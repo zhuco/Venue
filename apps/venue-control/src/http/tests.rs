@@ -7,20 +7,51 @@ use std::{
 use rust_decimal::Decimal;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use venue_control_protocol::{
-    AccountSummary, CONTROL_SCHEMA_VERSION, CommandReceipt, ConnectionState, ControlAction,
-    ControlCommandRequest, ControlEvent, ControlSnapshot, GatewayMode, HealthState, StrategyKind,
-    StrategyLifecycle, StrategySummary, VenueId,
+    ACCOUNT_DELIVERY_SCHEMA_VERSION, AccountDeliveryAck, AccountDeliveryBinding,
+    AccountDeliveryClaim, AccountDeliveryClaimRequest, AccountDeliveryLease,
+    AccountDeliveryPurpose, AccountDeliveryReceipt, AccountDeliveryReceiptState, AccountSummary,
+    CONTROL_SCHEMA_VERSION, CommandReceipt, ConnectionState, ControlAction, ControlCommandRequest,
+    ControlEvent, ControlSnapshot, GatewayMode, HealthState, StrategyKind, StrategyLifecycle,
+    StrategySummary, VenueId,
 };
 
 use super::*;
 use crate::{
-    AccountNodeBinding, ClaimedCommand, CommandEnqueueResult, CommandSettleResult,
-    ControlRepository, RepositoryError, ScopedCommandReceipt, SnapshotStoreResult, StoredEvent,
+    AccountDeliveryRepository, AccountDeliveryRepositoryError, AccountNodeBinding, ClaimedCommand,
+    CommandEnqueueResult, CommandSettleResult, ControlRepository, DeliveryStoreResult,
+    RepositoryError, ScopedCommandReceipt, SnapshotStoreResult, StoredEvent,
 };
 
 #[derive(Clone, Default)]
 struct TestRepository {
     state: Arc<Mutex<TestState>>,
+}
+
+impl AccountDeliveryRepository for TestRepository {
+    async fn claim_account_deliveries(
+        &self,
+        _: &AccountDeliveryBinding,
+        _: &str,
+        _: u64,
+        _: u64,
+        _: u32,
+    ) -> Result<Vec<AccountDeliveryClaim>, AccountDeliveryRepositoryError> {
+        Ok(Vec::new())
+    }
+
+    async fn acknowledge_account_delivery(
+        &self,
+        _: &AccountDeliveryAck,
+    ) -> Result<DeliveryStoreResult, AccountDeliveryRepositoryError> {
+        Ok(DeliveryStoreResult::Stored)
+    }
+
+    async fn record_account_delivery_receipt(
+        &self,
+        _: &AccountDeliveryReceipt,
+    ) -> Result<DeliveryStoreResult, AccountDeliveryRepositoryError> {
+        Ok(DeliveryStoreResult::Stored)
+    }
 }
 
 #[derive(Default)]
@@ -261,6 +292,88 @@ async fn request_timeout_and_slow_sse_writes_fail_closed() -> Result<(), Box<dyn
 }
 
 #[tokio::test]
+async fn account_node_delivery_http_routes_only_transport_versioned_database_requests()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (address, stop, task) = start(
+        TestRepository::with_snapshot(Some(snapshot()?), Vec::new()),
+        ControlHttpConfig::default(),
+    )
+    .await?;
+    let binding = AccountDeliveryBinding {
+        venue: VenueId::Binance,
+        mode: GatewayMode::Live,
+        trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+        symbol: "BTC/USDT".parse()?,
+        instance_id: "grid-btc".to_owned(),
+        config_epoch: 7,
+    };
+    let claim_request = AccountDeliveryClaimRequest {
+        schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
+        binding: binding.clone(),
+        node_id: "node-a".to_owned(),
+        lease_duration_ms: 1_000,
+        limit: 10,
+    };
+    let response = request(
+        address,
+        &post_path(
+            "/v2/account-node/deliveries/claim",
+            &serde_json::to_vec(&claim_request)?,
+        ),
+    )
+    .await?;
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(response.ends_with("[]"));
+
+    let lease = AccountDeliveryLease {
+        schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
+        delivery_id: "command:request-1".to_owned(),
+        binding,
+        node_id: "node-a".to_owned(),
+        lease_epoch: 1,
+        leased_at_ms: 100,
+        expires_at_ms: 200,
+        purpose: AccountDeliveryPurpose::Install,
+    };
+    let ack = AccountDeliveryAck {
+        schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
+        lease: lease.clone(),
+        acknowledged_ms: 110,
+        durable_inbox_digest: [1; 32],
+    };
+    let response = request(
+        address,
+        &post_path(
+            "/v2/account-node/deliveries/ack",
+            &serde_json::to_vec(&ack)?,
+        ),
+    )
+    .await?;
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+
+    let receipt = AccountDeliveryReceipt {
+        schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
+        lease,
+        receipt_id: "receipt-1".to_owned(),
+        state: AccountDeliveryReceiptState::Applied,
+        observed_ms: 120,
+        account_fact_digest: [2; 32],
+        detail: "installed and applied by the account actor".to_owned(),
+    };
+    let response = request(
+        address,
+        &post_path(
+            "/v2/account-node/deliveries/receipts",
+            &serde_json::to_vec(&receipt)?,
+        ),
+    )
+    .await?;
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    stop_server(stop, task).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn non_loopback_listener_is_rejected_before_accepting_clients()
 -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("0.0.0.0:0").await?;
@@ -320,9 +433,13 @@ async fn request(
 }
 
 fn post_request(body: &[u8]) -> Vec<u8> {
+    post_path("/v2/control/commands", body)
+}
+
+fn post_path(path: &str, body: &[u8]) -> Vec<u8> {
     [
         format!(
-            "POST /v2/control/commands HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
             body.len()
         )
         .into_bytes(),

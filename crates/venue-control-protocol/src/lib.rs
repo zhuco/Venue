@@ -14,6 +14,295 @@ pub const CONTROL_SCHEMA_VERSION: u16 = 2;
 pub const SNAPSHOT_PATH: &str = "/v2/ui/snapshot";
 pub const EVENT_STREAM_PATH: &str = "/v2/ui/events";
 pub const COMMAND_PATH: &str = "/v2/control/commands";
+pub const ACCOUNT_DELIVERY_SCHEMA_VERSION: u16 = 1;
+pub const ACCOUNT_DELIVERY_CLAIM_PATH: &str = "/v2/account-node/deliveries/claim";
+pub const ACCOUNT_DELIVERY_ACK_PATH: &str = "/v2/account-node/deliveries/ack";
+pub const ACCOUNT_DELIVERY_RECEIPT_PATH: &str = "/v2/account-node/deliveries/receipts";
+
+/// Exact account-node scope for durable semantic delivery. It is deliberately unrelated to a
+/// gateway capability, writer generation, WAL position, or physical dispatch permit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AccountDeliveryBinding {
+    pub venue: VenueId,
+    pub mode: GatewayMode,
+    pub trading_account_id: String,
+    pub symbol: Symbol,
+    pub instance_id: String,
+    pub config_epoch: u64,
+}
+
+impl AccountDeliveryBinding {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if !venue_domain::is_canonical_trading_account_id(&self.trading_account_id) {
+            return Err(ProtocolError::AccountId);
+        }
+        if self.instance_id.trim().is_empty() {
+            return Err(ProtocolError::StrategyIdentity);
+        }
+        if self.config_epoch == 0 {
+            return Err(ProtocolError::ConfigEpoch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountDeliveryKind {
+    ControlCommand,
+    TestCopySemanticJob,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CopySemanticJobDelivery {
+    pub job_id: String,
+    pub job_digest: [u8; 32],
+    pub symbol: Symbol,
+    pub manifest: serde_json::Value,
+    pub semantic_job: serde_json::Value,
+    pub created_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+impl CopySemanticJobDelivery {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.job_id.trim().is_empty() || self.job_digest == [0; 32] {
+            return Err(ProtocolError::DeliveryIdentity);
+        }
+        if self.manifest.is_null() || self.semantic_job.is_null() {
+            return Err(ProtocolError::DeliveryPayload);
+        }
+        if self.created_at_ms == 0 || self.expires_at_ms <= self.created_at_ms {
+            return Err(ProtocolError::DeliveryTime);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+pub enum AccountDeliveryPayload {
+    ControlCommand(ControlCommandRequest),
+    TestCopySemanticJob(CopySemanticJobDelivery),
+}
+
+impl AccountDeliveryPayload {
+    #[must_use]
+    pub const fn kind(&self) -> AccountDeliveryKind {
+        match self {
+            Self::ControlCommand(_) => AccountDeliveryKind::ControlCommand,
+            Self::TestCopySemanticJob(_) => AccountDeliveryKind::TestCopySemanticJob,
+        }
+    }
+
+    fn validate_against(&self, binding: &AccountDeliveryBinding) -> Result<(), ProtocolError> {
+        match self {
+            Self::ControlCommand(command) => {
+                command.validate()?;
+                if command.venue != binding.venue
+                    || command.mode != binding.mode
+                    || command.trading_account_id != binding.trading_account_id
+                    || command.symbol != binding.symbol
+                    || command.instance_id != binding.instance_id
+                    || command.expected_config_epoch != binding.config_epoch
+                {
+                    return Err(ProtocolError::DeliveryBinding);
+                }
+            }
+            Self::TestCopySemanticJob(job) => {
+                job.validate()?;
+                if binding.mode != GatewayMode::Test {
+                    return Err(ProtocolError::LiveCopyDelivery);
+                }
+                if job.symbol != binding.symbol {
+                    return Err(ProtocolError::DeliveryBinding);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Revalidates a decoded database payload against the exact durable account binding.
+    pub fn validate_for_account_delivery(
+        &self,
+        binding: &AccountDeliveryBinding,
+    ) -> Result<(), ProtocolError> {
+        binding.validate()?;
+        self.validate_against(binding)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountDeliveryPurpose {
+    Install,
+    ReconcileOnly,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AccountDeliveryClaimRequest {
+    pub schema_version: u16,
+    pub binding: AccountDeliveryBinding,
+    pub node_id: String,
+    pub lease_duration_ms: u64,
+    pub limit: u32,
+}
+
+impl AccountDeliveryClaimRequest {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.schema_version != ACCOUNT_DELIVERY_SCHEMA_VERSION {
+            return Err(ProtocolError::DeliverySchemaVersion);
+        }
+        self.binding.validate()?;
+        if self.node_id.trim().is_empty() {
+            return Err(ProtocolError::DeliveryIdentity);
+        }
+        if self.lease_duration_ms == 0 || self.limit == 0 {
+            return Err(ProtocolError::DeliveryLease);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AccountDeliveryLease {
+    pub schema_version: u16,
+    pub delivery_id: String,
+    pub binding: AccountDeliveryBinding,
+    pub node_id: String,
+    pub lease_epoch: u64,
+    pub leased_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub purpose: AccountDeliveryPurpose,
+}
+
+impl AccountDeliveryLease {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.schema_version != ACCOUNT_DELIVERY_SCHEMA_VERSION {
+            return Err(ProtocolError::DeliverySchemaVersion);
+        }
+        self.binding.validate()?;
+        if self.delivery_id.trim().is_empty()
+            || self.node_id.trim().is_empty()
+            || self.lease_epoch == 0
+        {
+            return Err(ProtocolError::DeliveryIdentity);
+        }
+        if self.leased_at_ms == 0 || self.expires_at_ms <= self.leased_at_ms {
+            return Err(ProtocolError::DeliveryLease);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn grants_mutation_authority(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AccountDeliveryClaim {
+    pub lease: AccountDeliveryLease,
+    pub payload: AccountDeliveryPayload,
+}
+
+impl AccountDeliveryClaim {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        self.lease.validate()?;
+        self.payload.validate_against(&self.lease.binding)?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn grants_mutation_authority(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AccountDeliveryAck {
+    pub schema_version: u16,
+    pub lease: AccountDeliveryLease,
+    pub acknowledged_ms: u64,
+    pub durable_inbox_digest: [u8; 32],
+}
+
+impl AccountDeliveryAck {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.schema_version != ACCOUNT_DELIVERY_SCHEMA_VERSION {
+            return Err(ProtocolError::DeliverySchemaVersion);
+        }
+        self.lease.validate()?;
+        if self.lease.purpose != AccountDeliveryPurpose::Install
+            || self.acknowledged_ms < self.lease.leased_at_ms
+            || self.durable_inbox_digest == [0; 32]
+        {
+            return Err(ProtocolError::DeliveryAck);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn grants_mutation_authority(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountDeliveryReceiptState {
+    Applied,
+    Rejected,
+    Unknown,
+    Reconciled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AccountDeliveryReceipt {
+    pub schema_version: u16,
+    pub lease: AccountDeliveryLease,
+    pub receipt_id: String,
+    pub state: AccountDeliveryReceiptState,
+    pub observed_ms: u64,
+    pub account_fact_digest: [u8; 32],
+    pub detail: String,
+}
+
+impl AccountDeliveryReceipt {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.schema_version != ACCOUNT_DELIVERY_SCHEMA_VERSION {
+            return Err(ProtocolError::DeliverySchemaVersion);
+        }
+        self.lease.validate()?;
+        if self.receipt_id.trim().is_empty() || self.observed_ms < self.lease.leased_at_ms {
+            return Err(ProtocolError::ReceiptIdentity);
+        }
+        if matches!(
+            self.state,
+            AccountDeliveryReceiptState::Unknown | AccountDeliveryReceiptState::Rejected
+        ) && self.detail.trim().is_empty()
+        {
+            return Err(ProtocolError::ReceiptDetail);
+        }
+        if self.state == AccountDeliveryReceiptState::Reconciled
+            && (self.lease.purpose != AccountDeliveryPurpose::ReconcileOnly
+                || self.account_fact_digest == [0; 32])
+        {
+            return Err(ProtocolError::DeliveryReceipt);
+        }
+        if self.lease.purpose == AccountDeliveryPurpose::ReconcileOnly
+            && self.state != AccountDeliveryReceiptState::Reconciled
+        {
+            return Err(ProtocolError::DeliveryReceipt);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn grants_mutation_authority(&self) -> bool {
+        false
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -554,6 +843,8 @@ impl ControlEvent {
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ProtocolError {
+    #[error("unsupported account delivery protocol schema version")]
+    DeliverySchemaVersion,
     #[error("unsupported control protocol schema version")]
     SchemaVersion,
     #[error("control snapshot generated time is missing")]
@@ -586,6 +877,22 @@ pub enum ProtocolError {
     EventTime,
     #[error("control event content is missing")]
     EventContent,
+    #[error("account delivery identity is missing")]
+    DeliveryIdentity,
+    #[error("account delivery payload is missing or malformed")]
+    DeliveryPayload,
+    #[error("account delivery time window is malformed")]
+    DeliveryTime,
+    #[error("account delivery payload does not match its exact binding")]
+    DeliveryBinding,
+    #[error("LIVE Copy delivery is disabled")]
+    LiveCopyDelivery,
+    #[error("account delivery lease is malformed")]
+    DeliveryLease,
+    #[error("account delivery acknowledgement is malformed")]
+    DeliveryAck,
+    #[error("account delivery receipt transition is malformed")]
+    DeliveryReceipt,
 }
 
 #[cfg(test)]
@@ -625,6 +932,16 @@ mod tests {
         assert_eq!(SNAPSHOT_PATH, "/v2/ui/snapshot");
         assert_eq!(EVENT_STREAM_PATH, "/v2/ui/events");
         assert_eq!(COMMAND_PATH, "/v2/control/commands");
+        assert_eq!(ACCOUNT_DELIVERY_SCHEMA_VERSION, 1);
+        assert_eq!(
+            ACCOUNT_DELIVERY_CLAIM_PATH,
+            "/v2/account-node/deliveries/claim"
+        );
+        assert_eq!(ACCOUNT_DELIVERY_ACK_PATH, "/v2/account-node/deliveries/ack");
+        assert_eq!(
+            ACCOUNT_DELIVERY_RECEIPT_PATH,
+            "/v2/account-node/deliveries/receipts"
+        );
 
         let mut encoded = serde_json::to_value(request(ControlAction::Pause)?)?;
         let object = encoded
@@ -632,6 +949,100 @@ mod tests {
             .ok_or("control request must encode as an object")?;
         object.remove("mode");
         assert!(serde_json::from_value::<ControlCommandRequest>(encoded).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn account_delivery_is_exact_versioned_and_non_authoritative()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = AccountDeliveryBinding {
+            venue: VenueId::Binance,
+            mode: GatewayMode::Test,
+            trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            symbol: "BTC/USDT".parse()?,
+            instance_id: "copy-btc".to_owned(),
+            config_epoch: 7,
+        };
+        let lease = AccountDeliveryLease {
+            schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
+            delivery_id: "copy:job-1".to_owned(),
+            binding: binding.clone(),
+            node_id: "node-a".to_owned(),
+            lease_epoch: 1,
+            leased_at_ms: 100,
+            expires_at_ms: 200,
+            purpose: AccountDeliveryPurpose::Install,
+        };
+        let claim = AccountDeliveryClaim {
+            lease: lease.clone(),
+            payload: AccountDeliveryPayload::TestCopySemanticJob(CopySemanticJobDelivery {
+                job_id: "job-1".to_owned(),
+                job_digest: [1; 32],
+                symbol: binding.symbol.clone(),
+                manifest: serde_json::json!({"immutable": true}),
+                semantic_job: serde_json::json!({"target": "1"}),
+                created_at_ms: 90,
+                expires_at_ms: 300,
+            }),
+        };
+        assert_eq!(claim.validate(), Ok(()));
+        assert!(!claim.grants_mutation_authority());
+        assert!(!lease.grants_mutation_authority());
+
+        let ack = AccountDeliveryAck {
+            schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
+            lease: lease.clone(),
+            acknowledged_ms: 110,
+            durable_inbox_digest: [2; 32],
+        };
+        assert_eq!(ack.validate(), Ok(()));
+        assert!(!ack.grants_mutation_authority());
+
+        let mut live = claim.clone();
+        live.lease.binding.mode = GatewayMode::Live;
+        assert_eq!(live.validate(), Err(ProtocolError::LiveCopyDelivery));
+        let mut wrong_symbol = claim;
+        wrong_symbol.lease.binding.symbol = "ETH/USDT".parse()?;
+        assert_eq!(wrong_symbol.validate(), Err(ProtocolError::DeliveryBinding));
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_receipt_requires_reconcile_only_lease_and_account_fact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut lease = AccountDeliveryLease {
+            schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
+            delivery_id: "command:request-1".to_owned(),
+            binding: AccountDeliveryBinding {
+                venue: VenueId::Binance,
+                mode: GatewayMode::Live,
+                trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                symbol: "BTC/USDT".parse()?,
+                instance_id: "grid-btc".to_owned(),
+                config_epoch: 7,
+            },
+            node_id: "node-a".to_owned(),
+            lease_epoch: 2,
+            leased_at_ms: 200,
+            expires_at_ms: 300,
+            purpose: AccountDeliveryPurpose::Install,
+        };
+        let mut receipt = AccountDeliveryReceipt {
+            schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
+            lease: lease.clone(),
+            receipt_id: "receipt-2".to_owned(),
+            state: AccountDeliveryReceiptState::Reconciled,
+            observed_ms: 210,
+            account_fact_digest: [3; 32],
+            detail: "read back from durable account facts".to_owned(),
+        };
+        assert_eq!(receipt.validate(), Err(ProtocolError::DeliveryReceipt));
+        lease.purpose = AccountDeliveryPurpose::ReconcileOnly;
+        receipt.lease = lease;
+        assert_eq!(receipt.validate(), Ok(()));
+        assert!(!receipt.grants_mutation_authority());
+        receipt.account_fact_digest = [0; 32];
+        assert_eq!(receipt.validate(), Err(ProtocolError::DeliveryReceipt));
         Ok(())
     }
 

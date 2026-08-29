@@ -14,9 +14,14 @@ use tokio::{
     sync::{Semaphore, watch},
     time::{self, MissedTickBehavior},
 };
-use venue_control_protocol::ControlCommandRequest;
+use venue_control_protocol::{
+    AccountDeliveryAck, AccountDeliveryClaimRequest, AccountDeliveryReceipt, ControlCommandRequest,
+};
 
-use crate::{ControlRepository, ControlService, RepositoryError, ServiceError};
+use crate::{
+    AccountDeliveryRepository, AccountDeliveryRepositoryError, ControlRepository, ControlService,
+    RepositoryError, ServiceError,
+};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HEADER_LINES: usize = 64;
@@ -124,7 +129,7 @@ pub async fn serve_local<R>(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), HttpServerError>
 where
-    R: ControlRepository + 'static,
+    R: ControlRepository + AccountDeliveryRepository + 'static,
 {
     config.validate()?;
     if !listener.local_addr()?.ip().is_loopback() {
@@ -159,7 +164,7 @@ where
 
 async fn handle_connection<R>(mut stream: TcpStream, state: HttpState<R>)
 where
-    R: ControlRepository + 'static,
+    R: ControlRepository + AccountDeliveryRepository + 'static,
 {
     let request = match time::timeout(
         state.config.request_timeout,
@@ -186,7 +191,7 @@ async fn dispatch<R>(
     request: HttpRequest,
 ) -> Result<(), ()>
 where
-    R: ControlRepository + 'static,
+    R: ControlRepository + AccountDeliveryRepository + 'static,
 {
     let Some((path, query)) = split_target(&request.target) else {
         return write_error(stream, HttpError::BadRequest)
@@ -222,6 +227,76 @@ where
                     Ok(receipt) => receipt,
                     Err(error) => return write_error(stream, error).await.map_err(|_| ()),
                 };
+            let body = serde_json::to_vec(&receipt).map_err(|_| ())?;
+            write_response(stream, "200 OK", "application/json", "close", &body)
+                .await
+                .map_err(|_| ())
+        }
+        (Method::Post, "/v2/account-node/deliveries/claim") if query.is_none() => {
+            let claim_request =
+                match serde_json::from_slice::<AccountDeliveryClaimRequest>(&request.body) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        return write_error(stream, HttpError::BadRequest)
+                            .await
+                            .map_err(|_| ());
+                    }
+                };
+            let leased_at_ms = match now_ms() {
+                Ok(value) => value,
+                Err(error) => return write_error(stream, error).await.map_err(|_| ()),
+            };
+            let claims = match call(
+                state,
+                state
+                    .service
+                    .claim_account_deliveries(&claim_request, leased_at_ms),
+            )
+            .await
+            {
+                Ok(claims) => claims,
+                Err(error) => return write_error(stream, error).await.map_err(|_| ()),
+            };
+            let body = serde_json::to_vec(&claims).map_err(|_| ())?;
+            write_response(stream, "200 OK", "application/json", "close", &body)
+                .await
+                .map_err(|_| ())
+        }
+        (Method::Post, "/v2/account-node/deliveries/ack") if query.is_none() => {
+            let ack = match serde_json::from_slice::<AccountDeliveryAck>(&request.body) {
+                Ok(ack) => ack,
+                Err(_) => {
+                    return write_error(stream, HttpError::BadRequest)
+                        .await
+                        .map_err(|_| ());
+                }
+            };
+            if let Err(error) = call(state, state.service.acknowledge_account_delivery(&ack)).await
+            {
+                return write_error(stream, error).await.map_err(|_| ());
+            }
+            let body = serde_json::to_vec(&ack).map_err(|_| ())?;
+            write_response(stream, "200 OK", "application/json", "close", &body)
+                .await
+                .map_err(|_| ())
+        }
+        (Method::Post, "/v2/account-node/deliveries/receipts") if query.is_none() => {
+            let receipt = match serde_json::from_slice::<AccountDeliveryReceipt>(&request.body) {
+                Ok(receipt) => receipt,
+                Err(_) => {
+                    return write_error(stream, HttpError::BadRequest)
+                        .await
+                        .map_err(|_| ());
+                }
+            };
+            if let Err(error) = call(
+                state,
+                state.service.record_account_delivery_receipt(&receipt),
+            )
+            .await
+            {
+                return write_error(stream, error).await.map_err(|_| ());
+            }
             let body = serde_json::to_vec(&receipt).map_err(|_| ())?;
             write_response(stream, "200 OK", "application/json", "close", &body)
                 .await
@@ -448,6 +523,22 @@ fn map_service_error(error: ServiceError) -> HttpError {
         | ServiceError::InvalidLimit
         | ServiceError::InvalidDelivery(_) => HttpError::BadRequest,
         ServiceError::Repository(_) => HttpError::Internal,
+        ServiceError::AccountDeliveryRepository(
+            AccountDeliveryRepositoryError::BindingConflict
+            | AccountDeliveryRepositoryError::LeaseConflict
+            | AccountDeliveryRepositoryError::AckConflict
+            | AccountDeliveryRepositoryError::ReceiptConflict,
+        ) => HttpError::Conflict,
+        ServiceError::AccountDeliveryRepository(AccountDeliveryRepositoryError::Database) => {
+            HttpError::Unavailable
+        }
+        ServiceError::AccountDeliveryRepository(
+            AccountDeliveryRepositoryError::InvalidData
+            | AccountDeliveryRepositoryError::NumericRange,
+        ) => HttpError::BadRequest,
+        ServiceError::AccountDeliveryRepository(AccountDeliveryRepositoryError::CorruptData) => {
+            HttpError::Internal
+        }
     }
 }
 

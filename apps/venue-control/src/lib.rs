@@ -3,6 +3,8 @@
 //! The crate validates schema-v2 projections and semantic commands, then persists them through a
 //! repository boundary. It has no exchange adapter, credential, writer, WAL, or artifact access.
 
+mod account_delivery_postgres;
+mod account_delivery_repository;
 mod copy_model;
 mod copy_postgres;
 mod copy_repository;
@@ -13,6 +15,12 @@ mod postgres;
 mod repository;
 mod service;
 
+pub use account_delivery_postgres::{
+    MAX_ACCOUNT_DELIVERY_CLAIM, MAX_ACCOUNT_DELIVERY_LEASE_MS, MIGRATION_0004,
+};
+pub use account_delivery_repository::{
+    AccountDeliveryRepository, AccountDeliveryRepositoryError, DeliveryStoreResult,
+};
 pub use copy_model::{
     CopyApplyResult, CopyCrashReplay, CopyDeliveryClaim, CopyDriftProjection, CopyLeaderEnvelope,
     CopyLeaderIntent, CopyLeaderSnapshot, CopyLedgerProjectionInput, CopyObserverLease,

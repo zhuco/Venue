@@ -1,4 +1,5 @@
 use venue_control_protocol::{
+    AccountDeliveryAck, AccountDeliveryClaim, AccountDeliveryClaimRequest, AccountDeliveryReceipt,
     CONTROL_SCHEMA_VERSION, CommandReceipt, CommandState, ControlCommandRequest, ControlSnapshot,
     ProtocolError,
 };
@@ -10,6 +11,63 @@ use crate::{
 
 const MAX_EVENT_PAGE: u32 = 1_000;
 const MAX_COMMAND_CLAIM: u32 = 256;
+
+impl<R> ControlService<R>
+where
+    R: crate::AccountDeliveryRepository,
+{
+    pub async fn claim_account_deliveries(
+        &self,
+        request: &AccountDeliveryClaimRequest,
+        leased_at_ms: u64,
+    ) -> Result<Vec<AccountDeliveryClaim>, ServiceError> {
+        request.validate()?;
+        if request.lease_duration_ms > crate::MAX_ACCOUNT_DELIVERY_LEASE_MS
+            || request.limit > crate::MAX_ACCOUNT_DELIVERY_CLAIM
+            || leased_at_ms == 0
+        {
+            return Err(ServiceError::InvalidDelivery(
+                "account delivery lease window or limit is invalid",
+            ));
+        }
+        let expires_at_ms = leased_at_ms
+            .checked_add(request.lease_duration_ms)
+            .ok_or(ServiceError::InvalidObservedTime)?;
+        let claims = self
+            .repository
+            .claim_account_deliveries(
+                &request.binding,
+                &request.node_id,
+                leased_at_ms,
+                expires_at_ms,
+                request.limit,
+            )
+            .await?;
+        for claim in &claims {
+            claim.validate()?;
+        }
+        Ok(claims)
+    }
+
+    pub async fn acknowledge_account_delivery(
+        &self,
+        ack: &AccountDeliveryAck,
+    ) -> Result<crate::DeliveryStoreResult, ServiceError> {
+        ack.validate()?;
+        Ok(self.repository.acknowledge_account_delivery(ack).await?)
+    }
+
+    pub async fn record_account_delivery_receipt(
+        &self,
+        receipt: &AccountDeliveryReceipt,
+    ) -> Result<crate::DeliveryStoreResult, ServiceError> {
+        receipt.validate()?;
+        Ok(self
+            .repository
+            .record_account_delivery_receipt(receipt)
+            .await?)
+    }
+}
 
 pub struct ControlService<R> {
     repository: R,
@@ -160,6 +218,8 @@ pub enum ServiceError {
     InvalidDelivery(&'static str),
     #[error(transparent)]
     Repository(#[from] RepositoryError),
+    #[error(transparent)]
+    AccountDeliveryRepository(#[from] crate::AccountDeliveryRepositoryError),
 }
 
 #[cfg(test)]

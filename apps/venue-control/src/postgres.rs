@@ -7,6 +7,7 @@ use venue_control_protocol::{
 use crate::{
     AccountNodeBinding, ClaimedCommand, CommandEnqueueResult, CommandSettleResult,
     ControlRepository, RepositoryError, ScopedCommandReceipt, SnapshotStoreResult, StoredEvent,
+    account_delivery_postgres::insert_control_account_delivery,
 };
 
 pub const MIGRATION_0001: &str = include_str!("../migrations/0001_control_core.sql");
@@ -209,6 +210,18 @@ impl ControlRepository for PgControlRepository {
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
+        insert_control_account_delivery(&mut transaction, command, accepted.observed_ms)
+            .await
+            .map_err(|error| match error {
+                crate::AccountDeliveryRepositoryError::BindingConflict => {
+                    RepositoryError::StaleScope
+                }
+                crate::AccountDeliveryRepositoryError::NumericRange => {
+                    RepositoryError::NumericRange
+                }
+                crate::AccountDeliveryRepositoryError::CorruptData => RepositoryError::CorruptData,
+                _ => RepositoryError::Database,
+            })?;
         insert_event(&mut transaction, created_ms, event_json).await?;
         transaction.commit().await.map_err(database_error)?;
         Ok(CommandEnqueueResult::Inserted(accepted.clone()))

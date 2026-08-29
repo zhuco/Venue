@@ -3,12 +3,15 @@ use std::{env, process, time::SystemTime};
 use rust_decimal::Decimal;
 use sqlx::{Executor, PgPool, postgres::PgPoolOptions};
 use venue_control::{
-    CopyApplyResult, CopyLeaderEnvelope, CopyLeaderIntent, CopyLeaderSnapshot,
-    CopyLedgerProjectionInput, CopyObserverScope, CopyPlanningSnapshot, CopyReplayDeliveryState,
-    CopyRepository, CopyTestWorker, CopyTestWorkerConfig, FrozenCapitalSnapshot, MIGRATION_0001,
-    MIGRATION_0002, MIGRATION_0003, PgControlRepository, ScopedCopyDeliveryReceipt,
+    AccountDeliveryRepository, CopyApplyResult, CopyLeaderEnvelope, CopyLeaderIntent,
+    CopyLeaderSnapshot, CopyLedgerProjectionInput, CopyObserverScope, CopyPlanningSnapshot,
+    CopyReplayDeliveryState, CopyRepository, CopyTestWorker, CopyTestWorkerConfig,
+    FrozenCapitalSnapshot, MIGRATION_0001, MIGRATION_0002, MIGRATION_0003, MIGRATION_0004,
+    PgControlRepository, ScopedCopyDeliveryReceipt,
 };
-use venue_control_protocol::{GatewayMode, VenueId};
+use venue_control_protocol::{
+    AccountDeliveryBinding, AccountDeliveryPayload, GatewayMode, VenueId,
+};
 use venue_copy::{
     AuthoritativePositionSnapshot, CopyAction, CopyIdentityInput, DeliveryBinding,
     DeliveryReceiptStatus, LedgerAttribution, LedgerEntry, PersistedDeliveryReceipt,
@@ -29,6 +32,7 @@ async fn postgres_migration_concurrency_and_crash_windows() -> Result<(), Box<dy
     fixture.migrate_twice().await?;
     let repository = PgControlRepository::new(fixture.pool.clone());
     let scope = scope("atomic-observer");
+    install_account_scope(&fixture.pool).await?;
     let now = 10_000;
     repository
         .store_leader_envelope(&envelope(&scope, 1, now)?, now + 1)
@@ -45,6 +49,27 @@ async fn postgres_migration_concurrency_and_crash_windows() -> Result<(), Box<dy
         scalar_i64(&fixture.pool, "SELECT count(*) FROM venue_copy_plans").await?,
         1
     );
+    let claims = repository
+        .claim_account_deliveries(
+            &AccountDeliveryBinding {
+                venue: VenueId::Binance,
+                mode: GatewayMode::Test,
+                trading_account_id: scope.trading_account_id.clone(),
+                symbol: "BTC/USDT".parse()?,
+                instance_id: "copy-btc".to_owned(),
+                config_epoch: 7,
+            },
+            "account-node-a",
+            now + 3,
+            now + 100,
+            1,
+        )
+        .await?;
+    assert_eq!(claims.len(), 1);
+    assert!(matches!(
+        claims[0].payload,
+        AccountDeliveryPayload::TestCopySemanticJob(_)
+    ));
 
     repository
         .store_leader_envelope(&envelope(&scope, 2, now + 10)?, now + 11)
@@ -101,6 +126,7 @@ async fn postgres_receipts_unknown_fence_ledger_and_restart_recovery()
     fixture.migrate_twice().await?;
     let repository = PgControlRepository::new(fixture.pool.clone());
     let scope = scope("receipt-observer");
+    install_account_scope(&fixture.pool).await?;
     let worker = make_worker(repository.clone(), scope.clone(), "planner-a")?;
     let now = 20_000;
 
@@ -401,6 +427,18 @@ async fn scalar_i64(pool: &PgPool, sql: &str) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar(sql).fetch_one(pool).await
 }
 
+async fn install_account_scope(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO venue_control_strategy_scopes \
+         (instance_id, venue, mode, trading_account_id, symbol, config_epoch, snapshot_generated_ms) \
+         VALUES ('copy-btc', 'binance', 'TEST', \
+                 '00000000-0000-4000-8000-000000000001', 'BTC/USDT', 7, 1)",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 struct PgFixture {
     database_url: String,
     schema: String,
@@ -445,6 +483,7 @@ impl PgFixture {
             sqlx::raw_sql(MIGRATION_0001).execute(&self.pool).await?;
             sqlx::raw_sql(MIGRATION_0002).execute(&self.pool).await?;
             sqlx::raw_sql(MIGRATION_0003).execute(&self.pool).await?;
+            sqlx::raw_sql(MIGRATION_0004).execute(&self.pool).await?;
         }
         Ok(())
     }

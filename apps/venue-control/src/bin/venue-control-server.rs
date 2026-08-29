@@ -5,7 +5,7 @@ use std::{env, net::SocketAddr, sync::Arc};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use venue_control::{
     ControlHttpConfig, ControlService, MIGRATION_0001, MIGRATION_0002, MIGRATION_0003,
-    PgControlRepository, control_shutdown_channel, serve_local,
+    MIGRATION_0004, PgControlRepository, control_shutdown_channel, serve_local,
 };
 
 #[tokio::main]
@@ -42,5 +42,6 @@ async fn install_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(MIGRATION_0001).execute(pool).await?;
     sqlx::raw_sql(MIGRATION_0002).execute(pool).await?;
     sqlx::raw_sql(MIGRATION_0003).execute(pool).await?;
+    sqlx::raw_sql(MIGRATION_0004).execute(pool).await?;
     Ok(())
 }
