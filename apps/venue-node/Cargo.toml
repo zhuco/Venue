@@ -61,6 +61,7 @@ clap.workspace = true
 thiserror.workspace = true
 venue = { path = "../..", optional = true, default-features = false }
 venue-domain = { path = "../../crates/venue-domain" }
+venue-execution = { path = "../../crates/venue-execution" }
 venue-gateway-api = { path = "../../crates/venue-gateway-api" }
 venue-gateway-binance = { path = "../../crates/venue-gateway-binance", optional = true }
 venue-gateway-bitget = { path = "../../crates/venue-gateway-bitget", optional = true }
@@ -68,6 +69,11 @@ venue-gateway-bybit = { path = "../../crates/venue-gateway-bybit", optional = tr
 venue-gateway-gate = { path = "../../crates/venue-gateway-gate", optional = true }
 venue-gateway-hyperliquid = { path = "../../crates/venue-gateway-hyperliquid", optional = true }
 venue-gateway-okx = { path = "../../crates/venue-gateway-okx", optional = true }
+venue-runtime = { path = "../../crates/venue-runtime" }
+
+[dev-dependencies]
+rust_decimal.workspace = true
+tempfile.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"
