@@ -99,21 +99,30 @@ pub(crate) struct PositionRow {
     pub entry_px: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct OpenOrderRow {
+#[serde(deny_unknown_fields)]
+pub(crate) struct FrontendOrderRow {
+    pub children: Vec<FrontendOrderRow>,
     pub coin: String,
+    pub is_position_tpsl: bool,
+    pub is_trigger: bool,
     pub limit_px: String,
-    pub oid: serde_json::Value,
+    pub oid: u64,
+    pub order_type: String,
     pub orig_sz: String,
     pub reduce_only: bool,
     pub side: String,
     pub sz: String,
+    pub tif: Option<String>,
     pub timestamp: u64,
+    pub trigger_condition: String,
+    pub trigger_px: String,
     pub cloid: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct OrderStatusEnvelope {
     pub status: String,
     pub order: Option<OrderStatusBody>,
@@ -121,17 +130,11 @@ pub(crate) struct OrderStatusEnvelope {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub(crate) struct OrderStatusBody {
-    pub order: OrderStatusOrder,
+    pub order: FrontendOrderRow,
     pub status: String,
     pub status_timestamp: u64,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct OrderStatusOrder {
-    pub coin: String,
-    pub oid: u64,
-    pub cloid: Option<String>,
 }
 
 #[derive(Deserialize)]

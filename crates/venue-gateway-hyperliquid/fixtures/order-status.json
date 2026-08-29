@@ -2,7 +2,10 @@
   "status": "order",
   "order": {
     "order": {
+      "children": [],
       "coin": "BTC",
+      "isPositionTpsl": false,
+      "isTrigger": false,
       "side": "A",
       "limitPx": "2412.7",
       "sz": "0.0",
@@ -12,6 +15,8 @@
       "orderType": "Market",
       "origSz": "0.0076",
       "tif": "FrontendMarket",
+      "triggerCondition": "N/A",
+      "triggerPx": "0.0",
       "cloid": "0x00000000000000000000000000000001"
     },
     "status": "filled",

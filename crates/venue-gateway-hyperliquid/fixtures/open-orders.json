@@ -1,5 +1,6 @@
 [
   {
+    "children": [],
     "coin": "BTC",
     "isPositionTpsl": false,
     "isTrigger": false,
@@ -10,17 +11,28 @@
     "reduceOnly": true,
     "side": "A",
     "sz": "3.0",
+    "tif": "Alo",
     "timestamp": 1681247412573,
+    "triggerCondition": "N/A",
+    "triggerPx": "0.0",
     "cloid": "0x00000000000000000000000000000001"
   },
   {
+    "children": [],
     "coin": "ETH",
+    "isPositionTpsl": false,
+    "isTrigger": false,
     "limitPx": "4000.0",
     "oid": 91490943,
+    "orderType": "Limit",
     "origSz": "1.0",
     "reduceOnly": false,
     "side": "B",
     "sz": "1.0",
-    "timestamp": 1681247412574
+    "tif": "Gtc",
+    "timestamp": 1681247412574,
+    "triggerCondition": "N/A",
+    "triggerPx": "0.0",
+    "cloid": null
   }
 ]

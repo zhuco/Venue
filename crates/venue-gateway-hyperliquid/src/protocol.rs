@@ -1,5 +1,6 @@
 use std::{
     cmp::{Ordering, Reverse},
+    collections::BTreeMap,
     str::FromStr,
 };
 
@@ -13,13 +14,15 @@ use venue_gateway_api::GatewayMode;
 use crate::{
     HyperliquidConfig, HyperliquidError, HyperliquidReadBinding, endpoints,
     models::{
-        BboData, BookData, BookLevel, ClearinghouseState, EventEnvelope, OpenOrderRow,
+        BboData, BookData, BookLevel, ClearinghouseState, EventEnvelope, FrontendOrderRow,
         OrderStatusEnvelope, PerpMetaResponse, UserFillRow, UserFillsData,
     },
 };
 
 const MAX_BOOK_LEVELS: usize = 20;
 const MAX_FILL_PAGE: usize = 2_000;
+const MAX_FRONTEND_ORDERS: usize = 2_000;
+const MAX_FRONTEND_CHILDREN: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HyperliquidPayloadScope {
@@ -83,6 +86,25 @@ pub struct HyperliquidAccountSnapshot {
 pub struct HyperliquidOpenOrder {
     pub order: Order,
     pub exchange_time_ms: u64,
+    pub family: HyperliquidOrderFamily,
+    pub native_order_type: String,
+    pub time_in_force: Option<String>,
+    pub trigger_price: Option<Price>,
+    pub trigger_condition: String,
+    pub is_position_tpsl: bool,
+    pub child_order_ids: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HyperliquidOrderFamily {
+    Regular,
+    Conditional,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HyperliquidOrderFamilyCoverage {
+    CompleteFrontendSnapshot,
+    NotCoveredByFrontendOpenOrders,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,6 +112,11 @@ pub struct HyperliquidOpenOrdersSnapshot {
     pub scope: HyperliquidPayloadScope,
     pub observed_at_ms: u64,
     pub orders: Vec<HyperliquidOpenOrder>,
+    pub raw_payload: Vec<u8>,
+    pub regular_coverage: HyperliquidOrderFamilyCoverage,
+    pub conditional_coverage: HyperliquidOrderFamilyCoverage,
+    /// TWAP and other algorithmic parent state require a separate endpoint and remain unproven.
+    pub algo_coverage: HyperliquidOrderFamilyCoverage,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -282,8 +309,11 @@ impl HyperliquidOrderLookup {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HyperliquidOrderStatus {
+    /// The venue did not resolve the exact queried identity. This is not proof of absence or a
+    /// terminal outcome and must never authorize resubmission of an UNKNOWN command.
     Unknown {
         scope: HyperliquidPayloadScope,
+        lookup: HyperliquidOrderLookup,
     },
     Known {
         scope: HyperliquidPayloadScope,
@@ -327,7 +357,13 @@ pub fn build_clearinghouse_state_request(
 pub fn build_open_orders_request(
     meta: &HyperliquidPerpMeta,
 ) -> Result<HyperliquidInfoRequest, HyperliquidError> {
-    bound_user_request("openOrders", &meta.scope)
+    build_frontend_open_orders_request(meta)
+}
+
+pub fn build_frontend_open_orders_request(
+    meta: &HyperliquidPerpMeta,
+) -> Result<HyperliquidInfoRequest, HyperliquidError> {
+    bound_user_request("frontendOpenOrders", &meta.scope)
 }
 
 pub fn build_user_fills_by_time_request(
@@ -384,12 +420,14 @@ pub fn parse_order_status(
     match (envelope.status.as_str(), envelope.order) {
         ("unknownOid", None) => Ok(HyperliquidOrderStatus::Unknown {
             scope: meta.scope.clone(),
+            lookup: lookup.clone(),
         }),
         ("order", Some(body)) => {
             if body.order.coin != meta.scope.native_coin {
                 return Err(HyperliquidError::Binding);
             }
-            if body.status_timestamp == 0 || body.order.oid == 0 {
+            validate_status_order(&body.order)?;
+            if body.status_timestamp < body.order.timestamp {
                 return Err(HyperliquidError::Payload);
             }
             match lookup {
@@ -413,7 +451,8 @@ pub fn parse_order_status(
                 client_order_id: body
                     .order
                     .cloid
-                    .filter(|value| !value.is_empty())
+                    .map(canonical_cloid)
+                    .transpose()?
                     .map(FieldState::Known)
                     .unwrap_or(FieldState::Missing),
                 state: normalized_order_status(&body.status)?,
@@ -542,11 +581,20 @@ pub fn parse_open_orders_snapshot(
     meta: &HyperliquidPerpMeta,
     observed_at_ms: u64,
 ) -> Result<HyperliquidOpenOrdersSnapshot, HyperliquidError> {
+    parse_frontend_open_orders_snapshot(payload, meta, observed_at_ms)
+}
+
+pub fn parse_frontend_open_orders_snapshot(
+    payload: &[u8],
+    meta: &HyperliquidPerpMeta,
+    observed_at_ms: u64,
+) -> Result<HyperliquidOpenOrdersSnapshot, HyperliquidError> {
     if observed_at_ms == 0 {
         return Err(HyperliquidError::Payload);
     }
-    let rows: Vec<OpenOrderRow> =
+    let rows: Vec<FrontendOrderRow> =
         serde_json::from_slice(payload).map_err(|_| HyperliquidError::Payload)?;
+    let rows = flatten_frontend_rows(rows)?;
     let orders = rows
         .into_iter()
         .filter(|row| row.coin == meta.scope.native_coin)
@@ -560,11 +608,45 @@ pub fn parse_open_orders_snapshot(
     if order_ids.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(HyperliquidError::Payload);
     }
+    let mut client_order_ids = orders
+        .iter()
+        .filter_map(|item| match &item.order.client_order_id {
+            FieldState::Known(value) => Some(value.as_str()),
+            FieldState::Missing
+            | FieldState::Null
+            | FieldState::Unavailable { .. }
+            | FieldState::NotApplicable => None,
+        })
+        .collect::<Vec<_>>();
+    client_order_ids.sort_unstable();
+    if client_order_ids
+        .windows(2)
+        .any(|pair| pair[0].eq_ignore_ascii_case(pair[1]))
+    {
+        return Err(HyperliquidError::Payload);
+    }
     Ok(HyperliquidOpenOrdersSnapshot {
         scope: meta.scope.clone(),
         observed_at_ms,
         orders,
+        raw_payload: payload.to_vec(),
+        regular_coverage: HyperliquidOrderFamilyCoverage::CompleteFrontendSnapshot,
+        conditional_coverage: HyperliquidOrderFamilyCoverage::CompleteFrontendSnapshot,
+        algo_coverage: HyperliquidOrderFamilyCoverage::NotCoveredByFrontendOpenOrders,
     })
+}
+
+pub fn validate_frontend_open_orders_snapshot(
+    snapshot: &HyperliquidOpenOrdersSnapshot,
+    meta: &HyperliquidPerpMeta,
+) -> Result<(), HyperliquidError> {
+    let replayed =
+        parse_frontend_open_orders_snapshot(&snapshot.raw_payload, meta, snapshot.observed_at_ms)?;
+    if &replayed == snapshot {
+        Ok(())
+    } else {
+        Err(HyperliquidError::OrderFamily)
+    }
 }
 
 pub fn parse_private_user_fills(
@@ -696,13 +778,169 @@ fn normalize_position(
     }))
 }
 
-fn normalize_open_order(
-    row: OpenOrderRow,
-    symbol: &Symbol,
-) -> Result<HyperliquidOpenOrder, HyperliquidError> {
-    if row.timestamp == 0 {
+fn flatten_frontend_rows(
+    rows: Vec<FrontendOrderRow>,
+) -> Result<Vec<FrontendOrderRow>, HyperliquidError> {
+    if rows.len() > MAX_FRONTEND_ORDERS {
+        return Err(HyperliquidError::OrderFamily);
+    }
+    let mut indexes = BTreeMap::new();
+    let mut flattened = Vec::new();
+    for row in rows {
+        validate_frontend_row(&row, false)?;
+        let children = row.children.clone();
+        insert_frontend_row(&mut flattened, &mut indexes, row)?;
+        for child in children {
+            insert_frontend_row(&mut flattened, &mut indexes, child)?;
+        }
+    }
+    if flattened.len() > MAX_FRONTEND_ORDERS {
+        return Err(HyperliquidError::OrderFamily);
+    }
+    Ok(flattened)
+}
+
+fn insert_frontend_row(
+    rows: &mut Vec<FrontendOrderRow>,
+    indexes: &mut BTreeMap<u64, usize>,
+    row: FrontendOrderRow,
+) -> Result<(), HyperliquidError> {
+    if let Some(index) = indexes.get(&row.oid) {
+        if rows.get(*index) == Some(&row) {
+            return Ok(());
+        }
+        return Err(HyperliquidError::OrderFamily);
+    }
+    indexes.insert(row.oid, rows.len());
+    rows.push(row);
+    Ok(())
+}
+
+fn validate_frontend_row(
+    row: &FrontendOrderRow,
+    child: bool,
+) -> Result<HyperliquidOrderFamily, HyperliquidError> {
+    if row.oid == 0
+        || row.timestamp == 0
+        || row.coin.trim().is_empty()
+        || row.children.len() > MAX_FRONTEND_CHILDREN
+    {
+        return Err(HyperliquidError::OrderFamily);
+    }
+    let original = decimal(&row.orig_sz).map_err(|_| HyperliquidError::OrderFamily)?;
+    let remaining = decimal(&row.sz).map_err(|_| HyperliquidError::OrderFamily)?;
+    let limit_price = decimal(&row.limit_px).map_err(|_| HyperliquidError::OrderFamily)?;
+    if original <= Decimal::ZERO
+        || remaining <= Decimal::ZERO
+        || remaining > original
+        || limit_price <= Decimal::ZERO
+    {
+        return Err(HyperliquidError::OrderFamily);
+    }
+    if let Some(cloid) = &row.cloid {
+        canonical_cloid(cloid.clone()).map_err(|_| HyperliquidError::OrderFamily)?;
+    }
+
+    let trigger_price = decimal(&row.trigger_px).map_err(|_| HyperliquidError::OrderFamily)?;
+    let family = if row.is_trigger {
+        if !matches!(
+            row.order_type.as_str(),
+            "Take Profit Market" | "Take Profit Limit" | "Stop Market" | "Stop Limit"
+        ) || row.tif.is_some()
+            || trigger_price <= Decimal::ZERO
+            || !trigger_condition_matches(&row.trigger_condition, trigger_price)
+            || !row.children.is_empty()
+            || (row.is_position_tpsl && !row.reduce_only)
+        {
+            return Err(HyperliquidError::OrderFamily);
+        }
+        HyperliquidOrderFamily::Conditional
+    } else {
+        if row.is_position_tpsl
+            || row.order_type != "Limit"
+            || !matches!(row.tif.as_deref(), Some("Alo" | "Gtc"))
+            || trigger_price != Decimal::ZERO
+            || row.trigger_condition != "N/A"
+        {
+            return Err(HyperliquidError::OrderFamily);
+        }
+        HyperliquidOrderFamily::Regular
+    };
+    if child && family != HyperliquidOrderFamily::Conditional {
+        return Err(HyperliquidError::OrderFamily);
+    }
+    let mut child_ids = BTreeMap::new();
+    for nested in &row.children {
+        if nested.coin != row.coin
+            || validate_frontend_row(nested, true)? != HyperliquidOrderFamily::Conditional
+            || child_ids.insert(nested.oid, ()).is_some()
+        {
+            return Err(HyperliquidError::OrderFamily);
+        }
+    }
+    Ok(family)
+}
+
+fn trigger_condition_matches(value: &str, trigger_price: Decimal) -> bool {
+    value
+        .strip_prefix("Price above ")
+        .or_else(|| value.strip_prefix("Price below "))
+        .and_then(|raw| Decimal::from_str(raw).ok())
+        .is_some_and(|condition_price| condition_price == trigger_price)
+}
+
+fn validate_status_order(row: &FrontendOrderRow) -> Result<(), HyperliquidError> {
+    if row.oid == 0
+        || row.timestamp == 0
+        || row.coin.trim().is_empty()
+        || row.children.len() > MAX_FRONTEND_CHILDREN
+    {
         return Err(HyperliquidError::Payload);
     }
+    let original = decimal(&row.orig_sz)?;
+    let remaining = decimal(&row.sz)?;
+    if original <= Decimal::ZERO
+        || remaining < Decimal::ZERO
+        || remaining > original
+        || decimal(&row.limit_px)? <= Decimal::ZERO
+    {
+        return Err(HyperliquidError::Payload);
+    }
+    if let Some(cloid) = &row.cloid {
+        canonical_cloid(cloid.clone())?;
+    }
+    if row.order_type == "Market" {
+        if row.is_trigger
+            || row.is_position_tpsl
+            || row.tif.as_deref() != Some("FrontendMarket")
+            || decimal(&row.trigger_px)? != Decimal::ZERO
+            || row.trigger_condition != "N/A"
+            || !row.children.is_empty()
+        {
+            return Err(HyperliquidError::Payload);
+        }
+        return Ok(());
+    }
+    let mut open_row = row.clone();
+    if remaining.is_zero() {
+        open_row.sz = original.to_string();
+    }
+    validate_frontend_row(&open_row, false).map_err(|_| HyperliquidError::Payload)?;
+    Ok(())
+}
+
+fn canonical_cloid(value: String) -> Result<String, HyperliquidError> {
+    match HyperliquidOrderLookup::client_order_id(value)? {
+        HyperliquidOrderLookup::ClientOrderId(value) => Ok(value),
+        HyperliquidOrderLookup::OrderId(_) => Err(HyperliquidError::Payload),
+    }
+}
+
+fn normalize_open_order(
+    row: FrontendOrderRow,
+    symbol: &Symbol,
+) -> Result<HyperliquidOpenOrder, HyperliquidError> {
+    let family = validate_frontend_row(&row, false)?;
     let quantity = decimal(&row.orig_sz)?;
     let remaining = decimal(&row.sz)?;
     if quantity <= Decimal::ZERO || remaining <= Decimal::ZERO || remaining > quantity {
@@ -711,17 +949,17 @@ fn normalize_open_order(
     let filled_quantity = quantity
         .checked_sub(remaining)
         .ok_or(HyperliquidError::Payload)?;
-    let order_id = match row.oid {
-        serde_json::Value::Number(value) => value.as_u64().map(|value| value.to_string()),
-        serde_json::Value::String(value) if !value.trim().is_empty() => Some(value),
-        _ => None,
-    }
-    .ok_or(HyperliquidError::Payload)?;
+    let trigger_price = match family {
+        HyperliquidOrderFamily::Regular => None,
+        HyperliquidOrderFamily::Conditional => {
+            Some(Price::new(decimal(&row.trigger_px)?).map_err(|_| HyperliquidError::OrderFamily)?)
+        }
+    };
+    let client_order_id = row.cloid.map(canonical_cloid).transpose()?;
+    let child_order_ids = row.children.iter().map(|child| child.oid).collect();
     let order = Order {
-        order_id,
-        client_order_id: row
-            .cloid
-            .filter(|value| !value.is_empty())
+        order_id: row.oid.to_string(),
+        client_order_id: client_order_id
             .map(FieldState::Known)
             .unwrap_or(FieldState::Missing),
         symbol: symbol.clone(),
@@ -749,6 +987,13 @@ fn normalize_open_order(
     Ok(HyperliquidOpenOrder {
         order,
         exchange_time_ms: row.timestamp,
+        family,
+        native_order_type: row.order_type,
+        time_in_force: row.tif,
+        trigger_price,
+        trigger_condition: row.trigger_condition,
+        is_position_tpsl: row.is_position_tpsl,
+        child_order_ids,
     })
 }
 

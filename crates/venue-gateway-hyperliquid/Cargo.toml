@@ -8,11 +8,14 @@ publish = false
 [dependencies]
 bytes.workspace = true
 futures-util.workspace = true
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 reqwest.workspace = true
+rmp-serde = "1"
 rust_decimal.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha3 = "0.10"
 thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
