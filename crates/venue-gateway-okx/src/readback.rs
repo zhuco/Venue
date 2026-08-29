@@ -1399,7 +1399,7 @@ mod tests {
         let mut pages = all_empty_pages(&net_scope)?;
         for raw in &mut pages {
             raw.payload = match raw.surface {
-                OkxPrivateSurface::AccountConfig => br#"{"code":"0","msg":"","data":[{"uid":"fixture-sub-account","mainUid":"fixture-main-account","acctLv":"3","posMode":"net_mode"}]}"#.to_vec(),
+                OkxPrivateSurface::AccountConfig => br#"{"code":"0","msg":"","data":[{"uid":"fixture-sub-account","mainUid":"fixture-main-account","acctLv":"3","posMode":"net_mode","perm":"read_only,trade"}]}"#.to_vec(),
                 OkxPrivateSurface::Positions => br#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","mgnMode":"cross","posSide":"net","pos":"-2","avgPx":"60000","markPx":"59000","uTime":"1899999999000"}]}"#.to_vec(),
                 _ => continue,
             };

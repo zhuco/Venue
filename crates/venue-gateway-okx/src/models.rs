@@ -54,6 +54,7 @@ pub struct AccountConfigRow {
     pub main_uid: String,
     pub acct_lv: String,
     pub pos_mode: String,
+    pub perm: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]

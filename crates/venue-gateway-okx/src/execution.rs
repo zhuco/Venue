@@ -570,6 +570,22 @@ fn validate_http_response(
 pub enum OkxOrderReadbackAnchor {
     PlaceAck,
     CancelAck,
+    CancelDispatch,
+}
+
+impl OkxCancelRequest {
+    fn matches_accepted(&self, accepted: &OkxAcceptedOrder) -> bool {
+        self.scope == accepted.scope
+            && self.order_id == accepted.order_id
+            && self.client_order_id == accepted.client_order_id
+    }
+}
+
+impl OkxPlaceRequest {
+    #[must_use]
+    pub const fn is_reduce_once(&self) -> bool {
+        self.reduce_only && matches!(self.purpose, OrderPurpose::ExposureTakeProfit)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -590,6 +606,7 @@ pub struct OkxUnknownOrderReadbackRequest {
     scope: OkxExecutionScope,
     request_path: String,
     expected: OkxPlaceRequest,
+    not_before_ms: u64,
 }
 
 impl OkxPrivateRequest for OkxUnknownOrderReadbackRequest {
@@ -615,6 +632,36 @@ pub struct OkxUnknownOrderReadback {
     pub payload_sha256: String,
     pub raw_payload: Vec<u8>,
     pub order: OkxTimedOrder,
+}
+
+/// Read-only convergence request retained when a cancel dispatch has no trustworthy ACK.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OkxUnknownCancelReadbackRequest {
+    scope: OkxExecutionScope,
+    request_path: String,
+    expected: OkxAcceptedOrder,
+    not_before_ms: u64,
+}
+
+impl OkxPrivateRequest for OkxUnknownCancelReadbackRequest {
+    fn scope(&self) -> &OkxExecutionScope {
+        &self.scope
+    }
+    fn method(&self) -> &'static str {
+        GET
+    }
+    fn request_path(&self) -> &str {
+        &self.request_path
+    }
+    fn body(&self) -> &[u8] {
+        &[]
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OkxUnknownCancelResolution {
+    Terminal(OkxOrderReadback),
+    StillUnknown(OkxOrderReadback),
 }
 
 impl OkxPrivateRequest for OkxOrderReadbackRequest {
@@ -691,6 +738,16 @@ pub fn build_unknown_order_readback_request(
     profile: &OkxAccountProfile,
     submitted: &OkxPlaceRequest,
 ) -> Result<OkxUnknownOrderReadbackRequest, OkxError> {
+    build_unknown_order_readback_request_after(config, instrument, profile, submitted, 0)
+}
+
+pub fn build_unknown_order_readback_request_after(
+    config: &OkxConfig,
+    instrument: &OkxInstrument,
+    profile: &OkxAccountProfile,
+    submitted: &OkxPlaceRequest,
+    not_before_ms: u64,
+) -> Result<OkxUnknownOrderReadbackRequest, OkxError> {
     submitted.scope.validate(config, instrument, profile)?;
     validate_client_order_id(&submitted.client_order_id)?;
     Ok(OkxUnknownOrderReadbackRequest {
@@ -702,6 +759,36 @@ pub fn build_unknown_order_readback_request(
             submitted.client_order_id
         ),
         expected: submitted.clone(),
+        not_before_ms,
+    })
+}
+
+pub fn build_unknown_cancel_readback_request(
+    config: &OkxConfig,
+    instrument: &OkxInstrument,
+    profile: &OkxAccountProfile,
+    submitted: &OkxCancelRequest,
+    accepted: &OkxAcceptedOrder,
+    not_before_ms: u64,
+) -> Result<OkxUnknownCancelReadbackRequest, OkxError> {
+    accepted.scope.validate(config, instrument, profile)?;
+    if !submitted.matches_accepted(accepted) {
+        return Err(OkxError::Identity);
+    }
+    validate_order_id(&accepted.order_id)?;
+    if not_before_ms == 0 {
+        return Err(OkxError::Sequence);
+    }
+    Ok(OkxUnknownCancelReadbackRequest {
+        scope: accepted.scope.clone(),
+        request_path: format!(
+            "{}?instId={}&ordId={}",
+            endpoints::PLACE_ORDER,
+            instrument.native_id(),
+            accepted.order_id
+        ),
+        expected: accepted.clone(),
+        not_before_ms,
     })
 }
 
@@ -766,6 +853,9 @@ pub fn parse_unknown_order_readback(
     request: &OkxUnknownOrderReadbackRequest,
 ) -> Result<OkxUnknownOrderReadback, OkxError> {
     validate_http_response(&response, &request.scope)?;
+    if response.received_at_ms < request.not_before_ms {
+        return Err(OkxError::Sequence);
+    }
     let order = parse_bound_order_detail(
         &response.body,
         &request.scope,
@@ -791,6 +881,50 @@ pub fn parse_unknown_order_readback(
         raw_payload: response.body.to_vec(),
         order,
     })
+}
+
+pub fn parse_unknown_cancel_readback(
+    response: OkxHttpResponse,
+    request: &OkxUnknownCancelReadbackRequest,
+) -> Result<OkxUnknownCancelResolution, OkxError> {
+    validate_http_response(&response, &request.scope)?;
+    if response.received_at_ms < request.not_before_ms {
+        return Err(OkxError::Sequence);
+    }
+    let order = parse_bound_order_detail(
+        &response.body,
+        &request.scope,
+        Some(&request.expected.order_id),
+        &request.expected.client_order_id,
+        request.expected.side,
+        request.expected.position_side,
+        request.expected.quantity,
+        request.expected.contracts,
+        request.expected.limit_price,
+        request.expected.purpose,
+        request.expected.reduce_only,
+        request.expected.order_type,
+    )?;
+    if order.update_time_ms > response.received_at_ms {
+        return Err(OkxError::Sequence);
+    }
+    let readback = OkxOrderReadback {
+        scope: request.scope.clone(),
+        anchor: OkxOrderReadbackAnchor::CancelDispatch,
+        request_path: request.request_path.clone(),
+        received_at_ms: response.received_at_ms,
+        payload_sha256: crate::readback::payload_digest(&response.body),
+        raw_payload: response.body.to_vec(),
+        order,
+    };
+    if matches!(
+        readback.order.order.state,
+        OrderState::Cancelled | OrderState::Filled | OrderState::Expired | OrderState::Rejected
+    ) {
+        Ok(OkxUnknownCancelResolution::Terminal(readback))
+    } else {
+        Ok(OkxUnknownCancelResolution::StillUnknown(readback))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1092,6 +1226,33 @@ mod tests {
         assert_eq!(unknown.order.order.order_id, "7003");
         assert_eq!(unknown.raw_payload, ORDER_DETAIL);
         assert_eq!(unknown.payload_sha256.len(), 64);
+
+        let cancel_unknown = build_unknown_cancel_readback_request(
+            &config,
+            &instrument,
+            &profile,
+            &cancel,
+            &accepted,
+            1_787_911_200_450,
+        )?;
+        assert_eq!(cancel_unknown.method(), "GET");
+        let resolved = parse_unknown_cancel_readback(
+            response(&config, &instrument, 1_787_911_200_600, ORDER_DETAIL),
+            &cancel_unknown,
+        )?;
+        assert!(matches!(
+            resolved,
+            OkxUnknownCancelResolution::Terminal(ref value)
+                if value.anchor == OkxOrderReadbackAnchor::CancelDispatch
+                    && value.order.order.state == OrderState::Cancelled
+        ));
+        assert_eq!(
+            parse_unknown_cancel_readback(
+                response(&config, &instrument, 1_787_911_200_440, ORDER_DETAIL),
+                &cancel_unknown,
+            ),
+            Err(OkxError::Sequence)
+        );
         Ok(())
     }
 
@@ -1154,7 +1315,7 @@ mod tests {
             Err(OkxError::Binding)
         );
         let net_profile = crate::parse_account_profile(
-            br#"{"code":"0","msg":"","data":[{"uid":"fixture-sub-account","mainUid":"fixture-main-account","acctLv":"3","posMode":"net_mode"}]}"#,
+            br#"{"code":"0","msg":"","data":[{"uid":"fixture-sub-account","mainUid":"fixture-main-account","acctLv":"3","posMode":"net_mode","perm":"read_only,trade"}]}"#,
             OkxPositionMode::Net,
         )?;
         assert_eq!(

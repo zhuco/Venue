@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use rust_decimal::Decimal;
 use venue_domain::domain::{
     AccountBalance, Amount, Asset, FieldState, Fill, Order, OrderPurpose, OrderSide, OrderState,
@@ -21,6 +23,14 @@ pub struct OkxAccountProfile {
     main_uid: String,
     level: OkxAccountLevel,
     position_mode: OkxPositionMode,
+    permissions: BTreeSet<OkxApiPermission>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum OkxApiPermission {
+    ReadOnly,
+    Trade,
+    Withdraw,
 }
 
 impl OkxAccountProfile {
@@ -42,6 +52,21 @@ impl OkxAccountProfile {
     #[must_use]
     pub const fn position_mode(&self) -> OkxPositionMode {
         self.position_mode
+    }
+
+    #[must_use]
+    pub fn can_read(&self) -> bool {
+        self.permissions.contains(&OkxApiPermission::ReadOnly)
+    }
+
+    #[must_use]
+    pub fn can_trade(&self) -> bool {
+        self.permissions.contains(&OkxApiPermission::Trade)
+    }
+
+    #[must_use]
+    pub fn can_withdraw(&self) -> bool {
+        self.permissions.contains(&OkxApiPermission::Withdraw)
     }
 
     pub(crate) const fn supports_trade_mode(&self, trade_mode: OkxTradeMode) -> bool {
@@ -118,12 +143,33 @@ pub fn parse_account_profile(
     {
         return Err(OkxError::PositionMode);
     }
+    let permissions = parse_permissions(&row.perm)?;
     Ok(OkxAccountProfile {
         uid: row.uid.clone(),
         main_uid: row.main_uid.clone(),
         level,
         position_mode,
+        permissions,
     })
+}
+
+fn parse_permissions(value: &str) -> Result<BTreeSet<OkxApiPermission>, OkxError> {
+    let mut permissions = BTreeSet::new();
+    for raw in value.split(',') {
+        let permission = match raw {
+            "read_only" => OkxApiPermission::ReadOnly,
+            "trade" => OkxApiPermission::Trade,
+            "withdraw" => OkxApiPermission::Withdraw,
+            _ => return Err(OkxError::Payload),
+        };
+        if !permissions.insert(permission) {
+            return Err(OkxError::Payload);
+        }
+    }
+    if !permissions.contains(&OkxApiPermission::ReadOnly) {
+        return Err(OkxError::Payload);
+    }
+    Ok(permissions)
 }
 
 fn account_uid(value: &str) -> bool {
@@ -508,6 +554,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (config, instrument, profile) = scope()?;
         assert_eq!(profile.level(), OkxAccountLevel::MultiCurrencyMargin);
+        assert!(profile.can_read());
+        assert!(profile.can_trade());
+        assert!(!profile.can_withdraw());
         let balance = parse_balance(BALANCE, &config, &profile)?;
         assert_eq!(balance.balance.wallet_balance, Decimal::new(20_000, 0));
         assert_eq!(balance.update_time_ms, 1_787_911_200_300);

@@ -1,4 +1,5 @@
 mod binding;
+mod capability;
 mod config;
 mod credentials;
 mod execution;
@@ -14,20 +15,28 @@ use venue_domain::domain::{FieldState, Fill};
 use venue_gateway_api::CapabilityFlags;
 
 pub use binding::{OkxGatewayBinding, OkxGatewayBindingError};
+pub use capability::{
+    OKX_CAPABILITY_PROBE_SCHEMA_VERSION, OkxCapabilityCandidate, OkxCapabilityProbeEvidence,
+    OkxCapabilityProbeScope, OkxMutationProbeEvidence, OkxPrivateStreamProbeEvidence,
+    OkxPrivateStreamProbeFrame, OkxProbeHttpResponse, PersistedOkxCapabilityProbe,
+    load_capability_probe, persist_capability_probe, validate_capability_candidate,
+};
 pub use config::{OkxConfig, endpoints};
 pub use credentials::OkxCredentials;
 pub use execution::{
     OkxAcceptedCancel, OkxAcceptedOrder, OkxCancelRequest, OkxExecutionScope, OkxOrderReadback,
     OkxOrderReadbackAnchor, OkxOrderReadbackRequest, OkxPlaceIntent, OkxPlaceRequest,
-    OkxPrivateRequest, OkxTradeMode, OkxUnknownOrderReadback, OkxUnknownOrderReadbackRequest,
-    build_cancel_order_readback_request, build_cancel_request, build_order_readback_request,
-    build_place_request, build_unknown_order_readback_request, parse_cancel_ack,
-    parse_order_detail, parse_place_ack, parse_unknown_order_readback,
+    OkxPrivateRequest, OkxTradeMode, OkxUnknownCancelReadbackRequest, OkxUnknownCancelResolution,
+    OkxUnknownOrderReadback, OkxUnknownOrderReadbackRequest, build_cancel_order_readback_request,
+    build_cancel_request, build_order_readback_request, build_place_request,
+    build_unknown_cancel_readback_request, build_unknown_order_readback_request,
+    build_unknown_order_readback_request_after, parse_cancel_ack, parse_order_detail,
+    parse_place_ack, parse_unknown_cancel_readback, parse_unknown_order_readback,
 };
 pub use private::{
-    OkxAccountLevel, OkxAccountProfile, OkxPage, OkxPageState, OkxTimedBalance, OkxTimedOrder,
-    OkxTimedPosition, parse_account_profile, parse_balance, parse_fills_page, parse_orders_page,
-    parse_positions,
+    OkxAccountLevel, OkxAccountProfile, OkxApiPermission, OkxPage, OkxPageState, OkxTimedBalance,
+    OkxTimedOrder, OkxTimedPosition, parse_account_profile, parse_balance, parse_fills_page,
+    parse_orders_page, parse_positions,
 };
 pub use private_ws::{
     OkxAccountSnapshotState, OkxActivePrivateSubscription, OkxEventWindow,
@@ -48,8 +57,8 @@ pub use readback::{
 };
 pub use sign::{SignedHeaders, request_path, sign};
 pub use transport::{
-    OkxHttpResponse, OkxHttpTransport, OkxPrivateWsTransport, OkxReceivedPrivateFrame,
-    OkxTransportError,
+    OkxCancelOnceOutcome, OkxHttpResponse, OkxHttpTransport, OkxPlaceOnceOutcome,
+    OkxPrivateWsTransport, OkxReceivedPrivateFrame, OkxTransportError,
 };
 
 /// No account capability is advertised until authenticated readback, private stream, writer,
@@ -94,6 +103,10 @@ pub enum OkxError {
     Precision,
     #[error("OKX mutation or readback identity is invalid or ambiguous")]
     Identity,
+    #[error("OKX capability probe evidence is incomplete, stale, or invalid")]
+    Capability,
+    #[error("OKX capability probe evidence could not be persisted or recovered")]
+    Persistence,
 }
 
 #[cfg(test)]
