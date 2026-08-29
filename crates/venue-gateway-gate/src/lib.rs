@@ -1,21 +1,30 @@
 //! Gate.io gateway protocol boundary.
 //!
-//! This crate contains deterministic Gate.io protocol behavior and immutable gateway identity
-//! validation. It has no HTTP/WebSocket transport, capability issuer, writer, WAL, or mutation
-//! authority.
+//! This crate contains deterministic Gate.io protocol behavior, bounded async transport, and
+//! immutable TEST/LIVE request binding. It deliberately has no capability issuer, writer, WAL,
+//! owner registry, retry loop, or mutation authority: a safe host must supply those controls.
 
 mod config;
 mod credentials;
 pub mod endpoints;
+mod execution;
 mod order_families;
 mod orders;
 mod private;
+mod private_surface;
 mod public;
 mod risk;
 mod sign;
+mod transport;
 
 pub use config::{GateConfig, GateProductScope};
 pub use credentials::GateCredentials;
+pub use execution::{
+    GateAcceptedMutation, GateCancelIntent, GateDispatchUnknown, GateExactOrderReadback,
+    GateExactReadbackRequest, GateExecutionError, GateMutationKind, GateMutationSettlement,
+    GatePreparedMutation, GateSettlementFinality, prepare_cancel, prepare_limit_post_only,
+    prepare_reduce_once, settle_exact_readback,
+};
 pub use order_families::{
     GATE_STAGE7_ORDER_PROFILE_VERSION, GateStage7OrderFamilyCandidate, GateStage7OrderFamilyError,
     GateStage7OrderFamilyEvidence, GateStage7OrderFamilyScope, GateStage7UnsupportedEvidence,
@@ -27,6 +36,11 @@ pub use orders::{
     collect_regular_order_pages, parse_fill_record, parse_regular_order,
 };
 pub use private::{GatePrivatePayloadError, optional_price, parse_account_balance, parse_position};
+pub use private_surface::{
+    GateFillsCursor, GatePreparedPrivateRead, GatePrivateReadError, GatePrivateReadSource,
+    GatePrivateReadbackCandidate, GateRawPrivateResponse, prepare_private_read,
+    validate_private_readback,
+};
 pub use public::*;
 pub use risk::{
     GateContractRules, GateRiskAccountMode, GateRiskError, GateRiskReadback, decimal,
@@ -39,6 +53,10 @@ pub use sign::{
     sign_websocket_subscription,
 };
 use thiserror::Error;
+pub use transport::{
+    GateHttpTransport, GateMutationDispatch, GatePrivateWsFrame, GatePrivateWsTransport,
+    GateTransportError, GateTransportLimits, connect_private_ws,
+};
 use venue_gateway_api::{GatewayApiError, GatewayBinding, VenueId};
 
 /// A validated Gate.io identity. Holding this value grants no read or mutation capability.
@@ -59,6 +77,24 @@ impl GateGatewayBinding {
     #[must_use]
     pub const fn gateway_binding(&self) -> &GatewayBinding {
         &self.0
+    }
+
+    #[must_use]
+    pub const fn config(&self) -> GateConfig {
+        GateConfig::for_mode(self.0.mode)
+    }
+
+    pub(crate) fn validate_request_binding(
+        &self,
+        candidate: &GatewayBinding,
+    ) -> Result<(), GateGatewayBindingError> {
+        candidate
+            .validate()
+            .map_err(GateGatewayBindingError::Gateway)?;
+        if candidate != &self.0 {
+            return Err(GateGatewayBindingError::Venue);
+        }
+        Ok(())
     }
 }
 

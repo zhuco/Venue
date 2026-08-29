@@ -14,9 +14,10 @@ pub const FUTURES_ACCOUNT: &str = "/futures/usdt/accounts";
 pub const UNIFIED_ACCOUNT: &str = "/unified/accounts";
 pub const FUTURES_DUAL_MODE: &str = "/futures/usdt/dual_mode";
 pub const POSITIONS: &str = "/futures/usdt/positions";
+pub const DUAL_POSITIONS_PREFIX: &str = "/futures/usdt/dual_comp/positions";
 pub const FUTURES_ORDER: &str = "/futures/usdt/orders";
 pub const FUTURES_OPEN_ORDERS: &str = "/futures/usdt/orders";
-pub const FUTURES_FILLS: &str = "/futures/usdt/my_trades_timerange";
+pub const FUTURES_FILLS: &str = "/futures/usdt/my_trades";
 
 pub(crate) fn canonical_rest_path(endpoint: &str) -> Result<String, GateProtocolError> {
     if !endpoint.starts_with('/')
