@@ -1,4 +1,11 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use venue_control_protocol::{
     ACCOUNT_DELIVERY_SCHEMA_VERSION, AccountDeliveryBinding, AccountDeliveryClaim,
@@ -9,8 +16,10 @@ use venue_control_protocol::{
 use venue_domain::Symbol;
 
 use super::{
-    ClaimAcceptance, ControlDeliveryError, ControlDeliveryInbox, ControlDeliveryJournal,
-    ControlDeliveryJournalError, ControlDeliveryJournalRecord, DurableStoreResult,
+    ClaimAcceptance, ControlDeliveryDriver, ControlDeliveryError, ControlDeliveryInbox,
+    ControlDeliveryJournal, ControlDeliveryJournalError, ControlDeliveryJournalRecord,
+    ControlDeliveryWork, ControlHttpClient, ControlHttpClientConfig, ControlHttpClientError,
+    DurableStoreResult, OpaqueControlDeliveryJournal,
 };
 
 const ACCOUNT: &str = "00000000-0000-4000-8000-000000000032";
@@ -284,6 +293,203 @@ fn first_claim_and_scope_are_exactly_fenced() -> Result<(), Box<dyn std::error::
         Err(ControlDeliveryError::FailedClosed)
     ));
     Ok(())
+}
+
+#[test]
+fn opaque_storage_recovers_incomplete_tail_and_fences_a_stale_writer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("control-delivery.jsonl");
+    let mut first = ControlDeliveryInbox::recover(
+        OpaqueControlDeliveryJournal::open(&path)?,
+        binding()?,
+        NODE,
+    )?;
+    let mut stale = ControlDeliveryInbox::recover(
+        OpaqueControlDeliveryJournal::open(&path)?,
+        binding()?,
+        NODE,
+    )?;
+    first.accept_claim(claim(1, 100, 200, AccountDeliveryPurpose::Install)?, 110)?;
+    assert!(matches!(
+        stale.accept_claim(claim(1, 100, 200, AccountDeliveryPurpose::Install)?, 110),
+        Err(ControlDeliveryError::Journal(
+            ControlDeliveryJournalError::SequenceConflict
+        ))
+    ));
+    drop(first);
+    drop(stale);
+
+    let mut file = OpenOptions::new().append(true).open(&path)?;
+    file.write_all(b"{\"incomplete\"")?;
+    file.sync_data()?;
+    drop(file);
+
+    let recovered = ControlDeliveryInbox::recover(
+        OpaqueControlDeliveryJournal::open(&path)?,
+        binding()?,
+        NODE,
+    )?;
+    assert_eq!(recovered.pending_acknowledgements(150).len(), 1);
+    assert!(std::fs::read(&path)?.ends_with(b"\n"));
+    Ok(())
+}
+
+#[test]
+fn control_http_client_requires_exact_loopback_and_bounded_timeouts() {
+    for rejected in [
+        "http://localhost:8080/",
+        "https://127.0.0.1:8080/",
+        "http://127.0.0.1/",
+        "http://127.0.0.1:8080/control",
+        "http://127.0.0.1:8080/?token=secret",
+    ] {
+        assert!(matches!(
+            ControlHttpClient::new(ControlHttpClientConfig::local(rejected)),
+            Err(ControlHttpClientError::InvalidConfig)
+        ));
+    }
+    let mut timeout = ControlHttpClientConfig::local("http://127.0.0.1:8080/");
+    timeout.request_timeout = Duration::from_secs(11);
+    assert!(matches!(
+        ControlHttpClient::new(timeout),
+        Err(ControlHttpClientError::InvalidConfig)
+    ));
+}
+
+#[tokio::test]
+async fn polling_driver_orders_claim_durable_ack_actor_and_receipt()
+-> Result<(), Box<dyn std::error::Error>> {
+    let install = claim(1, 100, 1_100, AccountDeliveryPurpose::Install)?;
+    let claim_body = serde_json::to_vec(&vec![install])?;
+    let (base_url, server) = spawn_control_server(claim_body, 3).await?;
+    let client = ControlHttpClient::new(ControlHttpClientConfig::local(base_url))?;
+    let journal = MemoryJournal::default();
+    let inbox = new_inbox(journal.clone())?;
+    let mut driver = ControlDeliveryDriver::new(client, inbox, 1_000, 1)?;
+
+    let mut work = driver.poll(110).await?;
+    assert_eq!(journal.len()?, 3);
+    assert_eq!(work.len(), 1);
+    let actor = match work.pop() {
+        Some(ControlDeliveryWork::Actor(turn)) => turn,
+        Some(ControlDeliveryWork::Reconcile(_)) => {
+            return Err("install claim became reconciliation".into());
+        }
+        None => return Err("actor work missing".into()),
+    };
+    assert!(!driver.grants_gateway_capability());
+    assert!(!driver.grants_writer_lease());
+    assert!(!driver.grants_wal_authority());
+    assert!(!driver.grants_dispatch_permit());
+    driver
+        .submit_actor_completion(actor.applied(130, digest(4), "actor durable")?, 140)
+        .await?;
+    assert_eq!(journal.len()?, 5);
+
+    let paths = server.await??;
+    assert_eq!(
+        paths,
+        vec![
+            "/v2/account-node/deliveries/claim",
+            "/v2/account-node/deliveries/ack",
+            "/v2/account-node/deliveries/receipts"
+        ]
+    );
+    Ok(())
+}
+
+async fn spawn_control_server(
+    claim_body: Vec<u8>,
+    requests: usize,
+) -> Result<
+    (
+        String,
+        tokio::task::JoinHandle<Result<Vec<String>, std::io::Error>>,
+    ),
+    std::io::Error,
+> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let mut paths = Vec::new();
+        for index in 0..requests {
+            let (mut stream, _) = listener.accept().await?;
+            let (path, request_body) = read_http_request(&mut stream).await?;
+            let response_body = if index == 0 {
+                claim_body.clone()
+            } else {
+                request_body
+            };
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            );
+            stream.write_all(headers.as_bytes()).await?;
+            stream.write_all(&response_body).await?;
+            stream.shutdown().await?;
+            paths.push(path);
+        }
+        Ok(paths)
+    });
+    Ok((format!("http://{address}/"), server))
+}
+
+async fn read_http_request(
+    stream: &mut tokio::net::TcpStream,
+) -> Result<(String, Vec<u8>), std::io::Error> {
+    const MAX_TEST_REQUEST: usize = 128 * 1024;
+    let mut encoded = Vec::new();
+    let header_end = loop {
+        if let Some(index) = encoded.windows(4).position(|window| window == b"\r\n\r\n") {
+            break index + 4;
+        }
+        if encoded.len() >= MAX_TEST_REQUEST {
+            return Err(std::io::Error::other("test request exceeds bound"));
+        }
+        let mut chunk = [0_u8; 4_096];
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Err(std::io::Error::other("test request ended before headers"));
+        }
+        encoded.extend_from_slice(&chunk[..read]);
+    };
+    let headers = std::str::from_utf8(&encoded[..header_end])
+        .map_err(|_| std::io::Error::other("test request headers are not UTF-8"))?;
+    let mut lines = headers.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| std::io::Error::other("test request line missing"))?;
+    let path = request_line
+        .split_ascii_whitespace()
+        .nth(1)
+        .ok_or_else(|| std::io::Error::other("test request path missing"))?
+        .to_owned();
+    let content_length = lines
+        .find_map(|line| {
+            line.split_once(':').and_then(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+        })
+        .ok_or_else(|| std::io::Error::other("test content length missing"))?;
+    let total = header_end
+        .checked_add(content_length)
+        .ok_or_else(|| std::io::Error::other("test request length overflow"))?;
+    if total > MAX_TEST_REQUEST {
+        return Err(std::io::Error::other("test request exceeds bound"));
+    }
+    while encoded.len() < total {
+        let remaining = total - encoded.len();
+        let mut chunk = vec![0_u8; remaining.min(4_096)];
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Err(std::io::Error::other("test request body ended early"));
+        }
+        encoded.extend_from_slice(&chunk[..read]);
+    }
+    Ok((path, encoded[header_end..total].to_vec()))
 }
 
 fn new_inbox(

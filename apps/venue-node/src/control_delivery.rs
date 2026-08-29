@@ -668,6 +668,53 @@ impl<J: ControlDeliveryJournal> ControlDeliveryInbox<J> {
             .collect()
     }
 
+    pub fn pending_actor_turns(
+        &self,
+        now_ms: u64,
+    ) -> Result<Vec<ActorDeliveryTurn>, ControlDeliveryError> {
+        self.require_open()?;
+        let mut turns = Vec::new();
+        for delivery in self.projection.deliveries.values() {
+            let Some((&epoch, accepted)) = delivery.claims.last_key_value() else {
+                continue;
+            };
+            if accepted.claim.lease.purpose == AccountDeliveryPurpose::Install
+                && delivery.ack_confirmed.contains_key(&epoch)
+                && !delivery.receipts.contains_key(&epoch)
+            {
+                validate_lease_time(&accepted.claim.lease, now_ms)?;
+                turns.push(ActorDeliveryTurn {
+                    claim: accepted.claim.clone(),
+                    durable_inbox_digest: accepted.durable_inbox_digest,
+                });
+            }
+        }
+        Ok(turns)
+    }
+
+    pub fn pending_reconciliation_turns(
+        &self,
+        now_ms: u64,
+    ) -> Result<Vec<ReconciliationTurn>, ControlDeliveryError> {
+        self.require_open()?;
+        let mut turns = Vec::new();
+        for delivery in self.projection.deliveries.values() {
+            let Some((&epoch, accepted)) = delivery.claims.last_key_value() else {
+                continue;
+            };
+            if accepted.claim.lease.purpose == AccountDeliveryPurpose::ReconcileOnly
+                && !delivery.receipts.contains_key(&epoch)
+            {
+                validate_lease_time(&accepted.claim.lease, now_ms)?;
+                turns.push(ReconciliationTurn {
+                    claim: accepted.claim.clone(),
+                    durable_inbox_digest: accepted.durable_inbox_digest,
+                });
+            }
+        }
+        Ok(turns)
+    }
+
     fn record_completion(
         &mut self,
         claim: &AccountDeliveryClaim,
