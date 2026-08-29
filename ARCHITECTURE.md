@@ -91,6 +91,11 @@ crates/
 六个节点 binary 必须各自只链接一个交易所 adapter。构建验收继续扫描生产 endpoint，拒绝把其他 adapter 链接进
 固定节点。`legacy` 只是有退出条件的迁移隔离区，不允许新增功能。
 
+当前 `apps/venue-node` 已建立上述六个固定产物和逐 feature 二进制隔离门禁。Binance、Gate.io、Bitget 仅在显式
+`LIVE` 下委托既有 Stage 7 安全闭环；其 `TEST` 不能重定向到生产 client。Bybit、OKX、Hyperliquid 目前只完成
+secret-free scope、adapter endpoint 选择及隔离 artifact root，且在 Owner、WAL、唯一账户 fence、签名 readback、
+UNKNOWN、Stop/Flatten 和人工 Canary 证据接入前无条件失败关闭，不读取凭证、联网或创建工件。
+
 ## 5. 依赖方向
 
 以下 `A -> B` 表示 A 依赖 B：
@@ -204,9 +209,9 @@ Copy planner/job-consumer lease 只允许竞争数据库 job 的规划或投递�
 | Binance | `venue-gateway-binance` | 已迁入 Portfolio Margin binding、TEST/LIVE 端点、secrecy 凭证、PAPI HMAC、exchangeInfo instrument rules、公共 BBO/深度/成交/闭合 bar raw envelope、账户/仓位/订单/成交/风险纯协议和七日有界成交分页；根签名 readback、transport 与 Stage 7 capability/WAL/writer 仍是生产权威 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
 | Bitget | `venue-gateway-bitget` | 已迁入 UTA TEST Demo/LIVE、凭证与 REST/WS 签名、公共市场、带时效 instrument metadata、账户/设置/持仓/normal 订单/成交同 attempt 五面候选与 raw 重放；不从官方未提供的字段猜 contract value；签名 transport/WS 与 Stage 7 capability/WAL/writer 仍留根 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
 | Gate.io | `venue-gateway-gate` | 已迁入 USDT perpetual TEST/LIVE、凭证/REST/WS 签名、公共市场、账户/持仓/风险、regular 订单/成交闭合分页；Stage 7 profile 候选重放 regular raw pages，并只把 Conditional/Algo 表示为显式 unsupported；签名采集 transport 与 Stage 7 capability/WAL/writer 仍留根 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
-| Bybit | `venue-gateway-bybit` | 公共/私有协议与 place/cancel/reduce、ACK、闭合读回已绑定；async HTTP/私有 WS 禁 redirect，并具超时/2 MiB 级限额、分配前 WS 限额、ACK 前有界缓存、received-at、应用层心跳与 generation；writer/WAL/capability 为空 | `TEST | LIVE`；只有 transport，不得小额实盘 mutation |
-| OKX | `venue-gateway-okx` | linear SWAP 公私协议、execution 与 orders/account/positions 私流已绑定；async HTTP/私有 WS 具同样的 redirect、超时、限长、缓存、心跳和 generation 边界；tdMode 只接受 Cross/Isolated、Net 意图拒绝，writer/WAL/capability 为空 | `TEST | LIVE`；只有 transport，不得小额实盘 mutation |
-| Hyperliquid | `venue-gateway-hyperliquid` | `/info`、恢复查询与 orderUpdates/userFills/userEvents 已绑定；async HTTP/双私有 WS 具限时限长、ACK 前缓存、received-at、心跳、generation 与跨频道 fill 去重；`tid` 不是 sequence；EIP-712 action signing、writer/WAL/capability 为空 | `TEST | LIVE`；无 action signing，不能 mutation |
+| Bybit | `venue-gateway-bybit` | 公共/私有协议与 place/cancel/reduce、ACK、闭合读回已绑定；async HTTP/私有 WS 禁 redirect，并具超时/2 MiB 级限额、分配前 WS 限额、ACK 前有界缓存、received-at、应用层心跳与 generation；固定 node binary 已建立，但 writer/WAL/capability 为空 | `TEST | LIVE`；节点在完整安全闭环接入前失败关闭，不得小额实盘 mutation |
+| OKX | `venue-gateway-okx` | linear SWAP 公私协议、execution 与 orders/account/positions 私流已绑定；async HTTP/私有 WS 具同样的 redirect、超时、限长、缓存、心跳和 generation 边界；tdMode 只接受 Cross/Isolated、Net 意图拒绝；固定 node binary 已建立，但 writer/WAL/capability 为空 | `TEST | LIVE`；节点在完整安全闭环接入前失败关闭，不得小额实盘 mutation |
+| Hyperliquid | `venue-gateway-hyperliquid` | `/info`、恢复查询与 orderUpdates/userFills/userEvents 已绑定；async HTTP/双私有 WS 具限时限长、ACK 前缓存、received-at、心跳、generation 与跨频道 fill 去重；`tid` 不是 sequence；固定 node binary 已建立，EIP-712 action signing、writer/WAL/capability 仍为空 | `TEST | LIVE`；节点在完整安全闭环接入前失败关闭，不能 mutation |
 
 KOL 网关只是协议 fixture 和差异对照来源，不继承其运行开关或实盘准入状态。前三所的生产权威继续来自 Venue 已验收实现。
 
@@ -347,7 +352,7 @@ PostgreSQL 不得成为已发物理订单的第二权威 writer。Copy ledger �
 1. **工具链与结构基线**：全 workspace、CI、rustfmt 和 clippy 锁定 Rust 1.98.0；建立 workspace、依赖检查和现有 Binance/Gate/Bitget 固定节点 binary；只移动代码和改引用，不改变行为。
 2. **Execution/Runtime 收拢**：`venue-execution` 先承载不改格式的通用 command journal、writer lease 与账户 canonical-root fence；`venue-runtime` 先承载 authority、account lane、account kernel 与 Strategy Actor，再迁入 grid/scalping/shared/legacy；根 facade 保持既有 Stage 7 API 与全部行为测试。
 3. **Gateway API**：提取统一契约，先接回 Venue 的 Binance/Gate/Bitget；逐项导入 KOL fixture 做差异测试。
-4. **新增三所最小闭环**：Bybit、OKX、Hyperliquid 各自增加固定 binary 和显式 `TEST | LIVE` 配置；完成该所最小 LIVE 安全闭环后即可对单账户、单交易对小额调试，无需等待 Copy 或策略全量迁移；同一修改同步配置枚举、`AGENTS.md` 和 `CODEMAP.md`。
+4. **新增三所最小闭环**：Bybit、OKX、Hyperliquid 的固定 binary 和显式 `TEST | LIVE` scope 已建立，但当前仍停在不可写的失败关闭边界；逐所接入并验收 Owner、WAL、唯一账户 fence、签名 readback、UNKNOWN、Stop/Flatten 与人工 Canary 后，才可对单账户、单交易对小额调试，无需等待 Copy 或策略全量迁移；同一修改同步配置枚举、`AGENTS.md` 和 `CODEMAP.md`。
 5. **Copy TEST**：迁移 KOL 目标敞口、outbox/inbox、observer 和账本，使用离线 fixture 或网关 `TEST` 验证；不引入 Shadow 网关模式。
 6. **指标与 UI**：迁入 VenuePulse 五层算法和查询/控制型 VenueFlow，再开放有审计的高风险控制命令。
 7. **逐所扩大 LIVE**：在第 4 步小额实盘调试基础上，按一个精确账户、一个精确 writer、一个交易所依次完成 Copy 产品 Canary 和接管；新增三所不得并行扩大。
