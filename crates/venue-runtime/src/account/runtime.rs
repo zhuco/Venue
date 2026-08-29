@@ -13,9 +13,10 @@ use crate::{
             AccountFault, AccountHealth, AccountKey, AccountReconcilerError,
             AccountReconciliationReport, AccountRecoverySnapshot, DesiredOrderSets, FlattenPlan,
             InstanceLifecycle, MarketHub, MarketHubError, PersistedOrderRouteAppendReceipt,
-            PrivateRouteReport, PrivateRouter, PrivateRouterError, ReconcileScope,
-            RecoveredShutdownMode, RegistryError, SignedOpenOrders, SignedStopProof, StopPlan,
-            StrategyBinding, StrategyInstanceKey, StrategyRegistry, reconcile_open_orders,
+            PhysicalRecoveryAuthorityRoots, PhysicalRecoveryReadbackManifest, PrivateRouteReport,
+            PrivateRouter, PrivateRouterError, ReconcileScope, RecoveredShutdownMode,
+            RegistryError, SignedOpenOrders, SignedStopProof, StopPlan, StrategyBinding,
+            StrategyInstanceKey, StrategyRegistry, reconcile_open_orders,
         },
         strategy::{
             AccountMarketEvent, PersistedPrivateFact, StrategyActorHost, StrategyControl,
@@ -23,6 +24,13 @@ use crate::{
         },
     },
 };
+
+#[cfg(test)]
+use crate::runtime::account::{
+    PhysicalReadbackReceipt, PhysicalReadbackSurface, PhysicalRecoveryScope,
+};
+#[cfg(test)]
+use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
 
 #[derive(Debug)]
 pub struct AccountRuntime {
@@ -55,6 +63,12 @@ pub struct AccountRuntime {
     owner_index_tail_sequence: u64,
     owner_index_record_count: u64,
     durable_recovery_complete: bool,
+    physical_authority_roots: Option<PhysicalRecoveryAuthorityRoots>,
+    physical_private_generation_floor: u64,
+    pending_physical_recovery: Option<PhysicalRecoveryReadbackManifest>,
+    admitted_physical_recovery: Option<PhysicalRecoveryReadbackManifest>,
+    #[cfg(test)]
+    automatic_physical_recovery_fixture: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +145,12 @@ impl AccountRuntime {
             owner_index_tail_sequence: 0,
             owner_index_record_count: 0,
             durable_recovery_complete: false,
+            physical_authority_roots: None,
+            physical_private_generation_floor: 0,
+            pending_physical_recovery: None,
+            admitted_physical_recovery: None,
+            #[cfg(test)]
+            automatic_physical_recovery_fixture: true,
             capability_evidence,
             account,
             health: AccountHealth::Starting,
@@ -169,6 +189,192 @@ impl AccountRuntime {
     #[must_use]
     pub const fn connection_generation(&self) -> u64 {
         self.connection_generation
+    }
+
+    /// Returns the exact recovered Owner, WAL, and Unknown projection roots that a physical
+    /// readback scope must bind. These digests are evidence anchors only and grant no I/O or
+    /// mutation authority.
+    #[must_use]
+    pub const fn physical_recovery_authority_roots(
+        &self,
+    ) -> Option<&PhysicalRecoveryAuthorityRoots> {
+        self.physical_authority_roots.as_ref()
+    }
+
+    #[must_use]
+    pub const fn physical_recovery_private_generation_floor(&self) -> u64 {
+        self.physical_private_generation_floor
+    }
+
+    /// Installs one complete in-memory physical readback for the next connection generation.
+    /// The manifest is consumed exactly once by `mark_account_ready` and is never persisted.
+    pub fn install_physical_recovery_manifest(
+        &mut self,
+        manifest: PhysicalRecoveryReadbackManifest,
+    ) -> Result<(), AccountRuntimeError> {
+        if !self.durable_recovery_complete {
+            return Err(AccountRuntimeError::DurableRecoveryRequired);
+        }
+        if self.pending_physical_recovery.is_some() {
+            return Err(AccountRuntimeError::PhysicalRecoveryAlreadyInstalled);
+        }
+        self.validate_physical_recovery_manifest(&manifest)?;
+        self.pending_physical_recovery = Some(manifest);
+        Ok(())
+    }
+
+    fn validate_physical_recovery_manifest(
+        &self,
+        manifest: &PhysicalRecoveryReadbackManifest,
+    ) -> Result<(), AccountRuntimeError> {
+        let expected_connection_generation = self
+            .connection_generation
+            .checked_add(1)
+            .ok_or(AccountRuntimeError::ConnectionGenerationExhausted)?;
+        let scope = manifest.scope();
+        let binding = scope.binding();
+        let roots_match = self
+            .physical_authority_roots
+            .as_ref()
+            .is_some_and(|expected| expected == scope.authority_roots());
+        let account_matches = binding.venue.as_str() == self.account.exchange.as_str()
+            && binding.trading_account_id == self.account.account;
+        #[cfg(test)]
+        let account_matches = account_matches || self.automatic_physical_recovery_fixture;
+        let configuration_matches = match self.registry.binding_by_symbol(&binding.symbol) {
+            Some(strategy) => {
+                strategy.config_digest == scope.config_digest()
+                    && self
+                        .registry
+                        .registration(&strategy.key)
+                        .is_some_and(|registration| {
+                            registration.config_epoch == scope.config_epoch()
+                        })
+            }
+            None => self.registry.registrations().next().is_none(),
+        };
+        if !roots_match
+            || !account_matches
+            || !configuration_matches
+            || scope.connection_generation() != expected_connection_generation
+            || scope.recovered_private_generation() != self.physical_private_generation_floor
+            || manifest.private_generation() <= self.physical_private_generation_floor
+        {
+            return Err(AccountRuntimeError::PhysicalRecoveryScopeMismatch);
+        }
+        Ok(())
+    }
+
+    fn physical_turn_authorized(&self) -> bool {
+        let current_admitted = self
+            .admitted_physical_recovery
+            .as_ref()
+            .is_some_and(|manifest| {
+                manifest.scope().connection_generation() == self.connection_generation
+            });
+        let recovery_staged = self
+            .pending_physical_recovery
+            .as_ref()
+            .is_some_and(|manifest| {
+                self.connection_generation.checked_add(1)
+                    == Some(manifest.scope().connection_generation())
+            });
+        current_admitted || recovery_staged
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disable_automatic_physical_recovery_fixture(&mut self) {
+        self.automatic_physical_recovery_fixture = false;
+    }
+
+    #[cfg(test)]
+    fn install_automatic_physical_recovery_fixture(&mut self) -> Result<(), AccountRuntimeError> {
+        if !self.automatic_physical_recovery_fixture
+            || !self.durable_recovery_complete
+            || self.pending_physical_recovery.is_some()
+        {
+            return Ok(());
+        }
+        let connection_generation = self
+            .connection_generation
+            .checked_add(1)
+            .ok_or(AccountRuntimeError::ConnectionGenerationExhausted)?;
+        let private_generation = self
+            .physical_private_generation_floor
+            .checked_add(1)
+            .ok_or(AccountRuntimeError::PhysicalRecoveryScopeMismatch)?;
+        let (symbol, config_digest, config_epoch) =
+            if let Some(registration) = self.registry.registrations().next() {
+                (
+                    registration.binding.key.symbol.clone(),
+                    registration.binding.config_digest.clone(),
+                    registration.config_epoch,
+                )
+            } else {
+                (
+                    "BTC/USDT"
+                        .parse()
+                        .map_err(|_| AccountRuntimeError::PhysicalRecoveryScopeMismatch)?,
+                    "empty_account".to_owned(),
+                    1,
+                )
+            };
+        let venue = match self.account.exchange {
+            crate::domain::ExchangeId::Binance => VenueId::Binance,
+            crate::domain::ExchangeId::Gate => VenueId::Gate,
+            crate::domain::ExchangeId::Bitget => VenueId::Bitget,
+            crate::domain::ExchangeId::Bybit => VenueId::Bybit,
+            crate::domain::ExchangeId::Hyperliquid => VenueId::Hyperliquid,
+            crate::domain::ExchangeId::Okx => VenueId::Okx,
+        };
+        let roots = self
+            .physical_authority_roots
+            .clone()
+            .ok_or(AccountRuntimeError::PhysicalRecoveryRequired)?;
+        let scope = PhysicalRecoveryScope::verified(
+            GatewayBinding::new(
+                venue,
+                GatewayMode::Test,
+                "00000000-0000-4000-8000-000000000001",
+                symbol,
+            )
+            .map_err(|_| AccountRuntimeError::PhysicalRecoveryScopeMismatch)?,
+            config_digest,
+            config_epoch,
+            connection_generation,
+            self.physical_private_generation_floor,
+            roots,
+        )
+        .map_err(|_| AccountRuntimeError::PhysicalRecoveryScopeMismatch)?;
+        let surfaces = [
+            PhysicalReadbackSurface::Account,
+            PhysicalReadbackSurface::Positions,
+            PhysicalReadbackSurface::UmOrder,
+            PhysicalReadbackSurface::UmConditional,
+            PhysicalReadbackSurface::UmAlgo,
+            PhysicalReadbackSurface::FillsCursor,
+        ];
+        let receipts = surfaces
+            .into_iter()
+            .enumerate()
+            .map(|(index, surface)| {
+                let seed = u8::try_from(index).unwrap_or(u8::MAX).saturating_add(1);
+                PhysicalReadbackReceipt::verified_complete(
+                    &scope,
+                    surface,
+                    connection_generation,
+                    private_generation,
+                    [seed; 32],
+                    0,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| AccountRuntimeError::PhysicalRecoveryScopeMismatch)?;
+        self.pending_physical_recovery = Some(
+            PhysicalRecoveryReadbackManifest::verified(scope, receipts)
+                .map_err(|_| AccountRuntimeError::PhysicalRecoveryScopeMismatch)?,
+        );
+        Ok(())
     }
 
     #[must_use]
@@ -278,12 +484,14 @@ impl AccountRuntime {
             pending_private_batches,
             routes,
             unresolved_mutations,
+            physical_authority_roots,
         ) = snapshot.into_parts();
         if account != self.account {
             return Err(AccountRuntimeError::RecoveryAccountMismatch);
         }
         let next_state_revision = self.next_strategy_state_revision()?;
         let recovered_private_sequence = applied_private_cursor.sequence();
+        let recovered_private_generation = applied_private_cursor.generation();
         if strategy_states.len() != self.registry.registrations().count()
             || (!pending_private_batches.is_empty() && last_connection_generation == 0)
             || unresolved_mutations.iter().any(|request| {
@@ -448,6 +656,10 @@ impl AccountRuntime {
         self.owner_index_root = Some(journal_roots.owner_index());
         self.owner_index_tail_sequence = journal_roots.owner_index_tail_sequence();
         self.owner_index_record_count = journal_roots.owner_index_record_count();
+        self.physical_authority_roots = Some(physical_authority_roots);
+        self.physical_private_generation_floor = recovered_private_generation;
+        self.pending_physical_recovery = None;
+        self.admitted_physical_recovery = None;
         self.strategy_state_revision = next_state_revision;
         self.durable_recovery_complete = true;
         self.advance_applied_private_cursor();
@@ -458,6 +670,14 @@ impl AccountRuntime {
         if !self.durable_recovery_complete {
             return Err(AccountRuntimeError::DurableRecoveryRequired);
         }
+        #[cfg(test)]
+        self.install_automatic_physical_recovery_fixture()?;
+        let manifest = self
+            .pending_physical_recovery
+            .as_ref()
+            .cloned()
+            .ok_or(AccountRuntimeError::PhysicalRecoveryRequired)?;
+        self.validate_physical_recovery_manifest(&manifest)?;
         if self.execution_lane.has_in_flight() {
             return Err(AccountRuntimeError::ReconnectWithInFlight);
         }
@@ -507,6 +727,9 @@ impl AccountRuntime {
         self.last_instance_flat.clear();
         self.health = AccountHealth::Ready;
         self.fault = None;
+        self.pending_physical_recovery = None;
+        self.physical_private_generation_floor = manifest.private_generation();
+        self.admitted_physical_recovery = Some(manifest);
         Ok(recovering)
     }
 
@@ -596,11 +819,22 @@ impl AccountRuntime {
             .private_route_revision
             .checked_add(1)
             .ok_or(AccountRuntimeError::PrivateApplicationState)?;
+        let current_roots = self
+            .physical_authority_roots
+            .as_ref()
+            .ok_or(AccountRuntimeError::PhysicalRecoveryRequired)?;
+        let next_physical_roots = PhysicalRecoveryAuthorityRoots::verified(
+            next_root,
+            *current_roots.wal(),
+            *current_roots.unknown(),
+        )
+        .map_err(|_| AccountRuntimeError::PhysicalRecoveryScopeMismatch)?;
         self.private_router = next_router;
         self.private_route_revision = next_revision;
         self.owner_index_root = Some(next_root);
         self.owner_index_tail_sequence = append_sequence;
         self.owner_index_record_count = next_record_count;
+        self.physical_authority_roots = Some(next_physical_roots);
         Ok(())
     }
 
@@ -1036,6 +1270,13 @@ impl AccountRuntime {
         &mut self,
         key: &StrategyInstanceKey,
     ) -> Result<Option<StrategyTurn>, AccountRuntimeError> {
+        #[cfg(test)]
+        if !self.physical_turn_authorized() {
+            self.install_automatic_physical_recovery_fixture()?;
+        }
+        if !self.physical_turn_authorized() {
+            return Err(AccountRuntimeError::PhysicalRecoveryRequired);
+        }
         if self.active_turns.contains_key(key) {
             return Err(AccountRuntimeError::StrategyTurnActive);
         }
@@ -1574,6 +1815,12 @@ pub enum AccountRuntimeError {
     ResidualPositionCustody,
     #[error("durable account recovery must be installed before private connectivity becomes ready")]
     DurableRecoveryRequired,
+    #[error("a complete physical recovery readback manifest is required for the next connection")]
+    PhysicalRecoveryRequired,
+    #[error("a physical recovery manifest is already staged for the next connection")]
+    PhysicalRecoveryAlreadyInstalled,
+    #[error("physical recovery binding, generation, configuration, or authority roots drifted")]
+    PhysicalRecoveryScopeMismatch,
     #[error("durable account recovery was already installed or startup already advanced")]
     DurableRecoveryAlreadyInstalled,
     #[error("durable recovery snapshot belongs to another exchange account")]

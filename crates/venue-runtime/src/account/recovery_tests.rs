@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, error::Error};
 
 use rust_decimal::Decimal;
+use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
 
 use super::tests::{
     EvidenceFixture, account, binding, establish_empty_signed_orders, owner, place_request,
@@ -36,6 +37,56 @@ fn recovery_roots() -> Result<RecoveryJournalRoots, Box<dyn Error>> {
 
 fn empty_private_cursor() -> Result<RecoveredPrivateCursor, Box<dyn Error>> {
     Ok(RecoveredPrivateCursor::verified(0, 0, None)?)
+}
+
+fn physical_manifest(
+    runtime: &AccountRuntime,
+    binding: GatewayBinding,
+    roots: PhysicalRecoveryAuthorityRoots,
+    connection_generation: u64,
+    recovered_private_generation: u64,
+    private_generation: u64,
+) -> Result<PhysicalRecoveryReadbackManifest, Box<dyn Error>> {
+    let registration = runtime
+        .registry()
+        .binding_by_symbol(&binding.symbol)
+        .ok_or("physical recovery strategy binding missing")?;
+    let config_epoch = runtime
+        .registry()
+        .registration(&registration.key)
+        .ok_or("physical recovery registration missing")?
+        .config_epoch;
+    let scope = PhysicalRecoveryScope::verified(
+        binding,
+        registration.config_digest.clone(),
+        config_epoch,
+        connection_generation,
+        recovered_private_generation,
+        roots,
+    )?;
+    let surfaces = [
+        PhysicalReadbackSurface::Account,
+        PhysicalReadbackSurface::Positions,
+        PhysicalReadbackSurface::UmOrder,
+        PhysicalReadbackSurface::UmConditional,
+        PhysicalReadbackSurface::UmAlgo,
+        PhysicalReadbackSurface::FillsCursor,
+    ];
+    let receipts = surfaces
+        .into_iter()
+        .enumerate()
+        .map(|(index, surface)| {
+            PhysicalReadbackReceipt::verified_complete(
+                &scope,
+                surface,
+                71,
+                private_generation,
+                [u8::try_from(index).unwrap_or(u8::MAX).saturating_add(1); 32],
+                0,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PhysicalRecoveryReadbackManifest::verified(scope, receipts)?)
 }
 
 #[allow(
@@ -193,6 +244,99 @@ fn startup_requires_durable_recovery_and_restores_unknown_fence() -> Result<(), 
             reason: crate::execution::AccountReplanReason::ProvenAbsent,
             ..
         }
+    ));
+    Ok(())
+}
+
+#[test]
+fn physical_manifest_gates_startup_connection_generation_and_actor_turns()
+-> Result<(), Box<dyn Error>> {
+    let account = AccountKey::new(ExchangeId::Binance, "00000000-0000-4000-8000-000000000101")?;
+    let key = StrategyInstanceKey::new(
+        account.clone(),
+        StrategyKind::HedgedGrid,
+        "grid_btc",
+        "BTC/USDT".parse()?,
+    )?;
+    let grid = StrategyBinding::new(key, "run_1", "config_1")?;
+    let mut runtime = AccountRuntime::new(account.clone());
+    runtime.disable_automatic_physical_recovery_fixture();
+    runtime.register_strategy(grid.clone())?;
+    runtime.restore_durable_state(recovery_snapshot(
+        account.clone(),
+        recovery_roots()?,
+        0,
+        empty_private_cursor()?,
+        vec![RecoveredStrategyState::verified(
+            grid.clone(),
+            1,
+            InstanceLifecycle::Registered,
+            None,
+        )?],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )?)?;
+    runtime.request_pause(&grid.key)?;
+
+    assert!(matches!(
+        runtime.mark_account_ready(),
+        Err(AccountRuntimeError::PhysicalRecoveryRequired)
+    ));
+    assert!(matches!(
+        runtime.pop_strategy_input(&grid.key),
+        Err(AccountRuntimeError::PhysicalRecoveryRequired)
+    ));
+    assert_eq!(runtime.health(), AccountHealth::Starting);
+    assert_eq!(runtime.connection_generation(), 0);
+
+    let gateway_binding = GatewayBinding::new(
+        VenueId::Binance,
+        GatewayMode::Live,
+        account.account.clone(),
+        grid.key.symbol.clone(),
+    )?;
+    let expected_roots = runtime
+        .physical_recovery_authority_roots()
+        .cloned()
+        .ok_or("physical recovery roots missing")?;
+    let drifted_roots = PhysicalRecoveryAuthorityRoots::verified(
+        [0x99; 32],
+        *expected_roots.wal(),
+        *expected_roots.unknown(),
+    )?;
+    let drifted = physical_manifest(&runtime, gateway_binding.clone(), drifted_roots, 1, 0, 1)?;
+    assert!(matches!(
+        runtime.install_physical_recovery_manifest(drifted),
+        Err(AccountRuntimeError::PhysicalRecoveryScopeMismatch)
+    ));
+    assert!(matches!(
+        runtime.mark_account_ready(),
+        Err(AccountRuntimeError::PhysicalRecoveryRequired)
+    ));
+
+    let manifest = physical_manifest(
+        &runtime,
+        gateway_binding.clone(),
+        expected_roots.clone(),
+        1,
+        0,
+        1,
+    )?;
+    runtime.install_physical_recovery_manifest(manifest)?;
+    runtime.mark_account_ready()?;
+    assert_eq!(runtime.health(), AccountHealth::Ready);
+    assert_eq!(runtime.connection_generation(), 1);
+
+    assert!(matches!(
+        runtime.mark_account_ready(),
+        Err(AccountRuntimeError::PhysicalRecoveryRequired)
+    ));
+    assert_eq!(runtime.connection_generation(), 1);
+    let stale_floor = physical_manifest(&runtime, gateway_binding, expected_roots, 2, 0, 2)?;
+    assert!(matches!(
+        runtime.install_physical_recovery_manifest(stale_floor),
+        Err(AccountRuntimeError::PhysicalRecoveryScopeMismatch)
     ));
     Ok(())
 }
