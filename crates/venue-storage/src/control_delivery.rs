@@ -1,11 +1,10 @@
-use std::{
-    fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
-};
-
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::{
+    StorageError,
+    journal::{DurableJsonl, JsonlSnapshot},
+};
 
 const RECORD_SCHEMA_VERSION: u16 = 1;
 const FIRST_RECORD_HASH: [u8; 32] = [0; 32];
@@ -41,21 +40,20 @@ struct Replay {
 /// crossed `sync_data`.
 #[derive(Debug)]
 pub struct OpaqueJournal {
-    path: PathBuf,
+    jsonl: DurableJsonl,
 }
 
 impl OpaqueJournal {
-    pub fn open(path: impl Into<PathBuf>) -> Result<Self, OpaqueJournalError> {
-        let path = path.into();
-        let journal = Self { path };
-        journal.with_locked_file(|file| replay_and_repair(file, &journal.path).map(|_| ()))?;
+    pub fn open(path: impl Into<std::path::PathBuf>) -> Result<Self, OpaqueJournalError> {
+        let journal = Self {
+            jsonl: DurableJsonl::new(path),
+        };
+        journal.jsonl.recover(true, replay)?;
         Ok(journal)
     }
 
     pub fn recover(&mut self) -> Result<Vec<OpaqueJournalRecord>, OpaqueJournalError> {
-        self.with_locked_file(|file| {
-            replay_and_repair(file, &self.path).map(|replay| replay.records)
-        })
+        Ok(self.jsonl.recover(true, replay)?.records)
     }
 
     pub fn append(
@@ -66,8 +64,8 @@ impl OpaqueJournal {
         if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(OpaqueJournalError::RecordTooLarge);
         }
-        self.with_locked_file(|file| {
-            let replay = replay_and_repair(file, &self.path)?;
+        self.jsonl.append(|snapshot| {
+            let replay = replay(snapshot)?;
             if replay.next_sequence != expected_sequence {
                 return Err(OpaqueJournalError::SequenceConflict {
                     expected: expected_sequence,
@@ -85,83 +83,16 @@ impl OpaqueJournal {
                 payload: payload.to_vec(),
             };
             let encoded = serde_json::to_vec(&stored).map_err(OpaqueJournalError::Encode)?;
-            file.seek(SeekFrom::End(0))
-                .and_then(|_| file.write_all(&encoded))
-                .and_then(|()| file.write_all(b"\n"))
-                .and_then(|()| file.sync_data())
-                .map_err(|source| OpaqueJournalError::Io {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            Ok(expected_sequence)
+            Ok((expected_sequence, encoded))
         })
     }
-
-    fn with_locked_file<T>(
-        &self,
-        operation: impl FnOnce(&mut File) -> Result<T, OpaqueJournalError>,
-    ) -> Result<T, OpaqueJournalError> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&self.path)
-            .map_err(|source| OpaqueJournalError::Io {
-                path: self.path.clone(),
-                source,
-            })?;
-        file.try_lock().map_err(|source| OpaqueJournalError::Lock {
-            path: self.path.clone(),
-            source: source.into(),
-        })?;
-        operation(&mut file)
-    }
 }
 
-fn replay_and_repair(file: &mut File, path: &Path) -> Result<Replay, OpaqueJournalError> {
-    file.seek(SeekFrom::Start(0))
-        .map_err(|source| OpaqueJournalError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|source| OpaqueJournalError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let complete_length = bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
-    if complete_length != bytes.len() {
-        let durable_length =
-            u64::try_from(complete_length).map_err(|_| OpaqueJournalError::SequenceExhausted)?;
-        file.set_len(durable_length)
-            .and_then(|()| file.sync_data())
-            .map_err(|source| OpaqueJournalError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        bytes.truncate(complete_length);
-    }
-    replay_complete_lines(&bytes)
-}
-
-fn replay_complete_lines(bytes: &[u8]) -> Result<Replay, OpaqueJournalError> {
+fn replay(snapshot: &JsonlSnapshot) -> Result<Replay, OpaqueJournalError> {
     let mut records = Vec::new();
     let mut next_sequence = 1_u64;
     let mut tail_sha256 = FIRST_RECORD_HASH;
-    let complete = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-    if complete.is_empty() {
-        return Ok(Replay {
-            records,
-            next_sequence,
-            tail_sha256,
-        });
-    }
-    for line in complete.split(|byte| *byte == b'\n') {
+    for line in snapshot.lines() {
         if line.is_empty() {
             return Err(OpaqueJournalError::Corrupt);
         }
@@ -203,16 +134,8 @@ fn stored_record_digest(record: &StoredRecord) -> [u8; 32] {
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpaqueJournalError {
-    #[error("opaque journal I/O failed for {path}: {source}", path = path.display())]
-    Io {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[error("opaque journal lock is held for {path}: {source}", path = path.display())]
-    Lock {
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Storage(#[from] StorageError),
     #[error("opaque journal encoding failed: {0}")]
     Encode(serde_json::Error),
     #[error("opaque journal decoding failed: {0}")]
