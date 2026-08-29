@@ -1,16 +1,18 @@
+use k256::{SecretKey, ecdsa::SigningKey};
 use secrecy::{ExposeSecret, SecretString};
+use sha3::{Digest, Keccak256};
 
 use crate::HyperliquidError;
 
-/// Request-scoped Hyperliquid Agent/API Wallet material. It intentionally has no
-/// `Debug`, `Clone`, serialization, or secret accessor until the signing boundary exists.
+/// Request-scoped Hyperliquid Agent/API Wallet material. It intentionally has no `Debug`,
+/// `Clone`, serialization, or public secret accessor.
 pub struct HyperliquidCredentials {
     master_address: String,
     user_address: String,
     vault_address: Option<String>,
     agent_name: String,
     agent_address: String,
-    _agent_private_key: SecretString,
+    agent_private_key: SecretString,
 }
 
 impl HyperliquidCredentials {
@@ -65,21 +67,28 @@ impl HyperliquidCredentials {
         agent_address: String,
         agent_private_key: SecretString,
     ) -> Result<Self, HyperliquidError> {
-        let vault_valid = vault_address.as_deref().is_none_or(valid_address);
-        let distinct_agent = !agent_address.eq_ignore_ascii_case(&master_address)
-            && !agent_address.eq_ignore_ascii_case(&user_address)
+        let master_address = normalize_address(&master_address)?;
+        let user_address = normalize_address(&user_address)?;
+        let vault_address = vault_address
+            .as_deref()
+            .map(normalize_address)
+            .transpose()?;
+        let agent_address = normalize_address(&agent_address)?;
+        let signing_key = signing_key(agent_private_key.expose_secret())?;
+        let derived_agent_address = address_from_signing_key(&signing_key)?;
+        let expected_user = vault_address.as_deref().unwrap_or(&master_address);
+        let distinct_agent = agent_address != master_address
+            && agent_address != user_address
             && vault_address
-                .as_deref()
-                .is_none_or(|vault| !agent_address.eq_ignore_ascii_case(vault));
-        if !valid_address(&master_address)
-            || !valid_address(&user_address)
-            || !valid_address(&agent_address)
-            || !vault_valid
+                .as_ref()
+                .is_none_or(|vault| vault != &agent_address);
+        if user_address != expected_user
+            || agent_address != derived_agent_address
             || !distinct_agent
             || agent_name.trim().is_empty()
+            || agent_name.trim() != agent_name
             || agent_name.len() > 128
             || agent_name.chars().any(char::is_control)
-            || !valid_private_key(agent_private_key.expose_secret())
         {
             return Err(HyperliquidError::Credentials);
         }
@@ -89,8 +98,28 @@ impl HyperliquidCredentials {
             vault_address,
             agent_name,
             agent_address,
-            _agent_private_key: agent_private_key,
+            agent_private_key,
         })
+    }
+
+    #[must_use]
+    pub fn master_address(&self) -> &str {
+        &self.master_address
+    }
+
+    #[must_use]
+    pub fn user_address(&self) -> &str {
+        &self.user_address
+    }
+
+    #[must_use]
+    pub fn vault_address(&self) -> Option<&str> {
+        self.vault_address.as_deref()
+    }
+
+    #[must_use]
+    pub fn agent_name(&self) -> &str {
+        &self.agent_name
     }
 
     #[must_use]
@@ -107,15 +136,89 @@ impl HyperliquidCredentials {
             &self.agent_name,
         )
     }
+
+    pub(crate) fn signing_key(&self) -> Result<SigningKey, HyperliquidError> {
+        signing_key(self.agent_private_key.expose_secret())
+    }
 }
 
 pub(crate) fn valid_address(value: &str) -> bool {
-    value.len() == 42
-        && value.starts_with("0x")
-        && value.as_bytes()[2..].iter().all(u8::is_ascii_hexdigit)
+    address_bytes(value).is_ok()
 }
 
-fn valid_private_key(value: &str) -> bool {
+pub(crate) fn address_bytes(value: &str) -> Result<[u8; 20], HyperliquidError> {
+    let raw = value
+        .strip_prefix("0x")
+        .ok_or(HyperliquidError::Credentials)?;
+    if raw.len() != 40 {
+        return Err(HyperliquidError::Credentials);
+    }
+    let mut decoded = [0_u8; 20];
+    let (pairs, remainder) = raw.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(HyperliquidError::Credentials);
+    }
+    for (index, pair) in pairs.iter().enumerate() {
+        decoded[index] = (hex_nibble(pair[0]).ok_or(HyperliquidError::Credentials)? << 4)
+            | hex_nibble(pair[1]).ok_or(HyperliquidError::Credentials)?;
+    }
+    if decoded == [0; 20] {
+        return Err(HyperliquidError::Credentials);
+    }
+    Ok(decoded)
+}
+
+fn normalize_address(value: &str) -> Result<String, HyperliquidError> {
+    address_bytes(value)?;
+    Ok(value.to_ascii_lowercase())
+}
+
+fn signing_key(value: &str) -> Result<SigningKey, HyperliquidError> {
     let raw = value.strip_prefix("0x").unwrap_or(value);
-    raw.len() == 64 && raw.as_bytes().iter().all(u8::is_ascii_hexdigit)
+    if raw.len() != 64 || !raw.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return Err(HyperliquidError::Credentials);
+    }
+    let mut decoded = [0_u8; 32];
+    let (pairs, remainder) = raw.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(HyperliquidError::Credentials);
+    }
+    for (index, pair) in pairs.iter().enumerate() {
+        decoded[index] = (hex_nibble(pair[0]).ok_or(HyperliquidError::Credentials)? << 4)
+            | hex_nibble(pair[1]).ok_or(HyperliquidError::Credentials)?;
+    }
+    let secret = SecretKey::from_slice(&decoded);
+    decoded.fill(0);
+    let secret = secret.map_err(|_| HyperliquidError::Credentials)?;
+    Ok(SigningKey::from(secret))
+}
+
+fn address_from_signing_key(signing_key: &SigningKey) -> Result<String, HyperliquidError> {
+    let point = signing_key.verifying_key().to_encoded_point(false);
+    let point = point.as_bytes();
+    if point.len() != 65 || point.first() != Some(&4) {
+        return Err(HyperliquidError::Credentials);
+    }
+    let hash = Keccak256::digest(&point[1..]);
+    let mut output = String::with_capacity(42);
+    output.push_str("0x");
+    for byte in &hash[12..] {
+        push_hex_byte(&mut output, *byte);
+    }
+    Ok(output)
+}
+
+fn push_hex_byte(output: &mut String, value: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    output.push(char::from(HEX[usize::from(value >> 4)]));
+    output.push(char::from(HEX[usize::from(value & 0x0f)]));
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }

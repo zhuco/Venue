@@ -13,9 +13,9 @@ use tokio_tungstenite::{
 };
 
 use crate::{
-    HyperliquidConfig, HyperliquidError, HyperliquidInfoRequest, HyperliquidPrivateStreamBinding,
-    HyperliquidPrivateStreamDecoder, HyperliquidPrivateSubscriptionKind, HyperliquidReadBinding,
-    build_private_subscription,
+    HyperliquidConfig, HyperliquidError, HyperliquidExchangeRequest, HyperliquidInfoRequest,
+    HyperliquidPrivateStreamBinding, HyperliquidPrivateStreamDecoder,
+    HyperliquidPrivateSubscriptionKind, HyperliquidReadBinding, build_private_subscription,
 };
 
 const MAX_TIMEOUT: Duration = Duration::from_secs(60);
@@ -61,6 +61,7 @@ impl HyperliquidHttpTransport {
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .connect_timeout(timeout)
             .timeout(timeout)
             .build()
@@ -101,19 +102,61 @@ impl HyperliquidHttpTransport {
         if request.body().is_empty() || request.body().len() > MAX_REQUEST_BYTES {
             return Err(HyperliquidTransportError::Protocol);
         }
+        self.post_json(
+            expected_binding,
+            request.rest_origin(),
+            request.endpoint(),
+            request.body(),
+        )
+        .await
+    }
+
+    /// Dispatches exactly one already-signed request. The client policy is explicitly `never`, so
+    /// timeout, disconnect, and 5xx results return to the WAL owner as UNKNOWN/rejected evidence
+    /// instead of replaying a nonce behind its back.
+    pub async fn post_exchange(
+        &self,
+        expected_binding: &HyperliquidReadBinding,
+        request: &HyperliquidExchangeRequest,
+    ) -> Result<HyperliquidHttpResponse, HyperliquidTransportError> {
+        let config = HyperliquidConfig::for_binding(expected_binding.gateway());
+        if request.binding() != expected_binding
+            || request.mode() != config.mode()
+            || request.source().mode() != config.mode()
+            || request.rest_origin() != config.rest_origin()
+            || request.endpoint() != "/exchange"
+        {
+            return Err(HyperliquidTransportError::Binding);
+        }
+        if request.body().is_empty() || request.body().len() > MAX_REQUEST_BYTES {
+            return Err(HyperliquidTransportError::Protocol);
+        }
+        self.post_json(
+            expected_binding,
+            request.rest_origin(),
+            request.endpoint(),
+            request.body(),
+        )
+        .await
+    }
+
+    async fn post_json(
+        &self,
+        expected_binding: &HyperliquidReadBinding,
+        rest_origin: &str,
+        endpoint: &str,
+        body_bytes: &[u8],
+    ) -> Result<HyperliquidHttpResponse, HyperliquidTransportError> {
         #[cfg(test)]
-        let origin = self
-            .origin_override
-            .as_deref()
-            .unwrap_or(request.rest_origin());
+        let origin = self.origin_override.as_deref().unwrap_or(rest_origin);
         #[cfg(not(test))]
-        let origin = request.rest_origin();
-        let url = format!("{}{}", origin.trim_end_matches('/'), request.endpoint());
+        let origin = rest_origin;
+        let url = format!("{}{}", origin.trim_end_matches('/'), endpoint);
         let send = self
             .client
             .post(url)
             .header(CONTENT_TYPE, "application/json")
-            .body(request.body().to_vec())
+            .body(body_bytes.to_vec())
             .send();
         let mut response = tokio::time::timeout(self.timeout, send)
             .await
@@ -631,13 +674,22 @@ pub enum HyperliquidTransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        HyperliquidAloOrder, HyperliquidCredentials, HyperliquidGatewayBinding,
+        HyperliquidNonceStore, HyperliquidPerpMeta, NonceCheckpoint, build_alo_place_request,
+        reserve_next_nonce,
+    };
+    use rust_decimal::Decimal;
     use std::io::{Error as IoError, ErrorKind};
     use tokio::{net::TcpListener, task::JoinHandle};
     use tokio_tungstenite::{accept_async, tungstenite::Message};
+    use venue_domain::domain::OrderSide;
     use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
 
     const USER: &str = "0x0000000000000000000000000000000000000001";
     const OTHER_USER: &str = "0x3333333333333333333333333333333333333333";
+    const AGENT: &str = "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a";
+    const AGENT_KEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const PRIVATE_FRAME: &[u8] = br#"{"channel":"orderUpdates","data":[{"order":{"coin":"BTC","side":"B","limitPx":"65000.5","sz":"0.4","oid":101,"timestamp":1700000000000,"origSz":"1.0","cloid":"0x00000000000000000000000000000001"},"status":"open","statusTimestamp":1700000000001}]}"#;
 
     fn read_binding(
@@ -681,6 +733,37 @@ mod tests {
         Ok(HyperliquidPrivateStreamBinding::new(&meta, generation)?)
     }
 
+    fn meta(mode: GatewayMode) -> Result<HyperliquidPerpMeta, Box<dyn std::error::Error>> {
+        let gateway = HyperliquidGatewayBinding::new(GatewayBinding::new(
+            VenueId::Hyperliquid,
+            mode,
+            "00000000-0000-4000-8000-000000000001",
+            "BTC/USDC".parse()?,
+        )?)?;
+        let read = HyperliquidReadBinding::new(gateway, USER)?;
+        Ok(crate::parse_perp_meta(
+            br#"{"universe":[{"name":"BTC","szDecimals":5,"maxLeverage":50}]}"#,
+            &read,
+        )?)
+    }
+
+    #[derive(Default)]
+    struct MemoryNonceStore(Option<NonceCheckpoint>);
+
+    impl HyperliquidNonceStore for MemoryNonceStore {
+        fn load(
+            &mut self,
+            _agent_address: &str,
+        ) -> Result<Option<NonceCheckpoint>, HyperliquidError> {
+            Ok(self.0.clone())
+        }
+
+        fn persist(&mut self, checkpoint: &NonceCheckpoint) -> Result<(), HyperliquidError> {
+            self.0 = Some(checkpoint.clone());
+            Ok(())
+        }
+    }
+
     enum HttpMock {
         Response { status: u16, body: Vec<u8> },
         Delayed(Duration),
@@ -713,6 +796,32 @@ mod tests {
                 HttpMock::Delayed(delay) => tokio::time::sleep(delay).await,
                 HttpMock::Disconnect => {}
             }
+        });
+        Ok((format!("http://{address}"), task))
+    }
+
+    async fn spawn_counting_http_error_mock()
+    -> Result<(String, JoinHandle<usize>), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let task = tokio::spawn(async move {
+            let mut accepted = 0;
+            for _ in 0..2 {
+                let Ok(Ok((stream, _))) =
+                    tokio::time::timeout(Duration::from_millis(300), listener.accept()).await
+                else {
+                    break;
+                };
+                accepted += 1;
+                if read_headers(&stream).await.is_ok() {
+                    let _ = write_all(
+                        &stream,
+                        b"HTTP/1.1 503 ERROR\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                }
+            }
+            accepted
         });
         Ok((format!("http://{address}"), task))
     }
@@ -814,6 +923,36 @@ mod tests {
             Err(HyperliquidTransportError::Http)
         );
         task.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exchange_transport_dispatches_once_without_automatic_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let meta = meta(GatewayMode::Test)?;
+        let credentials =
+            HyperliquidCredentials::from_values(USER, USER, None, "venue-agent", AGENT, AGENT_KEY)?;
+        let mut nonce_store = MemoryNonceStore::default();
+        let nonce = reserve_next_nonce(&mut nonce_store, AGENT, 1_700_000_000_000)?;
+        let order = HyperliquidAloOrder::new(
+            &meta,
+            OrderSide::Buy,
+            Decimal::new(65_000, 0),
+            Decimal::new(1, 1),
+            false,
+            "0x00000000000000000000000000000001",
+        )?;
+        let request = build_alo_place_request(&credentials, nonce, order, None)?;
+        let (origin, server) = spawn_counting_http_error_mock().await?;
+        let transport =
+            HyperliquidHttpTransport::for_test(Duration::from_millis(500), 128, origin)?;
+        assert_eq!(
+            transport
+                .post_exchange(meta.scope.binding(), &request)
+                .await,
+            Err(HyperliquidTransportError::HttpStatus(503))
+        );
+        assert_eq!(server.await?, 1);
         Ok(())
     }
 

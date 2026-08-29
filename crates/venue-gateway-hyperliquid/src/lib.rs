@@ -1,3 +1,4 @@
+mod action;
 mod binding;
 mod config;
 mod credentials;
@@ -9,12 +10,20 @@ mod transport;
 
 use venue_gateway_api::CapabilityFlags;
 
+pub use action::{
+    HyperliquidActionKind, HyperliquidAloOrder, HyperliquidCancel, HyperliquidExchangeOutcome,
+    HyperliquidExchangeRequest, HyperliquidIocReduceOnlyOrder, HyperliquidSource,
+    build_alo_place_request, build_cancel_request, build_ioc_reduce_only_request,
+    parse_exchange_response,
+};
 pub use binding::{
     HyperliquidGatewayBinding, HyperliquidGatewayBindingError, HyperliquidReadBinding,
 };
 pub use config::{HyperliquidConfig, endpoints};
 pub use credentials::HyperliquidCredentials;
-pub use nonce::{NonceCheckpoint, prepare_next_nonce};
+pub use nonce::{
+    HyperliquidNonceStore, NonceCheckpoint, PersistedNonce, prepare_next_nonce, reserve_next_nonce,
+};
 pub use private_stream::{
     HyperliquidFillStream, HyperliquidFillUpdate, HyperliquidOrderUpdate, HyperliquidPrivateEvent,
     HyperliquidPrivateStreamBinding, HyperliquidPrivateStreamDecoder,
@@ -23,13 +32,14 @@ pub use private_stream::{
 pub use protocol::{
     HyperliquidAccountSnapshot, HyperliquidBbo, HyperliquidFill, HyperliquidFillCursor,
     HyperliquidFillPage, HyperliquidFillQuery, HyperliquidInfoRequest, HyperliquidOpenOrder,
-    HyperliquidOpenOrdersSnapshot, HyperliquidOrderLookup, HyperliquidOrderStatus,
-    HyperliquidPayloadScope, HyperliquidPerpMeta, HyperliquidUserFills,
-    build_clearinghouse_state_request, build_l2_book_request, build_meta_request,
-    build_open_orders_request, build_order_status_request, build_user_fills_by_time_request,
-    parse_clearinghouse_snapshot, parse_l2_book_bbo, parse_open_orders_snapshot,
+    HyperliquidOpenOrdersSnapshot, HyperliquidOrderFamily, HyperliquidOrderFamilyCoverage,
+    HyperliquidOrderLookup, HyperliquidOrderStatus, HyperliquidPayloadScope, HyperliquidPerpMeta,
+    HyperliquidUserFills, build_clearinghouse_state_request, build_frontend_open_orders_request,
+    build_l2_book_request, build_meta_request, build_open_orders_request,
+    build_order_status_request, build_user_fills_by_time_request, parse_clearinghouse_snapshot,
+    parse_frontend_open_orders_snapshot, parse_l2_book_bbo, parse_open_orders_snapshot,
     parse_order_status, parse_perp_meta, parse_private_user_fills, parse_user_fills_page,
-    parse_ws_bbo,
+    parse_ws_bbo, validate_frontend_open_orders_snapshot,
 };
 pub use transport::{
     HyperliquidHttpResponse, HyperliquidHttpTransport, HyperliquidPrivateWsTransport,
@@ -53,10 +63,14 @@ pub enum HyperliquidError {
     Payload,
     #[error("Hyperliquid payload does not match the fixed account or instrument binding")]
     Binding,
-    #[error(
-        "Hyperliquid signing and mutation are unavailable until protocol dependencies and safety gates are approved"
-    )]
-    SigningUnavailable,
+    #[error("Hyperliquid action is invalid or outside the narrow execution profile")]
+    Action,
+    #[error("Hyperliquid MessagePack or EIP-712 Agent signing failed")]
+    Signing,
+    #[error("Hyperliquid exchange response is invalid or contradicts the requested action")]
+    Response,
+    #[error("Hyperliquid frontend open-order family evidence is incomplete or inconsistent")]
+    OrderFamily,
 }
 
 #[cfg(test)]
@@ -71,11 +85,13 @@ mod tests {
     const BOOK: &[u8] = include_bytes!("../fixtures/l2-book.json");
     const CLEARINGHOUSE: &[u8] = include_bytes!("../fixtures/clearinghouse-state.json");
     const OPEN_ORDERS: &[u8] = include_bytes!("../fixtures/open-orders.json");
+    const FRONTEND_ORDER_FAMILIES: &[u8] =
+        include_bytes!("../fixtures/frontend-open-orders-family.json");
     const FILLS_PAGE: &[u8] = include_bytes!("../fixtures/fills-page.json");
     const ORDER_STATUS: &[u8] = include_bytes!("../fixtures/order-status.json");
     const PRIVATE_STREAM: &[u8] = include_bytes!("../fixtures/private-stream.json");
     const USER: &str = "0x0000000000000000000000000000000000000001";
-    const AGENT: &str = "0x2222222222222222222222222222222222222222";
+    const AGENT: &str = "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a";
 
     fn binding(
         venue: VenueId,
@@ -175,6 +191,28 @@ mod tests {
             "11".repeat(32),
         );
         assert!(matches!(vault_owner, Err(HyperliquidError::Credentials)));
+        assert!(matches!(
+            HyperliquidCredentials::from_values(
+                USER,
+                USER,
+                None,
+                "venue-agent",
+                AGENT,
+                "12".repeat(32),
+            ),
+            Err(HyperliquidError::Credentials)
+        ));
+        assert!(matches!(
+            HyperliquidCredentials::from_values(
+                "0x0000000000000000000000000000000000000000",
+                "0x0000000000000000000000000000000000000000",
+                None,
+                "venue-agent",
+                AGENT,
+                "11".repeat(32),
+            ),
+            Err(HyperliquidError::Credentials)
+        ));
     }
 
     #[test]
@@ -191,6 +229,29 @@ mod tests {
             Err(HyperliquidError::Nonce)
         );
         Ok(())
+    }
+
+    #[test]
+    fn nonce_reservation_fails_closed_without_durable_readback() {
+        struct NonDurableStore;
+
+        impl HyperliquidNonceStore for NonDurableStore {
+            fn load(
+                &mut self,
+                _agent_address: &str,
+            ) -> Result<Option<NonceCheckpoint>, HyperliquidError> {
+                Ok(None)
+            }
+
+            fn persist(&mut self, _checkpoint: &NonceCheckpoint) -> Result<(), HyperliquidError> {
+                Ok(())
+            }
+        }
+
+        assert_eq!(
+            reserve_next_nonce(&mut NonDurableStore, AGENT, 1_700_000_000_000),
+            Err(HyperliquidError::Nonce)
+        );
     }
 
     #[test]
@@ -230,6 +291,53 @@ mod tests {
         assert_eq!(orders.orders[0].order.state, OrderState::PartiallyFilled);
         assert_eq!(orders.orders[0].order.filled_quantity, Decimal::new(2, 0));
         assert!(orders.orders[0].order.reduce_only);
+        assert_eq!(orders.orders[0].family, HyperliquidOrderFamily::Regular);
+        assert_eq!(
+            orders.algo_coverage,
+            HyperliquidOrderFamilyCoverage::NotCoveredByFrontendOpenOrders
+        );
+        validate_frontend_open_orders_snapshot(&orders, &meta)?;
+        Ok(())
+    }
+
+    #[test]
+    fn frontend_open_orders_replays_regular_and_conditional_without_claiming_algo()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let selected = meta(GatewayMode::Live)?;
+        let snapshot = parse_frontend_open_orders_snapshot(
+            FRONTEND_ORDER_FAMILIES,
+            &selected,
+            1_700_000_000_010,
+        )?;
+        assert_eq!(snapshot.orders.len(), 2);
+        assert_eq!(
+            snapshot
+                .orders
+                .iter()
+                .filter(|order| order.family == HyperliquidOrderFamily::Regular)
+                .count(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .orders
+                .iter()
+                .filter(|order| order.family == HyperliquidOrderFamily::Conditional)
+                .count(),
+            1
+        );
+        assert_eq!(
+            snapshot.algo_coverage,
+            HyperliquidOrderFamilyCoverage::NotCoveredByFrontendOpenOrders
+        );
+        validate_frontend_open_orders_snapshot(&snapshot, &selected)?;
+
+        let mut tampered = snapshot;
+        tampered.orders[0].order.quantity += Decimal::ONE;
+        assert_eq!(
+            validate_frontend_open_orders_snapshot(&tampered, &selected),
+            Err(HyperliquidError::OrderFamily)
+        );
         Ok(())
     }
 
@@ -387,7 +495,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(build_open_orders_request(&test)?.body())?,
-            serde_json::json!({"type":"openOrders","user":USER})
+            serde_json::json!({"type":"frontendOpenOrders","user":USER})
         );
 
         let query =
@@ -476,10 +584,13 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(
+        assert_eq!(
             parse_order_status(br#"{"status":"unknownOid"}"#, &selected, &lookup)?,
-            HyperliquidOrderStatus::Unknown { .. }
-        ));
+            HyperliquidOrderStatus::Unknown {
+                scope: selected.scope.clone(),
+                lookup: lookup.clone(),
+            }
+        );
         assert_eq!(
             parse_order_status(
                 ORDER_STATUS,
