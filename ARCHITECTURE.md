@@ -56,7 +56,7 @@ VenueFlow Desktop / optional Agent
 
 `venue-control` 校验 schema v2 scope，以 PostgreSQL durable inbox/outbox、fencing delivery lease、幂等 claim 和终态 receipt 保存命令，并提供
 仅本地 HTTP/SSE `/v2`。TEST-only Copy worker 可在事务内锁定 leader 事件并持久化纯规划结果、delivery、ledger 与恢复状态；
-节点 ACK 只证明本地 inbox 已耐久，Unknown 只能进入下一序号只读对账。Node 已有注入式 delivery 状态机契约和内存恢复测试，但共享 journal 实现与 HTTP polling 尚未接通。它不能直接提交订单，LIVE Copy 在数据库访问前失败关闭；唤醒通道不能
+节点 ACK 只证明本地 inbox 已耐久，Unknown 只能进入下一序号只读对账。共享 opaque journal 与 Control 侧 bounded polling 路由已存在，但 Node 尚未接 storage adapter 和 HTTP polling client。它不能直接提交订单，LIVE Copy 在数据库访问前失败关闭；唤醒通道不能
 代替耐久记录；节点仍须先持久化本地 Actor inbox，再独立重验 risk、Owner、WAL、writer 和私有事实。
 
 ## 4. 目标 workspace
@@ -82,8 +82,9 @@ crates/
 │  └─ src/{hedged_grid,scalping}/
 ├─ venue-copy/
 ├─ venue-execution/
-│  └─ src/{journal.rs,writer_lease.rs,canonical_root.rs}
+│  └─ src/{journal.rs,writer_lease.rs,canonical_root.rs,owner_routes.rs}
 ├─ venue-storage/
+│  └─ src/{journal.rs,control_delivery.rs,...}
 ├─ venue-runtime/
 │  └─ src/{authority.rs,account_lane.rs,account,strategy,grid,scalping,copy,shared,legacy}/
 └─ venue-control-protocol/
@@ -95,7 +96,7 @@ crates/
 当前 `apps/venue-node` 已建立上述六个固定产物、逐 feature 二进制隔离门禁及 exchange-neutral `safe_host`。安全宿主
 在 root/WAL/Owner/writer metadata 与独立 hash-chain control log 恢复后才允许连接，持久应用 Pause/Resume/Stop/Flatten/Canary，
 并组合一次性 dispatch permit 与 UNKNOWN 读回；它不会自行产生 capability。Binance、Gate.io、Bitget 仅在显式
-`LIVE` 下委托既有 Stage 7 安全闭环；其 `TEST` 不能重定向到生产 client。六所固定 binary 均已在本地封装对应 adapter 的 `PhysicalGateway` 候选和契约测试，六所 adapter 已具备绑定型 async 私有读取与单次 mutation/readback 候选，Bybit、OKX、Hyperliquid 另有可持久化 probe 候选；这些候选未接入 `run()`/启动链，尚缺恢复后完整签名采集、耐久 Owner/native identity、共享 async 驱动、UNKNOWN 查无单证明和 Control-applied capability promotion。它们没有接通 Node 的 capability、WAL、唯一账户 fence、Stop/Flatten 与 Canary 链，所以固定节点仍失败关闭，不读取凭证、联网或创建工件。
+`LIVE` 下委托既有 Stage 7 安全闭环；其 `TEST` 不能重定向到生产 client。六所 adapter 已具备绑定型 async 私有读取与单次 mutation/readback 候选；部分固定 `run()` 只实例化 inert candidate 做隔离/失败关闭预检。共享层现已具备耐久 Owner/native identity、六面物理恢复 manifest、要求 adapter 先验签且不可从持久 claim 反序列化恢复的 `ProvenAbsent` 契约、单 runtime 线性 async 边界与 Control-applied capability promotion 契约；但没有 fixed binary 构造 `TokioPhysicalGateway` 或把候选接入 `NodeSafetyHost`/dispatch，async 边界仍预检原始 capability snapshot。Node 的 capability、WAL、唯一账户 fence、Stop/Flatten 与 Canary 链未闭合，因此新路径继续失败关闭。
 
 ## 5. 依赖方向
 
@@ -261,7 +262,7 @@ bar base volume，并继续绑定 generation/provenance。指标内部允许使�
 当前第一版 `apps/venueflow` 已用同一套 eframe/egui_tiles/WGPU 视图提供原生窗口与 WebAssembly canvas；native client 使用
 Tokio/reqwest/SSE，Web client 使用 reqwest/EventSource。`venue-control-protocol` schema v2 固定 `/v2/ui/snapshot`、
 `/v2/ui/events` 和 `/v2/control/commands` 的 DTO、递归校验、receipt 与错误边界。策略和命令都显式携带 `TEST | LIVE`，两端只显示查询投影并提交语义控制请求；Stop/Flatten
-必须携带精确 mode、account、symbol、instance、config epoch、action 与人工确认。`apps/venue-control` 已提供 schema scope 重验、repository 边界与 PostgreSQL durable inbox/outbox 核心；当前没有 HTTP/SSE server、账户节点 adapter 或交易执行连接。
+必须携带精确 mode、account、symbol、instance、config epoch、action 与人工确认。`apps/venue-control` 已提供本地 HTTP/SSE server、schema scope 重验、PostgreSQL durable inbox/outbox 及 bounded 节点 claim/ACK/receipt 路由；当前没有 Node polling client、Node storage adapter 或交易执行连接。
 
 迁移范围：
 
@@ -312,7 +313,7 @@ PostgreSQL 不得成为已发物理订单的第二权威 writer。Copy ledger �
 | 语言 | Rust 2024；工具链和 workspace `rust-version` 精确锁定 Rust 1.98.0 |
 | 交易 Actor | 顺序状态机、专用 OS thread 或受控 executor、有界 mailbox |
 | 异步 I/O | Tokio；不授予执行顺序或 mutation authority |
-| HTTP/控制 | schema v2、PostgreSQL repository、仅本地 HTTP/SSE `/v2`、TEST-only Copy worker；账户节点 adapter 尚未接入 |
+| HTTP/控制 | schema v2、PostgreSQL repository、仅本地 HTTP/SSE `/v2`、bounded Node polling 路由、TEST-only Copy worker；Node client/storage adapter 尚未接入 |
 | 交易 HTTP/WS | reqwest、tokio-tungstenite 或经等价验收的现有阻塞 transport |
 | 数值 | rust_decimal 处理交易金额；指标内部可用 f64 |
 | 数据库 | PostgreSQL、SQLx、显式 migrations |
@@ -368,6 +369,7 @@ PostgreSQL 不得成为已发物理订单的第二权威 writer。Copy ledger �
 - workspace 依赖图无反向依赖或循环；
 - 新增依赖已证明当前必需，且未引入白名单同用途的第二套直接依赖；
 - 六个节点 binary 只接受 `TEST | LIVE`，交易所及模式之间 endpoint/凭证/binding/artifact isolation；
+- `scripts/verify_gateway_candidate_contract.ps1` 的逐 binary 构建、隔离和零工件失败关闭探针通过；其矩阵中未接线项保持 `not_reached`、`writer_enabled=false`，不能替代实盘准入；
 - 同账户同 symbol 的第二 Owner 被拒绝；
 - Grid、Scalping、Copy 都不能绕过唯一 Execution Lane；
 - Copy UNKNOWN 重启后先查事实且不重复下单；

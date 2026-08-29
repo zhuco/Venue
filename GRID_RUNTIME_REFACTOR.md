@@ -28,12 +28,12 @@
 writer 或物理交易客户端。`legacy_stage7_strategy_binding` 只转换单策略身份，不授予 mutation 能力。配置中的
 `trading_account_id` 是真实账户的稳定规范 UUID，跨 symbol/策略复用；交易所 `account_binding` 只表示产品/模式能力。
 迁移完成前，现有 Stage 7 仍是唯一实盘 writer；不得同时为同一账户启动账户内核的新物理执行路径。
-通用 `CommandJournal`、writer lease 与账户级 canonical-root fence 固定在 `venue-execution`；原 JSONL serde/hash、writer schema、fsync、调用方工件路径及机器级 `stage7_writer_roots/v2` 路径保持不变。append 必须在排他文件锁内核对磁盘长度等于恢复时耐久长度，旧进程、坏尾、空行、hash/状态迁移分叉均失败关闭；writer 恢复拒绝同 revision 的主备分叉，并验证 scope、generation 与 handoff 不变量；Unix 文件替换/创建同步父目录。Stage 7 继续经根 facade 使用同一实现。文件型 checkpoint、facts journal、private evidence、fill cursor 与 Scalping evidence/risk 的耐久实现集中在 `venue-storage`，根 `src/storage` 只保留兼容 facade/宿主扩展。
-六所 adapter 均已补齐绑定型 async HTTP/私有 WS、订单族/持仓/成交证据、单次 mutation 候选及 ACK 后只读收敛；Bybit、OKX、Hyperliquid 另有可持久化 probe 候选。六个固定 binary 已各自封装本地 `PhysicalGateway` 候选与契约测试，但未接入 `run()`/启动链；静态 capability、Node writer 与 WAL 均未因此开启，不能加入网格 mutation 或接管链。
+通用 `CommandJournal`、writer lease 与账户级 canonical-root fence 固定在 `venue-execution`；`DurableOwnerRoutes` 独占并重放同一 CommandJournal，以 family + native identity 生成精确 cancel route，不增加第二本 journal 或 mutation authority。原 JSONL serde/hash、writer schema、fsync、调用方工件路径及机器级 `stage7_writer_roots/v2` 路径保持不变。`venue-storage` 的单一 `DurableJsonl` 同时支撑 facts 与 opaque Control journal，append 在排他锁内核对耐久长度并同步文件/父目录；旧进程、坏尾、空行、hash/状态迁移分叉均失败关闭。Stage 7 继续经根 facade 使用原实现。
+六所 adapter 均已补齐绑定型 async HTTP/私有 WS、订单族/持仓/成交证据、单次 mutation 候选及 ACK 后只读收敛；Bybit、OKX、Hyperliquid 另有可持久化 probe 候选。部分固定 `run()` 只实例化 inert candidate 做隔离/失败关闭预检；没有 fixed binary 构造 `TokioPhysicalGateway` 或把候选接入 `NodeSafetyHost`/dispatch，静态 capability、Node writer 与 WAL 均未因此开启。
 `apps/venue-node` 已提供六个逐 adapter 固定产物：Binance、Gate.io、Bitget 仅在精确 `LIVE` 下委托现有 Stage 7
 部署入口并继续使用原 Owner/WAL/writer/reconciliation/Canary 契约；旧物理 client 不支持 `TEST`，因此对应节点
 明确失败关闭而不回退到生产 endpoint。Bybit、OKX、Hyperliquid 节点只验证 secret-free binding、adapter endpoint、
-凭证环境变量命名空间与隔离 artifact root。`safe_host` 与 `supervision` 在 root/WAL/Owner/writer metadata 和独立 hash-chain control log 恢复后才允许连接，并持久应用 Pause/Resume/Stop/Flatten/Canary、一次性 permit 与 UNKNOWN 禁重投；候选物理桥仍缺恢复后完整签名采集、耐久 Owner/native identity、同步宿主到 async transport 的唯一执行边界、UNKNOWN 查无单证明及 Control-applied capability promotion，因此六所新节点路径继续拒绝启动，不读取凭证、联网或写工件。
+凭证环境变量命名空间与隔离 artifact root。`safe_host` 与 `supervision` 在 root/WAL/Owner/writer metadata 和独立 hash-chain control log 恢复后才允许连接，并持久应用 Pause/Resume/Stop/Flatten/Canary、一次性 permit 与 UNKNOWN 禁重投。共享层现已有耐久 Owner/native identity、绑定 Owner/WAL/Unknown roots 的六面物理恢复 manifest、要求 adapter 先验签且不可从持久 claim 反序列化恢复的 `ProvenAbsent` 契约、单 runtime 线性 async 边界，以及绑定 Control/Owner/WAL/writer/Canary 的不可序列化 host capability token；但这些组件尚未由 adapter/Node 组合，async 边界仍预检原始 snapshot，因此新节点路径继续拒绝启动。
 Stage 7 成交热路径不得遍历历史命令 WAL。命令 journal 在启动重放时建立未决命令、撤单目标和交易所订单 ID 的派生内存索引；滚动补撤批次以原 JSONL 格式一次 fsync 持久化 Prepared/Submitted 状态，再并行提交物理请求。接管只可在签名全订单族为空、零未决且零本地事务后显式按源 SHA 封存已解析 WAL；原件留在同 root，活动 WAL 从空文件继续，禁止运行中轮转或删除审计源。
 
 纯内核启动必须先安装覆盖 lifecycle、config epoch、Stop/Flatten fence、连接代际、已应用私有游标、完整批次
@@ -43,6 +43,9 @@ Actor 每次取件由运行时签发绑定 connection/private/config/turn 的不
 applied receipt 才能更新 Desired Orders、进入 Running 或生成执行意图。命令/native identity 还必须由账户 journal
 分配收据绑定订单族，策略调用方不得自报这些权限。重连、参数变更或更新一代签名对账不会复活未入 WAL 的旧意图；
 已进入 WAL 的 Unknown 必须按原 command、native client identity、订单族和更新连接的完整回读证明收敛，不能直接重发。
+物理恢复的内存值类型/验证器还要求同一 attempt、严格更新的 private generation 完整交付 Account、Positions、三个订单族与
+FillsCursor 六面，并绑定 config 与 Owner/WAL/Unknown roots；空账户也必须显式交付空面。它尚未被 adapter、账户 startup 或
+固定 binary 消费，也不是已持久化的 manifest 工件。
 
 ## 2. 术语
 
@@ -449,7 +452,7 @@ Gate、Bitget 当前 profile 只允许常规订单族，条件/Algo 由同一 pr
 `/v2/ui/snapshot`、`/v2/ui/events`、`/v2/control/commands`。策略投影和命令必须携带精确 `TEST | LIVE`，两端只调用 API，不读取数据库、WAL 或 artifacts，
 不持有凭证，不直连交易所，不直接下单。Stop/Flatten 必须显示并提交精确 mode、account、symbol、instance、config epoch、action 与人工确认；
 `apps/venue-control` 提供 transport-neutral schema 重验、幂等 repository、PostgreSQL durable inbox/outbox/claim/terminal receipt，
-以及仅限本地的 HTTP/SSE `/v2` 适配层；PostgreSQL fencing delivery lease 绑定精确 instance/config epoch，ACK 只表示节点 inbox 已耐久，Unknown 只能由下一序号只读 reconciliation claim 收敛，重复 receipt 必须幂等且冲突失败关闭。Node 侧已建立注入式 delivery 语义状态机，闭合 lease fencing、耐久 ACK 后 Actor apply、Unknown 下一序号只读 claim、幂等冲突与崩溃恢复，但目前只有内存测试，尚未接入共享 journal 的 opaque recover/expected-sequence durable append 实现或 HTTP polling。TEST-only Copy worker 可原子持久化冻结资本、语义 job、delivery/receipt、ledger 与崩溃恢复，但 LIVE 在数据库访问前失败关闭；账户节点仍须按 Actor applied、Execution Lane、risk、Owner、WAL 与 writer 边界重新验证，数据库 lease、claim 或 Control receipt 均不授予 mutation authority。
+以及仅限本地的 HTTP/SSE `/v2` 适配层；bounded Node claim/ACK/receipt 路由和 PostgreSQL fencing delivery lease 均绑定精确 instance/config epoch，ACK 只表示节点 inbox 已耐久，Unknown 只能由下一序号只读 reconciliation claim 收敛，重复 receipt 必须幂等且冲突失败关闭。Node 侧 delivery 状态机已闭合 lease fencing、耐久 ACK 后 Actor apply、Unknown 下一序号只读 claim、幂等冲突与崩溃恢复；`venue-storage::OpaqueJournal` 已提供 opaque recover/expected-sequence durable append，但 Node 的 storage adapter 与 HTTP polling client 尚未实现。TEST-only Copy worker 可原子持久化冻结资本、语义 job、delivery/receipt、ledger 与崩溃恢复，LIVE 在数据库访问前失败关闭；数据库 lease、claim 或 Control receipt 均不授予 mutation authority。
 
 ## 12. 验收标准
 
@@ -469,11 +472,13 @@ cargo test
 - 同账户两个不同 symbol 的策略互不读写状态、互不撤单；
 - 同 symbol 第二策略被拒绝；
 - Unknown 命令重启后先查事实、不重复下单；
+- 点查 404、部分页或普通空页不能证明查无单；只有 adapter 在新代重验完整签名订单族并收集到终端 cursor 才能生成 `ProvenAbsent`。`SignedOrderReadback` 与权威 outcome 不可反序列化，重启必须重验原始签名页；
 - WAL 前候选在 Pause、Stop、私有事实或重连后不能取得旧 permit；已写 WAL 的候选只能由持久 NotDispatched/Unknown/outcome 收敛；
 - 连接断开只暂停受影响账户；
 - Stop 只撤目标实例订单且默认不主动平仓；残仓时保留 symbol custody；
 - 开仓订单全部满足实时最小名义价值；
 - 三个交易所 adapter 通过相同 runtime/reducer 契约测试。
+- `scripts/verify_gateway_candidate_contract.ps1` 通过六个隔离 binary、TEST/LIVE root 和缺证据零工件探针；矩阵中的 `not_reached` 与 `writer_enabled=false` 必须原样保留，不能当作 Canary 或实盘准入。
 - 取证恢复证明原文件不改写、规范序列不重编号、quarantine 无遗漏/重叠、派生前缀 append-only；源文件、manifest、派生前缀、binding/root 或 crash residue 任一变化使全部 Stage 7 入口失败关闭，Shadow 仍为零写。
 
 账户内核自身还必须覆盖：跨策略族的同 symbol 注册失败；已持久私有 Order/Fill 只能按 family + Client Order ID 或
