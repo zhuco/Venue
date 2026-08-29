@@ -39,7 +39,20 @@ pub enum BybitError {
     Rejected,
     #[error("Bybit response does not match the fixed gateway binding")]
     Binding,
+    #[error("Bybit private pagination is incomplete, mixed, or unbounded")]
+    Pagination,
+    #[error("Bybit private history window is invalid or unbounded")]
+    Clock,
+    #[error("Bybit canonical order-family evidence is invalid or incomplete")]
+    OrderFamily,
+    #[error("Bybit normalized private projection does not replay its raw evidence")]
+    Projection,
+    #[error("Bybit API-key or capability candidate evidence is invalid")]
+    Capability,
 }
+
+#[cfg(test)]
+mod private_tests;
 
 #[cfg(test)]
 mod tests {

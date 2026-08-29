@@ -1,0 +1,12 @@
+{
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+    "category": "linear",
+    "nextPageCursor": "",
+    "list": [
+      {"symbol":"BTCUSDT","orderId":"stop-24","orderLinkId":"risk-stop","side":"Sell","positionIdx":1,"orderStatus":"Untriggered","qty":"1","cumExecQty":"0","price":"0","avgPrice":"","reduceOnly":true,"stopOrderType":"Stop","triggerPrice":"55000","closeOnTrigger":true,"createdTime":"1800","updatedTime":"1900"}
+    ]
+  },
+  "time": 2000
+}
