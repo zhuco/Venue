@@ -1,10 +1,10 @@
 use rust_decimal::Decimal;
 
 use crate::domain::{
-    AuthoritativeOrderOutcome, CancelCommand, CommandId, ExecutionCommand, NativeOrderFamily,
-    OrderCommand, OrderOutcomeBinding, OrderOutcomeError, OrderOutcomeStatus, OrderOwner,
-    OrderPurpose, OrderReadbackCoverage, OrderReadbackObservation, OrderSide, OrderState,
-    PositionSide, Price, SignedOrderReadback, Symbol, UnknownOrderContract, UnresolvedOrderReason,
+    CancelCommand, CommandId, ExecutionCommand, NativeOrderFamily, OrderCommand,
+    OrderOutcomeBinding, OrderOutcomeError, OrderOutcomeStatus, OrderOwner, OrderPurpose,
+    OrderReadbackCoverage, OrderReadbackObservation, OrderSide, OrderState, PositionSide, Price,
+    SignedOrderReadback, Symbol, UnknownOrderContract, UnresolvedOrderReason,
 };
 
 fn owner(run_id: &str) -> Result<OrderOwner, Box<dyn std::error::Error>> {
@@ -45,6 +45,14 @@ fn readback(
     observation: OrderReadbackObservation,
 ) -> Result<SignedOrderReadback, OrderOutcomeError> {
     SignedOrderReadback::verified(binding, generation, coverage, observation, [0xA5; 32])
+}
+
+fn complete_coverage(page_count: u32) -> OrderReadbackCoverage {
+    OrderReadbackCoverage::CompleteFamilyCollection {
+        page_count,
+        collection_root_sha256: [0xB6; 32],
+        terminal_cursor_commitment_sha256: [0xC7; 32],
+    }
 }
 
 #[test]
@@ -91,7 +99,7 @@ fn newer_signed_found_rows_classify_open_and_terminal() -> Result<(), Box<dyn st
     let terminal = readback(
         contract.binding().clone(),
         9,
-        OrderReadbackCoverage::CompleteFamilyCollection { page_count: 2 },
+        complete_coverage(2),
         OrderReadbackObservation::Found {
             native_client_id: CommandId::new("client-a")?,
             exchange_order_id: "venue-101".to_owned(),
@@ -141,7 +149,7 @@ fn proven_absent_requires_complete_newer_signed_family_collection()
     let complete_empty = readback(
         contract.binding().clone(),
         8,
-        OrderReadbackCoverage::CompleteFamilyCollection { page_count: 1 },
+        complete_coverage(1),
         OrderReadbackObservation::EmptyCollection,
     )?;
     let outcome = contract.classify(complete_empty);
@@ -158,7 +166,7 @@ fn same_generation_complete_collection_is_not_new_evidence()
     let stale = readback(
         contract.binding().clone(),
         7,
-        OrderReadbackCoverage::CompleteFamilyCollection { page_count: 1 },
+        complete_coverage(1),
         OrderReadbackObservation::EmptyCollection,
     )?;
 
@@ -181,7 +189,7 @@ fn binding_and_native_identity_mismatches_fail_closed() -> Result<(), Box<dyn st
     let wrong_binding = readback(
         other_binding,
         8,
-        OrderReadbackCoverage::CompleteFamilyCollection { page_count: 1 },
+        complete_coverage(1),
         OrderReadbackObservation::EmptyCollection,
     )?;
     let wrong_native_identity = readback(
@@ -213,7 +221,35 @@ fn malformed_signed_envelopes_are_rejected() -> Result<(), Box<dyn std::error::E
         SignedOrderReadback::verified(
             binding.clone(),
             8,
-            OrderReadbackCoverage::CompleteFamilyCollection { page_count: 0 },
+            complete_coverage(0),
+            OrderReadbackObservation::EmptyCollection,
+            [0xA5; 32],
+        ),
+        Err(OrderOutcomeError::InvalidCoverage)
+    );
+    assert_eq!(
+        SignedOrderReadback::verified(
+            binding.clone(),
+            8,
+            OrderReadbackCoverage::CompleteFamilyCollection {
+                page_count: 1,
+                collection_root_sha256: [0; 32],
+                terminal_cursor_commitment_sha256: [0xC7; 32],
+            },
+            OrderReadbackObservation::EmptyCollection,
+            [0xA5; 32],
+        ),
+        Err(OrderOutcomeError::InvalidCoverage)
+    );
+    assert_eq!(
+        SignedOrderReadback::verified(
+            binding.clone(),
+            8,
+            OrderReadbackCoverage::CompleteFamilyCollection {
+                page_count: 1,
+                collection_root_sha256: [0xB6; 32],
+                terminal_cursor_commitment_sha256: [0; 32],
+            },
             OrderReadbackObservation::EmptyCollection,
             [0xA5; 32],
         ),
@@ -233,34 +269,23 @@ fn malformed_signed_envelopes_are_rejected() -> Result<(), Box<dyn std::error::E
 }
 
 #[test]
-fn canonical_outcome_round_trips_for_durable_consumers() -> Result<(), Box<dyn std::error::Error>> {
-    let contract = contract()?;
-    let outcome = contract.classify(readback(
-        contract.binding().clone(),
-        8,
-        OrderReadbackCoverage::CompleteFamilyCollection { page_count: 1 },
-        OrderReadbackObservation::EmptyCollection,
-    )?);
-
-    let encoded = serde_json::to_vec(&outcome)?;
-    let decoded: AuthoritativeOrderOutcome = serde_json::from_slice(&encoded)?;
-    assert_eq!(decoded, outcome);
-    Ok(())
-}
-
-#[test]
-fn durable_consumer_cannot_relabel_an_authoritative_outcome()
+fn tampered_persisted_collection_claim_requires_adapter_revalidation()
 -> Result<(), Box<dyn std::error::Error>> {
     let contract = contract()?;
-    let outcome = contract.classify(readback(
-        contract.binding().clone(),
-        8,
-        OrderReadbackCoverage::CompleteFamilyCollection { page_count: 1 },
-        OrderReadbackObservation::EmptyCollection,
-    )?);
-    let mut encoded = serde_json::to_value(outcome)?;
-    encoded["status"] = serde_json::json!({ "outcome": "open" });
+    let mut persisted_claim = serde_json::to_value(complete_coverage(1))?;
+    persisted_claim["complete_family_collection"]["collection_root_sha256"] =
+        serde_json::to_value(vec![0_u8; 32])?;
+    let untrusted_coverage: OrderReadbackCoverage = serde_json::from_value(persisted_claim)?;
 
-    assert!(serde_json::from_value::<AuthoritativeOrderOutcome>(encoded).is_err());
+    assert_eq!(
+        SignedOrderReadback::verified(
+            contract.binding().clone(),
+            8,
+            untrusted_coverage,
+            OrderReadbackObservation::EmptyCollection,
+            [0xA5; 32],
+        ),
+        Err(OrderOutcomeError::InvalidCoverage)
+    );
     Ok(())
 }

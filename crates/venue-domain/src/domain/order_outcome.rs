@@ -217,7 +217,13 @@ pub enum OrderReadbackCoverage {
     /// One identity lookup. A returned matching order is useful, but a 404 is never absence proof.
     ExactIdentity,
     /// Every page of the bound native order family was signed and collected to its terminal cursor.
-    CompleteFamilyCollection { page_count: u32 },
+    /// The collection root commits the ordered page set; the cursor commitment distinguishes a
+    /// proved terminal cursor from a merely empty intermediate page.
+    CompleteFamilyCollection {
+        page_count: u32,
+        collection_root_sha256: [u8; 32],
+        terminal_cursor_commitment_sha256: [u8; 32],
+    },
     /// At least one signed page exists, but terminal collection coverage was not established.
     IncompleteFamilyCollection { page_count: u32 },
 }
@@ -240,6 +246,15 @@ pub enum OrderReadbackObservation {
 }
 
 /// Adapter-verified signed readback bound to one UNKNOWN mutation identity.
+///
+/// This type intentionally does not implement `Deserialize`. Recovery must reload the raw signed
+/// pages, reverify them through the exchange adapter, allocate a new readback generation, and call
+/// [`Self::verified`]. A persisted digest, coverage tag, or status is not signature evidence.
+///
+/// ```compile_fail
+/// use venue_domain::domain::SignedOrderReadback;
+/// let _claim: Result<SignedOrderReadback, _> = serde_json::from_slice(b"{}");
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SignedOrderReadback {
     binding: OrderOutcomeBinding,
@@ -247,32 +262,6 @@ pub struct SignedOrderReadback {
     coverage: OrderReadbackCoverage,
     observation: OrderReadbackObservation,
     signed_readback_sha256: [u8; 32],
-}
-
-#[derive(Deserialize)]
-struct SignedOrderReadbackWire {
-    binding: OrderOutcomeBinding,
-    readback_generation: u64,
-    coverage: OrderReadbackCoverage,
-    observation: OrderReadbackObservation,
-    signed_readback_sha256: [u8; 32],
-}
-
-impl<'de> Deserialize<'de> for SignedOrderReadback {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = SignedOrderReadbackWire::deserialize(deserializer)?;
-        Self::verified(
-            wire.binding,
-            wire.readback_generation,
-            wire.coverage,
-            wire.observation,
-            wire.signed_readback_sha256,
-        )
-        .map_err(D::Error::custom)
-    }
 }
 
 impl SignedOrderReadback {
@@ -286,10 +275,20 @@ impl SignedOrderReadback {
         observation: OrderReadbackObservation,
         signed_readback_sha256: [u8; 32],
     ) -> Result<Self, OrderOutcomeError> {
-        let invalid_page_count = match coverage {
+        let invalid_coverage = match coverage {
             OrderReadbackCoverage::ExactIdentity => false,
-            OrderReadbackCoverage::CompleteFamilyCollection { page_count }
-            | OrderReadbackCoverage::IncompleteFamilyCollection { page_count } => page_count == 0,
+            OrderReadbackCoverage::CompleteFamilyCollection {
+                page_count,
+                collection_root_sha256,
+                terminal_cursor_commitment_sha256,
+            } => {
+                page_count == 0
+                    || collection_root_sha256.iter().all(|byte| *byte == 0)
+                    || terminal_cursor_commitment_sha256
+                        .iter()
+                        .all(|byte| *byte == 0)
+            }
+            OrderReadbackCoverage::IncompleteFamilyCollection { page_count } => page_count == 0,
         };
         let invalid_found_identity = matches!(
             &observation,
@@ -301,7 +300,7 @@ impl SignedOrderReadback {
         if readback_generation == 0 {
             return Err(OrderOutcomeError::InvalidGeneration);
         }
-        if invalid_page_count {
+        if invalid_coverage {
             return Err(OrderOutcomeError::InvalidCoverage);
         }
         if signed_readback_sha256.iter().all(|byte| *byte == 0) {
@@ -355,7 +354,14 @@ pub enum OrderOutcomeStatus {
 }
 
 /// Canonical outcome of an ACK-less/UNKNOWN order mutation. Private fields prevent callers from
-/// manufacturing `ProvenAbsent` without passing through [`UnknownOrderContract::classify`].
+/// manufacturing `ProvenAbsent` without passing through [`UnknownOrderContract::classify`]. The
+/// fact is deliberately serialization-only: persisted claims must never restore authority without
+/// adapter revalidation of the original signed collection into a new [`SignedOrderReadback`].
+///
+/// ```compile_fail
+/// use venue_domain::domain::AuthoritativeOrderOutcome;
+/// let _claim: Result<AuthoritativeOrderOutcome, _> = serde_json::from_slice(b"{}");
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AuthoritativeOrderOutcome {
     contract: UnknownOrderContract,
@@ -387,27 +393,6 @@ impl AuthoritativeOrderOutcome {
     }
 }
 
-#[derive(Deserialize)]
-struct AuthoritativeOrderOutcomeWire {
-    contract: UnknownOrderContract,
-    readback: SignedOrderReadback,
-    status: OrderOutcomeStatus,
-}
-
-impl<'de> Deserialize<'de> for AuthoritativeOrderOutcome {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = AuthoritativeOrderOutcomeWire::deserialize(deserializer)?;
-        let classified = wire.contract.classify(wire.readback);
-        if classified.status != wire.status {
-            return Err(D::Error::custom(OrderOutcomeError::InvalidOutcome));
-        }
-        Ok(classified)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnresolvedOrderReason {
@@ -428,14 +413,14 @@ pub enum OrderOutcomeError {
     MissingNativeIdentity,
     #[error("order readback generations must be non-zero")]
     InvalidGeneration,
-    #[error("signed family collection coverage requires at least one page")]
+    #[error(
+        "complete signed family coverage requires pages, a collection root, and a terminal cursor commitment"
+    )]
     InvalidCoverage,
     #[error("signed order readback digest must be non-zero")]
     UnsignedReadback,
     #[error("a found order observation requires a non-empty exchange order identity")]
     InvalidObservation,
-    #[error("serialized order outcome does not match its authoritative classification")]
-    InvalidOutcome,
 }
 
 fn valid_command_identity(value: &str) -> bool {
