@@ -8,6 +8,7 @@
   "data": [{
     "instType": "SWAP",
     "instId": "BTC-USDT-SWAP",
+    "tdMode": "cross",
     "ordId": "7004",
     "clOrdId": "00000000000000000000000000000004",
     "side": "buy",

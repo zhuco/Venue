@@ -6,7 +6,7 @@ use venue_domain::domain::{
 
 use crate::models::{AccountConfigRow, BalanceRow, Envelope, FillRow, OrderRow, PositionRow};
 use crate::public::{decimal, decode_success, positive_decimal, positive_u64};
-use crate::{OkxConfig, OkxError, OkxFill, OkxInstrument, OkxPositionMode};
+use crate::{OkxConfig, OkxError, OkxFill, OkxInstrument, OkxPositionMode, OkxTradeMode};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OkxAccountLevel {
@@ -42,6 +42,13 @@ impl OkxAccountProfile {
     #[must_use]
     pub const fn position_mode(&self) -> OkxPositionMode {
         self.position_mode
+    }
+
+    pub(crate) const fn supports_trade_mode(&self, trade_mode: OkxTradeMode) -> bool {
+        match trade_mode {
+            OkxTradeMode::Cross => true,
+            OkxTradeMode::Isolated => matches!(self.level, OkxAccountLevel::Futures),
+        }
     }
 }
 
@@ -249,7 +256,11 @@ pub(crate) fn normalize_position_row(
     if raw_quantity.is_zero() && !retain_zero {
         return Ok(None);
     }
-    let quantity = instrument.contracts_to_base(raw_quantity.abs())?;
+    let contracts = match side {
+        PositionSide::Net => raw_quantity,
+        PositionSide::Long | PositionSide::Short => raw_quantity.abs(),
+    };
+    let quantity = instrument.contracts_to_base(contracts)?;
     let position = Position {
         symbol: instrument.instrument().symbol.clone(),
         side,

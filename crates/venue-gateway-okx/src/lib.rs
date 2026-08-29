@@ -17,11 +17,12 @@ pub use binding::{OkxGatewayBinding, OkxGatewayBindingError};
 pub use config::{OkxConfig, endpoints};
 pub use credentials::OkxCredentials;
 pub use execution::{
-    OkxAcceptedCancel, OkxAcceptedOrder, OkxCancelRequest, OkxExecutionScope,
-    OkxOrderReadbackRequest, OkxPlaceIntent, OkxPlaceRequest, OkxPrivateRequest, OkxTradeMode,
-    OkxUnknownOrderReadback, OkxUnknownOrderReadbackRequest, build_cancel_request,
-    build_order_readback_request, build_place_request, build_unknown_order_readback_request,
-    parse_cancel_ack, parse_order_detail, parse_place_ack, parse_unknown_order_readback,
+    OkxAcceptedCancel, OkxAcceptedOrder, OkxCancelRequest, OkxExecutionScope, OkxOrderReadback,
+    OkxOrderReadbackAnchor, OkxOrderReadbackRequest, OkxPlaceIntent, OkxPlaceRequest,
+    OkxPrivateRequest, OkxTradeMode, OkxUnknownOrderReadback, OkxUnknownOrderReadbackRequest,
+    build_cancel_order_readback_request, build_cancel_request, build_order_readback_request,
+    build_place_request, build_unknown_order_readback_request, parse_cancel_ack,
+    parse_order_detail, parse_place_ack, parse_unknown_order_readback,
 };
 pub use private::{
     OkxAccountLevel, OkxAccountProfile, OkxPage, OkxPageState, OkxTimedBalance, OkxTimedOrder,

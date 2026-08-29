@@ -14,7 +14,7 @@ use crate::private::{
     normalize_balance_row, normalize_order_row, normalize_position_row, order_side, position_side,
 };
 use crate::public::positive_u64;
-use crate::{OkxConfig, OkxCredentials, OkxError, OkxInstrument, OkxPositionMode};
+use crate::{OkxConfig, OkxCredentials, OkxError, OkxInstrument, OkxPositionMode, OkxTradeMode};
 
 const LOGIN_PATH: &str = "/users/self/verify";
 
@@ -23,10 +23,12 @@ pub struct OkxPrivateWsScope {
     gateway_binding: GatewayBinding,
     native_instrument_id: String,
     instrument_generation: u64,
+    private_generation: u64,
     uid: String,
     main_uid: String,
     account_level: OkxAccountLevel,
     position_mode: OkxPositionMode,
+    trade_mode: OkxTradeMode,
 }
 
 impl OkxPrivateWsScope {
@@ -34,19 +36,27 @@ impl OkxPrivateWsScope {
         config: &OkxConfig,
         instrument: &OkxInstrument,
         profile: &OkxAccountProfile,
+        trade_mode: OkxTradeMode,
+        private_generation: u64,
     ) -> Result<Self, OkxError> {
         instrument.validate_scope(config)?;
-        if profile.uid().is_empty() || profile.main_uid().is_empty() {
+        if profile.uid().is_empty()
+            || profile.main_uid().is_empty()
+            || private_generation == 0
+            || !profile.supports_trade_mode(trade_mode)
+        {
             return Err(OkxError::Binding);
         }
         Ok(Self {
             gateway_binding: config.gateway_binding().clone(),
             native_instrument_id: instrument.native_id().to_owned(),
             instrument_generation: instrument.instrument().generation,
+            private_generation,
             uid: profile.uid().to_owned(),
             main_uid: profile.main_uid().to_owned(),
             account_level: profile.level(),
             position_mode: profile.position_mode(),
+            trade_mode,
         })
     }
 
@@ -55,8 +65,10 @@ impl OkxPrivateWsScope {
         config: &OkxConfig,
         instrument: &OkxInstrument,
         profile: &OkxAccountProfile,
+        trade_mode: OkxTradeMode,
+        private_generation: u64,
     ) -> Result<(), OkxError> {
-        if self != &Self::new(config, instrument, profile)? {
+        if self != &Self::new(config, instrument, profile, trade_mode, private_generation)? {
             return Err(OkxError::Binding);
         }
         Ok(())
@@ -75,6 +87,16 @@ impl OkxPrivateWsScope {
     #[must_use]
     pub const fn instrument_generation(&self) -> u64 {
         self.instrument_generation
+    }
+
+    #[must_use]
+    pub const fn private_generation(&self) -> u64 {
+        self.private_generation
+    }
+
+    #[must_use]
+    pub const fn trade_mode(&self) -> OkxTradeMode {
+        self.trade_mode
     }
 
     #[must_use]
@@ -132,11 +154,14 @@ pub fn build_ws_login(
     config: &OkxConfig,
     instrument: &OkxInstrument,
     profile: &OkxAccountProfile,
+    trade_mode: OkxTradeMode,
+    private_generation: u64,
     credentials: &OkxCredentials,
     timestamp_seconds: &str,
 ) -> Result<OkxWsLoginFrame, OkxError> {
     validate_seconds(timestamp_seconds)?;
-    let scope = OkxPrivateWsScope::new(config, instrument, profile)?;
+    let scope =
+        OkxPrivateWsScope::new(config, instrument, profile, trade_mode, private_generation)?;
     let mut mac = Hmac::<Sha256>::new_from_slice(credentials.api_secret.expose_secret().as_bytes())
         .map_err(|_| OkxError::SigningInput)?;
     mac.update(timestamp_seconds.as_bytes());
@@ -190,7 +215,13 @@ impl OkxPrivateWsSession {
         instrument: &OkxInstrument,
         profile: &OkxAccountProfile,
     ) -> Result<(), OkxError> {
-        self.scope.validate(config, instrument, profile)?;
+        self.scope.validate(
+            config,
+            instrument,
+            profile,
+            self.scope.trade_mode,
+            self.scope.private_generation,
+        )?;
         if self.endpoint != config.private_ws() || self.connection_id.is_empty() {
             return Err(OkxError::Binding);
         }
@@ -421,6 +452,7 @@ fn valid_ack_arg(arg: &SubscribeReplyArg, config: &OkxConfig, instrument: &OkxIn
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OkxWsBatch<T> {
     pub instrument_generation: u64,
+    pub private_generation: u64,
     pub event_time_ms: Option<u64>,
     pub items: Vec<T>,
 }
@@ -433,6 +465,7 @@ pub enum OkxWsDelivery<T> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SnapshotPending<T> {
+    private_generation: u64,
     next_page: u32,
     event_time_ms: Option<u64>,
     items: Vec<T>,
@@ -480,6 +513,40 @@ struct Push<T> {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct WsOrderRow {
+    inst_type: String,
+    inst_id: String,
+    td_mode: String,
+    ord_id: String,
+    #[serde(default)]
+    cl_ord_id: String,
+    side: String,
+    pos_side: String,
+    sz: String,
+    acc_fill_sz: String,
+    px: String,
+    avg_px: String,
+    reduce_only: String,
+    state: String,
+    u_time: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WsPositionRow {
+    inst_type: String,
+    inst_id: String,
+    mgn_mode: String,
+    pos_side: String,
+    pos: String,
+    avg_px: String,
+    mark_px: String,
+    u_time: String,
+    p_time: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PushArg {
     channel: String,
     uid: String,
@@ -494,11 +561,11 @@ struct PushArg {
 pub fn parse_ws_orders(
     payload: &[u8],
     active: &OkxActivePrivateSubscription,
-    frame_generation: u64,
+    private_generation: u64,
     window: OkxEventWindow,
 ) -> Result<OkxWsBatch<OkxTimedOrder>, OkxError> {
-    validate_active(active, frame_generation)?;
-    let push: Push<OrderRow> = serde_json::from_slice(payload).map_err(|_| OkxError::Payload)?;
+    validate_active(active, private_generation)?;
+    let push: Push<WsOrderRow> = serde_json::from_slice(payload).map_err(|_| OkxError::Payload)?;
     if push.event_type.is_some() || push.cur_page.is_some() || push.last_page.is_some() {
         return Err(OkxError::Pagination);
     }
@@ -514,6 +581,9 @@ pub fn parse_ws_orders(
     let mut event_time_ms = 0;
     let mut items = Vec::with_capacity(push.data.len());
     for row in push.data {
+        if row.td_mode != active.scope.trade_mode().wire_value() {
+            return Err(OkxError::Binding);
+        }
         if row.ord_id.is_empty()
             || !row.ord_id.bytes().all(|byte| byte.is_ascii_digit())
             || !identities.insert(row.ord_id.clone())
@@ -534,7 +604,21 @@ pub fn parse_ws_orders(
         )?;
         event_time_ms = event_time_ms.max(row_time);
         items.push(normalize_ws_order(
-            row,
+            OrderRow {
+                inst_type: row.inst_type,
+                inst_id: row.inst_id,
+                ord_id: row.ord_id,
+                cl_ord_id: row.cl_ord_id,
+                side: row.side,
+                pos_side: row.pos_side,
+                sz: row.sz,
+                acc_fill_sz: row.acc_fill_sz,
+                px: row.px,
+                avg_px: row.avg_px,
+                reduce_only: row.reduce_only,
+                state: row.state,
+                u_time: row.u_time,
+            },
             &active.instrument,
             &active.profile,
         )?);
@@ -545,11 +629,11 @@ pub fn parse_ws_orders(
 pub fn parse_ws_account(
     payload: &[u8],
     active: &OkxActivePrivateSubscription,
-    frame_generation: u64,
+    private_generation: u64,
     state: &mut OkxAccountSnapshotState,
     window: OkxEventWindow,
 ) -> Result<OkxWsDelivery<OkxTimedBalance>, OkxError> {
-    validate_active(active, frame_generation)?;
+    validate_active(active, private_generation)?;
     let push: Push<BalanceRow> = serde_json::from_slice(payload).map_err(|_| OkxError::Payload)?;
     validate_arg(
         &push.arg,
@@ -588,12 +672,13 @@ pub fn parse_ws_account(
 pub fn parse_ws_positions(
     payload: &[u8],
     active: &OkxActivePrivateSubscription,
-    frame_generation: u64,
+    private_generation: u64,
     state: &mut OkxPositionSnapshotState,
     window: OkxEventWindow,
 ) -> Result<OkxWsDelivery<OkxTimedPosition>, OkxError> {
-    validate_active(active, frame_generation)?;
-    let push: Push<PositionRow> = serde_json::from_slice(payload).map_err(|_| OkxError::Payload)?;
+    validate_active(active, private_generation)?;
+    let push: Push<WsPositionRow> =
+        serde_json::from_slice(payload).map_err(|_| OkxError::Payload)?;
     validate_arg(
         &push.arg,
         "positions",
@@ -609,6 +694,9 @@ pub fn parse_ws_positions(
     let mut event_time_ms = None;
     let mut items = Vec::with_capacity(push.data.len());
     for row in push.data {
+        if row.mgn_mode != active.scope.trade_mode().wire_value() {
+            return Err(OkxError::Binding);
+        }
         if !sides.insert(row.pos_side.clone()) {
             return Err(OkxError::Identity);
         }
@@ -623,8 +711,21 @@ pub fn parse_ws_positions(
             window.previous_event_time_ms,
         )?;
         event_time_ms = Some(event_time_ms.unwrap_or(0).max(push_time));
-        let position = normalize_position_row(row, &active.instrument, &active.profile, true)?
-            .ok_or(OkxError::Payload)?;
+        let position = normalize_position_row(
+            PositionRow {
+                inst_type: row.inst_type,
+                inst_id: row.inst_id,
+                pos_side: row.pos_side,
+                pos: row.pos,
+                avg_px: row.avg_px,
+                mark_px: row.mark_px,
+                u_time: row.u_time,
+            },
+            &active.instrument,
+            &active.profile,
+            true,
+        )?
+        .ok_or(OkxError::Payload)?;
         items.push(position);
     }
     collect_position_page(
@@ -726,11 +827,17 @@ fn collect_snapshot_page<T: Clone>(
     let last_page = last_page.ok_or(OkxError::Pagination)?;
     let mut next = match pending.clone() {
         None if current_page == 1 => SnapshotPending {
+            private_generation: active.scope.private_generation(),
             next_page: 2,
             event_time_ms: None,
             items: Vec::new(),
         },
-        Some(value) if value.next_page == current_page => value,
+        Some(value)
+            if value.private_generation == active.scope.private_generation()
+                && value.next_page == current_page =>
+        {
+            value
+        }
         _ => return Err(OkxError::Pagination),
     };
     next.event_time_ms = match (next.event_time_ms, event_time_ms) {
@@ -758,17 +865,21 @@ fn collect_snapshot_page<T: Clone>(
 
 fn validate_active(
     active: &OkxActivePrivateSubscription,
-    frame_generation: u64,
+    private_generation: u64,
 ) -> Result<(), OkxError> {
     if active.connection_id.is_empty()
         || active.request_id.is_empty()
-        || frame_generation != active.scope.instrument_generation()
+        || private_generation != active.scope.private_generation()
     {
         return Err(OkxError::Binding);
     }
-    active
-        .scope
-        .validate(&active.config, &active.instrument, &active.profile)
+    active.scope.validate(
+        &active.config,
+        &active.instrument,
+        &active.profile,
+        active.scope.trade_mode,
+        active.scope.private_generation,
+    )
 }
 
 fn validate_subscription(
@@ -852,6 +963,7 @@ fn finish_batch<T>(
     }
     Ok(OkxWsBatch {
         instrument_generation: active.scope.instrument_generation(),
+        private_generation: active.scope.private_generation(),
         event_time_ms,
         items,
     })
@@ -947,6 +1059,8 @@ mod tests {
             &config,
             &instrument,
             &profile,
+            OkxTradeMode::Cross,
+            17,
             &OkxCredentials::from_values("key", "mysecret", "pass")?,
             "1538054050",
         )?;
@@ -990,10 +1104,14 @@ mod tests {
             &config,
             &instrument,
             &profile,
+            OkxTradeMode::Cross,
+            17,
             &OkxCredentials::from_values("key", "mysecret", "pass")?,
             "1538054050",
         )?;
         assert!(login.endpoint().contains("wspap.okx.com"));
+        assert_eq!(login.scope().private_generation(), 17);
+        assert_eq!(login.scope().trade_mode(), OkxTradeMode::Cross);
         assert_eq!(
             login.secret_payload().expose_secret(),
             r#"{"op":"login","args":[{"apiKey":"key","passphrase":"pass","timestamp":"1538054050","sign":"m+lzVL6siKIpimAa/6y8lHpWZe0SCpehAqymC8Nel0A="}]}"#
@@ -1036,6 +1154,19 @@ mod tests {
             build_private_subscribe(&session, &live, &live_instrument, &live_profile, "request2"),
             Err(OkxError::Binding)
         );
+        assert_eq!(
+            build_ws_login(
+                &config,
+                &instrument,
+                &profile,
+                OkxTradeMode::Cross,
+                0,
+                &OkxCredentials::from_values("key", "mysecret", "pass")?,
+                "1538054050",
+            )
+            .err(),
+            Some(OkxError::Binding)
+        );
         Ok(())
     }
 
@@ -1046,17 +1177,18 @@ mod tests {
         let orders = parse_ws_orders(
             ORDER_PUSH,
             &active,
-            9,
+            17,
             OkxEventWindow::new(1_787_911_201_000, None)?,
         )?;
         assert_eq!(orders.instrument_generation, 9);
+        assert_eq!(orders.private_generation, 17);
         assert_eq!(orders.event_time_ms, Some(1_787_911_200_700));
         assert_eq!(orders.items[0].order.state, OrderState::Filled);
 
         let OkxWsDelivery::Batch(account) = parse_ws_account(
             ACCOUNT_PUSH,
             &active,
-            9,
+            17,
             &mut OkxAccountSnapshotState::default(),
             OkxEventWindow::new(1_787_911_201_000, None)?,
         )?
@@ -1068,7 +1200,7 @@ mod tests {
         let OkxWsDelivery::Batch(positions) = parse_ws_positions(
             POSITION_PUSH,
             &active,
-            9,
+            17,
             &mut OkxPositionSnapshotState::default(),
             OkxEventWindow::new(1_787_911_201_000, None)?,
         )?
@@ -1091,7 +1223,7 @@ mod tests {
             parse_ws_orders(
                 ORDER_PUSH,
                 &active,
-                9,
+                17,
                 OkxEventWindow::new(1_787_911_200_699, None)?
             ),
             Err(OkxError::Sequence)
@@ -1101,7 +1233,7 @@ mod tests {
             parse_ws_orders(
                 wrong_uid,
                 &active,
-                9,
+                17,
                 OkxEventWindow::new(1_787_911_201_000, None)?
             ),
             Err(OkxError::Binding)
@@ -1110,9 +1242,33 @@ mod tests {
             parse_ws_positions(
                 POSITION_PUSH,
                 &active,
-                10,
+                16,
                 &mut OkxPositionSnapshotState::default(),
                 OkxEventWindow::new(1_787_911_201_000, None)?
+            ),
+            Err(OkxError::Binding)
+        );
+
+        let mut wrong_order_mode: serde_json::Value = serde_json::from_slice(ORDER_PUSH)?;
+        wrong_order_mode["data"][0]["tdMode"] = serde_json::json!("isolated");
+        assert_eq!(
+            parse_ws_orders(
+                &serde_json::to_vec(&wrong_order_mode)?,
+                &active,
+                17,
+                OkxEventWindow::new(1_787_911_201_000, None)?,
+            ),
+            Err(OkxError::Binding)
+        );
+        let mut wrong_position_mode: serde_json::Value = serde_json::from_slice(POSITION_PUSH)?;
+        wrong_position_mode["data"][0]["mgnMode"] = serde_json::json!("isolated");
+        assert_eq!(
+            parse_ws_positions(
+                &serde_json::to_vec(&wrong_position_mode)?,
+                &active,
+                17,
+                &mut OkxPositionSnapshotState::default(),
+                OkxEventWindow::new(1_787_911_201_000, None)?,
             ),
             Err(OkxError::Binding)
         );
@@ -1130,17 +1286,29 @@ mod tests {
             parse_ws_account(
                 &serde_json::to_vec(&first)?,
                 &active,
-                9,
+                17,
                 &mut state,
                 OkxEventWindow::new(1_787_911_201_000, None)?
             )?,
             OkxWsDelivery::PendingSnapshot { next_page: 2 }
         );
+        let mut next_generation = active.clone();
+        next_generation.scope.private_generation = 18;
+        assert_eq!(
+            parse_ws_account(
+                br#"{"arg":{"channel":"account","uid":"fixture-sub-account"},"eventType":"snapshot","curPage":2,"lastPage":true,"data":[]}"#,
+                &next_generation,
+                18,
+                &mut state.clone(),
+                OkxEventWindow::new(1_787_911_201_000, None)?,
+            ),
+            Err(OkxError::Pagination)
+        );
         let empty = br#"{"arg":{"channel":"account","uid":"fixture-sub-account"},"eventType":"snapshot","curPage":2,"lastPage":true,"data":[]}"#;
         let OkxWsDelivery::Batch(closed) = parse_ws_account(
             empty,
             &active,
-            9,
+            17,
             &mut state,
             OkxEventWindow::new(1_787_911_201_000, None)?,
         )?
@@ -1154,7 +1322,7 @@ mod tests {
         let OkxWsDelivery::Batch(empty_closed) = parse_ws_account(
             empty_first.as_bytes(),
             &active,
-            9,
+            17,
             &mut OkxAccountSnapshotState::default(),
             OkxEventWindow::new(1_787_911_201_000, None)?,
         )?

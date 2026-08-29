@@ -20,8 +20,8 @@ use venue_gateway_api::GatewayBinding;
 use crate::{
     OkxAccountProfile, OkxActivePrivateSubscription, OkxConfig, OkxCredentials, OkxInstrument,
     OkxPrivateReadRequest, OkxPrivateRequest, OkxPrivateSubscription, OkxPrivateWsScope,
-    OkxWsLoginFrame, SignedHeaders, activate_private_subscription, build_private_subscribe,
-    build_ws_login, parse_ws_login_ack,
+    OkxTradeMode, OkxWsLoginFrame, SignedHeaders, activate_private_subscription,
+    build_private_subscribe, build_ws_login, parse_ws_login_ack,
 };
 
 const HEADER_NAMES: [&str; 5] = [
@@ -141,6 +141,8 @@ impl OkxHttpTransport {
         request: &R,
         timestamp: &str,
     ) -> Result<OkxHttpResponse, OkxTransportError> {
+        // One call performs one physical dispatch. A timeout or disconnect is UNKNOWN to this
+        // adapter and must be resolved by a separately signed readback request.
         if request.scope().gateway_binding() != self.config.gateway_binding() {
             return Err(OkxTransportError::Binding);
         }
@@ -281,6 +283,7 @@ pub struct OkxReceivedPrivateFrame {
     pub account_profile: OkxAccountProfile,
     pub binding: GatewayBinding,
     pub instrument_generation: u64,
+    pub private_generation: u64,
     pub received_at_ms: u64,
     pub payload: Bytes,
 }
@@ -307,6 +310,8 @@ impl OkxPrivateWsTransport {
         config: &OkxConfig,
         instrument: &OkxInstrument,
         profile: &OkxAccountProfile,
+        trade_mode: OkxTradeMode,
+        private_generation: u64,
         credentials: &OkxCredentials,
         timestamp_seconds: &str,
         request_id: &str,
@@ -318,6 +323,8 @@ impl OkxPrivateWsTransport {
             config,
             instrument,
             profile,
+            trade_mode,
+            private_generation,
             credentials,
             timestamp_seconds,
             request_id,
@@ -333,6 +340,8 @@ impl OkxPrivateWsTransport {
         config: &OkxConfig,
         instrument: &OkxInstrument,
         profile: &OkxAccountProfile,
+        trade_mode: OkxTradeMode,
+        private_generation: u64,
         credentials: &OkxCredentials,
         timestamp_seconds: &str,
         request_id: &str,
@@ -342,8 +351,16 @@ impl OkxPrivateWsTransport {
         if !valid_limits(operation_timeout, max_frame_bytes) {
             return Err(OkxTransportError::Configuration);
         }
-        let login = build_ws_login(config, instrument, profile, credentials, timestamp_seconds)
-            .map_err(|_| OkxTransportError::Binding)?;
+        let login = build_ws_login(
+            config,
+            instrument,
+            profile,
+            trade_mode,
+            private_generation,
+            credentials,
+            timestamp_seconds,
+        )
+        .map_err(|_| OkxTransportError::Binding)?;
         if login.endpoint() != config.private_ws()
             || login.scope().gateway_binding() != config.gateway_binding()
             || login.scope().instrument_generation() != instrument.instrument().generation
@@ -441,6 +458,7 @@ impl OkxPrivateWsTransport {
                 account_profile: self.active.account_profile().clone(),
                 binding: self.active.scope().gateway_binding().clone(),
                 instrument_generation: self.active.scope().instrument_generation(),
+                private_generation: self.active.scope().private_generation(),
                 received_at_ms: buffered.received_at_ms,
                 payload: buffered.payload,
             });
@@ -658,7 +676,10 @@ fn valid_limits(operation_timeout: Duration, byte_limit: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use futures_util::{SinkExt, StreamExt};
     use tokio::{
@@ -883,6 +904,75 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn mutation_timeout_is_dispatched_once_without_transport_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use venue_domain::domain::{
+            CommandId, OrderCommand, OrderOwner, OrderPurpose, OrderSide, PositionSide, Price,
+        };
+        let (config, instrument, profile) = scope(GatewayMode::Test, 7)?;
+        let command = OrderCommand {
+            command_id: CommandId::new("place-once")?,
+            client_order_id: CommandId::new("placeonce7")?,
+            owner: OrderOwner {
+                strategy_instance_id: "grid1".to_owned(),
+                run_id: "run1".to_owned(),
+                exchange: "okx".to_owned(),
+                account: config.gateway_binding().trading_account_id.to_string(),
+                symbol: config.gateway_binding().symbol.clone(),
+                purpose: OrderPurpose::Reduce,
+            },
+            side: OrderSide::Sell,
+            position_side: PositionSide::Long,
+            quantity: rust_decimal::Decimal::new(2, 1),
+            limit_price: Price::new(rust_decimal::Decimal::new(60_000, 0))?,
+            reduce_only: true,
+        };
+        let request = crate::build_place_request(
+            &config,
+            &instrument,
+            &profile,
+            crate::OkxTradeMode::Cross,
+            crate::OkxPlaceIntent::Limit(&command),
+        )?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_server = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(120);
+            while let Ok(Ok((mut stream, _))) = timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                listener.accept(),
+            )
+            .await
+            {
+                accepts_server.fetch_add(1, Ordering::SeqCst);
+                let mut request_bytes = [0_u8; 2048];
+                let _ = stream.read(&mut request_bytes).await;
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    drop(stream);
+                });
+            }
+        });
+        let transport =
+            OkxHttpTransport::with_origin(config, &origin, Duration::from_millis(20), 256)?;
+        assert_eq!(
+            transport
+                .execute(
+                    &OkxCredentials::from_values("key", "secret", "pass")?,
+                    &request,
+                    "2026-08-29T01:02:03.000Z",
+                )
+                .await,
+            Err(OkxTransportError::Timeout)
+        );
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(accepts.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
     #[test]
     fn transport_limits_reject_near_unbounded_waits_and_buffers()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1045,6 +1135,8 @@ mod tests {
             &config,
             &instrument,
             &profile,
+            OkxTradeMode::Cross,
+            17,
             &OkxCredentials::from_values("key", "secret", "pass")?,
             "1538054050",
             "request1",
@@ -1057,6 +1149,7 @@ mod tests {
         let frame = transport.next_frame().await?;
         let first_received_at_ms = frame.received_at_ms;
         assert_eq!(frame.instrument_generation, 9);
+        assert_eq!(frame.private_generation, 17);
         assert!(first_received_at_ms > 0);
         assert_eq!(frame.binding, *config.gateway_binding());
         assert_eq!(frame.scope, *transport.active_subscription().scope());
@@ -1087,6 +1180,8 @@ mod tests {
                 &config,
                 &instrument,
                 &profile,
+                OkxTradeMode::Cross,
+                17,
                 &credentials,
                 "1538054050",
                 "request1",
@@ -1103,6 +1198,8 @@ mod tests {
             &config,
             &instrument,
             &profile,
+            OkxTradeMode::Cross,
+            17,
             &credentials,
             "1538054050",
             "request1",
@@ -1126,6 +1223,8 @@ mod tests {
             &config,
             &instrument,
             &profile,
+            OkxTradeMode::Cross,
+            17,
             &credentials,
             "1538054050",
             "request1",
@@ -1161,6 +1260,8 @@ mod tests {
                 &config,
                 &instrument,
                 &profile,
+                OkxTradeMode::Cross,
+                17,
                 &OkxCredentials::from_values("key", "secret", "pass")?,
                 "1538054050",
                 "request1",
@@ -1198,6 +1299,8 @@ mod tests {
             &config,
             &instrument,
             &profile,
+            OkxTradeMode::Cross,
+            17,
             &OkxCredentials::from_values("key", "secret", "pass")?,
             "1538054050",
             "request1",
@@ -1237,6 +1340,8 @@ mod tests {
             &config,
             &instrument,
             &profile,
+            OkxTradeMode::Cross,
+            17,
             &OkxCredentials::from_values("key", "secret", "pass")?,
             "1538054050",
             "request1",
@@ -1272,6 +1377,8 @@ mod tests {
                 &config,
                 &instrument,
                 &profile,
+                OkxTradeMode::Cross,
+                17,
                 &credentials,
                 "1538054050",
                 "request1",
@@ -1310,6 +1417,8 @@ mod tests {
                 &config,
                 &instrument,
                 &profile,
+                OkxTradeMode::Cross,
+                17,
                 &OkxCredentials::from_values("key", "secret", "pass")?,
                 "1538054050",
                 "request1",
