@@ -6,6 +6,7 @@ mod models;
 mod private;
 mod private_ws;
 mod public;
+mod readback;
 mod sign;
 mod transport;
 
@@ -18,8 +19,9 @@ pub use credentials::OkxCredentials;
 pub use execution::{
     OkxAcceptedCancel, OkxAcceptedOrder, OkxCancelRequest, OkxExecutionScope,
     OkxOrderReadbackRequest, OkxPlaceIntent, OkxPlaceRequest, OkxPrivateRequest, OkxTradeMode,
-    build_cancel_request, build_order_readback_request, build_place_request, parse_cancel_ack,
-    parse_order_detail, parse_place_ack,
+    OkxUnknownOrderReadback, OkxUnknownOrderReadbackRequest, build_cancel_request,
+    build_order_readback_request, build_place_request, build_unknown_order_readback_request,
+    parse_cancel_ack, parse_order_detail, parse_place_ack, parse_unknown_order_readback,
 };
 pub use private::{
     OkxAccountLevel, OkxAccountProfile, OkxPage, OkxPageState, OkxTimedBalance, OkxTimedOrder,
@@ -34,6 +36,15 @@ pub use private_ws::{
     parse_ws_positions,
 };
 pub use public::{OkxInstrument, parse_bbo, parse_instrument};
+pub use readback::{
+    OKX_PRIVATE_MAX_PAGES, OKX_PRIVATE_PAGE_LIMIT, OKX_PRIVATE_READBACK_SCHEMA_VERSION,
+    OkxAlgoOrderKind, OkxCanonicalOrder, OkxOrderFamilyReadback, OkxPositionFact,
+    OkxPositionFactSource, OkxPrivatePageAdvance, OkxPrivateReadRequest, OkxPrivateReadScope,
+    OkxPrivateReadbackCandidate, OkxPrivateSurface, OkxRawPrivatePage, advance_private_page,
+    build_account_config_request, build_algo_orders_request, build_balance_request,
+    build_fills_request, build_positions_request, build_regular_orders_request,
+    complete_private_readback,
+};
 pub use sign::{SignedHeaders, request_path, sign};
 pub use transport::{
     OkxHttpResponse, OkxHttpTransport, OkxPrivateWsTransport, OkxReceivedPrivateFrame,
@@ -47,7 +58,8 @@ pub const fn capabilities() -> CapabilityFlags {
     CapabilityFlags::empty()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OkxPositionMode {
     Net,
     LongShort,

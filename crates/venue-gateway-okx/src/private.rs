@@ -92,7 +92,7 @@ pub fn parse_account_profile(
     let [row] = envelope.data.as_slice() else {
         return Err(OkxError::Payload);
     };
-    if row.uid.is_empty() || row.main_uid.is_empty() {
+    if !account_uid(&row.uid) || !account_uid(&row.main_uid) {
         return Err(OkxError::Payload);
     }
     let level = match row.acct_lv.as_str() {
@@ -117,6 +117,14 @@ pub fn parse_account_profile(
         level,
         position_mode,
     })
+}
+
+fn account_uid(value: &str) -> bool {
+    !value.is_empty()
+        && value == value.trim()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 pub fn parse_balance(
@@ -306,7 +314,7 @@ pub(crate) fn normalize_order_row(
     })
 }
 
-fn normalize_fill(
+pub(crate) fn normalize_fill(
     row: FillRow,
     instrument: &OkxInstrument,
     profile: &OkxAccountProfile,
