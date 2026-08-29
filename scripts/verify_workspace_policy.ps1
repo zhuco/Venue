@@ -16,9 +16,9 @@ $allowedDependencies = @(
     'egui', 'egui_tiles', 'fs2', 'futures-util', 'hmac', 'js-sys', 'reqwest', 'rust_decimal',
     'secrecy', 'serde', 'serde_json', 'sha2', 'sqlx', 'tempfile', 'thiserror', 'tokio',
     'tokio-tungstenite', 'toml', 'tracing', 'tracing-subscriber', 'tungstenite', 'venue-control-protocol',
-    'venue-copy', 'venue-domain', 'venue-gateway-api', 'venue-gateway-binance', 'venue-gateway-bitget',
+    'venue-copy', 'venue-domain', 'venue-execution', 'venue-gateway-api', 'venue-gateway-binance', 'venue-gateway-bitget',
     'venue-gateway-bybit', 'venue-gateway-gate', 'venue-gateway-hyperliquid', 'venue-gateway-okx',
-    'venue-indicators', 'venue-storage', 'venue-strategies', 'wasm-bindgen', 'wasm-bindgen-futures', 'web-sys'
+    'venue-indicators', 'venue-runtime', 'venue-storage', 'venue-strategies', 'wasm-bindgen', 'wasm-bindgen-futures', 'web-sys'
 )
 
 function Get-TrackedActivePaths {
