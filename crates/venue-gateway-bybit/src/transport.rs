@@ -22,9 +22,9 @@ use venue_gateway_api::GatewayBinding;
 
 use crate::sign::ws_auth_signature;
 use crate::{
-    BybitCredentials, BybitGatewayBinding, BybitOrderAck, BybitPreparedPrivateRequest,
-    BybitPreparedRequest, BybitRawPrivatePayload, parse_order_ack, sign_prepared_request,
-    sign_private_request,
+    BybitCredentials, BybitExecutionError, BybitGatewayBinding, BybitOrderAck,
+    BybitPreparedPrivateRequest, BybitPreparedRequest, BybitPrivateStreamProbeEvidence,
+    BybitRawPrivatePayload, parse_order_ack, sign_prepared_request, sign_private_request,
 };
 
 const PRIVATE_TOPICS: [&str; 4] = [
@@ -95,7 +95,7 @@ impl BybitHttpTransport {
         )
     }
 
-    fn with_endpoint(
+    pub(crate) fn with_endpoint(
         binding: &BybitGatewayBinding,
         generation: u64,
         endpoint: String,
@@ -182,8 +182,11 @@ impl BybitHttpTransport {
                 body.extend_from_slice(&chunk);
             }
             let received_at_ms = unix_ms()?;
-            parse_order_ack(binding, request, &body, received_at_ms)
-                .map_err(|_| BybitTransportError::Ack)
+            match parse_order_ack(binding, request, &body, received_at_ms) {
+                Ok(ack) => Ok(ack),
+                Err(BybitExecutionError::VenueRejected) => Err(BybitTransportError::Rejected),
+                Err(_) => Err(BybitTransportError::Ack),
+            }
         };
         timeout(self.limits.operation_timeout, operation)
             .await
@@ -289,6 +292,7 @@ pub struct BybitPrivateWsTransport<S = MaybeTlsStream<TcpStream>> {
     generation: u64,
     endpoint: String,
     connection_id: String,
+    authenticated_at_ms: u64,
     limits: BybitTransportLimits,
     pre_live_frames: VecDeque<BybitRawPrivateFrame>,
     buffered_bytes: usize,
@@ -319,6 +323,22 @@ where
     #[must_use]
     pub fn connection_id(&self) -> &str {
         &self.connection_id
+    }
+
+    pub fn capability_probe_evidence(
+        &self,
+        observed_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<BybitPrivateStreamProbeEvidence, BybitTransportError> {
+        BybitPrivateStreamProbeEvidence::authenticated(
+            self.binding.clone(),
+            self.generation,
+            self.authenticated_at_ms,
+            observed_at_ms,
+            expires_at_ms,
+            &self.connection_id,
+        )
+        .map_err(|_| BybitTransportError::Binding)
     }
 
     pub async fn next_raw_frame(&mut self) -> Result<BybitRawPrivateFrame, BybitTransportError> {
@@ -606,6 +626,7 @@ where
         generation,
         endpoint,
         connection_id: subscribe_ack.connection_id,
+        authenticated_at_ms: now_ms,
         limits,
         pre_live_frames,
         buffered_bytes,
@@ -895,6 +916,8 @@ pub enum BybitTransportError {
     Protocol,
     #[error("Bybit transport acknowledgement is invalid or rejected")]
     Ack,
+    #[error("Bybit rejected the physical mutation request")]
+    Rejected,
     #[error("Bybit private websocket heartbeat is invalid or missing")]
     Heartbeat,
     #[error("Bybit transport signing failed")]
