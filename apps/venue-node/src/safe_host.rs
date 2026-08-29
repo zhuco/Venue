@@ -14,7 +14,10 @@ use venue_execution::{
     CommandState, DispatchGuard, WriterLeaseAuthority, WriterLeaseError, WriterScope,
     WriterSession, acquire_account_canonical_root,
 };
-use venue_gateway_api::{CapabilitySnapshot, GatewayApiError, GatewayBinding, MutationCapability};
+use venue_gateway_api::{
+    CapabilityPromotionError, CapabilitySnapshot, GatewayApiError, GatewayBinding,
+    HostAdmissionEvidence, HostAdmittedCapability, MutationCapability,
+};
 use venue_runtime::{AccountKey, AccountModelError, StrategyBinding};
 
 use crate::{
@@ -461,6 +464,7 @@ pub struct ControlCompletion {
 #[derive(Clone, Debug)]
 pub struct PreparedDispatch {
     command: ExecutionCommand,
+    config_epoch: u64,
     connection_generation: u64,
     private_generation: u64,
     writer_generation: u64,
@@ -472,16 +476,46 @@ impl PreparedDispatch {
     pub fn command_id(&self) -> &CommandId {
         self.command.command_id()
     }
+
+    #[cfg(test)]
+    pub(crate) const fn config_epoch(&self) -> u64 {
+        self.config_epoch
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn connection_generation(&self) -> u64 {
+        self.connection_generation
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn private_generation(&self) -> u64 {
+        self.private_generation
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn writer_generation(&self) -> u64 {
+        self.writer_generation
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn writer_revision(&self) -> u64 {
+        self.writer_revision
+    }
 }
 
 /// Linear physical authority: it is not Clone and is consumed by `PhysicalGateway::dispatch`.
 pub struct DispatchPermit {
     binding: GatewayBinding,
     command: ExecutionCommand,
+    config_epoch: u64,
+    connection_generation: u64,
     writer_generation: u64,
     writer_revision: u64,
     readback_generation: u64,
+    authorized_at_ms: u64,
     canary_sha256: Option<String>,
+    admitted_capability: Option<HostAdmittedCapability>,
+    admission_evidence: Option<HostAdmissionEvidence>,
     _writer_guard: DispatchGuard,
 }
 
@@ -514,6 +548,31 @@ impl DispatchPermit {
     #[must_use]
     pub fn canary_sha256(&self) -> Option<&str> {
         self.canary_sha256.as_deref()
+    }
+
+    pub(crate) fn into_async_parts(
+        mut self,
+    ) -> Result<(HostAdmittedCapability, HostAdmissionEvidence, Self), CapabilityPromotionError>
+    {
+        let capability = self
+            .admitted_capability
+            .take()
+            .ok_or(CapabilityPromotionError::Denied)?;
+        let evidence = self
+            .admission_evidence
+            .take()
+            .ok_or(CapabilityPromotionError::Denied)?;
+        validate_dispatch_admission(
+            &capability,
+            &evidence,
+            &self.binding,
+            self.config_epoch,
+            self.connection_generation,
+            self.readback_generation,
+            self.authorized_at_ms,
+            mutation_capability(&self.command),
+        )?;
+        Ok((capability, evidence, self))
     }
 }
 
@@ -651,6 +710,7 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
         self.journal.prepare(command.clone())?;
         Ok(PreparedDispatch {
             command,
+            config_epoch: self.config_epoch,
             connection_generation: self.last_readback.connection_generation,
             private_generation: self.last_readback.private_generation,
             writer_generation: self.writer_session.generation,
@@ -661,9 +721,17 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
     pub fn dispatch_prepared(
         &mut self,
         prepared: PreparedDispatch,
+        admitted_capability: HostAdmittedCapability,
+        admission_evidence: HostAdmissionEvidence,
         now_ms: u64,
     ) -> Result<DispatchOutcome, SafeHostError> {
-        self.dispatch_prepared_inner(prepared, now_ms, TestCrashPoint::None)
+        self.dispatch_prepared_inner(
+            prepared,
+            admitted_capability,
+            admission_evidence,
+            now_ms,
+            TestCrashPoint::None,
+        )
     }
 
     pub fn recover_unknowns(&mut self, now_ms: u64) -> Result<(), SafeHostError> {
@@ -871,10 +939,18 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
     pub(crate) fn dispatch_with_crash(
         &mut self,
         prepared: PreparedDispatch,
+        admitted_capability: HostAdmittedCapability,
+        admission_evidence: HostAdmissionEvidence,
         now_ms: u64,
         crash_point: TestCrashPoint,
     ) -> Result<DispatchOutcome, SafeHostError> {
-        self.dispatch_prepared_inner(prepared, now_ms, crash_point)
+        self.dispatch_prepared_inner(
+            prepared,
+            admitted_capability,
+            admission_evidence,
+            now_ms,
+            crash_point,
+        )
     }
 
     fn open_with_root(
@@ -962,6 +1038,8 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
     fn dispatch_prepared_inner(
         &mut self,
         prepared: PreparedDispatch,
+        admitted_capability: HostAdmittedCapability,
+        admission_evidence: HostAdmissionEvidence,
         now_ms: u64,
         crash_point: TestCrashPoint,
     ) -> Result<DispatchOutcome, SafeHostError> {
@@ -974,7 +1052,8 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
         if receipt.command != prepared.command || receipt.state != CommandState::Prepared {
             return Err(SafeHostError::PreparedIdentity);
         }
-        if prepared.connection_generation != self.last_readback.connection_generation
+        if prepared.config_epoch != self.config_epoch
+            || prepared.connection_generation != self.last_readback.connection_generation
             || prepared.private_generation != self.last_readback.private_generation
             || prepared.writer_generation != self.writer_session.generation
             || prepared.writer_revision != self.writer_session.revision
@@ -987,6 +1066,23 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
             )?;
             return Err(SafeHostError::PreparedStale);
         }
+        if is_risk_increasing(&prepared.command)
+            && self.canary.as_ref().is_none_or(|canary| {
+                canary.capability_version != admitted_capability.capability_version()
+            })
+        {
+            return Err(SafeHostError::CanaryEvidence);
+        }
+        validate_dispatch_admission(
+            &admitted_capability,
+            &admission_evidence,
+            &self.binding,
+            self.config_epoch,
+            self.last_readback.connection_generation,
+            self.last_readback.private_generation,
+            now_ms,
+            mutation_capability(&prepared.command),
+        )?;
         let writer_guard = match self.writer.dispatch_guard(&self.writer_session, now_ms) {
             Ok(guard) => guard,
             Err(error) => {
@@ -1008,9 +1104,12 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
         let permit = DispatchPermit {
             binding: self.binding.clone(),
             command: prepared.command,
+            config_epoch: self.config_epoch,
+            connection_generation: self.last_readback.connection_generation,
             writer_generation: self.writer_session.generation,
             writer_revision: self.writer_session.revision,
             readback_generation: self.last_readback.private_generation,
+            authorized_at_ms: now_ms,
             canary_sha256: risk_increasing
                 .then(|| {
                     self.canary
@@ -1018,6 +1117,8 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
                         .map(|evidence| evidence.evidence_sha256.clone())
                 })
                 .flatten(),
+            admitted_capability: Some(admitted_capability),
+            admission_evidence: Some(admission_evidence),
             _writer_guard: writer_guard,
         };
         let gateway_result = self.gateway.dispatch(permit);
@@ -1106,17 +1207,6 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
         {
             return Err(SafeHostError::UnsupportedOrderFamily);
         }
-        let mutation = mutation_capability(command);
-        let capability = self.gateway.capability_snapshot();
-        let expected_version = if risk_increasing {
-            self.canary
-                .as_ref()
-                .ok_or(SafeHostError::CanaryEvidence)?
-                .capability_version
-        } else {
-            capability.version
-        };
-        capability.authorize(&self.binding, expected_version, now_ms, mutation)?;
         if risk_increasing {
             validate_canary_static(
                 &self.binding,
@@ -1360,6 +1450,30 @@ fn validate_canary_static(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_dispatch_admission(
+    capability: &HostAdmittedCapability,
+    evidence: &HostAdmissionEvidence,
+    binding: &GatewayBinding,
+    config_epoch: u64,
+    connection_generation: u64,
+    private_generation: u64,
+    now_ms: u64,
+    mutation: MutationCapability,
+) -> Result<(), CapabilityPromotionError> {
+    let scope = capability.scope();
+    if evidence.scope() != scope
+        || scope.binding() != binding
+        || scope.config_epoch() != config_epoch
+        || scope.connection_generation() != connection_generation
+        || scope.private_generation() != private_generation
+        || capability.expires_ms() != evidence.promotion_expires_ms()
+    {
+        return Err(CapabilityPromotionError::Scope);
+    }
+    capability.authorize(evidence, now_ms, mutation)
+}
+
 fn mutation_capability(command: &ExecutionCommand) -> MutationCapability {
     match command {
         ExecutionCommand::PlaceLimit(_) => MutationCapability::PlaceLimit,
@@ -1457,6 +1571,8 @@ pub enum SafeHostError {
     AsyncGateway(#[from] AsyncGatewayBoundaryError),
     #[error(transparent)]
     GatewayApi(#[from] GatewayApiError),
+    #[error(transparent)]
+    CapabilityPromotion(#[from] CapabilityPromotionError),
     #[error(transparent)]
     Account(#[from] AccountModelError),
     #[error(transparent)]

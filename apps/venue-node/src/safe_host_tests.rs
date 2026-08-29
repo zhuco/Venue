@@ -23,7 +23,11 @@ use venue_domain::domain::{
 };
 use venue_execution::{CommandJournal, CommandState, WriterLeaseError};
 use venue_gateway_api::{
-    CapabilityFlags, CapabilitySnapshot, GatewayBinding, GatewayMode, VenueId,
+    CanaryAdmissionReceipt, CapabilityFlags, CapabilityProbeCandidate, CapabilitySnapshot,
+    CompleteOrderFamilyEvidence, ControlAppliedReceipt, ControlState, EvidenceCommitment,
+    GatewayBinding, GatewayMode, HostAdmissionEvidence, HostAdmittedCapability,
+    OrderFamilyEvidence, OrderFamilySupport, OwnerRecoveryReceipt, PromotionScope, VenueId,
+    WalRecoveryReceipt, WriterFenceReceipt, promote_capability,
 };
 use venue_runtime::{AccountKey, StrategyBinding, StrategyInstanceKey, StrategyKind};
 
@@ -142,6 +146,14 @@ impl FakeGateway {
 
     fn with_empty_capability(mut self) -> Self {
         self.capability.flags = CapabilityFlags::empty();
+        self
+    }
+
+    fn with_read_only_capability(mut self) -> Self {
+        self.capability.flags = CapabilityFlags::READ_ACCOUNT
+            | CapabilityFlags::READ_ORDERS
+            | CapabilityFlags::READ_FILLS
+            | CapabilityFlags::PRIVATE_STREAM;
         self
     }
 }
@@ -421,10 +433,14 @@ impl AsyncPhysicalGateway for FakeAsyncGateway {
 
     fn dispatch(
         &mut self,
+        admitted_capability: HostAdmittedCapability,
+        admission_evidence: HostAdmissionEvidence,
         permit: crate::DispatchPermit,
     ) -> impl Future<Output = Result<GatewayDispatchResult, AsyncGatewayCallError<Self::Error>>> + Send
     {
-        let binding_matches = permit.binding() == &self.binding;
+        let binding_matches = permit.binding() == &self.binding
+            && admitted_capability.scope().binding() == &self.binding
+            && admitted_capability.scope() == admission_evidence.scope();
         let plan = self.dispatches.pop_front();
         let calls = Arc::clone(&self.dispatch_calls);
         let threads = Arc::clone(&self.runtime_threads);
@@ -491,6 +507,73 @@ fn canary_for(
         CommandId::new(command_id)?,
         DIGEST,
     )?)
+}
+
+fn commitment(byte: char) -> Result<EvidenceCommitment, Box<dyn std::error::Error>> {
+    Ok(EvidenceCommitment::new(byte.to_string().repeat(64))?)
+}
+
+fn admitted_capability(
+    binding: &GatewayBinding,
+    prepared: &crate::PreparedDispatch,
+    now_ms: u64,
+) -> Result<(HostAdmittedCapability, HostAdmissionEvidence), Box<dyn std::error::Error>> {
+    let scope = PromotionScope::new(
+        binding.clone(),
+        prepared.config_epoch(),
+        prepared.connection_generation(),
+        prepared.private_generation(),
+    )?;
+    let order_families = CompleteOrderFamilyEvidence::new(
+        OrderFamilyEvidence::new(OrderFamilySupport::Complete, commitment('1')?),
+        OrderFamilyEvidence::new(OrderFamilySupport::Complete, commitment('2')?),
+        OrderFamilyEvidence::new(OrderFamilySupport::Complete, commitment('3')?),
+    );
+    let expires_ms = now_ms.checked_add(10_000).ok_or("test expiry overflow")?;
+    let candidate = CapabilityProbeCandidate::from_snapshot(
+        CapabilitySnapshot {
+            binding: binding.clone(),
+            version: 7,
+            observed_ms: now_ms,
+            expires_ms,
+            flags: CapabilityFlags::READ_ACCOUNT
+                | CapabilityFlags::READ_ORDERS
+                | CapabilityFlags::READ_FILLS
+                | CapabilityFlags::PRIVATE_STREAM
+                | CapabilityFlags::TRADE
+                | CapabilityFlags::PLACE_LIMIT
+                | CapabilityFlags::PLACE_MARKET
+                | CapabilityFlags::CANCEL,
+        },
+        prepared.connection_generation(),
+        prepared.private_generation(),
+        order_families.clone(),
+        commitment('4')?,
+    )?;
+    let evidence = HostAdmissionEvidence::new(
+        scope.clone(),
+        expires_ms,
+        order_families,
+        ControlAppliedReceipt::new(
+            scope.clone(),
+            ControlState::Active,
+            1,
+            now_ms,
+            commitment('5')?,
+        )?,
+        OwnerRecoveryReceipt::new(scope.clone(), 1, now_ms, commitment('6')?)?,
+        WalRecoveryReceipt::new(scope.clone(), 1, 0, 0, now_ms, commitment('7')?)?,
+        WriterFenceReceipt::new(
+            scope.clone(),
+            prepared.writer_generation(),
+            prepared.writer_revision(),
+            now_ms,
+            commitment('8')?,
+        )?,
+        CanaryAdmissionReceipt::new(scope, 1, 7, now_ms, expires_ms, commitment('9')?)?,
+    )?;
+    let capability = promote_capability(&candidate, evidence.clone(), now_ms)?;
+    Ok((capability, evidence))
 }
 
 fn entry_command(
@@ -687,8 +770,15 @@ fn submitted_crash_becomes_unknown_and_uses_readback_without_dispatch()
         1_000,
     )?;
     let prepared = first.prepare_dispatch(command, 1_000)?;
+    let (capability, evidence) = admitted_capability(launch.binding(), &prepared, 1_000)?;
     assert!(matches!(
-        first.dispatch_with_crash(prepared, 1_000, TestCrashPoint::AfterSubmitted),
+        first.dispatch_with_crash(
+            prepared,
+            capability,
+            evidence,
+            1_000,
+            TestCrashPoint::AfterSubmitted
+        ),
         Err(SafeHostError::InjectedCrash)
     ));
     drop(first);
@@ -735,8 +825,15 @@ fn crash_after_gateway_ack_recovers_accepted_without_resubmission()
         1_000,
     )?;
     let prepared = first.prepare_dispatch(command, 1_000)?;
+    let (capability, evidence) = admitted_capability(launch.binding(), &prepared, 1_000)?;
     assert!(matches!(
-        first.dispatch_with_crash(prepared, 1_000, TestCrashPoint::AfterGatewayResult),
+        first.dispatch_with_crash(
+            prepared,
+            capability,
+            evidence,
+            1_000,
+            TestCrashPoint::AfterGatewayResult
+        ),
         Err(SafeHostError::InjectedCrash)
     ));
     drop(first);
@@ -796,9 +893,10 @@ fn ack_then_disconnect_stays_unknown_until_signed_readback_and_never_retries()
         1_000,
     )?;
     let prepared = host.prepare_dispatch(command.clone(), 1_000)?;
+    let (capability, evidence) = admitted_capability(launch.binding(), &prepared, 1_000)?;
 
     assert_eq!(
-        host.dispatch_prepared(prepared, 1_000)?,
+        host.dispatch_prepared(prepared, capability, evidence, 1_000)?,
         DispatchOutcome::Unknown
     );
     host.recover_unknowns(1_200)?;
@@ -856,9 +954,10 @@ fn async_timeout_and_disconnect_become_unknown_then_exact_readback_without_resub
             1_000,
         )?;
         let prepared = host.prepare_dispatch(command.clone(), 1_000)?;
+        let (capability, evidence) = admitted_capability(launch.binding(), &prepared, 1_000)?;
 
         assert_eq!(
-            host.dispatch_prepared(prepared, 1_000)?,
+            host.dispatch_prepared(prepared, capability, evidence, 1_000)?,
             DispatchOutcome::Unknown
         );
         assert_eq!(counters.dispatch.load(Ordering::SeqCst), 1);
@@ -936,6 +1035,63 @@ fn empty_capability_fails_before_artifacts_or_gateway_calls()
 }
 
 #[test]
+fn read_only_recovery_capability_connects_but_does_not_grant_mutation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let launch = launch(&directory, "LIVE")?;
+    let owner = owner(launch.binding())?;
+    let dispatch_calls = Arc::new(AtomicUsize::new(0));
+    let host = NodeSafetyHost::open_for_test(
+        &launch,
+        owner,
+        FakeGateway::new(launch.binding().clone(), vec![ReadbackPlan::initial()])
+            .with_read_only_capability()
+            .with_counter(Arc::clone(&dispatch_calls)),
+        None,
+        1_000,
+    )?;
+
+    assert_eq!(host.binding(), launch.binding());
+    assert_eq!(dispatch_calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[test]
+fn mismatched_host_admission_fails_before_physical_mutation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let launch = launch(&directory, "LIVE")?;
+    let owner = owner(launch.binding())?;
+    let dispatch_calls = Arc::new(AtomicUsize::new(0));
+    let command = entry_command(launch.binding(), "stale_host_admission")?;
+    let mut host = NodeSafetyHost::open_for_test(
+        &launch,
+        owner.clone(),
+        FakeGateway::new(launch.binding().clone(), vec![ReadbackPlan::initial()])
+            .with_counter(Arc::clone(&dispatch_calls)),
+        Some(canary_for(
+            launch.binding(),
+            &owner,
+            "stale_host_admission",
+        )?),
+        1_000,
+    )?;
+    let prepared = host.prepare_dispatch(command, 1_000)?;
+    let (capability, _) = admitted_capability(launch.binding(), &prepared, 1_000)?;
+    let (_, drifted_evidence) = admitted_capability(launch.binding(), &prepared, 1_001)?;
+
+    assert!(matches!(
+        host.dispatch_prepared(prepared, capability, drifted_evidence, 1_001),
+        Err(SafeHostError::CapabilityPromotion(
+            venue_gateway_api::CapabilityPromotionError::Scope
+                | venue_gateway_api::CapabilityPromotionError::Drift
+        ))
+    ));
+    assert_eq!(dispatch_calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[test]
 fn unsupported_signed_order_family_cannot_be_opened_by_capability_flags()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
@@ -988,10 +1144,11 @@ fn writer_renewal_revokes_a_prepared_dispatch_before_gateway_call()
         1_000,
     )?;
     let prepared = host.prepare_dispatch(command, 1_000)?;
+    let (capability, evidence) = admitted_capability(launch.binding(), &prepared, 1_000)?;
     host.renew_writer(2_000)?;
 
     assert!(matches!(
-        host.dispatch_prepared(prepared, 2_000),
+        host.dispatch_prepared(prepared, capability, evidence, 2_000),
         Err(SafeHostError::PreparedStale)
     ));
     assert_eq!(counter.load(Ordering::SeqCst), 0);
@@ -1181,8 +1338,9 @@ fn fake_rejected_readback_result_is_terminal_without_resubmit()
         1_000,
     )?;
     let prepared = host.prepare_dispatch(command, 1_000)?;
+    let (capability, evidence) = admitted_capability(launch.binding(), &prepared, 1_000)?;
     assert_eq!(
-        host.dispatch_prepared(prepared, 1_000)?,
+        host.dispatch_prepared(prepared, capability, evidence, 1_000)?,
         DispatchOutcome::Unknown
     );
     host.recover_unknowns(1_200)?;

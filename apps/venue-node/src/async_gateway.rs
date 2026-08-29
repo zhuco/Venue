@@ -1,6 +1,9 @@
 use std::{future::Future, time::Duration};
 
-use venue_gateway_api::{CapabilityFlags, CapabilitySnapshot, GatewayBinding};
+use venue_gateway_api::{
+    CapabilityFlags, CapabilitySnapshot, GatewayBinding, HostAdmissionEvidence,
+    HostAdmittedCapability,
+};
 
 use crate::{
     DispatchPermit, GatewayDispatchResult, GatewayRecoveryPermit, PhysicalGateway,
@@ -38,6 +41,8 @@ pub trait AsyncPhysicalGateway {
 
     fn dispatch(
         &mut self,
+        admitted_capability: HostAdmittedCapability,
+        admission_evidence: HostAdmissionEvidence,
         permit: DispatchPermit,
     ) -> impl Future<Output = Result<GatewayDispatchResult, AsyncGatewayCallError<Self::Error>>> + Send;
 }
@@ -152,7 +157,15 @@ impl<G: AsyncPhysicalGateway, R: TokioRuntimeDriver> TokioPhysicalGateway<G, R> 
     }
 
     fn dispatch_linear(&mut self, permit: DispatchPermit) -> GatewayDispatchResult {
-        let future = self.adapter.dispatch(permit);
+        let Ok((admitted_capability, admission_evidence, permit)) = permit.into_async_parts()
+        else {
+            return GatewayDispatchResult::Rejected {
+                reason_code: "host_admission_invalid".to_owned(),
+            };
+        };
+        let future = self
+            .adapter
+            .dispatch(admitted_capability, admission_evidence, permit);
         match self.runtime.run(self.timeouts.dispatch, future) {
             TokioRuntimeRun::Completed(Ok(result)) => result,
             TokioRuntimeRun::TimedOut
@@ -218,7 +231,6 @@ pub(crate) fn validate_capability_preflight(
         | CapabilityFlags::READ_FILLS
         | CapabilityFlags::PRIVATE_STREAM;
     if !capability.flags.contains(recovery_reads)
-        || !capability.flags.contains(CapabilityFlags::TRADE)
         || capability.flags.contains(CapabilityFlags::WITHDRAW)
     {
         return Err(AsyncGatewayBoundaryError::CapabilityIncomplete);
@@ -230,7 +242,7 @@ pub(crate) fn validate_capability_preflight(
 pub enum AsyncGatewayBoundaryError {
     #[error("async gateway capability is empty and remains fail-closed")]
     CapabilityClosed,
-    #[error("async gateway capability does not cover complete recovery and trade evidence")]
+    #[error("async gateway capability does not cover complete recovery read evidence")]
     CapabilityIncomplete,
     #[error("async gateway capability does not match the fixed node binding")]
     CapabilityScope,
