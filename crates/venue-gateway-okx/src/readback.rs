@@ -460,7 +460,8 @@ pub fn advance_private_page(page: &OkxRawPrivatePage) -> Result<OkxPrivatePageAd
         return Err(OkxError::Pagination);
     }
     let ids = private_page_ids(page)?;
-    validate_page_ids(&ids, None)?;
+    let previous_after = page.request_after.as_deref().map(numeric_id).transpose()?;
+    validate_page_ids(&ids, previous_after)?;
     if ids.len() < usize::from(OKX_PRIVATE_PAGE_LIMIT) {
         return Ok(OkxPrivatePageAdvance::Closed);
     }
@@ -570,6 +571,9 @@ pub fn complete_private_readback(
 
     let account_raw = one_unpaged(&mut grouped, OkxPrivateSurface::AccountConfig)?;
     let profile = crate::parse_account_profile(&account_raw.payload, scope.expected_position_mode)?;
+    if !profile.supports_trade_mode(scope.trade_mode) {
+        return Err(OkxError::Binding);
+    }
     let balance_raw = one_unpaged(&mut grouped, OkxPrivateSurface::Balance)?;
     let balance = crate::parse_balance(&balance_raw.payload, &config_from_scope(scope)?, &profile)?;
     if balance.update_time_ms > balance_raw.received_at_ms {
@@ -679,8 +683,6 @@ struct StrictPositionRow {
     avg_px: String,
     mark_px: String,
     u_time: String,
-    #[serde(default)]
-    p_time: String,
 }
 
 fn parse_strict_positions(
@@ -704,7 +706,6 @@ fn parse_strict_positions(
                 avg_px: row.avg_px,
                 mark_px: row.mark_px,
                 u_time: row.u_time,
-                p_time: row.p_time,
             },
             instrument,
             profile,
@@ -1381,6 +1382,63 @@ mod tests {
         pages.push(page(next, empty())?);
         let candidate = complete_private_readback(&scope, &instrument, pages)?;
         assert_eq!(candidate.fills.len(), 100);
+        Ok(())
+    }
+
+    #[test]
+    fn net_short_sign_is_preserved_and_account_level_rejects_isolated_mode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (config, instrument, _) = setup()?;
+        let net_scope = OkxPrivateReadScope::new(
+            &config,
+            &instrument,
+            OkxPositionMode::Net,
+            OkxTradeMode::Cross,
+            12,
+        )?;
+        let mut pages = all_empty_pages(&net_scope)?;
+        for raw in &mut pages {
+            raw.payload = match raw.surface {
+                OkxPrivateSurface::AccountConfig => br#"{"code":"0","msg":"","data":[{"uid":"fixture-sub-account","mainUid":"fixture-main-account","acctLv":"3","posMode":"net_mode"}]}"#.to_vec(),
+                OkxPrivateSurface::Positions => br#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","mgnMode":"cross","posSide":"net","pos":"-2","avgPx":"60000","markPx":"59000","uTime":"1899999999000"}]}"#.to_vec(),
+                _ => continue,
+            };
+            raw.payload_sha256 = payload_digest(&raw.payload);
+        }
+        let candidate = complete_private_readback(&net_scope, &instrument, pages)?;
+        assert_eq!(candidate.positions.len(), 1);
+        assert_eq!(candidate.positions[0].position.side, PositionSide::Net);
+        assert_eq!(
+            candidate.positions[0].position.quantity,
+            Decimal::new(-2, 1)
+        );
+
+        let isolated_scope = OkxPrivateReadScope::new(
+            &config,
+            &instrument,
+            OkxPositionMode::LongShort,
+            OkxTradeMode::Isolated,
+            13,
+        )?;
+        assert_eq!(
+            complete_private_readback(
+                &isolated_scope,
+                &instrument,
+                all_empty_pages(&isolated_scope)?,
+            ),
+            Err(OkxError::Binding)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn next_cursor_is_not_derived_from_a_page_outside_its_requested_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, _, scope) = setup()?;
+        let request = build_fills_request(&scope, 1, Some("200"))?;
+        let payload = br#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","billId":"200","ordId":"200","clOrdId":"c200","fillPx":"60000","fillSz":"1","side":"buy","posSide":"long","feeCcy":"USDT","fee":"-1","ts":"100","fillTime":"100","execType":"M"}]}"#;
+        let raw = page(request, payload.as_slice())?;
+        assert_eq!(advance_private_page(&raw), Err(OkxError::Sequence));
         Ok(())
     }
 }

@@ -84,8 +84,6 @@ pub struct PositionRow {
     pub avg_px: String,
     pub mark_px: String,
     pub u_time: String,
-    #[serde(default)]
-    pub p_time: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]

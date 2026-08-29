@@ -53,7 +53,10 @@ impl OkxExecutionScope {
         trade_mode: OkxTradeMode,
     ) -> Result<Self, OkxError> {
         instrument.validate_scope(config)?;
-        if profile.uid().is_empty() || profile.main_uid().is_empty() {
+        if profile.uid().is_empty()
+            || profile.main_uid().is_empty()
+            || !profile.supports_trade_mode(trade_mode)
+        {
             return Err(OkxError::Binding);
         }
         Ok(Self {
@@ -317,6 +320,9 @@ pub struct OkxAcceptedOrder {
     order_id: String,
     client_order_id: String,
     accepted_at_ms: u64,
+    ack_received_at_ms: u64,
+    ack_payload_sha256: String,
+    raw_ack_payload: Vec<u8>,
     side: OrderSide,
     position_side: PositionSide,
     quantity: Decimal,
@@ -340,9 +346,24 @@ impl OkxAcceptedOrder {
     pub const fn accepted_at_ms(&self) -> u64 {
         self.accepted_at_ms
     }
+
+    #[must_use]
+    pub const fn ack_received_at_ms(&self) -> u64 {
+        self.ack_received_at_ms
+    }
     #[must_use]
     pub const fn scope(&self) -> &OkxExecutionScope {
         &self.scope
+    }
+
+    #[must_use]
+    pub fn ack_payload_sha256(&self) -> &str {
+        &self.ack_payload_sha256
+    }
+
+    #[must_use]
+    pub fn raw_ack_payload(&self) -> &[u8] {
+        &self.raw_ack_payload
     }
 }
 
@@ -358,19 +379,27 @@ struct AckRow {
 }
 
 pub fn parse_place_ack(
-    payload: &[u8],
+    response: OkxHttpResponse,
     request: &OkxPlaceRequest,
 ) -> Result<OkxAcceptedOrder, OkxError> {
-    let row = one_ack(payload)?;
+    validate_http_response(&response, &request.scope)?;
+    let row = one_ack(&response.body)?;
     if row.cl_ord_id != request.client_order_id {
         return Err(OkxError::Identity);
     }
     validate_order_id(&row.ord_id)?;
+    let accepted_at_ms = positive_u64(&row.ts)?;
+    if accepted_at_ms > response.received_at_ms {
+        return Err(OkxError::Sequence);
+    }
     Ok(OkxAcceptedOrder {
         scope: request.scope.clone(),
         order_id: row.ord_id,
         client_order_id: row.cl_ord_id,
-        accepted_at_ms: positive_u64(&row.ts)?,
+        accepted_at_ms,
+        ack_received_at_ms: response.received_at_ms,
+        ack_payload_sha256: crate::readback::payload_digest(&response.body),
+        raw_ack_payload: response.body.to_vec(),
         side: request.side,
         position_side: request.position_side,
         quantity: request.quantity,
@@ -444,6 +473,9 @@ pub struct OkxAcceptedCancel {
     order_id: String,
     client_order_id: String,
     accepted_at_ms: u64,
+    ack_received_at_ms: u64,
+    ack_payload_sha256: String,
+    raw_ack_payload: Vec<u8>,
 }
 
 impl OkxAcceptedCancel {
@@ -459,21 +491,44 @@ impl OkxAcceptedCancel {
     pub const fn accepted_at_ms(&self) -> u64 {
         self.accepted_at_ms
     }
+
+    #[must_use]
+    pub const fn ack_received_at_ms(&self) -> u64 {
+        self.ack_received_at_ms
+    }
+
+    #[must_use]
+    pub fn ack_payload_sha256(&self) -> &str {
+        &self.ack_payload_sha256
+    }
+
+    #[must_use]
+    pub fn raw_ack_payload(&self) -> &[u8] {
+        &self.raw_ack_payload
+    }
 }
 
 pub fn parse_cancel_ack(
-    payload: &[u8],
+    response: OkxHttpResponse,
     request: &OkxCancelRequest,
 ) -> Result<OkxAcceptedCancel, OkxError> {
-    let row = one_ack(payload)?;
+    validate_http_response(&response, &request.scope)?;
+    let row = one_ack(&response.body)?;
     if row.ord_id != request.order_id || row.cl_ord_id != request.client_order_id {
         return Err(OkxError::Identity);
+    }
+    let accepted_at_ms = positive_u64(&row.ts)?;
+    if accepted_at_ms > response.received_at_ms {
+        return Err(OkxError::Sequence);
     }
     Ok(OkxAcceptedCancel {
         scope: request.scope.clone(),
         order_id: row.ord_id,
         client_order_id: row.cl_ord_id,
-        accepted_at_ms: positive_u64(&row.ts)?,
+        accepted_at_ms,
+        ack_received_at_ms: response.received_at_ms,
+        ack_payload_sha256: crate::readback::payload_digest(&response.body),
+        raw_ack_payload: response.body.to_vec(),
     })
 }
 
@@ -493,6 +548,39 @@ pub struct OkxOrderReadbackRequest {
     scope: OkxExecutionScope,
     request_path: String,
     expected: OkxAcceptedOrder,
+    anchor: OkxOrderReadbackAnchor,
+    not_before_ms: u64,
+}
+
+fn validate_http_response(
+    response: &OkxHttpResponse,
+    scope: &OkxExecutionScope,
+) -> Result<(), OkxError> {
+    if response.binding != *scope.gateway_binding()
+        || response.instrument_generation != scope.instrument_generation()
+        || response.received_at_ms == 0
+        || response.body.is_empty()
+    {
+        return Err(OkxError::Binding);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OkxOrderReadbackAnchor {
+    PlaceAck,
+    CancelAck,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OkxOrderReadback {
+    pub scope: OkxExecutionScope,
+    pub anchor: OkxOrderReadbackAnchor,
+    pub request_path: String,
+    pub received_at_ms: u64,
+    pub payload_sha256: String,
+    pub raw_payload: Vec<u8>,
+    pub order: OkxTimedOrder,
 }
 
 /// Exact post-dispatch readback keyed by the original client identity. It is usable when the
@@ -561,6 +649,39 @@ pub fn build_order_readback_request(
             accepted.order_id
         ),
         expected: accepted.clone(),
+        anchor: OkxOrderReadbackAnchor::PlaceAck,
+        not_before_ms: accepted.ack_received_at_ms,
+    })
+}
+
+pub fn build_cancel_order_readback_request(
+    config: &OkxConfig,
+    instrument: &OkxInstrument,
+    profile: &OkxAccountProfile,
+    accepted_order: &OkxAcceptedOrder,
+    accepted_cancel: &OkxAcceptedCancel,
+) -> Result<OkxOrderReadbackRequest, OkxError> {
+    accepted_order.scope.validate(config, instrument, profile)?;
+    if accepted_cancel.scope != accepted_order.scope
+        || accepted_cancel.order_id != accepted_order.order_id
+        || accepted_cancel.client_order_id != accepted_order.client_order_id
+        || accepted_cancel.accepted_at_ms < accepted_order.accepted_at_ms
+        || accepted_cancel.ack_received_at_ms < accepted_order.ack_received_at_ms
+    {
+        return Err(OkxError::Identity);
+    }
+    validate_order_id(&accepted_order.order_id)?;
+    Ok(OkxOrderReadbackRequest {
+        scope: accepted_order.scope.clone(),
+        request_path: format!(
+            "{}?instId={}&ordId={}",
+            endpoints::PLACE_ORDER,
+            instrument.native_id(),
+            accepted_order.order_id
+        ),
+        expected: accepted_order.clone(),
+        anchor: OkxOrderReadbackAnchor::CancelAck,
+        not_before_ms: accepted_cancel.ack_received_at_ms,
     })
 }
 
@@ -605,11 +726,15 @@ struct DetailRow {
 }
 
 pub fn parse_order_detail(
-    payload: &[u8],
+    response: OkxHttpResponse,
     request: &OkxOrderReadbackRequest,
-) -> Result<OkxTimedOrder, OkxError> {
-    parse_bound_order_detail(
-        payload,
+) -> Result<OkxOrderReadback, OkxError> {
+    validate_http_response(&response, &request.scope)?;
+    if response.received_at_ms < request.not_before_ms {
+        return Err(OkxError::Sequence);
+    }
+    let order = parse_bound_order_detail(
+        &response.body,
         &request.scope,
         Some(&request.expected.order_id),
         &request.expected.client_order_id,
@@ -621,19 +746,26 @@ pub fn parse_order_detail(
         request.expected.purpose,
         request.expected.reduce_only,
         request.expected.order_type,
-    )
+    )?;
+    if order.update_time_ms > response.received_at_ms {
+        return Err(OkxError::Sequence);
+    }
+    Ok(OkxOrderReadback {
+        scope: request.scope.clone(),
+        anchor: request.anchor,
+        request_path: request.request_path.clone(),
+        received_at_ms: response.received_at_ms,
+        payload_sha256: crate::readback::payload_digest(&response.body),
+        raw_payload: response.body.to_vec(),
+        order,
+    })
 }
 
 pub fn parse_unknown_order_readback(
     response: OkxHttpResponse,
     request: &OkxUnknownOrderReadbackRequest,
 ) -> Result<OkxUnknownOrderReadback, OkxError> {
-    if response.binding != *request.scope.gateway_binding()
-        || response.instrument_generation != request.scope.instrument_generation()
-        || response.received_at_ms == 0
-    {
-        return Err(OkxError::Binding);
-    }
+    validate_http_response(&response, &request.scope)?;
     let order = parse_bound_order_detail(
         &response.body,
         &request.scope,
@@ -847,6 +979,20 @@ mod tests {
         })
     }
 
+    fn response(
+        config: &OkxConfig,
+        instrument: &OkxInstrument,
+        received_at_ms: u64,
+        payload: &'static [u8],
+    ) -> OkxHttpResponse {
+        OkxHttpResponse {
+            binding: config.gateway_binding().clone(),
+            instrument_generation: instrument.instrument().generation,
+            received_at_ms,
+            body: bytes::Bytes::from_static(payload),
+        }
+    }
+
     #[test]
     fn place_cancel_and_detail_form_one_bound_signed_flow() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -872,8 +1018,12 @@ mod tests {
         assert_eq!(headers.get("x-simulated-trading"), Some("1"));
 
         // sCode=0 is acceptance only; no terminal state is inferred here.
-        let accepted = parse_place_ack(PLACE_ACK, &place)?;
+        let accepted = parse_place_ack(
+            response(&config, &instrument, 1_787_911_200_350, PLACE_ACK),
+            &place,
+        )?;
         assert_eq!(accepted.order_id(), "7003");
+        assert_eq!(accepted.ack_payload_sha256().len(), 64);
         let cancel_command = CancelCommand {
             command_id: CommandId::new("cancel3")?,
             owner: owner(OrderPurpose::Reduce)?,
@@ -885,10 +1035,19 @@ mod tests {
             std::str::from_utf8(cancel.body())?,
             r#"{"instId":"BTC-USDT-SWAP","ordId":"7003"}"#
         );
-        let cancel_accepted = parse_cancel_ack(CANCEL_ACK, &cancel)?;
+        let cancel_accepted = parse_cancel_ack(
+            response(&config, &instrument, 1_787_911_200_450, CANCEL_ACK),
+            &cancel,
+        )?;
         assert_eq!(cancel_accepted.order_id(), "7003");
 
-        let readback = build_order_readback_request(&config, &instrument, &profile, &accepted)?;
+        let readback = build_cancel_order_readback_request(
+            &config,
+            &instrument,
+            &profile,
+            &accepted,
+            &cancel_accepted,
+        )?;
         assert_eq!(
             readback.request_path(),
             "/api/v5/trade/order?instId=BTC-USDT-SWAP&ordId=7003"
@@ -899,10 +1058,22 @@ mod tests {
             "2026-08-29T01:02:04.000Z",
         )?;
         assert_eq!(readback_headers.get("x-simulated-trading"), Some("1"));
-        let order = parse_order_detail(ORDER_DETAIL, &readback)?;
-        assert_eq!(order.order.state, OrderState::Cancelled);
-        assert_eq!(order.order.quantity, Decimal::new(2, 1));
-        assert!(order.order.reduce_only);
+        let order = parse_order_detail(
+            response(&config, &instrument, 1_787_911_200_600, ORDER_DETAIL),
+            &readback,
+        )?;
+        assert_eq!(order.anchor, OkxOrderReadbackAnchor::CancelAck);
+        assert_eq!(order.order.order.state, OrderState::Cancelled);
+        assert_eq!(order.order.order.quantity, Decimal::new(2, 1));
+        assert!(order.order.order.reduce_only);
+        assert_eq!(order.payload_sha256.len(), 64);
+        assert_eq!(
+            parse_order_detail(
+                response(&config, &instrument, 1_787_911_200_430, ORDER_DETAIL),
+                &readback,
+            ),
+            Err(OkxError::Sequence)
+        );
 
         let unknown = build_unknown_order_readback_request(&config, &instrument, &profile, &place)?;
         assert_eq!(
@@ -973,11 +1144,54 @@ mod tests {
             OkxPlaceIntent::Limit(&limit()?),
         )?;
         assert_eq!(
+            build_place_request(
+                &live,
+                &instrument,
+                &profile,
+                OkxTradeMode::Isolated,
+                OkxPlaceIntent::Limit(&limit()?),
+            ),
+            Err(OkxError::Binding)
+        );
+        let net_profile = crate::parse_account_profile(
+            br#"{"code":"0","msg":"","data":[{"uid":"fixture-sub-account","mainUid":"fixture-main-account","acctLv":"3","posMode":"net_mode"}]}"#,
+            OkxPositionMode::Net,
+        )?;
+        assert_eq!(
+            build_place_request(
+                &live,
+                &instrument,
+                &net_profile,
+                OkxTradeMode::Cross,
+                OkxPlaceIntent::Limit(&limit()?),
+            ),
+            Err(OkxError::PositionMode)
+        );
+        assert_eq!(
             parse_place_ack(
-                br#"{"code":"0","msg":"","data":[{"ordId":"7003","clOrdId":"wrong","ts":"1","sCode":"0","sMsg":""}]}"#,
-                &place
+                OkxHttpResponse {
+                    binding: live.gateway_binding().clone(),
+                    instrument_generation: instrument.instrument().generation,
+                    received_at_ms: 2,
+                    body: bytes::Bytes::from_static(
+                        br#"{"code":"0","msg":"","data":[{"ordId":"7003","clOrdId":"wrong","ts":"1","sCode":"0","sMsg":""}]}"#,
+                    ),
+                },
+                &place,
             ),
             Err(OkxError::Identity)
+        );
+        assert_eq!(
+            parse_place_ack(
+                OkxHttpResponse {
+                    binding: live.gateway_binding().clone(),
+                    instrument_generation: instrument.instrument().generation + 1,
+                    received_at_ms: 1_787_911_200_350,
+                    body: bytes::Bytes::from_static(PLACE_ACK),
+                },
+                &place,
+            ),
+            Err(OkxError::Binding)
         );
         let (test, _, _) = scope(GatewayMode::Test)?;
         assert_eq!(
