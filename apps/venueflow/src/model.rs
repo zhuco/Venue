@@ -104,6 +104,7 @@ impl AppModel {
             schema_version: CONTROL_SCHEMA_VERSION,
             request_id: format!("venueflow-{now_ms}-{}", self.request_sequence),
             venue: strategy.venue,
+            mode: strategy.mode,
             trading_account_id: strategy.trading_account_id.clone(),
             instance_id: strategy.instance_id.clone(),
             symbol: strategy.symbol.clone(),
@@ -129,7 +130,11 @@ pub fn format_decimal(value: Decimal, precision: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use venue_control_protocol::{CONTROL_SCHEMA_VERSION, ConnectionState, ControlSnapshot};
+    use rust_decimal::Decimal;
+    use venue_control_protocol::{
+        CONTROL_SCHEMA_VERSION, ConnectionState, ControlAction, ControlSnapshot, GatewayMode,
+        StrategyKind, StrategyLifecycle, StrategySummary, VenueId,
+    };
 
     use super::{AppModel, Preferences};
 
@@ -148,5 +153,34 @@ mod tests {
         });
         assert_eq!(model.connection, ConnectionState::Live);
         assert!(model.snapshot.is_some());
+    }
+
+    #[test]
+    fn command_scope_preserves_the_strategy_gateway_mode() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut model = AppModel::new(Preferences::default());
+        let strategy = StrategySummary {
+            instance_id: "grid-btc".to_owned(),
+            kind: StrategyKind::Grid,
+            venue: VenueId::Binance,
+            mode: GatewayMode::Test,
+            trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            symbol: "BTC/USDT".parse()?,
+            lifecycle: StrategyLifecycle::Running,
+            config_epoch: 7,
+            open_orders: 0,
+            long_quantity: Decimal::ZERO,
+            short_quantity: Decimal::ZERO,
+            realized_pnl: Decimal::ZERO,
+            unrealized_pnl: Decimal::ZERO,
+            last_receipt_ms: 1,
+            attention: None,
+        };
+
+        let request = model.begin_command(&strategy, ControlAction::Stop, 10);
+
+        assert_eq!(request.mode, GatewayMode::Test);
+        assert!(request.expected_confirmation().contains("mode=TEST"));
+        Ok(())
     }
 }

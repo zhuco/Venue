@@ -3,15 +3,17 @@
 //! These types are query projections and semantic control requests. They never grant physical
 //! mutation authority; an account node must independently validate every accepted request.
 
+use std::collections::BTreeSet;
+
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use venue_domain::Symbol;
-use venue_gateway_api::{GatewayMode, VenueId};
+pub use venue_gateway_api::{GatewayMode, VenueId};
 
-pub const CONTROL_SCHEMA_VERSION: u16 = 1;
-pub const SNAPSHOT_PATH: &str = "/v1/ui/snapshot";
-pub const EVENT_STREAM_PATH: &str = "/v1/ui/events";
-pub const COMMAND_PATH: &str = "/v1/control/commands";
+pub const CONTROL_SCHEMA_VERSION: u16 = 2;
+pub const SNAPSHOT_PATH: &str = "/v2/ui/snapshot";
+pub const EVENT_STREAM_PATH: &str = "/v2/ui/events";
+pub const COMMAND_PATH: &str = "/v2/control/commands";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -71,6 +73,7 @@ pub struct StrategySummary {
     pub instance_id: String,
     pub kind: StrategyKind,
     pub venue: VenueId,
+    pub mode: GatewayMode,
     pub trading_account_id: String,
     pub symbol: Symbol,
     pub lifecycle: StrategyLifecycle,
@@ -192,20 +195,215 @@ impl ControlSnapshot {
         if self.generated_ms == 0 {
             return Err(ProtocolError::GeneratedTime);
         }
+        let mut account_identities = BTreeSet::new();
         for account in &self.accounts {
             if !venue_domain::is_canonical_trading_account_id(&account.trading_account_id) {
                 return Err(ProtocolError::AccountId);
             }
+            if account.last_reconciled_ms > self.generated_ms
+                || (account.last_reconciled_ms != 0 && account.private_generation == 0)
+            {
+                return Err(ProtocolError::SnapshotTime);
+            }
+            if !account_identities.insert((
+                account.venue,
+                account.mode,
+                account.trading_account_id.as_str(),
+            )) {
+                return Err(ProtocolError::DuplicateIdentity);
+            }
         }
+        let mut strategy_identities = BTreeSet::new();
         for strategy in &self.strategies {
             if strategy.instance_id.trim().is_empty()
                 || !venue_domain::is_canonical_trading_account_id(&strategy.trading_account_id)
             {
                 return Err(ProtocolError::StrategyIdentity);
             }
+            if strategy.config_epoch == 0
+                || strategy.long_quantity.is_sign_negative()
+                || strategy.short_quantity.is_sign_negative()
+            {
+                return Err(ProtocolError::SnapshotValue);
+            }
+            if strategy.last_receipt_ms > self.generated_ms {
+                return Err(ProtocolError::SnapshotTime);
+            }
+            if strategy
+                .attention
+                .as_ref()
+                .is_some_and(|attention| attention.trim().is_empty())
+                || (strategy.lifecycle == StrategyLifecycle::NeedsAttention
+                    && strategy.attention.is_none())
+            {
+                return Err(ProtocolError::SnapshotContent);
+            }
+            if !strategy_identities.insert(strategy.instance_id.as_str()) {
+                return Err(ProtocolError::DuplicateIdentity);
+            }
+            if !account_identities.iter().any(|(venue, mode, account_id)| {
+                *venue == strategy.venue
+                    && *mode == strategy.mode
+                    && *account_id == strategy.trading_account_id
+            }) {
+                return Err(ProtocolError::StrategyIdentity);
+            }
         }
+        validate_copy_relations(&self.copy_relations, &strategy_identities)?;
+        validate_markets(&self.markets, self.generated_ms)?;
+        validate_ledger(&self.ledger, self.generated_ms)?;
         Ok(())
     }
+}
+
+fn validate_copy_relations(
+    relations: &[CopyRelationSummary],
+    strategy_identities: &BTreeSet<&str>,
+) -> Result<(), ProtocolError> {
+    let mut identities = BTreeSet::new();
+    for relation in relations {
+        if relation.leader_id.trim().is_empty()
+            || relation.follower_instance_id.trim().is_empty()
+            || relation.leader_id == relation.follower_instance_id
+            || !strategy_identities.contains(relation.follower_instance_id.as_str())
+            || relation
+                .last_applied_job
+                .as_ref()
+                .is_some_and(|job| job.trim().is_empty())
+        {
+            return Err(ProtocolError::SnapshotContent);
+        }
+        if !identities.insert((
+            relation.leader_id.as_str(),
+            relation.follower_instance_id.as_str(),
+            &relation.symbol,
+        )) {
+            return Err(ProtocolError::DuplicateIdentity);
+        }
+    }
+    Ok(())
+}
+
+fn validate_markets(markets: &[MarketSummary], generated_ms: u64) -> Result<(), ProtocolError> {
+    let mut market_identities = BTreeSet::new();
+    for market in markets {
+        if !market_identities.insert(&market.symbol) {
+            return Err(ProtocolError::DuplicateIdentity);
+        }
+        if !positive(market.last)
+            || !positive(market.bid)
+            || !positive(market.ask)
+            || market.bid > market.ask
+        {
+            return Err(ProtocolError::SnapshotValue);
+        }
+        validate_bars(&market.bars, generated_ms)?;
+        validate_book(&market.bids)?;
+        validate_book(&market.asks)?;
+        validate_trades(&market.trades, generated_ms)?;
+        validate_indicators(&market.indicators, generated_ms)?;
+    }
+    Ok(())
+}
+
+fn validate_bars(bars: &[UiBar], generated_ms: u64) -> Result<(), ProtocolError> {
+    let mut previous_open_time = None;
+    for bar in bars {
+        if bar.open_time_ms == 0 || bar.open_time_ms > generated_ms {
+            return Err(ProtocolError::SnapshotTime);
+        }
+        if previous_open_time.is_some_and(|previous| bar.open_time_ms <= previous) {
+            return Err(ProtocolError::SnapshotContent);
+        }
+        if !positive(bar.open)
+            || !positive(bar.high)
+            || !positive(bar.low)
+            || !positive(bar.close)
+            || bar.volume.is_sign_negative()
+            || bar.low > bar.open.min(bar.close)
+            || bar.high < bar.open.max(bar.close)
+            || bar.low > bar.high
+        {
+            return Err(ProtocolError::SnapshotValue);
+        }
+        previous_open_time = Some(bar.open_time_ms);
+    }
+    Ok(())
+}
+
+fn validate_book(levels: &[UiBookLevel]) -> Result<(), ProtocolError> {
+    let mut prices = BTreeSet::new();
+    for level in levels {
+        if !positive(level.price) || !positive(level.quantity) {
+            return Err(ProtocolError::SnapshotValue);
+        }
+        if !prices.insert(level.price) {
+            return Err(ProtocolError::DuplicateIdentity);
+        }
+    }
+    Ok(())
+}
+
+fn validate_trades(trades: &[UiTrade], generated_ms: u64) -> Result<(), ProtocolError> {
+    let mut identities = BTreeSet::new();
+    for trade in trades {
+        if trade.trade_id.trim().is_empty() {
+            return Err(ProtocolError::SnapshotContent);
+        }
+        if !identities.insert(trade.trade_id.as_str()) {
+            return Err(ProtocolError::DuplicateIdentity);
+        }
+        if trade.occurred_ms == 0 || trade.occurred_ms > generated_ms {
+            return Err(ProtocolError::SnapshotTime);
+        }
+        if !positive(trade.price) || !positive(trade.quantity) {
+            return Err(ProtocolError::SnapshotValue);
+        }
+    }
+    Ok(())
+}
+
+fn validate_indicators(
+    indicators: &[IndicatorValue],
+    generated_ms: u64,
+) -> Result<(), ProtocolError> {
+    let mut identities = BTreeSet::new();
+    for indicator in indicators {
+        if indicator.name.trim().is_empty() || indicator.source_version.trim().is_empty() {
+            return Err(ProtocolError::SnapshotContent);
+        }
+        if !identities.insert(indicator.name.as_str()) {
+            return Err(ProtocolError::DuplicateIdentity);
+        }
+        if indicator.observed_ms == 0 || indicator.observed_ms > generated_ms {
+            return Err(ProtocolError::SnapshotTime);
+        }
+    }
+    Ok(())
+}
+
+fn validate_ledger(ledger: &[LedgerEntry], generated_ms: u64) -> Result<(), ProtocolError> {
+    let mut receipt_identities = BTreeSet::new();
+    for entry in ledger {
+        if entry.receipt_id.trim().is_empty()
+            || entry.instance_id.trim().is_empty()
+            || entry.action.trim().is_empty()
+            || entry.state.trim().is_empty()
+        {
+            return Err(ProtocolError::SnapshotContent);
+        }
+        if entry.occurred_ms == 0 || entry.occurred_ms > generated_ms {
+            return Err(ProtocolError::SnapshotTime);
+        }
+        if !receipt_identities.insert(entry.receipt_id.as_str()) {
+            return Err(ProtocolError::DuplicateIdentity);
+        }
+    }
+    Ok(())
+}
+
+fn positive(value: Decimal) -> bool {
+    value.is_sign_positive() && !value.is_zero()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -239,6 +437,7 @@ pub struct ControlCommandRequest {
     pub schema_version: u16,
     pub request_id: String,
     pub venue: VenueId,
+    pub mode: GatewayMode,
     pub trading_account_id: String,
     pub instance_id: String,
     pub symbol: Symbol,
@@ -251,11 +450,15 @@ impl ControlCommandRequest {
     #[must_use]
     pub fn expected_confirmation(&self) -> String {
         format!(
-            "{} {} {} {}",
+            "{} venue={} mode={} trading_account_id={} symbol={} instance_id({})={} expected_config_epoch={}",
             self.action.as_str(),
             self.venue,
+            self.mode,
             self.trading_account_id,
-            self.symbol
+            self.symbol,
+            self.instance_id.len(),
+            self.instance_id,
+            self.expected_config_epoch,
         )
     }
 
@@ -300,12 +503,53 @@ pub struct CommandReceipt {
     pub detail: String,
 }
 
+impl CommandReceipt {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.schema_version != CONTROL_SCHEMA_VERSION {
+            return Err(ProtocolError::SchemaVersion);
+        }
+        if self.request_id.trim().is_empty() || self.receipt_id.trim().is_empty() {
+            return Err(ProtocolError::ReceiptIdentity);
+        }
+        if self.observed_ms == 0 {
+            return Err(ProtocolError::ReceiptTime);
+        }
+        if matches!(self.state, CommandState::Rejected | CommandState::Unknown)
+            && self.detail.trim().is_empty()
+        {
+            return Err(ProtocolError::ReceiptDetail);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum ControlEvent {
     Snapshot(ControlSnapshot),
     CommandReceipt(CommandReceipt),
     Notice { observed_ms: u64, message: String },
+}
+
+impl ControlEvent {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        match self {
+            Self::Snapshot(snapshot) => snapshot.validate(),
+            Self::CommandReceipt(receipt) => receipt.validate(),
+            Self::Notice {
+                observed_ms,
+                message,
+            } => {
+                if *observed_ms == 0 {
+                    return Err(ProtocolError::EventTime);
+                }
+                if message.trim().is_empty() {
+                    return Err(ProtocolError::EventContent);
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -324,6 +568,24 @@ pub enum ProtocolError {
     ConfigEpoch,
     #[error("high-risk control confirmation does not match the exact scope")]
     Confirmation,
+    #[error("control snapshot contains a duplicate identity")]
+    DuplicateIdentity,
+    #[error("control snapshot contains an invalid time or generation")]
+    SnapshotTime,
+    #[error("control snapshot contains an invalid numeric value")]
+    SnapshotValue,
+    #[error("control snapshot contains invalid nested content")]
+    SnapshotContent,
+    #[error("command receipt identity is missing")]
+    ReceiptIdentity,
+    #[error("command receipt observed time is missing")]
+    ReceiptTime,
+    #[error("rejected or unknown command receipt detail is missing")]
+    ReceiptDetail,
+    #[error("control event observed time is missing")]
+    EventTime,
+    #[error("control event content is missing")]
+    EventContent,
 }
 
 #[cfg(test)]
@@ -335,6 +597,7 @@ mod tests {
             schema_version: CONTROL_SCHEMA_VERSION,
             request_id: "request-1".to_owned(),
             venue: VenueId::Binance,
+            mode: GatewayMode::Live,
             trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             instance_id: "grid-btc".to_owned(),
             symbol: "BTC/USDT".parse()?,
@@ -357,6 +620,22 @@ mod tests {
     }
 
     #[test]
+    fn schema_v2_paths_and_mode_are_wire_required() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(CONTROL_SCHEMA_VERSION, 2);
+        assert_eq!(SNAPSHOT_PATH, "/v2/ui/snapshot");
+        assert_eq!(EVENT_STREAM_PATH, "/v2/ui/events");
+        assert_eq!(COMMAND_PATH, "/v2/control/commands");
+
+        let mut encoded = serde_json::to_value(request(ControlAction::Pause)?)?;
+        let object = encoded
+            .as_object_mut()
+            .ok_or("control request must encode as an object")?;
+        object.remove("mode");
+        assert!(serde_json::from_value::<ControlCommandRequest>(encoded).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn stop_and_flatten_require_exact_human_visible_scope() -> Result<(), Box<dyn std::error::Error>>
     {
         for action in [ControlAction::Stop, ControlAction::Flatten] {
@@ -367,6 +646,37 @@ mod tests {
             command.confirmation = Some("FLATTEN another-account BTC/USDT".to_owned());
             assert_eq!(command.validate(), Err(ProtocolError::Confirmation));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn high_risk_confirmation_cannot_be_replayed_across_any_scope_field()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = request(ControlAction::Stop)?;
+        command.confirmation = Some(command.expected_confirmation());
+        assert_eq!(command.validate(), Ok(()));
+
+        let mut changed = command.clone();
+        changed.action = ControlAction::Flatten;
+        assert_eq!(changed.validate(), Err(ProtocolError::Confirmation));
+        let mut changed = command.clone();
+        changed.venue = VenueId::Okx;
+        assert_eq!(changed.validate(), Err(ProtocolError::Confirmation));
+        let mut changed = command.clone();
+        changed.mode = GatewayMode::Test;
+        assert_eq!(changed.validate(), Err(ProtocolError::Confirmation));
+        let mut changed = command.clone();
+        changed.trading_account_id = "00000000-0000-4000-8000-000000000002".to_owned();
+        assert_eq!(changed.validate(), Err(ProtocolError::Confirmation));
+        let mut changed = command.clone();
+        changed.symbol = "ETH/USDT".parse()?;
+        assert_eq!(changed.validate(), Err(ProtocolError::Confirmation));
+        let mut changed = command.clone();
+        changed.instance_id = "grid-eth".to_owned();
+        assert_eq!(changed.validate(), Err(ProtocolError::Confirmation));
+        let mut changed = command;
+        changed.expected_config_epoch += 1;
+        assert_eq!(changed.validate(), Err(ProtocolError::Confirmation));
         Ok(())
     }
 
@@ -401,5 +711,238 @@ mod tests {
         });
         assert_eq!(snapshot.validate(), Err(ProtocolError::AccountId));
         Ok(())
+    }
+
+    #[test]
+    fn command_receipt_validates_identity_time_detail_and_round_trips()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let valid_receipt = receipt(CommandState::Applied, "");
+        assert_eq!(valid_receipt.validate(), Ok(()));
+        let encoded = serde_json::to_string(&valid_receipt)?;
+        assert_eq!(
+            serde_json::from_str::<CommandReceipt>(&encoded)?,
+            valid_receipt
+        );
+
+        let mut invalid = valid_receipt.clone();
+        invalid.schema_version += 1;
+        assert_eq!(invalid.validate(), Err(ProtocolError::SchemaVersion));
+        let mut invalid = valid_receipt.clone();
+        invalid.request_id = " ".to_owned();
+        assert_eq!(invalid.validate(), Err(ProtocolError::ReceiptIdentity));
+        let mut invalid = valid_receipt.clone();
+        invalid.receipt_id.clear();
+        assert_eq!(invalid.validate(), Err(ProtocolError::ReceiptIdentity));
+        let mut invalid = valid_receipt;
+        invalid.observed_ms = 0;
+        assert_eq!(invalid.validate(), Err(ProtocolError::ReceiptTime));
+        for state in [CommandState::Rejected, CommandState::Unknown] {
+            assert_eq!(
+                receipt(state, " ").validate(),
+                Err(ProtocolError::ReceiptDetail)
+            );
+            assert_eq!(receipt(state, "verified reason").validate(), Ok(()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn control_event_recursively_validates_and_round_trips()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let event = ControlEvent::Snapshot(snapshot()?);
+        assert_eq!(event.validate(), Ok(()));
+        let encoded = serde_json::to_string(&event)?;
+        assert_eq!(serde_json::from_str::<ControlEvent>(&encoded)?, event);
+
+        let mut invalid_snapshot = snapshot()?;
+        invalid_snapshot.generated_ms = 0;
+        assert_eq!(
+            ControlEvent::Snapshot(invalid_snapshot).validate(),
+            Err(ProtocolError::GeneratedTime)
+        );
+
+        let receipt_event = ControlEvent::CommandReceipt(receipt(CommandState::Unknown, "timeout"));
+        assert_eq!(receipt_event.validate(), Ok(()));
+        let mut invalid_receipt = receipt(CommandState::Unknown, "");
+        invalid_receipt.observed_ms = 0;
+        assert_eq!(
+            ControlEvent::CommandReceipt(invalid_receipt).validate(),
+            Err(ProtocolError::ReceiptTime)
+        );
+        assert_eq!(
+            ControlEvent::Notice {
+                observed_ms: 0,
+                message: "ready".to_owned(),
+            }
+            .validate(),
+            Err(ProtocolError::EventTime)
+        );
+        assert_eq!(
+            ControlEvent::Notice {
+                observed_ms: 10,
+                message: " ".to_owned(),
+            }
+            .validate(),
+            Err(ProtocolError::EventContent)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_rejects_duplicate_nested_identities() -> Result<(), Box<dyn std::error::Error>> {
+        let original = snapshot()?;
+
+        let mut duplicate = original.clone();
+        duplicate.accounts.push(duplicate.accounts[0].clone());
+        assert_eq!(duplicate.validate(), Err(ProtocolError::DuplicateIdentity));
+        let mut duplicate = original.clone();
+        duplicate.strategies.push(duplicate.strategies[0].clone());
+        assert_eq!(duplicate.validate(), Err(ProtocolError::DuplicateIdentity));
+        let mut duplicate = original.clone();
+        duplicate
+            .copy_relations
+            .push(duplicate.copy_relations[0].clone());
+        assert_eq!(duplicate.validate(), Err(ProtocolError::DuplicateIdentity));
+        let mut duplicate = original.clone();
+        duplicate.markets.push(duplicate.markets[0].clone());
+        assert_eq!(duplicate.validate(), Err(ProtocolError::DuplicateIdentity));
+        let mut duplicate = original;
+        duplicate.ledger.push(duplicate.ledger[0].clone());
+        assert_eq!(duplicate.validate(), Err(ProtocolError::DuplicateIdentity));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_rejects_invalid_nested_values_times_and_references()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let original = snapshot()?;
+
+        let mut invalid = original.clone();
+        invalid.strategies[0].long_quantity = Decimal::NEGATIVE_ONE;
+        assert_eq!(invalid.validate(), Err(ProtocolError::SnapshotValue));
+        let mut invalid = original.clone();
+        invalid.markets[0].bars[0].high = Decimal::new(9, 0);
+        assert_eq!(invalid.validate(), Err(ProtocolError::SnapshotValue));
+        let mut invalid = original.clone();
+        invalid.markets[0].trades[0].occurred_ms = invalid.generated_ms + 1;
+        assert_eq!(invalid.validate(), Err(ProtocolError::SnapshotTime));
+        let mut invalid = original.clone();
+        invalid.accounts[0].private_generation = 0;
+        assert_eq!(invalid.validate(), Err(ProtocolError::SnapshotTime));
+        let mut invalid = original.clone();
+        invalid.strategies[0].trading_account_id =
+            "00000000-0000-4000-8000-000000000002".to_owned();
+        assert_eq!(invalid.validate(), Err(ProtocolError::StrategyIdentity));
+        let mut invalid = original.clone();
+        invalid.strategies[0].mode = GatewayMode::Test;
+        assert_eq!(invalid.validate(), Err(ProtocolError::StrategyIdentity));
+        let mut invalid = original;
+        invalid.copy_relations[0].follower_instance_id = "missing".to_owned();
+        assert_eq!(invalid.validate(), Err(ProtocolError::SnapshotContent));
+        Ok(())
+    }
+
+    fn receipt(state: CommandState, detail: &str) -> CommandReceipt {
+        CommandReceipt {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            request_id: "request-1".to_owned(),
+            state,
+            receipt_id: "receipt-1".to_owned(),
+            observed_ms: 100,
+            detail: detail.to_owned(),
+        }
+    }
+
+    fn snapshot() -> Result<ControlSnapshot, Box<dyn std::error::Error>> {
+        let account_id = "00000000-0000-4000-8000-000000000001".to_owned();
+        let symbol: Symbol = "BTC/USDT".parse()?;
+        Ok(ControlSnapshot {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            generated_ms: 100,
+            connection: ConnectionState::Live,
+            accounts: vec![AccountSummary {
+                venue: VenueId::Binance,
+                mode: GatewayMode::Live,
+                trading_account_id: account_id.clone(),
+                health: HealthState::Healthy,
+                equity: Decimal::new(10_000, 0),
+                available_margin: Decimal::new(8_000, 0),
+                unrealized_pnl: Decimal::new(50, 0),
+                private_generation: 4,
+                writer_generation: 2,
+                last_reconciled_ms: 90,
+            }],
+            strategies: vec![StrategySummary {
+                instance_id: "copy-btc".to_owned(),
+                kind: StrategyKind::Copy,
+                venue: VenueId::Binance,
+                mode: GatewayMode::Live,
+                trading_account_id: account_id,
+                symbol: symbol.clone(),
+                lifecycle: StrategyLifecycle::Running,
+                config_epoch: 7,
+                open_orders: 1,
+                long_quantity: Decimal::ONE,
+                short_quantity: Decimal::ZERO,
+                realized_pnl: Decimal::new(10, 0),
+                unrealized_pnl: Decimal::new(5, 0),
+                last_receipt_ms: 95,
+                attention: None,
+            }],
+            copy_relations: vec![CopyRelationSummary {
+                leader_id: "leader-btc".to_owned(),
+                follower_instance_id: "copy-btc".to_owned(),
+                symbol: symbol.clone(),
+                target_exposure: Decimal::new(100, 0),
+                actual_exposure: Decimal::new(99, 0),
+                drift: Decimal::NEGATIVE_ONE,
+                status: CopyStatus::Tracking,
+                last_applied_job: Some("job-1".to_owned()),
+            }],
+            markets: vec![MarketSummary {
+                symbol,
+                last: Decimal::new(100, 0),
+                bid: Decimal::new(99, 0),
+                ask: Decimal::new(101, 0),
+                change_percent_24h: Decimal::new(5, 1),
+                bars: vec![UiBar {
+                    open_time_ms: 50,
+                    open: Decimal::new(98, 0),
+                    high: Decimal::new(102, 0),
+                    low: Decimal::new(97, 0),
+                    close: Decimal::new(100, 0),
+                    volume: Decimal::new(200, 0),
+                }],
+                bids: vec![UiBookLevel {
+                    price: Decimal::new(99, 0),
+                    quantity: Decimal::ONE,
+                }],
+                asks: vec![UiBookLevel {
+                    price: Decimal::new(101, 0),
+                    quantity: Decimal::ONE,
+                }],
+                trades: vec![UiTrade {
+                    trade_id: "trade-1".to_owned(),
+                    occurred_ms: 96,
+                    price: Decimal::new(100, 0),
+                    quantity: Decimal::ONE,
+                    aggressor: AggressorSide::Buy,
+                }],
+                indicators: vec![IndicatorValue {
+                    name: "rsi".to_owned(),
+                    value: Decimal::new(55, 0),
+                    observed_ms: 95,
+                    source_version: "v1".to_owned(),
+                }],
+            }],
+            ledger: vec![LedgerEntry {
+                receipt_id: "receipt-1".to_owned(),
+                instance_id: "copy-btc".to_owned(),
+                occurred_ms: 97,
+                action: "resume".to_owned(),
+                state: "applied".to_owned(),
+                detail: String::new(),
+            }],
+        })
     }
 }

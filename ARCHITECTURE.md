@@ -156,13 +156,17 @@ Leader Intent
 -> copy ledger and drift repair
 ```
 
-当前 `venue-copy` 已落地纯资本/目标敞口 reducer、确定性身份、数量 sizing 与跨所 LIMIT 转换。它只使用同 generation、同估值币种和
+当前 `venue-copy` 已落地纯资本/目标敞口 reducer、确定性身份、数量 sizing、跨所 LIMIT 转换、delivery/receipt 状态、幂等 ledger 与 drift repair。它只使用同 generation、同估值币种和
 有效期内的冻结资本事实，并按 configured、allocated、扣安全储备后的 available margin 三者最小值确定 follower 有效资本；
 跨零反向必须先平仓并等待新私有事实。规范 `InstrumentIdentity`、Precision、ContractSpec、metadata 与 snapshot 只存在于
 `venue-domain`：sizing 精确绑定 instrument/reference generation 与半开时效窗口，把 quote delta 向下归一为 base quantity 或
 contract lots，显式返回 reduce-only 与残差；LIMIT 只保留同一稳定 instrument 的相对偏移，BUY 向下、SELL 向上对齐且不得跨越
 风险边界。job、planning snapshot、child order 和 idempotency key 继续按 length-delimited SHA-256 与 domain separation 固化。
-这些 reducer 均不依赖 storage、network、runtime、native symbol 或 writer；outbox/inbox、ledger 与 drift repair 尚未接入。
+delivery manifest 把 job/snapshot/child/idempotency、leader/follower/account/instrument/policy、plan digest、generation 和短时效窗口绑定为不可变提交；
+账户节点持久回执只允许 Applied/Unknown/Reconciled/Rejected，Unknown 封存旧授权且只能由下一序号精确对账收敛。ledger 对精确重复
+no-op，拒绝冲突、跳序和 generation 回退，并显式区分 Copy、External、Manual 归因；drift repair 只从不超过 60 秒的新鲜权威持仓和
+可重算目标生成全新 job 的语义请求，跨零仍须先平仓再等待新私有事实。这些 reducer 均不依赖 storage、network、runtime、native symbol
+或 writer；transactional outbox/inbox、数据库 observer/lease 与账户 runtime 投递仍未接入。
 
 必须保留：
 
@@ -196,9 +200,9 @@ Copy planner/job-consumer lease 只允许竞争数据库 job 的规划或投递�
 | Binance | `venue-gateway-binance` | 已迁入 Portfolio Margin binding、TEST/LIVE 端点、secrecy 凭证、PAPI HMAC、exchangeInfo instrument rules、公共 BBO/深度/成交/闭合 bar raw envelope、账户/仓位/订单/成交/风险纯协议和七日有界成交分页；根签名 readback、transport 与 Stage 7 capability/WAL/writer 仍是生产权威 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
 | Bitget | `venue-gateway-bitget` | 已迁入 UTA TEST Demo/LIVE、凭证与 REST/WS 签名、公共市场、带时效 instrument metadata、账户/设置/持仓/normal 订单/成交同 attempt 五面候选与 raw 重放；不从官方未提供的字段猜 contract value；签名 transport/WS 与 Stage 7 capability/WAL/writer 仍留根 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
 | Gate.io | `venue-gateway-gate` | 已迁入 USDT perpetual TEST/LIVE、凭证/REST/WS 签名、公共市场、账户/持仓/风险、regular 订单/成交闭合分页；Stage 7 profile 候选重放 regular raw pages，并只把 Conditional/Algo 表示为显式 unsupported；签名采集 transport 与 Stage 7 capability/WAL/writer 仍留根 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
-| Bybit | `venue-gateway-bybit` | 已迁入 binding/端点/凭证/HMAC、USDT linear instrument/BBO 与 `cts/u/seq`，以及同 binding 的 UTA2 identity、UNIFIED 余额、linear positionIdx、挂单/历史/成交和显式分页闭合；旧未绑定 execution parser 已删除；transport/private stream/writer/WAL/capability 为空 | `TEST | LIVE`；完成最小安全闭环前仅纯协议/fixture，不得小额实盘 |
-| OKX | `venue-gateway-okx` | 已迁入 binding、模拟盘请求头、凭证/HMAC、linear SWAP instrument/BBO、账户模式/余额/仓位/挂单/成交与 after 分页；canonical limit/market/reduce 可编码 place/cancel 并解析 ack/签名详情回读，tdMode 只接受 Cross/Isolated、Net 意图拒绝；transport/writer/WAL/capability 为空 | `TEST | LIVE`；完成最小安全闭环前仅纯协议/fixture，不得小额实盘 |
-| Hyperliquid | `venue-gateway-hyperliquid` | 已迁入 user/symbol/mode binding、端点、命名 Agent secret、持久 nonce、meta/L2/BBO、clearinghouse/open orders/WS fills、inclusive fill cursor、绑定型 `/info` 与 `orderStatus` 恢复查询；`tid` 明确不是 sequence；EIP-712 action signing、transport/writer/WAL/capability 为空 | `TEST | LIVE`；完成最小安全闭环前仅纯协议/fixture，不得小额实盘 |
+| Bybit | `venue-gateway-bybit` | 已迁入 binding/端点/凭证/HMAC、USDT linear instrument/BBO 与 `cts/u/seq`，以及同 binding 的 UTA2 identity、UNIFIED 余额、linear positionIdx、挂单/历史/成交和显式分页闭合；纯 execution 可构造 place/cancel/reduce、校验 ACK 并要求显式闭合读回；transport/private stream/writer/WAL/capability 为空 | `TEST | LIVE`；完成最小安全闭环前仅纯协议/fixture，不得小额实盘 |
+| OKX | `venue-gateway-okx` | 已迁入 binding、模拟盘请求头、凭证/HMAC、linear SWAP instrument/BBO、账户模式/余额/仓位/挂单/成交与 after 分页；canonical limit/market/reduce 可编码 place/cancel 并解析 ack/签名详情回读，private WS 可校验 login 及 orders/account/positions 增量；tdMode 只接受 Cross/Isolated、Net 意图拒绝，transport/writer/WAL/capability 为空 | `TEST | LIVE`；完成最小安全闭环前仅纯协议/fixture，不得小额实盘 |
+| Hyperliquid | `venue-gateway-hyperliquid` | 已迁入 user/symbol/mode binding、端点、命名 Agent secret、持久 nonce、meta/L2/BBO、clearinghouse/open orders/WS fills、inclusive fill cursor、绑定型 `/info` 与 `orderStatus` 恢复查询，以及 `orderUpdates`、`userFills`、`userEvents` 的私流 generation 栅栏；`tid` 明确不是 sequence；EIP-712 action signing、transport/writer/WAL/capability 为空 | `TEST | LIVE`；完成最小安全闭环前仅纯协议/fixture，不得小额实盘 |
 
 KOL 网关只是协议 fixture 和差异对照来源，不继承其运行开关或实盘准入状态。前三所的生产权威继续来自 Venue 已验收实现。
 
@@ -234,7 +238,9 @@ core / series / ta / orderflow / registry
 ```
 
 迁移增量 `update/reset/warmup` 契约及算法测试；通过适配器消费 `venue-domain` 的 Bar、Trade、OrderBook，禁止复制权威
-行情类型。指标内部允许使用 `f64`，但任何价格、数量或风险 mutation 必须回到 Decimal 领域类型并重新校验。
+行情类型。规范 closed `PublicBar` 显式保留 base/quote volume、trade count 与 taker-buy base/quote volume 的 Known/Unavailable
+状态；Missing、Null、NotApplicable、负量、taker 超总量或可证明的 quote/price 边界矛盾均失败关闭。现有 feature builder 已真实消费
+bar base volume，并继续绑定 generation/provenance。指标内部允许使用 `f64`，但任何价格、数量或风险 mutation 必须回到 Decimal 领域类型并重新校验。
 
 `mas_frame`、`market_maker_*` 和其他策略特征不迁移。指标 crate 不读取凭证、数据库、WAL 或交易所客户端。
 
@@ -243,9 +249,9 @@ core / series / ta / orderflow / registry
 桌面技术栈固定为 Rust 2024、`eframe/egui`、`egui_tiles` 和 WGPU；异步网络使用 Tokio 与 WebSocket/SSE client。
 
 当前第一版 `apps/venueflow` 已用同一套 eframe/egui_tiles/WGPU 视图提供原生窗口与 WebAssembly canvas；native client 使用
-Tokio/reqwest/SSE，Web client 使用 reqwest/EventSource。`venue-control-protocol` schema v1 固定 `/v1/ui/snapshot`、
-`/v1/ui/events` 和 `/v1/control/commands` 的 DTO、receipt 与错误边界。两端只显示查询投影并提交语义控制请求；Stop/Flatten
-必须携带精确 account、symbol、action 与人工确认，服务端仍须重新验证。当前没有 Control server、数据库投影或交易执行连接。
+Tokio/reqwest/SSE，Web client 使用 reqwest/EventSource。`venue-control-protocol` schema v2 固定 `/v2/ui/snapshot`、
+`/v2/ui/events` 和 `/v2/control/commands` 的 DTO、递归校验、receipt 与错误边界。策略和命令都显式携带 `TEST | LIVE`，两端只显示查询投影并提交语义控制请求；Stop/Flatten
+必须携带精确 mode、account、symbol、instance、config epoch、action 与人工确认，服务端仍须重新验证。当前没有 Control server、数据库投影或交易执行连接。
 
 迁移范围：
 
@@ -254,7 +260,7 @@ Tokio/reqwest/SSE，Web client 使用 reqwest/EventSource。`venue-control-proto
 - Grid、Scalping、Copy 实例的查询、Pause/Stop/Flatten 与人工确认流程。
 
 删除 Alpha DTO、旧策略 analytics、模拟交易和 UI 内 mutation gate。VenueFlow 不持有交易所凭证，不直接连接交易所，
-不读取 PostgreSQL 或 artifacts，只调用版本化 Control protocol。高风险操作必须显示精确 account/symbol/action 并经服务端再次确认。
+不读取 PostgreSQL 或 artifacts，只调用版本化 Control protocol。高风险操作必须显示并确认精确 mode/account/symbol/instance/config epoch/action，服务端和账户 runtime 仍须独立重验。
 
 ## 11. Agent 边界
 

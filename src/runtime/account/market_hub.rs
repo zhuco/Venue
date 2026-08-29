@@ -260,6 +260,21 @@ mod tests {
                 high: Price::new(Decimal::new(101, 0))?,
                 low: Price::new(Decimal::new(99, 0))?,
                 close: Price::new(Decimal::new(100, 0))?,
+                base_volume: crate::domain::FieldState::Unavailable {
+                    reason: crate::domain::UnknownReason::SourceOmitted,
+                },
+                quote_volume: crate::domain::FieldState::Unavailable {
+                    reason: crate::domain::UnknownReason::SourceOmitted,
+                },
+                trade_count: crate::domain::FieldState::Unavailable {
+                    reason: crate::domain::UnknownReason::SourceOmitted,
+                },
+                taker_buy_base_volume: crate::domain::FieldState::Unavailable {
+                    reason: crate::domain::UnknownReason::SourceOmitted,
+                },
+                taker_buy_quote_volume: crate::domain::FieldState::Unavailable {
+                    reason: crate::domain::UnknownReason::SourceOmitted,
+                },
             }),
         )?)
     }

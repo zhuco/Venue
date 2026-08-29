@@ -103,6 +103,21 @@ fn bar(index: u64) -> Result<MarketEvent, Box<dyn std::error::Error>> {
         high: price(102 + index as i64)?,
         low: price(99 + index as i64)?,
         close: price(101 + index as i64)?,
+        base_volume: FieldState::Unavailable {
+            reason: venue::domain::UnknownReason::SourceOmitted,
+        },
+        quote_volume: FieldState::Unavailable {
+            reason: venue::domain::UnknownReason::SourceOmitted,
+        },
+        trade_count: FieldState::Unavailable {
+            reason: venue::domain::UnknownReason::SourceOmitted,
+        },
+        taker_buy_base_volume: FieldState::Unavailable {
+            reason: venue::domain::UnknownReason::SourceOmitted,
+        },
+        taker_buy_quote_volume: FieldState::Unavailable {
+            reason: venue::domain::UnknownReason::SourceOmitted,
+        },
     }))
 }
 

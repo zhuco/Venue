@@ -937,6 +937,21 @@ fn direct_resident_frames_admit_without_external_evidence() -> Result<(), Box<dy
                         high: Price::new(Decimal::new(101, 0))?,
                         low: Price::new(Decimal::new(98, 0))?,
                         close: Price::new(Decimal::new(100, 0))?,
+                        base_volume: FieldState::Unavailable {
+                            reason: crate::domain::UnknownReason::SourceOmitted,
+                        },
+                        quote_volume: FieldState::Unavailable {
+                            reason: crate::domain::UnknownReason::SourceOmitted,
+                        },
+                        trade_count: FieldState::Unavailable {
+                            reason: crate::domain::UnknownReason::SourceOmitted,
+                        },
+                        taker_buy_base_volume: FieldState::Unavailable {
+                            reason: crate::domain::UnknownReason::SourceOmitted,
+                        },
+                        taker_buy_quote_volume: FieldState::Unavailable {
+                            reason: crate::domain::UnknownReason::SourceOmitted,
+                        },
                     }),
                 },
                 generation: 1,

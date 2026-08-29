@@ -348,7 +348,7 @@ artifacts/<exchange>/<account>/
 
 现有 Stage 7 root 在迁移完成前继续使用原文件名。checkpoint、writer、WAL、JSONL、admission、capability 和 handoff 收据均为恢复工件，不得当普通日志删除。Binance 人工授权的外部 Algo 精确清理另写 `external_algo_cleanup.jsonl`：它与 `commands.jsonl` 分离，避免伪造策略 ownership，但同样是受保护的 hash-chain mutation WAL。
 
-通用 facts Journal 检测到崩溃留下的不完整尾部时，必须在任何新追加前截断到最后一条完整换行记录并 `fsync`；完整行的解码或序号错误仍失败关闭，不得修复或跳过。Checkpoint 和可重建 Projection 的原子替换必须使用同目录唯一临时文件，先同步文件再 rename，Unix 上 rename 后继续同步父目录；失败时不得将临时内容解释为权威状态。
+通用 facts Journal 在 open 与每次 append 前都必须权威重放；检测到崩溃留下的不完整尾部时，先截断到最后一条完整换行记录并 `fsync`，再重放并核对磁盘 next sequence 与内存一致，才允许追加。完整坏 JSON、空完整行、非 1 起始、断裂序号或外部完整推进均失败关闭，不得修复、跳过或覆盖。Checkpoint 和可重建 Projection 的原子替换必须使用同目录唯一临时文件，先同步文件再 rename，Unix 上 rename 后继续同步父目录；失败时不得将临时内容解释为权威状态。
 
 Stage 7 控制记录不存在时不得推断为 Running。只有同时不存在 checkpoint 与 control 的全新工件根，才可在取得该根唯一 writer guard 后一次性持久化 Running；已有 checkpoint 缺失 control 一律按 Stop 失败关闭。持久 Stopping 不得被普通启动或 Running 记录恢复，只有显式 Reset 且已满足停止清理不变量时才能推进到恢复态。
 
@@ -438,9 +438,9 @@ Gate、Bitget 当前 profile 只允许常规订单族，条件/Algo 由同一 pr
 
 ### E. 控制端
 
-本地 Control API 使用版本化 `venue-control-protocol`；原生 VenueFlow 与 WebAssembly canvas 共用
-`/v1/ui/snapshot`、`/v1/ui/events`、`/v1/control/commands`。两端只调用 API，不读取数据库、WAL 或 artifacts，
-不持有凭证，不直连交易所，不直接下单。Stop/Flatten 必须显示并提交精确 account、symbol、action 与人工确认；
+本地 Control API 使用 `venue-control-protocol` schema v2；原生 VenueFlow 与 WebAssembly canvas 共用
+`/v2/ui/snapshot`、`/v2/ui/events`、`/v2/control/commands`。策略投影和命令必须携带精确 `TEST | LIVE`，两端只调用 API，不读取数据库、WAL 或 artifacts，
+不持有凭证，不直连交易所，不直接下单。Stop/Flatten 必须显示并提交精确 mode、account、symbol、instance、config epoch、action 与人工确认；
 Control server 和账户节点仍须按 durable inbox、Actor applied、Execution Lane、risk、Owner、WAL 与 writer 边界重新验证。
 
 ## 12. 验收标准

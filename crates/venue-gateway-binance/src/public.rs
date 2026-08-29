@@ -13,8 +13,6 @@ use crate::{BinanceAccountBinding, native_symbol};
 const ONE_MINUTE_MS: u64 = 60_000;
 
 /// Immutable adapter evidence binding one normalized fact to the exact native payload and times.
-/// For bars, volume, trade-count, and taker-volume fields remain authoritative in `raw_payload`;
-/// `PublicBar` deliberately represents only the domain's completed OHLC subset.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BinancePublicEnvelope<T> {
     native_symbol: String,
@@ -213,7 +211,7 @@ pub fn parse_closed_bar(
     {
         return Err(BinancePublicError::Sequence);
     }
-    validate_complete_bar_evidence(kline)?;
+    let evidence = complete_bar_evidence(kline)?;
     let open = positive_price(kline.get("o"))?;
     let high = positive_price(kline.get("h"))?;
     let low = positive_price(kline.get("l"))?;
@@ -237,7 +235,15 @@ pub fn parse_closed_bar(
         high,
         low,
         close,
+        base_volume: FieldState::Known(evidence.base_volume),
+        quote_volume: FieldState::Known(evidence.quote_volume),
+        trade_count: FieldState::Known(evidence.trade_count),
+        taker_buy_base_volume: FieldState::Known(evidence.taker_buy_base_volume),
+        taker_buy_quote_volume: FieldState::Known(evidence.taker_buy_quote_volume),
     };
+    if !fact.is_valid() {
+        return Err(BinancePublicError::Value);
+    }
     Ok(envelope(
         payload,
         expected_native,
@@ -293,23 +299,33 @@ fn envelope<T>(
     }
 }
 
-fn validate_complete_bar_evidence(kline: &Map<String, Value>) -> Result<(), BinancePublicError> {
+struct CompleteBarEvidence {
+    trade_count: u64,
+    base_volume: Decimal,
+    quote_volume: Decimal,
+    taker_buy_base_volume: Decimal,
+    taker_buy_quote_volume: Decimal,
+}
+
+fn complete_bar_evidence(
+    kline: &Map<String, Value>,
+) -> Result<CompleteBarEvidence, BinancePublicError> {
     let first_trade_id = u64_value(kline.get("f"))?;
     let last_trade_id = u64_value(kline.get("L"))?;
     let trade_count = u64_value(kline.get("n"))?;
     let base_volume = non_negative_decimal(kline.get("v"))?;
     let quote_volume = non_negative_decimal(kline.get("q"))?;
-    let taker_base_volume = non_negative_decimal(kline.get("V"))?;
-    let taker_quote_volume = non_negative_decimal(kline.get("Q"))?;
-    if taker_base_volume > base_volume
-        || taker_quote_volume > quote_volume
+    let taker_buy_base_volume = non_negative_decimal(kline.get("V"))?;
+    let taker_buy_quote_volume = non_negative_decimal(kline.get("Q"))?;
+    if taker_buy_base_volume > base_volume
+        || taker_buy_quote_volume > quote_volume
         || (trade_count == 0
             && (first_trade_id != 0
                 || last_trade_id != 0
                 || !base_volume.is_zero()
                 || !quote_volume.is_zero()
-                || !taker_base_volume.is_zero()
-                || !taker_quote_volume.is_zero()))
+                || !taker_buy_base_volume.is_zero()
+                || !taker_buy_quote_volume.is_zero()))
         || (trade_count > 0
             && (first_trade_id == 0
                 || last_trade_id < first_trade_id
@@ -318,7 +334,13 @@ fn validate_complete_bar_evidence(kline: &Map<String, Value>) -> Result<(), Bina
     {
         return Err(BinancePublicError::Value);
     }
-    Ok(())
+    Ok(CompleteBarEvidence {
+        trade_count,
+        base_volume,
+        quote_volume,
+        taker_buy_base_volume,
+        taker_buy_quote_volume,
+    })
 }
 
 fn levels(

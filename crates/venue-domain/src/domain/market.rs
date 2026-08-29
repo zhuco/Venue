@@ -72,6 +72,110 @@ pub struct PublicBar {
     pub high: Price,
     pub low: Price,
     pub close: Price,
+    pub base_volume: FieldState<Decimal>,
+    pub quote_volume: FieldState<Decimal>,
+    pub trade_count: FieldState<u64>,
+    pub taker_buy_base_volume: FieldState<Decimal>,
+    pub taker_buy_quote_volume: FieldState<Decimal>,
+}
+
+impl PublicBar {
+    /// Validates only facts provable from normalized fields; unknown source fields remain unknown.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        let Some(span_ms) = self.close_time_ms.checked_sub(self.open_time_ms) else {
+            return false;
+        };
+        if self.generation == 0
+            || self.received_at_ms == 0
+            || self.sequence == 0
+            || self.interval_ms == 0
+            || (span_ms != self.interval_ms && span_ms.checked_add(1) != Some(self.interval_ms))
+            || self.high < self.open.max(self.close)
+            || self.low > self.open.min(self.close)
+            || self.high < self.low
+            || !explicit(&self.base_volume)
+            || !explicit(&self.quote_volume)
+            || !explicit(&self.trade_count)
+            || !explicit(&self.taker_buy_base_volume)
+            || !explicit(&self.taker_buy_quote_volume)
+            || !non_negative(&self.base_volume)
+            || !non_negative(&self.quote_volume)
+            || !non_negative(&self.taker_buy_base_volume)
+            || !non_negative(&self.taker_buy_quote_volume)
+            || !known_lte(&self.taker_buy_base_volume, &self.base_volume)
+            || !known_lte(&self.taker_buy_quote_volume, &self.quote_volume)
+            || !quote_is_price_bounded(&self.base_volume, &self.quote_volume, self.low, self.high)
+            || !quote_is_price_bounded(
+                &self.taker_buy_base_volume,
+                &self.taker_buy_quote_volume,
+                self.low,
+                self.high,
+            )
+        {
+            return false;
+        }
+        match self.trade_count {
+            FieldState::Known(0) => [
+                &self.base_volume,
+                &self.quote_volume,
+                &self.taker_buy_base_volume,
+                &self.taker_buy_quote_volume,
+            ]
+            .into_iter()
+            .all(known_zero),
+            FieldState::Known(_) => {
+                known_positive(&self.base_volume) && known_positive(&self.quote_volume)
+            }
+            _ => true,
+        }
+    }
+}
+
+fn explicit<T>(value: &FieldState<T>) -> bool {
+    matches!(value, FieldState::Known(_) | FieldState::Unavailable { .. })
+}
+
+fn non_negative(value: &FieldState<Decimal>) -> bool {
+    !matches!(value, FieldState::Known(value) if value.is_sign_negative())
+}
+
+fn known_lte(left: &FieldState<Decimal>, right: &FieldState<Decimal>) -> bool {
+    match (left, right) {
+        (FieldState::Known(left), FieldState::Known(right)) => left <= right,
+        (FieldState::Known(_), _) => false,
+        _ => true,
+    }
+}
+
+fn quote_is_price_bounded(
+    base: &FieldState<Decimal>,
+    quote: &FieldState<Decimal>,
+    low: Price,
+    high: Price,
+) -> bool {
+    let quote = match quote {
+        FieldState::Known(quote) => quote,
+        _ => return true,
+    };
+    let FieldState::Known(base) = base else {
+        return false;
+    };
+    let Some(minimum) = base.checked_mul(low.value()) else {
+        return false;
+    };
+    let Some(maximum) = base.checked_mul(high.value()) else {
+        return false;
+    };
+    *quote >= minimum && *quote <= maximum
+}
+
+fn known_positive(value: &FieldState<Decimal>) -> bool {
+    matches!(value, FieldState::Known(value) if *value > Decimal::ZERO)
+}
+
+fn known_zero(value: &FieldState<Decimal>) -> bool {
+    matches!(value, FieldState::Known(value) if value.is_zero())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -115,4 +219,96 @@ pub enum MarketEvent {
     Bar(PublicBar),
     Ticker(PublicTicker),
     MarkFunding(MarkFunding),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bar() -> Result<PublicBar, Box<dyn std::error::Error>> {
+        Ok(PublicBar {
+            symbol: "BTC/USDT".parse()?,
+            generation: 1,
+            received_at_ms: 60_000,
+            sequence: 1,
+            open_time_ms: 0,
+            close_time_ms: 59_999,
+            interval_ms: 60_000,
+            open: Price::new(Decimal::from(100))?,
+            high: Price::new(Decimal::from(110))?,
+            low: Price::new(Decimal::from(90))?,
+            close: Price::new(Decimal::from(105))?,
+            base_volume: FieldState::Known(Decimal::from(10)),
+            quote_volume: FieldState::Known(Decimal::from(1_000)),
+            trade_count: FieldState::Known(5),
+            taker_buy_base_volume: FieldState::Known(Decimal::from(4)),
+            taker_buy_quote_volume: FieldState::Known(Decimal::from(400)),
+        })
+    }
+
+    #[test]
+    fn completed_bar_accepts_known_or_explicitly_unknown_volume()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut value = bar()?;
+        assert!(value.is_valid());
+        value.quote_volume = FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        };
+        value.trade_count = FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        };
+        value.taker_buy_quote_volume = FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        };
+        assert!(value.is_valid());
+        let serialized = serde_json::to_value(&value)?;
+        assert_eq!(serialized["quote_volume"]["state"], "unavailable");
+        Ok(())
+    }
+
+    #[test]
+    fn completed_bar_rejects_unprovable_volume_and_time_claims()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut value = bar()?;
+        value.taker_buy_base_volume = FieldState::Known(Decimal::from(11));
+        assert!(!value.is_valid());
+
+        value = bar()?;
+        value.quote_volume = FieldState::Known(Decimal::from(2_000));
+        assert!(!value.is_valid());
+
+        value = bar()?;
+        value.trade_count = FieldState::Known(0);
+        assert!(!value.is_valid());
+
+        value = bar()?;
+        value.base_volume = FieldState::Known(-Decimal::ONE);
+        assert!(!value.is_valid());
+
+        value = bar()?;
+        value.base_volume = FieldState::Known(Decimal::ZERO);
+        value.quote_volume = FieldState::Known(Decimal::ZERO);
+        value.trade_count = FieldState::Known(0);
+        value.taker_buy_base_volume = FieldState::Known(Decimal::ZERO);
+        value.taker_buy_quote_volume = FieldState::Known(Decimal::ZERO);
+        assert!(value.is_valid());
+
+        value = bar()?;
+        value.open = Price::new(Decimal::MAX)?;
+        value.high = Price::new(Decimal::MAX)?;
+        value.low = Price::new(Decimal::MAX)?;
+        value.close = Price::new(Decimal::MAX)?;
+        value.base_volume = FieldState::Known(Decimal::MAX);
+        value.quote_volume = FieldState::Known(Decimal::MAX);
+        assert!(!value.is_valid());
+
+        value = bar()?;
+        value.base_volume = FieldState::Missing;
+        assert!(!value.is_valid());
+
+        value = bar()?;
+        value.received_at_ms = 1;
+        assert!(value.is_valid());
+        Ok(())
+    }
 }

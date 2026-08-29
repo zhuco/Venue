@@ -1520,18 +1520,16 @@ fn parse_bar(
     let high = required_price(kline.get("h"))?;
     let low = required_price(kline.get("l"))?;
     let close = required_price(kline.get("c"))?;
-    if close_time_ms <= open_time_ms
-        || high < open.max(close)
-        || low > open.min(close)
-        || high < low
-    {
-        return Err(BinanceError::Payload);
-    }
+    let base_volume = bar_decimal(kline.get("v"))?;
+    let quote_volume = bar_decimal(kline.get("q"))?;
+    let trade_count = bar_count(kline.get("n"))?;
+    let taker_buy_base_volume = bar_decimal(kline.get("V"))?;
+    let taker_buy_quote_volume = bar_decimal(kline.get("Q"))?;
     let sequence = open_time_ms
         .checked_div(INTERVAL_MS)
         .and_then(|value| value.checked_add(1))
         .ok_or(BinanceError::Sequence)?;
-    Ok(PublicBar {
+    let bar = PublicBar {
         symbol: record.symbol.clone(),
         generation: record.generation,
         received_at_ms: record.received_at_ms,
@@ -1543,7 +1541,13 @@ fn parse_bar(
         high,
         low,
         close,
-    })
+        base_volume,
+        quote_volume,
+        trade_count,
+        taker_buy_base_volume,
+        taker_buy_quote_volume,
+    };
+    bar.is_valid().then_some(bar).ok_or(BinanceError::Payload)
 }
 
 fn parse_rest_bar(record: &RawMarketRecord, value: &Value) -> Result<PublicBar, BinanceError> {
@@ -1558,18 +1562,16 @@ fn parse_rest_bar(record: &RawMarketRecord, value: &Value) -> Result<PublicBar, 
     let high = required_price(row.get(2))?;
     let low = required_price(row.get(3))?;
     let close = required_price(row.get(4))?;
-    if close_time_ms <= open_time_ms
-        || high < open.max(close)
-        || low > open.min(close)
-        || high < low
-    {
-        return Err(BinanceError::Payload);
-    }
+    let base_volume = bar_decimal(row.get(5))?;
+    let quote_volume = bar_decimal(row.get(7))?;
+    let trade_count = bar_count(row.get(8))?;
+    let taker_buy_base_volume = bar_decimal(row.get(9))?;
+    let taker_buy_quote_volume = bar_decimal(row.get(10))?;
     let sequence = open_time_ms
         .checked_div(INTERVAL_MS)
         .and_then(|value| value.checked_add(1))
         .ok_or(BinanceError::Sequence)?;
-    Ok(PublicBar {
+    let bar = PublicBar {
         symbol: record.symbol.clone(),
         generation: record.generation,
         received_at_ms: record.received_at_ms,
@@ -1581,7 +1583,13 @@ fn parse_rest_bar(record: &RawMarketRecord, value: &Value) -> Result<PublicBar, 
         high,
         low,
         close,
-    })
+        base_volume,
+        quote_volume,
+        trade_count,
+        taker_buy_base_volume,
+        taker_buy_quote_volume,
+    };
+    bar.is_valid().then_some(bar).ok_or(BinanceError::Payload)
 }
 
 pub fn split_closed_kline_bootstrap(
@@ -1897,6 +1905,28 @@ pub enum PrivateError {
     FillPage,
     #[error("Binance PAPI user-trades pagination exceeded its bounded page budget")]
     FillPageLimit,
+}
+fn bar_count(value: Option<&Value>) -> Result<FieldState<u64>, BinanceError> {
+    match value {
+        None | Some(Value::Null) => Ok(FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        }),
+        Some(value) => value
+            .as_u64()
+            .map(FieldState::Known)
+            .ok_or(BinanceError::Payload),
+    }
+}
+fn bar_decimal(value: Option<&Value>) -> Result<FieldState<Decimal>, BinanceError> {
+    match value {
+        None | Some(Value::Null) => Ok(FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        }),
+        Some(Value::String(raw)) => Decimal::from_str(raw)
+            .map(FieldState::Known)
+            .map_err(|_| BinanceError::Payload),
+        Some(_) => Err(BinanceError::Payload),
+    }
 }
 
 impl From<RecentFillsPaginationError> for PrivateError {

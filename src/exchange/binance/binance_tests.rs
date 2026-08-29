@@ -313,7 +313,7 @@ fn public_streams_preserve_unknowns_without_defaulting() -> Result<(), Box<dyn s
     let symbol: Symbol = "DOGE/USDT".parse()?;
     let trade = RawMarketRecord::new(RawSource::WebSocketTrade, symbol.clone(), 1, 1, r#"{"e":"aggTrade","E":1,"s":"DOGEUSDT","a":2,"p":"0.1","q":"50","nq":"5","f":3,"l":4,"T":1,"st":1}"#.to_owned())?;
     let ticker = RawMarketRecord::new(RawSource::WebSocketTicker, symbol.clone(), 1, 2, r#"{"e":"bookTicker","u":2,"E":2,"T":2,"s":"DOGEUSDT","b":"0.1","B":"50","a":"0.2","A":"25","st":1}"#.to_owned())?;
-    let bar = RawMarketRecord::new(RawSource::WebSocketKline, symbol.clone(), 1, 119_999, r#"{"e":"kline","E":119999,"s":"DOGEUSDT","st":1,"k":{"t":60000,"T":119999,"s":"DOGEUSDT","i":"1m","o":"0.1","h":"0.2","l":"0.09","c":"0.15","x":true}}"#.to_owned())?;
+    let bar = RawMarketRecord::new(RawSource::WebSocketKline, symbol.clone(), 1, 119_999, r#"{"e":"kline","E":119999,"s":"DOGEUSDT","st":1,"k":{"t":60000,"T":119999,"s":"DOGEUSDT","i":"1m","o":"0.1","h":"0.2","l":"0.09","c":"0.15","v":"50","q":"7.5","n":4,"V":"20","Q":"3","x":true}}"#.to_owned())?;
     let mark = RawMarketRecord::new(RawSource::WebSocketMarkFunding, symbol, 1, 3, r#"{"e":"markPriceUpdate","E":3,"s":"DOGEUSDT","p":"0.1","i":"0.1","r":"0.0001","T":4,"st":1}"#.to_owned())?;
 
     assert!(matches!(
@@ -332,8 +332,17 @@ fn public_streams_preserve_unknowns_without_defaulting() -> Result<(), Box<dyn s
         MarketEvent::Bar(PublicBar {
             sequence: 2,
             close,
+            base_volume: FieldState::Known(base_volume),
+            quote_volume: FieldState::Known(quote_volume),
+            trade_count: FieldState::Known(4),
+            taker_buy_base_volume: FieldState::Known(taker_buy_base_volume),
+            taker_buy_quote_volume: FieldState::Known(taker_buy_quote_volume),
             ..
         }) if close.value() == Decimal::new(15, 2)
+            && base_volume == Decimal::from(50)
+            && quote_volume == Decimal::new(75, 1)
+            && taker_buy_base_volume == Decimal::from(20)
+            && taker_buy_quote_volume == Decimal::from(3)
     ));
     assert!(matches!(
         normalize(&mark, "DOGEUSDT")?,
@@ -343,6 +352,22 @@ fn public_streams_preserve_unknowns_without_defaulting() -> Result<(), Box<dyn s
             ..
         })
     ));
+    Ok(())
+}
+
+#[test]
+fn completed_kline_rejects_inconsistent_volume_evidence() -> Result<(), Box<dyn std::error::Error>>
+{
+    let symbol: Symbol = "DOGE/USDT".parse()?;
+    let payload = r#"{"e":"kline","E":119999,"s":"DOGEUSDT","st":1,"k":{"t":60000,"T":119999,"s":"DOGEUSDT","i":"1m","o":"0.1","h":"0.2","l":"0.09","c":"0.15","v":"50","q":"7.5","n":4,"V":"51","Q":"3","x":true}}"#;
+    let record = RawMarketRecord::new(
+        RawSource::WebSocketKline,
+        symbol,
+        1,
+        119_999,
+        payload.to_owned(),
+    )?;
+    assert!(normalize(&record, "DOGEUSDT").is_err());
     Ok(())
 }
 

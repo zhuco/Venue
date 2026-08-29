@@ -45,6 +45,11 @@ impl CopyId {
     pub const fn as_bytes(&self) -> &[u8; UUID_BYTES] {
         &self.0
     }
+
+    #[must_use]
+    pub fn is_nil(&self) -> bool {
+        self.0 == [0; UUID_BYTES]
+    }
 }
 
 impl fmt::Display for CopyId {
@@ -67,6 +72,11 @@ impl IdempotencyKey {
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; DIGEST_BYTES] {
         &self.0
+    }
+
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        self.0 == [0; DIGEST_BYTES]
     }
 }
 
@@ -158,6 +168,10 @@ fn derive(domain: &[u8], parts: &[&[u8]]) -> [u8; DIGEST_BYTES] {
         hash.update(part);
     }
     hash.finalize().into()
+}
+
+pub(crate) fn derive_commitment(domain: &[u8], parts: &[&[u8]]) -> [u8; DIGEST_BYTES] {
+    derive(domain, parts)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]

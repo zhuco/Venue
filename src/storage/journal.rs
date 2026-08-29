@@ -29,21 +29,8 @@ pub struct JournalRecovery {
 impl Journal {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StorageError> {
         let path = path.into();
-        let mut recovery = recover_file(&path)?;
-        if recovery.truncated_tail {
-            truncate_incomplete_tail(&path)?;
-            recovery = recover_file(&path)?;
-            if recovery.truncated_tail {
-                return Err(StorageError::TailRepair);
-            }
-        }
-        let next_sequence = match recovery.entries.last() {
-            Some(entry) => entry
-                .sequence
-                .checked_add(1)
-                .ok_or(StorageError::SequenceExhausted)?,
-            None => 1,
-        };
+        let recovery = recover_repaired_file(&path)?;
+        let next_sequence = next_sequence(&recovery.entries)?;
         Ok(Self {
             path,
             next_sequence,
@@ -55,7 +42,14 @@ impl Journal {
             .header
             .validate()
             .map_err(StorageError::InvalidRecord)?;
+        let recovery = recover_repaired_file(&self.path)?;
+        if next_sequence(&recovery.entries)? != self.next_sequence {
+            return Err(StorageError::Sequence);
+        }
         let sequence = self.next_sequence;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(StorageError::SequenceExhausted)?;
         let entry = JournalEntry { sequence, record };
         let encoded = serde_json::to_vec(&entry).map_err(StorageError::Encode)?;
         let mut file = OpenOptions::new()
@@ -79,15 +73,35 @@ impl Journal {
             path: self.path.clone(),
             source,
         })?;
-        self.next_sequence = self
-            .next_sequence
-            .checked_add(1)
-            .ok_or(StorageError::SequenceExhausted)?;
+        self.next_sequence = next_sequence;
         Ok(sequence)
     }
 
     pub fn recover(&self) -> Result<JournalRecovery, StorageError> {
         recover_file(&self.path)
+    }
+}
+
+fn recover_repaired_file(path: &Path) -> Result<JournalRecovery, StorageError> {
+    let recovery = recover_file(path)?;
+    if !recovery.truncated_tail {
+        return Ok(recovery);
+    }
+    truncate_incomplete_tail(path)?;
+    let repaired = recover_file(path)?;
+    if repaired.truncated_tail {
+        return Err(StorageError::TailRepair);
+    }
+    Ok(repaired)
+}
+
+fn next_sequence(entries: &[JournalEntry]) -> Result<u64, StorageError> {
+    match entries.last() {
+        Some(entry) => entry
+            .sequence
+            .checked_add(1)
+            .ok_or(StorageError::SequenceExhausted),
+        None => Ok(1),
     }
 }
 
@@ -142,15 +156,17 @@ fn recover_file(path: &Path) -> Result<JournalRecovery, StorageError> {
     let truncated_tail = complete_length != bytes.len();
     let complete = &bytes[..complete_length];
     let mut entries = Vec::new();
-    for line in complete
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-    {
-        let entry: JournalEntry = serde_json::from_slice(line).map_err(StorageError::Decode)?;
-        entries.push(entry);
+    if let Some(without_final_newline) = complete.strip_suffix(b"\n") {
+        for line in without_final_newline.split(|byte| *byte == b'\n') {
+            let entry: JournalEntry = serde_json::from_slice(line).map_err(StorageError::Decode)?;
+            entries.push(entry);
+        }
+    }
+    if entries.first().is_some_and(|entry| entry.sequence != 1) {
+        return Err(StorageError::Sequence);
     }
     for pair in entries.windows(2) {
-        if pair[1].sequence != pair[0].sequence + 1 {
+        if pair[0].sequence.checked_add(1) != Some(pair[1].sequence) {
             return Err(StorageError::Sequence);
         }
     }
@@ -179,4 +195,129 @@ pub enum StorageError {
     TailRepair,
     #[error("record is invalid: {0}")]
     InvalidRecord(crate::domain::EventIdError),
+}
+
+#[cfg(test)]
+mod tests {
+    use rust_decimal::Decimal;
+    use sha2::{Digest, Sha256};
+    use tempfile::tempdir;
+
+    use crate::domain::{Amount, Asset, DomainEvent, EventHeader, EventId, EventSource};
+
+    use super::*;
+
+    #[test]
+    fn append_repairs_crash_tail_before_extending_the_sequence_chain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("facts.jsonl");
+        let first = fact("first", 1)?;
+        let second = fact("second", 2)?;
+        let third = fact("third", 3)?;
+        let mut journal = Journal::open(&path)?;
+        assert_eq!(journal.append(first.clone())?, 1);
+        let durable_prefix = fs::read(&path)?;
+        let durable_prefix_hash = Sha256::digest(&durable_prefix);
+
+        let crashed_entry = JournalEntry {
+            sequence: 2,
+            record: fact("crashed", 2)?,
+        };
+        let crashed_bytes = serde_json::to_vec(&crashed_entry)?;
+        let mut file = OpenOptions::new().append(true).open(&path)?;
+        file.write_all(&crashed_bytes[..crashed_bytes.len() / 2])?;
+        file.sync_all()?;
+
+        assert_eq!(journal.append(second.clone())?, 2);
+        let repaired_bytes = fs::read(&path)?;
+        assert_eq!(
+            Sha256::digest(&repaired_bytes[..durable_prefix.len()]),
+            durable_prefix_hash
+        );
+        assert!(repaired_bytes.ends_with(b"\n"));
+
+        let mut restarted = Journal::open(&path)?;
+        assert_eq!(restarted.append(third.clone())?, 3);
+        let recovery = restarted.recover()?;
+        assert!(!recovery.truncated_tail);
+        assert_eq!(
+            recovery
+                .entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            recovery
+                .entries
+                .into_iter()
+                .map(|entry| entry.record)
+                .collect::<Vec<_>>(),
+            vec![first, second, third]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn append_fails_closed_on_a_complete_corrupt_record() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempdir()?;
+        let path = directory.path().join("facts.jsonl");
+        let mut journal = Journal::open(&path)?;
+        journal.append(fact("first", 1)?)?;
+        let mut file = OpenOptions::new().append(true).open(&path)?;
+        file.write_all(b"{not-json}\n")?;
+        file.sync_all()?;
+        let corrupted = fs::read(&path)?;
+
+        assert!(matches!(
+            journal.append(fact("second", 2)?),
+            Err(StorageError::Decode(_))
+        ));
+        assert_eq!(fs::read(path)?, corrupted);
+        Ok(())
+    }
+
+    #[test]
+    fn append_fails_closed_on_a_complete_sequence_fork() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("facts.jsonl");
+        let mut journal = Journal::open(&path)?;
+        journal.append(fact("first", 1)?)?;
+        let fork = JournalEntry {
+            sequence: 3,
+            record: fact("fork", 3)?,
+        };
+        let mut file = OpenOptions::new().append(true).open(&path)?;
+        file.write_all(&serde_json::to_vec(&fork)?)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        let forked = fs::read(&path)?;
+
+        assert!(matches!(
+            journal.append(fact("second", 2)?),
+            Err(StorageError::Sequence)
+        ));
+        assert_eq!(fs::read(path)?, forked);
+        Ok(())
+    }
+
+    fn fact(event_id: &str, generation: u64) -> Result<FactRecord, Box<dyn std::error::Error>> {
+        Ok(FactRecord {
+            header: EventHeader {
+                schema_version: 1,
+                event_id: EventId::new(event_id)?,
+                source: EventSource::Recovery,
+                source_sequence: Some(generation),
+                received_at_ms: generation,
+                generation,
+            },
+            event: DomainEvent::Funding(Amount::new(
+                Asset::new("USDT")?,
+                Decimal::from(generation),
+            )),
+        })
+    }
 }

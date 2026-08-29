@@ -9,7 +9,7 @@ use rust_decimal::{
 };
 
 use crate::{
-    domain::{Price, PublicBar, PublicTrade, Symbol},
+    domain::{FieldState, Price, PublicBar, PublicTrade, Symbol},
     indicator::{
         BARS_SOURCE, BOOK_SOURCE, FeatureFrame, FeatureState, FeatureValues, SourceCursor,
         TRADES_SOURCE,
@@ -20,6 +20,7 @@ use crate::{
 const BOOK_FEATURE_VERSION: &str = "pulse-mas-depth-ofi-v2";
 const TRADE_FEATURE_VERSION: &str = "pulse-orderflow-v1";
 const BAR_FEATURE_VERSION: &str = "pulse-ta-v1";
+const BAR_VOLUME_FEATURE_VERSION: &str = "pulse-ta-ohlcv-v2";
 const TOXICITY_FEATURE_VERSION: &str = "pulse-mas-flow-toxicity-v2";
 const SHORT_RETURN_PERIOD: usize = 2;
 const TREND_PERIOD: usize = 16;
@@ -75,6 +76,7 @@ struct BarSample {
     generation: u64,
     close_time_ms: u64,
     close: Price,
+    base_volume: Option<Decimal>,
 }
 
 impl ScalpingFeatureBuilder {
@@ -210,10 +212,7 @@ impl ScalpingFeatureBuilder {
         if bar.symbol != book.symbol
             || bar.generation != book.generation
             || bar.interval_ms != 60_000
-            || bar.close_time_ms <= bar.open_time_ms
-            || bar.high < bar.open.max(bar.close)
-            || bar.low > bar.open.min(bar.close)
-            || bar.high < bar.low
+            || !bar.is_valid()
         {
             return Err(FeatureBuildError::Bar);
         }
@@ -243,6 +242,10 @@ impl ScalpingFeatureBuilder {
             generation: bar.generation,
             close_time_ms: bar.close_time_ms,
             close: bar.close,
+            base_volume: match &bar.base_volume {
+                FieldState::Known(value) => Some(*value),
+                _ => None,
+            },
         });
         while self.bars.len() > self.maximum_trades.get().max(BANDWIDTH_PERIOD + 1) {
             let _ = self.bars.pop_front();
@@ -344,6 +347,11 @@ impl ScalpingFeatureBuilder {
         };
         self.state = state;
         let bar_features = bar_features.unwrap_or_default();
+        let bar_feature_version = if bar_features.volume_observed {
+            BAR_VOLUME_FEATURE_VERSION
+        } else {
+            BAR_FEATURE_VERSION
+        };
         Ok(FeatureFrame {
             symbol: book.symbol.clone(),
             schema_version: 1,
@@ -354,7 +362,7 @@ impl ScalpingFeatureBuilder {
             feature_versions: BTreeMap::from([
                 (BOOK_SOURCE.to_owned(), BOOK_FEATURE_VERSION.to_owned()),
                 (TRADES_SOURCE.to_owned(), TRADE_FEATURE_VERSION.to_owned()),
-                (BARS_SOURCE.to_owned(), BAR_FEATURE_VERSION.to_owned()),
+                (BARS_SOURCE.to_owned(), bar_feature_version.to_owned()),
                 ("toxicity".to_owned(), TOXICITY_FEATURE_VERSION.to_owned()),
                 ("_feature_profile".to_owned(), self.profile.clone()),
                 (
@@ -475,6 +483,7 @@ struct BarFeatures {
     trend_efficiency: Decimal,
     bandwidth_expansion: Decimal,
     expected_move_bps: Option<Decimal>,
+    volume_observed: bool,
 }
 
 fn derive_bar_features(
@@ -524,6 +533,7 @@ fn derive_bar_features(
         trend_efficiency,
         bandwidth_expansion,
         expected_move_bps: natr_value.map(|atr| atr / current.value() * Decimal::new(10_000, 0)),
+        volume_observed: samples.iter().all(|sample| sample.base_volume.is_some()),
     }))
 }
 
@@ -582,7 +592,10 @@ mod tests {
         market::OrderBook,
     };
 
-    use super::{BarSample, ScalpingFeatureBuilder, derive_bar_features, flow_toxicity};
+    use super::{
+        BAR_VOLUME_FEATURE_VERSION, BARS_SOURCE, BarSample, ScalpingFeatureBuilder,
+        derive_bar_features, flow_toxicity,
+    };
 
     fn builder() -> Result<ScalpingFeatureBuilder, Box<dyn std::error::Error>> {
         let capacity = NonZeroUsize::new(32).ok_or("non-zero capacity")?;
@@ -681,6 +694,7 @@ mod tests {
                 generation: 1,
                 close_time_ms: value as u64,
                 close: Price::new(Decimal::from(value))?,
+                base_volume: Some(Decimal::from(10)),
             });
         }
         let refs: Vec<_> = samples.iter().collect();
@@ -769,11 +783,20 @@ mod tests {
                 high: Price::new(Decimal::new(101, 0))?,
                 low: Price::new(Decimal::new(99, 0))?,
                 close: Price::new(Decimal::new(100, 0))?,
+                base_volume: FieldState::Known(Decimal::from(10)),
+                quote_volume: FieldState::Known(Decimal::from(1_000)),
+                trade_count: FieldState::Known(5),
+                taker_buy_base_volume: FieldState::Known(Decimal::from(4)),
+                taker_buy_quote_volume: FieldState::Known(Decimal::from(400)),
             })?;
         }
         assert_eq!(builder.natr_value, Some(Decimal::new(2, 0)));
         let frame = builder.frame(1_260_000)?;
         assert_eq!(frame.values.expected_move_bps, Decimal::new(200, 0));
+        assert_eq!(
+            frame.feature_versions.get(BARS_SOURCE).map(String::as_str),
+            Some(BAR_VOLUME_FEATURE_VERSION)
+        );
         assert_eq!(frame.state, FeatureState::Warmup);
         Ok(())
     }
@@ -796,6 +819,11 @@ mod tests {
                 high: Price::new(Decimal::new(101, 0))?,
                 low: Price::new(Decimal::new(99, 0))?,
                 close: Price::new(Decimal::new(100, 0))?,
+                base_volume: FieldState::Known(Decimal::from(10)),
+                quote_volume: FieldState::Known(Decimal::from(1_000)),
+                trade_count: FieldState::Known(5),
+                taker_buy_base_volume: FieldState::Known(Decimal::from(4)),
+                taker_buy_quote_volume: FieldState::Known(Decimal::from(400)),
             })?;
         }
         let mut next_book = OrderBook::default();
@@ -826,6 +854,11 @@ mod tests {
             high: Price::new(Decimal::new(101, 0))?,
             low: Price::new(Decimal::new(99, 0))?,
             close: Price::new(Decimal::new(100, 0))?,
+            base_volume: FieldState::Known(Decimal::from(10)),
+            quote_volume: FieldState::Known(Decimal::from(1_000)),
+            trade_count: FieldState::Known(5),
+            taker_buy_base_volume: FieldState::Known(Decimal::from(4)),
+            taker_buy_quote_volume: FieldState::Known(Decimal::from(400)),
         })?;
         assert_eq!(builder.natr_samples, 14);
         assert!(builder.bars.iter().all(|bar| bar.generation == 4));

@@ -158,6 +158,21 @@ fn source_rejects_non_mark_symbol_stale_and_same_watermark_tamper()
                 high: Price::new(Decimal::new(2, 0))?,
                 low: Price::new(Decimal::ONE)?,
                 close: Price::new(Decimal::ONE)?,
+                base_volume: FieldState::Unavailable {
+                    reason: venue::domain::UnknownReason::SourceOmitted,
+                },
+                quote_volume: FieldState::Unavailable {
+                    reason: venue::domain::UnknownReason::SourceOmitted,
+                },
+                trade_count: FieldState::Unavailable {
+                    reason: venue::domain::UnknownReason::SourceOmitted,
+                },
+                taker_buy_base_volume: FieldState::Unavailable {
+                    reason: venue::domain::UnknownReason::SourceOmitted,
+                },
+                taker_buy_quote_volume: FieldState::Unavailable {
+                    reason: venue::domain::UnknownReason::SourceOmitted,
+                },
             }),
         }),
         Err(ScalpingEpisodeObservationSourceError::MarkSource)

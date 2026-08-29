@@ -207,6 +207,7 @@ impl AccountMarketEvent {
             || event_generation(&event) == 0
             || event_sequence(&event) == 0
             || embedded_received_at(&event).is_some_and(|embedded| embedded != received_at_ms)
+            || matches!(&event, MarketEvent::Bar(bar) if !bar.is_valid())
         {
             return Err(StrategyHostError::MarketFact);
         }
@@ -323,7 +324,7 @@ const PRIVATE_INPUT_BURST_LIMIT: usize = 64;
 
 #[derive(Clone, Debug)]
 enum MarketMailboxEntry {
-    Lossless(AccountMarketEvent),
+    Lossless(Box<AccountMarketEvent>),
     Coalesced(MarketEventKind),
 }
 
@@ -492,7 +493,7 @@ impl StrategyActorHost {
             return Err(StrategyHostError::LosslessMarketMailboxFull);
         }
         self.market_order
-            .push_back(MarketMailboxEntry::Lossless(event));
+            .push_back(MarketMailboxEntry::Lossless(Box::new(event)));
         self.lossless_market_depth += 1;
         Ok(())
     }
@@ -521,7 +522,7 @@ impl StrategyActorHost {
             match entry {
                 MarketMailboxEntry::Lossless(event) => {
                     self.lossless_market_depth = self.lossless_market_depth.saturating_sub(1);
-                    return Some(StrategyInput::Market(event));
+                    return Some(StrategyInput::Market(*event));
                 }
                 MarketMailboxEntry::Coalesced(kind) => {
                     if let Some(event) = self.latest_market.remove(&kind) {
@@ -704,6 +705,21 @@ mod tests {
                 high: price(11)?,
                 low: price(9)?,
                 close: price(10)?,
+                base_volume: FieldState::Unavailable {
+                    reason: crate::domain::UnknownReason::SourceOmitted,
+                },
+                quote_volume: FieldState::Unavailable {
+                    reason: crate::domain::UnknownReason::SourceOmitted,
+                },
+                trade_count: FieldState::Unavailable {
+                    reason: crate::domain::UnknownReason::SourceOmitted,
+                },
+                taker_buy_base_volume: FieldState::Unavailable {
+                    reason: crate::domain::UnknownReason::SourceOmitted,
+                },
+                taker_buy_quote_volume: FieldState::Unavailable {
+                    reason: crate::domain::UnknownReason::SourceOmitted,
+                },
             }),
         )?)
     }
