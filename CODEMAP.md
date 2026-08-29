@@ -73,8 +73,8 @@
 
 | 功能 | 首要入口 | 直接继续 |
 |---|---|---|
-| 命令 WAL/journal | `crates/venue-execution/src/journal.rs` | 原 JSONL serde/hash/状态迁移与路径调用约定不变；`src/execution/journal.rs` 只兼容重导出，通用事实 journal 仍位于 `crates/venue-storage/src/journal.rs` |
-| 单 writer 与 dispatch guard | `crates/venue-execution/src/writer_lease.rs` | `canonical_root.rs` 提供 `(exchange, trading_account_id)` 机器级账户 fence，保留既有 schema-2、hash 与 `stage7_writer_roots/v2` 路径；根 `src/execution/writer_lease.rs`、`src/runtime/grid/stage7_writer_registry.rs` 只作兼容 facade；symbol/Owner 级 lease 之外，不同 symbol 不能选择不同 canonical root |
+| 命令 WAL/journal | `crates/venue-execution/src/journal.rs` | 原 JSONL serde/hash/状态迁移与路径调用约定不变；append 持有排他文件锁并核对恢复时的耐久长度，旧进程、坏尾、空行、hash 或状态迁移分叉均失败关闭；Unix rename/创建同步父目录；`src/execution/journal.rs` 只兼容重导出，通用事实 journal 仍位于 `crates/venue-storage/src/journal.rs` |
+| 单 writer 与 dispatch guard | `crates/venue-execution/src/writer_lease.rs` | `canonical_root.rs` 提供 `(exchange, trading_account_id)` 机器级账户 fence，保留既有 schema-2、hash 与 `stage7_writer_roots/v2` 路径；恢复拒绝同 revision 的主备分叉，并按 scope/generation/handoff 不变量验证可选版本；根 `src/execution/writer_lease.rs`、`src/runtime/grid/stage7_writer_registry.rs` 只作兼容 facade；symbol/Owner 级 lease 之外，不同 symbol 不能选择不同 canonical root |
 | 执行门禁与物理归一化 | `src/execution/gate.rs` | `src/execution/engine.rs`、`src/risk.rs` |
 | 私有事实、对账和恢复 | `src/execution/reconcile.rs` | `src/execution/{private_projection,fill_recovery,recovery_writer}.rs`、`src/runtime/shared/private_facts_worker.rs`；私有 session 与 fill cursor 使用稳定 `trading_account_id`，不得使用产品类型代替账户身份 |
 | 外部 Algo 清理审计 | `src/execution/external_algo_cleanup.rs` | 独立 custody/permit/hash-chain WAL，只经 `recovery_writer` 的同一 writer 锁 dispatch；中断后先签名回读，仍在场才允许新一轮预写，已消失只结算、不重复撤单 |

@@ -28,7 +28,7 @@
 writer 或物理交易客户端。`legacy_stage7_strategy_binding` 只转换单策略身份，不授予 mutation 能力。配置中的
 `trading_account_id` 是真实账户的稳定规范 UUID，跨 symbol/策略复用；交易所 `account_binding` 只表示产品/模式能力。
 迁移完成前，现有 Stage 7 仍是唯一实盘 writer；不得同时为同一账户启动账户内核的新物理执行路径。
-通用 `CommandJournal`、writer lease 与账户级 canonical-root fence 固定在 `venue-execution`；原 JSONL serde/hash、writer schema、fsync、调用方工件路径及机器级 `stage7_writer_roots/v2` 路径保持不变，Stage 7 继续经根 facade 使用同一实现。文件型 checkpoint、facts journal、private evidence、fill cursor 与 Scalping evidence/risk 的耐久实现集中在 `venue-storage`，根 `src/storage` 只保留兼容 facade/宿主扩展。
+通用 `CommandJournal`、writer lease 与账户级 canonical-root fence 固定在 `venue-execution`；原 JSONL serde/hash、writer schema、fsync、调用方工件路径及机器级 `stage7_writer_roots/v2` 路径保持不变。append 必须在排他文件锁内核对磁盘长度等于恢复时耐久长度，旧进程、坏尾、空行、hash/状态迁移分叉均失败关闭；writer 恢复拒绝同 revision 的主备分叉，并验证 scope、generation 与 handoff 不变量；Unix 文件替换/创建同步父目录。Stage 7 继续经根 facade 使用同一实现。文件型 checkpoint、facts journal、private evidence、fill cursor 与 Scalping evidence/risk 的耐久实现集中在 `venue-storage`，根 `src/storage` 只保留兼容 facade/宿主扩展。
 Bybit、OKX、Hyperliquid 虽已有绑定型 async HTTP/私有 WS transport，但 capability、writer 与 WAL 仍为空，不能加入网格 mutation 或接管链。
 `apps/venue-node` 已提供六个逐 adapter 固定产物：Binance、Gate.io、Bitget 仅在精确 `LIVE` 下委托现有 Stage 7
 部署入口并继续使用原 Owner/WAL/writer/reconciliation/Canary 契约；旧物理 client 不支持 `TEST`，因此对应节点
