@@ -1,0 +1,16 @@
+{
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+    "apiKey": "test",
+    "readOnly": 0,
+    "secret": "",
+    "permissions": {
+      "ContractTrade": ["Order", "Position"],
+      "Wallet": [],
+      "Derivatives": ["DerivativesTrade"]
+    },
+    "uta": 1
+  },
+  "time": 2000
+}

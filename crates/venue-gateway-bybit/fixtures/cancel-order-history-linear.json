@@ -5,7 +5,7 @@
     "category": "linear",
     "nextPageCursor": "",
     "list": [
-      {"symbol":"BTCUSDT","orderId":"23","orderLinkId":"cancel-client","side":"Sell","positionIdx":1,"orderStatus":"Cancelled","qty":"1","cumExecQty":"0","price":"62000","avgPrice":"","reduceOnly":true,"createdTime":"1800","updatedTime":"2002"}
+      {"symbol":"BTCUSDT","orderId":"23","orderLinkId":"cancel-client","side":"Sell","positionIdx":1,"orderStatus":"Cancelled","qty":"1","cumExecQty":"0","price":"62000","avgPrice":"","reduceOnly":true,"stopOrderType":"UNKNOWN","triggerPrice":"0","closeOnTrigger":false,"createdTime":"1800","updatedTime":"2002"}
     ]
   },
   "time": 2002

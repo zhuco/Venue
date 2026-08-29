@@ -22,8 +22,9 @@ use venue_gateway_api::GatewayBinding;
 
 use crate::sign::ws_auth_signature;
 use crate::{
-    BybitCredentials, BybitGatewayBinding, BybitOrderAck, BybitPreparedRequest, parse_order_ack,
-    sign_prepared_request,
+    BybitCredentials, BybitGatewayBinding, BybitOrderAck, BybitPreparedPrivateRequest,
+    BybitPreparedRequest, BybitRawPrivatePayload, parse_order_ack, sign_prepared_request,
+    sign_private_request,
 };
 
 const PRIVATE_TOPICS: [&str; 4] = [
@@ -182,6 +183,82 @@ impl BybitHttpTransport {
             let received_at_ms = unix_ms()?;
             parse_order_ack(binding, request, &body, received_at_ms)
                 .map_err(|_| BybitTransportError::Ack)
+        };
+        timeout(self.limits.operation_timeout, operation)
+            .await
+            .map_err(|_| BybitTransportError::Timeout)?
+    }
+
+    pub async fn execute_private_read(
+        &self,
+        binding: &BybitGatewayBinding,
+        credentials: &BybitCredentials,
+        request: &BybitPreparedPrivateRequest,
+        timestamp_ms: u64,
+    ) -> Result<BybitRawPrivatePayload, BybitTransportError> {
+        binding
+            .validate_request_binding(&self.binding)
+            .map_err(|_| BybitTransportError::Binding)?;
+        request
+            .validate(binding)
+            .map_err(|_| BybitTransportError::Binding)?;
+        if request.generation != self.generation
+            || request.origin != binding.config().rest_origin()
+            || self.binding != request.binding
+        {
+            return Err(BybitTransportError::Binding);
+        }
+        if request.query.len() > self.limits.maximum_body_bytes {
+            return Err(BybitTransportError::BodyTooLarge);
+        }
+        let signed = sign_private_request(credentials, binding, request, timestamp_ms)
+            .map_err(|_| BybitTransportError::Signing)?;
+        let url = if request.query.is_empty() {
+            format!("{}{}", self.endpoint, request.path)
+        } else {
+            format!("{}{}?{}", self.endpoint, request.path, request.query)
+        };
+        let operation = async {
+            let mut builder = self.client.get(url);
+            for name in [
+                "X-BAPI-API-KEY",
+                "X-BAPI-SIGN",
+                "X-BAPI-SIGN-TYPE",
+                "X-BAPI-TIMESTAMP",
+                "X-BAPI-RECV-WINDOW",
+            ] {
+                let value = signed.get(name).ok_or(BybitTransportError::Signing)?;
+                builder = builder.header(name, value);
+            }
+            let mut response = builder.send().await.map_err(map_reqwest)?;
+            if !response.status().is_success() {
+                return Err(BybitTransportError::HttpStatus);
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > self.limits.maximum_body_bytes as u64)
+            {
+                return Err(BybitTransportError::BodyTooLarge);
+            }
+            let mut body = BytesMut::new();
+            while let Some(chunk) = response.chunk().await.map_err(map_reqwest)? {
+                let new_length = body
+                    .len()
+                    .checked_add(chunk.len())
+                    .ok_or(BybitTransportError::BodyTooLarge)?;
+                if new_length > self.limits.maximum_body_bytes {
+                    return Err(BybitTransportError::BodyTooLarge);
+                }
+                body.extend_from_slice(&chunk);
+            }
+            BybitRawPrivatePayload::from_response(
+                binding,
+                request,
+                timestamp_ms,
+                unix_ms()?,
+                body.to_vec(),
+            )
+            .map_err(|_| BybitTransportError::Ack)
         };
         timeout(self.limits.operation_timeout, operation)
             .await
@@ -833,7 +910,7 @@ mod tests {
     use crate::{
         BybitAccountIdentity, BybitLinearInstrumentRules, BybitOrderKind, BybitPlaceIntent,
         BybitPrivateSource, BybitPublicSource, BybitRawPrivatePayload, BybitRawPublicPayload,
-        BybitTimeInForce, parse_account_identity, parse_linear_instrument,
+        BybitTimeInForce, parse_account_identity, parse_linear_instrument, prepare_private_request,
     };
     use rust_decimal::Decimal;
     use tokio::net::TcpListener;
@@ -844,6 +921,7 @@ mod tests {
     const ACCOUNT_ID: &str = "00000000-0000-4000-8000-000000000001";
     const ACCOUNT: &[u8] = include_bytes!("../fixtures/account-info-uta2.json");
     const INSTRUMENT: &str = include_str!("../fixtures/instruments-linear.json");
+    const POSITIONS: &str = include_str!("../fixtures/positions-linear.json");
     const PLACE_ACK: &str = include_str!("../fixtures/place-order-ack.json");
 
     struct Facts {
@@ -862,10 +940,20 @@ mod tests {
             ACCOUNT_ID,
             "BTC/USDT".parse()?,
         )?)?;
-        let account = BybitRawPrivatePayload::new(
+        let account_request = prepare_private_request(
             &binding,
-            BybitPrivateSource::AccountInfo,
             7,
+            11,
+            0,
+            BybitPrivateSource::AccountInfo,
+            None,
+            None,
+            None,
+        )?;
+        let account = BybitRawPrivatePayload::from_response(
+            &binding,
+            &account_request,
+            1_670_000_000_000,
             1_716_863_719_400,
             ACCOUNT.to_vec(),
         )?;
@@ -958,6 +1046,9 @@ mod tests {
         };
         let headers_end = headers_end + 4;
         let headers = String::from_utf8_lossy(&request[..headers_end]);
+        if headers.starts_with("GET ") {
+            return true;
+        }
         let content_length = headers.lines().find_map(|line| {
             let (name, value) = line.split_once(':')?;
             name.eq_ignore_ascii_case("content-length")
@@ -997,6 +1088,44 @@ mod tests {
         assert!(sent.starts_with("POST /v5/order/create HTTP/1.1"));
         assert!(sent.contains("x-bapi-sign:"));
         assert!(sent.ends_with(std::str::from_utf8(&request.body)?));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_get_signs_the_exact_query_and_returns_request_bound_raw_evidence()
+    -> Result<(), TestError> {
+        let facts = facts(GatewayMode::Test)?;
+        let request = prepare_private_request(
+            &facts.binding,
+            7,
+            11,
+            0,
+            BybitPrivateSource::Positions,
+            None,
+            None,
+            None,
+        )?;
+        let (endpoint, server) =
+            http_mock(Some(http_response("200 OK", POSITIONS)), Duration::ZERO).await?;
+        let limits = BybitTransportLimits::new(Duration::from_secs(2), 16 * 1024)?;
+        let transport = BybitHttpTransport::with_endpoint(&facts.binding, 7, endpoint, limits)?;
+        let raw = transport
+            .execute_private_read(
+                &facts.binding,
+                &facts.credentials,
+                &request,
+                1_670_000_000_000,
+            )
+            .await?;
+        assert_eq!(raw.source, BybitPrivateSource::Positions);
+        assert_eq!(raw.request_query, request.query);
+        assert_eq!(raw.request_timestamp_ms, 1_670_000_000_000);
+        assert!(!raw.payload_sha256.is_empty());
+        let sent = String::from_utf8(server.await??)?;
+        assert!(sent.starts_with(
+            "GET /v5/position/list?category=linear&symbol=BTCUSDT&limit=200 HTTP/1.1"
+        ));
+        assert!(sent.contains("x-bapi-sign:"));
         Ok(())
     }
 

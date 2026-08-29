@@ -1,13 +1,15 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use venue_domain::domain::{FieldState, OrderSide, OrderState, PositionSide, Price};
+use venue_domain::domain::{
+    FieldState, NativeOrderFamily, OrderSide, OrderState, PositionSide, Price,
+};
 use venue_gateway_api::GatewayBinding;
 
 use crate::{
     BybitAccountIdentity, BybitAccountMode, BybitCredentials, BybitError, BybitGatewayBinding,
     BybitLinearInstrumentRules, BybitOpenOrder, BybitOpenOrderPage, BybitOrderEvidence,
-    BybitOrderEvidencePage, BybitPageClosure, BybitPublicSource, BybitRestBbo, SignedHeaders,
-    endpoints, linear_native_symbol, sign,
+    BybitOrderEvidencePage, BybitPublicSource, BybitRestBbo, SignedHeaders,
+    complete_open_order_pages, complete_order_history_pages, endpoints, linear_native_symbol, sign,
 };
 
 const MARKET_BBO_MAX_AGE_MS: u64 = 1_000;
@@ -308,36 +310,30 @@ impl BybitClosedOrderReadback {
         if generation == 0 || open_pages.is_empty() || history_pages.is_empty() {
             return Err(BybitExecutionError::Readback);
         }
-        let mut open_closure = BybitPageClosure::default();
-        let mut history_closure = BybitPageClosure::default();
-        let mut open_orders = Vec::new();
-        let mut history = Vec::new();
-        let mut received_at_ms = u64::MAX;
-        for page in open_pages {
-            validate_page_scope(binding, generation, &page.binding, page.generation)?;
-            received_at_ms = received_at_ms.min(page.received_at_ms);
-            open_closure
-                .accept(&page.meta)
+        let open = complete_open_order_pages(binding, NativeOrderFamily::UmOrder, open_pages)
+            .map_err(|_| BybitExecutionError::Readback)?;
+        let history =
+            complete_order_history_pages(binding, NativeOrderFamily::UmOrder, history_pages)
                 .map_err(|_| BybitExecutionError::Readback)?;
-            open_orders.extend(page.orders.iter().cloned());
-        }
-        for page in history_pages {
-            validate_page_scope(binding, generation, &page.binding, page.generation)?;
-            received_at_ms = received_at_ms.min(page.received_at_ms);
-            history_closure
-                .accept(&page.meta)
-                .map_err(|_| BybitExecutionError::Readback)?;
-            history.extend(page.orders.iter().cloned());
-        }
-        if !open_closure.is_closed() || !history_closure.is_closed() {
+        if open.generation != generation
+            || history.generation != generation
+            || open.attempt_id != history.attempt_id
+        {
             return Err(BybitExecutionError::Readback);
         }
+        let received_at_ms = open
+            .raw_pages
+            .iter()
+            .chain(history.raw_pages.iter())
+            .map(|raw| raw.received_at_ms)
+            .min()
+            .ok_or(BybitExecutionError::Readback)?;
         Ok(Self {
             binding: binding.gateway_binding().clone(),
             generation,
             received_at_ms,
-            open_orders,
-            history,
+            open_orders: open.orders,
+            history: history.orders,
         })
     }
 }
@@ -500,19 +496,6 @@ fn valid_native_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
-fn validate_page_scope(
-    binding: &BybitGatewayBinding,
-    generation: u64,
-    page_binding: &GatewayBinding,
-    page_generation: u64,
-) -> Result<(), BybitExecutionError> {
-    if page_binding == binding.gateway_binding() && page_generation == generation {
-        Ok(())
-    } else {
-        Err(BybitExecutionError::Binding)
-    }
-}
-
 fn matches_open(order: &BybitOpenOrder, ack: &BybitOrderAck) -> bool {
     let order_id_matches = ack
         .order_id
@@ -642,9 +625,9 @@ impl From<BybitError> for BybitExecutionError {
 mod tests {
     use super::*;
     use crate::{
-        BybitPrivateSource, BybitPublicSource, BybitRawPrivatePayload, BybitRawPublicPayload,
-        parse_account_identity, parse_linear_instrument, parse_open_order_page,
-        parse_order_history_page, parse_rest_bbo,
+        BybitHistoryWindow, BybitPrivateSource, BybitPublicSource, BybitRawPrivatePayload,
+        BybitRawPublicPayload, parse_account_identity, parse_linear_instrument,
+        parse_open_order_page, parse_order_history_page, parse_rest_bbo, prepare_private_request,
     };
     use venue_gateway_api::{GatewayMode, VenueId};
 
@@ -672,10 +655,20 @@ mod tests {
             ACCOUNT_ID,
             "BTC/USDT".parse()?,
         )?)?;
-        let account_raw = BybitRawPrivatePayload::new(
+        let account_request = prepare_private_request(
             &binding,
-            BybitPrivateSource::AccountInfo,
             7,
+            11,
+            0,
+            BybitPrivateSource::AccountInfo,
+            None,
+            None,
+            None,
+        )?;
+        let account_raw = BybitRawPrivatePayload::from_response(
+            &binding,
+            &account_request,
+            1_670_000_000_000,
             1_716_863_719_400,
             ACCOUNT.to_vec(),
         )?;
@@ -722,7 +715,15 @@ mod tests {
         source: BybitPrivateSource,
         payload: &[u8],
     ) -> Result<BybitRawPrivatePayload, BybitError> {
-        BybitRawPrivatePayload::new(binding, source, 7, 2_100, payload.to_vec())
+        let history_window = matches!(
+            source,
+            BybitPrivateSource::OrderHistory(_) | BybitPrivateSource::Executions
+        )
+        .then(|| BybitHistoryWindow::new(1, 2_100))
+        .transpose()?;
+        let request =
+            prepare_private_request(binding, 7, 11, 0, source, None, history_window, None)?;
+        BybitRawPrivatePayload::from_response(binding, &request, 2_000, 2_100, payload.to_vec())
     }
 
     #[test]
@@ -845,17 +846,19 @@ mod tests {
         assert_eq!(ack.status, BybitAckStatus::AcceptedOnly);
         let open = parse_open_order_page(
             &facts.binding,
-            &private_raw(&facts.binding, BybitPrivateSource::OpenOrders, OPEN)?,
-            None,
+            &private_raw(
+                &facts.binding,
+                BybitPrivateSource::OpenOrders(NativeOrderFamily::UmOrder),
+                OPEN,
+            )?,
         )?;
         let history = parse_order_history_page(
             &facts.binding,
             &private_raw(
                 &facts.binding,
-                BybitPrivateSource::OrderHistory,
+                BybitPrivateSource::OrderHistory(NativeOrderFamily::UmOrder),
                 EMPTY_ORDERS,
             )?,
-            None,
         )?;
         let readback =
             BybitClosedOrderReadback::from_pages(&facts.binding, 7, &[open], &[history])?;
@@ -897,17 +900,19 @@ mod tests {
         let ack = parse_order_ack(&facts.binding, &request, CANCEL_ACK, 2_003)?;
         let open = parse_open_order_page(
             &facts.binding,
-            &private_raw(&facts.binding, BybitPrivateSource::OpenOrders, EMPTY_ORDERS)?,
-            None,
+            &private_raw(
+                &facts.binding,
+                BybitPrivateSource::OpenOrders(NativeOrderFamily::UmOrder),
+                EMPTY_ORDERS,
+            )?,
         )?;
         let history = parse_order_history_page(
             &facts.binding,
             &private_raw(
                 &facts.binding,
-                BybitPrivateSource::OrderHistory,
+                BybitPrivateSource::OrderHistory(NativeOrderFamily::UmOrder),
                 CANCEL_HISTORY,
             )?,
-            None,
         )?;
         let mut unclosed = open.clone();
         unclosed.meta.next_cursor = Some("next".to_owned());
