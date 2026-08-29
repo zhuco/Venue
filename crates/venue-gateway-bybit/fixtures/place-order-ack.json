@@ -1,0 +1,10 @@
+{
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+    "orderId": "20",
+    "orderLinkId": "MANAGED_CLIENT_ID"
+  },
+  "retExtInfo": {},
+  "time": 2001
+}

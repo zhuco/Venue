@@ -1,0 +1,23 @@
+{
+  "arg": {
+    "channel": "orders",
+    "uid": "fixture-sub-account",
+    "instType": "SWAP",
+    "instId": "BTC-USDT-SWAP"
+  },
+  "data": [{
+    "instType": "SWAP",
+    "instId": "BTC-USDT-SWAP",
+    "ordId": "7004",
+    "clOrdId": "00000000000000000000000000000004",
+    "side": "buy",
+    "posSide": "long",
+    "sz": "2",
+    "accFillSz": "2",
+    "px": "60000",
+    "avgPx": "59995",
+    "reduceOnly": "false",
+    "state": "filled",
+    "uTime": "1787911200700"
+  }]
+}

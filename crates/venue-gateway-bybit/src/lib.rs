@@ -1,6 +1,7 @@
 mod binding;
 mod config;
 mod credentials;
+mod execution;
 mod private;
 mod public;
 mod sign;
@@ -9,6 +10,7 @@ use venue_gateway_api::CapabilityFlags;
 pub use binding::BybitGatewayBinding;
 pub use config::{BybitConfig, endpoints};
 pub use credentials::BybitCredentials;
+pub use execution::*;
 pub use private::*;
 pub use public::*;
 pub use sign::{SignedHeaders, sign};

@@ -9,7 +9,7 @@ pub(crate) struct EventEnvelope {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UserFillsData {
-    pub is_snapshot: bool,
+    pub is_snapshot: Option<bool>,
     pub user: String,
     pub fills: Vec<UserFillRow>,
 }
@@ -131,5 +131,26 @@ pub(crate) struct OrderStatusBody {
 pub(crate) struct OrderStatusOrder {
     pub coin: String,
     pub oid: u64,
+    pub cloid: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WsOrderUpdateRow {
+    pub order: WsBasicOrderRow,
+    pub status: String,
+    pub status_timestamp: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WsBasicOrderRow {
+    pub coin: String,
+    pub side: String,
+    pub limit_px: String,
+    pub sz: String,
+    pub oid: u64,
+    pub timestamp: u64,
+    pub orig_sz: String,
     pub cloid: Option<String>,
 }

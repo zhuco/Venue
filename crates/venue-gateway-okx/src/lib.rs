@@ -4,6 +4,7 @@ mod credentials;
 mod execution;
 mod models;
 mod private;
+mod private_ws;
 mod public;
 mod sign;
 
@@ -23,6 +24,13 @@ pub use private::{
     OkxAccountLevel, OkxAccountProfile, OkxPage, OkxPageState, OkxTimedBalance, OkxTimedOrder,
     OkxTimedPosition, parse_account_profile, parse_balance, parse_fills_page, parse_orders_page,
     parse_positions,
+};
+pub use private_ws::{
+    OkxAccountSnapshotState, OkxActivePrivateSubscription, OkxEventWindow,
+    OkxPositionSnapshotState, OkxPrivateSubscription, OkxPrivateWsScope, OkxPrivateWsSession,
+    OkxWsBatch, OkxWsDelivery, OkxWsLoginFrame, activate_private_subscription,
+    build_private_subscribe, build_ws_login, parse_ws_account, parse_ws_login_ack, parse_ws_orders,
+    parse_ws_positions,
 };
 pub use public::{OkxInstrument, parse_bbo, parse_instrument};
 pub use sign::{SignedHeaders, request_path, sign};

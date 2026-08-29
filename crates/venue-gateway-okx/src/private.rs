@@ -128,6 +128,13 @@ pub fn parse_balance(
     let [account] = envelope.data.as_slice() else {
         return Err(OkxError::Payload);
     };
+    normalize_balance_row(account, config)
+}
+
+pub(crate) fn normalize_balance_row(
+    account: &BalanceRow,
+    config: &OkxConfig,
+) -> Result<OkxTimedBalance, OkxError> {
     let quote = config.gateway_binding().symbol.quote();
     let mut details = account.details.iter().filter(|detail| detail.ccy == quote);
     let detail = details.next().ok_or(OkxError::Binding)?;
@@ -164,11 +171,13 @@ pub fn parse_positions(
     envelope
         .data
         .into_iter()
-        .filter_map(|row| match normalize_position(row, instrument, profile) {
-            Ok(Some(position)) => Some(Ok(position)),
-            Ok(None) => None,
-            Err(error) => Some(Err(error)),
-        })
+        .filter_map(
+            |row| match normalize_position_row(row, instrument, profile, false) {
+                Ok(Some(position)) => Some(Ok(position)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            },
+        )
         .collect()
 }
 
@@ -191,7 +200,7 @@ pub fn parse_orders_page(
     let items = envelope
         .data
         .into_iter()
-        .map(|row| normalize_order(row, instrument, profile))
+        .map(|row| normalize_order_row(row, instrument, profile, false))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(OkxPage { items, state })
 }
@@ -220,15 +229,16 @@ pub fn parse_fills_page(
     Ok(OkxPage { items, state })
 }
 
-fn normalize_position(
+pub(crate) fn normalize_position_row(
     row: PositionRow,
     instrument: &OkxInstrument,
     profile: &OkxAccountProfile,
+    retain_zero: bool,
 ) -> Result<Option<OkxTimedPosition>, OkxError> {
     validate_instrument_row(&row.inst_type, &row.inst_id, instrument)?;
     let raw_quantity = decimal(&row.pos)?;
     let side = position_side(profile.position_mode, &row.pos_side, raw_quantity)?;
-    if raw_quantity.is_zero() {
+    if raw_quantity.is_zero() && !retain_zero {
         return Ok(None);
     }
     let quantity = instrument.contracts_to_base(raw_quantity.abs())?;
@@ -245,10 +255,11 @@ fn normalize_position(
     }))
 }
 
-fn normalize_order(
+pub(crate) fn normalize_order_row(
     row: OrderRow,
     instrument: &OkxInstrument,
     profile: &OkxAccountProfile,
+    allow_terminal: bool,
 ) -> Result<OkxTimedOrder, OkxError> {
     validate_instrument_row(&row.inst_type, &row.inst_id, instrument)?;
     nonempty_id(&row.ord_id)?;
@@ -264,6 +275,10 @@ fn normalize_order(
     let state = match row.state.as_str() {
         "live" => OrderState::New,
         "partially_filled" => OrderState::PartiallyFilled,
+        "filled" if allow_terminal => OrderState::Filled,
+        "canceled" | "mmp_canceled" if allow_terminal => OrderState::Cancelled,
+        "rejected" if allow_terminal => OrderState::Rejected,
+        "expired" if allow_terminal => OrderState::Expired,
         _ => return Err(OkxError::Payload),
     };
     let order = Order {
@@ -343,7 +358,7 @@ fn validate_instrument_row(
     }
 }
 
-fn position_side(
+pub(crate) fn position_side(
     mode: OkxPositionMode,
     raw_side: &str,
     raw_quantity: Decimal,
@@ -360,7 +375,7 @@ fn position_side(
     }
 }
 
-fn order_side(value: &str) -> Result<OrderSide, OkxError> {
+pub(crate) fn order_side(value: &str) -> Result<OrderSide, OkxError> {
     match value {
         "buy" => Ok(OrderSide::Buy),
         "sell" => Ok(OrderSide::Sell),
@@ -368,7 +383,7 @@ fn order_side(value: &str) -> Result<OrderSide, OkxError> {
     }
 }
 
-fn boolean(value: &str) -> Result<bool, OkxError> {
+pub(crate) fn boolean(value: &str) -> Result<bool, OkxError> {
     match value {
         "true" => Ok(true),
         "false" => Ok(false),

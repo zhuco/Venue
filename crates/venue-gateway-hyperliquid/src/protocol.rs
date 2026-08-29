@@ -594,7 +594,7 @@ pub fn parse_private_user_fills(
     reject_duplicate_fills(&fills)?;
     Ok(HyperliquidUserFills {
         scope: meta.scope.clone(),
-        is_snapshot: data.is_snapshot,
+        is_snapshot: data.is_snapshot.ok_or(HyperliquidError::Payload)?,
         fills,
     })
 }
@@ -752,7 +752,7 @@ fn normalize_open_order(
     })
 }
 
-fn normalize_fill(
+pub(crate) fn normalize_fill(
     row: UserFillRow,
     scope: &HyperliquidPayloadScope,
 ) -> Result<HyperliquidFill, HyperliquidError> {
@@ -879,7 +879,7 @@ fn bbo(
     })
 }
 
-fn side(value: &str) -> Result<OrderSide, HyperliquidError> {
+pub(crate) fn side(value: &str) -> Result<OrderSide, HyperliquidError> {
     match value {
         "B" => Ok(OrderSide::Buy),
         "A" => Ok(OrderSide::Sell),
@@ -887,7 +887,7 @@ fn side(value: &str) -> Result<OrderSide, HyperliquidError> {
     }
 }
 
-fn decimal(value: &str) -> Result<Decimal, HyperliquidError> {
+pub(crate) fn decimal(value: &str) -> Result<Decimal, HyperliquidError> {
     Decimal::from_str(value).map_err(|_| HyperliquidError::Payload)
 }
 
@@ -914,7 +914,7 @@ fn info_request(
     })
 }
 
-fn normalized_order_status(value: &str) -> Result<OrderState, HyperliquidError> {
+pub(crate) fn normalized_order_status(value: &str) -> Result<OrderState, HyperliquidError> {
     match value {
         "open" | "triggered" => Ok(OrderState::New),
         "filled" => Ok(OrderState::Filled),

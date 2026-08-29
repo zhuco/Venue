@@ -1,0 +1,20 @@
+{
+  "arg": {
+    "channel": "account",
+    "uid": "fixture-sub-account"
+  },
+  "eventType": "snapshot",
+  "curPage": 1,
+  "lastPage": true,
+  "data": [{
+    "uTime": "1787911200800",
+    "details": [{
+      "ccy": "USDT",
+      "eq": "19995",
+      "availBal": "18995",
+      "imr": "900",
+      "mmr": "90",
+      "uTime": "1787911200800"
+    }]
+  }]
+}

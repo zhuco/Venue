@@ -284,6 +284,8 @@ pub struct BybitPosition {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BybitPositionPage {
+    pub binding: GatewayBinding,
+    pub generation: u64,
     pub meta: BybitPageMeta,
     pub positions: Vec<BybitPosition>,
 }
@@ -341,6 +343,8 @@ pub fn parse_position_page(
         return Err(BybitError::Payload);
     }
     Ok(BybitPositionPage {
+        binding: raw.binding.clone(),
+        generation: raw.generation,
         meta: page_meta(requested_cursor, envelope.result.next_page_cursor),
         positions,
     })
@@ -356,6 +360,9 @@ pub struct BybitOpenOrder {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BybitOpenOrderPage {
+    pub binding: GatewayBinding,
+    pub generation: u64,
+    pub received_at_ms: u64,
     pub meta: BybitPageMeta,
     pub orders: Vec<BybitOpenOrder>,
 }
@@ -383,6 +390,9 @@ pub fn parse_open_order_page(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(BybitOpenOrderPage {
+        binding: raw.binding.clone(),
+        generation: raw.generation,
+        received_at_ms: raw.received_at_ms,
         meta: page_meta(requested_cursor, envelope.result.next_page_cursor),
         orders,
     })
@@ -396,11 +406,15 @@ pub struct BybitOrderEvidence {
     pub position_side: PositionSide,
     pub position_idx: u8,
     pub reduce_only: bool,
+    pub state: OrderState,
     pub updated_at_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BybitOrderEvidencePage {
+    pub binding: GatewayBinding,
+    pub generation: u64,
+    pub received_at_ms: u64,
     pub meta: BybitPageMeta,
     pub orders: Vec<BybitOrderEvidence>,
 }
@@ -432,11 +446,15 @@ pub fn parse_order_history_page(
                 position_side: position_side(row.position_idx)?,
                 position_idx: row.position_idx,
                 reduce_only: row.reduce_only,
+                state: order_state(&row.order_status)?,
                 updated_at_ms: positive_u64(&row.updated_time)?,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(BybitOrderEvidencePage {
+        binding: raw.binding.clone(),
+        generation: raw.generation,
+        received_at_ms: raw.received_at_ms,
         meta: page_meta(requested_cursor, envelope.result.next_page_cursor),
         orders,
     })
@@ -452,6 +470,8 @@ pub struct BybitFill {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BybitExecutionPage {
+    pub binding: GatewayBinding,
+    pub generation: u64,
     pub meta: BybitPageMeta,
     pub fills: Vec<BybitFill>,
 }
@@ -545,6 +565,8 @@ pub fn parse_execution_page(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(BybitExecutionPage {
+        binding: raw.binding.clone(),
+        generation: raw.generation,
         meta: page_meta(requested_cursor, envelope.result.next_page_cursor),
         fills,
     })
@@ -558,14 +580,7 @@ fn normalize_order(
     if row.order_id.is_empty() {
         return Err(BybitError::Payload);
     }
-    let state = match row.order_status.as_str() {
-        "New" => OrderState::New,
-        "PartiallyFilled" => OrderState::PartiallyFilled,
-        "Filled" => OrderState::Filled,
-        "Cancelled" | "Deactivated" => OrderState::Cancelled,
-        "Rejected" => OrderState::Rejected,
-        _ => return Err(BybitError::Payload),
-    };
+    let state = order_state(&row.order_status)?;
     if open_only && !matches!(state, OrderState::New | OrderState::PartiallyFilled) {
         return Err(BybitError::Payload);
     }
@@ -625,6 +640,17 @@ fn order_side(value: &str) -> Result<OrderSide, BybitError> {
     match value {
         "Buy" => Ok(OrderSide::Buy),
         "Sell" => Ok(OrderSide::Sell),
+        _ => Err(BybitError::Payload),
+    }
+}
+
+fn order_state(value: &str) -> Result<OrderState, BybitError> {
+    match value {
+        "New" => Ok(OrderState::New),
+        "PartiallyFilled" => Ok(OrderState::PartiallyFilled),
+        "Filled" => Ok(OrderState::Filled),
+        "Cancelled" | "Deactivated" => Ok(OrderState::Cancelled),
+        "Rejected" => Ok(OrderState::Rejected),
         _ => Err(BybitError::Payload),
     }
 }

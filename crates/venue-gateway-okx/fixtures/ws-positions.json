@@ -1,0 +1,21 @@
+{
+  "arg": {
+    "channel": "positions",
+    "uid": "fixture-sub-account",
+    "instType": "SWAP",
+    "instId": "BTC-USDT-SWAP"
+  },
+  "eventType": "snapshot",
+  "curPage": 1,
+  "lastPage": true,
+  "data": [{
+    "instType": "SWAP",
+    "instId": "BTC-USDT-SWAP",
+    "posSide": "long",
+    "pos": "0",
+    "avgPx": "",
+    "markPx": "60001",
+    "uTime": "1787911200850",
+    "pTime": "1787911200900"
+  }]
+}

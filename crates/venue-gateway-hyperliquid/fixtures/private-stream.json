@@ -1,0 +1,77 @@
+[
+  {
+    "channel": "orderUpdates",
+    "data": [
+      {
+        "order": {
+          "coin": "BTC",
+          "side": "B",
+          "limitPx": "65000.5",
+          "sz": "0.4",
+          "oid": 101,
+          "timestamp": 1700000000000,
+          "origSz": "1.0",
+          "cloid": "0x00000000000000000000000000000001"
+        },
+        "status": "open",
+        "statusTimestamp": 1700000000001
+      }
+    ]
+  },
+  {
+    "channel": "userFills",
+    "data": {
+      "isSnapshot": true,
+      "user": "0x0000000000000000000000000000000000000001",
+      "fills": [
+        {
+          "coin": "BTC",
+          "px": "65010.0",
+          "sz": "0.2",
+          "side": "A",
+          "time": 1700000000003,
+          "closedPnl": "2.0",
+          "oid": 102,
+          "fee": "0.3",
+          "tid": 5002,
+          "feeToken": "USDC",
+          "crossed": true
+        },
+        {
+          "coin": "BTC",
+          "px": "65000.5",
+          "sz": "0.6",
+          "side": "B",
+          "time": 1700000000002,
+          "closedPnl": "0",
+          "oid": 101,
+          "cloid": "0x00000000000000000000000000000001",
+          "fee": "1.25",
+          "tid": 5001,
+          "feeToken": "USDC",
+          "crossed": false
+        }
+      ]
+    }
+  },
+  {
+    "channel": "userEvents",
+    "data": {
+      "fills": [
+        {
+          "coin": "BTC",
+          "px": "65020.0",
+          "sz": "0.1",
+          "side": "A",
+          "time": 1700000000004,
+          "closedPnl": "1.0",
+          "oid": 103,
+          "fee": "0.2",
+          "tid": 5003,
+          "feeToken": "USDC",
+          "crossed": true
+        }
+      ]
+    }
+  }
+]

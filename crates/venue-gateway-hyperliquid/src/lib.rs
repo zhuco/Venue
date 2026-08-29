@@ -3,6 +3,7 @@ mod config;
 mod credentials;
 mod models;
 mod nonce;
+mod private_stream;
 mod protocol;
 
 use venue_gateway_api::CapabilityFlags;
@@ -13,6 +14,11 @@ pub use binding::{
 pub use config::{HyperliquidConfig, endpoints};
 pub use credentials::HyperliquidCredentials;
 pub use nonce::{NonceCheckpoint, prepare_next_nonce};
+pub use private_stream::{
+    HyperliquidFillStream, HyperliquidFillUpdate, HyperliquidOrderUpdate, HyperliquidPrivateEvent,
+    HyperliquidPrivateStreamBinding, HyperliquidPrivateStreamDecoder,
+    HyperliquidPrivateSubscription, HyperliquidPrivateSubscriptionKind, build_private_subscription,
+};
 pub use protocol::{
     HyperliquidAccountSnapshot, HyperliquidBbo, HyperliquidFill, HyperliquidFillCursor,
     HyperliquidFillPage, HyperliquidFillQuery, HyperliquidInfoRequest, HyperliquidOpenOrder,
@@ -62,6 +68,7 @@ mod tests {
     const OPEN_ORDERS: &[u8] = include_bytes!("../fixtures/open-orders.json");
     const FILLS_PAGE: &[u8] = include_bytes!("../fixtures/fills-page.json");
     const ORDER_STATUS: &[u8] = include_bytes!("../fixtures/order-status.json");
+    const PRIVATE_STREAM: &[u8] = include_bytes!("../fixtures/private-stream.json");
     const USER: &str = "0x0000000000000000000000000000000000000001";
     const AGENT: &str = "0x2222222222222222222222222222222222222222";
 
@@ -478,6 +485,213 @@ mod tests {
         );
         assert_eq!(
             HyperliquidOrderLookup::client_order_id("0x1234"),
+            Err(HyperliquidError::Payload)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn private_subscriptions_are_exact_and_generation_scoped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let meta = meta(GatewayMode::Test)?;
+        assert_eq!(
+            HyperliquidPrivateStreamBinding::new(&meta, 0),
+            Err(HyperliquidError::Binding)
+        );
+        let binding = HyperliquidPrivateStreamBinding::new(&meta, 7)?;
+        assert_eq!(binding.generation(), 7);
+        assert_eq!(binding.mode(), GatewayMode::Test);
+        assert_eq!(binding.scope().user_address(), USER);
+        assert_eq!(binding.scope().symbol().to_string(), "BTC/USDC");
+
+        for (kind, expected) in [
+            (
+                HyperliquidPrivateSubscriptionKind::OrderUpdates,
+                serde_json::json!({
+                    "method":"subscribe",
+                    "subscription":{"type":"orderUpdates","user":USER}
+                }),
+            ),
+            (
+                HyperliquidPrivateSubscriptionKind::UserFills,
+                serde_json::json!({
+                    "method":"subscribe",
+                    "subscription":{
+                        "type":"userFills",
+                        "user":USER,
+                        "aggregateByTime":false
+                    }
+                }),
+            ),
+            (
+                HyperliquidPrivateSubscriptionKind::UserEvents,
+                serde_json::json!({
+                    "method":"subscribe",
+                    "subscription":{"type":"userEvents","user":USER}
+                }),
+            ),
+        ] {
+            let request = build_private_subscription(&binding, kind)?;
+            assert_eq!(request.binding(), &binding);
+            assert_eq!(request.kind(), kind);
+            assert_eq!(request.websocket(), "wss://api.hyperliquid-testnet.xyz/ws");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(request.body())?,
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn private_stream_preserves_order_and_fill_identity_across_official_channels()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let frames: Vec<serde_json::Value> = serde_json::from_slice(PRIVATE_STREAM)?;
+        let binding = HyperliquidPrivateStreamBinding::new(&meta(GatewayMode::Live)?, 11)?;
+        let mut decoder = HyperliquidPrivateStreamDecoder::new(binding.clone());
+
+        let orders = decoder.decode(&serde_json::to_vec(&frames[0])?, 11, 1_700_000_000_010)?;
+        let HyperliquidPrivateEvent::Order(order) = &orders[0] else {
+            return Err("order event missing".into());
+        };
+        assert_eq!(order.binding, binding);
+        assert_eq!(order.native_coin, "BTC");
+        assert_eq!(order.order_id, 101);
+        assert_eq!(order.raw_status, "open");
+        assert_eq!(order.state, OrderState::New);
+        assert_eq!(order.event_time_ms, 1_700_000_000_001);
+        assert_eq!(order.original_quantity, Decimal::ONE);
+        assert_eq!(order.remaining_quantity, Decimal::new(4, 1));
+        assert_eq!(
+            order.client_order_id,
+            FieldState::Known("0x00000000000000000000000000000001".to_owned())
+        );
+
+        let snapshot = decoder.decode(&serde_json::to_vec(&frames[1])?, 11, 1_700_000_000_010)?;
+        assert_eq!(snapshot.len(), 2);
+        let HyperliquidPrivateEvent::Fill(first) = &snapshot[0] else {
+            return Err("fill event missing".into());
+        };
+        assert_eq!(first.binding.generation(), 11);
+        assert_eq!(first.stream, HyperliquidFillStream::UserFills);
+        assert_eq!(first.snapshot, FieldState::Known(true));
+        assert_eq!(first.fill.fill.exchange_time_ms, Some(1_700_000_000_002));
+
+        let live = decoder.decode(&serde_json::to_vec(&frames[2])?, 11, 1_700_000_000_010)?;
+        let HyperliquidPrivateEvent::Fill(fill) = &live[0] else {
+            return Err("userEvents fill missing".into());
+        };
+        assert_eq!(fill.stream, HyperliquidFillStream::UserEvents);
+        assert_eq!(fill.snapshot, FieldState::NotApplicable);
+        assert_eq!(fill.fill.fill.exchange_time_ms, Some(1_700_000_000_004));
+        Ok(())
+    }
+
+    #[test]
+    fn private_stream_rejects_generation_user_coin_duplicate_and_time_rollback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let frames: Vec<serde_json::Value> = serde_json::from_slice(PRIVATE_STREAM)?;
+        let binding = HyperliquidPrivateStreamBinding::new(&meta(GatewayMode::Test)?, 17)?;
+        let order = serde_json::to_vec(&frames[0])?;
+        let fills = serde_json::to_vec(&frames[1])?;
+
+        let mut decoder = HyperliquidPrivateStreamDecoder::new(binding.clone());
+        assert_eq!(
+            decoder.decode(&order, 16, 1_700_000_000_010),
+            Err(HyperliquidError::Binding)
+        );
+        assert_eq!(decoder.decode(&order, 17, 1_700_000_000_010)?.len(), 1);
+        assert_eq!(
+            decoder.decode(&order, 17, 1_700_000_000_010),
+            Err(HyperliquidError::Payload)
+        );
+
+        let mut rollback = frames[0].clone();
+        rollback["data"][0]["statusTimestamp"] = serde_json::json!(1_700_000_000_000_u64);
+        assert_eq!(
+            decoder.decode(&serde_json::to_vec(&rollback)?, 17, 1_700_000_000_010),
+            Err(HyperliquidError::Payload)
+        );
+
+        let mut future = HyperliquidPrivateStreamDecoder::new(binding.clone());
+        assert_eq!(
+            future.decode(&order, 17, 1_700_000_000_000),
+            Err(HyperliquidError::Payload)
+        );
+
+        let mut inconsistent = frames[0].clone();
+        inconsistent["data"][0]["status"] = serde_json::json!("filled");
+        assert_eq!(
+            HyperliquidPrivateStreamDecoder::new(binding.clone()).decode(
+                &serde_json::to_vec(&inconsistent)?,
+                17,
+                1_700_000_000_010
+            ),
+            Err(HyperliquidError::Payload)
+        );
+
+        let mut wrong_coin = frames[0].clone();
+        wrong_coin["data"][0]["order"]["coin"] = serde_json::json!("ETH");
+        assert_eq!(
+            HyperliquidPrivateStreamDecoder::new(binding.clone()).decode(
+                &serde_json::to_vec(&wrong_coin)?,
+                17,
+                1_700_000_000_010
+            ),
+            Err(HyperliquidError::Binding)
+        );
+
+        let mut wrong_user = frames[1].clone();
+        wrong_user["data"]["user"] =
+            serde_json::json!("0x3333333333333333333333333333333333333333");
+        assert_eq!(
+            HyperliquidPrivateStreamDecoder::new(binding).decode(
+                &serde_json::to_vec(&wrong_user)?,
+                17,
+                1_700_000_000_010
+            ),
+            Err(HyperliquidError::Binding)
+        );
+
+        let mut wrong_fill_coin = frames[1].clone();
+        wrong_fill_coin["data"]["fills"][0]["coin"] = serde_json::json!("ETH");
+        assert_eq!(
+            HyperliquidPrivateStreamDecoder::new(HyperliquidPrivateStreamBinding::new(
+                &meta(GatewayMode::Test)?,
+                19
+            )?)
+            .decode(
+                &serde_json::to_vec(&wrong_fill_coin)?,
+                19,
+                1_700_000_000_010
+            ),
+            Err(HyperliquidError::Binding)
+        );
+
+        let mut fill_decoder = HyperliquidPrivateStreamDecoder::new(
+            HyperliquidPrivateStreamBinding::new(&meta(GatewayMode::Test)?, 18)?,
+        );
+        assert_eq!(fill_decoder.decode(&fills, 18, 1_700_000_000_010)?.len(), 2);
+        assert_eq!(
+            fill_decoder.decode(&fills, 18, 1_700_000_000_010),
+            Err(HyperliquidError::Payload)
+        );
+
+        let mut missing_snapshot = frames[1].clone();
+        missing_snapshot["data"]
+            .as_object_mut()
+            .ok_or("user fills data object missing")?
+            .remove("isSnapshot");
+        assert_eq!(
+            HyperliquidPrivateStreamDecoder::new(HyperliquidPrivateStreamBinding::new(
+                &meta(GatewayMode::Test)?,
+                20
+            )?)
+            .decode(
+                &serde_json::to_vec(&missing_snapshot)?,
+                20,
+                1_700_000_000_010
+            ),
             Err(HyperliquidError::Payload)
         );
         Ok(())
