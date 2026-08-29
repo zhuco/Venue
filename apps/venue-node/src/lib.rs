@@ -8,6 +8,19 @@ use clap::Parser;
 use venue_domain::domain::Symbol;
 use venue_gateway_api::{CapabilityFlags, GatewayApiError, GatewayBinding, GatewayMode, VenueId};
 
+mod safe_host;
+
+#[cfg(test)]
+mod safe_host_tests;
+
+pub use safe_host::{
+    CanaryEvidence, CommandReadbackKey, ControlAction, ControlCompletion, ControlEvidence,
+    DispatchOutcome, DispatchPermit, FamilyReadbackCoverage, GatewayAcknowledgement,
+    GatewayDispatchResult, NodeSafetyHost, PhysicalGateway, PreparedDispatch, ReadbackCommandState,
+    SafeHostError, SignedCommandReadback, SignedOwnedOrder, SignedReadbackReceipt,
+    SignedReadbackRequest,
+};
+
 const ARTIFACT_COMMANDS: [&str; 14] = [
     "grid-start",
     "grid-shadow",
@@ -390,21 +403,15 @@ mod tests {
 
     #[test]
     fn unintegrated_adapter_is_always_fail_closed() {
-        assert!(matches!(
-            reject_unintegrated_runtime(
-                VenueId::Bybit,
-                GatewayMode::Live,
-                CapabilityFlags::empty()
-            ),
-            Err(NodeError::IncompleteSafetyClosure { .. })
-        ));
-        assert!(matches!(
-            reject_unintegrated_runtime(
-                VenueId::Bybit,
-                GatewayMode::Live,
-                CapabilityFlags::READ_ACCOUNT
-            ),
-            Err(NodeError::UnexpectedAdapterCapability(VenueId::Bybit))
-        ));
+        for venue in [VenueId::Bybit, VenueId::Okx, VenueId::Hyperliquid] {
+            assert!(matches!(
+                reject_unintegrated_runtime(venue, GatewayMode::Live, CapabilityFlags::empty()),
+                Err(NodeError::IncompleteSafetyClosure { .. })
+            ));
+            assert!(matches!(
+                reject_unintegrated_runtime(venue, GatewayMode::Live, CapabilityFlags::READ_ACCOUNT),
+                Err(NodeError::UnexpectedAdapterCapability(rejected)) if rejected == venue
+            ));
+        }
     }
 }
