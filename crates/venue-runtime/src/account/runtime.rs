@@ -68,7 +68,7 @@ pub struct AccountRuntime {
     pending_physical_recovery: Option<PhysicalRecoveryReadbackManifest>,
     admitted_physical_recovery: Option<PhysicalRecoveryReadbackManifest>,
     #[cfg(test)]
-    automatic_physical_recovery_fixture: bool,
+    physical_recovery_test_fixture_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -150,7 +150,7 @@ impl AccountRuntime {
             pending_physical_recovery: None,
             admitted_physical_recovery: None,
             #[cfg(test)]
-            automatic_physical_recovery_fixture: true,
+            physical_recovery_test_fixture_enabled: false,
             capability_evidence,
             account,
             health: AccountHealth::Starting,
@@ -206,14 +206,18 @@ impl AccountRuntime {
         self.physical_private_generation_floor
     }
 
-    /// Installs one complete in-memory physical readback for the next connection generation.
-    /// The manifest is consumed exactly once by `mark_account_ready` and is never persisted.
+    /// Attempts to install one complete in-memory physical readback for the next connection.
+    /// Production rejects every caller-built manifest until an opaque fresh collector and runtime
+    /// authority-root refresh path are integrated. The value type remains a future contract only.
     pub fn install_physical_recovery_manifest(
         &mut self,
         manifest: PhysicalRecoveryReadbackManifest,
     ) -> Result<(), AccountRuntimeError> {
         if !self.durable_recovery_complete {
             return Err(AccountRuntimeError::DurableRecoveryRequired);
+        }
+        if !self.physical_recovery_integration_available() {
+            return Err(AccountRuntimeError::PhysicalRecoveryIntegrationUnavailable);
         }
         if self.pending_physical_recovery.is_some() {
             return Err(AccountRuntimeError::PhysicalRecoveryAlreadyInstalled);
@@ -240,7 +244,7 @@ impl AccountRuntime {
         let account_matches = binding.venue.as_str() == self.account.exchange.as_str()
             && binding.trading_account_id == self.account.account;
         #[cfg(test)]
-        let account_matches = account_matches || self.automatic_physical_recovery_fixture;
+        let account_matches = account_matches || self.physical_recovery_test_fixture_enabled;
         let configuration_matches = match self.registry.binding_by_symbol(&binding.symbol) {
             Some(strategy) => {
                 strategy.config_digest == scope.config_digest()
@@ -265,7 +269,21 @@ impl AccountRuntime {
         Ok(())
     }
 
+    fn physical_recovery_integration_available(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.physical_recovery_test_fixture_enabled
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
     fn physical_turn_authorized(&self) -> bool {
+        if !self.physical_recovery_integration_available() {
+            return false;
+        }
         let current_admitted = self
             .admitted_physical_recovery
             .as_ref()
@@ -283,13 +301,14 @@ impl AccountRuntime {
     }
 
     #[cfg(test)]
-    pub(crate) fn disable_automatic_physical_recovery_fixture(&mut self) {
-        self.automatic_physical_recovery_fixture = false;
+    /// Explicit compatibility hook for account-kernel tests that do not own a physical collector.
+    pub(crate) fn enable_physical_recovery_test_fixture(&mut self) {
+        self.physical_recovery_test_fixture_enabled = true;
     }
 
     #[cfg(test)]
-    fn install_automatic_physical_recovery_fixture(&mut self) -> Result<(), AccountRuntimeError> {
-        if !self.automatic_physical_recovery_fixture
+    fn stage_physical_recovery_test_fixture(&mut self) -> Result<(), AccountRuntimeError> {
+        if !self.physical_recovery_test_fixture_enabled
             || !self.durable_recovery_complete
             || self.pending_physical_recovery.is_some()
         {
@@ -670,8 +689,11 @@ impl AccountRuntime {
         if !self.durable_recovery_complete {
             return Err(AccountRuntimeError::DurableRecoveryRequired);
         }
+        if !self.physical_recovery_integration_available() {
+            return Err(AccountRuntimeError::PhysicalRecoveryIntegrationUnavailable);
+        }
         #[cfg(test)]
-        self.install_automatic_physical_recovery_fixture()?;
+        self.stage_physical_recovery_test_fixture()?;
         let manifest = self
             .pending_physical_recovery
             .as_ref()
@@ -1270,12 +1292,15 @@ impl AccountRuntime {
         &mut self,
         key: &StrategyInstanceKey,
     ) -> Result<Option<StrategyTurn>, AccountRuntimeError> {
+        if !self.physical_recovery_integration_available() {
+            return Err(AccountRuntimeError::PhysicalRecoveryIntegrationUnavailable);
+        }
         #[cfg(test)]
         if !self.physical_turn_authorized() {
-            self.install_automatic_physical_recovery_fixture()?;
+            self.stage_physical_recovery_test_fixture()?;
         }
         if !self.physical_turn_authorized() {
-            return Err(AccountRuntimeError::PhysicalRecoveryRequired);
+            return Err(AccountRuntimeError::PhysicalRecoveryIntegrationUnavailable);
         }
         if self.active_turns.contains_key(key) {
             return Err(AccountRuntimeError::StrategyTurnActive);
@@ -1815,6 +1840,10 @@ pub enum AccountRuntimeError {
     ResidualPositionCustody,
     #[error("durable account recovery must be installed before private connectivity becomes ready")]
     DurableRecoveryRequired,
+    #[error(
+        "production physical recovery integration is unavailable; caller manifests cannot authorize connectivity or actor turns"
+    )]
+    PhysicalRecoveryIntegrationUnavailable,
     #[error("a complete physical recovery readback manifest is required for the next connection")]
     PhysicalRecoveryRequired,
     #[error("a physical recovery manifest is already staged for the next connection")]

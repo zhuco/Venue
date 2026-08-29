@@ -145,6 +145,7 @@ pub(super) fn install_persisted_order_route(
 }
 
 pub(super) fn restore_empty_recovery(runtime: &mut AccountRuntime) -> Result<(), Box<dyn Error>> {
+    runtime.enable_physical_recovery_test_fixture();
     let strategy_states = runtime
         .registry()
         .registrations()
@@ -213,6 +214,7 @@ fn startup_requires_durable_recovery_and_restores_unknown_fence() -> Result<(), 
         vec![recovered_request],
     )?;
     let mut runtime = AccountRuntime::new(account()?);
+    runtime.enable_physical_recovery_test_fixture();
     runtime.register_strategy(grid.clone())?;
     runtime.restore_durable_state(snapshot)?;
     runtime.mark_account_ready()?;
@@ -249,30 +251,35 @@ fn startup_requires_durable_recovery_and_restores_unknown_fence() -> Result<(), 
 }
 
 #[test]
-fn physical_manifest_gates_startup_connection_generation_and_actor_turns()
+fn production_physical_recovery_is_unavailable_for_live_test_and_multi_strategy_manifests()
 -> Result<(), Box<dyn Error>> {
     let account = AccountKey::new(ExchangeId::Binance, "00000000-0000-4000-8000-000000000101")?;
-    let key = StrategyInstanceKey::new(
+    let grid_key = StrategyInstanceKey::new(
         account.clone(),
         StrategyKind::HedgedGrid,
         "grid_btc",
         "BTC/USDT".parse()?,
     )?;
-    let grid = StrategyBinding::new(key, "run_1", "config_1")?;
+    let scalp_key = StrategyInstanceKey::new(
+        account.clone(),
+        StrategyKind::Scalping,
+        "scalp_eth",
+        "ETH/USDT".parse()?,
+    )?;
+    let grid = StrategyBinding::new(grid_key, "run_1", "config_1")?;
+    let scalp = StrategyBinding::new(scalp_key, "run_2", "config_2")?;
     let mut runtime = AccountRuntime::new(account.clone());
-    runtime.disable_automatic_physical_recovery_fixture();
     runtime.register_strategy(grid.clone())?;
+    runtime.register_strategy(scalp.clone())?;
     runtime.restore_durable_state(recovery_snapshot(
         account.clone(),
         recovery_roots()?,
         0,
         empty_private_cursor()?,
-        vec![RecoveredStrategyState::verified(
-            grid.clone(),
-            1,
-            InstanceLifecycle::Registered,
-            None,
-        )?],
+        vec![
+            RecoveredStrategyState::verified(grid.clone(), 1, InstanceLifecycle::Registered, None)?,
+            RecoveredStrategyState::verified(scalp, 1, InstanceLifecycle::Registered, None)?,
+        ],
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -281,63 +288,40 @@ fn physical_manifest_gates_startup_connection_generation_and_actor_turns()
 
     assert!(matches!(
         runtime.mark_account_ready(),
-        Err(AccountRuntimeError::PhysicalRecoveryRequired)
+        Err(AccountRuntimeError::PhysicalRecoveryIntegrationUnavailable)
     ));
     assert!(matches!(
         runtime.pop_strategy_input(&grid.key),
-        Err(AccountRuntimeError::PhysicalRecoveryRequired)
+        Err(AccountRuntimeError::PhysicalRecoveryIntegrationUnavailable)
     ));
     assert_eq!(runtime.health(), AccountHealth::Starting);
     assert_eq!(runtime.connection_generation(), 0);
 
-    let gateway_binding = GatewayBinding::new(
-        VenueId::Binance,
-        GatewayMode::Live,
-        account.account.clone(),
-        grid.key.symbol.clone(),
-    )?;
     let expected_roots = runtime
         .physical_recovery_authority_roots()
         .cloned()
         .ok_or("physical recovery roots missing")?;
-    let drifted_roots = PhysicalRecoveryAuthorityRoots::verified(
-        [0x99; 32],
-        *expected_roots.wal(),
-        *expected_roots.unknown(),
-    )?;
-    let drifted = physical_manifest(&runtime, gateway_binding.clone(), drifted_roots, 1, 0, 1)?;
-    assert!(matches!(
-        runtime.install_physical_recovery_manifest(drifted),
-        Err(AccountRuntimeError::PhysicalRecoveryScopeMismatch)
-    ));
-    assert!(matches!(
-        runtime.mark_account_ready(),
-        Err(AccountRuntimeError::PhysicalRecoveryRequired)
-    ));
-
-    let manifest = physical_manifest(
-        &runtime,
-        gateway_binding.clone(),
-        expected_roots.clone(),
-        1,
-        0,
-        1,
-    )?;
-    runtime.install_physical_recovery_manifest(manifest)?;
-    runtime.mark_account_ready()?;
-    assert_eq!(runtime.health(), AccountHealth::Ready);
-    assert_eq!(runtime.connection_generation(), 1);
-
-    assert!(matches!(
-        runtime.mark_account_ready(),
-        Err(AccountRuntimeError::PhysicalRecoveryRequired)
-    ));
-    assert_eq!(runtime.connection_generation(), 1);
-    let stale_floor = physical_manifest(&runtime, gateway_binding, expected_roots, 2, 0, 2)?;
-    assert!(matches!(
-        runtime.install_physical_recovery_manifest(stale_floor),
-        Err(AccountRuntimeError::PhysicalRecoveryScopeMismatch)
-    ));
+    for mode in [GatewayMode::Test, GatewayMode::Live] {
+        let manifest = physical_manifest(
+            &runtime,
+            GatewayBinding::new(
+                VenueId::Binance,
+                mode,
+                account.account.clone(),
+                grid.key.symbol.clone(),
+            )?,
+            expected_roots.clone(),
+            1,
+            0,
+            1,
+        )?;
+        assert!(matches!(
+            runtime.install_physical_recovery_manifest(manifest),
+            Err(AccountRuntimeError::PhysicalRecoveryIntegrationUnavailable)
+        ));
+    }
+    assert_eq!(runtime.health(), AccountHealth::Starting);
+    assert_eq!(runtime.connection_generation(), 0);
     Ok(())
 }
 
@@ -347,6 +331,7 @@ fn durable_recovery_restores_epoch_lifecycle_shutdown_fence_and_connection_floor
     let paused = binding(StrategyKind::HedgedGrid, "grid_sol", "SOL/USDT")?;
     let stopping = binding(StrategyKind::Scalping, "scalp_eth", "ETH/USDT")?;
     let mut runtime = AccountRuntime::new(account()?);
+    runtime.enable_physical_recovery_test_fixture();
     runtime.register_strategy(paused.clone())?;
     runtime.register_strategy(stopping.clone())?;
     let mut evidence = EvidenceFixture::new()?;
@@ -504,6 +489,7 @@ fn recovery_advances_across_zero_delivery_and_fully_applied_batches() -> Result<
         )?);
     }
     let mut zero_runtime = AccountRuntime::new(account()?);
+    zero_runtime.enable_physical_recovery_test_fixture();
     zero_runtime.restore_durable_state(recovery_snapshot(
         account()?,
         recovery_roots_with_boundaries([0, 2, 0, 0, 0], [0, 2, 0, 0, 0])?,
@@ -519,6 +505,7 @@ fn recovery_advances_across_zero_delivery_and_fully_applied_batches() -> Result<
 
     let grid = binding(StrategyKind::HedgedGrid, "grid_sol", "SOL/USDT")?;
     let mut applied_runtime = AccountRuntime::new(account()?);
+    applied_runtime.enable_physical_recovery_test_fixture();
     applied_runtime.register_strategy(grid.clone())?;
     let mut applied_evidence = EvidenceFixture::new()?;
     let mut applied_batches = Vec::new();
