@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{Price, Symbol};
+use venue_domain::{Price, Symbol};
 
 pub const BOOK_SOURCE: &str = "book";
 pub const TRADES_SOURCE: &str = "trades";

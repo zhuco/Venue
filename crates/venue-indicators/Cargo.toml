@@ -1,0 +1,20 @@
+[package]
+name = "venue-indicators"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.0"
+publish = false
+
+[dependencies]
+rust_decimal = { version = "1", features = ["serde", "serde-with-str"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+venue-domain = { path = "../venue-domain" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+expect_used = "deny"
+panic = "deny"
+unwrap_used = "deny"

@@ -1,10 +1,8 @@
 use std::num::NonZeroUsize;
 
-use crate::{
-    domain::{MarketEvent, Symbol},
-    indicator::{FeatureBuildError, FeatureFrame, FeatureState, ScalpingFeatureBuilder},
-    market::OrderBook,
-};
+use venue_domain::{MarketEvent, Symbol};
+
+use super::{FeatureBuildError, FeatureFrame, FeatureState, PublicBook, ScalpingFeatureBuilder};
 
 const FRAME_EMIT_INTERVAL_MS: u64 = 250;
 
@@ -74,7 +72,7 @@ impl ScalpingPublicMarketSource {
     pub fn consume(
         &mut self,
         input: RecordedPublicEvent,
-        book: &OrderBook,
+        book: &impl PublicBook,
         now_ms: u64,
     ) -> Result<PublicMarketSourceOutput, PublicMarketSourceError> {
         self.consume_with_emission(input, book, now_ms, true)
@@ -85,16 +83,16 @@ impl ScalpingPublicMarketSource {
     pub(crate) fn consume_batched(
         &mut self,
         input: RecordedPublicEvent,
-        book: &OrderBook,
+        book: &impl PublicBook,
         now_ms: u64,
     ) -> Result<PublicMarketSourceOutput, PublicMarketSourceError> {
         self.consume_with_emission(input, book, now_ms, false)
     }
 
-    fn consume_with_emission(
+    fn consume_with_emission<B: PublicBook>(
         &mut self,
         input: RecordedPublicEvent,
-        book: &OrderBook,
+        book: &B,
         now_ms: u64,
         allow_emission: bool,
     ) -> Result<PublicMarketSourceOutput, PublicMarketSourceError> {

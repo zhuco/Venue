@@ -8,13 +8,11 @@ use rust_decimal::{
     prelude::{Signed, ToPrimitive},
 };
 
-use crate::{
-    domain::{FieldState, Price, PublicBar, PublicTrade, Symbol},
-    indicator::{
-        BARS_SOURCE, BOOK_SOURCE, FeatureFrame, FeatureState, FeatureValues, SourceCursor,
-        TRADES_SOURCE,
-    },
-    market::OrderBook,
+use venue_domain::{FieldState, Price, PublicBar, PublicTrade, Symbol};
+
+use super::{
+    BARS_SOURCE, BOOK_SOURCE, FeatureFrame, FeatureState, FeatureValues, PublicBook, SourceCursor,
+    TRADES_SOURCE,
 };
 
 const BOOK_FEATURE_VERSION: &str = "pulse-mas-depth-ofi-v2";
@@ -116,7 +114,7 @@ impl ScalpingFeatureBuilder {
 
     pub fn ingest_book(
         &mut self,
-        book: &OrderBook,
+        book: &impl PublicBook,
         received_at_ms: u64,
     ) -> Result<(), FeatureBuildError> {
         let symbol = book.symbol().cloned().ok_or(FeatureBuildError::Book)?;
