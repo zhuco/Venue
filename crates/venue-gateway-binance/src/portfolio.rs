@@ -118,6 +118,10 @@ pub fn complete_scoped_positions(
 
 /// Produces one same-generation account/leg risk observation. Stablecoin parity is never assumed:
 /// SOL/USDC and USDT contracts require explicit quote-to-USD evidence.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the signed payloads, binding scope, generation, clock, and currency evidence form one indivisible risk tuple"
+)]
 pub fn parse_risk_snapshots(
     account_payload: &str,
     positions_payload: &str,

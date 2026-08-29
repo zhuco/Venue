@@ -1,6 +1,6 @@
 # 多策略、多交易所账户运行时与对冲网格开发规范
 
-更新：2026-08-27
+更新：2026-08-30
 
 ## 1. 文档职责
 
@@ -438,7 +438,10 @@ Gate、Bitget 当前 profile 只允许常规订单族，条件/Algo 由同一 pr
 
 ### E. 控制端
 
-最后增加本地 Control API。Web 面板和 Windows UI 只调用 API，不读取 WAL、不持有凭证、不直接下单。
+本地 Control API 使用版本化 `venue-control-protocol`；原生 VenueFlow 与 WebAssembly canvas 共用
+`/v1/ui/snapshot`、`/v1/ui/events`、`/v1/control/commands`。两端只调用 API，不读取数据库、WAL 或 artifacts，
+不持有凭证，不直连交易所，不直接下单。Stop/Flatten 必须显示并提交精确 account、symbol、action 与人工确认；
+Control server 和账户节点仍须按 durable inbox、Actor applied、Execution Lane、risk、Owner、WAL 与 writer 边界重新验证。
 
 ## 12. 验收标准
 

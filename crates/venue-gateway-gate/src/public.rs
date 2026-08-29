@@ -549,7 +549,7 @@ enum GateBookBridgeState {
         buffered: VecDeque<GatePublicRecord<GateBookDelta>>,
     },
     AwaitingBridge {
-        snapshot: GatePublicRecord<MarketSnapshot>,
+        snapshot: Box<GatePublicRecord<MarketSnapshot>>,
     },
     Ready {
         sequence: u64,
@@ -691,7 +691,9 @@ impl GateOrderBookBridge {
         }
         let mut actions = vec![GateBookBridgeAction::ReplaceSnapshot(snapshot.clone())];
         let Some(first) = buffered.pop_front() else {
-            self.state = GateBookBridgeState::AwaitingBridge { snapshot };
+            self.state = GateBookBridgeState::AwaitingBridge {
+                snapshot: Box::new(snapshot),
+            };
             return Ok(actions);
         };
         if !covers(
@@ -1086,7 +1088,7 @@ mod tests {
     }
 
     fn delta_payload(first: u64, last: u64, full: bool) -> String {
-        let full = full.then_some(",\"full\":true").unwrap_or_default();
+        let full = if full { ",\"full\":true" } else { "" };
         format!(
             r#"{{"time_ms":1700000001000,"channel":"futures.order_book_update","event":"update","result":{{"t":1700000001001,"s":"DOGE_USDT","U":{first},"u":{last},"b":[{{"p":"0.100","s":"2"}}],"a":[{{"p":"0.101","s":"3"}}]{full}}}}}"#
         )

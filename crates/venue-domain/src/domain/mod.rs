@@ -21,7 +21,11 @@ pub use event::{
     UnknownReason,
 };
 pub use identity::is_canonical_trading_account_id;
-pub use instrument::{Instrument, InstrumentError, MarketKind};
+pub use instrument::{
+    ContractSpec, Instrument, InstrumentError, InstrumentIdentity, InstrumentMetadata,
+    InstrumentMetadataError, InstrumentSnapshot, InstrumentSnapshotError, InstrumentValueError,
+    MarketKind, Precision, ValueUnit,
+};
 pub use market::{
     AggressorSide, MarkFunding, MarketDelta, MarketEvent, MarketLevel, MarketSnapshot, PublicBar,
     PublicTicker, PublicTrade,

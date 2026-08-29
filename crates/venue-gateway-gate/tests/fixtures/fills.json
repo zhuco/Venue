@@ -1,0 +1,24 @@
+[
+  {
+    "id": "227262266",
+    "order_id": "9001",
+    "contract": "DOGE_USDT",
+    "size": "-41",
+    "price": "0.08548",
+    "fee": "-0.01",
+    "pnl": "1.25",
+    "role": "taker",
+    "create_time_ms": "1787512420195",
+    "text": "t-ord-etp-l-0000000000000001"
+  },
+  {
+    "id": 227262267,
+    "order_id": 9002,
+    "contract": "DOGE_USDT",
+    "size": "10",
+    "price": "0.08600",
+    "role": "future_role",
+    "create_time": "1787512420.250",
+    "text": "foreign-order"
+  }
+]

@@ -1,0 +1,24 @@
+[
+  {
+    "id": "9001",
+    "contract": "DOGE_USDT",
+    "size": "50",
+    "left": "30",
+    "is_reduce_only": false,
+    "status": "open",
+    "price": "0.10000",
+    "fill_price": "0.10001",
+    "text": "t-hgo_e7_long_open_l1"
+  },
+  {
+    "id": 9002,
+    "contract": "DOGE_USDT",
+    "size": "-40",
+    "left": "-40",
+    "is_reduce_only": false,
+    "status": "open",
+    "price": "0.10100",
+    "fill_price": "0",
+    "text": "t-hgo_e7_short_open_l1"
+  }
+]

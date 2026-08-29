@@ -1,6 +1,6 @@
 # VENUE 目标架构与技术栈
 
-更新：2026-08-29
+更新：2026-08-30
 
 ## 1. 文档职责
 
@@ -156,11 +156,13 @@ Leader Intent
 -> copy ledger and drift repair
 ```
 
-当前 `venue-copy` 已落地纯资本/目标敞口 reducer 与确定性身份内核：只使用同一 generation、同一估值币种和有效期内的冻结事实，
-按 configured、allocated、扣安全储备后的 available margin 三者最小值确定 follower 有效资本，复用 leader 已包含杠杆的
-exposure ratio，且跨零反向必须先平仓并等待新私有事实。它不依赖 storage、network、runtime 或 writer；完整数量/价格 sizing
-要等规范 `Instrument` 补齐跨所稳定身份和合约换算语义后再实现，禁止在 Copy 内复制一套 metadata。job、planning snapshot、
-child order 和 idempotency key 已按 KOL 的 length-delimited SHA-256 与 domain separation 固化，重放不读取时间或随机源。
+当前 `venue-copy` 已落地纯资本/目标敞口 reducer、确定性身份、数量 sizing 与跨所 LIMIT 转换。它只使用同 generation、同估值币种和
+有效期内的冻结资本事实，并按 configured、allocated、扣安全储备后的 available margin 三者最小值确定 follower 有效资本；
+跨零反向必须先平仓并等待新私有事实。规范 `InstrumentIdentity`、Precision、ContractSpec、metadata 与 snapshot 只存在于
+`venue-domain`：sizing 精确绑定 instrument/reference generation 与半开时效窗口，把 quote delta 向下归一为 base quantity 或
+contract lots，显式返回 reduce-only 与残差；LIMIT 只保留同一稳定 instrument 的相对偏移，BUY 向下、SELL 向上对齐且不得跨越
+风险边界。job、planning snapshot、child order 和 idempotency key 继续按 length-delimited SHA-256 与 domain separation 固化。
+这些 reducer 均不依赖 storage、network、runtime、native symbol 或 writer；outbox/inbox、ledger 与 drift repair 尚未接入。
 
 必须保留：
 
@@ -191,12 +193,12 @@ Copy planner/job-consumer lease 只允许竞争数据库 job 的规划或投递�
 
 | Venue | 目标 adapter | 当前权威来源 | 初始准入 |
 |---|---|---|---|
-| Binance | `venue-gateway-binance` | 已迁入 Portfolio Margin 产品身份、原生 symbol、私有 payload、账户/仓位/订单/成交/风险纯规范化及有界成交 cursor 分页；根路径兼容 re-export，现有签名 readback、transport 与 Stage 7 capability/WAL/writer 保持生产权威，GatewayBinding 不授予旧 writer 能力 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
-| Bitget | `venue-gateway-bitget` | 已迁入 UTA 产品身份、当前官方 TEST Demo/LIVE 端点、secrecy 凭证、REST/WS 签名、公共市场、账户模式/余额/持仓及账户/腿风险纯协议；根路径兼容 re-export，HTTP/WS transport、私有 readback、订单/成交、Stage 7 capability/WAL/writer 仍由根 package 保持生产权威 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
-| Gate.io | `venue-gateway-gate` | 已迁入 USDT perpetual scope、当前官方 TEST/LIVE 端点、secrecy 凭证、REST/WS 签名、公共市场、账户/持仓、合约数量及账户/腿风险纯协议；根路径兼容 re-export，HTTP/WS transport、私有 readback、订单/成交、Stage 7 capability/WAL/writer 仍由根 package 保持生产权威 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
-| Bybit | `venue-gateway-bybit` | 已迁入完整 gateway binding、由 binding 派生的 V5 TEST/LIVE endpoint、secrecy 凭证/签名 header、HMAC 固定向量与签名成交 fixture；capability 为空，transport/private stream/writer 待接 | `TEST | LIVE`；最小 LIVE 安全闭环后即可小额实盘调试 |
-| OKX | `venue-gateway-okx` | 已迁入完整 gateway binding、由 binding 派生的 V5 TEST 模拟盘/LIVE 端点与请求头、三项 secret、HMAC 固定向量与合约成交规范化 fixture；capability 为空，transport/private stream/writer 待接 | `TEST | LIVE`；最小 LIVE 安全闭环后即可小额实盘调试 |
-| Hyperliquid | `venue-gateway-hyperliquid` | 已迁入完整 gateway binding、由 binding 派生的 TEST/LIVE 端点、命名 Agent secret 边界、按 Agent 绑定的持久 nonce 契约与私有成交 fixture；EIP-712 所需 `k256`/MessagePack/Keccak 依赖尚未获准，因此 signing/transport/writer 未接且 capability 为空 | `TEST | LIVE`；最小 LIVE 安全闭环后即可小额实盘调试 |
+| Binance | `venue-gateway-binance` | 已迁入 Portfolio Margin binding、TEST/LIVE 端点、secrecy 凭证、PAPI HMAC、exchangeInfo instrument rules、公共 BBO/深度/成交/闭合 bar raw envelope、账户/仓位/订单/成交/风险纯协议和七日有界成交分页；根签名 readback、transport 与 Stage 7 capability/WAL/writer 仍是生产权威 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
+| Bitget | `venue-gateway-bitget` | 已迁入 UTA TEST Demo/LIVE、凭证与 REST/WS 签名、公共市场、带时效 instrument metadata、账户/设置/持仓/normal 订单/成交同 attempt 五面候选与 raw 重放；不从官方未提供的字段猜 contract value；签名 transport/WS 与 Stage 7 capability/WAL/writer 仍留根 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
+| Gate.io | `venue-gateway-gate` | 已迁入 USDT perpetual TEST/LIVE、凭证/REST/WS 签名、公共市场、账户/持仓/风险、regular 订单/成交闭合分页；Stage 7 profile 候选重放 regular raw pages，并只把 Conditional/Algo 表示为显式 unsupported；签名采集 transport 与 Stage 7 capability/WAL/writer 仍留根 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
+| Bybit | `venue-gateway-bybit` | 已迁入 binding/端点/凭证/HMAC、USDT linear instrument/BBO 与 `cts/u/seq`，以及同 binding 的 UTA2 identity、UNIFIED 余额、linear positionIdx、挂单/历史/成交和显式分页闭合；旧未绑定 execution parser 已删除；transport/private stream/writer/WAL/capability 为空 | `TEST | LIVE`；完成最小安全闭环前仅纯协议/fixture，不得小额实盘 |
+| OKX | `venue-gateway-okx` | 已迁入 binding、模拟盘请求头、凭证/HMAC、linear SWAP instrument/BBO、账户模式/余额/仓位/挂单/成交与 after 分页；canonical limit/market/reduce 可编码 place/cancel 并解析 ack/签名详情回读，tdMode 只接受 Cross/Isolated、Net 意图拒绝；transport/writer/WAL/capability 为空 | `TEST | LIVE`；完成最小安全闭环前仅纯协议/fixture，不得小额实盘 |
+| Hyperliquid | `venue-gateway-hyperliquid` | 已迁入 user/symbol/mode binding、端点、命名 Agent secret、持久 nonce、meta/L2/BBO、clearinghouse/open orders/WS fills、inclusive fill cursor、绑定型 `/info` 与 `orderStatus` 恢复查询；`tid` 明确不是 sequence；EIP-712 action signing、transport/writer/WAL/capability 为空 | `TEST | LIVE`；完成最小安全闭环前仅纯协议/fixture，不得小额实盘 |
 
 KOL 网关只是协议 fixture 和差异对照来源，不继承其运行开关或实盘准入状态。前三所的生产权威继续来自 Venue 已验收实现。
 
@@ -239,6 +241,11 @@ core / series / ta / orderflow / registry
 ## 10. VenueFlow 桌面端
 
 桌面技术栈固定为 Rust 2024、`eframe/egui`、`egui_tiles` 和 WGPU；异步网络使用 Tokio 与 WebSocket/SSE client。
+
+当前第一版 `apps/venueflow` 已用同一套 eframe/egui_tiles/WGPU 视图提供原生窗口与 WebAssembly canvas；native client 使用
+Tokio/reqwest/SSE，Web client 使用 reqwest/EventSource。`venue-control-protocol` schema v1 固定 `/v1/ui/snapshot`、
+`/v1/ui/events` 和 `/v1/control/commands` 的 DTO、receipt 与错误边界。两端只显示查询投影并提交语义控制请求；Stop/Flatten
+必须携带精确 account、symbol、action 与人工确认，服务端仍须重新验证。当前没有 Control server、数据库投影或交易执行连接。
 
 迁移范围：
 

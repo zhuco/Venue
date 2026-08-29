@@ -7,6 +7,8 @@
 mod config;
 mod credentials;
 pub mod endpoints;
+mod order_families;
+mod orders;
 mod private;
 mod public;
 mod risk;
@@ -14,6 +16,16 @@ mod sign;
 
 pub use config::{GateConfig, GateProductScope};
 pub use credentials::GateCredentials;
+pub use order_families::{
+    GATE_STAGE7_ORDER_PROFILE_VERSION, GateStage7OrderFamilyCandidate, GateStage7OrderFamilyError,
+    GateStage7OrderFamilyEvidence, GateStage7OrderFamilyScope, GateStage7UnsupportedEvidence,
+    GateStage7UnsupportedOrderFamily, validate_stage7_order_families,
+};
+pub use orders::{
+    GATE_PRIVATE_MAX_PAGES, GATE_PRIVATE_PAGE_LIMIT, GateFillRecord, GateFillsReadback,
+    GateOrderPayloadError, GateRegularOrdersReadback, collect_fill_pages,
+    collect_regular_order_pages, parse_fill_record, parse_regular_order,
+};
 pub use private::{GatePrivatePayloadError, optional_price, parse_account_balance, parse_position};
 pub use public::*;
 pub use risk::{

@@ -6,6 +6,8 @@
 
 mod capital;
 mod identity;
+mod limit;
+mod sizing;
 
 pub use capital::{
     CapitalSnapshot, TargetExposureError, TargetExposurePlan, TargetExposureRequest,
@@ -14,4 +16,12 @@ pub use capital::{
 pub use identity::{
     CopyAction, CopyId, CopyIdentityError, CopyIdentityInput, CopyIdentitySet, IdempotencyKey,
     derive_copy_identities,
+};
+pub use limit::{
+    CrossVenueLimitPlan, CrossVenueLimitRequest, LimitPriceError, convert_cross_venue_limit,
+    normalize_limit_price,
+};
+pub use sizing::{
+    ReferencePriceSnapshot, SemanticSizingPlan, SemanticSizingRequest, SizedQuantity, SizingError,
+    plan_semantic_size,
 };

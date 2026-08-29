@@ -3,6 +3,8 @@ mod binding;
 mod config;
 mod credentials;
 pub mod endpoints;
+pub mod instrument;
+pub mod private;
 pub mod public;
 pub mod risk;
 mod sign;
