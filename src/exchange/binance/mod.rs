@@ -27,6 +27,12 @@ use super::{
     binance_private::{self, PrivateParseError, PrivateReadback},
 };
 
+use binance_private::USER_TRADES_PAGE_LIMIT;
+pub use binance_private::{
+    RecentFillsCursor, RecentFillsPageRequest, RecentFillsPaginationError, RecentFillsReadback,
+    paginate_recent_fills,
+};
+
 mod public_stream;
 pub use public_stream::{PublicStream, PublicStreamSocket, depth_stream_url, public_stream_url};
 mod market_scan;
@@ -43,9 +49,6 @@ const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PROXY_RESPONSE_LIMIT: usize = 8 * 1024;
 const PUBLIC_GET_TRANSPORT_ATTEMPTS: u8 = 3;
 const PUBLIC_GET_RETRY_BASE_MS: u64 = 100;
-const USER_TRADES_PAGE_LIMIT: u16 = 1_000;
-const USER_TRADES_MAX_PAGES: u32 = 10_000;
-const USER_TRADES_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const API_KEY_ENV: &str = "BINANCE_API_KEY";
 const API_SECRET_ENV: &str = "BINANCE_API_SECRET";
 type HmacSha256 = Hmac<sha2::Sha256>;
@@ -202,31 +205,6 @@ pub(crate) struct BinanceGridPrivateReadback {
     pub signed_regular_order_payloads: Vec<String>,
     pub algo_orders: Vec<crate::domain::Order>,
     pub signed_algo_order_payloads: Vec<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RecentFillsCursor {
-    pub observed_through_ms: u64,
-    pub last_trade_id: Option<u64>,
-    pub last_event_time_ms: Option<u64>,
-}
-
-/// One bounded request issued by the cursor paginator. It is public so a
-/// local fixture or a credential-owning gateway can inspect the exact query
-/// contract without constructing a network client.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RecentFillsPageRequest {
-    pub start_time_ms: u64,
-    pub end_time_ms: u64,
-    pub from_id: Option<u64>,
-    pub limit: u16,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RecentFillsReadback {
-    pub payload: String,
-    pub cursor: RecentFillsCursor,
-    pub pages: u32,
 }
 
 /// A listen key is sensitive connection material and deliberately has no Display or Debug impl.
@@ -1911,6 +1889,15 @@ pub enum PrivateError {
     FillPageLimit,
 }
 
+impl From<RecentFillsPaginationError> for PrivateError {
+    fn from(error: RecentFillsPaginationError) -> Self {
+        match error {
+            RecentFillsPaginationError::FillPage => Self::FillPage,
+            RecentFillsPaginationError::FillPageLimit => Self::FillPageLimit,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PrivateReadbackError {
     #[error("Binance PAPI account readback request failed: {0}")]
@@ -1980,10 +1967,6 @@ fn user_trades_parameters(
     parameters.push(("limit", USER_TRADES_PAGE_LIMIT.to_string()));
     parameters
 }
-
-#[path = "binance_fill_pagination.rs"]
-mod binance_fill_pagination;
-pub use binance_fill_pagination::paginate_recent_fills;
 
 #[cfg(test)]
 #[path = "binance_tests.rs"]

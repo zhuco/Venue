@@ -8,6 +8,13 @@ use venue_domain::domain::{
     PositionSide, Price, Symbol, UnknownReason,
 };
 
+#[path = "fill_pagination.rs"]
+mod fill_pagination;
+pub use fill_pagination::{
+    RecentFillsCursor, RecentFillsPageRequest, RecentFillsPaginationError, RecentFillsReadback,
+    USER_TRADES_PAGE_LIMIT, paginate_recent_fills,
+};
+
 /// Normalized private readback data. It is not authoritative until its caller journals it as
 /// generation-fenced private facts.
 #[derive(Clone, Debug, Eq, PartialEq)]

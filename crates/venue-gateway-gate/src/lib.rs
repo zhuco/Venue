@@ -1,12 +1,22 @@
 //! Gate.io gateway protocol boundary.
 //!
-//! The first migration slice contains only credential-free public-market protocol behavior and
-//! immutable gateway identity validation. It has no HTTP/WebSocket transport, credentials,
-//! capability issuer, writer, WAL, or mutation authority.
+//! This crate contains deterministic Gate.io protocol behavior and immutable gateway identity
+//! validation. It has no HTTP/WebSocket transport, capability issuer, writer, WAL, or mutation
+//! authority.
 
+mod config;
+mod credentials;
+pub mod endpoints;
 mod public;
+mod sign;
 
+pub use config::{GateConfig, GateProductScope};
+pub use credentials::GateCredentials;
 pub use public::*;
+pub use sign::{
+    GatePrivateChannel, GateRestSignedHeaders, GateWebSocketAuth, sign_rest,
+    sign_websocket_subscription,
+};
 use thiserror::Error;
 use venue_gateway_api::{GatewayApiError, GatewayBinding, VenueId};
 
@@ -37,6 +47,16 @@ pub enum GateGatewayBindingError {
     Venue,
     #[error(transparent)]
     Gateway(#[from] GatewayApiError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum GateProtocolError {
+    #[error("Gate.io credentials are unavailable or empty")]
+    Credentials,
+    #[error("Gate.io signing input is invalid")]
+    SigningInput,
+    #[error("Gate.io gateway supports only USDT-settled perpetual futures")]
+    ProductScope,
 }
 
 #[cfg(test)]

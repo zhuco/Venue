@@ -1927,7 +1927,10 @@ dependencies = [
 name = "venue-gateway-bitget"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "hmac",
  "rust_decimal",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2",
@@ -1955,7 +1958,9 @@ dependencies = [
 name = "venue-gateway-gate"
 version = "0.1.0"
 dependencies = [
+ "hmac",
  "rust_decimal",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2",
