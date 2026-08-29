@@ -1,15 +1,13 @@
 use std::time::Duration;
 
-use eframe::egui;
-use serde::{Deserialize, Serialize};
-use venue_control_protocol::ConnectionState;
-
 use crate::{
     client::{ClientEvent, ControlClient},
     model::{AppModel, Preferences},
     theme, ui,
     workspace::Workspaces,
 };
+use eframe::egui;
+use serde::{Deserialize, Serialize};
 
 const STORAGE_KEY: &str = "venueflow-state-v1";
 const PERSISTED_SCHEMA_VERSION: u16 = 1;
@@ -68,26 +66,22 @@ impl VenueFlowApp {
         for event in events {
             match event {
                 ClientEvent::SnapshotConnected => {
-                    if matches!(
-                        self.model.connection,
-                        ConnectionState::Connecting | ConnectionState::Offline
-                    ) {
-                        self.model.connection = ConnectionState::Live;
-                    }
+                    self.model.snapshot_connected();
                 }
-                ClientEvent::StreamConnected => {
-                    self.model.connection = ConnectionState::Live;
-                    self.model.last_error = None;
+                ClientEvent::SnapshotUnavailable(message) => {
+                    self.model.snapshot_unavailable(message);
                 }
-                ClientEvent::Disconnected(message) => {
-                    self.model.connection = if self.model.snapshot.is_some() {
-                        ConnectionState::Degraded
-                    } else {
-                        ConnectionState::Offline
-                    };
+                ClientEvent::StreamConnected { resumed_after } => {
+                    self.model.stream_connected(resumed_after);
+                }
+                ClientEvent::StreamUnavailable(message) => {
+                    self.model.stream_unavailable(message);
+                }
+                ClientEvent::CommandUnavailable(message) => {
                     self.model.last_error = Some(message.clone());
                     self.model.notice(message);
                 }
+                ClientEvent::EventCursor(event_id) => self.model.observe_event_id(event_id),
                 ClientEvent::Snapshot(snapshot) => self.model.apply_snapshot(snapshot),
                 ClientEvent::Receipt(receipt) => {
                     if self.model.apply_receipt(receipt.clone()) {
@@ -107,7 +101,7 @@ impl VenueFlowApp {
             return;
         }
         self.reconnect = false;
-        self.model.connection = ConnectionState::Connecting;
+        self.model.reconnecting();
         self.client =
             ControlClient::connect(self.model.preferences.endpoint.clone(), context.clone());
         self.model.notice("Reconnecting to the Control API");
@@ -216,7 +210,15 @@ mod tests {
                 .and_then(serde_json::Value::as_u64),
             Some(u64::from(PERSISTED_SCHEMA_VERSION))
         );
-        for forbidden in ["credentials", "wal", "orders", "positions", "snapshot"] {
+        for forbidden in [
+            "credentials",
+            "wal",
+            "orders",
+            "positions",
+            "snapshot",
+            "commands",
+            "receipts",
+        ] {
             assert!(value.get(forbidden).is_none());
         }
     }
