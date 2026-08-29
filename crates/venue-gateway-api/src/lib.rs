@@ -4,6 +4,16 @@ use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 use venue_domain::domain::{Symbol, is_canonical_trading_account_id};
 
+mod capability_promotion;
+
+pub use capability_promotion::{
+    CanaryAdmissionReceipt, CapabilityProbeCandidate, CapabilityPromotionError,
+    CompleteOrderFamilyEvidence, ControlAppliedReceipt, ControlState, EvidenceCommitment,
+    HostAdmissionEvidence, HostAdmittedCapability, MAX_PROMOTION_TTL_MS, OrderFamilyEvidence,
+    OrderFamilySupport, OwnerRecoveryReceipt, PromotionScope, WalRecoveryReceipt,
+    WriterFenceReceipt, promote_capability,
+};
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VenueId {
