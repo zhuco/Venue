@@ -7,6 +7,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use venue_domain::FactRecord;
 
+use crate::checkpoint::sync_parent;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct JournalEntry {
     pub sequence: u64,
@@ -131,6 +133,7 @@ impl DurableJsonl {
     where
         E: From<StorageError>,
     {
+        require_parent(&self.path).map_err(E::from)?;
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -157,6 +160,7 @@ impl DurableJsonl {
                     source,
                 })
             })?;
+        sync_parent(&self.path).map_err(E::from)?;
         Ok(value)
     }
 
@@ -170,6 +174,18 @@ impl DurableJsonl {
             }),
         }
     }
+}
+
+fn require_parent(path: &Path) -> Result<&Path, StorageError> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| StorageError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "journal path has no parent directory",
+            ),
+        })
 }
 
 #[derive(Debug)]

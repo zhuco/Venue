@@ -117,7 +117,7 @@ fn temporary_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn sync_parent(path: &Path) -> Result<(), StorageError> {
+pub(crate) fn sync_parent(path: &Path) -> Result<(), StorageError> {
     let parent = path.parent().ok_or_else(|| StorageError::Io {
         path: path.to_path_buf(),
         source: std::io::Error::new(
@@ -134,6 +134,6 @@ fn sync_parent(path: &Path) -> Result<(), StorageError> {
 }
 
 #[cfg(not(unix))]
-fn sync_parent(_path: &Path) -> Result<(), StorageError> {
+pub(crate) fn sync_parent(_path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
