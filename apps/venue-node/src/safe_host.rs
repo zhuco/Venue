@@ -19,6 +19,7 @@ use venue_runtime::{AccountKey, AccountModelError, StrategyBinding};
 
 use crate::{
     NodeLaunch,
+    async_gateway::{AsyncGatewayBoundaryError, validate_capability_preflight},
     supervision::{
         ActorAppliedCanaryReceipt, ActorAppliedControlReceipt, ActorCanaryTurn, ActorControlTurn,
         CanaryControlRequest, PersistedControlCompletion, RestoredLifecycle, SupervisionError,
@@ -598,6 +599,7 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
         now_ms: u64,
     ) -> Result<Self, SafeHostError> {
         validate_static_scope(launch.binding(), &owner, gateway.binding())?;
+        validate_capability_preflight(launch.binding(), &gateway.capability_snapshot())?;
         let artifacts_root = launch.artifacts_root();
         let writer_scope = writer_scope(launch.binding(), &owner);
         let guard = acquire_account_canonical_root(&writer_scope, &artifacts_root)?;
@@ -841,6 +843,7 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
         now_ms: u64,
     ) -> Result<Self, SafeHostError> {
         validate_static_scope(launch.binding(), &owner, gateway.binding())?;
+        validate_capability_preflight(launch.binding(), &gateway.capability_snapshot())?;
         let mut host = Self::open_with_root(
             launch.binding().clone(),
             launch.artifacts_root(),
@@ -1450,6 +1453,8 @@ pub(crate) enum TestCrashPoint {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SafeHostError {
+    #[error(transparent)]
+    AsyncGateway(#[from] AsyncGatewayBoundaryError),
     #[error(transparent)]
     GatewayApi(#[from] GatewayApiError),
     #[error(transparent)]
