@@ -23,12 +23,12 @@
 
 现有 Stage 7 共享网格运行时是迁移中的可运行实现。新增修复必须符合本文边界，不再扩展成另一套交易所专用运行时。
 
-账户级纯内核固定在 `src/runtime/account/`，策略顺序邮箱固定在 `src/runtime/strategy/`，账户执行调度契约固定在
-`src/execution/account_lane.rs`。这些模块只建立身份、注册、路由、调度和对账边界，不持有连接、凭证、WAL、
+账户级纯内核固定在 `crates/venue-runtime/src/account/`，策略顺序邮箱固定在 `crates/venue-runtime/src/strategy/`，账户执行调度契约固定在
+`crates/venue-runtime/src/account_lane.rs`；根 `src/runtime/account/`、`src/runtime/strategy/` 与 `src/execution/account_lane.rs` 只保留兼容 facade。这些模块只建立身份、注册、路由、调度和对账边界，不持有连接、凭证、WAL、
 writer 或物理交易客户端。`legacy_stage7_strategy_binding` 只转换单策略身份，不授予 mutation 能力。配置中的
 `trading_account_id` 是真实账户的稳定规范 UUID，跨 symbol/策略复用；交易所 `account_binding` 只表示产品/模式能力。
 迁移完成前，现有 Stage 7 仍是唯一实盘 writer；不得同时为同一账户启动账户内核的新物理执行路径。
-文件型 checkpoint、journal、private evidence、fill cursor 与 Scalping evidence/risk 的耐久实现已集中到 `venue-storage`，根 `src/storage` 只保留兼容 facade/宿主扩展；本次物理提取不改变 fsync、恢复、WAL 或接管语义。
+通用 `CommandJournal`、writer lease 与账户级 canonical-root fence 固定在 `venue-execution`；原 JSONL serde/hash、writer schema、fsync、调用方工件路径及机器级 `stage7_writer_roots/v2` 路径保持不变，Stage 7 继续经根 facade 使用同一实现。文件型 checkpoint、facts journal、private evidence、fill cursor 与 Scalping evidence/risk 的耐久实现集中在 `venue-storage`，根 `src/storage` 只保留兼容 facade/宿主扩展。
 Bybit、OKX、Hyperliquid 虽已有绑定型 async HTTP/私有 WS transport，但 capability、writer 与 WAL 仍为空，不能加入网格 mutation 或接管链。
 Stage 7 成交热路径不得遍历历史命令 WAL。命令 journal 在启动重放时建立未决命令、撤单目标和交易所订单 ID 的派生内存索引；滚动补撤批次以原 JSONL 格式一次 fsync 持久化 Prepared/Submitted 状态，再并行提交物理请求。接管只可在签名全订单族为空、零未决且零本地事务后显式按源 SHA 封存已解析 WAL；原件留在同 root，活动 WAL 从空文件继续，禁止运行中轮转或删除审计源。
 
@@ -107,9 +107,10 @@ Exchange Account Process
 - `domain`：规范类型，不依赖策略或交易所。
 - `exchange`：原生协议、签名、分页、限频、原生 symbol 与规范事实转换。
 - `strategy`：纯 reducer（状态归约器），输入事实并输出语义意图。
-- `runtime/account`：账户级身份注册、规范路由、对账和生命周期纯内核；物理连接由后续 runtime 组合层持有。
-- `runtime/strategy`：目标策略实例宿主、Checkpoint 和恢复。
-- `execution`：Owner、WAL、唯一 writer（写入者）、限频和命令结果。
+- `venue-runtime/account`：账户级身份注册、规范路由、对账和生命周期纯内核；物理连接由后续 runtime 组合层持有。
+- `venue-runtime/strategy`：目标策略实例宿主、Checkpoint 和恢复；opaque turn/applied authority 的发行构造器保持 crate-private。
+- `venue-runtime/account_lane`：账户级公平调度、Unknown fence 与 WAL 前/后授权分态，不持有 writer、WAL 或客户端。
+- `venue-execution`：通用命令 WAL、唯一 writer lease、账户 canonical-root fence 与命令哈希；根 execution 其余物理门禁保持现状。
 - `risk`：少量账户级硬上限与策略自身风险逻辑。
 
 同一策略族跨交易所必须复用一个 reducer。交易所差异只进入 adapter、能力证据、Execution Profile（执行配置）或 Deployment Binding（部署绑定）。
@@ -148,7 +149,7 @@ Exchange Account Process
 ### 4.4 Execution Lane（执行通道）
 
 - 一个账户只有一个精确 writer；
-- 机器级 canonical root 与进程锁按 `(exchange, trading_account_id)` 建键，不含 symbol、Owner 或策略；Stage 7、旧网格、Scalping Live、Canary 和可写恢复必须先取得同一账户 fence，Shadow 不占用；
+- 机器级 canonical root 与进程锁由 `venue-execution` 按 `(exchange, trading_account_id)` 建键，不含 symbol、Owner 或策略；Stage 7、旧网格、Scalping Live、Canary 和可写恢复必须先取得同一账户 fence，Shadow 不占用；
 - 负责 Owner 校验、WAL、Client Order ID、基础数量/价格精度、账户硬上限和交易所限频；创建订单在入队时原子保留 `(family, client id, Owner)`，Cancel 必须精确命中同 Owner、同 family；
 - 高优先级：成交后的补撤、止损、减仓、紧急撤单；
 - 中优先级：策略正常挂撤；

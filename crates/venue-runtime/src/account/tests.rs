@@ -356,7 +356,7 @@ fn set_desired(
                 OrderSide::Buy,
                 PositionSide::Long,
                 Some(Decimal::ONE),
-                Some(desired_price.clone()),
+                Some(desired_price),
                 false,
                 None,
             )

@@ -4480,11 +4480,13 @@ dependencies = [
  "tracing-subscriber",
  "tungstenite",
  "venue-domain",
+ "venue-execution",
  "venue-gateway-api",
  "venue-gateway-binance",
  "venue-gateway-bitget",
  "venue-gateway-gate",
  "venue-indicators",
+ "venue-runtime",
  "venue-storage",
  "venue-strategies",
 ]
@@ -4535,6 +4537,21 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "venue-execution"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.19",
+ "venue-domain",
+ "venue-gateway-api",
 ]
 
 [[package]]
@@ -4661,6 +4678,22 @@ dependencies = [
  "serde",
  "thiserror 2.0.19",
  "venue-domain",
+]
+
+[[package]]
+name = "venue-runtime"
+version = "0.1.0"
+dependencies = [
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.19",
+ "venue-domain",
+ "venue-execution",
+ "venue-gateway-api",
+ "venue-storage",
 ]
 
 [[package]]
