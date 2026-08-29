@@ -1,4 +1,5 @@
 mod checkpoint;
+mod control_delivery;
 mod facts;
 mod fill_cursor;
 mod journal;
@@ -7,6 +8,7 @@ mod scalping_evidence;
 mod scalping_risk;
 
 pub use checkpoint::{Checkpoint, CheckpointStore, ProjectionStore};
+pub use control_delivery::{OpaqueJournal, OpaqueJournalError, OpaqueJournalRecord};
 pub use facts::{AcceptOutcome, TradingFacts};
 pub use fill_cursor::{FillCursor, FillCursorCommit, FillCursorError, FillCursorStore};
 pub use journal::{Journal, JournalEntry, JournalRecovery, StorageError};
