@@ -1,0 +1,823 @@
+use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke};
+use egui_tiles::{Behavior, TileId, Tiles, UiResponse};
+use venue_control_protocol::{
+    AggressorSide, ConnectionState, ControlAction, HealthState, MarketSummary, StrategyLifecycle,
+    StrategySummary,
+};
+
+use crate::{
+    client::ControlClient,
+    model::{AppModel, PendingConfirmation, WorkspaceKind, decimal_to_f64, format_decimal},
+    theme,
+    workspace::{Pane, PaneKind, Workspaces},
+};
+
+pub struct PaneBehavior<'a> {
+    pub model: &'a mut AppModel,
+    pub client: &'a ControlClient,
+}
+
+impl Behavior<Pane> for PaneBehavior<'_> {
+    fn pane_ui(&mut self, ui: &mut egui::Ui, _tile_id: TileId, pane: &mut Pane) -> UiResponse {
+        theme::panel_frame().show(ui, |ui| match pane.kind {
+            PaneKind::MarketWatch => show_market_watch(ui, self.model),
+            PaneKind::Chart => show_chart(ui, pane, self.model),
+            PaneKind::OrderBook => show_order_book(ui, pane, self.model),
+            PaneKind::TradeTape => show_trade_tape(ui, pane, self.model),
+            PaneKind::Accounts => show_accounts(ui, self.model),
+            PaneKind::Strategies => show_strategies(ui, self.model),
+            PaneKind::CopyRelations => show_copy_relations(ui, self.model),
+            PaneKind::Ledger => show_ledger(ui, self.model),
+            PaneKind::Control => show_control(ui, self.model, self.client),
+            PaneKind::Diagnostics => show_diagnostics(ui, self.model),
+        });
+        UiResponse::None
+    }
+
+    fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::WidgetText {
+        pane.title().into()
+    }
+
+    fn is_tab_closable(&self, _tiles: &Tiles<Pane>, _tile_id: TileId) -> bool {
+        true
+    }
+
+    fn gap_width(&self, _style: &egui::Style) -> f32 {
+        4.0
+    }
+}
+
+pub fn show_top_bar(
+    ui: &mut egui::Ui,
+    model: &mut AppModel,
+    workspaces: &mut Workspaces,
+    show_modules: &mut bool,
+    show_settings: &mut bool,
+) {
+    egui::Frame::new()
+        .fill(theme::BG_SECONDARY)
+        .stroke(Stroke::new(1.0, theme::DIVIDER))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("VENUEFLOW")
+                        .strong()
+                        .size(18.0)
+                        .color(theme::BRAND_HOVER),
+                );
+                ui.separator();
+                for workspace in WorkspaceKind::ALL {
+                    if ui
+                        .selectable_label(workspaces.active == workspace, workspace.label())
+                        .clicked()
+                    {
+                        workspaces.active = workspace;
+                    }
+                }
+                ui.separator();
+                let symbols = model
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| {
+                        snapshot
+                            .markets
+                            .iter()
+                            .map(|market| market.symbol.to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                egui::ComboBox::from_id_salt("selected-symbol")
+                    .selected_text(&model.preferences.selected_symbol)
+                    .width(120.0)
+                    .show_ui(ui, |ui| {
+                        for symbol in symbols {
+                            ui.selectable_value(
+                                &mut model.preferences.selected_symbol,
+                                symbol.clone(),
+                                symbol,
+                            );
+                        }
+                    });
+                ui.separator();
+                connection_badge(ui, model.connection);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Settings").clicked() {
+                        *show_settings = true;
+                    }
+                    if ui.button("Modules").clicked() {
+                        *show_modules = true;
+                    }
+                    if ui.button("Reset layout").clicked() {
+                        workspaces.restore_active();
+                        model.notice("Restored the active workspace layout");
+                    }
+                });
+            });
+        });
+}
+
+pub fn show_status_bar(ui: &mut egui::Ui, model: &AppModel) {
+    let generated = model
+        .snapshot
+        .as_ref()
+        .map_or("no snapshot".to_owned(), |snapshot| {
+            format!("snapshot {}", snapshot.generated_ms)
+        });
+    egui::Frame::new()
+        .fill(theme::BG_SECONDARY)
+        .inner_margin(egui::Margin::symmetric(10, 5))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.small(format!(
+                    "Control API: {}",
+                    endpoint_label(&model.preferences.endpoint)
+                ));
+                ui.separator();
+                ui.small(generated);
+                if let Some(receipt) = &model.last_receipt {
+                    ui.separator();
+                    ui.small(format!(
+                        "last receipt {} · {:?}",
+                        receipt.receipt_id, receipt.state
+                    ));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.small("query/control plane only · no credentials · no direct mutation");
+                });
+            });
+        });
+}
+
+pub fn show_confirmation(context: &egui::Context, model: &mut AppModel, client: &ControlClient) {
+    let Some(mut pending) = model.pending_confirmation.take() else {
+        return;
+    };
+    let expected = pending.request.expected_confirmation();
+    let mut keep_open = true;
+    egui::Window::new("Confirm high-risk control action")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(context, |ui| {
+            ui.colored_label(
+                theme::WARNING,
+                "This request is only an intent. The service and account node will revalidate it.",
+            );
+            ui.separator();
+            ui.label(format!("Venue: {}", pending.request.venue));
+            ui.label(format!("Account: {}", pending.request.trading_account_id));
+            ui.label(format!("Instance: {}", pending.request.instance_id));
+            ui.label(format!("Symbol: {}", pending.request.symbol));
+            ui.label(format!("Action: {}", pending.request.action.as_str()));
+            ui.add_space(6.0);
+            ui.label("Type the exact confirmation:");
+            ui.monospace(&expected);
+            ui.text_edit_singleline(&mut pending.typed);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    keep_open = false;
+                }
+                let enabled = pending.typed == expected;
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Submit intent"))
+                    .clicked()
+                {
+                    pending.request.confirmation = Some(pending.typed.clone());
+                    match client.send(pending.request.clone()) {
+                        Ok(()) => model.notice(format!(
+                            "Submitted {} intent for {}",
+                            pending.request.action.as_str(),
+                            pending.request.instance_id
+                        )),
+                        Err(error) => {
+                            model.notice(format!("Control request rejected locally: {error}"))
+                        }
+                    }
+                    keep_open = false;
+                }
+            });
+        });
+    if keep_open {
+        model.pending_confirmation = Some(pending);
+    }
+}
+
+pub fn show_settings(
+    context: &egui::Context,
+    open: &mut bool,
+    model: &mut AppModel,
+    reconnect: &mut bool,
+) {
+    egui::Window::new("VenueFlow settings")
+        .open(open)
+        .resizable(false)
+        .show(context, |ui| {
+            ui.label("Control API base URL");
+            ui.text_edit_singleline(&mut model.preferences.endpoint);
+            ui.small("Web builds may leave this empty to use the current origin.");
+            if ui.button("Reconnect").clicked() {
+                *reconnect = true;
+            }
+            ui.separator();
+            ui.add(
+                egui::Slider::new(&mut model.preferences.ui_scale, 0.85..=1.35).text("UI scale"),
+            );
+            ui.checkbox(&mut model.preferences.show_status_bar, "Show status bar");
+            ui.separator();
+            ui.colored_label(
+                theme::TEXT_SECONDARY,
+                "Endpoints must be Venue Control API endpoints, never exchange endpoints.",
+            );
+        });
+}
+
+pub fn show_modules(context: &egui::Context, open: &mut bool, workspaces: &mut Workspaces) {
+    let visibility = workspaces.pane_visibility();
+    egui::Window::new("Workspace modules")
+        .open(open)
+        .resizable(false)
+        .show(context, |ui| {
+            for (tile_id, title, mut visible) in visibility {
+                if ui.checkbox(&mut visible, title).changed() {
+                    workspaces.set_visible(tile_id, visible);
+                }
+            }
+        });
+}
+
+fn connection_badge(ui: &mut egui::Ui, state: ConnectionState) {
+    let (label, color) = match state {
+        ConnectionState::Connecting => ("CONNECTING", theme::WARNING),
+        ConnectionState::Live => ("LIVE DATA", theme::BUY),
+        ConnectionState::Degraded => ("DEGRADED", theme::WARNING),
+        ConnectionState::Offline => ("OFFLINE", theme::SELL),
+    };
+    ui.colored_label(color, RichText::new(label).strong());
+}
+
+fn show_market_watch(ui: &mut egui::Ui, model: &mut AppModel) {
+    pane_heading(ui, "Markets", "normalized Control API projections");
+    let rows = model
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.markets.clone())
+        .unwrap_or_default();
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::Grid::new("market-watch-grid")
+            .striped(true)
+            .num_columns(3)
+            .show(ui, |ui| {
+                ui.strong("Symbol");
+                ui.strong("Last");
+                ui.strong("24h");
+                ui.end_row();
+                for market in rows {
+                    let symbol = market.symbol.to_string();
+                    if ui
+                        .selectable_label(model.preferences.selected_symbol == symbol, &symbol)
+                        .clicked()
+                    {
+                        model.preferences.selected_symbol = symbol;
+                    }
+                    ui.monospace(format_decimal(market.last, 4));
+                    let change = decimal_to_f64(market.change_percent_24h);
+                    ui.colored_label(theme::value_color(change), format!("{change:+.2}%"));
+                    ui.end_row();
+                }
+            });
+    });
+}
+
+fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &AppModel) {
+    let symbol = pane
+        .symbol
+        .as_deref()
+        .unwrap_or(&model.preferences.selected_symbol);
+    pane_heading(ui, symbol, "candles and server-computed indicators");
+    let Some(market) = market(model, symbol) else {
+        empty(ui, "No market projection is available for this symbol.");
+        return;
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.label(format!("Last {}", format_decimal(market.last, 4)));
+        ui.label(format!("Bid {}", format_decimal(market.bid, 4)));
+        ui.label(format!("Ask {}", format_decimal(market.ask, 4)));
+        for indicator in market.indicators.iter().take(6) {
+            ui.colored_label(
+                theme::BRAND_HOVER,
+                format!("{} {}", indicator.name, format_decimal(indicator.value, 3)),
+            )
+            .on_hover_text(format!(
+                "{} · observed {}",
+                indicator.source_version, indicator.observed_ms
+            ));
+        }
+    });
+    pane.visible_bars = pane.visible_bars.clamp(20, 400);
+    let wheel = ui.input(|input| input.smooth_scroll_delta.y);
+    if wheel.abs() > f32::EPSILON && ui.rect_contains_pointer(ui.max_rect()) {
+        let step = if wheel > 0.0 { -10 } else { 10 };
+        pane.visible_bars = pane.visible_bars.saturating_add_signed(step).clamp(20, 400);
+    }
+    candle_plot(ui, market, pane.visible_bars);
+}
+
+fn candle_plot(ui: &mut egui::Ui, market: &MarketSummary, visible_bars: usize) {
+    let height = ui.available_height().max(120.0);
+    let (response, painter) =
+        ui.allocate_painter(egui::vec2(ui.available_width(), height), Sense::hover());
+    let bars = market
+        .bars
+        .iter()
+        .rev()
+        .take(visible_bars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    if bars.is_empty() {
+        painter.text(
+            response.rect.center(),
+            Align2::CENTER_CENTER,
+            "No candles",
+            FontId::proportional(14.0),
+            theme::TEXT_SECONDARY,
+        );
+        return;
+    }
+    let mut low = f64::INFINITY;
+    let mut high = f64::NEG_INFINITY;
+    for bar in &bars {
+        low = low.min(decimal_to_f64(bar.low));
+        high = high.max(decimal_to_f64(bar.high));
+    }
+    let span = (high - low).max(f64::EPSILON);
+    let rect = response.rect.shrink2(egui::vec2(8.0, 10.0));
+    let width = rect.width() / bars.len() as f32;
+    let price_y = |price: f64| rect.bottom() - (((price - low) / span) as f32 * rect.height());
+    for index in 0..=4 {
+        let y = rect.top() + rect.height() * index as f32 / 4.0;
+        painter.line_segment(
+            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(0x20, 0x35, 0x43, 120)),
+        );
+    }
+    for (index, bar) in bars.iter().enumerate() {
+        let open = decimal_to_f64(bar.open);
+        let close = decimal_to_f64(bar.close);
+        let x = rect.left() + (index as f32 + 0.5) * width;
+        let color = if close >= open {
+            theme::BUY
+        } else {
+            theme::SELL
+        };
+        painter.line_segment(
+            [
+                Pos2::new(x, price_y(decimal_to_f64(bar.low))),
+                Pos2::new(x, price_y(decimal_to_f64(bar.high))),
+            ],
+            Stroke::new(1.0, color),
+        );
+        let top = price_y(open.max(close));
+        let bottom = price_y(open.min(close));
+        let body = Rect::from_min_max(
+            Pos2::new(x - width * 0.31, top),
+            Pos2::new(x + width * 0.31, bottom.max(top + 1.0)),
+        );
+        painter.rect_filled(body, 0.5, color);
+    }
+    if let Some(pointer) = response.hover_pos().filter(|point| rect.contains(*point)) {
+        painter.line_segment(
+            [
+                Pos2::new(pointer.x, rect.top()),
+                Pos2::new(pointer.x, rect.bottom()),
+            ],
+            Stroke::new(1.0, theme::TEXT_SECONDARY),
+        );
+        painter.line_segment(
+            [
+                Pos2::new(rect.left(), pointer.y),
+                Pos2::new(rect.right(), pointer.y),
+            ],
+            Stroke::new(1.0, theme::TEXT_SECONDARY),
+        );
+        let price = high - f64::from((pointer.y - rect.top()) / rect.height()) * span;
+        painter.text(
+            Pos2::new(rect.right() - 4.0, pointer.y - 4.0),
+            Align2::RIGHT_BOTTOM,
+            format!("{price:.4}"),
+            FontId::monospace(11.0),
+            theme::TEXT_PRIMARY,
+        );
+    }
+}
+
+fn show_order_book(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
+    let symbol = pane
+        .symbol
+        .as_deref()
+        .unwrap_or(&model.preferences.selected_symbol);
+    pane_heading(ui, "Order book", symbol);
+    let Some(market) = market(model, symbol) else {
+        empty(ui, "No order-book projection.");
+        return;
+    };
+    egui::Grid::new(format!("book-{}", pane.instance))
+        .striped(true)
+        .num_columns(3)
+        .show(ui, |ui| {
+            ui.strong("Side");
+            ui.strong("Price");
+            ui.strong("Quantity");
+            ui.end_row();
+            for level in market.asks.iter().rev().take(10) {
+                ui.colored_label(theme::SELL, "ASK");
+                ui.monospace(format_decimal(level.price, 4));
+                ui.monospace(format_decimal(level.quantity, 4));
+                ui.end_row();
+            }
+            for level in market.bids.iter().take(10) {
+                ui.colored_label(theme::BUY, "BID");
+                ui.monospace(format_decimal(level.price, 4));
+                ui.monospace(format_decimal(level.quantity, 4));
+                ui.end_row();
+            }
+        });
+}
+
+fn show_trade_tape(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
+    let symbol = pane
+        .symbol
+        .as_deref()
+        .unwrap_or(&model.preferences.selected_symbol);
+    pane_heading(ui, "Trade tape", symbol);
+    let Some(market) = market(model, symbol) else {
+        empty(ui, "No trade projection.");
+        return;
+    };
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::Grid::new(format!("tape-{}", pane.instance))
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("Time");
+                ui.strong("Price");
+                ui.strong("Qty");
+                ui.end_row();
+                for trade in market.trades.iter().rev().take(80) {
+                    let color = match trade.aggressor {
+                        AggressorSide::Buy => theme::BUY,
+                        AggressorSide::Sell => theme::SELL,
+                        AggressorSide::Unknown => theme::TEXT_SECONDARY,
+                    };
+                    ui.monospace(trade.occurred_ms.to_string());
+                    ui.colored_label(color, format_decimal(trade.price, 4));
+                    ui.monospace(format_decimal(trade.quantity, 4));
+                    ui.end_row();
+                }
+            });
+    });
+}
+
+fn show_accounts(ui: &mut egui::Ui, model: &AppModel) {
+    pane_heading(ui, "Accounts", "secret-free query projections");
+    let Some(snapshot) = &model.snapshot else {
+        empty(ui, "Waiting for the Control API.");
+        return;
+    };
+    egui::ScrollArea::both().show(ui, |ui| {
+        egui::Grid::new("accounts-grid")
+            .striped(true)
+            .show(ui, |ui| {
+                for heading in [
+                    "Venue",
+                    "Mode",
+                    "Account",
+                    "Health",
+                    "Equity",
+                    "Available",
+                    "uPnL",
+                    "Private gen",
+                    "Writer gen",
+                ] {
+                    ui.strong(heading);
+                }
+                ui.end_row();
+                for account in &snapshot.accounts {
+                    ui.label(account.venue.to_string());
+                    ui.label(account.mode.to_string());
+                    ui.monospace(short_account(&account.trading_account_id));
+                    health_label(ui, account.health);
+                    ui.monospace(format_decimal(account.equity, 2));
+                    ui.monospace(format_decimal(account.available_margin, 2));
+                    let pnl = decimal_to_f64(account.unrealized_pnl);
+                    ui.colored_label(theme::value_color(pnl), format!("{pnl:+.2}"));
+                    ui.monospace(account.private_generation.to_string());
+                    ui.monospace(account.writer_generation.to_string());
+                    ui.end_row();
+                }
+            });
+    });
+}
+
+fn show_strategies(ui: &mut egui::Ui, model: &mut AppModel) {
+    pane_heading(ui, "Strategies", "Grid · Scalping · Copy");
+    let strategies = model
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.strategies.clone())
+        .unwrap_or_default();
+    if strategies.is_empty() {
+        empty(ui, "No strategy instances were returned.");
+        return;
+    }
+    egui::ScrollArea::both().show(ui, |ui| {
+        egui::Grid::new("strategies-grid")
+            .striped(true)
+            .show(ui, |ui| {
+                for heading in [
+                    "Instance", "Kind", "Venue", "Symbol", "State", "Orders", "Long", "Short",
+                    "PnL", "Epoch",
+                ] {
+                    ui.strong(heading);
+                }
+                ui.end_row();
+                for strategy in strategies {
+                    if ui
+                        .selectable_label(
+                            model.preferences.selected_instance.as_deref()
+                                == Some(strategy.instance_id.as_str()),
+                            &strategy.instance_id,
+                        )
+                        .clicked()
+                    {
+                        model.preferences.selected_instance = Some(strategy.instance_id.clone());
+                        model.preferences.selected_symbol = strategy.symbol.to_string();
+                    }
+                    ui.label(format!("{:?}", strategy.kind));
+                    ui.label(strategy.venue.to_string());
+                    ui.label(strategy.symbol.to_string());
+                    lifecycle_label(ui, strategy.lifecycle);
+                    ui.monospace(strategy.open_orders.to_string());
+                    ui.monospace(format_decimal(strategy.long_quantity, 4));
+                    ui.monospace(format_decimal(strategy.short_quantity, 4));
+                    let pnl = decimal_to_f64(strategy.realized_pnl + strategy.unrealized_pnl);
+                    ui.colored_label(theme::value_color(pnl), format!("{pnl:+.2}"));
+                    ui.monospace(strategy.config_epoch.to_string());
+                    ui.end_row();
+                    if let Some(attention) = &strategy.attention {
+                        ui.label("");
+                        ui.colored_label(theme::WARNING, attention);
+                        ui.end_row();
+                    }
+                }
+            });
+    });
+}
+
+fn show_copy_relations(ui: &mut egui::Ui, model: &AppModel) {
+    pane_heading(ui, "Copy relations", "target exposure and durable drift");
+    let Some(snapshot) = &model.snapshot else {
+        empty(ui, "Waiting for copy projections.");
+        return;
+    };
+    egui::Grid::new("copy-grid").striped(true).show(ui, |ui| {
+        for heading in [
+            "Leader", "Follower", "Symbol", "Target", "Actual", "Drift", "State",
+        ] {
+            ui.strong(heading);
+        }
+        ui.end_row();
+        for relation in &snapshot.copy_relations {
+            ui.label(&relation.leader_id);
+            ui.label(&relation.follower_instance_id);
+            ui.label(relation.symbol.to_string());
+            ui.monospace(format_decimal(relation.target_exposure, 4));
+            ui.monospace(format_decimal(relation.actual_exposure, 4));
+            let drift = decimal_to_f64(relation.drift);
+            ui.colored_label(theme::value_color(-drift.abs()), format!("{drift:+.4}"));
+            ui.label(format!("{:?}", relation.status));
+            ui.end_row();
+        }
+    });
+}
+
+fn show_ledger(ui: &mut egui::Ui, model: &AppModel) {
+    pane_heading(
+        ui,
+        "Receipt ledger",
+        "read-only execution and control receipts",
+    );
+    let Some(snapshot) = &model.snapshot else {
+        empty(ui, "Waiting for ledger projections.");
+        return;
+    };
+    egui::ScrollArea::both().show(ui, |ui| {
+        egui::Grid::new("ledger-grid").striped(true).show(ui, |ui| {
+            for heading in [
+                "Observed", "Instance", "Action", "State", "Receipt", "Detail",
+            ] {
+                ui.strong(heading);
+            }
+            ui.end_row();
+            for entry in snapshot.ledger.iter().rev().take(500) {
+                ui.monospace(entry.occurred_ms.to_string());
+                ui.label(&entry.instance_id);
+                ui.label(&entry.action);
+                ui.label(&entry.state);
+                ui.monospace(&entry.receipt_id);
+                ui.label(&entry.detail);
+                ui.end_row();
+            }
+        });
+    });
+}
+
+fn show_control(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
+    pane_heading(
+        ui,
+        "Lifecycle control",
+        "semantic intents; server revalidation required",
+    );
+    let strategies = model
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.strategies.clone())
+        .unwrap_or_default();
+    if strategies.is_empty() {
+        empty(ui, "No controllable strategy projection is available.");
+        return;
+    }
+    if model.preferences.selected_instance.is_none() {
+        model.preferences.selected_instance = strategies.first().map(|row| row.instance_id.clone());
+    }
+    egui::ComboBox::from_id_salt("control-instance")
+        .selected_text(
+            model
+                .preferences
+                .selected_instance
+                .as_deref()
+                .unwrap_or("Select instance"),
+        )
+        .show_ui(ui, |ui| {
+            for strategy in &strategies {
+                ui.selectable_value(
+                    &mut model.preferences.selected_instance,
+                    Some(strategy.instance_id.clone()),
+                    format!(
+                        "{} · {} · {}",
+                        strategy.instance_id, strategy.venue, strategy.symbol
+                    ),
+                );
+            }
+        });
+    let selected = model
+        .preferences
+        .selected_instance
+        .as_deref()
+        .and_then(|id| strategies.iter().find(|row| row.instance_id == id))
+        .cloned();
+    let Some(strategy) = selected else {
+        return;
+    };
+    ui.separator();
+    ui.label(format!("Account: {}", strategy.trading_account_id));
+    ui.label(format!("Symbol: {}", strategy.symbol));
+    ui.label(format!("Config epoch: {}", strategy.config_epoch));
+    lifecycle_label(ui, strategy.lifecycle);
+    if let Some(attention) = &strategy.attention {
+        ui.colored_label(theme::WARNING, attention);
+    }
+    ui.add_space(8.0);
+    ui.horizontal_wrapped(|ui| {
+        for (action, label) in [
+            (ControlAction::Pause, "Pause"),
+            (ControlAction::Resume, "Resume"),
+            (ControlAction::Stop, "Stop"),
+            (ControlAction::Flatten, "Flatten"),
+        ] {
+            let button = if action == ControlAction::Flatten {
+                egui::Button::new(RichText::new(label).color(theme::SELL))
+            } else {
+                egui::Button::new(label)
+            };
+            if ui.add(button).clicked() {
+                submit_or_confirm(model, client, &strategy, action);
+            }
+        }
+    });
+    ui.separator();
+    ui.small("Stop cancels only the selected instance's owned orders and preserves residual custody. Flatten additionally requests signed zero-position convergence.");
+}
+
+fn submit_or_confirm(
+    model: &mut AppModel,
+    client: &ControlClient,
+    strategy: &StrategySummary,
+    action: ControlAction,
+) {
+    let request = model.begin_command(strategy, action, now_ms());
+    if action.requires_confirmation() {
+        model.pending_confirmation = Some(PendingConfirmation {
+            request,
+            typed: String::new(),
+        });
+    } else {
+        match client.send(request) {
+            Ok(()) => model.notice(format!("Submitted {} intent", action.as_str())),
+            Err(error) => model.notice(format!("Control request rejected locally: {error}")),
+        }
+    }
+}
+
+fn show_diagnostics(ui: &mut egui::Ui, model: &AppModel) {
+    pane_heading(ui, "Diagnostics", "control-plane client state");
+    connection_badge(ui, model.connection);
+    ui.label(format!(
+        "Endpoint: {}",
+        endpoint_label(&model.preferences.endpoint)
+    ));
+    if let Some(snapshot) = &model.snapshot {
+        ui.label(format!("Schema: {}", snapshot.schema_version));
+        ui.label(format!("Generated: {}", snapshot.generated_ms));
+        ui.label(format!("Accounts: {}", snapshot.accounts.len()));
+        ui.label(format!("Strategies: {}", snapshot.strategies.len()));
+        ui.label(format!("Markets: {}", snapshot.markets.len()));
+        ui.label(format!("Ledger rows: {}", snapshot.ledger.len()));
+    }
+    ui.separator();
+    ui.strong("Recent notices");
+    for notice in &model.notices {
+        ui.small(notice);
+    }
+    ui.separator();
+    ui.colored_label(theme::TEXT_SECONDARY, "The UI cannot read PostgreSQL, WAL, checkpoints, artifacts, credentials, or exchange-native endpoints.");
+}
+
+fn market<'a>(model: &'a AppModel, symbol: &str) -> Option<&'a MarketSummary> {
+    model
+        .snapshot
+        .as_ref()?
+        .markets
+        .iter()
+        .find(|market| market.symbol.to_string() == symbol)
+}
+
+fn pane_heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
+    ui.horizontal(|ui| {
+        ui.strong(title);
+        ui.colored_label(theme::TEXT_SECONDARY, subtitle);
+    });
+    ui.separator();
+}
+
+fn empty(ui: &mut egui::Ui, message: &str) {
+    ui.centered_and_justified(|ui| {
+        ui.colored_label(theme::TEXT_SECONDARY, message);
+    });
+}
+
+fn lifecycle_label(ui: &mut egui::Ui, lifecycle: StrategyLifecycle) {
+    let color = match lifecycle {
+        StrategyLifecycle::Running => theme::BUY,
+        StrategyLifecycle::Paused | StrategyLifecycle::Rebuilding => theme::WARNING,
+        StrategyLifecycle::NeedsAttention => theme::SELL,
+        StrategyLifecycle::Starting | StrategyLifecycle::Stopping | StrategyLifecycle::Stopped => {
+            theme::TEXT_SECONDARY
+        }
+    };
+    ui.colored_label(color, format!("{:?}", lifecycle));
+}
+
+fn health_label(ui: &mut egui::Ui, health: HealthState) {
+    let color = match health {
+        HealthState::Healthy => theme::BUY,
+        HealthState::Recovering | HealthState::NeedsAttention => theme::WARNING,
+        HealthState::Stopped | HealthState::Unknown => theme::TEXT_SECONDARY,
+    };
+    ui.colored_label(color, format!("{:?}", health));
+}
+
+fn short_account(account: &str) -> String {
+    if account.len() <= 13 {
+        account.to_owned()
+    } else {
+        format!("{}…{}", &account[..8], &account[account.len() - 4..])
+    }
+}
+
+fn endpoint_label(endpoint: &str) -> &str {
+    if endpoint.trim().is_empty() {
+        "same origin"
+    } else {
+        endpoint
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}

@@ -1,7 +1,9 @@
 [workspace]
 members = [
     ".",
+    "apps/venueflow",
     "crates/venue-copy",
+    "crates/venue-control-protocol",
     "crates/venue-domain",
     "crates/venue-gateway-api",
     "crates/venue-gateway-binance",
