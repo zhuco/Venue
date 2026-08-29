@@ -23,9 +23,12 @@ use venue_node::{
     SignedCommandReadback, SignedOwnedOrder, SignedReadbackReceipt, SignedReadbackRequest,
     reject_unintegrated_legacy_test_runtime, report_result,
 };
+use venue_runtime::account::PhysicalRecoveryReadbackManifest;
+
+#[cfg(test)]
 use venue_runtime::account::{
     PhysicalReadbackReceipt, PhysicalReadbackSurface, PhysicalRecoveryManifestError,
-    PhysicalRecoveryReadbackManifest, PhysicalRecoveryScope,
+    PhysicalRecoveryScope,
 };
 
 const PROGRAM: &str = "venue-node-gate";
@@ -72,13 +75,27 @@ pub struct GatePhysicalReadback {
     pub command_results: Vec<SignedCommandReadback>,
 }
 
-/// Maps one adapter-validated Gate account attempt into the shared six-face recovery contract.
-/// This is read-only evidence construction: the returned manifest grants no writer, capability,
-/// network handle, or mutation authority.
-pub fn gate_physical_recovery_manifest(
+/// Gate's current public candidate is mutable and does not preserve opaque, scope-bound authority
+/// for every raw page. Until the adapter supplies such a value, production cannot construct the
+/// shared recovery manifest from a caller-provided candidate, generation, or authority root.
+pub const fn gate_physical_recovery_manifest()
+-> Result<PhysicalRecoveryReadbackManifest, GateRecoveryManifestError> {
+    Err(GateRecoveryManifestError::Unavailable)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum GateRecoveryManifestError {
+    #[error("Gate recovery manifest requires unavailable opaque fresh collection authority")]
+    Unavailable,
+}
+
+/// Test-only contract fixture. Production cannot pass a mutable adapter candidate, caller-selected
+/// generation, or current recovery roots into a manifest constructor.
+#[cfg(test)]
+fn gate_physical_recovery_manifest_fixture(
     scope: PhysicalRecoveryScope,
     readback: &GatePhysicalReadback,
-) -> Result<PhysicalRecoveryReadbackManifest, GateRecoveryManifestError> {
+) -> Result<PhysicalRecoveryReadbackManifest, GateRecoveryFixtureError> {
     let candidate = &readback.candidate;
     let family_scope = candidate.order_families.scope();
     if scope.binding() != &candidate.binding
@@ -97,15 +114,15 @@ pub fn gate_physical_recovery_manifest(
             .any(|position| position.symbol != candidate.binding.symbol)
         || candidate.raw_payload_digests.len() < 4
     {
-        return Err(GateRecoveryManifestError::Candidate);
+        return Err(GateRecoveryFixtureError::Candidate);
     }
 
     let attempt = candidate.attempt;
     let generation = readback.private_generation;
     let regular_count = u64::try_from(candidate.order_families.regular().orders.len())
-        .map_err(|_| GateRecoveryManifestError::RecordCount)?;
+        .map_err(|_| GateRecoveryFixtureError::RecordCount)?;
     let fill_count = u64::try_from(candidate.fills.fills.len())
-        .map_err(|_| GateRecoveryManifestError::RecordCount)?;
+        .map_err(|_| GateRecoveryFixtureError::RecordCount)?;
     let complete = |surface, record_count| {
         PhysicalReadbackReceipt::verified_complete(
             &scope,
@@ -137,6 +154,7 @@ pub fn gate_physical_recovery_manifest(
     Ok(PhysicalRecoveryReadbackManifest::verified(scope, receipts)?)
 }
 
+#[cfg(test)]
 fn gate_recovery_surface_evidence(
     candidate: &GatePrivateReadbackCandidate,
     private_generation: u64,
@@ -174,8 +192,9 @@ fn gate_recovery_surface_evidence(
     digest.finalize().into()
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum GateRecoveryManifestError {
+enum GateRecoveryFixtureError {
     #[error("Gate recovery candidate does not bind one complete regular-only Hedge attempt")]
     Candidate,
     #[error("Gate recovery readback record count exceeds the shared manifest range")]
@@ -1098,6 +1117,18 @@ mod tests {
     }
 
     #[test]
+    fn production_manifest_bridge_accepts_no_relabelled_candidate_and_is_unavailable() {
+        let production_bridge: fn() -> Result<
+            PhysicalRecoveryReadbackManifest,
+            GateRecoveryManifestError,
+        > = gate_physical_recovery_manifest;
+        assert!(matches!(
+            production_bridge(),
+            Err(GateRecoveryManifestError::Unavailable)
+        ));
+    }
+
+    #[test]
     fn validated_gate_attempt_maps_to_one_root_bound_six_face_manifest()
     -> Result<(), Box<dyn std::error::Error>> {
         let candidate = private_candidate()?;
@@ -1107,7 +1138,8 @@ mod tests {
         let expected_fill_count = u64::try_from(candidate.fills.fills.len())?;
         let authority_roots = roots(1)?;
         let scope = recovery_scope(28, authority_roots.clone())?;
-        let manifest = gate_physical_recovery_manifest(scope, &recovery_readback(candidate, 29))?;
+        let manifest =
+            gate_physical_recovery_manifest_fixture(scope, &recovery_readback(candidate, 29))?;
 
         assert_eq!(manifest.attempt_id(), expected_attempt);
         assert_eq!(manifest.private_generation(), 29);
@@ -1219,7 +1251,7 @@ mod tests {
             Some("227262265")
         );
 
-        let manifest = gate_physical_recovery_manifest(
+        let manifest = gate_physical_recovery_manifest_fixture(
             recovery_scope(28, roots(1)?)?,
             &recovery_readback(candidate, 29),
         )?;
@@ -1243,20 +1275,20 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let candidate = private_candidate()?;
         assert!(matches!(
-            gate_physical_recovery_manifest(
+            gate_physical_recovery_manifest_fixture(
                 recovery_scope(29, roots(1)?)?,
                 &recovery_readback(candidate.clone(), 29),
             ),
-            Err(GateRecoveryManifestError::Manifest(
+            Err(GateRecoveryFixtureError::Manifest(
                 PhysicalRecoveryManifestError::StaleGeneration
             ))
         ));
 
-        let first = gate_physical_recovery_manifest(
+        let first = gate_physical_recovery_manifest_fixture(
             recovery_scope(28, roots(1)?)?,
             &recovery_readback(candidate.clone(), 29),
         )?;
-        let drifted = gate_physical_recovery_manifest(
+        let drifted = gate_physical_recovery_manifest_fixture(
             recovery_scope(28, roots(9)?)?,
             &recovery_readback(candidate, 29),
         )?;
