@@ -4500,6 +4500,8 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "venue-control-protocol",
+ "venue-copy",
+ "venue-domain",
 ]
 
 [[package]]
@@ -4519,6 +4521,7 @@ name = "venue-copy"
 version = "0.1.0"
 dependencies = [
  "rust_decimal",
+ "serde",
  "sha2",
  "thiserror 2.0.19",
  "venue-domain",

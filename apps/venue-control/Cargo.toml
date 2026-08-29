@@ -11,6 +11,8 @@ serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 venue-control-protocol = { path = "../../crates/venue-control-protocol" }
+venue-copy = { path = "../../crates/venue-copy" }
+venue-domain = { path = "../../crates/venue-domain" }
 
 [dev-dependencies]
 rust_decimal.workspace = true
