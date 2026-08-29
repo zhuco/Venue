@@ -54,8 +54,9 @@ VenueFlow Desktop / optional Agent
               Exchange
 ```
 
-`venue-control` 当前是 transport-neutral 控制核心：校验 schema v2 scope，并以 PostgreSQL durable inbox/outbox、幂等 claim
-和终态 receipt 保存命令；它不能规划交易或直接提交订单。HTTP/SSE server 与账户节点 adapter 尚未实现。未来的唤醒通道不能
+`venue-control` 校验 schema v2 scope，以 PostgreSQL durable inbox/outbox、幂等 claim 和终态 receipt 保存命令，并提供
+仅本地 HTTP/SSE `/v2`。TEST-only Copy worker 可在事务内锁定 leader 事件并持久化纯规划结果、delivery、ledger 与恢复状态；
+它不能直接提交订单，LIVE 在数据库访问前失败关闭。账户节点 adapter 尚未实现。唤醒通道不能
 代替耐久记录；节点仍须先持久化本地 Actor inbox，再独立重验 risk、Owner、WAL、writer 和私有事实。
 
 ## 4. 目标 workspace
@@ -91,7 +92,9 @@ crates/
 六个节点 binary 必须各自只链接一个交易所 adapter。构建验收继续扫描生产 endpoint，拒绝把其他 adapter 链接进
 固定节点。`legacy` 只是有退出条件的迁移隔离区，不允许新增功能。
 
-当前 `apps/venue-node` 已建立上述六个固定产物和逐 feature 二进制隔离门禁。Binance、Gate.io、Bitget 仅在显式
+当前 `apps/venue-node` 已建立上述六个固定产物、逐 feature 二进制隔离门禁及 exchange-neutral `safe_host`。安全宿主
+组合 canonical root、唯一 writer、Owner、WAL、一次性 dispatch permit、UNKNOWN 读回、Stop/Flatten 与精确 Canary，
+但不会自行产生 capability。Binance、Gate.io、Bitget 仅在显式
 `LIVE` 下委托既有 Stage 7 安全闭环；其 `TEST` 不能重定向到生产 client。Bybit、OKX、Hyperliquid 目前只完成
 secret-free scope、adapter endpoint 选择及隔离 artifact root，且在 Owner、WAL、唯一账户 fence、签名 readback、
 UNKNOWN、Stop/Flatten 和人工 Canary 证据接入前无条件失败关闭，不读取凭证、联网或创建工件。
@@ -209,9 +212,9 @@ Copy planner/job-consumer lease 只允许竞争数据库 job 的规划或投递�
 | Binance | `venue-gateway-binance` | 已迁入 Portfolio Margin binding、TEST/LIVE 端点、secrecy 凭证、PAPI HMAC、exchangeInfo instrument rules、公共 BBO/深度/成交/闭合 bar raw envelope、账户/仓位/订单/成交/风险纯协议和七日有界成交分页；根签名 readback、transport 与 Stage 7 capability/WAL/writer 仍是生产权威 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
 | Bitget | `venue-gateway-bitget` | 已迁入 UTA TEST Demo/LIVE、凭证与 REST/WS 签名、公共市场、带时效 instrument metadata、账户/设置/持仓/normal 订单/成交同 attempt 五面候选与 raw 重放；不从官方未提供的字段猜 contract value；签名 transport/WS 与 Stage 7 capability/WAL/writer 仍留根 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
 | Gate.io | `venue-gateway-gate` | 已迁入 USDT perpetual TEST/LIVE、凭证/REST/WS 签名、公共市场、账户/持仓/风险、regular 订单/成交闭合分页；Stage 7 profile 候选重放 regular raw pages，并只把 Conditional/Algo 表示为显式 unsupported；签名采集 transport 与 Stage 7 capability/WAL/writer 仍留根 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
-| Bybit | `venue-gateway-bybit` | 公共/私有协议与 place/cancel/reduce、ACK、闭合读回已绑定；async HTTP/私有 WS 禁 redirect，并具超时/2 MiB 级限额、分配前 WS 限额、ACK 前有界缓存、received-at、应用层心跳与 generation；固定 node binary 已建立，但 writer/WAL/capability 为空 | `TEST | LIVE`；节点在完整安全闭环接入前失败关闭，不得小额实盘 mutation |
-| OKX | `venue-gateway-okx` | linear SWAP 公私协议、execution 与 orders/account/positions 私流已绑定；async HTTP/私有 WS 具同样的 redirect、超时、限长、缓存、心跳和 generation 边界；tdMode 只接受 Cross/Isolated、Net 意图拒绝；固定 node binary 已建立，但 writer/WAL/capability 为空 | `TEST | LIVE`；节点在完整安全闭环接入前失败关闭，不得小额实盘 mutation |
-| Hyperliquid | `venue-gateway-hyperliquid` | `/info`、恢复查询与 orderUpdates/userFills/userEvents 已绑定；async HTTP/双私有 WS 具限时限长、ACK 前缓存、received-at、心跳、generation 与跨频道 fill 去重；`action.rs` 已完成 MessagePack action hash、EIP-712 Agent 签名、持久 nonce 与限价下单/撤单 wire；`tid` 不是 sequence；固定 node binary 已建立，writer/WAL/capability 仍为空 | `TEST | LIVE`；节点在完整安全闭环接入前失败关闭，不能 mutation |
+| Bybit | `venue-gateway-bybit` | 账户/Hedge 双腿、regular/conditional、Algo explicit-unsupported 与成交详情证据已闭合；ACK 后 exact lookup，断线/超时不重投；异步 transport 保持限时限长、缓存、心跳与 generation；writer/WAL/capability 为空 | `TEST | LIVE`；节点在完整安全闭环接入前失败关闭，不得小额实盘 mutation |
+| OKX | `venue-gateway-okx` | Net/Hedge 完整腿、三订单族、fills cursor、tdMode/mgnMode、独立私流 generation 与 ACK hash/readback 已绑定；超时只读回、不重投；writer/WAL/capability 为空 | `TEST | LIVE`；节点在完整安全闭环接入前失败关闭，不得小额实盘 mutation |
+| Hyperliquid | `venue-gateway-hyperliquid` | ALO/cancel/IOC reduce-only、官方签名向量、vault/模式绑定与 ACK 后 orderStatus 已闭合；UNKNOWN 不重投，成交边界为 2000/页且最近 10000 条；`tid` 不是 sequence；writer/WAL/capability 为空 | `TEST | LIVE`；节点在完整安全闭环接入前失败关闭，不能 mutation |
 
 KOL 网关只是协议 fixture 和差异对照来源，不继承其运行开关或实盘准入状态。前三所的生产权威继续来自 Venue 已验收实现。
 
@@ -311,7 +314,7 @@ PostgreSQL 不得成为已发物理订单的第二权威 writer。Copy ledger �
 | 语言 | Rust 2024；工具链和 workspace `rust-version` 精确锁定 Rust 1.98.0 |
 | 交易 Actor | 顺序状态机、专用 OS thread 或受控 executor、有界 mailbox |
 | 异步 I/O | Tokio；不授予执行顺序或 mutation authority |
-| HTTP/控制 | 当前仅 schema v2 服务核心与 PostgreSQL repository；HTTP/SSE server 尚未选定或实现 |
+| HTTP/控制 | schema v2、PostgreSQL repository、仅本地 HTTP/SSE `/v2`、TEST-only Copy worker；账户节点 adapter 尚未接入 |
 | 交易 HTTP/WS | reqwest、tokio-tungstenite 或经等价验收的现有阻塞 transport |
 | 数值 | rust_decimal 处理交易金额；指标内部可用 f64 |
 | 数据库 | PostgreSQL、SQLx、显式 migrations |

@@ -4843,9 +4843,12 @@ name = "venue-node"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "rust_decimal",
+ "tempfile",
  "thiserror 2.0.19",
  "venue",
  "venue-domain",
+ "venue-execution",
  "venue-gateway-api",
  "venue-gateway-binance",
  "venue-gateway-bitget",
@@ -4853,6 +4856,7 @@ dependencies = [
  "venue-gateway-gate",
  "venue-gateway-hyperliquid",
  "venue-gateway-okx",
+ "venue-runtime",
 ]
 
 [[package]]
