@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use rust_decimal::Decimal;
 use venue_domain::domain::{FieldState, OrderSide, OrderState, Price};
@@ -12,6 +12,7 @@ use crate::{
 };
 
 const MAX_PRIVATE_EVENTS_PER_FRAME: usize = 2_000;
+const MAX_RECENT_FILL_IDENTITIES: usize = 8_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HyperliquidPrivateStreamBinding {
@@ -183,6 +184,13 @@ struct EventFrontier {
     ids: BTreeSet<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SeenFill {
+    first_stream: HyperliquidFillStream,
+    counterpart_seen: bool,
+    fill: HyperliquidFill,
+}
+
 impl EventFrontier {
     fn accept(&mut self, event: &HyperliquidPrivateEvent) -> Result<(), HyperliquidError> {
         let time_ms = event.event_time_ms();
@@ -205,6 +213,8 @@ pub struct HyperliquidPrivateStreamDecoder {
     binding: HyperliquidPrivateStreamBinding,
     order_frontier: EventFrontier,
     fill_frontier: EventFrontier,
+    seen_fills: BTreeMap<String, SeenFill>,
+    seen_fill_order: VecDeque<String>,
 }
 
 impl HyperliquidPrivateStreamDecoder {
@@ -214,6 +224,8 @@ impl HyperliquidPrivateStreamDecoder {
             binding,
             order_frontier: EventFrontier::default(),
             fill_frontier: EventFrontier::default(),
+            seen_fills: BTreeMap::new(),
+            seen_fill_order: VecDeque::new(),
         }
     }
 
@@ -339,13 +351,47 @@ impl HyperliquidPrivateStreamDecoder {
         if sort_snapshot {
             events.sort_by_key(HyperliquidPrivateEvent::event_time_ms);
         }
-        let mut next = self.fill_frontier.clone();
-        for event in &events {
-            validate_received_at(event, received_at_ms)?;
-            next.accept(event)?;
+        let mut next_frontier = self.fill_frontier.clone();
+        let mut next_seen = self.seen_fills.clone();
+        let mut next_order = self.seen_fill_order.clone();
+        let mut unique = Vec::with_capacity(events.len());
+        for event in events {
+            validate_received_at(&event, received_at_ms)?;
+            let HyperliquidPrivateEvent::Fill(update) = &event else {
+                return Err(HyperliquidError::Payload);
+            };
+            let fill_id = update.fill.fill.fill_id.clone();
+            if let Some(seen) = next_seen.get_mut(&fill_id) {
+                if seen.fill != update.fill
+                    || seen.first_stream == update.stream
+                    || seen.counterpart_seen
+                {
+                    return Err(HyperliquidError::Payload);
+                }
+                seen.counterpart_seen = true;
+                continue;
+            }
+            next_frontier.accept(&event)?;
+            next_seen.insert(
+                fill_id.clone(),
+                SeenFill {
+                    first_stream: update.stream,
+                    counterpart_seen: false,
+                    fill: update.fill.clone(),
+                },
+            );
+            next_order.push_back(fill_id);
+            while next_order.len() > MAX_RECENT_FILL_IDENTITIES {
+                if let Some(expired) = next_order.pop_front() {
+                    next_seen.remove(&expired);
+                }
+            }
+            unique.push(event);
         }
-        self.fill_frontier = next;
-        Ok(events)
+        self.fill_frontier = next_frontier;
+        self.seen_fills = next_seen;
+        self.seen_fill_order = next_order;
+        Ok(unique)
     }
 }
 

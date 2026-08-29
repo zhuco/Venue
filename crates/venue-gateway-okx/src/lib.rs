@@ -7,6 +7,7 @@ mod private;
 mod private_ws;
 mod public;
 mod sign;
+mod transport;
 
 use venue_domain::domain::{FieldState, Fill};
 use venue_gateway_api::CapabilityFlags;
@@ -34,6 +35,10 @@ pub use private_ws::{
 };
 pub use public::{OkxInstrument, parse_bbo, parse_instrument};
 pub use sign::{SignedHeaders, request_path, sign};
+pub use transport::{
+    OkxHttpResponse, OkxHttpTransport, OkxPrivateWsTransport, OkxReceivedPrivateFrame,
+    OkxTransportError,
+};
 
 /// No account capability is advertised until authenticated readback, private stream, writer,
 /// WAL, and UNKNOWN reconciliation are all connected.

@@ -5,6 +5,7 @@ mod models;
 mod nonce;
 mod private_stream;
 mod protocol;
+mod transport;
 
 use venue_gateway_api::CapabilityFlags;
 
@@ -29,6 +30,10 @@ pub use protocol::{
     parse_clearinghouse_snapshot, parse_l2_book_bbo, parse_open_orders_snapshot,
     parse_order_status, parse_perp_meta, parse_private_user_fills, parse_user_fills_page,
     parse_ws_bbo,
+};
+pub use transport::{
+    HyperliquidHttpResponse, HyperliquidHttpTransport, HyperliquidPrivateWsTransport,
+    HyperliquidTransportError, ReceivedPrivateFrame,
 };
 
 /// No account capability is advertised until authenticated readback, private stream,
@@ -584,6 +589,46 @@ mod tests {
         assert_eq!(fill.stream, HyperliquidFillStream::UserEvents);
         assert_eq!(fill.snapshot, FieldState::NotApplicable);
         assert_eq!(fill.fill.fill.exchange_time_ms, Some(1_700_000_000_004));
+        Ok(())
+    }
+
+    #[test]
+    fn private_stream_deduplicates_only_identical_cross_channel_fills()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let frames: Vec<serde_json::Value> = serde_json::from_slice(PRIVATE_STREAM)?;
+        let binding = HyperliquidPrivateStreamBinding::new(&meta(GatewayMode::Live)?, 12)?;
+        let snapshot = serde_json::to_vec(&frames[1])?;
+        let overlap = serde_json::json!({
+            "channel": "userEvents",
+            "data": {"fills": [frames[1]["data"]["fills"][0].clone()]}
+        });
+        let overlap = serde_json::to_vec(&overlap)?;
+
+        let mut decoder = HyperliquidPrivateStreamDecoder::new(binding.clone());
+        assert_eq!(decoder.decode(&snapshot, 12, 1_700_000_000_010)?.len(), 2);
+        assert!(decoder.decode(&overlap, 12, 1_700_000_000_010)?.is_empty());
+        assert_eq!(
+            decoder.decode(&overlap, 12, 1_700_000_000_010),
+            Err(HyperliquidError::Payload)
+        );
+
+        let mut conflicting = frames[1]["data"]["fills"][0].clone();
+        conflicting["px"] = serde_json::json!("65010.1");
+        let conflict = serde_json::to_vec(&serde_json::json!({
+            "channel": "userEvents",
+            "data": {"fills": [conflicting]}
+        }))?;
+        let mut conflict_decoder = HyperliquidPrivateStreamDecoder::new(binding);
+        assert_eq!(
+            conflict_decoder
+                .decode(&snapshot, 12, 1_700_000_000_010)?
+                .len(),
+            2
+        );
+        assert_eq!(
+            conflict_decoder.decode(&conflict, 12, 1_700_000_000_010),
+            Err(HyperliquidError::Payload)
+        );
         Ok(())
     }
 

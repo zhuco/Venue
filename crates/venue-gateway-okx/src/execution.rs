@@ -92,6 +92,11 @@ impl OkxExecutionScope {
     }
 
     #[must_use]
+    pub const fn instrument_generation(&self) -> u64 {
+        self.instrument_generation
+    }
+
+    #[must_use]
     pub const fn position_mode(&self) -> OkxPositionMode {
         self.position_mode
     }

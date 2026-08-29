@@ -74,7 +74,10 @@ pub struct BybitPreparedRequest {
 }
 
 impl BybitPreparedRequest {
-    fn validate(&self, binding: &BybitGatewayBinding) -> Result<(), BybitExecutionError> {
+    pub(crate) fn validate(
+        &self,
+        binding: &BybitGatewayBinding,
+    ) -> Result<(), BybitExecutionError> {
         binding
             .validate_request_binding(&self.binding)
             .map_err(|_| BybitExecutionError::Binding)?;

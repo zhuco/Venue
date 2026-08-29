@@ -61,6 +61,20 @@ pub fn sign(
     })
 }
 
+pub(crate) fn ws_auth_signature(
+    credentials: &BybitCredentials,
+    expires_at_ms: u64,
+) -> Result<SecretString, BybitError> {
+    if expires_at_ms == 0 {
+        return Err(BybitError::SigningInput);
+    }
+    let mut mac = Hmac::<Sha256>::new_from_slice(credentials.api_secret.expose_secret().as_bytes())
+        .map_err(|_| BybitError::SigningInput)?;
+    mac.update(b"GET/realtime");
+    mac.update(expires_at_ms.to_string().as_bytes());
+    Ok(SecretString::from(hex(&mac.finalize().into_bytes())))
+}
+
 fn hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut value = String::with_capacity(bytes.len() * 2);

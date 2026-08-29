@@ -5,6 +5,7 @@ mod execution;
 mod private;
 mod public;
 mod sign;
+mod transport;
 use venue_gateway_api::CapabilityFlags;
 
 pub use binding::BybitGatewayBinding;
@@ -14,6 +15,10 @@ pub use execution::*;
 pub use private::*;
 pub use public::*;
 pub use sign::{SignedHeaders, sign};
+pub use transport::{
+    BybitHttpTransport, BybitPrivateWsTransport, BybitRawPrivateFrame, BybitTransportError,
+    BybitTransportLimits, connect_private_ws,
+};
 
 /// No account capability is advertised until authenticated readback, private stream, writer,
 /// WAL, and UNKNOWN reconciliation are all connected.

@@ -76,6 +76,16 @@ impl OkxPrivateWsScope {
     pub const fn instrument_generation(&self) -> u64 {
         self.instrument_generation
     }
+
+    #[must_use]
+    pub fn uid(&self) -> &str {
+        &self.uid
+    }
+
+    #[must_use]
+    pub fn main_uid(&self) -> &str {
+        &self.main_uid
+    }
 }
 
 pub struct OkxWsLoginFrame {
@@ -236,6 +246,11 @@ impl OkxActivePrivateSubscription {
     #[must_use]
     pub const fn scope(&self) -> &OkxPrivateWsScope {
         &self.scope
+    }
+
+    #[must_use]
+    pub const fn account_profile(&self) -> &OkxAccountProfile {
+        &self.profile
     }
 }
 
