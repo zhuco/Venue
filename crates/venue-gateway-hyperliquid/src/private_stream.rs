@@ -8,7 +8,7 @@ use crate::{
     HyperliquidConfig, HyperliquidError, HyperliquidFill, HyperliquidPayloadScope,
     HyperliquidPerpMeta,
     models::{EventEnvelope, UserFillRow, UserFillsData, WsOrderUpdateRow},
-    protocol::{decimal, normalize_fill, normalized_order_status, side},
+    protocol::{canonical_cloid, decimal, normalize_fill, normalized_order_status, side},
 };
 
 const MAX_PRIVATE_EVENTS_PER_FRAME: usize = 2_000;
@@ -415,8 +415,7 @@ fn normalize_order(
         return Err(HyperliquidError::Payload);
     }
     let client_order_id = match row.order.cloid {
-        Some(value) if value.is_empty() => return Err(HyperliquidError::Payload),
-        Some(value) => FieldState::Known(value),
+        Some(value) => FieldState::Known(canonical_cloid(value)?),
         None => FieldState::Missing,
     };
     let state = normalized_order_status(&row.status)?;

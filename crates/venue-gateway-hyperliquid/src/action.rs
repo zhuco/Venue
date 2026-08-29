@@ -4,13 +4,14 @@ use k256::ecdsa::{RecoveryId, Signature, SigningKey};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
-use venue_domain::domain::{OrderSide, Price};
+use venue_domain::domain::{FieldState, OrderSide, OrderState, Price};
 use venue_gateway_api::GatewayMode;
 
 use crate::{
     HyperliquidConfig, HyperliquidCredentials, HyperliquidError, HyperliquidOrderLookup,
-    HyperliquidPayloadScope, HyperliquidPerpMeta, HyperliquidReadBinding, PersistedNonce,
-    endpoints,
+    HyperliquidOrderStatus, HyperliquidPayloadScope, HyperliquidPerpMeta,
+    HyperliquidPrivateStreamBinding, HyperliquidReadBinding, PersistedNonce,
+    build_order_status_request, endpoints,
 };
 
 const MAX_WIRE_DECIMALS: u32 = 8;
@@ -169,6 +170,7 @@ pub struct HyperliquidExchangeRequest {
     vault_address: Option<String>,
     connection_id: [u8; 32],
     expected: ResponseExpectation,
+    readback_target: ReadbackTarget,
     body: Vec<u8>,
 }
 
@@ -246,6 +248,8 @@ impl HyperliquidExchangeRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// The synchronous `/exchange` response is only an acknowledgement. Accepted mutations are not
+/// terminal until a generation-bound, read-only `orderStatus` query converges them.
 pub enum HyperliquidExchangeOutcome {
     Resting {
         order_id: u64,
@@ -263,12 +267,326 @@ pub enum HyperliquidExchangeOutcome {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HyperliquidExchangeReadbackPlan {
+    binding: HyperliquidPrivateStreamBinding,
+    nonce: u64,
+    kind: HyperliquidActionKind,
+    lookup: HyperliquidOrderLookup,
+    acknowledgement: Option<HyperliquidExchangeOutcome>,
+    target: ReadbackTarget,
+}
+
+impl HyperliquidExchangeReadbackPlan {
+    #[must_use]
+    pub const fn binding(&self) -> &HyperliquidPrivateStreamBinding {
+        &self.binding
+    }
+
+    #[must_use]
+    pub const fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> HyperliquidActionKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn lookup(&self) -> &HyperliquidOrderLookup {
+        &self.lookup
+    }
+
+    #[must_use]
+    pub const fn acknowledgement(&self) -> Option<&HyperliquidExchangeOutcome> {
+        self.acknowledgement.as_ref()
+    }
+
+    pub fn order_status_request(
+        &self,
+        meta: &HyperliquidPerpMeta,
+    ) -> Result<crate::HyperliquidInfoRequest, HyperliquidError> {
+        if meta.scope != *self.binding.scope() {
+            return Err(HyperliquidError::Readback);
+        }
+        build_order_status_request(meta, &self.lookup)
+    }
+
+    pub fn reconcile(
+        &self,
+        status: Option<&HyperliquidOrderStatus>,
+    ) -> Result<HyperliquidExchangeConvergence, HyperliquidError> {
+        if let Some(HyperliquidExchangeOutcome::Rejected { reason }) = &self.acknowledgement {
+            return Ok(HyperliquidExchangeConvergence::Rejected {
+                reason: reason.clone(),
+            });
+        }
+        let Some(status) = status else {
+            return Ok(HyperliquidExchangeConvergence::PendingUnknown);
+        };
+        match status {
+            HyperliquidOrderStatus::Unknown { scope, lookup } => {
+                if scope != self.binding.scope() || lookup != &self.lookup {
+                    return Err(HyperliquidError::Readback);
+                }
+                Ok(HyperliquidExchangeConvergence::PendingUnknown)
+            }
+            HyperliquidOrderStatus::Known {
+                scope,
+                order_id,
+                client_order_id,
+                side,
+                limit_price,
+                original_quantity,
+                remaining_quantity,
+                reduce_only,
+                native_order_type,
+                time_in_force,
+                state,
+                exchange_time_ms,
+            } => {
+                if scope != self.binding.scope()
+                    || !self.lookup_matches(*order_id, client_order_id)
+                    || !self.target.matches_order(
+                        client_order_id,
+                        *side,
+                        *limit_price,
+                        *original_quantity,
+                        *reduce_only,
+                    )
+                    || (self.kind == HyperliquidActionKind::AloPlace
+                        && (native_order_type != "Limit"
+                            || time_in_force.as_deref() != Some("Alo")))
+                    || (self.kind == HyperliquidActionKind::IocReduceOnly
+                        && !matches!(
+                            (native_order_type.as_str(), time_in_force.as_deref()),
+                            ("Limit", Some("Ioc")) | ("Market", Some("FrontendMarket"))
+                        ))
+                {
+                    return Err(HyperliquidError::Readback);
+                }
+                if *remaining_quantity > *original_quantity || !self.state_converges(*state) {
+                    return Err(HyperliquidError::Readback);
+                }
+                if self.cancel_still_open(*state) {
+                    return Ok(HyperliquidExchangeConvergence::PendingUnknown);
+                }
+                Ok(HyperliquidExchangeConvergence::Confirmed {
+                    order_id: *order_id,
+                    state: *state,
+                    exchange_time_ms: *exchange_time_ms,
+                })
+            }
+        }
+    }
+
+    fn lookup_matches(&self, order_id: u64, client_order_id: &FieldState<String>) -> bool {
+        match &self.lookup {
+            HyperliquidOrderLookup::OrderId(expected) => order_id == *expected,
+            HyperliquidOrderLookup::ClientOrderId(expected) => matches!(
+                client_order_id,
+                FieldState::Known(actual) if actual.eq_ignore_ascii_case(expected)
+            ),
+        }
+    }
+
+    fn state_converges(&self, state: OrderState) -> bool {
+        match (&self.acknowledgement, self.kind) {
+            (Some(HyperliquidExchangeOutcome::Resting { .. }), HyperliquidActionKind::AloPlace) => {
+                matches!(
+                    state,
+                    OrderState::New
+                        | OrderState::PartiallyFilled
+                        | OrderState::Filled
+                        | OrderState::Cancelled
+                )
+            }
+            (
+                Some(HyperliquidExchangeOutcome::Filled { .. }),
+                HyperliquidActionKind::IocReduceOnly,
+            ) => state == OrderState::Filled,
+            (Some(HyperliquidExchangeOutcome::Cancelled { .. }), HyperliquidActionKind::Cancel) => {
+                matches!(state, OrderState::Filled | OrderState::Cancelled)
+            }
+            (None, HyperliquidActionKind::AloPlace) => state != OrderState::Unknown,
+            (None, HyperliquidActionKind::IocReduceOnly) => matches!(
+                state,
+                OrderState::Filled | OrderState::Cancelled | OrderState::Rejected
+            ),
+            (None, HyperliquidActionKind::Cancel) => state != OrderState::Unknown,
+            (Some(HyperliquidExchangeOutcome::Rejected { .. }), _) => true,
+            _ => false,
+        }
+    }
+
+    fn cancel_still_open(&self, state: OrderState) -> bool {
+        self.kind == HyperliquidActionKind::Cancel
+            && self.acknowledgement.is_none()
+            && matches!(state, OrderState::New | OrderState::PartiallyFilled)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HyperliquidExchangeConvergence {
+    /// An absent/unknown status is not proof that the mutation did not reach the venue. The exact
+    /// signed request must remain UNKNOWN and must not be submitted again.
+    PendingUnknown,
+    Rejected {
+        reason: String,
+    },
+    Confirmed {
+        order_id: u64,
+        state: OrderState,
+        exchange_time_ms: u64,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReadbackTarget {
+    Order {
+        client_order_id: String,
+        side: OrderSide,
+        limit_price: Price,
+        quantity: Decimal,
+        reduce_only: bool,
+    },
+    Cancel {
+        order_id: u64,
+    },
+}
+
+impl ReadbackTarget {
+    fn matches_order(
+        &self,
+        client_order_id: &FieldState<String>,
+        side: OrderSide,
+        limit_price: Price,
+        quantity: Decimal,
+        reduce_only: bool,
+    ) -> bool {
+        match self {
+            Self::Order {
+                client_order_id: expected_client_order_id,
+                side: expected_side,
+                limit_price: expected_limit_price,
+                quantity: expected_quantity,
+                reduce_only: expected_reduce_only,
+            } => {
+                matches!(
+                    client_order_id,
+                    FieldState::Known(actual)
+                        if actual.eq_ignore_ascii_case(expected_client_order_id)
+                ) && side == *expected_side
+                    && limit_price == *expected_limit_price
+                    && quantity == *expected_quantity
+                    && reduce_only == *expected_reduce_only
+            }
+            Self::Cancel { .. } => true,
+        }
+    }
+}
+
+pub fn begin_exchange_readback(
+    request: &HyperliquidExchangeRequest,
+    acknowledgement: Option<&HyperliquidExchangeOutcome>,
+    binding: &HyperliquidPrivateStreamBinding,
+) -> Result<HyperliquidExchangeReadbackPlan, HyperliquidError> {
+    if binding.scope().binding() != request.binding()
+        || binding.mode() != request.mode()
+        || binding.generation() == 0
+    {
+        return Err(HyperliquidError::Readback);
+    }
+    validate_acknowledgement(request, acknowledgement)?;
+    let lookup = match acknowledgement {
+        Some(HyperliquidExchangeOutcome::Resting { order_id })
+        | Some(HyperliquidExchangeOutcome::Filled { order_id, .. })
+        | Some(HyperliquidExchangeOutcome::Cancelled { order_id }) => {
+            HyperliquidOrderLookup::order_id(*order_id)?
+        }
+        Some(HyperliquidExchangeOutcome::Rejected { .. }) | None => {
+            match &request.readback_target {
+                ReadbackTarget::Order {
+                    client_order_id, ..
+                } => HyperliquidOrderLookup::client_order_id(client_order_id.clone())?,
+                ReadbackTarget::Cancel { order_id } => HyperliquidOrderLookup::order_id(*order_id)?,
+            }
+        }
+    };
+    Ok(HyperliquidExchangeReadbackPlan {
+        binding: binding.clone(),
+        nonce: request.nonce,
+        kind: request.kind,
+        lookup,
+        acknowledgement: acknowledgement.cloned(),
+        target: request.readback_target.clone(),
+    })
+}
+
+fn validate_acknowledgement(
+    request: &HyperliquidExchangeRequest,
+    acknowledgement: Option<&HyperliquidExchangeOutcome>,
+) -> Result<(), HyperliquidError> {
+    match (request.kind, acknowledgement) {
+        (_, None) => Ok(()),
+        (
+            HyperliquidActionKind::AloPlace,
+            Some(HyperliquidExchangeOutcome::Resting { order_id }),
+        ) if *order_id > 0 => Ok(()),
+        (
+            HyperliquidActionKind::IocReduceOnly,
+            Some(HyperliquidExchangeOutcome::Filled {
+                order_id,
+                total_size,
+                ..
+            }),
+        ) if *order_id > 0
+            && *total_size > Decimal::ZERO
+            && matches!(
+                request.readback_target,
+                ReadbackTarget::Order { quantity, .. } if *total_size <= quantity
+            ) =>
+        {
+            Ok(())
+        }
+        (
+            HyperliquidActionKind::Cancel,
+            Some(HyperliquidExchangeOutcome::Cancelled { order_id }),
+        ) if matches!(
+            request.readback_target,
+            ReadbackTarget::Cancel { order_id: expected } if *order_id == expected
+        ) =>
+        {
+            Ok(())
+        }
+        (_, Some(HyperliquidExchangeOutcome::Rejected { reason }))
+            if !reason.is_empty() && reason.len() <= MAX_REJECTION_BYTES =>
+        {
+            Ok(())
+        }
+        _ => Err(HyperliquidError::Readback),
+    }
+}
+
 pub fn build_alo_place_request(
     credentials: &HyperliquidCredentials,
     nonce: PersistedNonce,
     order: HyperliquidAloOrder,
     expires_after_ms: Option<u64>,
 ) -> Result<HyperliquidExchangeRequest, HyperliquidError> {
+    let readback_target = ReadbackTarget::Order {
+        client_order_id: order.client_order_id.clone(),
+        side: if order.is_buy {
+            OrderSide::Buy
+        } else {
+            OrderSide::Sell
+        },
+        limit_price: Price::new(decimal_from_wire(&order.price)?)
+            .map_err(|_| HyperliquidError::Action)?,
+        quantity: decimal_from_wire(&order.size)?,
+        reduce_only: order.reduce_only,
+    };
     let action = Action::Order(OrderAction {
         kind: "order",
         orders: vec![OrderWire {
@@ -290,7 +608,10 @@ pub fn build_alo_place_request(
         nonce,
         expires_after_ms,
         HyperliquidActionKind::AloPlace,
-        ResponseExpectation::Alo,
+        ResponseContract {
+            acknowledgement: ResponseExpectation::Alo,
+            readback_target,
+        },
         action,
     )
 }
@@ -302,6 +623,18 @@ pub fn build_ioc_reduce_only_request(
     expires_after_ms: Option<u64>,
 ) -> Result<HyperliquidExchangeRequest, HyperliquidError> {
     let expected_size = decimal_from_wire(&order.size)?;
+    let readback_target = ReadbackTarget::Order {
+        client_order_id: order.client_order_id.clone(),
+        side: if order.is_buy {
+            OrderSide::Buy
+        } else {
+            OrderSide::Sell
+        },
+        limit_price: Price::new(decimal_from_wire(&order.price)?)
+            .map_err(|_| HyperliquidError::Action)?,
+        quantity: expected_size,
+        reduce_only: true,
+    };
     let action = Action::Order(OrderAction {
         kind: "order",
         orders: vec![OrderWire {
@@ -323,7 +656,10 @@ pub fn build_ioc_reduce_only_request(
         nonce,
         expires_after_ms,
         HyperliquidActionKind::IocReduceOnly,
-        ResponseExpectation::Ioc { expected_size },
+        ResponseContract {
+            acknowledgement: ResponseExpectation::Ioc { expected_size },
+            readback_target,
+        },
         action,
     )
 }
@@ -334,6 +670,9 @@ pub fn build_cancel_request(
     cancel: HyperliquidCancel,
     expires_after_ms: Option<u64>,
 ) -> Result<HyperliquidExchangeRequest, HyperliquidError> {
+    let readback_target = ReadbackTarget::Cancel {
+        order_id: cancel.order_id,
+    };
     let action = Action::Cancel(CancelAction {
         kind: "cancel",
         cancels: vec![CancelWire {
@@ -347,14 +686,17 @@ pub fn build_cancel_request(
         nonce,
         expires_after_ms,
         HyperliquidActionKind::Cancel,
-        ResponseExpectation::Cancel {
-            order_id: cancel.order_id,
+        ResponseContract {
+            acknowledgement: ResponseExpectation::Cancel {
+                order_id: cancel.order_id,
+            },
+            readback_target,
         },
         action,
     )
 }
 
-pub fn parse_exchange_response(
+pub fn parse_exchange_ack(
     payload: &[u8],
     request: &HyperliquidExchangeRequest,
 ) -> Result<HyperliquidExchangeOutcome, HyperliquidError> {
@@ -411,11 +753,25 @@ pub fn parse_exchange_response(
     }
 }
 
+/// Compatibility name for the synchronous exchange acknowledgement parser. A successful return is
+/// not a terminal mutation receipt; use `begin_exchange_readback` and read-only `orderStatus`.
+pub fn parse_exchange_response(
+    payload: &[u8],
+    request: &HyperliquidExchangeRequest,
+) -> Result<HyperliquidExchangeOutcome, HyperliquidError> {
+    parse_exchange_ack(payload, request)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ResponseExpectation {
     Alo,
     Ioc { expected_size: Decimal },
     Cancel { order_id: u64 },
+}
+
+struct ResponseContract {
+    acknowledgement: ResponseExpectation,
+    readback_target: ReadbackTarget,
 }
 
 #[derive(Serialize)]
@@ -553,7 +909,7 @@ fn signed_request(
     nonce: PersistedNonce,
     expires_after_ms: Option<u64>,
     kind: HyperliquidActionKind,
-    expected: ResponseExpectation,
+    response_contract: ResponseContract,
     action: Action,
 ) -> Result<HyperliquidExchangeRequest, HyperliquidError> {
     if !scope
@@ -593,7 +949,8 @@ fn signed_request(
         expires_after_ms,
         vault_address: credentials.vault_address().map(str::to_owned),
         connection_id,
-        expected,
+        expected: response_contract.acknowledgement,
+        readback_target: response_contract.readback_target,
         body,
     })
 }
@@ -816,6 +1173,13 @@ mod tests {
         order_type: LimitOrderType,
     }
 
+    #[derive(Serialize)]
+    struct OfficialDummyAction {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        num: u64,
+    }
+
     #[test]
     fn official_python_sdk_order_signature_vector_matches() -> Result<(), HyperliquidError> {
         let action = OfficialOrderAction {
@@ -847,6 +1211,66 @@ mod tests {
             "0x2b54116ff64054968aa237c20ca9ff68000f977c93289157748a3162b6ea940e"
         );
         assert_eq!(signature.v, 28);
+        Ok(())
+    }
+
+    #[test]
+    fn official_python_sdk_source_and_vault_signature_vectors_match() -> Result<(), HyperliquidError>
+    {
+        let action = OfficialDummyAction {
+            kind: "dummy",
+            num: 100_000_000_000,
+        };
+        let key = SigningKey::from_slice(&hex_key(
+            "0123456789012345678901234567890123456789012345678901234567890123",
+        )?)
+        .map_err(|_| HyperliquidError::Signing)?;
+        let no_vault = action_hash(&action, None, 0, None)?;
+        let live = sign_agent(&key, HyperliquidSource::Live, no_vault)?;
+        assert_eq!(
+            live.r,
+            // The official Python vector omits this scalar's leading zero nibble; the wire uses
+            // the equivalent fixed-width bytes32 representation.
+            "0x053749d5b30552aeb2fca34b530185976545bb22d0b3ce6f62e31be961a59298"
+        );
+        assert_eq!(
+            live.s,
+            "0x755c40ba9bf05223521753995abb2f73ab3229be8ec921f350cb447e384d8ed8"
+        );
+        assert_eq!(live.v, 27);
+        let test = sign_agent(&key, HyperliquidSource::Test, no_vault)?;
+        assert_eq!(
+            test.r,
+            "0x542af61ef1f429707e3c76c5293c80d01f74ef853e34b76efffcb57e574f9510"
+        );
+        assert_eq!(
+            test.s,
+            "0x17b8b32f086e8cdede991f1e2c529f5dd5297cbe8128500e00cbaf766204a613"
+        );
+        assert_eq!(test.v, 28);
+
+        let vault = "0x1719884eb866cb12b2287399b15f7db5e7d775ea";
+        let vault_hash = action_hash(&action, Some(vault), 0, None)?;
+        let live_vault = sign_agent(&key, HyperliquidSource::Live, vault_hash)?;
+        assert_eq!(
+            live_vault.r,
+            "0x003c548db75e479f8012acf3000ca3a6b05606bc2ec0c29c50c515066a326239"
+        );
+        assert_eq!(
+            live_vault.s,
+            "0x4d402be7396ce74fbba3795769cda45aec00dc3125a984f2a9f23177b190da2c"
+        );
+        assert_eq!(live_vault.v, 28);
+        let test_vault = sign_agent(&key, HyperliquidSource::Test, vault_hash)?;
+        assert_eq!(
+            test_vault.r,
+            "0xe281d2fb5c6e25ca01601f878e4d69c965bb598b88fac58e475dd1f5e56c362b"
+        );
+        assert_eq!(
+            test_vault.s,
+            "0x7ddad27e9a238d045c035bc606349d075d5c5cd00a6cd1da23ab5c39d4ef0f60"
+        );
+        assert_eq!(test_vault.v, 27);
         Ok(())
     }
 
@@ -924,6 +1348,97 @@ mod tests {
     }
 
     #[test]
+    fn acknowledged_and_unknown_actions_converge_only_through_bound_readback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let meta = meta(GatewayMode::Test, USER)?;
+        let credentials =
+            HyperliquidCredentials::from_values(USER, USER, None, "venue-agent", AGENT, AGENT_KEY)?;
+        let mut store = MemoryNonceStore::default();
+        let nonce = reserve_next_nonce(&mut store, AGENT, 1_700_000_000_000)?;
+        let request = build_alo_place_request(
+            &credentials,
+            nonce,
+            HyperliquidAloOrder::new(
+                &meta,
+                OrderSide::Buy,
+                Decimal::new(6_500_500, 3),
+                Decimal::new(4, 1),
+                false,
+                "0x00000000000000000000000000000001",
+            )?,
+            None,
+        )?;
+        let acknowledgement = parse_exchange_ack(
+            br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":77}}]}}}"#,
+            &request,
+        )?;
+        let private = HyperliquidPrivateStreamBinding::new(&meta, 9)?;
+        let plan = begin_exchange_readback(&request, Some(&acknowledgement), &private)?;
+        assert_eq!(plan.binding().generation(), 9);
+        assert_eq!(plan.nonce(), 1_700_000_000_000);
+        assert_eq!(plan.kind(), HyperliquidActionKind::AloPlace);
+        assert_eq!(
+            plan.reconcile(None)?,
+            HyperliquidExchangeConvergence::PendingUnknown
+        );
+        let status_payload = serde_json::to_vec(&serde_json::json!({
+            "status":"order",
+            "order":{
+                "order":{
+                    "children":[], "coin":"BTC", "isPositionTpsl":false,
+                    "isTrigger":false, "side":"B", "limitPx":"6500.5", "sz":"0.4",
+                    "oid":77, "timestamp":1_700_000_000_001_u64, "reduceOnly":false,
+                    "orderType":"Limit", "origSz":"0.4", "tif":"Alo",
+                    "triggerCondition":"N/A", "triggerPx":"0.0",
+                    "cloid":"0x00000000000000000000000000000001"
+                },
+                "status":"open", "statusTimestamp":1_700_000_000_002_u64
+            }
+        }))?;
+        let status = crate::parse_order_status(&status_payload, &meta, plan.lookup())?;
+        assert_eq!(
+            plan.reconcile(Some(&status))?,
+            HyperliquidExchangeConvergence::Confirmed {
+                order_id: 77,
+                state: OrderState::New,
+                exchange_time_ms: 1_700_000_000_002,
+            }
+        );
+
+        let unknown = begin_exchange_readback(&request, None, &private)?;
+        assert!(matches!(
+            unknown.lookup(),
+            HyperliquidOrderLookup::ClientOrderId(_)
+        ));
+        let unknown_status =
+            crate::parse_order_status(br#"{"status":"unknownOid"}"#, &meta, unknown.lookup())?;
+        assert_eq!(
+            unknown.reconcile(Some(&unknown_status))?,
+            HyperliquidExchangeConvergence::PendingUnknown
+        );
+        assert_eq!(
+            begin_exchange_readback(
+                &request,
+                Some(&acknowledgement),
+                &HyperliquidPrivateStreamBinding::new(&meta, 10)?
+            )?
+            .binding()
+            .generation(),
+            10
+        );
+
+        let mut wrong = serde_json::from_slice::<serde_json::Value>(&status_payload)?;
+        wrong["order"]["order"]["reduceOnly"] = serde_json::json!(true);
+        let wrong_status =
+            crate::parse_order_status(&serde_json::to_vec(&wrong)?, &meta, plan.lookup())?;
+        assert_eq!(
+            plan.reconcile(Some(&wrong_status)),
+            Err(HyperliquidError::Readback)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn vault_ioc_and_cancel_keep_exact_scope_and_response_shape()
     -> Result<(), Box<dyn std::error::Error>> {
         const VAULT: &str = "0x0000000000000000000000000000000000000002";
@@ -951,11 +1466,12 @@ mod tests {
         assert_eq!(body["vaultAddress"], VAULT);
         assert_eq!(body["action"]["orders"][0]["r"], true);
         assert_eq!(body["action"]["orders"][0]["t"]["limit"]["tif"], "Ioc");
-        assert!(matches!(
-            parse_exchange_response(
+        let ioc_ack = parse_exchange_ack(
                 br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"filled":{"totalSz":"0.2","avgPx":"63999.5","oid":88}}]}}}"#,
                 &ioc_request,
-            )?,
+            )?;
+        assert!(matches!(
+            &ioc_ack,
             HyperliquidExchangeOutcome::Filled { order_id: 88, .. }
         ));
         assert!(matches!(
@@ -973,13 +1489,68 @@ mod tests {
             HyperliquidCancel::new(&meta, 88)?,
             None,
         )?;
+        let cancel_ack = parse_exchange_ack(
+            br#"{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}"#,
+            &cancel_request,
+        )?;
         assert!(matches!(
-            parse_exchange_response(
-                br#"{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}"#,
-                &cancel_request,
-            )?,
+            &cancel_ack,
             HyperliquidExchangeOutcome::Cancelled { order_id: 88 }
         ));
+
+        let private = HyperliquidPrivateStreamBinding::new(&meta, 22)?;
+        let ioc_plan = begin_exchange_readback(&ioc_request, Some(&ioc_ack), &private)?;
+        let ioc_status_payload = serde_json::to_vec(&serde_json::json!({
+            "status":"order",
+            "order":{
+                "order":{
+                    "children":[], "coin":"BTC", "isPositionTpsl":false,
+                    "isTrigger":false, "side":"A", "limitPx":"64000", "sz":"0",
+                    "oid":88, "timestamp":1_700_000_000_001_u64, "reduceOnly":true,
+                    "orderType":"Market", "origSz":"0.3", "tif":"FrontendMarket",
+                    "triggerCondition":"N/A", "triggerPx":"0.0",
+                    "cloid":"0x00000000000000000000000000000002"
+                },
+                "status":"filled", "statusTimestamp":1_700_000_000_002_u64
+            }
+        }))?;
+        let ioc_status = crate::parse_order_status(&ioc_status_payload, &meta, ioc_plan.lookup())?;
+        assert!(matches!(
+            ioc_plan.reconcile(Some(&ioc_status))?,
+            HyperliquidExchangeConvergence::Confirmed {
+                order_id: 88,
+                state: OrderState::Filled,
+                ..
+            }
+        ));
+
+        let cancel_plan = begin_exchange_readback(&cancel_request, Some(&cancel_ack), &private)?;
+        let cancel_status =
+            crate::parse_order_status(&ioc_status_payload, &meta, cancel_plan.lookup())?;
+        assert!(matches!(
+            cancel_plan.reconcile(Some(&cancel_status))?,
+            HyperliquidExchangeConvergence::Confirmed {
+                order_id: 88,
+                state: OrderState::Filled,
+                ..
+            }
+        ));
+
+        let unknown_cancel = begin_exchange_readback(&cancel_request, None, &private)?;
+        let mut still_open = serde_json::from_slice::<serde_json::Value>(&ioc_status_payload)?;
+        still_open["order"]["order"]["sz"] = serde_json::json!("0.3");
+        still_open["order"]["order"]["orderType"] = serde_json::json!("Limit");
+        still_open["order"]["order"]["tif"] = serde_json::json!("Alo");
+        still_open["order"]["status"] = serde_json::json!("open");
+        let still_open = crate::parse_order_status(
+            &serde_json::to_vec(&still_open)?,
+            &meta,
+            unknown_cancel.lookup(),
+        )?;
+        assert_eq!(
+            unknown_cancel.reconcile(Some(&still_open))?,
+            HyperliquidExchangeConvergence::PendingUnknown
+        );
         Ok(())
     }
 

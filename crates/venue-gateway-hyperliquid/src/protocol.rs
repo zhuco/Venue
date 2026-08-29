@@ -20,7 +20,8 @@ use crate::{
 };
 
 const MAX_BOOK_LEVELS: usize = 20;
-const MAX_FILL_PAGE: usize = 2_000;
+pub const HYPERLIQUID_FILL_RESPONSE_LIMIT: usize = 2_000;
+pub const HYPERLIQUID_RECENT_FILL_RETENTION_LIMIT: usize = 10_000;
 const MAX_FRONTEND_ORDERS: usize = 2_000;
 const MAX_FRONTEND_CHILDREN: usize = 64;
 
@@ -222,7 +223,7 @@ impl HyperliquidFillQuery {
     fn validate(&self) -> Result<(), HyperliquidError> {
         if self.begin_ms == 0
             || self.end_ms < self.begin_ms
-            || !(1..=MAX_FILL_PAGE).contains(&self.limit)
+            || !(1..=HYPERLIQUID_FILL_RESPONSE_LIMIT).contains(&self.limit)
             || self.after.as_ref().is_some_and(|cursor| {
                 cursor.scope != self.scope
                     || cursor.page_coin.is_empty()
@@ -319,8 +320,25 @@ pub enum HyperliquidOrderStatus {
         scope: HyperliquidPayloadScope,
         order_id: u64,
         client_order_id: FieldState<String>,
+        side: OrderSide,
+        limit_price: Price,
+        original_quantity: Decimal,
+        remaining_quantity: Decimal,
+        reduce_only: bool,
+        native_order_type: String,
+        time_in_force: Option<String>,
         state: OrderState,
         exchange_time_ms: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HyperliquidFillCoverage {
+    MorePages,
+    /// The requested window is exhausted within the venue-visible recent-fill history. The venue
+    /// only exposes its most recent 10,000 fills, so this is never proof about older history.
+    VenueVisibleWindowExhausted {
+        maximum_retained_fills: usize,
     },
 }
 
@@ -329,8 +347,11 @@ pub struct HyperliquidFillPage {
     pub scope: HyperliquidPayloadScope,
     pub fills: Vec<HyperliquidFill>,
     pub next_cursor: Option<HyperliquidFillCursor>,
-    /// True only when the response was below the venue cap and the local limit did not truncate it.
+    /// True only when the response was below the per-response cap and the local limit did not
+    /// truncate it. This exhausts the venue-visible window, not history older than its retention
+    /// limit; callers must inspect `coverage` and must not interpret it as all-time completeness.
     pub complete: bool,
+    pub coverage: HyperliquidFillCoverage,
 }
 
 pub fn build_meta_request(
@@ -445,6 +466,15 @@ pub fn parse_order_status(
                 }
                 HyperliquidOrderLookup::OrderId(_) | HyperliquidOrderLookup::ClientOrderId(_) => {}
             }
+            let state = normalized_order_status(&body.status)?;
+            let original_quantity = decimal(&body.order.orig_sz)?;
+            let remaining_quantity = decimal(&body.order.sz)?;
+            if (state == OrderState::Filled && !remaining_quantity.is_zero())
+                || (matches!(state, OrderState::New | OrderState::PartiallyFilled)
+                    && remaining_quantity.is_zero())
+            {
+                return Err(HyperliquidError::Payload);
+            }
             Ok(HyperliquidOrderStatus::Known {
                 scope: meta.scope.clone(),
                 order_id: body.order.oid,
@@ -455,7 +485,15 @@ pub fn parse_order_status(
                     .transpose()?
                     .map(FieldState::Known)
                     .unwrap_or(FieldState::Missing),
-                state: normalized_order_status(&body.status)?,
+                side: side(&body.order.side)?,
+                limit_price: Price::new(decimal(&body.order.limit_px)?)
+                    .map_err(|_| HyperliquidError::Payload)?,
+                original_quantity,
+                remaining_quantity,
+                reduce_only: body.order.reduce_only,
+                native_order_type: body.order.order_type,
+                time_in_force: body.order.tif,
+                state,
                 exchange_time_ms: body.status_timestamp,
             })
         }
@@ -692,10 +730,10 @@ pub fn parse_user_fills_page(
     }
     let rows: Vec<UserFillRow> =
         serde_json::from_slice(payload).map_err(|_| HyperliquidError::Payload)?;
-    if rows.len() > MAX_FILL_PAGE {
+    if rows.len() > HYPERLIQUID_FILL_RESPONSE_LIMIT {
         return Err(HyperliquidError::Payload);
     }
-    let capped = rows.len() == MAX_FILL_PAGE;
+    let capped = rows.len() == HYPERLIQUID_FILL_RESPONSE_LIMIT;
     let mut rows = rows
         .into_iter()
         .map(|row| {
@@ -742,6 +780,13 @@ pub fn parse_user_fills_page(
         fills,
         next_cursor,
         complete,
+        coverage: if complete {
+            HyperliquidFillCoverage::VenueVisibleWindowExhausted {
+                maximum_retained_fills: HYPERLIQUID_RECENT_FILL_RETENTION_LIMIT,
+            }
+        } else {
+            HyperliquidFillCoverage::MorePages
+        },
     })
 }
 
@@ -929,7 +974,7 @@ fn validate_status_order(row: &FrontendOrderRow) -> Result<(), HyperliquidError>
     Ok(())
 }
 
-fn canonical_cloid(value: String) -> Result<String, HyperliquidError> {
+pub(crate) fn canonical_cloid(value: String) -> Result<String, HyperliquidError> {
     match HyperliquidOrderLookup::client_order_id(value)? {
         HyperliquidOrderLookup::ClientOrderId(value) => Ok(value),
         HyperliquidOrderLookup::OrderId(_) => Err(HyperliquidError::Payload),
@@ -1048,7 +1093,8 @@ pub(crate) fn normalize_fill(
         fill,
         client_order_id: row
             .cloid
-            .filter(|value| !value.is_empty())
+            .map(canonical_cloid)
+            .transpose()?
             .map(FieldState::Known)
             .unwrap_or(FieldState::Missing),
     })
