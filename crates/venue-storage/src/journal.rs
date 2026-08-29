@@ -133,7 +133,6 @@ impl DurableJsonl {
     where
         E: From<StorageError>,
     {
-        require_parent(&self.path).map_err(E::from)?;
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -174,18 +173,6 @@ impl DurableJsonl {
             }),
         }
     }
-}
-
-fn require_parent(path: &Path) -> Result<&Path, StorageError> {
-    path.parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| StorageError::Io {
-            path: path.to_path_buf(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "journal path has no parent directory",
-            ),
-        })
 }
 
 #[derive(Debug)]
@@ -290,7 +277,10 @@ pub enum StorageError {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use rust_decimal::Decimal;
     use sha2::{Digest, Sha256};
@@ -298,6 +288,14 @@ mod tests {
     use venue_domain::{Amount, Asset, DomainEvent, EventHeader, EventId, EventSource};
 
     use super::*;
+
+    struct RemoveTestFile(PathBuf);
+
+    impl Drop for RemoveTestFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
 
     #[test]
     fn fact_journal_preserves_the_legacy_jsonl_wire_format()
@@ -314,6 +312,42 @@ mod tests {
         })?;
         expected.push(b'\n');
         assert_eq!(fs::read(path)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn fact_journal_supports_a_bare_relative_path_across_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path = PathBuf::from(format!(
+            ".venue-storage-relative-facts-{}-{nonce}.jsonl",
+            std::process::id()
+        ));
+        assert!(
+            path.parent()
+                .is_some_and(|parent| parent.as_os_str().is_empty())
+        );
+        let _remove_file = RemoveTestFile(path.clone());
+        let record = fact("relative", 1)?;
+        {
+            let mut journal = Journal::open(&path)?;
+            assert_eq!(journal.append(record.clone())?, 1);
+        }
+
+        let mut expected = serde_json::to_vec(&JournalEntry {
+            sequence: 1,
+            record: record.clone(),
+        })?;
+        expected.push(b'\n');
+        assert_eq!(fs::read(&path)?, expected);
+        let reopened = Journal::open(&path)?;
+        assert_eq!(
+            reopened.recover()?.entries,
+            vec![JournalEntry {
+                sequence: 1,
+                record,
+            }]
+        );
         Ok(())
     }
 
