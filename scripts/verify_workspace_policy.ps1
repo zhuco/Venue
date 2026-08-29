@@ -13,8 +13,8 @@ $legacySourceLineCeilings = @{
 }
 $allowedDependencies = @(
     'base64', 'bitflags', 'bytes', 'clap', 'crossbeam-channel', 'ctrlc', 'dotenvy', 'eframe',
-    'egui', 'egui_tiles', 'fs2', 'futures-util', 'hmac', 'js-sys', 'reqwest', 'rust_decimal',
-    'secrecy', 'serde', 'serde_json', 'sha2', 'sqlx', 'tempfile', 'thiserror', 'tokio',
+    'egui', 'egui_tiles', 'fs2', 'futures-util', 'hmac', 'js-sys', 'k256', 'reqwest', 'rmp-serde',
+    'rust_decimal', 'secrecy', 'serde', 'serde_json', 'sha2', 'sha3', 'sqlx', 'tempfile', 'thiserror', 'tokio',
     'tokio-tungstenite', 'toml', 'tracing', 'tracing-subscriber', 'tungstenite', 'venue-control-protocol',
     'venue-copy', 'venue-domain', 'venue-execution', 'venue-gateway-api', 'venue-gateway-binance', 'venue-gateway-bitget',
     'venue-gateway-bybit', 'venue-gateway-gate', 'venue-gateway-hyperliquid', 'venue-gateway-okx',
