@@ -4661,6 +4661,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "venue-node"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "thiserror 2.0.19",
+ "venue",
+ "venue-domain",
+ "venue-gateway-api",
+ "venue-gateway-binance",
+ "venue-gateway-bitget",
+ "venue-gateway-bybit",
+ "venue-gateway-gate",
+ "venue-gateway-hyperliquid",
+ "venue-gateway-okx",
+]
+
+[[package]]
 name = "venue-storage"
 version = "0.1.0"
 dependencies = [

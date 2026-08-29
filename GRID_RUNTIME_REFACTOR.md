@@ -30,6 +30,11 @@ writer 或物理交易客户端。`legacy_stage7_strategy_binding` 只转换单�
 迁移完成前，现有 Stage 7 仍是唯一实盘 writer；不得同时为同一账户启动账户内核的新物理执行路径。
 文件型 checkpoint、journal、private evidence、fill cursor 与 Scalping evidence/risk 的耐久实现已集中到 `venue-storage`，根 `src/storage` 只保留兼容 facade/宿主扩展；本次物理提取不改变 fsync、恢复、WAL 或接管语义。
 Bybit、OKX、Hyperliquid 虽已有绑定型 async HTTP/私有 WS transport，但 capability、writer 与 WAL 仍为空，不能加入网格 mutation 或接管链。
+`apps/venue-node` 已提供六个逐 adapter 固定产物：Binance、Gate.io、Bitget 仅在精确 `LIVE` 下委托现有 Stage 7
+部署入口并继续使用原 Owner/WAL/writer/reconciliation/Canary 契约；旧物理 client 不支持 `TEST`，因此对应节点
+明确失败关闭而不回退到生产 endpoint。Bybit、OKX、Hyperliquid 节点只验证 secret-free binding、adapter endpoint、
+凭证环境变量命名空间与隔离 artifact root；在 Owner、WAL、唯一账户 fence、签名 readback、UNKNOWN、Stop/Flatten
+和人工 Canary 证据全部由共享 runtime 接入前，无条件拒绝启动，不读取凭证、联网或写工件。
 Stage 7 成交热路径不得遍历历史命令 WAL。命令 journal 在启动重放时建立未决命令、撤单目标和交易所订单 ID 的派生内存索引；滚动补撤批次以原 JSONL 格式一次 fsync 持久化 Prepared/Submitted 状态，再并行提交物理请求。接管只可在签名全订单族为空、零未决且零本地事务后显式按源 SHA 封存已解析 WAL；原件留在同 root，活动 WAL 从空文件继续，禁止运行中轮转或删除审计源。
 
 纯内核启动必须先安装覆盖 lifecycle、config epoch、Stop/Flatten fence、连接代际、已应用私有游标、完整批次

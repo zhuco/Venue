@@ -2,6 +2,7 @@
 members = [
     ".",
     "apps/venue-control",
+    "apps/venue-node",
     "apps/venueflow",
     "crates/venue-copy",
     "crates/venue-control-protocol",
@@ -27,6 +28,7 @@ rust-version = "1.98.0"
 base64 = "0.22"
 bitflags = { version = "2", features = ["serde"] }
 bytes = "1"
+clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 hmac = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -83,7 +85,7 @@ path = "src/bin/verify-grid-exposure-shadow.rs"
 
 [dependencies]
 base64.workspace = true
-clap = { version = "4", features = ["derive"] }
+clap.workspace = true
 ctrlc = "3"
 dotenvy = "0.15"
 fs2 = "0.4"

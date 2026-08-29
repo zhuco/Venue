@@ -1,0 +1,78 @@
+[package]
+name = "venue-node"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+binance = [
+    "dep:venue",
+    "dep:venue-gateway-binance",
+    "venue/hedged-grid-binance",
+]
+bitget = [
+    "dep:venue",
+    "dep:venue-gateway-bitget",
+    "venue/hedged-grid-bitget",
+]
+bybit = ["dep:venue-gateway-bybit"]
+gate = [
+    "dep:venue",
+    "dep:venue-gateway-gate",
+    "venue/hedged-grid-gate",
+]
+hyperliquid = ["dep:venue-gateway-hyperliquid"]
+okx = ["dep:venue-gateway-okx"]
+
+[[bin]]
+name = "venue-node-binance"
+path = "src/bin/venue-node-binance.rs"
+required-features = ["binance"]
+
+[[bin]]
+name = "venue-node-bitget"
+path = "src/bin/venue-node-bitget.rs"
+required-features = ["bitget"]
+
+[[bin]]
+name = "venue-node-bybit"
+path = "src/bin/venue-node-bybit.rs"
+required-features = ["bybit"]
+
+[[bin]]
+name = "venue-node-gate"
+path = "src/bin/venue-node-gate.rs"
+required-features = ["gate"]
+
+[[bin]]
+name = "venue-node-hyperliquid"
+path = "src/bin/venue-node-hyperliquid.rs"
+required-features = ["hyperliquid"]
+
+[[bin]]
+name = "venue-node-okx"
+path = "src/bin/venue-node-okx.rs"
+required-features = ["okx"]
+
+[dependencies]
+clap.workspace = true
+thiserror.workspace = true
+venue = { path = "../..", optional = true, default-features = false }
+venue-domain = { path = "../../crates/venue-domain" }
+venue-gateway-api = { path = "../../crates/venue-gateway-api" }
+venue-gateway-binance = { path = "../../crates/venue-gateway-binance", optional = true }
+venue-gateway-bitget = { path = "../../crates/venue-gateway-bitget", optional = true }
+venue-gateway-bybit = { path = "../../crates/venue-gateway-bybit", optional = true }
+venue-gateway-gate = { path = "../../crates/venue-gateway-gate", optional = true }
+venue-gateway-hyperliquid = { path = "../../crates/venue-gateway-hyperliquid", optional = true }
+venue-gateway-okx = { path = "../../crates/venue-gateway-okx", optional = true }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+expect_used = "deny"
+panic = "deny"
+unwrap_used = "deny"
