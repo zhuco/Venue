@@ -29,11 +29,11 @@ writer 或物理交易客户端。`legacy_stage7_strategy_binding` 只转换单�
 `trading_account_id` 是真实账户的稳定规范 UUID，跨 symbol/策略复用；交易所 `account_binding` 只表示产品/模式能力。
 迁移完成前，现有 Stage 7 仍是唯一实盘 writer；不得同时为同一账户启动账户内核的新物理执行路径。
 通用 `CommandJournal`、writer lease 与账户级 canonical-root fence 固定在 `venue-execution`；原 JSONL serde/hash、writer schema、fsync、调用方工件路径及机器级 `stage7_writer_roots/v2` 路径保持不变。append 必须在排他文件锁内核对磁盘长度等于恢复时耐久长度，旧进程、坏尾、空行、hash/状态迁移分叉均失败关闭；writer 恢复拒绝同 revision 的主备分叉，并验证 scope、generation 与 handoff 不变量；Unix 文件替换/创建同步父目录。Stage 7 继续经根 facade 使用同一实现。文件型 checkpoint、facts journal、private evidence、fill cursor 与 Scalping evidence/risk 的耐久实现集中在 `venue-storage`，根 `src/storage` 只保留兼容 facade/宿主扩展。
-Bybit、OKX、Hyperliquid 已补齐绑定型 async HTTP/私有 WS、订单族/持仓/成交证据及 ACK 后只读收敛，但 capability、writer 与 WAL 仍为空，不能加入网格 mutation 或接管链。
+六所 adapter 均已补齐绑定型 async HTTP/私有 WS、订单族/持仓/成交证据、单次 mutation 候选及 ACK 后只读收敛；Bybit、OKX、Hyperliquid 另有可持久化 probe 候选。静态 capability、Node writer 与 WAL 均未因此开启，不能加入网格 mutation 或接管链。
 `apps/venue-node` 已提供六个逐 adapter 固定产物：Binance、Gate.io、Bitget 仅在精确 `LIVE` 下委托现有 Stage 7
 部署入口并继续使用原 Owner/WAL/writer/reconciliation/Canary 契约；旧物理 client 不支持 `TEST`，因此对应节点
 明确失败关闭而不回退到生产 endpoint。Bybit、OKX、Hyperliquid 节点只验证 secret-free binding、adapter endpoint、
-凭证环境变量命名空间与隔离 artifact root。`safe_host` 已把 canonical root、唯一 writer、Owner、WAL、一次性 permit、UNKNOWN 读回、Stop/Flatten 与 command-bound Canary 组合成 exchange-neutral 安全宿主；在各 adapter 的完整 capability/readback/physical gateway 接入前，新增三所固定节点仍无条件拒绝启动，不读取凭证、联网或写工件。
+凭证环境变量命名空间与隔离 artifact root。`safe_host` 与 `supervision` 在 root/WAL/Owner/writer metadata 和独立 hash-chain control log 恢复后才允许连接，并持久应用 Pause/Resume/Stop/Flatten/Canary、一次性 permit 与 UNKNOWN 禁重投；在各 adapter 的 capability/physical gateway 接入前，六所新节点路径仍无条件拒绝启动，不读取凭证、联网或写工件。
 Stage 7 成交热路径不得遍历历史命令 WAL。命令 journal 在启动重放时建立未决命令、撤单目标和交易所订单 ID 的派生内存索引；滚动补撤批次以原 JSONL 格式一次 fsync 持久化 Prepared/Submitted 状态，再并行提交物理请求。接管只可在签名全订单族为空、零未决且零本地事务后显式按源 SHA 封存已解析 WAL；原件留在同 root，活动 WAL 从空文件继续，禁止运行中轮转或删除审计源。
 
 纯内核启动必须先安装覆盖 lifecycle、config epoch、Stop/Flatten fence、连接代际、已应用私有游标、完整批次
@@ -449,8 +449,7 @@ Gate、Bitget 当前 profile 只允许常规订单族，条件/Algo 由同一 pr
 `/v2/ui/snapshot`、`/v2/ui/events`、`/v2/control/commands`。策略投影和命令必须携带精确 `TEST | LIVE`，两端只调用 API，不读取数据库、WAL 或 artifacts，
 不持有凭证，不直连交易所，不直接下单。Stop/Flatten 必须显示并提交精确 mode、account、symbol、instance、config epoch、action 与人工确认；
 `apps/venue-control` 提供 transport-neutral schema 重验、幂等 repository、PostgreSQL durable inbox/outbox/claim/terminal receipt，
-以及仅限本地的 HTTP/SSE `/v2` 适配层；TEST-only Copy worker 可原子持久化冻结资本、语义 job、delivery/receipt、ledger 与崩溃恢复，但 LIVE 在数据库访问前失败关闭。账户节点 adapter 尚未实现。账户节点仍须按 Actor applied、Execution Lane、risk、Owner、WAL 与 writer 边界重新验证，
-数据库 claim 或 Control receipt 均不授予 mutation authority。
+以及仅限本地的 HTTP/SSE `/v2` 适配层；PostgreSQL fencing delivery lease 绑定精确 instance/config epoch，ACK 只表示节点 inbox 已耐久，Unknown 只能由下一序号只读 reconciliation claim 收敛，重复 receipt 必须幂等且冲突失败关闭。TEST-only Copy worker 可原子持久化冻结资本、语义 job、delivery/receipt、ledger 与崩溃恢复，但 LIVE 在数据库访问前失败关闭。账户节点轮询 adapter 尚未实现；账户节点仍须按 Actor applied、Execution Lane、risk、Owner、WAL 与 writer 边界重新验证，数据库 lease、claim 或 Control receipt 均不授予 mutation authority。
 
 ## 12. 验收标准
 

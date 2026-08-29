@@ -54,9 +54,9 @@ VenueFlow Desktop / optional Agent
               Exchange
 ```
 
-`venue-control` 校验 schema v2 scope，以 PostgreSQL durable inbox/outbox、幂等 claim 和终态 receipt 保存命令，并提供
+`venue-control` 校验 schema v2 scope，以 PostgreSQL durable inbox/outbox、fencing delivery lease、幂等 claim 和终态 receipt 保存命令，并提供
 仅本地 HTTP/SSE `/v2`。TEST-only Copy worker 可在事务内锁定 leader 事件并持久化纯规划结果、delivery、ledger 与恢复状态；
-它不能直接提交订单，LIVE 在数据库访问前失败关闭。账户节点 adapter 尚未实现。唤醒通道不能
+节点 ACK 只证明本地 inbox 已耐久，Unknown 只能进入下一序号只读对账。它不能直接提交订单，LIVE Copy 在数据库访问前失败关闭；账户节点轮询 adapter 尚未实现。唤醒通道不能
 代替耐久记录；节点仍须先持久化本地 Actor inbox，再独立重验 risk、Owner、WAL、writer 和私有事实。
 
 ## 4. 目标 workspace
@@ -93,11 +93,11 @@ crates/
 固定节点。`legacy` 只是有退出条件的迁移隔离区，不允许新增功能。
 
 当前 `apps/venue-node` 已建立上述六个固定产物、逐 feature 二进制隔离门禁及 exchange-neutral `safe_host`。安全宿主
-组合 canonical root、唯一 writer、Owner、WAL、一次性 dispatch permit、UNKNOWN 读回、Stop/Flatten 与精确 Canary，
-但不会自行产生 capability。Binance、Gate.io、Bitget 仅在显式
-`LIVE` 下委托既有 Stage 7 安全闭环；其 `TEST` 不能重定向到生产 client。Bybit、OKX、Hyperliquid 目前只完成
-secret-free scope、adapter endpoint 选择及隔离 artifact root，且在 Owner、WAL、唯一账户 fence、签名 readback、
-UNKNOWN、Stop/Flatten 和人工 Canary 证据接入前无条件失败关闭，不读取凭证、联网或创建工件。
+在 root/WAL/Owner/writer metadata 与独立 hash-chain control log 恢复后才允许连接，持久应用 Pause/Resume/Stop/Flatten/Canary，
+并组合一次性 dispatch permit 与 UNKNOWN 读回；它不会自行产生 capability。Binance、Gate.io、Bitget 仅在显式
+`LIVE` 下委托既有 Stage 7 安全闭环；其 `TEST` 不能重定向到生产 client。六所 adapter 已具备各自的绑定型 async 私有读取与单次 mutation/readback 候选，
+Bybit、OKX、Hyperliquid 另有可持久化 probe 候选；但尚未接入 Node 的 capability、Owner、WAL、唯一账户 fence、Stop/Flatten 与 Canary 链，
+所以固定节点仍无条件失败关闭，不读取凭证、联网或创建工件。
 
 ## 5. 依赖方向
 
@@ -205,16 +205,16 @@ Copy planner/job-consumer lease 只允许竞争数据库 job 的规划或投递�
 
 ## 8. 六交易所网关
 
-当前已把六所规范身份、仅含 `TEST | LIVE` 的模式、账户/交易对 binding 与版本化 capability mutation 门禁落入 `venue-gateway-api`；根 package 复用同一 `VenueId`，不再复制交易所枚举。门禁要求完整读取、私流、交易和具体 mutation 能力且拒绝提现权限。Binance、Bitget、Gate.io 沿用现有账户订单族能力证据；Bybit、OKX、Hyperliquid 在 adapter 最小闭环完成前能力为空并失败关闭。
+当前已把六所规范身份、仅含 `TEST | LIVE` 的模式、账户/交易对 binding 与版本化 capability mutation 门禁落入 `venue-gateway-api`；根 package 复用同一 `VenueId`，不再复制交易所枚举。六所 adapter 侧 async 读取、订单族、单次 mutation 与 ACK 后 readback 候选已闭合，但静态 capability 均不因此自动开启；只有 Node 完成 Owner/WAL/writer/reconciliation/Canary 绑定后才能产生运行 authority。
 
 | Venue | 目标 adapter | 当前权威来源 | 初始准入 |
 |---|---|---|---|
-| Binance | `venue-gateway-binance` | 已迁入 Portfolio Margin binding、TEST/LIVE 端点、secrecy 凭证、PAPI HMAC、exchangeInfo instrument rules、公共 BBO/深度/成交/闭合 bar raw envelope、账户/仓位/订单/成交/风险纯协议和七日有界成交分页；根签名 readback、transport 与 Stage 7 capability/WAL/writer 仍是生产权威 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
-| Bitget | `venue-gateway-bitget` | 已迁入 UTA TEST Demo/LIVE、凭证与 REST/WS 签名、公共市场、带时效 instrument metadata、账户/设置/持仓/normal 订单/成交同 attempt 五面候选与 raw 重放；不从官方未提供的字段猜 contract value；签名 transport/WS 与 Stage 7 capability/WAL/writer 仍留根 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
-| Gate.io | `venue-gateway-gate` | 已迁入 USDT perpetual TEST/LIVE、凭证/REST/WS 签名、公共市场、账户/持仓/风险、regular 订单/成交闭合分页；Stage 7 profile 候选重放 regular raw pages，并只把 Conditional/Algo 表示为显式 unsupported；签名采集 transport 与 Stage 7 capability/WAL/writer 仍留根 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
-| Bybit | `venue-gateway-bybit` | 账户/Hedge 双腿、regular/conditional、Algo explicit-unsupported 与成交详情证据已闭合；ACK 后 exact lookup，断线/超时不重投；异步 transport 保持限时限长、缓存、心跳与 generation；writer/WAL/capability 为空 | `TEST | LIVE`；节点在完整安全闭环接入前失败关闭，不得小额实盘 mutation |
-| OKX | `venue-gateway-okx` | Net/Hedge 完整腿、三订单族、fills cursor、tdMode/mgnMode、独立私流 generation 与 ACK hash/readback 已绑定；超时只读回、不重投；writer/WAL/capability 为空 | `TEST | LIVE`；节点在完整安全闭环接入前失败关闭，不得小额实盘 mutation |
-| Hyperliquid | `venue-gateway-hyperliquid` | ALO/cancel/IOC reduce-only、官方签名向量、vault/模式绑定与 ACK 后 orderStatus 已闭合；UNKNOWN 不重投，成交边界为 2000/页且最近 10000 条；`tid` 不是 sequence；writer/WAL/capability 为空 | `TEST | LIVE`；节点在完整安全闭环接入前失败关闭，不能 mutation |
+| Binance | `venue-gateway-binance` | Portfolio Margin async HTTP/私流、Net/Hedge 腿、regular/Algo/conditional-unsupported、fills cursor、place/cancel/reduce-once 与 ACK 后 exact signed readback 已闭合；Stage 7 capability/WAL/writer 仍是生产权威 | `TEST | LIVE`；adapter 静态能力为空，Node 接入前不开放新路径 |
+| Bitget | `venue-gateway-bitget` | UTA TEST Demo/LIVE async 私有链路、账户五面同 attempt、normal/unsupported 订单族、place/cancel/reduce-once 与 UNKNOWN exact readback 已闭合；Stage 7 capability/WAL/writer 仍是生产权威 | `TEST | LIVE`；adapter 静态能力为空，Node 接入前不开放新路径 |
+| Gate.io | `venue-gateway-gate` | TEST/LIVE async 签名 HTTP/私流、账户/Hedge 腿、regular/profile-explicit-unsupported、fills cursor、post-only place/exact cancel/reduce-once 与 ACK readback 已闭合；Stage 7 capability/WAL/writer 仍是生产权威 | `TEST | LIVE`；adapter 静态能力为空，Node 接入前不开放新路径 |
+| Bybit | `venue-gateway-bybit` | 物理单次会话与 API-secret HMAC probe 已闭合账户、Hedge 腿、三订单族、订单详情/fills、私流 generation、place/cancel/reduce-only IOC 与 ACK exact lookup | `TEST | LIVE`；probe 仅为候选，静态能力及 Node/writer/WAL 关闭 |
+| OKX | `venue-gateway-okx` | 可持久化 probe 已闭合 Net/Hedge 腿、三订单族、fills、模式、私流 generation、place/cancel/reduce-once 与 ACK UNKNOWN readback；共享命令尚拒绝 Net mutation | `TEST | LIVE`；probe 仅为候选，静态能力及 Node/writer/WAL 关闭 |
+| Hyperliquid | `venue-gateway-hyperliquid` | 单次 dispatch 与可持久化 probe 已闭合 vault/coin/mode/generation、三类 action、fills 去重、官方签名向量、ACK UNKNOWN 与 orderStatus readback | `TEST | LIVE`；probe 仅为候选，静态能力及 Node/writer/WAL 关闭 |
 
 KOL 网关只是协议 fixture 和差异对照来源，不继承其运行开关或实盘准入状态。前三所的生产权威继续来自 Venue 已验收实现。
 

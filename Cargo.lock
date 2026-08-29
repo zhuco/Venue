@@ -4724,13 +4724,18 @@ dependencies = [
 name = "venue-gateway-binance"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "futures-util",
  "hmac",
+ "reqwest",
  "rust_decimal",
  "secrecy",
  "serde",
  "serde_json",
  "sha2",
  "thiserror 2.0.19",
+ "tokio",
+ "tokio-tungstenite",
  "venue-domain",
  "venue-gateway-api",
 ]
@@ -4740,13 +4745,18 @@ name = "venue-gateway-bitget"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "bytes",
+ "futures-util",
  "hmac",
+ "reqwest",
  "rust_decimal",
  "secrecy",
  "serde",
  "serde_json",
  "sha2",
  "thiserror 2.0.19",
+ "tokio",
+ "tokio-tungstenite",
  "venue-domain",
  "venue-gateway-api",
 ]
@@ -4775,13 +4785,18 @@ dependencies = [
 name = "venue-gateway-gate"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "futures-util",
  "hmac",
+ "reqwest",
  "rust_decimal",
  "secrecy",
  "serde",
  "serde_json",
  "sha2",
  "thiserror 2.0.19",
+ "tokio",
+ "tokio-tungstenite",
  "venue-domain",
  "venue-gateway-api",
 ]
@@ -4844,9 +4859,13 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.19",
  "venue",
+ "venue-control-protocol",
  "venue-domain",
  "venue-execution",
  "venue-gateway-api",
