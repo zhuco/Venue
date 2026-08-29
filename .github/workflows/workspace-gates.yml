@@ -1,0 +1,31 @@
+name: workspace-gates
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt, clippy
+      - name: Verify repository policy
+        shell: pwsh
+        run: ./scripts/verify_workspace_policy.ps1
+      - name: Verify repository hygiene
+        shell: pwsh
+        run: ./scripts/verify_repository_hygiene.ps1
+      - name: Verify fixed deployment binaries
+        shell: pwsh
+        run: ./scripts/verify_fixed_deployment_binaries.ps1
+      - name: Verify Rust workspace quality
+        shell: pwsh
+        run: ./scripts/verify_workspace_quality.ps1

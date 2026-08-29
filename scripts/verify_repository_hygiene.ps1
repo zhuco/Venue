@@ -34,6 +34,7 @@ $forbiddenExtensions = @(
     ".tar",
     ".zip"
 )
+$protectedArtifactRoots = @("artifacts/")
 
 $tracked = @(git ls-files)
 if ($LASTEXITCODE -ne 0) {
@@ -44,6 +45,11 @@ $violations = [System.Collections.Generic.List[string]]::new()
 $totalBytes = [int64]0
 foreach ($relativePath in $tracked) {
     $normalized = $relativePath.Replace("\", "/")
+    if ($normalized.StartsWith("bak/", [StringComparison]::OrdinalIgnoreCase)) {
+        # `bak` is frozen legacy. Report its presence without reading its contents or metadata.
+        $violations.Add("frozen legacy path is tracked: $normalized")
+        continue
+    }
     if ($forbiddenFiles -contains $normalized) {
         $violations.Add("secret/local file is tracked: $normalized")
     }
@@ -65,6 +71,23 @@ foreach ($relativePath in $tracked) {
     $totalBytes += $bytes
     if ($bytes -gt $maxSingleFileBytes) {
         $violations.Add("tracked file exceeds 2 MiB: $normalized ($bytes bytes)")
+    }
+}
+
+$changedPaths = @(
+    & git diff --name-status --no-ext-diff -- . ':!bak/**'
+    if ($LASTEXITCODE -ne 0) { throw "git diff failed" }
+    & git diff --cached --name-status --no-ext-diff -- . ':!bak/**'
+    if ($LASTEXITCODE -ne 0) { throw "git diff --cached failed" }
+)
+foreach ($change in $changedPaths) {
+    if ($change -match '^(?<status>[A-Z]+)\s+(?<path>.+)$') {
+        $path = $Matches.path.Replace("\", "/")
+        if ($Matches.status.StartsWith("D") -and $protectedArtifactRoots | Where-Object {
+                $path.StartsWith($_, [StringComparison]::OrdinalIgnoreCase)
+            }) {
+            $violations.Add("protected runtime artifact deletion is forbidden: $path")
+        }
     }
 }
 

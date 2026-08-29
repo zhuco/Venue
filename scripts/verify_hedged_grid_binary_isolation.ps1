@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)] [ValidateSet('binance', 'gate', 'bitget')] [string]$Exchange,
+    [Parameter(Mandatory)] [ValidateSet('binance', 'gate', 'bitget', 'bybit', 'okx', 'hyperliquid')] [string]$Exchange,
     [Parameter(Mandatory)] [string]$BinaryPath
 )
 
@@ -13,9 +13,12 @@ if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
 }
 
 $families = [ordered]@{
-    binance = @('fapi.binance.com', 'papi.binance.com')
+    binance = @('fapi.binance.com', 'papi.binance.com', 'fstream.binance.com')
     gate = @('api.gateio.ws', 'fx-ws.gateio.ws')
     bitget = @('api.bitget.com', 'ws.bitget.com')
+    bybit = @('api.bybit.com', 'stream.bybit.com')
+    okx = @('www.okx.com', 'ws.okx.com')
+    hyperliquid = @('api.hyperliquid.xyz')
 }
 $content = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($binary))
 
