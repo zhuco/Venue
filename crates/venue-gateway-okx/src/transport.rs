@@ -18,10 +18,13 @@ use tokio_tungstenite::{
 use venue_gateway_api::GatewayBinding;
 
 use crate::{
-    OkxAccountProfile, OkxActivePrivateSubscription, OkxConfig, OkxCredentials, OkxInstrument,
+    OkxAcceptedCancel, OkxAcceptedOrder, OkxAccountProfile, OkxActivePrivateSubscription,
+    OkxCancelRequest, OkxConfig, OkxCredentials, OkxInstrument, OkxPlaceRequest,
     OkxPrivateReadRequest, OkxPrivateRequest, OkxPrivateSubscription, OkxPrivateWsScope,
-    OkxTradeMode, OkxWsLoginFrame, SignedHeaders, activate_private_subscription,
-    build_private_subscribe, build_ws_login, parse_ws_login_ack,
+    OkxTradeMode, OkxUnknownCancelReadbackRequest, OkxUnknownOrderReadbackRequest, OkxWsLoginFrame,
+    SignedHeaders, activate_private_subscription, build_private_subscribe,
+    build_unknown_cancel_readback_request, build_unknown_order_readback_request_after,
+    build_ws_login, parse_cancel_ack, parse_place_ack, parse_ws_login_ack,
 };
 
 const HEADER_NAMES: [&str; 5] = [
@@ -76,6 +79,24 @@ pub struct OkxHttpTransport {
     origin: String,
     operation_timeout: Duration,
     max_body_bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OkxPlaceOnceOutcome {
+    Acknowledged(Box<OkxAcceptedOrder>),
+    Unknown {
+        readback: Box<OkxUnknownOrderReadbackRequest>,
+        transport_error: Option<OkxTransportError>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OkxCancelOnceOutcome {
+    Acknowledged(Box<OkxAcceptedCancel>),
+    Unknown {
+        readback: Box<OkxUnknownCancelReadbackRequest>,
+        transport_error: Option<OkxTransportError>,
+    },
 }
 
 impl OkxHttpTransport {
@@ -185,6 +206,97 @@ impl OkxHttpTransport {
         .await
     }
 
+    /// Consumes one place request and performs at most one mutation call. Any untrustworthy or
+    /// missing ACK returns only an exact GET readback handle; the submitted request is not returned.
+    pub async fn place_once(
+        &self,
+        credentials: &OkxCredentials,
+        instrument: &OkxInstrument,
+        profile: &OkxAccountProfile,
+        request: OkxPlaceRequest,
+        timestamp: &str,
+    ) -> Result<OkxPlaceOnceOutcome, OkxTransportError> {
+        request
+            .signed_headers(credentials, &self.config, timestamp)
+            .map_err(|_| OkxTransportError::Binding)?;
+        let dispatched_at_ms = received_at_ms()?;
+        let readback = build_unknown_order_readback_request_after(
+            &self.config,
+            instrument,
+            profile,
+            &request,
+            dispatched_at_ms,
+        )
+        .map_err(|_| OkxTransportError::Binding)?;
+        match self.execute(credentials, &request, timestamp).await {
+            Ok(response) => match parse_place_ack(response, &request) {
+                Ok(accepted) => Ok(OkxPlaceOnceOutcome::Acknowledged(Box::new(accepted))),
+                Err(_) => Ok(OkxPlaceOnceOutcome::Unknown {
+                    readback: Box::new(readback),
+                    transport_error: None,
+                }),
+            },
+            Err(error) => Ok(OkxPlaceOnceOutcome::Unknown {
+                readback: Box::new(readback),
+                transport_error: Some(error),
+            }),
+        }
+    }
+
+    /// The reduce path accepts only the canonical exposure-reduction request and consumes it once.
+    pub async fn reduce_once(
+        &self,
+        credentials: &OkxCredentials,
+        instrument: &OkxInstrument,
+        profile: &OkxAccountProfile,
+        request: OkxPlaceRequest,
+        timestamp: &str,
+    ) -> Result<OkxPlaceOnceOutcome, OkxTransportError> {
+        if !request.is_reduce_once() {
+            return Err(OkxTransportError::Binding);
+        }
+        self.place_once(credentials, instrument, profile, request, timestamp)
+            .await
+    }
+
+    /// Consumes one cancel request. UNKNOWN never yields a second cancel surface, only order detail.
+    pub async fn cancel_once(
+        &self,
+        credentials: &OkxCredentials,
+        instrument: &OkxInstrument,
+        profile: &OkxAccountProfile,
+        accepted_order: &OkxAcceptedOrder,
+        request: OkxCancelRequest,
+        timestamp: &str,
+    ) -> Result<OkxCancelOnceOutcome, OkxTransportError> {
+        request
+            .signed_headers(credentials, &self.config, timestamp)
+            .map_err(|_| OkxTransportError::Binding)?;
+        let dispatched_at_ms = received_at_ms()?;
+        let readback = build_unknown_cancel_readback_request(
+            &self.config,
+            instrument,
+            profile,
+            &request,
+            accepted_order,
+            dispatched_at_ms,
+        )
+        .map_err(|_| OkxTransportError::Binding)?;
+        match self.execute(credentials, &request, timestamp).await {
+            Ok(response) => match parse_cancel_ack(response, &request) {
+                Ok(accepted) => Ok(OkxCancelOnceOutcome::Acknowledged(Box::new(accepted))),
+                Err(_) => Ok(OkxCancelOnceOutcome::Unknown {
+                    readback: Box::new(readback),
+                    transport_error: None,
+                }),
+            },
+            Err(error) => Ok(OkxCancelOnceOutcome::Unknown {
+                readback: Box::new(readback),
+                transport_error: Some(error),
+            }),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn execute_bound(
         &self,
@@ -284,6 +396,8 @@ pub struct OkxReceivedPrivateFrame {
     pub binding: GatewayBinding,
     pub instrument_generation: u64,
     pub private_generation: u64,
+    pub connection_id: String,
+    pub subscription_request_id: String,
     pub received_at_ms: u64,
     pub payload: Bytes,
 }
@@ -459,6 +573,8 @@ impl OkxPrivateWsTransport {
                 binding: self.active.scope().gateway_binding().clone(),
                 instrument_generation: self.active.scope().instrument_generation(),
                 private_generation: self.active.scope().private_generation(),
+                connection_id: self.active.connection_id().to_owned(),
+                subscription_request_id: self.active.request_id().to_owned(),
                 received_at_ms: buffered.received_at_ms,
                 payload: buffered.payload,
             });
@@ -958,16 +1074,25 @@ mod tests {
         });
         let transport =
             OkxHttpTransport::with_origin(config, &origin, Duration::from_millis(20), 256)?;
-        assert_eq!(
-            transport
-                .execute(
-                    &OkxCredentials::from_values("key", "secret", "pass")?,
-                    &request,
-                    "2026-08-29T01:02:03.000Z",
-                )
-                .await,
-            Err(OkxTransportError::Timeout)
-        );
+        let outcome = transport
+            .place_once(
+                &OkxCredentials::from_values("key", "secret", "pass")?,
+                &instrument,
+                &profile,
+                request,
+                "2026-08-29T01:02:03.000Z",
+            )
+            .await?;
+        let OkxPlaceOnceOutcome::Unknown {
+            readback,
+            transport_error,
+        } = outcome
+        else {
+            return Err("timeout must stay UNKNOWN".into());
+        };
+        assert_eq!(transport_error, Some(OkxTransportError::Timeout));
+        assert_eq!(readback.method(), "GET");
+        assert!(readback.body().is_empty());
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(accepts.load(Ordering::SeqCst), 1);
         Ok(())

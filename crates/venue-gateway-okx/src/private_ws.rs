@@ -283,6 +283,16 @@ impl OkxActivePrivateSubscription {
     pub const fn account_profile(&self) -> &OkxAccountProfile {
         &self.profile
     }
+
+    #[must_use]
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
+    }
+
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
 }
 
 impl OkxPrivateSubscription {

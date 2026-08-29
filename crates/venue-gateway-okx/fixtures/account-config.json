@@ -5,6 +5,7 @@
     "uid": "fixture-sub-account",
     "mainUid": "fixture-main-account",
     "acctLv": "3",
-    "posMode": "long_short_mode"
+    "posMode": "long_short_mode",
+    "perm": "read_only,trade"
   }]
 }
