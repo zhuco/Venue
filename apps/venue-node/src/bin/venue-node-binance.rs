@@ -60,26 +60,31 @@ fn run() -> Result<(), NodeError> {
 mod candidate_bridge {
     use std::collections::BTreeSet;
 
+    #[cfg(test)]
     use sha2::{Digest, Sha256};
     use venue_domain::domain::{ExecutionCommand, NativeOrderFamily, Symbol};
     use venue_gateway_api::{CapabilityFlags, CapabilitySnapshot, GatewayBinding};
+    #[cfg(test)]
+    use venue_gateway_binance::BINANCE_EXECUTION_PROFILE_VERSION;
     use venue_gateway_binance::{
-        BINANCE_EXECUTION_PROFILE_VERSION, BinanceConfig, BinanceInstrumentRules,
-        BinancePhysicalMutationOutcome, BinancePreparedMutation, BinancePrivateReadbackCandidate,
-        BinanceTransportError, prepare_execution_command, settle_mutation_ack,
+        BinanceConfig, BinanceInstrumentRules, BinancePhysicalMutationOutcome,
+        BinancePreparedMutation, BinancePrivateReadbackCandidate, BinanceTransportError,
+        prepare_execution_command, settle_mutation_ack,
     };
     use venue_node::{
         CommandReadbackKey, DispatchPermit, FamilyReadbackCoverage, GatewayAcknowledgement,
         GatewayDispatchResult, GatewayRecoveryPermit, PhysicalGateway, ReadbackCommandState,
         SignedCommandReadback, SignedReadbackReceipt, SignedReadbackRequest,
     };
+    #[cfg(test)]
     use venue_runtime::account::{
         PhysicalReadbackReceipt, PhysicalReadbackSurface, PhysicalRecoveryManifestError,
-        PhysicalRecoveryReadbackManifest, PhysicalRecoveryScope,
     };
+    use venue_runtime::account::{PhysicalRecoveryReadbackManifest, PhysicalRecoveryScope};
 
     const REGULAR_REJECTED: &str = "binance_adapter_preflight_rejected";
     const VENUE_REJECTED: &str = "binance_http_client_rejected";
+    #[cfg(test)]
     const RECOVERY_SURFACES: [PhysicalReadbackSurface; 6] = [
         PhysicalReadbackSurface::Account,
         PhysicalReadbackSurface::Positions,
@@ -248,18 +253,31 @@ mod candidate_bridge {
             prepare_execution_command(&self.rules, private, command)
                 .map_err(|_| BinanceBridgeError::Command)
         }
+
+        fn physical_recovery_manifest(
+            &self,
+            _scope: &PhysicalRecoveryScope,
+        ) -> Result<PhysicalRecoveryReadbackManifest, BinanceBridgeError> {
+            // BinancePrivateReadScope is caller-constructible and does not bind recovered
+            // configuration or Owner/WAL/Unknown roots. The adapter also returns no exact durable
+            // Owner projection. Until the backend issues an opaque post-recovery collection bound
+            // to both, no raw adapter candidate is admissible as a physical recovery manifest.
+            Err(BinanceBridgeError::PhysicalRecoveryEvidenceUnavailable)
+        }
     }
 
-    fn physical_recovery_manifest(
+    #[cfg(test)]
+    fn fixture_physical_recovery_manifest(
         expected_scope: PhysicalRecoveryScope,
         collection_scope: &PhysicalRecoveryScope,
         private: &BinancePrivateReadbackCandidate,
     ) -> Result<PhysicalRecoveryReadbackManifest, BinanceBridgeError> {
-        let receipts = physical_recovery_receipts(collection_scope, private)?;
+        let receipts = fixture_physical_recovery_receipts(collection_scope, private)?;
         PhysicalRecoveryReadbackManifest::verified(expected_scope, receipts).map_err(Into::into)
     }
 
-    fn physical_recovery_receipts(
+    #[cfg(test)]
+    fn fixture_physical_recovery_receipts(
         scope: &PhysicalRecoveryScope,
         private: &BinancePrivateReadbackCandidate,
     ) -> Result<Vec<PhysicalReadbackReceipt>, BinanceBridgeError> {
@@ -276,6 +294,9 @@ mod candidate_bridge {
             || fills_cursor.last_trade_id.is_some() != fills_cursor.last_event_time_ms.is_some()
         {
             return Err(BinanceBridgeError::ReadbackScope);
+        }
+        if !private.regular().orders.is_empty() || !private.algo().orders.is_empty() {
+            return Err(BinanceBridgeError::OwnerEvidenceUnavailable);
         }
 
         RECOVERY_SURFACES
@@ -307,6 +328,7 @@ mod candidate_bridge {
             .collect()
     }
 
+    #[cfg(test)]
     fn recovery_surface_metric(
         private: &BinancePrivateReadbackCandidate,
         surface: PhysicalReadbackSurface,
@@ -327,6 +349,7 @@ mod candidate_bridge {
         })
     }
 
+    #[cfg(test)]
     fn recovery_surface_digest(
         scope: &PhysicalRecoveryScope,
         private: &BinancePrivateReadbackCandidate,
@@ -356,6 +379,7 @@ mod candidate_bridge {
         digest.finalize().into()
     }
 
+    #[cfg(test)]
     const fn recovery_surface_tag(surface: PhysicalReadbackSurface) -> u8 {
         match surface {
             PhysicalReadbackSurface::Account => 1,
@@ -367,6 +391,7 @@ mod candidate_bridge {
         }
     }
 
+    #[cfg(test)]
     fn recovery_digest_optional_u64(digest: &mut Sha256, value: Option<u64>) {
         match value {
             Some(value) => {
@@ -377,6 +402,7 @@ mod candidate_bridge {
         }
     }
 
+    #[cfg(test)]
     fn recovery_digest_bytes(digest: &mut Sha256, value: &[u8]) {
         digest.update((value.len() as u64).to_be_bytes());
         digest.update(value);
@@ -505,10 +531,13 @@ mod candidate_bridge {
         ReadbackScope,
         #[error("Binance candidate readback has no durable Owner evidence")]
         OwnerEvidenceUnavailable,
+        #[error("Binance adapter cannot issue a scope-bound physical recovery collection")]
+        PhysicalRecoveryEvidenceUnavailable,
         #[error("Binance candidate exact command evidence is incomplete")]
         CommandEvidence,
         #[error("Binance candidate readback was not issued by this bridge")]
         ReadbackSignature,
+        #[cfg(test)]
         #[error("Binance physical recovery manifest is invalid: {0}")]
         PhysicalRecovery(#[from] PhysicalRecoveryManifestError),
         #[error("canonical command is not representable by the closed Binance adapter")]
@@ -550,6 +579,9 @@ mod candidate_bridge {
         );
         const FILLS: &[u8] = include_bytes!(
             "../../../../crates/venue-gateway-binance/fixtures/user-trades-page.json"
+        );
+        const ALGO: &[u8] = include_bytes!(
+            "../../../../crates/venue-gateway-binance/fixtures/open-algo-orders.json"
         );
         const EXACT: &[u8] = include_bytes!(
             "../../../../crates/venue-gateway-binance/fixtures/exact-order-readback.json"
@@ -750,7 +782,7 @@ mod candidate_bridge {
                 17,
             )?;
             let scope = recovery_scope(config.gateway_binding().clone(), 16, [1, 2, 3])?;
-            let manifest = physical_recovery_manifest(scope.clone(), &scope, &readback)?;
+            let manifest = fixture_physical_recovery_manifest(scope.clone(), &scope, &readback)?;
 
             assert_eq!(manifest.attempt_id(), 11);
             assert_eq!(manifest.private_generation(), 17);
@@ -831,17 +863,19 @@ mod candidate_bridge {
                 18,
             )?;
             let scope = recovery_scope(config.gateway_binding().clone(), 16, [1, 2, 3])?;
-            let baseline = physical_recovery_receipts(&scope, &first)?;
+            let baseline = fixture_physical_recovery_receipts(&scope, &first)?;
 
             let mut mixed_attempt = baseline.clone();
-            mixed_attempt[2] = physical_recovery_receipts(&scope, &other_attempt)?[2].clone();
+            mixed_attempt[2] =
+                fixture_physical_recovery_receipts(&scope, &other_attempt)?[2].clone();
             assert_eq!(
                 PhysicalRecoveryReadbackManifest::verified(scope.clone(), mixed_attempt),
                 Err(PhysicalRecoveryManifestError::AttemptDrift)
             );
 
             let mut mixed_generation = baseline;
-            mixed_generation[4] = physical_recovery_receipts(&scope, &other_generation)?[4].clone();
+            mixed_generation[4] =
+                fixture_physical_recovery_receipts(&scope, &other_generation)?[4].clone();
             assert_eq!(
                 PhysicalRecoveryReadbackManifest::verified(scope, mixed_generation),
                 Err(PhysicalRecoveryManifestError::GenerationDrift)
@@ -917,10 +951,44 @@ mod candidate_bridge {
             for drifted_roots in [[9, 2, 3], [1, 9, 3], [1, 2, 9]] {
                 let drifted = recovery_scope(config.gateway_binding().clone(), 16, drifted_roots)?;
                 assert_eq!(
-                    physical_recovery_manifest(expected.clone(), &drifted, &readback),
+                    fixture_physical_recovery_manifest(expected.clone(), &drifted, &readback),
                     Err(BinanceBridgeError::PhysicalRecovery(
                         PhysicalRecoveryManifestError::ScopeDrift
                     ))
+                );
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn raw_adapter_candidate_cannot_construct_or_relabel_production_recovery()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let (config, rules, readback) = fixture_with_evidence(
+                GatewayMode::Test,
+                false,
+                br#"[]"#,
+                br#"[]"#,
+                br#"[]"#,
+                br#"[]"#,
+                11,
+                17,
+            )?;
+            let binding = config.gateway_binding().clone();
+            let original = recovery_scope(binding.clone(), 16, [1, 2, 3])?;
+            let relabelled = PhysicalRecoveryScope::verified(
+                binding,
+                "config_2",
+                8,
+                16,
+                PhysicalRecoveryAuthorityRoots::verified([9; 32], [8; 32], [7; 32])?,
+            )?;
+            let mut bridge = BinancePhysicalGatewayCandidate::new(config, rules, NoBackend)?;
+            bridge.latest_private = Some(readback);
+
+            for caller_scope in [&original, &relabelled] {
+                assert_eq!(
+                    bridge.physical_recovery_manifest(caller_scope),
+                    Err(BinanceBridgeError::PhysicalRecoveryEvidenceUnavailable)
                 );
             }
             Ok(())
@@ -998,25 +1066,56 @@ mod candidate_bridge {
         #[test]
         fn nonempty_native_orders_fail_without_durable_owner_map()
         -> Result<(), Box<dyn std::error::Error>> {
-            let (config, rules, readback) = fixture(GatewayMode::Test, false, true)?;
-            let binding = config.gateway_binding().clone();
-            let mut bridge = BinancePhysicalGatewayCandidate::new(config, rules, NoBackend)?;
-            assert_eq!(
-                bridge.convert_readback(
-                    &binding,
-                    1,
-                    16,
-                    &[],
-                    BinanceCandidateReadback {
-                        connection_generation: 2,
-                        observed_ms: 2_000,
-                        evidence_digest: readback.raw_payload_digest(),
-                        private: readback,
-                        command_results: Vec::new(),
-                    },
-                ),
-                Err(BinanceBridgeError::OwnerEvidenceUnavailable)
-            );
+            let candidates = [
+                fixture_with_evidence(
+                    GatewayMode::Test,
+                    false,
+                    POSITIONS,
+                    include_bytes!(
+                        "../../../../crates/venue-gateway-binance/fixtures/open-orders.json"
+                    ),
+                    br#"[]"#,
+                    FILLS,
+                    11,
+                    17,
+                )?,
+                fixture_with_evidence(
+                    GatewayMode::Test,
+                    false,
+                    POSITIONS,
+                    br#"[]"#,
+                    ALGO,
+                    FILLS,
+                    11,
+                    17,
+                )?,
+            ];
+            for (config, rules, readback) in candidates {
+                let binding = config.gateway_binding().clone();
+                let scope = recovery_scope(binding.clone(), 16, [1, 2, 3])?;
+                assert_eq!(
+                    fixture_physical_recovery_receipts(&scope, &readback),
+                    Err(BinanceBridgeError::OwnerEvidenceUnavailable)
+                );
+
+                let mut bridge = BinancePhysicalGatewayCandidate::new(config, rules, NoBackend)?;
+                assert_eq!(
+                    bridge.convert_readback(
+                        &binding,
+                        1,
+                        16,
+                        &[],
+                        BinanceCandidateReadback {
+                            connection_generation: 2,
+                            observed_ms: 2_000,
+                            evidence_digest: readback.raw_payload_digest(),
+                            private: readback,
+                            command_results: Vec::new(),
+                        },
+                    ),
+                    Err(BinanceBridgeError::OwnerEvidenceUnavailable)
+                );
+            }
             Ok(())
         }
 
