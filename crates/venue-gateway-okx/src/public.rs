@@ -36,7 +36,7 @@ impl OkxInstrument {
     }
 
     pub(crate) fn validate_scope(&self, config: &OkxConfig) -> Result<(), OkxError> {
-        if &self.instrument.symbol != &config.gateway_binding().symbol
+        if self.instrument.symbol != config.gateway_binding().symbol
             || self.instrument.generation == 0
             || self.base_quantity_per_contract <= Decimal::ZERO
         {

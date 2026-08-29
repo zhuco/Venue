@@ -1,4 +1,7 @@
-use std::{cmp::Ordering, str::FromStr};
+use std::{
+    cmp::{Ordering, Reverse},
+    str::FromStr,
+};
 
 use rust_decimal::Decimal;
 use venue_domain::domain::{
@@ -472,8 +475,8 @@ pub fn parse_l2_book_bbo(
         .iter()
         .map(normalize_level)
         .collect::<Result<Vec<_>, _>>()?;
-    bids.sort_by(|left, right| right.price.cmp(&left.price));
-    asks.sort_by(|left, right| left.price.cmp(&right.price));
+    bids.sort_by_key(|level| Reverse(level.price));
+    asks.sort_by_key(|level| level.price);
     bbo(meta, data.time, bids.remove(0), asks.remove(0))
 }
 

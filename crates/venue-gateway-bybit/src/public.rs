@@ -86,7 +86,6 @@ impl BybitRawPublicPayload {
     }
 }
 
-#[must_use]
 pub fn linear_native_symbol(symbol: &Symbol) -> Result<String, BybitPublicError> {
     if symbol.quote() != "USDT" {
         return Err(BybitPublicError::Product);

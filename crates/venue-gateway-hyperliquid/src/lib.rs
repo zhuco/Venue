@@ -280,7 +280,7 @@ mod tests {
         )?;
         assert!(second.complete);
         assert_eq!(second.fills.len(), 1);
-        assert_eq!(second.fills[0].fill.fill_id.ends_with(":BTC:6002"), true);
+        assert!(second.fills[0].fill.fill_id.ends_with(":BTC:6002"));
         Ok(())
     }
 
