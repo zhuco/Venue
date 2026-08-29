@@ -54,11 +54,9 @@ VenueFlow Desktop / optional Agent
               Exchange
 ```
 
-`venue-control` 可以规划和持久化跟单目标，但不能直接提交订单。Control 到节点的权威传输使用 PostgreSQL durable
-command outbox/inbox；LISTEN/NOTIFY、SSE、WebSocket 或 HTTP 只能唤醒，不能代替耐久记录。每条命令具有确定性 ID，
-绑定 account、instance、symbol、config epoch、capability epoch 和 payload digest。节点必须先把命令持久化到本地 Actor
-inbox，再确认数据库 delivery；重复投递只返回同一 applied/拒绝回执。节点回执写入独立 receipt outbox，Control 只能在
-消费持久回执后推进 copy ledger。账户节点仍须重新执行风险、Owner、WAL、writer 和私有事实校验。
+`venue-control` 当前是 transport-neutral 控制核心：校验 schema v2 scope，并以 PostgreSQL durable inbox/outbox、幂等 claim
+和终态 receipt 保存命令；它不能规划交易或直接提交订单。HTTP/SSE server 与账户节点 adapter 尚未实现。未来的唤醒通道不能
+代替耐久记录；节点仍须先持久化本地 Actor inbox，再独立重验 risk、Owner、WAL、writer 和私有事实。
 
 ## 4. 目标 workspace
 
@@ -80,7 +78,7 @@ crates/
 ├─ venue-gateway-hyperliquid/
 ├─ venue-gateway-okx/
 ├─ venue-strategies/
-│  └─ src/{grid,scalping}/
+│  └─ src/{hedged_grid,scalping}/
 ├─ venue-copy/
 ├─ venue-execution/
 ├─ venue-storage/
@@ -99,13 +97,15 @@ crates/
 ```text
 venue-indicators -> venue-domain
 venue-gateway-api -> venue-domain
-venue-gateway-* -> venue-gateway-api
+venue-gateway-* -> venue-domain + venue-gateway-api
 venue-strategies -> venue-domain
 venue-copy -> venue-domain
+venue-storage -> venue-domain
+venue-control-protocol -> venue-domain + venue-gateway-api
 venue-execution -> venue-domain + venue-storage + venue-gateway-api
 venue-runtime -> venue-execution + venue-strategies + venue-copy
 venue-node-<venue> -> venue-runtime + exactly one venue-gateway-*
-venue-control -> venue-copy + venue-storage + venue-control-protocol
+venue-control -> venue-control-protocol + sqlx
 venueflow / optional Agent -> venue-control-protocol
 ```
 
@@ -200,9 +200,9 @@ Copy planner/job-consumer lease 只允许竞争数据库 job 的规划或投递�
 | Binance | `venue-gateway-binance` | 已迁入 Portfolio Margin binding、TEST/LIVE 端点、secrecy 凭证、PAPI HMAC、exchangeInfo instrument rules、公共 BBO/深度/成交/闭合 bar raw envelope、账户/仓位/订单/成交/风险纯协议和七日有界成交分页；根签名 readback、transport 与 Stage 7 capability/WAL/writer 仍是生产权威 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
 | Bitget | `venue-gateway-bitget` | 已迁入 UTA TEST Demo/LIVE、凭证与 REST/WS 签名、公共市场、带时效 instrument metadata、账户/设置/持仓/normal 订单/成交同 attempt 五面候选与 raw 重放；不从官方未提供的字段猜 contract value；签名 transport/WS 与 Stage 7 capability/WAL/writer 仍留根 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
 | Gate.io | `venue-gateway-gate` | 已迁入 USDT perpetual TEST/LIVE、凭证/REST/WS 签名、公共市场、账户/持仓/风险、regular 订单/成交闭合分页；Stage 7 profile 候选重放 regular raw pages，并只把 Conditional/Algo 表示为显式 unsupported；签名采集 transport 与 Stage 7 capability/WAL/writer 仍留根 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
-| Bybit | `venue-gateway-bybit` | 已迁入 binding/端点/凭证/HMAC、USDT linear instrument/BBO 与 `cts/u/seq`，以及同 binding 的 UTA2 identity、UNIFIED 余额、linear positionIdx、挂单/历史/成交和显式分页闭合；纯 execution 可构造 place/cancel/reduce、校验 ACK 并要求显式闭合读回；transport/private stream/writer/WAL/capability 为空 | `TEST | LIVE`；完成最小安全闭环前仅纯协议/fixture，不得小额实盘 |
-| OKX | `venue-gateway-okx` | 已迁入 binding、模拟盘请求头、凭证/HMAC、linear SWAP instrument/BBO、账户模式/余额/仓位/挂单/成交与 after 分页；canonical limit/market/reduce 可编码 place/cancel 并解析 ack/签名详情回读，private WS 可校验 login 及 orders/account/positions 增量；tdMode 只接受 Cross/Isolated、Net 意图拒绝，transport/writer/WAL/capability 为空 | `TEST | LIVE`；完成最小安全闭环前仅纯协议/fixture，不得小额实盘 |
-| Hyperliquid | `venue-gateway-hyperliquid` | 已迁入 user/symbol/mode binding、端点、命名 Agent secret、持久 nonce、meta/L2/BBO、clearinghouse/open orders/WS fills、inclusive fill cursor、绑定型 `/info` 与 `orderStatus` 恢复查询，以及 `orderUpdates`、`userFills`、`userEvents` 的私流 generation 栅栏；`tid` 明确不是 sequence；EIP-712 action signing、transport/writer/WAL/capability 为空 | `TEST | LIVE`；完成最小安全闭环前仅纯协议/fixture，不得小额实盘 |
+| Bybit | `venue-gateway-bybit` | 公共/私有协议与 place/cancel/reduce、ACK、闭合读回已绑定；async HTTP/私有 WS 禁 redirect，并具超时/2 MiB 级限额、分配前 WS 限额、ACK 前有界缓存、received-at、应用层心跳与 generation；writer/WAL/capability 为空 | `TEST | LIVE`；只有 transport，不得小额实盘 mutation |
+| OKX | `venue-gateway-okx` | linear SWAP 公私协议、execution 与 orders/account/positions 私流已绑定；async HTTP/私有 WS 具同样的 redirect、超时、限长、缓存、心跳和 generation 边界；tdMode 只接受 Cross/Isolated、Net 意图拒绝，writer/WAL/capability 为空 | `TEST | LIVE`；只有 transport，不得小额实盘 mutation |
+| Hyperliquid | `venue-gateway-hyperliquid` | `/info`、恢复查询与 orderUpdates/userFills/userEvents 已绑定；async HTTP/双私有 WS 具限时限长、ACK 前缓存、received-at、心跳、generation 与跨频道 fill 去重；`tid` 不是 sequence；EIP-712 action signing、writer/WAL/capability 为空 | `TEST | LIVE`；无 action signing，不能 mutation |
 
 KOL 网关只是协议 fixture 和差异对照来源，不继承其运行开关或实盘准入状态。前三所的生产权威继续来自 Venue 已验收实现。
 
@@ -231,13 +231,13 @@ KOL 网关只是协议 fixture 和差异对照来源，不继承其运行开关�
 
 ## 9. 指标
 
-VenuePulse 迁入单一 `venue-indicators` crate，并按五个模块组织：
+VenuePulse 当前迁入单一 `venue-indicators` crate，并按实际职责组织：
 
 ```text
-core / series / ta / orderflow / registry
+feature_frame / public_book / public_market_source / scalping_features
 ```
 
-迁移增量 `update/reset/warmup` 契约及算法测试；通过适配器消费 `venue-domain` 的 Bar、Trade、OrderBook，禁止复制权威
+crate 通过窄 `PublicBook` 适配器消费 `venue-domain` 的 Bar、Trade 与盘口，禁止复制权威
 行情类型。规范 closed `PublicBar` 显式保留 base/quote volume、trade count 与 taker-buy base/quote volume 的 Known/Unavailable
 状态；Missing、Null、NotApplicable、负量、taker 超总量或可证明的 quote/price 边界矛盾均失败关闭。现有 feature builder 已真实消费
 bar base volume，并继续绑定 generation/provenance。指标内部允许使用 `f64`，但任何价格、数量或风险 mutation 必须回到 Decimal 领域类型并重新校验。
@@ -251,7 +251,7 @@ bar base volume，并继续绑定 generation/provenance。指标内部允许使�
 当前第一版 `apps/venueflow` 已用同一套 eframe/egui_tiles/WGPU 视图提供原生窗口与 WebAssembly canvas；native client 使用
 Tokio/reqwest/SSE，Web client 使用 reqwest/EventSource。`venue-control-protocol` schema v2 固定 `/v2/ui/snapshot`、
 `/v2/ui/events` 和 `/v2/control/commands` 的 DTO、递归校验、receipt 与错误边界。策略和命令都显式携带 `TEST | LIVE`，两端只显示查询投影并提交语义控制请求；Stop/Flatten
-必须携带精确 mode、account、symbol、instance、config epoch、action 与人工确认，服务端仍须重新验证。当前没有 Control server、数据库投影或交易执行连接。
+必须携带精确 mode、account、symbol、instance、config epoch、action 与人工确认。`apps/venue-control` 已提供 schema scope 重验、repository 边界与 PostgreSQL durable inbox/outbox 核心；当前没有 HTTP/SSE server、账户节点 adapter 或交易执行连接。
 
 迁移范围：
 
@@ -302,7 +302,7 @@ PostgreSQL 不得成为已发物理订单的第二权威 writer。Copy ledger �
 | 语言 | Rust 2024；工具链和 workspace `rust-version` 精确锁定 Rust 1.98.0 |
 | 交易 Actor | 顺序状态机、专用 OS thread 或受控 executor、有界 mailbox |
 | 异步 I/O | Tokio；不授予执行顺序或 mutation authority |
-| HTTP/控制 | Axum、Serde JSON、SSE/WebSocket |
+| HTTP/控制 | 当前仅 schema v2 服务核心与 PostgreSQL repository；HTTP/SSE server 尚未选定或实现 |
 | 交易 HTTP/WS | reqwest、tokio-tungstenite 或经等价验收的现有阻塞 transport |
 | 数值 | rust_decimal 处理交易金额；指标内部可用 f64 |
 | 数据库 | PostgreSQL、SQLx、显式 migrations |

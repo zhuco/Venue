@@ -142,7 +142,8 @@ fn reconstructed_replenishment_round_cannot_reuse_old_market_identity()
     let temporary = tempfile::tempdir()?;
     let mut journal = CommandJournal::open(temporary.path().join("commands.jsonl"))?;
     first.prepare(&mut journal)?;
-    let mut reconstructed = HedgedGridState::new(binding.clone())?;
+    let mut reconstructed =
+        HedgedGridState::new_with_params(binding.clone(), HedgedGridParams::phase_one(10)?)?;
     let _ = reconstructed.observe_inventory(second_inventory.clone())?;
     reconstructed
         .reconcile_replenishment_round(highest_durable_replenishment_round(&journal, &binding)?)?;
@@ -196,7 +197,8 @@ fn malformed_owned_replenishment_identity_fails_closed() -> Result<(), Box<dyn s
 #[test]
 fn recovered_inventory_skips_stale_replenishment_reason() -> Result<(), Box<dyn std::error::Error>>
 {
-    let mut state = HedgedGridState::new(phase_one_binding()?)?;
+    let mut state =
+        HedgedGridState::new_with_params(phase_one_binding()?, HedgedGridParams::phase_one(10)?)?;
     let inventory = GridInventory {
         private_generation: 2,
         private_observed_at_ms: 200,
@@ -248,7 +250,8 @@ fn one_private_batch_reserves_both_mirrored_fills_before_dispatch()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
     let store = ProjectionStore::new(temporary.path().join("grid.json"));
-    let mut state = HedgedGridState::new(phase_one_binding()?)?;
+    let mut state =
+        HedgedGridState::new_with_params(phase_one_binding()?, HedgedGridParams::phase_one(10)?)?;
     let inventory = GridInventory {
         private_generation: 1,
         private_observed_at_ms: 100,
@@ -410,7 +413,8 @@ fn reduce_only_order_keeps_its_inventory_bounded_quantity() -> Result<(), Box<dy
 #[test]
 fn adjacent_stream_fill_reserves_before_the_first_transaction_settles()
 -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = HedgedGridState::new(phase_one_binding()?)?;
+    let mut state =
+        HedgedGridState::new_with_params(phase_one_binding()?, HedgedGridParams::phase_one(10)?)?;
     let _ = state.observe_inventory(GridInventory {
         private_generation: 1,
         private_observed_at_ms: 100,
@@ -471,7 +475,8 @@ fn adjacent_stream_fill_reserves_before_the_first_transaction_settles()
 #[test]
 fn rolling_reduce_order_uses_uncommitted_inventory_quantity()
 -> Result<(), Box<dyn std::error::Error>> {
-    let mut state = HedgedGridState::new(phase_one_binding()?)?;
+    let mut state =
+        HedgedGridState::new_with_params(phase_one_binding()?, HedgedGridParams::phase_one(10)?)?;
     let initial = GridInventory {
         private_generation: 1,
         private_observed_at_ms: 100,

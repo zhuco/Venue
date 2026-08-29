@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "apps/venue-control",
     "apps/venueflow",
     "crates/venue-copy",
     "crates/venue-control-protocol",
@@ -12,6 +13,9 @@ members = [
     "crates/venue-gateway-gate",
     "crates/venue-gateway-hyperliquid",
     "crates/venue-gateway-okx",
+    "crates/venue-indicators",
+    "crates/venue-storage",
+    "crates/venue-strategies",
 ]
 resolver = "3"
 
@@ -32,6 +36,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "json"] }
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "macros", "sync"] }
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
@@ -98,9 +103,12 @@ venue-gateway-api = { path = "crates/venue-gateway-api" }
 venue-gateway-binance = { path = "crates/venue-gateway-binance" }
 venue-gateway-bitget = { path = "crates/venue-gateway-bitget" }
 venue-gateway-gate = { path = "crates/venue-gateway-gate" }
+venue-indicators = { path = "crates/venue-indicators" }
+venue-storage = { path = "crates/venue-storage" }
+venue-strategies = { path = "crates/venue-strategies" }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

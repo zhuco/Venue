@@ -5,9 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use venue_domain::{Price, Symbol};
 
-pub const BOOK_SOURCE: &str = "book";
-pub const TRADES_SOURCE: &str = "trades";
-pub const BARS_SOURCE: &str = "bars";
+pub use venue_domain::domain::{BARS_SOURCE, BOOK_SOURCE, TRADES_SOURCE};
 pub const FEATURE_PROFILE_KEY: &str = "_feature_profile";
 pub const FEATURE_PROFILE_DIGEST_KEY: &str = "_feature_profile_digest";
 pub const BREAKOUT_OPPORTUNITY_VERSION_KEY: &str = "_breakout_opportunity";

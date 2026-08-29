@@ -415,6 +415,8 @@ pub struct GridTransaction {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+// Runtime and persisted fixtures share this stable value-owned action shape; dispatch is infrequent.
+#[allow(clippy::large_enum_variant)]
 pub enum GridAction {
     /// Runtime freezes opening and settles/cancels only owned orders before calling
     /// `begin_replenishment`; it must not cancel external orders.

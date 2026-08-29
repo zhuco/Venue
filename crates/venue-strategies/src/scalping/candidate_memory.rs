@@ -29,19 +29,19 @@ pub struct CandidateMemoryState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CandidateMemoryRejection {
+pub enum CandidateMemoryRejection {
     Duplicate,
     Capacity,
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct CandidateMemory {
+pub struct CandidateMemory {
     candidates: BTreeMap<String, SeenCandidate>,
     breakout_cursor: Option<BreakoutCursor>,
 }
 
 impl CandidateMemory {
-    pub(crate) fn check_and_record(
+    pub fn check_and_record(
         &mut self,
         candidate: &SemanticIntent,
         watermark_ms: u64,
@@ -77,17 +77,14 @@ impl CandidateMemory {
         Ok(())
     }
 
-    pub(crate) fn export_state(&self) -> CandidateMemoryState {
+    pub fn export_state(&self) -> CandidateMemoryState {
         CandidateMemoryState {
             candidates: self.candidates.values().cloned().collect(),
             breakout_cursor: self.breakout_cursor.clone(),
         }
     }
 
-    pub(crate) fn restore_state(
-        &mut self,
-        state: CandidateMemoryState,
-    ) -> Result<(), ScalpingError> {
+    pub fn restore_state(&mut self, state: CandidateMemoryState) -> Result<(), ScalpingError> {
         if state.candidates.len() > MAX_TRACKED_CANDIDATES
             || state.candidates.iter().any(|seen| {
                 seen.candidate_id.trim().is_empty()

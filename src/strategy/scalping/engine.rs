@@ -17,11 +17,8 @@ use crate::{
     },
 };
 
-use super::{
-    candidate_memory::{CandidateMemory, CandidateMemoryRejection},
-    evidence::robust_value,
-    risk::RiskLedger,
-};
+use super::evidence::robust_value;
+use venue_strategies::scalping::{CandidateMemory, CandidateMemoryRejection, RiskLedger};
 
 /// The first migrated strategy is intentionally a synchronous pure state machine. It may produce
 /// a semantic intent in Shadow, but it has no execution, network, journal, or permit dependency.
@@ -186,7 +183,11 @@ impl ScalpingStrategy {
         if frame.symbol != self.binding.symbol {
             return Err(ScalpingError::Symbol);
         }
-        frame.validate(&self.params.required_sources, self.params.max_data_age_ms)?;
+        frame
+            .validate(&self.params.required_sources, self.params.max_data_age_ms)
+            .map_err(|error| ScalpingError::Feature {
+                detail: error.to_string(),
+            })?;
         if frame
             .feature_versions
             .get("_feature_profile")
@@ -482,7 +483,11 @@ impl ScalpingStrategy {
         if frame.symbol != self.binding.symbol {
             return Err(ScalpingError::Symbol);
         }
-        frame.validate(&self.params.required_sources, self.params.max_data_age_ms)?;
+        frame
+            .validate(&self.params.required_sources, self.params.max_data_age_ms)
+            .map_err(|error| ScalpingError::Feature {
+                detail: error.to_string(),
+            })?;
         if frame
             .feature_versions
             .get("_feature_profile")
@@ -678,7 +683,11 @@ impl ScalpingStrategy {
         if frame.symbol != self.binding.symbol {
             return Err(ScalpingError::Symbol);
         }
-        frame.validate(&self.params.required_sources, self.params.max_data_age_ms)?;
+        frame
+            .validate(&self.params.required_sources, self.params.max_data_age_ms)
+            .map_err(|error| ScalpingError::Feature {
+                detail: error.to_string(),
+            })?;
         if frame
             .feature_versions
             .get("_feature_profile")

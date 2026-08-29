@@ -10,25 +10,26 @@
 
 | 功能 | 首要入口 | 直接继续 |
 |---|---|---|
-| 构建、依赖与仓库体积门禁 | `Cargo.toml` | workspace 当前包含根 package、`venue-copy`、`venue-control-protocol`、`venue-domain`、六个 `venue-gateway-*` adapter 与 `apps/venueflow`，resolver 固定为 3；只在真实代码迁移时增加成员；workspace 与 `rust-toolchain.toml` 共同锁定 Rust 1.98.0；`Cargo.lock`；`scripts/verify_repository_hygiene.ps1` 拒绝跟踪运行态/构建/发布/secret 文件、单文件超过 2 MiB 或工作树总量超过 10 MiB |
+| 构建、依赖与仓库体积门禁 | `Cargo.toml` | workspace 当前包含根 package、`venue-copy`、`venue-control-protocol`、`venue-domain`、`venue-indicators`、`venue-storage`、`venue-strategies`、`venue-gateway-api`、六个 `venue-gateway-*` adapter、`apps/venue-control` 与 `apps/venueflow`，resolver 固定为 3；workspace 与 `rust-toolchain.toml` 共同锁定 Rust 1.98.0；`Cargo.lock`；`scripts/verify_repository_hygiene.ps1` 执行体积和运行态文件门禁 |
 | 六所网关身份、模式与能力门禁 | `crates/venue-gateway-api/src/lib.rs` | 规范 venue 固定 Binance、Bitget、Bybit、Gate.io、Hyperliquid、OKX；运行模式只接受精确 `TEST`、`LIVE`；`GatewayBinding` 固定规范账户 UUID 与 symbol，版本化 capability 必须 scope 精确、未过期、具备完整读取/私流/交易及具体 mutation 且无提现权限；未接 adapter 的 venue 在账户能力证据中保持空集、失败关闭 |
 | Binance Portfolio Margin adapter | `crates/venue-gateway-binance/src/lib.rs` | `binding.rs` 固定 Portfolio Margin UM 身份；`config.rs`、`credentials.rs`、`sign.rs` 只从精确 TEST/LIVE binding 派生端点与 PAPI 签名；`instrument.rs` 严格解析 exchangeInfo 双向 symbol/rules；`public.rs` 保留 BBO/深度/成交/闭合 bar 的原始证据、事件时间、base/quote volume、trade count 与 taker-buy volume；`private.rs`、`portfolio.rs`、`fill_pagination.rs` 负责账户/仓位/订单/成交/风险和七日有界分页；根路径现有签名 readback、transport、Stage 7 capability/WAL/writer 仍是生产权威 |
 | Bitget adapter | `crates/venue-gateway-bitget/src/lib.rs` | `config.rs` 固定 UTA v3 TEST Demo/LIVE，凭证与 REST/WS 签名使用 `secrecy`；`instrument.rs` 以 UTA payload 构造带时效 `InstrumentSnapshot`，不猜 contract value；`public.rs` 负责公共市场；`private.rs` 把账户、设置、持仓、normal 订单与成交绑定为同 attempt 五面候选并重放 raw hash；`account.rs`、`risk.rs` 保持账户/腿规范化；签名 transport/WS、Stage 7 capability/WAL/writer 仍留根 |
 | Gate.io adapter | `crates/venue-gateway-gate/src/lib.rs` | `config.rs`、`credentials.rs`、`sign.rs` 固定 TEST/LIVE USDT futures；`public.rs`、`private.rs`、`risk.rs` 负责市场、账户、持仓与合约规则；`orders.rs` 严格规范化 regular 订单/成交与闭合分页；`order_families.rs` 重放 regular raw pages，并只以 profile v1 显式声明 Conditional/Algo unsupported；transport、签名采集、Stage 7 capability/WAL/writer 仍留根 |
-| Bybit V5 adapter | `crates/venue-gateway-bybit/src/lib.rs` | binding、端点、凭证与 HMAC 均绑定账户/symbol/mode；`public.rs` 解析 USDT linear instrument、BBO 与 `cts/u/seq`；`private.rs` 原子校验 UTA2 identity、UNIFIED 余额、linear `positionIdx`、挂单/历史/成交和显式分页闭合；`execution.rs` 构造 place/cancel/reduce 请求、校验 ACK，并要求显式闭合的订单读回；仍无 transport/private stream/writer/WAL/capability |
-| OKX V5 adapter | `crates/venue-gateway-okx/src/lib.rs` | binding、模拟盘请求头、凭证与 REST 签名均固定；`public.rs` 解析 linear SWAP instrument/BBO，`private.rs` 规范化账户模式、余额、仓位、挂单与成交；`execution.rs` 把 canonical limit/market/reduce 变成 place/cancel 请求并用签名详情回读结算，`private_ws.rs` 严格解析 login、orders/account/positions 三频道增量；`tdMode` 只接受 Cross/Isolated 且暂拒绝 Net 意图，仍无 transport/writer/WAL/capability |
-| Hyperliquid adapter | `crates/venue-gateway-hyperliquid/src/lib.rs` | binding 固定 user/symbol/mode，配置、命名 Agent secret 与持久 nonce 均隔离；`protocol.rs` 提供绑定型 `/info` 请求、meta/L2/BBO、clearinghouse/open orders/WS fills、inclusive fill cursor 与 `orderStatus` 恢复查询；`private_stream.rs` 严格解析 `orderUpdates`、`userFills`、`userEvents` 并按连接代失败关闭，明确 `tid` 不是 sequence；EIP-712 action signing、transport、writer/WAL/capability 仍为空 |
+| Bybit V5 adapter | `crates/venue-gateway-bybit/src/lib.rs` | 公共/私有协议与 execution 保持分页、ACK 和闭合读回边界；`transport.rs` 提供绑定型 async HTTP/私有 WS、限时限长、ACK 前有界缓存、received-at、应用层心跳与 generation；仍无 writer/WAL/capability |
+| OKX V5 adapter | `crates/venue-gateway-okx/src/lib.rs` | linear SWAP 公私协议和 execution 读回均绑定账户/symbol/mode；`private_ws.rs` 解析 login、orders/account/positions，`transport.rs` 提供限时限长的 async HTTP/私有 WS、ACK 前有界缓存、received-at、心跳与 generation；`tdMode` 只接受 Cross/Isolated，仍无 writer/WAL/capability |
+| Hyperliquid adapter | `crates/venue-gateway-hyperliquid/src/lib.rs` | `protocol.rs` 与 `private_stream.rs` 提供绑定型 `/info`、恢复查询和私流 generation；`transport.rs` 提供限时限长的 async HTTP/双私有 WS、ACK 前有界缓存、received-at、心跳、generation 与跨频道 fill 去重；`tid` 不是 sequence；EIP-712 action signing、writer/WAL/capability 仍为空 |
 | CLI 定义与命令分派 | `src/cli.rs` | `src/app.rs`、`src/main.rs` |
 | 多策略账户运行时内核 | `src/runtime/account/mod.rs` | `src/domain/runtime_identity.rs` 固定账户/实例、订单族能力及 opaque turn authority；`registry.rs` 强制 symbol 独占/config epoch/残仓 custody；`private_router.rs` 按 family + 双 ID 路由且整批成功后才推进 cursor；`market_hub.rs` 做 symbol generation 栅栏；`reconciler.rs` 校验三订单族、Net/Hedge 完整持仓腿及订单全语义；`recovery.rs` 用规范 manifest 绑定 lifecycle/fence/连接代/Actor inbox/WAL/Owner 和 journal root/tail；`runtime.rs` 原子组合；当前无网络、writer 和物理 mutation |
 | 策略 Actor 宿主与邮箱 | `src/runtime/strategy/mod.rs` | 私有事实与 Delta/Trade/Bar 有界无损；仅 Snapshot/Ticker/MarkFunding 合并；私有 burst 64 后让行对账/控制；一个实例一个 runtime-issued turn，durable applied receipt 后才可 Running/输出授权意图 |
 | 跟单纯规划内核 | `crates/venue-copy/src/lib.rs` | `capital.rs` 冻结资本并计算目标敞口，跨零反向必须分两轮；`identity.rs` 固化 job/snapshot/child/idempotency 身份；`sizing.rs` 与 `limit.rs` 完成数量和跨所 LIMIT 规范化；`delivery.rs` 绑定 immutable manifest 与 Applied/Unknown/Reconciled/Rejected 持久回执，Unknown 禁止重投；`ledger.rs` 幂等投影 Copy/External/Manual 归因；`drift.rs` 只从新鲜权威持仓生成新 job 的语义修复；全 crate 无 storage/network/runtime/writer/mutation authority |
 | 版本化 Control 协议 | `crates/venue-control-protocol/src/lib.rs` | schema v2 DTO 固定 snapshot、event、command、receipt 与递归校验；HTTP 路径为 `/v2/ui/snapshot`、`/v2/ui/events`、`/v2/control/commands`；策略与命令显式携带 `TEST | LIVE`，Stop/Flatten 人工确认精确绑定 mode/account/symbol/instance/config epoch；不含 handler、数据库、凭证、WAL 或交易客户端 |
+| Control 服务核心 | `apps/venue-control/src/lib.rs` | transport-neutral `ControlService` 重新校验 schema v2 scope；`repository.rs` 定义幂等 inbox/outbox/claim/settle 边界，`postgres.rs` 与 `migrations/0001_control_core.sql` 用 SQLx/PostgreSQL 提供 durable 实现；当前没有 HTTP/SSE server、账户节点 adapter、交易客户端、writer/WAL 或 mutation authority |
 | VenueFlow 原生/Web 客户端 | `apps/venueflow/src/main.rs` | `src/lib.rs` 是 WASM canvas 入口；`app.rs`、`client.rs`、`model.rs`、`workspace.rs` 共用 eframe/egui_tiles/WGPU UI 与 Control v2 DTO；native 用 Tokio/reqwest/SSE，Web 用 reqwest/EventSource；两端只访问版本化 Control API 并保留命令的精确 mode，不直连交易所、数据库或 artifacts |
 | 账户 Execution Lane 调度 | `src/execution/account_lane.rs` | Applied turn + journal identity receipt 绑定 connection/private/config/turn、命令摘要、native ID/family；创建先保留 Owner 路由，Cancel 精确核对 owner/family；有界公平队列、实例 Unknown fence；候选、WAL-prepared、一次性 dispatch permit 分态，WAL 后 fence 必须持久收敛；outcome/abort/readback 只收精确持久收据；不持有 writer/WAL/client，Stage 7 实盘 mutation 路径不变 |
 | Hedged Grid 固定部署组合 | `src/deployment.rs` | `src/bin/hedged-grid-{binance,gate,bitget}.rs`；Cargo `hedged-grid-*` feature 固定组合，只允许只读 doctor/Grid 生命周期命令，且配置交易所必须匹配；Binance 组合另允许强锚定、零交易所 mutation 的 private/public evidence 恢复命令，Gate/Bitget 明确拒绝 |
 | 配置、交易所选择、账户身份、网格层数 | `src/config.rs` | `venue.toml`、`venue.grid.toml`、`venue.gate.example.toml`、`venue.bitget.example.toml`；`trading_account_id` 必须是稳定规范 UUID，同一真实账户跨 symbol 复用；`account_binding` 只表示交易所产品/模式能力 |
 | 凭证环境读取 | `src/credential_env.rs` | 根 `.env` 仅作本地输入，禁止读取到文档/日志 |
-| 规范交易账户、Instrument、交易对、金额、订单、仓位、成交 | `crates/venue-domain/src/domain/mod.rs` | `identity.rs` 唯一定义规范账户 UUID；`instrument.rs` 唯一定义稳定 `InstrumentIdentity`、Precision、ContractSpec、metadata 与半开时效 snapshot，并提供 base/quote contract 安全换算；`market.rs::PublicBar` 对闭合 OHLC、base/quote volume、trade count 与 taker-buy volume 保留 Known/Unavailable 语义并校验可证明关系；根 `src/domain/mod.rs` 保持既有 facade 与 crate-private runtime authority，禁止为迁移公开 turn 构造器 |
+| 规范交易账户、Instrument、交易对、金额、订单、仓位、成交 | `crates/venue-domain/src/domain/mod.rs` | `identity.rs` 唯一定义规范账户 UUID；`instrument.rs` 唯一定义 Instrument 与换算；`market.rs::PublicBar` 保留闭合行情 Known/Unavailable 语义；`risk_value.rs` 为策略风险事实到耐久存储提供无反向依赖的规范值接口；根 `src/domain/mod.rs` 保持既有 facade 与 crate-private runtime authority |
 | 日志初始化 | `src/log.rs` | 日志级别在 `src/config.rs` |
 | 错误汇总 | `src/error.rs` | 各领域本地错误枚举 |
 
@@ -36,9 +37,9 @@
 
 | 功能 | 首要入口 | 直接继续 |
 |---|---|---|
-| 网格参数、epoch、订单意图模型 | `src/strategy/hedged_grid/model.rs` | `src/strategy/hedged_grid/mod.rs` |
-| 网格纯状态机、库存、desired ladder、maker fill/滚动 | `src/strategy/hedged_grid/reducer.rs` | `model.rs` 持久化 fill anchor 与 passive-book fallback 穿价证明；只有 maker 成交驱动，taker 只更新库存与对账 |
-| 高暴露浮盈市价减仓 | `src/strategy/hedged_grid/exposure_guard.rs` | `src/domain/risk_snapshot.rs`、`src/runtime/hedged_grid/{risk_snapshot,shadow_evidence}.rs`、`src/runtime/grid/stage7_exposure.rs`、`src/risk.rs`、`src/execution/journal.rs`；触发前不撤现有网格；成功收据使用 hash-chain 与 head-first 崩溃恢复，Stop 后切换风险发布时可用完整收据安全退休已成交 pending；`exposure_shadow_evidence.jsonl`/`.1`、`exposure_take_profit.jsonl` 与 `exposure_take_profit.head.json` 均为受保护工件 |
+| 网格参数、epoch、订单意图模型 | `crates/venue-strategies/src/hedged_grid/model.rs` | 根 `src/strategy/hedged_grid/mod.rs` 仅兼容重导出 |
+| 网格纯状态机、库存、desired ladder、maker fill/滚动 | `crates/venue-strategies/src/hedged_grid/reducer.rs` | `model.rs` 持久化 fill anchor 与 passive-book fallback 穿价证明；只有 maker 成交驱动，taker 只更新库存与对账 |
+| 高暴露浮盈市价减仓 | `crates/venue-strategies/src/hedged_grid/exposure_guard.rs` | `crates/venue-domain/src/domain/risk_snapshot.rs`、`src/runtime/hedged_grid/{risk_snapshot,shadow_evidence}.rs`、`src/runtime/grid/stage7_exposure.rs`；策略 crate 只产出语义结果，持久化和 mutation 仍由根 runtime 承担 |
 | 风险 Shadow 只读验收 | `src/runtime/grid/stage7_exposure_shadow_verifier.rs` | `src/bin/verify-grid-exposure-shadow.rs`；要求 risk-bound admission，逐条交叉核对同 root 原始引用，再按三所固定 raw tuple 语义重放并精确比较 account/目标 leg；全程无凭证、网络和写入，且不等于风险 Live 准入 |
 | Binance 旧运行时兼容与当前共享实盘 | `src/runtime/legacy/hedged_grid_live.rs` | 旧 checkpoint/stop 兼容隔离在 `src/runtime/legacy/{hedged_grid_hot_path,hedged_grid_recovery,hedged_grid_support}.rs`，共用私有事实入口为 `src/runtime/shared/private_facts_worker.rs`；签名缺单与终态成交确认位于 legacy 的 `hedged_grid_fill_readback.rs`；当前实盘入口是共享 `run_binance_stage7_grid`，仍受 admission/handoff 门禁约束 |
 | 三家共享 Stage 7 runtime | `src/runtime/grid/stage7_grid.rs` | `src/runtime/grid/{stage7_grid_binding,stage7_resident,stage7_fill_drive,stage7_exposure,stage7_risk_lane,stage7_readback,stage7_grid_model,stage7_grid_error,stage7_mutation,stage7_retry}.rs`；新空根在取得唯一 root guard 后一次性持久化 Running，已有 checkpoint 缺失 control 时按 Stop 失败关闭，Stopping 只接受显式 Reset；所有 Shadow/Live/Canary/Stop/Flatten/交接均要求三订单族签名覆盖，且 regular 投影必须与该族快照完全一致；完整 owned maker fill 经私有证据、reducer 与最小 checkpoint 后直接进入滚动 WAL/唯一 writer，不读 BBO、公共流、风险或逐单 REST；三所 exchange-native post-only 是穿价竞态的物理栅栏，明确拒绝只按精确 WAL 结果转签名对账，禁止改价、吃单或自动重试旧命令；周期风险首轮采集由单 in-flight request-only lane 执行，不持有 writer/WAL/mutation，过时代结果不入证据；初装/整网重建仍在 closing 签名确认后再次排空并重采 BBO，opening 必须全量 post-only；缺失、矛盾或非托管条件/Algo 行一律失败关闭 |
@@ -76,23 +77,23 @@
 | 执行门禁与物理归一化 | `src/execution/gate.rs` | `src/execution/engine.rs`、`src/risk.rs` |
 | 私有事实、对账和恢复 | `src/execution/reconcile.rs` | `src/execution/{private_projection,fill_recovery,recovery_writer}.rs`、`src/runtime/shared/private_facts_worker.rs`；私有 session 与 fill cursor 使用稳定 `trading_account_id`，不得使用产品类型代替账户身份 |
 | 外部 Algo 清理审计 | `src/execution/external_algo_cleanup.rs` | 独立 custody/permit/hash-chain WAL，只经 `recovery_writer` 的同一 writer 锁 dispatch；中断后先签名回读，仍在场才允许新一轮预写，已消失只结算、不重复撤单 |
-| checkpoint 与权威事实 | `src/storage/checkpoint.rs` | `src/storage/{journal,facts,private_evidence,fill_cursor}.rs`；Checkpoint/Projection 使用唯一同目录临时文件、文件 fsync、原子 rename 及 Unix 父目录 fsync；facts Journal 在 open 与每次 append 前均权威重放，截断并 fsync 不完整尾部，再核对磁盘/内存 next sequence；完整坏行、空行、非 1 起始、分叉或并发推进均失败关闭；私有规范事实只能由 `PersistedPrivateEvidence` 收据构造并通过领域校验；多事实按 index/count 整批持久路由，Actor applied 后才推进 cursor；账户恢复 manifest 精确承诺五类 journal root/tail/count 与完整 replay 投影 |
+| checkpoint 与权威事实 | `crates/venue-storage/src/lib.rs` | `checkpoint.rs`、`journal.rs`、`facts.rs`、`private_evidence.rs`、`fill_cursor.rs`、`scalping_{evidence,risk}.rs` 集中耐久文件 I/O；根 `src/storage/*` 只保留兼容 facade/宿主扩展；原子 rename、fsync、hash/replay 与坏尾失败关闭语义不变 |
 | Canary、保护、紧急降险 | `src/execution/canary_sequence.rs` | `src/execution/{canary_evidence,canary_preflight,emergency_flatten,protection_custody}.rs` |
 
 ## Scalping、行情与自动选币
 
 | 功能 | 首要入口 | 直接继续 |
 |---|---|---|
-| Scalping 策略 | `src/strategy/scalping/mod.rs` | `src/strategy/scalping/{model,engine,risk,checkpoint}.rs` |
+| Scalping 策略 | `crates/venue-strategies/src/scalping/mod.rs` | 纯 model/candidate memory/risk 位于 crate；根 `src/strategy/scalping/{engine,checkpoint}.rs` 保留 runtime/storage 宿主组合 |
 | Scalping Shadow/Live resident | `src/runtime/scalping/scalping_resident_process.rs` | `src/runtime/scalping/{scalping_resident,scalping_live_driver,scalping_live_gateway,scalping_live_exit}.rs`；Live gateway 的未知命令恢复与单元测试分别在同目录的 `scalping_live_gateway_recovery.rs`、`scalping_live_gateway_tests.rs`，公开 API 仍由 `runtime` facade 统一导出 |
 | 控制目标与自动编排 | `src/runtime/scalping/scalping_control.rs` | `src/runtime/scalping/binance_auto_shadow.rs` |
 | 公共行情、订单簿、记录与回放 | `src/market/mod.rs` | `src/market/{session,orderbook,recorder,replay}.rs` |
-| 指标与 FeatureFrame | `src/indicator/feature_frame.rs` | `src/indicator/{public_market_source,scalping_features}.rs` |
+| 指标与 FeatureFrame | `crates/venue-indicators/src/feature_frame.rs` | `public_book.rs`、`public_market_source.rs`、`scalping_features.rs`；根 `src/indicator/mod.rs` 仅适配根 OrderBook 并重导出 |
 | Binance 候选扫描 | `src/market/scanner.rs` | `src/exchange/binance/market_scan.rs`、`src/runtime/scalping/binance_market_scan.rs` |
 
 ## 测试定位
 
-- 网格 reducer/风险状态测试：`src/strategy/hedged_grid/{reducer_tests,exposure_guard,recovery_tests}.rs`。
+- 网格 reducer/风险状态测试：`crates/venue-strategies/src/hedged_grid/{reducer_tests,exposure_guard,recovery_tests}.rs`。
 - 交易所 adapter 测试：`src/exchange/{binance,bitget,gate,grid}/` 内的测试文件及各交易所直接测试模块。
 - 共享 resident/runtime 测试：`src/runtime/grid/stage7_grid_tests.rs` 统一组合 `stage7_grid_{core,recovery}_tests.rs`，其余专项位于 `stage7_grid_reconciliation_tests.rs`、`stage7_fill_sequence_tests.rs`、`stage7_install_recovery_tests.rs`、`stage7_inventory_recovery_evidence_tests.rs`、`stage7_exposure_composition_tests.rs`、`hedged_grid_runtime_equivalence_tests.rs`、`exposure_runtime_tests.rs` 及各 `stage7_*` 模块内测试。
 - 账户运行时架构契约：`src/runtime/account/{tests,recovery_tests}.rs`、`src/runtime/account/tests/runtime_safety_tests.rs` 及 `account/{private_router,market_hub,reconciler}.rs`、`runtime/strategy/mod.rs` 内测试；覆盖多 symbol/family 隔离、durable inbox/applied cursor、Actor turn ack、Owner/Cancel 路由、邮箱与执行公平性、WAL 三态/Unknown/恢复清单、配置 epoch、Pause/Stop 残仓 custody/Flatten、三订单族能力与签名订单全语义、Net/Hedge 完整持仓腿。

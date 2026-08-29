@@ -50,12 +50,12 @@ fn fill(
     let fill_price = state
         .owned_orders
         .get(&source_order)
-        .map(|order| order.price.clone())
+        .map(|order| order.price)
         .or_else(|| {
             state
                 .owned_fill_records
                 .get(fill_id)
-                .map(|record| record.fill_price.clone())
+                .map(|record| record.fill_price)
         })
         .ok_or("missing source order")?;
     Ok(OwnedGridFill {
@@ -474,8 +474,9 @@ fn unsubmitted_rolling_transaction_can_return_to_exact_reconciliation()
         .clone()
         .ok_or("missing cancelled order")?;
 
-    let decision =
-        state.abandon_unsubmitted_transactions_for_reconciliation(&[transaction.id.clone()])?;
+    let decision = state.abandon_unsubmitted_transactions_for_reconciliation(
+        std::slice::from_ref(&transaction.id),
+    )?;
 
     assert_eq!(
         decision,

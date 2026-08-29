@@ -50,12 +50,12 @@ fn fill(
     let fill_price = state
         .owned_orders
         .get(&source_order)
-        .map(|order| order.price.clone())
+        .map(|order| order.price)
         .or_else(|| {
             state
                 .owned_fill_records
                 .get(fill_id)
-                .map(|record| record.fill_price.clone())
+                .map(|record| record.fill_price)
         })
         .ok_or("missing source order")?;
     Ok(OwnedGridFill {

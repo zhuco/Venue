@@ -8,6 +8,7 @@ mod money;
 mod order;
 mod position;
 mod risk_snapshot;
+mod risk_value;
 mod symbol;
 
 pub use account::{AccountBalance, AccountError};
@@ -27,8 +28,8 @@ pub use instrument::{
     MarketKind, Precision, ValueUnit,
 };
 pub use market::{
-    AggressorSide, MarkFunding, MarketDelta, MarketEvent, MarketLevel, MarketSnapshot, PublicBar,
-    PublicTicker, PublicTrade,
+    AggressorSide, BARS_SOURCE, BOOK_SOURCE, MarkFunding, MarketDelta, MarketEvent, MarketLevel,
+    MarketSnapshot, PublicBar, PublicTicker, PublicTrade, TRADES_SOURCE,
 };
 pub use money::{Amount, AmountError, Asset, Price};
 pub use order::{Fill, Order, OrderError, OrderPurpose, OrderSide, OrderState};
@@ -37,4 +38,5 @@ pub use risk_snapshot::{
     AccountRiskSnapshot, LegRiskSnapshot, RiskSnapshotError, RiskSourceStatus,
     validate_risk_snapshot_pair,
 };
+pub use risk_value::{RiskFactValue, RiskUnitValue};
 pub use symbol::{Symbol, SymbolError};

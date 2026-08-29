@@ -80,7 +80,7 @@ impl ScalpingPublicMarketSource {
 
     /// Batch ingestion preserves every provenance and feature update while deferring frame
     /// sampling until the full ordered batch has been consumed.
-    pub(crate) fn consume_batched(
+    pub fn consume_batched(
         &mut self,
         input: RecordedPublicEvent,
         book: &impl PublicBook,
@@ -270,7 +270,7 @@ impl ScalpingPublicMarketSource {
     }
 
     /// Samples the fully ingested batch at most once under the same 250ms output cadence.
-    pub(crate) fn sample_batched_frame(
+    pub fn sample_batched_frame(
         &mut self,
         now_ms: u64,
     ) -> Result<Option<FeatureFrame>, PublicMarketSourceError> {

@@ -28,6 +28,8 @@
 writer 或物理交易客户端。`legacy_stage7_strategy_binding` 只转换单策略身份，不授予 mutation 能力。配置中的
 `trading_account_id` 是真实账户的稳定规范 UUID，跨 symbol/策略复用；交易所 `account_binding` 只表示产品/模式能力。
 迁移完成前，现有 Stage 7 仍是唯一实盘 writer；不得同时为同一账户启动账户内核的新物理执行路径。
+文件型 checkpoint、journal、private evidence、fill cursor 与 Scalping evidence/risk 的耐久实现已集中到 `venue-storage`，根 `src/storage` 只保留兼容 facade/宿主扩展；本次物理提取不改变 fsync、恢复、WAL 或接管语义。
+Bybit、OKX、Hyperliquid 虽已有绑定型 async HTTP/私有 WS transport，但 capability、writer 与 WAL 仍为空，不能加入网格 mutation 或接管链。
 Stage 7 成交热路径不得遍历历史命令 WAL。命令 journal 在启动重放时建立未决命令、撤单目标和交易所订单 ID 的派生内存索引；滚动补撤批次以原 JSONL 格式一次 fsync 持久化 Prepared/Submitted 状态，再并行提交物理请求。接管只可在签名全订单族为空、零未决且零本地事务后显式按源 SHA 封存已解析 WAL；原件留在同 root，活动 WAL 从空文件继续，禁止运行中轮转或删除审计源。
 
 纯内核启动必须先安装覆盖 lifecycle、config epoch、Stop/Flatten fence、连接代际、已应用私有游标、完整批次
@@ -89,7 +91,7 @@ Exchange Account Process
 ├─ Strategy Actor C：scalping / ETH-USDT
 ├─ Execution Lane（唯一执行通道）
 ├─ Reconciler（账户对账器）
-└─ Control API（控制接口，未来供 Web/UI 使用）
+└─ Control API 边界（当前服务核心在 `apps/venue-control`，HTTP/SSE 与节点 adapter 未实现）
 ```
 
 数据流必须单向：
@@ -441,7 +443,9 @@ Gate、Bitget 当前 profile 只允许常规订单族，条件/Algo 由同一 pr
 本地 Control API 使用 `venue-control-protocol` schema v2；原生 VenueFlow 与 WebAssembly canvas 共用
 `/v2/ui/snapshot`、`/v2/ui/events`、`/v2/control/commands`。策略投影和命令必须携带精确 `TEST | LIVE`，两端只调用 API，不读取数据库、WAL 或 artifacts，
 不持有凭证，不直连交易所，不直接下单。Stop/Flatten 必须显示并提交精确 mode、account、symbol、instance、config epoch、action 与人工确认；
-Control server 和账户节点仍须按 durable inbox、Actor applied、Execution Lane、risk、Owner、WAL 与 writer 边界重新验证。
+`apps/venue-control` 当前只提供 transport-neutral schema 重验、幂等 repository 与 PostgreSQL durable inbox/outbox/claim/terminal receipt；
+HTTP/SSE server 和账户节点 adapter 尚未实现。账户节点仍须按 Actor applied、Execution Lane、risk、Owner、WAL 与 writer 边界重新验证，
+数据库 claim 或 Control receipt 均不授予 mutation authority。
 
 ## 12. 验收标准
 

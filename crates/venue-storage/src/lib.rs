@@ -17,7 +17,7 @@ pub use scalping_evidence::{
     EvidenceBundle, ScalpingEvidenceError, ScalpingEvidenceJournal, ScalpingEvidenceRecord,
 };
 pub use scalping_risk::{
-    RiskFactValue, RiskUnitValue, ScalpingRiskBinding, ScalpingRiskCommit, ScalpingRiskCursor,
-    ScalpingRiskEntry, ScalpingRiskError, ScalpingRiskFact, ScalpingRiskJournal,
-    ScalpingRiskRecord, ScalpingRiskRecovery, ScalpingRiskReplay,
+    ScalpingRiskBinding, ScalpingRiskCommit, ScalpingRiskCursor, ScalpingRiskEntry,
+    ScalpingRiskError, ScalpingRiskFact, ScalpingRiskJournal, ScalpingRiskRecord,
+    ScalpingRiskRecovery, ScalpingRiskReplay,
 };

@@ -20,6 +20,24 @@ pub struct RiskFact {
     pub realized_pnl: Decimal,
 }
 
+impl venue_domain::RiskFactValue<RiskUnit> for RiskFact {
+    fn fact_id(&self) -> &str {
+        &self.fact_id
+    }
+
+    fn event_time_ms(&self) -> u64 {
+        self.event_time_ms
+    }
+
+    fn valuation_generation(&self) -> u64 {
+        self.valuation_generation
+    }
+
+    fn risk_unit(&self) -> &RiskUnit {
+        &self.risk_unit
+    }
+}
+
 /// Complete revaluation proof for the active windows. Strategy never converts between valuation
 /// generations itself.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -76,7 +94,7 @@ pub struct RiskLedgerState {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RiskLedger {
+pub struct RiskLedger {
     facts: VecDeque<RiskFact>,
     seen: BTreeSet<String>,
     pending_revaluation: BTreeSet<String>,
@@ -95,7 +113,7 @@ pub(crate) struct RiskLedger {
 }
 
 impl RiskLedger {
-    pub(crate) fn new(params: &ScalpingParams) -> Self {
+    pub fn new(params: &ScalpingParams) -> Self {
         Self {
             facts: VecDeque::new(),
             seen: BTreeSet::new(),
@@ -115,7 +133,7 @@ impl RiskLedger {
         }
     }
 
-    pub(crate) fn is_pristine(&self) -> bool {
+    pub fn is_pristine(&self) -> bool {
         self.facts.is_empty()
             && self.pending_revaluation.is_empty()
             && self.last_event_time.is_none()
@@ -123,7 +141,7 @@ impl RiskLedger {
             && !self.generation_mismatch
     }
 
-    pub(crate) fn record(&mut self, fact: RiskFact) -> Result<RiskSnapshot, ScalpingError> {
+    pub fn record(&mut self, fact: RiskFact) -> Result<RiskSnapshot, ScalpingError> {
         if self.seen.contains(&fact.fact_id) || self.pending_revaluation.contains(&fact.fact_id) {
             return Ok(self.snapshot(self.last_event_time.unwrap_or(fact.event_time_ms)));
         }
@@ -180,7 +198,7 @@ impl RiskLedger {
         Ok(self.snapshot(now_ms))
     }
 
-    pub(crate) fn require_revaluation(
+    pub fn require_revaluation(
         &mut self,
         observed_at_ms: u64,
     ) -> Result<RiskSnapshot, ScalpingError> {
@@ -197,7 +215,7 @@ impl RiskLedger {
         Ok(self.snapshot(observed_at_ms))
     }
 
-    pub(crate) fn export_state(&self) -> RiskLedgerState {
+    pub fn export_state(&self) -> RiskLedgerState {
         RiskLedgerState {
             facts: self.facts.iter().cloned().collect(),
             seen_fact_ids: self.seen.iter().cloned().collect(),
@@ -210,7 +228,7 @@ impl RiskLedger {
         }
     }
 
-    pub(crate) fn restore_state(&mut self, state: RiskLedgerState) -> Result<(), ScalpingError> {
+    pub fn restore_state(&mut self, state: RiskLedgerState) -> Result<(), ScalpingError> {
         if state
             .facts
             .windows(2)
@@ -262,7 +280,7 @@ impl RiskLedger {
         Ok(())
     }
 
-    pub(crate) fn apply_revaluation(
+    pub fn apply_revaluation(
         &mut self,
         proof: RiskRevaluation,
     ) -> Result<RiskSnapshot, ScalpingError> {
@@ -327,7 +345,7 @@ impl RiskLedger {
         Ok(self.snapshot(proof.complete_through_ms))
     }
 
-    pub(crate) fn snapshot(&self, now_ms: u64) -> RiskSnapshot {
+    pub fn snapshot(&self, now_ms: u64) -> RiskSnapshot {
         let Some(generation) = self.generation else {
             return RiskSnapshot {
                 gate: RiskGate::GenerationMismatch,

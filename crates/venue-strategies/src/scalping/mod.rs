@@ -7,10 +7,10 @@ mod candidate_memory;
 mod model;
 mod risk;
 
-pub const BOOK_SOURCE: &str = "book";
-pub const TRADES_SOURCE: &str = "trades";
-pub const BARS_SOURCE: &str = "bars";
+pub use venue_domain::domain::{BARS_SOURCE, BOOK_SOURCE, TRADES_SOURCE};
 
-pub use candidate_memory::{BreakoutCursor, CandidateMemoryState, SeenCandidate};
+pub use candidate_memory::{
+    BreakoutCursor, CandidateMemory, CandidateMemoryRejection, CandidateMemoryState, SeenCandidate,
+};
 pub use model::*;
-pub use risk::{RiskFact, RiskGate, RiskLedgerState, RiskRevaluation, RiskSnapshot};
+pub use risk::{RiskFact, RiskGate, RiskLedger, RiskLedgerState, RiskRevaluation, RiskSnapshot};

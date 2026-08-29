@@ -49,11 +49,18 @@ impl ScalpingCheckpointStore {
     }
 
     pub fn load(&self) -> Result<Option<ScalpingCheckpoint>, ScalpingError> {
-        Ok(self.store.load()?)
+        self.store
+            .load()
+            .map_err(|error| ScalpingError::Persistence {
+                detail: error.to_string(),
+            })
     }
 
     pub fn save(&self, checkpoint: &ScalpingCheckpoint) -> Result<(), ScalpingError> {
-        self.store.save(checkpoint)?;
-        Ok(())
+        self.store
+            .save(checkpoint)
+            .map_err(|error| ScalpingError::Persistence {
+                detail: error.to_string(),
+            })
     }
 }

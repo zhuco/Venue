@@ -56,7 +56,7 @@ impl StrategyBinding {
         Ok(())
     }
 
-    pub(crate) fn digest(&self) -> String {
+    pub fn digest(&self) -> String {
         let mut digest = Sha256::new();
         for field in [
             match self.strategy_kind {
@@ -99,7 +99,7 @@ impl RiskUnit {
         &self.0
     }
 
-    pub(crate) fn shadow() -> Self {
+    pub fn shadow() -> Self {
         Self("risk".to_owned())
     }
 
@@ -109,6 +109,12 @@ impl RiskUnit {
             && value
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    }
+}
+
+impl venue_domain::RiskUnitValue for RiskUnit {
+    fn as_str(&self) -> &str {
+        self.as_str()
     }
 }
 
@@ -126,7 +132,7 @@ impl RiskLimit {
         Self { value, unit }
     }
 
-    pub(crate) fn is_valid(&self) -> bool {
+    pub fn is_valid(&self) -> bool {
         self.value > Decimal::ZERO && RiskUnit::is_valid(self.unit.as_str())
     }
 }
@@ -140,7 +146,7 @@ pub struct RiskPlan {
 }
 
 impl RiskPlan {
-    pub(crate) fn is_valid(&self) -> bool {
+    pub fn is_valid(&self) -> bool {
         self.risk_per_episode.is_valid()
             && self.max_episode_loss.is_valid()
             && self.risk_per_episode.unit == self.max_episode_loss.unit
@@ -148,7 +154,7 @@ impl RiskPlan {
             && self.quote_cap.value > Decimal::ZERO
     }
 
-    pub(crate) fn admits_worst_loss(&self, worst_loss: &RiskLimit) -> bool {
+    pub fn admits_worst_loss(&self, worst_loss: &RiskLimit) -> bool {
         worst_loss.is_valid()
             && worst_loss.unit == self.risk_per_episode.unit
             && worst_loss.value <= self.risk_per_episode.value
@@ -191,7 +197,7 @@ impl ExitDistancePolicy {
         }
     }
 
-    pub(crate) fn is_valid(&self) -> bool {
+    pub fn is_valid(&self) -> bool {
         match self {
             Self::StaticHardStop {
                 hard_stop_distance_bps,
@@ -208,7 +214,7 @@ impl ExitDistancePolicy {
         }
     }
 
-    pub(crate) fn distances_bps(&self, normalized_atr_bps: Decimal) -> (Decimal, Decimal) {
+    pub fn distances_bps(&self, normalized_atr_bps: Decimal) -> (Decimal, Decimal) {
         match self {
             Self::StaticHardStop {
                 hard_stop_distance_bps,
@@ -829,7 +835,7 @@ pub struct EpisodeProjection {
 }
 
 impl EpisodeProjection {
-    pub(crate) fn reserve(
+    pub fn reserve(
         frozen_intent: SemanticIntent,
         frozen_evidence: Option<CandidateEvidence>,
         observed_at_ms: u64,
@@ -853,7 +859,7 @@ impl EpisodeProjection {
         }
     }
 
-    pub(crate) fn validate_persisted(&self) -> Result<(), ScalpingError> {
+    pub fn validate_persisted(&self) -> Result<(), ScalpingError> {
         if self.episode_id.trim().is_empty()
             || self.episode_id != self.frozen_intent.intent_id
             || self
@@ -949,7 +955,7 @@ pub struct SafetyDeadline {
 }
 
 impl SafetyDeadline {
-    pub(crate) fn validate(&self) -> Result<(), ScalpingError> {
+    pub fn validate(&self) -> Result<(), ScalpingError> {
         if self.deadline_id.trim().is_empty()
             || self.generation == 0
             || self.armed_at_ms == 0
@@ -1102,14 +1108,16 @@ pub enum ScalpingError {
     Parameters,
     #[error("feature frame belongs to a different symbol")]
     Symbol,
-    #[error("feature frame is invalid")]
-    Feature,
+    #[error("feature frame is invalid: {detail}")]
+    Feature { detail: String },
     #[error("feature profile identity differs from the parameter release")]
     FeatureProfile,
     #[error("feature frame does not advance the persisted strategy watermark")]
     FeatureProgress,
     #[error("checkpoint is incompatible with the current strategy binding or release")]
     Checkpoint,
+    #[error("strategy projection persistence failed: {detail}")]
+    Persistence { detail: String },
     #[error("controller authorization is absent, stale, or bound to a different instance")]
     Authorization,
     #[error("shadow outcome does not match the pending semantic intent")]

@@ -8,7 +8,7 @@ use rust_decimal::{
     prelude::{Signed, ToPrimitive},
 };
 
-use venue_domain::{FieldState, Price, PublicBar, PublicTrade, Symbol};
+use venue_domain::{AggressorSide, FieldState, Price, PublicBar, PublicTrade, Symbol};
 
 use super::{
     BARS_SOURCE, BOOK_SOURCE, FeatureFrame, FeatureState, FeatureValues, PublicBook, SourceCursor,
@@ -264,8 +264,8 @@ impl ScalpingFeatureBuilder {
             true,
         )?;
         let signed_quantity = match trade.aggressor {
-            crate::domain::FieldState::Known(crate::domain::AggressorSide::Buy) => trade.quantity,
-            crate::domain::FieldState::Known(crate::domain::AggressorSide::Sell) => -trade.quantity,
+            FieldState::Known(AggressorSide::Buy) => trade.quantity,
+            FieldState::Known(AggressorSide::Sell) => -trade.quantity,
             _ => return Err(FeatureBuildError::Trade),
         };
         self.trades.push_back(TradeSample {
@@ -582,18 +582,64 @@ mod tests {
 
     use rust_decimal::Decimal;
 
-    use crate::{
-        domain::{
-            AggressorSide, FieldState, MarketLevel, MarketSnapshot, Price, PublicBar, PublicTrade,
-        },
-        indicator::FeatureState,
-        market::OrderBook,
+    use venue_domain::{
+        AggressorSide, FieldState, MarketLevel, MarketSnapshot, Price, PublicBar, PublicTrade,
+        Symbol,
     };
 
     use super::{
-        BAR_VOLUME_FEATURE_VERSION, BARS_SOURCE, BarSample, ScalpingFeatureBuilder,
-        derive_bar_features, flow_toxicity,
+        BAR_VOLUME_FEATURE_VERSION, BARS_SOURCE, BarSample, FeatureState, PublicBook,
+        ScalpingFeatureBuilder, derive_bar_features, flow_toxicity,
     };
+
+    #[derive(Clone, Debug, Default)]
+    struct TestBook {
+        symbol: Option<Symbol>,
+        generation: Option<u64>,
+        sequence: Option<u64>,
+        bids: Vec<MarketLevel>,
+        asks: Vec<MarketLevel>,
+    }
+
+    impl TestBook {
+        fn apply_snapshot(&mut self, snapshot: MarketSnapshot) {
+            self.symbol = Some(snapshot.symbol);
+            self.generation = Some(snapshot.generation);
+            self.sequence = Some(snapshot.sequence);
+            self.bids = snapshot.bids;
+            self.asks = snapshot.asks;
+        }
+    }
+
+    impl PublicBook for TestBook {
+        fn synchronized(&self) -> bool {
+            self.symbol.is_some()
+        }
+
+        fn bridged(&self) -> bool {
+            false
+        }
+
+        fn symbol(&self) -> Option<&Symbol> {
+            self.symbol.as_ref()
+        }
+
+        fn generation(&self) -> Option<u64> {
+            self.generation
+        }
+
+        fn sequence(&self) -> Option<u64> {
+            self.sequence
+        }
+
+        fn bids(&self) -> Vec<MarketLevel> {
+            self.bids.clone()
+        }
+
+        fn asks(&self) -> Vec<MarketLevel> {
+            self.asks.clone()
+        }
+    }
 
     fn builder() -> Result<ScalpingFeatureBuilder, Box<dyn std::error::Error>> {
         let capacity = NonZeroUsize::new(32).ok_or("non-zero capacity")?;
@@ -605,8 +651,8 @@ mod tests {
         )?)
     }
 
-    fn book() -> Result<OrderBook, Box<dyn std::error::Error>> {
-        let mut book = OrderBook::default();
+    fn book() -> Result<TestBook, Box<dyn std::error::Error>> {
+        let mut book = TestBook::default();
         book.apply_snapshot(MarketSnapshot {
             symbol: "BTC/USDT".parse()?,
             generation: 3,
@@ -824,7 +870,7 @@ mod tests {
                 taker_buy_quote_volume: FieldState::Known(Decimal::from(400)),
             })?;
         }
-        let mut next_book = OrderBook::default();
+        let mut next_book = TestBook::default();
         next_book.apply_snapshot(MarketSnapshot {
             symbol: "BTC/USDT".parse()?,
             generation: 4,

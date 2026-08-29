@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{FieldState, Price, Symbol, UnknownReason};
 
+pub const BOOK_SOURCE: &str = "book";
+pub const TRADES_SOURCE: &str = "trades";
+pub const BARS_SOURCE: &str = "bars";
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MarketLevel {
     pub price: Price,

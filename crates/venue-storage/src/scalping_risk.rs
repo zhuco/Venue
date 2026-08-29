@@ -8,17 +8,7 @@ use std::{
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
-
-pub trait RiskUnitValue: Clone + Debug + Eq + Ord + Serialize + DeserializeOwned {
-    fn as_str(&self) -> &str;
-}
-
-pub trait RiskFactValue<U>: Clone + Debug + Eq + Serialize + DeserializeOwned {
-    fn fact_id(&self) -> &str;
-    fn event_time_ms(&self) -> u64;
-    fn valuation_generation(&self) -> u64;
-    fn risk_unit(&self) -> &U;
-}
+use venue_domain::{RiskFactValue, RiskUnitValue};
 
 /// The immutable identity shared by one owner/release logical-risk stream.
 /// A valuation generation is deliberately part of every record, rather than a mutable journal

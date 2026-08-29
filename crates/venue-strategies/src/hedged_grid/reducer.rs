@@ -239,11 +239,11 @@ impl HedgedGridState {
                 // drained Stop shape accepted by the schema-2 migration.
                 self.retire_drained_stop_maker_facts()?;
                 self.retire_superseded_maker_facts()?;
-                return self.validate_checkpoint_structure();
+                self.validate_checkpoint_structure()
             }
-            2 => return self.migrate_schema_two_checkpoint(),
+            2 => self.migrate_schema_two_checkpoint(),
             1 => self.migrate_schema_one_checkpoint(),
-            _ => return Err(HedgedGridError::Checkpoint),
+            _ => Err(HedgedGridError::Checkpoint),
         }
     }
 
@@ -253,15 +253,15 @@ impl HedgedGridState {
         {
             return Err(HedgedGridError::Checkpoint);
         }
-        if self.phase == GridPhase::Running {
-            if let (Some(epoch), Some(inventory)) = (&self.epoch, &self.inventory) {
-                let legs = Self::capacity_deficiency(epoch, inventory, self.params.grid_count)?;
-                if legs.any() {
-                    self.inventory_recovery = InventoryRecoveryState::Deficient {
-                        legs,
-                        first_seen_generation: inventory.private_generation,
-                    };
-                }
+        if self.phase == GridPhase::Running
+            && let (Some(epoch), Some(inventory)) = (&self.epoch, &self.inventory)
+        {
+            let legs = Self::capacity_deficiency(epoch, inventory, self.params.grid_count)?;
+            if legs.any() {
+                self.inventory_recovery = InventoryRecoveryState::Deficient {
+                    legs,
+                    first_seen_generation: inventory.private_generation,
+                };
             }
         }
         self.schema_version = super::HEDGED_GRID_SCHEMA_VERSION;
@@ -335,14 +335,14 @@ impl HedgedGridState {
         let retire = self
             .owned_fill_records
             .iter()
-            .filter_map(|(fill_id, record)| {
-                (record.source_order.key.epoch < current_epoch
+            .filter(|(fill_id, record)| {
+                record.source_order.key.epoch < current_epoch
                     && record.maker == Some(true)
                     && !record.grid_action_emitted
                     && !record.retired_without_action
-                    && active_recovery_fill != Some(fill_id.as_str()))
-                .then(|| (fill_id.clone(), record.source_order.key.clone()))
+                    && active_recovery_fill != Some(fill_id.as_str())
             })
+            .map(|(fill_id, record)| (fill_id.clone(), record.source_order.key.clone()))
             .collect::<Vec<_>>();
         if retire
             .iter()
@@ -890,16 +890,15 @@ impl HedgedGridState {
             return Err(HedgedGridError::Phase);
         }
         inventory.validate()?;
-        if let Some(previous) = &self.inventory {
-            if inventory.private_generation < previous.private_generation
+        if let Some(previous) = &self.inventory
+            && (inventory.private_generation < previous.private_generation
                 || (inventory.private_generation == previous.private_generation
                     && inventory.private_observed_at_ms < previous.private_observed_at_ms)
                 || (inventory.private_generation == previous.private_generation
                     && inventory.private_observed_at_ms == previous.private_observed_at_ms
-                    && inventory != *previous)
-            {
-                return Err(HedgedGridError::InventoryGeneration);
-            }
+                    && inventory != *previous))
+        {
+            return Err(HedgedGridError::InventoryGeneration);
         }
         self.inventory = Some(inventory);
         self.stream_inventory_adjustments = StreamInventoryAdjustments::default();
@@ -976,7 +975,7 @@ impl HedgedGridState {
     /// The raw private event must already be durable. Its quantity effect is projected once while
     /// the signed inventory readback catches up; replay with richer maker evidence cannot apply it
     /// twice.
-    pub(crate) fn observe_stream_owned_fill(
+    pub fn observe_stream_owned_fill(
         &mut self,
         fill: OwnedGridFill,
     ) -> Result<GridDecision, HedgedGridError> {
@@ -1026,10 +1025,11 @@ impl HedgedGridState {
                 return Err(HedgedGridError::FillConflict);
             }
             if record.grid_action_emitted || maker != Some(true) {
-                if record.maker.is_none() && maker.is_some() {
-                    if let Some(record) = self.owned_fill_records.get_mut(&fill.fill_id) {
-                        record.maker = maker;
-                    }
+                if record.maker.is_none()
+                    && maker.is_some()
+                    && let Some(record) = self.owned_fill_records.get_mut(&fill.fill_id)
+                {
+                    record.maker = maker;
                 }
                 return Ok(GridDecision::Noop);
             }
@@ -1095,18 +1095,15 @@ impl HedgedGridState {
             return Ok(GridDecision::Noop);
         }
         let source = record.source_order.clone();
-        let reanchor_after_generation = match self.inventory_recovery {
+        let reanchor_after_generation = matches!(
+            self.inventory_recovery,
             InventoryRecoveryState::AwaitingNextOwnedFill { armed_generation }
-                if record.private_generation > armed_generation =>
-            {
-                true
-            }
-            _ => false,
-        };
+                if record.private_generation > armed_generation
+        );
         let decision = if reanchor_after_generation {
             self.inventory_recovery = InventoryRecoveryState::ReanchorPending {
                 fill_id: fill_id.to_owned(),
-                fill_price: record.fill_price.clone(),
+                fill_price: record.fill_price,
             };
             GridDecision::Actions(vec![GridAction::ReanchorAtFill {
                 fill_id: fill_id.to_owned(),
@@ -1201,7 +1198,7 @@ impl HedgedGridState {
     /// Releases only transactions that have been reserved locally but have not reached the
     /// exchange. The confirmed fill remains consumed; the still-live cancel targets are restored
     /// so the runtime can cancel the exact signed order set and rebuild at current precision.
-    pub(crate) fn abandon_unsubmitted_transactions_for_reconciliation(
+    pub fn abandon_unsubmitted_transactions_for_reconciliation(
         &mut self,
         transaction_ids: &[String],
     ) -> Result<GridDecision, HedgedGridError> {
@@ -1256,7 +1253,7 @@ impl HedgedGridState {
         highest.checked_add(1).ok_or(HedgedGridError::Rolling)
     }
 
-    pub(crate) fn reconcile_order_sequences(&mut self) {
+    pub fn reconcile_order_sequences(&mut self) {
         let Some(epoch) = self.epoch.as_ref().map(|epoch| epoch.epoch) else {
             self.order_sequences = GridOrderSequences::default();
             return;
@@ -1287,7 +1284,7 @@ impl HedgedGridState {
         self.order_sequences = sequences;
     }
 
-    pub(crate) fn begin_reconciliation_reset(
+    pub fn begin_reconciliation_reset(
         &mut self,
         owned_orders: BTreeMap<GridOrderKey, GridOrderIntent>,
     ) -> Result<(), HedgedGridError> {
@@ -1309,7 +1306,7 @@ impl HedgedGridState {
         Ok(())
     }
 
-    pub(crate) fn block_for_order_reconciliation(&mut self) -> Result<(), HedgedGridError> {
+    pub fn block_for_order_reconciliation(&mut self) -> Result<(), HedgedGridError> {
         if self.phase != GridPhase::Running {
             return Err(HedgedGridError::Phase);
         }
@@ -1317,7 +1314,7 @@ impl HedgedGridState {
         Ok(())
     }
 
-    pub(crate) fn defer_blocked_reconciliation_until(
+    pub fn defer_blocked_reconciliation_until(
         &mut self,
         not_before_ms: u64,
     ) -> Result<(), HedgedGridError> {
@@ -1328,18 +1325,18 @@ impl HedgedGridState {
         Ok(())
     }
 
-    pub(crate) fn blocked_reconciliation_is_due(&self, now_ms: u64) -> bool {
+    pub fn blocked_reconciliation_is_due(&self, now_ms: u64) -> bool {
         self.phase == GridPhase::BlockedUnknown
             && self
                 .blocked_reconciliation_not_before_ms
                 .is_none_or(|not_before_ms| now_ms >= not_before_ms)
     }
 
-    pub(crate) fn blocked_reconciliation_not_before_ms(&self) -> Option<u64> {
+    pub fn blocked_reconciliation_not_before_ms(&self) -> Option<u64> {
         self.blocked_reconciliation_not_before_ms
     }
 
-    pub(crate) fn reconcile_blocked_orders(
+    pub fn reconcile_blocked_orders(
         &mut self,
         owned_orders: BTreeMap<GridOrderKey, GridOrderIntent>,
     ) -> Result<(), HedgedGridError> {
@@ -1371,7 +1368,7 @@ impl HedgedGridState {
     /// operator stop is active. Every supplied order has already been proved against this
     /// binding's accepted WAL by the runtime. Pending rolling transactions are local planning
     /// state and can be discarded because this transition may only cancel visible orders.
-    pub(crate) fn reconcile_stopping_orders(
+    pub fn reconcile_stopping_orders(
         &mut self,
         owned_orders: BTreeMap<GridOrderKey, GridOrderIntent>,
     ) -> Result<(), HedgedGridError> {

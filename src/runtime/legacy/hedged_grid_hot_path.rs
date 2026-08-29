@@ -524,7 +524,7 @@ mod generation_tests {
 
     use crate::{
         domain::{FieldState, Price},
-        strategy::hedged_grid::{GridInventory, HedgedGridState},
+        strategy::hedged_grid::{GridInventory, HedgedGridParams, HedgedGridState},
     };
 
     use super::*;
@@ -532,7 +532,10 @@ mod generation_tests {
     #[test]
     fn same_connection_fill_after_inventory_uses_a_later_strategy_generation()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut state = HedgedGridState::new(super::super::hedged_grid_live::phase_one_binding()?)?;
+        let mut state = HedgedGridState::new_with_params(
+            super::super::hedged_grid_live::phase_one_binding()?,
+            HedgedGridParams::phase_one(10)?,
+        )?;
         state.inventory = Some(GridInventory {
             private_generation: 41,
             private_observed_at_ms: 1_000,
