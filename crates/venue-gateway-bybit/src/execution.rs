@@ -8,7 +8,7 @@ use venue_gateway_api::GatewayBinding;
 use crate::{
     BybitAccountIdentity, BybitAccountMode, BybitCredentials, BybitError, BybitGatewayBinding,
     BybitLinearInstrumentRules, BybitOpenOrder, BybitOpenOrderPage, BybitOrderEvidence,
-    BybitOrderEvidencePage, BybitPublicSource, BybitRestBbo, SignedHeaders,
+    BybitOrderEvidencePage, BybitOrderLookup, BybitPublicSource, BybitRestBbo, SignedHeaders,
     complete_open_order_pages, complete_order_history_pages, endpoints, linear_native_symbol, sign,
 };
 
@@ -293,11 +293,13 @@ pub fn parse_order_ack(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BybitClosedOrderReadback {
-    pub binding: GatewayBinding,
-    pub generation: u64,
-    pub received_at_ms: u64,
-    pub open_orders: Vec<BybitOpenOrder>,
-    pub history: Vec<BybitOrderEvidence>,
+    binding: GatewayBinding,
+    generation: u64,
+    lookup: BybitOrderLookup,
+    requested_at_ms: u64,
+    received_at_ms: u64,
+    open_orders: Vec<BybitOpenOrder>,
+    history: Vec<BybitOrderEvidence>,
 }
 
 impl BybitClosedOrderReadback {
@@ -321,6 +323,36 @@ impl BybitClosedOrderReadback {
         {
             return Err(BybitExecutionError::Readback);
         }
+        let lookup = open
+            .raw_pages
+            .first()
+            .and_then(|raw| raw.lookup.clone())
+            .ok_or(BybitExecutionError::Readback)?;
+        if history
+            .raw_pages
+            .first()
+            .and_then(|raw| raw.lookup.as_ref())
+            != Some(&lookup)
+            || open.orders.len() > 1
+            || history.orders.len() > 1
+            || open
+                .orders
+                .iter()
+                .any(|order| !lookup_matches_order(&lookup, &order.order))
+            || history
+                .orders
+                .iter()
+                .any(|order| !lookup_matches_order(&lookup, &order.order))
+        {
+            return Err(BybitExecutionError::Readback);
+        }
+        let requested_at_ms = open
+            .raw_pages
+            .iter()
+            .chain(history.raw_pages.iter())
+            .map(|raw| raw.request_timestamp_ms)
+            .min()
+            .ok_or(BybitExecutionError::Readback)?;
         let received_at_ms = open
             .raw_pages
             .iter()
@@ -331,6 +363,8 @@ impl BybitClosedOrderReadback {
         Ok(Self {
             binding: binding.gateway_binding().clone(),
             generation,
+            lookup,
+            requested_at_ms,
             received_at_ms,
             open_orders: open.orders,
             history: history.orders,
@@ -361,8 +395,10 @@ pub fn settle_order_ack(
     if &ack.binding != binding.gateway_binding()
         || &readback.binding != binding.gateway_binding()
         || ack.generation != readback.generation
+        || readback.requested_at_ms < ack.received_at_ms
         || readback.received_at_ms < ack.received_at_ms
         || ack.status != BybitAckStatus::AcceptedOnly
+        || !lookup_matches_ack(&readback.lookup, ack)
     {
         return Err(BybitExecutionError::Binding);
     }
@@ -390,7 +426,7 @@ pub fn settle_order_ack(
     }
     let item = history.first().ok_or(BybitExecutionError::Unsettled)?;
     let finality = if matches!(
-        item.state,
+        item.order.state,
         OrderState::Filled | OrderState::Cancelled | OrderState::Expired | OrderState::Rejected
     ) {
         BybitSettlementFinality::Terminal
@@ -398,9 +434,9 @@ pub fn settle_order_ack(
         BybitSettlementFinality::Working
     };
     Ok(BybitOrderSettlement {
-        order_id: item.order_id.clone(),
-        client_order_id: item.client_order_id.clone(),
-        state: item.state,
+        order_id: item.order.order_id.clone(),
+        client_order_id: item.order.client_order_id.clone(),
+        state: item.order.state,
         finality,
         updated_at_ms: item.updated_at_ms,
     })
@@ -513,13 +549,31 @@ fn matches_history(order: &BybitOrderEvidence, ack: &BybitOrderAck) -> bool {
     let order_id_matches = ack
         .order_id
         .as_ref()
-        .is_none_or(|value| value == &order.order_id);
-    let client_id_matches = match (&ack.client_order_id, &order.client_order_id) {
+        .is_none_or(|value| value == &order.order.order_id);
+    let client_id_matches = match (&ack.client_order_id, &order.order.client_order_id) {
         (None, _) => true,
         (Some(expected), FieldState::Known(actual)) => expected == actual,
         (Some(_), _) => false,
     };
     order_id_matches && client_id_matches
+}
+
+fn lookup_matches_order(lookup: &BybitOrderLookup, order: &venue_domain::domain::Order) -> bool {
+    match (&lookup.order_id, &lookup.client_order_id) {
+        (Some(expected), None) => expected == &order.order_id,
+        (None, Some(expected)) => {
+            matches!(&order.client_order_id, FieldState::Known(actual) if actual == expected)
+        }
+        _ => false,
+    }
+}
+
+fn lookup_matches_ack(lookup: &BybitOrderLookup, ack: &BybitOrderAck) -> bool {
+    match (&lookup.order_id, &lookup.client_order_id) {
+        (Some(expected), None) => ack.order_id.as_ref() == Some(expected),
+        (None, Some(expected)) => ack.client_order_id.as_ref() == Some(expected),
+        _ => false,
+    }
 }
 
 fn side_wire(side: OrderSide) -> &'static str {
@@ -635,7 +689,7 @@ mod tests {
     const ACCOUNT: &[u8] = include_bytes!("../fixtures/account-info-uta2.json");
     const INSTRUMENT: &str = include_str!("../fixtures/instruments-linear.json");
     const BBO: &str = include_str!("../fixtures/orderbook-linear-bbo.json");
-    const OPEN: &[u8] = include_bytes!("../fixtures/open-orders-linear.json");
+    const OPEN: &[u8] = include_bytes!("../fixtures/exact-open-order-linear.json");
     const CANCEL_HISTORY: &[u8] = include_bytes!("../fixtures/cancel-order-history-linear.json");
     const PLACE_ACK: &[u8] = include_bytes!("../fixtures/place-order-ack.json");
     const CANCEL_ACK: &[u8] = include_bytes!("../fixtures/cancel-order-ack.json");
@@ -713,6 +767,7 @@ mod tests {
     fn private_raw(
         binding: &BybitGatewayBinding,
         source: BybitPrivateSource,
+        lookup: BybitOrderLookup,
         payload: &[u8],
     ) -> Result<BybitRawPrivatePayload, BybitError> {
         let history_window = matches!(
@@ -721,9 +776,17 @@ mod tests {
         )
         .then(|| BybitHistoryWindow::new(1, 2_100))
         .transpose()?;
-        let request =
-            prepare_private_request(binding, 7, 11, 0, source, None, history_window, None)?;
-        BybitRawPrivatePayload::from_response(binding, &request, 2_000, 2_100, payload.to_vec())
+        let request = prepare_private_request(
+            binding,
+            7,
+            11,
+            0,
+            source,
+            None,
+            history_window,
+            Some(lookup),
+        )?;
+        BybitRawPrivatePayload::from_response(binding, &request, 2_004, 2_100, payload.to_vec())
     }
 
     #[test]
@@ -844,11 +907,13 @@ mod tests {
         )?;
         let ack = parse_order_ack(&facts.binding, &request, PLACE_ACK, 2_002)?;
         assert_eq!(ack.status, BybitAckStatus::AcceptedOnly);
+        let lookup = BybitOrderLookup::by_client_order_id("MANAGED_CLIENT_ID")?;
         let open = parse_open_order_page(
             &facts.binding,
             &private_raw(
                 &facts.binding,
                 BybitPrivateSource::OpenOrders(NativeOrderFamily::UmOrder),
+                lookup.clone(),
                 OPEN,
             )?,
         )?;
@@ -857,6 +922,7 @@ mod tests {
             &private_raw(
                 &facts.binding,
                 BybitPrivateSource::OrderHistory(NativeOrderFamily::UmOrder),
+                lookup,
                 EMPTY_ORDERS,
             )?,
         )?;
@@ -869,6 +935,12 @@ mod tests {
         stale_generation.generation = 8;
         assert_eq!(
             settle_order_ack(&facts.binding, &ack, &stale_generation),
+            Err(BybitExecutionError::Binding)
+        );
+        let mut pre_ack_request = readback.clone();
+        pre_ack_request.requested_at_ms = ack.received_at_ms - 1;
+        assert_eq!(
+            settle_order_ack(&facts.binding, &ack, &pre_ack_request),
             Err(BybitExecutionError::Binding)
         );
         let mut pre_ack = readback;
@@ -898,11 +970,13 @@ mod tests {
             },
         )?;
         let ack = parse_order_ack(&facts.binding, &request, CANCEL_ACK, 2_003)?;
+        let lookup = BybitOrderLookup::by_order_id("23")?;
         let open = parse_open_order_page(
             &facts.binding,
             &private_raw(
                 &facts.binding,
                 BybitPrivateSource::OpenOrders(NativeOrderFamily::UmOrder),
+                lookup.clone(),
                 EMPTY_ORDERS,
             )?,
         )?;
@@ -911,6 +985,7 @@ mod tests {
             &private_raw(
                 &facts.binding,
                 BybitPrivateSource::OrderHistory(NativeOrderFamily::UmOrder),
+                lookup,
                 CANCEL_HISTORY,
             )?,
         )?;
