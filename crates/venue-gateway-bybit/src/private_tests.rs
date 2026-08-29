@@ -703,14 +703,23 @@ fn fresh_complete_probe_is_persistable_for_test_and_live_only() -> Result<(), Te
             )?,
         )?;
         let session = BybitPhysicalSession::from_probe(
-            gateway,
+            gateway.clone(),
             credentials,
-            rules,
+            rules.clone(),
             &evidence,
             BybitTransportLimits::new(std::time::Duration::from_secs(1), 16 * 1_024)?,
             2_500,
         )?;
         assert_eq!(session.capability_snapshot(), snapshot);
+        let synchronous = BybitSynchronousPhysicalSession::from_persisted_probe(
+            gateway,
+            BybitCredentials::from_values("test", "secret")?,
+            &json,
+            rules.raw,
+            BybitTransportLimits::new(std::time::Duration::from_secs(1), 16 * 1_024)?,
+            2_500,
+        )?;
+        assert_eq!(synchronous.capability_snapshot(), snapshot);
     }
     Ok(())
 }

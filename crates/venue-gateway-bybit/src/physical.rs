@@ -1,4 +1,5 @@
 use rust_decimal::Decimal;
+use tokio::runtime::{Builder, Runtime};
 use venue_domain::domain::{OrderSide, PositionSide};
 use venue_gateway_api::{CapabilitySnapshot, GatewayBinding, MutationCapability};
 
@@ -8,8 +9,9 @@ use crate::{
     BybitHistoryWindow, BybitHttpTransport, BybitLinearInstrumentRules, BybitOrderAck,
     BybitOrderKind, BybitOrderLookup, BybitOrderSettlement, BybitPlaceIntent,
     BybitPositionReadback, BybitPreparedPrivateRequest, BybitPreparedRequest, BybitPrivateSource,
-    BybitRequestKind, BybitRestBbo, BybitTimeInForce, BybitTransportError, BybitTransportLimits,
-    prepare_cancel_request, prepare_place_request, prepare_private_request, settle_order_ack,
+    BybitRawPublicPayload, BybitRequestKind, BybitRestBbo, BybitTimeInForce, BybitTransportError,
+    BybitTransportLimits, parse_linear_instrument, prepare_cancel_request, prepare_place_request,
+    prepare_private_request, settle_order_ack,
 };
 
 /// A verified adapter session with real Bybit HTTP transport. It owns no writer, WAL, Owner map,
@@ -26,6 +28,34 @@ pub struct BybitPhysicalSession {
 }
 
 impl BybitPhysicalSession {
+    /// Replays a durable HMAC-bound probe and its exact public instrument payload before creating
+    /// a physical session. This remains an adapter candidate: callers must supply independent
+    /// Owner/WAL/writer/Control/Canary authority before loading credentials or invoking it.
+    pub fn from_persisted_probe(
+        binding: BybitGatewayBinding,
+        credentials: BybitCredentials,
+        probe_payload: &[u8],
+        instrument_payload: BybitRawPublicPayload,
+        limits: BybitTransportLimits,
+        now_ms: u64,
+    ) -> Result<Self, BybitPhysicalError> {
+        let (probe, capability) = BybitCapabilityProbeEvidence::from_json_verified(
+            probe_payload,
+            &binding,
+            &credentials,
+            now_ms,
+        )
+        .map_err(|_| BybitPhysicalError::Capability)?;
+        let rules = parse_linear_instrument(&binding, instrument_payload)
+            .map_err(|_| BybitPhysicalError::Intent)?;
+        if rules.raw.generation != capability.version
+            || rules.instrument.generation != capability.version
+        {
+            return Err(BybitPhysicalError::Scope);
+        }
+        Self::from_probe(binding, credentials, rules, &probe, limits, now_ms)
+    }
+
     pub fn from_probe(
         binding: BybitGatewayBinding,
         credentials: BybitCredentials,
@@ -215,6 +245,97 @@ impl BybitPhysicalSession {
     }
 }
 
+/// Local synchronous shell for the account node's synchronous `PhysicalGateway` boundary. The
+/// runtime is created only when a caller has already supplied the persisted inputs and credentials;
+/// constructing the fixed node's secret-free candidate does not allocate it or touch the network.
+pub struct BybitSynchronousPhysicalSession {
+    runtime: Runtime,
+    session: BybitPhysicalSession,
+}
+
+impl BybitSynchronousPhysicalSession {
+    pub fn from_persisted_probe(
+        binding: BybitGatewayBinding,
+        credentials: BybitCredentials,
+        probe_payload: &[u8],
+        instrument_payload: BybitRawPublicPayload,
+        limits: BybitTransportLimits,
+        now_ms: u64,
+    ) -> Result<Self, BybitPhysicalError> {
+        let session = BybitPhysicalSession::from_persisted_probe(
+            binding,
+            credentials,
+            probe_payload,
+            instrument_payload,
+            limits,
+            now_ms,
+        )?;
+        Self::from_session(session)
+    }
+
+    fn from_session(session: BybitPhysicalSession) -> Result<Self, BybitPhysicalError> {
+        let runtime = Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|_| BybitPhysicalError::Runtime)?;
+        Ok(Self { runtime, session })
+    }
+
+    #[must_use]
+    pub const fn binding(&self) -> &GatewayBinding {
+        self.session.binding()
+    }
+
+    #[must_use]
+    pub fn capability_snapshot(&self) -> CapabilitySnapshot {
+        self.session.capability_snapshot()
+    }
+
+    pub fn prepare_place_once(
+        &self,
+        intent: &BybitPlaceIntent,
+        now_ms: u64,
+        market_bbo: Option<&BybitRestBbo>,
+    ) -> Result<BybitOneShotMutation, BybitPhysicalError> {
+        self.session.prepare_place_once(intent, now_ms, market_bbo)
+    }
+
+    pub fn prepare_cancel_once(
+        &self,
+        intent: &BybitCancelIntent,
+        now_ms: u64,
+    ) -> Result<BybitOneShotMutation, BybitPhysicalError> {
+        self.session.prepare_cancel_once(intent, now_ms)
+    }
+
+    pub fn prepare_reduce_once(
+        &self,
+        client_order_id: impl Into<String>,
+        position_side: PositionSide,
+        quantity: Decimal,
+        now_ms: u64,
+        market_bbo: &BybitRestBbo,
+    ) -> Result<BybitOneShotMutation, BybitPhysicalError> {
+        self.session.prepare_reduce_once(
+            client_order_id,
+            position_side,
+            quantity,
+            now_ms,
+            market_bbo,
+        )
+    }
+
+    pub fn dispatch_once(
+        &mut self,
+        mutation: BybitOneShotMutation,
+        timestamp_ms: u64,
+    ) -> Result<BybitDispatchOnceResult, BybitPhysicalError> {
+        self.runtime
+            .block_on(self.session.dispatch_once(mutation, timestamp_ms))
+    }
+}
+
 /// Linear dispatch value. It deliberately does not implement `Clone` and is consumed by
 /// `dispatch_once`; timeout/disconnect results contain only readback state, never a retry request.
 pub struct BybitOneShotMutation {
@@ -358,6 +479,8 @@ pub enum BybitPhysicalError {
     Transport,
     #[error("Bybit physical exact readback is incomplete or conflicting")]
     Readback,
+    #[error("Bybit synchronous physical runtime could not be created")]
+    Runtime,
 }
 
 impl From<BybitExecutionError> for BybitPhysicalError {
@@ -381,7 +504,12 @@ impl From<crate::BybitError> for BybitPhysicalError {
 
 #[cfg(test)]
 mod tests {
-    use std::{io, time::Duration};
+    use std::{
+        io::{self, Read},
+        net::TcpListener as StdTcpListener,
+        thread,
+        time::Duration,
+    };
 
     use tokio::net::TcpListener;
     use venue_domain::domain::Price;
@@ -612,6 +740,29 @@ mod tests {
             ));
             assert!(!server.await??);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn synchronous_shell_consumes_one_request_and_preserves_unknown() -> Result<(), TestError> {
+        let listener = StdTcpListener::bind("127.0.0.1:0")?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let server = thread::spawn(move || -> Result<(), io::Error> {
+            let (mut stream, _) = listener.accept()?;
+            let mut buffer = [0_u8; 4_096];
+            let _ = stream.read(&mut buffer)?;
+            Ok(())
+        });
+        let (session, _) = session(GatewayMode::Test, endpoint, Duration::from_secs(1))?;
+        let mut synchronous = BybitSynchronousPhysicalSession::from_session(session)?;
+        let mutation = synchronous.prepare_place_once(&place_intent()?, NOW_MS, None)?;
+        assert!(matches!(
+            synchronous.dispatch_once(mutation, NOW_MS)?,
+            BybitDispatchOnceResult::Unknown(_)
+        ));
+        server
+            .join()
+            .map_err(|_| io::Error::other("Bybit test server thread panicked"))??;
         Ok(())
     }
 
