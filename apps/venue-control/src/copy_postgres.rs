@@ -14,6 +14,7 @@ use crate::{
     CopyObserverScope, CopyReplayDeliveryState, CopyReplayJob, CopyRepository, CopyRepositoryError,
     CopyStoreResult, CopyTestJob, MAX_COPY_DELIVERY_CLAIM_MS, MAX_COPY_OBSERVER_LEASE_MS,
     ObservedCopyIntent, PgControlRepository, PlannedCopyJob, ScopedCopyDeliveryReceipt,
+    account_delivery_postgres::insert_copy_account_delivery,
 };
 
 pub const MIGRATION_0002: &str = include_str!("../migrations/0002_copy_core.sql");
@@ -517,6 +518,9 @@ impl CopyRepository for PgControlRepository {
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
+        insert_copy_account_delivery(&mut transaction, job, committed_at_ms)
+            .await
+            .map_err(map_account_delivery_error)?;
         let updated = sqlx::query(
             "UPDATE venue_copy_observer_cursors \
              SET last_event_sequence = $2, updated_at_ms = $3 \
@@ -1270,6 +1274,9 @@ async fn persist_planned_copy_job(
     .execute(&mut **transaction)
     .await
     .map_err(database_error)?;
+    insert_copy_account_delivery(transaction, job, from_i64(planned_at)?)
+        .await
+        .map_err(map_account_delivery_error)?;
     let updated = sqlx::query(
         "UPDATE venue_copy_observer_cursors \
          SET last_event_sequence = $2, updated_at_ms = $3 \
@@ -1542,6 +1549,15 @@ const fn receipt_status(status: DeliveryReceiptStatus) -> &'static str {
 
 fn database_error(_: sqlx::Error) -> CopyRepositoryError {
     CopyRepositoryError::Database
+}
+
+fn map_account_delivery_error(error: crate::AccountDeliveryRepositoryError) -> CopyRepositoryError {
+    match error {
+        crate::AccountDeliveryRepositoryError::BindingConflict => CopyRepositoryError::InvalidData,
+        crate::AccountDeliveryRepositoryError::NumericRange => CopyRepositoryError::NumericRange,
+        crate::AccountDeliveryRepositoryError::CorruptData => CopyRepositoryError::CorruptData,
+        _ => CopyRepositoryError::Database,
+    }
 }
 
 #[cfg(test)]
