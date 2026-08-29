@@ -620,7 +620,11 @@ impl WriterLeaseAuthority {
     }
 
     fn validate_state(&self, state: &DurableState) -> Result<(), WriterLeaseError> {
-        if state.schema_version != 1 || state.scope != self.scope || state.next_generation == 0 {
+        if state.schema_version != 1
+            || state.scope != self.scope
+            || state.next_generation == 0
+            || (state.protection_only && state.active.is_none())
+        {
             return Err(WriterLeaseError::CorruptAuthority);
         }
         if let Some(handoff) = &state.pending_executable_handoff
@@ -629,16 +633,22 @@ impl WriterLeaseAuthority {
                 || handoff.receipt_id.trim().is_empty()
                 || handoff.predecessor.token.is_empty()
                 || handoff.predecessor.generation == 0
+                || handoff.predecessor.generation >= state.next_generation
+                || handoff.predecessor.revision >= state.revision
                 || handoff.predecessor.readback_generation == 0
                 || handoff.readback_generation < handoff.predecessor.readback_generation
                 || !valid_summary(&handoff.handoff_sha256)
-                || !valid_summary(&handoff.successor_executable_sha256))
+                || !valid_summary(&handoff.successor_executable_sha256)
+                || state
+                    .consumed_executable_handoffs
+                    .contains(&handoff.receipt_id))
         {
             return Err(WriterLeaseError::CorruptAuthority);
         }
         if let Some(active) = &state.active
             && (active.token.is_empty()
                 || active.generation == 0
+                || active.generation >= state.next_generation
                 || active.revision != state.revision
                 || active.readback_generation == 0)
         {
@@ -699,7 +709,14 @@ impl WriterLeaseAuthority {
                 Err(_) => present = true,
             }
         }
-        if let Some(state) = decoded.into_iter().max_by_key(|state| state.revision) {
+        if let Some(max_revision) = decoded.iter().map(|state| state.revision).max() {
+            let mut newest = decoded
+                .into_iter()
+                .filter(|state| state.revision == max_revision);
+            let state = newest.next().ok_or(WriterLeaseError::CorruptAuthority)?;
+            if newest.any(|candidate| candidate != state) {
+                return Err(WriterLeaseError::CorruptAuthority);
+            }
             return Ok(Some(state));
         }
         if present {
@@ -856,6 +873,7 @@ fn persist_state(path: &Path, state: &DurableState) -> Result<(), WriterLeaseErr
         })
         .map_err(WriterLeaseError::Io)?;
     sync_file(path)?;
+    sync_parent(path)?;
     write_synced(&backup, &encoded)
 }
 
@@ -877,6 +895,19 @@ fn sync_file(path: &Path) -> Result<(), WriterLeaseError> {
         .open(path)
         .and_then(|file| file.sync_all())
         .map_err(WriterLeaseError::Io)
+}
+
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> Result<(), WriterLeaseError> {
+    let parent = path.parent().ok_or(WriterLeaseError::AuthorityPath)?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(WriterLeaseError::Io)
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) -> Result<(), WriterLeaseError> {
+    Ok(())
 }
 
 fn sibling(path: &Path, suffix: &str) -> PathBuf {
@@ -923,4 +954,151 @@ pub enum WriterLeaseError {
     HandoffPending,
     #[error("executable handoff receipt was already consumed")]
     HandoffReceiptConsumed,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn scope(owner_scope: &str) -> Result<WriterScope, Box<dyn std::error::Error>> {
+        Ok(WriterScope {
+            exchange: "gate".to_owned(),
+            account: "00000000-0000-4000-8000-000000000001".to_owned(),
+            symbol: "DOGE/USDT".parse()?,
+            owner_scope: owner_scope.to_owned(),
+        })
+    }
+
+    #[test]
+    fn concurrent_initial_writers_never_both_acquire_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("writer.json");
+        let writer_scope = scope("grid")?;
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for now_ms in [1_u64, 2_u64] {
+            let path = path.clone();
+            let writer_scope = writer_scope.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let authority = WriterLeaseAuthority::open(path, writer_scope);
+                barrier.wait();
+                authority.and_then(|authority| authority.register_initial(now_ms, 1))
+            }));
+        }
+
+        let mut acquired = 0;
+        let mut rejected = 0;
+        for handle in handles {
+            match handle
+                .join()
+                .map_err(|_| "writer registration thread panicked")?
+            {
+                Ok(_) => acquired += 1,
+                Err(WriterLeaseError::WriterExists) => rejected += 1,
+                Err(error) => return Err(Box::new(error)),
+            }
+        }
+        assert_eq!((acquired, rejected), (1, 1));
+        Ok(())
+    }
+
+    #[test]
+    fn held_dispatch_lock_fails_closed_without_changing_the_session()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("writer.json");
+        let writer_scope = scope("grid")?;
+        let authority = WriterLeaseAuthority::open(&path, writer_scope.clone())?;
+        let session = authority.register_initial(1, 1)?;
+        let guard = authority.persistent_dispatch_guard(&session)?;
+
+        let contender = WriterLeaseAuthority::open(path, writer_scope)?;
+        assert!(matches!(
+            contender.persistent_dispatch_guard(&session),
+            Err(WriterLeaseError::Lock(_))
+        ));
+        assert_eq!(authority.active_session()?, Some(session.clone()));
+        drop(guard);
+        assert!(authority.persistent_dispatch_guard(&session).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn restart_recovers_backup_but_rejects_equal_revision_state_fork()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("writer.json");
+        let writer_scope = scope("grid")?;
+        let authority = WriterLeaseAuthority::open(&path, writer_scope.clone())?;
+        let session = authority.register_initial(1, 1)?;
+
+        fs::write(&path, b"{\"torn\":true")?;
+        let recovered = WriterLeaseAuthority::open(&path, writer_scope.clone())?;
+        assert_eq!(recovered.active_session()?, Some(session.clone()));
+
+        let backup = sibling(&path, ".backup");
+        let mut fork = decode_state(&fs::read(&backup)?)?;
+        let active = fork
+            .active
+            .as_mut()
+            .ok_or(WriterLeaseError::CorruptAuthority)?;
+        active.token = "forked-session-token".to_owned();
+        let mut encoded = serde_json::to_vec(&fork)?;
+        encoded.push(b'\n');
+        fs::write(&path, &encoded)?;
+        let mut conflicting = fork;
+        conflicting
+            .active
+            .as_mut()
+            .ok_or(WriterLeaseError::CorruptAuthority)?
+            .token = "other-forked-session-token".to_owned();
+        let mut conflicting_encoded = serde_json::to_vec(&conflicting)?;
+        conflicting_encoded.push(b'\n');
+        fs::write(&backup, conflicting_encoded)?;
+
+        assert!(matches!(
+            WriterLeaseAuthority::open(path, writer_scope),
+            Err(WriterLeaseError::CorruptAuthority)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_generation_or_cross_scope_restart_cannot_recover()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("writer.json");
+        let writer_scope = scope("grid")?;
+        let authority = WriterLeaseAuthority::open(&path, writer_scope.clone())?;
+        authority.register_initial(1, 1)?;
+
+        let mut other_scope = writer_scope.clone();
+        other_scope.owner_scope = "scalping".to_owned();
+        assert!(matches!(
+            WriterLeaseAuthority::open(&path, other_scope),
+            Err(WriterLeaseError::CorruptAuthority)
+        ));
+
+        let mut state = decode_state(&fs::read(&path)?)?;
+        state.next_generation = state
+            .active
+            .as_ref()
+            .ok_or(WriterLeaseError::CorruptAuthority)?
+            .generation;
+        let mut encoded = serde_json::to_vec(&state)?;
+        encoded.push(b'\n');
+        fs::write(&path, &encoded)?;
+        fs::write(sibling(&path, ".backup"), &encoded)?;
+        assert!(matches!(
+            WriterLeaseAuthority::open(path, writer_scope),
+            Err(WriterLeaseError::CorruptAuthority)
+        ));
+        Ok(())
+    }
 }
