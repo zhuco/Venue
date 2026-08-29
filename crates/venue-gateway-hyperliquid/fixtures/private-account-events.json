@@ -1,0 +1,53 @@
+[
+  {
+    "channel": "orderUpdates",
+    "data": [
+      {
+        "order": {
+          "coin": "BTC",
+          "side": "B",
+          "limitPx": "65000.5",
+          "sz": "0.4",
+          "oid": 101,
+          "timestamp": 1700000000000,
+          "origSz": "1.0",
+          "cloid": "0x00000000000000000000000000000001"
+        },
+        "status": "open",
+        "statusTimestamp": 1700000000001
+      }
+    ]
+  },
+  {
+    "channel": "userFills",
+    "data": {
+      "isSnapshot": false,
+      "user": "0x0000000000000000000000000000000000000001",
+      "fills": [
+        {
+          "coin": "BTC",
+          "px": "65000.5",
+          "sz": "0.6",
+          "side": "B",
+          "time": 1700000000002,
+          "closedPnl": "0",
+          "oid": 101,
+          "cloid": "0x00000000000000000000000000000001",
+          "fee": "1.25",
+          "tid": 5001,
+          "feeToken": "USDC"
+        }
+      ]
+    }
+  },
+  {
+    "channel": "clearinghouseState",
+    "data": {
+      "user": "0x0000000000000000000000000000000000000001",
+      "time": 1700000000003,
+      "marginSummary": { "accountValue": "1000.25" },
+      "withdrawable": "800.25",
+      "assetPositions": []
+    }
+  }
+]

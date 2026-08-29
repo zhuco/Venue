@@ -1,0 +1,97 @@
+[workspace]
+members = [
+    ".",
+    "crates/venue-copy",
+    "crates/venue-domain",
+    "crates/venue-gateway-api",
+    "crates/venue-gateway-bybit",
+    "crates/venue-gateway-hyperliquid",
+    "crates/venue-gateway-okx",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98.0"
+
+[workspace.dependencies]
+base64 = "0.22"
+bitflags = { version = "2", features = ["serde"] }
+hmac = "0.12"
+rust_decimal = { version = "1", features = ["serde", "serde-with-str"] }
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+
+[package]
+name = "venue"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+hedged-grid-binance = []
+hedged-grid-gate = []
+hedged-grid-bitget = []
+
+[[bin]]
+name = "venue"
+path = "src/main.rs"
+
+[[bin]]
+name = "hedged-grid-binance"
+path = "src/bin/hedged-grid-binance.rs"
+required-features = ["hedged-grid-binance"]
+
+[[bin]]
+name = "hedged-grid-gate"
+path = "src/bin/hedged-grid-gate.rs"
+required-features = ["hedged-grid-gate"]
+
+[[bin]]
+name = "hedged-grid-bitget"
+path = "src/bin/hedged-grid-bitget.rs"
+required-features = ["hedged-grid-bitget"]
+
+[[bin]]
+name = "verify-grid-inventory-recovery"
+path = "src/bin/verify-grid-inventory-recovery.rs"
+
+[[bin]]
+name = "verify-grid-exposure-shadow"
+path = "src/bin/verify-grid-exposure-shadow.rs"
+
+[dependencies]
+base64.workspace = true
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+dotenvy = "0.15"
+fs2 = "0.4"
+hmac.workspace = true
+rust_decimal.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+toml = "0.9"
+tungstenite = { version = "0.26", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+venue-domain = { path = "crates/venue-domain" }
+venue-gateway-api = { path = "crates/venue-gateway-api" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+expect_used = "deny"
+panic = "deny"
+unwrap_used = "deny"

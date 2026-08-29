@@ -1,0 +1,26 @@
+[package]
+name = "venue-gateway-okx"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+base64.workspace = true
+hmac.workspace = true
+rust_decimal.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+venue-domain = { path = "../venue-domain" }
+venue-gateway-api = { path = "../venue-gateway-api" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+expect_used = "deny"
+panic = "deny"
+unwrap_used = "deny"

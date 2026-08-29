@@ -1,0 +1,21 @@
+# Stage 7 Gate.io USDT perpetual release. Copy to an untracked local file; credentials are resolved
+# only from GATEIO_API_KEY and GATEIO_API_SECRET in the process environment or workspace-root .env.
+log = "info"
+trading_account_id = "f073dff3-7743-4cdb-9516-fb57f8b139f2"
+symbol = "DOGE/USDT"
+
+[gate]
+account_binding = "usdt_futures_dual"
+
+[hedged_grid]
+grid_count = 3
+
+[hedged_grid.exposure_take_profit]
+enabled = true
+shadow = false
+position_equity_multiple = "3"
+unrealized_pnl_equity_ratio = "0.05"
+reduce_ratio = "0.30"
+snapshot_interval_ms = 120000
+max_snapshot_age_ms = 3000
+rearm_clear_generations = 2

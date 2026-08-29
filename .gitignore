@@ -1,0 +1,16 @@
+/bak/
+/target/
+/target-*/
+/.codex-target-*/
+/.codex-local-toolchain/
+/releases/
+/.env
+/.secrets/
+/artifacts/
+/venue.local.toml
+/logs/
+/data/
+*.log
+*.jsonl
+*.sqlite
+*.db

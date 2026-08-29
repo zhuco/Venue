@@ -1,0 +1,20 @@
+log = "info"
+trading_account_id = "3f62c1d0-7d50-432c-802d-df76e3afdc92"
+symbol = "SOL/USDC"
+
+[binance]
+account_binding = "portfolio_margin_um"
+private_custody_max_stale_ms = 30000
+
+[hedged_grid]
+grid_count = 10
+
+[hedged_grid.exposure_take_profit]
+enabled = true
+shadow = false
+position_equity_multiple = "3"
+unrealized_pnl_equity_ratio = "0.05"
+reduce_ratio = "0.30"
+snapshot_interval_ms = 120000
+max_snapshot_age_ms = 3000
+rearm_clear_generations = 2

@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "provenance": [
+    {
+      "source_path": "bak/VenueAlpha/strategies/multi-alpha-scalper/src/runtime.rs",
+      "source_sha256": "185f7c0bb9680996de5128c2aaa8220290d52dc2e72faa9b90dcbc8bd8681f5e",
+      "line_start": 636,
+      "line_end": 681,
+      "symbols": ["MasExecutionCoordinator::run"]
+    },
+    {
+      "source_path": "bak/VenueAlpha/strategies/multi-alpha-scalper/src/runtime.rs",
+      "source_sha256": "185f7c0bb9680996de5128c2aaa8220290d52dc2e72faa9b90dcbc8bd8681f5e",
+      "line_start": 1236,
+      "line_end": 1328,
+      "symbols": ["MasExecutionCoordinator::handle_command", "MasExecutionCoordinator::wait_for_safe_stop"]
+    },
+    {
+      "source_path": "bak/VenueAlpha/strategies/multi-alpha-scalper/src/runtime_tests.rs",
+      "source_sha256": "0f2ac7961af884ea7bea6a02e5fe901d85cb59b5ed3da86e38b6a3666bc08e13",
+      "line_start": 952,
+      "line_end": 978,
+      "symbols": ["periodic_reconcile_stop_convergence_regression"]
+    },
+    {
+      "source_path": "bak/VenueAlpha/apps/venue-alpha-runner/src/main.rs",
+      "source_sha256": "b59f6e0c5851193135012dd3393d076bd6671a7db0b0e5959c8b85f42ac033b9",
+      "line_start": 644,
+      "line_end": 847,
+      "symbols": ["run_mas_instance"]
+    },
+    {
+      "source_path": "bak/VenueAlpha/apps/venue-alpha-runner/src/risk_replay.rs",
+      "source_sha256": "ce0c2080145417adfe31415fc6c062137e935b060e39dd200970770817052742",
+      "line_start": 58,
+      "line_end": 129,
+      "symbols": ["fetch_risk_replay", "sort_risk_facts_for_ledger"]
+    }
+  ],
+  "coordinator_actor": {
+    "bootstrap_before_loop": true,
+    "biased_priority": [
+      "command",
+      "private_reconcile_signal",
+      "timer_reconcile",
+      "market_frame"
+    ],
+    "timer_missed_tick_behavior": "skip",
+    "command_channel_closed": {
+      "control": "stop_and_protect",
+      "wait_for_safe_stop": true
+    },
+    "market_enabled_states": ["running", "resuming_cooldown"]
+  },
+  "runner_composition": {
+    "command_channel_capacity": 64,
+    "private_reconcile_signal_capacity": 1,
+    "private_event_signal_is_try_send": true,
+    "runtime_reconcile_interval_ms": 250,
+    "risk_poll_missed_tick_behavior": "skip",
+    "risk_delivery": "command_channel",
+    "shutdown": {
+      "command": "shutdown",
+      "await_runtime_safe_convergence": true
+    }
+  },
+  "risk_replay": {
+    "max_pages": 128,
+    "max_facts_per_page": 512,
+    "generation_change_refetches_from_initial_cursor": true,
+    "validate_cursor_before_event_time_sort": true,
+    "terminal_empty_page_may_hold_cursor": true,
+    "stale_replay_after_max_stale_ms": "shutdown"
+  },
+  "safety_regression": {
+    "repeated_capability_gap_control": "stop_and_protect_once",
+    "convergence_terminal_state": "stopped_flat",
+    "durable_pending_mutation": "none"
+  }
+}

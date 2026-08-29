@@ -1,0 +1,7 @@
+log = "info"
+trading_account_id = "3f62c1d0-7d50-432c-802d-df76e3afdc92"
+symbol = "SOL/USDT"
+
+[binance]
+account_binding = "portfolio_margin_um"
+private_custody_max_stale_ms = 30000

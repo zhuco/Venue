@@ -1,0 +1,36 @@
+{
+  "code": "0",
+  "msg": "",
+  "data": [
+    {
+      "instType": "SWAP",
+      "instId": "BTC-USDT-SWAP",
+      "billId": "9002",
+      "ordId": "order-9002",
+      "clOrdId": "0123456789abcdef0123456789abcdef",
+      "fillPx": "60000",
+      "fillSz": "2",
+      "side": "buy",
+      "posSide": "long",
+      "subType": "3",
+      "feeCcy": "usdt",
+      "fee": "-0.25",
+      "ts": "1787911201500"
+    },
+    {
+      "instType": "SWAP",
+      "instId": "BTC-USDT-SWAP",
+      "billId": "9001",
+      "ordId": "order-9001",
+      "clOrdId": "0123456789abcdef0123456789abcdef",
+      "fillPx": "60010",
+      "fillSz": "1",
+      "side": "sell",
+      "posSide": "short",
+      "subType": "3",
+      "feeCcy": "usdt",
+      "fee": "-0.13",
+      "ts": "1787911201600"
+    }
+  ]
+}

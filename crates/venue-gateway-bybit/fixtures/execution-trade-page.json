@@ -1,0 +1,54 @@
+{
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+    "category": "linear",
+    "nextPageCursor": "page=2",
+    "list": [
+      {
+        "symbol": "BTCUSDT",
+        "orderId": "20",
+        "orderLinkId": "MANAGED_CLIENT_ID",
+        "side": "Buy",
+        "execId": "a",
+        "execPrice": "100",
+        "execQty": "1",
+        "execFee": "-0.01",
+        "execTime": "1000",
+        "feeCurrency": "USDT",
+        "closedSize": "0",
+        "execType": "Trade"
+      },
+      {
+        "symbol": "BTCUSDT",
+        "orderId": "21",
+        "orderLinkId": "foreign",
+        "side": "Buy",
+        "execId": "b",
+        "execPrice": "101",
+        "execQty": "2",
+        "execFee": "0.02",
+        "execTime": "1500",
+        "feeCurrency": "USDT",
+        "closedSize": "2",
+        "execType": "Trade"
+      },
+      {
+        "symbol": "BTCUSDT",
+        "orderId": "22",
+        "orderLinkId": "foreign",
+        "side": "Sell",
+        "execId": "c",
+        "execPrice": "102",
+        "execQty": "3",
+        "execFee": "0.03",
+        "execTime": "2000",
+        "feeCurrency": "USDT",
+        "closedSize": "0",
+        "execType": "Trade"
+      }
+    ]
+  },
+  "retExtInfo": {},
+  "time": 2000
+}

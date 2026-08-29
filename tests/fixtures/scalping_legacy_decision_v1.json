@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "source_path": "bak/VenueAlpha/strategies/multi-alpha-scalper/src/decision.rs",
+    "source_sha256": "26bdbb18e7a02f017ab3f09bb959a032adc0937c379d7d32825aec2589c74ac4",
+    "extraction_symbols": [
+      "tests::frame",
+      "tests::evidence",
+      "tests::range_fade_is_deterministic_and_deduplicated",
+      "tests::breakout_requires_durable_boundary_and_compression_cycle_identity",
+      "tests::reprice_keeps_frozen_identity_and_rejects_cost_deterioration"
+    ],
+    "migration_exceptions": [
+      {
+        "legacy": "range_deviation_bps=0.5 under max_spread_bps=0.8",
+        "root": "min_deviation_bps=0.2",
+        "reason": "WeightedMid divergence is bounded by half the spread, making the old default unreachable."
+      },
+      {
+        "legacy": "regime confidence divided by 10 before the 0.6 gate",
+        "root": "raw normalized confidence with min=0.6 and margin=0.1",
+        "reason": "The old scaling made the configured confidence gate unreachable."
+      }
+    ]
+  },
+  "range_fade": {
+    "frame": {
+      "mid_price": "100",
+      "fair_price": "101",
+      "spread_bps": "0.1",
+      "depth_quote": "1000",
+      "book_imbalance": "1",
+      "trade_imbalance": "1",
+      "short_return_bps": "0",
+      "trend_efficiency": "0",
+      "bandwidth_expansion": "0",
+      "expected_move_bps": "20",
+      "toxicity": "0"
+    },
+    "evidence": {
+      "fill_ratio": "1",
+      "fill_probability": "1",
+      "target_probability": "0.8",
+      "stop_probability": "0.1",
+      "other_probability": "0.1",
+      "target_pnl_bps": "20",
+      "stop_pnl_bps": "-5",
+      "other_pnl_bps": "0",
+      "entry_cost_bps": "0.2",
+      "exit_cost_bps": "0.4",
+      "funding_cost_bps": "0",
+      "nonfill_cost_bps": "0",
+      "opportunity_cost_bps": "0",
+      "uncertainty_bps": "1",
+      "calibration_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+      "cost_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "risk_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "expected": {
+      "direction": "long",
+      "expert": "range_fade",
+      "entry_style": "passive_maker",
+      "outcome_expected_value_bps": "15.5",
+      "net_expected_value_bps": "14.9",
+      "robust_expected_value_bps": "13.9"
+    }
+  },
+  "reprice": {
+    "observed_at_ms": 101,
+    "fresh_entry_cost_bps": "0.2",
+    "degraded_entry_cost_bps": "1000"
+  },
+  "breakout": {
+    "initial_watermark_ms": 100,
+    "mature_watermark_ms": 2100,
+    "same_cycle_watermark_ms": 3101,
+    "next_cycle_watermark_ms": 4102,
+    "boundary_sequence": 1,
+    "compression_cycle_sequence": 1,
+    "next_boundary_sequence": 2,
+    "next_compression_cycle_sequence": 2
+  }
+}

@@ -1,0 +1,23 @@
+[package]
+name = "venue-gateway-api"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+bitflags.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+venue-domain = { path = "../venue-domain" }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+expect_used = "deny"
+panic = "deny"
+unwrap_used = "deny"

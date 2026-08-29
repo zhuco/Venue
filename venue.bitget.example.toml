@@ -1,0 +1,22 @@
+# Stage 7 Bitget UTA USDT perpetual release. Copy to an untracked local file; credentials are
+# resolved from the process environment or workspace-root .env. The passphrase reader accepts
+# BITGET_API_PASSPHRASE and the existing BITGET_PASSPHRASE alias.
+log = "info"
+trading_account_id = "b020247b-c25f-4df9-93ce-32daf9e2beff"
+symbol = "DOGE/USDT"
+
+[bitget]
+account_binding = "uta_usdt_futures_hedge"
+
+[hedged_grid]
+grid_count = 3
+
+[hedged_grid.exposure_take_profit]
+enabled = true
+shadow = false
+position_equity_multiple = "3"
+unrealized_pnl_equity_ratio = "0.05"
+reduce_ratio = "0.30"
+snapshot_interval_ms = 120000
+max_snapshot_age_ms = 3000
+rearm_clear_generations = 2
