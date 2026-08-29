@@ -30,8 +30,18 @@ use super::{
 use binance_private::USER_TRADES_PAGE_LIMIT;
 pub use binance_private::{
     RecentFillsCursor, RecentFillsPageRequest, RecentFillsPaginationError, RecentFillsReadback,
-    paginate_recent_fills,
 };
+
+pub fn paginate_recent_fills<F>(
+    initial_cursor: RecentFillsCursor,
+    target_through_ms: u64,
+    fetch: F,
+) -> Result<RecentFillsReadback, PrivateError>
+where
+    F: FnMut(RecentFillsPageRequest) -> Result<String, PrivateError>,
+{
+    binance_private::paginate_recent_fills(initial_cursor, target_through_ms, fetch)
+}
 
 mod public_stream;
 pub use public_stream::{PublicStream, PublicStreamSocket, depth_stream_url, public_stream_url};

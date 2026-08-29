@@ -24,8 +24,33 @@ use crate::domain::{
 };
 use crate::exchange::websocket;
 
-mod bitget_risk;
-pub use bitget_risk::{BitgetRiskReadback, parse_risk_snapshots};
+use venue_gateway_bitget::risk as bitget_risk;
+pub use venue_gateway_bitget::risk::BitgetRiskReadback;
+
+pub fn parse_risk_snapshots(
+    assets_value: &Value,
+    position_values: &[Value],
+    symbol: &Symbol,
+    account: &str,
+    private_generation: u64,
+    observed_at_ms: u64,
+) -> Result<
+    (
+        crate::domain::AccountRiskSnapshot,
+        Vec<crate::domain::LegRiskSnapshot>,
+    ),
+    BitgetError,
+> {
+    bitget_risk::parse_risk_snapshots(
+        assets_value,
+        position_values,
+        symbol,
+        account,
+        private_generation,
+        observed_at_ms,
+    )
+    .map_err(BitgetError::from)
+}
 
 const API_BASE_URL: &str = "https://api.bitget.com";
 const PRIVATE_WS_URL: &str = "wss://ws.bitget.com/v3/ws/private";
@@ -985,10 +1010,7 @@ fn filter_private_event_for_symbol(value: &mut Value, symbol: &str) -> Result<bo
 }
 
 pub fn native_symbol(symbol: &Symbol) -> Result<String, BitgetError> {
-    if symbol.quote() != "USDT" {
-        return Err(BitgetError::Symbol);
-    }
-    Ok(format!("{}USDT", symbol.base()))
+    bitget_risk::native_symbol(symbol).map_err(BitgetError::from)
 }
 
 pub fn parse_contract_rules(
@@ -1337,11 +1359,7 @@ fn parse_side(value: &str) -> Result<OrderSide, BitgetError> {
     }
 }
 fn parse_position_side(value: &str) -> Result<PositionSide, BitgetError> {
-    match value {
-        "long" => Ok(PositionSide::Long),
-        "short" => Ok(PositionSide::Short),
-        _ => Err(BitgetError::Payload),
-    }
+    bitget_risk::parse_position_side(value).map_err(BitgetError::from)
 }
 fn native_side(value: OrderSide) -> &'static str {
     match value {
@@ -1583,13 +1601,10 @@ fn parse_json(text: &str) -> Result<Value, BitgetError> {
     serde_json::from_str(text).map_err(|_| BitgetError::Payload)
 }
 fn object(value: &Value) -> Result<&Map<String, Value>, BitgetError> {
-    value.as_object().ok_or(BitgetError::Payload)
+    bitget_risk::object(value).map_err(BitgetError::from)
 }
 fn text<'a>(object: &'a Map<String, Value>, field: &str) -> Result<&'a str, BitgetError> {
-    object
-        .get(field)
-        .and_then(Value::as_str)
-        .ok_or(BitgetError::Payload)
+    bitget_risk::text(object, field).map_err(BitgetError::from)
 }
 fn identifier(value: Option<&Value>) -> Result<String, BitgetError> {
     match value {
@@ -1599,7 +1614,7 @@ fn identifier(value: Option<&Value>) -> Result<String, BitgetError> {
     }
 }
 fn decimal(object: &Map<String, Value>, field: &str) -> Result<Decimal, BitgetError> {
-    decimal_value(object.get(field))
+    bitget_risk::decimal(object, field).map_err(BitgetError::from)
 }
 fn decimal_value(value: Option<&Value>) -> Result<Decimal, BitgetError> {
     match value {
@@ -1768,6 +1783,17 @@ pub enum BitgetError {
     WebSocketSubscribe,
     #[error("Bitget private WebSocket closed")]
     StreamClosed,
+}
+
+impl From<venue_gateway_bitget::risk::BitgetRiskError> for BitgetError {
+    fn from(error: venue_gateway_bitget::risk::BitgetRiskError) -> Self {
+        match error {
+            venue_gateway_bitget::risk::BitgetRiskError::Payload => Self::Payload,
+            venue_gateway_bitget::risk::BitgetRiskError::Symbol => Self::Symbol,
+            venue_gateway_bitget::risk::BitgetRiskError::PositionMode => Self::PositionMode,
+            venue_gateway_bitget::risk::BitgetRiskError::RiskSnapshot => Self::RiskSnapshot,
+        }
+    }
 }
 
 fn is_success_code(value: Option<&Value>) -> bool {

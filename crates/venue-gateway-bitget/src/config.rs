@@ -2,10 +2,10 @@ use venue_gateway_api::GatewayMode;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BitgetConfig {
-    pub rest_origin: &'static str,
-    pub public_ws: &'static str,
-    pub private_ws: &'static str,
-    pub paper_trading: bool,
+    mode: GatewayMode,
+    rest_origin: &'static str,
+    public_ws: &'static str,
+    private_ws: &'static str,
 }
 
 impl BitgetConfig {
@@ -13,18 +13,43 @@ impl BitgetConfig {
     pub const fn for_mode(mode: GatewayMode) -> Self {
         match mode {
             GatewayMode::Test => Self {
+                mode,
                 rest_origin: "https://api.bitget.com",
                 public_ws: "wss://wspap.bitget.com/v3/ws/public",
                 private_ws: "wss://wspap.bitget.com/v3/ws/private",
-                paper_trading: true,
             },
             GatewayMode::Live => Self {
+                mode,
                 rest_origin: "https://api.bitget.com",
                 public_ws: "wss://ws.bitget.com/v3/ws/public",
                 private_ws: "wss://ws.bitget.com/v3/ws/private",
-                paper_trading: false,
             },
         }
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> GatewayMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub const fn rest_origin(&self) -> &'static str {
+        self.rest_origin
+    }
+
+    #[must_use]
+    pub const fn public_ws(&self) -> &'static str {
+        self.public_ws
+    }
+
+    #[must_use]
+    pub const fn private_ws(&self) -> &'static str {
+        self.private_ws
+    }
+
+    #[must_use]
+    pub const fn paper_trading(&self) -> bool {
+        matches!(self.mode, GatewayMode::Test)
     }
 }
 
@@ -35,15 +60,17 @@ mod tests {
     #[test]
     fn test_is_exactly_demo_and_live_is_exactly_production() {
         let test = BitgetConfig::for_mode(GatewayMode::Test);
-        assert_eq!(test.rest_origin, "https://api.bitget.com");
-        assert_eq!(test.public_ws, "wss://wspap.bitget.com/v3/ws/public");
-        assert_eq!(test.private_ws, "wss://wspap.bitget.com/v3/ws/private");
-        assert!(test.paper_trading);
+        assert_eq!(test.rest_origin(), "https://api.bitget.com");
+        assert_eq!(test.public_ws(), "wss://wspap.bitget.com/v3/ws/public");
+        assert_eq!(test.private_ws(), "wss://wspap.bitget.com/v3/ws/private");
+        assert!(test.paper_trading());
+        assert_eq!(test.mode(), GatewayMode::Test);
 
         let live = BitgetConfig::for_mode(GatewayMode::Live);
-        assert_eq!(live.rest_origin, "https://api.bitget.com");
-        assert_eq!(live.public_ws, "wss://ws.bitget.com/v3/ws/public");
-        assert_eq!(live.private_ws, "wss://ws.bitget.com/v3/ws/private");
-        assert!(!live.paper_trading);
+        assert_eq!(live.rest_origin(), "https://api.bitget.com");
+        assert_eq!(live.public_ws(), "wss://ws.bitget.com/v3/ws/public");
+        assert_eq!(live.private_ws(), "wss://ws.bitget.com/v3/ws/private");
+        assert!(!live.paper_trading());
+        assert_eq!(live.mode(), GatewayMode::Live);
     }
 }

@@ -3,6 +3,7 @@ mod config;
 mod credentials;
 pub mod endpoints;
 pub mod public;
+pub mod risk;
 mod sign;
 
 pub use binding::{BitgetAccountBinding, BitgetBindingError};

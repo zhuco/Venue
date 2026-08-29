@@ -1,11 +1,11 @@
 use hmac::{Hmac, Mac};
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha512};
 
-use crate::{GateCredentials, GateProtocolError};
+use crate::{GateCredentials, GateProtocolError, endpoints};
 
 pub struct GateRestSignedHeaders {
-    entries: [(String, String); 3],
+    entries: [(String, SecretString); 3],
 }
 
 impl GateRestSignedHeaders {
@@ -14,7 +14,7 @@ impl GateRestSignedHeaders {
         self.entries
             .iter()
             .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
+            .map(|(_, value)| value.expose_secret())
     }
 }
 
@@ -23,18 +23,18 @@ pub fn sign_rest(
     credentials: &GateCredentials,
     timestamp_sec: i64,
     method: &str,
-    path: &str,
+    endpoint: &str,
     query: &str,
     body: &[u8],
 ) -> Result<GateRestSignedHeaders, GateProtocolError> {
     if timestamp_sec <= 0
         || method.is_empty()
         || !method.bytes().all(|byte| byte.is_ascii_uppercase())
-        || !path.starts_with("/api/v4/")
         || query.starts_with('?')
     {
         return Err(GateProtocolError::SigningInput);
     }
+    let path = endpoints::canonical_rest_path(endpoint)?;
     let body_hash = hex(&Sha512::digest(body));
     let canonical = format!("{method}\n{path}\n{query}\n{body_hash}\n{timestamp_sec}");
     let signature = signature(credentials, canonical.as_bytes())?;
@@ -42,10 +42,13 @@ pub fn sign_rest(
         entries: [
             (
                 "KEY".to_owned(),
-                credentials.api_key.expose_secret().to_owned(),
+                SecretString::from(credentials.api_key.expose_secret().to_owned()),
             ),
-            ("Timestamp".to_owned(), timestamp_sec.to_string()),
-            ("SIGN".to_owned(), signature),
+            (
+                "Timestamp".to_owned(),
+                SecretString::from(timestamp_sec.to_string()),
+            ),
+            ("SIGN".to_owned(), SecretString::from(signature)),
         ],
     })
 }
@@ -71,17 +74,17 @@ impl GatePrivateChannel {
 }
 
 pub struct GateWebSocketAuth {
-    api_key: String,
-    signature: String,
+    api_key: SecretString,
+    signature: SecretString,
 }
 
 impl GateWebSocketAuth {
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&str> {
         if name.eq_ignore_ascii_case("KEY") {
-            Some(self.api_key.as_str())
+            Some(self.api_key.expose_secret())
         } else if name.eq_ignore_ascii_case("SIGN") {
-            Some(self.signature.as_str())
+            Some(self.signature.expose_secret())
         } else if name.eq_ignore_ascii_case("method") {
             Some("api_key")
         } else {
@@ -104,8 +107,8 @@ pub fn sign_websocket_subscription(
         channel.as_str()
     );
     Ok(GateWebSocketAuth {
-        api_key: credentials.api_key.expose_secret().to_owned(),
-        signature: signature(credentials, canonical.as_bytes())?,
+        api_key: SecretString::from(credentials.api_key.expose_secret().to_owned()),
+        signature: SecretString::from(signature(credentials, canonical.as_bytes())?),
     })
 }
 
@@ -137,15 +140,21 @@ mod tests {
     fn modes_select_current_official_test_or_live_origins() {
         let test = GateConfig::for_mode(GatewayMode::Test);
         let live = GateConfig::for_mode(GatewayMode::Live);
-        assert_eq!(test.rest_origin, "https://api-testnet.gateapi.io/api/v4");
+        assert_eq!(test.rest_origin(), "https://api-testnet.gateapi.io/api/v4");
         assert_eq!(
-            test.usdt_futures_ws,
+            test.usdt_futures_ws(),
             "wss://ws-testnet.gate.com/v4/ws/futures/usdt"
         );
-        assert_eq!(live.rest_origin, "https://api.gateio.ws/api/v4");
-        assert_eq!(live.usdt_futures_ws, "wss://fx-ws.gateio.ws/v4/ws/usdt");
-        assert!(test.testnet);
-        assert!(!live.testnet);
+        assert_eq!(live.rest_origin(), "https://api.gateio.ws/api/v4");
+        assert_eq!(live.usdt_futures_ws(), "wss://fx-ws.gateio.ws/v4/ws/usdt");
+        assert!(test.testnet());
+        assert!(!live.testnet());
+        assert_eq!(test.mode(), GatewayMode::Test);
+        assert_eq!(live.mode(), GatewayMode::Live);
+        assert_eq!(
+            test.rest_url(endpoints::FUTURES_ORDER),
+            Ok("https://api-testnet.gateapi.io/api/v4/futures/usdt/orders".to_owned())
+        );
     }
 
     #[test]
@@ -172,7 +181,7 @@ mod tests {
             &credentials,
             1_541_993_715,
             "GET",
-            "/api/v4/futures/orders",
+            "/futures/orders",
             "contract=BTC_USD&status=finished&limit=50",
             &[],
         )?;
@@ -209,11 +218,11 @@ mod tests {
         let credentials = GateCredentials::from_values("key", "secret");
         if let Ok(credentials) = credentials {
             assert_eq!(
-                sign_rest(&credentials, 1, "get", "/api/v4/futures/orders", "", &[]).err(),
+                sign_rest(&credentials, 1, "get", "/futures/orders", "", &[]).err(),
                 Some(GateProtocolError::SigningInput)
             );
             assert_eq!(
-                sign_rest(&credentials, 1, "GET", "/futures/orders", "", &[]).err(),
+                sign_rest(&credentials, 1, "GET", "/api/v4/futures/orders", "", &[]).err(),
                 Some(GateProtocolError::SigningInput)
             );
             assert_eq!(

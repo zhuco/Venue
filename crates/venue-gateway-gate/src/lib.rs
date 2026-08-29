@@ -8,11 +8,18 @@ mod config;
 mod credentials;
 pub mod endpoints;
 mod public;
+mod risk;
 mod sign;
 
 pub use config::{GateConfig, GateProductScope};
 pub use credentials::GateCredentials;
 pub use public::*;
+pub use risk::{
+    GateContractRules, GateRiskAccountMode, GateRiskError, GateRiskReadback, decimal,
+    decimal_value, dual_position_side, object, parse_dual_position_mode, parse_risk_snapshots,
+    parse_risk_snapshots_with_unified, requires_unified_single_currency, text,
+    validate_risk_readback_window,
+};
 pub use sign::{
     GatePrivateChannel, GateRestSignedHeaders, GateWebSocketAuth, sign_rest,
     sign_websocket_subscription,

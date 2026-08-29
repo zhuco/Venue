@@ -1,10 +1,9 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hmac::{Hmac, Mac};
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use sha2::Sha256;
-use venue_gateway_api::GatewayMode;
 
-use crate::{BitgetCredentials, BitgetError};
+use crate::{BitgetConfig, BitgetCredentials, BitgetError};
 
 pub struct SignInput<'a> {
     pub timestamp_ms: u64,
@@ -15,7 +14,7 @@ pub struct SignInput<'a> {
 }
 
 pub struct SignedHeaders {
-    entries: [(String, String); 6],
+    entries: [(String, SecretString); 6],
     paper_trading: bool,
 }
 
@@ -28,7 +27,7 @@ impl SignedHeaders {
         self.entries
             .iter()
             .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
+            .map(|(_, value)| value.expose_secret())
     }
 }
 
@@ -55,7 +54,7 @@ pub fn prehash(input: &SignInput<'_>) -> Result<Vec<u8>, BitgetError> {
 
 pub fn sign(
     credentials: &BitgetCredentials,
-    mode: GatewayMode,
+    config: &BitgetConfig,
     input: &SignInput<'_>,
 ) -> Result<SignedHeaders, BitgetError> {
     let prehash = prehash(input)?;
@@ -67,17 +66,26 @@ pub fn sign(
     let signature = STANDARD.encode(mac.finalize().into_bytes());
     Ok(SignedHeaders {
         entries: [
-            ("ACCESS-KEY".to_owned(), api_key.to_owned()),
-            ("ACCESS-SIGN".to_owned(), signature),
+            (
+                "ACCESS-KEY".to_owned(),
+                SecretString::from(api_key.to_owned()),
+            ),
+            ("ACCESS-SIGN".to_owned(), SecretString::from(signature)),
             (
                 "ACCESS-TIMESTAMP".to_owned(),
-                input.timestamp_ms.to_string(),
+                SecretString::from(input.timestamp_ms.to_string()),
             ),
-            ("ACCESS-PASSPHRASE".to_owned(), passphrase.to_owned()),
-            ("Content-Type".to_owned(), "application/json".to_owned()),
-            ("locale".to_owned(), "en-US".to_owned()),
+            (
+                "ACCESS-PASSPHRASE".to_owned(),
+                SecretString::from(passphrase.to_owned()),
+            ),
+            (
+                "Content-Type".to_owned(),
+                SecretString::from("application/json".to_owned()),
+            ),
+            ("locale".to_owned(), SecretString::from("en-US".to_owned())),
         ],
-        paper_trading: matches!(mode, GatewayMode::Test),
+        paper_trading: config.paper_trading(),
     })
 }
 
@@ -94,6 +102,8 @@ pub fn ws_sign(credentials: &BitgetCredentials, timestamp_s: u64) -> Result<Stri
 
 #[cfg(test)]
 mod tests {
+    use venue_gateway_api::GatewayMode;
+
     use super::*;
 
     fn credentials() -> Result<BitgetCredentials, BitgetError> {
@@ -113,7 +123,11 @@ mod tests {
             prehash(&input)?,
             b"1627366780545GET/api/v3/account/fee-rate?category=SPOT&symbol=BTCUSDT"
         );
-        let headers = sign(&credentials()?, GatewayMode::Live, &input)?;
+        let headers = sign(
+            &credentials()?,
+            &BitgetConfig::for_mode(GatewayMode::Live),
+            &input,
+        )?;
         assert_eq!(
             headers.get("ACCESS-SIGN"),
             Some("Cnzpvm2X8kzdlPnV+DENDS3HIuU/jZq4eJknd1s0vfQ=")
@@ -131,7 +145,11 @@ mod tests {
             query: "",
             body: br#"{"symbol":"BTCUSDT"}"#,
         };
-        let headers = sign(&credentials()?, GatewayMode::Test, &input)?;
+        let headers = sign(
+            &credentials()?,
+            &BitgetConfig::for_mode(GatewayMode::Test),
+            &input,
+        )?;
         assert_eq!(headers.get("paptrading"), Some("1"));
         assert_eq!(headers.get("content-type"), Some("application/json"));
         Ok(())

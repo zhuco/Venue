@@ -20,7 +20,7 @@ impl BitgetCredentials {
             optional_environment("BITGET_API_PASSPHRASE")?,
             optional_environment("BITGET_PASSPHRASE")?,
         )?;
-        Self::from_secrets(api_key, api_secret, SecretString::from(passphrase))
+        Self::from_secrets(api_key, api_secret, passphrase)
     }
 
     #[cfg(test)]
@@ -55,20 +55,22 @@ impl BitgetCredentials {
     }
 }
 
-fn optional_environment(name: &str) -> Result<Option<String>, BitgetError> {
+fn optional_environment(name: &str) -> Result<Option<SecretString>, BitgetError> {
     match std::env::var(name) {
-        Ok(value) => Ok(Some(value)),
+        Ok(value) => Ok(Some(SecretString::from(value))),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(BitgetError::Credentials),
     }
 }
 
 fn select_passphrase(
-    canonical: Option<String>,
-    legacy: Option<String>,
-) -> Result<String, BitgetError> {
+    canonical: Option<SecretString>,
+    legacy: Option<SecretString>,
+) -> Result<SecretString, BitgetError> {
     match (canonical, legacy) {
-        (Some(canonical), Some(legacy)) if canonical != legacy => Err(BitgetError::Credentials),
+        (Some(canonical), Some(legacy)) if canonical.expose_secret() != legacy.expose_secret() => {
+            Err(BitgetError::Credentials)
+        }
         (Some(canonical), _) => Ok(canonical),
         (None, Some(legacy)) => Ok(legacy),
         (None, None) => Err(BitgetError::Credentials),
@@ -88,17 +90,25 @@ mod tests {
 
     #[test]
     fn passphrase_aliases_must_not_conflict() {
-        assert_eq!(
-            select_passphrase(Some("primary".to_owned()), Some("legacy".to_owned())),
-            Err(BitgetError::Credentials)
+        let conflict = select_passphrase(
+            Some(SecretString::from("primary".to_owned())),
+            Some(SecretString::from("legacy".to_owned())),
         );
-        assert_eq!(
-            select_passphrase(Some("same".to_owned()), Some("same".to_owned())),
-            Ok("same".to_owned())
+        assert!(matches!(conflict, Err(BitgetError::Credentials)));
+
+        let same = select_passphrase(
+            Some(SecretString::from("same".to_owned())),
+            Some(SecretString::from("same".to_owned())),
         );
-        assert_eq!(
-            select_passphrase(None, Some("legacy".to_owned())),
-            Ok("legacy".to_owned())
-        );
+        assert!(same.is_ok());
+        if let Ok(same) = same {
+            assert_eq!(same.expose_secret(), "same");
+        }
+
+        let legacy = select_passphrase(None, Some(SecretString::from("legacy".to_owned())));
+        assert!(legacy.is_ok());
+        if let Ok(legacy) = legacy {
+            assert_eq!(legacy.expose_secret(), "legacy");
+        }
     }
 }

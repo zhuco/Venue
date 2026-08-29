@@ -23,9 +23,8 @@ use crate::domain::{
     Symbol,
 };
 use crate::exchange::websocket;
-
-pub(crate) mod gate_risk;
-pub use gate_risk::{GateRiskAccountMode, GateRiskReadback, parse_risk_snapshots};
+pub use venue_gateway_gate::{GateContractRules, GateRiskAccountMode, GateRiskReadback};
+use venue_gateway_gate::{decimal, decimal_value, dual_position_side, object, text};
 
 const API_BASE_URL: &str = "https://api.gateio.ws/api/v4";
 const SETTLE: &str = "usdt";
@@ -62,32 +61,90 @@ impl GateCredentials {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GateContractRules {
-    pub native_symbol: String,
-    pub instrument: Instrument,
-    pub quanto_multiplier: Decimal,
-    pub minimum_contracts: Decimal,
-    pub decimal_contracts: bool,
+trait GateContractRulesCompat {
+    fn native_contracts(&self, quantity: Decimal) -> Result<Decimal, GateError>;
 }
 
-impl GateContractRules {
-    pub fn minimum_quantity(&self) -> Decimal {
-        self.quanto_multiplier * self.minimum_contracts
+impl GateContractRulesCompat for GateContractRules {
+    fn native_contracts(&self, quantity: Decimal) -> Result<Decimal, GateError> {
+        self.native_contracts_checked(quantity).map_err(Into::into)
+    }
+}
+
+pub fn parse_risk_snapshots(
+    account_value: &Value,
+    position_values: &[Value],
+    symbol: &Symbol,
+    rules: &GateContractRules,
+    account: &str,
+    private_generation: u64,
+    observed_at_ms: u64,
+) -> Result<
+    (
+        GateRiskAccountMode,
+        crate::domain::AccountRiskSnapshot,
+        Vec<crate::domain::LegRiskSnapshot>,
+    ),
+    GateError,
+> {
+    venue_gateway_gate::parse_risk_snapshots(
+        account_value,
+        position_values,
+        symbol,
+        rules,
+        account,
+        private_generation,
+        observed_at_ms,
+    )
+    .map_err(Into::into)
+}
+
+pub(crate) mod gate_risk {
+    use super::*;
+
+    pub(crate) fn validate_risk_readback_window(
+        started_at_ms: u64,
+        observed_at_ms: u64,
+    ) -> Result<(), GateError> {
+        venue_gateway_gate::validate_risk_readback_window(started_at_ms, observed_at_ms)
+            .map_err(Into::into)
     }
 
-    fn native_contracts(&self, quantity: Decimal) -> Result<Decimal, GateError> {
-        if !quantity.is_sign_positive() || quantity.is_zero() {
-            return Err(GateError::Quantity);
-        }
-        let contracts = quantity / self.quanto_multiplier;
-        if contracts < self.minimum_contracts {
-            return Err(GateError::Quantity);
-        }
-        if !self.decimal_contracts && contracts.fract() != Decimal::ZERO {
-            return Err(GateError::Quantity);
-        }
-        Ok(contracts)
+    pub(crate) fn requires_unified_single_currency(value: &Value) -> Result<bool, GateError> {
+        venue_gateway_gate::requires_unified_single_currency(value).map_err(Into::into)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn parse_risk_snapshots_with_unified(
+        account_value: &Value,
+        unified_mode_value: &Value,
+        unified_account_value: &Value,
+        position_values: &[Value],
+        symbol: &Symbol,
+        rules: &GateContractRules,
+        account: &str,
+        private_generation: u64,
+        observed_at_ms: u64,
+    ) -> Result<
+        (
+            GateRiskAccountMode,
+            crate::domain::AccountRiskSnapshot,
+            Vec<crate::domain::LegRiskSnapshot>,
+        ),
+        GateError,
+    > {
+        venue_gateway_gate::parse_risk_snapshots_with_unified(
+            account_value,
+            unified_mode_value,
+            unified_account_value,
+            position_values,
+            symbol,
+            rules,
+            account,
+            private_generation,
+            observed_at_ms,
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -548,7 +605,7 @@ impl GatePrivateRest {
         let fills = fills
             .iter()
             .map(|fill| {
-                Ok(GateFill {
+                Ok::<GateFill, GateError>(GateFill {
                     fill: parse_fill(fill, symbol, rules)
                         .map_err(|_| GateError::PrivatePayload("fills"))?,
                     client_order_id: parse_fill_client_order_id(fill)
@@ -1001,11 +1058,7 @@ pub fn parse_position(
     if text(object, "contract")? != rules.native_symbol || symbol != &rules.instrument.symbol {
         return Err(GateError::Symbol);
     }
-    let side = match text(object, "mode")? {
-        "dual_long" => PositionSide::Long,
-        "dual_short" => PositionSide::Short,
-        _ => return Err(GateError::Payload),
-    };
+    let side = dual_position_side(text(object, "mode")?).map_err(|_| GateError::Payload)?;
     let quantity = decimal(object, "size")?.abs() * rules.quanto_multiplier;
     Ok(Position {
         symbol: symbol.clone(),
@@ -1139,12 +1192,7 @@ pub fn parse_account_balance(value: &Value) -> Result<AccountBalance, GateError>
 }
 
 pub fn parse_dual_position_mode(value: &Value) -> Result<bool, GateError> {
-    matches!(
-        object(value)?.get("position_mode").and_then(Value::as_str),
-        Some("dual")
-    )
-    .then_some(true)
-    .ok_or(GateError::PositionMode)
+    venue_gateway_gate::parse_dual_position_mode(value).map_err(Into::into)
 }
 
 fn signed_contracts(contracts: Decimal, side: OrderSide) -> Result<Decimal, GateError> {
@@ -1427,35 +1475,10 @@ fn parse_json(text: &str) -> Result<Value, GateError> {
     serde_json::from_str(text).map_err(|_| GateError::Payload)
 }
 
-fn object(value: &Value) -> Result<&Map<String, Value>, GateError> {
-    value.as_object().ok_or(GateError::Payload)
-}
-
-fn text<'a>(object: &'a Map<String, Value>, field: &str) -> Result<&'a str, GateError> {
-    object
-        .get(field)
-        .and_then(Value::as_str)
-        .ok_or(GateError::Payload)
-}
-
 fn identifier(value: Option<&Value>) -> Result<String, GateError> {
     match value {
         Some(Value::String(value)) if !value.trim().is_empty() => Ok(value.to_owned()),
         Some(Value::Number(value)) => Ok(value.to_string()),
-        _ => Err(GateError::Payload),
-    }
-}
-
-fn decimal(object: &Map<String, Value>, field: &str) -> Result<Decimal, GateError> {
-    decimal_value(object.get(field))
-}
-
-fn decimal_value(value: Option<&Value>) -> Result<Decimal, GateError> {
-    match value {
-        Some(Value::String(value)) => Decimal::from_str(value).map_err(|_| GateError::Payload),
-        Some(Value::Number(value)) => {
-            Decimal::from_str(&value.to_string()).map_err(|_| GateError::Payload)
-        }
         _ => Err(GateError::Payload),
     }
 }
@@ -1533,7 +1556,7 @@ fn optional_decimal(value: Option<&Value>) -> Result<Decimal, GateError> {
     match value {
         None | Some(Value::Null) => Ok(Decimal::ZERO),
         Some(Value::String(value)) if value.is_empty() => Ok(Decimal::ZERO),
-        value => decimal_value(value),
+        value => Ok(decimal_value(value)?),
     }
 }
 
@@ -1649,6 +1672,18 @@ pub enum GateError {
     WebSocket,
     #[error("Gate.io private WebSocket closed")]
     StreamClosed,
+}
+
+impl From<venue_gateway_gate::GateRiskError> for GateError {
+    fn from(value: venue_gateway_gate::GateRiskError) -> Self {
+        match value {
+            venue_gateway_gate::GateRiskError::Payload => Self::Payload,
+            venue_gateway_gate::GateRiskError::PositionMode => Self::PositionMode,
+            venue_gateway_gate::GateRiskError::RiskAccountMode => Self::RiskAccountMode,
+            venue_gateway_gate::GateRiskError::RiskSnapshot => Self::RiskSnapshot,
+            venue_gateway_gate::GateRiskError::Quantity => Self::Quantity,
+        }
+    }
 }
 
 #[cfg(test)]
