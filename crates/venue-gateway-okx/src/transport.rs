@@ -19,8 +19,9 @@ use venue_gateway_api::GatewayBinding;
 
 use crate::{
     OkxAccountProfile, OkxActivePrivateSubscription, OkxConfig, OkxCredentials, OkxInstrument,
-    OkxPrivateRequest, OkxPrivateSubscription, OkxPrivateWsScope, OkxWsLoginFrame,
-    activate_private_subscription, build_private_subscribe, build_ws_login, parse_ws_login_ack,
+    OkxPrivateReadRequest, OkxPrivateRequest, OkxPrivateSubscription, OkxPrivateWsScope,
+    OkxWsLoginFrame, SignedHeaders, activate_private_subscription, build_private_subscribe,
+    build_ws_login, parse_ws_login_ack,
 };
 
 const HEADER_NAMES: [&str; 5] = [
@@ -143,20 +144,69 @@ impl OkxHttpTransport {
         if request.scope().gateway_binding() != self.config.gateway_binding() {
             return Err(OkxTransportError::Binding);
         }
-        if request.body().len() > self.max_body_bytes {
+        let signed = request
+            .signed_headers(credentials, &self.config, timestamp)
+            .map_err(|_| OkxTransportError::Binding)?;
+        self.execute_bound(
+            request.scope().gateway_binding(),
+            request.scope().instrument_generation(),
+            request.method(),
+            request.request_path(),
+            request.body(),
+            &signed,
+        )
+        .await
+    }
+
+    /// Executes a request-bound authenticated read. This does not collect pages or grant any
+    /// capability; callers must wrap the response in `OkxRawPrivatePage` and close the attempt.
+    pub async fn execute_read(
+        &self,
+        credentials: &OkxCredentials,
+        request: &OkxPrivateReadRequest,
+        timestamp: &str,
+    ) -> Result<OkxHttpResponse, OkxTransportError> {
+        if request.scope().gateway_binding() != self.config.gateway_binding() {
+            return Err(OkxTransportError::Binding);
+        }
+        let signed = request
+            .signed_headers(credentials, &self.config, timestamp)
+            .map_err(|_| OkxTransportError::Binding)?;
+        self.execute_bound(
+            request.scope().gateway_binding(),
+            request.scope().instrument_generation(),
+            request.method(),
+            request.request_path(),
+            &[],
+            &signed,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_bound(
+        &self,
+        binding: &GatewayBinding,
+        instrument_generation: u64,
+        method: &str,
+        request_path: &str,
+        body: &[u8],
+        signed: &SignedHeaders,
+    ) -> Result<OkxHttpResponse, OkxTransportError> {
+        if binding != self.config.gateway_binding() {
+            return Err(OkxTransportError::Binding);
+        }
+        if body.len() > self.max_body_bytes {
             return Err(OkxTransportError::BodyTooLarge);
         }
-        let method = match request.method() {
+        let method = match method {
             "GET" => Method::GET,
             "POST" => Method::POST,
             _ => return Err(OkxTransportError::Configuration),
         };
-        let signed = request
-            .signed_headers(credentials, &self.config, timestamp)
-            .map_err(|_| OkxTransportError::Binding)?;
         let mut builder = self
             .client
-            .request(method, format!("{}{}", self.origin, request.request_path()));
+            .request(method, format!("{}{}", self.origin, request_path));
         for name in HEADER_NAMES {
             let value = signed.get(name).ok_or(OkxTransportError::Configuration)?;
             let value =
@@ -166,8 +216,8 @@ impl OkxHttpTransport {
         if let Some(value) = signed.get("x-simulated-trading") {
             builder = builder.header("x-simulated-trading", value);
         }
-        if !request.body().is_empty() {
-            builder = builder.body(request.body().to_vec());
+        if !body.is_empty() {
+            builder = builder.body(body.to_vec());
         }
         let response = timeout(self.operation_timeout, builder.send())
             .await
@@ -191,7 +241,7 @@ impl OkxHttpTransport {
         let body = read_bounded_body(response, self.operation_timeout, self.max_body_bytes).await?;
         Ok(OkxHttpResponse {
             binding: self.config.gateway_binding().clone(),
-            instrument_generation: request.scope().instrument_generation(),
+            instrument_generation,
             received_at_ms: received_at_ms()?,
             body,
         })

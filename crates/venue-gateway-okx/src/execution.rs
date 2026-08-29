@@ -9,21 +9,22 @@ use venue_gateway_api::GatewayBinding;
 use crate::private::{OkxAccountLevel, OkxAccountProfile, OkxTimedOrder};
 use crate::public::{decimal, decode_success, positive_decimal, positive_u64};
 use crate::{
-    OkxConfig, OkxCredentials, OkxError, OkxInstrument, OkxPositionMode, SignedHeaders, endpoints,
-    sign,
+    OkxConfig, OkxCredentials, OkxError, OkxHttpResponse, OkxInstrument, OkxPositionMode,
+    SignedHeaders, endpoints, sign,
 };
 
 const POST: &str = "POST";
 const GET: &str = "GET";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OkxTradeMode {
     Cross,
     Isolated,
 }
 
 impl OkxTradeMode {
-    const fn wire_value(self) -> &'static str {
+    pub(crate) const fn wire_value(self) -> &'static str {
         match self {
             Self::Cross => "cross",
             Self::Isolated => "isolated",
@@ -494,6 +495,40 @@ pub struct OkxOrderReadbackRequest {
     expected: OkxAcceptedOrder,
 }
 
+/// Exact post-dispatch readback keyed by the original client identity. It is usable when the
+/// transport outcome is UNKNOWN and therefore no accepted venue order ID exists.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OkxUnknownOrderReadbackRequest {
+    scope: OkxExecutionScope,
+    request_path: String,
+    expected: OkxPlaceRequest,
+}
+
+impl OkxPrivateRequest for OkxUnknownOrderReadbackRequest {
+    fn scope(&self) -> &OkxExecutionScope {
+        &self.scope
+    }
+    fn method(&self) -> &'static str {
+        GET
+    }
+    fn request_path(&self) -> &str {
+        &self.request_path
+    }
+    fn body(&self) -> &[u8] {
+        &[]
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OkxUnknownOrderReadback {
+    pub scope: OkxExecutionScope,
+    pub request_path: String,
+    pub received_at_ms: u64,
+    pub payload_sha256: String,
+    pub raw_payload: Vec<u8>,
+    pub order: OkxTimedOrder,
+}
+
 impl OkxPrivateRequest for OkxOrderReadbackRequest {
     fn scope(&self) -> &OkxExecutionScope {
         &self.scope
@@ -529,6 +564,26 @@ pub fn build_order_readback_request(
     })
 }
 
+pub fn build_unknown_order_readback_request(
+    config: &OkxConfig,
+    instrument: &OkxInstrument,
+    profile: &OkxAccountProfile,
+    submitted: &OkxPlaceRequest,
+) -> Result<OkxUnknownOrderReadbackRequest, OkxError> {
+    submitted.scope.validate(config, instrument, profile)?;
+    validate_client_order_id(&submitted.client_order_id)?;
+    Ok(OkxUnknownOrderReadbackRequest {
+        scope: submitted.scope.clone(),
+        request_path: format!(
+            "{}?instId={}&clOrdId={}",
+            endpoints::PLACE_ORDER,
+            instrument.native_id(),
+            submitted.client_order_id
+        ),
+        expected: submitted.clone(),
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DetailRow {
@@ -553,30 +608,98 @@ pub fn parse_order_detail(
     payload: &[u8],
     request: &OkxOrderReadbackRequest,
 ) -> Result<OkxTimedOrder, OkxError> {
+    parse_bound_order_detail(
+        payload,
+        &request.scope,
+        Some(&request.expected.order_id),
+        &request.expected.client_order_id,
+        request.expected.side,
+        request.expected.position_side,
+        request.expected.quantity,
+        request.expected.contracts,
+        request.expected.limit_price,
+        request.expected.purpose,
+        request.expected.reduce_only,
+        request.expected.order_type,
+    )
+}
+
+pub fn parse_unknown_order_readback(
+    response: OkxHttpResponse,
+    request: &OkxUnknownOrderReadbackRequest,
+) -> Result<OkxUnknownOrderReadback, OkxError> {
+    if response.binding != *request.scope.gateway_binding()
+        || response.instrument_generation != request.scope.instrument_generation()
+        || response.received_at_ms == 0
+    {
+        return Err(OkxError::Binding);
+    }
+    let order = parse_bound_order_detail(
+        &response.body,
+        &request.scope,
+        None,
+        &request.expected.client_order_id,
+        request.expected.side,
+        request.expected.position_side,
+        request.expected.quantity,
+        request.expected.contracts,
+        request.expected.limit_price,
+        request.expected.purpose,
+        request.expected.reduce_only,
+        request.expected.order_type,
+    )?;
+    if order.update_time_ms > response.received_at_ms {
+        return Err(OkxError::Sequence);
+    }
+    Ok(OkxUnknownOrderReadback {
+        scope: request.scope.clone(),
+        request_path: request.request_path.clone(),
+        received_at_ms: response.received_at_ms,
+        payload_sha256: crate::readback::payload_digest(&response.body),
+        raw_payload: response.body.to_vec(),
+        order,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_bound_order_detail(
+    payload: &[u8],
+    scope: &OkxExecutionScope,
+    expected_order_id: Option<&str>,
+    expected_client_order_id: &str,
+    expected_side: OrderSide,
+    expected_position_side: PositionSide,
+    expected_quantity: Decimal,
+    expected_contracts: Decimal,
+    expected_limit_price: Option<Price>,
+    expected_purpose: OrderPurpose,
+    expected_reduce_only: bool,
+    expected_order_type: &'static str,
+) -> Result<OkxTimedOrder, OkxError> {
     let envelope = decode_success::<DetailRow>(payload)?;
     let [row] = envelope.data.as_slice() else {
         return Err(OkxError::Payload);
     };
-    let expected = &request.expected;
     if row.inst_type != "SWAP"
-        || row.inst_id != request.scope.native_instrument_id
-        || row.td_mode != request.scope.trade_mode.wire_value()
-        || row.ord_id != expected.order_id
-        || row.cl_ord_id != expected.client_order_id
-        || row.side != side_text(expected.side)
-        || row.pos_side != position_side_text(expected.position_side)?
-        || row.ord_type != expected.order_type
-        || positive_decimal(&row.sz)? != expected.contracts
-        || parse_optional_price(&row.px)? != expected.limit_price
+        || row.inst_id != scope.native_instrument_id
+        || row.td_mode != scope.trade_mode.wire_value()
+        || expected_order_id.is_some_and(|expected| row.ord_id != expected)
+        || row.cl_ord_id != expected_client_order_id
+        || row.side != side_text(expected_side)
+        || row.pos_side != position_side_text(expected_position_side)?
+        || row.ord_type != expected_order_type
+        || positive_decimal(&row.sz)? != expected_contracts
+        || parse_optional_price(&row.px)? != expected_limit_price
     {
         return Err(OkxError::Binding);
     }
+    validate_order_id(&row.ord_id)?;
     let raw_reduce_only = parse_boolean(&row.reduce_only)?;
-    if request.scope.position_mode != OkxPositionMode::LongShort || raw_reduce_only {
+    if scope.position_mode != OkxPositionMode::LongShort || raw_reduce_only {
         return Err(OkxError::PositionMode);
     }
     let filled_contracts = decimal(&row.acc_fill_sz)?;
-    if filled_contracts.is_sign_negative() || filled_contracts > expected.contracts {
+    if filled_contracts.is_sign_negative() || filled_contracts > expected_contracts {
         return Err(OkxError::Payload);
     }
     let state = match row.state.as_str() {
@@ -591,20 +714,20 @@ pub fn parse_order_detail(
     let order = Order {
         order_id: row.ord_id.clone(),
         client_order_id: FieldState::Known(row.cl_ord_id.clone()),
-        symbol: request.scope.gateway_binding.symbol.clone(),
-        side: expected.side,
-        position_side: FieldState::Known(expected.position_side),
-        purpose: FieldState::Known(expected.purpose),
+        symbol: scope.gateway_binding.symbol.clone(),
+        side: expected_side,
+        position_side: FieldState::Known(expected_position_side),
+        purpose: FieldState::Known(expected_purpose),
         state,
-        quantity: expected.quantity,
+        quantity: expected_quantity,
         filled_quantity: filled_contracts
-            .checked_mul(request.scope.base_quantity_per_contract)
+            .checked_mul(scope.base_quantity_per_contract)
             .ok_or(OkxError::Payload)?,
-        limit_price: expected.limit_price,
+        limit_price: expected_limit_price,
         average_price: parse_optional_price(&row.avg_px)?
             .map(FieldState::Known)
             .unwrap_or(FieldState::Missing),
-        reduce_only: expected.reduce_only,
+        reduce_only: expected_reduce_only,
     };
     order.validate().map_err(|_| OkxError::Payload)?;
     Ok(OkxTimedOrder {
@@ -780,6 +903,24 @@ mod tests {
         assert_eq!(order.order.state, OrderState::Cancelled);
         assert_eq!(order.order.quantity, Decimal::new(2, 1));
         assert!(order.order.reduce_only);
+
+        let unknown = build_unknown_order_readback_request(&config, &instrument, &profile, &place)?;
+        assert_eq!(
+            unknown.request_path(),
+            "/api/v5/trade/order?instId=BTC-USDT-SWAP&clOrdId=00000000000000000000000000000003"
+        );
+        let unknown = parse_unknown_order_readback(
+            OkxHttpResponse {
+                binding: config.gateway_binding().clone(),
+                instrument_generation: instrument.instrument().generation,
+                received_at_ms: 1_900_000_000_000,
+                body: bytes::Bytes::copy_from_slice(ORDER_DETAIL),
+            },
+            &unknown,
+        )?;
+        assert_eq!(unknown.order.order.order_id, "7003");
+        assert_eq!(unknown.raw_payload, ORDER_DETAIL);
+        assert_eq!(unknown.payload_sha256.len(), 64);
         Ok(())
     }
 
