@@ -1,5 +1,6 @@
 mod canonical_root;
 mod journal;
+mod owner_routes;
 mod writer_lease;
 
 use sha2::{Digest, Sha256};
@@ -10,6 +11,10 @@ pub use canonical_root::{
 };
 pub use journal::{
     CommandJournal, CommandJournalError, CommandReceipt, CommandState, OrderReadbackIdentity,
+};
+pub use owner_routes::{
+    AccountOwnerRouteScope, DurableOwnerRoutes, ExactCancelRoute, NativeOrderRoute,
+    NativeOrderRouteKey, OwnerRouteFence, OwnerRouteProjection, OwnerRoutesError,
 };
 pub use writer_lease::{
     DispatchGuard, ExecutableHandoffReceipt, FlatReceipt, ProtectedReceipt, WRITER_LEASE_TTL_MS,
