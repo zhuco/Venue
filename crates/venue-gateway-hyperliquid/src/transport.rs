@@ -324,6 +324,15 @@ impl HyperliquidPrivateWsTransport {
         &self.binding
     }
 
+    /// Captures persistable subscription coverage only after `connect` has acknowledged all three
+    /// private subscriptions. It grants no mutation authority by itself.
+    pub fn capability_probe_evidence(
+        &self,
+        observed_ms: u64,
+    ) -> Result<crate::HyperliquidPrivateStreamProbeEvidence, HyperliquidError> {
+        crate::HyperliquidPrivateStreamProbeEvidence::from_connected(&self.binding, observed_ms)
+    }
+
     pub async fn next_frame(
         &mut self,
         expected_binding: &HyperliquidPrivateStreamBinding,
