@@ -8,6 +8,7 @@ use clap::Parser;
 use venue_domain::domain::Symbol;
 use venue_gateway_api::{CapabilityFlags, GatewayApiError, GatewayBinding, GatewayMode, VenueId};
 
+mod async_gateway;
 mod control_delivery;
 mod safe_host;
 mod supervision;
@@ -22,6 +23,11 @@ pub use control_delivery::{
     ControlDeliveryInbox, ControlDeliveryJournal, ControlDeliveryJournalError,
     ControlDeliveryJournalRecord, DurableDeliveryOutput, DurableStoreResult,
     ReconciliationCompletion, ReconciliationTurn,
+};
+
+pub use async_gateway::{
+    AsyncGatewayBoundaryError, AsyncGatewayCallError, AsyncGatewayTimeouts, AsyncPhysicalGateway,
+    TokioPhysicalGateway, TokioRuntimeDriver, TokioRuntimeRun,
 };
 
 pub use safe_host::{

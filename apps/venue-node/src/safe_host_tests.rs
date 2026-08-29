@@ -2,12 +2,16 @@ use std::{
     collections::{BTreeSet, VecDeque},
     ffi::OsString,
     fs::OpenOptions,
+    future::Future,
     io::Write,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    task::{Context, Poll, Wake, Waker},
+    thread::{Thread, ThreadId},
+    time::{Duration, Instant},
 };
 
 use rust_decimal::Decimal;
@@ -24,10 +28,12 @@ use venue_gateway_api::{
 use venue_runtime::{AccountKey, StrategyBinding, StrategyInstanceKey, StrategyKind};
 
 use crate::{
+    AsyncGatewayBoundaryError, AsyncGatewayCallError, AsyncGatewayTimeouts, AsyncPhysicalGateway,
     CanaryControlRequest, CanaryEvidence, ControlAction, DispatchOutcome, FamilyReadbackCoverage,
     GatewayAcknowledgement, GatewayDispatchResult, GatewayRecoveryPermit, NodeLaunch,
     NodeSafetyHost, PhysicalGateway, ReadbackCommandState, SafeHostError, SignedCommandReadback,
-    SignedReadbackReceipt, SignedReadbackRequest, safe_host::TestCrashPoint,
+    SignedReadbackReceipt, SignedReadbackRequest, TokioPhysicalGateway, TokioRuntimeDriver,
+    TokioRuntimeRun, safe_host::TestCrashPoint,
 };
 
 const ACCOUNT: &str = "00000000-0000-4000-8000-000000000010";
@@ -133,6 +139,11 @@ impl FakeGateway {
         self.unsupported_regular = true;
         self
     }
+
+    fn with_empty_capability(mut self) -> Self {
+        self.capability.flags = CapabilityFlags::empty();
+        self
+    }
 }
 
 impl PhysicalGateway for FakeGateway {
@@ -163,57 +174,7 @@ impl PhysicalGateway for FakeGateway {
             return Err(());
         }
         let plan = self.readbacks.pop_front().ok_or(())?;
-        let regular = if self.unsupported_regular {
-            FamilyReadbackCoverage::unsupported(venue_domain::domain::NativeOrderFamily::UmOrder)
-        } else {
-            FamilyReadbackCoverage::complete(venue_domain::domain::NativeOrderFamily::UmOrder)
-        };
-        let mut coverage = vec![
-            regular,
-            FamilyReadbackCoverage::complete(
-                venue_domain::domain::NativeOrderFamily::UmConditional,
-            ),
-            FamilyReadbackCoverage::complete(venue_domain::domain::NativeOrderFamily::UmAlgo),
-        ];
-        if plan.omit_family {
-            let _ = coverage.pop();
-        }
-        let command_results = request
-            .commands()
-            .iter()
-            .cloned()
-            .map(|key| {
-                let state = match plan.resolution {
-                    ReadbackResolution::Accepted(venue_order_id) => {
-                        ReadbackCommandState::Accepted {
-                            venue_order_id: venue_order_id.to_owned(),
-                        }
-                    }
-                    ReadbackResolution::Rejected(reason_code) => ReadbackCommandState::Rejected {
-                        reason_code: reason_code.to_owned(),
-                    },
-                    ReadbackResolution::Absent => ReadbackCommandState::ProvenAbsent,
-                };
-                SignedCommandReadback::new(key, state).map_err(|_| ())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let nonzero_position_symbols = if plan.nonzero_position {
-            BTreeSet::from([request.binding().symbol.clone()])
-        } else {
-            BTreeSet::new()
-        };
-        SignedReadbackReceipt::new(
-            request.binding().clone(),
-            plan.connection_generation,
-            plan.private_generation,
-            plan.observed_ms,
-            DIGEST,
-            coverage,
-            Vec::new(),
-            nonzero_position_symbols,
-            command_results,
-        )
-        .map_err(|_| ())
+        receipt_from_plan(request, plan, self.unsupported_regular)
     }
 
     fn verify_signed_readback(&self, receipt: &SignedReadbackReceipt) -> Result<(), Self::Error> {
@@ -230,6 +191,255 @@ impl PhysicalGateway for FakeGateway {
             .unwrap_or(GatewayDispatchResult::Rejected {
                 reason_code: "fake_missing_result".to_owned(),
             })
+    }
+}
+
+fn receipt_from_plan(
+    request: &SignedReadbackRequest,
+    plan: ReadbackPlan,
+    unsupported_regular: bool,
+) -> Result<SignedReadbackReceipt, ()> {
+    let regular = if unsupported_regular {
+        FamilyReadbackCoverage::unsupported(venue_domain::domain::NativeOrderFamily::UmOrder)
+    } else {
+        FamilyReadbackCoverage::complete(venue_domain::domain::NativeOrderFamily::UmOrder)
+    };
+    let mut coverage = vec![
+        regular,
+        FamilyReadbackCoverage::complete(venue_domain::domain::NativeOrderFamily::UmConditional),
+        FamilyReadbackCoverage::complete(venue_domain::domain::NativeOrderFamily::UmAlgo),
+    ];
+    if plan.omit_family {
+        let _ = coverage.pop();
+    }
+    let command_results = request
+        .commands()
+        .iter()
+        .cloned()
+        .map(|key| {
+            let state = match plan.resolution {
+                ReadbackResolution::Accepted(venue_order_id) => ReadbackCommandState::Accepted {
+                    venue_order_id: venue_order_id.to_owned(),
+                },
+                ReadbackResolution::Rejected(reason_code) => ReadbackCommandState::Rejected {
+                    reason_code: reason_code.to_owned(),
+                },
+                ReadbackResolution::Absent => ReadbackCommandState::ProvenAbsent,
+            };
+            SignedCommandReadback::new(key, state).map_err(|_| ())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let nonzero_position_symbols = if plan.nonzero_position {
+        BTreeSet::from([request.binding().symbol.clone()])
+    } else {
+        BTreeSet::new()
+    };
+    SignedReadbackReceipt::new(
+        request.binding().clone(),
+        plan.connection_generation,
+        plan.private_generation,
+        plan.observed_ms,
+        DIGEST,
+        coverage,
+        Vec::new(),
+        nonzero_position_symbols,
+        command_results,
+    )
+    .map_err(|_| ())
+}
+
+#[derive(Clone, Copy)]
+enum AsyncDispatchPlan {
+    Timeout,
+    Disconnected,
+}
+
+struct FakeAsyncGateway {
+    binding: GatewayBinding,
+    capability: CapabilitySnapshot,
+    readbacks: VecDeque<ReadbackPlan>,
+    dispatches: VecDeque<AsyncDispatchPlan>,
+    connect_calls: Arc<AtomicUsize>,
+    readback_calls: Arc<AtomicUsize>,
+    dispatch_calls: Arc<AtomicUsize>,
+    runtime_threads: Arc<Mutex<Vec<ThreadId>>>,
+    connected: bool,
+}
+
+impl FakeAsyncGateway {
+    fn new(
+        binding: GatewayBinding,
+        readbacks: Vec<ReadbackPlan>,
+        dispatches: Vec<AsyncDispatchPlan>,
+        counters: AsyncGatewayCounters,
+    ) -> Self {
+        let capability = FakeGateway::new(binding.clone(), Vec::new()).capability;
+        Self {
+            binding,
+            capability,
+            readbacks: readbacks.into(),
+            dispatches: dispatches.into(),
+            connect_calls: counters.connect,
+            readback_calls: counters.readback,
+            dispatch_calls: counters.dispatch,
+            runtime_threads: counters.runtime_threads,
+            connected: false,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AsyncGatewayCounters {
+    connect: Arc<AtomicUsize>,
+    readback: Arc<AtomicUsize>,
+    dispatch: Arc<AtomicUsize>,
+    runtime_threads: Arc<Mutex<Vec<ThreadId>>>,
+}
+
+impl AsyncGatewayCounters {
+    fn new() -> Self {
+        Self {
+            connect: Arc::new(AtomicUsize::new(0)),
+            readback: Arc::new(AtomicUsize::new(0)),
+            dispatch: Arc::new(AtomicUsize::new(0)),
+            runtime_threads: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+struct TestTokioRuntime;
+
+struct ThreadWake {
+    thread: Thread,
+}
+
+impl Wake for ThreadWake {
+    fn wake(self: Arc<Self>) {
+        self.thread.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.thread.unpark();
+    }
+}
+
+impl TokioRuntimeDriver for TestTokioRuntime {
+    fn run<F: Future + Send>(
+        &mut self,
+        timeout: Duration,
+        future: F,
+    ) -> TokioRuntimeRun<F::Output> {
+        let Some(deadline) = Instant::now().checked_add(timeout) else {
+            return TokioRuntimeRun::Failed;
+        };
+        let waker = Waker::from(Arc::new(ThreadWake {
+            thread: std::thread::current(),
+        }));
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return TokioRuntimeRun::Completed(output),
+                Poll::Pending => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return TokioRuntimeRun::TimedOut;
+                    }
+                    std::thread::park_timeout(remaining);
+                }
+            }
+        }
+    }
+}
+
+fn record_runtime_thread(threads: &Mutex<Vec<ThreadId>>) -> Result<(), ()> {
+    threads
+        .lock()
+        .map_err(|_| ())?
+        .push(std::thread::current().id());
+    Ok(())
+}
+
+impl AsyncPhysicalGateway for FakeAsyncGateway {
+    type Error = ();
+
+    fn binding(&self) -> &GatewayBinding {
+        &self.binding
+    }
+
+    fn capability_snapshot(&self) -> CapabilitySnapshot {
+        self.capability.clone()
+    }
+
+    fn connect_after_recovery(
+        &mut self,
+        permit: GatewayRecoveryPermit,
+    ) -> impl Future<Output = Result<(), AsyncGatewayCallError<Self::Error>>> + Send {
+        let result = if permit.binding() == &self.binding && !self.connected {
+            self.connected = true;
+            Ok(())
+        } else {
+            Err(AsyncGatewayCallError::Failed(()))
+        };
+        let calls = Arc::clone(&self.connect_calls);
+        let threads = Arc::clone(&self.runtime_threads);
+        async move {
+            record_runtime_thread(&threads).map_err(AsyncGatewayCallError::Failed)?;
+            calls.fetch_add(1, Ordering::SeqCst);
+            result
+        }
+    }
+
+    fn signed_readback(
+        &mut self,
+        request: SignedReadbackRequest,
+    ) -> impl Future<Output = Result<SignedReadbackReceipt, AsyncGatewayCallError<Self::Error>>> + Send
+    {
+        let result = if self.connected {
+            self.readbacks
+                .pop_front()
+                .ok_or(())
+                .and_then(|plan| receipt_from_plan(&request, plan, false))
+                .map_err(AsyncGatewayCallError::Failed)
+        } else {
+            Err(AsyncGatewayCallError::Disconnected)
+        };
+        let calls = Arc::clone(&self.readback_calls);
+        let threads = Arc::clone(&self.runtime_threads);
+        async move {
+            record_runtime_thread(&threads).map_err(AsyncGatewayCallError::Failed)?;
+            calls.fetch_add(1, Ordering::SeqCst);
+            result
+        }
+    }
+
+    fn verify_signed_readback(&self, receipt: &SignedReadbackReceipt) -> Result<(), Self::Error> {
+        (receipt.commitment_sha256() == DIGEST)
+            .then_some(())
+            .ok_or(())
+    }
+
+    fn dispatch(
+        &mut self,
+        permit: crate::DispatchPermit,
+    ) -> impl Future<Output = Result<GatewayDispatchResult, AsyncGatewayCallError<Self::Error>>> + Send
+    {
+        let binding_matches = permit.binding() == &self.binding;
+        let plan = self.dispatches.pop_front();
+        let calls = Arc::clone(&self.dispatch_calls);
+        let threads = Arc::clone(&self.runtime_threads);
+        async move {
+            record_runtime_thread(&threads).map_err(AsyncGatewayCallError::Failed)?;
+            calls.fetch_add(1, Ordering::SeqCst);
+            if !binding_matches {
+                return Err(AsyncGatewayCallError::Failed(()));
+            }
+            match plan {
+                Some(AsyncDispatchPlan::Timeout) => std::future::pending().await,
+                Some(AsyncDispatchPlan::Disconnected) => Err(AsyncGatewayCallError::Disconnected),
+                None => Err(AsyncGatewayCallError::Failed(())),
+            }
+        }
     }
 }
 
@@ -601,27 +811,127 @@ fn ack_then_disconnect_stays_unknown_until_signed_readback_and_never_retries()
 }
 
 #[test]
-fn capability_binding_mismatch_is_rejected_before_wal() -> Result<(), Box<dyn std::error::Error>> {
+fn async_timeout_and_disconnect_become_unknown_then_exact_readback_without_resubmit()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (suffix, dispatch_plan) in [
+        ("timeout", AsyncDispatchPlan::Timeout),
+        ("disconnect", AsyncDispatchPlan::Disconnected),
+    ] {
+        let directory = tempfile::tempdir()?;
+        let launch = launch(&directory, "LIVE")?;
+        let owner = owner(launch.binding())?;
+        let command_id = format!("async_{suffix}");
+        let command = entry_command(launch.binding(), &command_id)?;
+        let counters = AsyncGatewayCounters::new();
+        let gateway = FakeAsyncGateway::new(
+            launch.binding().clone(),
+            vec![
+                ReadbackPlan::initial(),
+                ReadbackPlan {
+                    connection_generation: 2,
+                    private_generation: 2,
+                    observed_ms: 1_100,
+                    resolution: ReadbackResolution::Accepted("venue_async_exact"),
+                    nonzero_position: false,
+                    omit_family: false,
+                },
+            ],
+            vec![dispatch_plan],
+            counters.clone(),
+        );
+        let boundary = TokioPhysicalGateway::new(
+            gateway,
+            TestTokioRuntime,
+            AsyncGatewayTimeouts::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_millis(20),
+            )?,
+        )?;
+        let mut host = NodeSafetyHost::open_for_test(
+            &launch,
+            owner.clone(),
+            boundary,
+            Some(canary_for(launch.binding(), &owner, &command_id)?),
+            1_000,
+        )?;
+        let prepared = host.prepare_dispatch(command.clone(), 1_000)?;
+
+        assert_eq!(
+            host.dispatch_prepared(prepared, 1_000)?,
+            DispatchOutcome::Unknown
+        );
+        assert_eq!(counters.dispatch.load(Ordering::SeqCst), 1);
+        host.recover_unknowns(1_200)?;
+        assert_eq!(counters.connect.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.readback.load(Ordering::SeqCst), 2);
+        assert_eq!(counters.dispatch.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            host.prepare_dispatch(command, 1_200),
+            Err(SafeHostError::CommandAlreadyJournaled)
+        ));
+        let journal = CommandJournal::open(journal_path(&launch))?;
+        assert!(matches!(
+            journal
+                .receipt(&CommandId::new(command_id.clone())?)
+                .map(|receipt| &receipt.state),
+            Some(CommandState::Accepted { venue_order_id })
+                if venue_order_id == "venue_async_exact"
+        ));
+        let threads = counters
+            .runtime_threads
+            .lock()
+            .map_err(|_| std::io::Error::other("runtime thread record poisoned"))?;
+        let Some(first_thread) = threads.first() else {
+            return Err(std::io::Error::other("missing runtime thread record").into());
+        };
+        assert_eq!(threads.len(), 4);
+        assert!(threads.iter().all(|thread| thread == first_thread));
+    }
+    Ok(())
+}
+
+#[test]
+fn capability_binding_mismatch_fails_before_artifacts_or_gateway_calls()
+-> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let launch = launch(&directory, "LIVE")?;
     let owner = owner(launch.binding())?;
     let mut gateway = FakeGateway::new(launch.binding().clone(), vec![ReadbackPlan::initial()]);
     gateway.capability.binding.mode = GatewayMode::Test;
-    let mut host = NodeSafetyHost::open_for_test(
-        &launch,
-        owner.clone(),
-        gateway,
-        Some(canary_for(launch.binding(), &owner, "command_wrong_cap")?),
-        1_000,
-    )?;
+    let result = NodeSafetyHost::open_for_test(&launch, owner, gateway, None, 1_000);
 
     assert!(matches!(
-        host.prepare_dispatch(entry_command(launch.binding(), "command_wrong_cap")?, 1_000),
-        Err(SafeHostError::GatewayApi(_))
+        result,
+        Err(SafeHostError::AsyncGateway(
+            AsyncGatewayBoundaryError::CapabilityScope
+        ))
     ));
-    let journal = CommandJournal::open(journal_path(&launch))?;
-    assert!(!journal.has_unresolved());
-    assert_eq!(journal.commands().count(), 0);
+    assert!(!launch.artifacts_root().exists());
+    Ok(())
+}
+
+#[test]
+fn empty_capability_fails_before_artifacts_or_gateway_calls()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let launch = launch(&directory, "LIVE")?;
+    let owner = owner(launch.binding())?;
+    let connect_calls = Arc::new(AtomicUsize::new(0));
+    let gateway = FakeGateway::new(launch.binding().clone(), vec![ReadbackPlan::initial()])
+        .with_connect_counter(Arc::clone(&connect_calls))
+        .with_empty_capability();
+
+    let result = NodeSafetyHost::open_for_test(&launch, owner, gateway, None, 1_000);
+
+    assert!(matches!(
+        result,
+        Err(SafeHostError::AsyncGateway(
+            AsyncGatewayBoundaryError::CapabilityClosed
+        ))
+    ));
+    assert_eq!(connect_calls.load(Ordering::SeqCst), 0);
+    assert!(!launch.artifacts_root().exists());
     Ok(())
 }
 
