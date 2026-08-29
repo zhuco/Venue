@@ -1,17 +1,21 @@
 use std::process::ExitCode;
 
+#[cfg(test)]
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use venue_domain::domain::{NativeOrderFamily, PositionSide};
 use venue_gateway_api::{CapabilityFlags, CapabilitySnapshot, GatewayBinding, VenueId};
+use venue_gateway_okx::{OkxConfig, OkxPhysicalCandidate, capabilities};
+#[cfg(test)]
 use venue_gateway_okx::{
-    OkxConfig, OkxPhysicalCandidate, OkxPositionMode, OkxPrivateReadbackCandidate,
-    OkxPrivateSurface, OkxRawPrivatePage, capabilities,
+    OkxPositionMode, OkxPrivateReadbackCandidate, OkxPrivateSurface, OkxRawPrivatePage,
 };
 use venue_node::{
     AdapterIsolation, DispatchPermit, GatewayDispatchResult, GatewayRecoveryPermit, NodeError,
     NodeLaunch, PhysicalGateway, SignedReadbackReceipt, SignedReadbackRequest,
     reject_unintegrated_runtime, report_result,
 };
+#[cfg(test)]
 use venue_runtime::account::{
     PhysicalReadbackReceipt, PhysicalReadbackSurface, PhysicalRecoveryManifestError,
     PhysicalRecoveryReadbackManifest, PhysicalRecoveryScope,
@@ -25,7 +29,6 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), NodeError> {
     assert_candidate_bridge::<OkxNodePhysicalCandidate>();
-    assert_post_recovery_mapper(map_post_recovery_readback);
     let launch = NodeLaunch::from_environment(VenueId::Okx)?;
     launch.require_no_runtime_arguments()?;
     let adapter = OkxConfig::for_binding(launch.binding().clone())
@@ -49,32 +52,19 @@ fn run() -> Result<(), NodeError> {
 
 fn assert_candidate_bridge<G: PhysicalGateway>() {}
 
-fn assert_post_recovery_mapper(
-    _mapper: fn(
-        PhysicalRecoveryScope,
-        OkxPostRecoveryCollection<'_>,
-    ) -> Result<PhysicalRecoveryReadbackManifest, OkxNodeBridgeError>,
-) {
+fn reject_missing_post_recovery_authority() -> OkxNodeBridgeError {
+    OkxNodeBridgeError::PostRecoveryCollectorUnavailable
 }
 
-/// One complete OKX collection that was started only after the shared recovery scope was fixed.
-/// Its fields intentionally have no production constructor in this binary: the existing durable
-/// capability probe lacks the recovery-scope commitment and therefore cannot be relabelled as a
-/// fresh collection. A future synchronous collector must construct this value after network I/O.
-struct OkxPostRecoveryCollection<'a> {
-    candidate: &'a OkxPrivateReadbackCandidate,
-    private_generation: u64,
-    recovery_scope_sha256: [u8; 32],
-}
-
-fn map_post_recovery_readback(
+/// Test-only contract for a future collector. Production deliberately has no constructor or
+/// mapper: the current durable probe does not carry post-recovery freshness or root authority.
+#[cfg(test)]
+fn map_test_only_recovery_readback(
     recovery_scope: PhysicalRecoveryScope,
-    collected: OkxPostRecoveryCollection<'_>,
+    candidate: &OkxPrivateReadbackCandidate,
+    private_generation: u64,
 ) -> Result<PhysicalRecoveryReadbackManifest, OkxNodeBridgeError> {
-    let candidate = collected.candidate;
-    if candidate.scope().gateway_binding() != recovery_scope.binding()
-        || collected.recovery_scope_sha256 != *recovery_scope.commitment_sha256()
-    {
+    if candidate.scope().gateway_binding() != recovery_scope.binding() {
         return Err(OkxNodeBridgeError::Scope);
     }
     validate_position_mode(candidate)?;
@@ -103,7 +93,8 @@ fn map_post_recovery_readback(
             &recovery_scope,
             PhysicalReadbackSurface::Account,
             attempt_id,
-            collected.private_generation,
+            private_generation,
+            candidate,
             &account_pages,
             1,
         )?,
@@ -111,7 +102,8 @@ fn map_post_recovery_readback(
             &recovery_scope,
             PhysicalReadbackSurface::Positions,
             attempt_id,
-            collected.private_generation,
+            private_generation,
+            candidate,
             &position_pages,
             usize_to_u64(candidate.positions.len())?,
         )?,
@@ -141,7 +133,8 @@ fn map_post_recovery_readback(
             &recovery_scope,
             surface,
             attempt_id,
-            collected.private_generation,
+            private_generation,
+            candidate,
             &readback.raw_pages.iter().collect::<Vec<_>>(),
             usize_to_u64(readback.orders.len())?,
         )?);
@@ -150,7 +143,8 @@ fn map_post_recovery_readback(
         &recovery_scope,
         PhysicalReadbackSurface::FillsCursor,
         attempt_id,
-        collected.private_generation,
+        private_generation,
+        candidate,
         &fills_pages,
         usize_to_u64(candidate.fills.len())?,
     )?);
@@ -159,6 +153,7 @@ fn map_post_recovery_readback(
         .map_err(OkxNodeBridgeError::Manifest)
 }
 
+#[cfg(test)]
 fn validate_position_mode(
     candidate: &OkxPrivateReadbackCandidate,
 ) -> Result<(), OkxNodeBridgeError> {
@@ -185,6 +180,7 @@ fn validate_position_mode(
     Ok(())
 }
 
+#[cfg(test)]
 fn pages_for(
     candidate: &OkxPrivateReadbackCandidate,
     predicate: impl Fn(OkxPrivateSurface) -> bool,
@@ -196,15 +192,17 @@ fn pages_for(
         .collect()
 }
 
+#[cfg(test)]
 fn complete_receipt(
     recovery_scope: &PhysicalRecoveryScope,
     surface: PhysicalReadbackSurface,
     attempt_id: u64,
     private_generation: u64,
+    candidate: &OkxPrivateReadbackCandidate,
     pages: &[&OkxRawPrivatePage],
     record_count: u64,
 ) -> Result<PhysicalReadbackReceipt, OkxNodeBridgeError> {
-    let evidence_sha256 = evidence_commitment(recovery_scope, pages)?;
+    let evidence_sha256 = evidence_commitment(recovery_scope, candidate, pages)?;
     PhysicalReadbackReceipt::verified_complete(
         recovery_scope,
         surface,
@@ -216,8 +214,10 @@ fn complete_receipt(
     .map_err(OkxNodeBridgeError::Manifest)
 }
 
+#[cfg(test)]
 fn evidence_commitment(
     recovery_scope: &PhysicalRecoveryScope,
+    candidate: &OkxPrivateReadbackCandidate,
     pages: &[&OkxRawPrivatePage],
 ) -> Result<[u8; 32], OkxNodeBridgeError> {
     if pages.is_empty() {
@@ -231,7 +231,9 @@ fn evidence_commitment(
     for page in ordered {
         page.validate()
             .map_err(|_| OkxNodeBridgeError::IncompleteSurface)?;
-        if page.scope.gateway_binding() != recovery_scope.binding() {
+        if page.scope != *candidate.scope()
+            || page.scope.gateway_binding() != recovery_scope.binding()
+        {
             return Err(OkxNodeBridgeError::Scope);
         }
         let encoded =
@@ -246,6 +248,7 @@ fn evidence_commitment(
     Ok(digest.finalize().into())
 }
 
+#[cfg(test)]
 fn usize_to_u64(value: usize) -> Result<u64, OkxNodeBridgeError> {
     u64::try_from(value).map_err(|_| OkxNodeBridgeError::EvidenceCommitment)
 }
@@ -284,18 +287,18 @@ impl PhysicalGateway for OkxNodePhysicalCandidate {
         // A durable probe predates recovery. It cannot be relabelled as the required fresh private
         // generation, and opening credentials/network here without the shared collector would
         // bypass the account-wide signed readback gate.
-        Err(OkxNodeBridgeError::PostRecoveryCollectorUnavailable)
+        Err(reject_missing_post_recovery_authority())
     }
 
     fn signed_readback(
         &mut self,
         _request: &SignedReadbackRequest,
     ) -> Result<SignedReadbackReceipt, Self::Error> {
-        Err(OkxNodeBridgeError::PostRecoveryCollectorUnavailable)
+        Err(reject_missing_post_recovery_authority())
     }
 
     fn verify_signed_readback(&self, _receipt: &SignedReadbackReceipt) -> Result<(), Self::Error> {
-        Err(OkxNodeBridgeError::PostRecoveryCollectorUnavailable)
+        Err(reject_missing_post_recovery_authority())
     }
 
     fn dispatch(&mut self, _permit: DispatchPermit) -> GatewayDispatchResult {
@@ -309,14 +312,18 @@ impl PhysicalGateway for OkxNodePhysicalCandidate {
 enum OkxNodeBridgeError {
     #[error("OKX node physical candidate does not match the recovered binding or generation")]
     Scope,
+    #[cfg(test)]
     #[error("OKX readback does not contain exact Net or Long/Short position coverage")]
     PositionMode,
+    #[cfg(test)]
     #[error("OKX readback omits a required raw account, position, order-family, or fills surface")]
     IncompleteSurface,
+    #[cfg(test)]
     #[error("OKX readback evidence commitment could not be encoded")]
     EvidenceCommitment,
     #[error("OKX node lacks a scope-bound post-recovery full signed readback collector")]
     PostRecoveryCollectorUnavailable,
+    #[cfg(test)]
     #[error(transparent)]
     Manifest(PhysicalRecoveryManifestError),
 }
@@ -397,6 +404,23 @@ mod tests {
         Ok(complete_private_readback(&scope, &instrument, pages)?)
     }
 
+    fn alternate_scope(
+        mode: OkxPositionMode,
+        trade_mode: OkxTradeMode,
+        attempt_id: u64,
+        instrument_generation: u64,
+    ) -> Result<OkxPrivateReadScope, Box<dyn std::error::Error>> {
+        let config = OkxConfig::for_binding(binding()?)?;
+        let instrument = parse_instrument(INSTRUMENT, &config, instrument_generation)?;
+        Ok(OkxPrivateReadScope::new(
+            &config,
+            &instrument,
+            mode,
+            trade_mode,
+            attempt_id,
+        )?)
+    }
+
     fn recovery_scope(
         recovered_private_generation: u64,
     ) -> Result<PhysicalRecoveryScope, Box<dyn std::error::Error>> {
@@ -422,15 +446,7 @@ mod tests {
         scope: PhysicalRecoveryScope,
         private_generation: u64,
     ) -> Result<PhysicalRecoveryReadbackManifest, OkxNodeBridgeError> {
-        let recovery_scope_sha256 = *scope.commitment_sha256();
-        map_post_recovery_readback(
-            scope,
-            OkxPostRecoveryCollection {
-                candidate,
-                private_generation,
-                recovery_scope_sha256,
-            },
-        )
+        map_test_only_recovery_readback(scope, candidate, private_generation)
     }
 
     #[test]
@@ -469,8 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_generation_and_missing_recovery_commitment_fail_closed()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn stale_generation_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
         let candidate = candidate(OkxPositionMode::LongShort)?;
         assert_eq!(
             map_candidate(&candidate, recovery_scope(41)?, 41),
@@ -478,27 +493,60 @@ mod tests {
                 PhysicalRecoveryManifestError::StaleGeneration
             ))
         );
+        Ok(())
+    }
 
-        let scope = recovery_scope(40)?;
+    #[test]
+    fn cross_attempt_mode_and_instrument_generation_pages_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for alternate in [
+            alternate_scope(OkxPositionMode::LongShort, OkxTradeMode::Cross, 12, 7)?,
+            alternate_scope(OkxPositionMode::Net, OkxTradeMode::Cross, 11, 7)?,
+            alternate_scope(OkxPositionMode::LongShort, OkxTradeMode::Isolated, 11, 7)?,
+        ] {
+            let replacement = page(build_fills_request(&alternate, 0, None)?, EMPTY)?;
+            replacement.validate()?;
+            let mut mixed = candidate(OkxPositionMode::LongShort)?;
+            let target = mixed
+                .raw_pages
+                .iter_mut()
+                .find(|raw| raw.surface == OkxPrivateSurface::Fills)
+                .ok_or("missing fills page")?;
+            *target = replacement;
+            assert_eq!(
+                map_candidate(&mixed, recovery_scope(40)?, 41),
+                Err(OkxNodeBridgeError::Scope)
+            );
+        }
+
+        let alternate = alternate_scope(OkxPositionMode::LongShort, OkxTradeMode::Cross, 11, 8)?;
+        let replacement = page(build_regular_orders_request(&alternate, 0, None)?, EMPTY)?;
+        replacement.validate()?;
+        let mut mixed = candidate(OkxPositionMode::LongShort)?;
+        let regular = mixed
+            .order_families
+            .get_mut(&NativeOrderFamily::UmOrder)
+            .ok_or("missing regular family")?;
+        let [target] = regular.raw_pages.as_mut_slice() else {
+            return Err("unexpected regular page count".into());
+        };
+        *target = replacement;
         assert_eq!(
-            map_post_recovery_readback(
-                scope,
-                OkxPostRecoveryCollection {
-                    candidate: &candidate,
-                    private_generation: 41,
-                    recovery_scope_sha256: [0; 32],
-                },
-            ),
+            map_candidate(&mixed, recovery_scope(40)?, 41),
             Err(OkxNodeBridgeError::Scope)
         );
         Ok(())
     }
 
     #[test]
-    fn mapper_does_not_promote_adapter_capability_or_mutation() {
+    fn old_probe_candidate_cannot_be_relabelled_by_production_bridge() {
         assert!(capabilities().is_empty());
         assert_eq!(
-            OkxNodeBridgeError::PostRecoveryCollectorUnavailable.to_string(),
+            reject_missing_post_recovery_authority(),
+            OkxNodeBridgeError::PostRecoveryCollectorUnavailable
+        );
+        assert_eq!(
+            reject_missing_post_recovery_authority().to_string(),
             "OKX node lacks a scope-bound post-recovery full signed readback collector"
         );
     }
