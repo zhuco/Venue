@@ -4,53 +4,10 @@ param([string]$CargoTargetDir)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$expectedBaseline = 'af54c157400ff819c0027c06cd96c6fcf6e101c8'
 $repoRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
-$allowedPaths = @(
-    'apps/venue-node/tests/gateway_candidate_conformance.rs',
-    'scripts/verify_gateway_candidate_contract.ps1'
-)
-
-function Invoke-GitLines {
-    param([Parameter(Mandatory)] [string[]]$Arguments)
-
-    $lines = & git.exe -C $repoRoot @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "git $($Arguments -join ' ') 失败，退出码 $LASTEXITCODE"
-    }
-    @($lines)
-}
-
-Invoke-GitLines -Arguments @('cat-file', '-e', "$expectedBaseline`^{commit}") | Out-Null
-$mergeBase = (Invoke-GitLines -Arguments @('merge-base', $expectedBaseline, 'HEAD') | Select-Object -First 1)
-if ($mergeBase -ne $expectedBaseline) {
-    throw "当前 HEAD 不是 Goal41 精确基线 $expectedBaseline 的后代。"
-}
-
-$changed = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-foreach ($path in Invoke-GitLines -Arguments @('diff', '--name-only', $expectedBaseline, '--')) {
-    if ($path) {
-        [void]$changed.Add($path.Replace('\', '/'))
-    }
-}
-foreach ($path in Invoke-GitLines -Arguments @('ls-files', '--others', '--exclude-standard')) {
-    if ($path) {
-        [void]$changed.Add($path.Replace('\', '/'))
-    }
-}
-foreach ($path in $changed) {
-    if ($path -notin $allowedPaths) {
-        throw "Goal41 基线之后出现租约外路径：$path"
-    }
-}
-foreach ($path in $allowedPaths) {
-    if (-not (Test-Path -LiteralPath (Join-Path $repoRoot $path) -PathType Leaf)) {
-        throw "Goal41 租约路径缺失：$path"
-    }
-}
 
 if (-not $CargoTargetDir) {
-    $CargoTargetDir = Join-Path ([System.IO.Path]::GetTempPath()) 'venue-goal41-gateway-contract-target'
+    $CargoTargetDir = Join-Path ([System.IO.Path]::GetTempPath()) 'venue-gateway-candidate-contract-target'
 }
 $targetRoot = [System.IO.Path]::GetFullPath($CargoTargetDir)
 if ($targetRoot.Equals($repoRoot, [StringComparison]::OrdinalIgnoreCase) -or
@@ -58,7 +15,7 @@ if ($targetRoot.Equals($repoRoot, [StringComparison]::OrdinalIgnoreCase) -or
         $repoRoot + [System.IO.Path]::DirectorySeparatorChar,
         [StringComparison]::OrdinalIgnoreCase
     )) {
-    throw 'Goal41 专项构建目录必须位于 worktree 外。'
+    throw '网关候选专项构建目录必须位于 worktree 外。'
 }
 New-Item -ItemType Directory -Path $targetRoot -Force | Out-Null
 $cargoTemp = Join-Path `
@@ -120,7 +77,7 @@ function Test-MissingEvidenceFailClosed {
     foreach ($mode in @('TEST', 'LIVE')) {
         $probeBase = Join-Path `
             (Split-Path -Parent $targetRoot) `
-            "venue-goal41-no-io-$Venue-$mode-$([Guid]::NewGuid().ToString('N'))"
+            "venue-gateway-no-io-$Venue-$mode-$([Guid]::NewGuid().ToString('N'))"
         if (Test-Path -LiteralPath $probeBase) {
             throw "失败关闭探针路径意外已存在：$probeBase"
         }
@@ -204,28 +161,64 @@ foreach ($venue in @('binance', 'bitget', 'bybit', 'gate', 'hyperliquid', 'okx')
     $isolation = $isolationJson | ConvertFrom-Json
     Test-MissingEvidenceFailClosed -Venue $venue -BinaryPath $binaryPath
 
-    $candidateLevel = if ($venue -in @('binance', 'bitget', 'gate')) {
-        'native_candidate_behavior'
-    } else {
-        'precredential_fail_closed'
+    $candidateEvidence = switch ($venue) {
+        'binance' {
+            [ordered]@{
+                order_families = 'binary_test_exact_three_family_coverage'
+                one_shot_mutation = 'shared_host_only; candidate_test_prepares_three_mutation_kinds'
+                ack_unknown = 'binary_test_exact_readback_or_unknown'
+                capability = 'binary_test_empty'
+            }
+        }
+        'bitget' {
+            [ordered]@{
+                order_families = 'candidate_readback_exercised; no_direct_family_assertion'
+                one_shot_mutation = 'binary_test_dispatch_count_equals_one'
+                ack_unknown = 'binary_test_exact_readback_failure_is_unknown'
+                capability = 'binary_test_empty'
+            }
+        }
+        'gate' {
+            [ordered]@{
+                order_families = 'binary_test_regular_complete_conditional_algo_profile_unsupported'
+                one_shot_mutation = 'binary_test_place_cancel_reduce_once_and_replay_rejected'
+                ack_unknown = 'binary_test_unknown_not_retried'
+                capability = 'candidate_fixture_nonempty; fixed_binary_not_candidate_admitted'
+            }
+        }
+        'bybit' {
+            [ordered]@{
+                order_families = 'not_reached; precredential_fail_closed'
+                one_shot_mutation = 'not_reached; precredential_fail_closed'
+                ack_unknown = 'not_reached; precredential_fail_closed'
+                capability = 'binary_test_empty'
+            }
+        }
+        'hyperliquid' {
+            [ordered]@{
+                order_families = 'not_reached; shared_integration_fail_closed'
+                one_shot_mutation = 'not_reached; shared_integration_fail_closed'
+                ack_unknown = 'not_reached; shared_integration_fail_closed'
+                capability = 'binary_test_empty'
+            }
+        }
+        'okx' {
+            [ordered]@{
+                order_families = 'not_reached; no_post_recovery_collector'
+                one_shot_mutation = 'not_reached; no_post_recovery_collector'
+                ack_unknown = 'not_reached; no_post_recovery_collector'
+                capability = 'fixed_binary_adapter_flags_empty; candidate_bridge_not_constructed'
+            }
+        }
     }
     $matrix.Add([ordered]@{
         venue = $venue
-        candidate_level = $candidateLevel
-        test_live_binding_isolation = $true
-        three_order_families = if ($candidateLevel -eq 'native_candidate_behavior') {
-            'complete_or_profile_unsupported'
-        } else {
-            'readback_unreachable_without_complete_evidence'
-        }
-        one_shot_mutation = if ($candidateLevel -eq 'native_candidate_behavior') {
-            'candidate_and_shared_host_regression'
-        } else {
-            'mutation_unreachable'
-        }
-        ack_unknown_no_resubmit = $true
-        capability_empty = $true
-        missing_evidence_zero_artifact_io = $true
+        test_live_binding = 'integration_test_exact_and_disjoint'
+        order_family_evidence = $candidateEvidence.order_families
+        one_shot_evidence = $candidateEvidence.one_shot_mutation
+        ack_unknown_evidence = $candidateEvidence.ack_unknown
+        capability_evidence = $candidateEvidence.capability
+        missing_evidence_probe = 'process_nonzero_under_15s; credentials_removed; artifact_root_absent'
         endpoint_isolation = $isolation.endpoint_isolation
         credential_namespace_isolation = $isolation.credential_namespace_isolation
         executable_sha256 = $isolation.executable_sha256
@@ -233,7 +226,7 @@ foreach ($venue in @('binance', 'bitget', 'bybit', 'gate', 'hyperliquid', 'okx')
 }
 
 [ordered]@{
-    baseline = $expectedBaseline
     writer_enabled = $false
+    shared_host_tests = 'actual venue-node --lib test suite'
     coverage = $matrix
 } | ConvertTo-Json -Depth 5
