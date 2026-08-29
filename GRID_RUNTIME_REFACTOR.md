@@ -91,7 +91,7 @@ Exchange Account Process
 ├─ Strategy Actor C：scalping / ETH-USDT
 ├─ Execution Lane（唯一执行通道）
 ├─ Reconciler（账户对账器）
-└─ Control API 边界（当前服务核心在 `apps/venue-control`，HTTP/SSE 与节点 adapter 未实现）
+└─ Control API 边界（`apps/venue-control` 已提供本地 HTTP/SSE，账户节点 adapter 未实现）
 ```
 
 数据流必须单向：
@@ -444,8 +444,8 @@ Gate、Bitget 当前 profile 只允许常规订单族，条件/Algo 由同一 pr
 本地 Control API 使用 `venue-control-protocol` schema v2；原生 VenueFlow 与 WebAssembly canvas 共用
 `/v2/ui/snapshot`、`/v2/ui/events`、`/v2/control/commands`。策略投影和命令必须携带精确 `TEST | LIVE`，两端只调用 API，不读取数据库、WAL 或 artifacts，
 不持有凭证，不直连交易所，不直接下单。Stop/Flatten 必须显示并提交精确 mode、account、symbol、instance、config epoch、action 与人工确认；
-`apps/venue-control` 当前只提供 transport-neutral schema 重验、幂等 repository 与 PostgreSQL durable inbox/outbox/claim/terminal receipt；
-HTTP/SSE server 和账户节点 adapter 尚未实现。账户节点仍须按 Actor applied、Execution Lane、risk、Owner、WAL 与 writer 边界重新验证，
+`apps/venue-control` 提供 transport-neutral schema 重验、幂等 repository、PostgreSQL durable inbox/outbox/claim/terminal receipt，
+以及仅限本地的 HTTP/SSE `/v2` 适配层；账户节点 adapter 尚未实现。账户节点仍须按 Actor applied、Execution Lane、risk、Owner、WAL 与 writer 边界重新验证，
 数据库 claim 或 Control receipt 均不授予 mutation authority。
 
 ## 12. 验收标准

@@ -40,7 +40,7 @@ sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "json"] }
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "macros", "signal", "sync", "io-util"] }
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 
 [package]

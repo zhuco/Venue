@@ -6,6 +6,7 @@
 mod copy_model;
 mod copy_postgres;
 mod copy_repository;
+mod http;
 mod model;
 mod postgres;
 mod repository;
@@ -20,6 +21,7 @@ pub use copy_model::{
 };
 pub use copy_postgres::MIGRATION_0002;
 pub use copy_repository::{CopyRepository, CopyRepositoryError};
+pub use http::{ControlHttpConfig, HttpServerError, control_shutdown_channel, serve_local};
 pub use model::{AccountNodeBinding, ClaimedCommand, ScopedCommandReceipt, StoredEvent};
 pub use postgres::{MIGRATION_0001, PgControlRepository};
 pub use repository::{
