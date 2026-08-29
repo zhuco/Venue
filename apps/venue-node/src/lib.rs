@@ -8,11 +8,21 @@ use clap::Parser;
 use venue_domain::domain::Symbol;
 use venue_gateway_api::{CapabilityFlags, GatewayApiError, GatewayBinding, GatewayMode, VenueId};
 
+mod control_delivery;
 mod safe_host;
 mod supervision;
 
 #[cfg(test)]
+mod control_delivery_tests;
+#[cfg(test)]
 mod safe_host_tests;
+
+pub use control_delivery::{
+    ActorDeliveryCompletion, ActorDeliveryTurn, ClaimAcceptance, ControlDeliveryError,
+    ControlDeliveryInbox, ControlDeliveryJournal, ControlDeliveryJournalError,
+    ControlDeliveryJournalRecord, DurableDeliveryOutput, DurableStoreResult,
+    ReconciliationCompletion, ReconciliationTurn,
+};
 
 pub use safe_host::{
     CanaryEvidence, CommandReadbackKey, ControlCompletion, DispatchOutcome, DispatchPermit,
