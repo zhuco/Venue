@@ -6,6 +6,7 @@
 pub mod account;
 pub mod account_lane;
 mod authority;
+pub mod shared;
 pub mod strategy;
 
 pub use authority::{
