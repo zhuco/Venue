@@ -89,6 +89,26 @@ fn restart_recovers_opaque_payloads_and_continues_the_chain()
 }
 
 #[test]
+fn first_durable_append_is_recovered_after_restart() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let path = directory.path().join("control-delivery.jsonl");
+    {
+        let mut journal = OpaqueJournal::open(&path)?;
+        assert_eq!(journal.append(1, b"root")?, 1);
+    }
+
+    let mut restarted = OpaqueJournal::open(path)?;
+    assert_eq!(
+        restarted.recover()?,
+        vec![OpaqueJournalRecord {
+            sequence: 1,
+            payload: b"root".to_vec(),
+        }]
+    );
+    Ok(())
+}
+
+#[test]
 fn complete_payload_or_chain_tampering_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
     for field in ["payload", "previous_sha256"] {
         let directory = tempdir()?;
@@ -141,5 +161,29 @@ fn complete_malformed_line_fails_closed_without_tail_repair()
         Err(OpaqueJournalError::Decode(_))
     ));
     assert_eq!(fs::read(&path)?, corrupted);
+    Ok(())
+}
+
+#[test]
+fn append_fails_closed_for_a_missing_or_invalid_parent_directory()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempdir()?;
+    let missing_path = directory.path().join("missing").join("control.jsonl");
+    let mut missing = OpaqueJournal::open(&missing_path)?;
+    assert!(matches!(
+        missing.append(1, b"root"),
+        Err(OpaqueJournalError::Storage(StorageError::Io { .. }))
+    ));
+    assert!(!missing_path.exists());
+
+    let not_directory = directory.path().join("not-a-directory");
+    fs::write(&not_directory, b"file")?;
+    let invalid_path = not_directory.join("control.jsonl");
+    let mut invalid = OpaqueJournal::open(&invalid_path)?;
+    assert!(matches!(
+        invalid.append(1, b"root"),
+        Err(OpaqueJournalError::Storage(StorageError::Io { .. }))
+    ));
+    assert!(!invalid_path.exists());
     Ok(())
 }
