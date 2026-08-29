@@ -116,7 +116,7 @@ fn ack_is_durable_and_control_confirmed_before_actor_applied()
     assert!(!turn.grants_writer_lease());
     assert!(!turn.grants_wal_authority());
     assert!(!turn.grants_dispatch_permit());
-    let completion = turn.applied(140, digest(7), "actor inbox and checkpoint durable")?;
+    let completion = turn.applied_fixture(140, digest(7), "actor inbox and checkpoint durable")?;
     let receipt = inbox.record_actor_completion(completion)?;
     assert_eq!(receipt.value().state, AccountDeliveryReceiptState::Applied);
     assert_eq!(receipt.durable_sequence(), 4);
@@ -296,6 +296,83 @@ fn first_claim_and_scope_are_exactly_fenced() -> Result<(), Box<dyn std::error::
 }
 
 #[test]
+fn expired_turn_does_not_block_other_delivery_or_next_reconciliation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut inbox = new_inbox(MemoryJournal::default())?;
+    let expired = claim_with_delivery(
+        "command:expired",
+        1,
+        100,
+        200,
+        AccountDeliveryPurpose::Install,
+    )?;
+    install_ack(&mut inbox, expired, 110, 120)?;
+    let active = claim_with_delivery(
+        "command:active",
+        1,
+        150,
+        350,
+        AccountDeliveryPurpose::Install,
+    )?;
+    install_ack(&mut inbox, active, 160, 170)?;
+
+    let turns = inbox.pending_actor_turns(210)?;
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].lease().delivery_id, "command:active");
+
+    let reconciliation = claim_with_delivery(
+        "command:expired",
+        2,
+        200,
+        300,
+        AccountDeliveryPurpose::ReconcileOnly,
+    )?;
+    assert!(matches!(
+        inbox.accept_claim(reconciliation, 210)?,
+        ClaimAcceptance::Reconcile(_)
+    ));
+    let reconciliation_turns = inbox.pending_reconciliation_turns(220)?;
+    assert_eq!(reconciliation_turns.len(), 1);
+    assert_eq!(
+        reconciliation_turns[0].lease().delivery_id,
+        "command:expired"
+    );
+
+    assert!(inbox.pending_reconciliation_turns(310)?.is_empty());
+    assert_eq!(inbox.pending_actor_turns(310)?.len(), 1);
+    let next_reconciliation = claim_with_delivery(
+        "command:expired",
+        3,
+        300,
+        400,
+        AccountDeliveryPurpose::ReconcileOnly,
+    )?;
+    assert!(matches!(
+        inbox.accept_claim(next_reconciliation, 310)?,
+        ClaimAcceptance::Reconcile(_)
+    ));
+    Ok(())
+}
+
+#[test]
+fn caller_digest_cannot_create_a_production_applied_receipt()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut inbox = new_inbox(MemoryJournal::default())?;
+    let install = claim(1, 100, 200, AccountDeliveryPurpose::Install)?;
+    install_ack(&mut inbox, install, 110, 120)?;
+    let turn = inbox
+        .actor_turn("command:request-32", 130)?
+        .ok_or("actor turn missing")?;
+    assert!(matches!(
+        turn.applied(140, digest(8), "caller claims durable"),
+        Err(ControlDeliveryError::ActorAppliedUnavailable)
+    ));
+    assert!(inbox.pending_receipts().is_empty());
+    assert_eq!(inbox.pending_actor_turns(150)?.len(), 1);
+    Ok(())
+}
+
+#[test]
 fn opaque_storage_recovers_incomplete_tail_and_fences_a_stale_writer()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
@@ -383,7 +460,7 @@ async fn polling_driver_orders_claim_durable_ack_actor_and_receipt()
     assert!(!driver.grants_wal_authority());
     assert!(!driver.grants_dispatch_permit());
     driver
-        .submit_actor_completion(actor.applied(130, digest(4), "actor durable")?, 140)
+        .submit_actor_completion(actor.applied_fixture(130, digest(4), "actor durable")?, 140)
         .await?;
     assert_eq!(journal.len()?, 5);
 
@@ -529,11 +606,27 @@ fn claim(
     expires_at_ms: u64,
     purpose: AccountDeliveryPurpose,
 ) -> Result<AccountDeliveryClaim, venue_domain::SymbolError> {
+    claim_with_delivery(
+        "command:request-32",
+        lease_epoch,
+        leased_at_ms,
+        expires_at_ms,
+        purpose,
+    )
+}
+
+fn claim_with_delivery(
+    delivery_id: &str,
+    lease_epoch: u64,
+    leased_at_ms: u64,
+    expires_at_ms: u64,
+    purpose: AccountDeliveryPurpose,
+) -> Result<AccountDeliveryClaim, venue_domain::SymbolError> {
     let binding = binding()?;
     Ok(AccountDeliveryClaim {
         lease: AccountDeliveryLease {
             schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
-            delivery_id: "command:request-32".to_owned(),
+            delivery_id: delivery_id.to_owned(),
             binding: binding.clone(),
             node_id: NODE.to_owned(),
             lease_epoch,
