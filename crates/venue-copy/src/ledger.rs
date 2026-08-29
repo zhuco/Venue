@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use venue_domain::domain::Amount;
 
 use crate::{CopyId, DeliveryBinding};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum LedgerAttribution {
     Copy,
     External,
@@ -14,7 +15,7 @@ pub enum LedgerAttribution {
 }
 
 /// One persisted private-fact projection. It is evidence for a reducer, not an execution result.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LedgerEntry {
     pub sequence: u64,
     pub generation: u64,

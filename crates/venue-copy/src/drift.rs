@@ -1,4 +1,5 @@
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use venue_domain::domain::Amount;
 
@@ -7,7 +8,7 @@ use crate::{CopyId, CopyIdentitySet, DeliveryBinding, TargetExposurePlan};
 pub const MAX_REPAIR_TTL_MS: u64 = 5 * 60 * 1_000;
 pub const MAX_POSITION_SNAPSHOT_TTL_MS: u64 = 60 * 1_000;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AuthoritativePositionSnapshot {
     pub binding: DeliveryBinding,
     pub generation: u64,
@@ -31,7 +32,7 @@ pub struct DriftRepairPlanRequest {
 }
 
 /// A new semantic planning request. It carries no order shape, transport, or mutation authority.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DriftRepairRequest {
     pub supersedes_job_id: CopyId,
     pub identities: CopyIdentitySet,

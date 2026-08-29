@@ -1,5 +1,6 @@
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -7,7 +8,7 @@ const UUID_BYTES: usize = 16;
 const DIGEST_BYTES: usize = 32;
 
 /// The accepted leader action is part of the durable copy-job identity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum CopyAction {
     New,
     Amend,
@@ -25,7 +26,7 @@ impl CopyAction {
 }
 
 /// Frozen UUID bytes required to reproduce the KOL planner's accepted identity contract.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CopyIdentityInput {
     pub event_id: [u8; UUID_BYTES],
     pub source_event_id: [u8; UUID_BYTES],
@@ -37,7 +38,7 @@ pub struct CopyIdentityInput {
 }
 
 /// One deterministic UUID-shaped identity. It is data only and grants no execution authority.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct CopyId([u8; UUID_BYTES]);
 
 impl CopyId {
@@ -65,7 +66,7 @@ impl fmt::Display for CopyId {
 }
 
 /// Full SHA-256 idempotency commitment persisted alongside the derived job.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct IdempotencyKey([u8; DIGEST_BYTES]);
 
 impl IdempotencyKey {
@@ -90,7 +91,7 @@ impl fmt::Display for IdempotencyKey {
 }
 
 /// Stable identities for one frozen leader event and follower binding.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CopyIdentitySet {
     pub job_id: CopyId,
     pub planning_snapshot_id: CopyId,

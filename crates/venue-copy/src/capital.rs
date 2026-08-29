@@ -1,4 +1,5 @@
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use venue_domain::domain::{Amount, Asset};
 
@@ -30,7 +31,7 @@ pub struct TargetExposureRequest {
 }
 
 /// Pure target-exposure result. It is not an order or mutation authority.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TargetExposurePlan {
     pub snapshot_generation: u64,
     pub exposure_ratio: Decimal,

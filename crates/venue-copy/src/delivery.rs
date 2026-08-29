@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use venue_domain::domain::{InstrumentIdentity, MarketKind, is_canonical_trading_account_id};
 
@@ -5,7 +6,7 @@ use crate::{CopyId, CopyIdentitySet, identity::derive_commitment};
 
 pub const MAX_DELIVERY_TTL_MS: u64 = 5 * 60 * 1_000;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeliveryBinding {
     pub leader_id: CopyId,
     pub follower_id: CopyId,
@@ -15,7 +16,7 @@ pub struct DeliveryBinding {
     pub policy_id: CopyId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FollowerDeliveryManifest {
     pub identities: CopyIdentitySet,
     pub binding: DeliveryBinding,
@@ -113,7 +114,7 @@ impl FollowerDeliveryManifest {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DeliveryReceiptStatus {
     Applied,
     Unknown,
@@ -121,7 +122,7 @@ pub enum DeliveryReceiptStatus {
     Rejected,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PersistedDeliveryReceipt {
     pub delivery_digest: [u8; 32],
     pub binding: DeliveryBinding,
