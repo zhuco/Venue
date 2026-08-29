@@ -27,11 +27,24 @@ integrated and verified Owner, WAL, the unique account writer fence, signed read
 reconciliation, Stop/Flatten, and operator-confirmed Canary evidence.
 
 `venue_node::NodeSafetyHost` is the exchange-neutral composition boundary for that integration. It
-reuses the canonical account-root fence, writer lease, and command WAL from `venue-execution`,
-routes every command through one exact `StrategyBinding`, and gives an injected `PhysicalGateway`
+reuses the canonical account-root fence, writer lease, and command WAL from `venue-execution`.
+Startup now restores and validates the canonical root, durable Owner/config scope, mutation WAL,
+control-receipt chain, and predecessor writer metadata before issuing the adapter a non-cloneable
+connection permit. No adapter readback or connection is allowed before that permit.
+
+Pause, Resume, Stop, Flatten, and command-bound Canary are two-phase durable turns. The host first
+fsyncs the exact scoped request, then issues a non-cloneable Actor turn; only a receipt created after
+the Actor inbox/checkpoint transaction is durable can advance lifecycle or install Canary evidence.
+Accepted but unapplied turns are reissued after a crash, applied Pause/Stopping/Stopped state is
+replayed on restart, duplicate request identities fail closed, and Stop/Flatten completion is itself
+persisted with the newer signed full-family readback. The control journal is hash chained, repairs
+only an incomplete crash tail, and rejects any corrupt complete record before gateway connection.
+
+The mutation side routes every command through one exact `StrategyBinding`, and gives an injected
+`PhysicalGateway`
 one non-cloneable dispatch permit only after WAL, capability, writer, binding, and lifecycle checks;
-risk-increasing LIVE commands additionally require fresh Canary evidence bound to that exact
-durable command identity. Startup and ambiguous
+risk-increasing commands in both TEST and LIVE additionally require fresh Canary evidence bound to
+that exact durable command identity. Startup and ambiguous
 dispatches require a newer adapter-verified signed readback; UNKNOWN
 commands are settled from their durable family/client identity and are never resubmitted. Stop and
 Flatten accept exact operator evidence and complete only from a request-newer full-family receipt;
