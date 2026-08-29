@@ -1,5 +1,6 @@
 mod market_hub;
 mod model;
+mod physical_recovery;
 mod private_router;
 mod reconciler;
 mod recovery;
@@ -12,6 +13,11 @@ pub use crate::{
 };
 pub use market_hub::{BestBidOffer, MarketHub, MarketHubError, MarketPublish};
 pub use model::{AccountFault, AccountHealth, InstanceLifecycle};
+pub use physical_recovery::{
+    PhysicalReadbackCoverage, PhysicalReadbackReceipt, PhysicalReadbackSurface,
+    PhysicalRecoveryAuthorityRoots, PhysicalRecoveryManifestError,
+    PhysicalRecoveryReadbackManifest, PhysicalRecoveryScope,
+};
 pub(crate) use private_router::PrivateRouter;
 pub use private_router::{
     PrivateDelivery, PrivateReconcileRequest, PrivateRouteReport, PrivateRouterError,
