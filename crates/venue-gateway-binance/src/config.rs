@@ -56,6 +56,11 @@ impl BinanceConfig {
     }
 
     #[must_use]
+    pub const fn gateway_binding(&self) -> &GatewayBinding {
+        &self.binding
+    }
+
+    #[must_use]
     pub const fn account_binding(&self) -> BinanceAccountBinding {
         self.account_binding
     }
@@ -92,6 +97,18 @@ impl BinanceConfig {
         }
         Ok(())
     }
+}
+
+pub mod endpoints {
+    pub const LISTEN_KEY: &str = "/papi/v1/listenKey";
+    pub const ACCOUNT: &str = "/papi/v1/account";
+    pub const ACCOUNT_CONFIG: &str = "/papi/v1/um/accountConfig";
+    pub const POSITION_MODE: &str = "/papi/v1/um/positionSide/dual";
+    pub const POSITIONS: &str = "/papi/v1/um/positionRisk";
+    pub const OPEN_ORDERS: &str = "/papi/v1/um/openOrders";
+    pub const OPEN_ALGO_ORDERS: &str = "/papi/v1/um/algo/openAlgoOrders";
+    pub const USER_TRADES: &str = "/papi/v1/um/userTrades";
+    pub const ORDER: &str = "/papi/v1/um/order";
 }
 
 #[cfg(test)]

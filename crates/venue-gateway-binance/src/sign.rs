@@ -73,6 +73,14 @@ impl SignedBinanceRestRequest {
                 .rsplit_once("&signature=")
                 .is_some_and(|(payload, signature)| !payload.is_empty() && signature.len() == 64)
     }
+
+    pub(crate) fn api_key(&self) -> &str {
+        self.api_key.expose_secret()
+    }
+
+    pub(crate) fn query(&self) -> &str {
+        self.query.expose_secret()
+    }
 }
 
 pub fn sign_rest(
