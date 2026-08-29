@@ -67,22 +67,35 @@ impl VenueFlowApp {
         let events = self.client.drain().take(5_000).collect::<Vec<_>>();
         for event in events {
             match event {
-                ClientEvent::Connected => self.model.connection = ConnectionState::Live,
+                ClientEvent::SnapshotConnected => {
+                    if matches!(
+                        self.model.connection,
+                        ConnectionState::Connecting | ConnectionState::Offline
+                    ) {
+                        self.model.connection = ConnectionState::Live;
+                    }
+                }
+                ClientEvent::StreamConnected => {
+                    self.model.connection = ConnectionState::Live;
+                    self.model.last_error = None;
+                }
                 ClientEvent::Disconnected(message) => {
                     self.model.connection = if self.model.snapshot.is_some() {
                         ConnectionState::Degraded
                     } else {
                         ConnectionState::Offline
                     };
+                    self.model.last_error = Some(message.clone());
                     self.model.notice(message);
                 }
                 ClientEvent::Snapshot(snapshot) => self.model.apply_snapshot(snapshot),
                 ClientEvent::Receipt(receipt) => {
-                    self.model.notice(format!(
-                        "Control receipt {} is {:?}",
-                        receipt.receipt_id, receipt.state
-                    ));
-                    self.model.last_receipt = Some(receipt);
+                    if self.model.apply_receipt(receipt.clone()) {
+                        self.model.notice(format!(
+                            "Control receipt {} is {:?}: {}",
+                            receipt.receipt_id, receipt.state, receipt.detail
+                        ));
+                    }
                 }
                 ClientEvent::Notice(message) => self.model.notice(message),
             }

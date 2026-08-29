@@ -59,10 +59,15 @@ pub struct PendingConfirmation {
 #[derive(Debug)]
 pub struct AppModel {
     pub preferences: Preferences,
+    /// Connectivity of this secret-free Control API client, not the account runtime projection.
     pub connection: ConnectionState,
+    /// The account-runtime state reported by the most recent validated snapshot.
+    pub control_connection: Option<ConnectionState>,
+    pub last_error: Option<String>,
     pub snapshot: Option<ControlSnapshot>,
     pub pending_confirmation: Option<PendingConfirmation>,
     pub last_receipt: Option<CommandReceipt>,
+    receipt_ids: VecDeque<String>,
     pub notices: VecDeque<String>,
     request_sequence: u64,
 }
@@ -72,16 +77,19 @@ impl AppModel {
         Self {
             preferences,
             connection: ConnectionState::Connecting,
+            control_connection: None,
+            last_error: None,
             snapshot: None,
             pending_confirmation: None,
             last_receipt: None,
+            receipt_ids: VecDeque::new(),
             notices: VecDeque::new(),
             request_sequence: 0,
         }
     }
 
     pub fn apply_snapshot(&mut self, snapshot: ControlSnapshot) {
-        self.connection = snapshot.connection;
+        self.control_connection = Some(snapshot.connection);
         if !snapshot
             .markets
             .iter()
@@ -91,6 +99,19 @@ impl AppModel {
             self.preferences.selected_symbol = first.symbol.to_string();
         }
         self.snapshot = Some(snapshot);
+    }
+
+    /// Returns false for an already-rendered receipt. SSE replay is expected after reconnects.
+    pub fn apply_receipt(&mut self, receipt: CommandReceipt) -> bool {
+        if self.receipt_ids.iter().any(|id| id == &receipt.receipt_id) {
+            return false;
+        }
+        self.receipt_ids.push_back(receipt.receipt_id.clone());
+        while self.receipt_ids.len() > MAX_NOTICES {
+            self.receipt_ids.pop_front();
+        }
+        self.last_receipt = Some(receipt);
+        true
     }
 
     pub fn begin_command(
@@ -132,8 +153,8 @@ pub fn format_decimal(value: Decimal, precision: usize) -> String {
 mod tests {
     use rust_decimal::Decimal;
     use venue_control_protocol::{
-        CONTROL_SCHEMA_VERSION, ConnectionState, ControlAction, ControlSnapshot, GatewayMode,
-        StrategyKind, StrategyLifecycle, StrategySummary, VenueId,
+        CONTROL_SCHEMA_VERSION, CommandReceipt, ConnectionState, ControlAction, ControlSnapshot,
+        GatewayMode, StrategyKind, StrategyLifecycle, StrategySummary, VenueId,
     };
 
     use super::{AppModel, Preferences};
@@ -151,7 +172,8 @@ mod tests {
             markets: Vec::new(),
             ledger: Vec::new(),
         });
-        assert_eq!(model.connection, ConnectionState::Live);
+        assert_eq!(model.connection, ConnectionState::Connecting);
+        assert_eq!(model.control_connection, Some(ConnectionState::Live));
         assert!(model.snapshot.is_some());
     }
 
@@ -182,5 +204,28 @@ mod tests {
         assert_eq!(request.mode, GatewayMode::Test);
         assert!(request.expected_confirmation().contains("mode=TEST"));
         Ok(())
+    }
+
+    #[test]
+    fn replayed_receipts_are_idempotent_but_new_terminal_receipts_remain_visible() {
+        let mut model = AppModel::new(Preferences::default());
+        let accepted = CommandReceipt {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            request_id: "request-1".to_owned(),
+            state: venue_control_protocol::CommandState::Accepted,
+            receipt_id: "receipt-accepted".to_owned(),
+            observed_ms: 1,
+            detail: String::new(),
+        };
+        assert!(model.apply_receipt(accepted.clone()));
+        assert!(!model.apply_receipt(accepted));
+        assert!(model.apply_receipt(CommandReceipt {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            request_id: "request-1".to_owned(),
+            receipt_id: "receipt-applied".to_owned(),
+            state: venue_control_protocol::CommandState::Applied,
+            observed_ms: 2,
+            detail: String::new(),
+        }));
     }
 }

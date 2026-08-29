@@ -142,6 +142,10 @@ pub fn show_status_bar(ui: &mut egui::Ui, model: &AppModel) {
                         receipt.receipt_id, receipt.state
                     ));
                 }
+                if let Some(error) = &model.last_error {
+                    ui.separator();
+                    ui.colored_label(theme::SELL, format!("Control error: {error}"));
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.small("query/control plane only · no credentials · no direct mutation");
                 });
@@ -166,9 +170,14 @@ pub fn show_confirmation(context: &egui::Context, model: &mut AppModel, client: 
             );
             ui.separator();
             ui.label(format!("Venue: {}", pending.request.venue));
+            ui.label(format!("Mode: {}", pending.request.mode));
             ui.label(format!("Account: {}", pending.request.trading_account_id));
             ui.label(format!("Instance: {}", pending.request.instance_id));
             ui.label(format!("Symbol: {}", pending.request.symbol));
+            ui.label(format!(
+                "Config epoch: {}",
+                pending.request.expected_config_epoch
+            ));
             ui.label(format!("Action: {}", pending.request.action.as_str()));
             ui.add_space(6.0);
             ui.label("Type the exact confirmation:");
@@ -536,8 +545,8 @@ fn show_strategies(ui: &mut egui::Ui, model: &mut AppModel) {
             .striped(true)
             .show(ui, |ui| {
                 for heading in [
-                    "Instance", "Kind", "Venue", "Symbol", "State", "Orders", "Long", "Short",
-                    "PnL", "Epoch",
+                    "Instance", "Kind", "Venue", "Mode", "Symbol", "State", "Orders", "Long",
+                    "Short", "PnL", "Epoch",
                 ] {
                     ui.strong(heading);
                 }
@@ -556,6 +565,7 @@ fn show_strategies(ui: &mut egui::Ui, model: &mut AppModel) {
                     }
                     ui.label(format!("{:?}", strategy.kind));
                     ui.label(strategy.venue.to_string());
+                    ui.label(strategy.mode.to_string());
                     ui.label(strategy.symbol.to_string());
                     lifecycle_label(ui, strategy.lifecycle);
                     ui.monospace(strategy.open_orders.to_string());
@@ -681,6 +691,8 @@ fn show_control(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient)
         return;
     };
     ui.separator();
+    ui.label(format!("Venue: {}", strategy.venue));
+    ui.label(format!("Mode: {}", strategy.mode));
     ui.label(format!("Account: {}", strategy.trading_account_id));
     ui.label(format!("Symbol: {}", strategy.symbol));
     ui.label(format!("Config epoch: {}", strategy.config_epoch));
@@ -733,6 +745,12 @@ fn submit_or_confirm(
 fn show_diagnostics(ui: &mut egui::Ui, model: &AppModel) {
     pane_heading(ui, "Diagnostics", "control-plane client state");
     connection_badge(ui, model.connection);
+    ui.label(format!(
+        "Runtime projection: {}",
+        model
+            .control_connection
+            .map_or("awaiting snapshot".to_owned(), |state| format!("{state:?}"))
+    ));
     ui.label(format!(
         "Endpoint: {}",
         endpoint_label(&model.preferences.endpoint)

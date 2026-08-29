@@ -43,7 +43,7 @@ js-sys = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Document", "Element", "ErrorEvent", "EventSource", "HtmlCanvasElement", "MessageEvent", "Window"] }
+web-sys = { version = "0.3", features = ["Document", "Element", "ErrorEvent", "Event", "EventSource", "HtmlCanvasElement", "MessageEvent", "Window"] }
 
 [lints.rust]
 unsafe_code = "forbid"
