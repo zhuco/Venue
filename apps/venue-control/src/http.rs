@@ -11,7 +11,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::watch,
+    sync::{Semaphore, watch},
     time::{self, MissedTickBehavior},
 };
 use venue_control_protocol::ControlCommandRequest;
@@ -21,6 +21,7 @@ use crate::{ControlRepository, ControlService, RepositoryError, ServiceError};
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HEADER_LINES: usize = 64;
 const MAX_HEADER_LINE_BYTES: usize = 1_024;
+const MAX_ACTIVE_CONNECTIONS: usize = 64;
 const DEFAULT_REQUEST_BODY_LIMIT: usize = 64 * 1024;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -66,6 +67,8 @@ impl ControlHttpConfig {
 pub enum HttpServerError {
     #[error("control HTTP configuration contains an invalid bound")]
     InvalidConfig,
+    #[error("control HTTP listener must be bound to a loopback address")]
+    NonLoopbackBind,
     #[error("control HTTP server failed: {0}")]
     Serve(#[from] std::io::Error),
 }
@@ -124,6 +127,10 @@ where
     R: ControlRepository + 'static,
 {
     config.validate()?;
+    if !listener.local_addr()?.ip().is_loopback() {
+        return Err(HttpServerError::NonLoopbackBind);
+    }
+    let connections = Arc::new(Semaphore::new(MAX_ACTIVE_CONNECTIONS));
     let state = HttpState {
         service,
         config,
@@ -136,7 +143,15 @@ where
             }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
-                tokio::spawn(handle_connection(stream, state.clone()));
+                let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
+                let connection_state = state.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    handle_connection(stream, connection_state).await;
+                });
             }
         }
     }

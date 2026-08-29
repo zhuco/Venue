@@ -260,6 +260,22 @@ async fn request_timeout_and_slow_sse_writes_fail_closed() -> Result<(), Box<dyn
     Ok(())
 }
 
+#[tokio::test]
+async fn non_loopback_listener_is_rejected_before_accepting_clients()
+-> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("0.0.0.0:0").await?;
+    let (_, shutdown) = control_shutdown_channel();
+    let result = serve_local(
+        listener,
+        Arc::new(ControlService::new(TestRepository::default())),
+        ControlHttpConfig::default(),
+        shutdown,
+    )
+    .await;
+    assert!(matches!(result, Err(HttpServerError::NonLoopbackBind)));
+    Ok(())
+}
+
 async fn start(
     repository: TestRepository,
     config: ControlHttpConfig,
