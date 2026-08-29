@@ -12,8 +12,16 @@ use std::{
 
 use rust_decimal::Decimal;
 
+pub use venue_runtime::shared::{
+    PrivateBootstrapScope, PrivateExposure, PrivateFactsClockRoot, PrivateFactsEffect,
+    PrivateFactsFailureStage, PrivateFactsReadiness, PrivateFactsSnapshot, PrivateFactsWorkerState,
+    PrivateReadbackTicket,
+};
+use venue_runtime::shared::{
+    PrivateFactsScheduleError, PrivateFactsSchedulePolicy, PrivateFactsScheduler,
+};
+
 use crate::{
-    backoff::jittered_exponential_delay_ms,
     config::BinanceAccountBinding,
     domain::{
         AccountBalance, CommandId, FieldState, Order, Position, PositionSide, Price, Symbol,
@@ -104,13 +112,6 @@ impl BinancePrivateFactsWorkerConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PrivateFactsWorkerState {
-    Backoff,
-    NeedsBootstrap,
-    Ready,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DurableStreamFullFill {
     pub fill_id: String,
@@ -122,135 +123,6 @@ pub(crate) struct DurableStreamFullFill {
     pub maker: FieldState<bool>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PrivateBootstrapScope {
-    Account,
-    Positions,
-    PositionMode,
-    AccountConfig,
-    Orders,
-    AlgoOrders,
-    Fills,
-}
-
-/// Non-sensitive location of the most recent failed worker effect. The original transport or
-/// payload error is deliberately not persisted because it can contain exchange-provided text.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PrivateFactsFailureStage {
-    Connect,
-    ConnectCompletion,
-    BootstrapTransport(PrivateBootstrapScope),
-    BootstrapCompletion(PrivateBootstrapScope),
-    FrameTransport,
-    FrameCompletion,
-    Keepalive,
-    KeepaliveCompletion,
-}
-
-impl PrivateBootstrapScope {
-    const fn next(self) -> Option<Self> {
-        match self {
-            Self::Account => Some(Self::Positions),
-            Self::Positions => Some(Self::PositionMode),
-            Self::PositionMode => Some(Self::AccountConfig),
-            Self::AccountConfig => Some(Self::Orders),
-            Self::Orders => Some(Self::AlgoOrders),
-            Self::AlgoOrders => Some(Self::Fills),
-            Self::Fills => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PrivateReadbackTicket {
-    generation: u64,
-    evidence_sequence: u64,
-}
-
-impl PrivateReadbackTicket {
-    pub const fn generation(self) -> u64 {
-        self.generation
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PrivateFactsEffect {
-    Connect {
-        effect_id: u64,
-    },
-    Bootstrap {
-        effect_id: u64,
-        ticket: PrivateReadbackTicket,
-        scope: PrivateBootstrapScope,
-    },
-    ReceiveFrame {
-        effect_id: u64,
-        generation: u64,
-        next_sequence: u64,
-    },
-    Keepalive {
-        effect_id: u64,
-        generation: u64,
-    },
-}
-
-impl PrivateFactsEffect {
-    pub const fn effect_id(self) -> u64 {
-        match self {
-            Self::Connect { effect_id }
-            | Self::Bootstrap { effect_id, .. }
-            | Self::ReceiveFrame { effect_id, .. }
-            | Self::Keepalive { effect_id, .. } => effect_id,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct PrivateFactsCommitReport {
-    pub fills: FillRecoveryReport,
-    pub account: ReconciliationReport,
-}
-
-/// The only private-session identity that may cross from the resident worker into runtime
-/// admission. It is minted after durable readback confirmation, never from socket activity.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PrivateFactsReadiness {
-    pub generation: u64,
-    pub observed_at_ms: u64,
-    pub root_cause_fact_id: String,
-    pub exposure: PrivateExposure,
-    pub ordinary_order_debt: bool,
-    pub algo_order_debt: bool,
-}
-
-/// A complete, normalized snapshot retained by the account-runtime boundary after the same
-/// durable bootstrap that minted `PrivateFactsReadiness`. Strategy actors may consume this
-/// snapshot through runtime routing, but never receive a transport or raw exchange payload.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PrivateFactsSnapshot {
-    pub generation: u64,
-    pub observed_at_ms: u64,
-    pub can_trade: bool,
-    pub hedge_position: bool,
-    pub positions: Vec<Position>,
-    pub orders: Vec<Order>,
-    pub fills: Vec<crate::domain::Fill>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PrivateFactsClockRoot {
-    pub observed_at_ms: u64,
-    pub root_cause_fact_id: String,
-}
-
-/// Anonymous account shape retained only after the same-ticket bootstrap has been committed.
-/// It deliberately excludes quantities, order IDs, and all exchange-native fields.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PrivateExposure {
-    Flat,
-    Open,
-}
-
 #[derive(Debug)]
 pub struct BinancePrivateFactsWorker {
     config: BinancePrivateFactsWorkerConfig,
@@ -259,47 +131,12 @@ pub struct BinancePrivateFactsWorker {
     facts: Journal,
     fill_cursor: FillCursorStore,
     fill_recovery: FillRecoveryCoordinator,
-    state: PrivateFactsWorkerState,
-    bootstrap_scope: PrivateBootstrapScope,
-    pending: Option<PendingEffect>,
-    next_effect_id: u64,
-    next_retry_at_ms: u64,
-    next_keepalive_at_ms: u64,
-    next_refresh_at_ms: Option<u64>,
-    stream_readback_due_at_ms: Option<u64>,
-    periodic_readback_interval_ms: Option<u64>,
-    consecutive_failures: u8,
-    last_frame_sequence: u64,
-    last_frame_poll_at_ms: u64,
+    scheduler: PrivateFactsScheduler,
     ready_projection: Option<PrivateFactsReadiness>,
     ready_snapshot: Option<PrivateFactsSnapshot>,
     ready_authority_projection: Option<PrivateFactsProjectionInput>,
-    periodic_readback_in_progress: bool,
-    last_failure_stage: Option<PrivateFactsFailureStage>,
     defer_routine_stream_readback: bool,
     durable_stream_full_fills: VecDeque<DurableStreamFullFill>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PendingEffect {
-    effect_id: u64,
-    kind: PendingEffectKind,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PendingEffectKind {
-    Connect,
-    Bootstrap {
-        ticket: PrivateReadbackTicket,
-        scope: PrivateBootstrapScope,
-    },
-    ReceiveFrame {
-        generation: u64,
-        sequence: u64,
-    },
-    Keepalive {
-        generation: u64,
-    },
 }
 
 struct PrivateFactsBootstrap {
@@ -543,6 +380,16 @@ impl BinancePrivateFactsWorker {
             }
         }
         let fill_recovery = FillRecoveryCoordinator::recover(&facts, &fill_cursor)?;
+        let scheduler = PrivateFactsScheduler::new(
+            PrivateFactsSchedulePolicy {
+                base_backoff_ms: BASE_BACKOFF_MS,
+                max_backoff_ms: MAX_BACKOFF_MS,
+                keepalive_ms: KEEPALIVE_MS,
+                stream_burst_coalesce_ms: STREAM_BURST_COALESCE_MS,
+                frame_poll_ms: FRAME_POLL_MS,
+            },
+            config.account.clone(),
+        )?;
         Ok(Self {
             config,
             projection_authority,
@@ -550,23 +397,10 @@ impl BinancePrivateFactsWorker {
             facts,
             fill_cursor,
             fill_recovery,
-            state: PrivateFactsWorkerState::Backoff,
-            bootstrap_scope: PrivateBootstrapScope::Account,
-            pending: None,
-            next_effect_id: 1,
-            next_retry_at_ms: 0,
-            next_keepalive_at_ms: 0,
-            next_refresh_at_ms: None,
-            stream_readback_due_at_ms: None,
-            periodic_readback_interval_ms: None,
-            consecutive_failures: 0,
-            last_frame_sequence: 0,
-            last_frame_poll_at_ms: 0,
+            scheduler,
             ready_projection: None,
             ready_snapshot: None,
             ready_authority_projection: None,
-            periodic_readback_in_progress: false,
-            last_failure_stage: None,
             defer_routine_stream_readback: false,
             durable_stream_full_fills: VecDeque::new(),
         })
@@ -576,99 +410,46 @@ impl BinancePrivateFactsWorker {
         &mut self,
         now_ms: u64,
     ) -> Result<Option<PrivateFactsEffect>, PrivateFactsWorkerError> {
-        if self.pending.is_some() {
+        if self.scheduler.pending_effect_id().is_some() {
             return Ok(None);
         }
-        if self.state == PrivateFactsWorkerState::Ready
-            && self
-                .stream_readback_due_at_ms
-                .is_some_and(|due_at_ms| now_ms >= due_at_ms)
-        {
-            self.begin_stream_readback();
+        if self.scheduler.stream_readback_due(now_ms) {
+            self.begin_stream_readback()?;
         }
-        if self.state == PrivateFactsWorkerState::Ready
-            && self.stream_readback_due_at_ms.is_none()
-            && let Some(refresh_at_ms) = self.next_refresh_at_ms
-        {
+        if self.scheduler.periodic_readback_due(now_ms) {
             // A due fallback readback must not jump ahead of an already-buffered user-stream
             // fill. Poll the socket at least once at/after the deadline; only an empty poll
             // permits the slower seven-scope refresh on the following turn.
-            if now_ms >= refresh_at_ms && self.last_frame_poll_at_ms >= refresh_at_ms {
-                self.begin_periodic_readback()?;
-            }
+            self.begin_periodic_readback()?;
         }
-        let kind = match self.state {
-            PrivateFactsWorkerState::Backoff if now_ms < self.next_retry_at_ms => return Ok(None),
-            PrivateFactsWorkerState::Backoff => PendingEffectKind::Connect,
-            PrivateFactsWorkerState::NeedsBootstrap => PendingEffectKind::Bootstrap {
-                ticket: self.readback_ticket()?,
-                scope: self.bootstrap_scope,
-            },
-            PrivateFactsWorkerState::Ready => {
-                let generation = self.session_generation()?;
-                if now_ms >= self.next_keepalive_at_ms {
-                    PendingEffectKind::Keepalive { generation }
-                } else {
-                    self.last_frame_poll_at_ms = now_ms;
-                    PendingEffectKind::ReceiveFrame {
-                        generation,
-                        sequence: self
-                            .last_frame_sequence
-                            .checked_add(1)
-                            .ok_or(PrivateFactsWorkerError::Effect)?,
-                    }
-                }
+        let (generation, evidence_sequence) = {
+            let session = self.lock_session()?;
+            if self.scheduler.state() == PrivateFactsWorkerState::NeedsBootstrap
+                && session.state() != PrivateSessionState::NeedsReadback
+            {
+                return Err(PrivateFactsWorkerError::State);
             }
+            (session.generation(), session.journal().last_sequence())
         };
-        let effect_id = self.next_effect_id;
-        self.next_effect_id = self
-            .next_effect_id
-            .checked_add(1)
-            .ok_or(PrivateFactsWorkerError::Effect)?;
-        self.pending = Some(PendingEffect { effect_id, kind });
-        Ok(Some(match kind {
-            PendingEffectKind::Connect => PrivateFactsEffect::Connect { effect_id },
-            PendingEffectKind::Bootstrap { ticket, scope } => PrivateFactsEffect::Bootstrap {
-                effect_id,
-                ticket,
-                scope,
-            },
-            PendingEffectKind::ReceiveFrame {
-                generation,
-                sequence,
-            } => PrivateFactsEffect::ReceiveFrame {
-                effect_id,
-                generation,
-                next_sequence: sequence,
-            },
-            PendingEffectKind::Keepalive { generation } => PrivateFactsEffect::Keepalive {
-                effect_id,
-                generation,
-            },
-        }))
+        self.scheduler
+            .next_effect(now_ms, generation, evidence_sequence)
+            .map_err(Into::into)
     }
 
     pub fn complete_connect(&mut self, effect_id: u64) -> Result<u64, PrivateFactsWorkerError> {
-        self.take_pending(effect_id, |kind| matches!(kind, PendingEffectKind::Connect))?;
+        self.scheduler.begin_connect_completion(effect_id)?;
         let generation = self.lock_session()?.on_reconnect()?;
-        self.state = PrivateFactsWorkerState::NeedsBootstrap;
-        self.bootstrap_scope = PrivateBootstrapScope::Account;
-        self.consecutive_failures = 0;
-        self.last_frame_sequence = 0;
-        self.last_frame_poll_at_ms = 0;
-        self.stream_readback_due_at_ms = None;
+        self.scheduler.finish_connect_completion()?;
         self.ready_projection = None;
         self.ready_snapshot = None;
         self.ready_authority_projection = None;
-        self.periodic_readback_in_progress = false;
         Ok(generation)
     }
 
     pub fn complete_no_frame(&mut self, effect_id: u64) -> Result<(), PrivateFactsWorkerError> {
-        self.take_pending(effect_id, |kind| {
-            matches!(kind, PendingEffectKind::ReceiveFrame { .. })
-        })?;
-        Ok(())
+        self.scheduler
+            .complete_no_frame(effect_id)
+            .map_err(Into::into)
     }
 
     pub fn complete_keepalive(
@@ -676,16 +457,19 @@ impl BinancePrivateFactsWorker {
         effect_id: u64,
         now_ms: u64,
     ) -> Result<(), PrivateFactsWorkerError> {
-        let pending = self.take_pending(effect_id, |kind| {
-            matches!(kind, PendingEffectKind::Keepalive { .. })
-        })?;
-        let PendingEffectKind::Keepalive { generation } = pending.kind else {
-            return Err(PrivateFactsWorkerError::Effect);
-        };
-        if generation != self.session_generation()? {
+        let generation = self.session_generation()?;
+        if let Err(error) = self
+            .scheduler
+            .complete_keepalive(effect_id, generation, now_ms)
+        {
+            if error == PrivateFactsScheduleError::Generation {
+                return self.fail(now_ms, PrivateFactsWorkerError::StaleEpoch);
+            }
+            return Err(error.into());
+        }
+        if self.scheduler.state() != PrivateFactsWorkerState::Ready {
             return self.fail(now_ms, PrivateFactsWorkerError::StaleEpoch);
         }
-        self.next_keepalive_at_ms = now_ms.saturating_add(KEEPALIVE_MS);
         Ok(())
     }
 
@@ -697,17 +481,17 @@ impl BinancePrivateFactsWorker {
         payload: String,
         now_ms: u64,
     ) -> Result<PrivateSignal, PrivateFactsWorkerError> {
-        let pending = self.take_pending(effect_id, |kind| {
-            matches!(kind, PendingEffectKind::ReceiveFrame { .. })
-        })?;
-        let PendingEffectKind::ReceiveFrame {
-            generation,
-            sequence: expected_sequence,
-        } = pending.kind
-        else {
-            return Err(PrivateFactsWorkerError::Effect);
-        };
-        if sequence != expected_sequence || generation != self.session_generation()? {
+        let generation = self.session_generation()?;
+        if let Err(error) = self
+            .scheduler
+            .complete_frame(effect_id, generation, sequence)
+        {
+            if error == PrivateFactsScheduleError::Generation {
+                return self.fail(now_ms, PrivateFactsWorkerError::SequenceGap);
+            }
+            return Err(error.into());
+        }
+        if self.scheduler.state() != PrivateFactsWorkerState::Ready {
             return self.fail(now_ms, PrivateFactsWorkerError::SequenceGap);
         }
         let ingested = {
@@ -732,7 +516,6 @@ impl BinancePrivateFactsWorker {
                 )
             })
             .flatten();
-        self.last_frame_sequence = sequence;
         match signal {
             PrivateSignal::ReadbackRequired if self.defer_routine_stream_readback => {
                 if let Some(fill) = durable_fill {
@@ -744,22 +527,17 @@ impl BinancePrivateFactsWorker {
                 Ok(signal)
             }
             PrivateSignal::ReadbackRequired | PrivateSignal::RiskAlert => {
-                self.state = PrivateFactsWorkerState::NeedsBootstrap;
-                self.bootstrap_scope = PrivateBootstrapScope::Account;
+                self.scheduler.require_immediate_readback();
                 self.ready_projection = None;
                 self.ready_snapshot = None;
                 self.ready_authority_projection = None;
-                self.periodic_readback_in_progress = false;
-                self.stream_readback_due_at_ms = None;
                 Ok(signal)
             }
             PrivateSignal::OrderLifecycleDebounced => {
                 self.ready_projection = None;
                 self.ready_snapshot = None;
                 self.ready_authority_projection = None;
-                self.periodic_readback_in_progress = false;
-                self.stream_readback_due_at_ms =
-                    Some(now_ms.saturating_add(STREAM_BURST_COALESCE_MS));
+                self.scheduler.schedule_stream_readback(now_ms)?;
                 Ok(signal)
             }
             PrivateSignal::StreamExpired { .. } => self.fail(
@@ -774,7 +552,8 @@ impl BinancePrivateFactsWorker {
         effect_id: u64,
         now_ms: u64,
     ) -> Result<(), PrivateFactsWorkerError> {
-        self.take_pending(effect_id, |_| true)?;
+        self.scheduler
+            .complete_transport_failure(effect_id, now_ms)?;
         self.force_fence(now_ms);
         Ok(())
     }
@@ -783,7 +562,7 @@ impl BinancePrivateFactsWorker {
         let Ok(session) = self.session.lock() else {
             return false;
         };
-        self.state == PrivateFactsWorkerState::Ready
+        self.scheduler.state() == PrivateFactsWorkerState::Ready
             && session.state() == PrivateSessionState::Ready
             && self
                 .fill_recovery
@@ -791,8 +570,8 @@ impl BinancePrivateFactsWorker {
                 .allows_ready(session.generation())
     }
 
-    pub const fn state(&self) -> PrivateFactsWorkerState {
-        self.state
+    pub fn state(&self) -> PrivateFactsWorkerState {
+        self.scheduler.state()
     }
 
     /// Enables a caller-owned same-connection readback cadence. This is a liveness fallback for
@@ -801,11 +580,9 @@ impl BinancePrivateFactsWorker {
         &mut self,
         interval_ms: u64,
     ) -> Result<(), PrivateFactsWorkerError> {
-        if interval_ms == 0 {
-            return Err(PrivateFactsWorkerError::Effect);
-        }
-        self.periodic_readback_interval_ms = Some(interval_ms);
-        Ok(())
+        self.scheduler
+            .set_periodic_readback_interval(interval_ms)
+            .map_err(Into::into)
     }
 
     /// Grid fills are already durable in the private evidence journal. This mode lets the
@@ -824,22 +601,22 @@ impl BinancePrivateFactsWorker {
         self.session_generation()
     }
 
-    pub const fn last_failure_stage(&self) -> Option<PrivateFactsFailureStage> {
-        self.last_failure_stage
+    pub fn last_failure_stage(&self) -> Option<PrivateFactsFailureStage> {
+        self.scheduler.last_failure_stage()
     }
 
     /// True only while a scheduled same-generation refresh is replacing an otherwise valid
     /// signed readback. Stream signals, mutations, transport failures, and reconnects clear it.
-    pub const fn periodic_readback_in_progress(&self) -> bool {
-        self.periodic_readback_in_progress
+    pub fn periodic_readback_in_progress(&self) -> bool {
+        self.scheduler.periodic_readback_in_progress()
     }
 
     fn record_failure(&mut self, stage: PrivateFactsFailureStage) {
-        self.last_failure_stage = Some(stage);
+        self.scheduler.record_failure(stage);
     }
 
     fn clear_failure(&mut self) {
-        self.last_failure_stage = None;
+        self.scheduler.clear_failure();
     }
 
     /// Revokes the current Ready identity after a local mutation and schedules a fresh private
@@ -861,7 +638,7 @@ impl BinancePrivateFactsWorker {
     pub fn readiness(&self) -> Result<Option<PrivateFactsReadiness>, PrivateFactsWorkerError> {
         let session = self.lock_session()?;
         let readiness = self.ready_projection.clone().filter(|projection| {
-            (self.state == PrivateFactsWorkerState::Ready
+            (self.scheduler.state() == PrivateFactsWorkerState::Ready
                 && session.state() == PrivateSessionState::Ready
                 && self
                     .fill_recovery
@@ -935,33 +712,24 @@ impl BinancePrivateFactsWorker {
         scope: PrivateBootstrapScope,
         now_ms: u64,
     ) -> Result<(), PrivateFactsWorkerError> {
-        let pending = self.take_pending(effect_id, |kind| {
-            matches!(kind, PendingEffectKind::Bootstrap { .. })
-        })?;
-        let PendingEffectKind::Bootstrap {
-            ticket: expected_ticket,
-            scope: expected_scope,
-        } = pending.kind
-        else {
-            return Err(PrivateFactsWorkerError::Effect);
-        };
-        if expected_ticket != ticket
-            || expected_scope != scope
-            || self.bootstrap_scope != scope
-            || scope == PrivateBootstrapScope::Fills
+        if let Err(error) = self
+            .scheduler
+            .complete_bootstrap_scope(effect_id, ticket, scope)
         {
-            return self.fail(now_ms, PrivateFactsWorkerError::StaleEpoch);
+            if error == PrivateFactsScheduleError::Generation {
+                return self.fail(now_ms, PrivateFactsWorkerError::StaleEpoch);
+            }
+            return Err(error.into());
         }
         let ticket_is_current = {
             let session = self.lock_session()?;
             session
-                .validate_readback_ticket(ticket.generation, ticket.evidence_sequence)
+                .validate_readback_ticket(ticket.generation(), ticket.evidence_sequence())
                 .is_ok()
         };
         if !ticket_is_current {
             return self.fail(now_ms, PrivateFactsWorkerError::StaleEpoch);
         }
-        self.bootstrap_scope = scope.next().ok_or(PrivateFactsWorkerError::Effect)?;
         Ok(())
     }
 
@@ -971,17 +739,10 @@ impl BinancePrivateFactsWorker {
         bootstrap: PrivateFactsBootstrap,
         now_ms: u64,
     ) -> Result<PrivateFactsCommitReport, PrivateFactsWorkerError> {
-        let pending = self.take_pending(effect_id, |kind| {
-            matches!(kind, PendingEffectKind::Bootstrap { .. })
-        })?;
-        let PendingEffectKind::Bootstrap { ticket, scope } = pending.kind else {
-            return Err(PrivateFactsWorkerError::Effect);
+        let ticket = match self.scheduler.complete_bootstrap(effect_id) {
+            Ok(ticket) => ticket,
+            Err(_) => return self.fail(now_ms, PrivateFactsWorkerError::Effect),
         };
-        if scope != PrivateBootstrapScope::Fills
-            || self.bootstrap_scope != PrivateBootstrapScope::Fills
-        {
-            return self.fail(now_ms, PrivateFactsWorkerError::Effect);
-        }
         if let Err(error) = self.validate_bootstrap(ticket, &bootstrap) {
             return self.fail(now_ms, error);
         }
@@ -1007,17 +768,11 @@ impl BinancePrivateFactsWorker {
         };
         match self.commit_bootstrap(ticket, bootstrap) {
             Ok(report) => {
-                self.state = PrivateFactsWorkerState::Ready;
-                self.next_keepalive_at_ms = now_ms.saturating_add(KEEPALIVE_MS);
                 let authority_interval = self
                     .projection_authority
                     .as_ref()
                     .map(|authority| (authority.custody_max_stale_ms / 2).max(1));
-                self.next_refresh_at_ms = authority_interval
-                    .into_iter()
-                    .chain(self.periodic_readback_interval_ms)
-                    .min()
-                    .map(|interval| now_ms.saturating_add(interval));
+                self.scheduler.mark_ready(now_ms, authority_interval);
                 let evidence_sequence = self.lock_session()?.journal().last_sequence();
                 let mut projection = projection;
                 projection.root_cause_fact_id = format!(
@@ -1027,8 +782,6 @@ impl BinancePrivateFactsWorker {
                 self.ready_projection = Some(projection);
                 self.ready_snapshot = Some(snapshot);
                 self.ready_authority_projection = authority_projection;
-                self.periodic_readback_in_progress = false;
-                self.stream_readback_due_at_ms = None;
                 Ok(report)
             }
             Err(error) => self.fail(now_ms, error),
@@ -1043,13 +796,13 @@ impl BinancePrivateFactsWorker {
         self.validate_bootstrap(ticket, &bootstrap)?;
         let session = Arc::clone(&self.session);
         let mut session = session.lock().map_err(|_| PrivateFactsWorkerError::Lock)?;
-        if session.generation() != ticket.generation
+        if session.generation() != ticket.generation()
             || session.state() != PrivateSessionState::NeedsReadback
-            || session.journal().last_sequence() != ticket.evidence_sequence
+            || session.journal().last_sequence() != ticket.evidence_sequence()
         {
             return Err(PrivateFactsWorkerError::StaleEpoch);
         }
-        let guard = session.begin_readback_confirmation(ticket.generation)?;
+        let guard = session.begin_readback_confirmation(ticket.generation())?;
         let fills = self.fill_recovery.accept_batch(
             &mut self.facts,
             &self.fill_cursor,
@@ -1059,21 +812,21 @@ impl BinancePrivateFactsWorker {
                 symbol: &self.config.symbol,
                 readback: bootstrap.fills,
                 received_at_ms: bootstrap.target_through_ms,
-                native_epoch: ticket.generation,
-                hub_bootstrap_generation: ticket.generation,
+                native_epoch: ticket.generation(),
+                hub_bootstrap_generation: ticket.generation(),
             },
         )?;
         if !self
             .fill_recovery
             .epoch_gate()
-            .allows_ready(ticket.generation)
+            .allows_ready(ticket.generation())
         {
             return Err(PrivateFactsWorkerError::StaleEpoch);
         }
         let account = self.fill_recovery.accept_account_readback(
             &mut self.facts,
             ReadbackBatch {
-                generation: ticket.generation,
+                generation: ticket.generation(),
                 received_at_ms: bootstrap.target_through_ms,
                 balances: &bootstrap.account.balances,
                 positions: &bootstrap.account.positions,
@@ -1090,7 +843,7 @@ impl BinancePrivateFactsWorker {
         ticket: PrivateReadbackTicket,
         bootstrap: &PrivateFactsBootstrap,
     ) -> Result<(), PrivateFactsWorkerError> {
-        if bootstrap.generation != ticket.generation
+        if bootstrap.generation != ticket.generation()
             || bootstrap.target_through_ms == 0
             || bootstrap.fills.cursor.observed_through_ms < bootstrap.target_through_ms
             || !bootstrap.account.capabilities.can_trade
@@ -1153,50 +906,19 @@ impl BinancePrivateFactsWorker {
                 _ => return Err(PrivateFactsWorkerError::State),
             }
         }
-        self.state = PrivateFactsWorkerState::NeedsBootstrap;
-        self.bootstrap_scope = PrivateBootstrapScope::Account;
+        self.scheduler.begin_periodic_readback()?;
         self.ready_projection = None;
         self.ready_snapshot = None;
         self.ready_authority_projection = None;
-        self.next_refresh_at_ms = None;
-        self.periodic_readback_in_progress = true;
-        self.stream_readback_due_at_ms = None;
         Ok(())
     }
 
-    fn begin_stream_readback(&mut self) {
-        self.state = PrivateFactsWorkerState::NeedsBootstrap;
-        self.bootstrap_scope = PrivateBootstrapScope::Account;
+    fn begin_stream_readback(&mut self) -> Result<(), PrivateFactsWorkerError> {
+        self.scheduler.begin_stream_readback()?;
         self.ready_projection = None;
         self.ready_snapshot = None;
         self.ready_authority_projection = None;
-        self.next_refresh_at_ms = None;
-        self.periodic_readback_in_progress = false;
-        self.stream_readback_due_at_ms = None;
-    }
-
-    fn readback_ticket(&self) -> Result<PrivateReadbackTicket, PrivateFactsWorkerError> {
-        let session = self.lock_session()?;
-        if session.state() != PrivateSessionState::NeedsReadback {
-            return Err(PrivateFactsWorkerError::State);
-        }
-        Ok(PrivateReadbackTicket {
-            generation: session.generation(),
-            evidence_sequence: session.journal().last_sequence(),
-        })
-    }
-
-    fn take_pending(
-        &mut self,
-        effect_id: u64,
-        accepts: impl FnOnce(PendingEffectKind) -> bool,
-    ) -> Result<PendingEffect, PrivateFactsWorkerError> {
-        let pending = self.pending.take().ok_or(PrivateFactsWorkerError::Effect)?;
-        if pending.effect_id != effect_id || !accepts(pending.kind) {
-            self.pending = Some(pending);
-            return Err(PrivateFactsWorkerError::Effect);
-        }
-        Ok(pending)
+        Ok(())
     }
 
     fn fail<T>(
@@ -1214,39 +936,17 @@ impl BinancePrivateFactsWorker {
                 session.fail_closed_in_memory();
             }
             self.fill_recovery.fence_epoch();
-            self.state = PrivateFactsWorkerState::Backoff;
-            self.pending = None;
-            self.last_frame_sequence = 0;
-            self.last_frame_poll_at_ms = 0;
-            self.stream_readback_due_at_ms = None;
             self.ready_projection = None;
             self.ready_snapshot = None;
             self.ready_authority_projection = None;
-            self.periodic_readback_in_progress = false;
         }
     }
 
     fn fence(&mut self, now_ms: u64) -> Result<(), PrivateFactsWorkerError> {
         self.fill_recovery.fence_epoch();
-        self.state = PrivateFactsWorkerState::Backoff;
-        self.bootstrap_scope = PrivateBootstrapScope::Account;
-        self.pending = None;
-        self.last_frame_sequence = 0;
-        self.last_frame_poll_at_ms = 0;
-        self.stream_readback_due_at_ms = None;
+        self.scheduler.enter_backoff(now_ms);
         self.ready_projection = None;
         self.ready_authority_projection = None;
-        self.periodic_readback_in_progress = false;
-        self.next_refresh_at_ms = None;
-        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        let delay = jittered_exponential_delay_ms(
-            BASE_BACKOFF_MS,
-            MAX_BACKOFF_MS,
-            self.consecutive_failures,
-            &self.config.account,
-            now_ms,
-        );
-        self.next_retry_at_ms = now_ms.saturating_add(delay);
         let disconnect = self.lock_session()?.on_disconnect();
         if disconnect.is_err()
             && let Ok(mut session) = self.session.lock()
@@ -1269,14 +969,7 @@ impl BinancePrivateFactsWorker {
     }
 
     fn idle_wait(&self, now_ms: u64) -> Duration {
-        let millis = match self.state {
-            PrivateFactsWorkerState::Backoff => self
-                .next_retry_at_ms
-                .saturating_sub(now_ms)
-                .clamp(1, FRAME_POLL_MS),
-            PrivateFactsWorkerState::NeedsBootstrap | PrivateFactsWorkerState::Ready => 1,
-        };
-        Duration::from_millis(millis)
+        self.scheduler.idle_wait(now_ms)
     }
 }
 
@@ -1420,7 +1113,7 @@ impl BinancePrivateFactsTransport {
                     !one_way_position,
                 );
                 Ok(Some(PrivateFactsBootstrap {
-                    generation: ticket.generation,
+                    generation: ticket.generation(),
                     target_through_ms,
                     account: PrivateReadback {
                         capabilities: binance_private::PrivateAccountCapabilities {
@@ -1758,6 +1451,23 @@ pub enum PrivateFactsWorkerError {
     Readback(#[from] PrivateReadbackError),
     #[error("Binance private payload failed: {0}")]
     Parse(#[from] PrivateParseError),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PrivateFactsCommitReport {
+    pub fills: FillRecoveryReport,
+    pub account: ReconciliationReport,
+}
+
+impl From<PrivateFactsScheduleError> for PrivateFactsWorkerError {
+    fn from(error: PrivateFactsScheduleError) -> Self {
+        match error {
+            PrivateFactsScheduleError::Policy => Self::Config,
+            PrivateFactsScheduleError::Effect => Self::Effect,
+            PrivateFactsScheduleError::State => Self::State,
+            PrivateFactsScheduleError::Generation => Self::StaleEpoch,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -121,7 +121,7 @@ fn bootstrap(
     target: u64,
 ) -> Result<PrivateFactsBootstrap, PrivateFactsWorkerError> {
     Ok(PrivateFactsBootstrap {
-        generation: ticket.generation,
+        generation: ticket.generation(),
         target_through_ms: target,
         account: complete_account(&worker.config.symbol)?,
         fills: RecentFillsReadback {
@@ -488,8 +488,11 @@ fn durable_full_fill_fast_path_defers_routine_readback() -> Result<(), PrivateFa
         worker.next_effect(302)?,
         Some(PrivateFactsEffect::ReceiveFrame { .. })
     ));
-    let pending = worker.pending.ok_or(PrivateFactsWorkerError::Effect)?;
-    worker.complete_no_frame(pending.effect_id)?;
+    let pending_effect_id = worker
+        .scheduler
+        .pending_effect_id()
+        .ok_or(PrivateFactsWorkerError::Effect)?;
+    worker.complete_no_frame(pending_effect_id)?;
     let Some(PrivateFactsEffect::ReceiveFrame { effect_id, .. }) = worker.next_effect(600_200)?
     else {
         return Err(PrivateFactsWorkerError::Effect);
@@ -674,13 +677,13 @@ fn backoff_is_jittered_exponential_and_explicitly_capped() -> Result<(), Private
             return Err(PrivateFactsWorkerError::Effect);
         };
         worker.complete_transport_failure(effect_id, now)?;
-        let delay = worker.next_retry_at_ms.saturating_sub(now);
+        let delay = worker.scheduler.next_retry_at_ms().saturating_sub(now);
         let upper = BASE_BACKOFF_MS
             .saturating_mul(1_u64 << u32::from((failure - 1).min(15)))
             .min(MAX_BACKOFF_MS);
         assert!(delay >= (upper / 2).max(1));
         assert!(delay <= upper);
-        now = worker.next_retry_at_ms;
+        now = worker.scheduler.next_retry_at_ms();
     }
     assert_eq!(
         worker.idle_wait(now.saturating_sub(1)),
@@ -713,7 +716,7 @@ fn sequence_gap_fences_session_and_uses_bounded_exponential_backoff()
         Err(PrivateFactsWorkerError::SequenceGap)
     ));
     assert!(!worker.entry_ready());
-    let retry_at = worker.next_retry_at_ms;
+    let retry_at = worker.scheduler.next_retry_at_ms();
     assert!(retry_at > 201);
     assert_eq!(worker.next_effect(retry_at.saturating_sub(1))?, None);
     assert!(matches!(
