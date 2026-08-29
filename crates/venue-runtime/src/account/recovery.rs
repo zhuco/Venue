@@ -1,3 +1,9 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    reason = "recovery authority binds every journal and projection boundary explicitly"
+)]
+
 use std::collections::BTreeSet;
 
 use sha2::{Digest, Sha256};

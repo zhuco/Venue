@@ -38,6 +38,10 @@ fn empty_private_cursor() -> Result<RecoveredPrivateCursor, Box<dyn Error>> {
     Ok(RecoveredPrivateCursor::verified(0, 0, None)?)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test snapshots enumerate every recovered authority boundary"
+)]
 fn recovery_snapshot(
     account: AccountKey,
     journal_roots: RecoveryJournalRoots,

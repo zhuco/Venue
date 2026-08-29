@@ -305,6 +305,10 @@ pub struct DesiredOrder {
 impl DesiredOrder {
     /// Durable strategy-checkpoint recovery and applied-turn adapters are the only intended
     /// callers. Strategies cannot reduce desired state to a forgeable set of native IDs.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "desired authority must bind every canonical order semantic"
+    )]
     pub(crate) fn verified(
         family: NativeOrderFamily,
         client_order_id: impl Into<String>,

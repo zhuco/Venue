@@ -18,7 +18,6 @@ mod recovery_writer;
 mod scalping_entry_quote;
 mod writer_lease;
 
-pub(crate) use account_lane::AccountExecutionLane;
 pub use account_lane::{
     AccountDispatchDecision, AccountDispatchPermit, AccountExecutionIntent,
     AccountExecutionRequest, AccountLaneError, AccountLaneFollowUp, AccountLanePriority,

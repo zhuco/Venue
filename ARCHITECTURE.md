@@ -81,9 +81,10 @@ crates/
 │  └─ src/{hedged_grid,scalping}/
 ├─ venue-copy/
 ├─ venue-execution/
+│  └─ src/{journal.rs,writer_lease.rs,canonical_root.rs}
 ├─ venue-storage/
 ├─ venue-runtime/
-│  └─ src/{account,grid,scalping,copy,shared,legacy}/
+│  └─ src/{authority.rs,account_lane.rs,account,strategy,grid,scalping,copy,shared,legacy}/
 └─ venue-control-protocol/
 ```
 
@@ -102,8 +103,8 @@ venue-strategies -> venue-domain
 venue-copy -> venue-domain
 venue-storage -> venue-domain
 venue-control-protocol -> venue-domain + venue-gateway-api
-venue-execution -> venue-domain + venue-storage + venue-gateway-api
-venue-runtime -> venue-execution + venue-strategies + venue-copy
+venue-execution -> venue-domain + venue-gateway-api
+venue-runtime -> venue-domain + venue-execution + venue-storage + venue-gateway-api
 venue-node-<venue> -> venue-runtime + exactly one venue-gateway-*
 venue-control -> venue-control-protocol + sqlx
 venueflow / optional Agent -> venue-control-protocol
@@ -112,7 +113,7 @@ venueflow / optional Agent -> venue-control-protocol
 硬边界：
 
 - `venue-domain` 不依赖业务、数据库、网络、UI 或交易所；
-- crate 拆分期间，带 crate-private 构造器的 runtime turn/capability authority identity 暂留根 `domain` facade；不得为了物理迁移把其发行构造器公开，待 `venue-runtime` 提取时再整体移动；
+- runtime turn/capability authority identity 唯一实现位于 `venue-runtime`，发行构造器保持 crate-private；根 `domain` 只兼容重导出类型，不得为了物理迁移公开授权构造器；
 - adapter 不依赖 runtime、strategy、copy 或 UI；原生协议不得越过 adapter；
 - strategy 和 copy 不依赖具体交易所、凭证、native symbol 或物理客户端；
 - `venue-control-protocol` 只含版本化 DTO、错误码和序列化契约，不含 Axum handler、数据库、runtime 或 application service；
@@ -122,10 +123,13 @@ venueflow / optional Agent -> venue-control-protocol
 
 ## 6. Runtime 内部结构
 
-`venue-runtime` 按责任分组，禁止重新回到根目录平铺：
+`venue-runtime` 按责任分组，禁止重新回到根目录平铺；未实际迁入的依赖不得预装：
 
 ```text
-account/   身份、Registry、Market Hub、Private Router、Reconciler、Actor host
+authority.rs   账户/实例 identity、订单族 capability 与 opaque turn/applied authority
+account_lane.rs 账户公平调度、Unknown fence、WAL 前/后授权分态
+account/   Registry、Market Hub、Private Router、Reconciler、恢复与 Actor host
+strategy/  顺序邮箱与 Strategy turn
 grid/      三所现有 Stage 7 的共享网格运行时及以后验收通过的交易所组合；根 facade 保持既有 Stage 7 API
 scalping/  test、live、evidence、scheduling；迁移期间由根 runtime facade 保持既有模块名和公开 API
 copy/      follower Actor、目标应用、漂移修复、跟单回执
@@ -341,7 +345,7 @@ PostgreSQL 不得成为已发物理订单的第二权威 writer。Copy ledger �
 ## 14. 迁移顺序
 
 1. **工具链与结构基线**：全 workspace、CI、rustfmt 和 clippy 锁定 Rust 1.98.0；建立 workspace、依赖检查和现有 Binance/Gate/Bitget 固定节点 binary；只移动代码和改引用，不改变行为。
-2. **Runtime 收拢**：把现有 account/grid/scalping/shared/legacy 分目录，缩小根 facade；保持全部测试通过。
+2. **Execution/Runtime 收拢**：`venue-execution` 先承载不改格式的通用 command journal、writer lease 与账户 canonical-root fence；`venue-runtime` 先承载 authority、account lane、account kernel 与 Strategy Actor，再迁入 grid/scalping/shared/legacy；根 facade 保持既有 Stage 7 API 与全部行为测试。
 3. **Gateway API**：提取统一契约，先接回 Venue 的 Binance/Gate/Bitget；逐项导入 KOL fixture 做差异测试。
 4. **新增三所最小闭环**：Bybit、OKX、Hyperliquid 各自增加固定 binary 和显式 `TEST | LIVE` 配置；完成该所最小 LIVE 安全闭环后即可对单账户、单交易对小额调试，无需等待 Copy 或策略全量迁移；同一修改同步配置枚举、`AGENTS.md` 和 `CODEMAP.md`。
 5. **Copy TEST**：迁移 KOL 目标敞口、outbox/inbox、observer 和账本，使用离线 fixture 或网关 `TEST` 验证；不引入 Shadow 网关模式。
