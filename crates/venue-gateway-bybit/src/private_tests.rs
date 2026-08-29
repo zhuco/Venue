@@ -32,6 +32,17 @@ fn raw_page(
     cursor: Option<&str>,
     payload: &[u8],
 ) -> Result<BybitRawPrivatePayload, BybitError> {
+    raw_page_with_generation(binding, source, 7, page_index, cursor, payload)
+}
+
+fn raw_page_with_generation(
+    binding: &BybitGatewayBinding,
+    source: BybitPrivateSource,
+    generation: u64,
+    page_index: u32,
+    cursor: Option<&str>,
+    payload: &[u8],
+) -> Result<BybitRawPrivatePayload, BybitError> {
     let history_window = matches!(
         source,
         BybitPrivateSource::OrderHistory(_) | BybitPrivateSource::Executions
@@ -40,7 +51,7 @@ fn raw_page(
     .transpose()?;
     let request = prepare_private_request(
         binding,
-        7,
+        generation,
         11,
         page_index,
         source,
@@ -252,6 +263,101 @@ fn pagination_requires_the_exact_cursor_chain_and_unique_native_ids() -> Result<
 }
 
 #[test]
+fn windows_cursors_generations_symbols_accounts_and_hedge_legs_fail_closed() -> Result<(), TestError>
+{
+    let live = binding(GatewayMode::Live)?;
+    assert_eq!(
+        BybitHistoryWindow::new(1_000, 1_000),
+        Err(BybitError::Clock)
+    );
+    assert_eq!(
+        prepare_private_request(
+            &live,
+            7,
+            11,
+            1,
+            BybitPrivateSource::Positions,
+            Some("bad&cursor"),
+            None,
+            None,
+        ),
+        Err(BybitError::Pagination)
+    );
+
+    let first_payload = String::from_utf8(ORDERS.to_vec())?
+        .replace("\"nextPageCursor\": \"\"", "\"nextPageCursor\": \"next\"");
+    let first = parse_open_order_page(
+        &live,
+        &raw_page_with_generation(
+            &live,
+            BybitPrivateSource::OpenOrders(NativeOrderFamily::UmOrder),
+            7,
+            0,
+            None,
+            first_payload.as_bytes(),
+        )?,
+    )?;
+    let wrong_generation = parse_open_order_page(
+        &live,
+        &raw_page_with_generation(
+            &live,
+            BybitPrivateSource::OpenOrders(NativeOrderFamily::UmOrder),
+            8,
+            1,
+            Some("next"),
+            EMPTY_PAGE,
+        )?,
+    )?;
+    assert_eq!(
+        complete_open_order_pages(
+            &live,
+            NativeOrderFamily::UmOrder,
+            &[first, wrong_generation],
+        ),
+        Err(BybitError::Pagination)
+    );
+
+    let wrong_symbol = String::from_utf8(POSITIONS.to_vec())?.replace("BTCUSDT", "ETHUSDT");
+    let wrong_symbol = raw(
+        &live,
+        BybitPrivateSource::Positions,
+        wrong_symbol.as_bytes(),
+    )?;
+    assert_eq!(
+        parse_position_page(&live, &wrong_symbol),
+        Err(BybitError::Binding)
+    );
+
+    let other_account = BybitGatewayBinding::new(GatewayBinding::new(
+        VenueId::Bybit,
+        GatewayMode::Live,
+        "00000000-0000-4000-8000-000000000002",
+        "BTC/USDT".parse()?,
+    )?)?;
+    let positions = raw(&live, BybitPrivateSource::Positions, POSITIONS)?;
+    assert_eq!(
+        parse_position_page(&other_account, &positions),
+        Err(BybitError::Binding)
+    );
+
+    let mut incomplete: serde_json::Value = serde_json::from_slice(POSITIONS)?;
+    incomplete["result"]["list"]
+        .as_array_mut()
+        .ok_or("missing list")?
+        .truncate(1);
+    let incomplete = raw(
+        &live,
+        BybitPrivateSource::Positions,
+        &serde_json::to_vec(&incomplete)?,
+    )?;
+    assert_eq!(
+        parse_position_page(&live, &incomplete),
+        Err(BybitError::Payload)
+    );
+    Ok(())
+}
+
+#[test]
 fn all_family_and_capability_candidates_remain_non_authoritative() -> Result<(), TestError> {
     let binding = binding(GatewayMode::Live)?;
     let credentials = BybitCredentials::from_values("test", "secret")?;
@@ -270,6 +376,30 @@ fn all_family_and_capability_candidates_remain_non_authoritative() -> Result<(),
         &[parse_position_page(
             &binding,
             &raw(&binding, BybitPrivateSource::Positions, POSITIONS)?,
+        )?],
+    )?;
+    let regular_history = complete_order_history_pages(
+        &binding,
+        NativeOrderFamily::UmOrder,
+        &[parse_order_history_page(
+            &binding,
+            &raw(
+                &binding,
+                BybitPrivateSource::OrderHistory(NativeOrderFamily::UmOrder),
+                HISTORY,
+            )?,
+        )?],
+    )?;
+    let conditional_history = complete_order_history_pages(
+        &binding,
+        NativeOrderFamily::UmConditional,
+        &[parse_order_history_page(
+            &binding,
+            &raw(
+                &binding,
+                BybitPrivateSource::OrderHistory(NativeOrderFamily::UmConditional),
+                EMPTY_PAGE,
+            )?,
         )?],
     )?;
     let regular = complete_open_order_pages(
@@ -308,34 +438,50 @@ fn all_family_and_capability_candidates_remain_non_authoritative() -> Result<(),
         scope.clone(),
         2_500,
         [
-            BybitOrderFamilyEvidence::Complete(regular),
-            BybitOrderFamilyEvidence::Complete(conditional),
+            BybitOrderFamilyEvidence::Complete(Box::new(BybitCompleteOrderFamilyEvidence {
+                open_orders: regular,
+                order_history: regular_history.clone(),
+            })),
+            BybitOrderFamilyEvidence::Complete(Box::new(BybitCompleteOrderFamilyEvidence {
+                open_orders: conditional,
+                order_history: conditional_history,
+            })),
             BybitOrderFamilyEvidence::Unsupported(BybitUnsupportedOrderFamilyEvidence::algo(
+                scope.binding.clone(),
                 BYBIT_LINEAR_ORDER_PROFILE_VERSION,
             )),
         ],
-    )?;
-    let history = complete_order_history_pages(
-        &binding,
-        NativeOrderFamily::UmOrder,
-        &[parse_order_history_page(
-            &binding,
-            &raw(
-                &binding,
-                BybitPrivateSource::OrderHistory(NativeOrderFamily::UmOrder),
-                HISTORY,
-            )?,
-        )?],
     )?;
     let fills = complete_execution_pages(
         &binding,
         &[parse_execution_page(
             &binding,
             &raw(&binding, BybitPrivateSource::Executions, EXECUTIONS)?,
-            &history.orders,
+            &regular_history.orders,
         )?],
-        &history.orders,
+        &regular_history.orders,
     )?;
+    assert_eq!(
+        families.algo(),
+        &BybitUnsupportedOrderFamilyEvidence::algo(
+            scope.binding.clone(),
+            BYBIT_LINEAR_ORDER_PROFILE_VERSION,
+        )
+    );
+    let mut tampered_fills = fills.clone();
+    tampered_fills.fills[0].fill.order_id = "unbound-order".to_owned();
+    assert_eq!(
+        validate_capability_candidate(
+            scope.clone(),
+            2_500,
+            api_key.clone(),
+            account.clone(),
+            positions.clone(),
+            families.clone(),
+            tampered_fills,
+        ),
+        Err(BybitError::Projection)
+    );
     let candidate =
         validate_capability_candidate(scope, 2_500, api_key, account, positions, families, fills)?;
     assert!(candidate.candidate_flags.contains(CapabilityFlags::TRADE));

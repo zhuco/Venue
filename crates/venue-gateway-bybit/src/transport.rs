@@ -35,6 +35,7 @@ const PRIVATE_TOPICS: [&str; 4] = [
 ];
 const MAX_PRE_LIVE_FRAMES: usize = 256;
 const MAX_PRE_LIVE_BYTES: usize = 1_048_576;
+const MAX_TRANSPORT_BODY_BYTES: usize = 2 * 1_024 * 1_024;
 const PRIVATE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,7 +52,7 @@ impl BybitTransportLimits {
         if operation_timeout.is_zero()
             || operation_timeout > Duration::from_secs(60)
             || maximum_body_bytes == 0
-            || maximum_body_bytes > 1_048_576
+            || maximum_body_bytes > MAX_TRANSPORT_BODY_BYTES
         {
             return Err(BybitTransportError::Limits);
         }
@@ -1066,6 +1067,43 @@ mod tests {
         .into_bytes()
     }
 
+    #[test]
+    fn transport_body_limit_accepts_exactly_two_mib_and_rejects_the_next_byte()
+    -> Result<(), TestError> {
+        let limits = BybitTransportLimits::new(Duration::from_secs(2), MAX_TRANSPORT_BODY_BYTES)?;
+        assert_eq!(limits.maximum_body_bytes(), MAX_TRANSPORT_BODY_BYTES);
+        assert_eq!(
+            BybitTransportLimits::new(Duration::from_secs(2), MAX_TRANSPORT_BODY_BYTES + 1,),
+            Err(BybitTransportError::Limits)
+        );
+
+        let facts = facts(GatewayMode::Test)?;
+        let mut exact = br#"{"topic":"order.linear","data":[]}"#.to_vec();
+        exact.resize(MAX_TRANSPORT_BODY_BYTES, b' ');
+        assert!(
+            make_raw_frame(
+                facts.binding.gateway_binding(),
+                7,
+                Bytes::from(exact.clone()),
+                MAX_TRANSPORT_BODY_BYTES,
+                1,
+            )
+            .is_ok()
+        );
+        exact.push(b' ');
+        assert_eq!(
+            make_raw_frame(
+                facts.binding.gateway_binding(),
+                7,
+                Bytes::from(exact),
+                MAX_TRANSPORT_BODY_BYTES,
+                1,
+            ),
+            Err(BybitTransportError::BodyTooLarge)
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn http_sends_only_bound_prepared_request_and_parses_ack() -> Result<(), TestError> {
         let facts = facts(GatewayMode::Test)?;
@@ -1195,6 +1233,54 @@ mod tests {
             Err(BybitTransportError::Disconnected)
         );
         let _ = disconnected.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disconnected_mutation_is_not_automatically_replayed() -> Result<(), TestError> {
+        let facts = facts(GatewayMode::Test)?;
+        let request = request(&facts)?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4_096];
+            loop {
+                stream.readable().await?;
+                match stream.try_read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        request.extend_from_slice(&buffer[..read]);
+                        if complete_http_request(&request) {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            drop(stream);
+            Ok::<bool, io::Error>(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_ok(),
+            )
+        });
+        let limits = BybitTransportLimits::new(Duration::from_secs(1), 16 * 1_024)?;
+        let transport = BybitHttpTransport::with_endpoint(&facts.binding, 7, endpoint, limits)?;
+        assert_eq!(
+            transport
+                .execute_order(
+                    &facts.binding,
+                    &facts.credentials,
+                    &request,
+                    1_670_000_000_000,
+                )
+                .await,
+            Err(BybitTransportError::Disconnected)
+        );
+        assert!(!server.await??);
         Ok(())
     }
 

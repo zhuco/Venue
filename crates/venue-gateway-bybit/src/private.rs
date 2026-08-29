@@ -12,7 +12,7 @@ use venue_domain::domain::{
     Amount, Asset, FieldState, Fill, NativeOrderFamily, Order, OrderPurpose, OrderSide, OrderState,
     Position, PositionSide, Price,
 };
-use venue_gateway_api::{CapabilityFlags, GatewayBinding};
+use venue_gateway_api::GatewayBinding;
 
 use crate::{
     BybitCredentials, BybitError, BybitGatewayBinding, SignedHeaders, endpoints,
@@ -49,7 +49,7 @@ pub struct BybitHistoryWindow {
 impl BybitHistoryWindow {
     pub fn new(start_ms: u64, end_ms: u64) -> Result<Self, BybitError> {
         if start_ms == 0
-            || end_ms < start_ms
+            || end_ms <= start_ms
             || end_ms.saturating_sub(start_ms) > BYBIT_HISTORY_WINDOW_MAX_MS
         {
             return Err(BybitError::Clock);
@@ -715,9 +715,7 @@ pub fn parse_position_page(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let has_net = sides.contains(&PositionSide::Net);
-    let has_hedge = sides.contains(&PositionSide::Long) || sides.contains(&PositionSide::Short);
-    if has_net && has_hedge {
+    if sides != BTreeSet::from([PositionSide::Long, PositionSide::Short]) {
         return Err(BybitError::Payload);
     }
     Ok(BybitPositionPage {
@@ -797,6 +795,8 @@ pub fn parse_api_key_evidence(
 pub struct BybitOpenOrder {
     pub order: Order,
     pub family: NativeOrderFamily,
+    pub native_order_type: String,
+    pub native_time_in_force: String,
     pub position_idx: u8,
     pub stop_order_type: Option<String>,
     pub trigger_price: Option<Price>,
@@ -857,17 +857,15 @@ pub fn parse_open_order_page(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BybitOrderEvidence {
-    pub order_id: String,
-    pub client_order_id: FieldState<String>,
+    pub order: Order,
     pub family: NativeOrderFamily,
-    pub side: OrderSide,
-    pub position_side: PositionSide,
+    pub native_order_type: String,
+    pub native_time_in_force: String,
     pub position_idx: u8,
-    pub reduce_only: bool,
     pub stop_order_type: Option<String>,
     pub trigger_price: Option<Price>,
     pub close_on_trigger: bool,
-    pub state: OrderState,
+    pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
 
@@ -904,21 +902,18 @@ pub fn parse_order_history_page(
             if row.order_id.is_empty() || !ids.insert(row.order_id.clone()) {
                 return Err(BybitError::Payload);
             }
-            let side = order_side(&row.side)?;
-            let family_fields = validate_order_family(&row, family)?;
+            let normalized = normalize_order(raw, row, family, false)?;
             Ok(BybitOrderEvidence {
-                order_id: row.order_id,
-                client_order_id: field_text(row.order_link_id),
+                order: normalized.order,
                 family,
-                side,
-                position_side: position_side(row.position_idx)?,
-                position_idx: row.position_idx,
-                reduce_only: row.reduce_only,
-                stop_order_type: family_fields.stop_order_type,
-                trigger_price: family_fields.trigger_price,
-                close_on_trigger: row.close_on_trigger,
-                state: order_state(&row.order_status)?,
-                updated_at_ms: positive_u64(&row.updated_time)?,
+                native_order_type: normalized.native_order_type,
+                native_time_in_force: normalized.native_time_in_force,
+                position_idx: normalized.position_idx,
+                stop_order_type: normalized.stop_order_type,
+                trigger_price: normalized.trigger_price,
+                close_on_trigger: normalized.close_on_trigger,
+                created_at_ms: normalized.created_at_ms,
+                updated_at_ms: normalized.updated_at_ms,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -966,7 +961,7 @@ pub fn parse_execution_page(
     envelope.result.validate_symbols(&raw.native_symbol)?;
     let evidence = order_evidence
         .iter()
-        .map(|item| (item.order_id.as_str(), item))
+        .map(|item| (item.order.order_id.as_str(), item))
         .collect::<BTreeMap<_, _>>();
     if evidence.len() != order_evidence.len() {
         return Err(BybitError::Payload);
@@ -988,7 +983,9 @@ pub fn parse_execution_page(
                 .get(row.order_id.as_str())
                 .ok_or(BybitError::Payload)?;
             let side = order_side(&row.side)?;
-            if side != item.side || field_text(row.order_link_id.clone()) != item.client_order_id {
+            if side != item.order.side
+                || field_text(row.order_link_id.clone()) != item.order.client_order_id
+            {
                 return Err(BybitError::Binding);
             }
             let time = positive_u64(&row.exec_time)?;
@@ -1024,7 +1021,7 @@ pub fn parse_execution_page(
                 order_id: row.order_id,
                 symbol: raw.binding.symbol.clone(),
                 side,
-                position_side: FieldState::Known(item.position_side),
+                position_side: item.order.position_side.clone(),
                 quantity,
                 price: Price::new(decimal(&row.exec_price)?).map_err(|_| BybitError::Payload)?,
                 fee,
@@ -1035,7 +1032,7 @@ pub fn parse_execution_page(
             fill.validate().map_err(|_| BybitError::Payload)?;
             Ok(BybitFill {
                 fill,
-                client_order_id: item.client_order_id.clone(),
+                client_order_id: item.order.client_order_id.clone(),
                 closed_size,
                 native_order_sequence: seq,
             })
@@ -1117,9 +1114,7 @@ pub fn complete_position_pages(
         }
     }
     let first = pages.first().ok_or(BybitError::Pagination)?;
-    let has_net = sides.contains(&PositionSide::Net);
-    let has_hedge = sides.contains(&PositionSide::Long) || sides.contains(&PositionSide::Short);
-    if has_net && has_hedge {
+    if sides != BTreeSet::from([PositionSide::Long, PositionSide::Short]) {
         return Err(BybitError::Payload);
     }
     Ok(BybitPositionReadback {
@@ -1132,7 +1127,7 @@ pub fn complete_position_pages(
             .map(|page| page.raw.received_at_ms)
             .max()
             .ok_or(BybitError::Pagination)?,
-        hedge_mode: has_hedge,
+        hedge_mode: true,
         positions,
     })
 }
@@ -1229,7 +1224,7 @@ pub fn complete_order_history_pages(
             return Err(BybitError::Projection);
         }
         for order in &page.orders {
-            if !ids.insert(order.order_id.clone()) {
+            if !ids.insert(order.order.order_id.clone()) {
                 return Err(BybitError::Pagination);
             }
             orders.push(order.clone());
@@ -1306,238 +1301,6 @@ pub fn complete_execution_pages(
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BybitOrderFamilyScope {
-    pub binding: GatewayBinding,
-    pub profile_version: u64,
-    pub attempt_id: u64,
-    pub generation: u64,
-    pub observed_at_ms: u64,
-    pub expires_at_ms: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BybitUnsupportedOrderFamilyEvidence {
-    pub family: NativeOrderFamily,
-    pub profile_version: u64,
-}
-
-impl BybitUnsupportedOrderFamilyEvidence {
-    #[must_use]
-    pub const fn algo(profile_version: u64) -> Self {
-        Self {
-            family: NativeOrderFamily::UmAlgo,
-            profile_version,
-        }
-    }
-
-    #[must_use]
-    pub const fn reason(self) -> &'static str {
-        "Bybit linear exposes regular Order and conditional StopOrder namespaces, but no distinct algo namespace or admitted algo mutation surface"
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum BybitOrderFamilyEvidence {
-    Complete(BybitOpenOrdersReadback),
-    Unsupported(BybitUnsupportedOrderFamilyEvidence),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BybitOrderFamilyCandidate {
-    scope: BybitOrderFamilyScope,
-    regular: BybitOpenOrdersReadback,
-    conditional: BybitOpenOrdersReadback,
-    algo: BybitUnsupportedOrderFamilyEvidence,
-    raw_payload_digest: [u8; 32],
-}
-
-impl BybitOrderFamilyCandidate {
-    #[must_use]
-    pub const fn scope(&self) -> &BybitOrderFamilyScope {
-        &self.scope
-    }
-
-    #[must_use]
-    pub const fn regular(&self) -> &BybitOpenOrdersReadback {
-        &self.regular
-    }
-
-    #[must_use]
-    pub const fn conditional(&self) -> &BybitOpenOrdersReadback {
-        &self.conditional
-    }
-
-    #[must_use]
-    pub const fn algo(&self) -> BybitUnsupportedOrderFamilyEvidence {
-        self.algo
-    }
-
-    #[must_use]
-    pub const fn raw_payload_digest(&self) -> [u8; 32] {
-        self.raw_payload_digest
-    }
-}
-
-pub fn validate_order_family_candidate<I>(
-    scope: BybitOrderFamilyScope,
-    validated_at_ms: u64,
-    evidence: I,
-) -> Result<BybitOrderFamilyCandidate, BybitError>
-where
-    I: IntoIterator<Item = BybitOrderFamilyEvidence>,
-{
-    let binding = BybitGatewayBinding::new(scope.binding.clone())?;
-    if scope.profile_version != BYBIT_LINEAR_ORDER_PROFILE_VERSION
-        || scope.attempt_id == 0
-        || scope.generation == 0
-        || scope.observed_at_ms == 0
-        || scope.expires_at_ms <= scope.observed_at_ms
-        || validated_at_ms < scope.observed_at_ms
-        || validated_at_ms >= scope.expires_at_ms
-    {
-        return Err(BybitError::Capability);
-    }
-    let mut regular = None;
-    let mut conditional = None;
-    let mut algo = None;
-    for item in evidence {
-        match item {
-            BybitOrderFamilyEvidence::Complete(value) => {
-                let slot = match value.family {
-                    NativeOrderFamily::UmOrder => &mut regular,
-                    NativeOrderFamily::UmConditional => &mut conditional,
-                    NativeOrderFamily::UmAlgo => return Err(BybitError::OrderFamily),
-                };
-                if slot.replace(value).is_some() {
-                    return Err(BybitError::OrderFamily);
-                }
-            }
-            BybitOrderFamilyEvidence::Unsupported(value) => {
-                if value.family != NativeOrderFamily::UmAlgo
-                    || value.profile_version != scope.profile_version
-                    || algo.replace(value).is_some()
-                {
-                    return Err(BybitError::OrderFamily);
-                }
-            }
-        }
-    }
-    let regular = regular.ok_or(BybitError::OrderFamily)?;
-    let conditional = conditional.ok_or(BybitError::OrderFamily)?;
-    let algo = algo.ok_or(BybitError::OrderFamily)?;
-    for readback in [&regular, &conditional] {
-        if readback.binding != scope.binding
-            || readback.generation != scope.generation
-            || readback.attempt_id != scope.attempt_id
-            || readback.observed_at_ms > scope.observed_at_ms
-        {
-            return Err(BybitError::Binding);
-        }
-        let replayed =
-            complete_open_order_pages(&binding, readback.family, &readback_pages(readback)?)?;
-        if &replayed != readback {
-            return Err(BybitError::Projection);
-        }
-    }
-    let raw_payload_digest =
-        digest_raw_pages(regular.raw_pages.iter().chain(conditional.raw_pages.iter()));
-    Ok(BybitOrderFamilyCandidate {
-        scope,
-        regular,
-        conditional,
-        algo,
-        raw_payload_digest,
-    })
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BybitCapabilityCandidate {
-    pub scope: BybitOrderFamilyScope,
-    pub api_key: BybitApiKeyEvidence,
-    pub account: BybitAccountReadback,
-    pub positions: BybitPositionReadback,
-    pub order_families: BybitOrderFamilyCandidate,
-    pub fills: BybitFillReadback,
-    pub candidate_flags: CapabilityFlags,
-}
-
-pub fn validate_capability_candidate(
-    scope: BybitOrderFamilyScope,
-    validated_at_ms: u64,
-    api_key: BybitApiKeyEvidence,
-    account: BybitAccountReadback,
-    positions: BybitPositionReadback,
-    order_families: BybitOrderFamilyCandidate,
-    fills: BybitFillReadback,
-) -> Result<BybitCapabilityCandidate, BybitError> {
-    let _ = BybitGatewayBinding::new(scope.binding.clone())?;
-    let observed_at_ms = [
-        api_key.observed_at_ms,
-        account.observed_at_ms,
-        positions.observed_at_ms,
-        order_families.scope.observed_at_ms,
-        fills.observed_at_ms,
-    ]
-    .into_iter()
-    .max()
-    .ok_or(BybitError::Capability)?;
-    if order_families.scope != scope
-        || api_key.binding != scope.binding
-        || account.identity.binding != scope.binding
-        || positions.binding != scope.binding
-        || fills.binding != scope.binding
-        || api_key.attempt_id != scope.attempt_id
-        || account.attempt_id != scope.attempt_id
-        || positions.attempt_id != scope.attempt_id
-        || fills.attempt_id != scope.attempt_id
-        || api_key.generation != scope.generation
-        || account.identity.generation != scope.generation
-        || positions.generation != scope.generation
-        || fills.generation != scope.generation
-        || observed_at_ms != scope.observed_at_ms
-        || validated_at_ms < scope.observed_at_ms
-        || validated_at_ms >= scope.expires_at_ms
-        || api_key.withdraw
-        || !api_key.contract_order
-        || !api_key.contract_position
-    {
-        return Err(BybitError::Capability);
-    }
-    let mut candidate_flags =
-        CapabilityFlags::READ_ACCOUNT | CapabilityFlags::READ_ORDERS | CapabilityFlags::READ_FILLS;
-    if !api_key.read_only && api_key.derivatives_trade {
-        candidate_flags |= CapabilityFlags::TRADE
-            | CapabilityFlags::PLACE_LIMIT
-            | CapabilityFlags::PLACE_MARKET
-            | CapabilityFlags::CANCEL
-            | CapabilityFlags::AMEND;
-    }
-    if positions.hedge_mode {
-        candidate_flags |= CapabilityFlags::HEDGE_POSITION;
-    }
-    Ok(BybitCapabilityCandidate {
-        scope,
-        api_key,
-        account,
-        positions,
-        order_families,
-        fills,
-        candidate_flags,
-    })
-}
-
-fn readback_pages(
-    readback: &BybitOpenOrdersReadback,
-) -> Result<Vec<BybitOpenOrderPage>, BybitError> {
-    let binding = BybitGatewayBinding::new(readback.binding.clone())?;
-    readback
-        .raw_pages
-        .iter()
-        .map(|raw| parse_open_order_page(&binding, raw))
-        .collect()
-}
-
 fn validate_page_chain<'a>(
     binding: &BybitGatewayBinding,
     pages: impl Iterator<Item = (&'a BybitRawPrivatePayload, &'a BybitPageMeta)>,
@@ -1589,19 +1352,6 @@ fn validate_same_attempt(
     } else {
         Err(BybitError::Binding)
     }
-}
-
-fn digest_raw_pages<'a>(pages: impl Iterator<Item = &'a BybitRawPrivatePayload>) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    for page in pages {
-        digest.update(
-            u64::try_from(page.payload.len())
-                .unwrap_or(u64::MAX)
-                .to_be_bytes(),
-        );
-        digest.update(&page.payload);
-    }
-    digest.finalize().into()
 }
 
 struct OrderFamilyFields {
@@ -1660,6 +1410,8 @@ fn normalize_order(
         return Err(BybitError::Payload);
     }
     let family_fields = validate_order_family(&row, family)?;
+    let native_order_type = validate_native_order_type(&row.order_type)?.to_owned();
+    let native_time_in_force = validate_native_time_in_force(&row.time_in_force)?.to_owned();
     let reduce_only = row.reduce_only;
     let order = Order {
         order_id: row.order_id,
@@ -1683,6 +1435,8 @@ fn normalize_order(
     Ok(BybitOpenOrder {
         order,
         family,
+        native_order_type,
+        native_time_in_force,
         position_idx: row.position_idx,
         stop_order_type: family_fields.stop_order_type,
         trigger_price: family_fields.trigger_price,
@@ -1690,6 +1444,20 @@ fn normalize_order(
         created_at_ms: positive_u64(&row.created_time)?,
         updated_at_ms: positive_u64(&row.updated_time)?,
     })
+}
+
+fn validate_native_order_type(value: &str) -> Result<&str, BybitError> {
+    match value {
+        "Limit" | "Market" => Ok(value),
+        _ => Err(BybitError::Payload),
+    }
+}
+
+fn validate_native_time_in_force(value: &str) -> Result<&str, BybitError> {
+    match value {
+        "GTC" | "IOC" | "FOK" | "PostOnly" | "RPI" => Ok(value),
+        _ => Err(BybitError::Payload),
+    }
 }
 
 fn validate_page<T>(page: &Page<T>, native_symbol: &str, limit: usize) -> Result<(), BybitError> {
@@ -1726,12 +1494,14 @@ fn order_side(value: &str) -> Result<OrderSide, BybitError> {
 
 fn order_state(value: &str) -> Result<OrderState, BybitError> {
     match value {
-        "New" | "Untriggered" => Ok(OrderState::New),
+        "Created" | "New" | "Untriggered" | "Active" => Ok(OrderState::New),
         "PartiallyFilled" => Ok(OrderState::PartiallyFilled),
         "Filled" => Ok(OrderState::Filled),
-        "Cancelled" | "Deactivated" => Ok(OrderState::Cancelled),
+        "Cancelled" | "Deactivated" | "PartiallyFilledCanceled" | "PartiallyFilledCancelled" => {
+            Ok(OrderState::Cancelled)
+        }
         "Rejected" => Ok(OrderState::Rejected),
-        "Triggered" => Ok(OrderState::Unknown),
+        "PendingCancel" | "Triggered" => Ok(OrderState::Unknown),
         _ => Err(BybitError::Payload),
     }
 }
@@ -1911,6 +1681,8 @@ struct OrderRow {
     side: String,
     position_idx: u8,
     order_status: String,
+    order_type: String,
+    time_in_force: String,
     qty: String,
     cum_exec_qty: String,
     price: String,
