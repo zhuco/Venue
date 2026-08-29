@@ -46,6 +46,7 @@ pub struct BitgetRawPrivatePage {
     pub binding: GatewayBinding,
     pub native_symbol: String,
     pub attempt_id: u64,
+    pub generation: u64,
     pub page_index: u32,
     pub request_cursor: Option<String>,
     /// Effective signed `startTime` for fill history after window clamping. Other surfaces must
@@ -68,6 +69,31 @@ impl BitgetRawPrivatePage {
         received_at_ms: u64,
         payload: String,
     ) -> Result<Self, BitgetPrivateError> {
+        Self::new_with_generation(
+            surface,
+            binding,
+            attempt_id,
+            attempt_id,
+            page_index,
+            request_cursor,
+            fill_history_start_ms,
+            received_at_ms,
+            payload,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_generation(
+        surface: BitgetPrivateSurface,
+        binding: GatewayBinding,
+        attempt_id: u64,
+        generation: u64,
+        page_index: u32,
+        request_cursor: Option<String>,
+        fill_history_start_ms: Option<u64>,
+        received_at_ms: u64,
+        payload: String,
+    ) -> Result<Self, BitgetPrivateError> {
         validate_binding(&binding)?;
         let native_symbol = native_symbol(&binding.symbol)?;
         let payload_sha256 = payload_digest(&payload);
@@ -77,6 +103,7 @@ impl BitgetRawPrivatePage {
             binding,
             native_symbol,
             attempt_id,
+            generation,
             page_index,
             request_cursor,
             fill_history_start_ms,
@@ -91,6 +118,7 @@ impl BitgetRawPrivatePage {
     pub fn validate(&self) -> Result<(), BitgetPrivateError> {
         if self.parser_schema_version != BITGET_PRIVATE_PARSER_SCHEMA_VERSION
             || self.attempt_id == 0
+            || self.generation == 0
             || self.received_at_ms == 0
             || self.payload.is_empty()
             || self
@@ -167,6 +195,7 @@ pub enum BitgetPrivateFace {
 pub struct BitgetPrivateGenerationCandidate {
     pub binding: GatewayBinding,
     pub attempt_id: u64,
+    pub generation: u64,
     pub observed_at_ms: u64,
     pub raw_pages: Vec<BitgetRawPrivatePage>,
     pub balance: AccountBalance,
@@ -204,7 +233,7 @@ pub fn parse_positions_face(
         return Err(BitgetPrivateError::Cursor);
     }
     let mut sides = BTreeSet::new();
-    let positions = rows
+    let mut positions = rows
         .iter()
         .filter(|row| row.get("symbol").and_then(Value::as_str) == Some(raw.native_symbol.as_str()))
         .map(|row| {
@@ -216,6 +245,22 @@ pub fn parse_positions_face(
             Ok(position)
         })
         .collect::<Result<Vec<_>, BitgetPrivateError>>()?;
+    for side in [PositionSide::Long, PositionSide::Short] {
+        if !sides.contains(&side) {
+            positions.push(Position {
+                symbol: raw.binding.symbol.clone(),
+                side,
+                quantity: Decimal::ZERO,
+                entry_price: None,
+                mark_price: None,
+            });
+        }
+    }
+    positions.sort_by_key(|position| match position.side {
+        PositionSide::Long => 0,
+        PositionSide::Short => 1,
+        PositionSide::Net => 2,
+    });
     Ok(BitgetPositionsFace { raw, positions })
 }
 
@@ -282,11 +327,15 @@ pub fn complete_private_turn(
     let fills = complete_fill_pages(&fill_pages)?;
     let binding = account_face.raw.binding.clone();
     let attempt_id = account_face.raw.attempt_id;
+    let generation = account_face.raw.generation;
     let mut raw_pages = vec![account_face.raw, settings_face.raw, positions_face.raw];
     raw_pages.extend(order_pages.into_iter().map(|page| page.raw));
     raw_pages.extend(fill_pages.into_iter().map(|page| page.raw));
     if raw_pages.iter().any(|raw| {
-        raw.binding != binding || raw.attempt_id != attempt_id || raw.validate().is_err()
+        raw.binding != binding
+            || raw.attempt_id != attempt_id
+            || raw.generation != generation
+            || raw.validate().is_err()
     }) {
         return Err(BitgetPrivateError::MixedAttempt);
     }
@@ -296,6 +345,7 @@ pub fn complete_private_turn(
     Ok(BitgetPrivateGenerationCandidate {
         binding,
         attempt_id,
+        generation,
         observed_at_ms,
         raw_pages,
         balance: account_face.balance,
@@ -523,6 +573,7 @@ fn validate_page_chain<'a>(
         return Err(BitgetPrivateError::Pagination);
     }
     let attempt_id = first.attempt_id;
+    let generation = first.generation;
     let binding = &first.binding;
     let fill_history_start_ms = first.fill_history_start_ms;
     let mut expected_cursor: Option<&str> = None;
@@ -531,6 +582,7 @@ fn validate_page_chain<'a>(
         raw.validate()?;
         if raw.surface != surface
             || raw.attempt_id != attempt_id
+            || raw.generation != generation
             || &raw.binding != binding
             || raw.fill_history_start_ms != fill_history_start_ms
             || usize::try_from(raw.page_index).ok() != Some(index)
@@ -1031,9 +1083,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let candidate = complete_private_turn(complete_faces()?)?;
         assert_eq!(candidate.attempt_id, 7);
+        assert_eq!(candidate.generation, 7);
         assert_eq!(candidate.binding, binding("DOGE/USDT")?);
         assert_eq!(candidate.raw_pages.len(), 5);
-        assert_eq!(candidate.positions.len(), 1);
+        assert_eq!(candidate.positions.len(), 2);
+        assert_eq!(candidate.positions[1].side, PositionSide::Short);
+        assert_eq!(candidate.positions[1].quantity, Decimal::ZERO);
         assert_eq!(candidate.orders.len(), 1);
         assert_eq!(candidate.fills.len(), 1);
         assert!(candidate.hedge_mode);
@@ -1082,6 +1137,18 @@ mod tests {
         }
         assert_eq!(
             complete_private_turn(cross_attempt),
+            Err(BitgetPrivateError::MixedAttempt)
+        );
+
+        let mut cross_generation = complete_faces()?;
+        if let Some(BitgetPrivateFace::Settings(face)) = cross_generation
+            .iter_mut()
+            .find(|face| matches!(face, BitgetPrivateFace::Settings(_)))
+        {
+            face.raw.generation = 8;
+        }
+        assert_eq!(
+            complete_private_turn(cross_generation),
             Err(BitgetPrivateError::MixedAttempt)
         );
 
