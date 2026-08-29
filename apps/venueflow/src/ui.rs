@@ -1,13 +1,16 @@
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke};
 use egui_tiles::{Behavior, TileId, Tiles, UiResponse};
 use venue_control_protocol::{
-    AggressorSide, ConnectionState, ControlAction, HealthState, MarketSummary, StrategyLifecycle,
-    StrategySummary,
+    AggressorSide, CommandState, ConnectionState, ControlAction, ControlCommandRequest,
+    HealthState, MarketSummary, StrategyLifecycle, StrategySummary,
 };
 
 use crate::{
     client::ControlClient,
-    model::{AppModel, PendingConfirmation, WorkspaceKind, decimal_to_f64, format_decimal},
+    model::{
+        AppModel, PendingConfirmation, WorkspaceKind, decimal_to_f64, format_decimal,
+        freshness_age_ms, requires_operator_confirmation,
+    },
     theme,
     workspace::{Pane, PaneKind, Workspaces},
 };
@@ -135,10 +138,10 @@ pub fn show_status_bar(ui: &mut egui::Ui, model: &AppModel) {
                 ));
                 ui.separator();
                 ui.small(generated);
-                if let Some(receipt) = &model.last_receipt {
+                if let Some(receipt) = model.last_terminal_receipt() {
                     ui.separator();
                     ui.small(format!(
-                        "last receipt {} · {:?}",
+                        "final receipt {} · {:?}",
                         receipt.receipt_id, receipt.state
                     ));
                 }
@@ -192,16 +195,8 @@ pub fn show_confirmation(context: &egui::Context, model: &mut AppModel, client: 
                     .add_enabled(enabled, egui::Button::new("Submit intent"))
                     .clicked()
                 {
-                    pending.request.confirmation = Some(pending.typed.clone());
-                    match client.send(pending.request.clone()) {
-                        Ok(()) => model.notice(format!(
-                            "Submitted {} intent for {}",
-                            pending.request.action.as_str(),
-                            pending.request.instance_id
-                        )),
-                        Err(error) => {
-                            model.notice(format!("Control request rejected locally: {error}"))
-                        }
+                    if let Some(request) = pending.confirmed_request() {
+                        send_command(model, client, request);
                     }
                     keep_open = false;
                 }
@@ -508,6 +503,7 @@ fn show_accounts(ui: &mut egui::Ui, model: &AppModel) {
                     "uPnL",
                     "Private gen",
                     "Writer gen",
+                    "Reconciled age",
                 ] {
                     ui.strong(heading);
                 }
@@ -523,9 +519,21 @@ fn show_accounts(ui: &mut egui::Ui, model: &AppModel) {
                     ui.colored_label(theme::value_color(pnl), format!("{pnl:+.2}"));
                     ui.monospace(account.private_generation.to_string());
                     ui.monospace(account.writer_generation.to_string());
+                    ui.monospace(format_freshness(freshness_age_ms(
+                        snapshot.generated_ms,
+                        account.last_reconciled_ms,
+                    )));
                     ui.end_row();
                 }
             });
+        ui.separator();
+        ui.colored_label(
+            theme::WARNING,
+            "WAL state · runtime Unknown fence · capability freshness: not projected by Control v2",
+        );
+        ui.small(
+            "VenueFlow shows writer/private generations and reconciliation age only; it does not infer missing authority from health or ledger text.",
+        );
     });
 }
 
@@ -720,6 +728,45 @@ fn show_control(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient)
     });
     ui.separator();
     ui.small("Stop cancels only the selected instance's owned orders and preserves residual custody. Flatten additionally requests signed zero-position convergence.");
+    ui.small("Pause, Stop, and Flatten require an exact typed scope confirmation. The account node remains authoritative and must independently revalidate every intent.");
+    if !model.commands.is_empty() {
+        ui.separator();
+        ui.strong("This session's command receipts");
+        egui::ScrollArea::vertical()
+            .max_height(170.0)
+            .show(ui, |ui| {
+                for command in model.commands.iter().take(16) {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.monospace(&command.request.request_id);
+                        ui.label(command.request.action.as_str());
+                        ui.label(command.request.mode.to_string());
+                        ui.monospace(&command.request.trading_account_id);
+                        ui.label(command.request.symbol.to_string());
+                        ui.label(&command.request.instance_id);
+                        ui.monospace(format!("epoch {}", command.request.expected_config_epoch));
+                    });
+                    match (&command.latest_receipt, &command.terminal_receipt) {
+                        (_, Some(receipt)) => {
+                            receipt_state_label(ui, receipt.state);
+                            ui.monospace(format!("final receipt {}", receipt.receipt_id));
+                            if !receipt.detail.is_empty() {
+                                ui.small(&receipt.detail);
+                            }
+                        }
+                        (Some(receipt), None) => {
+                            receipt_state_label(ui, receipt.state);
+                            ui.small(
+                                "accepted; awaiting a final Applied / Rejected / Unknown receipt",
+                            );
+                        }
+                        (None, None) => {
+                            ui.colored_label(theme::WARNING, "submitted; awaiting receipt");
+                        }
+                    }
+                    ui.separator();
+                }
+            });
+    }
 }
 
 fn submit_or_confirm(
@@ -729,16 +776,24 @@ fn submit_or_confirm(
     action: ControlAction,
 ) {
     let request = model.begin_command(strategy, action, now_ms());
-    if action.requires_confirmation() {
-        model.pending_confirmation = Some(PendingConfirmation {
-            request,
-            typed: String::new(),
-        });
+    if requires_operator_confirmation(action) {
+        model.pending_confirmation = Some(PendingConfirmation::new(request));
     } else {
-        match client.send(request) {
-            Ok(()) => model.notice(format!("Submitted {} intent", action.as_str())),
-            Err(error) => model.notice(format!("Control request rejected locally: {error}")),
+        send_command(model, client, request);
+    }
+}
+
+fn send_command(model: &mut AppModel, client: &ControlClient, request: ControlCommandRequest) {
+    match client.send(request.clone()) {
+        Ok(()) => {
+            model.record_submission(request.clone());
+            model.notice(format!(
+                "Submitted {} intent for {}",
+                request.action.as_str(),
+                request.instance_id
+            ));
         }
+        Err(error) => model.notice(format!("Control request rejected locally: {error}")),
     }
 }
 
@@ -755,6 +810,28 @@ fn show_diagnostics(ui: &mut egui::Ui, model: &AppModel) {
         "Endpoint: {}",
         endpoint_label(&model.preferences.endpoint)
     ));
+    ui.label(format!(
+        "Snapshot polling: {}",
+        if model.snapshot_online {
+            "online"
+        } else {
+            "offline"
+        }
+    ));
+    ui.label(format!(
+        "SSE stream: {}",
+        if model.event_stream_online {
+            "online"
+        } else {
+            "offline"
+        }
+    ));
+    ui.label(format!(
+        "Last event ID: {}",
+        model
+            .last_event_id
+            .map_or("none".to_owned(), |event_id| event_id.to_string())
+    ));
     if let Some(snapshot) = &model.snapshot {
         ui.label(format!("Schema: {}", snapshot.schema_version));
         ui.label(format!("Generated: {}", snapshot.generated_ms));
@@ -764,12 +841,41 @@ fn show_diagnostics(ui: &mut egui::Ui, model: &AppModel) {
         ui.label(format!("Ledger rows: {}", snapshot.ledger.len()));
     }
     ui.separator();
+    ui.strong("Authority coverage in Control v2");
+    ui.label("TEST/LIVE, account, strategy, private generation, writer generation: projected");
+    ui.label("Command Accepted/Applied/Rejected/Unknown receipts: projected");
+    ui.colored_label(theme::WARNING, "WAL state: not projected");
+    ui.colored_label(theme::WARNING, "Runtime Unknown fence: not projected");
+    ui.colored_label(
+        theme::WARNING,
+        "Capability evidence freshness: not projected",
+    );
+    ui.separator();
     ui.strong("Recent notices");
     for notice in &model.notices {
         ui.small(notice);
     }
     ui.separator();
     ui.colored_label(theme::TEXT_SECONDARY, "The UI cannot read PostgreSQL, WAL, checkpoints, artifacts, credentials, or exchange-native endpoints.");
+}
+
+fn receipt_state_label(ui: &mut egui::Ui, state: CommandState) {
+    let color = match state {
+        CommandState::Applied => theme::BUY,
+        CommandState::Accepted => theme::WARNING,
+        CommandState::Rejected | CommandState::Unknown => theme::SELL,
+    };
+    ui.colored_label(color, format!("{state:?}"));
+}
+
+fn format_freshness(age_ms: Option<u64>) -> String {
+    age_ms.map_or("unknown".to_owned(), |age_ms| {
+        if age_ms < 1_000 {
+            format!("{age_ms} ms")
+        } else {
+            format!("{:.1} s", age_ms as f64 / 1_000.0)
+        }
+    })
 }
 
 fn market<'a>(model: &'a AppModel, symbol: &str) -> Option<&'a MarketSummary> {
