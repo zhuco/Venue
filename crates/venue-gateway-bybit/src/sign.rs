@@ -1,11 +1,12 @@
 use hmac::{Hmac, Mac};
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use sha2::Sha256;
+use venue_gateway_api::GatewayBinding;
 
-use crate::{BybitCredentials, BybitError};
+use crate::{BybitCredentials, BybitError, BybitGatewayBinding};
 
 pub struct SignedHeaders {
-    entries: [(String, String); 5],
+    entries: [(String, SecretString); 5],
 }
 
 impl SignedHeaders {
@@ -14,16 +15,19 @@ impl SignedHeaders {
         self.entries
             .iter()
             .find(|(candidate, _)| candidate == name)
-            .map(|(_, value)| value.as_str())
+            .map(|(_, value)| value.expose_secret())
     }
 }
 
 pub fn sign(
     credentials: &BybitCredentials,
+    binding: &BybitGatewayBinding,
+    request_binding: &GatewayBinding,
     timestamp_ms: u64,
-    recv_window_ms: u64,
     payload: &[u8],
 ) -> Result<SignedHeaders, BybitError> {
+    binding.validate_request_binding(request_binding)?;
+    let recv_window_ms = binding.config().recv_window_ms();
     if timestamp_ms == 0 || recv_window_ms == 0 || recv_window_ms > 10_000 {
         return Err(BybitError::SigningInput);
     }
@@ -39,11 +43,20 @@ pub fn sign(
     let signature = hex(&mac.finalize().into_bytes());
     Ok(SignedHeaders {
         entries: [
-            ("X-BAPI-API-KEY".to_owned(), api_key.to_owned()),
-            ("X-BAPI-SIGN".to_owned(), signature),
-            ("X-BAPI-SIGN-TYPE".to_owned(), "2".to_owned()),
-            ("X-BAPI-TIMESTAMP".to_owned(), timestamp),
-            ("X-BAPI-RECV-WINDOW".to_owned(), recv_window),
+            (
+                "X-BAPI-API-KEY".to_owned(),
+                SecretString::from(api_key.to_owned()),
+            ),
+            ("X-BAPI-SIGN".to_owned(), SecretString::from(signature)),
+            (
+                "X-BAPI-SIGN-TYPE".to_owned(),
+                SecretString::from("2".to_owned()),
+            ),
+            ("X-BAPI-TIMESTAMP".to_owned(), SecretString::from(timestamp)),
+            (
+                "X-BAPI-RECV-WINDOW".to_owned(),
+                SecretString::from(recv_window),
+            ),
         ],
     })
 }

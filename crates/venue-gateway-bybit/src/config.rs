@@ -4,29 +4,56 @@ const RECV_WINDOW_MS: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BybitConfig {
-    pub rest_origin: &'static str,
-    pub public_ws: &'static str,
-    pub private_ws: &'static str,
-    pub recv_window_ms: u64,
+    mode: GatewayMode,
+    rest_origin: &'static str,
+    public_ws: &'static str,
+    private_ws: &'static str,
+    recv_window_ms: u64,
 }
 
 impl BybitConfig {
-    #[must_use]
-    pub const fn for_mode(mode: GatewayMode) -> Self {
+    pub(crate) const fn for_mode(mode: GatewayMode) -> Self {
         match mode {
             GatewayMode::Test => Self {
+                mode,
                 rest_origin: "https://api-testnet.bybit.com",
                 public_ws: "wss://stream-testnet.bybit.com/v5/public/linear",
                 private_ws: "wss://stream-testnet.bybit.com/v5/private",
                 recv_window_ms: RECV_WINDOW_MS,
             },
             GatewayMode::Live => Self {
+                mode,
                 rest_origin: "https://api.bybit.com",
                 public_ws: "wss://stream.bybit.com/v5/public/linear",
                 private_ws: "wss://stream.bybit.com/v5/private",
                 recv_window_ms: RECV_WINDOW_MS,
             },
         }
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> GatewayMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub const fn rest_origin(&self) -> &'static str {
+        self.rest_origin
+    }
+
+    #[must_use]
+    pub const fn public_ws(&self) -> &'static str {
+        self.public_ws
+    }
+
+    #[must_use]
+    pub const fn private_ws(&self) -> &'static str {
+        self.private_ws
+    }
+
+    #[must_use]
+    pub const fn recv_window_ms(&self) -> u64 {
+        self.recv_window_ms
     }
 }
 

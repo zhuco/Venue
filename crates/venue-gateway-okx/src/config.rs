@@ -1,30 +1,63 @@
-use venue_gateway_api::GatewayMode;
+use venue_gateway_api::{GatewayBinding, GatewayMode};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+use crate::{OkxGatewayBinding, OkxGatewayBindingError};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OkxConfig {
-    pub rest_origin: &'static str,
-    pub public_ws: &'static str,
-    pub private_ws: &'static str,
-    pub simulated_trading: bool,
+    binding: OkxGatewayBinding,
+    rest_origin: &'static str,
+    public_ws: &'static str,
+    private_ws: &'static str,
 }
 
 impl OkxConfig {
-    #[must_use]
-    pub const fn for_mode(mode: GatewayMode) -> Self {
-        match mode {
+    pub fn for_binding(binding: GatewayBinding) -> Result<Self, OkxGatewayBindingError> {
+        let binding = OkxGatewayBinding::new(binding)?;
+        let config = match binding.gateway_binding().mode {
             GatewayMode::Test => Self {
+                binding,
                 rest_origin: "https://www.okx.com",
                 public_ws: "wss://wspap.okx.com:8443/ws/v5/public",
                 private_ws: "wss://wspap.okx.com:8443/ws/v5/private",
-                simulated_trading: true,
             },
             GatewayMode::Live => Self {
+                binding,
                 rest_origin: "https://www.okx.com",
                 public_ws: "wss://ws.okx.com:8443/ws/v5/public",
                 private_ws: "wss://ws.okx.com:8443/ws/v5/private",
-                simulated_trading: false,
             },
-        }
+        };
+        Ok(config)
+    }
+
+    #[must_use]
+    pub const fn gateway_binding(&self) -> &GatewayBinding {
+        self.binding.gateway_binding()
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> GatewayMode {
+        self.gateway_binding().mode
+    }
+
+    #[must_use]
+    pub const fn rest_origin(&self) -> &'static str {
+        self.rest_origin
+    }
+
+    #[must_use]
+    pub const fn public_ws(&self) -> &'static str {
+        self.public_ws
+    }
+
+    #[must_use]
+    pub const fn private_ws(&self) -> &'static str {
+        self.private_ws
+    }
+
+    #[must_use]
+    pub const fn simulated_trading(&self) -> bool {
+        matches!(self.mode(), GatewayMode::Test)
     }
 }
 

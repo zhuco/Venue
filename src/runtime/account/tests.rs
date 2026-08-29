@@ -9,7 +9,7 @@ use crate::{
     domain::{
         AccountBalance, CancelCommand, CommandId, DomainEvent, EventHeader, EventId, EventSource,
         ExecutionCommand, FieldState, Fill, NativeOrderFamily, Order, OrderCommand, OrderOwner,
-        OrderPurpose, OrderSide, OrderState, Position, PositionSide, Price, PublicTicker, Symbol,
+        OrderPurpose, OrderSide, OrderState, Position, PositionSide, Price, PublicTicker,
     },
     execution::{
         AccountDispatchDecision, AccountDispatchPermit, AccountExecutionIntent,
@@ -20,7 +20,6 @@ use crate::{
     },
     runtime::strategy::{AccountMarketEvent, PersistedPrivateFact, StrategyInput},
     storage::{PersistedPrivateEvidence, PrivateEvidence, PrivateEvidenceJournal},
-    strategy::hedged_grid::HedgedGridBinding,
 };
 
 pub(super) fn account() -> Result<AccountKey, Box<dyn Error>> {
@@ -1753,24 +1752,6 @@ fn private_route_plan_rejects_lifecycle_revision_change() -> Result<(), Box<dyn 
         runtime.commit_private_route(PersistedPrivateDispatchReceipt::persisted(plan)),
         Err(AccountRuntimeError::StalePrivateRoutePlan)
     ));
-    Ok(())
-}
-
-#[test]
-fn legacy_stage7_bridge_carries_identity_without_writer_authority() -> Result<(), Box<dyn Error>> {
-    let legacy = HedgedGridBinding {
-        strategy_instance_id: "hedged_grid_sol_usdt".to_owned(),
-        run_id: "primary".to_owned(),
-        exchange: "gate".to_owned(),
-        account: "futures".to_owned(),
-        symbol: Symbol::new("SOL", "USDT")?,
-        config_version: "stage7".to_owned(),
-        owner_scope: "hedged_grid_sol_usdt_primary".to_owned(),
-    };
-    let bridged = legacy_stage7_strategy_binding(&legacy)?;
-    assert_eq!(bridged.key.account.exchange, ExchangeId::Gate);
-    assert_eq!(bridged.key.strategy_kind, StrategyKind::HedgedGrid);
-    assert_eq!(bridged.key.symbol, legacy.symbol);
     Ok(())
 }
 

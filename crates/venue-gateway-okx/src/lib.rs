@@ -1,3 +1,4 @@
+mod binding;
 mod config;
 mod credentials;
 mod models;
@@ -9,12 +10,21 @@ use rust_decimal::Decimal;
 use venue_domain::domain::{
     Amount, Asset, FieldState, Fill, OrderSide, PositionSide, Price, Symbol,
 };
+use venue_gateway_api::CapabilityFlags;
 
+pub use binding::{OkxGatewayBinding, OkxGatewayBindingError};
 pub use config::{OkxConfig, endpoints};
 pub use credentials::OkxCredentials;
 pub use sign::{SignedHeaders, request_path, sign};
 
 use models::{Envelope, FillRow};
+
+/// No account capability is advertised until authenticated readback, private stream, writer,
+/// WAL, and UNKNOWN reconciliation are all connected.
+#[must_use]
+pub const fn capabilities() -> CapabilityFlags {
+    CapabilityFlags::empty()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OkxPositionMode {
@@ -148,26 +158,42 @@ pub enum OkxError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use venue_gateway_api::GatewayMode;
+    use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
 
     const FILL_FIXTURE: &[u8] = include_bytes!("../fixtures/fills-history-page.json");
 
+    fn config(mode: GatewayMode) -> Result<OkxConfig, Box<dyn std::error::Error>> {
+        Ok(OkxConfig::for_binding(GatewayBinding::new(
+            VenueId::Okx,
+            mode,
+            "00000000-0000-4000-8000-000000000001",
+            "BTC/USDT".parse()?,
+        )?)?)
+    }
+
     #[test]
-    fn modes_select_only_test_or_live_transport() {
-        let test = OkxConfig::for_mode(GatewayMode::Test);
-        let live = OkxConfig::for_mode(GatewayMode::Live);
-        assert!(test.simulated_trading);
-        assert!(!live.simulated_trading);
-        assert!(test.private_ws.contains("wspap.okx.com"));
-        assert!(live.private_ws.contains("ws.okx.com"));
+    fn one_binding_selects_only_its_test_or_live_transport()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let test = config(GatewayMode::Test)?;
+        let live = config(GatewayMode::Live)?;
+        assert!(test.simulated_trading());
+        assert!(!live.simulated_trading());
+        assert!(test.private_ws().contains("wspap.okx.com"));
+        assert!(live.private_ws().contains("ws.okx.com"));
+        assert_eq!(test.gateway_binding().mode, GatewayMode::Test);
+        assert_eq!(live.gateway_binding().mode, GatewayMode::Live);
+        assert_eq!(test.gateway_binding().symbol.to_string(), "BTC/USDT");
+        assert_eq!(capabilities(), CapabilityFlags::empty());
+        Ok(())
     }
 
     #[test]
     fn signing_preserves_the_okx_fixed_vector() -> Result<(), OkxError> {
         let credentials = OkxCredentials::from_values("key", "mysecret", "pass")?;
+        let config = config(GatewayMode::Test).map_err(|_| OkxError::Binding)?;
         let headers = sign(
             &credentials,
-            GatewayMode::Test,
+            &config,
             "2020-12-08T09:08:57.715Z",
             "GET",
             "/api/v5/account/balance",
@@ -184,9 +210,10 @@ mod tests {
     #[test]
     fn live_signing_omits_simulated_trading_header() -> Result<(), OkxError> {
         let credentials = OkxCredentials::from_values("key", "mysecret", "pass")?;
+        let config = config(GatewayMode::Live).map_err(|_| OkxError::Binding)?;
         let headers = sign(
             &credentials,
-            GatewayMode::Live,
+            &config,
             "2020-12-08T09:08:57.715Z",
             "GET",
             "/api/v5/account/balance",

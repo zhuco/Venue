@@ -15,19 +15,30 @@ pub struct HyperliquidCredentials {
 
 impl HyperliquidCredentials {
     pub fn from_environment() -> Result<Self, HyperliquidError> {
-        Self::from_values(
-            std::env::var("HYPERLIQUID_MASTER_ADDRESS")
-                .map_err(|_| HyperliquidError::Credentials)?,
-            std::env::var("HYPERLIQUID_USER_ADDRESS").map_err(|_| HyperliquidError::Credentials)?,
-            std::env::var("HYPERLIQUID_VAULT_ADDRESS").ok(),
-            std::env::var("HYPERLIQUID_AGENT_NAME").map_err(|_| HyperliquidError::Credentials)?,
-            std::env::var("HYPERLIQUID_AGENT_ADDRESS")
-                .map_err(|_| HyperliquidError::Credentials)?,
+        let master_address = std::env::var("HYPERLIQUID_MASTER_ADDRESS")
+            .map_err(|_| HyperliquidError::Credentials)?;
+        let user_address =
+            std::env::var("HYPERLIQUID_USER_ADDRESS").map_err(|_| HyperliquidError::Credentials)?;
+        let vault_address = std::env::var("HYPERLIQUID_VAULT_ADDRESS").ok();
+        let agent_name =
+            std::env::var("HYPERLIQUID_AGENT_NAME").map_err(|_| HyperliquidError::Credentials)?;
+        let agent_address = std::env::var("HYPERLIQUID_AGENT_ADDRESS")
+            .map_err(|_| HyperliquidError::Credentials)?;
+        let agent_private_key = SecretString::from(
             std::env::var("HYPERLIQUID_AGENT_PRIVATE_KEY")
                 .map_err(|_| HyperliquidError::Credentials)?,
+        );
+        Self::from_secrets(
+            master_address,
+            user_address,
+            vault_address,
+            agent_name,
+            agent_address,
+            agent_private_key,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn from_values(
         master_address: impl Into<String>,
         user_address: impl Into<String>,
@@ -36,11 +47,24 @@ impl HyperliquidCredentials {
         agent_address: impl Into<String>,
         agent_private_key: impl Into<String>,
     ) -> Result<Self, HyperliquidError> {
-        let master_address = master_address.into();
-        let user_address = user_address.into();
-        let agent_name = agent_name.into();
-        let agent_address = agent_address.into();
-        let agent_private_key = SecretString::from(agent_private_key.into());
+        Self::from_secrets(
+            master_address.into(),
+            user_address.into(),
+            vault_address,
+            agent_name.into(),
+            agent_address.into(),
+            SecretString::from(agent_private_key.into()),
+        )
+    }
+
+    fn from_secrets(
+        master_address: String,
+        user_address: String,
+        vault_address: Option<String>,
+        agent_name: String,
+        agent_address: String,
+        agent_private_key: SecretString,
+    ) -> Result<Self, HyperliquidError> {
         let vault_valid = vault_address.as_deref().is_none_or(valid_address);
         let distinct_agent = !agent_address.eq_ignore_ascii_case(&master_address)
             && !agent_address.eq_ignore_ascii_case(&user_address)

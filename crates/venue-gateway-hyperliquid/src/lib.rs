@@ -1,3 +1,4 @@
+mod binding;
 mod config;
 mod credentials;
 mod models;
@@ -11,6 +12,7 @@ use venue_domain::domain::{
 };
 use venue_gateway_api::CapabilityFlags;
 
+pub use binding::{HyperliquidGatewayBinding, HyperliquidGatewayBindingError};
 pub use config::{HyperliquidConfig, endpoints};
 pub use credentials::HyperliquidCredentials;
 pub use nonce::{NonceCheckpoint, prepare_next_nonce};
@@ -153,19 +155,66 @@ pub enum HyperliquidError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use venue_gateway_api::GatewayMode;
+    use venue_gateway_api::{GatewayApiError, GatewayBinding, GatewayMode, VenueId};
 
     const PRIVATE_EVENTS: &[u8] = include_bytes!("../fixtures/private-account-events.json");
     const USER: &str = "0x0000000000000000000000000000000000000001";
     const AGENT: &str = "0x2222222222222222222222222222222222222222";
 
+    fn binding(
+        venue: VenueId,
+        mode: GatewayMode,
+    ) -> Result<GatewayBinding, Box<dyn std::error::Error>> {
+        Ok(GatewayBinding::new(
+            venue,
+            mode,
+            "00000000-0000-4000-8000-000000000001",
+            "BTC/USDC".parse()?,
+        )?)
+    }
+
     #[test]
-    fn modes_select_only_testnet_or_live_endpoints() {
-        let test = HyperliquidConfig::for_mode(GatewayMode::Test);
-        let live = HyperliquidConfig::for_mode(GatewayMode::Live);
-        assert_eq!(test.rest_origin, "https://api.hyperliquid-testnet.xyz");
-        assert_eq!(live.rest_origin, "https://api.hyperliquid.xyz");
-        assert_ne!(test.websocket, live.websocket);
+    fn binding_and_config_accept_only_hyperliquid_test_or_live()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert!("SHADOW".parse::<GatewayMode>().is_err());
+        let test =
+            HyperliquidGatewayBinding::new(binding(VenueId::Hyperliquid, GatewayMode::Test)?)?;
+        let live =
+            HyperliquidGatewayBinding::new(binding(VenueId::Hyperliquid, GatewayMode::Live)?)?;
+        let test_config = HyperliquidConfig::for_binding(&test);
+        let live_config = HyperliquidConfig::for_binding(&live);
+        assert_eq!(test_config.mode(), GatewayMode::Test);
+        assert_eq!(live_config.mode(), GatewayMode::Live);
+        assert_eq!(
+            test_config.rest_origin(),
+            "https://api.hyperliquid-testnet.xyz"
+        );
+        assert_eq!(live_config.rest_origin(), "https://api.hyperliquid.xyz");
+        assert_ne!(test_config.websocket(), live_config.websocket());
+        assert_eq!(test.gateway_binding().symbol.to_string(), "BTC/USDC");
+        assert_eq!(capabilities(), CapabilityFlags::empty());
+        Ok(())
+    }
+
+    #[test]
+    fn binding_rejects_wrong_venue_and_account() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            HyperliquidGatewayBinding::new(binding(VenueId::Bybit, GatewayMode::Live)?),
+            Err(HyperliquidGatewayBindingError::Venue)
+        );
+        let invalid_account = GatewayBinding {
+            venue: VenueId::Hyperliquid,
+            mode: GatewayMode::Live,
+            trading_account_id: "owner-address-is-not-an-account-uuid".to_owned(),
+            symbol: "BTC/USDC".parse()?,
+        };
+        assert_eq!(
+            HyperliquidGatewayBinding::new(invalid_account),
+            Err(HyperliquidGatewayBindingError::Gateway(
+                GatewayApiError::TradingAccountId
+            ))
+        );
+        Ok(())
     }
 
     #[test]
@@ -188,6 +237,15 @@ mod tests {
             "11".repeat(32),
         );
         assert!(credential.is_ok());
+        let vault_owner = HyperliquidCredentials::from_values(
+            USER,
+            USER,
+            Some(AGENT.to_owned()),
+            "venue-agent",
+            AGENT.to_ascii_uppercase().replace("0X", "0x"),
+            "11".repeat(32),
+        );
+        assert!(matches!(vault_owner, Err(HyperliquidError::Credentials)));
     }
 
     #[test]

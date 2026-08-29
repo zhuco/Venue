@@ -1,4 +1,3 @@
-mod legacy_stage7;
 mod market_hub;
 mod model;
 mod private_router;
@@ -11,7 +10,6 @@ pub use crate::domain::{
     AccountKey, AccountModelError, AccountOrderCapabilityEvidence, ExchangeId, StrategyBinding,
     StrategyInstanceKey, StrategyKind,
 };
-pub use legacy_stage7::legacy_stage7_strategy_binding;
 pub use market_hub::{BestBidOffer, MarketHub, MarketHubError, MarketPublish};
 pub use model::{AccountFault, AccountHealth, InstanceLifecycle};
 pub(crate) use private_router::PrivateRouter;

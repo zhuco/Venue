@@ -1,13 +1,12 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hmac::{Hmac, Mac};
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use sha2::Sha256;
-use venue_gateway_api::GatewayMode;
 
-use crate::{OkxCredentials, OkxError};
+use crate::{OkxConfig, OkxCredentials, OkxError};
 
 pub struct SignedHeaders {
-    entries: [(String, String); 5],
+    entries: [(String, SecretString); 5],
     simulated_trading: bool,
 }
 
@@ -20,13 +19,13 @@ impl SignedHeaders {
         self.entries
             .iter()
             .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
+            .map(|(_, value)| value.expose_secret())
     }
 }
 
 pub fn sign(
     credentials: &OkxCredentials,
-    mode: GatewayMode,
+    config: &OkxConfig,
     timestamp: &str,
     method: &str,
     request_path: &str,
@@ -50,13 +49,25 @@ pub fn sign(
     let signature = STANDARD.encode(mac.finalize().into_bytes());
     Ok(SignedHeaders {
         entries: [
-            ("OK-ACCESS-KEY".to_owned(), api_key.to_owned()),
-            ("OK-ACCESS-SIGN".to_owned(), signature),
-            ("OK-ACCESS-TIMESTAMP".to_owned(), timestamp.to_owned()),
-            ("OK-ACCESS-PASSPHRASE".to_owned(), passphrase.to_owned()),
-            ("Content-Type".to_owned(), "application/json".to_owned()),
+            (
+                "OK-ACCESS-KEY".to_owned(),
+                SecretString::from(api_key.to_owned()),
+            ),
+            ("OK-ACCESS-SIGN".to_owned(), SecretString::from(signature)),
+            (
+                "OK-ACCESS-TIMESTAMP".to_owned(),
+                SecretString::from(timestamp.to_owned()),
+            ),
+            (
+                "OK-ACCESS-PASSPHRASE".to_owned(),
+                SecretString::from(passphrase.to_owned()),
+            ),
+            (
+                "Content-Type".to_owned(),
+                SecretString::from("application/json".to_owned()),
+            ),
         ],
-        simulated_trading: matches!(mode, GatewayMode::Test),
+        simulated_trading: config.simulated_trading(),
     })
 }
 
