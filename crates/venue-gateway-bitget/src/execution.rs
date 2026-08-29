@@ -415,6 +415,19 @@ pub fn build_ack_readback_request(
 pub fn build_unknown_readback_request(
     unknown: &BitgetUnknownMutation,
 ) -> Result<BitgetExactReadbackRequest, BitgetExecutionError> {
+    build_unknown_recovery_readback_request(unknown, unknown.generation)
+}
+
+/// Rebinds an UNKNOWN mutation's exact native identity to the current connection generation.
+/// The mutation itself remains the original one-shot attempt; only its signed readback may move
+/// forward after reconnect. A caller cannot move the lookup backwards or reconstruct a dispatch.
+pub fn build_unknown_recovery_readback_request(
+    unknown: &BitgetUnknownMutation,
+    readback_generation: u64,
+) -> Result<BitgetExactReadbackRequest, BitgetExecutionError> {
+    if readback_generation < unknown.generation {
+        return Err(BitgetExecutionError::Readback);
+    }
     let lookup = match (&unknown.order_id, &unknown.client_order_id) {
         (Some(order_id), _) => BitgetOrderLookup::OrderId(order_id.clone()),
         (None, Some(client_order_id)) => BitgetOrderLookup::ClientOrderId(client_order_id.clone()),
@@ -423,7 +436,7 @@ pub fn build_unknown_readback_request(
     build_readback(
         &unknown.binding,
         unknown.attempt_id,
-        unknown.generation,
+        readback_generation,
         lookup,
         unknown.dispatched_at_ms,
         unknown.kind,
@@ -567,7 +580,7 @@ pub fn settle_unknown_readback(
 ) -> Result<BitgetMutationSettlement, BitgetExecutionError> {
     if unknown.binding != readback.request.binding
         || unknown.attempt_id != readback.request.attempt_id
-        || unknown.generation != readback.request.generation
+        || readback.request.generation < unknown.generation
         || unknown.kind != readback.request.expected_kind
         || readback.request.not_before_ms != unknown.dispatched_at_ms
     {
@@ -1022,6 +1035,24 @@ mod tests {
         assert_eq!(
             settle_unknown_readback(&unknown, &readback)?.finality,
             BitgetReadbackFinality::AbsentAtReadback
+        );
+
+        let recovered = build_unknown_recovery_readback_request(&unknown, 8)?;
+        assert_eq!(recovered.generation, 8);
+        let recovered_readback = parse_exact_order_readback(
+            &config,
+            recovered,
+            1_100,
+            1_101,
+            br#"{"code":"00000","data":null}"#.to_vec(),
+        )?;
+        assert_eq!(
+            settle_unknown_readback(&unknown, &recovered_readback)?.finality,
+            BitgetReadbackFinality::AbsentAtReadback
+        );
+        assert_eq!(
+            build_unknown_recovery_readback_request(&unknown, 6),
+            Err(BitgetExecutionError::Readback)
         );
         Ok(())
     }
