@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+rust_decimal.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -16,7 +17,6 @@ venue-copy = { path = "../../crates/venue-copy" }
 venue-domain = { path = "../../crates/venue-domain" }
 
 [dev-dependencies]
-rust_decimal.workspace = true
 tokio.workspace = true
 
 [lints.rust]
