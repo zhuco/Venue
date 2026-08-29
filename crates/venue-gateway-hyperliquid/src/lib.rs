@@ -4,6 +4,7 @@ mod capability;
 mod config;
 mod credentials;
 mod models;
+mod node_candidate;
 mod nonce;
 mod physical;
 mod private_stream;
@@ -32,6 +33,7 @@ pub use capability::{
 };
 pub use config::{HyperliquidConfig, endpoints};
 pub use credentials::HyperliquidCredentials;
+pub use node_candidate::HyperliquidNodeCandidate;
 pub use nonce::{
     HyperliquidNonceStore, NonceCheckpoint, PersistedNonce, prepare_next_nonce, reserve_next_nonce,
 };

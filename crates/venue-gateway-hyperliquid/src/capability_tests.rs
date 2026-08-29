@@ -299,11 +299,103 @@ async fn complete_fresh_probe_yields_only_a_non_withdrawal_candidate_and_tamper_
         Err(HyperliquidError::CapabilityProbe)
     );
 
+    let persisted = serde_json::to_vec(&evidence)?;
+    let restored = HyperliquidNodeCandidate::from_persisted_slice(
+        selected.scope.binding().gateway().gateway_binding(),
+        &persisted,
+        observed_ms + 1,
+    )?;
+    assert_eq!(restored.candidate_capability_snapshot(), &candidate);
+    assert_eq!(capabilities(), CapabilityFlags::empty());
+
+    let mut action_nonces = MemoryNonceStore::default();
+    drop(restored.prepare_alo(
+        &mut action_nonces,
+        &selected,
+        &private,
+        &credential,
+        1_800_000_000_100,
+        HyperliquidAloOrder::new(
+            &selected,
+            OrderSide::Buy,
+            Decimal::new(6_500_500, 3),
+            Decimal::new(4, 1),
+            false,
+            "0x00000000000000000000000000000011",
+        )?,
+        None,
+    )?);
+    drop(restored.prepare_cancel(
+        &mut action_nonces,
+        &selected,
+        &private,
+        &credential,
+        1_800_000_000_101,
+        HyperliquidCancel::new(&selected, 77)?,
+        None,
+    )?);
+    drop(restored.prepare_ioc_reduce_only(
+        &mut action_nonces,
+        &selected,
+        &private,
+        &credential,
+        1_800_000_000_102,
+        HyperliquidIocReduceOnlyOrder::new(
+            &selected,
+            OrderSide::Sell,
+            Decimal::new(6_400_000, 3),
+            Decimal::new(2, 1),
+            "0x00000000000000000000000000000012",
+        )?,
+        None,
+    )?);
+    assert_eq!(
+        action_nonces
+            .load(AGENT)?
+            .ok_or("candidate nonce checkpoint missing")?
+            .last_nonce_ms,
+        1_800_000_000_102
+    );
+
+    let newer_private = HyperliquidPrivateStreamBinding::new(&selected, 22)?;
+    assert!(matches!(
+        restored.prepare_cancel(
+            &mut action_nonces,
+            &selected,
+            &newer_private,
+            &credential,
+            1_800_000_000_103,
+            HyperliquidCancel::new(&selected, 77)?,
+            None,
+        ),
+        Err(HyperliquidError::CapabilityProbe)
+    ));
+
     let mut tampered = serde_json::to_value(&evidence)?;
     tampered["payload"]["vault_address"] =
         serde_json::json!("0x0000000000000000000000000000000000000002");
     let tampered: HyperliquidCapabilityProbeEvidence = serde_json::from_value(tampered)?;
     assert_eq!(tampered.verify(), Err(HyperliquidError::CapabilityProbe));
+    let tampered = serde_json::to_vec(&tampered)?;
+    assert!(matches!(
+        HyperliquidNodeCandidate::from_persisted_slice(
+            selected.scope.binding().gateway().gateway_binding(),
+            &tampered,
+            observed_ms + 1,
+        ),
+        Err(HyperliquidError::CapabilityProbe)
+    ));
+
+    let live_binding = GatewayBinding::new(
+        VenueId::Hyperliquid,
+        GatewayMode::Live,
+        ACCOUNT,
+        "BTC/USDC".parse()?,
+    )?;
+    assert!(matches!(
+        HyperliquidNodeCandidate::from_persisted_slice(&live_binding, &persisted, observed_ms + 1,),
+        Err(HyperliquidError::CapabilityProbe)
+    ));
     Ok(())
 }
 

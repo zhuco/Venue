@@ -335,6 +335,30 @@ impl HyperliquidCapabilityProbeEvidence {
         Ok(())
     }
 
+    pub(crate) fn validate_node_scope(
+        &self,
+        meta: &HyperliquidPerpMeta,
+        private_stream: &HyperliquidPrivateStreamBinding,
+        credentials: &HyperliquidCredentials,
+    ) -> Result<(), HyperliquidError> {
+        self.verify()?;
+        if self.payload.binding != *meta.scope.binding().gateway().gateway_binding()
+            || self.payload.user_address != meta.scope.user_address()
+            || self.payload.native_coin != meta.scope.native_coin()
+            || self.payload.private_generation != private_stream.generation()
+            || private_stream.scope() != &meta.scope
+            || self.payload.master_address != credentials.master_address()
+            || self.payload.user_address != credentials.user_address()
+            || self.payload.vault_address.as_deref() != credentials.vault_address()
+            || self.payload.agent_address != credentials.agent_address()
+            || self.payload.agent_name != credentials.agent_name()
+            || self.payload.withdrawals_permitted
+        {
+            return Err(HyperliquidError::CapabilityProbe);
+        }
+        Ok(())
+    }
+
     /// Produces only a candidate common snapshot. `PLACE_MARKET` is intentionally absent because
     /// the shared API cannot yet distinguish exposure-increasing market orders from the proven IOC
     /// reduce-only surface. `WITHDRAW` is always absent.
