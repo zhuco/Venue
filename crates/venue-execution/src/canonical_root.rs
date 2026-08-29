@@ -76,15 +76,6 @@ pub fn acquire_account_canonical_root(
     acquire_in(&registry_root, scope, artifacts_root)
 }
 
-#[doc(hidden)]
-pub fn acquire_account_canonical_root_in(
-    registry_root: &Path,
-    scope: &WriterScope,
-    artifacts_root: &Path,
-) -> Result<Stage7CanonicalRootGuard, Stage7WriterRegistryError> {
-    acquire_in(registry_root, scope, artifacts_root)
-}
-
 fn acquire_in(
     registry_root: &Path,
     scope: &WriterScope,

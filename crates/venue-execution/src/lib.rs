@@ -7,7 +7,6 @@ use venue_domain::domain::ExecutionCommand;
 
 pub use canonical_root::{
     AccountCanonicalRootError, AccountCanonicalRootGuard, acquire_account_canonical_root,
-    acquire_account_canonical_root_in,
 };
 pub use journal::{
     CommandJournal, CommandJournalError, CommandReceipt, CommandState, OrderReadbackIdentity,
