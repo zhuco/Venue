@@ -56,7 +56,7 @@ VenueFlow Desktop / optional Agent
 
 `venue-control` 校验 schema v2 scope，以 PostgreSQL durable inbox/outbox、fencing delivery lease、幂等 claim 和终态 receipt 保存命令，并提供
 仅本地 HTTP/SSE `/v2`。TEST-only Copy worker 可在事务内锁定 leader 事件并持久化纯规划结果、delivery、ledger 与恢复状态；
-节点 ACK 只证明本地 inbox 已耐久，Unknown 只能进入下一序号只读对账。它不能直接提交订单，LIVE Copy 在数据库访问前失败关闭；账户节点轮询 adapter 尚未实现。唤醒通道不能
+节点 ACK 只证明本地 inbox 已耐久，Unknown 只能进入下一序号只读对账。Node 已有注入式 delivery 状态机契约和内存恢复测试，但共享 journal 实现与 HTTP polling 尚未接通。它不能直接提交订单，LIVE Copy 在数据库访问前失败关闭；唤醒通道不能
 代替耐久记录；节点仍须先持久化本地 Actor inbox，再独立重验 risk、Owner、WAL、writer 和私有事实。
 
 ## 4. 目标 workspace
@@ -95,9 +95,7 @@ crates/
 当前 `apps/venue-node` 已建立上述六个固定产物、逐 feature 二进制隔离门禁及 exchange-neutral `safe_host`。安全宿主
 在 root/WAL/Owner/writer metadata 与独立 hash-chain control log 恢复后才允许连接，持久应用 Pause/Resume/Stop/Flatten/Canary，
 并组合一次性 dispatch permit 与 UNKNOWN 读回；它不会自行产生 capability。Binance、Gate.io、Bitget 仅在显式
-`LIVE` 下委托既有 Stage 7 安全闭环；其 `TEST` 不能重定向到生产 client。六所 adapter 已具备各自的绑定型 async 私有读取与单次 mutation/readback 候选，
-Bybit、OKX、Hyperliquid 另有可持久化 probe 候选；但尚未接入 Node 的 capability、Owner、WAL、唯一账户 fence、Stop/Flatten 与 Canary 链，
-所以固定节点仍无条件失败关闭，不读取凭证、联网或创建工件。
+`LIVE` 下委托既有 Stage 7 安全闭环；其 `TEST` 不能重定向到生产 client。六所固定 binary 均已在本地封装对应 adapter 的 `PhysicalGateway` 候选和契约测试，六所 adapter 已具备绑定型 async 私有读取与单次 mutation/readback 候选，Bybit、OKX、Hyperliquid 另有可持久化 probe 候选；这些候选未接入 `run()`/启动链，尚缺恢复后完整签名采集、耐久 Owner/native identity、共享 async 驱动、UNKNOWN 查无单证明和 Control-applied capability promotion。它们没有接通 Node 的 capability、WAL、唯一账户 fence、Stop/Flatten 与 Canary 链，所以固定节点仍失败关闭，不读取凭证、联网或创建工件。
 
 ## 5. 依赖方向
 
@@ -213,7 +211,7 @@ Copy planner/job-consumer lease 只允许竞争数据库 job 的规划或投递�
 | Bitget | `venue-gateway-bitget` | UTA TEST Demo/LIVE async 私有链路、账户五面同 attempt、normal/unsupported 订单族、place/cancel/reduce-once 与 UNKNOWN exact readback 已闭合；Stage 7 capability/WAL/writer 仍是生产权威 | `TEST | LIVE`；adapter 静态能力为空，Node 接入前不开放新路径 |
 | Gate.io | `venue-gateway-gate` | TEST/LIVE async 签名 HTTP/私流、账户/Hedge 腿、regular/profile-explicit-unsupported、fills cursor、post-only place/exact cancel/reduce-once 与 ACK readback 已闭合；Stage 7 capability/WAL/writer 仍是生产权威 | `TEST | LIVE`；adapter 静态能力为空，Node 接入前不开放新路径 |
 | Bybit | `venue-gateway-bybit` | 物理单次会话与 API-secret HMAC probe 已闭合账户、Hedge 腿、三订单族、订单详情/fills、私流 generation、place/cancel/reduce-only IOC 与 ACK exact lookup | `TEST | LIVE`；probe 仅为候选，静态能力及 Node/writer/WAL 关闭 |
-| OKX | `venue-gateway-okx` | 可持久化 probe 已闭合 Net/Hedge 腿、三订单族、fills、模式、私流 generation、place/cancel/reduce-once 与 ACK UNKNOWN readback；共享命令尚拒绝 Net mutation | `TEST | LIVE`；probe 仅为候选，静态能力及 Node/writer/WAL 关闭 |
+| OKX | `venue-gateway-okx` | 可持久化 probe 已闭合 Net/Hedge 腿、三订单族、fills、模式、私流 generation、place/cancel/reduce-once 与 ACK UNKNOWN readback；共享命令已按权威 Net 持仓校验 mutation，但 OKX 候选仍只开放 Hedge mutation 建模 | `TEST | LIVE`；probe 仅为候选，静态能力及 Node/writer/WAL 关闭 |
 | Hyperliquid | `venue-gateway-hyperliquid` | 单次 dispatch 与可持久化 probe 已闭合 vault/coin/mode/generation、三类 action、fills 去重、官方签名向量、ACK UNKNOWN 与 orderStatus readback | `TEST | LIVE`；probe 仅为候选，静态能力及 Node/writer/WAL 关闭 |
 
 KOL 网关只是协议 fixture 和差异对照来源，不继承其运行开关或实盘准入状态。前三所的生产权威继续来自 Venue 已验收实现。
