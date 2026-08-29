@@ -1,0 +1,44 @@
+[
+  {
+    "closedPnl": "0.0",
+    "coin": "ETH",
+    "crossed": true,
+    "dir": "Open Long",
+    "fee": "0.2",
+    "feeToken": "USDC",
+    "oid": 200,
+    "px": "4000.0",
+    "side": "B",
+    "sz": "0.1",
+    "time": 1700000000001,
+    "tid": 6000
+  },
+  {
+    "closedPnl": "0.0",
+    "coin": "BTC",
+    "crossed": false,
+    "dir": "Open Long",
+    "fee": "0.3",
+    "feeToken": "USDC",
+    "oid": 201,
+    "px": "65000.0",
+    "side": "B",
+    "sz": "0.2",
+    "time": 1700000000001,
+    "tid": 6001
+  },
+  {
+    "closedPnl": "2.0",
+    "coin": "BTC",
+    "crossed": true,
+    "dir": "Close Long",
+    "fee": "0.4",
+    "feeToken": "USDC",
+    "oid": 202,
+    "px": "65100.0",
+    "side": "A",
+    "sz": "0.1",
+    "time": 1700000000002,
+    "tid": 6002
+  }
+]

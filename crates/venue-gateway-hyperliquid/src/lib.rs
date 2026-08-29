@@ -3,137 +3,29 @@ mod config;
 mod credentials;
 mod models;
 mod nonce;
+mod protocol;
 
-use std::str::FromStr;
-
-use rust_decimal::Decimal;
-use venue_domain::domain::{
-    Amount, Asset, FieldState, Fill, OrderSide, Price, Symbol, UnknownReason,
-};
 use venue_gateway_api::CapabilityFlags;
 
-pub use binding::{HyperliquidGatewayBinding, HyperliquidGatewayBindingError};
+pub use binding::{
+    HyperliquidGatewayBinding, HyperliquidGatewayBindingError, HyperliquidReadBinding,
+};
 pub use config::{HyperliquidConfig, endpoints};
 pub use credentials::HyperliquidCredentials;
 pub use nonce::{NonceCheckpoint, prepare_next_nonce};
-
-use models::{EventEnvelope, UserFillRow, UserFillsData};
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HyperliquidFill {
-    pub fill: Fill,
-    pub client_order_id: FieldState<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HyperliquidUserFills {
-    pub user_address: String,
-    pub is_snapshot: bool,
-    pub fills: Vec<HyperliquidFill>,
-}
+pub use protocol::{
+    HyperliquidAccountSnapshot, HyperliquidBbo, HyperliquidFill, HyperliquidFillCursor,
+    HyperliquidFillPage, HyperliquidFillQuery, HyperliquidOpenOrder, HyperliquidOpenOrdersSnapshot,
+    HyperliquidPayloadScope, HyperliquidPerpMeta, HyperliquidUserFills,
+    parse_clearinghouse_snapshot, parse_l2_book_bbo, parse_open_orders_snapshot, parse_perp_meta,
+    parse_private_user_fills, parse_user_fills_page, parse_ws_bbo,
+};
 
 /// No account capability is advertised until authenticated readback, private stream,
 /// EIP-712 signing, writer ownership, WAL, and UNKNOWN reconciliation are all connected.
 #[must_use]
 pub const fn capabilities() -> CapabilityFlags {
     CapabilityFlags::empty()
-}
-
-pub fn parse_private_user_fills(
-    payload: &[u8],
-    symbol: &Symbol,
-    native_coin: &str,
-    expected_user_address: &str,
-) -> Result<HyperliquidUserFills, HyperliquidError> {
-    if native_coin.is_empty() || !credentials::valid_address(expected_user_address) {
-        return Err(HyperliquidError::Binding);
-    }
-    let events: Vec<EventEnvelope> =
-        serde_json::from_slice(payload).map_err(|_| HyperliquidError::Payload)?;
-    let mut matching = events
-        .into_iter()
-        .filter(|event| event.channel == "userFills");
-    let event = matching.next().ok_or(HyperliquidError::Payload)?;
-    if matching.next().is_some() {
-        return Err(HyperliquidError::Payload);
-    }
-    let data: UserFillsData =
-        serde_json::from_value(event.data).map_err(|_| HyperliquidError::Payload)?;
-    if !data.user.eq_ignore_ascii_case(expected_user_address) {
-        return Err(HyperliquidError::Binding);
-    }
-    let fills = data
-        .fills
-        .into_iter()
-        .map(|row| normalize_fill(row, symbol, native_coin, &data.user))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(HyperliquidUserFills {
-        user_address: data.user.to_ascii_lowercase(),
-        is_snapshot: data.is_snapshot,
-        fills,
-    })
-}
-
-fn normalize_fill(
-    row: UserFillRow,
-    symbol: &Symbol,
-    native_coin: &str,
-    user_address: &str,
-) -> Result<HyperliquidFill, HyperliquidError> {
-    if row.coin != native_coin || row.coin != symbol.base() || symbol.quote() != "USDC" {
-        return Err(HyperliquidError::Binding);
-    }
-    if row.oid == 0 || row.tid == 0 || row.time == 0 {
-        return Err(HyperliquidError::Payload);
-    }
-    let side = match row.side.as_str() {
-        "B" => OrderSide::Buy,
-        "A" => OrderSide::Sell,
-        _ => return Err(HyperliquidError::Payload),
-    };
-    let quantity = decimal(&row.sz)?;
-    if !quantity.is_sign_positive() || quantity.is_zero() {
-        return Err(HyperliquidError::Payload);
-    }
-    let fee_asset = Asset::new(&row.fee_token).map_err(|_| HyperliquidError::Payload)?;
-    let fee = Amount::new(fee_asset.clone(), decimal(&row.fee)?.abs());
-    let realized_pnl = Amount::new(fee_asset, decimal(&row.closed_pnl)?);
-    let fill = Fill {
-        fill_id: format!(
-            "hl:{}:{native_coin}:{}",
-            user_address.to_ascii_lowercase(),
-            row.tid
-        ),
-        execution_sequence: FieldState::Known(row.tid),
-        order_id: row.oid.to_string(),
-        symbol: symbol.clone(),
-        side,
-        position_side: FieldState::Unavailable {
-            reason: UnknownReason::SourceOmitted,
-        },
-        quantity,
-        price: Price::new(decimal(&row.px)?).map_err(|_| HyperliquidError::Payload)?,
-        fee: FieldState::Known(fee),
-        realized_pnl: FieldState::Known(realized_pnl),
-        maker: row
-            .crossed
-            .map(|crossed| FieldState::Known(!crossed))
-            .unwrap_or(FieldState::Missing),
-        exchange_time_ms: Some(row.time),
-    };
-    fill.validate().map_err(|_| HyperliquidError::Payload)?;
-    Ok(HyperliquidFill {
-        fill,
-        client_order_id: row
-            .cloid
-            .filter(|value| !value.is_empty())
-            .map(FieldState::Known)
-            .unwrap_or(FieldState::Missing),
-    })
-}
-
-fn decimal(value: &str) -> Result<Decimal, HyperliquidError> {
-    Decimal::from_str(value).map_err(|_| HyperliquidError::Payload)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -155,9 +47,16 @@ pub enum HyperliquidError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal::Decimal;
+    use venue_domain::domain::{FieldState, OrderState, PositionSide, UnknownReason};
     use venue_gateway_api::{GatewayApiError, GatewayBinding, GatewayMode, VenueId};
 
     const PRIVATE_EVENTS: &[u8] = include_bytes!("../fixtures/private-account-events.json");
+    const META: &[u8] = include_bytes!("../fixtures/perp-meta.json");
+    const BOOK: &[u8] = include_bytes!("../fixtures/l2-book.json");
+    const CLEARINGHOUSE: &[u8] = include_bytes!("../fixtures/clearinghouse-state.json");
+    const OPEN_ORDERS: &[u8] = include_bytes!("../fixtures/open-orders.json");
+    const FILLS_PAGE: &[u8] = include_bytes!("../fixtures/fills-page.json");
     const USER: &str = "0x0000000000000000000000000000000000000001";
     const AGENT: &str = "0x2222222222222222222222222222222222222222";
 
@@ -171,6 +70,19 @@ mod tests {
             "00000000-0000-4000-8000-000000000001",
             "BTC/USDC".parse()?,
         )?)
+    }
+
+    fn read_binding(
+        mode: GatewayMode,
+    ) -> Result<HyperliquidReadBinding, Box<dyn std::error::Error>> {
+        Ok(HyperliquidReadBinding::new(
+            HyperliquidGatewayBinding::new(binding(VenueId::Hyperliquid, mode)?)?,
+            USER,
+        )?)
+    }
+
+    fn meta(mode: GatewayMode) -> Result<HyperliquidPerpMeta, Box<dyn std::error::Error>> {
+        Ok(parse_perp_meta(META, &read_binding(mode)?)?)
     }
 
     #[test]
@@ -265,19 +177,64 @@ mod tests {
     }
 
     #[test]
-    fn private_fill_fixture_preserves_identity_and_unknown_position_side()
+    fn meta_and_books_bind_native_coin_user_symbol_and_mode()
     -> Result<(), Box<dyn std::error::Error>> {
-        let symbol = "BTC/USDC".parse()?;
-        let page = parse_private_user_fills(PRIVATE_EVENTS, &symbol, "BTC", USER)?;
+        let meta = meta(GatewayMode::Test)?;
+        assert_eq!(meta.scope.native_coin(), "BTC");
+        assert_eq!(meta.scope.user_address(), USER);
+        assert_eq!(meta.scope.symbol().to_string(), "BTC/USDC");
+        assert_eq!(meta.scope.mode(), GatewayMode::Test);
+        assert_eq!(meta.asset_index, 0);
+        assert_eq!(meta.size_decimals, 5);
+        let bbo = parse_l2_book_bbo(BOOK, &meta)?;
+        assert_eq!(bbo.exchange_time_ms, 1_754_450_974_231);
+        assert_eq!(bbo.bid.price.value(), Decimal::new(1_133_770, 1));
+        assert_eq!(bbo.ask.price.value(), Decimal::new(1_133_970, 1));
+        let ws = br#"{"channel":"bbo","data":{"coin":"BTC","time":1754450974232,"bbo":[{"px":"113377.0","sz":"1.0","n":1},{"px":"113397.0","sz":"2.0","n":2}]}}"#;
+        assert_eq!(parse_ws_bbo(ws, &meta)?.exchange_time_ms, 1_754_450_974_232);
+        Ok(())
+    }
+
+    #[test]
+    fn account_and_orders_are_fixed_binding_snapshots() -> Result<(), Box<dyn std::error::Error>> {
+        let meta = meta(GatewayMode::Live)?;
+        let account = parse_clearinghouse_snapshot(CLEARINGHOUSE, &meta)?;
+        assert_eq!(account.scope.mode(), GatewayMode::Live);
+        assert_eq!(
+            account.balance.wallet_balance,
+            Decimal::new(13_109_482_328, 6)
+        );
+        let position = account.position.ok_or("position missing")?;
+        assert_eq!(position.side, PositionSide::Short);
+        assert_eq!(position.quantity, Decimal::new(335, 4));
+
+        let orders = parse_open_orders_snapshot(OPEN_ORDERS, &meta, 1_700_000_000_010)?;
+        assert_eq!(orders.orders.len(), 1);
+        assert_eq!(orders.orders[0].order.state, OrderState::PartiallyFilled);
+        assert_eq!(orders.orders[0].order.filled_quantity, Decimal::new(2, 0));
+        assert!(orders.orders[0].order.reduce_only);
+        Ok(())
+    }
+
+    #[test]
+    fn private_fill_fixture_preserves_composite_identity_without_fake_sequence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let meta = meta(GatewayMode::Test)?;
+        let page = parse_private_user_fills(PRIVATE_EVENTS, &meta)?;
         assert!(!page.is_snapshot);
         assert_eq!(page.fills.len(), 1);
         let item = &page.fills[0];
         assert_eq!(
             item.fill.fill_id,
-            "hl:0x0000000000000000000000000000000000000001:BTC:5001"
+            "hl:0x0000000000000000000000000000000000000001:1700000000002:BTC:5001"
         );
         assert_eq!(item.fill.order_id, "101");
-        assert_eq!(item.fill.execution_sequence, FieldState::Known(5001));
+        assert_eq!(
+            item.fill.execution_sequence,
+            FieldState::Unavailable {
+                reason: UnknownReason::SourceOmitted
+            }
+        );
         assert!(matches!(
             item.fill.position_side,
             FieldState::Unavailable {
@@ -292,22 +249,101 @@ mod tests {
     }
 
     #[test]
-    fn wrong_user_or_native_coin_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
-        let symbol = "BTC/USDC".parse()?;
+    fn fill_page_is_sorted_filtered_and_explicitly_closed() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let meta = meta(GatewayMode::Test)?;
+        let first = parse_user_fills_page(
+            FILLS_PAGE,
+            &meta,
+            &HyperliquidFillQuery {
+                begin_ms: 1_700_000_000_001,
+                end_ms: 1_700_000_000_002,
+                limit: 1,
+                after: None,
+            },
+        )?;
+        assert!(!first.complete);
+        assert_eq!(first.fills.len(), 1);
+        let cursor = first.next_cursor.ok_or("cursor missing")?;
+        assert_eq!(cursor.native_coin, "BTC");
+        assert_eq!(cursor.trade_id, 6001);
+        let second = parse_user_fills_page(
+            FILLS_PAGE,
+            &meta,
+            &HyperliquidFillQuery {
+                begin_ms: 1_700_000_000_001,
+                end_ms: 1_700_000_000_002,
+                limit: 10,
+                after: Some(cursor),
+            },
+        )?;
+        assert!(second.complete);
+        assert_eq!(second.fills.len(), 1);
+        assert_eq!(second.fills[0].fill.fill_id.ends_with(":BTC:6002"), true);
+        Ok(())
+    }
+
+    #[test]
+    fn wrong_user_coin_or_malformed_book_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let wrong_user = HyperliquidReadBinding::new(
+            HyperliquidGatewayBinding::new(binding(VenueId::Hyperliquid, GatewayMode::Test)?)?,
+            "0x3333333333333333333333333333333333333333",
+        )?;
+        let wrong_user_meta = parse_perp_meta(META, &wrong_user)?;
         assert_eq!(
-            parse_private_user_fills(
-                PRIVATE_EVENTS,
-                &symbol,
-                "BTC",
-                "0x3333333333333333333333333333333333333333"
-            ),
+            parse_private_user_fills(PRIVATE_EVENTS, &wrong_user_meta),
             Err(HyperliquidError::Binding)
         );
+        let eth_binding = GatewayBinding::new(
+            VenueId::Hyperliquid,
+            GatewayMode::Test,
+            "00000000-0000-4000-8000-000000000001",
+            "ETH/USDC".parse()?,
+        )?;
+        let eth = HyperliquidReadBinding::new(HyperliquidGatewayBinding::new(eth_binding)?, USER)?;
+        let eth_meta = parse_perp_meta(META, &eth)?;
         assert_eq!(
-            parse_private_user_fills(PRIVATE_EVENTS, &symbol, "ETH", USER),
+            parse_l2_book_bbo(BOOK, &eth_meta),
             Err(HyperliquidError::Binding)
+        );
+        let crossed = br#"{"coin":"BTC","time":1,"levels":[[{"px":"11","sz":"1","n":1}],[{"px":"10","sz":"1","n":1}]]}"#;
+        assert_eq!(
+            parse_l2_book_bbo(crossed, &meta(GatewayMode::Live)?),
+            Err(HyperliquidError::Payload)
         );
         assert_eq!(capabilities(), CapabilityFlags::empty());
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_fill_cursor_and_missing_required_maker_fact_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let meta = meta(GatewayMode::Test)?;
+        let mut duplicate: Vec<serde_json::Value> = serde_json::from_slice(FILLS_PAGE)?;
+        duplicate.push(duplicate[1].clone());
+        assert_eq!(
+            parse_user_fills_page(
+                &serde_json::to_vec(&duplicate)?,
+                &meta,
+                &HyperliquidFillQuery {
+                    begin_ms: 1_700_000_000_001,
+                    end_ms: 1_700_000_000_002,
+                    limit: 10,
+                    after: None,
+                }
+            ),
+            Err(HyperliquidError::Payload)
+        );
+
+        let mut events: Vec<serde_json::Value> = serde_json::from_slice(PRIVATE_EVENTS)?;
+        events[1]["data"]["fills"][0]
+            .as_object_mut()
+            .ok_or("fill object missing")?
+            .remove("crossed");
+        assert_eq!(
+            parse_private_user_fills(&serde_json::to_vec(&events)?, &meta),
+            Err(HyperliquidError::Payload)
+        );
         Ok(())
     }
 }

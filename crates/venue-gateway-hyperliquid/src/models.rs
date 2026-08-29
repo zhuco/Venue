@@ -28,5 +28,87 @@ pub(crate) struct UserFillRow {
     pub fee: String,
     pub tid: u64,
     pub fee_token: String,
-    pub crossed: Option<bool>,
+    pub crossed: bool,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct PerpMetaResponse {
+    pub universe: Vec<PerpMetaRow>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PerpMetaRow {
+    pub name: String,
+    pub sz_decimals: u32,
+    pub max_leverage: u32,
+    #[serde(default)]
+    pub is_delisted: bool,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BookData {
+    pub coin: String,
+    pub time: u64,
+    pub levels: [Vec<BookLevel>; 2],
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BboData {
+    pub coin: String,
+    pub time: u64,
+    pub bbo: [Option<BookLevel>; 2],
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BookLevel {
+    pub px: String,
+    pub sz: String,
+    pub n: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClearinghouseState {
+    pub asset_positions: Vec<AssetPositionRow>,
+    pub margin_summary: MarginSummaryRow,
+    pub cross_maintenance_margin_used: String,
+    pub withdrawable: String,
+    pub time: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MarginSummaryRow {
+    pub account_value: String,
+    pub total_margin_used: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AssetPositionRow {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub position: PositionRow,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PositionRow {
+    pub coin: String,
+    pub szi: String,
+    pub entry_px: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OpenOrderRow {
+    pub coin: String,
+    pub limit_px: String,
+    pub oid: serde_json::Value,
+    pub orig_sz: String,
+    pub reduce_only: bool,
+    pub side: String,
+    pub sz: String,
+    pub timestamp: u64,
+    pub cloid: Option<String>,
 }

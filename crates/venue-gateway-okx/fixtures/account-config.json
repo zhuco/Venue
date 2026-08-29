@@ -1,0 +1,10 @@
+{
+  "code": "0",
+  "msg": "",
+  "data": [{
+    "uid": "fixture-sub-account",
+    "mainUid": "fixture-main-account",
+    "acctLv": "3",
+    "posMode": "long_short_mode"
+  }]
+}

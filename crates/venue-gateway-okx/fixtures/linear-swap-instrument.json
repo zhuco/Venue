@@ -1,0 +1,17 @@
+{
+  "code": "0",
+  "msg": "",
+  "data": [{
+    "instType": "SWAP",
+    "instId": "BTC-USDT-SWAP",
+    "settleCcy": "USDT",
+    "tickSz": "0.1",
+    "lotSz": "1",
+    "minSz": "1",
+    "ctVal": "0.01",
+    "ctMult": "10",
+    "ctValCcy": "BTC",
+    "ctType": "linear",
+    "state": "live"
+  }]
+}

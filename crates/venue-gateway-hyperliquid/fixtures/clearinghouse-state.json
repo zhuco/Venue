@@ -1,0 +1,39 @@
+{
+  "assetPositions": [
+    {
+      "type": "oneWay",
+      "position": {
+        "coin": "BTC",
+        "szi": "-0.0335",
+        "entryPx": "113000.0",
+        "positionValue": "3785.0",
+        "unrealizedPnl": "-0.0134"
+      }
+    },
+    {
+      "type": "oneWay",
+      "position": {
+        "coin": "ETH",
+        "szi": "1.0",
+        "entryPx": "4000.0",
+        "positionValue": "4000.0",
+        "unrealizedPnl": "1.0"
+      }
+    }
+  ],
+  "crossMaintenanceMarginUsed": "2.5",
+  "crossMarginSummary": {
+    "accountValue": "13104.514502",
+    "totalMarginUsed": "4.0",
+    "totalNtlPos": "3785.0",
+    "totalRawUsd": "13104.514502"
+  },
+  "marginSummary": {
+    "accountValue": "13109.482328",
+    "totalMarginUsed": "4.967826",
+    "totalNtlPos": "3785.0",
+    "totalRawUsd": "13009.454678"
+  },
+  "time": 1708622398623,
+  "withdrawable": "13104.514502"
+}

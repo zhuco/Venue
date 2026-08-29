@@ -60,6 +60,7 @@ impl BybitConfig {
 pub mod endpoints {
     pub const TIME: &str = "/v5/market/time";
     pub const INSTRUMENTS: &str = "/v5/market/instruments-info";
+    pub const ORDERBOOK: &str = "/v5/market/orderbook";
     pub const ACCOUNT_INFO: &str = "/v5/account/info";
     pub const API_INFO: &str = "/v5/user/query-api";
     pub const BALANCES: &str = "/v5/account/wallet-balance";

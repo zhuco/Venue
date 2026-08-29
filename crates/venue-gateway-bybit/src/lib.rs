@@ -2,6 +2,7 @@ mod binding;
 mod config;
 mod credentials;
 mod models;
+mod public;
 mod sign;
 
 use std::str::FromStr;
@@ -13,6 +14,7 @@ use venue_gateway_api::CapabilityFlags;
 pub use binding::BybitGatewayBinding;
 pub use config::{BybitConfig, endpoints};
 pub use credentials::BybitCredentials;
+pub use public::*;
 pub use sign::{SignedHeaders, sign};
 
 /// No account capability is advertised until authenticated readback, private stream, writer,

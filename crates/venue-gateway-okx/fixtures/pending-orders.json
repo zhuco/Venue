@@ -1,0 +1,19 @@
+{
+  "code": "0",
+  "msg": "",
+  "data": [{
+    "instType": "SWAP",
+    "instId": "BTC-USDT-SWAP",
+    "ordId": "7002",
+    "clOrdId": "00000000000000000000000000000002",
+    "side": "sell",
+    "posSide": "short",
+    "sz": "2",
+    "accFillSz": "0.5",
+    "px": "60000",
+    "avgPx": "60010",
+    "reduceOnly": "true",
+    "state": "partially_filled",
+    "uTime": "1787911200200"
+  }]
+}

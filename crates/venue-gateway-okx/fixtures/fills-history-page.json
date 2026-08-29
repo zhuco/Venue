@@ -15,7 +15,9 @@
       "subType": "3",
       "feeCcy": "usdt",
       "fee": "-0.25",
-      "ts": "1787911201500"
+      "ts": "1787911201500",
+      "fillTime": "1787911201400",
+      "execType": "M"
     },
     {
       "instType": "SWAP",
@@ -30,7 +32,9 @@
       "subType": "3",
       "feeCcy": "usdt",
       "fee": "-0.13",
-      "ts": "1787911201600"
+      "ts": "1787911201600",
+      "fillTime": "1787911201300",
+      "execType": "T"
     }
   ]
 }

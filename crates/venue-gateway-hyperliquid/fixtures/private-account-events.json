@@ -35,7 +35,8 @@
           "cloid": "0x00000000000000000000000000000001",
           "fee": "1.25",
           "tid": 5001,
-          "feeToken": "USDC"
+          "feeToken": "USDC",
+          "crossed": false
         }
       ]
     }
