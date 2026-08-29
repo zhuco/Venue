@@ -1,6 +1,8 @@
 use rust_decimal::Decimal;
 use serde_json::Value;
-use venue_domain::domain::{FieldState, Order, OrderSide, OrderState, PositionSide, Price};
+use venue_domain::domain::{
+    ExecutionCommand, FieldState, Order, OrderSide, OrderState, PositionSide, Price,
+};
 use venue_gateway_api::GatewayBinding;
 
 use crate::readback::{
@@ -268,6 +270,56 @@ pub fn prepare_reduce_once(
     )
 }
 
+/// Translates the account-node's canonical command without weakening either command validation or
+/// the adapter's same-generation mutation checks. Unsupported native families and opening market
+/// orders stay closed until their exact Binance surfaces are represented by this adapter.
+pub fn prepare_execution_command(
+    rules: &BinanceInstrumentRules,
+    readback: &BinancePrivateReadbackCandidate,
+    command: &ExecutionCommand,
+) -> Result<BinancePreparedMutation, BinanceExecutionError> {
+    command
+        .validate()
+        .map_err(|_| BinanceExecutionError::Intent)?;
+    match command {
+        ExecutionCommand::PlaceLimit(command) => prepare_place_limit(
+            rules,
+            readback,
+            &BinancePlaceIntent {
+                client_order_id: command.client_order_id.as_str().to_owned(),
+                side: command.side,
+                position_side: command.position_side,
+                quantity: command.quantity,
+                limit_price: command.limit_price,
+                time_in_force: BinanceTimeInForce::PostOnly,
+                reduce_only: command.reduce_only,
+            },
+        ),
+        ExecutionCommand::MarketReduce(command) => prepare_reduce_once(
+            rules,
+            readback,
+            &BinanceReduceOnceIntent {
+                client_order_id: command.client_order_id.as_str().to_owned(),
+                position_side: command.position_side,
+                quantity: command.quantity,
+                private_generation: command.position_generation,
+            },
+        ),
+        ExecutionCommand::Cancel(command) => prepare_cancel(
+            rules,
+            readback,
+            &BinanceCancelIntent {
+                client_order_id: command.target_client_order_id.as_str().to_owned(),
+            },
+        ),
+        ExecutionCommand::PlaceMarket(_)
+        | ExecutionCommand::StopMarketCloseAll(_)
+        | ExecutionCommand::StopMarketFullPosition(_) => {
+            Err(BinanceExecutionError::UnsupportedCommand)
+        }
+    }
+}
+
 fn prepared(
     rules: &BinanceInstrumentRules,
     readback: &BinancePrivateReadbackCandidate,
@@ -530,6 +582,8 @@ pub enum BinanceExecutionError {
     VenueRejected,
     #[error("Binance ACK did not settle through an exact signed readback")]
     Readback,
+    #[error("canonical command has no closed Binance physical mutation surface")]
+    UnsupportedCommand,
 }
 
 impl From<BinanceReadbackError> for BinanceExecutionError {
