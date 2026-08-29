@@ -1,0 +1,24 @@
+{
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+    "list": [{
+      "accountType": "UNIFIED",
+      "totalEquity": "1000",
+      "totalWalletBalance": "980",
+      "totalAvailableBalance": "900",
+      "totalInitialMargin": "70",
+      "totalMaintenanceMargin": "10",
+      "coin": [{
+        "coin": "USDT",
+        "equity": "1000",
+        "walletBalance": "980",
+        "locked": "10",
+        "borrowAmount": "0",
+        "totalPositionIM": "70",
+        "totalPositionMM": "10"
+      }]
+    }]
+  },
+  "time": 2000
+}

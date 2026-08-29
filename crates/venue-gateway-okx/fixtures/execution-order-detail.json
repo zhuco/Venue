@@ -1,0 +1,21 @@
+{
+  "code": "0",
+  "msg": "",
+  "data": [{
+    "instType": "SWAP",
+    "instId": "BTC-USDT-SWAP",
+    "tdMode": "cross",
+    "ordType": "limit",
+    "ordId": "7003",
+    "clOrdId": "00000000000000000000000000000003",
+    "side": "sell",
+    "posSide": "long",
+    "sz": "2",
+    "accFillSz": "0",
+    "px": "60000",
+    "avgPx": "",
+    "reduceOnly": "false",
+    "state": "canceled",
+    "uTime": "1787911200500"
+  }]
+}

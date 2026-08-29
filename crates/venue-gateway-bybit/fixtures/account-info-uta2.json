@@ -1,0 +1,10 @@
+{
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+    "marginMode": "REGULAR_MARGIN",
+    "unifiedMarginStatus": 5,
+    "updatedTime": "2000"
+  },
+  "time": 2000
+}

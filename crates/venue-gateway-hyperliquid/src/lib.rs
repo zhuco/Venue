@@ -15,10 +15,14 @@ pub use credentials::HyperliquidCredentials;
 pub use nonce::{NonceCheckpoint, prepare_next_nonce};
 pub use protocol::{
     HyperliquidAccountSnapshot, HyperliquidBbo, HyperliquidFill, HyperliquidFillCursor,
-    HyperliquidFillPage, HyperliquidFillQuery, HyperliquidOpenOrder, HyperliquidOpenOrdersSnapshot,
+    HyperliquidFillPage, HyperliquidFillQuery, HyperliquidInfoRequest, HyperliquidOpenOrder,
+    HyperliquidOpenOrdersSnapshot, HyperliquidOrderLookup, HyperliquidOrderStatus,
     HyperliquidPayloadScope, HyperliquidPerpMeta, HyperliquidUserFills,
-    parse_clearinghouse_snapshot, parse_l2_book_bbo, parse_open_orders_snapshot, parse_perp_meta,
-    parse_private_user_fills, parse_user_fills_page, parse_ws_bbo,
+    build_clearinghouse_state_request, build_l2_book_request, build_meta_request,
+    build_open_orders_request, build_order_status_request, build_user_fills_by_time_request,
+    parse_clearinghouse_snapshot, parse_l2_book_bbo, parse_open_orders_snapshot,
+    parse_order_status, parse_perp_meta, parse_private_user_fills, parse_user_fills_page,
+    parse_ws_bbo,
 };
 
 /// No account capability is advertised until authenticated readback, private stream,
@@ -57,6 +61,7 @@ mod tests {
     const CLEARINGHOUSE: &[u8] = include_bytes!("../fixtures/clearinghouse-state.json");
     const OPEN_ORDERS: &[u8] = include_bytes!("../fixtures/open-orders.json");
     const FILLS_PAGE: &[u8] = include_bytes!("../fixtures/fills-page.json");
+    const ORDER_STATUS: &[u8] = include_bytes!("../fixtures/order-status.json");
     const USER: &str = "0x0000000000000000000000000000000000000001";
     const AGENT: &str = "0x2222222222222222222222222222222222222222";
 
@@ -251,31 +256,27 @@ mod tests {
     #[test]
     fn fill_page_is_sorted_filtered_and_explicitly_closed() -> Result<(), Box<dyn std::error::Error>>
     {
-        let meta = meta(GatewayMode::Test)?;
+        let selected = meta(GatewayMode::Test)?;
         let first = parse_user_fills_page(
             FILLS_PAGE,
-            &meta,
-            &HyperliquidFillQuery {
-                begin_ms: 1_700_000_000_001,
-                end_ms: 1_700_000_000_002,
-                limit: 1,
-                after: None,
-            },
+            &selected,
+            &HyperliquidFillQuery::new(&selected, 1_700_000_000_001, 1_700_000_000_002, 1, None)?,
         )?;
         assert!(!first.complete);
         assert_eq!(first.fills.len(), 1);
         let cursor = first.next_cursor.ok_or("cursor missing")?;
-        assert_eq!(cursor.native_coin, "BTC");
-        assert_eq!(cursor.trade_id, 6001);
+        assert_eq!(cursor.page_coin(), "BTC");
+        assert_eq!(cursor.trade_id(), 6001);
         let second = parse_user_fills_page(
             FILLS_PAGE,
-            &meta,
-            &HyperliquidFillQuery {
-                begin_ms: 1_700_000_000_001,
-                end_ms: 1_700_000_000_002,
-                limit: 10,
-                after: Some(cursor),
-            },
+            &selected,
+            &HyperliquidFillQuery::new(
+                &selected,
+                1_700_000_000_001,
+                1_700_000_000_002,
+                10,
+                Some(cursor),
+            )?,
         )?;
         assert!(second.complete);
         assert_eq!(second.fills.len(), 1);
@@ -325,12 +326,7 @@ mod tests {
             parse_user_fills_page(
                 &serde_json::to_vec(&duplicate)?,
                 &meta,
-                &HyperliquidFillQuery {
-                    begin_ms: 1_700_000_000_001,
-                    end_ms: 1_700_000_000_002,
-                    limit: 10,
-                    after: None,
-                }
+                &HyperliquidFillQuery::new(&meta, 1_700_000_000_001, 1_700_000_000_002, 10, None,)?
             ),
             Err(HyperliquidError::Payload)
         );
@@ -342,6 +338,146 @@ mod tests {
             .remove("crossed");
         assert_eq!(
             parse_private_user_fills(&serde_json::to_vec(&events)?, &meta),
+            Err(HyperliquidError::Payload)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn info_request_bodies_are_exact_and_keep_test_live_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let test = meta(GatewayMode::Test)?;
+        let live = meta(GatewayMode::Live)?;
+        let meta_request = build_meta_request(test.scope.binding())?;
+        assert_eq!(meta_request.mode(), GatewayMode::Test);
+        assert_eq!(
+            meta_request.rest_origin(),
+            "https://api.hyperliquid-testnet.xyz"
+        );
+        assert_eq!(meta_request.endpoint(), "/info");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(meta_request.body())?,
+            serde_json::json!({"type":"meta"})
+        );
+        let live_book = build_l2_book_request(&live)?;
+        assert_eq!(live_book.mode(), GatewayMode::Live);
+        assert_eq!(live_book.rest_origin(), "https://api.hyperliquid.xyz");
+        assert_eq!(live_book.binding(), live.scope.binding());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(live_book.body())?,
+            serde_json::json!({"type":"l2Book","coin":"BTC"})
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                build_clearinghouse_state_request(&test)?.body()
+            )?,
+            serde_json::json!({"type":"clearinghouseState","user":USER})
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(build_open_orders_request(&test)?.body())?,
+            serde_json::json!({"type":"openOrders","user":USER})
+        );
+
+        let query =
+            HyperliquidFillQuery::new(&test, 1_700_000_000_001, 1_700_000_000_002, 1, None)?;
+        let request = build_user_fills_by_time_request(&query)?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(request.body())?,
+            serde_json::json!({
+                "type":"userFillsByTime",
+                "user":USER,
+                "startTime":1_700_000_000_001_u64,
+                "endTime":1_700_000_000_002_u64,
+                "aggregateByTime":false
+            })
+        );
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(request.body())?
+                .get("limit")
+                .is_none()
+        );
+        assert!(HyperliquidFillQuery::new(&test, 0, 1, 1, None).is_err());
+        assert!(HyperliquidFillQuery::new(&test, 2, 1, 1, None).is_err());
+        assert!(HyperliquidFillQuery::new(&test, 1, 2, 0, None).is_err());
+        assert!(HyperliquidFillQuery::new(&test, 1, 2, 2_001, None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn inclusive_fill_cursor_and_order_status_recovery_are_bound_and_strict()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let selected = meta(GatewayMode::Test)?;
+        let first = parse_user_fills_page(
+            FILLS_PAGE,
+            &selected,
+            &HyperliquidFillQuery::new(&selected, 1_700_000_000_001, 1_700_000_000_002, 1, None)?,
+        )?;
+        let cursor = first.next_cursor.ok_or("cursor missing")?;
+        let next = HyperliquidFillQuery::new(
+            &selected,
+            1_700_000_000_001,
+            1_700_000_000_002,
+            10,
+            Some(cursor.clone()),
+        )?;
+        let body: serde_json::Value =
+            serde_json::from_slice(build_user_fills_by_time_request(&next)?.body())?;
+        assert_eq!(body["startTime"], cursor.time_ms());
+        assert_eq!(
+            HyperliquidFillQuery::new(
+                &meta(GatewayMode::Live)?,
+                1_700_000_000_001,
+                1_700_000_000_002,
+                10,
+                Some(cursor)
+            ),
+            Err(HyperliquidError::Payload)
+        );
+
+        let lookup = HyperliquidOrderLookup::order_id(91_490_942)?;
+        let request = build_order_status_request(&selected, &lookup)?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(request.body())?,
+            serde_json::json!({"type":"orderStatus","user":USER,"oid":91_490_942_u64})
+        );
+        let cloid = HyperliquidOrderLookup::client_order_id("0x00000000000000000000000000000001")?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                build_order_status_request(&selected, &cloid)?.body()
+            )?,
+            serde_json::json!({
+                "type":"orderStatus",
+                "user":USER,
+                "oid":"0x00000000000000000000000000000001"
+            })
+        );
+        assert!(matches!(
+            parse_order_status(ORDER_STATUS, &selected, &cloid)?,
+            HyperliquidOrderStatus::Known { .. }
+        ));
+        assert!(matches!(
+            parse_order_status(ORDER_STATUS, &selected, &lookup)?,
+            HyperliquidOrderStatus::Known {
+                order_id: 91_490_942,
+                state: OrderState::Filled,
+                exchange_time_ms: 1_724_361_546_645,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_order_status(br#"{"status":"unknownOid"}"#, &selected, &lookup)?,
+            HyperliquidOrderStatus::Unknown { .. }
+        ));
+        assert_eq!(
+            parse_order_status(
+                ORDER_STATUS,
+                &selected,
+                &HyperliquidOrderLookup::order_id(91_490_943)?
+            ),
+            Err(HyperliquidError::Binding)
+        );
+        assert_eq!(
+            HyperliquidOrderLookup::client_order_id("0x1234"),
             Err(HyperliquidError::Payload)
         );
         Ok(())

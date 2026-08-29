@@ -1,0 +1,20 @@
+{
+  "status": "order",
+  "order": {
+    "order": {
+      "coin": "BTC",
+      "side": "A",
+      "limitPx": "2412.7",
+      "sz": "0.0",
+      "oid": 91490942,
+      "timestamp": 1724361546645,
+      "reduceOnly": true,
+      "orderType": "Market",
+      "origSz": "0.0076",
+      "tif": "FrontendMarket",
+      "cloid": "0x00000000000000000000000000000001"
+    },
+    "status": "filled",
+    "statusTimestamp": 1724361546645
+  }
+}

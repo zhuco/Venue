@@ -1,0 +1,14 @@
+{
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+    "category": "linear",
+    "nextPageCursor": "",
+    "list": [
+      {"symbol":"BTCUSDT","orderId":"20","orderLinkId":"MANAGED_CLIENT_ID","side":"Buy","positionIdx":1,"orderStatus":"Filled","qty":"1","cumExecQty":"1","price":"100","avgPrice":"100","reduceOnly":false,"createdTime":"800","updatedTime":"1000"},
+      {"symbol":"BTCUSDT","orderId":"21","orderLinkId":"foreign","side":"Buy","positionIdx":1,"orderStatus":"Filled","qty":"2","cumExecQty":"2","price":"101","avgPrice":"101","reduceOnly":true,"createdTime":"1200","updatedTime":"1500"},
+      {"symbol":"BTCUSDT","orderId":"22","orderLinkId":"foreign","side":"Sell","positionIdx":2,"orderStatus":"Filled","qty":"3","cumExecQty":"3","price":"102","avgPrice":"102","reduceOnly":false,"createdTime":"1600","updatedTime":"2000"}
+    ]
+  },
+  "time": 2000
+}

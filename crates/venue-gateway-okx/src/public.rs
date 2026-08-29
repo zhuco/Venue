@@ -50,6 +50,27 @@ impl OkxInstrument {
             .checked_mul(self.base_quantity_per_contract)
             .ok_or(OkxError::Payload)
     }
+
+    pub(crate) fn base_to_contracts(&self, quantity: Decimal) -> Result<Decimal, OkxError> {
+        if quantity < self.minimum_base_quantity
+            || quantity <= Decimal::ZERO
+            || quantity % self.instrument.quantity_step != Decimal::ZERO
+        {
+            return Err(OkxError::Precision);
+        }
+        let contracts = quantity
+            .checked_div(self.base_quantity_per_contract)
+            .ok_or(OkxError::Precision)?;
+        if contracts <= Decimal::ZERO
+            || contracts
+                .checked_mul(self.base_quantity_per_contract)
+                .filter(|round_trip| *round_trip == quantity)
+                .is_none()
+        {
+            return Err(OkxError::Precision);
+        }
+        Ok(contracts)
+    }
 }
 
 /// Parses the exact bound linear USDT perpetual from an OKX V5 instruments response.

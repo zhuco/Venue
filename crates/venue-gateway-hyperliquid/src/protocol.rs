@@ -8,10 +8,10 @@ use venue_domain::domain::{
 use venue_gateway_api::GatewayMode;
 
 use crate::{
-    HyperliquidError, HyperliquidReadBinding,
+    HyperliquidConfig, HyperliquidError, HyperliquidReadBinding, endpoints,
     models::{
         BboData, BookData, BookLevel, ClearinghouseState, EventEnvelope, OpenOrderRow,
-        PerpMetaResponse, UserFillRow, UserFillsData,
+        OrderStatusEnvelope, PerpMetaResponse, UserFillRow, UserFillsData,
     },
 };
 
@@ -102,28 +102,103 @@ pub struct HyperliquidUserFills {
     pub fills: Vec<HyperliquidFill>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HyperliquidFillCursor {
-    pub time_ms: u64,
-    pub native_coin: String,
-    pub trade_id: u64,
+    scope: HyperliquidPayloadScope,
+    time_ms: u64,
+    page_coin: String,
+    trade_id: u64,
+}
+
+impl HyperliquidFillCursor {
+    #[must_use]
+    pub const fn scope(&self) -> &HyperliquidPayloadScope {
+        &self.scope
+    }
+
+    #[must_use]
+    pub const fn time_ms(&self) -> u64 {
+        self.time_ms
+    }
+
+    #[must_use]
+    pub fn page_coin(&self) -> &str {
+        &self.page_coin
+    }
+
+    #[must_use]
+    pub const fn trade_id(&self) -> u64 {
+        self.trade_id
+    }
+
+    fn key(&self) -> (u64, &str, u64) {
+        (self.time_ms, &self.page_coin, self.trade_id)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HyperliquidFillQuery {
-    pub begin_ms: u64,
-    pub end_ms: u64,
-    pub limit: usize,
-    pub after: Option<HyperliquidFillCursor>,
+    scope: HyperliquidPayloadScope,
+    begin_ms: u64,
+    end_ms: u64,
+    limit: usize,
+    after: Option<HyperliquidFillCursor>,
 }
 
 impl HyperliquidFillQuery {
-    pub fn validate(&self) -> Result<(), HyperliquidError> {
+    pub fn new(
+        meta: &HyperliquidPerpMeta,
+        begin_ms: u64,
+        end_ms: u64,
+        limit: usize,
+        after: Option<HyperliquidFillCursor>,
+    ) -> Result<Self, HyperliquidError> {
+        let value = Self {
+            scope: meta.scope.clone(),
+            begin_ms,
+            end_ms,
+            limit,
+            after,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> &HyperliquidPayloadScope {
+        &self.scope
+    }
+
+    #[must_use]
+    pub const fn begin_ms(&self) -> u64 {
+        self.begin_ms
+    }
+
+    #[must_use]
+    pub const fn end_ms(&self) -> u64 {
+        self.end_ms
+    }
+
+    #[must_use]
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+
+    #[must_use]
+    pub const fn after(&self) -> Option<&HyperliquidFillCursor> {
+        self.after.as_ref()
+    }
+
+    fn validate(&self) -> Result<(), HyperliquidError> {
         if self.begin_ms == 0
             || self.end_ms < self.begin_ms
             || !(1..=MAX_FILL_PAGE).contains(&self.limit)
             || self.after.as_ref().is_some_and(|cursor| {
-                cursor.time_ms < self.begin_ms || cursor.time_ms > self.end_ms
+                cursor.scope != self.scope
+                    || cursor.page_coin.is_empty()
+                    || cursor.trade_id == 0
+                    || cursor.time_ms < self.begin_ms
+                    || cursor.time_ms > self.end_ms
             })
         {
             return Err(HyperliquidError::Payload);
@@ -133,12 +208,217 @@ impl HyperliquidFillQuery {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HyperliquidInfoRequest {
+    binding: HyperliquidReadBinding,
+    mode: GatewayMode,
+    rest_origin: &'static str,
+    body: Vec<u8>,
+}
+
+impl HyperliquidInfoRequest {
+    #[must_use]
+    pub const fn binding(&self) -> &HyperliquidReadBinding {
+        &self.binding
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> GatewayMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub const fn rest_origin(&self) -> &'static str {
+        self.rest_origin
+    }
+
+    #[must_use]
+    pub const fn endpoint(&self) -> &'static str {
+        endpoints::INFO
+    }
+
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HyperliquidOrderLookup {
+    OrderId(u64),
+    ClientOrderId(String),
+}
+
+impl HyperliquidOrderLookup {
+    pub fn order_id(value: u64) -> Result<Self, HyperliquidError> {
+        if value == 0 {
+            Err(HyperliquidError::Payload)
+        } else {
+            Ok(Self::OrderId(value))
+        }
+    }
+
+    pub fn client_order_id(value: impl Into<String>) -> Result<Self, HyperliquidError> {
+        let value = value.into();
+        let raw = value.strip_prefix("0x").ok_or(HyperliquidError::Payload)?;
+        if raw.len() != 32 || !raw.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+            return Err(HyperliquidError::Payload);
+        }
+        Ok(Self::ClientOrderId(format!(
+            "0x{}",
+            raw.to_ascii_lowercase()
+        )))
+    }
+
+    fn validate(&self) -> Result<(), HyperliquidError> {
+        match self {
+            Self::OrderId(value) => Self::order_id(*value).map(|_| ()),
+            Self::ClientOrderId(value) => Self::client_order_id(value.clone()).map(|_| ()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HyperliquidOrderStatus {
+    Unknown {
+        scope: HyperliquidPayloadScope,
+    },
+    Known {
+        scope: HyperliquidPayloadScope,
+        order_id: u64,
+        client_order_id: FieldState<String>,
+        state: OrderState,
+        exchange_time_ms: u64,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HyperliquidFillPage {
     pub scope: HyperliquidPayloadScope,
     pub fills: Vec<HyperliquidFill>,
     pub next_cursor: Option<HyperliquidFillCursor>,
     /// True only when the response was below the venue cap and the local limit did not truncate it.
     pub complete: bool,
+}
+
+pub fn build_meta_request(
+    binding: &HyperliquidReadBinding,
+) -> Result<HyperliquidInfoRequest, HyperliquidError> {
+    info_request(binding, serde_json::json!({"type": "meta"}))
+}
+
+pub fn build_l2_book_request(
+    meta: &HyperliquidPerpMeta,
+) -> Result<HyperliquidInfoRequest, HyperliquidError> {
+    info_request(
+        meta.scope.binding(),
+        serde_json::json!({"type": "l2Book", "coin": meta.scope.native_coin()}),
+    )
+}
+
+pub fn build_clearinghouse_state_request(
+    meta: &HyperliquidPerpMeta,
+) -> Result<HyperliquidInfoRequest, HyperliquidError> {
+    bound_user_request("clearinghouseState", &meta.scope)
+}
+
+pub fn build_open_orders_request(
+    meta: &HyperliquidPerpMeta,
+) -> Result<HyperliquidInfoRequest, HyperliquidError> {
+    bound_user_request("openOrders", &meta.scope)
+}
+
+pub fn build_user_fills_by_time_request(
+    query: &HyperliquidFillQuery,
+) -> Result<HyperliquidInfoRequest, HyperliquidError> {
+    query.validate()?;
+    let start_time = query
+        .after
+        .as_ref()
+        .map_or(query.begin_ms, |cursor| cursor.time_ms);
+    info_request(
+        query.scope.binding(),
+        serde_json::json!({
+            "type": "userFillsByTime",
+            "user": query.scope.user_address(),
+            "startTime": start_time,
+            "endTime": query.end_ms,
+            "aggregateByTime": false,
+        }),
+    )
+}
+
+pub fn build_order_status_request(
+    meta: &HyperliquidPerpMeta,
+    lookup: &HyperliquidOrderLookup,
+) -> Result<HyperliquidInfoRequest, HyperliquidError> {
+    lookup.validate()?;
+    let oid = match lookup {
+        HyperliquidOrderLookup::OrderId(value) if *value > 0 => serde_json::Value::from(*value),
+        HyperliquidOrderLookup::ClientOrderId(value) => {
+            HyperliquidOrderLookup::client_order_id(value.clone())?;
+            serde_json::Value::String(value.clone())
+        }
+        HyperliquidOrderLookup::OrderId(_) => return Err(HyperliquidError::Payload),
+    };
+    info_request(
+        meta.scope.binding(),
+        serde_json::json!({
+            "type": "orderStatus",
+            "user": meta.scope.user_address(),
+            "oid": oid,
+        }),
+    )
+}
+
+pub fn parse_order_status(
+    payload: &[u8],
+    meta: &HyperliquidPerpMeta,
+    lookup: &HyperliquidOrderLookup,
+) -> Result<HyperliquidOrderStatus, HyperliquidError> {
+    lookup.validate()?;
+    let envelope: OrderStatusEnvelope =
+        serde_json::from_slice(payload).map_err(|_| HyperliquidError::Payload)?;
+    match (envelope.status.as_str(), envelope.order) {
+        ("unknownOid", None) => Ok(HyperliquidOrderStatus::Unknown {
+            scope: meta.scope.clone(),
+        }),
+        ("order", Some(body)) => {
+            if body.order.coin != meta.scope.native_coin {
+                return Err(HyperliquidError::Binding);
+            }
+            if body.status_timestamp == 0 || body.order.oid == 0 {
+                return Err(HyperliquidError::Payload);
+            }
+            match lookup {
+                HyperliquidOrderLookup::OrderId(expected) if body.order.oid != *expected => {
+                    return Err(HyperliquidError::Binding);
+                }
+                HyperliquidOrderLookup::ClientOrderId(expected)
+                    if body
+                        .order
+                        .cloid
+                        .as_deref()
+                        .is_none_or(|actual| !actual.eq_ignore_ascii_case(expected)) =>
+                {
+                    return Err(HyperliquidError::Binding);
+                }
+                HyperliquidOrderLookup::OrderId(_) | HyperliquidOrderLookup::ClientOrderId(_) => {}
+            }
+            Ok(HyperliquidOrderStatus::Known {
+                scope: meta.scope.clone(),
+                order_id: body.order.oid,
+                client_order_id: body
+                    .order
+                    .cloid
+                    .filter(|value| !value.is_empty())
+                    .map(FieldState::Known)
+                    .unwrap_or(FieldState::Missing),
+                state: normalized_order_status(&body.status)?,
+                exchange_time_ms: body.status_timestamp,
+            })
+        }
+        _ => Err(HyperliquidError::Payload),
+    }
 }
 
 pub fn parse_perp_meta(
@@ -322,6 +602,9 @@ pub fn parse_user_fills_page(
     query: &HyperliquidFillQuery,
 ) -> Result<HyperliquidFillPage, HyperliquidError> {
     query.validate()?;
+    if query.scope != meta.scope {
+        return Err(HyperliquidError::Binding);
+    }
     let rows: Vec<UserFillRow> =
         serde_json::from_slice(payload).map_err(|_| HyperliquidError::Payload)?;
     if rows.len() > MAX_FILL_PAGE {
@@ -334,21 +617,26 @@ pub fn parse_user_fills_page(
             if row.time < query.begin_ms || row.time > query.end_ms {
                 return Err(HyperliquidError::Payload);
             }
-            let cursor = fill_cursor(&row)?;
+            let cursor = fill_cursor(&row, &meta.scope)?;
             Ok((cursor, row))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    rows.sort_by(|left, right| left.0.cmp(&right.0));
-    if rows.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+    rows.sort_by(|left, right| left.0.key().cmp(&right.0.key()));
+    if rows
+        .windows(2)
+        .any(|pair| pair[0].0.key() == pair[1].0.key())
+    {
         return Err(HyperliquidError::Payload);
     }
     let mut fills = Vec::new();
     let mut last_consumed = None;
     let mut truncated = false;
-    for (cursor, row) in rows
-        .into_iter()
-        .filter(|(cursor, _)| query.after.as_ref().is_none_or(|after| cursor > after))
-    {
+    for (cursor, row) in rows.into_iter().filter(|(cursor, _)| {
+        query
+            .after
+            .as_ref()
+            .is_none_or(|after| cursor.key() > after.key())
+    }) {
         last_consumed = Some(cursor.clone());
         if row.coin != meta.scope.native_coin {
             continue;
@@ -518,13 +806,17 @@ fn normalize_fill(
     })
 }
 
-fn fill_cursor(row: &UserFillRow) -> Result<HyperliquidFillCursor, HyperliquidError> {
+fn fill_cursor(
+    row: &UserFillRow,
+    scope: &HyperliquidPayloadScope,
+) -> Result<HyperliquidFillCursor, HyperliquidError> {
     if row.coin.is_empty() || row.time == 0 || row.tid == 0 {
         return Err(HyperliquidError::Payload);
     }
     Ok(HyperliquidFillCursor {
+        scope: scope.clone(),
         time_ms: row.time,
-        native_coin: row.coin.clone(),
+        page_coin: row.coin.clone(),
         trade_id: row.tid,
     })
 }
@@ -594,4 +886,61 @@ fn side(value: &str) -> Result<OrderSide, HyperliquidError> {
 
 fn decimal(value: &str) -> Result<Decimal, HyperliquidError> {
     Decimal::from_str(value).map_err(|_| HyperliquidError::Payload)
+}
+
+fn bound_user_request(
+    kind: &str,
+    scope: &HyperliquidPayloadScope,
+) -> Result<HyperliquidInfoRequest, HyperliquidError> {
+    info_request(
+        scope.binding(),
+        serde_json::json!({"type": kind, "user": scope.user_address()}),
+    )
+}
+
+fn info_request(
+    binding: &HyperliquidReadBinding,
+    body: serde_json::Value,
+) -> Result<HyperliquidInfoRequest, HyperliquidError> {
+    let config = HyperliquidConfig::for_binding(binding.gateway());
+    Ok(HyperliquidInfoRequest {
+        binding: binding.clone(),
+        mode: config.mode(),
+        rest_origin: config.rest_origin(),
+        body: serde_json::to_vec(&body).map_err(|_| HyperliquidError::Payload)?,
+    })
+}
+
+fn normalized_order_status(value: &str) -> Result<OrderState, HyperliquidError> {
+    match value {
+        "open" | "triggered" => Ok(OrderState::New),
+        "filled" => Ok(OrderState::Filled),
+        "canceled"
+        | "marginCanceled"
+        | "vaultWithdrawalCanceled"
+        | "openInterestCapCanceled"
+        | "selfTradeCanceled"
+        | "reduceOnlyCanceled"
+        | "siblingFilledCanceled"
+        | "delistedCanceled"
+        | "liquidatedCanceled"
+        | "scheduledCancel" => Ok(OrderState::Cancelled),
+        "rejected"
+        | "tickRejected"
+        | "minTradeNtlRejected"
+        | "perpMarginRejected"
+        | "reduceOnlyRejected"
+        | "badAloPxRejected"
+        | "iocCancelRejected"
+        | "badTriggerPxRejected"
+        | "marketOrderNoLiquidityRejected"
+        | "positionIncreaseAtOpenInterestCapRejected"
+        | "positionFlipAtOpenInterestCapRejected"
+        | "tooAggressiveAtOpenInterestCapRejected"
+        | "openInterestIncreaseRejected"
+        | "insufficientSpotBalanceRejected"
+        | "oracleRejected"
+        | "perpMaxPositionRejected" => Ok(OrderState::Rejected),
+        _ => Err(HyperliquidError::Payload),
+    }
 }

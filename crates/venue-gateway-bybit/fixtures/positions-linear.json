@@ -1,0 +1,13 @@
+{
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+    "category": "linear",
+    "nextPageCursor": "",
+    "list": [
+      {"symbol":"BTCUSDT","side":"Buy","size":"1.25","avgPrice":"60000","markPrice":"60100","liqPrice":"40000","unrealisedPnl":"125","positionIdx":1,"updatedTime":"1900","seq":"90"},
+      {"symbol":"BTCUSDT","side":"Sell","size":"0.5","avgPrice":"61000","markPrice":"60100","liqPrice":"80000","unrealisedPnl":"450","positionIdx":2,"updatedTime":"1950","seq":"91"}
+    ]
+  },
+  "time": 2000
+}

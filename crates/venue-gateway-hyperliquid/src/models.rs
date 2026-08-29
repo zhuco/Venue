@@ -112,3 +112,24 @@ pub(crate) struct OpenOrderRow {
     pub timestamp: u64,
     pub cloid: Option<String>,
 }
+
+#[derive(Deserialize)]
+pub(crate) struct OrderStatusEnvelope {
+    pub status: String,
+    pub order: Option<OrderStatusBody>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OrderStatusBody {
+    pub order: OrderStatusOrder,
+    pub status: String,
+    pub status_timestamp: u64,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct OrderStatusOrder {
+    pub coin: String,
+    pub oid: u64,
+    pub cloid: Option<String>,
+}

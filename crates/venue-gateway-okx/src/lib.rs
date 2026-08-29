@@ -1,6 +1,7 @@
 mod binding;
 mod config;
 mod credentials;
+mod execution;
 mod models;
 mod private;
 mod public;
@@ -12,6 +13,12 @@ use venue_gateway_api::CapabilityFlags;
 pub use binding::{OkxGatewayBinding, OkxGatewayBindingError};
 pub use config::{OkxConfig, endpoints};
 pub use credentials::OkxCredentials;
+pub use execution::{
+    OkxAcceptedCancel, OkxAcceptedOrder, OkxCancelRequest, OkxExecutionScope,
+    OkxOrderReadbackRequest, OkxPlaceIntent, OkxPlaceRequest, OkxPrivateRequest, OkxTradeMode,
+    build_cancel_request, build_order_readback_request, build_place_request, parse_cancel_ack,
+    parse_order_detail, parse_place_ack,
+};
 pub use private::{
     OkxAccountLevel, OkxAccountProfile, OkxPage, OkxPageState, OkxTimedBalance, OkxTimedOrder,
     OkxTimedPosition, parse_account_profile, parse_balance, parse_fills_page, parse_orders_page,
@@ -57,6 +64,10 @@ pub enum OkxError {
     Sequence,
     #[error("OKX pagination cursor is invalid or the page is not closed")]
     Pagination,
+    #[error("OKX quantity or price cannot be represented exactly by the bound instrument")]
+    Precision,
+    #[error("OKX mutation or readback identity is invalid or ambiguous")]
+    Identity,
 }
 
 #[cfg(test)]
