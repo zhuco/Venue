@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+use hmac::{Hmac, Mac};
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use venue_domain::domain::NativeOrderFamily;
@@ -308,6 +310,7 @@ pub struct BybitCapabilityProbeEvidence {
     raw_payloads: Vec<BybitRawPrivatePayload>,
     flags: CapabilityFlags,
     evidence_sha256: String,
+    evidence_hmac_sha256: String,
 }
 
 impl BybitCapabilityProbeEvidence {
@@ -359,6 +362,7 @@ impl BybitCapabilityProbeEvidence {
             || self.scope.generation == 0
             || self.flags != EXECUTABLE_FLAGS
             || self.evidence_sha256 != self.compute_digest()?
+            || !self.verify_hmac(credentials)?
         {
             return Err(BybitError::Capability);
         }
@@ -408,6 +412,10 @@ impl BybitCapabilityProbeEvidence {
     }
 
     fn compute_digest(&self) -> Result<String, BybitError> {
+        Ok(sha256_hex(&self.unsigned_bytes()?))
+    }
+
+    fn unsigned_bytes(&self) -> Result<Vec<u8>, BybitError> {
         #[derive(Serialize)]
         struct Unsigned<'a> {
             schema_version: u16,
@@ -416,15 +424,36 @@ impl BybitCapabilityProbeEvidence {
             raw_payloads: &'a [BybitRawPrivatePayload],
             flags: CapabilityFlags,
         }
-        let bytes = serde_json::to_vec(&Unsigned {
+        serde_json::to_vec(&Unsigned {
             schema_version: self.schema_version,
             scope: &self.scope,
             private_stream: &self.private_stream,
             raw_payloads: &self.raw_payloads,
             flags: self.flags,
         })
-        .map_err(|_| BybitError::Capability)?;
-        Ok(sha256_hex(&bytes))
+        .map_err(|_| BybitError::Capability)
+    }
+
+    fn compute_hmac(&self, credentials: &BybitCredentials) -> Result<String, BybitError> {
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(credentials.api_secret.expose_secret().as_bytes())
+                .map_err(|_| BybitError::Capability)?;
+        mac.update(&self.unsigned_bytes()?);
+        Ok(mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
+
+    fn verify_hmac(&self, credentials: &BybitCredentials) -> Result<bool, BybitError> {
+        let tag = decode_sha256(&self.evidence_hmac_sha256)?;
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(credentials.api_secret.expose_secret().as_bytes())
+                .map_err(|_| BybitError::Capability)?;
+        mac.update(&self.unsigned_bytes()?);
+        Ok(mac.verify_slice(&tag).is_ok())
     }
 }
 
@@ -442,8 +471,10 @@ pub fn finalize_capability_probe(
         raw_payloads,
         flags: EXECUTABLE_FLAGS,
         evidence_sha256: String::new(),
+        evidence_hmac_sha256: String::new(),
     };
     evidence.evidence_sha256 = evidence.compute_digest()?;
+    evidence.evidence_hmac_sha256 = evidence.compute_hmac(credentials)?;
     let binding = BybitGatewayBinding::new(evidence.scope.binding.clone())?;
     let snapshot = evidence.verify(&binding, credentials, validated_at_ms)?;
     Ok((evidence, snapshot))
@@ -814,4 +845,17 @@ fn is_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn decode_sha256(value: &str) -> Result<[u8; 32], BybitError> {
+    if !is_sha256(value) {
+        return Err(BybitError::Capability);
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, byte) in decoded.iter_mut().enumerate() {
+        let start = index.checked_mul(2).ok_or(BybitError::Capability)?;
+        let end = start.checked_add(2).ok_or(BybitError::Capability)?;
+        *byte = u8::from_str_radix(&value[start..end], 16).map_err(|_| BybitError::Capability)?;
+    }
+    Ok(decoded)
 }

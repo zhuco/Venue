@@ -660,6 +660,11 @@ fn fresh_complete_probe_is_persistable_for_test_and_live_only() -> Result<(), Te
             BybitCapabilityProbeEvidence::from_json_verified(&json, &gateway, &credentials, 2_500)?;
         assert_eq!(loaded, evidence);
         assert_eq!(loaded_snapshot, snapshot);
+        let wrong_secret = BybitCredentials::from_values("test", "different-secret")?;
+        assert_eq!(
+            BybitCapabilityProbeEvidence::from_json_verified(&json, &gateway, &wrong_secret, 2_500,),
+            Err(BybitError::Capability)
+        );
         assert_eq!(
             evidence.verify(&gateway, &credentials, 3_000),
             Err(BybitError::Capability)
