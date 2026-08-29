@@ -3,34 +3,46 @@ use std::{
     process::ExitCode,
 };
 
+#[cfg(test)]
 use serde::Serialize;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use venue_gateway_api::{CapabilityFlags, CapabilitySnapshot, GatewayBinding, VenueId};
+#[cfg(test)]
 use venue_gateway_bybit::{
-    BybitCapabilityCandidate, BybitCompleteOrderFamilyEvidence, BybitError, BybitGatewayBinding,
+    BybitCapabilityCandidate, BybitCompleteOrderFamilyEvidence, BybitError,
     BybitOrderFamilyEvidence, BybitPositionPage, BybitPrivateSource,
-    BybitPrivateStreamProbeEvidence, BybitRawPrivatePayload, BybitSynchronousPhysicalSession,
-    capabilities, complete_account_readback, complete_position_pages, parse_position_page,
-    validate_capability_candidate, validate_order_family_candidate,
+    BybitPrivateStreamProbeEvidence, BybitRawPrivatePayload, complete_account_readback,
+    complete_position_pages, parse_position_page, validate_capability_candidate,
+    validate_order_family_candidate,
 };
+use venue_gateway_bybit::{BybitGatewayBinding, BybitSynchronousPhysicalSession, capabilities};
 use venue_node::{
     AdapterIsolation, DispatchPermit, GatewayDispatchResult, GatewayRecoveryPermit, NodeError,
     NodeLaunch, PhysicalGateway, SignedReadbackReceipt, SignedReadbackRequest,
     reject_unintegrated_runtime, report_result,
 };
+#[cfg(test)]
 use venue_runtime::account::{
     PhysicalReadbackReceipt, PhysicalReadbackSurface, PhysicalRecoveryManifestError,
-    PhysicalRecoveryReadbackManifest, PhysicalRecoveryScope,
 };
+use venue_runtime::account::{PhysicalRecoveryReadbackManifest, PhysicalRecoveryScope};
 
 const PROGRAM: &str = "venue-node-bybit";
 const PROBE_FILE: &str = "bybit_capability_probe.json";
 const INSTRUMENT_FILE: &str = "bybit_linear_instrument.json";
 
-/// Maps already verified Bybit REST and private-stream candidates into the shared in-memory
-/// recovery manifest. This does not consume the persisted HMAC probe, advertise capability, open
-/// credentials, write an artifact, or grant writer/dispatch authority.
+/// The fixed node cannot issue a production manifest until the adapter exposes an opaque fresh-turn
+/// authority that proves API-key replay, private-stream authentication/freshness, and one complete
+/// same-attempt REST collection. Persisted probes and caller-constructed candidates stay inert.
 pub fn map_bybit_physical_recovery_manifest(
+    _scope: PhysicalRecoveryScope,
+) -> Result<PhysicalRecoveryReadbackManifest, BybitRecoveryManifestMappingError> {
+    Err(BybitRecoveryManifestMappingError::FreshTurnAuthorityUnavailable)
+}
+
+#[cfg(test)]
+fn map_bybit_physical_recovery_fixture_manifest(
     scope: PhysicalRecoveryScope,
     candidate: &BybitCapabilityCandidate,
     private_stream: &BybitPrivateStreamProbeEvidence,
@@ -184,6 +196,7 @@ pub fn map_bybit_physical_recovery_manifest(
         .map_err(BybitRecoveryManifestMappingError::Manifest)
 }
 
+#[cfg(test)]
 fn exact_raw_payload(
     payloads: &[BybitRawPrivatePayload],
     source: BybitPrivateSource,
@@ -202,6 +215,7 @@ fn exact_raw_payload(
     Ok(payload)
 }
 
+#[cfg(test)]
 fn complete_order_family_receipt(
     scope: &PhysicalRecoveryScope,
     surface: PhysicalReadbackSurface,
@@ -231,6 +245,7 @@ fn complete_order_family_receipt(
     )
 }
 
+#[cfg(test)]
 fn complete_receipt(
     scope: &PhysicalRecoveryScope,
     surface: PhysicalReadbackSurface,
@@ -250,6 +265,7 @@ fn complete_receipt(
     .map_err(BybitRecoveryManifestMappingError::Manifest)
 }
 
+#[cfg(test)]
 fn evidence_digest<T: Serialize>(
     domain: &[u8],
     private_stream: &[u8],
@@ -274,16 +290,19 @@ fn evidence_digest<T: Serialize>(
     Ok(digest.finalize().into())
 }
 
+#[cfg(test)]
 fn record_count(value: usize) -> Result<u64, BybitRecoveryManifestMappingError> {
     u64::try_from(value).map_err(|_| BybitRecoveryManifestMappingError::RecordCount)
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 struct BybitCompleteFamilyCommitment<'a> {
     open_orders: &'a [BybitRawPrivatePayload],
     order_history: &'a [BybitRawPrivatePayload],
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 struct BybitUnsupportedFamilyCommitment<'a> {
     binding: &'a GatewayBinding,
@@ -293,14 +312,21 @@ struct BybitUnsupportedFamilyCommitment<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum BybitRecoveryManifestMappingError {
+    #[error("Bybit production recovery manifest requires opaque fresh-turn authority")]
+    FreshTurnAuthorityUnavailable,
+    #[cfg(test)]
     #[error("Bybit recovery candidate failed signed evidence replay: {0}")]
     Candidate(BybitError),
+    #[cfg(test)]
     #[error("Bybit recovery candidate does not match the recovered/private-stream scope")]
     Scope,
+    #[cfg(test)]
     #[error("Bybit recovery evidence cannot be encoded canonically")]
     EvidenceEncoding,
+    #[cfg(test)]
     #[error("Bybit recovery evidence record count exceeds the manifest representation")]
     RecordCount,
+    #[cfg(test)]
     #[error("Bybit recovery manifest is incomplete or stale: {0}")]
     Manifest(PhysicalRecoveryManifestError),
 }
@@ -690,11 +716,35 @@ mod tests {
     }
 
     #[test]
+    fn production_manifest_rejects_deserialized_generation_relabeling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (binding, old_candidate) = recovery_candidate(GatewayMode::Live)?;
+        let old_stream = private_stream(binding.gateway_binding(), 7)?;
+        let mut relabeled_stream = serde_json::to_value(old_stream)?;
+        relabeled_stream["connection_generation"] = serde_json::json!(8);
+        relabeled_stream["private_generation"] = serde_json::json!(8);
+        let relabeled_stream: BybitPrivateStreamProbeEvidence =
+            serde_json::from_value(relabeled_stream)?;
+
+        assert_eq!(old_candidate.scope.generation, 7);
+        assert_eq!(relabeled_stream.generation(), 8);
+        assert_eq!(
+            map_bybit_physical_recovery_manifest(recovery_scope(
+                binding.gateway_binding().clone(),
+                7,
+            )?),
+            Err(BybitRecoveryManifestMappingError::FreshTurnAuthorityUnavailable)
+        );
+        assert_eq!(capabilities(), CapabilityFlags::empty());
+        Ok(())
+    }
+
+    #[test]
     fn complete_same_attempt_new_generation_maps_all_six_faces_without_capability()
     -> Result<(), Box<dyn std::error::Error>> {
         let (binding, candidate) = recovery_candidate(GatewayMode::Test)?;
         let stream = private_stream(binding.gateway_binding(), 7)?;
-        let manifest = map_bybit_physical_recovery_manifest(
+        let manifest = map_bybit_physical_recovery_fixture_manifest(
             recovery_scope(binding.gateway_binding().clone(), 6)?,
             &candidate,
             &stream,
@@ -768,7 +818,7 @@ mod tests {
         let mut missing_page = candidate.clone();
         missing_page.positions.raw_pages.clear();
         assert!(matches!(
-            map_bybit_physical_recovery_manifest(
+            map_bybit_physical_recovery_fixture_manifest(
                 recovery_scope(binding.gateway_binding().clone(), 6)?,
                 &missing_page,
                 &stream,
@@ -780,7 +830,7 @@ mod tests {
         let mut cross_attempt = candidate.clone();
         cross_attempt.fills.attempt_id = 12;
         assert!(matches!(
-            map_bybit_physical_recovery_manifest(
+            map_bybit_physical_recovery_fixture_manifest(
                 recovery_scope(binding.gateway_binding().clone(), 6)?,
                 &cross_attempt,
                 &stream,
@@ -789,7 +839,7 @@ mod tests {
             Err(BybitRecoveryManifestMappingError::Candidate(_))
         ));
         assert!(matches!(
-            map_bybit_physical_recovery_manifest(
+            map_bybit_physical_recovery_fixture_manifest(
                 recovery_scope(binding.gateway_binding().clone(), 7)?,
                 &candidate,
                 &stream,
@@ -800,7 +850,7 @@ mod tests {
             ))
         ));
         assert_eq!(
-            map_bybit_physical_recovery_manifest(
+            map_bybit_physical_recovery_fixture_manifest(
                 recovery_scope(binding.gateway_binding().clone(), 6)?,
                 &candidate,
                 &private_stream(binding.gateway_binding(), 8)?,
