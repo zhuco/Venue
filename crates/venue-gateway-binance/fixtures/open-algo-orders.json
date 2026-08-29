@@ -1,0 +1,1 @@
+[{"symbol":"BTCUSDT","algoId":201,"clientAlgoId":"venue_algo_1","algoStatus":"NEW","orderType":"STOP_MARKET","side":"SELL","positionSide":"LONG","quantity":"0.010","triggerPrice":"49000","workingType":"MARK_PRICE","closePosition":false,"reduceOnly":true}]

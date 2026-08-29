@@ -1,0 +1,745 @@
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use bytes::{Bytes, BytesMut};
+use secrecy::ExposeSecret;
+use tokio::time::timeout;
+
+use crate::execution::{
+    BinanceExactOrderReadback, BinanceMutationAck, BinancePreparedMutation,
+    parse_exact_order_readback, parse_mutation_ack,
+};
+use crate::readback::{BinancePrivateReadRequest, BinancePrivateReadScope, BinanceRawPrivatePage};
+use crate::{
+    BinanceConfig, BinanceCredentials, BinanceHttpMethod, BinanceRestSignInput,
+    SignedBinanceRestRequest, endpoints, sign_rest,
+};
+
+const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_TRANSPORT_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BinanceTransportLimits {
+    operation_timeout: Duration,
+    maximum_body_bytes: usize,
+}
+
+impl BinanceTransportLimits {
+    pub fn new(
+        operation_timeout: Duration,
+        maximum_body_bytes: usize,
+    ) -> Result<Self, BinanceTransportError> {
+        if operation_timeout.is_zero()
+            || operation_timeout > MAX_OPERATION_TIMEOUT
+            || maximum_body_bytes == 0
+            || maximum_body_bytes > MAX_TRANSPORT_BYTES
+        {
+            return Err(BinanceTransportError::Limits);
+        }
+        Ok(Self {
+            operation_timeout,
+            maximum_body_bytes,
+        })
+    }
+
+    #[must_use]
+    pub const fn operation_timeout(self) -> Duration {
+        self.operation_timeout
+    }
+
+    #[must_use]
+    pub const fn maximum_body_bytes(self) -> usize {
+        self.maximum_body_bytes
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceHttpResponse {
+    pub requested_at_ms: u64,
+    pub received_at_ms: u64,
+    pub status: u16,
+    pub payload: Bytes,
+}
+
+pub struct BinanceHttpTransport {
+    client: reqwest::Client,
+    config: BinanceConfig,
+    instrument_generation: u64,
+    private_generation: u64,
+    endpoint: String,
+    limits: BinanceTransportLimits,
+}
+
+impl BinanceHttpTransport {
+    pub fn new(
+        config: BinanceConfig,
+        instrument_generation: u64,
+        private_generation: u64,
+        limits: BinanceTransportLimits,
+    ) -> Result<Self, BinanceTransportError> {
+        let endpoint = config.portfolio_rest_origin().to_owned();
+        Self::build(
+            config,
+            instrument_generation,
+            private_generation,
+            endpoint,
+            limits,
+            true,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_endpoint(
+        config: BinanceConfig,
+        instrument_generation: u64,
+        private_generation: u64,
+        endpoint: String,
+        limits: BinanceTransportLimits,
+    ) -> Result<Self, BinanceTransportError> {
+        Self::build(
+            config,
+            instrument_generation,
+            private_generation,
+            endpoint,
+            limits,
+            false,
+        )
+    }
+
+    fn build(
+        config: BinanceConfig,
+        instrument_generation: u64,
+        private_generation: u64,
+        endpoint: String,
+        limits: BinanceTransportLimits,
+        require_fixed_endpoint: bool,
+    ) -> Result<Self, BinanceTransportError> {
+        if instrument_generation == 0
+            || private_generation == 0
+            || endpoint.is_empty()
+            || require_fixed_endpoint && endpoint != config.portfolio_rest_origin()
+        {
+            return Err(BinanceTransportError::Binding);
+        }
+        let client = reqwest::Client::builder()
+            .connect_timeout(limits.operation_timeout)
+            .timeout(limits.operation_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .map_err(|_| BinanceTransportError::Http)?;
+        Ok(Self {
+            client,
+            config,
+            instrument_generation,
+            private_generation,
+            endpoint,
+            limits,
+        })
+    }
+
+    #[must_use]
+    pub const fn config(&self) -> &BinanceConfig {
+        &self.config
+    }
+
+    pub async fn execute_read(
+        &self,
+        credentials: &BinanceCredentials,
+        request: &BinancePrivateReadRequest,
+        timestamp_ms: u64,
+    ) -> Result<BinanceRawPrivatePage, BinanceTransportError> {
+        self.validate_scope(request.scope())?;
+        let response = self
+            .execute_signed(
+                credentials,
+                request.scope(),
+                request.method(),
+                request.path(),
+                request.parameters(),
+                timestamp_ms,
+                false,
+            )
+            .await?;
+        BinanceRawPrivatePage::new(
+            request,
+            response.requested_at_ms,
+            response.received_at_ms,
+            response.payload,
+        )
+        .map_err(|_| BinanceTransportError::Payload)
+    }
+
+    /// Performs exactly one physical mutation dispatch. Timeout, disconnect, and ambiguous server
+    /// status are UNKNOWN and are never retried by this transport.
+    pub async fn dispatch_once(
+        &self,
+        credentials: &BinanceCredentials,
+        scope: &BinancePrivateReadScope,
+        request: &BinancePreparedMutation,
+        timestamp_ms: u64,
+    ) -> Result<BinanceMutationAck, BinanceTransportError> {
+        self.validate_scope(scope)?;
+        request
+            .validate(scope)
+            .map_err(|_| BinanceTransportError::Binding)?;
+        let response = self
+            .execute_signed(
+                credentials,
+                scope,
+                request.method(),
+                request.path(),
+                request.parameters(),
+                timestamp_ms,
+                true,
+            )
+            .await?;
+        parse_mutation_ack(request, scope, &response.payload, response.received_at_ms)
+            .map_err(|_| BinanceTransportError::Ack)
+    }
+
+    /// Dispatches once and then performs one separately signed exact lookup. Failure of either
+    /// network operation never causes a second mutation dispatch.
+    pub async fn dispatch_then_exact_readback(
+        &self,
+        credentials: &BinanceCredentials,
+        scope: &BinancePrivateReadScope,
+        request: &BinancePreparedMutation,
+        dispatch_timestamp_ms: u64,
+    ) -> BinancePhysicalMutationOutcome {
+        let ack = match self
+            .dispatch_once(credentials, scope, request, dispatch_timestamp_ms)
+            .await
+        {
+            Ok(ack) => ack,
+            Err(error) if error.is_unknown_dispatch() => {
+                return BinancePhysicalMutationOutcome::DispatchUnknown { error };
+            }
+            Err(error) => return BinancePhysicalMutationOutcome::DispatchFailed { error },
+        };
+        let exact_request = match request.exact_readback_request(scope) {
+            Ok(request) => request,
+            Err(_) => {
+                return BinancePhysicalMutationOutcome::AckedReadbackUnknown {
+                    ack,
+                    error: BinanceTransportError::Binding,
+                };
+            }
+        };
+        let page = match self
+            .execute_read(
+                credentials,
+                &exact_request,
+                match unix_ms() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return BinancePhysicalMutationOutcome::AckedReadbackUnknown { ack, error };
+                    }
+                },
+            )
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                return BinancePhysicalMutationOutcome::AckedReadbackUnknown { ack, error };
+            }
+        };
+        match parse_exact_order_readback(&ack, &exact_request, &page) {
+            Ok(readback) => BinancePhysicalMutationOutcome::ReadBack {
+                ack,
+                readback: Box::new(readback),
+            },
+            Err(_) => BinancePhysicalMutationOutcome::AckedReadbackUnknown {
+                ack,
+                error: BinanceTransportError::Ack,
+            },
+        }
+    }
+
+    pub async fn create_listen_key(
+        &self,
+        credentials: &BinanceCredentials,
+    ) -> Result<crate::BinanceListenKey, BinanceTransportError> {
+        let response = self
+            .execute_api_key_request(credentials, BinanceHttpMethod::Post)
+            .await?;
+        crate::BinanceListenKey::from_response(
+            self.config.gateway_binding(),
+            self.instrument_generation,
+            self.private_generation,
+            &response.payload,
+        )
+    }
+
+    pub async fn keepalive_listen_key(
+        &self,
+        credentials: &BinanceCredentials,
+    ) -> Result<(), BinanceTransportError> {
+        self.execute_api_key_request(credentials, BinanceHttpMethod::Put)
+            .await
+            .map(|_| ())
+    }
+
+    async fn execute_api_key_request(
+        &self,
+        credentials: &BinanceCredentials,
+        method: BinanceHttpMethod,
+    ) -> Result<BinanceHttpResponse, BinanceTransportError> {
+        let requested_at_ms = unix_ms()?;
+        let url = format!("{}{}", self.endpoint, endpoints::LISTEN_KEY);
+        let builder = match method {
+            BinanceHttpMethod::Post => self.client.post(url),
+            BinanceHttpMethod::Put => self.client.put(url),
+            BinanceHttpMethod::Get | BinanceHttpMethod::Delete => {
+                return Err(BinanceTransportError::Protocol);
+            }
+        }
+        .header("X-MBX-APIKEY", credentials.api_key.expose_secret());
+        self.send_bounded(builder, requested_at_ms, false).await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "binding, method, path, parameters, clock, and mutation classification are one physical request"
+    )]
+    async fn execute_signed(
+        &self,
+        credentials: &BinanceCredentials,
+        scope: &BinancePrivateReadScope,
+        method: BinanceHttpMethod,
+        path: &str,
+        parameters: &[(String, String)],
+        timestamp_ms: u64,
+        mutation: bool,
+    ) -> Result<BinanceHttpResponse, BinanceTransportError> {
+        if timestamp_ms == 0 || timestamp_ms < scope.requested_at_ms() {
+            return Err(BinanceTransportError::Clock);
+        }
+        let parameter_refs = parameters
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        let signed = sign_rest(
+            credentials,
+            &self.config,
+            &BinanceRestSignInput {
+                binding: scope.binding(),
+                method,
+                path,
+                parameters: &parameter_refs,
+                recv_window_ms: 5_000,
+                timestamp_ms,
+            },
+        )
+        .map_err(|_| BinanceTransportError::Signing)?;
+        self.send_signed(signed, timestamp_ms, mutation).await
+    }
+
+    async fn send_signed(
+        &self,
+        signed: SignedBinanceRestRequest,
+        requested_at_ms: u64,
+        mutation: bool,
+    ) -> Result<BinanceHttpResponse, BinanceTransportError> {
+        if signed.origin() != self.config.portfolio_rest_origin()
+            || !signed.authentication_material_is_present()
+        {
+            return Err(BinanceTransportError::Binding);
+        }
+        let url = format!("{}{}?{}", self.endpoint, signed.path(), signed.query());
+        let builder = match signed.method() {
+            BinanceHttpMethod::Get => self.client.get(url),
+            BinanceHttpMethod::Post => self.client.post(url),
+            BinanceHttpMethod::Delete => self.client.delete(url),
+            BinanceHttpMethod::Put => self.client.put(url),
+        }
+        .header("X-MBX-APIKEY", signed.api_key());
+        self.send_bounded(builder, requested_at_ms, mutation).await
+    }
+
+    async fn send_bounded(
+        &self,
+        builder: reqwest::RequestBuilder,
+        requested_at_ms: u64,
+        mutation: bool,
+    ) -> Result<BinanceHttpResponse, BinanceTransportError> {
+        let response = timeout(self.limits.operation_timeout, builder.send())
+            .await
+            .map_err(|_| BinanceTransportError::Timeout)?
+            .map_err(map_reqwest)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            return if mutation && (status >= 500 || status == 408) {
+                Err(BinanceTransportError::AmbiguousStatus(status))
+            } else {
+                Err(BinanceTransportError::HttpStatus(status))
+            };
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > self.limits.maximum_body_bytes as u64)
+        {
+            return Err(BinanceTransportError::BodyTooLarge);
+        }
+        let payload = timeout(self.limits.operation_timeout, async {
+            let mut response = response;
+            let mut body = BytesMut::new();
+            while let Some(chunk) = response.chunk().await.map_err(map_reqwest)? {
+                let next = body
+                    .len()
+                    .checked_add(chunk.len())
+                    .ok_or(BinanceTransportError::BodyTooLarge)?;
+                if next > self.limits.maximum_body_bytes {
+                    return Err(BinanceTransportError::BodyTooLarge);
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok::<Bytes, BinanceTransportError>(body.freeze())
+        })
+        .await
+        .map_err(|_| BinanceTransportError::Timeout)??;
+        Ok(BinanceHttpResponse {
+            requested_at_ms,
+            received_at_ms: unix_ms()?,
+            status,
+            payload,
+        })
+    }
+
+    fn validate_scope(&self, scope: &BinancePrivateReadScope) -> Result<(), BinanceTransportError> {
+        if scope.binding() != self.config.gateway_binding()
+            || scope.instrument_generation() != self.instrument_generation
+            || scope.private_generation() != self.private_generation
+            || self.endpoint.is_empty()
+        {
+            return Err(BinanceTransportError::Binding);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub enum BinancePhysicalMutationOutcome {
+    ReadBack {
+        ack: BinanceMutationAck,
+        readback: Box<BinanceExactOrderReadback>,
+    },
+    AckedReadbackUnknown {
+        ack: BinanceMutationAck,
+        error: BinanceTransportError,
+    },
+    DispatchUnknown {
+        error: BinanceTransportError,
+    },
+    DispatchFailed {
+        error: BinanceTransportError,
+    },
+}
+
+fn map_reqwest(error: reqwest::Error) -> BinanceTransportError {
+    if error.is_timeout() {
+        BinanceTransportError::Timeout
+    } else {
+        // After `send` begins, reqwest cannot prove that an EOF/body/protocol failure happened
+        // before a mutation reached Binance. Conservatively classify every non-timeout transport
+        // failure as disconnected/UNKNOWN; callers may only issue an exact signed readback.
+        BinanceTransportError::Disconnected
+    }
+}
+
+fn unix_ms() -> Result<u64, BinanceTransportError> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| BinanceTransportError::Clock)?
+        .as_millis();
+    u64::try_from(millis).map_err(|_| BinanceTransportError::Clock)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum BinanceTransportError {
+    #[error("Binance transport limits are invalid or exceed the hard maximum")]
+    Limits,
+    #[error("Binance transport does not match the fixed binding, endpoint, or generation")]
+    Binding,
+    #[error("Binance request signing failed")]
+    Signing,
+    #[error("Binance HTTP transport failed")]
+    Http,
+    #[error("Binance HTTP request timed out with an UNKNOWN mutation outcome")]
+    Timeout,
+    #[error("Binance connection ended with an UNKNOWN mutation outcome")]
+    Disconnected,
+    #[error("Binance returned HTTP status {0}")]
+    HttpStatus(u16),
+    #[error("Binance returned ambiguous HTTP status {0} after dispatch")]
+    AmbiguousStatus(u16),
+    #[error("Binance response exceeded the bounded body or frame limit")]
+    BodyTooLarge,
+    #[error("Binance response or mutation acknowledgement is invalid")]
+    Ack,
+    #[error("Binance transport payload is invalid")]
+    Payload,
+    #[error("Binance transport clock is invalid or regressed")]
+    Clock,
+    #[error("Binance transport protocol state is invalid")]
+    Protocol,
+    #[error("Binance private stream ended")]
+    EndOfStream,
+}
+
+impl BinanceTransportError {
+    #[must_use]
+    pub const fn is_unknown_dispatch(self) -> bool {
+        matches!(
+            self,
+            Self::Timeout | Self::Disconnected | Self::AmbiguousStatus(_)
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        time::sleep,
+    };
+    use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
+
+    use super::*;
+    use crate::execution::prepared_for_transport_test;
+    use crate::{
+        BinanceAccountBinding, BinanceInstrumentRules, BinanceMutationKind,
+        BinancePrivateReadScope, build_account_request, parse_instrument_rules,
+    };
+
+    const EXCHANGE_INFO: &str = include_str!("../tests/fixtures/exchange_info_btcusdt.json");
+    const ACK: &[u8] = include_bytes!("../fixtures/place-order-ack.json");
+    const EXACT: &[u8] = include_bytes!("../fixtures/exact-order-readback.json");
+    const ACCOUNT: &[u8] = include_bytes!("../fixtures/portfolio-account.json");
+
+    enum Behavior {
+        Body(&'static [u8]),
+        Partial(&'static [u8], usize),
+        Delay(Duration),
+    }
+
+    async fn fake_http(
+        behaviors: Vec<Behavior>,
+    ) -> Result<(String, Arc<AtomicUsize>), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let count = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::clone(&count);
+        tokio::spawn(async move {
+            for behavior in behaviors {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                accepted.fetch_add(1, Ordering::SeqCst);
+                let mut request = vec![0_u8; 16 * 1024];
+                let _ = stream.read(&mut request).await;
+                match behavior {
+                    Behavior::Body(body) => {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes()).await;
+                        let _ = stream.write_all(body).await;
+                    }
+                    Behavior::Partial(body, sent_bytes) => {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes()).await;
+                        let _ = stream.write_all(&body[..sent_bytes.min(body.len())]).await;
+                    }
+                    Behavior::Delay(duration) => sleep(duration).await,
+                }
+            }
+        });
+        Ok((format!("http://{address}"), count))
+    }
+
+    fn facts(
+        account: &str,
+    ) -> Result<
+        (
+            BinanceConfig,
+            BinanceInstrumentRules,
+            BinancePrivateReadScope,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let binding = GatewayBinding::new(
+            VenueId::Binance,
+            GatewayMode::Test,
+            account,
+            "BTC/USDT".parse()?,
+        )?;
+        let config =
+            BinanceConfig::for_binding(BinanceAccountBinding::PortfolioMarginUm, &binding)?;
+        let rules = parse_instrument_rules(EXCHANGE_INFO, binding.symbol.clone(), 7)?;
+        let scope = BinancePrivateReadScope::new(&config, &rules, 17, 11, 900)?;
+        Ok((config, rules, scope))
+    }
+
+    #[test]
+    fn transport_limits_are_finite_and_bounded() {
+        assert_eq!(
+            BinanceTransportLimits::new(Duration::ZERO, 1),
+            Err(BinanceTransportError::Limits)
+        );
+        assert_eq!(
+            BinanceTransportLimits::new(Duration::from_secs(61), 1),
+            Err(BinanceTransportError::Limits)
+        );
+        assert_eq!(
+            BinanceTransportLimits::new(Duration::from_secs(1), MAX_TRANSPORT_BYTES + 1),
+            Err(BinanceTransportError::Limits)
+        );
+    }
+
+    #[tokio::test]
+    async fn http_timeout_body_limit_generation_and_binding_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let credentials = BinanceCredentials::from_values("key", "secret")?;
+        let (config, _, scope) = facts("00000000-0000-4000-8000-000000000001")?;
+        let limits = BinanceTransportLimits::new(Duration::from_millis(20), 64)?;
+
+        let (slow_endpoint, _) =
+            fake_http(vec![Behavior::Delay(Duration::from_millis(100))]).await?;
+        let slow =
+            BinanceHttpTransport::with_endpoint(config.clone(), 7, 17, slow_endpoint, limits)?;
+        let request = build_account_request(&scope)?;
+        assert_eq!(
+            slow.execute_read(&credentials, &request, 1_000).await,
+            Err(BinanceTransportError::Timeout)
+        );
+
+        let oversized: &'static [u8] = Box::leak(vec![b'x'; 65].into_boxed_slice());
+        let (large_endpoint, _) = fake_http(vec![Behavior::Body(oversized)]).await?;
+        let large =
+            BinanceHttpTransport::with_endpoint(config.clone(), 7, 17, large_endpoint, limits)?;
+        assert_eq!(
+            large.execute_read(&credentials, &request, 1_000).await,
+            Err(BinanceTransportError::BodyTooLarge)
+        );
+
+        let (_, _, wrong_scope) = facts("00000000-0000-4000-8000-000000000002")?;
+        assert_eq!(
+            large
+                .execute_read(&credentials, &build_account_request(&wrong_scope)?, 1_000)
+                .await,
+            Err(BinanceTransportError::Binding)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ack_disconnect_is_unknown_and_mutation_is_dispatched_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let credentials = BinanceCredentials::from_values("key", "secret")?;
+        let (config, _, scope) = facts("00000000-0000-4000-8000-000000000001")?;
+        let (endpoint, count) = fake_http(vec![Behavior::Partial(ACK, ACK.len() / 2)]).await?;
+        let transport = BinanceHttpTransport::with_endpoint(
+            config,
+            7,
+            17,
+            endpoint,
+            BinanceTransportLimits::new(Duration::from_secs(1), 1024)?,
+        )?;
+        let request =
+            prepared_for_transport_test(&scope, BinanceMutationKind::PlaceLimit, "venue_place_1");
+
+        let error = match transport
+            .dispatch_once(&credentials, &scope, &request, unix_ms()?)
+            .await
+        {
+            Ok(_) => return Err("the fake unexpectedly acknowledged a closed connection".into()),
+            Err(error) => error,
+        };
+        assert!(error.is_unknown_dispatch());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_ack_is_followed_by_one_separately_signed_exact_readback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let credentials = BinanceCredentials::from_values("key", "secret")?;
+        let (config, _, scope) = facts("00000000-0000-4000-8000-000000000001")?;
+        let (endpoint, count) = fake_http(vec![Behavior::Body(ACK), Behavior::Body(EXACT)]).await?;
+        let transport = BinanceHttpTransport::with_endpoint(
+            config,
+            7,
+            17,
+            endpoint,
+            BinanceTransportLimits::new(Duration::from_secs(1), 4096)?,
+        )?;
+        let request =
+            prepared_for_transport_test(&scope, BinanceMutationKind::PlaceLimit, "venue_place_1");
+
+        let outcome = transport
+            .dispatch_then_exact_readback(&credentials, &scope, &request, unix_ms()?)
+            .await;
+        assert!(matches!(
+            outcome,
+            BinancePhysicalMutationOutcome::ReadBack { ref ack, ref readback }
+                if ack.order_id == "401" && readback.order.order_id == "401"
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn api_key_listen_key_request_remains_on_the_configured_test_origin()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let credentials = BinanceCredentials::from_values("key", "secret")?;
+        let (config, _, _) = facts("00000000-0000-4000-8000-000000000001")?;
+        assert_eq!(config.mode(), GatewayMode::Test);
+        assert_eq!(
+            config.portfolio_rest_origin(),
+            "https://testnet.binancefuture.com"
+        );
+        let (endpoint, _) =
+            fake_http(vec![Behavior::Body(br#"{"listenKey":"test-listen-key"}"#)]).await?;
+        let transport = BinanceHttpTransport::with_endpoint(
+            config,
+            7,
+            17,
+            endpoint,
+            BinanceTransportLimits::new(Duration::from_secs(1), 1024)?,
+        )?;
+        assert!(
+            format!("{:?}", transport.create_listen_key(&credentials).await?).contains("redacted")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordinary_signed_read_uses_the_fixture_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let credentials = BinanceCredentials::from_values("key", "secret")?;
+        let (config, _, scope) = facts("00000000-0000-4000-8000-000000000001")?;
+        let (endpoint, _) = fake_http(vec![Behavior::Body(ACCOUNT)]).await?;
+        let transport = BinanceHttpTransport::with_endpoint(
+            config,
+            7,
+            17,
+            endpoint,
+            BinanceTransportLimits::new(Duration::from_secs(1), 4096)?,
+        )?;
+        let page = transport
+            .execute_read(&credentials, &build_account_request(&scope)?, unix_ms()?)
+            .await?;
+        assert_eq!(page.payload.as_ref(), ACCOUNT);
+        Ok(())
+    }
+}
