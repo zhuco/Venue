@@ -11,6 +11,7 @@ use crate::domain::{
     StopMarketFullPositionCommand,
 };
 use crate::execution_command_sha256;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 /// The WAL keeps the native family beside its client identity so UNKNOWN resolution cannot query
@@ -60,6 +61,8 @@ pub struct CommandJournal {
     accepted_cancel_targets: BTreeMap<CommandId, usize>,
     venue_order_client_ids: BTreeMap<String, Option<CommandId>>,
     next_sequence: u64,
+    durable_len: u64,
+    needs_parent_sync: bool,
 }
 
 impl CommandJournal {
@@ -68,7 +71,8 @@ impl CommandJournal {
         let mut receipts: BTreeMap<CommandId, CommandReceipt> = BTreeMap::new();
         let mut client_ids: BTreeMap<CommandId, CommandId> = BTreeMap::new();
         let mut next_sequence = 1;
-        for receipt in read_all(&path)? {
+        let replay = read_all(&path)?;
+        for receipt in replay.receipts {
             if receipt.sequence != next_sequence {
                 return Err(CommandJournalError::Sequence);
             }
@@ -112,6 +116,8 @@ impl CommandJournal {
             accepted_cancel_targets: BTreeMap::new(),
             venue_order_client_ids: BTreeMap::new(),
             next_sequence,
+            durable_len: replay.durable_len,
+            needs_parent_sync: !replay.existed,
         };
         journal.rebuild_query_indexes();
         Ok(journal)
@@ -654,45 +660,72 @@ impl CommandJournal {
         self.add_query_indexes(command_id, next);
     }
 
-    fn append(&self, receipt: &CommandReceipt) -> Result<(), CommandJournalError> {
+    fn append(&mut self, receipt: &CommandReceipt) -> Result<(), CommandJournalError> {
         let encoded = serde_json::to_vec(receipt).map_err(CommandJournalError::Encode)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|source| CommandJournalError::Io {
-                path: self.path.clone(),
-                source,
-            })?;
-        file.write_all(&encoded)
-            .and_then(|()| file.write_all(b"\n"))
-            .and_then(|()| file.sync_data())
-            .map_err(|source| CommandJournalError::Io {
-                path: self.path.clone(),
-                source,
-            })
+        self.append_encoded(&[encoded.as_slice(), b"\n"])
     }
 
-    fn append_batch(&self, receipts: &[CommandReceipt]) -> Result<(), CommandJournalError> {
+    fn append_batch(&mut self, receipts: &[CommandReceipt]) -> Result<(), CommandJournalError> {
         let mut encoded = Vec::new();
         for receipt in receipts {
             serde_json::to_writer(&mut encoded, receipt).map_err(CommandJournalError::Encode)?;
             encoded.push(b'\n');
         }
+        self.append_encoded(&[encoded.as_slice()])
+    }
+
+    fn append_encoded(&mut self, chunks: &[&[u8]]) -> Result<(), CommandJournalError> {
         let mut file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&self.path)
             .map_err(|source| CommandJournalError::Io {
                 path: self.path.clone(),
                 source,
             })?;
-        file.write_all(&encoded)
-            .and_then(|()| file.sync_data())
+        file.try_lock_exclusive()
             .map_err(|source| CommandJournalError::Io {
                 path: self.path.clone(),
                 source,
-            })
+            })?;
+        let disk_len = file
+            .metadata()
+            .map_err(|source| CommandJournalError::Io {
+                path: self.path.clone(),
+                source,
+            })?
+            .len();
+        if disk_len != self.durable_len {
+            return Err(CommandJournalError::Sequence);
+        }
+        let appended_len = chunks.iter().try_fold(0_u64, |total, chunk| {
+            let chunk_len =
+                u64::try_from(chunk.len()).map_err(|_| CommandJournalError::Sequence)?;
+            total
+                .checked_add(chunk_len)
+                .ok_or(CommandJournalError::Sequence)
+        })?;
+        for chunk in chunks {
+            file.write_all(chunk)
+                .map_err(|source| CommandJournalError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        file.sync_data().map_err(|source| CommandJournalError::Io {
+            path: self.path.clone(),
+            source,
+        })?;
+        if self.needs_parent_sync {
+            sync_parent(&self.path)?;
+            self.needs_parent_sync = false;
+        }
+        self.durable_len = self
+            .durable_len
+            .checked_add(appended_len)
+            .ok_or(CommandJournalError::Sequence)?;
+        Ok(())
     }
 }
 
@@ -734,10 +767,22 @@ fn decrement_count(counts: &mut BTreeMap<CommandId, usize>, key: &CommandId) {
     }
 }
 
-fn read_all(path: &Path) -> Result<Vec<CommandReceipt>, CommandJournalError> {
+struct JournalReplay {
+    receipts: Vec<CommandReceipt>,
+    durable_len: u64,
+    existed: bool,
+}
+
+fn read_all(path: &Path) -> Result<JournalReplay, CommandJournalError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(JournalReplay {
+                receipts: Vec::new(),
+                durable_len: 0,
+                existed: false,
+            });
+        }
         Err(source) => {
             return Err(CommandJournalError::Io {
                 path: path.to_path_buf(),
@@ -748,11 +793,43 @@ fn read_all(path: &Path) -> Result<Vec<CommandReceipt>, CommandJournalError> {
     if !bytes.is_empty() && !bytes.ends_with(b"\n") {
         return Err(CommandJournalError::Truncated);
     }
-    bytes
+    let durable_len = u64::try_from(bytes.len()).map_err(|_| CommandJournalError::Sequence)?;
+    let body = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    if body
         .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_slice(line).map_err(CommandJournalError::Decode))
-        .collect()
+        .any(|line| line.is_empty())
+        && !body.is_empty()
+    {
+        return Err(CommandJournalError::Sequence);
+    }
+    let receipts = if body.is_empty() {
+        Vec::new()
+    } else {
+        body.split(|byte| *byte == b'\n')
+            .map(|line| serde_json::from_slice(line).map_err(CommandJournalError::Decode))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(JournalReplay {
+        receipts,
+        durable_len,
+        existed: true,
+    })
+}
+
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> Result<(), CommandJournalError> {
+    let parent = path.parent().ok_or(CommandJournalError::Sequence)?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| CommandJournalError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) -> Result<(), CommandJournalError> {
+    Ok(())
 }
 
 fn command_hash(command: &ExecutionCommand) -> Result<String, CommandJournalError> {
@@ -1164,6 +1241,138 @@ mod tests {
                 target_client_order_id: stop.client_strategy_id,
             }),
             Err(CommandJournalError::Owner)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn each_dispatch_crash_window_recovers_without_reusing_the_command()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+
+        let prepared_path = directory.path().join("prepared.jsonl");
+        let prepared = command()?;
+        CommandJournal::open(&prepared_path)?.prepare_place(prepared.clone())?;
+        let mut recovered = CommandJournal::open(&prepared_path)?;
+        assert_eq!(recovered.fence_interrupted_dispatches()?, (1, 0));
+        assert!(matches!(
+            recovered.transition(&prepared.command_id, CommandState::Submitted),
+            Err(CommandJournalError::Transition)
+        ));
+
+        let submitted_path = directory.path().join("submitted.jsonl");
+        let submitted = command()?;
+        let mut journal = CommandJournal::open(&submitted_path)?;
+        journal.prepare_place(submitted.clone())?;
+        journal.transition(&submitted.command_id, CommandState::Submitted)?;
+        drop(journal);
+        let mut recovered = CommandJournal::open(&submitted_path)?;
+        assert_eq!(recovered.fence_interrupted_dispatches()?, (0, 1));
+        let before_retry = fs::metadata(&submitted_path)?.len();
+        assert!(matches!(
+            recovered.prepare_place(submitted.clone())?.state,
+            CommandState::Unknown { .. }
+        ));
+        assert_eq!(fs::metadata(&submitted_path)?.len(), before_retry);
+        assert!(matches!(
+            recovered.transition(&submitted.command_id, CommandState::Submitted),
+            Err(CommandJournalError::Transition)
+        ));
+        recovered.transition(
+            &submitted.command_id,
+            CommandState::Accepted {
+                venue_order_id: "signed_readback_order".to_owned(),
+            },
+        )?;
+        drop(recovered);
+        let settled = CommandJournal::open(&submitted_path)?;
+        assert!(!settled.has_unresolved());
+        assert_eq!(
+            settled.client_id_by_venue_order_id("signed_readback_order"),
+            Some(&submitted.client_order_id)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_concurrent_journal_cannot_append_a_sequence_fork()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("commands.jsonl");
+        let mut first = CommandJournal::open(&path)?;
+        let mut stale = CommandJournal::open(&path)?;
+        let first_command = command()?;
+        let mut stale_command = command()?;
+        stale_command.command_id = CommandId::new("stale_command")?;
+        stale_command.client_order_id = CommandId::new("stale_client")?;
+
+        first.prepare_place(first_command.clone())?;
+        assert!(matches!(
+            stale.prepare_place(stale_command.clone()),
+            Err(CommandJournalError::Sequence)
+        ));
+
+        let recovered = CommandJournal::open(path)?;
+        assert!(recovered.receipt(&first_command.command_id).is_some());
+        assert!(recovered.receipt(&stale_command.command_id).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn torn_blank_hash_and_transition_forks_all_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("commands.jsonl");
+        let planned = command()?;
+        CommandJournal::open(&path)?.prepare_place(planned.clone())?;
+        let original = fs::read(&path)?;
+
+        let mut torn = original.clone();
+        torn.extend_from_slice(b"{\"sequence\":2");
+        fs::write(&path, torn)?;
+        assert!(matches!(
+            CommandJournal::open(&path),
+            Err(CommandJournalError::Truncated)
+        ));
+
+        let mut blank = original.clone();
+        blank.extend_from_slice(b"\n");
+        fs::write(&path, blank)?;
+        assert!(matches!(
+            CommandJournal::open(&path),
+            Err(CommandJournalError::Sequence)
+        ));
+
+        let mut receipt: CommandReceipt = serde_json::from_slice(
+            original
+                .strip_suffix(b"\n")
+                .ok_or(CommandJournalError::Truncated)?,
+        )?;
+        receipt.command_sha256 = "0".repeat(64);
+        let mut bad_hash = serde_json::to_vec(&receipt)?;
+        bad_hash.push(b'\n');
+        fs::write(&path, bad_hash)?;
+        assert!(matches!(
+            CommandJournal::open(&path),
+            Err(CommandJournalError::Hash)
+        ));
+
+        let first: CommandReceipt = serde_json::from_slice(
+            original
+                .strip_suffix(b"\n")
+                .ok_or(CommandJournalError::Truncated)?,
+        )?;
+        let fork = CommandReceipt {
+            sequence: 2,
+            ..first.clone()
+        };
+        let mut transition_fork = original;
+        serde_json::to_writer(&mut transition_fork, &fork)?;
+        transition_fork.push(b'\n');
+        fs::write(&path, transition_fork)?;
+        assert!(matches!(
+            CommandJournal::open(path),
+            Err(CommandJournalError::Transition)
         ));
         Ok(())
     }

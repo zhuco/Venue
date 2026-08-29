@@ -495,4 +495,42 @@ mod tests {
         drop(gate);
         Ok(())
     }
+
+    #[test]
+    fn test_and_live_named_roots_cannot_split_one_canonical_account()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let registry = temporary.path().join("registry");
+        let test_root = temporary.path().join("TEST");
+        let live_root = temporary.path().join("LIVE");
+        let writer_scope = scope("gate")?;
+
+        drop(acquire_in(&registry, &writer_scope, &test_root)?);
+        assert!(matches!(
+            acquire_in(&registry, &writer_scope, &live_root),
+            Err(Stage7WriterRegistryError::CanonicalRootConflict { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_entry_hash_fork_is_never_repaired_or_rebound()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let registry = temporary.path().join("registry");
+        let root = temporary.path().join("gate");
+        let writer_scope = scope("gate")?;
+        let account_sha256 = digest_json(&account_key(&writer_scope)?)?;
+        drop(acquire_in(&registry, &writer_scope, &root)?);
+
+        let entry_path = registry.join(format!("{account_sha256}.json"));
+        let mut entry: DurableCanonicalRoot = serde_json::from_slice(&fs::read(&entry_path)?)?;
+        entry.entry_sha256 = "0".repeat(64);
+        fs::write(&entry_path, serde_json::to_vec(&entry)?)?;
+        assert!(matches!(
+            acquire_in(&registry, &writer_scope, &root),
+            Err(Stage7WriterRegistryError::Corrupt)
+        ));
+        Ok(())
+    }
 }
