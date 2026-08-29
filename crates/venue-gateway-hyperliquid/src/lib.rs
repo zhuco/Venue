@@ -11,10 +11,11 @@ mod transport;
 use venue_gateway_api::CapabilityFlags;
 
 pub use action::{
-    HyperliquidActionKind, HyperliquidAloOrder, HyperliquidCancel, HyperliquidExchangeOutcome,
-    HyperliquidExchangeRequest, HyperliquidIocReduceOnlyOrder, HyperliquidSource,
+    HyperliquidActionKind, HyperliquidAloOrder, HyperliquidCancel, HyperliquidExchangeConvergence,
+    HyperliquidExchangeOutcome, HyperliquidExchangeReadbackPlan, HyperliquidExchangeRequest,
+    HyperliquidIocReduceOnlyOrder, HyperliquidSource, begin_exchange_readback,
     build_alo_place_request, build_cancel_request, build_ioc_reduce_only_request,
-    parse_exchange_response,
+    parse_exchange_ack, parse_exchange_response,
 };
 pub use binding::{
     HyperliquidGatewayBinding, HyperliquidGatewayBindingError, HyperliquidReadBinding,
@@ -30,13 +31,15 @@ pub use private_stream::{
     HyperliquidPrivateSubscription, HyperliquidPrivateSubscriptionKind, build_private_subscription,
 };
 pub use protocol::{
-    HyperliquidAccountSnapshot, HyperliquidBbo, HyperliquidFill, HyperliquidFillCursor,
-    HyperliquidFillPage, HyperliquidFillQuery, HyperliquidInfoRequest, HyperliquidOpenOrder,
-    HyperliquidOpenOrdersSnapshot, HyperliquidOrderFamily, HyperliquidOrderFamilyCoverage,
-    HyperliquidOrderLookup, HyperliquidOrderStatus, HyperliquidPayloadScope, HyperliquidPerpMeta,
-    HyperliquidUserFills, build_clearinghouse_state_request, build_frontend_open_orders_request,
-    build_l2_book_request, build_meta_request, build_open_orders_request,
-    build_order_status_request, build_user_fills_by_time_request, parse_clearinghouse_snapshot,
+    HYPERLIQUID_FILL_RESPONSE_LIMIT, HYPERLIQUID_RECENT_FILL_RETENTION_LIMIT,
+    HyperliquidAccountSnapshot, HyperliquidBbo, HyperliquidFill, HyperliquidFillCoverage,
+    HyperliquidFillCursor, HyperliquidFillPage, HyperliquidFillQuery, HyperliquidInfoRequest,
+    HyperliquidOpenOrder, HyperliquidOpenOrdersSnapshot, HyperliquidOrderFamily,
+    HyperliquidOrderFamilyCoverage, HyperliquidOrderLookup, HyperliquidOrderStatus,
+    HyperliquidPayloadScope, HyperliquidPerpMeta, HyperliquidUserFills,
+    build_clearinghouse_state_request, build_frontend_open_orders_request, build_l2_book_request,
+    build_meta_request, build_open_orders_request, build_order_status_request,
+    build_user_fills_by_time_request, parse_clearinghouse_snapshot,
     parse_frontend_open_orders_snapshot, parse_l2_book_bbo, parse_open_orders_snapshot,
     parse_order_status, parse_perp_meta, parse_private_user_fills, parse_user_fills_page,
     parse_ws_bbo, validate_frontend_open_orders_snapshot,
@@ -69,6 +72,8 @@ pub enum HyperliquidError {
     Signing,
     #[error("Hyperliquid exchange response is invalid or contradicts the requested action")]
     Response,
+    #[error("Hyperliquid action readback is missing, stale, or contradicts the signed request")]
+    Readback,
     #[error("Hyperliquid frontend open-order family evidence is incomplete or inconsistent")]
     OrderFamily,
 }
@@ -383,6 +388,7 @@ mod tests {
             &HyperliquidFillQuery::new(&selected, 1_700_000_000_001, 1_700_000_000_002, 1, None)?,
         )?;
         assert!(!first.complete);
+        assert_eq!(first.coverage, HyperliquidFillCoverage::MorePages);
         assert_eq!(first.fills.len(), 1);
         let cursor = first.next_cursor.ok_or("cursor missing")?;
         assert_eq!(cursor.page_coin(), "BTC");
@@ -399,6 +405,14 @@ mod tests {
             )?,
         )?;
         assert!(second.complete);
+        assert_eq!(
+            second.coverage,
+            HyperliquidFillCoverage::VenueVisibleWindowExhausted {
+                maximum_retained_fills: 10_000
+            }
+        );
+        assert_eq!(HYPERLIQUID_FILL_RESPONSE_LIMIT, 2_000);
+        assert_eq!(HYPERLIQUID_RECENT_FILL_RETENTION_LIMIT, 10_000);
         assert_eq!(second.fills.len(), 1);
         assert!(second.fills[0].fill.fill_id.ends_with(":BTC:6002"));
         Ok(())
@@ -797,6 +811,17 @@ mod tests {
             Err(HyperliquidError::Binding)
         );
 
+        let mut wrong_cloid = frames[0].clone();
+        wrong_cloid["data"][0]["order"]["cloid"] = serde_json::json!("not-a-cloid");
+        assert_eq!(
+            HyperliquidPrivateStreamDecoder::new(binding.clone()).decode(
+                &serde_json::to_vec(&wrong_cloid)?,
+                17,
+                1_700_000_000_010
+            ),
+            Err(HyperliquidError::Payload)
+        );
+
         let mut wrong_user = frames[1].clone();
         wrong_user["data"]["user"] =
             serde_json::json!("0x3333333333333333333333333333333333333333");
@@ -822,6 +847,21 @@ mod tests {
                 1_700_000_000_010
             ),
             Err(HyperliquidError::Binding)
+        );
+
+        let mut wrong_fill_cloid = frames[1].clone();
+        wrong_fill_cloid["data"]["fills"][0]["cloid"] = serde_json::json!("not-a-cloid");
+        assert_eq!(
+            HyperliquidPrivateStreamDecoder::new(HyperliquidPrivateStreamBinding::new(
+                &meta(GatewayMode::Test)?,
+                21
+            )?)
+            .decode(
+                &serde_json::to_vec(&wrong_fill_cloid)?,
+                21,
+                1_700_000_000_010
+            ),
+            Err(HyperliquidError::Payload)
         );
 
         let mut fill_decoder = HyperliquidPrivateStreamDecoder::new(
