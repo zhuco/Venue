@@ -191,8 +191,8 @@ Copy planner/job-consumer lease 只允许竞争数据库 job 的规划或投递�
 | Venue | 目标 adapter | 当前权威来源 | 初始准入 |
 |---|---|---|---|
 | Binance | `venue-gateway-binance` | 已迁入 Portfolio Margin 产品身份、原生 symbol、私有 payload 与账户/仓位/订单/成交/风险纯规范化；根路径兼容 re-export，现有签名 readback、transport 与 Stage 7 capability/WAL/writer 保持生产权威，GatewayBinding 不授予旧 writer 能力 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
-| Bitget | `venue-gateway-bitget` | Venue 当前 UTA readback、Stage 7 和 KOL fixture 对照 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
-| Gate.io | `venue-gateway-gate` | Venue 当前 futures readback、Stage 7 和 KOL fixture 对照 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
+| Bitget | `venue-gateway-bitget` | 已迁入 UTA 产品身份、公共订阅、原始证据、订单簿序列与市场事件纯协议，根路径兼容 re-export；GatewayBinding 只校验 Bitget TEST/LIVE 身份且不授予 mutation；HTTP/WS transport、私有 readback、Stage 7 capability/WAL/writer 仍由根 package 保持生产权威 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
+| Gate.io | `venue-gateway-gate` | 已迁入无凭证的公共订阅、验签、规则与市场事件纯协议，根路径兼容 re-export；GatewayBinding 只校验 Gate.io TEST/LIVE 身份且不授予 mutation；HTTP/WS transport、私有 readback、Stage 7 capability/WAL/writer 仍由根 package 保持生产权威 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
 | Bybit | `venue-gateway-bybit` | 已迁入 KOL V5 endpoint、HMAC 固定向量与签名成交 fixture；transport/private stream/writer 待接 | `TEST | LIVE`；最小 LIVE 安全闭环后即可小额实盘调试 |
 | OKX | `venue-gateway-okx` | 已迁入 KOL V5 TEST 模拟盘/LIVE 端点、三项 secret、HMAC 固定向量与合约成交规范化 fixture；transport/private stream/writer 待接 | `TEST | LIVE`；最小 LIVE 安全闭环后即可小额实盘调试 |
 | Hyperliquid | `venue-gateway-hyperliquid` | 已迁入 TEST/LIVE 端点、命名 Agent secret 边界、按 Agent 绑定的持久 nonce 契约与私有成交 fixture；EIP-712 所需 `k256`/MessagePack/Keccak 依赖尚未获准，因此 signing/transport/writer 未接且 capability 为空 | `TEST | LIVE`；最小 LIVE 安全闭环后即可小额实盘调试 |

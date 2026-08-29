@@ -5,10 +5,11 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use super::fill_sequence_tests::intent;
+use super::stage7_canary_support::{STAGE7_LIVE_ADMISSION_FILE, Stage7LiveAdmissionEvidence};
 use super::*;
 use crate::{
     config::{
@@ -17,7 +18,7 @@ use crate::{
     },
     domain::{
         AccountBalance, Amount, Asset, FieldState, Fill, Instrument, MarketKind, OrderPurpose,
-        OrderState, PositionSide,
+        OrderState, Position, PositionSide,
     },
     exchange::grid::{
         GridOrderFamilyReadback, GridPrivateEvent, GridPublicPayload, GridPublicPayloadSource,
@@ -107,6 +108,10 @@ struct StreamFillVenue {
     client: RecordingMutationClient,
     readback_calls: Arc<AtomicUsize>,
     book_reads: Arc<AtomicUsize>,
+    readbacks: VecDeque<Result<GridVenueReadback, GridVenueError>>,
+    private_events: VecDeque<GridPrivateEvent>,
+    private_empty_polls: usize,
+    risk_client: Option<Arc<dyn HedgedGridRiskReadbackClient>>,
     exact_order_outcomes: VecDeque<Result<Order, GridVenueError>>,
     book: (Price, Price),
 }
@@ -124,6 +129,10 @@ impl HedgedGridVenue for StreamFillVenue {
         self.instrument.quantity_step
     }
 
+    fn verify_current_instrument_rules(&mut self) -> Result<(), GridVenueError> {
+        Ok(())
+    }
+
     fn best_bid_ask(&self, _now_ms: u64) -> Result<(Price, Price), GridVenueError> {
         self.book_reads.fetch_add(1, Ordering::SeqCst);
         Ok(self.book)
@@ -131,7 +140,13 @@ impl HedgedGridVenue for StreamFillVenue {
 
     fn readback(&mut self) -> Result<GridVenueReadback, GridVenueError> {
         self.readback_calls.fetch_add(1, Ordering::SeqCst);
-        Err(GridVenueError::PrivateReadbackRequired)
+        self.readbacks
+            .pop_front()
+            .unwrap_or(Err(GridVenueError::PrivateReadbackRequired))
+    }
+
+    fn risk_readback_client(&self) -> Option<Arc<dyn HedgedGridRiskReadbackClient>> {
+        self.risk_client.clone()
     }
 
     fn connect_private_stream(&mut self) -> Result<(), GridVenueError> {
@@ -139,7 +154,11 @@ impl HedgedGridVenue for StreamFillVenue {
     }
 
     fn next_private_event(&mut self) -> Result<Option<GridPrivateEvent>, GridVenueError> {
-        Ok(None)
+        if self.private_empty_polls > 0 {
+            self.private_empty_polls -= 1;
+            return Ok(None);
+        }
+        Ok(self.private_events.pop_front())
     }
 
     fn reset_private_stream(&mut self) {}
@@ -396,6 +415,272 @@ fn instrument() -> Result<Instrument, Box<dyn std::error::Error>> {
 fn resident_fill_hot_path_dispatches_while_risk_worker_is_blocked()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
+    let mut cfg = config(3)?;
+    let exposure_config = ExposureTakeProfitConfig {
+        enabled: true,
+        shadow: true,
+        position_equity_multiple: Decimal::new(3, 0),
+        unrealized_pnl_equity_ratio: Decimal::new(5, 2),
+        reduce_ratio: Decimal::new(30, 2),
+        snapshot_interval_ms: 120_000,
+        max_snapshot_age_ms: 3_000,
+        rearm_clear_generations: 2,
+    };
+    cfg.hedged_grid
+        .as_mut()
+        .ok_or("missing grid config")?
+        .exposure_take_profit = Some(exposure_config);
+    let binding = gate_binding(&cfg)?;
+    let params = release_params(&cfg, &binding)?;
+    let mut state = HedgedGridState::new_with_params(binding.clone(), params)?;
+    let _ = state.observe_inventory(GridInventory {
+        private_generation: 1,
+        private_observed_at_ms: 100,
+        mark_price: Price::new(Decimal::new(100, 0))?,
+        long_quantity: Decimal::new(20, 2),
+        short_quantity: Decimal::new(20, 2),
+    })?;
+    let _ = state.install_epoch(GridEpoch {
+        epoch: 1,
+        anchor_price: Price::new(Decimal::new(100, 0))?,
+        step: Price::new(Decimal::new(2, 1))?,
+        grid_quantity: Decimal::new(5, 2),
+        passive_book_fallback: None,
+    })?;
+    let source = state
+        .owned_orders
+        .values()
+        .find(|order| {
+            order.key.position == GridPosition::Long
+                && order.key.role == GridOrderRole::Open
+                && order.key.level == 1
+        })
+        .cloned()
+        .ok_or("missing stream-fill source")?;
+    let mut commands = CommandJournal::open(temporary.path().join(COMMAND_FILE))?;
+    let mut original_venue_order_id = None;
+    let mut signed_orders = Vec::new();
+    for owned in state.owned_orders.values() {
+        let GridMutation::Place(original) = place_command(&binding, &instrument()?, owned)? else {
+            return Err("owned intent did not create a place command".into());
+        };
+        let command_id = original.command_id.clone();
+        let venue_order_id = original.client_order_id.as_str().to_owned();
+        if owned.key == source.key {
+            original_venue_order_id = Some(venue_order_id.clone());
+        }
+        signed_orders.push(Order {
+            order_id: venue_order_id.clone(),
+            client_order_id: FieldState::Known(venue_order_id.clone()),
+            symbol: binding.symbol.clone(),
+            side: original.side,
+            position_side: FieldState::Known(original.position_side),
+            purpose: FieldState::Known(if owned.reduce_only {
+                OrderPurpose::Reduce
+            } else {
+                OrderPurpose::Entry
+            }),
+            state: OrderState::New,
+            quantity: original.quantity,
+            filled_quantity: Decimal::ZERO,
+            limit_price: Some(original.limit_price),
+            average_price: FieldState::Missing,
+            reduce_only: original.reduce_only,
+        });
+        commands.prepare_place(original)?;
+        commands.transition(&command_id, CommandState::Submitted)?;
+        commands.transition(&command_id, CommandState::Accepted { venue_order_id })?;
+    }
+    let original_command_ids = commands
+        .commands()
+        .map(|command| command.command_id().clone())
+        .collect::<Vec<_>>();
+    let original_venue_order_id = original_venue_order_id.ok_or("missing source venue id")?;
+    let checkpoint = Stage7GridCheckpoint {
+        schema_version: 1,
+        binding: binding.clone(),
+        state,
+        private_generation: 1,
+        exposure_guard: None,
+        pending_exposure_reduction: None,
+        fill_history_start_ms: 1,
+        order_health_fenced: false,
+        last_order_health_checked_at_ms: 0,
+    };
+    ProjectionStore::new(temporary.path().join(CHECKPOINT_FILE)).save(&checkpoint)?;
+    set_stage7_grid_control(
+        &cfg,
+        temporary.path(),
+        HedgedGridControlTarget::Running,
+    )?;
+    let admission = Stage7LiveAdmissionEvidence::new_with_exposure(
+        CapabilityBinding {
+            exchange: binding.exchange.clone(),
+            account_binding: "usdt_futures_dual".to_owned(),
+            symbol: binding.symbol.to_string(),
+            api_key_sha256: "a".repeat(64),
+        },
+        binding.clone(),
+        checkpoint.state.params.clone(),
+        instrument()?,
+        Decimal::ONE,
+        Some(exposure_config),
+        "b".repeat(64),
+        10,
+        100,
+        1,
+        1,
+    )?;
+    ProjectionStore::new(temporary.path().join(STAGE7_LIVE_ADMISSION_FILE)).save(&admission)?;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let readback_calls = Arc::new(AtomicUsize::new(0));
+    let book_reads = Arc::new(AtomicUsize::new(0));
+    let mut readback = shadow_readback()?;
+    readback.positions = vec![
+        Position {
+            symbol: binding.symbol.clone(),
+            side: PositionSide::Long,
+            quantity: Decimal::new(20, 2),
+            entry_price: Some(Price::new(Decimal::new(100, 0))?),
+            mark_price: Some(Price::new(Decimal::new(100, 0))?),
+        },
+        Position {
+            symbol: binding.symbol.clone(),
+            side: PositionSide::Short,
+            quantity: Decimal::new(20, 2),
+            entry_price: Some(Price::new(Decimal::new(100, 0))?),
+            mark_price: Some(Price::new(Decimal::new(100, 0))?),
+        },
+    ];
+    readback.orders = signed_orders.clone();
+    readback.order_family_readback = Some(GridOrderFamilyReadback::regular_only_adapter_profile(
+        signed_orders,
+        vec!["signed resident order surface".to_owned()],
+    )?);
+    let private_event = GridPrivateEvent::Fill {
+        fill: Fill {
+            execution_sequence: FieldState::Known(1),
+            fill_id: "resident-stream-fill-1".to_owned(),
+            order_id: original_venue_order_id,
+            symbol: binding.symbol.clone(),
+            side: source.side,
+            position_side: FieldState::Known(PositionSide::Long),
+            quantity: source.quantity,
+            price: source.price,
+            fee: FieldState::Missing,
+            realized_pnl: FieldState::Missing,
+            maker: FieldState::Known(true),
+            exchange_time_ms: Some(150),
+        },
+        client_order_id: FieldState::Known(client_order_id(&source.key)?.as_str().to_owned()),
+        raw_payload: "resident private complete fill".to_owned(),
+    };
+    let (release_risk, risk_gate) = mpsc::channel();
+    let venue = StreamFillVenue {
+        instrument: instrument()?,
+        client: RecordingMutationClient {
+            calls: Arc::clone(&calls),
+        },
+        readback_calls: Arc::clone(&readback_calls),
+        book_reads: Arc::clone(&book_reads),
+        readbacks: VecDeque::from([
+            Ok(readback),
+            Err(GridVenueError::Gate(
+                crate::exchange::gate::GateError::Http,
+            )),
+        ]),
+        private_events: VecDeque::from([private_event]),
+        private_empty_polls: 1,
+        risk_client: Some(Arc::new(GatedRiskClient {
+            gate: Mutex::new(risk_gate),
+        })),
+        exact_order_outcomes: VecDeque::new(),
+        book: (
+            Price::new(Decimal::new(200, 0))?,
+            Price::new(Decimal::new(201, 0))?,
+        ),
+    };
+    let wal_path = temporary.path().join(COMMAND_FILE);
+    let wal_len_before_dispatch = std::fs::metadata(&wal_path)?.len();
+    drop(commands);
+    let artifacts_root = temporary.path().to_path_buf();
+    let (done_tx, done_rx) = mpsc::channel();
+    let resident = thread::spawn(move || {
+        let mut venue = venue;
+        let result = run_stage7_grid(
+            &cfg,
+            Stage7GridRequest {
+                artifacts_root,
+                max_turns: Some(2),
+                reset_on_start: false,
+                skip_inventory_replenishment_until_recovered: false,
+                confirm_mainnet_grid_mutations: true,
+                shadow_only: false,
+                stop_after_first_owned_fill: false,
+                wall_clock_deadline_ms: None,
+                force_order_health_check: false,
+            },
+            binding,
+            &mut venue,
+        )
+        .map_err(|error| error.to_string());
+        let _ = done_tx.send(result);
+    });
+    let report = match done_rx.recv_timeout(Duration::from_secs(1)) {
+        Ok(result) => result.map_err(std::io::Error::other)?,
+        Err(_) => {
+            let _ = release_risk.send(());
+            let _ = resident.join();
+            return Err("resident blocked behind the in-flight risk worker".into());
+        }
+    };
+    assert_eq!(report.turns, 2);
+    assert!(std::fs::metadata(wal_path)?.len() > wal_len_before_dispatch);
+    assert_eq!(readback_calls.load(Ordering::SeqCst), 2);
+    assert!(book_reads.load(Ordering::SeqCst) > 0);
+    let mut recorded = calls
+        .lock()
+        .map_err(|_| "recording client lock poisoned")?
+        .clone();
+    recorded.sort_unstable();
+    assert_eq!(recorded, ["cancel", "place", "place"]);
+    let commands = CommandJournal::open(temporary.path().join(COMMAND_FILE))?;
+    let dispatched = commands
+        .commands()
+        .filter(|command| !original_command_ids.contains(command.command_id()))
+        .collect::<Vec<_>>();
+    assert_eq!(dispatched.len(), 3);
+    assert_eq!(
+        dispatched
+            .iter()
+            .filter(|command| matches!(command, ExecutionCommand::PlaceLimit(_)))
+            .count(),
+        2
+    );
+    assert_eq!(
+        dispatched
+            .iter()
+            .filter(|command| matches!(command, ExecutionCommand::Cancel(_)))
+            .count(),
+        1
+    );
+    assert!(dispatched.iter().all(|command| {
+        commands.receipt(command.command_id()).is_some_and(|receipt| {
+            matches!(receipt.state, CommandState::Accepted { .. })
+        })
+    }));
+    assert!(!commands.has_unresolved());
+    release_risk.send(())?;
+    resident
+        .join()
+        .map_err(|_| "resident test thread panicked")?;
+    Ok(())
+}
+
+#[test]
+fn complete_stream_fill_dispatches_without_signed_readback_or_bbo_gate()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
     let cfg = config(3)?;
     let binding = gate_binding(&cfg)?;
     let params = release_params(&cfg, &binding)?;
@@ -439,7 +724,6 @@ fn resident_fill_hot_path_dispatches_while_risk_worker_is_blocked()
         commands.transition(&command_id, CommandState::Submitted)?;
         commands.transition(&command_id, CommandState::Accepted { venue_order_id })?;
     }
-    let original_venue_order_id = original_venue_order_id.ok_or("missing source venue id")?;
     let mut checkpoint = Stage7GridCheckpoint {
         schema_version: 1,
         binding: binding.clone(),
@@ -453,12 +737,7 @@ fn resident_fill_hot_path_dispatches_while_risk_worker_is_blocked()
     };
     let authority = WriterLeaseAuthority::open(
         temporary.path().join(WRITER_FILE),
-        WriterScope {
-            exchange: binding.exchange.clone(),
-            account: binding.account.clone(),
-            symbol: binding.symbol.clone(),
-            owner_scope: binding.owner_scope.clone(),
-        },
+        stage7_writer_scope(&binding),
     )?;
     let writer = authority.register_initial(1, 1)?;
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -471,6 +750,10 @@ fn resident_fill_hot_path_dispatches_while_risk_worker_is_blocked()
         },
         readback_calls: Arc::clone(&readback_calls),
         book_reads: Arc::clone(&book_reads),
+        readbacks: VecDeque::new(),
+        private_events: VecDeque::new(),
+        private_empty_polls: 0,
+        risk_client: None,
         exact_order_outcomes: VecDeque::new(),
         book: (
             Price::new(Decimal::new(200, 0))?,
@@ -481,18 +764,11 @@ fn resident_fill_hot_path_dispatches_while_risk_worker_is_blocked()
     let store = ProjectionStore::new(temporary.path().join(CHECKPOINT_FILE));
     let wal_path = temporary.path().join(COMMAND_FILE);
     let wal_len_before_dispatch = std::fs::metadata(&wal_path)?.len();
-    let (release_risk, risk_gate) = mpsc::channel();
-    let mut risk_lane = Stage7RiskLane::new(Some(Arc::new(GatedRiskClient {
-        gate: Mutex::new(risk_gate),
-    })));
-    risk_lane.start(binding.account.clone(), 2)?;
-    assert!(risk_lane.pending());
-    assert!(risk_lane.poll()?.is_none());
     let fill = GridVenueFill {
         fill: Fill {
             execution_sequence: FieldState::Known(1),
-            fill_id: "stream-fill-1".to_owned(),
-            order_id: original_venue_order_id,
+            fill_id: "stream-fill-zero-rest".to_owned(),
+            order_id: original_venue_order_id.ok_or("missing source venue id")?,
             symbol: binding.symbol.clone(),
             side: source.side,
             position_side: FieldState::Known(PositionSide::Long),
@@ -525,8 +801,6 @@ fn resident_fill_hot_path_dispatches_while_risk_worker_is_blocked()
     assert!(std::fs::metadata(wal_path)?.len() > wal_len_before_dispatch);
     assert_eq!(readback_calls.load(Ordering::SeqCst), 0);
     assert_eq!(book_reads.load(Ordering::SeqCst), 0);
-    assert!(risk_lane.pending());
-    assert!(risk_lane.poll()?.is_none());
     let mut recorded = calls
         .lock()
         .map_err(|_| "recording client lock poisoned")?
@@ -534,15 +808,6 @@ fn resident_fill_hot_path_dispatches_while_risk_worker_is_blocked()
     recorded.sort_unstable();
     assert_eq!(recorded, ["cancel", "place", "place"]);
     assert!(!commands.has_unresolved());
-    release_risk.send(())?;
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while risk_lane.pending() {
-        let _ = risk_lane.poll()?;
-        if Instant::now() >= deadline {
-            return Err("risk worker did not finish after release".into());
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
     Ok(())
 }
 

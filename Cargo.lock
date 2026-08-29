@@ -1877,6 +1877,8 @@ dependencies = [
  "venue-domain",
  "venue-gateway-api",
  "venue-gateway-binance",
+ "venue-gateway-bitget",
+ "venue-gateway-gate",
 ]
 
 [[package]]
@@ -1922,12 +1924,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "venue-gateway-bitget"
+version = "0.1.0"
+dependencies = [
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "venue-domain",
+ "venue-gateway-api",
+]
+
+[[package]]
 name = "venue-gateway-bybit"
 version = "0.1.0"
 dependencies = [
  "hmac",
  "rust_decimal",
  "secrecy",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "venue-domain",
+ "venue-gateway-api",
+]
+
+[[package]]
+name = "venue-gateway-gate"
+version = "0.1.0"
+dependencies = [
+ "rust_decimal",
  "serde",
  "serde_json",
  "sha2",

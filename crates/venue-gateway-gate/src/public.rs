@@ -15,13 +15,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::domain::{
+use venue_domain::domain::{
     AggressorSide, FieldState, MarketDelta, MarketLevel, MarketSnapshot, Price, PublicTicker,
     PublicTrade, Symbol,
 };
 
 /// Parser contract revision for the documented Gate futures payload shapes accepted here.
-pub(crate) const GATE_PUBLIC_PARSER_SCHEMA_VERSION: u16 = 1;
+pub const GATE_PUBLIC_PARSER_SCHEMA_VERSION: u16 = 1;
 
 const CHANNEL_BOOK_DELTA: &str = "futures.order_book_update";
 const CHANNEL_BOOK_TICKER: &str = "futures.book_ticker";
@@ -35,15 +35,15 @@ const MAX_ORDER_BOOK_DEPTH: u16 = 100;
 /// from the independently fetched, versioned contract rule, so normalized domain quantities are
 /// never mistaken for raw contract counts.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct GatePublicBinding {
-    pub(crate) symbol: Symbol,
-    pub(crate) native_symbol: String,
+pub struct GatePublicBinding {
+    pub symbol: Symbol,
+    pub native_symbol: String,
     #[serde(with = "rust_decimal::serde::str")]
-    pub(crate) base_quantity_per_contract: Decimal,
+    pub base_quantity_per_contract: Decimal,
 }
 
 impl GatePublicBinding {
-    pub(crate) fn new(
+    pub fn new(
         symbol: Symbol,
         native_symbol: impl Into<String>,
         base_quantity_per_contract: Decimal,
@@ -70,14 +70,14 @@ impl GatePublicBinding {
 
 /// Gate's USDT futures native contract spelling for the canonical symbol.
 #[must_use]
-pub(crate) fn native_symbol_for(symbol: &Symbol) -> String {
+pub fn native_symbol_for(symbol: &Symbol) -> String {
     format!("{}_{}", symbol.base(), symbol.quote())
 }
 
 /// Builds the one REST snapshot request that carries Gate's update ID. The caller must use the
 /// same `level` in the matching WS subscription; Gate documents mismatched depth as unsafe for
 /// incremental reconstruction.
-pub(crate) fn rest_order_book_path(
+pub fn rest_order_book_path(
     binding: &GatePublicBinding,
     level: u16,
 ) -> Result<String, GatePublicError> {
@@ -91,7 +91,7 @@ pub(crate) fn rest_order_book_path(
 /// Builds the documented public subscriptions for a single normalized binding. No I/O occurs
 /// here; a transport must persist each raw response before invoking the corresponding parser.
 #[allow(dead_code)]
-pub(crate) fn public_subscriptions(
+pub fn public_subscriptions(
     binding: &GatePublicBinding,
     frequency_ms: u16,
     level: u16,
@@ -128,7 +128,7 @@ pub(crate) fn public_subscriptions(
 /// The hedged-grid contract consumes only a sequenced order book. Keeping its transport scope to
 /// the depth channel prevents unrelated trade/ticker bursts from delaying the exact event-time
 /// book that authorizes mutations; richer market-data consumers keep using `public_subscriptions`.
-pub(crate) fn grid_public_subscriptions(
+pub fn grid_public_subscriptions(
     binding: &GatePublicBinding,
     frequency_ms: u16,
     level: u16,
@@ -151,7 +151,7 @@ pub(crate) fn grid_public_subscriptions(
 /// The source carried by a raw public message. It has no persistence side effect by itself.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum GatePublicPayloadKind {
+pub enum GatePublicPayloadKind {
     RestOrderBookSnapshot,
     WebSocketOrderBookDelta,
     WebSocketBookTicker,
@@ -165,19 +165,19 @@ pub(crate) enum GatePublicPayloadKind {
 /// this payload before exposing a parsed event. The content hash makes that later recording
 /// independently auditable without coupling the adapter to a runtime writer.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct GatePublicRawPayload {
-    pub(crate) parser_schema_version: u16,
-    pub(crate) kind: GatePublicPayloadKind,
-    pub(crate) symbol: Symbol,
-    pub(crate) native_symbol: String,
-    pub(crate) generation: u64,
-    pub(crate) received_at_ms: u64,
-    pub(crate) payload_sha256: String,
-    pub(crate) payload: String,
+pub struct GatePublicRawPayload {
+    pub parser_schema_version: u16,
+    pub kind: GatePublicPayloadKind,
+    pub symbol: Symbol,
+    pub native_symbol: String,
+    pub generation: u64,
+    pub received_at_ms: u64,
+    pub payload_sha256: String,
+    pub payload: String,
 }
 
 impl GatePublicRawPayload {
-    pub(crate) fn new(
+    pub fn new(
         binding: &GatePublicBinding,
         kind: GatePublicPayloadKind,
         generation: u64,
@@ -199,7 +199,7 @@ impl GatePublicRawPayload {
         })
     }
 
-    pub(crate) fn verify(&self, binding: &GatePublicBinding, kind: GatePublicPayloadKind) -> bool {
+    pub fn verify(&self, binding: &GatePublicBinding, kind: GatePublicPayloadKind) -> bool {
         self.parser_schema_version == GATE_PUBLIC_PARSER_SCHEMA_VERSION
             && self.kind == kind
             && self.symbol == binding.symbol
@@ -213,18 +213,14 @@ impl GatePublicRawPayload {
 
 /// Receive and venue time attached to every parsed public event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct GateFreshness {
-    pub(crate) received_at_ms: u64,
-    pub(crate) exchange_time_ms: u64,
+pub struct GateFreshness {
+    pub received_at_ms: u64,
+    pub exchange_time_ms: u64,
 }
 
 #[cfg(test)]
 impl GateFreshness {
-    pub(crate) fn is_fresh_at(
-        self,
-        now_ms: u64,
-        maximum_age_ms: u64,
-    ) -> Result<bool, GatePublicError> {
+    pub fn is_fresh_at(self, now_ms: u64, maximum_age_ms: u64) -> Result<bool, GatePublicError> {
         if maximum_age_ms == 0 || now_ms < self.received_at_ms {
             return Err(GatePublicError::Freshness);
         }
@@ -234,64 +230,64 @@ impl GateFreshness {
 
 /// A normalized payload always remains attached to the exact raw metadata it came from.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GatePublicRecord<T> {
-    pub(crate) raw: GatePublicRawPayload,
-    pub(crate) freshness: GateFreshness,
-    pub(crate) value: T,
+pub struct GatePublicRecord<T> {
+    pub raw: GatePublicRawPayload,
+    pub freshness: GateFreshness,
+    pub value: T,
 }
 
 #[cfg(test)]
 impl GatePublicRecord<MarketSnapshot> {
-    pub(crate) fn market_event(&self) -> crate::domain::MarketEvent {
-        crate::domain::MarketEvent::Snapshot(self.value.clone())
+    pub fn market_event(&self) -> venue_domain::domain::MarketEvent {
+        venue_domain::domain::MarketEvent::Snapshot(self.value.clone())
     }
 }
 
 #[cfg(test)]
 impl GatePublicRecord<MarketDelta> {
-    pub(crate) fn market_event(&self) -> crate::domain::MarketEvent {
-        crate::domain::MarketEvent::Delta(self.value.clone())
+    pub fn market_event(&self) -> venue_domain::domain::MarketEvent {
+        venue_domain::domain::MarketEvent::Delta(self.value.clone())
     }
 }
 
 #[cfg(test)]
 impl GatePublicRecord<PublicTicker> {
-    pub(crate) fn market_event(&self) -> crate::domain::MarketEvent {
-        crate::domain::MarketEvent::Ticker(self.value.clone())
+    pub fn market_event(&self) -> venue_domain::domain::MarketEvent {
+        venue_domain::domain::MarketEvent::Ticker(self.value.clone())
     }
 }
 
 #[cfg(test)]
 impl GatePublicRecord<PublicTrade> {
-    pub(crate) fn market_event(&self) -> crate::domain::MarketEvent {
-        crate::domain::MarketEvent::Trade(self.value.clone())
+    pub fn market_event(&self) -> venue_domain::domain::MarketEvent {
+        venue_domain::domain::MarketEvent::Trade(self.value.clone())
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GateBookDelta {
-    pub(crate) delta: MarketDelta,
+pub struct GateBookDelta {
+    pub delta: MarketDelta,
     /// Gate may send a complete depth replacement on the incremental channel.
-    pub(crate) full: bool,
+    pub full: bool,
 }
 
 /// Gate ticker data that has enough fields to prove a fresh mark/index observation. It remains
 /// separate from `MarkFunding`, because this channel does not include a next-funding timestamp.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GateMarkPrice {
-    pub(crate) symbol: Symbol,
-    pub(crate) generation: u64,
-    pub(crate) received_at_ms: u64,
-    pub(crate) exchange_time_ms: u64,
-    pub(crate) mark_price: Price,
-    pub(crate) index_price: Price,
+pub struct GateMarkPrice {
+    pub symbol: Symbol,
+    pub generation: u64,
+    pub received_at_ms: u64,
+    pub exchange_time_ms: u64,
+    pub mark_price: Price,
+    pub index_price: Price,
     #[allow(clippy::struct_field_names)]
-    pub(crate) funding_rate: Decimal,
-    pub(crate) price_type: GateTickerPriceType,
+    pub funding_rate: Decimal,
+    pub price_type: GateTickerPriceType,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GateTickerPriceType {
+pub enum GateTickerPriceType {
     Last,
     Mark,
     Index,
@@ -302,7 +298,7 @@ pub(crate) enum GateTickerPriceType {
 /// That response has no contract field. Its native symbol is therefore bound to the exact
 /// requested contract in `GatePublicRawPayload`; a response carrying a contract field is checked
 /// too, rather than silently accepting a mismatched fixture or proxy response.
-pub(crate) fn parse_rest_snapshot(
+pub fn parse_rest_snapshot(
     binding: &GatePublicBinding,
     raw: GatePublicRawPayload,
 ) -> Result<GatePublicRecord<MarketSnapshot>, GatePublicError> {
@@ -334,7 +330,7 @@ pub(crate) fn parse_rest_snapshot(
 
 /// Parses the `futures.order_book_update` WebSocket notification. The bridge below decides
 /// whether this normalized delta is stale, is the snapshot bridge, or proves a sequence gap.
-pub(crate) fn parse_ws_delta(
+pub fn parse_ws_delta(
     binding: &GatePublicBinding,
     raw: GatePublicRawPayload,
 ) -> Result<GatePublicRecord<GateBookDelta>, GatePublicError> {
@@ -385,7 +381,7 @@ pub(crate) fn parse_ws_delta(
 }
 
 /// Parses a fresh best-bid/ask message from `futures.book_ticker`.
-pub(crate) fn parse_ws_book_ticker(
+pub fn parse_ws_book_ticker(
     binding: &GatePublicBinding,
     raw: GatePublicRawPayload,
 ) -> Result<GatePublicRecord<PublicTicker>, GatePublicError> {
@@ -424,7 +420,7 @@ pub(crate) fn parse_ws_book_ticker(
 }
 
 /// Parses the selected-contract `futures.tickers` mark/index observation.
-pub(crate) fn parse_ws_mark_price(
+pub fn parse_ws_mark_price(
     binding: &GatePublicBinding,
     raw: GatePublicRawPayload,
 ) -> Result<GatePublicRecord<GateMarkPrice>, GatePublicError> {
@@ -472,7 +468,7 @@ pub(crate) fn parse_ws_mark_price(
 /// A duplicate or decreasing trade ID in one WebSocket notification is rejected; allowing it
 /// would erase an otherwise explicit replay/order invariant. The caller can independently retain
 /// cross-message IDs if it needs a longer deduplication window.
-pub(crate) fn parse_ws_trades(
+pub fn parse_ws_trades(
     binding: &GatePublicBinding,
     raw: GatePublicRawPayload,
 ) -> Result<Vec<GatePublicRecord<PublicTrade>>, GatePublicError> {
@@ -540,7 +536,7 @@ pub(crate) fn parse_ws_trades(
 /// not mutate a recorder. Every gap invalidates the generation and makes the caller fetch a new
 /// REST snapshot before publishing further depth.
 #[derive(Clone, Debug)]
-pub(crate) struct GateOrderBookBridge {
+pub struct GateOrderBookBridge {
     binding: GatePublicBinding,
     generation: u64,
     maximum_buffered_deltas: usize,
@@ -564,7 +560,7 @@ enum GateBookBridgeState {
 /// The caller must apply these actions atomically in the order returned. `ReplaceSnapshot` alone
 /// is not readiness: only a bridge delta, or a documented `full=true` replacement, is ready.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum GateBookBridgeAction {
+pub enum GateBookBridgeAction {
     Buffered,
     IgnoredStale,
     ReplaceSnapshot(GatePublicRecord<MarketSnapshot>),
@@ -572,7 +568,7 @@ pub(crate) enum GateBookBridgeAction {
 }
 
 impl GateOrderBookBridge {
-    pub(crate) fn new(
+    pub fn new(
         binding: GatePublicBinding,
         generation: u64,
         maximum_buffered_deltas: usize,
@@ -591,18 +587,18 @@ impl GateOrderBookBridge {
     }
 
     #[must_use]
-    pub(crate) const fn generation(&self) -> u64 {
+    pub const fn generation(&self) -> u64 {
         self.generation
     }
 
     #[must_use]
-    pub(crate) fn is_ready(&self) -> bool {
+    pub fn is_ready(&self) -> bool {
         matches!(self.state, GateBookBridgeState::Ready { .. })
     }
 
     /// Drops an old generation and all unbridged deltas. Reusing a depth update across a reconnect
     /// is forbidden even when its numeric sequence looks plausible.
-    pub(crate) fn reset_generation(&mut self, generation: u64) -> Result<(), GatePublicError> {
+    pub fn reset_generation(&mut self, generation: u64) -> Result<(), GatePublicError> {
         if generation == 0 || generation <= self.generation {
             return Err(GatePublicError::Generation);
         }
@@ -613,7 +609,7 @@ impl GateOrderBookBridge {
         Ok(())
     }
 
-    pub(crate) fn receive_delta(
+    pub fn receive_delta(
         &mut self,
         delta: GatePublicRecord<GateBookDelta>,
     ) -> Result<Vec<GateBookBridgeAction>, GatePublicError> {
@@ -676,7 +672,7 @@ impl GateOrderBookBridge {
         }
     }
 
-    pub(crate) fn receive_snapshot(
+    pub fn receive_snapshot(
         &mut self,
         snapshot: GatePublicRecord<MarketSnapshot>,
     ) -> Result<Vec<GateBookBridgeAction>, GatePublicError> {
@@ -1025,7 +1021,7 @@ fn digest(payload: &str) -> String {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub(crate) enum GatePublicError {
+pub enum GatePublicError {
     #[error("Gate public binding is not an exact USDT futures symbol and positive multiplier")]
     Binding,
     #[error("Gate public payload metadata is invalid or does not match its binding")]
@@ -1066,7 +1062,7 @@ pub(crate) enum GatePublicError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::MarketEvent;
+    use venue_domain::domain::MarketEvent;
 
     fn binding() -> Result<GatePublicBinding, GatePublicError> {
         GatePublicBinding::new(

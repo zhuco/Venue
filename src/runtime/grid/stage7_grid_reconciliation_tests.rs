@@ -202,6 +202,10 @@ fn signed_fill_dispatches_without_cached_book_refresh_or_exact_order_readback()
         },
         readback_calls: Arc::new(AtomicUsize::new(0)),
         book_reads: Arc::clone(&book_reads),
+        readbacks: VecDeque::new(),
+        private_events: VecDeque::new(),
+        private_empty_polls: 0,
+        risk_client: None,
         exact_order_outcomes: VecDeque::new(),
         book: (
             Price::new(Decimal::new(9_998, 2))?,

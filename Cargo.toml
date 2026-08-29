@@ -5,7 +5,9 @@ members = [
     "crates/venue-domain",
     "crates/venue-gateway-api",
     "crates/venue-gateway-binance",
+    "crates/venue-gateway-bitget",
     "crates/venue-gateway-bybit",
+    "crates/venue-gateway-gate",
     "crates/venue-gateway-hyperliquid",
     "crates/venue-gateway-okx",
 ]
@@ -86,6 +88,8 @@ tracing-subscriber = "0.3"
 venue-domain = { path = "crates/venue-domain" }
 venue-gateway-api = { path = "crates/venue-gateway-api" }
 venue-gateway-binance = { path = "crates/venue-gateway-binance" }
+venue-gateway-bitget = { path = "crates/venue-gateway-bitget" }
+venue-gateway-gate = { path = "crates/venue-gateway-gate" }
 
 [dev-dependencies]
 tempfile = "3"

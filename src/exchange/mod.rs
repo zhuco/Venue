@@ -14,12 +14,14 @@ mod binance_risk_readback;
 mod binance_signer;
 #[path = "bitget/mod.rs"]
 pub mod bitget;
-#[path = "bitget/public.rs"]
-pub(crate) mod bitget_public;
+pub(crate) mod bitget_public {
+    pub(crate) use venue_gateway_bitget::public::*;
+}
 #[path = "gate/mod.rs"]
 pub mod gate;
-#[path = "gate/public.rs"]
-pub(crate) mod gate_public;
+pub(crate) mod gate_public {
+    pub(crate) use venue_gateway_gate::*;
+}
 #[path = "grid/mod.rs"]
 pub(crate) mod grid;
 #[path = "shared/private_session.rs"]

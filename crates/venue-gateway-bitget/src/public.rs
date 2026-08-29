@@ -13,14 +13,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::domain::{
+use venue_domain::domain::{
     AggressorSide, FieldState, MarketDelta, MarketEvent, MarketLevel, MarketSnapshot, Price,
     PublicTicker, PublicTrade, Symbol, UnknownReason,
 };
 
-pub(crate) const BITGET_PUBLIC_PARSER_SCHEMA_VERSION: u16 = 1;
-pub(crate) const BITGET_UTA_FUTURES_CATEGORY: &str = "USDT-FUTURES";
-pub(crate) const BITGET_UTA_FUTURES_INST_TYPE: &str = "usdt-futures";
+pub const BITGET_PUBLIC_PARSER_SCHEMA_VERSION: u16 = 1;
+pub const BITGET_UTA_FUTURES_CATEGORY: &str = "USDT-FUTURES";
+pub const BITGET_UTA_FUTURES_INST_TYPE: &str = "usdt-futures";
 #[cfg(test)]
 const DEFAULT_PUBLIC_FRESHNESS_MS: u64 = 5_000;
 const MAX_BOOK_LEVELS: usize = 1_000;
@@ -29,7 +29,7 @@ const MAX_BOOK_LEVELS: usize = 1_000;
 /// recording and retry/backoff effects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum BitgetPublicSource {
+pub enum BitgetPublicSource {
     RestOrderBook,
     RestTicker,
     WebSocketBooks,
@@ -42,7 +42,7 @@ pub(crate) enum BitgetPublicSource {
 /// untrusted caller.  This prevents a response for one native instrument from being relabelled as
 /// another canonical symbol before parsing.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct BitgetRawPublicPayload {
+pub struct BitgetRawPublicPayload {
     pub parser_schema_version: u16,
     pub source: BitgetPublicSource,
     pub symbol: Symbol,
@@ -54,7 +54,7 @@ pub(crate) struct BitgetRawPublicPayload {
 }
 
 impl BitgetRawPublicPayload {
-    pub(crate) fn new(
+    pub fn new(
         source: BitgetPublicSource,
         symbol: Symbol,
         generation: u64,
@@ -78,7 +78,7 @@ impl BitgetRawPublicPayload {
         })
     }
 
-    pub(crate) fn validate(&self) -> Result<(), BitgetPublicError> {
+    pub fn validate(&self) -> Result<(), BitgetPublicError> {
         if self.parser_schema_version != BITGET_PUBLIC_PARSER_SCHEMA_VERSION
             || self.generation == 0
             || self.received_at_ms == 0
@@ -93,10 +93,7 @@ impl BitgetRawPublicPayload {
 }
 
 /// Builds the only UTA REST order-book route accepted by this adapter.  It performs no I/O.
-pub(crate) fn rest_orderbook_path(
-    symbol: &Symbol,
-    limit: u16,
-) -> Result<String, BitgetPublicError> {
+pub fn rest_orderbook_path(symbol: &Symbol, limit: u16) -> Result<String, BitgetPublicError> {
     if limit == 0 || usize::from(limit) > MAX_BOOK_LEVELS {
         return Err(BitgetPublicError::DepthLimit);
     }
@@ -108,7 +105,7 @@ pub(crate) fn rest_orderbook_path(
 
 /// Builds the UTA ticker query used to obtain a BBO and mark-price reference.  It performs no
 /// I/O and makes the query's requested native symbol explicit in the raw-payload binding.
-pub(crate) fn rest_ticker_path(symbol: &Symbol) -> Result<String, BitgetPublicError> {
+pub fn rest_ticker_path(symbol: &Symbol) -> Result<String, BitgetPublicError> {
     let native = native_symbol(symbol)?;
     Ok(format!(
         "/api/v3/market/tickers?category={BITGET_UTA_FUTURES_CATEGORY}&symbol={native}"
@@ -116,7 +113,7 @@ pub(crate) fn rest_ticker_path(symbol: &Symbol) -> Result<String, BitgetPublicEr
 }
 
 /// The documented JSON subscriptions for the two UTA streams consumed by this parser.
-pub(crate) fn public_subscriptions(symbol: &Symbol) -> Result<Value, BitgetPublicError> {
+pub fn public_subscriptions(symbol: &Symbol) -> Result<Value, BitgetPublicError> {
     let native = native_symbol(symbol)?;
     Ok(json!({
         "op": "subscribe",
@@ -138,7 +135,7 @@ pub(crate) fn public_subscriptions(symbol: &Symbol) -> Result<Value, BitgetPubli
 /// A bounded REST depth snapshot.  Bitget's REST response has no `seq`, so this type intentionally
 /// cannot be converted to a [`MarketSnapshot`] or submitted to [`BitgetBookSequencer`].
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BitgetRestOrderBook {
+pub struct BitgetRestOrderBook {
     pub raw: BitgetRawPublicPayload,
     pub exchange_time_ms: u64,
     pub bids: Vec<MarketLevel>,
@@ -147,11 +144,11 @@ pub(crate) struct BitgetRestOrderBook {
 
 #[cfg(test)]
 impl BitgetRestOrderBook {
-    pub(crate) fn best_bid_ask(&self) -> Result<(Price, Price), BitgetPublicError> {
+    pub fn best_bid_ask(&self) -> Result<(Price, Price), BitgetPublicError> {
         best_bid_ask(&self.bids, &self.asks)
     }
 
-    pub(crate) fn fresh_at(&self, now_ms: u64, maximum_age_ms: u64) -> bool {
+    pub fn fresh_at(&self, now_ms: u64, maximum_age_ms: u64) -> bool {
         fresh_at(self.raw.received_at_ms, now_ms, maximum_age_ms)
     }
 }
@@ -159,7 +156,7 @@ impl BitgetRestOrderBook {
 /// Parses `GET /api/v3/market/orderbook`.  The response itself does not echo its symbol, so the
 /// function first validates the request-bound raw envelope and then returns a non-bridgeable
 /// reference snapshot.
-pub(crate) fn parse_rest_orderbook(
+pub fn parse_rest_orderbook(
     raw: BitgetRawPublicPayload,
 ) -> Result<BitgetRestOrderBook, BitgetPublicError> {
     require_source(&raw, BitgetPublicSource::RestOrderBook)?;
@@ -179,7 +176,7 @@ pub(crate) fn parse_rest_orderbook(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BitgetBookAction {
+pub enum BitgetBookAction {
     Snapshot,
     Update,
 }
@@ -187,14 +184,14 @@ pub(crate) enum BitgetBookAction {
 /// `seq` and `pseq` are native sequence metadata.  They stay inside the Bitget adapter until a
 /// validated message is mapped to a normalized `MarketSnapshot` or `MarketDelta`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct BitgetBookSequence {
+pub struct BitgetBookSequence {
     pub previous_sequence: u64,
     pub sequence: u64,
 }
 
 /// A parsed `books` frame.  Its raw envelope contains the exact native symbol and original JSON.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BitgetBooksMessage {
+pub struct BitgetBooksMessage {
     pub raw: BitgetRawPublicPayload,
     pub action: BitgetBookAction,
     pub sequence: BitgetBookSequence,
@@ -206,7 +203,7 @@ pub(crate) struct BitgetBooksMessage {
 
 impl BitgetBooksMessage {
     /// Converts only after the caller's sequencer has assigned the active public generation.
-    pub(crate) fn normalize(&self, generation: u64) -> Result<MarketEvent, BitgetPublicError> {
+    pub fn normalize(&self, generation: u64) -> Result<MarketEvent, BitgetPublicError> {
         if generation == 0 {
             return Err(BitgetPublicError::Generation);
         }
@@ -237,14 +234,14 @@ impl BitgetBooksMessage {
 
 #[cfg(test)]
 impl BitgetBooksMessage {
-    pub(crate) fn fresh_at(&self, now_ms: u64, maximum_age_ms: u64) -> bool {
+    pub fn fresh_at(&self, now_ms: u64, maximum_age_ms: u64) -> bool {
         fresh_at(self.raw.received_at_ms, now_ms, maximum_age_ms)
     }
 }
 
 /// Parses one UTA `books` WebSocket `snapshot` or `update` frame with an exact `books`,
 /// `usdt-futures`, and native-symbol binding.
-pub(crate) fn parse_books_message(
+pub fn parse_books_message(
     raw: BitgetRawPublicPayload,
 ) -> Result<BitgetBooksMessage, BitgetPublicError> {
     require_source(&raw, BitgetPublicSource::WebSocketBooks)?;
@@ -307,7 +304,7 @@ pub(crate) fn parse_books_message(
 /// The active `books` sequence state.  A `ResetRequired` result clears the active bridge; no
 /// following update may be normalized until a new WebSocket `snapshot` is accepted.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BitgetBookSequencer {
+pub struct BitgetBookSequencer {
     generation: u64,
     active: Option<ActiveBook>,
 }
@@ -329,7 +326,7 @@ impl Default for BitgetBookSequencer {
 
 impl BitgetBookSequencer {
     #[must_use]
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             generation: 1,
             active: None,
@@ -337,12 +334,12 @@ impl BitgetBookSequencer {
     }
 
     #[must_use]
-    pub(crate) const fn next_generation(&self) -> u64 {
+    pub const fn next_generation(&self) -> u64 {
         self.generation
     }
 
     #[must_use]
-    pub(crate) fn ready_generation(&self) -> Option<u64> {
+    pub fn ready_generation(&self) -> Option<u64> {
         self.active
             .as_ref()
             .and_then(|active| active.bridged.then_some(active.generation))
@@ -350,7 +347,7 @@ impl BitgetBookSequencer {
 
     /// Process restart must never reuse an already journaled public generation. This deliberately
     /// drops any local bridge: only a later native `snapshot` may make the new generation ready.
-    pub(crate) fn reset_generation(&mut self, generation: u64) -> Result<(), BitgetPublicError> {
+    pub fn reset_generation(&mut self, generation: u64) -> Result<(), BitgetPublicError> {
         if generation == 0 || generation < self.generation {
             return Err(BitgetPublicError::Generation);
         }
@@ -362,7 +359,7 @@ impl BitgetBookSequencer {
     /// Applies the documented `pseq` contract.  A first update must cover the snapshot's `seq`;
     /// later updates must name the immediately preceding `seq`.  A zero `pseq` on an update is an
     /// explicit exchange-reset signal, never an opportunity to keep an old book.
-    pub(crate) fn accept(
+    pub fn accept(
         &mut self,
         message: &BitgetBooksMessage,
     ) -> Result<BitgetBookSequenceStatus, BitgetPublicError> {
@@ -455,7 +452,7 @@ impl BitgetBookSequencer {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BitgetBookSequenceFault {
+pub enum BitgetBookSequenceFault {
     MissingSnapshot,
     SnapshotNotCovered,
     PreviousSequenceMismatch,
@@ -464,7 +461,7 @@ pub(crate) enum BitgetBookSequenceFault {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BitgetBookSequenceStatus {
+pub enum BitgetBookSequenceStatus {
     Snapshot {
         generation: u64,
         replaced_generation: Option<u64>,
@@ -485,7 +482,7 @@ pub(crate) enum BitgetBookSequenceStatus {
 
 impl BitgetBookSequenceStatus {
     #[must_use]
-    pub(crate) const fn active_generation(self) -> Option<u64> {
+    pub const fn active_generation(self) -> Option<u64> {
         match self {
             Self::Snapshot { generation, .. }
             | Self::Bridged { generation, .. }
@@ -495,7 +492,7 @@ impl BitgetBookSequenceStatus {
     }
 
     #[must_use]
-    pub(crate) const fn ready(self) -> bool {
+    pub const fn ready(self) -> bool {
         matches!(self, Self::Bridged { .. } | Self::Updated { .. })
     }
 }
@@ -504,7 +501,7 @@ impl BitgetBookSequenceStatus {
 /// matching-engine timestamp.  It is intentionally separate from `MarkFunding`: UTA ticker does
 /// not provide a next funding time, so fabricating one would be incorrect.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BitgetTickerEvent {
+pub struct BitgetTickerEvent {
     pub raw: BitgetRawPublicPayload,
     pub bbo: PublicTicker,
     pub mark: BitgetMarkPrice,
@@ -513,17 +510,17 @@ pub(crate) struct BitgetTickerEvent {
 
 #[cfg(test)]
 impl BitgetTickerEvent {
-    pub(crate) fn market_event(&self) -> MarketEvent {
+    pub fn market_event(&self) -> MarketEvent {
         MarketEvent::Ticker(self.bbo.clone())
     }
 
-    pub(crate) fn fresh_at(&self, now_ms: u64, maximum_age_ms: u64) -> bool {
+    pub fn fresh_at(&self, now_ms: u64, maximum_age_ms: u64) -> bool {
         fresh_at(self.raw.received_at_ms, now_ms, maximum_age_ms)
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BitgetMarkPrice {
+pub struct BitgetMarkPrice {
     pub symbol: Symbol,
     pub generation: u64,
     pub received_at_ms: u64,
@@ -534,7 +531,7 @@ pub(crate) struct BitgetMarkPrice {
 }
 
 /// Parses `GET /api/v3/market/tickers` for exactly the requested USDT-futures native symbol.
-pub(crate) fn parse_rest_ticker(
+pub fn parse_rest_ticker(
     raw: BitgetRawPublicPayload,
 ) -> Result<BitgetTickerEvent, BitgetPublicError> {
     require_source(&raw, BitgetPublicSource::RestTicker)?;
@@ -594,7 +591,7 @@ pub(crate) fn parse_rest_ticker(
 /// duplicate IDs inside one frame are rejected here.  Cross-frame durable dedupe belongs at the
 /// common market/facts acceptance boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BitgetPublicTradeEvent {
+pub struct BitgetPublicTradeEvent {
     pub raw: BitgetRawPublicPayload,
     pub trade: PublicTrade,
     pub correlation_id: u64,
@@ -603,18 +600,18 @@ pub(crate) struct BitgetPublicTradeEvent {
 
 #[cfg(test)]
 impl BitgetPublicTradeEvent {
-    pub(crate) fn market_event(&self) -> MarketEvent {
+    pub fn market_event(&self) -> MarketEvent {
         MarketEvent::Trade(self.trade.clone())
     }
 
-    pub(crate) fn fresh_at(&self, now_ms: u64, maximum_age_ms: u64) -> bool {
+    pub fn fresh_at(&self, now_ms: u64, maximum_age_ms: u64) -> bool {
         fresh_at(self.raw.received_at_ms, now_ms, maximum_age_ms)
     }
 }
 
 /// Parses a UTA `publicTrade` frame.  Each returned event carries the unchanged complete raw
 /// frame so the caller can store one raw record and expose normalized per-trade facts.
-pub(crate) fn parse_public_trade_message(
+pub fn parse_public_trade_message(
     raw: BitgetRawPublicPayload,
 ) -> Result<Vec<BitgetPublicTradeEvent>, BitgetPublicError> {
     require_source(&raw, BitgetPublicSource::WebSocketPublicTrade)?;
@@ -648,7 +645,7 @@ fn fresh_at(received_at_ms: u64, now_ms: u64, maximum_age_ms: u64) -> bool {
         && now_ms - received_at_ms <= maximum_age_ms
 }
 
-pub(crate) fn native_symbol(symbol: &Symbol) -> Result<String, BitgetPublicError> {
+pub fn native_symbol(symbol: &Symbol) -> Result<String, BitgetPublicError> {
     if symbol.quote() != "USDT" {
         return Err(BitgetPublicError::Symbol);
     }
@@ -897,7 +894,7 @@ fn payload_digest(payload: &str) -> String {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub(crate) enum BitgetPublicError {
+pub enum BitgetPublicError {
     #[error("Bitget public payload metadata is invalid")]
     Metadata,
     #[error("Bitget public payload is malformed")]

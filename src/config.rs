@@ -3,6 +3,7 @@ use std::{fs, path::Path};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 pub use venue_gateway_binance::BinanceAccountBinding;
+pub use venue_gateway_bitget::BitgetAccountBinding;
 
 use crate::{
     Result,
@@ -108,12 +109,6 @@ pub struct BitgetConfig {
     pub account_binding: BitgetAccountBinding,
     #[serde(default = "default_private_custody_max_stale_ms")]
     pub private_custody_max_stale_ms: u64,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum BitgetAccountBinding {
-    UtaUsdtFuturesHedge,
 }
 
 const fn default_private_custody_max_stale_ms() -> u64 {

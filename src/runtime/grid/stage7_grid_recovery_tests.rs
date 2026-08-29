@@ -964,6 +964,10 @@ fn complete_signed_fill_needs_no_exact_order_rest_and_is_not_starved()
         },
         readback_calls,
         book_reads: Arc::new(AtomicUsize::new(0)),
+        readbacks: VecDeque::new(),
+        private_events: VecDeque::new(),
+        private_empty_polls: 0,
+        risk_client: None,
         exact_order_outcomes: VecDeque::new(),
         book: (
             Price::new(Decimal::new(9_999, 2))?,
@@ -991,6 +995,10 @@ fn complete_signed_fill_needs_no_exact_order_rest_and_is_not_starved()
         commands.transition(&command_id, CommandState::Submitted)?;
         commands.transition(&command_id, CommandState::Accepted { venue_order_id })?;
     }
+    let original_command_ids = commands
+        .commands()
+        .map(|command| command.command_id().clone())
+        .collect::<Vec<_>>();
     let store = ProjectionStore::new(temporary.path().join(CHECKPOINT_FILE));
 
     assert_eq!(
@@ -1013,6 +1021,31 @@ fn complete_signed_fill_needs_no_exact_order_rest_and_is_not_starved()
     assert_eq!(calls.len(), 3);
     assert_eq!(calls.iter().filter(|call| **call == "place").count(), 2);
     assert_eq!(calls.iter().filter(|call| **call == "cancel").count(), 1);
+    let dispatched = commands
+        .commands()
+        .filter(|command| !original_command_ids.contains(command.command_id()))
+        .collect::<Vec<_>>();
+    assert_eq!(dispatched.len(), 3);
+    assert_eq!(
+        dispatched
+            .iter()
+            .filter(|command| matches!(command, ExecutionCommand::PlaceLimit(_)))
+            .count(),
+        2
+    );
+    assert_eq!(
+        dispatched
+            .iter()
+            .filter(|command| matches!(command, ExecutionCommand::Cancel(_)))
+            .count(),
+        1
+    );
+    assert!(dispatched.iter().all(|command| {
+        commands.receipt(command.command_id()).is_some_and(|receipt| {
+            matches!(receipt.state, CommandState::Accepted { .. })
+        })
+    }));
+    assert!(!commands.has_unresolved());
     assert!(store.load::<Stage7GridCheckpoint>()?.is_some());
     Ok(())
 }
