@@ -1,12 +1,17 @@
 mod action;
 mod binding;
+mod capability;
 mod config;
 mod credentials;
 mod models;
 mod nonce;
+mod physical;
 mod private_stream;
 mod protocol;
 mod transport;
+
+#[cfg(test)]
+mod capability_tests;
 
 use venue_gateway_api::CapabilityFlags;
 
@@ -20,10 +25,19 @@ pub use action::{
 pub use binding::{
     HyperliquidGatewayBinding, HyperliquidGatewayBindingError, HyperliquidReadBinding,
 };
+pub use capability::{
+    HYPERLIQUID_CAPABILITY_PROBE_MAX_TTL_MS, HYPERLIQUID_CAPABILITY_PROBE_SCHEMA,
+    HyperliquidCapabilityProbeEvidence, HyperliquidFillWindowEvidence, HyperliquidFillWindowProbe,
+    HyperliquidPrivateStreamProbeEvidence,
+};
 pub use config::{HyperliquidConfig, endpoints};
 pub use credentials::HyperliquidCredentials;
 pub use nonce::{
     HyperliquidNonceStore, NonceCheckpoint, PersistedNonce, prepare_next_nonce, reserve_next_nonce,
+};
+pub use physical::{
+    HyperliquidPendingReadback, HyperliquidPhysicalDispatch, HyperliquidPhysicalDispatchResult,
+    HyperliquidPhysicalReadbackResult, HyperliquidProbeActionReceipt,
 };
 pub use private_stream::{
     HyperliquidFillStream, HyperliquidFillUpdate, HyperliquidOrderUpdate, HyperliquidPrivateEvent,
@@ -76,6 +90,8 @@ pub enum HyperliquidError {
     Readback,
     #[error("Hyperliquid frontend open-order family evidence is incomplete or inconsistent")]
     OrderFamily,
+    #[error("Hyperliquid capability probe evidence is incomplete, stale, or tampered")]
+    CapabilityProbe,
 }
 
 #[cfg(test)]
