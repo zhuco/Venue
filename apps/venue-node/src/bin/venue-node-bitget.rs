@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use venue_domain::domain::{CommandId, FieldState, NativeOrderFamily, OrderOwner, OrderState};
 use venue_gateway_api::{CapabilitySnapshot, GatewayBinding, GatewayMode, VenueId};
 use venue_gateway_bitget::instrument::BitgetInstrumentRules;
+use venue_gateway_bitget::private::{BitgetPrivateGenerationCandidate, BitgetPrivateSurface};
 use venue_gateway_bitget::{
     BitgetConfig, BitgetExactOrderReadback, BitgetExactReadbackRequest, BitgetMutationAck,
     BitgetMutationOutcome, BitgetNodePreparedMutation, BitgetNodeReadbackCandidate,
@@ -22,6 +23,10 @@ use venue_node::{
     GatewayDispatchResult, GatewayRecoveryPermit, NodeError, NodeLaunch, PhysicalGateway,
     ReadbackCommandState, SignedCommandReadback, SignedOwnedOrder, SignedReadbackReceipt,
     SignedReadbackRequest, reject_unintegrated_legacy_test_runtime, report_result,
+};
+use venue_runtime::account::{
+    PhysicalReadbackReceipt, PhysicalReadbackSurface, PhysicalRecoveryManifestError,
+    PhysicalRecoveryReadbackManifest, PhysicalRecoveryScope,
 };
 
 const PROGRAM: &str = "venue-node-bitget";
@@ -59,6 +64,186 @@ struct BitgetCollectedReadback {
     rules: BitgetInstrumentRules,
     candidate: BitgetNodeReadbackCandidate,
     owner_routes: BTreeMap<String, OrderOwner>,
+}
+
+/// Maps one replay-checked Bitget five-face turn and its regular-only execution profile into the
+/// six readback faces required by account recovery. This remains an in-memory evidence mapping;
+/// it neither persists authority nor grants a writer, capability, or dispatch permit.
+pub fn bitget_physical_recovery_manifest(
+    scope: PhysicalRecoveryScope,
+    candidate: &BitgetNodeReadbackCandidate,
+) -> Result<PhysicalRecoveryReadbackManifest, PhysicalRecoveryManifestError> {
+    if candidate.private().binding != *scope.binding() {
+        return Err(PhysicalRecoveryManifestError::ScopeDrift);
+    }
+    let receipts = bitget_physical_recovery_receipts(&scope, candidate)?;
+    PhysicalRecoveryReadbackManifest::verified(scope, receipts)
+}
+
+fn bitget_physical_recovery_receipts(
+    scope: &PhysicalRecoveryScope,
+    candidate: &BitgetNodeReadbackCandidate,
+) -> Result<Vec<PhysicalReadbackReceipt>, PhysicalRecoveryManifestError> {
+    let private = candidate.private();
+    let attempt_id = private.attempt_id;
+    let private_generation = private.generation;
+    let account_records = if account_is_empty(private) { 0 } else { 1 };
+    let position_records = count_records(
+        private
+            .positions
+            .iter()
+            .filter(|position| !position.quantity.is_zero())
+            .count(),
+    )?;
+    let order_records = count_records(private.orders.len())?;
+    let fill_records = count_records(private.fills.len())?;
+    let profile_version = candidate.families().scope().profile_version;
+
+    Ok(vec![
+        PhysicalReadbackReceipt::verified_complete(
+            scope,
+            PhysicalReadbackSurface::Account,
+            attempt_id,
+            private_generation,
+            bitget_surface_evidence(
+                candidate,
+                b"account-and-settings",
+                &[
+                    BitgetPrivateSurface::Account,
+                    BitgetPrivateSurface::Settings,
+                ],
+            ),
+            account_records,
+        )?,
+        PhysicalReadbackReceipt::verified_complete(
+            scope,
+            PhysicalReadbackSurface::Positions,
+            attempt_id,
+            private_generation,
+            bitget_surface_evidence(candidate, b"positions", &[BitgetPrivateSurface::Positions]),
+            position_records,
+        )?,
+        PhysicalReadbackReceipt::verified_complete(
+            scope,
+            PhysicalReadbackSurface::UmOrder,
+            attempt_id,
+            private_generation,
+            bitget_surface_evidence(
+                candidate,
+                b"um-order-normal",
+                &[BitgetPrivateSurface::RegularOrders],
+            ),
+            order_records,
+        )?,
+        PhysicalReadbackReceipt::verified_unsupported_order_family(
+            scope,
+            PhysicalReadbackSurface::UmConditional,
+            attempt_id,
+            private_generation,
+            bitget_unsupported_evidence(candidate, b"um-conditional"),
+            profile_version,
+        )?,
+        PhysicalReadbackReceipt::verified_unsupported_order_family(
+            scope,
+            PhysicalReadbackSurface::UmAlgo,
+            attempt_id,
+            private_generation,
+            bitget_unsupported_evidence(candidate, b"um-algo"),
+            profile_version,
+        )?,
+        PhysicalReadbackReceipt::verified_complete(
+            scope,
+            PhysicalReadbackSurface::FillsCursor,
+            attempt_id,
+            private_generation,
+            bitget_surface_evidence(candidate, b"fills-cursor", &[BitgetPrivateSurface::Fills]),
+            fill_records,
+        )?,
+    ])
+}
+
+fn account_is_empty(private: &BitgetPrivateGenerationCandidate) -> bool {
+    private.balance.wallet_balance.is_zero()
+        && private.balance.available_balance.is_zero()
+        && private.balance.initial_margin.is_zero()
+        && private.balance.maintenance_margin.is_zero()
+}
+
+fn count_records(value: usize) -> Result<u64, PhysicalRecoveryManifestError> {
+    u64::try_from(value).map_err(|_| PhysicalRecoveryManifestError::Coverage)
+}
+
+fn bitget_surface_evidence(
+    candidate: &BitgetNodeReadbackCandidate,
+    domain: &[u8],
+    surfaces: &[BitgetPrivateSurface],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    commit_evidence_bytes(&mut digest, b"venue-bitget-physical-readback-face-v1");
+    commit_evidence_bytes(&mut digest, candidate.commitment_sha256().as_bytes());
+    commit_evidence_bytes(&mut digest, domain);
+    for raw in candidate
+        .private()
+        .raw_pages
+        .iter()
+        .filter(|raw| surfaces.contains(&raw.surface))
+    {
+        commit_evidence_bytes(&mut digest, &[bitget_private_surface_tag(raw.surface)]);
+        commit_evidence_bytes(&mut digest, &raw.attempt_id.to_be_bytes());
+        commit_evidence_bytes(&mut digest, &raw.generation.to_be_bytes());
+        commit_evidence_bytes(&mut digest, &raw.page_index.to_be_bytes());
+        commit_evidence_option(&mut digest, raw.request_cursor.as_deref());
+        commit_evidence_option_u64(&mut digest, raw.fill_history_start_ms);
+        commit_evidence_bytes(&mut digest, raw.payload_sha256.as_bytes());
+    }
+    digest.finalize().into()
+}
+
+fn bitget_unsupported_evidence(candidate: &BitgetNodeReadbackCandidate, family: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    commit_evidence_bytes(&mut digest, b"venue-bitget-physical-unsupported-family-v1");
+    commit_evidence_bytes(&mut digest, candidate.commitment_sha256().as_bytes());
+    commit_evidence_bytes(&mut digest, family);
+    commit_evidence_bytes(
+        &mut digest,
+        &candidate.families().scope().profile_version.to_be_bytes(),
+    );
+    digest.finalize().into()
+}
+
+const fn bitget_private_surface_tag(surface: BitgetPrivateSurface) -> u8 {
+    match surface {
+        BitgetPrivateSurface::Account => 1,
+        BitgetPrivateSurface::Settings => 2,
+        BitgetPrivateSurface::Positions => 3,
+        BitgetPrivateSurface::RegularOrders => 4,
+        BitgetPrivateSurface::Fills => 5,
+    }
+}
+
+fn commit_evidence_option(digest: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            commit_evidence_bytes(digest, &[1]);
+            commit_evidence_bytes(digest, value.as_bytes());
+        }
+        None => commit_evidence_bytes(digest, &[0]),
+    }
+}
+
+fn commit_evidence_option_u64(digest: &mut Sha256, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            commit_evidence_bytes(digest, &[1]);
+            commit_evidence_bytes(digest, &value.to_be_bytes());
+        }
+        None => commit_evidence_bytes(digest, &[0]),
+    }
+}
+
+fn commit_evidence_bytes(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
 }
 
 /// Local fixed-binary wrapper. It can only operate through a caller-supplied synchronous I/O
@@ -535,11 +720,12 @@ mod tests {
         instrument::{BitgetRawInstrumentPayload, parse_instrument_rules},
         parse_exact_order_readback,
         private::{
-            BitgetPrivateFace, BitgetPrivateSurface, BitgetRawPrivatePage, complete_private_turn,
-            parse_account_face, parse_fill_page, parse_positions_face, parse_regular_order_page,
-            parse_settings_face,
+            BitgetPrivateError, BitgetPrivateFace, BitgetPrivateSurface, BitgetRawPrivatePage,
+            complete_private_turn, parse_account_face, parse_fill_page, parse_positions_face,
+            parse_regular_order_page, parse_settings_face,
         },
     };
+    use venue_runtime::account::{PhysicalReadbackCoverage, PhysicalRecoveryAuthorityRoots};
 
     use super::*;
 
@@ -658,7 +844,56 @@ mod tests {
         )?)
     }
 
+    fn private_faces(
+        binding: &GatewayBinding,
+        observed_at_ms: u64,
+        balance: &str,
+    ) -> Result<Vec<BitgetPrivateFace>, Box<dyn std::error::Error>> {
+        Ok(vec![
+            BitgetPrivateFace::Account(parse_account_face(raw(
+                binding,
+                BitgetPrivateSurface::Account,
+                observed_at_ms,
+                json!({
+                    "imr":"0", "mmr":"0",
+                    "assets":[{"coin":"USDT", "balance":balance, "available":balance}]
+                }),
+            )?)?),
+            BitgetPrivateFace::Settings(parse_settings_face(raw(
+                binding,
+                BitgetPrivateSurface::Settings,
+                observed_at_ms,
+                json!({"holdMode":"hedge_mode"}),
+            )?)?),
+            BitgetPrivateFace::Positions(parse_positions_face(raw(
+                binding,
+                BitgetPrivateSurface::Positions,
+                observed_at_ms,
+                json!({"list":[]}),
+            )?)?),
+            BitgetPrivateFace::RegularOrders(vec![parse_regular_order_page(raw(
+                binding,
+                BitgetPrivateSurface::RegularOrders,
+                observed_at_ms,
+                json!({"list":[], "cursor":null}),
+            )?)?]),
+            BitgetPrivateFace::Fills(vec![parse_fill_page(raw(
+                binding,
+                BitgetPrivateSurface::Fills,
+                observed_at_ms,
+                json!({"list":[], "cursor":null}),
+            )?)?]),
+        ])
+    }
+
     fn collected(mode: GatewayMode) -> Result<BitgetCollectedReadback, Box<dyn std::error::Error>> {
+        collected_with_balance(mode, "20")
+    }
+
+    fn collected_with_balance(
+        mode: GatewayMode,
+        balance: &str,
+    ) -> Result<BitgetCollectedReadback, Box<dyn std::error::Error>> {
         let binding = binding(mode)?;
         let now_ms = unix_ms()?;
         let observed_at_ms = now_ms.saturating_sub(1);
@@ -678,41 +913,7 @@ mod tests {
             )?,
             now_ms,
         )?;
-        let private = complete_private_turn(vec![
-            BitgetPrivateFace::Account(parse_account_face(raw(
-                &binding,
-                BitgetPrivateSurface::Account,
-                observed_at_ms,
-                json!({
-                    "imr":"0", "mmr":"0",
-                    "assets":[{"coin":"USDT", "balance":"20", "available":"20"}]
-                }),
-            )?)?),
-            BitgetPrivateFace::Settings(parse_settings_face(raw(
-                &binding,
-                BitgetPrivateSurface::Settings,
-                observed_at_ms,
-                json!({"holdMode":"hedge_mode"}),
-            )?)?),
-            BitgetPrivateFace::Positions(parse_positions_face(raw(
-                &binding,
-                BitgetPrivateSurface::Positions,
-                observed_at_ms,
-                json!({"list":[]}),
-            )?)?),
-            BitgetPrivateFace::RegularOrders(vec![parse_regular_order_page(raw(
-                &binding,
-                BitgetPrivateSurface::RegularOrders,
-                observed_at_ms,
-                json!({"list":[], "cursor":null}),
-            )?)?]),
-            BitgetPrivateFace::Fills(vec![parse_fill_page(raw(
-                &binding,
-                BitgetPrivateSurface::Fills,
-                observed_at_ms,
-                json!({"list":[], "cursor":null}),
-            )?)?]),
-        ])?;
+        let private = complete_private_turn(private_faces(&binding, observed_at_ms, balance)?)?;
         let candidate = BitgetNodeReadbackCandidate::validate(
             BitgetOrderFamilyScope {
                 binding,
@@ -739,6 +940,19 @@ mod tests {
             candidate,
             owner_routes: BTreeMap::new(),
         })
+    }
+
+    fn recovery_scope(
+        mode: GatewayMode,
+        owner_root_seed: u8,
+    ) -> Result<PhysicalRecoveryScope, Box<dyn std::error::Error>> {
+        Ok(PhysicalRecoveryScope::verified(
+            binding(mode)?,
+            "bitget_config_1",
+            3,
+            6,
+            PhysicalRecoveryAuthorityRoots::verified([owner_root_seed; 32], [2; 32], [3; 32])?,
+        )?)
     }
 
     fn place_command() -> Result<ExecutionCommand, Box<dyn std::error::Error>> {
@@ -777,6 +991,97 @@ mod tests {
                 Err(GatewayApiError::CapabilityScope)
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_manifest_maps_demo_and_live_without_granting_capability()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for mode in [GatewayMode::Test, GatewayMode::Live] {
+            let collected = collected(mode)?;
+            let manifest =
+                bitget_physical_recovery_manifest(recovery_scope(mode, 1)?, &collected.candidate)?;
+            assert_eq!(manifest.scope().binding().mode, mode);
+            assert_eq!(manifest.attempt_id(), 9);
+            assert_eq!(manifest.private_generation(), 7);
+            assert!(matches!(
+                manifest.coverage(PhysicalReadbackSurface::UmOrder),
+                PhysicalReadbackCoverage::Complete {
+                    record_count: 0,
+                    ..
+                }
+            ));
+            for surface in [
+                PhysicalReadbackSurface::UmConditional,
+                PhysicalReadbackSurface::UmAlgo,
+            ] {
+                assert!(matches!(
+                    manifest.coverage(surface),
+                    PhysicalReadbackCoverage::Unsupported {
+                        profile_version: BITGET_ORDER_PROFILE_VERSION,
+                        ..
+                    }
+                ));
+            }
+            let gateway = BitgetPhysicalGateway::new(binding(mode)?, FailClosedBitgetIo);
+            assert!(gateway.capability_snapshot().flags.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_empty_account_still_maps_all_six_faces() -> Result<(), Box<dyn std::error::Error>> {
+        let collected = collected_with_balance(GatewayMode::Test, "0")?;
+        let manifest = bitget_physical_recovery_manifest(
+            recovery_scope(GatewayMode::Test, 1)?,
+            &collected.candidate,
+        )?;
+        for surface in [
+            PhysicalReadbackSurface::Account,
+            PhysicalReadbackSurface::Positions,
+            PhysicalReadbackSurface::UmOrder,
+            PhysicalReadbackSurface::FillsCursor,
+        ] {
+            assert!(matches!(
+                manifest.coverage(surface),
+                PhysicalReadbackCoverage::Complete {
+                    record_count: 0,
+                    ..
+                }
+            ));
+        }
+        assert!(manifest.commitment_sha256().iter().any(|byte| *byte != 0));
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_private_attempts_cannot_be_mapped_into_one_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding(GatewayMode::Test)?;
+        let observed_at_ms = unix_ms()?.saturating_sub(1);
+        let mut faces = private_faces(&binding, observed_at_ms, "0")?;
+        let BitgetPrivateFace::Positions(positions) = &mut faces[2] else {
+            return Err(Box::new(BitgetPhysicalError::Scope));
+        };
+        positions.raw.attempt_id = 10;
+        assert_eq!(
+            complete_private_turn(faces),
+            Err(BitgetPrivateError::MixedAttempt)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn authority_root_drift_cannot_stitch_bitget_receipts() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let collected = collected_with_balance(GatewayMode::Live, "0")?;
+        let expected = recovery_scope(GatewayMode::Live, 1)?;
+        let drifted = recovery_scope(GatewayMode::Live, 9)?;
+        let drifted_receipts = bitget_physical_recovery_receipts(&drifted, &collected.candidate)?;
+        assert_eq!(
+            PhysicalRecoveryReadbackManifest::verified(expected, drifted_receipts),
+            Err(PhysicalRecoveryManifestError::ScopeDrift)
+        );
         Ok(())
     }
 
