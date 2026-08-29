@@ -1,5 +1,6 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use venue_domain::domain::{
     FieldState, NativeOrderFamily, OrderSide, OrderState, PositionSide, Price,
 };
@@ -95,6 +96,25 @@ impl BybitPreparedRequest {
             return Err(BybitExecutionError::Binding);
         }
         Ok(())
+    }
+
+    pub(crate) fn exact_lookup(&self) -> Result<BybitOrderLookup, BybitExecutionError> {
+        match (&self.expected_order_id, &self.expected_client_order_id) {
+            (Some(order_id), None) => BybitOrderLookup::by_order_id(order_id.clone())
+                .map_err(|_| BybitExecutionError::Intent),
+            (None, Some(client_order_id)) => {
+                BybitOrderLookup::by_client_order_id(client_order_id.clone())
+                    .map_err(|_| BybitExecutionError::Intent)
+            }
+            _ => Err(BybitExecutionError::Intent),
+        }
+    }
+
+    pub(crate) fn body_sha256(&self) -> String {
+        Sha256::digest(&self.body)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 }
 
@@ -369,6 +389,61 @@ impl BybitClosedOrderReadback {
             open_orders: open.orders,
             history: history.orders,
         })
+    }
+
+    pub(crate) fn validate_pending_scope(
+        &self,
+        binding: &BybitGatewayBinding,
+        generation: u64,
+        submitted_at_ms: u64,
+        lookup: &BybitOrderLookup,
+    ) -> Result<(), BybitExecutionError> {
+        if &self.binding != binding.gateway_binding()
+            || self.generation != generation
+            || self.requested_at_ms < submitted_at_ms
+            || self.received_at_ms < submitted_at_ms
+            || &self.lookup != lookup
+        {
+            return Err(BybitExecutionError::Binding);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn exact_settlement(
+        &self,
+    ) -> Result<Option<BybitOrderSettlement>, BybitExecutionError> {
+        if self.open_orders.len() > 1
+            || self.history.len() > 1
+            || (!self.open_orders.is_empty() && !self.history.is_empty())
+        {
+            return Err(BybitExecutionError::Readback);
+        }
+        if let Some(item) = self.open_orders.first() {
+            return Ok(Some(BybitOrderSettlement {
+                order_id: item.order.order_id.clone(),
+                client_order_id: item.order.client_order_id.clone(),
+                state: item.order.state,
+                finality: BybitSettlementFinality::Working,
+                updated_at_ms: item.updated_at_ms,
+            }));
+        }
+        Ok(self.history.first().map(|item| BybitOrderSettlement {
+            order_id: item.order.order_id.clone(),
+            client_order_id: item.order.client_order_id.clone(),
+            state: item.order.state,
+            finality: if matches!(
+                item.order.state,
+                OrderState::Filled
+                    | OrderState::Cancelled
+                    | OrderState::Expired
+                    | OrderState::Rejected
+            ) {
+                BybitSettlementFinality::Terminal
+            } else {
+                BybitSettlementFinality::Working
+            },
+            updated_at_ms: item.updated_at_ms,
+        }))
     }
 }
 

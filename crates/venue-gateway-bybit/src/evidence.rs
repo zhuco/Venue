@@ -1,19 +1,38 @@
 use std::collections::BTreeSet;
 
+use hmac::{Hmac, Mac};
+use secrecy::ExposeSecret;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use venue_domain::domain::NativeOrderFamily;
-use venue_gateway_api::{CapabilityFlags, GatewayBinding};
+use venue_gateway_api::{CapabilityFlags, CapabilitySnapshot, GatewayBinding};
 
 use crate::{
-    BYBIT_LINEAR_ORDER_PROFILE_VERSION, BybitAccountReadback, BybitApiKeyEvidence, BybitError,
-    BybitExecutionPage, BybitFillReadback, BybitGatewayBinding, BybitOpenOrderPage,
-    BybitOpenOrdersReadback, BybitOrderEvidence, BybitOrderEvidencePage, BybitOrderHistoryReadback,
-    BybitPositionReadback, BybitRawPrivatePayload, complete_execution_pages,
-    complete_open_order_pages, complete_order_history_pages, parse_execution_page,
-    parse_open_order_page, parse_order_history_page,
+    BYBIT_LINEAR_ORDER_PROFILE_VERSION, BybitAccountReadback, BybitApiKeyEvidence,
+    BybitCredentials, BybitError, BybitExecutionPage, BybitFillReadback, BybitGatewayBinding,
+    BybitOpenOrderPage, BybitOpenOrdersReadback, BybitOrderEvidence, BybitOrderEvidencePage,
+    BybitOrderHistoryReadback, BybitPositionPage, BybitPositionReadback, BybitPrivateSource,
+    BybitRawPrivatePayload, complete_account_readback, complete_execution_pages,
+    complete_open_order_pages, complete_order_history_pages, complete_position_pages,
+    parse_api_key_evidence, parse_execution_page, parse_open_order_page, parse_order_history_page,
+    parse_position_page,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+pub const BYBIT_CAPABILITY_PROBE_SCHEMA_VERSION: u16 = 1;
+
+const EXECUTABLE_FLAGS: CapabilityFlags = CapabilityFlags::from_bits_retain(
+    CapabilityFlags::READ_ACCOUNT.bits()
+        | CapabilityFlags::READ_ORDERS.bits()
+        | CapabilityFlags::READ_FILLS.bits()
+        | CapabilityFlags::PRIVATE_STREAM.bits()
+        | CapabilityFlags::TRADE.bits()
+        | CapabilityFlags::PLACE_LIMIT.bits()
+        | CapabilityFlags::PLACE_MARKET.bits()
+        | CapabilityFlags::CANCEL.bits()
+        | CapabilityFlags::HEDGE_POSITION.bits(),
+);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BybitOrderFamilyScope {
     pub binding: GatewayBinding,
     pub profile_version: u64,
@@ -204,6 +223,263 @@ pub struct BybitCapabilityCandidate {
     pub candidate_flags: CapabilityFlags,
 }
 
+/// Secret-free proof emitted only after private WebSocket authentication and subscription have
+/// completed for the exact binding and generation. The connection id is hashed before persistence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BybitPrivateStreamProbeEvidence {
+    binding: GatewayBinding,
+    connection_generation: u64,
+    private_generation: u64,
+    authenticated_at_ms: u64,
+    observed_at_ms: u64,
+    expires_at_ms: u64,
+    connection_id_sha256: String,
+}
+
+impl BybitPrivateStreamProbeEvidence {
+    pub(crate) fn authenticated(
+        binding: GatewayBinding,
+        generation: u64,
+        authenticated_at_ms: u64,
+        observed_at_ms: u64,
+        expires_at_ms: u64,
+        connection_id: &str,
+    ) -> Result<Self, BybitError> {
+        if generation == 0
+            || authenticated_at_ms == 0
+            || observed_at_ms < authenticated_at_ms
+            || expires_at_ms <= observed_at_ms
+            || connection_id.is_empty()
+        {
+            return Err(BybitError::Capability);
+        }
+        BybitGatewayBinding::new(binding.clone())?;
+        Ok(Self {
+            binding,
+            connection_generation: generation,
+            private_generation: generation,
+            authenticated_at_ms,
+            observed_at_ms,
+            expires_at_ms,
+            connection_id_sha256: sha256_hex(connection_id.as_bytes()),
+        })
+    }
+
+    #[must_use]
+    pub const fn binding(&self) -> &GatewayBinding {
+        &self.binding
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.private_generation
+    }
+
+    fn validate(
+        &self,
+        binding: &GatewayBinding,
+        generation: u64,
+        now_ms: u64,
+    ) -> Result<(), BybitError> {
+        if &self.binding != binding
+            || self.connection_generation != generation
+            || self.private_generation != generation
+            || self.authenticated_at_ms == 0
+            || self.observed_at_ms < self.authenticated_at_ms
+            || self.expires_at_ms <= self.observed_at_ms
+            || now_ms < self.observed_at_ms
+            || now_ms >= self.expires_at_ms
+            || !is_sha256(&self.connection_id_sha256)
+        {
+            return Err(BybitError::Capability);
+        }
+        Ok(())
+    }
+}
+
+/// Durable, secret-free probe artifact. Raw signed-read response bodies are retained so loading the
+/// artifact replays account, both Hedge legs, all three canonical order families, order details,
+/// and fills instead of trusting a serialized flag set.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BybitCapabilityProbeEvidence {
+    schema_version: u16,
+    scope: BybitOrderFamilyScope,
+    private_stream: BybitPrivateStreamProbeEvidence,
+    raw_payloads: Vec<BybitRawPrivatePayload>,
+    flags: CapabilityFlags,
+    evidence_sha256: String,
+    evidence_hmac_sha256: String,
+}
+
+impl BybitCapabilityProbeEvidence {
+    #[must_use]
+    pub const fn scope(&self) -> &BybitOrderFamilyScope {
+        &self.scope
+    }
+
+    #[must_use]
+    pub fn evidence_sha256(&self) -> &str {
+        &self.evidence_sha256
+    }
+
+    pub fn to_json(&self) -> Result<Vec<u8>, BybitError> {
+        serde_json::to_vec(self).map_err(|_| BybitError::Capability)
+    }
+
+    pub fn from_json_verified(
+        payload: &[u8],
+        expected_binding: &BybitGatewayBinding,
+        credentials: &BybitCredentials,
+        now_ms: u64,
+    ) -> Result<(Self, CapabilitySnapshot), BybitError> {
+        let evidence: Self = serde_json::from_slice(payload).map_err(|_| BybitError::Capability)?;
+        let snapshot = evidence.verify(expected_binding, credentials, now_ms)?;
+        Ok((evidence, snapshot))
+    }
+
+    pub fn verify(
+        &self,
+        expected_binding: &BybitGatewayBinding,
+        credentials: &BybitCredentials,
+        now_ms: u64,
+    ) -> Result<CapabilitySnapshot, BybitError> {
+        self.verify_candidate(expected_binding, credentials, now_ms)
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    pub(crate) fn verify_candidate(
+        &self,
+        expected_binding: &BybitGatewayBinding,
+        credentials: &BybitCredentials,
+        now_ms: u64,
+    ) -> Result<(CapabilitySnapshot, BybitCapabilityCandidate), BybitError> {
+        expected_binding.validate_request_binding(&self.scope.binding)?;
+        if self.schema_version != BYBIT_CAPABILITY_PROBE_SCHEMA_VERSION
+            || self.scope.profile_version != BYBIT_LINEAR_ORDER_PROFILE_VERSION
+            || self.scope.attempt_id == 0
+            || self.scope.generation == 0
+            || self.flags != EXECUTABLE_FLAGS
+            || self.evidence_sha256 != self.compute_digest()?
+            || !self.verify_hmac(credentials)?
+        {
+            return Err(BybitError::Capability);
+        }
+        self.private_stream
+            .validate(&self.scope.binding, self.scope.generation, now_ms)?;
+        let candidate = replay_capability_candidate(
+            expected_binding,
+            credentials,
+            self.scope.clone(),
+            now_ms,
+            &self.raw_payloads,
+        )?;
+        if candidate
+            .candidate_flags
+            .contains(CapabilityFlags::WITHDRAW)
+            || !candidate
+                .candidate_flags
+                .contains(EXECUTABLE_FLAGS - CapabilityFlags::PRIVATE_STREAM)
+        {
+            return Err(BybitError::Capability);
+        }
+        let observed_ms = self
+            .scope
+            .observed_at_ms
+            .max(self.private_stream.observed_at_ms);
+        let expires_ms = self
+            .scope
+            .expires_at_ms
+            .min(self.private_stream.expires_at_ms);
+        if observed_ms == 0
+            || expires_ms <= observed_ms
+            || now_ms < observed_ms
+            || now_ms >= expires_ms
+        {
+            return Err(BybitError::Capability);
+        }
+        Ok((
+            CapabilitySnapshot {
+                binding: self.scope.binding.clone(),
+                version: self.scope.generation,
+                observed_ms,
+                expires_ms,
+                flags: self.flags,
+            },
+            candidate,
+        ))
+    }
+
+    fn compute_digest(&self) -> Result<String, BybitError> {
+        Ok(sha256_hex(&self.unsigned_bytes()?))
+    }
+
+    fn unsigned_bytes(&self) -> Result<Vec<u8>, BybitError> {
+        #[derive(Serialize)]
+        struct Unsigned<'a> {
+            schema_version: u16,
+            scope: &'a BybitOrderFamilyScope,
+            private_stream: &'a BybitPrivateStreamProbeEvidence,
+            raw_payloads: &'a [BybitRawPrivatePayload],
+            flags: CapabilityFlags,
+        }
+        serde_json::to_vec(&Unsigned {
+            schema_version: self.schema_version,
+            scope: &self.scope,
+            private_stream: &self.private_stream,
+            raw_payloads: &self.raw_payloads,
+            flags: self.flags,
+        })
+        .map_err(|_| BybitError::Capability)
+    }
+
+    fn compute_hmac(&self, credentials: &BybitCredentials) -> Result<String, BybitError> {
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(credentials.api_secret.expose_secret().as_bytes())
+                .map_err(|_| BybitError::Capability)?;
+        mac.update(&self.unsigned_bytes()?);
+        Ok(mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
+
+    fn verify_hmac(&self, credentials: &BybitCredentials) -> Result<bool, BybitError> {
+        let tag = decode_sha256(&self.evidence_hmac_sha256)?;
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(credentials.api_secret.expose_secret().as_bytes())
+                .map_err(|_| BybitError::Capability)?;
+        mac.update(&self.unsigned_bytes()?);
+        Ok(mac.verify_slice(&tag).is_ok())
+    }
+}
+
+pub fn finalize_capability_probe(
+    candidate: BybitCapabilityCandidate,
+    private_stream: BybitPrivateStreamProbeEvidence,
+    credentials: &BybitCredentials,
+    validated_at_ms: u64,
+) -> Result<(BybitCapabilityProbeEvidence, CapabilitySnapshot), BybitError> {
+    let raw_payloads = collect_probe_payloads(&candidate);
+    let mut evidence = BybitCapabilityProbeEvidence {
+        schema_version: BYBIT_CAPABILITY_PROBE_SCHEMA_VERSION,
+        scope: candidate.scope,
+        private_stream,
+        raw_payloads,
+        flags: EXECUTABLE_FLAGS,
+        evidence_sha256: String::new(),
+        evidence_hmac_sha256: String::new(),
+    };
+    evidence.evidence_sha256 = evidence.compute_digest()?;
+    evidence.evidence_hmac_sha256 = evidence.compute_hmac(credentials)?;
+    let binding = BybitGatewayBinding::new(evidence.scope.binding.clone())?;
+    let snapshot = evidence.verify(&binding, credentials, validated_at_ms)?;
+    Ok((evidence, snapshot))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn validate_capability_candidate(
     scope: BybitOrderFamilyScope,
@@ -226,6 +502,7 @@ pub fn validate_capability_candidate(
     .max()
     .ok_or(BybitError::Capability)?;
     if order_families.scope != scope
+        || api_key.raw.binding != scope.binding
         || api_key.binding != scope.binding
         || account.identity.binding != scope.binding
         || positions.binding != scope.binding
@@ -235,6 +512,7 @@ pub fn validate_capability_candidate(
         || positions.attempt_id != scope.attempt_id
         || fills.attempt_id != scope.attempt_id
         || api_key.generation != scope.generation
+        || api_key.raw.generation != scope.generation
         || account.identity.generation != scope.generation
         || positions.generation != scope.generation
         || fills.generation != scope.generation
@@ -273,6 +551,202 @@ pub fn validate_capability_candidate(
         fills,
         candidate_flags,
     })
+}
+
+fn collect_probe_payloads(candidate: &BybitCapabilityCandidate) -> Vec<BybitRawPrivatePayload> {
+    let mut payloads = vec![candidate.api_key.raw.clone()];
+    payloads.extend(candidate.account.raw_payloads.iter().cloned());
+    payloads.extend(candidate.positions.raw_pages.iter().cloned());
+    payloads.extend(
+        candidate
+            .order_families
+            .regular
+            .open_orders
+            .raw_pages
+            .iter()
+            .cloned(),
+    );
+    payloads.extend(
+        candidate
+            .order_families
+            .regular
+            .order_history
+            .raw_pages
+            .iter()
+            .cloned(),
+    );
+    payloads.extend(
+        candidate
+            .order_families
+            .conditional
+            .open_orders
+            .raw_pages
+            .iter()
+            .cloned(),
+    );
+    payloads.extend(
+        candidate
+            .order_families
+            .conditional
+            .order_history
+            .raw_pages
+            .iter()
+            .cloned(),
+    );
+    payloads.extend(candidate.fills.raw_pages.iter().cloned());
+    payloads
+}
+
+fn replay_capability_candidate(
+    binding: &BybitGatewayBinding,
+    credentials: &BybitCredentials,
+    scope: BybitOrderFamilyScope,
+    validated_at_ms: u64,
+    payloads: &[BybitRawPrivatePayload],
+) -> Result<BybitCapabilityCandidate, BybitError> {
+    if payloads.is_empty()
+        || payloads.iter().any(|raw| {
+            raw.binding != scope.binding
+                || raw.generation != scope.generation
+                || raw.attempt_id != scope.attempt_id
+        })
+    {
+        return Err(BybitError::Capability);
+    }
+    let api_raw = exact_payload(payloads, BybitPrivateSource::ApiKeyInfo)?;
+    let account_raw = exact_payload(payloads, BybitPrivateSource::AccountInfo)?;
+    let wallet_raw = exact_payload(payloads, BybitPrivateSource::WalletBalance)?;
+    let position_raws = matching_payloads(payloads, BybitPrivateSource::Positions);
+    let regular_open_raws = matching_payloads(
+        payloads,
+        BybitPrivateSource::OpenOrders(NativeOrderFamily::UmOrder),
+    );
+    let regular_history_raws = matching_payloads(
+        payloads,
+        BybitPrivateSource::OrderHistory(NativeOrderFamily::UmOrder),
+    );
+    let conditional_open_raws = matching_payloads(
+        payloads,
+        BybitPrivateSource::OpenOrders(NativeOrderFamily::UmConditional),
+    );
+    let conditional_history_raws = matching_payloads(
+        payloads,
+        BybitPrivateSource::OrderHistory(NativeOrderFamily::UmConditional),
+    );
+    let execution_raws = matching_payloads(payloads, BybitPrivateSource::Executions);
+    let accounted = 3_usize
+        .checked_add(position_raws.len())
+        .and_then(|count| count.checked_add(regular_open_raws.len()))
+        .and_then(|count| count.checked_add(regular_history_raws.len()))
+        .and_then(|count| count.checked_add(conditional_open_raws.len()))
+        .and_then(|count| count.checked_add(conditional_history_raws.len()))
+        .and_then(|count| count.checked_add(execution_raws.len()))
+        .ok_or(BybitError::Capability)?;
+    if accounted != payloads.len() {
+        return Err(BybitError::Capability);
+    }
+
+    let api_key = parse_api_key_evidence(binding, credentials, api_raw)?;
+    let account = complete_account_readback(binding, account_raw.clone(), wallet_raw.clone())?;
+    let position_pages = position_raws
+        .iter()
+        .map(|raw| parse_position_page(binding, raw))
+        .collect::<Result<Vec<BybitPositionPage>, _>>()?;
+    let positions = complete_position_pages(binding, &position_pages)?;
+    let regular_open = parse_open_pages(binding, &regular_open_raws)?;
+    let regular_history = parse_history_pages(binding, &regular_history_raws)?;
+    let conditional_open = parse_open_pages(binding, &conditional_open_raws)?;
+    let conditional_history = parse_history_pages(binding, &conditional_history_raws)?;
+    let families = validate_order_family_candidate(
+        scope.clone(),
+        validated_at_ms,
+        [
+            BybitOrderFamilyEvidence::Complete(Box::new(BybitCompleteOrderFamilyEvidence {
+                open_orders: complete_open_order_pages(
+                    binding,
+                    NativeOrderFamily::UmOrder,
+                    &regular_open,
+                )?,
+                order_history: complete_order_history_pages(
+                    binding,
+                    NativeOrderFamily::UmOrder,
+                    &regular_history,
+                )?,
+            })),
+            BybitOrderFamilyEvidence::Complete(Box::new(BybitCompleteOrderFamilyEvidence {
+                open_orders: complete_open_order_pages(
+                    binding,
+                    NativeOrderFamily::UmConditional,
+                    &conditional_open,
+                )?,
+                order_history: complete_order_history_pages(
+                    binding,
+                    NativeOrderFamily::UmConditional,
+                    &conditional_history,
+                )?,
+            })),
+            BybitOrderFamilyEvidence::Unsupported(BybitUnsupportedOrderFamilyEvidence::algo(
+                scope.binding.clone(),
+                scope.profile_version,
+            )),
+        ],
+    )?;
+    let order_details = families.order_details()?;
+    let execution_pages = execution_raws
+        .iter()
+        .map(|raw| parse_execution_page(binding, raw, &order_details))
+        .collect::<Result<Vec<BybitExecutionPage>, _>>()?;
+    let fills = complete_execution_pages(binding, &execution_pages, &order_details)?;
+    validate_capability_candidate(
+        scope,
+        validated_at_ms,
+        api_key,
+        account,
+        positions,
+        families,
+        fills,
+    )
+}
+
+fn exact_payload(
+    payloads: &[BybitRawPrivatePayload],
+    source: BybitPrivateSource,
+) -> Result<&BybitRawPrivatePayload, BybitError> {
+    let mut matches = payloads.iter().filter(|raw| raw.source == source);
+    let value = matches.next().ok_or(BybitError::Capability)?;
+    if matches.next().is_some() {
+        return Err(BybitError::Capability);
+    }
+    Ok(value)
+}
+
+fn matching_payloads(
+    payloads: &[BybitRawPrivatePayload],
+    source: BybitPrivateSource,
+) -> Vec<BybitRawPrivatePayload> {
+    payloads
+        .iter()
+        .filter(|raw| raw.source == source)
+        .cloned()
+        .collect()
+}
+
+fn parse_open_pages(
+    binding: &BybitGatewayBinding,
+    raws: &[BybitRawPrivatePayload],
+) -> Result<Vec<BybitOpenOrderPage>, BybitError> {
+    raws.iter()
+        .map(|raw| parse_open_order_page(binding, raw))
+        .collect()
+}
+
+fn parse_history_pages(
+    binding: &BybitGatewayBinding,
+    raws: &[BybitRawPrivatePayload],
+) -> Result<Vec<BybitOrderEvidencePage>, BybitError> {
+    raws.iter()
+        .map(|raw| parse_order_history_page(binding, raw))
+        .collect()
 }
 
 fn validate_complete_family(
@@ -357,4 +831,31 @@ fn digest_raw_pages<'a>(pages: impl Iterator<Item = &'a BybitRawPrivatePayload>)
         digest.update(&page.payload);
     }
     digest.finalize().into()
+}
+
+fn sha256_hex(payload: &[u8]) -> String {
+    Sha256::digest(payload)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn decode_sha256(value: &str) -> Result<[u8; 32], BybitError> {
+    if !is_sha256(value) {
+        return Err(BybitError::Capability);
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, byte) in decoded.iter_mut().enumerate() {
+        let start = index.checked_mul(2).ok_or(BybitError::Capability)?;
+        let end = start.checked_add(2).ok_or(BybitError::Capability)?;
+        *byte = u8::from_str_radix(&value[start..end], 16).map_err(|_| BybitError::Capability)?;
+    }
+    Ok(decoded)
 }

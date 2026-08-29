@@ -6,7 +6,7 @@ use std::{
 
 use rust_decimal::Decimal;
 use secrecy::ExposeSecret;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use venue_domain::domain::{
     Amount, Asset, FieldState, Fill, NativeOrderFamily, Order, OrderPurpose, OrderSide, OrderState,
@@ -29,7 +29,7 @@ const POSITION_PAGE_LIMIT: usize = 200;
 const ORDER_PAGE_LIMIT: usize = 50;
 const EXECUTION_PAGE_LIMIT: usize = 100;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BybitPrivateSource {
     ApiKeyInfo,
     AccountInfo,
@@ -40,7 +40,7 @@ pub enum BybitPrivateSource {
     Executions,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BybitHistoryWindow {
     pub start_ms: u64,
     pub end_ms: u64,
@@ -58,7 +58,7 @@ impl BybitHistoryWindow {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BybitOrderLookup {
     pub order_id: Option<String>,
     pub client_order_id: Option<String>,
@@ -193,7 +193,7 @@ pub fn sign_private_request(
     )
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BybitRawPrivatePayload {
     pub parser_schema_version: u16,
     pub binding: GatewayBinding,
@@ -205,7 +205,7 @@ pub struct BybitRawPrivatePayload {
     pub request_cursor: Option<String>,
     pub history_window: Option<BybitHistoryWindow>,
     pub lookup: Option<BybitOrderLookup>,
-    pub request_path: &'static str,
+    pub request_path: String,
     pub request_query: String,
     pub request_timestamp_ms: u64,
     pub received_at_ms: u64,
@@ -238,7 +238,7 @@ impl BybitRawPrivatePayload {
             request_cursor: request.request_cursor.clone(),
             history_window: request.history_window.clone(),
             lookup: request.lookup.clone(),
-            request_path: request.path,
+            request_path: request.path.to_owned(),
             request_query: request.query.clone(),
             request_timestamp_ms,
             received_at_ms,
@@ -255,19 +255,16 @@ impl BybitRawPrivatePayload {
         source: BybitPrivateSource,
     ) -> Result<(), BybitError> {
         binding.validate_request_binding(&self.binding)?;
-        let request = BybitPreparedPrivateRequest {
-            binding: self.binding.clone(),
-            generation: self.generation,
-            attempt_id: self.attempt_id,
-            page_index: self.page_index,
-            origin: binding.config().rest_origin(),
-            path: self.request_path,
-            source: self.source,
-            query: self.request_query.clone(),
-            request_cursor: self.request_cursor.clone(),
-            history_window: self.history_window.clone(),
-            lookup: self.lookup.clone(),
-        };
+        let request = prepare_private_request(
+            binding,
+            self.generation,
+            self.attempt_id,
+            self.page_index,
+            self.source,
+            self.request_cursor.as_deref(),
+            self.history_window.clone(),
+            self.lookup.clone(),
+        )?;
         if self.parser_schema_version != BYBIT_PRIVATE_PARSER_SCHEMA_VERSION
             || self.source != source
             || self.native_symbol
@@ -276,6 +273,8 @@ impl BybitRawPrivatePayload {
             || self.received_at_ms < self.request_timestamp_ms
             || self.payload.is_empty()
             || self.payload_sha256 != payload_digest(&self.payload)
+            || self.request_path != request.path
+            || self.request_query != request.query
             || request.validate(binding).is_err()
         {
             return Err(BybitError::Binding);
@@ -732,6 +731,7 @@ pub fn parse_position_page(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BybitApiKeyEvidence {
+    pub raw: BybitRawPrivatePayload,
     pub binding: GatewayBinding,
     pub generation: u64,
     pub attempt_id: u64,
@@ -762,6 +762,7 @@ pub fn parse_api_key_evidence(
     }
     validate_permissions(&result.permissions)?;
     Ok(BybitApiKeyEvidence {
+        raw: raw.clone(),
         binding: raw.binding.clone(),
         generation: raw.generation,
         attempt_id: raw.attempt_id,

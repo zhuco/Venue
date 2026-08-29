@@ -12,6 +12,7 @@ const ORDERS: &[u8] = include_bytes!("../fixtures/open-orders-linear.json");
 const STOP_ORDERS: &[u8] = include_bytes!("../fixtures/open-stop-orders-linear.json");
 const HISTORY: &[u8] = include_bytes!("../fixtures/order-history-linear.json");
 const EXECUTIONS: &[u8] = include_bytes!("../fixtures/execution-trade-page.json");
+const INSTRUMENT: &str = include_str!("../fixtures/instruments-linear.json");
 const EMPTY_PAGE: &[u8] = br#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","nextPageCursor":"","list":[]},"time":2000}"#;
 
 type TestError = Box<dyn std::error::Error>;
@@ -68,6 +69,123 @@ fn raw(
     payload: &[u8],
 ) -> Result<BybitRawPrivatePayload, BybitError> {
     raw_page(binding, source, 0, None, payload)
+}
+
+fn capability_candidate(
+    mode: GatewayMode,
+) -> Result<
+    (
+        BybitGatewayBinding,
+        BybitCredentials,
+        BybitCapabilityCandidate,
+    ),
+    TestError,
+> {
+    let binding = binding(mode)?;
+    let credentials = BybitCredentials::from_values("test", "secret")?;
+    let api_key = parse_api_key_evidence(
+        &binding,
+        &credentials,
+        &raw(&binding, BybitPrivateSource::ApiKeyInfo, API_KEY)?,
+    )?;
+    let account = complete_account_readback(
+        &binding,
+        raw(&binding, BybitPrivateSource::AccountInfo, ACCOUNT)?,
+        raw(&binding, BybitPrivateSource::WalletBalance, WALLET)?,
+    )?;
+    let positions = complete_position_pages(
+        &binding,
+        &[parse_position_page(
+            &binding,
+            &raw(&binding, BybitPrivateSource::Positions, POSITIONS)?,
+        )?],
+    )?;
+    let regular_history = complete_order_history_pages(
+        &binding,
+        NativeOrderFamily::UmOrder,
+        &[parse_order_history_page(
+            &binding,
+            &raw(
+                &binding,
+                BybitPrivateSource::OrderHistory(NativeOrderFamily::UmOrder),
+                HISTORY,
+            )?,
+        )?],
+    )?;
+    let conditional_history = complete_order_history_pages(
+        &binding,
+        NativeOrderFamily::UmConditional,
+        &[parse_order_history_page(
+            &binding,
+            &raw(
+                &binding,
+                BybitPrivateSource::OrderHistory(NativeOrderFamily::UmConditional),
+                EMPTY_PAGE,
+            )?,
+        )?],
+    )?;
+    let regular = complete_open_order_pages(
+        &binding,
+        NativeOrderFamily::UmOrder,
+        &[parse_open_order_page(
+            &binding,
+            &raw(
+                &binding,
+                BybitPrivateSource::OpenOrders(NativeOrderFamily::UmOrder),
+                ORDERS,
+            )?,
+        )?],
+    )?;
+    let conditional = complete_open_order_pages(
+        &binding,
+        NativeOrderFamily::UmConditional,
+        &[parse_open_order_page(
+            &binding,
+            &raw(
+                &binding,
+                BybitPrivateSource::OpenOrders(NativeOrderFamily::UmConditional),
+                STOP_ORDERS,
+            )?,
+        )?],
+    )?;
+    let scope = BybitOrderFamilyScope {
+        binding: binding.gateway_binding().clone(),
+        profile_version: BYBIT_LINEAR_ORDER_PROFILE_VERSION,
+        attempt_id: 11,
+        generation: 7,
+        observed_at_ms: 2_000,
+        expires_at_ms: 3_000,
+    };
+    let families = validate_order_family_candidate(
+        scope.clone(),
+        2_500,
+        [
+            BybitOrderFamilyEvidence::Complete(Box::new(BybitCompleteOrderFamilyEvidence {
+                open_orders: regular,
+                order_history: regular_history.clone(),
+            })),
+            BybitOrderFamilyEvidence::Complete(Box::new(BybitCompleteOrderFamilyEvidence {
+                open_orders: conditional,
+                order_history: conditional_history,
+            })),
+            BybitOrderFamilyEvidence::Unsupported(BybitUnsupportedOrderFamilyEvidence::algo(
+                scope.binding.clone(),
+                BYBIT_LINEAR_ORDER_PROFILE_VERSION,
+            )),
+        ],
+    )?;
+    let fills = complete_execution_pages(
+        &binding,
+        &[parse_execution_page(
+            &binding,
+            &raw(&binding, BybitPrivateSource::Executions, EXECUTIONS)?,
+            &regular_history.orders,
+        )?],
+        &regular_history.orders,
+    )?;
+    let candidate =
+        validate_capability_candidate(scope, 2_500, api_key, account, positions, families, fills)?;
+    Ok((binding, credentials, candidate))
 }
 
 #[test]
@@ -482,6 +600,20 @@ fn all_family_and_capability_candidates_remain_non_authoritative() -> Result<(),
         ),
         Err(BybitError::Projection)
     );
+    let mut withdrawal = api_key.clone();
+    withdrawal.withdraw = true;
+    assert_eq!(
+        validate_capability_candidate(
+            scope.clone(),
+            2_500,
+            withdrawal,
+            account.clone(),
+            positions.clone(),
+            families.clone(),
+            fills.clone(),
+        ),
+        Err(BybitError::Capability)
+    );
     let candidate =
         validate_capability_candidate(scope, 2_500, api_key, account, positions, families, fills)?;
     assert!(candidate.candidate_flags.contains(CapabilityFlags::TRADE));
@@ -496,6 +628,108 @@ fn all_family_and_capability_candidates_remain_non_authoritative() -> Result<(),
             .contains(CapabilityFlags::WITHDRAW)
     );
     assert_eq!(capabilities(), CapabilityFlags::empty());
+    Ok(())
+}
+
+#[test]
+fn fresh_complete_probe_is_persistable_for_test_and_live_only() -> Result<(), TestError> {
+    for mode in [GatewayMode::Test, GatewayMode::Live] {
+        let (gateway, credentials, candidate) = capability_candidate(mode)?;
+        let stream = BybitPrivateStreamProbeEvidence::authenticated(
+            gateway.gateway_binding().clone(),
+            7,
+            1_950,
+            2_100,
+            3_000,
+            "private-connection-7",
+        )?;
+        let (evidence, snapshot) =
+            finalize_capability_probe(candidate, stream, &credentials, 2_500)?;
+        assert_eq!(snapshot.binding.mode, mode);
+        assert_eq!(snapshot.version, 7);
+        assert!(snapshot.flags.contains(CapabilityFlags::PRIVATE_STREAM));
+        assert!(snapshot.flags.contains(CapabilityFlags::PLACE_LIMIT));
+        assert!(snapshot.flags.contains(CapabilityFlags::PLACE_MARKET));
+        assert!(snapshot.flags.contains(CapabilityFlags::CANCEL));
+        assert!(!snapshot.flags.contains(CapabilityFlags::WITHDRAW));
+        assert!(!snapshot.flags.contains(CapabilityFlags::AMEND));
+        assert_eq!(capabilities(), CapabilityFlags::empty());
+
+        let json = evidence.to_json()?;
+        let (loaded, loaded_snapshot) =
+            BybitCapabilityProbeEvidence::from_json_verified(&json, &gateway, &credentials, 2_500)?;
+        assert_eq!(loaded, evidence);
+        assert_eq!(loaded_snapshot, snapshot);
+        let wrong_secret = BybitCredentials::from_values("test", "different-secret")?;
+        assert_eq!(
+            BybitCapabilityProbeEvidence::from_json_verified(&json, &gateway, &wrong_secret, 2_500,),
+            Err(BybitError::Capability)
+        );
+        assert_eq!(
+            evidence.verify(&gateway, &credentials, 3_000),
+            Err(BybitError::Capability)
+        );
+
+        let wrong_mode = binding(match mode {
+            GatewayMode::Test => GatewayMode::Live,
+            GatewayMode::Live => GatewayMode::Test,
+        })?;
+        assert_eq!(
+            evidence.verify(&wrong_mode, &credentials, 2_500),
+            Err(BybitError::Binding)
+        );
+
+        let mut tampered: serde_json::Value = serde_json::from_slice(&json)?;
+        tampered["scope"]["generation"] = serde_json::json!(8);
+        let tampered = serde_json::to_vec(&tampered)?;
+        assert_eq!(
+            BybitCapabilityProbeEvidence::from_json_verified(
+                &tampered,
+                &gateway,
+                &credentials,
+                2_500,
+            ),
+            Err(BybitError::Capability)
+        );
+
+        let rules = parse_linear_instrument(
+            &gateway,
+            BybitRawPublicPayload::new(
+                &gateway,
+                BybitPublicSource::LinearInstrument,
+                7,
+                2_500,
+                INSTRUMENT.to_owned(),
+            )?,
+        )?;
+        let session = BybitPhysicalSession::from_probe(
+            gateway,
+            credentials,
+            rules,
+            &evidence,
+            BybitTransportLimits::new(std::time::Duration::from_secs(1), 16 * 1_024)?,
+            2_500,
+        )?;
+        assert_eq!(session.capability_snapshot(), snapshot);
+    }
+    Ok(())
+}
+
+#[test]
+fn private_stream_cross_generation_cannot_complete_probe() -> Result<(), TestError> {
+    let (binding, credentials, candidate) = capability_candidate(GatewayMode::Test)?;
+    let stream = BybitPrivateStreamProbeEvidence::authenticated(
+        binding.gateway_binding().clone(),
+        8,
+        1_950,
+        2_100,
+        3_000,
+        "private-connection-8",
+    )?;
+    assert_eq!(
+        finalize_capability_probe(candidate, stream, &credentials, 2_500),
+        Err(BybitError::Capability)
+    );
     Ok(())
 }
 
