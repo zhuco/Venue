@@ -115,7 +115,7 @@ impl OkxHttpTransport {
     }
 
     #[cfg(test)]
-    fn with_origin(
+    pub(crate) fn with_origin(
         config: OkxConfig,
         origin: &str,
         operation_timeout: Duration,

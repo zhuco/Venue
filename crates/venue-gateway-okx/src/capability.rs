@@ -260,6 +260,74 @@ pub fn validate_capability_candidate(
     persisted: &PersistedOkxCapabilityProbe,
     validated_at_ms: u64,
 ) -> Result<OkxCapabilityCandidate, OkxError> {
+    let (evidence, readback, stream_observed) =
+        validate_read_candidate_parts(config, instrument, persisted, validated_at_ms)?;
+    let scope = &evidence.scope;
+    if scope.position_mode != OkxPositionMode::LongShort {
+        // Shared canonical mutation commands carry explicit LONG/SHORT meaning. Net mutation
+        // remains rejected even though a Net account may produce complete read-side evidence.
+        return Err(OkxError::Capability);
+    }
+    let mutation_observed = validate_mutations(config, instrument, &readback, &evidence.mutations)?;
+    let observed_at_ms = readback
+        .observed_at_ms
+        .max(stream_observed)
+        .max(mutation_observed);
+    if observed_at_ms != scope.observed_at_ms {
+        return Err(OkxError::Capability);
+    }
+    let candidate_flags = read_flags(scope.position_mode)
+        | CapabilityFlags::TRADE
+        | CapabilityFlags::PLACE_LIMIT
+        | CapabilityFlags::PLACE_MARKET
+        | CapabilityFlags::CANCEL;
+    if candidate_flags.contains(CapabilityFlags::WITHDRAW) {
+        return Err(OkxError::Capability);
+    }
+    Ok(OkxCapabilityCandidate {
+        scope: scope.clone(),
+        evidence_sha256: persisted.evidence_sha256().to_owned(),
+        candidate_flags,
+        readback,
+    })
+}
+
+/// Validates the durable account/order/fill/private-stream portion for either OKX Net or
+/// Long/Short mode. This deliberately omits TRADE and all mutation flags: callers cannot turn a
+/// read-only Net candidate into authority for canonical LONG/SHORT commands.
+pub fn validate_read_capability_candidate(
+    config: &OkxConfig,
+    instrument: &OkxInstrument,
+    persisted: &PersistedOkxCapabilityProbe,
+    validated_at_ms: u64,
+) -> Result<OkxCapabilityCandidate, OkxError> {
+    let (evidence, readback, stream_observed) =
+        validate_read_candidate_parts(config, instrument, persisted, validated_at_ms)?;
+    let scope = &evidence.scope;
+    if readback.observed_at_ms.max(stream_observed) != scope.observed_at_ms {
+        return Err(OkxError::Capability);
+    }
+    Ok(OkxCapabilityCandidate {
+        scope: scope.clone(),
+        evidence_sha256: persisted.evidence_sha256().to_owned(),
+        candidate_flags: read_flags(scope.position_mode),
+        readback,
+    })
+}
+
+fn validate_read_candidate_parts<'a>(
+    config: &OkxConfig,
+    instrument: &OkxInstrument,
+    persisted: &'a PersistedOkxCapabilityProbe,
+    validated_at_ms: u64,
+) -> Result<
+    (
+        &'a OkxCapabilityProbeEvidence,
+        OkxPrivateReadbackCandidate,
+        u64,
+    ),
+    OkxError,
+> {
     let evidence = persisted.evidence();
     let scope = &evidence.scope;
     instrument.validate_scope(config)?;
@@ -296,34 +364,18 @@ pub fn validate_capability_candidate(
     validate_positions(&readback, scope.position_mode)?;
     validate_order_families(&readback)?;
     let stream_observed = validate_private_stream(scope, &readback, &evidence.private_stream)?;
-    let mutation_observed = validate_mutations(config, instrument, &readback, &evidence.mutations)?;
-    let observed_at_ms = readback
-        .observed_at_ms
-        .max(stream_observed)
-        .max(mutation_observed);
-    if observed_at_ms != scope.observed_at_ms {
-        return Err(OkxError::Capability);
-    }
-    let mut candidate_flags = CapabilityFlags::READ_ACCOUNT
+    Ok((evidence, readback, stream_observed))
+}
+
+fn read_flags(position_mode: OkxPositionMode) -> CapabilityFlags {
+    let mut flags = CapabilityFlags::READ_ACCOUNT
         | CapabilityFlags::READ_ORDERS
         | CapabilityFlags::READ_FILLS
-        | CapabilityFlags::PRIVATE_STREAM
-        | CapabilityFlags::TRADE
-        | CapabilityFlags::PLACE_LIMIT
-        | CapabilityFlags::PLACE_MARKET
-        | CapabilityFlags::CANCEL;
-    if scope.position_mode == OkxPositionMode::LongShort {
-        candidate_flags |= CapabilityFlags::HEDGE_POSITION;
+        | CapabilityFlags::PRIVATE_STREAM;
+    if position_mode == OkxPositionMode::LongShort {
+        flags |= CapabilityFlags::HEDGE_POSITION;
     }
-    if candidate_flags.contains(CapabilityFlags::WITHDRAW) {
-        return Err(OkxError::Capability);
-    }
-    Ok(OkxCapabilityCandidate {
-        scope: scope.clone(),
-        evidence_sha256: persisted.evidence_sha256().to_owned(),
-        candidate_flags,
-        readback,
-    })
+    flags
 }
 
 fn validate_positions(
@@ -557,12 +609,18 @@ mod tests {
 
     use rust_decimal::Decimal;
     use serde_json::json;
-    use venue_domain::domain::{CommandId, OrderOwner, OrderPurpose, OrderSide, Price};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    use venue_domain::domain::{
+        CommandId, ExecutionCommand, OrderOwner, OrderPurpose, OrderSide, Price,
+    };
     use venue_gateway_api::{GatewayMode, VenueId};
 
     use super::*;
     use crate::{
-        OkxAlgoOrderKind, OkxPrivateReadRequest, build_account_config_request,
+        OkxAlgoOrderKind, OkxCredentials, OkxPrivateReadRequest, build_account_config_request,
         build_algo_orders_request, build_balance_request, build_fills_request,
         build_positions_request, build_regular_orders_request, capabilities, parse_instrument,
     };
@@ -927,6 +985,223 @@ mod tests {
         );
         assert_eq!(capabilities(), CapabilityFlags::empty());
         fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn net_mode_is_complete_read_side_only_and_cannot_authorize_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (config, instrument, mut evidence) = fixture(GatewayMode::Test)?;
+        evidence.scope.position_mode = OkxPositionMode::Net;
+        let net_scope = OkxPrivateReadScope::new(
+            &config,
+            &instrument,
+            OkxPositionMode::Net,
+            evidence.scope.trade_mode,
+            evidence.scope.read_attempt_id,
+        )?;
+        for page in &mut evidence.private_pages {
+            page.scope = net_scope.clone();
+            if page.surface == crate::OkxPrivateSurface::AccountConfig {
+                let mut payload: Value = serde_json::from_slice(&page.payload)?;
+                payload["data"][0]["posMode"] = Value::String("net_mode".to_owned());
+                page.payload = serde_json::to_vec(&payload)?;
+                page.payload_sha256 = crate::readback::payload_digest(&page.payload);
+            } else if page.surface == crate::OkxPrivateSurface::Positions {
+                let payload = json!({"code":"0","msg":"","data":[{
+                    "instType":"SWAP","instId":"BTC-USDT-SWAP","mgnMode":"cross",
+                    "posSide":"net","pos":"0","avgPx":"","markPx":"",
+                    "uTime":(BASE_MS+600).to_string()
+                }]});
+                page.payload = serde_json::to_vec(&payload)?;
+                page.payload_sha256 = crate::readback::payload_digest(&page.payload);
+            } else if page.surface == crate::OkxPrivateSurface::Fills {
+                let mut payload: Value = serde_json::from_slice(&page.payload)?;
+                payload["data"][0]["posSide"] = Value::String("net".to_owned());
+                page.payload = serde_json::to_vec(&payload)?;
+                page.payload_sha256 = crate::readback::payload_digest(&page.payload);
+            }
+        }
+        let (persisted, directory) = persist_fixture("net-read.json", &evidence)?;
+        let candidate =
+            validate_read_capability_candidate(&config, &instrument, &persisted, BASE_MS + 1_000)?;
+        assert_eq!(candidate.scope.position_mode, OkxPositionMode::Net);
+        assert!(
+            candidate
+                .candidate_flags
+                .contains(CapabilityFlags::READ_ACCOUNT)
+        );
+        assert!(
+            candidate
+                .candidate_flags
+                .contains(CapabilityFlags::READ_ORDERS)
+        );
+        assert!(
+            candidate
+                .candidate_flags
+                .contains(CapabilityFlags::READ_FILLS)
+        );
+        assert!(
+            candidate
+                .candidate_flags
+                .contains(CapabilityFlags::PRIVATE_STREAM)
+        );
+        assert!(!candidate.candidate_flags.contains(CapabilityFlags::TRADE));
+        assert!(
+            !candidate
+                .candidate_flags
+                .contains(CapabilityFlags::HEDGE_POSITION)
+        );
+        assert_eq!(
+            validate_capability_candidate(&config, &instrument, &persisted, BASE_MS + 1_000),
+            Err(OkxError::Capability)
+        );
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn physical_candidate_prepares_test_and_live_place_cancel_and_reduce_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for mode in [GatewayMode::Test, GatewayMode::Live] {
+            let (config, instrument, mut evidence) = fixture(mode)?;
+            let position_page = evidence
+                .private_pages
+                .iter_mut()
+                .find(|page| page.surface == crate::OkxPrivateSurface::Positions)
+                .ok_or("missing position page")?;
+            let mut positions: Value = serde_json::from_slice(&position_page.payload)?;
+            positions["data"][0]["pos"] = Value::String("1".to_owned());
+            positions["data"][0]["avgPx"] = Value::String("59000".to_owned());
+            positions["data"][0]["markPx"] = Value::String("60000".to_owned());
+            position_page.payload = serde_json::to_vec(&positions)?;
+            position_page.payload_sha256 = crate::readback::payload_digest(&position_page.payload);
+            let (persisted, directory) = persist_fixture("physical.json", &evidence)?;
+            let candidate = crate::OkxPhysicalCandidate::from_probe(
+                config.clone(),
+                instrument.clone(),
+                &persisted,
+                BASE_MS + 1_000,
+            )?;
+            assert_eq!(candidate.binding().mode, mode);
+            assert!(
+                candidate
+                    .prepare_place_once(
+                        &ExecutionCommand::PlaceLimit(evidence.mutations.place.clone()),
+                        BASE_MS + 1_000,
+                    )
+                    .is_ok()
+            );
+            assert!(
+                candidate
+                    .prepare_place_once(
+                        &ExecutionCommand::MarketReduce(evidence.mutations.reduce.clone()),
+                        BASE_MS + 1_000,
+                    )
+                    .is_ok()
+            );
+            let place_request = build_place_request(
+                &config,
+                &instrument,
+                &candidate.readback().profile,
+                evidence.scope.trade_mode,
+                OkxPlaceIntent::Limit(&evidence.mutations.place),
+            )?;
+            let accepted =
+                parse_place_ack(evidence.mutations.place_ack.response()?, &place_request)?;
+            assert!(
+                candidate
+                    .prepare_cancel_once(&evidence.mutations.cancel, &accepted, BASE_MS + 1_000,)
+                    .is_ok()
+            );
+            fs::remove_dir_all(directory)?;
+        }
+        Ok(())
+    }
+
+    async fn response_server(
+        responses: Vec<Option<Vec<u8>>>,
+    ) -> Result<
+        (
+            String,
+            tokio::task::JoinHandle<Result<bool, std::io::Error>>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            for response in responses {
+                let (mut stream, _) = listener.accept().await?;
+                let mut request = [0_u8; 8_192];
+                let _ = stream.read(&mut request).await?;
+                if let Some(body) = response {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(headers.as_bytes()).await?;
+                    stream.write_all(&body).await?;
+                    stream.shutdown().await?;
+                }
+            }
+            Ok(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_ok(),
+            )
+        });
+        Ok((origin, server))
+    }
+
+    #[tokio::test]
+    async fn physical_ack_and_disconnect_both_require_exact_readback_without_resubmission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for disconnect_first in [false, true] {
+            let (config, instrument, evidence) = fixture(GatewayMode::Test)?;
+            let (persisted, directory) = persist_fixture("dispatch.json", &evidence)?;
+            let candidate = crate::OkxPhysicalCandidate::from_probe(
+                config,
+                instrument,
+                &persisted,
+                BASE_MS + 1_000,
+            )?;
+            let first = (!disconnect_first).then(|| evidence.mutations.place_ack.payload.clone());
+            let (origin, server) = response_server(vec![
+                first,
+                Some(evidence.mutations.place_detail.payload.clone()),
+            ])
+            .await?;
+            let session = candidate.into_session_with_origin(
+                OkxCredentials::from_values("key", "secret", "passphrase")?,
+                &origin,
+                std::time::Duration::from_secs(1),
+                16 * 1_024,
+            )?;
+            let mutation = session.candidate().prepare_place_once(
+                &ExecutionCommand::PlaceLimit(evidence.mutations.place.clone()),
+                BASE_MS + 1_000,
+            )?;
+            let crate::OkxDispatchOnceResult::PendingReadback(pending) = session
+                .dispatch_once(mutation, "2026-08-30T00:00:00.000Z", BASE_MS + 1_000)
+                .await?;
+            let settled = session
+                .readback_pending(pending, "2026-08-30T00:00:00.100Z")
+                .await?;
+            if disconnect_first {
+                assert!(matches!(
+                    settled,
+                    crate::OkxPhysicalReadbackResult::ConfirmedUnknown(_)
+                ));
+            } else {
+                assert!(matches!(
+                    settled,
+                    crate::OkxPhysicalReadbackResult::Confirmed(_)
+                ));
+            }
+            assert!(!server.await??);
+            fs::remove_dir_all(directory)?;
+        }
         Ok(())
     }
 

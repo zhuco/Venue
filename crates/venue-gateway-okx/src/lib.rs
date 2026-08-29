@@ -4,6 +4,7 @@ mod config;
 mod credentials;
 mod execution;
 mod models;
+mod physical;
 mod private;
 mod private_ws;
 mod public;
@@ -20,6 +21,7 @@ pub use capability::{
     OkxCapabilityProbeScope, OkxMutationProbeEvidence, OkxPrivateStreamProbeEvidence,
     OkxPrivateStreamProbeFrame, OkxProbeHttpResponse, PersistedOkxCapabilityProbe,
     load_capability_probe, persist_capability_probe, validate_capability_candidate,
+    validate_read_capability_candidate,
 };
 pub use config::{OkxConfig, endpoints};
 pub use credentials::OkxCredentials;
@@ -32,6 +34,10 @@ pub use execution::{
     build_unknown_cancel_readback_request, build_unknown_order_readback_request,
     build_unknown_order_readback_request_after, parse_cancel_ack, parse_order_detail,
     parse_place_ack, parse_unknown_cancel_readback, parse_unknown_order_readback,
+};
+pub use physical::{
+    OkxDispatchOnceResult, OkxOneShotMutation, OkxPendingMutation, OkxPhysicalCandidate,
+    OkxPhysicalError, OkxPhysicalReadbackResult, OkxPhysicalSession,
 };
 pub use private::{
     OkxAccountLevel, OkxAccountProfile, OkxApiPermission, OkxPage, OkxPageState, OkxTimedBalance,
