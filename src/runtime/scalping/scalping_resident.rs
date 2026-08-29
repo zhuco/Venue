@@ -119,10 +119,9 @@ impl ScalpingResidentRuntime {
         if private_gate
             .as_ref()
             .is_some_and(|private_gate| private_gate.control.is_some())
+            && let Some(control_gate) = private_gate.take()
         {
-            if let Some(control_gate) = private_gate.take() {
-                report.private_gate = Some(self.host.on_private_gate(&control_gate)?);
-            }
+            report.private_gate = Some(self.host.on_private_gate(&control_gate)?);
         }
         if let Some(private_gate) = private_gate.as_ref() {
             report.private_gate = Some(self.host.on_private_gate(private_gate)?);

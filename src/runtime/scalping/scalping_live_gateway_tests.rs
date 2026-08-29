@@ -164,8 +164,8 @@ mod tests {
         let tick = Price::new(Decimal::new(1, 2))?;
         let long = entry_price(
             &intent,
-            Price::new(Decimal::new(99_99, 2))?,
-            Price::new(Decimal::new(100_00, 2))?,
+            Price::new(Decimal::new(9_999, 2))?,
+            Price::new(Decimal::new(10_000, 2))?,
             tick,
         )?;
         assert!(long.value() <= intent.reference_price.value() * Decimal::new(992, 3));
@@ -173,8 +173,8 @@ mod tests {
         intent.direction = Direction::Short;
         let short = entry_price(
             &intent,
-            Price::new(Decimal::new(100_00, 2))?,
-            Price::new(Decimal::new(100_01, 2))?,
+            Price::new(Decimal::new(10_000, 2))?,
+            Price::new(Decimal::new(10_001, 2))?,
             tick,
         )?;
         assert!(short.value() >= intent.reference_price.value() * Decimal::new(1008, 3));

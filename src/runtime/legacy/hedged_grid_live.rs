@@ -281,7 +281,7 @@ pub fn run_hedged_grid_live(
     })?;
     worker.enable_durable_fill_fast_path();
     worker.set_periodic_readback_interval(GRID_PRIVATE_READBACK_INTERVAL_MS)?;
-    let mut transport = open_grid_private_transport(&cfg, &control_store, &binding)?;
+    let mut transport = open_grid_private_transport(cfg, &control_store, &binding)?;
     if begin_rejected_epoch_recovery(&mut state, &commands, transport.authoritative_now_ms()?)? {
         save_state(&checkpoint_store, &state)?;
     }
@@ -1039,90 +1039,90 @@ fn handle_actions(
         );
     }
 
-    for action in actions {
-        match action {
-            GridAction::Reset { reason } => {
-                let reset_result = dispatch_reset_orders(
-                    commands,
-                    transport,
-                    authority,
-                    writer,
-                    binding,
-                    state,
-                    Some(snapshot),
-                    now_ms,
-                );
-                match reset_result {
-                    Ok(()) => {}
-                    Err(HedgedGridLiveError::Unresolved | HedgedGridLiveError::Rejected) => {
-                        save_state(store, state)?;
-                        return Ok(true);
-                    }
-                    Err(error) => return Err(error),
-                }
-                if let Err(error) = state.reset_orders_settled() {
-                    warn!(
-                        event = "grid_reset_settlement_phase_mismatch",
-                        phase = ?state.phase,
-                        pending_transactions = state.pending_transactions.len(),
-                        reason = %error,
-                        "重置撤单结算的状态不匹配"
-                    );
-                    return Err(error.into());
-                }
-                save_state(store, state)?;
-                if reason == GridResetReason::InventoryLow {
-                    state.reconcile_replenishment_round(highest_durable_replenishment_round(
-                        commands, binding,
-                    )?)?;
-                    let replenishment_decision = match state.begin_replenishment() {
-                        Ok(decision) => decision,
-                        Err(error) => {
-                            warn!(
-                                event = "grid_replenishment_phase_mismatch",
-                                phase = ?state.phase,
-                                reset_reason = ?state.reset_reason,
-                                pending_transactions = state.pending_transactions.len(),
-                                reason = %error,
-                                "库存补充状态不匹配"
-                            );
-                            return Err(error.into());
-                        }
-                    };
-                    let GridDecision::Actions(actions) = replenishment_decision else {
-                        return Err(HedgedGridLiveError::Strategy(HedgedGridError::Phase));
-                    };
-                    let replenishments = actions
-                        .into_iter()
-                        .filter_map(|action| match action {
-                            GridAction::Replenish(value) => Some(value),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>();
-                    let mutations = replenishments
-                        .iter()
-                        .map(|replenishment| {
-                            market_command(binding, replenishment, instrument, inventory)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
+    let Some(action) = actions.into_iter().next() else {
+        return Ok(false);
+    };
+    match action {
+        GridAction::Reset { reason } => {
+            let reset_result = dispatch_reset_orders(
+                commands,
+                transport,
+                authority,
+                writer,
+                binding,
+                state,
+                Some(snapshot),
+                now_ms,
+            );
+            match reset_result {
+                Ok(()) => {}
+                Err(HedgedGridLiveError::Unresolved | HedgedGridLiveError::Rejected) => {
                     save_state(store, state)?;
-                    dispatch_batch(commands, transport, authority, writer, mutations)?;
                     return Ok(true);
                 }
-                return install_epoch(
-                    state, store, commands, transport, public, instrument, authority, writer,
-                    binding, inventory, now_ms,
+                Err(error) => return Err(error),
+            }
+            if let Err(error) = state.reset_orders_settled() {
+                warn!(
+                    event = "grid_reset_settlement_phase_mismatch",
+                    phase = ?state.phase,
+                    pending_transactions = state.pending_transactions.len(),
+                    reason = %error,
+                    "重置撤单结算的状态不匹配"
                 );
+                return Err(error.into());
             }
-            GridAction::Dispatch(_) | GridAction::ReanchorAtFill { .. } => {
-                return Err(HedgedGridLiveError::Dispatch);
+            save_state(store, state)?;
+            if reason == GridResetReason::InventoryLow {
+                state.reconcile_replenishment_round(highest_durable_replenishment_round(
+                    commands, binding,
+                )?)?;
+                let replenishment_decision = match state.begin_replenishment() {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        warn!(
+                            event = "grid_replenishment_phase_mismatch",
+                            phase = ?state.phase,
+                            reset_reason = ?state.reset_reason,
+                            pending_transactions = state.pending_transactions.len(),
+                            reason = %error,
+                            "库存补充状态不匹配"
+                        );
+                        return Err(error.into());
+                    }
+                };
+                let GridDecision::Actions(actions) = replenishment_decision else {
+                    return Err(HedgedGridLiveError::Strategy(HedgedGridError::Phase));
+                };
+                let replenishments = actions
+                    .into_iter()
+                    .filter_map(|action| match action {
+                        GridAction::Replenish(value) => Some(value),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let mutations = replenishments
+                    .iter()
+                    .map(|replenishment| {
+                        market_command(binding, replenishment, instrument, inventory)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                save_state(store, state)?;
+                dispatch_batch(commands, transport, authority, writer, mutations)?;
+                return Ok(true);
             }
-            GridAction::Place(_) | GridAction::Replenish(_) => {
-                return Err(HedgedGridLiveError::Strategy(HedgedGridError::Phase));
-            }
+            install_epoch(
+                state, store, commands, transport, public, instrument, authority, writer, binding,
+                inventory, now_ms,
+            )
+        }
+        GridAction::Dispatch(_) | GridAction::ReanchorAtFill { .. } => {
+            Err(HedgedGridLiveError::Dispatch)
+        }
+        GridAction::Place(_) | GridAction::Replenish(_) => {
+            Err(HedgedGridLiveError::Strategy(HedgedGridError::Phase))
         }
     }
-    Ok(false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1466,6 +1466,10 @@ fn install_epoch(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "reset dispatch must bind the durable WAL, writer, owner, state, and signed snapshot together"
+)]
 fn dispatch_reset_orders(
     commands: &mut CommandJournal,
     transport: &BinancePrivateFactsTransport,

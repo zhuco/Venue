@@ -4839,22 +4839,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "venue-runtime"
-version = "0.1.0"
-dependencies = [
- "rust_decimal",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.19",
- "venue-domain",
- "venue-execution",
- "venue-gateway-api",
- "venue-storage",
-]
-
-[[package]]
 name = "venue-node"
 version = "0.1.0"
 dependencies = [
@@ -4869,6 +4853,22 @@ dependencies = [
  "venue-gateway-gate",
  "venue-gateway-hyperliquid",
  "venue-gateway-okx",
+]
+
+[[package]]
+name = "venue-runtime"
+version = "0.1.0"
+dependencies = [
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.19",
+ "venue-domain",
+ "venue-execution",
+ "venue-gateway-api",
+ "venue-storage",
 ]
 
 [[package]]

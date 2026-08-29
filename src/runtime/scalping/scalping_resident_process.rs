@@ -675,10 +675,10 @@ fn fail_closed_finalize(
     if let Err(error) = sources.drain_pending_deadline() {
         errors.push(format!("deadline preflight: {error}"));
     }
-    if let Some(now_ms) = now_ms {
-        if let Err(error) = persist_worker_fence(sources, gate, worker, now_ms) {
-            errors.push(format!("private fence: {error}"));
-        }
+    if let Some(now_ms) = now_ms
+        && let Err(error) = persist_worker_fence(sources, gate, worker, now_ms)
+    {
+        errors.push(format!("private fence: {error}"));
     }
     if let Err(error) = sources.drive_control_private(None, Some(stop_report()), None) {
         errors.push(format!("stop-and-protect: {error}"));

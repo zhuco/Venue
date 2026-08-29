@@ -88,7 +88,6 @@ impl Stage7PublicJournal {
             .unwrap_or(0);
         let file = OpenOptions::new()
             .create(true)
-            .write(true)
             .append(true)
             .open(&path)
             .map_err(|source| Stage7PublicJournalError::Io {
@@ -105,6 +104,13 @@ impl Stage7PublicJournal {
         })
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "single-record append remains the tested compatibility boundary for future callers"
+        )
+    )]
     pub(super) fn append(
         &mut self,
         generation: u64,
@@ -202,6 +208,13 @@ impl Stage7PublicJournal {
         self.max_generation
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "explicit recovery remains the tested compatibility boundary for journal repair"
+        )
+    )]
     pub(super) fn recover(&mut self) -> Result<Vec<Stage7PublicRecord>, Stage7PublicJournalError> {
         self.repair_if_needed()?;
         self.file

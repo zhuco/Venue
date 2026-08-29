@@ -547,6 +547,10 @@ pub(super) fn immediate_executable_handoff_private_generation(
     Ok(Some(receipt.private_generation))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "handoff-chain validation must bind every predecessor identity and recursion fence"
+)]
 fn validate_admission_chain(
     capability_binding: &CapabilityBinding,
     instrument: &crate::domain::Instrument,

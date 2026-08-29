@@ -51,6 +51,7 @@ pub fn scan_binance_usdt_perpetuals(
     let lock_path = artifacts_root.join("binance_market_scan.lock");
     let lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)

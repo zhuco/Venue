@@ -401,10 +401,10 @@ fn settle_network_outcomes(
 ) -> Result<(), HedgedGridLiveError> {
     let mut result = Ok(());
     for (mutation, outcome) in outcomes {
-        if let Err(error) = settle_mutation(commands, mutation, outcome) {
-            if result.is_ok() {
-                result = Err(error);
-            }
+        if let Err(error) = settle_mutation(commands, mutation, outcome)
+            && result.is_ok()
+        {
+            result = Err(error);
         }
     }
     result

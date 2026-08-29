@@ -531,6 +531,10 @@ fn cancel_before_submit(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the test facade mirrors the production settlement authority boundary"
+)]
 pub(super) fn settle_exposure_take_profit<V: HedgedGridVenue>(
     checkpoint: &mut Stage7GridCheckpoint,
     checkpoint_store: &ProjectionStore,

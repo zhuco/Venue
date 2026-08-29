@@ -231,10 +231,10 @@ impl ScalpingCandidateEvidenceCoordinator {
         preparation: Option<CandidatePreparation>,
     ) -> Result<(), ScalpingCandidateEvidenceError> {
         self.ensure_live()?;
-        if let Some(preparation) = &preparation {
-            if preparation.binding_digest != self.binding.digest() {
-                return self.fail_closed(ScalpingCandidateEvidenceError::Identity);
-            }
+        if let Some(preparation) = &preparation
+            && preparation.binding_digest != self.binding.digest()
+        {
+            return self.fail_closed(ScalpingCandidateEvidenceError::Identity);
         }
         if let Err(error) = self.assembler.record_preparation(preparation.clone()) {
             return self.fail_closed(error.into());
@@ -538,10 +538,10 @@ fn validate_checkpoint(
     {
         return Err(ScalpingCandidateEvidenceError::Checkpoint);
     }
-    if let Some(frame) = &checkpoint.last_frame {
-        if frame.generation == 0 || frame.watermark_ms == 0 {
-            return Err(ScalpingCandidateEvidenceError::Checkpoint);
-        }
+    if let Some(frame) = &checkpoint.last_frame
+        && (frame.generation == 0 || frame.watermark_ms == 0)
+    {
+        return Err(ScalpingCandidateEvidenceError::Checkpoint);
     }
     if checkpoint.last_assembled_evidence.is_some() && checkpoint.last_frame.is_none() {
         return Err(ScalpingCandidateEvidenceError::Checkpoint);
@@ -549,23 +549,22 @@ fn validate_checkpoint(
     if checkpoint.last_evidence_sequence == Some(0) {
         return Err(ScalpingCandidateEvidenceError::Checkpoint);
     }
-    if let Some(preparation) = &checkpoint.pending_preparation {
-        if preparation.preparation_id.trim().is_empty()
+    if let Some(preparation) = &checkpoint.pending_preparation
+        && (preparation.preparation_id.trim().is_empty()
             || preparation.binding_digest != binding.digest()
             || preparation.frame_generation == 0
             || preparation.watermark_ms == 0
             || checkpoint.last_frame.as_ref().is_none_or(|frame| {
                 frame.generation != preparation.frame_generation
                     || frame.watermark_ms != preparation.watermark_ms
-            })
-        {
-            return Err(ScalpingCandidateEvidenceError::Checkpoint);
-        }
+            }))
+    {
+        return Err(ScalpingCandidateEvidenceError::Checkpoint);
     }
-    if let Some(applied) = &checkpoint.applied_risk {
-        if !valid_applied_risk(binding, params, &applied.bound(), &applied.receipt)? {
-            return Err(ScalpingCandidateEvidenceError::Checkpoint);
-        }
+    if let Some(applied) = &checkpoint.applied_risk
+        && !valid_applied_risk(binding, params, &applied.bound(), &applied.receipt)?
+    {
+        return Err(ScalpingCandidateEvidenceError::Checkpoint);
     }
     Ok(())
 }

@@ -398,14 +398,14 @@ impl ScalpingResidentSources {
             report.episode_observation_applied = self.consume_pending_mark()?;
         }
         report.deadline_persisted = self.advance_deadline_owner(deadline_clock.as_ref())?;
-        if !report.deadline_persisted {
-            if let Some(clock) = deadline_clock {
-                let timer = self.resident.drive_cycle(ScalpingResidentCycle {
-                    deadline_clock: Some(clock),
-                    ..ScalpingResidentCycle::default()
-                })?;
-                merge_resident_report(&mut report.resident, timer);
-            }
+        if !report.deadline_persisted
+            && let Some(clock) = deadline_clock
+        {
+            let timer = self.resident.drive_cycle(ScalpingResidentCycle {
+                deadline_clock: Some(clock),
+                ..ScalpingResidentCycle::default()
+            })?;
+            merge_resident_report(&mut report.resident, timer);
         }
         self.sync_episode()?;
         self.persist()?;

@@ -586,15 +586,15 @@ impl BinancePrivateFactsWorker {
         {
             self.begin_stream_readback();
         }
-        if self.state == PrivateFactsWorkerState::Ready && self.stream_readback_due_at_ms.is_none()
+        if self.state == PrivateFactsWorkerState::Ready
+            && self.stream_readback_due_at_ms.is_none()
+            && let Some(refresh_at_ms) = self.next_refresh_at_ms
         {
-            if let Some(refresh_at_ms) = self.next_refresh_at_ms {
-                // A due fallback readback must not jump ahead of an already-buffered user-stream
-                // fill. Poll the socket at least once at/after the deadline; only an empty poll
-                // permits the slower seven-scope refresh on the following turn.
-                if now_ms >= refresh_at_ms && self.last_frame_poll_at_ms >= refresh_at_ms {
-                    self.begin_periodic_readback()?;
-                }
+            // A due fallback readback must not jump ahead of an already-buffered user-stream
+            // fill. Poll the socket at least once at/after the deadline; only an empty poll
+            // permits the slower seven-scope refresh on the following turn.
+            if now_ms >= refresh_at_ms && self.last_frame_poll_at_ms >= refresh_at_ms {
+                self.begin_periodic_readback()?;
             }
         }
         let kind = match self.state {
@@ -1248,10 +1248,10 @@ impl BinancePrivateFactsWorker {
         );
         self.next_retry_at_ms = now_ms.saturating_add(delay);
         let disconnect = self.lock_session()?.on_disconnect();
-        if disconnect.is_err() {
-            if let Ok(mut session) = self.session.lock() {
-                session.fail_closed_in_memory();
-            }
+        if disconnect.is_err()
+            && let Ok(mut session) = self.session.lock()
+        {
+            session.fail_closed_in_memory();
         }
         disconnect.map(|_| ()).map_err(Into::into)
     }
@@ -1327,10 +1327,7 @@ impl BinancePrivateFactsTransport {
     fn connect(&mut self) -> Result<(), PrivateFactsWorkerError> {
         self.close();
         let listen_key = self.client.create_user_stream()?;
-        let mut socket = match PrivateStreamSocket::connect(&listen_key) {
-            Ok(socket) => socket,
-            Err(error) => return Err(error.into()),
-        };
+        let mut socket = PrivateStreamSocket::connect(&listen_key)?;
         if let Err(error) = socket.set_read_timeout(Duration::from_millis(FRAME_POLL_MS)) {
             return Err(error.into());
         }
@@ -1647,11 +1644,7 @@ pub fn drive_binance_private_facts_turn(
                 Ok(PrivateFactsTurn::Fenced)
             }
         },
-        PrivateFactsEffect::ReceiveFrame {
-            effect_id,
-            next_sequence: _,
-            ..
-        } => match transport.poll_frame() {
+        PrivateFactsEffect::ReceiveFrame { effect_id, .. } => match transport.poll_frame() {
             Ok(Some((sequence, payload))) => {
                 match worker.complete_frame(effect_id, sequence, now_ms, payload, now_ms) {
                     Ok(_) => {

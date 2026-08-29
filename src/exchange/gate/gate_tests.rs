@@ -675,9 +675,9 @@ fn private_balance_subscription_uses_only_the_required_user_id() {
 }
 
 #[test]
-fn futures_heartbeat_is_public_and_timestamp_bound() {
-    let payload = gate_futures_ping(123).unwrap();
-    let value: Value = serde_json::from_str(&payload).unwrap();
+fn futures_heartbeat_is_public_and_timestamp_bound() -> Result<(), Box<dyn std::error::Error>> {
+    let payload = gate_futures_ping(123)?;
+    let value: Value = serde_json::from_str(&payload)?;
     assert_eq!(
         value,
         json!({
@@ -686,6 +686,7 @@ fn futures_heartbeat_is_public_and_timestamp_bound() {
         })
     );
     assert!(value.get("auth").is_none());
+    Ok(())
 }
 
 #[test]

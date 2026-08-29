@@ -933,13 +933,12 @@ impl ScalpingShadowCoordinator {
         {
             return Err(ScalpingCoordinatorError::RecoveryGeneration);
         }
-        if let Some(previous_generation) = self.last_private_generation {
-            if facts.generation < previous_generation
+        if let Some(previous_generation) = self.last_private_generation
+            && (facts.generation < previous_generation
                 || (facts.generation == previous_generation
-                    && facts.observed_at_ms <= self.last_private_observed_at_ms.unwrap_or(0))
-            {
-                return Err(ScalpingCoordinatorError::PrivateGeneration);
-            }
+                    && facts.observed_at_ms <= self.last_private_observed_at_ms.unwrap_or(0)))
+        {
+            return Err(ScalpingCoordinatorError::PrivateGeneration);
         }
         self.last_private_generation = Some(facts.generation);
         self.last_private_observed_at_ms = Some(facts.observed_at_ms);

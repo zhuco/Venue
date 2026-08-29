@@ -1047,9 +1047,8 @@ pub(crate) fn sanitize_private_stream_payload_for_transport(
     serde_json::to_string(&value).map_err(|_| PrivateError::ListenKey)
 }
 
-/// Both Binance stream families use `fstream.binance.com`. Public and private streams must take
-/// the same explicitly configured proxy route; otherwise a private-ready deployment can never
-/// warm its public market source.
+/// Both stream families use `fstream.binance.com` and must take the same explicit proxy route.
+#[allow(clippy::result_large_err)]
 pub(super) fn connect_binance_stream(
     url: &str,
 ) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, tungstenite::Error> {
@@ -1066,6 +1065,7 @@ pub(super) fn connect_binance_stream(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn connect_direct_binance_stream(
     url: &str,
 ) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, tungstenite::Error> {

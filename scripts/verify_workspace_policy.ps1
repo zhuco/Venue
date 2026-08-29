@@ -18,7 +18,7 @@ $allowedDependencies = @(
     'tokio-tungstenite', 'toml', 'tracing', 'tracing-subscriber', 'tungstenite', 'venue-control-protocol',
     'venue-copy', 'venue-domain', 'venue-execution', 'venue-gateway-api', 'venue-gateway-binance', 'venue-gateway-bitget',
     'venue-gateway-bybit', 'venue-gateway-gate', 'venue-gateway-hyperliquid', 'venue-gateway-okx',
-    'venue-indicators', 'venue-runtime', 'venue-storage', 'venue-strategies', 'wasm-bindgen', 'wasm-bindgen-futures', 'web-sys'
+    'venue', 'venue-indicators', 'venue-runtime', 'venue-storage', 'venue-strategies', 'wasm-bindgen', 'wasm-bindgen-futures', 'web-sys'
 )
 
 function Get-TrackedActivePaths {

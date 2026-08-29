@@ -196,14 +196,18 @@ mod tests {
 
     use super::{MarketRankSample, MarketRejectReason, MarketScannerParams, select_liquid_movers};
 
-    fn sample(symbol: &str, change_24h_bps: i64, quote_volume: i64) -> MarketRankSample {
-        MarketRankSample {
-            symbol: symbol.parse().expect("test symbol"),
+    fn sample(
+        symbol: &str,
+        change_24h_bps: i64,
+        quote_volume: i64,
+    ) -> Result<MarketRankSample, Box<dyn std::error::Error>> {
+        Ok(MarketRankSample {
+            symbol: symbol.parse()?,
             observed_at_ms: 100,
             source_generation: 7,
             change_24h_bps: Decimal::new(change_24h_bps, 0),
             quote_volume: Decimal::new(quote_volume, 0),
-        }
+        })
     }
 
     #[test]
@@ -212,11 +216,11 @@ mod tests {
         let selection = select_liquid_movers(
             &MarketScannerParams::phase8(),
             vec![
-                sample("BTC/USDT", 400, 500),
-                sample("ETH/USDT", -900, 450),
-                sample("SOL/USDT", 800, 400),
-                sample("XRP/USDT", -1_200, 300),
-                sample("DOGE/USDT", 5_000, 10),
+                sample("BTC/USDT", 400, 500)?,
+                sample("ETH/USDT", -900, 450)?,
+                sample("SOL/USDT", 800, 400)?,
+                sample("XRP/USDT", -1_200, 300)?,
+                sample("DOGE/USDT", 5_000, 10)?,
             ],
         )?;
 
@@ -244,10 +248,10 @@ mod tests {
         let selection = select_liquid_movers(
             &MarketScannerParams::phase8(),
             vec![
-                sample("BTC/USDT", 100, 100),
-                sample("BTC/USDT", 200, 200),
-                sample("ETH/USDT", 0, 100),
-                sample("SOL/USDT", 100, 0),
+                sample("BTC/USDT", 100, 100)?,
+                sample("BTC/USDT", 200, 200)?,
+                sample("ETH/USDT", 0, 100)?,
+                sample("SOL/USDT", 100, 0)?,
             ],
         )?;
 

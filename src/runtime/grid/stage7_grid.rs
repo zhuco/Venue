@@ -1004,16 +1004,15 @@ fn execute_mutations<V: HedgedGridVenue>(
                     Stage7Mutation::Reduce(command) => Some(command.client_order_id.as_str()),
                     Stage7Mutation::Cancel(_) => None,
                 };
-                if let Some(client_order_id) = submitted_client_order_id {
-                    if let Ok(ExactOrderRecovery::Found(venue_order_id)) =
+                if let Some(client_order_id) = submitted_client_order_id
+                    && let Ok(ExactOrderRecovery::Found(venue_order_id)) =
                         recover_order(client_order_id, venue)
-                    {
-                        commands.transition(
-                            mutation.command_id(),
-                            CommandState::Accepted { venue_order_id },
-                        )?;
-                        continue;
-                    }
+                {
+                    commands.transition(
+                        mutation.command_id(),
+                        CommandState::Accepted { venue_order_id },
+                    )?;
+                    continue;
                 }
                 // A cancel can cross an exchange-side fill/cancel boundary.  Only an exact
                 // client-identity query may settle that race; an active or unqueryable target

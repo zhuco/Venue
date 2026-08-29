@@ -91,7 +91,7 @@ impl BitgetCredentials {
     }
 
     pub fn api_key_sha256(&self) -> String {
-        hex(&Sha256::digest(self.key.as_bytes()))
+        hex(Sha256::digest(self.key.as_bytes()))
     }
 }
 
@@ -1661,15 +1661,19 @@ fn wall_clock_ms() -> Result<u64, BitgetError> {
         .and_then(|duration| u64::try_from(duration.as_millis()).map_err(|_| BitgetError::Clock))
 }
 
+type PrivateReadbackResults<A, B, C, D, E> = (
+    Result<A, BitgetError>,
+    Result<B, BitgetError>,
+    Result<C, BitgetError>,
+    Result<D, BitgetError>,
+    Result<E, BitgetError>,
+);
+
+type CompletePrivateReadback<A, B, C, D, E> = (A, B, C, D, E);
+
 fn complete_private_readback_tuple<A, B, C, D, E>(
-    results: (
-        Result<A, BitgetError>,
-        Result<B, BitgetError>,
-        Result<C, BitgetError>,
-        Result<D, BitgetError>,
-        Result<E, BitgetError>,
-    ),
-) -> Result<(A, B, C, D, E), BitgetError> {
+    results: PrivateReadbackResults<A, B, C, D, E>,
+) -> Result<CompletePrivateReadback<A, B, C, D, E>, BitgetError> {
     let (assets, settings, positions, orders, fills) = results;
     Ok((assets?, settings?, positions?, orders?, fills?))
 }

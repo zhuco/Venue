@@ -211,7 +211,7 @@ Copy planner/job-consumer lease 只允许竞争数据库 job 的规划或投递�
 | Gate.io | `venue-gateway-gate` | 已迁入 USDT perpetual TEST/LIVE、凭证/REST/WS 签名、公共市场、账户/持仓/风险、regular 订单/成交闭合分页；Stage 7 profile 候选重放 regular raw pages，并只把 Conditional/Algo 表示为显式 unsupported；签名采集 transport 与 Stage 7 capability/WAL/writer 仍留根 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
 | Bybit | `venue-gateway-bybit` | 公共/私有协议与 place/cancel/reduce、ACK、闭合读回已绑定；async HTTP/私有 WS 禁 redirect，并具超时/2 MiB 级限额、分配前 WS 限额、ACK 前有界缓存、received-at、应用层心跳与 generation；固定 node binary 已建立，但 writer/WAL/capability 为空 | `TEST | LIVE`；节点在完整安全闭环接入前失败关闭，不得小额实盘 mutation |
 | OKX | `venue-gateway-okx` | linear SWAP 公私协议、execution 与 orders/account/positions 私流已绑定；async HTTP/私有 WS 具同样的 redirect、超时、限长、缓存、心跳和 generation 边界；tdMode 只接受 Cross/Isolated、Net 意图拒绝；固定 node binary 已建立，但 writer/WAL/capability 为空 | `TEST | LIVE`；节点在完整安全闭环接入前失败关闭，不得小额实盘 mutation |
-| Hyperliquid | `venue-gateway-hyperliquid` | `/info`、恢复查询与 orderUpdates/userFills/userEvents 已绑定；async HTTP/双私有 WS 具限时限长、ACK 前缓存、received-at、心跳、generation 与跨频道 fill 去重；`tid` 不是 sequence；固定 node binary 已建立，EIP-712 action signing、writer/WAL/capability 仍为空 | `TEST | LIVE`；节点在完整安全闭环接入前失败关闭，不能 mutation |
+| Hyperliquid | `venue-gateway-hyperliquid` | `/info`、恢复查询与 orderUpdates/userFills/userEvents 已绑定；async HTTP/双私有 WS 具限时限长、ACK 前缓存、received-at、心跳、generation 与跨频道 fill 去重；`action.rs` 已完成 MessagePack action hash、EIP-712 Agent 签名、持久 nonce 与限价下单/撤单 wire；`tid` 不是 sequence；固定 node binary 已建立，writer/WAL/capability 仍为空 | `TEST | LIVE`；节点在完整安全闭环接入前失败关闭，不能 mutation |
 
 KOL 网关只是协议 fixture 和差异对照来源，不继承其运行开关或实盘准入状态。前三所的生产权威继续来自 Venue 已验收实现。
 

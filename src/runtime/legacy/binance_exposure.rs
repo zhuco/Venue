@@ -336,6 +336,10 @@ impl BinanceExposureRuntime {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "settlement revalidates each durable, private, writer, and instrument authority at one boundary"
+    )]
     pub(super) fn settle(
         &mut self,
         commands: &mut CommandJournal,

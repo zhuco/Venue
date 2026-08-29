@@ -18,6 +18,14 @@ pub(super) fn is_transient_readback_error(error: &GridVenueError) -> bool {
     )
 }
 
+pub(super) fn is_transient_instrument_rule_error(error: &GridVenueError) -> bool {
+    matches!(error, GridVenueError::InstrumentRulesUnavailable)
+}
+
+pub(super) fn is_transient_venue_startup_error(error: &GridVenueError) -> bool {
+    is_transient_readback_error(error) || is_transient_instrument_rule_error(error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,12 +57,4 @@ mod tests {
             assert!(is_transient_readback_error(&error));
         }
     }
-}
-
-pub(super) fn is_transient_instrument_rule_error(error: &GridVenueError) -> bool {
-    matches!(error, GridVenueError::InstrumentRulesUnavailable)
-}
-
-pub(super) fn is_transient_venue_startup_error(error: &GridVenueError) -> bool {
-    is_transient_readback_error(error) || is_transient_instrument_rule_error(error)
 }

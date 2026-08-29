@@ -333,12 +333,12 @@ impl PrivateEvidenceSession {
             .journal
             .append(evidence)
             .map_err(PrivateSessionError::Evidence)?;
-        if let (Some(durable), Some(guard)) = (self.durable.as_mut(), guard) {
-            if let Err(error) = durable.finish_transition(guard, generation, state, sequence) {
-                self.generation = generation;
-                self.state = PrivateSessionState::Reconnecting;
-                return Err(error.into());
-            }
+        if let (Some(durable), Some(guard)) = (self.durable.as_mut(), guard)
+            && let Err(error) = durable.finish_transition(guard, generation, state, sequence)
+        {
+            self.generation = generation;
+            self.state = PrivateSessionState::Reconnecting;
+            return Err(error.into());
         }
         self.generation = generation;
         self.state = state;

@@ -257,11 +257,10 @@ mod tests {
         Ok(Config::load(path)?)
     }
 
-    fn binding() -> StrategyBinding {
+    fn binding() -> Result<StrategyBinding, serde_json::Error> {
         serde_json::from_str(
             r#"{"strategy_kind":"scalping","strategy_instance_id":"stage6","run_id":"run-1","exchange":"binance","account":"00000000-0000-4000-8000-000000000001","symbol":"SOL/USDT","parameter_release_id":"stage6-v1","owner_scope":"stage6:run-1","risk_budget":{"asset":"USDT","value":"5"}}"#,
         )
-        .unwrap_or_else(|error| panic!("test binding must decode: {error}"))
     }
 
     fn request(root: PathBuf, binding_path: PathBuf, deadline: u64) -> ScalpingControlRequest {
@@ -282,7 +281,7 @@ mod tests {
         let config = config(directory.path())?;
         let root = directory.path().join("artifacts");
         let binding_path = directory.path().join("binding.json");
-        fs::write(&binding_path, serde_json::to_vec(&binding())?)?;
+        fs::write(&binding_path, serde_json::to_vec(&binding()?)?)?;
         let deadline = wall_clock_ms()? + 1_000;
         let first = apply_scalping_control(
             &config,
@@ -310,7 +309,7 @@ mod tests {
         let config = config(directory.path())?;
         let root = directory.path().join("artifacts");
         let binding_path = directory.path().join("binding.json");
-        fs::write(&binding_path, serde_json::to_vec(&binding())?)?;
+        fs::write(&binding_path, serde_json::to_vec(&binding()?)?)?;
         let mut missing_confirmation =
             request(root.clone(), binding_path.clone(), wall_clock_ms()? + 1_000);
         missing_confirmation.confirm_entry_authority = false;

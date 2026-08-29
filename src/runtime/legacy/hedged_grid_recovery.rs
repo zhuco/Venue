@@ -212,6 +212,10 @@ fn exposure_order_resolution(venue_order_id: Option<String>) -> CommandState {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::items_after_test_module,
+    reason = "this focused regression test remains adjacent to the private helper it verifies"
+)]
 mod exposure_recovery_tests {
     use super::*;
 

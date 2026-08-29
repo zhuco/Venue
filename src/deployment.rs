@@ -1049,6 +1049,10 @@ fn bitget_stream_doctor(cfg: &Config) -> Result<()> {
 }
 
 #[cfg(any(feature = "hedged-grid-gate", feature = "hedged-grid-bitget"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the operator readback line deliberately prints one complete, explicit evidence tuple"
+)]
 fn print_private_readback(
     exchange: &str,
     symbol: &crate::domain::Symbol,

@@ -149,13 +149,13 @@ fn binance_canary_capability_is_bound_to_pm_account_symbol_and_api_identity()
 }
 
 #[test]
-fn binance_mutation_response_returns_only_the_exact_native_order_id() {
+fn binance_mutation_response_returns_only_the_exact_native_order_id()
+-> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(
         binance_accepted_order_id(
             r#"{"orderId":13677753681,"clientOrderId":"hgo_e961_long_close_l1"}"#,
             "hgo_e961_long_close_l1",
-        )
-        .unwrap(),
+        )?,
         "13677753681"
     );
     assert!(
@@ -165,6 +165,7 @@ fn binance_mutation_response_returns_only_the_exact_native_order_id() {
         )
         .is_err()
     );
+    Ok(())
 }
 
 #[test]

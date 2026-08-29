@@ -1082,6 +1082,10 @@ pub(super) fn require_stage7_canary<V: Stage7CanaryVenue>(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the lifecycle receipt commits all release and evidence identities atomically"
+)]
 pub(super) fn append_stage7_grid_lifecycle_capability(
     capability_binding: &CapabilityBinding,
     deployment_binding: &HedgedGridBinding,
@@ -1144,6 +1148,10 @@ pub(super) fn require_stage7_grid_lifecycle<V: Stage7CanaryVenue>(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the admission check deliberately compares every persisted lifecycle identity"
+)]
 fn require_stage7_grid_lifecycle_context(
     capability_binding: &CapabilityBinding,
     deployment_binding: &HedgedGridBinding,
@@ -1156,7 +1164,7 @@ fn require_stage7_grid_lifecycle_context(
     executable_sha256: &str,
 ) -> Result<(), Stage7GridError> {
     let current = CapabilityEvidenceStore::open(artifacts_root.join(CAPABILITY_EVIDENCE_FILE))?
-        .current(&capability_binding, now_ms)?;
+        .current(capability_binding, now_ms)?;
     let (admission, predecessor) =
         super::stage7_executable_handoff::validated_admission_predecessor(
             capability_binding,
@@ -1168,7 +1176,7 @@ fn require_stage7_grid_lifecycle_context(
         )?;
     let lifecycle = current.get(&Capability::GridLifecycle);
     if admission.matches_current_exposure(
-        &capability_binding,
+        capability_binding,
         instrument,
         minimum_quantity,
         executable_sha256,

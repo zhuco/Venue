@@ -101,6 +101,10 @@ struct ShadowLegSemantic<'a> {
     unrealized_pnl: &'a Decimal,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the evidence constructor binds all independently verified risk surfaces at one boundary"
+)]
 pub(crate) fn build_shadow_evidence(
     binding: &HedgedGridBinding,
     params: &ExposureGuardParams,

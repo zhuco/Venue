@@ -385,6 +385,10 @@ pub(crate) struct GridVenueFill {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "boxing the fill would change the shared Stage 7 event contract outside exchange"
+)]
 pub(crate) enum GridPrivateEvent {
     Fill {
         fill: Fill,

@@ -851,7 +851,7 @@ impl GatePrivateStream {
             .headers_mut()
             .insert("X-Gate-Size-Decimal", HeaderValue::from_static("1"));
         let (mut socket, _) = websocket::connect_tls(request).map_err(|_| GateError::WebSocket)?;
-        let expected_channels = private_subscription_channels(user_id, &native_symbol);
+        let expected_channels = private_subscription_channels(user_id, native_symbol);
         for (channel, payload) in expected_channels.iter().cloned() {
             let message = private_subscription(credentials, timestamp, channel, payload)?;
             socket

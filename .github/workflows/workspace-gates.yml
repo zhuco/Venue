@@ -17,6 +17,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
       - name: Verify repository policy
         shell: pwsh
         run: ./scripts/verify_workspace_policy.ps1
@@ -26,6 +27,12 @@ jobs:
       - name: Verify fixed deployment binaries
         shell: pwsh
         run: ./scripts/verify_fixed_deployment_binaries.ps1
+      - name: Verify isolated venue node binaries
+        shell: pwsh
+        run: ./scripts/verify_venue_node_binaries.ps1
+      - name: Verify VenueFlow Web build
+        shell: pwsh
+        run: cargo check -p venueflow --target wasm32-unknown-unknown --no-default-features --features web --lib --locked
       - name: Verify Rust workspace quality
         shell: pwsh
         run: ./scripts/verify_workspace_quality.ps1

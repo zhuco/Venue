@@ -212,11 +212,10 @@ fn resolve_addresses(
     deadline: ConnectDeadline,
 ) -> Option<Vec<SocketAddr>> {
     finish_before_deadline("venue-ws-dns", deadline, move || {
-        let resolved = (host.as_str(), port)
+        (host.as_str(), port)
             .to_socket_addrs()
             .ok()
-            .map(|addresses| addresses.collect::<Vec<_>>());
-        resolved
+            .map(|addresses| addresses.collect::<Vec<_>>())
     })
     .flatten()
 }
@@ -303,8 +302,8 @@ mod tests {
     #[test]
     fn all_addresses_share_one_decreasing_connect_budget() {
         let addresses = vec![
-            "127.0.0.1:1".parse().expect("test address"),
-            "127.0.0.1:2".parse().expect("test address"),
+            SocketAddr::from(([127, 0, 0, 1], 1)),
+            SocketAddr::from(([127, 0, 0, 1], 2)),
         ];
         let deadline = ConnectDeadline {
             expires_at: Instant::now() + Duration::from_secs(1),
@@ -327,7 +326,7 @@ mod tests {
         };
         let mut attempts = 0;
         let connected = first_connected(
-            vec!["127.0.0.1:1".parse().expect("test address")],
+            vec![SocketAddr::from(([127, 0, 0, 1], 1))],
             deadline,
             |_, _| {
                 attempts += 1;

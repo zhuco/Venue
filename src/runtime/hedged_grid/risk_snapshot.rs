@@ -135,6 +135,10 @@ pub(crate) fn select_binding_risk_snapshot(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the authorized plan crosses one rare risk boundary and boxing would spread through its callers"
+)]
 pub(crate) enum MarketReductionPlan {
     Authorized {
         command: MarketReduceCommand,
@@ -448,13 +452,12 @@ impl ExposureReductionAuditHead {
         {
             return Err(RiskSnapshotRuntimeError::ReceiptEvidence);
         }
-        if let Some(record) = &self.pending_record {
-            if record.sequence != self.sequence
+        if let Some(record) = &self.pending_record
+            && (record.sequence != self.sequence
                 || record.record_sha256 != self.record_sha256
-                || record.record_sha256 != record.expected_sha256()?
-            {
-                return Err(RiskSnapshotRuntimeError::ReceiptEvidence);
-            }
+                || record.record_sha256 != record.expected_sha256()?)
+        {
+            return Err(RiskSnapshotRuntimeError::ReceiptEvidence);
         }
         Ok(())
     }
