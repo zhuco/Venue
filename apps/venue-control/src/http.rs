@@ -14,13 +14,15 @@ use tokio::{
     sync::{Semaphore, watch},
     time::{self, MissedTickBehavior},
 };
-use venue_control_protocol::{
-    AccountDeliveryAck, AccountDeliveryClaimRequest, AccountDeliveryReceipt, ControlCommandRequest,
-};
+use venue_control_protocol::ControlCommandRequest;
 
 use crate::{
     AccountDeliveryRepository, AccountDeliveryRepositoryError, ControlRepository, ControlService,
     RepositoryError, ServiceError,
+    account_node_poll::{
+        AccountNodePollError, AccountNodeRoute, MAX_ACCOUNT_NODE_HTTP_TIMEOUT,
+        handle_account_node_request,
+    },
 };
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -114,6 +116,7 @@ enum HttpError {
     Timeout,
     Unavailable,
     Conflict,
+    DeliveryConflict,
     Internal,
 }
 
@@ -232,75 +235,40 @@ where
                 .await
                 .map_err(|_| ())
         }
-        (Method::Post, "/v2/account-node/deliveries/claim") if query.is_none() => {
-            let claim_request =
-                match serde_json::from_slice::<AccountDeliveryClaimRequest>(&request.body) {
-                    Ok(request) => request,
-                    Err(_) => {
-                        return write_error(stream, HttpError::BadRequest)
-                            .await
-                            .map_err(|_| ());
-                    }
-                };
-            let leased_at_ms = match now_ms() {
+        (Method::Post, path) if query.is_none() && AccountNodeRoute::from_path(path).is_some() => {
+            let route = AccountNodeRoute::from_path(path).ok_or(())?;
+            let observed_ms = match now_ms() {
                 Ok(value) => value,
                 Err(error) => return write_error(stream, error).await.map_err(|_| ()),
             };
-            let claims = match call(
-                state,
+            let body = match handle_account_node_request(
+                state.service.as_ref(),
+                route,
+                &request.body,
+                observed_ms,
+                state.config.request_timeout,
+            )
+            .await
+            {
+                Ok(body) => body,
+                Err(error) => {
+                    return write_error(stream, map_account_node_error(error))
+                        .await
+                        .map_err(|_| ());
+                }
+            };
+            write_response_with_timeout(
+                stream,
+                "200 OK",
+                "application/json",
+                "close",
+                &body,
                 state
-                    .service
-                    .claim_account_deliveries(&claim_request, leased_at_ms),
+                    .config
+                    .request_timeout
+                    .min(MAX_ACCOUNT_NODE_HTTP_TIMEOUT),
             )
             .await
-            {
-                Ok(claims) => claims,
-                Err(error) => return write_error(stream, error).await.map_err(|_| ()),
-            };
-            let body = serde_json::to_vec(&claims).map_err(|_| ())?;
-            write_response(stream, "200 OK", "application/json", "close", &body)
-                .await
-                .map_err(|_| ())
-        }
-        (Method::Post, "/v2/account-node/deliveries/ack") if query.is_none() => {
-            let ack = match serde_json::from_slice::<AccountDeliveryAck>(&request.body) {
-                Ok(ack) => ack,
-                Err(_) => {
-                    return write_error(stream, HttpError::BadRequest)
-                        .await
-                        .map_err(|_| ());
-                }
-            };
-            if let Err(error) = call(state, state.service.acknowledge_account_delivery(&ack)).await
-            {
-                return write_error(stream, error).await.map_err(|_| ());
-            }
-            let body = serde_json::to_vec(&ack).map_err(|_| ())?;
-            write_response(stream, "200 OK", "application/json", "close", &body)
-                .await
-                .map_err(|_| ())
-        }
-        (Method::Post, "/v2/account-node/deliveries/receipts") if query.is_none() => {
-            let receipt = match serde_json::from_slice::<AccountDeliveryReceipt>(&request.body) {
-                Ok(receipt) => receipt,
-                Err(_) => {
-                    return write_error(stream, HttpError::BadRequest)
-                        .await
-                        .map_err(|_| ());
-                }
-            };
-            if let Err(error) = call(
-                state,
-                state.service.record_account_delivery_receipt(&receipt),
-            )
-            .await
-            {
-                return write_error(stream, error).await.map_err(|_| ());
-            }
-            let body = serde_json::to_vec(&receipt).map_err(|_| ())?;
-            write_response(stream, "200 OK", "application/json", "close", &body)
-                .await
-                .map_err(|_| ())
         }
         (Method::Get, "/v2/ui/events") => {
             let cursor = match event_cursor(query, request.last_event_id) {
@@ -498,6 +466,23 @@ async fn write_response(
     stream.shutdown().await
 }
 
+async fn write_response_with_timeout(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    connection: &str,
+    body: &[u8],
+    timeout: Duration,
+) -> Result<(), ()> {
+    time::timeout(
+        timeout,
+        write_response(stream, status, content_type, connection, body),
+    )
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())
+}
+
 async fn write_error(stream: &mut TcpStream, error: HttpError) -> Result<(), std::io::Error> {
     let (status, code) = match error {
         HttpError::BadRequest => ("400 Bad Request", "invalid_request"),
@@ -505,10 +490,24 @@ async fn write_error(stream: &mut TcpStream, error: HttpError) -> Result<(), std
         HttpError::Timeout => ("504 Gateway Timeout", "request_timeout"),
         HttpError::Unavailable => ("503 Service Unavailable", "service_unavailable"),
         HttpError::Conflict => ("409 Conflict", "command_conflict"),
+        HttpError::DeliveryConflict => ("409 Conflict", "delivery_conflict"),
         HttpError::Internal => ("500 Internal Server Error", "internal_error"),
     };
     let body = format!("{{\"error\":\"{code}\"}}");
     write_response(stream, status, "application/json", "close", body.as_bytes()).await
+}
+
+fn map_account_node_error(error: AccountNodePollError) -> HttpError {
+    match error {
+        AccountNodePollError::InvalidRequest => HttpError::BadRequest,
+        AccountNodePollError::PayloadTooLarge => HttpError::PayloadTooLarge,
+        AccountNodePollError::Timeout => HttpError::Timeout,
+        AccountNodePollError::Service(error) => match map_service_error(error) {
+            HttpError::Conflict => HttpError::DeliveryConflict,
+            mapped => mapped,
+        },
+        AccountNodePollError::InvalidRepositoryResponse => HttpError::Internal,
+    }
 }
 
 fn map_service_error(error: ServiceError) -> HttpError {
