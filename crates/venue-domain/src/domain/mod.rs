@@ -6,6 +6,7 @@ mod instrument;
 mod market;
 mod money;
 mod order;
+mod order_outcome;
 mod position;
 mod risk_snapshot;
 mod risk_value;
@@ -33,6 +34,11 @@ pub use market::{
 };
 pub use money::{Amount, AmountError, Asset, Price};
 pub use order::{Fill, Order, OrderError, OrderPurpose, OrderSide, OrderState};
+pub use order_outcome::{
+    AuthoritativeOrderOutcome, OrderOutcomeBinding, OrderOutcomeError, OrderOutcomeStatus,
+    OrderReadbackCoverage, OrderReadbackObservation, SignedOrderReadback, UnknownOrderContract,
+    UnresolvedOrderReason,
+};
 pub use position::{Position, PositionSide};
 pub use risk_snapshot::{
     AccountRiskSnapshot, LegRiskSnapshot, RiskSnapshotError, RiskSourceStatus,
@@ -40,3 +46,6 @@ pub use risk_snapshot::{
 };
 pub use risk_value::{RiskFactValue, RiskUnitValue};
 pub use symbol::{Symbol, SymbolError};
+
+#[cfg(test)]
+mod order_outcome_tests;
