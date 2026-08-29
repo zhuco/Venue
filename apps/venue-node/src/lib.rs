@@ -9,17 +9,22 @@ use venue_domain::domain::Symbol;
 use venue_gateway_api::{CapabilityFlags, GatewayApiError, GatewayBinding, GatewayMode, VenueId};
 
 mod safe_host;
+mod supervision;
 
 #[cfg(test)]
 mod safe_host_tests;
 
 pub use safe_host::{
-    CanaryEvidence, CommandReadbackKey, ControlAction, ControlCompletion, ControlEvidence,
-    DispatchOutcome, DispatchPermit, FamilyReadbackCoverage, GatewayAcknowledgement,
-    GatewayDispatchResult, NodeSafetyHost, PhysicalGateway, PreparedDispatch, ReadbackCommandState,
-    SafeHostError, SignedCommandReadback, SignedOwnedOrder, SignedReadbackReceipt,
-    SignedReadbackRequest,
+    CanaryEvidence, CommandReadbackKey, ControlCompletion, DispatchOutcome, DispatchPermit,
+    FamilyReadbackCoverage, GatewayAcknowledgement, GatewayDispatchResult, GatewayRecoveryPermit,
+    NodeSafetyHost, PhysicalGateway, PreparedDispatch, ReadbackCommandState, SafeHostError,
+    SignedCommandReadback, SignedOwnedOrder, SignedReadbackReceipt, SignedReadbackRequest,
 };
+pub use supervision::{
+    ActorAppliedCanaryReceipt, ActorAppliedControlReceipt, ActorCanaryTurn, ActorControlTurn,
+    CanaryControlRequest, SupervisionError,
+};
+pub use venue_control_protocol::{CommandReceipt, ControlAction, ControlCommandRequest};
 
 const ARTIFACT_COMMANDS: [&str; 14] = [
     "grid-start",

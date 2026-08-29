@@ -4,6 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use serde::{Deserialize, Serialize};
+use venue_control_protocol::{CommandReceipt, ControlAction, ControlCommandRequest};
 use venue_domain::domain::{
     CommandId, ExecutionCommand, NativeOrderFamily, OrderOwner, OrderPurpose, Symbol,
 };
@@ -12,15 +14,23 @@ use venue_execution::{
     CommandState, DispatchGuard, WriterLeaseAuthority, WriterLeaseError, WriterScope,
     WriterSession, acquire_account_canonical_root,
 };
-use venue_gateway_api::{
-    CapabilitySnapshot, GatewayApiError, GatewayBinding, GatewayMode, MutationCapability,
-};
+use venue_gateway_api::{CapabilitySnapshot, GatewayApiError, GatewayBinding, MutationCapability};
 use venue_runtime::{AccountKey, AccountModelError, StrategyBinding};
 
-use crate::NodeLaunch;
+use crate::{
+    NodeLaunch,
+    supervision::{
+        ActorAppliedCanaryReceipt, ActorAppliedControlReceipt, ActorCanaryTurn, ActorControlTurn,
+        CanaryControlRequest, PersistedControlCompletion, RestoredLifecycle, SupervisionError,
+        SupervisionJournal,
+    },
+};
 
 const COMMANDS_FILE: &str = "commands.jsonl";
+const SUPERVISION_FILE: &str = "control_receipts.jsonl";
 const WRITER_FILE: &str = "writer.json";
+#[cfg(test)]
+const DIGEST_FOR_TEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const REQUIRED_FAMILIES: [NativeOrderFamily; 3] = [
     NativeOrderFamily::UmOrder,
     NativeOrderFamily::UmConditional,
@@ -36,6 +46,10 @@ pub trait PhysicalGateway {
 
     fn capability_snapshot(&self) -> CapabilitySnapshot;
 
+    /// The host issues this only after canonical-root, WAL, Owner, durable control and writer
+    /// metadata have all been recovered. Implementations must not connect before this call.
+    fn connect_after_recovery(&mut self, permit: GatewayRecoveryPermit) -> Result<(), Self::Error>;
+
     fn signed_readback(
         &mut self,
         request: &SignedReadbackRequest,
@@ -44,6 +58,48 @@ pub trait PhysicalGateway {
     fn verify_signed_readback(&self, receipt: &SignedReadbackReceipt) -> Result<(), Self::Error>;
 
     fn dispatch(&mut self, permit: DispatchPermit) -> GatewayDispatchResult;
+}
+
+/// Non-cloneable startup proof. Possession means local recovery is complete, not mutation authority.
+pub struct GatewayRecoveryPermit {
+    binding: GatewayBinding,
+    config_epoch: u64,
+    unresolved_commands: usize,
+    predecessor_writer_generation: Option<u64>,
+    connection_generation_floor: u64,
+    private_generation_floor: u64,
+}
+
+impl GatewayRecoveryPermit {
+    #[must_use]
+    pub const fn binding(&self) -> &GatewayBinding {
+        &self.binding
+    }
+
+    #[must_use]
+    pub const fn config_epoch(&self) -> u64 {
+        self.config_epoch
+    }
+
+    #[must_use]
+    pub const fn unresolved_commands(&self) -> usize {
+        self.unresolved_commands
+    }
+
+    #[must_use]
+    pub const fn predecessor_writer_generation(&self) -> Option<u64> {
+        self.predecessor_writer_generation
+    }
+
+    #[must_use]
+    pub const fn connection_generation_floor(&self) -> u64 {
+        self.connection_generation_floor
+    }
+
+    #[must_use]
+    pub const fn private_generation_floor(&self) -> u64 {
+        self.private_generation_floor
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -315,7 +371,7 @@ impl SignedReadbackReceipt {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CanaryEvidence {
     binding: GatewayBinding,
     strategy_instance_id: String,
@@ -368,57 +424,37 @@ impl CanaryEvidence {
     pub fn evidence_sha256(&self) -> &str {
         &self.evidence_sha256
     }
-}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ControlAction {
-    Stop,
-    Flatten,
-}
+    #[must_use]
+    pub(crate) const fn binding(&self) -> &GatewayBinding {
+        &self.binding
+    }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ControlEvidence {
-    binding: GatewayBinding,
-    action: ControlAction,
-    strategy_instance_id: String,
-    run_id: String,
-    config_digest: String,
-    confirmed_at_ms: u64,
-    confirmation_sha256: String,
-}
+    #[must_use]
+    pub(crate) fn strategy_instance_id(&self) -> &str {
+        &self.strategy_instance_id
+    }
 
-impl ControlEvidence {
-    pub fn new(
-        binding: GatewayBinding,
-        action: ControlAction,
-        owner: &StrategyBinding,
-        confirmed_at_ms: u64,
-        confirmation_sha256: impl Into<String>,
-    ) -> Result<Self, SafeHostError> {
-        let confirmation_sha256 = confirmation_sha256.into();
-        validate_digest(&confirmation_sha256)?;
-        if confirmed_at_ms == 0 {
-            return Err(SafeHostError::ControlEvidence);
-        }
-        Ok(Self {
-            binding,
-            action,
-            strategy_instance_id: owner.key.instance_id.clone(),
-            run_id: owner.run_id.clone(),
-            config_digest: owner.config_digest.clone(),
-            confirmed_at_ms,
-            confirmation_sha256,
-        })
+    #[must_use]
+    pub(crate) fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    #[must_use]
+    pub(crate) fn config_digest(&self) -> &str {
+        &self.config_digest
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlCompletion {
+    pub request_id: String,
     pub action: ControlAction,
     pub connection_generation: u64,
     pub private_generation: u64,
     pub symbol_custody_retained: bool,
     pub readback_sha256: String,
+    pub receipt: CommandReceipt,
 }
 
 #[derive(Clone, Debug)]
@@ -512,10 +548,13 @@ pub enum DispatchOutcome {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum HostLifecycle {
     Active,
+    Paused,
+    AwaitingActor,
     Stopping {
+        request_id: String,
         action: ControlAction,
         after_connection_generation: u64,
         after_private_generation: u64,
@@ -538,10 +577,12 @@ pub struct NodeSafetyHost<G: PhysicalGateway> {
     owner: StrategyBinding,
     gateway: G,
     journal: CommandJournal,
+    supervision: SupervisionJournal,
     writer: WriterLeaseAuthority,
     writer_session: WriterSession,
     last_readback: SignedReadbackReceipt,
     canary: Option<CanaryEvidence>,
+    config_epoch: u64,
     lifecycle: HostLifecycle,
     _canonical_root: CanonicalRootHold,
 }
@@ -552,8 +593,8 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
     pub fn open(
         launch: &NodeLaunch,
         owner: StrategyBinding,
+        config_epoch: u64,
         gateway: G,
-        canary: Option<CanaryEvidence>,
         now_ms: u64,
     ) -> Result<Self, SafeHostError> {
         validate_static_scope(launch.binding(), &owner, gateway.binding())?;
@@ -564,8 +605,8 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
             launch.binding().clone(),
             artifacts_root,
             owner,
+            config_epoch,
             gateway,
-            canary,
             now_ms,
             CanonicalRootHold::Machine { _guard: guard },
         )
@@ -584,6 +625,11 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
     #[must_use]
     pub const fn owner(&self) -> &StrategyBinding {
         &self.owner
+    }
+
+    #[must_use]
+    pub const fn config_epoch(&self) -> u64 {
+        self.config_epoch
     }
 
     pub fn renew_writer(&mut self, now_ms: u64) -> Result<(), SafeHostError> {
@@ -639,35 +685,95 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
         Ok(())
     }
 
-    pub fn request_control(
+    /// Persists and scopes one authoritative control command before issuing an Actor turn.
+    pub fn accept_control_command(
         &mut self,
-        evidence: ControlEvidence,
+        request: ControlCommandRequest,
         now_ms: u64,
-    ) -> Result<(), SafeHostError> {
-        if self.lifecycle != HostLifecycle::Active
-            || evidence.binding != self.binding
-            || evidence.strategy_instance_id != self.owner.key.instance_id
-            || evidence.run_id != self.owner.run_id
-            || evidence.config_digest != self.owner.config_digest
-            || evidence.confirmed_at_ms > now_ms
-            || evidence.confirmation_sha256.is_empty()
-        {
-            return Err(SafeHostError::ControlEvidence);
-        }
-        self.lifecycle = HostLifecycle::Stopping {
-            action: evidence.action,
-            after_connection_generation: self.last_readback.connection_generation,
-            after_private_generation: self.last_readback.private_generation,
+    ) -> Result<ActorControlTurn, SafeHostError> {
+        let turn = self.supervision.accept_control(
+            request,
+            self.last_readback.connection_generation,
+            self.last_readback.private_generation,
+            now_ms,
+        )?;
+        self.lifecycle = HostLifecycle::AwaitingActor;
+        Ok(turn)
+    }
+
+    /// Reissues a crash-recovered durable turn. It never creates a second control request.
+    pub fn recovered_control_turn(&self) -> Result<Option<ActorControlTurn>, SafeHostError> {
+        self.supervision
+            .recovered_control_turn()
+            .map_err(Into::into)
+    }
+
+    /// Consumes only the receipt created from the matching linear Actor turn.
+    pub fn apply_control_receipt(
+        &mut self,
+        receipt: ActorAppliedControlReceipt,
+    ) -> Result<CommandReceipt, SafeHostError> {
+        let action = receipt.request().action;
+        let request_id = receipt.request().request_id.clone();
+        let connection_generation = receipt.connection_generation();
+        let private_generation = receipt.private_generation();
+        let control_receipt = self.supervision.apply_control(receipt)?;
+        self.lifecycle = match action {
+            ControlAction::Pause => HostLifecycle::Paused,
+            ControlAction::Resume => HostLifecycle::Active,
+            ControlAction::Stop | ControlAction::Flatten => HostLifecycle::Stopping {
+                request_id,
+                action,
+                after_connection_generation: connection_generation,
+                after_private_generation: private_generation,
+            },
         };
-        Ok(())
+        Ok(control_receipt)
+    }
+
+    pub fn accept_canary_control(
+        &mut self,
+        request: CanaryControlRequest,
+        now_ms: u64,
+    ) -> Result<ActorCanaryTurn, SafeHostError> {
+        validate_canary_static(
+            &self.binding,
+            &self.owner,
+            Some(&request.evidence),
+            self.last_readback.private_generation,
+            now_ms,
+        )?;
+        self.supervision
+            .accept_canary(
+                request,
+                self.last_readback.connection_generation,
+                self.last_readback.private_generation,
+                now_ms,
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn apply_canary_receipt(
+        &mut self,
+        receipt: ActorAppliedCanaryReceipt,
+    ) -> Result<CommandReceipt, SafeHostError> {
+        let evidence = receipt.request().evidence.clone();
+        let control_receipt = self.supervision.apply_canary(receipt)?;
+        self.canary = Some(evidence);
+        Ok(control_receipt)
+    }
+
+    pub fn recovered_canary_turn(&self) -> Result<Option<ActorCanaryTurn>, SafeHostError> {
+        self.supervision.recovered_canary_turn().map_err(Into::into)
     }
 
     pub fn complete_control(&mut self, now_ms: u64) -> Result<ControlCompletion, SafeHostError> {
         let HostLifecycle::Stopping {
+            request_id,
             action,
             after_connection_generation,
             after_private_generation,
-        } = self.lifecycle
+        } = self.lifecycle.clone()
         else {
             return Err(SafeHostError::ControlLifecycle);
         };
@@ -699,17 +805,29 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
         if action == ControlAction::Flatten && has_position {
             return Err(SafeHostError::ControlNotProven);
         }
+        let persisted = PersistedControlCompletion {
+            request_id: request_id.clone(),
+            action,
+            connection_generation: receipt.connection_generation,
+            private_generation: receipt.private_generation,
+            symbol_custody_retained: has_position,
+            readback_sha256: receipt.commitment_sha256.clone(),
+            observed_ms: now_ms,
+        };
+        let control_receipt = self.supervision.complete_control(persisted)?;
         self.lifecycle = if has_position {
             HostLifecycle::StoppedWithCustody
         } else {
             HostLifecycle::StoppedFlat
         };
         let completion = ControlCompletion {
+            request_id: request_id.clone(),
             action,
             connection_generation: receipt.connection_generation,
             private_generation: receipt.private_generation,
             symbol_custody_retained: has_position,
             readback_sha256: receipt.commitment_sha256.clone(),
+            receipt: control_receipt,
         };
         Ok(completion)
     }
@@ -723,15 +841,27 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
         now_ms: u64,
     ) -> Result<Self, SafeHostError> {
         validate_static_scope(launch.binding(), &owner, gateway.binding())?;
-        Self::open_with_root(
+        let mut host = Self::open_with_root(
             launch.binding().clone(),
             launch.artifacts_root(),
             owner,
+            1,
             gateway,
-            canary,
             now_ms,
             CanonicalRootHold::TestOnly,
-        )
+        )?;
+        if let Some(evidence) = canary {
+            let turn = host.accept_canary_control(
+                CanaryControlRequest {
+                    request_id: format!("test-canary-{now_ms}"),
+                    evidence,
+                },
+                now_ms,
+            )?;
+            let receipt = turn.persisted(1, DIGEST_FOR_TEST, now_ms)?;
+            let _ = host.apply_canary_receipt(receipt)?;
+        }
+        Ok(host)
     }
 
     #[cfg(test)]
@@ -748,8 +878,8 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
         binding: GatewayBinding,
         artifacts_root: PathBuf,
         owner: StrategyBinding,
+        config_epoch: u64,
         mut gateway: G,
-        canary: Option<CanaryEvidence>,
         now_ms: u64,
         canonical_root: CanonicalRootHold,
     ) -> Result<Self, SafeHostError> {
@@ -762,11 +892,34 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
         let mut journal = CommandJournal::open(account_directory.join(COMMANDS_FILE))?;
         journal.fence_interrupted_dispatches()?;
         validate_recovered_owner_routes(&journal, &owner)?;
+        let supervision = SupervisionJournal::open(
+            account_directory.join(SUPERVISION_FILE),
+            binding.clone(),
+            owner.clone(),
+            config_epoch,
+        )?;
+        let restored = supervision.projection()?;
+        let scope = writer_scope(&binding, &owner);
+        let writer = WriterLeaseAuthority::open(account_directory.join(WRITER_FILE), scope)?;
+        let predecessor = writer.active_session()?;
         let recovery_commands = recovery_keys(&journal)?;
+        let lifecycle = host_lifecycle(&restored.lifecycle);
+        gateway
+            .connect_after_recovery(GatewayRecoveryPermit {
+                binding: binding.clone(),
+                config_epoch,
+                unresolved_commands: recovery_commands.len(),
+                predecessor_writer_generation: predecessor
+                    .as_ref()
+                    .map(|session| session.generation),
+                connection_generation_floor: restored.connection_generation_floor,
+                private_generation_floor: restored.private_generation_floor,
+            })
+            .map_err(|_| SafeHostError::GatewayOperation)?;
         let request = SignedReadbackRequest {
             binding: binding.clone(),
-            after_connection_generation: 0,
-            after_private_generation: 0,
+            after_connection_generation: restored.connection_generation_floor,
+            after_private_generation: restored.private_generation_floor,
             commands: recovery_commands,
         };
         let receipt = gateway
@@ -778,9 +931,7 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
             return Err(SafeHostError::UnknownUnresolved);
         }
 
-        let scope = writer_scope(&binding, &owner);
-        let writer = WriterLeaseAuthority::open(account_directory.join(WRITER_FILE), scope)?;
-        let writer_session = match writer.active_session()? {
+        let writer_session = match predecessor {
             Some(predecessor) => writer.recover_same_scope_after_readback(
                 &predecessor,
                 receipt.private_generation,
@@ -794,11 +945,13 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
             owner,
             gateway,
             journal,
+            supervision,
             writer,
             writer_session,
             last_readback: receipt,
-            canary,
-            lifecycle: HostLifecycle::Active,
+            canary: restored.canary,
+            config_epoch,
+            lifecycle,
             _canonical_root: canonical_root,
         })
     }
@@ -913,11 +1066,16 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
             return Err(SafeHostError::OwnerRoute);
         }
         let risk_increasing = is_risk_increasing(command);
-        match self.lifecycle {
+        match &self.lifecycle {
             HostLifecycle::Active => {}
-            HostLifecycle::Stopping { .. } | HostLifecycle::StoppedWithCustody
+            HostLifecycle::Paused
+            | HostLifecycle::AwaitingActor
+            | HostLifecycle::Stopping { .. }
+            | HostLifecycle::StoppedWithCustody
                 if !risk_increasing => {}
-            HostLifecycle::Stopping { .. }
+            HostLifecycle::Paused
+            | HostLifecycle::AwaitingActor
+            | HostLifecycle::Stopping { .. }
             | HostLifecycle::StoppedWithCustody
             | HostLifecycle::StoppedFlat => return Err(SafeHostError::ControlLifecycle),
         }
@@ -947,7 +1105,7 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
         }
         let mutation = mutation_capability(command);
         let capability = self.gateway.capability_snapshot();
-        let expected_version = if risk_increasing && self.binding.mode == GatewayMode::Live {
+        let expected_version = if risk_increasing {
             self.canary
                 .as_ref()
                 .ok_or(SafeHostError::CanaryEvidence)?
@@ -964,11 +1122,10 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
                 self.last_readback.private_generation,
                 now_ms,
             )?;
-            if self.binding.mode == GatewayMode::Live
-                && self
-                    .canary
-                    .as_ref()
-                    .is_none_or(|evidence| evidence.authorized_command_id != *command.command_id())
+            if self
+                .canary
+                .as_ref()
+                .is_none_or(|evidence| evidence.authorized_command_id != *command.command_id())
             {
                 return Err(SafeHostError::CanaryEvidence);
             }
@@ -1007,6 +1164,27 @@ fn validate_static_scope(
         return Err(SafeHostError::BindingScope);
     }
     Ok(())
+}
+
+fn host_lifecycle(restored: &RestoredLifecycle) -> HostLifecycle {
+    match restored {
+        RestoredLifecycle::Active => HostLifecycle::Active,
+        RestoredLifecycle::Paused => HostLifecycle::Paused,
+        RestoredLifecycle::AwaitingActor(_) => HostLifecycle::AwaitingActor,
+        RestoredLifecycle::Stopping {
+            request_id,
+            action,
+            after_connection_generation,
+            after_private_generation,
+        } => HostLifecycle::Stopping {
+            request_id: request_id.clone(),
+            action: *action,
+            after_connection_generation: *after_connection_generation,
+            after_private_generation: *after_private_generation,
+        },
+        RestoredLifecycle::StoppedWithCustody => HostLifecycle::StoppedWithCustody,
+        RestoredLifecycle::StoppedFlat => HostLifecycle::StoppedFlat,
+    }
 }
 
 fn writer_scope(binding: &GatewayBinding, owner: &StrategyBinding) -> WriterScope {
@@ -1165,9 +1343,6 @@ fn validate_canary_static(
     private_generation: u64,
     now_ms: u64,
 ) -> Result<(), SafeHostError> {
-    if binding.mode == GatewayMode::Test && canary.is_none() {
-        return Ok(());
-    }
     let evidence = canary.ok_or(SafeHostError::CanaryEvidence)?;
     if evidence.binding != *binding
         || evidence.strategy_instance_id != owner.key.instance_id
@@ -1285,6 +1460,8 @@ pub enum SafeHostError {
     Writer(#[from] WriterLeaseError),
     #[error(transparent)]
     Journal(#[from] CommandJournalError),
+    #[error(transparent)]
+    Supervision(#[from] SupervisionError),
     #[error("node safety host I/O failed for {path}: {source}", path = path.display())]
     Io {
         path: PathBuf,
@@ -1322,8 +1499,6 @@ pub enum SafeHostError {
     PreparedStale,
     #[error("the latest signed readback does not support this command's native order family")]
     UnsupportedOrderFamily,
-    #[error("Stop/Flatten evidence is invalid")]
-    ControlEvidence,
     #[error("Stop/Flatten lifecycle forbids this action")]
     ControlLifecycle,
     #[error("updated signed readback does not prove Stop/Flatten completion")]
