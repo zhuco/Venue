@@ -114,7 +114,12 @@ pub fn text<'a>(object: &'a Map<String, Value>, field: &str) -> Result<&'a str, 
 
 #[doc(hidden)]
 pub fn decimal(object: &Map<String, Value>, field: &str) -> Result<Decimal, BitgetRiskError> {
-    match object.get(field) {
+    decimal_value(object.get(field))
+}
+
+#[doc(hidden)]
+pub fn decimal_value(value: Option<&Value>) -> Result<Decimal, BitgetRiskError> {
+    match value {
         Some(Value::String(value)) => {
             Decimal::from_str(value).map_err(|_| BitgetRiskError::Payload)
         }

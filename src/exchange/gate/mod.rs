@@ -24,7 +24,7 @@ use crate::domain::{
 };
 use crate::exchange::websocket;
 pub use venue_gateway_gate::{GateContractRules, GateRiskAccountMode, GateRiskReadback};
-use venue_gateway_gate::{decimal, decimal_value, dual_position_side, object, text};
+use venue_gateway_gate::{decimal, decimal_value, object, optional_price, text};
 
 const API_BASE_URL: &str = "https://api.gateio.ws/api/v4";
 const SETTLE: &str = "usdt";
@@ -1054,19 +1054,7 @@ pub fn parse_position(
     symbol: &Symbol,
     rules: &GateContractRules,
 ) -> Result<Position, GateError> {
-    let object = object(value)?;
-    if text(object, "contract")? != rules.native_symbol || symbol != &rules.instrument.symbol {
-        return Err(GateError::Symbol);
-    }
-    let side = dual_position_side(text(object, "mode")?).map_err(|_| GateError::Payload)?;
-    let quantity = decimal(object, "size")?.abs() * rules.quanto_multiplier;
-    Ok(Position {
-        symbol: symbol.clone(),
-        side,
-        quantity,
-        entry_price: optional_price(object.get("entry_price"))?,
-        mark_price: optional_price(object.get("mark_price"))?,
-    })
+    venue_gateway_gate::parse_position(value, symbol, rules).map_err(Into::into)
 }
 
 pub fn parse_fill(
@@ -1165,30 +1153,7 @@ fn canonical_exposure_position_side(text: &str) -> Option<PositionSide> {
 }
 
 pub fn parse_account_balance(value: &Value) -> Result<AccountBalance, GateError> {
-    let object = object(value)?;
-    let asset = Asset::new("USDT").map_err(|_| GateError::Payload)?;
-    let available_balance = decimal(object, "available")?;
-    let reported_total = decimal(object, "total")?;
-    // Gate's dual-position account may expose a transient negative `total` while the separately
-    // reported spendable `available` balance remains non-negative.  Preserve the admissible
-    // account fact rather than rejecting a signed readback needed to reduce an open hedge leg.
-    let wallet_balance = if reported_total.is_sign_negative() {
-        available_balance
-    } else {
-        reported_total
-    };
-    let initial_margin = optional_decimal(object.get("position_initial_margin"))?
-        + optional_decimal(object.get("order_initial_margin"))?;
-    let maintenance_margin = optional_decimal(object.get("maintenance_margin"))?;
-    let balance = AccountBalance {
-        asset,
-        wallet_balance,
-        available_balance,
-        initial_margin,
-        maintenance_margin,
-    };
-    balance.validate().map_err(|_| GateError::Payload)?;
-    Ok(balance)
+    venue_gateway_gate::parse_account_balance(value).map_err(Into::into)
 }
 
 pub fn parse_dual_position_mode(value: &Value) -> Result<bool, GateError> {
@@ -1490,21 +1455,6 @@ fn bool_field(object: &Map<String, Value>, field: &str) -> Result<bool, GateErro
         .ok_or(GateError::Payload)
 }
 
-fn optional_price(value: Option<&Value>) -> Result<Option<Price>, GateError> {
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) if value.is_empty() => Ok(None),
-        value => {
-            let price = decimal_value(value)?;
-            if price.is_zero() {
-                Ok(None)
-            } else {
-                Price::new(price).map(Some).map_err(|_| GateError::Payload)
-            }
-        }
-    }
-}
-
 fn optional_price_state(value: Option<&Value>) -> Result<FieldState<Price>, GateError> {
     match value {
         None => Ok(FieldState::Missing),
@@ -1549,14 +1499,6 @@ fn optional_maker(value: Option<&Value>) -> FieldState<bool> {
             reason: crate::domain::UnknownReason::Ambiguous,
         },
         None => FieldState::Missing,
-    }
-}
-
-fn optional_decimal(value: Option<&Value>) -> Result<Decimal, GateError> {
-    match value {
-        None | Some(Value::Null) => Ok(Decimal::ZERO),
-        Some(Value::String(value)) if value.is_empty() => Ok(Decimal::ZERO),
-        value => Ok(decimal_value(value)?),
     }
 }
 
@@ -1682,6 +1624,15 @@ impl From<venue_gateway_gate::GateRiskError> for GateError {
             venue_gateway_gate::GateRiskError::RiskAccountMode => Self::RiskAccountMode,
             venue_gateway_gate::GateRiskError::RiskSnapshot => Self::RiskSnapshot,
             venue_gateway_gate::GateRiskError::Quantity => Self::Quantity,
+        }
+    }
+}
+
+impl From<venue_gateway_gate::GatePrivatePayloadError> for GateError {
+    fn from(value: venue_gateway_gate::GatePrivatePayloadError) -> Self {
+        match value {
+            venue_gateway_gate::GatePrivatePayloadError::Payload => Self::Payload,
+            venue_gateway_gate::GatePrivatePayloadError::Symbol => Self::Symbol,
         }
     }
 }

@@ -309,6 +309,27 @@ fn private_readback_accepts_only_one_complete_observation_tuple() -> Result<(), 
 }
 
 #[test]
+fn account_position_compatibility_wrappers_preserve_uta_semantics()
+-> Result<(), Box<dyn std::error::Error>> {
+    let balance = parse_balance(&json!({
+        "imr":"2", "mmr":"1",
+        "assets":[{"coin":"USDT", "balance":"20", "available":"17"}]
+    }))?;
+    assert_eq!(balance.wallet_balance, Decimal::from(20));
+    let symbol: Symbol = "DOGE/USDT".parse()?;
+    let position = parse_position(
+        &json!({
+            "symbol":"DOGEUSDT", "marginCoin":"USDT", "holdMode":"hedge_mode",
+            "posSide":"long", "total":"12", "avgPrice":"0.09", "markPrice":"0.1"
+        }),
+        &symbol,
+    )?;
+    assert_eq!(position.side, PositionSide::Long);
+    assert_eq!(position.quantity, Decimal::from(12));
+    Ok(())
+}
+
+#[test]
 fn post_only_verification_requires_bitget_post_only_time_in_force() {
     assert!(is_post_only_order(&json!({"timeInForce":"post_only"})));
     assert!(!is_post_only_order(&json!({"timeInForce":"normal"})));

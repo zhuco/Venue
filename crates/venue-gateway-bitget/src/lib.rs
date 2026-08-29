@@ -1,3 +1,4 @@
+pub mod account;
 mod binding;
 mod config;
 mod credentials;

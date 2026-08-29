@@ -1886,6 +1886,7 @@ name = "venue-copy"
 version = "0.1.0"
 dependencies = [
  "rust_decimal",
+ "sha2",
  "thiserror",
  "venue-domain",
 ]

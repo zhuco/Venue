@@ -7,12 +7,14 @@
 mod config;
 mod credentials;
 pub mod endpoints;
+mod private;
 mod public;
 mod risk;
 mod sign;
 
 pub use config::{GateConfig, GateProductScope};
 pub use credentials::GateCredentials;
+pub use private::{GatePrivatePayloadError, optional_price, parse_account_balance, parse_position};
 pub use public::*;
 pub use risk::{
     GateContractRules, GateRiskAccountMode, GateRiskError, GateRiskReadback, decimal,

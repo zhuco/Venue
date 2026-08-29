@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeSet,
     net::TcpStream,
-    str::FromStr,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -24,6 +23,7 @@ use crate::domain::{
 };
 use crate::exchange::websocket;
 
+use venue_gateway_bitget::account as bitget_account;
 use venue_gateway_bitget::risk as bitget_risk;
 pub use venue_gateway_bitget::risk::BitgetRiskReadback;
 
@@ -616,11 +616,9 @@ impl BitgetPrivateRest {
             raw_payloads,
             signed_regular_order_payloads: orders_raw,
             balance: parse_balance(assets).map_err(|error| readback_error("assets", error))?,
-            hedge_position: object(settings)
-                .map_err(|error| readback_error("settings", error))?
-                .get("holdMode")
-                .and_then(Value::as_str)
-                == Some("hedge_mode"),
+            hedge_position: bitget_account::is_hedge_mode(settings)
+                .map_err(BitgetError::from)
+                .map_err(|error| readback_error("settings", error))?,
             positions,
             orders,
             fills,
@@ -665,8 +663,8 @@ impl BitgetPrivateRest {
         let settings_json = parse_json(&settings_raw)?;
         let positions_json = parse_json(&positions_raw)?;
         let assets = bitget_data(&assets_json)?;
-        let settings = object(bitget_data(&settings_json)?)?;
-        if settings.get("holdMode").and_then(Value::as_str) != Some("hedge_mode") {
+        let settings = bitget_data(&settings_json)?;
+        if !bitget_account::is_hedge_mode(settings).map_err(BitgetError::from)? {
             return Err(BitgetError::PositionMode);
         }
         let positions = list_data(bitget_data(&positions_json)?)?;
@@ -1094,20 +1092,7 @@ fn parse_regular_open_order(value: &Value, symbol: &Symbol) -> Result<Order, Bit
 }
 
 pub fn parse_position(value: &Value, symbol: &Symbol) -> Result<Position, BitgetError> {
-    let object = object(value)?;
-    if text(object, "symbol")? != native_symbol(symbol)?
-        || text(object, "marginCoin")? != "USDT"
-        || text(object, "holdMode")? != "hedge_mode"
-    {
-        return Err(BitgetError::Payload);
-    }
-    Ok(Position {
-        symbol: symbol.clone(),
-        side: parse_position_side(text(object, "posSide")?)?,
-        quantity: decimal(object, "total")?,
-        entry_price: optional_price(object.get("avgPrice"))?,
-        mark_price: optional_price(object.get("markPrice"))?,
-    })
+    bitget_account::parse_position(value, symbol).map_err(BitgetError::from)
 }
 
 pub fn parse_fill(value: &Value, symbol: &Symbol) -> Result<Fill, BitgetError> {
@@ -1199,26 +1184,7 @@ pub fn parse_private_fill_message(
 }
 
 fn parse_balance(value: &Value) -> Result<AccountBalance, BitgetError> {
-    let payload = object(value)?;
-    let asset = payload
-        .get("assets")
-        .and_then(Value::as_array)
-        .and_then(|assets| {
-            assets
-                .iter()
-                .find(|asset| asset.get("coin").and_then(Value::as_str) == Some("USDT"))
-        })
-        .ok_or(BitgetError::Payload)?;
-    let asset = object(asset)?;
-    let balance = AccountBalance {
-        asset: Asset::new("USDT").map_err(|_| BitgetError::Payload)?,
-        wallet_balance: decimal(asset, "balance")?,
-        available_balance: decimal(asset, "available")?,
-        initial_margin: optional_decimal(payload.get("imr"))?,
-        maintenance_margin: optional_decimal(payload.get("mmr"))?,
-    };
-    balance.validate().map_err(|_| BitgetError::Payload)?;
-    Ok(balance)
+    bitget_account::parse_balance(value).map_err(BitgetError::from)
 }
 
 fn parse_fee(value: &Value) -> Result<FieldState<Amount>, BitgetError> {
@@ -1617,29 +1583,13 @@ fn decimal(object: &Map<String, Value>, field: &str) -> Result<Decimal, BitgetEr
     bitget_risk::decimal(object, field).map_err(BitgetError::from)
 }
 fn decimal_value(value: Option<&Value>) -> Result<Decimal, BitgetError> {
-    match value {
-        Some(Value::String(value)) => Decimal::from_str(value).map_err(|_| BitgetError::Payload),
-        Some(Value::Number(value)) => {
-            Decimal::from_str(&value.to_string()).map_err(|_| BitgetError::Payload)
-        }
-        _ => Err(BitgetError::Payload),
-    }
+    bitget_risk::decimal_value(value).map_err(BitgetError::from)
 }
 fn optional_decimal(value: Option<&Value>) -> Result<Decimal, BitgetError> {
-    match value {
-        None | Some(Value::Null) => Ok(Decimal::ZERO),
-        Some(Value::String(value)) if value.is_empty() => Ok(Decimal::ZERO),
-        value => decimal_value(value),
-    }
+    bitget_account::optional_decimal(value).map_err(BitgetError::from)
 }
 fn optional_price(value: Option<&Value>) -> Result<Option<Price>, BitgetError> {
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) if value == "0" || value.is_empty() => Ok(None),
-        value => Price::new(decimal_value(value)?)
-            .map(Some)
-            .map_err(|_| BitgetError::Payload),
-    }
+    bitget_account::optional_price(value).map_err(BitgetError::from)
 }
 fn optional_price_state(value: Option<&Value>) -> Result<FieldState<Price>, BitgetError> {
     match value {
@@ -1792,6 +1742,15 @@ impl From<venue_gateway_bitget::risk::BitgetRiskError> for BitgetError {
             venue_gateway_bitget::risk::BitgetRiskError::Symbol => Self::Symbol,
             venue_gateway_bitget::risk::BitgetRiskError::PositionMode => Self::PositionMode,
             venue_gateway_bitget::risk::BitgetRiskError::RiskSnapshot => Self::RiskSnapshot,
+        }
+    }
+}
+
+impl From<venue_gateway_bitget::account::BitgetAccountError> for BitgetError {
+    fn from(error: venue_gateway_bitget::account::BitgetAccountError) -> Self {
+        match error {
+            venue_gateway_bitget::account::BitgetAccountError::Payload => Self::Payload,
+            venue_gateway_bitget::account::BitgetAccountError::Symbol => Self::Symbol,
         }
     }
 }

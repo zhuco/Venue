@@ -156,10 +156,11 @@ Leader Intent
 -> copy ledger and drift repair
 ```
 
-当前第一批 `venue-copy` 已落地为纯资本/目标敞口 reducer：只使用同一 generation、同一估值币种和有效期内的冻结事实，
+当前 `venue-copy` 已落地纯资本/目标敞口 reducer 与确定性身份内核：只使用同一 generation、同一估值币种和有效期内的冻结事实，
 按 configured、allocated、扣安全储备后的 available margin 三者最小值确定 follower 有效资本，复用 leader 已包含杠杆的
 exposure ratio，且跨零反向必须先平仓并等待新私有事实。它不依赖 storage、network、runtime 或 writer；完整数量/价格 sizing
-要等规范 `Instrument` 补齐跨所稳定身份和合约换算语义后再实现，禁止在 Copy 内复制一套 metadata。
+要等规范 `Instrument` 补齐跨所稳定身份和合约换算语义后再实现，禁止在 Copy 内复制一套 metadata。job、planning snapshot、
+child order 和 idempotency key 已按 KOL 的 length-delimited SHA-256 与 domain separation 固化，重放不读取时间或随机源。
 
 必须保留：
 
@@ -191,8 +192,8 @@ Copy planner/job-consumer lease 只允许竞争数据库 job 的规划或投递�
 | Venue | 目标 adapter | 当前权威来源 | 初始准入 |
 |---|---|---|---|
 | Binance | `venue-gateway-binance` | 已迁入 Portfolio Margin 产品身份、原生 symbol、私有 payload、账户/仓位/订单/成交/风险纯规范化及有界成交 cursor 分页；根路径兼容 re-export，现有签名 readback、transport 与 Stage 7 capability/WAL/writer 保持生产权威，GatewayBinding 不授予旧 writer 能力 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
-| Bitget | `venue-gateway-bitget` | 已迁入 UTA 产品身份、当前官方 TEST Demo/LIVE 端点、secrecy 凭证、REST/WS 签名、公共市场纯协议及账户/腿风险规范化；根路径兼容 re-export，HTTP/WS transport、私有 readback、Stage 7 capability/WAL/writer 仍由根 package 保持生产权威 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
-| Gate.io | `venue-gateway-gate` | 已迁入 USDT perpetual scope、当前官方 TEST/LIVE 端点、secrecy 凭证、REST/WS 签名、公共市场纯协议、合约数量及账户/腿风险规范化；根路径兼容 re-export，HTTP/WS transport、私有 readback、Stage 7 capability/WAL/writer 仍由根 package 保持生产权威 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
+| Bitget | `venue-gateway-bitget` | 已迁入 UTA 产品身份、当前官方 TEST Demo/LIVE 端点、secrecy 凭证、REST/WS 签名、公共市场、账户模式/余额/持仓及账户/腿风险纯协议；根路径兼容 re-export，HTTP/WS transport、私有 readback、订单/成交、Stage 7 capability/WAL/writer 仍由根 package 保持生产权威 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
+| Gate.io | `venue-gateway-gate` | 已迁入 USDT perpetual scope、当前官方 TEST/LIVE 端点、secrecy 凭证、REST/WS 签名、公共市场、账户/持仓、合约数量及账户/腿风险纯协议；根路径兼容 re-export，HTTP/WS transport、私有 readback、订单/成交、Stage 7 capability/WAL/writer 仍由根 package 保持生产权威 | `TEST | LIVE`；保留现有已验收路径，新 Copy 路径重新 Canary |
 | Bybit | `venue-gateway-bybit` | 已迁入 KOL V5 endpoint、HMAC 固定向量与签名成交 fixture；transport/private stream/writer 待接 | `TEST | LIVE`；最小 LIVE 安全闭环后即可小额实盘调试 |
 | OKX | `venue-gateway-okx` | 已迁入 KOL V5 TEST 模拟盘/LIVE 端点、三项 secret、HMAC 固定向量与合约成交规范化 fixture；transport/private stream/writer 待接 | `TEST | LIVE`；最小 LIVE 安全闭环后即可小额实盘调试 |
 | Hyperliquid | `venue-gateway-hyperliquid` | 已迁入 TEST/LIVE 端点、命名 Agent secret 边界、按 Agent 绑定的持久 nonce 契约与私有成交 fixture；EIP-712 所需 `k256`/MessagePack/Keccak 依赖尚未获准，因此 signing/transport/writer 未接且 capability 为空 | `TEST | LIVE`；最小 LIVE 安全闭环后即可小额实盘调试 |
