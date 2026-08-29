@@ -118,13 +118,10 @@ fn temporary_path(path: &Path) -> PathBuf {
 
 #[cfg(unix)]
 pub(crate) fn sync_parent(path: &Path) -> Result<(), StorageError> {
-    let parent = path.parent().ok_or_else(|| StorageError::Io {
-        path: path.to_path_buf(),
-        source: std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "atomic storage path has no parent directory",
-        ),
-    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|source| StorageError::Io {
