@@ -1,9 +1,11 @@
 use std::{
     collections::VecDeque,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, mpsc,
         atomic::{AtomicUsize, Ordering},
     },
+    thread,
+    time::{Duration, Instant},
 };
 
 use super::fill_sequence_tests::intent;
@@ -19,7 +21,8 @@ use crate::{
     },
     exchange::grid::{
         GridOrderFamilyReadback, GridPrivateEvent, GridPublicPayload, GridPublicPayloadSource,
-        GridVenueFill, HedgedGridMutationClient,
+        GridRiskReadback, GridVenueFill, HedgedGridMutationClient,
+        HedgedGridRiskReadbackClient,
     },
     execution::CapabilityBinding,
     runtime::hedged_grid,
@@ -32,6 +35,25 @@ use crate::{
 const TEST_PUBLIC_FRESHNESS_MS: u64 = 5_000;
 
 struct UnavailableMutationClient;
+
+struct GatedRiskClient {
+    gate: Mutex<mpsc::Receiver<()>>,
+}
+
+impl HedgedGridRiskReadbackClient for GatedRiskClient {
+    fn risk_readback(
+        &self,
+        _account: &str,
+        _private_generation: u64,
+    ) -> Result<GridRiskReadback, GridVenueError> {
+        self.gate
+            .lock()
+            .map_err(|_| GridVenueError::RiskReadbackUnsupported)?
+            .recv()
+            .map_err(|_| GridVenueError::RiskReadbackUnsupported)?;
+        Err(GridVenueError::RiskReadbackUnsupported)
+    }
+}
 
 impl HedgedGridMutationClient for UnavailableMutationClient {
     fn place_limit_post_only(
@@ -371,7 +393,7 @@ fn instrument() -> Result<Instrument, Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn complete_stream_fill_dispatches_without_signed_readback_or_bbo_gate()
+fn resident_fill_hot_path_dispatches_while_risk_worker_is_blocked()
 -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
     let cfg = config(3)?;
@@ -459,6 +481,13 @@ fn complete_stream_fill_dispatches_without_signed_readback_or_bbo_gate()
     let store = ProjectionStore::new(temporary.path().join(CHECKPOINT_FILE));
     let wal_path = temporary.path().join(COMMAND_FILE);
     let wal_len_before_dispatch = std::fs::metadata(&wal_path)?.len();
+    let (release_risk, risk_gate) = mpsc::channel();
+    let mut risk_lane = Stage7RiskLane::new(Some(Arc::new(GatedRiskClient {
+        gate: Mutex::new(risk_gate),
+    })));
+    risk_lane.start(binding.account.clone(), 2)?;
+    assert!(risk_lane.pending());
+    assert!(risk_lane.poll()?.is_none());
     let fill = GridVenueFill {
         fill: Fill {
             execution_sequence: FieldState::Known(1),
@@ -496,6 +525,8 @@ fn complete_stream_fill_dispatches_without_signed_readback_or_bbo_gate()
     assert!(std::fs::metadata(wal_path)?.len() > wal_len_before_dispatch);
     assert_eq!(readback_calls.load(Ordering::SeqCst), 0);
     assert_eq!(book_reads.load(Ordering::SeqCst), 0);
+    assert!(risk_lane.pending());
+    assert!(risk_lane.poll()?.is_none());
     let mut recorded = calls
         .lock()
         .map_err(|_| "recording client lock poisoned")?
@@ -503,6 +534,15 @@ fn complete_stream_fill_dispatches_without_signed_readback_or_bbo_gate()
     recorded.sort_unstable();
     assert_eq!(recorded, ["cancel", "place", "place"]);
     assert!(!commands.has_unresolved());
+    release_risk.send(())?;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while risk_lane.pending() {
+        let _ = risk_lane.poll()?;
+        if Instant::now() >= deadline {
+            return Err("risk worker did not finish after release".into());
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
     Ok(())
 }
 
@@ -1500,4 +1540,3 @@ fn legacy_binance_raw_ack_is_bound_to_both_signed_order_identities()
     ));
     Ok(())
 }
-

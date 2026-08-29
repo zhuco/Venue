@@ -31,6 +31,7 @@ mod public_stream;
 pub use public_stream::{PublicStream, PublicStreamSocket, depth_stream_url, public_stream_url};
 mod market_scan;
 pub use market_scan::parse_usdt_perpetual_market_rank_samples;
+pub use venue_gateway_binance::native_symbol;
 
 pub const PARSER_SCHEMA_VERSION: u16 = 1;
 const REST_BASE_URL: &str = "https://fapi.binance.com";
@@ -1276,10 +1277,6 @@ fn encode_component(value: &str) -> String {
             _ => vec![format!("%{byte:02X}")],
         })
         .collect()
-}
-
-pub fn native_symbol(symbol: &Symbol) -> String {
-    format!("{}{}", symbol.base(), symbol.quote())
 }
 
 pub(crate) fn client_order_id_is_valid(value: &str) -> bool {

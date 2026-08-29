@@ -2,6 +2,7 @@ use std::{fs, path::Path};
 
 use rust_decimal::Decimal;
 use serde::Deserialize;
+pub use venue_gateway_binance::BinanceAccountBinding;
 
 use crate::{
     Result,
@@ -121,12 +122,6 @@ const fn default_private_custody_max_stale_ms() -> u64 {
 
 const fn default_true() -> bool {
     true
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum BinanceAccountBinding {
-    PortfolioMarginUm,
 }
 
 impl Config {

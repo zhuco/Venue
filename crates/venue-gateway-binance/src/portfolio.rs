@@ -3,12 +3,12 @@ use std::str::FromStr;
 use rust_decimal::Decimal;
 use serde_json::{Map, Value};
 
-use crate::domain::{
+use venue_domain::domain::{
     AccountBalance, AccountRiskSnapshot, Asset, LegRiskSnapshot, Position, PositionSide, Price,
     RiskSourceStatus, Symbol, validate_risk_snapshot_pair,
 };
 
-use super::binance_private::{PrivateAccountCapabilities, PrivateParseError};
+use crate::private::{PrivateAccountCapabilities, PrivateParseError};
 
 const POSITION_NOTIONAL_SCALE: u32 = 8;
 
@@ -72,10 +72,7 @@ pub fn capabilities(
     account_config_payload: &str,
     position_mode_payload: &str,
 ) -> Result<PrivateAccountCapabilities, PrivateParseError> {
-    super::binance_private::parse_account_capabilities(
-        account_config_payload,
-        position_mode_payload,
-    )
+    crate::private::parse_account_capabilities(account_config_payload, position_mode_payload)
 }
 
 /// PAPI's account-wide risk values are the authority for a Portfolio Margin deployment. The UM
@@ -170,8 +167,7 @@ pub fn parse_risk_snapshots(
     let mut legs = Vec::new();
     for value in positions {
         let item = value.as_object().ok_or(PrivateParseError::Payload)?;
-        if item.get("symbol").and_then(Value::as_str)
-            != Some(super::binance::native_symbol(symbol).as_str())
+        if item.get("symbol").and_then(Value::as_str) != Some(crate::native_symbol(symbol).as_str())
         {
             continue;
         }

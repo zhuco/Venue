@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, str::FromStr};
 use rust_decimal::Decimal;
 use serde_json::{Map, Value};
 
-use crate::domain::{
+use venue_domain::domain::{
     AccountBalance, Amount, Asset, FieldState, Fill, Order, OrderSide, OrderState, Position,
     PositionSide, Price, Symbol, UnknownReason,
 };
@@ -626,7 +626,7 @@ fn check_symbol_key(
     field: &str,
     expected: &Symbol,
 ) -> Result<(), PrivateParseError> {
-    if text(item, field)? == super::binance::native_symbol(expected) {
+    if text(item, field)? == crate::native_symbol(expected) {
         Ok(())
     } else {
         Err(PrivateParseError::Symbol)
@@ -860,12 +860,12 @@ pub enum PrivateParseError {
     #[error("Binance risk snapshot is incomplete or internally inconsistent")]
     RiskSnapshot,
     #[error("normalized account balance is invalid: {0}")]
-    Account(crate::domain::AccountError),
+    Account(venue_domain::domain::AccountError),
     #[error("normalized order or fill is invalid: {0}")]
-    OrderValidation(crate::domain::OrderError),
+    OrderValidation(venue_domain::domain::OrderError),
 }
 
-pub(super) fn validate_risk_readback_window(
+pub fn validate_risk_readback_window(
     started_at_ms: u64,
     observed_at_ms: u64,
     max_age_ms: u64,
@@ -882,7 +882,7 @@ pub(super) fn validate_risk_readback_window(
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::{FieldState, OrderState, PositionSide};
+    use venue_domain::domain::{FieldState, OrderState, PositionSide};
 
     use super::*;
 

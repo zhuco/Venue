@@ -953,8 +953,8 @@ fn complete_signed_fill_needs_no_exact_order_rest_and_is_not_starved()
     };
     let mut readback = shadow_readback()?;
     readback.fills = vec![fill("long-fill", &long), fill("long-fill-2", &long_two)];
+    readback.fills[0].fill.quantity = Decimal::new(4, 2);
     readback.fills[1].fill.execution_sequence = FieldState::Known(2);
-    readback.fills[1].fill.quantity = Decimal::new(4, 2);
     let calls = Arc::new(Mutex::new(Vec::new()));
     let readback_calls = Arc::new(AtomicUsize::new(0));
     let mut venue = StreamFillVenue {
@@ -1006,8 +1006,8 @@ fn complete_signed_fill_needs_no_exact_order_rest_and_is_not_starved()
         )?,
         FillDriveOutcome::dispatched()
     );
-    assert!(!checkpoint.state.owned_orders.contains_key(&long.key));
-    assert!(checkpoint.state.owned_orders.contains_key(&long_two.key));
+    assert!(checkpoint.state.owned_orders.contains_key(&long.key));
+    assert!(!checkpoint.state.owned_orders.contains_key(&long_two.key));
     assert!(checkpoint.state.pending_transactions.is_empty());
     let calls = calls.lock().map_err(|_| "mutation calls poisoned")?;
     assert_eq!(calls.len(), 3);

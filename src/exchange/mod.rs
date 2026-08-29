@@ -2,10 +2,12 @@
 pub mod binance;
 #[path = "binance/clock.rs"]
 mod binance_clock;
-#[path = "binance/portfolio.rs"]
-pub mod binance_portfolio;
-#[path = "binance/private.rs"]
-pub mod binance_private;
+pub mod binance_portfolio {
+    pub use venue_gateway_binance::portfolio::*;
+}
+pub mod binance_private {
+    pub use venue_gateway_binance::private::*;
+}
 #[path = "binance/risk_readback.rs"]
 mod binance_risk_readback;
 #[path = "binance/signer.rs"]

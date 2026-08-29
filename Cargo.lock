@@ -1876,6 +1876,7 @@ dependencies = [
  "tungstenite",
  "venue-domain",
  "venue-gateway-api",
+ "venue-gateway-binance",
 ]
 
 [[package]]
@@ -1906,6 +1907,18 @@ dependencies = [
  "serde_json",
  "thiserror",
  "venue-domain",
+]
+
+[[package]]
+name = "venue-gateway-binance"
+version = "0.1.0"
+dependencies = [
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "venue-domain",
+ "venue-gateway-api",
 ]
 
 [[package]]
