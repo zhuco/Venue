@@ -9,7 +9,8 @@ use bytes::BytesMut;
 use venue_gateway_api::GatewayBinding;
 
 use crate::{
-    BitgetAccountBinding, BitgetConfig, BitgetCredentials, SignInput, endpoints,
+    BitgetAccountBinding, BitgetAuthenticatedRecoverySession, BitgetConfig, BitgetCredentials,
+    BitgetPrivateWsTransport, SignInput, endpoints,
     execution::{
         BitgetExactOrderReadback, BitgetExactReadbackRequest, BitgetExecutionError,
         BitgetMutationOutcome, BitgetPreparedMutation, BitgetUnknownReason, into_unknown,
@@ -221,6 +222,32 @@ pub struct BitgetHttpTransport {
     endpoint: String,
     limits: BitgetTransportLimits,
     dispatched: tokio::sync::Mutex<BTreeSet<(u64, u64, String)>>,
+}
+
+struct RecoverySessionUse<'a> {
+    session: &'a BitgetAuthenticatedRecoverySession,
+    completed: bool,
+}
+
+impl<'a> RecoverySessionUse<'a> {
+    fn new(session: &'a BitgetAuthenticatedRecoverySession) -> Self {
+        Self {
+            session,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for RecoverySessionUse<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.session.revoke();
+        }
+    }
 }
 
 impl BitgetHttpTransport {
@@ -521,6 +548,170 @@ impl BitgetHttpTransport {
             .map_err(|_| BitgetTransportError::Protocol)
     }
 
+    /// Executes one recovery GET only under an adapter-issued authenticated private session. The
+    /// private socket is round-tripped after the HTTP await; a disconnect, replacement login,
+    /// generation drift, deadline expiry, endpoint mismatch, or universe drift discards the page.
+    pub(crate) async fn execute_authenticated_recovery_read<S>(
+        &self,
+        private_ws: &mut BitgetPrivateWsTransport<S>,
+        session: &BitgetAuthenticatedRecoverySession,
+        credentials: &BitgetCredentials,
+        request: &BitgetPrivateReadRequest,
+    ) -> Result<BitgetRawPrivatePage, BitgetTransportError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let mut session_use = RecoverySessionUse::new(session);
+        let now_ms = unix_ms()?;
+        session.validate_credentials(credentials)?;
+        self.validate_authenticated_recovery_scope(session, request, now_ms)?;
+        let maximum_response_bytes = self.limits.maximum_body_bytes();
+        session.reserve_get(&request.binding.symbol, maximum_response_bytes)?;
+        let page = self
+            .execute_private_read(credentials, request, now_ms)
+            .await?;
+        private_ws.revalidate_recovery_session(session).await?;
+        self.validate_authenticated_recovery_scope(session, request, unix_ms()?)?;
+        if page.received_at_ms < session.started_at_ms()
+            || page.received_at_ms >= session.deadline_at_ms()
+        {
+            return Err(BitgetTransportError::RecoverySession);
+        }
+        session.settle_get(maximum_response_bytes, page.payload.len())?;
+        session_use.complete();
+        Ok(page)
+    }
+
+    /// Collects the signed Bitget account/settings/positions/regular-orders/fills turn for this
+    /// symbol. All pages use the session-issued attempt and connection generation. Unsupported
+    /// conditional/Algo families remain the existing execution-profile evidence and are not
+    /// synthesized from HTTP 404 or an empty regular page.
+    pub async fn collect_authenticated_private_turn<S>(
+        &self,
+        private_ws: &mut BitgetPrivateWsTransport<S>,
+        session: &BitgetAuthenticatedRecoverySession,
+        credentials: &BitgetCredentials,
+    ) -> Result<BitgetPrivateGenerationCandidate, BitgetTransportError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let mut session_use = RecoverySessionUse::new(session);
+        session.validate_credentials(credentials)?;
+        let request_spec = session.begin_symbol(&self.binding.symbol)?;
+        let attempt_id = session.attempt_id();
+        let generation = session.connection_generation();
+        let probe = build_account_read_request(&self.binding, attempt_id, generation);
+        self.validate_authenticated_recovery_scope(session, &probe, unix_ms()?)?;
+        let requested_fill_start_ms = request_spec.requested_fill_start_ms();
+        let server_now_ms = request_spec.fills_target_through_ms();
+        let account = self
+            .execute_authenticated_recovery_read(private_ws, session, credentials, &probe)
+            .await?;
+        let settings_request = build_settings_read_request(&self.binding, attempt_id, generation);
+        let settings = self
+            .execute_authenticated_recovery_read(
+                private_ws,
+                session,
+                credentials,
+                &settings_request,
+            )
+            .await?;
+        let positions_request =
+            build_positions_read_request(&self.binding, attempt_id, generation)?;
+        let positions = self
+            .execute_authenticated_recovery_read(
+                private_ws,
+                session,
+                credentials,
+                &positions_request,
+            )
+            .await?;
+
+        let mut order_pages = Vec::new();
+        let mut order_cursor = None;
+        for page_index in 0..BITGET_MAX_PRIVATE_PAGES {
+            let page_index = u32::try_from(page_index).map_err(|_| BitgetTransportError::Pages)?;
+            let request = build_regular_orders_read_request(
+                &self.binding,
+                attempt_id,
+                generation,
+                page_index,
+                order_cursor.as_deref(),
+            )?;
+            let page = parse_regular_order_page(
+                self.execute_authenticated_recovery_read(
+                    private_ws,
+                    session,
+                    credentials,
+                    &request,
+                )
+                .await?,
+            )
+            .map_err(|_| BitgetTransportError::Protocol)?;
+            order_cursor = page.next_cursor.clone();
+            order_pages.push(page);
+            if order_cursor.is_none() {
+                break;
+            }
+        }
+        if order_cursor.is_some() {
+            return Err(BitgetTransportError::Pages);
+        }
+
+        let effective_start_ms = requested_fill_start_ms.map(|start| {
+            start.max(server_now_ms.saturating_sub(BITGET_MAX_FILL_HISTORY_WINDOW_MS))
+        });
+        let mut fill_pages = Vec::new();
+        let mut fill_cursor = None;
+        for page_index in 0..BITGET_MAX_PRIVATE_PAGES {
+            let page_index = u32::try_from(page_index).map_err(|_| BitgetTransportError::Pages)?;
+            let request = build_fills_read_request(
+                &self.binding,
+                attempt_id,
+                generation,
+                page_index,
+                fill_cursor.as_deref(),
+                effective_start_ms,
+                server_now_ms,
+            )?;
+            let page = parse_fill_page(
+                self.execute_authenticated_recovery_read(
+                    private_ws,
+                    session,
+                    credentials,
+                    &request,
+                )
+                .await?,
+            )
+            .map_err(|_| BitgetTransportError::Protocol)?;
+            fill_cursor = page.next_cursor.clone();
+            fill_pages.push(page);
+            if fill_cursor.is_none() {
+                break;
+            }
+        }
+        if fill_cursor.is_some() {
+            return Err(BitgetTransportError::Pages);
+        }
+        let candidate = complete_private_turn(vec![
+            BitgetPrivateFace::Account(
+                parse_account_face(account).map_err(|_| BitgetTransportError::Protocol)?,
+            ),
+            BitgetPrivateFace::Settings(
+                parse_settings_face(settings).map_err(|_| BitgetTransportError::Protocol)?,
+            ),
+            BitgetPrivateFace::Positions(
+                parse_positions_face(positions).map_err(|_| BitgetTransportError::Protocol)?,
+            ),
+            BitgetPrivateFace::RegularOrders(order_pages),
+            BitgetPrivateFace::Fills(fill_pages),
+        ])
+        .map_err(|_| BitgetTransportError::Protocol)?;
+        session.commit_symbol(&self.binding.symbol)?;
+        session_use.complete();
+        Ok(candidate)
+    }
+
     fn validate_scope(
         &self,
         binding: &GatewayBinding,
@@ -530,6 +721,26 @@ impl BitgetHttpTransport {
             return Err(BitgetTransportError::Binding);
         }
         validate_binding(binding, &self.config)
+    }
+
+    fn validate_authenticated_recovery_scope(
+        &self,
+        session: &BitgetAuthenticatedRecoverySession,
+        request: &BitgetPrivateReadRequest,
+        now_ms: u64,
+    ) -> Result<(), BitgetTransportError> {
+        session.validate(&request.binding, now_ms)?;
+        if self.endpoint != session.rest_origin()
+            || self.config.mode() != session.mode()
+            || self.binding.trading_account_id != session.trading_account_id()
+            || self.generation != session.connection_generation()
+            || self.limits != session.transport_limits()
+            || request.attempt_id != session.attempt_id()
+            || request.generation != session.connection_generation()
+        {
+            return Err(BitgetTransportError::RecoverySession);
+        }
+        Ok(())
     }
 
     async fn send(
@@ -673,21 +884,37 @@ pub enum BitgetTransportError {
     Pages,
     #[error("Bitget transport clock is invalid")]
     Clock,
+    #[error(
+        "Bitget authenticated recovery session is revoked, expired, cross-generation, outside its frozen universe, or not bound to the exact TEST/LIVE endpoint"
+    )]
+    RecoverySession,
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
+    use futures_util::{SinkExt, StreamExt};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
-        sync::Mutex,
+        sync::{Mutex, oneshot},
     };
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
     use venue_gateway_api::{GatewayMode, VenueId};
 
     use super::*;
-    use crate::{BitgetCancelIntent, prepare_cancel_request};
+    use crate::{
+        BitgetCancelIntent, BitgetRecoverySymbolRequest, prepare_cancel_request,
+        private_ws::authenticate_private_stream_for_test,
+    };
+
+    const ACCOUNT_BODY: &str = r#"{"code":"00000","data":{"imr":"0","mmr":"0","assets":[{"coin":"USDT","balance":"20","available":"20"}]}}"#;
+    const SETTINGS_BODY: &str = r#"{"code":"00000","data":{"holdMode":"hedge_mode"}}"#;
+    const POSITIONS_BODY: &str = r#"{"code":"00000","data":{"list":[]}}"#;
+    const PAGE_BODY: &str = r#"{"code":"00000","data":{"list":[],"cursor":null}}"#;
+    const FIRST_SYMBOL_BODY_BYTES: usize =
+        ACCOUNT_BODY.len() + SETTINGS_BODY.len() + POSITIONS_BODY.len() + 2 * PAGE_BODY.len();
 
     fn binding(mode: GatewayMode) -> Result<GatewayBinding, Box<dyn std::error::Error>> {
         Ok(GatewayBinding::new(
@@ -873,6 +1100,196 @@ mod tests {
         assert_eq!(candidate.positions.len(), 2);
         server.await??;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn authenticated_multi_symbol_collector_preflights_global_page_and_byte_budgets()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        run_authenticated_budget_case(5, 8 * 1024 * 1024).await?;
+        run_authenticated_budget_case(6, 64 * 1024 + FIRST_SYMBOL_BODY_BYTES.saturating_sub(1))
+            .await
+    }
+
+    async fn run_authenticated_budget_case(
+        maximum_total_pages: u32,
+        maximum_total_bytes: usize,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let http_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let http_origin: &'static str =
+            Box::leak(format!("http://{}", http_listener.local_addr()?).into_boxed_str());
+        let (second_symbol_done, wait_for_second_symbol) = oneshot::channel();
+        let http_server = tokio::spawn(async move {
+            for _ in 0..5 {
+                let (mut socket, _) = http_listener.accept().await?;
+                let mut buffer = vec![0_u8; 8192];
+                let length = socket.read(&mut buffer).await?;
+                let request = String::from_utf8_lossy(&buffer[..length]);
+                let lower = request.to_ascii_lowercase();
+                if !lower.contains("access-key: key")
+                    || !lower.contains("access-sign:")
+                    || !lower.contains("access-timestamp:")
+                    || !lower.contains("access-passphrase: pass")
+                    || !lower.contains("paptrading: 1")
+                    || request.contains("ETHUSDT")
+                {
+                    return Err(std::io::Error::other(
+                        "recovery GET was unsigned, not Demo-scoped, or crossed symbols",
+                    ));
+                }
+                let body = recovery_body(&request)?;
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+            }
+            wait_for_second_symbol.await.map_err(|_| {
+                std::io::Error::other("second-symbol completion signal was dropped")
+            })?;
+            if tokio::time::timeout(Duration::from_millis(50), http_listener.accept())
+                .await
+                .is_ok()
+            {
+                return Err(std::io::Error::other(
+                    "second symbol reached HTTP after the global budget was exhausted",
+                ));
+            }
+            Ok::<_, std::io::Error>(())
+        });
+
+        let ws_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let ws_endpoint = format!("ws://{}", ws_listener.local_addr()?);
+        let ws_server = tokio::spawn(async move {
+            let (socket, _) = ws_listener.accept().await?;
+            let mut websocket = accept_async(socket).await?;
+            let _login = websocket.next().await.ok_or("missing login")??;
+            websocket
+                .send(Message::Text(
+                    r#"{"event":"login","code":"0","msg":""}"#.into(),
+                ))
+                .await?;
+            let _subscribe = websocket.next().await.ok_or("missing subscribe")??;
+            for topic in ["account", "position", "order"] {
+                websocket
+                    .send(Message::Text(
+                        format!(
+                            r#"{{"event":"subscribe","arg":{{"instType":"UTA","topic":"{topic}"}},"connId":"budget"}}"#
+                        )
+                        .into(),
+                    ))
+                    .await?;
+            }
+            for _ in 0..5 {
+                let ping = websocket.next().await.ok_or("missing recovery ping")??;
+                let Message::Ping(nonce) = ping else {
+                    return Err("recovery liveness did not use a nonce ping".into());
+                };
+                websocket.send(Message::Pong(nonce)).await?;
+            }
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        });
+
+        let account_id = "00000000-0000-4000-8000-000000000021";
+        let first_binding = GatewayBinding::new(
+            VenueId::Bitget,
+            GatewayMode::Test,
+            account_id,
+            "BTC/USDT".parse()?,
+        )?;
+        let second_binding = GatewayBinding::new(
+            VenueId::Bitget,
+            GatewayMode::Test,
+            account_id,
+            "ETH/USDT".parse()?,
+        )?;
+        let config = BitgetConfig::for_mode(GatewayMode::Test);
+        let credentials = BitgetCredentials::from_values("key", "secret", "pass")?;
+        let transport_limits = limits(1_000)?;
+        let (stream, _) = tokio_tungstenite::connect_async(&ws_endpoint).await?;
+        let mut private_ws = authenticate_private_stream_for_test(
+            stream,
+            ws_endpoint,
+            first_binding.clone(),
+            config,
+            &credentials,
+            1_700_000_000_000,
+            transport_limits,
+        )
+        .await?;
+        let started_at_ms = unix_ms()?;
+        let session = private_ws
+            .begin_recovery_session(
+                [
+                    BitgetRecoverySymbolRequest::verified(
+                        first_binding.symbol.clone(),
+                        Some(1),
+                        started_at_ms,
+                    )?,
+                    BitgetRecoverySymbolRequest::verified(
+                        second_binding.symbol.clone(),
+                        Some(1),
+                        started_at_ms,
+                    )?,
+                ],
+                started_at_ms + 30_000,
+                maximum_total_bytes,
+                maximum_total_pages,
+            )?
+            .with_rest_origin_for_test(http_origin)?;
+        let generation = session.connection_generation();
+        let first = BitgetHttpTransport::with_endpoint(
+            first_binding,
+            generation,
+            config,
+            http_origin.to_owned(),
+            transport_limits,
+        )?;
+        let second = BitgetHttpTransport::with_endpoint(
+            second_binding,
+            generation,
+            config,
+            http_origin.to_owned(),
+            transport_limits,
+        )?;
+        assert_eq!(
+            first
+                .collect_authenticated_private_turn(&mut private_ws, &session, &credentials)
+                .await?
+                .raw_pages
+                .len(),
+            5
+        );
+        assert_eq!(
+            second
+                .collect_authenticated_private_turn(&mut private_ws, &session, &credentials)
+                .await,
+            Err(BitgetTransportError::RecoverySession)
+        );
+        second_symbol_done
+            .send(())
+            .map_err(|_| "HTTP budget observer exited before the second symbol")?;
+        http_server.await??;
+        ws_server.await??;
+        Ok(())
+    }
+
+    fn recovery_body(request: &str) -> Result<&'static str, std::io::Error> {
+        if request.contains(endpoints::BALANCES) {
+            Ok(ACCOUNT_BODY)
+        } else if request.contains(endpoints::ACCOUNT_SETTINGS) {
+            Ok(SETTINGS_BODY)
+        } else if request.contains(endpoints::POSITIONS) {
+            Ok(POSITIONS_BODY)
+        } else if request.contains(endpoints::OPEN_ORDERS) || request.contains(endpoints::FILLS) {
+            Ok(PAGE_BODY)
+        } else {
+            Err(std::io::Error::other("unexpected recovery request path"))
+        }
     }
 
     #[test]

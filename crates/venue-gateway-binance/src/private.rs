@@ -14,6 +14,10 @@ pub use fill_pagination::{
     RecentFillsCursor, RecentFillsPageRequest, RecentFillsPaginationError, RecentFillsReadback,
     USER_TRADES_PAGE_LIMIT, paginate_recent_fills,
 };
+pub(crate) use fill_pagination::{
+    USER_TRADES_MAX_PAGES, USER_TRADES_WINDOW_MS, advance_recent_fills_page,
+    validate_recent_fills_range,
+};
 
 /// Normalized private readback data. It is not authoritative until its caller journals it as
 /// generation-fenced private facts.

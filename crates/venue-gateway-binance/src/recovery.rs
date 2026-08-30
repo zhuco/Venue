@@ -1,15 +1,25 @@
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use sha2::{Digest, Sha256};
+use tokio::time::timeout;
 use venue_domain::domain::{
     FieldState, NativeOrderFamily, Order, OrderOwner, OrderPurpose, Symbol,
 };
 use venue_gateway_api::GatewayMode;
 
-use crate::private::RecentFillsCursor;
+use crate::private::{
+    RecentFillsCursor, RecentFillsPageRequest, USER_TRADES_MAX_PAGES, USER_TRADES_PAGE_LIMIT,
+    USER_TRADES_WINDOW_MS, advance_recent_fills_page, validate_recent_fills_range,
+};
 use crate::{
-    BINANCE_EXECUTION_PROFILE_VERSION, BinanceConfig, BinanceInstrumentRules,
-    BinancePrivateReadbackCandidate, BinancePrivateSurface, BinanceRawPrivatePage,
+    BINANCE_EXECUTION_PROFILE_VERSION, BinanceConfig, BinanceCredentials, BinanceHttpTransport,
+    BinanceInstrumentRules, BinancePrivateReadScope, BinancePrivateReadbackCandidate,
+    BinancePrivateSurface, BinanceRawPrivatePage, build_account_config_request,
+    build_account_request, build_algo_orders_request, build_fills_request,
+    build_position_mode_request, build_positions_request, build_regular_orders_request,
     complete_private_readback,
 };
 
@@ -22,6 +32,9 @@ const RECOVERY_FACES: [BinanceRecoveryFace; 6] = [
     BinanceRecoveryFace::FillsCursor,
 ];
 const BINANCE_RECOVERY_MAX_FRESHNESS_MS: u64 = 30_000;
+const BINANCE_RECOVERY_MAX_SYMBOLS: usize = 256;
+const BINANCE_RECOVERY_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const BINANCE_RECOVERY_MAX_TOTAL_PAGES: u32 = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum BinanceRecoveryFace {
@@ -56,6 +69,7 @@ pub struct BinanceRecoveryAuthorityRoots {
 }
 
 impl BinanceRecoveryAuthorityRoots {
+    #[cfg(test)]
     pub fn verified(
         owner: [u8; 32],
         wal: [u8; 32],
@@ -94,13 +108,14 @@ impl BinanceRecoveryAuthorityRoots {
 pub struct BinanceRecoveryScopeInput {
     pub config_digest: String,
     pub config_epoch: u64,
-    pub connection_generation: u64,
     pub recovered_private_generation: u64,
     pub private_generation: u64,
     pub attempt_id: u64,
     pub started_at_ms: u64,
     pub deadline_at_ms: u64,
-    pub authority_roots: BinanceRecoveryAuthorityRoots,
+    pub maximum_total_bytes: usize,
+    pub maximum_total_pages: u32,
+    pub authority_roots: Option<BinanceRecoveryAuthorityRoots>,
     pub symbol_universe: BTreeSet<Symbol>,
 }
 
@@ -117,13 +132,14 @@ pub struct BinanceRecoveryCollectionScope {
     private_stream_origin: &'static str,
     config_digest: String,
     config_epoch: u64,
-    connection_generation: u64,
     recovered_private_generation: u64,
     private_generation: u64,
     attempt_id: u64,
     started_at_ms: u64,
     deadline_at_ms: u64,
-    authority_roots: BinanceRecoveryAuthorityRoots,
+    maximum_total_bytes: usize,
+    maximum_total_pages: u32,
+    authority_roots: Option<BinanceRecoveryAuthorityRoots>,
     symbol_universe: BTreeSet<Symbol>,
     commitment_sha256: [u8; 32],
 }
@@ -133,16 +149,31 @@ impl BinanceRecoveryCollectionScope {
         config: &BinanceConfig,
         input: BinanceRecoveryScopeInput,
     ) -> Result<Self, BinanceRecoveryCollectorError> {
+        Self::verified_inner(config, input, false)
+    }
+
+    fn verified_inner(
+        config: &BinanceConfig,
+        input: BinanceRecoveryScopeInput,
+        allow_fixture_authority: bool,
+    ) -> Result<Self, BinanceRecoveryCollectorError> {
         let binding = config.gateway_binding();
+        if input.authority_roots.is_some() && !allow_fixture_authority {
+            return Err(BinanceRecoveryCollectorError::AuthorityRoot);
+        }
         if !valid_config_digest(&input.config_digest)
             || input.config_epoch == 0
-            || input.connection_generation == 0
             || input.private_generation <= input.recovered_private_generation
             || input.attempt_id == 0
             || input.started_at_ms == 0
             || input.deadline_at_ms <= input.started_at_ms
             || input.deadline_at_ms - input.started_at_ms > BINANCE_RECOVERY_MAX_FRESHNESS_MS
+            || input.maximum_total_bytes == 0
+            || input.maximum_total_bytes > BINANCE_RECOVERY_MAX_TOTAL_BYTES
+            || input.maximum_total_pages == 0
+            || input.maximum_total_pages > BINANCE_RECOVERY_MAX_TOTAL_PAGES
             || input.symbol_universe.is_empty()
+            || input.symbol_universe.len() > BINANCE_RECOVERY_MAX_SYMBOLS
             || !input.symbol_universe.contains(&binding.symbol)
         {
             return Err(BinanceRecoveryCollectorError::Scope);
@@ -164,12 +195,13 @@ impl BinanceRecoveryCollectionScope {
             private_stream_origin: endpoint_scope.private_stream_origin,
             config_digest: input.config_digest,
             config_epoch: input.config_epoch,
-            connection_generation: input.connection_generation,
             recovered_private_generation: input.recovered_private_generation,
             private_generation: input.private_generation,
             attempt_id: input.attempt_id,
             started_at_ms: input.started_at_ms,
             deadline_at_ms: input.deadline_at_ms,
+            maximum_total_bytes: input.maximum_total_bytes,
+            maximum_total_pages: input.maximum_total_pages,
             authority_roots: input.authority_roots,
             symbol_universe: input.symbol_universe,
             commitment_sha256,
@@ -194,11 +226,6 @@ impl BinanceRecoveryCollectionScope {
     #[must_use]
     pub const fn config_epoch(&self) -> u64 {
         self.config_epoch
-    }
-
-    #[must_use]
-    pub const fn connection_generation(&self) -> u64 {
-        self.connection_generation
     }
 
     #[must_use]
@@ -227,8 +254,18 @@ impl BinanceRecoveryCollectionScope {
     }
 
     #[must_use]
-    pub const fn authority_roots(&self) -> &BinanceRecoveryAuthorityRoots {
-        &self.authority_roots
+    pub const fn maximum_total_bytes(&self) -> usize {
+        self.maximum_total_bytes
+    }
+
+    #[must_use]
+    pub const fn maximum_total_pages(&self) -> u32 {
+        self.maximum_total_pages
+    }
+
+    #[must_use]
+    pub const fn authority_roots(&self) -> Option<&BinanceRecoveryAuthorityRoots> {
+        self.authority_roots.as_ref()
     }
 
     #[must_use]
@@ -251,6 +288,7 @@ pub struct BinanceRecoveryOwnerRoute {
 }
 
 impl BinanceRecoveryOwnerRoute {
+    #[cfg(test)]
     pub fn verified(
         family: NativeOrderFamily,
         venue_order_id: impl Into<String>,
@@ -320,9 +358,334 @@ pub enum BinanceRecoveryOrderCustody {
     },
 }
 
+/// One symbol-specific, read-only transport source. Construction verifies only static adapter
+/// shape; a collector session is created later and only after Binance accepts a real signed
+/// Account GET on this exact transport instance.
+pub struct BinanceRecoverySymbolSource<'a> {
+    transport: &'a BinanceHttpTransport,
+    rules: BinanceInstrumentRules,
+    initial_fills_cursor: RecentFillsCursor,
+    fills_target_through_ms: u64,
+}
+
+impl<'a> BinanceRecoverySymbolSource<'a> {
+    pub fn verified(
+        transport: &'a BinanceHttpTransport,
+        rules: BinanceInstrumentRules,
+        initial_fills_cursor: RecentFillsCursor,
+        fills_target_through_ms: u64,
+    ) -> Result<Self, BinanceRecoveryCollectorError> {
+        Self::verified_inner(
+            transport,
+            rules,
+            initial_fills_cursor,
+            fills_target_through_ms,
+            false,
+        )
+    }
+
+    fn verified_inner(
+        transport: &'a BinanceHttpTransport,
+        rules: BinanceInstrumentRules,
+        initial_fills_cursor: RecentFillsCursor,
+        fills_target_through_ms: u64,
+        allow_fixture_endpoint: bool,
+    ) -> Result<Self, BinanceRecoveryCollectorError> {
+        rules
+            .instrument
+            .validate()
+            .map_err(|_| BinanceRecoveryCollectorError::RequestUniverse)?;
+        validate_recent_fills_range::<BinanceRecoveryCollectorError>(
+            initial_fills_cursor,
+            fills_target_through_ms,
+        )?;
+        if initial_fills_cursor.observed_through_ms == fills_target_through_ms
+            || rules.instrument.symbol != transport.config().gateway_binding().symbol
+            || rules.native_symbol != crate::native_symbol(&rules.instrument.symbol)
+            || rules.instrument.generation != transport.recovery_instrument_generation()
+            || !transport.recovery_uses_fixed_endpoint() && !allow_fixture_endpoint
+        {
+            return Err(
+                if !transport.recovery_uses_fixed_endpoint() && !allow_fixture_endpoint {
+                    BinanceRecoveryCollectorError::TransportEndpoint
+                } else {
+                    BinanceRecoveryCollectorError::RequestUniverse
+                },
+            );
+        }
+        Ok(Self {
+            transport,
+            rules,
+            initial_fills_cursor,
+            fills_target_through_ms,
+        })
+    }
+}
+
+/// Opaque, non-serializable session sealed by one successful signed Account GET. It is deliberately
+/// private: the session proves authenticated continuity of this adapter transport only; its
+/// generation numbers remain observed labels and are not runtime authority.
+struct BinanceAuthenticatedCollectorSession<'a> {
+    source: BinanceRecoverySymbolSource<'a>,
+    credentials: &'a BinanceCredentials,
+    read_scope: BinancePrivateReadScope,
+    authenticated_account: BinanceRawPrivatePage,
+    transport_instance_serial: u64,
+    instrument_generation: u64,
+    private_generation: u64,
+    request_universe_sha256: [u8; 32],
+    seal_sha256: [u8; 32],
+    raw_pages: Vec<BinanceRawPrivatePage>,
+    total_bytes: usize,
+    total_pages: u32,
+}
+
+impl<'a> BinanceAuthenticatedCollectorSession<'a> {
+    async fn authenticate(
+        source: BinanceRecoverySymbolSource<'a>,
+        credentials: &'a BinanceCredentials,
+        scope: &BinanceRecoveryCollectionScope,
+        request_universe_sha256: [u8; 32],
+        consumed_bytes: usize,
+        consumed_pages: u32,
+    ) -> Result<Self, BinanceRecoveryCollectorError> {
+        validate_source_scope(scope, &source)?;
+        if consumed_pages >= scope.maximum_total_pages {
+            return Err(BinanceRecoveryCollectorError::PageLimit);
+        }
+        let read_scope = BinancePrivateReadScope::new(
+            source.transport.config(),
+            &source.rules,
+            scope.private_generation,
+            scope.attempt_id,
+            scope.started_at_ms,
+        )
+        .map_err(|_| BinanceRecoveryCollectorError::RequestUniverse)?;
+        let request = build_account_request(&read_scope)
+            .map_err(|_| BinanceRecoveryCollectorError::RequestUniverse)?;
+        let authenticated_account = execute_bounded_read(
+            source.transport,
+            credentials,
+            &request,
+            scope.deadline_at_ms,
+        )
+        .await
+        .map_err(|error| {
+            if error == BinanceRecoveryCollectorError::TransportRead {
+                BinanceRecoveryCollectorError::Authentication
+            } else {
+                error
+            }
+        })?;
+        validate_authenticated_page(scope, source.transport, &read_scope, &authenticated_account)?;
+        let account_payload = std::str::from_utf8(&authenticated_account.payload)
+            .map_err(|_| BinanceRecoveryCollectorError::Authentication)?;
+        crate::portfolio::parse_account_balance(account_payload)
+            .map_err(|_| BinanceRecoveryCollectorError::Authentication)?;
+        let transport_instance_serial = source.transport.recovery_instance_serial();
+        let instrument_generation = source.transport.recovery_instrument_generation();
+        let private_generation = source.transport.recovery_private_generation();
+        let seal_sha256 = authenticated_session_seal(
+            scope,
+            transport_instance_serial,
+            instrument_generation,
+            private_generation,
+            &request_universe_sha256,
+            &authenticated_account,
+        );
+        let mut session = Self {
+            source,
+            credentials,
+            read_scope,
+            authenticated_account: authenticated_account.clone(),
+            transport_instance_serial,
+            instrument_generation,
+            private_generation,
+            request_universe_sha256,
+            seal_sha256,
+            raw_pages: Vec::new(),
+            total_bytes: consumed_bytes,
+            total_pages: consumed_pages,
+        };
+        session.push_page(scope, authenticated_account)?;
+        session.validate(scope)?;
+        Ok(session)
+    }
+
+    async fn read(
+        &mut self,
+        scope: &BinanceRecoveryCollectionScope,
+        request: crate::BinancePrivateReadRequest,
+    ) -> Result<BinanceRawPrivatePage, BinanceRecoveryCollectorError> {
+        self.validate(scope)?;
+        self.preflight_page_budget(scope)?;
+        if request.scope() != &self.read_scope {
+            return Err(BinanceRecoveryCollectorError::SessionDrift);
+        }
+        let page = execute_bounded_read(
+            self.source.transport,
+            self.credentials,
+            &request,
+            scope.deadline_at_ms,
+        )
+        .await?;
+        self.validate(scope)?;
+        validate_authenticated_page(scope, self.source.transport, &self.read_scope, &page)?;
+        Ok(page)
+    }
+
+    fn preflight_page_budget(
+        &self,
+        scope: &BinanceRecoveryCollectionScope,
+    ) -> Result<(), BinanceRecoveryCollectorError> {
+        if self.total_pages >= scope.maximum_total_pages {
+            return Err(BinanceRecoveryCollectorError::PageLimit);
+        }
+        Ok(())
+    }
+
+    fn push_page(
+        &mut self,
+        scope: &BinanceRecoveryCollectionScope,
+        page: BinanceRawPrivatePage,
+    ) -> Result<(), BinanceRecoveryCollectorError> {
+        let next_bytes = self
+            .total_bytes
+            .checked_add(page.payload.len())
+            .ok_or(BinanceRecoveryCollectorError::SizeLimit)?;
+        let next_pages = self
+            .total_pages
+            .checked_add(1)
+            .ok_or(BinanceRecoveryCollectorError::PageLimit)?;
+        if next_bytes > scope.maximum_total_bytes
+            || next_pages > scope.maximum_total_pages
+            || page.payload.len() > self.source.transport.recovery_limits().maximum_body_bytes()
+        {
+            return Err(if next_bytes > scope.maximum_total_bytes {
+                BinanceRecoveryCollectorError::SizeLimit
+            } else {
+                BinanceRecoveryCollectorError::PageLimit
+            });
+        }
+        self.total_bytes = next_bytes;
+        self.total_pages = next_pages;
+        self.raw_pages.push(page);
+        Ok(())
+    }
+
+    fn validate(
+        &self,
+        scope: &BinanceRecoveryCollectionScope,
+    ) -> Result<(), BinanceRecoveryCollectorError> {
+        if self.transport_instance_serial != self.source.transport.recovery_instance_serial()
+            || self.instrument_generation != self.source.transport.recovery_instrument_generation()
+            || self.private_generation != self.source.transport.recovery_private_generation()
+            || self.private_generation != scope.private_generation
+            || self.seal_sha256
+                != authenticated_session_seal(
+                    scope,
+                    self.transport_instance_serial,
+                    self.instrument_generation,
+                    self.private_generation,
+                    &self.request_universe_sha256,
+                    &self.authenticated_account,
+                )
+            || unix_ms()? > scope.deadline_at_ms
+        {
+            return Err(BinanceRecoveryCollectorError::SessionDrift);
+        }
+        Ok(())
+    }
+
+    async fn collect_remaining(
+        &mut self,
+        scope: &BinanceRecoveryCollectionScope,
+    ) -> Result<(), BinanceRecoveryCollectorError> {
+        for request in [
+            build_account_config_request(&self.read_scope),
+            build_position_mode_request(&self.read_scope),
+            build_positions_request(&self.read_scope),
+            build_regular_orders_request(&self.read_scope),
+            build_algo_orders_request(&self.read_scope),
+        ] {
+            let request = request.map_err(|_| BinanceRecoveryCollectorError::RequestUniverse)?;
+            let page = self.read(scope, request).await?;
+            self.push_page(scope, page)?;
+        }
+        self.collect_fills(scope).await
+    }
+
+    async fn collect_fills(
+        &mut self,
+        scope: &BinanceRecoveryCollectionScope,
+    ) -> Result<(), BinanceRecoveryCollectorError> {
+        let mut cursor = self.source.initial_fills_cursor;
+        let mut window_start = cursor.observed_through_ms;
+        let mut fill_page_index = 0_u32;
+        while window_start < self.source.fills_target_through_ms {
+            let window_end = window_start
+                .saturating_add(USER_TRADES_WINDOW_MS)
+                .min(self.source.fills_target_through_ms);
+            loop {
+                fill_page_index = fill_page_index
+                    .checked_add(1)
+                    .ok_or(BinanceRecoveryCollectorError::PageLimit)?;
+                if fill_page_index > USER_TRADES_MAX_PAGES {
+                    return Err(BinanceRecoveryCollectorError::PageLimit);
+                }
+                let request_shape = RecentFillsPageRequest {
+                    start_time_ms: window_start,
+                    end_time_ms: window_end,
+                    from_id: match cursor.last_trade_id {
+                        Some(value) => Some(
+                            value
+                                .checked_add(1)
+                                .ok_or(BinanceRecoveryCollectorError::Cursor)?,
+                        ),
+                        None => None,
+                    },
+                    limit: USER_TRADES_PAGE_LIMIT,
+                };
+                let request = build_fills_request(
+                    &self.read_scope,
+                    fill_page_index,
+                    cursor,
+                    window_start,
+                    window_end,
+                )
+                .map_err(|_| BinanceRecoveryCollectorError::Cursor)?;
+                let page = self.read(scope, request).await?;
+                let payload = std::str::from_utf8(&page.payload)
+                    .map_err(|_| BinanceRecoveryCollectorError::Cursor)?;
+                let (_, terminal) = advance_recent_fills_page::<BinanceRecoveryCollectorError>(
+                    &mut cursor,
+                    request_shape,
+                    payload,
+                )?;
+                self.push_page(scope, page)?;
+                if terminal {
+                    cursor.observed_through_ms = window_end;
+                    break;
+                }
+            }
+            window_start = window_end;
+        }
+        Ok(())
+    }
+
+    fn into_replay(self) -> BinanceRecoveryReplay {
+        BinanceRecoveryReplay {
+            config: self.source.transport.config().clone(),
+            rules: self.source.rules,
+            initial_fills_cursor: self.source.initial_fills_cursor,
+            fills_target_through_ms: self.source.fills_target_through_ms,
+            raw_pages: self.raw_pages,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BinanceRecoveryReplay {
-    connection_generation: u64,
     config: BinanceConfig,
     rules: BinanceInstrumentRules,
     initial_fills_cursor: RecentFillsCursor,
@@ -330,10 +693,10 @@ pub struct BinanceRecoveryReplay {
     raw_pages: Vec<BinanceRawPrivatePage>,
 }
 
+#[cfg(test)]
 impl BinanceRecoveryReplay {
     #[must_use]
     pub fn new(
-        connection_generation: u64,
         config: BinanceConfig,
         rules: BinanceInstrumentRules,
         initial_fills_cursor: RecentFillsCursor,
@@ -341,7 +704,6 @@ impl BinanceRecoveryReplay {
         raw_pages: Vec<BinanceRawPrivatePage>,
     ) -> Self {
         Self {
-            connection_generation,
             config,
             rules,
             initial_fills_cursor,
@@ -415,6 +777,7 @@ pub struct BinanceFreshRecoveryCandidate {
     replays: Vec<BinanceRecoveryReplay>,
     projections: Vec<BinanceRecoverySymbolProjection>,
     faces: Vec<BinanceRecoveryFaceCommitment>,
+    request_universe_sha256: [u8; 32],
     projection_commitment_sha256: [u8; 32],
 }
 
@@ -437,6 +800,11 @@ impl BinanceFreshRecoveryCandidate {
     #[must_use]
     pub fn faces(&self) -> &[BinanceRecoveryFaceCommitment] {
         &self.faces
+    }
+
+    #[must_use]
+    pub const fn request_universe_sha256(&self) -> &[u8; 32] {
+        &self.request_universe_sha256
     }
 
     #[must_use]
@@ -463,6 +831,7 @@ impl BinanceFreshRecoveryCandidate {
         )?;
         if rebuilt.projections != self.projections
             || rebuilt.faces != self.faces
+            || rebuilt.request_universe_sha256 != self.request_universe_sha256
             || rebuilt.projection_commitment_sha256 != self.projection_commitment_sha256
         {
             return Err(BinanceRecoveryCollectorError::ProjectionCommitment);
@@ -478,6 +847,88 @@ pub struct BinanceFreshRecoveryCollector {
 }
 
 impl BinanceFreshRecoveryCollector {
+    pub async fn collect_authenticated<'a>(
+        scope: BinanceRecoveryCollectionScope,
+        credentials: &'a BinanceCredentials,
+        sources: Vec<BinanceRecoverySymbolSource<'a>>,
+    ) -> Result<BinanceFreshRecoveryCandidate, BinanceRecoveryCollectorError> {
+        if scope.authority_roots.is_some() {
+            return Err(BinanceRecoveryCollectorError::AuthorityRoot);
+        }
+        Self::collect_authenticated_inner(scope, credentials, sources, Vec::new()).await
+    }
+
+    async fn collect_authenticated_inner<'a>(
+        scope: BinanceRecoveryCollectionScope,
+        credentials: &'a BinanceCredentials,
+        mut sources: Vec<BinanceRecoverySymbolSource<'a>>,
+        mut owner_routes: Vec<BinanceRecoveryOwnerRoute>,
+    ) -> Result<BinanceFreshRecoveryCandidate, BinanceRecoveryCollectorError> {
+        validate_owner_routes(&scope, &owner_routes)?;
+        owner_routes.sort_by(|left, right| owner_route_key(left).cmp(&owner_route_key(right)));
+        sources.sort_by(|left, right| {
+            left.transport
+                .config()
+                .gateway_binding()
+                .symbol
+                .cmp(&right.transport.config().gateway_binding().symbol)
+        });
+        let actual_symbols = sources
+            .iter()
+            .map(|source| source.transport.config().gateway_binding().symbol.clone())
+            .collect::<BTreeSet<_>>();
+        if actual_symbols != scope.symbol_universe || sources.len() != actual_symbols.len() {
+            return Err(BinanceRecoveryCollectorError::RequestUniverse);
+        }
+        let mut replays = Vec::with_capacity(sources.len());
+        let request_universe_sha256 = request_universe_commitment_from_sources(&scope, &sources);
+        let mut total_bytes = 0_usize;
+        let mut total_pages = 0_u32;
+        for source in sources {
+            let mut session = BinanceAuthenticatedCollectorSession::authenticate(
+                source,
+                credentials,
+                &scope,
+                request_universe_sha256,
+                total_bytes,
+                total_pages,
+            )
+            .await?;
+            session.collect_remaining(&scope).await?;
+            total_bytes = session.total_bytes;
+            total_pages = session.total_pages;
+            replays.push(session.into_replay());
+        }
+        let completed_at_ms = unix_ms()?;
+        let candidate = build_candidate(scope, owner_routes, completed_at_ms, replays)?;
+        if candidate.request_universe_sha256 != request_universe_sha256 {
+            return Err(BinanceRecoveryCollectorError::RequestUniverse);
+        }
+        Ok(candidate)
+    }
+
+    #[cfg(test)]
+    async fn collect_authenticated_fixture<'a>(
+        scope: BinanceRecoveryCollectionScope,
+        credentials: &'a BinanceCredentials,
+        transports: Vec<(
+            &'a BinanceHttpTransport,
+            BinanceInstrumentRules,
+            RecentFillsCursor,
+            u64,
+        )>,
+        owner_routes: Vec<BinanceRecoveryOwnerRoute>,
+    ) -> Result<BinanceFreshRecoveryCandidate, BinanceRecoveryCollectorError> {
+        let mut sources = Vec::with_capacity(transports.len());
+        for (transport, rules, cursor, target) in transports {
+            sources.push(BinanceRecoverySymbolSource::verified_inner(
+                transport, rules, cursor, target, true,
+            )?);
+        }
+        Self::collect_authenticated_inner(scope, credentials, sources, owner_routes).await
+    }
+
+    #[cfg(test)]
     pub fn begin(
         scope: BinanceRecoveryCollectionScope,
         mut owner_routes: Vec<BinanceRecoveryOwnerRoute>,
@@ -490,6 +941,7 @@ impl BinanceFreshRecoveryCollector {
         })
     }
 
+    #[cfg(test)]
     pub fn finish(
         self,
         completed_at_ms: u64,
@@ -543,7 +995,9 @@ fn build_candidate(
     }
     validate_account_projection(&projections)?;
     let faces = build_face_commitments(&scope, &replays, &projections);
-    let projection_commitment_sha256 = projection_commitment(&scope, &faces, &projections);
+    let request_universe_sha256 = request_universe_commitment(&scope, &replays);
+    let projection_commitment_sha256 =
+        projection_commitment(&scope, &request_universe_sha256, &faces, &projections);
     Ok(BinanceFreshRecoveryCandidate {
         scope,
         completed_at_ms,
@@ -551,8 +1005,107 @@ fn build_candidate(
         replays,
         projections,
         faces,
+        request_universe_sha256,
         projection_commitment_sha256,
     })
+}
+
+fn validate_source_scope(
+    scope: &BinanceRecoveryCollectionScope,
+    source: &BinanceRecoverySymbolSource<'_>,
+) -> Result<(), BinanceRecoveryCollectorError> {
+    let config = source.transport.config();
+    let binding = config.gateway_binding();
+    if binding.mode != scope.mode
+        || binding.trading_account_id != scope.trading_account_id
+        || !scope.symbol_universe.contains(&binding.symbol)
+        || config.account_binding().as_str() != scope.account_binding
+        || config.portfolio_rest_origin() != scope.portfolio_rest_origin
+        || config.usd_m_public_rest_origin() != scope.usd_m_public_rest_origin
+        || config.public_stream_origin() != scope.public_stream_origin
+        || config.private_stream_origin() != scope.private_stream_origin
+        || source.transport.recovery_private_generation() != scope.private_generation
+        || source.rules.instrument.symbol != binding.symbol
+        || source.rules.instrument.generation != source.transport.recovery_instrument_generation()
+        || source.fills_target_through_ms > scope.started_at_ms
+    {
+        return Err(BinanceRecoveryCollectorError::RequestUniverse);
+    }
+    Ok(())
+}
+
+async fn execute_bounded_read(
+    transport: &BinanceHttpTransport,
+    credentials: &BinanceCredentials,
+    request: &crate::BinancePrivateReadRequest,
+    deadline_at_ms: u64,
+) -> Result<BinanceRawPrivatePage, BinanceRecoveryCollectorError> {
+    let before_ms = unix_ms()?;
+    let remaining_ms = deadline_at_ms
+        .checked_sub(before_ms)
+        .filter(|remaining| *remaining > 0)
+        .ok_or(BinanceRecoveryCollectorError::Expired)?;
+    let page = timeout(
+        Duration::from_millis(remaining_ms),
+        transport.execute_read(credentials, request, before_ms),
+    )
+    .await
+    .map_err(|_| BinanceRecoveryCollectorError::Expired)?
+    .map_err(|_| BinanceRecoveryCollectorError::TransportRead)?;
+    if unix_ms()? > deadline_at_ms {
+        return Err(BinanceRecoveryCollectorError::Expired);
+    }
+    Ok(page)
+}
+
+fn validate_authenticated_page(
+    scope: &BinanceRecoveryCollectionScope,
+    transport: &BinanceHttpTransport,
+    read_scope: &BinancePrivateReadScope,
+    page: &BinanceRawPrivatePage,
+) -> Result<(), BinanceRecoveryCollectorError> {
+    if &page.scope != read_scope
+        || read_scope.binding() != transport.config().gateway_binding()
+        || read_scope.instrument_generation() != transport.recovery_instrument_generation()
+        || read_scope.private_generation() != transport.recovery_private_generation()
+        || read_scope.private_generation() != scope.private_generation
+        || read_scope.attempt_id() != scope.attempt_id
+        || read_scope.requested_at_ms() != scope.started_at_ms
+        || page.received_at_ms > scope.deadline_at_ms
+    {
+        return Err(BinanceRecoveryCollectorError::SessionDrift);
+    }
+    Ok(())
+}
+
+fn authenticated_session_seal(
+    scope: &BinanceRecoveryCollectionScope,
+    transport_instance_serial: u64,
+    instrument_generation: u64,
+    private_generation: u64,
+    request_universe_sha256: &[u8; 32],
+    account_page: &BinanceRawPrivatePage,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    commit_bytes(
+        &mut digest,
+        b"venue-binance-authenticated-recovery-session-v1",
+    );
+    commit_bytes(&mut digest, scope.commitment_sha256());
+    commit_u64(&mut digest, transport_instance_serial);
+    commit_u64(&mut digest, instrument_generation);
+    commit_u64(&mut digest, private_generation);
+    commit_bytes(&mut digest, request_universe_sha256);
+    commit_page(&mut digest, account_page);
+    digest.finalize().into()
+}
+
+fn unix_ms() -> Result<u64, BinanceRecoveryCollectorError> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| BinanceRecoveryCollectorError::Clock)?
+        .as_millis();
+    u64::try_from(millis).map_err(|_| BinanceRecoveryCollectorError::Clock)
 }
 
 fn validate_replay_scope(
@@ -564,7 +1117,6 @@ fn validate_replay_scope(
     if replay.raw_pages.is_empty()
         || binding.mode != scope.mode
         || binding.trading_account_id != scope.trading_account_id
-        || replay.connection_generation != scope.connection_generation
         || replay.config.account_binding().as_str() != scope.account_binding
         || replay.config.portfolio_rest_origin() != scope.portfolio_rest_origin
         || replay.config.usd_m_public_rest_origin() != scope.usd_m_public_rest_origin
@@ -782,12 +1334,14 @@ fn face_contains_surface(face: BinanceRecoveryFace, surface: BinancePrivateSurfa
 
 fn projection_commitment(
     scope: &BinanceRecoveryCollectionScope,
+    request_universe_sha256: &[u8; 32],
     faces: &[BinanceRecoveryFaceCommitment],
     projections: &[BinanceRecoverySymbolProjection],
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
     commit_bytes(&mut digest, b"venue-binance-recovery-projection-v1");
     commit_bytes(&mut digest, &scope.commitment_sha256);
+    commit_bytes(&mut digest, request_universe_sha256);
     for face in faces {
         commit_bytes(&mut digest, &[face.face.tag()]);
         commit_bytes(&mut digest, &face.evidence_sha256);
@@ -809,6 +1363,82 @@ fn projection_commitment(
         }
     }
     digest.finalize().into()
+}
+
+fn request_universe_commitment(
+    scope: &BinanceRecoveryCollectionScope,
+    replays: &[BinanceRecoveryReplay],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    commit_bytes(&mut digest, b"venue-binance-recovery-request-universe-v1");
+    commit_bytes(&mut digest, scope.commitment_sha256());
+    for replay in replays {
+        commit_request_spec(
+            &mut digest,
+            &replay.config,
+            &replay.rules,
+            replay.initial_fills_cursor,
+            replay.fills_target_through_ms,
+        );
+    }
+    digest.finalize().into()
+}
+
+fn request_universe_commitment_from_sources(
+    scope: &BinanceRecoveryCollectionScope,
+    sources: &[BinanceRecoverySymbolSource<'_>],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    commit_bytes(&mut digest, b"venue-binance-recovery-request-universe-v1");
+    commit_bytes(&mut digest, scope.commitment_sha256());
+    for source in sources {
+        commit_request_spec(
+            &mut digest,
+            source.transport.config(),
+            &source.rules,
+            source.initial_fills_cursor,
+            source.fills_target_through_ms,
+        );
+    }
+    digest.finalize().into()
+}
+
+fn commit_request_spec(
+    digest: &mut Sha256,
+    config: &BinanceConfig,
+    rules: &BinanceInstrumentRules,
+    initial_fills_cursor: RecentFillsCursor,
+    fills_target_through_ms: u64,
+) {
+    commit_str(digest, &config.gateway_binding().symbol.to_string());
+    commit_str(digest, &rules.native_symbol);
+    commit_u64(digest, rules.instrument.generation);
+    commit_str(digest, &rules.instrument.price_tick.value().to_string());
+    commit_str(digest, &rules.instrument.quantity_step.to_string());
+    commit_str(digest, &rules.minimum_quantity.to_string());
+    commit_str(digest, rules.instrument.minimum_notional.asset.as_str());
+    commit_str(digest, &rules.instrument.minimum_notional.value.to_string());
+    commit_u64(digest, initial_fills_cursor.observed_through_ms);
+    commit_u64(
+        digest,
+        initial_fills_cursor.last_trade_id.unwrap_or_default(),
+    );
+    commit_u64(
+        digest,
+        initial_fills_cursor.last_event_time_ms.unwrap_or_default(),
+    );
+    commit_u64(digest, fills_target_through_ms);
+    for surface in [
+        BinancePrivateSurface::Account,
+        BinancePrivateSurface::AccountConfig,
+        BinancePrivateSurface::PositionMode,
+        BinancePrivateSurface::Positions,
+        BinancePrivateSurface::RegularOrders,
+        BinancePrivateSurface::AlgoOrders,
+        BinancePrivateSurface::Fills,
+    ] {
+        commit_bytes(digest, &[surface as u8]);
+    }
 }
 
 fn scope_commitment(
@@ -839,18 +1469,25 @@ fn scope_commitment(
     commit_str(&mut digest, &input.config_digest);
     for value in [
         input.config_epoch,
-        input.connection_generation,
         input.recovered_private_generation,
         input.private_generation,
         input.attempt_id,
         input.started_at_ms,
         input.deadline_at_ms,
+        u64::try_from(input.maximum_total_bytes).unwrap_or(u64::MAX),
+        u64::from(input.maximum_total_pages),
     ] {
         commit_u64(&mut digest, value);
     }
-    commit_bytes(&mut digest, input.authority_roots.owner());
-    commit_bytes(&mut digest, input.authority_roots.wal());
-    commit_bytes(&mut digest, input.authority_roots.unknown());
+    match &input.authority_roots {
+        Some(roots) => {
+            commit_bytes(&mut digest, &[1]);
+            commit_bytes(&mut digest, roots.owner());
+            commit_bytes(&mut digest, roots.wal());
+            commit_bytes(&mut digest, roots.unknown());
+        }
+        None => commit_bytes(&mut digest, &[0]),
+    }
     for symbol in &input.symbol_universe {
         commit_str(&mut digest, &symbol.to_string());
     }
@@ -1038,12 +1675,38 @@ pub enum BinanceRecoveryCollectorError {
     AttemptDrift,
     #[error("Binance recovery raw response replay is incomplete or invalid")]
     Replay,
+    #[error("Binance recovery request universe is incomplete, duplicated, or inconsistent")]
+    RequestUniverse,
+    #[error("Binance recovery production transport does not use the fixed TEST/LIVE endpoint")]
+    TransportEndpoint,
+    #[error("Binance recovery could not establish a session from a real signed Account GET")]
+    Authentication,
+    #[error("Binance recovery signed read transport failed after authentication")]
+    TransportRead,
+    #[error(
+        "Binance recovery authenticated session seal, transport instance, or generation drifted"
+    )]
+    SessionDrift,
+    #[error("Binance recovery exceeded its frozen total response-size budget")]
+    SizeLimit,
+    #[error("Binance recovery exceeded its frozen page budget")]
+    PageLimit,
+    #[error("Binance recovery fills cursor is invalid, regressed, or incomplete")]
+    Cursor,
+    #[error("Binance recovery clock is invalid or regressed")]
+    Clock,
     #[error("Binance recovery account projections disagree across symbols")]
     ProjectionCommitment,
     #[error("Binance recovery candidate was relabelled under another scope")]
     Relabelled,
     #[error("Binance recovery candidate is stale or outside its collection deadline")]
     Expired,
+}
+
+impl From<crate::private::RecentFillsPaginationError> for BinanceRecoveryCollectorError {
+    fn from(_: crate::private::RecentFillsPaginationError) -> Self {
+        Self::Cursor
+    }
 }
 
 #[cfg(test)]

@@ -1,11 +1,14 @@
 //! Fresh, scope-bound Bitget recovery collection candidate.
 //!
-//! Production stays unavailable. Test-only fixtures exercise the intended six-face shape, but a
-//! caller-supplied endpoint, digest, raw page, or Owner route is never treated as physical or
-//! durable authority. This module grants no capability, writer, WAL, or dispatch authority.
+//! The production transport can now issue and post-await revalidate an authenticated read-only
+//! session. Installation remains unavailable until the runtime can pass its sealed complete
+//! universe and durable Owner/WAL/structured-Unknown projection without a `venue-runtime`
+//! dependency or caller-supplied digest. Test-only fixtures exercise that final six-face fold. This
+//! module grants no capability, writer, WAL, or dispatch authority.
 
-/// Production collection remains unavailable until an authenticated transport session and durable
-/// Owner/WAL/Unknown projection authority can issue an unforgeable collection handle.
+/// The final six-face production fold remains unavailable at the adapter/runtime boundary. Use
+/// `connect_authenticated_private_ws`, `begin_recovery_session`, and
+/// `collect_authenticated_private_turn` for the real read-only transport portion.
 #[derive(Debug, Eq, PartialEq)]
 pub struct BitgetFreshRecoveryCollector {
     _sealed: (),
@@ -13,16 +16,38 @@ pub struct BitgetFreshRecoveryCollector {
 
 impl BitgetFreshRecoveryCollector {
     pub fn begin() -> Result<Self, BitgetFreshRecoveryCollectorError> {
-        Err(BitgetFreshRecoveryCollectorError::Unavailable)
+        Err(BitgetFreshRecoveryCollectorError::ProductionUnavailable(
+            BitgetRecoveryProductionGap::RuntimeSealedUniverseBridge,
+        ))
     }
+
+    #[must_use]
+    pub const fn production_gaps() -> &'static [BitgetRecoveryProductionGap] {
+        &BitgetRecoveryProductionGap::ALL
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BitgetRecoveryProductionGap {
+    /// `venue-runtime` owns the complete registry/config/root scope, but this crate intentionally
+    /// does not depend on it and no opaque cross-crate adapter handle exists yet.
+    RuntimeSealedUniverseBridge,
+    /// Visible orders still need the runtime's replayed exact Owner routes, WAL head, and
+    /// structured Unknown set; a caller-provided digest or route list is not durable evidence.
+    DurableOwnerWalUnknownProjection,
+}
+
+impl BitgetRecoveryProductionGap {
+    pub const ALL: [Self; 2] = [
+        Self::RuntimeSealedUniverseBridge,
+        Self::DurableOwnerWalUnknownProjection,
+    ];
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum BitgetFreshRecoveryCollectorError {
-    #[error(
-        "Bitget fresh physical recovery is unavailable without authenticated transport-session and durable authority handles"
-    )]
-    Unavailable,
+    #[error("Bitget fresh physical recovery fold is unavailable at production gap {0:?}")]
+    ProductionUnavailable(BitgetRecoveryProductionGap),
 }
 
 #[cfg(test)]
@@ -1542,7 +1567,18 @@ mod fixture {
         fn production_collector_is_unavailable_and_grants_no_capability() {
             assert_eq!(
                 super::super::BitgetFreshRecoveryCollector::begin(),
-                Err(super::super::BitgetFreshRecoveryCollectorError::Unavailable)
+                Err(
+                    super::super::BitgetFreshRecoveryCollectorError::ProductionUnavailable(
+                        super::super::BitgetRecoveryProductionGap::RuntimeSealedUniverseBridge,
+                    )
+                )
+            );
+            assert_eq!(
+                super::super::BitgetFreshRecoveryCollector::production_gaps(),
+                &[
+                    super::super::BitgetRecoveryProductionGap::RuntimeSealedUniverseBridge,
+                    super::super::BitgetRecoveryProductionGap::DurableOwnerWalUnknownProjection,
+                ]
             );
             assert!(crate::capabilities().is_empty());
         }

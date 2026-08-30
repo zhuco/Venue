@@ -1,4 +1,7 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use bytes::{Bytes, BytesMut};
 use secrecy::ExposeSecret;
@@ -16,6 +19,7 @@ use crate::{
 
 const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_TRANSPORT_BYTES: usize = 2 * 1024 * 1024;
+static NEXT_TRANSPORT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BinanceTransportLimits {
@@ -67,6 +71,8 @@ pub struct BinanceHttpTransport {
     private_generation: u64,
     endpoint: String,
     limits: BinanceTransportLimits,
+    instance_serial: u64,
+    fixed_endpoint: bool,
 }
 
 impl BinanceHttpTransport {
@@ -127,6 +133,11 @@ impl BinanceHttpTransport {
             .no_proxy()
             .build()
             .map_err(|_| BinanceTransportError::Http)?;
+        let instance_serial = NEXT_TRANSPORT_INSTANCE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| BinanceTransportError::Protocol)?;
         Ok(Self {
             client,
             config,
@@ -134,12 +145,34 @@ impl BinanceHttpTransport {
             private_generation,
             endpoint,
             limits,
+            instance_serial,
+            fixed_endpoint: require_fixed_endpoint,
         })
     }
 
     #[must_use]
     pub const fn config(&self) -> &BinanceConfig {
         &self.config
+    }
+
+    pub(crate) const fn recovery_instrument_generation(&self) -> u64 {
+        self.instrument_generation
+    }
+
+    pub(crate) const fn recovery_private_generation(&self) -> u64 {
+        self.private_generation
+    }
+
+    pub(crate) const fn recovery_instance_serial(&self) -> u64 {
+        self.instance_serial
+    }
+
+    pub(crate) const fn recovery_uses_fixed_endpoint(&self) -> bool {
+        self.fixed_endpoint
+    }
+
+    pub(crate) const fn recovery_limits(&self) -> BinanceTransportLimits {
+        self.limits
     }
 
     pub async fn execute_read(

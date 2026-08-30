@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeSet, VecDeque},
     fmt,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -8,6 +9,7 @@ use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
@@ -24,16 +26,18 @@ use venue_gateway_api::GatewayBinding;
 
 use crate::execution::{mutation_unknown, parse_mutation_ack};
 use crate::{
-    GateAcceptedMutation, GateContractRules, GateCredentials, GateDispatchUnknown,
-    GateExactOrderReadback, GateExactReadbackRequest, GateGatewayBinding, GateMutationKind,
+    GateAcceptedMutation, GateAuthenticatedRecoverySession, GateAuthenticatedRecoverySessionLease,
+    GateContractRules, GateCredentials, GateDispatchUnknown, GateExactOrderReadback,
+    GateExactReadbackRequest, GateFreshRecoveryError, GateGatewayBinding, GateMutationKind,
     GatePreparedMutation, GatePreparedPrivateRead, GatePrivateChannel,
-    GatePrivateReadbackCandidate, GateRawPrivateResponse,
+    GatePrivateReadbackCandidate, GateRawPrivateResponse, GateRecoverySymbolScope,
 };
 
 const MAX_TRANSPORT_BODY_BYTES: usize = 2 * 1_024 * 1_024;
 const MAX_PRE_LIVE_FRAMES: usize = 256;
 const MAX_PRE_LIVE_BYTES: usize = 1_048_576;
 const PRIVATE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+static NEXT_RECOVERY_CONTROL_NONCE: AtomicU64 = AtomicU64::new(1);
 const PRIVATE_CHANNELS: [GatePrivateChannel; 4] = [
     GatePrivateChannel::Orders,
     GatePrivateChannel::UserTrades,
@@ -104,7 +108,7 @@ impl GateHttpTransport {
         )
     }
 
-    fn with_endpoint(
+    pub(crate) fn with_endpoint(
         binding: &GateGatewayBinding,
         generation: u64,
         endpoint: String,
@@ -174,6 +178,10 @@ impl GateHttpTransport {
             payload,
         )
         .map_err(|_| GateTransportError::Protocol)
+    }
+
+    pub(crate) const fn limits(&self) -> GateTransportLimits {
+        self.limits
     }
 
     /// Consumes the one-shot mutation. Timeout or disconnect returns only an exact signed
@@ -293,6 +301,25 @@ impl GateHttpTransport {
         }
         Ok(())
     }
+
+    pub(crate) fn matches_recovery_session(
+        &self,
+        mode: venue_gateway_api::GatewayMode,
+        trading_account_id: &str,
+        rest_origin: &str,
+        limits: GateTransportLimits,
+        request_generation: u64,
+        request_binding: &GatewayBinding,
+    ) -> bool {
+        self.binding.mode == mode
+            && self.binding.trading_account_id == trading_account_id
+            && request_binding.mode == mode
+            && request_binding.trading_account_id == trading_account_id
+            && self.binding == *request_binding
+            && self.generation == request_generation
+            && (cfg!(test) || self.endpoint == rest_origin)
+            && self.limits == limits
+    }
 }
 
 fn add_signed_headers(
@@ -354,6 +381,7 @@ pub struct GatePrivateWsTransport<S = MaybeTlsStream<TcpStream>> {
     buffered: VecDeque<GatePrivateWsFrame>,
     buffered_bytes: usize,
     next_heartbeat_at: Instant,
+    recovery_session: Option<GateAuthenticatedRecoverySessionLease>,
 }
 
 impl<S> GatePrivateWsTransport<S>
@@ -375,7 +403,132 @@ where
         &self.endpoint
     }
 
+    /// Freezes one bounded, single-use recovery universe on this authenticated private transport.
+    pub fn begin_recovery_session<I>(
+        &self,
+        symbols: I,
+        deadline_at_ms: u64,
+        maximum_total_bytes: usize,
+        maximum_total_pages: u32,
+    ) -> Result<GateAuthenticatedRecoverySession, GateFreshRecoveryError>
+    where
+        I: IntoIterator<Item = GateRecoverySymbolScope>,
+    {
+        self.recovery_session
+            .as_ref()
+            .ok_or(GateFreshRecoveryError::AuthenticatedSessionRequired)
+            .and_then(|lease| {
+                lease.begin(
+                    symbols,
+                    deadline_at_ms,
+                    maximum_total_bytes,
+                    maximum_total_pages,
+                )
+            })
+    }
+
+    /// Proves the exact private socket is still alive. Only the unique binary pong for this call
+    /// succeeds; stale binary pongs and Gate text pongs are ignored.
+    pub async fn revalidate_recovery_session(
+        &mut self,
+        session: &GateAuthenticatedRecoverySession,
+    ) -> Result<(), GateTransportError> {
+        self.validate_recovery_session_identity(session)?;
+        let nonce = recovery_control_nonce(session)?;
+        let result = async {
+            timeout(
+                self.limits.operation_timeout,
+                self.stream
+                    .send(Message::Ping(Bytes::copy_from_slice(&nonce))),
+            )
+            .await
+            .map_err(|_| GateTransportError::Timeout)?
+            .map_err(map_websocket)?;
+            loop {
+                let message = timeout(self.limits.operation_timeout, self.stream.next())
+                    .await
+                    .map_err(|_| GateTransportError::Timeout)?
+                    .ok_or(GateTransportError::EndOfStream)?
+                    .map_err(map_websocket)?;
+                match message {
+                    Message::Pong(payload) if recovery_control_pong_matches(&payload, &nonce) => {
+                        break;
+                    }
+                    Message::Pong(_) => continue,
+                    Message::Text(text) => {
+                        if private_pong(&text)? {
+                            continue;
+                        }
+                        self.buffer_recovery_frame(Bytes::from(text.to_string()))?;
+                    }
+                    Message::Ping(payload) => self
+                        .stream
+                        .send(Message::Pong(payload))
+                        .await
+                        .map_err(map_websocket)?,
+                    Message::Binary(_) | Message::Frame(_) => {
+                        return Err(GateTransportError::Protocol);
+                    }
+                    Message::Close(_) => return Err(GateTransportError::EndOfStream),
+                }
+            }
+            self.validate_recovery_session_identity(session)
+        }
+        .await;
+        if result.is_err() {
+            session.revoke();
+        }
+        result
+    }
+
+    fn validate_recovery_session_identity(
+        &self,
+        session: &GateAuthenticatedRecoverySession,
+    ) -> Result<(), GateTransportError> {
+        session
+            .validate_current()
+            .map_err(|_| GateTransportError::Session)?;
+        if self.binding.mode != session.mode()
+            || self.binding.trading_account_id != session.trading_account_id()
+            || self.generation != session.request_generation()
+            || self.endpoint != session.private_ws_endpoint()
+            || self.limits != session.transport_limits()
+        {
+            return Err(GateTransportError::Session);
+        }
+        Ok(())
+    }
+
+    fn buffer_recovery_frame(&mut self, payload: Bytes) -> Result<(), GateTransportError> {
+        let frame = make_private_frame(
+            &self.binding,
+            self.generation,
+            payload,
+            self.limits.maximum_body_bytes,
+            unix_ms()?,
+        )?;
+        self.buffered_bytes = self
+            .buffered_bytes
+            .checked_add(frame.payload.len())
+            .ok_or(GateTransportError::PreLiveBufferOverflow)?;
+        if self.buffered.len() >= MAX_PRE_LIVE_FRAMES || self.buffered_bytes > MAX_PRE_LIVE_BYTES {
+            return Err(GateTransportError::PreLiveBufferOverflow);
+        }
+        self.buffered.push_back(frame);
+        Ok(())
+    }
+
     pub async fn next_raw_frame(&mut self) -> Result<GatePrivateWsFrame, GateTransportError> {
+        let result = self.next_raw_frame_inner().await;
+        if result.is_err()
+            && let Some(session) = &self.recovery_session
+        {
+            session.revoke();
+        }
+        result
+    }
+
+    async fn next_raw_frame_inner(&mut self) -> Result<GatePrivateWsFrame, GateTransportError> {
         if let Some(frame) = self.buffered.pop_front() {
             self.buffered_bytes = self.buffered_bytes.saturating_sub(frame.payload.len());
             return Ok(frame);
@@ -441,6 +594,14 @@ where
     }
 }
 
+impl<S> Drop for GatePrivateWsTransport<S> {
+    fn drop(&mut self) {
+        if let Some(session) = &self.recovery_session {
+            session.revoke();
+        }
+    }
+}
+
 pub async fn connect_private_ws(
     binding: &GateGatewayBinding,
     credentials: &GateCredentials,
@@ -482,6 +643,7 @@ pub async fn connect_private_ws(
         &private.user_id,
         private.generation,
         limits,
+        Some(binding.config().rest_origin().to_owned()),
     )
     .await
 }
@@ -496,6 +658,7 @@ async fn authenticate_private_stream<S>(
     user_id: &str,
     generation: u64,
     limits: GateTransportLimits,
+    recovery_rest_origin: Option<String>,
 ) -> Result<GatePrivateWsTransport<S>, GateTransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -542,6 +705,19 @@ where
     }
     let (buffered, buffered_bytes) =
         read_subscription_acks(&mut stream, binding, generation, limits).await?;
+    let recovery_session = recovery_rest_origin
+        .map(|rest_origin| {
+            GateAuthenticatedRecoverySessionLease::issue(
+                binding,
+                rest_origin,
+                endpoint.clone(),
+                generation,
+                limits,
+                credentials,
+            )
+        })
+        .transpose()
+        .map_err(|_| GateTransportError::Session)?;
     Ok(GatePrivateWsTransport {
         stream,
         binding: binding.gateway_binding().clone(),
@@ -551,6 +727,7 @@ where
         buffered,
         buffered_bytes,
         next_heartbeat_at: Instant::now() + PRIVATE_HEARTBEAT_INTERVAL,
+        recovery_session,
     })
 }
 
@@ -690,6 +867,28 @@ fn private_pong(payload: &str) -> Result<bool, GateTransportError> {
     Ok(value.get("channel").and_then(Value::as_str) == Some("futures.pong"))
 }
 
+fn recovery_control_nonce(
+    session: &GateAuthenticatedRecoverySession,
+) -> Result<[u8; 32], GateTransportError> {
+    let serial = NEXT_RECOVERY_CONTROL_NONCE
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| GateTransportError::Session)?;
+    let mut digest = Sha256::new();
+    digest.update(b"venue-gate-recovery-control-nonce-v1");
+    digest.update(session.request_universe_sha256());
+    digest.update(session.connection_generation().to_be_bytes());
+    digest.update(session.private_generation().to_be_bytes());
+    digest.update(session.attempt_id().to_be_bytes());
+    digest.update(serial.to_be_bytes());
+    Ok(digest.finalize().into())
+}
+
+fn recovery_control_pong_matches(payload: &Bytes, nonce: &[u8; 32]) -> bool {
+    payload.as_ref() == nonce
+}
+
 fn map_websocket(error: WebSocketError) -> GateTransportError {
     if matches!(error, WebSocketError::Capacity(_)) {
         GateTransportError::BodyTooLarge
@@ -743,6 +942,8 @@ pub enum GateTransportError {
     Signing,
     #[error("Gate transport clock is invalid")]
     Clock,
+    #[error("Gate authenticated recovery session could not be issued")]
+    Session,
 }
 
 #[cfg(test)]
@@ -883,6 +1084,20 @@ mod tests {
         r#"{"id":"9001","contract":"DOGE_USDT","size":"10","left":"10","is_reduce_only":false,"status":"open","finish_as":"","price":"0.1","fill_price":"0","text":"t-grid_long_1"}"#
     }
 
+    #[test]
+    fn recovery_liveness_accepts_only_the_exact_binary_pong() {
+        let nonce = [7_u8; 32];
+        assert!(recovery_control_pong_matches(
+            &Bytes::copy_from_slice(&nonce),
+            &nonce
+        ));
+        assert!(!recovery_control_pong_matches(
+            &Bytes::from_static(b"stale-pong"),
+            &nonce
+        ));
+        assert!(!recovery_control_pong_matches(&Bytes::new(), &nonce));
+    }
+
     #[tokio::test]
     async fn signed_test_http_never_changes_mode_and_ack_returns_exact_readback()
     -> Result<(), TestError> {
@@ -989,6 +1204,21 @@ mod tests {
                 ))
                 .await?;
             }
+            let ping = ws.next().await.ok_or("missing recovery ping")??;
+            let Message::Ping(control_nonce) = ping else {
+                return Err::<(), TestError>("recovery control must use binary ping".into());
+            };
+            ws.send(Message::Pong(Bytes::from_static(b"stale-pong")))
+                .await?;
+            ws.send(Message::Text(
+                r#"{"channel":"futures.pong","event":"update","result":{}}"#.into(),
+            ))
+            .await?;
+            ws.send(Message::Text(
+                r#"{"channel":"futures.positions","event":"update","result":[]}"#.into(),
+            ))
+            .await?;
+            ws.send(Message::Pong(control_nonce)).await?;
             Ok::<(), TestError>(())
         });
         let stream = TcpStream::connect(address).await?;
@@ -1003,12 +1233,70 @@ mod tests {
             "42",
             7,
             limits,
+            Some("http://signed-gate-recovery.test".to_owned()),
         )
         .await?;
+        let session = private.begin_recovery_session(
+            [GateRecoverySymbolScope::verified(
+                binding.clone(),
+                rules.clone(),
+                crate::GateFillsCursor::default(),
+            )?],
+            unix_ms()?.saturating_add(2_000),
+            64 * 1024,
+            1,
+        )?;
+        assert!(session.is_current());
+        assert_eq!(session.mode(), GatewayMode::Test);
+        assert_eq!(session.trading_account_id(), ACCOUNT);
+        assert_eq!(session.rest_origin(), "http://signed-gate-recovery.test");
+        assert_eq!(session.private_ws_endpoint(), format!("ws://{address}"));
+        assert_eq!(session.request_generation(), 7);
+        private.revalidate_recovery_session(&session).await?;
         let frame = private.next_raw_frame().await?;
         assert_eq!(frame.channel, "futures.orders");
         assert_eq!(frame.binding.mode, GatewayMode::Test);
+        assert_eq!(private.next_raw_frame().await?.channel, "futures.positions");
+        let account = crate::prepare_private_read(
+            &binding,
+            &rules,
+            7,
+            session.attempt_id(),
+            crate::GatePrivateReadSource::Account,
+            crate::GateFillsCursor::default(),
+        )?;
+        session.reserve_get(&account, limits.maximum_body_bytes())?;
+        session.settle_get(&account, 2, None)?;
+        let positions = crate::prepare_private_read(
+            &binding,
+            &rules,
+            7,
+            session.attempt_id(),
+            crate::GatePrivateReadSource::DualPositions,
+            crate::GateFillsCursor::default(),
+        )?;
+        assert!(matches!(
+            session.reserve_get(&positions, limits.maximum_body_bytes()),
+            Err(GateFreshRecoveryError::Budget)
+        ));
+        let replacement = private.begin_recovery_session(
+            [GateRecoverySymbolScope::verified(
+                binding.clone(),
+                rules.clone(),
+                crate::GateFillsCursor::default(),
+            )?],
+            unix_ms()?.saturating_add(2_000),
+            64 * 1024,
+            8,
+        )?;
+        assert!(!session.is_current());
+        assert!(replacement.is_current());
         server.await??;
+        assert!(matches!(
+            private.next_raw_frame().await,
+            Err(GateTransportError::EndOfStream | GateTransportError::Disconnected)
+        ));
+        assert!(!replacement.is_current());
         Ok(())
     }
 }

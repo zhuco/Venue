@@ -1,19 +1,22 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use venue_domain::domain::{AccountBalance, CommandId, FieldState, OrderOwner, Symbol};
 use venue_gateway_api::{GatewayMode, VenueId};
 
 use crate::{
-    GATE_STAGE7_ORDER_PROFILE_VERSION, GateConfig, GateContractRules, GateFillsCursor,
-    GateGatewayBinding, GatePreparedPrivateRead, GatePrivateReadError, GatePrivateReadSource,
-    GatePrivateReadbackCandidate, GateRawPrivateResponse, prepare_private_read,
-    validate_private_readback,
+    GATE_PRIVATE_PAGE_LIMIT, GATE_STAGE7_ORDER_PROFILE_VERSION, GateAuthenticatedRecoverySession,
+    GateConfig, GateContractRules, GateCredentials, GateFillsCursor, GateGatewayBinding,
+    GateHttpTransport, GatePreparedPrivateRead, GatePrivateReadError, GatePrivateReadSource,
+    GatePrivateReadbackCandidate, GatePrivateWsTransport, GateRawPrivateResponse,
+    GateTransportError, prepare_private_read, validate_private_readback,
 };
 
-#[cfg(test)]
 const MAX_CONFIG_DIGEST_LEN: usize = 128;
-#[cfg(test)]
 const MAX_COLLECTION_WINDOW_MS: u64 = 3_000;
 
 /// Opaque recovery roots frozen before any Gate request is prepared. These values do not open a
@@ -26,6 +29,17 @@ pub struct GateRecoveryAuthorityRoots {
 }
 
 impl GateRecoveryAuthorityRoots {
+    /// Leaves durable authority roots intentionally unbound at the adapter collection layer.
+    /// Runtime/Node admission must bind and verify those roots before installing this candidate.
+    #[must_use]
+    pub const fn unbound() -> Self {
+        Self {
+            owner: [0; 32],
+            wal: [0; 32],
+            unknown: [0; 32],
+        }
+    }
+
     pub fn verified(
         owner: [u8; 32],
         wal: [u8; 32],
@@ -178,6 +192,7 @@ pub struct GateRecoveryScope {
     deadline_at_ms: u64,
     authority_roots: GateRecoveryAuthorityRoots,
     symbol_universe: Vec<Symbol>,
+    request_universe_sha256: [u8; 32],
     commitment_sha256: [u8; 32],
 }
 
@@ -253,6 +268,11 @@ impl GateRecoveryScope {
     }
 
     #[must_use]
+    pub const fn request_universe_sha256(&self) -> &[u8; 32] {
+        &self.request_universe_sha256
+    }
+
+    #[must_use]
     pub const fn commitment_sha256(&self) -> &[u8; 32] {
         &self.commitment_sha256
     }
@@ -306,6 +326,59 @@ impl std::fmt::Debug for GateFreshRecoveryRawResponse {
 }
 
 impl GateFreshRecoveryRawResponse {
+    /// Returns the exact continuation cursor for a full regular/fills page, or `None` only for a
+    /// terminal short page. Callers remain responsible for the exported hard page-count bound.
+    pub fn next_page_cursor(&self) -> Result<Option<GateFillsCursor>, GateFreshRecoveryError> {
+        if !matches!(
+            self.raw.source,
+            GatePrivateReadSource::RegularOrders | GatePrivateReadSource::Fills
+        ) {
+            return Err(GateFreshRecoveryError::Cursor);
+        }
+        let value: Value = serde_json::from_str(&self.raw.payload)
+            .map_err(|_| GateFreshRecoveryError::PrivateRead(GatePrivateReadError::Payload))?;
+        let rows = value.as_array().ok_or(GateFreshRecoveryError::PrivateRead(
+            GatePrivateReadError::Payload,
+        ))?;
+        if rows.len() < GATE_PRIVATE_PAGE_LIMIT {
+            return Ok(None);
+        }
+        if rows.len() != GATE_PRIVATE_PAGE_LIMIT {
+            return Err(GateFreshRecoveryError::Cursor);
+        }
+        let id = rows
+            .last()
+            .and_then(|row| row.get("id"))
+            .and_then(|value| match value {
+                Value::String(value) => Some(value.clone()),
+                Value::Number(value) => Some(value.to_string()),
+                _ => None,
+            })
+            .ok_or(GateFreshRecoveryError::Cursor)?;
+        Ok(Some(GateFillsCursor::new(Some(id))?))
+    }
+
+    fn from_authenticated_response(
+        prepared: &GateRecoveryPreparedRead,
+        raw: GateRawPrivateResponse,
+    ) -> Result<Self, GateFreshRecoveryError> {
+        if raw.binding != prepared.request.binding
+            || raw.generation != prepared.request.generation
+            || raw.attempt != prepared.request.attempt
+            || raw.source != prepared.request.source
+            || raw.endpoint != prepared.request.endpoint
+            || raw.query != prepared.request.query
+            || raw.cursor_before != prepared.request.cursor_before
+        {
+            return Err(GateFreshRecoveryError::ScopeDrift);
+        }
+        Ok(Self {
+            recovery_scope_sha256: prepared.recovery_scope_sha256,
+            symbol: prepared.symbol.clone(),
+            raw,
+        })
+    }
+
     #[cfg(test)]
     pub fn from_response(
         prepared: &GateRecoveryPreparedRead,
@@ -325,11 +398,7 @@ impl GateFreshRecoveryRawResponse {
             received_at_ms,
             payload,
         )?;
-        Ok(Self {
-            recovery_scope_sha256: prepared.recovery_scope_sha256,
-            symbol: prepared.symbol.clone(),
-            raw,
-        })
+        Self::from_authenticated_response(prepared, raw)
     }
 }
 
@@ -471,13 +540,11 @@ pub struct GateFreshRecoveryCollector {
     scope: GateRecoveryScope,
     symbols: BTreeMap<Symbol, GateRecoverySymbolScope>,
     owner_routes: BTreeMap<(Symbol, String), GateRecoveryOwnerRoute>,
+    authenticated_session: Option<GateAuthenticatedRecoverySession>,
 }
 
 impl GateFreshRecoveryCollector {
-    /// Production construction stays unavailable until the shared runtime can supply an
-    /// unforgeable authenticated transport-session receipt carrying the actual connection/private
-    /// generations and a durable proof that the symbol universe equals the selected configuration.
-    /// Caller-provided generations, digests, symbols, payloads, and timestamps are not promoted.
+    /// Caller-only recovery facts never establish an authenticated collection session.
     pub fn start<I, J>(
         start: GateRecoveryCollectionStart,
         symbols: I,
@@ -488,11 +555,72 @@ impl GateFreshRecoveryCollector {
         J: IntoIterator<Item = GateRecoveryOwnerRoute>,
     {
         let _ = (start, symbols.into_iter(), owner_routes.into_iter());
-        Err(GateFreshRecoveryError::Unavailable)
+        Err(GateFreshRecoveryError::AuthenticatedSessionRequired)
+    }
+
+    /// Starts one production read-only attempt from a live, crate-issued private-session seal.
+    ///
+    /// The sealed session is the sole source of generations, attempt, deadline, rules, cursors,
+    /// request universe, and budgets. Production cannot inject durable roots or ExactOwner routes.
+    pub fn start_authenticated(
+        authenticated_session: GateAuthenticatedRecoverySession,
+    ) -> Result<Self, GateFreshRecoveryError> {
+        authenticated_session.validate_current()?;
+        let recovered_private_generation = authenticated_session
+            .private_generation()
+            .checked_sub(1)
+            .ok_or(GateFreshRecoveryError::Generation)?;
+        let start = GateRecoveryCollectionStart {
+            mode: authenticated_session.mode(),
+            trading_account_id: authenticated_session.trading_account_id().to_owned(),
+            config_digest: "gate_authenticated_recovery_v1".to_owned(),
+            config_epoch: authenticated_session.collection_epoch(),
+            connection_generation: authenticated_session.connection_generation(),
+            recovered_private_generation,
+            attempt_id: authenticated_session.attempt_id(),
+            started_at_ms: authenticated_session.started_at_ms(),
+            deadline_at_ms: authenticated_session.deadline_at_ms(),
+            authority_roots: GateRecoveryAuthorityRoots::unbound(),
+        };
+        let symbols = authenticated_session.symbol_scopes().collect::<Vec<_>>();
+        let mut collector = Self::start_verified(
+            start.clone(),
+            symbols,
+            std::iter::empty::<GateRecoveryOwnerRoute>(),
+        )?;
+        if collector.scope.rest_origin != authenticated_session.rest_origin()
+            || collector.scope.private_ws_endpoint != authenticated_session.private_ws_endpoint()
+            || collector.scope.private_generation != authenticated_session.private_generation()
+        {
+            return Err(GateFreshRecoveryError::AuthenticatedSessionEndpoint);
+        }
+        collector.scope.request_universe_sha256 = *authenticated_session.request_universe_sha256();
+        collector.scope.commitment_sha256 = scope_commitment(
+            &start,
+            collector.scope.rest_origin,
+            collector.scope.private_ws_endpoint,
+            collector.scope.private_generation,
+            &collector.scope.symbol_universe,
+            &collector.scope.request_universe_sha256,
+        );
+        collector.authenticated_session = Some(authenticated_session);
+        Ok(collector)
     }
 
     #[cfg(test)]
     fn start_fixture<I, J>(
+        start: GateRecoveryCollectionStart,
+        symbols: I,
+        owner_routes: J,
+    ) -> Result<Self, GateFreshRecoveryError>
+    where
+        I: IntoIterator<Item = GateRecoverySymbolScope>,
+        J: IntoIterator<Item = GateRecoveryOwnerRoute>,
+    {
+        Self::start_verified(start, symbols, owner_routes)
+    }
+
+    fn start_verified<I, J>(
         start: GateRecoveryCollectionStart,
         symbols: I,
         owner_routes: J,
@@ -530,6 +658,7 @@ impl GateFreshRecoveryCollector {
             config.usdt_futures_ws(),
             private_generation,
             &symbol_universe,
+            &[0; 32],
         );
         let scope = GateRecoveryScope {
             mode: start.mode,
@@ -546,6 +675,7 @@ impl GateFreshRecoveryCollector {
             deadline_at_ms: start.deadline_at_ms,
             authority_roots: start.authority_roots,
             symbol_universe,
+            request_universe_sha256: [0; 32],
             commitment_sha256,
         };
 
@@ -565,6 +695,7 @@ impl GateFreshRecoveryCollector {
             scope,
             symbols: by_symbol,
             owner_routes: routes,
+            authenticated_session: None,
         })
     }
 
@@ -611,6 +742,114 @@ impl GateFreshRecoveryCollector {
         })
     }
 
+    /// Executes one prepared signed GET within the authenticated attempt. The private-session seal
+    /// is checked before the network await and again after it returns. The outer deadline bounds the
+    /// await independently of the HTTP client's operation timeout.
+    pub async fn execute_read<S>(
+        &self,
+        transport: &GateHttpTransport,
+        private_ws: &mut GatePrivateWsTransport<S>,
+        credentials: &GateCredentials,
+        prepared: &GateRecoveryPreparedRead,
+    ) -> Result<GateFreshRecoveryRawResponse, GateFreshRecoveryError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let session = self
+            .authenticated_session
+            .as_ref()
+            .ok_or(GateFreshRecoveryError::AuthenticatedSessionRequired)?;
+        let result = self
+            .execute_read_inner(transport, private_ws, session, credentials, prepared)
+            .await;
+        if result.is_err() {
+            session.revoke();
+        }
+        result
+    }
+
+    async fn execute_read_inner<S>(
+        &self,
+        transport: &GateHttpTransport,
+        private_ws: &mut GatePrivateWsTransport<S>,
+        session: &GateAuthenticatedRecoverySession,
+        credentials: &GateCredentials,
+        prepared: &GateRecoveryPreparedRead,
+    ) -> Result<GateFreshRecoveryRawResponse, GateFreshRecoveryError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        self.validate_session_and_transport(session, transport, credentials, prepared)?;
+        session.reserve_get(&prepared.request, transport.limits().maximum_body_bytes())?;
+        private_ws.revalidate_recovery_session(session).await?;
+        let symbol_scope = self
+            .symbols
+            .get(&prepared.symbol)
+            .ok_or(GateFreshRecoveryError::SymbolUniverse)?;
+        let requested_at_ms = unix_ms()?;
+        if requested_at_ms < self.scope.started_at_ms
+            || requested_at_ms >= self.scope.deadline_at_ms
+        {
+            return Err(GateFreshRecoveryError::Deadline);
+        }
+        let remaining = self.scope.deadline_at_ms - requested_at_ms;
+        let raw = tokio::time::timeout(
+            Duration::from_millis(remaining),
+            transport.execute_private_read(
+                &symbol_scope.binding,
+                credentials,
+                &symbol_scope.rules,
+                &prepared.request,
+                requested_at_ms,
+            ),
+        )
+        .await
+        .map_err(|_| GateFreshRecoveryError::Deadline)??;
+        private_ws.revalidate_recovery_session(session).await?;
+        self.validate_session_and_transport(session, transport, credentials, prepared)?;
+        let validated_at_ms = unix_ms()?;
+        if validated_at_ms >= self.scope.deadline_at_ms
+            || raw.received_at_ms >= self.scope.deadline_at_ms
+        {
+            return Err(GateFreshRecoveryError::Deadline);
+        }
+        let response = GateFreshRecoveryRawResponse::from_authenticated_response(prepared, raw)?;
+        let next_cursor = match prepared.request.source {
+            GatePrivateReadSource::RegularOrders | GatePrivateReadSource::Fills => response
+                .next_page_cursor()?
+                .and_then(|cursor| cursor.last_native_id().map(str::to_owned)),
+            GatePrivateReadSource::Account | GatePrivateReadSource::DualPositions => None,
+        };
+        session.settle_get(&prepared.request, response.raw.payload.len(), next_cursor)?;
+        Ok(response)
+    }
+
+    fn validate_session_and_transport(
+        &self,
+        session: &GateAuthenticatedRecoverySession,
+        transport: &GateHttpTransport,
+        credentials: &GateCredentials,
+        prepared: &GateRecoveryPreparedRead,
+    ) -> Result<(), GateFreshRecoveryError> {
+        session.validate_credentials(credentials)?;
+        session.validate_request(&prepared.request, unix_ms()?)?;
+        if prepared.recovery_scope_sha256 != self.scope.commitment_sha256
+            || prepared.symbol != prepared.request.binding.symbol
+            || prepared.request.attempt != self.scope.attempt_id
+            || !transport.matches_recovery_session(
+                session.mode(),
+                session.trading_account_id(),
+                session.rest_origin(),
+                session.transport_limits(),
+                session.request_generation(),
+                &prepared.request.binding,
+            )
+        {
+            return Err(GateFreshRecoveryError::AuthenticatedSessionScope);
+        }
+        Ok(())
+    }
+
     pub fn finish<I>(
         self,
         validated_at_ms: u64,
@@ -619,6 +858,9 @@ impl GateFreshRecoveryCollector {
     where
         I: IntoIterator<Item = GateFreshRecoveryRawResponse>,
     {
+        if let Some(session) = &self.authenticated_session {
+            session.validate_current()?;
+        }
         if validated_at_ms < self.scope.started_at_ms
             || validated_at_ms >= self.scope.deadline_at_ms
         {
@@ -697,6 +939,12 @@ impl GateFreshRecoveryCollector {
             &owned_open_orders,
             &unknown_open_orders,
         );
+        if let Some(session) = &self.authenticated_session {
+            if !owned_open_orders.is_empty() {
+                return Err(GateFreshRecoveryError::OwnerRoute);
+            }
+            session.commit_collection()?;
+        }
         Ok(GateFreshRecoveryCandidate {
             scope: self.scope,
             account: account.ok_or(GateFreshRecoveryError::MissingSurface)?,
@@ -709,7 +957,6 @@ impl GateFreshRecoveryCollector {
     }
 }
 
-#[cfg(test)]
 fn validate_start(start: &GateRecoveryCollectionStart) -> Result<(), GateFreshRecoveryError> {
     if start.trading_account_id.trim().is_empty()
         || start.config_epoch == 0
@@ -892,13 +1139,13 @@ fn surface_commitments(
     Ok(surfaces)
 }
 
-#[cfg(test)]
 fn scope_commitment(
     start: &GateRecoveryCollectionStart,
     rest_origin: &str,
     private_ws_endpoint: &str,
     private_generation: u64,
     symbols: &[Symbol],
+    request_universe_sha256: &[u8; 32],
 ) -> [u8; 32] {
     let mut digest = tagged_digest(b"venue-gate-fresh-recovery-scope-v1");
     update_string(&mut digest, start.mode.as_str());
@@ -916,6 +1163,7 @@ fn scope_commitment(
     digest.update(start.authority_roots.owner);
     digest.update(start.authority_roots.wal);
     digest.update(start.authority_roots.unknown);
+    digest.update(request_universe_sha256);
     for symbol in symbols {
         update_string(&mut digest, &symbol.to_string());
     }
@@ -1034,12 +1282,26 @@ fn valid_native_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+fn unix_ms() -> Result<u64, GateFreshRecoveryError> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| GateFreshRecoveryError::Clock)?
+        .as_millis();
+    u64::try_from(millis).map_err(|_| GateFreshRecoveryError::Clock)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum GateFreshRecoveryError {
-    #[error(
-        "Gate production recovery collection requires unavailable authenticated session and configuration-universe authority"
-    )]
-    Unavailable,
+    #[error("Gate production recovery collection requires a crate-issued authenticated session")]
+    AuthenticatedSessionRequired,
+    #[error("Gate authenticated recovery session issuer is unavailable")]
+    AuthenticatedSessionIssuer,
+    #[error("Gate authenticated recovery session endpoint is not the exact selected endpoint")]
+    AuthenticatedSessionEndpoint,
+    #[error("Gate authenticated recovery session does not match the attempt scope or transport")]
+    AuthenticatedSessionScope,
+    #[error("Gate authenticated recovery session was revoked by disconnect or replacement")]
+    AuthenticatedSessionRevoked,
     #[error("Gate recovery scope, attempt, or collection window is invalid")]
     Scope,
     #[error("Gate recovery configuration digest or epoch is invalid")]
@@ -1072,12 +1334,22 @@ pub enum GateFreshRecoveryError {
     AccountDivergence,
     #[error("Gate recovery record count exceeds the supported range")]
     RecordCount,
+    #[error("Gate recovery global page or byte budget was exhausted before a GET")]
+    Budget,
+    #[error("Gate recovery collection epoch or request face was already consumed")]
+    SessionConsumed,
+    #[error("Gate recovery clock is invalid")]
+    Clock,
+    #[error(transparent)]
+    Transport(#[from] GateTransportError),
     #[error(transparent)]
     PrivateRead(#[from] GatePrivateReadError),
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use rust_decimal::Decimal;
     use venue_domain::domain::{Amount, Instrument, MarketKind, OrderPurpose, Price};
     use venue_gateway_api::{GatewayBinding, GatewayMode};
@@ -1245,8 +1517,38 @@ mod tests {
                 [symbol],
                 std::iter::empty::<GateRecoveryOwnerRoute>(),
             ),
-            Err(GateFreshRecoveryError::Unavailable)
+            Err(GateFreshRecoveryError::AuthenticatedSessionRequired)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn authenticated_start_derives_attempt_universe_and_unbound_roots_from_session()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let symbol = symbol_scope(GatewayMode::Test, "DOGE/USDT", "DOGE_USDT", 7, None)?;
+        let limits = crate::GateTransportLimits::new(Duration::from_secs(2), 16 * 1024)?;
+        let credentials = GateCredentials::from_values("key", "secret")?;
+        let lease = crate::GateAuthenticatedRecoverySessionLease::issue(
+            symbol.binding(),
+            symbol.binding().config().rest_origin().to_owned(),
+            symbol.binding().config().usdt_futures_ws().to_owned(),
+            7,
+            limits,
+            &credentials,
+        )?;
+        let session = lease.begin([symbol], unix_ms()?.saturating_add(2_000), 64 * 1024, 8)?;
+        let expected_attempt = session.attempt_id();
+        let expected_universe = *session.request_universe_sha256();
+        let collector = GateFreshRecoveryCollector::start_authenticated(session)?;
+        assert_eq!(collector.scope().attempt_id(), expected_attempt);
+        assert_eq!(
+            collector.scope().request_universe_sha256(),
+            &expected_universe
+        );
+        assert_eq!(
+            collector.scope().authority_roots(),
+            &GateRecoveryAuthorityRoots::unbound()
+        );
         Ok(())
     }
 
@@ -1312,6 +1614,14 @@ mod tests {
                 include_str!("../tests/fixtures/fills.json").to_owned(),
             ],
         )?;
+        for response in responses.iter().filter(|response| {
+            matches!(
+                response.raw.source,
+                GatePrivateReadSource::RegularOrders | GatePrivateReadSource::Fills
+            )
+        }) {
+            assert_eq!(response.next_page_cursor()?, None);
+        }
         let candidate = collector.finish(1_300, responses)?;
 
         assert_eq!(candidate.scope().symbol_universe(), &["DOGE/USDT".parse()?]);

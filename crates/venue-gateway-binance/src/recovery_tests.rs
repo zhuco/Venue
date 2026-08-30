@@ -1,16 +1,25 @@
 use std::collections::BTreeSet;
 use std::error::Error;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::time::Duration;
 
 use bytes::Bytes;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 use venue_domain::domain::{NativeOrderFamily, OrderOwner, OrderPurpose, Symbol};
 use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
 
 use super::*;
 use crate::{
-    BinanceAccountBinding, BinancePrivateReadScope, build_account_config_request,
-    build_account_request, build_algo_orders_request, build_fills_request,
-    build_position_mode_request, build_positions_request, build_regular_orders_request,
-    parse_instrument_rules,
+    BinanceAccountBinding, BinanceCredentials, BinanceHttpTransport, BinancePrivateReadScope,
+    BinanceTransportLimits, build_account_config_request, build_account_request,
+    build_algo_orders_request, build_fills_request, build_position_mode_request,
+    build_positions_request, build_regular_orders_request, parse_instrument_rules,
 };
 
 const ACCOUNT_ID: &str = "00000000-0000-4000-8000-000000000001";
@@ -54,38 +63,22 @@ fn collection_scope_with(
     deadline_at_ms: u64,
     roots_seed: u8,
 ) -> Result<BinanceRecoveryCollectionScope, Box<dyn Error>> {
-    collection_scope_with_connection(
-        config,
-        config_digest,
-        private_generation,
-        deadline_at_ms,
-        roots_seed,
-        9,
-    )
-}
-
-fn collection_scope_with_connection(
-    config: &BinanceConfig,
-    config_digest: &str,
-    private_generation: u64,
-    deadline_at_ms: u64,
-    roots_seed: u8,
-    connection_generation: u64,
-) -> Result<BinanceRecoveryCollectionScope, Box<dyn Error>> {
-    Ok(BinanceRecoveryCollectionScope::verified(
+    Ok(BinanceRecoveryCollectionScope::verified_inner(
         config,
         BinanceRecoveryScopeInput {
             config_digest: config_digest.to_owned(),
             config_epoch: 5,
-            connection_generation,
             recovered_private_generation: 16,
             private_generation,
             attempt_id: 11,
             started_at_ms: 900,
             deadline_at_ms,
-            authority_roots: authority_roots(roots_seed)?,
+            maximum_total_bytes: 8 * 1024 * 1024,
+            maximum_total_pages: 1_000,
+            authority_roots: Some(authority_roots(roots_seed)?),
             symbol_universe: BTreeSet::from([config.gateway_binding().symbol.clone()]),
         },
+        true,
     )?)
 }
 
@@ -129,7 +122,6 @@ fn replay(
         )?,
     ];
     Ok(BinanceRecoveryReplay::new(
-        9,
         config.clone(),
         rules.clone(),
         cursor,
@@ -164,6 +156,60 @@ fn exact_routes(symbol: &Symbol) -> Result<Vec<BinanceRecoveryOwnerRoute>, Box<d
             owner(symbol.clone(), OrderPurpose::Protection),
         )?,
     ])
+}
+
+async fn fake_signed_reads(payloads: Vec<&'static [u8]>) -> Result<String, Box<dyn Error>> {
+    Ok(fake_signed_reads_counted(payloads).await?.0)
+}
+
+async fn fake_signed_reads_counted(
+    payloads: Vec<&'static [u8]>,
+) -> Result<(String, Arc<AtomicUsize>), Box<dyn Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let count = Arc::new(AtomicUsize::new(0));
+    let accepted = Arc::clone(&count);
+    tokio::spawn(async move {
+        for payload in payloads {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            accepted.fetch_add(1, Ordering::SeqCst);
+            let mut request = vec![0_u8; 16 * 1024];
+            let _ = stream.read(&mut request).await;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(payload).await;
+        }
+    });
+    Ok((format!("http://{address}"), count))
+}
+
+fn production_scope(
+    config: &BinanceConfig,
+    started_at_ms: u64,
+    maximum_total_pages: u32,
+    symbol_universe: BTreeSet<Symbol>,
+) -> Result<BinanceRecoveryCollectionScope, BinanceRecoveryCollectorError> {
+    BinanceRecoveryCollectionScope::verified(
+        config,
+        BinanceRecoveryScopeInput {
+            config_digest: "config_authenticated".to_owned(),
+            config_epoch: 5,
+            recovered_private_generation: 16,
+            private_generation: 17,
+            attempt_id: 11,
+            started_at_ms,
+            deadline_at_ms: started_at_ms + 5_000,
+            maximum_total_bytes: 8 * 1024 * 1024,
+            maximum_total_pages,
+            authority_roots: None,
+            symbol_universe,
+        },
+    )
 }
 
 fn collected_candidate(
@@ -267,17 +313,11 @@ fn old_probe_cannot_be_relabelled_or_used_after_deadline() -> TestResult {
     let (config, _) = config_and_rules()?;
     let candidate = collected_candidate(exact_routes(&config.gateway_binding().symbol)?)?;
     let relabelled = collection_scope_with(&config, "config_2", 17, 2_500, 9)?;
-    let connection_relabelled =
-        collection_scope_with_connection(&config, "config_1", 17, 2_500, 1, 10)?;
     let (other_config, _) =
         config_and_rules_for(GatewayMode::Live, "00000000-0000-4000-8000-000000000099")?;
     let mode_account_relabelled = collection_scope_with(&other_config, "config_1", 17, 2_500, 1)?;
 
-    for drifted in [
-        &relabelled,
-        &connection_relabelled,
-        &mode_account_relabelled,
-    ] {
+    for drifted in [&relabelled, &mode_account_relabelled] {
         assert_eq!(
             candidate.verify_fresh(drifted, 2_200),
             Err(BinanceRecoveryCollectorError::Relabelled)
@@ -330,15 +370,6 @@ fn cross_generation_pages_and_stale_generation_fail_closed() -> TestResult {
         Err(BinanceRecoveryCollectorError::AttemptDrift)
     );
 
-    let scope = collection_scope_with(&config, "config_1", 17, 2_500, 1)?;
-    let mut wrong_connection = replay(&config, &rules, 17, REGULAR, ALGO)?;
-    wrong_connection.connection_generation = 10;
-    assert_eq!(
-        BinanceFreshRecoveryCollector::begin(scope, Vec::new())?
-            .finish(2_100, vec![wrong_connection]),
-        Err(BinanceRecoveryCollectorError::Scope)
-    );
-
     assert!(collection_scope_with(&config, "config_1", 16, 2_500, 1).is_err());
     assert!(collection_scope_with(&config, "config_1", 17, 31_001, 1).is_err());
     Ok(())
@@ -378,5 +409,306 @@ fn owner_routes_must_match_account_symbol_and_both_native_id_namespaces() -> Tes
         BinanceFreshRecoveryCollector::begin(scope, vec![wrong]),
         Err(BinanceRecoveryCollectorError::OwnerRoute)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn real_signed_http_establishes_private_sealed_read_only_session() -> TestResult {
+    let (config, rules) = config_and_rules()?;
+    let started_at_ms = unix_ms()?;
+    let cursor = RecentFillsCursor {
+        observed_through_ms: started_at_ms - 1,
+        last_trade_id: None,
+        last_event_time_ms: None,
+    };
+    let scope = BinanceRecoveryCollectionScope::verified(
+        &config,
+        BinanceRecoveryScopeInput {
+            config_digest: "config_authenticated".to_owned(),
+            config_epoch: 5,
+            recovered_private_generation: 16,
+            private_generation: 17,
+            attempt_id: 11,
+            started_at_ms,
+            deadline_at_ms: started_at_ms + 5_000,
+            maximum_total_bytes: 8 * 1024 * 1024,
+            maximum_total_pages: 100,
+            authority_roots: None,
+            symbol_universe: BTreeSet::from([config.gateway_binding().symbol.clone()]),
+        },
+    )?;
+    let endpoint = fake_signed_reads(vec![
+        ACCOUNT,
+        ACCOUNT_CONFIG,
+        POSITION_MODE,
+        POSITIONS,
+        REGULAR,
+        ALGO,
+        b"[]",
+    ])
+    .await?;
+    let transport = BinanceHttpTransport::with_endpoint(
+        config.clone(),
+        7,
+        17,
+        endpoint,
+        BinanceTransportLimits::new(Duration::from_secs(1), 1024 * 1024)?,
+    )?;
+    let credentials = BinanceCredentials::from_values("key", "secret")?;
+    let candidate = BinanceFreshRecoveryCollector::collect_authenticated_fixture(
+        scope,
+        &credentials,
+        vec![(&transport, rules, cursor, started_at_ms)],
+        Vec::new(),
+    )
+    .await?;
+
+    assert_eq!(candidate.faces().len(), 6);
+    assert!(
+        candidate.projections()[0]
+            .order_custody()
+            .iter()
+            .all(|custody| matches!(custody, BinanceRecoveryOrderCustody::Unknown { .. }))
+    );
+    assert!(
+        candidate
+            .request_universe_sha256()
+            .iter()
+            .any(|byte| *byte != 0)
+    );
+    assert!(crate::capabilities().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn production_source_rejects_non_fixed_endpoint_before_authentication() -> TestResult {
+    let (config, rules) = config_and_rules()?;
+    let endpoint = fake_signed_reads(Vec::new()).await?;
+    let transport = BinanceHttpTransport::with_endpoint(
+        config,
+        7,
+        17,
+        endpoint,
+        BinanceTransportLimits::new(Duration::from_secs(1), 1024)?,
+    )?;
+    let cursor = RecentFillsCursor {
+        observed_through_ms: 1,
+        last_trade_id: None,
+        last_event_time_ms: None,
+    };
+    assert!(matches!(
+        BinanceRecoverySymbolSource::verified(&transport, rules, cursor, 2),
+        Err(BinanceRecoveryCollectorError::TransportEndpoint)
+    ));
+    Ok(())
+}
+
+#[test]
+fn production_scope_rejects_caller_constructed_authority_roots() -> TestResult {
+    let (config, _) = config_and_rules()?;
+    let input = BinanceRecoveryScopeInput {
+        config_digest: "config_untrusted_roots".to_owned(),
+        config_epoch: 5,
+        recovered_private_generation: 16,
+        private_generation: 17,
+        attempt_id: 11,
+        started_at_ms: 1_000,
+        deadline_at_ms: 2_000,
+        maximum_total_bytes: 1024,
+        maximum_total_pages: 10,
+        authority_roots: Some(authority_roots(1)?),
+        symbol_universe: BTreeSet::from([config.gateway_binding().symbol.clone()]),
+    };
+    assert_eq!(
+        BinanceRecoveryCollectionScope::verified(&config, input),
+        Err(BinanceRecoveryCollectorError::AuthorityRoot)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_success_status_must_parse_before_session_is_sealed() -> TestResult {
+    let (config, rules) = config_and_rules()?;
+    let started_at_ms = unix_ms()?;
+    let cursor = RecentFillsCursor {
+        observed_through_ms: started_at_ms - 1,
+        last_trade_id: None,
+        last_event_time_ms: None,
+    };
+    let scope = production_scope(
+        &config,
+        started_at_ms,
+        100,
+        BTreeSet::from([config.gateway_binding().symbol.clone()]),
+    )?;
+    let endpoint = fake_signed_reads(vec![b"{}"]).await?;
+    let transport = BinanceHttpTransport::with_endpoint(
+        config,
+        7,
+        17,
+        endpoint,
+        BinanceTransportLimits::new(Duration::from_secs(1), 1024)?,
+    )?;
+    let credentials = BinanceCredentials::from_values("key", "secret")?;
+    assert!(matches!(
+        BinanceFreshRecoveryCollector::collect_authenticated_fixture(
+            scope,
+            &credentials,
+            vec![(&transport, rules, cursor, started_at_ms)],
+            Vec::new(),
+        )
+        .await,
+        Err(BinanceRecoveryCollectorError::Authentication)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn global_page_budget_is_checked_before_the_next_http_get() -> TestResult {
+    let (config, rules) = config_and_rules()?;
+    let started_at_ms = unix_ms()?;
+    let cursor = RecentFillsCursor {
+        observed_through_ms: started_at_ms - 1,
+        last_trade_id: None,
+        last_event_time_ms: None,
+    };
+    let scope = production_scope(
+        &config,
+        started_at_ms,
+        1,
+        BTreeSet::from([config.gateway_binding().symbol.clone()]),
+    )?;
+    let (endpoint, count) = fake_signed_reads_counted(vec![ACCOUNT]).await?;
+    let transport = BinanceHttpTransport::with_endpoint(
+        config,
+        7,
+        17,
+        endpoint,
+        BinanceTransportLimits::new(Duration::from_secs(1), 1024 * 1024)?,
+    )?;
+    let credentials = BinanceCredentials::from_values("key", "secret")?;
+    assert!(matches!(
+        BinanceFreshRecoveryCollector::collect_authenticated_fixture(
+            scope,
+            &credentials,
+            vec![(&transport, rules, cursor, started_at_ms)],
+            Vec::new(),
+        )
+        .await,
+        Err(BinanceRecoveryCollectorError::PageLimit)
+    ));
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn exhausted_page_budget_prevents_the_next_symbol_authentication_get() -> TestResult {
+    let (btc_config, btc_rules) = config_and_rules()?;
+    let eth_symbol: Symbol = "ETH/USDT".parse()?;
+    let eth_binding = GatewayBinding::new(
+        VenueId::Binance,
+        GatewayMode::Test,
+        ACCOUNT_ID,
+        eth_symbol.clone(),
+    )?;
+    let eth_config =
+        BinanceConfig::for_binding(BinanceAccountBinding::PortfolioMarginUm, &eth_binding)?;
+    let eth_exchange_info = EXCHANGE_INFO
+        .replace("BTCUSDT", "ETHUSDT")
+        .replace("\"BTC\"", "\"ETH\"");
+    let eth_rules = parse_instrument_rules(&eth_exchange_info, eth_symbol.clone(), 7)?;
+    let started_at_ms = unix_ms()?;
+    let cursor = RecentFillsCursor {
+        observed_through_ms: started_at_ms - 1,
+        last_trade_id: None,
+        last_event_time_ms: None,
+    };
+    let scope = production_scope(
+        &btc_config,
+        started_at_ms,
+        7,
+        BTreeSet::from([btc_config.gateway_binding().symbol.clone(), eth_symbol]),
+    )?;
+    let (btc_endpoint, btc_count) = fake_signed_reads_counted(vec![
+        ACCOUNT,
+        ACCOUNT_CONFIG,
+        POSITION_MODE,
+        POSITIONS,
+        REGULAR,
+        ALGO,
+        b"[]",
+    ])
+    .await?;
+    let btc_transport = BinanceHttpTransport::with_endpoint(
+        btc_config,
+        7,
+        17,
+        btc_endpoint,
+        BinanceTransportLimits::new(Duration::from_secs(1), 1024 * 1024)?,
+    )?;
+    let (eth_endpoint, eth_count) = fake_signed_reads_counted(Vec::new()).await?;
+    let eth_transport = BinanceHttpTransport::with_endpoint(
+        eth_config,
+        7,
+        17,
+        eth_endpoint,
+        BinanceTransportLimits::new(Duration::from_secs(1), 1024 * 1024)?,
+    )?;
+    let credentials = BinanceCredentials::from_values("key", "secret")?;
+
+    assert!(matches!(
+        BinanceFreshRecoveryCollector::collect_authenticated_fixture(
+            scope,
+            &credentials,
+            vec![
+                (&btc_transport, btc_rules, cursor, started_at_ms),
+                (&eth_transport, eth_rules, cursor, started_at_ms),
+            ],
+            Vec::new(),
+        )
+        .await,
+        Err(BinanceRecoveryCollectorError::PageLimit)
+    ));
+    assert_eq!(btc_count.load(Ordering::SeqCst), 7);
+    assert_eq!(eth_count.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn complete_multi_symbol_universe_is_required_before_any_http_get() -> TestResult {
+    let (config, rules) = config_and_rules()?;
+    let started_at_ms = unix_ms()?;
+    let cursor = RecentFillsCursor {
+        observed_through_ms: started_at_ms - 1,
+        last_trade_id: None,
+        last_event_time_ms: None,
+    };
+    let eth: Symbol = "ETH/USDT".parse()?;
+    let scope = production_scope(
+        &config,
+        started_at_ms,
+        100,
+        BTreeSet::from([config.gateway_binding().symbol.clone(), eth]),
+    )?;
+    let (endpoint, count) = fake_signed_reads_counted(Vec::new()).await?;
+    let transport = BinanceHttpTransport::with_endpoint(
+        config,
+        7,
+        17,
+        endpoint,
+        BinanceTransportLimits::new(Duration::from_secs(1), 1024)?,
+    )?;
+    let credentials = BinanceCredentials::from_values("key", "secret")?;
+    assert!(matches!(
+        BinanceFreshRecoveryCollector::collect_authenticated_fixture(
+            scope,
+            &credentials,
+            vec![(&transport, rules, cursor, started_at_ms)],
+            Vec::new(),
+        )
+        .await,
+        Err(BinanceRecoveryCollectorError::RequestUniverse)
+    ));
+    assert_eq!(count.load(Ordering::SeqCst), 0);
     Ok(())
 }

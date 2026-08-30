@@ -14,6 +14,7 @@ mod private;
 mod private_surface;
 mod public;
 mod recovery;
+mod recovery_session;
 mod risk;
 mod sign;
 mod transport;
@@ -51,6 +52,8 @@ pub use recovery::{
     GateRecoverySurfaceCommitment, GateRecoverySymbolReadback, GateRecoverySymbolScope,
     GateUnknownOpenOrder, GateUnknownOpenOrderReason,
 };
+pub use recovery_session::GateAuthenticatedRecoverySession;
+pub(crate) use recovery_session::GateAuthenticatedRecoverySessionLease;
 pub use risk::{
     GateContractRules, GateRiskAccountMode, GateRiskError, GateRiskReadback, decimal,
     decimal_value, dual_position_side, object, parse_dual_position_mode, parse_risk_snapshots,

@@ -1,4 +1,6 @@
+use secrecy::ExposeSecret;
 use secrecy::SecretString;
+use sha2::{Digest, Sha256};
 
 use crate::GateProtocolError;
 
@@ -29,5 +31,38 @@ impl GateCredentials {
             api_key: SecretString::from(api_key),
             api_secret: SecretString::from(api_secret),
         })
+    }
+
+    pub(crate) fn identity_commitment(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"venue-gate-credential-identity-v2");
+        for value in [
+            self.api_key.expose_secret().as_bytes(),
+            self.api_secret.expose_secret().as_bytes(),
+        ] {
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value);
+        }
+        digest.finalize().into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GateCredentials;
+
+    #[test]
+    fn credential_commitment_binds_key_and_secret_without_exposing_either()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let baseline = GateCredentials::from_values("key", "secret")?.identity_commitment();
+        assert_ne!(
+            baseline,
+            GateCredentials::from_values("other", "secret")?.identity_commitment()
+        );
+        assert_ne!(
+            baseline,
+            GateCredentials::from_values("key", "other")?.identity_commitment()
+        );
+        Ok(())
     }
 }

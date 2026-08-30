@@ -1,4 +1,5 @@
 use secrecy::{ExposeSecret, SecretString};
+use sha2::{Digest, Sha256};
 
 use crate::BitgetError;
 
@@ -52,6 +53,20 @@ impl BitgetCredentials {
             api_secret,
             passphrase,
         })
+    }
+
+    pub(crate) fn identity_commitment(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"venue-bitget-credential-identity-v1");
+        for value in [
+            self.api_key.expose_secret(),
+            self.api_secret.expose_secret(),
+            self.passphrase.expose_secret(),
+        ] {
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        digest.finalize().into()
     }
 }
 
