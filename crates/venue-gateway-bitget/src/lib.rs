@@ -10,6 +10,7 @@ mod order_families;
 pub mod private;
 mod private_ws;
 pub mod public;
+mod recovery;
 pub mod risk;
 mod sign;
 mod transport;
@@ -23,6 +24,7 @@ pub use execution::*;
 pub use node_bridge::*;
 pub use order_families::*;
 pub use private_ws::*;
+pub use recovery::*;
 pub use sign::{SignInput, SignedHeaders, prehash, sign, ws_sign};
 pub use transport::*;
 
