@@ -1,9 +1,8 @@
 use std::{future::Future, time::Duration};
 
-use venue_gateway_api::{
-    CapabilityFlags, CapabilitySnapshot, GatewayBinding, HostAdmissionEvidence,
-    HostAdmittedCapability,
-};
+use venue_gateway_api::{CapabilityFlags, CapabilitySnapshot, GatewayBinding};
+#[cfg(test)]
+use venue_gateway_api::{HostAdmissionEvidence, HostAdmittedCapability};
 
 use crate::{
     DispatchPermit, GatewayDispatchResult, GatewayRecoveryPermit, PhysicalGateway,
@@ -39,6 +38,8 @@ pub trait AsyncPhysicalGateway {
 
     fn verify_signed_readback(&self, receipt: &SignedReadbackReceipt) -> Result<(), Self::Error>;
 
+    /// Positive mutation wiring is a test fixture until the upstream authority is unforgeable.
+    #[cfg(test)]
     fn dispatch(
         &mut self,
         admitted_capability: HostAdmittedCapability,
@@ -55,6 +56,10 @@ pub trait TokioRuntimeDriver {
     /// reconstructed by this driver.
     fn run<F: Future + Send>(&mut self, timeout: Duration, future: F)
     -> TokioRuntimeRun<F::Output>;
+
+    /// Injected boundary clock used immediately before a test-only async mutation leaves the host.
+    #[cfg(test)]
+    fn execution_now_ms(&self) -> u64;
 }
 
 #[derive(Debug)]
@@ -156,8 +161,11 @@ impl<G: AsyncPhysicalGateway, R: TokioRuntimeDriver> TokioPhysicalGateway<G, R> 
         }
     }
 
+    #[cfg(test)]
     fn dispatch_linear(&mut self, permit: DispatchPermit) -> GatewayDispatchResult {
-        let Ok((admitted_capability, admission_evidence, permit)) = permit.into_async_parts()
+        let execution_now_ms = self.runtime.execution_now_ms();
+        let Ok((admitted_capability, admission_evidence, permit)) =
+            permit.into_async_parts(execution_now_ms)
         else {
             return GatewayDispatchResult::Rejected {
                 reason_code: "host_admission_invalid".to_owned(),
@@ -174,6 +182,14 @@ impl<G: AsyncPhysicalGateway, R: TokioRuntimeDriver> TokioPhysicalGateway<G, R> 
             | TokioRuntimeRun::Completed(Err(AsyncGatewayCallError::Failed(_))) => {
                 GatewayDispatchResult::Unknown
             }
+        }
+    }
+
+    #[cfg(not(test))]
+    fn dispatch_linear(&mut self, _permit: DispatchPermit) -> GatewayDispatchResult {
+        // Public promotion inputs cannot prove production authority, so no future is constructed.
+        GatewayDispatchResult::Rejected {
+            reason_code: "host_admission_unavailable".to_owned(),
         }
     }
 }
