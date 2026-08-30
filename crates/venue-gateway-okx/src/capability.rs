@@ -28,6 +28,10 @@ use crate::{
 };
 
 pub const OKX_CAPABILITY_PROBE_SCHEMA_VERSION: u16 = 1;
+/// Stable label for schema-1 probe files. They are legacy, caller-assembled capability evidence;
+/// they are not fresh recovery collection and never authorize startup or mutation.
+pub const OKX_LEGACY_CAPABILITY_PROBE_EVIDENCE_CLASS: &str =
+    "legacy_non_authoritative_capability_probe";
 const MAX_PERSISTED_PROBE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -989,6 +993,25 @@ mod tests {
     }
 
     #[test]
+    fn legacy_probe_cannot_create_a_production_physical_candidate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (config, instrument, evidence) = fixture(GatewayMode::Test)?;
+        let (persisted, directory) = persist_fixture("legacy-physical.json", &evidence)?;
+        assert!(matches!(
+            crate::OkxPhysicalCandidate::from_probe(
+                config,
+                instrument,
+                &persisted,
+                BASE_MS + 1_000
+            ),
+            Err(crate::OkxPhysicalError::LegacyProbeUnavailable)
+        ));
+        assert_eq!(crate::capabilities(), CapabilityFlags::empty());
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
     fn net_mode_is_complete_read_side_only_and_cannot_authorize_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
         let (config, instrument, mut evidence) = fixture(GatewayMode::Test)?;
@@ -1077,7 +1100,7 @@ mod tests {
             position_page.payload = serde_json::to_vec(&positions)?;
             position_page.payload_sha256 = crate::readback::payload_digest(&position_page.payload);
             let (persisted, directory) = persist_fixture("physical.json", &evidence)?;
-            let candidate = crate::OkxPhysicalCandidate::from_probe(
+            let candidate = crate::OkxPhysicalCandidate::from_probe_fixture(
                 config.clone(),
                 instrument.clone(),
                 &persisted,
@@ -1160,7 +1183,7 @@ mod tests {
         for disconnect_first in [false, true] {
             let (config, instrument, evidence) = fixture(GatewayMode::Test)?;
             let (persisted, directory) = persist_fixture("dispatch.json", &evidence)?;
-            let candidate = crate::OkxPhysicalCandidate::from_probe(
+            let candidate = crate::OkxPhysicalCandidate::from_probe_fixture(
                 config,
                 instrument,
                 &persisted,

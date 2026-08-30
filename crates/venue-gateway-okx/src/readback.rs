@@ -46,7 +46,7 @@ pub enum OkxAlgoOrderKind {
 }
 
 impl OkxAlgoOrderKind {
-    const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::ConditionalOco,
         Self::Trigger,
         Self::MoveOrderStop,

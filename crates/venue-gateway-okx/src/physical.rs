@@ -1,17 +1,23 @@
+#[cfg(test)]
 use std::time::Duration;
 
-use venue_domain::domain::{CancelCommand, ExecutionCommand, OrderState, PositionSide};
+use venue_domain::domain::OrderState;
+#[cfg(test)]
+use venue_domain::domain::{CancelCommand, ExecutionCommand, PositionSide};
 use venue_gateway_api::{CapabilitySnapshot, GatewayBinding, MutationCapability};
 
 use crate::{
     OkxAcceptedOrder, OkxCancelOnceOutcome, OkxCancelRequest, OkxCapabilityCandidate, OkxConfig,
     OkxCredentials, OkxError, OkxHttpResponse, OkxHttpTransport, OkxInstrument, OkxOrderReadback,
-    OkxOrderReadbackRequest, OkxPlaceIntent, OkxPlaceOnceOutcome, OkxPlaceRequest,
-    OkxTransportError, OkxUnknownCancelReadbackRequest, OkxUnknownCancelResolution,
-    OkxUnknownOrderReadback, OkxUnknownOrderReadbackRequest, PersistedOkxCapabilityProbe,
-    build_cancel_order_readback_request, build_cancel_request, build_order_readback_request,
-    build_place_request, parse_order_detail, parse_unknown_cancel_readback,
-    parse_unknown_order_readback, validate_capability_candidate,
+    OkxOrderReadbackRequest, OkxPlaceOnceOutcome, OkxPlaceRequest, OkxTransportError,
+    OkxUnknownCancelReadbackRequest, OkxUnknownCancelResolution, OkxUnknownOrderReadback,
+    OkxUnknownOrderReadbackRequest, PersistedOkxCapabilityProbe,
+    build_cancel_order_readback_request, build_order_readback_request, parse_order_detail,
+    parse_unknown_cancel_readback, parse_unknown_order_readback,
+};
+#[cfg(test)]
+use crate::{
+    OkxPlaceIntent, build_cancel_request, build_place_request, validate_capability_candidate,
 };
 
 /// Secret-free, non-authoritative bridge from durable probe evidence to the physical adapter.
@@ -24,7 +30,21 @@ pub struct OkxPhysicalCandidate {
 }
 
 impl OkxPhysicalCandidate {
+    /// Legacy schema-1 probe evidence is caller-assembled and cannot establish authenticated
+    /// recovery scope, durable roots, or a writer/Canary chain. Production conversion is always
+    /// unavailable.
     pub fn from_probe(
+        config: OkxConfig,
+        instrument: OkxInstrument,
+        persisted: &PersistedOkxCapabilityProbe,
+        now_ms: u64,
+    ) -> Result<Self, OkxPhysicalError> {
+        let _ = (config, instrument, persisted, now_ms);
+        Err(OkxPhysicalError::LegacyProbeUnavailable)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_probe_fixture(
         config: OkxConfig,
         instrument: OkxInstrument,
         persisted: &PersistedOkxCapabilityProbe,
@@ -78,7 +98,8 @@ impl OkxPhysicalCandidate {
         &self.probe.readback
     }
 
-    pub fn prepare_place_once(
+    #[cfg(test)]
+    pub(crate) fn prepare_place_once(
         &self,
         command: &ExecutionCommand,
         now_ms: u64,
@@ -146,7 +167,8 @@ impl OkxPhysicalCandidate {
         })
     }
 
-    pub fn prepare_cancel_once(
+    #[cfg(test)]
+    pub(crate) fn prepare_cancel_once(
         &self,
         command: &CancelCommand,
         accepted_order: &OkxAcceptedOrder,
@@ -170,21 +192,6 @@ impl OkxPhysicalCandidate {
                 request: Box::new(request),
                 accepted_order: Box::new(accepted_order.clone()),
             },
-        })
-    }
-
-    pub fn into_session(
-        self,
-        credentials: OkxCredentials,
-        operation_timeout: Duration,
-        max_body_bytes: usize,
-    ) -> Result<OkxPhysicalSession, OkxPhysicalError> {
-        let transport =
-            OkxHttpTransport::new(self.config.clone(), operation_timeout, max_body_bytes)?;
-        Ok(OkxPhysicalSession {
-            candidate: self,
-            credentials,
-            transport,
         })
     }
 
@@ -403,6 +410,7 @@ impl OkxOneShotMutation {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 enum OkxPhysicalRequest {
     Place {
         request: Box<OkxPlaceRequest>,
@@ -531,6 +539,8 @@ const fn terminal(state: OrderState) -> bool {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum OkxPhysicalError {
+    #[error("legacy OKX capability probes cannot create a production physical session")]
+    LegacyProbeUnavailable,
     #[error("OKX physical capability probe is invalid, incomplete, or stale")]
     Capability,
     #[error("OKX physical binding, mode, or generation does not match")]
