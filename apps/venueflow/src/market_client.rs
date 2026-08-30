@@ -41,7 +41,8 @@ mod native {
     const REST_KLINES_ENDPOINT: &str = "https://fapi.binance.com/fapi/v1/klines";
     const EXCHANGE_INFO_ENDPOINT: &str = "https://fapi.binance.com/fapi/v1/exchangeInfo";
     const TICKER_24H_ENDPOINT: &str = "https://fapi.binance.com/fapi/v1/ticker/24hr";
-    const COMBINED_STREAM_ENDPOINT: &str = "wss://fstream.binance.com/stream";
+    const MARKET_STREAM_ENDPOINT: &str = "wss://fstream.binance.com/market/stream";
+    const PUBLIC_STREAM_ENDPOINT: &str = "wss://fstream.binance.com/public/stream";
     const CONNECT_BUDGET: Duration = Duration::from_secs(10);
     const HTTP_BODY_LIMIT: usize = 1024 * 1024;
     const CATALOG_BODY_LIMIT: usize = 4 * 1024 * 1024;
@@ -430,26 +431,23 @@ mod native {
             {
                 return worker_failure(event_tx, error);
             }
-            let url = combined_stream_url(&selections);
-            let websocket_config = WebSocketConfig::default()
-                .max_message_size(Some(WS_FRAME_LIMIT))
-                .max_frame_size(Some(WS_FRAME_LIMIT));
-            let connection = tokio::select! {
+            let (market_url, public_url) = combined_stream_urls(&selections);
+            let public_connection = tokio::select! {
                 command = commands.recv() => return command,
                 result = timeout(CONNECT_BUDGET, connect_public_websocket(
-                    &url,
-                    websocket_config,
+                    &public_url,
+                    websocket_config(),
                     proxy,
                 )) => result,
             };
-            let mut websocket = match connection {
+            let mut public_websocket = match public_connection {
                 Ok(Ok(websocket)) => websocket,
                 Ok(Err(error)) => {
                     if let Some(command) = retry_after_error(
                         generation,
                         &selections,
                         attempt,
-                        format!("websocket connect failed: {error}"),
+                        format!("public websocket connect failed: {error}"),
                         commands,
                         &mut emitter,
                     )
@@ -465,7 +463,50 @@ mod native {
                         generation,
                         &selections,
                         attempt,
-                        "websocket connect timed out".to_owned(),
+                        "public websocket connect timed out".to_owned(),
+                        commands,
+                        &mut emitter,
+                    )
+                    .await
+                    {
+                        return Some(command);
+                    }
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+            };
+            let market_connection = tokio::select! {
+                command = commands.recv() => return command,
+                result = timeout(CONNECT_BUDGET, connect_public_websocket(
+                    &market_url,
+                    websocket_config(),
+                    proxy,
+                )) => result,
+            };
+            let mut market_websocket = match market_connection {
+                Ok(Ok(websocket)) => websocket,
+                Ok(Err(error)) => {
+                    if let Some(command) = retry_after_error(
+                        generation,
+                        &selections,
+                        attempt,
+                        format!("market websocket connect failed: {error}"),
+                        commands,
+                        &mut emitter,
+                    )
+                    .await
+                    {
+                        return Some(command);
+                    }
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+                Err(_) => {
+                    if let Some(command) = retry_after_error(
+                        generation,
+                        &selections,
+                        attempt,
+                        "market websocket connect timed out".to_owned(),
                         commands,
                         &mut emitter,
                     )
@@ -485,24 +526,31 @@ mod native {
             attempt = 0;
             let mut heartbeat = tokio::time::interval(PING_INTERVAL);
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            let mut last_pong = Instant::now();
+            let mut last_public_pong = Instant::now();
+            let mut last_market_pong = Instant::now();
             let session_error = loop {
                 tokio::select! {
                     command = commands.recv() => return command,
                     _ = heartbeat.tick() => {
-                        if last_pong.elapsed() > PONG_DEADLINE {
-                            break "websocket pong deadline exceeded".to_owned();
+                        if last_public_pong.elapsed() > PONG_DEADLINE {
+                            break "public websocket pong deadline exceeded".to_owned();
                         }
-                        if let Err(error) = websocket.send(Message::Ping(Vec::new().into())).await {
-                            break format!("websocket ping failed: {error}");
+                        if last_market_pong.elapsed() > PONG_DEADLINE {
+                            break "market websocket pong deadline exceeded".to_owned();
+                        }
+                        if let Err(error) = public_websocket.send(Message::Ping(Vec::new().into())).await {
+                            break format!("public websocket ping failed: {error}");
+                        }
+                        if let Err(error) = market_websocket.send(Message::Ping(Vec::new().into())).await {
+                            break format!("market websocket ping failed: {error}");
                         }
                     }
-                    frame = websocket.next() => {
+                    frame = public_websocket.next() => {
                         match frame {
                             Some(Ok(Message::Text(payload))) => {
                                 let received_ms = now_ms();
                                 if payload.len() > WS_FRAME_LIMIT {
-                                    break "websocket text frame exceeded 1 MiB".to_owned();
+                                    break "public websocket text frame exceeded 1 MiB".to_owned();
                                 }
                                 if let Err(error) = dispatch_payload(
                                     payload.as_ref(),
@@ -516,18 +564,51 @@ mod native {
                                 }
                             }
                             Some(Ok(Message::Ping(payload))) => {
-                                if let Err(error) = websocket.send(Message::Pong(payload)).await {
-                                    break format!("websocket pong failed: {error}");
+                                if let Err(error) = public_websocket.send(Message::Pong(payload)).await {
+                                    break format!("public websocket pong failed: {error}");
                                 }
                             }
-                            Some(Ok(Message::Pong(_))) => last_pong = Instant::now(),
-                            Some(Ok(Message::Close(_))) => break "websocket closed".to_owned(),
+                            Some(Ok(Message::Pong(_))) => last_public_pong = Instant::now(),
+                            Some(Ok(Message::Close(_))) => break "public websocket closed".to_owned(),
                             Some(Ok(Message::Binary(_))) => {
-                                break "unexpected websocket binary frame".to_owned();
+                                break "unexpected public websocket binary frame".to_owned();
                             }
                             Some(Ok(Message::Frame(_))) => {}
-                            Some(Err(error)) => break format!("websocket receive failed: {error}"),
-                            None => break "websocket stream ended".to_owned(),
+                            Some(Err(error)) => break format!("public websocket receive failed: {error}"),
+                            None => break "public websocket stream ended".to_owned(),
+                        }
+                    }
+                    frame = market_websocket.next() => {
+                        match frame {
+                            Some(Ok(Message::Text(payload))) => {
+                                let received_ms = now_ms();
+                                if payload.len() > WS_FRAME_LIMIT {
+                                    break "market websocket text frame exceeded 1 MiB".to_owned();
+                                }
+                                if let Err(error) = dispatch_payload(
+                                    payload.as_ref(),
+                                    generation,
+                                    &selections,
+                                    catalog,
+                                    received_ms,
+                                    &mut emitter,
+                                ) {
+                                    break error;
+                                }
+                            }
+                            Some(Ok(Message::Ping(payload))) => {
+                                if let Err(error) = market_websocket.send(Message::Pong(payload)).await {
+                                    break format!("market websocket pong failed: {error}");
+                                }
+                            }
+                            Some(Ok(Message::Pong(_))) => last_market_pong = Instant::now(),
+                            Some(Ok(Message::Close(_))) => break "market websocket closed".to_owned(),
+                            Some(Ok(Message::Binary(_))) => {
+                                break "unexpected market websocket binary frame".to_owned();
+                            }
+                            Some(Ok(Message::Frame(_))) => {}
+                            Some(Err(error)) => break format!("market websocket receive failed: {error}"),
+                            None => break "market websocket stream ended".to_owned(),
                         }
                     }
                 }
@@ -549,6 +630,12 @@ mod native {
     }
 
     type PublicWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    fn websocket_config() -> WebSocketConfig {
+        WebSocketConfig::default()
+            .max_message_size(Some(WS_FRAME_LIMIT))
+            .max_frame_size(Some(WS_FRAME_LIMIT))
+    }
 
     async fn connect_public_websocket(
         url: &str,
@@ -1027,22 +1114,38 @@ mod native {
         ))
     }
 
-    fn combined_stream_url(selections: &[MarketSelection]) -> String {
-        let mut streams = vec!["!ticker@arr".to_owned()];
+    fn combined_stream_urls(selections: &[MarketSelection]) -> (String, String) {
+        let mut market_streams = vec!["!ticker@arr".to_owned()];
+        let mut public_streams = Vec::new();
         for selection in selections {
             let symbol = native_symbol(&selection.binding.symbol).to_ascii_lowercase();
             for stream in [
                 format!("{symbol}@kline_{}", selection.interval.label()),
-                format!("{symbol}@bookTicker"),
                 format!("{symbol}@aggTrade"),
+            ] {
+                if !market_streams.contains(&stream) {
+                    market_streams.push(stream);
+                }
+            }
+            for stream in [
+                format!("{symbol}@bookTicker"),
                 format!("{symbol}@depth20@100ms"),
             ] {
-                if !streams.contains(&stream) {
-                    streams.push(stream);
+                if !public_streams.contains(&stream) {
+                    public_streams.push(stream);
                 }
             }
         }
-        format!("{COMBINED_STREAM_ENDPOINT}?streams={}", streams.join("/"))
+        (
+            format!(
+                "{MARKET_STREAM_ENDPOINT}?streams={}",
+                market_streams.join("/")
+            ),
+            format!(
+                "{PUBLIC_STREAM_ENDPOINT}?streams={}",
+                public_streams.join("/")
+            ),
+        )
     }
 
     const fn binance_interval(interval: ChartInterval) -> BinanceKlineInterval {
@@ -1185,15 +1288,16 @@ mod native {
         }
 
         #[test]
-        fn builds_one_combined_stream_for_all_facts() -> Result<(), String> {
+        fn separates_market_and_public_stream_paths() -> Result<(), String> {
             let selection = selection("ETH/USDT", ChartInterval::OneHour)?;
+            let (market, public) = combined_stream_urls(&[selection]);
             assert_eq!(
-                combined_stream_url(&[selection]),
-                concat!(
-                    "wss://fstream.binance.com/stream?streams=",
-                    "!ticker@arr/ethusdt@kline_1h/ethusdt@bookTicker/",
-                    "ethusdt@aggTrade/ethusdt@depth20@100ms"
-                )
+                market,
+                "wss://fstream.binance.com/market/stream?streams=!ticker@arr/ethusdt@kline_1h/ethusdt@aggTrade"
+            );
+            assert_eq!(
+                public,
+                "wss://fstream.binance.com/public/stream?streams=ethusdt@bookTicker/ethusdt@depth20@100ms"
             );
             Ok(())
         }
@@ -1202,11 +1306,11 @@ mod native {
         fn combined_stream_deduplicates_shared_symbol_facts() -> Result<(), String> {
             let one_minute = selection("BTC/USDT", ChartInterval::OneMinute)?;
             let five_minutes = selection("BTC/USDT", ChartInterval::FiveMinutes)?;
-            let url = combined_stream_url(&[one_minute, five_minutes]);
-            assert_eq!(url.matches("btcusdt@bookTicker").count(), 1);
-            assert_eq!(url.matches("btcusdt@aggTrade").count(), 1);
-            assert_eq!(url.matches("btcusdt@depth20@100ms").count(), 1);
-            assert_eq!(url.matches("btcusdt@kline_").count(), 2);
+            let (market, public) = combined_stream_urls(&[one_minute, five_minutes]);
+            assert_eq!(public.matches("btcusdt@bookTicker").count(), 1);
+            assert_eq!(market.matches("btcusdt@aggTrade").count(), 1);
+            assert_eq!(public.matches("btcusdt@depth20@100ms").count(), 1);
+            assert_eq!(market.matches("btcusdt@kline_").count(), 2);
             Ok(())
         }
 
