@@ -66,6 +66,8 @@ pub struct Preferences {
     pub endpoint: String,
     pub selected_symbol: String,
     pub selected_instance: Option<String>,
+    /// Selection is a view preference only. Relation configuration always remains in Control.
+    pub selected_copy_relation: Option<String>,
     pub ui_scale: f32,
     pub show_status_bar: bool,
     pub language: Language,
@@ -79,6 +81,7 @@ impl Default for Preferences {
             endpoint: String::new(),
             selected_symbol: "BTC/USDC".to_owned(),
             selected_instance: None,
+            selected_copy_relation: None,
             ui_scale: 1.0,
             show_status_bar: true,
             language: default_language(),
@@ -404,10 +407,27 @@ impl AppModel {
         }
     }
 
+    pub fn select_copy_relation(
+        &mut self,
+        leader_id: &str,
+        follower_instance_id: &str,
+        symbol: &str,
+    ) {
+        self.preferences.selected_copy_relation =
+            Some(copy_relation_key(leader_id, follower_instance_id, symbol));
+        self.preferences.selected_instance = Some(follower_instance_id.to_owned());
+        self.preferences.selected_symbol = symbol.to_owned();
+    }
+
     pub fn notice(&mut self, message: impl Into<String>) {
         self.notices.push_front(message.into());
         self.notices.truncate(MAX_NOTICES);
     }
+}
+
+/// A display-only stable selection key. It is never sent to Control or an exchange.
+pub fn copy_relation_key(leader_id: &str, follower_instance_id: &str, symbol: &str) -> String {
+    format!("{leader_id}\u{1f}{follower_instance_id}\u{1f}{symbol}")
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -456,8 +476,8 @@ mod tests {
     };
 
     use super::{
-        AppModel, DEFAULT_FAVORITE_SYMBOLS, PendingConfirmation, Preferences, freshness_age_ms,
-        requires_operator_confirmation,
+        AppModel, DEFAULT_FAVORITE_SYMBOLS, PendingConfirmation, Preferences, copy_relation_key,
+        freshness_age_ms, requires_operator_confirmation,
     };
 
     #[test]
@@ -538,6 +558,22 @@ mod tests {
         model.stream_unavailable("stream lost".to_owned());
         assert_eq!(model.connection, ConnectionState::Degraded);
         assert_eq!(model.last_event_id, Some(7));
+    }
+
+    #[test]
+    fn selecting_a_copy_relation_updates_only_local_view_selection() {
+        let mut model = AppModel::new(Preferences::default());
+        model.select_copy_relation("leader-1", "copy-btc", "BTC/USDT");
+
+        assert_eq!(
+            model.preferences.selected_copy_relation,
+            Some(copy_relation_key("leader-1", "copy-btc", "BTC/USDT"))
+        );
+        assert_eq!(
+            model.preferences.selected_instance.as_deref(),
+            Some("copy-btc")
+        );
+        assert_eq!(model.preferences.selected_symbol, "BTC/USDT");
     }
 
     #[test]

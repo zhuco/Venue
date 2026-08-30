@@ -136,6 +136,17 @@ resources! {
     NoStrategies => "No strategy instances were returned.", "服务端未返回策略实例。";
     CopySubtitle => "target exposure and durable drift", "目标敞口与持久偏差";
     NoCopy => "Waiting for copy projections.", "正在等待跟单投影。";
+    CopyRelationDetails => "Selected relation", "已选跟单关系";
+    CopyRelationBinding => "Exact follower binding", "精确跟单账户绑定";
+    CopyRelationConfiguration => "Copy configuration", "跟单配置";
+    LeaderBindingUnavailable => "Leader account binding is not projected by Control v2.", "Control v2 未投影带单账户绑定。";
+    CopyConfigurationUnavailable => "Capital allocation, multiplier, and risk policy are not projected by Control v2.", "Control v2 未投影资本分配、倍率和风险策略。";
+    CopyEditingUnavailable => "Create and edit are unavailable until Control exposes an authenticated relation configuration endpoint.", "Control 提供经认证的关系配置端点前，不能创建或编辑关系。";
+    LastAppliedJob => "Last applied job", "最近应用任务";
+    NoAppliedJob => "No applied job", "暂无已应用任务";
+    SelectCopyRelation => "Select a relation to inspect its precise follower scope.", "选择一条关系以查看其精确跟单范围。";
+    FollowerInstance => "Follower instance", "跟单实例";
+    RelationStatus => "Relation status", "关系状态";
     Leader => "Leader", "带单账户";
     Follower => "Follower", "跟单账户";
     Target => "Target", "目标";
@@ -147,6 +158,7 @@ resources! {
     Action => "Action", "操作";
     Receipt => "Receipt", "回执";
     Detail => "Detail", "详情";
+    FailureReason => "Failure reason", "失败原因";
     ControlSubtitle => "semantic intents; server revalidation required", "仅提交语义意图；必须由服务端复核";
     NoControl => "No controllable strategy projection is available.", "暂无可控制的策略投影。";
     SelectInstance => "Select instance", "选择实例";
