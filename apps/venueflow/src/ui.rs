@@ -66,18 +66,20 @@ pub fn show_top_bar(
     egui::Frame::new()
         .fill(theme::BG_SECONDARY)
         .stroke(Stroke::new(1.0, theme::DIVIDER))
-        .inner_margin(egui::Margin::symmetric(10, 4))
+        .inner_margin(egui::Margin::symmetric(10, 3))
         .show(ui, |ui| {
             let language = model.preferences.language;
             let connection = model.connection;
             let mut reset_requested = false;
-            let (picker_response, ()) = egui::containers::Sides::new()
+            let picker_requested = std::cell::Cell::new(*show_symbol_picker);
+            let mut symbol_filter = model.symbol_filter.clone();
+            let ((), search_response) = egui::containers::Sides::new()
                 .shrink_left()
-                .height(46.0)
+                .height(48.0)
                 .show(
                     ui,
                     |ui| {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_centered(|ui| {
                             ui.label(
                                 RichText::new("VENUEFLOW")
                                     .strong()
@@ -98,48 +100,16 @@ pub fn show_top_bar(
                             }
                             ui.separator();
                             let selected_symbol = model.preferences.selected_symbol.clone();
-                            let selected_quote = local_quote(model, &selected_symbol);
-                            let selected_details = selected_quote.map_or_else(
-                                || "—  —".to_owned(),
-                                |quote| {
-                                    format!(
-                                        "{} {:+.2}%",
-                                        model.format_market_price(&selected_symbol, quote.last),
-                                        quote.change_percent_24h
-                                    )
-                                },
-                            );
-                            let picker_response = ui.add_sized(
-                                [150.0, 42.0],
-                                egui::Button::new(symbol_tab_text(
-                                    &format!("{}  ▼", selected_symbol),
-                                    &selected_details,
-                                    selected_quote.map_or(theme::TEXT_SECONDARY, |quote| {
-                                        theme::value_color(decimal_to_f64(quote.change_percent_24h))
-                                    }),
-                                )),
-                            );
-                            ui.painter().line_segment(
-                                [
-                                    picker_response.rect.left_top(),
-                                    picker_response.rect.right_top(),
-                                ],
-                                Stroke::new(2.0, theme::BRAND),
-                            );
-                            if picker_response.clicked() {
-                                *show_symbol_picker = !*show_symbol_picker;
-                            }
-                            ui.separator();
                             egui::ScrollArea::horizontal()
                                 .id_salt("favorite-symbol-tabs")
                                 .auto_shrink([false, true])
                                 .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        let favorites = model.preferences.favorite_symbols.clone();
-                                        for symbol in favorites
-                                            .into_iter()
-                                            .filter(|symbol| symbol != &selected_symbol)
-                                        {
+                                    ui.horizontal_centered(|ui| {
+                                        let mut tabs = model.preferences.favorite_symbols.clone();
+                                        if !tabs.contains(&selected_symbol) {
+                                            tabs.push(selected_symbol.clone());
+                                        }
+                                        for symbol in tabs {
                                             let quote = local_quote(model, &symbol);
                                             let details = quote.map_or_else(
                                                 || "—  —".to_owned(),
@@ -161,30 +131,41 @@ pub fn show_top_bar(
                                                         quote.change_percent_24h,
                                                     ))
                                                 });
-                                            if ui
-                                                .add_sized(
-                                                    [150.0, 42.0],
-                                                    egui::Button::selectable(
-                                                        selected,
-                                                        symbol_tab_text(
-                                                            &symbol,
-                                                            &details,
-                                                            detail_color,
-                                                        ),
-                                                    ),
-                                                )
-                                                .clicked()
-                                            {
+                                            let response = ui.add_sized(
+                                                [150.0, 44.0],
+                                                egui::Button::new(symbol_tab_text(
+                                                    &symbol,
+                                                    &details,
+                                                    detail_color,
+                                                ))
+                                                .fill(if selected {
+                                                    theme::PANEL
+                                                } else {
+                                                    theme::BG_SECONDARY
+                                                }),
+                                            );
+                                            if selected {
+                                                ui.painter().line_segment(
+                                                    [
+                                                        response.rect.left_top(),
+                                                        response.rect.right_top(),
+                                                    ],
+                                                    Stroke::new(2.0, theme::BRAND),
+                                                );
+                                            }
+                                            if response.clicked() {
                                                 model.preferences.selected_symbol = symbol;
                                                 workspaces.follow_dynamic_charts_latest();
                                             }
                                         }
-                                        if ui.small_button("+").clicked() {
-                                            *show_symbol_picker = true;
+                                        if ui
+                                            .add_sized([32.0, 44.0], egui::Button::new("+"))
+                                            .clicked()
+                                        {
+                                            picker_requested.set(true);
                                         }
                                     });
                                 });
-                            picker_response
                         })
                         .inner
                     },
@@ -199,13 +180,46 @@ pub fn show_top_bar(
                             reset_requested = true;
                         }
                         connection_badge(ui, connection, language);
+                        let filter_before = symbol_filter.clone();
+                        let search_response = ui.add_sized(
+                            [230.0, 30.0],
+                            egui::TextEdit::singleline(&mut symbol_filter).hint_text(
+                                match language {
+                                    Language::SimplifiedChinese => "搜索交易对",
+                                    Language::English => "Search markets",
+                                },
+                            ),
+                        );
+                        if search_response.has_focus() && symbol_filter == filter_before {
+                            let fallback = ui.input(|input| {
+                                input
+                                    .events
+                                    .iter()
+                                    .filter_map(|event| match event {
+                                        egui::Event::Text(value) | egui::Event::Paste(value) => {
+                                            Some(value.as_str())
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect::<String>()
+                            });
+                            if !fallback.is_empty() {
+                                symbol_filter.push_str(&fallback);
+                            }
+                        }
+                        if search_response.has_focus() || symbol_filter != filter_before {
+                            picker_requested.set(true);
+                        }
+                        search_response
                     },
                 );
+            model.symbol_filter = symbol_filter;
+            *show_symbol_picker = picker_requested.get();
             if reset_requested {
                 workspaces.restore_active();
                 model.notice("Restored the active workspace layout");
             }
-            show_symbol_picker_popup(&picker_response, show_symbol_picker, model, workspaces);
+            show_symbol_picker_popup(&search_response, show_symbol_picker, model, workspaces);
         });
 }
 
@@ -271,37 +285,6 @@ fn show_symbol_picker_popup(
         )
         .show(|ui| {
             ui.set_min_width(560.0);
-            let filter_before_input = model.symbol_filter.clone();
-            let search = ui.add(
-                egui::TextEdit::singleline(&mut model.symbol_filter)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("BTCUSDC / BTC/USDC"),
-            );
-            if model.symbol_filter == filter_before_input {
-                let fallback_text = ui.input(|input| {
-                    input
-                        .events
-                        .iter()
-                        .filter_map(|event| match event {
-                            egui::Event::Text(value) | egui::Event::Paste(value) => {
-                                Some(value.as_str())
-                            }
-                            _ => None,
-                        })
-                        .collect::<String>()
-                });
-                if !fallback_text.is_empty() {
-                    model.symbol_filter.push_str(&fallback_text);
-                } else if ui.input(|input| input.key_pressed(egui::Key::Backspace)) {
-                    model.symbol_filter.pop();
-                }
-            }
-            if model.symbol_filter.is_empty() {
-                search.request_focus();
-            }
-            if search.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Tab)) {
-                search.request_focus();
-            }
             ui.horizontal(|ui| {
                 for (group, label) in [
                     (SymbolGroup::Favorites, "★ 收藏"),
