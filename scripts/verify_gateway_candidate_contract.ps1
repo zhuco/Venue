@@ -7,7 +7,12 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 
 if (-not $CargoTargetDir) {
-    $CargoTargetDir = Join-Path 'G:\Build\Venue' "venue-gateway-candidate-contract-target-$PID"
+    $targetParent = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
+        'G:\Build\Venue'
+    } else {
+        $env:CARGO_TARGET_DIR
+    }
+    $CargoTargetDir = Join-Path $targetParent "venue-gateway-candidate-contract-target-$PID"
 }
 $targetRoot = [System.IO.Path]::GetFullPath($CargoTargetDir)
 if ($targetRoot.Equals($repoRoot, [StringComparison]::OrdinalIgnoreCase) -or

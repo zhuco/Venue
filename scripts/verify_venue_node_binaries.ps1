@@ -6,7 +6,12 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $CargoTargetDir) {
-    $CargoTargetDir = Join-Path 'G:\Build\Venue' "venue-node-verification-target-$PID"
+    $targetParent = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
+        'G:\Build\Venue'
+    } else {
+        $env:CARGO_TARGET_DIR
+    }
+    $CargoTargetDir = Join-Path $targetParent "venue-node-verification-target-$PID"
 }
 $targetRoot = [System.IO.Path]::GetFullPath($CargoTargetDir)
 $repoRootFull = [System.IO.Path]::GetFullPath($repoRoot)

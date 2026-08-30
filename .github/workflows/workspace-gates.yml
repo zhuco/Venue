@@ -33,6 +33,9 @@ jobs:
       - name: Verify isolated venue node binaries
         shell: pwsh
         run: ./scripts/verify_venue_node_binaries.ps1
+      - name: Verify gateway candidate contract
+        shell: pwsh
+        run: ./scripts/verify_gateway_candidate_contract.ps1
       - name: Verify VenueFlow Web build
         shell: pwsh
         run: cargo check -p venueflow --target wasm32-unknown-unknown --no-default-features --features web --lib --locked
