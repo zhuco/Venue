@@ -30,20 +30,24 @@
 - `domain` 不依赖业务模块；交易所原始协议只存在于 `exchange`；策略不得依赖具体交易所、凭证、原生字段或物理订单客户端。
 - 同一策略族跨交易所复用 reducer 和 runtime；交易所差异只进入 adapter、能力证据、execution profile 或 deployment binding。
 - 规范交易对使用大写 `BASE/QUOTE` 的 `domain::Symbol`；native symbol 不越过 adapter。
-- 配置必须恰好选择 Binance、Gate.io、Bitget、Bybit、OKX、Hyperliquid 之一，网关模式只允许精确 `TEST` 或 `LIVE`。凭证只来自进程环境或根 `.env`，不得写进 TOML、日志、错误或工件。
+- 配置必须恰好选择 Binance、Gate.io、Bitget、Bybit、OKX、Hyperliquid 之一，网关运行模式只允许精确 `LIVE`；不得新增测试网、demo、Shadow 或隐式布尔模式。离线 fixture、mock 和集成测试是验证手段，不是运行模式。凭证只来自进程环境或根 `.env`，不得写进 TOML、日志、错误或工件。
 - 禁止复制规范类型、指标算法、归一化、订单事实或 journal；禁止用 `unsafe`、`unwrap`、`expect`、`panic!` 处理运行时外部输入。
 - 注释只解释边界、不变量、失败语义和非显然原因，不复述代码。
 - Git 只跟踪源码、配置、长期文档、脚本与小型协议 fixture；禁止跟踪 `bak/`、构建/发布目录、工具链、凭证、运行日志、数据库和 `artifacts/`。受保护工件只保留在本地或部署存储，不以清理仓库为由删除。
 
-## 依赖白名单
+## 依赖治理
 
-- 同一用途已有白名单实现时，未经用户明确批准不得增加第二套同类直接依赖；先查 workspace 和 `Cargo.lock`，不得因个人偏好替换。
-- 依赖只在当前功能实际使用时加入，不为未来模块预装。
+- 下列依赖是优先基线，不是禁止扩展的封闭清单。当前功能确有需要时可以新增依赖，但必须先查 workspace 与 `Cargo.lock`，
+  说明现有依赖为何不能满足，并在同一修改中加入实际调用和专项测试；不得因个人偏好替换或为未来模块预装。
+- 同一用途原则上复用既有实现；只有当前任务存在可验证的技术缺口时才允许增加第二套同类直接依赖，并必须限制调用边界和退出条件。
 - 用途固定为：异步运行时 `tokio`；HTTP client `reqwest`；WebSocket `tokio-tungstenite`；JSON `serde` + `serde_json`；交易 Decimal `rust_decimal`；library 错误 `thiserror`；日志 `tracing` + `tracing-subscriber`；网络 Buffer `bytes`。
 - 状态与通信固定为：读多写少快照 `arc-swap`；同步 Mutex/RwLock `parking_lot`；异步通道 `tokio::sync`；UI/同步线程边界 `crossbeam-channel`。
 - 安全与能力固定为：凭证 `secrecy` + `zeroize`；adapter capability `bitflags`。
 - PostgreSQL 固定使用 `sqlx`；只有当前功能明确需要本地 SQLite 时才可使用 `rusqlite`，不引入其他 ORM 或数据库封装。
 - 现有 Stage 7 直接 `tungstenite` 只是冻结迁移例外，不得增加新调用点；转换前保留，不为满足白名单直接破坏式删除。
+
+本地 Cargo 构建产物统一写入 `G:\Build\Venue`，由根 `.cargo/config.toml` 固定；验证脚本可在其下创建按 PID 隔离的子目录，
+不得重新把大体积 `target/` 写入仓库。
 
 ## 文档同步
 

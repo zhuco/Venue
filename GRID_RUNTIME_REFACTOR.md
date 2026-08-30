@@ -12,6 +12,10 @@
 
 `CODEMAP.md` 只负责定位代码。事故时间线、已完成阶段、临时发布号和一次性排障记录不得继续写入长期文档。
 
+目标交易所模式已改为只允许精确 `LIVE`。本文出现的 `TEST | LIVE` 或 TEST Node/Copy 是等待
+[`REFACTOR_IMPLEMENTATION_GOALS.md`](REFACTOR_IMPLEMENTATION_GOALS.md) Goal 0 删除的当前兼容状态，不构成后续设计选项；
+离线 fixture、mock 与数据库集成测试保留，但不得成为交易所运行模式或连接真实交易所。
+
 当前选择的架构不是功能最多的方案，而是最适合“主要由一个人使用、需要多个交易所和同账户多个交易对、不要反复重构”的方案：
 
 - 每个交易所账户一个常驻进程；

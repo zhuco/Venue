@@ -8,6 +8,10 @@
 [`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md) 继续约束当前三所 Stage 7 网格热路径、恢复、接管和实盘准入；
 在目标架构尚未逐项验收前，不得用本文替代现有安全门。
 
+目标模式已更新为只允许精确 `LIVE`。本文后续出现的 `TEST | LIVE`、TEST Node、TEST Copy、测试网或 demo endpoint
+描述的是尚待 Goal 0 删除的当前兼容实现，不再是目标架构；离线 fixture、mock 和数据库集成测试继续保留，但不是运行模式。
+具体拆分、文件租约与验收顺序见 [`REFACTOR_IMPLEMENTATION_GOALS.md`](REFACTOR_IMPLEMENTATION_GOALS.md)。
+
 迁移来源只提供行为和测试证据：
 
 - `G:\kol`：跟单语义、账本、事务 outbox/inbox、租约栅栏和六所协议 fixture；
@@ -322,7 +326,7 @@ PostgreSQL 不得成为已发物理订单的第二权威 writer。Copy ledger �
 | 日志与追踪 | tracing；凭证和私有 payload 默认脱敏 |
 | 配置 | TOML + process env/root `.env` secrets |
 
-依赖白名单按用途执行：
+依赖基线按用途优先执行：
 
 | 用途 | 唯一直接依赖 | Venue 定位 |
 |---|---|---|
@@ -343,7 +347,9 @@ PostgreSQL 不得成为已发物理订单的第二权威 writer。Copy ledger �
 | PostgreSQL | `sqlx` | Control/Copy 服务端数据 |
 | 本地 SQLite | `rusqlite` | 仅当当前功能确实需要 SQLite |
 
-白名单解决同一用途时，未经用户明确批准不得引入第二套同类直接依赖；不得为未来模块提前增加未使用依赖。
+当前功能确有需要时可以增加基线外依赖，但必须先检查 workspace 与 `Cargo.lock`，证明现有依赖不能满足，并在同一修改中
+加入真实调用和专项测试。同一用途原则上仍复用既有实现；只有可验证的技术缺口才允许第二套同类直接依赖，不得为未来模块预装。
+本地 Cargo 构建目录固定为 `G:\Build\Venue`；验证脚本可在其下使用按 PID 隔离的子目录。
 现有 Stage 7 直接 `tungstenite` 是行为等价迁移前的唯一冻结例外，不允许增加新调用点；它与 `tokio-tungstenite` 的底层传递性关系不构成新的第三套 WebSocket 实现。
 
 不得在同一阶段同时重写网络 transport、交易状态机和持久化布局。当前 Stage 7 可继续使用既有阻塞 I/O，先完成 crate

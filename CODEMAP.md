@@ -4,13 +4,14 @@
 
 本文件只回答“功能代码在哪里”。合并跟单、六交易所、指标、桌面 UI 后的目标 workspace、依赖边界、技术栈和迁移顺序查
 [`ARCHITECTURE.md`](ARCHITECTURE.md)；多策略账户运行时、网格、成交热路径、库存恢复、验收和接管统一查
-[`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md)。不要从 `bak/` 或历史提交寻找当前约束。
+[`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md)；当前未完成实现、并行文件租约和验收顺序查
+[`REFACTOR_IMPLEMENTATION_GOALS.md`](REFACTOR_IMPLEMENTATION_GOALS.md)。不要从 `bak/` 或历史提交寻找当前约束。
 
 ## 进程、配置与通用领域
 
 | 功能 | 首要入口 | 直接继续 |
 |---|---|---|
-| 构建、依赖与仓库体积门禁 | `Cargo.toml` | workspace 当前包含根 package、`venue-copy`、`venue-control-protocol`、`venue-domain`、`venue-execution`、`venue-indicators`、`venue-runtime`、`venue-storage`、`venue-strategies`、`venue-gateway-api`、六个 `venue-gateway-*` adapter、`apps/venue-node`、`apps/venue-control` 与 `apps/venueflow`，resolver 固定为 3；workspace 与 `rust-toolchain.toml` 共同锁定 Rust 1.98.0；`Cargo.lock`；`scripts/verify_repository_hygiene.ps1` 执行体积和运行态文件门禁 |
+| 构建、依赖与仓库体积门禁 | `Cargo.toml` | workspace 当前包含根 package、`venue-copy`、`venue-control-protocol`、`venue-domain`、`venue-execution`、`venue-indicators`、`venue-runtime`、`venue-storage`、`venue-strategies`、`venue-gateway-api`、六个 `venue-gateway-*` adapter、`apps/venue-node`、`apps/venue-control` 与 `apps/venueflow`，resolver 固定为 3；workspace 与 `rust-toolchain.toml` 共同锁定 Rust 1.98.0；`.cargo/config.toml` 固定本地构建目录为 `G:\Build\Venue`；`Cargo.lock`；`scripts/verify_repository_hygiene.ps1` 执行体积和运行态文件门禁 |
 | 六所网关身份、模式与能力门禁 | `crates/venue-gateway-api/src/lib.rs` | 规范 venue 固定 Binance、Bitget、Bybit、Gate.io、Hyperliquid、OKX；运行模式只接受精确 `TEST`、`LIVE`；`capability_promotion.rs` 的普通 `promote/authorize` 入口固定 `AuthorityUnavailable`，序列化 probe 或调用方组合的 Control、Owner/WAL、writer、Canary 与订单族 receipt 不能升级能力；crate 内 authority 绑定完整 scope、epoch 与单调 serial，但生产 verifier/耐久 authority epoch 尚未接线，Node dispatch 继续固定拒绝，静态能力为空 |
 | Binance Portfolio Margin adapter | `crates/venue-gateway-binance/src/lib.rs` | `transport.rs`、`private_ws.rs`、`readback.rs` 与 `execution.rs` 提供绑定型 async HTTP/私流、Net/Hedge 完整腿、regular/Algo/conditional-unsupported、fills cursor、place/cancel/reduce-once 及 ACK 后 exact signed readback；`recovery.rs` 的生产只读 collector 先以真实签名 Account 解析签发同 transport seal，再在同一有界 attempt 内冻结完整 symbol/cursor universe、逐 await 重验并采集六面 raw；生产不接 caller Owner/root，所有可见订单保持 structured Unknown。它不是 runtime recovery authority，不授予 capability/WAL/writer；Stage 7 仍是生产权威 |
 | Bitget adapter | `crates/venue-gateway-bitget/src/lib.rs` | `transport.rs`、`private_ws.rs`、`execution.rs` 与 `order_families.rs` 提供精确 TEST Demo/LIVE async 私有链路、账户五面同 attempt、normal/unsupported 订单族、place/cancel/reduce-once 与 UNKNOWN exact readback；生产 transport 仅在 login 与三频道 ACK 后签发一次性只读 session，绑定凭证、完整 symbol/cursor universe、deadline 和全局 pages/bytes，并在每次 HTTP 前后以唯一 nonce Pong 重验。最终六面 recovery fold 仍固定 Unavailable，尚缺 runtime durable Owner/WAL/Unknown bridge；adapter 静态能力为空 |
