@@ -94,6 +94,13 @@ resources! {
     Live => "LIVE", "实时";
     History => "HISTORY", "历史";
     NoCandles => "No candles", "暂无K线";
+    Open => "Open", "开";
+    High => "High", "高";
+    Low => "Low", "低";
+    Close => "Close", "收";
+    Change => "Change", "涨跌幅";
+    Amplitude => "Amplitude", "振幅";
+    Volume => "Volume", "成交量";
     NoBook => "No order-book data. Waiting for the public WebSocket.", "暂无订单簿，正在等待公共 WebSocket。";
     Side => "Side", "方向";
     Price => "Price", "价格";
@@ -189,5 +196,7 @@ mod tests {
     fn language_resources_are_stable_and_distinct() {
         assert_eq!(text(Language::English, TextKey::Settings), "Settings");
         assert_eq!(text(Language::SimplifiedChinese, TextKey::Settings), "设置");
+        assert_eq!(text(Language::English, TextKey::Amplitude), "Amplitude");
+        assert_eq!(text(Language::SimplifiedChinese, TextKey::Change), "涨跌幅");
     }
 }

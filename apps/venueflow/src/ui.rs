@@ -912,16 +912,34 @@ fn candle_plot(
             bar_index_at_x(price_rect.left(), price_rect.width(), bars.len(), pointer.x)
         {
             let bar = &bars[index];
+            let percent = |value| {
+                if bar.open.is_zero() {
+                    rust_decimal::Decimal::ZERO
+                } else {
+                    value * rust_decimal::Decimal::new(100, 0) / bar.open
+                }
+            };
+            let change_percent = percent(bar.close - bar.open);
+            let amplitude_percent = percent(bar.high - bar.low);
             painter.text(
                 price_rect.left_top() + egui::vec2(6.0, 6.0),
                 Align2::LEFT_TOP,
                 format!(
-                    "{}  O {}  H {}  L {}  C {}  V {}",
+                    "{}  {} {}  {} {}  {} {}  {} {}  {} {:+.2}%  {} {:.2}%  {} {}",
                     bar.open_time_ms,
+                    text(language, TextKey::Open),
                     format_decimal(bar.open, price_scale),
+                    text(language, TextKey::High),
                     format_decimal(bar.high, price_scale),
+                    text(language, TextKey::Low),
                     format_decimal(bar.low, price_scale),
+                    text(language, TextKey::Close),
                     format_decimal(bar.close, price_scale),
+                    text(language, TextKey::Change),
+                    decimal_to_f64(change_percent),
+                    text(language, TextKey::Amplitude),
+                    decimal_to_f64(amplitude_percent),
+                    text(language, TextKey::Volume),
                     format_decimal(bar.volume, quantity_scale),
                 ),
                 FontId::monospace(f32::from(settings.chart_text_size)),
