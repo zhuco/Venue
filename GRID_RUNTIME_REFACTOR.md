@@ -33,7 +33,7 @@ writer 或物理交易客户端。`legacy_stage7_strategy_binding` 只转换单�
 `apps/venue-node` 已提供六个逐 adapter 固定产物：Binance、Gate.io、Bitget 仅在精确 `LIVE` 下委托现有 Stage 7
 部署入口并继续使用原 Owner/WAL/writer/reconciliation/Canary 契约；旧物理 client 不支持 `TEST`，因此对应节点
 明确失败关闭而不回退到生产 endpoint。Bybit、OKX、Hyperliquid 节点只验证 secret-free binding、adapter endpoint、
-凭证环境变量命名空间与隔离 artifact root。`safe_host` 与 `supervision` 仍维护 root/WAL/Owner/writer metadata、独立 control log、一次性 permit 与 UNKNOWN 禁重投。共享层已有耐久 Owner/native identity、六面物理恢复值类型、`ProvenAbsent`、bounded loopback Control polling、单 runtime async 与 host capability 候选契约；但普通调用方仍可构造 promotion receipt，六所也尚无绑定 recovery scope 的 fresh collector、exact Owner 与结构化 Unknown 证明。生产 physical installer、Ready、Actor turn、host admission 和 async mutation 因此统一失败关闭；Prepared 在 admission 失败时耐久 Rejected，物理调用为零。
+凭证环境变量命名空间与隔离 artifact root。`safe_host` 与 `supervision` 仍维护 root/WAL/Owner/writer metadata、独立 control log、一次性 permit 与 UNKNOWN 禁重投。共享层已有耐久 Owner/native identity、六面物理恢复值类型、`ProvenAbsent`、bounded loopback Control polling、单 runtime async 与 host capability 候选契约；六所也已有 scope/raw/exact-Owner/structured-Unknown collector 测试夹具。普通调用方仍可构造 promotion receipt，生产又缺不可伪造认证 transport session、完整配置 universe 与耐久 root refresh authority，因此 physical installer、Ready、Actor turn、host admission 和 async mutation 统一失败关闭；Prepared 在 admission 失败时耐久 Rejected，物理调用为零。Bybit、OKX、Hyperliquid 的 mutation builder、签名、POST 与 dispatch 仅在 `cfg(test)`，不能由 feature 在生产构建复活。
 Stage 7 成交热路径不得遍历历史命令 WAL。命令 journal 在启动重放时建立未决命令、撤单目标和交易所订单 ID 的派生内存索引；滚动补撤批次以原 JSONL 格式一次 fsync 持久化 Prepared/Submitted 状态，再并行提交物理请求。接管只可在签名全订单族为空、零未决且零本地事务后显式按源 SHA 封存已解析 WAL；原件留在同 root，活动 WAL 从空文件继续，禁止运行中轮转或删除审计源。
 
 纯内核启动必须先安装覆盖 lifecycle、config epoch、Stop/Flatten fence、连接代际、已应用私有游标、完整批次
@@ -44,7 +44,7 @@ applied receipt 才能更新 Desired Orders、进入 Running 或生成执行意�
 分配收据绑定订单族，策略调用方不得自报这些权限。重连、参数变更或更新一代签名对账不会复活未入 WAL 的旧意图；
 已进入 WAL 的 Unknown 必须按原 command、native client identity、订单族和更新连接的完整回读证明收敛，不能直接重发。
 物理恢复的内存值类型/验证器还要求同一 attempt、严格更新的 private generation 完整交付 Account、Positions、三个订单族与
-FillsCursor 六面，并绑定 connection generation、config 与 Owner/WAL/Unknown roots；空账户也必须显式交付空面。测试夹具已覆盖六所映射形状，但生产入口不得从普通 candidate、持久 probe、caller generation 或 caller digest 构造准入；在 opaque fresh collector、多 symbol 完整性和运行期 root refresh authority 完成前，账户 startup 与固定 binary 统一返回 integration unavailable，也不生成持久 manifest 工件。
+FillsCursor 六面，并绑定 mode/account/native binding、完整 registry universe/config epoch、position mode、profile version、connection/private generation 与 Owner/WAL/structured Unknown roots；任一 WAL、Unknown、root、config 或 profile 漂移立即撤销 Ready/turn。六所测试 fixture 覆盖 endpoint/session/freshness、raw replay、exact Owner 与结构化 Unknown，但生产入口不得从普通 candidate、持久 probe、caller generation 或 caller digest 构造准入；在 opaque authenticated collector 与耐久 root refresh authority 完成前，账户 startup 与固定 binary 统一返回 integration unavailable，也不生成持久 manifest 工件。
 
 ## 2. 术语
 
@@ -451,7 +451,7 @@ Gate、Bitget 当前 profile 只允许常规订单族，条件/Algo 由同一 pr
 `/v2/ui/snapshot`、`/v2/ui/events`、`/v2/control/commands`。策略投影和命令必须携带精确 `TEST | LIVE`，两端只调用 API，不读取数据库、WAL 或 artifacts，
 不持有凭证，不直连交易所，不直接下单。Stop/Flatten 必须显示并提交精确 mode、account、symbol、instance、config epoch、action 与人工确认；
 `apps/venue-control` 提供 transport-neutral schema 重验、幂等 repository、PostgreSQL durable inbox/outbox/claim/terminal receipt，
-以及仅限本地的 HTTP/SSE `/v2` 适配层；bounded Node claim/ACK/receipt 路由和 PostgreSQL fencing delivery lease 均绑定精确 instance/config epoch，ACK 只表示节点 inbox 已耐久，Unknown 只能由下一序号只读 reconciliation claim 收敛，重复 receipt 必须幂等且冲突失败关闭。Node 侧 delivery 状态机已闭合 lease fencing、耐久 ACK 后 Actor apply、Unknown 下一序号只读 claim、幂等冲突与崩溃恢复；`venue-storage::OpaqueJournal` 已提供 opaque recover/expected-sequence durable append，但 Node 的 storage adapter 与 HTTP polling client 尚未实现。TEST-only Copy worker 可原子持久化冻结资本、语义 job、delivery/receipt、ledger 与崩溃恢复，LIVE 在数据库访问前失败关闭；数据库 lease、claim 或 Control receipt 均不授予 mutation authority。
+以及仅限本地的 HTTP/SSE `/v2` 适配层；bounded Node claim/ACK/receipt 路由和 PostgreSQL fencing delivery lease 均绑定精确 instance/config epoch，ACK 只表示节点 inbox 已耐久，Unknown 只能由下一序号只读 reconciliation claim 收敛，重复 receipt 必须幂等且冲突失败关闭。Node 已接入唯一 `OpaqueJournal` storage adapter 与 bounded loopback HTTP polling client；claim、ACK、receipt 每次 await 后都以当前时钟重验 lease/session/epoch，ACK 绑定完整 inbox replay root/sequence/node，过期 outbox 不确认或重放。由于缺少 Actor journal/checkpoint 发行的不可伪造 durable-applied receipt，生产 Applied 仍返回 `ActorAppliedUnavailable`。TEST-only Copy worker 可原子持久化冻结资本、语义 job、delivery/receipt、ledger 与崩溃恢复，LIVE 在数据库访问前失败关闭；数据库 lease、claim 或 Control receipt 均不授予 mutation authority。
 
 ## 12. 验收标准
 
