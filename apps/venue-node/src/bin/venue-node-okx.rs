@@ -4,16 +4,16 @@ use std::process::ExitCode;
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use venue_domain::domain::{NativeOrderFamily, PositionSide};
-use venue_gateway_api::{CapabilityFlags, CapabilitySnapshot, GatewayBinding, VenueId};
-use venue_gateway_okx::{OkxConfig, OkxPhysicalCandidate, capabilities};
+#[cfg(test)]
+use venue_gateway_api::GatewayBinding;
+use venue_gateway_api::VenueId;
+use venue_gateway_okx::{OkxConfig, capabilities};
 #[cfg(test)]
 use venue_gateway_okx::{
     OkxPositionMode, OkxPrivateReadbackCandidate, OkxPrivateSurface, OkxRawPrivatePage,
 };
 use venue_node::{
-    AdapterIsolation, DispatchPermit, GatewayDispatchResult, GatewayRecoveryPermit, NodeError,
-    NodeLaunch, PhysicalGateway, SignedReadbackReceipt, SignedReadbackRequest,
-    reject_unintegrated_runtime, report_result,
+    AdapterIsolation, NodeError, NodeLaunch, reject_unintegrated_runtime, report_result,
 };
 #[cfg(test)]
 use venue_runtime::account::{
@@ -28,7 +28,6 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), NodeError> {
-    assert_candidate_bridge::<OkxNodePhysicalCandidate>();
     let launch = NodeLaunch::from_environment(VenueId::Okx)?;
     launch.require_no_runtime_arguments()?;
     let adapter = OkxConfig::for_binding(launch.binding().clone())
@@ -50,8 +49,7 @@ fn run() -> Result<(), NodeError> {
     reject_unintegrated_runtime(VenueId::Okx, launch.binding().mode, capabilities())
 }
 
-fn assert_candidate_bridge<G: PhysicalGateway>() {}
-
+#[cfg(test)]
 fn reject_missing_post_recovery_authority() -> OkxNodeBridgeError {
     OkxNodeBridgeError::PostRecoveryCollectorUnavailable
 }
@@ -253,61 +251,7 @@ fn usize_to_u64(value: usize) -> Result<u64, OkxNodeBridgeError> {
     u64::try_from(value).map_err(|_| OkxNodeBridgeError::EvidenceCommitment)
 }
 
-/// Compile-time bridge from the validated OKX physical candidate to the fixed node contract.
-/// The shared host currently has no recovery-time constructor that can supply this value with an
-/// Owner route, applied Control state and a post-connect full signed generation. Consequently the
-/// binary never constructs it and remains fail-closed before credentials or network access.
-struct OkxNodePhysicalCandidate {
-    candidate: OkxPhysicalCandidate,
-}
-
-impl PhysicalGateway for OkxNodePhysicalCandidate {
-    type Error = OkxNodeBridgeError;
-
-    fn binding(&self) -> &GatewayBinding {
-        self.candidate.binding()
-    }
-
-    fn capability_snapshot(&self) -> CapabilitySnapshot {
-        CapabilitySnapshot {
-            binding: self.candidate.binding().clone(),
-            version: 0,
-            observed_ms: 0,
-            expires_ms: 0,
-            flags: CapabilityFlags::empty(),
-        }
-    }
-
-    fn connect_after_recovery(&mut self, permit: GatewayRecoveryPermit) -> Result<(), Self::Error> {
-        if permit.binding() != self.candidate.binding()
-            || self.candidate.private_generation() <= permit.private_generation_floor()
-        {
-            return Err(OkxNodeBridgeError::Scope);
-        }
-        // A durable probe predates recovery. It cannot be relabelled as the required fresh private
-        // generation, and opening credentials/network here without the shared collector would
-        // bypass the account-wide signed readback gate.
-        Err(reject_missing_post_recovery_authority())
-    }
-
-    fn signed_readback(
-        &mut self,
-        _request: &SignedReadbackRequest,
-    ) -> Result<SignedReadbackReceipt, Self::Error> {
-        Err(reject_missing_post_recovery_authority())
-    }
-
-    fn verify_signed_readback(&self, _receipt: &SignedReadbackReceipt) -> Result<(), Self::Error> {
-        Err(reject_missing_post_recovery_authority())
-    }
-
-    fn dispatch(&mut self, _permit: DispatchPermit) -> GatewayDispatchResult {
-        // `connect_after_recovery` cannot succeed until the shared post-recovery collector exists.
-        // Preserve UNKNOWN/no-resubmit semantics if a future caller violates that sequencing.
-        GatewayDispatchResult::Unknown
-    }
-}
-
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 enum OkxNodeBridgeError {
     #[error("OKX node physical candidate does not match the recovered binding or generation")]

@@ -12,9 +12,9 @@ use venue_gateway_api::GatewayMode;
 use venue_gateway_api::{CapabilityFlags, CapabilitySnapshot, GatewayBinding, VenueId};
 #[cfg(test)]
 use venue_gateway_hyperliquid::{
-    HYPERLIQUID_CAPABILITY_PROBE_SCHEMA, HyperliquidAccountSnapshot, HyperliquidActionKind,
-    HyperliquidFillWindowEvidence, HyperliquidOpenOrdersSnapshot, HyperliquidOrderFamily,
-    HyperliquidOrderFamilyCoverage, HyperliquidOrderLookup, HyperliquidOrderStatus,
+    HYPERLIQUID_CAPABILITY_PROBE_SCHEMA, HyperliquidAccountSnapshot, HyperliquidFillWindowEvidence,
+    HyperliquidOpenOrdersSnapshot, HyperliquidOrderFamily, HyperliquidOrderFamilyCoverage,
+    HyperliquidOrderLookup, HyperliquidOrderStatus, HyperliquidOrderStatusUnknownReason,
     HyperliquidPayloadScope,
 };
 use venue_gateway_hyperliquid::{
@@ -187,7 +187,16 @@ struct HyperliquidProbeRecoveryPayload {
 #[cfg(test)]
 #[derive(serde::Deserialize)]
 struct HyperliquidProbeRecoveryAction {
-    kind: HyperliquidActionKind,
+    kind: HyperliquidProbeRecoveryActionKind,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum HyperliquidProbeRecoveryActionKind {
+    AloPlace,
+    Cancel,
+    IocReduceOnly,
 }
 
 #[cfg(test)]
@@ -339,9 +348,9 @@ fn validate_recovery_anchor(
     anchor: &HyperliquidProbeRecoveryAnchor,
 ) -> Result<(), HyperliquidBridgeError> {
     let expected_actions = [
-        HyperliquidActionKind::AloPlace,
-        HyperliquidActionKind::Cancel,
-        HyperliquidActionKind::IocReduceOnly,
+        HyperliquidProbeRecoveryActionKind::AloPlace,
+        HyperliquidProbeRecoveryActionKind::Cancel,
+        HyperliquidProbeRecoveryActionKind::IocReduceOnly,
     ];
     let expected_user = anchor
         .payload
@@ -513,7 +522,7 @@ fn validate_order_status(
     anchor: &HyperliquidProbeRecoveryAnchor,
 ) -> Result<(), HyperliquidBridgeError> {
     let (scope, matches_lookup, exchange_time_ms) = match readback.status {
-        HyperliquidOrderStatus::Unknown { scope, lookup } => {
+        HyperliquidOrderStatus::Unknown { scope, lookup, .. } => {
             (scope, lookup == readback.lookup, None)
         }
         HyperliquidOrderStatus::Known {
@@ -839,13 +848,13 @@ mod tests {
                     fill_window: fill_window_json,
                     actions: [
                         HyperliquidProbeRecoveryAction {
-                            kind: HyperliquidActionKind::AloPlace,
+                            kind: HyperliquidProbeRecoveryActionKind::AloPlace,
                         },
                         HyperliquidProbeRecoveryAction {
-                            kind: HyperliquidActionKind::Cancel,
+                            kind: HyperliquidProbeRecoveryActionKind::Cancel,
                         },
                         HyperliquidProbeRecoveryAction {
-                            kind: HyperliquidActionKind::IocReduceOnly,
+                            kind: HyperliquidProbeRecoveryActionKind::IocReduceOnly,
                         },
                     ],
                 },
@@ -1152,6 +1161,8 @@ mod tests {
         let unknown = HyperliquidOrderStatus::Unknown {
             scope: status_scope,
             lookup: fixture.lookup.clone(),
+            native_identity: fixture.lookup.native_identity(),
+            reason: HyperliquidOrderStatusUnknownReason::UnknownOid,
         };
         let statuses = [HyperliquidOrderStatusReadback {
             private_generation: 11,
