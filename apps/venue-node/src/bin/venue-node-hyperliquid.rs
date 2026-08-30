@@ -1,27 +1,39 @@
 use std::process::ExitCode;
 
+#[cfg(test)]
+use std::collections::BTreeSet;
+
+#[cfg(test)]
 use serde::Serialize;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use venue_gateway_api::GatewayMode;
 use venue_gateway_api::{CapabilityFlags, CapabilitySnapshot, GatewayBinding, VenueId};
+#[cfg(test)]
 use venue_gateway_hyperliquid::{
     HYPERLIQUID_CAPABILITY_PROBE_SCHEMA, HyperliquidAccountSnapshot, HyperliquidActionKind,
-    HyperliquidConfig, HyperliquidFillWindowEvidence, HyperliquidGatewayBinding,
-    HyperliquidNodeCandidate, HyperliquidOpenOrdersSnapshot, HyperliquidOrderFamily,
+    HyperliquidFillWindowEvidence, HyperliquidOpenOrdersSnapshot, HyperliquidOrderFamily,
     HyperliquidOrderFamilyCoverage, HyperliquidOrderLookup, HyperliquidOrderStatus,
-    HyperliquidPayloadScope, capabilities,
+    HyperliquidPayloadScope,
+};
+use venue_gateway_hyperliquid::{
+    HyperliquidConfig, HyperliquidGatewayBinding, HyperliquidNodeCandidate, capabilities,
 };
 use venue_node::{
     AdapterIsolation, DispatchPermit, GatewayDispatchResult, GatewayRecoveryPermit, NodeError,
     NodeLaunch, PhysicalGateway, SignedReadbackReceipt, SignedReadbackRequest,
     reject_unintegrated_runtime, report_result,
 };
+use venue_runtime::account::PhysicalRecoveryReadbackManifest;
+#[cfg(test)]
 use venue_runtime::account::{
     PhysicalReadbackReceipt, PhysicalReadbackSurface, PhysicalRecoveryManifestError,
-    PhysicalRecoveryReadbackManifest, PhysicalRecoveryScope,
+    PhysicalRecoveryScope,
 };
 
 const PROGRAM: &str = "venue-node-hyperliquid";
+#[cfg(test)]
 const HYPERLIQUID_RECOVERY_ORDER_PROFILE_VERSION: u64 = 1;
 
 fn main() -> ExitCode {
@@ -103,30 +115,20 @@ impl HyperliquidPhysicalGatewayCandidate {
         }
     }
 
-    /// Converts one already-verified candidate probe plus the exact in-memory read responses from
-    /// the same collection turn into the shared six-face recovery value. This is deliberately not
-    /// called by `run`: a manifest is read-only evidence, not host capability or mutation authority.
+    /// Persisted probe evidence cannot be rebound to a fresh recovery scope. Until an opaque
+    /// collector binds expiry, raw replay, Unknown and Owner proof to the exact attempt and roots,
+    /// production recovery is unavailable rather than accepting a caller-assembled manifest.
     #[allow(dead_code)]
     fn recovery_readback_manifest(
         &self,
-        scope: PhysicalRecoveryScope,
-        attempt_id: u64,
-        readback: HyperliquidRecoveryReadback<'_>,
     ) -> Result<PhysicalRecoveryReadbackManifest, HyperliquidBridgeError> {
-        let candidate = self
-            .persisted_probe
-            .as_ref()
-            .ok_or(HyperliquidBridgeError::RecoveryEvidence)?;
-        let encoded = serde_json::to_vec(candidate.evidence())
-            .map_err(|_| HyperliquidBridgeError::RecoveryEvidence)?;
-        let anchor: HyperliquidProbeRecoveryAnchor = serde_json::from_slice(&encoded)
-            .map_err(|_| HyperliquidBridgeError::RecoveryEvidence)?;
-        map_recovery_readback(&self.binding, scope, attempt_id, &anchor, readback)
+        Err(HyperliquidBridgeError::RecoveryUnavailable)
     }
 }
 
 /// Exact read-only `orderStatus` response retained with its request identity and raw response hash.
 /// `Unknown` remains unresolved evidence; it is never converted into an empty order-family page.
+#[cfg(test)]
 struct HyperliquidOrderStatusReadback<'a> {
     private_generation: u64,
     observed_ms: u64,
@@ -137,23 +139,37 @@ struct HyperliquidOrderStatusReadback<'a> {
 
 /// All native read responses needed by the mapping. Required traditional faces are `Option`s so
 /// omission reaches an explicit fail-closed error instead of becoming a fabricated empty result.
+#[cfg(test)]
 struct HyperliquidRecoveryReadback<'a> {
     account: Option<&'a HyperliquidAccountSnapshot>,
     orders: Option<&'a HyperliquidOpenOrdersSnapshot>,
     fills: Option<&'a HyperliquidFillWindowEvidence>,
     order_status: &'a [HyperliquidOrderStatusReadback<'a>],
+    owner_order_ids: Option<&'a BTreeSet<String>>,
+    raw_meta: &'a [u8],
+    raw_account: &'a [u8],
+    collected_at_ms: u64,
 }
 
+#[cfg(test)]
 #[derive(serde::Deserialize)]
 struct HyperliquidProbeRecoveryAnchor {
     payload: HyperliquidProbeRecoveryPayload,
     commitment_keccak256: String,
+    collector_scope_sha256: [u8; 32],
+    collector_attempt_id: u64,
+    collector_meta_sha256: [u8; 32],
+    collector_account_sha256: [u8; 32],
+    collector_orders_sha256: [u8; 32],
 }
 
+#[cfg(test)]
 #[derive(serde::Deserialize)]
 struct HyperliquidProbeRecoveryPayload {
     schema_version: u16,
     binding: GatewayBinding,
+    observed_ms: u64,
+    expires_ms: u64,
     private_generation: u64,
     master_address: String,
     user_address: String,
@@ -161,15 +177,20 @@ struct HyperliquidProbeRecoveryPayload {
     native_coin: String,
     account_exchange_time_ms: u64,
     orders_observed_ms: u64,
+    meta_commitment_keccak256: String,
+    account_commitment_keccak256: String,
+    orders_commitment_keccak256: String,
     fill_window: serde_json::Value,
     actions: [HyperliquidProbeRecoveryAction; 3],
 }
 
+#[cfg(test)]
 #[derive(serde::Deserialize)]
 struct HyperliquidProbeRecoveryAction {
     kind: HyperliquidActionKind,
 }
 
+#[cfg(test)]
 fn map_recovery_readback(
     binding: &GatewayBinding,
     scope: PhysicalRecoveryScope,
@@ -177,7 +198,13 @@ fn map_recovery_readback(
     anchor: &HyperliquidProbeRecoveryAnchor,
     readback: HyperliquidRecoveryReadback<'_>,
 ) -> Result<PhysicalRecoveryReadbackManifest, HyperliquidBridgeError> {
-    validate_recovery_anchor(binding, &scope, anchor)?;
+    validate_recovery_anchor(
+        binding,
+        &scope,
+        attempt_id,
+        readback.collected_at_ms,
+        anchor,
+    )?;
     let account = readback
         .account
         .ok_or(HyperliquidBridgeError::RecoveryEvidence)?;
@@ -196,6 +223,9 @@ fn map_recovery_readback(
         || orders.regular_coverage != HyperliquidOrderFamilyCoverage::CompleteFrontendSnapshot
         || orders.conditional_coverage != HyperliquidOrderFamilyCoverage::CompleteFrontendSnapshot
         || orders.algo_coverage != HyperliquidOrderFamilyCoverage::NotCoveredByFrontendOpenOrders
+        || sha256(readback.raw_meta) != anchor.collector_meta_sha256
+        || sha256(readback.raw_account) != anchor.collector_account_sha256
+        || sha256(&orders.raw_payload) != anchor.collector_orders_sha256
     {
         return Err(HyperliquidBridgeError::RecoveryEvidence);
     }
@@ -215,6 +245,20 @@ fn map_recovery_readback(
     let order_payload_sha256 = sha256(&orders.raw_payload);
     let regular_count = family_count(orders, HyperliquidOrderFamily::Regular)?;
     let conditional_count = family_count(orders, HyperliquidOrderFamily::Conditional)?;
+    let actual_order_ids = orders
+        .orders
+        .iter()
+        .map(|order| order.order.order_id.clone())
+        .collect::<BTreeSet<_>>();
+    if readback.owner_order_ids != Some(&actual_order_ids)
+        || (regular_count == 0
+            && readback
+                .order_status
+                .iter()
+                .any(|readback| matches!(readback.status, HyperliquidOrderStatus::Unknown { .. })))
+    {
+        return Err(HyperliquidBridgeError::RecoveryEvidence);
+    }
     let fills_count =
         u64::try_from(fills.fill_count()).map_err(|_| HyperliquidBridgeError::RecoveryEvidence)?;
     let generation = anchor.payload.private_generation;
@@ -286,9 +330,12 @@ fn map_recovery_readback(
     Ok(PhysicalRecoveryReadbackManifest::verified(scope, receipts)?)
 }
 
+#[cfg(test)]
 fn validate_recovery_anchor(
     binding: &GatewayBinding,
     scope: &PhysicalRecoveryScope,
+    attempt_id: u64,
+    collected_at_ms: u64,
     anchor: &HyperliquidProbeRecoveryAnchor,
 ) -> Result<(), HyperliquidBridgeError> {
     let expected_actions = [
@@ -303,11 +350,19 @@ fn validate_recovery_anchor(
         .unwrap_or(&anchor.payload.master_address);
     if binding != scope.binding()
         || binding != &anchor.payload.binding
+        || anchor.collector_scope_sha256 != *scope.commitment_sha256()
+        || anchor.collector_attempt_id != attempt_id
         || anchor.payload.schema_version != HYPERLIQUID_CAPABILITY_PROBE_SCHEMA
         || anchor.payload.binding.venue != VenueId::Hyperliquid
         || anchor.payload.user_address != expected_user
         || anchor.payload.native_coin != binding.symbol.base()
         || anchor.payload.private_generation == 0
+        || collected_at_ms < anchor.payload.observed_ms
+        || collected_at_ms >= anchor.payload.expires_ms
+        || anchor.payload.expires_ms <= anchor.payload.observed_ms
+        || !valid_hex_commitment(&anchor.payload.meta_commitment_keccak256)
+        || !valid_hex_commitment(&anchor.payload.account_commitment_keccak256)
+        || !valid_hex_commitment(&anchor.payload.orders_commitment_keccak256)
         || anchor.commitment_keccak256.len() != 64
         || !anchor
             .commitment_keccak256
@@ -326,6 +381,12 @@ fn validate_recovery_anchor(
     Ok(())
 }
 
+#[cfg(test)]
+fn valid_hex_commitment(value: &str) -> bool {
+    value.len() == 64 && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
+}
+
+#[cfg(test)]
 fn validate_payload_scope(
     scope: &HyperliquidPayloadScope,
     anchor: &HyperliquidProbeRecoveryAnchor,
@@ -339,6 +400,7 @@ fn validate_payload_scope(
     Ok(())
 }
 
+#[cfg(test)]
 fn family_count(
     orders: &HyperliquidOpenOrdersSnapshot,
     family: HyperliquidOrderFamily,
@@ -353,6 +415,7 @@ fn family_count(
     .map_err(|_| HyperliquidBridgeError::RecoveryEvidence)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn order_family_receipt(
     scope: &PhysicalRecoveryScope,
@@ -402,6 +465,7 @@ fn order_family_receipt(
     }
 }
 
+#[cfg(test)]
 fn order_surface_tag(surface: PhysicalReadbackSurface) -> Result<u8, HyperliquidBridgeError> {
     match surface {
         PhysicalReadbackSurface::UmOrder => Ok(1),
@@ -413,6 +477,7 @@ fn order_surface_tag(surface: PhysicalReadbackSurface) -> Result<u8, Hyperliquid
     }
 }
 
+#[cfg(test)]
 fn order_status_commitment(
     anchor: &HyperliquidProbeRecoveryAnchor,
     readbacks: &[HyperliquidOrderStatusReadback<'_>],
@@ -442,6 +507,7 @@ fn order_status_commitment(
     Ok(digest.finalize().into())
 }
 
+#[cfg(test)]
 fn validate_order_status(
     readback: &HyperliquidOrderStatusReadback<'_>,
     anchor: &HyperliquidProbeRecoveryAnchor,
@@ -473,6 +539,7 @@ fn validate_order_status(
     Ok(())
 }
 
+#[cfg(test)]
 fn recovery_common_commitment(
     scope_sha256: &[u8; 32],
     anchor: &HyperliquidProbeRecoveryAnchor,
@@ -483,11 +550,25 @@ fn recovery_common_commitment(
         &(
             &anchor.payload.binding,
             mode_tag(anchor.payload.binding.mode),
+            anchor.payload.observed_ms,
+            anchor.payload.expires_ms,
             anchor.payload.private_generation,
             &anchor.payload.user_address,
             &anchor.payload.vault_address,
             &anchor.payload.native_coin,
-            &anchor.commitment_keccak256,
+            (
+                &anchor.payload.meta_commitment_keccak256,
+                &anchor.payload.account_commitment_keccak256,
+                &anchor.payload.orders_commitment_keccak256,
+                &anchor.commitment_keccak256,
+            ),
+            (
+                &anchor.collector_scope_sha256,
+                anchor.collector_attempt_id,
+                &anchor.collector_meta_sha256,
+                &anchor.collector_account_sha256,
+                &anchor.collector_orders_sha256,
+            ),
             anchor
                 .payload
                 .actions
@@ -498,6 +579,7 @@ fn recovery_common_commitment(
     )
 }
 
+#[cfg(test)]
 fn mode_tag(mode: GatewayMode) -> u8 {
     match mode {
         GatewayMode::Test => 1,
@@ -505,6 +587,7 @@ fn mode_tag(mode: GatewayMode) -> u8 {
     }
 }
 
+#[cfg(test)]
 fn evidence_commitment<T: Serialize>(
     domain: &[u8],
     common_sha256: &[u8; 32],
@@ -519,6 +602,7 @@ fn evidence_commitment<T: Serialize>(
     Ok(digest.finalize().into())
 }
 
+#[cfg(test)]
 fn commit_order_status(
     digest: &mut Sha256,
     status: &HyperliquidOrderStatus,
@@ -560,6 +644,7 @@ fn commit_order_status(
     Ok(())
 }
 
+#[cfg(test)]
 fn commit_lookup(digest: &mut Sha256, lookup: &HyperliquidOrderLookup) {
     match lookup {
         HyperliquidOrderLookup::OrderId(value) => {
@@ -573,10 +658,12 @@ fn commit_lookup(digest: &mut Sha256, lookup: &HyperliquidOrderLookup) {
     }
 }
 
+#[cfg(test)]
 fn sha256(value: &[u8]) -> [u8; 32] {
     Sha256::digest(value).into()
 }
 
+#[cfg(test)]
 fn commit_bytes(digest: &mut Sha256, value: &[u8]) {
     digest.update((value.len() as u64).to_be_bytes());
     digest.update(value);
@@ -633,8 +720,14 @@ enum HyperliquidBridgeError {
         "Hyperliquid candidate bridge lacks shared async runtime, readback promotion and command mapping"
     )]
     SharedIntegration,
+    #[error(
+        "Hyperliquid recovery is unavailable without a fresh scope-bound collector and structured Unknown/Owner proof"
+    )]
+    RecoveryUnavailable,
+    #[cfg(test)]
     #[error("Hyperliquid recovery readback evidence is missing, stale, or scope-inconsistent")]
     RecoveryEvidence,
+    #[cfg(test)]
     #[error(transparent)]
     RecoveryManifest(#[from] PhysicalRecoveryManifestError),
 }
@@ -642,6 +735,7 @@ enum HyperliquidBridgeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use venue_gateway_api::GatewayMode;
     use venue_gateway_hyperliquid::{
         HyperliquidReadBinding, parse_clearinghouse_snapshot, parse_frontend_open_orders_snapshot,
         parse_order_status, parse_perp_meta,
@@ -650,6 +744,9 @@ mod tests {
 
     const ACCOUNT: &str = "00000000-0000-4000-8000-000000000001";
     const USER: &str = "0x0000000000000000000000000000000000000001";
+    const PROBE_OBSERVED_MS: u64 = 1_724_361_547_000;
+    const COLLECTED_AT_MS: u64 = PROBE_OBSERVED_MS + 1;
+    const PROBE_EXPIRES_MS: u64 = PROBE_OBSERVED_MS + 60_000;
     const META: &[u8] =
         include_bytes!("../../../../crates/venue-gateway-hyperliquid/fixtures/perp-meta.json");
     const ACCOUNT_SNAPSHOT: &[u8] = include_bytes!(
@@ -680,6 +777,7 @@ mod tests {
         fills: HyperliquidFillWindowEvidence,
         lookup: HyperliquidOrderLookup,
         status: HyperliquidOrderStatus,
+        owner_order_ids: BTreeSet<String>,
     }
 
     fn recovery_fixture() -> Result<RecoveryFixture, Box<dyn std::error::Error>> {
@@ -688,8 +786,13 @@ mod tests {
             HyperliquidReadBinding::new(HyperliquidGatewayBinding::new(selected.clone())?, USER)?;
         let meta = parse_perp_meta(META, &read_binding)?;
         let account = parse_clearinghouse_snapshot(ACCOUNT_SNAPSHOT, &meta)?;
-        let observed_ms = 1_724_361_547_000;
+        let observed_ms = PROBE_OBSERVED_MS;
         let orders = parse_frontend_open_orders_snapshot(ORDERS, &meta, observed_ms)?;
+        let owner_order_ids = orders
+            .orders
+            .iter()
+            .map(|order| order.order.order_id.clone())
+            .collect();
         let fill_window_json = serde_json::json!({
             "gateway_binding": selected,
             "user_address": USER,
@@ -713,12 +816,15 @@ mod tests {
             10,
             PhysicalRecoveryAuthorityRoots::verified([1; 32], [2; 32], [3; 32])?,
         )?;
+        let collector_scope_sha256 = *scope.commitment_sha256();
         Ok(RecoveryFixture {
             scope,
             anchor: HyperliquidProbeRecoveryAnchor {
                 payload: HyperliquidProbeRecoveryPayload {
                     schema_version: HYPERLIQUID_CAPABILITY_PROBE_SCHEMA,
                     binding: selected,
+                    observed_ms: PROBE_OBSERVED_MS,
+                    expires_ms: PROBE_EXPIRES_MS,
                     private_generation: 11,
                     master_address: USER.to_owned(),
                     user_address: USER.to_owned(),
@@ -726,6 +832,9 @@ mod tests {
                     native_coin: "BTC".to_owned(),
                     account_exchange_time_ms: account.exchange_time_ms,
                     orders_observed_ms: observed_ms,
+                    meta_commitment_keccak256: "bb".repeat(32),
+                    account_commitment_keccak256: "cc".repeat(32),
+                    orders_commitment_keccak256: "dd".repeat(32),
                     fill_window: fill_window_json,
                     actions: [
                         HyperliquidProbeRecoveryAction {
@@ -740,19 +849,25 @@ mod tests {
                     ],
                 },
                 commitment_keccak256: "aa".repeat(32),
+                collector_scope_sha256,
+                collector_attempt_id: 41,
+                collector_meta_sha256: sha256(META),
+                collector_account_sha256: sha256(ACCOUNT_SNAPSHOT),
+                collector_orders_sha256: sha256(ORDERS),
             },
             account,
             orders,
             fills,
             lookup,
             status,
+            owner_order_ids,
         })
     }
 
     fn status_readback(fixture: &RecoveryFixture) -> HyperliquidOrderStatusReadback<'_> {
         HyperliquidOrderStatusReadback {
             private_generation: 11,
-            observed_ms: 1_724_361_547_000,
+            observed_ms: PROBE_OBSERVED_MS,
             lookup: &fixture.lookup,
             status: &fixture.status,
             response_sha256: sha256(ORDER_STATUS),
@@ -790,6 +905,17 @@ mod tests {
     }
 
     #[test]
+    fn production_recovery_manifest_is_unconditionally_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bridge = HyperliquidPhysicalGatewayCandidate::new(binding(GatewayMode::Test)?, None)?;
+        assert_eq!(
+            bridge.recovery_readback_manifest(),
+            Err(HyperliquidBridgeError::RecoveryUnavailable)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn hyperliquid_readback_maps_all_six_faces_without_authorizing_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = recovery_fixture()?;
@@ -804,6 +930,10 @@ mod tests {
                 orders: Some(&fixture.orders),
                 fills: Some(&fixture.fills),
                 order_status: &statuses,
+                owner_order_ids: Some(&fixture.owner_order_ids),
+                raw_meta: META,
+                raw_account: ACCOUNT_SNAPSHOT,
+                collected_at_ms: COLLECTED_AT_MS,
             },
         )?;
 
@@ -864,6 +994,10 @@ mod tests {
                     orders: Some(&fixture.orders),
                     fills: Some(&fixture.fills),
                     order_status: &statuses,
+                    owner_order_ids: Some(&fixture.owner_order_ids),
+                    raw_meta: META,
+                    raw_account: ACCOUNT_SNAPSHOT,
+                    collected_at_ms: COLLECTED_AT_MS,
                 },
             ),
             Err(HyperliquidBridgeError::RecoveryEvidence)
@@ -883,6 +1017,10 @@ mod tests {
                     orders: Some(&fixture.orders),
                     fills: Some(&fixture.fills),
                     order_status: &statuses,
+                    owner_order_ids: Some(&fixture.owner_order_ids),
+                    raw_meta: META,
+                    raw_account: ACCOUNT_SNAPSHOT,
+                    collected_at_ms: COLLECTED_AT_MS,
                 },
             ),
             Err(HyperliquidBridgeError::RecoveryEvidence)
@@ -908,6 +1046,10 @@ mod tests {
                     orders: Some(&fixture.orders),
                     fills: Some(&fixture.fills),
                     order_status: &statuses,
+                    owner_order_ids: Some(&fixture.owner_order_ids),
+                    raw_meta: META,
+                    raw_account: ACCOUNT_SNAPSHOT,
+                    collected_at_ms: COLLECTED_AT_MS,
                 },
             ),
             Err(HyperliquidBridgeError::RecoveryEvidence)
@@ -938,6 +1080,153 @@ mod tests {
                     orders: Some(&fixture.orders),
                     fills: Some(&fixture.fills),
                     order_status: &statuses,
+                    owner_order_ids: Some(&fixture.owner_order_ids),
+                    raw_meta: META,
+                    raw_account: ACCOUNT_SNAPSHOT,
+                    collected_at_ms: COLLECTED_AT_MS,
+                },
+            ),
+            Err(HyperliquidBridgeError::RecoveryEvidence)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn old_probe_cannot_be_relabelled_to_new_attempt_scope_or_roots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = recovery_fixture()?;
+        let relabelled_scope = PhysicalRecoveryScope::verified(
+            fixture.scope.binding().clone(),
+            fixture.scope.config_digest(),
+            fixture.scope.config_epoch(),
+            fixture.scope.recovered_private_generation(),
+            PhysicalRecoveryAuthorityRoots::verified([4; 32], [5; 32], [6; 32])?,
+        )?;
+        let statuses = [status_readback(&fixture)];
+        let readback = || HyperliquidRecoveryReadback {
+            account: Some(&fixture.account),
+            orders: Some(&fixture.orders),
+            fills: Some(&fixture.fills),
+            order_status: &statuses,
+            owner_order_ids: Some(&fixture.owner_order_ids),
+            raw_meta: META,
+            raw_account: ACCOUNT_SNAPSHOT,
+            collected_at_ms: COLLECTED_AT_MS,
+        };
+        assert_eq!(
+            map_recovery_readback(
+                &fixture.anchor.payload.binding,
+                relabelled_scope,
+                41,
+                &fixture.anchor,
+                readback(),
+            ),
+            Err(HyperliquidBridgeError::RecoveryEvidence)
+        );
+        assert_eq!(
+            map_recovery_readback(
+                &fixture.anchor.payload.binding,
+                fixture.scope.clone(),
+                42,
+                &fixture.anchor,
+                readback(),
+            ),
+            Err(HyperliquidBridgeError::RecoveryEvidence)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_order_status_cannot_turn_an_unreplayed_family_into_complete_empty()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut fixture = recovery_fixture()?;
+        let status_scope = match &fixture.status {
+            HyperliquidOrderStatus::Unknown { scope, .. }
+            | HyperliquidOrderStatus::Known { scope, .. } => scope.clone(),
+        };
+        fixture.orders.orders.clear();
+        fixture.owner_order_ids.clear();
+        fixture.anchor.collector_orders_sha256 = sha256(&fixture.orders.raw_payload);
+        let unknown = HyperliquidOrderStatus::Unknown {
+            scope: status_scope,
+            lookup: fixture.lookup.clone(),
+        };
+        let statuses = [HyperliquidOrderStatusReadback {
+            private_generation: 11,
+            observed_ms: PROBE_OBSERVED_MS,
+            lookup: &fixture.lookup,
+            status: &unknown,
+            response_sha256: sha256(b"unknownOid"),
+        }];
+        assert_eq!(
+            map_recovery_readback(
+                &fixture.anchor.payload.binding,
+                fixture.scope.clone(),
+                41,
+                &fixture.anchor,
+                HyperliquidRecoveryReadback {
+                    account: Some(&fixture.account),
+                    orders: Some(&fixture.orders),
+                    fills: Some(&fixture.fills),
+                    order_status: &statuses,
+                    owner_order_ids: Some(&fixture.owner_order_ids),
+                    raw_meta: META,
+                    raw_account: ACCOUNT_SNAPSHOT,
+                    collected_at_ms: COLLECTED_AT_MS,
+                },
+            ),
+            Err(HyperliquidBridgeError::RecoveryEvidence)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nonempty_orders_without_structured_owner_proof_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = recovery_fixture()?;
+        assert!(!fixture.orders.orders.is_empty());
+        let statuses = [status_readback(&fixture)];
+        assert_eq!(
+            map_recovery_readback(
+                &fixture.anchor.payload.binding,
+                fixture.scope.clone(),
+                41,
+                &fixture.anchor,
+                HyperliquidRecoveryReadback {
+                    account: Some(&fixture.account),
+                    orders: Some(&fixture.orders),
+                    fills: Some(&fixture.fills),
+                    order_status: &statuses,
+                    owner_order_ids: None,
+                    raw_meta: META,
+                    raw_account: ACCOUNT_SNAPSHOT,
+                    collected_at_ms: COLLECTED_AT_MS,
+                },
+            ),
+            Err(HyperliquidBridgeError::RecoveryEvidence)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expired_probe_fixture_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = recovery_fixture()?;
+        let statuses = [status_readback(&fixture)];
+        assert_eq!(
+            map_recovery_readback(
+                &fixture.anchor.payload.binding,
+                fixture.scope.clone(),
+                41,
+                &fixture.anchor,
+                HyperliquidRecoveryReadback {
+                    account: Some(&fixture.account),
+                    orders: Some(&fixture.orders),
+                    fills: Some(&fixture.fills),
+                    order_status: &statuses,
+                    owner_order_ids: Some(&fixture.owner_order_ids),
+                    raw_meta: META,
+                    raw_account: ACCOUNT_SNAPSHOT,
+                    collected_at_ms: PROBE_EXPIRES_MS,
                 },
             ),
             Err(HyperliquidBridgeError::RecoveryEvidence)
