@@ -13,6 +13,7 @@ mod orders;
 mod private;
 mod private_surface;
 mod public;
+mod recovery;
 mod risk;
 mod sign;
 mod transport;
@@ -42,6 +43,14 @@ pub use private_surface::{
     validate_private_readback,
 };
 pub use public::*;
+pub use recovery::{
+    GateFreshRecoveryCandidate, GateFreshRecoveryCollector, GateFreshRecoveryError,
+    GateFreshRecoveryRawResponse, GateOwnedOpenOrder, GateRecoveryAuthorityRoots,
+    GateRecoveryCollectionStart, GateRecoveryCoverage, GateRecoveryOwnerRoute,
+    GateRecoveryPreparedRead, GateRecoveryScope, GateRecoverySurface,
+    GateRecoverySurfaceCommitment, GateRecoverySymbolReadback, GateRecoverySymbolScope,
+    GateUnknownOpenOrder, GateUnknownOpenOrderReason,
+};
 pub use risk::{
     GateContractRules, GateRiskAccountMode, GateRiskError, GateRiskReadback, decimal,
     decimal_value, dual_position_side, object, parse_dual_position_mode, parse_risk_snapshots,
