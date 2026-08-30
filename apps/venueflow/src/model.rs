@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,25 @@ const MAX_NOTICES: usize = 8;
 const MAX_RECEIPT_IDS: usize = 256;
 const MAX_COMMANDS: usize = 32;
 pub const DEFAULT_FAVORITE_SYMBOLS: [&str; 4] = ["BTC/USDC", "ETH/USDC", "SOL/USDC", "BNB/USDC"];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketQuote {
+    pub symbol: String,
+    pub last: Decimal,
+    pub change_percent_24h: Decimal,
+    pub quote_volume_24h: Decimal,
+    pub exchange_time_ms: u64,
+    pub received_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SymbolGroup {
+    Favorites,
+    Usdc,
+    Usdt,
+    #[default]
+    All,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum WorkspaceKind {
@@ -125,7 +144,9 @@ pub struct AppModel {
     pub local_catalog_error: Option<String>,
     #[cfg(not(target_arch = "wasm32"))]
     pub local_proxy_detected: bool,
+    pub local_quotes: BTreeMap<String, MarketQuote>,
     pub symbol_filter: String,
+    pub symbol_group: SymbolGroup,
     pub follow_latest_requested: bool,
     request_sequence: u64,
 }
@@ -154,7 +175,9 @@ impl AppModel {
             local_catalog_error: None,
             #[cfg(not(target_arch = "wasm32"))]
             local_proxy_detected: false,
+            local_quotes: BTreeMap::new(),
             symbol_filter: String::new(),
+            symbol_group: SymbolGroup::All,
             follow_latest_requested: false,
             request_sequence: 0,
         }
@@ -170,6 +193,19 @@ impl AppModel {
         symbols.dedup();
         self.local_symbols = symbols;
         self.local_catalog_error = None;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn apply_local_quotes(&mut self, quotes: Vec<MarketQuote>) {
+        for quote in quotes {
+            let replace = self
+                .local_quotes
+                .get(&quote.symbol)
+                .is_none_or(|current| quote.exchange_time_ms >= current.exchange_time_ms);
+            if replace {
+                self.local_quotes.insert(quote.symbol.clone(), quote);
+            }
+        }
     }
 
     pub fn apply_snapshot(&mut self, snapshot: ControlSnapshot) {

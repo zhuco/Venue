@@ -4946,6 +4946,7 @@ dependencies = [
  "venue-domain",
  "venue-gateway-api",
  "venue-gateway-binance",
+ "venue-indicators",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

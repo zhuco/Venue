@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
 use rust_decimal::Decimal;
 use serde_json::{Map, Value};
@@ -334,7 +337,8 @@ pub fn parse_closed_bar(
 
 /// Parses Binance USD-M `GET /fapi/v1/exchangeInfo` into the complete canonical set currently
 /// eligible for the local public feed. Inactive, delivery, and non-USDT/USDC products are omitted;
-/// malformed or ambiguous native identities fail the whole catalog closed.
+/// products whose base asset cannot be represented by the canonical alphanumeric domain symbol
+/// are omitted; ambiguous identities inside the representable catalog fail the whole parse.
 pub fn parse_public_exchange_info(payload: &str) -> Result<Vec<Symbol>, BinancePublicError> {
     let value: Value = serde_json::from_str(payload).map_err(|_| BinancePublicError::Payload)?;
     let rows = value
@@ -355,7 +359,9 @@ pub fn parse_public_exchange_info(payload: &str) -> Result<Vec<Symbol>, BinanceP
         {
             continue;
         }
-        let symbol = Symbol::new(base, quote).map_err(|_| BinancePublicError::Symbol)?;
+        let Ok(symbol) = Symbol::new(base, quote) else {
+            continue;
+        };
         if native_symbol(&symbol) != native_symbol_value
             || !native.insert(native_symbol_value.to_owned())
             || !canonical.insert(symbol)
@@ -367,6 +373,131 @@ pub fn parse_public_exchange_info(payload: &str) -> Result<Vec<Symbol>, BinanceP
         return Err(BinancePublicError::Value);
     }
     Ok(canonical.into_iter().collect())
+}
+
+/// One credential-free all-market 24-hour ticker used by desktop discovery surfaces.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinancePublic24hTicker {
+    pub symbol: Symbol,
+    pub exchange_time_ms: u64,
+    pub received_at_ms: u64,
+    pub last_price: Price,
+    pub price_change_percent: Decimal,
+    pub quote_volume: Decimal,
+}
+
+/// Parses Binance's `!ticker@arr` combined stream against an exchangeInfo-derived catalog.
+/// Native symbols absent from the current catalog are ignored, while duplicate catalog or frame
+/// identities fail closed.
+pub fn parse_public_market_ticker_array(
+    payload: &str,
+    catalog: &[Symbol],
+    received_at_ms: u64,
+) -> Result<Vec<BinancePublic24hTicker>, BinancePublicError> {
+    if catalog.is_empty() || received_at_ms == 0 {
+        return Err(BinancePublicError::Value);
+    }
+    let mut by_native = BTreeMap::new();
+    for symbol in catalog {
+        let native = native_symbol(symbol);
+        if by_native.insert(native, symbol.clone()).is_some() {
+            return Err(BinancePublicError::Symbol);
+        }
+    }
+    let value: Value = serde_json::from_str(payload).map_err(|_| BinancePublicError::Payload)?;
+    let mut wrapper = value
+        .as_object()
+        .cloned()
+        .ok_or(BinancePublicError::Payload)?;
+    if wrapper.get("stream").and_then(Value::as_str) != Some("!ticker@arr") {
+        return Err(BinancePublicError::Payload);
+    }
+    let rows = wrapper
+        .remove("data")
+        .and_then(|value| value.as_array().cloned())
+        .ok_or(BinancePublicError::Payload)?;
+    let mut seen = BTreeSet::new();
+    let mut tickers = Vec::with_capacity(rows.len().min(catalog.len()));
+    for row in rows {
+        let row = row.as_object().ok_or(BinancePublicError::Payload)?;
+        if row.get("e").and_then(Value::as_str) != Some("24hrTicker") {
+            return Err(BinancePublicError::Payload);
+        }
+        let native = required_string(row.get("s"))?;
+        let Some(symbol) = by_native.get(native) else {
+            continue;
+        };
+        if !seen.insert(native.to_owned()) {
+            return Err(BinancePublicError::Symbol);
+        }
+        let exchange_time_ms = positive_u64(row.get("E"))?;
+        if exchange_time_ms > received_at_ms {
+            return Err(BinancePublicError::Value);
+        }
+        tickers.push(BinancePublic24hTicker {
+            symbol: symbol.clone(),
+            exchange_time_ms,
+            received_at_ms,
+            last_price: positive_price(row.get("c"))?,
+            price_change_percent: decimal(row.get("P"))?,
+            quote_volume: non_negative_decimal(row.get("q"))?,
+        });
+    }
+    if tickers.is_empty() {
+        return Err(BinancePublicError::Value);
+    }
+    Ok(tickers)
+}
+
+/// Parses the credential-free `GET /fapi/v1/ticker/24hr` all-market startup snapshot.
+pub fn parse_public_market_ticker_snapshot(
+    payload: &str,
+    catalog: &[Symbol],
+    received_at_ms: u64,
+) -> Result<Vec<BinancePublic24hTicker>, BinancePublicError> {
+    if catalog.is_empty() || received_at_ms == 0 {
+        return Err(BinancePublicError::Value);
+    }
+    let by_native = catalog
+        .iter()
+        .map(|symbol| (native_symbol(symbol), symbol.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if by_native.len() != catalog.len() {
+        return Err(BinancePublicError::Symbol);
+    }
+    let rows = serde_json::from_str::<Value>(payload)
+        .map_err(|_| BinancePublicError::Payload)?
+        .as_array()
+        .cloned()
+        .ok_or(BinancePublicError::Payload)?;
+    let mut seen = BTreeSet::new();
+    let mut tickers = Vec::with_capacity(rows.len().min(catalog.len()));
+    for row in rows {
+        let row = row.as_object().ok_or(BinancePublicError::Payload)?;
+        let native = required_string(row.get("symbol"))?;
+        let Some(symbol) = by_native.get(native) else {
+            continue;
+        };
+        if !seen.insert(native.to_owned()) {
+            return Err(BinancePublicError::Symbol);
+        }
+        let exchange_time_ms = positive_u64(row.get("closeTime"))?;
+        if exchange_time_ms > received_at_ms {
+            return Err(BinancePublicError::Value);
+        }
+        tickers.push(BinancePublic24hTicker {
+            symbol: symbol.clone(),
+            exchange_time_ms,
+            received_at_ms,
+            last_price: positive_price(row.get("lastPrice"))?,
+            price_change_percent: decimal(row.get("priceChangePercent"))?,
+            quote_volume: non_negative_decimal(row.get("quoteVolume"))?,
+        });
+    }
+    if tickers.is_empty() {
+        return Err(BinancePublicError::Value);
+    }
+    Ok(tickers)
 }
 
 /// Parses a direct Binance `bookTicker` frame or a combined-stream wrapper for the local,
@@ -1222,5 +1353,30 @@ mod public_market_tests {
             BinanceKlineInterval::parse("3m"),
             Err(BinancePublicError::Interval)
         );
+    }
+
+    #[test]
+    fn all_market_ticker_array_is_catalog_scoped_and_signed_change_is_preserved()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let catalog = vec!["BTC/USDT".parse()?, "ETH/USDC".parse()?];
+        let payload = r#"{"stream":"!ticker@arr","data":[
+            {"e":"24hrTicker","E":1000,"s":"BTCUSDT","c":"101.5","P":"-2.25","q":"500000"},
+            {"e":"24hrTicker","E":1001,"s":"ETHUSDC","c":"2500","P":"3.75","q":"800000"},
+            {"e":"24hrTicker","E":1001,"s":"UNKNOWN","c":"1","P":"0","q":"1"}
+        ]}"#;
+        let tickers = parse_public_market_ticker_array(payload, &catalog, 1_002)?;
+        assert_eq!(tickers.len(), 2);
+        assert_eq!(tickers[0].symbol.to_string(), "BTC/USDT");
+        assert_eq!(tickers[0].price_change_percent, Decimal::new(-225, 2));
+        assert_eq!(tickers[1].last_price.value(), Decimal::from(2_500));
+        let snapshot = r#"[
+            {"symbol":"BTCUSDT","lastPrice":"102.5","priceChangePercent":"-1.5","quoteVolume":"900000","closeTime":1000},
+            {"symbol":"ETHUSDC","lastPrice":"2510","priceChangePercent":"4.25","quoteVolume":"700000","closeTime":1001}
+        ]"#;
+        let tickers = parse_public_market_ticker_snapshot(snapshot, &catalog, 1_002)?;
+        assert_eq!(tickers.len(), 2);
+        assert_eq!(tickers[0].last_price.value(), Decimal::new(1_025, 1));
+        assert_eq!(tickers[1].price_change_percent, Decimal::new(425, 2));
+        Ok(())
     }
 }

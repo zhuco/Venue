@@ -4,9 +4,11 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use venue_control_protocol::{UiBar, UiBookLevel, UiTrade};
+use venue_domain::{FieldState, PublicBar};
 use venue_gateway_api::PublicMarketBinding;
+use venue_indicators::chart::{ChartIndicatorError, ChartStudyEngine, ChartStudyValues};
 
-use crate::chart::ChartInterval;
+use crate::chart::{ChartInterval, ChartStudyPoint};
 
 pub const MAX_BARS: usize = 2_000;
 pub const MAX_TRADES: usize = 200;
@@ -49,10 +51,11 @@ pub enum MarketStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub enum MarketPayload {
     RestHistory {
-        bars: Vec<UiBar>,
+        bars: Vec<PublicBar>,
     },
     WsBar {
         bar: UiBar,
+        study_bar: Box<PublicBar>,
         closed: bool,
     },
     BookSnapshot {
@@ -87,6 +90,7 @@ pub struct LocalMarketView {
     pub status: MarketStatus,
     pub status_detail: Option<String>,
     pub bars: Vec<UiBar>,
+    pub studies: Vec<ChartStudyPoint>,
     pub bids: Vec<UiBookLevel>,
     pub asks: Vec<UiBookLevel>,
     pub trades: Vec<UiTrade>,
@@ -106,6 +110,7 @@ impl LocalMarketView {
             status: MarketStatus::LoadingHistory,
             status_detail: None,
             bars: Vec::new(),
+            studies: Vec::new(),
             bids: Vec::new(),
             asks: Vec::new(),
             trades: Vec::new(),
@@ -129,6 +134,8 @@ pub enum ReduceOutcome {
 pub struct LocalMarketReducer {
     view: LocalMarketView,
     closed_bars: BTreeSet<u64>,
+    closed_facts: BTreeMap<u64, PublicBar>,
+    studies: ChartStudyEngine,
 }
 
 impl LocalMarketReducer {
@@ -148,6 +155,8 @@ impl LocalMarketReducer {
         Ok(Self {
             view: LocalMarketView::empty(generation, selection),
             closed_bars: BTreeSet::new(),
+            closed_facts: BTreeMap::new(),
+            studies: ChartStudyEngine::standard().map_err(LocalMarketError::Indicator)?,
         })
     }
 
@@ -167,6 +176,8 @@ impl LocalMarketReducer {
             .ok_or(LocalMarketError::GenerationExhausted)?;
         self.view = LocalMarketView::empty(generation, selection);
         self.closed_bars.clear();
+        self.closed_facts.clear();
+        self.studies.reset();
         Ok(generation)
     }
 
@@ -186,7 +197,11 @@ impl LocalMarketReducer {
 
         match envelope.payload {
             MarketPayload::RestHistory { bars } => self.apply_history(bars)?,
-            MarketPayload::WsBar { bar, closed } => self.apply_bar(bar, closed)?,
+            MarketPayload::WsBar {
+                bar,
+                study_bar,
+                closed,
+            } => self.apply_bar(bar, *study_bar, closed)?,
             MarketPayload::BookSnapshot { bids, asks } => self.apply_book(bids, asks)?,
             MarketPayload::Bbo { bid, ask } => self.apply_bbo(bid, ask)?,
             MarketPayload::Trade(trade) => self.apply_trade(trade)?,
@@ -217,30 +232,117 @@ impl LocalMarketReducer {
         }
     }
 
-    fn apply_history(&mut self, bars: Vec<UiBar>) -> Result<(), LocalMarketError> {
-        for bar in &bars {
-            validate_bar(bar, self.view.selection.interval)?;
-        }
+    fn apply_history(&mut self, mut bars: Vec<PublicBar>) -> Result<(), LocalMarketError> {
+        bars.sort_by_key(|bar| bar.open_time_ms);
+        self.view.bars.clear();
+        self.view.studies.clear();
+        self.closed_bars.clear();
+        self.closed_facts.clear();
+        self.studies.reset();
         for bar in bars {
+            validate_study_bar(&bar, &self.view.selection)?;
+            let ui_bar = ui_bar_from_public(&bar)?;
+            let values = self
+                .studies
+                .ingest_closed(&bar)
+                .map_err(LocalMarketError::Indicator)?;
             self.closed_bars.insert(bar.open_time_ms);
-            upsert_bar(&mut self.view.bars, bar);
+            self.closed_facts.insert(bar.open_time_ms, bar);
+            upsert_bar(&mut self.view.bars, ui_bar.clone());
+            upsert_study(
+                &mut self.view.studies,
+                ChartStudyPoint {
+                    open_time_ms: ui_bar.open_time_ms,
+                    confirmed: true,
+                    ..study_point(values)
+                },
+            );
         }
         trim_bars(&mut self.view.bars, &mut self.closed_bars);
+        trim_studies(&mut self.view.studies);
         self.view.last = self.view.bars.last().map(|bar| bar.close);
         Ok(())
     }
 
-    fn apply_bar(&mut self, bar: UiBar, closed: bool) -> Result<(), LocalMarketError> {
+    fn apply_bar(
+        &mut self,
+        bar: UiBar,
+        study_bar: PublicBar,
+        closed: bool,
+    ) -> Result<(), LocalMarketError> {
         validate_bar(&bar, self.view.selection.interval)?;
+        validate_study_bar(&study_bar, &self.view.selection)?;
+        if bar.open_time_ms != study_bar.open_time_ms {
+            return Err(LocalMarketError::ScopeMismatch);
+        }
         if self.closed_bars.contains(&bar.open_time_ms) && !closed {
             return Ok(());
         }
         if closed {
+            if let Some(existing) = self.closed_facts.get(&bar.open_time_ms) {
+                if existing != &study_bar {
+                    self.closed_facts.insert(bar.open_time_ms, study_bar);
+                    return self.rebuild_studies_and_bars();
+                }
+            } else {
+                let values = self
+                    .studies
+                    .ingest_closed(&study_bar)
+                    .map_err(LocalMarketError::Indicator)?;
+                upsert_study(
+                    &mut self.view.studies,
+                    ChartStudyPoint {
+                        open_time_ms: bar.open_time_ms,
+                        confirmed: true,
+                        ..study_point(values)
+                    },
+                );
+                self.closed_facts.insert(bar.open_time_ms, study_bar);
+            }
             self.closed_bars.insert(bar.open_time_ms);
+        } else {
+            let values = self
+                .studies
+                .preview(&study_bar)
+                .map_err(LocalMarketError::Indicator)?;
+            upsert_study(
+                &mut self.view.studies,
+                ChartStudyPoint {
+                    open_time_ms: bar.open_time_ms,
+                    confirmed: false,
+                    ..study_point(values)
+                },
+            );
         }
         self.view.last = Some(bar.close);
         upsert_bar(&mut self.view.bars, bar);
         trim_bars(&mut self.view.bars, &mut self.closed_bars);
+        trim_studies(&mut self.view.studies);
+        Ok(())
+    }
+
+    fn rebuild_studies_and_bars(&mut self) -> Result<(), LocalMarketError> {
+        self.studies.reset();
+        self.view.studies.clear();
+        self.view.bars.clear();
+        self.closed_bars.clear();
+        for bar in self.closed_facts.values() {
+            let values = self
+                .studies
+                .ingest_closed(bar)
+                .map_err(LocalMarketError::Indicator)?;
+            let ui_bar = ui_bar_from_public(bar)?;
+            self.closed_bars.insert(bar.open_time_ms);
+            self.view.bars.push(ui_bar);
+            self.view.studies.push(ChartStudyPoint {
+                open_time_ms: bar.open_time_ms,
+                confirmed: true,
+                ..study_point(values)
+            });
+        }
+        self.view.last = self.view.bars.last().map(|bar| bar.close);
+        trim_bars(&mut self.view.bars, &mut self.closed_bars);
+        trim_studies(&mut self.view.studies);
         Ok(())
     }
 
@@ -399,6 +501,60 @@ pub enum LocalMarketError {
     InvalidBbo,
     #[error("trade identity, time, price, or quantity is invalid")]
     InvalidTrade,
+    #[error("local chart indicator rejected market data: {0}")]
+    Indicator(#[from] ChartIndicatorError),
+}
+
+fn validate_study_bar(
+    bar: &PublicBar,
+    selection: &MarketSelection,
+) -> Result<(), LocalMarketError> {
+    if bar.symbol != selection.binding.symbol
+        || bar.generation == 0
+        || bar.interval_ms != selection.interval.duration_ms()
+        || !bar.is_valid()
+    {
+        return Err(LocalMarketError::InvalidBar);
+    }
+    Ok(())
+}
+
+fn ui_bar_from_public(bar: &PublicBar) -> Result<UiBar, LocalMarketError> {
+    let FieldState::Known(volume) = bar.base_volume else {
+        return Err(LocalMarketError::InvalidBar);
+    };
+    Ok(UiBar {
+        open_time_ms: bar.open_time_ms,
+        open: bar.open.value(),
+        high: bar.high.value(),
+        low: bar.low.value(),
+        close: bar.close.value(),
+        volume,
+    })
+}
+
+fn study_point(values: ChartStudyValues) -> ChartStudyPoint {
+    let (bollinger_upper, bollinger_middle, bollinger_lower) =
+        values.bollinger.map_or((None, None, None), |value| {
+            (Some(value.upper), Some(value.middle), Some(value.lower))
+        });
+    let (macd, macd_signal, macd_histogram) = values.macd.map_or((None, None, None), |value| {
+        (Some(value.macd), Some(value.signal), Some(value.histogram))
+    });
+    ChartStudyPoint {
+        sma: values.sma,
+        ema: values.ema,
+        bollinger_upper,
+        bollinger_middle,
+        bollinger_lower,
+        vwap: values.vwap,
+        rsi: values.rsi,
+        macd,
+        macd_signal,
+        macd_histogram,
+        atr: values.atr,
+        ..ChartStudyPoint::default()
+    }
 }
 
 fn validate_bar(bar: &UiBar, interval: ChartInterval) -> Result<(), LocalMarketError> {
@@ -426,6 +582,19 @@ fn upsert_bar(bars: &mut Vec<UiBar>, bar: UiBar) {
     match bars.binary_search_by_key(&bar.open_time_ms, |existing| existing.open_time_ms) {
         Ok(index) => bars[index] = bar,
         Err(index) => bars.insert(index, bar),
+    }
+}
+
+fn upsert_study(studies: &mut Vec<ChartStudyPoint>, point: ChartStudyPoint) {
+    match studies.binary_search_by_key(&point.open_time_ms, |existing| existing.open_time_ms) {
+        Ok(index) => studies[index] = point,
+        Err(index) => studies.insert(index, point),
+    }
+}
+
+fn trim_studies(studies: &mut Vec<ChartStudyPoint>) {
+    if studies.len() > MAX_BARS {
+        studies.drain(..studies.len() - MAX_BARS);
     }
 }
 
@@ -467,6 +636,7 @@ fn normalize_book_side(
 mod tests {
     use super::*;
     use venue_control_protocol::AggressorSide;
+    use venue_domain::Price;
 
     fn selection(symbol: &str) -> Result<MarketSelection, LocalMarketError> {
         MarketSelection::binance_usd_m(symbol, ChartInterval::OneMinute)
@@ -481,6 +651,31 @@ mod tests {
             close: Decimal::new(close, 0),
             volume: Decimal::new(10, 0),
         }
+    }
+
+    fn study_bar(open_time_ms: u64, close: i64) -> Result<PublicBar, LocalMarketError> {
+        let ui = bar(open_time_ms, close);
+        let price = |value| Price::new(value).map_err(|_| LocalMarketError::InvalidBar);
+        Ok(PublicBar {
+            symbol: "BTC/USDT"
+                .parse()
+                .map_err(|_| LocalMarketError::InvalidSymbol)?,
+            generation: 1,
+            received_at_ms: open_time_ms + 60_000,
+            sequence: open_time_ms / 60_000,
+            open_time_ms,
+            close_time_ms: open_time_ms + 59_999,
+            interval_ms: 60_000,
+            open: price(ui.open)?,
+            high: price(ui.high)?,
+            low: price(ui.low)?,
+            close: price(ui.close)?,
+            base_volume: FieldState::Known(ui.volume),
+            quote_volume: FieldState::Known(ui.volume * ui.close),
+            trade_count: FieldState::Known(1),
+            taker_buy_base_volume: FieldState::Known(Decimal::ZERO),
+            taker_buy_quote_volume: FieldState::Known(Decimal::ZERO),
+        })
     }
 
     fn envelope(
@@ -519,7 +714,7 @@ mod tests {
             &reducer,
             120_000,
             MarketPayload::RestHistory {
-                bars: vec![bar(60_000, 10)],
+                bars: vec![study_bar(60_000, 10)?],
             },
         );
         reducer.apply(old.clone())?;
@@ -562,7 +757,7 @@ mod tests {
             &reducer,
             180_000,
             MarketPayload::RestHistory {
-                bars: vec![bar(120_000, 12), bar(60_000, 11)],
+                bars: vec![study_bar(120_000, 12)?, study_bar(60_000, 11)?],
             },
         );
         reducer.apply(history)?;
@@ -571,6 +766,7 @@ mod tests {
             181_000,
             MarketPayload::WsBar {
                 bar: bar(120_000, 13),
+                study_bar: Box::new(study_bar(120_000, 13)?),
                 closed: true,
             },
         );
@@ -580,6 +776,7 @@ mod tests {
             182_000,
             MarketPayload::WsBar {
                 bar: bar(120_000, 99),
+                study_bar: Box::new(study_bar(120_000, 99)?),
                 closed: false,
             },
         );
@@ -595,8 +792,8 @@ mod tests {
     fn bars_are_bounded_to_newest_two_thousand() -> Result<(), LocalMarketError> {
         let mut reducer = LocalMarketReducer::new(selection("BTC/USDT")?)?;
         let bars = (1_u64..=2_010)
-            .map(|index| bar(index * 60_000, 10))
-            .collect();
+            .map(|index| study_bar(index * 60_000, 10))
+            .collect::<Result<Vec<_>, _>>()?;
         let result = envelope(
             &reducer,
             2_011 * 60_000,

@@ -200,7 +200,6 @@ fn split(
 
 fn build_trading() -> Tree<Pane> {
     let mut tiles = Tiles::default();
-    let watch = pane(&mut tiles, PaneKind::MarketWatch, 1);
     let chart = pane(&mut tiles, PaneKind::Chart, 1);
     let book = pane(&mut tiles, PaneKind::OrderBook, 1);
     let tape = pane(&mut tiles, PaneKind::TradeTape, 1);
@@ -209,8 +208,7 @@ fn build_trading() -> Tree<Pane> {
     let market_side = split(&mut tiles, LinearDir::Vertical, book, tape, 0.52);
     let upper = split(&mut tiles, LinearDir::Horizontal, chart, market_side, 0.76);
     let lower = split(&mut tiles, LinearDir::Horizontal, strategies, control, 0.72);
-    let center = split(&mut tiles, LinearDir::Vertical, upper, lower, 0.67);
-    let root = split(&mut tiles, LinearDir::Horizontal, watch, center, 0.16);
+    let root = split(&mut tiles, LinearDir::Vertical, upper, lower, 0.72);
     Tree::new("venueflow-trading", root, tiles)
 }
 
@@ -238,13 +236,11 @@ fn build_operations() -> Tree<Pane> {
 
 fn build_multi_chart() -> Tree<Pane> {
     let mut tiles = Tiles::default();
-    let watch = pane(&mut tiles, PaneKind::MarketWatch, 2);
     let btc = chart(&mut tiles, 1, "BTC/USDC");
     let eth = chart(&mut tiles, 2, "ETH/USDC");
     let sol = chart(&mut tiles, 3, "SOL/USDC");
     let bnb = chart(&mut tiles, 4, "BNB/USDC");
-    let charts = tiles.insert_grid_tile(vec![btc, eth, sol, bnb]);
-    let root = split(&mut tiles, LinearDir::Horizontal, watch, charts, 0.14);
+    let root = tiles.insert_grid_tile(vec![btc, eth, sol, bnb]);
     Tree::new("venueflow-multi-chart", root, tiles)
 }
 

@@ -1,11 +1,29 @@
 use std::ops::Range;
 
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use venue_control_protocol::UiBar;
 
 pub const DEFAULT_VISIBLE_BARS: usize = 120;
 pub const MIN_VISIBLE_BARS: usize = 20;
 pub const MAX_VISIBLE_BARS: usize = 400;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ChartStudyPoint {
+    pub open_time_ms: u64,
+    pub confirmed: bool,
+    pub sma: Option<Decimal>,
+    pub ema: Option<Decimal>,
+    pub bollinger_upper: Option<Decimal>,
+    pub bollinger_middle: Option<Decimal>,
+    pub bollinger_lower: Option<Decimal>,
+    pub vwap: Option<Decimal>,
+    pub rsi: Option<Decimal>,
+    pub macd: Option<Decimal>,
+    pub macd_signal: Option<Decimal>,
+    pub macd_histogram: Option<Decimal>,
+    pub atr: Option<Decimal>,
+}
 
 /// UI-owned display interval. It deliberately has no exchange-native representation.
 #[derive(

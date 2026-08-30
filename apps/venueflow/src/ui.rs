@@ -8,12 +8,12 @@ use venue_control_protocol::{
 #[cfg(not(target_arch = "wasm32"))]
 use crate::market::{LocalMarketView, MarketSelection, MarketStatus};
 use crate::{
-    chart::{PriceRange, bar_center_x, bar_index_at_x},
+    chart::{ChartStudyPoint, PriceRange, bar_center_x, bar_index_at_x},
     client::ControlClient,
     i18n::{Language, TextKey, text},
     model::{
-        AppModel, PendingConfirmation, WorkspaceKind, decimal_to_f64, format_decimal,
-        freshness_age_ms, requires_operator_confirmation,
+        AppModel, MarketQuote, PendingConfirmation, SymbolGroup, WorkspaceKind, decimal_to_f64,
+        format_decimal, freshness_age_ms, requires_operator_confirmation,
     },
     theme,
     workspace::{Pane, PaneKind, Workspaces},
@@ -60,7 +60,9 @@ pub fn show_top_bar(
     workspaces: &mut Workspaces,
     show_modules: &mut bool,
     show_settings: &mut bool,
+    show_symbol_picker: &mut bool,
 ) {
+    let context = ui.ctx().clone();
     egui::Frame::new()
         .fill(theme::BG_SECONDARY)
         .stroke(Stroke::new(1.0, theme::DIVIDER))
@@ -84,59 +86,6 @@ pub fn show_top_bar(
                     }
                 }
                 ui.separator();
-                let mut symbols = available_symbols(model);
-                symbols.extend(model.preferences.favorite_symbols.iter().cloned());
-                symbols.push(model.preferences.selected_symbol.clone());
-                symbols.sort_by(|left, right| {
-                    favorite_rank(&model.preferences.favorite_symbols, left)
-                        .cmp(&favorite_rank(&model.preferences.favorite_symbols, right))
-                        .then_with(|| left.cmp(right))
-                });
-                symbols.dedup();
-                let mut selected = None;
-                egui::ComboBox::from_id_salt("selected-symbol")
-                    .selected_text(&model.preferences.selected_symbol)
-                    .width(150.0)
-                    .show_ui(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut model.symbol_filter)
-                                .hint_text(text(language, TextKey::SearchSymbol)),
-                        );
-                        ui.separator();
-                        let filter = model.symbol_filter.trim().to_ascii_uppercase();
-                        egui::ScrollArea::vertical()
-                            .max_height(420.0)
-                            .show(ui, |ui| {
-                                let mut shown = 0;
-                                for symbol in &symbols {
-                                    if !filter.is_empty() && !symbol.contains(&filter) {
-                                        continue;
-                                    }
-                                    shown += 1;
-                                    if ui
-                                        .selectable_label(
-                                            model.preferences.selected_symbol == *symbol,
-                                            symbol,
-                                        )
-                                        .clicked()
-                                    {
-                                        selected = Some(symbol.clone());
-                                    }
-                                }
-                                if shown == 0 {
-                                    ui.colored_label(
-                                        theme::TEXT_SECONDARY,
-                                        text(language, TextKey::NoSymbols),
-                                    );
-                                }
-                            });
-                    });
-                if let Some(symbol) = selected {
-                    model.preferences.selected_symbol = symbol;
-                    model.symbol_filter.clear();
-                    workspaces.follow_dynamic_charts_latest();
-                }
-                ui.separator();
                 connection_badge(ui, model.connection, language);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(text(language, TextKey::Settings)).clicked() {
@@ -151,7 +100,192 @@ pub fn show_top_bar(
                     }
                 });
             });
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui
+                    .button(format!("⌕  {}  ▾", model.preferences.selected_symbol))
+                    .clicked()
+                {
+                    *show_symbol_picker = true;
+                }
+                ui.separator();
+                egui::ScrollArea::horizontal()
+                    .id_salt("favorite-symbol-tabs")
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let favorites = model.preferences.favorite_symbols.clone();
+                            for symbol in favorites {
+                                let quote = local_quote(model, &symbol);
+                                let details = quote.map_or_else(
+                                    || "—".to_owned(),
+                                    |quote| {
+                                        format!(
+                                            "{}  {:+.2}%",
+                                            format_decimal(quote.last, 4),
+                                            quote.change_percent_24h
+                                        )
+                                    },
+                                );
+                                let selected = model.preferences.selected_symbol == symbol;
+                                if ui
+                                    .selectable_label(selected, format!("{symbol}\n{details}"))
+                                    .clicked()
+                                {
+                                    model.preferences.selected_symbol = symbol;
+                                    workspaces.follow_dynamic_charts_latest();
+                                }
+                            }
+                            if ui.small_button("＋").clicked() {
+                                *show_symbol_picker = true;
+                            }
+                        });
+                    });
+            });
         });
+    show_symbol_picker_window(&context, show_symbol_picker, model, workspaces);
+}
+
+fn show_symbol_picker_window(
+    context: &egui::Context,
+    open: &mut bool,
+    model: &mut AppModel,
+    workspaces: &mut Workspaces,
+) {
+    if !*open {
+        return;
+    }
+    if context.input(|input| input.key_pressed(egui::Key::Escape)) {
+        *open = false;
+        return;
+    }
+    let language = model.preferences.language;
+    let mut symbols = available_symbols(model);
+    symbols.extend(model.preferences.favorite_symbols.iter().cloned());
+    symbols.sort_by(|left, right| {
+        favorite_rank(&model.preferences.favorite_symbols, left)
+            .cmp(&favorite_rank(&model.preferences.favorite_symbols, right))
+            .then_with(|| left.cmp(right))
+    });
+    symbols.dedup();
+    let normalized_filter = model
+        .symbol_filter
+        .trim()
+        .to_ascii_uppercase()
+        .replace(['/', '-', '_'], "");
+    let filtered = symbols
+        .into_iter()
+        .filter(|symbol| {
+            let group_match = match model.symbol_group {
+                SymbolGroup::Favorites => model.preferences.favorite_symbols.contains(symbol),
+                SymbolGroup::Usdc => symbol.ends_with("/USDC"),
+                SymbolGroup::Usdt => symbol.ends_with("/USDT"),
+                SymbolGroup::All => true,
+            };
+            let normalized_symbol = symbol.replace('/', "");
+            group_match
+                && (normalized_filter.is_empty() || normalized_symbol.contains(&normalized_filter))
+        })
+        .collect::<Vec<_>>();
+    let mut selected = context
+        .input(|input| input.key_pressed(egui::Key::Enter))
+        .then(|| filtered.first().cloned())
+        .flatten();
+    let mut keep_open = *open;
+    egui::Window::new(text(language, TextKey::SearchSymbol))
+        .open(&mut keep_open)
+        .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .default_width(760.0)
+        .resizable(true)
+        .collapsible(false)
+        .show(context, |ui| {
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut model.symbol_filter)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("BTCUSDC / BTC/USDC"),
+            );
+            if model.symbol_filter.is_empty() {
+                search.request_focus();
+            }
+            if search.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Tab)) {
+                search.request_focus();
+            }
+            ui.horizontal(|ui| {
+                for (group, label) in [
+                    (SymbolGroup::Favorites, "★ 收藏"),
+                    (SymbolGroup::All, "全部"),
+                    (SymbolGroup::Usdc, "USDC"),
+                    (SymbolGroup::Usdt, "USDT"),
+                ] {
+                    ui.selectable_value(&mut model.symbol_group, group, label);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.small(format!("{} markets", filtered.len()));
+                });
+            });
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(440.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("symbol-picker-grid")
+                        .striped(true)
+                        .num_columns(5)
+                        .min_col_width(110.0)
+                        .show(ui, |ui| {
+                            ui.strong("★");
+                            ui.strong(text(language, TextKey::Symbol));
+                            ui.strong(text(language, TextKey::Last));
+                            ui.strong("24h %");
+                            ui.strong("24h Quote Volume");
+                            ui.end_row();
+                            for symbol in &filtered {
+                                let favorite = model.preferences.favorite_symbols.contains(symbol);
+                                if ui.small_button(if favorite { "★" } else { "☆" }).clicked() {
+                                    if favorite {
+                                        model
+                                            .preferences
+                                            .favorite_symbols
+                                            .retain(|item| item != symbol);
+                                    } else {
+                                        model.preferences.favorite_symbols.push(symbol.clone());
+                                    }
+                                }
+                                if ui
+                                    .selectable_label(
+                                        model.preferences.selected_symbol == *symbol,
+                                        symbol,
+                                    )
+                                    .clicked()
+                                {
+                                    selected = Some(symbol.clone());
+                                }
+                                if let Some(quote) = local_quote(model, symbol) {
+                                    ui.monospace(format_decimal(quote.last, 6));
+                                    ui.colored_label(
+                                        if quote.change_percent_24h >= rust_decimal::Decimal::ZERO {
+                                            theme::BUY
+                                        } else {
+                                            theme::SELL
+                                        },
+                                        format!("{:+.2}%", quote.change_percent_24h),
+                                    );
+                                    ui.monospace(format_decimal(quote.quote_volume_24h, 0));
+                                } else {
+                                    ui.monospace("—");
+                                    ui.monospace("—");
+                                    ui.monospace("—");
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
+    *open = keep_open;
+    if let Some(symbol) = selected {
+        model.preferences.selected_symbol = symbol;
+        model.symbol_filter.clear();
+        workspaces.follow_dynamic_charts_latest();
+        *open = false;
+    }
 }
 
 pub fn show_status_bar(ui: &mut egui::Ui, model: &AppModel) {
@@ -455,13 +589,32 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &AppModel) {
         });
         ui.horizontal_wrapped(|ui| {
             ui.strong(text(language, TextKey::Indicators));
-            ui.colored_label(
-                theme::TEXT_SECONDARY,
-                text(language, TextKey::IndicatorPending),
-            );
+            if let Some(study) = local.studies.last() {
+                let state = if study.confirmed { "closed" } else { "forming" };
+                ui.colored_label(theme::TEXT_SECONDARY, format!("7 studies · {state}"));
+                for (name, value) in [
+                    ("SMA20", study.sma),
+                    ("EMA20", study.ema),
+                    ("VWAP", study.vwap),
+                    ("RSI14", study.rsi),
+                    ("ATR14", study.atr),
+                ] {
+                    if let Some(value) = value {
+                        ui.monospace(format!("{name} {}", format_decimal(value, 4)));
+                    }
+                }
+            } else {
+                ui.colored_label(theme::TEXT_SECONDARY, "warming up");
+            }
         });
         show_chart_toolbar(ui, pane, language);
-        candle_plot(ui, &local.bars, &mut pane.viewport, language);
+        candle_plot(
+            ui,
+            &local.bars,
+            &local.studies,
+            &mut pane.viewport,
+            language,
+        );
         return;
     }
     pane_heading(ui, symbol, text(language, TextKey::ControlFallback));
@@ -485,7 +638,7 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &AppModel) {
         }
     });
     show_chart_toolbar(ui, pane, language);
-    candle_plot(ui, &market.bars, &mut pane.viewport, language);
+    candle_plot(ui, &market.bars, &[], &mut pane.viewport, language);
 }
 
 fn show_chart_toolbar(ui: &mut egui::Ui, pane: &mut Pane, language: Language) {
@@ -525,6 +678,7 @@ fn show_chart_toolbar(ui: &mut egui::Ui, pane: &mut Pane, language: Language) {
 fn candle_plot(
     ui: &mut egui::Ui,
     all_bars: &[UiBar],
+    all_studies: &[ChartStudyPoint],
     viewport: &mut crate::chart::ChartViewport,
     language: Language,
 ) {
@@ -565,17 +719,44 @@ fn candle_plot(
 
     let range = viewport.visible_range(all_bars.len());
     let bars = &all_bars[range];
+    let has_local_studies = !all_studies.is_empty();
+    let price_ratio = if has_local_studies { 0.58 } else { 0.78 };
     let price_rect = Rect::from_min_max(
         plot_rect.min,
         Pos2::new(
             plot_rect.right(),
-            plot_rect.top() + plot_rect.height() * 0.78,
+            plot_rect.top() + plot_rect.height() * price_ratio,
         ),
     );
     let volume_rect = Rect::from_min_max(
         Pos2::new(plot_rect.left(), price_rect.bottom() + 5.0),
-        plot_rect.max,
+        Pos2::new(
+            plot_rect.right(),
+            if has_local_studies {
+                plot_rect.top() + plot_rect.height() * 0.70
+            } else {
+                plot_rect.bottom()
+            },
+        ),
     );
+    let rsi_rect = has_local_studies.then(|| {
+        Rect::from_min_max(
+            Pos2::new(plot_rect.left(), volume_rect.bottom() + 5.0),
+            Pos2::new(
+                plot_rect.right(),
+                plot_rect.top() + plot_rect.height() * 0.84,
+            ),
+        )
+    });
+    let macd_rect = has_local_studies.then(|| {
+        Rect::from_min_max(
+            Pos2::new(
+                plot_rect.left(),
+                plot_rect.top() + plot_rect.height() * 0.85,
+            ),
+            plot_rect.max,
+        )
+    });
     let Some(price_range) = PriceRange::from_bars(bars) else {
         return;
     };
@@ -644,6 +825,15 @@ fn candle_plot(
             Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 150),
         );
     }
+    if has_local_studies {
+        draw_price_studies(&painter, price_rect, bars, all_studies, price_y);
+        if let Some(rect) = rsi_rect {
+            draw_rsi_study(&painter, rect, bars, all_studies);
+        }
+        if let Some(rect) = macd_rect {
+            draw_macd_study(&painter, rect, bars, all_studies);
+        }
+    }
     if let Some(last) = bars.last() {
         let y = price_y(decimal_to_f64(last.close));
         painter.line_segment(
@@ -706,6 +896,205 @@ fn candle_plot(
             );
         }
     }
+}
+
+fn draw_price_studies(
+    painter: &egui::Painter,
+    rect: Rect,
+    bars: &[UiBar],
+    studies: &[ChartStudyPoint],
+    price_y: impl Fn(f64) -> f32 + Copy,
+) {
+    draw_study_line(
+        painter,
+        rect,
+        bars,
+        studies,
+        |point| point.sma,
+        price_y,
+        Color32::from_rgb(255, 196, 80),
+    );
+    draw_study_line(
+        painter,
+        rect,
+        bars,
+        studies,
+        |point| point.ema,
+        price_y,
+        Color32::from_rgb(68, 215, 160),
+    );
+    for (selector, color) in [
+        (
+            (|point: &ChartStudyPoint| point.bollinger_upper)
+                as fn(&ChartStudyPoint) -> Option<rust_decimal::Decimal>,
+            Color32::from_rgb(116, 147, 255),
+        ),
+        (
+            |point: &ChartStudyPoint| point.bollinger_middle,
+            Color32::from_rgb(95, 118, 205),
+        ),
+        (
+            |point: &ChartStudyPoint| point.bollinger_lower,
+            Color32::from_rgb(116, 147, 255),
+        ),
+        (
+            |point: &ChartStudyPoint| point.vwap,
+            Color32::from_rgb(225, 118, 255),
+        ),
+    ] {
+        draw_study_line(painter, rect, bars, studies, selector, price_y, color);
+    }
+    painter.text(
+        rect.left_top() + egui::vec2(6.0, 22.0),
+        Align2::LEFT_TOP,
+        "SMA20  EMA20  BOLL20,2  VWAP",
+        FontId::monospace(10.0),
+        theme::TEXT_SECONDARY,
+    );
+}
+
+fn draw_study_line(
+    painter: &egui::Painter,
+    rect: Rect,
+    bars: &[UiBar],
+    studies: &[ChartStudyPoint],
+    selector: fn(&ChartStudyPoint) -> Option<rust_decimal::Decimal>,
+    value_y: impl Fn(f64) -> f32,
+    color: Color32,
+) {
+    let mut previous = None;
+    for (index, bar) in bars.iter().enumerate() {
+        let current = study_at(studies, bar.open_time_ms)
+            .and_then(selector)
+            .and_then(|value| {
+                bar_center_x(rect.left(), rect.width(), bars.len(), index)
+                    .map(|x| Pos2::new(x, value_y(decimal_to_f64(value))))
+            });
+        if let (Some(left), Some(right)) = (previous, current) {
+            painter.line_segment([left, right], Stroke::new(1.25, color));
+        }
+        previous = current;
+    }
+}
+
+fn draw_rsi_study(
+    painter: &egui::Painter,
+    rect: Rect,
+    bars: &[UiBar],
+    studies: &[ChartStudyPoint],
+) {
+    let y = |value: f64| rect.bottom() - (value.clamp(0.0, 100.0) as f32 / 100.0) * rect.height();
+    for level in [30.0, 50.0, 70.0] {
+        let color = if level == 50.0 {
+            theme::TEXT_SECONDARY
+        } else {
+            Color32::from_rgb(91, 69, 122)
+        };
+        painter.line_segment(
+            [
+                Pos2::new(rect.left(), y(level)),
+                Pos2::new(rect.right(), y(level)),
+            ],
+            Stroke::new(0.75, color),
+        );
+    }
+    draw_study_line(
+        painter,
+        rect,
+        bars,
+        studies,
+        |point| point.rsi,
+        y,
+        Color32::from_rgb(193, 113, 255),
+    );
+    painter.text(
+        rect.left_top() + egui::vec2(4.0, 2.0),
+        Align2::LEFT_TOP,
+        "RSI 14",
+        FontId::monospace(10.0),
+        theme::TEXT_SECONDARY,
+    );
+}
+
+fn draw_macd_study(
+    painter: &egui::Painter,
+    rect: Rect,
+    bars: &[UiBar],
+    studies: &[ChartStudyPoint],
+) {
+    let maximum = bars
+        .iter()
+        .filter_map(|bar| study_at(studies, bar.open_time_ms))
+        .flat_map(|point| [point.macd, point.macd_signal, point.macd_histogram])
+        .flatten()
+        .map(decimal_to_f64)
+        .map(f64::abs)
+        .fold(0.0_f64, f64::max)
+        .max(f64::EPSILON);
+    let y = |value: f64| rect.center().y - (value / maximum) as f32 * rect.height() * 0.44;
+    painter.line_segment(
+        [
+            Pos2::new(rect.left(), rect.center().y),
+            Pos2::new(rect.right(), rect.center().y),
+        ],
+        Stroke::new(0.75, theme::TEXT_SECONDARY),
+    );
+    let width = rect.width() / bars.len().max(1) as f32;
+    for (index, bar) in bars.iter().enumerate() {
+        let Some(value) =
+            study_at(studies, bar.open_time_ms).and_then(|point| point.macd_histogram)
+        else {
+            continue;
+        };
+        let value = decimal_to_f64(value);
+        let Some(x) = bar_center_x(rect.left(), rect.width(), bars.len(), index) else {
+            continue;
+        };
+        painter.rect_filled(
+            Rect::from_two_pos(
+                Pos2::new(x - width * 0.28, y(0.0)),
+                Pos2::new(x + width * 0.28, y(value)),
+            ),
+            0.0,
+            if value >= 0.0 {
+                theme::BUY
+            } else {
+                theme::SELL
+            },
+        );
+    }
+    draw_study_line(
+        painter,
+        rect,
+        bars,
+        studies,
+        |point| point.macd,
+        y,
+        Color32::from_rgb(255, 196, 80),
+    );
+    draw_study_line(
+        painter,
+        rect,
+        bars,
+        studies,
+        |point| point.macd_signal,
+        y,
+        Color32::from_rgb(68, 215, 160),
+    );
+    painter.text(
+        rect.left_top() + egui::vec2(4.0, 2.0),
+        Align2::LEFT_TOP,
+        "MACD 12,26,9",
+        FontId::monospace(10.0),
+        theme::TEXT_SECONDARY,
+    );
+}
+
+fn study_at(studies: &[ChartStudyPoint], open_time_ms: u64) -> Option<&ChartStudyPoint> {
+    studies
+        .binary_search_by_key(&open_time_ms, |point| point.open_time_ms)
+        .ok()
+        .and_then(|index| studies.get(index))
 }
 
 fn show_order_book(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
@@ -1365,6 +1754,10 @@ fn favorite_rank(favorites: &[String], symbol: &str) -> usize {
         .iter()
         .position(|favorite| favorite == symbol)
         .unwrap_or(favorites.len())
+}
+
+fn local_quote<'a>(model: &'a AppModel, symbol: &str) -> Option<&'a MarketQuote> {
+    model.local_quotes.get(symbol)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

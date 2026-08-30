@@ -22,22 +22,25 @@ mod native {
     };
     use venue_control_protocol::{AggressorSide as UiAggressorSide, UiBar, UiBookLevel, UiTrade};
     use venue_domain::domain::{
-        AggressorSide, FieldState, MarketSnapshot, PublicBar, PublicTicker, PublicTrade,
+        AggressorSide, FieldState, MarketSnapshot, PublicBar, PublicTicker, PublicTrade, Symbol,
     };
     use venue_gateway_binance::{
         BinanceFormingBar, BinanceKlineInterval, BinancePublicKline, native_symbol,
         parse_public_exchange_info, parse_public_market_agg_trade, parse_public_market_bbo,
         parse_public_market_depth20_snapshot, parse_public_market_kline,
-        parse_public_market_rest_klines,
+        parse_public_market_rest_klines, parse_public_market_ticker_array,
+        parse_public_market_ticker_snapshot,
     };
 
     use crate::{
         chart::ChartInterval,
         market::{MarketEnvelope, MarketPayload, MarketSelection, MarketStatus},
+        model::MarketQuote,
     };
 
     const REST_KLINES_ENDPOINT: &str = "https://fapi.binance.com/fapi/v1/klines";
     const EXCHANGE_INFO_ENDPOINT: &str = "https://fapi.binance.com/fapi/v1/exchangeInfo";
+    const TICKER_24H_ENDPOINT: &str = "https://fapi.binance.com/fapi/v1/ticker/24hr";
     const COMBINED_STREAM_ENDPOINT: &str = "wss://fstream.binance.com/stream";
     const CONNECT_BUDGET: Duration = Duration::from_secs(10);
     const HTTP_BODY_LIMIT: usize = 1024 * 1024;
@@ -55,9 +58,11 @@ mod native {
 
     #[derive(Clone, Debug, PartialEq)]
     pub enum LocalMarketClientEvent {
-        Market(MarketEnvelope),
+        Market(Box<MarketEnvelope>),
+        Quotes(Vec<MarketQuote>),
         Catalog(Vec<String>),
         CatalogUnavailable(String),
+        QuotesUnavailable(String),
         ProxyDetected(bool),
         RepaintRequested,
         WorkerFailed(String),
@@ -315,15 +320,27 @@ mod native {
         };
         let proxy = ProxySetting::from_environment("fstream.binance.com");
         let _ = event_tx.try_send(LocalMarketClientEvent::ProxyDetected(proxy.configured()));
-        let catalog_http = http.clone();
-        let catalog_events = event_tx.clone();
-        tokio::spawn(async move {
-            let event = match fetch_catalog(&catalog_http).await {
-                Ok(symbols) => LocalMarketClientEvent::Catalog(symbols),
-                Err(error) => LocalMarketClientEvent::CatalogUnavailable(error),
-            };
-            let _ = catalog_events.try_send(event);
-        });
+        let catalog = match fetch_catalog(&http).await {
+            Ok(symbols) => {
+                let labels = symbols.iter().map(ToString::to_string).collect();
+                let _ = event_tx.try_send(LocalMarketClientEvent::Catalog(labels));
+                symbols
+            }
+            Err(error) => {
+                let _ = event_tx.try_send(LocalMarketClientEvent::CatalogUnavailable(error));
+                Vec::new()
+            }
+        };
+        if !catalog.is_empty() {
+            match fetch_quote_snapshot(&http, &catalog).await {
+                Ok(quotes) => {
+                    let _ = event_tx.try_send(LocalMarketClientEvent::Quotes(quotes));
+                }
+                Err(error) => {
+                    let _ = event_tx.try_send(LocalMarketClientEvent::QuotesUnavailable(error));
+                }
+            }
+        }
         let mut pending = None;
         loop {
             let command = match pending.take() {
@@ -350,6 +367,7 @@ mod native {
                         selections,
                         &http,
                         &proxy,
+                        &catalog,
                         &mut async_rx,
                         &event_tx,
                     )
@@ -365,6 +383,7 @@ mod native {
         selections: Vec<MarketSelection>,
         http: &reqwest::Client,
         proxy: &ProxySetting,
+        catalog: &[Symbol],
         commands: &mut mpsc::Receiver<LocalMarketCommand>,
         event_tx: &Sender<LocalMarketClientEvent>,
     ) -> Option<LocalMarketCommand> {
@@ -479,6 +498,7 @@ mod native {
                                     payload.as_ref(),
                                     generation,
                                     &selections,
+                                    catalog,
                                     received_ms,
                                     &mut emitter,
                                 ) {
@@ -601,7 +621,7 @@ mod native {
         Ok(stream)
     }
 
-    async fn fetch_catalog(http: &reqwest::Client) -> Result<Vec<String>, String> {
+    async fn fetch_catalog(http: &reqwest::Client) -> Result<Vec<Symbol>, String> {
         let response = http
             .get(EXCHANGE_INFO_ENDPOINT)
             .send()
@@ -635,13 +655,55 @@ mod native {
         let payload =
             std::str::from_utf8(&body).map_err(|_| "symbol catalog was not UTF-8".to_owned())?;
         parse_public_exchange_info(payload)
-            .map(|symbols| {
-                symbols
+            .map_err(|error| format!("symbol catalog parse failed: {error}"))
+    }
+
+    async fn fetch_quote_snapshot(
+        http: &reqwest::Client,
+        catalog: &[Symbol],
+    ) -> Result<Vec<MarketQuote>, String> {
+        let response = http
+            .get(TICKER_24H_ENDPOINT)
+            .send()
+            .await
+            .map_err(|error| format!("24h ticker request failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "24h ticker returned HTTP {}",
+                response.status().as_u16()
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|size| size > CATALOG_BODY_LIMIT as u64)
+        {
+            return Err("24h ticker exceeded 4 MiB".to_owned());
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| format!("24h ticker body failed: {error}"))?;
+        if body.len() > CATALOG_BODY_LIMIT {
+            return Err("24h ticker exceeded 4 MiB".to_owned());
+        }
+        let received_ms = now_ms();
+        let payload = std::str::from_utf8(&body)
+            .map_err(|_| "24h ticker response was not UTF-8".to_owned())?;
+        parse_public_market_ticker_snapshot(payload, catalog, received_ms)
+            .map_err(|error| format!("24h ticker parse failed: {error}"))
+            .map(|tickers| {
+                tickers
                     .into_iter()
-                    .map(|symbol| symbol.to_string())
+                    .map(|ticker| MarketQuote {
+                        symbol: ticker.symbol.to_string(),
+                        last: ticker.last_price.value(),
+                        change_percent_24h: ticker.price_change_percent,
+                        quote_volume_24h: ticker.quote_volume,
+                        exchange_time_ms: ticker.exchange_time_ms,
+                        received_ms: ticker.received_at_ms,
+                    })
                     .collect()
             })
-            .map_err(|error| format!("symbol catalog parse failed: {error}"))
     }
 
     async fn load_history(
@@ -672,7 +734,7 @@ mod native {
                 received_ms,
                 payload: MarketPayload::RestHistory { bars },
             };
-            if let Err(error) = emitter.emit(LocalMarketClientEvent::Market(envelope)) {
+            if let Err(error) = emitter.emit(LocalMarketClientEvent::Market(Box::new(envelope))) {
                 return AttemptResult::Failed(error);
             }
         }
@@ -684,7 +746,7 @@ mod native {
         selection: &MarketSelection,
         generation: u64,
         limit: usize,
-    ) -> Result<(Vec<UiBar>, u64, u64), String> {
+    ) -> Result<(Vec<PublicBar>, u64, u64), String> {
         let url = rest_klines_url(selection, limit)?;
         let response = http
             .get(url)
@@ -731,10 +793,6 @@ mod native {
         let event_time_ms = bars
             .last()
             .map_or(received_ms, |bar| bar.close_time_ms.min(received_ms));
-        let bars = bars
-            .into_iter()
-            .map(ui_bar_from_closed)
-            .collect::<Result<Vec<_>, _>>()?;
         Ok((bars, received_ms, event_time_ms))
     }
 
@@ -762,21 +820,41 @@ mod native {
         payload: &str,
         generation: u64,
         selections: &[MarketSelection],
+        catalog: &[Symbol],
         received_ms: u64,
         emitter: &mut EventEmitter,
     ) -> Result<(), String> {
+        if payload.contains("\"stream\":\"!ticker@arr\"") {
+            let tickers = parse_public_market_ticker_array(payload, catalog, received_ms)
+                .map_err(|error| format!("all-market ticker parse failed: {error}"))?;
+            let quotes = tickers
+                .into_iter()
+                .map(|ticker| MarketQuote {
+                    symbol: ticker.symbol.to_string(),
+                    last: ticker.last_price.value(),
+                    change_percent_24h: ticker.price_change_percent,
+                    quote_volume_24h: ticker.quote_volume,
+                    exchange_time_ms: ticker.exchange_time_ms,
+                    received_ms: ticker.received_at_ms,
+                })
+                .collect();
+            emitter.emit(LocalMarketClientEvent::Quotes(quotes))?;
+            return Ok(());
+        }
         for selection in selections {
             if let Ok(kline) =
                 parse_public_market_kline(payload, &selection.binding, generation, received_ms)
             {
-                let (event_time_ms, bar, closed) = match kline {
+                let (event_time_ms, bar, study_bar, closed) = match kline {
                     BinancePublicKline::Forming(envelope) => {
                         let event_time_ms = envelope.exchange_event_time_ms();
                         let fact = envelope.into_fact();
                         if fact.interval != binance_interval(selection.interval) {
                             continue;
                         }
-                        (event_time_ms, ui_bar_from_forming(fact), false)
+                        let bar = ui_bar_from_forming(&fact);
+                        let study_bar = study_bar_from_forming(fact);
+                        (event_time_ms, bar, study_bar, false)
                     }
                     BinancePublicKline::Closed(envelope) => {
                         let event_time_ms = envelope.exchange_event_time_ms();
@@ -784,16 +862,21 @@ mod native {
                         if fact.interval_ms != selection.interval.duration_ms() {
                             continue;
                         }
-                        (event_time_ms, ui_bar_from_closed(fact)?, true)
+                        let bar = ui_bar_from_closed(&fact)?;
+                        (event_time_ms, bar, fact, true)
                     }
                 };
-                emitter.emit(LocalMarketClientEvent::Market(MarketEnvelope {
+                emitter.emit(LocalMarketClientEvent::Market(Box::new(MarketEnvelope {
                     generation,
                     selection: selection.clone(),
                     event_time_ms,
                     received_ms,
-                    payload: MarketPayload::WsBar { bar, closed },
-                }))?;
+                    payload: MarketPayload::WsBar {
+                        bar,
+                        study_bar: Box::new(study_bar),
+                        closed,
+                    },
+                })))?;
                 continue;
             }
             if let Ok(envelope) =
@@ -801,13 +884,13 @@ mod native {
             {
                 let event_time_ms = envelope.exchange_event_time_ms();
                 let (bid, ask) = ui_bbo(envelope.into_fact());
-                emitter.emit(LocalMarketClientEvent::Market(MarketEnvelope {
+                emitter.emit(LocalMarketClientEvent::Market(Box::new(MarketEnvelope {
                     generation,
                     selection: selection.clone(),
                     event_time_ms,
                     received_ms,
                     payload: MarketPayload::Bbo { bid, ask },
-                }))?;
+                })))?;
                 continue;
             }
             if let Ok(envelope) =
@@ -815,13 +898,13 @@ mod native {
             {
                 let event_time_ms = envelope.exchange_event_time_ms();
                 let trade = ui_trade(envelope.into_fact());
-                emitter.emit(LocalMarketClientEvent::Market(MarketEnvelope {
+                emitter.emit(LocalMarketClientEvent::Market(Box::new(MarketEnvelope {
                     generation,
                     selection: selection.clone(),
                     event_time_ms,
                     received_ms,
                     payload: MarketPayload::Trade(trade),
-                }))?;
+                })))?;
                 continue;
             }
             if let Ok(envelope) =
@@ -829,13 +912,13 @@ mod native {
             {
                 let event_time_ms = envelope.exchange_event_time_ms();
                 let (bids, asks) = ui_book_from_snapshot(envelope.into_fact());
-                emitter.emit(LocalMarketClientEvent::Market(MarketEnvelope {
+                emitter.emit(LocalMarketClientEvent::Market(Box::new(MarketEnvelope {
                     generation,
                     selection: selection.clone(),
                     event_time_ms,
                     received_ms,
                     payload: MarketPayload::BookSnapshot { bids, asks },
-                }))?;
+                })))?;
             }
         }
         Ok(())
@@ -891,7 +974,7 @@ mod native {
         ) -> Result<(), String> {
             let timestamp = now_ms();
             for selection in selections {
-                self.emit(LocalMarketClientEvent::Market(MarketEnvelope {
+                self.emit(LocalMarketClientEvent::Market(Box::new(MarketEnvelope {
                     generation,
                     selection: selection.clone(),
                     event_time_ms: timestamp,
@@ -900,7 +983,7 @@ mod native {
                         status,
                         detail: detail.clone(),
                     },
-                }))?;
+                })))?;
             }
             Ok(())
         }
@@ -935,7 +1018,7 @@ mod native {
     }
 
     fn combined_stream_url(selections: &[MarketSelection]) -> String {
-        let mut streams = Vec::new();
+        let mut streams = vec!["!ticker@arr".to_owned()];
         for selection in selections {
             let symbol = native_symbol(&selection.binding.symbol).to_ascii_lowercase();
             for stream in [
@@ -963,7 +1046,7 @@ mod native {
         }
     }
 
-    fn ui_bar_from_forming(bar: BinanceFormingBar) -> UiBar {
+    fn ui_bar_from_forming(bar: &BinanceFormingBar) -> UiBar {
         UiBar {
             open_time_ms: bar.open_time_ms,
             open: bar.open.value(),
@@ -974,8 +1057,8 @@ mod native {
         }
     }
 
-    fn ui_bar_from_closed(bar: PublicBar) -> Result<UiBar, String> {
-        let FieldState::Known(volume) = bar.base_volume else {
+    fn ui_bar_from_closed(bar: &PublicBar) -> Result<UiBar, String> {
+        let FieldState::Known(volume) = &bar.base_volume else {
             return Err("normalized bar has no known base volume".to_owned());
         };
         Ok(UiBar {
@@ -984,8 +1067,29 @@ mod native {
             high: bar.high.value(),
             low: bar.low.value(),
             close: bar.close.value(),
-            volume,
+            volume: *volume,
         })
+    }
+
+    fn study_bar_from_forming(bar: BinanceFormingBar) -> PublicBar {
+        PublicBar {
+            symbol: bar.symbol,
+            generation: bar.generation,
+            received_at_ms: bar.received_at_ms,
+            sequence: bar.sequence,
+            open_time_ms: bar.open_time_ms,
+            close_time_ms: bar.close_time_ms,
+            interval_ms: bar.interval.milliseconds(),
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+            base_volume: FieldState::Known(bar.base_volume),
+            quote_volume: FieldState::Known(bar.quote_volume),
+            trade_count: FieldState::Known(bar.trade_count),
+            taker_buy_base_volume: FieldState::Known(bar.taker_buy_base_volume),
+            taker_buy_quote_volume: FieldState::Known(bar.taker_buy_quote_volume),
+        }
     }
 
     fn ui_bbo(ticker: PublicTicker) -> (rust_decimal::Decimal, rust_decimal::Decimal) {
@@ -1077,7 +1181,7 @@ mod native {
                 combined_stream_url(&[selection]),
                 concat!(
                     "wss://fstream.binance.com/stream?streams=",
-                    "ethusdt@kline_1h/ethusdt@bookTicker/",
+                    "!ticker@arr/ethusdt@kline_1h/ethusdt@bookTicker/",
                     "ethusdt@aggTrade/ethusdt@depth20@100ms"
                 )
             );
@@ -1125,10 +1229,12 @@ mod native {
                 taker_buy_base_volume: Decimal::new(4, 0),
                 taker_buy_quote_volume: Decimal::new(400, 0),
             };
-            let ui = ui_bar_from_forming(bar);
+            let ui = ui_bar_from_forming(&bar);
+            let study = study_bar_from_forming(bar);
             assert_eq!(ui.open_time_ms, 60_000);
             assert_eq!(ui.close, Decimal::new(105, 0));
             assert_eq!(ui.volume, Decimal::new(12, 0));
+            assert!(study.is_valid());
             Ok(())
         }
 

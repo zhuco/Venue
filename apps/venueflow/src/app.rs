@@ -15,7 +15,7 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 const STORAGE_KEY: &str = "venueflow-state-v1";
-const PERSISTED_SCHEMA_VERSION: u16 = 2;
+const PERSISTED_SCHEMA_VERSION: u16 = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -43,6 +43,7 @@ pub struct VenueFlowApp {
     market_client: Option<LocalMarketClient>,
     show_modules: bool,
     show_settings: bool,
+    show_symbol_picker: bool,
     reconnect: bool,
 }
 
@@ -75,6 +76,7 @@ impl VenueFlowApp {
             market_client,
             show_modules: false,
             show_settings: false,
+            show_symbol_picker: false,
             reconnect: false,
         }
     }
@@ -123,13 +125,20 @@ impl VenueFlowApp {
         for event in client.drain(10_000) {
             match event {
                 LocalMarketClientEvent::Market(envelope) => {
-                    if let Err(error) = self.model.local_markets.apply(envelope) {
+                    if let Err(error) = self.model.local_markets.apply(*envelope) {
                         self.model
                             .notice(format!("Ignored invalid local market event: {error}"));
                     }
                 }
                 LocalMarketClientEvent::Catalog(symbols) => {
                     self.model.apply_local_catalog(symbols);
+                }
+                LocalMarketClientEvent::Quotes(quotes) => {
+                    self.model.apply_local_quotes(quotes);
+                }
+                LocalMarketClientEvent::QuotesUnavailable(error) => {
+                    self.model
+                        .notice(format!("Local Binance 24h quotes unavailable: {error}"));
                 }
                 LocalMarketClientEvent::CatalogUnavailable(error) => {
                     self.model.local_catalog_error = Some(error.clone());
@@ -231,6 +240,7 @@ impl eframe::App for VenueFlowApp {
             &mut self.workspaces,
             &mut self.show_modules,
             &mut self.show_settings,
+            &mut self.show_symbol_picker,
         );
 
         let status_height = if self.model.preferences.show_status_bar {
@@ -309,6 +319,11 @@ fn load(storage: Option<&dyn eframe::Storage>) -> PersistedState {
     };
     match serde_json::from_str::<PersistedState>(&encoded) {
         Ok(state) if state.schema_version == PERSISTED_SCHEMA_VERSION => state,
+        Ok(state) if state.schema_version == 2 => PersistedState {
+            schema_version: PERSISTED_SCHEMA_VERSION,
+            preferences: state.preferences,
+            workspaces: Workspaces::default(),
+        },
         Ok(_) | Err(_) => PersistedState::default(),
     }
 }
