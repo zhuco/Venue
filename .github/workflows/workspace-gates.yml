@@ -12,6 +12,8 @@ permissions:
 jobs:
   verify:
     runs-on: windows-latest
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/venue-target
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
@@ -55,6 +57,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/venue-target
       VENUE_CONTROL_POSTGRES_REQUIRED: "1"
       VENUE_CONTROL_TEST_DATABASE_URL: postgresql://venue_ci:venue_ci@127.0.0.1:5432/venue_ci
     steps:
