@@ -11,13 +11,13 @@ use super::*;
 use crate::{
     domain::{
         AccountBalance, CommandId, DomainEvent, NativeOrderFamily, OrderPurpose, Position,
-        PositionSide,
+        PositionSide, Price, PublicTicker,
     },
     execution::{
         AccountExecutionRequest, AccountLaneError, AccountLaneFollowUp, AccountLanePriority,
         UnknownReadbackProof, UnknownResolution,
     },
-    runtime::strategy::StrategyInput,
+    runtime::strategy::{AccountMarketEvent, StrategyInput},
 };
 
 fn recovery_roots_with_boundaries(
@@ -87,6 +87,36 @@ fn physical_manifest(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(PhysicalRecoveryReadbackManifest::verified(scope, receipts)?)
+}
+
+fn authenticated_physical_manifest(
+    session: &PhysicalRecoverySession,
+) -> Result<PhysicalRecoveryReadbackManifest, Box<dyn Error>> {
+    let receipts = [
+        PhysicalReadbackSurface::Account,
+        PhysicalReadbackSurface::Positions,
+        PhysicalReadbackSurface::UmOrder,
+        PhysicalReadbackSurface::UmConditional,
+        PhysicalReadbackSurface::UmAlgo,
+        PhysicalReadbackSurface::FillsCursor,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, surface)| {
+        PhysicalReadbackReceipt::verified_complete_account(
+            session.scope(),
+            surface,
+            session.attempt_id(),
+            session.private_generation(),
+            [u8::try_from(index).unwrap_or(u8::MAX).saturating_add(21); 32],
+            0,
+        )
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    Ok(PhysicalRecoveryReadbackManifest::verified(
+        session.scope().clone(),
+        receipts,
+    )?)
 }
 
 #[allow(
@@ -172,6 +202,260 @@ pub(super) fn restore_empty_recovery(runtime: &mut AccountRuntime) -> Result<(),
         Vec::new(),
         Vec::new(),
     )?)?;
+    Ok(())
+}
+
+#[test]
+fn runtime_issued_recovery_session_binds_full_universe_and_refresh_epoch()
+-> Result<(), Box<dyn Error>> {
+    let btc = binding(StrategyKind::HedgedGrid, "grid_btc", "BTC/USDT")?;
+    let eth = binding(StrategyKind::Scalping, "scalp_eth", "ETH/USDT")?;
+    let mut runtime = AccountRuntime::new(account()?);
+    runtime.register_strategy(eth)?;
+    runtime.register_strategy(btc)?;
+    restore_empty_recovery(&mut runtime)?;
+
+    let session = runtime.issue_physical_recovery_session()?;
+    assert_eq!(session.attempt_id(), 1);
+    assert_eq!(session.session_epoch(), 1);
+    assert_eq!(session.connection_generation(), 1);
+    assert_eq!(session.private_generation(), 1);
+    assert_eq!(
+        session.scope().position_mode(),
+        Some(AccountPositionMode::Hedge)
+    );
+    assert_eq!(session.scope().profile_version(), Some(1));
+    assert_eq!(
+        session
+            .scope()
+            .account_universe()
+            .iter()
+            .map(|entry| entry.symbol().to_string())
+            .collect::<Vec<_>>(),
+        ["BTC/USDT", "ETH/USDT"]
+    );
+    assert!(
+        session
+            .scope()
+            .account_universe()
+            .iter()
+            .all(|entry| entry.config_epoch() == 1 && entry.config_digest() == "config_1")
+    );
+    runtime.validate_physical_recovery_session_after_await(&session)?;
+
+    let refresh =
+        super::recovery_session::PhysicalRecoveryRootRefresh::test_complete_replay(&session)?;
+    let refreshed = runtime.refresh_physical_recovery_session(&session, refresh)?;
+    assert_eq!(refreshed.attempt_id(), session.attempt_id());
+    assert_eq!(refreshed.session_epoch(), 2);
+    assert_eq!(refreshed.durable_roots().authority_epoch(), 2);
+    runtime.validate_physical_recovery_session_after_await(&refreshed)?;
+    assert!(matches!(
+        runtime.validate_physical_recovery_session_after_await(&session),
+        Err(AccountRuntimeError::PhysicalRecoverySessionInvalid)
+    ));
+    assert!(matches!(
+        runtime.validate_physical_recovery_session_after_await(&refreshed),
+        Err(AccountRuntimeError::PhysicalRecoverySessionInvalid)
+    ));
+    Ok(())
+}
+
+#[test]
+fn recovery_session_rejects_cross_runtime_and_expired_authority() -> Result<(), Box<dyn Error>> {
+    let strategy = binding(StrategyKind::HedgedGrid, "grid_btc", "BTC/USDT")?;
+    let mut first = AccountRuntime::new(account()?);
+    first.register_strategy(strategy.clone())?;
+    restore_empty_recovery(&mut first)?;
+    let foreign = first.issue_physical_recovery_session()?;
+
+    let mut second = AccountRuntime::new(account()?);
+    second.register_strategy(strategy.clone())?;
+    restore_empty_recovery(&mut second)?;
+    let local = second.issue_physical_recovery_session()?;
+    let foreign_refresh =
+        super::recovery_session::PhysicalRecoveryRootRefresh::test_complete_replay(&foreign)?;
+    assert!(matches!(
+        second.refresh_physical_recovery_session(&local, foreign_refresh),
+        Err(AccountRuntimeError::PhysicalRecoveryDurableRootRegression)
+    ));
+    assert!(matches!(
+        second.validate_physical_recovery_session_after_await(&local),
+        Err(AccountRuntimeError::PhysicalRecoverySessionInvalid)
+    ));
+
+    let mut expired_runtime = AccountRuntime::new(account()?);
+    expired_runtime.register_strategy(strategy)?;
+    restore_empty_recovery(&mut expired_runtime)?;
+    let expired = expired_runtime.issue_expired_physical_recovery_session_for_test()?;
+    assert!(matches!(
+        expired_runtime.validate_physical_recovery_session_after_await(&expired),
+        Err(AccountRuntimeError::PhysicalRecoverySessionExpired)
+    ));
+    Ok(())
+}
+
+#[test]
+fn recovery_session_revokes_on_universe_and_profile_drift() -> Result<(), Box<dyn Error>> {
+    let strategy = binding(StrategyKind::HedgedGrid, "grid_btc", "BTC/USDT")?;
+    let mut config_runtime = AccountRuntime::new(account()?);
+    config_runtime.register_strategy(strategy.clone())?;
+    restore_empty_recovery(&mut config_runtime)?;
+    let config_session = config_runtime.issue_physical_recovery_session()?;
+    config_runtime.change_parameters(&strategy.key, "config_2".to_owned())?;
+    assert!(matches!(
+        config_runtime.validate_physical_recovery_session_after_await(&config_session),
+        Err(AccountRuntimeError::PhysicalRecoverySessionInvalid)
+    ));
+
+    let mut profile_runtime = AccountRuntime::new(account()?);
+    profile_runtime.register_strategy(strategy)?;
+    restore_empty_recovery(&mut profile_runtime)?;
+    let profile_session = profile_runtime.issue_physical_recovery_session()?;
+    profile_runtime.set_physical_profile_version_for_test(2);
+    assert!(matches!(
+        profile_runtime.validate_physical_recovery_session_after_await(&profile_session),
+        Err(AccountRuntimeError::PhysicalRecoverySessionInvalid)
+    ));
+
+    let root_strategy = binding(StrategyKind::HedgedGrid, "grid_root", "SOL/USDT")?;
+    let mut root_runtime = AccountRuntime::new(account()?);
+    root_runtime.register_strategy(root_strategy.clone())?;
+    restore_empty_recovery(&mut root_runtime)?;
+    let root_session = root_runtime.issue_physical_recovery_session()?;
+    install_persisted_order_route(
+        &mut root_runtime,
+        RecoveredOrderRoute::verified(
+            NativeOrderFamily::UmOrder,
+            CommandId::new("cmd_root_drift")?,
+            "client_root_drift".to_owned(),
+            None,
+            owner(&root_strategy, OrderPurpose::Entry),
+        ),
+    )?;
+    assert!(matches!(
+        root_runtime.validate_physical_recovery_session_after_await(&root_session),
+        Err(AccountRuntimeError::PhysicalRecoverySessionInvalid)
+    ));
+    Ok(())
+}
+
+#[test]
+fn recovery_session_revokes_on_pause_resume_and_freeze_drift() -> Result<(), Box<dyn Error>> {
+    let strategy = binding(StrategyKind::HedgedGrid, "grid_state", "BTC/USDT")?;
+    let mut paused = AccountRuntime::new(account()?);
+    paused.register_strategy(strategy.clone())?;
+    restore_empty_recovery(&mut paused)?;
+    let pause_session = paused.issue_physical_recovery_session()?;
+    paused.request_pause(&strategy.key)?;
+    assert!(matches!(
+        paused.validate_physical_recovery_session_after_await(&pause_session),
+        Err(AccountRuntimeError::PhysicalRecoveryDurableRootDrift)
+    ));
+
+    let mut resumed = AccountRuntime::new(account()?);
+    resumed.register_strategy(strategy.clone())?;
+    resumed.request_pause(&strategy.key)?;
+    restore_empty_recovery(&mut resumed)?;
+    let resume_session = resumed.issue_physical_recovery_session()?;
+    resumed.request_resume(&strategy.key)?;
+    assert!(matches!(
+        resumed.validate_physical_recovery_session_after_await(&resume_session),
+        Err(AccountRuntimeError::PhysicalRecoveryDurableRootDrift)
+    ));
+
+    let mut frozen = AccountRuntime::new(account()?);
+    frozen.register_strategy(strategy)?;
+    restore_empty_recovery(&mut frozen)?;
+    let freeze_session = frozen.issue_physical_recovery_session()?;
+    frozen.freeze_account(AccountFault::PrivateEvidenceGap);
+    assert!(matches!(
+        frozen.validate_physical_recovery_session_after_await(&freeze_session),
+        Err(AccountRuntimeError::PhysicalRecoveryDurableRootDrift)
+    ));
+    assert_eq!(frozen.health(), AccountHealth::Frozen);
+    assert_eq!(
+        frozen.fault_reason(),
+        Some(AccountFault::PrivateEvidenceGap)
+    );
+    Ok(())
+}
+
+#[test]
+fn recovery_session_revokes_on_private_and_actor_authority_drift() -> Result<(), Box<dyn Error>> {
+    let strategy = binding(StrategyKind::HedgedGrid, "grid_actor", "BTC/USDT")?;
+    let mut private_runtime = AccountRuntime::new(account()?);
+    private_runtime.register_strategy(strategy.clone())?;
+    restore_empty_recovery(&mut private_runtime)?;
+    private_runtime.mark_account_ready()?;
+    let private_session = private_runtime.issue_physical_recovery_session()?;
+    let mut evidence = EvidenceFixture::new()?;
+    let evidence = evidence.append(1, 10, "private authority drift")?;
+    let plan = private_runtime.plan_private_route(private_fact(&evidence, balance_event()?)?)?;
+    private_runtime.commit_private_route(PersistedPrivateDispatchReceipt::persisted(plan))?;
+    assert!(matches!(
+        private_runtime.validate_physical_recovery_session_after_await(&private_session),
+        Err(AccountRuntimeError::PhysicalRecoveryDurableRootDrift)
+    ));
+
+    let mut actor_runtime = AccountRuntime::new(account()?);
+    actor_runtime.register_strategy(strategy.clone())?;
+    restore_empty_recovery(&mut actor_runtime)?;
+    actor_runtime.mark_account_ready()?;
+    establish_empty_signed_orders(&mut actor_runtime, 1)?;
+    let actor_session = actor_runtime.issue_physical_recovery_session()?;
+    assert!(actor_runtime.publish_market(AccountMarketEvent::new(
+        101,
+        crate::domain::MarketEvent::Ticker(PublicTicker {
+            symbol: strategy.key.symbol.clone(),
+            generation: 1,
+            received_at_ms: 101,
+            exchange_time_ms: 100,
+            transaction_time_ms: 100,
+            update_id: 1,
+            bid_price: Price::new(Decimal::new(99, 0))?,
+            bid_quantity: Decimal::ONE,
+            ask_price: Price::new(Decimal::new(100, 0))?,
+            ask_quantity: Decimal::ONE,
+        }),
+    )?)?);
+    assert!(matches!(
+        actor_runtime.validate_physical_recovery_session_after_await(&actor_session),
+        Err(AccountRuntimeError::PhysicalRecoveryDurableRootDrift)
+    ));
+    Ok(())
+}
+
+#[test]
+fn authenticated_manifest_cannot_cross_session_or_skip_session_validation()
+-> Result<(), Box<dyn Error>> {
+    let strategy = binding(StrategyKind::HedgedGrid, "grid_btc", "BTC/USDT")?;
+    let mut runtime = AccountRuntime::new(account()?);
+    runtime.register_strategy(strategy)?;
+    restore_empty_recovery(&mut runtime)?;
+    let session = runtime.issue_physical_recovery_session()?;
+    let manifest = authenticated_physical_manifest(&session)?;
+    assert!(matches!(
+        runtime.install_authenticated_physical_recovery_manifest(&session, manifest),
+        Err(AccountRuntimeError::PhysicalRecoveryPostAwaitRefreshRequired)
+    ));
+    let session = runtime.issue_physical_recovery_session()?;
+    let refresh =
+        super::recovery_session::PhysicalRecoveryRootRefresh::test_complete_replay(&session)?;
+    let session = runtime.refresh_physical_recovery_session(&session, refresh)?;
+    let manifest = authenticated_physical_manifest(&session)?;
+    runtime.install_authenticated_physical_recovery_manifest(&session, manifest)?;
+    assert_eq!(runtime.mark_account_ready()?.len(), 1);
+
+    let mut other = AccountRuntime::new(account()?);
+    other.register_strategy(binding(StrategyKind::HedgedGrid, "grid_btc", "BTC/USDT")?)?;
+    restore_empty_recovery(&mut other)?;
+    let other_session = other.issue_physical_recovery_session()?;
+    let foreign_manifest = authenticated_physical_manifest(&other_session)?;
+    assert!(matches!(
+        other.install_authenticated_physical_recovery_manifest(&session, foreign_manifest),
+        Err(AccountRuntimeError::PhysicalRecoverySessionInvalid)
+    ));
     Ok(())
 }
 
@@ -307,10 +591,26 @@ fn production_physical_recovery_is_unavailable_for_live_test_and_multi_strategy_
     assert_eq!(runtime.health(), AccountHealth::Starting);
     assert_eq!(runtime.connection_generation(), 0);
 
+    let session = runtime.issue_physical_recovery_session()?;
+    assert!(matches!(
+        runtime.mark_account_ready(),
+        Err(AccountRuntimeError::PhysicalRecoveryIntegrationUnavailable)
+    ));
+    let after_ready = runtime.issue_physical_recovery_session()?;
+    assert!(after_ready.attempt_id() > session.attempt_id());
+    let manifest = authenticated_physical_manifest(&after_ready)?;
+    assert!(matches!(
+        runtime.install_authenticated_physical_recovery_manifest(&after_ready, manifest),
+        Err(AccountRuntimeError::PhysicalRecoveryIntegrationUnavailable)
+    ));
+    let replacement = runtime.issue_physical_recovery_session()?;
+    assert!(replacement.attempt_id() > after_ready.attempt_id());
+
     let expected_roots = runtime
         .physical_recovery_authority_roots()
         .cloned()
         .ok_or("physical recovery roots missing")?;
+    let mut previous_attempt = replacement.attempt_id();
     for mode in [GatewayMode::Test, GatewayMode::Live] {
         let manifest = physical_manifest(
             &runtime,
@@ -329,6 +629,9 @@ fn production_physical_recovery_is_unavailable_for_live_test_and_multi_strategy_
             runtime.install_physical_recovery_manifest(manifest),
             Err(AccountRuntimeError::PhysicalRecoveryIntegrationUnavailable)
         ));
+        let replacement = runtime.issue_physical_recovery_session()?;
+        assert!(replacement.attempt_id() > previous_attempt);
+        previous_attempt = replacement.attempt_id();
     }
     assert_eq!(runtime.health(), AccountHealth::Starting);
     assert_eq!(runtime.connection_generation(), 0);

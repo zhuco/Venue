@@ -144,6 +144,46 @@ impl RecoveryJournalRoots {
     pub(super) const fn mutation_wal(&self) -> [u8; 32] {
         self.mutation_wal
     }
+
+    pub(super) const fn strategy_checkpoint_head(&self) -> ([u8; 32], u64, u64) {
+        (
+            self.strategy_checkpoint,
+            self.strategy_checkpoint_boundary.tail_sequence,
+            self.strategy_checkpoint_boundary.record_count,
+        )
+    }
+
+    pub(super) const fn private_evidence_head(&self) -> ([u8; 32], u64, u64) {
+        (
+            self.private_evidence,
+            self.private_evidence_boundary.tail_sequence,
+            self.private_evidence_boundary.record_count,
+        )
+    }
+
+    pub(super) const fn actor_inbox_head(&self) -> ([u8; 32], u64, u64) {
+        (
+            self.actor_inbox,
+            self.actor_inbox_boundary.tail_sequence,
+            self.actor_inbox_boundary.record_count,
+        )
+    }
+
+    pub(super) const fn mutation_wal_head(&self) -> ([u8; 32], u64, u64) {
+        (
+            self.mutation_wal,
+            self.mutation_wal_boundary.tail_sequence,
+            self.mutation_wal_boundary.record_count,
+        )
+    }
+
+    pub(super) const fn owner_index_head(&self) -> ([u8; 32], u64, u64) {
+        (
+            self.owner_index,
+            self.owner_index_boundary.tail_sequence,
+            self.owner_index_boundary.record_count,
+        )
+    }
 }
 
 /// Digest stored by the recovery adapter only after all five journal heads and their replayed
@@ -162,6 +202,10 @@ impl RecoveryManifestCommitment {
             return Err(RecoverySnapshotError::ManifestCommitment);
         }
         Ok(Self { sha256 })
+    }
+
+    pub(super) const fn sha256(&self) -> [u8; 32] {
+        self.sha256
     }
 }
 

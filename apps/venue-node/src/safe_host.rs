@@ -15,7 +15,9 @@ use venue_execution::{
     WriterSession, acquire_account_canonical_root,
 };
 #[cfg(test)]
-use venue_gateway_api::{CapabilityFlags, MutationCapability};
+use venue_gateway_api::{
+    CapabilityFlags, CapabilityProbeCandidate, MAX_PROMOTION_TTL_MS, MutationCapability,
+};
 use venue_gateway_api::{
     CapabilityPromotionError, CapabilitySnapshot, GatewayApiError, GatewayBinding,
     HostAdmissionEvidence, HostAdmittedCapability,
@@ -480,6 +482,78 @@ pub struct PreparedDispatch {
     writer_revision: u64,
 }
 
+/// Unit-test-only stand-in for the still-unavailable production host authority. Its private
+/// fields and cfg(test) constructor keep positive physical-flow fixtures out of production.
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct TestAdmittedCapability {
+    evidence: HostAdmissionEvidence,
+    capability_version: u64,
+    issued_ms: u64,
+    expires_ms: u64,
+    flags: CapabilityFlags,
+}
+
+#[cfg(test)]
+impl TestAdmittedCapability {
+    pub(crate) fn issue(
+        candidate: &CapabilityProbeCandidate,
+        evidence: HostAdmissionEvidence,
+        now_ms: u64,
+    ) -> Result<Self, CapabilityPromotionError> {
+        let scope = evidence.scope();
+        if candidate.binding() != scope.binding()
+            || candidate.connection_generation() != scope.connection_generation()
+            || candidate.private_generation() != scope.private_generation()
+            || candidate.capability_version() == 0
+        {
+            return Err(CapabilityPromotionError::Scope);
+        }
+        let ttl = evidence
+            .promotion_expires_ms()
+            .checked_sub(now_ms)
+            .ok_or(CapabilityPromotionError::Freshness)?;
+        if ttl == 0 || ttl > MAX_PROMOTION_TTL_MS {
+            return Err(CapabilityPromotionError::Freshness);
+        }
+        validate_test_capability_flags(candidate.flags(), MutationCapability::Cancel)?;
+        Ok(Self {
+            capability_version: candidate.capability_version(),
+            issued_ms: now_ms,
+            expires_ms: evidence.promotion_expires_ms(),
+            flags: candidate.flags(),
+            evidence,
+        })
+    }
+
+    fn authorize(
+        &self,
+        current_evidence: &HostAdmissionEvidence,
+        now_ms: u64,
+        mutation: MutationCapability,
+    ) -> Result<(), CapabilityPromotionError> {
+        if current_evidence != &self.evidence {
+            return Err(CapabilityPromotionError::Drift);
+        }
+        if now_ms < self.issued_ms || now_ms >= self.expires_ms {
+            return Err(CapabilityPromotionError::Freshness);
+        }
+        validate_test_capability_flags(self.flags, mutation)
+    }
+
+    pub(crate) const fn scope(&self) -> &venue_gateway_api::PromotionScope {
+        self.evidence.scope()
+    }
+
+    pub(crate) const fn capability_version(&self) -> u64 {
+        self.capability_version
+    }
+
+    pub(crate) const fn expires_ms(&self) -> u64 {
+        self.expires_ms
+    }
+}
+
 impl PreparedDispatch {
     #[must_use]
     pub fn command_id(&self) -> &CommandId {
@@ -529,7 +603,7 @@ pub struct DispatchPermit {
     #[cfg(test)]
     admission_expires_ms: u64,
     #[cfg(test)]
-    admitted_capability: Option<HostAdmittedCapability>,
+    admitted_capability: Option<TestAdmittedCapability>,
     #[cfg(test)]
     admission_evidence: Option<HostAdmissionEvidence>,
     _writer_guard: DispatchGuard,
@@ -571,7 +645,7 @@ impl DispatchPermit {
         mut self,
         execution_now_ms: u64,
         gateway_snapshot: &CapabilitySnapshot,
-    ) -> Result<(HostAdmittedCapability, HostAdmissionEvidence, Self), CapabilityPromotionError>
+    ) -> Result<(TestAdmittedCapability, HostAdmissionEvidence, Self), CapabilityPromotionError>
     {
         let capability = self
             .admitted_capability
@@ -991,7 +1065,7 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
     pub(crate) fn dispatch_admitted_for_test(
         &mut self,
         prepared: PreparedDispatch,
-        admitted_capability: HostAdmittedCapability,
+        admitted_capability: TestAdmittedCapability,
         admission_evidence: HostAdmissionEvidence,
         now_ms: u64,
     ) -> Result<DispatchOutcome, SafeHostError> {
@@ -1013,7 +1087,7 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
     pub(crate) fn dispatch_with_crash(
         &mut self,
         prepared: PreparedDispatch,
-        admitted_capability: HostAdmittedCapability,
+        admitted_capability: TestAdmittedCapability,
         admission_evidence: HostAdmissionEvidence,
         now_ms: u64,
         crash_point: TestCrashPoint,
@@ -1113,7 +1187,7 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
     fn dispatch_admitted_inner(
         &mut self,
         prepared: PreparedDispatch,
-        admitted_capability: HostAdmittedCapability,
+        admitted_capability: TestAdmittedCapability,
         admission_evidence: HostAdmissionEvidence,
         now_ms: u64,
         crash_point: TestCrashPoint,
@@ -1217,7 +1291,7 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
     fn validate_admission_state(
         &self,
         prepared: &PreparedDispatch,
-        capability: &HostAdmittedCapability,
+        capability: &TestAdmittedCapability,
         evidence: &HostAdmissionEvidence,
         now_ms: u64,
     ) -> Result<(CapabilityFlags, u64, u64), SafeHostError> {
@@ -1611,7 +1685,7 @@ fn validate_canary_static(
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 fn validate_dispatch_admission(
-    capability: &HostAdmittedCapability,
+    capability: &TestAdmittedCapability,
     evidence: &HostAdmissionEvidence,
     binding: &GatewayBinding,
     config_epoch: u64,
@@ -1631,6 +1705,31 @@ fn validate_dispatch_admission(
         return Err(CapabilityPromotionError::Scope);
     }
     capability.authorize(evidence, now_ms, mutation)
+}
+
+#[cfg(test)]
+fn validate_test_capability_flags(
+    flags: CapabilityFlags,
+    mutation: MutationCapability,
+) -> Result<(), CapabilityPromotionError> {
+    let required_reads = CapabilityFlags::READ_ACCOUNT
+        | CapabilityFlags::READ_ORDERS
+        | CapabilityFlags::READ_FILLS
+        | CapabilityFlags::PRIVATE_STREAM;
+    let mutation_flag = match mutation {
+        MutationCapability::PlaceLimit => CapabilityFlags::PLACE_LIMIT,
+        MutationCapability::PlaceMarket => CapabilityFlags::PLACE_MARKET,
+        MutationCapability::Cancel => CapabilityFlags::CANCEL,
+        MutationCapability::Amend => CapabilityFlags::AMEND,
+    };
+    if !flags.contains(required_reads)
+        || !flags.contains(CapabilityFlags::TRADE)
+        || flags.contains(CapabilityFlags::WITHDRAW)
+        || !flags.contains(mutation_flag)
+    {
+        return Err(CapabilityPromotionError::Denied);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

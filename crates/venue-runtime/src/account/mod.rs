@@ -4,6 +4,7 @@ mod physical_recovery;
 mod private_router;
 mod reconciler;
 mod recovery;
+mod recovery_session;
 mod registry;
 mod runtime;
 
@@ -16,7 +17,7 @@ pub use model::{AccountFault, AccountHealth, InstanceLifecycle};
 pub use physical_recovery::{
     PhysicalReadbackCoverage, PhysicalReadbackReceipt, PhysicalReadbackSurface,
     PhysicalRecoveryAuthorityRoots, PhysicalRecoveryManifestError,
-    PhysicalRecoveryReadbackManifest, PhysicalRecoveryScope,
+    PhysicalRecoveryReadbackManifest, PhysicalRecoveryScope, PhysicalRecoveryUniverseEntry,
 };
 pub(crate) use private_router::PrivateRouter;
 pub use private_router::{
@@ -36,6 +37,10 @@ pub use recovery::{
     RecoveredOrderRoute, RecoveredPrivateBatch, RecoveredPrivateCursor, RecoveredShutdownMode,
     RecoveredShutdownState, RecoveredStrategyState, RecoveryJournalBoundary, RecoveryJournalRoots,
     RecoveryManifestCommitment, RecoverySnapshotError,
+};
+pub use recovery_session::{
+    PhysicalRecoveryDurableRoots, PhysicalRecoveryRootRefresh, PhysicalRecoverySession,
+    PhysicalRecoverySessionError,
 };
 pub use registry::{FlattenPlan, RegistryError, StopPlan, StrategyRegistration};
 pub(crate) use registry::{SignedStopProof, StrategyRegistry};

@@ -10,7 +10,9 @@ use sha2::{Digest, Sha256};
 use venue_domain::domain::{NativeOrderFamily, PositionSide, Symbol};
 use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
 
-use super::{AccountKey, AccountPositionMode, model::validate_config_digest};
+use super::{
+    AccountKey, AccountPositionMode, StrategyBinding, StrategyKind, model::validate_config_digest,
+};
 
 const REQUIRED_SURFACES: [PhysicalReadbackSurface; 6] = [
     PhysicalReadbackSurface::Account,
@@ -187,6 +189,12 @@ impl PhysicalRecoveryAuthorityRoots {
         Ok(refreshed)
     }
 
+    pub(super) fn same_unknown_authority(&self, other: &Self) -> bool {
+        self.unknown == other.unknown
+            && self.structured_unknowns == other.structured_unknowns
+            && self.structured_unknowns_bound == other.structured_unknowns_bound
+    }
+
     #[must_use]
     pub const fn owner(&self) -> &[u8; 32] {
         &self.owner
@@ -204,17 +212,38 @@ impl PhysicalRecoveryAuthorityRoots {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct PhysicalRecoveryRegistration {
-    symbol: Symbol,
-    config_digest: String,
+pub struct PhysicalRecoveryUniverseEntry {
+    binding: StrategyBinding,
     config_epoch: u64,
+}
+
+impl PhysicalRecoveryUniverseEntry {
+    #[must_use]
+    pub const fn symbol(&self) -> &Symbol {
+        &self.binding.key.symbol
+    }
+
+    #[must_use]
+    pub fn config_digest(&self) -> &str {
+        &self.binding.config_digest
+    }
+
+    #[must_use]
+    pub const fn config_epoch(&self) -> u64 {
+        self.config_epoch
+    }
+
+    #[must_use]
+    pub const fn binding(&self) -> &StrategyBinding {
+        &self.binding
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PhysicalRecoveryAccountAuthority {
     account: AccountKey,
     mode: GatewayMode,
-    registrations: Vec<PhysicalRecoveryRegistration>,
+    registrations: Vec<PhysicalRecoveryUniverseEntry>,
     position_mode: AccountPositionMode,
     family_support: BTreeMap<NativeOrderFamily, bool>,
     profile_version: u64,
@@ -231,6 +260,7 @@ pub struct PhysicalRecoveryScope {
     recovered_private_generation: u64,
     authority_roots: PhysicalRecoveryAuthorityRoots,
     account_authority: Option<PhysicalRecoveryAccountAuthority>,
+    recovery_session_sha256: Option<[u8; 32]>,
     commitment_sha256: [u8; 32],
 }
 
@@ -269,6 +299,7 @@ impl PhysicalRecoveryScope {
             recovered_private_generation,
             authority_roots,
             account_authority: None,
+            recovery_session_sha256: None,
             commitment_sha256,
         })
     }
@@ -285,7 +316,68 @@ impl PhysicalRecoveryScope {
         authority_roots: PhysicalRecoveryAuthorityRoots,
     ) -> Result<Self, PhysicalRecoveryManifestError>
     where
-        I: IntoIterator<Item = (Symbol, String, u64)>,
+        I: IntoIterator<Item = (StrategyBinding, u64)>,
+    {
+        Self::verified_account_with_session(
+            binding,
+            account,
+            registrations,
+            position_mode,
+            family_support,
+            profile_version,
+            connection_generation,
+            recovered_private_generation,
+            authority_roots,
+            None,
+        )
+    }
+
+    pub(super) fn verified_account_session<I>(
+        binding: GatewayBinding,
+        account: AccountKey,
+        registrations: I,
+        position_mode: AccountPositionMode,
+        family_support: BTreeMap<NativeOrderFamily, bool>,
+        profile_version: u64,
+        connection_generation: u64,
+        recovered_private_generation: u64,
+        authority_roots: PhysicalRecoveryAuthorityRoots,
+        recovery_session_sha256: [u8; 32],
+    ) -> Result<Self, PhysicalRecoveryManifestError>
+    where
+        I: IntoIterator<Item = (StrategyBinding, u64)>,
+    {
+        if !nonzero_digest(&recovery_session_sha256) {
+            return Err(PhysicalRecoveryManifestError::RecoverySession);
+        }
+        Self::verified_account_with_session(
+            binding,
+            account,
+            registrations,
+            position_mode,
+            family_support,
+            profile_version,
+            connection_generation,
+            recovered_private_generation,
+            authority_roots,
+            Some(recovery_session_sha256),
+        )
+    }
+
+    fn verified_account_with_session<I>(
+        binding: GatewayBinding,
+        account: AccountKey,
+        registrations: I,
+        position_mode: AccountPositionMode,
+        family_support: BTreeMap<NativeOrderFamily, bool>,
+        profile_version: u64,
+        connection_generation: u64,
+        recovered_private_generation: u64,
+        authority_roots: PhysicalRecoveryAuthorityRoots,
+        recovery_session_sha256: Option<[u8; 32]>,
+    ) -> Result<Self, PhysicalRecoveryManifestError>
+    where
+        I: IntoIterator<Item = (StrategyBinding, u64)>,
     {
         binding
             .validate()
@@ -306,24 +398,26 @@ impl PhysicalRecoveryScope {
         }
         let mut registrations = registrations
             .into_iter()
-            .map(|(symbol, config_digest, config_epoch)| {
-                if config_epoch == 0 || validate_config_digest(&config_digest).is_err() {
+            .map(|(registration, config_epoch)| {
+                if registration.key.account != account
+                    || config_epoch == 0
+                    || validate_config_digest(&registration.config_digest).is_err()
+                {
                     return Err(PhysicalRecoveryManifestError::Configuration);
                 }
-                Ok(PhysicalRecoveryRegistration {
-                    symbol,
-                    config_digest,
+                Ok(PhysicalRecoveryUniverseEntry {
+                    binding: registration,
                     config_epoch,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        registrations.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+        registrations.sort_by(|left, right| left.symbol().cmp(right.symbol()));
         if registrations
             .windows(2)
-            .any(|pair| pair[0].symbol == pair[1].symbol)
+            .any(|pair| pair[0].symbol() == pair[1].symbol())
             || registrations
                 .first()
-                .is_some_and(|registration| registration.symbol != binding.symbol)
+                .is_some_and(|registration| registration.symbol() != &binding.symbol)
         {
             return Err(PhysicalRecoveryManifestError::Registry);
         }
@@ -341,6 +435,7 @@ impl PhysicalRecoveryScope {
             recovered_private_generation,
             &authority_roots,
             &account_authority,
+            recovery_session_sha256.as_ref(),
         );
         Ok(Self {
             binding,
@@ -350,6 +445,7 @@ impl PhysicalRecoveryScope {
             recovered_private_generation,
             authority_roots,
             account_authority: Some(account_authority),
+            recovery_session_sha256,
             commitment_sha256,
         })
     }
@@ -364,22 +460,19 @@ impl PhysicalRecoveryScope {
         profile_version: u64,
     ) -> bool
     where
-        I: IntoIterator<Item = (Symbol, String, u64)>,
+        I: IntoIterator<Item = (StrategyBinding, u64)>,
     {
         let Some(expected) = &self.account_authority else {
             return false;
         };
         let mut registrations = registrations
             .into_iter()
-            .map(
-                |(symbol, config_digest, config_epoch)| PhysicalRecoveryRegistration {
-                    symbol,
-                    config_digest,
-                    config_epoch,
-                },
-            )
+            .map(|(binding, config_epoch)| PhysicalRecoveryUniverseEntry {
+                binding,
+                config_epoch,
+            })
             .collect::<Vec<_>>();
-        registrations.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+        registrations.sort_by(|left, right| left.symbol().cmp(right.symbol()));
         expected.account == *account
             && expected.mode == mode
             && expected.registrations == registrations
@@ -400,7 +493,7 @@ impl PhysicalRecoveryScope {
         let symbols = authority
             .registrations
             .iter()
-            .map(|registration| registration.symbol.clone())
+            .map(|registration| registration.symbol().clone())
             .collect::<BTreeSet<_>>();
         let covered_symbols = if surface == PhysicalReadbackSurface::Account {
             BTreeSet::new()
@@ -495,6 +588,27 @@ impl PhysicalRecoveryScope {
     #[must_use]
     pub const fn authority_roots(&self) -> &PhysicalRecoveryAuthorityRoots {
         &self.authority_roots
+    }
+
+    #[must_use]
+    pub fn account_universe(&self) -> &[PhysicalRecoveryUniverseEntry] {
+        self.account_authority
+            .as_ref()
+            .map_or(&[], |authority| authority.registrations.as_slice())
+    }
+
+    #[must_use]
+    pub fn position_mode(&self) -> Option<AccountPositionMode> {
+        self.account_authority
+            .as_ref()
+            .map(|authority| authority.position_mode)
+    }
+
+    #[must_use]
+    pub fn profile_version(&self) -> Option<u64> {
+        self.account_authority
+            .as_ref()
+            .map(|authority| authority.profile_version)
     }
 
     #[must_use]
@@ -810,6 +924,8 @@ pub enum PhysicalRecoveryManifestError {
     Registry,
     #[error("physical recovery omitted a registered symbol, position leg, or order-family face")]
     SymbolCoverage,
+    #[error("physical recovery scope is missing its runtime-issued recovery session")]
+    RecoverySession,
 }
 
 fn scope_commitment(
@@ -842,9 +958,10 @@ fn account_scope_commitment(
     recovered_private_generation: u64,
     roots: &PhysicalRecoveryAuthorityRoots,
     authority: &PhysicalRecoveryAccountAuthority,
+    recovery_session_sha256: Option<&[u8; 32]>,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
-    commit_bytes(&mut digest, b"venue-physical-recovery-account-scope-v3");
+    commit_bytes(&mut digest, b"venue-physical-recovery-account-scope-v4");
     commit_bytes(
         &mut digest,
         &[venue_tag(binding.venue), mode_tag(authority.mode)],
@@ -857,8 +974,14 @@ fn account_scope_commitment(
     commit_u64(&mut digest, recovered_private_generation);
     commit_u64(&mut digest, authority.registrations.len() as u64);
     for registration in &authority.registrations {
-        commit_str(&mut digest, &registration.symbol.to_string());
-        commit_str(&mut digest, &registration.config_digest);
+        commit_bytes(
+            &mut digest,
+            &[strategy_kind_tag(registration.binding.key.strategy_kind)],
+        );
+        commit_str(&mut digest, &registration.binding.key.instance_id);
+        commit_str(&mut digest, &registration.binding.key.symbol.to_string());
+        commit_str(&mut digest, &registration.binding.run_id);
+        commit_str(&mut digest, &registration.binding.config_digest);
         commit_u64(&mut digest, registration.config_epoch);
     }
     for family in [
@@ -880,6 +1003,13 @@ fn account_scope_commitment(
         commit_bytes(&mut digest, &[family_tag(unknown.family)]);
         commit_str(&mut digest, &unknown.symbol.to_string());
         commit_bytes(&mut digest, &[unknown_reason_tag(unknown.reason)]);
+    }
+    match recovery_session_sha256 {
+        Some(session) => {
+            commit_bytes(&mut digest, &[1]);
+            commit_bytes(&mut digest, session);
+        }
+        None => commit_bytes(&mut digest, &[0]),
     }
     digest.finalize().into()
 }
@@ -975,6 +1105,13 @@ const fn unknown_reason_tag(reason: PhysicalRecoveryUnknownReason) -> u8 {
     }
 }
 
+const fn strategy_kind_tag(kind: StrategyKind) -> u8 {
+    match kind {
+        StrategyKind::HedgedGrid => 1,
+        StrategyKind::Scalping => 2,
+    }
+}
+
 const fn venue_tag(venue: VenueId) -> u8 {
     match venue {
         VenueId::Binance => 1,
@@ -1015,6 +1152,7 @@ mod tests {
     use std::error::Error;
 
     use super::*;
+    use crate::StrategyInstanceKey;
 
     const ACCOUNT_ID: &str = "00000000-0000-4000-8000-000000000001";
 
@@ -1059,13 +1197,38 @@ mod tests {
         anchor: &str,
     ) -> Result<PhysicalRecoveryScope, Box<dyn Error>> {
         let account = AccountKey::new(crate::domain::ExchangeId::Binance, ACCOUNT_ID)?;
+        let registrations = [
+            (
+                StrategyBinding::new(
+                    StrategyInstanceKey::new(
+                        account.clone(),
+                        StrategyKind::HedgedGrid,
+                        "grid_btc",
+                        "BTC/USDT".parse()?,
+                    )?,
+                    "run_btc",
+                    "btc_config",
+                )?,
+                7,
+            ),
+            (
+                StrategyBinding::new(
+                    StrategyInstanceKey::new(
+                        account.clone(),
+                        StrategyKind::Scalping,
+                        "scalp_eth",
+                        "ETH/USDT".parse()?,
+                    )?,
+                    "run_eth",
+                    "eth_config",
+                )?,
+                9,
+            ),
+        ];
         Ok(PhysicalRecoveryScope::verified_account(
             GatewayBinding::new(VenueId::Binance, mode, ACCOUNT_ID, anchor.parse()?)?,
             account,
-            [
-                ("BTC/USDT".parse()?, "btc_config".to_owned(), 7),
-                ("ETH/USDT".parse()?, "eth_config".to_owned(), 9),
-            ],
+            registrations,
             AccountPositionMode::Hedge,
             all_family_support(),
             1,
@@ -1393,6 +1556,16 @@ mod tests {
     #[test]
     fn native_trading_account_must_equal_the_account_authority() -> Result<(), Box<dyn Error>> {
         let account = AccountKey::new(crate::domain::ExchangeId::Binance, ACCOUNT_ID)?;
+        let registration = StrategyBinding::new(
+            StrategyInstanceKey::new(
+                account.clone(),
+                StrategyKind::HedgedGrid,
+                "grid_btc",
+                "BTC/USDT".parse()?,
+            )?,
+            "run_btc",
+            "btc_config",
+        )?;
         let result = PhysicalRecoveryScope::verified_account(
             GatewayBinding::new(
                 VenueId::Binance,
@@ -1401,7 +1574,7 @@ mod tests {
                 "BTC/USDT".parse()?,
             )?,
             account,
-            [("BTC/USDT".parse()?, "btc_config".to_owned(), 1)],
+            [(registration, 1)],
             AccountPositionMode::Hedge,
             all_family_support(),
             1,

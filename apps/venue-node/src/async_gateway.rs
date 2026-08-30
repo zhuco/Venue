@@ -1,9 +1,11 @@
 use std::{future::Future, time::Duration};
 
-use venue_gateway_api::{CapabilityFlags, CapabilitySnapshot, GatewayBinding};
 #[cfg(test)]
-use venue_gateway_api::{HostAdmissionEvidence, HostAdmittedCapability};
+use venue_gateway_api::HostAdmissionEvidence;
+use venue_gateway_api::{CapabilityFlags, CapabilitySnapshot, GatewayBinding};
 
+#[cfg(test)]
+use crate::safe_host::TestAdmittedCapability;
 use crate::{
     DispatchPermit, GatewayDispatchResult, GatewayRecoveryPermit, PhysicalGateway,
     SignedReadbackReceipt, SignedReadbackRequest,
@@ -40,9 +42,13 @@ pub trait AsyncPhysicalGateway {
 
     /// Positive mutation wiring remains a test fixture until real durable authorities are sealed.
     #[cfg(test)]
+    #[allow(
+        private_interfaces,
+        reason = "the test-only authority must remain crate-local even though the production trait is public"
+    )]
     fn dispatch(
         &mut self,
-        admitted_capability: HostAdmittedCapability,
+        admitted_capability: TestAdmittedCapability,
         admission_evidence: HostAdmissionEvidence,
         permit: DispatchPermit,
     ) -> impl Future<Output = Result<GatewayDispatchResult, AsyncGatewayCallError<Self::Error>>> + Send;

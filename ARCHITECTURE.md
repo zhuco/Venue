@@ -56,7 +56,7 @@ VenueFlow Desktop / optional Agent
 
 `venue-control` 校验 schema v2 scope，以 PostgreSQL durable inbox/outbox、fencing delivery lease、幂等 claim 和终态 receipt 保存命令，并提供
 仅本地 HTTP/SSE `/v2`。TEST-only Copy worker 可在事务内锁定 leader 事件并持久化纯规划结果、delivery、ledger 与恢复状态；
-节点 ACK 只证明本地 inbox 已耐久，Unknown 只能进入下一序号只读对账。Node 已接入单一 opaque-journal adapter 与 bounded loopback HTTP polling client；每次 await 后都以当前时钟重验 lease/session/epoch，过期 outbox 不确认或重放。Actor durable-applied authority 尚未接入，因此生产 Applied 继续失败关闭。它不能直接提交订单，LIVE Copy 在数据库访问前失败关闭；唤醒通道不能
+节点 ACK 只证明本地 inbox 已耐久，Unknown 只能进入下一序号只读对账。Node 已接入单一 opaque-journal adapter 与 bounded loopback HTTP polling client；每次 await 后都以当前时钟重验 lease/session/epoch，过期 outbox 不确认或重放。storage 已有 anchored Actor journal/checkpoint durability receipt，但尚未由 runtime 用规范 Actor/Owner 与真实 WAL head 接线，因此生产 Applied 继续失败关闭。它不能直接提交订单，LIVE Copy 在数据库访问前失败关闭；唤醒通道不能
 代替耐久记录；节点仍须先持久化本地 Actor inbox，再独立重验 risk、Owner、WAL、writer 和私有事实。
 
 ## 4. 目标 workspace
@@ -84,7 +84,7 @@ crates/
 ├─ venue-execution/
 │  └─ src/{journal.rs,writer_lease.rs,canonical_root.rs,owner_routes.rs}
 ├─ venue-storage/
-│  └─ src/{journal.rs,control_delivery.rs,...}
+│  └─ src/{journal.rs,control_delivery.rs,actor_applied.rs,...}
 ├─ venue-runtime/
 │  └─ src/{authority.rs,account_lane.rs,account,strategy,grid,scalping,copy,shared,legacy}/
 └─ venue-control-protocol/
@@ -96,7 +96,7 @@ crates/
 当前 `apps/venue-node` 已建立上述六个固定产物、逐 feature 二进制隔离门禁及 exchange-neutral `safe_host`。安全宿主
 在 root/WAL/Owner/writer metadata 与独立 hash-chain control log 恢复后才允许连接，持久应用 Pause/Resume/Stop/Flatten/Canary，
 并组合一次性 dispatch permit 与 UNKNOWN 读回；它不会自行产生 capability。Binance、Gate.io、Bitget 仅在显式
-`LIVE` 下委托既有 Stage 7 安全闭环；其 `TEST` 不能重定向到生产 client。六所 adapter 已具备绑定型 async 私有读取与 test-only scope/raw/Owner/structured-Unknown recovery collector；Bybit、OKX、Hyperliquid 的 mutation builder、签名、POST 与 dispatch 在生产构建中不可达。共享层已绑定完整账户 universe/config/profile 与 Owner/WAL/Unknown 漂移撤权，但 capability promotion receipt、不可伪造认证 transport session、耐久 root refresh 和 Actor durable-applied authority尚未闭合。生产 Node 因此拒绝 physical recovery install、Actor Ready、host admission 与 async dispatch；失败的 Prepared 会耐久终结而不会调用物理 adapter。Stage 7 仍是唯一生产 writer。
+`LIVE` 下委托既有 Stage 7 安全闭环；其 `TEST` 不能重定向到生产 client。六所 adapter 已具备绑定型 async 私有读取与 test-only scope/raw/Owner/structured-Unknown recovery collector；Bybit、OKX、Hyperliquid 的 mutation builder、签名、POST 与 dispatch 在生产构建中不可达。公共 capability promotion 已固定失败关闭；共享 runtime 已用私有 issuer seal 绑定完整账户 universe/config/profile、五类 journal/checkpoint head、Owner/WAL/Unknown 与 authority-state commitment，每次 await 后重验且至少 refresh 一次才允许 install；生产 refresh 构造保持封闭。六所生产 authenticated collector、耐久 replay refresh adapter、真实 host promotion verifier及 Actor durability receipt 的 runtime 接线仍未闭合，生产 Node 因此拒绝 physical recovery install、Actor Ready、host admission 与 async dispatch；失败的 Prepared 会耐久终结而不会调用物理 adapter。Stage 7 仍是唯一生产 writer。
 
 ## 5. 依赖方向
 

@@ -23,11 +23,11 @@ use venue_domain::domain::{
 };
 use venue_execution::{CommandJournal, CommandState, WriterLeaseError};
 use venue_gateway_api::{
-    CanaryAdmissionReceipt, CapabilityFlags, CapabilityProbeCandidate, CapabilitySnapshot,
-    CompleteOrderFamilyEvidence, ControlAppliedReceipt, ControlState, EvidenceCommitment,
-    GatewayBinding, GatewayMode, HostAdmissionEvidence, HostAdmittedCapability,
-    OrderFamilyEvidence, OrderFamilySupport, OwnerRecoveryReceipt, PromotionScope, VenueId,
-    WalRecoveryReceipt, WriterFenceReceipt, promote_capability,
+    CanaryAdmissionReceipt, CapabilityFlags, CapabilityProbeCandidate, CapabilityPromotionError,
+    CapabilitySnapshot, CompleteOrderFamilyEvidence, ControlAppliedReceipt, ControlState,
+    EvidenceCommitment, GatewayBinding, GatewayMode, HostAdmissionEvidence, OrderFamilyEvidence,
+    OrderFamilySupport, OwnerRecoveryReceipt, PromotionScope, VenueId, WalRecoveryReceipt,
+    WriterFenceReceipt, promote_capability,
 };
 use venue_runtime::{AccountKey, StrategyBinding, StrategyInstanceKey, StrategyKind};
 
@@ -37,7 +37,8 @@ use crate::{
     GatewayAcknowledgement, GatewayDispatchResult, GatewayRecoveryPermit, NodeLaunch,
     NodeSafetyHost, PhysicalGateway, ReadbackCommandState, SafeHostError, SignedCommandReadback,
     SignedReadbackReceipt, SignedReadbackRequest, TokioPhysicalGateway, TokioRuntimeDriver,
-    TokioRuntimeRun, safe_host::TestCrashPoint,
+    TokioRuntimeRun,
+    safe_host::{TestAdmittedCapability, TestCrashPoint},
 };
 
 const ACCOUNT: &str = "00000000-0000-4000-8000-000000000010";
@@ -479,7 +480,7 @@ impl AsyncPhysicalGateway for FakeAsyncGateway {
 
     fn dispatch(
         &mut self,
-        admitted_capability: HostAdmittedCapability,
+        admitted_capability: TestAdmittedCapability,
         admission_evidence: HostAdmissionEvidence,
         permit: crate::DispatchPermit,
     ) -> impl Future<Output = Result<GatewayDispatchResult, AsyncGatewayCallError<Self::Error>>> + Send
@@ -563,11 +564,11 @@ fn commitment(byte: char) -> Result<EvidenceCommitment, Box<dyn std::error::Erro
     Ok(EvidenceCommitment::new(byte.to_string().repeat(64))?)
 }
 
-fn admitted_capability(
+fn promotion_material(
     binding: &GatewayBinding,
     prepared: &crate::PreparedDispatch,
     now_ms: u64,
-) -> Result<(HostAdmittedCapability, HostAdmissionEvidence), Box<dyn std::error::Error>> {
+) -> Result<(CapabilityProbeCandidate, HostAdmissionEvidence), Box<dyn std::error::Error>> {
     let scope = PromotionScope::new(
         binding.clone(),
         prepared.config_epoch(),
@@ -622,7 +623,16 @@ fn admitted_capability(
         )?,
         CanaryAdmissionReceipt::new(scope, 1, 7, now_ms, expires_ms, commitment('9')?)?,
     )?;
-    let capability = promote_capability(&candidate, evidence.clone(), now_ms)?;
+    Ok((candidate, evidence))
+}
+
+fn admitted_capability(
+    binding: &GatewayBinding,
+    prepared: &crate::PreparedDispatch,
+    now_ms: u64,
+) -> Result<(TestAdmittedCapability, HostAdmissionEvidence), Box<dyn std::error::Error>> {
+    let (candidate, evidence) = promotion_material(binding, prepared, now_ms)?;
+    let capability = TestAdmittedCapability::issue(&candidate, evidence.clone(), now_ms)?;
     Ok((capability, evidence))
 }
 
@@ -1155,43 +1165,35 @@ fn read_only_recovery_capability_connects_but_does_not_grant_mutation()
 }
 
 #[test]
-fn publicly_constructed_token_cannot_dispatch_in_production_path()
+fn public_promotion_is_unavailable_and_never_reaches_physical_dispatch()
 -> Result<(), Box<dyn std::error::Error>> {
-    for entry in ["dispatch", "admit"] {
-        let directory = tempfile::tempdir()?;
-        let launch = launch(&directory, "LIVE")?;
-        let owner = owner(launch.binding())?;
-        let dispatch_calls = Arc::new(AtomicUsize::new(0));
-        let command_id = CommandId::new(format!("forged_public_{entry}"))?;
-        let mut host = NodeSafetyHost::open_for_test(
-            &launch,
-            owner.clone(),
-            FakeGateway::new(launch.binding().clone(), vec![ReadbackPlan::initial()])
-                .with_counter(Arc::clone(&dispatch_calls)),
-            Some(canary_for(launch.binding(), &owner, command_id.as_str())?),
-            1_000,
-        )?;
-        let prepared =
-            host.prepare_dispatch(entry_command(launch.binding(), command_id.as_str())?, 1_000)?;
-        let (capability, evidence) = admitted_capability(launch.binding(), &prepared, 1_000)?;
-        let unavailable = if entry == "dispatch" {
-            host.dispatch_prepared(prepared, capability, evidence, 1_000)
-                .map(|_| ())
-        } else {
-            host.admit_prepared(prepared, capability, evidence, 1_000)
-        };
+    let directory = tempfile::tempdir()?;
+    let launch = launch(&directory, "LIVE")?;
+    let owner = owner(launch.binding())?;
+    let dispatch_calls = Arc::new(AtomicUsize::new(0));
+    let command_id = CommandId::new("forged_public_promotion")?;
+    let mut host = NodeSafetyHost::open_for_test(
+        &launch,
+        owner.clone(),
+        FakeGateway::new(launch.binding().clone(), vec![ReadbackPlan::initial()])
+            .with_counter(Arc::clone(&dispatch_calls)),
+        Some(canary_for(launch.binding(), &owner, command_id.as_str())?),
+        1_000,
+    )?;
+    let prepared =
+        host.prepare_dispatch(entry_command(launch.binding(), command_id.as_str())?, 1_000)?;
+    let (candidate, evidence) = promotion_material(launch.binding(), &prepared, 1_000)?;
 
-        assert!(matches!(
-            unavailable,
-            Err(SafeHostError::HostAdmissionUnavailable)
-        ));
-        assert_eq!(dispatch_calls.load(Ordering::SeqCst), 0);
-        let journal = CommandJournal::open(journal_path(&launch))?;
-        assert!(matches!(
-            journal.receipt(&command_id).map(|receipt| &receipt.state),
-            Some(CommandState::Rejected { reason }) if reason == "host_admission_unavailable"
-        ));
-    }
+    assert_eq!(
+        promote_capability(&candidate, evidence, 1_000),
+        Err(CapabilityPromotionError::AuthorityUnavailable)
+    );
+    assert_eq!(dispatch_calls.load(Ordering::SeqCst), 0);
+    let journal = CommandJournal::open(journal_path(&launch))?;
+    assert!(matches!(
+        journal.receipt(&command_id).map(|receipt| &receipt.state),
+        Some(CommandState::Prepared)
+    ));
     Ok(())
 }
 

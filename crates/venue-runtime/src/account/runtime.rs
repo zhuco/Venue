@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
+    account::recovery_session::PhysicalRecoverySessionIssuer,
     domain::{AccountOrderCapabilityEvidence, AppliedStrategyTurnReceipt, StrategyTurnToken},
     execution::{
         AccountDispatchDecision, AccountExecutionIntent, AccountExecutionLane,
@@ -13,7 +14,8 @@ use crate::{
             AccountFault, AccountHealth, AccountKey, AccountPositionMode, AccountReconcilerError,
             AccountReconciliationReport, AccountRecoverySnapshot, DesiredOrderSets, FlattenPlan,
             InstanceLifecycle, MarketHub, MarketHubError, PersistedOrderRouteAppendReceipt,
-            PhysicalRecoveryAuthorityRoots, PhysicalRecoveryReadbackManifest, PrivateRouteReport,
+            PhysicalRecoveryAuthorityRoots, PhysicalRecoveryDurableRoots,
+            PhysicalRecoveryReadbackManifest, PhysicalRecoverySession, PrivateRouteReport,
             PrivateRouter, PrivateRouterError, ReconcileScope, RecoveredShutdownMode,
             RegistryError, SignedOpenOrders, SignedStopProof, StopPlan, StrategyBinding,
             StrategyInstanceKey, StrategyRegistry, reconcile_open_orders,
@@ -52,6 +54,7 @@ pub struct AccountRuntime {
     active_turns: BTreeMap<StrategyInstanceKey, ActiveStrategyTurn>,
     last_applied_turns: BTreeMap<StrategyInstanceKey, StrategyTurnToken>,
     strategy_state_revision: u64,
+    market_actor_revision: u64,
     private_route_revision: u64,
     dispatch_revision: u64,
     pending_private_applications: BTreeMap<u64, PendingPrivateApplication>,
@@ -64,10 +67,13 @@ pub struct AccountRuntime {
     recovered_gateway_mode: Option<GatewayMode>,
     recovered_position_mode: Option<AccountPositionMode>,
     physical_authority_roots: Option<PhysicalRecoveryAuthorityRoots>,
+    physical_durable_roots: Option<PhysicalRecoveryDurableRoots>,
     physical_private_generation_floor: u64,
     pending_physical_recovery: Option<PhysicalRecoveryReadbackManifest>,
     admitted_physical_recovery: Option<PhysicalRecoveryReadbackManifest>,
     physical_recovery_drifted: bool,
+    physical_recovery_session_issuer: PhysicalRecoverySessionIssuer,
+    active_physical_recovery_session: Option<PhysicalRecoverySession>,
     #[cfg(test)]
     physical_recovery_test_fixture_enabled: bool,
     #[cfg(test)]
@@ -124,6 +130,7 @@ impl AccountRuntime {
     #[must_use]
     pub fn new(account: AccountKey) -> Self {
         let capability_evidence = AccountOrderCapabilityEvidence::for_account(account.clone());
+        let physical_recovery_session_issuer = PhysicalRecoverySessionIssuer::new(&account);
         Self {
             registry: StrategyRegistry::new(account.clone()),
             market_hub: MarketHub::new(),
@@ -138,6 +145,7 @@ impl AccountRuntime {
             active_turns: BTreeMap::new(),
             last_applied_turns: BTreeMap::new(),
             strategy_state_revision: 0,
+            market_actor_revision: 0,
             private_route_revision: 0,
             dispatch_revision: 1,
             pending_private_applications: BTreeMap::new(),
@@ -150,10 +158,13 @@ impl AccountRuntime {
             recovered_gateway_mode: None,
             recovered_position_mode: None,
             physical_authority_roots: None,
+            physical_durable_roots: None,
             physical_private_generation_floor: 0,
             pending_physical_recovery: None,
             admitted_physical_recovery: None,
             physical_recovery_drifted: false,
+            physical_recovery_session_issuer,
+            active_physical_recovery_session: None,
             #[cfg(test)]
             physical_recovery_test_fixture_enabled: false,
             #[cfg(test)]
@@ -232,6 +243,12 @@ impl AccountRuntime {
             .ok_or(AccountRuntimeError::StrategyStateRevisionExhausted)
     }
 
+    fn next_market_actor_revision(&self) -> Result<u64, AccountRuntimeError> {
+        self.market_actor_revision
+            .checked_add(1)
+            .ok_or(AccountRuntimeError::ActorAuthorityRevisionExhausted)
+    }
+
     fn next_dispatch_revision(&self) -> Result<u64, AccountRuntimeError> {
         self.dispatch_revision
             .checked_add(1)
@@ -283,7 +300,10 @@ impl AccountRuntime {
         self.actors
             .insert(binding.key.clone(), StrategyActorHost::new(binding));
         self.strategy_state_revision = next_state_revision;
-        if self.admitted_physical_recovery.is_some() {
+        if self.admitted_physical_recovery.is_some()
+            || self.active_physical_recovery_session.is_some()
+        {
+            self.physical_durable_roots = None;
             self.revoke_physical_authority();
         }
         Ok(())
@@ -303,7 +323,7 @@ impl AccountRuntime {
             gateway_mode,
             position_mode,
             journal_roots,
-            _manifest_commitment,
+            manifest_commitment,
             last_connection_generation,
             applied_private_cursor,
             strategy_states,
@@ -469,6 +489,12 @@ impl AccountRuntime {
                 .clone();
             next_lane.recover_unknown(request, &binding)?;
         }
+        let physical_durable_roots = PhysicalRecoveryDurableRoots::from_recovered(
+            &journal_roots,
+            &manifest_commitment,
+            physical_authority_roots.clone(),
+        )
+        .map_err(|_| AccountRuntimeError::RecoveryStateMismatch)?;
         self.private_router = next_router;
         self.execution_lane = next_lane;
         self.registry = next_registry;
@@ -483,11 +509,13 @@ impl AccountRuntime {
         self.owner_index_tail_sequence = journal_roots.owner_index_tail_sequence();
         self.owner_index_record_count = journal_roots.owner_index_record_count();
         self.physical_authority_roots = Some(physical_authority_roots);
+        self.physical_durable_roots = Some(physical_durable_roots);
         self.recovered_gateway_mode = Some(gateway_mode);
         self.recovered_position_mode = Some(position_mode);
         self.physical_private_generation_floor = recovered_private_generation;
         self.pending_physical_recovery = None;
         self.admitted_physical_recovery = None;
+        self.active_physical_recovery_session = None;
         self.physical_recovery_drifted = false;
         self.strategy_state_revision = next_state_revision;
         self.durable_recovery_complete = true;
@@ -500,7 +528,12 @@ impl AccountRuntime {
             return Err(AccountRuntimeError::DurableRecoveryRequired);
         }
         if !self.physical_recovery_integration_available() {
+            self.revoke_physical_authority();
             return Err(AccountRuntimeError::PhysicalRecoveryIntegrationUnavailable);
+        }
+        if self.active_physical_recovery_session.is_some() {
+            self.revoke_physical_authority();
+            return Err(AccountRuntimeError::PhysicalRecoverySessionInvalid);
         }
         #[cfg(test)]
         self.stage_physical_recovery_test_fixture()?;
@@ -608,8 +641,10 @@ impl AccountRuntime {
             }
             return Err(error.into());
         }
+        let next_actor_revision = self.next_market_actor_revision()?;
         self.market_hub = next_hub;
         self.actors.insert(binding.key.clone(), next_actor);
+        self.market_actor_revision = next_actor_revision;
         Ok(true)
     }
 
@@ -665,7 +700,10 @@ impl AccountRuntime {
         self.owner_index_tail_sequence = append_sequence;
         self.owner_index_record_count = next_record_count;
         self.physical_authority_roots = Some(next_physical_roots);
-        if self.admitted_physical_recovery.is_some() {
+        self.physical_durable_roots = None;
+        if self.admitted_physical_recovery.is_some()
+            || self.active_physical_recovery_session.is_some()
+        {
             self.revoke_physical_authority();
         }
         Ok(())
@@ -1096,7 +1134,10 @@ impl AccountRuntime {
         self.strategy_state_revision = next_state_revision;
         let _discarded_old_configuration = self.execution_lane.discard_queued_instance(key);
         self.install_dispatch_revision(next_dispatch_revision);
-        if self.admitted_physical_recovery.is_some() {
+        if self.admitted_physical_recovery.is_some()
+            || self.active_physical_recovery_session.is_some()
+        {
+            self.physical_durable_roots = None;
             self.revoke_physical_authority();
         }
         Ok(())
@@ -1417,6 +1458,7 @@ impl AccountRuntime {
             },
         );
         self.physical_authority_roots = None;
+        self.physical_durable_roots = None;
         self.revoke_physical_authority();
         let decision = decision?;
         match decision {
@@ -1433,6 +1475,7 @@ impl AccountRuntime {
     ) -> Result<AccountLaneFollowUp, AccountRuntimeError> {
         let follow_up = self.execution_lane.record_outcome(receipt);
         self.physical_authority_roots = None;
+        self.physical_durable_roots = None;
         self.revoke_physical_authority();
         let follow_up = follow_up?;
         Ok(follow_up)
@@ -1457,6 +1500,7 @@ impl AccountRuntime {
         }
         let follow_up = self.execution_lane.resolve_unknown(proof);
         self.physical_authority_roots = None;
+        self.physical_durable_roots = None;
         self.revoke_physical_authority();
         let follow_up = follow_up?;
         Ok(follow_up)
@@ -1634,6 +1678,7 @@ impl AccountRuntime {
         self.last_instance_flat.remove(key);
         self.stop_fences.remove(key);
         self.shutdown_modes.remove(key);
+        self.physical_durable_roots = None;
         self.revoke_physical_authority();
         Ok(binding)
     }
@@ -1687,6 +1732,22 @@ pub enum AccountRuntimeError {
     PhysicalRecoveryAlreadyInstalled,
     #[error("physical recovery binding, generation, configuration, or authority roots drifted")]
     PhysicalRecoveryScopeMismatch,
+    #[error("a physical recovery session is already active for this account")]
+    PhysicalRecoverySessionActive,
+    #[error("physical recovery requires a complete durable checkpoint and five-journal root set")]
+    PhysicalRecoveryDurableRootsRequired,
+    #[error("physical recovery requires at least one completely configured account symbol")]
+    PhysicalRecoveryUniverseIncomplete,
+    #[error("physical recovery session is forged, revoked, stale, or belongs to another attempt")]
+    PhysicalRecoverySessionInvalid,
+    #[error("physical recovery session lease expired")]
+    PhysicalRecoverySessionExpired,
+    #[error("physical recovery manifest requires a post-await durable refresh session epoch")]
+    PhysicalRecoveryPostAwaitRefreshRequired,
+    #[error("physical recovery durable roots or account authority drifted during collection")]
+    PhysicalRecoveryDurableRootDrift,
+    #[error("physical recovery durable-root refresh is incomplete, regressive, or cross-attempt")]
+    PhysicalRecoveryDurableRootRegression,
     #[error("durable account recovery was already installed or startup already advanced")]
     DurableRecoveryAlreadyInstalled,
     #[error("durable recovery snapshot belongs to another exchange account")]
@@ -1715,6 +1776,8 @@ pub enum AccountRuntimeError {
     PrivateApplicationState,
     #[error("strategy registry/lifecycle/config state revision counter is exhausted")]
     StrategyStateRevisionExhausted,
+    #[error("actor authority revision counter is exhausted")]
+    ActorAuthorityRevisionExhausted,
     #[error("execution dispatch authority revision counter is exhausted")]
     DispatchRevisionExhausted,
 }

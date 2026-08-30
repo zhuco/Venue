@@ -473,23 +473,20 @@ pub struct HostAdmittedCapability {
     expires_ms: u64,
     flags: CapabilityFlags,
     probe_commitment: EvidenceCommitment,
+    authority_epoch: u64,
+    issuance_serial: u64,
 }
 
 impl HostAdmittedCapability {
+    /// Ordinary callers cannot revalidate host authority by echoing evidence back to this type.
+    /// Production authorization must use the internal authority that issued the capability.
     pub fn authorize(
         &self,
-        current_evidence: &HostAdmissionEvidence,
-        now_ms: u64,
-        mutation: MutationCapability,
+        _current_evidence: &HostAdmissionEvidence,
+        _now_ms: u64,
+        _mutation: MutationCapability,
     ) -> Result<(), CapabilityPromotionError> {
-        if current_evidence != &self.evidence {
-            return Err(CapabilityPromotionError::Drift);
-        }
-        if now_ms < self.issued_ms || now_ms >= self.expires_ms {
-            return Err(CapabilityPromotionError::Freshness);
-        }
-        validate_flags(self.flags, mutation)?;
-        Ok(())
+        Err(CapabilityPromotionError::AuthorityUnavailable)
     }
 
     #[must_use]
@@ -513,11 +510,162 @@ impl HostAdmittedCapability {
     }
 }
 
+/// Compatibility entry point for ordinary probe/evidence callers. Evidence values are deliberately
+/// not authority: only the crate-internal verifier can promote them.
 pub fn promote_capability(
-    candidate: &CapabilityProbeCandidate,
-    evidence: HostAdmissionEvidence,
-    now_ms: u64,
+    _candidate: &CapabilityProbeCandidate,
+    _evidence: HostAdmissionEvidence,
+    _now_ms: u64,
 ) -> Result<HostAdmittedCapability, CapabilityPromotionError> {
+    Err(CapabilityPromotionError::AuthorityUnavailable)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IssuanceWatermark {
+    config_epoch: u64,
+    connection_generation: u64,
+    private_generation: u64,
+    capability_version: u64,
+    control_sequence: u64,
+    owner_revision: u64,
+    wal_tail_sequence: u64,
+    writer_generation: u64,
+    fence_revision: u64,
+    canary_sequence: u64,
+}
+
+impl IssuanceWatermark {
+    fn from_evidence(
+        candidate: &CapabilityProbeCandidate,
+        evidence: &HostAdmissionEvidence,
+    ) -> Self {
+        Self {
+            config_epoch: evidence.scope.config_epoch,
+            connection_generation: evidence.scope.connection_generation,
+            private_generation: evidence.scope.private_generation,
+            capability_version: candidate.capability_version,
+            control_sequence: evidence.control.durable_sequence,
+            owner_revision: evidence.owner.owner_revision,
+            wal_tail_sequence: evidence.wal.tail_sequence,
+            writer_generation: evidence.writer.writer_generation,
+            fence_revision: evidence.writer.fence_revision,
+            canary_sequence: evidence.canary.canary_sequence,
+        }
+    }
+
+    fn is_strict_successor_of(&self, previous: &Self) -> bool {
+        let no_rollback = self.config_epoch >= previous.config_epoch
+            && self.connection_generation >= previous.connection_generation
+            && self.private_generation >= previous.private_generation
+            && self.capability_version >= previous.capability_version
+            && self.control_sequence >= previous.control_sequence
+            && self.owner_revision >= previous.owner_revision
+            && self.wal_tail_sequence >= previous.wal_tail_sequence
+            && self.writer_generation >= previous.writer_generation
+            && self.fence_revision >= previous.fence_revision
+            && self.canary_sequence >= previous.canary_sequence;
+        no_rollback && self != previous
+    }
+}
+
+/// Single in-process issuer owned by the host verification boundary. It is deliberately private,
+/// non-serializable, and non-cloneable; ordinary probe/evidence callers cannot construct it.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct CapabilityPromotionAuthority {
+    scope: PromotionScope,
+    authority_epoch: u64,
+    issuance_serial: u64,
+    last_issuance: Option<IssuanceWatermark>,
+}
+
+#[allow(dead_code)]
+impl CapabilityPromotionAuthority {
+    fn establish(
+        scope: PromotionScope,
+        authority_epoch: u64,
+    ) -> Result<Self, CapabilityPromotionError> {
+        if authority_epoch == 0 {
+            return Err(CapabilityPromotionError::Scope);
+        }
+        Ok(Self {
+            scope,
+            authority_epoch,
+            issuance_serial: 0,
+            last_issuance: None,
+        })
+    }
+
+    fn promote(
+        &mut self,
+        candidate: &CapabilityProbeCandidate,
+        evidence: HostAdmissionEvidence,
+        now_ms: u64,
+    ) -> Result<HostAdmittedCapability, CapabilityPromotionError> {
+        if evidence.scope != self.scope
+            || candidate.binding != self.scope.binding
+            || candidate.connection_generation != self.scope.connection_generation
+            || candidate.private_generation != self.scope.private_generation
+        {
+            return Err(CapabilityPromotionError::Scope);
+        }
+        validate_promotion(candidate, &evidence, now_ms)?;
+
+        let watermark = IssuanceWatermark::from_evidence(candidate, &evidence);
+        if self
+            .last_issuance
+            .as_ref()
+            .is_some_and(|previous| !watermark.is_strict_successor_of(previous))
+        {
+            return Err(CapabilityPromotionError::Replay);
+        }
+        let issuance_serial = self
+            .issuance_serial
+            .checked_add(1)
+            .ok_or(CapabilityPromotionError::Replay)?;
+
+        let admitted = HostAdmittedCapability {
+            capability_version: candidate.capability_version,
+            issued_ms: now_ms,
+            expires_ms: evidence.promotion_expires_ms,
+            flags: candidate.flags,
+            probe_commitment: candidate.probe_commitment.clone(),
+            authority_epoch: self.authority_epoch,
+            issuance_serial,
+            evidence,
+        };
+        self.issuance_serial = issuance_serial;
+        self.last_issuance = Some(watermark);
+        Ok(admitted)
+    }
+
+    fn authorize(
+        &self,
+        capability: &HostAdmittedCapability,
+        current_evidence: &HostAdmissionEvidence,
+        now_ms: u64,
+        mutation: MutationCapability,
+    ) -> Result<(), CapabilityPromotionError> {
+        if capability.authority_epoch != self.authority_epoch
+            || capability.issuance_serial != self.issuance_serial
+        {
+            return Err(CapabilityPromotionError::Replay);
+        }
+        if current_evidence != &capability.evidence {
+            return Err(CapabilityPromotionError::Drift);
+        }
+        if now_ms < capability.issued_ms || now_ms >= capability.expires_ms {
+            return Err(CapabilityPromotionError::Freshness);
+        }
+        validate_flags(capability.flags, mutation)
+    }
+}
+
+fn validate_promotion(
+    candidate: &CapabilityProbeCandidate,
+    evidence: &HostAdmissionEvidence,
+    now_ms: u64,
+) -> Result<(), CapabilityPromotionError> {
     if candidate.binding != evidence.scope.binding
         || candidate.connection_generation != evidence.scope.connection_generation
         || candidate.private_generation != evidence.scope.private_generation
@@ -558,14 +706,7 @@ pub fn promote_capability(
         return Err(CapabilityPromotionError::Denied);
     }
     validate_flags(candidate.flags, MutationCapability::Cancel)?;
-    Ok(HostAdmittedCapability {
-        capability_version: candidate.capability_version,
-        issued_ms: now_ms,
-        expires_ms: evidence.promotion_expires_ms,
-        flags: candidate.flags,
-        probe_commitment: candidate.probe_commitment.clone(),
-        evidence,
-    })
+    Ok(())
 }
 
 fn validate_flags(
@@ -588,6 +729,8 @@ fn validate_flags(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum CapabilityPromotionError {
+    #[error("capability promotion requires the internal host verification authority")]
+    AuthorityUnavailable,
     #[error("capability promotion scope, generation, epoch, or version does not match")]
     Scope,
     #[error("capability promotion evidence is stale, future-dated, or exceeds the short TTL")]
@@ -604,8 +747,350 @@ pub enum CapabilityPromotionError {
     Canary,
     #[error("host-admitted capability evidence drifted after promotion")]
     Drift,
+    #[error("capability promotion or authorization replayed or rolled back authority state")]
+    Replay,
     #[error("candidate flags do not authorize the requested mutation or include withdrawal")]
     Denied,
     #[error(transparent)]
     Gateway(#[from] GatewayApiError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{GatewayMode, VenueId};
+
+    const ACCOUNT: &str = "00000000-0000-0000-0000-000000000001";
+    const NOW_MS: u64 = 10_000;
+
+    fn commitment(byte: char) -> Result<EvidenceCommitment, CapabilityPromotionError> {
+        EvidenceCommitment::new(byte.to_string().repeat(64))
+    }
+
+    fn binding() -> Result<GatewayBinding, Box<dyn std::error::Error>> {
+        Ok(GatewayBinding::new(
+            VenueId::Bybit,
+            GatewayMode::Live,
+            ACCOUNT,
+            "BTC/USDT".parse()?,
+        )?)
+    }
+
+    fn authority(
+        binding: GatewayBinding,
+    ) -> Result<CapabilityPromotionAuthority, CapabilityPromotionError> {
+        CapabilityPromotionAuthority::establish(PromotionScope::new(binding, 5, 11, 13)?, 41)
+    }
+
+    fn families() -> Result<CompleteOrderFamilyEvidence, CapabilityPromotionError> {
+        Ok(CompleteOrderFamilyEvidence::new(
+            OrderFamilyEvidence::new(OrderFamilySupport::Complete, commitment('1')?),
+            OrderFamilyEvidence::new(OrderFamilySupport::ExplicitlyUnsupported, commitment('2')?),
+            OrderFamilyEvidence::new(OrderFamilySupport::ExplicitlyUnsupported, commitment('3')?),
+        ))
+    }
+
+    fn candidate(
+        binding: GatewayBinding,
+    ) -> Result<CapabilityProbeCandidate, CapabilityPromotionError> {
+        CapabilityProbeCandidate::from_snapshot(
+            CapabilitySnapshot {
+                binding,
+                version: 7,
+                observed_ms: 9_000,
+                expires_ms: 30_000,
+                flags: CapabilityFlags::READ_ACCOUNT
+                    | CapabilityFlags::READ_ORDERS
+                    | CapabilityFlags::READ_FILLS
+                    | CapabilityFlags::PRIVATE_STREAM
+                    | CapabilityFlags::TRADE
+                    | CapabilityFlags::PLACE_LIMIT
+                    | CapabilityFlags::CANCEL,
+            },
+            11,
+            13,
+            families()?,
+            commitment('4')?,
+        )
+    }
+
+    fn evidence(
+        binding: GatewayBinding,
+        control_sequence: u64,
+        control_commitment: char,
+        expires_ms: u64,
+    ) -> Result<HostAdmissionEvidence, CapabilityPromotionError> {
+        let scope = PromotionScope::new(binding, 5, 11, 13)?;
+        HostAdmissionEvidence::new(
+            scope.clone(),
+            expires_ms,
+            families()?,
+            ControlAppliedReceipt::new(
+                scope.clone(),
+                ControlState::Active,
+                control_sequence,
+                9_100,
+                commitment(control_commitment)?,
+            )?,
+            OwnerRecoveryReceipt::new(scope.clone(), 23, 9_200, commitment('6')?)?,
+            WalRecoveryReceipt::new(scope.clone(), 29, 0, 0, 9_300, commitment('7')?)?,
+            WriterFenceReceipt::new(scope.clone(), 19, 31, 9_400, commitment('8')?)?,
+            CanaryAdmissionReceipt::new(scope, 37, 7, 9_500, 25_000, commitment('9')?)?,
+        )
+    }
+
+    fn rebind_evidence_scope(evidence: &mut HostAdmissionEvidence, scope: PromotionScope) {
+        evidence.scope = scope.clone();
+        evidence.control.scope = scope.clone();
+        evidence.owner.scope = scope.clone();
+        evidence.wal.scope = scope.clone();
+        evidence.writer.scope = scope.clone();
+        evidence.canary.scope = scope;
+    }
+
+    #[test]
+    fn internal_authority_issues_and_checks_an_exact_capability()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding()?;
+        let candidate = candidate(binding.clone())?;
+        let evidence = evidence(binding.clone(), 17, '5', 20_000)?;
+        let mut authority = authority(binding)?;
+        let capability = authority.promote(&candidate, evidence.clone(), NOW_MS)?;
+
+        assert_eq!(capability.capability_version(), 7);
+        assert_eq!(capability.expires_ms(), 20_000);
+        assert_eq!(
+            authority.authorize(
+                &capability,
+                &evidence,
+                19_999,
+                MutationCapability::PlaceLimit,
+            ),
+            Ok(())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn internal_promotion_rejects_withdrawal_and_overlong_ttl()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding()?;
+        let exact_evidence = evidence(binding.clone(), 17, '5', 20_000)?;
+        let mut withdrawal_candidate = candidate(binding.clone())?;
+        withdrawal_candidate.flags.insert(CapabilityFlags::WITHDRAW);
+        let mut authority = authority(binding.clone())?;
+        assert_eq!(
+            authority.promote(&withdrawal_candidate, exact_evidence, NOW_MS),
+            Err(CapabilityPromotionError::Denied)
+        );
+
+        let mut long_candidate = candidate(binding.clone())?;
+        long_candidate.expires_ms = 50_000;
+        let mut long_evidence = evidence(binding, 17, '5', 20_000)?;
+        long_evidence.promotion_expires_ms = NOW_MS + MAX_PROMOTION_TTL_MS + 1;
+        long_evidence.canary.expires_ms = 50_000;
+        assert_eq!(
+            authority.promote(&long_candidate, long_evidence, NOW_MS),
+            Err(CapabilityPromotionError::Freshness)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn internal_promotion_rejects_scope_generation_and_family_mismatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding()?;
+        let exact_candidate = candidate(binding.clone())?;
+        let exact_evidence = evidence(binding.clone(), 17, '5', 20_000)?;
+        let mut authority = authority(binding)?;
+
+        let mut generation_drift = exact_candidate.clone();
+        generation_drift.private_generation += 1;
+        assert_eq!(
+            authority.promote(&generation_drift, exact_evidence.clone(), NOW_MS),
+            Err(CapabilityPromotionError::Scope)
+        );
+
+        let mut family_drift = exact_candidate.clone();
+        family_drift.order_families.um_order.commitment = commitment('a')?;
+        assert_eq!(
+            authority.promote(&family_drift, exact_evidence.clone(), NOW_MS),
+            Err(CapabilityPromotionError::Scope)
+        );
+
+        let mut scope_drift = exact_evidence;
+        let drifted_scope = PromotionScope::new(
+            scope_drift.scope.binding.clone(),
+            scope_drift.scope.config_epoch + 1,
+            scope_drift.scope.connection_generation,
+            scope_drift.scope.private_generation,
+        )?;
+        rebind_evidence_scope(&mut scope_drift, drifted_scope);
+        assert_eq!(
+            authority.promote(&exact_candidate, scope_drift, NOW_MS),
+            Err(CapabilityPromotionError::Scope)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admission_constructor_rejects_paused_and_unsettled_wal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding()?;
+        let exact = evidence(binding.clone(), 17, '5', 20_000)?;
+        let mut paused_control = exact.control.clone();
+        paused_control.state = ControlState::Paused;
+        assert_eq!(
+            HostAdmissionEvidence::new(
+                exact.scope.clone(),
+                exact.promotion_expires_ms,
+                exact.order_families.clone(),
+                paused_control,
+                exact.owner.clone(),
+                exact.wal.clone(),
+                exact.writer.clone(),
+                exact.canary.clone(),
+            ),
+            Err(CapabilityPromotionError::Control)
+        );
+
+        for (pending_commands, unknown_commands) in [(1, 0), (0, 1)] {
+            let exact = evidence(binding.clone(), 17, '5', 20_000)?;
+            let mut unsettled_wal = exact.wal.clone();
+            unsettled_wal.pending_commands = pending_commands;
+            unsettled_wal.unknown_commands = unknown_commands;
+            assert_eq!(
+                HostAdmissionEvidence::new(
+                    exact.scope,
+                    exact.promotion_expires_ms,
+                    exact.order_families,
+                    exact.control,
+                    exact.owner,
+                    unsettled_wal,
+                    exact.writer,
+                    exact.canary,
+                ),
+                Err(CapabilityPromotionError::OwnerWal)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn verified_evidence_drift_invalidates_the_issued_capability()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding()?;
+        let candidate = candidate(binding.clone())?;
+        let exact_evidence = evidence(binding.clone(), 17, '5', 20_000)?;
+        let drifted = evidence(binding.clone(), 17, 'a', 20_000)?;
+        let mut authority = authority(binding)?;
+        let capability = authority.promote(&candidate, exact_evidence, NOW_MS)?;
+
+        assert_eq!(
+            authority.authorize(&capability, &drifted, 15_000, MutationCapability::Cancel,),
+            Err(CapabilityPromotionError::Drift)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_critical_receipt_and_scope_drift_invalidates_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding()?;
+        let candidate = candidate(binding.clone())?;
+        let exact = evidence(binding.clone(), 17, '5', 20_000)?;
+        let mut authority = authority(binding)?;
+        let capability = authority.promote(&candidate, exact.clone(), NOW_MS)?;
+
+        let mut drifts = Vec::new();
+        let mut control = exact.clone();
+        control.control.durable_sequence += 1;
+        drifts.push(control);
+        let mut owner = exact.clone();
+        owner.owner.owner_revision += 1;
+        drifts.push(owner);
+        let mut wal = exact.clone();
+        wal.wal.tail_sequence += 1;
+        drifts.push(wal);
+        let mut writer = exact.clone();
+        writer.writer.fence_revision += 1;
+        drifts.push(writer);
+        let mut canary = exact.clone();
+        canary.canary.canary_sequence += 1;
+        drifts.push(canary);
+        let mut family = exact.clone();
+        family.order_families.um_order.commitment = commitment('a')?;
+        drifts.push(family);
+
+        for drifted_scope in [
+            PromotionScope::new(
+                exact.scope.binding.clone(),
+                exact.scope.config_epoch + 1,
+                exact.scope.connection_generation,
+                exact.scope.private_generation,
+            )?,
+            PromotionScope::new(
+                exact.scope.binding.clone(),
+                exact.scope.config_epoch,
+                exact.scope.connection_generation + 1,
+                exact.scope.private_generation,
+            )?,
+            PromotionScope::new(
+                exact.scope.binding.clone(),
+                exact.scope.config_epoch,
+                exact.scope.connection_generation,
+                exact.scope.private_generation + 1,
+            )?,
+        ] {
+            let mut scope = exact.clone();
+            rebind_evidence_scope(&mut scope, drifted_scope);
+            drifts.push(scope);
+        }
+
+        for drift in drifts {
+            assert_eq!(
+                authority.authorize(&capability, &drift, 15_000, MutationCapability::Cancel,),
+                Err(CapabilityPromotionError::Drift)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn authority_rejects_receipt_replay_and_revokes_the_previous_serial()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding()?;
+        let candidate = candidate(binding.clone())?;
+        let first_evidence = evidence(binding.clone(), 17, '5', 20_000)?;
+        let mut authority = authority(binding.clone())?;
+        let first = authority.promote(&candidate, first_evidence.clone(), NOW_MS)?;
+
+        assert_eq!(
+            authority.promote(&candidate, first_evidence.clone(), NOW_MS + 1),
+            Err(CapabilityPromotionError::Replay)
+        );
+
+        let successor_evidence = evidence(binding, 18, 'a', 20_000)?;
+        let _successor = authority.promote(&candidate, successor_evidence, NOW_MS + 1)?;
+        assert_eq!(
+            authority.authorize(&first, &first_evidence, 15_000, MutationCapability::Cancel,),
+            Err(CapabilityPromotionError::Replay)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn issued_capability_expires_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding()?;
+        let candidate = candidate(binding.clone())?;
+        let evidence = evidence(binding.clone(), 17, '5', 20_000)?;
+        let mut authority = authority(binding)?;
+        let capability = authority.promote(&candidate, evidence.clone(), NOW_MS)?;
+
+        assert_eq!(
+            authority.authorize(&capability, &evidence, 20_000, MutationCapability::Cancel,),
+            Err(CapabilityPromotionError::Freshness)
+        );
+        Ok(())
+    }
 }

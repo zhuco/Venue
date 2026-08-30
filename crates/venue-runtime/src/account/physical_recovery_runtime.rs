@@ -1,6 +1,11 @@
 use std::collections::BTreeMap;
 
+use sha2::{Digest, Sha256};
+
 use super::{AccountRuntime, AccountRuntimeError};
+use crate::account::recovery_session::{
+    PhysicalRecoveryRootRefresh, PhysicalRecoverySession, PhysicalRecoverySessionParameters,
+};
 #[cfg(test)]
 use crate::runtime::account::{
     PhysicalReadbackReceipt, PhysicalReadbackSurface, PhysicalRecoveryScope,
@@ -9,10 +14,345 @@ use crate::{
     domain::NativeOrderFamily,
     runtime::account::{PhysicalRecoveryAuthorityRoots, PhysicalRecoveryReadbackManifest},
 };
+use venue_gateway_api::GatewayBinding;
 #[cfg(test)]
-use venue_gateway_api::{GatewayBinding, VenueId};
+use venue_gateway_api::VenueId;
 
 impl AccountRuntime {
+    fn physical_recovery_runtime_authority_sha256(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        commit_bytes(&mut digest, b"venue-physical-recovery-runtime-authority-v1");
+        commit_u64(&mut digest, self.strategy_state_revision);
+        commit_u64(&mut digest, self.market_actor_revision);
+        commit_u64(&mut digest, self.private_route_revision);
+        commit_u64(&mut digest, self.dispatch_revision);
+        commit_u64(&mut digest, self.connection_generation);
+        commit_u64(&mut digest, self.last_applied_private_sequence);
+        commit_u64(&mut digest, self.last_reconciliation_generation);
+        commit_bytes(&mut digest, &[account_health_tag(self.health)]);
+        commit_bytes(&mut digest, &[self.fault.map_or(0, account_fault_tag)]);
+        commit_bytes(&mut digest, &[u8::from(self.private_batch_fence_active)]);
+        commit_u64(&mut digest, self.registry.registrations().count() as u64);
+        for registration in self.registry.registrations() {
+            commit_strategy_key(&mut digest, &registration.binding.key);
+            commit_str(&mut digest, &registration.binding.run_id);
+            commit_str(&mut digest, &registration.binding.config_digest);
+            commit_u64(&mut digest, registration.config_epoch);
+            commit_bytes(&mut digest, &[lifecycle_tag(registration.lifecycle)]);
+        }
+        commit_u64(&mut digest, self.turn_sequences.len() as u64);
+        for (key, sequence) in &self.turn_sequences {
+            commit_strategy_key(&mut digest, key);
+            commit_u64(&mut digest, *sequence);
+        }
+        commit_u64(&mut digest, self.active_turns.len() as u64);
+        for (key, active) in &self.active_turns {
+            commit_strategy_key(&mut digest, key);
+            commit_turn_token(&mut digest, &active.token);
+        }
+        commit_u64(&mut digest, self.last_applied_turns.len() as u64);
+        for (key, token) in &self.last_applied_turns {
+            commit_strategy_key(&mut digest, key);
+            commit_turn_token(&mut digest, token);
+        }
+        commit_u64(&mut digest, self.pending_private_applications.len() as u64);
+        for (sequence, application) in &self.pending_private_applications {
+            commit_u64(&mut digest, *sequence);
+            commit_u64(&mut digest, application.expected.len() as u64);
+            for (key, fact_index) in &application.expected {
+                commit_strategy_key(&mut digest, key);
+                commit_u64(&mut digest, u64::from(*fact_index));
+            }
+        }
+        commit_u64(&mut digest, self.completed_private_sequences.len() as u64);
+        for sequence in &self.completed_private_sequences {
+            commit_u64(&mut digest, *sequence);
+        }
+        commit_u64(&mut digest, self.stop_fences.len() as u64);
+        for (key, (connection_generation, private_generation)) in &self.stop_fences {
+            commit_strategy_key(&mut digest, key);
+            commit_u64(&mut digest, *connection_generation);
+            commit_u64(&mut digest, *private_generation);
+        }
+        commit_u64(&mut digest, self.shutdown_modes.len() as u64);
+        for (key, mode) in &self.shutdown_modes {
+            commit_strategy_key(&mut digest, key);
+            commit_bytes(
+                &mut digest,
+                &[match mode {
+                    super::ShutdownMode::Stop => 1,
+                    super::ShutdownMode::Flatten => 2,
+                }],
+            );
+        }
+        digest.finalize().into()
+    }
+
+    fn recovery_session_parameters(
+        &self,
+        durable_roots: super::PhysicalRecoveryDurableRoots,
+    ) -> Result<PhysicalRecoverySessionParameters, AccountRuntimeError> {
+        let connection_generation = self
+            .connection_generation
+            .checked_add(1)
+            .ok_or(AccountRuntimeError::ConnectionGenerationExhausted)?;
+        let expected_private_generation = self
+            .physical_private_generation_floor
+            .checked_add(1)
+            .ok_or(AccountRuntimeError::PhysicalRecoveryScopeMismatch)?;
+        let registrations = self
+            .registry
+            .registrations()
+            .map(|registration| (registration.binding.clone(), registration.config_epoch))
+            .collect::<Vec<_>>();
+        let anchor = registrations
+            .iter()
+            .map(|(binding, _)| &binding.key.symbol)
+            .min()
+            .cloned()
+            .ok_or(AccountRuntimeError::PhysicalRecoveryUniverseIncomplete)?;
+        let mode = self
+            .recovered_gateway_mode
+            .ok_or(AccountRuntimeError::DurableRecoveryRequired)?;
+        let position_mode = self
+            .recovered_position_mode
+            .ok_or(AccountRuntimeError::DurableRecoveryRequired)?;
+        let binding = GatewayBinding::new(
+            self.account.exchange,
+            mode,
+            self.account.account.clone(),
+            anchor,
+        )
+        .map_err(|_| AccountRuntimeError::PhysicalRecoveryScopeMismatch)?;
+        Ok(PhysicalRecoverySessionParameters {
+            binding,
+            account: self.account.clone(),
+            registrations,
+            position_mode,
+            family_support: self.physical_family_support(),
+            profile_version: self.physical_profile_version(),
+            connection_generation,
+            recovered_private_generation: self.physical_private_generation_floor,
+            expected_private_generation,
+            runtime_authority_sha256: self.physical_recovery_runtime_authority_sha256(),
+            durable_roots,
+        })
+    }
+
+    /// Issues an opaque, authenticated lease for one read-only recovery attempt. The issuer uses
+    /// only runtime-owned recovered roots and registry state; callers cannot supply a digest,
+    /// generation, universe, or profile to be signed.
+    pub fn issue_physical_recovery_session(
+        &mut self,
+    ) -> Result<PhysicalRecoverySession, AccountRuntimeError> {
+        if !self.durable_recovery_complete {
+            return Err(AccountRuntimeError::DurableRecoveryRequired);
+        }
+        if self.active_physical_recovery_session.is_some()
+            || self.pending_physical_recovery.is_some()
+        {
+            return Err(AccountRuntimeError::PhysicalRecoverySessionActive);
+        }
+        let durable_roots = self
+            .physical_durable_roots
+            .clone()
+            .ok_or(AccountRuntimeError::PhysicalRecoveryDurableRootsRequired)?;
+        if self.physical_authority_roots.as_ref() != Some(durable_roots.physical_roots()) {
+            return Err(AccountRuntimeError::PhysicalRecoveryDurableRootDrift);
+        }
+        let parameters = self.recovery_session_parameters(durable_roots)?;
+        let session = self
+            .physical_recovery_session_issuer
+            .issue(parameters)
+            .map_err(|_| AccountRuntimeError::PhysicalRecoveryScopeMismatch)?;
+        self.active_physical_recovery_session = Some(session.clone());
+        Ok(session)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn issue_expired_physical_recovery_session_for_test(
+        &mut self,
+    ) -> Result<PhysicalRecoverySession, AccountRuntimeError> {
+        if !self.durable_recovery_complete || self.active_physical_recovery_session.is_some() {
+            return Err(AccountRuntimeError::DurableRecoveryRequired);
+        }
+        let durable_roots = self
+            .physical_durable_roots
+            .clone()
+            .ok_or(AccountRuntimeError::PhysicalRecoveryDurableRootsRequired)?;
+        let parameters = self.recovery_session_parameters(durable_roots)?;
+        let session = self
+            .physical_recovery_session_issuer
+            .issue_expired_for_test(parameters)
+            .map_err(|_| AccountRuntimeError::PhysicalRecoveryScopeMismatch)?;
+        self.active_physical_recovery_session = Some(session.clone());
+        Ok(session)
+    }
+
+    fn validate_physical_recovery_session(
+        &self,
+        session: &PhysicalRecoverySession,
+    ) -> Result<(), AccountRuntimeError> {
+        if !self.durable_recovery_complete {
+            return Err(AccountRuntimeError::DurableRecoveryRequired);
+        }
+        let active = self
+            .active_physical_recovery_session
+            .as_ref()
+            .ok_or(AccountRuntimeError::PhysicalRecoverySessionInvalid)?;
+        if !active.same_authority(session)
+            || !self.physical_recovery_session_issuer.authenticates(session)
+        {
+            return Err(AccountRuntimeError::PhysicalRecoverySessionInvalid);
+        }
+        if session.is_expired() {
+            return Err(AccountRuntimeError::PhysicalRecoverySessionExpired);
+        }
+        let durable_roots = self
+            .physical_durable_roots
+            .as_ref()
+            .ok_or(AccountRuntimeError::PhysicalRecoveryDurableRootsRequired)?;
+        let physical_roots_current = self.physical_authority_roots.as_ref()
+            == Some(durable_roots.physical_roots())
+            && session.durable_roots() == durable_roots;
+        let expected_connection_generation = self
+            .connection_generation
+            .checked_add(1)
+            .ok_or(AccountRuntimeError::ConnectionGenerationExhausted)?;
+        let expected_private_generation = self
+            .physical_private_generation_floor
+            .checked_add(1)
+            .ok_or(AccountRuntimeError::PhysicalRecoveryScopeMismatch)?;
+        let scope = session.scope();
+        let account_authority_current = self
+            .recovered_gateway_mode
+            .zip(self.recovered_position_mode)
+            .is_some_and(|(mode, position_mode)| {
+                scope.matches_account_authority(
+                    &self.account,
+                    mode,
+                    self.registry.registrations().map(|registration| {
+                        (registration.binding.clone(), registration.config_epoch)
+                    }),
+                    position_mode,
+                    &self.physical_family_support(),
+                    self.physical_profile_version(),
+                )
+            });
+        if !physical_roots_current
+            || !account_authority_current
+            || session.runtime_authority_sha256()
+                != &self.physical_recovery_runtime_authority_sha256()
+            || scope.authority_roots() != durable_roots.physical_roots()
+            || scope.connection_generation() != expected_connection_generation
+            || scope.recovered_private_generation() != self.physical_private_generation_floor
+            || session.private_generation() != expected_private_generation
+        {
+            return Err(AccountRuntimeError::PhysicalRecoveryDurableRootDrift);
+        }
+        Ok(())
+    }
+
+    fn revoke_failed_recovery_session(
+        &mut self,
+        error: AccountRuntimeError,
+    ) -> AccountRuntimeError {
+        self.revoke_physical_authority();
+        error
+    }
+
+    /// Must be called after every collector await. It rechecks the unexpired lease, authenticated
+    /// attempt/session epoch, complete registry/profile authority, and every current durable root.
+    pub fn validate_physical_recovery_session_after_await(
+        &mut self,
+        session: &PhysicalRecoverySession,
+    ) -> Result<(), AccountRuntimeError> {
+        self.validate_physical_recovery_session(session)
+            .map_err(|error| self.revoke_failed_recovery_session(error))
+    }
+
+    /// Consumes one complete durable replay refresh and returns the next authenticated epoch.
+    /// Refresh never extends the original lease. Any omission, regression, or cross-attempt
+    /// receipt revokes the entire recovery authority.
+    pub fn refresh_physical_recovery_session(
+        &mut self,
+        session: &PhysicalRecoverySession,
+        refresh: PhysicalRecoveryRootRefresh,
+    ) -> Result<PhysicalRecoverySession, AccountRuntimeError> {
+        if let Err(error) = self.validate_physical_recovery_session(session) {
+            return Err(self.revoke_failed_recovery_session(error));
+        }
+        if !refresh.matches(session)
+            || !refresh
+                .roots()
+                .monotonic_successor_of(session.durable_roots())
+        {
+            return Err(self.revoke_failed_recovery_session(
+                AccountRuntimeError::PhysicalRecoveryDurableRootRegression,
+            ));
+        }
+        let roots = refresh.roots().clone();
+        let parameters = match self.recovery_session_parameters(roots.clone()) {
+            Ok(parameters) => parameters,
+            Err(error) => return Err(self.revoke_failed_recovery_session(error)),
+        };
+        let refreshed = match self
+            .physical_recovery_session_issuer
+            .refresh(session, parameters)
+        {
+            Ok(refreshed) => refreshed,
+            Err(_) => {
+                return Err(self.revoke_failed_recovery_session(
+                    AccountRuntimeError::PhysicalRecoveryScopeMismatch,
+                ));
+            }
+        };
+        self.physical_authority_roots = Some(roots.physical_roots().clone());
+        self.physical_durable_roots = Some(roots);
+        self.active_physical_recovery_session = Some(refreshed.clone());
+        Ok(refreshed)
+    }
+
+    /// Stages a manifest only when it is bound to the exact current authenticated session. The
+    /// existing integration gate remains closed in production until a gateway collector is wired.
+    pub fn install_authenticated_physical_recovery_manifest(
+        &mut self,
+        session: &PhysicalRecoverySession,
+        manifest: PhysicalRecoveryReadbackManifest,
+    ) -> Result<(), AccountRuntimeError> {
+        if !self.physical_recovery_integration_available() {
+            self.revoke_physical_authority();
+            return Err(AccountRuntimeError::PhysicalRecoveryIntegrationUnavailable);
+        }
+        if let Err(error) = self.validate_physical_recovery_session(session) {
+            return Err(self.revoke_failed_recovery_session(error));
+        }
+        if session.session_epoch() < 2 || session.durable_roots().authority_epoch() < 2 {
+            return Err(self.revoke_failed_recovery_session(
+                AccountRuntimeError::PhysicalRecoveryPostAwaitRefreshRequired,
+            ));
+        }
+        if self.pending_physical_recovery.is_some() {
+            return Err(self.revoke_failed_recovery_session(
+                AccountRuntimeError::PhysicalRecoveryAlreadyInstalled,
+            ));
+        }
+        if manifest.scope() != session.scope()
+            || manifest.attempt_id() != session.attempt_id()
+            || manifest.private_generation() != session.private_generation()
+        {
+            return Err(self.revoke_failed_recovery_session(
+                AccountRuntimeError::PhysicalRecoverySessionInvalid,
+            ));
+        }
+        if let Err(error) = self.validate_physical_recovery_manifest(&manifest) {
+            return Err(self.revoke_failed_recovery_session(error));
+        }
+        self.pending_physical_recovery = Some(manifest);
+        self.active_physical_recovery_session = None;
+        Ok(())
+    }
+
     fn physical_family_support(&self) -> BTreeMap<NativeOrderFamily, bool> {
         [
             NativeOrderFamily::UmOrder,
@@ -58,7 +398,14 @@ impl AccountRuntime {
             return Err(AccountRuntimeError::DurableRecoveryRequired);
         }
         if !self.physical_recovery_integration_available() {
-            return Err(AccountRuntimeError::PhysicalRecoveryIntegrationUnavailable);
+            return Err(self.revoke_failed_recovery_session(
+                AccountRuntimeError::PhysicalRecoveryIntegrationUnavailable,
+            ));
+        }
+        if self.active_physical_recovery_session.is_some() {
+            return Err(self.revoke_failed_recovery_session(
+                AccountRuntimeError::PhysicalRecoverySessionInvalid,
+            ));
         }
         if self.pending_physical_recovery.is_some() {
             return Err(AccountRuntimeError::PhysicalRecoveryAlreadyInstalled);
@@ -89,11 +436,7 @@ impl AccountRuntime {
                     &self.account,
                     mode,
                     self.registry.registrations().map(|registration| {
-                        (
-                            registration.binding.key.symbol.clone(),
-                            registration.binding.config_digest.clone(),
-                            registration.config_epoch,
-                        )
+                        (registration.binding.clone(), registration.config_epoch)
                     }),
                     position_mode,
                     &self.physical_family_support(),
@@ -158,11 +501,7 @@ impl AccountRuntime {
                                 &self.account,
                                 mode,
                                 self.registry.registrations().map(|registration| {
-                                    (
-                                        registration.binding.key.symbol.clone(),
-                                        registration.binding.config_digest.clone(),
-                                        registration.config_epoch,
-                                    )
+                                    (registration.binding.clone(), registration.config_epoch)
                                 }),
                                 position_mode,
                                 &self.physical_family_support(),
@@ -173,13 +512,16 @@ impl AccountRuntime {
     }
 
     pub(super) fn revoke_physical_authority(&mut self) {
+        self.active_physical_recovery_session = None;
         self.pending_physical_recovery = None;
         self.admitted_physical_recovery = None;
         self.active_turns.clear();
         self.last_applied_turns.clear();
         self.invalidate_dispatch_authority_fail_closed();
-        self.health = crate::runtime::account::AccountHealth::Starting;
-        self.fault = None;
+        if self.health != crate::runtime::account::AccountHealth::Frozen {
+            self.health = crate::runtime::account::AccountHealth::Starting;
+            self.fault = None;
+        }
         self.physical_recovery_drifted = true;
     }
 
@@ -201,7 +543,9 @@ impl AccountRuntime {
     #[cfg(test)]
     pub(crate) fn set_physical_profile_version_for_test(&mut self, version: u64) {
         self.physical_profile_version_override = Some(version);
-        if self.admitted_physical_recovery.is_some() {
+        if self.admitted_physical_recovery.is_some()
+            || self.active_physical_recovery_session.is_some()
+        {
             self.revoke_physical_authority();
         }
     }
@@ -256,13 +600,9 @@ impl AccountRuntime {
             )
             .map_err(|_| AccountRuntimeError::PhysicalRecoveryScopeMismatch)?,
             self.account.clone(),
-            self.registry.registrations().map(|registration| {
-                (
-                    registration.binding.key.symbol.clone(),
-                    registration.binding.config_digest.clone(),
-                    registration.config_epoch,
-                )
-            }),
+            self.registry
+                .registrations()
+                .map(|registration| (registration.binding.clone(), registration.config_epoch)),
             self.recovered_position_mode
                 .ok_or(AccountRuntimeError::PhysicalRecoveryRequired)?,
             self.physical_family_support(),
@@ -324,4 +664,72 @@ impl AccountRuntime {
         );
         Ok(())
     }
+}
+
+const fn account_health_tag(health: super::AccountHealth) -> u8 {
+    match health {
+        super::AccountHealth::Starting => 1,
+        super::AccountHealth::Ready => 2,
+        super::AccountHealth::Frozen => 3,
+    }
+}
+
+const fn account_fault_tag(fault: super::AccountFault) -> u8 {
+    match fault {
+        super::AccountFault::PrivateStreamDisconnected => 1,
+        super::AccountFault::PrivateGenerationMismatch => 2,
+        super::AccountFault::PrivateEvidenceGap => 3,
+        super::AccountFault::PrivateEvidenceBatchIncomplete => 4,
+        super::AccountFault::ReconciliationFailed => 5,
+        super::AccountFault::WriterUnavailable => 6,
+    }
+}
+
+const fn lifecycle_tag(lifecycle: super::InstanceLifecycle) -> u8 {
+    match lifecycle {
+        super::InstanceLifecycle::Registered => 1,
+        super::InstanceLifecycle::Recovering => 2,
+        super::InstanceLifecycle::Running => 3,
+        super::InstanceLifecycle::Paused => 4,
+        super::InstanceLifecycle::Stopping => 5,
+        super::InstanceLifecycle::Faulted => 6,
+        super::InstanceLifecycle::NeedsAttention => 7,
+    }
+}
+
+fn commit_strategy_key(digest: &mut Sha256, key: &crate::StrategyInstanceKey) {
+    commit_bytes(digest, &[strategy_kind_tag(key.strategy_kind)]);
+    commit_str(digest, key.account.exchange.as_str());
+    commit_str(digest, &key.account.account);
+    commit_str(digest, &key.instance_id);
+    commit_str(digest, &key.symbol.to_string());
+}
+
+const fn strategy_kind_tag(kind: crate::StrategyKind) -> u8 {
+    match kind {
+        crate::StrategyKind::HedgedGrid => 1,
+        crate::StrategyKind::Scalping => 2,
+    }
+}
+
+fn commit_turn_token(digest: &mut Sha256, token: &crate::StrategyTurnToken) {
+    commit_strategy_key(digest, token.target());
+    commit_u64(digest, token.connection_generation());
+    commit_u64(digest, token.private_generation());
+    commit_str(digest, token.config_digest());
+    commit_u64(digest, token.config_epoch());
+    commit_u64(digest, token.turn_sequence());
+}
+
+fn commit_str(digest: &mut Sha256, value: &str) {
+    commit_bytes(digest, value.as_bytes());
+}
+
+fn commit_u64(digest: &mut Sha256, value: u64) {
+    commit_bytes(digest, &value.to_be_bytes());
+}
+
+fn commit_bytes(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
 }
