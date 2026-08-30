@@ -12,14 +12,15 @@ permissions:
 jobs:
   verify:
     runs-on: windows-latest
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/venue-target
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
+      - name: Configure runner-local Cargo target
+        shell: pwsh
+        run: Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$($env:RUNNER_TEMP)/venue-target"
       - name: Verify repository policy
         shell: pwsh
         run: ./scripts/verify_workspace_policy.ps1
@@ -57,12 +58,14 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/venue-target
       VENUE_CONTROL_POSTGRES_REQUIRED: "1"
       VENUE_CONTROL_TEST_DATABASE_URL: postgresql://venue_ci:venue_ci@127.0.0.1:5432/venue_ci
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
+      - name: Configure runner-local Cargo target
+        shell: pwsh
+        run: Add-Content -LiteralPath $env:GITHUB_ENV -Value "CARGO_TARGET_DIR=$($env:RUNNER_TEMP)/venue-target"
       - name: Run mandatory PostgreSQL integration tests
         shell: pwsh
         run: ./scripts/verify_postgres_integration.ps1
