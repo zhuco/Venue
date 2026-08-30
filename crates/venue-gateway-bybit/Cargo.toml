@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+test-fixtures = []
+
 [dependencies]
 bytes.workspace = true
 futures-util.workspace = true
