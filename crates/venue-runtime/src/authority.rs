@@ -76,6 +76,8 @@ impl AccountOrderCapabilityEvidence {
 pub enum StrategyKind {
     HedgedGrid,
     Scalping,
+    /// A follower-owned semantic Copy actor. It still has no exchange client or writer authority.
+    Copy,
 }
 
 /// Stable logical ownership identity. A controlled process restart may replace `run_id` in its

@@ -1,3 +1,4 @@
+mod copy_actor;
 mod market_hub;
 mod model;
 mod physical_recovery;
@@ -13,6 +14,7 @@ pub use crate::{
     AccountKey, AccountModelError, AccountOrderCapabilityEvidence, ExchangeId, StrategyBinding,
     StrategyInstanceKey, StrategyKind,
 };
+pub use copy_actor::{CopyActorAppliedArtifacts, CopyActorAppliedReceipt, CopyActorCommitment};
 pub use market_hub::{BestBidOffer, MarketHub, MarketHubError, MarketPublish};
 pub use model::{AccountFault, AccountHealth, InstanceLifecycle};
 pub use physical_recovery::{

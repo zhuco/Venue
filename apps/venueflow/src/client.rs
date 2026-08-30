@@ -1,7 +1,8 @@
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui;
 use venue_control_protocol::{
-    COMMAND_PATH, CommandReceipt, ControlCommandRequest, ControlEvent, ControlSnapshot,
+    COMMAND_PATH, COPY_RELATION_PATH, CommandReceipt, ControlCommandRequest, ControlEvent,
+    ControlSnapshot, CopyRelationReceipt, CopyRelationRecord, CopyRelationUpsertRequest,
     EVENT_STREAM_PATH, SNAPSHOT_PATH,
 };
 
@@ -21,15 +22,19 @@ pub enum ClientEvent {
     StreamConnected { resumed_after: Option<i64> },
     StreamUnavailable(String),
     CommandUnavailable(String),
+    CopyRelationUnavailable(String),
     EventCursor(i64),
     Snapshot(ControlSnapshot),
     Receipt(CommandReceipt),
+    CopyRelationConfigs(Vec<CopyRelationRecord>),
+    CopyRelationReceipt(CopyRelationReceipt),
     Notice(String),
 }
 
 pub struct ControlClient {
     events: Receiver<ClientEvent>,
     command_tx: Sender<ControlCommandRequest>,
+    copy_relation_tx: Sender<CopyRelationUpsertRequest>,
     #[cfg(not(target_arch = "wasm32"))]
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(target_arch = "wasm32")]
@@ -40,20 +45,29 @@ impl ControlClient {
     pub fn connect(endpoint: String, context: egui::Context) -> Self {
         let (event_tx, events) = unbounded();
         let (command_tx, command_rx) = unbounded();
+        let (copy_relation_tx, copy_relation_rx) = unbounded();
 
         #[cfg(not(target_arch = "wasm32"))]
         let stop = {
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            start_native(endpoint, event_tx, command_rx, context, stop.clone());
+            start_native(
+                endpoint,
+                event_tx,
+                command_rx,
+                copy_relation_rx,
+                context,
+                stop.clone(),
+            );
             stop
         };
 
         #[cfg(target_arch = "wasm32")]
-        let web = WebClient::start(endpoint, event_tx, command_rx, context);
+        let web = WebClient::start(endpoint, event_tx, command_rx, copy_relation_rx, context);
 
         Self {
             events,
             command_tx,
+            copy_relation_tx,
             #[cfg(not(target_arch = "wasm32"))]
             stop,
             #[cfg(target_arch = "wasm32")]
@@ -69,6 +83,16 @@ impl ControlClient {
         command.validate().map_err(ClientError::Protocol)?;
         self.command_tx
             .send(command)
+            .map_err(|_| ClientError::Closed)
+    }
+
+    pub fn send_copy_relation(
+        &self,
+        request: CopyRelationUpsertRequest,
+    ) -> Result<(), ClientError> {
+        request.validate().map_err(ClientError::Protocol)?;
+        self.copy_relation_tx
+            .send(request)
             .map_err(|_| ClientError::Closed)
     }
 }
@@ -134,6 +158,7 @@ fn start_native(
     endpoint: String,
     sender: Sender<ClientEvent>,
     commands: Receiver<ControlCommandRequest>,
+    copy_relations: Receiver<CopyRelationUpsertRequest>,
     context: egui::Context,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -157,7 +182,14 @@ fn start_native(
                     return;
                 }
             };
-            runtime.block_on(native_loop(endpoint, sender, commands, context, stop));
+            runtime.block_on(native_loop(
+                endpoint,
+                sender,
+                commands,
+                copy_relations,
+                context,
+                stop,
+            ));
         });
     if let Err(error) = spawn {
         tracing::error!(%error, "failed to spawn VenueFlow control client");
@@ -169,6 +201,7 @@ async fn native_loop(
     endpoint: String,
     sender: Sender<ClientEvent>,
     commands: Receiver<ControlCommandRequest>,
+    copy_relations: Receiver<CopyRelationUpsertRequest>,
     context: egui::Context,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -188,6 +221,7 @@ async fn native_loop(
     };
 
     fetch_native_snapshot(&client, &endpoint, &sender, &context).await;
+    fetch_native_copy_relations(&client, &endpoint, &sender, &context).await;
     let stream_sender = sender.clone();
     let stream_context = context.clone();
     let stream_client = client.clone();
@@ -255,11 +289,114 @@ async fn native_loop(
             }
         }
 
+        for request in copy_relations.try_iter().take(16) {
+            let response = client
+                .post(path(&endpoint, COPY_RELATION_PATH))
+                .json(&request)
+                .timeout(REQUEST_TIMEOUT)
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    match response.json::<CopyRelationReceipt>().await {
+                        Ok(receipt)
+                            if receipt.validate().is_ok()
+                                && receipt.relation_id == request.relation.relation_id =>
+                        {
+                            publish(&sender, &context, ClientEvent::CopyRelationReceipt(receipt));
+                        }
+                        Ok(_) => publish(
+                            &sender,
+                            &context,
+                            ClientEvent::CopyRelationUnavailable(
+                                "invalid or mismatched copy relation receipt".to_owned(),
+                            ),
+                        ),
+                        Err(error) => publish(
+                            &sender,
+                            &context,
+                            ClientEvent::CopyRelationUnavailable(format!(
+                                "invalid copy relation receipt: {error}"
+                            )),
+                        ),
+                    }
+                }
+                Ok(response) => publish(
+                    &sender,
+                    &context,
+                    ClientEvent::CopyRelationUnavailable(format!(
+                        "copy relation request returned HTTP {}",
+                        response.status()
+                    )),
+                ),
+                Err(error) => publish(
+                    &sender,
+                    &context,
+                    ClientEvent::CopyRelationUnavailable(format!(
+                        "copy relation request failed: {error}"
+                    )),
+                ),
+            }
+        }
+
         if tokio::time::Instant::now() >= next_snapshot {
             fetch_native_snapshot(&client, &endpoint, &sender, &context).await;
+            fetch_native_copy_relations(&client, &endpoint, &sender, &context).await;
             next_snapshot = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn fetch_native_copy_relations(
+    client: &reqwest::Client,
+    endpoint: &str,
+    sender: &Sender<ClientEvent>,
+    context: &egui::Context,
+) {
+    match client
+        .get(path(endpoint, COPY_RELATION_PATH))
+        .timeout(REQUEST_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            match response.json::<Vec<CopyRelationRecord>>().await {
+                Ok(configs) if configs.iter().all(|record| record.validate().is_ok()) => {
+                    publish(sender, context, ClientEvent::CopyRelationConfigs(configs))
+                }
+                Ok(_) => publish(
+                    sender,
+                    context,
+                    ClientEvent::CopyRelationUnavailable(
+                        "copy relation configuration validation failed".to_owned(),
+                    ),
+                ),
+                Err(error) => publish(
+                    sender,
+                    context,
+                    ClientEvent::CopyRelationUnavailable(format!(
+                        "invalid copy relation configuration: {error}"
+                    )),
+                ),
+            }
+        }
+        Ok(response) => publish(
+            sender,
+            context,
+            ClientEvent::CopyRelationUnavailable(format!(
+                "copy relation configuration returned HTTP {}",
+                response.status()
+            )),
+        ),
+        Err(error) => publish(
+            sender,
+            context,
+            ClientEvent::CopyRelationUnavailable(format!(
+                "copy relation configuration unavailable: {error}"
+            )),
+        ),
     }
 }
 
@@ -587,6 +724,7 @@ impl WebClient {
         endpoint: String,
         sender: Sender<ClientEvent>,
         commands: Receiver<ControlCommandRequest>,
+        copy_relations: Receiver<CopyRelationUpsertRequest>,
         context: egui::Context,
     ) -> Self {
         let stop = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -602,7 +740,20 @@ impl WebClient {
             context.clone(),
             stop.clone(),
         );
-        spawn_web_commands(endpoint, sender, commands, context, stop.clone());
+        spawn_web_copy_relations(
+            endpoint.clone(),
+            sender.clone(),
+            context.clone(),
+            stop.clone(),
+        );
+        spawn_web_commands(
+            endpoint.clone(),
+            sender.clone(),
+            commands,
+            context.clone(),
+            stop.clone(),
+        );
+        spawn_web_copy_relation_requests(endpoint, sender, copy_relations, context, stop.clone());
         Self { stop }
     }
 }
@@ -833,6 +984,62 @@ fn spawn_web_snapshot(
 }
 
 #[cfg(target_arch = "wasm32")]
+fn spawn_web_copy_relations(
+    endpoint: String,
+    sender: Sender<ClientEvent>,
+    context: egui::Context,
+    stop: std::rc::Rc<std::cell::Cell<bool>>,
+) {
+    wasm_bindgen_futures::spawn_local(async move {
+        while !stop.get() {
+            match reqwest::Client::new()
+                .get(path(&endpoint, COPY_RELATION_PATH))
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    match response.json::<Vec<CopyRelationRecord>>().await {
+                        Ok(configs) if configs.iter().all(|record| record.validate().is_ok()) => {
+                            publish(&sender, &context, ClientEvent::CopyRelationConfigs(configs))
+                        }
+                        Ok(_) => publish(
+                            &sender,
+                            &context,
+                            ClientEvent::CopyRelationUnavailable(
+                                "copy relation configuration validation failed".to_owned(),
+                            ),
+                        ),
+                        Err(error) => publish(
+                            &sender,
+                            &context,
+                            ClientEvent::CopyRelationUnavailable(format!(
+                                "invalid copy relation configuration: {error}"
+                            )),
+                        ),
+                    }
+                }
+                Ok(response) => publish(
+                    &sender,
+                    &context,
+                    ClientEvent::CopyRelationUnavailable(format!(
+                        "copy relation configuration returned HTTP {}",
+                        response.status()
+                    )),
+                ),
+                Err(error) => publish(
+                    &sender,
+                    &context,
+                    ClientEvent::CopyRelationUnavailable(format!(
+                        "copy relation configuration unavailable: {error}"
+                    )),
+                ),
+            }
+            wasm_timer(3_000).await;
+        }
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
 fn spawn_web_commands(
     endpoint: String,
     sender: Sender<ClientEvent>,
@@ -886,6 +1093,73 @@ fn spawn_web_commands(
                         &sender,
                         &context,
                         ClientEvent::CommandUnavailable(format!("control command failed: {error}")),
+                    ),
+                }
+            }
+            wasm_timer(100).await;
+        }
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn spawn_web_copy_relation_requests(
+    endpoint: String,
+    sender: Sender<ClientEvent>,
+    requests: Receiver<CopyRelationUpsertRequest>,
+    context: egui::Context,
+    stop: std::rc::Rc<std::cell::Cell<bool>>,
+) {
+    wasm_bindgen_futures::spawn_local(async move {
+        while !stop.get() {
+            for request in requests.try_iter().take(16) {
+                match reqwest::Client::new()
+                    .post(path(&endpoint, COPY_RELATION_PATH))
+                    .json(&request)
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.status().is_success() => {
+                        match response.json::<CopyRelationReceipt>().await {
+                            Ok(receipt)
+                                if receipt.validate().is_ok()
+                                    && receipt.relation_id == request.relation.relation_id =>
+                            {
+                                publish(
+                                    &sender,
+                                    &context,
+                                    ClientEvent::CopyRelationReceipt(receipt),
+                                );
+                            }
+                            Ok(_) => publish(
+                                &sender,
+                                &context,
+                                ClientEvent::CopyRelationUnavailable(
+                                    "invalid or mismatched copy relation receipt".to_owned(),
+                                ),
+                            ),
+                            Err(error) => publish(
+                                &sender,
+                                &context,
+                                ClientEvent::CopyRelationUnavailable(format!(
+                                    "invalid copy relation receipt: {error}"
+                                )),
+                            ),
+                        }
+                    }
+                    Ok(response) => publish(
+                        &sender,
+                        &context,
+                        ClientEvent::CopyRelationUnavailable(format!(
+                            "copy relation request returned HTTP {}",
+                            response.status()
+                        )),
+                    ),
+                    Err(error) => publish(
+                        &sender,
+                        &context,
+                        ClientEvent::CopyRelationUnavailable(format!(
+                            "copy relation request failed: {error}"
+                        )),
                     ),
                 }
             }

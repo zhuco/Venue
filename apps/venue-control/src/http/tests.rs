@@ -12,17 +12,18 @@ use venue_control_protocol::{
     AccountDeliveryPayload, AccountDeliveryPurpose, AccountDeliveryReceipt,
     AccountDeliveryReceiptState, AccountSummary, CONTROL_SCHEMA_VERSION, CommandReceipt,
     ConnectionState, ControlAction, ControlCommandRequest, ControlEvent, ControlSnapshot,
-    GatewayMode, HealthState, INDICATOR_EVENT_STREAM_PATH, INDICATOR_SNAPSHOT_PATH,
-    IndicatorBinding, IndicatorFeatureValues, IndicatorFrameProjection, IndicatorProvenance,
-    StrategyKind, StrategyLifecycle, StrategySummary, VenueId,
+    CopyRelationReceipt, CopyRelationReceiptState, CopyRelationUpsertRequest, GatewayMode,
+    HealthState, INDICATOR_EVENT_STREAM_PATH, INDICATOR_SNAPSHOT_PATH, IndicatorBinding,
+    IndicatorFeatureValues, IndicatorFrameProjection, IndicatorProvenance, StrategyKind,
+    StrategyLifecycle, StrategySummary, VenueId,
 };
 
 use super::*;
 use crate::{
     AccountDeliveryRepository, AccountDeliveryRepositoryError, AccountNodeBinding, ClaimedCommand,
-    CommandEnqueueResult, CommandSettleResult, ControlRepository, DeliveryStoreResult,
-    IndicatorProjectionStore, RepositoryError, ScopedCommandReceipt, SnapshotStoreResult,
-    StoredEvent,
+    CommandEnqueueResult, CommandSettleResult, ControlRepository, CopyRelationRepository,
+    CopyRelationRepositoryError, DeliveryStoreResult, IndicatorProjectionStore, RepositoryError,
+    ScopedCommandReceipt, SnapshotStoreResult, StoredEvent,
 };
 
 #[derive(Clone, Default)]
@@ -97,6 +98,35 @@ impl AccountDeliveryRepository for TestRepository {
         }
         state.delivery.receipts.push(receipt.clone());
         Ok(DeliveryStoreResult::Stored)
+    }
+}
+
+impl CopyRelationRepository for TestRepository {
+    async fn upsert_copy_relation(
+        &self,
+        request: &CopyRelationUpsertRequest,
+        observed_ms: u64,
+    ) -> Result<CopyRelationReceipt, CopyRelationRepositoryError> {
+        request
+            .validate()
+            .map_err(|_| CopyRelationRepositoryError::InvalidData)?;
+        Ok(CopyRelationReceipt {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            relation_id: request.relation.relation_id.clone(),
+            revision: request.expected_revision.unwrap_or(0) + 1,
+            state: if request.expected_revision.is_some() {
+                CopyRelationReceiptState::Updated
+            } else {
+                CopyRelationReceiptState::Created
+            },
+            observed_ms,
+        })
+    }
+
+    async fn list_copy_relations(
+        &self,
+    ) -> Result<Vec<venue_control_protocol::CopyRelationRecord>, CopyRelationRepositoryError> {
+        Ok(Vec::new())
     }
 }
 

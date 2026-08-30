@@ -4874,6 +4874,7 @@ dependencies = [
  "tokio",
  "venue",
  "venue-control-protocol",
+ "venue-copy",
  "venue-domain",
  "venue-execution",
  "venue-gateway-api",

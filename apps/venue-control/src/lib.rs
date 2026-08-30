@@ -8,6 +8,8 @@ mod account_delivery_repository;
 mod account_node_poll;
 mod copy_model;
 mod copy_postgres;
+mod copy_relation_postgres;
+mod copy_relation_repository;
 mod copy_repository;
 mod copy_worker;
 mod http;
@@ -35,6 +37,8 @@ pub use copy_model::{
     ObservedCopyIntent, ScopedCopyDeliveryReceipt,
 };
 pub use copy_postgres::MIGRATION_0002;
+pub use copy_relation_postgres::MIGRATION_0006;
+pub use copy_relation_repository::{CopyRelationRepository, CopyRelationRepositoryError};
 pub use copy_repository::{CopyRepository, CopyRepositoryError};
 pub use copy_worker::{
     CopyPlanningSnapshot, CopySemanticJob, CopyWorker, CopyWorkerConfig, CopyWorkerError,

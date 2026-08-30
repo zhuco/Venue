@@ -2,7 +2,7 @@ use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, S
 use egui_tiles::{Behavior, TileId, Tiles, UiResponse};
 use venue_control_protocol::{
     AggressorSide, CommandState, ConnectionState, ControlAction, ControlCommandRequest,
-    CopyRelationSummary, HealthState, MarketSummary, StrategyLifecycle, StrategySummary, UiBar,
+    HealthState, MarketSummary, StrategyLifecycle, StrategySummary, UiBar,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -13,8 +13,8 @@ use crate::{
     client::ControlClient,
     i18n::{Language, TextKey, text},
     model::{
-        AppModel, MarketQuote, PendingConfirmation, SymbolGroup, WorkspaceKind, copy_relation_key,
-        decimal_to_f64, format_decimal, freshness_age_ms, requires_operator_confirmation,
+        AppModel, MarketQuote, PendingConfirmation, SymbolGroup, WorkspaceKind, decimal_to_f64,
+        format_decimal, freshness_age_ms, requires_operator_confirmation,
     },
     theme,
     workspace::{Pane, PaneKind, Workspaces},
@@ -34,7 +34,7 @@ impl Behavior<Pane> for PaneBehavior<'_> {
             PaneKind::TradeTape => show_trade_tape(ui, pane, self.model),
             PaneKind::Accounts => show_accounts(ui, self.model),
             PaneKind::Strategies => show_strategies(ui, self.model),
-            PaneKind::CopyRelations => show_copy_relations(ui, self.model),
+            PaneKind::CopyRelations => crate::copy_relation_view::show(ui, self.model, self.client),
             PaneKind::Ledger => show_ledger(ui, self.model),
             PaneKind::Control => show_control(ui, self.model, self.client),
             PaneKind::Diagnostics => show_diagnostics(ui, self.model),
@@ -1451,173 +1451,6 @@ fn show_strategies(ui: &mut egui::Ui, model: &mut AppModel) {
             });
     });
 }
-fn show_copy_relations(ui: &mut egui::Ui, model: &mut AppModel) {
-    let language = model.preferences.language;
-    pane_heading(
-        ui,
-        text(language, TextKey::CopyRelations),
-        text(language, TextKey::CopySubtitle),
-    );
-    let Some(snapshot) = &model.snapshot else {
-        empty(ui, text(language, TextKey::NoCopy));
-        return;
-    };
-    let relations = snapshot.copy_relations.clone();
-    let strategies = snapshot.strategies.clone();
-    if relations.is_empty() {
-        empty(ui, text(language, TextKey::NoCopy));
-        return;
-    }
-    egui::ScrollArea::horizontal().show(ui, |ui| {
-        egui::Grid::new("copy-grid").striped(true).show(ui, |ui| {
-            for heading in [
-                TextKey::Leader,
-                TextKey::Follower,
-                TextKey::Symbol,
-                TextKey::Target,
-                TextKey::Actual,
-                TextKey::Drift,
-                TextKey::State,
-            ] {
-                ui.strong(text(language, heading));
-            }
-            ui.end_row();
-            for relation in &relations {
-                let key = copy_relation_key(
-                    &relation.leader_id,
-                    &relation.follower_instance_id,
-                    &relation.symbol.to_string(),
-                );
-                let selected =
-                    model.preferences.selected_copy_relation.as_deref() == Some(key.as_str());
-                if ui.selectable_label(selected, &relation.leader_id).clicked()
-                    || ui
-                        .selectable_label(selected, &relation.follower_instance_id)
-                        .clicked()
-                {
-                    model.select_copy_relation(
-                        &relation.leader_id,
-                        &relation.follower_instance_id,
-                        &relation.symbol.to_string(),
-                    );
-                }
-                ui.label(relation.symbol.to_string());
-                ui.monospace(format_decimal(relation.target_exposure, 4));
-                ui.monospace(format_decimal(relation.actual_exposure, 4));
-                let drift = decimal_to_f64(relation.drift);
-                ui.colored_label(theme::value_color(drift), format!("{drift:+.4}"));
-                ui.label(format!("{:?}", relation.status));
-                ui.end_row();
-            }
-        });
-    });
-
-    let selected_relation = model
-        .preferences
-        .selected_copy_relation
-        .as_deref()
-        .and_then(|key| {
-            relations
-                .iter()
-                .find(|relation| {
-                    copy_relation_key(
-                        &relation.leader_id,
-                        &relation.follower_instance_id,
-                        &relation.symbol.to_string(),
-                    ) == key
-                })
-                .cloned()
-        });
-    let Some(relation) = selected_relation else {
-        ui.add_space(8.0);
-        ui.small(text(language, TextKey::SelectCopyRelation));
-        return;
-    };
-    show_copy_relation_detail(ui, language, &relation, &strategies);
-}
-
-fn show_copy_relation_detail(
-    ui: &mut egui::Ui,
-    language: Language,
-    relation: &CopyRelationSummary,
-    strategies: &[StrategySummary],
-) {
-    ui.add_space(8.0);
-    ui.separator();
-    ui.strong(text(language, TextKey::CopyRelationDetails));
-    ui.label(format!(
-        "{}: {} · {}: {} · {}",
-        text(language, TextKey::Leader),
-        relation.leader_id,
-        text(language, TextKey::FollowerInstance),
-        relation.follower_instance_id,
-        relation.symbol
-    ));
-    ui.horizontal_wrapped(|ui| {
-        metric(
-            ui,
-            text(language, TextKey::Target),
-            relation.target_exposure,
-        );
-        metric(
-            ui,
-            text(language, TextKey::Actual),
-            relation.actual_exposure,
-        );
-        metric(ui, text(language, TextKey::Drift), relation.drift);
-        ui.label(format!(
-            "{}: {:?}",
-            text(language, TextKey::RelationStatus),
-            relation.status
-        ));
-    });
-    ui.label(format!(
-        "{}: {}",
-        text(language, TextKey::LastAppliedJob),
-        relation
-            .last_applied_job
-            .as_deref()
-            .unwrap_or(text(language, TextKey::NoAppliedJob))
-    ));
-    ui.add_space(4.0);
-    ui.strong(text(language, TextKey::CopyRelationBinding));
-    if let Some(follower) = strategies
-        .iter()
-        .find(|strategy| strategy.instance_id == relation.follower_instance_id)
-    {
-        egui::Grid::new("copy-follower-binding").show(ui, |ui| {
-            for (label, value) in [
-                (text(language, TextKey::Venue), follower.venue.to_string()),
-                (text(language, TextKey::Mode), follower.mode.to_string()),
-                (
-                    text(language, TextKey::Account),
-                    follower.trading_account_id.clone(),
-                ),
-                (text(language, TextKey::Symbol), follower.symbol.to_string()),
-                (
-                    text(language, TextKey::Epoch),
-                    follower.config_epoch.to_string(),
-                ),
-            ] {
-                ui.strong(label);
-                ui.monospace(value);
-                ui.end_row();
-            }
-        });
-    } else {
-        ui.colored_label(theme::SELL, "Follower strategy projection is missing.");
-    }
-    ui.small(text(language, TextKey::LeaderBindingUnavailable));
-    ui.add_space(4.0);
-    ui.strong(text(language, TextKey::CopyRelationConfiguration));
-    ui.small(text(language, TextKey::CopyConfigurationUnavailable));
-    ui.add_enabled(false, egui::Button::new("Create / edit relation"));
-    ui.small(text(language, TextKey::CopyEditingUnavailable));
-}
-
-fn metric(ui: &mut egui::Ui, label: &str, value: rust_decimal::Decimal) {
-    ui.label(format!("{label}: {}", format_decimal(value, 4)));
-}
 fn show_ledger(ui: &mut egui::Ui, model: &AppModel) {
     let language = model.preferences.language;
     pane_heading(
@@ -2055,7 +1888,7 @@ fn local_market<'a>(
     let selection = MarketSelection::binance_usd_m(symbol, interval).ok()?;
     model.local_markets.view(&selection)
 }
-fn pane_heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
+pub(crate) fn pane_heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
     ui.horizontal(|ui| {
         ui.strong(title);
         ui.colored_label(theme::TEXT_SECONDARY, subtitle);
@@ -2063,7 +1896,7 @@ fn pane_heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
     ui.separator();
 }
 
-fn empty(ui: &mut egui::Ui, message: &str) {
+pub(crate) fn empty(ui: &mut egui::Ui, message: &str) {
     ui.centered_and_justified(|ui| {
         ui.colored_label(theme::TEXT_SECONDARY, message);
     });

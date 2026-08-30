@@ -90,7 +90,7 @@ Exchange Account Process
 ├─ Strategy Actor C：scalping / ETH-USDT
 ├─ Execution Lane（唯一执行通道）
 ├─ Reconciler（账户对账器）
-└─ Control API 边界（`apps/venue-control` 已提供本地 HTTP/SSE，账户节点 adapter 未实现）
+└─ Control API 边界（本地 HTTP/SSE；Copy inbox 只接收耐久语义输入并由 Actor Applied 再验证）
 ```
 
 数据流必须单向：

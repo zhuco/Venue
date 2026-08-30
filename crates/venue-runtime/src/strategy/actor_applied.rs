@@ -228,6 +228,7 @@ fn commit_identity(digest: &mut Sha256, binding: &StrategyBinding, include_kind:
             match binding.key.strategy_kind {
                 StrategyKind::HedgedGrid => b"hedged_grid",
                 StrategyKind::Scalping => b"scalping",
+                StrategyKind::Copy => b"copy",
             },
         );
     }

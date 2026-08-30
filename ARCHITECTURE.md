@@ -59,7 +59,7 @@ VenueFlow Desktop / optional Agent
 
 `venue-control` 校验 schema v2 scope，以 PostgreSQL durable inbox/outbox、fencing delivery lease、幂等 claim 和终态 receipt 保存命令，并提供
 仅本地 HTTP/SSE `/v2`。LIVE-only Copy worker 可在事务内锁定 leader 事件并持久化纯规划结果、delivery、ledger 与恢复状态；
-节点 ACK 只证明本地 inbox 已耐久，Unknown 只能进入下一序号只读对账。Node 已接入单一 opaque-journal adapter 与 bounded loopback HTTP polling client；每次 await 后都以当前时钟重验 lease/session/epoch，过期 outbox 不确认或重放。storage 已有 anchored Actor journal/checkpoint durability receipt，但尚未由 runtime 用规范 Actor/Owner 与真实 WAL head 接线，因此生产 Applied 继续失败关闭。Copy 不能直接提交订单且始终不授予 mutation authority；唤醒通道不能
+节点 ACK 只证明本地 inbox 已耐久，Unknown 只能进入下一序号只读对账。Node 已接入单一 opaque-journal adapter 与 bounded loopback HTTP polling client；每次 await 后都以当前时钟重验 lease/session/epoch，过期 outbox 不确认或重放。Copy delivery 严格校验 immutable manifest 并派生规范 Actor/Owner；runtime 只从恢复后的真实 WAL head 写 anchored Actor journal/checkpoint，receipt 必须精确匹配 delivery/inbox commitment 后才可 Applied。Copy 不能直接提交订单且始终不授予 mutation authority；唤醒通道不能
 代替耐久记录；节点仍须先持久化本地 Actor inbox，再独立重验 risk、Owner、WAL、writer 和私有事实。
 
 ## 4. 目标 workspace

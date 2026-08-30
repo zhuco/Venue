@@ -197,7 +197,7 @@ resources! {
     Indicators => "Local indicators", "本地指标";
     IndicatorPending => "Local indicators are not connected yet; Control indicators are not mixed into Binance local data.", "本地指标尚未接入；不会把 Control 指标静默混入 Binance 本地行情。";
     StopSemantics => "Stop cancels only the selected instance's owned orders and preserves residual custody. Flatten additionally requests signed zero-position convergence.", "停止只撤销所选实例拥有的订单并保留残余仓位托管；平仓还会请求带签名的零仓位收敛。";
-    ConfirmationSemantics => "Pause, Stop, and Flatten require an exact typed scope confirmation. The account node remains authoritative and must independently revalidate every intent.", "暂停、停止与平仓需要输入精确的作用域确认；账户节点始终保持权威并独立复核每个意图。";
+    ConfirmationSemantics => "Pause, Resume, Stop, and Flatten require an exact typed scope confirmation. The account node remains authoritative and must independently revalidate every intent.", "暂停、恢复、停止与平仓需要输入精确的作用域确认；账户节点始终保持权威并独立复核每个意图。";
     SessionReceipts => "This session's command receipts", "本次会话的命令回执";
     AccountProjectionCaveat => "WAL state · runtime Unknown fence · capability freshness: not projected by Control v2", "WAL 状态 · 运行时 Unknown 栅栏 · 能力证据时效：Control v2 尚未投影";
     AccountAuthorityCaveat => "VenueFlow shows writer/private generations and reconciliation age only; it does not infer missing authority from health or ledger text.", "VenueFlow 只显示写入者/私流代际与对账时效，不会根据健康状态或账本文本推断缺失的权威事实。";

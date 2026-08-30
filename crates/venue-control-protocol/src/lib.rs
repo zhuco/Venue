@@ -32,6 +32,7 @@ pub const ACCOUNT_DELIVERY_SCHEMA_VERSION: u16 = 2;
 pub const ACCOUNT_DELIVERY_CLAIM_PATH: &str = "/v2/account-node/deliveries/claim";
 pub const ACCOUNT_DELIVERY_ACK_PATH: &str = "/v2/account-node/deliveries/ack";
 pub const ACCOUNT_DELIVERY_RECEIPT_PATH: &str = "/v2/account-node/deliveries/receipts";
+pub const COPY_RELATION_PATH: &str = "/v2/copy/relations";
 
 /// Exact account-node scope for durable semantic delivery. It is deliberately unrelated to a
 /// gateway capability, writer generation, WAL position, or physical dispatch permit.
@@ -408,6 +409,8 @@ pub enum CopyStatus {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CopyRelationSummary {
+    pub relation_id: String,
+    pub revision: u64,
     pub leader_id: String,
     pub follower_instance_id: String,
     pub symbol: Symbol,
@@ -416,6 +419,159 @@ pub struct CopyRelationSummary {
     pub drift: Decimal,
     pub status: CopyStatus,
     pub last_applied_job: Option<String>,
+}
+
+/// Exact LIVE identity of one endpoint in a Copy relation. This remains a control-plane
+/// declaration; it never represents an account writer, credential, or dispatch authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CopyRelationBinding {
+    pub venue: VenueId,
+    #[serde(deserialize_with = "deserialize_live_mode")]
+    pub mode: GatewayMode,
+    pub trading_account_id: String,
+    pub instance_id: String,
+    pub symbol: Symbol,
+}
+
+impl CopyRelationBinding {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.mode != GatewayMode::Live {
+            return Err(ProtocolError::Mode);
+        }
+        if !venue_domain::is_canonical_trading_account_id(&self.trading_account_id) {
+            return Err(ProtocolError::AccountId);
+        }
+        if self.instance_id.trim().is_empty() {
+            return Err(ProtocolError::StrategyIdentity);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CopyRiskPolicy {
+    pub max_total_notional: Decimal,
+    pub max_order_notional: Decimal,
+    pub max_leverage: Decimal,
+}
+
+impl CopyRiskPolicy {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if !positive(self.max_total_notional)
+            || !positive(self.max_order_notional)
+            || self.max_order_notional > self.max_total_notional
+            || !positive(self.max_leverage)
+        {
+            return Err(ProtocolError::CopyRelationPolicy);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyLifecyclePolicy {
+    Active,
+    Paused,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CopyRelationConfig {
+    pub relation_id: String,
+    pub leader: CopyRelationBinding,
+    pub follower: CopyRelationBinding,
+    pub allocated_capital: Decimal,
+    pub multiplier: Decimal,
+    pub safety_reserve_rate: Decimal,
+    pub risk: CopyRiskPolicy,
+    pub lifecycle: CopyLifecyclePolicy,
+}
+
+/// Versioned query projection for one durable Copy relation configuration.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CopyRelationRecord {
+    pub relation: CopyRelationConfig,
+    pub revision: u64,
+}
+
+impl CopyRelationRecord {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        self.relation.validate()?;
+        if self.revision == 0 {
+            return Err(ProtocolError::CopyRelationRevision);
+        }
+        Ok(())
+    }
+}
+
+impl CopyRelationConfig {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if !is_uuid(&self.relation_id) {
+            return Err(ProtocolError::CopyRelationIdentity);
+        }
+        self.leader.validate()?;
+        self.follower.validate()?;
+        if self.leader == self.follower
+            || !positive(self.allocated_capital)
+            || !positive(self.multiplier)
+            || self.safety_reserve_rate.is_sign_negative()
+            || self.safety_reserve_rate >= Decimal::ONE
+        {
+            return Err(ProtocolError::CopyRelationPolicy);
+        }
+        self.risk.validate()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CopyRelationUpsertRequest {
+    pub schema_version: u16,
+    pub relation: CopyRelationConfig,
+    /// `None` creates a relation. A revision is required for every edit to make retries and
+    /// concurrent operators fail closed instead of silently overwriting risk policy.
+    pub expected_revision: Option<u64>,
+}
+
+impl CopyRelationUpsertRequest {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.schema_version != CONTROL_SCHEMA_VERSION {
+            return Err(ProtocolError::SchemaVersion);
+        }
+        self.relation.validate()?;
+        if self.expected_revision == Some(0) {
+            return Err(ProtocolError::CopyRelationRevision);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyRelationReceiptState {
+    Created,
+    Updated,
+    Existing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CopyRelationReceipt {
+    pub schema_version: u16,
+    pub relation_id: String,
+    pub revision: u64,
+    pub state: CopyRelationReceiptState,
+    pub observed_ms: u64,
+}
+
+impl CopyRelationReceipt {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.schema_version != CONTROL_SCHEMA_VERSION {
+            return Err(ProtocolError::SchemaVersion);
+        }
+        if !is_uuid(&self.relation_id) || self.revision == 0 || self.observed_ms == 0 {
+            return Err(ProtocolError::CopyRelationIdentity);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -740,7 +896,9 @@ fn validate_copy_relations(
 ) -> Result<(), ProtocolError> {
     let mut identities = BTreeSet::new();
     for relation in relations {
-        if relation.leader_id.trim().is_empty()
+        if !is_uuid(&relation.relation_id)
+            || relation.revision == 0
+            || relation.leader_id.trim().is_empty()
             || relation.follower_instance_id.trim().is_empty()
             || relation.leader_id == relation.follower_instance_id
             || !strategy_identities.contains(relation.follower_instance_id.as_str())
@@ -752,6 +910,7 @@ fn validate_copy_relations(
             return Err(ProtocolError::SnapshotContent);
         }
         if !identities.insert((
+            relation.relation_id.as_str(),
             relation.leader_id.as_str(),
             relation.follower_instance_id.as_str(),
             &relation.symbol,
@@ -760,6 +919,18 @@ fn validate_copy_relations(
         }
     }
     Ok(())
+}
+
+fn is_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && [8, 13, 18, 23]
+            .into_iter()
+            .all(|index| bytes[index] == b'-')
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
 }
 
 fn validate_markets(markets: &[MarketSummary], generated_ms: u64) -> Result<(), ProtocolError> {
@@ -1069,6 +1240,12 @@ pub enum ProtocolError {
     AccountId,
     #[error("strategy identity is missing or invalid")]
     StrategyIdentity,
+    #[error("copy relation identity is missing or invalid")]
+    CopyRelationIdentity,
+    #[error("copy relation revision is invalid or stale")]
+    CopyRelationRevision,
+    #[error("copy relation capital, multiplier, lifecycle, or risk policy is invalid")]
+    CopyRelationPolicy,
     #[error("control request identity is missing")]
     RequestIdentity,
     #[error("control request config epoch must be positive")]
@@ -1536,6 +1713,8 @@ mod tests {
                 attention: None,
             }],
             copy_relations: vec![CopyRelationSummary {
+                relation_id: "00000000-0000-4000-8000-000000000010".to_owned(),
+                revision: 1,
                 leader_id: "leader-btc".to_owned(),
                 follower_instance_id: "copy-btc".to_owned(),
                 symbol: symbol.clone(),
@@ -1590,5 +1769,44 @@ mod tests {
                 detail: String::new(),
             }],
         })
+    }
+
+    #[test]
+    fn copy_relation_config_requires_exact_live_bindings_and_safe_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let symbol: Symbol = "BTC/USDT".parse()?;
+        let binding = |instance_id: &str| CopyRelationBinding {
+            venue: VenueId::Binance,
+            mode: GatewayMode::Live,
+            trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            instance_id: instance_id.to_owned(),
+            symbol: symbol.clone(),
+        };
+        let request = CopyRelationUpsertRequest {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            relation: CopyRelationConfig {
+                relation_id: "00000000-0000-4000-8000-000000000010".to_owned(),
+                leader: binding("leader-btc"),
+                follower: binding("copy-btc"),
+                allocated_capital: Decimal::new(500, 0),
+                multiplier: Decimal::ONE,
+                safety_reserve_rate: Decimal::new(1, 1),
+                risk: CopyRiskPolicy {
+                    max_total_notional: Decimal::new(1_000, 0),
+                    max_order_notional: Decimal::new(100, 0),
+                    max_leverage: Decimal::new(3, 0),
+                },
+                lifecycle: CopyLifecyclePolicy::Paused,
+            },
+            expected_revision: None,
+        };
+        assert_eq!(request.validate(), Ok(()));
+        let mut invalid = request.clone();
+        invalid.relation.safety_reserve_rate = Decimal::ONE;
+        assert_eq!(invalid.validate(), Err(ProtocolError::CopyRelationPolicy));
+        let mut invalid = request;
+        invalid.relation.follower = invalid.relation.leader.clone();
+        assert_eq!(invalid.validate(), Err(ProtocolError::CopyRelationPolicy));
+        Ok(())
     }
 }

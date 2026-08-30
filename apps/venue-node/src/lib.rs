@@ -18,6 +18,7 @@ mod async_gateway;
 mod control_delivery;
 mod control_delivery_storage;
 mod control_http_client;
+mod copy_semantic;
 mod safe_host;
 mod supervision;
 
@@ -39,6 +40,7 @@ pub use control_http_client::{
     MAX_CONTROL_HTTP_REQUEST_BYTES, MAX_CONTROL_HTTP_RESPONSE_BYTES, MAX_CONTROL_HTTP_TIMEOUT,
     MAX_CONTROL_LEASE_DURATION_MS,
 };
+pub use copy_semantic::{CopySemanticDelivery, CopySemanticError};
 
 pub use async_gateway::{
     AsyncGatewayBoundaryError, AsyncGatewayCallError, AsyncGatewayTimeouts, AsyncPhysicalGateway,

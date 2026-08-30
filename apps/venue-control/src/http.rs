@@ -15,12 +15,14 @@ use tokio::{
     time::{self, MissedTickBehavior},
 };
 use venue_control_protocol::{
-    ControlCommandRequest, INDICATOR_EVENT_STREAM_PATH, INDICATOR_SNAPSHOT_PATH,
+    COPY_RELATION_PATH, ControlCommandRequest, CopyRelationUpsertRequest,
+    INDICATOR_EVENT_STREAM_PATH, INDICATOR_SNAPSHOT_PATH,
 };
 
 use crate::{
     AccountDeliveryRepository, AccountDeliveryRepositoryError, ControlRepository, ControlService,
-    IndicatorProjectionError, IndicatorProjectionStore, RepositoryError, ServiceError,
+    CopyRelationRepository, CopyRelationRepositoryError, IndicatorProjectionError,
+    IndicatorProjectionStore, RepositoryError, ServiceError,
     account_node_poll::{
         AccountNodePollError, AccountNodeRoute, MAX_ACCOUNT_NODE_HTTP_TIMEOUT,
         handle_account_node_request,
@@ -137,7 +139,7 @@ pub async fn serve_local<R>(
     shutdown: watch::Receiver<bool>,
 ) -> Result<(), HttpServerError>
 where
-    R: ControlRepository + AccountDeliveryRepository + 'static,
+    R: ControlRepository + AccountDeliveryRepository + CopyRelationRepository + 'static,
 {
     serve_local_with_indicators(
         listener,
@@ -159,7 +161,7 @@ pub async fn serve_local_with_indicators<R>(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), HttpServerError>
 where
-    R: ControlRepository + AccountDeliveryRepository + 'static,
+    R: ControlRepository + AccountDeliveryRepository + CopyRelationRepository + 'static,
 {
     config.validate()?;
     if !listener.local_addr()?.ip().is_loopback() {
@@ -195,7 +197,7 @@ where
 
 async fn handle_connection<R>(mut stream: TcpStream, state: HttpState<R>)
 where
-    R: ControlRepository + AccountDeliveryRepository + 'static,
+    R: ControlRepository + AccountDeliveryRepository + CopyRelationRepository + 'static,
 {
     let request = match time::timeout(
         state.config.request_timeout,
@@ -222,7 +224,7 @@ async fn dispatch<R>(
     request: HttpRequest,
 ) -> Result<(), ()>
 where
-    R: ControlRepository + AccountDeliveryRepository + 'static,
+    R: ControlRepository + AccountDeliveryRepository + CopyRelationRepository + 'static,
 {
     let Some((path, query)) = split_target(&request.target) else {
         return write_error(stream, HttpError::BadRequest)
@@ -273,6 +275,43 @@ where
                     Ok(receipt) => receipt,
                     Err(error) => return write_error(stream, error).await.map_err(|_| ()),
                 };
+            let body = serde_json::to_vec(&receipt).map_err(|_| ())?;
+            write_response(stream, "200 OK", "application/json", "close", &body)
+                .await
+                .map_err(|_| ())
+        }
+        (Method::Get, COPY_RELATION_PATH) if query.is_none() => {
+            let relations = match call(state, state.service.copy_relations()).await {
+                Ok(relations) => relations,
+                Err(error) => return write_error(stream, error).await.map_err(|_| ()),
+            };
+            let body = serde_json::to_vec(&relations).map_err(|_| ())?;
+            write_response(stream, "200 OK", "application/json", "close", &body)
+                .await
+                .map_err(|_| ())
+        }
+        (Method::Post, COPY_RELATION_PATH) if query.is_none() => {
+            let request = match serde_json::from_slice::<CopyRelationUpsertRequest>(&request.body) {
+                Ok(request) => request,
+                Err(_) => {
+                    return write_error(stream, HttpError::BadRequest)
+                        .await
+                        .map_err(|_| ());
+                }
+            };
+            let observed_ms = match now_ms() {
+                Ok(observed_ms) => observed_ms,
+                Err(error) => return write_error(stream, error).await.map_err(|_| ()),
+            };
+            let receipt = match call(
+                state,
+                state.service.upsert_copy_relation(&request, observed_ms),
+            )
+            .await
+            {
+                Ok(receipt) => receipt,
+                Err(error) => return write_error(stream, error).await.map_err(|_| ()),
+            };
             let body = serde_json::to_vec(&receipt).map_err(|_| ())?;
             write_response(stream, "200 OK", "application/json", "close", &body)
                 .await
@@ -625,6 +664,18 @@ fn map_service_error(error: ServiceError) -> HttpError {
             | AccountDeliveryRepositoryError::NumericRange,
         ) => HttpError::BadRequest,
         ServiceError::AccountDeliveryRepository(AccountDeliveryRepositoryError::CorruptData) => {
+            HttpError::Internal
+        }
+        ServiceError::CopyRelationRepository(CopyRelationRepositoryError::Conflict) => {
+            HttpError::Conflict
+        }
+        ServiceError::CopyRelationRepository(CopyRelationRepositoryError::Database) => {
+            HttpError::Unavailable
+        }
+        ServiceError::CopyRelationRepository(CopyRelationRepositoryError::InvalidData) => {
+            HttpError::BadRequest
+        }
+        ServiceError::CopyRelationRepository(CopyRelationRepositoryError::CorruptData) => {
             HttpError::Internal
         }
     }

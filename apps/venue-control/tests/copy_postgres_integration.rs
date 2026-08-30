@@ -5,14 +5,16 @@ use sqlx::{Executor, PgPool, postgres::PgPoolOptions};
 use venue_control::{
     AccountDeliveryRepository, CopyApplyResult, CopyLeaderEnvelope, CopyLeaderIntent,
     CopyLeaderSnapshot, CopyLedgerProjectionInput, CopyObserverScope, CopyPlanningSnapshot,
-    CopyReplayDeliveryState, CopyRepository, CopyWorker, CopyWorkerConfig, FrozenCapitalSnapshot,
-    MIGRATION_0001, MIGRATION_0002, MIGRATION_0003, MIGRATION_0004, MIGRATION_0005,
-    PgControlRepository, ScopedCopyDeliveryReceipt,
+    CopyRelationRepository, CopyRelationRepositoryError, CopyReplayDeliveryState, CopyRepository,
+    CopyWorker, CopyWorkerConfig, FrozenCapitalSnapshot, MIGRATION_0001, MIGRATION_0002,
+    MIGRATION_0003, MIGRATION_0004, MIGRATION_0005, MIGRATION_0006, PgControlRepository,
+    ScopedCopyDeliveryReceipt,
 };
 use venue_control_protocol::{
     ACCOUNT_DELIVERY_SCHEMA_VERSION, AccountDeliveryAck, AccountDeliveryBinding,
-    AccountDeliveryPayload, AccountDeliveryReceipt, AccountDeliveryReceiptState, GatewayMode,
-    VenueId,
+    AccountDeliveryPayload, AccountDeliveryReceipt, AccountDeliveryReceiptState,
+    CONTROL_SCHEMA_VERSION, CopyLifecyclePolicy, CopyRelationBinding, CopyRelationConfig,
+    CopyRelationReceiptState, CopyRelationUpsertRequest, CopyRiskPolicy, GatewayMode, VenueId,
 };
 use venue_copy::{
     AuthoritativePositionSnapshot, CopyAction, CopyIdentityInput, DeliveryBinding,
@@ -430,6 +432,91 @@ async fn postgres_receipts_unknown_fence_ledger_and_restart_recovery()
     Ok(())
 }
 
+#[tokio::test]
+async fn postgres_copy_relation_config_is_live_bound_idempotent_and_revision_fenced()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = integration_database_url() else {
+        println!(
+            "SKIP: VENUE_CONTROL_TEST_DATABASE_URL is not set; relation config test was not run"
+        );
+        return Ok(());
+    };
+    let fixture = PgFixture::create(&database_url, "relation_config").await?;
+    fixture.migrate_twice().await?;
+    install_account_scope(&fixture.pool).await?;
+    let repository = PgControlRepository::new(fixture.pool.clone());
+    let created = repository
+        .upsert_copy_relation(&relation_request(None, Decimal::ONE)?, 100)
+        .await?;
+    assert_eq!(created.state, CopyRelationReceiptState::Created);
+    assert_eq!(created.revision, 1);
+    let replay = repository
+        .upsert_copy_relation(&relation_request(None, Decimal::ONE)?, 101)
+        .await?;
+    assert_eq!(replay.state, CopyRelationReceiptState::Existing);
+    assert_eq!(replay.revision, 1);
+    assert_eq!(
+        repository
+            .upsert_copy_relation(&relation_request(Some(7), Decimal::new(2, 0))?, 102)
+            .await,
+        Err(CopyRelationRepositoryError::Conflict)
+    );
+    let updated = repository
+        .upsert_copy_relation(&relation_request(Some(1), Decimal::new(2, 0))?, 103)
+        .await?;
+    assert_eq!(updated.state, CopyRelationReceiptState::Updated);
+    assert_eq!(updated.revision, 2);
+    let configs = repository.list_copy_relations().await?;
+    assert_eq!(configs.len(), 1);
+    assert_eq!(configs[0].revision, 2);
+    assert_eq!(configs[0].relation.multiplier, Decimal::new(2, 0));
+    sqlx::query(
+        "UPDATE venue_copy_relation_configs SET follower_symbol = 'ETH/USDT' \
+         WHERE relation_id = '00000000-0000-4000-8000-000000000010'",
+    )
+    .execute(&fixture.pool)
+    .await?;
+    assert_eq!(
+        repository.list_copy_relations().await,
+        Err(CopyRelationRepositoryError::CorruptData)
+    );
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+fn relation_request(
+    expected_revision: Option<u64>,
+    multiplier: Decimal,
+) -> Result<CopyRelationUpsertRequest, Box<dyn std::error::Error>> {
+    let binding = |instance_id: &str| -> Result<CopyRelationBinding, Box<dyn std::error::Error>> {
+        Ok(CopyRelationBinding {
+            venue: VenueId::Binance,
+            mode: GatewayMode::Live,
+            trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            instance_id: instance_id.to_owned(),
+            symbol: "BTC/USDT".parse()?,
+        })
+    };
+    Ok(CopyRelationUpsertRequest {
+        schema_version: CONTROL_SCHEMA_VERSION,
+        relation: CopyRelationConfig {
+            relation_id: "00000000-0000-4000-8000-000000000010".to_owned(),
+            leader: binding("leader-btc")?,
+            follower: binding("copy-btc")?,
+            allocated_capital: Decimal::new(500, 0),
+            multiplier,
+            safety_reserve_rate: Decimal::new(1, 1),
+            risk: CopyRiskPolicy {
+                max_total_notional: Decimal::new(1_000, 0),
+                max_order_notional: Decimal::new(100, 0),
+                max_leverage: Decimal::new(3, 0),
+            },
+            lifecycle: CopyLifecyclePolicy::Paused,
+        },
+        expected_revision,
+    })
+}
+
 async fn plan_one(
     repository: &PgControlRepository,
     worker: &CopyWorker,
@@ -745,6 +832,7 @@ impl PgFixture {
             sqlx::raw_sql(MIGRATION_0003).execute(&self.pool).await?;
             sqlx::raw_sql(MIGRATION_0004).execute(&self.pool).await?;
             sqlx::raw_sql(MIGRATION_0005).execute(&self.pool).await?;
+            sqlx::raw_sql(MIGRATION_0006).execute(&self.pool).await?;
         }
         Ok(())
     }

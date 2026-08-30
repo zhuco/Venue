@@ -1,10 +1,13 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::str::FromStr;
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use venue_control_protocol::{
     CONTROL_SCHEMA_VERSION, CommandReceipt, CommandState, ConnectionState, ControlAction,
-    ControlCommandRequest, ControlSnapshot, StrategySummary,
+    ControlCommandRequest, ControlSnapshot, CopyLifecyclePolicy, CopyRelationBinding,
+    CopyRelationConfig, CopyRelationRecord, CopyRelationUpsertRequest, CopyRiskPolicy, GatewayMode,
+    StrategySummary, VenueId,
 };
 
 use crate::i18n::{Language, TextKey, text};
@@ -105,6 +108,131 @@ pub struct PendingConfirmation {
     pub typed: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct CopyRelationDraft {
+    pub relation_id: String,
+    pub expected_revision: Option<u64>,
+    pub leader_venue: VenueId,
+    pub leader_account_id: String,
+    pub leader_instance_id: String,
+    pub leader_symbol: String,
+    pub follower_venue: VenueId,
+    pub follower_account_id: String,
+    pub follower_instance_id: String,
+    pub follower_symbol: String,
+    pub allocated_capital: String,
+    pub multiplier: String,
+    pub safety_reserve_rate: String,
+    pub max_total_notional: String,
+    pub max_order_notional: String,
+    pub max_leverage: String,
+    pub lifecycle: CopyLifecyclePolicy,
+}
+
+impl CopyRelationDraft {
+    pub fn new() -> Self {
+        Self {
+            relation_id: String::new(),
+            expected_revision: None,
+            leader_venue: VenueId::Binance,
+            leader_account_id: String::new(),
+            leader_instance_id: String::new(),
+            leader_symbol: String::new(),
+            follower_venue: VenueId::Binance,
+            follower_account_id: String::new(),
+            follower_instance_id: String::new(),
+            follower_symbol: String::new(),
+            allocated_capital: "100".to_owned(),
+            multiplier: "1".to_owned(),
+            safety_reserve_rate: "0".to_owned(),
+            max_total_notional: "100".to_owned(),
+            max_order_notional: "100".to_owned(),
+            max_leverage: "1".to_owned(),
+            lifecycle: CopyLifecyclePolicy::Active,
+        }
+    }
+
+    pub fn from_config(config: &CopyRelationConfig, revision: u64) -> Self {
+        Self {
+            relation_id: config.relation_id.clone(),
+            expected_revision: Some(revision),
+            leader_venue: config.leader.venue,
+            leader_account_id: config.leader.trading_account_id.clone(),
+            leader_instance_id: config.leader.instance_id.clone(),
+            leader_symbol: config.leader.symbol.to_string(),
+            follower_venue: config.follower.venue,
+            follower_account_id: config.follower.trading_account_id.clone(),
+            follower_instance_id: config.follower.instance_id.clone(),
+            follower_symbol: config.follower.symbol.to_string(),
+            allocated_capital: config.allocated_capital.normalize().to_string(),
+            multiplier: config.multiplier.normalize().to_string(),
+            safety_reserve_rate: config.safety_reserve_rate.normalize().to_string(),
+            max_total_notional: config.risk.max_total_notional.normalize().to_string(),
+            max_order_notional: config.risk.max_order_notional.normalize().to_string(),
+            max_leverage: config.risk.max_leverage.normalize().to_string(),
+            lifecycle: config.lifecycle,
+        }
+    }
+
+    pub fn to_request(&self) -> Result<CopyRelationUpsertRequest, String> {
+        let relation = CopyRelationConfig {
+            relation_id: self.relation_id.trim().to_owned(),
+            leader: binding(
+                self.leader_venue,
+                &self.leader_account_id,
+                &self.leader_instance_id,
+                &self.leader_symbol,
+            )?,
+            follower: binding(
+                self.follower_venue,
+                &self.follower_account_id,
+                &self.follower_instance_id,
+                &self.follower_symbol,
+            )?,
+            allocated_capital: decimal(&self.allocated_capital, "allocated capital")?,
+            multiplier: decimal(&self.multiplier, "multiplier")?,
+            safety_reserve_rate: decimal(&self.safety_reserve_rate, "safety reserve rate")?,
+            risk: CopyRiskPolicy {
+                max_total_notional: decimal(&self.max_total_notional, "maximum total notional")?,
+                max_order_notional: decimal(&self.max_order_notional, "maximum order notional")?,
+                max_leverage: decimal(&self.max_leverage, "maximum leverage")?,
+            },
+            lifecycle: self.lifecycle,
+        };
+        let request = CopyRelationUpsertRequest {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            relation,
+            expected_revision: self.expected_revision,
+        };
+        request
+            .validate()
+            .map_err(|error| format!("invalid copy relation: {error}"))?;
+        Ok(request)
+    }
+}
+
+fn binding(
+    venue: VenueId,
+    account_id: &str,
+    instance_id: &str,
+    symbol: &str,
+) -> Result<CopyRelationBinding, String> {
+    Ok(CopyRelationBinding {
+        venue,
+        mode: GatewayMode::Live,
+        trading_account_id: account_id.trim().to_owned(),
+        instance_id: instance_id.trim().to_owned(),
+        symbol: symbol
+            .trim()
+            .parse()
+            .map_err(|_| "symbol must use canonical BASE/QUOTE form".to_owned())?,
+    })
+}
+
+fn decimal(value: &str, label: &str) -> Result<Decimal, String> {
+    Decimal::from_str(value.trim()).map_err(|_| format!("{label} must be a decimal number"))
+}
+
 impl PendingConfirmation {
     pub fn new(request: ControlCommandRequest) -> Self {
         Self {
@@ -144,6 +272,9 @@ pub struct AppModel {
     pub last_event_id: Option<i64>,
     pub last_error: Option<String>,
     pub snapshot: Option<ControlSnapshot>,
+    /// Configurations returned by the dedicated secret-free Control relation endpoint.
+    pub copy_relation_configs: Vec<CopyRelationRecord>,
+    pub copy_relation_draft: Option<CopyRelationDraft>,
     pub pending_confirmation: Option<PendingConfirmation>,
     pub last_receipt: Option<CommandReceipt>,
     pub commands: VecDeque<CommandProgress>,
@@ -189,6 +320,8 @@ impl AppModel {
             last_event_id: None,
             last_error: None,
             snapshot: None,
+            copy_relation_configs: Vec::new(),
+            copy_relation_draft: None,
             pending_confirmation: None,
             last_receipt: None,
             commands: VecDeque::new(),
@@ -284,6 +417,10 @@ impl AppModel {
             self.preferences.selected_symbol = first.symbol.to_string();
         }
         self.snapshot = Some(snapshot);
+    }
+
+    pub fn apply_copy_relation_configs(&mut self, configs: Vec<CopyRelationRecord>) {
+        self.copy_relation_configs = configs;
     }
 
     pub fn snapshot_connected(&mut self) {
@@ -409,12 +546,11 @@ impl AppModel {
 
     pub fn select_copy_relation(
         &mut self,
-        leader_id: &str,
+        relation_id: &str,
         follower_instance_id: &str,
         symbol: &str,
     ) {
-        self.preferences.selected_copy_relation =
-            Some(copy_relation_key(leader_id, follower_instance_id, symbol));
+        self.preferences.selected_copy_relation = Some(relation_id.to_owned());
         self.preferences.selected_instance = Some(follower_instance_id.to_owned());
         self.preferences.selected_symbol = symbol.to_owned();
     }
@@ -423,11 +559,6 @@ impl AppModel {
         self.notices.push_front(message.into());
         self.notices.truncate(MAX_NOTICES);
     }
-}
-
-/// A display-only stable selection key. It is never sent to Control or an exchange.
-pub fn copy_relation_key(leader_id: &str, follower_instance_id: &str, symbol: &str) -> String {
-    format!("{leader_id}\u{1f}{follower_instance_id}\u{1f}{symbol}")
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -441,7 +572,7 @@ fn preferred_symbol_rank(symbol: &str) -> usize {
 pub const fn requires_operator_confirmation(action: ControlAction) -> bool {
     matches!(
         action,
-        ControlAction::Pause | ControlAction::Stop | ControlAction::Flatten
+        ControlAction::Pause | ControlAction::Resume | ControlAction::Stop | ControlAction::Flatten
     )
 }
 
@@ -476,8 +607,8 @@ mod tests {
     };
 
     use super::{
-        AppModel, DEFAULT_FAVORITE_SYMBOLS, PendingConfirmation, Preferences, copy_relation_key,
-        freshness_age_ms, requires_operator_confirmation,
+        AppModel, DEFAULT_FAVORITE_SYMBOLS, PendingConfirmation, Preferences, freshness_age_ms,
+        requires_operator_confirmation,
     };
 
     #[test]
@@ -563,17 +694,40 @@ mod tests {
     #[test]
     fn selecting_a_copy_relation_updates_only_local_view_selection() {
         let mut model = AppModel::new(Preferences::default());
-        model.select_copy_relation("leader-1", "copy-btc", "BTC/USDT");
+        model.select_copy_relation(
+            "00000000-0000-4000-8000-000000000003",
+            "copy-btc",
+            "BTC/USDT",
+        );
 
         assert_eq!(
             model.preferences.selected_copy_relation,
-            Some(copy_relation_key("leader-1", "copy-btc", "BTC/USDT"))
+            Some("00000000-0000-4000-8000-000000000003".to_owned())
         );
         assert_eq!(
             model.preferences.selected_instance.as_deref(),
             Some("copy-btc")
         );
         assert_eq!(model.preferences.selected_symbol, "BTC/USDT");
+    }
+
+    #[test]
+    fn copy_relation_draft_requires_valid_live_bindings_and_risk_limits() {
+        let mut draft = super::CopyRelationDraft::new();
+        draft.relation_id = "00000000-0000-4000-8000-000000000003".to_owned();
+        draft.leader_account_id = "00000000-0000-4000-8000-000000000001".to_owned();
+        draft.leader_instance_id = "leader-btc".to_owned();
+        draft.leader_symbol = "BTC/USDT".to_owned();
+        draft.follower_account_id = "00000000-0000-4000-8000-000000000002".to_owned();
+        draft.follower_instance_id = "copy-btc".to_owned();
+        draft.follower_symbol = "BTC/USDT".to_owned();
+        draft.max_total_notional = "100".to_owned();
+        draft.max_order_notional = "50".to_owned();
+
+        assert!(draft.to_request().is_ok());
+
+        draft.max_order_notional = "101".to_owned();
+        assert!(draft.to_request().is_err());
     }
 
     #[test]
@@ -606,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn pause_stop_and_flatten_require_exact_operator_visible_scope()
+    fn all_lifecycle_actions_require_exact_operator_visible_scope()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut model = AppModel::new(Preferences::default());
         let strategy = StrategySummary {
@@ -628,6 +782,7 @@ mod tests {
         };
         for action in [
             ControlAction::Pause,
+            ControlAction::Resume,
             ControlAction::Stop,
             ControlAction::Flatten,
         ] {
@@ -655,7 +810,6 @@ mod tests {
                 .ok_or("confirmation did not arm")?;
             confirmed.validate()?;
         }
-        assert!(!requires_operator_confirmation(ControlAction::Resume));
         Ok(())
     }
 

@@ -158,6 +158,32 @@ impl ActorDeliveryTurn {
         Err(ControlDeliveryError::ActorAppliedUnavailable)
     }
 
+    /// Converts only the runtime's durable Copy Actor receipt into Control's semantic Applied
+    /// completion. The receipt is checked against this exact inbox turn; it does not report a
+    /// physical execution outcome or expose a dispatch permit.
+    pub fn applied_from_copy_runtime(
+        self,
+        applied: &venue_runtime::account::CopyActorAppliedReceipt,
+        observed_ms: u64,
+        detail: impl Into<String>,
+    ) -> Result<ActorDeliveryCompletion, ControlDeliveryError> {
+        let commitment = applied.commitment();
+        if commitment.delivery_digest() != copy_delivery_digest(&self.claim.payload)
+            || commitment.durable_inbox_digest() != self.durable_inbox_digest
+            || commitment.durable_inbox_sequence() != self.durable_inbox_sequence
+            || commitment.durable_inbox_root_digest() != self.durable_inbox_root_digest
+        {
+            return Err(ControlDeliveryError::ActorAppliedUnavailable);
+        }
+        self.complete(
+            AccountDeliveryReceiptState::Applied,
+            observed_ms,
+            applied.account_fact_digest(),
+            detail.into(),
+            Some(ActorDurableAppliedAuthority(())),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn applied_fixture(
         self,
@@ -1220,6 +1246,15 @@ fn validate_detail(
     } else {
         Ok(())
     }
+}
+
+fn copy_delivery_digest(payload: &AccountDeliveryPayload) -> [u8; 32] {
+    let AccountDeliveryPayload::CopySemanticJob(job) = payload else {
+        return [0; 32];
+    };
+    serde_json::from_value::<venue_copy::FollowerDeliveryManifest>(job.manifest.clone())
+        .map(|manifest| manifest.delivery_digest())
+        .unwrap_or([0; 32])
 }
 
 fn digest_serialized<T: Serialize + ?Sized>(value: &T) -> Result<[u8; 32], ControlDeliveryError> {

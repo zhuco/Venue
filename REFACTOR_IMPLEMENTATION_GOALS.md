@@ -10,7 +10,7 @@
 
 ## 2. 当前待办
 
-当前没有已批准、尚未实现的 Goal。
+当前没有已批准、尚未实现的 Goal。最近获准的 Copy 交付门禁已关闭：Node 以恢复后的真实 WAL head 持久应用规范 Copy Actor；Control/PostgreSQL 以 LIVE-only、幂等 revision 保存关系配置与投递闭环；VenueFlow 只经 Control API 查询和编辑关系，且不持有凭证、writer、WAL 或交易客户端。任何真实账户 Canary 仍须依照 `GRID_RUNTIME_REFACTOR.md` 逐账户单独授权。
 
 新增任务必须先写成边界明确、可独立验收的 Goal，再进入活动 workspace。发布门禁以
 `.github/workflows/workspace-gates.yml`、`scripts/verify_workspace_quality.ps1`、

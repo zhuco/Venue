@@ -37,14 +37,14 @@ mod physical_recovery_runtime;
 
 #[derive(Debug)]
 pub struct AccountRuntime {
-    account: AccountKey,
+    pub(crate) account: AccountKey,
     capability_evidence: AccountOrderCapabilityEvidence,
-    health: AccountHealth,
+    pub(crate) health: AccountHealth,
     fault: Option<AccountFault>,
     connection_generation: u64,
     last_applied_private_sequence: u64,
-    last_reconciliation_generation: u64,
-    registry: StrategyRegistry,
+    pub(crate) last_reconciliation_generation: u64,
+    pub(crate) registry: StrategyRegistry,
     market_hub: MarketHub,
     private_router: PrivateRouter,
     actors: BTreeMap<StrategyInstanceKey, StrategyActorHost>,
@@ -53,12 +53,13 @@ pub struct AccountRuntime {
     last_instance_flat: BTreeMap<StrategyInstanceKey, (u64, bool)>,
     stop_fences: BTreeMap<StrategyInstanceKey, (u64, u64)>,
     shutdown_modes: BTreeMap<StrategyInstanceKey, ShutdownMode>,
-    turn_sequences: BTreeMap<StrategyInstanceKey, u64>,
-    active_turns: BTreeMap<StrategyInstanceKey, ActiveStrategyTurn>,
-    last_applied_turns: BTreeMap<StrategyInstanceKey, StrategyTurnToken>,
-    last_applied_durable: BTreeMap<StrategyInstanceKey, venue_storage::ActorAppliedReceipt>,
-    actor_applied_stores: BTreeMap<StrategyInstanceKey, ActorAppliedTurnStore>,
-    actor_applied_wal_head: Option<DurableWalHead>,
+    pub(crate) turn_sequences: BTreeMap<StrategyInstanceKey, u64>,
+    pub(crate) active_turns: BTreeMap<StrategyInstanceKey, ActiveStrategyTurn>,
+    pub(crate) last_applied_turns: BTreeMap<StrategyInstanceKey, StrategyTurnToken>,
+    pub(crate) last_applied_durable:
+        BTreeMap<StrategyInstanceKey, venue_storage::ActorAppliedReceipt>,
+    pub(crate) actor_applied_stores: BTreeMap<StrategyInstanceKey, ActorAppliedTurnStore>,
+    pub(crate) actor_applied_wal_head: Option<DurableWalHead>,
     strategy_state_revision: u64,
     market_actor_revision: u64,
     private_route_revision: u64,
@@ -69,7 +70,7 @@ pub struct AccountRuntime {
     owner_index_root: Option<[u8; 32]>,
     owner_index_tail_sequence: u64,
     owner_index_record_count: u64,
-    durable_recovery_complete: bool,
+    pub(crate) durable_recovery_complete: bool,
     recovered_gateway_mode: Option<GatewayMode>,
     recovered_position_mode: Option<AccountPositionMode>,
     physical_authority_roots: Option<PhysicalRecoveryAuthorityRoots>,
@@ -88,7 +89,7 @@ pub struct AccountRuntime {
     actor_applied_test_directories: Vec<tempfile::TempDir>,
 }
 #[derive(Clone, Debug)]
-struct ActiveStrategyTurn {
+pub(crate) struct ActiveStrategyTurn {
     token: StrategyTurnToken,
     input: StrategyInput,
 }

@@ -14,6 +14,32 @@ const MAX_COMMAND_CLAIM: u32 = 256;
 
 impl<R> ControlService<R>
 where
+    R: crate::CopyRelationRepository,
+{
+    pub async fn upsert_copy_relation(
+        &self,
+        request: &venue_control_protocol::CopyRelationUpsertRequest,
+        observed_ms: u64,
+    ) -> Result<venue_control_protocol::CopyRelationReceipt, ServiceError> {
+        request.validate()?;
+        if observed_ms == 0 {
+            return Err(ServiceError::InvalidObservedTime);
+        }
+        Ok(self
+            .repository
+            .upsert_copy_relation(request, observed_ms)
+            .await?)
+    }
+
+    pub async fn copy_relations(
+        &self,
+    ) -> Result<Vec<venue_control_protocol::CopyRelationRecord>, ServiceError> {
+        Ok(self.repository.list_copy_relations().await?)
+    }
+}
+
+impl<R> ControlService<R>
+where
     R: crate::AccountDeliveryRepository,
 {
     pub async fn claim_account_deliveries(
@@ -220,6 +246,8 @@ pub enum ServiceError {
     Repository(#[from] RepositoryError),
     #[error(transparent)]
     AccountDeliveryRepository(#[from] crate::AccountDeliveryRepositoryError),
+    #[error(transparent)]
+    CopyRelationRepository(#[from] crate::CopyRelationRepositoryError),
 }
 
 #[cfg(test)]
