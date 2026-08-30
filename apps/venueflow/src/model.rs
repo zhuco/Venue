@@ -7,9 +7,12 @@ use venue_control_protocol::{
     ControlCommandRequest, ControlSnapshot, StrategySummary,
 };
 
+use crate::i18n::{Language, TextKey, text};
+
 const MAX_NOTICES: usize = 8;
 const MAX_RECEIPT_IDS: usize = 256;
 const MAX_COMMANDS: usize = 32;
+pub const DEFAULT_FAVORITE_SYMBOLS: [&str; 4] = ["BTC/USDC", "ETH/USDC", "SOL/USDC", "BNB/USDC"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum WorkspaceKind {
@@ -21,11 +24,11 @@ pub enum WorkspaceKind {
 impl WorkspaceKind {
     pub const ALL: [Self; 3] = [Self::Trading, Self::Operations, Self::MultiChart];
 
-    pub const fn label(self) -> &'static str {
+    pub const fn label(self, language: Language) -> &'static str {
         match self {
-            Self::Trading => "Trading",
-            Self::Operations => "Operations",
-            Self::MultiChart => "Multi-chart",
+            Self::Trading => text(language, TextKey::Trading),
+            Self::Operations => text(language, TextKey::Operations),
+            Self::MultiChart => text(language, TextKey::MultiChart),
         }
     }
 }
@@ -38,17 +41,29 @@ pub struct Preferences {
     pub selected_instance: Option<String>,
     pub ui_scale: f32,
     pub show_status_bar: bool,
+    pub language: Language,
+    pub favorite_symbols: Vec<String>,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             endpoint: String::new(),
-            selected_symbol: "BTC/USDT".to_owned(),
+            selected_symbol: "BTC/USDC".to_owned(),
             selected_instance: None,
             ui_scale: 1.0,
             show_status_bar: true,
+            language: default_language(),
+            favorite_symbols: DEFAULT_FAVORITE_SYMBOLS.map(str::to_owned).to_vec(),
         }
+    }
+}
+
+const fn default_language() -> Language {
+    if cfg!(target_arch = "wasm32") {
+        Language::English
+    } else {
+        Language::SimplifiedChinese
     }
 }
 
@@ -104,6 +119,14 @@ pub struct AppModel {
     pub notices: VecDeque<String>,
     #[cfg(not(target_arch = "wasm32"))]
     pub local_markets: crate::market::LocalMarketStore,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub local_symbols: Vec<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub local_catalog_error: Option<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub local_proxy_detected: bool,
+    pub symbol_filter: String,
+    pub follow_latest_requested: bool,
     request_sequence: u64,
 }
 
@@ -125,8 +148,28 @@ impl AppModel {
             notices: VecDeque::new(),
             #[cfg(not(target_arch = "wasm32"))]
             local_markets: crate::market::LocalMarketStore::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            local_symbols: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            local_catalog_error: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            local_proxy_detected: false,
+            symbol_filter: String::new(),
+            follow_latest_requested: false,
             request_sequence: 0,
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn apply_local_catalog(&mut self, mut symbols: Vec<String>) {
+        symbols.sort_by(|left, right| {
+            preferred_symbol_rank(left)
+                .cmp(&preferred_symbol_rank(right))
+                .then_with(|| left.cmp(right))
+        });
+        symbols.dedup();
+        self.local_symbols = symbols;
+        self.local_catalog_error = None;
     }
 
     pub fn apply_snapshot(&mut self, snapshot: ControlSnapshot) {
@@ -266,6 +309,14 @@ impl AppModel {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn preferred_symbol_rank(symbol: &str) -> usize {
+    DEFAULT_FAVORITE_SYMBOLS
+        .iter()
+        .position(|preferred| *preferred == symbol)
+        .unwrap_or(DEFAULT_FAVORITE_SYMBOLS.len())
+}
+
 pub const fn requires_operator_confirmation(action: ControlAction) -> bool {
     matches!(
         action,
@@ -301,9 +352,37 @@ mod tests {
     };
 
     use super::{
-        AppModel, PendingConfirmation, Preferences, freshness_age_ms,
+        AppModel, DEFAULT_FAVORITE_SYMBOLS, PendingConfirmation, Preferences, freshness_age_ms,
         requires_operator_confirmation,
     };
+
+    #[test]
+    fn defaults_select_and_pin_the_four_usdc_markets() {
+        let preferences = Preferences::default();
+        assert_eq!(preferences.selected_symbol, "BTC/USDC");
+        assert_eq!(
+            preferences.favorite_symbols,
+            DEFAULT_FAVORITE_SYMBOLS.map(str::to_owned)
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn public_catalog_keeps_favorites_first_without_hiding_other_symbols() {
+        let mut model = AppModel::new(Preferences::default());
+        model.apply_local_catalog(vec![
+            "XRP/USDT".to_owned(),
+            "BNB/USDC".to_owned(),
+            "BTC/USDC".to_owned(),
+            "ETH/USDC".to_owned(),
+            "SOL/USDC".to_owned(),
+        ]);
+        assert_eq!(
+            &model.local_symbols[..4],
+            &DEFAULT_FAVORITE_SYMBOLS.map(str::to_owned)
+        );
+        assert_eq!(model.local_symbols[4], "XRP/USDT");
+    }
 
     #[test]
     fn a_snapshot_is_query_state_not_persisted_authority() {

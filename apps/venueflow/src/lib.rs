@@ -1,6 +1,7 @@
 mod app;
 mod chart;
 mod client;
+mod i18n;
 #[cfg(not(target_arch = "wasm32"))]
 mod market;
 #[cfg(not(target_arch = "wasm32"))]

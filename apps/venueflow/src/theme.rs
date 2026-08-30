@@ -1,5 +1,8 @@
 use eframe::egui::{self, Color32, FontId, Frame, Margin, Stroke, TextStyle};
 
+#[cfg(not(target_arch = "wasm32"))]
+use eframe::egui::{FontData, FontDefinitions, FontFamily};
+
 pub const BG_PRIMARY: Color32 = Color32::from_rgb(0x07, 0x13, 0x1f);
 pub const BG_SECONDARY: Color32 = Color32::from_rgb(0x0d, 0x1b, 0x2a);
 pub const PANEL: Color32 = Color32::from_rgb(0x11, 0x23, 0x33);
@@ -13,6 +16,8 @@ pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0x8f, 0xa6, 0xb5);
 pub const DIVIDER: Color32 = Color32::from_rgb(0x20, 0x35, 0x43);
 
 pub fn apply(context: &egui::Context) {
+    #[cfg(not(target_arch = "wasm32"))]
+    install_system_cjk_fallback(context);
     context.set_theme(egui::Theme::Dark);
     let mut style = (*context.style_of(egui::Theme::Dark)).clone();
     let mut visuals = egui::Visuals::dark();
@@ -55,6 +60,49 @@ pub fn apply(context: &egui::Context) {
         .text_styles
         .insert(TextStyle::Monospace, FontId::monospace(12.0));
     context.set_style_of(egui::Theme::Dark, style);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn install_system_cjk_fallback(context: &egui::Context) {
+    const MAX_FONT_BYTES: u64 = 32 * 1024 * 1024;
+    let Some(path) = cjk_font_candidates().into_iter().find(|path| {
+        std::fs::metadata(path).is_ok_and(|metadata| {
+            metadata.is_file() && metadata.len() > 0 && metadata.len() <= MAX_FONT_BYTES
+        })
+    }) else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    let mut fonts = FontDefinitions::default();
+    let name = "venueflow-system-cjk".to_owned();
+    fonts
+        .font_data
+        .insert(name.clone(), FontData::from_owned(bytes).into());
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        fonts.families.entry(family).or_default().push(name.clone());
+    }
+    context.set_fonts(fonts);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cjk_font_candidates() -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(windows) = std::env::var_os("WINDIR") {
+        let fonts = std::path::PathBuf::from(windows).join("Fonts");
+        candidates.push(fonts.join("msyh.ttc"));
+        candidates.push(fonts.join("Deng.ttf"));
+        candidates.push(fonts.join("simhei.ttf"));
+    }
+    for path in [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+        "/System/Library/Fonts/PingFang.ttc",
+    ] {
+        candidates.push(path.into());
+    }
+    candidates
 }
 
 pub fn panel_frame() -> Frame {

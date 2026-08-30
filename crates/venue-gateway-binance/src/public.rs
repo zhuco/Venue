@@ -332,6 +332,43 @@ pub fn parse_closed_bar(
     ))
 }
 
+/// Parses Binance USD-M `GET /fapi/v1/exchangeInfo` into the complete canonical set currently
+/// eligible for the local public feed. Inactive, delivery, and non-USDT/USDC products are omitted;
+/// malformed or ambiguous native identities fail the whole catalog closed.
+pub fn parse_public_exchange_info(payload: &str) -> Result<Vec<Symbol>, BinancePublicError> {
+    let value: Value = serde_json::from_str(payload).map_err(|_| BinancePublicError::Payload)?;
+    let rows = value
+        .as_object()
+        .and_then(|object| object.get("symbols"))
+        .and_then(Value::as_array)
+        .ok_or(BinancePublicError::Payload)?;
+    let mut canonical = BTreeSet::new();
+    let mut native = BTreeSet::new();
+    for row in rows {
+        let row = row.as_object().ok_or(BinancePublicError::Payload)?;
+        let native_symbol_value = required_string(row.get("symbol"))?;
+        let base = required_string(row.get("baseAsset"))?;
+        let quote = required_string(row.get("quoteAsset"))?;
+        let status = required_string(row.get("status"))?;
+        let contract_type = required_string(row.get("contractType"))?;
+        if status != "TRADING" || contract_type != "PERPETUAL" || !matches!(quote, "USDT" | "USDC")
+        {
+            continue;
+        }
+        let symbol = Symbol::new(base, quote).map_err(|_| BinancePublicError::Symbol)?;
+        if native_symbol(&symbol) != native_symbol_value
+            || !native.insert(native_symbol_value.to_owned())
+            || !canonical.insert(symbol)
+        {
+            return Err(BinancePublicError::Symbol);
+        }
+    }
+    if canonical.is_empty() {
+        return Err(BinancePublicError::Value);
+    }
+    Ok(canonical.into_iter().collect())
+}
+
 /// Parses a direct Binance `bookTicker` frame or a combined-stream wrapper for the local,
 /// credential-free public market binding.
 pub fn parse_public_market_bbo(
@@ -976,6 +1013,13 @@ fn positive_u64(value: Option<&Value>) -> Result<u64, BinancePublicError> {
     })
 }
 
+fn required_string(value: Option<&Value>) -> Result<&str, BinancePublicError> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or(BinancePublicError::Payload)
+}
+
 fn u64_value(value: Option<&Value>) -> Result<u64, BinancePublicError> {
     value
         .and_then(Value::as_u64)
@@ -1055,6 +1099,34 @@ mod public_market_tests {
         assert_eq!(depth.fact().sequence, 10);
         assert_eq!(depth.fact().bids.len(), 2);
         assert_eq!(depth.fact().asks.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn exchange_info_returns_all_and_only_trading_usd_m_perpetuals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = r#"{
+            "timezone":"UTC",
+            "symbols":[
+                {"symbol":"BTCUSDT","baseAsset":"BTC","quoteAsset":"USDT","status":"TRADING","contractType":"PERPETUAL"},
+                {"symbol":"ETHUSDC","baseAsset":"ETH","quoteAsset":"USDC","status":"TRADING","contractType":"PERPETUAL"},
+                {"symbol":"SOLUSDT_250926","baseAsset":"SOL","quoteAsset":"USDT","status":"TRADING","contractType":"CURRENT_QUARTER"},
+                {"symbol":"OLDUSDT","baseAsset":"OLD","quoteAsset":"USDT","status":"SETTLING","contractType":"PERPETUAL"},
+                {"symbol":"BTCUSD","baseAsset":"BTC","quoteAsset":"USD","status":"TRADING","contractType":"PERPETUAL"}
+            ]
+        }"#;
+        let symbols = parse_public_exchange_info(payload)?;
+        assert_eq!(
+            symbols
+                .into_iter()
+                .map(|symbol| symbol.to_string())
+                .collect::<Vec<_>>(),
+            ["BTC/USDT", "ETH/USDC"]
+        );
+        assert_eq!(
+            parse_public_exchange_info(&payload.replace("BTCUSDT", "WRONG")),
+            Err(BinancePublicError::Symbol)
+        );
         Ok(())
     }
 

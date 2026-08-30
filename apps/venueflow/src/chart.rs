@@ -142,6 +142,7 @@ impl ChartViewport {
         requested_visible_bars: usize,
         anchor_ratio: f32,
     ) {
+        let was_following_latest = self.right_offset == 0;
         let current = self.visible_range(total_bars);
         if current.is_empty() {
             self.visible_bars = requested_visible_bars.clamp(MIN_VISIBLE_BARS, MAX_VISIBLE_BARS);
@@ -160,6 +161,9 @@ impl ChartViewport {
             .saturating_sub(new_anchor_offset)
             .min(newest_allowed_start);
         self.right_offset = total_bars.saturating_sub(new_start.saturating_add(new_count));
+        if was_following_latest {
+            self.right_offset = 0;
+        }
     }
 
     /// Positive steps zoom in and negative steps zoom out. Each step is about ten percent of the
@@ -317,6 +321,17 @@ mod tests {
         let after = viewport.visible_range(500);
         assert!(after.contains(&anchored_before));
         assert_eq!(after.start + (after.len() - 1) / 2, anchored_before);
+    }
+
+    #[test]
+    fn zoom_stays_on_the_latest_bar_until_an_explicit_drag() {
+        let mut viewport = ChartViewport::default();
+        viewport.zoom_by_steps(500, 0.2, 4);
+        assert_eq!(viewport.right_offset(), 0);
+        assert_eq!(viewport.visible_range(501).end, 501);
+
+        viewport.pan_by_drag(501, 1_000.0, 100.0);
+        assert!(viewport.right_offset() > 0);
     }
 
     #[test]

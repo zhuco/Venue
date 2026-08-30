@@ -10,6 +10,7 @@ use crate::market::{LocalMarketView, MarketSelection, MarketStatus};
 use crate::{
     chart::{PriceRange, bar_center_x, bar_index_at_x},
     client::ControlClient,
+    i18n::{Language, TextKey, text},
     model::{
         AppModel, PendingConfirmation, WorkspaceKind, decimal_to_f64, format_decimal,
         freshness_age_ms, requires_operator_confirmation,
@@ -41,7 +42,7 @@ impl Behavior<Pane> for PaneBehavior<'_> {
     }
 
     fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::WidgetText {
-        pane.title().into()
+        pane.title(self.model.preferences.language).into()
     }
 
     fn is_tab_closable(&self, _tiles: &Tiles<Pane>, _tile_id: TileId) -> bool {
@@ -65,6 +66,7 @@ pub fn show_top_bar(
         .stroke(Stroke::new(1.0, theme::DIVIDER))
         .inner_margin(egui::Margin::symmetric(12, 8))
         .show(ui, |ui| {
+            let language = model.preferences.language;
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("VENUEFLOW")
@@ -75,54 +77,75 @@ pub fn show_top_bar(
                 ui.separator();
                 for workspace in WorkspaceKind::ALL {
                     if ui
-                        .selectable_label(workspaces.active == workspace, workspace.label())
+                        .selectable_label(workspaces.active == workspace, workspace.label(language))
                         .clicked()
                     {
                         workspaces.active = workspace;
                     }
                 }
                 ui.separator();
-                let mut symbols = model
-                    .snapshot
-                    .as_ref()
-                    .map(|snapshot| {
-                        snapshot
-                            .markets
-                            .iter()
-                            .map(|market| market.symbol.to_string())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                symbols.extend(
-                    ["BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT"]
-                        .into_iter()
-                        .map(str::to_owned),
-                );
+                let mut symbols = available_symbols(model);
+                symbols.extend(model.preferences.favorite_symbols.iter().cloned());
                 symbols.push(model.preferences.selected_symbol.clone());
-                symbols.sort();
+                symbols.sort_by(|left, right| {
+                    favorite_rank(&model.preferences.favorite_symbols, left)
+                        .cmp(&favorite_rank(&model.preferences.favorite_symbols, right))
+                        .then_with(|| left.cmp(right))
+                });
                 symbols.dedup();
+                let mut selected = None;
                 egui::ComboBox::from_id_salt("selected-symbol")
                     .selected_text(&model.preferences.selected_symbol)
-                    .width(120.0)
+                    .width(150.0)
                     .show_ui(ui, |ui| {
-                        for symbol in symbols {
-                            ui.selectable_value(
-                                &mut model.preferences.selected_symbol,
-                                symbol.clone(),
-                                symbol,
-                            );
-                        }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut model.symbol_filter)
+                                .hint_text(text(language, TextKey::SearchSymbol)),
+                        );
+                        ui.separator();
+                        let filter = model.symbol_filter.trim().to_ascii_uppercase();
+                        egui::ScrollArea::vertical()
+                            .max_height(420.0)
+                            .show(ui, |ui| {
+                                let mut shown = 0;
+                                for symbol in &symbols {
+                                    if !filter.is_empty() && !symbol.contains(&filter) {
+                                        continue;
+                                    }
+                                    shown += 1;
+                                    if ui
+                                        .selectable_label(
+                                            model.preferences.selected_symbol == *symbol,
+                                            symbol,
+                                        )
+                                        .clicked()
+                                    {
+                                        selected = Some(symbol.clone());
+                                    }
+                                }
+                                if shown == 0 {
+                                    ui.colored_label(
+                                        theme::TEXT_SECONDARY,
+                                        text(language, TextKey::NoSymbols),
+                                    );
+                                }
+                            });
                     });
+                if let Some(symbol) = selected {
+                    model.preferences.selected_symbol = symbol;
+                    model.symbol_filter.clear();
+                    workspaces.follow_dynamic_charts_latest();
+                }
                 ui.separator();
-                connection_badge(ui, model.connection);
+                connection_badge(ui, model.connection, language);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Settings").clicked() {
+                    if ui.button(text(language, TextKey::Settings)).clicked() {
                         *show_settings = true;
                     }
-                    if ui.button("Modules").clicked() {
+                    if ui.button(text(language, TextKey::Modules)).clicked() {
                         *show_modules = true;
                     }
-                    if ui.button("Reset layout").clicked() {
+                    if ui.button(text(language, TextKey::ResetLayout)).clicked() {
                         workspaces.restore_active();
                         model.notice("Restored the active workspace layout");
                     }
@@ -132,10 +155,11 @@ pub fn show_top_bar(
 }
 
 pub fn show_status_bar(ui: &mut egui::Ui, model: &AppModel) {
+    let language = model.preferences.language;
     let generated = model
         .snapshot
         .as_ref()
-        .map_or("no snapshot".to_owned(), |snapshot| {
+        .map_or(text(language, TextKey::NoSnapshot).to_owned(), |snapshot| {
             format!("snapshot {}", snapshot.generated_ms)
         });
     egui::Frame::new()
@@ -170,10 +194,13 @@ pub fn show_status_bar(ui: &mut egui::Ui, model: &AppModel) {
                 }
                 if let Some(error) = &model.last_error {
                     ui.separator();
-                    ui.colored_label(theme::SELL, format!("Control error: {error}"));
+                    ui.colored_label(
+                        theme::SELL,
+                        format!("{}: {error}", text(language, TextKey::ControlError)),
+                    );
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.small("EXEC=CONTROL · no credentials in UI · no direct mutation");
+                    ui.small(text(language, TextKey::ControlBoundary));
                 });
             });
         });
@@ -185,15 +212,13 @@ pub fn show_confirmation(context: &egui::Context, model: &mut AppModel, client: 
     };
     let expected = pending.request.expected_confirmation();
     let mut keep_open = true;
-    egui::Window::new("Confirm high-risk control action")
+    let language = model.preferences.language;
+    egui::Window::new(text(language, TextKey::ConfirmAction))
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(context, |ui| {
-            ui.colored_label(
-                theme::WARNING,
-                "This request is only an intent. The service and account node will revalidate it.",
-            );
+            ui.colored_label(theme::WARNING, text(language, TextKey::IntentWarning));
             ui.separator();
             ui.label(format!("Venue: {}", pending.request.venue));
             ui.label(format!("Mode: {}", pending.request.mode));
@@ -206,16 +231,19 @@ pub fn show_confirmation(context: &egui::Context, model: &mut AppModel, client: 
             ));
             ui.label(format!("Action: {}", pending.request.action.as_str()));
             ui.add_space(6.0);
-            ui.label("Type the exact confirmation:");
+            ui.label(text(language, TextKey::TypeConfirmation));
             ui.monospace(&expected);
             ui.text_edit_singleline(&mut pending.typed);
             ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
+                if ui.button(text(language, TextKey::Cancel)).clicked() {
                     keep_open = false;
                 }
                 let enabled = pending.typed == expected;
                 if ui
-                    .add_enabled(enabled, egui::Button::new("Submit intent"))
+                    .add_enabled(
+                        enabled,
+                        egui::Button::new(text(language, TextKey::SubmitIntent)),
+                    )
                     .clicked()
                 {
                     if let Some(request) = pending.confirmed_request() {
@@ -236,39 +264,69 @@ pub fn show_settings(
     model: &mut AppModel,
     reconnect: &mut bool,
 ) {
-    egui::Window::new("VenueFlow settings")
+    let language = model.preferences.language;
+    egui::Window::new(text(language, TextKey::SettingsTitle))
         .open(open)
         .resizable(false)
+        .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(context, |ui| {
-            ui.label("Control API base URL");
+            ui.label(text(language, TextKey::Language));
+            egui::ComboBox::from_id_salt("venueflow-language")
+                .selected_text(model.preferences.language.label())
+                .show_ui(ui, |ui| {
+                    for option in Language::ALL {
+                        ui.selectable_value(
+                            &mut model.preferences.language,
+                            option,
+                            option.label(),
+                        );
+                    }
+                });
+            ui.separator();
+            let language = model.preferences.language;
+            ui.label(text(language, TextKey::ControlUrl));
             ui.text_edit_singleline(&mut model.preferences.endpoint);
-            ui.small("Web builds may leave this empty to use the current origin.");
-            if ui.button("Reconnect").clicked() {
+            ui.small(text(language, TextKey::WebSameOrigin));
+            if ui.button(text(language, TextKey::Reconnect)).clicked() {
                 *reconnect = true;
             }
             ui.separator();
-            ui.label("Local Binance USD-M symbol (canonical BASE/USDT or BASE/USDC)");
-            ui.text_edit_singleline(&mut model.preferences.selected_symbol);
+            ui.label(text(language, TextKey::LocalSymbol));
+            if ui
+                .text_edit_singleline(&mut model.preferences.selected_symbol)
+                .changed()
+            {
+                model.follow_latest_requested = true;
+            }
             #[cfg(not(target_arch = "wasm32"))]
-            ui.small("Native only · fixed Binance LIVE public endpoints · no API key.");
+            ui.small(text(language, TextKey::NativePublicOnly));
             #[cfg(target_arch = "wasm32")]
-            ui.small("Web builds remain Control-only and do not connect to exchanges.");
+            ui.small(text(language, TextKey::WebControlOnly));
             ui.separator();
             ui.add(
-                egui::Slider::new(&mut model.preferences.ui_scale, 0.85..=1.35).text("UI scale"),
+                egui::Slider::new(&mut model.preferences.ui_scale, 0.85..=1.35)
+                    .text(text(language, TextKey::UiScale)),
             );
-            ui.checkbox(&mut model.preferences.show_status_bar, "Show status bar");
+            ui.checkbox(
+                &mut model.preferences.show_status_bar,
+                text(language, TextKey::ShowStatus),
+            );
             ui.separator();
             ui.colored_label(
                 theme::TEXT_SECONDARY,
-                "The configurable URL above is only for Venue Control; local public market endpoints are fixed in native code.",
+                text(language, TextKey::FixedEndpointHint),
             );
         });
 }
 
-pub fn show_modules(context: &egui::Context, open: &mut bool, workspaces: &mut Workspaces) {
-    let visibility = workspaces.pane_visibility();
-    egui::Window::new("Workspace modules")
+pub fn show_modules(
+    context: &egui::Context,
+    open: &mut bool,
+    workspaces: &mut Workspaces,
+    language: Language,
+) {
+    let visibility = workspaces.pane_visibility(language);
+    egui::Window::new(text(language, TextKey::WorkspaceModules))
         .open(open)
         .resizable(false)
         .show(context, |ui| {
@@ -280,47 +338,75 @@ pub fn show_modules(context: &egui::Context, open: &mut bool, workspaces: &mut W
         });
 }
 
-fn connection_badge(ui: &mut egui::Ui, state: ConnectionState) {
+fn connection_badge(ui: &mut egui::Ui, state: ConnectionState, language: Language) {
     let (label, color) = match state {
-        ConnectionState::Connecting => ("CONNECTING", theme::WARNING),
-        ConnectionState::Live => ("LIVE DATA", theme::BUY),
-        ConnectionState::Degraded => ("DEGRADED", theme::WARNING),
-        ConnectionState::Offline => ("OFFLINE", theme::SELL),
+        ConnectionState::Connecting => (text(language, TextKey::Connecting), theme::WARNING),
+        ConnectionState::Live => (text(language, TextKey::LiveData), theme::BUY),
+        ConnectionState::Degraded => (text(language, TextKey::Degraded), theme::WARNING),
+        ConnectionState::Offline => (text(language, TextKey::Offline), theme::SELL),
     };
     ui.colored_label(color, RichText::new(label).strong());
 }
 
 fn show_market_watch(ui: &mut egui::Ui, model: &mut AppModel) {
+    let language = model.preferences.language;
     pane_heading(
         ui,
-        "Markets",
-        "Control discovery · Binance local execution prices",
+        text(language, TextKey::Markets),
+        text(language, TextKey::MarketSource),
     );
-    let rows = model
-        .snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.markets.clone())
-        .unwrap_or_default();
+    let mut symbols = available_symbols(model);
+    symbols.extend(model.preferences.favorite_symbols.iter().cloned());
+    symbols.sort_by(|left, right| {
+        favorite_rank(&model.preferences.favorite_symbols, left)
+            .cmp(&favorite_rank(&model.preferences.favorite_symbols, right))
+            .then_with(|| left.cmp(right))
+    });
+    symbols.dedup();
     egui::ScrollArea::vertical().show(ui, |ui| {
         egui::Grid::new("market-watch-grid")
             .striped(true)
             .num_columns(3)
             .show(ui, |ui| {
-                ui.strong("Symbol");
-                ui.strong("Last");
-                ui.strong("24h");
+                ui.strong(text(language, TextKey::Symbol));
+                ui.strong(text(language, TextKey::Last));
+                ui.strong(text(language, TextKey::Source));
                 ui.end_row();
-                for market in rows {
-                    let symbol = market.symbol.to_string();
+                for symbol in symbols {
                     if ui
                         .selectable_label(model.preferences.selected_symbol == symbol, &symbol)
                         .clicked()
                     {
-                        model.preferences.selected_symbol = symbol;
+                        model.preferences.selected_symbol = symbol.clone();
+                        model.follow_latest_requested = true;
                     }
-                    ui.monospace(format_decimal(market.last, 4));
-                    let change = decimal_to_f64(market.change_percent_24h);
-                    ui.colored_label(theme::value_color(change), format!("{change:+.2}%"));
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        if let Some(last) = model
+                            .local_markets
+                            .view_for_symbol(&symbol)
+                            .and_then(|market| market.last)
+                        {
+                            ui.monospace(format_decimal(last, 4));
+                            ui.colored_label(theme::BUY, "BINANCE");
+                        } else if let Some(projected) = market(model, &symbol) {
+                            ui.monospace(format_decimal(projected.last, 4));
+                            ui.colored_label(theme::TEXT_SECONDARY, "CONTROL");
+                        } else {
+                            ui.monospace("—");
+                            ui.colored_label(theme::TEXT_SECONDARY, "BINANCE");
+                        }
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        if let Some(projected) = market(model, &symbol) {
+                            ui.monospace(format_decimal(projected.last, 4));
+                            ui.colored_label(theme::TEXT_SECONDARY, "CONTROL");
+                        } else {
+                            ui.monospace("—");
+                            ui.colored_label(theme::TEXT_SECONDARY, "CONTROL");
+                        }
+                    }
                     ui.end_row();
                 }
             });
@@ -328,23 +414,36 @@ fn show_market_watch(ui: &mut egui::Ui, model: &mut AppModel) {
 }
 
 fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &AppModel) {
+    let language = model.preferences.language;
     let symbol = pane
         .symbol
         .as_deref()
         .unwrap_or(&model.preferences.selected_symbol);
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(local) = local_market(model, symbol, pane.interval) {
-        pane_heading(ui, symbol, "DATA=BINANCE LIVE · local public REST/WS");
+        pane_heading(ui, symbol, text(language, TextKey::DataSource));
         ui.horizontal_wrapped(|ui| {
-            local_status_label(ui, local.status);
+            local_status_label(ui, local.status, language);
             if let Some(last) = local.last {
-                ui.label(format!("Last {}", format_decimal(last, 4)));
+                ui.label(format!(
+                    "{} {}",
+                    text(language, TextKey::Last),
+                    format_decimal(last, 4)
+                ));
             }
             if let Some(bid) = local.bid {
-                ui.label(format!("Bid {}", format_decimal(bid, 4)));
+                ui.label(format!(
+                    "{} {}",
+                    text(language, TextKey::Bid),
+                    format_decimal(bid, 4)
+                ));
             }
             if let Some(ask) = local.ask {
-                ui.label(format!("Ask {}", format_decimal(ask, 4)));
+                ui.label(format!(
+                    "{} {}",
+                    text(language, TextKey::Ask),
+                    format_decimal(ask, 4)
+                ));
             }
             ui.colored_label(
                 theme::TEXT_SECONDARY,
@@ -354,13 +453,20 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &AppModel) {
                 ui.colored_label(theme::WARNING, detail);
             }
         });
-        show_chart_toolbar(ui, pane);
-        candle_plot(ui, &local.bars, &mut pane.viewport);
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(text(language, TextKey::Indicators));
+            ui.colored_label(
+                theme::TEXT_SECONDARY,
+                text(language, TextKey::IndicatorPending),
+            );
+        });
+        show_chart_toolbar(ui, pane, language);
+        candle_plot(ui, &local.bars, &mut pane.viewport, language);
         return;
     }
-    pane_heading(ui, symbol, "Control projection fallback");
+    pane_heading(ui, symbol, text(language, TextKey::ControlFallback));
     let Some(market) = market(model, symbol) else {
-        empty(ui, "No market projection is available for this symbol.");
+        empty(ui, text(language, TextKey::NoMarket));
         return;
     };
     ui.horizontal_wrapped(|ui| {
@@ -378,11 +484,11 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &AppModel) {
             ));
         }
     });
-    show_chart_toolbar(ui, pane);
-    candle_plot(ui, &market.bars, &mut pane.viewport);
+    show_chart_toolbar(ui, pane, language);
+    candle_plot(ui, &market.bars, &mut pane.viewport, language);
 }
 
-fn show_chart_toolbar(ui: &mut egui::Ui, pane: &mut Pane) {
+fn show_chart_toolbar(ui: &mut egui::Ui, pane: &mut Pane, language: Language) {
     ui.horizontal(|ui| {
         for interval in crate::chart::ChartInterval::ALL {
             if ui
@@ -394,28 +500,34 @@ fn show_chart_toolbar(ui: &mut egui::Ui, pane: &mut Pane) {
             }
         }
         ui.separator();
-        if ui.small_button("Fit").clicked() {
+        if ui.small_button(text(language, TextKey::Fit)).clicked() {
             pane.viewport.reset();
         }
-        if ui.small_button("Follow").clicked() {
+        if ui.small_button(text(language, TextKey::Follow)).clicked() {
             pane.viewport.follow_latest();
         }
         ui.colored_label(
             theme::TEXT_SECONDARY,
             format!(
-                "{} bars{}",
+                "{} {} · {}",
                 pane.viewport.visible_bars(),
+                text(language, TextKey::Bars),
                 if pane.viewport.right_offset() == 0 {
-                    " · LIVE"
+                    text(language, TextKey::Live)
                 } else {
-                    " · HISTORY"
+                    text(language, TextKey::History)
                 }
             ),
         );
     });
 }
 
-fn candle_plot(ui: &mut egui::Ui, all_bars: &[UiBar], viewport: &mut crate::chart::ChartViewport) {
+fn candle_plot(
+    ui: &mut egui::Ui,
+    all_bars: &[UiBar],
+    viewport: &mut crate::chart::ChartViewport,
+    language: Language,
+) {
     let height = ui.available_height().max(120.0);
     let (response, painter) = ui.allocate_painter(
         egui::vec2(ui.available_width(), height),
@@ -425,7 +537,7 @@ fn candle_plot(ui: &mut egui::Ui, all_bars: &[UiBar], viewport: &mut crate::char
         painter.text(
             response.rect.center(),
             Align2::CENTER_CENTER,
-            "No candles",
+            text(language, TextKey::NoCandles),
             FontId::proportional(14.0),
             theme::TEXT_SECONDARY,
         );
@@ -597,21 +709,26 @@ fn candle_plot(ui: &mut egui::Ui, all_bars: &[UiBar], viewport: &mut crate::char
 }
 
 fn show_order_book(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
+    let language = model.preferences.language;
     let symbol = pane
         .symbol
         .as_deref()
         .unwrap_or(&model.preferences.selected_symbol);
-    pane_heading(ui, "Order book", symbol);
+    pane_heading(ui, text(language, TextKey::OrderBook), symbol);
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(local) = model.local_markets.view_for_symbol(symbol) {
-        show_book_rows(ui, pane.instance, &local.asks, &local.bids);
+        if local.asks.is_empty() || local.bids.is_empty() {
+            empty(ui, text(language, TextKey::NoBook));
+        } else {
+            show_book_rows(ui, pane.instance, &local.asks, &local.bids, language);
+        }
         return;
     }
     let Some(market) = market(model, symbol) else {
-        empty(ui, "No order-book projection.");
+        empty(ui, text(language, TextKey::NoBook));
         return;
     };
-    show_book_rows(ui, pane.instance, &market.asks, &market.bids);
+    show_book_rows(ui, pane.instance, &market.asks, &market.bids, language);
 }
 
 fn show_book_rows(
@@ -619,23 +736,24 @@ fn show_book_rows(
     instance: u32,
     asks: &[venue_control_protocol::UiBookLevel],
     bids: &[venue_control_protocol::UiBookLevel],
+    language: Language,
 ) {
     egui::Grid::new(format!("book-{instance}"))
         .striped(true)
         .num_columns(3)
         .show(ui, |ui| {
-            ui.strong("Side");
-            ui.strong("Price");
-            ui.strong("Quantity");
+            ui.strong(text(language, TextKey::Side));
+            ui.strong(text(language, TextKey::Price));
+            ui.strong(text(language, TextKey::Quantity));
             ui.end_row();
             for level in asks.iter().rev().take(10) {
-                ui.colored_label(theme::SELL, "ASK");
+                ui.colored_label(theme::SELL, text(language, TextKey::Ask));
                 ui.monospace(format_decimal(level.price, 4));
                 ui.monospace(format_decimal(level.quantity, 4));
                 ui.end_row();
             }
             for level in bids.iter().take(10) {
-                ui.colored_label(theme::BUY, "BID");
+                ui.colored_label(theme::BUY, text(language, TextKey::Bid));
                 ui.monospace(format_decimal(level.price, 4));
                 ui.monospace(format_decimal(level.quantity, 4));
                 ui.end_row();
@@ -644,31 +762,41 @@ fn show_book_rows(
 }
 
 fn show_trade_tape(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
+    let language = model.preferences.language;
     let symbol = pane
         .symbol
         .as_deref()
         .unwrap_or(&model.preferences.selected_symbol);
-    pane_heading(ui, "Trade tape", symbol);
+    pane_heading(ui, text(language, TextKey::TradeTape), symbol);
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(local) = model.local_markets.view_for_symbol(symbol) {
-        show_trade_rows(ui, pane.instance, &local.trades);
+        if local.trades.is_empty() {
+            empty(ui, text(language, TextKey::NoTrades));
+        } else {
+            show_trade_rows(ui, pane.instance, &local.trades, language);
+        }
         return;
     }
     let Some(market) = market(model, symbol) else {
-        empty(ui, "No trade projection.");
+        empty(ui, text(language, TextKey::NoTrades));
         return;
     };
-    show_trade_rows(ui, pane.instance, &market.trades);
+    show_trade_rows(ui, pane.instance, &market.trades, language);
 }
 
-fn show_trade_rows(ui: &mut egui::Ui, instance: u32, trades: &[venue_control_protocol::UiTrade]) {
+fn show_trade_rows(
+    ui: &mut egui::Ui,
+    instance: u32,
+    trades: &[venue_control_protocol::UiTrade],
+    language: Language,
+) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         egui::Grid::new(format!("tape-{instance}"))
             .striped(true)
             .show(ui, |ui| {
-                ui.strong("Time");
-                ui.strong("Price");
-                ui.strong("Qty");
+                ui.strong(text(language, TextKey::Time));
+                ui.strong(text(language, TextKey::Price));
+                ui.strong(text(language, TextKey::Quantity));
                 ui.end_row();
                 for trade in trades.iter().rev().take(80) {
                     let color = match trade.aggressor {
@@ -686,9 +814,14 @@ fn show_trade_rows(ui: &mut egui::Ui, instance: u32, trades: &[venue_control_pro
 }
 
 fn show_accounts(ui: &mut egui::Ui, model: &AppModel) {
-    pane_heading(ui, "Accounts", "secret-free query projections");
+    let language = model.preferences.language;
+    pane_heading(
+        ui,
+        text(language, TextKey::Accounts),
+        text(language, TextKey::AccountsSource),
+    );
     let Some(snapshot) = &model.snapshot else {
-        empty(ui, "Waiting for the Control API.");
+        empty(ui, text(language, TextKey::WaitingControl));
         return;
     };
     egui::ScrollArea::both().show(ui, |ui| {
@@ -696,18 +829,18 @@ fn show_accounts(ui: &mut egui::Ui, model: &AppModel) {
             .striped(true)
             .show(ui, |ui| {
                 for heading in [
-                    "Venue",
-                    "Mode",
-                    "Account",
-                    "Health",
-                    "Equity",
-                    "Available",
-                    "uPnL",
-                    "Private gen",
-                    "Writer gen",
-                    "Reconciled age",
+                    TextKey::Venue,
+                    TextKey::Mode,
+                    TextKey::Account,
+                    TextKey::Health,
+                    TextKey::Equity,
+                    TextKey::Available,
+                    TextKey::UnrealizedPnl,
+                    TextKey::PrivateGeneration,
+                    TextKey::WriterGeneration,
+                    TextKey::ReconciledAge,
                 ] {
-                    ui.strong(heading);
+                    ui.strong(text(language, heading));
                 }
                 ui.end_row();
                 for account in &snapshot.accounts {
@@ -731,23 +864,26 @@ fn show_accounts(ui: &mut egui::Ui, model: &AppModel) {
         ui.separator();
         ui.colored_label(
             theme::WARNING,
-            "WAL state · runtime Unknown fence · capability freshness: not projected by Control v2",
+            text(language, TextKey::AccountProjectionCaveat),
         );
-        ui.small(
-            "VenueFlow shows writer/private generations and reconciliation age only; it does not infer missing authority from health or ledger text.",
-        );
+        ui.small(text(language, TextKey::AccountAuthorityCaveat));
     });
 }
 
 fn show_strategies(ui: &mut egui::Ui, model: &mut AppModel) {
-    pane_heading(ui, "Strategies", "Grid · Scalping · Copy");
+    let language = model.preferences.language;
+    pane_heading(
+        ui,
+        text(language, TextKey::Strategies),
+        text(language, TextKey::StrategiesSubtitle),
+    );
     let strategies = model
         .snapshot
         .as_ref()
         .map(|snapshot| snapshot.strategies.clone())
         .unwrap_or_default();
     if strategies.is_empty() {
-        empty(ui, "No strategy instances were returned.");
+        empty(ui, text(language, TextKey::NoStrategies));
         return;
     }
     egui::ScrollArea::both().show(ui, |ui| {
@@ -755,10 +891,19 @@ fn show_strategies(ui: &mut egui::Ui, model: &mut AppModel) {
             .striped(true)
             .show(ui, |ui| {
                 for heading in [
-                    "Instance", "Kind", "Venue", "Mode", "Symbol", "State", "Orders", "Long",
-                    "Short", "PnL", "Epoch",
+                    TextKey::Instance,
+                    TextKey::Kind,
+                    TextKey::Venue,
+                    TextKey::Mode,
+                    TextKey::Symbol,
+                    TextKey::State,
+                    TextKey::Orders,
+                    TextKey::Long,
+                    TextKey::Short,
+                    TextKey::Pnl,
+                    TextKey::Epoch,
                 ] {
-                    ui.strong(heading);
+                    ui.strong(text(language, heading));
                 }
                 ui.end_row();
                 for strategy in strategies {
@@ -796,16 +941,27 @@ fn show_strategies(ui: &mut egui::Ui, model: &mut AppModel) {
 }
 
 fn show_copy_relations(ui: &mut egui::Ui, model: &AppModel) {
-    pane_heading(ui, "Copy relations", "target exposure and durable drift");
+    let language = model.preferences.language;
+    pane_heading(
+        ui,
+        text(language, TextKey::CopyRelations),
+        text(language, TextKey::CopySubtitle),
+    );
     let Some(snapshot) = &model.snapshot else {
-        empty(ui, "Waiting for copy projections.");
+        empty(ui, text(language, TextKey::NoCopy));
         return;
     };
     egui::Grid::new("copy-grid").striped(true).show(ui, |ui| {
         for heading in [
-            "Leader", "Follower", "Symbol", "Target", "Actual", "Drift", "State",
+            TextKey::Leader,
+            TextKey::Follower,
+            TextKey::Symbol,
+            TextKey::Target,
+            TextKey::Actual,
+            TextKey::Drift,
+            TextKey::State,
         ] {
-            ui.strong(heading);
+            ui.strong(text(language, heading));
         }
         ui.end_row();
         for relation in &snapshot.copy_relations {
@@ -823,21 +979,27 @@ fn show_copy_relations(ui: &mut egui::Ui, model: &AppModel) {
 }
 
 fn show_ledger(ui: &mut egui::Ui, model: &AppModel) {
+    let language = model.preferences.language;
     pane_heading(
         ui,
-        "Receipt ledger",
-        "read-only execution and control receipts",
+        text(language, TextKey::ReceiptLedger),
+        text(language, TextKey::LedgerSubtitle),
     );
     let Some(snapshot) = &model.snapshot else {
-        empty(ui, "Waiting for ledger projections.");
+        empty(ui, text(language, TextKey::NoLedger));
         return;
     };
     egui::ScrollArea::both().show(ui, |ui| {
         egui::Grid::new("ledger-grid").striped(true).show(ui, |ui| {
             for heading in [
-                "Observed", "Instance", "Action", "State", "Receipt", "Detail",
+                TextKey::Observed,
+                TextKey::Instance,
+                TextKey::Action,
+                TextKey::State,
+                TextKey::Receipt,
+                TextKey::Detail,
             ] {
-                ui.strong(heading);
+                ui.strong(text(language, heading));
             }
             ui.end_row();
             for entry in snapshot.ledger.iter().rev().take(500) {
@@ -854,10 +1016,11 @@ fn show_ledger(ui: &mut egui::Ui, model: &AppModel) {
 }
 
 fn show_control(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
+    let language = model.preferences.language;
     pane_heading(
         ui,
-        "Lifecycle control",
-        "semantic intents; server revalidation required",
+        text(language, TextKey::LifecycleControl),
+        text(language, TextKey::ControlSubtitle),
     );
     let strategies = model
         .snapshot
@@ -865,7 +1028,7 @@ fn show_control(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient)
         .map(|snapshot| snapshot.strategies.clone())
         .unwrap_or_default();
     if strategies.is_empty() {
-        empty(ui, "No controllable strategy projection is available.");
+        empty(ui, text(language, TextKey::NoControl));
         return;
     }
     if model.preferences.selected_instance.is_none() {
@@ -877,7 +1040,7 @@ fn show_control(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient)
                 .preferences
                 .selected_instance
                 .as_deref()
-                .unwrap_or("Select instance"),
+                .unwrap_or(text(language, TextKey::SelectInstance)),
         )
         .show_ui(ui, |ui| {
             for strategy in &strategies {
@@ -901,11 +1064,31 @@ fn show_control(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient)
         return;
     };
     ui.separator();
-    ui.label(format!("Venue: {}", strategy.venue));
-    ui.label(format!("Mode: {}", strategy.mode));
-    ui.label(format!("Account: {}", strategy.trading_account_id));
-    ui.label(format!("Symbol: {}", strategy.symbol));
-    ui.label(format!("Config epoch: {}", strategy.config_epoch));
+    ui.label(format!(
+        "{}: {}",
+        text(language, TextKey::Venue),
+        strategy.venue
+    ));
+    ui.label(format!(
+        "{}: {}",
+        text(language, TextKey::Mode),
+        strategy.mode
+    ));
+    ui.label(format!(
+        "{}: {}",
+        text(language, TextKey::Account),
+        strategy.trading_account_id
+    ));
+    ui.label(format!(
+        "{}: {}",
+        text(language, TextKey::Symbol),
+        strategy.symbol
+    ));
+    ui.label(format!(
+        "{}: {}",
+        text(language, TextKey::Epoch),
+        strategy.config_epoch
+    ));
     lifecycle_label(ui, strategy.lifecycle);
     if let Some(attention) = &strategy.attention {
         ui.colored_label(theme::WARNING, attention);
@@ -913,10 +1096,10 @@ fn show_control(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient)
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
         for (action, label) in [
-            (ControlAction::Pause, "Pause"),
-            (ControlAction::Resume, "Resume"),
-            (ControlAction::Stop, "Stop"),
-            (ControlAction::Flatten, "Flatten"),
+            (ControlAction::Pause, text(language, TextKey::Pause)),
+            (ControlAction::Resume, text(language, TextKey::Resume)),
+            (ControlAction::Stop, text(language, TextKey::Stop)),
+            (ControlAction::Flatten, text(language, TextKey::Flatten)),
         ] {
             let button = if action == ControlAction::Flatten {
                 egui::Button::new(RichText::new(label).color(theme::SELL))
@@ -929,11 +1112,11 @@ fn show_control(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient)
         }
     });
     ui.separator();
-    ui.small("Stop cancels only the selected instance's owned orders and preserves residual custody. Flatten additionally requests signed zero-position convergence.");
-    ui.small("Pause, Stop, and Flatten require an exact typed scope confirmation. The account node remains authoritative and must independently revalidate every intent.");
+    ui.small(text(language, TextKey::StopSemantics));
+    ui.small(text(language, TextKey::ConfirmationSemantics));
     if !model.commands.is_empty() {
         ui.separator();
-        ui.strong("This session's command receipts");
+        ui.strong(text(language, TextKey::SessionReceipts));
         egui::ScrollArea::vertical()
             .max_height(170.0)
             .show(ui, |ui| {
@@ -1000,77 +1183,135 @@ fn send_command(model: &mut AppModel, client: &ControlClient, request: ControlCo
 }
 
 fn show_diagnostics(ui: &mut egui::Ui, model: &AppModel) {
-    pane_heading(ui, "Diagnostics", "control-plane client state");
-    connection_badge(ui, model.connection);
+    let language = model.preferences.language;
+    pane_heading(
+        ui,
+        text(language, TextKey::Diagnostics),
+        text(language, TextKey::DiagnosticsSubtitle),
+    );
+    connection_badge(ui, model.connection, language);
     ui.label(format!(
-        "Runtime projection: {}",
-        model
-            .control_connection
-            .map_or("awaiting snapshot".to_owned(), |state| format!("{state:?}"))
+        "{}: {}",
+        text(language, TextKey::RuntimeProjection),
+        model.control_connection.map_or(
+            text(language, TextKey::AwaitingSnapshot).to_owned(),
+            |state| format!("{state:?}")
+        )
     ));
     ui.label(format!(
-        "Endpoint: {}",
+        "{}: {}",
+        text(language, TextKey::Endpoint),
         endpoint_label(&model.preferences.endpoint)
     ));
     ui.label(format!(
-        "Snapshot polling: {}",
+        "{}: {}",
+        text(language, TextKey::SnapshotPolling),
         if model.snapshot_online {
-            "online"
+            text(language, TextKey::Online)
         } else {
-            "offline"
+            text(language, TextKey::Offline)
         }
     ));
     ui.label(format!(
-        "SSE stream: {}",
+        "{}: {}",
+        text(language, TextKey::EventStream),
         if model.event_stream_online {
-            "online"
+            text(language, TextKey::Online)
         } else {
-            "offline"
+            text(language, TextKey::Offline)
         }
     ));
     ui.label(format!(
-        "Last event ID: {}",
+        "{}: {}",
+        text(language, TextKey::LastEventId),
         model
             .last_event_id
-            .map_or("none".to_owned(), |event_id| event_id.to_string())
+            .map_or(text(language, TextKey::None).to_owned(), |event_id| {
+                event_id.to_string()
+            })
     ));
     if let Some(snapshot) = &model.snapshot {
-        ui.label(format!("Schema: {}", snapshot.schema_version));
-        ui.label(format!("Generated: {}", snapshot.generated_ms));
-        ui.label(format!("Accounts: {}", snapshot.accounts.len()));
-        ui.label(format!("Strategies: {}", snapshot.strategies.len()));
-        ui.label(format!("Markets: {}", snapshot.markets.len()));
-        ui.label(format!("Ledger rows: {}", snapshot.ledger.len()));
+        ui.label(format!(
+            "{}: {}",
+            text(language, TextKey::Schema),
+            snapshot.schema_version
+        ));
+        ui.label(format!(
+            "{}: {}",
+            text(language, TextKey::Generated),
+            snapshot.generated_ms
+        ));
+        ui.label(format!(
+            "{}: {}",
+            text(language, TextKey::Accounts),
+            snapshot.accounts.len()
+        ));
+        ui.label(format!(
+            "{}: {}",
+            text(language, TextKey::Strategies),
+            snapshot.strategies.len()
+        ));
+        ui.label(format!(
+            "{}: {}",
+            text(language, TextKey::Markets),
+            snapshot.markets.len()
+        ));
+        ui.label(format!(
+            "{}: {}",
+            text(language, TextKey::LedgerRows),
+            snapshot.ledger.len()
+        ));
     }
     ui.separator();
-    ui.strong("Authority coverage in Control v2");
-    ui.label("TEST/LIVE, account, strategy, private generation, writer generation: projected");
-    ui.label("Command Accepted/Applied/Rejected/Unknown receipts: projected");
-    ui.colored_label(theme::WARNING, "WAL state: not projected");
-    ui.colored_label(theme::WARNING, "Runtime Unknown fence: not projected");
+    ui.strong(text(language, TextKey::AuthorityCoverage));
+    ui.label(text(language, TextKey::LiveProjection));
+    ui.label(text(language, TextKey::ReceiptProjection));
+    ui.colored_label(theme::WARNING, text(language, TextKey::WalNotProjected));
+    ui.colored_label(theme::WARNING, text(language, TextKey::UnknownNotProjected));
     ui.colored_label(
         theme::WARNING,
-        "Capability evidence freshness: not projected",
+        text(language, TextKey::CapabilityNotProjected),
     );
     ui.separator();
     #[cfg(not(target_arch = "wasm32"))]
     {
-        ui.strong("Local public market data");
-        ui.label("Venue: Binance USD-M · mode: LIVE · identity: none");
+        ui.strong(text(language, TextKey::LocalPublicData));
+        ui.label(text(language, TextKey::LocalVenueLive));
         ui.label(format!(
-            "Subscriptions: {} · generation: {}",
+            "{}: {} · {}: {}",
+            text(language, TextKey::Subscriptions),
             model.local_markets.selections().count(),
+            text(language, TextKey::Generation),
             model.local_markets.generation()
         ));
-        ui.label("Fixed endpoints: fapi.binance.com + fstream.binance.com");
+        ui.label(format!(
+            "{}: {}",
+            text(language, TextKey::CatalogSymbols),
+            model.local_symbols.len()
+        ));
+        ui.label(text(
+            language,
+            if model.local_proxy_detected {
+                TextKey::ProxyEnabled
+            } else {
+                TextKey::ProxyDisabled
+            },
+        ));
+        if let Some(error) = &model.local_catalog_error {
+            ui.colored_label(theme::WARNING, error);
+        }
+        ui.label(text(language, TextKey::FixedEndpoints));
         ui.separator();
     }
-    ui.strong("Recent notices");
+    ui.strong(text(language, TextKey::RecentNotices));
     for notice in &model.notices {
         ui.small(notice);
     }
     ui.separator();
-    ui.colored_label(theme::TEXT_SECONDARY, "The native UI may read Binance public market endpoints. It cannot read credentials, private streams, PostgreSQL, WAL, checkpoints, artifacts, or any exchange mutation path.");
+    ui.colored_label(
+        theme::TEXT_SECONDARY,
+        text(language, TextKey::PublicBoundary),
+    );
 }
 
 fn receipt_state_label(ui: &mut egui::Ui, state: CommandState) {
@@ -1101,6 +1342,31 @@ fn market<'a>(model: &'a AppModel, symbol: &str) -> Option<&'a MarketSummary> {
         .find(|market| market.symbol.to_string() == symbol)
 }
 
+fn available_symbols(model: &AppModel) -> Vec<String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if !model.local_symbols.is_empty() {
+        return model.local_symbols.clone();
+    }
+    model
+        .snapshot
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .markets
+                .iter()
+                .map(|market| market.symbol.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn favorite_rank(favorites: &[String], symbol: &str) -> usize {
+    favorites
+        .iter()
+        .position(|favorite| favorite == symbol)
+        .unwrap_or(favorites.len())
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn local_market<'a>(
     model: &'a AppModel,
@@ -1112,15 +1378,16 @@ fn local_market<'a>(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn local_status_label(ui: &mut egui::Ui, status: MarketStatus) {
-    let color = match status {
-        MarketStatus::Live => theme::BUY,
-        MarketStatus::LoadingHistory | MarketStatus::Connecting | MarketStatus::Resyncing => {
-            theme::WARNING
-        }
-        MarketStatus::Stale | MarketStatus::Offline => theme::SELL,
+fn local_status_label(ui: &mut egui::Ui, status: MarketStatus, language: Language) {
+    let (label, color) = match status {
+        MarketStatus::Live => (text(language, TextKey::Live), theme::BUY),
+        MarketStatus::LoadingHistory => (text(language, TextKey::LoadingHistory), theme::WARNING),
+        MarketStatus::Connecting => (text(language, TextKey::Connecting), theme::WARNING),
+        MarketStatus::Resyncing => (text(language, TextKey::Resyncing), theme::WARNING),
+        MarketStatus::Stale => (text(language, TextKey::Stale), theme::SELL),
+        MarketStatus::Offline => (text(language, TextKey::Offline), theme::SELL),
     };
-    ui.colored_label(color, RichText::new(format!("{status:?}")).strong());
+    ui.colored_label(color, RichText::new(label).strong());
 }
 
 fn pane_heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {

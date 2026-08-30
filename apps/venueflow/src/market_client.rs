@@ -6,11 +6,18 @@ mod native {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
     use futures_util::{SinkExt as _, StreamExt as _};
-    use tokio::{runtime::Builder, sync::mpsc, time::timeout};
+    use tokio::{
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
+        net::TcpStream,
+        runtime::Builder,
+        sync::mpsc,
+        time::timeout,
+    };
     use tokio_tungstenite::{
-        connect_async_with_config,
+        MaybeTlsStream, WebSocketStream, client_async_tls_with_config, connect_async_with_config,
         tungstenite::{Message, protocol::WebSocketConfig},
     };
     use venue_control_protocol::{AggressorSide as UiAggressorSide, UiBar, UiBookLevel, UiTrade};
@@ -19,7 +26,7 @@ mod native {
     };
     use venue_gateway_binance::{
         BinanceFormingBar, BinanceKlineInterval, BinancePublicKline, native_symbol,
-        parse_public_market_agg_trade, parse_public_market_bbo,
+        parse_public_exchange_info, parse_public_market_agg_trade, parse_public_market_bbo,
         parse_public_market_depth20_snapshot, parse_public_market_kline,
         parse_public_market_rest_klines,
     };
@@ -30,10 +37,13 @@ mod native {
     };
 
     const REST_KLINES_ENDPOINT: &str = "https://fapi.binance.com/fapi/v1/klines";
+    const EXCHANGE_INFO_ENDPOINT: &str = "https://fapi.binance.com/fapi/v1/exchangeInfo";
     const COMBINED_STREAM_ENDPOINT: &str = "wss://fstream.binance.com/stream";
     const CONNECT_BUDGET: Duration = Duration::from_secs(10);
     const HTTP_BODY_LIMIT: usize = 1024 * 1024;
+    const CATALOG_BODY_LIMIT: usize = 4 * 1024 * 1024;
     const WS_FRAME_LIMIT: usize = 1024 * 1024;
+    const PROXY_RESPONSE_LIMIT: usize = 16 * 1024;
     const COMMAND_CAPACITY: usize = 8;
     const EVENT_CAPACITY: usize = 8_192;
     const MAX_SUBSCRIPTIONS: usize = 8;
@@ -46,6 +56,9 @@ mod native {
     #[derive(Clone, Debug, PartialEq)]
     pub enum LocalMarketClientEvent {
         Market(MarketEnvelope),
+        Catalog(Vec<String>),
+        CatalogUnavailable(String),
+        ProxyDetected(bool),
         RepaintRequested,
         WorkerFailed(String),
     }
@@ -152,6 +165,105 @@ mod native {
         Ok(unique.into_iter().collect())
     }
 
+    enum ProxySetting {
+        Direct,
+        Http(ProxyRoute),
+        Invalid,
+    }
+
+    struct ProxyRoute {
+        host: String,
+        port: u16,
+        authorization: Option<String>,
+    }
+
+    impl ProxySetting {
+        fn from_environment(target_host: &str) -> Self {
+            let no_proxy = ["NO_PROXY", "no_proxy"]
+                .into_iter()
+                .find_map(|name| std::env::var(name).ok())
+                .filter(|value| !value.trim().is_empty());
+            let proxy = [
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+            ]
+            .into_iter()
+            .find_map(|name| std::env::var(name).ok())
+            .filter(|value| !value.trim().is_empty());
+            Self::from_values(proxy.as_deref(), no_proxy.as_deref(), target_host)
+        }
+
+        fn from_values(proxy: Option<&str>, no_proxy: Option<&str>, target_host: &str) -> Self {
+            if no_proxy.is_some_and(|rules| bypasses_proxy(rules, target_host)) {
+                return Self::Direct;
+            }
+            let Some(raw) = proxy else {
+                return Self::Direct;
+            };
+            match parse_http_proxy(raw) {
+                Ok(route) => Self::Http(route),
+                Err(()) => Self::Invalid,
+            }
+        }
+
+        const fn configured(&self) -> bool {
+            !matches!(self, Self::Direct)
+        }
+    }
+
+    fn parse_http_proxy(raw: &str) -> Result<ProxyRoute, ()> {
+        let normalized = if raw.contains("://") {
+            raw.trim().to_owned()
+        } else {
+            format!("http://{}", raw.trim())
+        };
+        let url = reqwest::Url::parse(&normalized).map_err(|_| ())?;
+        if url.scheme() != "http" || url.path() != "/" || url.query().is_some() {
+            return Err(());
+        }
+        let host = url.host_str().filter(|host| !host.is_empty()).ok_or(())?;
+        let port = url.port_or_known_default().ok_or(())?;
+        let authorization = if url.username().is_empty() {
+            None
+        } else {
+            let password = url.password().ok_or(())?;
+            let raw = format!("{}:{password}", url.username());
+            Some(format!("Basic {}", BASE64_STANDARD.encode(raw.as_bytes())))
+        };
+        Ok(ProxyRoute {
+            host: host.to_owned(),
+            port,
+            authorization,
+        })
+    }
+
+    fn bypasses_proxy(rules: &str, target_host: &str) -> bool {
+        let target = target_host
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        rules.split(',').any(|rule| {
+            let rule = rule.trim().to_ascii_lowercase();
+            if rule == "*" {
+                return true;
+            }
+            let host = rule
+                .split_once(':')
+                .map_or(rule.as_str(), |(host, _)| host)
+                .trim_start_matches('.')
+                .trim_end_matches('.');
+            !host.is_empty()
+                && (target == host
+                    || target
+                        .strip_suffix(host)
+                        .is_some_and(|prefix| prefix.ends_with('.')))
+        })
+    }
+
     fn worker_main(
         command_rx: Receiver<LocalMarketCommand>,
         event_tx: Sender<LocalMarketClientEvent>,
@@ -201,6 +313,17 @@ mod native {
                 return;
             }
         };
+        let proxy = ProxySetting::from_environment("fstream.binance.com");
+        let _ = event_tx.try_send(LocalMarketClientEvent::ProxyDetected(proxy.configured()));
+        let catalog_http = http.clone();
+        let catalog_events = event_tx.clone();
+        tokio::spawn(async move {
+            let event = match fetch_catalog(&catalog_http).await {
+                Ok(symbols) => LocalMarketClientEvent::Catalog(symbols),
+                Err(error) => LocalMarketClientEvent::CatalogUnavailable(error),
+            };
+            let _ = catalog_events.try_send(event);
+        });
         let mut pending = None;
         loop {
             let command = match pending.take() {
@@ -226,6 +349,7 @@ mod native {
                         generation,
                         selections,
                         &http,
+                        &proxy,
                         &mut async_rx,
                         &event_tx,
                     )
@@ -240,6 +364,7 @@ mod native {
         generation: u64,
         selections: Vec<MarketSelection>,
         http: &reqwest::Client,
+        proxy: &ProxySetting,
         commands: &mut mpsc::Receiver<LocalMarketCommand>,
         event_tx: &Sender<LocalMarketClientEvent>,
     ) -> Option<LocalMarketCommand> {
@@ -282,13 +407,14 @@ mod native {
                 .max_frame_size(Some(WS_FRAME_LIMIT));
             let connection = tokio::select! {
                 command = commands.recv() => return command,
-                result = timeout(
-                    CONNECT_BUDGET,
-                    connect_async_with_config(&url, Some(websocket_config), false),
-                ) => result,
+                result = timeout(CONNECT_BUDGET, connect_public_websocket(
+                    &url,
+                    websocket_config,
+                    proxy,
+                )) => result,
             };
             let mut websocket = match connection {
-                Ok(Ok((websocket, _))) => websocket,
+                Ok(Ok(websocket)) => websocket,
                 Ok(Err(error)) => {
                     if let Some(command) = retry_after_error(
                         generation,
@@ -390,6 +516,132 @@ mod native {
             }
             attempt = attempt.saturating_add(1);
         }
+    }
+
+    type PublicWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    async fn connect_public_websocket(
+        url: &str,
+        config: WebSocketConfig,
+        proxy: &ProxySetting,
+    ) -> Result<PublicWebSocket, String> {
+        match proxy {
+            ProxySetting::Direct => connect_async_with_config(url, Some(config), false)
+                .await
+                .map(|(websocket, _)| websocket)
+                .map_err(|error| format!("direct websocket connect failed: {error}")),
+            ProxySetting::Http(route) => {
+                let target = reqwest::Url::parse(url)
+                    .map_err(|_| "public websocket URL is invalid".to_owned())?;
+                let target_host = target
+                    .host_str()
+                    .ok_or_else(|| "public websocket host is unavailable".to_owned())?;
+                let target_port = target
+                    .port_or_known_default()
+                    .ok_or_else(|| "public websocket port is unavailable".to_owned())?;
+                let stream = TcpStream::connect((route.host.as_str(), route.port))
+                    .await
+                    .map_err(|_| "websocket proxy TCP connect failed".to_owned())?;
+                let stream = establish_http_connect(
+                    stream,
+                    target_host,
+                    target_port,
+                    route.authorization.as_deref(),
+                )
+                .await?;
+                client_async_tls_with_config(url, stream, Some(config), None)
+                    .await
+                    .map(|(websocket, _)| websocket)
+                    .map_err(|error| format!("proxied websocket handshake failed: {error}"))
+            }
+            ProxySetting::Invalid => {
+                Err("configured websocket proxy is invalid or unsupported".to_owned())
+            }
+        }
+    }
+
+    async fn establish_http_connect(
+        mut stream: TcpStream,
+        target_host: &str,
+        target_port: u16,
+        authorization: Option<&str>,
+    ) -> Result<TcpStream, String> {
+        let authority = format!("{target_host}:{target_port}");
+        let authorization = authorization.map_or(String::new(), |authorization| {
+            format!("Proxy-Authorization: {authorization}\r\n")
+        });
+        let request = format!(
+            "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: Keep-Alive\r\n{authorization}\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|_| "websocket proxy CONNECT write failed".to_owned())?;
+        let mut response = Vec::new();
+        let mut chunk = [0_u8; 1_024];
+        while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .map_err(|_| "websocket proxy CONNECT read failed".to_owned())?;
+            if read == 0 {
+                return Err("websocket proxy closed the CONNECT tunnel".to_owned());
+            }
+            if response.len().saturating_add(read) > PROXY_RESPONSE_LIMIT {
+                return Err("websocket proxy CONNECT response exceeded its bound".to_owned());
+            }
+            response.extend_from_slice(&chunk[..read]);
+        }
+        let response = std::str::from_utf8(&response)
+            .map_err(|_| "websocket proxy CONNECT response was not UTF-8".to_owned())?;
+        let status = response.lines().next().unwrap_or_default();
+        if !status.starts_with("HTTP/1.1 200 ") && !status.starts_with("HTTP/1.0 200 ") {
+            return Err("websocket proxy rejected the CONNECT tunnel".to_owned());
+        }
+        Ok(stream)
+    }
+
+    async fn fetch_catalog(http: &reqwest::Client) -> Result<Vec<String>, String> {
+        let response = http
+            .get(EXCHANGE_INFO_ENDPOINT)
+            .send()
+            .await
+            .map_err(|error| format!("symbol catalog request failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "symbol catalog returned HTTP {}",
+                response.status().as_u16()
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|size| size > CATALOG_BODY_LIMIT as u64)
+        {
+            return Err("symbol catalog exceeded 4 MiB".to_owned());
+        }
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| format!("symbol catalog body failed: {error}"))?;
+            let new_len = body
+                .len()
+                .checked_add(chunk.len())
+                .ok_or_else(|| "symbol catalog length overflow".to_owned())?;
+            if new_len > CATALOG_BODY_LIMIT {
+                return Err("symbol catalog exceeded 4 MiB".to_owned());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let payload =
+            std::str::from_utf8(&body).map_err(|_| "symbol catalog was not UTF-8".to_owned())?;
+        parse_public_exchange_info(payload)
+            .map(|symbols| {
+                symbols
+                    .into_iter()
+                    .map(|symbol| symbol.to_string())
+                    .collect()
+            })
+            .map_err(|error| format!("symbol catalog parse failed: {error}"))
     }
 
     async fn load_history(
@@ -891,6 +1143,46 @@ mod native {
             assert_ne!(retry_delay(3, 7), retry_delay(3, 8));
             assert_eq!(retry_delay(99, 7), retry_delay(99, 7));
             assert!(retry_delay(99, 7) >= Duration::from_secs(25));
+        }
+
+        #[test]
+        fn proxy_detection_honors_no_proxy() {
+            assert!(matches!(
+                ProxySetting::from_values(
+                    Some("http://proxy.local:7897"),
+                    None,
+                    "fstream.binance.com"
+                ),
+                ProxySetting::Http(_)
+            ));
+            assert!(matches!(
+                ProxySetting::from_values(
+                    Some("http://proxy.local:7897"),
+                    Some("localhost,.binance.com"),
+                    "fstream.binance.com"
+                ),
+                ProxySetting::Direct
+            ));
+        }
+
+        #[test]
+        fn proxy_parser_supports_redacted_http_basic_auth() -> Result<(), String> {
+            let route = parse_http_proxy("http://user:pass@127.0.0.1:7897")
+                .map_err(|()| "valid proxy was rejected".to_owned())?;
+            assert_eq!(route.host, "127.0.0.1");
+            assert_eq!(route.port, 7_897);
+            assert!(route.authorization.as_deref().is_some_and(|value| {
+                value.starts_with("Basic ") && !value.contains("user") && !value.contains("pass")
+            }));
+            assert!(matches!(
+                ProxySetting::from_values(
+                    Some("socks5://127.0.0.1:1080"),
+                    None,
+                    "fstream.binance.com"
+                ),
+                ProxySetting::Invalid
+            ));
+            Ok(())
         }
     }
 }

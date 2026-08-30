@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     chart::{ChartInterval, ChartViewport},
+    i18n::{Language, TextKey, text},
     model::WorkspaceKind,
 };
 
@@ -21,18 +22,18 @@ pub enum PaneKind {
 }
 
 impl PaneKind {
-    pub const fn title(self) -> &'static str {
+    pub const fn title(self, language: Language) -> &'static str {
         match self {
-            Self::MarketWatch => "Market watch",
-            Self::Chart => "Chart & indicators",
-            Self::OrderBook => "Order book",
-            Self::TradeTape => "Trade tape",
-            Self::Accounts => "Accounts",
-            Self::Strategies => "Strategies",
-            Self::CopyRelations => "Copy relations",
-            Self::Ledger => "Receipt ledger",
-            Self::Control => "Lifecycle control",
-            Self::Diagnostics => "Diagnostics",
+            Self::MarketWatch => text(language, TextKey::MarketWatch),
+            Self::Chart => text(language, TextKey::ChartIndicators),
+            Self::OrderBook => text(language, TextKey::OrderBook),
+            Self::TradeTape => text(language, TextKey::TradeTape),
+            Self::Accounts => text(language, TextKey::Accounts),
+            Self::Strategies => text(language, TextKey::Strategies),
+            Self::CopyRelations => text(language, TextKey::CopyRelations),
+            Self::Ledger => text(language, TextKey::ReceiptLedger),
+            Self::Control => text(language, TextKey::LifecycleControl),
+            Self::Diagnostics => text(language, TextKey::Diagnostics),
         }
     }
 }
@@ -68,11 +69,11 @@ impl Pane {
         }
     }
 
-    pub fn title(&self) -> String {
+    pub fn title(&self, language: Language) -> String {
         if self.kind == PaneKind::Chart && self.instance > 1 {
-            format!("{} {}", self.kind.title(), self.instance)
+            format!("{} {}", self.kind.title(language), self.instance)
         } else {
-            self.kind.title().to_owned()
+            self.kind.title(language).to_owned()
         }
     }
 }
@@ -127,12 +128,16 @@ impl Workspaces {
         }
     }
 
-    pub fn pane_visibility(&self) -> Vec<(TileId, String, bool)> {
+    pub fn pane_visibility(&self, language: Language) -> Vec<(TileId, String, bool)> {
         let tree = self.active_tree();
         tree.tiles
             .iter()
             .filter_map(|(tile_id, tile)| match tile {
-                Tile::Pane(pane) => Some((*tile_id, pane.title(), tree.tiles.is_visible(*tile_id))),
+                Tile::Pane(pane) => Some((
+                    *tile_id,
+                    pane.title(language),
+                    tree.tiles.is_visible(*tile_id),
+                )),
                 Tile::Container(_) => None,
             })
             .collect()
@@ -140,6 +145,17 @@ impl Workspaces {
 
     pub fn set_visible(&mut self, tile_id: TileId, visible: bool) {
         self.active_tree_mut().tiles.set_visible(tile_id, visible);
+    }
+
+    pub fn follow_dynamic_charts_latest(&mut self) {
+        for (_, tile) in self.active_tree_mut().tiles.iter_mut() {
+            if let Tile::Pane(pane) = tile
+                && pane.kind == PaneKind::Chart
+                && pane.symbol.is_none()
+            {
+                pane.viewport.follow_latest();
+            }
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -223,11 +239,11 @@ fn build_operations() -> Tree<Pane> {
 fn build_multi_chart() -> Tree<Pane> {
     let mut tiles = Tiles::default();
     let watch = pane(&mut tiles, PaneKind::MarketWatch, 2);
-    let btc = chart(&mut tiles, 1, "BTC/USDT");
-    let eth = chart(&mut tiles, 2, "ETH/USDT");
-    let sol = chart(&mut tiles, 3, "SOL/USDT");
-    let doge = chart(&mut tiles, 4, "DOGE/USDT");
-    let charts = tiles.insert_grid_tile(vec![btc, eth, sol, doge]);
+    let btc = chart(&mut tiles, 1, "BTC/USDC");
+    let eth = chart(&mut tiles, 2, "ETH/USDC");
+    let sol = chart(&mut tiles, 3, "SOL/USDC");
+    let bnb = chart(&mut tiles, 4, "BNB/USDC");
+    let charts = tiles.insert_grid_tile(vec![btc, eth, sol, bnb]);
     let root = split(&mut tiles, LinearDir::Horizontal, watch, charts, 0.14);
     Tree::new("venueflow-multi-chart", root, tiles)
 }
@@ -237,6 +253,23 @@ mod tests {
     use egui_tiles::Tile;
 
     use super::{PaneKind, Workspaces};
+
+    #[test]
+    fn multi_chart_starts_with_the_four_pinned_usdc_markets() {
+        let workspaces = Workspaces::default();
+        let symbols = workspaces
+            .multi_chart
+            .tiles
+            .iter()
+            .filter_map(|(_, tile)| match tile {
+                Tile::Pane(pane) if pane.kind == PaneKind::Chart => pane.symbol.as_deref(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for required in ["BTC/USDC", "ETH/USDC", "SOL/USDC", "BNB/USDC"] {
+            assert!(symbols.contains(&required));
+        }
+    }
 
     #[test]
     fn operational_workspace_contains_control_and_audit_surfaces() {

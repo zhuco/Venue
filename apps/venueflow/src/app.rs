@@ -15,7 +15,7 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 const STORAGE_KEY: &str = "venueflow-state-v1";
-const PERSISTED_SCHEMA_VERSION: u16 = 1;
+const PERSISTED_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -128,6 +128,17 @@ impl VenueFlowApp {
                             .notice(format!("Ignored invalid local market event: {error}"));
                     }
                 }
+                LocalMarketClientEvent::Catalog(symbols) => {
+                    self.model.apply_local_catalog(symbols);
+                }
+                LocalMarketClientEvent::CatalogUnavailable(error) => {
+                    self.model.local_catalog_error = Some(error.clone());
+                    self.model
+                        .notice(format!("Local Binance symbol catalog unavailable: {error}"));
+                }
+                LocalMarketClientEvent::ProxyDetected(detected) => {
+                    self.model.local_proxy_detected = detected;
+                }
                 LocalMarketClientEvent::RepaintRequested => context.request_repaint(),
                 LocalMarketClientEvent::WorkerFailed(error) => {
                     self.model
@@ -195,6 +206,9 @@ impl eframe::App for VenueFlowApp {
         }
         self.drain_client();
         self.reconnect_if_requested(context);
+        if std::mem::take(&mut self.model.follow_latest_requested) {
+            self.workspaces.follow_dynamic_charts_latest();
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.synchronize_local_markets();
@@ -248,7 +262,12 @@ impl eframe::App for VenueFlowApp {
             &mut self.model,
             &mut self.reconnect,
         );
-        ui::show_modules(&context, &mut self.show_modules, &mut self.workspaces);
+        ui::show_modules(
+            &context,
+            &mut self.show_modules,
+            &mut self.workspaces,
+            self.model.preferences.language,
+        );
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
