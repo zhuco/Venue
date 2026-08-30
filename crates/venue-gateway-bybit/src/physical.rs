@@ -646,45 +646,43 @@ mod tests {
     }
 
     #[test]
-    fn test_and_live_prepare_bound_place_cancel_and_reduce_once() -> Result<(), TestError> {
-        for mode in [GatewayMode::Test, GatewayMode::Live] {
-            let (session, bbo) = session(
-                mode,
-                "http://127.0.0.1:1".to_owned(),
-                Duration::from_secs(1),
-            )?;
-            let place = session.prepare_place_once(&place_intent()?, NOW_MS, None)?;
-            assert_eq!(place.request.path, crate::endpoints::PLACE_ORDER);
-            assert_eq!(place.request.binding.mode, mode);
-            let cancel = session.prepare_cancel_once(
-                &BybitCancelIntent {
-                    order_id: None,
-                    client_order_id: Some("MANAGED_CLIENT_ID".to_owned()),
-                },
-                NOW_MS,
-            )?;
-            assert_eq!(cancel.request.path, crate::endpoints::CANCEL_ORDER);
-            let reduce = session.prepare_reduce_once(
-                "reduce-short-once",
-                PositionSide::Short,
-                Decimal::new(1, 3),
-                NOW_MS,
-                &bbo,
-            )?;
-            let body: serde_json::Value = serde_json::from_slice(&reduce.request.body)?;
-            assert_eq!(body["side"], "Buy");
-            assert_eq!(body["positionIdx"], 2);
-            assert_eq!(body["orderType"], "Market");
-            assert_eq!(body["timeInForce"], "IOC");
-            assert_eq!(body["reduceOnly"], true);
-        }
+    fn live_fixture_prepares_bound_place_cancel_and_reduce_once() -> Result<(), TestError> {
+        let (session, bbo) = session(
+            GatewayMode::Live,
+            "http://127.0.0.1:1".to_owned(),
+            Duration::from_secs(1),
+        )?;
+        let place = session.prepare_place_once(&place_intent()?, NOW_MS, None)?;
+        assert_eq!(place.request.path, crate::endpoints::PLACE_ORDER);
+        assert_eq!(place.request.binding.mode, GatewayMode::Live);
+        let cancel = session.prepare_cancel_once(
+            &BybitCancelIntent {
+                order_id: None,
+                client_order_id: Some("MANAGED_CLIENT_ID".to_owned()),
+            },
+            NOW_MS,
+        )?;
+        assert_eq!(cancel.request.path, crate::endpoints::CANCEL_ORDER);
+        let reduce = session.prepare_reduce_once(
+            "reduce-short-once",
+            PositionSide::Short,
+            Decimal::new(1, 3),
+            NOW_MS,
+            &bbo,
+        )?;
+        let body: serde_json::Value = serde_json::from_slice(&reduce.request.body)?;
+        assert_eq!(body["side"], "Buy");
+        assert_eq!(body["positionIdx"], 2);
+        assert_eq!(body["orderType"], "Market");
+        assert_eq!(body["timeInForce"], "IOC");
+        assert_eq!(body["reduceOnly"], true);
         Ok(())
     }
 
     #[test]
     fn stale_or_cross_generation_session_fails_before_mutation() -> Result<(), TestError> {
         let (mut session, _) = session(
-            GatewayMode::Test,
+            GatewayMode::Live,
             "http://127.0.0.1:1".to_owned(),
             Duration::from_secs(1),
         )?;
@@ -732,7 +730,7 @@ mod tests {
             (Duration::from_millis(200), Duration::from_millis(40)),
         ] {
             let (endpoint, server) = failure_endpoint(server_delay).await?;
-            let (session, _) = session(GatewayMode::Test, endpoint, timeout)?;
+            let (session, _) = session(GatewayMode::Live, endpoint, timeout)?;
             let mutation = session.prepare_place_once(&place_intent()?, NOW_MS, None)?;
             assert!(matches!(
                 session.dispatch_once(mutation, NOW_MS).await?,
@@ -753,7 +751,7 @@ mod tests {
             let _ = stream.read(&mut buffer)?;
             Ok(())
         });
-        let (session, _) = session(GatewayMode::Test, endpoint, Duration::from_secs(1))?;
+        let (session, _) = session(GatewayMode::Live, endpoint, Duration::from_secs(1))?;
         let mut synchronous = BybitSynchronousPhysicalSession::from_session(session)?;
         let mutation = synchronous.prepare_place_once(&place_intent()?, NOW_MS, None)?;
         assert!(matches!(
@@ -769,7 +767,7 @@ mod tests {
     #[test]
     fn ack_remains_unknown_until_new_exact_readback_settles() -> Result<(), TestError> {
         let (session, _) = session(
-            GatewayMode::Test,
+            GatewayMode::Live,
             "http://127.0.0.1:1".to_owned(),
             Duration::from_secs(1),
         )?;

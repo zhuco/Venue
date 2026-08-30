@@ -30,20 +30,15 @@ fn arguments(mode: &str, symbol: &str) -> Vec<OsString> {
 }
 
 #[test]
-fn all_six_bindings_keep_test_and_live_roots_disjoint() -> Result<(), Box<dyn std::error::Error>> {
+fn all_six_bindings_accept_only_exact_live() -> Result<(), Box<dyn std::error::Error>> {
     for (venue, symbol) in VENUES {
-        let test = NodeLaunch::try_parse_from(venue, arguments("TEST", symbol))?;
         let live = NodeLaunch::try_parse_from(venue, arguments("LIVE", symbol))?;
 
-        assert_eq!(test.binding().venue, venue);
-        assert_eq!(test.binding().mode, GatewayMode::Test);
         assert_eq!(live.binding().venue, venue);
         assert_eq!(live.binding().mode, GatewayMode::Live);
-        assert_ne!(test.artifacts_root(), live.artifacts_root());
-        assert!(test.artifacts_root().ends_with(Path::new(ACCOUNT)));
         assert!(live.artifacts_root().ends_with(Path::new(ACCOUNT)));
 
-        for invalid in ["test", "live", "SHADOW", " LIVE "] {
+        for invalid in ["TEST", "test", "live", "SHADOW", " LIVE "] {
             assert!(NodeLaunch::try_parse_from(venue, arguments(invalid, symbol)).is_err());
         }
     }

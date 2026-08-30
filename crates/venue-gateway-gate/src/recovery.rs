@@ -1316,7 +1316,7 @@ pub enum GateFreshRecoveryError {
     SymbolScope,
     #[error("Gate recovery Owner route is invalid, duplicated, or outside the symbol universe")]
     OwnerRoute,
-    #[error("Gate recovery endpoint does not match the selected TEST/LIVE mode")]
+    #[error("Gate recovery endpoint does not match LIVE")]
     Endpoint,
     #[error("Gate recovery fill cursor is inconsistent with the frozen scope")]
     Cursor,
@@ -1510,10 +1510,10 @@ mod tests {
     #[test]
     fn production_collector_rejects_caller_reported_session_generation_and_universe()
     -> Result<(), Box<dyn std::error::Error>> {
-        let symbol = symbol_scope(GatewayMode::Test, "DOGE/USDT", "DOGE_USDT", 7, None)?;
+        let symbol = symbol_scope(GatewayMode::Live, "DOGE/USDT", "DOGE_USDT", 7, None)?;
         assert!(matches!(
             GateFreshRecoveryCollector::start(
-                start(GatewayMode::Test, 1, 4, 9, 55)?,
+                start(GatewayMode::Live, 1, 4, 9, 55)?,
                 [symbol],
                 std::iter::empty::<GateRecoveryOwnerRoute>(),
             ),
@@ -1525,7 +1525,7 @@ mod tests {
     #[test]
     fn authenticated_start_derives_attempt_universe_and_unbound_roots_from_session()
     -> Result<(), Box<dyn std::error::Error>> {
-        let symbol = symbol_scope(GatewayMode::Test, "DOGE/USDT", "DOGE_USDT", 7, None)?;
+        let symbol = symbol_scope(GatewayMode::Live, "DOGE/USDT", "DOGE_USDT", 7, None)?;
         let limits = crate::GateTransportLimits::new(Duration::from_secs(2), 16 * 1024)?;
         let credentials = GateCredentials::from_values("key", "secret")?;
         let lease = crate::GateAuthenticatedRecoverySessionLease::issue(
@@ -1553,38 +1553,27 @@ mod tests {
     }
 
     #[test]
-    fn collection_start_binds_exact_test_and_live_endpoints()
-    -> Result<(), Box<dyn std::error::Error>> {
-        for (mode, rest, websocket) in [
-            (
-                GatewayMode::Test,
-                "https://api-testnet.gateapi.io/api/v4",
-                "wss://ws-testnet.gate.com/v4/ws/futures/usdt",
-            ),
-            (
-                GatewayMode::Live,
-                "https://api.gateio.ws/api/v4",
-                "wss://fx-ws.gateio.ws/v4/ws/usdt",
-            ),
-        ] {
-            let symbol = symbol_scope(mode, "DOGE/USDT", "DOGE_USDT", 7, None)?;
-            let collector = GateFreshRecoveryCollector::start_fixture(
-                start(mode, 1, 4, 9, 55)?,
-                [symbol.clone()],
-                [],
-            )?;
-            assert_eq!(collector.scope().mode(), mode);
-            assert_eq!(collector.scope().rest_origin(), rest);
-            assert_eq!(collector.scope().private_ws_endpoint(), websocket);
-            assert_eq!(collector.scope().private_generation(), 10);
-            let prepared = collector.prepare_read(
-                &"DOGE/USDT".parse()?,
-                GatePrivateReadSource::Account,
-                GateFillsCursor::default(),
-            )?;
-            assert!(prepared.rest_url().starts_with(rest));
-            assert_eq!(prepared.symbol(), &"DOGE/USDT".parse()?);
-        }
+    fn collection_start_binds_exact_live_endpoints() -> Result<(), Box<dyn std::error::Error>> {
+        let mode = GatewayMode::Live;
+        let rest = "https://api.gateio.ws/api/v4";
+        let websocket = "wss://fx-ws.gateio.ws/v4/ws/usdt";
+        let symbol = symbol_scope(mode, "DOGE/USDT", "DOGE_USDT", 7, None)?;
+        let collector = GateFreshRecoveryCollector::start_fixture(
+            start(mode, 1, 4, 9, 55)?,
+            [symbol.clone()],
+            [],
+        )?;
+        assert_eq!(collector.scope().mode(), mode);
+        assert_eq!(collector.scope().rest_origin(), rest);
+        assert_eq!(collector.scope().private_ws_endpoint(), websocket);
+        assert_eq!(collector.scope().private_generation(), 10);
+        let prepared = collector.prepare_read(
+            &"DOGE/USDT".parse()?,
+            GatePrivateReadSource::Account,
+            GateFillsCursor::default(),
+        )?;
+        assert!(prepared.rest_url().starts_with(rest));
+        assert_eq!(prepared.symbol(), &"DOGE/USDT".parse()?);
         Ok(())
     }
 
@@ -1592,7 +1581,7 @@ mod tests {
     fn complete_attempt_emits_six_raw_commitments_and_structured_unknown_owner()
     -> Result<(), Box<dyn std::error::Error>> {
         let symbol = symbol_scope(
-            GatewayMode::Test,
+            GatewayMode::Live,
             "DOGE/USDT",
             "DOGE_USDT",
             7,
@@ -1600,7 +1589,7 @@ mod tests {
         )?;
         let route = owner_route("DOGE/USDT", "hgo_e7_long_open_l1", "9001")?;
         let collector = GateFreshRecoveryCollector::start_fixture(
-            start(GatewayMode::Test, 1, 4, 9, 55)?,
+            start(GatewayMode::Live, 1, 4, 9, 55)?,
             [symbol.clone()],
             [route],
         )?;
@@ -1681,11 +1670,11 @@ mod tests {
 
     #[test]
     fn missing_face_and_missing_symbol_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
-        let doge = symbol_scope(GatewayMode::Test, "DOGE/USDT", "DOGE_USDT", 7, None)?;
-        let btc = symbol_scope(GatewayMode::Test, "BTC/USDT", "BTC_USDT", 8, None)?;
+        let doge = symbol_scope(GatewayMode::Live, "DOGE/USDT", "DOGE_USDT", 7, None)?;
+        let btc = symbol_scope(GatewayMode::Live, "BTC/USDT", "BTC_USDT", 8, None)?;
 
         let collector = GateFreshRecoveryCollector::start_fixture(
-            start(GatewayMode::Test, 1, 4, 9, 55)?,
+            start(GatewayMode::Live, 1, 4, 9, 55)?,
             [doge.clone()],
             [],
         )?;
@@ -1699,7 +1688,7 @@ mod tests {
         ));
 
         let collector = GateFreshRecoveryCollector::start_fixture(
-            start(GatewayMode::Test, 1, 4, 9, 55)?,
+            start(GatewayMode::Live, 1, 4, 9, 55)?,
             [doge.clone(), btc],
             [],
         )?;
@@ -1714,10 +1703,10 @@ mod tests {
     #[test]
     fn account_raw_fork_across_symbol_universe_is_rejected()
     -> Result<(), Box<dyn std::error::Error>> {
-        let doge = symbol_scope(GatewayMode::Test, "DOGE/USDT", "DOGE_USDT", 7, None)?;
-        let btc = symbol_scope(GatewayMode::Test, "BTC/USDT", "BTC_USDT", 8, None)?;
+        let doge = symbol_scope(GatewayMode::Live, "DOGE/USDT", "DOGE_USDT", 7, None)?;
+        let btc = symbol_scope(GatewayMode::Live, "BTC/USDT", "BTC_USDT", 8, None)?;
         let collector = GateFreshRecoveryCollector::start_fixture(
-            start(GatewayMode::Test, 1, 4, 9, 55)?,
+            start(GatewayMode::Live, 1, 4, 9, 55)?,
             [doge.clone(), btc.clone()],
             [],
         )?;
@@ -1735,10 +1724,10 @@ mod tests {
     #[test]
     fn wrong_native_owner_identity_stays_structured_unknown()
     -> Result<(), Box<dyn std::error::Error>> {
-        let symbol = symbol_scope(GatewayMode::Test, "DOGE/USDT", "DOGE_USDT", 7, None)?;
+        let symbol = symbol_scope(GatewayMode::Live, "DOGE/USDT", "DOGE_USDT", 7, None)?;
         let route = owner_route("DOGE/USDT", "hgo_e7_long_open_l1", "9999")?;
         let collector = GateFreshRecoveryCollector::start_fixture(
-            start(GatewayMode::Test, 1, 4, 9, 55)?,
+            start(GatewayMode::Live, 1, 4, 9, 55)?,
             [symbol.clone()],
             [route],
         )?;
@@ -1765,9 +1754,9 @@ mod tests {
     #[test]
     fn expired_or_cross_generation_root_scope_cannot_relabel_old_raw()
     -> Result<(), Box<dyn std::error::Error>> {
-        let symbol = symbol_scope(GatewayMode::Test, "DOGE/USDT", "DOGE_USDT", 7, None)?;
+        let symbol = symbol_scope(GatewayMode::Live, "DOGE/USDT", "DOGE_USDT", 7, None)?;
         let expired = GateFreshRecoveryCollector::start_fixture(
-            start(GatewayMode::Test, 1, 4, 9, 55)?,
+            start(GatewayMode::Live, 1, 4, 9, 55)?,
             [symbol.clone()],
             [],
         )?;
@@ -1779,14 +1768,14 @@ mod tests {
         ));
 
         let old = GateFreshRecoveryCollector::start_fixture(
-            start(GatewayMode::Test, 1, 4, 9, 55)?,
+            start(GatewayMode::Live, 1, 4, 9, 55)?,
             [symbol.clone()],
             [],
         )?;
         let old_responses = complete_for_symbol(&old, &symbol, empty_payloads("DOGE_USDT"))?;
         let old_scope = *old.scope().commitment_sha256();
         let new = GateFreshRecoveryCollector::start_fixture(
-            start(GatewayMode::Test, 9, 5, 10, 56)?,
+            start(GatewayMode::Live, 9, 5, 10, 56)?,
             [symbol],
             [],
         )?;

@@ -777,16 +777,6 @@ impl BitgetHttpTransport {
                 headers.get(name).ok_or(BitgetTransportError::Signing)?,
             );
         }
-        if self.config.paper_trading() {
-            builder = builder.header(
-                "paptrading",
-                headers
-                    .get("paptrading")
-                    .ok_or(BitgetTransportError::Binding)?,
-            );
-        } else if headers.get("paptrading").is_some() {
-            return Err(BitgetTransportError::Binding);
-        }
         let mut response = builder.send().await.map_err(map_reqwest)?;
         if !response.status().is_success() {
             return Err(BitgetTransportError::HttpStatus);
@@ -885,7 +875,7 @@ pub enum BitgetTransportError {
     #[error("Bitget transport clock is invalid")]
     Clock,
     #[error(
-        "Bitget authenticated recovery session is revoked, expired, cross-generation, outside its frozen universe, or not bound to the exact TEST/LIVE endpoint"
+        "Bitget authenticated recovery session is revoked, expired, cross-generation, outside its frozen universe, or not bound to the exact LIVE endpoint"
     )]
     RecoverySession,
 }
@@ -992,7 +982,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_request_never_carries_demo_header() -> Result<(), Box<dyn std::error::Error>> {
+    async fn live_request_uses_only_standard_authenticated_headers()
+    -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}", listener.local_addr()?);
         let server = tokio::spawn(async move {
@@ -1000,7 +991,9 @@ mod tests {
             let mut buffer = vec![0_u8; 8192];
             let length = socket.read(&mut buffer).await?;
             let request = String::from_utf8_lossy(&buffer[..length]).to_ascii_lowercase();
-            assert!(!request.contains("paptrading:"));
+            assert!(request.contains("access-key: key"));
+            assert!(request.contains("access-sign:"));
+            assert!(!request.contains("paptrading"));
             let body = r#"{"code":"00000","requestTime":1,"data":{"orderId":"123","clientOid":"venue_1"}}"#;
             socket
                 .write_all(
@@ -1043,7 +1036,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn demo_collects_five_same_generation_faces_without_live_header_leakage()
+    async fn live_collects_five_same_generation_faces_from_loopback_fixture()
     -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}", listener.local_addr()?);
@@ -1053,8 +1046,6 @@ mod tests {
                 let mut buffer = vec![0_u8; 8192];
                 let length = socket.read(&mut buffer).await?;
                 let request = String::from_utf8_lossy(&buffer[..length]);
-                let lower = request.to_ascii_lowercase();
-                assert!(lower.contains("paptrading: 1"));
                 let body = if request.contains(endpoints::BALANCES) {
                     r#"{"code":"00000","data":{"imr":"0","mmr":"0","assets":[{"coin":"USDT","balance":"20","available":"20"}]}}"#
                 } else if request.contains(endpoints::ACCOUNT_SETTINGS) {
@@ -1081,8 +1072,8 @@ mod tests {
             }
             Ok::<_, std::io::Error>(())
         });
-        let binding = binding(GatewayMode::Test)?;
-        let config = BitgetConfig::for_mode(GatewayMode::Test);
+        let binding = binding(GatewayMode::Live)?;
+        let config = BitgetConfig::for_mode(GatewayMode::Live);
         let transport =
             BitgetHttpTransport::with_endpoint(binding, 7, config, endpoint, limits(500)?)?;
         let candidate = transport
@@ -1129,11 +1120,10 @@ mod tests {
                     || !lower.contains("access-sign:")
                     || !lower.contains("access-timestamp:")
                     || !lower.contains("access-passphrase: pass")
-                    || !lower.contains("paptrading: 1")
                     || request.contains("ETHUSDT")
                 {
                     return Err(std::io::Error::other(
-                        "recovery GET was unsigned, not Demo-scoped, or crossed symbols",
+                        "recovery GET was unsigned or crossed symbols",
                     ));
                 }
                 let body = recovery_body(&request)?;
@@ -1197,17 +1187,17 @@ mod tests {
         let account_id = "00000000-0000-4000-8000-000000000021";
         let first_binding = GatewayBinding::new(
             VenueId::Bitget,
-            GatewayMode::Test,
+            GatewayMode::Live,
             account_id,
             "BTC/USDT".parse()?,
         )?;
         let second_binding = GatewayBinding::new(
             VenueId::Bitget,
-            GatewayMode::Test,
+            GatewayMode::Live,
             account_id,
             "ETH/USDT".parse()?,
         )?;
-        let config = BitgetConfig::for_mode(GatewayMode::Test);
+        let config = BitgetConfig::for_mode(GatewayMode::Live);
         let credentials = BitgetCredentials::from_values("key", "secret", "pass")?;
         let transport_limits = limits(1_000)?;
         let (stream, _) = tokio_tungstenite::connect_async(&ws_endpoint).await?;
@@ -1295,7 +1285,7 @@ mod tests {
     #[test]
     fn fill_cursor_keeps_one_effective_window_across_pages()
     -> Result<(), Box<dyn std::error::Error>> {
-        let binding = binding(GatewayMode::Test)?;
+        let binding = binding(GatewayMode::Live)?;
         let first = build_fills_read_request(&binding, 9, 7, 0, None, Some(10), 100)?;
         let second = build_fills_read_request(&binding, 9, 7, 1, Some("next"), Some(10), 100)?;
         assert_eq!(first.fill_history_start_ms, second.fill_history_start_ms);

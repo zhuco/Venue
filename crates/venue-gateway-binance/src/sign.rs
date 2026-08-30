@@ -223,7 +223,7 @@ mod tests {
     #[test]
     fn signing_percent_encodes_exact_bytes_and_preserves_parameter_order()
     -> Result<(), Box<dyn std::error::Error>> {
-        let binding = binding(GatewayMode::Test)?;
+        let binding = binding(GatewayMode::Live)?;
         let config =
             BinanceConfig::for_binding(BinanceAccountBinding::PortfolioMarginUm, &binding)?;
         let credentials = BinanceCredentials::from_values("key", "secret")?;
@@ -262,12 +262,6 @@ mod tests {
             "00000000-0000-4000-8000-000000000002",
             "LTC/BTC".parse()?,
         )?;
-        let other_mode = GatewayBinding::new(
-            VenueId::Binance,
-            GatewayMode::Test,
-            "00000000-0000-4000-8000-000000000001",
-            "LTC/BTC".parse()?,
-        )?;
         let other_symbol = GatewayBinding::new(
             VenueId::Binance,
             GatewayMode::Live,
@@ -278,14 +272,6 @@ mod tests {
         for (scope, path, parameters, recv_window_ms, timestamp_ms, expected) in [
             (
                 &other_account,
-                "/papi/v1/um/order",
-                &[][..],
-                5_000,
-                1,
-                BinanceAuthError::Binding,
-            ),
-            (
-                &other_mode,
                 "/papi/v1/um/order",
                 &[][..],
                 5_000,

@@ -7,13 +7,11 @@
 本文是多策略、多交易所实盘和对冲网格的唯一长期开发契约，说明当前采用的架构、边界、成交热路径、恢复规则、迁移顺序与验收要求。
 
 [`ARCHITECTURE.md`](ARCHITECTURE.md) 定义合并跟单、六交易所网关、指标和桌面 UI 后的目标 workspace。六所是网关目标覆盖，
-网关只有 `TEST | LIVE` 两种模式，允许最小安全闭环后早期小额 LIVE 调试；这不自动扩大当前 Stage 7 网格的三所实盘准入，新增交易所仍必须独立完成策略、恢复和接管验收。
+网关只接受精确 `LIVE` 并只使用生产 endpoint；这不自动扩大当前 Stage 7 网格的三所实盘准入，新增交易所仍必须独立完成策略、恢复和接管验收。
 本文现有 Shadow/verify 是策略与工件证据流程，不是第三种网关运行模式。
 
 `CODEMAP.md` 只负责定位代码。事故时间线、已完成阶段、临时发布号和一次性排障记录不得继续写入长期文档。
 
-目标交易所模式已改为只允许精确 `LIVE`。本文出现的 `TEST | LIVE` 或 TEST Node/Copy 是等待
-[`REFACTOR_IMPLEMENTATION_GOALS.md`](REFACTOR_IMPLEMENTATION_GOALS.md) Goal 0 删除的当前兼容状态，不构成后续设计选项；
 离线 fixture、mock 与数据库集成测试保留，但不得成为交易所运行模式或连接真实交易所。
 
 当前选择的架构不是功能最多的方案，而是最适合“主要由一个人使用、需要多个交易所和同账户多个交易对、不要反复重构”的方案：
@@ -34,9 +32,8 @@ writer 或物理交易客户端。`legacy_stage7_strategy_binding` 只转换单�
 迁移完成前，现有 Stage 7 仍是唯一实盘 writer；不得同时为同一账户启动账户内核的新物理执行路径。
 通用 `CommandJournal`、writer lease 与账户级 canonical-root fence 固定在 `venue-execution`；`DurableOwnerRoutes` 独占并重放同一 CommandJournal，以 family + native identity 生成精确 cancel route，不增加第二本 journal 或 mutation authority。原 JSONL serde/hash、writer schema、fsync、调用方工件路径及机器级 `stage7_writer_roots/v2` 路径保持不变。`venue-storage` 的单一 `DurableJsonl` 同时支撑 facts 与 opaque Control journal，append 在排他锁内核对耐久长度并同步文件/父目录；旧进程、坏尾、空行、hash/状态迁移分叉均失败关闭。Stage 7 继续经根 facade 使用原实现。
 六所 adapter 均已补齐绑定型 async HTTP/私有 WS、订单族/持仓/成交证据、单次 mutation 候选及 ACK 后只读收敛；Bybit、OKX、Hyperliquid 另有可持久化 probe 候选。部分固定 `run()` 只实例化 inert candidate 做隔离/失败关闭预检；没有 fixed binary 构造 `TokioPhysicalGateway` 或把候选接入 `NodeSafetyHost`/dispatch，静态 capability、Node writer 与 WAL 均未因此开启。
-`apps/venue-node` 已提供六个逐 adapter 固定产物：Binance、Gate.io、Bitget 仅在精确 `LIVE` 下委托现有 Stage 7
-部署入口并继续使用原 Owner/WAL/writer/reconciliation/Canary 契约；旧物理 client 不支持 `TEST`，因此对应节点
-明确失败关闭而不回退到生产 endpoint。Bybit、OKX、Hyperliquid 节点只验证 secret-free binding、adapter endpoint、
+`apps/venue-node` 已提供六个逐 adapter 固定产物：Binance、Gate.io、Bitget 在精确 `LIVE` 下委托现有 Stage 7
+部署入口并继续使用原 Owner/WAL/writer/reconciliation/Canary 契约；非 LIVE 输入在 endpoint、凭证和工件初始化前拒绝。Bybit、OKX、Hyperliquid 节点只验证 secret-free binding、adapter endpoint、
 凭证环境变量命名空间与隔离 artifact root。Hyperliquid 固定使用 `HYPERLIQUID_ACCOUNT_ADDRESS`、`HYPERLIQUID_API_WALLET_ADDRESS`、`HYPERLIQUID_API_WALLET_PRIVATE_KEY` 三项必填及 `HYPERLIQUID_VAULT_ADDRESS` 可选；普通账户的读取/交易地址由 account 得出，Vault/Subaccount 模式由可选地址存在得出。API Wallet 地址必须由私钥推导一致，禁止额外 `is_vault` 开关、Agent 名称或重复 user/master 地址造成矛盾配置。`safe_host` 与 `supervision` 仍维护 root/WAL/Owner/writer metadata、独立 control log、一次性 permit 与 UNKNOWN 禁重投。共享层已有耐久 Owner/native identity、六面物理恢复值类型、`ProvenAbsent`、bounded loopback Control polling、单 runtime async 与 host capability 候选契约。Binance、Gate.io、Bitget 已新增生产可达但非 authority 的 authenticated 只读 collection session：冻结凭证、endpoint、generation、完整 symbol/cursor/订单族请求面、deadline 与全局 pages/bytes，逐 HTTP await 重验并拒绝 caller Owner/root；Bitget 最终六面 fold 仍关闭，三所 candidate 均不携带 capability、writer、WAL 或 permit。普通调用方的 capability promotion/authorize 已固定失败关闭，不能再用自组 receipt 升级；runtime 也已用私有 issuer seal 签发绑定完整账户 universe 与五类耐久 root 的恢复 session，并在 await/refresh/install 重验。生产仍缺三所 collector 到 runtime durable universe/root 的桥接、Bitget final fold、Bybit/OKX/Hyperliquid authenticated collector、耐久 replay refresh adapter 与真实 host promotion verifier，因此 physical installer、Ready、Actor turn、host admission 和 async mutation统一失败关闭；Prepared 在 admission 失败时耐久 Rejected，物理调用为零。Bybit、OKX、Hyperliquid 的 mutation builder、签名、POST 与 dispatch 仅在 `cfg(test)`，不能由 feature 在生产构建复活。
 Stage 7 成交热路径不得遍历历史命令 WAL。命令 journal 在启动重放时建立未决命令、撤单目标和交易所订单 ID 的派生内存索引；滚动补撤批次以原 JSONL 格式一次 fsync 持久化 Prepared/Submitted 状态，再并行提交物理请求。接管只可在签名全订单族为空、零未决且零本地事务后显式按源 SHA 封存已解析 WAL；原件留在同 root，活动 WAL 从空文件继续，禁止运行中轮转或删除审计源。
 
@@ -452,10 +449,10 @@ Gate、Bitget 当前 profile 只允许常规订单族，条件/Algo 由同一 pr
 ### E. 控制端
 
 本地 Control API 使用 `venue-control-protocol` schema v2；原生 VenueFlow 与 WebAssembly canvas 共用
-`/v2/ui/snapshot`、`/v2/ui/events`、`/v2/control/commands`。策略投影和命令必须携带精确 `TEST | LIVE`，两端只调用 API，不读取数据库、WAL 或 artifacts，
+`/v2/ui/snapshot`、`/v2/ui/events`、`/v2/control/commands`。策略投影和命令必须携带精确 `LIVE`，两端只调用 API，不读取数据库、WAL 或 artifacts，
 不持有凭证，不直连交易所，不直接下单。Stop/Flatten 必须显示并提交精确 mode、account、symbol、instance、config epoch、action 与人工确认；
 `apps/venue-control` 提供 transport-neutral schema 重验、幂等 repository、PostgreSQL durable inbox/outbox/claim/terminal receipt，
-以及仅限本地的 HTTP/SSE `/v2` 适配层；bounded Node claim/ACK/receipt 路由和 PostgreSQL fencing delivery lease 均绑定精确 instance/config epoch，ACK 只表示节点 inbox 已耐久，Unknown 只能由下一序号只读 reconciliation claim 收敛，重复 receipt 必须幂等且冲突失败关闭。Node 已接入唯一 `OpaqueJournal` storage adapter 与 bounded loopback HTTP polling client；claim、ACK、receipt 每次 await 后都以当前时钟重验 lease/session/epoch，ACK 绑定完整 inbox replay root/sequence/node，过期 outbox 不确认或重放。`venue-storage::ActorAppliedStore` 已提供 anchored journal/checkpoint durability receipt，能拒绝缺件、旧副本与回退；该 receipt 仍只证明调用方声明已耐久，尚未由 runtime 以规范 Actor/Owner 与真实 WAL head 接线，因此生产 Applied 继续返回 `ActorAppliedUnavailable`。TEST-only Copy worker 可原子持久化冻结资本、语义 job、delivery/receipt、ledger 与崩溃恢复，LIVE 在数据库访问前失败关闭；数据库 lease、claim 或 Control receipt 均不授予 mutation authority。
+以及仅限本地的 HTTP/SSE `/v2` 适配层；bounded Node claim/ACK/receipt 路由和 PostgreSQL fencing delivery lease 均绑定精确 instance/config epoch，ACK 只表示节点 inbox 已耐久，Unknown 只能由下一序号只读 reconciliation claim 收敛，重复 receipt 必须幂等且冲突失败关闭。Node 已接入唯一 `OpaqueJournal` storage adapter 与 bounded loopback HTTP polling client；claim、ACK、receipt 每次 await 后都以当前时钟重验 lease/session/epoch，ACK 绑定完整 inbox replay root/sequence/node，过期 outbox 不确认或重放。`venue-storage::ActorAppliedStore` 已提供 anchored journal/checkpoint durability receipt，能拒绝缺件、旧副本与回退；该 receipt 仍只证明调用方声明已耐久，尚未由 runtime 以规范 Actor/Owner 与真实 WAL head 接线，因此生产 Applied 继续返回 `ActorAppliedUnavailable`。LIVE-only Copy worker 可原子持久化冻结资本、语义 job、delivery/receipt、ledger 与崩溃恢复，但数据库 lease、claim 或 Control receipt 均不授予 mutation authority。
 
 ## 12. 验收标准
 
@@ -481,7 +478,7 @@ cargo test
 - Stop 只撤目标实例订单且默认不主动平仓；残仓时保留 symbol custody；
 - 开仓订单全部满足实时最小名义价值；
 - 三个交易所 adapter 通过相同 runtime/reducer 契约测试。
-- `scripts/verify_gateway_candidate_contract.ps1` 通过六个隔离 binary、TEST/LIVE root 和缺证据零工件探针；矩阵中的 `not_reached` 与 `writer_enabled=false` 必须原样保留，不能当作 Canary 或实盘准入。
+- `scripts/verify_gateway_candidate_contract.ps1` 通过六个隔离 LIVE binary、非生产模式前置拒绝和缺证据零工件探针；矩阵中的 `not_reached` 与 `writer_enabled=false` 必须原样保留，不能当作 Canary 或实盘准入。
 - 取证恢复证明原文件不改写、规范序列不重编号、quarantine 无遗漏/重叠、派生前缀 append-only；源文件、manifest、派生前缀、binding/root 或 crash residue 任一变化使全部 Stage 7 入口失败关闭，Shadow 仍为零写。
 
 账户内核自身还必须覆盖：跨策略族的同 symbol 注册失败；已持久私有 Order/Fill 只能按 family + Client Order ID 或
@@ -502,7 +499,8 @@ Pause 不被重连清除，NeedsAttention 不被普通控制绕过；Stop 只凭
 - 多用户、多租户和付费权限系统；
 - 跨机器分布式撮合或复杂服务网格；
 - 策略插件市场和公共 SDK；
-- Web 面板或 Windows UI；
+- 在网格/账户 Runtime 任务内实现 Web 面板或 Windows UI；独立 VenueFlow 任务可开发无凭证公共行情和 Control 客户端，
+  但不得进入成交热路径或持有账户、私流、writer、WAL 与 mutation；
 - 为未来功能预建未被当前任务使用的模块；
 - 让 `bak/` 参与构建、运行或持久化。
 

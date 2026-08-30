@@ -1415,7 +1415,7 @@ fn scope_precredential_bytes(
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
     append_bytes(&mut bytes, RECOVERY_SCOPE_SCHEMA);
-    append_bytes(&mut bytes, &[mode_tag(binding.mode)]);
+    append_bytes(&mut bytes, &[live_mode_tag()]);
     append_str(&mut bytes, &binding.trading_account_id);
     append_str(&mut bytes, rest_endpoint);
     append_str(&mut bytes, private_endpoint);
@@ -1467,11 +1467,8 @@ const fn recovery_bounds_valid(symbol_count: usize, bound_at_ms: u64, deadline_a
         && deadline_at_ms.saturating_sub(bound_at_ms) <= BYBIT_RECOVERY_MAX_DEADLINE_MS
 }
 
-const fn mode_tag(mode: GatewayMode) -> u8 {
-    match mode {
-        GatewayMode::Test => 1,
-        GatewayMode::Live => 2,
-    }
+const fn live_mode_tag() -> u8 {
+    2
 }
 
 const fn surface_tag(surface: BybitRecoverySurface) -> u8 {
@@ -1625,7 +1622,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let gateway_binding = GatewayBinding::new(
             VenueId::Bybit,
-            GatewayMode::Test,
+            GatewayMode::Live,
             "00000000-0000-4000-8000-000000000001",
             "BTC/USDT".parse()?,
         )?;

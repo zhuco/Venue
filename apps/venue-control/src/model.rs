@@ -11,8 +11,11 @@ pub struct AccountNodeBinding {
 
 impl AccountNodeBinding {
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
-        if self.trading_account_id.trim().is_empty() {
-            return Err("account node binding is missing a trading account id");
+        if self.mode != GatewayMode::Live {
+            return Err("account node binding mode must be exactly LIVE");
+        }
+        if !venue_domain::is_canonical_trading_account_id(&self.trading_account_id) {
+            return Err("account node binding trading account id is not canonical");
         }
         Ok(())
     }

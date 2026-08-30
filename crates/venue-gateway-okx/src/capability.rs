@@ -1007,7 +1007,7 @@ mod tests {
     #[test]
     fn complete_durable_probe_forms_only_a_non_authoritative_candidate()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (config, instrument, evidence) = fixture(GatewayMode::Test)?;
+        let (config, instrument, evidence) = fixture(GatewayMode::Live)?;
         let (persisted, directory) = persist_fixture("probe.json", &evidence)?;
         let candidate =
             validate_capability_candidate(&config, &instrument, &persisted, BASE_MS + 1_000)?;
@@ -1074,7 +1074,7 @@ mod tests {
     #[test]
     fn legacy_probe_cannot_create_a_production_physical_candidate()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (config, instrument, evidence) = fixture(GatewayMode::Test)?;
+        let (config, instrument, evidence) = fixture(GatewayMode::Live)?;
         let (persisted, directory) = persist_fixture("legacy-physical.json", &evidence)?;
         assert!(matches!(
             crate::OkxPhysicalCandidate::from_probe(
@@ -1093,7 +1093,7 @@ mod tests {
     #[test]
     fn net_mode_is_complete_read_side_only_and_cannot_authorize_mutation()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (config, instrument, mut evidence) = fixture(GatewayMode::Test)?;
+        let (config, instrument, mut evidence) = fixture(GatewayMode::Live)?;
         evidence.scope.position_mode = OkxPositionMode::Net;
         let net_scope = OkxPrivateReadScope::new(
             &config,
@@ -1165,61 +1165,58 @@ mod tests {
     }
 
     #[test]
-    fn physical_candidate_prepares_test_and_live_place_cancel_and_reduce_once()
+    fn physical_candidate_prepares_live_place_cancel_and_reduce_once()
     -> Result<(), Box<dyn std::error::Error>> {
-        for mode in [GatewayMode::Test, GatewayMode::Live] {
-            let (config, instrument, mut evidence) = fixture(mode)?;
-            let position_page = evidence
-                .private_pages
-                .iter_mut()
-                .find(|page| page.surface == crate::OkxPrivateSurface::Positions)
-                .ok_or("missing position page")?;
-            let mut positions: Value = serde_json::from_slice(&position_page.payload)?;
-            positions["data"][0]["pos"] = Value::String("1".to_owned());
-            positions["data"][0]["avgPx"] = Value::String("59000".to_owned());
-            positions["data"][0]["markPx"] = Value::String("60000".to_owned());
-            position_page.payload = serde_json::to_vec(&positions)?;
-            position_page.payload_sha256 = crate::readback::payload_digest(&position_page.payload);
-            let (persisted, directory) = persist_fixture("physical.json", &evidence)?;
-            let candidate = crate::OkxPhysicalCandidate::from_probe_fixture(
-                config.clone(),
-                instrument.clone(),
-                &persisted,
-                BASE_MS + 1_000,
-            )?;
-            assert_eq!(candidate.binding().mode, mode);
-            assert!(
-                candidate
-                    .prepare_place_once(
-                        &ExecutionCommand::PlaceLimit(evidence.mutations.place.clone()),
-                        BASE_MS + 1_000,
-                    )
-                    .is_ok()
-            );
-            assert!(
-                candidate
-                    .prepare_place_once(
-                        &ExecutionCommand::MarketReduce(evidence.mutations.reduce.clone()),
-                        BASE_MS + 1_000,
-                    )
-                    .is_ok()
-            );
-            let place_request = build_place_request(
-                &config,
-                &instrument,
-                &candidate.readback().profile,
-                evidence.scope.trade_mode,
-                OkxPlaceIntent::Limit(&evidence.mutations.place),
-            )?;
-            let accepted =
-                parse_place_ack(evidence.mutations.place_ack.response()?, &place_request)?;
-            assert!(
-                candidate
-                    .prepare_cancel_once(&evidence.mutations.cancel, &accepted, BASE_MS + 1_000,)
-                    .is_ok()
-            );
-            fs::remove_dir_all(directory)?;
-        }
+        let (config, instrument, mut evidence) = fixture(GatewayMode::Live)?;
+        let position_page = evidence
+            .private_pages
+            .iter_mut()
+            .find(|page| page.surface == crate::OkxPrivateSurface::Positions)
+            .ok_or("missing position page")?;
+        let mut positions: Value = serde_json::from_slice(&position_page.payload)?;
+        positions["data"][0]["pos"] = Value::String("1".to_owned());
+        positions["data"][0]["avgPx"] = Value::String("59000".to_owned());
+        positions["data"][0]["markPx"] = Value::String("60000".to_owned());
+        position_page.payload = serde_json::to_vec(&positions)?;
+        position_page.payload_sha256 = crate::readback::payload_digest(&position_page.payload);
+        let (persisted, directory) = persist_fixture("physical.json", &evidence)?;
+        let candidate = crate::OkxPhysicalCandidate::from_probe_fixture(
+            config.clone(),
+            instrument.clone(),
+            &persisted,
+            BASE_MS + 1_000,
+        )?;
+        assert_eq!(candidate.binding().mode, GatewayMode::Live);
+        assert!(
+            candidate
+                .prepare_place_once(
+                    &ExecutionCommand::PlaceLimit(evidence.mutations.place.clone()),
+                    BASE_MS + 1_000,
+                )
+                .is_ok()
+        );
+        assert!(
+            candidate
+                .prepare_place_once(
+                    &ExecutionCommand::MarketReduce(evidence.mutations.reduce.clone()),
+                    BASE_MS + 1_000,
+                )
+                .is_ok()
+        );
+        let place_request = build_place_request(
+            &config,
+            &instrument,
+            &candidate.readback().profile,
+            evidence.scope.trade_mode,
+            OkxPlaceIntent::Limit(&evidence.mutations.place),
+        )?;
+        let accepted = parse_place_ack(evidence.mutations.place_ack.response()?, &place_request)?;
+        assert!(
+            candidate
+                .prepare_cancel_once(&evidence.mutations.cancel, &accepted, BASE_MS + 1_000,)
+                .is_ok()
+        );
+        fs::remove_dir_all(directory)?;
         Ok(())
     }
 
@@ -1262,7 +1259,7 @@ mod tests {
     async fn physical_ack_and_disconnect_both_require_exact_readback_without_resubmission()
     -> Result<(), Box<dyn std::error::Error>> {
         for disconnect_first in [false, true] {
-            let (config, instrument, evidence) = fixture(GatewayMode::Test)?;
+            let (config, instrument, evidence) = fixture(GatewayMode::Live)?;
             let (persisted, directory) = persist_fixture("dispatch.json", &evidence)?;
             let candidate = crate::OkxPhysicalCandidate::from_probe_fixture(
                 config,
@@ -1313,10 +1310,15 @@ mod tests {
     fn mode_generation_disconnect_scope_and_withdrawal_fail_closed()
     -> Result<(), Box<dyn std::error::Error>> {
         let (live, live_instrument, evidence) = fixture(GatewayMode::Live)?;
-        let (test, test_instrument, _) = fixture(GatewayMode::Test)?;
         let (persisted, directory) = persist_fixture("live.json", &evidence)?;
+        let wrong = OkxConfig::for_binding(GatewayBinding::new(
+            VenueId::Okx,
+            GatewayMode::Live,
+            "00000000-0000-4000-8000-000000000001",
+            "ETH/USDT".parse()?,
+        )?)?;
         assert!(
-            validate_capability_candidate(&test, &test_instrument, &persisted, BASE_MS + 1_000)
+            validate_capability_candidate(&wrong, &live_instrument, &persisted, BASE_MS + 1_000)
                 .is_err()
         );
         fs::remove_dir_all(directory)?;
@@ -1372,7 +1374,7 @@ mod tests {
     #[test]
     fn stale_mutation_or_file_tampering_cannot_become_capability()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (config, instrument, mut evidence) = fixture(GatewayMode::Test)?;
+        let (config, instrument, mut evidence) = fixture(GatewayMode::Live)?;
         evidence.mutations.reduce_detail.payload[0] ^= 1;
         let (persisted, directory) = persist_fixture("probe-payload.json", &evidence)?;
         assert!(
@@ -1381,7 +1383,7 @@ mod tests {
         );
         fs::remove_dir_all(directory)?;
 
-        let (_, _, evidence) = fixture(GatewayMode::Test)?;
+        let (_, _, evidence) = fixture(GatewayMode::Live)?;
         let (path, directory) = test_path("probe-file.json")?;
         persist_capability_probe(&path, &evidence)?;
         let mut encoded = fs::read(&path)?;

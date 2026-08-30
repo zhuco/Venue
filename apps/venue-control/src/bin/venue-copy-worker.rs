@@ -1,26 +1,25 @@
-//! PostgreSQL-backed TEST-only copy planner worker. It produces semantic delivery jobs only and
-//! has no gateway, credential, Owner, WAL, writer, reconciliation, or mutation surface.
+//! PostgreSQL-backed semantic Copy planner. It produces LIVE-bound semantic delivery jobs only
+//! and has no gateway, credential, Owner, WAL, writer, reconciliation, or mutation surface.
 
 use std::{env, time::SystemTime};
 
 use sqlx::postgres::PgPoolOptions;
 use venue_control::{
-    CopyObserverScope, CopyTestWorker, CopyTestWorkerConfig, MIGRATION_0001, MIGRATION_0002,
-    MIGRATION_0003, MIGRATION_0004, PgControlRepository,
+    CopyObserverScope, CopyWorker, CopyWorkerConfig, MIGRATION_0001, MIGRATION_0002,
+    MIGRATION_0003, MIGRATION_0004, MIGRATION_0005, PgControlRepository,
 };
 use venue_control_protocol::{GatewayMode, VenueId};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = required("DATABASE_URL")?;
-    let mode = required("VENUE_COPY_MODE")?
-        .parse::<GatewayMode>()
-        .map_err(|_| "VENUE_COPY_MODE must be exactly TEST; LIVE is disabled")?;
+    let mode = parse_live_mode(&required("VENUE_COPY_MODE")?)?;
     let scope = CopyObserverScope {
         observer_id: required("VENUE_COPY_OBSERVER_ID")?,
         venue: required("VENUE_COPY_VENUE")?
             .parse::<VenueId>()
             .map_err(|_| "VENUE_COPY_VENUE is not a supported canonical venue")?,
+        mode,
         trading_account_id: required("VENUE_COPY_TRADING_ACCOUNT_ID")?,
     };
     let worker_id = required("VENUE_COPY_WORKER_ID")?;
@@ -32,9 +31,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sqlx::raw_sql(MIGRATION_0002).execute(&pool).await?;
     sqlx::raw_sql(MIGRATION_0003).execute(&pool).await?;
     sqlx::raw_sql(MIGRATION_0004).execute(&pool).await?;
-    let worker = CopyTestWorker::new(
+    sqlx::raw_sql(MIGRATION_0005).execute(&pool).await?;
+    let worker = CopyWorker::new(
         PgControlRepository::new(pool),
-        CopyTestWorkerConfig {
+        CopyWorkerConfig {
             mode,
             scope,
             worker_id,
@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let recovered_at = unix_time_ms()?;
     let recovered = worker.recover(recovered_at).await?;
     println!(
-        "copy TEST worker recovered cursor={} jobs={} ledger_entries={}",
+        "copy worker recovered cursor={} jobs={} ledger_entries={}",
         recovered.observer_cursor,
         recovered.jobs.len(),
         recovered.ledger_entries.len()
@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = interval.tick() => {
                 if let Some(planned) = worker.plan_next(unix_time_ms()?).await? {
                     println!(
-                        "copy TEST planner committed event={} job={}",
+                        "copy planner committed event={} job={}",
                         planned.observed.event_sequence,
                         planned.job.identities.job_id
                     );
@@ -72,7 +72,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn required(name: &str) -> Result<String, Box<dyn std::error::Error>> {
-    env::var(name).map_err(|_| format!("{name} must be set for the local TEST copy worker").into())
+    env::var(name).map_err(|_| format!("{name} must be set for the local copy worker").into())
+}
+
+fn parse_live_mode(raw: &str) -> Result<GatewayMode, Box<dyn std::error::Error>> {
+    if raw == "LIVE" {
+        Ok(GatewayMode::Live)
+    } else {
+        Err("VENUE_COPY_MODE must be exactly LIVE".into())
+    }
 }
 
 fn unix_time_ms() -> Result<u64, Box<dyn std::error::Error>> {
@@ -80,4 +88,17 @@ fn unix_time_ms() -> Result<u64, Box<dyn std::error::Error>> {
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_millis();
     Ok(u64::try_from(millis)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_mode_parser_accepts_only_the_exact_live_token() {
+        assert_eq!(parse_live_mode("LIVE").ok(), Some(GatewayMode::Live));
+        for raw in ["TEST", "live", " LIVE", "LIVE ", ""] {
+            assert!(parse_live_mode(raw).is_err(), "accepted {raw:?}");
+        }
+    }
 }

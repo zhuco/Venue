@@ -2,7 +2,7 @@ use venue_gateway_api::GatewayMode;
 
 use crate::{GateProtocolError, endpoints};
 
-/// Gate transport origins selected only by the validated TEST/LIVE gateway mode.
+/// Gate transport origins selected only by the validated LIVE gateway mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GateConfig {
     mode: GatewayMode,
@@ -14,11 +14,6 @@ impl GateConfig {
     #[must_use]
     pub const fn for_mode(mode: GatewayMode) -> Self {
         match mode {
-            GatewayMode::Test => Self {
-                mode,
-                rest_origin: "https://api-testnet.gateapi.io/api/v4",
-                usdt_futures_ws: "wss://ws-testnet.gate.com/v4/ws/futures/usdt",
-            },
             GatewayMode::Live => Self {
                 mode,
                 rest_origin: "https://api.gateio.ws/api/v4",
@@ -40,11 +35,6 @@ impl GateConfig {
     #[must_use]
     pub const fn usdt_futures_ws(&self) -> &'static str {
         self.usdt_futures_ws
-    }
-
-    #[must_use]
-    pub const fn testnet(&self) -> bool {
-        matches!(self.mode, GatewayMode::Test)
     }
 
     pub fn rest_url(&self, endpoint: &str) -> Result<String, GateProtocolError> {

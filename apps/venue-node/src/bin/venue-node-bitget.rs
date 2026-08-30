@@ -8,7 +8,7 @@ use std::{
 use clap::Parser;
 use sha2::{Digest, Sha256};
 use venue_domain::domain::{CommandId, FieldState, NativeOrderFamily, OrderOwner, OrderState};
-use venue_gateway_api::{CapabilitySnapshot, GatewayBinding, GatewayMode, VenueId};
+use venue_gateway_api::{CapabilitySnapshot, GatewayBinding, VenueId};
 use venue_gateway_bitget::instrument::BitgetInstrumentRules;
 #[cfg(test)]
 use venue_gateway_bitget::private::{BitgetPrivateGenerationCandidate, BitgetPrivateSurface};
@@ -23,7 +23,7 @@ use venue_node::{
     AdapterIsolation, DispatchPermit, FamilyReadbackCoverage, GatewayAcknowledgement,
     GatewayDispatchResult, GatewayRecoveryPermit, NodeError, NodeLaunch, PhysicalGateway,
     ReadbackCommandState, SignedCommandReadback, SignedOwnedOrder, SignedReadbackReceipt,
-    SignedReadbackRequest, reject_unintegrated_legacy_test_runtime, report_result,
+    SignedReadbackRequest, report_result,
 };
 #[cfg(test)]
 use venue_runtime::account::{
@@ -760,9 +760,6 @@ fn run() -> Result<(), NodeError> {
         account_binding: account_binding.as_str(),
     }
     .validate(launch.binding())?;
-    if launch.binding().mode == GatewayMode::Test {
-        return reject_unintegrated_legacy_test_runtime(VenueId::Bitget);
-    }
     venue::start_hedged_grid_bitget_deployment(cli).map_err(|error| NodeError::ExistingRuntime {
         venue: VenueId::Bitget,
         message: error.to_string(),
@@ -776,7 +773,7 @@ mod tests {
     use venue_domain::domain::{
         ExecutionCommand, OrderCommand, OrderPurpose, OrderSide, PositionSide, Price,
     };
-    use venue_gateway_api::{GatewayApiError, MutationCapability};
+    use venue_gateway_api::{GatewayApiError, GatewayMode, MutationCapability};
     use venue_gateway_bitget::{
         BITGET_ORDER_PROFILE_VERSION, BitgetAckStatus, BitgetOrderFamilyEvidence,
         BitgetOrderFamilyScope, BitgetUnsupportedEvidence,
@@ -1083,21 +1080,19 @@ mod tests {
     }
 
     #[test]
-    fn fixed_wrapper_binds_demo_and_live_but_grants_no_capability()
-    -> Result<(), Box<dyn std::error::Error>> {
-        for mode in [GatewayMode::Test, GatewayMode::Live] {
-            let binding = binding(mode)?;
-            let gateway = BitgetPhysicalGateway::new(binding.clone(), FailClosedBitgetIo);
-            assert_eq!(gateway.config.mode(), mode);
-            assert_eq!(gateway.config.paper_trading(), mode == GatewayMode::Test);
-            assert_eq!(gateway.binding(), &binding);
-            let capability = gateway.capability_snapshot();
-            assert!(capability.flags.is_empty());
-            assert_eq!(
-                capability.authorize(&binding, 1, 1, MutationCapability::PlaceLimit),
-                Err(GatewayApiError::CapabilityScope)
-            );
-        }
+    fn fixed_wrapper_binds_live_but_grants_no_capability() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mode = GatewayMode::Live;
+        let binding = binding(mode)?;
+        let gateway = BitgetPhysicalGateway::new(binding.clone(), FailClosedBitgetIo);
+        assert_eq!(gateway.config.mode(), mode);
+        assert_eq!(gateway.binding(), &binding);
+        let capability = gateway.capability_snapshot();
+        assert!(capability.flags.is_empty());
+        assert_eq!(
+            capability.authorize(&binding, 1, 1, MutationCapability::PlaceLimit),
+            Err(GatewayApiError::CapabilityScope)
+        );
         Ok(())
     }
 
@@ -1136,48 +1131,47 @@ mod tests {
     }
 
     #[test]
-    fn fixture_manifest_maps_demo_and_live_without_granting_capability()
+    fn fixture_manifest_maps_live_without_granting_capability()
     -> Result<(), Box<dyn std::error::Error>> {
-        for mode in [GatewayMode::Test, GatewayMode::Live] {
-            let collected = collected(mode)?;
-            let manifest = fixture_bitget_physical_recovery_manifest(
-                recovery_scope(mode, 1)?,
-                &collected.candidate,
-                &collected.owner_routes,
-            )?;
-            assert_eq!(manifest.scope().binding().mode, mode);
-            assert_eq!(manifest.attempt_id(), 9);
-            assert_eq!(manifest.private_generation(), 9);
+        let mode = GatewayMode::Live;
+        let collected = collected(mode)?;
+        let manifest = fixture_bitget_physical_recovery_manifest(
+            recovery_scope(mode, 1)?,
+            &collected.candidate,
+            &collected.owner_routes,
+        )?;
+        assert_eq!(manifest.scope().binding().mode, mode);
+        assert_eq!(manifest.attempt_id(), 9);
+        assert_eq!(manifest.private_generation(), 9);
+        assert!(matches!(
+            manifest.coverage(PhysicalReadbackSurface::UmOrder),
+            PhysicalReadbackCoverage::Complete {
+                record_count: 0,
+                ..
+            }
+        ));
+        for surface in [
+            PhysicalReadbackSurface::UmConditional,
+            PhysicalReadbackSurface::UmAlgo,
+        ] {
             assert!(matches!(
-                manifest.coverage(PhysicalReadbackSurface::UmOrder),
-                PhysicalReadbackCoverage::Complete {
-                    record_count: 0,
+                manifest.coverage(surface),
+                PhysicalReadbackCoverage::Unsupported {
+                    profile_version: BITGET_ORDER_PROFILE_VERSION,
                     ..
                 }
             ));
-            for surface in [
-                PhysicalReadbackSurface::UmConditional,
-                PhysicalReadbackSurface::UmAlgo,
-            ] {
-                assert!(matches!(
-                    manifest.coverage(surface),
-                    PhysicalReadbackCoverage::Unsupported {
-                        profile_version: BITGET_ORDER_PROFILE_VERSION,
-                        ..
-                    }
-                ));
-            }
-            let gateway = BitgetPhysicalGateway::new(binding(mode)?, FailClosedBitgetIo);
-            assert!(gateway.capability_snapshot().flags.is_empty());
         }
+        let gateway = BitgetPhysicalGateway::new(binding(mode)?, FailClosedBitgetIo);
+        assert!(gateway.capability_snapshot().flags.is_empty());
         Ok(())
     }
 
     #[test]
     fn explicit_empty_account_still_maps_all_six_faces() -> Result<(), Box<dyn std::error::Error>> {
-        let collected = collected_with_balance(GatewayMode::Test, "0")?;
+        let collected = collected_with_balance(GatewayMode::Live, "0")?;
         let manifest = fixture_bitget_physical_recovery_manifest(
-            recovery_scope(GatewayMode::Test, 1)?,
+            recovery_scope(GatewayMode::Live, 1)?,
             &collected.candidate,
             &collected.owner_routes,
         )?;
@@ -1204,7 +1198,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let now_ms = unix_ms()?;
         let collected = collected_at(
-            GatewayMode::Test,
+            GatewayMode::Live,
             "20",
             json!([regular_order_row()]),
             now_ms.saturating_sub(1),
@@ -1217,7 +1211,7 @@ mod tests {
         assert!(collected.owner_routes.is_empty());
         assert_eq!(
             fixture_bitget_physical_recovery_manifest(
-                recovery_scope(GatewayMode::Test, 1)?,
+                recovery_scope(GatewayMode::Live, 1)?,
                 &collected.candidate,
                 &collected.owner_routes,
             ),
@@ -1229,7 +1223,7 @@ mod tests {
     #[test]
     fn mixed_private_attempts_cannot_be_mapped_into_one_manifest()
     -> Result<(), Box<dyn std::error::Error>> {
-        let binding = binding(GatewayMode::Test)?;
+        let binding = binding(GatewayMode::Live)?;
         let observed_at_ms = unix_ms()?.saturating_sub(1);
         let mut faces = private_faces(&binding, observed_at_ms, "0")?;
         let BitgetPrivateFace::Positions(positions) = &mut faces[2] else {
@@ -1264,7 +1258,7 @@ mod tests {
     #[test]
     fn ack_is_exposed_only_after_exact_readback_and_failure_becomes_unknown()
     -> Result<(), Box<dyn std::error::Error>> {
-        let binding = binding(GatewayMode::Test)?;
+        let binding = binding(GatewayMode::Live)?;
         let mut exact = BitgetPhysicalGateway::new(
             binding.clone(),
             FakeIo {
@@ -1273,7 +1267,7 @@ mod tests {
             },
         );
         exact.connected = true;
-        exact.current = Some(collected(GatewayMode::Test)?);
+        exact.current = Some(collected(GatewayMode::Live)?);
         assert!(matches!(
             exact.dispatch_command(&place_command()?, 11),
             GatewayDispatchResult::Acknowledged(ref ack) if ack.venue_order_id() == "9001"
@@ -1289,7 +1283,7 @@ mod tests {
             },
         );
         unknown.connected = true;
-        unknown.current = Some(collected(GatewayMode::Test)?);
+        unknown.current = Some(collected(GatewayMode::Live)?);
         assert_eq!(
             unknown.dispatch_command(&place_command()?, 12),
             GatewayDispatchResult::Unknown

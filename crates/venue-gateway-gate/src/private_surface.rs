@@ -556,7 +556,7 @@ mod tests {
     fn facts() -> Result<(GateGatewayBinding, GateContractRules), Box<dyn std::error::Error>> {
         let binding = GateGatewayBinding::new(GatewayBinding::new(
             VenueId::Gate,
-            GatewayMode::Test,
+            GatewayMode::Live,
             ACCOUNT_ID,
             "DOGE/USDT".parse()?,
         )?)?;

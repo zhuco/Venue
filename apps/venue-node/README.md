@@ -8,12 +8,12 @@ cargo build -p venue-node --no-default-features --features bybit --bin venue-nod
 ```
 
 Every launch requires a canonical account UUID, canonical `BASE/QUOTE`, an absolute artifact base,
-and a mode spelled exactly `TEST` or `LIVE`. The final root is derived in memory as
+and a mode spelled exactly `LIVE`. The final root is derived in memory as
 `<base>/<venue>/<mode>/<trading_account_id>`; callers cannot supply or override it.
 
 Binance, Gate.io, and Bitget accept existing fixed Stage 7 commands after `--`. Omit the legacy
-`--artifacts-root` because the node injects the derived root. Only `LIVE` delegates to the existing
-runtime; `TEST` fails closed because those physical clients remain production-only.
+`--artifacts-root` because the node injects the derived root. Non-production modes are rejected
+before endpoint, credential, or artifact setup.
 
 ```text
 venue-node-gate --mode LIVE --trading-account-id <uuid> --symbol DOGE/USDT \
@@ -43,7 +43,7 @@ only an incomplete crash tail, and rejects any corrupt complete record before ga
 The mutation side routes every command through one exact `StrategyBinding`, and gives an injected
 `PhysicalGateway`
 one non-cloneable dispatch permit only after WAL, capability, writer, binding, and lifecycle checks;
-risk-increasing commands in both TEST and LIVE additionally require fresh Canary evidence bound to
+risk-increasing LIVE commands additionally require fresh Canary evidence bound to
 that exact durable command identity. Startup and ambiguous
 dispatches require a newer adapter-verified signed readback; UNKNOWN
 commands are settled from their durable family/client identity and are never resubmitted. Stop and

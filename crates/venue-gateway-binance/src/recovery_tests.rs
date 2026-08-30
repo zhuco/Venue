@@ -35,7 +35,7 @@ const FILLS: &[u8] = include_bytes!("../fixtures/user-trades-page.json");
 type TestResult = Result<(), Box<dyn Error>>;
 
 fn config_and_rules() -> Result<(BinanceConfig, BinanceInstrumentRules), Box<dyn Error>> {
-    config_and_rules_for(GatewayMode::Test, ACCOUNT_ID)
+    config_and_rules_for(GatewayMode::Live, ACCOUNT_ID)
 }
 
 fn config_and_rules_for(
@@ -315,9 +315,9 @@ fn old_probe_cannot_be_relabelled_or_used_after_deadline() -> TestResult {
     let relabelled = collection_scope_with(&config, "config_2", 17, 2_500, 9)?;
     let (other_config, _) =
         config_and_rules_for(GatewayMode::Live, "00000000-0000-4000-8000-000000000099")?;
-    let mode_account_relabelled = collection_scope_with(&other_config, "config_1", 17, 2_500, 1)?;
+    let account_relabelled = collection_scope_with(&other_config, "config_1", 17, 2_500, 1)?;
 
-    for drifted in [&relabelled, &mode_account_relabelled] {
+    for drifted in [&relabelled, &account_relabelled] {
         assert_eq!(
             candidate.verify_fresh(drifted, 2_200),
             Err(BinanceRecoveryCollectorError::Relabelled)
@@ -607,7 +607,7 @@ async fn exhausted_page_budget_prevents_the_next_symbol_authentication_get() -> 
     let eth_symbol: Symbol = "ETH/USDT".parse()?;
     let eth_binding = GatewayBinding::new(
         VenueId::Binance,
-        GatewayMode::Test,
+        GatewayMode::Live,
         ACCOUNT_ID,
         eth_symbol.clone(),
     )?;

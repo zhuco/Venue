@@ -10,8 +10,8 @@ use venue_copy::{
 use venue_domain::domain::Amount;
 
 use crate::{
-    CopyApplyResult, CopyCrashReplay, CopyDeliveryClaim, CopyLedgerProjectionInput,
-    CopyObserverScope, CopyRepository, CopyRepositoryError, CopyTestJob, ObservedCopyIntent,
+    CopyApplyResult, CopyCrashReplay, CopyDeliveryClaim, CopyJob, CopyLedgerProjectionInput,
+    CopyObserverScope, CopyRepository, CopyRepositoryError, ObservedCopyIntent,
     PgControlRepository, ScopedCopyDeliveryReceipt,
 };
 
@@ -48,7 +48,7 @@ impl FrozenCapitalSnapshot {
     }
 }
 
-/// Typed contents of `CopyLeaderSnapshot::snapshot_payload` consumed by the TEST planner.
+/// Typed contents of `CopyLeaderSnapshot::snapshot_payload` consumed by the semantic planner.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CopyPlanningSnapshot {
     pub capital: FrozenCapitalSnapshot,
@@ -68,11 +68,11 @@ pub struct PlannedCopyJob {
     pub observed: ObservedCopyIntent,
     pub frozen_capital: FrozenCapitalSnapshot,
     pub target: TargetExposurePlan,
-    pub job: CopyTestJob,
+    pub job: CopyJob,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CopyTestWorkerConfig {
+pub struct CopyWorkerConfig {
     pub mode: GatewayMode,
     pub scope: CopyObserverScope,
     pub worker_id: String,
@@ -80,10 +80,10 @@ pub struct CopyTestWorkerConfig {
     pub delivery_claim_ms: u64,
 }
 
-impl CopyTestWorkerConfig {
+impl CopyWorkerConfig {
     fn validate(&self) -> Result<(), CopyWorkerError> {
-        if self.mode != GatewayMode::Test {
-            return Err(CopyWorkerError::LiveDisabled);
+        if self.mode != GatewayMode::Live || self.scope.mode != self.mode {
+            return Err(CopyWorkerError::LiveModeRequired);
         }
         self.scope
             .validate()
@@ -101,15 +101,15 @@ impl CopyTestWorkerConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct CopyTestWorker {
+pub struct CopyWorker {
     repository: PgControlRepository,
-    config: CopyTestWorkerConfig,
+    config: CopyWorkerConfig,
 }
 
-impl CopyTestWorker {
+impl CopyWorker {
     pub fn new(
         repository: PgControlRepository,
-        config: CopyTestWorkerConfig,
+        config: CopyWorkerConfig,
     ) -> Result<Self, CopyWorkerError> {
         config.validate()?;
         Ok(Self { repository, config })
@@ -121,7 +121,7 @@ impl CopyTestWorker {
     }
 
     #[must_use]
-    pub const fn config(&self) -> &CopyTestWorkerConfig {
+    pub const fn config(&self) -> &CopyWorkerConfig {
         &self.config
     }
 
@@ -241,7 +241,7 @@ pub(crate) fn plan_observed_copy_job(
     manifest
         .validate(planned_at_ms)
         .map_err(|_| CopyWorkerError::InvalidPlanningInput)?;
-    let job = CopyTestJob {
+    let job = CopyJob {
         scope: observed.envelope.scope.clone(),
         source_event_sequence: observed.event_sequence,
         intent_id: observed.envelope.intent.intent_id,
@@ -264,8 +264,8 @@ pub(crate) fn plan_observed_copy_job(
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum CopyWorkerError {
-    #[error("LIVE copy control worker is disabled")]
-    LiveDisabled,
+    #[error("copy control worker mode must be exactly LIVE")]
+    LiveModeRequired,
     #[error("copy worker configuration is invalid")]
     InvalidConfig,
     #[error("copy worker clock overflowed")]
@@ -286,19 +286,20 @@ mod tests {
     use venue_domain::domain::{Asset, InstrumentIdentity, MarketKind, Symbol};
 
     #[tokio::test]
-    async fn live_worker_is_fail_closed_before_database_access() {
+    async fn live_worker_remains_semantic_and_non_authoritative() {
         let pool = sqlx::PgPool::connect_lazy("postgres://unused:unused@127.0.0.1/unused")
             .map(PgControlRepository::new);
         let Ok(repository) = pool else {
             return;
         };
-        let result = CopyTestWorker::new(
+        let worker = CopyWorker::new(
             repository,
-            CopyTestWorkerConfig {
+            CopyWorkerConfig {
                 mode: GatewayMode::Live,
                 scope: CopyObserverScope {
                     observer_id: "leader-a".to_owned(),
                     venue: venue_control_protocol::VenueId::Binance,
+                    mode: GatewayMode::Live,
                     trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
                 },
                 worker_id: "planner-a".to_owned(),
@@ -306,12 +307,14 @@ mod tests {
                 delivery_claim_ms: 1_000,
             },
         );
-        assert_eq!(result.map(|_| ()), Err(CopyWorkerError::LiveDisabled));
+        assert!(matches!(worker, Ok(worker) if !worker.grants_mutation_authority()));
     }
 
     #[test]
-    fn migration_keeps_planner_evidence_test_only_and_non_authoritative() {
+    fn migration_keeps_planner_evidence_live_only_and_non_authoritative() {
         assert!(MIGRATION_0003.contains("CHECK (mode = 'TEST')"));
+        assert!(crate::MIGRATION_0005.contains("CHECK (mode = 'LIVE')"));
+        assert!(!crate::MIGRATION_0005.contains("UPDATE "));
         assert!(!MIGRATION_0003.contains("writer_generation"));
         assert!(!MIGRATION_0003.contains("dispatch_permit"));
         assert!(!MIGRATION_0003.contains("mutation_authority BOOLEAN"));
@@ -413,6 +416,7 @@ mod tests {
             scope: CopyObserverScope {
                 observer_id: "leader-a".to_owned(),
                 venue: VenueId::Binance,
+                mode: GatewayMode::Live,
                 trading_account_id: account_id,
             },
             intent: crate::CopyLeaderIntent {

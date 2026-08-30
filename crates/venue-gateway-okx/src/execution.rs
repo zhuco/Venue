@@ -1114,7 +1114,7 @@ mod tests {
     #[test]
     fn place_cancel_and_detail_form_one_bound_signed_flow() -> Result<(), Box<dyn std::error::Error>>
     {
-        let (config, instrument, profile) = scope(GatewayMode::Test)?;
+        let (config, instrument, profile) = scope(GatewayMode::Live)?;
         let command = limit()?;
         let place = build_place_request(
             &config,
@@ -1127,13 +1127,13 @@ mod tests {
             std::str::from_utf8(place.body())?,
             r#"{"instId":"BTC-USDT-SWAP","tdMode":"cross","clOrdId":"00000000000000000000000000000003","side":"sell","posSide":"long","ordType":"limit","sz":"2","px":"60000"}"#
         );
-        assert_eq!(place.scope().gateway_binding().mode, GatewayMode::Test);
+        assert_eq!(place.scope().gateway_binding().mode, GatewayMode::Live);
         let headers = place.signed_headers(
             &OkxCredentials::from_values("key", "secret", "pass")?,
             &config,
             "2026-08-29T01:02:03.000Z",
         )?;
-        assert_eq!(headers.get("x-simulated-trading"), Some("1"));
+        assert_eq!(headers.get("x-simulated-trading"), None);
 
         // sCode=0 is acceptance only; no terminal state is inferred here.
         let accepted = parse_place_ack(
@@ -1175,7 +1175,7 @@ mod tests {
             &config,
             "2026-08-29T01:02:04.000Z",
         )?;
-        assert_eq!(readback_headers.get("x-simulated-trading"), Some("1"));
+        assert_eq!(readback_headers.get("x-simulated-trading"), None);
         let order = parse_order_detail(
             response(&config, &instrument, 1_787_911_200_600, ORDER_DETAIL),
             &readback,
@@ -1338,12 +1338,17 @@ mod tests {
             ),
             Err(OkxError::Binding)
         );
-        let (test, _, _) = scope(GatewayMode::Test)?;
+        let wrong = OkxConfig::for_binding(GatewayBinding::new(
+            VenueId::Okx,
+            GatewayMode::Live,
+            "00000000-0000-4000-8000-000000000001",
+            "ETH/USDT".parse()?,
+        )?)?;
         assert_eq!(
             place
                 .signed_headers(
                     &OkxCredentials::from_values("key", "secret", "pass")?,
-                    &test,
+                    &wrong,
                     "2026-08-29T01:02:03.000Z"
                 )
                 .err(),

@@ -492,12 +492,10 @@ mod tests {
         include_bytes!("../../../../crates/venue-gateway-bybit/fixtures/execution-trade-page.json");
     const EMPTY_PAGE: &[u8] = br#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","nextPageCursor":"","list":[]},"time":2000}"#;
 
-    fn candidate(
-        mode: GatewayMode,
-    ) -> Result<BybitPhysicalGatewayCandidate, Box<dyn std::error::Error>> {
+    fn candidate() -> Result<BybitPhysicalGatewayCandidate, Box<dyn std::error::Error>> {
         let binding = BybitGatewayBinding::new(GatewayBinding::new(
             VenueId::Bybit,
-            mode,
+            GatewayMode::Live,
             ACCOUNT_ID,
             "BTC/USDT".parse()?,
         )?)?;
@@ -523,10 +521,9 @@ mod tests {
         BybitRawPrivatePayload::from_response(binding, &request, 1_900, 2_000, payload.to_vec())
     }
 
-    fn recovery_candidate(
-        mode: GatewayMode,
-    ) -> Result<(BybitGatewayBinding, BybitCapabilityCandidate), Box<dyn std::error::Error>> {
-        let bridge = candidate(mode)?;
+    fn recovery_candidate()
+    -> Result<(BybitGatewayBinding, BybitCapabilityCandidate), Box<dyn std::error::Error>> {
+        let bridge = candidate()?;
         let binding = bridge.binding.clone();
         let api_key_raw = raw(&binding, BybitPrivateSource::ApiKeyInfo, API_KEY)?;
         let api_key = BybitApiKeyEvidence {
@@ -673,37 +670,35 @@ mod tests {
     }
 
     #[test]
-    fn test_and_live_candidates_are_inert_and_create_no_capability()
-    -> Result<(), Box<dyn std::error::Error>> {
-        for mode in [GatewayMode::Test, GatewayMode::Live] {
-            let candidate = candidate(mode)?;
-            assert_eq!(candidate.binding().mode, mode);
-            assert!(!candidate.has_loaded_session());
-            assert_eq!(
-                candidate.capability_snapshot().flags,
-                CapabilityFlags::empty()
-            );
-            assert!(
-                candidate
-                    .capability_snapshot()
-                    .authorize(candidate.binding(), 0, 1, MutationCapability::Cancel)
-                    .is_err()
-            );
-            assert_eq!(
-                candidate.probe_path().file_name(),
-                Some(PROBE_FILE.as_ref())
-            );
-            assert_eq!(
-                candidate.instrument_path().file_name(),
-                Some(INSTRUMENT_FILE.as_ref())
-            );
-        }
+    fn live_candidate_is_inert_and_creates_no_capability() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let candidate = candidate()?;
+        assert_eq!(candidate.binding().mode, GatewayMode::Live);
+        assert!(!candidate.has_loaded_session());
+        assert_eq!(
+            candidate.capability_snapshot().flags,
+            CapabilityFlags::empty()
+        );
+        assert!(
+            candidate
+                .capability_snapshot()
+                .authorize(candidate.binding(), 0, 1, MutationCapability::Cancel)
+                .is_err()
+        );
+        assert_eq!(
+            candidate.probe_path().file_name(),
+            Some(PROBE_FILE.as_ref())
+        );
+        assert_eq!(
+            candidate.instrument_path().file_name(),
+            Some(INSTRUMENT_FILE.as_ref())
+        );
         Ok(())
     }
 
     #[test]
     fn shared_delta_is_explicit_and_precredential() -> Result<(), Box<dyn std::error::Error>> {
-        let candidate = candidate(GatewayMode::Test)?;
+        let candidate = candidate()?;
         assert_eq!(
             candidate.fail_before_credentials(),
             BybitPhysicalGatewayBridgeError::SharedAuthority(BYBIT_PHYSICAL_GATEWAY_SHARED_DELTA)
@@ -719,7 +714,7 @@ mod tests {
     #[test]
     fn production_manifest_rejects_deserialized_generation_relabeling()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (binding, old_candidate) = recovery_candidate(GatewayMode::Live)?;
+        let (binding, old_candidate) = recovery_candidate()?;
         let old_stream = private_stream(binding.gateway_binding(), 7)?;
         let mut relabeled_stream = serde_json::to_value(old_stream)?;
         relabeled_stream["connection_generation"] = serde_json::json!(8);
@@ -743,7 +738,7 @@ mod tests {
     #[test]
     fn complete_same_attempt_new_generation_maps_all_six_faces_without_capability()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (binding, candidate) = recovery_candidate(GatewayMode::Test)?;
+        let (binding, candidate) = recovery_candidate()?;
         let stream = private_stream(binding.gateway_binding(), 7)?;
         let manifest = map_bybit_physical_recovery_fixture_manifest(
             recovery_scope(binding.gateway_binding().clone(), 6)?,
@@ -813,7 +808,7 @@ mod tests {
     fn missing_page_cross_attempt_and_stale_or_cross_generation_fail_closed()
     -> Result<(), Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
-        let (binding, candidate) = recovery_candidate(GatewayMode::Live)?;
+        let (binding, candidate) = recovery_candidate()?;
         let stream = private_stream(binding.gateway_binding(), 7)?;
 
         let mut missing_page = candidate.clone();

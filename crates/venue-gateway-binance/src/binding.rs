@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use venue_domain::domain::Symbol;
-use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
+use venue_gateway_api::{GatewayBinding, VenueId};
 
 #[must_use]
 pub fn native_symbol(symbol: &Symbol) -> String {
@@ -34,9 +34,7 @@ impl BinanceAccountBinding {
         if binding.venue != VenueId::Binance {
             return Err(BinanceBindingError::Venue);
         }
-        match binding.mode {
-            GatewayMode::Test | GatewayMode::Live => Ok(()),
-        }
+        Ok(())
     }
 }
 
@@ -50,6 +48,8 @@ pub enum BinanceBindingError {
 
 #[cfg(test)]
 mod tests {
+    use venue_gateway_api::GatewayMode;
+
     use super::*;
 
     fn binding(
@@ -79,14 +79,9 @@ mod tests {
     }
 
     #[test]
-    fn gateway_identity_accepts_only_binance_test_or_live() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn gateway_identity_accepts_only_binance_live() -> Result<(), Box<dyn std::error::Error>> {
         let profile = BinanceAccountBinding::PortfolioMarginUm;
         assert!("SHADOW".parse::<GatewayMode>().is_err());
-        assert_eq!(
-            profile.validate_gateway_binding(&binding(VenueId::Binance, GatewayMode::Test)?),
-            Ok(())
-        );
         assert_eq!(
             profile.validate_gateway_binding(&binding(VenueId::Binance, GatewayMode::Live)?),
             Ok(())

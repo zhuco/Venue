@@ -24,23 +24,18 @@ const AGENT_TYPE: &[u8] = b"Agent(string source,bytes32 connectionId)";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HyperliquidSource {
-    Test,
     Live,
 }
 
 impl HyperliquidSource {
     #[must_use]
-    pub const fn for_mode(mode: GatewayMode) -> Self {
-        match mode {
-            GatewayMode::Test => Self::Test,
-            GatewayMode::Live => Self::Live,
-        }
+    pub const fn live() -> Self {
+        Self::Live
     }
 
     #[must_use]
     pub const fn mode(self) -> GatewayMode {
         match self {
-            Self::Test => GatewayMode::Test,
             Self::Live => GatewayMode::Live,
         }
     }
@@ -48,7 +43,6 @@ impl HyperliquidSource {
     #[must_use]
     pub const fn as_wire(self) -> &'static str {
         match self {
-            Self::Test => "b",
             Self::Live => "a",
         }
     }
@@ -923,7 +917,7 @@ fn signed_request(
     {
         return Err(HyperliquidError::Binding);
     }
-    let source = HyperliquidSource::for_mode(scope.mode());
+    let source = HyperliquidSource::live();
     let connection_id = action_hash(
         &action,
         credentials.vault_address(),
@@ -1239,17 +1233,6 @@ mod tests {
             "0x755c40ba9bf05223521753995abb2f73ab3229be8ec921f350cb447e384d8ed8"
         );
         assert_eq!(live.v, 27);
-        let test = sign_agent(&key, HyperliquidSource::Test, no_vault)?;
-        assert_eq!(
-            test.r,
-            "0x542af61ef1f429707e3c76c5293c80d01f74ef853e34b76efffcb57e574f9510"
-        );
-        assert_eq!(
-            test.s,
-            "0x17b8b32f086e8cdede991f1e2c529f5dd5297cbe8128500e00cbaf766204a613"
-        );
-        assert_eq!(test.v, 28);
-
         let vault = "0x1719884eb866cb12b2287399b15f7db5e7d775ea";
         let vault_hash = action_hash(&action, Some(vault), 0, None)?;
         let live_vault = sign_agent(&key, HyperliquidSource::Live, vault_hash)?;
@@ -1262,22 +1245,12 @@ mod tests {
             "0x4d402be7396ce74fbba3795769cda45aec00dc3125a984f2a9f23177b190da2c"
         );
         assert_eq!(live_vault.v, 28);
-        let test_vault = sign_agent(&key, HyperliquidSource::Test, vault_hash)?;
-        assert_eq!(
-            test_vault.r,
-            "0xe281d2fb5c6e25ca01601f878e4d69c965bb598b88fac58e475dd1f5e56c362b"
-        );
-        assert_eq!(
-            test_vault.s,
-            "0x7ddad27e9a238d045c035bc606349d075d5c5cd00a6cd1da23ab5c39d4ef0f60"
-        );
-        assert_eq!(test_vault.v, 27);
         Ok(())
     }
 
     #[test]
     fn narrow_action_wires_are_bound_signed_and_strict() -> Result<(), Box<dyn std::error::Error>> {
-        let meta = meta(GatewayMode::Test, USER)?;
+        let meta = meta(GatewayMode::Live, USER)?;
         let credentials = HyperliquidCredentials::from_values(USER, None, AGENT, AGENT_KEY)?;
         let mut nonce_store = MemoryNonceStore::default();
         let nonce = reserve_next_nonce(&mut nonce_store, AGENT, 1_700_000_000_000)?;
@@ -1290,7 +1263,7 @@ mod tests {
             "0x00000000000000000000000000000001",
         )?;
         let request = build_alo_place_request(&credentials, nonce, alo, Some(1_700_000_001_000))?;
-        assert_eq!(request.source(), HyperliquidSource::Test);
+        assert_eq!(request.source(), HyperliquidSource::Live);
         assert_eq!(request.endpoint(), "/exchange");
         let body: serde_json::Value = serde_json::from_slice(request.body())?;
         assert_eq!(
@@ -1350,7 +1323,7 @@ mod tests {
     #[test]
     fn acknowledged_and_unknown_actions_converge_only_through_bound_readback()
     -> Result<(), Box<dyn std::error::Error>> {
-        let meta = meta(GatewayMode::Test, USER)?;
+        let meta = meta(GatewayMode::Live, USER)?;
         let credentials = HyperliquidCredentials::from_values(USER, None, AGENT, AGENT_KEY)?;
         let mut store = MemoryNonceStore::default();
         let nonce = reserve_next_nonce(&mut store, AGENT, 1_700_000_000_000)?;

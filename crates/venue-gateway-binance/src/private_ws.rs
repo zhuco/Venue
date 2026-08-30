@@ -318,7 +318,7 @@ mod tests {
     fn config() -> Result<BinanceConfig, Box<dyn std::error::Error>> {
         let binding = GatewayBinding::new(
             VenueId::Binance,
-            GatewayMode::Test,
+            GatewayMode::Live,
             "00000000-0000-4000-8000-000000000001",
             "BTC/USDT".parse()?,
         )?;

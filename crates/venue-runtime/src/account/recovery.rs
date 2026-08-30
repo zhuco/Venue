@@ -962,7 +962,6 @@ const fn native_order_family_tag(family: NativeOrderFamily) -> u8 {
 
 const fn gateway_mode_tag(mode: GatewayMode) -> u8 {
     match mode {
-        GatewayMode::Test => 1,
         GatewayMode::Live => 2,
     }
 }
@@ -1005,4 +1004,14 @@ fn commit_bytes(digest: &mut Sha256, value: &[u8]) {
     let len = u64::try_from(value.len()).unwrap_or(u64::MAX);
     digest.update(len.to_be_bytes());
     digest.update(value);
+}
+
+#[cfg(test)]
+mod live_mode_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn live_recovery_commitment_tag_remains_two() {
+        assert_eq!(gateway_mode_tag(GatewayMode::Live), 2);
+    }
 }

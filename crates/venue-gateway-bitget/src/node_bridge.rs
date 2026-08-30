@@ -387,24 +387,22 @@ mod tests {
     #[test]
     fn node_candidate_keeps_connection_and_private_turn_generations_distinct()
     -> Result<(), Box<dyn std::error::Error>> {
-        for mode in [GatewayMode::Test, GatewayMode::Live] {
-            let (_, candidate) = node_candidate(mode)?;
-            assert_eq!(candidate.private().raw_pages.len(), 5);
-            assert_eq!(candidate.connection_generation(), 7);
-            assert_eq!(candidate.private_generation(), 9);
-            assert!(candidate.supports(NativeOrderFamily::UmOrder));
-            assert!(!candidate.supports(NativeOrderFamily::UmConditional));
-            assert!(!candidate.supports(NativeOrderFamily::UmAlgo));
-            assert_eq!(candidate.commitment_sha256().len(), 64);
-        }
+        let (_, candidate) = node_candidate(GatewayMode::Live)?;
+        assert_eq!(candidate.private().raw_pages.len(), 5);
+        assert_eq!(candidate.connection_generation(), 7);
+        assert_eq!(candidate.private_generation(), 9);
+        assert!(candidate.supports(NativeOrderFamily::UmOrder));
+        assert!(!candidate.supports(NativeOrderFamily::UmConditional));
+        assert!(!candidate.supports(NativeOrderFamily::UmAlgo));
+        assert_eq!(candidate.commitment_sha256().len(), 64);
         Ok(())
     }
 
     #[test]
     fn node_bridge_emits_only_post_only_place_exact_cancel_and_reduce_once()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (rules, candidate) = node_candidate(GatewayMode::Test)?;
-        let config = BitgetConfig::for_mode(GatewayMode::Test);
+        let (rules, candidate) = node_candidate(GatewayMode::Live)?;
+        let config = BitgetConfig::for_mode(GatewayMode::Live);
         let place = ExecutionCommand::PlaceLimit(OrderCommand {
             command_id: CommandId::new("place_1")?,
             client_order_id: CommandId::new("venue_place_1")?,

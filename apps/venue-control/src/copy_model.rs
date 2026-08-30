@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use venue_control_protocol::VenueId;
+use venue_control_protocol::{GatewayMode, VenueId};
 use venue_copy::{
     AuthoritativePositionSnapshot, CopyId, CopyIdentityInput, CopyIdentitySet, DriftRepairError,
     DriftRepairPlanRequest, DriftRepairRequest, FollowerDeliveryManifest, LedgerEntry,
@@ -8,22 +8,37 @@ use venue_copy::{
 };
 use venue_domain::domain::is_canonical_trading_account_id;
 
+fn deserialize_live_mode<'de, D>(deserializer: D) -> Result<GatewayMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mode = GatewayMode::deserialize(deserializer)?;
+    if mode == GatewayMode::Live {
+        Ok(mode)
+    } else {
+        Err(serde::de::Error::custom("copy mode must be exactly LIVE"))
+    }
+}
+
 pub const MAX_COPY_OBSERVER_LEASE_MS: u64 = 60_000;
 pub const MAX_COPY_DELIVERY_CLAIM_MS: u64 = 60_000;
 pub const MAX_COPY_SNAPSHOT_TTL_MS: u64 = 5 * 60_000;
 
-/// A PostgreSQL coordination scope for Copy TEST. It deliberately has no gateway mode or writer
-/// generation: every row in migration 0002 is constrained to TEST and never grants mutation.
+/// A PostgreSQL coordination scope for semantic Copy planning. It is bound to LIVE while remaining
+/// unrelated to a gateway capability, writer generation, WAL position, or dispatch permit.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CopyObserverScope {
     pub observer_id: String,
     pub venue: VenueId,
+    #[serde(deserialize_with = "deserialize_live_mode")]
+    pub mode: GatewayMode,
     pub trading_account_id: String,
 }
 
 impl CopyObserverScope {
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
-        if self.observer_id.trim().is_empty()
+        if self.mode != GatewayMode::Live
+            || self.observer_id.trim().is_empty()
             || !is_canonical_trading_account_id(&self.trading_account_id)
         {
             return Err("copy observer scope is incomplete");
@@ -111,7 +126,7 @@ pub struct ObservedCopyIntent {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct CopyTestJob {
+pub struct CopyJob {
     pub scope: CopyObserverScope,
     pub source_event_sequence: i64,
     pub intent_id: CopyId,
@@ -122,7 +137,7 @@ pub struct CopyTestJob {
     pub created_at_ms: u64,
 }
 
-impl CopyTestJob {
+impl CopyJob {
     pub(crate) fn validate_against(
         &self,
         observed: &ObservedCopyIntent,
@@ -188,10 +203,10 @@ impl CopyObserverLease {
 }
 
 /// At-least-once database delivery custody. The account node must still durably install the job in
-/// its Actor inbox and pass Execution/Risk/Owner/WAL/Reconciliation before any TEST mutation.
+/// its Actor inbox and pass Execution/Risk/Owner/WAL/Reconciliation before any mutation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CopyDeliveryClaim {
-    pub job: CopyTestJob,
+    pub job: CopyJob,
     pub consumer_id: String,
     pub claim_epoch: u64,
     pub claimed_at_ms: u64,
@@ -284,7 +299,7 @@ pub enum CopyReplayDeliveryState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CopyReplayJob {
-    pub job: CopyTestJob,
+    pub job: CopyJob,
     pub delivery_state: CopyReplayDeliveryState,
     pub receipts: Vec<PersistedDeliveryReceipt>,
     pub projection_pending: bool,
@@ -321,6 +336,7 @@ mod tests {
             scope: CopyObserverScope {
                 observer_id: "leader-a".to_owned(),
                 venue: VenueId::Binance,
+                mode: GatewayMode::Live,
                 trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             },
             holder_id: "planner-1".to_owned(),
@@ -334,6 +350,27 @@ mod tests {
     }
 
     #[test]
+    fn copy_scope_wire_mode_accepts_only_live() -> Result<(), Box<dyn std::error::Error>> {
+        let scope = CopyObserverScope {
+            observer_id: "leader-a".to_owned(),
+            venue: VenueId::Binance,
+            mode: GatewayMode::Live,
+            trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+        };
+        let encoded = serde_json::to_value(scope)?;
+        assert!(serde_json::from_value::<CopyObserverScope>(encoded.clone()).is_ok());
+        for raw in ["TEST", "live", " LIVE", "LIVE "] {
+            let mut rejected = encoded.clone();
+            rejected["mode"] = serde_json::json!(raw);
+            assert!(
+                serde_json::from_value::<CopyObserverScope>(rejected).is_err(),
+                "accepted {raw:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn leader_envelope_requires_canonical_scope_and_half_open_snapshot()
     -> Result<(), Box<dyn std::error::Error>> {
         let identities = derive_copy_identities(&identity_input())?;
@@ -341,6 +378,7 @@ mod tests {
             scope: CopyObserverScope {
                 observer_id: "leader-a".to_owned(),
                 venue: VenueId::Binance,
+                mode: GatewayMode::Live,
                 trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             },
             intent: CopyLeaderIntent {

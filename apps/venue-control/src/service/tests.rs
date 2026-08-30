@@ -270,7 +270,7 @@ async fn snapshot_and_events_are_validated_and_monotonic() -> Result<(), Box<dyn
 }
 
 #[tokio::test]
-async fn submission_fails_closed_for_stale_cross_mode_and_bad_confirmation()
+async fn submission_fails_closed_for_stale_scope_and_bad_confirmation()
 -> Result<(), Box<dyn std::error::Error>> {
     let service = service_with_snapshot().await?;
 
@@ -278,13 +278,6 @@ async fn submission_fails_closed_for_stale_cross_mode_and_bad_confirmation()
     stale.expected_config_epoch += 1;
     assert_eq!(
         service.submit_command(&stale, 101).await,
-        Err(ServiceError::StaleOrMismatchedScope)
-    );
-
-    let mut cross_mode = command(ControlAction::Pause)?;
-    cross_mode.mode = GatewayMode::Test;
-    assert_eq!(
-        service.submit_command(&cross_mode, 101).await,
         Err(ServiceError::StaleOrMismatchedScope)
     );
 
@@ -321,18 +314,6 @@ async fn claim_is_mode_bound_one_shot_and_unknown_is_terminal()
     let pause = command(ControlAction::Pause)?;
     service.submit_command(&pause, 101).await?;
 
-    let wrong_mode = AccountNodeBinding {
-        venue: VenueId::Binance,
-        mode: GatewayMode::Test,
-        trading_account_id: pause.trading_account_id.clone(),
-    };
-    assert_eq!(
-        service
-            .claim_commands(&wrong_mode, "test-node", 102, 10)
-            .await,
-        Err(ServiceError::StaleOrMismatchedScope)
-    );
-
     let binding = AccountNodeBinding {
         venue: pause.venue,
         mode: pause.mode,
@@ -366,12 +347,6 @@ async fn claim_is_mode_bound_one_shot_and_unknown_is_terminal()
     wrong_consumer.consumer_id = "other-node".to_owned();
     assert_eq!(
         service.record_receipt(&wrong_consumer).await,
-        Err(ServiceError::Repository(RepositoryError::DeliveryConflict))
-    );
-    let mut wrong_scope = scoped.clone();
-    wrong_scope.command.mode = GatewayMode::Test;
-    assert_eq!(
-        service.record_receipt(&wrong_scope).await,
         Err(ServiceError::Repository(RepositoryError::DeliveryConflict))
     );
     assert_eq!(service.record_receipt(&scoped).await?, unknown);

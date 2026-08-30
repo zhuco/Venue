@@ -1,4 +1,4 @@
-use venue_gateway_api::{GatewayApiError, GatewayBinding, VenueId};
+use venue_gateway_api::{GatewayApiError, GatewayBinding, GatewayMode, VenueId};
 
 use crate::{HyperliquidError, credentials};
 
@@ -14,6 +14,9 @@ impl HyperliquidGatewayBinding {
             .map_err(HyperliquidGatewayBindingError::Gateway)?;
         if binding.venue != VenueId::Hyperliquid {
             return Err(HyperliquidGatewayBindingError::Venue);
+        }
+        if binding.mode != GatewayMode::Live {
+            return Err(HyperliquidGatewayBindingError::Mode);
         }
         Ok(Self(binding))
     }
@@ -64,6 +67,8 @@ impl HyperliquidReadBinding {
 pub enum HyperliquidGatewayBindingError {
     #[error("Hyperliquid gateway binding must use venue=hyperliquid")]
     Venue,
+    #[error("Hyperliquid gateway binding must use mode=LIVE")]
+    Mode,
     #[error(transparent)]
     Gateway(#[from] GatewayApiError),
 }

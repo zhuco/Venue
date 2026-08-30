@@ -81,7 +81,7 @@ struct RawNodeArguments {
     #[arg(long)]
     symbol: Symbol,
 
-    /// Absolute base. The node derives <base>/<venue>/<TEST|LIVE>/<account> and never accepts an
+    /// Absolute base. The node derives <base>/<venue>/LIVE/<account> and never accepts an
     /// operator-supplied final root.
     #[arg(long)]
     artifacts_base: PathBuf,
@@ -261,12 +261,6 @@ pub fn reject_unintegrated_runtime(
     })
 }
 
-/// The frozen Stage 7 physical clients are production-only. TEST is accepted as a gateway mode,
-/// but it cannot be redirected into those LIVE clients.
-pub fn reject_unintegrated_legacy_test_runtime(venue: VenueId) -> Result<(), NodeError> {
-    Err(NodeError::LegacyTestRuntime(venue))
-}
-
 #[must_use]
 pub fn report_result(program: &str, result: Result<(), NodeError>) -> ExitCode {
     match result {
@@ -280,9 +274,8 @@ pub fn report_result(program: &str, result: Result<(), NodeError>) -> ExitCode {
 
 fn parse_exact_mode(raw: &str) -> Result<GatewayMode, &'static str> {
     match raw {
-        "TEST" => Ok(GatewayMode::Test),
         "LIVE" => Ok(GatewayMode::Live),
-        _ => Err("gateway mode must be exactly TEST or LIVE"),
+        _ => Err("gateway mode must be exactly LIVE"),
     }
 }
 
@@ -328,10 +321,6 @@ pub enum NodeError {
         mode: GatewayMode,
         missing: &'static str,
     },
-    #[error(
-        "{0} TEST node is fail-closed because the existing Stage 7 runtime is LIVE-only; no endpoint, credential, or artifact fallback is allowed"
-    )]
-    LegacyTestRuntime(VenueId),
     #[error("existing {venue} runtime rejected launch: {message}")]
     ExistingRuntime { venue: VenueId, message: String },
 }
@@ -361,36 +350,28 @@ mod tests {
     }
 
     #[test]
-    fn node_mode_is_exactly_test_or_live() -> Result<(), Box<dyn std::error::Error>> {
-        assert_eq!(
-            NodeLaunch::try_parse_from(VenueId::Bybit, arguments("TEST"))?
-                .binding()
-                .mode,
-            GatewayMode::Test
-        );
+    fn node_mode_is_exactly_live() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(
             NodeLaunch::try_parse_from(VenueId::Bybit, arguments("LIVE"))?
                 .binding()
                 .mode,
             GatewayMode::Live
         );
-        for rejected in ["test", "live", "SHADOW", " LIVE ", ""] {
+        for rejected in ["TEST", "test", "live", "SHADOW", " LIVE ", ""] {
             assert!(NodeLaunch::try_parse_from(VenueId::Bybit, arguments(rejected)).is_err());
         }
         Ok(())
     }
 
     #[test]
-    fn artifact_roots_are_disjoint_by_venue_mode_and_account()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn artifact_roots_are_disjoint_by_venue_and_account() -> Result<(), Box<dyn std::error::Error>>
+    {
         let live = NodeLaunch::try_parse_from(VenueId::Bybit, arguments("LIVE"))?;
-        let test = NodeLaunch::try_parse_from(VenueId::Bybit, arguments("TEST"))?;
         let okx = NodeLaunch::try_parse_from(VenueId::Okx, arguments("LIVE"))?;
         let mut other_account = arguments("LIVE");
         other_account[4] = OsString::from("00000000-0000-4000-8000-000000000002");
         let other_account = NodeLaunch::try_parse_from(VenueId::Bybit, other_account)?;
 
-        assert_ne!(live.artifacts_root(), test.artifacts_root());
         assert_ne!(live.artifacts_root(), okx.artifacts_root());
         assert_ne!(live.artifacts_root(), other_account.artifacts_root());
         assert!(live.artifacts_root().ends_with(Path::new(ACCOUNT)));

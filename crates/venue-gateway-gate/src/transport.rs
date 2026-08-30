@@ -975,7 +975,7 @@ mod tests {
     > {
         let binding = GateGatewayBinding::new(GatewayBinding::new(
             VenueId::Gate,
-            GatewayMode::Test,
+            GatewayMode::Live,
             ACCOUNT,
             "DOGE/USDT".parse()?,
         )?)?;
@@ -1247,7 +1247,7 @@ mod tests {
             1,
         )?;
         assert!(session.is_current());
-        assert_eq!(session.mode(), GatewayMode::Test);
+        assert_eq!(session.mode(), GatewayMode::Live);
         assert_eq!(session.trading_account_id(), ACCOUNT);
         assert_eq!(session.rest_origin(), "http://signed-gate-recovery.test");
         assert_eq!(session.private_ws_endpoint(), format!("ws://{address}"));
@@ -1255,7 +1255,7 @@ mod tests {
         private.revalidate_recovery_session(&session).await?;
         let frame = private.next_raw_frame().await?;
         assert_eq!(frame.channel, "futures.orders");
-        assert_eq!(frame.binding.mode, GatewayMode::Test);
+        assert_eq!(frame.binding.mode, GatewayMode::Live);
         assert_eq!(private.next_raw_frame().await?.channel, "futures.positions");
         let account = crate::prepare_private_read(
             &binding,

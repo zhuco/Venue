@@ -932,7 +932,6 @@ fn recovery_request_universe_commitment(
     let mut digest = Sha256::new();
     digest.update(b"venue-bitget-authenticated-request-universe-v1");
     digest.update([match mode {
-        GatewayMode::Test => 1,
         GatewayMode::Live => 2,
     }]);
     for value in [trading_account_id, rest_origin, private_ws_endpoint] {
@@ -1369,8 +1368,8 @@ mod tests {
             }
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         });
-        let binding = binding(GatewayMode::Test)?;
-        let config = BitgetConfig::for_mode(GatewayMode::Test);
+        let binding = binding(GatewayMode::Live)?;
+        let config = BitgetConfig::for_mode(GatewayMode::Live);
         let (stream, _) = tokio_tungstenite::connect_async(&endpoint).await?;
         let mut transport = authenticate_private_stream(
             stream,
@@ -1482,8 +1481,8 @@ mod tests {
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         });
         let binding =
-            binding_for_account(GatewayMode::Test, "00000000-0000-4000-8000-000000000011")?;
-        let config = BitgetConfig::for_mode(GatewayMode::Test);
+            binding_for_account(GatewayMode::Live, "00000000-0000-4000-8000-000000000011")?;
+        let config = BitgetConfig::for_mode(GatewayMode::Live);
         let (stream, _) = tokio_tungstenite::connect_async(&endpoint).await?;
         let generation = next_serial(&NEXT_CONNECTION_GENERATION)?;
         let mut transport = authenticate_private_stream(
@@ -1506,7 +1505,7 @@ mod tests {
             100,
         )?;
         assert_eq!(session.connection_generation(), generation);
-        assert_eq!(session.mode(), GatewayMode::Test);
+        assert_eq!(session.mode(), GatewayMode::Live);
         assert_eq!(session.symbols().len(), 1);
         assert_eq!(session.private_generation(), session.attempt_id());
         assert!(
@@ -1638,8 +1637,8 @@ mod tests {
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         });
         let binding =
-            binding_for_account(GatewayMode::Test, "00000000-0000-4000-8000-000000000013")?;
-        let config = BitgetConfig::for_mode(GatewayMode::Test);
+            binding_for_account(GatewayMode::Live, "00000000-0000-4000-8000-000000000013")?;
+        let config = BitgetConfig::for_mode(GatewayMode::Live);
         let (stream, _) = tokio_tungstenite::connect_async(&endpoint).await?;
         let generation = next_serial(&NEXT_CONNECTION_GENERATION)?;
         let mut transport = authenticate_private_stream(
@@ -1676,12 +1675,9 @@ mod tests {
     }
 
     #[test]
-    fn demo_and_live_private_endpoints_never_alias() {
-        let demo = BitgetConfig::for_mode(GatewayMode::Test);
+    fn live_private_endpoint_is_exactly_production() {
         let live = BitgetConfig::for_mode(GatewayMode::Live);
-        assert!(demo.private_ws().contains("wspap.bitget.com"));
-        assert!(!live.private_ws().contains("wspap"));
-        assert_ne!(demo.private_ws(), live.private_ws());
+        assert_eq!(live.private_ws(), "wss://ws.bitget.com/v3/ws/private");
     }
 
     #[test]

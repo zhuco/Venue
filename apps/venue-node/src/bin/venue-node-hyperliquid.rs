@@ -587,11 +587,8 @@ fn recovery_common_commitment(
 }
 
 #[cfg(test)]
-fn mode_tag(mode: GatewayMode) -> u8 {
-    match mode {
-        GatewayMode::Test => 1,
-        GatewayMode::Live => 2,
-    }
+fn mode_tag(_mode: GatewayMode) -> u8 {
+    2
 }
 
 #[cfg(test)]
@@ -765,10 +762,10 @@ mod tests {
     const ORDER_STATUS: &[u8] =
         include_bytes!("../../../../crates/venue-gateway-hyperliquid/fixtures/order-status.json");
 
-    fn binding(mode: GatewayMode) -> Result<GatewayBinding, Box<dyn std::error::Error>> {
+    fn binding() -> Result<GatewayBinding, Box<dyn std::error::Error>> {
         Ok(GatewayBinding::new(
             VenueId::Hyperliquid,
-            mode,
+            GatewayMode::Live,
             ACCOUNT,
             "BTC/USDC".parse()?,
         )?)
@@ -788,7 +785,7 @@ mod tests {
     }
 
     fn recovery_fixture() -> Result<RecoveryFixture, Box<dyn std::error::Error>> {
-        let selected = binding(GatewayMode::Test)?;
+        let selected = binding()?;
         let read_binding =
             HyperliquidReadBinding::new(HyperliquidGatewayBinding::new(selected.clone())?, USER)?;
         let meta = parse_perp_meta(META, &read_binding)?;
@@ -886,14 +883,12 @@ mod tests {
     fn fixed_candidate_bridge_is_physical_but_never_auto_authorizes()
     -> Result<(), Box<dyn std::error::Error>> {
         assert_physical_gateway::<HyperliquidPhysicalGatewayCandidate>();
-        for mode in [GatewayMode::Test, GatewayMode::Live] {
-            let selected = binding(mode)?;
-            let bridge = HyperliquidPhysicalGatewayCandidate::new(selected.clone(), None)?;
-            assert_eq!(bridge.binding(), &selected);
-            assert!(bridge.capability_snapshot().flags.is_empty());
-            assert_eq!(bridge.capability_snapshot().version, 0);
-            assert!(bridge.persisted_probe_candidate().is_none());
-        }
+        let selected = binding()?;
+        let bridge = HyperliquidPhysicalGatewayCandidate::new(selected.clone(), None)?;
+        assert_eq!(bridge.binding(), &selected);
+        assert!(bridge.capability_snapshot().flags.is_empty());
+        assert_eq!(bridge.capability_snapshot().version, 0);
+        assert!(bridge.persisted_probe_candidate().is_none());
         Ok(())
     }
 
@@ -901,7 +896,7 @@ mod tests {
     fn fixed_candidate_bridge_rejects_other_venue() -> Result<(), Box<dyn std::error::Error>> {
         let wrong = GatewayBinding::new(
             VenueId::Okx,
-            GatewayMode::Test,
+            GatewayMode::Live,
             ACCOUNT,
             "BTC/USDC".parse()?,
         )?;
@@ -915,7 +910,7 @@ mod tests {
     #[test]
     fn production_recovery_manifest_is_unconditionally_unavailable()
     -> Result<(), Box<dyn std::error::Error>> {
-        let bridge = HyperliquidPhysicalGatewayCandidate::new(binding(GatewayMode::Test)?, None)?;
+        let bridge = HyperliquidPhysicalGatewayCandidate::new(binding()?, None)?;
         assert_eq!(
             bridge.recovery_readback_manifest(),
             Err(HyperliquidBridgeError::RecoveryUnavailable)

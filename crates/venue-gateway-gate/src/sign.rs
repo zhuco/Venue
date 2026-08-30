@@ -137,23 +137,14 @@ mod tests {
     use crate::{GateConfig, GateProductScope, endpoints};
 
     #[test]
-    fn modes_select_current_official_test_or_live_origins() {
-        let test = GateConfig::for_mode(GatewayMode::Test);
+    fn live_selects_current_official_production_origins() {
         let live = GateConfig::for_mode(GatewayMode::Live);
-        assert_eq!(test.rest_origin(), "https://api-testnet.gateapi.io/api/v4");
-        assert_eq!(
-            test.usdt_futures_ws(),
-            "wss://ws-testnet.gate.com/v4/ws/futures/usdt"
-        );
         assert_eq!(live.rest_origin(), "https://api.gateio.ws/api/v4");
         assert_eq!(live.usdt_futures_ws(), "wss://fx-ws.gateio.ws/v4/ws/usdt");
-        assert!(test.testnet());
-        assert!(!live.testnet());
-        assert_eq!(test.mode(), GatewayMode::Test);
         assert_eq!(live.mode(), GatewayMode::Live);
         assert_eq!(
-            test.rest_url(endpoints::FUTURES_ORDER),
-            Ok("https://api-testnet.gateapi.io/api/v4/futures/usdt/orders".to_owned())
+            live.rest_url(endpoints::FUTURES_ORDER),
+            Ok("https://api.gateio.ws/api/v4/futures/usdt/orders".to_owned())
         );
     }
 

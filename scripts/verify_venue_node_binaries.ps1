@@ -58,7 +58,7 @@ function Test-FailClosedNode {
         'operator-confirmed Canary evidence'
     )
 
-    foreach ($mode in @('TEST', 'LIVE')) {
+    foreach ($mode in @('LIVE')) {
         $probeBase = Join-Path `
             (Split-Path -Parent $targetRoot) `
             "venue-node-fail-closed-$Venue-$mode-$([Guid]::NewGuid().ToString('N'))"
@@ -114,6 +114,67 @@ function Test-FailClosedNode {
     }
 }
 
+function Test-NonProductionModeRejected {
+    param(
+        [Parameter(Mandatory)] [string]$Venue,
+        [Parameter(Mandatory)] [string]$BinaryPath
+    )
+
+    $probeBase = Join-Path `
+        (Split-Path -Parent $targetRoot) `
+        "venue-node-reject-test-$Venue-$([Guid]::NewGuid().ToString('N'))"
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $BinaryPath
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $credentialNames = @{
+        binance = @('BINANCE_API_KEY', 'BINANCE_API_SECRET')
+        bitget = @('BITGET_API_KEY', 'BITGET_API_SECRET', 'BITGET_API_PASSPHRASE', 'BITGET_PASSPHRASE')
+        bybit = @('BYBIT_API_KEY', 'BYBIT_API_SECRET')
+        gate = @('GATEIO_API_KEY', 'GATEIO_API_SECRET')
+        hyperliquid = @(
+            'HYPERLIQUID_ACCOUNT_ADDRESS', 'HYPERLIQUID_API_WALLET_ADDRESS',
+            'HYPERLIQUID_API_WALLET_PRIVATE_KEY', 'HYPERLIQUID_VAULT_ADDRESS'
+        )
+        okx = @('OKX_API_KEY', 'OKX_API_SECRET', 'OKX_API_PASSPHRASE')
+    }
+    foreach ($argument in @(
+        '--mode', 'TEST',
+        '--trading-account-id', '00000000-0000-4000-8000-000000000001',
+        '--symbol', 'BTC/USDT',
+        '--artifacts-base', $probeBase
+    )) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+    foreach ($credentialName in $credentialNames[$Venue]) {
+        [void]$startInfo.Environment.Remove($credentialName)
+    }
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw "无法启动 $Venue TEST 拒绝探针。"
+    }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit(15000)) {
+        $process.Kill($true)
+        $process.WaitForExit()
+        throw "$Venue TEST 拒绝探针未在 15 秒内结束。"
+    }
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
+    if ($process.ExitCode -eq 0 -or (Test-Path -LiteralPath $probeBase)) {
+        throw "$Venue 接受了 TEST 或在拒绝前创建了工件。"
+    }
+    if (-not "$stdout`n$stderr".Contains(
+        'gateway mode must be exactly LIVE',
+        [StringComparison]::Ordinal
+    )) {
+        throw "$Venue TEST 未由最前置 mode parser 拒绝。"
+    }
+}
+
 $evidence = [System.Collections.Generic.List[object]]::new()
 foreach ($venue in @('binance', 'bitget', 'bybit', 'gate', 'hyperliquid', 'okx')) {
     $binaryName = "venue-node-$venue"
@@ -129,9 +190,13 @@ foreach ($venue in @('binance', 'bitget', 'bybit', 'gate', 'hyperliquid', 'okx')
         -Venue $venue `
         -BinaryPath $binaryPath
     $venueEvidence = $result | ConvertFrom-Json
+    Test-NonProductionModeRejected -Venue $venue -BinaryPath $binaryPath
+    $venueEvidence | Add-Member -NotePropertyName rejected_modes -NotePropertyValue @('TEST')
+    $venueEvidence | Add-Member -NotePropertyName mode_rejection -NotePropertyValue `
+        'exact parser error; credentials removed; artifact root absent'
     if ($venue -in @('bybit', 'hyperliquid', 'okx')) {
         Test-FailClosedNode -Venue $venue -BinaryPath $binaryPath
-        $venueEvidence | Add-Member -NotePropertyName fail_closed_modes -NotePropertyValue @('TEST', 'LIVE')
+        $venueEvidence | Add-Member -NotePropertyName fail_closed_modes -NotePropertyValue @('LIVE')
         $venueEvidence | Add-Member -NotePropertyName fail_closed_no_io -NotePropertyValue $true
     }
     $evidence.Add($venueEvidence)

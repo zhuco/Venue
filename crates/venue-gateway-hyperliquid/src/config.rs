@@ -12,21 +12,11 @@ pub struct HyperliquidConfig {
 impl HyperliquidConfig {
     #[must_use]
     pub const fn for_binding(binding: &HyperliquidGatewayBinding) -> Self {
-        Self::for_mode(binding.gateway_binding().mode)
-    }
-
-    const fn for_mode(mode: GatewayMode) -> Self {
-        match mode {
-            GatewayMode::Test => Self {
-                mode,
-                rest_origin: "https://api.hyperliquid-testnet.xyz",
-                websocket: "wss://api.hyperliquid-testnet.xyz/ws",
-            },
-            GatewayMode::Live => Self {
-                mode,
-                rest_origin: "https://api.hyperliquid.xyz",
-                websocket: "wss://api.hyperliquid.xyz/ws",
-            },
+        let _ = binding;
+        Self {
+            mode: GatewayMode::Live,
+            rest_origin: "https://api.hyperliquid.xyz",
+            websocket: "wss://api.hyperliquid.xyz/ws",
         }
     }
 

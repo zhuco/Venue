@@ -1125,8 +1125,17 @@ const fn venue_tag(venue: VenueId) -> u8 {
 
 const fn mode_tag(mode: GatewayMode) -> u8 {
     match mode {
-        GatewayMode::Test => 1,
         GatewayMode::Live => 2,
+    }
+}
+
+#[cfg(test)]
+mod live_mode_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn live_physical_recovery_scope_tag_remains_two() {
+        assert_eq!(mode_tag(GatewayMode::Live), 2);
     }
 }
 
@@ -1188,13 +1197,25 @@ mod tests {
         )
     }
 
-    fn account_scope(mode: GatewayMode) -> Result<PhysicalRecoveryScope, Box<dyn Error>> {
-        account_scope_with_anchor(mode, "BTC/USDT")
+    fn account_scope() -> Result<PhysicalRecoveryScope, Box<dyn Error>> {
+        account_scope_with_anchor("BTC/USDT")
     }
 
-    fn account_scope_with_anchor(
-        mode: GatewayMode,
+    fn account_scope_with_anchor(anchor: &str) -> Result<PhysicalRecoveryScope, Box<dyn Error>> {
+        account_scope_with_anchor_and_roots(
+            anchor,
+            PhysicalRecoveryAuthorityRoots::verified_recovered(
+                hash(1),
+                hash(2),
+                hash(3),
+                BTreeSet::new(),
+            )?,
+        )
+    }
+
+    fn account_scope_with_anchor_and_roots(
         anchor: &str,
+        authority_roots: PhysicalRecoveryAuthorityRoots,
     ) -> Result<PhysicalRecoveryScope, Box<dyn Error>> {
         let account = AccountKey::new(crate::domain::ExchangeId::Binance, ACCOUNT_ID)?;
         let registrations = [
@@ -1226,7 +1247,12 @@ mod tests {
             ),
         ];
         Ok(PhysicalRecoveryScope::verified_account(
-            GatewayBinding::new(VenueId::Binance, mode, ACCOUNT_ID, anchor.parse()?)?,
+            GatewayBinding::new(
+                VenueId::Binance,
+                GatewayMode::Live,
+                ACCOUNT_ID,
+                anchor.parse()?,
+            )?,
             account,
             registrations,
             AccountPositionMode::Hedge,
@@ -1234,12 +1260,7 @@ mod tests {
             1,
             4,
             10,
-            PhysicalRecoveryAuthorityRoots::verified_recovered(
-                hash(1),
-                hash(2),
-                hash(3),
-                BTreeSet::new(),
-            )?,
+            authority_roots,
         )?)
     }
 
@@ -1370,8 +1391,8 @@ mod tests {
         let binding_drift = PhysicalRecoveryScope::verified(
             GatewayBinding::new(
                 VenueId::Binance,
-                GatewayMode::Test,
-                ACCOUNT_ID,
+                GatewayMode::Live,
+                "00000000-0000-4000-8000-000000000002",
                 "BTC/USDT".parse()?,
             )?,
             "config_1",
@@ -1461,7 +1482,7 @@ mod tests {
 
     #[test]
     fn multi_symbol_empty_faces_cover_every_symbol_and_hedge_leg() -> Result<(), Box<dyn Error>> {
-        let scope = account_scope(GatewayMode::Test)?;
+        let scope = account_scope()?;
         let manifest = PhysicalRecoveryReadbackManifest::verified(
             scope.clone(),
             account_receipts(&scope, 11)?,
@@ -1488,7 +1509,7 @@ mod tests {
 
     #[test]
     fn missing_symbol_or_position_leg_fails_closed() -> Result<(), Box<dyn Error>> {
-        let scope = account_scope(GatewayMode::Test)?;
+        let scope = account_scope()?;
         let btc: Symbol = "BTC/USDT".parse()?;
         let eth: Symbol = "ETH/USDT".parse()?;
         let mut missing_leg = account_receipts(&scope, 11)?;
@@ -1527,12 +1548,20 @@ mod tests {
     }
 
     #[test]
-    fn wrong_mode_and_old_private_generation_cannot_be_relabelled() -> Result<(), Box<dyn Error>> {
-        let expected = account_scope(GatewayMode::Test)?;
-        let wrong_mode = account_scope(GatewayMode::Live)?;
+    fn wrong_scope_and_old_private_generation_cannot_be_relabelled() -> Result<(), Box<dyn Error>> {
+        let expected = account_scope()?;
+        let wrong_scope = account_scope_with_anchor_and_roots(
+            "BTC/USDT",
+            PhysicalRecoveryAuthorityRoots::verified_recovered(
+                hash(4),
+                hash(2),
+                hash(3),
+                BTreeSet::new(),
+            )?,
+        )?;
         let mut mixed = account_receipts(&expected, 11)?;
         mixed[0] = PhysicalReadbackReceipt::verified_complete_account(
-            &wrong_mode,
+            &wrong_scope,
             PhysicalReadbackSurface::Account,
             51,
             11,
@@ -1569,7 +1598,7 @@ mod tests {
         let result = PhysicalRecoveryScope::verified_account(
             GatewayBinding::new(
                 VenueId::Binance,
-                GatewayMode::Test,
+                GatewayMode::Live,
                 "00000000-0000-4000-8000-000000000002",
                 "BTC/USDT".parse()?,
             )?,
@@ -1594,7 +1623,7 @@ mod tests {
     #[test]
     fn native_anchor_must_equal_the_canonical_account_universe_symbol() -> Result<(), Box<dyn Error>>
     {
-        let Err(error) = account_scope_with_anchor(GatewayMode::Test, "ETH/USDT") else {
+        let Err(error) = account_scope_with_anchor("ETH/USDT") else {
             return Err("non-canonical native anchor was accepted".into());
         };
         assert_eq!(

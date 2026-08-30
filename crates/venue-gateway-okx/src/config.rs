@@ -13,19 +13,11 @@ pub struct OkxConfig {
 impl OkxConfig {
     pub fn for_binding(binding: GatewayBinding) -> Result<Self, OkxGatewayBindingError> {
         let binding = OkxGatewayBinding::new(binding)?;
-        let config = match binding.gateway_binding().mode {
-            GatewayMode::Test => Self {
-                binding,
-                rest_origin: "https://www.okx.com",
-                public_ws: "wss://wspap.okx.com:8443/ws/v5/public",
-                private_ws: "wss://wspap.okx.com:8443/ws/v5/private",
-            },
-            GatewayMode::Live => Self {
-                binding,
-                rest_origin: "https://www.okx.com",
-                public_ws: "wss://ws.okx.com:8443/ws/v5/public",
-                private_ws: "wss://ws.okx.com:8443/ws/v5/private",
-            },
+        let config = Self {
+            binding,
+            rest_origin: "https://www.okx.com",
+            public_ws: "wss://ws.okx.com:8443/ws/v5/public",
+            private_ws: "wss://ws.okx.com:8443/ws/v5/private",
         };
         Ok(config)
     }
@@ -53,11 +45,6 @@ impl OkxConfig {
     #[must_use]
     pub const fn private_ws(&self) -> &'static str {
         self.private_ws
-    }
-
-    #[must_use]
-    pub const fn simulated_trading(&self) -> bool {
-        matches!(self.mode(), GatewayMode::Test)
     }
 }
 

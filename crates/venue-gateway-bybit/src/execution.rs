@@ -867,7 +867,7 @@ mod tests {
     #[test]
     fn limit_request_has_exact_linear_body_and_signature_preimage()
     -> Result<(), Box<dyn std::error::Error>> {
-        let facts = facts(GatewayMode::Test)?;
+        let facts = facts(GatewayMode::Live)?;
         let request = prepare_place_request(
             &facts.binding,
             &facts.identity,
@@ -877,7 +877,7 @@ mod tests {
             None,
         )?;
         assert_eq!(request.path, endpoints::PLACE_ORDER);
-        assert_eq!(request.origin, "https://api-testnet.bybit.com");
+        assert_eq!(request.origin, "https://api.bybit.com");
         assert_eq!(
             std::str::from_utf8(&request.body)?,
             r#"{"category":"linear","symbol":"BTCUSDT","side":"Buy","orderType":"Limit","qty":"0.001","price":"60000","timeInForce":"GTC","positionIdx":1,"orderLinkId":"MANAGED_CLIENT_ID","reduceOnly":false}"#
@@ -1084,10 +1084,15 @@ mod tests {
     }
 
     #[test]
-    fn cross_mode_signing_and_ambiguous_cancel_are_rejected()
+    fn cross_account_signing_and_ambiguous_cancel_are_rejected()
     -> Result<(), Box<dyn std::error::Error>> {
         let live = facts(GatewayMode::Live)?;
-        let test = facts(GatewayMode::Test)?;
+        let wrong = BybitGatewayBinding::new(GatewayBinding::new(
+            VenueId::Bybit,
+            GatewayMode::Live,
+            "00000000-0000-4000-8000-000000000002",
+            "BTC/USDT".parse()?,
+        )?)?;
         let request = prepare_place_request(
             &live.binding,
             &live.identity,
@@ -1098,7 +1103,7 @@ mod tests {
         )?;
         let credentials = BybitCredentials::from_values("test", "secret")?;
         assert_eq!(
-            sign_prepared_request(&credentials, &test.binding, &request, 1_670_000_000_000).err(),
+            sign_prepared_request(&credentials, &wrong, &request, 1_670_000_000_000).err(),
             Some(BybitExecutionError::Binding)
         );
         assert_eq!(

@@ -27,21 +27,21 @@ pub use account_node_poll::{
     MAX_ACCOUNT_NODE_HTTP_TIMEOUT,
 };
 pub use copy_model::{
-    CopyApplyResult, CopyCrashReplay, CopyDeliveryClaim, CopyDriftProjection, CopyLeaderEnvelope,
-    CopyLeaderIntent, CopyLeaderSnapshot, CopyLedgerProjectionInput, CopyObserverLease,
-    CopyObserverScope, CopyReplayDeliveryState, CopyReplayJob, CopyStoreResult, CopyTestJob,
+    CopyApplyResult, CopyCrashReplay, CopyDeliveryClaim, CopyDriftProjection, CopyJob,
+    CopyLeaderEnvelope, CopyLeaderIntent, CopyLeaderSnapshot, CopyLedgerProjectionInput,
+    CopyObserverLease, CopyObserverScope, CopyReplayDeliveryState, CopyReplayJob, CopyStoreResult,
     MAX_COPY_DELIVERY_CLAIM_MS, MAX_COPY_OBSERVER_LEASE_MS, MAX_COPY_SNAPSHOT_TTL_MS,
     ObservedCopyIntent, ScopedCopyDeliveryReceipt,
 };
 pub use copy_postgres::MIGRATION_0002;
 pub use copy_repository::{CopyRepository, CopyRepositoryError};
 pub use copy_worker::{
-    CopyPlanningSnapshot, CopySemanticJob, CopyTestWorker, CopyTestWorkerConfig, CopyWorkerError,
+    CopyPlanningSnapshot, CopySemanticJob, CopyWorker, CopyWorkerConfig, CopyWorkerError,
     FrozenCapitalSnapshot, MIGRATION_0003, PlannedCopyJob,
 };
 pub use http::{ControlHttpConfig, HttpServerError, control_shutdown_channel, serve_local};
 pub use model::{AccountNodeBinding, ClaimedCommand, ScopedCommandReceipt, StoredEvent};
-pub use postgres::{MIGRATION_0001, PgControlRepository};
+pub use postgres::{MIGRATION_0001, MIGRATION_0005, PgControlRepository};
 pub use repository::{
     CommandEnqueueResult, CommandSettleResult, ControlRepository, RepositoryError,
     SnapshotStoreResult,

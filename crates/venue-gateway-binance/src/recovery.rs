@@ -1452,7 +1452,6 @@ fn scope_commitment(
     commit_bytes(
         &mut digest,
         &[match mode {
-            GatewayMode::Test => 1,
             GatewayMode::Live => 2,
         }],
     );
@@ -1677,7 +1676,7 @@ pub enum BinanceRecoveryCollectorError {
     Replay,
     #[error("Binance recovery request universe is incomplete, duplicated, or inconsistent")]
     RequestUniverse,
-    #[error("Binance recovery production transport does not use the fixed TEST/LIVE endpoint")]
+    #[error("Binance recovery production transport does not use the fixed LIVE endpoint")]
     TransportEndpoint,
     #[error("Binance recovery could not establish a session from a real signed Account GET")]
     Authentication,

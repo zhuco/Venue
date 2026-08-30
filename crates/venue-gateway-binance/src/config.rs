@@ -27,12 +27,6 @@ impl BinanceConfig {
             public_stream_origin,
             private_stream_origin,
         ) = match binding.mode {
-            GatewayMode::Test => (
-                "https://testnet.binancefuture.com",
-                "https://testnet.binancefuture.com",
-                "wss://fstream.binancefuture.com",
-                "wss://fstream.binancefuture.com/pm/ws",
-            ),
             GatewayMode::Live => (
                 "https://papi.binance.com",
                 "https://fapi.binance.com",
@@ -127,29 +121,7 @@ mod tests {
     }
 
     #[test]
-    fn test_and_live_origins_are_fixed_and_disjoint() -> Result<(), Box<dyn std::error::Error>> {
-        let test = BinanceConfig::for_binding(
-            BinanceAccountBinding::PortfolioMarginUm,
-            &binding(GatewayMode::Test)?,
-        )?;
-        assert_eq!(test.mode(), GatewayMode::Test);
-        assert_eq!(
-            test.portfolio_rest_origin(),
-            "https://testnet.binancefuture.com"
-        );
-        assert_eq!(
-            test.usd_m_public_rest_origin(),
-            "https://testnet.binancefuture.com"
-        );
-        assert_eq!(
-            test.public_stream_origin(),
-            "wss://fstream.binancefuture.com"
-        );
-        assert_eq!(
-            test.private_stream_origin(),
-            "wss://fstream.binancefuture.com/pm/ws"
-        );
-
+    fn live_origins_are_fixed_to_production() -> Result<(), Box<dyn std::error::Error>> {
         let live = BinanceConfig::for_binding(
             BinanceAccountBinding::PortfolioMarginUm,
             &binding(GatewayMode::Live)?,
@@ -162,8 +134,6 @@ mod tests {
             live.private_stream_origin(),
             "wss://fstream.binance.com/pm/ws"
         );
-        assert_ne!(test.portfolio_rest_origin(), live.portfolio_rest_origin());
-        assert_ne!(test.private_stream_origin(), live.private_stream_origin());
         Ok(())
     }
 

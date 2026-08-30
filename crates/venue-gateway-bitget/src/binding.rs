@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
+use venue_gateway_api::{GatewayBinding, VenueId};
 
 /// The native UTA product/account mode is deployment identity, not mutation authority.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -28,9 +28,7 @@ impl BitgetAccountBinding {
         if binding.venue != VenueId::Bitget {
             return Err(BitgetBindingError::Venue);
         }
-        match binding.mode {
-            GatewayMode::Test | GatewayMode::Live => Ok(()),
-        }
+        Ok(())
     }
 }
 
@@ -44,6 +42,8 @@ pub enum BitgetBindingError {
 
 #[cfg(test)]
 mod tests {
+    use venue_gateway_api::GatewayMode;
+
     use super::*;
 
     fn binding(
@@ -72,14 +72,9 @@ mod tests {
     }
 
     #[test]
-    fn gateway_identity_accepts_only_bitget_test_or_live() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn gateway_identity_accepts_only_bitget_live() -> Result<(), Box<dyn std::error::Error>> {
         let profile = BitgetAccountBinding::UtaUsdtFuturesHedge;
         assert!("SHADOW".parse::<GatewayMode>().is_err());
-        assert_eq!(
-            profile.validate_gateway_binding(&binding(VenueId::Bitget, GatewayMode::Test)?),
-            Ok(())
-        );
         assert_eq!(
             profile.validate_gateway_binding(&binding(VenueId::Bitget, GatewayMode::Live)?),
             Ok(())

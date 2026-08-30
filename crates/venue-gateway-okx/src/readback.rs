@@ -1153,7 +1153,7 @@ mod tests {
     {
         let config = OkxConfig::for_binding(GatewayBinding::new(
             VenueId::Okx,
-            GatewayMode::Test,
+            GatewayMode::Live,
             "00000000-0000-4000-8000-000000000001",
             "BTC/USDT".parse()?,
         )?)?;
@@ -1235,7 +1235,7 @@ mod tests {
             &config,
             "2026-08-30T01:02:03.000Z",
         )?;
-        assert_eq!(headers.get("x-simulated-trading"), Some("1"));
+        assert_eq!(headers.get("x-simulated-trading"), None);
         assert_eq!(
             build_regular_orders_request(&scope, 1, None),
             Err(OkxError::Pagination)

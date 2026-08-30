@@ -25,7 +25,7 @@ use venue_execution::{CommandJournal, CommandState, WriterLeaseError};
 use venue_gateway_api::{
     CanaryAdmissionReceipt, CapabilityFlags, CapabilityProbeCandidate, CapabilityPromotionError,
     CapabilitySnapshot, CompleteOrderFamilyEvidence, ControlAppliedReceipt, ControlState,
-    EvidenceCommitment, GatewayBinding, GatewayMode, HostAdmissionEvidence, OrderFamilyEvidence,
+    EvidenceCommitment, GatewayBinding, HostAdmissionEvidence, OrderFamilyEvidence,
     OrderFamilySupport, OwnerRecoveryReceipt, PromotionScope, VenueId, WalRecoveryReceipt,
     WriterFenceReceipt, promote_capability,
 };
@@ -716,7 +716,7 @@ fn wrong_binding_or_mode_fails_before_artifact_creation() -> Result<(), Box<dyn 
     let launch = launch(&directory, "LIVE")?;
     let owner = owner(launch.binding())?;
     let mut wrong_binding = launch.binding().clone();
-    wrong_binding.mode = GatewayMode::Test;
+    wrong_binding.venue = VenueId::Gate;
     let gateway = FakeGateway::new(wrong_binding, vec![ReadbackPlan::initial()]);
 
     let result = NodeSafetyHost::open_for_test(
@@ -1105,7 +1105,7 @@ fn capability_binding_mismatch_fails_before_artifacts_or_gateway_calls()
     let launch = launch(&directory, "LIVE")?;
     let owner = owner(launch.binding())?;
     let mut gateway = FakeGateway::new(launch.binding().clone(), vec![ReadbackPlan::initial()]);
-    gateway.capability.binding.mode = GatewayMode::Test;
+    gateway.capability.binding.venue = VenueId::Gate;
     let result = NodeSafetyHost::open_for_test(&launch, owner, gateway, None, 1_000);
 
     assert!(matches!(

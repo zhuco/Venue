@@ -338,9 +338,6 @@ impl OkxHttpTransport {
                 HeaderValue::from_str(value).map_err(|_| OkxTransportError::Configuration)?;
             builder = builder.header(name, value);
         }
-        if let Some(value) = signed.get("x-simulated-trading") {
-            builder = builder.header("x-simulated-trading", value);
-        }
         if !body.is_empty() {
             builder = builder.body(body.to_vec());
         }
@@ -890,7 +887,7 @@ mod tests {
             CommandId, OrderCommand, OrderOwner, OrderPurpose, OrderSide, PositionSide, Price,
         };
 
-        let (config, instrument, profile) = scope(GatewayMode::Test, 7)?;
+        let (config, instrument, profile) = scope(GatewayMode::Live, 7)?;
         let command = OrderCommand {
             command_id: CommandId::new("place3")?,
             client_order_id: CommandId::new("00000000000000000000000000000003")?,
@@ -929,11 +926,17 @@ mod tests {
         assert_eq!(received.body, Bytes::from_static(b"{}"));
         assert_eq!(received.instrument_generation, 7);
         let wire = String::from_utf8(captured.lock().await.clone())?;
-        assert!(wire.contains("x-simulated-trading: 1"));
+        assert!(!wire.contains("x-simulated-trading"));
         assert!(wire.contains("ok-access-sign:"));
 
-        let (live, _, _) = scope(GatewayMode::Live, 7)?;
-        let wrong = OkxHttpTransport::with_origin(live, &origin, Duration::from_secs(1), 256)?;
+        let wrong_config = OkxConfig::for_binding(GatewayBinding::new(
+            VenueId::Okx,
+            GatewayMode::Live,
+            "00000000-0000-4000-8000-000000000001",
+            "ETH/USDT".parse()?,
+        )?)?;
+        let wrong =
+            OkxHttpTransport::with_origin(wrong_config, &origin, Duration::from_secs(1), 256)?;
         assert_eq!(
             wrong
                 .execute(
@@ -1037,7 +1040,7 @@ mod tests {
         use venue_domain::domain::{
             CommandId, OrderCommand, OrderOwner, OrderPurpose, OrderSide, PositionSide, Price,
         };
-        let (config, instrument, profile) = scope(GatewayMode::Test, 7)?;
+        let (config, instrument, profile) = scope(GatewayMode::Live, 7)?;
         let command = OrderCommand {
             command_id: CommandId::new("place-once")?,
             client_order_id: CommandId::new("placeonce7")?,
@@ -1265,7 +1268,7 @@ mod tests {
                 .into(),
         );
         let endpoint = ws_server(acknowledgements(), Some(push), None).await?;
-        let (config, instrument, profile) = scope(GatewayMode::Test, 9)?;
+        let (config, instrument, profile) = scope(GatewayMode::Live, 9)?;
         let mut transport = OkxPrivateWsTransport::connect_to(
             &endpoint,
             &config,
@@ -1389,7 +1392,7 @@ mod tests {
             let _ = socket.next().await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         });
-        let (config, instrument, profile) = scope(GatewayMode::Test, 9)?;
+        let (config, instrument, profile) = scope(GatewayMode::Live, 9)?;
         assert!(matches!(
             OkxPrivateWsTransport::connect_to(
                 &endpoint,
@@ -1429,7 +1432,7 @@ mod tests {
                 .await?;
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         });
-        let (config, instrument, profile) = scope(GatewayMode::Test, 9)?;
+        let (config, instrument, profile) = scope(GatewayMode::Live, 9)?;
         let mut transport = OkxPrivateWsTransport::connect_to(
             &endpoint,
             &config,
@@ -1470,7 +1473,7 @@ mod tests {
             let _ = socket.next().await;
             tokio::time::sleep(Duration::from_millis(200)).await;
         });
-        let (config, instrument, profile) = scope(GatewayMode::Test, 9)?;
+        let (config, instrument, profile) = scope(GatewayMode::Live, 9)?;
         let mut transport = OkxPrivateWsTransport::connect_to(
             &endpoint,
             &config,
@@ -1546,7 +1549,7 @@ mod tests {
                 let _ = socket.send(Message::Text("x".repeat(1024).into())).await;
             }
         });
-        let (config, instrument, profile) = scope(GatewayMode::Test, 9)?;
+        let (config, instrument, profile) = scope(GatewayMode::Live, 9)?;
         assert!(matches!(
             OkxPrivateWsTransport::connect_to(
                 &endpoint,

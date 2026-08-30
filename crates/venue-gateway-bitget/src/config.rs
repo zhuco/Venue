@@ -12,12 +12,6 @@ impl BitgetConfig {
     #[must_use]
     pub const fn for_mode(mode: GatewayMode) -> Self {
         match mode {
-            GatewayMode::Test => Self {
-                mode,
-                rest_origin: "https://api.bitget.com",
-                public_ws: "wss://wspap.bitget.com/v3/ws/public",
-                private_ws: "wss://wspap.bitget.com/v3/ws/private",
-            },
             GatewayMode::Live => Self {
                 mode,
                 rest_origin: "https://api.bitget.com",
@@ -46,11 +40,6 @@ impl BitgetConfig {
     pub const fn private_ws(&self) -> &'static str {
         self.private_ws
     }
-
-    #[must_use]
-    pub const fn paper_trading(&self) -> bool {
-        matches!(self.mode, GatewayMode::Test)
-    }
 }
 
 #[cfg(test)]
@@ -58,19 +47,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_exactly_demo_and_live_is_exactly_production() {
-        let test = BitgetConfig::for_mode(GatewayMode::Test);
-        assert_eq!(test.rest_origin(), "https://api.bitget.com");
-        assert_eq!(test.public_ws(), "wss://wspap.bitget.com/v3/ws/public");
-        assert_eq!(test.private_ws(), "wss://wspap.bitget.com/v3/ws/private");
-        assert!(test.paper_trading());
-        assert_eq!(test.mode(), GatewayMode::Test);
-
+    fn live_selects_only_production_endpoints() {
         let live = BitgetConfig::for_mode(GatewayMode::Live);
         assert_eq!(live.rest_origin(), "https://api.bitget.com");
         assert_eq!(live.public_ws(), "wss://ws.bitget.com/v3/ws/public");
         assert_eq!(live.private_ws(), "wss://ws.bitget.com/v3/ws/private");
-        assert!(!live.paper_trading());
         assert_eq!(live.mode(), GatewayMode::Live);
     }
 }

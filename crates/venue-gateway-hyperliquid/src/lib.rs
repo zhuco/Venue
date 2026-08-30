@@ -151,24 +151,19 @@ mod tests {
     }
 
     #[test]
-    fn binding_and_config_accept_only_hyperliquid_test_or_live()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn binding_and_config_accept_only_hyperliquid_live() -> Result<(), Box<dyn std::error::Error>> {
         assert!("SHADOW".parse::<GatewayMode>().is_err());
-        let test =
-            HyperliquidGatewayBinding::new(binding(VenueId::Hyperliquid, GatewayMode::Test)?)?;
+        let rejected = serde_json::from_str::<GatewayBinding>(
+            r#"{"venue":"hyperliquid","mode":"TEST","trading_account_id":"00000000-0000-4000-8000-000000000001","symbol":"BTC/USDC"}"#,
+        );
+        assert!(rejected.is_err());
         let live =
             HyperliquidGatewayBinding::new(binding(VenueId::Hyperliquid, GatewayMode::Live)?)?;
-        let test_config = HyperliquidConfig::for_binding(&test);
         let live_config = HyperliquidConfig::for_binding(&live);
-        assert_eq!(test_config.mode(), GatewayMode::Test);
         assert_eq!(live_config.mode(), GatewayMode::Live);
-        assert_eq!(
-            test_config.rest_origin(),
-            "https://api.hyperliquid-testnet.xyz"
-        );
         assert_eq!(live_config.rest_origin(), "https://api.hyperliquid.xyz");
-        assert_ne!(test_config.websocket(), live_config.websocket());
-        assert_eq!(test.gateway_binding().symbol.to_string(), "BTC/USDC");
+        assert_eq!(live_config.websocket(), "wss://api.hyperliquid.xyz/ws");
+        assert_eq!(live.gateway_binding().symbol.to_string(), "BTC/USDC");
         assert_eq!(capabilities(), CapabilityFlags::empty());
         Ok(())
     }
@@ -279,11 +274,11 @@ mod tests {
     #[test]
     fn meta_and_books_bind_native_coin_user_symbol_and_mode()
     -> Result<(), Box<dyn std::error::Error>> {
-        let meta = meta(GatewayMode::Test)?;
+        let meta = meta(GatewayMode::Live)?;
         assert_eq!(meta.scope.native_coin(), "BTC");
         assert_eq!(meta.scope.user_address(), USER);
         assert_eq!(meta.scope.symbol().to_string(), "BTC/USDC");
-        assert_eq!(meta.scope.mode(), GatewayMode::Test);
+        assert_eq!(meta.scope.mode(), GatewayMode::Live);
         assert_eq!(meta.asset_index, 0);
         assert_eq!(meta.size_decimals, 5);
         let bbo = parse_l2_book_bbo(BOOK, &meta)?;
@@ -366,7 +361,7 @@ mod tests {
     #[test]
     fn private_fill_fixture_preserves_composite_identity_without_fake_sequence()
     -> Result<(), Box<dyn std::error::Error>> {
-        let meta = meta(GatewayMode::Test)?;
+        let meta = meta(GatewayMode::Live)?;
         let page = parse_private_user_fills(PRIVATE_EVENTS, &meta)?;
         assert!(!page.is_snapshot);
         assert_eq!(page.fills.len(), 1);
@@ -398,7 +393,7 @@ mod tests {
     #[test]
     fn fill_page_is_sorted_filtered_and_explicitly_closed() -> Result<(), Box<dyn std::error::Error>>
     {
-        let selected = meta(GatewayMode::Test)?;
+        let selected = meta(GatewayMode::Live)?;
         let first = parse_user_fills_page(
             FILLS_PAGE,
             &selected,
@@ -438,7 +433,7 @@ mod tests {
     #[test]
     fn wrong_user_coin_or_malformed_book_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
         let wrong_user = HyperliquidReadBinding::new(
-            HyperliquidGatewayBinding::new(binding(VenueId::Hyperliquid, GatewayMode::Test)?)?,
+            HyperliquidGatewayBinding::new(binding(VenueId::Hyperliquid, GatewayMode::Live)?)?,
             "0x3333333333333333333333333333333333333333",
         )?;
         let wrong_user_meta = parse_perp_meta(META, &wrong_user)?;
@@ -448,7 +443,7 @@ mod tests {
         );
         let eth_binding = GatewayBinding::new(
             VenueId::Hyperliquid,
-            GatewayMode::Test,
+            GatewayMode::Live,
             "00000000-0000-4000-8000-000000000001",
             "ETH/USDC".parse()?,
         )?;
@@ -470,7 +465,7 @@ mod tests {
     #[test]
     fn duplicate_fill_cursor_and_missing_required_maker_fact_fail_closed()
     -> Result<(), Box<dyn std::error::Error>> {
-        let meta = meta(GatewayMode::Test)?;
+        let meta = meta(GatewayMode::Live)?;
         let mut duplicate: Vec<serde_json::Value> = serde_json::from_slice(FILLS_PAGE)?;
         duplicate.push(duplicate[1].clone());
         assert_eq!(
@@ -495,16 +490,12 @@ mod tests {
     }
 
     #[test]
-    fn info_request_bodies_are_exact_and_keep_test_live_scope()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let test = meta(GatewayMode::Test)?;
+    fn info_request_bodies_are_exact_and_keep_live_scope() -> Result<(), Box<dyn std::error::Error>>
+    {
         let live = meta(GatewayMode::Live)?;
-        let meta_request = build_meta_request(test.scope.binding())?;
-        assert_eq!(meta_request.mode(), GatewayMode::Test);
-        assert_eq!(
-            meta_request.rest_origin(),
-            "https://api.hyperliquid-testnet.xyz"
-        );
+        let meta_request = build_meta_request(live.scope.binding())?;
+        assert_eq!(meta_request.mode(), GatewayMode::Live);
+        assert_eq!(meta_request.rest_origin(), "https://api.hyperliquid.xyz");
         assert_eq!(meta_request.endpoint(), "/info");
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(meta_request.body())?,
@@ -520,17 +511,17 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(
-                build_clearinghouse_state_request(&test)?.body()
+                build_clearinghouse_state_request(&live)?.body()
             )?,
             serde_json::json!({"type":"clearinghouseState","user":USER})
         );
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(build_open_orders_request(&test)?.body())?,
+            serde_json::from_slice::<serde_json::Value>(build_open_orders_request(&live)?.body())?,
             serde_json::json!({"type":"frontendOpenOrders","user":USER})
         );
 
         let query =
-            HyperliquidFillQuery::new(&test, 1_700_000_000_001, 1_700_000_000_002, 1, None)?;
+            HyperliquidFillQuery::new(&live, 1_700_000_000_001, 1_700_000_000_002, 1, None)?;
         let request = build_user_fills_by_time_request(&query)?;
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(request.body())?,
@@ -547,17 +538,17 @@ mod tests {
                 .get("limit")
                 .is_none()
         );
-        assert!(HyperliquidFillQuery::new(&test, 0, 1, 1, None).is_err());
-        assert!(HyperliquidFillQuery::new(&test, 2, 1, 1, None).is_err());
-        assert!(HyperliquidFillQuery::new(&test, 1, 2, 0, None).is_err());
-        assert!(HyperliquidFillQuery::new(&test, 1, 2, 2_001, None).is_err());
+        assert!(HyperliquidFillQuery::new(&live, 0, 1, 1, None).is_err());
+        assert!(HyperliquidFillQuery::new(&live, 2, 1, 1, None).is_err());
+        assert!(HyperliquidFillQuery::new(&live, 1, 2, 0, None).is_err());
+        assert!(HyperliquidFillQuery::new(&live, 1, 2, 2_001, None).is_err());
         Ok(())
     }
 
     #[test]
     fn inclusive_fill_cursor_and_order_status_recovery_are_bound_and_strict()
     -> Result<(), Box<dyn std::error::Error>> {
-        let selected = meta(GatewayMode::Test)?;
+        let selected = meta(GatewayMode::Live)?;
         let first = parse_user_fills_page(
             FILLS_PAGE,
             &selected,
@@ -574,9 +565,21 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(build_user_fills_by_time_request(&next)?.body())?;
         assert_eq!(body["startTime"], cursor.time_ms());
+        let wrong = parse_perp_meta(
+            META,
+            &HyperliquidReadBinding::new(
+                HyperliquidGatewayBinding::new(GatewayBinding::new(
+                    VenueId::Hyperliquid,
+                    GatewayMode::Live,
+                    "00000000-0000-4000-8000-000000000002",
+                    "BTC/USDC".parse()?,
+                )?)?,
+                USER,
+            )?,
+        )?;
         assert_eq!(
             HyperliquidFillQuery::new(
-                &meta(GatewayMode::Live)?,
+                &wrong,
                 1_700_000_000_001,
                 1_700_000_000_002,
                 10,
@@ -642,14 +645,14 @@ mod tests {
     #[test]
     fn private_subscriptions_are_exact_and_generation_scoped()
     -> Result<(), Box<dyn std::error::Error>> {
-        let meta = meta(GatewayMode::Test)?;
+        let meta = meta(GatewayMode::Live)?;
         assert_eq!(
             HyperliquidPrivateStreamBinding::new(&meta, 0),
             Err(HyperliquidError::Binding)
         );
         let binding = HyperliquidPrivateStreamBinding::new(&meta, 7)?;
         assert_eq!(binding.generation(), 7);
-        assert_eq!(binding.mode(), GatewayMode::Test);
+        assert_eq!(binding.mode(), GatewayMode::Live);
         assert_eq!(binding.scope().user_address(), USER);
         assert_eq!(binding.scope().symbol().to_string(), "BTC/USDC");
 
@@ -683,7 +686,7 @@ mod tests {
             let request = build_private_subscription(&binding, kind)?;
             assert_eq!(request.binding(), &binding);
             assert_eq!(request.kind(), kind);
-            assert_eq!(request.websocket(), "wss://api.hyperliquid-testnet.xyz/ws");
+            assert_eq!(request.websocket(), "wss://api.hyperliquid.xyz/ws");
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(request.body())?,
                 expected
@@ -780,7 +783,7 @@ mod tests {
     fn private_stream_rejects_generation_user_coin_duplicate_and_time_rollback()
     -> Result<(), Box<dyn std::error::Error>> {
         let frames: Vec<serde_json::Value> = serde_json::from_slice(PRIVATE_STREAM)?;
-        let binding = HyperliquidPrivateStreamBinding::new(&meta(GatewayMode::Test)?, 17)?;
+        let binding = HyperliquidPrivateStreamBinding::new(&meta(GatewayMode::Live)?, 17)?;
         let order = serde_json::to_vec(&frames[0])?;
         let fills = serde_json::to_vec(&frames[1])?;
 
@@ -857,7 +860,7 @@ mod tests {
         wrong_fill_coin["data"]["fills"][0]["coin"] = serde_json::json!("ETH");
         assert_eq!(
             HyperliquidPrivateStreamDecoder::new(HyperliquidPrivateStreamBinding::new(
-                &meta(GatewayMode::Test)?,
+                &meta(GatewayMode::Live)?,
                 19
             )?)
             .decode(
@@ -872,7 +875,7 @@ mod tests {
         wrong_fill_cloid["data"]["fills"][0]["cloid"] = serde_json::json!("not-a-cloid");
         assert_eq!(
             HyperliquidPrivateStreamDecoder::new(HyperliquidPrivateStreamBinding::new(
-                &meta(GatewayMode::Test)?,
+                &meta(GatewayMode::Live)?,
                 21
             )?)
             .decode(
@@ -884,7 +887,7 @@ mod tests {
         );
 
         let mut fill_decoder = HyperliquidPrivateStreamDecoder::new(
-            HyperliquidPrivateStreamBinding::new(&meta(GatewayMode::Test)?, 18)?,
+            HyperliquidPrivateStreamBinding::new(&meta(GatewayMode::Live)?, 18)?,
         );
         assert_eq!(fill_decoder.decode(&fills, 18, 1_700_000_000_010)?.len(), 2);
         assert_eq!(
@@ -899,7 +902,7 @@ mod tests {
             .remove("isSnapshot");
         assert_eq!(
             HyperliquidPrivateStreamDecoder::new(HyperliquidPrivateStreamBinding::new(
-                &meta(GatewayMode::Test)?,
+                &meta(GatewayMode::Live)?,
                 20
             )?)
             .decode(

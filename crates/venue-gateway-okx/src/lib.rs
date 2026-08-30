@@ -148,17 +148,14 @@ mod tests {
     }
 
     #[test]
-    fn one_binding_selects_only_its_test_or_live_transport()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let test = config(GatewayMode::Test)?;
+    fn one_binding_selects_only_live_production_transport() -> Result<(), Box<dyn std::error::Error>>
+    {
         let live = config(GatewayMode::Live)?;
-        assert!(test.simulated_trading());
-        assert!(!live.simulated_trading());
-        assert!(test.private_ws().contains("wspap.okx.com"));
-        assert!(live.private_ws().contains("ws.okx.com"));
-        assert_eq!(test.gateway_binding().mode, GatewayMode::Test);
+        assert_eq!(live.rest_origin(), "https://www.okx.com");
+        assert_eq!(live.public_ws(), "wss://ws.okx.com:8443/ws/v5/public");
+        assert_eq!(live.private_ws(), "wss://ws.okx.com:8443/ws/v5/private");
         assert_eq!(live.gateway_binding().mode, GatewayMode::Live);
-        assert_eq!(test.gateway_binding().symbol.to_string(), "BTC/USDT");
+        assert_eq!(live.gateway_binding().symbol.to_string(), "BTC/USDT");
         assert_eq!(capabilities(), CapabilityFlags::empty());
         Ok(())
     }
@@ -166,7 +163,7 @@ mod tests {
     #[test]
     fn signing_preserves_the_okx_fixed_vector() -> Result<(), OkxError> {
         let credentials = OkxCredentials::from_values("key", "mysecret", "pass")?;
-        let config = config(GatewayMode::Test).map_err(|_| OkxError::Binding)?;
+        let config = config(GatewayMode::Live).map_err(|_| OkxError::Binding)?;
         let headers = sign(
             &credentials,
             &config,
@@ -179,7 +176,7 @@ mod tests {
             headers.get("OK-ACCESS-SIGN"),
             Some("7dqjFHmbJfEEOQc+0wMh6KyqlUAh5C2x6vqL7qZTilE=")
         );
-        assert_eq!(headers.get("x-simulated-trading"), Some("1"));
+        assert_eq!(headers.get("x-simulated-trading"), None);
         Ok(())
     }
 

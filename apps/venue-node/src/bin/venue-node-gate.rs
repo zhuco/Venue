@@ -10,7 +10,7 @@ use venue_domain::domain::{
     CommandId, ExecutionCommand, FieldState, NativeOrderFamily, OrderOwner, OrderPurpose,
     OrderState, PositionSide,
 };
-use venue_gateway_api::{CapabilitySnapshot, GatewayBinding, GatewayMode, VenueId};
+use venue_gateway_api::{CapabilitySnapshot, GatewayBinding, VenueId};
 use venue_gateway_gate::{
     GATE_STAGE7_ORDER_PROFILE_VERSION, GateCancelIntent, GateConfig, GateContractRules,
     GateFillsCursor, GateGatewayBinding, GateMutationKind, GateMutationSettlement,
@@ -21,7 +21,7 @@ use venue_node::{
     AdapterIsolation, DispatchPermit, FamilyReadbackCoverage, GatewayAcknowledgement,
     GatewayDispatchResult, GatewayRecoveryPermit, NodeError, NodeLaunch, PhysicalGateway,
     SignedCommandReadback, SignedOwnedOrder, SignedReadbackReceipt, SignedReadbackRequest,
-    reject_unintegrated_legacy_test_runtime, report_result,
+    report_result,
 };
 use venue_runtime::account::PhysicalRecoveryReadbackManifest;
 
@@ -692,9 +692,6 @@ fn run() -> Result<(), NodeError> {
         account_binding,
     }
     .validate(launch.binding())?;
-    if launch.binding().mode == GatewayMode::Test {
-        return reject_unintegrated_legacy_test_runtime(VenueId::Gate);
-    }
     venue::start_hedged_grid_gate_deployment(cli).map_err(|error| NodeError::ExistingRuntime {
         venue: VenueId::Gate,
         message: error.to_string(),
@@ -893,7 +890,7 @@ mod tests {
         fills_payload: &str,
         cursor: Option<&str>,
     ) -> Result<Vec<GateRawPrivateResponse>, Box<dyn std::error::Error>> {
-        let binding = binding(GatewayMode::Test)?;
+        let binding = binding(GatewayMode::Live)?;
         let rules = rules()?;
         Ok(vec![
             raw(
@@ -928,7 +925,7 @@ mod tests {
     }
 
     fn private_candidate() -> Result<GatePrivateReadbackCandidate, Box<dyn std::error::Error>> {
-        let binding = binding(GatewayMode::Test)?;
+        let binding = binding(GatewayMode::Live)?;
         let rules = rules()?;
         Ok(validate_private_readback(
             &binding,
@@ -951,7 +948,7 @@ mod tests {
         roots: PhysicalRecoveryAuthorityRoots,
     ) -> Result<PhysicalRecoveryScope, Box<dyn std::error::Error>> {
         Ok(PhysicalRecoveryScope::verified(
-            binding(GatewayMode::Test)?.gateway_binding().clone(),
+            binding(GatewayMode::Live)?.gateway_binding().clone(),
             "gate_config_28",
             28,
             1,
@@ -1060,27 +1057,21 @@ mod tests {
     }
 
     #[test]
-    fn candidate_binds_exact_test_live_origins_without_connecting()
+    fn candidate_binds_exact_live_origins_without_connecting()
     -> Result<(), Box<dyn std::error::Error>> {
         let captured = Rc::new(RefCell::new(Vec::new()));
-        for (mode, rest, websocket) in [
-            (
-                GatewayMode::Test,
-                "https://api-testnet.gateapi.io/api/v4",
-                "wss://ws-testnet.gate.com/v4/ws/futures/usdt",
-            ),
-            (
-                GatewayMode::Live,
-                "https://api.gateio.ws/api/v4",
-                "wss://fx-ws.gateio.ws/v4/ws/usdt",
-            ),
-        ] {
-            let gateway = gateway(mode, None, Vec::new(), Rc::clone(&captured))?;
-            assert_eq!(gateway.binding.config().mode(), mode);
-            assert_eq!(gateway.binding.config().rest_origin(), rest);
-            assert_eq!(gateway.binding.config().usdt_futures_ws(), websocket);
-            assert!(!gateway.connected);
-        }
+        let mode = GatewayMode::Live;
+        let gateway = gateway(mode, None, Vec::new(), Rc::clone(&captured))?;
+        assert_eq!(gateway.binding.config().mode(), mode);
+        assert_eq!(
+            gateway.binding.config().rest_origin(),
+            "https://api.gateio.ws/api/v4"
+        );
+        assert_eq!(
+            gateway.binding.config().usdt_futures_ws(),
+            "wss://fx-ws.gateio.ws/v4/ws/usdt"
+        );
+        assert!(!gateway.connected);
         Ok(())
     }
 
@@ -1088,7 +1079,7 @@ mod tests {
     fn candidate_requires_hedge_legs_regular_profile_and_exact_fill_cursor()
     -> Result<(), Box<dyn std::error::Error>> {
         let captured = Rc::new(RefCell::new(Vec::new()));
-        let gateway = gateway(GatewayMode::Test, Some("227262265"), Vec::new(), captured)?;
+        let gateway = gateway(GatewayMode::Live, Some("227262265"), Vec::new(), captured)?;
         let candidate = private_candidate()?;
         gateway.validate_candidate(&candidate)?;
         assert_eq!(candidate.positions[0].side, PositionSide::Long);
@@ -1175,7 +1166,7 @@ mod tests {
     #[test]
     fn missing_page_and_mixed_attempt_or_collection_generation_fail_before_mapping()
     -> Result<(), Box<dyn std::error::Error>> {
-        let binding = binding(GatewayMode::Test)?;
+        let binding = binding(GatewayMode::Live)?;
         let rules = rules()?;
         let responses = private_responses("[]", "[]", None)?;
         for missing in [
@@ -1235,7 +1226,7 @@ mod tests {
     #[test]
     fn empty_regular_and_fills_are_explicit_complete_faces_not_omissions()
     -> Result<(), Box<dyn std::error::Error>> {
-        let binding = binding(GatewayMode::Test)?;
+        let binding = binding(GatewayMode::Live)?;
         let rules = rules()?;
         let candidate = validate_private_readback(
             &binding,
@@ -1350,7 +1341,7 @@ mod tests {
                 GateSettlementFinality::Terminal,
             ),
         ];
-        let mut gateway = gateway(GatewayMode::Test, None, dispatches, Rc::clone(&captured))?;
+        let mut gateway = gateway(GatewayMode::Live, None, dispatches, Rc::clone(&captured))?;
 
         assert!(matches!(
             gateway.dispatch_authorized_command(limit_command()?),

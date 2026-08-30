@@ -135,7 +135,7 @@ fn recovery_snapshot(
 ) -> Result<AccountRecoverySnapshot, Box<dyn Error>> {
     let commitment = RecoveryManifestCommitment::test_for_replayed_state(
         &account,
-        GatewayMode::Test,
+        GatewayMode::Live,
         AccountPositionMode::Hedge,
         &journal_roots,
         last_connection_generation,
@@ -147,7 +147,7 @@ fn recovery_snapshot(
     )?;
     Ok(AccountRecoverySnapshot::verified(
         account,
-        GatewayMode::Test,
+        GatewayMode::Live,
         AccountPositionMode::Hedge,
         journal_roots,
         commitment,
@@ -610,29 +610,26 @@ fn production_physical_recovery_is_unavailable_for_live_test_and_multi_strategy_
         .physical_recovery_authority_roots()
         .cloned()
         .ok_or("physical recovery roots missing")?;
-    let mut previous_attempt = replacement.attempt_id();
-    for mode in [GatewayMode::Test, GatewayMode::Live] {
-        let manifest = physical_manifest(
-            &runtime,
-            GatewayBinding::new(
-                VenueId::Binance,
-                mode,
-                account.account.clone(),
-                grid.key.symbol.clone(),
-            )?,
-            expected_roots.clone(),
-            1,
-            0,
-            1,
-        )?;
-        assert!(matches!(
-            runtime.install_physical_recovery_manifest(manifest),
-            Err(AccountRuntimeError::PhysicalRecoveryIntegrationUnavailable)
-        ));
-        let replacement = runtime.issue_physical_recovery_session()?;
-        assert!(replacement.attempt_id() > previous_attempt);
-        previous_attempt = replacement.attempt_id();
-    }
+    let previous_attempt = replacement.attempt_id();
+    let manifest = physical_manifest(
+        &runtime,
+        GatewayBinding::new(
+            VenueId::Binance,
+            GatewayMode::Live,
+            account.account.clone(),
+            grid.key.symbol.clone(),
+        )?,
+        expected_roots,
+        1,
+        0,
+        1,
+    )?;
+    assert!(matches!(
+        runtime.install_physical_recovery_manifest(manifest),
+        Err(AccountRuntimeError::PhysicalRecoveryIntegrationUnavailable)
+    ));
+    let replacement = runtime.issue_physical_recovery_session()?;
+    assert!(replacement.attempt_id() > previous_attempt);
     assert_eq!(runtime.health(), AccountHealth::Starting);
     assert_eq!(runtime.connection_generation(), 0);
     Ok(())
@@ -748,7 +745,7 @@ fn manifest_commitment_rejects_truncated_routes_and_unknown_mutations() -> Resul
     )?];
     let commitment = RecoveryManifestCommitment::test_for_replayed_state(
         &account,
-        GatewayMode::Test,
+        GatewayMode::Live,
         AccountPositionMode::Hedge,
         &roots,
         1,
@@ -762,7 +759,7 @@ fn manifest_commitment_rejects_truncated_routes_and_unknown_mutations() -> Resul
     assert!(matches!(
         AccountRecoverySnapshot::verified(
             account.clone(),
-            GatewayMode::Test,
+            GatewayMode::Live,
             AccountPositionMode::Hedge,
             roots.clone(),
             commitment.clone(),
@@ -778,7 +775,7 @@ fn manifest_commitment_rejects_truncated_routes_and_unknown_mutations() -> Resul
     assert!(matches!(
         AccountRecoverySnapshot::verified(
             account,
-            GatewayMode::Test,
+            GatewayMode::Live,
             AccountPositionMode::Hedge,
             roots,
             commitment,

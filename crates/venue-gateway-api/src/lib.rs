@@ -72,8 +72,6 @@ impl FromStr for VenueId {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum GatewayMode {
-    #[serde(rename = "TEST")]
-    Test,
     #[serde(rename = "LIVE")]
     Live,
 }
@@ -82,7 +80,6 @@ impl GatewayMode {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Test => "TEST",
             Self::Live => "LIVE",
         }
     }
@@ -98,8 +95,7 @@ impl FromStr for GatewayMode {
     type Err = GatewayApiError;
 
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        match raw.trim() {
-            "TEST" => Ok(Self::Test),
+        match raw {
             "LIVE" => Ok(Self::Live),
             _ => Err(GatewayApiError::Mode),
         }
@@ -308,7 +304,7 @@ impl CapabilitySnapshot {
 pub enum GatewayApiError {
     #[error("venue must be Binance, Bitget, Bybit, Gate.io, Hyperliquid, or OKX")]
     Venue,
-    #[error("gateway mode must be exactly TEST or LIVE")]
+    #[error("gateway mode must be exactly LIVE")]
     Mode,
     #[error("trading account id must be a canonical UUID string")]
     TradingAccountId,
@@ -341,22 +337,23 @@ mod tests {
     }
 
     #[test]
-    fn gateway_mode_rejects_shadow_and_implicit_case_variants() {
-        assert_eq!("TEST".parse(), Ok(GatewayMode::Test));
+    fn gateway_mode_accepts_only_exact_live() {
         assert_eq!("LIVE".parse(), Ok(GatewayMode::Live));
-        assert!("Shadow".parse::<GatewayMode>().is_err());
-        assert!("live".parse::<GatewayMode>().is_err());
-        assert!("".parse::<GatewayMode>().is_err());
+        for rejected in ["TEST", "Shadow", "live", " LIVE", "LIVE ", ""] {
+            assert!(rejected.parse::<GatewayMode>().is_err());
+        }
     }
 
     #[test]
     fn serde_preserves_the_explicit_mode_boundary() -> Result<(), serde_json::Error> {
-        assert_eq!(serde_json::to_string(&GatewayMode::Test)?, "\"TEST\"");
+        assert_eq!(serde_json::to_string(&GatewayMode::Live)?, "\"LIVE\"");
         assert_eq!(
             serde_json::from_str::<GatewayMode>("\"LIVE\"")?,
             GatewayMode::Live
         );
-        assert!(serde_json::from_str::<GatewayMode>("\"SHADOW\"").is_err());
+        for rejected in ["\"TEST\"", "\"SHADOW\"", "\"live\""] {
+            assert!(serde_json::from_str::<GatewayMode>(rejected).is_err());
+        }
         Ok(())
     }
 
@@ -389,7 +386,7 @@ mod tests {
     fn binding_requires_a_canonical_account_id() -> Result<(), Box<dyn std::error::Error>> {
         let symbol = "BTC/USDT".parse()?;
         assert_eq!(
-            GatewayBinding::new(VenueId::Okx, GatewayMode::Test, "account-name", symbol),
+            GatewayBinding::new(VenueId::Okx, GatewayMode::Live, "account-name", symbol),
             Err(GatewayApiError::TradingAccountId)
         );
         Ok(())

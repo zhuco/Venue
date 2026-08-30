@@ -912,7 +912,7 @@ mod tests {
     fn complete_readback_closes_hedge_legs_families_and_fill_cursor()
     -> Result<(), Box<dyn std::error::Error>> {
         let (config, rules, scope) = facts(
-            GatewayMode::Test,
+            GatewayMode::Live,
             "00000000-0000-4000-8000-000000000001",
             7,
             17,
@@ -947,7 +947,7 @@ mod tests {
         assert_eq!(candidate.fills_cursor.last_trade_id, Some(301));
         assert_eq!(candidate.fills_cursor.observed_through_ms, 2_000);
         assert_ne!(candidate.raw_payload_digest, [0; 32]);
-        assert_eq!(config.mode(), GatewayMode::Test);
+        assert_eq!(config.mode(), GatewayMode::Live);
         Ok(())
     }
 
@@ -955,7 +955,7 @@ mod tests {
     fn net_mode_is_one_complete_signed_leg_and_preserves_directional_quantity()
     -> Result<(), Box<dyn std::error::Error>> {
         let (config, rules, scope) = facts(
-            GatewayMode::Test,
+            GatewayMode::Live,
             "00000000-0000-4000-8000-000000000001",
             7,
             17,
@@ -1057,7 +1057,7 @@ mod tests {
     fn fills_use_bounded_pages_and_never_mix_from_id_with_time_bounds()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_, _, scope) = facts(
-            GatewayMode::Test,
+            GatewayMode::Live,
             "00000000-0000-4000-8000-000000000001",
             7,
             17,

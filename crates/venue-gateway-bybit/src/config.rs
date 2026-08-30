@@ -12,22 +12,13 @@ pub struct BybitConfig {
 }
 
 impl BybitConfig {
-    pub(crate) const fn for_mode(mode: GatewayMode) -> Self {
-        match mode {
-            GatewayMode::Test => Self {
-                mode,
-                rest_origin: "https://api-testnet.bybit.com",
-                public_ws: "wss://stream-testnet.bybit.com/v5/public/linear",
-                private_ws: "wss://stream-testnet.bybit.com/v5/private",
-                recv_window_ms: RECV_WINDOW_MS,
-            },
-            GatewayMode::Live => Self {
-                mode,
-                rest_origin: "https://api.bybit.com",
-                public_ws: "wss://stream.bybit.com/v5/public/linear",
-                private_ws: "wss://stream.bybit.com/v5/private",
-                recv_window_ms: RECV_WINDOW_MS,
-            },
+    pub(crate) const fn live() -> Self {
+        Self {
+            mode: GatewayMode::Live,
+            rest_origin: "https://api.bybit.com",
+            public_ws: "wss://stream.bybit.com/v5/public/linear",
+            private_ws: "wss://stream.bybit.com/v5/private",
+            recv_window_ms: RECV_WINDOW_MS,
         }
     }
 

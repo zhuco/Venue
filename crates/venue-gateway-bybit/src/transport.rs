@@ -1183,7 +1183,7 @@ mod tests {
             Err(BybitTransportError::Limits)
         );
 
-        let facts = facts(GatewayMode::Test)?;
+        let facts = facts(GatewayMode::Live)?;
         let mut exact = br#"{"topic":"order.linear","data":[]}"#.to_vec();
         exact.resize(MAX_TRANSPORT_BODY_BYTES, b' ');
         assert!(
@@ -1212,7 +1212,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_sends_only_bound_prepared_request_and_parses_ack() -> Result<(), TestError> {
-        let facts = facts(GatewayMode::Test)?;
+        let facts = facts(GatewayMode::Live)?;
         let request = request(&facts)?;
         let (endpoint, server) =
             http_mock(Some(http_response("200 OK", PLACE_ACK)), Duration::ZERO).await?;
@@ -1238,7 +1238,7 @@ mod tests {
     #[tokio::test]
     async fn http_get_signs_the_exact_query_and_returns_request_bound_raw_evidence()
     -> Result<(), TestError> {
-        let facts = facts(GatewayMode::Test)?;
+        let facts = facts(GatewayMode::Live)?;
         let request = prepare_private_request(
             &facts.binding,
             7,
@@ -1274,32 +1274,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_rejects_cross_mode_timeout_and_disconnect() -> Result<(), TestError> {
+    async fn http_rejects_cross_account_timeout_and_disconnect() -> Result<(), TestError> {
         let live = facts(GatewayMode::Live)?;
-        let test = facts(GatewayMode::Test)?;
-        let live_request = request(&live)?;
+        let mut wrong_request = request(&live)?;
+        wrong_request.binding.trading_account_id =
+            "00000000-0000-4000-8000-000000000002".to_owned();
         let limits = BybitTransportLimits::new(Duration::from_millis(40), 16 * 1024)?;
-        let transport = BybitHttpTransport::new(&test.binding, 7, limits)?;
+        let transport = BybitHttpTransport::new(&live.binding, 7, limits)?;
         assert_eq!(
             transport
                 .execute_order(
-                    &test.binding,
-                    &test.credentials,
-                    &live_request,
+                    &live.binding,
+                    &live.credentials,
+                    &wrong_request,
                     1_670_000_000_000
                 )
                 .await,
             Err(BybitTransportError::Binding)
         );
 
-        let request = request(&test)?;
+        let request = request(&live)?;
         let mut oversized_request = request.clone();
         oversized_request.body = vec![b'x'; limits.maximum_body_bytes + 1];
         assert_eq!(
             transport
                 .execute_order(
-                    &test.binding,
-                    &test.credentials,
+                    &live.binding,
+                    &live.credentials,
                     &oversized_request,
                     1_670_000_000_000
                 )
@@ -1311,12 +1312,12 @@ mod tests {
             Duration::from_millis(200),
         )
         .await?;
-        let transport = BybitHttpTransport::with_endpoint(&test.binding, 7, endpoint, limits)?;
+        let transport = BybitHttpTransport::with_endpoint(&live.binding, 7, endpoint, limits)?;
         assert_eq!(
             transport
                 .execute_order(
-                    &test.binding,
-                    &test.credentials,
+                    &live.binding,
+                    &live.credentials,
                     &request,
                     1_670_000_000_000
                 )
@@ -1326,12 +1327,12 @@ mod tests {
         delayed.abort();
 
         let (endpoint, disconnected) = http_mock(None, Duration::ZERO).await?;
-        let transport = BybitHttpTransport::with_endpoint(&test.binding, 7, endpoint, limits)?;
+        let transport = BybitHttpTransport::with_endpoint(&live.binding, 7, endpoint, limits)?;
         assert_eq!(
             transport
                 .execute_order(
-                    &test.binding,
-                    &test.credentials,
+                    &live.binding,
+                    &live.credentials,
                     &request,
                     1_670_000_000_000
                 )
@@ -1344,7 +1345,7 @@ mod tests {
 
     #[tokio::test]
     async fn disconnected_mutation_is_not_automatically_replayed() -> Result<(), TestError> {
-        let facts = facts(GatewayMode::Test)?;
+        let facts = facts(GatewayMode::Live)?;
         let request = request(&facts)?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}", listener.local_addr()?);
@@ -1398,7 +1399,7 @@ mod tests {
             Err(BybitTransportError::Limits)
         );
 
-        let facts = facts(GatewayMode::Test)?;
+        let facts = facts(GatewayMode::Live)?;
         let request = request(&facts)?;
         let redirect_target = TcpListener::bind("127.0.0.1:0").await?;
         let location = format!("http://{}", redirect_target.local_addr()?);
@@ -1461,7 +1462,7 @@ mod tests {
     #[tokio::test]
     async fn websocket_waits_for_auth_and_subscription_ack_before_raw_delivery()
     -> Result<(), TestError> {
-        let facts = facts(GatewayMode::Test)?;
+        let facts = facts(GatewayMode::Live)?;
         let (listener, endpoint) = ws_listener().await?;
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await?;
@@ -1530,7 +1531,7 @@ mod tests {
     #[tokio::test]
     async fn websocket_text_heartbeat_requires_exact_pong_before_delivering_data()
     -> Result<(), TestError> {
-        let facts = facts(GatewayMode::Test)?;
+        let facts = facts(GatewayMode::Live)?;
         let (listener, endpoint) = ws_listener().await?;
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await?;
@@ -1597,7 +1598,7 @@ mod tests {
     #[tokio::test]
     async fn websocket_config_rejects_oversized_frame_before_protocol_parsing()
     -> Result<(), TestError> {
-        let facts = facts(GatewayMode::Test)?;
+        let facts = facts(GatewayMode::Live)?;
         let (listener, endpoint) = ws_listener().await?;
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await?;
@@ -1631,7 +1632,7 @@ mod tests {
     #[tokio::test]
     async fn websocket_pre_live_buffer_fails_closed_at_the_hard_frame_limit()
     -> Result<(), TestError> {
-        let facts = facts(GatewayMode::Test)?;
+        let facts = facts(GatewayMode::Live)?;
         let (listener, endpoint) = ws_listener().await?;
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await?;
@@ -1678,7 +1679,7 @@ mod tests {
     #[tokio::test]
     async fn websocket_pre_live_buffer_fails_closed_at_the_hard_byte_limit() -> Result<(), TestError>
     {
-        let facts = facts(GatewayMode::Test)?;
+        let facts = facts(GatewayMode::Live)?;
         let (listener, endpoint) = ws_listener().await?;
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await?;
@@ -1766,7 +1767,7 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_rejects_binary_ack_and_binary_private_frame() -> Result<(), TestError> {
-        let facts = facts(GatewayMode::Test)?;
+        let facts = facts(GatewayMode::Live)?;
         let limits = BybitTransportLimits::new(Duration::from_secs(2), 16 * 1024)?;
 
         let (listener, endpoint) = ws_listener().await?;

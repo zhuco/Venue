@@ -666,7 +666,7 @@ mod tests {
     fn facts(account: &str) -> Result<Facts, Box<dyn std::error::Error>> {
         let binding = GatewayBinding::new(
             VenueId::Binance,
-            GatewayMode::Test,
+            GatewayMode::Live,
             account,
             "BTC/USDT".parse()?,
         )?;

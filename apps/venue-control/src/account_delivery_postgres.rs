@@ -7,7 +7,7 @@ use venue_control_protocol::{
 };
 
 use crate::{
-    AccountDeliveryRepository, AccountDeliveryRepositoryError, CopyTestJob, DeliveryStoreResult,
+    AccountDeliveryRepository, AccountDeliveryRepositoryError, CopyJob, DeliveryStoreResult,
     PgControlRepository,
 };
 
@@ -60,7 +60,7 @@ impl AccountDeliveryRepository for PgControlRepository {
               AND s.trading_account_id = d.trading_account_id AND s.symbol = d.symbol \
               AND s.instance_id = d.instance_id AND s.config_epoch = d.config_epoch \
              LEFT JOIN venue_copy_jobs j \
-               ON d.source_kind = 'test_copy_semantic_job' AND j.job_id = d.source_id \
+               ON d.source_kind = 'copy_semantic_job' AND j.job_id = d.source_id \
              WHERE d.venue = $1 AND d.mode = $2 AND d.trading_account_id = $3 \
                AND d.symbol = $4 AND d.instance_id = $5 AND d.config_epoch = $6 \
                AND (d.delivery_state = 'pending' \
@@ -378,13 +378,13 @@ pub(crate) async fn insert_control_account_delivery(
 
 pub(crate) async fn insert_copy_account_delivery(
     transaction: &mut Transaction<'_, Postgres>,
-    job: &CopyTestJob,
+    job: &CopyJob,
     created_at_ms: u64,
 ) -> Result<(), AccountDeliveryRepositoryError> {
     let symbol = job.manifest.binding.instrument.symbol.to_string();
     let scopes = sqlx::query(
         "SELECT instance_id, config_epoch FROM venue_control_strategy_scopes \
-         WHERE venue = $1 AND mode = 'TEST' AND trading_account_id = $2 AND symbol = $3 \
+         WHERE venue = $1 AND mode = 'LIVE' AND trading_account_id = $2 AND symbol = $3 \
          ORDER BY instance_id LIMIT 2 FOR SHARE",
     )
     .bind(job.scope.venue.as_str())
@@ -399,14 +399,14 @@ pub(crate) async fn insert_copy_account_delivery(
     let scope = &scopes[0];
     let binding = AccountDeliveryBinding {
         venue: job.scope.venue,
-        mode: GatewayMode::Test,
+        mode: GatewayMode::Live,
         trading_account_id: job.scope.trading_account_id.clone(),
         symbol: job.manifest.binding.instrument.symbol.clone(),
         instance_id: scope.try_get("instance_id").map_err(database_error)?,
         config_epoch: from_i64(scope.try_get("config_epoch").map_err(database_error)?)?,
     };
     let job_id = job.identities.job_id.to_string();
-    let payload = AccountDeliveryPayload::TestCopySemanticJob(CopySemanticJobDelivery {
+    let payload = AccountDeliveryPayload::CopySemanticJob(CopySemanticJobDelivery {
         job_id: job_id.clone(),
         job_digest: job.job_digest,
         symbol: job.manifest.binding.instrument.symbol.clone(),
@@ -419,7 +419,7 @@ pub(crate) async fn insert_copy_account_delivery(
     insert_delivery(
         transaction,
         format!("copy:{job_id}"),
-        AccountDeliveryKind::TestCopySemanticJob,
+        AccountDeliveryKind::CopySemanticJob,
         &job_id,
         &binding,
         &payload,
@@ -551,16 +551,16 @@ async fn verify_delivery_source(
                 return Err(AccountDeliveryRepositoryError::CorruptData);
             }
         }
-        ("test_copy_semantic_job", AccountDeliveryPayload::TestCopySemanticJob(wire)) => {
+        ("copy_semantic_job", AccountDeliveryPayload::CopySemanticJob(wire)) => {
             let row = sqlx::query(
-                "SELECT job_json FROM venue_copy_jobs WHERE job_id = $1 AND mode = 'TEST' FOR SHARE",
+                "SELECT job_json FROM venue_copy_jobs WHERE job_id = $1 AND mode = 'LIVE' FOR SHARE",
             )
             .bind(&source_id)
             .fetch_optional(&mut **transaction)
             .await
             .map_err(database_error)?
             .ok_or(AccountDeliveryRepositoryError::CorruptData)?;
-            let durable: CopyTestJob = decode(row.try_get("job_json").map_err(database_error)?)?;
+            let durable: CopyJob = decode(row.try_get("job_json").map_err(database_error)?)?;
             let expected = CopySemanticJobDelivery {
                 job_id: durable.identities.job_id.to_string(),
                 job_digest: durable.job_digest,
@@ -737,7 +737,7 @@ fn from_i64(value: i64) -> Result<u64, AccountDeliveryRepositoryError> {
 const fn kind_str(kind: AccountDeliveryKind) -> &'static str {
     match kind {
         AccountDeliveryKind::ControlCommand => "control_command",
-        AccountDeliveryKind::TestCopySemanticJob => "test_copy_semantic_job",
+        AccountDeliveryKind::CopySemanticJob => "copy_semantic_job",
     }
 }
 
@@ -759,7 +759,6 @@ const fn receipt_state_str(state: AccountDeliveryReceiptState) -> &'static str {
 
 fn parse_mode(value: String) -> Result<GatewayMode, AccountDeliveryRepositoryError> {
     match value.as_str() {
-        "TEST" => Ok(GatewayMode::Test),
         "LIVE" => Ok(GatewayMode::Live),
         _ => Err(AccountDeliveryRepositoryError::CorruptData),
     }
@@ -781,7 +780,9 @@ mod tests {
 
     #[test]
     fn migration_and_api_never_define_mutation_authority() {
-        assert!(MIGRATION_0004.contains("mode = 'TEST'"));
+        assert!(MIGRATION_0004.contains("mode IN ('TEST', 'LIVE')"));
+        assert!(crate::MIGRATION_0005.contains("CHECK (mode = 'LIVE')"));
+        assert!(!crate::MIGRATION_0005.contains("UPDATE "));
         assert!(MIGRATION_0004.contains("lease_epoch"));
         for forbidden in [
             "writer_generation BIGINT",

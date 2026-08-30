@@ -635,103 +635,97 @@ fn all_family_and_capability_candidates_remain_non_authoritative() -> Result<(),
 }
 
 #[test]
-fn fresh_complete_probe_is_persistable_for_test_and_live_only() -> Result<(), TestError> {
-    for mode in [GatewayMode::Test, GatewayMode::Live] {
-        let (gateway, credentials, candidate) = capability_candidate(mode)?;
-        let stream = BybitPrivateStreamProbeEvidence::authenticated(
-            gateway.gateway_binding().clone(),
-            7,
-            7,
-            1_950,
-            2_100,
-            3_000,
-            "private-connection-7",
-        )?;
-        let (evidence, snapshot) =
-            finalize_capability_probe(candidate, stream, &credentials, 2_500)?;
-        assert_eq!(snapshot.binding.mode, mode);
-        assert_eq!(snapshot.version, 7);
-        assert!(snapshot.flags.contains(CapabilityFlags::PRIVATE_STREAM));
-        assert!(!snapshot.flags.contains(CapabilityFlags::TRADE));
-        assert!(!snapshot.flags.contains(CapabilityFlags::PLACE_LIMIT));
-        assert!(!snapshot.flags.contains(CapabilityFlags::PLACE_MARKET));
-        assert!(!snapshot.flags.contains(CapabilityFlags::CANCEL));
-        assert!(!snapshot.flags.contains(CapabilityFlags::WITHDRAW));
-        assert!(!snapshot.flags.contains(CapabilityFlags::AMEND));
-        assert_eq!(capabilities(), CapabilityFlags::empty());
+fn fresh_complete_probe_is_persistable_for_live_only() -> Result<(), TestError> {
+    let (gateway, credentials, candidate) = capability_candidate(GatewayMode::Live)?;
+    let stream = BybitPrivateStreamProbeEvidence::authenticated(
+        gateway.gateway_binding().clone(),
+        7,
+        7,
+        1_950,
+        2_100,
+        3_000,
+        "private-connection-7",
+    )?;
+    let (evidence, snapshot) = finalize_capability_probe(candidate, stream, &credentials, 2_500)?;
+    assert_eq!(snapshot.binding.mode, GatewayMode::Live);
+    assert_eq!(snapshot.version, 7);
+    assert!(snapshot.flags.contains(CapabilityFlags::PRIVATE_STREAM));
+    assert!(!snapshot.flags.contains(CapabilityFlags::TRADE));
+    assert!(!snapshot.flags.contains(CapabilityFlags::PLACE_LIMIT));
+    assert!(!snapshot.flags.contains(CapabilityFlags::PLACE_MARKET));
+    assert!(!snapshot.flags.contains(CapabilityFlags::CANCEL));
+    assert!(!snapshot.flags.contains(CapabilityFlags::WITHDRAW));
+    assert!(!snapshot.flags.contains(CapabilityFlags::AMEND));
+    assert_eq!(capabilities(), CapabilityFlags::empty());
 
-        let json = evidence.to_json()?;
-        let (loaded, loaded_snapshot) =
-            BybitCapabilityProbeEvidence::from_json_verified(&json, &gateway, &credentials, 2_500)?;
-        assert_eq!(loaded, evidence);
-        assert_eq!(loaded_snapshot, snapshot);
-        let wrong_secret = BybitCredentials::from_values("test", "different-secret")?;
-        assert_eq!(
-            BybitCapabilityProbeEvidence::from_json_verified(&json, &gateway, &wrong_secret, 2_500,),
-            Err(BybitError::Capability)
-        );
-        assert_eq!(
-            evidence.verify(&gateway, &credentials, 3_000),
-            Err(BybitError::Capability)
-        );
+    let json = evidence.to_json()?;
+    let (loaded, loaded_snapshot) =
+        BybitCapabilityProbeEvidence::from_json_verified(&json, &gateway, &credentials, 2_500)?;
+    assert_eq!(loaded, evidence);
+    assert_eq!(loaded_snapshot, snapshot);
+    let wrong_secret = BybitCredentials::from_values("test", "different-secret")?;
+    assert_eq!(
+        BybitCapabilityProbeEvidence::from_json_verified(&json, &gateway, &wrong_secret, 2_500,),
+        Err(BybitError::Capability)
+    );
+    assert_eq!(
+        evidence.verify(&gateway, &credentials, 3_000),
+        Err(BybitError::Capability)
+    );
 
-        let wrong_mode = binding(match mode {
-            GatewayMode::Test => GatewayMode::Live,
-            GatewayMode::Live => GatewayMode::Test,
-        })?;
-        assert_eq!(
-            evidence.verify(&wrong_mode, &credentials, 2_500),
-            Err(BybitError::Binding)
-        );
+    let wrong_account = BybitGatewayBinding::new(GatewayBinding::new(
+        VenueId::Bybit,
+        GatewayMode::Live,
+        "00000000-0000-4000-8000-000000000002",
+        "BTC/USDT".parse()?,
+    )?)?;
+    assert_eq!(
+        evidence.verify(&wrong_account, &credentials, 2_500),
+        Err(BybitError::Binding)
+    );
 
-        let mut tampered: serde_json::Value = serde_json::from_slice(&json)?;
-        tampered["scope"]["generation"] = serde_json::json!(8);
-        let tampered = serde_json::to_vec(&tampered)?;
-        assert_eq!(
-            BybitCapabilityProbeEvidence::from_json_verified(
-                &tampered,
-                &gateway,
-                &credentials,
-                2_500,
-            ),
-            Err(BybitError::Capability)
-        );
+    let mut tampered: serde_json::Value = serde_json::from_slice(&json)?;
+    tampered["scope"]["generation"] = serde_json::json!(8);
+    let tampered = serde_json::to_vec(&tampered)?;
+    assert_eq!(
+        BybitCapabilityProbeEvidence::from_json_verified(&tampered, &gateway, &credentials, 2_500,),
+        Err(BybitError::Capability)
+    );
 
-        let rules = parse_linear_instrument(
+    let rules = parse_linear_instrument(
+        &gateway,
+        BybitRawPublicPayload::new(
             &gateway,
-            BybitRawPublicPayload::new(
-                &gateway,
-                BybitPublicSource::LinearInstrument,
-                7,
-                2_500,
-                INSTRUMENT.to_owned(),
-            )?,
-        )?;
-        let session = BybitPhysicalSession::from_probe(
-            gateway.clone(),
-            credentials,
-            rules.clone(),
-            &evidence,
-            BybitTransportLimits::new(std::time::Duration::from_secs(1), 16 * 1_024)?,
+            BybitPublicSource::LinearInstrument,
+            7,
             2_500,
-        )?;
-        assert_eq!(session.capability_snapshot(), snapshot);
-        let synchronous = BybitSynchronousPhysicalSession::from_persisted_probe(
-            gateway,
-            BybitCredentials::from_values("test", "secret")?,
-            &json,
-            rules.raw,
-            BybitTransportLimits::new(std::time::Duration::from_secs(1), 16 * 1_024)?,
-            2_500,
-        )?;
-        assert_eq!(synchronous.capability_snapshot(), snapshot);
-    }
+            INSTRUMENT.to_owned(),
+        )?,
+    )?;
+    let session = BybitPhysicalSession::from_probe(
+        gateway.clone(),
+        credentials,
+        rules.clone(),
+        &evidence,
+        BybitTransportLimits::new(std::time::Duration::from_secs(1), 16 * 1_024)?,
+        2_500,
+    )?;
+    assert_eq!(session.capability_snapshot(), snapshot);
+    let synchronous = BybitSynchronousPhysicalSession::from_persisted_probe(
+        gateway,
+        BybitCredentials::from_values("test", "secret")?,
+        &json,
+        rules.raw,
+        BybitTransportLimits::new(std::time::Duration::from_secs(1), 16 * 1_024)?,
+        2_500,
+    )?;
+    assert_eq!(synchronous.capability_snapshot(), snapshot);
     Ok(())
 }
 
 #[test]
 fn private_stream_cross_generation_cannot_complete_probe() -> Result<(), TestError> {
-    let (binding, credentials, candidate) = capability_candidate(GatewayMode::Test)?;
+    let (binding, credentials, candidate) = capability_candidate(GatewayMode::Live)?;
     let stream = BybitPrivateStreamProbeEvidence::authenticated(
         binding.gateway_binding().clone(),
         8,
@@ -751,8 +745,13 @@ fn private_stream_cross_generation_cannot_complete_probe() -> Result<(), TestErr
 #[test]
 fn cross_binding_family_relabelling_and_payload_tampering_fail_closed() -> Result<(), TestError> {
     let live = binding(GatewayMode::Live)?;
-    let test = binding(GatewayMode::Test)?;
-    let test_raw = raw(&test, BybitPrivateSource::Positions, POSITIONS)?;
+    let wrong = BybitGatewayBinding::new(GatewayBinding::new(
+        VenueId::Bybit,
+        GatewayMode::Live,
+        "00000000-0000-4000-8000-000000000002",
+        "BTC/USDT".parse()?,
+    )?)?;
+    let test_raw = raw(&wrong, BybitPrivateSource::Positions, POSITIONS)?;
     assert_eq!(
         parse_position_page(&live, &test_raw),
         Err(BybitError::Binding)

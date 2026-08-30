@@ -1,7 +1,7 @@
 //! Gate.io gateway protocol boundary.
 //!
 //! This crate contains deterministic Gate.io protocol behavior, bounded async transport, and
-//! immutable TEST/LIVE request binding. It deliberately has no capability issuer, writer, WAL,
+//! immutable LIVE request binding. It deliberately has no capability issuer, writer, WAL,
 //! owner registry, retry loop, or mutation authority: a safe host must supply those controls.
 
 mod config;
@@ -147,13 +147,10 @@ mod binding_tests {
     }
 
     #[test]
-    fn gate_binding_accepts_only_gate_test_or_live_identity()
-    -> Result<(), Box<dyn std::error::Error>> {
-        for mode in [GatewayMode::Test, GatewayMode::Live] {
-            let validated = GateGatewayBinding::new(binding(VenueId::Gate, mode)?)?;
-            assert_eq!(validated.gateway_binding().mode, mode);
-            assert_eq!(validated.gateway_binding().venue, VenueId::Gate);
-        }
+    fn gate_binding_accepts_only_gate_live_identity() -> Result<(), Box<dyn std::error::Error>> {
+        let validated = GateGatewayBinding::new(binding(VenueId::Gate, GatewayMode::Live)?)?;
+        assert_eq!(validated.gateway_binding().mode, GatewayMode::Live);
+        assert_eq!(validated.gateway_binding().venue, VenueId::Gate);
         assert_eq!(
             GateGatewayBinding::new(binding(VenueId::Bitget, GatewayMode::Live)?),
             Err(GateGatewayBindingError::Venue)

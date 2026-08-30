@@ -1,11 +1,9 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use venue_gateway_api::{GatewayMode, VenueId};
+use venue_gateway_api::VenueId;
 use venue_gateway_binance::BinanceConfig;
-use venue_node::{
-    AdapterIsolation, NodeError, NodeLaunch, reject_unintegrated_legacy_test_runtime, report_result,
-};
+use venue_node::{AdapterIsolation, NodeError, NodeLaunch, report_result};
 
 const PROGRAM: &str = "venue-node-binance";
 
@@ -45,9 +43,6 @@ fn run() -> Result<(), NodeError> {
         account_binding: adapter.account_binding().as_str(),
     }
     .validate(launch.binding())?;
-    if launch.binding().mode == GatewayMode::Test {
-        return reject_unintegrated_legacy_test_runtime(VenueId::Binance);
-    }
     venue::start_hedged_grid_binance_deployment(cli).map_err(|error| NodeError::ExistingRuntime {
         venue: VenueId::Binance,
         message: error.to_string(),
@@ -773,7 +768,7 @@ mod candidate_bridge {
         fn explicit_empty_account_maps_all_six_physical_recovery_faces()
         -> Result<(), Box<dyn std::error::Error>> {
             let (config, _, readback) = fixture_with_evidence(
-                GatewayMode::Test,
+                GatewayMode::Live,
                 false,
                 br#"[]"#,
                 br#"[]"#,
@@ -834,7 +829,7 @@ mod candidate_bridge {
         fn cross_attempt_and_generation_faces_fail_closed() -> Result<(), Box<dyn std::error::Error>>
         {
             let (config, _, first) = fixture_with_evidence(
-                GatewayMode::Test,
+                GatewayMode::Live,
                 false,
                 br#"[]"#,
                 br#"[]"#,
@@ -844,7 +839,7 @@ mod candidate_bridge {
                 17,
             )?;
             let (_, _, other_attempt) = fixture_with_evidence(
-                GatewayMode::Test,
+                GatewayMode::Live,
                 false,
                 br#"[]"#,
                 br#"[]"#,
@@ -854,7 +849,7 @@ mod candidate_bridge {
                 17,
             )?;
             let (_, _, other_generation) = fixture_with_evidence(
-                GatewayMode::Test,
+                GatewayMode::Live,
                 false,
                 br#"[]"#,
                 br#"[]"#,
@@ -889,7 +884,7 @@ mod candidate_bridge {
         -> Result<(), Box<dyn std::error::Error>> {
             let binding = GatewayBinding::new(
                 VenueId::Binance,
-                GatewayMode::Test,
+                GatewayMode::Live,
                 "00000000-0000-4000-8000-000000000001",
                 "BTC/USDT".parse()?,
             )?;
@@ -939,7 +934,7 @@ mod candidate_bridge {
         fn authority_root_drift_invalidates_collected_faces()
         -> Result<(), Box<dyn std::error::Error>> {
             let (config, _, readback) = fixture_with_evidence(
-                GatewayMode::Test,
+                GatewayMode::Live,
                 false,
                 br#"[]"#,
                 br#"[]"#,
@@ -965,7 +960,7 @@ mod candidate_bridge {
         fn raw_adapter_candidate_cannot_construct_or_relabel_production_recovery()
         -> Result<(), Box<dyn std::error::Error>> {
             let (config, rules, readback) = fixture_with_evidence(
-                GatewayMode::Test,
+                GatewayMode::Live,
                 false,
                 br#"[]"#,
                 br#"[]"#,
@@ -997,22 +992,14 @@ mod candidate_bridge {
         }
 
         #[test]
-        fn test_and_live_remain_exact_and_candidate_capability_is_empty()
+        fn live_remains_exact_and_candidate_capability_is_empty()
         -> Result<(), Box<dyn std::error::Error>> {
-            let (test_config, rules, _) = fixture(GatewayMode::Test, false, false)?;
-            let bridge = BinancePhysicalGatewayCandidate::new(test_config, rules, NoBackend)?;
-            assert_eq!(bridge.config.mode(), GatewayMode::Test);
-            assert!(
-                bridge
-                    .config
-                    .portfolio_rest_origin()
-                    .contains("testnet.binancefuture.com")
-            );
-            assert!(
-                !bridge
-                    .config
-                    .portfolio_rest_origin()
-                    .contains("papi.binance.com")
+            let (live, rules, _) = fixture(GatewayMode::Live, false, false)?;
+            let bridge = BinancePhysicalGatewayCandidate::new(live, rules, NoBackend)?;
+            assert_eq!(bridge.config.mode(), GatewayMode::Live);
+            assert_eq!(
+                bridge.config.portfolio_rest_origin(),
+                "https://papi.binance.com"
             );
             let capability = bridge.capability_snapshot();
             assert!(capability.flags.is_empty());
@@ -1020,9 +1007,6 @@ mod candidate_bridge {
                 capability.authorize(bridge.binding(), 1, 1_000, MutationCapability::PlaceLimit,),
                 Err(venue_gateway_api::GatewayApiError::CapabilityScope)
             );
-
-            let (live, _, _) = fixture(GatewayMode::Live, false, false)?;
-            assert_eq!(live.portfolio_rest_origin(), "https://papi.binance.com");
             Ok(())
         }
 
@@ -1030,7 +1014,7 @@ mod candidate_bridge {
         fn readback_converts_net_and_hedge_with_exact_three_family_coverage()
         -> Result<(), Box<dyn std::error::Error>> {
             for net in [false, true] {
-                let (config, rules, readback) = fixture(GatewayMode::Test, net, false)?;
+                let (config, rules, readback) = fixture(GatewayMode::Live, net, false)?;
                 let binding = config.gateway_binding().clone();
                 let mut bridge = BinancePhysicalGatewayCandidate::new(config, rules, NoBackend)?;
                 let receipt = bridge.convert_readback(
@@ -1070,7 +1054,7 @@ mod candidate_bridge {
         -> Result<(), Box<dyn std::error::Error>> {
             let candidates = [
                 fixture_with_evidence(
-                    GatewayMode::Test,
+                    GatewayMode::Live,
                     false,
                     POSITIONS,
                     include_bytes!(
@@ -1082,7 +1066,7 @@ mod candidate_bridge {
                     17,
                 )?,
                 fixture_with_evidence(
-                    GatewayMode::Test,
+                    GatewayMode::Live,
                     false,
                     POSITIONS,
                     br#"[]"#,
@@ -1124,7 +1108,7 @@ mod candidate_bridge {
         #[test]
         fn shared_commands_translate_only_place_cancel_and_reduce_once()
         -> Result<(), Box<dyn std::error::Error>> {
-            let (_, rules, readback) = fixture(GatewayMode::Test, false, false)?;
+            let (_, rules, readback) = fixture(GatewayMode::Live, false, false)?;
             let place = ExecutionCommand::PlaceLimit(OrderCommand {
                 command_id: CommandId::new("place_1")?,
                 client_order_id: CommandId::new("venue_place_1")?,
@@ -1170,7 +1154,7 @@ mod candidate_bridge {
         #[test]
         fn net_adapter_is_closed_but_shared_command_model_cannot_express_it()
         -> Result<(), Box<dyn std::error::Error>> {
-            let (_, rules, readback) = fixture(GatewayMode::Test, true, false)?;
+            let (_, rules, readback) = fixture(GatewayMode::Live, true, false)?;
             let direct = venue_gateway_binance::BinancePlaceIntent {
                 client_order_id: "venue_net_1".to_owned(),
                 side: OrderSide::Buy,
@@ -1199,7 +1183,7 @@ mod candidate_bridge {
         #[test]
         fn acknowledgement_requires_exact_signed_readback_or_stays_unknown()
         -> Result<(), Box<dyn std::error::Error>> {
-            let (config, rules, readback) = fixture(GatewayMode::Test, false, false)?;
+            let (config, rules, readback) = fixture(GatewayMode::Live, false, false)?;
             let prepared = prepare_place_limit(
                 &rules,
                 &readback,

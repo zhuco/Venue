@@ -9,10 +9,10 @@ use venue_copy::{
 use crate::copy_worker::plan_observed_copy_job;
 
 use crate::{
-    CopyApplyResult, CopyCrashReplay, CopyDeliveryClaim, CopyDriftProjection, CopyLeaderEnvelope,
-    CopyLeaderIntent, CopyLeaderSnapshot, CopyLedgerProjectionInput, CopyObserverLease,
-    CopyObserverScope, CopyReplayDeliveryState, CopyReplayJob, CopyRepository, CopyRepositoryError,
-    CopyStoreResult, CopyTestJob, MAX_COPY_DELIVERY_CLAIM_MS, MAX_COPY_OBSERVER_LEASE_MS,
+    CopyApplyResult, CopyCrashReplay, CopyDeliveryClaim, CopyDriftProjection, CopyJob,
+    CopyLeaderEnvelope, CopyLeaderIntent, CopyLeaderSnapshot, CopyLedgerProjectionInput,
+    CopyObserverLease, CopyObserverScope, CopyReplayDeliveryState, CopyReplayJob, CopyRepository,
+    CopyRepositoryError, CopyStoreResult, MAX_COPY_DELIVERY_CLAIM_MS, MAX_COPY_OBSERVER_LEASE_MS,
     ObservedCopyIntent, PgControlRepository, PlannedCopyJob, ScopedCopyDeliveryReceipt,
     account_delivery_postgres::insert_copy_account_delivery,
 };
@@ -37,7 +37,7 @@ impl PgControlRepository {
                ON o.event_sequence = j.source_event_sequence AND o.observer_id = j.observer_id \
              JOIN venue_copy_leader_intents i USING (intent_id) \
              JOIN venue_copy_leader_snapshots s USING (snapshot_id) \
-             WHERE j.observer_id = $1 AND j.venue = $2 AND j.mode = 'TEST' \
+             WHERE j.observer_id = $1 AND j.venue = $2 AND j.mode = 'LIVE' \
                AND j.trading_account_id = $3 ORDER BY j.source_event_sequence",
         )
         .bind(&scope.observer_id)
@@ -50,7 +50,7 @@ impl PgControlRepository {
             return Err(CopyRepositoryError::CorruptData);
         }
         for row in rows {
-            let job: CopyTestJob = decode(row.try_get("job_json").map_err(database_error)?)?;
+            let job: CopyJob = decode(row.try_get("job_json").map_err(database_error)?)?;
             let plan_venue: String = row.try_get("plan_venue").map_err(database_error)?;
             let plan_mode: String = row.try_get("plan_mode").map_err(database_error)?;
             let plan_account_id: String = row.try_get("plan_account_id").map_err(database_error)?;
@@ -70,7 +70,7 @@ impl PgControlRepository {
             let recomputed = plan_observed_copy_job(observed, job.created_at_ms)
                 .map_err(|_| CopyRepositoryError::CorruptData)?;
             if plan_venue != scope.venue.as_str()
-                || plan_mode != "TEST"
+                || plan_mode != "LIVE"
                 || plan_account_id != scope.trading_account_id
                 || source_event_sequence != job.source_event_sequence
                 || digest(plan_digest)? != job.job_digest
@@ -146,7 +146,7 @@ impl CopyRepository for PgControlRepository {
         advisory_lock(&mut transaction, &snapshot_id, 20_002).await?;
 
         if let Some(row) = sqlx::query(
-            "SELECT i.observer_id, i.venue, i.trading_account_id, i.intent_json, i.intent_digest, \
+            "SELECT i.observer_id, i.venue, i.mode, i.trading_account_id, i.intent_json, i.intent_digest, \
                     s.snapshot_json, s.snapshot_digest, o.event_digest, o.event_sequence \
              FROM venue_copy_leader_intents i \
              JOIN venue_copy_leader_snapshots s USING (snapshot_id) \
@@ -181,7 +181,7 @@ impl CopyRepository for PgControlRepository {
         }
 
         if let Some(row) = sqlx::query(
-            "SELECT observer_id, venue, trading_account_id, snapshot_json, snapshot_digest \
+            "SELECT observer_id, venue, mode, trading_account_id, snapshot_json, snapshot_digest \
              FROM venue_copy_leader_snapshots WHERE snapshot_id = $1 FOR SHARE",
         )
         .bind(&snapshot_id)
@@ -204,7 +204,7 @@ impl CopyRepository for PgControlRepository {
                 "INSERT INTO venue_copy_leader_snapshots \
                  (snapshot_id, observer_id, venue, mode, trading_account_id, generation, \
                   observed_at_ms, expires_at_ms, snapshot_digest, snapshot_json) \
-                 VALUES ($1, $2, $3, 'TEST', $4, $5, $6, $7, $8, $9)",
+                 VALUES ($1, $2, $3, 'LIVE', $4, $5, $6, $7, $8, $9)",
             )
             .bind(&snapshot_id)
             .bind(&envelope.scope.observer_id)
@@ -224,7 +224,7 @@ impl CopyRepository for PgControlRepository {
             "INSERT INTO venue_copy_leader_intents \
              (intent_id, observer_id, venue, mode, trading_account_id, snapshot_id, intent_digest, \
               intent_json, observed_at_ms, stored_at_ms) \
-             VALUES ($1, $2, $3, 'TEST', $4, $5, $6, $7, $8, $9)",
+             VALUES ($1, $2, $3, 'LIVE', $4, $5, $6, $7, $8, $9)",
         )
         .bind(&intent_id)
         .bind(&envelope.scope.observer_id)
@@ -287,7 +287,7 @@ impl CopyRepository for PgControlRepository {
         advisory_lock(&mut transaction, &scope.observer_id, 20_003).await?;
         ensure_observer_scope(&mut transaction, scope).await?;
         let current = sqlx::query(
-            "SELECT venue, trading_account_id, holder_id, lease_epoch, acquired_at_ms, expires_at_ms \
+            "SELECT venue, mode, trading_account_id, holder_id, lease_epoch, acquired_at_ms, expires_at_ms \
              FROM venue_copy_observer_leases WHERE observer_id = $1 FOR UPDATE",
         )
         .bind(&scope.observer_id)
@@ -299,6 +299,7 @@ impl CopyRepository for PgControlRepository {
             let durable_scope = CopyObserverScope {
                 observer_id: scope.observer_id.clone(),
                 venue: parse_venue(row.try_get("venue").map_err(database_error)?)?,
+                mode: parse_live_mode(row.try_get("mode").map_err(database_error)?)?,
                 trading_account_id: row.try_get("trading_account_id").map_err(database_error)?,
             };
             if durable_scope != *scope {
@@ -330,7 +331,7 @@ impl CopyRepository for PgControlRepository {
             "INSERT INTO venue_copy_observer_leases \
              (observer_id, venue, mode, trading_account_id, lease_kind, mutation_authority, \
               holder_id, lease_epoch, acquired_at_ms, expires_at_ms) \
-             VALUES ($1, $2, 'TEST', $3, 'COPY_TEST_OBSERVER', FALSE, $4, $5, $6, $7) \
+             VALUES ($1, $2, 'LIVE', $3, 'COPY_OBSERVER', FALSE, $4, $5, $6, $7) \
              ON CONFLICT (observer_id) DO UPDATE SET \
                holder_id = EXCLUDED.holder_id, lease_epoch = EXCLUDED.lease_epoch, \
                acquired_at_ms = EXCLUDED.acquired_at_ms, expires_at_ms = EXCLUDED.expires_at_ms",
@@ -398,7 +399,7 @@ impl CopyRepository for PgControlRepository {
         &self,
         lease: &CopyObserverLease,
         observed: &ObservedCopyIntent,
-        job: &CopyTestJob,
+        job: &CopyJob,
         committed_at_ms: u64,
     ) -> Result<CopyApplyResult, CopyRepositoryError> {
         lease
@@ -440,8 +441,7 @@ impl CopyRepository for PgControlRepository {
             .map_err(database_error)?
             .ok_or(CopyRepositoryError::CursorConflict)?;
             let durable_digest = digest(row.try_get("event_digest").map_err(database_error)?)?;
-            let durable_job: CopyTestJob =
-                decode(row.try_get("job_json").map_err(database_error)?)?;
+            let durable_job: CopyJob = decode(row.try_get("job_json").map_err(database_error)?)?;
             if durable_digest == observed.event_digest && durable_job == *job {
                 transaction.commit().await.map_err(database_error)?;
                 return Ok(CopyApplyResult::Existing);
@@ -476,7 +476,7 @@ impl CopyRepository for PgControlRepository {
              (job_id, observer_id, source_event_sequence, intent_id, venue, mode, \
               trading_account_id, idempotency_key, follower_binding_id, manifest_json, job_json, \
               job_digest, created_at_ms, expires_at_ms) \
-             VALUES ($1, $2, $3, $4, $5, 'TEST', $6, $7, $8, $9, $10, $11, $12, $13)",
+             VALUES ($1, $2, $3, $4, $5, 'LIVE', $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(&job_id)
         .bind(&job.scope.observer_id)
@@ -564,7 +564,7 @@ impl CopyRepository for PgControlRepository {
         let rows = sqlx::query(
             "SELECT j.job_id, j.job_json, j.job_digest, o.claim_epoch \
              FROM venue_copy_jobs j JOIN venue_copy_delivery_outbox o USING (job_id) \
-             WHERE j.observer_id = $1 AND j.venue = $2 AND j.mode = 'TEST' \
+             WHERE j.observer_id = $1 AND j.venue = $2 AND j.mode = 'LIVE' \
                AND j.trading_account_id = $3 AND j.expires_at_ms > $4 \
                AND (o.delivery_state = 'pending' \
                     OR (o.delivery_state = 'claimed' AND o.claim_expires_at_ms <= $4)) \
@@ -581,7 +581,7 @@ impl CopyRepository for PgControlRepository {
         let mut claims = Vec::with_capacity(rows.len());
         for row in rows {
             let job_id: String = row.try_get("job_id").map_err(database_error)?;
-            let job: CopyTestJob = decode(row.try_get("job_json").map_err(database_error)?)?;
+            let job: CopyJob = decode(row.try_get("job_json").map_err(database_error)?)?;
             let durable_job_digest = digest(row.try_get("job_digest").map_err(database_error)?)?;
             if expires_at_ms > job.manifest.expires_at_ms {
                 return Err(CopyRepositoryError::InvalidData);
@@ -665,7 +665,7 @@ impl CopyRepository for PgControlRepository {
         .await
         .map_err(database_error)?
         .ok_or(CopyRepositoryError::DeliveryConflict)?;
-        let durable_job: CopyTestJob = decode(row.try_get("job_json").map_err(database_error)?)?;
+        let durable_job: CopyJob = decode(row.try_get("job_json").map_err(database_error)?)?;
         if durable_job != scoped.claim.job
             || row
                 .try_get::<Option<String>, _>("claimed_by")
@@ -822,7 +822,7 @@ impl CopyRepository for PgControlRepository {
         .await
         .map_err(database_error)?
         .ok_or(CopyRepositoryError::ProjectionConflict)?;
-        let job: CopyTestJob = decode(row.try_get("job_json").map_err(database_error)?)?;
+        let job: CopyJob = decode(row.try_get("job_json").map_err(database_error)?)?;
         let status: String = row.try_get("status").map_err(database_error)?;
         let already_projected: bool = row.try_get("projected").map_err(database_error)?;
         if already_projected
@@ -837,7 +837,7 @@ impl CopyRepository for PgControlRepository {
 
         let rows = sqlx::query(
             "SELECT entry_json FROM venue_copy_ledger \
-             WHERE venue = $1 AND mode = 'TEST' AND trading_account_id = $2 \
+             WHERE venue = $1 AND mode = 'LIVE' AND trading_account_id = $2 \
                AND follower_binding_id = $3 ORDER BY ledger_sequence FOR SHARE",
         )
         .bind(job.scope.venue.as_str())
@@ -872,7 +872,7 @@ impl CopyRepository for PgControlRepository {
         };
         if let Some(row) = sqlx::query(
             "SELECT position_generation FROM venue_copy_drift_projections \
-             WHERE venue = $1 AND mode = 'TEST' AND trading_account_id = $2 \
+             WHERE venue = $1 AND mode = 'LIVE' AND trading_account_id = $2 \
                AND follower_binding_id = $3 FOR UPDATE",
         )
         .bind(job.scope.venue.as_str())
@@ -892,7 +892,7 @@ impl CopyRepository for PgControlRepository {
             "INSERT INTO venue_copy_ledger \
              (venue, mode, trading_account_id, follower_binding_id, ledger_sequence, generation, \
               job_id, receipt_sequence, fact_digest, entry_json, projected_at_ms) \
-             VALUES ($1, 'TEST', $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+             VALUES ($1, 'LIVE', $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(job.scope.venue.as_str())
         .bind(account_id)
@@ -911,7 +911,7 @@ impl CopyRepository for PgControlRepository {
             "INSERT INTO venue_copy_drift_projections \
              (venue, mode, trading_account_id, follower_binding_id, position_generation, \
               source_job_id, receipt_sequence, projection_json, projected_at_ms) \
-             VALUES ($1, 'TEST', $2, $3, $4, $5, $6, $7, $8) \
+             VALUES ($1, 'LIVE', $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT (venue, mode, trading_account_id, follower_binding_id) DO UPDATE SET \
                position_generation = EXCLUDED.position_generation, \
                source_job_id = EXCLUDED.source_job_id, receipt_sequence = EXCLUDED.receipt_sequence, \
@@ -1011,7 +1011,7 @@ impl CopyRepository for PgControlRepository {
         let receipt_rows = sqlx::query(
             "SELECT r.job_id, r.receipt_json FROM venue_copy_delivery_receipts r \
              JOIN venue_copy_jobs j USING (job_id) \
-             WHERE j.observer_id = $1 AND j.venue = $2 AND j.mode = 'TEST' \
+             WHERE j.observer_id = $1 AND j.venue = $2 AND j.mode = 'LIVE' \
                AND j.trading_account_id = $3 ORDER BY r.job_id, r.receipt_sequence",
         )
         .bind(&scope.observer_id)
@@ -1033,7 +1033,7 @@ impl CopyRepository for PgControlRepository {
                     EXISTS (SELECT 1 FROM venue_copy_receipt_outbox ro \
                             WHERE ro.job_id = j.job_id AND ro.projected = FALSE) AS projection_pending \
              FROM venue_copy_jobs j JOIN venue_copy_delivery_outbox o USING (job_id) \
-             WHERE j.observer_id = $1 AND j.venue = $2 AND j.mode = 'TEST' \
+             WHERE j.observer_id = $1 AND j.venue = $2 AND j.mode = 'LIVE' \
                AND j.trading_account_id = $3 ORDER BY j.created_at_ms, j.job_id",
         )
         .bind(&scope.observer_id)
@@ -1045,7 +1045,7 @@ impl CopyRepository for PgControlRepository {
         let mut jobs = Vec::with_capacity(rows.len());
         for row in rows {
             let job_id: String = row.try_get("job_id").map_err(database_error)?;
-            let job: CopyTestJob = decode(row.try_get("job_json").map_err(database_error)?)?;
+            let job: CopyJob = decode(row.try_get("job_json").map_err(database_error)?)?;
             let durable_job_digest = digest(row.try_get("job_digest").map_err(database_error)?)?;
             if job.scope != *scope
                 || job.identities.job_id.to_string() != job_id
@@ -1111,7 +1111,7 @@ impl CopyRepository for PgControlRepository {
 
         let ledger_rows = sqlx::query(
             "SELECT follower_binding_id, entry_json FROM venue_copy_ledger \
-             WHERE venue = $1 AND mode = 'TEST' AND trading_account_id = $2 \
+             WHERE venue = $1 AND mode = 'LIVE' AND trading_account_id = $2 \
              ORDER BY follower_binding_id, ledger_sequence",
         )
         .bind(scope.venue.as_str())
@@ -1135,7 +1135,7 @@ impl CopyRepository for PgControlRepository {
         }
         let drift_rows = sqlx::query(
             "SELECT projection_json FROM venue_copy_drift_projections \
-             WHERE venue = $1 AND mode = 'TEST' AND trading_account_id = $2 \
+             WHERE venue = $1 AND mode = 'LIVE' AND trading_account_id = $2 \
              ORDER BY follower_binding_id",
         )
         .bind(scope.venue.as_str())
@@ -1168,7 +1168,7 @@ async fn load_next_observed_for_update(
          FROM venue_copy_observer_outbox o \
          JOIN venue_copy_leader_intents i USING (intent_id) \
          JOIN venue_copy_leader_snapshots s USING (snapshot_id) \
-         WHERE o.observer_id = $1 AND i.venue = $2 AND i.mode = 'TEST' \
+         WHERE o.observer_id = $1 AND i.venue = $2 AND i.mode = 'LIVE' \
            AND i.trading_account_id = $3 AND o.event_sequence > $4 \
          ORDER BY o.event_sequence LIMIT 1 FOR UPDATE OF o",
     )
@@ -1215,7 +1215,7 @@ async fn persist_planned_copy_job(
          (job_id, observer_id, source_event_sequence, intent_id, venue, mode, \
           trading_account_id, idempotency_key, follower_binding_id, manifest_json, job_json, \
           job_digest, created_at_ms, expires_at_ms) \
-         VALUES ($1, $2, $3, $4, $5, 'TEST', $6, $7, $8, $9, $10, $11, $12, $13)",
+         VALUES ($1, $2, $3, $4, $5, 'LIVE', $6, $7, $8, $9, $10, $11, $12, $13)",
     )
     .bind(&job_id)
     .bind(&job.scope.observer_id)
@@ -1237,7 +1237,7 @@ async fn persist_planned_copy_job(
         "INSERT INTO venue_copy_plans \
          (job_id, venue, mode, trading_account_id, source_event_sequence, \
           capital_snapshot_json, target_exposure_json, plan_digest, planned_at_ms) \
-         VALUES ($1, $2, 'TEST', $3, $4, $5, $6, $7, $8)",
+         VALUES ($1, $2, 'LIVE', $3, $4, $5, $6, $7, $8)",
     )
     .bind(&job_id)
     .bind(job.scope.venue.as_str())
@@ -1315,7 +1315,7 @@ async fn ensure_observer_scope(
 ) -> Result<(), CopyRepositoryError> {
     sqlx::query(
         "INSERT INTO venue_copy_observer_scopes \
-         (observer_id, venue, mode, trading_account_id) VALUES ($1, $2, 'TEST', $3) \
+         (observer_id, venue, mode, trading_account_id) VALUES ($1, $2, 'LIVE', $3) \
          ON CONFLICT (observer_id) DO NOTHING",
     )
     .bind(&scope.observer_id)
@@ -1325,7 +1325,7 @@ async fn ensure_observer_scope(
     .await
     .map_err(database_error)?;
     let row = sqlx::query(
-        "SELECT venue, trading_account_id FROM venue_copy_observer_scopes \
+        "SELECT venue, mode, trading_account_id FROM venue_copy_observer_scopes \
          WHERE observer_id = $1 FOR SHARE",
     )
     .bind(&scope.observer_id)
@@ -1335,6 +1335,7 @@ async fn ensure_observer_scope(
     let durable = CopyObserverScope {
         observer_id: scope.observer_id.clone(),
         venue: parse_venue(row.try_get("venue").map_err(database_error)?)?,
+        mode: parse_live_mode(row.try_get("mode").map_err(database_error)?)?,
         trading_account_id: row.try_get("trading_account_id").map_err(database_error)?,
     };
     if durable != *scope {
@@ -1349,7 +1350,7 @@ async fn lock_and_validate_lease(
     now_ms: i64,
 ) -> Result<(), CopyRepositoryError> {
     let row = sqlx::query(
-        "SELECT venue, trading_account_id, holder_id, lease_epoch, acquired_at_ms, expires_at_ms, \
+        "SELECT venue, mode, trading_account_id, holder_id, lease_epoch, acquired_at_ms, expires_at_ms, \
                 lease_kind, mutation_authority \
          FROM venue_copy_observer_leases WHERE observer_id = $1 FOR SHARE",
     )
@@ -1361,6 +1362,7 @@ async fn lock_and_validate_lease(
     let durable_scope = CopyObserverScope {
         observer_id: lease.scope.observer_id.clone(),
         venue: parse_venue(row.try_get("venue").map_err(database_error)?)?,
+        mode: parse_live_mode(row.try_get("mode").map_err(database_error)?)?,
         trading_account_id: row.try_get("trading_account_id").map_err(database_error)?,
     };
     let mutation_authority: bool = row.try_get("mutation_authority").map_err(database_error)?;
@@ -1378,7 +1380,7 @@ async fn lock_and_validate_lease(
             .map_err(database_error)?
             <= now_ms
         || mutation_authority
-        || kind != "COPY_TEST_OBSERVER"
+        || kind != "COPY_OBSERVER"
     {
         return Err(CopyRepositoryError::LeaseConflict);
     }
@@ -1397,7 +1399,7 @@ async fn load_observed_after(
          FROM venue_copy_observer_outbox o \
          JOIN venue_copy_leader_intents i USING (intent_id) \
          JOIN venue_copy_leader_snapshots s USING (snapshot_id) \
-         WHERE o.observer_id = $1 AND i.venue = $2 AND i.mode = 'TEST' \
+         WHERE o.observer_id = $1 AND i.venue = $2 AND i.mode = 'LIVE' \
            AND i.trading_account_id = $3 AND o.event_sequence > $4 \
          ORDER BY o.event_sequence LIMIT $5",
     )
@@ -1425,7 +1427,7 @@ async fn load_observed_at(
          FROM venue_copy_observer_outbox o \
          JOIN venue_copy_leader_intents i USING (intent_id) \
          JOIN venue_copy_leader_snapshots s USING (snapshot_id) \
-         WHERE o.observer_id = $1 AND i.venue = $2 AND i.mode = 'TEST' \
+         WHERE o.observer_id = $1 AND i.venue = $2 AND i.mode = 'LIVE' \
            AND i.trading_account_id = $3 AND o.event_sequence = $4",
     )
     .bind(&scope.observer_id)
@@ -1484,12 +1486,23 @@ fn scope_from_row(row: &sqlx::postgres::PgRow) -> Result<CopyObserverScope, Copy
     Ok(CopyObserverScope {
         observer_id: row.try_get("observer_id").map_err(database_error)?,
         venue: parse_venue(row.try_get("venue").map_err(database_error)?)?,
+        mode: parse_live_mode(row.try_get("mode").map_err(database_error)?)?,
         trading_account_id: row.try_get("trading_account_id").map_err(database_error)?,
     })
 }
 
 fn parse_venue(value: String) -> Result<venue_control_protocol::VenueId, CopyRepositoryError> {
     value.parse().map_err(|_| CopyRepositoryError::CorruptData)
+}
+
+fn parse_live_mode(
+    value: String,
+) -> Result<venue_control_protocol::GatewayMode, CopyRepositoryError> {
+    if value == "LIVE" {
+        Ok(venue_control_protocol::GatewayMode::Live)
+    } else {
+        Err(CopyRepositoryError::CorruptData)
+    }
 }
 
 fn validate_window(
@@ -1577,6 +1590,9 @@ mod tests {
         assert!(MIGRATION_0002.contains("reconciliation_required"));
         assert!(!MIGRATION_0002.contains("writer_generation"));
         assert!(!MIGRATION_0002.contains("dispatch_permit"));
+        assert!(crate::MIGRATION_0005.contains("CHECK (mode = 'LIVE')"));
+        assert!(crate::MIGRATION_0005.contains("COPY_OBSERVER"));
+        assert!(!crate::MIGRATION_0005.contains("UPDATE "));
     }
 
     #[test]

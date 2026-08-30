@@ -845,7 +845,7 @@ fn install_ack<J: ControlDeliveryJournal>(
 fn binding() -> Result<AccountDeliveryBinding, venue_domain::SymbolError> {
     Ok(AccountDeliveryBinding {
         venue: VenueId::Binance,
-        mode: GatewayMode::Test,
+        mode: GatewayMode::Live,
         trading_account_id: ACCOUNT.to_owned(),
         symbol: Symbol::new("BTC", "USDT")?,
         instance_id: "grid-btc".to_owned(),

@@ -3,8 +3,8 @@ use std::future::Future;
 use thiserror::Error;
 
 use crate::{
-    CopyApplyResult, CopyCrashReplay, CopyDeliveryClaim, CopyLeaderEnvelope,
-    CopyLedgerProjectionInput, CopyObserverLease, CopyObserverScope, CopyStoreResult, CopyTestJob,
+    CopyApplyResult, CopyCrashReplay, CopyDeliveryClaim, CopyJob, CopyLeaderEnvelope,
+    CopyLedgerProjectionInput, CopyObserverLease, CopyObserverScope, CopyStoreResult,
     ObservedCopyIntent, ScopedCopyDeliveryReceipt,
 };
 
@@ -32,7 +32,7 @@ pub enum CopyRepositoryError {
     ProjectionConflict,
 }
 
-/// Durable Copy TEST coordination. Implementations may fence planner/observer work, but these
+/// Durable LIVE Copy coordination. Implementations may fence planner/observer work, but these
 /// methods never acquire, renew, revoke, or impersonate an account mutation writer.
 pub trait CopyRepository: Send + Sync {
     fn store_leader_envelope(
@@ -60,7 +60,7 @@ pub trait CopyRepository: Send + Sync {
         &self,
         lease: &CopyObserverLease,
         observed: &ObservedCopyIntent,
-        job: &CopyTestJob,
+        job: &CopyJob,
         committed_at_ms: u64,
     ) -> impl Future<Output = Result<CopyApplyResult, CopyRepositoryError>> + Send;
 

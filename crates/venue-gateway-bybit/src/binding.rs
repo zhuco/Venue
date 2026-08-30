@@ -1,4 +1,4 @@
-use venue_gateway_api::{GatewayBinding, VenueId};
+use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
 
 use crate::{BybitConfig, BybitError};
 
@@ -15,10 +15,10 @@ impl BybitGatewayBinding {
         gateway_binding
             .validate()
             .map_err(|_| BybitError::Binding)?;
-        if gateway_binding.venue != VenueId::Bybit {
+        if gateway_binding.venue != VenueId::Bybit || gateway_binding.mode != GatewayMode::Live {
             return Err(BybitError::Binding);
         }
-        let config = BybitConfig::for_mode(gateway_binding.mode);
+        let config = BybitConfig::live();
         Ok(Self {
             gateway_binding,
             config,

@@ -72,7 +72,7 @@ impl HyperliquidExchangeDispatch for MockDispatch {
 fn meta() -> Result<HyperliquidPerpMeta, Box<dyn std::error::Error>> {
     let gateway = GatewayBinding::new(
         VenueId::Hyperliquid,
-        GatewayMode::Test,
+        GatewayMode::Live,
         ACCOUNT,
         "BTC/USDC".parse()?,
     )?;

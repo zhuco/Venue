@@ -10,11 +10,23 @@ use serde::{Deserialize, Serialize};
 use venue_domain::Symbol;
 pub use venue_gateway_api::{GatewayMode, VenueId};
 
+fn deserialize_live_mode<'de, D>(deserializer: D) -> Result<GatewayMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mode = GatewayMode::deserialize(deserializer)?;
+    if mode == GatewayMode::Live {
+        Ok(mode)
+    } else {
+        Err(serde::de::Error::custom("mode must be exactly LIVE"))
+    }
+}
+
 pub const CONTROL_SCHEMA_VERSION: u16 = 2;
 pub const SNAPSHOT_PATH: &str = "/v2/ui/snapshot";
 pub const EVENT_STREAM_PATH: &str = "/v2/ui/events";
 pub const COMMAND_PATH: &str = "/v2/control/commands";
-pub const ACCOUNT_DELIVERY_SCHEMA_VERSION: u16 = 1;
+pub const ACCOUNT_DELIVERY_SCHEMA_VERSION: u16 = 2;
 pub const ACCOUNT_DELIVERY_CLAIM_PATH: &str = "/v2/account-node/deliveries/claim";
 pub const ACCOUNT_DELIVERY_ACK_PATH: &str = "/v2/account-node/deliveries/ack";
 pub const ACCOUNT_DELIVERY_RECEIPT_PATH: &str = "/v2/account-node/deliveries/receipts";
@@ -24,6 +36,7 @@ pub const ACCOUNT_DELIVERY_RECEIPT_PATH: &str = "/v2/account-node/deliveries/rec
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AccountDeliveryBinding {
     pub venue: VenueId,
+    #[serde(deserialize_with = "deserialize_live_mode")]
     pub mode: GatewayMode,
     pub trading_account_id: String,
     pub symbol: Symbol,
@@ -33,6 +46,9 @@ pub struct AccountDeliveryBinding {
 
 impl AccountDeliveryBinding {
     pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.mode != GatewayMode::Live {
+            return Err(ProtocolError::Mode);
+        }
         if !venue_domain::is_canonical_trading_account_id(&self.trading_account_id) {
             return Err(ProtocolError::AccountId);
         }
@@ -50,7 +66,7 @@ impl AccountDeliveryBinding {
 #[serde(rename_all = "snake_case")]
 pub enum AccountDeliveryKind {
     ControlCommand,
-    TestCopySemanticJob,
+    CopySemanticJob,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -83,7 +99,7 @@ impl CopySemanticJobDelivery {
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum AccountDeliveryPayload {
     ControlCommand(ControlCommandRequest),
-    TestCopySemanticJob(CopySemanticJobDelivery),
+    CopySemanticJob(CopySemanticJobDelivery),
 }
 
 impl AccountDeliveryPayload {
@@ -91,7 +107,7 @@ impl AccountDeliveryPayload {
     pub const fn kind(&self) -> AccountDeliveryKind {
         match self {
             Self::ControlCommand(_) => AccountDeliveryKind::ControlCommand,
-            Self::TestCopySemanticJob(_) => AccountDeliveryKind::TestCopySemanticJob,
+            Self::CopySemanticJob(_) => AccountDeliveryKind::CopySemanticJob,
         }
     }
 
@@ -109,10 +125,10 @@ impl AccountDeliveryPayload {
                     return Err(ProtocolError::DeliveryBinding);
                 }
             }
-            Self::TestCopySemanticJob(job) => {
+            Self::CopySemanticJob(job) => {
                 job.validate()?;
-                if binding.mode != GatewayMode::Test {
-                    return Err(ProtocolError::LiveCopyDelivery);
+                if binding.mode != GatewayMode::Live {
+                    return Err(ProtocolError::Mode);
                 }
                 if job.symbol != binding.symbol {
                     return Err(ProtocolError::DeliveryBinding);
@@ -346,6 +362,7 @@ pub enum StrategyLifecycle {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AccountSummary {
     pub venue: VenueId,
+    #[serde(deserialize_with = "deserialize_live_mode")]
     pub mode: GatewayMode,
     pub trading_account_id: String,
     pub health: HealthState,
@@ -362,6 +379,7 @@ pub struct StrategySummary {
     pub instance_id: String,
     pub kind: StrategyKind,
     pub venue: VenueId,
+    #[serde(deserialize_with = "deserialize_live_mode")]
     pub mode: GatewayMode,
     pub trading_account_id: String,
     pub symbol: Symbol,
@@ -486,6 +504,9 @@ impl ControlSnapshot {
         }
         let mut account_identities = BTreeSet::new();
         for account in &self.accounts {
+            if account.mode != GatewayMode::Live {
+                return Err(ProtocolError::Mode);
+            }
             if !venue_domain::is_canonical_trading_account_id(&account.trading_account_id) {
                 return Err(ProtocolError::AccountId);
             }
@@ -504,6 +525,9 @@ impl ControlSnapshot {
         }
         let mut strategy_identities = BTreeSet::new();
         for strategy in &self.strategies {
+            if strategy.mode != GatewayMode::Live {
+                return Err(ProtocolError::Mode);
+            }
             if strategy.instance_id.trim().is_empty()
                 || !venue_domain::is_canonical_trading_account_id(&strategy.trading_account_id)
             {
@@ -726,6 +750,7 @@ pub struct ControlCommandRequest {
     pub schema_version: u16,
     pub request_id: String,
     pub venue: VenueId,
+    #[serde(deserialize_with = "deserialize_live_mode")]
     pub mode: GatewayMode,
     pub trading_account_id: String,
     pub instance_id: String,
@@ -754,6 +779,9 @@ impl ControlCommandRequest {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.schema_version != CONTROL_SCHEMA_VERSION {
             return Err(ProtocolError::SchemaVersion);
+        }
+        if self.mode != GatewayMode::Live {
+            return Err(ProtocolError::Mode);
         }
         if self.request_id.trim().is_empty() || self.instance_id.trim().is_empty() {
             return Err(ProtocolError::RequestIdentity);
@@ -847,6 +875,8 @@ pub enum ProtocolError {
     DeliverySchemaVersion,
     #[error("unsupported control protocol schema version")]
     SchemaVersion,
+    #[error("control and account delivery mode must be exactly LIVE")]
+    Mode,
     #[error("control snapshot generated time is missing")]
     GeneratedTime,
     #[error("trading account id is not canonical")]
@@ -885,8 +915,6 @@ pub enum ProtocolError {
     DeliveryTime,
     #[error("account delivery payload does not match its exact binding")]
     DeliveryBinding,
-    #[error("LIVE Copy delivery is disabled")]
-    LiveCopyDelivery,
     #[error("account delivery lease is malformed")]
     DeliveryLease,
     #[error("account delivery acknowledgement is malformed")]
@@ -932,7 +960,7 @@ mod tests {
         assert_eq!(SNAPSHOT_PATH, "/v2/ui/snapshot");
         assert_eq!(EVENT_STREAM_PATH, "/v2/ui/events");
         assert_eq!(COMMAND_PATH, "/v2/control/commands");
-        assert_eq!(ACCOUNT_DELIVERY_SCHEMA_VERSION, 1);
+        assert_eq!(ACCOUNT_DELIVERY_SCHEMA_VERSION, 2);
         assert_eq!(
             ACCOUNT_DELIVERY_CLAIM_PATH,
             "/v2/account-node/deliveries/claim"
@@ -949,6 +977,10 @@ mod tests {
             .ok_or("control request must encode as an object")?;
         object.remove("mode");
         assert!(serde_json::from_value::<ControlCommandRequest>(encoded).is_err());
+
+        let mut encoded = serde_json::to_value(request(ControlAction::Pause)?)?;
+        encoded["mode"] = serde_json::json!("TEST");
+        assert!(serde_json::from_value::<ControlCommandRequest>(encoded).is_err());
         Ok(())
     }
 
@@ -957,7 +989,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let binding = AccountDeliveryBinding {
             venue: VenueId::Binance,
-            mode: GatewayMode::Test,
+            mode: GatewayMode::Live,
             trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             symbol: "BTC/USDT".parse()?,
             instance_id: "copy-btc".to_owned(),
@@ -975,7 +1007,7 @@ mod tests {
         };
         let claim = AccountDeliveryClaim {
             lease: lease.clone(),
-            payload: AccountDeliveryPayload::TestCopySemanticJob(CopySemanticJobDelivery {
+            payload: AccountDeliveryPayload::CopySemanticJob(CopySemanticJobDelivery {
                 job_id: "job-1".to_owned(),
                 job_digest: [1; 32],
                 symbol: binding.symbol.clone(),
@@ -998,9 +1030,9 @@ mod tests {
         assert_eq!(ack.validate(), Ok(()));
         assert!(!ack.grants_mutation_authority());
 
-        let mut live = claim.clone();
-        live.lease.binding.mode = GatewayMode::Live;
-        assert_eq!(live.validate(), Err(ProtocolError::LiveCopyDelivery));
+        let mut encoded = serde_json::to_value(&claim)?;
+        encoded["lease"]["binding"]["mode"] = serde_json::json!("TEST");
+        assert!(serde_json::from_value::<AccountDeliveryClaim>(encoded).is_err());
         let mut wrong_symbol = claim;
         wrong_symbol.lease.binding.symbol = "ETH/USDT".parse()?;
         assert_eq!(wrong_symbol.validate(), Err(ProtocolError::DeliveryBinding));
@@ -1074,9 +1106,6 @@ mod tests {
         changed.venue = VenueId::Okx;
         assert_eq!(changed.validate(), Err(ProtocolError::Confirmation));
         let mut changed = command.clone();
-        changed.mode = GatewayMode::Test;
-        assert_eq!(changed.validate(), Err(ProtocolError::Confirmation));
-        let mut changed = command.clone();
         changed.trading_account_id = "00000000-0000-4000-8000-000000000002".to_owned();
         assert_eq!(changed.validate(), Err(ProtocolError::Confirmation));
         let mut changed = command.clone();
@@ -1110,7 +1139,7 @@ mod tests {
         snapshot.schema_version = CONTROL_SCHEMA_VERSION;
         snapshot.accounts.push(AccountSummary {
             venue: VenueId::Binance,
-            mode: GatewayMode::Test,
+            mode: GatewayMode::Live,
             trading_account_id: "not-canonical".to_owned(),
             health: HealthState::Unknown,
             equity: Decimal::ZERO,
@@ -1244,12 +1273,26 @@ mod tests {
         invalid.strategies[0].trading_account_id =
             "00000000-0000-4000-8000-000000000002".to_owned();
         assert_eq!(invalid.validate(), Err(ProtocolError::StrategyIdentity));
-        let mut invalid = original.clone();
-        invalid.strategies[0].mode = GatewayMode::Test;
-        assert_eq!(invalid.validate(), Err(ProtocolError::StrategyIdentity));
         let mut invalid = original;
         invalid.copy_relations[0].follower_instance_id = "missing".to_owned();
         assert_eq!(invalid.validate(), Err(ProtocolError::SnapshotContent));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_wire_rejects_non_live_nested_modes() -> Result<(), Box<dyn std::error::Error>> {
+        let encoded = serde_json::to_value(snapshot()?)?;
+        for path in [["accounts", "0", "mode"], ["strategies", "0", "mode"]] {
+            for raw in ["TEST", "live", " LIVE", "LIVE "] {
+                let mut rejected = encoded.clone();
+                rejected[path[0]][path[1].parse::<usize>()?][path[2]] = serde_json::json!(raw);
+                assert!(
+                    serde_json::from_value::<ControlSnapshot>(rejected).is_err(),
+                    "accepted {raw:?} at {}",
+                    path[0]
+                );
+            }
+        }
         Ok(())
     }
 

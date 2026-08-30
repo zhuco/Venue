@@ -1109,7 +1109,7 @@ mod tests {
     #[test]
     fn login_and_subscriptions_are_exact_and_environment_bound()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (config, instrument, profile) = scope(GatewayMode::Test)?;
+        let (config, instrument, profile) = scope(GatewayMode::Live)?;
         let login = build_ws_login(
             &config,
             &instrument,
@@ -1119,7 +1119,7 @@ mod tests {
             &OkxCredentials::from_values("key", "mysecret", "pass")?,
             "1538054050",
         )?;
-        assert!(login.endpoint().contains("wspap.okx.com"));
+        assert_eq!(login.endpoint(), "wss://ws.okx.com:8443/ws/v5/private");
         assert_eq!(login.scope().private_generation(), 17);
         assert_eq!(login.scope().trade_mode(), OkxTradeMode::Cross);
         assert_eq!(
@@ -1159,9 +1159,14 @@ mod tests {
             .is_ok()
         );
 
-        let (live, live_instrument, live_profile) = scope(GatewayMode::Live)?;
+        let wrong = OkxConfig::for_binding(GatewayBinding::new(
+            VenueId::Okx,
+            GatewayMode::Live,
+            "00000000-0000-4000-8000-000000000001",
+            "ETH/USDT".parse()?,
+        )?)?;
         assert_eq!(
-            build_private_subscribe(&session, &live, &live_instrument, &live_profile, "request2"),
+            build_private_subscribe(&session, &wrong, &instrument, &profile, "request2"),
             Err(OkxError::Binding)
         );
         assert_eq!(

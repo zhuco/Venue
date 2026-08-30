@@ -15,15 +15,11 @@ pub struct SignInput<'a> {
 
 pub struct SignedHeaders {
     entries: [(String, SecretString); 6],
-    paper_trading: bool,
 }
 
 impl SignedHeaders {
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&str> {
-        if name.eq_ignore_ascii_case("paptrading") {
-            return self.paper_trading.then_some("1");
-        }
         self.entries
             .iter()
             .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
@@ -54,7 +50,7 @@ pub fn prehash(input: &SignInput<'_>) -> Result<Vec<u8>, BitgetError> {
 
 pub fn sign(
     credentials: &BitgetCredentials,
-    config: &BitgetConfig,
+    _config: &BitgetConfig,
     input: &SignInput<'_>,
 ) -> Result<SignedHeaders, BitgetError> {
     let prehash = prehash(input)?;
@@ -85,7 +81,6 @@ pub fn sign(
             ),
             ("locale".to_owned(), SecretString::from("en-US".to_owned())),
         ],
-        paper_trading: config.paper_trading(),
     })
 }
 
@@ -132,26 +127,8 @@ mod tests {
             headers.get("ACCESS-SIGN"),
             Some("Cnzpvm2X8kzdlPnV+DENDS3HIuU/jZq4eJknd1s0vfQ=")
         );
-        assert_eq!(headers.get("paptrading"), None);
-        Ok(())
-    }
-
-    #[test]
-    fn test_private_headers_are_explicitly_paper_trading() -> Result<(), BitgetError> {
-        let input = SignInput {
-            timestamp_ms: 1,
-            method: "POST",
-            request_path: "/api/v3/trade/place-order",
-            query: "",
-            body: br#"{"symbol":"BTCUSDT"}"#,
-        };
-        let headers = sign(
-            &credentials()?,
-            &BitgetConfig::for_mode(GatewayMode::Test),
-            &input,
-        )?;
-        assert_eq!(headers.get("paptrading"), Some("1"));
         assert_eq!(headers.get("content-type"), Some("application/json"));
+        assert!(headers.get("paptrading").is_none());
         Ok(())
     }
 

@@ -7,15 +7,11 @@ use crate::{OkxConfig, OkxCredentials, OkxError};
 
 pub(crate) struct SignedHeaders {
     entries: [(String, SecretString); 5],
-    simulated_trading: bool,
 }
 
 impl SignedHeaders {
     #[must_use]
     pub(crate) fn get(&self, name: &str) -> Option<&str> {
-        if name.eq_ignore_ascii_case("x-simulated-trading") {
-            return self.simulated_trading.then_some("1");
-        }
         self.entries
             .iter()
             .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
@@ -25,7 +21,7 @@ impl SignedHeaders {
 
 pub(crate) fn sign(
     credentials: &OkxCredentials,
-    config: &OkxConfig,
+    _config: &OkxConfig,
     timestamp: &str,
     method: &str,
     request_path: &str,
@@ -67,6 +63,5 @@ pub(crate) fn sign(
                 SecretString::from("application/json".to_owned()),
             ),
         ],
-        simulated_trading: config.simulated_trading(),
     })
 }

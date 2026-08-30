@@ -5,8 +5,8 @@ use sqlx::{Executor, PgPool, postgres::PgPoolOptions};
 use venue_control::{
     AccountDeliveryRepository, CopyApplyResult, CopyLeaderEnvelope, CopyLeaderIntent,
     CopyLeaderSnapshot, CopyLedgerProjectionInput, CopyObserverScope, CopyPlanningSnapshot,
-    CopyReplayDeliveryState, CopyRepository, CopyTestWorker, CopyTestWorkerConfig,
-    FrozenCapitalSnapshot, MIGRATION_0001, MIGRATION_0002, MIGRATION_0003, MIGRATION_0004,
+    CopyReplayDeliveryState, CopyRepository, CopyWorker, CopyWorkerConfig, FrozenCapitalSnapshot,
+    MIGRATION_0001, MIGRATION_0002, MIGRATION_0003, MIGRATION_0004, MIGRATION_0005,
     PgControlRepository, ScopedCopyDeliveryReceipt,
 };
 use venue_control_protocol::{
@@ -18,6 +18,140 @@ use venue_copy::{
     derive_copy_identities,
 };
 use venue_domain::domain::{Amount, Asset, InstrumentIdentity, MarketKind, Symbol};
+
+#[tokio::test]
+async fn live_only_migration_rejects_legacy_test_rows_without_rewriting_them()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = integration_database_url() else {
+        println!(
+            "SKIP: VENUE_CONTROL_TEST_DATABASE_URL is not set; LIVE-only migration test was not run"
+        );
+        return Ok(());
+    };
+    let fixture = PgFixture::create(&database_url, "legacy_mode").await?;
+    sqlx::raw_sql(MIGRATION_0001).execute(&fixture.pool).await?;
+    sqlx::raw_sql(MIGRATION_0002).execute(&fixture.pool).await?;
+    sqlx::raw_sql(MIGRATION_0003).execute(&fixture.pool).await?;
+    sqlx::raw_sql(MIGRATION_0004).execute(&fixture.pool).await?;
+    sqlx::raw_sql(
+        "ALTER TABLE venue_copy_observer_scopes \
+         DROP CONSTRAINT venue_copy_observer_scopes_mode_check; \
+         INSERT INTO venue_copy_observer_scopes \
+         (observer_id, venue, mode, trading_account_id) VALUES \
+         ('legacy-observer', 'binance', 'TEST', \
+          '00000000-0000-4000-8000-000000000001');",
+    )
+    .execute(&fixture.pool)
+    .await?;
+
+    assert!(
+        sqlx::raw_sql(MIGRATION_0005)
+            .execute(&fixture.pool)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        scalar_i64(
+            &fixture.pool,
+            "SELECT count(*) FROM venue_copy_observer_scopes WHERE mode = 'TEST'"
+        )
+        .await?,
+        1
+    );
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_only_migration_rejects_legacy_delivery_schema_without_rewriting_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = integration_database_url() else {
+        println!(
+            "SKIP: VENUE_CONTROL_TEST_DATABASE_URL is not set; delivery schema migration test was not run"
+        );
+        return Ok(());
+    };
+    let fixture = PgFixture::create(&database_url, "legacy_delivery_schema").await?;
+    sqlx::raw_sql(MIGRATION_0001).execute(&fixture.pool).await?;
+    sqlx::raw_sql(MIGRATION_0002).execute(&fixture.pool).await?;
+    sqlx::raw_sql(MIGRATION_0003).execute(&fixture.pool).await?;
+    sqlx::raw_sql(MIGRATION_0004).execute(&fixture.pool).await?;
+    sqlx::raw_sql(
+        r#"INSERT INTO venue_account_deliveries
+           (delivery_id, source_kind, source_id, venue, mode, trading_account_id, symbol,
+            instance_id, config_epoch, payload_json, created_at_ms, updated_at_ms)
+           VALUES
+           ('legacy-schema', 'control_command', 'legacy-command', 'binance', 'LIVE',
+            '00000000-0000-4000-8000-000000000001', 'BTC/USDT', 'grid-btc', 1,
+            '{}'::jsonb, 1, 1);
+           INSERT INTO venue_account_delivery_claims
+           (delivery_id, lease_epoch, node_id, purpose, leased_at_ms, expires_at_ms, claim_json)
+           VALUES
+           ('legacy-schema', 1, 'legacy-node', 'install', 1, 2,
+            '{"schema_version":1}'::jsonb);"#,
+    )
+    .execute(&fixture.pool)
+    .await?;
+
+    assert!(
+        sqlx::raw_sql(MIGRATION_0005)
+            .execute(&fixture.pool)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        scalar_i64(
+            &fixture.pool,
+            "SELECT count(*) FROM venue_account_delivery_claims \
+             WHERE claim_json ->> 'schema_version' = '1'"
+        )
+        .await?,
+        1
+    );
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_only_migration_rejects_any_non_live_json_mode_without_rewriting_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = integration_database_url() else {
+        println!(
+            "SKIP: VENUE_CONTROL_TEST_DATABASE_URL is not set; JSON mode migration test was not run"
+        );
+        return Ok(());
+    };
+    let fixture = PgFixture::create(&database_url, "legacy_json_mode").await?;
+    sqlx::raw_sql(MIGRATION_0001).execute(&fixture.pool).await?;
+    sqlx::raw_sql(MIGRATION_0002).execute(&fixture.pool).await?;
+    sqlx::raw_sql(MIGRATION_0003).execute(&fixture.pool).await?;
+    sqlx::raw_sql(MIGRATION_0004).execute(&fixture.pool).await?;
+    sqlx::query(
+        "INSERT INTO venue_control_snapshots (generated_ms, snapshot_json) \
+         VALUES (1, $1::jsonb)",
+    )
+    .bind(r#"{"accounts":[{"mode":"SHADOW"}]}"#)
+    .execute(&fixture.pool)
+    .await?;
+
+    assert!(
+        sqlx::raw_sql(MIGRATION_0005)
+            .execute(&fixture.pool)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        scalar_i64(
+            &fixture.pool,
+            "SELECT count(*) FROM venue_control_snapshots \
+             WHERE snapshot_json #>> '{accounts,0,mode}' = 'SHADOW'"
+        )
+        .await?,
+        1
+    );
+    fixture.cleanup().await?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn postgres_migration_concurrency_and_crash_windows() -> Result<(), Box<dyn std::error::Error>>
@@ -53,7 +187,7 @@ async fn postgres_migration_concurrency_and_crash_windows() -> Result<(), Box<dy
         .claim_account_deliveries(
             &AccountDeliveryBinding {
                 venue: VenueId::Binance,
-                mode: GatewayMode::Test,
+                mode: GatewayMode::Live,
                 trading_account_id: scope.trading_account_id.clone(),
                 symbol: "BTC/USDT".parse()?,
                 instance_id: "copy-btc".to_owned(),
@@ -68,7 +202,7 @@ async fn postgres_migration_concurrency_and_crash_windows() -> Result<(), Box<dy
     assert_eq!(claims.len(), 1);
     assert!(matches!(
         claims[0].payload,
-        AccountDeliveryPayload::TestCopySemanticJob(_)
+        AccountDeliveryPayload::CopySemanticJob(_)
     ));
 
     repository
@@ -249,7 +383,7 @@ async fn postgres_receipts_unknown_fence_ledger_and_restart_recovery()
 
 async fn plan_one(
     repository: &PgControlRepository,
-    worker: &CopyTestWorker,
+    worker: &CopyWorker,
     scope: &CopyObserverScope,
     seed: u8,
     now: u64,
@@ -264,7 +398,7 @@ async fn plan_one(
 }
 
 async fn project_applied_ledger(
-    worker: &CopyTestWorker,
+    worker: &CopyWorker,
     claim: &venue_control::CopyDeliveryClaim,
     planned: &venue_control::PlannedCopyJob,
     now: u64,
@@ -325,11 +459,11 @@ fn make_worker(
     repository: PgControlRepository,
     scope: CopyObserverScope,
     worker_id: &str,
-) -> Result<CopyTestWorker, venue_control::CopyWorkerError> {
-    CopyTestWorker::new(
+) -> Result<CopyWorker, venue_control::CopyWorkerError> {
+    CopyWorker::new(
         repository,
-        CopyTestWorkerConfig {
-            mode: GatewayMode::Test,
+        CopyWorkerConfig {
+            mode: GatewayMode::Live,
             scope,
             worker_id: worker_id.to_owned(),
             observer_lease_ms: 1_000,
@@ -413,6 +547,7 @@ fn scope(observer_id: &str) -> CopyObserverScope {
     CopyObserverScope {
         observer_id: observer_id.to_owned(),
         venue: VenueId::Binance,
+        mode: GatewayMode::Live,
         trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
     }
 }
@@ -431,7 +566,7 @@ async fn install_account_scope(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO venue_control_strategy_scopes \
          (instance_id, venue, mode, trading_account_id, symbol, config_epoch, snapshot_generated_ms) \
-         VALUES ('copy-btc', 'binance', 'TEST', \
+         VALUES ('copy-btc', 'binance', 'LIVE', \
                  '00000000-0000-4000-8000-000000000001', 'BTC/USDT', 7, 1)",
     )
     .execute(pool)
@@ -484,6 +619,7 @@ impl PgFixture {
             sqlx::raw_sql(MIGRATION_0002).execute(&self.pool).await?;
             sqlx::raw_sql(MIGRATION_0003).execute(&self.pool).await?;
             sqlx::raw_sql(MIGRATION_0004).execute(&self.pool).await?;
+            sqlx::raw_sql(MIGRATION_0005).execute(&self.pool).await?;
         }
         Ok(())
     }

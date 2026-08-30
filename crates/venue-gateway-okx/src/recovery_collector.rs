@@ -1344,12 +1344,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_and_live_collect_fresh_six_face_hedge_evidence() -> Result<(), Box<dyn Error>> {
+    async fn live_collects_fresh_six_face_hedge_evidence() -> Result<(), Box<dyn Error>> {
         let TestScope {
             config,
             instrument,
             active,
-        } = test_scope(GatewayMode::Test, OkxPositionMode::LongShort)?;
+        } = test_scope(GatewayMode::Live, OkxPositionMode::LongShort)?;
         assert!(matches!(
             OkxFreshRecoveryCollector::new(
                 config,
@@ -1365,46 +1365,40 @@ mod tests {
             ),
             Err(OkxFreshRecoveryError::IntegrationUnavailable)
         ));
-        for gateway_mode in [GatewayMode::Test, GatewayMode::Live] {
-            let (origin, server) =
-                server(OkxPositionMode::LongShort, false, Duration::ZERO).await?;
-            let result = collector(
-                test_scope(gateway_mode, OkxPositionMode::LongShort)?,
-                OkxPositionMode::LongShort,
-                16,
-                Vec::new(),
-                Duration::from_secs(5),
-                &origin,
-            )?
-            .collect()
-            .await?;
-            let OkxFreshRecoveryOutcome::Complete(evidence) = result else {
-                return Err("empty account unexpectedly unresolved".into());
-            };
-            assert_eq!(evidence.scope().binding().mode, gateway_mode);
-            assert_eq!(evidence.scope().private_generation(), 17);
-            assert_eq!(evidence.scope().connection_generation(), 23);
-            assert_eq!(evidence.scope().rest_origin(), "https://www.okx.com");
-            assert_eq!(
-                evidence.scope().private_ws_endpoint(),
-                match gateway_mode {
-                    GatewayMode::Test => "wss://wspap.okx.com:8443/ws/v5/private",
-                    GatewayMode::Live => "wss://ws.okx.com:8443/ws/v5/private",
-                }
-            );
-            assert!(evidence.scope().public_ws_endpoint().contains("/public"));
-            assert_eq!(evidence.readback().positions.len(), 2);
-            assert_eq!(evidence.faces.len(), 6);
-            assert_eq!(
-                evidence
-                    .face(OkxFreshRecoverySurface::Account)
-                    .raw_pages()
-                    .len(),
-                2
-            );
-            assert_eq!(crate::capabilities(), CapabilityFlags::empty());
-            server.await??;
-        }
+        let (origin, server) = server(OkxPositionMode::LongShort, false, Duration::ZERO).await?;
+        let result = collector(
+            test_scope(GatewayMode::Live, OkxPositionMode::LongShort)?,
+            OkxPositionMode::LongShort,
+            16,
+            Vec::new(),
+            Duration::from_secs(5),
+            &origin,
+        )?
+        .collect()
+        .await?;
+        let OkxFreshRecoveryOutcome::Complete(evidence) = result else {
+            return Err("empty account unexpectedly unresolved".into());
+        };
+        assert_eq!(evidence.scope().binding().mode, GatewayMode::Live);
+        assert_eq!(evidence.scope().private_generation(), 17);
+        assert_eq!(evidence.scope().connection_generation(), 23);
+        assert_eq!(evidence.scope().rest_origin(), "https://www.okx.com");
+        assert_eq!(
+            evidence.scope().private_ws_endpoint(),
+            "wss://ws.okx.com:8443/ws/v5/private"
+        );
+        assert!(evidence.scope().public_ws_endpoint().contains("/public"));
+        assert_eq!(evidence.readback().positions.len(), 2);
+        assert_eq!(evidence.faces.len(), 6);
+        assert_eq!(
+            evidence
+                .face(OkxFreshRecoverySurface::Account)
+                .raw_pages()
+                .len(),
+            2
+        );
+        assert_eq!(crate::capabilities(), CapabilityFlags::empty());
+        server.await??;
         Ok(())
     }
 
@@ -1413,7 +1407,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let (origin, server) = server(OkxPositionMode::Net, false, Duration::ZERO).await?;
         let result = collector(
-            test_scope(GatewayMode::Test, OkxPositionMode::Net)?,
+            test_scope(GatewayMode::Live, OkxPositionMode::Net)?,
             OkxPositionMode::Net,
             16,
             Vec::new(),
@@ -1429,7 +1423,7 @@ mod tests {
         assert_eq!(evidence.scope().position_mode(), OkxPositionMode::Net);
         server.await??;
 
-        let scope = test_scope(GatewayMode::Test, OkxPositionMode::LongShort)?;
+        let scope = test_scope(GatewayMode::Live, OkxPositionMode::LongShort)?;
         assert!(matches!(
             collector(
                 scope,
@@ -1441,7 +1435,7 @@ mod tests {
             ),
             Err(OkxFreshRecoveryError::Mode)
         ));
-        let scope = test_scope(GatewayMode::Test, OkxPositionMode::LongShort)?;
+        let scope = test_scope(GatewayMode::Live, OkxPositionMode::LongShort)?;
         assert!(matches!(
             collector(
                 scope,
@@ -1462,7 +1456,7 @@ mod tests {
         let (origin, first_server) =
             server(OkxPositionMode::LongShort, true, Duration::ZERO).await?;
         let result = collector(
-            test_scope(GatewayMode::Test, OkxPositionMode::LongShort)?,
+            test_scope(GatewayMode::Live, OkxPositionMode::LongShort)?,
             OkxPositionMode::LongShort,
             16,
             Vec::new(),
@@ -1484,7 +1478,7 @@ mod tests {
         let (origin, second_server) =
             server(OkxPositionMode::LongShort, true, Duration::ZERO).await?;
         let result = collector(
-            test_scope(GatewayMode::Test, OkxPositionMode::LongShort)?,
+            test_scope(GatewayMode::Live, OkxPositionMode::LongShort)?,
             OkxPositionMode::LongShort,
             16,
             vec![owner_route()?],
@@ -1503,7 +1497,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let (origin, server) = server(OkxPositionMode::LongShort, false, Duration::ZERO).await?;
         let result = collector(
-            test_scope(GatewayMode::Test, OkxPositionMode::LongShort)?,
+            test_scope(GatewayMode::Live, OkxPositionMode::LongShort)?,
             OkxPositionMode::LongShort,
             16,
             Vec::new(),
@@ -1539,7 +1533,7 @@ mod tests {
         let (origin, server) =
             server(OkxPositionMode::LongShort, false, Duration::from_millis(20)).await?;
         let result = collector(
-            test_scope(GatewayMode::Test, OkxPositionMode::LongShort)?,
+            test_scope(GatewayMode::Live, OkxPositionMode::LongShort)?,
             OkxPositionMode::LongShort,
             16,
             Vec::new(),

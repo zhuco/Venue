@@ -17,7 +17,6 @@ if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
 $families = [ordered]@{
     binance = [ordered]@{
         endpoints = @(
-            'testnet.binancefuture.com',
             'papi.binance.com',
             'fapi.binance.com',
             'fstream.binance.com'
@@ -26,7 +25,7 @@ $families = [ordered]@{
         binding = @('portfolio_margin_um')
     }
     bitget = [ordered]@{
-        endpoints = @('api.bitget.com', 'wspap.bitget.com', 'ws.bitget.com')
+        endpoints = @('api.bitget.com', 'ws.bitget.com')
         credentials = @(
             'BITGET_API_KEY',
             'BITGET_API_SECRET',
@@ -37,9 +36,7 @@ $families = [ordered]@{
     }
     bybit = [ordered]@{
         endpoints = @(
-            'api-testnet.bybit.com',
             'api.bybit.com',
-            'stream-testnet.bybit.com',
             'stream.bybit.com'
         )
         credentials = @('BYBIT_API_KEY', 'BYBIT_API_SECRET')
@@ -47,16 +44,14 @@ $families = [ordered]@{
     }
     gate = [ordered]@{
         endpoints = @(
-            'api-testnet.gateapi.io',
             'api.gateio.ws',
-            'ws-testnet.gate.com',
             'fx-ws.gateio.ws'
         )
         credentials = @('GATEIO_API_KEY', 'GATEIO_API_SECRET')
         binding = @('usdt_futures_dual')
     }
     hyperliquid = [ordered]@{
-        endpoints = @('api.hyperliquid-testnet.xyz', 'api.hyperliquid.xyz')
+        endpoints = @('api.hyperliquid.xyz')
         credentials = @(
             'HYPERLIQUID_ACCOUNT_ADDRESS',
             'HYPERLIQUID_API_WALLET_ADDRESS',
@@ -66,7 +61,7 @@ $families = [ordered]@{
         binding = @('usdc_perpetual_api_wallet')
     }
     okx = [ordered]@{
-        endpoints = @('www.okx.com', 'wspap.okx.com', 'ws.okx.com')
+        endpoints = @('www.okx.com', 'ws.okx.com')
         credentials = @('OKX_API_KEY', 'OKX_API_SECRET', 'OKX_API_PASSPHRASE')
         binding = @('linear_swap')
     }
@@ -74,6 +69,29 @@ $families = [ordered]@{
 
 $content = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($binary))
 $selected = $families[$Venue]
+$forbiddenNonProductionMarkers = @(
+    'testnet',
+    'sandbox',
+    'paper_trading',
+    'simulated-trading',
+    'testnet.binancefuture.com',
+    'wspap.bitget.com',
+    'paptrading',
+    'api-testnet.bybit.com',
+    'stream-testnet.bybit.com',
+    'api-testnet.gateapi.io',
+    'ws-testnet.gate.com',
+    'api.hyperliquid-testnet.xyz',
+    'wspap.okx.com',
+    'x-simulated-trading'
+)
+# Do not scan the bare token `demo`: case-insensitive binary search also matches Rust identifiers
+# such as `TradeMode`. Exact demo/test endpoints and headers above are the deployable evidence.
+foreach ($needle in $forbiddenNonProductionMarkers) {
+    if ($content.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        throw "固定节点 $Venue 包含非生产 endpoint/header 标记：$needle"
+    }
+}
 foreach ($category in @('endpoints', 'credentials', 'binding')) {
     foreach ($needle in $selected[$category]) {
         if ($content.IndexOf($needle, [StringComparison]::Ordinal) -lt 0) {

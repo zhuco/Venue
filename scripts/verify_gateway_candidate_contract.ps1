@@ -73,7 +73,7 @@ function Test-MissingEvidenceFailClosed {
         [Parameter(Mandatory)] [string]$BinaryPath
     )
 
-    foreach ($mode in @('TEST', 'LIVE')) {
+    foreach ($mode in @('LIVE')) {
         $probeBase = Join-Path `
             (Split-Path -Parent $targetRoot) `
             "venue-gateway-no-io-$Venue-$mode-$([Guid]::NewGuid().ToString('N'))"
@@ -140,6 +140,56 @@ function Test-MissingEvidenceFailClosed {
     }
 }
 
+function Test-NonProductionModeRejected {
+    param(
+        [Parameter(Mandatory)] [string]$Venue,
+        [Parameter(Mandatory)] [string]$BinaryPath
+    )
+
+    $probeBase = Join-Path `
+        (Split-Path -Parent $targetRoot) `
+        "venue-gateway-reject-test-$Venue-$([Guid]::NewGuid().ToString('N'))"
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $BinaryPath
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in @(
+        '--mode', 'TEST',
+        '--trading-account-id', '00000000-0000-4000-8000-000000000041',
+        '--symbol', $symbols[$Venue],
+        '--artifacts-base', $probeBase
+    )) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+    foreach ($credentialName in $credentialNames[$Venue]) {
+        [void]$startInfo.Environment.Remove($credentialName)
+    }
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw "无法启动 $Venue TEST 拒绝探针。"
+    }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit(15000)) {
+        $process.Kill($true)
+        $process.WaitForExit()
+        throw "$Venue TEST 拒绝探针未在 15 秒内结束。"
+    }
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
+    if ($process.ExitCode -eq 0 -or (Test-Path -LiteralPath $probeBase)) {
+        throw "$Venue 接受了 TEST 或在拒绝前创建了工件。"
+    }
+    if (-not "$stdout`n$stderr".Contains(
+        'gateway mode must be exactly LIVE',
+        [StringComparison]::Ordinal
+    )) {
+        throw "$Venue TEST 未由最前置 mode parser 拒绝。"
+    }
+}
+
 $matrix = [System.Collections.Generic.List[object]]::new()
 foreach ($venue in @('binance', 'bitget', 'bybit', 'gate', 'hyperliquid', 'okx')) {
     $binaryName = "venue-node-$venue"
@@ -163,6 +213,7 @@ foreach ($venue in @('binance', 'bitget', 'bybit', 'gate', 'hyperliquid', 'okx')
         throw "$venue 固定二进制隔离验证失败。"
     }
     $isolation = $isolationJson | ConvertFrom-Json
+    Test-NonProductionModeRejected -Venue $venue -BinaryPath $binaryPath
     Test-MissingEvidenceFailClosed -Venue $venue -BinaryPath $binaryPath
 
     $candidateEvidence = switch ($venue) {
@@ -217,7 +268,9 @@ foreach ($venue in @('binance', 'bitget', 'bybit', 'gate', 'hyperliquid', 'okx')
     }
     $matrix.Add([ordered]@{
         venue = $venue
-        test_live_binding = 'integration_test_exact_and_disjoint'
+        live_binding = 'integration_test_exact_live_and_reject_nonproduction'
+        rejected_modes = @('TEST')
+        mode_rejection = 'exact parser error; credentials removed; artifact root absent'
         order_family_evidence = $candidateEvidence.order_families
         one_shot_evidence = $candidateEvidence.one_shot_mutation
         ack_unknown_evidence = $candidateEvidence.ack_unknown

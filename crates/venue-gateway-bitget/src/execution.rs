@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use venue_domain::domain::{
     FieldState, Order, OrderSide, OrderState, Position, PositionSide, Price,
 };
-use venue_gateway_api::{GatewayBinding, GatewayMode};
+use venue_gateway_api::GatewayBinding;
 
 use crate::{
     BitgetAccountBinding, BitgetConfig, BitgetCredentials, SignInput, SignedHeaders, endpoints,
@@ -663,9 +663,7 @@ fn validate_binding(
     BitgetAccountBinding::UtaUsdtFuturesHedge
         .validate_gateway_binding(binding)
         .map_err(|_| BitgetExecutionError::Binding)?;
-    if binding.mode != config.mode()
-        || (matches!(binding.mode, GatewayMode::Test) != config.paper_trading())
-    {
+    if binding.mode != config.mode() {
         return Err(BitgetExecutionError::Binding);
     }
     Ok(())
@@ -856,9 +854,9 @@ mod tests {
     #[test]
     fn place_and_reduce_once_encode_only_consistent_hedge_directions()
     -> Result<(), Box<dyn std::error::Error>> {
-        let binding = binding(GatewayMode::Test)?;
-        let config = BitgetConfig::for_mode(GatewayMode::Test);
-        let rules = rules(GatewayMode::Test)?;
+        let binding = binding(GatewayMode::Live)?;
+        let config = BitgetConfig::for_mode(GatewayMode::Live);
+        let rules = rules(GatewayMode::Live)?;
         let place = prepare_place_request(
             &binding,
             &config,
@@ -943,7 +941,7 @@ mod tests {
         assert!(
             prepare_cancel_request(
                 &live,
-                &BitgetConfig::for_mode(GatewayMode::Test),
+                &BitgetConfig::for_mode(GatewayMode::Live),
                 7,
                 9,
                 &BitgetCancelIntent {

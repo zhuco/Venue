@@ -74,14 +74,13 @@ mod fixture {
     const MAX_RECOVERY_SYMBOLS: usize = 256;
     const MAX_RECOVERY_WINDOW_MS: u64 = 60_000;
 
-    /// Exact endpoint and Demo-header identity observed by the read-only collection transport.
+    /// Exact LIVE endpoint identity observed by the read-only collection transport.
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct BitgetRecoveryEndpoint {
         mode: GatewayMode,
         rest_origin: String,
         public_ws: String,
         private_ws: String,
-        paper_trading: bool,
     }
 
     impl BitgetRecoveryEndpoint {
@@ -93,7 +92,6 @@ mod fixture {
                 rest_origin: config.rest_origin().to_owned(),
                 public_ws: config.public_ws().to_owned(),
                 private_ws: config.private_ws().to_owned(),
-                paper_trading: config.paper_trading(),
             }
         }
 
@@ -102,14 +100,12 @@ mod fixture {
             rest_origin: impl Into<String>,
             public_ws: impl Into<String>,
             private_ws: impl Into<String>,
-            paper_trading: bool,
         ) -> Result<Self, BitgetRecoveryError> {
             let endpoint = Self {
                 mode,
                 rest_origin: rest_origin.into(),
                 public_ws: public_ws.into(),
                 private_ws: private_ws.into(),
-                paper_trading,
             };
             if endpoint != Self::for_mode(mode) {
                 return Err(BitgetRecoveryError::Endpoint);
@@ -135,11 +131,6 @@ mod fixture {
         #[must_use]
         pub fn private_ws(&self) -> &str {
             &self.private_ws
-        }
-
-        #[must_use]
-        pub const fn paper_trading(&self) -> bool {
-            self.paper_trading
         }
     }
 
@@ -974,7 +965,6 @@ mod fixture {
         commit_str(&mut digest, &scope.endpoint.rest_origin);
         commit_str(&mut digest, &scope.endpoint.public_ws);
         commit_str(&mut digest, &scope.endpoint.private_ws);
-        commit_bool(&mut digest, scope.endpoint.paper_trading);
         commit_str(&mut digest, scope.account_binding.as_str());
         commit_str(&mut digest, &scope.trading_account_id);
         commit_str(&mut digest, &scope.config_digest);
@@ -1209,7 +1199,7 @@ mod fixture {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
     pub enum BitgetRecoveryError {
-        #[error("Bitget recovery endpoint does not exactly match Demo(TEST) or LIVE configuration")]
+        #[error("Bitget recovery endpoint does not exactly match LIVE configuration")]
         Endpoint,
         #[error("Bitget recovery account binding is invalid")]
         Account,
@@ -1445,66 +1435,60 @@ mod fixture {
         }
 
         #[test]
-        fn demo_and_live_bind_exact_endpoints_and_keep_generations_distinct()
+        fn live_binds_exact_endpoints_and_keeps_generations_distinct()
         -> Result<(), Box<dyn std::error::Error>> {
-            for mode in [GatewayMode::Test, GatewayMode::Live] {
-                let btc = symbol("BTC/USDT")?;
-                let mut collector = new_collector(mode, vec![btc.clone()])?;
-                collector.push_symbol(&rules(mode, &btc)?, private(mode, &btc, json!([]))?, 250)?;
-                let candidate = complete(collector, Vec::new())?;
-                assert_eq!(candidate.scope().endpoint().mode(), mode);
-                assert_eq!(
-                    candidate.scope().endpoint().paper_trading(),
-                    mode == GatewayMode::Test
-                );
-                assert_eq!(
-                    candidate.scope().connection_generation(),
-                    CONNECTION_GENERATION
-                );
-                assert_eq!(candidate.scope().private_generation(), PRIVATE_GENERATION);
-                assert_ne!(
-                    candidate.scope().connection_generation(),
-                    candidate.scope().private_generation()
-                );
-                assert!(crate::capabilities().is_empty());
-                assert!(
-                    candidate
-                        .raw_commitment_sha256()
-                        .iter()
-                        .any(|byte| *byte != 0)
-                );
-                for surface in [
-                    BitgetRecoverySurface::Account,
-                    BitgetRecoverySurface::Positions,
-                    BitgetRecoverySurface::UmOrder,
-                    BitgetRecoverySurface::FillsCursor,
-                ] {
-                    assert!(matches!(
-                        candidate.coverage(surface),
-                        BitgetRecoveryCoverage::Complete { .. }
-                    ));
-                }
-                for surface in [
-                    BitgetRecoverySurface::UmConditional,
-                    BitgetRecoverySurface::UmAlgo,
-                ] {
-                    assert!(matches!(
-                        candidate.coverage(surface),
-                        BitgetRecoveryCoverage::Unsupported {
-                            profile_version: BITGET_ORDER_PROFILE_VERSION,
-                            ..
-                        }
-                    ));
-                }
+            let mode = GatewayMode::Live;
+            let btc = symbol("BTC/USDT")?;
+            let mut collector = new_collector(mode, vec![btc.clone()])?;
+            collector.push_symbol(&rules(mode, &btc)?, private(mode, &btc, json!([]))?, 250)?;
+            let candidate = complete(collector, Vec::new())?;
+            assert_eq!(candidate.scope().endpoint().mode(), mode);
+            assert_eq!(
+                candidate.scope().connection_generation(),
+                CONNECTION_GENERATION
+            );
+            assert_eq!(candidate.scope().private_generation(), PRIVATE_GENERATION);
+            assert_ne!(
+                candidate.scope().connection_generation(),
+                candidate.scope().private_generation()
+            );
+            assert!(crate::capabilities().is_empty());
+            assert!(
+                candidate
+                    .raw_commitment_sha256()
+                    .iter()
+                    .any(|byte| *byte != 0)
+            );
+            for surface in [
+                BitgetRecoverySurface::Account,
+                BitgetRecoverySurface::Positions,
+                BitgetRecoverySurface::UmOrder,
+                BitgetRecoverySurface::FillsCursor,
+            ] {
+                assert!(matches!(
+                    candidate.coverage(surface),
+                    BitgetRecoveryCoverage::Complete { .. }
+                ));
             }
-            let test = BitgetRecoveryEndpoint::for_mode(GatewayMode::Test);
+            for surface in [
+                BitgetRecoverySurface::UmConditional,
+                BitgetRecoverySurface::UmAlgo,
+            ] {
+                assert!(matches!(
+                    candidate.coverage(surface),
+                    BitgetRecoveryCoverage::Unsupported {
+                        profile_version: BITGET_ORDER_PROFILE_VERSION,
+                        ..
+                    }
+                ));
+            }
+            let live = BitgetRecoveryEndpoint::for_mode(GatewayMode::Live);
             assert_eq!(
                 BitgetRecoveryEndpoint::verified(
                     GatewayMode::Live,
-                    test.rest_origin(),
-                    test.public_ws(),
-                    test.private_ws(),
-                    test.paper_trading(),
+                    "https://fixture.invalid",
+                    live.public_ws(),
+                    live.private_ws(),
                 ),
                 Err(BitgetRecoveryError::Endpoint)
             );
@@ -1587,20 +1571,20 @@ mod fixture {
         fn missing_face_or_symbol_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
             let btc = symbol("BTC/USDT")?;
             let eth = symbol("ETH/USDT")?;
-            let mut missing_face = private(GatewayMode::Test, &btc, json!([]))?;
+            let mut missing_face = private(GatewayMode::Live, &btc, json!([]))?;
             missing_face
                 .raw_pages
                 .retain(|raw| raw.surface != BitgetPrivateSurface::Fills);
-            let mut collector = new_collector(GatewayMode::Test, vec![btc.clone()])?;
+            let mut collector = new_collector(GatewayMode::Live, vec![btc.clone()])?;
             assert!(matches!(
-                collector.push_symbol(&rules(GatewayMode::Test, &btc)?, missing_face, 250),
+                collector.push_symbol(&rules(GatewayMode::Live, &btc)?, missing_face, 250),
                 Err(BitgetRecoveryError::Readback(_))
             ));
 
-            let mut collector = new_collector(GatewayMode::Test, vec![btc.clone(), eth])?;
+            let mut collector = new_collector(GatewayMode::Live, vec![btc.clone(), eth])?;
             collector.push_symbol(
-                &rules(GatewayMode::Test, &btc)?,
-                private(GatewayMode::Test, &btc, json!([]))?,
+                &rules(GatewayMode::Live, &btc)?,
+                private(GatewayMode::Live, &btc, json!([]))?,
                 250,
             )?;
             let endpoint = collector.scope.endpoint().clone();
@@ -1623,10 +1607,10 @@ mod fixture {
                 "qty":"0.001", "cumExecQty":"0", "price":"100000",
                 "avgPrice":"0", "delegateType":"normal"
             });
-            let mut collector = new_collector(GatewayMode::Test, vec![btc.clone()])?;
+            let mut collector = new_collector(GatewayMode::Live, vec![btc.clone()])?;
             collector.push_symbol(
-                &rules(GatewayMode::Test, &btc)?,
-                private(GatewayMode::Test, &btc, json!([order]))?,
+                &rules(GatewayMode::Live, &btc)?,
+                private(GatewayMode::Live, &btc, json!([order]))?,
                 250,
             )?;
             let endpoint = collector.scope.endpoint().clone();
@@ -1635,11 +1619,11 @@ mod fixture {
                 Err(BitgetRecoveryError::OwnerRoute)
             );
 
-            let mut collector = new_collector(GatewayMode::Test, vec![btc.clone()])?;
+            let mut collector = new_collector(GatewayMode::Live, vec![btc.clone()])?;
             collector.push_symbol(
-                &rules(GatewayMode::Test, &btc)?,
+                &rules(GatewayMode::Live, &btc)?,
                 private(
-                    GatewayMode::Test,
+                    GatewayMode::Live,
                     &btc,
                     json!([{
                         "orderId":"9001", "clientOid":"venue_open_1",

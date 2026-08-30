@@ -2,7 +2,7 @@
 //!
 //! This module has no transport, credentials, runtime, writer, or persistence side effects. Raw
 //! payloads retain their exact bytes and the full gateway binding so a response cannot be
-//! relabelled across venue, account, symbol, or TEST/LIVE mode before normalization.
+//! relabelled across venue, account, symbol, or LIVE binding before normalization.
 
 use std::str::FromStr;
 

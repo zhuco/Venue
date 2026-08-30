@@ -873,7 +873,7 @@ mod tests {
     #[tokio::test]
     async fn http_transport_enforces_binding_status_size_timeout_and_disconnect()
     -> Result<(), Box<dyn std::error::Error>> {
-        let binding = read_binding(GatewayMode::Test, USER)?;
+        let binding = read_binding(GatewayMode::Live, USER)?;
         let request = crate::build_meta_request(&binding)?;
         let (origin, task) = spawn_http_mock(HttpMock::Response {
             status: 200,
@@ -888,7 +888,7 @@ mod tests {
         assert!(response.received_at_ms > 0);
         task.await?;
 
-        let wrong = read_binding(GatewayMode::Test, OTHER_USER)?;
+        let wrong = read_binding(GatewayMode::Live, OTHER_USER)?;
         assert_eq!(
             transport.post_info(&wrong, &request).await,
             Err(HyperliquidTransportError::Binding)
@@ -941,7 +941,7 @@ mod tests {
     #[tokio::test]
     async fn exchange_transport_dispatches_once_without_automatic_retry()
     -> Result<(), Box<dyn std::error::Error>> {
-        let meta = meta(GatewayMode::Test)?;
+        let meta = meta(GatewayMode::Live)?;
         let credentials = HyperliquidCredentials::from_values(USER, None, AGENT, AGENT_KEY)?;
         let mut nonce_store = MemoryNonceStore::default();
         let nonce = reserve_next_nonce(&mut nonce_store, AGENT, 1_700_000_000_000)?;
@@ -1072,7 +1072,7 @@ mod tests {
     #[tokio::test]
     async fn websocket_requires_all_exact_acks_before_delivering_bound_bytes()
     -> Result<(), Box<dyn std::error::Error>> {
-        let binding = private_binding(GatewayMode::Test, 31)?;
+        let binding = private_binding(GatewayMode::Live, 31)?;
         let (target, server) = spawn_ws_mock(WsMock::Success).await?;
         let mut transport = HyperliquidPrivateWsTransport::connect_for_test(
             binding.clone(),
@@ -1119,7 +1119,7 @@ mod tests {
         )
         .await?;
         let wrong_scope =
-            private_binding_for(GatewayMode::Test, 41, OTHER_USER, "ETH/USDC", "ETH")?;
+            private_binding_for(GatewayMode::Live, 41, OTHER_USER, "ETH/USDC", "ETH")?;
         assert_eq!(
             transport.next_frame(&wrong_scope).await,
             Err(HyperliquidTransportError::Binding)
@@ -1195,7 +1195,7 @@ mod tests {
         ] {
             let (target, server) = spawn_ws_mock(behavior).await?;
             let mut transport = HyperliquidPrivateWsTransport::connect_for_heartbeat_test(
-                private_binding(GatewayMode::Test, 52)?,
+                private_binding(GatewayMode::Live, 52)?,
                 Duration::from_millis(20),
                 Duration::from_millis(10),
                 64 * 1024,

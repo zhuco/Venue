@@ -612,7 +612,7 @@ mod tests {
     > {
         let binding = GatewayBinding::new(
             VenueId::Binance,
-            GatewayMode::Test,
+            GatewayMode::Live,
             account,
             "BTC/USDT".parse()?,
         )?;
@@ -732,15 +732,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_key_listen_key_request_remains_on_the_configured_test_origin()
+    async fn api_key_listen_key_request_uses_live_scope_with_loopback_fixture()
     -> Result<(), Box<dyn std::error::Error>> {
         let credentials = BinanceCredentials::from_values("key", "secret")?;
         let (config, _, _) = facts("00000000-0000-4000-8000-000000000001")?;
-        assert_eq!(config.mode(), GatewayMode::Test);
-        assert_eq!(
-            config.portfolio_rest_origin(),
-            "https://testnet.binancefuture.com"
-        );
+        assert_eq!(config.mode(), GatewayMode::Live);
+        assert_eq!(config.portfolio_rest_origin(), "https://papi.binance.com");
         let (endpoint, _) =
             fake_http(vec![Behavior::Body(br#"{"listenKey":"test-listen-key"}"#)]).await?;
         let transport = BinanceHttpTransport::with_endpoint(

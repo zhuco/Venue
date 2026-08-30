@@ -297,7 +297,7 @@ mod tests {
     fn binding() -> Result<GatewayBinding, Box<dyn std::error::Error>> {
         Ok(GatewayBinding::new(
             VenueId::Okx,
-            GatewayMode::Test,
+            GatewayMode::Live,
             ACCOUNT_ID,
             "BTC/USDT".parse()?,
         )?)

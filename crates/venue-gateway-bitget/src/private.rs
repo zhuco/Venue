@@ -1159,8 +1159,8 @@ mod tests {
         {
             face.raw.binding = GatewayBinding::new(
                 VenueId::Bitget,
-                GatewayMode::Test,
-                "00000000-0000-4000-8000-000000000001",
+                GatewayMode::Live,
+                "00000000-0000-4000-8000-000000000002",
                 "DOGE/USDT".parse()?,
             )?;
         }

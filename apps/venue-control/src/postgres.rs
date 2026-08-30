@@ -11,6 +11,7 @@ use crate::{
 };
 
 pub const MIGRATION_0001: &str = include_str!("../migrations/0001_control_core.sql");
+pub const MIGRATION_0005: &str = include_str!("../migrations/0005_live_only.sql");
 
 #[derive(Clone, Debug)]
 pub struct PgControlRepository {
@@ -47,6 +48,9 @@ impl ControlRepository for PgControlRepository {
         &self,
         snapshot: &ControlSnapshot,
     ) -> Result<SnapshotStoreResult, RepositoryError> {
+        snapshot
+            .validate()
+            .map_err(|_| RepositoryError::CorruptData)?;
         let generated_ms = to_i64(snapshot.generated_ms)?;
         let snapshot_json = encode(snapshot)?;
         let event_json = encode(&ControlEvent::Snapshot(snapshot.clone()))?;
@@ -130,6 +134,12 @@ impl ControlRepository for PgControlRepository {
         command: &ControlCommandRequest,
         accepted: &CommandReceipt,
     ) -> Result<CommandEnqueueResult, RepositoryError> {
+        command
+            .validate()
+            .map_err(|_| RepositoryError::CorruptData)?;
+        accepted
+            .validate()
+            .map_err(|_| RepositoryError::CorruptData)?;
         let command_json = encode(command)?;
         let receipt_json = encode(accepted)?;
         let created_ms = to_i64(accepted.observed_ms)?;
@@ -234,6 +244,9 @@ impl ControlRepository for PgControlRepository {
         claimed_ms: u64,
         limit: u32,
     ) -> Result<Vec<ClaimedCommand>, RepositoryError> {
+        binding
+            .validate()
+            .map_err(|_| RepositoryError::CorruptData)?;
         let claimed_ms_i64 = to_i64(claimed_ms)?;
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let rows = sqlx::query(
@@ -294,6 +307,9 @@ impl ControlRepository for PgControlRepository {
         &self,
         scoped: &ScopedCommandReceipt,
     ) -> Result<CommandSettleResult, RepositoryError> {
+        scoped
+            .validate()
+            .map_err(|_| RepositoryError::CorruptData)?;
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let row = sqlx::query(
             "SELECT i.command_json, i.receipt_json, o.delivery_state, o.claimed_by, o.claimed_ms \
@@ -399,6 +415,9 @@ impl ControlRepository for PgControlRepository {
         &self,
         command: &ControlCommandRequest,
     ) -> Result<bool, RepositoryError> {
+        command
+            .validate()
+            .map_err(|_| RepositoryError::CorruptData)?;
         let row = sqlx::query(
             "SELECT 1 FROM venue_control_strategy_scopes \
              WHERE instance_id = $1 AND venue = $2 AND mode = $3 \
@@ -422,6 +441,11 @@ impl ControlRepository for PgControlRepository {
         mode: GatewayMode,
         trading_account_id: &str,
     ) -> Result<bool, RepositoryError> {
+        if mode != GatewayMode::Live
+            || !venue_domain::is_canonical_trading_account_id(trading_account_id)
+        {
+            return Err(RepositoryError::CorruptData);
+        }
         let row = sqlx::query(
             "SELECT 1 FROM venue_control_strategy_scopes \
              WHERE venue = $1 AND mode = $2 AND trading_account_id = $3 LIMIT 1",

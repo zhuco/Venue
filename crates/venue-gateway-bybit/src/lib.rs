@@ -89,23 +89,21 @@ mod tests {
     }
 
     #[test]
-    fn bindings_select_only_testnet_or_live_endpoints() -> Result<(), Box<dyn std::error::Error>> {
-        let test = BybitGatewayBinding::new(gateway_binding(
-            GatewayMode::Test,
-            "00000000-0000-4000-8000-000000000001",
-            "BTC/USDT",
-        )?)?;
+    fn binding_accepts_only_live_and_uses_production_endpoints()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rejected = serde_json::from_str::<GatewayBinding>(
+            r#"{"venue":"bybit","mode":"TEST","trading_account_id":"00000000-0000-4000-8000-000000000001","symbol":"BTC/USDT"}"#,
+        );
         let live = BybitGatewayBinding::new(gateway_binding(
             GatewayMode::Live,
             "00000000-0000-4000-8000-000000000001",
             "BTC/USDT",
         )?)?;
-        let test = test.config();
         let live = live.config();
-        assert_eq!(test.rest_origin(), "https://api-testnet.bybit.com");
+        assert!(rejected.is_err());
         assert_eq!(live.rest_origin(), "https://api.bybit.com");
-        assert_ne!(test.private_ws(), live.private_ws());
-        assert_eq!(test.mode(), GatewayMode::Test);
+        assert_eq!(live.public_ws(), "wss://stream.bybit.com/v5/public/linear");
+        assert_eq!(live.private_ws(), "wss://stream.bybit.com/v5/private");
         assert_eq!(live.mode(), GatewayMode::Live);
         assert_eq!(capabilities(), CapabilityFlags::empty());
         Ok(())
@@ -136,15 +134,13 @@ mod tests {
     }
 
     #[test]
-    fn binding_rejects_cross_mode_wrong_account_and_wrong_symbol()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn binding_rejects_wrong_account_and_wrong_symbol() -> Result<(), Box<dyn std::error::Error>> {
         let account_id = "00000000-0000-4000-8000-000000000001";
         let configured = gateway_binding(GatewayMode::Live, account_id, "BTC/USDT")?;
         let binding = BybitGatewayBinding::new(configured.clone())?;
         let credentials = BybitCredentials::from_values("test", "secret")?;
 
         for request_binding in [
-            gateway_binding(GatewayMode::Test, account_id, "BTC/USDT")?,
             gateway_binding(
                 GatewayMode::Live,
                 "00000000-0000-4000-8000-000000000002",
