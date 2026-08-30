@@ -81,6 +81,8 @@ impl ChartInterval {
 pub struct ChartViewport {
     visible_bars: usize,
     right_offset: usize,
+    #[serde(skip)]
+    drag_remainder_milli_bars: i32,
 }
 
 impl Default for ChartViewport {
@@ -88,6 +90,7 @@ impl Default for ChartViewport {
         Self {
             visible_bars: DEFAULT_VISIBLE_BARS,
             right_offset: 0,
+            drag_remainder_milli_bars: 0,
         }
     }
 }
@@ -104,10 +107,12 @@ impl ChartViewport {
     pub fn reset(&mut self) {
         self.visible_bars = DEFAULT_VISIBLE_BARS;
         self.right_offset = 0;
+        self.drag_remainder_milli_bars = 0;
     }
 
     pub fn follow_latest(&mut self) {
         self.right_offset = 0;
+        self.drag_remainder_milli_bars = 0;
     }
 
     pub fn visible_range(&mut self, total_bars: usize) -> Range<usize> {
@@ -136,7 +141,8 @@ impl ChartViewport {
         };
     }
 
-    /// Converts a horizontal drag into whole-candle panning. A rightward drag reveals history.
+    /// Converts a horizontal drag into whole-candle panning. Dragging left reveals history, while
+    /// dragging right returns towards live data. Sub-candle movement is retained during the drag.
     pub fn pan_by_drag(&mut self, total_bars: usize, chart_width: f32, drag_delta_x: f32) {
         let visible = self.visible_range(total_bars);
         if visible.is_empty() || !chart_width.is_finite() || chart_width <= 0.0 {
@@ -146,10 +152,21 @@ impl ChartViewport {
         if !width_per_bar.is_finite() || width_per_bar <= 0.0 {
             return;
         }
-        let delta = (drag_delta_x / width_per_bar).round();
-        if delta.is_finite() {
-            self.pan_by_bars(total_bars, delta as isize);
+        let delta_milli_bars = (-drag_delta_x / width_per_bar * 1_000.0).round();
+        if delta_milli_bars.is_finite() {
+            let accumulated = self
+                .drag_remainder_milli_bars
+                .saturating_add(delta_milli_bars as i32);
+            let whole_bars = accumulated / 1_000;
+            self.drag_remainder_milli_bars = accumulated % 1_000;
+            if whole_bars != 0 {
+                self.pan_by_bars(total_bars, whole_bars as isize);
+            }
         }
+    }
+
+    pub fn finish_drag(&mut self) {
+        self.drag_remainder_milli_bars = 0;
     }
 
     /// Changes the visible count while retaining the bar under `anchor_ratio` in the same place.
@@ -348,17 +365,29 @@ mod tests {
         assert_eq!(viewport.right_offset(), 0);
         assert_eq!(viewport.visible_range(501).end, 501);
 
-        viewport.pan_by_drag(501, 1_000.0, 100.0);
+        viewport.pan_by_drag(501, 1_000.0, -100.0);
         assert!(viewport.right_offset() > 0);
     }
 
     #[test]
     fn drag_pans_by_candle_width() {
         let mut viewport = ChartViewport::default();
-        viewport.pan_by_drag(500, 120.0, 20.0);
-        assert_eq!(viewport.right_offset(), 20);
         viewport.pan_by_drag(500, 120.0, -20.0);
+        assert_eq!(viewport.right_offset(), 20);
+        viewport.pan_by_drag(500, 120.0, 20.0);
         assert_eq!(viewport.right_offset(), 0);
+    }
+
+    #[test]
+    fn drag_retains_sub_candle_motion_until_it_becomes_visible() {
+        let mut viewport = ChartViewport::default();
+        for _ in 0..5 {
+            viewport.pan_by_drag(500, 1_200.0, -2.0);
+        }
+        assert_eq!(viewport.right_offset(), 1);
+        viewport.finish_drag();
+        viewport.pan_by_drag(500, 1_200.0, -2.0);
+        assert_eq!(viewport.right_offset(), 1);
     }
 
     #[test]

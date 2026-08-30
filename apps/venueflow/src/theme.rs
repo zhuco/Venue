@@ -3,17 +3,18 @@ use eframe::egui::{self, Color32, FontId, Frame, Margin, Stroke, TextStyle};
 #[cfg(not(target_arch = "wasm32"))]
 use eframe::egui::{FontData, FontDefinitions, FontFamily};
 
-pub const BG_PRIMARY: Color32 = Color32::from_rgb(0x07, 0x13, 0x1f);
-pub const BG_SECONDARY: Color32 = Color32::from_rgb(0x0d, 0x1b, 0x2a);
-pub const PANEL: Color32 = Color32::from_rgb(0x11, 0x23, 0x33);
-pub const BRAND: Color32 = Color32::from_rgb(0x16, 0xb8, 0xa6);
-pub const BRAND_HOVER: Color32 = Color32::from_rgb(0x26, 0xcf, 0xc0);
-pub const BUY: Color32 = Color32::from_rgb(0x35, 0xc9, 0x88);
-pub const SELL: Color32 = Color32::from_rgb(0xf0, 0x61, 0x74);
-pub const WARNING: Color32 = Color32::from_rgb(0xe4, 0xb8, 0x55);
-pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xe7, 0xf0, 0xf4);
-pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0x8f, 0xa6, 0xb5);
-pub const DIVIDER: Color32 = Color32::from_rgb(0x20, 0x35, 0x43);
+pub const BG_PRIMARY: Color32 = Color32::from_rgb(0x0b, 0x0e, 0x11);
+pub const BG_SECONDARY: Color32 = Color32::from_rgb(0x18, 0x1a, 0x20);
+pub const PANEL: Color32 = Color32::from_rgb(0x0e, 0x12, 0x17);
+pub const BRAND: Color32 = Color32::from_rgb(0xf0, 0xb9, 0x0b);
+pub const BRAND_HOVER: Color32 = Color32::from_rgb(0xfc, 0xd5, 0x35);
+pub const BUY: Color32 = Color32::from_rgb(0x0e, 0xcb, 0x81);
+pub const SELL: Color32 = Color32::from_rgb(0xf6, 0x46, 0x5d);
+pub const WARNING: Color32 = Color32::from_rgb(0xf0, 0xb9, 0x0b);
+pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xea, 0xec, 0xef);
+pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0x84, 0x8e, 0x9c);
+pub const DIVIDER: Color32 = Color32::from_rgb(0x2b, 0x31, 0x39);
+pub const CHART_GRID: Color32 = Color32::from_rgb(0x1e, 0x23, 0x29);
 
 pub fn apply(context: &egui::Context) {
     #[cfg(not(target_arch = "wasm32"))]
@@ -27,7 +28,7 @@ pub fn apply(context: &egui::Context) {
     visuals.extreme_bg_color = BG_PRIMARY;
     visuals.faint_bg_color = BG_SECONDARY;
     visuals.window_stroke = Stroke::new(1.0, DIVIDER);
-    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(0x16, 0xb8, 0xa6, 64);
+    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(0xf0, 0xb9, 0x0b, 48);
     visuals.selection.stroke = Stroke::new(1.0, BRAND);
     visuals.hyperlink_color = BRAND_HOVER;
     visuals.warn_fg_color = WARNING;
@@ -36,29 +37,29 @@ pub fn apply(context: &egui::Context) {
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, DIVIDER);
     visuals.widgets.inactive.bg_fill = BG_SECONDARY;
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, DIVIDER);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x14, 0x31, 0x40);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x2b, 0x31, 0x39);
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, BRAND_HOVER);
-    visuals.widgets.active.bg_fill = Color32::from_rgb(0x0e, 0x8f, 0x83);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(0x3a, 0x3f, 0x47);
     visuals.widgets.active.bg_stroke = Stroke::new(1.0, BRAND_HOVER);
     style.visuals = visuals;
-    style.spacing.item_spacing = egui::vec2(6.0, 5.0);
-    style.spacing.button_padding = egui::vec2(10.0, 6.0);
-    style.spacing.interact_size = egui::vec2(36.0, 28.0);
+    style.spacing.item_spacing = egui::vec2(6.0, 4.0);
+    style.spacing.button_padding = egui::vec2(9.0, 5.0);
+    style.spacing.interact_size = egui::vec2(34.0, 26.0);
     style
         .text_styles
-        .insert(TextStyle::Heading, FontId::proportional(20.0));
+        .insert(TextStyle::Heading, FontId::proportional(18.0));
     style
         .text_styles
-        .insert(TextStyle::Body, FontId::proportional(13.5));
+        .insert(TextStyle::Body, FontId::proportional(12.5));
     style
         .text_styles
-        .insert(TextStyle::Button, FontId::proportional(13.0));
+        .insert(TextStyle::Button, FontId::proportional(12.0));
     style
         .text_styles
-        .insert(TextStyle::Small, FontId::proportional(11.5));
+        .insert(TextStyle::Small, FontId::proportional(11.0));
     style
         .text_styles
-        .insert(TextStyle::Monospace, FontId::monospace(12.0));
+        .insert(TextStyle::Monospace, FontId::monospace(11.5));
     context.set_style_of(egui::Theme::Dark, style);
 }
 
