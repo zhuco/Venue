@@ -8,6 +8,7 @@ mod market;
 #[cfg(not(target_arch = "wasm32"))]
 mod market_client;
 mod model;
+mod order_book_view;
 mod settings_panel;
 mod theme;
 mod ui;

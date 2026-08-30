@@ -218,7 +218,9 @@ fn fake_applied_receipt(
         1,
         1,
     )?;
-    Ok(crate::domain::AppliedStrategyTurnReceipt::persisted(token))
+    Ok(crate::domain::AppliedStrategyTurnReceipt::test_persisted(
+        token,
+    ))
 }
 
 pub(super) fn runtime_place_intent(
@@ -427,9 +429,10 @@ pub(super) fn pop_applied_strategy_input(
         return Ok(None);
     };
     let input = turn.input().clone();
-    runtime.acknowledge_strategy_turn(crate::domain::AppliedStrategyTurnReceipt::persisted(
-        turn.token().clone(),
-    ))?;
+    runtime.persist_and_acknowledge_strategy_turn(
+        key,
+        format!("checkpoint-{}", turn.token().turn_sequence()).into_bytes(),
+    )?;
     Ok(Some(input))
 }
 
@@ -1329,9 +1332,10 @@ fn flatten_requires_complete_same_generation_zero_hedge_legs() -> Result<(), Box
         runtime.complete_flatten(&grid.key),
         Err(AccountRuntimeError::ShutdownActorStatePending)
     ));
-    runtime.acknowledge_strategy_turn(crate::domain::AppliedStrategyTurnReceipt::persisted(
-        active.token().clone(),
-    ))?;
+    runtime.persist_and_acknowledge_strategy_turn(
+        &grid.key,
+        format!("checkpoint-{}", active.token().turn_sequence()).into_bytes(),
+    )?;
     runtime.complete_flatten(&grid.key)?;
     assert!(runtime.registry().registration(&grid.key).is_none());
     Ok(())

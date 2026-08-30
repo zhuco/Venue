@@ -1239,68 +1239,40 @@ fn show_order_book(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
         .symbol
         .as_deref()
         .unwrap_or(&model.preferences.selected_symbol);
-    pane_heading(ui, text(language, TextKey::OrderBook), symbol);
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(local) = model.local_markets.view_for_symbol(symbol) {
-        if local.asks.is_empty() || local.bids.is_empty() {
-            empty(ui, text(language, TextKey::NoBook));
-        } else {
-            show_book_rows(
-                ui,
-                pane.instance,
-                &local.asks,
-                &local.bids,
-                language,
-                model,
-                symbol,
-            );
-        }
+        crate::order_book_view::show(
+            ui,
+            pane.instance,
+            &local.asks,
+            &local.bids,
+            &local.trades,
+            local.last,
+            local.bid,
+            local.ask,
+            language,
+            model,
+            symbol,
+        );
         return;
     }
     let Some(market) = market(model, symbol) else {
         empty(ui, text(language, TextKey::NoBook));
         return;
     };
-    show_book_rows(
+    crate::order_book_view::show(
         ui,
         pane.instance,
         &market.asks,
         &market.bids,
+        &market.trades,
+        Some(market.last),
+        Some(market.bid),
+        Some(market.ask),
         language,
         model,
         symbol,
     );
-}
-fn show_book_rows(
-    ui: &mut egui::Ui,
-    instance: u32,
-    asks: &[venue_control_protocol::UiBookLevel],
-    bids: &[venue_control_protocol::UiBookLevel],
-    language: Language,
-    model: &AppModel,
-    symbol: &str,
-) {
-    egui::Grid::new(format!("book-{instance}"))
-        .striped(true)
-        .num_columns(3)
-        .show(ui, |ui| {
-            ui.strong(text(language, TextKey::Side));
-            ui.strong(text(language, TextKey::Price));
-            ui.strong(text(language, TextKey::Quantity));
-            ui.end_row();
-            for level in asks.iter().rev().take(10) {
-                ui.colored_label(theme::SELL, text(language, TextKey::Ask));
-                ui.monospace(model.format_market_price(symbol, level.price));
-                ui.monospace(model.format_market_quantity(symbol, level.quantity));
-                ui.end_row();
-            }
-            for level in bids.iter().take(10) {
-                ui.colored_label(theme::BUY, text(language, TextKey::Bid));
-                ui.monospace(model.format_market_price(symbol, level.price));
-                ui.monospace(model.format_market_quantity(symbol, level.quantity));
-                ui.end_row();
-            }
-        });
 }
 fn show_trade_tape(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
     let language = model.preferences.language;

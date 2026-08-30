@@ -222,6 +222,18 @@ impl PhysicalRecoveryDurableRoots {
     pub(super) const fn physical_roots(&self) -> &PhysicalRecoveryAuthorityRoots {
         &self.physical_roots
     }
+
+    /// Exposes only the replay cardinalities bound into the opaque session. Gateway collectors
+    /// use them to commit their read-only recovery evidence; journal contents remain private.
+    #[must_use]
+    pub const fn owner_record_count(&self) -> u64 {
+        self.owner_index.record_count
+    }
+
+    #[must_use]
+    pub const fn wal_record_count(&self) -> u64 {
+        self.mutation_wal.record_count
+    }
 }
 
 /// Opaque runtime-issued authority for exactly one bounded physical recovery attempt. It contains

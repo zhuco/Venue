@@ -16,7 +16,7 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 const STORAGE_KEY: &str = "venueflow-state-v1";
-const PERSISTED_SCHEMA_VERSION: u16 = 3;
+const PERSISTED_SCHEMA_VERSION: u16 = 4;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -327,7 +327,7 @@ fn load(storage: Option<&dyn eframe::Storage>) -> PersistedState {
     };
     match serde_json::from_str::<PersistedState>(&encoded) {
         Ok(state) if state.schema_version == PERSISTED_SCHEMA_VERSION => state,
-        Ok(state) if state.schema_version == 2 => PersistedState {
+        Ok(state) if matches!(state.schema_version, 2 | 3) => PersistedState {
             schema_version: PERSISTED_SCHEMA_VERSION,
             preferences: state.preferences,
             workspaces: Workspaces::default(),

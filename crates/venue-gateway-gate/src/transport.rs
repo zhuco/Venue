@@ -31,6 +31,7 @@ use crate::{
     GateExactReadbackRequest, GateFreshRecoveryError, GateGatewayBinding, GateMutationKind,
     GatePreparedMutation, GatePreparedPrivateRead, GatePrivateChannel,
     GatePrivateReadbackCandidate, GateRawPrivateResponse, GateRecoverySymbolScope,
+    GateRuntimeRecoveryAwaitGuard, GateRuntimeRecoveryScope,
 };
 
 const MAX_TRANSPORT_BODY_BYTES: usize = 2 * 1_024 * 1_024;
@@ -140,7 +141,41 @@ impl GateHttpTransport {
         request: &GatePreparedPrivateRead,
         timestamp_ms: u64,
     ) -> Result<GateRawPrivateResponse, GateTransportError> {
+        self.execute_private_read_inner(binding, credentials, rules, request, timestamp_ms, None)
+            .await
+    }
+
+    pub(crate) async fn execute_private_read_guarded(
+        &self,
+        binding: &GateGatewayBinding,
+        credentials: &GateCredentials,
+        rules: &GateContractRules,
+        request: &GatePreparedPrivateRead,
+        timestamp_ms: u64,
+        runtime_guard: Option<GateRuntimeRecoveryAwaitGuard<'_>>,
+    ) -> Result<GateRawPrivateResponse, GateTransportError> {
+        self.execute_private_read_inner(
+            binding,
+            credentials,
+            rules,
+            request,
+            timestamp_ms,
+            runtime_guard,
+        )
+        .await
+    }
+
+    async fn execute_private_read_inner(
+        &self,
+        binding: &GateGatewayBinding,
+        credentials: &GateCredentials,
+        rules: &GateContractRules,
+        request: &GatePreparedPrivateRead,
+        timestamp_ms: u64,
+        runtime_guard: Option<GateRuntimeRecoveryAwaitGuard<'_>>,
+    ) -> Result<GateRawPrivateResponse, GateTransportError> {
         self.validate_binding(binding, rules, request.generation)?;
+        revalidate_runtime_guard(runtime_guard)?;
         request
             .validate(binding, rules)
             .map_err(|_| GateTransportError::Binding)?;
@@ -164,10 +199,12 @@ impl GateHttpTransport {
                 .send()
                 .await
                 .map_err(map_reqwest)?;
-            read_response(response, self.limits.maximum_body_bytes).await
+            revalidate_runtime_guard(runtime_guard)?;
+            read_response_guarded(response, self.limits.maximum_body_bytes, runtime_guard).await
         })
         .await
         .map_err(|_| GateTransportError::Timeout)??;
+        revalidate_runtime_guard(runtime_guard)?;
         let payload = String::from_utf8(body.to_vec()).map_err(|_| GateTransportError::Protocol)?;
         GateRawPrivateResponse::from_response(
             binding,
@@ -338,8 +375,16 @@ fn add_signed_headers(
 }
 
 async fn read_response(
+    response: reqwest::Response,
+    maximum_body_bytes: usize,
+) -> Result<Bytes, GateTransportError> {
+    read_response_guarded(response, maximum_body_bytes, None).await
+}
+
+async fn read_response_guarded(
     mut response: reqwest::Response,
     maximum_body_bytes: usize,
+    runtime_guard: Option<GateRuntimeRecoveryAwaitGuard<'_>>,
 ) -> Result<Bytes, GateTransportError> {
     if !response.status().is_success() {
         return Err(GateTransportError::HttpStatus);
@@ -352,6 +397,7 @@ async fn read_response(
     }
     let mut body = BytesMut::new();
     while let Some(chunk) = response.chunk().await.map_err(map_reqwest)? {
+        revalidate_runtime_guard(runtime_guard)?;
         let next = body
             .len()
             .checked_add(chunk.len())
@@ -362,6 +408,16 @@ async fn read_response(
         body.extend_from_slice(&chunk);
     }
     Ok(body.freeze())
+}
+
+fn revalidate_runtime_guard(
+    runtime_guard: Option<GateRuntimeRecoveryAwaitGuard<'_>>,
+) -> Result<(), GateTransportError> {
+    runtime_guard
+        .map(GateRuntimeRecoveryAwaitGuard::revalidate)
+        .transpose()
+        .map(|_| ())
+        .map_err(|_| GateTransportError::RuntimeScope)
 }
 
 fn map_reqwest(error: reqwest::Error) -> GateTransportError {
@@ -427,13 +483,50 @@ where
             })
     }
 
+    /// Freezes the shared-runtime registry/root/Owner/Unknown commitment into the authenticated
+    /// four-ACK private session before any signed recovery GET can be prepared.
+    pub fn begin_runtime_recovery_session<I>(
+        &self,
+        runtime_scope: GateRuntimeRecoveryScope,
+        symbols: I,
+        deadline_at_ms: u64,
+        maximum_total_bytes: usize,
+        maximum_total_pages: u32,
+    ) -> Result<GateAuthenticatedRecoverySession, GateFreshRecoveryError>
+    where
+        I: IntoIterator<Item = GateRecoverySymbolScope>,
+    {
+        self.recovery_session
+            .as_ref()
+            .ok_or(GateFreshRecoveryError::AuthenticatedSessionRequired)
+            .and_then(|lease| {
+                lease.begin_runtime(
+                    runtime_scope,
+                    symbols,
+                    deadline_at_ms,
+                    maximum_total_bytes,
+                    maximum_total_pages,
+                )
+            })
+    }
+
     /// Proves the exact private socket is still alive. Only the unique binary pong for this call
     /// succeeds; stale binary pongs and Gate text pongs are ignored.
     pub async fn revalidate_recovery_session(
         &mut self,
         session: &GateAuthenticatedRecoverySession,
     ) -> Result<(), GateTransportError> {
+        self.revalidate_recovery_session_guarded(session, None)
+            .await
+    }
+
+    pub(crate) async fn revalidate_recovery_session_guarded(
+        &mut self,
+        session: &GateAuthenticatedRecoverySession,
+        runtime_guard: Option<GateRuntimeRecoveryAwaitGuard<'_>>,
+    ) -> Result<(), GateTransportError> {
         self.validate_recovery_session_identity(session)?;
+        revalidate_runtime_guard(runtime_guard)?;
         let nonce = recovery_control_nonce(session)?;
         let result = async {
             timeout(
@@ -444,12 +537,14 @@ where
             .await
             .map_err(|_| GateTransportError::Timeout)?
             .map_err(map_websocket)?;
+            revalidate_runtime_guard(runtime_guard)?;
             loop {
                 let message = timeout(self.limits.operation_timeout, self.stream.next())
                     .await
                     .map_err(|_| GateTransportError::Timeout)?
                     .ok_or(GateTransportError::EndOfStream)?
                     .map_err(map_websocket)?;
+                revalidate_runtime_guard(runtime_guard)?;
                 match message {
                     Message::Pong(payload) if recovery_control_pong_matches(&payload, &nonce) => {
                         break;
@@ -465,13 +560,15 @@ where
                         .stream
                         .send(Message::Pong(payload))
                         .await
-                        .map_err(map_websocket)?,
+                        .map_err(map_websocket)
+                        .and_then(|()| revalidate_runtime_guard(runtime_guard))?,
                     Message::Binary(_) | Message::Frame(_) => {
                         return Err(GateTransportError::Protocol);
                     }
                     Message::Close(_) => return Err(GateTransportError::EndOfStream),
                 }
             }
+            revalidate_runtime_guard(runtime_guard)?;
             self.validate_recovery_session_identity(session)
         }
         .await;
@@ -918,6 +1015,8 @@ pub enum GateTransportError {
     Limits,
     #[error("Gate transport binding, mode, or generation does not match")]
     Binding,
+    #[error("Gate runtime recovery scope drifted across a network await")]
+    RuntimeScope,
     #[error("Gate transport operation timed out")]
     Timeout,
     #[error("Gate HTTP client could not be created")]
@@ -951,7 +1050,7 @@ mod tests {
     use std::io;
 
     use rust_decimal::Decimal;
-    use tokio::net::TcpListener;
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
     use tokio_tungstenite::{accept_async, client_async};
     use venue_domain::domain::{
         Amount, CommandId, Instrument, MarketKind, OrderCommand, OrderOwner, OrderPurpose,
@@ -963,6 +1062,14 @@ mod tests {
 
     const ACCOUNT: &str = "00000000-0000-4000-8000-000000000001";
     type TestError = Box<dyn std::error::Error + Send + Sync>;
+
+    struct StaticRuntimeScope([u8; 32]);
+
+    impl crate::GateRuntimeRecoveryRevalidator for StaticRuntimeScope {
+        fn current_scope_sha256(&self) -> Option<[u8; 32]> {
+            Some(self.0)
+        }
+    }
 
     fn facts() -> Result<
         (
@@ -1053,6 +1160,41 @@ mod tests {
                 let _ = stream.try_write(&response)?;
             }
             Ok(request)
+        });
+        Ok((format!("http://{address}"), task))
+    }
+
+    async fn recovery_http_mock(
+        bodies: [String; 4],
+    ) -> Result<(String, tokio::task::JoinHandle<io::Result<Vec<Vec<u8>>>>), io::Error> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for body in bodies {
+                let (mut stream, _) = listener.accept().await?;
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    stream.readable().await?;
+                    match stream.try_read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(read) => {
+                            request.extend_from_slice(&buffer[..read]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n")
+                                && request_body_complete(&request)
+                            {
+                                break;
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                stream.write_all(&response(&body)).await?;
+                requests.push(request);
+            }
+            Ok(requests)
         });
         Ok((format!("http://{address}"), task))
     }
@@ -1297,6 +1439,156 @@ mod tests {
             Err(GateTransportError::EndOfStream | GateTransportError::Disconnected)
         ));
         assert!(!replacement.is_current());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_authenticated_collection_reads_all_faces_before_committing_one_bundle()
+    -> Result<(), TestError> {
+        let (_, credentials, rules, _) = facts()?;
+        // The authenticated-session registry fences by account. Keep this end-to-end test on a
+        // distinct account so concurrently running socket tests cannot deliberately supersede it.
+        let binding = GateGatewayBinding::new(GatewayBinding::new(
+            VenueId::Gate,
+            GatewayMode::Live,
+            "00000000-0000-4000-8000-000000000099",
+            rules.instrument.symbol.clone(),
+        )?)?;
+        let (http_endpoint, http_server) = recovery_http_mock([
+            r#"{"position_mode":"dual","total":"10","available":"9"}"#.to_owned(),
+            r#"[{"user":42,"contract":"DOGE_USDT","mode":"dual_long","size":"0","entry_price":"0","mark_price":"0"},{"user":42,"contract":"DOGE_USDT","mode":"dual_short","size":"2","entry_price":"0.1","mark_price":"0.11"}]"#.to_owned(),
+            include_str!("../tests/fixtures/regular_orders.json").to_owned(),
+            include_str!("../tests/fixtures/fills.json").to_owned(),
+        ])
+        .await?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let websocket_server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut ws = accept_async(stream).await?;
+            let mut subscriptions = Vec::new();
+            for _ in 0..4 {
+                let message = ws.next().await.ok_or("closed")??;
+                let Message::Text(text) = message else {
+                    return Err::<(), TestError>("expected subscription".into());
+                };
+                let value: Value = serde_json::from_str(&text)?;
+                subscriptions.push(
+                    value
+                        .get("channel")
+                        .and_then(Value::as_str)
+                        .ok_or("channel")?
+                        .to_owned(),
+                );
+            }
+            for channel in subscriptions {
+                ws.send(Message::Text(
+                    json!({"channel":channel,"event":"subscribe","result":{"status":"success"}})
+                        .to_string()
+                        .into(),
+                ))
+                .await?;
+            }
+            for _ in 0..8 {
+                let message = ws.next().await.ok_or("missing recovery ping")??;
+                let Message::Ping(nonce) = message else {
+                    return Err::<(), TestError>("recovery liveness must use binary ping".into());
+                };
+                ws.send(Message::Pong(nonce)).await?;
+            }
+            Ok::<(), TestError>(())
+        });
+        let limits = GateTransportLimits::new(Duration::from_secs(2), 16 * 1024)?;
+        let stream = TcpStream::connect(address).await?;
+        let (client, _) = client_async(format!("ws://{address}"), stream).await?;
+        let mut private = authenticate_private_stream(
+            client,
+            format!("ws://{address}"),
+            &binding,
+            &credentials,
+            &rules,
+            "42",
+            7,
+            limits,
+            Some(http_endpoint.clone()),
+        )
+        .await?;
+        let runtime_scope =
+            crate::GateRuntimeRecoveryScope::verified(crate::GateRuntimeRecoveryScopeInput {
+                mode: GatewayMode::Live,
+                trading_account_id: binding.gateway_binding().trading_account_id.clone(),
+                config_digest: "gate_runtime_test".to_owned(),
+                config_epoch: 3,
+                connection_generation: 71,
+                recovered_private_generation: 0,
+                position_mode: crate::GateRuntimePositionMode::Hedge,
+                order_profile: crate::GateRuntimeOrderProfile::stage7_regular_only(),
+                recovery_session_sha256: [7; 32],
+                authority_roots: crate::GateRecoveryAuthorityRoots::verified(
+                    [1; 32], [2; 32], [3; 32],
+                )?,
+                registrations: vec![crate::GateRuntimeRecoveryRegistration::verified(
+                    rules.instrument.symbol.clone(),
+                    "grid",
+                    "grid_doge",
+                    "gate_runtime_test",
+                    3,
+                )?],
+                owner_routes: Vec::new(),
+                structured_unknowns: Vec::new(),
+            })?;
+        let revalidator = StaticRuntimeScope(*runtime_scope.commitment_sha256());
+        let session = private.begin_runtime_recovery_session(
+            runtime_scope,
+            [GateRecoverySymbolScope::verified(
+                binding.clone(),
+                rules.clone(),
+                crate::GateFillsCursor::default(),
+            )?],
+            unix_ms()?.saturating_add(2_000),
+            64 * 1024,
+            4,
+        )?;
+        let transport = GateHttpTransport::with_endpoint(&binding, 7, http_endpoint, limits)?;
+        let bundle = crate::GateFreshRecoveryCollector::collect_runtime_authenticated(
+            session,
+            &transport,
+            &mut private,
+            &credentials,
+            &revalidator,
+        )
+        .await?;
+        let candidate = bundle.candidate();
+        assert_eq!(candidate.scope().connection_generation(), 71);
+        assert_eq!(candidate.symbol_readbacks().len(), 1);
+        assert_eq!(candidate.unknown_open_orders().len(), 2);
+        assert!(matches!(
+            candidate
+                .surface(crate::GateRecoverySurface::ConditionalOrders)
+                .ok_or("conditional coverage")?
+                .coverage(),
+            crate::GateRecoveryCoverage::Unsupported { .. }
+        ));
+        let requests = http_server.await??;
+        assert_eq!(requests.len(), 4);
+        for expected in [
+            "GET /futures/usdt/accounts HTTP/1.1",
+            "GET /futures/usdt/dual_comp/positions/DOGE_USDT?holding=false HTTP/1.1",
+            "GET /futures/usdt/orders?contract=DOGE_USDT&limit=100&status=open HTTP/1.1",
+            "GET /futures/usdt/my_trades?contract=DOGE_USDT&limit=100 HTTP/1.1",
+        ] {
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| String::from_utf8_lossy(request).starts_with(expected)),
+                "missing {expected}; requests={:?}",
+                requests
+                    .iter()
+                    .map(|request| String::from_utf8_lossy(request).into_owned())
+                    .collect::<Vec<_>>()
+            );
+        }
+        websocket_server.await??;
         Ok(())
     }
 }

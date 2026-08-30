@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{ExchangeId, NativeOrderFamily, OrderOwner, Symbol};
+use venue_storage::ActorAppliedReceipt;
 
 const MAX_RUNTIME_ID_LEN: usize = 36;
 const MAX_CONFIG_DIGEST_LEN: usize = 128;
@@ -187,16 +188,33 @@ impl StrategyTurnToken {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppliedStrategyTurnReceipt {
     token: StrategyTurnToken,
+    actor_applied: Option<ActorAppliedReceipt>,
 }
 
 impl AppliedStrategyTurnReceipt {
-    pub(crate) fn persisted(token: StrategyTurnToken) -> Self {
-        Self { token }
+    pub(crate) fn persisted(token: StrategyTurnToken, actor_applied: ActorAppliedReceipt) -> Self {
+        Self {
+            token,
+            actor_applied: Some(actor_applied),
+        }
     }
 
     #[must_use]
     pub(crate) const fn token(&self) -> &StrategyTurnToken {
         &self.token
+    }
+
+    #[must_use]
+    pub(crate) const fn actor_applied(&self) -> Option<&ActorAppliedReceipt> {
+        self.actor_applied.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_persisted(token: StrategyTurnToken) -> Self {
+        Self {
+            token,
+            actor_applied: None,
+        }
     }
 }
 

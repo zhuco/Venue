@@ -36,3 +36,30 @@ jobs:
       - name: Verify Rust workspace quality
         shell: pwsh
         run: ./scripts/verify_workspace_quality.ps1
+
+  postgres-integration:
+    name: PostgreSQL integration gate
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: venue_ci
+          POSTGRES_USER: venue_ci
+          POSTGRES_PASSWORD: venue_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U venue_ci -d venue_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      VENUE_CONTROL_POSTGRES_REQUIRED: "1"
+      VENUE_CONTROL_TEST_DATABASE_URL: postgresql://venue_ci:venue_ci@127.0.0.1:5432/venue_ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - name: Run mandatory PostgreSQL integration tests
+        shell: pwsh
+        run: ./scripts/verify_postgres_integration.ps1

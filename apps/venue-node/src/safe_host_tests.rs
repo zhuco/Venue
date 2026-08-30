@@ -21,7 +21,9 @@ use venue_domain::domain::{
     CommandId, ExecutionCommand, OrderCommand, OrderOwner, OrderPurpose, OrderSide, PositionSide,
     Price,
 };
-use venue_execution::{CommandJournal, CommandState, WriterLeaseError};
+use venue_execution::{
+    CommandJournal, CommandState, WriterLeaseAuthority, WriterLeaseError, WriterScope,
+};
 use venue_gateway_api::{
     CanaryAdmissionReceipt, CapabilityFlags, CapabilityProbeCandidate, CapabilityPromotionError,
     CapabilitySnapshot, CompleteOrderFamilyEvidence, ControlAppliedReceipt, ControlState,
@@ -660,10 +662,7 @@ fn entry_command(
 }
 
 fn journal_path(launch: &NodeLaunch) -> PathBuf {
-    launch
-        .artifacts_root()
-        .join("account")
-        .join("commands.jsonl")
+    launch.artifacts_root().join("commands.jsonl")
 }
 
 fn supervision_path(launch: &NodeLaunch) -> PathBuf {
@@ -1194,6 +1193,80 @@ fn public_promotion_is_unavailable_and_never_reaches_physical_dispatch()
         journal.receipt(&command_id).map(|receipt| &receipt.state),
         Some(CommandState::Prepared)
     ));
+    Ok(())
+}
+
+#[test]
+fn stage7_writer_lease_blocks_node_before_it_can_create_a_second_writer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let launch = launch(&directory, "LIVE")?;
+    let owner = owner(launch.binding())?;
+    let root = launch.artifacts_root();
+    std::fs::create_dir_all(&root)?;
+    let stage7_scope = WriterScope {
+        exchange: launch.binding().venue.as_str().to_owned(),
+        account: launch.binding().trading_account_id.clone(),
+        symbol: launch.binding().symbol.clone(),
+        owner_scope: format!("{}_{}", owner.key.instance_id, owner.run_id),
+    };
+    let stage7_writer = WriterLeaseAuthority::open(root.join("writer.json"), stage7_scope)?;
+    let _stage7_session = stage7_writer.register_initial(1_000, 1)?;
+
+    let result = NodeSafetyHost::open_for_test(
+        &launch,
+        owner,
+        FakeGateway::new(
+            launch.binding().clone(),
+            vec![ReadbackPlan {
+                connection_generation: 1,
+                private_generation: 2,
+                observed_ms: 900,
+                resolution: ReadbackResolution::Absent,
+                nonzero_position: false,
+                omit_family: false,
+            }],
+        ),
+        None,
+        1_001,
+    );
+
+    assert!(matches!(
+        result,
+        Err(SafeHostError::Writer(WriterLeaseError::Fenced))
+    ));
+    Ok(())
+}
+
+#[test]
+fn nonempty_legacy_node_journal_blocks_shared_wal_takeover_before_gateway_connect()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let launch = launch(&directory, "LIVE")?;
+    let owner = owner(launch.binding())?;
+    let legacy_path = launch
+        .artifacts_root()
+        .join("account")
+        .join("commands.jsonl");
+    std::fs::create_dir_all(
+        legacy_path
+            .parent()
+            .ok_or("legacy command journal path has no parent")?,
+    )?;
+    CommandJournal::open(&legacy_path)?.prepare(entry_command(launch.binding(), "legacy")?)?;
+    let connects = Arc::new(AtomicUsize::new(0));
+
+    let result = NodeSafetyHost::open_for_test(
+        &launch,
+        owner,
+        FakeGateway::new(launch.binding().clone(), vec![ReadbackPlan::initial()])
+            .with_connect_counter(Arc::clone(&connects)),
+        None,
+        1_000,
+    );
+
+    assert!(matches!(result, Err(SafeHostError::LegacyNodeJournal)));
+    assert_eq!(connects.load(Ordering::SeqCst), 0);
     Ok(())
 }
 
@@ -1914,63 +1987,4 @@ fn wrong_control_scope_and_config_generation_are_rejected_deterministically()
     Ok(())
 }
 
-#[test]
-fn completed_stop_receipt_restores_stopped_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
-    let directory = tempfile::tempdir()?;
-    let launch = launch(&directory, "LIVE")?;
-    let owner = owner(launch.binding())?;
-    let mut first = NodeSafetyHost::open_for_test(
-        &launch,
-        owner.clone(),
-        FakeGateway::new(
-            launch.binding().clone(),
-            vec![
-                ReadbackPlan::initial(),
-                ReadbackPlan::recovery(ReadbackResolution::Absent),
-            ],
-        ),
-        None,
-        1_000,
-    )?;
-    apply_control(
-        &mut first,
-        launch.binding(),
-        ControlAction::Stop,
-        "durable-stop",
-        1_000,
-    )?;
-    let completion = first.complete_control(12_000)?;
-    assert_eq!(completion.request_id, "durable-stop");
-    completion.receipt.validate()?;
-    drop(first);
-
-    let mut reopened = NodeSafetyHost::open_for_test(
-        &launch,
-        owner,
-        FakeGateway::new(
-            launch.binding().clone(),
-            vec![ReadbackPlan {
-                connection_generation: 3,
-                private_generation: 3,
-                observed_ms: 22_000,
-                resolution: ReadbackResolution::Absent,
-                nonzero_position: false,
-                omit_family: false,
-            }],
-        ),
-        None,
-        23_000,
-    )?;
-    assert!(matches!(
-        reopened.prepare_dispatch(
-            entry_command(launch.binding(), "after-durable-stop")?,
-            23_000,
-        ),
-        Err(SafeHostError::ControlLifecycle)
-    ));
-    assert!(matches!(
-        reopened.complete_control(23_000),
-        Err(SafeHostError::ControlLifecycle)
-    ));
-    Ok(())
-}
+mod durable_stop_tests;

@@ -202,11 +202,9 @@ fn build_trading() -> Tree<Pane> {
     let mut tiles = Tiles::default();
     let chart = pane(&mut tiles, PaneKind::Chart, 1);
     let book = pane(&mut tiles, PaneKind::OrderBook, 1);
-    let tape = pane(&mut tiles, PaneKind::TradeTape, 1);
     let strategies = pane(&mut tiles, PaneKind::Strategies, 1);
     let control = pane(&mut tiles, PaneKind::Control, 1);
-    let market_side = split(&mut tiles, LinearDir::Vertical, book, tape, 0.52);
-    let upper = split(&mut tiles, LinearDir::Horizontal, chart, market_side, 0.76);
+    let upper = split(&mut tiles, LinearDir::Horizontal, chart, book, 0.76);
     let lower = split(&mut tiles, LinearDir::Horizontal, strategies, control, 0.72);
     let root = split(&mut tiles, LinearDir::Vertical, upper, lower, 0.72);
     Tree::new("venueflow-trading", root, tiles)
@@ -285,6 +283,28 @@ mod tests {
                     .any(|(_, tile)| { matches!(tile, Tile::Pane(pane) if pane.kind == required) })
             );
         }
+    }
+
+    #[test]
+    fn trading_workspace_combines_book_and_trades_in_one_market_pane() {
+        let workspaces = Workspaces::default();
+        let kinds = workspaces
+            .trading
+            .tiles
+            .iter()
+            .filter_map(|(_, tile)| match tile {
+                Tile::Pane(pane) => Some(pane.kind),
+                Tile::Container(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == PaneKind::OrderBook)
+                .count(),
+            1
+        );
+        assert!(!kinds.contains(&PaneKind::TradeTape));
     }
 
     #[test]

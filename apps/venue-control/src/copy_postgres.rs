@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use sqlx::{Postgres, Row, Transaction};
+use venue_control_protocol::AccountDeliveryReceipt;
 use venue_copy::{
     CopyLedger, DeliveryReceiptStatus, DeliveryState, DeliveryTracker, LedgerApply,
     PersistedDeliveryReceipt,
@@ -35,8 +36,9 @@ impl PgControlRepository {
              FROM venue_copy_jobs j JOIN venue_copy_plans p USING (job_id) \
              JOIN venue_copy_observer_outbox o \
                ON o.event_sequence = j.source_event_sequence AND o.observer_id = j.observer_id \
-             JOIN venue_copy_leader_intents i USING (intent_id) \
-             JOIN venue_copy_leader_snapshots s USING (snapshot_id) \
+             JOIN venue_copy_leader_intents i \
+               ON i.intent_id = j.intent_id AND i.intent_id = o.intent_id \
+             JOIN venue_copy_leader_snapshots s ON s.snapshot_id = i.snapshot_id \
              WHERE j.observer_id = $1 AND j.venue = $2 AND j.mode = 'LIVE' \
                AND j.trading_account_id = $3 ORDER BY j.source_event_sequence",
         )
@@ -683,7 +685,6 @@ impl CopyRepository for PgControlRepository {
         {
             return Err(CopyRepositoryError::DeliveryConflict);
         }
-
         if let Some(existing) = sqlx::query(
             "SELECT receipt_json FROM venue_copy_delivery_receipts \
              WHERE job_id = $1 AND receipt_sequence = $2 FOR SHARE",
@@ -702,6 +703,8 @@ impl CopyRepository for PgControlRepository {
             }
             return Err(CopyRepositoryError::ReplayConflict);
         }
+        require_durable_node_receipt(&mut transaction, &job_id, &durable_job, &scoped.receipt)
+            .await?;
 
         let receipts = load_receipts(&mut transaction, &job_id).await?;
         let mut tracker =
@@ -1571,6 +1574,54 @@ fn map_account_delivery_error(error: crate::AccountDeliveryRepositoryError) -> C
         crate::AccountDeliveryRepositoryError::CorruptData => CopyRepositoryError::CorruptData,
         _ => CopyRepositoryError::Database,
     }
+}
+
+/// A Copy coordinator receipt is only a projection of a terminal account-node receipt. In
+/// particular, a PostgreSQL delivery lease or Copy consumer claim cannot fabricate Applied state.
+async fn require_durable_node_receipt(
+    transaction: &mut Transaction<'_, Postgres>,
+    job_id: &str,
+    job: &CopyJob,
+    receipt: &PersistedDeliveryReceipt,
+) -> Result<(), CopyRepositoryError> {
+    let (node_state, delivery_state) = match receipt.status {
+        DeliveryReceiptStatus::Applied => ("applied", "settled"),
+        DeliveryReceiptStatus::Unknown => ("unknown", "reconciliation_required"),
+        DeliveryReceiptStatus::Reconciled => ("reconciled", "settled"),
+        DeliveryReceiptStatus::Rejected => ("rejected", "settled"),
+    };
+    let rows = sqlx::query(
+        "SELECT r.receipt_json FROM venue_account_deliveries d \
+         JOIN venue_account_delivery_receipts r USING (delivery_id) \
+         WHERE d.source_kind = 'copy_semantic_job' AND d.source_id = $1 \
+           AND d.delivery_state = $2 AND r.receipt_state = $3 FOR SHARE",
+    )
+    .bind(job_id)
+    .bind(delivery_state)
+    .bind(node_state)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    if rows.len() != 1 {
+        return Err(CopyRepositoryError::DeliveryConflict);
+    }
+    let node: AccountDeliveryReceipt =
+        decode(rows[0].try_get("receipt_json").map_err(database_error)?)?;
+    node.validate()
+        .map_err(|_| CopyRepositoryError::CorruptData)?;
+    if node.observed_ms > receipt.persisted_at_ms
+        || node.lease.binding.venue != job.scope.venue
+        || node.lease.binding.mode != job.scope.mode
+        || node.lease.binding.trading_account_id != job.scope.trading_account_id
+        || node.lease.binding.symbol != job.manifest.binding.instrument.symbol
+        || matches!(
+            receipt.status,
+            DeliveryReceiptStatus::Applied | DeliveryReceiptStatus::Reconciled
+        ) && node.account_fact_digest == [0; 32]
+    {
+        return Err(CopyRepositoryError::DeliveryConflict);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

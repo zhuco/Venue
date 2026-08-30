@@ -1,8 +1,8 @@
+mod account_gateway;
 mod binding;
 mod config;
 mod credentials;
 mod evidence;
-#[cfg(test)]
 mod execution;
 #[cfg(test)]
 mod physical;
@@ -13,11 +13,11 @@ mod sign;
 mod transport;
 use venue_gateway_api::CapabilityFlags;
 
+pub use account_gateway::{BybitAccountGateway, BybitAccountGatewayError};
 pub use binding::BybitGatewayBinding;
 pub use config::{BybitConfig, endpoints};
 pub use credentials::BybitCredentials;
 pub use evidence::*;
-#[cfg(test)]
 pub use execution::*;
 #[cfg(test)]
 pub use physical::*;

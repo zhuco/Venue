@@ -10,9 +10,10 @@ use venue_domain::domain::{
     CommandId, ExecutionCommand, NativeOrderFamily, OrderOwner, OrderPurpose, Symbol,
 };
 use venue_execution::{
-    AccountCanonicalRootError, AccountCanonicalRootGuard, CommandJournal, CommandJournalError,
-    CommandState, DispatchGuard, WriterLeaseAuthority, WriterLeaseError, WriterScope,
-    WriterSession, acquire_account_canonical_root,
+    AccountCanonicalRootError, AccountCanonicalRootGuard, AccountOwnerRouteScope, CommandJournal,
+    CommandJournalError, CommandState, DispatchGuard, DurableOwnerRoutes, OwnerRouteFence,
+    OwnerRoutesError, WriterLeaseAuthority, WriterLeaseError, WriterScope, WriterSession,
+    acquire_account_canonical_root,
 };
 #[cfg(test)]
 use venue_gateway_api::{
@@ -743,6 +744,16 @@ enum CanonicalRootHold {
     TestOnly,
 }
 
+impl CanonicalRootHold {
+    fn canonical_root_sha256(&self) -> &str {
+        match self {
+            Self::Machine { _guard } => _guard.canonical_root_sha256(),
+            #[cfg(test)]
+            Self::TestOnly => DIGEST_FOR_TEST,
+        }
+    }
+}
+
 pub struct NodeSafetyHost<G: PhysicalGateway> {
     binding: GatewayBinding,
     artifacts_root: PathBuf,
@@ -1116,7 +1127,10 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
             path: account_directory.clone(),
             source,
         })?;
-        let mut journal = CommandJournal::open(account_directory.join(COMMANDS_FILE))?;
+        reject_legacy_node_command_journal(account_directory.join(COMMANDS_FILE))?;
+        // A Node successor must recover the exact Stage 7 command ledger. A separate Node WAL
+        // would make the shared canonical-root fence insufficient to prove a single writer.
+        let mut journal = CommandJournal::open(artifacts_root.join(COMMANDS_FILE))?;
         journal.fence_interrupted_dispatches()?;
         validate_recovered_owner_routes(&journal, &owner)?;
         let supervision = SupervisionJournal::open(
@@ -1127,7 +1141,9 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
         )?;
         let restored = supervision.projection()?;
         let scope = writer_scope(&binding, &owner);
-        let writer = WriterLeaseAuthority::open(account_directory.join(WRITER_FILE), scope)?;
+        // This is the Stage 7 lease path. Reusing it fences a still-live predecessor before the
+        // Node can create any writer session of its own.
+        let writer = WriterLeaseAuthority::open(artifacts_root.join(WRITER_FILE), scope)?;
         let predecessor = writer.active_session()?;
         let recovery_commands = recovery_keys(&journal)?;
         let lifecycle = host_lifecycle(&restored.lifecycle);
@@ -1157,6 +1173,12 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
         if journal.has_unresolved() {
             return Err(SafeHostError::UnknownUnresolved);
         }
+        validate_owner_routes(
+            artifacts_root.join(COMMANDS_FILE),
+            &binding,
+            canonical_root.canonical_root_sha256(),
+            receipt.private_generation,
+        )?;
 
         let writer_session = match predecessor {
             Some(predecessor) => writer.recover_same_scope_after_readback(
@@ -1517,7 +1539,7 @@ fn writer_scope(binding: &GatewayBinding, owner: &StrategyBinding) -> WriterScop
         exchange: binding.venue.as_str().to_owned(),
         account: binding.trading_account_id.clone(),
         symbol: binding.symbol.clone(),
-        owner_scope: owner.key.instance_id.clone(),
+        owner_scope: format!("{}_{}", owner.key.instance_id, owner.run_id),
     }
 }
 
@@ -1532,6 +1554,38 @@ fn validate_recovered_owner_routes(
     {
         return Err(SafeHostError::OwnerRoute);
     }
+    Ok(())
+}
+
+/// Earlier Node candidates used a local journal under `account/`. Its records cannot be merged
+/// into Stage 7's WAL without proving one ordered history, so a nonempty legacy journal blocks
+/// startup before network connection or writer recovery.
+fn reject_legacy_node_command_journal(path: PathBuf) -> Result<(), SafeHostError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let legacy = CommandJournal::open(path)?;
+    if legacy.commands().next().is_some() {
+        return Err(SafeHostError::LegacyNodeJournal);
+    }
+    Ok(())
+}
+
+/// Validates the durable Owner/native projection reconstructed from the same Stage 7 WAL after
+/// UNKNOWN settlement. The host retains the journal handle that will append any later state.
+fn validate_owner_routes(
+    journal_path: PathBuf,
+    binding: &GatewayBinding,
+    canonical_root_sha256: &str,
+    private_generation: u64,
+) -> Result<(), SafeHostError> {
+    let scope = AccountOwnerRouteScope::new(
+        binding.venue,
+        binding.trading_account_id.clone(),
+        canonical_root_sha256,
+    )?;
+    let fence = OwnerRouteFence::new(scope, private_generation)?;
+    let _routes = DurableOwnerRoutes::open(journal_path, fence)?;
     Ok(())
 }
 
@@ -1842,6 +1896,8 @@ pub enum SafeHostError {
     #[error(transparent)]
     Journal(#[from] CommandJournalError),
     #[error(transparent)]
+    OwnerRoutes(#[from] OwnerRoutesError),
+    #[error(transparent)]
     Supervision(#[from] SupervisionError),
     #[error("node safety host I/O failed for {path}: {source}", path = path.display())]
     Io {
@@ -1872,6 +1928,8 @@ pub enum SafeHostError {
     OwnerCommand(venue_domain::domain::CommandError),
     #[error("command identity is already present in the WAL")]
     CommandAlreadyJournaled,
+    #[error("a nonempty legacy Node command journal blocks shared-WAL takeover")]
+    LegacyNodeJournal,
     #[error("prepared dispatch does not match the durable WAL state")]
     PreparedIdentity,
     #[error("LIVE entry mutation lacks exact, fresh operator Canary evidence")]

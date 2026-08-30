@@ -7,7 +7,7 @@ feature:
 cargo build -p venue-node --no-default-features --features bybit --bin venue-node-bybit
 ```
 
-Every launch requires a canonical account UUID, canonical `BASE/QUOTE`, an absolute artifact base,
+Every launch requires a stable internal trading-account ID (not an exchange-issued UUID), canonical `BASE/QUOTE`, an absolute artifact base,
 and a mode spelled exactly `LIVE`. The final root is derived in memory as
 `<base>/<venue>/<mode>/<trading_account_id>`; callers cannot supply or override it.
 
@@ -20,36 +20,30 @@ venue-node-gate --mode LIVE --trading-account-id <uuid> --symbol DOGE/USDT \
   --artifacts-base <absolute-path> -- --config venue.gate.example.toml grid-stop
 ```
 
-Bybit, OKX, and Hyperliquid currently validate only their secret-free binding, selected adapter
-endpoints, credential environment namespace, and derived root. They then fail closed before reading
-credentials, networking, or creating artifacts. Do not enable them until the shared runtime has
-integrated and verified Owner, WAL, the unique account writer fence, signed readback, UNKNOWN
-reconciliation, Stop/Flatten, and operator-confirmed Canary evidence.
+Bybit, OKX, and Hyperliquid expose only three production subcommands after `--`: `preflight`,
+`canary-place`, and `canary-cancel`. Each requires `--confirm-live <lowercase-venue>`. The binaries
+load credentials from the root `.env`; they never print credential values.
 
-`venue_node::NodeSafetyHost` is the exchange-neutral composition boundary for that integration. It
-reuses the canonical account-root fence, writer lease, and command WAL from `venue-execution`.
-Startup now restores and validates the canonical root, durable Owner/config scope, mutation WAL,
-control-receipt chain, and predecessor writer metadata before issuing the adapter a non-cloneable
-connection permit. No adapter readback or connection is allowed before that permit.
+Bybit and OKX use `DOGE/USDT`; Hyperliquid perpetuals use `DOGE/USDC`. A fixed binary rejects a
+non-canonical quote before gateway construction.
 
-Pause, Resume, Stop, Flatten, and command-bound Canary are two-phase durable turns. The host first
-fsyncs the exact scoped request, then issues a non-cloneable Actor turn; only a receipt created after
-the Actor inbox/checkpoint transaction is durable can advance lifecycle or install Canary evidence.
-Accepted but unapplied turns are reissued after a crash, applied Pause/Stopping/Stopped state is
-replayed on restart, duplicate request identities fail closed, and Stop/Flatten completion is itself
-persisted with the newer signed full-family readback. The control journal is hash chained, repairs
-only an incomplete crash tail, and rejects any corrupt complete record before gateway connection.
+```text
+venue-node-okx --mode LIVE --trading-account-id <internal-id> --symbol DOGE/USDT \
+  --artifacts-base G:\Venue\artifacts -- preflight --confirm-live okx
+```
 
-The mutation side routes every command through one exact `StrategyBinding`, and gives an injected
-`PhysicalGateway`
-one non-cloneable dispatch permit only after WAL, capability, writer, binding, and lifecycle checks;
-risk-increasing LIVE commands additionally require fresh Canary evidence bound to
-that exact durable command identity. Startup and ambiguous
-dispatches require a newer adapter-verified signed readback; UNKNOWN
-commands are settled from their durable family/client identity and are never resubmitted. Stop and
-Flatten accept exact operator evidence and complete only from a request-newer full-family receipt;
-Stop retains symbol custody while a signed nonzero position remains. The fixed binaries are not yet
-wired to this host, so their existing fail-closed behavior is unchanged.
+All production mutations pass through `venue_execution::AccountMutationHost`: one process lock per
+account, one `commands.jsonl`, Owner embedded in each command, `Submitted` persisted before the
+adapter receives a non-cloneable permit, and ambiguous results frozen as `Unknown` without retry.
+Risk-increasing commands are post-only limit orders. The account's cumulative nominal position
+cannot exceed 10 USDT; an existing uncancelled entry or non-zero venue position fences another
+entry. OKX accepts canonical base quantity but converts it to whole/lot-aligned contracts using
+live instrument rules.
+Market, stop, and reduce-only commands remain unavailable in this MVP path.
+
+The artifact root is `G:\Venue\artifacts\<venue>\LIVE\<trading_account_id>`. Append is refused once
+`commands.jsonl` reaches 5 MiB and no file may exceed 10 MiB; Hyperliquid `nonce.json` is capped at
+4 KiB. Archive only terminal, reconciled history; never remove unresolved `Submitted/Unknown` state.
 
 Run `scripts/verify_venue_node_binaries.ps1` with a target directory outside the worktree to build
 all six exact feature compositions and scan each executable for foreign endpoint, credential, and

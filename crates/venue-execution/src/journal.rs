@@ -67,45 +67,62 @@ pub struct CommandJournal {
 
 impl CommandJournal {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, CommandJournalError> {
+        Self::open_segmented(path, &[])
+    }
+
+    pub(crate) fn open_segmented(
+        path: impl Into<PathBuf>,
+        historical_paths: &[PathBuf],
+    ) -> Result<Self, CommandJournalError> {
         let path = path.into();
         let mut receipts: BTreeMap<CommandId, CommandReceipt> = BTreeMap::new();
         let mut client_ids: BTreeMap<CommandId, CommandId> = BTreeMap::new();
         let mut next_sequence = 1;
-        let replay = read_all(&path)?;
-        for receipt in replay.receipts {
-            if receipt.sequence != next_sequence {
-                return Err(CommandJournalError::Sequence);
-            }
-            receipt
-                .command
-                .validate()
-                .map_err(CommandJournalError::Command)?;
-            if receipt.command_sha256 != command_hash(&receipt.command)? {
-                return Err(CommandJournalError::Hash);
-            }
-            let command_id = receipt.command.command_id().clone();
-            let client_id = receipt.command.native_client_id().cloned();
-            if let Some(previous) = receipts.get(&command_id) {
-                if previous.command_sha256 != receipt.command_sha256
-                    || !allowed_transition(&previous.state, &receipt.state)
-                {
-                    return Err(CommandJournalError::Transition);
+        let mut active_replay = None;
+        for replay_path in historical_paths
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(std::iter::once(path.as_path()))
+        {
+            let replay = read_all(replay_path)?;
+            active_replay = Some((replay.durable_len, replay.existed));
+            for receipt in replay.receipts {
+                if receipt.sequence != next_sequence {
+                    return Err(CommandJournalError::Sequence);
                 }
-            } else {
-                if let ExecutionCommand::Cancel(command) = &receipt.command {
-                    validate_cancel_target(&receipts, &client_ids, command)?;
+                receipt
+                    .command
+                    .validate()
+                    .map_err(CommandJournalError::Command)?;
+                if receipt.command_sha256 != command_hash(&receipt.command)? {
+                    return Err(CommandJournalError::Hash);
                 }
-                if let Some(client_id) = client_id
-                    && client_ids.insert(client_id, command_id.clone()).is_some()
-                {
-                    return Err(CommandJournalError::Duplicate);
+                let command_id = receipt.command.command_id().clone();
+                let client_id = receipt.command.native_client_id().cloned();
+                if let Some(previous) = receipts.get(&command_id) {
+                    if previous.command_sha256 != receipt.command_sha256
+                        || !allowed_transition(&previous.state, &receipt.state)
+                    {
+                        return Err(CommandJournalError::Transition);
+                    }
+                } else {
+                    if let ExecutionCommand::Cancel(command) = &receipt.command {
+                        validate_cancel_target(&receipts, &client_ids, command)?;
+                    }
+                    if let Some(client_id) = client_id
+                        && client_ids.insert(client_id, command_id.clone()).is_some()
+                    {
+                        return Err(CommandJournalError::Duplicate);
+                    }
                 }
+                receipts.insert(command_id, receipt);
+                next_sequence = next_sequence
+                    .checked_add(1)
+                    .ok_or(CommandJournalError::Sequence)?;
             }
-            receipts.insert(command_id, receipt);
-            next_sequence = next_sequence
-                .checked_add(1)
-                .ok_or(CommandJournalError::Sequence)?;
         }
+        let (active_durable_len, active_existed) =
+            active_replay.ok_or(CommandJournalError::Sequence)?;
         let mut journal = Self {
             path,
             receipts,
@@ -116,11 +133,39 @@ impl CommandJournal {
             accepted_cancel_targets: BTreeMap::new(),
             venue_order_client_ids: BTreeMap::new(),
             next_sequence,
-            durable_len: replay.durable_len,
-            needs_parent_sync: !replay.existed,
+            durable_len: active_durable_len,
+            needs_parent_sync: !active_existed,
         };
         journal.rebuild_query_indexes();
         Ok(journal)
+    }
+
+    pub(crate) fn rotate_active(&mut self, archive_path: &Path) -> Result<(), CommandJournalError> {
+        if self.has_unresolved() || archive_path.exists() {
+            return Err(CommandJournalError::Sequence);
+        }
+        fs::rename(&self.path, archive_path).map_err(|source| CommandJournalError::Io {
+            path: self.path.clone(),
+            source,
+        })?;
+        sync_parent(archive_path)?;
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|source| CommandJournalError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        file.sync_data().map_err(|source| CommandJournalError::Io {
+            path: self.path.clone(),
+            source,
+        })?;
+        sync_parent(&self.path)?;
+        self.durable_len = 0;
+        self.needs_parent_sync = false;
+        Ok(())
     }
 
     pub fn prepare(

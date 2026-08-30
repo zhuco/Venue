@@ -1,3 +1,4 @@
+mod account_host;
 mod canonical_root;
 mod journal;
 mod owner_routes;
@@ -6,6 +7,12 @@ mod writer_lease;
 use sha2::{Digest, Sha256};
 use venue_domain::domain::ExecutionCommand;
 
+pub use account_host::{
+    AccountDispatchOutcome, AccountDispatchPermit, AccountGatewayResult, AccountHostError,
+    AccountHostValidationError, AccountMutationHost, AccountPhysicalGateway,
+    AccountRecoveryOutcome, AccountRecoveryReport, AccountRecoveryRequest, AccountRecoveryState,
+    COMMAND_JOURNAL_HARD_LIMIT_BYTES, COMMAND_JOURNAL_ROTATE_BYTES,
+};
 pub use canonical_root::{
     AccountCanonicalRootError, AccountCanonicalRootGuard, acquire_account_canonical_root,
 };

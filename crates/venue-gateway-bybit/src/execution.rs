@@ -98,6 +98,7 @@ impl BybitPreparedRequest {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn exact_lookup(&self) -> Result<BybitOrderLookup, BybitExecutionError> {
         match (&self.expected_order_id, &self.expected_client_order_id) {
             (Some(order_id), None) => BybitOrderLookup::by_order_id(order_id.clone())
@@ -110,6 +111,7 @@ impl BybitPreparedRequest {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn body_sha256(&self) -> String {
         Sha256::digest(&self.body)
             .iter()
@@ -391,6 +393,7 @@ impl BybitClosedOrderReadback {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn validate_pending_scope(
         &self,
         binding: &BybitGatewayBinding,

@@ -1,4 +1,5 @@
-#[cfg(test)]
+mod account_gateway;
+#[allow(dead_code)]
 mod action;
 mod binding;
 mod capability;
@@ -17,6 +18,8 @@ mod transport;
 mod capability_tests;
 
 use venue_gateway_api::CapabilityFlags;
+
+pub use account_gateway::{HyperliquidAccountGateway, HyperliquidAccountGatewayError};
 
 #[cfg(test)]
 pub use action::{
@@ -185,6 +188,16 @@ mod tests {
             Err(HyperliquidGatewayBindingError::Gateway(
                 GatewayApiError::TradingAccountId
             ))
+        );
+        let wrong_quote = GatewayBinding::new(
+            VenueId::Hyperliquid,
+            GatewayMode::Live,
+            "00000000-0000-4000-8000-000000000001",
+            "DOGE/USDT".parse()?,
+        )?;
+        assert_eq!(
+            HyperliquidGatewayBinding::new(wrong_quote),
+            Err(HyperliquidGatewayBindingError::Quote)
         );
         Ok(())
     }

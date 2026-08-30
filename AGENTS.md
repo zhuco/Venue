@@ -19,10 +19,11 @@
 
 - 只实现当前获准任务，不创建未被当前需求使用的未来模块、公共 SDK、插件系统或多租户控制面。
 - 完成修改必须执行 `cargo fmt --all --check`、`cargo check --workspace --all-targets`、`cargo test --workspace`、`scripts/verify_repository_hygiene.ps1` 和任务专项验证；失败时不得宣称完成或删除被替代实现。
-- 实盘 mutation 一次只允许一个精确 writer；先验证，再按交易所逐家 Canary/接管，禁止两个版本同时写同一 binding。
-- 策略只输出语义意图；所有 mutation 必须经过 execution、risk、owner、WAL/journal 和 reconciliation。
-- 数据、私有事实、订单身份、规则或恢复状态无法证明时失败关闭，只允许降险和对账。
-- 不得把 `artifacts` 中的 checkpoint、writer、WAL、JSONL、admission、capability 或 handoff 收据当普通日志删除。
+- 实盘 mutation 每个 `(exchange, trading_account_id)` 只允许一个账户级 writer；单机优先使用一个进程锁和一个串行 Execution Lane，多机部署实际出现前不得增加租约选举、分布式 fencing 或可执行文件 handoff 链。先验证，再按交易所逐家 Canary，禁止两个版本同时写同一账户。
+- 策略只输出语义意图；所有 mutation 必须依次经过 risk、同一命令 WAL 和账户级 writer。Owner 只是 WAL 中的 `strategy_id/user_id` 归属字段，不单独建立 authority、journal、root 或 receipt 体系。
+- 初期 Bybit、OKX、Hyperliquid 的 DOGE 账户累计名义仓位硬上限为 10U；已有未撤入场命令或交易所签名读到非零持仓时禁止继续增险。OKX 数量必须以实时 `ctVal × ctMult × contracts` 换算并遵守 `lotSz/minSz`，不得把基础币数量直接当张数。
+- WAL 状态保持最小集合 `Prepared / Submitted / Accepted / Rejected / Unknown`；请求结果不确定时持久化 `Unknown`、冻结该账户新增风险并以签名订单/成交查询收敛，禁止自动重投。撤单和 reduce-only 降险仍可继续。
+- 本地运行工件根固定为 `G:\Venue\artifacts`。追加文件在 5 MiB 轮转，任何单文件不得超过 10 MiB；原始私流默认不落盘，诊断时最多两个 5 MiB 滚动段；整个根默认预算 256 MiB。必须保留未决 WAL、当前 checkpoint、成交游标及 Unknown 关联事实；已对账覆盖的历史段可压缩或删除，原始 wire payload 不得作为永久恢复前提。
 
 ## 代码与配置
 
@@ -33,7 +34,7 @@
 - 配置必须恰好选择 Binance、Gate.io、Bitget、Bybit、OKX、Hyperliquid 之一，网关运行模式只允许精确 `LIVE`；不得新增测试网、demo、Shadow 或隐式布尔模式。离线 fixture、mock 和集成测试是验证手段，不是运行模式。凭证只来自进程环境或根 `.env`，不得写进 TOML、日志、错误或工件。
 - 禁止复制规范类型、指标算法、归一化、订单事实或 journal；禁止用 `unsafe`、`unwrap`、`expect`、`panic!` 处理运行时外部输入。
 - 注释只解释边界、不变量、失败语义和非显然原因，不复述代码。
-- Git 只跟踪源码、配置、长期文档、脚本与小型协议 fixture；禁止跟踪 `bak/`、构建/发布目录、工具链、凭证、运行日志、数据库和 `artifacts/`。受保护工件只保留在本地或部署存储，不以清理仓库为由删除。
+- Git 只跟踪源码、配置、长期文档、脚本与小型协议 fixture；禁止跟踪 `bak/`、构建/发布目录、工具链、凭证、运行日志、数据库和 `artifacts/`。清理 `artifacts` 必须按上述活跃恢复集与历史归档边界执行，禁止删除未决 WAL、Unknown 关联事实或当前 checkpoint。
 
 ## 依赖治理
 

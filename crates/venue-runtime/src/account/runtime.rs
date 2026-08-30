@@ -1,33 +1,36 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::AccountRuntimeError;
+
 use crate::{
     account::recovery_session::PhysicalRecoverySessionIssuer,
     domain::{AccountOrderCapabilityEvidence, AppliedStrategyTurnReceipt, StrategyTurnToken},
     execution::{
         AccountDispatchDecision, AccountExecutionIntent, AccountExecutionLane,
-        AccountExecutionRequest, AccountLaneError, AccountLaneFollowUp, ExposureEffect,
+        AccountExecutionRequest, AccountLaneFollowUp, ExposureEffect,
         PersistedMutationOutcomeReceipt, PersistedWalPreparedReceipt, PersistedWriterLeaseReceipt,
         PreWalCandidate, UnknownReadbackProof, WalNotPreparedReceipt,
     },
     runtime::{
         account::{
-            AccountFault, AccountHealth, AccountKey, AccountPositionMode, AccountReconcilerError,
+            AccountFault, AccountHealth, AccountKey, AccountPositionMode,
             AccountReconciliationReport, AccountRecoverySnapshot, DesiredOrderSets, FlattenPlan,
-            InstanceLifecycle, MarketHub, MarketHubError, PersistedOrderRouteAppendReceipt,
+            InstanceLifecycle, MarketHub, PersistedOrderRouteAppendReceipt,
             PhysicalRecoveryAuthorityRoots, PhysicalRecoveryDurableRoots,
             PhysicalRecoveryReadbackManifest, PhysicalRecoverySession, PrivateRouteReport,
-            PrivateRouter, PrivateRouterError, ReconcileScope, RecoveredShutdownMode,
-            RegistryError, SignedOpenOrders, SignedStopProof, StopPlan, StrategyBinding,
-            StrategyInstanceKey, StrategyRegistry, reconcile_open_orders,
+            PrivateRouter, ReconcileScope, RecoveredShutdownMode, RegistryError, SignedOpenOrders,
+            SignedStopProof, StopPlan, StrategyBinding, StrategyInstanceKey, StrategyRegistry,
+            reconcile_open_orders,
         },
         strategy::{
-            AccountMarketEvent, PersistedPrivateFact, StrategyActorHost, StrategyControl,
-            StrategyHostError, StrategyInput, StrategyTurn,
+            AccountMarketEvent, ActorAppliedTurnStore, AppliedPrivateDelivery,
+            PersistedPrivateFact, StrategyActorHost, StrategyControl, StrategyInput, StrategyTurn,
         },
     },
 };
 
 use venue_gateway_api::GatewayMode;
+use venue_storage::DurableWalHead;
 
 #[path = "physical_recovery_runtime.rs"]
 mod physical_recovery_runtime;
@@ -53,6 +56,9 @@ pub struct AccountRuntime {
     turn_sequences: BTreeMap<StrategyInstanceKey, u64>,
     active_turns: BTreeMap<StrategyInstanceKey, ActiveStrategyTurn>,
     last_applied_turns: BTreeMap<StrategyInstanceKey, StrategyTurnToken>,
+    last_applied_durable: BTreeMap<StrategyInstanceKey, venue_storage::ActorAppliedReceipt>,
+    actor_applied_stores: BTreeMap<StrategyInstanceKey, ActorAppliedTurnStore>,
+    actor_applied_wal_head: Option<DurableWalHead>,
     strategy_state_revision: u64,
     market_actor_revision: u64,
     private_route_revision: u64,
@@ -78,6 +84,8 @@ pub struct AccountRuntime {
     physical_recovery_test_fixture_enabled: bool,
     #[cfg(test)]
     physical_profile_version_override: Option<u64>,
+    #[cfg(test)]
+    actor_applied_test_directories: Vec<tempfile::TempDir>,
 }
 #[derive(Clone, Debug)]
 struct ActiveStrategyTurn {
@@ -144,6 +152,9 @@ impl AccountRuntime {
             turn_sequences: BTreeMap::new(),
             active_turns: BTreeMap::new(),
             last_applied_turns: BTreeMap::new(),
+            last_applied_durable: BTreeMap::new(),
+            actor_applied_stores: BTreeMap::new(),
+            actor_applied_wal_head: None,
             strategy_state_revision: 0,
             market_actor_revision: 0,
             private_route_revision: 0,
@@ -169,6 +180,8 @@ impl AccountRuntime {
             physical_recovery_test_fixture_enabled: false,
             #[cfg(test)]
             physical_profile_version_override: None,
+            #[cfg(test)]
+            actor_applied_test_directories: Vec::new(),
             capability_evidence,
             account,
             health: AccountHealth::Starting,
@@ -309,6 +322,82 @@ impl AccountRuntime {
         Ok(())
     }
 
+    fn actor_private_generation(&self) -> u64 {
+        if self.last_reconciliation_generation > 0 {
+            self.last_reconciliation_generation
+        } else {
+            self.admitted_physical_recovery
+                .as_ref()
+                .map_or(self.physical_private_generation_floor, |manifest| {
+                    manifest.private_generation()
+                })
+        }
+    }
+
+    fn turn_private_generation(&self, input: &StrategyInput) -> u64 {
+        match input {
+            // A persisted private fact is only routed after its generation was fenced by the
+            // account router. The applied checkpoint remains bound to the current runtime
+            // authority generation, so a later signed reconciliation cannot be rolled back by
+            // an older raw-evidence generation.
+            StrategyInput::Private(fact) => self
+                .actor_private_generation()
+                .max(fact.evidence().generation()),
+            StrategyInput::Reconciliation(notice) => notice.private_generation,
+            StrategyInput::Control(_) | StrategyInput::Market(_) => self.actor_private_generation(),
+        }
+    }
+
+    /// Installs the recovered Actor-applied journal/checkpoint pair for one exact binding. The
+    /// store itself owns the durable-head verification; no caller-supplied receipt is accepted.
+    pub(crate) fn install_actor_applied_store(
+        &mut self,
+        store: ActorAppliedTurnStore,
+    ) -> Result<(), AccountRuntimeError> {
+        let key = store.binding().key.clone();
+        if self
+            .registry
+            .registration(&key)
+            .is_none_or(|registration| registration.binding != *store.binding())
+            || self.active_turns.contains_key(&key)
+            || self.last_applied_turns.contains_key(&key)
+            || self.actor_applied_stores.contains_key(&key)
+        {
+            return Err(AccountRuntimeError::ActorAppliedStore);
+        }
+        if self.durable_recovery_complete
+            && let Some(recovered) = store.recover()?
+        {
+            let receipt = recovered.receipt();
+            let registration = self
+                .registry
+                .registration(&key)
+                .ok_or(AccountRuntimeError::ActorMissing)?;
+            if Some(receipt.wal()) != self.actor_applied_wal_head
+                || receipt.generations().config_epoch() != registration.config_epoch
+                || receipt.generations().connection_generation() > self.connection_generation
+                || store
+                    .recovered_private_deliveries()?
+                    .iter()
+                    .any(|delivery| {
+                        self.pending_private_applications
+                            .get(&delivery.evidence_sequence)
+                            .is_some_and(|application| {
+                                application
+                                    .expected
+                                    .contains(&(key.clone(), delivery.fact_index))
+                            })
+                    })
+            {
+                return Err(AccountRuntimeError::ActorAppliedStore);
+            }
+            self.turn_sequences
+                .insert(key.clone(), receipt.turn_sequence());
+        }
+        self.actor_applied_stores.insert(key, store);
+        Ok(())
+    }
+
     /// Installs the complete durable ownership and unresolved-WAL recovery result. Runtime
     /// connectivity cannot become Ready until this succeeds, including for an empty new account.
     pub(crate) fn restore_durable_state(
@@ -335,6 +424,9 @@ impl AccountRuntime {
         if account != self.account {
             return Err(AccountRuntimeError::RecoveryAccountMismatch);
         }
+        let (wal_root, wal_tail, wal_count) = journal_roots.mutation_wal_head();
+        let recovered_actor_wal_head = DurableWalHead::new(wal_root, wal_tail, wal_count)
+            .map_err(|_| AccountRuntimeError::RecoveryStateMismatch)?;
         let next_state_revision = self.next_strategy_state_revision()?;
         let recovered_private_sequence = applied_private_cursor.sequence();
         let recovered_private_generation = applied_private_cursor.generation();
@@ -354,6 +446,8 @@ impl AccountRuntime {
         let mut next_shutdown_modes = BTreeMap::new();
         let mut next_pending_private: BTreeMap<u64, PendingPrivateApplication> = BTreeMap::new();
         let mut next_completed_private = BTreeSet::new();
+        let mut recovered_applied_deliveries = BTreeSet::new();
+        let mut next_turn_sequences = self.turn_sequences.clone();
         let mut recovered_strategy_keys = BTreeSet::new();
         for state in strategy_states {
             let (binding, config_epoch, lifecycle, shutdown) = state.into_parts();
@@ -443,6 +537,15 @@ impl AccountRuntime {
             if routed != recovered || !applied.is_subset(&routed.keys().cloned().collect()) {
                 return Err(AccountRuntimeError::RecoveryStateMismatch);
             }
+            for (target, fact_index) in &applied {
+                recovered_applied_deliveries.insert((
+                    target.clone(),
+                    AppliedPrivateDelivery {
+                        evidence_sequence: sequence,
+                        fact_index: *fact_index,
+                    },
+                ));
+            }
             let mut expected = BTreeSet::new();
             for ((target, fact_index), fact) in routed {
                 if applied.contains(&(target.clone(), fact_index)) {
@@ -464,6 +567,36 @@ impl AccountRuntime {
                 .insert(sequence, PendingPrivateApplication { expected })
                 .is_some()
             {
+                return Err(AccountRuntimeError::RecoveryStateMismatch);
+            }
+        }
+        if !self.actor_applied_stores.is_empty() {
+            let mut durable_applied_deliveries = BTreeSet::new();
+            for (key, store) in &self.actor_applied_stores {
+                let registration = next_registry
+                    .registration(key)
+                    .ok_or(AccountRuntimeError::RecoveryStateMismatch)?;
+                if registration.binding != *store.binding() {
+                    return Err(AccountRuntimeError::RecoveryStateMismatch);
+                }
+                let Some(recovered) = store.recover()? else {
+                    continue;
+                };
+                let receipt = recovered.receipt();
+                if receipt.wal() != recovered_actor_wal_head
+                    || receipt.generations().config_epoch() != registration.config_epoch
+                    || receipt.generations().connection_generation() > last_connection_generation
+                {
+                    return Err(AccountRuntimeError::RecoveryStateMismatch);
+                }
+                next_turn_sequences.insert(key.clone(), receipt.turn_sequence());
+                for delivery in store.recovered_private_deliveries()? {
+                    if delivery.evidence_sequence > recovered_private_sequence {
+                        durable_applied_deliveries.insert((key.clone(), delivery));
+                    }
+                }
+            }
+            if durable_applied_deliveries != recovered_applied_deliveries {
                 return Err(AccountRuntimeError::RecoveryStateMismatch);
             }
         }
@@ -503,8 +636,10 @@ impl AccountRuntime {
         self.shutdown_modes = next_shutdown_modes;
         self.pending_private_applications = next_pending_private;
         self.completed_private_sequences = next_completed_private;
+        self.turn_sequences = next_turn_sequences;
         self.connection_generation = last_connection_generation;
         self.last_applied_private_sequence = recovered_private_sequence;
+        self.actor_applied_wal_head = Some(recovered_actor_wal_head);
         self.owner_index_root = Some(journal_roots.owner_index());
         self.owner_index_tail_sequence = journal_roots.owner_index_tail_sequence();
         self.owner_index_record_count = journal_roots.owner_index_record_count();
@@ -520,6 +655,10 @@ impl AccountRuntime {
         self.strategy_state_revision = next_state_revision;
         self.durable_recovery_complete = true;
         self.advance_applied_private_cursor();
+        #[cfg(test)]
+        if self.physical_recovery_test_fixture_enabled {
+            self.install_actor_applied_test_stores()?;
+        }
         Ok(())
     }
 
@@ -1127,6 +1266,9 @@ impl AccountRuntime {
             next_registration.binding.clone(),
             next_registration.config_epoch,
         )?;
+        if let Some(store) = self.actor_applied_stores.get_mut(key) {
+            store.refresh_binding(next_registration.binding.clone())?;
+        }
         let next_state_revision = self.next_strategy_state_revision()?;
         let next_dispatch_revision = self.next_dispatch_revision()?;
         self.registry = next_registry;
@@ -1164,6 +1306,9 @@ impl AccountRuntime {
         if self.active_turns.contains_key(key) {
             return Err(AccountRuntimeError::StrategyTurnActive);
         }
+        if !self.actor_applied_stores.contains_key(key) || self.actor_applied_wal_head.is_none() {
+            return Err(AccountRuntimeError::ActorAppliedUnavailable);
+        }
         let Some(input) = self
             .actors
             .get_mut(key)
@@ -1186,7 +1331,7 @@ impl AccountRuntime {
         let token = StrategyTurnToken::issue(
             key.clone(),
             self.connection_generation,
-            self.last_reconciliation_generation,
+            self.turn_private_generation(&input),
             registration.binding.config_digest.clone(),
             registration.config_epoch,
             turn_sequence,
@@ -1203,13 +1348,50 @@ impl AccountRuntime {
         Ok(Some(StrategyTurn::issued(token, input)))
     }
 
-    /// Applies an actor turn only after its inbox/checkpoint transaction produced an opaque durable
-    /// receipt. Exact reconciliation therefore cannot make an instance Running merely by enqueue.
-    pub(crate) fn acknowledge_strategy_turn(
+    /// Persists a canonical Actor-applied commit before lifecycle or semantic intent can advance.
+    /// The runtime derives identity, generations, private cursor and recovered WAL head itself.
+    pub(crate) fn persist_and_acknowledge_strategy_turn(
+        &mut self,
+        key: &StrategyInstanceKey,
+        replay_state: Vec<u8>,
+    ) -> Result<AppliedStrategyTurnReceipt, AccountRuntimeError> {
+        self.reject_drifted_physical_authority()?;
+        let active = self
+            .active_turns
+            .get(key)
+            .cloned()
+            .ok_or(AccountRuntimeError::StrategyTurnAuthority)?;
+        let applied_private_sequence =
+            self.prospective_applied_private_sequence(key, &active.input)?;
+        let wal = self
+            .actor_applied_wal_head
+            .ok_or(AccountRuntimeError::ActorAppliedUnavailable)?;
+        let durable = self
+            .actor_applied_stores
+            .get_mut(key)
+            .ok_or(AccountRuntimeError::ActorAppliedUnavailable)?
+            .commit(
+                &active.token,
+                wal,
+                applied_private_sequence,
+                match &active.input {
+                    StrategyInput::Private(fact) => Some(AppliedPrivateDelivery {
+                        evidence_sequence: fact.evidence().sequence(),
+                        fact_index: fact.fact_index(),
+                    }),
+                    _ => None,
+                },
+                replay_state,
+            )?;
+        let receipt = AppliedStrategyTurnReceipt::persisted(active.token, durable);
+        self.acknowledge_durable_strategy_turn(receipt.clone())?;
+        Ok(receipt)
+    }
+
+    fn acknowledge_durable_strategy_turn(
         &mut self,
         receipt: AppliedStrategyTurnReceipt,
     ) -> Result<(), AccountRuntimeError> {
-        self.reject_drifted_physical_authority()?;
         let token = receipt.token();
         let active = self
             .active_turns
@@ -1221,12 +1403,26 @@ impl AccountRuntime {
             .ok_or(AccountRuntimeError::ActorMissing)?;
         if active.token != *token
             || token.connection_generation() != self.connection_generation
-            || token.private_generation() != self.last_reconciliation_generation
+            || token.private_generation() != self.turn_private_generation(&active.input)
             || token.config_digest() != registration.binding.config_digest
             || token.config_epoch() != registration.config_epoch
         {
             return Err(AccountRuntimeError::StrategyTurnAuthority);
         }
+        let applied_private_sequence =
+            self.prospective_applied_private_sequence(token.target(), &active.input)?;
+        self.actor_applied_stores
+            .get(token.target())
+            .ok_or(AccountRuntimeError::ActorAppliedUnavailable)?
+            .verify_current(
+                token,
+                self.actor_applied_wal_head
+                    .ok_or(AccountRuntimeError::ActorAppliedUnavailable)?,
+                applied_private_sequence,
+                receipt
+                    .actor_applied()
+                    .ok_or(AccountRuntimeError::ActorAppliedUnavailable)?,
+            )?;
         if let StrategyInput::Private(fact) = &active.input {
             let application = self
                 .pending_private_applications
@@ -1286,6 +1482,13 @@ impl AccountRuntime {
         if !self.has_pending_private_delivery(token.target()) {
             self.last_applied_turns
                 .insert(token.target().clone(), token.clone());
+            self.last_applied_durable.insert(
+                token.target().clone(),
+                receipt
+                    .actor_applied()
+                    .ok_or(AccountRuntimeError::ActorAppliedUnavailable)?
+                    .clone(),
+            );
         }
         let _revoked = self
             .execution_lane
@@ -1301,7 +1504,66 @@ impl AccountRuntime {
         self.last_applied_turns
             .get(key)
             .cloned()
-            .map(AppliedStrategyTurnReceipt::persisted)
+            .zip(self.last_applied_durable.get(key).cloned())
+            .map(|(token, durable)| AppliedStrategyTurnReceipt::persisted(token, durable))
+    }
+
+    #[cfg(test)]
+    fn install_actor_applied_test_stores(&mut self) -> Result<(), AccountRuntimeError> {
+        let bindings = self
+            .registry
+            .registrations()
+            .map(|registration| registration.binding.clone())
+            .collect::<Vec<_>>();
+        for binding in bindings {
+            if self.actor_applied_stores.contains_key(&binding.key) {
+                continue;
+            }
+            let directory =
+                tempfile::tempdir().map_err(|_| AccountRuntimeError::ActorAppliedStore)?;
+            let store = ActorAppliedTurnStore::create_new(
+                binding,
+                directory.path().join("actor-applied.jsonl"),
+                directory.path().join("actor-checkpoint.json"),
+            )?;
+            self.actor_applied_test_directories.push(directory);
+            self.install_actor_applied_store(store)?;
+        }
+        Ok(())
+    }
+
+    fn prospective_applied_private_sequence(
+        &self,
+        key: &StrategyInstanceKey,
+        input: &StrategyInput,
+    ) -> Result<u64, AccountRuntimeError> {
+        let StrategyInput::Private(fact) = input else {
+            return Ok(self.last_applied_private_sequence);
+        };
+        let sequence = fact.evidence().sequence();
+        let mut pending = self.pending_private_applications.clone();
+        let application = pending
+            .get_mut(&sequence)
+            .ok_or(AccountRuntimeError::PrivateApplicationState)?;
+        if !application
+            .expected
+            .remove(&(key.clone(), fact.fact_index()))
+        {
+            return Err(AccountRuntimeError::PrivateApplicationState);
+        }
+        let mut completed = self.completed_private_sequences.clone();
+        if application.expected.is_empty() {
+            pending.remove(&sequence);
+            completed.insert(sequence);
+        }
+        let mut cursor = self.last_applied_private_sequence;
+        while cursor
+            .checked_add(1)
+            .is_some_and(|next| completed.remove(&next))
+        {
+            cursor = cursor.saturating_add(1);
+        }
+        Ok(cursor)
     }
 
     pub fn enqueue_execution(
@@ -1459,6 +1721,7 @@ impl AccountRuntime {
         );
         self.physical_authority_roots = None;
         self.physical_durable_roots = None;
+        self.actor_applied_wal_head = None;
         self.revoke_physical_authority();
         let decision = decision?;
         match decision {
@@ -1476,6 +1739,7 @@ impl AccountRuntime {
         let follow_up = self.execution_lane.record_outcome(receipt);
         self.physical_authority_roots = None;
         self.physical_durable_roots = None;
+        self.actor_applied_wal_head = None;
         self.revoke_physical_authority();
         let follow_up = follow_up?;
         Ok(follow_up)
@@ -1682,104 +1946,6 @@ impl AccountRuntime {
         self.revoke_physical_authority();
         Ok(binding)
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum AccountRuntimeError {
-    #[error(transparent)]
-    Registry(#[from] RegistryError),
-    #[error(transparent)]
-    PrivateRouter(#[from] PrivateRouterError),
-    #[error(transparent)]
-    MarketHub(#[from] MarketHubError),
-    #[error(transparent)]
-    StrategyHost(#[from] StrategyHostError),
-    #[error(transparent)]
-    Reconciler(#[from] AccountReconcilerError),
-    #[error(transparent)]
-    ExecutionLane(#[from] AccountLaneError),
-    #[error("account is not ready on the requested private generation")]
-    AccountUnavailable,
-    #[error("strategy actor host is missing")]
-    ActorMissing,
-    #[error("signed reconciliation generation is stale or duplicated")]
-    StaleReconciliation,
-    #[error("risk-increasing execution is fenced for this account or instance")]
-    RiskFenced,
-    #[error("native order family is unsupported by this account capability evidence")]
-    UnsupportedOrderFamily,
-    #[error("execution request is not bound to a current signed private generation")]
-    StaleExecutionAuthority,
-    #[error("Stop and Flatten lifecycle modes cannot be confused or downgraded")]
-    ShutdownMode,
-    #[error("Stop or Flatten cannot complete while its actor has an active or unapplied turn")]
-    ShutdownActorStatePending,
-    #[error("Flatten requires a same-generation signed zero-position proof")]
-    FlattenNotProven,
-    #[error(
-        "Stop preserves a residual position, so the instance retains symbol custody until flat"
-    )]
-    ResidualPositionCustody,
-    #[error("durable account recovery must be installed before private connectivity becomes ready")]
-    DurableRecoveryRequired,
-    #[error(
-        "production physical recovery integration is unavailable; caller manifests cannot authorize connectivity or actor turns"
-    )]
-    PhysicalRecoveryIntegrationUnavailable,
-    #[error("a complete physical recovery readback manifest is required for the next connection")]
-    PhysicalRecoveryRequired,
-    #[error("a physical recovery manifest is already staged for the next connection")]
-    PhysicalRecoveryAlreadyInstalled,
-    #[error("physical recovery binding, generation, configuration, or authority roots drifted")]
-    PhysicalRecoveryScopeMismatch,
-    #[error("a physical recovery session is already active for this account")]
-    PhysicalRecoverySessionActive,
-    #[error("physical recovery requires a complete durable checkpoint and five-journal root set")]
-    PhysicalRecoveryDurableRootsRequired,
-    #[error("physical recovery requires at least one completely configured account symbol")]
-    PhysicalRecoveryUniverseIncomplete,
-    #[error("physical recovery session is forged, revoked, stale, or belongs to another attempt")]
-    PhysicalRecoverySessionInvalid,
-    #[error("physical recovery session lease expired")]
-    PhysicalRecoverySessionExpired,
-    #[error("physical recovery manifest requires a post-await durable refresh session epoch")]
-    PhysicalRecoveryPostAwaitRefreshRequired,
-    #[error("physical recovery durable roots or account authority drifted during collection")]
-    PhysicalRecoveryDurableRootDrift,
-    #[error("physical recovery durable-root refresh is incomplete, regressive, or cross-attempt")]
-    PhysicalRecoveryDurableRootRegression,
-    #[error("durable account recovery was already installed or startup already advanced")]
-    DurableRecoveryAlreadyInstalled,
-    #[error("durable recovery snapshot belongs to another exchange account")]
-    RecoveryAccountMismatch,
-    #[error("durable recovery does not exactly cover configured strategies and mutation epochs")]
-    RecoveryStateMismatch,
-    #[error("reconciliation or execution authority belongs to a stale configuration epoch")]
-    StaleConfiguration,
-    #[error("configuration cannot change while this instance has an in-flight or UNKNOWN mutation")]
-    ParameterChangeBusy,
-    #[error("an in-flight mutation must be classified as UNKNOWN before reconnect becomes ready")]
-    ReconnectWithInFlight,
-    #[error("durable actor inbox turns must be applied or recovered before reconnect advances")]
-    ReconnectWithUnappliedActorState,
-    #[error("connection generation counter is exhausted")]
-    ConnectionGenerationExhausted,
-    #[error("a strategy instance already has an unacknowledged actor turn")]
-    StrategyTurnActive,
-    #[error("strategy turn receipt is stale, unpersisted, or belongs to another authority epoch")]
-    StrategyTurnAuthority,
-    #[error("private route plan is stale relative to the committed durable inbox revision")]
-    StalePrivateRoutePlan,
-    #[error("order route append receipt does not extend the installed durable owner-index head")]
-    OrderRouteReceipt,
-    #[error("private actor application cursor or delivery acknowledgement is inconsistent")]
-    PrivateApplicationState,
-    #[error("strategy registry/lifecycle/config state revision counter is exhausted")]
-    StrategyStateRevisionExhausted,
-    #[error("actor authority revision counter is exhausted")]
-    ActorAuthorityRevisionExhausted,
-    #[error("execution dispatch authority revision counter is exhausted")]
-    DispatchRevisionExhausted,
 }
 
 #[cfg(test)]

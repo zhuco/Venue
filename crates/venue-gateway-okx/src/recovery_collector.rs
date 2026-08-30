@@ -1054,7 +1054,7 @@ fn unix_ms() -> Result<u64, OkxFreshRecoveryError> {
     u64::try_from(millis).map_err(|_| OkxFreshRecoveryError::Clock)
 }
 
-fn okx_timestamp(now: SystemTime) -> Result<String, OkxFreshRecoveryError> {
+pub(crate) fn okx_timestamp(now: SystemTime) -> Result<String, OkxFreshRecoveryError> {
     let duration = now
         .duration_since(UNIX_EPOCH)
         .map_err(|_| OkxFreshRecoveryError::Clock)?;

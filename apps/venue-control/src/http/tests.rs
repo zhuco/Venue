@@ -12,14 +12,17 @@ use venue_control_protocol::{
     AccountDeliveryPayload, AccountDeliveryPurpose, AccountDeliveryReceipt,
     AccountDeliveryReceiptState, AccountSummary, CONTROL_SCHEMA_VERSION, CommandReceipt,
     ConnectionState, ControlAction, ControlCommandRequest, ControlEvent, ControlSnapshot,
-    GatewayMode, HealthState, StrategyKind, StrategyLifecycle, StrategySummary, VenueId,
+    GatewayMode, HealthState, INDICATOR_EVENT_STREAM_PATH, INDICATOR_SNAPSHOT_PATH,
+    IndicatorBinding, IndicatorFeatureValues, IndicatorFrameProjection, IndicatorProvenance,
+    StrategyKind, StrategyLifecycle, StrategySummary, VenueId,
 };
 
 use super::*;
 use crate::{
     AccountDeliveryRepository, AccountDeliveryRepositoryError, AccountNodeBinding, ClaimedCommand,
     CommandEnqueueResult, CommandSettleResult, ControlRepository, DeliveryStoreResult,
-    RepositoryError, ScopedCommandReceipt, SnapshotStoreResult, StoredEvent,
+    IndicatorProjectionStore, RepositoryError, ScopedCommandReceipt, SnapshotStoreResult,
+    StoredEvent,
 };
 
 #[derive(Clone, Default)]
@@ -360,6 +363,48 @@ async fn sse_replays_cursor_and_gracefully_stops() -> Result<(), Box<dyn std::er
     tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut tail)).await??;
     task.await??;
     Ok(())
+}
+
+#[tokio::test]
+async fn indicator_snapshot_and_sse_are_read_only_bounded_cursor_projections()
+-> Result<(), Box<dyn std::error::Error>> {
+    let indicators = Arc::new(IndicatorProjectionStore::default());
+    indicators.publish(indicator_projection(100)?).await?;
+    let (address, stop, task) = start_with_indicators(
+        TestRepository::with_snapshot(Some(snapshot()?), Vec::new()),
+        Arc::clone(&indicators),
+        ControlHttpConfig {
+            event_poll_interval: Duration::from_millis(1),
+            ..ControlHttpConfig::default()
+        },
+    )
+    .await?;
+    let snapshot_response = request(
+        address,
+        format!("GET {INDICATOR_SNAPSHOT_PATH} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes(),
+    )
+    .await?;
+    assert!(snapshot_response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(response_body(&snapshot_response)?.contains("\"frames\""));
+
+    let mut stream = tokio::net::TcpStream::connect(address).await?;
+    stream
+        .write_all(
+            format!(
+                "GET {INDICATOR_EVENT_STREAM_PATH}?after=0 HTTP/1.1\r\nHost: localhost\r\nLast-Event-ID: 0\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let mut received = Vec::new();
+    while !String::from_utf8_lossy(&received).contains("event: indicator") {
+        let mut chunk = [0_u8; 1_024];
+        let count = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut chunk)).await??;
+        assert_ne!(count, 0);
+        received.extend_from_slice(&chunk[..count]);
+    }
+    assert!(String::from_utf8(received)?.contains("id: 1"));
+    stop_server(stop, task).await
 }
 
 #[tokio::test]
@@ -746,6 +791,31 @@ async fn start(
     Ok((address, stop, task))
 }
 
+async fn start_with_indicators(
+    repository: TestRepository,
+    indicators: Arc<IndicatorProjectionStore>,
+    config: ControlHttpConfig,
+) -> Result<
+    (
+        std::net::SocketAddr,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<Result<(), HttpServerError>>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (stop, shutdown) = control_shutdown_channel();
+    let task = tokio::spawn(serve_local_with_indicators(
+        listener,
+        Arc::new(ControlService::new(repository)),
+        indicators,
+        config,
+        shutdown,
+    ));
+    Ok((address, stop, task))
+}
+
 async fn stop_server(
     stop: watch::Sender<bool>,
     task: tokio::task::JoinHandle<Result<(), HttpServerError>>,
@@ -797,6 +867,49 @@ fn delivery_binding() -> Result<AccountDeliveryBinding, Box<dyn std::error::Erro
         symbol: "BTC/USDT".parse()?,
         instance_id: "grid-btc".to_owned(),
         config_epoch: 7,
+    })
+}
+
+fn indicator_projection(
+    observed_ms: u64,
+) -> Result<IndicatorFrameProjection, Box<dyn std::error::Error>> {
+    let event_time_ms = observed_ms.checked_sub(1).ok_or("indicator time")?;
+    Ok(IndicatorFrameProjection {
+        schema_version: CONTROL_SCHEMA_VERSION,
+        binding: IndicatorBinding {
+            venue: VenueId::Binance,
+            mode: GatewayMode::Live,
+            trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            symbol: "BTC/USDT".parse()?,
+        },
+        generation: 7,
+        watermark_ms: event_time_ms,
+        observed_ms,
+        maximum_age_ms: 100,
+        provenance: ["book", "trades", "bars"]
+            .into_iter()
+            .map(|source| IndicatorProvenance {
+                source: source.to_owned(),
+                generation: 7,
+                sequence: 1,
+                event_time_ms,
+                age_ms: 1,
+                feature_version: "v1".to_owned(),
+            })
+            .collect(),
+        values: IndicatorFeatureValues {
+            mid_price: Decimal::from(100),
+            fair_price: Decimal::from(100),
+            spread_bps: Decimal::ONE,
+            depth_quote: Decimal::from(1_000),
+            book_imbalance: Decimal::ZERO,
+            trade_imbalance: Decimal::ZERO,
+            short_return_bps: Decimal::ZERO,
+            trend_efficiency: Decimal::ZERO,
+            bandwidth_expansion: Decimal::ZERO,
+            expected_move_bps: Decimal::ONE,
+            toxicity: Decimal::ZERO,
+        },
     })
 }
 

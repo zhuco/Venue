@@ -18,10 +18,7 @@ use venue_control_protocol::{
 #[tokio::test]
 async fn postgres_delivery_lease_ack_unknown_reconcile_and_restart_are_fenced()
 -> Result<(), Box<dyn std::error::Error>> {
-    let Some(database_url) = integration_database_url() else {
-        println!(
-            "SKIP: VENUE_CONTROL_TEST_DATABASE_URL is not set; account delivery PostgreSQL test was not run"
-        );
+    let Some(database_url) = integration_database_url()? else {
         return Ok(());
     };
     let fixture = PgFixture::create(&database_url).await?;
@@ -222,10 +219,23 @@ fn snapshot() -> Result<ControlSnapshot, Box<dyn std::error::Error>> {
     })
 }
 
-fn integration_database_url() -> Option<String> {
-    env::var("VENUE_CONTROL_TEST_DATABASE_URL")
+fn integration_database_url() -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let database_url = env::var("VENUE_CONTROL_TEST_DATABASE_URL")
         .ok()
-        .filter(|value| !value.trim().is_empty())
+        .filter(|value| !value.trim().is_empty());
+    if database_url.is_none()
+        && env::var("VENUE_CONTROL_POSTGRES_REQUIRED").ok().as_deref() == Some("1")
+    {
+        return Err(
+            "VENUE_CONTROL_TEST_DATABASE_URL is required by the PostgreSQL integration gate".into(),
+        );
+    }
+    if database_url.is_none() {
+        println!(
+            "SKIP: VENUE_CONTROL_TEST_DATABASE_URL is not set; account delivery PostgreSQL test was not run"
+        );
+    }
+    Ok(database_url)
 }
 
 struct PgFixture {
@@ -260,6 +270,7 @@ impl PgFixture {
             })
             .connect(database_url)
             .await?;
+        println!("PostgreSQL integration database connected (connection string redacted)");
         Ok(Self {
             database_url: database_url.to_owned(),
             schema,

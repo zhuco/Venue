@@ -1,58 +1,11 @@
 //! Fresh, scope-bound Bitget recovery collection candidate.
 //!
-//! The production transport can now issue and post-await revalidate an authenticated read-only
-//! session. Installation remains unavailable until the runtime can pass its sealed complete
-//! universe and durable Owner/WAL/structured-Unknown projection without a `venue-runtime`
-//! dependency or caller-supplied digest. Test-only fixtures exercise that final six-face fold. This
-//! module grants no capability, writer, WAL, or dispatch authority.
+//! This is evidence-only: it cannot issue a mutation, acquire a writer, or open a WAL. The
+//! authenticated private session remains responsible for the five signed physical surfaces and
+//! their post-await connection checks; this module folds those readbacks into the six canonical
+//! recovery surfaces and binds the result to Runtime-owned durable facts.
 
-/// The final six-face production fold remains unavailable at the adapter/runtime boundary. Use
-/// `connect_authenticated_private_ws`, `begin_recovery_session`, and
-/// `collect_authenticated_private_turn` for the real read-only transport portion.
-#[derive(Debug, Eq, PartialEq)]
-pub struct BitgetFreshRecoveryCollector {
-    _sealed: (),
-}
-
-impl BitgetFreshRecoveryCollector {
-    pub fn begin() -> Result<Self, BitgetFreshRecoveryCollectorError> {
-        Err(BitgetFreshRecoveryCollectorError::ProductionUnavailable(
-            BitgetRecoveryProductionGap::RuntimeSealedUniverseBridge,
-        ))
-    }
-
-    #[must_use]
-    pub const fn production_gaps() -> &'static [BitgetRecoveryProductionGap] {
-        &BitgetRecoveryProductionGap::ALL
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BitgetRecoveryProductionGap {
-    /// `venue-runtime` owns the complete registry/config/root scope, but this crate intentionally
-    /// does not depend on it and no opaque cross-crate adapter handle exists yet.
-    RuntimeSealedUniverseBridge,
-    /// Visible orders still need the runtime's replayed exact Owner routes, WAL head, and
-    /// structured Unknown set; a caller-provided digest or route list is not durable evidence.
-    DurableOwnerWalUnknownProjection,
-}
-
-impl BitgetRecoveryProductionGap {
-    pub const ALL: [Self; 2] = [
-        Self::RuntimeSealedUniverseBridge,
-        Self::DurableOwnerWalUnknownProjection,
-    ];
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum BitgetFreshRecoveryCollectorError {
-    #[error("Bitget fresh physical recovery fold is unavailable at production gap {0:?}")]
-    ProductionUnavailable(BitgetRecoveryProductionGap),
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-mod fixture {
+mod physical {
 
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -1247,6 +1200,9 @@ mod fixture {
 
         use super::*;
         use crate::{
+            BitgetRuntimeRecoveryRegistration, BitgetRuntimeRecoveryRevalidator,
+            BitgetRuntimeRecoveryScope, BitgetRuntimeRecoveryScopeInput,
+            BitgetRuntimeStructuredUnknown,
             instrument::{BitgetRawInstrumentPayload, parse_instrument_rules},
             private::{
                 BitgetPrivateFace, BitgetRawPrivatePage, complete_private_turn, parse_account_face,
@@ -1496,6 +1452,71 @@ mod fixture {
         }
 
         #[test]
+        fn runtime_bundle_requires_exact_unknown_projection_and_all_six_faces()
+        -> Result<(), Box<dyn std::error::Error>> {
+            struct FixedScope([u8; 32]);
+            impl BitgetRuntimeRecoveryRevalidator for FixedScope {
+                fn current_scope_sha256(&self) -> Option<[u8; 32]> {
+                    Some(self.0)
+                }
+            }
+
+            let mode = GatewayMode::Live;
+            let btc = symbol("BTC/USDT")?;
+            let fresh_scope = scope(mode, vec![btc.clone()])?;
+            let registration = BitgetRuntimeRecoveryRegistration::verified(
+                btc.clone(),
+                "grid_1",
+                "bitget_config_1",
+                3,
+            )?;
+            let missing_unknown =
+                BitgetRuntimeRecoveryScope::verified(BitgetRuntimeRecoveryScopeInput {
+                    fresh_scope: fresh_scope.clone(),
+                    recovery_session_sha256: [9; 32],
+                    registrations: vec![registration.clone()],
+                    owner_routes: Vec::new(),
+                    structured_unknowns: Vec::new(),
+                });
+            assert!(matches!(
+                missing_unknown,
+                Err(crate::BitgetRuntimeRecoveryError::Unknown)
+            ));
+
+            let runtime_scope =
+                BitgetRuntimeRecoveryScope::verified(BitgetRuntimeRecoveryScopeInput {
+                    fresh_scope: fresh_scope.clone(),
+                    recovery_session_sha256: [9; 32],
+                    registrations: vec![registration],
+                    owner_routes: Vec::new(),
+                    structured_unknowns: vec![BitgetRuntimeStructuredUnknown::verified(
+                        CommandId::new("unknown_1".to_owned())?,
+                        CommandId::new("venue_unknown_1".to_owned())?,
+                        NativeOrderFamily::UmOrder,
+                        btc.clone(),
+                    )?],
+                })?;
+            let endpoint = fresh_scope.endpoint().clone();
+            let mut collector = BitgetFreshRecoveryCollector::begin(
+                fresh_scope,
+                &endpoint,
+                generation()?,
+                STARTED_AT_MS,
+            )?;
+            collector.push_symbol(&rules(mode, &btc)?, private(mode, &btc, json!([]))?, 250)?;
+            let revalidator = FixedScope(*runtime_scope.commitment_sha256());
+            let bundle = collector.finish_runtime(
+                runtime_scope,
+                &endpoint,
+                generation()?,
+                300,
+                &revalidator,
+            )?;
+            assert_eq!(bundle.candidate().scope().symbols().len(), 1);
+            Ok(())
+        }
+
+        #[test]
         fn reconnect_and_private_advance_finish_unknown_without_relabel()
         -> Result<(), Box<dyn std::error::Error>> {
             let btc = symbol("BTC/USDT")?;
@@ -1545,26 +1566,6 @@ mod fixture {
                 assert_eq!(unresolved.venue_order_id(), Some("native_unknown_1"));
             }
             Ok(())
-        }
-
-        #[test]
-        fn production_collector_is_unavailable_and_grants_no_capability() {
-            assert_eq!(
-                super::super::BitgetFreshRecoveryCollector::begin(),
-                Err(
-                    super::super::BitgetFreshRecoveryCollectorError::ProductionUnavailable(
-                        super::super::BitgetRecoveryProductionGap::RuntimeSealedUniverseBridge,
-                    )
-                )
-            );
-            assert_eq!(
-                super::super::BitgetFreshRecoveryCollector::production_gaps(),
-                &[
-                    super::super::BitgetRecoveryProductionGap::RuntimeSealedUniverseBridge,
-                    super::super::BitgetRecoveryProductionGap::DurableOwnerWalUnknownProjection,
-                ]
-            );
-            assert!(crate::capabilities().is_empty());
         }
 
         #[test]
@@ -1687,3 +1688,5 @@ mod fixture {
         }
     }
 }
+
+pub use physical::*;

@@ -13,7 +13,8 @@ use venue_gateway_api::{GatewayMode, VenueId};
 
 use crate::{
     GATE_STAGE7_ORDER_PROFILE_VERSION, GateCredentials, GateFreshRecoveryError, GateGatewayBinding,
-    GatePreparedPrivateRead, GatePrivateReadSource, GateRecoverySymbolScope, GateTransportLimits,
+    GatePreparedPrivateRead, GatePrivateReadSource, GateRecoverySymbolScope,
+    GateRuntimeRecoveryScope, GateTransportLimits,
 };
 
 const MAX_RECOVERY_SYMBOLS: usize = 256;
@@ -79,6 +80,7 @@ pub struct GateAuthenticatedRecoverySession {
     maximum_total_pages: u32,
     symbols: BTreeMap<Symbol, GateRecoverySymbolScope>,
     request_universe_sha256: [u8; 32],
+    runtime_scope: Option<GateRuntimeRecoveryScope>,
     collection: Mutex<RecoveryCollectionState>,
 }
 
@@ -97,6 +99,13 @@ impl std::fmt::Debug for GateAuthenticatedRecoverySession {
             .field("deadline_at_ms", &self.deadline_at_ms)
             .field("maximum_total_bytes", &self.maximum_total_bytes)
             .field("maximum_total_pages", &self.maximum_total_pages)
+            .field(
+                "runtime_scope_sha256",
+                &self
+                    .runtime_scope
+                    .as_ref()
+                    .map(GateRuntimeRecoveryScope::commitment_sha256),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -219,6 +228,10 @@ impl GateAuthenticatedRecoverySession {
         self.seal.request_generation
     }
 
+    pub(crate) const fn runtime_scope(&self) -> Option<&GateRuntimeRecoveryScope> {
+        self.runtime_scope.as_ref()
+    }
+
     pub(crate) fn reserve_get(
         &self,
         request: &GatePreparedPrivateRead,
@@ -337,6 +350,23 @@ impl GateAuthenticatedRecoverySession {
     }
 }
 
+impl Drop for GateAuthenticatedRecoverySession {
+    fn drop(&mut self) {
+        // A caller that abandons an incomplete collection must not leave a reusable authenticated
+        // epoch behind. A newer epoch has already fenced this one, so it must remain untouched.
+        if self.is_current() {
+            let committed = self
+                .collection
+                .lock()
+                .map(|collection| collection.committed)
+                .unwrap_or(false);
+            if !committed {
+                self.revoke();
+            }
+        }
+    }
+}
+
 pub(crate) struct GateAuthenticatedRecoverySessionLease {
     seal: Arc<GatePrivateSessionSeal>,
 }
@@ -397,6 +427,46 @@ impl GateAuthenticatedRecoverySessionLease {
     where
         I: IntoIterator<Item = GateRecoverySymbolScope>,
     {
+        self.begin_inner(
+            symbols,
+            deadline_at_ms,
+            maximum_total_bytes,
+            maximum_total_pages,
+            None,
+        )
+    }
+
+    pub(crate) fn begin_runtime<I>(
+        &self,
+        runtime_scope: GateRuntimeRecoveryScope,
+        symbols: I,
+        deadline_at_ms: u64,
+        maximum_total_bytes: usize,
+        maximum_total_pages: u32,
+    ) -> Result<GateAuthenticatedRecoverySession, GateFreshRecoveryError>
+    where
+        I: IntoIterator<Item = GateRecoverySymbolScope>,
+    {
+        self.begin_inner(
+            symbols,
+            deadline_at_ms,
+            maximum_total_bytes,
+            maximum_total_pages,
+            Some(runtime_scope),
+        )
+    }
+
+    fn begin_inner<I>(
+        &self,
+        symbols: I,
+        deadline_at_ms: u64,
+        maximum_total_bytes: usize,
+        maximum_total_pages: u32,
+        runtime_scope: Option<GateRuntimeRecoveryScope>,
+    ) -> Result<GateAuthenticatedRecoverySession, GateFreshRecoveryError>
+    where
+        I: IntoIterator<Item = GateRecoverySymbolScope>,
+    {
         let mut scopes = BTreeMap::new();
         for scope in symbols {
             let binding = scope.binding().gateway_binding();
@@ -422,9 +492,18 @@ impl GateAuthenticatedRecoverySessionLease {
         {
             return Err(GateFreshRecoveryError::Scope);
         }
+        if let Some(runtime_scope) = &runtime_scope {
+            runtime_scope.validate_authenticated_universe(
+                self.seal.mode,
+                &self.seal.trading_account_id,
+                scopes.keys(),
+            )?;
+        }
         let collection_epoch = next_epoch(&self.seal.collection_epoch)?;
         let attempt_id = next_serial(&NEXT_RECOVERY_ATTEMPT)?;
-        let private_generation = attempt_id;
+        let private_generation = runtime_scope
+            .as_ref()
+            .map_or(attempt_id, GateRuntimeRecoveryScope::private_generation);
         let request_universe_sha256 = universe_commitment(
             &self.seal,
             collection_epoch,
@@ -435,6 +514,7 @@ impl GateAuthenticatedRecoverySessionLease {
             maximum_total_bytes,
             maximum_total_pages,
             &scopes,
+            runtime_scope.as_ref(),
         );
         let collection_symbols = scopes
             .iter()
@@ -463,6 +543,7 @@ impl GateAuthenticatedRecoverySessionLease {
             maximum_total_pages,
             symbols: scopes,
             request_universe_sha256,
+            runtime_scope,
             collection: Mutex::new(RecoveryCollectionState {
                 symbols: collection_symbols,
                 in_flight: None,
@@ -495,6 +576,7 @@ fn universe_commitment(
     maximum_total_bytes: usize,
     maximum_total_pages: u32,
     scopes: &BTreeMap<Symbol, GateRecoverySymbolScope>,
+    runtime_scope: Option<&GateRuntimeRecoveryScope>,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"venue-gate-authenticated-recovery-universe-v1");
@@ -512,6 +594,13 @@ fn universe_commitment(
     digest.update((maximum_total_bytes as u64).to_be_bytes());
     digest.update(maximum_total_pages.to_be_bytes());
     digest.update(seal.credential_identity_sha256);
+    match runtime_scope {
+        Some(runtime_scope) => {
+            digest.update([1]);
+            digest.update(runtime_scope.commitment_sha256());
+        }
+        None => digest.update([0]),
+    }
     for source in [
         GatePrivateReadSource::Account,
         GatePrivateReadSource::DualPositions,

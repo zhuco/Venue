@@ -1,5 +1,9 @@
 use std::collections::{BTreeMap, VecDeque};
 
+mod actor_applied;
+
+pub(crate) use actor_applied::{ActorAppliedTurnStore, AppliedPrivateDelivery};
+
 use crate::{
     domain::{
         DomainEvent, EventSource, FactRecord, MarketEvent, NativeOrderFamily, StrategyBinding,

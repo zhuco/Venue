@@ -180,6 +180,8 @@ impl CopyWorker {
         &self,
         receipt: &ScopedCopyDeliveryReceipt,
     ) -> Result<CopyApplyResult, CopyWorkerError> {
+        // The repository accepts this only after it finds the matching durable account-node
+        // terminal receipt; this Copy consumer claim is never an execution authorization.
         self.repository
             .record_copy_receipt(receipt)
             .await

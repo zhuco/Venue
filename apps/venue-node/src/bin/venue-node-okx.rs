@@ -1,4 +1,4 @@
-use std::process::ExitCode;
+use std::{process::ExitCode, time::Duration};
 
 #[cfg(test)]
 use sha2::{Digest, Sha256};
@@ -7,13 +7,16 @@ use venue_domain::domain::{NativeOrderFamily, PositionSide};
 #[cfg(test)]
 use venue_gateway_api::GatewayBinding;
 use venue_gateway_api::VenueId;
-use venue_gateway_okx::{OkxConfig, capabilities};
+#[cfg(test)]
+use venue_gateway_okx::capabilities;
+use venue_gateway_okx::{OkxAccountGateway, OkxConfig, OkxTradeMode};
 #[cfg(test)]
 use venue_gateway_okx::{
     OkxPositionMode, OkxPrivateReadbackCandidate, OkxPrivateSurface, OkxRawPrivatePage,
 };
 use venue_node::{
-    AdapterIsolation, NodeError, NodeLaunch, reject_unintegrated_runtime, report_result,
+    AdapterIsolation, NodeError, NodeLaunch, error_chain, load_root_dotenv, report_result,
+    run_live_mvp,
 };
 #[cfg(test)]
 use venue_runtime::account::{
@@ -29,7 +32,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), NodeError> {
     let launch = NodeLaunch::from_environment(VenueId::Okx)?;
-    launch.require_no_runtime_arguments()?;
+    let command = launch.live_mvp_command()?;
     let adapter = OkxConfig::for_binding(launch.binding().clone())
         .map_err(|_| NodeError::AdapterIsolation(VenueId::Okx))?;
     AdapterIsolation {
@@ -45,8 +48,18 @@ fn run() -> Result<(), NodeError> {
         account_binding: "linear_swap",
     }
     .validate(launch.binding())?;
-    let _isolated_artifacts_root = launch.artifacts_root();
-    reject_unintegrated_runtime(VenueId::Okx, launch.binding().mode, capabilities())
+    load_root_dotenv()?;
+    let gateway = OkxAccountGateway::connect_from_environment(
+        launch.binding().clone(),
+        OkxTradeMode::Cross,
+        Duration::from_secs(10),
+        2 * 1024 * 1024,
+    )
+    .map_err(|error| NodeError::LiveGateway {
+        venue: VenueId::Okx,
+        message: error_chain(&error),
+    })?;
+    run_live_mvp(&launch, command, gateway)
 }
 
 #[cfg(test)]

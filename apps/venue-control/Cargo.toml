@@ -15,6 +15,7 @@ tokio.workspace = true
 venue-control-protocol = { path = "../../crates/venue-control-protocol" }
 venue-copy = { path = "../../crates/venue-copy" }
 venue-domain = { path = "../../crates/venue-domain" }
+venue-indicators = { path = "../../crates/venue-indicators" }
 
 [dev-dependencies]
 tokio.workspace = true

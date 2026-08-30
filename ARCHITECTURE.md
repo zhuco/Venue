@@ -209,16 +209,16 @@ Copy planner/job-consumer lease 只允许竞争数据库 job 的规划或投递�
 
 ## 8. 六交易所网关
 
-当前已把六所规范身份、仅含精确 `LIVE` 的模式、账户/交易对 binding 与版本化 capability 候选契约落入 `venue-gateway-api`；根 package 复用同一 `VenueId`，不再复制交易所枚举。六所 adapter 具备 async 只读与离线 mutation/recovery 契约测试，但新 Node 路径的生产 mutation 仍关闭；只有 Node 以不可由普通调用方构造的 authority 同时证明 Control、Owner/WAL、writer、reconciliation、Canary 与实际发送时刻 TTL 后才能开放运行 authority。
+六所规范身份、精确 `LIVE` 模式和账户/交易对 binding 统一由 `venue-gateway-api` 提供。面向当前 10–20 用户的 MVP，Bybit、OKX、Hyperliquid 已采用较小安全闭环：账户进程锁、单一命令 WAL、Owner 字段、10U 风险上限、Unknown 禁重投及签名对账；不复制旧 Stage 7 的分布式 lease、handoff 或多层 receipt。
 
 | Venue | 目标 adapter | 当前权威来源 | 初始准入 |
 |---|---|---|---|
 | Binance | `venue-gateway-binance` | Portfolio Margin async HTTP/私流、Net/Hedge 腿、regular/Algo/conditional-unsupported、fills cursor、place/cancel/reduce-once 与 ACK 后 exact signed readback 已闭合；Stage 7 capability/WAL/writer 仍是生产权威 | `LIVE`；adapter 静态能力为空，Node 接入前不开放新路径 |
 | Bitget | `venue-gateway-bitget` | UTA LIVE async 私有链路、账户五面同 attempt、normal/unsupported 订单族、place/cancel/reduce-once 与 UNKNOWN exact readback 已闭合；Stage 7 capability/WAL/writer 仍是生产权威 | `LIVE`；adapter 静态能力为空，Node 接入前不开放新路径 |
 | Gate.io | `venue-gateway-gate` | LIVE async 签名 HTTP/私流、账户/Hedge 双腿、regular/profile-explicit-unsupported、fills cursor、post-only place/exact cancel/reduce-once 与 ACK readback 已闭合；Stage 7 capability/WAL/writer 仍是生产权威 | `LIVE`；adapter 静态能力为空，Node 接入前不开放新路径 |
-| Bybit | `venue-gateway-bybit` | 生产只保留 `READ_*` probe/readback；place/cancel/reduce、签名、POST、dispatch 与 recovery authority 仅 `cfg(test)`，且无 feature 可复活 | `LIVE`；生产 collector IntegrationUnavailable，静态能力及 Node/writer/WAL 关闭 |
-| OKX | `venue-gateway-okx` | 生产只保留固定 GET transport 与只读 probe；mutation builder/trait/签名/POST 和 recovery fixture 仅 `cfg(test)` | `LIVE`；生产 collector IntegrationUnavailable，静态能力及 Node/writer/WAL 关闭 |
-| Hyperliquid | `venue-gateway-hyperliquid` | 生产只保留绑定 `/info` 的只读 candidate；action、签名、`/exchange` POST、physical dispatch 与 recovery fixture 仅 `cfg(test)` | `LIVE`；生产 collector RecoveryIntegrationUnavailable，静态能力及 Node/writer/WAL 关闭 |
+| Bybit | `venue-gateway-bybit` | UTA2/双向持仓和权限预检；post-only place、exact cancel、signed exact readback | `LIVE`；仅经账户 host permit，账户累计名义仓位上限 10U；已有持仓或未撤入场时拒绝增险 |
+| OKX | `venue-gateway-okx` | Long/Short Cross 预检；SWAP 规则及 `ctVal × ctMult × contracts` 换算；post-only place、exact cancel/readback | `LIVE`；仅经账户 host permit，按张数向下取整；账户累计名义仓位上限 10U |
+| Hyperliquid | `venue-gateway-hyperliquid` | API Wallet 绑定、持仓/open-orders 预检；持久 nonce、ALO place、cloid exact cancel/readback | `LIVE`；仅经账户 host permit，账户累计名义仓位上限 10U；已有持仓或挂单时拒绝增险 |
 
 KOL 网关只是协议 fixture 和差异对照来源，不继承其运行开关或实盘准入状态。前三所的生产权威继续来自 Venue 已验收实现。
 

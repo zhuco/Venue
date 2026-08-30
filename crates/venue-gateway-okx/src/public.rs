@@ -14,6 +14,32 @@ pub struct OkxInstrument {
     minimum_base_quantity: Decimal,
 }
 
+/// Executable OKX contract size derived from a quote-notional ceiling. Quantities exposed to the
+/// shared runtime stay in base units while the wire request uses `contracts`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OkxNotionalSize {
+    contracts: Decimal,
+    base_quantity: Decimal,
+    quote_notional: Amount,
+}
+
+impl OkxNotionalSize {
+    #[must_use]
+    pub const fn contracts(&self) -> Decimal {
+        self.contracts
+    }
+
+    #[must_use]
+    pub const fn base_quantity(&self) -> Decimal {
+        self.base_quantity
+    }
+
+    #[must_use]
+    pub const fn quote_notional(&self) -> &Amount {
+        &self.quote_notional
+    }
+}
+
 impl OkxInstrument {
     #[must_use]
     pub fn native_id(&self) -> &str {
@@ -45,14 +71,13 @@ impl OkxInstrument {
         Ok(())
     }
 
-    pub(crate) fn contracts_to_base(&self, contracts: Decimal) -> Result<Decimal, OkxError> {
+    pub fn contracts_to_base(&self, contracts: Decimal) -> Result<Decimal, OkxError> {
         contracts
             .checked_mul(self.base_quantity_per_contract)
             .ok_or(OkxError::Payload)
     }
 
-    #[cfg(test)]
-    pub(crate) fn base_to_contracts(&self, quantity: Decimal) -> Result<Decimal, OkxError> {
+    pub fn base_to_contracts(&self, quantity: Decimal) -> Result<Decimal, OkxError> {
         if quantity < self.minimum_base_quantity
             || quantity <= Decimal::ZERO
             || quantity % self.instrument.quantity_step != Decimal::ZERO
@@ -71,6 +96,56 @@ impl OkxInstrument {
             return Err(OkxError::Precision);
         }
         Ok(contracts)
+    }
+
+    /// Floors an entry size to the venue contract step without exceeding the supplied quote cap.
+    /// A cap below `minSz` is rejected rather than rounded up through the risk boundary.
+    pub fn size_for_quote_notional(
+        &self,
+        cap: &Amount,
+        price: Price,
+    ) -> Result<OkxNotionalSize, OkxError> {
+        self.instrument.validate().map_err(|_| OkxError::Payload)?;
+        if cap.asset.as_str() != self.instrument.symbol.quote()
+            || cap.value <= Decimal::ZERO
+            || price.value() <= Decimal::ZERO
+        {
+            return Err(OkxError::Precision);
+        }
+        let quote_per_contract = self
+            .base_quantity_per_contract
+            .checked_mul(price.value())
+            .filter(|value| *value > Decimal::ZERO)
+            .ok_or(OkxError::Precision)?;
+        let contract_step = self
+            .instrument
+            .quantity_step
+            .checked_div(self.base_quantity_per_contract)
+            .filter(|value| *value > Decimal::ZERO)
+            .ok_or(OkxError::Precision)?;
+        let minimum_contracts = self
+            .minimum_base_quantity
+            .checked_div(self.base_quantity_per_contract)
+            .filter(|value| *value > Decimal::ZERO)
+            .ok_or(OkxError::Precision)?;
+        let raw_contracts = cap
+            .value
+            .checked_div(quote_per_contract)
+            .ok_or(OkxError::Precision)?;
+        let contracts = raw_contracts - raw_contracts % contract_step;
+        if contracts < minimum_contracts || contracts <= Decimal::ZERO {
+            return Err(OkxError::Precision);
+        }
+        let base_quantity = self.contracts_to_base(contracts)?;
+        let quote_value = base_quantity
+            .checked_mul(price.value())
+            .filter(|value| *value <= cap.value)
+            .ok_or(OkxError::Precision)?;
+        Ok(OkxNotionalSize {
+            contracts,
+            base_quantity,
+            quote_notional: Amount::new(cap.asset.clone(), quote_value),
+        })
     }
 }
 
@@ -287,6 +362,29 @@ mod tests {
             ),
             Err(OkxError::Payload)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn doge_contract_size_floors_ten_usdt_cap_to_point_eleven_contracts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const DOGE: &[u8] = br#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"DOGE-USDT-SWAP","ctType":"linear","ctVal":"1000","ctMult":"1","ctValCcy":"DOGE","settleCcy":"USDT","state":"live","tickSz":"0.00001","lotSz":"0.01","minSz":"0.01"}]}"#;
+        let config = OkxConfig::for_binding(GatewayBinding::new(
+            VenueId::Okx,
+            GatewayMode::Live,
+            "00000000-0000-4000-8000-000000000001",
+            "DOGE/USDT".parse()?,
+        )?)?;
+        let instrument = parse_instrument(DOGE, &config, 1)?;
+        let cap = Amount::new("USDT".parse()?, Decimal::TEN);
+        let price = Price::new(Decimal::new(8_503, 5))?;
+        let size = instrument.size_for_quote_notional(&cap, price)?;
+
+        assert_eq!(instrument.minimum_base_quantity(), Decimal::TEN);
+        assert_eq!(size.contracts(), Decimal::new(11, 2));
+        assert_eq!(size.base_quantity(), Decimal::new(110, 0));
+        assert_eq!(size.quote_notional().value, Decimal::new(93_533, 4));
+        assert!(size.quote_notional().value <= cap.value);
         Ok(())
     }
 

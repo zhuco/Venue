@@ -209,6 +209,13 @@ impl PhysicalRecoveryAuthorityRoots {
     pub const fn unknown(&self) -> &[u8; 32] {
         &self.unknown
     }
+
+    /// Number of unresolved durable commands included in this recovered root. This is evidence
+    /// metadata only; it does not expose the commands or confer reconciliation authority.
+    #[must_use]
+    pub fn unresolved_count(&self) -> u64 {
+        self.structured_unknowns.len() as u64
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

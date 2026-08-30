@@ -18,6 +18,9 @@ impl HyperliquidGatewayBinding {
         if binding.mode != GatewayMode::Live {
             return Err(HyperliquidGatewayBindingError::Mode);
         }
+        if binding.symbol.quote() != "USDC" {
+            return Err(HyperliquidGatewayBindingError::Quote);
+        }
         Ok(Self(binding))
     }
 
@@ -41,9 +44,7 @@ impl HyperliquidReadBinding {
         user_address: impl Into<String>,
     ) -> Result<Self, HyperliquidError> {
         let user_address = user_address.into();
-        if !credentials::valid_address(&user_address)
-            || gateway.gateway_binding().symbol.quote() != "USDC"
-        {
+        if !credentials::valid_address(&user_address) {
             return Err(HyperliquidError::Binding);
         }
         Ok(Self {
@@ -69,6 +70,8 @@ pub enum HyperliquidGatewayBindingError {
     Venue,
     #[error("Hyperliquid gateway binding must use mode=LIVE")]
     Mode,
+    #[error("Hyperliquid perpetual binding must use quote=USDC")]
+    Quote,
     #[error(transparent)]
     Gateway(#[from] GatewayApiError),
 }

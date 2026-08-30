@@ -25,6 +25,8 @@ where
 pub const CONTROL_SCHEMA_VERSION: u16 = 2;
 pub const SNAPSHOT_PATH: &str = "/v2/ui/snapshot";
 pub const EVENT_STREAM_PATH: &str = "/v2/ui/events";
+pub const INDICATOR_SNAPSHOT_PATH: &str = "/v2/indicators/snapshot";
+pub const INDICATOR_EVENT_STREAM_PATH: &str = "/v2/indicators/events";
 pub const COMMAND_PATH: &str = "/v2/control/commands";
 pub const ACCOUNT_DELIVERY_SCHEMA_VERSION: u16 = 2;
 pub const ACCOUNT_DELIVERY_CLAIM_PATH: &str = "/v2/account-node/deliveries/claim";
@@ -457,6 +459,169 @@ pub struct IndicatorValue {
     pub source_version: String,
 }
 
+/// One exact LIVE account/symbol scope for a read-only derived market projection. This scope is
+/// intentionally not an execution identity and carries no writer, WAL, credential, or permit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IndicatorBinding {
+    pub venue: VenueId,
+    #[serde(deserialize_with = "deserialize_live_mode")]
+    pub mode: GatewayMode,
+    pub trading_account_id: String,
+    pub symbol: Symbol,
+}
+
+impl IndicatorBinding {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.mode != GatewayMode::Live {
+            return Err(ProtocolError::Mode);
+        }
+        if !venue_domain::is_canonical_trading_account_id(&self.trading_account_id) {
+            return Err(ProtocolError::AccountId);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn grants_mutation_authority(&self) -> bool {
+        false
+    }
+}
+
+/// The public-evidence cursor for one input family. `age_ms` is not caller interpretation: it
+/// must exactly equal the containing frame observation time minus this event time.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IndicatorProvenance {
+    pub source: String,
+    pub generation: u64,
+    pub sequence: u64,
+    pub event_time_ms: u64,
+    pub age_ms: u64,
+    pub feature_version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct IndicatorFeatureValues {
+    pub mid_price: Decimal,
+    pub fair_price: Decimal,
+    pub spread_bps: Decimal,
+    pub depth_quote: Decimal,
+    pub book_imbalance: Decimal,
+    pub trade_imbalance: Decimal,
+    pub short_return_bps: Decimal,
+    pub trend_efficiency: Decimal,
+    pub bandwidth_expansion: Decimal,
+    pub expected_move_bps: Decimal,
+    pub toxicity: Decimal,
+}
+
+/// A fully-ready, bounded-age FeatureFrame rendered as a secret-free Control projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct IndicatorFrameProjection {
+    pub schema_version: u16,
+    pub binding: IndicatorBinding,
+    pub generation: u64,
+    pub watermark_ms: u64,
+    pub observed_ms: u64,
+    pub maximum_age_ms: u64,
+    pub provenance: Vec<IndicatorProvenance>,
+    pub values: IndicatorFeatureValues,
+}
+
+impl IndicatorFrameProjection {
+    pub fn validate_at(&self, snapshot_generated_ms: u64) -> Result<(), ProtocolError> {
+        self.binding.validate()?;
+        if self.schema_version != CONTROL_SCHEMA_VERSION
+            || self.generation == 0
+            || self.watermark_ms == 0
+            || self.observed_ms == 0
+            || self.maximum_age_ms == 0
+            || self.observed_ms > snapshot_generated_ms
+            || self.watermark_ms > self.observed_ms
+        {
+            return Err(ProtocolError::IndicatorIdentity);
+        }
+        let mut sources = BTreeSet::new();
+        for provenance in &self.provenance {
+            if provenance.source.trim().is_empty()
+                || provenance.generation != self.generation
+                || provenance.sequence == 0
+                || provenance.event_time_ms == 0
+                || provenance.event_time_ms > self.observed_ms
+                || provenance.age_ms != self.observed_ms - provenance.event_time_ms
+                || provenance.age_ms > self.maximum_age_ms
+                || snapshot_generated_ms - provenance.event_time_ms > self.maximum_age_ms
+                || provenance.feature_version.trim().is_empty()
+                || !sources.insert(provenance.source.as_str())
+            {
+                return Err(ProtocolError::IndicatorProvenance);
+            }
+        }
+        if !["book", "trades", "bars"]
+            .into_iter()
+            .all(|source| sources.contains(source))
+        {
+            return Err(ProtocolError::IndicatorProvenance);
+        }
+        let values = &self.values;
+        if !positive(values.mid_price)
+            || !positive(values.fair_price)
+            || values.spread_bps.is_sign_negative()
+            || values.depth_quote.is_sign_negative()
+            || values.book_imbalance < -Decimal::ONE
+            || values.book_imbalance > Decimal::ONE
+            || values.trade_imbalance < -Decimal::ONE
+            || values.trade_imbalance > Decimal::ONE
+            || values.trend_efficiency < -Decimal::ONE
+            || values.trend_efficiency > Decimal::ONE
+            || values.expected_move_bps.is_sign_negative()
+            || values.toxicity < Decimal::ZERO
+            || values.toxicity > Decimal::ONE
+        {
+            return Err(ProtocolError::IndicatorValues);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn grants_mutation_authority(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct IndicatorSnapshot {
+    pub schema_version: u16,
+    pub generated_ms: u64,
+    pub frames: Vec<IndicatorFrameProjection>,
+}
+
+impl IndicatorSnapshot {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.schema_version != CONTROL_SCHEMA_VERSION || self.generated_ms == 0 {
+            return Err(ProtocolError::IndicatorIdentity);
+        }
+        let mut identities = BTreeSet::new();
+        for frame in &self.frames {
+            frame.validate_at(self.generated_ms)?;
+            let binding = &frame.binding;
+            if !identities.insert((
+                binding.venue,
+                binding.mode,
+                binding.trading_account_id.as_str(),
+                &binding.symbol,
+            )) {
+                return Err(ProtocolError::DuplicateIdentity);
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn grants_mutation_authority(&self) -> bool {
+        false
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MarketSummary {
     pub symbol: Symbol,
@@ -848,6 +1013,27 @@ pub enum ControlEvent {
     Notice { observed_ms: u64, message: String },
 }
 
+/// Separate from UI control events so legacy Control consumers never need to decode market
+/// projections they did not request. The indicator SSE stream uses this event envelope only.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum IndicatorEvent {
+    Snapshot(IndicatorSnapshot),
+}
+
+impl IndicatorEvent {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        match self {
+            Self::Snapshot(snapshot) => snapshot.validate(),
+        }
+    }
+
+    #[must_use]
+    pub const fn grants_mutation_authority(&self) -> bool {
+        false
+    }
+}
+
 impl ControlEvent {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         match self {
@@ -897,6 +1083,12 @@ pub enum ProtocolError {
     SnapshotValue,
     #[error("control snapshot contains invalid nested content")]
     SnapshotContent,
+    #[error("indicator projection identity, scope, or freshness window is invalid")]
+    IndicatorIdentity,
+    #[error("indicator projection provenance is missing, duplicated, stale, or cross-generation")]
+    IndicatorProvenance,
+    #[error("indicator projection values are outside their normalized range")]
+    IndicatorValues,
     #[error("command receipt identity is missing")]
     ReceiptIdentity,
     #[error("command receipt observed time is missing")]

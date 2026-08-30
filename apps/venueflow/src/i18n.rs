@@ -42,6 +42,7 @@ resources! {
     ChartIndicators => "Chart & indicators", "K线与指标";
     OrderBook => "Order book", "订单簿";
     TradeTape => "Trade tape", "逐笔成交";
+    RecentTrades => "Recent trades", "最新成交";
     Accounts => "Accounts", "账户";
     Strategies => "Strategies", "策略";
     CopyRelations => "Copy relations", "跟单关系";
@@ -105,6 +106,8 @@ resources! {
     Side => "Side", "方向";
     Price => "Price", "价格";
     Quantity => "Quantity", "数量";
+    Total => "Total", "累计";
+    PricePrecision => "Price precision", "价格精度";
     Ask => "ASK", "卖";
     Bid => "BID", "买";
     NoTrades => "No trades. Waiting for the public WebSocket.", "暂无逐笔成交，正在等待公共 WebSocket。";
@@ -198,5 +201,6 @@ mod tests {
         assert_eq!(text(Language::SimplifiedChinese, TextKey::Settings), "设置");
         assert_eq!(text(Language::English, TextKey::Amplitude), "Amplitude");
         assert_eq!(text(Language::SimplifiedChinese, TextKey::Change), "涨跌幅");
+        assert_eq!(text(Language::SimplifiedChinese, TextKey::Total), "累计");
     }
 }

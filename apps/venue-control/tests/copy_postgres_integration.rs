@@ -10,7 +10,9 @@ use venue_control::{
     PgControlRepository, ScopedCopyDeliveryReceipt,
 };
 use venue_control_protocol::{
-    AccountDeliveryBinding, AccountDeliveryPayload, GatewayMode, VenueId,
+    ACCOUNT_DELIVERY_SCHEMA_VERSION, AccountDeliveryAck, AccountDeliveryBinding,
+    AccountDeliveryPayload, AccountDeliveryReceipt, AccountDeliveryReceiptState, GatewayMode,
+    VenueId,
 };
 use venue_copy::{
     AuthoritativePositionSnapshot, CopyAction, CopyIdentityInput, DeliveryBinding,
@@ -269,6 +271,17 @@ async fn postgres_receipts_unknown_fence_ledger_and_restart_recovery()
         .claim_deliveries("account-node", now + 3, 1)
         .await?
         .remove(0);
+    let applied_receipt = receipt(&applied_claim, DeliveryReceiptStatus::Applied, 1, now + 4);
+    assert!(
+        worker
+            .record_receipt(&ScopedCopyDeliveryReceipt {
+                claim: applied_claim.clone(),
+                receipt: applied_receipt.clone(),
+            })
+            .await
+            .is_err()
+    );
+    persist_node_receipt(&repository, &scope, DeliveryReceiptStatus::Applied, now + 4).await?;
     sqlx::raw_sql(
             "CREATE FUNCTION venue_test_fail_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ \
              BEGIN RAISE EXCEPTION 'simulated receipt crash'; END $$; \
@@ -277,7 +290,6 @@ async fn postgres_receipts_unknown_fence_ledger_and_restart_recovery()
         )
         .execute(&fixture.pool)
         .await?;
-    let applied_receipt = receipt(&applied_claim, DeliveryReceiptStatus::Applied, 1, now + 4);
     assert!(
         worker
             .record_receipt(&ScopedCopyDeliveryReceipt {
@@ -318,10 +330,17 @@ async fn postgres_receipts_unknown_fence_ledger_and_restart_recovery()
         .await?
         .remove(0);
     let unknown_receipt = receipt(&unknown_claim, DeliveryReceiptStatus::Unknown, 1, now + 24);
+    persist_node_receipt(
+        &repository,
+        &scope,
+        DeliveryReceiptStatus::Unknown,
+        now + 24,
+    )
+    .await?;
     worker
         .record_receipt(&ScopedCopyDeliveryReceipt {
             claim: unknown_claim.clone(),
-            receipt: unknown_receipt,
+            receipt: unknown_receipt.clone(),
         })
         .await?;
     assert!(
@@ -336,18 +355,41 @@ async fn postgres_receipts_unknown_fence_ledger_and_restart_recovery()
         2,
         now + 26,
     );
+    persist_node_receipt(
+        &repository,
+        &scope,
+        DeliveryReceiptStatus::Reconciled,
+        now + 26,
+    )
+    .await?;
     worker
         .record_receipt(&ScopedCopyDeliveryReceipt {
-            claim: unknown_claim,
+            claim: unknown_claim.clone(),
             receipt: reconciled,
         })
         .await?;
+    assert_eq!(
+        worker
+            .record_receipt(&ScopedCopyDeliveryReceipt {
+                claim: unknown_claim,
+                receipt: unknown_receipt,
+            })
+            .await?,
+        CopyApplyResult::Existing
+    );
 
     let rejected = plan_one(&repository, &worker, &scope, 30, now + 40).await?;
     let rejected_claim = worker
         .claim_deliveries("account-node", now + 43, 1)
         .await?
         .remove(0);
+    persist_node_receipt(
+        &repository,
+        &scope,
+        DeliveryReceiptStatus::Rejected,
+        now + 44,
+    )
+    .await?;
     worker
         .record_receipt(&ScopedCopyDeliveryReceipt {
             receipt: receipt(
@@ -365,6 +407,13 @@ async fn postgres_receipts_unknown_fence_ledger_and_restart_recovery()
     assert_eq!(replay.observer_cursor, 3);
     assert_eq!(replay.jobs.len(), 3);
     assert_eq!(replay.ledger_entries.len(), 1);
+    assert_eq!(replay.drift_projections.len(), 1);
+    let repair = replay.drift_projections[0]
+        .repair
+        .as_ref()
+        .ok_or("expected a drift repair semantic request")?;
+    assert_eq!(repair.supersedes_job_id, applied.job.identities.job_id);
+    assert_eq!(repair.delta_exposure.value, Decimal::ONE);
     assert!(
         replay
             .jobs
@@ -403,12 +452,16 @@ async fn project_applied_ledger(
     planned: &venue_control::PlannedCopyJob,
     now: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let position_exposure = Amount::new(
+        planned.target.target_exposure.asset.clone(),
+        planned.target.target_exposure.value - Decimal::ONE,
+    );
     let position = AuthoritativePositionSnapshot {
         binding: planned.job.manifest.binding.clone(),
         generation: 1,
         observed_at_ms: now - 1,
         expires_at_ms: now + 30_000,
-        exposure: planned.target.target_exposure.clone(),
+        exposure: position_exposure,
         fact_digest: [71; 32],
     };
     let input = CopyLedgerProjectionInput {
@@ -434,6 +487,78 @@ async fn project_applied_ledger(
         worker.project_ledger(&input).await?,
         CopyApplyResult::Stored
     );
+    Ok(())
+}
+
+async fn persist_node_receipt(
+    repository: &PgControlRepository,
+    scope: &CopyObserverScope,
+    status: DeliveryReceiptStatus,
+    observed_ms: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let binding = AccountDeliveryBinding {
+        venue: scope.venue,
+        mode: GatewayMode::Live,
+        trading_account_id: scope.trading_account_id.clone(),
+        symbol: "BTC/USDT".parse()?,
+        instance_id: "copy-btc".to_owned(),
+        config_epoch: 7,
+    };
+    let claims = repository
+        .claim_account_deliveries(
+            &binding,
+            "account-node",
+            observed_ms - 2,
+            observed_ms + 100,
+            1,
+        )
+        .await?;
+    let claim = claims
+        .into_iter()
+        .next()
+        .ok_or_else(|| "expected account-node delivery claim".to_owned())?;
+    if matches!(
+        status,
+        DeliveryReceiptStatus::Applied | DeliveryReceiptStatus::Rejected
+    ) {
+        repository
+            .acknowledge_account_delivery(&AccountDeliveryAck {
+                schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
+                lease: claim.lease.clone(),
+                acknowledged_ms: observed_ms - 1,
+                durable_inbox_digest: [61; 32],
+            })
+            .await?;
+    }
+    let state = match status {
+        DeliveryReceiptStatus::Applied => AccountDeliveryReceiptState::Applied,
+        DeliveryReceiptStatus::Unknown => AccountDeliveryReceiptState::Unknown,
+        DeliveryReceiptStatus::Reconciled => AccountDeliveryReceiptState::Reconciled,
+        DeliveryReceiptStatus::Rejected => AccountDeliveryReceiptState::Rejected,
+    };
+    repository
+        .record_account_delivery_receipt(&AccountDeliveryReceipt {
+            schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
+            lease: claim.lease,
+            receipt_id: format!("copy-node-{observed_ms}-{status:?}"),
+            state,
+            observed_ms,
+            account_fact_digest: matches!(
+                status,
+                DeliveryReceiptStatus::Applied | DeliveryReceiptStatus::Reconciled
+            )
+            .then_some([62; 32])
+            .unwrap_or([0; 32]),
+            detail: match status {
+                DeliveryReceiptStatus::Applied => String::new(),
+                DeliveryReceiptStatus::Unknown => "node requires reconciliation".to_owned(),
+                DeliveryReceiptStatus::Reconciled => {
+                    "node durable reconciliation completed".to_owned()
+                }
+                DeliveryReceiptStatus::Rejected => "node rejected semantic job".to_owned(),
+            },
+        })
+        .await?;
     Ok(())
 }
 

@@ -30,7 +30,7 @@ pub struct OkxExecutionScope {
 }
 
 impl OkxExecutionScope {
-    fn new(
+    pub(crate) fn new(
         config: &OkxConfig,
         instrument: &OkxInstrument,
         profile: &OkxAccountProfile,
@@ -93,6 +93,142 @@ impl OkxExecutionScope {
     pub const fn trade_mode(&self) -> OkxTradeMode {
         self.trade_mode
     }
+}
+
+/// Narrow host-only cancel request keyed by the durable client identity. The type is crate-private
+/// so no caller can reach the transport without an account-host dispatch permit.
+pub(crate) struct OkxHostCancelRequest {
+    scope: OkxExecutionScope,
+    body: Vec<u8>,
+    client_order_id: String,
+}
+
+impl OkxPrivateRequest for OkxHostCancelRequest {
+    fn scope(&self) -> &OkxExecutionScope {
+        &self.scope
+    }
+
+    fn method(&self) -> &'static str {
+        POST
+    }
+
+    fn request_path(&self) -> &str {
+        endpoints::CANCEL_ORDER
+    }
+
+    fn body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HostCancelWire<'a> {
+    inst_id: &'a str,
+    cl_ord_id: &'a str,
+}
+
+pub(crate) fn build_host_cancel_request(
+    config: &OkxConfig,
+    instrument: &OkxInstrument,
+    profile: &OkxAccountProfile,
+    trade_mode: OkxTradeMode,
+    command: &CancelCommand,
+) -> Result<OkxHostCancelRequest, OkxError> {
+    command.validate().map_err(|_| OkxError::Payload)?;
+    validate_owner(&command.owner, config)?;
+    validate_client_order_id(command.target_client_order_id.as_str())?;
+    let scope = OkxExecutionScope::new(config, instrument, profile, trade_mode)?;
+    let wire = HostCancelWire {
+        inst_id: instrument.native_id(),
+        cl_ord_id: command.target_client_order_id.as_str(),
+    };
+    Ok(OkxHostCancelRequest {
+        scope,
+        body: serde_json::to_vec(&wire).map_err(|_| OkxError::Payload)?,
+        client_order_id: command.target_client_order_id.as_str().to_owned(),
+    })
+}
+
+pub(crate) fn parse_host_cancel_ack(
+    response: OkxHttpResponse,
+    request: &OkxHostCancelRequest,
+) -> Result<String, OkxError> {
+    validate_http_response(&response, &request.scope)?;
+    let row = one_ack(&response.body)?;
+    if row.cl_ord_id != request.client_order_id {
+        return Err(OkxError::Identity);
+    }
+    validate_order_id(&row.ord_id)?;
+    Ok(row.ord_id)
+}
+
+pub(crate) struct OkxHostOrderLookupRequest {
+    scope: OkxExecutionScope,
+    request_path: String,
+    client_order_id: String,
+}
+
+impl OkxPrivateRequest for OkxHostOrderLookupRequest {
+    fn scope(&self) -> &OkxExecutionScope {
+        &self.scope
+    }
+
+    fn method(&self) -> &'static str {
+        GET
+    }
+
+    fn request_path(&self) -> &str {
+        &self.request_path
+    }
+
+    fn body(&self) -> &[u8] {
+        &[]
+    }
+}
+
+pub(crate) fn build_host_order_lookup_request(
+    config: &OkxConfig,
+    instrument: &OkxInstrument,
+    profile: &OkxAccountProfile,
+    trade_mode: OkxTradeMode,
+    client_order_id: &str,
+) -> Result<OkxHostOrderLookupRequest, OkxError> {
+    validate_client_order_id(client_order_id)?;
+    let scope = OkxExecutionScope::new(config, instrument, profile, trade_mode)?;
+    Ok(OkxHostOrderLookupRequest {
+        scope,
+        request_path: format!(
+            "{}?instId={}&clOrdId={client_order_id}",
+            endpoints::PLACE_ORDER,
+            instrument.native_id()
+        ),
+        client_order_id: client_order_id.to_owned(),
+    })
+}
+
+pub(crate) fn parse_host_order_lookup(
+    response: OkxHttpResponse,
+    request: &OkxHostOrderLookupRequest,
+) -> Result<Option<(String, OrderState)>, OkxError> {
+    validate_http_response(&response, &request.scope)?;
+    let envelope = decode_success::<DetailRow>(&response.body)?;
+    if envelope.data.is_empty() {
+        return Ok(None);
+    }
+    let [row] = envelope.data.as_slice() else {
+        return Err(OkxError::Identity);
+    };
+    if row.inst_type != "SWAP"
+        || row.inst_id != request.scope.native_instrument_id
+        || row.td_mode != request.scope.trade_mode.wire_value()
+        || row.cl_ord_id != request.client_order_id
+    {
+        return Err(OkxError::Binding);
+    }
+    validate_order_id(&row.ord_id)?;
+    let state = parse_order_state(&row.state)?;
+    Ok(Some((row.ord_id.clone(), state)))
 }
 
 /// The existing canonical commands are the only admitted place intents. Adapter-specific order
@@ -358,8 +494,8 @@ struct AckRow {
     cl_ord_id: String,
     ts: String,
     s_code: String,
-    #[serde(default)]
-    s_msg: String,
+    #[serde(default, rename = "sMsg")]
+    _s_msg: String,
 }
 
 pub fn parse_place_ack(
@@ -521,7 +657,7 @@ fn one_ack(payload: &[u8]) -> Result<AckRow, OkxError> {
     let [row] = envelope.data.as_slice() else {
         return Err(OkxError::Payload);
     };
-    if row.s_code != "0" || !row.s_msg.is_empty() {
+    if row.s_code != "0" {
         return Err(OkxError::Rejected);
     }
     Ok(row.clone())
@@ -952,15 +1088,7 @@ fn parse_bound_order_detail(
     if filled_contracts.is_sign_negative() || filled_contracts > expected_contracts {
         return Err(OkxError::Payload);
     }
-    let state = match row.state.as_str() {
-        "live" => OrderState::New,
-        "partially_filled" => OrderState::PartiallyFilled,
-        "filled" => OrderState::Filled,
-        "canceled" | "mmp_canceled" => OrderState::Cancelled,
-        "rejected" => OrderState::Rejected,
-        "expired" => OrderState::Expired,
-        _ => return Err(OkxError::Payload),
-    };
+    let state = parse_order_state(&row.state)?;
     let order = Order {
         order_id: row.ord_id.clone(),
         client_order_id: FieldState::Known(row.cl_ord_id.clone()),
@@ -983,6 +1111,18 @@ fn parse_bound_order_detail(
     Ok(OkxTimedOrder {
         order,
         update_time_ms: positive_u64(&row.u_time)?,
+    })
+}
+
+fn parse_order_state(value: &str) -> Result<OrderState, OkxError> {
+    Ok(match value {
+        "live" => OrderState::New,
+        "partially_filled" => OrderState::PartiallyFilled,
+        "filled" => OrderState::Filled,
+        "canceled" | "mmp_canceled" => OrderState::Cancelled,
+        "rejected" => OrderState::Rejected,
+        "expired" => OrderState::Expired,
+        _ => return Err(OkxError::Payload),
     })
 }
 
@@ -1142,6 +1282,19 @@ mod tests {
         )?;
         assert_eq!(accepted.order_id(), "7003");
         assert_eq!(accepted.ack_payload_sha256().len(), 64);
+        assert_eq!(
+            parse_place_ack(
+                response(
+                    &config,
+                    &instrument,
+                    1_787_911_200_350,
+                    br#"{"code":"0","msg":"","data":[{"ordId":"7003","clOrdId":"00000000000000000000000000000003","ts":"1787911200300","sCode":"0","sMsg":"Order placed"}]}"#,
+                ),
+                &place,
+            )?
+            .order_id(),
+            "7003"
+        );
         let cancel_command = CancelCommand {
             command_id: CommandId::new("cancel3")?,
             owner: owner(OrderPurpose::Reduce)?,

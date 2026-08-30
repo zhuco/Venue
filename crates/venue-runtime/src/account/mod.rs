@@ -7,6 +7,7 @@ mod recovery;
 mod recovery_session;
 mod registry;
 mod runtime;
+mod runtime_error;
 
 pub use crate::{
     AccountKey, AccountModelError, AccountOrderCapabilityEvidence, ExchangeId, StrategyBinding,
@@ -44,9 +45,8 @@ pub use recovery_session::{
 };
 pub use registry::{FlattenPlan, RegistryError, StopPlan, StrategyRegistration};
 pub(crate) use registry::{SignedStopProof, StrategyRegistry};
-pub use runtime::{
-    AccountRuntime, AccountRuntimeError, PersistedPrivateDispatchReceipt, PrivateRoutePlan,
-};
+pub use runtime::{AccountRuntime, PersistedPrivateDispatchReceipt, PrivateRoutePlan};
+pub use runtime_error::AccountRuntimeError;
 
 #[cfg(test)]
 mod recovery_tests;

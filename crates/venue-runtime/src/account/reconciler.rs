@@ -1292,7 +1292,7 @@ mod tests {
         );
         let key = strategy_key(account.clone())?;
         let token = StrategyTurnToken::issue(key, 2, 3, "config_1".to_owned(), 1, 1)?;
-        let applied = AppliedStrategyTurnReceipt::persisted(token);
+        let applied = AppliedStrategyTurnReceipt::test_persisted(token);
         let mut net_sets = DesiredOrderSets::new(AccountPositionMode::Net);
         net_sets.set_from_applied_turn(&applied, [net_desired.clone(), closing_net])?;
         let mut hedge_sets = DesiredOrderSets::new(AccountPositionMode::Hedge);
@@ -1496,7 +1496,7 @@ mod tests {
         registry.register(binding)?;
 
         let token = StrategyTurnToken::issue(key.clone(), 4, 6, "config_1".to_owned(), 1, 8)?;
-        let applied = AppliedStrategyTurnReceipt::persisted(token);
+        let applied = AppliedStrategyTurnReceipt::test_persisted(token);
         let mut applied_sets = DesiredOrderSets::new(AccountPositionMode::Hedge);
         applied_sets.set_from_applied_turn(&applied, Vec::<DesiredOrder>::new())?;
         applied_sets.verify_authority(&registry, 4, 6)?;

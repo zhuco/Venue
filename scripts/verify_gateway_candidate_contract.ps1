@@ -43,6 +43,16 @@ Invoke-Cargo -Arguments @(
     'test', '--locked', '-p', 'venue-node', '--no-default-features',
     '--test', 'gateway_candidate_conformance'
 )
+Invoke-Cargo -Arguments @(
+    'test', '--locked', '-p', 'venue-execution', 'account_host::tests'
+)
+Invoke-Cargo -Arguments @(
+    'test', '--locked', '-p', 'venue-gateway-okx', 'account_gateway::tests'
+)
+Invoke-Cargo -Arguments @(
+    'test', '--locked', '-p', 'venue-gateway-hyperliquid',
+    'binding_rejects_wrong_venue_and_account'
+)
 
 $symbols = @{
     binance = 'BTC/USDT'
@@ -94,6 +104,11 @@ function Test-MissingEvidenceFailClosed {
         )) {
             $startInfo.ArgumentList.Add($argument)
         }
+        if ($Venue -in $preCredentialVenues) {
+            foreach ($argument in @('--', 'preflight', '--confirm-live', 'wrong-venue')) {
+                $startInfo.ArgumentList.Add($argument)
+            }
+        }
         foreach ($credentialName in $credentialNames[$Venue]) {
             [void]$startInfo.Environment.Remove($credentialName)
         }
@@ -123,13 +138,11 @@ function Test-MissingEvidenceFailClosed {
 
         $output = "$stdout`n$stderr"
         if ($Venue -in $preCredentialVenues) {
-            foreach ($marker in @(
-                'Owner', 'WAL', 'unique account writer fence', 'signed readback',
-                'UNKNOWN reconciliation', 'Stop/Flatten', 'operator-confirmed Canary evidence'
+            if (-not $output.Contains(
+                '--confirm-live must exactly match the lowercase venue id',
+                [StringComparison]::Ordinal
             )) {
-                if (-not $output.Contains($marker, [StringComparison]::Ordinal)) {
-                    throw "$Venue $mode 失败关闭输出缺少共享证据标记：$marker"
-                }
+                throw "$Venue $mode 未在凭证读取前拒绝错误的人工确认。"
             }
         } elseif (-not $output.Contains(
             'runtime arguments must select exactly one fixed deployment command',
@@ -243,26 +256,26 @@ foreach ($venue in @('binance', 'bitget', 'bybit', 'gate', 'hyperliquid', 'okx')
         }
         'bybit' {
             [ordered]@{
-                order_families = 'not_reached; precredential_fail_closed'
-                one_shot_mutation = 'not_reached; precredential_fail_closed'
-                ack_unknown = 'not_reached; precredential_fail_closed'
-                capability = 'binary_test_empty'
+                order_families = 'signed_exact_order_readback_in_account_gateway'
+                one_shot_mutation = 'opaque_single_use_host_permit; post_only_place_and_exact_cancel'
+                ack_unknown = 'transport_ambiguity_is_unknown_without_retry'
+                capability = 'account_host_bound; public raw POST unavailable'
             }
         }
         'hyperliquid' {
             [ordered]@{
-                order_families = 'not_reached; shared_integration_fail_closed'
-                one_shot_mutation = 'not_reached; shared_integration_fail_closed'
-                ack_unknown = 'not_reached; shared_integration_fail_closed'
-                capability = 'binary_test_empty'
+                order_families = 'exact_cloid_order_status_readback'
+                one_shot_mutation = 'opaque_single_use_host_permit; persisted nonce before signing'
+                ack_unknown = 'exchange_transport_ambiguity_is_unknown_without_retry'
+                capability = 'account_host_bound; public exchange POST unavailable'
             }
         }
         'okx' {
             [ordered]@{
-                order_families = 'not_reached; no_post_recovery_collector'
-                one_shot_mutation = 'not_reached; no_post_recovery_collector'
-                ack_unknown = 'not_reached; no_post_recovery_collector'
-                capability = 'fixed_binary_adapter_flags_empty; candidate_bridge_not_constructed'
+                order_families = 'signed exact clOrdId readback in account gateway'
+                one_shot_mutation = 'opaque single-use host permit; base-to-contract conversion'
+                ack_unknown = 'transport ambiguity is unknown without retry'
+                capability = 'account_host_bound; public raw POST unavailable'
             }
         }
     }
@@ -283,7 +296,7 @@ foreach ($venue in @('binance', 'bitget', 'bybit', 'gate', 'hyperliquid', 'okx')
 }
 
 [ordered]@{
-    writer_enabled = $false
+    writer_enabled = 'bybit_okx_hyperliquid_live_mvp_only'
     shared_host_tests = 'actual venue-node --lib test suite'
     coverage = $matrix
 } | ConvertTo-Json -Depth 5

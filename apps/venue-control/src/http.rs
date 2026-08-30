@@ -14,11 +14,13 @@ use tokio::{
     sync::{Semaphore, watch},
     time::{self, MissedTickBehavior},
 };
-use venue_control_protocol::ControlCommandRequest;
+use venue_control_protocol::{
+    ControlCommandRequest, INDICATOR_EVENT_STREAM_PATH, INDICATOR_SNAPSHOT_PATH,
+};
 
 use crate::{
     AccountDeliveryRepository, AccountDeliveryRepositoryError, ControlRepository, ControlService,
-    RepositoryError, ServiceError,
+    IndicatorProjectionError, IndicatorProjectionStore, RepositoryError, ServiceError,
     account_node_poll::{
         AccountNodePollError, AccountNodeRoute, MAX_ACCOUNT_NODE_HTTP_TIMEOUT,
         handle_account_node_request,
@@ -82,6 +84,7 @@ pub enum HttpServerError {
 
 struct HttpState<R> {
     service: Arc<ControlService<R>>,
+    indicators: Arc<IndicatorProjectionStore>,
     config: ControlHttpConfig,
     shutdown: watch::Receiver<bool>,
 }
@@ -90,6 +93,7 @@ impl<R> Clone for HttpState<R> {
     fn clone(&self) -> Self {
         Self {
             service: Arc::clone(&self.service),
+            indicators: Arc::clone(&self.indicators),
             config: self.config.clone(),
             shutdown: self.shutdown.clone(),
         }
@@ -117,6 +121,7 @@ enum HttpError {
     Unavailable,
     Conflict,
     DeliveryConflict,
+    IndicatorCursorExpired,
     Internal,
 }
 
@@ -128,6 +133,28 @@ pub fn control_shutdown_channel() -> (watch::Sender<bool>, watch::Receiver<bool>
 pub async fn serve_local<R>(
     listener: TcpListener,
     service: Arc<ControlService<R>>,
+    config: ControlHttpConfig,
+    shutdown: watch::Receiver<bool>,
+) -> Result<(), HttpServerError>
+where
+    R: ControlRepository + AccountDeliveryRepository + 'static,
+{
+    serve_local_with_indicators(
+        listener,
+        service,
+        Arc::new(IndicatorProjectionStore::default()),
+        config,
+        shutdown,
+    )
+    .await
+}
+
+/// Runs the localhost Control server with an externally-owned, read-only indicator cache. Market
+/// producers may publish projections here, but the cache has no Control, writer, or mutation role.
+pub async fn serve_local_with_indicators<R>(
+    listener: TcpListener,
+    service: Arc<ControlService<R>>,
+    indicators: Arc<IndicatorProjectionStore>,
     config: ControlHttpConfig,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), HttpServerError>
@@ -141,6 +168,7 @@ where
     let connections = Arc::new(Semaphore::new(MAX_ACTIVE_CONNECTIONS));
     let state = HttpState {
         service,
+        indicators,
         config,
         shutdown: shutdown.clone(),
     };
@@ -205,6 +233,21 @@ where
         (Method::Get, "/v2/ui/snapshot") if query.is_none() => {
             let snapshot = match call(state, state.service.snapshot()).await {
                 Ok(snapshot) => snapshot,
+                Err(error) => return write_error(stream, error).await.map_err(|_| ()),
+            };
+            let body = serde_json::to_vec(&snapshot).map_err(|_| ())?;
+            write_response(stream, "200 OK", "application/json", "close", &body)
+                .await
+                .map_err(|_| ())
+        }
+        (Method::Get, INDICATOR_SNAPSHOT_PATH) if query.is_none() => {
+            let snapshot = match call_indicator(state, state.indicators.snapshot()).await {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => {
+                    return write_error(stream, HttpError::Unavailable)
+                        .await
+                        .map_err(|_| ());
+                }
                 Err(error) => return write_error(stream, error).await.map_err(|_| ()),
             };
             let body = serde_json::to_vec(&snapshot).map_err(|_| ())?;
@@ -277,6 +320,15 @@ where
             };
             write_sse_headers(stream).await.map_err(|_| ())?;
             stream_events(stream, state, cursor).await;
+            Ok(())
+        }
+        (Method::Get, INDICATOR_EVENT_STREAM_PATH) => {
+            let cursor = match event_cursor(query, request.last_event_id) {
+                Ok(cursor) => cursor,
+                Err(error) => return write_error(stream, error).await.map_err(|_| ()),
+            };
+            write_sse_headers(stream).await.map_err(|_| ())?;
+            stream_indicator_events(stream, state, cursor).await;
             Ok(())
         }
         _ => write_error(stream, HttpError::BadRequest)
@@ -408,6 +460,16 @@ async fn call<R, T>(
     }
 }
 
+async fn call_indicator<R, T>(
+    state: &HttpState<R>,
+    operation: impl std::future::Future<Output = Result<T, IndicatorProjectionError>>,
+) -> Result<T, HttpError> {
+    match time::timeout(state.config.request_timeout, operation).await {
+        Ok(result) => result.map_err(map_indicator_error),
+        Err(_) => Err(HttpError::Timeout),
+    }
+}
+
 async fn stream_events<R>(stream: &mut TcpStream, state: &HttpState<R>, mut cursor: i64)
 where
     R: ControlRepository + 'static,
@@ -426,6 +488,32 @@ where
                 for event in events {
                     let payload = match serde_json::to_string(&event.event) { Ok(payload) if payload.len() <= state.config.request_body_limit => payload, _ => return };
                     let frame = format!("id: {}\nevent: control\ndata: {payload}\n\n", event.sequence);
+                    if write_sse(stream, frame.as_bytes(), state.config.request_timeout).await.is_err() { return; }
+                    cursor = event.sequence;
+                }
+            }
+        }
+    }
+}
+
+async fn stream_indicator_events<R>(stream: &mut TcpStream, state: &HttpState<R>, mut cursor: i64)
+where
+    R: ControlRepository + 'static,
+{
+    let mut shutdown = state.shutdown.clone();
+    let mut poll = time::interval(state.config.event_poll_interval);
+    let mut keep_alive = time::interval(state.config.event_keep_alive);
+    poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    keep_alive.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => if changed.is_err() || *shutdown.borrow() { return; },
+            _ = keep_alive.tick() => if write_sse(stream, b": keep-alive\n\n", state.config.request_timeout).await.is_err() { return; },
+            _ = poll.tick() => {
+                let events = match call_indicator(state, state.indicators.events(cursor, state.config.event_page_limit)).await { Ok(events) => events, Err(_) => return };
+                for event in events {
+                    let payload = match serde_json::to_string(&event.event) { Ok(payload) if payload.len() <= state.config.request_body_limit => payload, _ => return };
+                    let frame = format!("id: {}\nevent: indicator\ndata: {payload}\n\n", event.sequence);
                     if write_sse(stream, frame.as_bytes(), state.config.request_timeout).await.is_err() { return; }
                     cursor = event.sequence;
                 }
@@ -491,6 +579,7 @@ async fn write_error(stream: &mut TcpStream, error: HttpError) -> Result<(), std
         HttpError::Unavailable => ("503 Service Unavailable", "service_unavailable"),
         HttpError::Conflict => ("409 Conflict", "command_conflict"),
         HttpError::DeliveryConflict => ("409 Conflict", "delivery_conflict"),
+        HttpError::IndicatorCursorExpired => ("409 Conflict", "indicator_cursor_expired"),
         HttpError::Internal => ("500 Internal Server Error", "internal_error"),
     };
     let body = format!("{{\"error\":\"{code}\"}}");
@@ -536,6 +625,23 @@ fn map_service_error(error: ServiceError) -> HttpError {
             | AccountDeliveryRepositoryError::NumericRange,
         ) => HttpError::BadRequest,
         ServiceError::AccountDeliveryRepository(AccountDeliveryRepositoryError::CorruptData) => {
+            HttpError::Internal
+        }
+    }
+}
+
+fn map_indicator_error(error: IndicatorProjectionError) -> HttpError {
+    match error {
+        IndicatorProjectionError::CursorExpired => HttpError::IndicatorCursorExpired,
+        IndicatorProjectionError::Cursor
+        | IndicatorProjectionError::Age
+        | IndicatorProjectionError::Input
+        | IndicatorProjectionError::Binding
+        | IndicatorProjectionError::Frame
+        | IndicatorProjectionError::Protocol(_)
+        | IndicatorProjectionError::Source(_)
+        | IndicatorProjectionError::Feature(_) => HttpError::BadRequest,
+        IndicatorProjectionError::Monotonic | IndicatorProjectionError::Sequence => {
             HttpError::Internal
         }
     }

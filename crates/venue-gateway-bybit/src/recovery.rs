@@ -7,6 +7,7 @@ use tokio::{
 };
 use venue_domain::domain::{NativeOrderFamily, Symbol};
 use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
+use venue_runtime::account::PhysicalRecoverySession;
 
 use crate::transport::unix_ms;
 use crate::{
@@ -84,6 +85,39 @@ pub struct BybitRecoveryAuthorityReceipt {
 }
 
 impl BybitRecoveryAuthorityReceipt {
+    /// Converts only a runtime-issued opaque session into the adapter's recovery authority.
+    /// A caller may inspect session metadata but cannot construct a session or forge its issuer
+    /// seal; the runtime revalidates the same session after every await and at installation.
+    pub fn from_runtime_session(
+        session: &PhysicalRecoverySession,
+    ) -> Result<Self, BybitFreshRecoveryError> {
+        let scope = session.scope();
+        if scope.binding().venue != VenueId::Bybit
+            || session.attempt_id() == 0
+            || session.session_epoch() == 0
+            || session.private_generation() == 0
+        {
+            return Err(BybitFreshRecoveryError::AuthorityRoots);
+        }
+        let roots = scope.authority_roots();
+        let roots =
+            BybitRecoveryRootCandidates::verified(*roots.owner(), *roots.wal(), *roots.unknown())?;
+        let mut digest = Sha256::new();
+        digest.update(b"venue-bybit-runtime-recovery-authority-v1");
+        digest.update(scope.commitment_sha256());
+        digest.update(session.durable_roots().commitment_sha256());
+        digest.update(session.attempt_id().to_be_bytes());
+        digest.update(session.session_epoch().to_be_bytes());
+        digest.update(session.private_generation().to_be_bytes());
+        Ok(Self {
+            roots,
+            owner_route_count: session.durable_roots().owner_record_count(),
+            wal_record_count: session.durable_roots().wal_record_count(),
+            unresolved_count: scope.authority_roots().unresolved_count(),
+            projection_sha256: digest.finalize().into(),
+        })
+    }
+
     #[must_use]
     pub const fn roots(&self) -> &BybitRecoveryRootCandidates {
         &self.roots

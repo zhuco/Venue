@@ -688,6 +688,7 @@ pub fn parse_position_page(
                 return Err(BybitError::Payload);
             }
             let quantity = non_negative_decimal(&row.size)?;
+            let empty_position = quantity.is_zero() && row.side.is_empty();
             match (row.position_idx, row.side.as_str(), quantity.is_zero()) {
                 (0, "Buy" | "Sell", _)
                 | (0, "", true)
@@ -708,9 +709,9 @@ pub fn parse_position_page(
                 position,
                 position_idx: row.position_idx,
                 liquidation_price: optional_price(&row.liq_price)?,
-                unrealized_pnl: decimal(&row.unrealised_pnl)?,
-                native_sequence: positive_u64(&row.seq)?,
-                updated_at_ms: positive_u64(&row.updated_time)?,
+                unrealized_pnl: position_unrealized_pnl(&row.unrealised_pnl, empty_position)?,
+                native_sequence: position_sequence(&row.seq, empty_position)?,
+                updated_at_ms: position_updated_at(&row.updated_time, empty_position)?,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -727,6 +728,102 @@ pub fn parse_position_page(
         ),
         positions,
     })
+}
+
+pub(crate) fn diagnose_position_page(
+    binding: &BybitGatewayBinding,
+    raw: &BybitRawPrivatePayload,
+) -> &'static str {
+    if raw
+        .validate(binding, BybitPrivateSource::Positions)
+        .is_err()
+    {
+        return "raw_binding";
+    }
+    let envelope = match decode::<Envelope<Page<PositionRow>>>(&raw.payload) {
+        Ok(envelope) => envelope,
+        Err(_) => {
+            let detail = serde_json::from_slice::<Envelope<Page<PositionRow>>>(&raw.payload)
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            for (field, marker) in [
+                ("symbol", "decode_symbol"),
+                ("side", "decode_side"),
+                ("size", "decode_size"),
+                ("avgPrice", "decode_avg_price"),
+                ("markPrice", "decode_mark_price"),
+                ("liqPrice", "decode_liq_price"),
+                ("unrealisedPnl", "decode_pnl"),
+                ("positionIdx", "decode_position_index"),
+                ("updatedTime", "decode_updated"),
+                ("seq", "decode_sequence"),
+                ("nextPageCursor", "decode_cursor"),
+                ("category", "decode_category"),
+            ] {
+                if detail.contains(field) {
+                    return marker;
+                }
+            }
+            return "decode_other";
+        }
+    };
+    if accepted(&envelope).is_err() {
+        return "venue_rejected";
+    }
+    if validate_page(&envelope.result, &raw.native_symbol, 200).is_err() {
+        return "page";
+    }
+    if envelope
+        .result
+        .validate_symbols(&raw.native_symbol)
+        .is_err()
+    {
+        return "symbol";
+    }
+    let mut sides = BTreeSet::new();
+    for row in envelope.result.list {
+        let Ok(side) = position_side(row.position_idx) else {
+            return "position_index";
+        };
+        if !sides.insert(side) {
+            return "duplicate_side";
+        }
+        let Ok(quantity) = non_negative_decimal(&row.size) else {
+            return "quantity";
+        };
+        let empty = quantity.is_zero() && row.side.is_empty();
+        if !matches!(
+            (row.position_idx, row.side.as_str(), quantity.is_zero()),
+            (0, "Buy" | "Sell", _)
+                | (0, "", true)
+                | (1, "Buy", _)
+                | (1, "", true)
+                | (2, "Sell", _)
+                | (2, "", true)
+        ) {
+            return "direction";
+        }
+        if optional_price(&row.avg_price).is_err()
+            || optional_price(&row.mark_price).is_err()
+            || optional_price(&row.liq_price).is_err()
+        {
+            return "price";
+        }
+        if position_unrealized_pnl(&row.unrealised_pnl, empty).is_err() {
+            return "pnl";
+        }
+        if position_sequence(&row.seq, empty).is_err() {
+            return "sequence";
+        }
+        if position_updated_at(&row.updated_time, empty).is_err() {
+            return "updated";
+        }
+    }
+    if sides != BTreeSet::from([PositionSide::Long, PositionSide::Short]) {
+        return "hedge_sides";
+    }
+    "unknown"
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1541,6 +1638,43 @@ fn positive_u64(value: &str) -> Result<u64, BybitError> {
         Ok(value)
     }
 }
+fn position_sequence(value: &str, empty_position: bool) -> Result<u64, BybitError> {
+    if empty_position && matches!(value, "" | "-1" | "0") {
+        Ok(0)
+    } else {
+        positive_u64(value)
+    }
+}
+fn position_updated_at(value: &str, empty_position: bool) -> Result<u64, BybitError> {
+    if empty_position && matches!(value, "" | "0") {
+        Ok(0)
+    } else {
+        positive_u64(value)
+    }
+}
+fn position_unrealized_pnl(value: &str, empty_position: bool) -> Result<Decimal, BybitError> {
+    if empty_position && value.is_empty() {
+        Ok(Decimal::ZERO)
+    } else {
+        decimal(value)
+    }
+}
+
+#[cfg(test)]
+mod empty_position_sentinel_tests {
+    use super::*;
+
+    #[test]
+    fn never_traded_sentinels_are_only_valid_for_empty_positions() {
+        assert_eq!(position_sequence("-1", true), Ok(0));
+        assert_eq!(position_updated_at("0", true), Ok(0));
+        assert_eq!(position_unrealized_pnl("", true), Ok(Decimal::ZERO));
+        assert_eq!(position_sequence("7", false), Ok(7));
+        assert!(position_sequence("-1", false).is_err());
+        assert!(position_updated_at("0", false).is_err());
+        assert!(position_unrealized_pnl("", false).is_err());
+    }
+}
 fn optional_price(value: &str) -> Result<Option<Price>, BybitError> {
     if value.is_empty() {
         Ok(None)
@@ -1558,6 +1692,31 @@ fn optional_field_price(value: &str) -> Result<FieldState<Price>, BybitError> {
 }
 fn decode<'a, T: Deserialize<'a>>(payload: &'a [u8]) -> Result<T, BybitError> {
     serde_json::from_slice(payload).map_err(|_| BybitError::Payload)
+}
+fn nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+fn string_or_integer<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Value {
+        Text(String),
+        Signed(i64),
+        Unsigned(u64),
+        Missing(Option<()>),
+    }
+    match Value::deserialize(deserializer)? {
+        Value::Text(value) => Ok(value),
+        Value::Signed(value) => Ok(value.to_string()),
+        Value::Unsigned(value) => Ok(value.to_string()),
+        Value::Missing(None | Some(())) => Ok(String::new()),
+    }
 }
 fn accepted<T>(envelope: &Envelope<T>) -> Result<(), BybitError> {
     if envelope.ret_code == 0 {
@@ -1654,6 +1813,7 @@ struct CoinRow {
 #[serde(rename_all = "camelCase")]
 struct Page<T> {
     category: String,
+    #[serde(default, deserialize_with = "nullable_string")]
     next_page_cursor: String,
     list: Vec<T>,
 }
@@ -1662,6 +1822,7 @@ struct Page<T> {
 #[serde(rename_all = "camelCase")]
 struct PositionRow {
     symbol: String,
+    #[serde(default, deserialize_with = "nullable_string")]
     side: String,
     size: String,
     avg_price: String,
@@ -1670,6 +1831,7 @@ struct PositionRow {
     unrealised_pnl: String,
     position_idx: u8,
     updated_time: String,
+    #[serde(default, deserialize_with = "string_or_integer")]
     seq: String,
 }
 

@@ -1,11 +1,17 @@
 use std::{
     ffi::{OsStr, OsString},
+    fs,
     path::{Component, Path, PathBuf},
     process::ExitCode,
 };
 
-use clap::Parser;
-use venue_domain::domain::Symbol;
+use clap::{Parser, Subcommand};
+use rust_decimal::Decimal;
+use venue_domain::domain::{
+    CancelCommand, CommandId, ExecutionCommand, OrderCommand, OrderOwner, OrderPurpose, OrderSide,
+    PositionSide, Price, Symbol,
+};
+use venue_execution::{AccountMutationHost, AccountPhysicalGateway};
 use venue_gateway_api::{CapabilityFlags, GatewayApiError, GatewayBinding, GatewayMode, VenueId};
 
 mod async_gateway;
@@ -68,6 +74,8 @@ const ARTIFACT_COMMANDS: [&str; 14] = [
     "grid-legacy-binance-bridge",
 ];
 const REQUIRED_NEW_VENUE_GATES: &str = "Owner, WAL, unique account writer fence, signed readback, UNKNOWN reconciliation, Stop/Flatten, and operator-confirmed Canary evidence";
+const LIVE_ARTIFACT_FILE_HARD_LIMIT_BYTES: u64 = 10 * 1024 * 1024;
+const LIVE_ARTIFACT_ROOT_FREEZE_BYTES: u64 = 240 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "venue-node", disable_version_flag = true)]
@@ -142,6 +150,15 @@ impl NodeLaunch {
         }
     }
 
+    pub fn live_mvp_command(&self) -> Result<LiveMvpCommand, NodeError> {
+        let arguments = std::iter::once(OsString::from("venue-live"))
+            .chain(self.runtime_arguments.iter().cloned());
+        let raw = RawLiveMvpArguments::try_parse_from(arguments)?;
+        let command = LiveMvpCommand::from_raw(raw.command, &self.binding)?;
+        validate_live_artifact_budget(&self.artifacts_base)?;
+        Ok(command)
+    }
+
     pub fn validate_runtime_scope(
         &self,
         trading_account_id: &str,
@@ -195,6 +212,132 @@ impl NodeLaunch {
             arguments.push(self.artifacts_root().into_os_string());
         }
         Ok(arguments)
+    }
+}
+
+#[derive(Debug, Parser)]
+struct RawLiveMvpArguments {
+    #[command(subcommand)]
+    command: RawLiveMvpCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum RawLiveMvpCommand {
+    /// Authenticated read-only startup plus account-WAL recovery; sends no mutation.
+    Preflight {
+        #[arg(long)]
+        confirm_live: String,
+    },
+    /// One post-only entry with a fixed 10 USDT nominal ceiling.
+    CanaryPlace {
+        #[arg(long)]
+        confirm_live: String,
+        #[arg(long)]
+        command_id: String,
+        #[arg(long)]
+        client_order_id: String,
+        #[arg(long, value_parser = parse_position_side)]
+        position_side: PositionSide,
+        #[arg(long)]
+        quantity: Decimal,
+        #[arg(long)]
+        limit_price: Decimal,
+    },
+    /// One exact cancel by the prior durable client identity.
+    CanaryCancel {
+        #[arg(long)]
+        confirm_live: String,
+        #[arg(long)]
+        command_id: String,
+        #[arg(long)]
+        target_client_order_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LiveMvpCommand {
+    Preflight,
+    Dispatch(Box<ExecutionCommand>),
+}
+
+impl LiveMvpCommand {
+    fn from_raw(raw: RawLiveMvpCommand, binding: &GatewayBinding) -> Result<Self, NodeError> {
+        match raw {
+            RawLiveMvpCommand::Preflight { confirm_live } => {
+                validate_live_confirmation(&confirm_live, binding.venue)?;
+                Ok(Self::Preflight)
+            }
+            RawLiveMvpCommand::CanaryPlace {
+                confirm_live,
+                command_id,
+                client_order_id,
+                position_side,
+                quantity,
+                limit_price,
+            } => {
+                validate_live_confirmation(&confirm_live, binding.venue)?;
+                let side = match position_side {
+                    PositionSide::Long => OrderSide::Buy,
+                    PositionSide::Short => OrderSide::Sell,
+                    PositionSide::Net => return Err(NodeError::LiveCommand),
+                };
+                let command = ExecutionCommand::PlaceLimit(OrderCommand {
+                    command_id: CommandId::new(command_id).map_err(|_| NodeError::LiveCommand)?,
+                    client_order_id: CommandId::new(client_order_id)
+                        .map_err(|_| NodeError::LiveCommand)?,
+                    owner: live_owner(binding, OrderPurpose::Entry),
+                    side,
+                    position_side,
+                    quantity,
+                    limit_price: Price::new(limit_price).map_err(|_| NodeError::LiveCommand)?,
+                    reduce_only: false,
+                });
+                command.validate().map_err(|_| NodeError::LiveCommand)?;
+                Ok(Self::Dispatch(Box::new(command)))
+            }
+            RawLiveMvpCommand::CanaryCancel {
+                confirm_live,
+                command_id,
+                target_client_order_id,
+            } => {
+                validate_live_confirmation(&confirm_live, binding.venue)?;
+                let command = ExecutionCommand::Cancel(CancelCommand {
+                    command_id: CommandId::new(command_id).map_err(|_| NodeError::LiveCommand)?,
+                    owner: live_owner(binding, OrderPurpose::Entry),
+                    target_client_order_id: CommandId::new(target_client_order_id)
+                        .map_err(|_| NodeError::LiveCommand)?,
+                });
+                command.validate().map_err(|_| NodeError::LiveCommand)?;
+                Ok(Self::Dispatch(Box::new(command)))
+            }
+        }
+    }
+}
+
+fn live_owner(binding: &GatewayBinding, purpose: OrderPurpose) -> OrderOwner {
+    OrderOwner {
+        strategy_instance_id: "canary".to_owned(),
+        run_id: "manual-canary".to_owned(),
+        exchange: binding.venue.as_str().to_owned(),
+        account: binding.trading_account_id.clone(),
+        symbol: binding.symbol.clone(),
+        purpose,
+    }
+}
+
+fn validate_live_confirmation(value: &str, venue: VenueId) -> Result<(), NodeError> {
+    if value == venue.as_str() {
+        Ok(())
+    } else {
+        Err(NodeError::LiveConfirmation)
+    }
+}
+
+fn parse_position_side(value: &str) -> Result<PositionSide, &'static str> {
+    match value {
+        "long" => Ok(PositionSide::Long),
+        "short" => Ok(PositionSide::Short),
+        _ => Err("position-side must be exactly long or short"),
     }
 }
 
@@ -272,6 +415,66 @@ pub fn report_result(program: &str, result: Result<(), NodeError>) -> ExitCode {
     }
 }
 
+pub fn load_root_dotenv() -> Result<(), NodeError> {
+    dotenvy::from_filename(".env")
+        .map(|_| ())
+        .map_err(|_| NodeError::Dotenv)
+}
+
+pub fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    for _ in 0..4 {
+        let Some(next) = source else {
+            break;
+        };
+        message.push_str(": ");
+        message.push_str(&next.to_string());
+        source = next.source();
+    }
+    message
+}
+
+pub fn run_live_mvp<G: AccountPhysicalGateway>(
+    launch: &NodeLaunch,
+    command: LiveMvpCommand,
+    gateway: G,
+) -> Result<(), NodeError> {
+    let venue = launch.binding().venue;
+    let mut host = AccountMutationHost::open(
+        launch.artifacts_root(),
+        launch.binding().clone(),
+        Decimal::TEN,
+        gateway,
+    )
+    .map_err(|error| NodeError::LiveHost {
+        venue,
+        message: error.to_string(),
+    })?;
+    match command {
+        LiveMvpCommand::Preflight => {
+            if host.has_unresolved() {
+                return Err(NodeError::LiveHost {
+                    venue,
+                    message: "signed recovery left an unresolved mutation".to_owned(),
+                });
+            }
+            println!("{venue} LIVE preflight passed; no mutation sent");
+            Ok(())
+        }
+        LiveMvpCommand::Dispatch(command) => {
+            let outcome = host
+                .dispatch(*command)
+                .map_err(|error| NodeError::LiveHost {
+                    venue,
+                    message: error.to_string(),
+                })?;
+            println!("{venue} LIVE dispatch outcome: {outcome:?}");
+            Ok(())
+        }
+    }
+}
+
 fn parse_exact_mode(raw: &str) -> Result<GatewayMode, &'static str> {
     match raw {
         "LIVE" => Ok(GatewayMode::Live),
@@ -286,6 +489,43 @@ fn validate_artifacts_base(path: &Path) -> Result<(), NodeError> {
             .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
     {
         return Err(NodeError::ArtifactsBase);
+    }
+    Ok(())
+}
+
+fn validate_live_artifact_budget(root: &Path) -> Result<(), NodeError> {
+    if !root.exists() {
+        return Ok(());
+    }
+    let mut total = 0_u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = fs::read_dir(&directory).map_err(|_| NodeError::ArtifactsBudget)?;
+        for entry in entries {
+            let entry = entry.map_err(|_| NodeError::ArtifactsBudget)?;
+            let file_type = entry.file_type().map_err(|_| NodeError::ArtifactsBudget)?;
+            if file_type.is_symlink() {
+                return Err(NodeError::ArtifactsBudget);
+            }
+            if file_type.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file() {
+                return Err(NodeError::ArtifactsBudget);
+            }
+            let size = entry
+                .metadata()
+                .map_err(|_| NodeError::ArtifactsBudget)?
+                .len();
+            if size > LIVE_ARTIFACT_FILE_HARD_LIMIT_BYTES {
+                return Err(NodeError::ArtifactsBudget);
+            }
+            total = total.checked_add(size).ok_or(NodeError::ArtifactsBudget)?;
+            if total >= LIVE_ARTIFACT_ROOT_FREEZE_BYTES {
+                return Err(NodeError::ArtifactsBudget);
+            }
+        }
     }
     Ok(())
 }
@@ -305,6 +545,8 @@ pub enum NodeError {
     Gateway(#[from] GatewayApiError),
     #[error("artifacts base must be an absolute lexical path without '.' or '..'")]
     ArtifactsBase,
+    #[error("LIVE artifacts exceed the 10 MiB file or 240 MiB freeze budget")]
+    ArtifactsBudget,
     #[error("fixed {0} node adapter isolation metadata is invalid")]
     AdapterIsolation(VenueId),
     #[error("node identity does not match the runtime configuration")]
@@ -313,6 +555,18 @@ pub enum NodeError {
         "runtime arguments must select exactly one fixed deployment command after '--' and must not contain --artifacts-root"
     )]
     RuntimeArguments,
+    #[error(
+        "LIVE command must be preflight, canary-place, or canary-cancel with valid bounded fields"
+    )]
+    LiveCommand,
+    #[error("--confirm-live must exactly match the lowercase venue id")]
+    LiveConfirmation,
+    #[error("{venue} production gateway preflight failed: {message}")]
+    LiveGateway { venue: VenueId, message: String },
+    #[error("{venue} account writer/WAL host failed closed: {message}")]
+    LiveHost { venue: VenueId, message: String },
+    #[error("root .env could not be loaded")]
+    Dotenv,
     #[error("{0} adapter advertised capability before the shared safety closure was integrated")]
     UnexpectedAdapterCapability(VenueId),
     #[error("{venue} {mode} node is fail-closed; missing {missing}")]
@@ -347,6 +601,13 @@ mod tests {
             OsString::from("--artifacts-base"),
             base().into_os_string(),
         ]
+    }
+
+    fn live_arguments(command: &[&str]) -> Vec<OsString> {
+        let mut raw = arguments("LIVE");
+        raw.push(OsString::from("--"));
+        raw.extend(command.iter().map(OsString::from));
+        raw
     }
 
     #[test]
@@ -424,5 +685,79 @@ mod tests {
                 Err(NodeError::UnexpectedAdapterCapability(rejected)) if rejected == venue
             ));
         }
+    }
+
+    #[test]
+    fn live_preflight_requires_exact_venue_confirmation() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let launch = NodeLaunch::try_parse_from(
+            VenueId::Bybit,
+            live_arguments(&["preflight", "--confirm-live", "bybit"]),
+        )?;
+        assert_eq!(launch.live_mvp_command()?, LiveMvpCommand::Preflight);
+
+        let rejected = NodeLaunch::try_parse_from(
+            VenueId::Bybit,
+            live_arguments(&["preflight", "--confirm-live", "okx"]),
+        )?;
+        assert!(matches!(
+            rejected.live_mvp_command(),
+            Err(NodeError::LiveConfirmation)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn live_place_builds_owner_bound_command() -> Result<(), Box<dyn std::error::Error>> {
+        let launch = NodeLaunch::try_parse_from(
+            VenueId::Okx,
+            live_arguments(&[
+                "canary-place",
+                "--confirm-live",
+                "okx",
+                "--command-id",
+                "cmd-1",
+                "--client-order-id",
+                "order-1",
+                "--position-side",
+                "long",
+                "--quantity",
+                "110",
+                "--limit-price",
+                "0.08503",
+            ]),
+        )?;
+        let LiveMvpCommand::Dispatch(command) = launch.live_mvp_command()? else {
+            return Err("expected place command".into());
+        };
+        let ExecutionCommand::PlaceLimit(command) = *command else {
+            return Err("expected place command".into());
+        };
+        assert_eq!(command.owner.exchange, "okx");
+        assert_eq!(command.owner.account, ACCOUNT);
+        assert_eq!(command.quantity, Decimal::from(110));
+        assert_eq!(command.limit_price.value(), Decimal::new(8503, 5));
+        Ok(())
+    }
+
+    #[test]
+    fn live_command_rejects_oversized_artifact_file() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let oversized = std::fs::File::create(temp.path().join("oversized.jsonl"))?;
+        oversized.set_len(LIVE_ARTIFACT_FILE_HARD_LIMIT_BYTES + 1)?;
+        let mut raw = arguments("LIVE");
+        raw[8] = temp.path().as_os_str().to_owned();
+        raw.extend([
+            OsString::from("--"),
+            OsString::from("preflight"),
+            OsString::from("--confirm-live"),
+            OsString::from("bybit"),
+        ]);
+        let launch = NodeLaunch::try_parse_from(VenueId::Bybit, raw)?;
+        assert!(matches!(
+            launch.live_mvp_command(),
+            Err(NodeError::ArtifactsBudget)
+        ));
+        Ok(())
     }
 }

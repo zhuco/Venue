@@ -12,8 +12,7 @@ use tokio_tungstenite::{
     tungstenite::{Message, protocol::WebSocketConfig},
 };
 
-#[cfg(test)]
-use crate::HyperliquidExchangeRequest;
+use crate::action::HyperliquidExchangeRequest;
 use crate::{
     HyperliquidConfig, HyperliquidError, HyperliquidInfoRequest, HyperliquidPrivateStreamBinding,
     HyperliquidPrivateStreamDecoder, HyperliquidPrivateSubscriptionKind, HyperliquidReadBinding,
@@ -116,7 +115,6 @@ impl HyperliquidHttpTransport {
     /// Dispatches exactly one already-signed request. The client policy is explicitly `never`, so
     /// timeout, disconnect, and 5xx results return to the WAL owner as UNKNOWN/rejected evidence
     /// instead of replaying a nonce behind its back.
-    #[cfg(test)]
     pub(crate) async fn post_exchange(
         &self,
         expected_binding: &HyperliquidReadBinding,

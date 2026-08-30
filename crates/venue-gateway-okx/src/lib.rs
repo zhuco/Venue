@@ -1,8 +1,8 @@
+mod account_gateway;
 mod binding;
 mod capability;
 mod config;
 mod credentials;
-#[cfg(test)]
 #[allow(dead_code)]
 mod execution;
 mod models;
@@ -21,6 +21,7 @@ mod transport;
 use venue_domain::domain::{FieldState, Fill};
 use venue_gateway_api::CapabilityFlags;
 
+pub use account_gateway::{OkxAccountGateway, OkxAccountGatewayError};
 pub use binding::{OkxGatewayBinding, OkxGatewayBindingError};
 #[cfg(test)]
 pub(crate) use capability::validate_mutation_capability_fixture;
@@ -36,10 +37,10 @@ pub use credentials::OkxCredentials;
 #[cfg(test)]
 pub(crate) use execution::{
     OkxAcceptedCancel, OkxAcceptedOrder, OkxCancelRequest, OkxExecutionScope, OkxOrderReadback,
-    OkxOrderReadbackRequest, OkxPlaceIntent, OkxPlaceRequest, OkxPrivateRequest,
-    OkxUnknownCancelReadbackRequest, OkxUnknownCancelResolution, OkxUnknownOrderReadback,
-    OkxUnknownOrderReadbackRequest, build_cancel_order_readback_request, build_cancel_request,
-    build_order_readback_request, build_place_request, build_unknown_cancel_readback_request,
+    OkxOrderReadbackRequest, OkxPlaceIntent, OkxPlaceRequest, OkxUnknownCancelReadbackRequest,
+    OkxUnknownCancelResolution, OkxUnknownOrderReadback, OkxUnknownOrderReadbackRequest,
+    build_cancel_order_readback_request, build_cancel_request, build_order_readback_request,
+    build_place_request, build_unknown_cancel_readback_request,
     build_unknown_order_readback_request_after, parse_cancel_ack, parse_order_detail,
     parse_place_ack, parse_unknown_cancel_readback, parse_unknown_order_readback,
 };
@@ -59,7 +60,7 @@ pub use private_ws::{
     build_private_subscribe, build_ws_login, parse_ws_account, parse_ws_login_ack, parse_ws_orders,
     parse_ws_positions,
 };
-pub use public::{OkxInstrument, parse_bbo, parse_instrument};
+pub use public::{OkxInstrument, OkxNotionalSize, parse_bbo, parse_instrument};
 pub use readback::{
     OKX_PRIVATE_MAX_PAGES, OKX_PRIVATE_PAGE_LIMIT, OKX_PRIVATE_READBACK_SCHEMA_VERSION,
     OkxAlgoOrderKind, OkxCanonicalOrder, OkxOrderFamilyReadback, OkxPositionFact,

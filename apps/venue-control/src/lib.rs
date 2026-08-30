@@ -11,6 +11,7 @@ mod copy_postgres;
 mod copy_repository;
 mod copy_worker;
 mod http;
+mod indicator_projection;
 mod model;
 mod postgres;
 mod repository;
@@ -39,7 +40,14 @@ pub use copy_worker::{
     CopyPlanningSnapshot, CopySemanticJob, CopyWorker, CopyWorkerConfig, CopyWorkerError,
     FrozenCapitalSnapshot, MIGRATION_0003, PlannedCopyJob,
 };
-pub use http::{ControlHttpConfig, HttpServerError, control_shutdown_channel, serve_local};
+pub use http::{
+    ControlHttpConfig, HttpServerError, control_shutdown_channel, serve_local,
+    serve_local_with_indicators,
+};
+pub use indicator_projection::{
+    IndicatorProjectionError, IndicatorProjectionStore, IndicatorProjector,
+    MAX_INDICATOR_EVENT_PAGE, StoredIndicatorEvent,
+};
 pub use model::{AccountNodeBinding, ClaimedCommand, ScopedCommandReceipt, StoredEvent};
 pub use postgres::{MIGRATION_0001, MIGRATION_0005, PgControlRepository};
 pub use repository::{

@@ -17,9 +17,11 @@ use tokio_tungstenite::{
 };
 use venue_gateway_api::GatewayBinding;
 
+use crate::execution::OkxPrivateRequest;
+
 #[cfg(test)]
 use crate::{
-    OkxAcceptedCancel, OkxAcceptedOrder, OkxCancelRequest, OkxPlaceRequest, OkxPrivateRequest,
+    OkxAcceptedCancel, OkxAcceptedOrder, OkxCancelRequest, OkxPlaceRequest,
     OkxUnknownCancelReadbackRequest, OkxUnknownOrderReadbackRequest,
     build_unknown_cancel_readback_request, build_unknown_order_readback_request_after,
     parse_cancel_ack, parse_place_ack,
@@ -162,7 +164,6 @@ impl OkxHttpTransport {
         })
     }
 
-    #[cfg(test)]
     pub(crate) async fn execute<R: OkxPrivateRequest + ?Sized>(
         &self,
         credentials: &OkxCredentials,
@@ -186,6 +187,50 @@ impl OkxHttpTransport {
             &signed,
         )
         .await
+    }
+
+    pub(crate) async fn fetch_instrument(
+        &self,
+        generation: u64,
+    ) -> Result<OkxHttpResponse, OkxTransportError> {
+        if generation == 0 {
+            return Err(OkxTransportError::Binding);
+        }
+        let symbol = &self.config.gateway_binding().symbol;
+        let native = format!("{}-{}-SWAP", symbol.base(), symbol.quote());
+        let path = format!(
+            "{}?instType=SWAP&instId={native}",
+            crate::endpoints::INSTRUMENTS
+        );
+        let response = timeout(
+            self.operation_timeout,
+            self.client.get(format!("{}{}", self.origin, path)).send(),
+        )
+        .await
+        .map_err(|_| OkxTransportError::Timeout)?
+        .map_err(|error| {
+            if error.is_timeout() {
+                OkxTransportError::Timeout
+            } else {
+                OkxTransportError::Http
+            }
+        })?;
+        if !response.status().is_success() {
+            return Err(OkxTransportError::HttpStatus(response.status().as_u16()));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > self.max_body_bytes as u64)
+        {
+            return Err(OkxTransportError::BodyTooLarge);
+        }
+        let body = read_bounded_body(response, self.operation_timeout, self.max_body_bytes).await?;
+        Ok(OkxHttpResponse {
+            binding: self.config.gateway_binding().clone(),
+            instrument_generation: generation,
+            received_at_ms: received_at_ms()?,
+            body,
+        })
     }
 
     /// Executes a request-bound authenticated read. This does not collect pages or grant any
@@ -325,7 +370,6 @@ impl OkxHttpTransport {
         }
         let method = match method {
             "GET" => Method::GET,
-            #[cfg(test)]
             "POST" => Method::POST,
             _ => return Err(OkxTransportError::Configuration),
         };

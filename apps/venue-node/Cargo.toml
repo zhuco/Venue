@@ -58,7 +58,9 @@ required-features = ["okx"]
 
 [dependencies]
 clap.workspace = true
+dotenvy = "0.15"
 reqwest.workspace = true
+rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -78,7 +80,6 @@ venue-runtime = { path = "../../crates/venue-runtime" }
 venue-storage = { path = "../../crates/venue-storage" }
 
 [dev-dependencies]
-rust_decimal.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 

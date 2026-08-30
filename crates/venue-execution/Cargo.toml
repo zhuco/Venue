@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 fs2 = "0.4"
+rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -15,7 +16,6 @@ venue-domain = { path = "../venue-domain" }
 venue-gateway-api = { path = "../venue-gateway-api" }
 
 [dev-dependencies]
-rust_decimal.workspace = true
 tempfile.workspace = true
 
 [lints.rust]

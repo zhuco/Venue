@@ -16,6 +16,7 @@ mod public;
 mod recovery;
 mod recovery_session;
 mod risk;
+mod runtime_recovery;
 mod sign;
 mod transport;
 
@@ -59,6 +60,12 @@ pub use risk::{
     decimal_value, dual_position_side, object, parse_dual_position_mode, parse_risk_snapshots,
     parse_risk_snapshots_with_unified, requires_unified_single_currency, text,
     validate_risk_readback_window,
+};
+pub(crate) use runtime_recovery::GateRuntimeRecoveryAwaitGuard;
+pub use runtime_recovery::{
+    GateRuntimeOrderProfile, GateRuntimePositionMode, GateRuntimeRecoveryBundle,
+    GateRuntimeRecoveryRegistration, GateRuntimeRecoveryRevalidator, GateRuntimeRecoveryScope,
+    GateRuntimeRecoveryScopeInput, GateRuntimeStructuredUnknown,
 };
 pub use sign::{
     GatePrivateChannel, GateRestSignedHeaders, GateWebSocketAuth, sign_rest,

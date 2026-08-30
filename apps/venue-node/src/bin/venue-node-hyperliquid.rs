@@ -1,4 +1,4 @@
-use std::process::ExitCode;
+use std::{process::ExitCode, time::Duration};
 
 #[cfg(test)]
 use std::collections::BTreeSet;
@@ -18,12 +18,13 @@ use venue_gateway_hyperliquid::{
     HyperliquidPayloadScope,
 };
 use venue_gateway_hyperliquid::{
-    HyperliquidConfig, HyperliquidGatewayBinding, HyperliquidNodeCandidate, capabilities,
+    HyperliquidAccountGateway, HyperliquidConfig, HyperliquidGatewayBinding,
+    HyperliquidNodeCandidate,
 };
 use venue_node::{
     AdapterIsolation, DispatchPermit, GatewayDispatchResult, GatewayRecoveryPermit, NodeError,
-    NodeLaunch, PhysicalGateway, SignedReadbackReceipt, SignedReadbackRequest,
-    reject_unintegrated_runtime, report_result,
+    NodeLaunch, PhysicalGateway, SignedReadbackReceipt, SignedReadbackRequest, error_chain,
+    load_root_dotenv, report_result, run_live_mvp,
 };
 use venue_runtime::account::PhysicalRecoveryReadbackManifest;
 #[cfg(test)]
@@ -42,7 +43,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), NodeError> {
     let launch = NodeLaunch::from_environment(VenueId::Hyperliquid)?;
-    launch.require_no_runtime_arguments()?;
+    let command = launch.live_mvp_command()?;
     let binding = HyperliquidGatewayBinding::new(launch.binding().clone())
         .map_err(|_| NodeError::AdapterIsolation(VenueId::Hyperliquid))?;
     let adapter = HyperliquidConfig::for_binding(&binding);
@@ -60,25 +61,31 @@ fn run() -> Result<(), NodeError> {
         account_binding: "usdc_perpetual_api_wallet",
     }
     .validate(launch.binding())?;
-    let _isolated_artifacts_root = launch.artifacts_root();
-    let candidate_bridge = HyperliquidPhysicalGatewayCandidate::new(launch.binding().clone(), None)
-        .map_err(|_| NodeError::AdapterIsolation(VenueId::Hyperliquid))?;
-    let advertised = candidate_bridge.capability_snapshot();
-    if !advertised.flags.is_empty() || candidate_bridge.persisted_probe_candidate().is_some() {
-        return Err(NodeError::UnexpectedAdapterCapability(VenueId::Hyperliquid));
-    }
-    reject_unintegrated_runtime(VenueId::Hyperliquid, launch.binding().mode, capabilities())
+    load_root_dotenv()?;
+    let gateway = HyperliquidAccountGateway::connect_from_environment(
+        launch.binding().clone(),
+        launch.artifacts_root().join("nonce.json"),
+        Duration::from_secs(10),
+        2 * 1024 * 1024,
+    )
+    .map_err(|error| NodeError::LiveGateway {
+        venue: VenueId::Hyperliquid,
+        message: error_chain(&error),
+    })?;
+    run_live_mvp(&launch, command, gateway)
 }
 
 /// Fixed-binary adapter boundary. A persisted probe can be attached for validation and action
 /// preparation, but the `PhysicalGateway` view remains closed until the shared host can explicitly
 /// promote candidate evidence and drive the async readback/action surfaces without bypassing its
 /// Control, Owner, WAL, writer and Canary sequence.
+#[allow(dead_code)]
 struct HyperliquidPhysicalGatewayCandidate {
     binding: GatewayBinding,
     persisted_probe: Option<HyperliquidNodeCandidate>,
 }
 
+#[allow(dead_code)]
 impl HyperliquidPhysicalGatewayCandidate {
     fn new(
         binding: GatewayBinding,
@@ -717,6 +724,7 @@ impl PhysicalGateway for HyperliquidPhysicalGatewayCandidate {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[allow(dead_code)]
 enum HyperliquidBridgeError {
     #[error("Hyperliquid fixed-node bridge binding does not match the launch scope")]
     Binding,

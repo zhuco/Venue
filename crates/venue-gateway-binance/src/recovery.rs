@@ -16,11 +16,11 @@ use crate::private::{
 };
 use crate::{
     BINANCE_EXECUTION_PROFILE_VERSION, BinanceConfig, BinanceCredentials, BinanceHttpTransport,
-    BinanceInstrumentRules, BinancePrivateReadScope, BinancePrivateReadbackCandidate,
-    BinancePrivateSurface, BinanceRawPrivatePage, build_account_config_request,
-    build_account_request, build_algo_orders_request, build_fills_request,
-    build_position_mode_request, build_positions_request, build_regular_orders_request,
-    complete_private_readback,
+    BinanceInstrumentRules, BinancePositionMode, BinancePrivateReadScope,
+    BinancePrivateReadbackCandidate, BinancePrivateSurface, BinanceRawPrivatePage,
+    build_account_config_request, build_account_request, build_algo_orders_request,
+    build_fills_request, build_position_mode_request, build_positions_request,
+    build_regular_orders_request, complete_private_readback,
 };
 
 const RECOVERY_FACES: [BinanceRecoveryFace; 6] = [
@@ -59,32 +59,37 @@ impl BinanceRecoveryFace {
     }
 }
 
-/// Opaque journal commitments captured before any recovery request is issued. These values do not
-/// open the journals or confer mutation authority.
+/// Runtime commitments captured before any recovery request is issued. These are digest-only
+/// evidence anchors: they neither open durable state nor confer writer or mutation authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BinanceRecoveryAuthorityRoots {
+pub struct BinanceRuntimeRecoveryCommitments {
     owner: [u8; 32],
     wal: [u8; 32],
     unknown: [u8; 32],
+    runtime_scope_sha256: [u8; 32],
 }
 
-impl BinanceRecoveryAuthorityRoots {
-    #[cfg(test)]
+impl BinanceRuntimeRecoveryCommitments {
+    /// Creates a digest-only handoff value. The shared Runtime must compare all four digests with
+    /// its sealed session before admitting a bundle; this adapter never treats caller input as
+    /// writer, WAL, or recovery authority.
     pub fn verified(
         owner: [u8; 32],
         wal: [u8; 32],
         unknown: [u8; 32],
+        runtime_scope_sha256: [u8; 32],
     ) -> Result<Self, BinanceRecoveryCollectorError> {
-        if [owner, wal, unknown]
+        if [owner, wal, unknown, runtime_scope_sha256]
             .iter()
             .any(|digest| digest.iter().all(|byte| *byte == 0))
         {
-            return Err(BinanceRecoveryCollectorError::AuthorityRoot);
+            return Err(BinanceRecoveryCollectorError::RuntimeCommitment);
         }
         Ok(Self {
             owner,
             wal,
             unknown,
+            runtime_scope_sha256,
         })
     }
 
@@ -102,6 +107,18 @@ impl BinanceRecoveryAuthorityRoots {
     pub const fn unknown(&self) -> &[u8; 32] {
         &self.unknown
     }
+
+    #[must_use]
+    pub const fn runtime_scope_sha256(&self) -> &[u8; 32] {
+        &self.runtime_scope_sha256
+    }
+}
+
+/// Runtime-owned freshness probe used only while collecting authenticated read evidence. The
+/// adapter compares this digest after every network await; the probe cannot grant capability,
+/// writer ownership, WAL access, or a dispatch permit.
+pub trait BinanceRuntimeRecoveryScopeProbe: Send + Sync {
+    fn current_runtime_scope_sha256(&self) -> [u8; 32];
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,7 +132,7 @@ pub struct BinanceRecoveryScopeInput {
     pub deadline_at_ms: u64,
     pub maximum_total_bytes: usize,
     pub maximum_total_pages: u32,
-    pub authority_roots: Option<BinanceRecoveryAuthorityRoots>,
+    pub runtime_commitments: BinanceRuntimeRecoveryCommitments,
     pub symbol_universe: BTreeSet<Symbol>,
 }
 
@@ -139,7 +156,7 @@ pub struct BinanceRecoveryCollectionScope {
     deadline_at_ms: u64,
     maximum_total_bytes: usize,
     maximum_total_pages: u32,
-    authority_roots: Option<BinanceRecoveryAuthorityRoots>,
+    runtime_commitments: BinanceRuntimeRecoveryCommitments,
     symbol_universe: BTreeSet<Symbol>,
     commitment_sha256: [u8; 32],
 }
@@ -149,18 +166,14 @@ impl BinanceRecoveryCollectionScope {
         config: &BinanceConfig,
         input: BinanceRecoveryScopeInput,
     ) -> Result<Self, BinanceRecoveryCollectorError> {
-        Self::verified_inner(config, input, false)
+        Self::verified_inner(config, input)
     }
 
     fn verified_inner(
         config: &BinanceConfig,
         input: BinanceRecoveryScopeInput,
-        allow_fixture_authority: bool,
     ) -> Result<Self, BinanceRecoveryCollectorError> {
         let binding = config.gateway_binding();
-        if input.authority_roots.is_some() && !allow_fixture_authority {
-            return Err(BinanceRecoveryCollectorError::AuthorityRoot);
-        }
         if !valid_config_digest(&input.config_digest)
             || input.config_epoch == 0
             || input.private_generation <= input.recovered_private_generation
@@ -202,7 +215,7 @@ impl BinanceRecoveryCollectionScope {
             deadline_at_ms: input.deadline_at_ms,
             maximum_total_bytes: input.maximum_total_bytes,
             maximum_total_pages: input.maximum_total_pages,
-            authority_roots: input.authority_roots,
+            runtime_commitments: input.runtime_commitments,
             symbol_universe: input.symbol_universe,
             commitment_sha256,
         })
@@ -264,8 +277,8 @@ impl BinanceRecoveryCollectionScope {
     }
 
     #[must_use]
-    pub const fn authority_roots(&self) -> Option<&BinanceRecoveryAuthorityRoots> {
-        self.authority_roots.as_ref()
+    pub const fn runtime_commitments(&self) -> &BinanceRuntimeRecoveryCommitments {
+        &self.runtime_commitments
     }
 
     #[must_use]
@@ -288,7 +301,6 @@ pub struct BinanceRecoveryOwnerRoute {
 }
 
 impl BinanceRecoveryOwnerRoute {
-    #[cfg(test)]
     pub fn verified(
         family: NativeOrderFamily,
         venue_order_id: impl Into<String>,
@@ -448,7 +460,9 @@ impl<'a> BinanceAuthenticatedCollectorSession<'a> {
         request_universe_sha256: [u8; 32],
         consumed_bytes: usize,
         consumed_pages: u32,
+        runtime_scope_probe: Option<&dyn BinanceRuntimeRecoveryScopeProbe>,
     ) -> Result<Self, BinanceRecoveryCollectorError> {
+        validate_runtime_scope_probe(scope, runtime_scope_probe)?;
         validate_source_scope(scope, &source)?;
         if consumed_pages >= scope.maximum_total_pages {
             return Err(BinanceRecoveryCollectorError::PageLimit);
@@ -477,6 +491,7 @@ impl<'a> BinanceAuthenticatedCollectorSession<'a> {
                 error
             }
         })?;
+        validate_runtime_scope_probe(scope, runtime_scope_probe)?;
         validate_authenticated_page(scope, source.transport, &read_scope, &authenticated_account)?;
         let account_payload = std::str::from_utf8(&authenticated_account.payload)
             .map_err(|_| BinanceRecoveryCollectorError::Authentication)?;
@@ -516,7 +531,9 @@ impl<'a> BinanceAuthenticatedCollectorSession<'a> {
         &mut self,
         scope: &BinanceRecoveryCollectionScope,
         request: crate::BinancePrivateReadRequest,
+        runtime_scope_probe: Option<&dyn BinanceRuntimeRecoveryScopeProbe>,
     ) -> Result<BinanceRawPrivatePage, BinanceRecoveryCollectorError> {
+        validate_runtime_scope_probe(scope, runtime_scope_probe)?;
         self.validate(scope)?;
         self.preflight_page_budget(scope)?;
         if request.scope() != &self.read_scope {
@@ -529,6 +546,7 @@ impl<'a> BinanceAuthenticatedCollectorSession<'a> {
             scope.deadline_at_ms,
         )
         .await?;
+        validate_runtime_scope_probe(scope, runtime_scope_probe)?;
         self.validate(scope)?;
         validate_authenticated_page(scope, self.source.transport, &self.read_scope, &page)?;
         Ok(page)
@@ -600,6 +618,7 @@ impl<'a> BinanceAuthenticatedCollectorSession<'a> {
     async fn collect_remaining(
         &mut self,
         scope: &BinanceRecoveryCollectionScope,
+        runtime_scope_probe: Option<&dyn BinanceRuntimeRecoveryScopeProbe>,
     ) -> Result<(), BinanceRecoveryCollectorError> {
         for request in [
             build_account_config_request(&self.read_scope),
@@ -609,15 +628,16 @@ impl<'a> BinanceAuthenticatedCollectorSession<'a> {
             build_algo_orders_request(&self.read_scope),
         ] {
             let request = request.map_err(|_| BinanceRecoveryCollectorError::RequestUniverse)?;
-            let page = self.read(scope, request).await?;
+            let page = self.read(scope, request, runtime_scope_probe).await?;
             self.push_page(scope, page)?;
         }
-        self.collect_fills(scope).await
+        self.collect_fills(scope, runtime_scope_probe).await
     }
 
     async fn collect_fills(
         &mut self,
         scope: &BinanceRecoveryCollectionScope,
+        runtime_scope_probe: Option<&dyn BinanceRuntimeRecoveryScopeProbe>,
     ) -> Result<(), BinanceRecoveryCollectorError> {
         let mut cursor = self.source.initial_fills_cursor;
         let mut window_start = cursor.observed_through_ms;
@@ -654,7 +674,7 @@ impl<'a> BinanceAuthenticatedCollectorSession<'a> {
                     window_end,
                 )
                 .map_err(|_| BinanceRecoveryCollectorError::Cursor)?;
-                let page = self.read(scope, request).await?;
+                let page = self.read(scope, request, runtime_scope_probe).await?;
                 let payload = std::str::from_utf8(&page.payload)
                     .map_err(|_| BinanceRecoveryCollectorError::Cursor)?;
                 let (_, terminal) = advance_recent_fills_page::<BinanceRecoveryCollectorError>(
@@ -781,6 +801,86 @@ pub struct BinanceFreshRecoveryCandidate {
     projection_commitment_sha256: [u8; 32],
 }
 
+/// Complete Binance collection evidence that can be consumed by the shared Runtime bridge.
+/// Construction rejects every unresolved custody record, so a returned bundle cannot silently
+/// turn an unknown or unmanaged order into a recoverable owned order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceRuntimeRecoveryBundle {
+    candidate: BinanceFreshRecoveryCandidate,
+    position_mode: BinancePositionMode,
+}
+
+impl BinanceRuntimeRecoveryBundle {
+    #[must_use]
+    pub const fn scope(&self) -> &BinanceRecoveryCollectionScope {
+        self.candidate.scope()
+    }
+
+    #[must_use]
+    pub fn projections(&self) -> &[BinanceRecoverySymbolProjection] {
+        self.candidate.projections()
+    }
+
+    #[must_use]
+    pub fn faces(&self) -> &[BinanceRecoveryFaceCommitment] {
+        self.candidate.faces()
+    }
+
+    #[must_use]
+    pub const fn request_universe_sha256(&self) -> &[u8; 32] {
+        self.candidate.request_universe_sha256()
+    }
+
+    #[must_use]
+    pub const fn projection_commitment_sha256(&self) -> &[u8; 32] {
+        self.candidate.projection_commitment_sha256()
+    }
+
+    #[must_use]
+    pub const fn attempt_id(&self) -> u64 {
+        self.candidate.scope.attempt_id
+    }
+
+    #[must_use]
+    pub const fn private_generation(&self) -> u64 {
+        self.candidate.scope.private_generation
+    }
+
+    #[must_use]
+    pub const fn deadline_at_ms(&self) -> u64 {
+        self.candidate.scope.deadline_at_ms
+    }
+
+    #[must_use]
+    pub const fn completed_at_ms(&self) -> u64 {
+        self.candidate.completed_at_ms
+    }
+
+    #[must_use]
+    pub const fn symbol_universe(&self) -> &BTreeSet<Symbol> {
+        self.candidate.scope.symbol_universe()
+    }
+
+    #[must_use]
+    pub fn position_mode(&self) -> BinancePositionMode {
+        self.position_mode
+    }
+
+    #[must_use]
+    pub const fn execution_profile_version(&self) -> u64 {
+        BINANCE_EXECUTION_PROFILE_VERSION
+    }
+
+    pub fn verify_fresh(
+        &self,
+        expected_scope: &BinanceRecoveryCollectionScope,
+        observed_at_ms: u64,
+    ) -> Result<(), BinanceRecoveryCollectorError> {
+        self.candidate
+            .verify_runtime_bundle(expected_scope, observed_at_ms)
+    }
+}
+
 impl BinanceFreshRecoveryCandidate {
     #[must_use]
     pub const fn scope(&self) -> &BinanceRecoveryCollectionScope {
@@ -838,6 +938,43 @@ impl BinanceFreshRecoveryCandidate {
         }
         Ok(())
     }
+
+    /// Converts fresh raw collection evidence into the only form exposed to the shared Runtime
+    /// bridge. Unknown regular or Algo custody is intentionally terminal for this attempt.
+    pub fn into_runtime_bundle(
+        self,
+        expected_scope: &BinanceRecoveryCollectionScope,
+        observed_at_ms: u64,
+    ) -> Result<BinanceRuntimeRecoveryBundle, BinanceRecoveryCollectorError> {
+        self.verify_runtime_bundle(expected_scope, observed_at_ms)?;
+        let position_mode = self
+            .projections
+            .first()
+            .ok_or(BinanceRecoveryCollectorError::SymbolUniverse)?
+            .private
+            .position_mode();
+        Ok(BinanceRuntimeRecoveryBundle {
+            candidate: self,
+            position_mode,
+        })
+    }
+
+    fn verify_runtime_bundle(
+        &self,
+        expected_scope: &BinanceRecoveryCollectionScope,
+        observed_at_ms: u64,
+    ) -> Result<(), BinanceRecoveryCollectorError> {
+        self.verify_fresh(expected_scope, observed_at_ms)?;
+        if self.projections.iter().any(|projection| {
+            projection
+                .order_custody
+                .iter()
+                .any(|custody| matches!(custody, BinanceRecoveryOrderCustody::Unknown { .. }))
+        }) {
+            return Err(BinanceRecoveryCollectorError::UnmanagedOrder);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -852,10 +989,31 @@ impl BinanceFreshRecoveryCollector {
         credentials: &'a BinanceCredentials,
         sources: Vec<BinanceRecoverySymbolSource<'a>>,
     ) -> Result<BinanceFreshRecoveryCandidate, BinanceRecoveryCollectorError> {
-        if scope.authority_roots.is_some() {
-            return Err(BinanceRecoveryCollectorError::AuthorityRoot);
-        }
-        Self::collect_authenticated_inner(scope, credentials, sources, Vec::new()).await
+        Self::collect_authenticated_inner(scope, credentials, sources, Vec::new(), None).await
+    }
+
+    /// Collects the production Runtime bridge in one bounded authenticated turn. Durable Owner
+    /// routes are inputs to custody verification only; neither they nor the Runtime scope probe
+    /// grant this adapter a mutation capability.
+    pub async fn collect_runtime_bundle_authenticated<'a>(
+        scope: BinanceRecoveryCollectionScope,
+        credentials: &'a BinanceCredentials,
+        sources: Vec<BinanceRecoverySymbolSource<'a>>,
+        owner_routes: Vec<BinanceRecoveryOwnerRoute>,
+        runtime_scope_probe: &dyn BinanceRuntimeRecoveryScopeProbe,
+    ) -> Result<BinanceRuntimeRecoveryBundle, BinanceRecoveryCollectorError> {
+        let expected_scope = scope.clone();
+        let candidate = Self::collect_authenticated_inner(
+            scope,
+            credentials,
+            sources,
+            owner_routes,
+            Some(runtime_scope_probe),
+        )
+        .await?;
+        let observed_at_ms = unix_ms()?;
+        validate_runtime_scope_probe(&expected_scope, Some(runtime_scope_probe))?;
+        candidate.into_runtime_bundle(&expected_scope, observed_at_ms)
     }
 
     async fn collect_authenticated_inner<'a>(
@@ -863,6 +1021,7 @@ impl BinanceFreshRecoveryCollector {
         credentials: &'a BinanceCredentials,
         mut sources: Vec<BinanceRecoverySymbolSource<'a>>,
         mut owner_routes: Vec<BinanceRecoveryOwnerRoute>,
+        runtime_scope_probe: Option<&dyn BinanceRuntimeRecoveryScopeProbe>,
     ) -> Result<BinanceFreshRecoveryCandidate, BinanceRecoveryCollectorError> {
         validate_owner_routes(&scope, &owner_routes)?;
         owner_routes.sort_by(|left, right| owner_route_key(left).cmp(&owner_route_key(right)));
@@ -892,14 +1051,18 @@ impl BinanceFreshRecoveryCollector {
                 request_universe_sha256,
                 total_bytes,
                 total_pages,
+                runtime_scope_probe,
             )
             .await?;
-            session.collect_remaining(&scope).await?;
+            session
+                .collect_remaining(&scope, runtime_scope_probe)
+                .await?;
             total_bytes = session.total_bytes;
             total_pages = session.total_pages;
             replays.push(session.into_replay());
         }
         let completed_at_ms = unix_ms()?;
+        validate_runtime_scope_probe(&scope, runtime_scope_probe)?;
         let candidate = build_candidate(scope, owner_routes, completed_at_ms, replays)?;
         if candidate.request_universe_sha256 != request_universe_sha256 {
             return Err(BinanceRecoveryCollectorError::RequestUniverse);
@@ -925,7 +1088,7 @@ impl BinanceFreshRecoveryCollector {
                 transport, rules, cursor, target, true,
             )?);
         }
-        Self::collect_authenticated_inner(scope, credentials, sources, owner_routes).await
+        Self::collect_authenticated_inner(scope, credentials, sources, owner_routes, None).await
     }
 
     #[cfg(test)]
@@ -1106,6 +1269,18 @@ fn unix_ms() -> Result<u64, BinanceRecoveryCollectorError> {
         .map_err(|_| BinanceRecoveryCollectorError::Clock)?
         .as_millis();
     u64::try_from(millis).map_err(|_| BinanceRecoveryCollectorError::Clock)
+}
+
+fn validate_runtime_scope_probe(
+    scope: &BinanceRecoveryCollectionScope,
+    runtime_scope_probe: Option<&dyn BinanceRuntimeRecoveryScopeProbe>,
+) -> Result<(), BinanceRecoveryCollectorError> {
+    if runtime_scope_probe.is_some_and(|probe| {
+        probe.current_runtime_scope_sha256() != *scope.runtime_commitments.runtime_scope_sha256()
+    }) {
+        return Err(BinanceRecoveryCollectorError::RuntimeScopeDrift);
+    }
+    Ok(())
 }
 
 fn validate_replay_scope(
@@ -1478,15 +1653,13 @@ fn scope_commitment(
     ] {
         commit_u64(&mut digest, value);
     }
-    match &input.authority_roots {
-        Some(roots) => {
-            commit_bytes(&mut digest, &[1]);
-            commit_bytes(&mut digest, roots.owner());
-            commit_bytes(&mut digest, roots.wal());
-            commit_bytes(&mut digest, roots.unknown());
-        }
-        None => commit_bytes(&mut digest, &[0]),
-    }
+    commit_bytes(&mut digest, input.runtime_commitments.owner());
+    commit_bytes(&mut digest, input.runtime_commitments.wal());
+    commit_bytes(&mut digest, input.runtime_commitments.unknown());
+    commit_bytes(
+        &mut digest,
+        input.runtime_commitments.runtime_scope_sha256(),
+    );
     for symbol in &input.symbol_universe {
         commit_str(&mut digest, &symbol.to_string());
     }
@@ -1664,8 +1837,10 @@ fn commit_bytes(digest: &mut Sha256, value: &[u8]) {
 pub enum BinanceRecoveryCollectorError {
     #[error("Binance recovery scope is incomplete or invalid")]
     Scope,
-    #[error("Binance recovery Owner, WAL, and Unknown roots must be nonzero")]
-    AuthorityRoot,
+    #[error("Binance recovery Runtime scope, Owner, WAL, and Unknown commitments must be nonzero")]
+    RuntimeCommitment,
+    #[error("Binance recovery Runtime scope changed during an authenticated collection await")]
+    RuntimeScopeDrift,
     #[error("Binance recovery Owner route is invalid, ambiguous, or out of scope")]
     OwnerRoute,
     #[error("Binance recovery symbol universe is incomplete or duplicated")]
@@ -1698,6 +1873,8 @@ pub enum BinanceRecoveryCollectorError {
     ProjectionCommitment,
     #[error("Binance recovery candidate was relabelled under another scope")]
     Relabelled,
+    #[error("Binance recovery contains an unknown or unmanaged regular/Algo order")]
+    UnmanagedOrder,
     #[error("Binance recovery candidate is stale or outside its collection deadline")]
     Expired,
 }

@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     process::ExitCode,
+    time::Duration,
 };
 
 #[cfg(test)]
@@ -9,6 +10,11 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use venue_gateway_api::{CapabilityFlags, CapabilitySnapshot, GatewayBinding, VenueId};
 #[cfg(test)]
+use venue_gateway_bybit::capabilities;
+use venue_gateway_bybit::{
+    BybitAccountGateway, BybitGatewayBinding, BybitSynchronousPhysicalSession, BybitTransportLimits,
+};
+#[cfg(test)]
 use venue_gateway_bybit::{
     BybitCapabilityCandidate, BybitCompleteOrderFamilyEvidence, BybitError,
     BybitOrderFamilyEvidence, BybitPositionPage, BybitPrivateSource,
@@ -16,11 +22,10 @@ use venue_gateway_bybit::{
     complete_position_pages, parse_position_page, validate_capability_candidate,
     validate_order_family_candidate,
 };
-use venue_gateway_bybit::{BybitGatewayBinding, BybitSynchronousPhysicalSession, capabilities};
 use venue_node::{
     AdapterIsolation, DispatchPermit, GatewayDispatchResult, GatewayRecoveryPermit, NodeError,
-    NodeLaunch, PhysicalGateway, SignedReadbackReceipt, SignedReadbackRequest,
-    reject_unintegrated_runtime, report_result,
+    NodeLaunch, PhysicalGateway, SignedReadbackReceipt, SignedReadbackRequest, error_chain,
+    load_root_dotenv, report_result, run_live_mvp,
 };
 #[cfg(test)]
 use venue_runtime::account::{
@@ -433,7 +438,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), NodeError> {
     let launch = NodeLaunch::from_environment(VenueId::Bybit)?;
-    launch.require_no_runtime_arguments()?;
+    let command = launch.live_mvp_command()?;
     let adapter = BybitGatewayBinding::new(launch.binding().clone())
         .map_err(|_| NodeError::AdapterIsolation(VenueId::Bybit))?;
     AdapterIsolation {
@@ -449,11 +454,20 @@ fn run() -> Result<(), NodeError> {
         account_binding: "uta2_linear",
     }
     .validate(launch.binding())?;
-    let candidate = BybitPhysicalGatewayCandidate::new(adapter, &launch.artifacts_root());
-    debug_assert!(!candidate.has_loaded_session());
-    let admitted_capabilities = candidate.capability_snapshot().flags;
-    debug_assert_eq!(admitted_capabilities, capabilities());
-    reject_unintegrated_runtime(VenueId::Bybit, launch.binding().mode, admitted_capabilities)
+    load_root_dotenv()?;
+    let limits =
+        BybitTransportLimits::new(Duration::from_secs(10), 2 * 1024 * 1024).map_err(|error| {
+            NodeError::LiveGateway {
+                venue: VenueId::Bybit,
+                message: error_chain(&error),
+            }
+        })?;
+    let gateway = BybitAccountGateway::connect_from_environment(launch.binding().clone(), limits)
+        .map_err(|error| NodeError::LiveGateway {
+        venue: VenueId::Bybit,
+        message: error_chain(&error),
+    })?;
+    run_live_mvp(&launch, command, gateway)
 }
 
 #[cfg(test)]

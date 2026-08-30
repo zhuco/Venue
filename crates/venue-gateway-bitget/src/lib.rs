@@ -12,6 +12,7 @@ mod private_ws;
 pub mod public;
 mod recovery;
 pub mod risk;
+mod runtime_recovery;
 mod sign;
 mod transport;
 
@@ -25,6 +26,12 @@ pub use node_bridge::*;
 pub use order_families::*;
 pub use private_ws::*;
 pub use recovery::*;
+pub(crate) use runtime_recovery::BitgetRuntimeRecoveryAwaitGuard;
+pub use runtime_recovery::{
+    BitgetRuntimeRecoveryBundle, BitgetRuntimeRecoveryError, BitgetRuntimeRecoveryRegistration,
+    BitgetRuntimeRecoveryRevalidator, BitgetRuntimeRecoveryScope, BitgetRuntimeRecoveryScopeInput,
+    BitgetRuntimeStructuredUnknown,
+};
 pub use sign::{SignInput, SignedHeaders, prehash, sign, ws_sign};
 pub use transport::*;
 

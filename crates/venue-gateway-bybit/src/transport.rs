@@ -22,13 +22,10 @@ use venue_gateway_api::GatewayBinding;
 
 use crate::sign::ws_auth_signature;
 use crate::{
-    BybitCredentials, BybitGatewayBinding, BybitPreparedPrivateRequest,
-    BybitPrivateStreamProbeEvidence, BybitRawPrivatePayload, sign_private_request,
-};
-#[cfg(test)]
-use crate::{
-    BybitExecutionError, BybitOrderAck, BybitPreparedRequest, parse_order_ack,
-    sign_prepared_request,
+    BybitCredentials, BybitExecutionError, BybitGatewayBinding, BybitOrderAck,
+    BybitPreparedPrivateRequest, BybitPreparedRequest, BybitPrivateStreamProbeEvidence,
+    BybitPublicSource, BybitRawPrivatePayload, BybitRawPublicPayload, linear_instrument_path,
+    parse_order_ack, sign_prepared_request, sign_private_request,
 };
 
 const PRIVATE_TOPICS: [&str; 4] = [
@@ -91,29 +88,42 @@ impl BybitHttpTransport {
         generation: u64,
         limits: BybitTransportLimits,
     ) -> Result<Self, BybitTransportError> {
-        Self::with_endpoint(
+        Self::build(
             binding,
             generation,
             binding.config().rest_origin().to_owned(),
             limits,
+            false,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_endpoint(
         binding: &BybitGatewayBinding,
         generation: u64,
         endpoint: String,
         limits: BybitTransportLimits,
     ) -> Result<Self, BybitTransportError> {
+        Self::build(binding, generation, endpoint, limits, true)
+    }
+
+    fn build(
+        binding: &BybitGatewayBinding,
+        generation: u64,
+        endpoint: String,
+        limits: BybitTransportLimits,
+        disable_proxy: bool,
+    ) -> Result<Self, BybitTransportError> {
         if generation == 0 || endpoint.is_empty() {
             return Err(BybitTransportError::Binding);
         }
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(limits.operation_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .build()
-            .map_err(|_| BybitTransportError::Http)?;
+            .redirect(reqwest::redirect::Policy::none());
+        if disable_proxy {
+            builder = builder.no_proxy();
+        }
+        let client = builder.build().map_err(|_| BybitTransportError::Http)?;
         Ok(Self {
             client,
             binding: binding.gateway_binding().clone(),
@@ -123,8 +133,7 @@ impl BybitHttpTransport {
         })
     }
 
-    #[cfg(test)]
-    pub async fn execute_order(
+    pub(crate) async fn execute_order(
         &self,
         binding: &BybitGatewayBinding,
         credentials: &BybitCredentials,
@@ -192,6 +201,54 @@ impl BybitHttpTransport {
                 Err(BybitExecutionError::VenueRejected) => Err(BybitTransportError::Rejected),
                 Err(_) => Err(BybitTransportError::Ack),
             }
+        };
+        timeout(self.limits.operation_timeout, operation)
+            .await
+            .map_err(|_| BybitTransportError::Timeout)?
+    }
+
+    pub(crate) async fn fetch_linear_instrument(
+        &self,
+        binding: &BybitGatewayBinding,
+    ) -> Result<BybitRawPublicPayload, BybitTransportError> {
+        binding
+            .validate_request_binding(&self.binding)
+            .map_err(|_| BybitTransportError::Binding)?;
+        let path = linear_instrument_path(binding).map_err(|_| BybitTransportError::Binding)?;
+        let url = format!("{}{}", self.endpoint, path);
+        let operation = async {
+            let mut response = self.client.get(url).send().await.map_err(map_reqwest)?;
+            if !response.status().is_success() {
+                return Err(BybitTransportError::HttpStatus);
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > self.limits.maximum_body_bytes as u64)
+            {
+                return Err(BybitTransportError::BodyTooLarge);
+            }
+            let mut body = BytesMut::new();
+            while let Some(chunk) = response.chunk().await.map_err(map_reqwest)? {
+                let new_length = body
+                    .len()
+                    .checked_add(chunk.len())
+                    .ok_or(BybitTransportError::BodyTooLarge)?;
+                if new_length > self.limits.maximum_body_bytes {
+                    return Err(BybitTransportError::BodyTooLarge);
+                }
+                body.extend_from_slice(&chunk);
+            }
+            let received_at_ms = unix_ms()?;
+            let payload =
+                String::from_utf8(body.to_vec()).map_err(|_| BybitTransportError::Protocol)?;
+            BybitRawPublicPayload::new(
+                binding,
+                BybitPublicSource::LinearInstrument,
+                self.generation,
+                received_at_ms,
+                payload,
+            )
+            .map_err(|_| BybitTransportError::Protocol)
         };
         timeout(self.limits.operation_timeout, operation)
             .await

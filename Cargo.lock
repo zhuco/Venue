@@ -4659,6 +4659,7 @@ dependencies = [
  "venue-control-protocol",
  "venue-copy",
  "venue-domain",
+ "venue-indicators",
 ]
 
 [[package]]
@@ -4778,7 +4779,9 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "venue-domain",
+ "venue-execution",
  "venue-gateway-api",
+ "venue-runtime",
 ]
 
 [[package]]
@@ -4819,6 +4822,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "venue-domain",
+ "venue-execution",
  "venue-gateway-api",
 ]
 
@@ -4840,6 +4844,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "venue-domain",
+ "venue-execution",
  "venue-gateway-api",
 ]
 
@@ -4858,6 +4863,7 @@ name = "venue-node"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "dotenvy",
  "reqwest",
  "rust_decimal",
  "serde",

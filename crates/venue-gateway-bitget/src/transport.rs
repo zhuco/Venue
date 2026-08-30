@@ -10,7 +10,8 @@ use venue_gateway_api::GatewayBinding;
 
 use crate::{
     BitgetAccountBinding, BitgetAuthenticatedRecoverySession, BitgetConfig, BitgetCredentials,
-    BitgetPrivateWsTransport, SignInput, endpoints,
+    BitgetPrivateWsTransport, BitgetRuntimeRecoveryAwaitGuard, BitgetRuntimeRecoveryRevalidator,
+    BitgetRuntimeRecoveryScope, SignInput, endpoints,
     execution::{
         BitgetExactOrderReadback, BitgetExactReadbackRequest, BitgetExecutionError,
         BitgetMutationOutcome, BitgetPreparedMutation, BitgetUnknownReason, into_unknown,
@@ -551,16 +552,22 @@ impl BitgetHttpTransport {
     /// Executes one recovery GET only under an adapter-issued authenticated private session. The
     /// private socket is round-tripped after the HTTP await; a disconnect, replacement login,
     /// generation drift, deadline expiry, endpoint mismatch, or universe drift discards the page.
-    pub(crate) async fn execute_authenticated_recovery_read<S>(
+    async fn execute_authenticated_recovery_read_guarded<S>(
         &self,
         private_ws: &mut BitgetPrivateWsTransport<S>,
         session: &BitgetAuthenticatedRecoverySession,
         credentials: &BitgetCredentials,
         request: &BitgetPrivateReadRequest,
+        runtime_guard: Option<BitgetRuntimeRecoveryAwaitGuard<'_>>,
     ) -> Result<BitgetRawPrivatePage, BitgetTransportError>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
+        if let Some(guard) = runtime_guard {
+            guard
+                .revalidate()
+                .map_err(|_| BitgetTransportError::RecoverySession)?;
+        }
         let mut session_use = RecoverySessionUse::new(session);
         let now_ms = unix_ms()?;
         session.validate_credentials(credentials)?;
@@ -570,7 +577,17 @@ impl BitgetHttpTransport {
         let page = self
             .execute_private_read(credentials, request, now_ms)
             .await?;
+        if let Some(guard) = runtime_guard {
+            guard
+                .revalidate()
+                .map_err(|_| BitgetTransportError::RecoverySession)?;
+        }
         private_ws.revalidate_recovery_session(session).await?;
+        if let Some(guard) = runtime_guard {
+            guard
+                .revalidate()
+                .map_err(|_| BitgetTransportError::RecoverySession)?;
+        }
         self.validate_authenticated_recovery_scope(session, request, unix_ms()?)?;
         if page.received_at_ms < session.started_at_ms()
             || page.received_at_ms >= session.deadline_at_ms()
@@ -595,6 +612,20 @@ impl BitgetHttpTransport {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
+        self.collect_authenticated_private_turn_guarded(private_ws, session, credentials, None)
+            .await
+    }
+
+    async fn collect_authenticated_private_turn_guarded<S>(
+        &self,
+        private_ws: &mut BitgetPrivateWsTransport<S>,
+        session: &BitgetAuthenticatedRecoverySession,
+        credentials: &BitgetCredentials,
+        runtime_guard: Option<BitgetRuntimeRecoveryAwaitGuard<'_>>,
+    ) -> Result<BitgetPrivateGenerationCandidate, BitgetTransportError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let mut session_use = RecoverySessionUse::new(session);
         session.validate_credentials(credentials)?;
         let request_spec = session.begin_symbol(&self.binding.symbol)?;
@@ -605,25 +636,33 @@ impl BitgetHttpTransport {
         let requested_fill_start_ms = request_spec.requested_fill_start_ms();
         let server_now_ms = request_spec.fills_target_through_ms();
         let account = self
-            .execute_authenticated_recovery_read(private_ws, session, credentials, &probe)
+            .execute_authenticated_recovery_read_guarded(
+                private_ws,
+                session,
+                credentials,
+                &probe,
+                runtime_guard,
+            )
             .await?;
         let settings_request = build_settings_read_request(&self.binding, attempt_id, generation);
         let settings = self
-            .execute_authenticated_recovery_read(
+            .execute_authenticated_recovery_read_guarded(
                 private_ws,
                 session,
                 credentials,
                 &settings_request,
+                runtime_guard,
             )
             .await?;
         let positions_request =
             build_positions_read_request(&self.binding, attempt_id, generation)?;
         let positions = self
-            .execute_authenticated_recovery_read(
+            .execute_authenticated_recovery_read_guarded(
                 private_ws,
                 session,
                 credentials,
                 &positions_request,
+                runtime_guard,
             )
             .await?;
 
@@ -639,11 +678,12 @@ impl BitgetHttpTransport {
                 order_cursor.as_deref(),
             )?;
             let page = parse_regular_order_page(
-                self.execute_authenticated_recovery_read(
+                self.execute_authenticated_recovery_read_guarded(
                     private_ws,
                     session,
                     credentials,
                     &request,
+                    runtime_guard,
                 )
                 .await?,
             )
@@ -675,11 +715,12 @@ impl BitgetHttpTransport {
                 server_now_ms,
             )?;
             let page = parse_fill_page(
-                self.execute_authenticated_recovery_read(
+                self.execute_authenticated_recovery_read_guarded(
                     private_ws,
                     session,
                     credentials,
                     &request,
+                    runtime_guard,
                 )
                 .await?,
             )
@@ -710,6 +751,42 @@ impl BitgetHttpTransport {
         session.commit_symbol(&self.binding.symbol)?;
         session_use.complete();
         Ok(candidate)
+    }
+
+    /// Collects one Runtime-bound physical turn. Runtime's immutable scope is checked before
+    /// entering the authenticated sequence and after it returns; either mismatch revokes the
+    /// caller's turn through the same fail-closed session error used by all recovery reads.
+    pub async fn collect_runtime_authenticated_private_turn<S>(
+        &self,
+        private_ws: &mut BitgetPrivateWsTransport<S>,
+        session: &BitgetAuthenticatedRecoverySession,
+        credentials: &BitgetCredentials,
+        runtime_scope: &BitgetRuntimeRecoveryScope,
+        revalidator: &dyn BitgetRuntimeRecoveryRevalidator,
+    ) -> Result<BitgetPrivateGenerationCandidate, BitgetTransportError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        runtime_scope
+            .validate_session(session)
+            .map_err(|_| BitgetTransportError::RecoverySession)?;
+        let guard = BitgetRuntimeRecoveryAwaitGuard::new(runtime_scope, revalidator)
+            .map_err(|_| BitgetTransportError::RecoverySession)?;
+        let result = self
+            .collect_authenticated_private_turn_guarded(
+                private_ws,
+                session,
+                credentials,
+                Some(guard),
+            )
+            .await;
+        guard
+            .revalidate()
+            .map_err(|_| BitgetTransportError::RecoverySession)?;
+        runtime_scope
+            .validate_session(session)
+            .map_err(|_| BitgetTransportError::RecoverySession)?;
+        result
     }
 
     fn validate_scope(

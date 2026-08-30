@@ -27,7 +27,7 @@ $env:CARGO_INCREMENTAL = '0'
 $env:TEMP = $cargoTemp
 $env:TMP = $cargoTemp
 
-function Test-FailClosedNode {
+function Test-UnauthorizedLiveRejected {
     param(
         [Parameter(Mandatory)] [string]$Venue,
         [Parameter(Mandatory)] [string]$BinaryPath
@@ -48,16 +48,6 @@ function Test-FailClosedNode {
         )
         okx = @('OKX_API_KEY', 'OKX_API_SECRET', 'OKX_API_PASSPHRASE')
     }
-    $requiredEvidence = @(
-        'Owner',
-        'WAL',
-        'unique account writer fence',
-        'signed readback',
-        'UNKNOWN reconciliation',
-        'Stop/Flatten',
-        'operator-confirmed Canary evidence'
-    )
-
     foreach ($mode in @('LIVE')) {
         $probeBase = Join-Path `
             (Split-Path -Parent $targetRoot) `
@@ -75,7 +65,8 @@ function Test-FailClosedNode {
             '--mode', $mode,
             '--trading-account-id', '00000000-0000-4000-8000-000000000001',
             '--symbol', $symbols[$Venue],
-            '--artifacts-base', $probeBase
+            '--artifacts-base', $probeBase,
+            '--', 'preflight', '--confirm-live', 'wrong-venue'
         )) {
             $startInfo.ArgumentList.Add($argument)
         }
@@ -103,10 +94,11 @@ function Test-FailClosedNode {
             throw "$Venue $mode 在安全证据未闭环时错误地成功启动。"
         }
         $output = "$stdout`n$stderr"
-        foreach ($marker in $requiredEvidence) {
-            if (-not $output.Contains($marker, [StringComparison]::Ordinal)) {
-                throw "$Venue $mode 失败关闭输出缺少证据标记：$marker"
-            }
+        if (-not $output.Contains(
+            '--confirm-live must exactly match the lowercase venue id',
+            [StringComparison]::Ordinal
+        )) {
+            throw "$Venue $mode 未在凭证读取前拒绝错误的人工确认。"
         }
         if (Test-Path -LiteralPath $probeBase) {
             throw "$Venue $mode 失败关闭前创建了工件路径：$probeBase"
@@ -195,9 +187,10 @@ foreach ($venue in @('binance', 'bitget', 'bybit', 'gate', 'hyperliquid', 'okx')
     $venueEvidence | Add-Member -NotePropertyName mode_rejection -NotePropertyValue `
         'exact parser error; credentials removed; artifact root absent'
     if ($venue -in @('bybit', 'hyperliquid', 'okx')) {
-        Test-FailClosedNode -Venue $venue -BinaryPath $binaryPath
-        $venueEvidence | Add-Member -NotePropertyName fail_closed_modes -NotePropertyValue @('LIVE')
-        $venueEvidence | Add-Member -NotePropertyName fail_closed_no_io -NotePropertyValue $true
+        Test-UnauthorizedLiveRejected -Venue $venue -BinaryPath $binaryPath
+        $venueEvidence | Add-Member -NotePropertyName live_commands -NotePropertyValue `
+            @('preflight', 'canary-place', 'canary-cancel')
+        $venueEvidence | Add-Member -NotePropertyName wrong_confirmation_no_io -NotePropertyValue $true
     }
     $evidence.Add($venueEvidence)
 }
