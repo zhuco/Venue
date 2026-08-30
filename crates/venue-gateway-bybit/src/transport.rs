@@ -22,9 +22,13 @@ use venue_gateway_api::GatewayBinding;
 
 use crate::sign::ws_auth_signature;
 use crate::{
-    BybitCredentials, BybitExecutionError, BybitGatewayBinding, BybitOrderAck,
-    BybitPreparedPrivateRequest, BybitPreparedRequest, BybitPrivateStreamProbeEvidence,
-    BybitRawPrivatePayload, parse_order_ack, sign_prepared_request, sign_private_request,
+    BybitCredentials, BybitGatewayBinding, BybitPreparedPrivateRequest,
+    BybitPrivateStreamProbeEvidence, BybitRawPrivatePayload, sign_private_request,
+};
+#[cfg(test)]
+use crate::{
+    BybitExecutionError, BybitOrderAck, BybitPreparedRequest, parse_order_ack,
+    sign_prepared_request,
 };
 
 const PRIVATE_TOPICS: [&str; 4] = [
@@ -119,6 +123,7 @@ impl BybitHttpTransport {
         })
     }
 
+    #[cfg(test)]
     pub async fn execute_order(
         &self,
         binding: &BybitGatewayBinding,

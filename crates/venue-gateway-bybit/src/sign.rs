@@ -19,7 +19,7 @@ impl SignedHeaders {
     }
 }
 
-pub fn sign(
+pub(crate) fn sign(
     credentials: &BybitCredentials,
     binding: &BybitGatewayBinding,
     request_binding: &GatewayBinding,

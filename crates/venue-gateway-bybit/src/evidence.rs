@@ -18,18 +18,19 @@ use crate::{
     parse_position_page,
 };
 
-pub const BYBIT_CAPABILITY_PROBE_SCHEMA_VERSION: u16 = 1;
+pub const BYBIT_CAPABILITY_PROBE_SCHEMA_VERSION: u16 = 2;
 
-const EXECUTABLE_FLAGS: CapabilityFlags = CapabilityFlags::from_bits_retain(
+const PERSISTED_READ_ONLY_FLAGS: CapabilityFlags = CapabilityFlags::from_bits_retain(
     CapabilityFlags::READ_ACCOUNT.bits()
         | CapabilityFlags::READ_ORDERS.bits()
         | CapabilityFlags::READ_FILLS.bits()
-        | CapabilityFlags::PRIVATE_STREAM.bits()
-        | CapabilityFlags::TRADE.bits()
-        | CapabilityFlags::PLACE_LIMIT.bits()
-        | CapabilityFlags::PLACE_MARKET.bits()
-        | CapabilityFlags::CANCEL.bits()
-        | CapabilityFlags::HEDGE_POSITION.bits(),
+        | CapabilityFlags::PRIVATE_STREAM.bits(),
+);
+
+const CANDIDATE_READ_ONLY_FLAGS: CapabilityFlags = CapabilityFlags::from_bits_retain(
+    CapabilityFlags::READ_ACCOUNT.bits()
+        | CapabilityFlags::READ_ORDERS.bits()
+        | CapabilityFlags::READ_FILLS.bits(),
 );
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -220,7 +221,15 @@ pub struct BybitCapabilityCandidate {
     pub positions: BybitPositionReadback,
     pub order_families: BybitOrderFamilyCandidate,
     pub fills: BybitFillReadback,
-    pub candidate_flags: CapabilityFlags,
+    candidate_flags: CapabilityFlags,
+}
+
+impl BybitCapabilityCandidate {
+    /// Read-only observations are evidence, never mutation admission.
+    #[must_use]
+    pub const fn candidate_flags(&self) -> CapabilityFlags {
+        self.candidate_flags
+    }
 }
 
 /// Secret-free proof emitted only after private WebSocket authentication and subscription have
@@ -367,7 +376,7 @@ impl BybitCapabilityProbeEvidence {
             || self.scope.profile_version != BYBIT_LINEAR_ORDER_PROFILE_VERSION
             || self.scope.attempt_id == 0
             || self.scope.generation == 0
-            || self.flags != EXECUTABLE_FLAGS
+            || self.flags != PERSISTED_READ_ONLY_FLAGS
             || self.evidence_sha256 != self.compute_digest()?
             || !self.verify_hmac(credentials)?
         {
@@ -382,13 +391,7 @@ impl BybitCapabilityProbeEvidence {
             now_ms,
             &self.raw_payloads,
         )?;
-        if candidate
-            .candidate_flags
-            .contains(CapabilityFlags::WITHDRAW)
-            || !candidate
-                .candidate_flags
-                .contains(EXECUTABLE_FLAGS - CapabilityFlags::PRIVATE_STREAM)
-        {
+        if candidate.candidate_flags != CANDIDATE_READ_ONLY_FLAGS {
             return Err(BybitError::Capability);
         }
         let observed_ms = self
@@ -476,7 +479,7 @@ pub fn finalize_capability_probe(
         scope: candidate.scope,
         private_stream,
         raw_payloads,
-        flags: EXECUTABLE_FLAGS,
+        flags: PERSISTED_READ_ONLY_FLAGS,
         evidence_sha256: String::new(),
         evidence_hmac_sha256: String::new(),
     };
@@ -538,17 +541,6 @@ pub fn validate_capability_candidate(
     if replayed_fills != fills {
         return Err(BybitError::Projection);
     }
-    let mut candidate_flags = CapabilityFlags::READ_ACCOUNT
-        | CapabilityFlags::READ_ORDERS
-        | CapabilityFlags::READ_FILLS
-        | CapabilityFlags::HEDGE_POSITION;
-    if !api_key.read_only && api_key.derivatives_trade {
-        candidate_flags |= CapabilityFlags::TRADE
-            | CapabilityFlags::PLACE_LIMIT
-            | CapabilityFlags::PLACE_MARKET
-            | CapabilityFlags::CANCEL
-            | CapabilityFlags::AMEND;
-    }
     Ok(BybitCapabilityCandidate {
         scope,
         api_key,
@@ -556,7 +548,7 @@ pub fn validate_capability_candidate(
         positions,
         order_families,
         fills,
-        candidate_flags,
+        candidate_flags: CANDIDATE_READ_ONLY_FLAGS,
     })
 }
 

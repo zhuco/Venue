@@ -2,7 +2,9 @@ mod binding;
 mod config;
 mod credentials;
 mod evidence;
+#[cfg(test)]
 mod execution;
+#[cfg(test)]
 mod physical;
 mod private;
 mod public;
@@ -15,16 +17,24 @@ pub use binding::BybitGatewayBinding;
 pub use config::{BybitConfig, endpoints};
 pub use credentials::BybitCredentials;
 pub use evidence::*;
+#[cfg(test)]
 pub use execution::*;
+#[cfg(test)]
 pub use physical::*;
 pub use private::*;
 pub use public::*;
 pub use recovery::*;
-pub use sign::{SignedHeaders, sign};
+pub use sign::SignedHeaders;
+pub(crate) use sign::sign;
 pub use transport::{
     BybitHttpTransport, BybitPrivateWsTransport, BybitRawPrivateFrame, BybitTransportError,
     BybitTransportLimits, connect_private_ws, connect_private_ws_for_generations,
 };
+
+/// Production has no constructible physical session until Owner/WAL/writer/Canary authority is
+/// integrated. The mutation implementation exists only in this crate's unit-test build.
+#[cfg(not(test))]
+pub enum BybitSynchronousPhysicalSession {}
 
 /// No account capability is advertised until authenticated readback, private stream, writer,
 /// WAL, and UNKNOWN reconciliation are all connected.

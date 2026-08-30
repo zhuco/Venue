@@ -109,9 +109,8 @@ impl BybitRecoveryAuthorityReceipt {
         &self.projection_sha256
     }
 
-    /// Explicitly test-only construction. Enabling `test-fixtures` cannot enable writer,
-    /// capability, dispatch, or production recovery integration.
-    #[cfg(any(test, feature = "test-fixtures"))]
+    /// Explicitly test-only construction; no Cargo feature can expose this in production.
+    #[cfg(test)]
     pub fn explicit_test_fixture(
         roots: BybitRecoveryRootCandidates,
         owner_route_count: u64,
@@ -730,6 +729,7 @@ pub async fn collect_bybit_fresh_recovery<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    bybit_fresh_recovery_integration_status()?;
     let mut progress = CollectionProgress::new(&scope);
     if !scope.verify_credentials(credentials) {
         return Err(BybitFreshRecoveryError::Credentials);

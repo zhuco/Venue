@@ -616,15 +616,18 @@ fn all_family_and_capability_candidates_remain_non_authoritative() -> Result<(),
     );
     let candidate =
         validate_capability_candidate(scope, 2_500, api_key, account, positions, families, fills)?;
-    assert!(candidate.candidate_flags.contains(CapabilityFlags::TRADE));
+    assert_eq!(
+        candidate.candidate_flags(),
+        CapabilityFlags::READ_ACCOUNT | CapabilityFlags::READ_ORDERS | CapabilityFlags::READ_FILLS
+    );
     assert!(
         !candidate
-            .candidate_flags
+            .candidate_flags()
             .contains(CapabilityFlags::PRIVATE_STREAM)
     );
     assert!(
         !candidate
-            .candidate_flags
+            .candidate_flags()
             .contains(CapabilityFlags::WITHDRAW)
     );
     assert_eq!(capabilities(), CapabilityFlags::empty());
@@ -649,9 +652,10 @@ fn fresh_complete_probe_is_persistable_for_test_and_live_only() -> Result<(), Te
         assert_eq!(snapshot.binding.mode, mode);
         assert_eq!(snapshot.version, 7);
         assert!(snapshot.flags.contains(CapabilityFlags::PRIVATE_STREAM));
-        assert!(snapshot.flags.contains(CapabilityFlags::PLACE_LIMIT));
-        assert!(snapshot.flags.contains(CapabilityFlags::PLACE_MARKET));
-        assert!(snapshot.flags.contains(CapabilityFlags::CANCEL));
+        assert!(!snapshot.flags.contains(CapabilityFlags::TRADE));
+        assert!(!snapshot.flags.contains(CapabilityFlags::PLACE_LIMIT));
+        assert!(!snapshot.flags.contains(CapabilityFlags::PLACE_MARKET));
+        assert!(!snapshot.flags.contains(CapabilityFlags::CANCEL));
         assert!(!snapshot.flags.contains(CapabilityFlags::WITHDRAW));
         assert!(!snapshot.flags.contains(CapabilityFlags::AMEND));
         assert_eq!(capabilities(), CapabilityFlags::empty());
