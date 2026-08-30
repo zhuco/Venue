@@ -813,6 +813,7 @@ mod tests {
             selected.clone(),
             "config_1",
             7,
+            1,
             10,
             PhysicalRecoveryAuthorityRoots::verified([1; 32], [2; 32], [3; 32])?,
         )?;
@@ -1099,6 +1100,7 @@ mod tests {
             fixture.scope.binding().clone(),
             fixture.scope.config_digest(),
             fixture.scope.config_epoch(),
+            fixture.scope.connection_generation(),
             fixture.scope.recovered_private_generation(),
             PhysicalRecoveryAuthorityRoots::verified([4; 32], [5; 32], [6; 32])?,
         )?;

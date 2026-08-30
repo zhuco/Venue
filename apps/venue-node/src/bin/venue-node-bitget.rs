@@ -1045,6 +1045,7 @@ mod tests {
             binding(mode)?,
             "bitget_config_1",
             3,
+            1,
             6,
             PhysicalRecoveryAuthorityRoots::verified([owner_root_seed; 32], [2; 32], [3; 32])?,
         )?)
@@ -1123,6 +1124,7 @@ mod tests {
             binding(GatewayMode::Live)?,
             "bitget_config_2",
             4,
+            1,
             8,
             PhysicalRecoveryAuthorityRoots::verified([9; 32], [8; 32], [7; 32])?,
         )?;

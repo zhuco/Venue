@@ -429,6 +429,7 @@ mod tests {
             binding()?,
             CONFIG_DIGEST,
             3,
+            1,
             recovered_private_generation,
             roots,
         )?)

@@ -4858,12 +4858,14 @@ name = "venue-node"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "reqwest",
  "rust_decimal",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.19",
+ "tokio",
  "venue",
  "venue-control-protocol",
  "venue-domain",
@@ -4876,6 +4878,7 @@ dependencies = [
  "venue-gateway-hyperliquid",
  "venue-gateway-okx",
  "venue-runtime",
+ "venue-storage",
 ]
 
 [[package]]

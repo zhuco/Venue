@@ -666,6 +666,7 @@ mod tests {
             binding,
             "config_1",
             1,
+            1,
             recovered_generation,
             PhysicalRecoveryAuthorityRoots::verified([1; 32], [2; 32], [3; 32])?,
         )

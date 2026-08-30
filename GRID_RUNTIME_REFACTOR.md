@@ -33,7 +33,7 @@ writer 或物理交易客户端。`legacy_stage7_strategy_binding` 只转换单�
 `apps/venue-node` 已提供六个逐 adapter 固定产物：Binance、Gate.io、Bitget 仅在精确 `LIVE` 下委托现有 Stage 7
 部署入口并继续使用原 Owner/WAL/writer/reconciliation/Canary 契约；旧物理 client 不支持 `TEST`，因此对应节点
 明确失败关闭而不回退到生产 endpoint。Bybit、OKX、Hyperliquid 节点只验证 secret-free binding、adapter endpoint、
-凭证环境变量命名空间与隔离 artifact root。`safe_host` 与 `supervision` 在 root/WAL/Owner/writer metadata 和独立 hash-chain control log 恢复后才允许连接，并持久应用 Pause/Resume/Stop/Flatten/Canary、一次性 permit 与 UNKNOWN 禁重投。共享层现已有耐久 Owner/native identity、绑定 Owner/WAL/Unknown roots 的六面物理恢复 manifest、要求 adapter 先验签且不可从持久 claim 反序列化恢复的 `ProvenAbsent` 契约、单 runtime 线性 async 边界，以及绑定 Control/Owner/WAL/writer/Canary 的不可序列化 host capability token；但这些组件尚未由 adapter/Node 组合，async 边界仍预检原始 snapshot，因此新节点路径继续拒绝启动。
+凭证环境变量命名空间与隔离 artifact root。`safe_host` 与 `supervision` 仍维护 root/WAL/Owner/writer metadata、独立 control log、一次性 permit 与 UNKNOWN 禁重投。共享层已有耐久 Owner/native identity、六面物理恢复值类型、`ProvenAbsent`、bounded loopback Control polling、单 runtime async 与 host capability 候选契约；但普通调用方仍可构造 promotion receipt，六所也尚无绑定 recovery scope 的 fresh collector、exact Owner 与结构化 Unknown 证明。生产 physical installer、Ready、Actor turn、host admission 和 async mutation 因此统一失败关闭；Prepared 在 admission 失败时耐久 Rejected，物理调用为零。
 Stage 7 成交热路径不得遍历历史命令 WAL。命令 journal 在启动重放时建立未决命令、撤单目标和交易所订单 ID 的派生内存索引；滚动补撤批次以原 JSONL 格式一次 fsync 持久化 Prepared/Submitted 状态，再并行提交物理请求。接管只可在签名全订单族为空、零未决且零本地事务后显式按源 SHA 封存已解析 WAL；原件留在同 root，活动 WAL 从空文件继续，禁止运行中轮转或删除审计源。
 
 纯内核启动必须先安装覆盖 lifecycle、config epoch、Stop/Flatten fence、连接代际、已应用私有游标、完整批次
@@ -44,8 +44,7 @@ applied receipt 才能更新 Desired Orders、进入 Running 或生成执行意�
 分配收据绑定订单族，策略调用方不得自报这些权限。重连、参数变更或更新一代签名对账不会复活未入 WAL 的旧意图；
 已进入 WAL 的 Unknown 必须按原 command、native client identity、订单族和更新连接的完整回读证明收敛，不能直接重发。
 物理恢复的内存值类型/验证器还要求同一 attempt、严格更新的 private generation 完整交付 Account、Positions、三个订单族与
-FillsCursor 六面，并绑定 config 与 Owner/WAL/Unknown roots；空账户也必须显式交付空面。它尚未被 adapter、账户 startup 或
-固定 binary 消费，也不是已持久化的 manifest 工件。
+FillsCursor 六面，并绑定 connection generation、config 与 Owner/WAL/Unknown roots；空账户也必须显式交付空面。测试夹具已覆盖六所映射形状，但生产入口不得从普通 candidate、持久 probe、caller generation 或 caller digest 构造准入；在 opaque fresh collector、多 symbol 完整性和运行期 root refresh authority 完成前，账户 startup 与固定 binary 统一返回 integration unavailable，也不生成持久 manifest 工件。
 
 ## 2. 术语
 

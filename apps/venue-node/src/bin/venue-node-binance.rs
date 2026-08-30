@@ -759,6 +759,7 @@ mod candidate_bridge {
                 binding,
                 "config_1",
                 7,
+                1,
                 recovered_private_generation,
                 PhysicalRecoveryAuthorityRoots::verified(
                     [root_seeds[0]; 32],
@@ -979,6 +980,7 @@ mod candidate_bridge {
                 binding,
                 "config_2",
                 8,
+                1,
                 16,
                 PhysicalRecoveryAuthorityRoots::verified([9; 32], [8; 32], [7; 32])?,
             )?;

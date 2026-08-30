@@ -96,7 +96,7 @@ crates/
 当前 `apps/venue-node` 已建立上述六个固定产物、逐 feature 二进制隔离门禁及 exchange-neutral `safe_host`。安全宿主
 在 root/WAL/Owner/writer metadata 与独立 hash-chain control log 恢复后才允许连接，持久应用 Pause/Resume/Stop/Flatten/Canary，
 并组合一次性 dispatch permit 与 UNKNOWN 读回；它不会自行产生 capability。Binance、Gate.io、Bitget 仅在显式
-`LIVE` 下委托既有 Stage 7 安全闭环；其 `TEST` 不能重定向到生产 client。六所 adapter 已具备绑定型 async 私有读取与单次 mutation/readback 候选；部分固定 `run()` 只实例化 inert candidate 做隔离/失败关闭预检。共享层现已具备耐久 Owner/native identity、六面物理恢复 manifest、要求 adapter 先验签且不可从持久 claim 反序列化恢复的 `ProvenAbsent` 契约、单 runtime 线性 async 边界与 Control-applied capability promotion 契约；但没有 fixed binary 构造 `TokioPhysicalGateway` 或把候选接入 `NodeSafetyHost`/dispatch，async 边界仍预检原始 capability snapshot。Node 的 capability、WAL、唯一账户 fence、Stop/Flatten 与 Canary 链未闭合，因此新路径继续失败关闭。
+`LIVE` 下委托既有 Stage 7 安全闭环；其 `TEST` 不能重定向到生产 client。六所 adapter 已具备绑定型 async 私有读取与单次 mutation/readback 候选；部分固定 `run()` 只实例化 inert candidate 做隔离/失败关闭预检。共享层现有耐久 Owner/native identity、六面物理恢复值类型、`ProvenAbsent`、Control delivery、单 runtime async 与 capability promotion 候选契约，但候选 receipt、post-recovery freshness、exact Owner、结构化 Unknown、运行期 root refresh 和 Actor durable-applied authority尚未闭合。生产 Node 因此拒绝 physical recovery install、Actor Ready、host admission 与 async dispatch；失败的 Prepared 会耐久终结而不会调用物理 adapter。Stage 7 仍是唯一生产 writer。
 
 ## 5. 依赖方向
 
@@ -204,7 +204,7 @@ Copy planner/job-consumer lease 只允许竞争数据库 job 的规划或投递�
 
 ## 8. 六交易所网关
 
-当前已把六所规范身份、仅含 `TEST | LIVE` 的模式、账户/交易对 binding 与版本化 capability mutation 门禁落入 `venue-gateway-api`；根 package 复用同一 `VenueId`，不再复制交易所枚举。六所 adapter 侧 async 读取、订单族、单次 mutation 与 ACK 后 readback 候选已闭合，但静态 capability 均不因此自动开启；只有 Node 完成 Owner/WAL/writer/reconciliation/Canary 绑定后才能产生运行 authority。
+当前已把六所规范身份、仅含 `TEST | LIVE` 的模式、账户/交易对 binding 与版本化 capability 候选契约落入 `venue-gateway-api`；根 package 复用同一 `VenueId`，不再复制交易所枚举。六所 adapter 侧 async 读取、订单族、单次 mutation 与 ACK 后 readback 候选已闭合，但静态 capability 均不因此自动开启；只有 Node 以不可由普通调用方构造的 authority 同时证明 Control、Owner/WAL、writer、reconciliation、Canary 与实际发送时刻 TTL 后才能开放运行 authority，当前生产实现明确拒绝。
 
 | Venue | 目标 adapter | 当前权威来源 | 初始准入 |
 |---|---|---|---|

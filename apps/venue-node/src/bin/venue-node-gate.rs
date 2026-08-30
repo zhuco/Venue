@@ -954,6 +954,7 @@ mod tests {
             binding(GatewayMode::Test)?.gateway_binding().clone(),
             "gate_config_28",
             28,
+            1,
             recovered_private_generation,
             roots,
         )?)
