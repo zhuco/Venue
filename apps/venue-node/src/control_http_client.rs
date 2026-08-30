@@ -406,7 +406,10 @@ impl<J: ControlDeliveryJournal> ControlDeliveryDriver<J> {
                     let ack = output.value().clone();
                     self.client.acknowledge(&ack).await?;
                     let confirmed_ms = self.now_ms()?;
-                    self.inbox.confirm_acknowledgement(&ack, confirmed_ms)?;
+                    match self.inbox.confirm_acknowledgement(&ack, confirmed_ms) {
+                        Ok(_) | Err(ControlDeliveryError::LeaseExpired) => {}
+                        Err(error) => return Err(error.into()),
+                    }
                 }
                 ClaimAcceptance::Reconcile(_) => {}
             }
@@ -463,14 +466,41 @@ impl<J: ControlDeliveryJournal> ControlDeliveryDriver<J> {
     async fn flush_outbox_current(&mut self) -> Result<(), ControlDeliveryDriverError> {
         let now_ms = self.now_ms()?;
         for ack in self.inbox.pending_acknowledgements(now_ms) {
+            let sending_ms = self.now_ms()?;
+            if let Err(error) = self
+                .inbox
+                .validate_ack_confirmation_session(&ack, sending_ms)
+            {
+                if matches!(error, ControlDeliveryError::LeaseExpired) {
+                    continue;
+                }
+                return Err(error.into());
+            }
             self.client.acknowledge(&ack).await?;
             let confirmed_ms = self.now_ms()?;
-            self.inbox.confirm_acknowledgement(&ack, confirmed_ms)?;
+            match self.inbox.confirm_acknowledgement(&ack, confirmed_ms) {
+                Ok(_) | Err(ControlDeliveryError::LeaseExpired) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-        for receipt in self.inbox.pending_receipts() {
+        let now_ms = self.now_ms()?;
+        for receipt in self.inbox.pending_receipts(now_ms) {
+            let sending_ms = self.now_ms()?;
+            if let Err(error) = self
+                .inbox
+                .validate_receipt_confirmation_session(&receipt, sending_ms)
+            {
+                if matches!(error, ControlDeliveryError::LeaseExpired) {
+                    continue;
+                }
+                return Err(error.into());
+            }
             self.client.record_receipt(&receipt).await?;
             let confirmed_ms = self.now_ms()?;
-            self.inbox.confirm_receipt(&receipt, confirmed_ms)?;
+            match self.inbox.confirm_receipt(&receipt, confirmed_ms) {
+                Ok(_) | Err(ControlDeliveryError::LeaseExpired) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(())
     }

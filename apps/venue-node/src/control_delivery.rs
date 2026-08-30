@@ -519,9 +519,7 @@ impl<J: ControlDeliveryJournal> ControlDeliveryInbox<J> {
         ack: &AccountDeliveryAck,
         confirmed_ms: u64,
     ) -> Result<DurableStoreResult, ControlDeliveryError> {
-        self.require_open()?;
-        ack.validate()
-            .map_err(|_| ControlDeliveryError::InvalidAck)?;
+        self.validate_ack_confirmation_session(ack, confirmed_ms)?;
         if confirmed_ms < ack.acknowledged_ms {
             return Err(ControlDeliveryError::InvalidAck);
         }
@@ -549,6 +547,29 @@ impl<J: ControlDeliveryJournal> ControlDeliveryInbox<J> {
             confirmed_ms,
         })?;
         Ok(DurableStoreResult::Stored)
+    }
+
+    pub(crate) fn validate_ack_confirmation_session(
+        &self,
+        ack: &AccountDeliveryAck,
+        confirmed_ms: u64,
+    ) -> Result<(), ControlDeliveryError> {
+        self.require_open()?;
+        ack.validate()
+            .map_err(|_| ControlDeliveryError::InvalidAck)?;
+        validate_lease_time(&ack.lease, confirmed_ms)?;
+        let delivery = self
+            .projection
+            .deliveries
+            .get(&ack.lease.delivery_id)
+            .ok_or(ControlDeliveryError::AckConflict)?;
+        let Some((&current_epoch, accepted)) = delivery.claims.last_key_value() else {
+            return Err(ControlDeliveryError::AckConflict);
+        };
+        if current_epoch != ack.lease.lease_epoch || accepted.claim.lease != ack.lease {
+            return Err(ControlDeliveryError::AckConflict);
+        }
+        Ok(())
     }
 
     pub fn actor_turn(
@@ -673,10 +694,7 @@ impl<J: ControlDeliveryJournal> ControlDeliveryInbox<J> {
         receipt: &AccountDeliveryReceipt,
         confirmed_ms: u64,
     ) -> Result<DurableStoreResult, ControlDeliveryError> {
-        self.require_open()?;
-        receipt
-            .validate()
-            .map_err(|_| ControlDeliveryError::InvalidReceipt)?;
+        self.validate_receipt_confirmation_session(receipt, confirmed_ms)?;
         if confirmed_ms < receipt.observed_ms {
             return Err(ControlDeliveryError::InvalidReceipt);
         }
@@ -705,6 +723,30 @@ impl<J: ControlDeliveryJournal> ControlDeliveryInbox<J> {
         Ok(DurableStoreResult::Stored)
     }
 
+    pub(crate) fn validate_receipt_confirmation_session(
+        &self,
+        receipt: &AccountDeliveryReceipt,
+        confirmed_ms: u64,
+    ) -> Result<(), ControlDeliveryError> {
+        self.require_open()?;
+        receipt
+            .validate()
+            .map_err(|_| ControlDeliveryError::InvalidReceipt)?;
+        validate_lease_time(&receipt.lease, confirmed_ms)?;
+        let delivery = self
+            .projection
+            .deliveries
+            .get(&receipt.lease.delivery_id)
+            .ok_or(ControlDeliveryError::ReceiptConflict)?;
+        let Some((&current_epoch, accepted)) = delivery.claims.last_key_value() else {
+            return Err(ControlDeliveryError::ReceiptConflict);
+        };
+        if current_epoch != receipt.lease.lease_epoch || accepted.claim.lease != receipt.lease {
+            return Err(ControlDeliveryError::ReceiptConflict);
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn pending_acknowledgements(&self, now_ms: u64) -> Vec<AccountDeliveryAck> {
         self.projection
@@ -722,13 +764,18 @@ impl<J: ControlDeliveryJournal> ControlDeliveryInbox<J> {
     }
 
     #[must_use]
-    pub fn pending_receipts(&self) -> Vec<AccountDeliveryReceipt> {
+    pub fn pending_receipts(&self, now_ms: u64) -> Vec<AccountDeliveryReceipt> {
         self.projection
             .deliveries
             .values()
             .filter_map(|delivery| {
+                let (&current_epoch, _) = delivery.claims.last_key_value()?;
                 let (&epoch, (receipt, _)) = delivery.receipts.last_key_value()?;
-                (!delivery.receipt_confirmed.contains_key(&epoch)).then(|| receipt.clone())
+                (epoch == current_epoch
+                    && !delivery.receipt_confirmed.contains_key(&epoch)
+                    && now_ms >= receipt.lease.leased_at_ms
+                    && now_ms < receipt.lease.expires_at_ms)
+                    .then(|| receipt.clone())
             })
             .collect()
     }
@@ -956,12 +1003,16 @@ fn apply_event(
                 .deliveries
                 .get_mut(&ack.lease.delivery_id)
                 .ok_or(ControlDeliveryError::CorruptJournal)?;
+            let current_epoch = delivery.claims.last_key_value().map(|item| *item.0);
             let accepted = delivery
                 .claims
                 .get(&ack.lease.lease_epoch)
                 .ok_or(ControlDeliveryError::CorruptJournal)?;
-            if accepted.ack.as_ref() != Some(ack)
+            if current_epoch != Some(ack.lease.lease_epoch)
+                || accepted.claim.lease != ack.lease
+                || accepted.ack.as_ref() != Some(ack)
                 || *confirmed_ms < ack.acknowledged_ms
+                || validate_lease_time(&ack.lease, *confirmed_ms).is_err()
                 || delivery
                     .ack_confirmed
                     .insert(ack.lease.lease_epoch, ack.clone())
@@ -1011,12 +1062,15 @@ fn apply_event(
                 .deliveries
                 .get_mut(&receipt.lease.delivery_id)
                 .ok_or(ControlDeliveryError::CorruptJournal)?;
-            if delivery
-                .receipts
-                .get(&receipt.lease.lease_epoch)
-                .map(|item| &item.0)
-                != Some(receipt)
+            let current_epoch = delivery.claims.last_key_value().map(|item| *item.0);
+            if current_epoch != Some(receipt.lease.lease_epoch)
+                || delivery
+                    .receipts
+                    .get(&receipt.lease.lease_epoch)
+                    .map(|item| &item.0)
+                    != Some(receipt)
                 || *confirmed_ms < receipt.observed_ms
+                || validate_lease_time(&receipt.lease, *confirmed_ms).is_err()
                 || delivery
                     .receipt_confirmed
                     .insert(receipt.lease.lease_epoch, receipt.clone())

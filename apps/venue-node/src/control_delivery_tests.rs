@@ -129,7 +129,7 @@ fn ack_is_durable_and_control_confirmed_before_actor_applied()
 
     let recovered = new_inbox(journal)?;
     assert!(recovered.pending_acknowledgements(160).is_empty());
-    assert!(recovered.pending_receipts().is_empty());
+    assert!(recovered.pending_receipts(160).is_empty());
     assert!(recovered.actor_turn("command:request-32", 160)?.is_none());
     Ok(())
 }
@@ -172,7 +172,7 @@ fn unknown_accepts_only_the_exact_next_reconciliation_claim()
     inbox.confirm_receipt(reconciled.value(), 230)?;
 
     let recovered = new_inbox(journal)?;
-    assert!(recovered.pending_receipts().is_empty());
+    assert!(recovered.pending_receipts(240).is_empty());
     assert!(
         recovered
             .reconciliation_turn("command:request-32", 240)?
@@ -369,7 +369,7 @@ fn completion_cannot_be_backdated_after_lease_expiry() -> Result<(), Box<dyn std
         inbox.record_actor_completion(completion, 200),
         Err(ControlDeliveryError::LeaseExpired)
     ));
-    assert!(inbox.pending_receipts().is_empty());
+    assert!(inbox.pending_receipts(190).is_empty());
 
     let reconciliation = claim(2, 200, 300, AccountDeliveryPurpose::ReconcileOnly)?;
     assert!(matches!(
@@ -392,7 +392,7 @@ fn caller_digest_cannot_create_a_production_applied_receipt()
         turn.applied(140, digest(8), "caller claims durable"),
         Err(ControlDeliveryError::ActorAppliedUnavailable)
     ));
-    assert!(inbox.pending_receipts().is_empty());
+    assert!(inbox.pending_receipts(130).is_empty());
     assert_eq!(inbox.pending_actor_turns(150)?.len(), 1);
     Ok(())
 }
@@ -427,7 +427,7 @@ fn production_delivery_cannot_apply_any_control_action_without_actor_authority()
             turn.applied(140, digest(8), "caller claims durable"),
             Err(ControlDeliveryError::ActorAppliedUnavailable)
         ));
-        assert!(inbox.pending_receipts().is_empty());
+        assert!(inbox.pending_receipts(130).is_empty());
     }
     Ok(())
 }
@@ -583,7 +583,7 @@ async fn polling_driver_orders_claim_durable_ack_actor_and_receipt()
         inbox,
         1_000,
         1,
-        scripted_clock([110, 110, 110, 120, 120, 130, 140]),
+        scripted_clock([110, 110, 110, 110, 120, 120, 130, 140]),
     )?;
 
     let mut work = driver.poll(110).await?;
@@ -631,11 +631,11 @@ async fn polling_driver_rechecks_clock_after_ack_and_skips_expired_actor()
         inbox,
         100,
         1,
-        scripted_clock([110, 110, 110, 200, 200]),
+        scripted_clock([110, 110, 110, 110, 200, 200]),
     )?;
 
     assert!(driver.poll(110).await?.is_empty());
-    assert_eq!(journal.len()?, 3);
+    assert_eq!(journal.len()?, 2);
     let paths = server.await??;
     assert_eq!(
         paths,
@@ -657,6 +657,56 @@ async fn polling_driver_rechecks_clock_after_ack_and_skips_expired_actor()
 }
 
 #[tokio::test]
+async fn receipt_replay_crossing_expiry_is_not_confirmed_or_replayed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let journal = MemoryJournal::default();
+    let mut inbox = new_inbox(journal.clone())?;
+    install_ack(
+        &mut inbox,
+        claim(1, 100, 200, AccountDeliveryPurpose::Install)?,
+        110,
+        120,
+    )?;
+    let turn = inbox
+        .actor_turn("command:request-32", 130)?
+        .ok_or("actor turn missing")?;
+    inbox.record_actor_completion(turn.rejected(140, [0; 32], "actor rejected command")?, 140)?;
+    assert_eq!(journal.len()?, 4);
+
+    let (base_url, server) = spawn_control_server(Vec::new(), 1).await?;
+    let client = ControlHttpClient::new(ControlHttpClientConfig::local(base_url))?;
+    let mut driver = ControlDeliveryDriver::new_with_clock(
+        client,
+        inbox,
+        100,
+        1,
+        scripted_clock([140, 140, 140, 200]),
+    )?;
+    driver.flush_outbox(140).await?;
+    assert_eq!(journal.len()?, 4);
+    assert_eq!(server.await??, vec!["/v2/account-node/deliveries/receipts"]);
+
+    let mut recovered = new_inbox(journal)?;
+    let expired_receipt = recovered
+        .pending_receipts(199)
+        .into_iter()
+        .next()
+        .ok_or("pending receipt missing before expiry")?;
+    assert!(recovered.pending_receipts(200).is_empty());
+    assert!(matches!(
+        recovered.confirm_receipt(&expired_receipt, 200),
+        Err(ControlDeliveryError::LeaseExpired)
+    ));
+    let reconciliation = claim(2, 200, 300, AccountDeliveryPurpose::ReconcileOnly)?;
+    assert!(matches!(
+        recovered.accept_claim(reconciliation, 210)?,
+        ClaimAcceptance::Reconcile(_)
+    ));
+    assert_eq!(recovered.pending_reconciliation_turns(220)?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn polling_driver_drops_claim_that_expires_during_http_await()
 -> Result<(), Box<dyn std::error::Error>> {
     let install = claim(1, 100, 200, AccountDeliveryPurpose::Install)?;
@@ -670,7 +720,7 @@ async fn polling_driver_drops_claim_that_expires_during_http_await()
         inbox,
         100,
         1,
-        scripted_clock([110, 110, 200, 200]),
+        scripted_clock([110, 110, 110, 200, 200]),
     )?;
 
     assert!(driver.poll(110).await?.is_empty());
@@ -696,7 +746,7 @@ async fn spawn_control_server(
         for index in 0..requests {
             let (mut stream, _) = listener.accept().await?;
             let (path, request_body) = read_http_request(&mut stream).await?;
-            let response_body = if index == 0 {
+            let response_body = if index == 0 && !claim_body.is_empty() {
                 claim_body.clone()
             } else {
                 request_body
