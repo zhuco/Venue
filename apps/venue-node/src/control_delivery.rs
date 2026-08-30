@@ -114,6 +114,8 @@ pub enum ClaimAcceptance {
 pub struct ActorDeliveryTurn {
     claim: AccountDeliveryClaim,
     durable_inbox_digest: [u8; 32],
+    durable_inbox_sequence: u64,
+    durable_inbox_root_digest: [u8; 32],
 }
 
 impl ActorDeliveryTurn {
@@ -130,6 +132,21 @@ impl ActorDeliveryTurn {
     #[must_use]
     pub const fn durable_inbox_digest(&self) -> [u8; 32] {
         self.durable_inbox_digest
+    }
+
+    #[must_use]
+    pub const fn durable_inbox_sequence(&self) -> u64 {
+        self.durable_inbox_sequence
+    }
+
+    #[must_use]
+    pub const fn durable_inbox_root_digest(&self) -> [u8; 32] {
+        self.durable_inbox_root_digest
+    }
+
+    #[must_use]
+    pub fn node_id(&self) -> &str {
+        &self.claim.lease.node_id
     }
 
     pub fn applied(
@@ -347,6 +364,7 @@ struct AcceptedClaim {
 struct DeliveryProjection {
     claims: BTreeMap<u64, AcceptedClaim>,
     ack_confirmed: BTreeMap<u64, AccountDeliveryAck>,
+    actor_roots: BTreeMap<u64, (u64, [u8; 32])>,
     receipts: BTreeMap<u64, (AccountDeliveryReceipt, u64)>,
     receipt_confirmed: BTreeMap<u64, AccountDeliveryReceipt>,
 }
@@ -363,6 +381,7 @@ pub struct ControlDeliveryInbox<J> {
     binding: AccountDeliveryBinding,
     node_id: String,
     next_sequence: u64,
+    durable_root_digest: [u8; 32],
     projection: Projection,
 }
 
@@ -382,6 +401,7 @@ impl<J: ControlDeliveryJournal> ControlDeliveryInbox<J> {
         let records = journal.recover()?;
         let mut projection = Projection::default();
         let mut next_sequence = 1_u64;
+        let mut durable_root_digest = [0_u8; 32];
         for record in records {
             if record.sequence != next_sequence || record.payload.len() > MAX_RECORD_BYTES {
                 return Err(ControlDeliveryError::CorruptJournal);
@@ -391,9 +411,12 @@ impl<J: ControlDeliveryJournal> ControlDeliveryInbox<J> {
             if persisted.schema_version != EVENT_SCHEMA_VERSION {
                 return Err(ControlDeliveryError::CorruptJournal);
             }
+            durable_root_digest =
+                advance_replay_root(durable_root_digest, record.sequence, &record.payload);
             apply_event(
                 &mut projection,
                 record.sequence,
+                durable_root_digest,
                 &persisted.event,
                 &binding,
                 &node_id,
@@ -407,6 +430,7 @@ impl<J: ControlDeliveryJournal> ControlDeliveryInbox<J> {
             binding,
             node_id,
             next_sequence,
+            durable_root_digest,
             projection,
         };
         if inbox.next_sequence == 1 {
@@ -546,9 +570,16 @@ impl<J: ControlDeliveryJournal> ControlDeliveryInbox<J> {
             return Ok(None);
         }
         validate_lease_time(&accepted.claim.lease, now_ms)?;
+        let (durable_inbox_sequence, durable_inbox_root_digest) = delivery
+            .actor_roots
+            .get(&epoch)
+            .copied()
+            .ok_or(ControlDeliveryError::CorruptJournal)?;
         Ok(Some(ActorDeliveryTurn {
             claim: accepted.claim.clone(),
             durable_inbox_digest: accepted.durable_inbox_digest,
+            durable_inbox_sequence,
+            durable_inbox_root_digest,
         }))
     }
 
@@ -579,7 +610,9 @@ impl<J: ControlDeliveryJournal> ControlDeliveryInbox<J> {
     pub fn record_actor_completion(
         &mut self,
         completion: ActorDeliveryCompletion,
+        recorded_ms: u64,
     ) -> Result<DurableDeliveryOutput<AccountDeliveryReceipt>, ControlDeliveryError> {
+        validate_lease_time(&completion.claim.lease, recorded_ms)?;
         if completion.claim.lease.purpose != AccountDeliveryPurpose::Install {
             return Err(ControlDeliveryError::InvalidCompletion);
         }
@@ -613,7 +646,9 @@ impl<J: ControlDeliveryJournal> ControlDeliveryInbox<J> {
     pub fn record_reconciliation(
         &mut self,
         completion: ReconciliationCompletion,
+        recorded_ms: u64,
     ) -> Result<DurableDeliveryOutput<AccountDeliveryReceipt>, ControlDeliveryError> {
+        validate_lease_time(&completion.claim.lease, recorded_ms)?;
         if completion.claim.lease.purpose != AccountDeliveryPurpose::ReconcileOnly {
             return Err(ControlDeliveryError::InvalidCompletion);
         }
@@ -716,9 +751,16 @@ impl<J: ControlDeliveryJournal> ControlDeliveryInbox<J> {
                     continue;
                 }
                 validate_lease_time(&accepted.claim.lease, now_ms)?;
+                let (durable_inbox_sequence, durable_inbox_root_digest) = delivery
+                    .actor_roots
+                    .get(&epoch)
+                    .copied()
+                    .ok_or(ControlDeliveryError::CorruptJournal)?;
                 turns.push(ActorDeliveryTurn {
                     claim: accepted.claim.clone(),
                     durable_inbox_digest: accepted.durable_inbox_digest,
+                    durable_inbox_sequence,
+                    durable_inbox_root_digest,
                 });
             }
         }
@@ -837,13 +879,16 @@ impl<J: ControlDeliveryJournal> ControlDeliveryInbox<J> {
             self.projection.failed_closed = true;
             return Err(ControlDeliveryError::JournalSequence);
         }
+        let durable_root_digest = advance_replay_root(self.durable_root_digest, sequence, &payload);
         apply_event(
             &mut self.projection,
             sequence,
+            durable_root_digest,
             &persisted.event,
             &self.binding,
             &self.node_id,
         )?;
+        self.durable_root_digest = durable_root_digest;
         self.next_sequence = self
             .next_sequence
             .checked_add(1)
@@ -855,6 +900,7 @@ impl<J: ControlDeliveryJournal> ControlDeliveryInbox<J> {
 fn apply_event(
     projection: &mut Projection,
     sequence: u64,
+    durable_root_digest: [u8; 32],
     event: &Event,
     binding: &AccountDeliveryBinding,
     node_id: &str,
@@ -919,6 +965,10 @@ fn apply_event(
                 || delivery
                     .ack_confirmed
                     .insert(ack.lease.lease_epoch, ack.clone())
+                    .is_some()
+                || delivery
+                    .actor_roots
+                    .insert(ack.lease.lease_epoch, (sequence, durable_root_digest))
                     .is_some()
             {
                 return Err(ControlDeliveryError::CorruptJournal);
@@ -1124,6 +1174,16 @@ fn digest_serialized<T: Serialize + ?Sized>(value: &T) -> Result<[u8; 32], Contr
         return Err(ControlDeliveryError::RecordTooLarge);
     }
     Ok(Sha256::digest(encoded).into())
+}
+
+fn advance_replay_root(previous: [u8; 32], sequence: u64, payload: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"venue-node-control-delivery-replay-root-v1");
+    digest.update(previous);
+    digest.update(sequence.to_le_bytes());
+    digest.update((payload.len() as u64).to_le_bytes());
+    digest.update(payload);
+    digest.finalize().into()
 }
 
 fn encode_hex(bytes: &[u8]) -> String {

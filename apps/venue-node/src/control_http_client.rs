@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, net::IpAddr, time::Duration};
+use std::{
+    collections::BTreeSet,
+    net::IpAddr,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use reqwest::{
     StatusCode, Url,
@@ -334,6 +339,7 @@ pub struct ControlDeliveryDriver<J> {
     inbox: ControlDeliveryInbox<J>,
     lease_duration_ms: u64,
     claim_limit: u32,
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 impl<J: ControlDeliveryJournal> ControlDeliveryDriver<J> {
@@ -353,7 +359,21 @@ impl<J: ControlDeliveryJournal> ControlDeliveryDriver<J> {
             inbox,
             lease_duration_ms,
             claim_limit,
+            clock: Arc::new(system_time_ms),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_clock(
+        client: ControlHttpClient,
+        inbox: ControlDeliveryInbox<J>,
+        lease_duration_ms: u64,
+        claim_limit: u32,
+        clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Result<Self, ControlDeliveryDriverError> {
+        let mut driver = Self::new(client, inbox, lease_duration_ms, claim_limit)?;
+        driver.clock = clock;
+        Ok(driver)
     }
 
     pub async fn poll(
@@ -363,8 +383,8 @@ impl<J: ControlDeliveryJournal> ControlDeliveryDriver<J> {
         if observed_ms == 0 {
             return Err(ControlDeliveryDriverError::InvalidTime);
         }
-        self.flush_outbox(observed_ms).await?;
-        let pending = self.pending_work(observed_ms)?;
+        self.flush_outbox_current().await?;
+        let pending = self.pending_work(self.now_ms()?)?;
         if !pending.is_empty() {
             return Ok(pending);
         }
@@ -377,16 +397,21 @@ impl<J: ControlDeliveryJournal> ControlDeliveryDriver<J> {
         };
         let claims = self.client.claim(&request).await?;
         for claim in claims {
-            match self.inbox.accept_claim(claim, observed_ms)? {
+            let received_ms = self.now_ms()?;
+            if !lease_is_active(&claim, received_ms) {
+                continue;
+            }
+            match self.inbox.accept_claim(claim, received_ms)? {
                 ClaimAcceptance::Install(output) => {
                     let ack = output.value().clone();
                     self.client.acknowledge(&ack).await?;
-                    self.inbox.confirm_acknowledgement(&ack, observed_ms)?;
+                    let confirmed_ms = self.now_ms()?;
+                    self.inbox.confirm_acknowledgement(&ack, confirmed_ms)?;
                 }
                 ClaimAcceptance::Reconcile(_) => {}
             }
         }
-        Ok(self.pending_work(observed_ms)?)
+        Ok(self.pending_work(self.now_ms()?)?)
     }
 
     pub async fn submit_actor_completion(
@@ -394,10 +419,17 @@ impl<J: ControlDeliveryJournal> ControlDeliveryDriver<J> {
         completion: ActorDeliveryCompletion,
         confirmed_ms: u64,
     ) -> Result<(), ControlDeliveryDriverError> {
-        let output = self.inbox.record_actor_completion(completion)?;
+        if confirmed_ms == 0 {
+            return Err(ControlDeliveryDriverError::InvalidTime);
+        }
+        let recorded_ms = self.now_ms()?;
+        let output = self
+            .inbox
+            .record_actor_completion(completion, recorded_ms)?;
         let receipt = output.value().clone();
         self.client.record_receipt(&receipt).await?;
-        self.inbox.confirm_receipt(&receipt, confirmed_ms)?;
+        let receipt_confirmed_ms = self.now_ms()?;
+        self.inbox.confirm_receipt(&receipt, receipt_confirmed_ms)?;
         Ok(())
     }
 
@@ -406,10 +438,15 @@ impl<J: ControlDeliveryJournal> ControlDeliveryDriver<J> {
         completion: ReconciliationCompletion,
         confirmed_ms: u64,
     ) -> Result<(), ControlDeliveryDriverError> {
-        let output = self.inbox.record_reconciliation(completion)?;
+        if confirmed_ms == 0 {
+            return Err(ControlDeliveryDriverError::InvalidTime);
+        }
+        let recorded_ms = self.now_ms()?;
+        let output = self.inbox.record_reconciliation(completion, recorded_ms)?;
         let receipt = output.value().clone();
         self.client.record_receipt(&receipt).await?;
-        self.inbox.confirm_receipt(&receipt, confirmed_ms)?;
+        let receipt_confirmed_ms = self.now_ms()?;
+        self.inbox.confirm_receipt(&receipt, receipt_confirmed_ms)?;
         Ok(())
     }
 
@@ -417,15 +454,34 @@ impl<J: ControlDeliveryJournal> ControlDeliveryDriver<J> {
         &mut self,
         observed_ms: u64,
     ) -> Result<(), ControlDeliveryDriverError> {
-        for ack in self.inbox.pending_acknowledgements(observed_ms) {
+        if observed_ms == 0 {
+            return Err(ControlDeliveryDriverError::InvalidTime);
+        }
+        self.flush_outbox_current().await
+    }
+
+    async fn flush_outbox_current(&mut self) -> Result<(), ControlDeliveryDriverError> {
+        let now_ms = self.now_ms()?;
+        for ack in self.inbox.pending_acknowledgements(now_ms) {
             self.client.acknowledge(&ack).await?;
-            self.inbox.confirm_acknowledgement(&ack, observed_ms)?;
+            let confirmed_ms = self.now_ms()?;
+            self.inbox.confirm_acknowledgement(&ack, confirmed_ms)?;
         }
         for receipt in self.inbox.pending_receipts() {
             self.client.record_receipt(&receipt).await?;
-            self.inbox.confirm_receipt(&receipt, observed_ms)?;
+            let confirmed_ms = self.now_ms()?;
+            self.inbox.confirm_receipt(&receipt, confirmed_ms)?;
         }
         Ok(())
+    }
+
+    fn now_ms(&self) -> Result<u64, ControlDeliveryDriverError> {
+        let now_ms = (self.clock)();
+        if now_ms == 0 {
+            Err(ControlDeliveryDriverError::InvalidTime)
+        } else {
+            Ok(now_ms)
+        }
     }
 
     fn pending_work(
@@ -475,6 +531,20 @@ impl<J: ControlDeliveryJournal> ControlDeliveryDriver<J> {
     pub const fn grants_dispatch_permit(&self) -> bool {
         false
     }
+}
+
+fn system_time_ms() -> u64 {
+    let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return 0;
+    };
+    let Ok(now_ms) = u64::try_from(elapsed.as_millis()) else {
+        return 0;
+    };
+    now_ms
+}
+
+fn lease_is_active(claim: &AccountDeliveryClaim, now_ms: u64) -> bool {
+    now_ms >= claim.lease.leased_at_ms && now_ms < claim.lease.expires_at_ms
 }
 
 #[derive(Debug, thiserror::Error)]
