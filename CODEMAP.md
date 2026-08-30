@@ -4,7 +4,7 @@
 
 本文件只回答“功能代码在哪里”。合并跟单、六交易所、指标、桌面 UI 后的目标 workspace、依赖边界、技术栈和迁移顺序查
 [`ARCHITECTURE.md`](ARCHITECTURE.md)；多策略账户运行时、网格、成交热路径、库存恢复、验收和接管统一查
-[`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md)；当前未完成实现、并行文件租约和验收顺序查
+[`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md)；当前获准的待实现 Goal 查
 [`REFACTOR_IMPLEMENTATION_GOALS.md`](REFACTOR_IMPLEMENTATION_GOALS.md)。不要从 `bak/` 或历史提交寻找当前约束。
 
 ## 进程、配置与通用领域

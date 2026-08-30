@@ -8,7 +8,7 @@
 [`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md) 继续约束当前三所 Stage 7 网格热路径、恢复、接管和实盘准入；
 在目标架构尚未逐项验收前，不得用本文替代现有安全门。
 
-当前未完成实现、文件租约与验收顺序见 [`REFACTOR_IMPLEMENTATION_GOALS.md`](REFACTOR_IMPLEMENTATION_GOALS.md)。
+当前获准的待实现 Goal 见 [`REFACTOR_IMPLEMENTATION_GOALS.md`](REFACTOR_IMPLEMENTATION_GOALS.md)。
 
 迁移来源只提供行为和测试证据：
 
