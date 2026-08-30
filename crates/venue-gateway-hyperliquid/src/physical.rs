@@ -1,20 +1,19 @@
+#[cfg(test)]
 use std::{future::Future, pin::Pin};
 
-use serde::{Deserialize, Serialize};
 use venue_domain::domain::OrderState;
 use venue_gateway_api::GatewayBinding;
 
 use crate::{
     HyperliquidActionKind, HyperliquidError, HyperliquidExchangeConvergence,
     HyperliquidExchangeOutcome, HyperliquidExchangeReadbackPlan, HyperliquidExchangeRequest,
-    HyperliquidHttpResponse, HyperliquidHttpTransport, HyperliquidOrderStatus,
-    HyperliquidPrivateStreamBinding, HyperliquidTransportError, begin_exchange_readback,
-    parse_exchange_ack,
+    HyperliquidHttpResponse, HyperliquidOrderStatus, HyperliquidPrivateStreamBinding,
+    HyperliquidTransportError, begin_exchange_readback, parse_exchange_ack,
 };
 
-/// The exchange call used by the linear adapter dispatch. Implementations must perform one HTTP
-/// attempt and must not retry. The production implementation delegates to the transport whose
-/// reqwest retry policy is fixed to `never`.
+/// Test-only exchange call used to prove one-attempt convergence semantics without exposing a
+/// production dispatch path.
+#[cfg(test)]
 pub(crate) trait HyperliquidExchangeDispatch {
     fn post_exchange<'a>(
         &'a mut self,
@@ -29,37 +28,19 @@ pub(crate) trait HyperliquidExchangeDispatch {
     >;
 }
 
-impl HyperliquidExchangeDispatch for HyperliquidHttpTransport {
-    fn post_exchange<'a>(
-        &'a mut self,
-        expected_binding: &'a crate::HyperliquidReadBinding,
-        request: &'a HyperliquidExchangeRequest,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<HyperliquidHttpResponse, HyperliquidTransportError>>
-                + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(HyperliquidHttpTransport::post_exchange(
-            self,
-            expected_binding,
-            request,
-        ))
-    }
-}
-
 /// A signed action paired with its exact private generation. This type is deliberately neither
 /// `Clone` nor serializable. Calling `dispatch_once` consumes the only copy, so a timeout or ACK
 /// disconnect can expose only its read-only `orderStatus` recovery plan, never the signed body.
+#[cfg(test)]
 pub struct HyperliquidPhysicalDispatch {
     request: HyperliquidExchangeRequest,
     private_binding: HyperliquidPrivateStreamBinding,
     fallback_plan: HyperliquidExchangeReadbackPlan,
 }
 
+#[cfg(test)]
 impl HyperliquidPhysicalDispatch {
-    pub fn new(
+    pub(crate) fn new(
         request: HyperliquidExchangeRequest,
         private_binding: &HyperliquidPrivateStreamBinding,
     ) -> Result<Self, HyperliquidError> {
@@ -69,16 +50,6 @@ impl HyperliquidPhysicalDispatch {
             private_binding: private_binding.clone(),
             fallback_plan,
         })
-    }
-
-    /// Performs exactly one physical POST. Any transport failure, malformed response, or binding
-    /// mismatch is UNKNOWN because the request may have reached the venue. The result contains no
-    /// request body and therefore cannot be resubmitted.
-    pub async fn dispatch_once(
-        self,
-        dispatch: &mut HyperliquidHttpTransport,
-    ) -> HyperliquidPhysicalDispatchResult {
-        self.dispatch_once_inner(dispatch).await
     }
 
     #[cfg(test)]
@@ -125,6 +96,7 @@ impl HyperliquidPhysicalDispatch {
     }
 }
 
+#[cfg(test)]
 struct PendingReadbackFields {
     plan: HyperliquidExchangeReadbackPlan,
     gateway_binding: GatewayBinding,
@@ -134,6 +106,7 @@ struct PendingReadbackFields {
     connection_id: [u8; 32],
 }
 
+#[cfg(test)]
 impl PendingReadbackFields {
     fn from_request(
         request: &HyperliquidExchangeRequest,
@@ -152,6 +125,7 @@ impl PendingReadbackFields {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub enum HyperliquidPhysicalDispatchResult {
     PendingReadback(Box<HyperliquidPendingReadback>),
     Rejected { reason: String },
@@ -160,6 +134,7 @@ pub enum HyperliquidPhysicalDispatchResult {
 /// Read-only recovery state after the signed request has been consumed. `PendingUnknown` returns
 /// this plan again; there is intentionally no transition back to a dispatchable request.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub struct HyperliquidPendingReadback {
     plan: HyperliquidExchangeReadbackPlan,
     gateway_binding: GatewayBinding,
@@ -169,6 +144,7 @@ pub struct HyperliquidPendingReadback {
     connection_id: [u8; 32],
 }
 
+#[cfg(test)]
 impl HyperliquidPendingReadback {
     #[must_use]
     pub const fn plan(&self) -> &HyperliquidExchangeReadbackPlan {
@@ -217,6 +193,7 @@ impl HyperliquidPendingReadback {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub enum HyperliquidPhysicalReadbackResult {
     PendingUnknown(Box<HyperliquidPendingReadback>),
     Rejected { reason: String },
@@ -225,7 +202,8 @@ pub enum HyperliquidPhysicalReadbackResult {
 
 /// Persistable terminal proof for one narrow action. A capability probe accepts only the exact
 /// ALO-resting, cancel-cancelled, and IOC-reduce-only-filled sequence from one binding/generation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HyperliquidProbeActionReceipt {
     gateway_binding: GatewayBinding,
     user_address: String,
@@ -240,6 +218,7 @@ pub struct HyperliquidProbeActionReceipt {
     exchange_time_ms: u64,
 }
 
+#[cfg(test)]
 impl HyperliquidProbeActionReceipt {
     #[must_use]
     pub const fn gateway_binding(&self) -> &GatewayBinding {

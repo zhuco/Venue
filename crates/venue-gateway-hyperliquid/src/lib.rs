@@ -1,3 +1,4 @@
+#[cfg(test)]
 mod action;
 mod binding;
 mod capability;
@@ -6,6 +7,7 @@ mod credentials;
 mod models;
 mod node_candidate;
 mod nonce;
+#[cfg(test)]
 mod physical;
 mod private_stream;
 mod protocol;
@@ -16,12 +18,12 @@ mod capability_tests;
 
 use venue_gateway_api::CapabilityFlags;
 
+#[cfg(test)]
 pub use action::{
     HyperliquidActionKind, HyperliquidAloOrder, HyperliquidCancel, HyperliquidExchangeConvergence,
     HyperliquidExchangeOutcome, HyperliquidExchangeReadbackPlan, HyperliquidExchangeRequest,
-    HyperliquidIocReduceOnlyOrder, HyperliquidSource, begin_exchange_readback,
-    build_alo_place_request, build_cancel_request, build_ioc_reduce_only_request,
-    parse_exchange_ack, parse_exchange_response,
+    HyperliquidIocReduceOnlyOrder, HyperliquidSource, begin_exchange_readback, parse_exchange_ack,
+    parse_exchange_response,
 };
 pub use binding::{
     HyperliquidGatewayBinding, HyperliquidGatewayBindingError, HyperliquidReadBinding,
@@ -29,7 +31,11 @@ pub use binding::{
 pub use capability::{
     HYPERLIQUID_CAPABILITY_PROBE_MAX_TTL_MS, HYPERLIQUID_CAPABILITY_PROBE_SCHEMA,
     HyperliquidCapabilityProbeEvidence, HyperliquidFillWindowEvidence, HyperliquidFillWindowProbe,
-    HyperliquidPrivateStreamProbeEvidence,
+    HyperliquidFreshProbeCollector, HyperliquidOwnerRoute, HyperliquidOwnerSnapshot,
+    HyperliquidPrivateStreamProbeEvidence, HyperliquidProbeAuthorityRoots,
+    HyperliquidProbeCollectionScope, HyperliquidRecoveryCoverage, HyperliquidRecoveryFace,
+    HyperliquidRecoverySurface, HyperliquidUnknownOrderEvidence, HyperliquidUnknownSnapshot,
+    HyperliquidUnresolvedOrder,
 };
 pub use config::{HyperliquidConfig, endpoints};
 pub use credentials::HyperliquidCredentials;
@@ -37,6 +43,7 @@ pub use node_candidate::HyperliquidNodeCandidate;
 pub use nonce::{
     HyperliquidNonceStore, NonceCheckpoint, PersistedNonce, prepare_next_nonce, reserve_next_nonce,
 };
+#[cfg(test)]
 pub use physical::{
     HyperliquidPendingReadback, HyperliquidPhysicalDispatch, HyperliquidPhysicalDispatchResult,
     HyperliquidPhysicalReadbackResult, HyperliquidProbeActionReceipt,
@@ -52,10 +59,10 @@ pub use protocol::{
     HyperliquidFillCursor, HyperliquidFillPage, HyperliquidFillQuery, HyperliquidInfoRequest,
     HyperliquidOpenOrder, HyperliquidOpenOrdersSnapshot, HyperliquidOrderFamily,
     HyperliquidOrderFamilyCoverage, HyperliquidOrderLookup, HyperliquidOrderStatus,
-    HyperliquidPayloadScope, HyperliquidPerpMeta, HyperliquidUserFills,
-    build_clearinghouse_state_request, build_frontend_open_orders_request, build_l2_book_request,
-    build_meta_request, build_open_orders_request, build_order_status_request,
-    build_user_fills_by_time_request, parse_clearinghouse_snapshot,
+    HyperliquidOrderStatusUnknownReason, HyperliquidPayloadScope, HyperliquidPerpMeta,
+    HyperliquidUserFills, build_clearinghouse_state_request, build_frontend_open_orders_request,
+    build_l2_book_request, build_meta_request, build_open_orders_request,
+    build_order_status_request, build_user_fills_by_time_request, parse_clearinghouse_snapshot,
     parse_frontend_open_orders_snapshot, parse_l2_book_bbo, parse_open_orders_snapshot,
     parse_order_status, parse_perp_meta, parse_private_user_fills, parse_user_fills_page,
     parse_ws_bbo, validate_frontend_open_orders_snapshot,
@@ -94,6 +101,8 @@ pub enum HyperliquidError {
     OrderFamily,
     #[error("Hyperliquid capability probe evidence is incomplete, stale, or tampered")]
     CapabilityProbe,
+    #[error("Hyperliquid fresh physical recovery integration is unavailable")]
+    RecoveryIntegrationUnavailable,
 }
 
 #[cfg(test)]
@@ -621,6 +630,8 @@ mod tests {
             HyperliquidOrderStatus::Unknown {
                 scope: selected.scope.clone(),
                 lookup: lookup.clone(),
+                native_identity: "91490942".to_owned(),
+                reason: HyperliquidOrderStatusUnknownReason::UnknownOid,
             }
         );
         assert_eq!(

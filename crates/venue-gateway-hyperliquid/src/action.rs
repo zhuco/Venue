@@ -327,7 +327,7 @@ impl HyperliquidExchangeReadbackPlan {
             return Ok(HyperliquidExchangeConvergence::PendingUnknown);
         };
         match status {
-            HyperliquidOrderStatus::Unknown { scope, lookup } => {
+            HyperliquidOrderStatus::Unknown { scope, lookup, .. } => {
                 if scope != self.binding.scope() || lookup != &self.lookup {
                     return Err(HyperliquidError::Readback);
                 }
@@ -570,7 +570,7 @@ fn validate_acknowledgement(
     }
 }
 
-pub fn build_alo_place_request(
+pub(crate) fn build_alo_place_request(
     credentials: &HyperliquidCredentials,
     nonce: PersistedNonce,
     order: HyperliquidAloOrder,
@@ -617,7 +617,7 @@ pub fn build_alo_place_request(
     )
 }
 
-pub fn build_ioc_reduce_only_request(
+pub(crate) fn build_ioc_reduce_only_request(
     credentials: &HyperliquidCredentials,
     nonce: PersistedNonce,
     order: HyperliquidIocReduceOnlyOrder,
@@ -665,7 +665,7 @@ pub fn build_ioc_reduce_only_request(
     )
 }
 
-pub fn build_cancel_request(
+pub(crate) fn build_cancel_request(
     credentials: &HyperliquidCredentials,
     nonce: PersistedNonce,
     cancel: HyperliquidCancel,

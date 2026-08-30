@@ -5,6 +5,7 @@ use std::{
 };
 
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use venue_domain::domain::{
     AccountBalance, Asset, FieldState, Fill, MarketLevel, Order, OrderSide, OrderState, Position,
     PositionSide, Price, Symbol, UnknownReason,
@@ -96,7 +97,7 @@ pub struct HyperliquidOpenOrder {
     pub child_order_ids: Vec<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum HyperliquidOrderFamily {
     Regular,
     Conditional,
@@ -273,10 +274,25 @@ impl HyperliquidInfoRequest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum HyperliquidOrderLookup {
     OrderId(u64),
     ClientOrderId(String),
+}
+
+impl HyperliquidOrderLookup {
+    #[must_use]
+    pub fn native_identity(&self) -> String {
+        match self {
+            Self::OrderId(value) => value.to_string(),
+            Self::ClientOrderId(value) => value.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum HyperliquidOrderStatusUnknownReason {
+    UnknownOid,
 }
 
 impl HyperliquidOrderLookup {
@@ -315,6 +331,8 @@ pub enum HyperliquidOrderStatus {
     Unknown {
         scope: HyperliquidPayloadScope,
         lookup: HyperliquidOrderLookup,
+        native_identity: String,
+        reason: HyperliquidOrderStatusUnknownReason,
     },
     Known {
         scope: HyperliquidPayloadScope,
@@ -442,6 +460,8 @@ pub fn parse_order_status(
         ("unknownOid", None) => Ok(HyperliquidOrderStatus::Unknown {
             scope: meta.scope.clone(),
             lookup: lookup.clone(),
+            native_identity: lookup.native_identity(),
+            reason: HyperliquidOrderStatusUnknownReason::UnknownOid,
         }),
         ("order", Some(body)) => {
             if body.order.coin != meta.scope.native_coin {
