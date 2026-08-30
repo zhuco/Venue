@@ -117,7 +117,7 @@ async fn postgres_delivery_lease_ack_unknown_reconcile_and_restart_are_fenced()
     };
     assert_eq!(
         restarted.record_account_delivery_receipt(&stale).await,
-        Err(AccountDeliveryRepositoryError::ReceiptConflict)
+        Err(AccountDeliveryRepositoryError::LeaseConflict)
     );
 
     let reconciled = AccountDeliveryReceipt {
