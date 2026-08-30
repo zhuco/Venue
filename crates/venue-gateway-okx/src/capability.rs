@@ -186,12 +186,53 @@ impl PersistedOkxCapabilityProbe {
     }
 }
 
+/// Validated, immutable view of legacy probe evidence.
+///
+/// Mutation and scope fields are deliberately not writable by callers:
+///
+/// ```compile_fail
+/// use venue_gateway_okx::OkxCapabilityCandidate;
+///
+/// fn rewrite_flags(candidate: &mut OkxCapabilityCandidate) {
+///     candidate.candidate_flags = candidate.candidate_flags();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use venue_gateway_okx::OkxCapabilityCandidate;
+///
+/// fn rewrite_generation(candidate: &mut OkxCapabilityCandidate) {
+///     candidate.scope.private_generation += 1;
+/// }
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OkxCapabilityCandidate {
-    pub scope: OkxCapabilityProbeScope,
-    pub evidence_sha256: String,
-    pub candidate_flags: CapabilityFlags,
-    pub readback: OkxPrivateReadbackCandidate,
+    scope: OkxCapabilityProbeScope,
+    evidence_sha256: String,
+    candidate_flags: CapabilityFlags,
+    readback: OkxPrivateReadbackCandidate,
+}
+
+impl OkxCapabilityCandidate {
+    #[must_use]
+    pub const fn scope(&self) -> &OkxCapabilityProbeScope {
+        &self.scope
+    }
+
+    #[must_use]
+    pub fn evidence_sha256(&self) -> &str {
+        &self.evidence_sha256
+    }
+
+    #[must_use]
+    pub const fn candidate_flags(&self) -> CapabilityFlags {
+        self.candidate_flags
+    }
+
+    #[must_use]
+    pub const fn readback(&self) -> &OkxPrivateReadbackCandidate {
+        &self.readback
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -972,26 +1013,30 @@ mod tests {
             validate_capability_candidate(&config, &instrument, &persisted, BASE_MS + 1_000)?;
         assert!(
             candidate
-                .candidate_flags
+                .candidate_flags()
                 .contains(CapabilityFlags::PRIVATE_STREAM)
         );
         assert!(
             candidate
-                .candidate_flags
+                .candidate_flags()
                 .contains(CapabilityFlags::HEDGE_POSITION)
         );
-        assert!(!candidate.candidate_flags.contains(CapabilityFlags::TRADE));
+        assert!(!candidate.candidate_flags().contains(CapabilityFlags::TRADE));
         assert!(
             !candidate
-                .candidate_flags
+                .candidate_flags()
                 .contains(CapabilityFlags::PLACE_LIMIT)
         );
         assert!(
             !candidate
-                .candidate_flags
+                .candidate_flags()
                 .contains(CapabilityFlags::PLACE_MARKET)
         );
-        assert!(!candidate.candidate_flags.contains(CapabilityFlags::CANCEL));
+        assert!(
+            !candidate
+                .candidate_flags()
+                .contains(CapabilityFlags::CANCEL)
+        );
         let fixture_candidate = validate_mutation_capability_fixture(
             &config,
             &instrument,
@@ -1000,12 +1045,12 @@ mod tests {
         )?;
         assert!(
             fixture_candidate
-                .candidate_flags
+                .candidate_flags()
                 .contains(CapabilityFlags::PLACE_LIMIT)
         );
         assert!(
             !candidate
-                .candidate_flags
+                .candidate_flags()
                 .contains(CapabilityFlags::WITHDRAW)
         );
         assert_eq!(
@@ -1082,36 +1127,39 @@ mod tests {
         let (persisted, directory) = persist_fixture("net-read.json", &evidence)?;
         let candidate =
             validate_read_capability_candidate(&config, &instrument, &persisted, BASE_MS + 1_000)?;
-        assert_eq!(candidate.scope.position_mode, OkxPositionMode::Net);
+        assert_eq!(candidate.scope().position_mode, OkxPositionMode::Net);
         assert!(
             candidate
-                .candidate_flags
+                .candidate_flags()
                 .contains(CapabilityFlags::READ_ACCOUNT)
         );
         assert!(
             candidate
-                .candidate_flags
+                .candidate_flags()
                 .contains(CapabilityFlags::READ_ORDERS)
         );
         assert!(
             candidate
-                .candidate_flags
+                .candidate_flags()
                 .contains(CapabilityFlags::READ_FILLS)
         );
         assert!(
             candidate
-                .candidate_flags
+                .candidate_flags()
                 .contains(CapabilityFlags::PRIVATE_STREAM)
         );
-        assert!(!candidate.candidate_flags.contains(CapabilityFlags::TRADE));
+        assert!(!candidate.candidate_flags().contains(CapabilityFlags::TRADE));
         assert!(
             !candidate
-                .candidate_flags
+                .candidate_flags()
                 .contains(CapabilityFlags::HEDGE_POSITION)
         );
         let public_candidate =
             validate_capability_candidate(&config, &instrument, &persisted, BASE_MS + 1_000)?;
-        assert_eq!(public_candidate.candidate_flags, candidate.candidate_flags);
+        assert_eq!(
+            public_candidate.candidate_flags(),
+            candidate.candidate_flags()
+        );
         fs::remove_dir_all(directory)?;
         Ok(())
     }

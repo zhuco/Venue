@@ -52,18 +52,18 @@ impl OkxPhysicalCandidate {
     ) -> Result<Self, OkxPhysicalError> {
         let probe = validate_mutation_capability_fixture(&config, &instrument, persisted, now_ms)
             .map_err(|_| OkxPhysicalError::Capability)?;
-        if probe.readback.profile.position_mode() != crate::OkxPositionMode::LongShort
-            || probe.readback.scope().trade_mode() != probe.scope.trade_mode
-            || probe.readback.scope().attempt_id() != probe.scope.read_attempt_id
+        if probe.readback().profile.position_mode() != crate::OkxPositionMode::LongShort
+            || probe.readback().scope().trade_mode() != probe.scope().trade_mode
+            || probe.readback().scope().attempt_id() != probe.scope().read_attempt_id
         {
             return Err(OkxPhysicalError::Scope);
         }
         let capability = CapabilitySnapshot {
-            binding: probe.scope.binding.clone(),
-            version: probe.scope.capability_version,
-            observed_ms: probe.scope.observed_at_ms,
-            expires_ms: probe.scope.expires_at_ms,
-            flags: probe.candidate_flags,
+            binding: probe.scope().binding.clone(),
+            version: probe.scope().capability_version,
+            observed_ms: probe.scope().observed_at_ms,
+            expires_ms: probe.scope().expires_at_ms,
+            flags: probe.candidate_flags(),
         };
         Ok(Self {
             config,
@@ -85,17 +85,17 @@ impl OkxPhysicalCandidate {
 
     #[must_use]
     pub const fn private_generation(&self) -> u64 {
-        self.probe.scope.private_generation
+        self.probe.scope().private_generation
     }
 
     #[must_use]
     pub fn probe_sha256(&self) -> &str {
-        &self.probe.evidence_sha256
+        self.probe.evidence_sha256()
     }
 
     #[must_use]
     pub const fn readback(&self) -> &crate::OkxPrivateReadbackCandidate {
-        &self.probe.readback
+        self.probe.readback()
     }
 
     #[cfg(test)]
@@ -118,7 +118,7 @@ impl OkxPhysicalCandidate {
             ExecutionCommand::MarketReduce(command) => {
                 let signed_quantity = self
                     .probe
-                    .readback
+                    .readback()
                     .positions
                     .iter()
                     .find(|position| position.position.side == command.position_side)
@@ -147,8 +147,8 @@ impl OkxPhysicalCandidate {
         let request = build_place_request(
             &self.config,
             &self.instrument,
-            &self.probe.readback.profile,
-            self.probe.scope.trade_mode,
+            &self.probe.readback().profile,
+            self.probe.scope().trade_mode,
             intent,
         )?;
         if request.is_reduce_once() != reduce_once {
@@ -158,7 +158,7 @@ impl OkxPhysicalCandidate {
             binding: self.binding().clone(),
             capability_version: self.capability.version,
             capability,
-            probe_sha256: self.probe.evidence_sha256.clone(),
+            probe_sha256: self.probe.evidence_sha256().to_owned(),
             prepared_at_ms: now_ms,
             request: OkxPhysicalRequest::Place {
                 request: Box::new(request),
@@ -178,7 +178,7 @@ impl OkxPhysicalCandidate {
         let request = build_cancel_request(
             &self.config,
             &self.instrument,
-            &self.probe.readback.profile,
+            &self.probe.readback().profile,
             command,
             accepted_order,
         )?;
@@ -186,7 +186,7 @@ impl OkxPhysicalCandidate {
             binding: self.binding().clone(),
             capability_version: self.capability.version,
             capability: MutationCapability::Cancel,
-            probe_sha256: self.probe.evidence_sha256.clone(),
+            probe_sha256: self.probe.evidence_sha256().to_owned(),
             prepared_at_ms: now_ms,
             request: OkxPhysicalRequest::Cancel {
                 request: Box::new(request),
@@ -254,7 +254,7 @@ impl OkxPhysicalSession {
                         .reduce_once(
                             &self.credentials,
                             &self.candidate.instrument,
-                            &self.candidate.probe.readback.profile,
+                            &self.candidate.probe.readback().profile,
                             *request,
                             timestamp,
                         )
@@ -264,7 +264,7 @@ impl OkxPhysicalSession {
                         .place_once(
                             &self.credentials,
                             &self.candidate.instrument,
-                            &self.candidate.probe.readback.profile,
+                            &self.candidate.probe.readback().profile,
                             *request,
                             timestamp,
                         )
@@ -275,13 +275,13 @@ impl OkxPhysicalSession {
                         let request = build_order_readback_request(
                             &self.candidate.config,
                             &self.candidate.instrument,
-                            &self.candidate.probe.readback.profile,
+                            &self.candidate.probe.readback().profile,
                             &accepted,
                         )?;
                         OkxDispatchOnceResult::PendingReadback(OkxPendingMutation {
                             binding: self.candidate.binding().clone(),
                             capability_version: self.candidate.capability.version,
-                            probe_sha256: self.candidate.probe.evidence_sha256.clone(),
+                            probe_sha256: self.candidate.probe.evidence_sha256().to_owned(),
                             request: OkxPendingRequest::OrderAck(request),
                         })
                     }
@@ -289,7 +289,7 @@ impl OkxPhysicalSession {
                         OkxDispatchOnceResult::PendingReadback(OkxPendingMutation {
                             binding: self.candidate.binding().clone(),
                             capability_version: self.candidate.capability.version,
-                            probe_sha256: self.candidate.probe.evidence_sha256.clone(),
+                            probe_sha256: self.candidate.probe.evidence_sha256().to_owned(),
                             request: OkxPendingRequest::OrderUnknown(*readback),
                         })
                     }
@@ -303,7 +303,7 @@ impl OkxPhysicalSession {
                 .cancel_once(
                     &self.credentials,
                     &self.candidate.instrument,
-                    &self.candidate.probe.readback.profile,
+                    &self.candidate.probe.readback().profile,
                     &accepted_order,
                     *request,
                     timestamp,
@@ -314,14 +314,14 @@ impl OkxPhysicalSession {
                     let request = build_cancel_order_readback_request(
                         &self.candidate.config,
                         &self.candidate.instrument,
-                        &self.candidate.probe.readback.profile,
+                        &self.candidate.probe.readback().profile,
                         &accepted_order,
                         &accepted_cancel,
                     )?;
                     OkxDispatchOnceResult::PendingReadback(OkxPendingMutation {
                         binding: self.candidate.binding().clone(),
                         capability_version: self.candidate.capability.version,
-                        probe_sha256: self.candidate.probe.evidence_sha256.clone(),
+                        probe_sha256: self.candidate.probe.evidence_sha256().to_owned(),
                         request: OkxPendingRequest::CancelAck(request),
                     })
                 }
@@ -329,7 +329,7 @@ impl OkxPhysicalSession {
                     OkxDispatchOnceResult::PendingReadback(OkxPendingMutation {
                         binding: self.candidate.binding().clone(),
                         capability_version: self.candidate.capability.version,
-                        probe_sha256: self.candidate.probe.evidence_sha256.clone(),
+                        probe_sha256: self.candidate.probe.evidence_sha256().to_owned(),
                         request: OkxPendingRequest::CancelUnknown(*readback),
                     })
                 }
@@ -386,7 +386,7 @@ impl OkxOneShotMutation {
     ) -> Result<(), OkxPhysicalError> {
         if self.binding != *candidate.binding()
             || self.capability_version != candidate.capability.version
-            || self.probe_sha256 != candidate.probe.evidence_sha256
+            || self.probe_sha256 != candidate.probe.evidence_sha256()
             || now_ms < self.prepared_at_ms
         {
             return Err(OkxPhysicalError::Scope);
@@ -454,7 +454,7 @@ impl OkxPendingMutation {
     fn validate(&self, candidate: &OkxPhysicalCandidate) -> Result<(), OkxPhysicalError> {
         if self.binding != *candidate.binding()
             || self.capability_version != candidate.capability.version
-            || self.probe_sha256 != candidate.probe.evidence_sha256
+            || self.probe_sha256 != candidate.probe.evidence_sha256()
         {
             return Err(OkxPhysicalError::Scope);
         }
