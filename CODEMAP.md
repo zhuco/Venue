@@ -1,18 +1,20 @@
 # VENUE 功能入口
 
-更新：2026-08-30
+更新：2026-08-31
 
-本文件只回答“功能代码在哪里”。合并跟单、六交易所、指标、桌面 UI 后的目标 workspace、依赖边界、技术栈和迁移顺序查
+本文件只回答“当前功能代码在哪里”。合并跟单、六交易所、指标、桌面/Web UI 后的目标 workspace、依赖边界和技术栈查
 [`ARCHITECTURE.md`](ARCHITECTURE.md)；多策略账户运行时、网格、成交热路径、库存恢复、验收和接管统一查
-[`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md)；当前获准的待实现 Goal 查
+[`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md)；统一执行链、Stage 7 退休、持续实盘授权、多子任务和 Web 迁移查
+[`UNIFIED_GATEWAY_WEB_MIGRATION.md`](UNIFIED_GATEWAY_WEB_MIGRATION.md)；当前获准的待实现 Goal 查
 [`REFACTOR_IMPLEMENTATION_GOALS.md`](REFACTOR_IMPLEMENTATION_GOALS.md)。不要从 `bak/` 或历史提交寻找当前约束。
 
 ## 进程、配置与通用领域
 
 | 功能 | 首要入口 | 直接继续 |
 |---|---|---|
+| 当前统一迁移 Goal | `UNIFIED_GATEWAY_WEB_MIGRATION.md` | T0–T8 子任务把 Stage 7 直接重构到六所统一 Account Runtime/Execution Lane，闭合 Copy 物理执行并建立响应式 `apps/venue-web`；真实 mutation 全局串行，AI 持续授权和 10U 技术门见第 2.1 节 |
 | 构建、依赖与仓库体积门禁 | `Cargo.toml` | workspace 当前包含根 package、`venue-copy`、`venue-control-protocol`、`venue-domain`、`venue-execution`、`venue-indicators`、`venue-runtime`、`venue-storage`、`venue-strategies`、`venue-gateway-api`、六个 `venue-gateway-*` adapter、`apps/venue-node`、`apps/venue-control` 与 `apps/venueflow`，resolver 固定为 3；workspace 与 `rust-toolchain.toml` 共同锁定 Rust 1.98.0；`.cargo/config.toml` 固定本地构建目录为 `G:\Build\Venue`；`Cargo.lock`；`scripts/verify_repository_hygiene.ps1` 执行体积和运行态文件门禁 |
-| MVP 实盘安全与工件预算 | `crates/venue-execution/src/account_host.rs`、`GRID_RUNTIME_REFACTOR.md` 第 1、4.4、7、8、11 节 | 新交易所只采用账户级进程锁、单一分段命令 WAL、WAL 内 Owner 字段和 Unknown 冻结/签名对账；host 在同一 WAL 持久化 `Submitted` 后才签发不可复制的一次性 dispatch permit，账户累计名义仓位上限固定 10U，已有未撤入场或交易所非零持仓时拒绝继续增险。干净 active 段达到 5 MiB 后轮转为连续编号历史段并在启动时整体重放；含未决状态时不轮转且冻结新增风险，单文件 10 MiB 硬上限。旧 Stage 7 的多层 lease/root/receipt/manifest/handoff 仅作迁移兼容，不得复制。工件根固定 `G:\Venue\artifacts`，原始私流最多 10 MiB、根预算 256 MiB |
+| 目标账户实盘安全与工件预算 | `crates/venue-execution/src/account_host.rs`、`crates/venue-runtime/src/account_lane.rs`、`GRID_RUNTIME_REFACTOR.md` 第 4.4、7、8、11 节 | 六所目标统一采用账户级进程锁、单一分段命令 WAL、WAL 内 Owner 和 Unknown 签名对账；host 在同一 WAL 持久化 `Submitted` 后才签发不可复制的一次性 dispatch permit。当前代码仍需补账户级汇总 10U 风险门，完成前持续授权不得发送新增风险。旧 Stage 7 多层 authority 仅作迁移兼容。工件根固定 `G:\Venue\artifacts`，轮转、单文件和根预算分别为 5 MiB、10 MiB、256 MiB |
 | 六所网关身份、模式与能力门禁 | `crates/venue-gateway-api/src/lib.rs` | 规范 venue 固定 Binance、Bitget、Bybit、Gate.io、Hyperliquid、OKX；运行模式只接受精确 `LIVE`，`PublicMarketBinding` 另提供无账户、无凭证、无 mutation 的 Binance USD-M 公共行情 scope；旧 `capability_promotion.rs` 的普通 `promote/authorize` 入口继续固定 `AuthorityUnavailable`，序列化 probe 不能升级能力；Bybit、OKX、Hyperliquid MVP 不复用该旧 authority 链，只消费 `AccountMutationHost` 在 WAL `Submitted` 后签发的一次性不可构造 permit |
 | Binance Portfolio Margin adapter | `crates/venue-gateway-binance/src/lib.rs` | `transport.rs`、`private_ws.rs`、`readback.rs` 与 `execution.rs` 提供绑定型 async HTTP/私流、Net/Hedge 完整腿、regular/Algo/conditional-unsupported、fills cursor、place/cancel/reduce-once 及 ACK 后 exact signed readback；`recovery.rs` 的生产只读 collector 先以真实签名 Account 解析签发同 transport seal，再在同一有界 attempt 内冻结完整 symbol/cursor universe、逐 await 重验并采集六面 raw；生产不接 caller Owner/root，所有可见订单保持 structured Unknown。它不是 runtime recovery authority，不授予 capability/WAL/writer；Stage 7 仍是生产权威 |
 | Bitget adapter | `crates/venue-gateway-bitget/src/lib.rs` | `transport.rs`、`private_ws.rs`、`execution.rs` 与 `order_families.rs` 提供精确 LIVE async 私有链路、账户五面同 attempt、normal/unsupported 订单族、place/cancel/reduce-once 与 UNKNOWN exact readback；生产 transport 仅在 login 与三频道 ACK 后签发一次性只读 session，绑定凭证、完整 symbol/cursor universe、deadline 和全局 pages/bytes，并在每次 HTTP 前后以唯一 nonce Pong 重验。`recovery.rs` 将同代五面折叠为 Account/Positions/UmOrder/UmConditional-unsupported/UmAlgo-unsupported/FillsCursor 六面证据；`runtime_recovery.rs` 用完整注册表、Owner/WAL/Unknown roots 和 session commitment 绑定 bundle，并逐 await 重验 Runtime scope。adapter 静态能力为空 |
@@ -21,17 +23,18 @@
 | OKX V5 adapter | `crates/venue-gateway-okx/src/account_gateway.rs` | 生产固定 Long/Short + Cross、实时 SWAP 规则、post-only place、精确 cancel 与 `clOrdId` signed readback；`public.rs` 按 `ctVal × ctMult × contracts` 在 base 数量与张数间换算并向下取整，不突破 10U；ACK 正常解析失败但订单行 `sCode=0` 时必须持久化 `Unknown` 并签名回读，禁止误记 `Rejected` 后继续增险；原始 POST 为 crate-private |
 | Hyperliquid adapter | `crates/venue-gateway-hyperliquid/src/account_gateway.rs` | 生产固定主账户/API Wallet 绑定、meta/clearinghouse/open-orders 预检、ALO place、精确 cancel 与 cloid readback；nonce 在签名前原子持久化且单文件上限 4 KiB，`/exchange` 为 crate-private 并只消费 host permit |
 | CLI 定义与命令分派 | `src/cli.rs` | `src/app.rs`、`src/main.rs` |
-| 六所固定账户节点产物 | `apps/venue-node/src/lib.rs` | 六 binary 继续逐 adapter 隔离。Bybit、OKX、Hyperliquid 生产只接受显式 `preflight`、`canary-place`、`canary-cancel`，要求精确小写 `--confirm-live`，从根 `.env` 读取凭证并接入 `AccountMutationHost`；账户累计名义仓位硬上限 10U。Binance、Gate.io、Bitget 继续使用各自现有入口，迁移状态以对应 adapter 行为为准 |
+| 六所固定账户节点产物 | `apps/venue-node/src/lib.rs` | 六 binary 逐 adapter 隔离。迁移期 Bybit、OKX、Hyperliquid 接 `AccountMutationHost` 的 preflight/Canary；Binance、Gate.io、Bitget 仍委托 Stage 7。目标是六所均由同一常驻 Account Runtime 组合唯一 Lane/host，不保留旁路 writer；`--confirm-live` 可由迁移任务持续授权提交，但不绕过风险/WAL/签名门 |
 | Control→Node delivery inbox | `apps/venue-node/src/control_delivery.rs` | `control_delivery_storage.rs` 是 `venue_storage::OpaqueJournal` 的唯一 Node adapter，`control_http_client.rs` 只访问精确 loopback HTTP；claim、ACK 与 receipt 每次 HTTP await 后都以当前时钟重验 lease/session/epoch，ACK 绑定完整 inbox replay root/sequence/node，过期 outbox 不确认或重放并等待下一 epoch reconciliation。Copy 由 `copy_semantic.rs` 严格校验 immutable manifest 并派生规范 Actor/Owner；只有 Runtime 的真实 durable Applied receipt 精确匹配 delivery/inbox commitment 才可写 `Applied`。不授予 capability、writer、WAL 或 dispatch |
 | Actor Applied 持久化证据 | `crates/venue-storage/src/actor_applied.rs` | `create_new` 与 `open_existing(anchor)` 耦合 hash-chain journal 和原子 checkpoint；anchor 精确绑定 root/tail/count/checkpoint，缺件、截断、旧一致副本、崩溃窗口、scope/generation/turn/replay/WAL 回退均失败关闭。`venue-runtime::account::copy_actor` 只从恢复后的真实 WAL durable head 写入 Copy Actor Applied；未完成恢复、非 Ready、无签名 generation 或 commitment 不匹配均失败关闭。receipt 不是身份、WAL 或 mutation authority |
 | 多策略账户运行时内核 | `crates/venue-runtime/src/account/mod.rs` | `registry.rs`、`private_router.rs`、`market_hub.rs`、`reconciler.rs` 与 `recovery.rs` 固定账户恢复/路由边界，`runtime_error.rs` 集中运行时失败语义；旧 `physical_recovery*` 多层证据链保持 Stage 7 迁移兼容且不再扩展。Bybit、OKX、Hyperliquid 的 MVP 生产 mutation 直接使用 `venue-execution::AccountMutationHost` 的账户锁、分段 WAL、Unknown 对账与一次性 permit，不从旧 Runtime fixture 或 capability 链取得 authority |
 | 策略 Actor 宿主与邮箱 | `crates/venue-runtime/src/strategy/mod.rs` | 私有事实与 Delta/Trade/Bar 有界无损；仅 Snapshot/Ticker/MarkFunding 合并；私有 burst 64 后让行对账/控制；一个实例一个 runtime-issued turn，durable applied receipt 后才可 Running/输出授权意图；`src/runtime/strategy/mod.rs` 只兼容重导出 |
 | 共享私有事实调度 | `crates/venue-runtime/src/shared/private_facts.rs` | effect 调度、session generation/ticket、周期刷新、退避与 readiness/snapshot；单 in-flight 且证据尾绑定，跨 generation 结果拒绝；根 worker 仅保留兼容 facade 与 Binance 协议/REST/WS 组合，不持有 writer/WAL/mutation |
-| 跟单纯规划内核 | `crates/venue-copy/src/lib.rs` | `capital.rs` 冻结资本并计算目标敞口，跨零反向必须分两轮；`identity.rs` 固化 job/snapshot/child/idempotency 身份；`sizing.rs` 与 `limit.rs` 完成数量和跨所 LIMIT 规范化；`delivery.rs` 绑定 immutable manifest 与 Applied/Unknown/Reconciled/Rejected 持久回执，Unknown 禁止重投；`ledger.rs` 幂等投影 Copy/External/Manual 归因；`drift.rs` 只从新鲜权威持仓生成新 job 的语义修复；需落 PostgreSQL 的值类型提供 serde，但全 crate 仍无 storage/network/runtime/writer/mutation authority |
+| 跟单纯规划内核 | `crates/venue-copy/src/lib.rs` | `capital.rs`、`identity.rs`、`sizing.rs`、`limit.rs`、`delivery.rs`、`ledger.rs`、`drift.rs` 提供纯语义；Control relation/delivery 与 Node semantic Applied 已接入。当前物理缺口是 Copy Actor 尚未生成 follower AccountExecutionIntent，也尚未以签名订单/成交/持仓回写 ledger/drift；Copy crate 永不持有 writer/client |
 | 版本化 Control 协议 | `crates/venue-control-protocol/src/lib.rs` | schema v2 DTO 固定 snapshot、event、command、receipt 与账户节点 delivery/claim/ACK/Unknown/Reconciled 的精确 LIVE binding、instance/config epoch 校验；`CopyRelationConfig` 另固定 relation UUID/revision、Leader/Follower 精确账户/实例/交易对绑定、资本、倍率、准备金、风险和 lifecycle；协议不授予 capability、writer、WAL 或交易权限 |
 | Control 服务核心 | `apps/venue-control/src/lib.rs` | Control 命令、本地 HTTP/SSE `/v2`、PostgreSQL fencing delivery lease 及 `account_node_poll.rs` 的 bounded claim/ACK/receipt HTTP 路由已落地；repository 始终重验 LIVE scope/lease/sequence，重复 receipt 幂等且冲突关闭；`/v2/copy/relations` 用 PostgreSQL revision、唯一 follower binding 和 JSON/索引列一致性保存配置；`venue-copy-worker` 只生成语义 job，mutation authority 恒为 false |
-| VenueFlow 原生/Web 客户端 | `apps/venueflow/src/main.rs` | native 用 `Last-Event-ID`、Web 用 `after=` 恢复命名 `control` SSE；snapshot/SSE 健康分离，接收上限 2 MiB、退避封顶 5 秒；Pause/Resume/Stop/Flatten 显示精确 scope，其中 Pause/Stop/Flatten 要求确认。跟单面板可查询、创建和 revision 编辑关系，展示精确双端绑定、资本/倍率/风险、目标/实际/漂移和任务/回执账本；两端均无账户私流、交易客户端、secret 或 artifacts 写权限 |
-| 账户 Execution Lane 调度 | `crates/venue-runtime/src/account_lane.rs` | Applied turn + journal identity receipt 绑定 connection/private/config/turn、命令摘要、native ID/family；创建先保留 Owner 路由，Cancel 精确核对 owner/family；有界公平队列、实例 Unknown fence；候选、WAL-prepared、一次性 dispatch permit 分态，WAL 后 fence 必须持久收敛；outcome/abort/readback 只收精确持久收据；不持有 writer/WAL/client，`src/execution/account_lane.rs` 只兼容重导出，Stage 7 实盘 mutation 路径不变 |
+| VenueFlow 内部运维客户端 | `apps/venueflow/src/main.rs` | 原生/WASM 继续查询 Control、编辑 Copy relation 和提交精确 scope 控制，保留内部诊断与无凭证公共行情能力；不作为面向用户的主 Web，不充当 BFF，不持有账户私流、writer、WAL、secret 或交易客户端 |
+| 响应式用户 Web（待建立） | `UNIFIED_GATEWAY_WEB_MIGRATION.md` 第 6 节 | 目标入口 `apps/venue-web`；Next.js 16 + React 19 + TypeScript、同源 BFF、桌面/移动端。目录尚未建立，不得把旧 `G:\kol\apps\web` 或 VenueFlow WASM 当作已完成入口 |
+| 账户 Execution Lane 调度 | `crates/venue-runtime/src/account_lane.rs` | 现有纯调度负责 Owner、优先级、单 in-flight 和 Unknown fence，不持有 writer/WAL/client。目标由 Account Runtime 将它与 `AccountMutationHost` 组合为六所唯一生产链；在此完成前 Stage 7/Canary host 仍是迁移期物理入口，不能称为已统一 |
 | Hedged Grid 固定部署组合 | `src/deployment.rs` | `src/bin/hedged-grid-{binance,gate,bitget}.rs`；Cargo `hedged-grid-*` feature 固定组合，只允许只读 doctor/Grid 生命周期命令，且配置交易所必须匹配；Binance 组合另允许强锚定、零交易所 mutation 的 private/public evidence 恢复命令，Gate/Bitget 明确拒绝 |
 | 配置、交易所选择、账户身份、网格层数 | `src/config.rs` | `venue.toml`、`venue.grid.toml`、`venue.gate.example.toml`、`venue.bitget.example.toml`；`trading_account_id` 是系统稳定内部 ID，不要求交易所提供 UUID，同一真实账户跨 symbol 复用；`account_binding` 只表示交易所产品/模式能力 |
 | 凭证环境读取 | `src/credential_env.rs` | 根 `.env` 仅作本地输入，禁止读取到文档/日志 |
@@ -39,7 +42,10 @@
 | 日志初始化 | `src/log.rs` | 日志级别在 `src/config.rs` |
 | 错误汇总 | `src/error.rs` | 各领域本地错误枚举 |
 
-## 对冲网格
+## 对冲网格与 Stage 7 迁移期入口
+
+本节的 `stage7_*`、legacy、handoff 和旧 root 条目是当前生产行为/恢复入口，不是目标执行架构。只允许修复阻断等价接管的缺陷；
+目标调用、逐所退出和删除门见 `UNIFIED_GATEWAY_WEB_MIGRATION.md` 第 5、7、9 节。
 
 | 功能 | 首要入口 | 直接继续 |
 |---|---|---|
@@ -47,9 +53,9 @@
 | 网格纯状态机、库存、desired ladder、maker fill/滚动 | `crates/venue-strategies/src/hedged_grid/reducer.rs` | `model.rs` 持久化 fill anchor 与 passive-book fallback 穿价证明；只有 maker 成交驱动，taker 只更新库存与对账 |
 | 高暴露浮盈市价减仓 | `crates/venue-strategies/src/hedged_grid/exposure_guard.rs` | `crates/venue-domain/src/domain/risk_snapshot.rs`、`src/runtime/hedged_grid/{risk_snapshot,shadow_evidence}.rs`、`src/runtime/grid/stage7_exposure.rs`；策略 crate 只产出语义结果，持久化和 mutation 仍由根 runtime 承担 |
 | 风险 Shadow 只读验收 | `src/runtime/grid/stage7_exposure_shadow_verifier.rs` | `src/bin/verify-grid-exposure-shadow.rs`；要求 risk-bound admission，逐条交叉核对同 root 原始引用，再按三所固定 raw tuple 语义重放并精确比较 account/目标 leg；全程无凭证、网络和写入，且不等于风险 Live 准入 |
-| Binance 旧运行时兼容与当前共享实盘 | `src/runtime/legacy/hedged_grid_live.rs` | 旧 checkpoint/stop 兼容隔离在 `src/runtime/legacy/{hedged_grid_hot_path,hedged_grid_recovery,hedged_grid_support}.rs`，共用私有事实入口为 `src/runtime/shared/private_facts_worker.rs`；签名缺单与终态成交确认位于 legacy 的 `hedged_grid_fill_readback.rs`；当前实盘入口是共享 `run_binance_stage7_grid`，仍受 admission/handoff 门禁约束 |
-| 三家共享 Stage 7 runtime | `src/runtime/grid/stage7_grid.rs` | `src/runtime/grid/{stage7_grid_binding,stage7_resident,stage7_fill_drive,stage7_exposure,stage7_risk_lane,stage7_readback,stage7_grid_model,stage7_grid_error,stage7_mutation,stage7_retry}.rs`；新空根在取得唯一 root guard 后一次性持久化 Running，已有 checkpoint 缺失 control 时按 Stop 失败关闭，Stopping 只接受显式 Reset；所有 Shadow/Live/Canary/Stop/Flatten/交接均要求三订单族签名覆盖，且 regular 投影必须与该族快照完全一致；完整 owned maker fill 经私有证据、reducer 与最小 checkpoint 后直接进入滚动 WAL/唯一 writer，不读 BBO、公共流、风险或逐单 REST；三所 exchange-native post-only 是穿价竞态的物理栅栏，明确拒绝只按精确 WAL 结果转签名对账，禁止改价、吃单或自动重试旧命令；周期风险首轮采集由单 in-flight request-only lane 执行，不持有 writer/WAL/mutation，过时代结果不入证据；初装/整网重建仍在 closing 签名确认后再次排空并重采 BBO，opening 必须全量 post-only；缺失、矛盾或非托管条件/Algo 行一律失败关闭 |
-| Stage 7 Canary 与准入 | `src/runtime/grid/stage7_grid_canary.rs` | `src/runtime/grid/{stage7_canary_runtime,stage7_canary_support,stage7_canary_safety,stage7_canary_contract,stage7_canary_limit}.rs`；准入 configuration digest 显式绑定 `grid_count` 与完整风险发布参数，Live 启动严格匹配当前配置 |
+| Binance Stage 7 冻结生产入口 | `src/runtime/legacy/hedged_grid_live.rs` | checkpoint/stop 兼容在 `src/runtime/legacy/{hedged_grid_hot_path,hedged_grid_recovery,hedged_grid_support}.rs`，当前实盘入口为 `run_binance_stage7_grid`；迁移前仍受既有 admission/handoff 门禁，统一链接管后退出生产调用 |
+| 三家 Stage 7 冻结 runtime | `src/runtime/grid/stage7_grid.rs` | `stage7_resident/fill_drive/exposure/risk_lane/readback/mutation/retry` 保存当前三所网格热路径和行为证据；完整 maker fill、post-only、完整订单族签名回读、Unknown 与重建语义必须提取为统一 runtime 契约，禁止在该入口新增第二套功能 |
+| Stage 7 冻结 Canary/准入 | `src/runtime/grid/stage7_grid_canary.rs` | `stage7_canary_*` 继续保护迁移期实盘并绑定现有配置摘要；新链完成同等门禁和逐所接管前不得删除 |
 | Stage 7 停止接管、清仓、健康、writer root | `src/runtime/grid/stage7_executable_handoff.rs` | schema-1 同 root 升级及 schema-2 跨主机/root 保仓迁移；`crates/venue-execution/src/canonical_root.rs` 以 `(exchange, trading_account_id)` 而非 symbol/Owner 建立机器级 canonical root 与进程锁，`src/runtime/grid/stage7_writer_registry.rs` 保持原 Stage 7 facade，Stage7、旧网格、Scalping Live、Canary 和可写恢复共用；Stop 与到期 `BlockedUnknown` 共用全订单族签名回读的 WAL 收敛与残仓 custody；最终 handoff 的 lease/readback 不得回退或跨 session；immutable receipt 后精确 fence 旧 lease，只有 receipt 绑定的 executable 可激活下一 writer generation；显式 WAL 封存只允许在签名全族为空、零未决和零本地事务边界执行 |
 | Binance 外部 Algo 精确清理 | `src/runtime/grid/stage7_external_algo_cleanup.rs` | CLI `grid-external-algo-cancel` 仅在完整签名 Algo 页证明“唯一一行且两个 operator 锚定 ID 精确匹配”、regular 页仍与 grid checkpoint/WAL 绑定且旧 WAL 零未决时开放；`src/execution/{external_algo_cleanup,recovery_writer}.rs` 复用 canonical root 与 `writer.json.lock`，先 fsync hash-chain `external_algo_cleanup.jsonl` 再发一次精确撤单，HTTP 回报不作终态，必须以新签名 Algo 空页结算；不把外部单伪造成 owned order，不撤 regular 网格单 |
 | Binance 旧运行时保仓桥接 | `src/runtime/grid/binance_legacy_stage7_bridge.rs` | CLI `grid-legacy-binance-stop` 只请求旧进程正常停止；bridge 在任何工件写入前取得相同 canonical Stage 7 writer-root guard，只接受全订单族签名零单、零未决与同 binding writer；全程无交易 mutation |
@@ -59,7 +65,7 @@
 | 共享 Grid 行为内核 | `src/runtime/hedged_grid/mod.rs` | `fill_driver.rs`、`rebuild.rs`、`risk_snapshot.rs`、`exposure_repair.rs`；三家实盘均由 `stage7_resident.rs` 组合，旧壳仅保留迁移兼容，须待完整验收后删除 |
 | 当前 Binance 配置/root | `venue.grid.toml` | 服务器 canonical root `/home/cta/venue/artifacts/hedged_grid_sol_usdc`；运行中的 immutable release 必须由进程、admission 与 executable SHA 共同核验，禁止以本文固定发布号替代实测；风险为 Live `3 / 0.05 / 0.30`；Shell 加载 CRLF `.env` 时必须去除行尾 CR，禁止改变凭证内容 |
 | 当前 Gate 配置/root | `venue.gate.example.toml` | 服务器 `/home/cta/venue/artifacts/gate_doge_usdt`；风险为 Live `3 / 0.05 / 0.30`；发布号和当前订单数以服务器签名 doctor 与 handoff 收据为准，不在长期文档固化 |
-| 当前 Bitget 配置/root | `venue.bitget.example.toml` | 服务器 canonical root 为 `/home/cta/venue/artifacts/bitget_doge_usdt`，当前发布 `releases/bitget-doge-usdt-77664b808a1b93b6`，风险为 Live `3 / 0.05 / 0.30`；运行状态、订单数、pending/WAL 与 custody 只以该 root 的新鲜签名证据及 writer/handoff 收据为准，不在长期文档固化瞬时值 |
+| 当前 Bitget 配置/root | `venue.bitget.example.toml` | 服务器 canonical root 为 `/home/cta/venue/artifacts/bitget_doge_usdt`，风险为 Live `3 / 0.05 / 0.30`；活动 release、运行状态、订单数、pending/WAL 与 custody 只以服务器进程、新鲜签名证据及 writer/handoff 收据为准，不在长期文档固化瞬时值 |
 | 内容寻址发布准备 | `scripts/prepare_hedged_grid_release.ps1` | 按 Exchange 以单一 feature 构建；`verify_hedged_grid_binary_isolation.ps1` 扫描生产 endpoint，拒绝链接其它 adapter；不停止进程、不复制凭证或 artifacts |
 
 ## 交易所 adapter

@@ -1,6 +1,6 @@
 # 多策略、多交易所账户运行时与对冲网格开发规范
 
-更新：2026-08-30
+更新：2026-08-31
 
 ## 1. 文档职责
 
@@ -9,6 +9,14 @@
 [`ARCHITECTURE.md`](ARCHITECTURE.md) 定义合并跟单、六交易所网关、指标和桌面 UI 后的目标 workspace。六所是网关目标覆盖，
 网关只接受精确 `LIVE` 并只使用生产 endpoint；这不自动扩大当前 Stage 7 网格的三所实盘准入，新增交易所仍必须独立完成策略、恢复和接管验收。
 本文现有 Shadow/verify 是策略与工件证据流程，不是第三种网关运行模式。
+
+Stage 7 直接重构到统一账户执行链、六所逐家接管和响应式 Web 迁移的阶段统一查
+[`UNIFIED_GATEWAY_WEB_MIGRATION.md`](UNIFIED_GATEWAY_WEB_MIGRATION.md)。本文继续拥有成交热路径、安全不变量和实盘接管最终解释权。
+
+该迁移任务已获得持续实盘授权：AI 可在现有账户 binding 和能力约束内选择交易对，对单账户累计不超过 10U 的名义风险执行
+逐所真实 Canary，并自行使用 CLI 的 `--confirm-live` 等技术确认参数，无需逐次请求人工确认。初期 Bybit、OKX、Hyperliquid
+既有 DOGE binding 仍固定为 `DOGE/USDT`。授权不包含提款、转账、修改账户安全/杠杆/保证金设置、创建凭证、突破 10U、
+Unknown 时增险或双 writer；完整范围和人工协助延后规则以迁移文档第 2.1–2.2 节为准。
 
 `CODEMAP.md` 只负责定位代码。事故时间线、已完成阶段、临时发布号和一次性排障记录不得继续写入长期文档。
 
@@ -23,7 +31,8 @@
 - 所有下单、撤单和市价减仓经过账户内唯一 Execution Lane（执行通道）；
 - Web 面板或 Windows UI 以后只接控制与查询接口，不进入交易热路径。
 
-现有 Stage 7 共享网格运行时是迁移中的可运行实现。新增修复必须符合本文边界，不再扩展成另一套交易所专用运行时。
+现有 Stage 7 共享网格运行时是迁移中的可运行实现和行为证据源。除修复阻断等价接管的缺陷外不得新增功能；其生产编排须直接
+收敛到统一 Account Runtime、Execution Lane 和 AccountMutationHost，最终不得保留第二套 writer/WAL/authority 链。
 
 账户级纯内核固定在 `crates/venue-runtime/src/account/`，策略顺序邮箱固定在 `crates/venue-runtime/src/strategy/`，账户执行调度固定在 `crates/venue-runtime/src/account_lane.rs`。配置中的 `trading_account_id` 是本系统生成并稳定保存的内部账户 ID，不要求交易所提供 UUID；同一真实账户跨 symbol/策略复用。
 
@@ -73,7 +82,7 @@ Hyperliquid 使用 `HYPERLIQUID_ACCOUNT_ADDRESS`、`HYPERLIQUID_API_WALLET_ADDRE
 
 固定约束：
 
-1. Binance、Gate.io、Bitget 各账户独立进程，不能共用一个跨交易所进程。
+1. 六个交易所各账户独立进程，不能共用一个跨交易所进程；每个固定 Node binary 只链接一个 adapter。
 2. 同一账户可运行多个不同交易对的网格或剥头皮实例。
 3. 当前不支持同一账户、同一交易对运行多个策略。
 4. 同一交易对的所有订单和仓位只归一个 Strategy Actor。
@@ -396,32 +405,40 @@ G:\Venue\artifacts\<exchange>\LIVE\<trading_account_id>\
 
 ## 11. 迁移顺序
 
-### A. 共享语义与热路径
+### A. 冻结并提取共享行为
 
 - 保持三个交易所共用 reducer；
 - 用户流成交优先于 REST、风险和健康动作；
 - 部分成交不阻塞其他完整成交；
 - 每代完整签名回读即时发现缺单并重建。
+- 将上述行为固化为不依赖 Stage 7 authority/root 的 runtime contract test；迁移期不得改变策略语义迎合新外壳。
 
-### B. 单策略 Account Runtime（账户运行时）
+### B. 统一 Account Runtime（账户运行时）
 
-- 把现有单交易对 Stage 7 接入账户级 Market Hub、Private Router 和 Execution Lane；
-- 行为与当前实盘等价后再迁移持久化布局。
+- 组合 Strategy Registry、Market Hub、Private Router、Execution Lane、AccountMutationHost 和 Reconciler；
+- Grid、Scalping、Copy 只输出共同的规范账户意图；
+- 账户进程锁、命令 WAL、Owner、风险和 Unknown 只实现一次；
+- 先保持现有 adapter transport 和网格 reducer 行为等价，再迁移持久化布局或异步 transport。
 
 ### C. 同账户多交易对
 
 - 引入 Strategy Registry（策略注册表）和 symbol 唯一占用；
 - 验证两个网格或多个剥头皮交易对共享连接、独立状态和公平执行。
+- Copy Follower 与 Grid/Scalping 使用相同 Owner 冲突规则，同一账户同一 symbol 只能有一个实例。
 
 ### D. 逐交易所迁移
 
-每个交易所按相同步骤逐家推进，交易所之间不并行 mutation：
+真实 mutation 按 Binance、Gate.io、Bitget、Bybit、OKX、Hyperliquid 的顺序逐家推进，交易所之间不并行接管：
 
 1. 停止旧 writer，确认账户进程锁已释放；读取当前 checkpoint 和命令 WAL，所有 `Submitted/Unknown` 先完成签名对账。
 2. 只读获取账户模式、实时规则、余额、全部持仓腿、支持的订单族、开放订单和必要成交历史；不支持的订单族由 adapter 明确拒绝，不要求伪造空页或永久保存原始报文。
 3. 验证 DOGE 账户累计名义仓位硬上限 10U、数量步长和最小下单量；已有未撤入场命令或非零持仓时不得继续增险。OKX 必须按 `ctVal × ctMult × contracts` 换算基础数量，并按 `lotSz/minSz` 约束可执行张数。
 4. 取得唯一账户进程锁，写入最小 checkpoint 并启动同一本 WAL；发送前落 `Prepared`，结果不确定落 `Unknown`。
-5. 每家只做一个不超过 10U 的 Canary，立即签名回读订单、成交和持仓。Canary 完整收敛并停止后才推进下一家；失败则释放 writer、保持 Paused 并人工检查。
+5. 每轮 Canary 的单笔和账户累计名义风险均不得超过 10U，并立即签名回读订单、成交和持仓。AI 可使用持续授权直接执行，
+   无需逐次请求人工确认；同一账户可重复多轮，但前一轮必须终态、无 Unknown/未撤增险订单且签名仓位归零后才能再次增险。
+   已有持仓账户仍可做只读、撤单、reduce-only、Stop/Flatten。该所全部必需轮次完成并停止后才推进下一家；失败则释放 writer、
+   保持 Paused，把确需外部权限的事项留到其他可执行任务完成后汇总。
+6. 该所全部生产调用进入统一账户链且旧调用点清零后，才允许删除其 Stage 7/旁路 Canary writer；读取旧工件所需兼容代码继续保留并测试。
 
 旧 Stage 7 的 evidence recovery、immutable manifest、lease generation 和 executable handoff 仅服务已有旧 root 的兼容恢复，不复制到新交易所。迁移旧 root 时只需证明旧进程停止、账户锁释放、未决 WAL 已收敛及当前订单/仓位已签名读回；新版本随后取得同一账户锁。
 
@@ -431,6 +448,15 @@ G:\Venue\artifacts\<exchange>\LIVE\<trading_account_id>\
 `/v2/ui/snapshot`、`/v2/ui/events`、`/v2/control/commands`。策略投影和命令必须携带精确 `LIVE`，两端只调用 API，不读取数据库、WAL 或 artifacts，
 不持有凭证，不直连交易所，不直接下单。Stop/Flatten 必须显示并提交精确 mode、account、symbol、instance、config epoch、action 与人工确认；
 `apps/venue-control` 提供幂等命令和本地 HTTP/SSE `/v2`。Control 只提交语义命令及 `instance/config epoch`，Node 接收后写入自身命令 WAL；Control 的数据库状态、delivery ACK 或 receipt 都不授予交易权限。当前阶段只需“命令已接收/已拒绝/已完成”三类终态，不建立第二套 Actor-applied root、跨层 durability receipt 或 delivery lease 证明链。重复命令按稳定 command ID 幂等处理，冲突输入拒绝。
+
+响应式 `apps/venue-web` 通过同源 BFF 访问相同 Control 契约；浏览器不直连 loopback Control，不读取数据库、WAL、artifacts 或
+交易所 secret。`G:\kol\apps\web` 只提供响应式布局、恢复失败关闭和交互测试参考，全部数据 DTO 和命令按 schema v2 重写。
+
+### F. Copy 物理闭环
+
+Copy delivery 的 semantic Applied 只能表示 Actor 已耐久接收目标。Node 必须继续生成 follower 账户意图，经风险、Owner、同一 WAL、
+唯一 writer 和 adapter dispatch，再以更新签名私有事实写回执行状态、ledger 和 drift。跨零反向先 reduce-only 到零并等待新事实；
+任一 Unknown 禁止重投旧 child。具体阶段和 Web 页面依赖查 `UNIFIED_GATEWAY_WEB_MIGRATION.md`。
 
 ## 12. 验收标准
 
@@ -455,7 +481,9 @@ cargo test
 - 连接断开只暂停受影响账户；
 - Stop 只撤目标实例订单且默认不主动平仓；残仓时保留 symbol custody；
 - 开仓订单全部满足实时最小名义价值；
-- 三个交易所 adapter 通过相同 runtime/reducer 契约测试。
+- 六个交易所 adapter 通过相同 Account Runtime/Execution Lane 契约测试；能力差异由 adapter 明确证明或拒绝。
+- Copy semantic Applied 必须继续进入 follower risk/Owner/WAL/writer，并由签名订单、成交和持仓事实收敛；只到达 delivery/ACK 不算物理闭环。
+- Web 在 SSE 断线、cursor 断层、schema 错误、会话过期或陈旧 snapshot 下必须关闭全部 mutation，并在桌面与 390×844 移动端通过关键流程。
 - `scripts/verify_gateway_candidate_contract.ps1` 必须证明非 LIVE 前置拒绝、未取得账户锁时物理 mutation 为零，以及 Unknown 不重投。
 - 工件专项测试证明 5 MiB 轮转、10 MiB 单文件硬上限、256 MiB 根预算、含 Unknown 段不删除，以及已对账历史段可压缩/清理。
 
@@ -471,11 +499,12 @@ cargo test
 - 多用户、多租户和付费权限系统；
 - 跨机器 writer 选举、分布式 fencing、内容寻址 executable handoff 或复杂服务网格；
 - 策略插件市场和公共 SDK；
-- 在网格/账户 Runtime 任务内实现 Web 面板或 Windows UI；独立 VenueFlow 任务可开发无凭证公共行情和 Control 客户端，
-  但不得进入成交热路径或持有账户、私流、writer、WAL 与 mutation；
+- 在网格/账户 Runtime 内嵌 Web 面板或 Windows UI；获准的独立 `apps/venue-web` 和 VenueFlow 可开发无凭证 Control 客户端，
+  但不得进入成交热路径或持有账户私流、writer、WAL 与 mutation 客户端；
 - 为未来功能预建未被当前任务使用的模块；
 - 让 `bak/` 参与构建、运行或持久化。
 
 只有当单机账户进程的 CPU、网络或交易所连接上限被实测证明不足时，才讨论拆分独立网关。当前规模下不提前增加这类复杂度。
 
-当前规模优先允许人工监督的 Stop、签名对账、释放账户锁和逐家 Canary；只有真实出现多机高可用需求后才重新评估 lease/handoff 体系。
+当前迁移优先使用已获持续授权的 AI 执行 Stop、签名对账、释放账户锁和逐家 Canary；确需外部权限的事项在其余任务完成后汇总。
+只有真实出现多机高可用需求后才重新评估 lease/handoff 体系。

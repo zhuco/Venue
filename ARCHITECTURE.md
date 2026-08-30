@@ -1,18 +1,21 @@
 # VENUE 目标架构与技术栈
 
-更新：2026-08-30
+更新：2026-08-31
 
 ## 1. 文档职责
 
-本文定义 Venue 合并跟单、指标、桌面 UI 与六交易所网关后的目标架构、依赖边界、技术栈和迁移顺序。
+本文定义 Venue 合并跟单、指标、桌面/Web UI 与六交易所网关后的目标架构、依赖边界和技术栈。
 [`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md) 继续约束当前三所 Stage 7 网格热路径、恢复、接管和实盘准入；
 在目标架构尚未逐项验收前，不得用本文替代现有安全门。
+
+当前统一执行链、旧三所接管和 Web 迁移的实施阶段与完成定义统一查
+[`UNIFIED_GATEWAY_WEB_MIGRATION.md`](UNIFIED_GATEWAY_WEB_MIGRATION.md)。
 
 当前获准的待实现 Goal 见 [`REFACTOR_IMPLEMENTATION_GOALS.md`](REFACTOR_IMPLEMENTATION_GOALS.md)。
 
 迁移来源只提供行为和测试证据：
 
-- `G:\kol`：跟单语义、账本、事务 outbox/inbox、租约栅栏和六所协议 fixture；
+- `G:\kol`：跟单语义、账本、事务 outbox/inbox、六所协议 fixture，以及 `apps/web` 的响应式 UI 行为和测试；
 - `bak/VenueCore`：VenuePulse 指标、VenueFlow 桌面框架及交易所网关缺口；
 - Condor 会话：Agent、指标计算和确定性执行分层思想。
 
@@ -24,21 +27,20 @@
 2. 每个 `(venue, trading_account_id)` 仍由一个账户节点进程拥有；`trading_account_id` 是凭证映射到真实交易账户的稳定规范 UUID，不是 `portfolio_margin_um` 等产品类型，也不含 symbol；同一真实账户任意时刻只有一个精确 writer。
 3. 网格、Scalping 和跟单都只输出语义意图；所有交易 mutation 统一经过账户 Runtime、Execution、Risk、Owner、WAL 和 Reconciliation。
 4. 跟单是独立 Copy Engine，不直接持有交易所客户端、凭证、writer lease 或 native mutation 权限。
-5. 桌面 UI、Control API 和 Agent 都属于慢速控制面，不进入成交热路径，不直接读取或改写 WAL；桌面端可使用严格无凭证、
+5. Web、桌面 UI、Control API 和 Agent 都属于慢速控制面，不进入成交热路径，不直接读取或改写 WAL；桌面端可使用严格无凭证、
    无账户身份、无 mutation 的本地公共行情通道，但所有账户查询、控制和交易权威仍只来自 Control/账户节点。
 6. 规范交易所集合固定为 Binance、Bitget、Bybit、Gate.io、Hyperliquid、OKX；策略是否可在某所运行仍由产品、账户和订单族能力证据决定。
 7. 网关运行模式只接受精确 `LIVE`；不设计测试网、demo、只读、Shadow 或隐式 `live=false` 模式。
-8. 旧策略、Condor 策略、VenuePulse 中的策略特征、KOL 重复网关和 VenueFlow 模拟交易全部不迁移。
+8. KOL 的响应式 Web 体验选择性迁移到独立 `apps/venue-web`；旧策略、重复网关/后端、Condor 策略、VenuePulse 中未采用的
+   策略特征和 VenueFlow 模拟交易不迁移。
 
 所有 `LIVE` 配置必须显式提供规范 `trading_account_id`。`account_binding` 仅描述 API 产品与账户模式能力；同一真实账户的不同交易对和策略必须复用同一 UUID。缺失、格式错误或与持久工件不一致时拒绝启动，禁止由 API Key、产品类型或 symbol 临时推导账户身份。
 
 ## 3. 目标进程拓扑
 
 ```text
-VenueFlow Desktop / optional Agent
-                 |
-                 v
-          venue-control
+Venue Web -> same-origin BFF --+
+VenueFlow Desktop / Agent -----+-> venue-control
    copy planning / query / control
  PostgreSQL command outbox + ledger
                  |
@@ -69,7 +71,8 @@ apps/
 ├─ venue-node/
 │  └─ src/bin/venue-node-{binance,bitget,bybit,gate,hyperliquid,okx}.rs
 ├─ venue-control/
-└─ venueflow/
+├─ venue-web/                 # 目标响应式用户 Web；建立前以迁移文档为入口
+└─ venueflow/                 # 内部运维/诊断桌面与 WASM 工具
 
 crates/
 ├─ venue-domain/
@@ -96,10 +99,10 @@ crates/
 六个节点 binary 必须各自只链接一个交易所 adapter。构建验收继续扫描生产 endpoint，拒绝把其他 adapter 链接进
 固定节点。`legacy` 只是有退出条件的迁移隔离区，不允许新增功能。
 
-当前 `apps/venue-node` 已建立上述六个固定产物、逐 feature 二进制隔离门禁及 exchange-neutral `safe_host`。安全宿主
-在 root/WAL/Owner/writer metadata 与独立 hash-chain control log 恢复后才允许连接，持久应用 Pause/Resume/Stop/Flatten/Canary，
-并组合一次性 dispatch permit 与 UNKNOWN 读回；它不会自行产生 capability。Binance、Gate.io、Bitget 仅在显式
-`LIVE` 下委托既有 Stage 7 安全闭环；任何非 LIVE 输入在 endpoint、凭证和工件初始化前拒绝。Binance、Gate.io、Bitget 已具备 adapter-owned authenticated 只读 collection session：凭证、endpoint、generation、完整 symbol/cursor/订单族请求面、deadline 与全局预算由私流 ACK 或首个已解析签名账户面冻结，每次 HTTP await 前后重验；生产 caller 不能注入 Owner/root，候选也不含 capability、writer、WAL 或 permit。Bitget 的最终六面 fold 仍关闭，三所也都尚未接收 runtime 的完整 durable universe/root session。Bybit、OKX、Hyperliquid 的 mutation builder、签名、POST 与 dispatch 在生产构建中不可达。公共 capability promotion 已固定失败关闭；共享 runtime 已用私有 issuer seal 绑定完整账户 universe/config/profile、五类 journal/checkpoint head、Owner/WAL/Unknown 与 authority-state commitment，每次 await 后重验且至少 refresh 一次才允许 install；生产 refresh 构造保持封闭。六所耐久 replay refresh adapter、真实 host promotion verifier及 Actor durability receipt 的 runtime 接线仍未闭合，生产 Node 因此拒绝 physical recovery install、Actor Ready、host admission 与 async dispatch；失败的 Prepared 会耐久终结而不会调用物理 adapter。Stage 7 仍是唯一生产 writer。
+当前 `apps/venue-node` 已建立六个固定产物和逐 feature 二进制隔离门禁。Binance、Gate.io、Bitget 的实盘 mutation 仍由
+Stage 7 兼容链掌握；Bybit、OKX、Hyperliquid 已通过 `AccountMutationHost` 提供显式 preflight/place/cancel Canary。
+六所尚未共同进入一个常驻 Account Runtime，Copy semantic Applied 也尚未进入物理 Execution Lane。迁移期不得扩展 Stage 7
+authority；统一和逐所接管按 `UNIFIED_GATEWAY_WEB_MIGRATION.md` 执行。
 
 ## 5. 依赖方向
 
@@ -117,6 +120,7 @@ venue-execution -> venue-domain + venue-gateway-api
 venue-runtime -> venue-domain + venue-execution + venue-storage + venue-gateway-api
 venue-node-<venue> -> venue-runtime + exactly one venue-gateway-*
 venue-control -> venue-control-protocol + sqlx
+venue-web BFF/client -> versioned venue-control HTTP/SSE contract
 venueflow / optional Agent -> venue-control-protocol
 venueflow local public market -> venue-gateway-api + public-only adapter surface
 ```
@@ -130,6 +134,7 @@ venueflow local public market -> venue-gateway-api + public-only adapter surface
 - `venue-control-protocol` 只含版本化 DTO、错误码和序列化契约，不含 Axum handler、数据库、runtime 或 application service；
 - UI 不依赖 execution、私有/交易 adapter 或数据库；账户查询和命令只依赖版本化 Control protocol。原生桌面端可另依赖
   `venue-gateway-api` 的 secret-free public binding 和明确 public-only 的 adapter surface，且不得链接凭证、账户、私流或 mutation；
+- Web 浏览器只访问同源 BFF；BFF 只代理 allow-list 内的版本化 Control 查询和语义命令，不提供任意透传或交易所客户端；
 - Control API DTO 不作为交易权威事实，节点必须重新验证；
 - 不复制 Symbol、Money、Order、Position、Fill、InstrumentRule、Capability 或 journal 类型。
 
@@ -182,7 +187,8 @@ delivery manifest 把 job/snapshot/child/idempotency、leader/follower/account/i
 账户节点持久回执只允许 Applied/Unknown/Reconciled/Rejected，Unknown 封存旧授权且只能由下一序号精确对账收敛。ledger 对精确重复
 no-op，拒绝冲突、跳序和 generation 回退，并显式区分 Copy、External、Manual 归因；drift repair 只从不超过 60 秒的新鲜权威持仓和
 可重算目标生成全新 job 的语义请求，跨零仍须先平仓再等待新私有事实。这些 reducer 均不依赖 storage、network、runtime、native symbol
-或 writer；transactional outbox/inbox、数据库 observer/lease 与账户 runtime 投递仍未接入。
+或 writer。Control/PostgreSQL relation、delivery、claim/ACK/receipt 与 Node semantic Applied 已接入；当前缺口是从 Copy Actor
+生成 follower 账户执行意图，并把签名执行事实回写 ledger/drift。
 
 必须保留：
 
@@ -227,7 +233,8 @@ KOL 网关只是协议 fixture 和差异对照来源，不继承其运行开关�
 现有 Stage 7 中名为 Shadow/verify 的命令是冻结的策略证据验收流程，不是 gateway mode；新 adapter 不得沿用该命名建立第三种运行状态。
 
 单所 adapter 一旦完成精确账户/交易对绑定、唯一 writer、Owner、WAL、独立小额限额、
-签名私有 readback、确定性订单身份、UNKNOWN 先对账、紧急 Stop/Flatten 和显式人工确认，就可对一个 binding 开始小额 `LIVE` Canary 调试。
+签名私有 readback、确定性订单身份、UNKNOWN 先对账和紧急 Stop/Flatten，就可对一个 binding 开始小额 `LIVE` Canary 调试。
+本迁移任务的 AI 持续授权、10U 上限和无需逐次人工确认规则见 `UNIFIED_GATEWAY_WEB_MIGRATION.md` 第 2.1 节；产品 UI 的高风险确认仍保留。
 完整 Copy、Grid 或 Scalping 产品准入仍需各自的行为、恢复和接管验收，不得因网关能下单而自动获得策略准入。
 
 每个 adapter 必须提供：
@@ -259,16 +266,18 @@ bar base volume，并继续绑定 generation/provenance。指标内部允许使�
 
 `mas_frame`、`market_maker_*` 和其他策略特征不迁移。指标 crate 不读取凭证、数据库、WAL 或交易所客户端。
 
-## 10. VenueFlow 桌面端
+## 10. 客户端
+
+### 10.1 VenueFlow 内部工具
 
 桌面技术栈固定为 Rust 2024、`eframe/egui`、`egui_tiles` 和 WGPU；异步网络使用 Tokio 与 WebSocket/SSE client。
 
 当前第一版 `apps/venueflow` 已用同一套 eframe/egui_tiles/WGPU 视图提供原生窗口与 WebAssembly canvas；native client 使用
 Tokio/reqwest/SSE，Web client 使用 reqwest/EventSource。`venue-control-protocol` schema v2 固定 `/v2/ui/snapshot`、
 `/v2/ui/events` 和 `/v2/control/commands` 的 DTO、递归校验、receipt 与错误边界。策略和命令都显式携带精确 `LIVE`，两端只显示查询投影并提交语义控制请求；Stop/Flatten
-必须携带精确 mode、account、symbol、instance、config epoch、action 与人工确认。`apps/venue-control` 已提供本地 HTTP/SSE server、schema scope 重验、PostgreSQL durable inbox/outbox 及 bounded 节点 claim/ACK/receipt 路由，Node polling client 与 opaque-journal storage adapter 已接入；Actor Applied 与真实 WAL head 尚未接线，Control 仍无物理交易执行权限。
+必须携带精确 mode、account、symbol、instance、config epoch、action 与人工确认。`apps/venue-control` 已提供本地 HTTP/SSE server、schema scope 重验、PostgreSQL durable inbox/outbox 及 bounded 节点 claim/ACK/receipt 路由；Node polling、storage adapter 和绑定真实 WAL head 的 Actor Applied 已接入，但 Copy 尚未生成账户执行意图，Control 仍无物理交易执行权限。
 
-迁移范围：
+保留范围：
 
 - 窗口、dock 布局、主题、图表、工作区持久化和指标面板；
 - KOL 的 leader/follower、binding、目标敞口、漂移、执行状态和账本查询交互；
@@ -278,6 +287,13 @@ Tokio/reqwest/SSE，Web client 使用 reqwest/EventSource。`venue-control-proto
 账户、策略、账本和控制只调用版本化 Control protocol。原生桌面端允许为行情/K 线直连生产公共 REST/WS，但 binding 必须无账户、
 无 secret、无私流、无下单能力，且 public-only 依赖边界须由构建测试证明。高风险操作必须显示并确认精确
 mode/account/symbol/instance/config epoch/action，服务端和账户 runtime 仍须独立重验。
+
+### 10.2 响应式 Web
+
+面向用户的主 Web 独立建立在 `apps/venue-web`，技术栈固定为 Next.js 16、React 19、TypeScript 严格模式和同源 BFF。
+从 `G:\kol\apps\web` 迁移响应式 shell、移动端交互、恢复失败关闭、十进制和页面信息架构；全部 `/v1` DTO、认证、数据访问和
+命令层按 Venue schema v2 重写。浏览器不直连 loopback Control、数据库或交易所，不接触交易所 secret。详细边界和页面顺序查
+[`UNIFIED_GATEWAY_WEB_MIGRATION.md`](UNIFIED_GATEWAY_WEB_MIGRATION.md) 第 6 节。
 
 ## 11. Agent 边界
 
@@ -319,12 +335,13 @@ PostgreSQL 不得成为已发物理订单的第二权威 writer。Copy ledger �
 | 语言 | Rust 2024；工具链和 workspace `rust-version` 精确锁定 Rust 1.98.0 |
 | 交易 Actor | 顺序状态机、专用 OS thread 或受控 executor、有界 mailbox |
 | 异步 I/O | Tokio；不授予执行顺序或 mutation authority |
-| HTTP/控制 | schema v2、PostgreSQL repository、仅本地 HTTP/SSE `/v2`、bounded Node polling 路由、LIVE-only Copy worker；Node client/storage adapter 尚未接入 |
+| HTTP/控制 | schema v2、PostgreSQL repository、仅本地 HTTP/SSE `/v2`、bounded Node polling 路由、LIVE-only Copy worker 和耐久 Actor Applied |
 | 交易 HTTP/WS | reqwest、tokio-tungstenite 或经等价验收的现有阻塞 transport |
 | 数值 | rust_decimal 处理交易金额；指标内部可用 f64 |
 | 数据库 | PostgreSQL、SQLx、显式 migrations |
 | 交易耐久化 | append-only JSONL、hash chain、fsync checkpoint/receipt |
 | 桌面 | eframe、egui、egui_tiles、WGPU |
+| Web | Next.js 16、React 19、TypeScript 严格模式、同源 BFF、响应式桌面/移动端 |
 | 日志与追踪 | tracing；凭证和私有 payload 默认脱敏 |
 | 配置 | TOML + process env/root `.env` secrets |
 
@@ -359,14 +376,10 @@ PostgreSQL 不得成为已发物理订单的第二权威 writer。Copy ledger �
 
 ## 14. 迁移顺序
 
-1. **工具链与结构基线**：全 workspace、CI、rustfmt 和 clippy 锁定 Rust 1.98.0；建立 workspace、依赖检查和现有 Binance/Gate/Bitget 固定节点 binary；只移动代码和改引用，不改变行为。
-2. **Execution/Runtime 收拢**：`venue-execution` 先承载不改格式的通用 command journal、writer lease 与账户 canonical-root fence；`venue-runtime` 先承载 authority、account lane、account kernel 与 Strategy Actor，再迁入 grid/scalping/shared/legacy；根 facade 保持既有 Stage 7 API 与全部行为测试。
-3. **Gateway API**：提取统一契约，先接回 Venue 的 Binance/Gate/Bitget；逐项导入 KOL fixture 做差异测试。
-4. **新增三所最小闭环**：Bybit、OKX、Hyperliquid 的固定 LIVE binary 已建立，但当前仍停在不可写的失败关闭边界；逐所接入并验收 Owner、WAL、唯一账户 fence、签名 readback、UNKNOWN、Stop/Flatten 与人工 Canary 后，才可对单账户、单交易对小额调试，无需等待 Copy 或策略全量迁移；同一修改同步配置枚举、`AGENTS.md` 和 `CODEMAP.md`。
-5. **Copy LIVE 语义链**：迁移 KOL 目标敞口、outbox/inbox、observer 和账本，使用离线 fixture/mock 验证；Copy 不持有 mutation authority。
-6. **指标与 UI**：迁入 VenuePulse 五层算法和查询/控制型 VenueFlow，再开放有审计的高风险控制命令。
-7. **逐所扩大 LIVE**：在第 4 步小额实盘调试基础上，按一个精确账户、一个精确 writer、一个交易所依次完成 Copy 产品 Canary 和接管；新增三所不得并行扩大。
-8. **Legacy 退休**：只有调用点清零、恢复工件兼容、行为等价和接管验收全部成立后，才能删除兼容层。
+当前实施顺序以 [`UNIFIED_GATEWAY_WEB_MIGRATION.md`](UNIFIED_GATEWAY_WEB_MIGRATION.md) 的 M0–M7 为准：先完成统一账户执行脊柱
+和 Copy 物理闭环，再按 Binance、Gate.io、Bitget、Bybit、OKX、Hyperliquid 的顺序完成单 writer 接管；Web 可在稳定的
+Control schema 上并行开发只读页面，但高风险写操作必须等待对应后端事实和失败关闭门禁。旧入口只有在调用点清零、恢复兼容、
+行为等价和实盘接管全部成立后才能删除。
 
 ## 15. 验收门槛
 
@@ -389,7 +402,7 @@ PostgreSQL 不得成为已发物理订单的第二权威 writer。Copy ledger �
 ## 16. 明确不做
 
 - 不迁移 `bak` 或 KOL 的策略实现；
-- 不复制 Hummingbot、Condor runtime、KOL 多服务部署或 Next.js PWA；
+- 不复制 Hummingbot、Condor runtime、KOL Rust 后端、重复网关或多服务部署；KOL Web 只选择性迁移 UI 行为和测试；
 - 不让 PostgreSQL、Control API、UI 或 Agent 直接写交易所；
 - 不为六所强造相同能力；
 - 不同时运行两个版本写同一 binding；
