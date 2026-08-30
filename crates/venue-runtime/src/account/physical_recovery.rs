@@ -1,9 +1,16 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    reason = "physical recovery binds every account authority and coverage dimension explicitly"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use sha2::{Digest, Sha256};
+use venue_domain::domain::{NativeOrderFamily, PositionSide, Symbol};
 use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
 
-use super::model::validate_config_digest;
+use super::{AccountKey, AccountPositionMode, model::validate_config_digest};
 
 const REQUIRED_SURFACES: [PhysicalReadbackSurface; 6] = [
     PhysicalReadbackSurface::Account,
@@ -51,10 +58,13 @@ pub enum PhysicalReadbackCoverage {
     Complete {
         evidence_sha256: [u8; 32],
         record_count: u64,
+        covered_symbols: BTreeSet<Symbol>,
+        covered_position_legs: BTreeSet<(Symbol, PositionSide)>,
     },
     Unsupported {
         evidence_sha256: [u8; 32],
         profile_version: u64,
+        covered_symbols: BTreeSet<Symbol>,
     },
 }
 
@@ -62,11 +72,18 @@ impl PhysicalReadbackCoverage {
     fn validate(&self, surface: PhysicalReadbackSurface) -> bool {
         match self {
             Self::Complete {
-                evidence_sha256, ..
-            } => nonzero_digest(evidence_sha256),
+                evidence_sha256,
+                covered_position_legs,
+                ..
+            } => {
+                nonzero_digest(evidence_sha256)
+                    && (surface == PhysicalReadbackSurface::Positions
+                        || covered_position_legs.is_empty())
+            }
             Self::Unsupported {
                 evidence_sha256,
                 profile_version,
+                ..
             } => {
                 surface.is_order_family() && *profile_version > 0 && nonzero_digest(evidence_sha256)
             }
@@ -93,6 +110,39 @@ pub struct PhysicalRecoveryAuthorityRoots {
     owner: [u8; 32],
     wal: [u8; 32],
     unknown: [u8; 32],
+    structured_unknowns: BTreeSet<PhysicalRecoveryUnknown>,
+    structured_unknowns_bound: bool,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) struct PhysicalRecoveryUnknown {
+    command_id: String,
+    native_client_id: String,
+    family: NativeOrderFamily,
+    symbol: Symbol,
+    reason: PhysicalRecoveryUnknownReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) enum PhysicalRecoveryUnknownReason {
+    DurableWalUnresolved,
+}
+
+impl PhysicalRecoveryUnknown {
+    pub(super) fn durable_wal_unresolved(
+        command_id: impl Into<String>,
+        native_client_id: impl Into<String>,
+        family: NativeOrderFamily,
+        symbol: Symbol,
+    ) -> Self {
+        Self {
+            command_id: command_id.into(),
+            native_client_id: native_client_id.into(),
+            family,
+            symbol,
+            reason: PhysicalRecoveryUnknownReason::DurableWalUnresolved,
+        }
+    }
 }
 
 impl PhysicalRecoveryAuthorityRoots {
@@ -108,7 +158,33 @@ impl PhysicalRecoveryAuthorityRoots {
             owner,
             wal,
             unknown,
+            structured_unknowns: BTreeSet::new(),
+            structured_unknowns_bound: false,
         })
+    }
+
+    pub(super) fn verified_recovered(
+        owner: [u8; 32],
+        wal: [u8; 32],
+        unknown: [u8; 32],
+        structured_unknowns: BTreeSet<PhysicalRecoveryUnknown>,
+    ) -> Result<Self, PhysicalRecoveryManifestError> {
+        let mut roots = Self::verified(owner, wal, unknown)?;
+        roots.structured_unknowns = structured_unknowns;
+        roots.structured_unknowns_bound = true;
+        Ok(roots)
+    }
+
+    pub(super) fn refreshed_owner(
+        &self,
+        owner: [u8; 32],
+    ) -> Result<Self, PhysicalRecoveryManifestError> {
+        if !nonzero_digest(&owner) {
+            return Err(PhysicalRecoveryManifestError::AuthorityRoot);
+        }
+        let mut refreshed = self.clone();
+        refreshed.owner = owner;
+        Ok(refreshed)
     }
 
     #[must_use]
@@ -127,6 +203,23 @@ impl PhysicalRecoveryAuthorityRoots {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PhysicalRecoveryRegistration {
+    symbol: Symbol,
+    config_digest: String,
+    config_epoch: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PhysicalRecoveryAccountAuthority {
+    account: AccountKey,
+    mode: GatewayMode,
+    registrations: Vec<PhysicalRecoveryRegistration>,
+    position_mode: AccountPositionMode,
+    family_support: BTreeMap<NativeOrderFamily, bool>,
+    profile_version: u64,
+}
+
 /// Immutable recovery anchor captured before the physical readback attempt. Every returned face
 /// commits this entire scope, making binding, configuration, or journal drift invalidate the turn.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,6 +230,7 @@ pub struct PhysicalRecoveryScope {
     connection_generation: u64,
     recovered_private_generation: u64,
     authority_roots: PhysicalRecoveryAuthorityRoots,
+    account_authority: Option<PhysicalRecoveryAccountAuthority>,
     commitment_sha256: [u8; 32],
 }
 
@@ -174,8 +268,203 @@ impl PhysicalRecoveryScope {
             connection_generation,
             recovered_private_generation,
             authority_roots,
+            account_authority: None,
             commitment_sha256,
         })
+    }
+
+    pub(super) fn verified_account<I>(
+        binding: GatewayBinding,
+        account: AccountKey,
+        registrations: I,
+        position_mode: AccountPositionMode,
+        family_support: BTreeMap<NativeOrderFamily, bool>,
+        profile_version: u64,
+        connection_generation: u64,
+        recovered_private_generation: u64,
+        authority_roots: PhysicalRecoveryAuthorityRoots,
+    ) -> Result<Self, PhysicalRecoveryManifestError>
+    where
+        I: IntoIterator<Item = (Symbol, String, u64)>,
+    {
+        binding
+            .validate()
+            .map_err(|_| PhysicalRecoveryManifestError::Binding)?;
+        if binding.venue.as_str() != account.exchange.as_str()
+            || binding.trading_account_id != account.account
+            || profile_version == 0
+            || connection_generation == 0
+            || !authority_roots.structured_unknowns_bound
+            || family_support.keys().copied().collect::<BTreeSet<_>>()
+                != BTreeSet::from([
+                    NativeOrderFamily::UmOrder,
+                    NativeOrderFamily::UmConditional,
+                    NativeOrderFamily::UmAlgo,
+                ])
+        {
+            return Err(PhysicalRecoveryManifestError::AccountAuthority);
+        }
+        let mut registrations = registrations
+            .into_iter()
+            .map(|(symbol, config_digest, config_epoch)| {
+                if config_epoch == 0 || validate_config_digest(&config_digest).is_err() {
+                    return Err(PhysicalRecoveryManifestError::Configuration);
+                }
+                Ok(PhysicalRecoveryRegistration {
+                    symbol,
+                    config_digest,
+                    config_epoch,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        registrations.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+        if registrations
+            .windows(2)
+            .any(|pair| pair[0].symbol == pair[1].symbol)
+            || registrations
+                .first()
+                .is_some_and(|registration| registration.symbol != binding.symbol)
+        {
+            return Err(PhysicalRecoveryManifestError::Registry);
+        }
+        let account_authority = PhysicalRecoveryAccountAuthority {
+            account,
+            mode: binding.mode,
+            registrations,
+            position_mode,
+            family_support,
+            profile_version,
+        };
+        let commitment_sha256 = account_scope_commitment(
+            &binding,
+            connection_generation,
+            recovered_private_generation,
+            &authority_roots,
+            &account_authority,
+        );
+        Ok(Self {
+            binding,
+            config_digest: "account_registry".to_owned(),
+            config_epoch: 1,
+            connection_generation,
+            recovered_private_generation,
+            authority_roots,
+            account_authority: Some(account_authority),
+            commitment_sha256,
+        })
+    }
+
+    pub(super) fn matches_account_authority<I>(
+        &self,
+        account: &AccountKey,
+        mode: GatewayMode,
+        registrations: I,
+        position_mode: AccountPositionMode,
+        family_support: &BTreeMap<NativeOrderFamily, bool>,
+        profile_version: u64,
+    ) -> bool
+    where
+        I: IntoIterator<Item = (Symbol, String, u64)>,
+    {
+        let Some(expected) = &self.account_authority else {
+            return false;
+        };
+        let mut registrations = registrations
+            .into_iter()
+            .map(
+                |(symbol, config_digest, config_epoch)| PhysicalRecoveryRegistration {
+                    symbol,
+                    config_digest,
+                    config_epoch,
+                },
+            )
+            .collect::<Vec<_>>();
+        registrations.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+        expected.account == *account
+            && expected.mode == mode
+            && expected.registrations == registrations
+            && expected.position_mode == position_mode
+            && expected.family_support == *family_support
+            && expected.profile_version == profile_version
+    }
+
+    fn expected_targets(
+        &self,
+        surface: PhysicalReadbackSurface,
+    ) -> Result<(BTreeSet<Symbol>, BTreeSet<(Symbol, PositionSide)>), PhysicalRecoveryManifestError>
+    {
+        let authority = self
+            .account_authority
+            .as_ref()
+            .ok_or(PhysicalRecoveryManifestError::AccountAuthority)?;
+        let symbols = authority
+            .registrations
+            .iter()
+            .map(|registration| registration.symbol.clone())
+            .collect::<BTreeSet<_>>();
+        let covered_symbols = if surface == PhysicalReadbackSurface::Account {
+            BTreeSet::new()
+        } else {
+            symbols.clone()
+        };
+        let covered_position_legs = if surface == PhysicalReadbackSurface::Positions {
+            let sides = match authority.position_mode {
+                AccountPositionMode::Net => [Some(PositionSide::Net), None],
+                AccountPositionMode::Hedge => [Some(PositionSide::Long), Some(PositionSide::Short)],
+            };
+            symbols
+                .into_iter()
+                .flat_map(|symbol| {
+                    sides
+                        .iter()
+                        .flatten()
+                        .cloned()
+                        .map(move |side| (symbol.clone(), side))
+                })
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        Ok((covered_symbols, covered_position_legs))
+    }
+
+    fn validate_surface_coverage(
+        &self,
+        surfaces: &BTreeMap<PhysicalReadbackSurface, PhysicalReadbackCoverage>,
+    ) -> Result<(), PhysicalRecoveryManifestError> {
+        let Some(authority) = &self.account_authority else {
+            return Ok(());
+        };
+        for (surface, coverage) in surfaces {
+            let (expected_symbols, expected_legs) = self.expected_targets(*surface)?;
+            let expected_supported = surface_family(*surface)
+                .and_then(|family| authority.family_support.get(&family).copied());
+            let valid = match coverage {
+                PhysicalReadbackCoverage::Complete {
+                    covered_symbols,
+                    covered_position_legs,
+                    ..
+                } => {
+                    expected_supported != Some(false)
+                        && *covered_symbols == expected_symbols
+                        && *covered_position_legs == expected_legs
+                }
+                PhysicalReadbackCoverage::Unsupported {
+                    profile_version,
+                    covered_symbols,
+                    ..
+                } => {
+                    expected_supported == Some(false)
+                        && *profile_version == authority.profile_version
+                        && *covered_symbols == expected_symbols
+                        && expected_legs.is_empty()
+                }
+            };
+            if !valid {
+                return Err(PhysicalRecoveryManifestError::SymbolCoverage);
+            }
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -242,6 +531,8 @@ impl PhysicalReadbackReceipt {
             PhysicalReadbackCoverage::Complete {
                 evidence_sha256,
                 record_count,
+                covered_symbols: BTreeSet::new(),
+                covered_position_legs: BTreeSet::new(),
             },
         )
     }
@@ -262,6 +553,83 @@ impl PhysicalReadbackReceipt {
             PhysicalReadbackCoverage::Unsupported {
                 evidence_sha256,
                 profile_version,
+                covered_symbols: BTreeSet::new(),
+            },
+        )
+    }
+
+    pub(super) fn verified_complete_account(
+        scope: &PhysicalRecoveryScope,
+        surface: PhysicalReadbackSurface,
+        attempt_id: u64,
+        private_generation: u64,
+        evidence_sha256: [u8; 32],
+        record_count: u64,
+    ) -> Result<Self, PhysicalRecoveryManifestError> {
+        let (covered_symbols, covered_position_legs) = scope.expected_targets(surface)?;
+        Self::verified(
+            scope,
+            surface,
+            attempt_id,
+            private_generation,
+            PhysicalReadbackCoverage::Complete {
+                evidence_sha256,
+                record_count,
+                covered_symbols,
+                covered_position_legs,
+            },
+        )
+    }
+
+    pub(super) fn verified_unsupported_order_family_account(
+        scope: &PhysicalRecoveryScope,
+        surface: PhysicalReadbackSurface,
+        attempt_id: u64,
+        private_generation: u64,
+        evidence_sha256: [u8; 32],
+    ) -> Result<Self, PhysicalRecoveryManifestError> {
+        let (covered_symbols, covered_position_legs) = scope.expected_targets(surface)?;
+        if !covered_position_legs.is_empty() {
+            return Err(PhysicalRecoveryManifestError::Coverage);
+        }
+        let profile_version = scope
+            .account_authority
+            .as_ref()
+            .ok_or(PhysicalRecoveryManifestError::AccountAuthority)?
+            .profile_version;
+        Self::verified(
+            scope,
+            surface,
+            attempt_id,
+            private_generation,
+            PhysicalReadbackCoverage::Unsupported {
+                evidence_sha256,
+                profile_version,
+                covered_symbols,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn verified_complete_account_targets(
+        scope: &PhysicalRecoveryScope,
+        surface: PhysicalReadbackSurface,
+        attempt_id: u64,
+        private_generation: u64,
+        evidence_sha256: [u8; 32],
+        covered_symbols: BTreeSet<Symbol>,
+        covered_position_legs: BTreeSet<(Symbol, PositionSide)>,
+    ) -> Result<Self, PhysicalRecoveryManifestError> {
+        Self::verified(
+            scope,
+            surface,
+            attempt_id,
+            private_generation,
+            PhysicalReadbackCoverage::Complete {
+                evidence_sha256,
+                record_count: 0,
+                covered_symbols,
+                covered_position_legs,
             },
         )
     }
@@ -366,6 +734,7 @@ impl PhysicalRecoveryReadbackManifest {
         if private_generation <= scope.recovered_private_generation {
             return Err(PhysicalRecoveryManifestError::StaleGeneration);
         }
+        scope.validate_surface_coverage(&surfaces)?;
         let commitment_sha256 = manifest_commitment(
             &scope.commitment_sha256,
             attempt_id,
@@ -435,6 +804,12 @@ pub enum PhysicalRecoveryManifestError {
     MissingSurface,
     #[error("physical readback private generation is not newer than recovered state")]
     StaleGeneration,
+    #[error("physical recovery account authority is incomplete")]
+    AccountAuthority,
+    #[error("physical recovery registry authority is incomplete or duplicated")]
+    Registry,
+    #[error("physical recovery omitted a registered symbol, position leg, or order-family face")]
+    SymbolCoverage,
 }
 
 fn scope_commitment(
@@ -461,6 +836,54 @@ fn scope_commitment(
     digest.finalize().into()
 }
 
+fn account_scope_commitment(
+    binding: &GatewayBinding,
+    connection_generation: u64,
+    recovered_private_generation: u64,
+    roots: &PhysicalRecoveryAuthorityRoots,
+    authority: &PhysicalRecoveryAccountAuthority,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    commit_bytes(&mut digest, b"venue-physical-recovery-account-scope-v3");
+    commit_bytes(
+        &mut digest,
+        &[venue_tag(binding.venue), mode_tag(authority.mode)],
+    );
+    commit_str(&mut digest, &binding.trading_account_id);
+    commit_str(&mut digest, &binding.symbol.to_string());
+    commit_str(&mut digest, &authority.account.account);
+    commit_bytes(&mut digest, &[position_mode_tag(authority.position_mode)]);
+    commit_u64(&mut digest, connection_generation);
+    commit_u64(&mut digest, recovered_private_generation);
+    commit_u64(&mut digest, authority.registrations.len() as u64);
+    for registration in &authority.registrations {
+        commit_str(&mut digest, &registration.symbol.to_string());
+        commit_str(&mut digest, &registration.config_digest);
+        commit_u64(&mut digest, registration.config_epoch);
+    }
+    for family in [
+        NativeOrderFamily::UmOrder,
+        NativeOrderFamily::UmConditional,
+        NativeOrderFamily::UmAlgo,
+    ] {
+        commit_bytes(&mut digest, &[family_tag(family)]);
+        commit_bytes(&mut digest, &[u8::from(authority.family_support[&family])]);
+    }
+    commit_u64(&mut digest, authority.profile_version);
+    commit_bytes(&mut digest, &roots.owner);
+    commit_bytes(&mut digest, &roots.wal);
+    commit_bytes(&mut digest, &roots.unknown);
+    commit_u64(&mut digest, roots.structured_unknowns.len() as u64);
+    for unknown in &roots.structured_unknowns {
+        commit_str(&mut digest, &unknown.command_id);
+        commit_str(&mut digest, &unknown.native_client_id);
+        commit_bytes(&mut digest, &[family_tag(unknown.family)]);
+        commit_str(&mut digest, &unknown.symbol.to_string());
+        commit_bytes(&mut digest, &[unknown_reason_tag(unknown.reason)]);
+    }
+    digest.finalize().into()
+}
+
 fn manifest_commitment(
     scope_sha256: &[u8; 32],
     attempt_id: u64,
@@ -479,22 +902,77 @@ fn manifest_commitment(
             PhysicalReadbackCoverage::Complete {
                 evidence_sha256,
                 record_count,
+                covered_symbols,
+                covered_position_legs,
             } => {
                 commit_bytes(&mut digest, &[1]);
                 commit_bytes(&mut digest, evidence_sha256);
                 commit_u64(&mut digest, *record_count);
+                commit_symbols(&mut digest, covered_symbols);
+                commit_u64(&mut digest, covered_position_legs.len() as u64);
+                for (symbol, side) in covered_position_legs {
+                    commit_str(&mut digest, &symbol.to_string());
+                    commit_bytes(&mut digest, &[position_side_tag(*side)]);
+                }
             }
             PhysicalReadbackCoverage::Unsupported {
                 evidence_sha256,
                 profile_version,
+                covered_symbols,
             } => {
                 commit_bytes(&mut digest, &[2]);
                 commit_bytes(&mut digest, evidence_sha256);
                 commit_u64(&mut digest, *profile_version);
+                commit_symbols(&mut digest, covered_symbols);
             }
         }
     }
     digest.finalize().into()
+}
+
+fn commit_symbols(digest: &mut Sha256, symbols: &BTreeSet<Symbol>) {
+    commit_u64(digest, symbols.len() as u64);
+    for symbol in symbols {
+        commit_str(digest, &symbol.to_string());
+    }
+}
+
+const fn surface_family(surface: PhysicalReadbackSurface) -> Option<NativeOrderFamily> {
+    match surface {
+        PhysicalReadbackSurface::UmOrder => Some(NativeOrderFamily::UmOrder),
+        PhysicalReadbackSurface::UmConditional => Some(NativeOrderFamily::UmConditional),
+        PhysicalReadbackSurface::UmAlgo => Some(NativeOrderFamily::UmAlgo),
+        _ => None,
+    }
+}
+
+const fn family_tag(family: NativeOrderFamily) -> u8 {
+    match family {
+        NativeOrderFamily::UmOrder => 1,
+        NativeOrderFamily::UmConditional => 2,
+        NativeOrderFamily::UmAlgo => 3,
+    }
+}
+
+const fn position_mode_tag(mode: AccountPositionMode) -> u8 {
+    match mode {
+        AccountPositionMode::Net => 1,
+        AccountPositionMode::Hedge => 2,
+    }
+}
+
+const fn position_side_tag(side: PositionSide) -> u8 {
+    match side {
+        PositionSide::Net => 1,
+        PositionSide::Long => 2,
+        PositionSide::Short => 3,
+    }
+}
+
+const fn unknown_reason_tag(reason: PhysicalRecoveryUnknownReason) -> u8 {
+    match reason {
+        PhysicalRecoveryUnknownReason::DurableWalUnresolved => 1,
+    }
 }
 
 const fn venue_tag(venue: VenueId) -> u8 {
@@ -570,6 +1048,64 @@ mod tests {
             10,
             PhysicalRecoveryAuthorityRoots::verified(hash(1), hash(2), hash(3))?,
         )
+    }
+
+    fn account_scope(mode: GatewayMode) -> Result<PhysicalRecoveryScope, Box<dyn Error>> {
+        account_scope_with_anchor(mode, "BTC/USDT")
+    }
+
+    fn account_scope_with_anchor(
+        mode: GatewayMode,
+        anchor: &str,
+    ) -> Result<PhysicalRecoveryScope, Box<dyn Error>> {
+        let account = AccountKey::new(crate::domain::ExchangeId::Binance, ACCOUNT_ID)?;
+        Ok(PhysicalRecoveryScope::verified_account(
+            GatewayBinding::new(VenueId::Binance, mode, ACCOUNT_ID, anchor.parse()?)?,
+            account,
+            [
+                ("BTC/USDT".parse()?, "btc_config".to_owned(), 7),
+                ("ETH/USDT".parse()?, "eth_config".to_owned(), 9),
+            ],
+            AccountPositionMode::Hedge,
+            all_family_support(),
+            1,
+            4,
+            10,
+            PhysicalRecoveryAuthorityRoots::verified_recovered(
+                hash(1),
+                hash(2),
+                hash(3),
+                BTreeSet::new(),
+            )?,
+        )?)
+    }
+
+    fn all_family_support() -> BTreeMap<NativeOrderFamily, bool> {
+        BTreeMap::from([
+            (NativeOrderFamily::UmOrder, true),
+            (NativeOrderFamily::UmConditional, true),
+            (NativeOrderFamily::UmAlgo, true),
+        ])
+    }
+
+    fn account_receipts(
+        scope: &PhysicalRecoveryScope,
+        generation: u64,
+    ) -> Result<Vec<PhysicalReadbackReceipt>, PhysicalRecoveryManifestError> {
+        REQUIRED_SURFACES
+            .iter()
+            .enumerate()
+            .map(|(index, surface)| {
+                PhysicalReadbackReceipt::verified_complete_account(
+                    scope,
+                    *surface,
+                    51,
+                    generation,
+                    hash(u8::try_from(index).unwrap_or(u8::MAX).saturating_add(41)),
+                    0,
+                )
+            })
+            .collect()
     }
 
     fn receipts(
@@ -756,6 +1292,141 @@ mod tests {
         assert_eq!(
             PhysicalRecoveryAuthorityRoots::verified([0; 32], hash(2), hash(3)),
             Err(PhysicalRecoveryManifestError::AuthorityRoot)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn multi_symbol_empty_faces_cover_every_symbol_and_hedge_leg() -> Result<(), Box<dyn Error>> {
+        let scope = account_scope(GatewayMode::Test)?;
+        let manifest = PhysicalRecoveryReadbackManifest::verified(
+            scope.clone(),
+            account_receipts(&scope, 11)?,
+        )?;
+        assert!(matches!(
+            manifest.coverage(PhysicalReadbackSurface::Positions),
+            PhysicalReadbackCoverage::Complete {
+                record_count: 0,
+                covered_symbols,
+                covered_position_legs,
+                ..
+            } if covered_symbols.len() == 2 && covered_position_legs.len() == 4
+        ));
+        assert!(matches!(
+            manifest.coverage(PhysicalReadbackSurface::UmOrder),
+            PhysicalReadbackCoverage::Complete {
+                record_count: 0,
+                covered_symbols,
+                ..
+            } if covered_symbols.len() == 2
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_symbol_or_position_leg_fails_closed() -> Result<(), Box<dyn Error>> {
+        let scope = account_scope(GatewayMode::Test)?;
+        let btc: Symbol = "BTC/USDT".parse()?;
+        let eth: Symbol = "ETH/USDT".parse()?;
+        let mut missing_leg = account_receipts(&scope, 11)?;
+        missing_leg[1] = PhysicalReadbackReceipt::verified_complete_account_targets(
+            &scope,
+            PhysicalReadbackSurface::Positions,
+            51,
+            11,
+            hash(70),
+            BTreeSet::from([btc.clone(), eth]),
+            BTreeSet::from([
+                (btc.clone(), PositionSide::Long),
+                (btc, PositionSide::Short),
+            ]),
+        )?;
+        assert_eq!(
+            PhysicalRecoveryReadbackManifest::verified(scope.clone(), missing_leg),
+            Err(PhysicalRecoveryManifestError::SymbolCoverage)
+        );
+
+        let mut missing_symbol = account_receipts(&scope, 11)?;
+        missing_symbol[2] = PhysicalReadbackReceipt::verified_complete_account_targets(
+            &scope,
+            PhysicalReadbackSurface::UmOrder,
+            51,
+            11,
+            hash(71),
+            BTreeSet::from(["BTC/USDT".parse()?]),
+            BTreeSet::new(),
+        )?;
+        assert_eq!(
+            PhysicalRecoveryReadbackManifest::verified(scope, missing_symbol),
+            Err(PhysicalRecoveryManifestError::SymbolCoverage)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wrong_mode_and_old_private_generation_cannot_be_relabelled() -> Result<(), Box<dyn Error>> {
+        let expected = account_scope(GatewayMode::Test)?;
+        let wrong_mode = account_scope(GatewayMode::Live)?;
+        let mut mixed = account_receipts(&expected, 11)?;
+        mixed[0] = PhysicalReadbackReceipt::verified_complete_account(
+            &wrong_mode,
+            PhysicalReadbackSurface::Account,
+            51,
+            11,
+            hash(72),
+            0,
+        )?;
+        assert_eq!(
+            PhysicalRecoveryReadbackManifest::verified(expected.clone(), mixed),
+            Err(PhysicalRecoveryManifestError::ScopeDrift)
+        );
+        assert_eq!(
+            PhysicalRecoveryReadbackManifest::verified(
+                expected.clone(),
+                account_receipts(&expected, 10)?,
+            ),
+            Err(PhysicalRecoveryManifestError::StaleGeneration)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_trading_account_must_equal_the_account_authority() -> Result<(), Box<dyn Error>> {
+        let account = AccountKey::new(crate::domain::ExchangeId::Binance, ACCOUNT_ID)?;
+        let result = PhysicalRecoveryScope::verified_account(
+            GatewayBinding::new(
+                VenueId::Binance,
+                GatewayMode::Test,
+                "00000000-0000-4000-8000-000000000002",
+                "BTC/USDT".parse()?,
+            )?,
+            account,
+            [("BTC/USDT".parse()?, "btc_config".to_owned(), 1)],
+            AccountPositionMode::Hedge,
+            all_family_support(),
+            1,
+            1,
+            0,
+            PhysicalRecoveryAuthorityRoots::verified_recovered(
+                hash(1),
+                hash(2),
+                hash(3),
+                BTreeSet::new(),
+            )?,
+        );
+        assert_eq!(result, Err(PhysicalRecoveryManifestError::AccountAuthority));
+        Ok(())
+    }
+
+    #[test]
+    fn native_anchor_must_equal_the_canonical_account_universe_symbol() -> Result<(), Box<dyn Error>>
+    {
+        let Err(error) = account_scope_with_anchor(GatewayMode::Test, "ETH/USDT") else {
+            return Err("non-canonical native anchor was accepted".into());
+        };
+        assert_eq!(
+            error.downcast_ref::<PhysicalRecoveryManifestError>(),
+            Some(&PhysicalRecoveryManifestError::Registry)
         );
         Ok(())
     }

@@ -23,7 +23,10 @@ use crate::{
 };
 
 pub(super) fn account() -> Result<AccountKey, Box<dyn Error>> {
-    Ok(AccountKey::new(ExchangeId::Binance, "portfolio")?)
+    Ok(AccountKey::new(
+        ExchangeId::Binance,
+        "00000000-0000-4000-8000-000000000001",
+    )?)
 }
 
 pub(super) fn binding(
@@ -285,25 +288,6 @@ fn lane_next_dispatch_permit(
     }
 }
 
-fn runtime_next_dispatch_permit(
-    runtime: &mut AccountRuntime,
-    wal_sequence: u64,
-) -> Result<AccountDispatchPermit, Box<dyn Error>> {
-    let candidate = runtime
-        .next_execution_for_wal()?
-        .ok_or("runtime mutation candidate missing")?;
-    let wal = PersistedWalPreparedReceipt::test_persisted(candidate, wal_sequence)?;
-    let writer = PersistedWriterLeaseReceipt::test_verified_current(
-        &wal,
-        AccountWriterCapability::EntryAndRiskReduction,
-        wal_sequence,
-    )?;
-    match runtime.authorize_execution_dispatch(wal, writer)? {
-        AccountDispatchDecision::Permit(permit) => Ok(permit),
-        AccountDispatchDecision::Fenced(_) => Err("runtime dispatch unexpectedly fenced".into()),
-    }
-}
-
 pub(super) fn place_request(
     binding: &StrategyBinding,
     suffix: &str,
@@ -536,8 +520,6 @@ fn private_router_delivers_exact_owner_and_never_guesses_unknown_fill() -> Resul
     runtime.register_strategy(grid.clone())?;
     runtime.register_strategy(scalp.clone())?;
     restore_empty_recovery(&mut runtime)?;
-    runtime.mark_account_ready()?;
-    establish_empty_signed_orders(&mut runtime, 1)?;
     install_persisted_order_route(
         &mut runtime,
         RecoveredOrderRoute::verified(
@@ -548,6 +530,8 @@ fn private_router_delivers_exact_owner_and_never_guesses_unknown_fill() -> Resul
             owner(&grid, OrderPurpose::Entry),
         ),
     )?;
+    runtime.mark_account_ready()?;
+    establish_empty_signed_orders(&mut runtime, 1)?;
 
     let mut evidence = EvidenceFixture::new()?;
     let first = evidence.append(1, 100, "owned fill")?;
@@ -608,8 +592,6 @@ fn conflicting_client_and_venue_identities_are_not_delivered() -> Result<(), Box
     runtime.register_strategy(grid.clone())?;
     runtime.register_strategy(scalp.clone())?;
     restore_empty_recovery(&mut runtime)?;
-    runtime.mark_account_ready()?;
-    establish_empty_signed_orders(&mut runtime, 1)?;
     install_persisted_order_route(
         &mut runtime,
         RecoveredOrderRoute::verified(
@@ -630,6 +612,8 @@ fn conflicting_client_and_venue_identities_are_not_delivered() -> Result<(), Box
             owner(&scalp, OrderPurpose::Entry),
         ),
     )?;
+    runtime.mark_account_ready()?;
+    establish_empty_signed_orders(&mut runtime, 1)?;
 
     let mut evidence = EvidenceFixture::new()?;
     let persisted = evidence.append(1, 100, "conflicting order")?;
@@ -656,8 +640,6 @@ fn execution_reserves_create_identity_and_cancel_requires_exact_owner_family()
     let mut runtime = AccountRuntime::new(account()?);
     runtime.register_strategy(grid.clone())?;
     restore_empty_recovery(&mut runtime)?;
-    runtime.mark_account_ready()?;
-    establish_empty_signed_orders(&mut runtime, 1)?;
     install_persisted_order_route(
         &mut runtime,
         RecoveredOrderRoute::verified(
@@ -668,6 +650,8 @@ fn execution_reserves_create_identity_and_cancel_requires_exact_owner_family()
             owner(&grid, OrderPurpose::Entry),
         ),
     )?;
+    runtime.mark_account_ready()?;
+    establish_empty_signed_orders(&mut runtime, 1)?;
 
     runtime.enqueue_execution(runtime_cancel_intent(
         &runtime,
@@ -676,13 +660,6 @@ fn execution_reserves_create_identity_and_cancel_requires_exact_owner_family()
         "cancel_target",
         NativeOrderFamily::UmOrder,
     )?)?;
-    let permit = runtime_next_dispatch_permit(&mut runtime, 1)?;
-    runtime.record_execution_outcome(PersistedMutationOutcomeReceipt::test_persisted(
-        &permit,
-        AccountMutationOutcome::Confirmed,
-        1,
-    )?)?;
-
     let applied = runtime
         .latest_applied_turn_receipt(&grid.key)
         .ok_or("applied actor turn missing")?;
@@ -736,8 +713,6 @@ fn actor_mailbox_preserves_private_priority_and_coalesces_market() -> Result<(),
     let mut runtime = AccountRuntime::new(account()?);
     runtime.register_strategy(grid.clone())?;
     restore_empty_recovery(&mut runtime)?;
-    runtime.mark_account_ready()?;
-    establish_empty_signed_orders(&mut runtime, 1)?;
     install_persisted_order_route(
         &mut runtime,
         RecoveredOrderRoute::verified(
@@ -748,6 +723,8 @@ fn actor_mailbox_preserves_private_priority_and_coalesces_market() -> Result<(),
             owner(&grid, OrderPurpose::Entry),
         ),
     )?;
+    runtime.mark_account_ready()?;
+    establish_empty_signed_orders(&mut runtime, 1)?;
 
     for update_id in [1, 2] {
         runtime.publish_market(AccountMarketEvent::new(
@@ -1041,7 +1018,7 @@ fn wal_abort_requires_receipt_and_returns_no_authorized_request() -> Result<(), 
 }
 
 #[test]
-fn reconnect_requires_in_flight_mutation_to_become_unknown() -> Result<(), Box<dyn Error>> {
+fn fsynced_wal_revokes_ready_without_exposing_a_dispatch_permit() -> Result<(), Box<dyn Error>> {
     let grid = binding(StrategyKind::HedgedGrid, "grid_sol", "SOL/USDT")?;
     let mut runtime = AccountRuntime::new(account()?);
     runtime.register_strategy(grid.clone())?;
@@ -1054,31 +1031,24 @@ fn reconnect_requires_in_flight_mutation_to_become_unknown() -> Result<(), Box<d
         "in_flight_disconnect",
         AccountLanePriority::Normal,
     )?)?;
-    let permit = runtime_next_dispatch_permit(&mut runtime, 1)?;
+    let candidate = runtime
+        .next_execution_for_wal()?
+        .ok_or("runtime WAL candidate missing")?;
+    let wal = PersistedWalPreparedReceipt::test_persisted(candidate, 1)?;
+    let writer = PersistedWriterLeaseReceipt::test_verified_current(
+        &wal,
+        AccountWriterCapability::EntryAndRiskReduction,
+        1,
+    )?;
+    assert!(matches!(
+        runtime.authorize_execution_dispatch(wal, writer),
+        Err(AccountRuntimeError::PhysicalRecoveryRequired)
+    ));
+    assert_eq!(runtime.health(), AccountHealth::Starting);
+    assert!(runtime.physical_recovery_authority_roots().is_none());
     assert!(matches!(
         runtime.mark_account_ready(),
-        Err(AccountRuntimeError::ReconnectWithInFlight)
-    ));
-    assert!(matches!(
-        runtime.record_execution_outcome(PersistedMutationOutcomeReceipt::test_persisted(
-            &permit,
-            AccountMutationOutcome::Unknown,
-            1,
-        )?)?,
-        AccountLaneFollowUp::ReconcileUnknown { .. }
-    ));
-    runtime.mark_account_ready()?;
-    establish_empty_signed_orders(&mut runtime, 1)?;
-    assert!(matches!(
-        runtime.enqueue_execution(runtime_place_intent(
-            &runtime,
-            &grid,
-            "still_fenced",
-            AccountLanePriority::Normal,
-        )?),
-        Err(AccountRuntimeError::ExecutionLane(
-            AccountLaneError::UnknownFence
-        ))
+        Err(AccountRuntimeError::PhysicalRecoveryRequired)
     ));
     Ok(())
 }
@@ -1148,14 +1118,11 @@ fn parameter_change_is_epoch_bound_and_discards_old_intents() -> Result<(), Box<
 
     runtime.change_parameters(&grid.key, "config_2".to_owned())?;
     assert!(matches!(
-        pop_applied_strategy_input(&mut runtime, &grid.key)?,
-        Some(StrategyInput::Control(
-            crate::runtime::strategy::StrategyControl::ParametersChanged {
-                config_digest,
-                config_epoch: 2,
-            }
-        )) if config_digest == "config_2"
+        runtime.pop_strategy_input(&grid.key),
+        Err(AccountRuntimeError::PhysicalRecoveryRequired)
     ));
+    runtime.mark_account_ready()?;
+    assert!(pop_applied_strategy_input(&mut runtime, &grid.key)?.is_none());
     let registration = runtime
         .registry()
         .registration(&grid.key)
@@ -1378,8 +1345,6 @@ fn signed_order_drift_immediately_recovers_only_missing_instance() -> Result<(),
     runtime.register_strategy(a.clone())?;
     runtime.register_strategy(b.clone())?;
     restore_empty_recovery(&mut runtime)?;
-    runtime.mark_account_ready()?;
-    establish_empty_signed_orders(&mut runtime, 1)?;
     install_persisted_order_route(
         &mut runtime,
         RecoveredOrderRoute::verified(
@@ -1400,6 +1365,8 @@ fn signed_order_drift_immediately_recovers_only_missing_instance() -> Result<(),
             owner(&b, OrderPurpose::Entry),
         ),
     )?;
+    runtime.mark_account_ready()?;
+    establish_empty_signed_orders(&mut runtime, 1)?;
     let mut desired = DesiredOrderSets::new(AccountPositionMode::Hedge);
     set_desired(&runtime, &mut desired, &a.key, ["a_client".to_owned()])?;
     set_desired(&runtime, &mut desired, &b.key, ["b_client".to_owned()])?;
@@ -1483,8 +1450,6 @@ fn signed_order_identity_match_still_detects_semantic_drift() -> Result<(), Box<
     let mut runtime = AccountRuntime::new(account()?);
     runtime.register_strategy(grid.clone())?;
     restore_empty_recovery(&mut runtime)?;
-    runtime.mark_account_ready()?;
-    establish_empty_signed_orders(&mut runtime, 1)?;
     install_persisted_order_route(
         &mut runtime,
         RecoveredOrderRoute::verified(
@@ -1495,6 +1460,8 @@ fn signed_order_identity_match_still_detects_semantic_drift() -> Result<(), Box<
             owner(&grid, OrderPurpose::Entry),
         ),
     )?;
+    runtime.mark_account_ready()?;
+    establish_empty_signed_orders(&mut runtime, 1)?;
     let mut desired = DesiredOrderSets::new(AccountPositionMode::Hedge);
     set_desired(
         &runtime,
@@ -1535,8 +1502,6 @@ fn private_evidence_gap_freezes_account_before_delivery() -> Result<(), Box<dyn 
     let mut runtime = AccountRuntime::new(account()?);
     runtime.register_strategy(grid.clone())?;
     restore_empty_recovery(&mut runtime)?;
-    runtime.mark_account_ready()?;
-    establish_empty_signed_orders(&mut runtime, 1)?;
     install_persisted_order_route(
         &mut runtime,
         RecoveredOrderRoute::verified(
@@ -1547,6 +1512,8 @@ fn private_evidence_gap_freezes_account_before_delivery() -> Result<(), Box<dyn 
             owner(&grid, OrderPurpose::Entry),
         ),
     )?;
+    runtime.mark_account_ready()?;
+    establish_empty_signed_orders(&mut runtime, 1)?;
     let mut evidence = EvidenceFixture::new()?;
     let first = evidence.append(1, 100, "first")?;
     let _skipped = evidence.append(1, 101, "skipped")?;
