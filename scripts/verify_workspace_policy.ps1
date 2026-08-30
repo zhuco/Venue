@@ -7,10 +7,6 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $maxSourceLines = 2000
 $expectedRustVersion = '1.98.0'
-$legacySourceLineCeilings = @{
-    # Existing active code predates this gate; it may not grow and must be split by its owner.
-    'src/exchange/binance/mod.rs' = 2020
-}
 $allowedDependencies = @(
     'base64', 'bitflags', 'bytes', 'clap', 'crossbeam-channel', 'ctrlc', 'dotenvy', 'eframe',
     'egui', 'egui_tiles', 'fs2', 'futures-util', 'hmac', 'js-sys', 'k256', 'reqwest', 'rmp-serde',
@@ -83,13 +79,8 @@ function Assert-SourceFileLimit {
             continue
         }
         $lineCount = @([System.IO.File]::ReadLines($fullPath)).Count
-        $ceiling = if ($legacySourceLineCeilings.ContainsKey($relativePath)) {
-            $legacySourceLineCeilings[$relativePath]
-        } else {
-            $maxSourceLines
-        }
-        if ($lineCount -gt $ceiling) {
-            $violations.Add("handwritten source exceeds $ceiling physical lines: $relativePath ($lineCount)")
+        if ($lineCount -gt $maxSourceLines) {
+            $violations.Add("handwritten source exceeds $maxSourceLines physical lines: $relativePath ($lineCount)")
         }
     }
     if ($violations.Count -gt 0) { throw ($violations -join [Environment]::NewLine) }
