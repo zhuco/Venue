@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fs::OpenOptions,
     io::Write,
     sync::{Arc, Mutex},
@@ -7,6 +8,12 @@ use std::{
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use super::{
+    ClaimAcceptance, ControlDeliveryDriver, ControlDeliveryError, ControlDeliveryInbox,
+    ControlDeliveryJournal, ControlDeliveryJournalError, ControlDeliveryJournalRecord,
+    ControlDeliveryWork, ControlHttpClient, ControlHttpClientConfig, ControlHttpClientError,
+    DurableStoreResult, OpaqueControlDeliveryJournal,
+};
 use venue_control_protocol::{
     ACCOUNT_DELIVERY_SCHEMA_VERSION, AccountDeliveryBinding, AccountDeliveryClaim,
     AccountDeliveryLease, AccountDeliveryPayload, AccountDeliveryPurpose,
@@ -14,13 +21,6 @@ use venue_control_protocol::{
     GatewayMode, VenueId,
 };
 use venue_domain::Symbol;
-
-use super::{
-    ClaimAcceptance, ControlDeliveryDriver, ControlDeliveryError, ControlDeliveryInbox,
-    ControlDeliveryJournal, ControlDeliveryJournalError, ControlDeliveryJournalRecord,
-    ControlDeliveryWork, ControlHttpClient, ControlHttpClientConfig, ControlHttpClientError,
-    DurableStoreResult, OpaqueControlDeliveryJournal,
-};
 
 const ACCOUNT: &str = "00000000-0000-4000-8000-000000000032";
 const NODE: &str = "venue-node-goal32";
@@ -117,7 +117,7 @@ fn ack_is_durable_and_control_confirmed_before_actor_applied()
     assert!(!turn.grants_wal_authority());
     assert!(!turn.grants_dispatch_permit());
     let completion = turn.applied_fixture(140, digest(7), "actor inbox and checkpoint durable")?;
-    let receipt = inbox.record_actor_completion(completion)?;
+    let receipt = inbox.record_actor_completion(completion, 140)?;
     assert_eq!(receipt.value().state, AccountDeliveryReceiptState::Applied);
     assert_eq!(receipt.durable_sequence(), 4);
     assert!(!receipt.grants_dispatch_permit());
@@ -145,11 +145,10 @@ fn unknown_accepts_only_the_exact_next_reconciliation_claim()
     let turn = inbox
         .actor_turn("command:request-32", 130)?
         .ok_or("actor turn missing")?;
-    let unknown = inbox.record_actor_completion(turn.unknown(
+    let unknown = inbox.record_actor_completion(
+        turn.unknown(140, [0; 32], "exchange result cannot be proven")?,
         140,
-        [0; 32],
-        "exchange result cannot be proven",
-    )?)?;
+    )?;
     assert_eq!(unknown.value().state, AccountDeliveryReceiptState::Unknown);
     inbox.confirm_receipt(unknown.value(), 150)?;
 
@@ -162,11 +161,10 @@ fn unknown_accepts_only_the_exact_next_reconciliation_claim()
     assert!(!turn.grants_writer_lease());
     assert!(!turn.grants_wal_authority());
     assert!(!turn.grants_dispatch_permit());
-    let reconciled = inbox.record_reconciliation(turn.reconciled(
+    let reconciled = inbox.record_reconciliation(
+        turn.reconciled(220, digest(9), "signed account facts resolve the unknown")?,
         220,
-        digest(9),
-        "signed account facts resolve the unknown",
-    )?)?;
+    )?;
     assert_eq!(
         reconciled.value().state,
         AccountDeliveryReceiptState::Reconciled
@@ -192,7 +190,7 @@ fn install_after_unknown_is_durably_failed_closed() -> Result<(), Box<dyn std::e
     let turn = inbox
         .actor_turn("command:request-32", 130)?
         .ok_or("actor turn missing")?;
-    let unknown = inbox.record_actor_completion(turn.unknown(140, [0; 32], "unknown")?)?;
+    let unknown = inbox.record_actor_completion(turn.unknown(140, [0; 32], "unknown")?, 140)?;
     inbox.confirm_receipt(unknown.value(), 150)?;
 
     let invalid = claim(2, 200, 300, AccountDeliveryPurpose::Install)?;
@@ -355,6 +353,33 @@ fn expired_turn_does_not_block_other_delivery_or_next_reconciliation()
 }
 
 #[test]
+fn completion_cannot_be_backdated_after_lease_expiry() -> Result<(), Box<dyn std::error::Error>> {
+    let mut inbox = new_inbox(MemoryJournal::default())?;
+    install_ack(
+        &mut inbox,
+        claim(1, 100, 200, AccountDeliveryPurpose::Install)?,
+        110,
+        120,
+    )?;
+    let turn = inbox
+        .actor_turn("command:request-32", 190)?
+        .ok_or("actor turn missing")?;
+    let completion = turn.rejected(190, [0; 32], "actor rejected command")?;
+    assert!(matches!(
+        inbox.record_actor_completion(completion, 200),
+        Err(ControlDeliveryError::LeaseExpired)
+    ));
+    assert!(inbox.pending_receipts().is_empty());
+
+    let reconciliation = claim(2, 200, 300, AccountDeliveryPurpose::ReconcileOnly)?;
+    assert!(matches!(
+        inbox.accept_claim(reconciliation, 210)?,
+        ClaimAcceptance::Reconcile(_)
+    ));
+    Ok(())
+}
+
+#[test]
 fn caller_digest_cannot_create_a_production_applied_receipt()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut inbox = new_inbox(MemoryJournal::default())?;
@@ -369,6 +394,66 @@ fn caller_digest_cannot_create_a_production_applied_receipt()
     ));
     assert!(inbox.pending_receipts().is_empty());
     assert_eq!(inbox.pending_actor_turns(150)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn production_delivery_cannot_apply_any_control_action_without_actor_authority()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (index, action) in [
+        ControlAction::Pause,
+        ControlAction::Resume,
+        ControlAction::Stop,
+        ControlAction::Flatten,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let delivery_id = format!("command:unavailable-{index}");
+        let mut inbox = new_inbox(MemoryJournal::default())?;
+        let claim = claim_with_delivery_action(
+            &delivery_id,
+            1,
+            100,
+            300,
+            AccountDeliveryPurpose::Install,
+            action,
+        )?;
+        install_ack(&mut inbox, claim, 110, 120)?;
+        let turn = inbox
+            .actor_turn(&delivery_id, 130)?
+            .ok_or("actor turn missing")?;
+        assert!(matches!(
+            turn.applied(140, digest(8), "caller claims durable"),
+            Err(ControlDeliveryError::ActorAppliedUnavailable)
+        ));
+        assert!(inbox.pending_receipts().is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn actor_turn_binds_ack_replay_root_sequence_and_node() -> Result<(), Box<dyn std::error::Error>> {
+    let journal = MemoryJournal::default();
+    let mut inbox = new_inbox(journal.clone())?;
+    let install = claim(1, 100, 300, AccountDeliveryPurpose::Install)?;
+    install_ack(&mut inbox, install, 110, 120)?;
+    let turn = inbox
+        .actor_turn("command:request-32", 130)?
+        .ok_or("actor turn missing")?;
+    assert_eq!(turn.durable_inbox_sequence(), 3);
+    assert_ne!(turn.durable_inbox_root_digest(), [0; 32]);
+    assert_eq!(turn.node_id(), NODE);
+    let expected_root = turn.durable_inbox_root_digest();
+    drop(inbox);
+
+    let recovered = new_inbox(journal)?;
+    let recovered_turn = recovered
+        .actor_turn("command:request-32", 140)?
+        .ok_or("recovered actor turn missing")?;
+    assert_eq!(recovered_turn.durable_inbox_sequence(), 3);
+    assert_eq!(recovered_turn.durable_inbox_root_digest(), expected_root);
+    assert_eq!(recovered_turn.node_id(), NODE);
     Ok(())
 }
 
@@ -413,6 +498,56 @@ fn opaque_storage_recovers_incomplete_tail_and_fences_a_stale_writer()
 }
 
 #[test]
+fn opaque_storage_rejects_tampered_durable_receipt() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("control-delivery.jsonl");
+    let mut inbox = ControlDeliveryInbox::recover(
+        OpaqueControlDeliveryJournal::open(&path)?,
+        binding()?,
+        NODE,
+    )?;
+    install_ack(
+        &mut inbox,
+        claim(1, 100, 300, AccountDeliveryPurpose::Install)?,
+        110,
+        120,
+    )?;
+    let turn = inbox
+        .actor_turn("command:request-32", 130)?
+        .ok_or("actor turn missing")?;
+    let completion = turn.rejected(140, [0; 32], "actor rejected command")?;
+    inbox.record_actor_completion(completion, 140)?;
+    drop(inbox);
+
+    let encoded = std::fs::read_to_string(&path)?;
+    let mut lines = encoded.lines().map(str::to_owned).collect::<Vec<_>>();
+    let last = lines.last_mut().ok_or("durable receipt record missing")?;
+    let mut record: serde_json::Value = serde_json::from_str(last)?;
+    let payload = record["payload"]
+        .as_array_mut()
+        .ok_or("durable receipt payload missing")?;
+    let bytes = payload
+        .iter()
+        .map(|value| value.as_u64().and_then(|value| u8::try_from(value).ok()))
+        .collect::<Option<Vec<_>>>()
+        .ok_or("durable receipt payload is invalid")?;
+    let detail = b"actor rejected command";
+    let offset = bytes
+        .windows(detail.len())
+        .position(|window| window == detail)
+        .ok_or("durable receipt detail missing")?;
+    payload[offset] = serde_json::json!(b'A');
+    *last = serde_json::to_string(&record)?;
+    std::fs::write(&path, format!("{}\n", lines.join("\n")))?;
+
+    assert!(matches!(
+        OpaqueControlDeliveryJournal::open(&path),
+        Err(ControlDeliveryJournalError::Corrupt)
+    ));
+    Ok(())
+}
+
+#[test]
 fn control_http_client_requires_exact_loopback_and_bounded_timeouts() {
     for rejected in [
         "http://localhost:8080/",
@@ -443,7 +578,13 @@ async fn polling_driver_orders_claim_durable_ack_actor_and_receipt()
     let client = ControlHttpClient::new(ControlHttpClientConfig::local(base_url))?;
     let journal = MemoryJournal::default();
     let inbox = new_inbox(journal.clone())?;
-    let mut driver = ControlDeliveryDriver::new(client, inbox, 1_000, 1)?;
+    let mut driver = ControlDeliveryDriver::new_with_clock(
+        client,
+        inbox,
+        1_000,
+        1,
+        scripted_clock([110, 110, 110, 120, 120, 130, 140]),
+    )?;
 
     let mut work = driver.poll(110).await?;
     assert_eq!(journal.len()?, 3);
@@ -473,6 +614,68 @@ async fn polling_driver_orders_claim_durable_ack_actor_and_receipt()
             "/v2/account-node/deliveries/receipts"
         ]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn polling_driver_rechecks_clock_after_ack_and_skips_expired_actor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let install = claim(1, 100, 200, AccountDeliveryPurpose::Install)?;
+    let claim_body = serde_json::to_vec(&vec![install])?;
+    let (base_url, server) = spawn_control_server(claim_body, 2).await?;
+    let client = ControlHttpClient::new(ControlHttpClientConfig::local(base_url))?;
+    let journal = MemoryJournal::default();
+    let inbox = new_inbox(journal.clone())?;
+    let mut driver = ControlDeliveryDriver::new_with_clock(
+        client,
+        inbox,
+        100,
+        1,
+        scripted_clock([110, 110, 110, 200, 200]),
+    )?;
+
+    assert!(driver.poll(110).await?.is_empty());
+    assert_eq!(journal.len()?, 3);
+    let paths = server.await??;
+    assert_eq!(
+        paths,
+        vec![
+            "/v2/account-node/deliveries/claim",
+            "/v2/account-node/deliveries/ack"
+        ]
+    );
+
+    let mut inbox = driver.into_inbox();
+    let reconciliation = claim(2, 200, 300, AccountDeliveryPurpose::ReconcileOnly)?;
+    assert!(matches!(
+        inbox.accept_claim(reconciliation, 210)?,
+        ClaimAcceptance::Reconcile(_)
+    ));
+    assert!(inbox.pending_actor_turns(210)?.is_empty());
+    assert_eq!(inbox.pending_reconciliation_turns(220)?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn polling_driver_drops_claim_that_expires_during_http_await()
+-> Result<(), Box<dyn std::error::Error>> {
+    let install = claim(1, 100, 200, AccountDeliveryPurpose::Install)?;
+    let claim_body = serde_json::to_vec(&vec![install])?;
+    let (base_url, server) = spawn_control_server(claim_body, 1).await?;
+    let client = ControlHttpClient::new(ControlHttpClientConfig::local(base_url))?;
+    let journal = MemoryJournal::default();
+    let inbox = new_inbox(journal.clone())?;
+    let mut driver = ControlDeliveryDriver::new_with_clock(
+        client,
+        inbox,
+        100,
+        1,
+        scripted_clock([110, 110, 200, 200]),
+    )?;
+
+    assert!(driver.poll(110).await?.is_empty());
+    assert_eq!(journal.len()?, 1);
+    assert_eq!(server.await??, vec!["/v2/account-node/deliveries/claim"]);
     Ok(())
 }
 
@@ -575,8 +778,8 @@ fn new_inbox(
     Ok(ControlDeliveryInbox::recover(journal, binding()?, NODE)?)
 }
 
-fn install_ack(
-    inbox: &mut ControlDeliveryInbox<MemoryJournal>,
+fn install_ack<J: ControlDeliveryJournal>(
+    inbox: &mut ControlDeliveryInbox<J>,
     claim: AccountDeliveryClaim,
     received_ms: u64,
     confirmed_ms: u64,
@@ -622,7 +825,40 @@ fn claim_with_delivery(
     expires_at_ms: u64,
     purpose: AccountDeliveryPurpose,
 ) -> Result<AccountDeliveryClaim, venue_domain::SymbolError> {
+    claim_with_delivery_action(
+        delivery_id,
+        lease_epoch,
+        leased_at_ms,
+        expires_at_ms,
+        purpose,
+        ControlAction::Pause,
+    )
+}
+
+fn claim_with_delivery_action(
+    delivery_id: &str,
+    lease_epoch: u64,
+    leased_at_ms: u64,
+    expires_at_ms: u64,
+    purpose: AccountDeliveryPurpose,
+    action: ControlAction,
+) -> Result<AccountDeliveryClaim, venue_domain::SymbolError> {
     let binding = binding()?;
+    let mut command = ControlCommandRequest {
+        schema_version: CONTROL_SCHEMA_VERSION,
+        request_id: "request-32".to_owned(),
+        venue: binding.venue,
+        mode: binding.mode,
+        trading_account_id: binding.trading_account_id.clone(),
+        instance_id: binding.instance_id.clone(),
+        symbol: binding.symbol.clone(),
+        action,
+        expected_config_epoch: binding.config_epoch,
+        confirmation: None,
+    };
+    if action.requires_confirmation() {
+        command.confirmation = Some(command.expected_confirmation());
+    }
     Ok(AccountDeliveryClaim {
         lease: AccountDeliveryLease {
             schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
@@ -634,21 +870,23 @@ fn claim_with_delivery(
             expires_at_ms,
             purpose,
         },
-        payload: AccountDeliveryPayload::ControlCommand(ControlCommandRequest {
-            schema_version: CONTROL_SCHEMA_VERSION,
-            request_id: "request-32".to_owned(),
-            venue: binding.venue,
-            mode: binding.mode,
-            trading_account_id: binding.trading_account_id,
-            instance_id: binding.instance_id,
-            symbol: binding.symbol,
-            action: ControlAction::Pause,
-            expected_config_epoch: binding.config_epoch,
-            confirmation: None,
-        }),
+        payload: AccountDeliveryPayload::ControlCommand(command),
     })
 }
 
 fn digest(value: u8) -> [u8; 32] {
     [value; 32]
+}
+
+fn scripted_clock<const N: usize>(values: [u64; N]) -> Arc<dyn Fn() -> u64 + Send + Sync> {
+    let values = Arc::new(Mutex::new(VecDeque::from(values)));
+    Arc::new(move || {
+        let Ok(mut values) = values.lock() else {
+            return 0;
+        };
+        let Some(value) = values.pop_front() else {
+            return 0;
+        };
+        value
+    })
 }

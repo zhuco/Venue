@@ -1,12 +1,10 @@
 use std::{collections::BTreeMap, future::Future, pin::Pin};
 
-use bytes::Bytes;
 use rust_decimal::Decimal;
 use venue_domain::domain::{FieldState, OrderSide};
-use venue_gateway_api::{
-    CapabilityFlags, GatewayApiError, GatewayBinding, GatewayMode, MutationCapability, VenueId,
-};
+use venue_gateway_api::{CapabilityFlags, GatewayBinding, GatewayMode, VenueId};
 
+use crate::action::build_alo_place_request;
 use crate::physical::HyperliquidExchangeDispatch;
 use crate::*;
 
@@ -43,7 +41,6 @@ impl HyperliquidNonceStore for MemoryNonceStore {
 }
 
 enum MockReply {
-    Body(Bytes),
     Disconnect,
 }
 
@@ -55,7 +52,7 @@ struct MockDispatch {
 impl HyperliquidExchangeDispatch for MockDispatch {
     fn post_exchange<'a>(
         &'a mut self,
-        expected_binding: &'a HyperliquidReadBinding,
+        _expected_binding: &'a HyperliquidReadBinding,
         _request: &'a HyperliquidExchangeRequest,
     ) -> Pin<
         Box<
@@ -66,11 +63,6 @@ impl HyperliquidExchangeDispatch for MockDispatch {
     > {
         self.calls += 1;
         let result = match &self.reply {
-            MockReply::Body(body) => Ok(HyperliquidHttpResponse {
-                binding: expected_binding.clone(),
-                body: body.clone(),
-                received_at_ms: 1_700_000_000_100,
-            }),
             MockReply::Disconnect => Err(HyperliquidTransportError::Http),
         };
         Box::pin(async move { result })
@@ -206,94 +198,103 @@ fn fill_window_deduplicates_exact_private_overlap_and_rejects_conflicts()
     Ok(())
 }
 
-#[tokio::test]
-async fn complete_fresh_probe_yields_only_a_non_withdrawal_candidate_and_tamper_fails()
+#[test]
+fn complete_fresh_probe_yields_only_a_non_withdrawal_candidate_and_tamper_fails()
 -> Result<(), Box<dyn std::error::Error>> {
     let selected = meta()?;
     let credential = credentials()?;
     let private = HyperliquidPrivateStreamBinding::new(&selected, 21)?;
-    let account = parse_clearinghouse_snapshot(CLEARINGHOUSE, &selected)?;
     let orders = parse_frontend_open_orders_snapshot(ORDERS, &selected, 1_700_000_000_010)?;
     let query =
         HyperliquidFillQuery::new(&selected, 1_700_000_000_001, 1_700_000_000_002, 10, None)?;
-    let page = parse_user_fills_page(FILLS, &selected, &query)?;
-    let mut fill_probe =
-        HyperliquidFillWindowProbe::new(&private, query.begin_ms(), query.end_ms())?;
-    fill_probe.ingest_page(&query, &page)?;
-    let fill_window = fill_probe.finish()?;
+    let started_ms = 1_708_622_398_623;
     let private_stream =
-        HyperliquidPrivateStreamProbeEvidence::from_connected(&private, 1_700_000_000_020)?;
-
-    let mut nonces = MemoryNonceStore::default();
-    let alo = action_receipt(
+        HyperliquidPrivateStreamProbeEvidence::from_connected(&private, started_ms + 20)?;
+    let owners = owner_snapshot(&orders)?;
+    let unknowns = HyperliquidUnknownSnapshot::new(vec![HyperliquidUnresolvedOrder::new(
+        HyperliquidOrderFamily::Regular,
+        HyperliquidOrderLookup::order_id(999)?,
+        "ack_disconnect",
+    )?])?;
+    let roots = HyperliquidProbeAuthorityRoots::for_snapshots(&owners, &unknowns, [2; 32])?;
+    let observed_ms = started_ms + 150;
+    let scope = HyperliquidProbeCollectionScope::new(
         &selected,
+        &credential,
         &private,
-        &credential,
-        reserve_next_nonce(&mut nonces, AGENT, 1_700_000_000_100)?,
-        ActionFixture::Alo,
-    )
-    .await
-    .map_err(|error| format!("ALO probe failed: {error}"))?;
-    let cancel = action_receipt(
-        &selected,
-        &private,
-        &credential,
-        reserve_next_nonce(&mut nonces, AGENT, 1_700_000_000_101)?,
-        ActionFixture::Cancel,
-    )
-    .await
-    .map_err(|error| format!("cancel probe failed: {error}"))?;
-    let ioc = action_receipt(
-        &selected,
-        &private,
-        &credential,
-        reserve_next_nonce(&mut nonces, AGENT, 1_700_000_000_102)?,
-        ActionFixture::Ioc,
-    )
-    .await
-    .map_err(|error| format!("IOC probe failed: {error}"))?;
-    let observed_ms = 1_800_000_000_000;
-    let evidence = HyperliquidCapabilityProbeEvidence::issue(
-        &selected,
-        &credential,
-        &account,
-        &orders,
-        fill_window,
-        private_stream,
-        31,
+        "config_7",
         7,
-        observed_ms,
-        observed_ms + 30_000,
-        [ioc, alo, cancel],
+        vec![selected.scope.symbol().clone(), "ETH/USDC".parse()?],
+        41,
+        31,
+        20,
+        roots,
+        started_ms,
+        started_ms + 180,
+        started_ms + 30_000,
     )?;
-    evidence.verify()?;
+    let expected_scope = scope.clone();
+    let mut collector = HyperliquidFreshProbeCollector::start(
+        scope,
+        &selected,
+        META,
+        &private,
+        owners,
+        unknowns,
+        query.begin_ms(),
+        query.end_ms(),
+    )?;
+    collector.ingest_account(CLEARINGHOUSE, started_ms + 30)?;
+    collector.ingest_orders(ORDERS, started_ms + 40)?;
+    collector.ingest_fill_page(&query, FILLS, started_ms + 50)?;
+    collector.ingest_unknown_order_status(
+        &HyperliquidOrderLookup::order_id(999)?,
+        br#"{"status":"unknownOid"}"#,
+        started_ms + 60,
+    )?;
+
+    let evidence = collector.finish(&credential, private_stream, 7, observed_ms)?;
+    evidence.verify(&credential)?;
+    assert_eq!(evidence.recovery_faces().len(), 6);
+    let order_face = evidence
+        .recovery_faces()
+        .iter()
+        .find(|face| face.surface() == HyperliquidRecoverySurface::UmOrder)
+        .ok_or("regular order face missing")?;
+    assert!(matches!(
+        order_face.coverage(),
+        HyperliquidRecoveryCoverage::BlockedUnknown {
+            visible_record_count: 1,
+            unresolved_count: 1,
+            ..
+        }
+    ));
+    assert_eq!(evidence.unknown_orders().len(), 1);
+    assert_eq!(evidence.unknown_orders()[0].native_identity(), "999");
+    assert_eq!(
+        evidence.unknown_orders()[0].unresolved_reason(),
+        "ack_disconnect"
+    );
+    assert_eq!(
+        evidence.unknown_orders()[0].reason(),
+        HyperliquidOrderStatusUnknownReason::UnknownOid
+    );
     let candidate = evidence.candidate_capability_snapshot(
         selected.scope.binding().gateway().gateway_binding(),
+        &credential,
         observed_ms + 1,
     )?;
-    assert!(candidate.flags.contains(CapabilityFlags::PLACE_LIMIT));
-    assert!(candidate.flags.contains(CapabilityFlags::CANCEL));
+    assert!(candidate.flags.contains(CapabilityFlags::READ_ACCOUNT));
+    assert!(!candidate.flags.contains(CapabilityFlags::TRADE));
+    assert!(!candidate.flags.contains(CapabilityFlags::PLACE_LIMIT));
+    assert!(!candidate.flags.contains(CapabilityFlags::CANCEL));
     assert!(!candidate.flags.contains(CapabilityFlags::PLACE_MARKET));
     assert!(!candidate.flags.contains(CapabilityFlags::WITHDRAW));
-    candidate.authorize(
-        &candidate.binding,
-        candidate.version,
-        observed_ms + 1,
-        MutationCapability::PlaceLimit,
-    )?;
-    assert_eq!(
-        candidate.authorize(
-            &candidate.binding,
-            candidate.version,
-            observed_ms + 1,
-            MutationCapability::PlaceMarket,
-        ),
-        Err(GatewayApiError::CapabilityDenied)
-    );
     assert_eq!(capabilities(), CapabilityFlags::empty());
     assert_eq!(
         evidence.candidate_capability_snapshot(
             selected.scope.binding().gateway().gateway_binding(),
+            &credential,
             observed_ms + 30_000,
         ),
         Err(HyperliquidError::CapabilityProbe)
@@ -301,204 +302,192 @@ async fn complete_fresh_probe_yields_only_a_non_withdrawal_candidate_and_tamper_
 
     let persisted = serde_json::to_vec(&evidence)?;
     let restored = HyperliquidNodeCandidate::from_persisted_slice(
-        selected.scope.binding().gateway().gateway_binding(),
+        &expected_scope,
+        &credential,
         &persisted,
         observed_ms + 1,
     )?;
     assert_eq!(restored.candidate_capability_snapshot(), &candidate);
     assert_eq!(capabilities(), CapabilityFlags::empty());
 
-    let mut action_nonces = MemoryNonceStore::default();
-    drop(restored.prepare_alo(
-        &mut action_nonces,
-        &selected,
-        &private,
-        &credential,
-        1_800_000_000_100,
-        HyperliquidAloOrder::new(
-            &selected,
-            OrderSide::Buy,
-            Decimal::new(6_500_500, 3),
-            Decimal::new(4, 1),
-            false,
-            "0x00000000000000000000000000000011",
-        )?,
-        None,
-    )?);
-    drop(restored.prepare_cancel(
-        &mut action_nonces,
-        &selected,
-        &private,
-        &credential,
-        1_800_000_000_101,
-        HyperliquidCancel::new(&selected, 77)?,
-        None,
-    )?);
-    drop(restored.prepare_ioc_reduce_only(
-        &mut action_nonces,
-        &selected,
-        &private,
-        &credential,
-        1_800_000_000_102,
-        HyperliquidIocReduceOnlyOrder::new(
-            &selected,
-            OrderSide::Sell,
-            Decimal::new(6_400_000, 3),
-            Decimal::new(2, 1),
-            "0x00000000000000000000000000000012",
-        )?,
-        None,
-    )?);
-    assert_eq!(
-        action_nonces
-            .load(AGENT)?
-            .ok_or("candidate nonce checkpoint missing")?
-            .last_nonce_ms,
-        1_800_000_000_102
-    );
-
-    let newer_private = HyperliquidPrivateStreamBinding::new(&selected, 22)?;
-    assert!(matches!(
-        restored.prepare_cancel(
-            &mut action_nonces,
-            &selected,
-            &newer_private,
-            &credential,
-            1_800_000_000_103,
-            HyperliquidCancel::new(&selected, 77)?,
-            None,
-        ),
-        Err(HyperliquidError::CapabilityProbe)
-    ));
-
     let mut tampered = serde_json::to_value(&evidence)?;
     tampered["payload"]["vault_address"] =
         serde_json::json!("0x0000000000000000000000000000000000000002");
     let tampered: HyperliquidCapabilityProbeEvidence = serde_json::from_value(tampered)?;
-    assert_eq!(tampered.verify(), Err(HyperliquidError::CapabilityProbe));
+    assert_eq!(
+        tampered.verify(&credential),
+        Err(HyperliquidError::CapabilityProbe)
+    );
     let tampered = serde_json::to_vec(&tampered)?;
     assert!(matches!(
         HyperliquidNodeCandidate::from_persisted_slice(
-            selected.scope.binding().gateway().gateway_binding(),
+            &expected_scope,
+            &credential,
             &tampered,
             observed_ms + 1,
         ),
         Err(HyperliquidError::CapabilityProbe)
     ));
 
-    let live_binding = GatewayBinding::new(
-        VenueId::Hyperliquid,
-        GatewayMode::Live,
-        ACCOUNT,
-        "BTC/USDC".parse()?,
-    )?;
+    let mut wrong_scope = serde_json::to_value(&expected_scope)?;
+    wrong_scope["config_epoch"] = serde_json::json!(8);
+    let wrong_scope: HyperliquidProbeCollectionScope = serde_json::from_value(wrong_scope)?;
     assert!(matches!(
-        HyperliquidNodeCandidate::from_persisted_slice(&live_binding, &persisted, observed_ms + 1,),
+        HyperliquidNodeCandidate::from_persisted_slice(
+            &wrong_scope,
+            &credential,
+            &persisted,
+            observed_ms + 1,
+        ),
+        Err(HyperliquidError::CapabilityProbe)
+    ));
+
+    for (field, replacement) in [
+        ("attempt_id", serde_json::json!(42)),
+        ("private_generation", serde_json::json!(22)),
+    ] {
+        let mut relabeled = serde_json::to_value(&evidence)?;
+        relabeled["payload"]["collection_scope"][field] = replacement;
+        let encoded = serde_json::to_vec(&relabeled)?;
+        assert!(matches!(
+            HyperliquidNodeCandidate::from_persisted_slice(
+                &expected_scope,
+                &credential,
+                &encoded,
+                observed_ms + 1,
+            ),
+            Err(HyperliquidError::CapabilityProbe)
+        ));
+    }
+
+    let mut root_relabel = serde_json::to_value(&evidence)?;
+    root_relabel["payload"]["collection_scope"]["authority_roots"]["wal_keccak256"] =
+        serde_json::json!("44".repeat(32));
+    let root_relabel = serde_json::to_vec(&root_relabel)?;
+    assert!(matches!(
+        HyperliquidNodeCandidate::from_persisted_slice(
+            &expected_scope,
+            &credential,
+            &root_relabel,
+            observed_ms + 1,
+        ),
+        Err(HyperliquidError::CapabilityProbe)
+    ));
+
+    let mut raw_replacement = serde_json::to_value(&evidence)?;
+    raw_replacement["payload"]["account_raw_payload"][0] = serde_json::json!(b'[');
+    let raw_replacement = serde_json::to_vec(&raw_replacement)?;
+    assert!(matches!(
+        HyperliquidNodeCandidate::from_persisted_slice(
+            &expected_scope,
+            &credential,
+            &raw_replacement,
+            observed_ms + 1,
+        ),
         Err(HyperliquidError::CapabilityProbe)
     ));
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum ActionFixture {
-    Alo,
-    Cancel,
-    Ioc,
+fn owner_snapshot(
+    orders: &HyperliquidOpenOrdersSnapshot,
+) -> Result<HyperliquidOwnerSnapshot, Box<dyn std::error::Error>> {
+    let routes = orders
+        .orders
+        .iter()
+        .map(|order| {
+            let client_order_id = match &order.order.client_order_id {
+                FieldState::Known(value) => Some(value.clone()),
+                FieldState::Missing => None,
+                _ => return Err(HyperliquidError::CapabilityProbe),
+            };
+            HyperliquidOwnerRoute::new(
+                order.family,
+                order.order.symbol.clone(),
+                order
+                    .order
+                    .order_id
+                    .parse()
+                    .map_err(|_| HyperliquidError::CapabilityProbe)?,
+                client_order_id,
+                "grid_btc",
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(HyperliquidOwnerSnapshot::new(routes)?)
 }
 
-async fn action_receipt(
-    meta: &HyperliquidPerpMeta,
-    private: &HyperliquidPrivateStreamBinding,
-    credentials: &HyperliquidCredentials,
-    nonce: PersistedNonce,
-    fixture: ActionFixture,
-) -> Result<HyperliquidProbeActionReceipt, Box<dyn std::error::Error>> {
-    let (request, acknowledgement, status) = match fixture {
-        ActionFixture::Alo => (
-            build_alo_place_request(
-                credentials,
-                nonce,
-                HyperliquidAloOrder::new(
-                    meta,
-                    OrderSide::Buy,
-                    Decimal::new(6_500_500, 3),
-                    Decimal::new(4, 1),
-                    false,
-                    "0x00000000000000000000000000000001",
-                )?,
-                None,
-            )?,
-            Bytes::from_static(br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":77}}]}}}"#),
-            status_payload(77, "B", "6500.5", "0.4", false, "Alo", "open", "0x00000000000000000000000000000001")?,
-        ),
-        ActionFixture::Cancel => (
-            build_cancel_request(credentials, nonce, HyperliquidCancel::new(meta, 77)?, None)?,
-            Bytes::from_static(br#"{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}"#),
-            status_payload(77, "B", "6500.5", "0.4", false, "Alo", "canceled", "0x00000000000000000000000000000001")?,
-        ),
-        ActionFixture::Ioc => (
-            build_ioc_reduce_only_request(
-                credentials,
-                nonce,
-                HyperliquidIocReduceOnlyOrder::new(
-                    meta,
-                    OrderSide::Sell,
-                    Decimal::new(6_400_000, 3),
-                    Decimal::new(2, 1),
-                    "0x00000000000000000000000000000002",
-                )?,
-                None,
-            )?,
-            Bytes::from_static(br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"filled":{"totalSz":"0.2","avgPx":"6400","oid":88}}]}}}"#),
-            status_payload(88, "A", "6400", "0", true, "Ioc", "filled", "0x00000000000000000000000000000002")?,
-        ),
-    };
-    let mut dispatch = MockDispatch {
-        reply: MockReply::Body(acknowledgement),
-        calls: 0,
-    };
-    let HyperliquidPhysicalDispatchResult::PendingReadback(pending) =
-        HyperliquidPhysicalDispatch::new(request, private)?
-            .dispatch_once_for_test(&mut dispatch)
-            .await
-    else {
-        return Err("probe action rejected".into());
-    };
-    assert_eq!(dispatch.calls, 1);
-    let status = parse_order_status(&status, meta, pending.plan().lookup())?;
-    let HyperliquidPhysicalReadbackResult::Confirmed(receipt) = pending.reconcile(Some(&status))?
-    else {
-        return Err("probe action did not converge".into());
-    };
-    Ok(receipt)
-}
+#[test]
+fn fresh_collector_rejects_owner_omission_deadline_and_cross_generation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let selected = meta()?;
+    let credential = credentials()?;
+    let private = HyperliquidPrivateStreamBinding::new(&selected, 21)?;
+    let owners = HyperliquidOwnerSnapshot::new(Vec::new())?;
+    let unknowns = HyperliquidUnknownSnapshot::new(Vec::new())?;
+    let roots = HyperliquidProbeAuthorityRoots::for_snapshots(&owners, &unknowns, [2; 32])?;
+    let started_ms = 1_708_622_398_623;
+    let scope = HyperliquidProbeCollectionScope::new(
+        &selected,
+        &credential,
+        &private,
+        "config_7",
+        7,
+        vec![selected.scope.symbol().clone(), "ETH/USDC".parse()?],
+        41,
+        31,
+        20,
+        roots,
+        started_ms,
+        started_ms + 180,
+        started_ms + 30_000,
+    )?;
+    let query =
+        HyperliquidFillQuery::new(&selected, 1_700_000_000_001, 1_700_000_000_002, 10, None)?;
 
-#[allow(clippy::too_many_arguments)]
-fn status_payload(
-    order_id: u64,
-    side: &str,
-    price: &str,
-    remaining_size: &str,
-    reduce_only: bool,
-    tif: &str,
-    status: &str,
-    client_order_id: &str,
-) -> Result<Vec<u8>, serde_json::Error> {
-    serde_json::to_vec(&serde_json::json!({
-        "status":"order",
-        "order":{
-            "order":{
-                "children":[], "coin":"BTC", "isPositionTpsl":false,
-                "isTrigger":false, "side":side, "limitPx":price, "sz":remaining_size,
-                "oid":order_id, "timestamp":1_700_000_000_110_u64,
-                "reduceOnly":reduce_only,
-                "orderType":if tif == "Ioc" {"Market"} else {"Limit"},
-                "origSz":if tif == "Ioc" {"0.2"} else {"0.4"},
-                "tif":if tif == "Ioc" {"FrontendMarket"} else {tif},
-                "triggerCondition":"N/A", "triggerPx":"0.0",
-                "cloid":client_order_id
-            },
-            "status":status, "statusTimestamp":1_700_000_000_120_u64
-        }
-    }))
+    let mut owner_collector = HyperliquidFreshProbeCollector::start(
+        scope.clone(),
+        &selected,
+        META,
+        &private,
+        owners.clone(),
+        unknowns.clone(),
+        query.begin_ms(),
+        query.end_ms(),
+    )?;
+    assert_eq!(
+        owner_collector.ingest_orders(ORDERS, started_ms + 40),
+        Err(HyperliquidError::CapabilityProbe)
+    );
+
+    let mut deadline_collector = HyperliquidFreshProbeCollector::start(
+        scope.clone(),
+        &selected,
+        META,
+        &private,
+        owners.clone(),
+        unknowns.clone(),
+        query.begin_ms(),
+        query.end_ms(),
+    )?;
+    assert_eq!(
+        deadline_collector.ingest_account(CLEARINGHOUSE, started_ms + 181),
+        Err(HyperliquidError::CapabilityProbe)
+    );
+
+    let newer_private = HyperliquidPrivateStreamBinding::new(&selected, 22)?;
+    assert!(matches!(
+        HyperliquidFreshProbeCollector::start(
+            scope,
+            &selected,
+            META,
+            &newer_private,
+            owners,
+            unknowns,
+            query.begin_ms(),
+            query.end_ms(),
+        ),
+        Err(HyperliquidError::CapabilityProbe)
+    ));
+    Ok(())
 }

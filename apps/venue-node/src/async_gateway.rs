@@ -38,7 +38,7 @@ pub trait AsyncPhysicalGateway {
 
     fn verify_signed_readback(&self, receipt: &SignedReadbackReceipt) -> Result<(), Self::Error>;
 
-    /// Positive mutation wiring is a test fixture until the upstream authority is unforgeable.
+    /// Positive mutation wiring remains a test fixture until real durable authorities are sealed.
     #[cfg(test)]
     fn dispatch(
         &mut self,
@@ -57,7 +57,7 @@ pub trait TokioRuntimeDriver {
     fn run<F: Future + Send>(&mut self, timeout: Duration, future: F)
     -> TokioRuntimeRun<F::Output>;
 
-    /// Injected boundary clock used immediately before a test-only async mutation leaves the host.
+    /// Boundary clock sampled before send and after completion in the test-only mutation fixture.
     #[cfg(test)]
     fn execution_now_ms(&self) -> u64;
 }
@@ -164,17 +164,23 @@ impl<G: AsyncPhysicalGateway, R: TokioRuntimeDriver> TokioPhysicalGateway<G, R> 
     #[cfg(test)]
     fn dispatch_linear(&mut self, permit: DispatchPermit) -> GatewayDispatchResult {
         let execution_now_ms = self.runtime.execution_now_ms();
+        let snapshot = self.adapter.capability_snapshot();
         let Ok((admitted_capability, admission_evidence, permit)) =
-            permit.into_async_parts(execution_now_ms)
+            permit.into_async_parts(execution_now_ms, &snapshot)
         else {
             return GatewayDispatchResult::Rejected {
                 reason_code: "host_admission_invalid".to_owned(),
             };
         };
+        let admission_expires_ms = permit.admission_expires_ms();
         let future = self
             .adapter
             .dispatch(admitted_capability, admission_evidence, permit);
-        match self.runtime.run(self.timeouts.dispatch, future) {
+        let result = self.runtime.run(self.timeouts.dispatch, future);
+        if self.runtime.execution_now_ms() >= admission_expires_ms {
+            return GatewayDispatchResult::Unknown;
+        }
+        match result {
             TokioRuntimeRun::Completed(Ok(result)) => result,
             TokioRuntimeRun::TimedOut
             | TokioRuntimeRun::Failed
@@ -187,7 +193,7 @@ impl<G: AsyncPhysicalGateway, R: TokioRuntimeDriver> TokioPhysicalGateway<G, R> 
 
     #[cfg(not(test))]
     fn dispatch_linear(&mut self, _permit: DispatchPermit) -> GatewayDispatchResult {
-        // Public promotion inputs cannot prove production authority, so no future is constructed.
+        // Real Control/Owner/WAL/Canary authorities are not connected in this composition.
         GatewayDispatchResult::Rejected {
             reason_code: "host_admission_unavailable".to_owned(),
         }

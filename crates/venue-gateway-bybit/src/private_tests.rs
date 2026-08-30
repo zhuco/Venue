@@ -638,6 +638,7 @@ fn fresh_complete_probe_is_persistable_for_test_and_live_only() -> Result<(), Te
         let stream = BybitPrivateStreamProbeEvidence::authenticated(
             gateway.gateway_binding().clone(),
             7,
+            7,
             1_950,
             2_100,
             3_000,
@@ -729,6 +730,7 @@ fn private_stream_cross_generation_cannot_complete_probe() -> Result<(), TestErr
     let (binding, credentials, candidate) = capability_candidate(GatewayMode::Test)?;
     let stream = BybitPrivateStreamProbeEvidence::authenticated(
         binding.gateway_binding().clone(),
+        8,
         8,
         1_950,
         2_100,

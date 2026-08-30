@@ -7,6 +7,7 @@
 use std::collections::BTreeSet;
 
 use sha2::{Digest, Sha256};
+use venue_gateway_api::GatewayMode;
 
 use crate::{
     domain::{
@@ -16,7 +17,9 @@ use crate::{
     runtime::{account::InstanceLifecycle, strategy::PersistedPrivateFact},
 };
 
-use super::PhysicalRecoveryAuthorityRoots;
+use super::{
+    AccountPositionMode, PhysicalRecoveryAuthorityRoots, physical_recovery::PhysicalRecoveryUnknown,
+};
 
 const MAX_RECOVERED_PRIVATE_FACTS: u32 = 1_024;
 
@@ -481,6 +484,8 @@ impl RecoveredPrivateBatch {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccountRecoverySnapshot {
     account: AccountKey,
+    gateway_mode: GatewayMode,
+    position_mode: AccountPositionMode,
     journal_roots: RecoveryJournalRoots,
     manifest_commitment: RecoveryManifestCommitment,
     last_connection_generation: u64,
@@ -495,6 +500,8 @@ pub struct AccountRecoverySnapshot {
 impl AccountRecoverySnapshot {
     pub(crate) fn verified(
         account: AccountKey,
+        gateway_mode: GatewayMode,
+        position_mode: AccountPositionMode,
         journal_roots: RecoveryJournalRoots,
         manifest_commitment: RecoveryManifestCommitment,
         last_connection_generation: u64,
@@ -514,6 +521,8 @@ impl AccountRecoverySnapshot {
         )?;
         let computed_manifest = recovery_manifest_sha256(
             &account,
+            gateway_mode,
+            position_mode,
             &journal_roots,
             last_connection_generation,
             &applied_private_cursor,
@@ -525,14 +534,31 @@ impl AccountRecoverySnapshot {
         if manifest_commitment.sha256 != computed_manifest {
             return Err(RecoverySnapshotError::ManifestCommitment);
         }
-        let physical_authority_roots = PhysicalRecoveryAuthorityRoots::verified(
+        let structured_unknowns = unresolved_mutations
+            .iter()
+            .map(|request| {
+                PhysicalRecoveryUnknown::durable_wal_unresolved(
+                    request.command_id().as_str(),
+                    request.native_client_id().as_str(),
+                    request.native_order_family(),
+                    request.target().symbol.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        if structured_unknowns.len() != unresolved_mutations.len() {
+            return Err(RecoverySnapshotError::UnknownIdentity);
+        }
+        let physical_authority_roots = PhysicalRecoveryAuthorityRoots::verified_recovered(
             journal_roots.owner_index(),
             journal_roots.mutation_wal(),
             unknown_projection_sha256(&unresolved_mutations)?,
+            structured_unknowns,
         )
         .map_err(|_| RecoverySnapshotError::PhysicalAuthorityRoots)?;
         Ok(Self {
             account,
+            gateway_mode,
+            position_mode,
             journal_roots,
             manifest_commitment,
             last_connection_generation,
@@ -549,6 +575,8 @@ impl AccountRecoverySnapshot {
         self,
     ) -> (
         AccountKey,
+        GatewayMode,
+        AccountPositionMode,
         RecoveryJournalRoots,
         RecoveryManifestCommitment,
         u64,
@@ -561,6 +589,8 @@ impl AccountRecoverySnapshot {
     ) {
         (
             self.account,
+            self.gateway_mode,
+            self.position_mode,
             self.journal_roots,
             self.manifest_commitment,
             self.last_connection_generation,
@@ -578,6 +608,8 @@ impl AccountRecoverySnapshot {
 impl RecoveryManifestCommitment {
     pub(crate) fn test_for_replayed_state(
         account: &AccountKey,
+        gateway_mode: GatewayMode,
+        position_mode: AccountPositionMode,
         journal_roots: &RecoveryJournalRoots,
         last_connection_generation: u64,
         applied_private_cursor: &RecoveredPrivateCursor,
@@ -589,6 +621,8 @@ impl RecoveryManifestCommitment {
         Ok(Self {
             sha256: recovery_manifest_sha256(
                 account,
+                gateway_mode,
+                position_mode,
                 journal_roots,
                 last_connection_generation,
                 applied_private_cursor,
@@ -625,6 +659,8 @@ pub enum RecoverySnapshotError {
     ManifestEncoding,
     #[error("recovery manifest cannot derive complete Owner, WAL, and Unknown authority roots")]
     PhysicalAuthorityRoots,
+    #[error("recovered UNKNOWN entries must retain unique native identity and reason")]
+    UnknownIdentity,
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -659,6 +695,8 @@ fn verify_private_evidence_coverage(
 
 fn recovery_manifest_sha256(
     account: &AccountKey,
+    gateway_mode: GatewayMode,
+    position_mode: AccountPositionMode,
     journal_roots: &RecoveryJournalRoots,
     last_connection_generation: u64,
     applied_private_cursor: &RecoveredPrivateCursor,
@@ -668,8 +706,10 @@ fn recovery_manifest_sha256(
     unresolved_mutations: &[AccountExecutionRequest],
 ) -> Result<[u8; 32], RecoverySnapshotError> {
     let mut digest = Sha256::new();
-    commit_bytes(&mut digest, b"venue-account-recovery-manifest-v1");
+    commit_bytes(&mut digest, b"venue-account-recovery-manifest-v2");
     commit_account_key(&mut digest, account);
+    commit_bytes(&mut digest, &[gateway_mode_tag(gateway_mode)]);
+    commit_bytes(&mut digest, &[position_mode_tag(position_mode)]);
     commit_bytes(&mut digest, &journal_roots.strategy_checkpoint);
     commit_journal_boundary(&mut digest, journal_roots.strategy_checkpoint_boundary);
     commit_bytes(&mut digest, &journal_roots.private_evidence);
@@ -747,6 +787,14 @@ fn unknown_projection_sha256(
     commit_bytes(&mut digest, b"venue-account-recovery-unknown-projection-v1");
     commit_len(&mut digest, unresolved_mutations.len());
     for request in unresolved_mutations {
+        commit_str(&mut digest, request.command_id().as_str());
+        commit_str(&mut digest, request.native_client_id().as_str());
+        commit_bytes(
+            &mut digest,
+            &[native_order_family_tag(request.native_order_family())],
+        );
+        commit_str(&mut digest, &request.target().symbol.to_string());
+        commit_bytes(&mut digest, &[1]);
         let commitment = request
             .canonical_recovery_commitment()
             .map_err(|_| RecoverySnapshotError::ManifestEncoding)?;
@@ -865,6 +913,20 @@ const fn native_order_family_tag(family: NativeOrderFamily) -> u8 {
         NativeOrderFamily::UmOrder => 1,
         NativeOrderFamily::UmConditional => 2,
         NativeOrderFamily::UmAlgo => 3,
+    }
+}
+
+const fn gateway_mode_tag(mode: GatewayMode) -> u8 {
+    match mode {
+        GatewayMode::Test => 1,
+        GatewayMode::Live => 2,
+    }
+}
+
+const fn position_mode_tag(mode: AccountPositionMode) -> u8 {
+    match mode {
+        AccountPositionMode::Net => 1,
+        AccountPositionMode::Hedge => 2,
     }
 }
 

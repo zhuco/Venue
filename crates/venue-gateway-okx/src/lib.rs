@@ -9,6 +9,7 @@ mod private;
 mod private_ws;
 mod public;
 mod readback;
+mod recovery_collector;
 mod sign;
 mod transport;
 
@@ -17,11 +18,11 @@ use venue_gateway_api::CapabilityFlags;
 
 pub use binding::{OkxGatewayBinding, OkxGatewayBindingError};
 pub use capability::{
-    OKX_CAPABILITY_PROBE_SCHEMA_VERSION, OkxCapabilityCandidate, OkxCapabilityProbeEvidence,
-    OkxCapabilityProbeScope, OkxMutationProbeEvidence, OkxPrivateStreamProbeEvidence,
-    OkxPrivateStreamProbeFrame, OkxProbeHttpResponse, PersistedOkxCapabilityProbe,
-    load_capability_probe, persist_capability_probe, validate_capability_candidate,
-    validate_read_capability_candidate,
+    OKX_CAPABILITY_PROBE_SCHEMA_VERSION, OKX_LEGACY_CAPABILITY_PROBE_EVIDENCE_CLASS,
+    OkxCapabilityCandidate, OkxCapabilityProbeEvidence, OkxCapabilityProbeScope,
+    OkxMutationProbeEvidence, OkxPrivateStreamProbeEvidence, OkxPrivateStreamProbeFrame,
+    OkxProbeHttpResponse, PersistedOkxCapabilityProbe, load_capability_probe,
+    persist_capability_probe, validate_capability_candidate, validate_read_capability_candidate,
 };
 pub use config::{OkxConfig, endpoints};
 pub use credentials::OkxCredentials;
@@ -60,6 +61,13 @@ pub use readback::{
     build_account_config_request, build_algo_orders_request, build_balance_request,
     build_fills_request, build_positions_request, build_regular_orders_request,
     complete_private_readback,
+};
+pub use recovery_collector::{
+    OKX_FRESH_RECOVERY_SCHEMA_VERSION, OkxFreshRecoveryCollector, OkxFreshRecoveryError,
+    OkxFreshRecoveryEvidence, OkxFreshRecoveryFace, OkxFreshRecoveryOutcome, OkxFreshRecoveryScope,
+    OkxFreshRecoverySurface, OkxFreshRecoveryUnknown, OkxFreshRecoveryUnknownIssue,
+    OkxFreshRecoveryUnknownKind, OkxOwnerRoute, OkxRecoveryAuthoritySnapshot,
+    OkxRecoveryConfiguration,
 };
 pub use sign::{SignedHeaders, request_path, sign};
 pub use transport::{

@@ -240,13 +240,15 @@ pub struct BybitPrivateStreamProbeEvidence {
 impl BybitPrivateStreamProbeEvidence {
     pub(crate) fn authenticated(
         binding: GatewayBinding,
-        generation: u64,
+        connection_generation: u64,
+        private_generation: u64,
         authenticated_at_ms: u64,
         observed_at_ms: u64,
         expires_at_ms: u64,
         connection_id: &str,
     ) -> Result<Self, BybitError> {
-        if generation == 0
+        if connection_generation == 0
+            || private_generation == 0
             || authenticated_at_ms == 0
             || observed_at_ms < authenticated_at_ms
             || expires_at_ms <= observed_at_ms
@@ -257,8 +259,8 @@ impl BybitPrivateStreamProbeEvidence {
         BybitGatewayBinding::new(binding.clone())?;
         Ok(Self {
             binding,
-            connection_generation: generation,
-            private_generation: generation,
+            connection_generation,
+            private_generation,
             authenticated_at_ms,
             observed_at_ms,
             expires_at_ms,
@@ -276,6 +278,11 @@ impl BybitPrivateStreamProbeEvidence {
         self.private_generation
     }
 
+    #[must_use]
+    pub const fn connection_generation(&self) -> u64 {
+        self.connection_generation
+    }
+
     fn validate(
         &self,
         binding: &GatewayBinding,
@@ -283,8 +290,8 @@ impl BybitPrivateStreamProbeEvidence {
         now_ms: u64,
     ) -> Result<(), BybitError> {
         if &self.binding != binding
-            || self.connection_generation != generation
             || self.private_generation != generation
+            || self.connection_generation == 0
             || self.authenticated_at_ms == 0
             || self.observed_at_ms < self.authenticated_at_ms
             || self.expires_at_ms <= self.observed_at_ms
@@ -597,7 +604,7 @@ fn collect_probe_payloads(candidate: &BybitCapabilityCandidate) -> Vec<BybitRawP
     payloads
 }
 
-fn replay_capability_candidate(
+pub(crate) fn replay_capability_candidate(
     binding: &BybitGatewayBinding,
     credentials: &BybitCredentials,
     scope: BybitOrderFamilyScope,

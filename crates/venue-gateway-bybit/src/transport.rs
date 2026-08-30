@@ -289,7 +289,9 @@ fn map_websocket(error: WebSocketError) -> BybitTransportError {
 pub struct BybitPrivateWsTransport<S = MaybeTlsStream<TcpStream>> {
     stream: WebSocketStream<S>,
     binding: GatewayBinding,
-    generation: u64,
+    connection_generation: u64,
+    private_generation: u64,
+    recovery_generations_independently_bound: bool,
     endpoint: String,
     connection_id: String,
     authenticated_at_ms: u64,
@@ -312,7 +314,22 @@ where
 
     #[must_use]
     pub const fn generation(&self) -> u64 {
-        self.generation
+        self.private_generation
+    }
+
+    #[must_use]
+    pub const fn connection_generation(&self) -> u64 {
+        self.connection_generation
+    }
+
+    #[must_use]
+    pub const fn private_generation(&self) -> u64 {
+        self.private_generation
+    }
+
+    #[must_use]
+    pub const fn recovery_generations_independently_bound(&self) -> bool {
+        self.recovery_generations_independently_bound
     }
 
     #[must_use]
@@ -325,6 +342,15 @@ where
         &self.connection_id
     }
 
+    #[must_use]
+    pub const fn authenticated_at_ms(&self) -> u64 {
+        self.authenticated_at_ms
+    }
+
+    pub(crate) async fn recovery_liveness_check(&mut self) -> Result<(), BybitTransportError> {
+        self.exchange_application_heartbeat().await
+    }
+
     pub fn capability_probe_evidence(
         &self,
         observed_at_ms: u64,
@@ -332,7 +358,8 @@ where
     ) -> Result<BybitPrivateStreamProbeEvidence, BybitTransportError> {
         BybitPrivateStreamProbeEvidence::authenticated(
             self.binding.clone(),
-            self.generation,
+            self.connection_generation,
+            self.private_generation,
             self.authenticated_at_ms,
             observed_at_ms,
             expires_at_ms,
@@ -360,7 +387,7 @@ where
                         Message::Text(value) => {
                             return make_raw_frame(
                                 &self.binding,
-                                self.generation,
+                                self.private_generation,
                                 Bytes::copy_from_slice(value.as_bytes()),
                                 self.limits.maximum_body_bytes,
                                 unix_ms()?,
@@ -386,7 +413,10 @@ where
             .heartbeat_sequence
             .checked_add(1)
             .ok_or(BybitTransportError::Heartbeat)?;
-        let request_id = format!("venueping{}-{}", self.generation, self.heartbeat_sequence);
+        let request_id = format!(
+            "venueping{}-{}-{}",
+            self.connection_generation, self.private_generation, self.heartbeat_sequence
+        );
         let payload = serde_json::to_string(&PingFrame {
             request_id: &request_id,
             op: "ping",
@@ -421,7 +451,7 @@ where
                         if value.get("topic").is_some() {
                             let frame = make_raw_frame(
                                 &self.binding,
-                                self.generation,
+                                self.private_generation,
                                 payload,
                                 self.limits.maximum_body_bytes,
                                 unix_ms()?,
@@ -538,7 +568,48 @@ pub async fn connect_private_ws(
     now_ms: u64,
     limits: BybitTransportLimits,
 ) -> Result<BybitPrivateWsTransport, BybitTransportError> {
-    if generation == 0 || now_ms == 0 {
+    connect_private_ws_inner(
+        binding,
+        credentials,
+        generation,
+        generation,
+        false,
+        now_ms,
+        limits,
+    )
+    .await
+}
+
+pub async fn connect_private_ws_for_generations(
+    binding: &BybitGatewayBinding,
+    credentials: &BybitCredentials,
+    connection_generation: u64,
+    private_generation: u64,
+    now_ms: u64,
+    limits: BybitTransportLimits,
+) -> Result<BybitPrivateWsTransport, BybitTransportError> {
+    connect_private_ws_inner(
+        binding,
+        credentials,
+        connection_generation,
+        private_generation,
+        true,
+        now_ms,
+        limits,
+    )
+    .await
+}
+
+async fn connect_private_ws_inner(
+    binding: &BybitGatewayBinding,
+    credentials: &BybitCredentials,
+    connection_generation: u64,
+    private_generation: u64,
+    recovery_generations_independently_bound: bool,
+    now_ms: u64,
+    limits: BybitTransportLimits,
+) -> Result<BybitPrivateWsTransport, BybitTransportError> {
+    if connection_generation == 0 || private_generation == 0 || now_ms == 0 {
         return Err(BybitTransportError::Binding);
     }
     let endpoint = binding.config().private_ws();
@@ -548,26 +619,31 @@ pub async fn connect_private_ws(
         endpoint.to_owned(),
         binding,
         credentials,
-        generation,
+        connection_generation,
+        private_generation,
+        recovery_generations_independently_bound,
         now_ms,
         limits,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn authenticate_private_stream<S>(
     mut stream: WebSocketStream<S>,
     endpoint: String,
     binding: &BybitGatewayBinding,
     credentials: &BybitCredentials,
-    generation: u64,
+    connection_generation: u64,
+    private_generation: u64,
+    recovery_generations_independently_bound: bool,
     now_ms: u64,
     limits: BybitTransportLimits,
 ) -> Result<BybitPrivateWsTransport<S>, BybitTransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if generation == 0 || now_ms == 0 || endpoint.is_empty() {
+    if connection_generation == 0 || private_generation == 0 || now_ms == 0 || endpoint.is_empty() {
         return Err(BybitTransportError::Binding);
     }
     let expires_at_ms = now_ms
@@ -575,7 +651,7 @@ where
         .ok_or(BybitTransportError::Clock)?;
     let signature =
         ws_auth_signature(credentials, expires_at_ms).map_err(|_| BybitTransportError::Signing)?;
-    let auth_request_id = format!("venueauth{generation}");
+    let auth_request_id = format!("venueauth{connection_generation}-{private_generation}");
     let auth = AuthFrame {
         request_id: &auth_request_id,
         op: "auth",
@@ -592,7 +668,7 @@ where
     let auth_ack = read_ack(&mut stream, limits).await?;
     validate_ack(&auth_ack, "auth", &auth_request_id, None)?;
 
-    let subscribe_request_id = format!("venuesub{generation}");
+    let subscribe_request_id = format!("venuesub{connection_generation}-{private_generation}");
     let subscribe = SubscribeFrame {
         request_id: &subscribe_request_id,
         op: "subscribe",
@@ -609,7 +685,7 @@ where
     let (subscribe_ack, pre_live_frames) = read_subscribe_ack(
         &mut stream,
         binding.gateway_binding(),
-        generation,
+        private_generation,
         limits,
         &subscribe_request_id,
         auth_ack.connection_id.as_str(),
@@ -623,7 +699,9 @@ where
     Ok(BybitPrivateWsTransport {
         stream,
         binding: binding.gateway_binding().clone(),
-        generation,
+        connection_generation,
+        private_generation,
+        recovery_generations_independently_bound,
         endpoint,
         connection_id: subscribe_ack.connection_id,
         authenticated_at_ms: now_ms,
@@ -884,7 +962,7 @@ impl fmt::Debug for BybitRawPrivateFrame {
     }
 }
 
-fn unix_ms() -> Result<u64, BybitTransportError> {
+pub(crate) fn unix_ms() -> Result<u64, BybitTransportError> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| BybitTransportError::Clock)?
@@ -1418,10 +1496,15 @@ mod tests {
             &facts.binding,
             &facts.credentials,
             7,
+            9,
+            true,
             1_000_000,
             limits,
         )
         .await?;
+        assert_eq!(transport.connection_generation(), 7);
+        assert_eq!(transport.private_generation(), 9);
+        assert!(transport.recovery_generations_independently_bound());
         let cached_received_at_ms = transport
             .pre_live_frames
             .front()
@@ -1429,7 +1512,7 @@ mod tests {
             .ok_or("missing pre-live frame")?;
         let frame = transport.next_raw_frame().await?;
         assert_eq!(frame.binding, *facts.binding.gateway_binding());
-        assert_eq!(frame.generation, 7);
+        assert_eq!(frame.generation, 9);
         assert_eq!(frame.received_at_ms, cached_received_at_ms);
         assert_eq!(
             transport.next_raw_frame().await,
@@ -1492,6 +1575,8 @@ mod tests {
             &facts.binding,
             &facts.credentials,
             7,
+            7,
+            true,
             1_000_000,
             limits,
         )
@@ -1525,6 +1610,8 @@ mod tests {
                 &facts.binding,
                 &facts.credentials,
                 7,
+                7,
+                true,
                 1_000_000,
                 limits
             )
@@ -1570,6 +1657,8 @@ mod tests {
                 &facts.binding,
                 &facts.credentials,
                 7,
+                7,
+                true,
                 1_000_000,
                 limits
             )
@@ -1620,6 +1709,8 @@ mod tests {
                 &facts.binding,
                 &facts.credentials,
                 7,
+                7,
+                true,
                 1_000_000,
                 limits
             )
@@ -1655,6 +1746,8 @@ mod tests {
                 &facts.binding,
                 &facts.credentials,
                 7,
+                7,
+                true,
                 1_000_000,
                 limits
             )
@@ -1691,6 +1784,8 @@ mod tests {
                 &facts.binding,
                 &facts.credentials,
                 7,
+                7,
+                true,
                 1_000_000,
                 limits
             )
@@ -1724,6 +1819,8 @@ mod tests {
             &facts.binding,
             &facts.credentials,
             7,
+            7,
+            true,
             1_000_000,
             limits,
         )

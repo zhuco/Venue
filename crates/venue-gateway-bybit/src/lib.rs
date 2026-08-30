@@ -6,6 +6,7 @@ mod execution;
 mod physical;
 mod private;
 mod public;
+mod recovery;
 mod sign;
 mod transport;
 use venue_gateway_api::CapabilityFlags;
@@ -18,10 +19,11 @@ pub use execution::*;
 pub use physical::*;
 pub use private::*;
 pub use public::*;
+pub use recovery::*;
 pub use sign::{SignedHeaders, sign};
 pub use transport::{
     BybitHttpTransport, BybitPrivateWsTransport, BybitRawPrivateFrame, BybitTransportError,
-    BybitTransportLimits, connect_private_ws,
+    BybitTransportLimits, connect_private_ws, connect_private_ws_for_generations,
 };
 
 /// No account capability is advertised until authenticated readback, private stream, writer,

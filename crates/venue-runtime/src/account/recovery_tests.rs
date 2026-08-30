@@ -105,6 +105,8 @@ fn recovery_snapshot(
 ) -> Result<AccountRecoverySnapshot, Box<dyn Error>> {
     let commitment = RecoveryManifestCommitment::test_for_replayed_state(
         &account,
+        GatewayMode::Test,
+        AccountPositionMode::Hedge,
         &journal_roots,
         last_connection_generation,
         &applied_private_cursor,
@@ -115,6 +117,8 @@ fn recovery_snapshot(
     )?;
     Ok(AccountRecoverySnapshot::verified(
         account,
+        GatewayMode::Test,
+        AccountPositionMode::Hedge,
         journal_roots,
         commitment,
         last_connection_generation,
@@ -246,6 +250,12 @@ fn startup_requires_durable_recovery_and_restores_unknown_fence() -> Result<(), 
             reason: crate::execution::AccountReplanReason::ProvenAbsent,
             ..
         }
+    ));
+    assert_eq!(runtime.health(), AccountHealth::Starting);
+    assert!(runtime.physical_recovery_authority_roots().is_none());
+    assert!(matches!(
+        runtime.pop_strategy_input(&grid.key),
+        Err(AccountRuntimeError::PhysicalRecoveryRequired)
     ));
     Ok(())
 }
@@ -435,6 +445,8 @@ fn manifest_commitment_rejects_truncated_routes_and_unknown_mutations() -> Resul
     )?];
     let commitment = RecoveryManifestCommitment::test_for_replayed_state(
         &account,
+        GatewayMode::Test,
+        AccountPositionMode::Hedge,
         &roots,
         1,
         &cursor,
@@ -447,6 +459,8 @@ fn manifest_commitment_rejects_truncated_routes_and_unknown_mutations() -> Resul
     assert!(matches!(
         AccountRecoverySnapshot::verified(
             account.clone(),
+            GatewayMode::Test,
+            AccountPositionMode::Hedge,
             roots.clone(),
             commitment.clone(),
             1,
@@ -461,6 +475,8 @@ fn manifest_commitment_rejects_truncated_routes_and_unknown_mutations() -> Resul
     assert!(matches!(
         AccountRecoverySnapshot::verified(
             account,
+            GatewayMode::Test,
+            AccountPositionMode::Hedge,
             roots,
             commitment,
             1,
@@ -607,5 +623,52 @@ fn order_route_receipt_must_extend_recovered_tail_once() -> Result<(), Box<dyn E
         runtime.owner_index_boundary_for_test(),
         Some(installed_boundary)
     );
+    Ok(())
+}
+
+#[test]
+fn installed_owner_root_drift_revokes_ready_and_actor_turns() -> Result<(), Box<dyn Error>> {
+    let grid = binding(StrategyKind::HedgedGrid, "grid_sol", "SOL/USDT")?;
+    let mut runtime = AccountRuntime::new(account()?);
+    runtime.register_strategy(grid.clone())?;
+    restore_empty_recovery(&mut runtime)?;
+    runtime.mark_account_ready()?;
+    establish_empty_signed_orders(&mut runtime, 1)?;
+
+    install_persisted_order_route(
+        &mut runtime,
+        RecoveredOrderRoute::verified(
+            NativeOrderFamily::UmOrder,
+            CommandId::new("cmd_root_drift")?,
+            "client_root_drift".to_owned(),
+            Some("venue_root_drift".to_owned()),
+            owner(&grid, OrderPurpose::Entry),
+        ),
+    )?;
+    assert_eq!(runtime.health(), AccountHealth::Starting);
+    assert!(matches!(
+        runtime.pop_strategy_input(&grid.key),
+        Err(AccountRuntimeError::PhysicalRecoveryRequired)
+    ));
+    runtime.mark_account_ready()?;
+    assert_eq!(runtime.connection_generation(), 2);
+    Ok(())
+}
+
+#[test]
+fn execution_profile_drift_revokes_ready_and_actor_turns() -> Result<(), Box<dyn Error>> {
+    let grid = binding(StrategyKind::HedgedGrid, "grid_sol", "SOL/USDT")?;
+    let mut runtime = AccountRuntime::new(account()?);
+    runtime.register_strategy(grid.clone())?;
+    restore_empty_recovery(&mut runtime)?;
+    runtime.mark_account_ready()?;
+    establish_empty_signed_orders(&mut runtime, 1)?;
+
+    runtime.set_physical_profile_version_for_test(2);
+    assert!(matches!(
+        runtime.pop_strategy_input(&grid.key),
+        Err(AccountRuntimeError::PhysicalRecoveryRequired)
+    ));
+    assert_eq!(runtime.health(), AccountHealth::Starting);
     Ok(())
 }

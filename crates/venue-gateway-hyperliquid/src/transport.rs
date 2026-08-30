@@ -12,10 +12,12 @@ use tokio_tungstenite::{
     tungstenite::{Message, protocol::WebSocketConfig},
 };
 
+#[cfg(test)]
+use crate::HyperliquidExchangeRequest;
 use crate::{
-    HyperliquidConfig, HyperliquidError, HyperliquidExchangeRequest, HyperliquidInfoRequest,
-    HyperliquidPrivateStreamBinding, HyperliquidPrivateStreamDecoder,
-    HyperliquidPrivateSubscriptionKind, HyperliquidReadBinding, build_private_subscription,
+    HyperliquidConfig, HyperliquidError, HyperliquidInfoRequest, HyperliquidPrivateStreamBinding,
+    HyperliquidPrivateStreamDecoder, HyperliquidPrivateSubscriptionKind, HyperliquidReadBinding,
+    build_private_subscription,
 };
 
 const MAX_TIMEOUT: Duration = Duration::from_secs(60);
@@ -114,7 +116,8 @@ impl HyperliquidHttpTransport {
     /// Dispatches exactly one already-signed request. The client policy is explicitly `never`, so
     /// timeout, disconnect, and 5xx results return to the WAL owner as UNKNOWN/rejected evidence
     /// instead of replaying a nonce behind its back.
-    pub async fn post_exchange(
+    #[cfg(test)]
+    pub(crate) async fn post_exchange(
         &self,
         expected_binding: &HyperliquidReadBinding,
         request: &HyperliquidExchangeRequest,
@@ -683,10 +686,10 @@ pub enum HyperliquidTransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action::build_alo_place_request;
     use crate::{
         HyperliquidAloOrder, HyperliquidCredentials, HyperliquidGatewayBinding,
-        HyperliquidNonceStore, HyperliquidPerpMeta, NonceCheckpoint, build_alo_place_request,
-        reserve_next_nonce,
+        HyperliquidNonceStore, HyperliquidPerpMeta, NonceCheckpoint, reserve_next_nonce,
     };
     use rust_decimal::Decimal;
     use std::io::{Error as IoError, ErrorKind};

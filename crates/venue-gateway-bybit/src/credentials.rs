@@ -1,4 +1,6 @@
+use hmac::{Hmac, Mac};
 use secrecy::{ExposeSecret, SecretString};
+use sha2::Sha256;
 
 use crate::BybitError;
 
@@ -29,5 +31,19 @@ impl BybitCredentials {
             api_key,
             api_secret,
         })
+    }
+
+    pub(crate) fn recovery_namespace_hmac(
+        &self,
+        scope_bytes: &[u8],
+    ) -> Result<[u8; 32], BybitError> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.api_secret.expose_secret().as_bytes())
+            .map_err(|_| BybitError::Credentials)?;
+        mac.update(b"venue-bybit-recovery-credential-namespace-v1");
+        mac.update(b"BYBIT_API_KEY\0BYBIT_API_SECRET");
+        mac.update(&(self.api_key.expose_secret().len() as u64).to_be_bytes());
+        mac.update(self.api_key.expose_secret().as_bytes());
+        mac.update(scope_bytes);
+        Ok(mac.finalize().into_bytes().into())
     }
 }

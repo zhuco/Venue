@@ -10,7 +10,7 @@ use crate::{
     },
     runtime::{
         account::{
-            AccountFault, AccountHealth, AccountKey, AccountReconcilerError,
+            AccountFault, AccountHealth, AccountKey, AccountPositionMode, AccountReconcilerError,
             AccountReconciliationReport, AccountRecoverySnapshot, DesiredOrderSets, FlattenPlan,
             InstanceLifecycle, MarketHub, MarketHubError, PersistedOrderRouteAppendReceipt,
             PhysicalRecoveryAuthorityRoots, PhysicalRecoveryReadbackManifest, PrivateRouteReport,
@@ -29,8 +29,9 @@ use crate::{
 use crate::runtime::account::{
     PhysicalReadbackReceipt, PhysicalReadbackSurface, PhysicalRecoveryScope,
 };
+use venue_gateway_api::GatewayMode;
 #[cfg(test)]
-use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
+use venue_gateway_api::{GatewayBinding, VenueId};
 
 #[derive(Debug)]
 pub struct AccountRuntime {
@@ -63,14 +64,18 @@ pub struct AccountRuntime {
     owner_index_tail_sequence: u64,
     owner_index_record_count: u64,
     durable_recovery_complete: bool,
+    recovered_gateway_mode: Option<GatewayMode>,
+    recovered_position_mode: Option<AccountPositionMode>,
     physical_authority_roots: Option<PhysicalRecoveryAuthorityRoots>,
     physical_private_generation_floor: u64,
     pending_physical_recovery: Option<PhysicalRecoveryReadbackManifest>,
     admitted_physical_recovery: Option<PhysicalRecoveryReadbackManifest>,
+    physical_recovery_drifted: bool,
     #[cfg(test)]
     physical_recovery_test_fixture_enabled: bool,
+    #[cfg(test)]
+    physical_profile_version_override: Option<u64>,
 }
-
 #[derive(Clone, Debug)]
 struct ActiveStrategyTurn {
     token: StrategyTurnToken,
@@ -145,12 +150,17 @@ impl AccountRuntime {
             owner_index_tail_sequence: 0,
             owner_index_record_count: 0,
             durable_recovery_complete: false,
+            recovered_gateway_mode: None,
+            recovered_position_mode: None,
             physical_authority_roots: None,
             physical_private_generation_floor: 0,
             pending_physical_recovery: None,
             admitted_physical_recovery: None,
+            physical_recovery_drifted: false,
             #[cfg(test)]
             physical_recovery_test_fixture_enabled: false,
+            #[cfg(test)]
+            physical_profile_version_override: None,
             capability_evidence,
             account,
             health: AccountHealth::Starting,
@@ -179,6 +189,25 @@ impl AccountRuntime {
             .supports(family)
             .then_some(())
             .ok_or(AccountRuntimeError::UnsupportedOrderFamily)
+    }
+
+    fn physical_family_support(&self) -> BTreeMap<crate::domain::NativeOrderFamily, bool> {
+        [
+            crate::domain::NativeOrderFamily::UmOrder,
+            crate::domain::NativeOrderFamily::UmConditional,
+            crate::domain::NativeOrderFamily::UmAlgo,
+        ]
+        .into_iter()
+        .map(|family| (family, self.capability_evidence.supports(family)))
+        .collect()
+    }
+
+    fn physical_profile_version(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(version) = self.physical_profile_version_override {
+            return version;
+        }
+        1_u64
     }
 
     #[must_use]
@@ -236,30 +265,31 @@ impl AccountRuntime {
             .checked_add(1)
             .ok_or(AccountRuntimeError::ConnectionGenerationExhausted)?;
         let scope = manifest.scope();
-        let binding = scope.binding();
         let roots_match = self
             .physical_authority_roots
             .as_ref()
             .is_some_and(|expected| expected == scope.authority_roots());
-        let account_matches = binding.venue.as_str() == self.account.exchange.as_str()
-            && binding.trading_account_id == self.account.account;
-        #[cfg(test)]
-        let account_matches = account_matches || self.physical_recovery_test_fixture_enabled;
-        let configuration_matches = match self.registry.binding_by_symbol(&binding.symbol) {
-            Some(strategy) => {
-                strategy.config_digest == scope.config_digest()
-                    && self
-                        .registry
-                        .registration(&strategy.key)
-                        .is_some_and(|registration| {
-                            registration.config_epoch == scope.config_epoch()
-                        })
-            }
-            None => self.registry.registrations().next().is_none(),
-        };
+        let authority_matches = self
+            .recovered_gateway_mode
+            .zip(self.recovered_position_mode)
+            .is_some_and(|(mode, position_mode)| {
+                scope.matches_account_authority(
+                    &self.account,
+                    mode,
+                    self.registry.registrations().map(|registration| {
+                        (
+                            registration.binding.key.symbol.clone(),
+                            registration.binding.config_digest.clone(),
+                            registration.config_epoch,
+                        )
+                    }),
+                    position_mode,
+                    &self.physical_family_support(),
+                    self.physical_profile_version(),
+                )
+            });
         if !roots_match
-            || !account_matches
-            || !configuration_matches
+            || !authority_matches
             || scope.connection_generation() != expected_connection_generation
             || scope.recovered_private_generation() != self.physical_private_generation_floor
             || manifest.private_generation() <= self.physical_private_generation_floor
@@ -300,10 +330,68 @@ impl AccountRuntime {
         current_admitted || recovery_staged
     }
 
-    #[cfg(test)]
+    fn admitted_physical_authority_current(&self) -> bool {
+        self.admitted_physical_recovery
+            .as_ref()
+            .is_some_and(|manifest| {
+                let scope = manifest.scope();
+                scope.connection_generation() == self.connection_generation
+                    && manifest.private_generation() == self.physical_private_generation_floor
+                    && self.physical_authority_roots.as_ref() == Some(scope.authority_roots())
+                    && self
+                        .recovered_gateway_mode
+                        .zip(self.recovered_position_mode)
+                        .is_some_and(|(mode, position_mode)| {
+                            scope.matches_account_authority(
+                                &self.account,
+                                mode,
+                                self.registry.registrations().map(|registration| {
+                                    (
+                                        registration.binding.key.symbol.clone(),
+                                        registration.binding.config_digest.clone(),
+                                        registration.config_epoch,
+                                    )
+                                }),
+                                position_mode,
+                                &self.physical_family_support(),
+                                self.physical_profile_version(),
+                            )
+                        })
+            })
+    }
+
+    fn revoke_physical_authority(&mut self) {
+        self.pending_physical_recovery = None;
+        self.admitted_physical_recovery = None;
+        self.active_turns.clear();
+        self.last_applied_turns.clear();
+        self.invalidate_dispatch_authority_fail_closed();
+        self.health = AccountHealth::Starting;
+        self.fault = None;
+        self.physical_recovery_drifted = true;
+    }
+
+    fn reject_drifted_physical_authority(&mut self) -> Result<(), AccountRuntimeError> {
+        if self.admitted_physical_recovery.is_some() && !self.admitted_physical_authority_current()
+        {
+            self.revoke_physical_authority();
+            return Err(AccountRuntimeError::PhysicalRecoveryRequired);
+        }
+        Ok(())
+    }
+
     /// Explicit compatibility hook for account-kernel tests that do not own a physical collector.
+    #[cfg(test)]
     pub(crate) fn enable_physical_recovery_test_fixture(&mut self) {
         self.physical_recovery_test_fixture_enabled = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_physical_profile_version_for_test(&mut self, version: u64) {
+        self.physical_profile_version_override = Some(version);
+        if self.admitted_physical_recovery.is_some() {
+            self.revoke_physical_authority();
+        }
     }
 
     #[cfg(test)]
@@ -322,22 +410,16 @@ impl AccountRuntime {
             .physical_private_generation_floor
             .checked_add(1)
             .ok_or(AccountRuntimeError::PhysicalRecoveryScopeMismatch)?;
-        let (symbol, config_digest, config_epoch) =
-            if let Some(registration) = self.registry.registrations().next() {
-                (
-                    registration.binding.key.symbol.clone(),
-                    registration.binding.config_digest.clone(),
-                    registration.config_epoch,
-                )
-            } else {
-                (
-                    "BTC/USDT"
-                        .parse()
-                        .map_err(|_| AccountRuntimeError::PhysicalRecoveryScopeMismatch)?,
-                    "empty_account".to_owned(),
-                    1,
-                )
-            };
+        let symbol = self
+            .registry
+            .registrations()
+            .map(|registration| registration.binding.key.symbol.clone())
+            .min()
+            .unwrap_or(
+                "BTC/USDT"
+                    .parse()
+                    .map_err(|_| AccountRuntimeError::PhysicalRecoveryScopeMismatch)?,
+            );
         let venue = match self.account.exchange {
             crate::domain::ExchangeId::Binance => VenueId::Binance,
             crate::domain::ExchangeId::Gate => VenueId::Gate,
@@ -350,16 +432,27 @@ impl AccountRuntime {
             .physical_authority_roots
             .clone()
             .ok_or(AccountRuntimeError::PhysicalRecoveryRequired)?;
-        let scope = PhysicalRecoveryScope::verified(
+        let scope = PhysicalRecoveryScope::verified_account(
             GatewayBinding::new(
                 venue,
-                GatewayMode::Test,
-                "00000000-0000-4000-8000-000000000001",
+                self.recovered_gateway_mode
+                    .ok_or(AccountRuntimeError::PhysicalRecoveryRequired)?,
+                self.account.account.clone(),
                 symbol,
             )
             .map_err(|_| AccountRuntimeError::PhysicalRecoveryScopeMismatch)?,
-            config_digest,
-            config_epoch,
+            self.account.clone(),
+            self.registry.registrations().map(|registration| {
+                (
+                    registration.binding.key.symbol.clone(),
+                    registration.binding.config_digest.clone(),
+                    registration.config_epoch,
+                )
+            }),
+            self.recovered_position_mode
+                .ok_or(AccountRuntimeError::PhysicalRecoveryRequired)?,
+            self.physical_family_support(),
+            self.physical_profile_version(),
             connection_generation,
             self.physical_private_generation_floor,
             roots,
@@ -378,14 +471,36 @@ impl AccountRuntime {
             .enumerate()
             .map(|(index, surface)| {
                 let seed = u8::try_from(index).unwrap_or(u8::MAX).saturating_add(1);
-                PhysicalReadbackReceipt::verified_complete(
-                    &scope,
-                    surface,
-                    connection_generation,
-                    private_generation,
-                    [seed; 32],
-                    0,
-                )
+                let unsupported = match surface {
+                    PhysicalReadbackSurface::UmOrder => !self
+                        .capability_evidence
+                        .supports(crate::domain::NativeOrderFamily::UmOrder),
+                    PhysicalReadbackSurface::UmConditional => !self
+                        .capability_evidence
+                        .supports(crate::domain::NativeOrderFamily::UmConditional),
+                    PhysicalReadbackSurface::UmAlgo => !self
+                        .capability_evidence
+                        .supports(crate::domain::NativeOrderFamily::UmAlgo),
+                    _ => false,
+                };
+                if unsupported {
+                    PhysicalReadbackReceipt::verified_unsupported_order_family_account(
+                        &scope,
+                        surface,
+                        connection_generation,
+                        private_generation,
+                        [seed; 32],
+                    )
+                } else {
+                    PhysicalReadbackReceipt::verified_complete_account(
+                        &scope,
+                        surface,
+                        connection_generation,
+                        private_generation,
+                        [seed; 32],
+                        0,
+                    )
+                }
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| AccountRuntimeError::PhysicalRecoveryScopeMismatch)?;
@@ -481,6 +596,9 @@ impl AccountRuntime {
         self.actors
             .insert(binding.key.clone(), StrategyActorHost::new(binding));
         self.strategy_state_revision = next_state_revision;
+        if self.admitted_physical_recovery.is_some() {
+            self.revoke_physical_authority();
+        }
         Ok(())
     }
 
@@ -495,6 +613,8 @@ impl AccountRuntime {
         }
         let (
             account,
+            gateway_mode,
+            position_mode,
             journal_roots,
             _manifest_commitment,
             last_connection_generation,
@@ -676,9 +796,12 @@ impl AccountRuntime {
         self.owner_index_tail_sequence = journal_roots.owner_index_tail_sequence();
         self.owner_index_record_count = journal_roots.owner_index_record_count();
         self.physical_authority_roots = Some(physical_authority_roots);
+        self.recovered_gateway_mode = Some(gateway_mode);
+        self.recovered_position_mode = Some(position_mode);
         self.physical_private_generation_floor = recovered_private_generation;
         self.pending_physical_recovery = None;
         self.admitted_physical_recovery = None;
+        self.physical_recovery_drifted = false;
         self.strategy_state_revision = next_state_revision;
         self.durable_recovery_complete = true;
         self.advance_applied_private_cursor();
@@ -752,6 +875,7 @@ impl AccountRuntime {
         self.pending_physical_recovery = None;
         self.physical_private_generation_floor = manifest.private_generation();
         self.admitted_physical_recovery = Some(manifest);
+        self.physical_recovery_drifted = false;
         Ok(recovering)
     }
 
@@ -845,18 +969,18 @@ impl AccountRuntime {
             .physical_authority_roots
             .as_ref()
             .ok_or(AccountRuntimeError::PhysicalRecoveryRequired)?;
-        let next_physical_roots = PhysicalRecoveryAuthorityRoots::verified(
-            next_root,
-            *current_roots.wal(),
-            *current_roots.unknown(),
-        )
-        .map_err(|_| AccountRuntimeError::PhysicalRecoveryScopeMismatch)?;
+        let next_physical_roots = current_roots
+            .refreshed_owner(next_root)
+            .map_err(|_| AccountRuntimeError::PhysicalRecoveryScopeMismatch)?;
         self.private_router = next_router;
         self.private_route_revision = next_revision;
         self.owner_index_root = Some(next_root);
         self.owner_index_tail_sequence = append_sequence;
         self.owner_index_record_count = next_record_count;
         self.physical_authority_roots = Some(next_physical_roots);
+        if self.admitted_physical_recovery.is_some() {
+            self.revoke_physical_authority();
+        }
         Ok(())
     }
 
@@ -1285,6 +1409,9 @@ impl AccountRuntime {
         self.strategy_state_revision = next_state_revision;
         let _discarded_old_configuration = self.execution_lane.discard_queued_instance(key);
         self.install_dispatch_revision(next_dispatch_revision);
+        if self.admitted_physical_recovery.is_some() {
+            self.revoke_physical_authority();
+        }
         Ok(())
     }
 
@@ -1292,11 +1419,15 @@ impl AccountRuntime {
         &mut self,
         key: &StrategyInstanceKey,
     ) -> Result<Option<StrategyTurn>, AccountRuntimeError> {
+        self.reject_drifted_physical_authority()?;
         if !self.physical_recovery_integration_available() {
             return Err(AccountRuntimeError::PhysicalRecoveryIntegrationUnavailable);
         }
+        if self.physical_recovery_drifted {
+            return Err(AccountRuntimeError::PhysicalRecoveryRequired);
+        }
         #[cfg(test)]
-        if !self.physical_turn_authorized() {
+        if !self.physical_recovery_drifted && !self.physical_turn_authorized() {
             self.stage_physical_recovery_test_fixture()?;
         }
         if !self.physical_turn_authorized() {
@@ -1350,6 +1481,7 @@ impl AccountRuntime {
         &mut self,
         receipt: AppliedStrategyTurnReceipt,
     ) -> Result<(), AccountRuntimeError> {
+        self.reject_drifted_physical_authority()?;
         let token = receipt.token();
         let active = self
             .active_turns
@@ -1560,7 +1692,7 @@ impl AccountRuntime {
         let registry = &self.registry;
         let applied_turns = &self.last_applied_turns;
         let active_turns = &self.active_turns;
-        Ok(self.execution_lane.authorize_dispatch(
+        let decision = self.execution_lane.authorize_dispatch(
             wal,
             writer,
             self.dispatch_revision,
@@ -1596,14 +1728,27 @@ impl AccountRuntime {
                             && registration.lifecycle.accepts_new_risk()
                     })
             },
-        )?)
+        );
+        self.physical_authority_roots = None;
+        self.revoke_physical_authority();
+        let decision = decision?;
+        match decision {
+            AccountDispatchDecision::Fenced(fence) => Ok(AccountDispatchDecision::Fenced(fence)),
+            AccountDispatchDecision::Permit(_) => {
+                Err(AccountRuntimeError::PhysicalRecoveryRequired)
+            }
+        }
     }
 
     pub(crate) fn record_execution_outcome(
         &mut self,
         receipt: PersistedMutationOutcomeReceipt,
     ) -> Result<AccountLaneFollowUp, AccountRuntimeError> {
-        Ok(self.execution_lane.record_outcome(receipt)?)
+        let follow_up = self.execution_lane.record_outcome(receipt);
+        self.physical_authority_roots = None;
+        self.revoke_physical_authority();
+        let follow_up = follow_up?;
+        Ok(follow_up)
     }
 
     pub(crate) fn abort_execution_before_wal(
@@ -1623,7 +1768,11 @@ impl AccountRuntime {
         {
             return Err(AccountRuntimeError::StaleExecutionAuthority);
         }
-        Ok(self.execution_lane.resolve_unknown(proof)?)
+        let follow_up = self.execution_lane.resolve_unknown(proof);
+        self.physical_authority_roots = None;
+        self.revoke_physical_authority();
+        let follow_up = follow_up?;
+        Ok(follow_up)
     }
 
     pub fn request_stop(
@@ -1798,6 +1947,7 @@ impl AccountRuntime {
         self.last_instance_flat.remove(key);
         self.stop_fences.remove(key);
         self.shutdown_modes.remove(key);
+        self.revoke_physical_authority();
         Ok(binding)
     }
 }
