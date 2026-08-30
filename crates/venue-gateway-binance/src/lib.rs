@@ -8,6 +8,10 @@ pub mod private;
 mod private_ws;
 mod public;
 mod readback;
+// Fixture-only: production stays unavailable until runtime-issued config-universe, durable-root,
+// and transport-session authority can construct this collector without caller self-attestation.
+#[cfg(test)]
+mod recovery;
 mod sign;
 mod transport;
 
@@ -29,6 +33,8 @@ pub use public::{
     parse_public_trade,
 };
 pub use readback::*;
+#[cfg(test)]
+pub use recovery::*;
 pub use sign::{BinanceHttpMethod, BinanceRestSignInput, SignedBinanceRestRequest, sign_rest};
 pub use transport::{
     BinanceHttpResponse, BinanceHttpTransport, BinancePhysicalMutationOutcome,
