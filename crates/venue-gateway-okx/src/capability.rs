@@ -10,21 +10,27 @@ use std::{
     path::Path,
 };
 
+#[cfg(test)]
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use venue_domain::domain::{
-    CancelCommand, FieldState, MarketReduceCommand, NativeOrderFamily, OrderCommand, OrderState,
-    PositionSide,
+    CancelCommand, MarketReduceCommand, NativeOrderFamily, OrderCommand, PositionSide,
 };
+#[cfg(test)]
+use venue_domain::domain::{FieldState, OrderState};
 use venue_gateway_api::{CapabilityFlags, GatewayBinding, VenueId};
 
 use crate::{
-    OkxConfig, OkxError, OkxHttpResponse, OkxInstrument, OkxPlaceIntent, OkxPositionMode,
-    OkxPrivateReadScope, OkxPrivateReadbackCandidate, OkxRawPrivatePage, OkxReceivedPrivateFrame,
-    OkxTradeMode, build_cancel_order_readback_request, build_cancel_request,
-    build_order_readback_request, build_place_request, complete_private_readback, parse_cancel_ack,
-    parse_order_detail, parse_place_ack,
+    OkxConfig, OkxError, OkxHttpResponse, OkxInstrument, OkxPositionMode, OkxPrivateReadScope,
+    OkxPrivateReadbackCandidate, OkxRawPrivatePage, OkxReceivedPrivateFrame, OkxTradeMode,
+    complete_private_readback,
+};
+#[cfg(test)]
+use crate::{
+    OkxPlaceIntent, build_cancel_order_readback_request, build_cancel_request,
+    build_order_readback_request, build_place_request, parse_cancel_ack, parse_order_detail,
+    parse_place_ack,
 };
 
 pub const OKX_CAPABILITY_PROBE_SCHEMA_VERSION: u16 = 1;
@@ -82,6 +88,7 @@ impl OkxProbeHttpResponse {
         Ok(())
     }
 
+    #[cfg(test)]
     fn response(&self) -> Result<OkxHttpResponse, OkxError> {
         self.validate()?;
         Ok(OkxHttpResponse {
@@ -258,7 +265,21 @@ fn write_immutable(path: &Path, encoded: &[u8]) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Legacy schema-1 probes can establish read-side consistency only. Mutation fields remain in the
+/// frozen wire schema, but this production validator never returns mutation capability flags.
 pub fn validate_capability_candidate(
+    config: &OkxConfig,
+    instrument: &OkxInstrument,
+    persisted: &PersistedOkxCapabilityProbe,
+    validated_at_ms: u64,
+) -> Result<OkxCapabilityCandidate, OkxError> {
+    validate_read_capability_candidate(config, instrument, persisted, validated_at_ms)
+}
+
+/// Test-only replay of the frozen schema-1 mutation fixture. This cannot be enabled by a Cargo
+/// feature and is not present in normal library builds.
+#[cfg(test)]
+pub(crate) fn validate_mutation_capability_fixture(
     config: &OkxConfig,
     instrument: &OkxInstrument,
     persisted: &PersistedOkxCapabilityProbe,
@@ -298,7 +319,7 @@ pub fn validate_capability_candidate(
 
 /// Validates the durable account/order/fill/private-stream portion for either OKX Net or
 /// Long/Short mode. This deliberately omits TRADE and all mutation flags: callers cannot turn a
-/// read-only Net candidate into authority for canonical LONG/SHORT commands.
+/// read-only candidate into authority for canonical LONG/SHORT commands.
 pub fn validate_read_capability_candidate(
     config: &OkxConfig,
     instrument: &OkxInstrument,
@@ -499,6 +520,7 @@ fn validate_private_stream(
     Ok(observed)
 }
 
+#[cfg(test)]
 fn validate_mutations(
     config: &OkxConfig,
     instrument: &OkxInstrument,
@@ -958,17 +980,29 @@ mod tests {
                 .candidate_flags
                 .contains(CapabilityFlags::HEDGE_POSITION)
         );
+        assert!(!candidate.candidate_flags.contains(CapabilityFlags::TRADE));
         assert!(
-            candidate
+            !candidate
                 .candidate_flags
                 .contains(CapabilityFlags::PLACE_LIMIT)
         );
         assert!(
-            candidate
+            !candidate
                 .candidate_flags
                 .contains(CapabilityFlags::PLACE_MARKET)
         );
-        assert!(candidate.candidate_flags.contains(CapabilityFlags::CANCEL));
+        assert!(!candidate.candidate_flags.contains(CapabilityFlags::CANCEL));
+        let fixture_candidate = validate_mutation_capability_fixture(
+            &config,
+            &instrument,
+            &persisted,
+            BASE_MS + 1_000,
+        )?;
+        assert!(
+            fixture_candidate
+                .candidate_flags
+                .contains(CapabilityFlags::PLACE_LIMIT)
+        );
         assert!(
             !candidate
                 .candidate_flags
@@ -1075,10 +1109,9 @@ mod tests {
                 .candidate_flags
                 .contains(CapabilityFlags::HEDGE_POSITION)
         );
-        assert_eq!(
-            validate_capability_candidate(&config, &instrument, &persisted, BASE_MS + 1_000),
-            Err(OkxError::Capability)
-        );
+        let public_candidate =
+            validate_capability_candidate(&config, &instrument, &persisted, BASE_MS + 1_000)?;
+        assert_eq!(public_candidate.candidate_flags, candidate.candidate_flags);
         fs::remove_dir_all(directory)?;
         Ok(())
     }
@@ -1295,7 +1328,7 @@ mod tests {
         evidence.mutations.reduce_detail.payload[0] ^= 1;
         let (persisted, directory) = persist_fixture("probe-payload.json", &evidence)?;
         assert!(
-            validate_capability_candidate(&config, &instrument, &persisted, BASE_MS + 1_000)
+            validate_mutation_capability_fixture(&config, &instrument, &persisted, BASE_MS + 1_000)
                 .is_err()
         );
         fs::remove_dir_all(directory)?;

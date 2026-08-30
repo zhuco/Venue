@@ -51,6 +51,7 @@ impl OkxInstrument {
             .ok_or(OkxError::Payload)
     }
 
+    #[cfg(test)]
     pub(crate) fn base_to_contracts(&self, quantity: Decimal) -> Result<Decimal, OkxError> {
         if quantity < self.minimum_base_quantity
             || quantity <= Decimal::ZERO

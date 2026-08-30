@@ -17,7 +17,7 @@ use crate::{
 };
 #[cfg(test)]
 use crate::{
-    OkxPlaceIntent, build_cancel_request, build_place_request, validate_capability_candidate,
+    OkxPlaceIntent, build_cancel_request, build_place_request, validate_mutation_capability_fixture,
 };
 
 /// Secret-free, non-authoritative bridge from durable probe evidence to the physical adapter.
@@ -50,7 +50,7 @@ impl OkxPhysicalCandidate {
         persisted: &PersistedOkxCapabilityProbe,
         now_ms: u64,
     ) -> Result<Self, OkxPhysicalError> {
-        let probe = validate_capability_candidate(&config, &instrument, persisted, now_ms)
+        let probe = validate_mutation_capability_fixture(&config, &instrument, persisted, now_ms)
             .map_err(|_| OkxPhysicalError::Capability)?;
         if probe.readback.profile.position_mode() != crate::OkxPositionMode::LongShort
             || probe.readback.scope().trade_mode() != probe.scope.trade_mode

@@ -17,14 +17,18 @@ use tokio_tungstenite::{
 };
 use venue_gateway_api::GatewayBinding;
 
+#[cfg(test)]
 use crate::{
-    OkxAcceptedCancel, OkxAcceptedOrder, OkxAccountProfile, OkxActivePrivateSubscription,
-    OkxCancelRequest, OkxConfig, OkxCredentials, OkxInstrument, OkxPlaceRequest,
-    OkxPrivateReadRequest, OkxPrivateRequest, OkxPrivateSubscription, OkxPrivateWsScope,
-    OkxTradeMode, OkxUnknownCancelReadbackRequest, OkxUnknownOrderReadbackRequest, OkxWsLoginFrame,
-    SignedHeaders, activate_private_subscription, build_private_subscribe,
+    OkxAcceptedCancel, OkxAcceptedOrder, OkxCancelRequest, OkxPlaceRequest, OkxPrivateRequest,
+    OkxUnknownCancelReadbackRequest, OkxUnknownOrderReadbackRequest,
     build_unknown_cancel_readback_request, build_unknown_order_readback_request_after,
-    build_ws_login, parse_cancel_ack, parse_place_ack, parse_ws_login_ack,
+    parse_cancel_ack, parse_place_ack,
+};
+use crate::{
+    OkxAccountProfile, OkxActivePrivateSubscription, OkxConfig, OkxCredentials, OkxInstrument,
+    OkxPrivateReadRequest, OkxPrivateSubscription, OkxPrivateWsScope, OkxTradeMode,
+    OkxWsLoginFrame, SignedHeaders, activate_private_subscription, build_private_subscribe,
+    build_ws_login, parse_ws_login_ack,
 };
 
 const HEADER_NAMES: [&str; 5] = [
@@ -82,6 +86,7 @@ pub struct OkxHttpTransport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub enum OkxPlaceOnceOutcome {
     Acknowledged(Box<OkxAcceptedOrder>),
     Unknown {
@@ -91,6 +96,7 @@ pub enum OkxPlaceOnceOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub enum OkxCancelOnceOutcome {
     Acknowledged(Box<OkxAcceptedCancel>),
     Unknown {
@@ -156,7 +162,8 @@ impl OkxHttpTransport {
         })
     }
 
-    pub async fn execute<R: OkxPrivateRequest + ?Sized>(
+    #[cfg(test)]
+    pub(crate) async fn execute<R: OkxPrivateRequest + ?Sized>(
         &self,
         credentials: &OkxCredentials,
         request: &R,
@@ -198,7 +205,7 @@ impl OkxHttpTransport {
         self.execute_bound(
             request.scope().gateway_binding(),
             request.scope().instrument_generation(),
-            request.method(),
+            "GET",
             request.request_path(),
             &[],
             &signed,
@@ -208,7 +215,8 @@ impl OkxHttpTransport {
 
     /// Consumes one place request and performs at most one mutation call. Any untrustworthy or
     /// missing ACK returns only an exact GET readback handle; the submitted request is not returned.
-    pub async fn place_once(
+    #[cfg(test)]
+    pub(crate) async fn place_once(
         &self,
         credentials: &OkxCredentials,
         instrument: &OkxInstrument,
@@ -244,7 +252,8 @@ impl OkxHttpTransport {
     }
 
     /// The reduce path accepts only the canonical exposure-reduction request and consumes it once.
-    pub async fn reduce_once(
+    #[cfg(test)]
+    pub(crate) async fn reduce_once(
         &self,
         credentials: &OkxCredentials,
         instrument: &OkxInstrument,
@@ -260,7 +269,8 @@ impl OkxHttpTransport {
     }
 
     /// Consumes one cancel request. UNKNOWN never yields a second cancel surface, only order detail.
-    pub async fn cancel_once(
+    #[cfg(test)]
+    pub(crate) async fn cancel_once(
         &self,
         credentials: &OkxCredentials,
         instrument: &OkxInstrument,
@@ -315,6 +325,7 @@ impl OkxHttpTransport {
         }
         let method = match method {
             "GET" => Method::GET,
+            #[cfg(test)]
             "POST" => Method::POST,
             _ => return Err(OkxTransportError::Configuration),
         };

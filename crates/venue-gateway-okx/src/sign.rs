@@ -5,14 +5,14 @@ use sha2::Sha256;
 
 use crate::{OkxConfig, OkxCredentials, OkxError};
 
-pub struct SignedHeaders {
+pub(crate) struct SignedHeaders {
     entries: [(String, SecretString); 5],
     simulated_trading: bool,
 }
 
 impl SignedHeaders {
     #[must_use]
-    pub fn get(&self, name: &str) -> Option<&str> {
+    pub(crate) fn get(&self, name: &str) -> Option<&str> {
         if name.eq_ignore_ascii_case("x-simulated-trading") {
             return self.simulated_trading.then_some("1");
         }
@@ -23,7 +23,7 @@ impl SignedHeaders {
     }
 }
 
-pub fn sign(
+pub(crate) fn sign(
     credentials: &OkxCredentials,
     config: &OkxConfig,
     timestamp: &str,
@@ -69,13 +69,4 @@ pub fn sign(
         ],
         simulated_trading: config.simulated_trading(),
     })
-}
-
-#[must_use]
-pub fn request_path(path: &str, query: &str) -> String {
-    if query.is_empty() {
-        path.to_owned()
-    } else {
-        format!("{path}?{query}")
-    }
 }

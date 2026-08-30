@@ -10,27 +10,11 @@ use crate::private::{OkxAccountLevel, OkxAccountProfile, OkxTimedOrder};
 use crate::public::{decimal, decode_success, positive_decimal, positive_u64};
 use crate::{
     OkxConfig, OkxCredentials, OkxError, OkxHttpResponse, OkxInstrument, OkxPositionMode,
-    SignedHeaders, endpoints, sign,
+    OkxTradeMode, SignedHeaders, endpoints, sign,
 };
 
 const POST: &str = "POST";
 const GET: &str = "GET";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OkxTradeMode {
-    Cross,
-    Isolated,
-}
-
-impl OkxTradeMode {
-    pub(crate) const fn wire_value(self) -> &'static str {
-        match self {
-            Self::Cross => "cross",
-            Self::Isolated => "isolated",
-        }
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OkxExecutionScope {
@@ -181,7 +165,7 @@ struct PlaceFields<'a> {
     order_type: &'static str,
 }
 
-pub trait OkxPrivateRequest {
+pub(crate) trait OkxPrivateRequest {
     fn scope(&self) -> &OkxExecutionScope;
     fn method(&self) -> &'static str;
     fn request_path(&self) -> &str;

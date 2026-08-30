@@ -242,7 +242,7 @@ impl OkxPrivateReadRequest {
         GET
     }
 
-    pub fn signed_headers(
+    pub(crate) fn signed_headers(
         &self,
         credentials: &OkxCredentials,
         config: &OkxConfig,

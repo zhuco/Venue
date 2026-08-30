@@ -2,8 +2,12 @@ mod binding;
 mod capability;
 mod config;
 mod credentials;
+#[cfg(test)]
+#[allow(dead_code)]
 mod execution;
 mod models;
+#[cfg(test)]
+#[allow(dead_code)]
 mod physical;
 mod private;
 mod private_ws;
@@ -11,12 +15,15 @@ mod public;
 mod readback;
 mod recovery_collector;
 mod sign;
+mod trade_mode;
 mod transport;
 
 use venue_domain::domain::{FieldState, Fill};
 use venue_gateway_api::CapabilityFlags;
 
 pub use binding::{OkxGatewayBinding, OkxGatewayBindingError};
+#[cfg(test)]
+pub(crate) use capability::validate_mutation_capability_fixture;
 pub use capability::{
     OKX_CAPABILITY_PROBE_SCHEMA_VERSION, OKX_LEGACY_CAPABILITY_PROBE_EVIDENCE_CLASS,
     OkxCapabilityCandidate, OkxCapabilityProbeEvidence, OkxCapabilityProbeScope,
@@ -26,19 +33,19 @@ pub use capability::{
 };
 pub use config::{OkxConfig, endpoints};
 pub use credentials::OkxCredentials;
-pub use execution::{
+#[cfg(test)]
+pub(crate) use execution::{
     OkxAcceptedCancel, OkxAcceptedOrder, OkxCancelRequest, OkxExecutionScope, OkxOrderReadback,
-    OkxOrderReadbackAnchor, OkxOrderReadbackRequest, OkxPlaceIntent, OkxPlaceRequest,
-    OkxPrivateRequest, OkxTradeMode, OkxUnknownCancelReadbackRequest, OkxUnknownCancelResolution,
-    OkxUnknownOrderReadback, OkxUnknownOrderReadbackRequest, build_cancel_order_readback_request,
-    build_cancel_request, build_order_readback_request, build_place_request,
-    build_unknown_cancel_readback_request, build_unknown_order_readback_request,
+    OkxOrderReadbackRequest, OkxPlaceIntent, OkxPlaceRequest, OkxPrivateRequest,
+    OkxUnknownCancelReadbackRequest, OkxUnknownCancelResolution, OkxUnknownOrderReadback,
+    OkxUnknownOrderReadbackRequest, build_cancel_order_readback_request, build_cancel_request,
+    build_order_readback_request, build_place_request, build_unknown_cancel_readback_request,
     build_unknown_order_readback_request_after, parse_cancel_ack, parse_order_detail,
     parse_place_ack, parse_unknown_cancel_readback, parse_unknown_order_readback,
 };
-pub use physical::{
-    OkxDispatchOnceResult, OkxOneShotMutation, OkxPendingMutation, OkxPhysicalCandidate,
-    OkxPhysicalError, OkxPhysicalReadbackResult, OkxPhysicalSession,
+#[cfg(test)]
+pub(crate) use physical::{
+    OkxDispatchOnceResult, OkxPhysicalCandidate, OkxPhysicalError, OkxPhysicalReadbackResult,
 };
 pub use private::{
     OkxAccountLevel, OkxAccountProfile, OkxApiPermission, OkxPage, OkxPageState, OkxTimedBalance,
@@ -69,10 +76,13 @@ pub use recovery_collector::{
     OkxFreshRecoveryUnknownKind, OkxOwnerRoute, OkxRecoveryAuthoritySnapshot,
     OkxRecoveryConfiguration,
 };
-pub use sign::{SignedHeaders, request_path, sign};
+pub(crate) use sign::{SignedHeaders, sign};
+pub use trade_mode::OkxTradeMode;
+#[cfg(test)]
+pub(crate) use transport::{OkxCancelOnceOutcome, OkxPlaceOnceOutcome};
 pub use transport::{
-    OkxCancelOnceOutcome, OkxHttpResponse, OkxHttpTransport, OkxPlaceOnceOutcome,
-    OkxPrivateWsTransport, OkxReceivedPrivateFrame, OkxTransportError,
+    OkxHttpResponse, OkxHttpTransport, OkxPrivateWsTransport, OkxReceivedPrivateFrame,
+    OkxTransportError,
 };
 
 /// No account capability is advertised until authenticated readback, private stream, writer,
