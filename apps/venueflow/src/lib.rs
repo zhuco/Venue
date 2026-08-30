@@ -1,5 +1,10 @@
 mod app;
+mod chart;
 mod client;
+#[cfg(not(target_arch = "wasm32"))]
+mod market;
+#[cfg(not(target_arch = "wasm32"))]
+mod market_client;
 mod model;
 mod theme;
 mod ui;

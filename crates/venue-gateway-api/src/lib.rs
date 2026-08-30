@@ -1,8 +1,8 @@
 use std::{fmt, str::FromStr};
 
 use bitflags::bitflags;
-use serde::{Deserialize, Serialize};
-use venue_domain::domain::{Symbol, is_canonical_trading_account_id};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use venue_domain::domain::{MarketKind, Symbol, is_canonical_trading_account_id};
 
 mod capability_promotion;
 
@@ -144,6 +144,80 @@ impl GatewayBinding {
     }
 }
 
+/// Secret-free display subscription scope for the first local public-market feed.
+///
+/// This type is deliberately separate from [`GatewayBinding`]: it never identifies an account,
+/// carries no credential material, and cannot be used as mutation or capability evidence. The
+/// initial contract is limited to Binance USDⓈ-M public data on the production endpoint.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct PublicMarketBinding {
+    pub venue: VenueId,
+    pub mode: GatewayMode,
+    pub market: MarketKind,
+    pub symbol: Symbol,
+}
+
+impl PublicMarketBinding {
+    pub fn binance_usds_m(symbol: Symbol) -> Result<Self, GatewayApiError> {
+        Self::new(
+            VenueId::Binance,
+            GatewayMode::Live,
+            MarketKind::LinearPerpetual,
+            symbol,
+        )
+    }
+
+    pub fn new(
+        venue: VenueId,
+        mode: GatewayMode,
+        market: MarketKind,
+        symbol: Symbol,
+    ) -> Result<Self, GatewayApiError> {
+        let value = Self {
+            venue,
+            mode,
+            market,
+            symbol,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), GatewayApiError> {
+        if self.venue != VenueId::Binance {
+            return Err(GatewayApiError::PublicMarketVenue);
+        }
+        if self.mode != GatewayMode::Live {
+            return Err(GatewayApiError::PublicMarketMode);
+        }
+        if self.market != MarketKind::LinearPerpetual {
+            return Err(GatewayApiError::PublicMarketProduct);
+        }
+        if !matches!(self.symbol.quote(), "USDT" | "USDC") {
+            return Err(GatewayApiError::PublicMarketSettlement);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct UncheckedPublicMarketBinding {
+    venue: VenueId,
+    mode: GatewayMode,
+    market: MarketKind,
+    symbol: Symbol,
+}
+
+impl<'de> Deserialize<'de> for PublicMarketBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = UncheckedPublicMarketBinding::deserialize(deserializer)?;
+        Self::new(raw.venue, raw.mode, raw.market, raw.symbol).map_err(D::Error::custom)
+    }
+}
+
 bitflags! {
     /// Versioned adapter evidence. Unsupported capabilities stay absent; adapters must not fill a
     /// lowest-common-denominator profile or infer trading authority from successful reads.
@@ -238,6 +312,14 @@ pub enum GatewayApiError {
     Mode,
     #[error("trading account id must be a canonical UUID string")]
     TradingAccountId,
+    #[error("local public market data currently supports Binance only")]
+    PublicMarketVenue,
+    #[error("local public market data currently supports LIVE only")]
+    PublicMarketMode,
+    #[error("local public market data currently supports Binance USDⓈ-M perpetuals only")]
+    PublicMarketProduct,
+    #[error("Binance USDⓈ-M public market symbols must settle in USDT or USDC")]
+    PublicMarketSettlement,
     #[error("gateway capability scope or version does not match the mutation")]
     CapabilityScope,
     #[error("gateway capability evidence is stale, future-dated, or malformed")]
@@ -310,6 +392,98 @@ mod tests {
             GatewayBinding::new(VenueId::Okx, GatewayMode::Test, "account-name", symbol),
             Err(GatewayApiError::TradingAccountId)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn public_market_binding_accepts_only_binance_live_usds_m()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for symbol in ["BTC/USDT", "SOL/USDC"] {
+            assert_eq!(
+                PublicMarketBinding::binance_usds_m(symbol.parse()?)?,
+                PublicMarketBinding::new(
+                    VenueId::Binance,
+                    GatewayMode::Live,
+                    MarketKind::LinearPerpetual,
+                    symbol.parse()?,
+                )?
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn public_market_binding_rejects_out_of_scope_venue_product_and_settlement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let symbol: Symbol = "BTC/USDT".parse()?;
+        assert_eq!(
+            PublicMarketBinding::new(
+                VenueId::Okx,
+                GatewayMode::Live,
+                MarketKind::LinearPerpetual,
+                symbol.clone(),
+            ),
+            Err(GatewayApiError::PublicMarketVenue)
+        );
+        assert_eq!(
+            PublicMarketBinding::new(
+                VenueId::Binance,
+                GatewayMode::Live,
+                MarketKind::Spot,
+                symbol,
+            ),
+            Err(GatewayApiError::PublicMarketProduct)
+        );
+        assert_eq!(
+            PublicMarketBinding::binance_usds_m("BTC/USD".parse()?),
+            Err(GatewayApiError::PublicMarketSettlement)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn public_market_binding_deserialization_revalidates_the_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let decoded: PublicMarketBinding = serde_json::from_str(
+            r#"{"venue":"binance","mode":"LIVE","market":"linear_perpetual","symbol":"BTC/USDT"}"#,
+        )?;
+        assert_eq!(
+            decoded,
+            PublicMarketBinding::binance_usds_m("BTC/USDT".parse()?)?
+        );
+
+        for raw in [
+            r#"{"venue":"okx","mode":"LIVE","market":"linear_perpetual","symbol":"BTC/USDT"}"#,
+            r#"{"venue":"binance","mode":"TEST","market":"linear_perpetual","symbol":"BTC/USDT"}"#,
+            r#"{"venue":"binance","mode":"LIVE","market":"spot","symbol":"BTC/USDT"}"#,
+            r#"{"venue":"binance","mode":"LIVE","market":"linear_perpetual","symbol":"BTC/USD"}"#,
+        ] {
+            assert!(serde_json::from_str::<PublicMarketBinding>(raw).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn public_market_binding_serialization_has_no_account_credential_or_capability_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let value = PublicMarketBinding::binance_usds_m("BTC/USDT".parse()?)?;
+        let encoded = serde_json::to_value(value)?;
+        let fields = encoded
+            .as_object()
+            .ok_or("public market binding must serialize to an object")?;
+        assert_eq!(fields.len(), 4);
+        for field in ["venue", "mode", "market", "symbol"] {
+            assert!(fields.contains_key(field));
+        }
+        for field in [
+            "trading_account_id",
+            "account",
+            "credentials",
+            "capabilities",
+            "flags",
+        ] {
+            assert!(!fields.contains_key(field));
+        }
         Ok(())
     }
 

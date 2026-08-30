@@ -1,7 +1,10 @@
 use egui_tiles::{Linear, LinearDir, Tile, TileId, Tiles, Tree};
 use serde::{Deserialize, Serialize};
 
-use crate::model::WorkspaceKind;
+use crate::{
+    chart::{ChartInterval, ChartViewport},
+    model::WorkspaceKind,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PaneKind {
@@ -40,7 +43,8 @@ pub struct Pane {
     pub kind: PaneKind,
     pub instance: u32,
     pub symbol: Option<String>,
-    pub visible_bars: usize,
+    pub interval: ChartInterval,
+    pub viewport: ChartViewport,
 }
 
 impl Pane {
@@ -49,7 +53,8 @@ impl Pane {
             kind,
             instance,
             symbol: None,
-            visible_bars: 120,
+            interval: ChartInterval::default(),
+            viewport: ChartViewport::default(),
         }
     }
 
@@ -58,7 +63,8 @@ impl Pane {
             kind: PaneKind::Chart,
             instance,
             symbol: Some(symbol.to_owned()),
-            visible_bars: 120,
+            interval: ChartInterval::default(),
+            viewport: ChartViewport::default(),
         }
     }
 
@@ -97,6 +103,14 @@ impl Default for Workspaces {
 }
 
 impl Workspaces {
+    fn active_tree(&self) -> &Tree<Pane> {
+        match self.active {
+            WorkspaceKind::Trading => &self.trading,
+            WorkspaceKind::Operations => &self.operations,
+            WorkspaceKind::MultiChart => &self.multi_chart,
+        }
+    }
+
     pub fn active_tree_mut(&mut self) -> &mut Tree<Pane> {
         match self.active {
             WorkspaceKind::Trading => &mut self.trading,
@@ -114,11 +128,7 @@ impl Workspaces {
     }
 
     pub fn pane_visibility(&self) -> Vec<(TileId, String, bool)> {
-        let tree = match self.active {
-            WorkspaceKind::Trading => &self.trading,
-            WorkspaceKind::Operations => &self.operations,
-            WorkspaceKind::MultiChart => &self.multi_chart,
-        };
+        let tree = self.active_tree();
         tree.tiles
             .iter()
             .filter_map(|(tile_id, tile)| match tile {
@@ -130,6 +140,27 @@ impl Workspaces {
 
     pub fn set_visible(&mut self, tile_id: TileId, visible: bool) {
         self.active_tree_mut().tiles.set_visible(tile_id, visible);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn active_chart_requests(&self, fallback_symbol: &str) -> Vec<(String, ChartInterval)> {
+        let tree = self.active_tree();
+        tree.tiles
+            .iter()
+            .filter_map(|(tile_id, tile)| match tile {
+                Tile::Pane(pane)
+                    if pane.kind == PaneKind::Chart && tree.tiles.is_visible(*tile_id) =>
+                {
+                    Some((
+                        pane.symbol
+                            .clone()
+                            .unwrap_or_else(|| fallback_symbol.to_owned()),
+                        pane.interval,
+                    ))
+                }
+                Tile::Pane(_) | Tile::Container(_) => None,
+            })
+            .collect()
     }
 }
 
@@ -154,7 +185,7 @@ fn split(
 fn build_trading() -> Tree<Pane> {
     let mut tiles = Tiles::default();
     let watch = pane(&mut tiles, PaneKind::MarketWatch, 1);
-    let chart = chart(&mut tiles, 1, "BTC/USDT");
+    let chart = pane(&mut tiles, PaneKind::Chart, 1);
     let book = pane(&mut tiles, PaneKind::OrderBook, 1);
     let tape = pane(&mut tiles, PaneKind::TradeTape, 1);
     let strategies = pane(&mut tiles, PaneKind::Strategies, 1);

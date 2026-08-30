@@ -3,14 +3,92 @@ use std::{collections::BTreeSet, str::FromStr};
 use rust_decimal::Decimal;
 use serde_json::{Map, Value};
 use venue_domain::domain::{
-    AggressorSide, FieldState, MarketDelta, MarketLevel, Price, PublicBar, PublicTicker,
-    PublicTrade,
+    AggressorSide, FieldState, MarketDelta, MarketLevel, MarketSnapshot, Price, PublicBar,
+    PublicTicker, PublicTrade, Symbol,
 };
-use venue_gateway_api::GatewayBinding;
+use venue_gateway_api::{GatewayBinding, PublicMarketBinding};
 
 use crate::{BinanceAccountBinding, native_symbol};
 
 const ONE_MINUTE_MS: u64 = 60_000;
+
+/// Kline intervals intentionally exposed by the first local Binance public-market feed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BinanceKlineInterval {
+    OneMinute,
+    FiveMinutes,
+    FifteenMinutes,
+    OneHour,
+    FourHours,
+    OneDay,
+}
+
+impl BinanceKlineInterval {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OneMinute => "1m",
+            Self::FiveMinutes => "5m",
+            Self::FifteenMinutes => "15m",
+            Self::OneHour => "1h",
+            Self::FourHours => "4h",
+            Self::OneDay => "1d",
+        }
+    }
+
+    #[must_use]
+    pub const fn milliseconds(self) -> u64 {
+        match self {
+            Self::OneMinute => 60_000,
+            Self::FiveMinutes => 300_000,
+            Self::FifteenMinutes => 900_000,
+            Self::OneHour => 3_600_000,
+            Self::FourHours => 14_400_000,
+            Self::OneDay => 86_400_000,
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self, BinancePublicError> {
+        match raw {
+            "1m" => Ok(Self::OneMinute),
+            "5m" => Ok(Self::FiveMinutes),
+            "15m" => Ok(Self::FifteenMinutes),
+            "1h" => Ok(Self::OneHour),
+            "4h" => Ok(Self::FourHours),
+            "1d" => Ok(Self::OneDay),
+            _ => Err(BinancePublicError::Interval),
+        }
+    }
+}
+
+/// Adapter-only in-progress kline. It is intentionally not a domain [`PublicBar`], because
+/// strategy facts may only contain an exchange-confirmed closed bar.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceFormingBar {
+    pub symbol: Symbol,
+    pub generation: u64,
+    pub received_at_ms: u64,
+    pub exchange_time_ms: u64,
+    pub sequence: u64,
+    pub open_time_ms: u64,
+    pub close_time_ms: u64,
+    pub interval: BinanceKlineInterval,
+    pub open: Price,
+    pub high: Price,
+    pub low: Price,
+    pub close: Price,
+    pub base_volume: Decimal,
+    pub quote_volume: Decimal,
+    pub trade_count: u64,
+    pub taker_buy_base_volume: Decimal,
+    pub taker_buy_quote_volume: Decimal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BinancePublicKline {
+    Forming(BinancePublicEnvelope<BinanceFormingBar>),
+    Closed(BinancePublicEnvelope<PublicBar>),
+}
 
 /// Immutable adapter evidence binding one normalized fact to the exact native payload and times.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -254,6 +332,487 @@ pub fn parse_closed_bar(
     ))
 }
 
+/// Parses a direct Binance `bookTicker` frame or a combined-stream wrapper for the local,
+/// credential-free public market binding.
+pub fn parse_public_market_bbo(
+    payload: &str,
+    binding: &PublicMarketBinding,
+    generation: u64,
+    received_at_ms: u64,
+) -> Result<BinancePublicEnvelope<PublicTicker>, BinancePublicError> {
+    let (object, expected_native) =
+        public_market_stream_object(payload, binding, generation, "bookTicker")?;
+    let exchange_event_time_ms = positive_u64(object.get("E"))?;
+    let transaction_time_ms = positive_u64(object.get("T"))?;
+    let bid_price = positive_price(object.get("b"))?;
+    let ask_price = positive_price(object.get("a"))?;
+    let bid_quantity = positive_decimal(object.get("B"))?;
+    let ask_quantity = positive_decimal(object.get("A"))?;
+    if received_at_ms == 0 || bid_price >= ask_price {
+        return Err(BinancePublicError::Value);
+    }
+    let fact = PublicTicker {
+        symbol: binding.symbol.clone(),
+        generation,
+        received_at_ms,
+        exchange_time_ms: exchange_event_time_ms,
+        transaction_time_ms,
+        update_id: positive_u64(object.get("u"))?,
+        bid_price,
+        bid_quantity,
+        ask_price,
+        ask_quantity,
+    };
+    Ok(envelope(
+        payload,
+        expected_native,
+        generation,
+        exchange_event_time_ms,
+        Some(transaction_time_ms),
+        fact,
+    ))
+}
+
+/// Parses a direct Binance `aggTrade` frame or a combined-stream wrapper. Binance's public
+/// aggregate trade frame has no quote quantity, so it is derived with checked decimal arithmetic.
+pub fn parse_public_market_agg_trade(
+    payload: &str,
+    binding: &PublicMarketBinding,
+    generation: u64,
+    received_at_ms: u64,
+) -> Result<BinancePublicEnvelope<PublicTrade>, BinancePublicError> {
+    let (object, expected_native) =
+        public_market_stream_object(payload, binding, generation, "aggTrade")?;
+    let exchange_event_time_ms = positive_u64(object.get("E"))?;
+    let transaction_time_ms = positive_u64(object.get("T"))?;
+    let first_trade_id = positive_u64(object.get("f"))?;
+    let last_trade_id = positive_u64(object.get("l"))?;
+    if received_at_ms == 0 || last_trade_id < first_trade_id {
+        return Err(BinancePublicError::Sequence);
+    }
+    let aggressor = match object.get("m") {
+        Some(Value::Bool(true)) => AggressorSide::Sell,
+        Some(Value::Bool(false)) => AggressorSide::Buy,
+        _ => return Err(BinancePublicError::Payload),
+    };
+    let price = positive_price(object.get("p"))?;
+    let quantity = positive_decimal(object.get("q"))?;
+    let quote_quantity = price
+        .value()
+        .checked_mul(quantity)
+        .ok_or(BinancePublicError::Value)?;
+    let fact = PublicTrade {
+        symbol: binding.symbol.clone(),
+        generation,
+        received_at_ms,
+        exchange_time_ms: exchange_event_time_ms,
+        transaction_time_ms,
+        aggregate_trade_id: positive_u64(object.get("a"))?,
+        first_trade_id,
+        last_trade_id,
+        price,
+        quantity,
+        quote_quantity,
+        aggressor: FieldState::Known(aggressor),
+    };
+    Ok(envelope(
+        payload,
+        expected_native,
+        generation,
+        exchange_event_time_ms,
+        Some(transaction_time_ms),
+        fact,
+    ))
+}
+
+/// Parses one bounded `depth20` partial-book snapshot. It accepts the Binance websocket `b`/`a`
+/// shape and the documented `bids`/`asks` spelling, but never treats a snapshot as a delta.
+pub fn parse_public_market_depth20_snapshot(
+    payload: &str,
+    binding: &PublicMarketBinding,
+    generation: u64,
+) -> Result<BinancePublicEnvelope<MarketSnapshot>, BinancePublicError> {
+    let (object, expected_native) =
+        public_market_stream_object(payload, binding, generation, "depthUpdate")?;
+    let exchange_event_time_ms = positive_u64(object.get("E"))?;
+    let transaction_time_ms = positive_u64(object.get("T"))?;
+    let sequence = positive_u64(object.get("lastUpdateId").or_else(|| object.get("u")))?;
+    let bids = levels(object.get("b").or_else(|| object.get("bids")), false)?;
+    let asks = levels(object.get("a").or_else(|| object.get("asks")), false)?;
+    validate_depth20_snapshot(&bids, &asks)?;
+    let fact = MarketSnapshot {
+        symbol: binding.symbol.clone(),
+        generation,
+        sequence,
+        exchange_time_ms: Some(exchange_event_time_ms),
+        bids,
+        asks,
+    };
+    Ok(envelope(
+        payload,
+        expected_native,
+        generation,
+        exchange_event_time_ms,
+        Some(transaction_time_ms),
+        fact,
+    ))
+}
+
+/// Parses a direct Binance `kline` frame or a combined-stream wrapper. A forming kline remains
+/// adapter-local; only a frame carrying `x=true` becomes a normalized [`PublicBar`].
+pub fn parse_public_market_kline(
+    payload: &str,
+    binding: &PublicMarketBinding,
+    generation: u64,
+    received_at_ms: u64,
+) -> Result<BinancePublicKline, BinancePublicError> {
+    let (object, expected_native) =
+        public_market_stream_object(payload, binding, generation, "kline")?;
+    let exchange_event_time_ms = positive_u64(object.get("E"))?;
+    let kline = object
+        .get("k")
+        .and_then(Value::as_object)
+        .ok_or(BinancePublicError::Payload)?;
+    check_symbol(kline.get("s"), &expected_native)?;
+    if received_at_ms == 0 {
+        return Err(BinancePublicError::Value);
+    }
+    let values = parse_kline_values(kline)?;
+    match kline.get("x").and_then(Value::as_bool) {
+        Some(true) => {
+            if exchange_event_time_ms < values.close_time_ms {
+                return Err(BinancePublicError::Sequence);
+            }
+            Ok(BinancePublicKline::Closed(envelope(
+                payload,
+                expected_native,
+                generation,
+                exchange_event_time_ms,
+                None,
+                values.into_public_bar(binding.symbol.clone(), generation, received_at_ms),
+            )))
+        }
+        Some(false) => Ok(BinancePublicKline::Forming(envelope(
+            payload,
+            expected_native,
+            generation,
+            exchange_event_time_ms,
+            None,
+            values.into_forming_bar(
+                binding.symbol.clone(),
+                generation,
+                received_at_ms,
+                exchange_event_time_ms,
+            ),
+        ))),
+        None => Err(BinancePublicError::Payload),
+    }
+}
+
+/// Parses the array returned by Binance USDⓈ-M `GET /fapi/v1/klines`. This endpoint does not
+/// include a symbol in each row, so the caller must bind the HTTP request to `binding`; rows whose
+/// close is not yet before the local receive time are intentionally filtered out as forming bars.
+pub fn parse_public_market_rest_klines(
+    payload: &str,
+    binding: &PublicMarketBinding,
+    generation: u64,
+    received_at_ms: u64,
+    interval: BinanceKlineInterval,
+) -> Result<Vec<PublicBar>, BinancePublicError> {
+    binding
+        .validate()
+        .map_err(|_| BinancePublicError::Binding)?;
+    if generation == 0 {
+        return Err(BinancePublicError::Generation);
+    }
+    if received_at_ms == 0 {
+        return Err(BinancePublicError::Value);
+    }
+    let rows = serde_json::from_str::<Value>(payload)
+        .map_err(|_| BinancePublicError::Payload)?
+        .as_array()
+        .cloned()
+        .ok_or(BinancePublicError::Payload)?;
+    let mut bars = Vec::with_capacity(rows.len());
+    let mut previous_sequence = None;
+    for row in rows {
+        let fields = row.as_array().ok_or(BinancePublicError::Payload)?;
+        if fields.len() < 11 {
+            return Err(BinancePublicError::Payload);
+        }
+        let values = parse_rest_kline_values(fields, interval)?;
+        if let Some(previous) = previous_sequence
+            && values.sequence <= previous
+        {
+            return Err(BinancePublicError::Sequence);
+        }
+        previous_sequence = Some(values.sequence);
+        if values.close_time_ms >= received_at_ms {
+            continue;
+        }
+        let bar = values.into_public_bar(binding.symbol.clone(), generation, received_at_ms);
+        if !bar.is_valid() {
+            return Err(BinancePublicError::Value);
+        }
+        bars.push(bar);
+    }
+    Ok(bars)
+}
+
+fn public_market_stream_object(
+    payload: &str,
+    binding: &PublicMarketBinding,
+    generation: u64,
+    event: &str,
+) -> Result<(Map<String, Value>, String), BinancePublicError> {
+    binding
+        .validate()
+        .map_err(|_| BinancePublicError::Binding)?;
+    if generation == 0 {
+        return Err(BinancePublicError::Generation);
+    }
+    let value: Value = serde_json::from_str(payload).map_err(|_| BinancePublicError::Payload)?;
+    let object = match value {
+        Value::Object(mut wrapper) if wrapper.contains_key("data") => {
+            let stream = wrapper
+                .remove("stream")
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .ok_or(BinancePublicError::Payload)?;
+            let data = wrapper.remove("data").ok_or(BinancePublicError::Payload)?;
+            let object = data
+                .as_object()
+                .cloned()
+                .ok_or(BinancePublicError::Payload)?;
+            let expected_prefix = native_symbol(&binding.symbol).to_ascii_lowercase();
+            if !stream.starts_with(&expected_prefix) {
+                return Err(BinancePublicError::Symbol);
+            }
+            object
+        }
+        Value::Object(object) => object,
+        _ => return Err(BinancePublicError::Payload),
+    };
+    let expected_native = native_symbol(&binding.symbol);
+    check_symbol(object.get("s"), &expected_native)?;
+    if object.get("e").and_then(Value::as_str) != Some(event) {
+        return Err(BinancePublicError::Payload);
+    }
+    Ok((object, expected_native))
+}
+
+fn validate_depth20_snapshot(
+    bids: &[MarketLevel],
+    asks: &[MarketLevel],
+) -> Result<(), BinancePublicError> {
+    if bids.is_empty() || asks.is_empty() || bids.len() > 20 || asks.len() > 20 {
+        return Err(BinancePublicError::Value);
+    }
+    if bids.windows(2).any(|pair| pair[0].price <= pair[1].price)
+        || asks.windows(2).any(|pair| pair[0].price >= pair[1].price)
+        || bids[0].price >= asks[0].price
+    {
+        return Err(BinancePublicError::Value);
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct KlineValues {
+    interval: BinanceKlineInterval,
+    sequence: u64,
+    open_time_ms: u64,
+    close_time_ms: u64,
+    open: Price,
+    high: Price,
+    low: Price,
+    close: Price,
+    evidence: CompleteBarEvidence,
+}
+
+impl KlineValues {
+    fn into_public_bar(self, symbol: Symbol, generation: u64, received_at_ms: u64) -> PublicBar {
+        PublicBar {
+            symbol,
+            generation,
+            received_at_ms,
+            sequence: self.sequence,
+            open_time_ms: self.open_time_ms,
+            close_time_ms: self.close_time_ms,
+            interval_ms: self.interval.milliseconds(),
+            open: self.open,
+            high: self.high,
+            low: self.low,
+            close: self.close,
+            base_volume: FieldState::Known(self.evidence.base_volume),
+            quote_volume: FieldState::Known(self.evidence.quote_volume),
+            trade_count: FieldState::Known(self.evidence.trade_count),
+            taker_buy_base_volume: FieldState::Known(self.evidence.taker_buy_base_volume),
+            taker_buy_quote_volume: FieldState::Known(self.evidence.taker_buy_quote_volume),
+        }
+    }
+
+    fn into_forming_bar(
+        self,
+        symbol: Symbol,
+        generation: u64,
+        received_at_ms: u64,
+        exchange_time_ms: u64,
+    ) -> BinanceFormingBar {
+        BinanceFormingBar {
+            symbol,
+            generation,
+            received_at_ms,
+            exchange_time_ms,
+            sequence: self.sequence,
+            open_time_ms: self.open_time_ms,
+            close_time_ms: self.close_time_ms,
+            interval: self.interval,
+            open: self.open,
+            high: self.high,
+            low: self.low,
+            close: self.close,
+            base_volume: self.evidence.base_volume,
+            quote_volume: self.evidence.quote_volume,
+            trade_count: self.evidence.trade_count,
+            taker_buy_base_volume: self.evidence.taker_buy_base_volume,
+            taker_buy_quote_volume: self.evidence.taker_buy_quote_volume,
+        }
+    }
+}
+
+fn parse_kline_values(kline: &Map<String, Value>) -> Result<KlineValues, BinancePublicError> {
+    let interval = BinanceKlineInterval::parse(
+        kline
+            .get("i")
+            .and_then(Value::as_str)
+            .ok_or(BinancePublicError::Payload)?,
+    )?;
+    let values = kline_values(
+        interval,
+        positive_u64(kline.get("t"))?,
+        positive_u64(kline.get("T"))?,
+        (
+            positive_price(kline.get("o"))?,
+            positive_price(kline.get("h"))?,
+            positive_price(kline.get("l"))?,
+            positive_price(kline.get("c"))?,
+        ),
+        complete_bar_evidence(kline)?,
+    )?;
+    Ok(values)
+}
+
+fn parse_rest_kline_values(
+    fields: &[Value],
+    interval: BinanceKlineInterval,
+) -> Result<KlineValues, BinancePublicError> {
+    let evidence = complete_rest_bar_evidence(
+        u64_value(fields.get(8))?,
+        non_negative_decimal(fields.get(5))?,
+        non_negative_decimal(fields.get(7))?,
+        non_negative_decimal(fields.get(9))?,
+        non_negative_decimal(fields.get(10))?,
+    )?;
+    kline_values(
+        interval,
+        positive_u64(fields.first())?,
+        positive_u64(fields.get(6))?,
+        (
+            positive_price(fields.get(1))?,
+            positive_price(fields.get(2))?,
+            positive_price(fields.get(3))?,
+            positive_price(fields.get(4))?,
+        ),
+        evidence,
+    )
+}
+
+fn kline_values(
+    interval: BinanceKlineInterval,
+    open_time_ms: u64,
+    close_time_ms: u64,
+    prices: (Price, Price, Price, Price),
+    evidence: CompleteBarEvidence,
+) -> Result<KlineValues, BinancePublicError> {
+    let (open, high, low, close) = prices;
+    let interval_ms = interval.milliseconds();
+    let expected_close = open_time_ms
+        .checked_add(interval_ms - 1)
+        .ok_or(BinancePublicError::Sequence)?;
+    if !open_time_ms.is_multiple_of(interval_ms)
+        || close_time_ms != expected_close
+        || high < open.max(close)
+        || low > open.min(close)
+        || high < low
+        || !quote_volume_is_price_bounded(evidence.base_volume, evidence.quote_volume, low, high)
+        || !quote_volume_is_price_bounded(
+            evidence.taker_buy_base_volume,
+            evidence.taker_buy_quote_volume,
+            low,
+            high,
+        )
+    {
+        return Err(BinancePublicError::Value);
+    }
+    let sequence = open_time_ms
+        .checked_div(interval_ms)
+        .and_then(|value| value.checked_add(1))
+        .ok_or(BinancePublicError::Sequence)?;
+    Ok(KlineValues {
+        interval,
+        sequence,
+        open_time_ms,
+        close_time_ms,
+        open,
+        high,
+        low,
+        close,
+        evidence,
+    })
+}
+
+fn quote_volume_is_price_bounded(
+    base_volume: Decimal,
+    quote_volume: Decimal,
+    low: Price,
+    high: Price,
+) -> bool {
+    let Some(minimum) = base_volume.checked_mul(low.value()) else {
+        return false;
+    };
+    let Some(maximum) = base_volume.checked_mul(high.value()) else {
+        return false;
+    };
+    quote_volume >= minimum && quote_volume <= maximum
+}
+
+fn complete_rest_bar_evidence(
+    trade_count: u64,
+    base_volume: Decimal,
+    quote_volume: Decimal,
+    taker_buy_base_volume: Decimal,
+    taker_buy_quote_volume: Decimal,
+) -> Result<CompleteBarEvidence, BinancePublicError> {
+    if taker_buy_base_volume > base_volume
+        || taker_buy_quote_volume > quote_volume
+        || (trade_count == 0
+            && (!base_volume.is_zero()
+                || !quote_volume.is_zero()
+                || !taker_buy_base_volume.is_zero()
+                || !taker_buy_quote_volume.is_zero()))
+        || (trade_count > 0 && (base_volume <= Decimal::ZERO || quote_volume <= Decimal::ZERO))
+    {
+        return Err(BinancePublicError::Value);
+    }
+    Ok(CompleteBarEvidence {
+        trade_count,
+        base_volume,
+        quote_volume,
+        taker_buy_base_volume,
+        taker_buy_quote_volume,
+    })
+}
+
 fn stream_object(
     payload: &str,
     binding: &GatewayBinding,
@@ -299,6 +858,7 @@ fn envelope<T>(
     }
 }
 
+#[derive(Clone)]
 struct CompleteBarEvidence {
     trade_count: u64,
     base_volume: Decimal,
@@ -428,6 +988,8 @@ pub enum BinancePublicError {
     Binding,
     #[error("Binance public payload generation must be positive")]
     Generation,
+    #[error("Binance public kline interval is outside the local chart contract")]
+    Interval,
     #[error("Binance public payload has an invalid or incomplete shape")]
     Payload,
     #[error("Binance public payload symbol does not match the canonical binding")]
@@ -438,4 +1000,155 @@ pub enum BinancePublicError {
     Value,
     #[error("Binance kline is not closed")]
     BarNotClosed,
+}
+
+#[cfg(test)]
+mod public_market_tests {
+    use super::*;
+    use venue_gateway_api::{GatewayMode, VenueId};
+
+    fn binding() -> Result<PublicMarketBinding, Box<dyn std::error::Error>> {
+        Ok(PublicMarketBinding::new(
+            VenueId::Binance,
+            GatewayMode::Live,
+            venue_domain::domain::MarketKind::LinearPerpetual,
+            "BTC/USDT".parse()?,
+        )?)
+    }
+
+    fn kline(closed: bool, event_time_ms: u64) -> String {
+        format!(
+            r#"{{"e":"kline","E":{event_time_ms},"s":"BTCUSDT","k":{{"t":60000,"T":119999,"s":"BTCUSDT","i":"1m","f":1,"L":2,"o":"100","h":"110","l":"90","c":"105","v":"2","n":2,"x":{closed},"q":"200","V":"1","Q":"100"}}}}"#
+        )
+    }
+
+    #[test]
+    fn public_market_parses_direct_and_combined_bbo_trade_and_depth20()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding()?;
+        let bbo = parse_public_market_bbo(
+            r#"{"e":"bookTicker","E":1000,"T":999,"s":"BTCUSDT","u":3,"b":"100","B":"2","a":"101","A":"3"}"#,
+            &binding,
+            7,
+            1_001,
+        )?;
+        assert_eq!(bbo.fact().symbol.to_string(), "BTC/USDT");
+        assert_eq!(bbo.fact().generation, 7);
+
+        let trade = parse_public_market_agg_trade(
+            r#"{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1000,"T":999,"s":"BTCUSDT","a":11,"p":"100","q":"2","f":21,"l":22,"m":false}}"#,
+            &binding,
+            7,
+            1_001,
+        )?;
+        assert_eq!(trade.fact().quote_quantity, Decimal::from(200));
+        assert_eq!(
+            trade.fact().aggressor,
+            FieldState::Known(AggressorSide::Buy)
+        );
+
+        let depth = parse_public_market_depth20_snapshot(
+            r#"{"stream":"btcusdt@depth20@100ms","data":{"e":"depthUpdate","E":1000,"T":999,"s":"BTCUSDT","u":10,"b":[["100","2"],["99","1"]],"a":[["101","3"],["102","4"]]}}"#,
+            &binding,
+            7,
+        )?;
+        assert_eq!(depth.fact().sequence, 10);
+        assert_eq!(depth.fact().bids.len(), 2);
+        assert_eq!(depth.fact().asks.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn public_market_kline_keeps_forming_data_out_of_domain_bar()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding()?;
+        match parse_public_market_kline(&kline(false, 70_000), &binding, 7, 70_001)? {
+            BinancePublicKline::Forming(envelope) => {
+                assert_eq!(envelope.fact().interval, BinanceKlineInterval::OneMinute);
+                assert_eq!(envelope.fact().sequence, 2);
+            }
+            BinancePublicKline::Closed(_) => return Err("forming frame became a PublicBar".into()),
+        }
+        match parse_public_market_kline(&kline(true, 120_000), &binding, 7, 120_001)? {
+            BinancePublicKline::Closed(envelope) => assert!(envelope.fact().is_valid()),
+            BinancePublicKline::Forming(_) => return Err("closed frame was not promoted".into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn public_market_rejects_wrong_symbol_old_generation_and_invalid_ohlc()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding()?;
+        let bbo = r#"{"e":"bookTicker","E":1000,"T":999,"s":"BTCUSDT","u":3,"b":"100","B":"2","a":"101","A":"3"}"#;
+        assert_eq!(
+            parse_public_market_bbo(&bbo.replace("BTCUSDT", "ETHUSDT"), &binding, 7, 1),
+            Err(BinancePublicError::Symbol)
+        );
+        assert_eq!(
+            parse_public_market_bbo(bbo, &binding, 0, 1),
+            Err(BinancePublicError::Generation)
+        );
+        assert_eq!(
+            parse_public_market_kline(
+                &kline(true, 120_000).replace("\"h\":\"110\"", "\"h\":\"99\""),
+                &binding,
+                7,
+                120_001
+            ),
+            Err(BinancePublicError::Value)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rest_klines_filter_the_unclosed_tail_and_reject_bad_ordering()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding()?;
+        let payload = r#"[
+            [60000,"100","110","90","105","2",119999,"200",2,"1","100","0"],
+            [120000,"105","115","100","110","2",179999,"210",2,"1","105","0"]
+        ]"#;
+        let bars = parse_public_market_rest_klines(
+            payload,
+            &binding,
+            7,
+            150_000,
+            BinanceKlineInterval::OneMinute,
+        )?;
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].open_time_ms, 60_000);
+        assert!(bars[0].is_valid());
+        assert_eq!(
+            parse_public_market_rest_klines(
+                r#"[[120000,"100","110","90","105","2",179999,"200",2,"1","100","0"],[60000,"100","110","90","105","2",119999,"200",2,"1","100","0"]]"#,
+                &binding,
+                7,
+                200_000,
+                BinanceKlineInterval::OneMinute,
+            ),
+            Err(BinancePublicError::Sequence)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chart_intervals_are_exactly_the_initial_contract() {
+        assert_eq!(
+            [
+                BinanceKlineInterval::OneMinute,
+                BinanceKlineInterval::FiveMinutes,
+                BinanceKlineInterval::FifteenMinutes,
+                BinanceKlineInterval::OneHour,
+                BinanceKlineInterval::FourHours,
+                BinanceKlineInterval::OneDay,
+            ]
+            .map(BinanceKlineInterval::as_str),
+            ["1m", "5m", "15m", "1h", "4h", "1d"]
+        );
+        assert_eq!(
+            BinanceKlineInterval::parse("3m"),
+            Err(BinancePublicError::Interval)
+        );
+    }
 }

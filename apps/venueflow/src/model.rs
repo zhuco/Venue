@@ -102,6 +102,8 @@ pub struct AppModel {
     pub commands: VecDeque<CommandProgress>,
     receipt_ids: VecDeque<String>,
     pub notices: VecDeque<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub local_markets: crate::market::LocalMarketStore,
     request_sequence: u64,
 }
 
@@ -121,16 +123,15 @@ impl AppModel {
             commands: VecDeque::new(),
             receipt_ids: VecDeque::new(),
             notices: VecDeque::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            local_markets: crate::market::LocalMarketStore::default(),
             request_sequence: 0,
         }
     }
 
     pub fn apply_snapshot(&mut self, snapshot: ControlSnapshot) {
         self.control_connection = Some(snapshot.connection);
-        if !snapshot
-            .markets
-            .iter()
-            .any(|market| market.symbol.to_string() == self.preferences.selected_symbol)
+        if self.preferences.selected_symbol.trim().is_empty()
             && let Some(first) = snapshot.markets.first()
         {
             self.preferences.selected_symbol = first.symbol.to_string();
@@ -335,14 +336,14 @@ mod tests {
     }
 
     #[test]
-    fn command_scope_preserves_the_strategy_gateway_mode() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn command_scope_preserves_the_live_strategy_gateway_mode()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut model = AppModel::new(Preferences::default());
         let strategy = StrategySummary {
             instance_id: "grid-btc".to_owned(),
             kind: StrategyKind::Grid,
             venue: VenueId::Binance,
-            mode: GatewayMode::Test,
+            mode: GatewayMode::Live,
             trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             symbol: "BTC/USDT".parse()?,
             lifecycle: StrategyLifecycle::Running,
@@ -358,8 +359,8 @@ mod tests {
 
         let request = model.begin_command(&strategy, ControlAction::Stop, 10);
 
-        assert_eq!(request.mode, GatewayMode::Test);
-        assert!(request.expected_confirmation().contains("mode=TEST"));
+        assert_eq!(request.mode, GatewayMode::Live);
+        assert!(request.expected_confirmation().contains("mode=LIVE"));
         Ok(())
     }
 
@@ -425,7 +426,7 @@ mod tests {
             schema_version: CONTROL_SCHEMA_VERSION,
             request_id: "request-1".to_owned(),
             venue: VenueId::Binance,
-            mode: GatewayMode::Test,
+            mode: GatewayMode::Live,
             trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             instance_id: "grid-btc".to_owned(),
             symbol: "BTC/USDT".parse()?,

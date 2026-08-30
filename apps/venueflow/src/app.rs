@@ -6,6 +6,11 @@ use crate::{
     theme, ui,
     workspace::Workspaces,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use crate::{
+    market::MarketSelection,
+    market_client::{LocalMarketClient, LocalMarketClientEvent},
+};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +39,8 @@ pub struct VenueFlowApp {
     model: AppModel,
     workspaces: Workspaces,
     client: ControlClient,
+    #[cfg(not(target_arch = "wasm32"))]
+    market_client: Option<LocalMarketClient>,
     show_modules: bool,
     show_settings: bool,
     reconnect: bool,
@@ -51,14 +58,86 @@ impl VenueFlowApp {
             model.preferences.endpoint.clone(),
             creation_context.egui_ctx.clone(),
         );
+        #[cfg(not(target_arch = "wasm32"))]
+        let (model, market_client) = match LocalMarketClient::start() {
+            Ok(client) => (model, Some(client)),
+            Err(error) => {
+                let mut model = model;
+                model.notice(format!("Local Binance market worker unavailable: {error}"));
+                (model, None)
+            }
+        };
         Self {
             model,
             workspaces: persisted.workspaces,
             client,
+            #[cfg(not(target_arch = "wasm32"))]
+            market_client,
             show_modules: false,
             show_settings: false,
             reconnect: false,
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn synchronize_local_markets(&mut self) {
+        let selections = self
+            .workspaces
+            .active_chart_requests(&self.model.preferences.selected_symbol)
+            .into_iter()
+            .filter_map(|(symbol, interval)| {
+                match MarketSelection::binance_usd_m(&symbol, interval) {
+                    Ok(selection) => Some(selection),
+                    Err(error) => {
+                        self.model.notice(format!(
+                            "Local Binance selection rejected for {symbol}: {error}"
+                        ));
+                        None
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        let generation = match self.model.local_markets.replace(selections) {
+            Ok(generation) => generation,
+            Err(error) => {
+                self.model
+                    .notice(format!("Local Binance subscription rejected: {error}"));
+                None
+            }
+        };
+        let (Some(generation), Some(client)) = (generation, self.market_client.as_ref()) else {
+            return;
+        };
+        let selections = self.model.local_markets.selections().cloned().collect();
+        if let Err(error) = client.replace_subscriptions(generation, selections) {
+            self.model
+                .notice(format!("Local Binance subscription unavailable: {error}"));
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn drain_local_markets(&mut self, context: &egui::Context) {
+        let Some(client) = self.market_client.as_ref() else {
+            return;
+        };
+        for event in client.drain(10_000) {
+            match event {
+                LocalMarketClientEvent::Market(envelope) => {
+                    if let Err(error) = self.model.local_markets.apply(envelope) {
+                        self.model
+                            .notice(format!("Ignored invalid local market event: {error}"));
+                    }
+                }
+                LocalMarketClientEvent::RepaintRequested => context.request_repaint(),
+                LocalMarketClientEvent::WorkerFailed(error) => {
+                    self.model
+                        .notice(format!("Local Binance market worker stopped: {error}"));
+                }
+            }
+        }
+        self.model
+            .local_markets
+            .refresh_staleness(unix_now_ms(), 5_000);
     }
 
     fn drain_client(&mut self) {
@@ -116,7 +195,16 @@ impl eframe::App for VenueFlowApp {
         }
         self.drain_client();
         self.reconnect_if_requested(context);
-        context.request_repaint_after(Duration::from_millis(250));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.synchronize_local_markets();
+            self.drain_local_markets(context);
+        }
+        context.request_repaint_after(Duration::from_millis(if cfg!(target_arch = "wasm32") {
+            250
+        } else {
+            50
+        }));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -185,6 +273,15 @@ impl eframe::App for VenueFlowApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         theme::BG_PRIMARY.to_normalized_gamma_f32()
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 fn load(storage: Option<&dyn eframe::Storage>) -> PersistedState {

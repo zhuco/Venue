@@ -2,10 +2,13 @@ use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, S
 use egui_tiles::{Behavior, TileId, Tiles, UiResponse};
 use venue_control_protocol::{
     AggressorSide, CommandState, ConnectionState, ControlAction, ControlCommandRequest,
-    HealthState, MarketSummary, StrategyLifecycle, StrategySummary,
+    HealthState, MarketSummary, StrategyLifecycle, StrategySummary, UiBar,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::market::{LocalMarketView, MarketSelection, MarketStatus};
 use crate::{
+    chart::{PriceRange, bar_center_x, bar_index_at_x},
     client::ControlClient,
     model::{
         AppModel, PendingConfirmation, WorkspaceKind, decimal_to_f64, format_decimal,
@@ -79,7 +82,7 @@ pub fn show_top_bar(
                     }
                 }
                 ui.separator();
-                let symbols = model
+                let mut symbols = model
                     .snapshot
                     .as_ref()
                     .map(|snapshot| {
@@ -90,6 +93,14 @@ pub fn show_top_bar(
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
+                symbols.extend(
+                    ["BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT"]
+                        .into_iter()
+                        .map(str::to_owned),
+                );
+                symbols.push(model.preferences.selected_symbol.clone());
+                symbols.sort();
+                symbols.dedup();
                 egui::ComboBox::from_id_salt("selected-symbol")
                     .selected_text(&model.preferences.selected_symbol)
                     .width(120.0)
@@ -138,6 +149,18 @@ pub fn show_status_bar(ui: &mut egui::Ui, model: &AppModel) {
                 ));
                 ui.separator();
                 ui.small(generated);
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(market) = model
+                    .local_markets
+                    .view_for_symbol(&model.preferences.selected_symbol)
+                {
+                    ui.separator();
+                    ui.small(format!(
+                        "DATA=BINANCE LIVE · {:?} · {} ms",
+                        market.status,
+                        market.latency_ms.unwrap_or_default()
+                    ));
+                }
                 if let Some(receipt) = model.last_terminal_receipt() {
                     ui.separator();
                     ui.small(format!(
@@ -150,7 +173,7 @@ pub fn show_status_bar(ui: &mut egui::Ui, model: &AppModel) {
                     ui.colored_label(theme::SELL, format!("Control error: {error}"));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.small("query/control plane only · no credentials · no direct mutation");
+                    ui.small("EXEC=CONTROL · no credentials in UI · no direct mutation");
                 });
             });
         });
@@ -224,6 +247,13 @@ pub fn show_settings(
                 *reconnect = true;
             }
             ui.separator();
+            ui.label("Local Binance USD-M symbol (canonical BASE/USDT or BASE/USDC)");
+            ui.text_edit_singleline(&mut model.preferences.selected_symbol);
+            #[cfg(not(target_arch = "wasm32"))]
+            ui.small("Native only · fixed Binance LIVE public endpoints · no API key.");
+            #[cfg(target_arch = "wasm32")]
+            ui.small("Web builds remain Control-only and do not connect to exchanges.");
+            ui.separator();
             ui.add(
                 egui::Slider::new(&mut model.preferences.ui_scale, 0.85..=1.35).text("UI scale"),
             );
@@ -231,7 +261,7 @@ pub fn show_settings(
             ui.separator();
             ui.colored_label(
                 theme::TEXT_SECONDARY,
-                "Endpoints must be Venue Control API endpoints, never exchange endpoints.",
+                "The configurable URL above is only for Venue Control; local public market endpoints are fixed in native code.",
             );
         });
 }
@@ -261,7 +291,11 @@ fn connection_badge(ui: &mut egui::Ui, state: ConnectionState) {
 }
 
 fn show_market_watch(ui: &mut egui::Ui, model: &mut AppModel) {
-    pane_heading(ui, "Markets", "normalized Control API projections");
+    pane_heading(
+        ui,
+        "Markets",
+        "Control discovery · Binance local execution prices",
+    );
     let rows = model
         .snapshot
         .as_ref()
@@ -298,7 +332,33 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &AppModel) {
         .symbol
         .as_deref()
         .unwrap_or(&model.preferences.selected_symbol);
-    pane_heading(ui, symbol, "candles and server-computed indicators");
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(local) = local_market(model, symbol, pane.interval) {
+        pane_heading(ui, symbol, "DATA=BINANCE LIVE · local public REST/WS");
+        ui.horizontal_wrapped(|ui| {
+            local_status_label(ui, local.status);
+            if let Some(last) = local.last {
+                ui.label(format!("Last {}", format_decimal(last, 4)));
+            }
+            if let Some(bid) = local.bid {
+                ui.label(format!("Bid {}", format_decimal(bid, 4)));
+            }
+            if let Some(ask) = local.ask {
+                ui.label(format!("Ask {}", format_decimal(ask, 4)));
+            }
+            ui.colored_label(
+                theme::TEXT_SECONDARY,
+                format!("latency {} ms", local.latency_ms.unwrap_or_default()),
+            );
+            if let Some(detail) = &local.status_detail {
+                ui.colored_label(theme::WARNING, detail);
+            }
+        });
+        show_chart_toolbar(ui, pane);
+        candle_plot(ui, &local.bars, &mut pane.viewport);
+        return;
+    }
+    pane_heading(ui, symbol, "Control projection fallback");
     let Some(market) = market(model, symbol) else {
         empty(ui, "No market projection is available for this symbol.");
         return;
@@ -318,29 +378,50 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &AppModel) {
             ));
         }
     });
-    pane.visible_bars = pane.visible_bars.clamp(20, 400);
-    let wheel = ui.input(|input| input.smooth_scroll_delta.y);
-    if wheel.abs() > f32::EPSILON && ui.rect_contains_pointer(ui.max_rect()) {
-        let step = if wheel > 0.0 { -10 } else { 10 };
-        pane.visible_bars = pane.visible_bars.saturating_add_signed(step).clamp(20, 400);
-    }
-    candle_plot(ui, market, pane.visible_bars);
+    show_chart_toolbar(ui, pane);
+    candle_plot(ui, &market.bars, &mut pane.viewport);
 }
 
-fn candle_plot(ui: &mut egui::Ui, market: &MarketSummary, visible_bars: usize) {
+fn show_chart_toolbar(ui: &mut egui::Ui, pane: &mut Pane) {
+    ui.horizontal(|ui| {
+        for interval in crate::chart::ChartInterval::ALL {
+            if ui
+                .selectable_label(pane.interval == interval, interval.label())
+                .clicked()
+            {
+                pane.interval = interval;
+                pane.viewport.reset();
+            }
+        }
+        ui.separator();
+        if ui.small_button("Fit").clicked() {
+            pane.viewport.reset();
+        }
+        if ui.small_button("Follow").clicked() {
+            pane.viewport.follow_latest();
+        }
+        ui.colored_label(
+            theme::TEXT_SECONDARY,
+            format!(
+                "{} bars{}",
+                pane.viewport.visible_bars(),
+                if pane.viewport.right_offset() == 0 {
+                    " · LIVE"
+                } else {
+                    " · HISTORY"
+                }
+            ),
+        );
+    });
+}
+
+fn candle_plot(ui: &mut egui::Ui, all_bars: &[UiBar], viewport: &mut crate::chart::ChartViewport) {
     let height = ui.available_height().max(120.0);
-    let (response, painter) =
-        ui.allocate_painter(egui::vec2(ui.available_width(), height), Sense::hover());
-    let bars = market
-        .bars
-        .iter()
-        .rev()
-        .take(visible_bars)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>();
-    if bars.is_empty() {
+    let (response, painter) = ui.allocate_painter(
+        egui::vec2(ui.available_width(), height),
+        Sense::click_and_drag(),
+    );
+    if all_bars.is_empty() {
         painter.text(
             response.rect.center(),
             Align2::CENTER_CENTER,
@@ -350,27 +431,77 @@ fn candle_plot(ui: &mut egui::Ui, market: &MarketSummary, visible_bars: usize) {
         );
         return;
     }
-    let mut low = f64::INFINITY;
-    let mut high = f64::NEG_INFINITY;
-    for bar in &bars {
-        low = low.min(decimal_to_f64(bar.low));
-        high = high.max(decimal_to_f64(bar.high));
+
+    let plot_rect = response.rect.shrink2(egui::vec2(8.0, 8.0));
+    let pointer_ratio = response.hover_pos().map_or(1.0, |point| {
+        ((point.x - plot_rect.left()) / plot_rect.width()).clamp(0.0, 1.0)
+    });
+    if response.hovered() {
+        let wheel = ui.input(|input| input.smooth_scroll_delta.y);
+        if wheel.abs() > f32::EPSILON {
+            viewport.zoom_by_steps(
+                all_bars.len(),
+                pointer_ratio,
+                if wheel > 0.0 { 1 } else { -1 },
+            );
+        }
     }
-    let span = (high - low).max(f64::EPSILON);
-    let rect = response.rect.shrink2(egui::vec2(8.0, 10.0));
-    let width = rect.width() / bars.len() as f32;
-    let price_y = |price: f64| rect.bottom() - (((price - low) / span) as f32 * rect.height());
+    if response.dragged() {
+        let drag_delta = ui.input(|input| input.pointer.delta().x);
+        viewport.pan_by_drag(all_bars.len(), plot_rect.width(), drag_delta);
+    }
+
+    let range = viewport.visible_range(all_bars.len());
+    let bars = &all_bars[range];
+    let price_rect = Rect::from_min_max(
+        plot_rect.min,
+        Pos2::new(
+            plot_rect.right(),
+            plot_rect.top() + plot_rect.height() * 0.78,
+        ),
+    );
+    let volume_rect = Rect::from_min_max(
+        Pos2::new(plot_rect.left(), price_rect.bottom() + 5.0),
+        plot_rect.max,
+    );
+    let Some(price_range) = PriceRange::from_bars(bars) else {
+        return;
+    };
+    let width = price_rect.width() / bars.len() as f32;
+    let price_y = |price: f64| {
+        price_range
+            .price_to_y(price_rect.top(), price_rect.height(), price)
+            .unwrap_or(price_rect.center().y)
+    };
     for index in 0..=4 {
-        let y = rect.top() + rect.height() * index as f32 / 4.0;
+        let y = price_rect.top() + price_rect.height() * index as f32 / 4.0;
         painter.line_segment(
-            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+            [
+                Pos2::new(price_rect.left(), y),
+                Pos2::new(price_rect.right(), y),
+            ],
             Stroke::new(1.0, Color32::from_rgba_unmultiplied(0x20, 0x35, 0x43, 120)),
         );
+        if let Some(price) = price_range.y_to_price(price_rect.top(), price_rect.height(), y) {
+            painter.text(
+                Pos2::new(price_rect.right() - 3.0, y - 2.0),
+                Align2::RIGHT_BOTTOM,
+                format!("{price:.4}"),
+                FontId::monospace(10.0),
+                theme::TEXT_SECONDARY,
+            );
+        }
     }
+    let maximum_volume = bars
+        .iter()
+        .map(|bar| decimal_to_f64(bar.volume))
+        .fold(0.0_f64, f64::max)
+        .max(f64::EPSILON);
     for (index, bar) in bars.iter().enumerate() {
         let open = decimal_to_f64(bar.open);
         let close = decimal_to_f64(bar.close);
-        let x = rect.left() + (index as f32 + 0.5) * width;
+        let x = bar_center_x(price_rect.left(), price_rect.width(), bars.len(), index)
+            .unwrap_or(price_rect.left());
         let color = if close >= open {
             theme::BUY
         } else {
@@ -390,30 +521,78 @@ fn candle_plot(ui: &mut egui::Ui, market: &MarketSummary, visible_bars: usize) {
             Pos2::new(x + width * 0.31, bottom.max(top + 1.0)),
         );
         painter.rect_filled(body, 0.5, color);
+        let volume_height =
+            (decimal_to_f64(bar.volume) / maximum_volume) as f32 * volume_rect.height();
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(x - width * 0.31, volume_rect.bottom() - volume_height),
+                Pos2::new(x + width * 0.31, volume_rect.bottom()),
+            ),
+            0.5,
+            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 150),
+        );
     }
-    if let Some(pointer) = response.hover_pos().filter(|point| rect.contains(*point)) {
+    if let Some(last) = bars.last() {
+        let y = price_y(decimal_to_f64(last.close));
         painter.line_segment(
             [
-                Pos2::new(pointer.x, rect.top()),
-                Pos2::new(pointer.x, rect.bottom()),
+                Pos2::new(price_rect.left(), y),
+                Pos2::new(price_rect.right(), y),
+            ],
+            Stroke::new(1.0, theme::BRAND_HOVER),
+        );
+    }
+    if let Some(pointer) = response
+        .hover_pos()
+        .filter(|point| plot_rect.contains(*point))
+    {
+        painter.line_segment(
+            [
+                Pos2::new(pointer.x, plot_rect.top()),
+                Pos2::new(pointer.x, plot_rect.bottom()),
             ],
             Stroke::new(1.0, theme::TEXT_SECONDARY),
         );
-        painter.line_segment(
-            [
-                Pos2::new(rect.left(), pointer.y),
-                Pos2::new(rect.right(), pointer.y),
-            ],
-            Stroke::new(1.0, theme::TEXT_SECONDARY),
-        );
-        let price = high - f64::from((pointer.y - rect.top()) / rect.height()) * span;
-        painter.text(
-            Pos2::new(rect.right() - 4.0, pointer.y - 4.0),
-            Align2::RIGHT_BOTTOM,
-            format!("{price:.4}"),
-            FontId::monospace(11.0),
-            theme::TEXT_PRIMARY,
-        );
+        if price_rect.contains(pointer) {
+            painter.line_segment(
+                [
+                    Pos2::new(price_rect.left(), pointer.y),
+                    Pos2::new(price_rect.right(), pointer.y),
+                ],
+                Stroke::new(1.0, theme::TEXT_SECONDARY),
+            );
+            if let Some(price) =
+                price_range.y_to_price(price_rect.top(), price_rect.height(), pointer.y)
+            {
+                painter.text(
+                    Pos2::new(price_rect.right() - 4.0, pointer.y - 4.0),
+                    Align2::RIGHT_BOTTOM,
+                    format!("{price:.4}"),
+                    FontId::monospace(11.0),
+                    theme::TEXT_PRIMARY,
+                );
+            }
+        }
+        if let Some(index) =
+            bar_index_at_x(price_rect.left(), price_rect.width(), bars.len(), pointer.x)
+        {
+            let bar = &bars[index];
+            painter.text(
+                price_rect.left_top() + egui::vec2(6.0, 6.0),
+                Align2::LEFT_TOP,
+                format!(
+                    "{}  O {}  H {}  L {}  C {}  V {}",
+                    bar.open_time_ms,
+                    format_decimal(bar.open, 4),
+                    format_decimal(bar.high, 4),
+                    format_decimal(bar.low, 4),
+                    format_decimal(bar.close, 4),
+                    format_decimal(bar.volume, 3),
+                ),
+                FontId::monospace(11.0),
+                theme::TEXT_PRIMARY,
+            );
+        }
     }
 }
 
@@ -423,11 +602,25 @@ fn show_order_book(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
         .as_deref()
         .unwrap_or(&model.preferences.selected_symbol);
     pane_heading(ui, "Order book", symbol);
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(local) = model.local_markets.view_for_symbol(symbol) {
+        show_book_rows(ui, pane.instance, &local.asks, &local.bids);
+        return;
+    }
     let Some(market) = market(model, symbol) else {
         empty(ui, "No order-book projection.");
         return;
     };
-    egui::Grid::new(format!("book-{}", pane.instance))
+    show_book_rows(ui, pane.instance, &market.asks, &market.bids);
+}
+
+fn show_book_rows(
+    ui: &mut egui::Ui,
+    instance: u32,
+    asks: &[venue_control_protocol::UiBookLevel],
+    bids: &[venue_control_protocol::UiBookLevel],
+) {
+    egui::Grid::new(format!("book-{instance}"))
         .striped(true)
         .num_columns(3)
         .show(ui, |ui| {
@@ -435,13 +628,13 @@ fn show_order_book(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
             ui.strong("Price");
             ui.strong("Quantity");
             ui.end_row();
-            for level in market.asks.iter().rev().take(10) {
+            for level in asks.iter().rev().take(10) {
                 ui.colored_label(theme::SELL, "ASK");
                 ui.monospace(format_decimal(level.price, 4));
                 ui.monospace(format_decimal(level.quantity, 4));
                 ui.end_row();
             }
-            for level in market.bids.iter().take(10) {
+            for level in bids.iter().take(10) {
                 ui.colored_label(theme::BUY, "BID");
                 ui.monospace(format_decimal(level.price, 4));
                 ui.monospace(format_decimal(level.quantity, 4));
@@ -456,19 +649,28 @@ fn show_trade_tape(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
         .as_deref()
         .unwrap_or(&model.preferences.selected_symbol);
     pane_heading(ui, "Trade tape", symbol);
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(local) = model.local_markets.view_for_symbol(symbol) {
+        show_trade_rows(ui, pane.instance, &local.trades);
+        return;
+    }
     let Some(market) = market(model, symbol) else {
         empty(ui, "No trade projection.");
         return;
     };
+    show_trade_rows(ui, pane.instance, &market.trades);
+}
+
+fn show_trade_rows(ui: &mut egui::Ui, instance: u32, trades: &[venue_control_protocol::UiTrade]) {
     egui::ScrollArea::vertical().show(ui, |ui| {
-        egui::Grid::new(format!("tape-{}", pane.instance))
+        egui::Grid::new(format!("tape-{instance}"))
             .striped(true)
             .show(ui, |ui| {
                 ui.strong("Time");
                 ui.strong("Price");
                 ui.strong("Qty");
                 ui.end_row();
-                for trade in market.trades.iter().rev().take(80) {
+                for trade in trades.iter().rev().take(80) {
                     let color = match trade.aggressor {
                         AggressorSide::Buy => theme::BUY,
                         AggressorSide::Sell => theme::SELL,
@@ -851,12 +1053,24 @@ fn show_diagnostics(ui: &mut egui::Ui, model: &AppModel) {
         "Capability evidence freshness: not projected",
     );
     ui.separator();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        ui.strong("Local public market data");
+        ui.label("Venue: Binance USD-M · mode: LIVE · identity: none");
+        ui.label(format!(
+            "Subscriptions: {} · generation: {}",
+            model.local_markets.selections().count(),
+            model.local_markets.generation()
+        ));
+        ui.label("Fixed endpoints: fapi.binance.com + fstream.binance.com");
+        ui.separator();
+    }
     ui.strong("Recent notices");
     for notice in &model.notices {
         ui.small(notice);
     }
     ui.separator();
-    ui.colored_label(theme::TEXT_SECONDARY, "The UI cannot read PostgreSQL, WAL, checkpoints, artifacts, credentials, or exchange-native endpoints.");
+    ui.colored_label(theme::TEXT_SECONDARY, "The native UI may read Binance public market endpoints. It cannot read credentials, private streams, PostgreSQL, WAL, checkpoints, artifacts, or any exchange mutation path.");
 }
 
 fn receipt_state_label(ui: &mut egui::Ui, state: CommandState) {
@@ -885,6 +1099,28 @@ fn market<'a>(model: &'a AppModel, symbol: &str) -> Option<&'a MarketSummary> {
         .markets
         .iter()
         .find(|market| market.symbol.to_string() == symbol)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn local_market<'a>(
+    model: &'a AppModel,
+    symbol: &str,
+    interval: crate::chart::ChartInterval,
+) -> Option<&'a LocalMarketView> {
+    let selection = MarketSelection::binance_usd_m(symbol, interval).ok()?;
+    model.local_markets.view(&selection)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn local_status_label(ui: &mut egui::Ui, status: MarketStatus) {
+    let color = match status {
+        MarketStatus::Live => theme::BUY,
+        MarketStatus::LoadingHistory | MarketStatus::Connecting | MarketStatus::Resyncing => {
+            theme::WARNING
+        }
+        MarketStatus::Stale | MarketStatus::Offline => theme::SELL,
+    };
+    ui.colored_label(color, RichText::new(format!("{status:?}")).strong());
 }
 
 fn pane_heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
