@@ -62,6 +62,7 @@ pub struct Preferences {
     pub show_status_bar: bool,
     pub language: Language,
     pub favorite_symbols: Vec<String>,
+    pub chart: crate::chart_settings::ChartDisplaySettings,
 }
 
 impl Default for Preferences {
@@ -74,6 +75,7 @@ impl Default for Preferences {
             show_status_bar: true,
             language: default_language(),
             favorite_symbols: DEFAULT_FAVORITE_SYMBOLS.map(str::to_owned).to_vec(),
+            chart: crate::chart_settings::ChartDisplaySettings::default(),
         }
     }
 }
@@ -148,11 +150,23 @@ pub struct AppModel {
     pub symbol_filter: String,
     pub symbol_group: SymbolGroup,
     pub follow_latest_requested: bool,
+    pub indicator_settings_requested: bool,
     request_sequence: u64,
 }
 
 impl AppModel {
-    pub fn new(preferences: Preferences) -> Self {
+    pub fn new(mut preferences: Preferences) -> Self {
+        if preferences.chart.validate().is_err() {
+            preferences.chart = crate::chart_settings::ChartDisplaySettings::default();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let local_markets = {
+            let mut store = crate::market::LocalMarketStore::default();
+            let _configuration_is_valid = store
+                .reconfigure_studies(preferences.chart.engine_config())
+                .is_ok();
+            store
+        };
         Self {
             preferences,
             connection: ConnectionState::Connecting,
@@ -168,7 +182,7 @@ impl AppModel {
             receipt_ids: VecDeque::new(),
             notices: VecDeque::new(),
             #[cfg(not(target_arch = "wasm32"))]
-            local_markets: crate::market::LocalMarketStore::default(),
+            local_markets,
             #[cfg(not(target_arch = "wasm32"))]
             local_symbols: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -179,6 +193,7 @@ impl AppModel {
             symbol_filter: String::new(),
             symbol_group: SymbolGroup::All,
             follow_latest_requested: false,
+            indicator_settings_requested: false,
             request_sequence: 0,
         }
     }

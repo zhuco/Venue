@@ -3,6 +3,7 @@ use std::time::Duration;
 use crate::{
     client::{ClientEvent, ControlClient},
     model::{AppModel, Preferences},
+    settings_panel::{self, SettingsPanelState},
     theme, ui,
     workspace::Workspaces,
 };
@@ -43,6 +44,7 @@ pub struct VenueFlowApp {
     market_client: Option<LocalMarketClient>,
     show_modules: bool,
     show_settings: bool,
+    settings_state: SettingsPanelState,
     show_symbol_picker: bool,
     reconnect: bool,
 }
@@ -76,6 +78,7 @@ impl VenueFlowApp {
             market_client,
             show_modules: false,
             show_settings: false,
+            settings_state: SettingsPanelState::default(),
             show_symbol_picker: false,
             reconnect: false,
         }
@@ -224,9 +227,9 @@ impl eframe::App for VenueFlowApp {
             self.drain_local_markets(context);
         }
         context.request_repaint_after(Duration::from_millis(if cfg!(target_arch = "wasm32") {
-            250
+            500
         } else {
-            50
+            250
         }));
     }
 
@@ -260,15 +263,20 @@ impl eframe::App for VenueFlowApp {
             };
             tree.ui(&mut behavior, ui);
         });
+        if std::mem::take(&mut self.model.indicator_settings_requested) {
+            self.show_settings = true;
+            self.settings_state.focus_indicators();
+        }
         if self.model.preferences.show_status_bar {
             ui::show_status_bar(ui, &self.model);
         }
 
         let context = ui.ctx().clone();
         ui::show_confirmation(&context, &mut self.model, &self.client);
-        ui::show_settings(
+        settings_panel::show(
             &context,
             &mut self.show_settings,
+            &mut self.settings_state,
             &mut self.model,
             &mut self.reconnect,
         );

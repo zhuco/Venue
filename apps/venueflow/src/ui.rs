@@ -9,6 +9,7 @@ use venue_control_protocol::{
 use crate::market::{LocalMarketView, MarketSelection, MarketStatus};
 use crate::{
     chart::{ChartStudyPoint, PriceRange, bar_center_x, bar_index_at_x},
+    chart_settings::ChartDisplaySettings,
     client::ControlClient,
     i18n::{Language, TextKey, text},
     model::{
@@ -447,67 +448,6 @@ pub fn show_confirmation(context: &egui::Context, model: &mut AppModel, client: 
     }
 }
 
-pub fn show_settings(
-    context: &egui::Context,
-    open: &mut bool,
-    model: &mut AppModel,
-    reconnect: &mut bool,
-) {
-    let language = model.preferences.language;
-    egui::Window::new(text(language, TextKey::SettingsTitle))
-        .open(open)
-        .resizable(false)
-        .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .show(context, |ui| {
-            ui.label(text(language, TextKey::Language));
-            egui::ComboBox::from_id_salt("venueflow-language")
-                .selected_text(model.preferences.language.label())
-                .show_ui(ui, |ui| {
-                    for option in Language::ALL {
-                        ui.selectable_value(
-                            &mut model.preferences.language,
-                            option,
-                            option.label(),
-                        );
-                    }
-                });
-            ui.separator();
-            let language = model.preferences.language;
-            ui.label(text(language, TextKey::ControlUrl));
-            ui.text_edit_singleline(&mut model.preferences.endpoint);
-            ui.small(text(language, TextKey::WebSameOrigin));
-            if ui.button(text(language, TextKey::Reconnect)).clicked() {
-                *reconnect = true;
-            }
-            ui.separator();
-            ui.label(text(language, TextKey::LocalSymbol));
-            if ui
-                .text_edit_singleline(&mut model.preferences.selected_symbol)
-                .changed()
-            {
-                model.follow_latest_requested = true;
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            ui.small(text(language, TextKey::NativePublicOnly));
-            #[cfg(target_arch = "wasm32")]
-            ui.small(text(language, TextKey::WebControlOnly));
-            ui.separator();
-            ui.add(
-                egui::Slider::new(&mut model.preferences.ui_scale, 0.85..=1.35)
-                    .text(text(language, TextKey::UiScale)),
-            );
-            ui.checkbox(
-                &mut model.preferences.show_status_bar,
-                text(language, TextKey::ShowStatus),
-            );
-            ui.separator();
-            ui.colored_label(
-                theme::TEXT_SECONDARY,
-                text(language, TextKey::FixedEndpointHint),
-            );
-        });
-}
-
 pub fn show_modules(
     context: &egui::Context,
     open: &mut bool,
@@ -602,7 +542,7 @@ fn show_market_watch(ui: &mut egui::Ui, model: &mut AppModel) {
     });
 }
 
-fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &AppModel) {
+fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
     let language = model.preferences.language;
     let symbol = pane
         .symbol
@@ -646,13 +586,31 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &AppModel) {
             ui.strong(text(language, TextKey::Indicators));
             if let Some(study) = local.studies.last() {
                 let state = if study.confirmed { "closed" } else { "forming" };
-                ui.colored_label(theme::TEXT_SECONDARY, format!("7 studies · {state}"));
+                ui.colored_label(
+                    theme::TEXT_SECONDARY,
+                    format!(
+                        "{} studies · {state}",
+                        model.preferences.chart.enabled_study_count()
+                    ),
+                );
                 for (name, value) in [
-                    ("SMA20", study.sma),
-                    ("EMA20", study.ema),
-                    ("VWAP", study.vwap),
-                    ("RSI14", study.rsi),
-                    ("ATR14", study.atr),
+                    (
+                        format!("SMA{}", model.preferences.chart.sma_period),
+                        study.sma,
+                    ),
+                    (
+                        format!("EMA{}", model.preferences.chart.ema_period),
+                        study.ema,
+                    ),
+                    ("VWAP".to_owned(), study.vwap),
+                    (
+                        format!("RSI{}", model.preferences.chart.rsi_period),
+                        study.rsi,
+                    ),
+                    (
+                        format!("ATR{}", model.preferences.chart.atr_period),
+                        study.atr,
+                    ),
                 ] {
                     if let Some(value) = value {
                         ui.monospace(format!("{name} {}", format_decimal(value, 4)));
@@ -662,14 +620,18 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &AppModel) {
                 ui.colored_label(theme::TEXT_SECONDARY, "warming up");
             }
         });
-        show_chart_toolbar(ui, pane, language);
+        let settings_requested = show_chart_toolbar(ui, pane, language);
         candle_plot(
             ui,
             &local.bars,
             &local.studies,
             &mut pane.viewport,
             language,
+            &model.preferences.chart,
         );
+        if settings_requested {
+            model.indicator_settings_requested = true;
+        }
         return;
     }
     pane_heading(ui, symbol, text(language, TextKey::ControlFallback));
@@ -692,12 +654,30 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &AppModel) {
             ));
         }
     });
-    show_chart_toolbar(ui, pane, language);
-    candle_plot(ui, &market.bars, &[], &mut pane.viewport, language);
+    let settings_requested = show_chart_toolbar(ui, pane, language);
+    candle_plot(
+        ui,
+        &market.bars,
+        &[],
+        &mut pane.viewport,
+        language,
+        &model.preferences.chart,
+    );
+    if settings_requested {
+        model.indicator_settings_requested = true;
+    }
 }
 
-fn show_chart_toolbar(ui: &mut egui::Ui, pane: &mut Pane, language: Language) {
+fn show_chart_toolbar(ui: &mut egui::Ui, pane: &mut Pane, language: Language) -> bool {
+    let mut settings_requested = false;
     ui.horizontal(|ui| {
+        if ui
+            .button(format!("⚙ {}", text(language, TextKey::Indicators)))
+            .clicked()
+        {
+            settings_requested = true;
+        }
+        ui.separator();
         for interval in crate::chart::ChartInterval::ALL {
             if ui
                 .selectable_label(pane.interval == interval, interval.label())
@@ -728,6 +708,7 @@ fn show_chart_toolbar(ui: &mut egui::Ui, pane: &mut Pane, language: Language) {
             ),
         );
     });
+    settings_requested
 }
 
 fn candle_plot(
@@ -736,6 +717,7 @@ fn candle_plot(
     all_studies: &[ChartStudyPoint],
     viewport: &mut crate::chart::ChartViewport,
     language: Language,
+    settings: &ChartDisplaySettings,
 ) {
     let height = ui.available_height().max(120.0);
     let (response, painter) = ui.allocate_painter(
@@ -768,17 +750,31 @@ fn candle_plot(
         }
     }
     if response.dragged() {
-        let drag_delta = ui.input(|input| input.pointer.delta().x);
-        viewport.pan_by_drag(all_bars.len(), plot_rect.width(), drag_delta);
+        viewport.pan_by_drag_total(all_bars.len(), plot_rect.width(), response.drag_delta().x);
     }
     if response.drag_stopped() {
+        viewport.pan_by_drag_total(all_bars.len(), plot_rect.width(), response.drag_delta().x);
         viewport.finish_drag();
     }
 
     let range = viewport.visible_range(all_bars.len());
     let bars = &all_bars[range];
     let has_local_studies = !all_studies.is_empty();
-    let price_ratio = if has_local_studies { 0.58 } else { 0.78 };
+    let sub_count = if has_local_studies {
+        [
+            settings.rsi.enabled,
+            settings.macd.enabled,
+            settings.atr.enabled,
+        ]
+        .into_iter()
+        .filter(|enabled| *enabled)
+        .count()
+    } else {
+        0
+    };
+    let volume_ratio = if settings.show_volume { 0.12 } else { 0.0 };
+    let sub_ratio = 0.145 * sub_count as f32;
+    let price_ratio = (1.0 - volume_ratio - sub_ratio).clamp(0.42, 0.86);
     let price_rect = Rect::from_min_max(
         plot_rect.min,
         Pos2::new(
@@ -786,35 +782,35 @@ fn candle_plot(
             plot_rect.top() + plot_rect.height() * price_ratio,
         ),
     );
-    let volume_rect = Rect::from_min_max(
-        Pos2::new(plot_rect.left(), price_rect.bottom() + 5.0),
-        Pos2::new(
-            plot_rect.right(),
-            if has_local_studies {
-                plot_rect.top() + plot_rect.height() * 0.70
-            } else {
-                plot_rect.bottom()
-            },
-        ),
-    );
-    let rsi_rect = has_local_studies.then(|| {
-        Rect::from_min_max(
-            Pos2::new(plot_rect.left(), volume_rect.bottom() + 5.0),
+    let mut cursor = price_rect.bottom() + 4.0;
+    let volume_rect = settings.show_volume.then(|| {
+        let rect = Rect::from_min_max(
+            Pos2::new(plot_rect.left(), cursor),
             Pos2::new(
                 plot_rect.right(),
-                plot_rect.top() + plot_rect.height() * 0.84,
+                cursor + plot_rect.height() * volume_ratio - 4.0,
             ),
-        )
+        );
+        cursor = rect.bottom() + 4.0;
+        rect
     });
-    let macd_rect = has_local_studies.then(|| {
-        Rect::from_min_max(
-            Pos2::new(
-                plot_rect.left(),
-                plot_rect.top() + plot_rect.height() * 0.85,
-            ),
-            plot_rect.max,
-        )
-    });
+    let sub_height = if sub_count == 0 {
+        0.0
+    } else {
+        (plot_rect.bottom() - cursor - 4.0 * (sub_count.saturating_sub(1)) as f32)
+            / sub_count as f32
+    };
+    let mut next_sub_rect = || {
+        let rect = Rect::from_min_max(
+            Pos2::new(plot_rect.left(), cursor),
+            Pos2::new(plot_rect.right(), cursor + sub_height),
+        );
+        cursor = rect.bottom() + 4.0;
+        rect
+    };
+    let rsi_rect = (has_local_studies && settings.rsi.enabled).then(&mut next_sub_rect);
+    let macd_rect = (has_local_studies && settings.macd.enabled).then(&mut next_sub_rect);
+    let atr_rect = (has_local_studies && settings.atr.enabled).then(&mut next_sub_rect);
     let Some(price_range) = PriceRange::from_bars(bars) else {
         return;
     };
@@ -838,7 +834,7 @@ fn candle_plot(
                 Pos2::new(price_rect.right() - 3.0, y - 2.0),
                 Align2::RIGHT_BOTTOM,
                 format!("{price:.4}"),
-                FontId::monospace(10.0),
+                FontId::monospace(f32::from(settings.chart_text_size)),
                 theme::TEXT_SECONDARY,
             );
         }
@@ -883,24 +879,29 @@ fn candle_plot(
             Pos2::new(x + width * 0.31, bottom.max(top + 1.0)),
         );
         painter.rect_filled(body, 0.5, color);
-        let volume_height =
-            (decimal_to_f64(bar.volume) / maximum_volume) as f32 * volume_rect.height();
-        painter.rect_filled(
-            Rect::from_min_max(
-                Pos2::new(x - width * 0.31, volume_rect.bottom() - volume_height),
-                Pos2::new(x + width * 0.31, volume_rect.bottom()),
-            ),
-            0.5,
-            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 150),
-        );
+        if let Some(volume_rect) = volume_rect {
+            let volume_height =
+                (decimal_to_f64(bar.volume) / maximum_volume) as f32 * volume_rect.height();
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(x - width * 0.31, volume_rect.bottom() - volume_height),
+                    Pos2::new(x + width * 0.31, volume_rect.bottom()),
+                ),
+                0.5,
+                Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 150),
+            );
+        }
     }
     if has_local_studies {
-        draw_price_studies(&painter, price_rect, bars, all_studies, price_y);
+        draw_price_studies(&painter, price_rect, bars, all_studies, price_y, settings);
         if let Some(rect) = rsi_rect {
-            draw_rsi_study(&painter, rect, bars, all_studies);
+            draw_rsi_study(&painter, rect, bars, all_studies, settings);
         }
         if let Some(rect) = macd_rect {
-            draw_macd_study(&painter, rect, bars, all_studies);
+            draw_macd_study(&painter, rect, bars, all_studies, settings);
+        }
+        if let Some(rect) = atr_rect {
+            draw_atr_study(&painter, rect, bars, all_studies, settings);
         }
     }
     if let Some(last) = bars.last() {
@@ -939,7 +940,7 @@ fn candle_plot(
                     Pos2::new(price_rect.right() - 4.0, pointer.y - 4.0),
                     Align2::RIGHT_BOTTOM,
                     format!("{price:.4}"),
-                    FontId::monospace(11.0),
+                    FontId::monospace(f32::from(settings.chart_text_size)),
                     theme::TEXT_PRIMARY,
                 );
             }
@@ -960,7 +961,7 @@ fn candle_plot(
                     format_decimal(bar.close, 4),
                     format_decimal(bar.volume, 3),
                 ),
-                FontId::monospace(11.0),
+                FontId::monospace(f32::from(settings.chart_text_size)),
                 theme::TEXT_PRIMARY,
             );
         }
@@ -973,51 +974,78 @@ fn draw_price_studies(
     bars: &[UiBar],
     studies: &[ChartStudyPoint],
     price_y: impl Fn(f64) -> f32 + Copy,
+    settings: &ChartDisplaySettings,
 ) {
-    draw_study_line(
-        painter,
-        rect,
-        bars,
-        studies,
-        |point| point.sma,
-        price_y,
-        Color32::from_rgb(255, 196, 80),
-    );
-    draw_study_line(
-        painter,
-        rect,
-        bars,
-        studies,
-        |point| point.ema,
-        price_y,
-        Color32::from_rgb(68, 215, 160),
-    );
-    for (selector, color) in [
-        (
-            (|point: &ChartStudyPoint| point.bollinger_upper)
-                as fn(&ChartStudyPoint) -> Option<rust_decimal::Decimal>,
-            Color32::from_rgb(116, 147, 255),
-        ),
-        (
-            |point: &ChartStudyPoint| point.bollinger_middle,
-            Color32::from_rgb(95, 118, 205),
-        ),
-        (
-            |point: &ChartStudyPoint| point.bollinger_lower,
-            Color32::from_rgb(116, 147, 255),
-        ),
-        (
-            |point: &ChartStudyPoint| point.vwap,
-            Color32::from_rgb(225, 118, 255),
-        ),
-    ] {
-        draw_study_line(painter, rect, bars, studies, selector, price_y, color);
+    if settings.sma.enabled {
+        draw_study_line(
+            painter,
+            rect,
+            bars,
+            studies,
+            |p| p.sma,
+            price_y,
+            Stroke::new(settings.sma.line_width(), settings.sma.color()),
+        );
+    }
+    if settings.ema.enabled {
+        draw_study_line(
+            painter,
+            rect,
+            bars,
+            studies,
+            |p| p.ema,
+            price_y,
+            Stroke::new(settings.ema.line_width(), settings.ema.color()),
+        );
+    }
+    if settings.bollinger.enabled {
+        for (selector, color) in [
+            (
+                (|p: &ChartStudyPoint| p.bollinger_upper) as fn(&ChartStudyPoint) -> _,
+                settings.bollinger.color(),
+            ),
+            (
+                |p: &ChartStudyPoint| p.bollinger_middle,
+                settings.bollinger.secondary_color(),
+            ),
+            (
+                |p: &ChartStudyPoint| p.bollinger_lower,
+                settings.bollinger.color(),
+            ),
+        ] {
+            draw_study_line(
+                painter,
+                rect,
+                bars,
+                studies,
+                selector,
+                price_y,
+                Stroke::new(settings.bollinger.line_width(), color),
+            );
+        }
+    }
+    if settings.vwap.enabled {
+        draw_study_line(
+            painter,
+            rect,
+            bars,
+            studies,
+            |p| p.vwap,
+            price_y,
+            Stroke::new(settings.vwap.line_width(), settings.vwap.color()),
+        );
     }
     painter.text(
         rect.left_top() + egui::vec2(6.0, 22.0),
         Align2::LEFT_TOP,
-        "SMA20  EMA20  BOLL20,2  VWAP",
-        FontId::monospace(10.0),
+        format!(
+            "SMA{}  EMA{}  BOLL{},{}  VWAP",
+            settings.sma_period,
+            settings.ema_period,
+            settings.bollinger_period,
+            settings.bollinger_multiplier_hundredths as f32 / 100.0
+        ),
+        FontId::monospace(f32::from(settings.chart_text_size)),
         theme::TEXT_SECONDARY,
     );
 }
@@ -1029,7 +1057,7 @@ fn draw_study_line(
     studies: &[ChartStudyPoint],
     selector: fn(&ChartStudyPoint) -> Option<rust_decimal::Decimal>,
     value_y: impl Fn(f64) -> f32,
-    color: Color32,
+    stroke: Stroke,
 ) {
     let mut previous = None;
     for (index, bar) in bars.iter().enumerate() {
@@ -1040,7 +1068,7 @@ fn draw_study_line(
                     .map(|x| Pos2::new(x, value_y(decimal_to_f64(value))))
             });
         if let (Some(left), Some(right)) = (previous, current) {
-            painter.line_segment([left, right], Stroke::new(1.25, color));
+            painter.line_segment([left, right], stroke);
         }
         previous = current;
     }
@@ -1051,6 +1079,7 @@ fn draw_rsi_study(
     rect: Rect,
     bars: &[UiBar],
     studies: &[ChartStudyPoint],
+    settings: &ChartDisplaySettings,
 ) {
     let y = |value: f64| rect.bottom() - (value.clamp(0.0, 100.0) as f32 / 100.0) * rect.height();
     for level in [30.0, 50.0, 70.0] {
@@ -1074,13 +1103,13 @@ fn draw_rsi_study(
         studies,
         |point| point.rsi,
         y,
-        Color32::from_rgb(193, 113, 255),
+        Stroke::new(settings.rsi.line_width(), settings.rsi.color()),
     );
     painter.text(
         rect.left_top() + egui::vec2(4.0, 2.0),
         Align2::LEFT_TOP,
-        "RSI 14",
-        FontId::monospace(10.0),
+        format!("RSI {}", settings.rsi_period),
+        FontId::monospace(f32::from(settings.chart_text_size)),
         theme::TEXT_SECONDARY,
     );
 }
@@ -1090,6 +1119,7 @@ fn draw_macd_study(
     rect: Rect,
     bars: &[UiBar],
     studies: &[ChartStudyPoint],
+    settings: &ChartDisplaySettings,
 ) {
     let maximum = bars
         .iter()
@@ -1139,7 +1169,7 @@ fn draw_macd_study(
         studies,
         |point| point.macd,
         y,
-        Color32::from_rgb(255, 196, 80),
+        Stroke::new(settings.macd.line_width(), settings.macd.color()),
     );
     draw_study_line(
         painter,
@@ -1148,13 +1178,48 @@ fn draw_macd_study(
         studies,
         |point| point.macd_signal,
         y,
-        Color32::from_rgb(68, 215, 160),
+        Stroke::new(settings.macd.line_width(), settings.macd.secondary_color()),
     );
     painter.text(
         rect.left_top() + egui::vec2(4.0, 2.0),
         Align2::LEFT_TOP,
-        "MACD 12,26,9",
-        FontId::monospace(10.0),
+        format!(
+            "MACD {},{},{}",
+            settings.macd_fast_period, settings.macd_slow_period, settings.macd_signal_period
+        ),
+        FontId::monospace(f32::from(settings.chart_text_size)),
+        theme::TEXT_SECONDARY,
+    );
+}
+
+fn draw_atr_study(
+    painter: &egui::Painter,
+    rect: Rect,
+    bars: &[UiBar],
+    studies: &[ChartStudyPoint],
+    settings: &ChartDisplaySettings,
+) {
+    let maximum = bars
+        .iter()
+        .filter_map(|bar| study_at(studies, bar.open_time_ms).and_then(|point| point.atr))
+        .map(decimal_to_f64)
+        .fold(0.0_f64, f64::max)
+        .max(f64::EPSILON);
+    let y = |value: f64| rect.bottom() - (value / maximum) as f32 * rect.height() * 0.82;
+    draw_study_line(
+        painter,
+        rect,
+        bars,
+        studies,
+        |point| point.atr,
+        y,
+        Stroke::new(settings.atr.line_width(), settings.atr.color()),
+    );
+    painter.text(
+        rect.left_top() + egui::vec2(4.0, 2.0),
+        Align2::LEFT_TOP,
+        format!("ATR {}", settings.atr_period),
+        FontId::monospace(f32::from(settings.chart_text_size)),
         theme::TEXT_SECONDARY,
     );
 }

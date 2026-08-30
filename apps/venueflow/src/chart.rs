@@ -83,6 +83,8 @@ pub struct ChartViewport {
     right_offset: usize,
     #[serde(skip)]
     drag_remainder_milli_bars: i32,
+    #[serde(skip)]
+    drag_applied_milli_pixels: i32,
 }
 
 impl Default for ChartViewport {
@@ -91,6 +93,7 @@ impl Default for ChartViewport {
             visible_bars: DEFAULT_VISIBLE_BARS,
             right_offset: 0,
             drag_remainder_milli_bars: 0,
+            drag_applied_milli_pixels: 0,
         }
     }
 }
@@ -108,11 +111,13 @@ impl ChartViewport {
         self.visible_bars = DEFAULT_VISIBLE_BARS;
         self.right_offset = 0;
         self.drag_remainder_milli_bars = 0;
+        self.drag_applied_milli_pixels = 0;
     }
 
     pub fn follow_latest(&mut self) {
         self.right_offset = 0;
         self.drag_remainder_milli_bars = 0;
+        self.drag_applied_milli_pixels = 0;
     }
 
     pub fn visible_range(&mut self, total_bars: usize) -> Range<usize> {
@@ -165,8 +170,20 @@ impl ChartViewport {
         }
     }
 
+    /// Applies the cumulative drag reported by the UI without counting earlier frames twice.
+    pub fn pan_by_drag_total(&mut self, total_bars: usize, chart_width: f32, drag_total_x: f32) {
+        if !drag_total_x.is_finite() {
+            return;
+        }
+        let total_milli_pixels = (drag_total_x * 1_000.0).round() as i32;
+        let delta_milli_pixels = total_milli_pixels.saturating_sub(self.drag_applied_milli_pixels);
+        self.drag_applied_milli_pixels = total_milli_pixels;
+        self.pan_by_drag(total_bars, chart_width, delta_milli_pixels as f32 / 1_000.0);
+    }
+
     pub fn finish_drag(&mut self) {
         self.drag_remainder_milli_bars = 0;
+        self.drag_applied_milli_pixels = 0;
     }
 
     /// Changes the visible count while retaining the bar under `anchor_ratio` in the same place.
@@ -388,6 +405,17 @@ mod tests {
         viewport.finish_drag();
         viewport.pan_by_drag(500, 1_200.0, -2.0);
         assert_eq!(viewport.right_offset(), 1);
+    }
+
+    #[test]
+    fn cumulative_drag_is_applied_once_across_multiple_frames() {
+        let mut viewport = ChartViewport::default();
+        viewport.pan_by_drag_total(500, 1_200.0, -60.0);
+        viewport.pan_by_drag_total(500, 1_200.0, -120.0);
+        assert_eq!(viewport.right_offset(), 12);
+        viewport.finish_drag();
+        viewport.pan_by_drag_total(500, 1_200.0, -120.0);
+        assert_eq!(viewport.right_offset(), 24);
     }
 
     #[test]

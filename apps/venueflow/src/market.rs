@@ -6,7 +6,9 @@ use thiserror::Error;
 use venue_control_protocol::{UiBar, UiBookLevel, UiTrade};
 use venue_domain::{FieldState, PublicBar};
 use venue_gateway_api::PublicMarketBinding;
-use venue_indicators::chart::{ChartIndicatorError, ChartStudyEngine, ChartStudyValues};
+use venue_indicators::chart::{
+    ChartIndicatorError, ChartStudyConfig, ChartStudyEngine, ChartStudyValues,
+};
 
 use crate::chart::{ChartInterval, ChartStudyPoint};
 
@@ -136,17 +138,19 @@ pub struct LocalMarketReducer {
     closed_bars: BTreeSet<u64>,
     closed_facts: BTreeMap<u64, PublicBar>,
     studies: ChartStudyEngine,
+    study_config: ChartStudyConfig,
 }
 
 impl LocalMarketReducer {
     #[cfg(test)]
     pub fn new(selection: MarketSelection) -> Result<Self, LocalMarketError> {
-        Self::new_at_generation(selection, 1)
+        Self::new_at_generation(selection, 1, ChartStudyConfig::default())
     }
 
     fn new_at_generation(
         selection: MarketSelection,
         generation: u64,
+        study_config: ChartStudyConfig,
     ) -> Result<Self, LocalMarketError> {
         selection.validate()?;
         if generation == 0 {
@@ -156,7 +160,9 @@ impl LocalMarketReducer {
             view: LocalMarketView::empty(generation, selection),
             closed_bars: BTreeSet::new(),
             closed_facts: BTreeMap::new(),
-            studies: ChartStudyEngine::standard().map_err(LocalMarketError::Indicator)?,
+            studies: ChartStudyEngine::with_config(&study_config)
+                .map_err(LocalMarketError::Indicator)?,
+            study_config,
         })
     }
 
@@ -322,7 +328,8 @@ impl LocalMarketReducer {
     }
 
     fn rebuild_studies_and_bars(&mut self) -> Result<(), LocalMarketError> {
-        self.studies.reset();
+        self.studies = ChartStudyEngine::with_config(&self.study_config)
+            .map_err(LocalMarketError::Indicator)?;
         self.view.studies.clear();
         self.view.bars.clear();
         self.closed_bars.clear();
@@ -344,6 +351,20 @@ impl LocalMarketReducer {
         trim_bars(&mut self.view.bars, &mut self.closed_bars);
         trim_studies(&mut self.view.studies);
         Ok(())
+    }
+
+    fn reconfigure_studies(
+        &mut self,
+        study_config: ChartStudyConfig,
+    ) -> Result<(), LocalMarketError> {
+        if self.study_config == study_config {
+            return Ok(());
+        }
+        study_config
+            .validate()
+            .map_err(LocalMarketError::Indicator)?;
+        self.study_config = study_config;
+        self.rebuild_studies_and_bars()
     }
 
     fn apply_bbo(&mut self, bid: Decimal, ask: Decimal) -> Result<(), LocalMarketError> {
@@ -410,6 +431,7 @@ impl LocalMarketReducer {
 pub struct LocalMarketStore {
     generation: u64,
     reducers: BTreeMap<MarketSelection, LocalMarketReducer>,
+    study_config: ChartStudyConfig,
 }
 
 impl LocalMarketStore {
@@ -435,7 +457,11 @@ impl LocalMarketStore {
             .ok_or(LocalMarketError::GenerationExhausted)?;
         let mut reducers = BTreeMap::new();
         for selection in unique {
-            let reducer = LocalMarketReducer::new_at_generation(selection.clone(), generation)?;
+            let reducer = LocalMarketReducer::new_at_generation(
+                selection.clone(),
+                generation,
+                self.study_config.clone(),
+            )?;
             reducers.insert(selection, reducer);
         }
         self.generation = generation;
@@ -472,6 +498,23 @@ impl LocalMarketStore {
         for reducer in self.reducers.values_mut() {
             reducer.refresh_staleness(now_ms, stale_after_ms);
         }
+    }
+
+    pub fn reconfigure_studies(
+        &mut self,
+        study_config: ChartStudyConfig,
+    ) -> Result<(), LocalMarketError> {
+        study_config
+            .validate()
+            .map_err(LocalMarketError::Indicator)?;
+        if self.study_config == study_config {
+            return Ok(());
+        }
+        for reducer in self.reducers.values_mut() {
+            reducer.reconfigure_studies(study_config.clone())?;
+        }
+        self.study_config = study_config;
+        Ok(())
     }
 }
 
@@ -785,6 +828,42 @@ mod tests {
         assert_eq!(reducer.view().bars[0].open_time_ms, 60_000);
         assert_eq!(reducer.view().bars[1].close, Decimal::new(13, 0));
         assert_eq!(reducer.view().last, Some(Decimal::new(13, 0)));
+        Ok(())
+    }
+
+    #[test]
+    fn indicator_reconfiguration_rebuilds_closed_history_without_resubscribing()
+    -> Result<(), LocalMarketError> {
+        let mut reducer = LocalMarketReducer::new(selection("BTC/USDT")?)?;
+        let bars = (1_u64..=5)
+            .map(|index| study_bar(index * 60_000, 100 + index as i64))
+            .collect::<Result<Vec<_>, _>>()?;
+        let history = envelope(&reducer, 360_000, MarketPayload::RestHistory { bars });
+        reducer.apply(history)?;
+        let generation = reducer.view().generation;
+        assert!(
+            reducer
+                .view()
+                .studies
+                .last()
+                .is_some_and(|point| point.sma.is_none())
+        );
+
+        let configuration = ChartStudyConfig {
+            sma_period: 2,
+            ..ChartStudyConfig::default()
+        };
+        reducer.reconfigure_studies(configuration)?;
+
+        assert_eq!(reducer.view().generation, generation);
+        assert_eq!(reducer.view().bars.len(), 5);
+        assert!(
+            reducer
+                .view()
+                .studies
+                .last()
+                .is_some_and(|point| point.sma.is_some())
+        );
         Ok(())
     }
 

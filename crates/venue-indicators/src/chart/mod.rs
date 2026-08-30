@@ -10,6 +10,7 @@ mod volatility;
 mod volume;
 
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use venue_domain::{PublicBar, Symbol};
 
 pub use momentum::{Macd, MacdValue, Rsi};
@@ -48,6 +49,62 @@ pub struct ChartStudyValues {
     pub atr: Option<Decimal>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChartStudyConfig {
+    pub sma_period: usize,
+    pub ema_period: usize,
+    pub bollinger_period: usize,
+    pub bollinger_multiplier: Decimal,
+    pub rsi_period: usize,
+    pub macd_fast_period: usize,
+    pub macd_slow_period: usize,
+    pub macd_signal_period: usize,
+    pub atr_period: usize,
+}
+
+impl Default for ChartStudyConfig {
+    fn default() -> Self {
+        Self {
+            sma_period: 20,
+            ema_period: 20,
+            bollinger_period: 20,
+            bollinger_multiplier: Decimal::from(2),
+            rsi_period: 14,
+            macd_fast_period: 12,
+            macd_slow_period: 26,
+            macd_signal_period: 9,
+            atr_period: 14,
+        }
+    }
+}
+
+impl ChartStudyConfig {
+    pub fn validate(&self) -> Result<(), ChartIndicatorError> {
+        const MAX_PERIOD: usize = 100_000;
+        let periods = [
+            self.sma_period,
+            self.ema_period,
+            self.bollinger_period,
+            self.rsi_period,
+            self.macd_fast_period,
+            self.macd_slow_period,
+            self.macd_signal_period,
+            self.atr_period,
+        ];
+        if periods
+            .iter()
+            .any(|period| *period == 0 || *period > MAX_PERIOD)
+            || self.macd_fast_period >= self.macd_slow_period
+            || self.bollinger_multiplier <= Decimal::ZERO
+            || self.bollinger_multiplier > Decimal::from(1_000)
+        {
+            return Err(ChartIndicatorError::InvalidParameters);
+        }
+        Ok(())
+    }
+}
+
 /// Fixed first-batch study set used by the chart and future explicit adapters.
 #[derive(Clone, Debug)]
 pub struct ChartStudyEngine {
@@ -71,16 +128,25 @@ struct ChartScope {
 
 impl ChartStudyEngine {
     pub fn standard() -> Result<Self, ChartIndicatorError> {
+        Self::with_config(&ChartStudyConfig::default())
+    }
+
+    pub fn with_config(config: &ChartStudyConfig) -> Result<Self, ChartIndicatorError> {
+        config.validate()?;
         Ok(Self {
             scope: None,
             last_close_time_ms: None,
-            sma: Sma::new(20)?,
-            ema: Ema::new(20)?,
-            bollinger: BollingerBands::new(20, Decimal::from(2))?,
+            sma: Sma::new(config.sma_period)?,
+            ema: Ema::new(config.ema_period)?,
+            bollinger: BollingerBands::new(config.bollinger_period, config.bollinger_multiplier)?,
             vwap: Vwap::new()?,
-            rsi: Rsi::new(14)?,
-            macd: Macd::new(12, 26, 9)?,
-            atr: Atr::new(14)?,
+            rsi: Rsi::new(config.rsi_period)?,
+            macd: Macd::new(
+                config.macd_fast_period,
+                config.macd_slow_period,
+                config.macd_signal_period,
+            )?,
+            atr: Atr::new(config.atr_period)?,
         })
     }
 
@@ -184,7 +250,7 @@ mod tests {
     use rust_decimal::Decimal;
     use venue_domain::{FieldState, Price, PublicBar};
 
-    use super::{ChartIndicatorError, ChartStudyEngine};
+    use super::{ChartIndicatorError, ChartStudyConfig, ChartStudyEngine};
 
     fn bar(sequence: u64) -> Result<PublicBar, Box<dyn std::error::Error>> {
         let open_time_ms = sequence * 60_000;
@@ -243,5 +309,25 @@ mod tests {
         engine.reset();
         assert!(engine.ingest_closed(&next_generation).is_ok());
         Ok(())
+    }
+
+    #[test]
+    fn configurable_engine_rejects_ambiguous_periods() {
+        let config = ChartStudyConfig {
+            macd_fast_period: 26,
+            ..ChartStudyConfig::default()
+        };
+        assert_eq!(
+            ChartStudyEngine::with_config(&config).map(|_| ()),
+            Err(ChartIndicatorError::InvalidParameters)
+        );
+        let config = ChartStudyConfig {
+            sma_period: 0,
+            ..ChartStudyConfig::default()
+        };
+        assert_eq!(
+            ChartStudyEngine::with_config(&config).map(|_| ()),
+            Err(ChartIndicatorError::InvalidParameters)
+        );
     }
 }

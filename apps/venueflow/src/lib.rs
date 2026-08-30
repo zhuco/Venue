@@ -1,5 +1,6 @@
 mod app;
 mod chart;
+mod chart_settings;
 mod client;
 mod i18n;
 #[cfg(not(target_arch = "wasm32"))]
@@ -7,6 +8,7 @@ mod market;
 #[cfg(not(target_arch = "wasm32"))]
 mod market_client;
 mod model;
+mod settings_panel;
 mod theme;
 mod ui;
 mod workspace;
