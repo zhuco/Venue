@@ -27,10 +27,10 @@ pub use private_ws::{
 };
 pub use public::{
     BinanceFormingBar, BinanceKlineInterval, BinancePublic24hTicker, BinancePublicEnvelope,
-    BinancePublicError, BinancePublicKline, parse_bbo, parse_closed_bar, parse_depth_delta,
-    parse_public_exchange_info, parse_public_market_agg_trade, parse_public_market_bbo,
-    parse_public_market_depth20_snapshot, parse_public_market_kline,
-    parse_public_market_rest_klines, parse_public_market_ticker_array,
+    BinancePublicError, BinancePublicInstrument, BinancePublicKline, parse_bbo, parse_closed_bar,
+    parse_depth_delta, parse_public_exchange_catalog, parse_public_exchange_info,
+    parse_public_market_agg_trade, parse_public_market_bbo, parse_public_market_depth20_snapshot,
+    parse_public_market_kline, parse_public_market_rest_klines, parse_public_market_ticker_array,
     parse_public_market_ticker_snapshot, parse_public_trade,
 };
 pub use readback::*;

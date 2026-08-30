@@ -6,7 +6,7 @@ use venue_control_protocol::{
 };
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::market::{LocalMarketView, MarketSelection, MarketStatus};
+use crate::market::{LocalMarketView, MarketSelection};
 use crate::{
     chart::{ChartStudyPoint, PriceRange, bar_center_x, bar_index_at_x},
     chart_settings::ChartDisplaySettings,
@@ -66,14 +66,14 @@ pub fn show_top_bar(
     egui::Frame::new()
         .fill(theme::BG_SECONDARY)
         .stroke(Stroke::new(1.0, theme::DIVIDER))
-        .inner_margin(egui::Margin::symmetric(10, 6))
+        .inner_margin(egui::Margin::symmetric(10, 4))
         .show(ui, |ui| {
             let language = model.preferences.language;
             let connection = model.connection;
             let mut reset_requested = false;
             let (picker_response, ()) = egui::containers::Sides::new()
                 .shrink_left()
-                .height(30.0)
+                .height(46.0)
                 .show(
                     ui,
                     |ui| {
@@ -97,15 +97,34 @@ pub fn show_top_bar(
                                 }
                             }
                             ui.separator();
+                            let selected_symbol = model.preferences.selected_symbol.clone();
+                            let selected_quote = local_quote(model, &selected_symbol);
+                            let selected_details = selected_quote.map_or_else(
+                                || "—  —".to_owned(),
+                                |quote| {
+                                    format!(
+                                        "{} {:+.2}%",
+                                        model.format_market_price(&selected_symbol, quote.last),
+                                        quote.change_percent_24h
+                                    )
+                                },
+                            );
                             let picker_response = ui.add_sized(
-                                [116.0, 26.0],
-                                egui::Button::new(
-                                    RichText::new(format!(
-                                        "{}  v",
-                                        model.preferences.selected_symbol
-                                    ))
-                                    .strong(),
-                                ),
+                                [150.0, 42.0],
+                                egui::Button::new(symbol_tab_text(
+                                    &format!("{}  ▼", selected_symbol),
+                                    &selected_details,
+                                    selected_quote.map_or(theme::TEXT_SECONDARY, |quote| {
+                                        theme::value_color(decimal_to_f64(quote.change_percent_24h))
+                                    }),
+                                )),
+                            );
+                            ui.painter().line_segment(
+                                [
+                                    picker_response.rect.left_top(),
+                                    picker_response.rect.right_top(),
+                                ],
+                                Stroke::new(2.0, theme::BRAND),
                             );
                             if picker_response.clicked() {
                                 *show_symbol_picker = !*show_symbol_picker;
@@ -117,25 +136,42 @@ pub fn show_top_bar(
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         let favorites = model.preferences.favorite_symbols.clone();
-                                        for symbol in favorites {
+                                        for symbol in favorites
+                                            .into_iter()
+                                            .filter(|symbol| symbol != &selected_symbol)
+                                        {
                                             let quote = local_quote(model, &symbol);
                                             let details = quote.map_or_else(
-                                                || "--".to_owned(),
+                                                || "—  —".to_owned(),
                                                 |quote| {
                                                     format!(
                                                         "{} {:+.2}%",
-                                                        format_decimal(quote.last, 4),
+                                                        model.format_market_price(
+                                                            &symbol, quote.last
+                                                        ),
                                                         quote.change_percent_24h
                                                     )
                                                 },
                                             );
                                             let selected =
                                                 model.preferences.selected_symbol == symbol;
+                                            let detail_color =
+                                                quote.map_or(theme::TEXT_SECONDARY, |quote| {
+                                                    theme::value_color(decimal_to_f64(
+                                                        quote.change_percent_24h,
+                                                    ))
+                                                });
                                             if ui
-                                                .selectable_label(
-                                                    selected,
-                                                    RichText::new(format!("{symbol}  {details}"))
-                                                        .size(12.0),
+                                                .add_sized(
+                                                    [150.0, 42.0],
+                                                    egui::Button::selectable(
+                                                        selected,
+                                                        symbol_tab_text(
+                                                            &symbol,
+                                                            &details,
+                                                            detail_color,
+                                                        ),
+                                                    ),
                                                 )
                                                 .clicked()
                                             {
@@ -316,7 +352,7 @@ fn show_symbol_picker_popup(
                                     selected = Some(symbol.clone());
                                 }
                                 if let Some(quote) = local_quote(model, symbol) {
-                                    ui.monospace(format_decimal(quote.last, 6));
+                                    ui.monospace(model.format_market_price(symbol, quote.last));
                                     ui.colored_label(
                                         if quote.change_percent_24h >= rust_decimal::Decimal::ZERO {
                                             theme::BUY
@@ -516,10 +552,10 @@ fn show_market_watch(ui: &mut egui::Ui, model: &mut AppModel) {
                             .view_for_symbol(&symbol)
                             .and_then(|market| market.last)
                         {
-                            ui.monospace(format_decimal(last, 4));
+                            ui.monospace(model.format_market_price(&symbol, last));
                             ui.colored_label(theme::BUY, "BINANCE");
                         } else if let Some(projected) = market(model, &symbol) {
-                            ui.monospace(format_decimal(projected.last, 4));
+                            ui.monospace(model.format_market_price(&symbol, projected.last));
                             ui.colored_label(theme::TEXT_SECONDARY, "CONTROL");
                         } else {
                             ui.monospace("—");
@@ -529,7 +565,7 @@ fn show_market_watch(ui: &mut egui::Ui, model: &mut AppModel) {
                     #[cfg(target_arch = "wasm32")]
                     {
                         if let Some(projected) = market(model, &symbol) {
-                            ui.monospace(format_decimal(projected.last, 4));
+                            ui.monospace(model.format_market_price(&symbol, projected.last));
                             ui.colored_label(theme::TEXT_SECONDARY, "CONTROL");
                         } else {
                             ui.monospace("—");
@@ -550,76 +586,7 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
         .unwrap_or(&model.preferences.selected_symbol);
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(local) = local_market(model, symbol, pane.interval) {
-        pane_heading(ui, symbol, text(language, TextKey::DataSource));
-        ui.horizontal_wrapped(|ui| {
-            local_status_label(ui, local.status, language);
-            if let Some(last) = local.last {
-                ui.label(format!(
-                    "{} {}",
-                    text(language, TextKey::Last),
-                    format_decimal(last, 4)
-                ));
-            }
-            if let Some(bid) = local.bid {
-                ui.label(format!(
-                    "{} {}",
-                    text(language, TextKey::Bid),
-                    format_decimal(bid, 4)
-                ));
-            }
-            if let Some(ask) = local.ask {
-                ui.label(format!(
-                    "{} {}",
-                    text(language, TextKey::Ask),
-                    format_decimal(ask, 4)
-                ));
-            }
-            ui.colored_label(
-                theme::TEXT_SECONDARY,
-                format!("latency {} ms", local.latency_ms.unwrap_or_default()),
-            );
-            if let Some(detail) = &local.status_detail {
-                ui.colored_label(theme::WARNING, detail);
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.strong(text(language, TextKey::Indicators));
-            if let Some(study) = local.studies.last() {
-                let state = if study.confirmed { "closed" } else { "forming" };
-                ui.colored_label(
-                    theme::TEXT_SECONDARY,
-                    format!(
-                        "{} studies · {state}",
-                        model.preferences.chart.enabled_study_count()
-                    ),
-                );
-                for (name, value) in [
-                    (
-                        format!("SMA{}", model.preferences.chart.sma_period),
-                        study.sma,
-                    ),
-                    (
-                        format!("EMA{}", model.preferences.chart.ema_period),
-                        study.ema,
-                    ),
-                    ("VWAP".to_owned(), study.vwap),
-                    (
-                        format!("RSI{}", model.preferences.chart.rsi_period),
-                        study.rsi,
-                    ),
-                    (
-                        format!("ATR{}", model.preferences.chart.atr_period),
-                        study.atr,
-                    ),
-                ] {
-                    if let Some(value) = value {
-                        ui.monospace(format!("{name} {}", format_decimal(value, 4)));
-                    }
-                }
-            } else {
-                ui.colored_label(theme::TEXT_SECONDARY, "warming up");
-            }
-        });
+        let (price_scale, quantity_scale) = model.market_scales(symbol);
         let settings_requested = show_chart_toolbar(ui, pane, language);
         candle_plot(
             ui,
@@ -628,6 +595,7 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
             &mut pane.viewport,
             language,
             &model.preferences.chart,
+            (price_scale, quantity_scale),
         );
         if settings_requested {
             model.indicator_settings_requested = true;
@@ -640,9 +608,18 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
         return;
     };
     ui.horizontal_wrapped(|ui| {
-        ui.label(format!("Last {}", format_decimal(market.last, 4)));
-        ui.label(format!("Bid {}", format_decimal(market.bid, 4)));
-        ui.label(format!("Ask {}", format_decimal(market.ask, 4)));
+        ui.label(format!(
+            "Last {}",
+            model.format_market_price(symbol, market.last)
+        ));
+        ui.label(format!(
+            "Bid {}",
+            model.format_market_price(symbol, market.bid)
+        ));
+        ui.label(format!(
+            "Ask {}",
+            model.format_market_price(symbol, market.ask)
+        ));
         for indicator in market.indicators.iter().take(6) {
             ui.colored_label(
                 theme::BRAND_HOVER,
@@ -662,6 +639,7 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
         &mut pane.viewport,
         language,
         &model.preferences.chart,
+        (8, 8),
     );
     if settings_requested {
         model.indicator_settings_requested = true;
@@ -718,7 +696,9 @@ fn candle_plot(
     viewport: &mut crate::chart::ChartViewport,
     language: Language,
     settings: &ChartDisplaySettings,
+    scales: (usize, usize),
 ) {
+    let (price_scale, quantity_scale) = scales;
     let height = ui.available_height().max(120.0);
     let (response, painter) = ui.allocate_painter(
         egui::vec2(ui.available_width(), height),
@@ -833,7 +813,7 @@ fn candle_plot(
             painter.text(
                 Pos2::new(price_rect.right() - 3.0, y - 2.0),
                 Align2::RIGHT_BOTTOM,
-                format!("{price:.4}"),
+                format_f64_trimmed(price, price_scale),
                 FontId::monospace(f32::from(settings.chart_text_size)),
                 theme::TEXT_SECONDARY,
             );
@@ -939,7 +919,7 @@ fn candle_plot(
                 painter.text(
                     Pos2::new(price_rect.right() - 4.0, pointer.y - 4.0),
                     Align2::RIGHT_BOTTOM,
-                    format!("{price:.4}"),
+                    format_f64_trimmed(price, price_scale),
                     FontId::monospace(f32::from(settings.chart_text_size)),
                     theme::TEXT_PRIMARY,
                 );
@@ -955,11 +935,11 @@ fn candle_plot(
                 format!(
                     "{}  O {}  H {}  L {}  C {}  V {}",
                     bar.open_time_ms,
-                    format_decimal(bar.open, 4),
-                    format_decimal(bar.high, 4),
-                    format_decimal(bar.low, 4),
-                    format_decimal(bar.close, 4),
-                    format_decimal(bar.volume, 3),
+                    format_decimal(bar.open, price_scale),
+                    format_decimal(bar.high, price_scale),
+                    format_decimal(bar.low, price_scale),
+                    format_decimal(bar.close, price_scale),
+                    format_decimal(bar.volume, quantity_scale),
                 ),
                 FontId::monospace(f32::from(settings.chart_text_size)),
                 theme::TEXT_PRIMARY,
@@ -1243,7 +1223,15 @@ fn show_order_book(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
         if local.asks.is_empty() || local.bids.is_empty() {
             empty(ui, text(language, TextKey::NoBook));
         } else {
-            show_book_rows(ui, pane.instance, &local.asks, &local.bids, language);
+            show_book_rows(
+                ui,
+                pane.instance,
+                &local.asks,
+                &local.bids,
+                language,
+                model,
+                symbol,
+            );
         }
         return;
     }
@@ -1251,7 +1239,15 @@ fn show_order_book(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
         empty(ui, text(language, TextKey::NoBook));
         return;
     };
-    show_book_rows(ui, pane.instance, &market.asks, &market.bids, language);
+    show_book_rows(
+        ui,
+        pane.instance,
+        &market.asks,
+        &market.bids,
+        language,
+        model,
+        symbol,
+    );
 }
 
 fn show_book_rows(
@@ -1260,6 +1256,8 @@ fn show_book_rows(
     asks: &[venue_control_protocol::UiBookLevel],
     bids: &[venue_control_protocol::UiBookLevel],
     language: Language,
+    model: &AppModel,
+    symbol: &str,
 ) {
     egui::Grid::new(format!("book-{instance}"))
         .striped(true)
@@ -1271,14 +1269,14 @@ fn show_book_rows(
             ui.end_row();
             for level in asks.iter().rev().take(10) {
                 ui.colored_label(theme::SELL, text(language, TextKey::Ask));
-                ui.monospace(format_decimal(level.price, 4));
-                ui.monospace(format_decimal(level.quantity, 4));
+                ui.monospace(model.format_market_price(symbol, level.price));
+                ui.monospace(model.format_market_quantity(symbol, level.quantity));
                 ui.end_row();
             }
             for level in bids.iter().take(10) {
                 ui.colored_label(theme::BUY, text(language, TextKey::Bid));
-                ui.monospace(format_decimal(level.price, 4));
-                ui.monospace(format_decimal(level.quantity, 4));
+                ui.monospace(model.format_market_price(symbol, level.price));
+                ui.monospace(model.format_market_quantity(symbol, level.quantity));
                 ui.end_row();
             }
         });
@@ -1296,7 +1294,7 @@ fn show_trade_tape(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
         if local.trades.is_empty() {
             empty(ui, text(language, TextKey::NoTrades));
         } else {
-            show_trade_rows(ui, pane.instance, &local.trades, language);
+            show_trade_rows(ui, pane.instance, &local.trades, language, model, symbol);
         }
         return;
     }
@@ -1304,7 +1302,7 @@ fn show_trade_tape(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
         empty(ui, text(language, TextKey::NoTrades));
         return;
     };
-    show_trade_rows(ui, pane.instance, &market.trades, language);
+    show_trade_rows(ui, pane.instance, &market.trades, language, model, symbol);
 }
 
 fn show_trade_rows(
@@ -1312,6 +1310,8 @@ fn show_trade_rows(
     instance: u32,
     trades: &[venue_control_protocol::UiTrade],
     language: Language,
+    model: &AppModel,
+    symbol: &str,
 ) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         egui::Grid::new(format!("tape-{instance}"))
@@ -1328,8 +1328,8 @@ fn show_trade_rows(
                         AggressorSide::Unknown => theme::TEXT_SECONDARY,
                     };
                     ui.monospace(trade.occurred_ms.to_string());
-                    ui.colored_label(color, format_decimal(trade.price, 4));
-                    ui.monospace(format_decimal(trade.quantity, 4));
+                    ui.colored_label(color, model.format_market_price(symbol, trade.price));
+                    ui.monospace(model.format_market_quantity(symbol, trade.quantity));
                     ui.end_row();
                 }
             });
@@ -1894,6 +1894,41 @@ fn local_quote<'a>(model: &'a AppModel, symbol: &str) -> Option<&'a MarketQuote>
     model.local_quotes.get(symbol)
 }
 
+fn symbol_tab_text(symbol: &str, details: &str, detail_color: Color32) -> egui::WidgetText {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        symbol,
+        0.0,
+        egui::TextFormat {
+            font_id: FontId::proportional(12.5),
+            color: theme::TEXT_PRIMARY,
+            ..Default::default()
+        },
+    );
+    job.append(
+        &format!("\n{details}"),
+        0.0,
+        egui::TextFormat {
+            font_id: FontId::monospace(11.0),
+            color: detail_color,
+            ..Default::default()
+        },
+    );
+    job.into()
+}
+
+fn format_f64_trimmed(value: f64, precision: usize) -> String {
+    let formatted = format!("{value:.precision$}");
+    if formatted.contains('.') {
+        formatted
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned()
+    } else {
+        formatted
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn local_market<'a>(
     model: &'a AppModel,
@@ -1902,19 +1937,6 @@ fn local_market<'a>(
 ) -> Option<&'a LocalMarketView> {
     let selection = MarketSelection::binance_usd_m(symbol, interval).ok()?;
     model.local_markets.view(&selection)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn local_status_label(ui: &mut egui::Ui, status: MarketStatus, language: Language) {
-    let (label, color) = match status {
-        MarketStatus::Live => (text(language, TextKey::Live), theme::BUY),
-        MarketStatus::LoadingHistory => (text(language, TextKey::LoadingHistory), theme::WARNING),
-        MarketStatus::Connecting => (text(language, TextKey::Connecting), theme::WARNING),
-        MarketStatus::Resyncing => (text(language, TextKey::Resyncing), theme::WARNING),
-        MarketStatus::Stale => (text(language, TextKey::Stale), theme::SELL),
-        MarketStatus::Offline => (text(language, TextKey::Offline), theme::SELL),
-    };
-    ui.colored_label(color, RichText::new(label).strong());
 }
 
 fn pane_heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {

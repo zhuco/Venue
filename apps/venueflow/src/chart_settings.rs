@@ -118,6 +118,7 @@ impl ChartDisplaySettings {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn enabled_study_count(&self) -> usize {
         [
             self.sma.enabled,

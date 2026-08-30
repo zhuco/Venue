@@ -24,6 +24,14 @@ pub struct MarketQuote {
     pub received_ms: u64,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketInstrument {
+    pub symbol: String,
+    pub price_scale: u32,
+    pub quantity_scale: u32,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SymbolGroup {
     Favorites,
@@ -143,6 +151,8 @@ pub struct AppModel {
     #[cfg(not(target_arch = "wasm32"))]
     pub local_symbols: Vec<String>,
     #[cfg(not(target_arch = "wasm32"))]
+    pub local_precisions: BTreeMap<String, (u32, u32)>,
+    #[cfg(not(target_arch = "wasm32"))]
     pub local_catalog_error: Option<String>,
     #[cfg(not(target_arch = "wasm32"))]
     pub local_proxy_detected: bool,
@@ -186,6 +196,8 @@ impl AppModel {
             #[cfg(not(target_arch = "wasm32"))]
             local_symbols: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
+            local_precisions: BTreeMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
             local_catalog_error: None,
             #[cfg(not(target_arch = "wasm32"))]
             local_proxy_detected: false,
@@ -199,7 +211,20 @@ impl AppModel {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn apply_local_catalog(&mut self, mut symbols: Vec<String>) {
+    pub fn apply_local_catalog(&mut self, instruments: Vec<MarketInstrument>) {
+        self.local_precisions = instruments
+            .iter()
+            .map(|instrument| {
+                (
+                    instrument.symbol.clone(),
+                    (instrument.price_scale, instrument.quantity_scale),
+                )
+            })
+            .collect();
+        let mut symbols = instruments
+            .into_iter()
+            .map(|instrument| instrument.symbol)
+            .collect::<Vec<_>>();
         symbols.sort_by(|left, right| {
             preferred_symbol_rank(left)
                 .cmp(&preferred_symbol_rank(right))
@@ -221,6 +246,31 @@ impl AppModel {
                 self.local_quotes.insert(quote.symbol.clone(), quote);
             }
         }
+    }
+
+    pub fn format_market_price(&self, _symbol: &str, value: Decimal) -> String {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((scale, _)) = self.local_precisions.get(_symbol) {
+            return format_decimal(value, *scale as usize);
+        }
+        format_decimal(value, 8)
+    }
+
+    pub fn format_market_quantity(&self, _symbol: &str, value: Decimal) -> String {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((_, scale)) = self.local_precisions.get(_symbol) {
+            return format_decimal(value, *scale as usize);
+        }
+        format_decimal(value, 8)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn market_scales(&self, symbol: &str) -> (usize, usize) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((price, quantity)) = self.local_precisions.get(symbol) {
+            return (*price as usize, *quantity as usize);
+        }
+        (8, 8)
     }
 
     pub fn apply_snapshot(&mut self, snapshot: ControlSnapshot) {
@@ -390,7 +440,10 @@ pub fn decimal_to_f64(value: Decimal) -> f64 {
 }
 
 pub fn format_decimal(value: Decimal, precision: usize) -> String {
-    format!("{:.*}", precision, decimal_to_f64(value))
+    value
+        .round_dp(precision.min(28) as u32)
+        .normalize()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -421,18 +474,40 @@ mod tests {
     #[test]
     fn public_catalog_keeps_favorites_first_without_hiding_other_symbols() {
         let mut model = AppModel::new(Preferences::default());
-        model.apply_local_catalog(vec![
-            "XRP/USDT".to_owned(),
-            "BNB/USDC".to_owned(),
-            "BTC/USDC".to_owned(),
-            "ETH/USDC".to_owned(),
-            "SOL/USDC".to_owned(),
-        ]);
+        model.apply_local_catalog(
+            ["XRP/USDT", "BNB/USDC", "BTC/USDC", "ETH/USDC", "SOL/USDC"]
+                .map(|symbol| super::MarketInstrument {
+                    symbol: symbol.to_owned(),
+                    price_scale: 2,
+                    quantity_scale: 3,
+                })
+                .to_vec(),
+        );
         assert_eq!(
             &model.local_symbols[..4],
             &DEFAULT_FAVORITE_SYMBOLS.map(str::to_owned)
         );
         assert_eq!(model.local_symbols[4], "XRP/USDT");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn exchange_precision_is_used_without_padding_trailing_zeroes() {
+        let mut model = AppModel::new(Preferences::default());
+        model.apply_local_catalog(vec![super::MarketInstrument {
+            symbol: "SOL/USDC".to_owned(),
+            price_scale: 4,
+            quantity_scale: 3,
+        }]);
+
+        assert_eq!(
+            model.format_market_price("SOL/USDC", Decimal::new(104_900, 3)),
+            "104.9"
+        );
+        assert_eq!(
+            model.format_market_quantity("SOL/USDC", Decimal::new(12_340, 3)),
+            "12.34"
+        );
     }
 
     #[test]

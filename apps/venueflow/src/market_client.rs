@@ -25,9 +25,9 @@ mod native {
         AggressorSide, FieldState, MarketSnapshot, PublicBar, PublicTicker, PublicTrade, Symbol,
     };
     use venue_gateway_binance::{
-        BinanceFormingBar, BinanceKlineInterval, BinancePublicKline, native_symbol,
-        parse_public_exchange_info, parse_public_market_agg_trade, parse_public_market_bbo,
-        parse_public_market_depth20_snapshot, parse_public_market_kline,
+        BinanceFormingBar, BinanceKlineInterval, BinancePublicInstrument, BinancePublicKline,
+        native_symbol, parse_public_exchange_catalog, parse_public_market_agg_trade,
+        parse_public_market_bbo, parse_public_market_depth20_snapshot, parse_public_market_kline,
         parse_public_market_rest_klines, parse_public_market_ticker_array,
         parse_public_market_ticker_snapshot,
     };
@@ -35,7 +35,7 @@ mod native {
     use crate::{
         chart::ChartInterval,
         market::{MarketEnvelope, MarketPayload, MarketSelection, MarketStatus},
-        model::MarketQuote,
+        model::{MarketInstrument, MarketQuote},
     };
 
     const REST_KLINES_ENDPOINT: &str = "https://fapi.binance.com/fapi/v1/klines";
@@ -60,7 +60,7 @@ mod native {
     pub enum LocalMarketClientEvent {
         Market(Box<MarketEnvelope>),
         Quotes(Vec<MarketQuote>),
-        Catalog(Vec<String>),
+        Catalog(Vec<MarketInstrument>),
         CatalogUnavailable(String),
         QuotesUnavailable(String),
         ProxyDetected(bool),
@@ -321,10 +321,20 @@ mod native {
         let proxy = ProxySetting::from_environment("fstream.binance.com");
         let _ = event_tx.try_send(LocalMarketClientEvent::ProxyDetected(proxy.configured()));
         let catalog = match fetch_catalog(&http).await {
-            Ok(symbols) => {
-                let labels = symbols.iter().map(ToString::to_string).collect();
+            Ok(instruments) => {
+                let labels = instruments
+                    .iter()
+                    .map(|instrument| MarketInstrument {
+                        symbol: instrument.symbol.to_string(),
+                        price_scale: instrument.price_tick.scale(),
+                        quantity_scale: instrument.quantity_step.scale(),
+                    })
+                    .collect();
                 let _ = event_tx.try_send(LocalMarketClientEvent::Catalog(labels));
-                symbols
+                instruments
+                    .into_iter()
+                    .map(|instrument| instrument.symbol)
+                    .collect()
             }
             Err(error) => {
                 let _ = event_tx.try_send(LocalMarketClientEvent::CatalogUnavailable(error));
@@ -621,7 +631,7 @@ mod native {
         Ok(stream)
     }
 
-    async fn fetch_catalog(http: &reqwest::Client) -> Result<Vec<Symbol>, String> {
+    async fn fetch_catalog(http: &reqwest::Client) -> Result<Vec<BinancePublicInstrument>, String> {
         let response = http
             .get(EXCHANGE_INFO_ENDPOINT)
             .send()
@@ -654,7 +664,7 @@ mod native {
         }
         let payload =
             std::str::from_utf8(&body).map_err(|_| "symbol catalog was not UTF-8".to_owned())?;
-        parse_public_exchange_info(payload)
+        parse_public_exchange_catalog(payload)
             .map_err(|error| format!("symbol catalog parse failed: {error}"))
     }
 

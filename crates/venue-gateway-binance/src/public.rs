@@ -335,18 +335,25 @@ pub fn parse_closed_bar(
     ))
 }
 
-/// Parses Binance USD-M `GET /fapi/v1/exchangeInfo` into the complete canonical set currently
-/// eligible for the local public feed. Inactive, delivery, and non-USDT/USDC products are omitted;
-/// products whose base asset cannot be represented by the canonical alphanumeric domain symbol
-/// are omitted; ambiguous identities inside the representable catalog fail the whole parse.
-pub fn parse_public_exchange_info(payload: &str) -> Result<Vec<Symbol>, BinancePublicError> {
+/// Display-relevant public instrument rules from Binance USD-M `exchangeInfo`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinancePublicInstrument {
+    pub symbol: Symbol,
+    pub price_tick: Decimal,
+    pub quantity_step: Decimal,
+}
+
+/// Parses the complete public catalog with exchange-authoritative price and quantity increments.
+pub fn parse_public_exchange_catalog(
+    payload: &str,
+) -> Result<Vec<BinancePublicInstrument>, BinancePublicError> {
     let value: Value = serde_json::from_str(payload).map_err(|_| BinancePublicError::Payload)?;
     let rows = value
         .as_object()
         .and_then(|object| object.get("symbols"))
         .and_then(Value::as_array)
         .ok_or(BinancePublicError::Payload)?;
-    let mut canonical = BTreeSet::new();
+    let mut canonical = BTreeMap::new();
     let mut native = BTreeSet::new();
     for row in rows {
         let row = row.as_object().ok_or(BinancePublicError::Payload)?;
@@ -362,9 +369,31 @@ pub fn parse_public_exchange_info(payload: &str) -> Result<Vec<Symbol>, BinanceP
         let Ok(symbol) = Symbol::new(base, quote) else {
             continue;
         };
+        let filters = row
+            .get("filters")
+            .and_then(Value::as_array)
+            .ok_or(BinancePublicError::Payload)?;
+        let filter_value = |kind: &str, field: &str| {
+            filters
+                .iter()
+                .filter_map(Value::as_object)
+                .find(|filter| filter.get("filterType").and_then(Value::as_str) == Some(kind))
+                .and_then(|filter| filter.get(field))
+        };
+        let price_tick = positive_decimal(filter_value("PRICE_FILTER", "tickSize"))?.normalize();
+        let quantity_step = positive_decimal(filter_value("LOT_SIZE", "stepSize"))?.normalize();
         if native_symbol(&symbol) != native_symbol_value
             || !native.insert(native_symbol_value.to_owned())
-            || !canonical.insert(symbol)
+            || canonical
+                .insert(
+                    symbol.clone(),
+                    BinancePublicInstrument {
+                        symbol,
+                        price_tick,
+                        quantity_step,
+                    },
+                )
+                .is_some()
         {
             return Err(BinancePublicError::Symbol);
         }
@@ -372,7 +401,17 @@ pub fn parse_public_exchange_info(payload: &str) -> Result<Vec<Symbol>, BinanceP
     if canonical.is_empty() {
         return Err(BinancePublicError::Value);
     }
-    Ok(canonical.into_iter().collect())
+    Ok(canonical.into_values().collect())
+}
+
+/// Returns only canonical symbols for consumers that do not render exchange precision.
+pub fn parse_public_exchange_info(payload: &str) -> Result<Vec<Symbol>, BinancePublicError> {
+    parse_public_exchange_catalog(payload).map(|catalog| {
+        catalog
+            .into_iter()
+            .map(|instrument| instrument.symbol)
+            .collect()
+    })
 }
 
 /// One credential-free all-market 24-hour ticker used by desktop discovery surfaces.
@@ -1239,8 +1278,8 @@ mod public_market_tests {
         let payload = r#"{
             "timezone":"UTC",
             "symbols":[
-                {"symbol":"BTCUSDT","baseAsset":"BTC","quoteAsset":"USDT","status":"TRADING","contractType":"PERPETUAL"},
-                {"symbol":"ETHUSDC","baseAsset":"ETH","quoteAsset":"USDC","status":"TRADING","contractType":"PERPETUAL"},
+                {"symbol":"BTCUSDT","baseAsset":"BTC","quoteAsset":"USDT","status":"TRADING","contractType":"PERPETUAL","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001"}]},
+                {"symbol":"ETHUSDC","baseAsset":"ETH","quoteAsset":"USDC","status":"TRADING","contractType":"PERPETUAL","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"0.001"}]},
                 {"symbol":"SOLUSDT_250926","baseAsset":"SOL","quoteAsset":"USDT","status":"TRADING","contractType":"CURRENT_QUARTER"},
                 {"symbol":"OLDUSDT","baseAsset":"OLD","quoteAsset":"USDT","status":"SETTLING","contractType":"PERPETUAL"},
                 {"symbol":"BTCUSD","baseAsset":"BTC","quoteAsset":"USD","status":"TRADING","contractType":"PERPETUAL"}
@@ -1254,6 +1293,9 @@ mod public_market_tests {
                 .collect::<Vec<_>>(),
             ["BTC/USDT", "ETH/USDC"]
         );
+        let catalog = parse_public_exchange_catalog(payload)?;
+        assert_eq!(catalog[0].price_tick, Decimal::new(1, 1));
+        assert_eq!(catalog[0].quantity_step, Decimal::new(1, 3));
         assert_eq!(
             parse_public_exchange_info(&payload.replace("BTCUSDT", "WRONG")),
             Err(BinancePublicError::Symbol)
