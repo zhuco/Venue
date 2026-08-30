@@ -262,6 +262,7 @@ fn receipt_from_plan(
 
 #[derive(Clone, Copy)]
 enum AsyncDispatchPlan {
+    Acknowledged,
     Timeout,
     Disconnected,
 }
@@ -321,6 +322,41 @@ impl AsyncGatewayCounters {
 
 struct TestTokioRuntime {
     execution_now_ms: u64,
+    completed_runs: usize,
+    advance_after_run: Option<(usize, u64)>,
+}
+
+impl TestTokioRuntime {
+    const fn at(execution_now_ms: u64) -> Self {
+        Self {
+            execution_now_ms,
+            completed_runs: 0,
+            advance_after_run: None,
+        }
+    }
+
+    const fn advance_after_run(
+        execution_now_ms: u64,
+        run_number: usize,
+        advanced_now_ms: u64,
+    ) -> Self {
+        Self {
+            execution_now_ms,
+            completed_runs: 0,
+            advance_after_run: Some((run_number, advanced_now_ms)),
+        }
+    }
+
+    fn complete_run(&mut self) {
+        self.completed_runs = self.completed_runs.saturating_add(1);
+        if self
+            .advance_after_run
+            .is_some_and(|(run_number, _)| run_number == self.completed_runs)
+            && let Some((_, advanced_now_ms)) = self.advance_after_run.take()
+        {
+            self.execution_now_ms = advanced_now_ms;
+        }
+    }
 }
 
 struct ThreadWake {
@@ -353,10 +389,14 @@ impl TokioRuntimeDriver for TestTokioRuntime {
         let mut future = Box::pin(future);
         loop {
             match future.as_mut().poll(&mut context) {
-                Poll::Ready(output) => return TokioRuntimeRun::Completed(output),
+                Poll::Ready(output) => {
+                    self.complete_run();
+                    return TokioRuntimeRun::Completed(output);
+                }
                 Poll::Pending => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
+                        self.complete_run();
                         return TokioRuntimeRun::TimedOut;
                     }
                     std::thread::park_timeout(remaining);
@@ -457,6 +497,10 @@ impl AsyncPhysicalGateway for FakeAsyncGateway {
                 return Err(AsyncGatewayCallError::Failed(()));
             }
             match plan {
+                Some(AsyncDispatchPlan::Acknowledged) => Ok(GatewayDispatchResult::Acknowledged(
+                    GatewayAcknowledgement::new("venue_async_ack")
+                        .map_err(|_| AsyncGatewayCallError::Failed(()))?,
+                )),
                 Some(AsyncDispatchPlan::Timeout) => std::future::pending().await,
                 Some(AsyncDispatchPlan::Disconnected) => Err(AsyncGatewayCallError::Disconnected),
                 None => Err(AsyncGatewayCallError::Failed(())),
@@ -945,9 +989,7 @@ fn async_timeout_and_disconnect_become_unknown_then_exact_readback_without_resub
         );
         let boundary = TokioPhysicalGateway::new(
             gateway,
-            TestTokioRuntime {
-                execution_now_ms: 1_000,
-            },
+            TestTokioRuntime::at(1_000),
             AsyncGatewayTimeouts::new(
                 Duration::from_secs(1),
                 Duration::from_secs(1),
@@ -1012,9 +1054,7 @@ fn async_boundary_rechecks_ttl_at_actual_execution_clock() -> Result<(), Box<dyn
             Vec::new(),
             counters.clone(),
         ),
-        TestTokioRuntime {
-            execution_now_ms: 11_000,
-        },
+        TestTokioRuntime::at(11_000),
         AsyncGatewayTimeouts::default(),
     )?;
     let mut host = NodeSafetyHost::open_for_test(
@@ -1117,34 +1157,83 @@ fn read_only_recovery_capability_connects_but_does_not_grant_mutation()
 #[test]
 fn publicly_constructed_token_cannot_dispatch_in_production_path()
 -> Result<(), Box<dyn std::error::Error>> {
+    for entry in ["dispatch", "admit"] {
+        let directory = tempfile::tempdir()?;
+        let launch = launch(&directory, "LIVE")?;
+        let owner = owner(launch.binding())?;
+        let dispatch_calls = Arc::new(AtomicUsize::new(0));
+        let command_id = CommandId::new(format!("forged_public_{entry}"))?;
+        let mut host = NodeSafetyHost::open_for_test(
+            &launch,
+            owner.clone(),
+            FakeGateway::new(launch.binding().clone(), vec![ReadbackPlan::initial()])
+                .with_counter(Arc::clone(&dispatch_calls)),
+            Some(canary_for(launch.binding(), &owner, command_id.as_str())?),
+            1_000,
+        )?;
+        let prepared =
+            host.prepare_dispatch(entry_command(launch.binding(), command_id.as_str())?, 1_000)?;
+        let (capability, evidence) = admitted_capability(launch.binding(), &prepared, 1_000)?;
+        let unavailable = if entry == "dispatch" {
+            host.dispatch_prepared(prepared, capability, evidence, 1_000)
+                .map(|_| ())
+        } else {
+            host.admit_prepared(prepared, capability, evidence, 1_000)
+        };
+
+        assert!(matches!(
+            unavailable,
+            Err(SafeHostError::HostAdmissionUnavailable)
+        ));
+        assert_eq!(dispatch_calls.load(Ordering::SeqCst), 0);
+        let journal = CommandJournal::open(journal_path(&launch))?;
+        assert!(matches!(
+            journal.receipt(&command_id).map(|receipt| &receipt.state),
+            Some(CommandState::Rejected { reason }) if reason == "host_admission_unavailable"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn canary_expiry_after_prepare_is_durably_rejected_without_dispatch()
+-> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let launch = launch(&directory, "LIVE")?;
     let owner = owner(launch.binding())?;
+    let command_id = CommandId::new("canary_expires_after_prepare")?;
     let dispatch_calls = Arc::new(AtomicUsize::new(0));
-    let command_id = CommandId::new("forged_public_token")?;
+    let expiring_canary = CanaryEvidence::new(
+        launch.binding().clone(),
+        &owner,
+        7,
+        1,
+        800,
+        1_001,
+        command_id.clone(),
+        DIGEST,
+    )?;
     let mut host = NodeSafetyHost::open_for_test(
         &launch,
-        owner.clone(),
+        owner,
         FakeGateway::new(launch.binding().clone(), vec![ReadbackPlan::initial()])
-            .with_read_only_capability()
             .with_counter(Arc::clone(&dispatch_calls)),
-        Some(canary_for(launch.binding(), &owner, command_id.as_str())?),
+        Some(expiring_canary),
         1_000,
     )?;
     let prepared =
         host.prepare_dispatch(entry_command(launch.binding(), command_id.as_str())?, 1_000)?;
-    let (forged_capability, forged_evidence) =
-        admitted_capability(launch.binding(), &prepared, 1_000)?;
+    let (capability, evidence) = admitted_capability(launch.binding(), &prepared, 1_000)?;
 
     assert!(matches!(
-        host.dispatch_prepared(prepared, forged_capability, forged_evidence, 1_000),
-        Err(SafeHostError::HostAdmissionUnavailable)
+        host.dispatch_admitted_for_test(prepared, capability, evidence, 1_001),
+        Err(SafeHostError::CanaryEvidence)
     ));
     assert_eq!(dispatch_calls.load(Ordering::SeqCst), 0);
     let journal = CommandJournal::open(journal_path(&launch))?;
     assert!(matches!(
         journal.receipt(&command_id).map(|receipt| &receipt.state),
-        Some(CommandState::Rejected { reason }) if reason == "host_admission_unavailable"
+        Some(CommandState::Rejected { reason }) if reason == "dispatch_revalidation_failed"
     ));
     Ok(())
 }
@@ -1186,8 +1275,93 @@ fn mismatched_host_admission_fails_before_physical_mutation()
         journal
             .receipt(&CommandId::new("stale_host_admission")?)
             .map(|receipt| &receipt.state),
-        Some(CommandState::Rejected { reason }) if reason == "host_admission_invalid"
+        Some(CommandState::Rejected { reason }) if reason == "dispatch_revalidation_failed"
     ));
+    Ok(())
+}
+
+#[test]
+fn async_completion_after_admission_ttl_is_unknown_and_never_retried()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let launch = launch(&directory, "LIVE")?;
+    let owner = owner(launch.binding())?;
+    let command_id = CommandId::new("async_expired_after_await")?;
+    let counters = AsyncGatewayCounters::new();
+    let boundary = TokioPhysicalGateway::new(
+        FakeAsyncGateway::new(
+            launch.binding().clone(),
+            vec![ReadbackPlan::initial()],
+            vec![AsyncDispatchPlan::Acknowledged],
+            counters.clone(),
+        ),
+        TestTokioRuntime::advance_after_run(1_000, 3, 11_000),
+        AsyncGatewayTimeouts::default(),
+    )?;
+    let mut host = NodeSafetyHost::open_for_test(
+        &launch,
+        owner.clone(),
+        boundary,
+        Some(canary_for(launch.binding(), &owner, command_id.as_str())?),
+        1_000,
+    )?;
+    let prepared =
+        host.prepare_dispatch(entry_command(launch.binding(), command_id.as_str())?, 1_000)?;
+    let (capability, evidence) = admitted_capability(launch.binding(), &prepared, 1_000)?;
+    assert_eq!(
+        host.dispatch_admitted_for_test(prepared, capability, evidence, 1_000)?,
+        DispatchOutcome::Unknown
+    );
+    assert_eq!(counters.dispatch.load(Ordering::SeqCst), 1);
+    let journal = CommandJournal::open(journal_path(&launch))?;
+    assert!(matches!(
+        journal.receipt(&command_id).map(|receipt| &receipt.state),
+        Some(CommandState::Unknown { reason }) if reason == "gateway_result_unknown"
+    ));
+    Ok(())
+}
+
+#[test]
+fn sealed_admission_rechecks_gateway_version_and_flags_before_send()
+-> Result<(), Box<dyn std::error::Error>> {
+    for drift in ["version", "flags"] {
+        let directory = tempfile::tempdir()?;
+        let launch = launch(&directory, "LIVE")?;
+        let owner = owner(launch.binding())?;
+        let command_id = CommandId::new(format!("sealed_gateway_{drift}"))?;
+        let dispatch_calls = Arc::new(AtomicUsize::new(0));
+        let mut host = NodeSafetyHost::open_for_test(
+            &launch,
+            owner.clone(),
+            FakeGateway::new(launch.binding().clone(), vec![ReadbackPlan::initial()])
+                .with_counter(Arc::clone(&dispatch_calls)),
+            Some(canary_for(launch.binding(), &owner, command_id.as_str())?),
+            1_000,
+        )?;
+        let prepared =
+            host.prepare_dispatch(entry_command(launch.binding(), command_id.as_str())?, 1_000)?;
+        let (capability, evidence) = admitted_capability(launch.binding(), &prepared, 1_000)?;
+        let snapshot = &mut host.gateway_mut_for_test().capability;
+        if drift == "version" {
+            snapshot.version = snapshot.version.saturating_add(1);
+        } else {
+            snapshot.flags.remove(CapabilityFlags::PLACE_LIMIT);
+        }
+
+        assert!(matches!(
+            host.dispatch_admitted_for_test(prepared, capability, evidence, 1_001),
+            Err(SafeHostError::GatewayApi(
+                venue_gateway_api::GatewayApiError::CapabilityScope
+                    | venue_gateway_api::GatewayApiError::CapabilityDenied
+            ))
+        ));
+        assert_eq!(dispatch_calls.load(Ordering::SeqCst), 0);
+        let journal = CommandJournal::open(journal_path(&launch))?;
+        assert!(matches!(
+            journal.receipt(&command_id).map(|receipt| &receipt.state),
+            Some(CommandState::Rejected { reason }) if reason == "dispatch_revalidation_failed"
+        ));
+    }
     Ok(())
 }
 
