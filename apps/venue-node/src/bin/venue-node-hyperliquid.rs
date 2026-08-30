@@ -51,15 +51,13 @@ fn run() -> Result<(), NodeError> {
         mode: adapter.mode(),
         endpoints: &[adapter.rest_origin(), adapter.websocket()],
         credential_environment: &[
-            "HYPERLIQUID_MASTER_ADDRESS",
-            "HYPERLIQUID_USER_ADDRESS",
+            "HYPERLIQUID_ACCOUNT_ADDRESS",
+            "HYPERLIQUID_API_WALLET_ADDRESS",
+            "HYPERLIQUID_API_WALLET_PRIVATE_KEY",
             "HYPERLIQUID_VAULT_ADDRESS",
-            "HYPERLIQUID_AGENT_NAME",
-            "HYPERLIQUID_AGENT_ADDRESS",
-            "HYPERLIQUID_AGENT_PRIVATE_KEY",
         ],
         credential_prefix: "HYPERLIQUID_",
-        account_binding: "usdc_perpetual_agent",
+        account_binding: "usdc_perpetual_api_wallet",
     }
     .validate(launch.binding())?;
     let _isolated_artifacts_root = launch.artifacts_root();

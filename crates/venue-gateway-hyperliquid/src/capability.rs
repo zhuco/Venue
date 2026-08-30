@@ -17,7 +17,7 @@ use crate::{
     parse_user_fills_page, validate_frontend_open_orders_snapshot,
 };
 
-pub const HYPERLIQUID_CAPABILITY_PROBE_SCHEMA: u16 = 2;
+pub const HYPERLIQUID_CAPABILITY_PROBE_SCHEMA: u16 = 3;
 pub const HYPERLIQUID_CAPABILITY_PROBE_MAX_TTL_MS: u64 = 60_000;
 const HYPERLIQUID_RECOVERY_PROFILE_VERSION: u64 = 1;
 type RawOrderIdentity = (HyperliquidOrderFamily, Symbol, u64, Option<String>);
@@ -240,7 +240,7 @@ impl HyperliquidProbeCollectionScope {
         }
         Ok(Self {
             binding: meta.scope.binding().gateway().gateway_binding().clone(),
-            master_address: credentials.master_address().to_owned(),
+            master_address: credentials.account_address().to_owned(),
             user_address: credentials.user_address().to_owned(),
             vault_address: credentials.vault_address().map(str::to_owned),
             native_coin: meta.scope.native_coin().to_owned(),
@@ -837,7 +837,6 @@ struct CapabilityProbePayload {
     user_address: String,
     vault_address: Option<String>,
     agent_address: String,
-    agent_name: String,
     native_coin: String,
     asset_index: u32,
     account_exchange_time_ms: u64,
@@ -906,11 +905,10 @@ impl HyperliquidCapabilityProbeEvidence {
             expires_ms: collection_scope.expires_ms,
             connection_generation: collection_scope.connection_generation,
             private_generation: private_stream.private_generation,
-            master_address: credentials.master_address().to_owned(),
+            master_address: credentials.account_address().to_owned(),
             user_address: credentials.user_address().to_owned(),
             vault_address: credentials.vault_address().map(str::to_owned),
-            agent_address: credentials.agent_address().to_owned(),
-            agent_name: credentials.agent_name().to_owned(),
+            agent_address: credentials.api_wallet_address().to_owned(),
             native_coin: meta.scope.native_coin().to_owned(),
             asset_index: meta.asset_index,
             account_exchange_time_ms: account.exchange_time_ms,
@@ -1087,7 +1085,6 @@ fn validate_persisted_payload(payload: &CapabilityProbePayload) -> Result<(), Hy
         || payload.withdrawals_permitted
         || payload.master_address.is_empty()
         || payload.agent_address.is_empty()
-        || payload.agent_name.is_empty()
         || payload.native_coin.is_empty()
         || !valid_hex_digest(&payload.meta_commitment_keccak256)
         || !valid_hex_digest(&payload.account_commitment_keccak256)
@@ -1564,11 +1561,10 @@ fn replay_raw_payloads(
     payload: &CapabilityProbePayload,
     credentials: &HyperliquidCredentials,
 ) -> Result<(), HyperliquidError> {
-    if credentials.master_address() != payload.master_address
+    if credentials.account_address() != payload.master_address
         || credentials.user_address() != payload.user_address
         || credentials.vault_address() != payload.vault_address.as_deref()
-        || credentials.agent_address() != payload.agent_address
-        || credentials.agent_name() != payload.agent_name
+        || credentials.api_wallet_address() != payload.agent_address
     {
         return Err(HyperliquidError::CapabilityProbe);
     }

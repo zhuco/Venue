@@ -81,7 +81,7 @@ pub const fn capabilities() -> CapabilityFlags {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum HyperliquidError {
-    #[error("Hyperliquid named Agent credentials are unavailable or invalid")]
+    #[error("Hyperliquid account and API Wallet credentials are unavailable or invalid")]
     Credentials,
     #[error("Hyperliquid nonce state is invalid, mismatched, or exhausted")]
     Nonce,
@@ -195,51 +195,41 @@ mod tests {
     }
 
     #[test]
-    fn named_agent_credentials_reject_an_owner_declared_as_the_agent() {
-        let result = HyperliquidCredentials::from_values(
-            USER,
-            USER,
-            None,
-            "venue-agent",
-            USER,
-            "11".repeat(32),
-        );
+    fn api_wallet_credentials_bind_account_vault_address_and_derived_signer() {
+        let result = HyperliquidCredentials::from_values(USER, None, USER, "11".repeat(32));
         assert!(matches!(result, Err(HyperliquidError::Credentials)));
-        let credential = HyperliquidCredentials::from_values(
+        let credential = HyperliquidCredentials::from_values(USER, None, AGENT, "11".repeat(32));
+        assert!(credential.is_ok());
+        let vault = "0x0000000000000000000000000000000000000002";
+        let vault_credential = HyperliquidCredentials::from_values(
             USER,
-            USER,
-            None,
-            "venue-agent",
+            Some(vault.to_owned()),
             AGENT,
             "11".repeat(32),
         );
-        assert!(credential.is_ok());
+        assert!(matches!(
+            vault_credential,
+            Ok(ref credentials)
+                if credentials.account_address() == USER
+                    && credentials.user_address() == vault
+                    && credentials.vault_address() == Some(vault)
+                    && credentials.api_wallet_address() == AGENT
+        ));
         let vault_owner = HyperliquidCredentials::from_values(
             USER,
-            USER,
             Some(AGENT.to_owned()),
-            "venue-agent",
             AGENT.to_ascii_uppercase().replace("0X", "0x"),
             "11".repeat(32),
         );
         assert!(matches!(vault_owner, Err(HyperliquidError::Credentials)));
         assert!(matches!(
-            HyperliquidCredentials::from_values(
-                USER,
-                USER,
-                None,
-                "venue-agent",
-                AGENT,
-                "12".repeat(32),
-            ),
+            HyperliquidCredentials::from_values(USER, None, AGENT, "12".repeat(32),),
             Err(HyperliquidError::Credentials)
         ));
         assert!(matches!(
             HyperliquidCredentials::from_values(
                 "0x0000000000000000000000000000000000000000",
-                "0x0000000000000000000000000000000000000000",
                 None,
-                "venue-agent",
                 AGENT,
                 "11".repeat(32),
             ),

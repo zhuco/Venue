@@ -6,7 +6,7 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $CargoTargetDir) {
-    $CargoTargetDir = Join-Path ([System.IO.Path]::GetTempPath()) 'venue-node-verification-target'
+    $CargoTargetDir = Join-Path 'G:\Build\Venue' "venue-node-verification-target-$PID"
 }
 $targetRoot = [System.IO.Path]::GetFullPath($CargoTargetDir)
 $repoRootFull = [System.IO.Path]::GetFullPath($repoRoot)
@@ -41,12 +41,10 @@ function Test-FailClosedNode {
     $credentialNames = @{
         bybit = @('BYBIT_API_KEY', 'BYBIT_API_SECRET')
         hyperliquid = @(
-            'HYPERLIQUID_MASTER_ADDRESS',
-            'HYPERLIQUID_USER_ADDRESS',
-            'HYPERLIQUID_VAULT_ADDRESS',
-            'HYPERLIQUID_AGENT_NAME',
-            'HYPERLIQUID_AGENT_ADDRESS',
-            'HYPERLIQUID_AGENT_PRIVATE_KEY'
+            'HYPERLIQUID_ACCOUNT_ADDRESS',
+            'HYPERLIQUID_API_WALLET_ADDRESS',
+            'HYPERLIQUID_API_WALLET_PRIVATE_KEY',
+            'HYPERLIQUID_VAULT_ADDRESS'
         )
         okx = @('OKX_API_KEY', 'OKX_API_SECRET', 'OKX_API_PASSPHRASE')
     }
@@ -90,9 +88,17 @@ function Test-FailClosedNode {
         if (-not $process.Start()) {
             throw "无法启动 $Venue $mode 失败关闭探针。"
         }
-        $stdout = $process.StandardOutput.ReadToEnd()
-        $stderr = $process.StandardError.ReadToEnd()
-        $process.WaitForExit()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(15000)) {
+            $process.Kill($true)
+            $process.WaitForExit()
+            [void]$stdoutTask.GetAwaiter().GetResult()
+            [void]$stderrTask.GetAwaiter().GetResult()
+            throw "$Venue $mode 缺证据探针未在 15 秒内失败关闭。"
+        }
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
         if ($process.ExitCode -eq 0) {
             throw "$Venue $mode 在安全证据未闭环时错误地成功启动。"
         }

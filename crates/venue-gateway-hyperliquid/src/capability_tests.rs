@@ -81,7 +81,7 @@ fn meta() -> Result<HyperliquidPerpMeta, Box<dyn std::error::Error>> {
 }
 
 fn credentials() -> Result<HyperliquidCredentials, HyperliquidError> {
-    HyperliquidCredentials::from_values(USER, USER, None, "venue-agent", AGENT, AGENT_KEY)
+    HyperliquidCredentials::from_values(USER, None, AGENT, AGENT_KEY)
 }
 
 #[test]

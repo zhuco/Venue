@@ -4,107 +4,90 @@ use sha3::{Digest, Keccak256};
 
 use crate::HyperliquidError;
 
-/// Request-scoped Hyperliquid Agent/API Wallet material. It intentionally has no `Debug`,
+/// Request-scoped Hyperliquid API Wallet material. It intentionally has no `Debug`,
 /// `Clone`, serialization, or public secret accessor.
 pub struct HyperliquidCredentials {
-    master_address: String,
+    account_address: String,
     user_address: String,
     vault_address: Option<String>,
-    agent_name: String,
-    agent_address: String,
-    agent_private_key: SecretString,
+    api_wallet_address: String,
+    api_wallet_private_key: SecretString,
 }
 
 impl HyperliquidCredentials {
     pub fn from_environment() -> Result<Self, HyperliquidError> {
-        let master_address = std::env::var("HYPERLIQUID_MASTER_ADDRESS")
+        let account_address = std::env::var("HYPERLIQUID_ACCOUNT_ADDRESS")
             .map_err(|_| HyperliquidError::Credentials)?;
-        let user_address =
-            std::env::var("HYPERLIQUID_USER_ADDRESS").map_err(|_| HyperliquidError::Credentials)?;
-        let vault_address = std::env::var("HYPERLIQUID_VAULT_ADDRESS").ok();
-        let agent_name =
-            std::env::var("HYPERLIQUID_AGENT_NAME").map_err(|_| HyperliquidError::Credentials)?;
-        let agent_address = std::env::var("HYPERLIQUID_AGENT_ADDRESS")
+        let vault_address = std::env::var("HYPERLIQUID_VAULT_ADDRESS")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let api_wallet_address = std::env::var("HYPERLIQUID_API_WALLET_ADDRESS")
             .map_err(|_| HyperliquidError::Credentials)?;
-        let agent_private_key = SecretString::from(
-            std::env::var("HYPERLIQUID_AGENT_PRIVATE_KEY")
+        let api_wallet_private_key = SecretString::from(
+            std::env::var("HYPERLIQUID_API_WALLET_PRIVATE_KEY")
                 .map_err(|_| HyperliquidError::Credentials)?,
         );
         Self::from_secrets(
-            master_address,
-            user_address,
+            account_address,
             vault_address,
-            agent_name,
-            agent_address,
-            agent_private_key,
+            api_wallet_address,
+            api_wallet_private_key,
         )
     }
 
     #[cfg(test)]
     pub(crate) fn from_values(
-        master_address: impl Into<String>,
-        user_address: impl Into<String>,
+        account_address: impl Into<String>,
         vault_address: Option<String>,
-        agent_name: impl Into<String>,
-        agent_address: impl Into<String>,
-        agent_private_key: impl Into<String>,
+        api_wallet_address: impl Into<String>,
+        api_wallet_private_key: impl Into<String>,
     ) -> Result<Self, HyperliquidError> {
         Self::from_secrets(
-            master_address.into(),
-            user_address.into(),
+            account_address.into(),
             vault_address,
-            agent_name.into(),
-            agent_address.into(),
-            SecretString::from(agent_private_key.into()),
+            api_wallet_address.into(),
+            SecretString::from(api_wallet_private_key.into()),
         )
     }
 
     fn from_secrets(
-        master_address: String,
-        user_address: String,
+        account_address: String,
         vault_address: Option<String>,
-        agent_name: String,
-        agent_address: String,
-        agent_private_key: SecretString,
+        api_wallet_address: String,
+        api_wallet_private_key: SecretString,
     ) -> Result<Self, HyperliquidError> {
-        let master_address = normalize_address(&master_address)?;
-        let user_address = normalize_address(&user_address)?;
+        let account_address = normalize_address(&account_address)?;
         let vault_address = vault_address
             .as_deref()
             .map(normalize_address)
             .transpose()?;
-        let agent_address = normalize_address(&agent_address)?;
-        let signing_key = signing_key(agent_private_key.expose_secret())?;
-        let derived_agent_address = address_from_signing_key(&signing_key)?;
-        let expected_user = vault_address.as_deref().unwrap_or(&master_address);
-        let distinct_agent = agent_address != master_address
-            && agent_address != user_address
+        let user_address = vault_address
+            .as_deref()
+            .unwrap_or(&account_address)
+            .to_owned();
+        let api_wallet_address = normalize_address(&api_wallet_address)?;
+        let signing_key = signing_key(api_wallet_private_key.expose_secret())?;
+        let derived_api_wallet_address = address_from_signing_key(&signing_key)?;
+        let distinct_api_wallet = api_wallet_address != account_address
+            && api_wallet_address != user_address
             && vault_address
                 .as_ref()
-                .is_none_or(|vault| vault != &agent_address);
-        if user_address != expected_user
-            || agent_address != derived_agent_address
-            || !distinct_agent
-            || agent_name.trim().is_empty()
-            || agent_name.trim() != agent_name
-            || agent_name.len() > 128
-            || agent_name.chars().any(char::is_control)
-        {
+                .is_none_or(|vault| vault != &api_wallet_address);
+        if api_wallet_address != derived_api_wallet_address || !distinct_api_wallet {
             return Err(HyperliquidError::Credentials);
         }
         Ok(Self {
-            master_address,
+            account_address,
             user_address,
             vault_address,
-            agent_name,
-            agent_address,
-            agent_private_key,
+            api_wallet_address,
+            api_wallet_private_key,
         })
     }
 
     #[must_use]
-    pub fn master_address(&self) -> &str {
-        &self.master_address
+    pub fn account_address(&self) -> &str {
+        &self.account_address
     }
 
     #[must_use]
@@ -118,27 +101,22 @@ impl HyperliquidCredentials {
     }
 
     #[must_use]
-    pub fn agent_name(&self) -> &str {
-        &self.agent_name
-    }
-
-    #[must_use]
-    pub fn agent_address(&self) -> &str {
-        &self.agent_address
+    pub fn api_wallet_address(&self) -> &str {
+        &self.api_wallet_address
     }
 
     #[must_use]
     pub fn public_binding(&self) -> (&str, &str, Option<&str>, &str) {
         (
-            &self.master_address,
+            &self.account_address,
             &self.user_address,
             self.vault_address.as_deref(),
-            &self.agent_name,
+            &self.api_wallet_address,
         )
     }
 
     pub(crate) fn signing_key(&self) -> Result<SigningKey, HyperliquidError> {
-        signing_key(self.agent_private_key.expose_secret())
+        signing_key(self.api_wallet_private_key.expose_secret())
     }
 }
 

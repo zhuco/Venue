@@ -942,8 +942,7 @@ mod tests {
     async fn exchange_transport_dispatches_once_without_automatic_retry()
     -> Result<(), Box<dyn std::error::Error>> {
         let meta = meta(GatewayMode::Test)?;
-        let credentials =
-            HyperliquidCredentials::from_values(USER, USER, None, "venue-agent", AGENT, AGENT_KEY)?;
+        let credentials = HyperliquidCredentials::from_values(USER, None, AGENT, AGENT_KEY)?;
         let mut nonce_store = MemoryNonceStore::default();
         let nonce = reserve_next_nonce(&mut nonce_store, AGENT, 1_700_000_000_000)?;
         let order = HyperliquidAloOrder::new(

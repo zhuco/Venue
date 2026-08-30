@@ -58,14 +58,12 @@ $families = [ordered]@{
     hyperliquid = [ordered]@{
         endpoints = @('api.hyperliquid-testnet.xyz', 'api.hyperliquid.xyz')
         credentials = @(
-            'HYPERLIQUID_MASTER_ADDRESS',
-            'HYPERLIQUID_USER_ADDRESS',
-            'HYPERLIQUID_VAULT_ADDRESS',
-            'HYPERLIQUID_AGENT_NAME',
-            'HYPERLIQUID_AGENT_ADDRESS',
-            'HYPERLIQUID_AGENT_PRIVATE_KEY'
+            'HYPERLIQUID_ACCOUNT_ADDRESS',
+            'HYPERLIQUID_API_WALLET_ADDRESS',
+            'HYPERLIQUID_API_WALLET_PRIVATE_KEY',
+            'HYPERLIQUID_VAULT_ADDRESS'
         )
-        binding = @('usdc_perpetual_agent')
+        binding = @('usdc_perpetual_api_wallet')
     }
     okx = [ordered]@{
         endpoints = @('www.okx.com', 'wspap.okx.com', 'ws.okx.com')

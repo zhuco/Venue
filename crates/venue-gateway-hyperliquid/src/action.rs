@@ -918,7 +918,7 @@ fn signed_request(
         .eq_ignore_ascii_case(credentials.user_address())
         || !nonce
             .agent_address()
-            .eq_ignore_ascii_case(credentials.agent_address())
+            .eq_ignore_ascii_case(credentials.api_wallet_address())
         || expires_after_ms.is_some_and(|value| value <= nonce.value())
     {
         return Err(HyperliquidError::Binding);
@@ -1278,8 +1278,7 @@ mod tests {
     #[test]
     fn narrow_action_wires_are_bound_signed_and_strict() -> Result<(), Box<dyn std::error::Error>> {
         let meta = meta(GatewayMode::Test, USER)?;
-        let credentials =
-            HyperliquidCredentials::from_values(USER, USER, None, "venue-agent", AGENT, AGENT_KEY)?;
+        let credentials = HyperliquidCredentials::from_values(USER, None, AGENT, AGENT_KEY)?;
         let mut nonce_store = MemoryNonceStore::default();
         let nonce = reserve_next_nonce(&mut nonce_store, AGENT, 1_700_000_000_000)?;
         let alo = HyperliquidAloOrder::new(
@@ -1352,8 +1351,7 @@ mod tests {
     fn acknowledged_and_unknown_actions_converge_only_through_bound_readback()
     -> Result<(), Box<dyn std::error::Error>> {
         let meta = meta(GatewayMode::Test, USER)?;
-        let credentials =
-            HyperliquidCredentials::from_values(USER, USER, None, "venue-agent", AGENT, AGENT_KEY)?;
+        let credentials = HyperliquidCredentials::from_values(USER, None, AGENT, AGENT_KEY)?;
         let mut store = MemoryNonceStore::default();
         let nonce = reserve_next_nonce(&mut store, AGENT, 1_700_000_000_000)?;
         let request = build_alo_place_request(
@@ -1444,14 +1442,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         const VAULT: &str = "0x0000000000000000000000000000000000000002";
         let meta = meta(GatewayMode::Live, VAULT)?;
-        let credentials = HyperliquidCredentials::from_values(
-            USER,
-            VAULT,
-            Some(VAULT.to_owned()),
-            "venue-agent",
-            AGENT,
-            AGENT_KEY,
-        )?;
+        let credentials =
+            HyperliquidCredentials::from_values(USER, Some(VAULT.to_owned()), AGENT, AGENT_KEY)?;
         let mut store = MemoryNonceStore::default();
         let ioc_nonce = reserve_next_nonce(&mut store, AGENT, 1_700_000_000_000)?;
         let ioc = HyperliquidIocReduceOnlyOrder::new(
