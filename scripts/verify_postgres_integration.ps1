@@ -30,6 +30,13 @@ function Invoke-PostgresIntegrationTest {
     $exitCode = $LASTEXITCODE
     $output | ForEach-Object { Write-Output $_ }
     if ($exitCode -ne 0) {
+        if ($env:GITHUB_ACTIONS -eq 'true') {
+            $summary = @($output | Select-Object -Last 24) -join [Environment]::NewLine
+            $summary = $summary -replace 'postgres(?:ql)?://[^\s]+', '<redacted-postgresql-uri>'
+            $summary = $summary -replace '(?i)(password|private[_-]?key|api[_-]?key|secret)=\S+', '$1=<redacted>'
+            $summary = $summary.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=PostgreSQL integration test failed::$summary"
+        }
         throw "PostgreSQL integration test $TestTarget failed with exit code $exitCode"
     }
     if ($output | Select-String -SimpleMatch 'SKIP:') {
