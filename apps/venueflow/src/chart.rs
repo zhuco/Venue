@@ -81,10 +81,14 @@ impl ChartInterval {
 pub struct ChartViewport {
     visible_bars: usize,
     right_offset: usize,
+    right_padding: usize,
     #[serde(skip)]
     drag_remainder_milli_bars: i32,
     #[serde(skip)]
     drag_applied_milli_pixels: i32,
+    /// Only used to keep an explicitly inspected historical window stable as new bars arrive.
+    #[serde(skip)]
+    last_total_bars: usize,
 }
 
 impl Default for ChartViewport {
@@ -92,8 +96,10 @@ impl Default for ChartViewport {
         Self {
             visible_bars: DEFAULT_VISIBLE_BARS,
             right_offset: 0,
+            right_padding: 0,
             drag_remainder_milli_bars: 0,
             drag_applied_milli_pixels: 0,
+            last_total_bars: 0,
         }
     }
 }
@@ -107,28 +113,51 @@ impl ChartViewport {
         self.right_offset
     }
 
+    /// Virtual future slots shown after the newest visible candle following a leftward drag.
+    #[cfg(test)]
+    pub const fn right_padding(&self) -> usize {
+        self.right_padding
+    }
+
+    pub fn display_slots(&self, displayed_bars: usize) -> usize {
+        displayed_bars.saturating_add(self.right_padding).max(1)
+    }
+
     pub fn reset(&mut self) {
         self.visible_bars = DEFAULT_VISIBLE_BARS;
         self.right_offset = 0;
+        self.right_padding = 0;
         self.drag_remainder_milli_bars = 0;
         self.drag_applied_milli_pixels = 0;
+        self.last_total_bars = 0;
     }
 
     pub fn follow_latest(&mut self) {
         self.right_offset = 0;
+        self.right_padding = 0;
         self.drag_remainder_milli_bars = 0;
         self.drag_applied_milli_pixels = 0;
+        self.last_total_bars = 0;
     }
 
     pub fn visible_range(&mut self, total_bars: usize) -> Range<usize> {
         if total_bars == 0 {
             self.right_offset = 0;
+            self.right_padding = 0;
+            self.last_total_bars = 0;
             return 0..0;
         }
         self.visible_bars = self.visible_bars.clamp(MIN_VISIBLE_BARS, MAX_VISIBLE_BARS);
         let count = self.visible_bars.min(total_bars);
+        if self.right_offset > 0 && total_bars > self.last_total_bars {
+            self.right_offset = self
+                .right_offset
+                .saturating_add(total_bars.saturating_sub(self.last_total_bars));
+        }
         let maximum_offset = total_bars.saturating_sub(count);
         self.right_offset = self.right_offset.min(maximum_offset);
+        self.right_padding = self.right_padding.min(count);
+        self.last_total_bars = total_bars;
         let end = total_bars.saturating_sub(self.right_offset);
         end.saturating_sub(count)..end
     }
@@ -137,17 +166,25 @@ impl ChartViewport {
     pub fn pan_by_bars(&mut self, total_bars: usize, delta: isize) {
         let visible = self.visible_range(total_bars);
         let maximum_offset = total_bars.saturating_sub(visible.len());
-        self.right_offset = if delta.is_negative() {
-            self.right_offset.saturating_sub(delta.unsigned_abs())
+        let amount = delta.unsigned_abs();
+        if delta.is_negative() {
+            let from_history = amount.min(self.right_offset);
+            self.right_offset = self.right_offset.saturating_sub(from_history);
+            self.right_padding = self
+                .right_padding
+                .saturating_sub(amount.saturating_sub(from_history));
         } else {
-            self.right_offset
-                .saturating_add(delta.unsigned_abs())
-                .min(maximum_offset)
-        };
+            let into_padding = amount.min(visible.len().saturating_sub(self.right_padding));
+            self.right_padding = self.right_padding.saturating_add(into_padding);
+            self.right_offset = self
+                .right_offset
+                .saturating_add(amount.saturating_sub(into_padding))
+                .min(maximum_offset);
+        }
     }
 
-    /// Converts a horizontal drag into whole-candle panning. Dragging left reveals history, while
-    /// dragging right returns towards live data. Sub-candle movement is retained during the drag.
+    /// Converts a horizontal drag into whole-candle panning. Leftward drags first make room after
+    /// the latest candle, then reveal history; rightward drags return towards live data.
     pub fn pan_by_drag(&mut self, total_bars: usize, chart_width: f32, drag_delta_x: f32) {
         let visible = self.visible_range(total_bars);
         if visible.is_empty() || !chart_width.is_finite() || chart_width <= 0.0 {
@@ -194,7 +231,7 @@ impl ChartViewport {
         requested_visible_bars: usize,
         anchor_ratio: f32,
     ) {
-        let was_following_latest = self.right_offset == 0;
+        let was_following_latest = self.right_offset == 0 && self.right_padding == 0;
         let current = self.visible_range(total_bars);
         if current.is_empty() {
             self.visible_bars = requested_visible_bars.clamp(MIN_VISIBLE_BARS, MAX_VISIBLE_BARS);
@@ -303,6 +340,37 @@ impl PriceRange {
         }
         Some(self.high - f64::from((y - top) / height) * span)
     }
+
+    /// Returns grid prices aligned to an integer number of exchange price ticks.
+    pub fn grid_prices(self, price_scale: usize, target_rows: usize) -> Vec<f64> {
+        let tick = 10_f64.powi(-(price_scale.min(18) as i32));
+        let target_rows = target_rows.max(1) as f64;
+        let ideal_ticks = ((self.high - self.low) / target_rows / tick)
+            .ceil()
+            .max(1.0);
+        let magnitude = 10_f64.powf(ideal_ticks.log10().floor());
+        let normalized = ideal_ticks / magnitude;
+        let integer_ticks = if normalized <= 1.0 {
+            1.0
+        } else if normalized <= 2.0 {
+            2.0
+        } else if normalized <= 5.0 {
+            5.0
+        } else {
+            10.0
+        } * magnitude;
+        let step = integer_ticks * tick;
+        if !step.is_finite() || step <= 0.0 {
+            return Vec::new();
+        }
+        let mut price = (self.low / step).ceil() * step;
+        let mut lines = Vec::new();
+        while price <= self.high + step * 0.000_001 && lines.len() < 128 {
+            lines.push(price);
+            price += step;
+        }
+        lines
+    }
 }
 
 pub fn bar_center_x(left: f32, width: f32, count: usize, index: usize) -> Option<f32> {
@@ -354,7 +422,7 @@ mod tests {
         assert_eq!(viewport.visible_bars(), 120);
         assert_eq!(viewport.visible_range(500), 380..500);
         viewport.pan_by_bars(500, 200);
-        assert_eq!(viewport.visible_range(500), 180..300);
+        assert_eq!(viewport.visible_range(500), 300..420);
         viewport.pan_by_bars(500, 999);
         assert_eq!(viewport.visible_range(500), 0..120);
         viewport.pan_by_bars(500, -999);
@@ -383,16 +451,40 @@ mod tests {
         assert_eq!(viewport.visible_range(501).end, 501);
 
         viewport.pan_by_drag(501, 1_000.0, -100.0);
-        assert!(viewport.right_offset() > 0);
+        assert!(viewport.right_padding() > 0);
     }
 
     #[test]
     fn drag_pans_by_candle_width() {
         let mut viewport = ChartViewport::default();
         viewport.pan_by_drag(500, 120.0, -20.0);
-        assert_eq!(viewport.right_offset(), 20);
-        viewport.pan_by_drag(500, 120.0, 20.0);
+        assert_eq!(viewport.right_padding(), 20);
         assert_eq!(viewport.right_offset(), 0);
+        viewport.pan_by_drag(500, 120.0, 20.0);
+        assert_eq!(viewport.right_padding(), 0);
+        assert_eq!(viewport.right_offset(), 0);
+    }
+
+    #[test]
+    fn drag_moves_the_latest_candle_left_before_entering_history() {
+        let mut viewport = ChartViewport::default();
+        viewport.pan_by_bars(500, 60);
+        assert_eq!(viewport.right_padding(), 60);
+        assert_eq!(viewport.visible_range(500), 380..500);
+        assert_eq!(viewport.display_slots(120), 180);
+
+        viewport.pan_by_bars(500, 100);
+        assert_eq!(viewport.right_padding(), 120);
+        assert_eq!(viewport.right_offset(), 40);
+    }
+
+    #[test]
+    fn historical_window_does_not_shift_when_live_bars_arrive() {
+        let mut viewport = ChartViewport::default();
+        viewport.pan_by_bars(500, 130);
+        let before = viewport.visible_range(500);
+        assert_eq!(before, 370..490);
+        assert_eq!(viewport.visible_range(501), before);
     }
 
     #[test]
@@ -401,10 +493,10 @@ mod tests {
         for _ in 0..5 {
             viewport.pan_by_drag(500, 1_200.0, -2.0);
         }
-        assert_eq!(viewport.right_offset(), 1);
+        assert_eq!(viewport.right_padding(), 1);
         viewport.finish_drag();
         viewport.pan_by_drag(500, 1_200.0, -2.0);
-        assert_eq!(viewport.right_offset(), 1);
+        assert_eq!(viewport.right_padding(), 1);
     }
 
     #[test]
@@ -412,10 +504,10 @@ mod tests {
         let mut viewport = ChartViewport::default();
         viewport.pan_by_drag_total(500, 1_200.0, -60.0);
         viewport.pan_by_drag_total(500, 1_200.0, -120.0);
-        assert_eq!(viewport.right_offset(), 12);
+        assert_eq!(viewport.right_padding(), 12);
         viewport.finish_drag();
         viewport.pan_by_drag_total(500, 1_200.0, -120.0);
-        assert_eq!(viewport.right_offset(), 24);
+        assert_eq!(viewport.right_padding(), 24);
     }
 
     #[test]
@@ -431,6 +523,14 @@ mod tests {
             .y_to_price(10.0, 100.0, y)
             .ok_or("chart coordinate maps to price")?;
         assert!((price - 105.0).abs() < 0.0001);
+        Ok(())
+    }
+
+    #[test]
+    fn price_grid_uses_integer_exchange_ticks() -> Result<(), String> {
+        let range = PriceRange::from_extrema(99.2, 100.8).ok_or("valid price range is required")?;
+        let lines = range.grid_prices(1, 4);
+        assert_eq!(lines, vec![99.5, 100.0, 100.5]);
         Ok(())
     }
 

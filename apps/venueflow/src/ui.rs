@@ -222,7 +222,6 @@ pub fn show_top_bar(
             show_symbol_picker_popup(&search_response, show_symbol_picker, model, workspaces);
         });
 }
-
 fn show_symbol_picker_popup(
     anchor: &egui::Response,
     open: &mut bool,
@@ -362,7 +361,6 @@ fn show_symbol_picker_popup(
         *open = false;
     }
 }
-
 pub fn show_status_bar(ui: &mut egui::Ui, model: &AppModel) {
     let language = model.preferences.language;
     let generated = model
@@ -414,7 +412,6 @@ pub fn show_status_bar(ui: &mut egui::Ui, model: &AppModel) {
             });
         });
 }
-
 pub fn show_confirmation(context: &egui::Context, model: &mut AppModel, client: &ControlClient) {
     let Some(mut pending) = model.pending_confirmation.take() else {
         return;
@@ -466,7 +463,6 @@ pub fn show_confirmation(context: &egui::Context, model: &mut AppModel, client: 
         model.pending_confirmation = Some(pending);
     }
 }
-
 pub fn show_modules(
     context: &egui::Context,
     open: &mut bool,
@@ -485,7 +481,6 @@ pub fn show_modules(
             }
         });
 }
-
 fn connection_badge(ui: &mut egui::Ui, state: ConnectionState, language: Language) {
     let (label, color) = match state {
         ConnectionState::Connecting => (text(language, TextKey::Connecting), theme::WARNING),
@@ -495,7 +490,6 @@ fn connection_badge(ui: &mut egui::Ui, state: ConnectionState, language: Languag
     };
     ui.colored_label(color, RichText::new(label).strong());
 }
-
 fn show_market_watch(ui: &mut egui::Ui, model: &mut AppModel) {
     let language = model.preferences.language;
     pane_heading(
@@ -560,7 +554,6 @@ fn show_market_watch(ui: &mut egui::Ui, model: &mut AppModel) {
             });
     });
 }
-
 fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
     let language = model.preferences.language;
     let symbol = pane
@@ -628,7 +621,6 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
         model.indicator_settings_requested = true;
     }
 }
-
 fn show_chart_toolbar(ui: &mut egui::Ui, pane: &mut Pane, language: Language) -> bool {
     let mut settings_requested = false;
     ui.horizontal(|ui| {
@@ -671,7 +663,6 @@ fn show_chart_toolbar(ui: &mut egui::Ui, pane: &mut Pane, language: Language) ->
     });
     settings_requested
 }
-
 fn candle_plot(
     ui: &mut egui::Ui,
     all_bars: &[UiBar],
@@ -721,7 +712,8 @@ fn candle_plot(
     }
 
     let range = viewport.visible_range(all_bars.len());
-    let bars = &all_bars[range];
+    let bars = &all_bars[range.clone()];
+    let display_slots = viewport.display_slots(bars.len());
     let has_local_studies = !all_studies.is_empty();
     let sub_count = if has_local_studies {
         [
@@ -777,14 +769,14 @@ fn candle_plot(
     let Some(price_range) = PriceRange::from_bars(bars) else {
         return;
     };
-    let width = price_rect.width() / bars.len() as f32;
+    let width = price_rect.width() / display_slots as f32;
     let price_y = |price: f64| {
         price_range
             .price_to_y(price_rect.top(), price_rect.height(), price)
             .unwrap_or(price_rect.center().y)
     };
-    for index in 0..=4 {
-        let y = price_rect.top() + price_rect.height() * index as f32 / 4.0;
+    for price in price_range.grid_prices(price_scale, 5) {
+        let y = price_y(price);
         painter.line_segment(
             [
                 Pos2::new(price_rect.left(), y),
@@ -792,19 +784,17 @@ fn candle_plot(
             ],
             Stroke::new(1.0, theme::CHART_GRID),
         );
-        if let Some(price) = price_range.y_to_price(price_rect.top(), price_rect.height(), y) {
-            painter.text(
-                Pos2::new(price_rect.right() - 3.0, y - 2.0),
-                Align2::RIGHT_BOTTOM,
-                format_f64_trimmed(price, price_scale),
-                FontId::monospace(f32::from(settings.chart_text_size)),
-                theme::TEXT_SECONDARY,
-            );
-        }
+        painter.text(
+            Pos2::new(price_rect.right() - 3.0, y - 2.0),
+            Align2::RIGHT_BOTTOM,
+            format_f64_trimmed(price, price_scale),
+            FontId::monospace(f32::from(settings.chart_text_size)),
+            theme::TEXT_SECONDARY,
+        );
     }
-    let vertical_grid_count = (price_rect.width() / 140.0).round().clamp(4.0, 12.0) as usize;
-    for index in 0..=vertical_grid_count {
-        let x = price_rect.left() + price_rect.width() * index as f32 / vertical_grid_count as f32;
+    let first_grid_slot = (15 - range.start % 15) % 15;
+    for index in (first_grid_slot..=display_slots).step_by(15) {
+        let x = price_rect.left() + width * index as f32;
         painter.line_segment(
             [
                 Pos2::new(x, price_rect.top()),
@@ -821,7 +811,7 @@ fn candle_plot(
     for (index, bar) in bars.iter().enumerate() {
         let open = decimal_to_f64(bar.open);
         let close = decimal_to_f64(bar.close);
-        let x = bar_center_x(price_rect.left(), price_rect.width(), bars.len(), index)
+        let x = bar_center_x(price_rect.left(), price_rect.width(), display_slots, index)
             .unwrap_or(price_rect.left());
         let color = if close >= open {
             theme::BUY
@@ -908,8 +898,13 @@ fn candle_plot(
                 );
             }
         }
-        if let Some(index) =
-            bar_index_at_x(price_rect.left(), price_rect.width(), bars.len(), pointer.x)
+        if let Some(index) = bar_index_at_x(
+            price_rect.left(),
+            price_rect.width(),
+            display_slots,
+            pointer.x,
+        )
+        .filter(|index| *index < bars.len())
         {
             let bar = &bars[index];
             let percent = |value| {
@@ -921,34 +916,66 @@ fn candle_plot(
             };
             let change_percent = percent(bar.close - bar.open);
             let amplitude_percent = percent(bar.high - bar.low);
-            painter.text(
-                price_rect.left_top() + egui::vec2(6.0, 6.0),
-                Align2::LEFT_TOP,
-                format!(
-                    "{}  {} {}  {} {}  {} {}  {} {}  {} {:+.2}%  {} {:.2}%  {} {}",
-                    bar.open_time_ms,
+            let label_format = egui::TextFormat {
+                font_id: FontId::monospace(f32::from(settings.chart_text_size)),
+                color: theme::TEXT_SECONDARY,
+                ..Default::default()
+            };
+            let value_format = egui::TextFormat {
+                color: if bar.close >= bar.open {
+                    theme::BUY
+                } else {
+                    theme::SELL
+                },
+                ..label_format.clone()
+            };
+            let mut stats = egui::text::LayoutJob::default();
+            stats.append(
+                &format!("{}  ", bar.open_time_ms),
+                0.0,
+                label_format.clone(),
+            );
+            for (label, value) in [
+                (
                     text(language, TextKey::Open),
                     format_decimal(bar.open, price_scale),
+                ),
+                (
                     text(language, TextKey::High),
                     format_decimal(bar.high, price_scale),
+                ),
+                (
                     text(language, TextKey::Low),
                     format_decimal(bar.low, price_scale),
+                ),
+                (
                     text(language, TextKey::Close),
                     format_decimal(bar.close, price_scale),
+                ),
+                (
                     text(language, TextKey::Change),
-                    decimal_to_f64(change_percent),
+                    format!("{:+.2}%", decimal_to_f64(change_percent)),
+                ),
+                (
                     text(language, TextKey::Amplitude),
-                    decimal_to_f64(amplitude_percent),
+                    format!("{:.2}%", decimal_to_f64(amplitude_percent)),
+                ),
+                (
                     text(language, TextKey::Volume),
                     format_decimal(bar.volume, quantity_scale),
                 ),
-                FontId::monospace(f32::from(settings.chart_text_size)),
+            ] {
+                stats.append(&format!("{label} "), 0.0, label_format.clone());
+                stats.append(&format!("{value}  "), 0.0, value_format.clone());
+            }
+            painter.galley(
+                price_rect.left_top() + egui::vec2(6.0, 6.0),
+                painter.layout_job(stats),
                 theme::TEXT_PRIMARY,
             );
         }
     }
 }
-
 fn draw_price_studies(
     painter: &egui::Painter,
     rect: Rect,
@@ -1030,7 +1057,6 @@ fn draw_price_studies(
         theme::TEXT_SECONDARY,
     );
 }
-
 fn draw_study_line(
     painter: &egui::Painter,
     rect: Rect,
@@ -1054,7 +1080,6 @@ fn draw_study_line(
         previous = current;
     }
 }
-
 fn draw_rsi_study(
     painter: &egui::Painter,
     rect: Rect,
@@ -1094,7 +1119,6 @@ fn draw_rsi_study(
         theme::TEXT_SECONDARY,
     );
 }
-
 fn draw_macd_study(
     painter: &egui::Painter,
     rect: Rect,
@@ -1172,7 +1196,6 @@ fn draw_macd_study(
         theme::TEXT_SECONDARY,
     );
 }
-
 fn draw_atr_study(
     painter: &egui::Painter,
     rect: Rect,
@@ -1204,14 +1227,12 @@ fn draw_atr_study(
         theme::TEXT_SECONDARY,
     );
 }
-
 fn study_at(studies: &[ChartStudyPoint], open_time_ms: u64) -> Option<&ChartStudyPoint> {
     studies
         .binary_search_by_key(&open_time_ms, |point| point.open_time_ms)
         .ok()
         .and_then(|index| studies.get(index))
 }
-
 fn show_order_book(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
     let language = model.preferences.language;
     let symbol = pane
@@ -1250,7 +1271,6 @@ fn show_order_book(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
         symbol,
     );
 }
-
 fn show_book_rows(
     ui: &mut egui::Ui,
     instance: u32,
@@ -1282,7 +1302,6 @@ fn show_book_rows(
             }
         });
 }
-
 fn show_trade_tape(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
     let language = model.preferences.language;
     let symbol = pane
@@ -1305,7 +1324,6 @@ fn show_trade_tape(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
     };
     show_trade_rows(ui, pane.instance, &market.trades, language, model, symbol);
 }
-
 fn show_trade_rows(
     ui: &mut egui::Ui,
     instance: u32,
@@ -1336,7 +1354,6 @@ fn show_trade_rows(
             });
     });
 }
-
 fn show_accounts(ui: &mut egui::Ui, model: &AppModel) {
     let language = model.preferences.language;
     pane_heading(
@@ -1393,7 +1410,6 @@ fn show_accounts(ui: &mut egui::Ui, model: &AppModel) {
         ui.small(text(language, TextKey::AccountAuthorityCaveat));
     });
 }
-
 fn show_strategies(ui: &mut egui::Ui, model: &mut AppModel) {
     let language = model.preferences.language;
     pane_heading(
@@ -1463,7 +1479,6 @@ fn show_strategies(ui: &mut egui::Ui, model: &mut AppModel) {
             });
     });
 }
-
 fn show_copy_relations(ui: &mut egui::Ui, model: &AppModel) {
     let language = model.preferences.language;
     pane_heading(
@@ -1501,7 +1516,6 @@ fn show_copy_relations(ui: &mut egui::Ui, model: &AppModel) {
         }
     });
 }
-
 fn show_ledger(ui: &mut egui::Ui, model: &AppModel) {
     let language = model.preferences.language;
     pane_heading(
@@ -1538,7 +1552,6 @@ fn show_ledger(ui: &mut egui::Ui, model: &AppModel) {
         });
     });
 }
-
 fn show_control(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
     let language = model.preferences.language;
     pane_heading(
@@ -1677,7 +1690,6 @@ fn show_control(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient)
             });
     }
 }
-
 fn submit_or_confirm(
     model: &mut AppModel,
     client: &ControlClient,
@@ -1691,7 +1703,6 @@ fn submit_or_confirm(
         send_command(model, client, request);
     }
 }
-
 fn send_command(model: &mut AppModel, client: &ControlClient, request: ControlCommandRequest) {
     match client.send(request.clone()) {
         Ok(()) => {
@@ -1705,7 +1716,6 @@ fn send_command(model: &mut AppModel, client: &ControlClient, request: ControlCo
         Err(error) => model.notice(format!("Control request rejected locally: {error}")),
     }
 }
-
 fn show_diagnostics(ui: &mut egui::Ui, model: &AppModel) {
     let language = model.preferences.language;
     pane_heading(
@@ -1837,7 +1847,6 @@ fn show_diagnostics(ui: &mut egui::Ui, model: &AppModel) {
         text(language, TextKey::PublicBoundary),
     );
 }
-
 fn receipt_state_label(ui: &mut egui::Ui, state: CommandState) {
     let color = match state {
         CommandState::Applied => theme::BUY,
@@ -1846,7 +1855,6 @@ fn receipt_state_label(ui: &mut egui::Ui, state: CommandState) {
     };
     ui.colored_label(color, format!("{state:?}"));
 }
-
 fn format_freshness(age_ms: Option<u64>) -> String {
     age_ms.map_or("unknown".to_owned(), |age_ms| {
         if age_ms < 1_000 {
@@ -1856,7 +1864,6 @@ fn format_freshness(age_ms: Option<u64>) -> String {
         }
     })
 }
-
 fn market<'a>(model: &'a AppModel, symbol: &str) -> Option<&'a MarketSummary> {
     model
         .snapshot
@@ -1865,7 +1872,6 @@ fn market<'a>(model: &'a AppModel, symbol: &str) -> Option<&'a MarketSummary> {
         .iter()
         .find(|market| market.symbol.to_string() == symbol)
 }
-
 fn available_symbols(model: &AppModel) -> Vec<String> {
     #[cfg(not(target_arch = "wasm32"))]
     if !model.local_symbols.is_empty() {
@@ -1883,18 +1889,15 @@ fn available_symbols(model: &AppModel) -> Vec<String> {
         })
         .unwrap_or_default()
 }
-
 fn favorite_rank(favorites: &[String], symbol: &str) -> usize {
     favorites
         .iter()
         .position(|favorite| favorite == symbol)
         .unwrap_or(favorites.len())
 }
-
 fn local_quote<'a>(model: &'a AppModel, symbol: &str) -> Option<&'a MarketQuote> {
     model.local_quotes.get(symbol)
 }
-
 fn symbol_tab_text(symbol: &str, details: &str, detail_color: Color32) -> egui::WidgetText {
     let mut job = egui::text::LayoutJob::default();
     job.append(
@@ -1917,7 +1920,6 @@ fn symbol_tab_text(symbol: &str, details: &str, detail_color: Color32) -> egui::
     );
     job.into()
 }
-
 fn format_f64_trimmed(value: f64, precision: usize) -> String {
     let formatted = format!("{value:.precision$}");
     if formatted.contains('.') {
@@ -1929,7 +1931,6 @@ fn format_f64_trimmed(value: f64, precision: usize) -> String {
         formatted
     }
 }
-
 #[cfg(not(target_arch = "wasm32"))]
 fn local_market<'a>(
     model: &'a AppModel,
@@ -1939,7 +1940,6 @@ fn local_market<'a>(
     let selection = MarketSelection::binance_usd_m(symbol, interval).ok()?;
     model.local_markets.view(&selection)
 }
-
 fn pane_heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
     ui.horizontal(|ui| {
         ui.strong(title);
