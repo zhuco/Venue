@@ -134,6 +134,16 @@ impl ActorDeliveryTurn {
 
     pub fn applied(
         self,
+        _observed_ms: u64,
+        _account_fact_digest: [u8; 32],
+        _detail: impl Into<String>,
+    ) -> Result<ActorDeliveryCompletion, ControlDeliveryError> {
+        Err(ControlDeliveryError::ActorAppliedUnavailable)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn applied_fixture(
+        self,
         observed_ms: u64,
         account_fact_digest: [u8; 32],
         detail: impl Into<String>,
@@ -146,6 +156,7 @@ impl ActorDeliveryTurn {
             observed_ms,
             account_fact_digest,
             detail.into(),
+            Some(ActorDurableAppliedAuthority(())),
         )
     }
 
@@ -160,6 +171,7 @@ impl ActorDeliveryTurn {
             observed_ms,
             account_fact_digest,
             detail.into(),
+            None,
         )
     }
 
@@ -174,6 +186,7 @@ impl ActorDeliveryTurn {
             observed_ms,
             account_fact_digest,
             detail.into(),
+            None,
         )
     }
 
@@ -183,6 +196,7 @@ impl ActorDeliveryTurn {
         observed_ms: u64,
         account_fact_digest: [u8; 32],
         detail: String,
+        applied_authority: Option<ActorDurableAppliedAuthority>,
     ) -> Result<ActorDeliveryCompletion, ControlDeliveryError> {
         validate_lease_time(&self.claim.lease, observed_ms)?;
         validate_detail(state, &detail)?;
@@ -193,6 +207,7 @@ impl ActorDeliveryTurn {
             observed_ms,
             account_fact_digest,
             detail,
+            applied_authority,
         })
     }
 
@@ -207,7 +222,11 @@ pub struct ActorDeliveryCompletion {
     observed_ms: u64,
     account_fact_digest: [u8; 32],
     detail: String,
+    applied_authority: Option<ActorDurableAppliedAuthority>,
 }
+
+#[derive(Debug)]
+struct ActorDurableAppliedAuthority(());
 
 impl ActorDeliveryCompletion {
     no_authority_methods!();
@@ -564,6 +583,17 @@ impl<J: ControlDeliveryJournal> ControlDeliveryInbox<J> {
         if completion.claim.lease.purpose != AccountDeliveryPurpose::Install {
             return Err(ControlDeliveryError::InvalidCompletion);
         }
+        match (completion.state, completion.applied_authority.as_ref()) {
+            (AccountDeliveryReceiptState::Applied, None) => {
+                return Err(ControlDeliveryError::ActorAppliedUnavailable);
+            }
+            (AccountDeliveryReceiptState::Applied, Some(_))
+            | (
+                AccountDeliveryReceiptState::Rejected | AccountDeliveryReceiptState::Unknown,
+                None,
+            ) => {}
+            _ => return Err(ControlDeliveryError::InvalidCompletion),
+        }
         let receipt = make_receipt(
             &completion.claim.lease,
             completion.durable_inbox_digest,
@@ -666,6 +696,59 @@ impl<J: ControlDeliveryJournal> ControlDeliveryInbox<J> {
                 (!delivery.receipt_confirmed.contains_key(&epoch)).then(|| receipt.clone())
             })
             .collect()
+    }
+
+    pub fn pending_actor_turns(
+        &self,
+        now_ms: u64,
+    ) -> Result<Vec<ActorDeliveryTurn>, ControlDeliveryError> {
+        self.require_open()?;
+        let mut turns = Vec::new();
+        for delivery in self.projection.deliveries.values() {
+            let Some((&epoch, accepted)) = delivery.claims.last_key_value() else {
+                continue;
+            };
+            if accepted.claim.lease.purpose == AccountDeliveryPurpose::Install
+                && delivery.ack_confirmed.contains_key(&epoch)
+                && !delivery.receipts.contains_key(&epoch)
+            {
+                if now_ms >= accepted.claim.lease.expires_at_ms {
+                    continue;
+                }
+                validate_lease_time(&accepted.claim.lease, now_ms)?;
+                turns.push(ActorDeliveryTurn {
+                    claim: accepted.claim.clone(),
+                    durable_inbox_digest: accepted.durable_inbox_digest,
+                });
+            }
+        }
+        Ok(turns)
+    }
+
+    pub fn pending_reconciliation_turns(
+        &self,
+        now_ms: u64,
+    ) -> Result<Vec<ReconciliationTurn>, ControlDeliveryError> {
+        self.require_open()?;
+        let mut turns = Vec::new();
+        for delivery in self.projection.deliveries.values() {
+            let Some((&epoch, accepted)) = delivery.claims.last_key_value() else {
+                continue;
+            };
+            if accepted.claim.lease.purpose == AccountDeliveryPurpose::ReconcileOnly
+                && !delivery.receipts.contains_key(&epoch)
+            {
+                if now_ms >= accepted.claim.lease.expires_at_ms {
+                    continue;
+                }
+                validate_lease_time(&accepted.claim.lease, now_ms)?;
+                turns.push(ReconciliationTurn {
+                    claim: accepted.claim.clone(),
+                    durable_inbox_digest: accepted.durable_inbox_digest,
+                });
+            }
+        }
+        Ok(turns)
     }
 
     fn record_completion(
@@ -1069,6 +1152,8 @@ pub enum ControlDeliveryError {
     AckConflict,
     #[error("control delivery completion is invalid")]
     InvalidCompletion,
+    #[error("Actor durable-applied authority is unavailable")]
+    ActorAppliedUnavailable,
     #[error("control delivery completion conflicts with durable state")]
     CompletionConflict,
     #[error("control delivery receipt is invalid")]

@@ -10,6 +10,8 @@ use venue_gateway_api::{CapabilityFlags, GatewayApiError, GatewayBinding, Gatewa
 
 mod async_gateway;
 mod control_delivery;
+mod control_delivery_storage;
+mod control_http_client;
 mod safe_host;
 mod supervision;
 
@@ -23,6 +25,13 @@ pub use control_delivery::{
     ControlDeliveryInbox, ControlDeliveryJournal, ControlDeliveryJournalError,
     ControlDeliveryJournalRecord, DurableDeliveryOutput, DurableStoreResult,
     ReconciliationCompletion, ReconciliationTurn,
+};
+pub use control_delivery_storage::OpaqueControlDeliveryJournal;
+pub use control_http_client::{
+    ControlDeliveryDriver, ControlDeliveryDriverError, ControlDeliveryWork, ControlHttpClient,
+    ControlHttpClientConfig, ControlHttpClientError, MAX_CONTROL_CLAIM_LIMIT,
+    MAX_CONTROL_HTTP_REQUEST_BYTES, MAX_CONTROL_HTTP_RESPONSE_BYTES, MAX_CONTROL_HTTP_TIMEOUT,
+    MAX_CONTROL_LEASE_DURATION_MS,
 };
 
 pub use async_gateway::{

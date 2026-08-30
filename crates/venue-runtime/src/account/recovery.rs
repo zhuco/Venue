@@ -16,6 +16,8 @@ use crate::{
     runtime::{account::InstanceLifecycle, strategy::PersistedPrivateFact},
 };
 
+use super::PhysicalRecoveryAuthorityRoots;
+
 const MAX_RECOVERED_PRIVATE_FACTS: u32 = 1_024;
 
 /// Content-addressed roots produced by the recovery adapter after replaying every durable account
@@ -134,6 +136,10 @@ impl RecoveryJournalRoots {
 
     pub(super) const fn owner_index_record_count(&self) -> u64 {
         self.owner_index_boundary.record_count
+    }
+
+    pub(super) const fn mutation_wal(&self) -> [u8; 32] {
+        self.mutation_wal
     }
 }
 
@@ -483,6 +489,7 @@ pub struct AccountRecoverySnapshot {
     pending_private_batches: Vec<RecoveredPrivateBatch>,
     routes: Vec<RecoveredOrderRoute>,
     unresolved_mutations: Vec<AccountExecutionRequest>,
+    physical_authority_roots: PhysicalRecoveryAuthorityRoots,
 }
 
 impl AccountRecoverySnapshot {
@@ -518,6 +525,12 @@ impl AccountRecoverySnapshot {
         if manifest_commitment.sha256 != computed_manifest {
             return Err(RecoverySnapshotError::ManifestCommitment);
         }
+        let physical_authority_roots = PhysicalRecoveryAuthorityRoots::verified(
+            journal_roots.owner_index(),
+            journal_roots.mutation_wal(),
+            unknown_projection_sha256(&unresolved_mutations)?,
+        )
+        .map_err(|_| RecoverySnapshotError::PhysicalAuthorityRoots)?;
         Ok(Self {
             account,
             journal_roots,
@@ -528,6 +541,7 @@ impl AccountRecoverySnapshot {
             pending_private_batches,
             routes,
             unresolved_mutations,
+            physical_authority_roots,
         })
     }
 
@@ -543,6 +557,7 @@ impl AccountRecoverySnapshot {
         Vec<RecoveredPrivateBatch>,
         Vec<RecoveredOrderRoute>,
         Vec<AccountExecutionRequest>,
+        PhysicalRecoveryAuthorityRoots,
     ) {
         (
             self.account,
@@ -554,6 +569,7 @@ impl AccountRecoverySnapshot {
             self.pending_private_batches,
             self.routes,
             self.unresolved_mutations,
+            self.physical_authority_roots,
         )
     }
 }
@@ -607,6 +623,8 @@ pub enum RecoverySnapshotError {
     OwnerRouteReceipt,
     #[error("recovery manifest contains a value that cannot be canonically encoded")]
     ManifestEncoding,
+    #[error("recovery manifest cannot derive complete Owner, WAL, and Unknown authority roots")]
+    PhysicalAuthorityRoots,
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -718,6 +736,21 @@ fn recovery_manifest_sha256(
             .canonical_recovery_commitment()
             .map_err(|_| RecoverySnapshotError::ManifestEncoding)?;
         commit_bytes(&mut digest, &request_commitment);
+    }
+    Ok(digest.finalize().into())
+}
+
+fn unknown_projection_sha256(
+    unresolved_mutations: &[AccountExecutionRequest],
+) -> Result<[u8; 32], RecoverySnapshotError> {
+    let mut digest = Sha256::new();
+    commit_bytes(&mut digest, b"venue-account-recovery-unknown-projection-v1");
+    commit_len(&mut digest, unresolved_mutations.len());
+    for request in unresolved_mutations {
+        let commitment = request
+            .canonical_recovery_commitment()
+            .map_err(|_| RecoverySnapshotError::ManifestEncoding)?;
+        commit_bytes(&mut digest, &commitment);
     }
     Ok(digest.finalize().into())
 }

@@ -1,0 +1,490 @@
+use std::{collections::BTreeSet, net::IpAddr, time::Duration};
+
+use reqwest::{
+    StatusCode, Url,
+    header::{CONTENT_LENGTH, CONTENT_TYPE},
+    redirect::Policy,
+};
+use serde::{Serialize, de::DeserializeOwned};
+use venue_control_protocol::{
+    ACCOUNT_DELIVERY_ACK_PATH, ACCOUNT_DELIVERY_CLAIM_PATH, ACCOUNT_DELIVERY_RECEIPT_PATH,
+    ACCOUNT_DELIVERY_SCHEMA_VERSION, AccountDeliveryAck, AccountDeliveryClaim,
+    AccountDeliveryClaimRequest, AccountDeliveryPurpose, AccountDeliveryReceipt,
+};
+
+use crate::control_delivery::{
+    ActorDeliveryCompletion, ActorDeliveryTurn, ClaimAcceptance, ControlDeliveryError,
+    ControlDeliveryInbox, ControlDeliveryJournal, ReconciliationCompletion, ReconciliationTurn,
+};
+
+pub const MAX_CONTROL_HTTP_REQUEST_BYTES: usize = 64 * 1024;
+pub const MAX_CONTROL_HTTP_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_CONTROL_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+pub const MAX_CONTROL_LEASE_DURATION_MS: u64 = 60_000;
+pub const MAX_CONTROL_CLAIM_LIMIT: u32 = 256;
+
+#[derive(Clone, Debug)]
+pub struct ControlHttpClientConfig {
+    pub base_url: String,
+    pub connect_timeout: Duration,
+    pub request_timeout: Duration,
+    pub max_response_bytes: usize,
+}
+
+impl ControlHttpClientConfig {
+    #[must_use]
+    pub fn local(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            connect_timeout: Duration::from_secs(3),
+            request_timeout: Duration::from_secs(5),
+            max_response_bytes: MAX_CONTROL_HTTP_RESPONSE_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ControlHttpClient {
+    client: reqwest::Client,
+    claim_url: Url,
+    ack_url: Url,
+    receipt_url: Url,
+    max_response_bytes: usize,
+}
+
+impl ControlHttpClient {
+    pub fn new(config: ControlHttpClientConfig) -> Result<Self, ControlHttpClientError> {
+        if config.connect_timeout.is_zero()
+            || config.request_timeout.is_zero()
+            || config.connect_timeout > config.request_timeout
+            || config.request_timeout > MAX_CONTROL_HTTP_TIMEOUT
+            || !(1..=MAX_CONTROL_HTTP_RESPONSE_BYTES).contains(&config.max_response_bytes)
+        {
+            return Err(ControlHttpClientError::InvalidConfig);
+        }
+        let base_url = validate_base_url(&config.base_url)?;
+        let claim_url = endpoint(&base_url, ACCOUNT_DELIVERY_CLAIM_PATH)?;
+        let ack_url = endpoint(&base_url, ACCOUNT_DELIVERY_ACK_PATH)?;
+        let receipt_url = endpoint(&base_url, ACCOUNT_DELIVERY_RECEIPT_PATH)?;
+        let client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .no_proxy()
+            .connect_timeout(config.connect_timeout)
+            .timeout(config.request_timeout)
+            .pool_max_idle_per_host(1)
+            .build()
+            .map_err(|_| ControlHttpClientError::Transport)?;
+        Ok(Self {
+            client,
+            claim_url,
+            ack_url,
+            receipt_url,
+            max_response_bytes: config.max_response_bytes,
+        })
+    }
+
+    pub async fn claim(
+        &self,
+        request: &AccountDeliveryClaimRequest,
+    ) -> Result<Vec<AccountDeliveryClaim>, ControlHttpClientError> {
+        request
+            .validate()
+            .map_err(|_| ControlHttpClientError::InvalidRequest)?;
+        if request.lease_duration_ms > MAX_CONTROL_LEASE_DURATION_MS
+            || request.limit > MAX_CONTROL_CLAIM_LIMIT
+        {
+            return Err(ControlHttpClientError::InvalidRequest);
+        }
+        let claims: Vec<AccountDeliveryClaim> = self.post_json(&self.claim_url, request).await?;
+        validate_claim_batch(request, &claims)?;
+        Ok(claims)
+    }
+
+    pub async fn acknowledge(
+        &self,
+        ack: &AccountDeliveryAck,
+    ) -> Result<AccountDeliveryAck, ControlHttpClientError> {
+        ack.validate()
+            .map_err(|_| ControlHttpClientError::InvalidRequest)?;
+        let echoed: AccountDeliveryAck = self.post_json(&self.ack_url, ack).await?;
+        if echoed != *ack {
+            return Err(ControlHttpClientError::ResponseConflict);
+        }
+        Ok(echoed)
+    }
+
+    pub async fn record_receipt(
+        &self,
+        receipt: &AccountDeliveryReceipt,
+    ) -> Result<AccountDeliveryReceipt, ControlHttpClientError> {
+        receipt
+            .validate()
+            .map_err(|_| ControlHttpClientError::InvalidRequest)?;
+        let echoed: AccountDeliveryReceipt = self.post_json(&self.receipt_url, receipt).await?;
+        if echoed != *receipt {
+            return Err(ControlHttpClientError::ResponseConflict);
+        }
+        Ok(echoed)
+    }
+
+    async fn post_json<T: Serialize + ?Sized, U: DeserializeOwned>(
+        &self,
+        url: &Url,
+        value: &T,
+    ) -> Result<U, ControlHttpClientError> {
+        let body = serde_json::to_vec(value).map_err(|_| ControlHttpClientError::InvalidRequest)?;
+        if body.is_empty() || body.len() > MAX_CONTROL_HTTP_REQUEST_BYTES {
+            return Err(ControlHttpClientError::RequestTooLarge);
+        }
+        let mut response = self
+            .client
+            .post(url.clone())
+            .header(CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    ControlHttpClientError::Timeout
+                } else {
+                    ControlHttpClientError::Transport
+                }
+            })?;
+        if response.status() != StatusCode::OK {
+            return Err(match response.status() {
+                StatusCode::CONFLICT => ControlHttpClientError::ResponseConflict,
+                StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => {
+                    ControlHttpClientError::Timeout
+                }
+                status => ControlHttpClientError::HttpStatus(status.as_u16()),
+            });
+        }
+        if !response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+            })
+        {
+            return Err(ControlHttpClientError::InvalidResponse);
+        }
+        if response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|length| length > self.max_response_bytes)
+        {
+            return Err(ControlHttpClientError::ResponseTooLarge);
+        }
+        let mut encoded = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| ControlHttpClientError::Transport)?
+        {
+            if encoded.len().saturating_add(chunk.len()) > self.max_response_bytes {
+                return Err(ControlHttpClientError::ResponseTooLarge);
+            }
+            encoded.extend_from_slice(&chunk);
+        }
+        if encoded.is_empty() {
+            return Err(ControlHttpClientError::InvalidResponse);
+        }
+        serde_json::from_slice(&encoded).map_err(|_| ControlHttpClientError::InvalidResponse)
+    }
+
+    #[must_use]
+    pub const fn grants_gateway_capability(&self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn grants_writer_lease(&self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn grants_wal_authority(&self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn grants_dispatch_permit(&self) -> bool {
+        false
+    }
+}
+
+fn validate_base_url(raw: &str) -> Result<Url, ControlHttpClientError> {
+    let url = Url::parse(raw).map_err(|_| ControlHttpClientError::InvalidConfig)?;
+    let loopback = url
+        .host_str()
+        .and_then(|host| host.parse::<IpAddr>().ok())
+        .is_some_and(|ip| ip.is_loopback());
+    if url.scheme() != "http"
+        || !loopback
+        || url.port().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ControlHttpClientError::InvalidConfig);
+    }
+    Ok(url)
+}
+
+fn endpoint(base: &Url, path: &str) -> Result<Url, ControlHttpClientError> {
+    base.join(path.trim_start_matches('/'))
+        .map_err(|_| ControlHttpClientError::InvalidConfig)
+}
+
+fn validate_claim_batch(
+    request: &AccountDeliveryClaimRequest,
+    claims: &[AccountDeliveryClaim],
+) -> Result<(), ControlHttpClientError> {
+    if claims.len() > request.limit as usize {
+        return Err(ControlHttpClientError::InvalidResponse);
+    }
+    let mut delivery_ids = BTreeSet::new();
+    for claim in claims {
+        claim
+            .validate()
+            .map_err(|_| ControlHttpClientError::InvalidResponse)?;
+        let lease = &claim.lease;
+        if lease.binding != request.binding
+            || lease.node_id != request.node_id
+            || lease
+                .expires_at_ms
+                .checked_sub(lease.leased_at_ms)
+                .is_none_or(|duration| duration != request.lease_duration_ms)
+            || (lease.purpose == AccountDeliveryPurpose::ReconcileOnly && lease.lease_epoch < 2)
+            || !delivery_ids.insert(lease.delivery_id.as_str())
+            || lease.grants_mutation_authority()
+            || claim.grants_mutation_authority()
+        {
+            return Err(ControlHttpClientError::InvalidResponse);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ControlHttpClientError {
+    #[error("control HTTP client configuration is invalid or not exact loopback HTTP")]
+    InvalidConfig,
+    #[error("control HTTP request is invalid")]
+    InvalidRequest,
+    #[error("control HTTP request exceeds the 64 KiB bound")]
+    RequestTooLarge,
+    #[error("control HTTP response exceeds the configured bound")]
+    ResponseTooLarge,
+    #[error("control HTTP response is invalid")]
+    InvalidResponse,
+    #[error("control HTTP response conflicts with the exact durable value")]
+    ResponseConflict,
+    #[error("control HTTP request timed out")]
+    Timeout,
+    #[error("control HTTP transport is unavailable")]
+    Transport,
+    #[error("control HTTP server returned non-success status {0}")]
+    HttpStatus(u16),
+}
+
+#[derive(Debug)]
+pub enum ControlDeliveryWork {
+    Actor(ActorDeliveryTurn),
+    Reconcile(ReconciliationTurn),
+}
+
+impl ControlDeliveryWork {
+    #[must_use]
+    pub const fn grants_gateway_capability(&self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn grants_writer_lease(&self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn grants_wal_authority(&self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn grants_dispatch_permit(&self) -> bool {
+        false
+    }
+}
+
+/// Drives the semantic delivery protocol without connecting it to physical execution.
+///
+/// Every transport step follows a durable inbox transition. A recovered outbox is flushed before
+/// new claims, and already accepted Actor or reconciliation work is returned before polling for
+/// more work.
+pub struct ControlDeliveryDriver<J> {
+    client: ControlHttpClient,
+    inbox: ControlDeliveryInbox<J>,
+    lease_duration_ms: u64,
+    claim_limit: u32,
+}
+
+impl<J: ControlDeliveryJournal> ControlDeliveryDriver<J> {
+    pub fn new(
+        client: ControlHttpClient,
+        inbox: ControlDeliveryInbox<J>,
+        lease_duration_ms: u64,
+        claim_limit: u32,
+    ) -> Result<Self, ControlDeliveryDriverError> {
+        if !(1..=MAX_CONTROL_LEASE_DURATION_MS).contains(&lease_duration_ms)
+            || !(1..=MAX_CONTROL_CLAIM_LIMIT).contains(&claim_limit)
+        {
+            return Err(ControlDeliveryDriverError::InvalidConfig);
+        }
+        Ok(Self {
+            client,
+            inbox,
+            lease_duration_ms,
+            claim_limit,
+        })
+    }
+
+    pub async fn poll(
+        &mut self,
+        observed_ms: u64,
+    ) -> Result<Vec<ControlDeliveryWork>, ControlDeliveryDriverError> {
+        if observed_ms == 0 {
+            return Err(ControlDeliveryDriverError::InvalidTime);
+        }
+        self.flush_outbox(observed_ms).await?;
+        let pending = self.pending_work(observed_ms)?;
+        if !pending.is_empty() {
+            return Ok(pending);
+        }
+        let request = AccountDeliveryClaimRequest {
+            schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
+            binding: self.inbox.binding().clone(),
+            node_id: self.inbox.node_id().to_owned(),
+            lease_duration_ms: self.lease_duration_ms,
+            limit: self.claim_limit,
+        };
+        let claims = self.client.claim(&request).await?;
+        for claim in claims {
+            match self.inbox.accept_claim(claim, observed_ms)? {
+                ClaimAcceptance::Install(output) => {
+                    let ack = output.value().clone();
+                    self.client.acknowledge(&ack).await?;
+                    self.inbox.confirm_acknowledgement(&ack, observed_ms)?;
+                }
+                ClaimAcceptance::Reconcile(_) => {}
+            }
+        }
+        Ok(self.pending_work(observed_ms)?)
+    }
+
+    pub async fn submit_actor_completion(
+        &mut self,
+        completion: ActorDeliveryCompletion,
+        confirmed_ms: u64,
+    ) -> Result<(), ControlDeliveryDriverError> {
+        let output = self.inbox.record_actor_completion(completion)?;
+        let receipt = output.value().clone();
+        self.client.record_receipt(&receipt).await?;
+        self.inbox.confirm_receipt(&receipt, confirmed_ms)?;
+        Ok(())
+    }
+
+    pub async fn submit_reconciliation(
+        &mut self,
+        completion: ReconciliationCompletion,
+        confirmed_ms: u64,
+    ) -> Result<(), ControlDeliveryDriverError> {
+        let output = self.inbox.record_reconciliation(completion)?;
+        let receipt = output.value().clone();
+        self.client.record_receipt(&receipt).await?;
+        self.inbox.confirm_receipt(&receipt, confirmed_ms)?;
+        Ok(())
+    }
+
+    pub async fn flush_outbox(
+        &mut self,
+        observed_ms: u64,
+    ) -> Result<(), ControlDeliveryDriverError> {
+        for ack in self.inbox.pending_acknowledgements(observed_ms) {
+            self.client.acknowledge(&ack).await?;
+            self.inbox.confirm_acknowledgement(&ack, observed_ms)?;
+        }
+        for receipt in self.inbox.pending_receipts() {
+            self.client.record_receipt(&receipt).await?;
+            self.inbox.confirm_receipt(&receipt, observed_ms)?;
+        }
+        Ok(())
+    }
+
+    fn pending_work(
+        &self,
+        observed_ms: u64,
+    ) -> Result<Vec<ControlDeliveryWork>, ControlDeliveryError> {
+        let mut work = self
+            .inbox
+            .pending_actor_turns(observed_ms)?
+            .into_iter()
+            .map(ControlDeliveryWork::Actor)
+            .collect::<Vec<_>>();
+        work.extend(
+            self.inbox
+                .pending_reconciliation_turns(observed_ms)?
+                .into_iter()
+                .map(ControlDeliveryWork::Reconcile),
+        );
+        Ok(work)
+    }
+
+    #[must_use]
+    pub const fn inbox(&self) -> &ControlDeliveryInbox<J> {
+        &self.inbox
+    }
+
+    pub fn into_inbox(self) -> ControlDeliveryInbox<J> {
+        self.inbox
+    }
+
+    #[must_use]
+    pub const fn grants_gateway_capability(&self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn grants_writer_lease(&self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn grants_wal_authority(&self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn grants_dispatch_permit(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ControlDeliveryDriverError {
+    #[error("control delivery driver configuration is invalid")]
+    InvalidConfig,
+    #[error("control delivery driver observed time is invalid")]
+    InvalidTime,
+    #[error(transparent)]
+    Http(#[from] ControlHttpClientError),
+    #[error(transparent)]
+    Inbox(#[from] ControlDeliveryError),
+}

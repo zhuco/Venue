@@ -23,6 +23,13 @@ use venue_node::{
     SignedCommandReadback, SignedOwnedOrder, SignedReadbackReceipt, SignedReadbackRequest,
     reject_unintegrated_legacy_test_runtime, report_result,
 };
+use venue_runtime::account::PhysicalRecoveryReadbackManifest;
+
+#[cfg(test)]
+use venue_runtime::account::{
+    PhysicalReadbackReceipt, PhysicalReadbackSurface, PhysicalRecoveryManifestError,
+    PhysicalRecoveryScope,
+};
 
 const PROGRAM: &str = "venue-node-gate";
 
@@ -66,6 +73,134 @@ pub struct GatePhysicalReadback {
     pub candidate: GatePrivateReadbackCandidate,
     pub owned_open_client_ids: BTreeSet<String>,
     pub command_results: Vec<SignedCommandReadback>,
+}
+
+/// Gate's current public candidate is mutable and does not preserve opaque, scope-bound authority
+/// for every raw page. Until the adapter supplies such a value, production cannot construct the
+/// shared recovery manifest from a caller-provided candidate, generation, or authority root.
+pub const fn gate_physical_recovery_manifest()
+-> Result<PhysicalRecoveryReadbackManifest, GateRecoveryManifestError> {
+    Err(GateRecoveryManifestError::Unavailable)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum GateRecoveryManifestError {
+    #[error("Gate recovery manifest requires unavailable opaque fresh collection authority")]
+    Unavailable,
+}
+
+/// Test-only contract fixture. Production cannot pass a mutable adapter candidate, caller-selected
+/// generation, or current recovery roots into a manifest constructor.
+#[cfg(test)]
+fn gate_physical_recovery_manifest_fixture(
+    scope: PhysicalRecoveryScope,
+    readback: &GatePhysicalReadback,
+) -> Result<PhysicalRecoveryReadbackManifest, GateRecoveryFixtureError> {
+    let candidate = &readback.candidate;
+    let family_scope = candidate.order_families.scope();
+    if scope.binding() != &candidate.binding
+        || family_scope.binding != candidate.binding
+        || family_scope.attempt != candidate.attempt
+        || family_scope.generation != candidate.generation
+        || family_scope.profile_version != GATE_STAGE7_ORDER_PROFILE_VERSION
+        || candidate.order_families.conditional().profile_version
+            != GATE_STAGE7_ORDER_PROFILE_VERSION
+        || candidate.order_families.algo().profile_version != GATE_STAGE7_ORDER_PROFILE_VERSION
+        || candidate.positions[0].side != PositionSide::Long
+        || candidate.positions[1].side != PositionSide::Short
+        || candidate
+            .positions
+            .iter()
+            .any(|position| position.symbol != candidate.binding.symbol)
+        || candidate.raw_payload_digests.len() < 4
+    {
+        return Err(GateRecoveryFixtureError::Candidate);
+    }
+
+    let attempt = candidate.attempt;
+    let generation = readback.private_generation;
+    let regular_count = u64::try_from(candidate.order_families.regular().orders.len())
+        .map_err(|_| GateRecoveryFixtureError::RecordCount)?;
+    let fill_count = u64::try_from(candidate.fills.fills.len())
+        .map_err(|_| GateRecoveryFixtureError::RecordCount)?;
+    let complete = |surface, record_count| {
+        PhysicalReadbackReceipt::verified_complete(
+            &scope,
+            surface,
+            attempt,
+            generation,
+            gate_recovery_surface_evidence(candidate, generation, surface),
+            record_count,
+        )
+    };
+    let unsupported = |surface| {
+        PhysicalReadbackReceipt::verified_unsupported_order_family(
+            &scope,
+            surface,
+            attempt,
+            generation,
+            gate_recovery_surface_evidence(candidate, generation, surface),
+            GATE_STAGE7_ORDER_PROFILE_VERSION,
+        )
+    };
+    let receipts = vec![
+        complete(PhysicalReadbackSurface::Account, 1)?,
+        complete(PhysicalReadbackSurface::Positions, 2)?,
+        complete(PhysicalReadbackSurface::UmOrder, regular_count)?,
+        unsupported(PhysicalReadbackSurface::UmConditional)?,
+        unsupported(PhysicalReadbackSurface::UmAlgo)?,
+        complete(PhysicalReadbackSurface::FillsCursor, fill_count)?,
+    ];
+    Ok(PhysicalRecoveryReadbackManifest::verified(scope, receipts)?)
+}
+
+#[cfg(test)]
+fn gate_recovery_surface_evidence(
+    candidate: &GatePrivateReadbackCandidate,
+    private_generation: u64,
+    surface: PhysicalReadbackSurface,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"venue-node-gate-physical-recovery-surface-v1\0");
+    digest.update(candidate.binding.mode.as_str().as_bytes());
+    digest.update(candidate.binding.trading_account_id.as_bytes());
+    digest.update(candidate.binding.symbol.to_string().as_bytes());
+    digest.update(candidate.generation.to_be_bytes());
+    digest.update(candidate.attempt.to_be_bytes());
+    digest.update(private_generation.to_be_bytes());
+    digest.update(candidate.observed_at_ms.to_be_bytes());
+    digest.update([match surface {
+        PhysicalReadbackSurface::Account => 1,
+        PhysicalReadbackSurface::Positions => 2,
+        PhysicalReadbackSurface::UmOrder => 3,
+        PhysicalReadbackSurface::UmConditional => 4,
+        PhysicalReadbackSurface::UmAlgo => 5,
+        PhysicalReadbackSurface::FillsCursor => 6,
+    }]);
+    for raw_digest in &candidate.raw_payload_digests {
+        digest.update(raw_digest);
+    }
+    digest.update(candidate.order_families.regular_payload_digest());
+    digest.update(GATE_STAGE7_ORDER_PROFILE_VERSION.to_be_bytes());
+    if let Some(cursor) = candidate.fills_cursor_before.last_native_id() {
+        digest.update(cursor.as_bytes());
+    }
+    digest.update([0]);
+    if let Some(cursor) = candidate.fills_cursor_after.last_native_id() {
+        digest.update(cursor.as_bytes());
+    }
+    digest.finalize().into()
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+enum GateRecoveryFixtureError {
+    #[error("Gate recovery candidate does not bind one complete regular-only Hedge attempt")]
+    Candidate,
+    #[error("Gate recovery readback record count exceeds the shared manifest range")]
+    RecordCount,
+    #[error(transparent)]
+    Manifest(#[from] PhysicalRecoveryManifestError),
 }
 
 pub enum GateExactDispatch {
@@ -577,9 +712,10 @@ mod tests {
     };
     use venue_gateway_api::{CapabilityFlags, GatewayMode};
     use venue_gateway_gate::{
-        GatePrivateReadSource, GateRawPrivateResponse, GateStage7UnsupportedOrderFamily,
-        prepare_private_read, validate_private_readback,
+        GatePrivateReadError, GatePrivateReadSource, GateRawPrivateResponse,
+        GateStage7UnsupportedOrderFamily, prepare_private_read, validate_private_readback,
     };
+    use venue_runtime::account::{PhysicalReadbackCoverage, PhysicalRecoveryAuthorityRoots};
 
     use super::*;
 
@@ -752,6 +888,45 @@ mod tests {
         )?)
     }
 
+    fn private_responses(
+        regular_payload: &str,
+        fills_payload: &str,
+        cursor: Option<&str>,
+    ) -> Result<Vec<GateRawPrivateResponse>, Box<dyn std::error::Error>> {
+        let binding = binding(GatewayMode::Test)?;
+        let rules = rules()?;
+        Ok(vec![
+            raw(
+                &binding,
+                &rules,
+                GatePrivateReadSource::Account,
+                None,
+                r#"{"position_mode":"dual","total":"10","available":"9"}"#,
+            )?,
+            raw(
+                &binding,
+                &rules,
+                GatePrivateReadSource::DualPositions,
+                None,
+                r#"[{"user":42,"contract":"DOGE_USDT","mode":"dual_long","size":"0","entry_price":"0","mark_price":"0"},{"user":42,"contract":"DOGE_USDT","mode":"dual_short","size":"2","entry_price":"0.1","mark_price":"0.11"}]"#,
+            )?,
+            raw(
+                &binding,
+                &rules,
+                GatePrivateReadSource::RegularOrders,
+                None,
+                regular_payload,
+            )?,
+            raw(
+                &binding,
+                &rules,
+                GatePrivateReadSource::Fills,
+                cursor,
+                fills_payload,
+            )?,
+        ])
+    }
+
     fn private_candidate() -> Result<GatePrivateReadbackCandidate, Box<dyn std::error::Error>> {
         let binding = binding(GatewayMode::Test)?;
         let rules = rules()?;
@@ -761,39 +936,48 @@ mod tests {
             GATE_STAGE7_ORDER_PROFILE_VERSION,
             2_000,
             1_200,
-            [
-                raw(
-                    &binding,
-                    &rules,
-                    GatePrivateReadSource::Account,
-                    None,
-                    r#"{"position_mode":"dual","total":"10","available":"9"}"#,
-                )?,
-                raw(
-                    &binding,
-                    &rules,
-                    GatePrivateReadSource::DualPositions,
-                    None,
-                    r#"[{"user":42,"contract":"DOGE_USDT","mode":"dual_long","size":"0","entry_price":"0","mark_price":"0"},{"user":42,"contract":"DOGE_USDT","mode":"dual_short","size":"2","entry_price":"0.1","mark_price":"0.11"}]"#,
-                )?,
-                raw(
-                    &binding,
-                    &rules,
-                    GatePrivateReadSource::RegularOrders,
-                    None,
-                    include_str!(
-                        "../../../../crates/venue-gateway-gate/tests/fixtures/regular_orders.json"
-                    ),
-                )?,
-                raw(
-                    &binding,
-                    &rules,
-                    GatePrivateReadSource::Fills,
-                    Some("227262265"),
-                    include_str!("../../../../crates/venue-gateway-gate/tests/fixtures/fills.json"),
-                )?,
-            ],
+            private_responses(
+                include_str!(
+                    "../../../../crates/venue-gateway-gate/tests/fixtures/regular_orders.json"
+                ),
+                include_str!("../../../../crates/venue-gateway-gate/tests/fixtures/fills.json"),
+                Some("227262265"),
+            )?,
         )?)
+    }
+
+    fn recovery_scope(
+        recovered_private_generation: u64,
+        roots: PhysicalRecoveryAuthorityRoots,
+    ) -> Result<PhysicalRecoveryScope, Box<dyn std::error::Error>> {
+        Ok(PhysicalRecoveryScope::verified(
+            binding(GatewayMode::Test)?.gateway_binding().clone(),
+            "gate_config_28",
+            28,
+            recovered_private_generation,
+            roots,
+        )?)
+    }
+
+    fn roots(seed: u8) -> Result<PhysicalRecoveryAuthorityRoots, Box<dyn std::error::Error>> {
+        Ok(PhysicalRecoveryAuthorityRoots::verified(
+            [seed; 32],
+            [seed.saturating_add(1); 32],
+            [seed.saturating_add(2); 32],
+        )?)
+    }
+
+    fn recovery_readback(
+        candidate: GatePrivateReadbackCandidate,
+        private_generation: u64,
+    ) -> GatePhysicalReadback {
+        GatePhysicalReadback {
+            connection_generation: private_generation,
+            private_generation,
+            candidate,
+            owned_open_client_ids: BTreeSet::new(),
+            command_results: Vec::new(),
+        }
     }
 
     struct OrderFixture<'a> {
@@ -929,6 +1113,190 @@ mod tests {
             ]
         );
         assert_eq!(readback_commitment(&candidate, 1, 1).len(), 64);
+        Ok(())
+    }
+
+    #[test]
+    fn production_manifest_bridge_accepts_no_relabelled_candidate_and_is_unavailable() {
+        let production_bridge: fn() -> Result<
+            PhysicalRecoveryReadbackManifest,
+            GateRecoveryManifestError,
+        > = gate_physical_recovery_manifest;
+        assert!(matches!(
+            production_bridge(),
+            Err(GateRecoveryManifestError::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn validated_gate_attempt_maps_to_one_root_bound_six_face_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let candidate = private_candidate()?;
+        let expected_attempt = candidate.attempt;
+        let expected_regular_count =
+            u64::try_from(candidate.order_families.regular().orders.len())?;
+        let expected_fill_count = u64::try_from(candidate.fills.fills.len())?;
+        let authority_roots = roots(1)?;
+        let scope = recovery_scope(28, authority_roots.clone())?;
+        let manifest =
+            gate_physical_recovery_manifest_fixture(scope, &recovery_readback(candidate, 29))?;
+
+        assert_eq!(manifest.attempt_id(), expected_attempt);
+        assert_eq!(manifest.private_generation(), 29);
+        assert_eq!(manifest.scope().authority_roots(), &authority_roots);
+        for (surface, count) in [
+            (PhysicalReadbackSurface::Account, 1),
+            (PhysicalReadbackSurface::Positions, 2),
+            (PhysicalReadbackSurface::UmOrder, expected_regular_count),
+            (PhysicalReadbackSurface::FillsCursor, expected_fill_count),
+        ] {
+            assert!(matches!(
+                manifest.coverage(surface),
+                PhysicalReadbackCoverage::Complete { record_count, .. }
+                    if *record_count == count
+            ));
+        }
+        for surface in [
+            PhysicalReadbackSurface::UmConditional,
+            PhysicalReadbackSurface::UmAlgo,
+        ] {
+            assert!(matches!(
+                manifest.coverage(surface),
+                PhysicalReadbackCoverage::Unsupported {
+                    profile_version: GATE_STAGE7_ORDER_PROFILE_VERSION,
+                    ..
+                }
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn missing_page_and_mixed_attempt_or_collection_generation_fail_before_mapping()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding(GatewayMode::Test)?;
+        let rules = rules()?;
+        let responses = private_responses("[]", "[]", None)?;
+        for missing in [
+            GatePrivateReadSource::Account,
+            GatePrivateReadSource::DualPositions,
+            GatePrivateReadSource::RegularOrders,
+            GatePrivateReadSource::Fills,
+        ] {
+            let incomplete = responses
+                .iter()
+                .filter(|response| response.source != missing)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert!(matches!(
+                validate_private_readback(
+                    &binding,
+                    &rules,
+                    GATE_STAGE7_ORDER_PROFILE_VERSION,
+                    2_000,
+                    1_200,
+                    incomplete,
+                ),
+                Err(GatePrivateReadError::MissingSurface)
+            ));
+        }
+
+        let mut mixed_attempt = responses.clone();
+        mixed_attempt[3].attempt += 1;
+        assert!(matches!(
+            validate_private_readback(
+                &binding,
+                &rules,
+                GATE_STAGE7_ORDER_PROFILE_VERSION,
+                2_000,
+                1_200,
+                mixed_attempt,
+            ),
+            Err(GatePrivateReadError::Binding)
+        ));
+
+        let mut mixed_generation = responses;
+        mixed_generation[3].generation += 1;
+        assert!(matches!(
+            validate_private_readback(
+                &binding,
+                &rules,
+                GATE_STAGE7_ORDER_PROFILE_VERSION,
+                2_000,
+                1_200,
+                mixed_generation,
+            ),
+            Err(GatePrivateReadError::Binding)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_regular_and_fills_are_explicit_complete_faces_not_omissions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding(GatewayMode::Test)?;
+        let rules = rules()?;
+        let candidate = validate_private_readback(
+            &binding,
+            &rules,
+            GATE_STAGE7_ORDER_PROFILE_VERSION,
+            2_000,
+            1_200,
+            private_responses("[]", "[]", Some("227262265"))?,
+        )?;
+        assert!(candidate.order_families.regular().orders.is_empty());
+        assert!(candidate.fills.fills.is_empty());
+        assert_eq!(
+            candidate.fills_cursor_after.last_native_id(),
+            Some("227262265")
+        );
+
+        let manifest = gate_physical_recovery_manifest_fixture(
+            recovery_scope(28, roots(1)?)?,
+            &recovery_readback(candidate, 29),
+        )?;
+        for surface in [
+            PhysicalReadbackSurface::UmOrder,
+            PhysicalReadbackSurface::FillsCursor,
+        ] {
+            assert!(matches!(
+                manifest.coverage(surface),
+                PhysicalReadbackCoverage::Complete {
+                    record_count: 0,
+                    ..
+                }
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stale_private_generation_and_authority_root_drift_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let candidate = private_candidate()?;
+        assert!(matches!(
+            gate_physical_recovery_manifest_fixture(
+                recovery_scope(29, roots(1)?)?,
+                &recovery_readback(candidate.clone(), 29),
+            ),
+            Err(GateRecoveryFixtureError::Manifest(
+                PhysicalRecoveryManifestError::StaleGeneration
+            ))
+        ));
+
+        let first = gate_physical_recovery_manifest_fixture(
+            recovery_scope(28, roots(1)?)?,
+            &recovery_readback(candidate.clone(), 29),
+        )?;
+        let drifted = gate_physical_recovery_manifest_fixture(
+            recovery_scope(28, roots(9)?)?,
+            &recovery_readback(candidate, 29),
+        )?;
+        assert_ne!(
+            first.scope().authority_roots(),
+            drifted.scope().authority_roots()
+        );
+        assert_ne!(first.commitment_sha256(), drifted.commitment_sha256());
         Ok(())
     }
 

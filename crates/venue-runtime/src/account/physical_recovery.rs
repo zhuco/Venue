@@ -134,6 +134,7 @@ pub struct PhysicalRecoveryScope {
     binding: GatewayBinding,
     config_digest: String,
     config_epoch: u64,
+    connection_generation: u64,
     recovered_private_generation: u64,
     authority_roots: PhysicalRecoveryAuthorityRoots,
     commitment_sha256: [u8; 32],
@@ -144,6 +145,7 @@ impl PhysicalRecoveryScope {
         binding: GatewayBinding,
         config_digest: impl Into<String>,
         config_epoch: u64,
+        connection_generation: u64,
         recovered_private_generation: u64,
         authority_roots: PhysicalRecoveryAuthorityRoots,
     ) -> Result<Self, PhysicalRecoveryManifestError> {
@@ -154,10 +156,14 @@ impl PhysicalRecoveryScope {
         if config_epoch == 0 || validate_config_digest(&config_digest).is_err() {
             return Err(PhysicalRecoveryManifestError::Configuration);
         }
+        if connection_generation == 0 {
+            return Err(PhysicalRecoveryManifestError::ConnectionGeneration);
+        }
         let commitment_sha256 = scope_commitment(
             &binding,
             &config_digest,
             config_epoch,
+            connection_generation,
             recovered_private_generation,
             &authority_roots,
         );
@@ -165,6 +171,7 @@ impl PhysicalRecoveryScope {
             binding,
             config_digest,
             config_epoch,
+            connection_generation,
             recovered_private_generation,
             authority_roots,
             commitment_sha256,
@@ -184,6 +191,11 @@ impl PhysicalRecoveryScope {
     #[must_use]
     pub const fn config_epoch(&self) -> u64 {
         self.config_epoch
+    }
+
+    #[must_use]
+    pub const fn connection_generation(&self) -> u64 {
+        self.connection_generation
     }
 
     #[must_use]
@@ -403,6 +415,8 @@ pub enum PhysicalRecoveryManifestError {
     Configuration,
     #[error("Owner, WAL, and Unknown recovery roots must all be nonzero digests")]
     AuthorityRoot,
+    #[error("physical recovery connection generation must be positive")]
+    ConnectionGeneration,
     #[error("physical readback attempt must be positive")]
     Attempt,
     #[error("physical readback private generation must be positive")]
@@ -427,6 +441,7 @@ fn scope_commitment(
     binding: &GatewayBinding,
     config_digest: &str,
     config_epoch: u64,
+    connection_generation: u64,
     recovered_private_generation: u64,
     roots: &PhysicalRecoveryAuthorityRoots,
 ) -> [u8; 32] {
@@ -438,6 +453,7 @@ fn scope_commitment(
     commit_str(&mut digest, &binding.symbol.to_string());
     commit_str(&mut digest, config_digest);
     commit_u64(&mut digest, config_epoch);
+    commit_u64(&mut digest, connection_generation);
     commit_u64(&mut digest, recovered_private_generation);
     commit_bytes(&mut digest, &roots.owner);
     commit_bytes(&mut digest, &roots.wal);
@@ -542,6 +558,7 @@ mod tests {
             )?,
             "config_1",
             config_epoch,
+            1,
             recovered_private_generation,
             roots,
         )?)
@@ -586,6 +603,7 @@ mod tests {
         assert_eq!(manifest.attempt_id(), 41);
         assert_eq!(manifest.private_generation(), 11);
         assert_eq!(manifest.scope().config_epoch(), 7);
+        assert_eq!(manifest.scope().connection_generation(), 1);
         assert!(nonzero_digest(manifest.commitment_sha256()));
         for surface in REQUIRED_SURFACES {
             assert!(matches!(
@@ -659,6 +677,7 @@ mod tests {
             )?,
             "config_1",
             7,
+            1,
             10,
             PhysicalRecoveryAuthorityRoots::verified(hash(1), hash(2), hash(3))?,
         )?;

@@ -1,6 +1,8 @@
 use std::{future::Future, time::Duration};
 
 use venue_gateway_api::{CapabilityFlags, CapabilitySnapshot, GatewayBinding};
+#[cfg(test)]
+use venue_gateway_api::{HostAdmissionEvidence, HostAdmittedCapability};
 
 use crate::{
     DispatchPermit, GatewayDispatchResult, GatewayRecoveryPermit, PhysicalGateway,
@@ -36,8 +38,12 @@ pub trait AsyncPhysicalGateway {
 
     fn verify_signed_readback(&self, receipt: &SignedReadbackReceipt) -> Result<(), Self::Error>;
 
+    /// Positive mutation wiring is a test fixture until the upstream authority is unforgeable.
+    #[cfg(test)]
     fn dispatch(
         &mut self,
+        admitted_capability: HostAdmittedCapability,
+        admission_evidence: HostAdmissionEvidence,
         permit: DispatchPermit,
     ) -> impl Future<Output = Result<GatewayDispatchResult, AsyncGatewayCallError<Self::Error>>> + Send;
 }
@@ -50,6 +56,10 @@ pub trait TokioRuntimeDriver {
     /// reconstructed by this driver.
     fn run<F: Future + Send>(&mut self, timeout: Duration, future: F)
     -> TokioRuntimeRun<F::Output>;
+
+    /// Injected boundary clock used immediately before a test-only async mutation leaves the host.
+    #[cfg(test)]
+    fn execution_now_ms(&self) -> u64;
 }
 
 #[derive(Debug)]
@@ -151,8 +161,19 @@ impl<G: AsyncPhysicalGateway, R: TokioRuntimeDriver> TokioPhysicalGateway<G, R> 
         }
     }
 
+    #[cfg(test)]
     fn dispatch_linear(&mut self, permit: DispatchPermit) -> GatewayDispatchResult {
-        let future = self.adapter.dispatch(permit);
+        let execution_now_ms = self.runtime.execution_now_ms();
+        let Ok((admitted_capability, admission_evidence, permit)) =
+            permit.into_async_parts(execution_now_ms)
+        else {
+            return GatewayDispatchResult::Rejected {
+                reason_code: "host_admission_invalid".to_owned(),
+            };
+        };
+        let future = self
+            .adapter
+            .dispatch(admitted_capability, admission_evidence, permit);
         match self.runtime.run(self.timeouts.dispatch, future) {
             TokioRuntimeRun::Completed(Ok(result)) => result,
             TokioRuntimeRun::TimedOut
@@ -161,6 +182,14 @@ impl<G: AsyncPhysicalGateway, R: TokioRuntimeDriver> TokioPhysicalGateway<G, R> 
             | TokioRuntimeRun::Completed(Err(AsyncGatewayCallError::Failed(_))) => {
                 GatewayDispatchResult::Unknown
             }
+        }
+    }
+
+    #[cfg(not(test))]
+    fn dispatch_linear(&mut self, _permit: DispatchPermit) -> GatewayDispatchResult {
+        // Public promotion inputs cannot prove production authority, so no future is constructed.
+        GatewayDispatchResult::Rejected {
+            reason_code: "host_admission_unavailable".to_owned(),
         }
     }
 }
@@ -218,7 +247,6 @@ pub(crate) fn validate_capability_preflight(
         | CapabilityFlags::READ_FILLS
         | CapabilityFlags::PRIVATE_STREAM;
     if !capability.flags.contains(recovery_reads)
-        || !capability.flags.contains(CapabilityFlags::TRADE)
         || capability.flags.contains(CapabilityFlags::WITHDRAW)
     {
         return Err(AsyncGatewayBoundaryError::CapabilityIncomplete);
@@ -230,7 +258,7 @@ pub(crate) fn validate_capability_preflight(
 pub enum AsyncGatewayBoundaryError {
     #[error("async gateway capability is empty and remains fail-closed")]
     CapabilityClosed,
-    #[error("async gateway capability does not cover complete recovery and trade evidence")]
+    #[error("async gateway capability does not cover complete recovery read evidence")]
     CapabilityIncomplete,
     #[error("async gateway capability does not match the fixed node binding")]
     CapabilityScope,

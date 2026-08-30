@@ -58,6 +58,7 @@ required-features = ["okx"]
 
 [dependencies]
 clap.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -74,10 +75,12 @@ venue-gateway-gate = { path = "../../crates/venue-gateway-gate", optional = true
 venue-gateway-hyperliquid = { path = "../../crates/venue-gateway-hyperliquid", optional = true }
 venue-gateway-okx = { path = "../../crates/venue-gateway-okx", optional = true }
 venue-runtime = { path = "../../crates/venue-runtime" }
+venue-storage = { path = "../../crates/venue-storage" }
 
 [dev-dependencies]
 rust_decimal.workspace = true
 tempfile.workspace = true
+tokio.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"
