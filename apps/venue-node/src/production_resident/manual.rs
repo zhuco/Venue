@@ -10,8 +10,8 @@ use venue_domain::{
 };
 use venue_runtime::{
     AccountLimitNormalizationIntent, AccountPhysicalGateway, AccountPricedLimitIntent,
-    AppliedStrategyTurnReceipt, SignedAccountOrderFact, SignedAccountPositionMode, StrategyBinding,
-    StrategyKind, account::AccountLanePriority,
+    AppliedStrategyTurnReceipt, SignedAccountOrderFact, SignedAccountPositionMode,
+    SignedAccountSnapshot, StrategyBinding, StrategyKind, account::AccountLanePriority,
 };
 
 use super::{NodeError, ProductionResident, persist_anchor};
@@ -775,16 +775,55 @@ fn signed_plan_matches(
     snapshot: &venue_runtime::SignedAccountSnapshot,
 ) -> bool {
     commands.iter().all(|(command_id, planned)| match planned {
-        ExecutionCommand::PlaceLimit(expected) => {
+        ExecutionCommand::PlaceLimit(_) => {
             if !accepted.contains_key(command_id) {
                 return false;
             }
+            let position_before = plan_commands
+                .iter()
+                .find(|plan| plan.command_id() == command_id)
+                .and_then(|plan| match plan {
+                    ManualPlanCommand::PlaceLimit {
+                        position_before, ..
+                    } => *position_before,
+                    ManualPlanCommand::Cancel { .. } => None,
+                });
+            signed_operator_canary_matches(
+                planned,
+                accepted
+                    .get(command_id)
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+                position_before,
+                snapshot,
+            )
+        }
+        ExecutionCommand::Cancel(_) => accepted.get(command_id).is_some_and(|venue_order_id| {
+            signed_operator_canary_matches(planned, venue_order_id, None, snapshot)
+        }),
+        _ => false,
+    })
+}
+
+/// Canary success requires the account-WAL acceptance and a newer complete signed account fact.
+/// A full fill is accepted only when exact fills and the addressed position delta cover it.
+pub(crate) fn signed_operator_canary_matches(
+    command: &ExecutionCommand,
+    venue_order_id: &str,
+    position_before: Option<Decimal>,
+    snapshot: &SignedAccountSnapshot,
+) -> bool {
+    if venue_order_id.trim().is_empty() {
+        return false;
+    }
+    match command {
+        ExecutionCommand::PlaceLimit(expected) => {
             snapshot.open_orders().iter().any(|actual| {
                 actual.client_order_id == expected.client_order_id.as_str()
-                    && actual
-                        .venue_order_id
-                        .as_deref()
-                        .is_some_and(|id| Some(id) == accepted.get(command_id).map(String::as_str))
+                    && actual.venue_order_id.as_deref() == Some(venue_order_id)
+                    && command
+                        .native_order_family()
+                        .is_some_and(|family| actual.family == family)
                     && actual.symbol == expected.owner.symbol
                     && actual.side == expected.side
                     && actual.position_side == expected.position_side
@@ -798,15 +837,7 @@ fn signed_plan_matches(
                         actual.state,
                         Some(OrderState::New | OrderState::PartiallyFilled)
                     )
-            }) || signed_complete_limit(
-                expected,
-                plan_commands
-                    .iter()
-                    .find(|plan| plan.command_id() == command_id),
-                accepted,
-                command_id,
-                snapshot,
-            )
+            }) || signed_complete_limit(expected, venue_order_id, position_before, snapshot)
         }
         ExecutionCommand::Cancel(command) => !snapshot.open_orders().iter().any(|actual| {
             actual.client_order_id == command.target_client_order_id.as_str()
@@ -815,8 +846,11 @@ fn signed_plan_matches(
                     Some(OrderState::New | OrderState::PartiallyFilled)
                 )
         }),
-        _ => false,
-    })
+        ExecutionCommand::PlaceMarket(_)
+        | ExecutionCommand::MarketReduce(_)
+        | ExecutionCommand::StopMarketFullPosition(_)
+        | ExecutionCommand::StopMarketCloseAll(_) => false,
+    }
 }
 
 fn manual_fill_matches_command(
@@ -842,19 +876,15 @@ fn manual_fill_matches_command(
 
 fn signed_complete_limit(
     expected: &venue_domain::OrderCommand,
-    planned: Option<&ManualPlanCommand>,
-    accepted: &BTreeMap<CommandId, String>,
-    command_id: &CommandId,
+    venue_order_id: &str,
+    position_before: Option<Decimal>,
     snapshot: &venue_runtime::SignedAccountSnapshot,
 ) -> bool {
-    let Some(venue_order_id) = accepted.get(command_id) else {
-        return false;
-    };
     let filled = snapshot
         .fills()
         .iter()
         .filter(|fill| {
-            fill.order_id == *venue_order_id
+            fill.order_id == venue_order_id
                 && fill.symbol == expected.owner.symbol
                 && fill.side == expected.side
                 && match fill.position_side {
@@ -877,18 +907,14 @@ fn signed_complete_limit(
     let Some(filled) = filled else {
         return false;
     };
-    let Some(ManualPlanCommand::PlaceLimit {
-        position_before: Some(position_before),
-        ..
-    }) = planned
-    else {
+    let Some(position_before) = position_before else {
         return false;
     };
     filled == expected.quantity
-        && signed_position_delta_proves_fill(expected, *position_before, snapshot, filled)
+        && signed_position_delta_proves_fill(expected, position_before, snapshot, filled)
 }
 
-fn signed_position_quantity(
+pub(crate) fn signed_position_quantity(
     snapshot: &venue_runtime::SignedAccountSnapshot,
     symbol: &venue_domain::Symbol,
     position_side: PositionSide,
@@ -1154,6 +1180,14 @@ mod tests {
         positions: Vec<SignedAccountPositionFact>,
         fills: Vec<Fill>,
     ) -> Result<SignedAccountSnapshot, Box<dyn std::error::Error>> {
+        snapshot_with_orders(Vec::new(), positions, fills)
+    }
+
+    fn snapshot_with_orders(
+        orders: Vec<SignedAccountOrderFact>,
+        positions: Vec<SignedAccountPositionFact>,
+        fills: Vec<Fill>,
+    ) -> Result<SignedAccountSnapshot, Box<dyn std::error::Error>> {
         Ok(SignedAccountSnapshot::complete_with_fills(
             binding()?,
             1,
@@ -1161,12 +1195,87 @@ mod tests {
             1,
             1,
             SignedAccountPositionMode::Hedge,
-            Vec::new(),
+            orders,
             positions,
             fills,
             "manual-fixture-fills".to_owned(),
             Vec::new(),
         )?)
+    }
+
+    #[test]
+    fn canary_acceptance_requires_an_exact_signed_order_or_absent_cancel_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let owner = owner()?;
+        let order = venue_domain::OrderCommand {
+            time_in_force: LimitTimeInForce::PostOnly,
+            command_id: CommandId::new("canary-place-a")?,
+            client_order_id: CommandId::new("canary-client-a")?,
+            owner: owner.clone(),
+            side: OrderSide::Buy,
+            position_side: PositionSide::Long,
+            quantity: Decimal::ONE,
+            limit_price: Price::new(Decimal::ONE)?,
+            reduce_only: false,
+        };
+        let command = ExecutionCommand::PlaceLimit(order.clone());
+        let family = command
+            .native_order_family()
+            .ok_or("place command has no order family")?;
+        let signed = SignedAccountOrderFact {
+            client_order_id: order.client_order_id.as_str().to_owned(),
+            venue_order_id: Some("canary-venue-a".to_owned()),
+            symbol: owner.symbol.clone(),
+            family,
+            side: order.side,
+            position_side: order.position_side,
+            quantity: order.quantity,
+            limit_price: Some(order.limit_price.value()),
+            time_in_force: Some(order.time_in_force),
+            created_at_ms: Some(1),
+            reduce_only: order.reduce_only,
+            owner: Some(owner.clone()),
+            external: false,
+            state: Some(OrderState::New),
+            filled_quantity: Some(Decimal::ZERO),
+        };
+        let snapshot = snapshot_with_orders(vec![signed.clone()], Vec::new(), Vec::new())?;
+        assert!(signed_operator_canary_matches(
+            &command,
+            "canary-venue-a",
+            Some(Decimal::ZERO),
+            &snapshot,
+        ));
+
+        let mut wrong = signed;
+        wrong.time_in_force = Some(LimitTimeInForce::Gtc);
+        let mismatched = snapshot_with_orders(vec![wrong], Vec::new(), Vec::new())?;
+        assert!(!signed_operator_canary_matches(
+            &command,
+            "canary-venue-a",
+            Some(Decimal::ZERO),
+            &mismatched,
+        ));
+
+        let cancel = ExecutionCommand::Cancel(CancelCommand {
+            command_id: CommandId::new("canary-cancel-a")?,
+            owner,
+            target_client_order_id: order.client_order_id,
+        });
+        assert!(!signed_operator_canary_matches(
+            &cancel,
+            "canary-venue-a",
+            None,
+            &snapshot,
+        ));
+        let absent = snapshot_with_orders(Vec::new(), Vec::new(), Vec::new())?;
+        assert!(signed_operator_canary_matches(
+            &cancel,
+            "canary-venue-a",
+            None,
+            &absent,
+        ));
+        Ok(())
     }
 
     #[test]

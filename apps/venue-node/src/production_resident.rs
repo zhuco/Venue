@@ -349,6 +349,18 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         command: ExecutionCommand,
     ) -> Result<(), NodeError> {
         let command_id = command.command_id().clone();
+        // The canary's fill fallback needs a signed leg baseline from immediately before its
+        // sole dispatch.  Take it before persisting the Actor turn: a fresh private generation
+        // invalidates prior Applied receipts, so it cannot sit between persistence and admission.
+        let signed_before = self.refresh_signed_snapshot()?;
+        let position_before = match &command {
+            ExecutionCommand::PlaceLimit(order) => Some(manual::signed_position_quantity(
+                &signed_before,
+                &order.owner.symbol,
+                order.position_side,
+            )),
+            _ => None,
+        };
         let replay = serde_json::to_vec(&ResidentReplay { command: &command })
             .map_err(|_| NodeError::ResidentRuntime)?;
         let applied = self
@@ -362,7 +374,7 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 binding,
                 &applied,
                 venue_runtime::account::AccountLanePriority::Normal,
-                command,
+                command.clone(),
             )
             .map_err(|error| NodeError::LiveHost {
                 venue: self.host.binding().venue,
@@ -384,7 +396,22 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             })?
             .map(|status| status.state().clone())
         {
-            Some(venue_runtime::CommandState::Accepted { .. }) => Ok(()),
+            Some(venue_runtime::CommandState::Accepted { venue_order_id }) => {
+                let signed_after = self.refresh_signed_snapshot()?;
+                if manual::signed_operator_canary_matches(
+                    &command,
+                    &venue_order_id,
+                    position_before,
+                    &signed_after,
+                ) {
+                    Ok(())
+                } else {
+                    Err(NodeError::LiveHost {
+                        venue: self.host.binding().venue,
+                        message: "operator canary is Accepted in the WAL but its fresh complete signed readback does not yet match".to_owned(),
+                    })
+                }
+            }
             Some(venue_runtime::CommandState::Rejected { reason }) => Err(NodeError::LiveHost {
                 venue: self.host.binding().venue,
                 message: format!("operator canary rejected: {reason}"),

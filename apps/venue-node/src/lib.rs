@@ -770,8 +770,8 @@ mod tests {
 
     use venue_runtime::{
         AccountGatewayResult, AccountHostValidationError, AccountRecoveryReport,
-        AccountRecoveryRequest, AccountRiskEvidence, SignedAccountPositionMode,
-        SignedAccountSnapshot,
+        AccountRecoveryRequest, AccountRiskEvidence, SignedAccountOrderFact,
+        SignedAccountPositionMode, SignedAccountSnapshot,
     };
 
     use super::*;
@@ -990,6 +990,8 @@ mod tests {
     struct LaneProofGateway {
         binding: GatewayBinding,
         dispatches: Arc<AtomicUsize>,
+        signed_generations: Arc<AtomicUsize>,
+        accepted: bool,
     }
 
     impl AccountPhysicalGateway for LaneProofGateway {
@@ -1011,21 +1013,59 @@ mod tests {
         }
 
         fn risk_evidence(&mut self) -> Result<AccountRiskEvidence, AccountHostValidationError> {
-            AccountRiskEvidence::complete(self.binding.clone(), now_ms(), 1, Vec::new(), Vec::new())
+            let generation = self
+                .signed_generations
+                .load(Ordering::SeqCst)
+                .max(1)
+                .try_into()
+                .map_err(|_| AccountHostValidationError::RiskEvidence)?;
+            AccountRiskEvidence::complete(
+                self.binding.clone(),
+                now_ms(),
+                generation,
+                Vec::new(),
+                Vec::new(),
+            )
         }
 
         fn signed_account_snapshot(
             &mut self,
             request: &AccountRecoveryRequest,
         ) -> Result<SignedAccountSnapshot, AccountHostValidationError> {
+            let generation = self
+                .signed_generations
+                .fetch_add(1, Ordering::SeqCst)
+                .saturating_add(1)
+                .try_into()
+                .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+            let orders = (self.accepted && self.dispatches.load(Ordering::SeqCst) != 0)
+                .then(|| SignedAccountOrderFact {
+                    client_order_id: "lane-client".to_owned(),
+                    venue_order_id: Some("lane-venue".to_owned()),
+                    symbol: self.binding.symbol.clone(),
+                    family: venue_domain::NativeOrderFamily::UmOrder,
+                    side: OrderSide::Buy,
+                    position_side: PositionSide::Long,
+                    quantity: Decimal::ONE,
+                    limit_price: Some(Decimal::ONE),
+                    time_in_force: Some(venue_domain::LimitTimeInForce::PostOnly),
+                    created_at_ms: Some(now_ms()),
+                    reduce_only: false,
+                    owner: None,
+                    external: true,
+                    state: Some(venue_domain::OrderState::New),
+                    filled_quantity: Some(Decimal::ZERO),
+                })
+                .into_iter()
+                .collect();
             SignedAccountSnapshot::complete(
                 self.binding.clone(),
                 now_ms(),
                 1,
-                1,
+                generation,
                 1,
                 SignedAccountPositionMode::Hedge,
-                Vec::new(),
+                orders,
                 [PositionSide::Long, PositionSide::Short]
                     .into_iter()
                     .map(|position_side| venue_runtime::SignedAccountPositionFact {
@@ -1053,7 +1093,13 @@ mod tests {
             _permit: venue_runtime::AccountDispatchPermit,
         ) -> AccountGatewayResult {
             self.dispatches.fetch_add(1, Ordering::SeqCst);
-            AccountGatewayResult::Unknown
+            if self.accepted {
+                AccountGatewayResult::Accepted {
+                    venue_order_id: "lane-venue".to_owned(),
+                }
+            } else {
+                AccountGatewayResult::Unknown
+            }
         }
     }
 
@@ -1083,16 +1129,58 @@ mod tests {
         let gateway = LaneProofGateway {
             binding: launch.binding().clone(),
             dispatches: Arc::clone(&dispatches),
+            signed_generations: Arc::new(AtomicUsize::new(0)),
+            accepted: false,
         };
-        assert!(run_live_mvp(&launch, command.clone(), gateway).is_err());
+        let first = run_live_mvp(&launch, command.clone(), gateway);
+        assert!(
+            first.is_err(),
+            "first canary unexpectedly succeeded: {first:?}"
+        );
         assert_eq!(dispatches.load(Ordering::SeqCst), 1);
         let restarted_dispatches = Arc::new(AtomicUsize::new(0));
         let restarted = LaneProofGateway {
             binding: launch.binding().clone(),
             dispatches: Arc::clone(&restarted_dispatches),
+            signed_generations: Arc::new(AtomicUsize::new(0)),
+            accepted: false,
         };
         assert!(run_live_mvp(&launch, command, restarted).is_err());
         assert_eq!(restarted_dispatches.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn operator_canary_accepts_only_after_a_fresh_matching_signed_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let mut raw = live_arguments(&[
+            "canary-place",
+            "--confirm-live",
+            "bybit",
+            "--command-id",
+            "lane-confirm-command",
+            "--client-order-id",
+            "lane-client",
+            "--position-side",
+            "long",
+            "--quantity",
+            "1",
+            "--limit-price",
+            "1",
+        ]);
+        raw[8] = temp.path().as_os_str().to_owned();
+        let launch = NodeLaunch::try_parse_from(VenueId::Bybit, raw)?;
+        let command = launch.live_mvp_command()?;
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let gateway = LaneProofGateway {
+            binding: launch.binding().clone(),
+            dispatches: Arc::clone(&dispatches),
+            signed_generations: Arc::new(AtomicUsize::new(0)),
+            accepted: true,
+        };
+        run_live_mvp(&launch, command, gateway)?;
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
