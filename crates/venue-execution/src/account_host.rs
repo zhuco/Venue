@@ -10,7 +10,7 @@ use fs2::FileExt;
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
 use venue_domain::domain::{
-    Asset, CommandId, ExecutionCommand, FieldState, InstrumentIdentity, MarketKind,
+    Asset, CancelCommand, CommandId, ExecutionCommand, FieldState, InstrumentIdentity, MarketKind,
     NativeOrderFamily, Order, OrderOwner, OrderSide, OrderState, Position, PositionSide, Price,
 };
 use venue_gateway_api::GatewayBinding;
@@ -826,13 +826,34 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
     pub fn refresh_legacy_v1_custody_routes(
         &mut self,
     ) -> Result<Vec<LegacyV1CustodyRoute>, AccountHostError<G::Error>> {
+        let snapshot = self.refresh_signed_snapshot()?;
+        self.legacy_v1_custody_routes_from_snapshot(&snapshot)
+    }
+
+    /// Derives legacy cancellation custody from the last Host-persisted signed snapshot without
+    /// performing another read.  A resident uses it only after it has installed that exact
+    /// generation into Runtime and before it persists the Actor turn that admits a cancel.
+    pub fn legacy_v1_custody_routes_from_latest_signed_snapshot(
+        &self,
+    ) -> Result<Vec<LegacyV1CustodyRoute>, AccountHostError<G::Error>> {
+        let snapshot = self
+            .latest_signed_snapshot
+            .as_ref()
+            .ok_or(AccountHostValidationError::LegacyPredecessor)
+            .map_err(AccountHostError::Validation)?;
+        self.legacy_v1_custody_routes_from_snapshot(snapshot)
+    }
+
+    fn legacy_v1_custody_routes_from_snapshot(
+        &self,
+        snapshot: &SignedAccountSnapshot,
+    ) -> Result<Vec<LegacyV1CustodyRoute>, AccountHostError<G::Error>> {
         let predecessor = self
             .legacy_v1_predecessor
             .as_ref()
             .ok_or(AccountHostValidationError::LegacyPredecessor)
             .map_err(AccountHostError::Validation)?
             .clone();
-        let snapshot = self.refresh_signed_snapshot()?;
         let now = now_ms().map_err(AccountHostError::Validation)?;
         if now < snapshot.observed_at_ms()
             || now.saturating_sub(snapshot.observed_at_ms()) > MAX_RISK_EVIDENCE_AGE_MS
@@ -1262,6 +1283,71 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         if is_risk_increasing(&command) {
             self.require_account_risk_headroom(&command)
                 .map_err(AccountHostError::Validation)?;
+        }
+        rotate_if_clean_and_due(&mut self.journal, &self.journal_path)
+            .map_err(AccountHostError::Journal)?;
+        require_append_budget(&self.journal_path, &command)
+            .map_err(AccountHostError::Validation)?;
+        let receipt = self
+            .journal
+            .prepare(command.clone())
+            .map_err(AccountHostError::Journal)?
+            .clone();
+        self.host_prepared_command(command, &receipt)
+    }
+
+    /// The sole legacy mutation entrance.  It re-derives the route from the latest persisted
+    /// signed snapshot, retains the historical Owner, and can append only an exact Cancel.
+    pub fn prepare_legacy_v1_custody_cancel_for_lane(
+        &mut self,
+        route: &LegacyV1CustodyRoute,
+    ) -> Result<HostPreparedCommand, AccountHostError<G::Error>> {
+        if !self
+            .legacy_v1_custody_routes_from_latest_signed_snapshot()?
+            .iter()
+            .any(|candidate| candidate == route)
+        {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::LegacyPredecessor,
+            ));
+        }
+        let command = ExecutionCommand::Cancel(CancelCommand {
+            command_id: legacy_v1_custody_cancel_command_id(route)
+                .map_err(AccountHostError::Validation)?,
+            owner: route.owner.clone(),
+            target_client_order_id: route.client_order_id.clone(),
+        });
+        self.prepare_legacy_v1_cancel_after_signed_route(command, route)
+    }
+
+    fn prepare_legacy_v1_cancel_after_signed_route(
+        &mut self,
+        command: ExecutionCommand,
+        route: &LegacyV1CustodyRoute,
+    ) -> Result<HostPreparedCommand, AccountHostError<G::Error>> {
+        let ExecutionCommand::Cancel(cancel) = &command else {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::LegacyPredecessor,
+            ));
+        };
+        if cancel.owner != route.owner
+            || cancel.target_client_order_id != route.client_order_id
+            || route.owner.exchange != self.binding.venue.as_str()
+            || !self.configured_symbols.contains(&route.owner.symbol)
+        {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::LegacyPredecessor,
+            ));
+        }
+        self.validate_net_command_against_signed_snapshot(&command)?;
+        let command_id = command.command_id().clone();
+        if let Some(receipt) = self.journal.receipt(&command_id) {
+            if receipt.command != command {
+                return Err(AccountHostError::Validation(
+                    AccountHostValidationError::Duplicate,
+                ));
+            }
+            return self.host_prepared_command(command, receipt);
         }
         rotate_if_clean_and_due(&mut self.journal, &self.journal_path)
             .map_err(AccountHostError::Journal)?;
@@ -2273,6 +2359,24 @@ fn valid_text(value: &str) -> bool {
 
 fn hex_sha256(value: [u8; 32]) -> String {
     value.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn legacy_v1_custody_cancel_command_id(
+    route: &LegacyV1CustodyRoute,
+) -> Result<CommandId, AccountHostValidationError> {
+    let encoded = serde_json::to_vec(&(
+        &route.command_id,
+        &route.owner,
+        route.family,
+        &route.client_order_id,
+        &route.venue_order_id,
+    ))
+    .map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+    let digest = hex_sha256(Sha256::digest(encoded).into());
+    // `CommandId` is capped at 36 bytes; keep the migration prefix short while retaining 128
+    // bits of deterministic route identity for idempotent recovery.
+    CommandId::new(format!("lc-{}", &digest[..32]))
+        .map_err(|_| AccountHostValidationError::LegacyPredecessor)
 }
 
 /// `CommandReceipt` is a struct-only canonical serde shape. This digest binds the dispatch

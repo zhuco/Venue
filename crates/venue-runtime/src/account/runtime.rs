@@ -1631,6 +1631,53 @@ impl AccountRuntime {
         self.enqueue_execution(intent)
     }
 
+    /// Accepts the Host-sealed migration exception only for an exact legacy cancellation route.
+    /// The current actor still supplies the durable turn and lane target; the historical Owner is
+    /// never registered as a normal strategy identity and cannot authorize new risk.
+    pub(crate) fn admit_host_prepared_legacy_v1_custody_cancel(
+        &mut self,
+        binding: &StrategyBinding,
+        applied: &AppliedStrategyTurnReceipt,
+        command: venue_domain::domain::ExecutionCommand,
+        allocation: DurableCommandIdentityAllocation,
+        route: &venue_execution::LegacyV1CustodyRoute,
+    ) -> Result<(), AccountRuntimeError> {
+        let token = applied.token();
+        if binding.key.account != self.account
+            || token.target() != &binding.key
+            || self.last_applied_turns.get(&binding.key) != Some(token)
+            || self.last_applied_durable.get(&binding.key) != applied.actor_applied()
+            || !matches!(command, venue_domain::domain::ExecutionCommand::Cancel(_))
+        {
+            return Err(AccountRuntimeError::StrategyTurnAuthority);
+        }
+        let identity =
+            CommandIdentityReceipt::from_durable_allocation(applied, &command, allocation)?;
+        let intent = AccountExecutionIntent::from_legacy_v1_custody_cancel_turn(
+            applied,
+            AccountLanePriority::Critical,
+            command,
+            identity,
+        )?;
+        self.private_router
+            .reserve_legacy_v1_custody_cancel(&intent, route)?;
+        let registration = self
+            .registry
+            .registration(intent.target())
+            .ok_or(AccountRuntimeError::ActorMissing)?;
+        let mut next_lane = self.execution_lane.clone();
+        next_lane.enqueue(
+            AccountExecutionRequest::authorize(intent)?,
+            &registration.binding,
+        )?;
+        self.execution_lane = next_lane;
+        self.private_route_revision = self
+            .private_route_revision
+            .checked_add(1)
+            .ok_or(AccountRuntimeError::PrivateApplicationState)?;
+        Ok(())
+    }
+
     pub(crate) fn has_active_execution(
         &self,
         command_id: &venue_domain::domain::CommandId,

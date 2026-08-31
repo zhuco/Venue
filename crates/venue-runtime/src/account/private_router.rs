@@ -272,6 +272,27 @@ impl PrivateRouter {
         }
     }
 
+    /// The legacy migration route is intentionally separate from normal Owner resolution: it is
+    /// supplied only by Runtime's sealed Host admission and can authorize one exact Cancel.
+    pub(crate) fn reserve_legacy_v1_custody_cancel(
+        &self,
+        intent: &AccountExecutionIntent,
+        route: &venue_execution::LegacyV1CustodyRoute,
+    ) -> Result<(), PrivateRouterError> {
+        let crate::domain::ExecutionCommand::Cancel(command) = intent.command() else {
+            return Err(PrivateRouterError::CancelTarget);
+        };
+        if !intent.is_legacy_v1_custody_cancel()
+            || intent.native_order_family() != route.family
+            || command.owner != route.owner
+            || command.target_client_order_id != route.client_order_id
+            || route.venue_order_id.trim().is_empty()
+        {
+            return Err(PrivateRouterError::CancelTarget);
+        }
+        Ok(())
+    }
+
     pub fn bind_venue_order(
         &mut self,
         family: NativeOrderFamily,

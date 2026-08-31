@@ -400,6 +400,31 @@ fn legacy_custody_routes_require_the_frozen_owner_wal_and_signed_open_identity()
     assert_eq!(routes[0].client_order_id.as_str(), "legacy-client");
     assert_eq!(routes[0].venue_order_id, "legacy-native");
     assert_eq!(host.gateway.snapshot.open_orders()[0].owner, None);
+    let ordinary_cancel = ExecutionCommand::Cancel(CancelCommand {
+        command_id: CommandId::new("ordinary-legacy-cancel")?,
+        owner: owner.clone(),
+        target_client_order_id: routes[0].client_order_id.clone(),
+    });
+    assert!(matches!(
+        host.prepare_for_lane(ordinary_cancel),
+        Err(AccountHostError::Validation(
+            AccountHostValidationError::Scope
+        ))
+    ));
+    let prepared = host.prepare_legacy_v1_custody_cancel_for_lane(&routes[0])?;
+    let ExecutionCommand::Cancel(cancel) = prepared.command() else {
+        return Err("legacy custody must prepare a cancel".into());
+    };
+    assert_eq!(cancel.owner, owner);
+    assert_eq!(cancel.target_client_order_id, routes[0].client_order_id);
+    let mut tampered = routes[0].clone();
+    tampered.venue_order_id.push_str("-tampered");
+    assert!(matches!(
+        host.prepare_legacy_v1_custody_cancel_for_lane(&tampered),
+        Err(AccountHostError::Validation(
+            AccountHostValidationError::LegacyPredecessor
+        ))
+    ));
     Ok(())
 }
 

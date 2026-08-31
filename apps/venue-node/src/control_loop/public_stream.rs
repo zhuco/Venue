@@ -200,6 +200,9 @@ impl ControlResidentLoop<venue_gateway_binance::BinanceAccountGateway> {
             .filter(|binding| binding.key.strategy_kind == StrategyKind::HedgedGrid)
             .cloned()
             .collect::<Vec<_>>();
+        if !grid_bindings.is_empty() {
+            while self.resident.cancel_legacy_v1_grid_custody_once()? {}
+        }
         // Initial installation is one startup transaction, not a market-data retry loop. Its
         // own signed readback leaves a failed/unknown account Paused; retrying here could create
         // a second epoch or physical child after an indeterminate gateway outcome.
@@ -224,6 +227,13 @@ impl ControlResidentLoop<venue_gateway_bitget::BitgetAccountGateway> {
     /// yields adapter-validated public facts; the existing resident bridge keeps its
     /// snapshot hidden until a covering update proves a contiguous book.
     pub fn run_bitget(mut self) -> Result<(), NodeError> {
+        if self
+            .bindings
+            .values()
+            .any(|binding| binding.key.strategy_kind == StrategyKind::HedgedGrid)
+        {
+            while self.resident.cancel_legacy_v1_grid_custody_once()? {}
+        }
         let runtime = public_runtime()?;
         let limits = venue_gateway_bitget::BitgetTransportLimits::new(
             Duration::from_secs(10),
@@ -301,6 +311,13 @@ impl ControlResidentLoop<venue_gateway_gate::GateAccountGateway> {
     /// Gate's socket is subscribed before its REST baseline is fetched. The resident therefore
     /// observes the existing snapshot-plus-delta bridge, never an unsequenced REST book.
     pub fn run_gate(mut self) -> Result<(), NodeError> {
+        if self
+            .bindings
+            .values()
+            .any(|binding| binding.key.strategy_kind == StrategyKind::HedgedGrid)
+        {
+            while self.resident.cancel_legacy_v1_grid_custody_once()? {}
+        }
         let runtime = public_runtime()?;
         let limits =
             venue_gateway_gate::GateTransportLimits::new(Duration::from_secs(10), 2 * 1024 * 1024)

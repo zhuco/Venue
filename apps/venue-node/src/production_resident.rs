@@ -427,6 +427,106 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         }
     }
 
+    /// Cancels at most one currently-open Stage-7 order through the same Host/WAL/lane before a
+    /// replacement Grid may bootstrap.  The old Owner is never registered as a strategy: the
+    /// Host re-derives this route from the exact Runtime generation and rejects every other kind
+    /// of mutation.  Call again only after this method has signedly converged the first route.
+    pub fn cancel_legacy_v1_grid_custody_once(&mut self) -> Result<bool, NodeError> {
+        self.refresh_signed_snapshot()?;
+        let routes = self
+            .host
+            .legacy_v1_custody_routes_from_current_snapshot()
+            .map_err(|error| NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: error.to_string(),
+            })?;
+        let Some(route) = routes.first().cloned() else {
+            return Ok(false);
+        };
+        let matching = self
+            .grid_bindings
+            .values()
+            .filter(|binding| binding.key.symbol == route.owner.symbol)
+            .cloned()
+            .collect::<Vec<_>>();
+        let [binding] = matching.as_slice() else {
+            return Err(NodeError::ResidentRuntime);
+        };
+        let replay = self
+            .grid_bridges
+            .get(&binding.key)
+            .ok_or(NodeError::ResidentRuntime)?
+            .checkpoint_bytes()?;
+        let applied = self
+            .runtime
+            .persist_resident_semantic_turn(binding, replay)
+            .map_err(resident_error)?;
+        persist_anchor(&self.artifacts_root, binding, &applied)?;
+        let command_id = self
+            .host
+            .prepare_and_admit_legacy_v1_custody_cancel(
+                &mut self.runtime,
+                binding,
+                &applied,
+                &route,
+            )
+            .map_err(|error| NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: error.to_string(),
+            })?;
+        self.runtime
+            .dispatch_next_with_host(&mut self.host)
+            .map_err(|error| NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: error.to_string(),
+            })?;
+        match self
+            .host
+            .command_status(&command_id)
+            .map_err(|error| NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: error.to_string(),
+            })?
+            .map(|status| status.state().clone())
+        {
+            Some(venue_runtime::CommandState::Accepted { .. }) => {}
+            Some(venue_runtime::CommandState::Rejected { reason }) => {
+                return Err(NodeError::LiveHost {
+                    venue: self.host.binding().venue,
+                    message: format!("legacy custody cancel rejected: {reason}"),
+                });
+            }
+            Some(venue_runtime::CommandState::Prepared)
+            | Some(venue_runtime::CommandState::Submitted)
+            | Some(venue_runtime::CommandState::Unknown { .. })
+            | None => {
+                return Err(NodeError::LiveHost {
+                    venue: self.host.binding().venue,
+                    message: "legacy custody cancel unresolved; signed reconciliation is required"
+                        .to_owned(),
+                });
+            }
+        }
+        self.refresh_signed_snapshot()?;
+        if self
+            .host
+            .legacy_v1_custody_routes_from_current_snapshot()
+            .map_err(|error| NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: error.to_string(),
+            })?
+            .iter()
+            .any(|candidate| candidate == &route)
+        {
+            return Err(NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: "legacy custody cancel is Accepted but the order remains open in fresh signed facts"
+                    .to_owned(),
+            });
+        }
+        Ok(true)
+    }
+
     /// The shared part of the Binance initial-install path. The concrete adapter owns the only
     /// production market read; tests inject the already-normalized bounded facts and still pass
     /// through the account Host, WAL and execution lane below.

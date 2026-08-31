@@ -179,6 +179,7 @@ pub struct AccountExecutionIntent {
     command_sha256: [u8; 32],
     allocation_sequence: u64,
     allocation_record_sha256: [u8; 32],
+    legacy_v1_custody_cancel: bool,
 }
 
 impl AccountExecutionIntent {
@@ -216,7 +217,24 @@ impl AccountExecutionIntent {
             command_sha256: identity.command_sha256,
             allocation_sequence: identity.allocation_sequence,
             allocation_record_sha256: identity.allocation_record_sha256,
+            legacy_v1_custody_cancel: false,
         })
+    }
+
+    pub(crate) fn from_legacy_v1_custody_cancel_turn(
+        applied: &AppliedStrategyTurnReceipt,
+        priority: AccountLanePriority,
+        command: ExecutionCommand,
+        identity: CommandIdentityReceipt,
+    ) -> Result<Self, AccountLaneError> {
+        let mut intent = Self::from_applied_turn(applied, priority, command, identity)?;
+        if !matches!(intent.command, ExecutionCommand::Cancel(_))
+            || intent.priority != AccountLanePriority::Critical
+        {
+            return Err(AccountLaneError::Authority);
+        }
+        intent.legacy_v1_custody_cancel = true;
+        Ok(intent)
     }
 
     #[must_use]
@@ -273,6 +291,11 @@ impl AccountExecutionIntent {
     pub const fn exposure(&self) -> ExposureEffect {
         execution_exposure(&self.command)
     }
+
+    #[must_use]
+    pub(crate) const fn is_legacy_v1_custody_cancel(&self) -> bool {
+        self.legacy_v1_custody_cancel
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -290,6 +313,7 @@ pub struct AccountExecutionRequest {
     command_sha256: [u8; 32],
     allocation_sequence: u64,
     allocation_record_sha256: [u8; 32],
+    legacy_v1_custody_cancel: bool,
 }
 
 impl AccountExecutionRequest {
@@ -316,6 +340,7 @@ impl AccountExecutionRequest {
             command_sha256: intent.command_sha256,
             allocation_sequence: intent.allocation_sequence,
             allocation_record_sha256: intent.allocation_record_sha256,
+            legacy_v1_custody_cancel: intent.legacy_v1_custody_cancel,
         })
     }
 
@@ -379,6 +404,11 @@ impl AccountExecutionRequest {
         execution_exposure(&self.command)
     }
 
+    #[must_use]
+    pub(crate) const fn is_legacy_v1_custody_cancel(&self) -> bool {
+        self.legacy_v1_custody_cancel
+    }
+
     /// Stable commitment consumed by the durable recovery manifest. It includes every authority
     /// and allocation field, so recovery cannot substitute a plausible command sharing only IDs.
     pub(crate) fn canonical_recovery_commitment(&self) -> Result<[u8; 32], AccountLaneError> {
@@ -401,6 +431,7 @@ impl AccountExecutionRequest {
             self.command_sha256,
             self.allocation_sequence,
             self.allocation_record_sha256,
+            self.legacy_v1_custody_cancel,
         ))
         .map_err(|_| AccountLaneError::CommandEncoding)?;
         Ok(Sha256::digest(encoded).into())
@@ -1052,7 +1083,10 @@ impl AccountExecutionLane {
             || request.admission_private_generation == 0
             || request.config_epoch == 0
             || request.target != binding.key
-            || !binding.matches_owner(request.command.mutation_owner())
+            || (!binding.matches_owner(request.command.mutation_owner())
+                && !request.is_legacy_v1_custody_cancel())
+            || (request.is_legacy_v1_custody_cancel()
+                && !matches!(request.command, ExecutionCommand::Cancel(_)))
             || request.command.validate_persisted_shape().is_err()
             || !request_identity_matches(&request)
         {
@@ -1501,7 +1535,10 @@ impl AccountExecutionLane {
             || request.admission_private_generation == 0
             || request.config_epoch == 0
             || request.target != binding.key
-            || !binding.matches_owner(request.command.mutation_owner())
+            || (!binding.matches_owner(request.command.mutation_owner())
+                && !request.is_legacy_v1_custody_cancel())
+            || (request.is_legacy_v1_custody_cancel()
+                && !matches!(request.command, ExecutionCommand::Cancel(_)))
             || request.command.validate_persisted_shape().is_err()
             || !request_identity_matches(&request)
         {

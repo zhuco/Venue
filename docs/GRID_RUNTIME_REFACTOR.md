@@ -397,6 +397,9 @@ G:\Venue\artifacts\<exchange>\LIVE\<trading_account_id>\
 导入时每一条物理 mutation 的 Owner 都必须匹配这份冻结身份，混合 Owner WAL 不复制。它们仅和
 状态为 `New`/`PartiallyFilled`、剩余量为正的签名订单的 native/client/full-shape 共同组成 cancellation-only custody
 候选，不可把旧 Owner 重写为新 UUID，也不可成为 Place/Reduce 的授权。
+候选只可在 Host 已把该份签名快照安装为 Runtime 当前 private generation 后，由当前策略的耐久 Actor turn
+提交同一 lane 的精确 Cancel；Host 在写入 `Prepared` 前再次从该已持久快照逐字段比对 route。任何较新的签名
+generation 在 dispatch 前到达，都必须拒绝该 Prepared，而不是用旧 Owner、旧 route 或新的快照自动重组/重投。
 
 ### 8.3 重启顺序
 

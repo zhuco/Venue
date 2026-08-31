@@ -5,7 +5,8 @@ use venue_domain::domain::ExecutionCommand;
 use venue_execution::{
     AccountCommandStatus, AccountDispatchOutcome, AccountHostError,
     AccountLimitNormalizationIntent, AccountMutationHost, AccountPhysicalGateway,
-    AccountPricedLimitIntent, AccountSymbolSet, HostPreparedCommand, execution_command_sha256,
+    AccountPricedLimitIntent, AccountSymbolSet, HostPreparedCommand, LegacyV1CustodyRoute,
+    execution_command_sha256,
 };
 use venue_gateway_api::GatewayBinding;
 
@@ -314,6 +315,17 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
         Ok(snapshot)
     }
 
+    /// Returns the exact legacy routes derived from the most recently installed Runtime
+    /// generation. This method performs no read, so an Actor turn persisted immediately after it
+    /// is bound to the same signed facts that custody preparation rechecks.
+    pub fn legacy_v1_custody_routes_from_current_snapshot(
+        &self,
+    ) -> Result<Vec<LegacyV1CustodyRoute>, AccountRuntimeHostError<G::Error>> {
+        self.host
+            .legacy_v1_custody_routes_from_latest_signed_snapshot()
+            .map_err(AccountRuntimeHostError::Host)
+    }
+
     /// Admits an operator-generated semantic command only after the sole Host has fsynced the
     /// corresponding WAL record. The prepared proof never leaves this resident wrapper.
     pub fn prepare_and_admit_operator(
@@ -370,13 +382,81 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
             )
             .map_err(AccountRuntimeHostError::Runtime)?;
         self.prepared.insert(
-            command_id,
+            command_id.clone(),
             PreparedLaneAdmission {
                 commitment,
                 proof: prepared,
             },
         );
         Ok(())
+    }
+
+    /// The only transition that permits an old Owner through the unified lane. The Host first
+    /// rechecks the supplied route against its current signed snapshot and creates only Cancel;
+    /// Runtime then accepts it under the current actor's durable turn with a sealed exception.
+    pub fn prepare_and_admit_legacy_v1_custody_cancel(
+        &mut self,
+        runtime: &mut AccountRuntime,
+        binding: &StrategyBinding,
+        applied: &AppliedStrategyTurnReceipt,
+        route: &LegacyV1CustodyRoute,
+    ) -> Result<venue_domain::domain::CommandId, AccountRuntimeHostError<G::Error>> {
+        if runtime.account() != &self.account
+            || binding.key.account != self.account
+            || binding.key.symbol != route.owner.symbol
+        {
+            return Err(AccountRuntimeHostError::Scope);
+        }
+        let prepared = self
+            .host
+            .prepare_legacy_v1_custody_cancel_for_lane(route)
+            .map_err(AccountRuntimeHostError::Host)?;
+        let command_id = prepared.command_id().clone();
+        let commitment = PreparedAdmissionCommitment::new(
+            binding,
+            applied,
+            AccountLanePriority::Critical,
+            &prepared,
+        )
+        .map_err(AccountRuntimeHostError::Runtime)?;
+        if let Some(existing) = self.prepared.get(&command_id) {
+            if existing.commitment == commitment && runtime.has_active_execution(&command_id) {
+                return Ok(command_id);
+            }
+            return Err(AccountRuntimeHostError::PreparedAdmissionConflict);
+        }
+        let allocation = DurableCommandIdentityAllocation::from_host_prepared(
+            prepared.receipt_sequence(),
+            prepared.receipt_digest(),
+            prepared.cancel_target_family(),
+        )
+        .map_err(|error| {
+            AccountRuntimeHostError::Runtime(AccountRuntimeError::ExecutionLane(error))
+        })?;
+        runtime
+            .admit_host_prepared_legacy_v1_custody_cancel(
+                binding,
+                applied,
+                prepared.command().clone(),
+                allocation,
+                route,
+            )
+            .map_err(AccountRuntimeHostError::Runtime)?;
+        runtime
+            .advance_resident_wal_head(
+                self.host
+                    .runtime_wal_head()
+                    .map_err(AccountRuntimeHostError::Host)?,
+            )
+            .map_err(AccountRuntimeHostError::Runtime)?;
+        self.prepared.insert(
+            command_id.clone(),
+            PreparedLaneAdmission {
+                commitment,
+                proof: prepared,
+            },
+        );
+        Ok(command_id)
     }
 
     /// Copy has a public semantic Actor receipt rather than a generic Runtime turn receipt.
