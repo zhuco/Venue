@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     str,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -25,12 +25,17 @@ use crate::{
     BITGET_ORDER_PROFILE_VERSION, BitgetAccountBinding, BitgetConfig, BitgetCredentials,
     BitgetExactOrderReadback, BitgetHttpTransport, BitgetMutationKind, BitgetMutationOutcome,
     BitgetNodeReadbackCandidate, BitgetOrderFamilyEvidence, BitgetOrderFamilyScope,
-    BitgetTransportError, BitgetTransportLimits, BitgetUnsupportedEvidence,
-    build_account_wide_open_orders_read_request, build_account_wide_positions_read_request,
-    build_ack_readback_request, build_fills_read_request, build_unknown_recovery_readback_request,
+    BitgetPrivateWsTransport, BitgetRawPrivateFrame, BitgetTransportError, BitgetTransportLimits,
+    BitgetUnsupportedEvidence, build_account_wide_open_orders_read_request,
+    build_account_wide_positions_read_request, build_ack_readback_request,
+    build_fills_read_request, build_unknown_recovery_readback_request,
+    connect_authenticated_private_ws,
     instrument::{BitgetInstrumentRules, BitgetRawInstrumentPayload, parse_instrument_rules},
     prepare_node_mutation,
-    private::{BITGET_MAX_FILL_HISTORY_WINDOW_MS, BITGET_MAX_PRIVATE_PAGES},
+    private::{
+        BITGET_MAX_FILL_HISTORY_WINDOW_MS, BITGET_MAX_PRIVATE_PAGES, BITGET_MAX_STREAM_FILLS,
+        parse_stream_fills,
+    },
     public::{BitgetPublicSource, BitgetRawPublicPayload, BitgetTickerEvent, parse_rest_ticker},
     settle_ack_readback, settle_unknown_readback,
 };
@@ -47,7 +52,24 @@ pub struct BitgetAccountGateway {
     rules: BitgetInstrumentRules,
     rules_catalog: BTreeMap<Symbol, BitgetInstrumentRules>,
     private: BitgetNodeReadbackCandidate,
+    /// The most recent complete signed snapshot attempt admitted by the account host. This is not
+    /// a websocket connection generation and is the only generation attached to stream fills.
+    private_generation: u64,
     next_attempt_id: u64,
+    private_stream: Option<BitgetPrivateWsTransport>,
+    private_stream_attempt: Option<u64>,
+    pending_private_fills: VecDeque<BitgetPrivateFillEvent>,
+}
+
+/// Sanitized execution evidence from one UTA `fill` update. The authenticated websocket frame
+/// and its native payload remain inside the adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BitgetPrivateFillEvent {
+    /// The adapter-local signed snapshot attempt that authorized this socket's delivery.
+    pub source_private_generation: u64,
+    pub received_at_ms: u64,
+    pub fill: Fill,
+    pub client_order_id: FieldState<String>,
 }
 
 impl BitgetAccountGateway {
@@ -79,8 +101,77 @@ impl BitgetAccountGateway {
             rules,
             rules_catalog,
             private,
+            private_generation: 0,
             next_attempt_id: 2,
+            private_stream: None,
+            private_stream_attempt: None,
+            pending_private_fills: VecDeque::new(),
         })
+    }
+
+    /// Opens one authenticated UTA stream only after a complete signed snapshot has installed an
+    /// exact attempt. Any refresh, disconnect, malformed frame, or bounded-queue overflow tears
+    /// the stream down; the caller must wait for another signed snapshot before retrying.
+    pub fn poll_private_fill(
+        &mut self,
+    ) -> Result<Option<BitgetPrivateFillEvent>, BitgetAccountGatewayError> {
+        if let Some(fill) = self.pending_private_fills.pop_front() {
+            return Ok(Some(fill));
+        }
+        if self.private_generation == 0
+            || self.private.private_generation() != self.private_generation
+        {
+            self.invalidate_private_stream();
+            return Err(BitgetAccountGatewayError::PrivateStream);
+        }
+        if self.private_stream.is_none() {
+            let stream = self
+                .runtime
+                .block_on(connect_authenticated_private_ws(
+                    self.transport_binding().clone(),
+                    &self.credentials,
+                    now_ms()?,
+                    self.transport.limits(),
+                ))
+                .map_err(BitgetAccountGatewayError::Transport)?;
+            self.private_stream = Some(stream);
+            self.private_stream_attempt = Some(self.private_generation);
+        }
+        if self.private_stream_attempt != Some(self.private_generation) {
+            self.invalidate_private_stream();
+            return Err(BitgetAccountGatewayError::PrivateStream);
+        }
+        let frame = match self.private_stream.as_mut() {
+            Some(stream) => self.runtime.block_on(stream.next_frame()),
+            None => return Err(BitgetAccountGatewayError::PrivateStream),
+        };
+        let events = match frame {
+            Ok(frame) => normalize_private_stream_fill(
+                frame,
+                self.transport_binding(),
+                self.private_generation,
+            ),
+            Err(error) => Err(BitgetAccountGatewayError::Transport(error)),
+        };
+        let events = match events {
+            Ok(events) => events,
+            Err(error) => {
+                self.invalidate_private_stream();
+                return Err(error);
+            }
+        };
+        if events.len() > BITGET_MAX_STREAM_FILLS
+            || self
+                .pending_private_fills
+                .len()
+                .saturating_add(events.len())
+                > BITGET_MAX_STREAM_FILLS
+        {
+            self.invalidate_private_stream();
+            return Err(BitgetAccountGatewayError::PrivateStream);
+        }
+        self.pending_private_fills.extend(events);
+        Ok(self.pending_private_fills.pop_front())
     }
 
     fn next_attempt_id(&mut self) -> Result<u64, BitgetAccountGatewayError> {
@@ -145,7 +236,14 @@ impl BitgetAccountGateway {
             attempt,
         ))?;
         self.private = private;
+        self.invalidate_private_stream();
         Ok(())
+    }
+
+    fn invalidate_private_stream(&mut self) {
+        self.private_stream = None;
+        self.private_stream_attempt = None;
+        self.pending_private_fills.clear();
     }
 
     fn dispatch_permit(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
@@ -349,13 +447,34 @@ impl AccountPhysicalGateway for BitgetAccountGateway {
         let attempt = self
             .next_attempt_id()
             .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-        self.runtime.block_on(fetch_account_wide_snapshot(
+        let snapshot = self.runtime.block_on(fetch_account_wide_snapshot(
             &self.transport,
             &self.credentials,
             &self.rules_catalog,
             attempt,
             request,
-        ))
+        ))?;
+        if snapshot.private_generation() != attempt {
+            return Err(AccountHostValidationError::SignedSnapshot);
+        }
+        let private = self
+            .runtime
+            .block_on(fetch_private(
+                &self.transport,
+                &self.credentials,
+                &self.rules,
+                attempt,
+            ))
+            .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+        if private.private_generation() != snapshot.private_generation()
+            || private.connection_generation() != snapshot.rules_generation()
+        {
+            return Err(AccountHostValidationError::SignedSnapshot);
+        }
+        self.private = private;
+        self.private_generation = snapshot.private_generation();
+        self.invalidate_private_stream();
+        Ok(snapshot)
     }
 
     fn normalize_limit_intent(
@@ -529,6 +648,38 @@ fn normalize_priced_limit(
         .validate()
         .map_err(|_| AccountHostValidationError::Command)?;
     Ok(ExecutionCommand::PlaceLimit(command))
+}
+
+fn normalize_private_stream_fill(
+    frame: BitgetRawPrivateFrame,
+    binding: &GatewayBinding,
+    private_generation: u64,
+) -> Result<Vec<BitgetPrivateFillEvent>, BitgetAccountGatewayError> {
+    if frame.binding != *binding || frame.generation == 0 || frame.received_at_ms == 0 {
+        return Err(BitgetAccountGatewayError::PrivateStream);
+    }
+    if frame.topic != "fill" {
+        return Ok(Vec::new());
+    }
+    if private_generation == 0 {
+        return Err(BitgetAccountGatewayError::PrivateStream);
+    }
+    let payload =
+        str::from_utf8(&frame.payload).map_err(|_| BitgetAccountGatewayError::PrivateStream)?;
+    let fills = parse_stream_fills(payload, &binding.symbol)
+        .map_err(|_| BitgetAccountGatewayError::PrivateStream)?;
+    if fills.len() > BITGET_MAX_STREAM_FILLS {
+        return Err(BitgetAccountGatewayError::PrivateStream);
+    }
+    Ok(fills
+        .into_iter()
+        .map(|fill| BitgetPrivateFillEvent {
+            source_private_generation: private_generation,
+            received_at_ms: frame.received_at_ms,
+            fill: fill.fill,
+            client_order_id: fill.client_order_id,
+        })
+        .collect())
 }
 
 const fn valid_hedge_limit_direction(
@@ -1431,6 +1582,8 @@ pub enum BitgetAccountGatewayError {
     Rules,
     #[error("Bitget signed account readback is invalid")]
     Readback,
+    #[error("Bitget private fill stream is malformed or no longer bound to its signed snapshot")]
+    PrivateStream,
     #[error(transparent)]
     Transport(#[from] BitgetTransportError),
 }
@@ -1477,6 +1630,36 @@ mod tests {
             1_000_000,
             payload,
         )?)?)
+    }
+
+    #[test]
+    fn private_stream_fill_uses_the_signed_snapshot_attempt_not_socket_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding()?;
+        let payload = json!({
+            "action": "update",
+            "arg": {"instType": "UTA", "topic": "fill"},
+            "data": [{
+                "execId": "1001", "orderId": "9001", "clientOid": "owned-9001",
+                "category": "usdt-futures", "symbol": "BTCUSDT", "side": "buy",
+                "holdSide": "long", "execQty": "0.001", "execPrice": "100000",
+                "feeDetail": [{"feeCoin": "USDT", "fee": "-0.01"}],
+                "execPnl": "0", "tradeScope": "maker", "execTime": "1700000000000"
+            }]
+        })
+        .to_string();
+        let frame = BitgetRawPrivateFrame {
+            binding: binding.clone(),
+            generation: 91,
+            topic: "fill".to_owned(),
+            received_at_ms: 1_700_000_000_001,
+            payload: bytes::Bytes::from(payload),
+        };
+        let events = normalize_private_stream_fill(frame, &binding, 7)?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_private_generation, 7);
+        assert_eq!(events[0].fill.fill_id, "1001");
+        Ok(())
     }
 
     #[test]

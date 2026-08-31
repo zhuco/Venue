@@ -33,7 +33,9 @@ use crate::{
     BitgetTransportLimits, transport::unix_ms, ws_sign,
 };
 
-const PRIVATE_TOPICS: [&str; 3] = ["account", "position", "order"];
+// `fill` is the documented UTA execution channel. It is ACK-gated with the account surfaces so
+// a socket never starts delivery before the full private subscription contract is accepted.
+const PRIVATE_TOPICS: [&str; 4] = ["account", "position", "order", "fill"];
 const MAX_PRE_LIVE_FRAMES: usize = 256;
 const MAX_PRE_LIVE_BYTES: usize = 1024 * 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
@@ -1266,7 +1268,7 @@ struct LoginArg<'a> {
 struct SubscribeFrame {
     #[serde(rename = "op")]
     operation: &'static str,
-    args: [SubscriptionArg; 3],
+    args: [SubscriptionArg; 4],
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -1334,7 +1336,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_delivery_waits_for_all_three_exact_subscription_acks()
+    async fn private_delivery_waits_for_all_exact_subscription_acks()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("ws://{}", listener.local_addr()?);
@@ -1356,7 +1358,7 @@ mod tests {
                         .into(),
                 ))
                 .await?;
-            for topic in ["account", "position", "order"] {
+            for topic in ["account", "position", "order", "fill"] {
                 websocket
                     .send(Message::Text(
                         format!(
@@ -1453,7 +1455,7 @@ mod tests {
                 ))
                 .await?;
             let _ = websocket.next().await.ok_or("missing subscribe")??;
-            for topic in ["account", "position", "order"] {
+            for topic in ["account", "position", "order", "fill"] {
                 websocket
                     .send(Message::Text(
                         format!(
@@ -1566,7 +1568,7 @@ mod tests {
                 ))
                 .await?;
             let _ = websocket.next().await;
-            for topic in ["account", "position", "order"] {
+            for topic in ["account", "position", "order", "fill"] {
                 websocket
                     .send(Message::Text(
                         format!(
@@ -1623,7 +1625,7 @@ mod tests {
                 ))
                 .await?;
             let _ = websocket.next().await;
-            for topic in ["account", "position", "order"] {
+            for topic in ["account", "position", "order", "fill"] {
                 websocket
                     .send(Message::Text(
                         format!(

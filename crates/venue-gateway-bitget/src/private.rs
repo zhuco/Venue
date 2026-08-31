@@ -23,6 +23,7 @@ pub const BITGET_UTA_FUTURES_CATEGORY: &str = "USDT-FUTURES";
 pub const BITGET_PRIVATE_PAGE_SIZE: usize = 100;
 pub const BITGET_MAX_PRIVATE_PAGES: usize = 900;
 pub const BITGET_MAX_FILL_HISTORY_WINDOW_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+pub const BITGET_MAX_STREAM_FILLS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -396,6 +397,54 @@ pub fn parse_fill_page(raw: BitgetRawPrivatePage) -> Result<BitgetFillPage, Bitg
         fills,
         next_cursor,
     })
+}
+
+/// Parses one documented UTA private `fill` message without retaining its raw frame. A websocket
+/// `snapshot` is not a signed account snapshot: the account gateway binds every parsed fill to
+/// its separately completed signed attempt before it can leave the adapter.
+pub fn parse_stream_fills(
+    payload: &str,
+    symbol: &Symbol,
+) -> Result<Vec<BitgetFill>, BitgetPrivateError> {
+    let root: Value = serde_json::from_str(payload).map_err(|_| BitgetPrivateError::Payload)?;
+    let root = object(&root)?;
+    let argument = root
+        .get("arg")
+        .and_then(Value::as_object)
+        .ok_or(BitgetPrivateError::Payload)?;
+    if argument.get("instType").and_then(Value::as_str) != Some("UTA")
+        || argument.get("topic").and_then(Value::as_str) != Some("fill")
+        || !matches!(
+            root.get("action").and_then(Value::as_str),
+            Some("snapshot" | "update")
+        )
+    {
+        return Err(BitgetPrivateError::Payload);
+    }
+    let rows = root
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or(BitgetPrivateError::Payload)?;
+    if rows.is_empty() || rows.len() > BITGET_MAX_STREAM_FILLS {
+        return Err(BitgetPrivateError::Payload);
+    }
+    let mut execution_ids = BTreeSet::new();
+    let mut fills = Vec::with_capacity(rows.len());
+    for row in rows {
+        let fill = parse_fill(row, symbol)?;
+        if fill.exchange_time_ms.is_none()
+            || !matches!(fill.maker, FieldState::Known(_))
+            || !execution_ids.insert(fill.fill_id.clone())
+        {
+            return Err(BitgetPrivateError::Payload);
+        }
+        let client_order_id = client_order_id(object(row)?.get("clientOid"));
+        fills.push(BitgetFill {
+            fill,
+            client_order_id,
+        });
+    }
+    Ok(fills)
 }
 
 /// Proves a closed, single-attempt regular-order pagination chain and rejects duplicate venue IDs.
@@ -1000,6 +1049,34 @@ mod tests {
             "execTime": "11",
             "updatedTime": "12"
         })
+    }
+
+    #[test]
+    fn private_stream_fill_requires_the_exact_uta_shape() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let payload = json!({
+            "action": "update",
+            "arg": {"instType": "UTA", "topic": "fill"},
+            "data": [fill_row("700")]
+        })
+        .to_string();
+        let fills = parse_stream_fills(&payload, &symbol()?)?;
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].fill.fill_id, "700");
+        assert!(matches!(fills[0].client_order_id, FieldState::Known(_)));
+
+        let snapshot = payload.replacen("\"update\"", "\"snapshot\"", 1);
+        assert_eq!(parse_stream_fills(&snapshot, &symbol()?)?.len(), 1);
+        let invalid_action = payload.replacen("\"update\"", "\"delete\"", 1);
+        assert!(parse_stream_fills(&invalid_action, &symbol()?).is_err());
+        let duplicate = json!({
+            "action": "update",
+            "arg": {"instType": "UTA", "topic": "fill"},
+            "data": [fill_row("701"), fill_row("701")]
+        })
+        .to_string();
+        assert!(parse_stream_fills(&duplicate, &symbol()?).is_err());
+        Ok(())
     }
 
     fn raw(
