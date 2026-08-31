@@ -1,10 +1,16 @@
 # Venue Web
 
-Responsive Control client using schema v2 only. Requires Node.js >=22.18; package versions are pinned in `package-lock.json`.
+Responsive Control client using schema v2 only. Product version and known limits: [root README](../../README.md), [release notes](../../CHANGELOG.md). Development workflow: [DEVELOPMENT](../../DEVELOPMENT.md).
+
+Use Node.js 24, matching CI. The package minimum is >=22.18; that lower bound does not certify every newer major. Next.js 16.3.3, React/React DOM 19.2.8 and TypeScript 7.0.2 are pinned in the package/lockfile. This is the user-facing DOM application, not the internal VenueFlow WASM canvas client.
+
+Overview, relations, accounts, orders, positions, fills, reconciliation, ledger/drift and semantic controls exist. The controlled BFF session is not a finished public multi-user onboarding system; production Node/Control/exchange connectivity, screenshot and latency acceptance remain separate.
 
 ## Build and run
 
 Run `npm ci`, `npm run typecheck`, `npm test`, and `npm run build` from this directory. The build produces `.next/standalone`, including `.next/static` and optional `public` assets. `npm run start` runs the standalone server; `PORT` and `HOSTNAME` control its listener. Deploy the generated standalone directory as one versioned release, without environment files or QA artifacts. Production browser access requires HTTPS.
+
+Next.js 16 does not run a linter during `next build`; this repository currently has no ESLint/Biome script. Typecheck and boundary scans must not be reported as a full lint pass. See the [official Next 16 changes](https://nextjs.org/blog/next-16); runtime support references are in [ARCHITECTURE](../../ARCHITECTURE.md).
 
 After building, run `npm run verify:boundary`. It scans application source and browser JavaScript for legacy Control endpoints, non-LIVE gateway modes, exchange credential fields, direct exchange API URLs and URL credentials. It reports only filenames/rule names, never matching secret text. CI runs this guard, typecheck, unit tests, production build and all five browser viewports; the isolated browser fixtures are not deployed.
 

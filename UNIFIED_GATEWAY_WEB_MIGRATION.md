@@ -12,6 +12,9 @@
 - 当前代码位置查 [`CODEMAP.md`](CODEMAP.md)。
 - 当前获准任务查 [`REFACTOR_IMPLEMENTATION_GOALS.md`](REFACTOR_IMPLEMENTATION_GOALS.md)。
 
+本文件的阶段是最终验收契约，不代表全部仍待编码，也不自动恢复已停止的长任务。
+当前源码状态以第 3 节为准；开发方式见 [`DEVELOPMENT.md`](DEVELOPMENT.md)，停用状态见 [`DEPRECATED.md`](DEPRECATED.md)，版本范围见 [`CHANGELOG.md`](CHANGELOG.md)。
+
 发生冲突时，交易安全与实盘接管以 `GRID_RUNTIME_REFACTOR.md` 为准；本文负责统一执行链和 Web 产品的实施顺序。
 
 ## 2. 已批准结果
@@ -104,11 +107,11 @@ AI 只发起经授权的 operator/control 语义动作，不能直接调用 adap
 - 六个 `venue-gateway-*` adapter 已具备不同程度的签名 HTTP、私流、账户事实、place/cancel、规则和签名回读能力。
 - 规范限价命令以 `LimitTimeInForce::{PostOnly, Gtc}` 区分只挂单和普通限价；六所 wire、签名订单与 WAL 对账必须保持同一政策，不能只按订单 ID 判定成功。
 - Binance、Gate.io、Bitget 的 Stage 7 已保存成熟的网格热路径、成交滚动、完整订单族回读、Unknown 和接管行为。
-- Bybit、OKX、Hyperliquid 已使用较小的 `AccountMutationHost` 安全闭环执行显式预检和 Canary 命令。
+- 六所固定 Node 已组合 `AccountRuntimeHost`、Execution Lane 与 `AccountMutationHost`；preflight/Canary 也不绕过统一链。旧三家的 `--legacy-v1-handoff` 前驱保护仍是当前启动前置条件，服务器接管另行证明。
 - `venue-copy` 已包含资本、目标敞口、数量、限价、确定性身份、delivery、ledger 和 drift 纯语义。
-- Control/PostgreSQL 已保存 Copy relation、job delivery、claim/ACK/receipt；Node 已能耐久应用 Copy 语义。
+- Control/PostgreSQL 已保存 Copy relation、job delivery、claim/ACK/receipt、ledger/drift 及 0016 未领取过期恢复；Node 已有 Copy 语义到同一账户 WAL 的物理桥和签名执行结果回传，完整产品闭环仍需验收。
 - 六所固定 Node 已接入 adapter-owned 公共盘口及公共成交；Bybit 重建完整簿、Hyperliquid 使用原生完整 L2 图像，OKX 按 `prevSeqId` 连续桥接。成交原生身份与本地 Session cursor 分离，批量事实有界无损轮转；Binance 保留显式原生聚合序列。Bybit/OKX/Gate 仅发布协议确认闭合的 K 线，Bitget/Hyperliquid 形成线不自动提升。行情只进入共享 MarketHub/FeatureSource；公共接收器和 fixture 通过不代表策略自动出单、私流热路径或逐所接管完成。
-- `G:\kol\apps\web` 使用 Next.js 16、React 19、TypeScript 7，已有响应式 shell、角色页面、恢复、SSE、十进制和交互测试。
+- 当前 `apps/venue-web` 已采用 Next.js 16、React 19、TypeScript 和同源 BFF，包含响应式页面、会话、恢复、SSE、十进制及隔离交互测试；旧 KOL Web 只是行为参考，不是运行依赖。
 
 ### 3.2 必须补齐的闭环
 
@@ -532,9 +535,9 @@ dispatch 启动 `<20ms`（均不含交易所网络）目标。Web 首次可用 s
 跨模块公共契约、依赖或架构变更及正式发布前集中建立以下基线；基线通过后的局部增量不重复全工作区测试，记录源码范围与专项结果：
 
 ```text
-cargo fmt --all --check
-cargo check --workspace --all-targets
-cargo test --workspace
+./scripts/Invoke-VenueBuild.ps1 -CargoArguments @('fmt','--all','--check')
+./scripts/Invoke-VenueBuild.ps1 -CargoArguments @('check','--locked','--workspace','--all-targets')
+./scripts/Invoke-VenueBuild.ps1 -CargoArguments @('test','--locked','--workspace')
 scripts/verify_repository_hygiene.ps1
 ```
 

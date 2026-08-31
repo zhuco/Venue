@@ -6,7 +6,7 @@
 
 本文是多策略、多交易所实盘和对冲网格的唯一长期开发契约，说明当前采用的架构、边界、成交热路径、恢复规则、迁移顺序与验收要求。
 
-[`ARCHITECTURE.md`](ARCHITECTURE.md) 定义合并跟单、六交易所网关、指标和桌面 UI 后的目标 workspace。六所是网关目标覆盖，
+[`ARCHITECTURE.md`](ARCHITECTURE.md) 说明合并跟单、六交易所网关、指标和桌面 UI 后的当前 workspace。六所是网关目标覆盖，
 网关只接受精确 `LIVE` 并只使用生产 endpoint；这不自动扩大当前 Stage 7 网格的三所实盘准入，新增交易所仍必须独立完成策略、恢复和接管验收。
 本文现有 Shadow/verify 是策略与工件证据流程，不是第三种网关运行模式。
 
@@ -30,7 +30,7 @@ Unknown 时增险或双 writer；完整范围和人工协助延后规则以迁�
 - 一个规范交易对只允许一个策略实例拥有；
 - 行情和账户私有连接共享，策略状态、订单归属和持久化隔离；
 - 所有下单、撤单和市价减仓经过账户内唯一 Execution Lane（执行通道）；
-- Web 面板或 Windows UI 以后只接控制与查询接口，不进入交易热路径。
+- Web 面板与 Windows UI 已有实现，只接控制与查询接口，不进入交易热路径；原生端无凭证公共行情例外见架构文档。
 
 Stage 7 网格实现仅保留为工件兼容读取和行为证据源；根 package 的三家 `hedged-grid-*` 生产 binary、feature、部署 re-export 与发布脚本已移除。新的生产编排只能经六个固定 Node binary、统一 Account Runtime、Execution Lane 和 AccountMutationHost，绝不保留第二套 writer/WAL/authority 链。
 
@@ -39,12 +39,12 @@ Stage 7 网格实现仅保留为工件兼容读取和行为证据源；根 packa
 当前 10–20 用户阶段采用最小实盘安全模型：
 
 1. 每个 `(exchange, trading_account_id)` 只有一个常驻账户进程、一个进程锁和一个串行 Execution Lane；当前不设计跨机器 writer 选举。
-2. 所有 mutation 共用一本 `commands.jsonl`，状态只保留 `Prepared / Submitted / Accepted / Rejected / Unknown`。发送前 fsync `Prepared`，发送后写结果；连接中断或超时写 `Unknown`。
+2. 所有 mutation 共用一本 `commands.jsonl`，状态只保留 `Prepared / Submitted / Accepted / Rejected / Unknown`。发送前 fsync `Prepared`，dispatch 前持久化 `Submitted`，再写请求结果；连接中断或超时写 `Unknown`。
 3. Owner 只是同一 WAL 记录中的 `strategy_id/user_id` 和订单 family/native identity，不建立独立 authority、journal、root、seal 或 receipt。
 4. `Unknown` 是恢复状态而不是权限体系：账户暂停新增风险，以原 Client Order ID、交易所订单 ID、订单族、成交和当前持仓的签名查询收敛；未收敛前禁止自动重发，允许撤单和 reduce-only。ACK 外层与订单行矛盾、身份或时间校验失败但订单行显示成功时也必须记为 `Unknown`，不得误记 `Rejected` 后释放风险。
-5. 启动准入只检查账户锁、配置/凭证、实时规则、当前 checkpoint、未决 WAL 和更新的签名订单/仓位/成交事实。检查通过后由同一账户进程直接持有 writer；不再要求调用链拼装多层 capability、admission、opaque session、五类 root 或一次性 dispatch receipt。
+5. 启动准入只检查账户锁、配置/凭证、实时规则、当前 checkpoint、未决 WAL 和更新的签名订单/仓位/成交事实。检查通过后由同一账户进程直接持有 writer；当前实现由同一 Host 在 Submitted 后签发一次性 dispatch permit，Actor applied 只证明本地耐久应用；不得在外部另拼 capability、admission、五类 root 或第二套 writer 权限链。
 
-现有 Stage 7 的 lease、canonical root、hash-chain receipt、handoff 和恢复 manifest 只作为迁移兼容实现，不得继续扩展，也不得成为 Bybit、OKX、Hyperliquid 接入的前置模板。迁移时优先收敛到上述单账户模型；旧 writer 与新 writer 不得重叠，旧 WAL 中的 Unknown 必须先对账。Bybit、OKX、Hyperliquid 已通过真实只读预检、10U 名义风险校验、最小 WAL/Unknown 恢复测试和逐家 Canary；后续 mutation 仍必须经本文的账户 host，不能因降低复杂度而绕过验收。
+现有 Stage 7 的 lease、canonical root、hash-chain receipt、handoff 和恢复 manifest 只作为迁移兼容实现，不得继续扩展，也不得成为 Bybit、OKX、Hyperliquid 接入的前置模板。迁移时优先收敛到上述单账户模型；旧 writer 与新 writer 不得重叠，旧 WAL 中的 Unknown 必须先对账。历史预检或 Canary 只证明其对应版本、账户与观测时点，不能作为当前版本已经完成生产接管的声明；后续 mutation 仍必须经本文的账户 host，并重新核验实时安全条件。
 
 Hyperliquid 使用 `HYPERLIQUID_ACCOUNT_ADDRESS`、`HYPERLIQUID_API_WALLET_ADDRESS`、`HYPERLIQUID_API_WALLET_PRIVATE_KEY` 三项必填及 `HYPERLIQUID_VAULT_ADDRESS` 可选；API Wallet 地址必须由私钥推导一致。其 USDC 风险估值经无凭证、只读的公开稳定币基准读取保守 USDC/USD bid 与 USDT/USD ask 后换算，绝不按 1:1 视为 USDT；基准异常、格式变更或读取失败均冻结新增风险。该窄估值读取不链接任何其他六所 adapter。Stage 7 成交热路径不得遍历历史 WAL；启动时只为未决命令、Client Order ID、Owner 字段和交易所订单 ID 建内存索引。
 
@@ -170,7 +170,7 @@ Exchange Account Process
 - 低优先级：周期查询、统计和报表；
 - 同一 Client Order ID 重试必须幂等，Unknown（结果未知）命令先查事实，不能直接重发。
 - 队列必须有界；Critical 连续服务也必须周期让行 FillRepair/Normal，不能让兄弟实例或普通工作永久饥饿。
-- 命令只有在账户进程锁仍持有、风险/生命周期仍允许且 `Prepared` 已 fsync 后才能发送；发送前校验失败写 `Rejected`，发送后结果不确定写 `Unknown`。不增加一次性 permit 或不可伪造 receipt 层。
+- 命令只有在账户进程锁仍持有、风险/生命周期仍允许且 `Prepared` 已 fsync 后才能发送；发送前校验失败写 `Rejected`，发送后结果不确定写 `Unknown`。复用同一 Host 现有的 Submitted 后 dispatch permit，不另增加独立 permit/receipt 权限层。
 - outcome 与 Unknown 回读直接按同一本 WAL 的 command、Client Order ID、family 和交易所订单 ID 核对；Transient 或 Unknown 只触发冻结与对账，不自动重试旧命令。
 - 限价政策是命令身份的一部分：`LimitTimeInForce::PostOnly/Gtc` 必须随 wire、签名事实、Unknown 回读、Owner 和 Desired Orders 精确比较。历史命令缺字段只按原 PostOnly 契约恢复且保持 WAL 字节；签名事实缺字段保持未知，不能默认只挂单。Grid 与 BBO 自动归一化仍为 PostOnly，手动 Gtc 不得改变策略防吃单边界。
 - 手动选价归一化必须保持原始价格、政策、Owner 和方向；数量只能按报价预算、签名平仓上限及实时 native lot 向下裁剪。适配器不得改用 BBO，归一化不写 WAL 或发送请求，物理准入仍经同一账户链。订单创建时间缺失保持未知，不能用更新或接收时间推导“最近挂单”。
@@ -473,7 +473,7 @@ Scalping Node 配置必须显式给出 `scalping.parameter_release_id/owner_scop
 
 本地 Control API 使用 `venue-control-protocol` schema v2；原生 VenueFlow 与 WebAssembly canvas 共用
 `/v2/ui/snapshot`、`/v2/ui/events`、`/v2/control/commands`。策略投影和命令必须携带精确 `LIVE`，两端只调用 API，不读取数据库、WAL 或 artifacts，
-不持有凭证，不直连交易所，不直接下单。Stop/Flatten 必须显示并提交精确 mode、account、symbol、instance、config epoch、action 与人工确认；
+不持有账户私流/交易凭证或物理订单客户端；原生端可用无凭证公共行情，账户表单的短暂输入与加密提交见 `ACCOUNT_MANAGEMENT.md`。Stop/Flatten 必须显示并提交精确 mode、account、symbol、instance、config epoch、action 与人工确认；
 `apps/venue-control` 提供幂等命令和本地 HTTP/SSE `/v2`。Control 只提交语义命令及 `instance/config epoch`，Node 接收后写入自身命令 WAL；Control 的数据库状态、delivery ACK 或 receipt 都不授予交易权限。当前阶段只需“命令已接收/已拒绝/已完成”三类终态，不建立第二套 Actor-applied root、跨层 durability receipt 或 delivery lease 证明链。重复命令按稳定 command ID 幂等处理，冲突输入拒绝。
 
 VenueFlow 的 Trade Dock 同样只提交语义 `TradeIntent`：按钮和热键必须先统一为 `TradingAction`；开平仓固定 LIMIT/GTC 并要求选价，平多/平空显式 reduce-only，UI 的 `min(quote preset / price, projected position)` 只作为数量上限，账户 Node 必须再按更新的签名仓位与 adapter 实时规则向下裁剪。撤当前未带显式订单 ID 时只能在同一 `(account, symbol)` 选择最近 Working order，撤全部也只能作用于该 scope。Control 接收不等于物理执行；生产 Actor durable-applied authority、风险、同一 WAL 和账户唯一 writer 全部满足前不得产生 mutation。
@@ -496,12 +496,14 @@ Copy Install 的领取租期精确截断于 immutable job 截止时间，不改�
 局部代码按 package 与直接契约验证，文档/注释只做静态检查；已通过基线后的增量不重复全工作区回归。
 跨模块公共契约、依赖或架构变更及正式发布前集中通过：
 
-```text
-cargo fmt --all -- --check
-cargo check --workspace --all-targets
-cargo test --workspace
-scripts/verify_repository_hygiene.ps1
+```powershell
+./scripts/Invoke-VenueBuild.ps1 -CargoArguments @('fmt','--all','--check')
+./scripts/Invoke-VenueBuild.ps1 -CargoArguments @('check','--locked','--workspace','--all-targets')
+./scripts/Invoke-VenueBuild.ps1 -CargoArguments @('test','--locked','--workspace')
+./scripts/verify_repository_hygiene.ps1
 ```
+
+本机缓存与 Ubuntu 本地交叉编译按 `scripts/BUILD_POLICY.md`；文档更新只做静态检查，不能因本文列出全量门禁就每次重跑。
 
 还必须覆盖：
 
@@ -531,7 +533,7 @@ scripts/verify_repository_hygiene.ps1
 当前不实现：
 
 - 同一账户同一交易对多策略；
-- 多用户、多租户和付费权限系统；
+- 超出已获准窄账户注册/登录/凭证管理范围的多租户与付费权限系统；
 - 跨机器 writer 选举、分布式 fencing、内容寻址 executable handoff 或复杂服务网格；
 - 策略插件市场和公共 SDK；
 - 在网格/账户 Runtime 内嵌 Web 面板或 Windows UI；获准的独立 `apps/venue-web` 和 VenueFlow 可开发无凭证 Control 客户端，

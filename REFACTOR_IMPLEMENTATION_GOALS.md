@@ -1,33 +1,40 @@
-# VENUE 重构待实现 Goals
+# VENUE 剩余开发与验收
 
-更新：2026-08-31
+更新：2026-09-01
 
-## 1. 本文职责
+本文只列当前尚未闭合的工作；不是自动继续执行全部任务的指令。每轮先明确获准范围，
+尤其文档整理不自动触发业务开发、部署或实盘。完整契约见
+[统一迁移](UNIFIED_GATEWAY_WEB_MIGRATION.md)，安全与接管见 [运行时契约](GRID_RUNTIME_REFACTOR.md)，
+当前已提交能力见 [README](README.md)，开发入口见 [DEVELOPMENT](DEVELOPMENT.md)。
 
-本文只保存当前尚未完成、可以直接交给 Codex 执行的实现 Goal。长期架构查
-[`ARCHITECTURE.md`](ARCHITECTURE.md)，账户运行时、网格、恢复、单 writer 与接管约束查
-[`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md)，代码入口查 [`CODEMAP.md`](CODEMAP.md)。
+## 已有基础，不重复开发
 
-## 2. 当前待办
+六个固定 Node 已组合账户 Runtime/Execution Lane/Host，Copy 已有物理桥和签名结果到 ledger 的实现，
+响应式 `apps/venue-web` 已建立，Stage 7 根生产 binary 已移除，Ubuntu 本机编译入口已落实。
+不要再以“复制一套网关”“新建整个 Web”“重写 Copy 纯规划”作为默认起点。
 
-当前已批准一个长期 Goal：按 [`UNIFIED_GATEWAY_WEB_MIGRATION.md`](UNIFIED_GATEWAY_WEB_MIGRATION.md) 将 Stage 7 直接重构到
-统一 Account Runtime/Execution Lane，完成六所逐家单 writer 接管，把 Copy semantic Applied 接到 follower 物理执行与签名事实，
-并建立独立 `apps/venue-web`，选择性迁移 `G:\kol\apps\web` 的响应式体验。
+## 仍需闭合
 
-该 Goal 必须按文档 T0–T8 有界子任务执行；代码和 Web 可按依赖并行，protocol、SQL migration、长期文档由单一整合者串行修改，
-真实 mutation 全局串行。任务已获得既有真实账户的持续实盘授权：AI 可在 binding/能力约束内选择交易对，自行使用技术确认参数，
-并在单账户累计名义风险不超过 10U 时逐所执行 Canary；初期 Bybit、OKX 固定 `DOGE/USDT`，Hyperliquid 使用实际永续报价 `DOGE/USDC` 并按新鲜汇率换算 USDT 风险。
-提款、转账、账户安全/杠杆/保证金设置、创建凭证、突破 10U、Unknown 时增险和双 writer 不在授权内。
+| 工作范围 | 当前缺口 | 完成证据 |
+|---|---|---|
+| 六所公共行情 | Bitget/Hyperliquid 权威闭合 bar；持续连接/重连的实际完整性 | 真实确认语义、断线/缺口失败关闭、来源时间及有界排队；forming 不冒充 closed |
+| Scalping | 签名安全投影、入场确认、服务端保护及退出流程 | 同一 Actor/WAL/Host 故障恢复与逐所验收；未完成时禁止自动入场 |
+| Grid/账户运行时 | 私流成交驱动、库存恢复、控制与多 symbol 常驻协同 | 共享 reducer 热路径、Stop/Flatten/Owner/Unknown 与公平性契约，不能只测纯 reducer |
+| Copy 产品闭环 | 实际 leader 权威输入、连续 ledger/drift 与过期/Unknown/跨零恢复 | 真实 Node 签名最终目标与 Control 账本一致；中间归零不是最终完成 |
+| 手动交易 | Grid desired/库存协同、Copy binding、全 scope 撤单 | 精确归属与更新签名订单/仓位；部分完成不回报“全部成功” |
+| 旧三家生产接管 | 服务器旧 release、writer、WAL 与未决订单事实 | 旧 writer 停止、前驱记录有效、Unknown 收敛、新链唯一锁及逐所 Canary |
+| UI 集成验收 | 实际 Node/Control/BFF/Web 连通、布局/易用性/速度 | 五视口逐页截图、恢复失败关闭、交互确认及分段延迟；fixture 不能代替实测 |
+| 自助账户扩展 | 当前已提交托管/验证仅 Binance；其他所与公众 Web 产品未完成 | 独立账户能力、凭证管理与归属验收；不靠展示按钮宣称支持 |
 
-不得为常规 Canary 逐次请求人工确认。需要用户凭证、主机/数据库权限、硬件签名、交易所后台设置或外部审批的事项先失败关闭，
-继续完成其他安全子任务，并在其余可执行任务完成后形成一次性人工协助清单。
+上述内容在迁移契约 T0–T8 中按依赖切分；只有具体实现任务获准时才启动相应子任务。
+不把全部待验收项无限加入一次文档或小修复任务。
 
-发布门禁以
-`.github/workflows/workspace-gates.yml`、`scripts/verify_workspace_quality.ps1`、
-`scripts/verify_repository_hygiene.ps1`、`scripts/verify_venue_node_linux_release.ps1`、
-`scripts/verify_venue_node_binaries.ps1`、`scripts/verify_gateway_candidate_contract.ps1` 和
-`scripts/verify_postgres_integration.ps1` 为准。
-响应式 Web 同时执行 typecheck、单元测试、build、`verify:boundary` 与五视口 Playwright；报告只保存在隔离构建目录。
+## 验证与执行边界
 
-真实交易所 Canary、单 writer 接管和受保护运行工件不属于离线代码门禁，仍须遵守
-[`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md) 的逐所顺序、签名对账和失败关闭规则；持续授权不豁免任何技术安全门。
+采用 [开发指南](DEVELOPMENT.md) 的影响面验证；公共契约/依赖或正式发布才集中全量。
+Web 的 typecheck/unit/build/边界扫描与隔离浏览器通过不代表真实交易完成；
+PostgreSQL 测试必须确认实际执行而非缺配置跳过。
+
+既有实盘授权的范围与技术约束保留在迁移契约第 2.1–2.2 节，但不扩大当前请求：
+单笔和更严格账户累计 10U 门、逐所串行、唯一 writer、Unknown 不重投始终保留。
+真正需要凭证/后台权限等外部协助时列明缺少的证据和最小操作，不伪造通过或改写真实持仓。

@@ -1,5 +1,7 @@
 # 账户与 API 管理
 
+入口：[README](README.md) / [开发指南](DEVELOPMENT.md)。本页描述已提交的 Control 账户管理与客户端边界，不包含其他工作区未提交的实验功能。
+
 ## 产品边界
 
 - 行情服务器选择独立于登录；当前 UI 仅提供 Binance。没有账号或 Control 不可用时，原生端仍可使用公共行情。
@@ -39,12 +41,15 @@ Node 的生产执行接线和实盘准入仍受 `GRID_RUNTIME_REFACTOR.md` 约�
 
 Control 使用现有 PostgreSQL，通过 `DATABASE_URL` 指定连接。设置 `VENUE_ACCOUNT_MASTER_KEY` 后运行：
 
-```text
-cargo run -p venue-control --bin venue-control-server
-cargo run -p venueflow --bin venueflow
+```powershell
+./scripts/Invoke-VenueBuild.ps1 -CargoArguments @('build','--locked','-p','venue-control','--bin','venue-control-server')
+./scripts/Invoke-VenueBuild.ps1 -CargoArguments @('build','--locked','-p','venueflow','--bin','venueflow')
 ```
 
-默认监听和连接 `127.0.0.1:39180`。Control 启动时幂等安装 `0001`–`0015` migrations；`0006`–`0013` 为跟单/投影迁移，`0014` 扩展手动交易语义，`0015` 安装账户管理。`VENUE_CONTROL_BIND` 可覆盖监听地址，但服务只允许 loopback；远程 UI 应通过受控 HTTPS 入口转发，Web 使用同源部署。`VENUE_CONTROL_URL` 提供首次 UI 默认地址，已有 UI 配置通过设置修改。
+编译结束后，从 guard 实际选择的固定缓存 `debug` 目录分别启动 `venue-control-server.exe` 和 `venueflow.exe`；
+主工作区默认为 `G:\Build\Venue\main\debug`。不要以长期 `cargo run` 占用构建锁。本次文档核对不自动启动任何服务。
+
+默认监听和连接 `127.0.0.1:39180`。Control 启动时幂等安装 `0001`–`0016` migrations；`0006`–`0013` 为跟单/投影迁移，`0014` 扩展手动交易语义，`0015` 安装账户管理，`0016` 支持从未领取即过期的 Copy delivery 恢复。`VENUE_CONTROL_BIND` 可覆盖监听地址，但服务只允许 loopback；远程 UI 应通过受控 HTTPS 入口转发，Web 使用同源部署。`VENUE_CONTROL_URL` 提供首次 UI 默认地址，已有 UI 配置通过设置修改。
 
 不要把数据库 URL、主密钥或实际 API Key 粘贴到诊断输出。主密钥丢失无法恢复绑定密文；轮换必须另行设计迁移，不可直接换值后假定旧绑定仍可用。
 

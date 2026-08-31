@@ -1,6 +1,6 @@
 # VENUE Workspace Rules
 
-本工作区只有根目录 Rust package 是活动代码；`bak/` 是冻结迁移来源。
+活动代码由根 `Cargo.toml` 声明的 Rust workspace（根 package、`apps/`、`crates/`）及独立 `apps/venue-web` npm 应用组成；`bak/` 是冻结迁移来源。
 
 ## 最短读取路径
 
