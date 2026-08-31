@@ -18,7 +18,7 @@
 ## 实施与实盘
 
 - 只实现当前获准任务，不创建未被当前需求使用的未来模块、公共 SDK、插件系统或多租户控制面。
-- 完成修改必须执行 `cargo fmt --all --check`、`cargo check --workspace --all-targets`、`cargo test --workspace`、`scripts/verify_repository_hygiene.ps1` 和任务专项验证；失败时不得宣称完成或删除被替代实现。
+- 默认按影响面验证：文档/注释只做静态检查，单模块修改只检查该 package 及直接契约，交易安全修改覆盖受影响的 risk/WAL/Unknown/恢复路径。跨模块公共契约、依赖或架构变更及正式发布前集中执行 `cargo fmt --all --check`、`cargo check --workspace --all-targets`、`cargo test --workspace`、`scripts/verify_repository_hygiene.ps1` 建立基线；基线后的局部增量不重复全工作区测试。记录验证对应的源码范围，相关验证失败时不得宣称完成或删除被替代实现。
 - 实盘 mutation 一次只允许一个精确 writer；先验证，再按交易所逐家 Canary/接管，禁止两个版本同时写同一 binding。
 - 策略只输出语义意图；所有 mutation 必须经过 execution、risk、owner、WAL/journal 和 reconciliation。
 - 数据、私有事实、订单身份、规则或恢复状态无法证明时失败关闭，只允许降险和对账。
@@ -44,6 +44,16 @@
 - 安全与能力固定为：凭证 `secrecy` + `zeroize`；adapter capability `bitflags`。
 - PostgreSQL 固定使用 `sqlx`；只有当前功能明确需要本地 SQLite 时才可使用 `rusqlite`，不引入其他 ORM 或数据库封装。
 - 现有 Stage 7 直接 `tungstenite` 只是冻结迁移例外，不得增加新调用点；转换前保留，不为满足白名单直接破坏式删除。
+
+## 本机 Rust 构建与磁盘预算
+
+- Windows 本机只允许三个固定缓存：`G:\Build\Venue\main`、`slot-1`、`slot-2`；主工作区使用 main，其余工作树按规范路径稳定映射到两个槽。禁止按会话、PID、时间戳、任务名新建或嵌套 target，不得改写 CARGO_TARGET_DIR/--target-dir 绕过入口。
+- Cargo 构建/检查/测试统一使用 `scripts/Invoke-VenueBuild.ps1 -CargoArguments @('check','--locked','-p','venue-runtime')`；专项验证脚本已有同一 guard，直接运行，不要二次套锁。只读空间检查用 `-CheckOnly`。原始 cargo 编译、临时脚本、IDE 或子进程也不得用于绕过限制。
+- 所有工作树合计最多两个受控构建；同槽锁覆盖构建、二进制核验/测试和产物复制。槽满等待最多60秒后报告，不新建目录、不抢锁、不终止其他会话进程；不允许嵌套 guard。
+- 准入预算：`G:\Build\Venue` 普通文件合计150 GiB（含旧目录及临时文件），F宿主空闲至少100 GiB，G至少20 GiB；超限拒绝新构建并报告。检查不跟随重解析点。这是入口准入检查，不是持续运行监控或系统硬配额；单次构建仍可能跨过阈值。
+- main 保留增量，隔离槽关闭增量；dev/test 使用精简调试信息。保持工具链/参数稳定；局部修改只验证受影响包，不反复全量测试、不常规 cargo clean。
+- 本阶段不自动清理。清理须另行核准精确目录并取得对应槽锁，只能处理已登记且无占用的冷缓存；不得删除整个 Build/项目目录、源码、bak、Git、数据库、发布产物、备份或运行恢复工件。G内删除不保证F的VHDX立即缩小。
+- 旧会话下一次构建前重读本段及 `scripts/BUILD_POLICY.md`。脚本用finally释放锁并恢复环境。GitHub托管CI复用其RUNNER_TEMP下既有target，不套用本机F/G容量阈值。
 
 ## 文档同步
 

@@ -14,6 +14,11 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'venue_build_guard.ps1')
+$venueBuildLease = Enter-VenueBuildGuard -RepoRoot (Split-Path -Parent $PSScriptRoot)
+try {
+Push-Location -LiteralPath (Split-Path -Parent $PSScriptRoot)
+try {
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $OutputRoot) { $OutputRoot = Join-Path $repoRoot 'releases' }
@@ -201,3 +206,5 @@ catch {
     }
     throw
 }
+} finally { Pop-Location }
+} finally { Exit-VenueBuildGuard $venueBuildLease }

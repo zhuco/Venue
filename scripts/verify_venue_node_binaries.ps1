@@ -3,30 +3,14 @@ param([string]$CargoTargetDir)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-
-$repoRoot = Split-Path -Parent $PSScriptRoot
-if (-not $CargoTargetDir) {
-    $CargoTargetDir = Join-Path ([System.IO.Path]::GetTempPath()) 'venue-node-verification-target'
-}
-$targetRoot = [System.IO.Path]::GetFullPath($CargoTargetDir)
-$repoRootFull = [System.IO.Path]::GetFullPath($repoRoot)
-if ($targetRoot.Equals($repoRootFull, [StringComparison]::OrdinalIgnoreCase) -or
-    $targetRoot.StartsWith(
-        $repoRootFull + [System.IO.Path]::DirectorySeparatorChar,
-        [StringComparison]::OrdinalIgnoreCase
-    )) {
-    throw 'venue-node 专项构建目录必须位于 worktree 外。'
-}
-New-Item -ItemType Directory -Path $targetRoot -Force | Out-Null
-$cargoTemp = Join-Path `
-    (Split-Path -Parent $targetRoot) `
-    "$([System.IO.Path]::GetFileName($targetRoot))-tmp"
-New-Item -ItemType Directory -Path $cargoTemp -Force | Out-Null
-$env:CARGO_TARGET_DIR = $targetRoot
-$env:CARGO_INCREMENTAL = '0'
-$env:TEMP = $cargoTemp
-$env:TMP = $cargoTemp
-
+. (Join-Path $PSScriptRoot 'venue_build_guard.ps1')
+$repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+$venueBuildLease = Enter-VenueBuildGuard -RepoRoot $repoRoot -Slot 'slot-2' -RequestedTarget $CargoTargetDir
+try {
+$targetRoot = $venueBuildLease.TargetDirectory
+$cargoTemp = $venueBuildLease.TempDirectory
+Push-Location -LiteralPath $repoRoot
+try {
 function Test-FailClosedNode {
     param(
         [Parameter(Mandatory)] [string]$Venue,
@@ -132,3 +116,5 @@ foreach ($venue in @('binance', 'bitget', 'bybit', 'gate', 'hyperliquid', 'okx')
 }
 
 $evidence | ConvertTo-Json -Depth 4
+} finally { Pop-Location }
+} finally { Exit-VenueBuildGuard $venueBuildLease }

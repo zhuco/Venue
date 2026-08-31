@@ -5,6 +5,11 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'venue_build_guard.ps1')
+$venueBuildLease = Enter-VenueBuildGuard -RepoRoot (Split-Path -Parent $PSScriptRoot)
+try {
+Push-Location -LiteralPath (Split-Path -Parent $PSScriptRoot)
+try {
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $expectedBins = [ordered]@{
@@ -81,3 +86,5 @@ if (-not $SkipBuild) {
 }
 
 Write-Output 'fixed binary contract verified: six root binaries; three single-adapter deployables; production endpoint isolation'
+} finally { Pop-Location }
+} finally { Exit-VenueBuildGuard $venueBuildLease }
