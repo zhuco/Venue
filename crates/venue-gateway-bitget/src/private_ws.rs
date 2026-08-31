@@ -641,8 +641,16 @@ where
     }
 
     pub async fn next_frame(&mut self) -> Result<BitgetRawPrivateFrame, BitgetTransportError> {
+        // A newer authenticated login for this account revokes the old seal before it may drain
+        // its buffered frame or read another socket message.
+        if !self.session_seal.active.load(Ordering::Acquire) {
+            return Err(BitgetTransportError::RecoverySession);
+        }
         if let Some(frame) = self.pre_live_frames.pop_front() {
             self.buffered_bytes = self.buffered_bytes.saturating_sub(frame.payload.len());
+            if !self.session_seal.active.load(Ordering::Acquire) {
+                return Err(BitgetTransportError::RecoverySession);
+            }
             return Ok(frame);
         }
         if Instant::now() >= self.next_heartbeat_at {
@@ -702,6 +710,9 @@ where
         };
         if result.is_err() {
             self.session_seal.revoke();
+        }
+        if !self.session_seal.active.load(Ordering::Acquire) {
+            return Err(BitgetTransportError::RecoverySession);
         }
         result
     }
@@ -1549,6 +1560,14 @@ mod tests {
         replacement.commit_symbol(&binding.symbol)?;
         assert!(replacement.is_committed());
         assert!(replacement.begin_symbol(&binding.symbol).is_err());
+        let _relogin = register_private_session(
+            &binding,
+            &BitgetCredentials::from_values("key", "secret", "pass")?,
+        )?;
+        assert!(matches!(
+            transport.next_frame().await,
+            Err(BitgetTransportError::RecoverySession)
+        ));
         server.await??;
         Ok(())
     }

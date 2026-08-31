@@ -121,24 +121,27 @@ impl BitgetAccountGateway {
         if self.private_generation == 0
             || self.private.private_generation() != self.private_generation
         {
-            self.invalidate_private_stream();
+            self.poison_private_stream();
             return Err(BitgetAccountGatewayError::PrivateStream);
         }
         if self.private_stream.is_none() {
-            let stream = self
-                .runtime
-                .block_on(connect_authenticated_private_ws(
-                    self.transport_binding().clone(),
-                    &self.credentials,
-                    now_ms()?,
-                    self.transport.limits(),
-                ))
-                .map_err(BitgetAccountGatewayError::Transport)?;
+            let stream = match self.runtime.block_on(connect_authenticated_private_ws(
+                self.transport_binding().clone(),
+                &self.credentials,
+                now_ms()?,
+                self.transport.limits(),
+            )) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    self.poison_private_stream();
+                    return Err(BitgetAccountGatewayError::Transport(error));
+                }
+            };
             self.private_stream = Some(stream);
             self.private_stream_attempt = Some(self.private_generation);
         }
         if self.private_stream_attempt != Some(self.private_generation) {
-            self.invalidate_private_stream();
+            self.poison_private_stream();
             return Err(BitgetAccountGatewayError::PrivateStream);
         }
         let frame = match self.private_stream.as_mut() {
@@ -156,7 +159,7 @@ impl BitgetAccountGateway {
         let events = match events {
             Ok(events) => events,
             Err(error) => {
-                self.invalidate_private_stream();
+                self.poison_private_stream();
                 return Err(error);
             }
         };
@@ -167,7 +170,7 @@ impl BitgetAccountGateway {
                 .saturating_add(events.len())
                 > BITGET_MAX_STREAM_FILLS
         {
-            self.invalidate_private_stream();
+            self.poison_private_stream();
             return Err(BitgetAccountGatewayError::PrivateStream);
         }
         self.pending_private_fills.extend(events);
@@ -221,6 +224,9 @@ impl BitgetAccountGateway {
     }
 
     fn refresh_private_for(&mut self, symbol: &Symbol) -> Result<(), BitgetAccountGatewayError> {
+        // Even a rejected refresh proves the old candidate is no longer safe to label stream
+        // facts. Only a later complete Host snapshot can reinstall this authorization.
+        self.poison_private_stream();
         if !self.rules_catalog.contains_key(symbol) {
             return Err(BitgetAccountGatewayError::Rules);
         }
@@ -239,15 +245,18 @@ impl BitgetAccountGateway {
             return Err(BitgetAccountGatewayError::Readback);
         }
         self.private = private;
-        self.private_generation = attempt;
-        self.invalidate_private_stream();
         Ok(())
     }
 
-    fn invalidate_private_stream(&mut self) {
+    fn clear_private_stream(&mut self) {
         self.private_stream = None;
         self.private_stream_attempt = None;
         self.pending_private_fills.clear();
+    }
+
+    fn poison_private_stream(&mut self) {
+        self.clear_private_stream();
+        self.private_generation = 0;
     }
 
     fn dispatch_permit(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
@@ -443,6 +452,7 @@ impl AccountPhysicalGateway for BitgetAccountGateway {
         &mut self,
         request: &AccountRecoveryRequest,
     ) -> Result<SignedAccountSnapshot, AccountHostValidationError> {
+        self.poison_private_stream();
         if request.binding() != self.transport_binding() {
             return Err(AccountHostValidationError::SignedSnapshot);
         }
@@ -477,7 +487,7 @@ impl AccountPhysicalGateway for BitgetAccountGateway {
         }
         self.private = private;
         self.private_generation = snapshot.private_generation();
-        self.invalidate_private_stream();
+        self.clear_private_stream();
         Ok(snapshot)
     }
 

@@ -106,7 +106,8 @@ impl GateAccountGateway {
             transport,
             rules,
             rules_catalog,
-            private_generation: private.attempt,
+            // The constructor's private candidate is not a Host-admitted account snapshot.
+            private_generation: 0,
             private,
             next_attempt: 2,
             private_stream: None,
@@ -134,23 +135,24 @@ impl GateAccountGateway {
             if self.private.attempt != self.private_generation {
                 return Err(GateAccountGatewayError::PrivateStream);
             }
-            let stream = self
-                .runtime
-                .block_on(connect_private_ws(
-                    &self.binding,
-                    &self.credentials,
-                    &self.rules,
-                    &self.private,
-                    self.transport.limits(),
-                ))
-                .map_err(GateAccountGatewayError::Transport)?;
+            let stream = match self.runtime.block_on(connect_private_ws(
+                &self.binding,
+                &self.credentials,
+                &self.rules,
+                &self.private,
+                self.transport.limits(),
+            )) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    self.poison_private_stream();
+                    return Err(GateAccountGatewayError::Transport(error));
+                }
+            };
             self.private_stream = Some(stream);
             self.private_stream_attempt = Some(self.private_generation);
         }
         if self.private_stream_attempt != Some(self.private_generation) {
-            self.private_stream = None;
-            self.private_stream_attempt = None;
-            self.pending_private_fills.clear();
+            self.poison_private_stream();
             return Err(GateAccountGatewayError::PrivateStream);
         }
         let result = match self.private_stream.as_mut() {
@@ -170,16 +172,12 @@ impl GateAccountGateway {
         let fills = match normalized {
             Ok(fills) => fills,
             Err(error) => {
-                self.private_stream = None;
-                self.private_stream_attempt = None;
-                self.pending_private_fills.clear();
+                self.poison_private_stream();
                 return Err(error);
             }
         };
         if fills.len() > MAX_PENDING_PRIVATE_FILLS {
-            self.private_stream = None;
-            self.private_stream_attempt = None;
-            self.pending_private_fills.clear();
+            self.poison_private_stream();
             return Err(GateAccountGatewayError::PrivateStream);
         }
         self.pending_private_fills.extend(fills);
@@ -264,6 +262,9 @@ impl GateAccountGateway {
     }
 
     fn refresh_private_for(&mut self, symbol: &Symbol) -> Result<(), GateAccountGatewayError> {
+        // A failed or symbol-scoped refresh may not keep streaming under an older account
+        // snapshot label; only the next complete Host snapshot can reauthorize delivery.
+        self.poison_private_stream();
         self.refresh_rules_for_symbols([symbol.clone()])?;
         let rules = self.registered_rules(symbol)?;
         let attempt = self.next_attempt()?;
@@ -275,6 +276,17 @@ impl GateAccountGateway {
             attempt,
         ))?;
         Ok(())
+    }
+
+    fn clear_private_stream(&mut self) {
+        self.private_stream = None;
+        self.private_stream_attempt = None;
+        self.pending_private_fills.clear();
+    }
+
+    fn poison_private_stream(&mut self) {
+        self.clear_private_stream();
+        self.private_generation = 0;
     }
 
     fn dispatch_permit(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
@@ -586,6 +598,7 @@ impl AccountPhysicalGateway for GateAccountGateway {
         &mut self,
         request: &AccountRecoveryRequest,
     ) -> Result<SignedAccountSnapshot, AccountHostValidationError> {
+        self.poison_private_stream();
         if request.binding() != self.binding.gateway_binding() {
             return Err(AccountHostValidationError::SignedSnapshot);
         }
@@ -624,9 +637,7 @@ impl AccountPhysicalGateway for GateAccountGateway {
         }
         self.private = private;
         self.private_generation = snapshot.private_generation();
-        self.private_stream = None;
-        self.private_stream_attempt = None;
-        self.pending_private_fills.clear();
+        self.clear_private_stream();
         Ok(snapshot)
     }
 
