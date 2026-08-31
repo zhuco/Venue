@@ -385,9 +385,11 @@ G:\Venue\artifacts\<exchange>\LIVE\<trading_account_id>\
 
 现有 Stage 7 文件在完成迁移前保持只读兼容；新路径不得继续产生无限增长的 `private_evidence.jsonl` 或复制相同事实到多本 journal。
 
-旧三所切换时，取得 `LegacyV1WriterPredecessor` 的精确旧锁之后，新 Host 可一次性导入冻结且全部终态的
+旧三所切换时，`LegacyV1WriterPredecessor` 必须同时绑定目标规范 `trading_account_id`；新 Host 同时持有精确旧锁
+和新账户 writer 锁之后，才可一次性导入冻结且全部终态的
 `commands.jsonl`：先按原 journal 的序号、哈希和状态转换验证，再复制为新 root 中不超过 5 MiB 的历史段，
-并持久化来源绝对路径、字节数和 SHA-256。源文件始终只读；已有导入标记必须精确匹配，任何中断、篡改、
+并持久化来源绝对路径、字节数和 SHA-256 及每个导入段的摘要。源文件始终只读；已有导入标记必须精确匹配，
+后续新 WAL 段可追加轮转，但导入前缀不可变；任何中断、篡改、
 空文件或 `Prepared/Submitted/Unknown` 均失败关闭，不清理后重试。此兼容导入只保留既有命令/Owner/路由事实，
 不从旧 checkpoint 推断 Grid 路由、库存或 Actor Applied，后者缺失时仍不得启动 Grid 或新增风险。
 

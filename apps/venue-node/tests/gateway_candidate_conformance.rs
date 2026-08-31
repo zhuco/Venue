@@ -134,6 +134,7 @@ fn legacy_handoff(
     let handoff_path = temporary.path().join("legacy-v1-handoff.json");
     let predecessor = venue_runtime::LegacyV1WriterPredecessor {
         exchange: venue,
+        successor_trading_account_id: ACCOUNT.to_owned(),
         legacy_product_account: scope.account.clone(),
         legacy_symbol: scope.symbol.clone(),
         legacy_owner_scope: scope.owner_scope.clone(),

@@ -22,6 +22,10 @@ const REGISTRY_DIRECTORY: &str = "stage7_writer_roots";
 #[serde(deny_unknown_fields)]
 pub struct LegacyV1WriterPredecessor {
     pub exchange: VenueId,
+    /// The one canonical unified account that may consume this frozen legacy product scope.
+    /// This is deployment-supplied and checked again by `AccountMutationHost`; a predecessor
+    /// record is never a transferable authority for a different account.
+    pub successor_trading_account_id: String,
     pub legacy_product_account: String,
     pub legacy_symbol: Symbol,
     pub legacy_owner_scope: String,
@@ -71,7 +75,8 @@ fn validate_legacy_predecessor(
     predecessor: &LegacyV1WriterPredecessor,
     registry_root: &Path,
 ) -> Result<(), Stage7WriterRegistryError> {
-    if predecessor.legacy_product_account.trim().is_empty()
+    if !is_canonical_trading_account_id(&predecessor.successor_trading_account_id)
+        || predecessor.legacy_product_account.trim().is_empty()
         || predecessor.legacy_owner_scope.trim().is_empty()
         || !predecessor.legacy_artifacts_root.is_absolute()
         || !valid_sha256(&predecessor.legacy_lock_sha256)
@@ -493,6 +498,7 @@ mod tests {
         File::create(&lock_path)?;
         let mut predecessor = LegacyV1WriterPredecessor {
             exchange: VenueId::Gate,
+            successor_trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             legacy_product_account: "usdt_futures".to_owned(),
             legacy_symbol: "DOGE/USDT".parse()?,
             legacy_owner_scope: "hedged_grid_doge_usdt_primary".to_owned(),

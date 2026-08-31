@@ -1413,6 +1413,61 @@ fn frozen_legacy_journal_is_segmented_without_mutating_the_source()
 }
 
 #[test]
+fn frozen_legacy_journal_marker_allows_later_clean_rotation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let legacy_root = temporary.path().join("legacy");
+    let destination = root(&temporary);
+    fs::create_dir_all(&legacy_root)?;
+    let source = legacy_root.join("commands.jsonl");
+    let command = command(Decimal::ONE)?;
+    let mut legacy = CommandJournal::open(&source)?;
+    legacy.prepare(command.clone())?;
+    legacy.transition(command.command_id(), CommandState::Submitted)?;
+    legacy.transition(
+        command.command_id(),
+        CommandState::Accepted {
+            venue_order_id: "legacy-native-2".to_owned(),
+        },
+    )?;
+
+    import_legacy_v1_journal_if_needed(&legacy_root, &destination)?;
+    fs::write(legacy_import_segment_path(&destination, 2)?, [])?;
+
+    import_legacy_v1_journal_if_needed(&legacy_root, &destination)?;
+    Ok(())
+}
+
+#[test]
+fn frozen_legacy_journal_marker_rejects_a_tampered_import_segment()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let legacy_root = temporary.path().join("legacy");
+    let destination = root(&temporary);
+    fs::create_dir_all(&legacy_root)?;
+    let source = legacy_root.join("commands.jsonl");
+    let command = command(Decimal::ONE)?;
+    let mut legacy = CommandJournal::open(&source)?;
+    legacy.prepare(command.clone())?;
+    legacy.transition(command.command_id(), CommandState::Submitted)?;
+    legacy.transition(
+        command.command_id(),
+        CommandState::Accepted {
+            venue_order_id: "legacy-native-3".to_owned(),
+        },
+    )?;
+
+    import_legacy_v1_journal_if_needed(&legacy_root, &destination)?;
+    fs::write(legacy_import_segment_path(&destination, 1)?, b"tampered\n")?;
+
+    assert!(matches!(
+        import_legacy_v1_journal_if_needed(&legacy_root, &destination),
+        Err(AccountHostValidationError::LegacyPredecessor)
+    ));
+    Ok(())
+}
+
+#[test]
 fn frozen_legacy_journal_with_unknown_is_not_imported() -> Result<(), Box<dyn std::error::Error>> {
     let temporary = tempfile::tempdir()?;
     let legacy_root = temporary.path().join("legacy");

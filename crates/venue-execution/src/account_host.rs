@@ -26,7 +26,7 @@ const MAX_RISK_EVIDENCE_AGE_MS: u64 = 60_000;
 const RUNTIME_BOOTSTRAP_FILE: &str = "signed-account-bootstrap.json";
 const RUNTIME_CHECKPOINT_LIMIT_BYTES: usize = 5 * 1024 * 1024;
 const LEGACY_V1_IMPORT_FILE: &str = "legacy-v1-journal-import.json";
-const LEGACY_V1_IMPORT_SCHEMA_VERSION: u16 = 1;
+const LEGACY_V1_IMPORT_SCHEMA_VERSION: u16 = 2;
 
 #[path = "account_normalization.rs"]
 mod account_normalization;
@@ -518,7 +518,25 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         binding: GatewayBinding,
         configured_symbols: AccountSymbolSet,
         max_entry_notional: Decimal,
+        gateway: G,
+    ) -> Result<Self, AccountHostError<G::Error>> {
+        Self::open_with_symbols_and_account_lock(
+            artifacts_root,
+            binding,
+            configured_symbols,
+            max_entry_notional,
+            gateway,
+            None,
+        )
+    }
+
+    fn open_with_symbols_and_account_lock(
+        artifacts_root: impl Into<PathBuf>,
+        binding: GatewayBinding,
+        configured_symbols: AccountSymbolSet,
+        max_entry_notional: Decimal,
         mut gateway: G,
+        preheld_account_lock: Option<File>,
     ) -> Result<Self, AccountHostError<G::Error>> {
         binding.validate().map_err(AccountHostError::Binding)?;
         if !configured_symbols.contains(&binding.symbol)
@@ -536,22 +554,10 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
             source,
         })?;
         let lock_path = artifacts_root.join("writer.lock");
-        let account_lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|source| AccountHostError::Io {
-                path: lock_path.clone(),
-                source,
-            })?;
-        account_lock
-            .try_lock_exclusive()
-            .map_err(|source| AccountHostError::Io {
-                path: lock_path,
-                source,
-            })?;
+        let account_lock = match preheld_account_lock {
+            Some(lock) => lock,
+            None => acquire_account_writer_lock(&lock_path)?,
+        };
         let journal_path = artifacts_root.join("commands.jsonl");
         let historical_paths =
             journal_segment_paths(&artifacts_root).map_err(AccountHostError::Validation)?;
@@ -656,17 +662,23 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         gateway: G,
         predecessor: LegacyV1WriterPredecessor,
     ) -> Result<Self, AccountHostError<G::Error>> {
-        if predecessor.exchange != binding.venue {
+        if predecessor.exchange != binding.venue
+            || predecessor.successor_trading_account_id != binding.trading_account_id
+        {
             return Err(AccountHostError::Validation(
                 AccountHostValidationError::LegacyPredecessor,
             ));
         }
         let artifacts_root = artifacts_root.into();
+        validate_artifacts_root(&artifacts_root, &binding).map_err(AccountHostError::Validation)?;
+        fs::create_dir_all(&artifacts_root).map_err(|source| AccountHostError::Io {
+            path: artifacts_root.clone(),
+            source,
+        })?;
         let legacy = predecessor
             .acquire()
             .map_err(AccountHostError::CanonicalRoot)?;
-        import_legacy_v1_journal_if_needed(&predecessor.legacy_artifacts_root, &artifacts_root)
-            .map_err(AccountHostError::Validation)?;
+        let account_lock = acquire_account_writer_lock(&artifacts_root.join("writer.lock"))?;
         let scope = WriterScope {
             exchange: binding.venue.as_str().to_owned(),
             account: binding.trading_account_id.clone(),
@@ -678,12 +690,15 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         // custody and is therefore fail-closed.
         let canonical = acquire_account_canonical_root(&scope, &predecessor.legacy_artifacts_root)
             .map_err(AccountHostError::CanonicalRoot)?;
-        let mut host = Self::open_with_symbols(
+        import_legacy_v1_journal_if_needed(&predecessor.legacy_artifacts_root, &artifacts_root)
+            .map_err(AccountHostError::Validation)?;
+        let mut host = Self::open_with_symbols_and_account_lock(
             artifacts_root,
             binding,
             configured_symbols,
             max_entry_notional,
             gateway,
+            Some(account_lock),
         )?;
         host._canonical_root = Some(canonical);
         host._legacy_predecessor = Some(legacy);
@@ -1736,8 +1751,29 @@ fn import_legacy_v1_journal_if_needed(
             || imported.source_path != source
             || imported.source_sha256 != source_sha256
             || imported.source_bytes != source_bytes
-            || imported.segment_count == 0
-            || journal_segment_paths(destination_root)?.len() != imported.segment_count
+            || imported.segments.is_empty()
+        {
+            return Err(AccountHostValidationError::LegacyPredecessor);
+        }
+        let paths = journal_segment_paths(destination_root)?;
+        if paths.len() < imported.segments.len()
+            || imported
+                .segments
+                .iter()
+                .enumerate()
+                .any(|(offset, expected)| {
+                    let index = offset.saturating_add(1);
+                    let Ok(path) = legacy_import_segment_path(destination_root, index) else {
+                        return true;
+                    };
+                    paths.get(offset) != Some(&path)
+                        || path.file_name().and_then(|value| value.to_str())
+                            != Some(expected.path.as_str())
+                        || !fs::metadata(&path)
+                            .map(|metadata| metadata.is_file() && metadata.len() == expected.bytes)
+                            .unwrap_or(false)
+                        || file_sha256(&path).ok().as_deref() != Some(expected.sha256.as_str())
+                })
         {
             return Err(AccountHostValidationError::LegacyPredecessor);
         }
@@ -1821,18 +1857,31 @@ fn import_legacy_v1_journal_if_needed(
     if segment_count == 0 {
         return Err(AccountHostValidationError::LegacyPredecessor);
     }
+    let mut segments = Vec::with_capacity(segment_count);
     for index in 1..=segment_count {
         let source = legacy_import_stage_path(destination_root, index)?;
-        let destination = destination_root.join(format!("commands-{index:06}.jsonl"));
-        fs::rename(source, destination)
+        let destination = legacy_import_segment_path(destination_root, index)?;
+        fs::rename(source, &destination)
             .map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+        let bytes = fs::metadata(&destination)
+            .map_err(|_| AccountHostValidationError::LegacyPredecessor)?
+            .len();
+        segments.push(LegacyV1JournalImportSegment {
+            path: destination
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or(AccountHostValidationError::LegacyPredecessor)?
+                .to_owned(),
+            bytes,
+            sha256: file_sha256(&destination)?,
+        });
     }
     let marker_body = serde_json::to_vec(&LegacyV1JournalImport {
         schema_version: LEGACY_V1_IMPORT_SCHEMA_VERSION,
         source_path: source,
         source_sha256,
         source_bytes,
-        segment_count,
+        segments,
     })
     .map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
     write_new_synced(&marker, &marker_body)?;
@@ -1846,7 +1895,15 @@ struct LegacyV1JournalImport {
     source_path: PathBuf,
     source_sha256: String,
     source_bytes: u64,
-    segment_count: usize,
+    segments: Vec<LegacyV1JournalImportSegment>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyV1JournalImportSegment {
+    path: String,
+    bytes: u64,
+    sha256: String,
 }
 
 fn legacy_import_stage_path(
@@ -1857,6 +1914,37 @@ fn legacy_import_stage_path(
         return Err(AccountHostValidationError::JournalBudget);
     }
     Ok(root.join(format!(".legacy-v1-import-{index:06}.stage")))
+}
+
+fn legacy_import_segment_path(
+    root: &Path,
+    index: usize,
+) -> Result<PathBuf, AccountHostValidationError> {
+    if index == 0 || index > 999_999 {
+        return Err(AccountHostValidationError::JournalBudget);
+    }
+    Ok(root.join(format!("commands-{index:06}.jsonl")))
+}
+
+fn acquire_account_writer_lock<E: std::error::Error + 'static>(
+    lock_path: &Path,
+) -> Result<File, AccountHostError<E>> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|source| AccountHostError::Io {
+            path: lock_path.to_path_buf(),
+            source,
+        })?;
+    lock.try_lock_exclusive()
+        .map_err(|source| AccountHostError::Io {
+            path: lock_path.to_path_buf(),
+            source,
+        })?;
+    Ok(lock)
 }
 
 fn file_sha256(path: &Path) -> Result<String, AccountHostValidationError> {
