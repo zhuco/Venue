@@ -79,6 +79,10 @@ pub(crate) struct GridBootstrapMarket {
 /// Private stream adapters expose only the normalized fact needed by the shared Grid path. The
 /// exchange frame and credentials stay inside its gateway, while the account Runtime remains the
 /// sole durable generation and delivery authority.
+#[cfg_attr(
+    not(any(feature = "binance", feature = "bitget", feature = "gate")),
+    allow(dead_code)
+)]
 struct GridPrivateFillFact {
     source_private_generation: u64,
     received_at_ms: u64,
@@ -445,6 +449,10 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
 
     /// A consumed initial-install request may not be retried, but it must leave the registered
     /// actor unable to accept risk when its required signed/public evidence was unavailable.
+    #[cfg_attr(
+        not(any(feature = "binance", feature = "bitget", feature = "gate")),
+        allow(dead_code)
+    )]
     pub(crate) fn fail_grid_bootstrap(
         &mut self,
         binding: &StrategyBinding,
@@ -764,6 +772,10 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
     /// Applies one adapter-normalized fill through the sole Runtime/Host composition. This shared
     /// path deliberately knows no native private protocol: adapters must establish the stream,
     /// generation, symbol and client identity before this bounded fact can enter the journal.
+    #[cfg_attr(
+        not(any(feature = "binance", feature = "bitget", feature = "gate")),
+        allow(dead_code)
+    )]
     fn consume_grid_private_fill(
         &mut self,
         venue: &str,

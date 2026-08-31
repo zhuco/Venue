@@ -7,7 +7,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use venue_domain::domain::{MarketEvent, Price};
+use venue_domain::domain::MarketEvent;
+#[cfg(feature = "bitget")]
+use venue_domain::domain::Price;
 use venue_runtime::{
     AccountPhysicalGateway, StrategyBinding, StrategyKind, account::InstanceLifecycle,
     strategy::AccountMarketEvent,
