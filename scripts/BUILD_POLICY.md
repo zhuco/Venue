@@ -40,7 +40,27 @@
 - 全局和项目 AGENTS.md 提供会话规则；旧会话开始下一次构建前需重新读取，必要时重启会话。这不是强制安全沙箱。
 - GitHub托管CI继续使用既有 RUNNER_TEMP 内的 job-owned target，不使用本机F/G盘阈值；保留同目录锁、两项并发和环境恢复，CI空闲下限2 GiB。
 
-## Linux 六所 Node 发布构建
+## 本地 Ubuntu 六所 Node 编译（默认发布入口）
+
+`45.77.253.180` 只接收本机编译好的产物并执行运行核验，不承担日常 Cargo 编译。Windows 本机使用既有
+Rust/Cargo 1.98.0、cargo-zigbuild 0.23.0、Zig 0.16.0 和 `x86_64-unknown-linux-gnu` 标准库，不依赖 WSL/Docker。
+交叉目标固定为 `x86_64-unknown-linux-gnu.2.35`，即 x86-64 GNU/Linux、glibc 2.35 基线；上传后仍需检查服务器动态库兼容性。
+版本后缀和缓存环境使用 [cargo-zigbuild 官方契约](https://github.com/rust-cross/cargo-zigbuild#specify-glibc-version)。
+
+```powershell
+# SourceRoot 必须为指定 commit 的干净 checkout，不包含工作区未提交的开发改动。
+./scripts/Build-VenueUbuntu.ps1 -SourceRoot G:\Build\Venue\ubuntu\source -ExpectedRevision <完整40位commit> -ReleaseId <版本号> -CheckOnly
+# 预检后去掉 -CheckOnly 编译六所；脚本不自动上传或启动服务。
+./scripts/test_venue_ubuntu_build.ps1
+```
+
+- 专用根为 `G:\Build\Venue\ubuntu`：`source` 可存固定 revision 的独立 checkout，`releases/<版本号>` 仅含六 binary、SHA256SUMS、manifest；工具缓存为 `zig-cache/zig-local-cache/zigbuild-cache`。源码只用干净 Git clone/bundle，不复制 `.env`、账户工件或未提交文件；已有 checkout 不自动 reset。
+- Cargo 仍使用既有 `slot-2` 锁和两个全局并发许可，其自动目标子目录 `slot-2/x86_64-unknown-linux-gnu/release` 不是另设 target root。六所按顺序、每次两个 Cargo jobs；全部目录计入 150 GiB 总预算。不清理 Windows 缓存，不安装工具、不改全局配置。
+- `-CheckOnly` 不新建输出、锁或缓存；正式构建前后均校验 HEAD 和干净状态，manifest 另记录构建入口/辅助/guard 脚本哈希，运行期间脚本变动则拒绝发布。源码 checkout 必须由构建独占，其他任务不得在构建期间同步或编辑；前后 Git 检查不是文件系统只读沙箱。输出要求 ELF64/x86-64，拒绝误复制 Windows exe；目录原子转为新 release，已有 release 不覆盖。失败保留缓存和本次 `.stage.*` 目录，不把不完整目录当发布包。
+- 入口持锁覆盖构建、ELF/哈希核验和复制，finally 还原 Cargo/Zig 环境并释放锁。版本化产物仅表示编译完成；签名 preflight、旧 writer/WAL 接管、真实网关、UI 和性能验收仍单独执行。
+- 脚本专项只跑静态/离线 fixture 和受影响编译，不因构建入口修改重跑全业务测试；`test_venue_ubuntu_build.ps1` 的小型验证工件保留在专用根，不执行交易或服务操作。
+
+## Linux 主机本地打包（备用，不在弱服务器日常使用）
 
 `package_venue_node_linux_release.sh` 只生成发布目录，不启动 Node、操作账户或部署服务。必须显式指定
 `--release-id`、`--output-root`、`--build-root` 和完整 40 位 `--expected-revision`；源码、发布根和构建根互不包含。

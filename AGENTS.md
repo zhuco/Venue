@@ -51,6 +51,7 @@
 
 - Windows 本机只允许三个固定缓存：`G:\Build\Venue\main`、`slot-1`、`slot-2`；主工作区使用 main，其余工作树按规范路径稳定映射到两个槽。禁止按会话、PID、时间戳、任务名新建或嵌套 target，不得改写 CARGO_TARGET_DIR/--target-dir 绕过入口。
 - Cargo 构建/检查/测试统一使用 `scripts/Invoke-VenueBuild.ps1 -CargoArguments @('check','--locked','-p','venue-runtime')`；专项验证脚本已有同一 guard，直接运行，不要二次套锁。只读空间检查用 `-CheckOnly`。原始 cargo 编译、临时脚本、IDE 或子进程也不得用于绕过限制。
+- Ubuntu 产物默认在本机用 `scripts/Build-VenueUbuntu.ps1` 交叉编译后上传，不在 `45.77.253.180` 日常编译。专用根 `G:\Build\Venue\ubuntu` 保存源码快照、Zig 工具缓存和版本化产物；Cargo 复用已有 slot-2 与同一 guard。目标、工具版本、预检和上传边界见 `scripts/BUILD_POLICY.md`，不另开 Cargo target。
 - 所有工作树合计最多两个受控构建；同槽锁覆盖构建、二进制核验/测试和产物复制。槽满等待最多60秒后报告，不新建目录、不抢锁、不终止其他会话进程；不允许嵌套 guard。
 - 准入预算：`G:\Build\Venue` 普通文件合计150 GiB（含旧目录及临时文件），F宿主空闲至少100 GiB，G至少20 GiB；超限拒绝新构建并报告。检查不跟随重解析点。这是入口准入检查，不是持续运行监控或系统硬配额；单次构建仍可能跨过阈值。
 - main 保留增量，并在 guard 内临时以空 RUSTC_WRAPPER 禁用外层编译 wrapper，避免全局 sccache 拒绝增量；finally 精确恢复原值，不改全局配置。隔离槽关闭增量并保留 wrapper；dev/test 使用精简调试信息。保持工具链/参数稳定；局部修改只验证受影响包，不反复全量测试、不常规 cargo clean。

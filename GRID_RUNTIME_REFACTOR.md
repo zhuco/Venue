@@ -387,6 +387,8 @@ G:\Venue\artifacts\<exchange>\LIVE\<trading_account_id>\
 
 实盘 resident 由进程监督器以 `on-failure` 语义托管：异常非零退出可从相同受准入发布和恢复工件重新启动；应用内显式 Stop 完成撤单后正常退出，监督器不得将其重新拉起。监督器不替代唯一 writer、WAL、签名对账或准入校验。
 
+Ubuntu Node 发布默认先在本机通过 `scripts/Build-VenueUbuntu.ps1` 交叉编译；独立版本化产物位于 `G:\Build\Venue\ubuntu\releases`，复用现有 slot-2 构建锁。弱集成服务器只接收产物并核验哈希、架构和动态库，不承担日常 Cargo 编译。编译/上传不授权启动 writer，也不替代原 WAL、旧 writer 停止及签名接管证据；构建入口与资源边界见 `scripts/BUILD_POLICY.md`。
+
 恢复不要求把整个进程做成分布式系统。单机顺序恢复、一个账户一个 writer 足够当前规模。
 
 Actor Applied 早于其后物理命令的 WAL 是正常顺序。重启安装 Actor 时，应由同一账户 Host 校验其 WAL head 是当前已恢复 WAL 的真实历史前缀，

@@ -430,6 +430,8 @@ dispatch 启动 `<20ms`（均不含交易所网络）目标。Web 首次可用 s
 1. 首先只读检查主机身份、工作目录、Git revision、现有进程/服务、监听端口、账户 binding、writer lock、WAL/Unknown 和磁盘预算；
 2. 不停止或修改无关服务，不覆盖活动 release、凭证、数据库和交易 artifacts；
 3. 使用版本化 release 或已验证部署目录，先完成二进制隔离和离线门禁；
+   Ubuntu binary 默认经本机 `scripts/Build-VenueUbuntu.ps1` 编译至 `G:\Build\Venue\ubuntu\releases/<版本号>` 后上传；
+   弱服务器不承担日常 Cargo 编译，上传后核对 SHA256、ELF 架构及动态库，不能仅以文件上传成功认定能运行；
 4. 任何账户启动前证明旧 writer 已停止且锁已释放，真实 mutation 仍全局串行；
 5. secret 只从主机既有受控环境读取，不下载、不回显、不写入测试报告；
 6. Gateway 启动后先做签名只读 preflight，再验证 Control/Node/BFF/UI 连通，账户累计 10U 门未完成前不得新增风险；
@@ -541,7 +543,7 @@ scripts/verify_repository_hygiene.ps1
 - `scripts/verify_workspace_quality.ps1`；
 - `scripts/verify_venue_node_binaries.ps1`；
 - `scripts/verify_venue_node_binary_isolation.ps1`；
-- `scripts/package_venue_node_linux_release.sh --release-id <id> --output-root <absolute-release-root> --build-root <absolute-build-root> --expected-revision <40-hex-commit> --preflight-only`；源码、构建根和发布根互不包含，预检要求干净且精确匹配的 Git checkout、Rust/Cargo 1.98.0 和至少 20 GiB 空闲。随后以相同参数去掉预检，持有固定缓存排他锁、逐所单 job 构建，生成仅含六个固定 Node binary、SHA256SUMS 与 manifest 的版本化目录；不清理缓存、不操作服务，见 `scripts/BUILD_POLICY.md`；
+- 默认 `scripts/Build-VenueUbuntu.ps1 -ExpectedRevision <40位commit> -ReleaseId <id> -CheckOnly`，可显式指定干净 `-SourceRoot`；预检后去掉 `-CheckOnly`，在本机受控 slot-2 编译六所 Linux ELF 产物至 `G:\Build\Venue\ubuntu\releases/<id>`。固定 GNU/Linux glibc 2.35 target、精确工具版本、源码 revision、SHA256 与不可覆盖的 manifest，专项为 `test_venue_ubuntu_build.ps1`。不在弱集成服务器日常编译；Linux 构建机仍可使用 `package_venue_node_linux_release.sh` 备用，不启动服务，完整约束见 `scripts/BUILD_POLICY.md`；
 - `scripts/verify_venue_node_linux_release.ps1`；
 - `scripts/verify_gateway_candidate_contract.ps1`；
 - `scripts/verify_postgres_integration.ps1`；

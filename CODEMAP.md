@@ -79,7 +79,7 @@ Web 的 Control 用户会话只在 BFF 环境注入，HTTP/SSE 同时保留 Cont
 | 当前 Gate 配置/root | `venue.gate.example.toml` | 服务器 `/home/cta/venue/artifacts/gate_doge_usdt`；风险为 Live `3 / 0.05 / 0.30`；发布号和当前订单数以服务器签名 doctor 与 handoff 收据为准，不在长期文档固化 |
 | 当前 Bitget 配置/root | `venue.bitget.example.toml` | 服务器 canonical root 为 `/home/cta/venue/artifacts/bitget_doge_usdt`，风险为 Live `3 / 0.05 / 0.30`；活动 release、运行状态、订单数、pending/WAL 与 custody 只以服务器进程、新鲜签名证据及 writer/handoff 收据为准，不在长期文档固化瞬时值 |
 | 固定 Node 二进制验证 | `scripts/verify_venue_node_binaries.ps1` | 验证六个 `venue-node-*` 是唯一固定 venue 启动产物；旧 hedged-grid 发布准备脚本与生产 binary 已删除 |
-| Linux Node 发布目录 | `scripts/package_venue_node_linux_release.sh` | 显式固定 `--expected-revision`、`--build-root` 与独立发布根；干净 Git/Rust 1.98/20 GiB 预检后持锁复用缓存，逐所单 job 生成六个 `venue-node-*` 和 SHA256SUMS/manifest。`--preflight-only` 不创建目录或锁，绝不操作实盘进程、凭证或账户 artifacts；资源边界见 `scripts/BUILD_POLICY.md`，脚本契约验证在 `verify_venue_node_linux_release.ps1` |
+| 本地 Ubuntu Node 编译与发布目录 | `scripts/Build-VenueUbuntu.ps1` | 默认 Windows 上用 Rust 1.98/Zig/cargo-zigbuild 编译 x86-64 GNU/Linux glibc 2.35 产物；专用根 `G:\Build\Venue\ubuntu`，Cargo 复用 slot-2 锁。固定干净 revision，逐所生成六个 ELF binary 和 SHA256SUMS/manifest；`-CheckOnly` 零写预检，不上传或启动服务。验证在 `test_venue_ubuntu_build.ps1`，资源规则见 `scripts/BUILD_POLICY.md`。`package_venue_node_linux_release.sh` 只保留 Linux 构建机备用，不在弱集成服务器日常编译 |
 
 ## 交易所 adapter
 
