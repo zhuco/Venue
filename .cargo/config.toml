@@ -1,2 +1,14 @@
 [build]
-target-dir = "G:/Build/Venue"
+target-dir = "G:/Build/Venue/main"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.test.package."*"]
+debug = false
