@@ -45,6 +45,9 @@ const PRIVATE_CHANNELS: [GatePrivateChannel; 4] = [
     GatePrivateChannel::Positions,
     GatePrivateChannel::Balances,
 ];
+/// A resident turn may not wait for a private socket indefinitely.  Idle is not a private
+/// generation change; disconnects and malformed frames remain terminal for that generation.
+const PRIVATE_READINESS_TIMEOUT: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GateTransportLimits {
@@ -702,6 +705,54 @@ where
             session.revoke();
         }
         result
+    }
+
+    /// Polls at most one private frame with the fixed resident readiness budget.  This is the
+    /// non-blocking counterpart to recovery's complete collection: an idle socket carries no
+    /// account fact, while transport failure is returned so its caller cannot continue on a
+    /// stale private generation.
+    pub async fn poll_raw_frame(
+        &mut self,
+    ) -> Result<Option<GatePrivateWsFrame>, GateTransportError> {
+        if let Some(frame) = self.buffered.pop_front() {
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(frame.payload.len());
+            return Ok(Some(frame));
+        }
+        if Instant::now() >= self.next_heartbeat_at {
+            self.send_heartbeat().await?;
+        }
+        let message = match timeout(PRIVATE_READINESS_TIMEOUT, self.stream.next()).await {
+            Err(_) => return Ok(None),
+            Ok(None) => return Err(GateTransportError::EndOfStream),
+            Ok(Some(Err(error))) => return Err(map_websocket(error)),
+            Ok(Some(Ok(message))) => message,
+        };
+        match message {
+            Message::Text(text) => {
+                if private_pong(&text)? {
+                    Ok(None)
+                } else {
+                    make_private_frame(
+                        &self.binding,
+                        self.generation,
+                        Bytes::from(text.to_string()),
+                        self.limits.maximum_body_bytes,
+                        unix_ms()?,
+                    )
+                    .map(Some)
+                }
+            }
+            Message::Ping(payload) => {
+                self.stream
+                    .send(Message::Pong(payload))
+                    .await
+                    .map_err(map_websocket)?;
+                Ok(None)
+            }
+            Message::Pong(_) => Ok(None),
+            Message::Binary(_) | Message::Frame(_) => Err(GateTransportError::Protocol),
+            Message::Close(_) => Err(GateTransportError::EndOfStream),
+        }
     }
 
     async fn next_raw_frame_inner(&mut self) -> Result<GatePrivateWsFrame, GateTransportError> {
@@ -1476,7 +1527,7 @@ mod tests {
         assert_eq!(session.private_ws_endpoint(), format!("ws://{address}"));
         assert_eq!(session.request_generation(), 7);
         private.revalidate_recovery_session(&session).await?;
-        let frame = private.next_raw_frame().await?;
+        let frame = private.poll_raw_frame().await?.ok_or("buffered frame")?;
         assert_eq!(frame.channel, "futures.orders");
         assert_eq!(frame.binding.mode, GatewayMode::Live);
         assert_eq!(private.next_raw_frame().await?.channel, "futures.positions");
