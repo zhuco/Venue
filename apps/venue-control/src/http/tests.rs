@@ -11,18 +11,20 @@ use venue_control_protocol::{
     AccountDeliveryClaim, AccountDeliveryClaimRequest, AccountDeliveryLease,
     AccountDeliveryPayload, AccountDeliveryPurpose, AccountDeliveryReceipt,
     AccountDeliveryReceiptState, AccountSummary, CONTROL_SCHEMA_VERSION, CommandReceipt,
-    ConnectionState, ControlAction, ControlCommandRequest, ControlEvent, ControlSnapshot,
-    GatewayMode, HealthState, INDICATOR_EVENT_STREAM_PATH, INDICATOR_SNAPSHOT_PATH,
-    IndicatorBinding, IndicatorFeatureValues, IndicatorFrameProjection, IndicatorProvenance,
-    StrategyKind, StrategyLifecycle, StrategySummary, VenueId,
+    ConnectionState, ControlAction, ControlCommandRequest, ControlSnapshot, CopyRelationReceipt,
+    CopyRelationReceiptState, CopyRelationUpsertRequest, ExecutionFactsSnapshot, GatewayMode,
+    HealthState, INDICATOR_EVENT_STREAM_PATH, INDICATOR_SNAPSHOT_PATH, IndicatorBinding,
+    IndicatorFeatureValues, IndicatorFrameProjection, IndicatorProvenance, NodeProjectionEnvelope,
+    StrategyKind, StrategyLifecycle, StrategySummary, UiAccountScope, UiEventEnvelope, UiEventKind,
+    UiEventNotification, VenueId,
 };
 
 use super::*;
 use crate::{
     AccountDeliveryRepository, AccountDeliveryRepositoryError, AccountNodeBinding, ClaimedCommand,
-    CommandEnqueueResult, CommandSettleResult, ControlRepository, DeliveryStoreResult,
-    IndicatorProjectionStore, RepositoryError, ScopedCommandReceipt, SnapshotStoreResult,
-    StoredEvent,
+    CommandEnqueueResult, CommandSettleResult, ControlRepository, CopyRelationRepository,
+    CopyRelationRepositoryError, DeliveryStoreResult, IndicatorProjectionStore, RepositoryError,
+    ScopedCommandReceipt, SnapshotStoreResult, StoredEvent,
 };
 
 #[derive(Clone, Default)]
@@ -100,9 +102,43 @@ impl AccountDeliveryRepository for TestRepository {
     }
 }
 
+impl CopyRelationRepository for TestRepository {
+    async fn upsert_copy_relation(
+        &self,
+        request: &CopyRelationUpsertRequest,
+        observed_ms: u64,
+    ) -> Result<CopyRelationReceipt, CopyRelationRepositoryError> {
+        request
+            .validate()
+            .map_err(|_| CopyRelationRepositoryError::InvalidData)?;
+        Ok(CopyRelationReceipt {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            relation_id: request.relation.relation_id.clone(),
+            revision: request.expected_revision.unwrap_or(0) + 1,
+            state: if request
+                .expected_revision
+                .is_some_and(|revision| revision != 0)
+            {
+                CopyRelationReceiptState::Updated
+            } else {
+                CopyRelationReceiptState::Created
+            },
+            observed_ms,
+        })
+    }
+
+    async fn list_copy_relations(
+        &self,
+    ) -> Result<Vec<venue_control_protocol::CopyRelationRecord>, CopyRelationRepositoryError> {
+        Ok(Vec::new())
+    }
+}
+
 #[derive(Default)]
 struct TestState {
     snapshot: Option<ControlSnapshot>,
+    execution_facts: Option<ExecutionFactsSnapshot>,
+    projections: BTreeMap<(VenueId, String, String), NodeProjectionEnvelope>,
     events: Vec<StoredEvent>,
     commands: BTreeMap<String, (ControlCommandRequest, CommandReceipt)>,
     delivery: DeliveryTestState,
@@ -142,6 +178,8 @@ impl TestRepository {
         Self {
             state: Arc::new(Mutex::new(TestState {
                 snapshot,
+                execution_facts: None,
+                projections: BTreeMap::new(),
                 events,
                 commands: BTreeMap::new(),
                 delivery: DeliveryTestState::default(),
@@ -192,7 +230,62 @@ impl ControlRepository for TestRepository {
         let sequence = state.events.len() as i64 + 1;
         state.events.push(StoredEvent {
             sequence,
-            event: ControlEvent::Snapshot(snapshot.clone()),
+            event: event(sequence, UiEventKind::Snapshot, &snapshot_scope(snapshot))?,
+        });
+        Ok(SnapshotStoreResult::Inserted {
+            event_sequence: sequence,
+        })
+    }
+    async fn load_execution_facts(
+        &self,
+    ) -> Result<Option<ExecutionFactsSnapshot>, RepositoryError> {
+        Ok(self.lock()?.execution_facts.clone())
+    }
+    async fn merge_node_projection(
+        &self,
+        projection: &NodeProjectionEnvelope,
+    ) -> Result<SnapshotStoreResult, RepositoryError> {
+        projection
+            .validate()
+            .map_err(|_| RepositoryError::CorruptData)?;
+        let mut state = self.lock()?;
+        let key = (
+            projection.binding.venue,
+            projection.binding.trading_account_id.clone(),
+            projection.node_id.clone(),
+        );
+        if let Some(current) = state.projections.get(&key) {
+            if current == projection {
+                return Ok(SnapshotStoreResult::Unchanged);
+            }
+            if current.node_generation > projection.node_generation
+                || (current.node_generation == projection.node_generation
+                    && current.sequence >= projection.sequence)
+            {
+                return Err(RepositoryError::ReplayConflict);
+            }
+            if (current.node_generation == projection.node_generation
+                && (projection.sequence != current.sequence + 1
+                    || projection.previous_digest != current.digest))
+                || (current.node_generation < projection.node_generation
+                    && (projection.sequence != 1 || projection.previous_digest != [0; 32]))
+            {
+                return Err(RepositoryError::ReplayConflict);
+            }
+        } else if projection.sequence != 1 || projection.previous_digest != [0; 32] {
+            return Err(RepositoryError::ReplayConflict);
+        }
+        state.snapshot = Some(projection.snapshot.clone());
+        state.execution_facts = Some(projection.facts.clone());
+        state.projections.insert(key, projection.clone());
+        let sequence = state.events.len() as i64 + 1;
+        state.events.push(StoredEvent {
+            sequence,
+            event: event(
+                sequence,
+                UiEventKind::Snapshot,
+                &snapshot_scope(&projection.snapshot),
+            )?,
         });
         Ok(SnapshotStoreResult::Inserted {
             event_sequence: sequence,
@@ -221,7 +314,7 @@ impl ControlRepository for TestRepository {
         let sequence = state.events.len() as i64 + 1;
         state.events.push(StoredEvent {
             sequence,
-            event: ControlEvent::CommandReceipt(accepted.clone()),
+            event: event(sequence, UiEventKind::Command, &command_scope(command))?,
         });
         Ok(CommandEnqueueResult::Inserted(accepted.clone()))
     }
@@ -242,6 +335,7 @@ impl ControlRepository for TestRepository {
     }
     async fn list_events(
         &self,
+        scope: &UiAccountScope,
         after: i64,
         limit: u32,
     ) -> Result<Vec<StoredEvent>, RepositoryError> {
@@ -249,7 +343,7 @@ impl ControlRepository for TestRepository {
             .lock()?
             .events
             .iter()
-            .filter(|event| event.sequence > after)
+            .filter(|event| event.sequence > after && event.event.scope == *scope)
             .take(limit as usize)
             .cloned()
             .collect())
@@ -323,17 +417,11 @@ async fn sse_replays_cursor_and_gracefully_stops() -> Result<(), Box<dyn std::er
     let events = vec![
         StoredEvent {
             sequence: 1,
-            event: ControlEvent::Notice {
-                observed_ms: 1,
-                message: "one".to_owned(),
-            },
+            event: event(1, UiEventKind::Snapshot, &scope())?,
         },
         StoredEvent {
             sequence: 2,
-            event: ControlEvent::Notice {
-                observed_ms: 2,
-                message: "two".to_owned(),
-            },
+            event: event(2, UiEventKind::Command, &scope())?,
         },
     ];
     let (address, stop, task) = start(
@@ -347,7 +435,7 @@ async fn sse_replays_cursor_and_gracefully_stops() -> Result<(), Box<dyn std::er
     let mut stream = tokio::net::TcpStream::connect(address).await?;
     stream
         .write_all(
-            b"GET /v2/ui/events?after=1 HTTP/1.1\r\nHost: localhost\r\nLast-Event-ID: 1\r\n\r\n",
+            b"GET /v2/ui/events?venue=binance&mode=LIVE&trading_account_id=00000000-0000-4000-8000-000000000001&after=1 HTTP/1.1\r\nHost: localhost\r\nLast-Event-ID: 1\r\n\r\n",
         )
         .await?;
     let mut received = Vec::new();
@@ -753,6 +841,60 @@ async fn account_node_boundary_caps_body_and_repository_time()
 }
 
 #[tokio::test]
+async fn account_node_projection_requires_a_valid_contiguous_idempotent_envelope()
+-> Result<(), Box<dyn std::error::Error>> {
+    let repository = TestRepository::default();
+    let (address, stop, task) = start(repository, ControlHttpConfig::default()).await?;
+    let projection = NodeProjectionEnvelope {
+        schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
+        binding: delivery_binding()?,
+        node_id: "node-instance-a".to_owned(),
+        node_generation: 1,
+        sequence: 1,
+        previous_digest: [0; 32],
+        digest: [42; 32],
+        copy_execution_evidence: Vec::new(),
+        copy_planning_facts: Vec::new(),
+        snapshot: snapshot()?,
+        facts: ExecutionFactsSnapshot {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            generated_ms: 100,
+            orders: Vec::new(),
+            positions: Vec::new(),
+            fills: Vec::new(),
+            reconciliation: Vec::new(),
+            copy_ledger: Vec::new(),
+            drift: Vec::new(),
+            execution: Vec::new(),
+            risk: Vec::new(),
+            health: Vec::new(),
+        },
+    };
+    let body = serde_json::to_vec(&projection)?;
+    let response = request(address, &post_path("/v2/account-node/projection", &body)).await?;
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert_eq!(
+        serde_json::from_str::<NodeProjectionEnvelope>(response_body(&response)?)?,
+        projection
+    );
+    let replay = request(address, &post_path("/v2/account-node/projection", &body)).await?;
+    assert!(replay.starts_with("HTTP/1.1 200 OK\r\n"));
+
+    let mut conflict = projection.clone();
+    conflict.digest = [43; 32];
+    let response = request(
+        address,
+        &post_path(
+            "/v2/account-node/projection",
+            &serde_json::to_vec(&conflict)?,
+        ),
+    )
+    .await?;
+    assert!(response.starts_with("HTTP/1.1 409 Conflict\r\n"));
+    stop_server(stop, task).await
+}
+
+#[tokio::test]
 async fn non_loopback_listener_is_rejected_before_accepting_clients()
 -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("0.0.0.0:0").await?;
@@ -929,6 +1071,55 @@ fn has_scope(snapshot: Option<&ControlSnapshot>, command: &ControlCommandRequest
     })
 }
 
+fn scope() -> UiAccountScope {
+    UiAccountScope {
+        venue: VenueId::Binance,
+        mode: GatewayMode::Live,
+        trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+    }
+}
+
+fn snapshot_scope(snapshot: &ControlSnapshot) -> UiAccountScope {
+    snapshot
+        .accounts
+        .first()
+        .map(|account| UiAccountScope {
+            venue: account.venue,
+            mode: account.mode,
+            trading_account_id: account.trading_account_id.clone(),
+        })
+        .unwrap_or_else(scope)
+}
+
+fn command_scope(command: &ControlCommandRequest) -> UiAccountScope {
+    UiAccountScope {
+        venue: command.venue,
+        mode: command.mode,
+        trading_account_id: command.trading_account_id.clone(),
+    }
+}
+
+fn event(
+    cursor: i64,
+    event_type: UiEventKind,
+    scope: &UiAccountScope,
+) -> Result<UiEventEnvelope, RepositoryError> {
+    UiEventEnvelope::from_notification(
+        UiEventNotification {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            event_type,
+            scope: scope.clone(),
+            observed_ms: u64::try_from(cursor).unwrap_or(1),
+        },
+        u64::try_from(cursor).unwrap_or(1),
+        cursor
+            .checked_sub(1)
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(0),
+    )
+    .map_err(|_| RepositoryError::CorruptData)
+}
+
 pub(super) fn command(
     action: ControlAction,
 ) -> Result<ControlCommandRequest, Box<dyn std::error::Error>> {
@@ -957,9 +1148,10 @@ pub(super) fn snapshot() -> Result<ControlSnapshot, Box<dyn std::error::Error>> 
             mode: GatewayMode::Live,
             trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             health: HealthState::Healthy,
-            equity: Decimal::new(10_000, 0),
-            available_margin: Decimal::new(8_000, 0),
-            unrealized_pnl: Decimal::ZERO,
+            equity: Some(Decimal::new(10_000, 0)),
+            available_margin: Some(Decimal::new(8_000, 0)),
+            unrealized_pnl: Some(Decimal::ZERO),
+            balances: Vec::new(),
             private_generation: 2,
             writer_generation: 1,
             last_reconciled_ms: 99,
@@ -976,8 +1168,8 @@ pub(super) fn snapshot() -> Result<ControlSnapshot, Box<dyn std::error::Error>> 
             open_orders: 4,
             long_quantity: Decimal::ONE,
             short_quantity: Decimal::ONE,
-            realized_pnl: Decimal::ZERO,
-            unrealized_pnl: Decimal::ZERO,
+            realized_pnl: Some(Decimal::ZERO),
+            unrealized_pnl: Some(Decimal::ZERO),
             last_receipt_ms: 99,
             attention: None,
         }],

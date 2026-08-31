@@ -216,6 +216,15 @@ pub fn build_positions_request(
     )
 }
 
+/// The account-risk gate needs the whole account, never merely the command symbol. The same
+/// signed scope still pins credentials, venue, account, and generations; omission of `symbol`
+/// is the Binance API's explicit account-wide query form.
+pub fn build_account_wide_positions_request(
+    scope: &BinancePrivateReadScope,
+) -> Result<BinancePrivateReadRequest, BinanceReadbackError> {
+    BinancePrivateReadRequest::new(scope, BinancePrivateSurface::Positions, 1, Vec::new())
+}
+
 pub fn build_regular_orders_request(
     scope: &BinancePrivateReadScope,
 ) -> Result<BinancePrivateReadRequest, BinanceReadbackError> {
@@ -225,6 +234,12 @@ pub fn build_regular_orders_request(
         1,
         symbol_parameters(scope),
     )
+}
+
+pub fn build_account_wide_regular_orders_request(
+    scope: &BinancePrivateReadScope,
+) -> Result<BinancePrivateReadRequest, BinanceReadbackError> {
+    BinancePrivateReadRequest::new(scope, BinancePrivateSurface::RegularOrders, 1, Vec::new())
 }
 
 pub fn build_algo_orders_request(
@@ -241,6 +256,17 @@ pub fn build_algo_orders_request(
     )
 }
 
+pub fn build_account_wide_algo_orders_request(
+    scope: &BinancePrivateReadScope,
+) -> Result<BinancePrivateReadRequest, BinanceReadbackError> {
+    BinancePrivateReadRequest::new(
+        scope,
+        BinancePrivateSurface::AlgoOrders,
+        1,
+        vec![("algoType".to_owned(), "CONDITIONAL".to_owned())],
+    )
+}
+
 pub fn build_fills_request(
     scope: &BinancePrivateReadScope,
     page_index: u32,
@@ -248,13 +274,35 @@ pub fn build_fills_request(
     start_time_ms: u64,
     end_time_ms: u64,
 ) -> Result<BinancePrivateReadRequest, BinanceReadbackError> {
+    build_fills_for_native_symbol_request(
+        scope,
+        &native_symbol(&scope.binding.symbol),
+        page_index,
+        cursor,
+        start_time_ms,
+        end_time_ms,
+    )
+}
+
+/// Builds a bounded fills request for a symbol discovered from the account-wide signed
+/// catalogue.  The scope still binds the credential/account generation; the symbol is explicit
+/// because PAPI user-trades has no account-wide endpoint.
+pub fn build_fills_for_native_symbol_request(
+    scope: &BinancePrivateReadScope,
+    native: &str,
+    page_index: u32,
+    cursor: RecentFillsCursor,
+    start_time_ms: u64,
+    end_time_ms: u64,
+) -> Result<BinancePrivateReadRequest, BinanceReadbackError> {
     if start_time_ms == 0
         || end_time_ms < start_time_ms
+        || native.trim().is_empty()
         || cursor.last_trade_id.is_some() != cursor.last_event_time_ms.is_some()
     {
         return Err(BinanceReadbackError::Request);
     }
-    let mut parameters = symbol_parameters(scope);
+    let mut parameters = vec![("symbol".to_owned(), native.to_owned())];
     parameters.push(("limit".to_owned(), "1000".to_owned()));
     match cursor.last_trade_id {
         Some(last_id) => parameters.push((
@@ -276,13 +324,31 @@ pub fn build_exact_order_request(
     scope: &BinancePrivateReadScope,
     client_order_id: &str,
 ) -> Result<BinancePrivateReadRequest, BinanceReadbackError> {
+    build_exact_order_for_native_symbol_request(
+        scope,
+        &native_symbol(&scope.binding.symbol),
+        client_order_id,
+    )
+}
+
+/// Exact order lookup for a command whose owner symbol differs from the resident's selected
+/// strategy symbol.  The signed scope still binds one account; this only selects the native
+/// PAPI order namespace that the durable command already owns.
+pub fn build_exact_order_for_native_symbol_request(
+    scope: &BinancePrivateReadScope,
+    native: &str,
+    client_order_id: &str,
+) -> Result<BinancePrivateReadRequest, BinanceReadbackError> {
     validate_client_order_id(client_order_id)?;
+    if native.trim().is_empty() {
+        return Err(BinanceReadbackError::Request);
+    }
     BinancePrivateReadRequest::new(
         scope,
         BinancePrivateSurface::ExactOrder,
         1,
         vec![
-            ("symbol".to_owned(), native_symbol(&scope.binding.symbol)),
+            ("symbol".to_owned(), native.to_owned()),
             ("origClientOrderId".to_owned(), client_order_id.to_owned()),
         ],
     )
@@ -1110,6 +1176,42 @@ mod tests {
                 .any(|(key, _)| key == "startTime")
         );
         assert_eq!(with_id.page_index(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn account_snapshot_can_page_fills_for_discovered_account_symbol()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, _, scope) = facts(
+            GatewayMode::Live,
+            "00000000-0000-4000-8000-000000000001",
+            7,
+            17,
+        )?;
+        let request = build_fills_for_native_symbol_request(
+            &scope,
+            "ETHUSDT",
+            3,
+            RecentFillsCursor {
+                observed_through_ms: 1_000,
+                last_trade_id: Some(9),
+                last_event_time_ms: Some(1_000),
+            },
+            1_000,
+            2_000,
+        )?;
+        assert!(
+            request
+                .parameters()
+                .iter()
+                .any(|pair| pair == &("symbol".to_owned(), "ETHUSDT".to_owned()))
+        );
+        assert!(
+            request
+                .parameters()
+                .iter()
+                .any(|pair| pair == &("fromId".to_owned(), "10".to_owned()))
+        );
         Ok(())
     }
 }

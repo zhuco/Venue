@@ -110,6 +110,18 @@ pub struct DurableWalHead {
     root_sha256: [u8; 32],
     tail_sequence: u64,
     record_count: u64,
+    #[serde(default)]
+    format_version: DurableWalHeadFormat,
+}
+
+/// Digest algorithm used by a durable command-WAL head. Missing fields in historical actor
+/// checkpoints deserialize as V1, preserving prefix validation across the incremental V2 move.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableWalHeadFormat {
+    #[default]
+    V1,
+    V2,
 }
 
 impl DurableWalHead {
@@ -128,7 +140,18 @@ impl DurableWalHead {
             root_sha256,
             tail_sequence,
             record_count,
+            format_version: DurableWalHeadFormat::V1,
         })
+    }
+
+    pub fn new_v2(
+        root_sha256: [u8; 32],
+        tail_sequence: u64,
+        record_count: u64,
+    ) -> Result<Self, ActorAppliedError> {
+        let mut head = Self::new(root_sha256, tail_sequence, record_count)?;
+        head.format_version = DurableWalHeadFormat::V2;
+        Ok(head)
     }
 
     #[must_use]
@@ -146,16 +169,30 @@ impl DurableWalHead {
         self.record_count
     }
 
+    #[must_use]
+    pub const fn format_version(&self) -> DurableWalHeadFormat {
+        self.format_version
+    }
+
     fn validate(self) -> Result<(), ActorAppliedError> {
-        Self::new(self.root_sha256, self.tail_sequence, self.record_count).map(|_| ())
+        let result = match self.format_version {
+            DurableWalHeadFormat::V1 => {
+                Self::new(self.root_sha256, self.tail_sequence, self.record_count)
+            }
+            DurableWalHeadFormat::V2 => {
+                Self::new_v2(self.root_sha256, self.tail_sequence, self.record_count)
+            }
+        };
+        result.map(|_| ())
     }
 
     fn does_not_drift_from(self, previous: Self) -> bool {
         let pair_changed = (self.tail_sequence, self.record_count)
             != (previous.tail_sequence, previous.record_count);
+        let format_changed = self.format_version != previous.format_version;
         self.tail_sequence >= previous.tail_sequence
             && self.record_count >= previous.record_count
-            && (pair_changed == (self.root_sha256 != previous.root_sha256))
+            && ((pair_changed || format_changed) == (self.root_sha256 != previous.root_sha256))
     }
 }
 
@@ -931,6 +968,20 @@ mod tests {
                 format!("state-{replay_revision}").into_bytes(),
             )?,
         )
+    }
+
+    #[test]
+    fn historical_wal_head_without_a_format_field_deserializes_as_v1()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let head: DurableWalHead = serde_json::from_value(serde_json::json!({
+            "root_sha256": digest(9),
+            "tail_sequence": 4,
+            "record_count": 3,
+        }))?;
+        assert_eq!(head.format_version(), DurableWalHeadFormat::V1);
+        assert_eq!(head.tail_sequence(), 4);
+        assert_eq!(head.record_count(), 3);
+        Ok(())
     }
 
     #[test]

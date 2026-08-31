@@ -929,6 +929,7 @@ fn commit_strategy_key(digest: &mut Sha256, key: &StrategyInstanceKey) {
         &[match key.strategy_kind {
             crate::domain::StrategyKind::HedgedGrid => 1,
             crate::domain::StrategyKind::Scalping => 2,
+            crate::domain::StrategyKind::Copy => 3,
         }],
     );
     commit_str(digest, &key.instance_id);

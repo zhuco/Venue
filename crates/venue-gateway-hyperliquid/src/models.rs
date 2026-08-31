@@ -32,6 +32,13 @@ pub(crate) struct UserFillRow {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UserTwapSliceFillRow {
+    pub fill: UserFillRow,
+    pub twap_id: u64,
+}
+
+#[derive(Deserialize)]
 pub(crate) struct PerpMetaResponse {
     pub universe: Vec<PerpMetaRow>,
 }
@@ -97,6 +104,7 @@ pub(crate) struct PositionRow {
     pub coin: String,
     pub szi: String,
     pub entry_px: Option<String>,
+    pub position_value: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]

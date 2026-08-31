@@ -2,7 +2,9 @@
 param()
 
 $ErrorActionPreference = "Stop"
-$maxTrackedBytes = 10MB
+# The unified Node/Web workspace plus preserved account/indicator sources is about 11 MiB.
+# This is a source-only budget; single-file and generated/secret exclusions stay unchanged.
+$maxTrackedBytes = 12MB
 $maxSingleFileBytes = 2MB
 $forbiddenRoots = @(
     "bak/",
@@ -11,6 +13,8 @@ $forbiddenRoots = @(
     ".codex-target-",
     ".codex-local-toolchain/",
     "releases/",
+    "content-releases/",
+    "handoff-staging/",
     "artifacts/",
     ".secrets/"
 )
@@ -92,7 +96,7 @@ foreach ($change in $changedPaths) {
 }
 
 if ($totalBytes -gt $maxTrackedBytes) {
-    $violations.Add("tracked worktree exceeds 10 MiB: $totalBytes bytes")
+    $violations.Add("tracked worktree exceeds 12 MiB: $totalBytes bytes")
 }
 if ($violations.Count -ne 0) {
     $violations | ForEach-Object { Write-Error $_ }

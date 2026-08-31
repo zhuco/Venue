@@ -356,9 +356,9 @@ pub fn complete_private_turn(
     })
 }
 
-/// Parses exactly one signed `unfilled-orders` page for the canonical regular family.
-/// Every row must explicitly carry `delegateType=normal`; unrelated order families cannot be
-/// silently filtered into an apparently complete regular snapshot.
+/// Parses one signed UTA `unfilled-orders` page. That endpoint includes every active delegate
+/// type; this regular-only mutation profile accepts only `delegateType=normal`, so any strategy
+/// row fails the whole candidate instead of being silently omitted from a claimed empty family.
 pub fn parse_regular_order_page(
     raw: BitgetRawPrivatePage,
 ) -> Result<BitgetRegularOrderPage, BitgetPrivateError> {

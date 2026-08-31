@@ -223,21 +223,16 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
                     &format!("{} {base_asset}", strategy.short_quantity.normalize()),
                     theme::SELL,
                 );
-                position_value(
-                    &mut columns[2],
-                    "PnL",
-                    &format!(
-                        "{:+} {quote_asset}",
-                        strategy.unrealized_pnl.round_dp(2).normalize()
-                    ),
-                    theme::value_color(
-                        strategy
-                            .unrealized_pnl
-                            .to_string()
-                            .parse::<f64>()
-                            .unwrap_or(0.0),
-                    ),
-                );
+                if let Some(pnl) = strategy.unrealized_pnl {
+                    position_value(
+                        &mut columns[2],
+                        "PnL",
+                        &format!("{:+} {quote_asset}", pnl.round_dp(2).normalize()),
+                        theme::value_color(pnl.to_string().parse::<f64>().unwrap_or(0.0)),
+                    );
+                } else {
+                    position_value(&mut columns[2], "PnL", "—", theme::TEXT_SECONDARY);
+                }
             });
         } else {
             ui.label(

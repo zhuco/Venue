@@ -20,6 +20,7 @@ pub struct UsdConversionEvidence {
     pub usd_per_asset: Decimal,
     pub private_generation: u64,
     pub observed_at_ms: u64,
+    pub source_time_ms: u64,
 }
 
 /// Parses Binance's Portfolio Margin asset-index response and binds its native timestamp to the
@@ -40,21 +41,31 @@ pub fn parse_usd_conversion_evidence(
         Value::Array(_) => return Err(PrivateParseError::CurrencyEvidence),
         _ => return Err(PrivateParseError::Payload),
     };
-    if item.get("asset").and_then(Value::as_str) != Some(asset.as_str())
-        || private_generation == 0
-        || observed_at_ms == 0
-    {
+    if private_generation == 0 || observed_at_ms == 0 {
         return Err(PrivateParseError::CurrencyEvidence);
     }
     let source_time_ms = item
         .get("time")
         .and_then(Value::as_u64)
         .ok_or(PrivateParseError::CurrencyEvidence)?;
-    if source_time_ms > observed_at_ms || observed_at_ms.saturating_sub(source_time_ms) > max_age_ms
+    if source_time_ms == 0
+        || source_time_ms > observed_at_ms
+        || observed_at_ms.saturating_sub(source_time_ms) > max_age_ms
     {
         return Err(PrivateParseError::CurrencyEvidence);
     }
-    let usd_per_asset = decimal(item, "assetIndexPrice")?;
+    // The current USD-M endpoint identifies a price as `SYMBOLUSD` and calls its value `index`.
+    // Keep the older PAPI `asset`/`assetIndexPrice` shape readable for frozen risk replay only;
+    // a public risk read below uses the documented first branch.
+    let expected_symbol = format!("{}USD", asset.as_str());
+    let usd_per_asset =
+        if item.get("symbol").and_then(Value::as_str) == Some(expected_symbol.as_str()) {
+            decimal(item, "index")?
+        } else if item.get("asset").and_then(Value::as_str) == Some(asset.as_str()) {
+            decimal(item, "assetIndexPrice")?
+        } else {
+            return Err(PrivateParseError::CurrencyEvidence);
+        };
     if usd_per_asset <= Decimal::ZERO {
         return Err(PrivateParseError::CurrencyEvidence);
     }
@@ -63,6 +74,7 @@ pub fn parse_usd_conversion_evidence(
         usd_per_asset,
         private_generation,
         observed_at_ms,
+        source_time_ms,
     })
 }
 
@@ -237,6 +249,7 @@ mod tests {
         let evidence = parse_usd_conversion_evidence(payload, asset.clone(), 7, 1_050, 100)?;
         assert_eq!(evidence.usd_per_asset, Decimal::new(9_998, 4));
         assert_eq!(evidence.private_generation, 7);
+        assert_eq!(evidence.source_time_ms, 1_000);
         let array_payload = r#"[{"asset":"USDT","assetIndexPrice":"0.9998","time":1000}]"#;
         assert_eq!(
             parse_usd_conversion_evidence(array_payload, asset.clone(), 7, 1_050, 100,)?,
@@ -305,6 +318,31 @@ mod tests {
     }
 
     #[test]
+    fn documented_usd_m_asset_index_uses_asset_usd_symbol_and_index()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let usdc: Asset = "USDC".parse()?;
+        let evidence = parse_usd_conversion_evidence(
+            r#"{"symbol":"USDCUSD","time":1000,"index":"0.9975"}"#,
+            usdc,
+            7,
+            1_050,
+            100,
+        )?;
+        assert_eq!(evidence.usd_per_asset, Decimal::new(9_975, 4));
+        assert!(
+            parse_usd_conversion_evidence(
+                r#"{"symbol":"USDTUSD","time":1000,"index":"1"}"#,
+                "USDC".parse()?,
+                7,
+                1_050,
+                100,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn portfolio_account_uses_aggregate_risk_values() -> Result<(), Box<dyn std::error::Error>> {
         let balance = parse_account_balance(
             r#"{"accountEquity":"12","totalAvailableBalance":"8","accountInitialMargin":"3","accountMaintMargin":"0.5"}"#,
@@ -343,6 +381,7 @@ mod tests {
             usd_per_asset: Decimal::new(999, 3),
             private_generation: 9,
             observed_at_ms: 1_000,
+            source_time_ms: 1_000,
         };
         let (account, legs) = parse_risk_snapshots(
             account,
@@ -380,6 +419,7 @@ mod tests {
             usd_per_asset: Decimal::new(9_999, 4),
             private_generation: 18,
             observed_at_ms: 1_000,
+            source_time_ms: 1_000,
         };
 
         let (_, legs) = parse_risk_snapshots(

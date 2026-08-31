@@ -8,13 +8,19 @@ use sha2::{Digest, Sha256};
 use venue_domain::domain::ExecutionCommand;
 
 pub use account_host::{
-    AccountDispatchOutcome, AccountDispatchPermit, AccountGatewayResult, AccountHostError,
-    AccountHostValidationError, AccountMutationHost, AccountPhysicalGateway,
-    AccountRecoveryOutcome, AccountRecoveryReport, AccountRecoveryRequest, AccountRecoveryState,
-    COMMAND_JOURNAL_HARD_LIMIT_BYTES, COMMAND_JOURNAL_ROTATE_BYTES,
+    AccountCommandStatus, AccountDispatchOutcome, AccountDispatchPermit, AccountGatewayResult,
+    AccountHostError, AccountHostValidationError, AccountInstrumentIdentity,
+    AccountLimitNormalizationIntent, AccountMutationHost, AccountPhysicalGateway,
+    AccountQuoteToUsdtRate, AccountRecoveryOutcome, AccountRecoveryReport, AccountRecoveryRequest,
+    AccountRecoveryState, AccountRiskAmount, AccountRiskEvidence, AccountRiskSummary,
+    AccountSymbolSet, COMMAND_JOURNAL_HARD_LIMIT_BYTES, COMMAND_JOURNAL_ROTATE_BYTES,
+    HostPreparedCommand, RuntimeBootstrapReceipt, SignedAccountBalance, SignedAccountOrderFact,
+    SignedAccountPositionFact, SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact,
+    SignedUnknownResult,
 };
 pub use canonical_root::{
-    AccountCanonicalRootError, AccountCanonicalRootGuard, acquire_account_canonical_root,
+    AccountCanonicalRootError, AccountCanonicalRootGuard, LegacyV1WriterGuard,
+    LegacyV1WriterPredecessor, acquire_account_canonical_root,
 };
 pub use journal::{
     CommandJournal, CommandJournalError, CommandReceipt, CommandState, OrderReadbackIdentity,

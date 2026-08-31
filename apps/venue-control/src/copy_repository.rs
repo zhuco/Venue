@@ -3,9 +3,9 @@ use std::future::Future;
 use thiserror::Error;
 
 use crate::{
-    CopyApplyResult, CopyCrashReplay, CopyDeliveryClaim, CopyJob, CopyLeaderEnvelope,
-    CopyLedgerProjectionInput, CopyObserverLease, CopyObserverScope, CopyStoreResult,
-    ObservedCopyIntent, ScopedCopyDeliveryReceipt,
+    CopyApplyResult, CopyCrashReplay, CopyDeliveryClaim, CopyExecutionProjectionInput, CopyJob,
+    CopyLeaderEnvelope, CopyLedgerProjectionInput, CopyObserverLease, CopyObserverScope,
+    CopyStoreResult, ObservedCopyIntent, ScopedCopyDeliveryReceipt,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -81,6 +81,11 @@ pub trait CopyRepository: Send + Sync {
     fn project_copy_ledger(
         &self,
         input: &CopyLedgerProjectionInput,
+    ) -> impl Future<Output = Result<CopyApplyResult, CopyRepositoryError>> + Send;
+
+    fn record_copy_execution(
+        &self,
+        input: &CopyExecutionProjectionInput,
     ) -> impl Future<Output = Result<CopyApplyResult, CopyRepositoryError>> + Send;
 
     fn load_copy_replay(

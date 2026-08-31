@@ -317,35 +317,30 @@ async fn postgres_http_private_snapshots_commands_and_sse_are_scoped_and_revocab
         AccountErrorCode::Forbidden,
     )
     .await?;
-    for session in [None, Some(&bob)] {
-        let mut stream = s
-            .get(venue_control_protocol::EVENT_STREAM_PATH, session)
-            .send()
-            .await?
-            .error_for_status()?;
-        let mut frames = String::new();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !frames.contains(": scoped") {
-                let chunk = stream.chunk().await?.ok_or("missing scoped event")?;
-                frames.push_str(std::str::from_utf8(&chunk)?);
-            }
-            Ok::<_, Box<dyn std::error::Error>>(())
-        })
-        .await??;
-        assert!(
-            !frames.contains(account)
-                && !frames.contains("grid-btc")
-                && !frames.contains(&receipt.receipt_id)
-        );
-    }
+    let event_path = format!(
+        "{}?venue=binance&mode=LIVE&trading_account_id={account}&after=0",
+        venue_control_protocol::EVENT_STREAM_PATH,
+    );
+    code(
+        s.get(&event_path, None).send().await?,
+        401,
+        AccountErrorCode::Unauthorized,
+    )
+    .await?;
+    code(
+        s.get(&event_path, Some(&bob)).send().await?,
+        403,
+        AccountErrorCode::Forbidden,
+    )
+    .await?;
     let mut stream = s
-        .get(venue_control_protocol::EVENT_STREAM_PATH, Some(&alice))
+        .get(&event_path, Some(&alice))
         .send()
         .await?
         .error_for_status()?;
     let mut frames = String::new();
     tokio::time::timeout(Duration::from_secs(3), async {
-        while !frames.contains(&receipt.receipt_id) {
+        while !frames.contains("event: control") {
             let chunk = stream.chunk().await?.ok_or("missing private event")?;
             frames.push_str(std::str::from_utf8(&chunk)?);
         }
@@ -380,7 +375,10 @@ async fn postgres_http_private_snapshots_commands_and_sse_are_scoped_and_revocab
     .await?;
     code(
         s.get(
-            &format!("{}?after=bad", venue_control_protocol::EVENT_STREAM_PATH),
+            &format!(
+                "{}?venue=binance&mode=LIVE&trading_account_id={account}&after=bad",
+                venue_control_protocol::EVENT_STREAM_PATH,
+            ),
             None,
         )
         .send()

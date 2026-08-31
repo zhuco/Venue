@@ -8,11 +8,12 @@ use std::{collections::BTreeSet, time::Duration};
 
 use venue_control_protocol::{
     ACCOUNT_DELIVERY_ACK_PATH, ACCOUNT_DELIVERY_CLAIM_PATH, ACCOUNT_DELIVERY_RECEIPT_PATH,
-    AccountDeliveryAck, AccountDeliveryClaim, AccountDeliveryClaimRequest, AccountDeliveryPurpose,
-    AccountDeliveryReceipt,
+    ACCOUNT_NODE_PROJECTION_PATH, AccountDeliveryAck, AccountDeliveryClaim,
+    AccountDeliveryClaimRequest, AccountDeliveryPurpose, AccountDeliveryReceipt,
+    NodeProjectionEnvelope,
 };
 
-use crate::{AccountDeliveryRepository, ControlService, ServiceError};
+use crate::{AccountDeliveryRepository, ControlRepository, ControlService, ServiceError};
 
 pub const MAX_ACCOUNT_NODE_HTTP_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_ACCOUNT_NODE_HTTP_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -23,6 +24,7 @@ pub(crate) enum AccountNodeRoute {
     Claim,
     Ack,
     Receipt,
+    Projection,
 }
 
 impl AccountNodeRoute {
@@ -31,6 +33,7 @@ impl AccountNodeRoute {
             ACCOUNT_DELIVERY_CLAIM_PATH => Some(Self::Claim),
             ACCOUNT_DELIVERY_ACK_PATH => Some(Self::Ack),
             ACCOUNT_DELIVERY_RECEIPT_PATH => Some(Self::Receipt),
+            ACCOUNT_NODE_PROJECTION_PATH => Some(Self::Projection),
             _ => None,
         }
     }
@@ -53,7 +56,7 @@ pub(crate) async fn handle_account_node_request<R>(
     configured_timeout: Duration,
 ) -> Result<Vec<u8>, AccountNodePollError>
 where
-    R: AccountDeliveryRepository,
+    R: AccountDeliveryRepository + ControlRepository,
 {
     if body.is_empty() {
         return Err(AccountNodePollError::InvalidRequest);
@@ -67,6 +70,7 @@ where
             AccountNodeRoute::Claim => claim(service, body, observed_ms).await,
             AccountNodeRoute::Ack => acknowledge(service, body).await,
             AccountNodeRoute::Receipt => record_receipt(service, body).await,
+            AccountNodeRoute::Projection => merge_projection(service, body).await,
         }
     })
     .await
@@ -75,6 +79,27 @@ where
         return Err(AccountNodePollError::InvalidRepositoryResponse);
     }
     Ok(response)
+}
+
+async fn merge_projection<R>(
+    service: &ControlService<R>,
+    body: &[u8],
+) -> Result<Vec<u8>, AccountNodePollError>
+where
+    R: ControlRepository,
+{
+    let projection = serde_json::from_slice::<NodeProjectionEnvelope>(body)
+        .map_err(|_| AccountNodePollError::InvalidRequest)?;
+    projection
+        .validate()
+        .map_err(|_| AccountNodePollError::InvalidRequest)?;
+    // An echo is an exact, idempotent acknowledgement. The sender only marks its local durable
+    // outbox complete after this value matches the envelope it appended before the request.
+    service
+        .merge_node_projection(&projection)
+        .await
+        .map_err(AccountNodePollError::Service)?;
+    serde_json::to_vec(&projection).map_err(|_| AccountNodePollError::InvalidRepositoryResponse)
 }
 
 async fn claim<R>(

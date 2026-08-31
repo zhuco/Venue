@@ -4,6 +4,8 @@
 /.codex-target-*/
 /.codex-local-toolchain/
 /releases/
+/content-releases/
+/handoff-staging/
 /.env
 /.secrets/
 /artifacts/

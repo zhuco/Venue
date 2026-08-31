@@ -132,6 +132,21 @@ pub fn public_subscriptions(symbol: &Symbol) -> Result<Value, BitgetPublicError>
     }))
 }
 
+/// The narrow subscription owned by the Scalping resident.  It intentionally excludes ticker
+/// and trade channels: a sequenced `books` snapshot plus covering updates is the only public
+/// input that may establish a strategy book.
+pub fn scalping_book_subscription(symbol: &Symbol) -> Result<Value, BitgetPublicError> {
+    let native = native_symbol(symbol)?;
+    Ok(json!({
+        "op": "subscribe",
+        "args": [{
+            "instType": BITGET_UTA_FUTURES_INST_TYPE,
+            "topic": "books",
+            "symbol": native,
+        }],
+    }))
+}
+
 /// A bounded REST depth snapshot.  Bitget's REST response has no `seq`, so this type intentionally
 /// cannot be converted to a [`MarketSnapshot`] or submitted to [`BitgetBookSequencer`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -965,6 +980,25 @@ mod tests {
         assert_eq!(parsed.best_bid_ask()?.0.value().to_string(), "0.100");
         assert!(parsed.fresh_at(6_000, DEFAULT_PUBLIC_FRESHNESS_MS));
         assert!(!parsed.fresh_at(6_001, DEFAULT_PUBLIC_FRESHNESS_MS));
+        Ok(())
+    }
+
+    #[test]
+    fn scalping_subscription_exposes_only_the_sequenced_book_channel()
+    -> Result<(), BitgetPublicError> {
+        let subscription = scalping_book_subscription(&symbol()?)?;
+        let args = subscription
+            .get("args")
+            .and_then(Value::as_array)
+            .ok_or(BitgetPublicError::Payload)?;
+        assert_eq!(args.len(), 1);
+        assert_eq!(
+            args.first()
+                .and_then(Value::as_object)
+                .and_then(|arg| arg.get("topic"))
+                .and_then(Value::as_str),
+            Some("books")
+        );
         Ok(())
     }
 

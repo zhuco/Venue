@@ -149,6 +149,24 @@ pub fn build_positions_read_request(
     ))
 }
 
+/// A signed, account-wide USDT-futures position query used only for entry-risk admission.
+/// The raw page remains bound to the fixed host identity, while the adapter validates every
+/// returned row's native USDT symbol before it contributes to the account aggregate.
+pub fn build_account_wide_positions_read_request(
+    binding: &GatewayBinding,
+    attempt_id: u64,
+    generation: u64,
+) -> BitgetPrivateReadRequest {
+    singleton_request(
+        binding,
+        BitgetPrivateSurface::Positions,
+        endpoints::POSITIONS,
+        attempt_id,
+        generation,
+        format!("category={BITGET_UTA_FUTURES_CATEGORY}"),
+    )
+}
+
 pub fn build_regular_orders_read_request(
     binding: &GatewayBinding,
     attempt_id: u64,
@@ -168,6 +186,53 @@ pub fn build_regular_orders_read_request(
         query: regular_orders_query(&binding.symbol, cursor)
             .map_err(|_| BitgetTransportError::Binding)?,
     })
+}
+
+/// A signed, paginated account-wide UTA open-order query. Bitget returns every active delegate
+/// type from this endpoint, so the caller must classify every returned row before admitting
+/// entry risk. It deliberately omits `symbol` so a non-selected USDT position cannot hide an
+/// exposure-increasing order from the fixed account gate.
+pub fn build_account_wide_open_orders_read_request(
+    binding: &GatewayBinding,
+    attempt_id: u64,
+    generation: u64,
+    page_index: u32,
+    cursor: Option<&str>,
+) -> Result<BitgetPrivateReadRequest, BitgetTransportError> {
+    let mut query = format!(
+        "category={BITGET_UTA_FUTURES_CATEGORY}&limit={}",
+        crate::private::BITGET_PRIVATE_PAGE_SIZE
+    );
+    if let Some(cursor) = cursor {
+        if cursor.is_empty() {
+            return Err(BitgetTransportError::Binding);
+        }
+        query.push_str("&cursor=");
+        query.push_str(&encode_query_component(cursor));
+    }
+    Ok(BitgetPrivateReadRequest {
+        binding: binding.clone(),
+        surface: BitgetPrivateSurface::RegularOrders,
+        attempt_id,
+        generation,
+        page_index,
+        request_cursor: cursor.map(str::to_owned),
+        fill_history_start_ms: None,
+        path: endpoints::OPEN_ORDERS,
+        query,
+    })
+}
+
+fn encode_query_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -223,6 +288,15 @@ pub struct BitgetHttpTransport {
     endpoint: String,
     limits: BitgetTransportLimits,
     dispatched: tokio::sync::Mutex<BTreeSet<(u64, u64, String)>>,
+}
+
+/// Bounded, credential-free response from Bitget's fixed LIVE REST origin.  It retains the
+/// local receive time so callers can bind the raw public envelope before strict parsing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BitgetPublicHttpResponse {
+    pub requested_at_ms: u64,
+    pub received_at_ms: u64,
+    pub payload: Vec<u8>,
 }
 
 struct RecoverySessionUse<'a> {
@@ -296,8 +370,61 @@ impl BitgetHttpTransport {
     }
 
     #[must_use]
+    pub const fn binding(&self) -> &GatewayBinding {
+        &self.binding
+    }
+
+    #[must_use]
     pub const fn config(&self) -> &BitgetConfig {
         &self.config
+    }
+
+    /// Reads the anchor public instrument rule without credentials.
+    pub async fn fetch_selected_instrument(&self) -> Result<Vec<u8>, BitgetTransportError> {
+        self.fetch_instrument_for(&self.binding).await
+    }
+
+    /// Reads one registered symbol through this account transport's fixed LIVE client.  The
+    /// caller retains the canonical-symbol catalog; this transport only proves the account and
+    /// production-endpoint scope match its anchor binding.
+    pub async fn fetch_instrument_for(
+        &self,
+        binding: &GatewayBinding,
+    ) -> Result<Vec<u8>, BitgetTransportError> {
+        self.validate_account_scope(binding)?;
+        let native = crate::public::native_symbol(&binding.symbol)
+            .map_err(|_| BitgetTransportError::Binding)?;
+        self.send_public(
+            endpoints::INSTRUMENTS,
+            &format!("category={BITGET_UTA_FUTURES_CATEGORY}&symbol={native}"),
+        )
+        .await
+    }
+
+    /// Reads the anchor symbol-scoped UTA ticker through this transport's fixed LIVE origin.
+    pub async fn fetch_selected_ticker(
+        &self,
+    ) -> Result<BitgetPublicHttpResponse, BitgetTransportError> {
+        self.fetch_ticker_for(&self.binding).await
+    }
+
+    /// Reads one registered symbol-scoped ticker with the same bounded client and LIVE origin.
+    pub async fn fetch_ticker_for(
+        &self,
+        binding: &GatewayBinding,
+    ) -> Result<BitgetPublicHttpResponse, BitgetTransportError> {
+        self.validate_account_scope(binding)?;
+        let path = crate::public::rest_ticker_path(&binding.symbol)
+            .map_err(|_| BitgetTransportError::Binding)?;
+        let requested_at_ms = unix_ms()?;
+        let url = format!("{}{}", self.endpoint, path);
+        let payload = self.send_bounded(self.client.get(url)).await?;
+        let received_at_ms = unix_ms()?.max(requested_at_ms);
+        Ok(BitgetPublicHttpResponse {
+            requested_at_ms,
+            received_at_ms,
+            payload,
+        })
     }
 
     pub async fn execute_private_read(
@@ -351,28 +478,50 @@ impl BitgetHttpTransport {
         requested_fill_start_ms: Option<u64>,
         server_now_ms: u64,
     ) -> Result<BitgetPrivateGenerationCandidate, BitgetTransportError> {
-        self.validate_scope(&self.binding, generation)?;
+        self.collect_private_turn_for(
+            credentials,
+            &self.binding,
+            attempt_id,
+            generation,
+            requested_fill_start_ms,
+            server_now_ms,
+        )
+        .await
+    }
+
+    /// Collects the existing five signed private surfaces for one registered symbol while
+    /// retaining this account's single HTTP client and mutation fence.
+    pub(crate) async fn collect_private_turn_for(
+        &self,
+        credentials: &BitgetCredentials,
+        binding: &GatewayBinding,
+        attempt_id: u64,
+        generation: u64,
+        requested_fill_start_ms: Option<u64>,
+        server_now_ms: u64,
+    ) -> Result<BitgetPrivateGenerationCandidate, BitgetTransportError> {
+        self.validate_scope(binding, generation)?;
         if attempt_id == 0 || server_now_ms == 0 {
             return Err(BitgetTransportError::Binding);
         }
         let account = self
             .execute_private_read(
                 credentials,
-                &build_account_read_request(&self.binding, attempt_id, generation),
+                &build_account_read_request(binding, attempt_id, generation),
                 unix_ms()?,
             )
             .await?;
         let settings = self
             .execute_private_read(
                 credentials,
-                &build_settings_read_request(&self.binding, attempt_id, generation),
+                &build_settings_read_request(binding, attempt_id, generation),
                 unix_ms()?,
             )
             .await?;
         let positions = self
             .execute_private_read(
                 credentials,
-                &build_positions_read_request(&self.binding, attempt_id, generation)?,
+                &build_positions_read_request(binding, attempt_id, generation)?,
                 unix_ms()?,
             )
             .await?;
@@ -382,7 +531,7 @@ impl BitgetHttpTransport {
         for page_index in 0..BITGET_MAX_PRIVATE_PAGES {
             let page_index = u32::try_from(page_index).map_err(|_| BitgetTransportError::Pages)?;
             let request = build_regular_orders_read_request(
-                &self.binding,
+                binding,
                 attempt_id,
                 generation,
                 page_index,
@@ -411,7 +560,7 @@ impl BitgetHttpTransport {
         for page_index in 0..BITGET_MAX_PRIVATE_PAGES {
             let page_index = u32::try_from(page_index).map_err(|_| BitgetTransportError::Pages)?;
             let request = build_fills_read_request(
-                &self.binding,
+                binding,
                 attempt_id,
                 generation,
                 page_index,
@@ -794,7 +943,17 @@ impl BitgetHttpTransport {
         binding: &GatewayBinding,
         generation: u64,
     ) -> Result<(), BitgetTransportError> {
-        if binding != &self.binding || generation != self.generation {
+        if generation != self.generation {
+            return Err(BitgetTransportError::Binding);
+        }
+        self.validate_account_scope(binding)
+    }
+
+    fn validate_account_scope(&self, binding: &GatewayBinding) -> Result<(), BitgetTransportError> {
+        if binding.venue != self.binding.venue
+            || binding.mode != self.binding.mode
+            || binding.trading_account_id != self.binding.trading_account_id
+        {
             return Err(BitgetTransportError::Binding);
         }
         validate_binding(binding, &self.config)
@@ -855,6 +1014,44 @@ impl BitgetHttpTransport {
             );
         }
         let mut response = builder.send().await.map_err(map_reqwest)?;
+        if !response.status().is_success() {
+            return Err(BitgetTransportError::HttpStatus);
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > self.limits.maximum_body_bytes as u64)
+        {
+            return Err(BitgetTransportError::BodyTooLarge);
+        }
+        let mut bytes = BytesMut::new();
+        while let Some(chunk) = response.chunk().await.map_err(map_reqwest)? {
+            let length = bytes
+                .len()
+                .checked_add(chunk.len())
+                .ok_or(BitgetTransportError::BodyTooLarge)?;
+            if length > self.limits.maximum_body_bytes {
+                return Err(BitgetTransportError::BodyTooLarge);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes.to_vec())
+    }
+
+    async fn send_public(&self, path: &str, query: &str) -> Result<Vec<u8>, BitgetTransportError> {
+        let url = format!("{}{}?{query}", self.endpoint, path);
+        self.send_bounded(self.client.get(url)).await
+    }
+
+    /// The sole bounded credential-free GET path.  Public normalization deliberately shares the
+    /// production client, redirect policy, timeout and body ceiling with instrument acquisition.
+    async fn send_bounded(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<Vec<u8>, BitgetTransportError> {
+        let mut response = tokio::time::timeout(self.limits.operation_timeout, request.send())
+            .await
+            .map_err(|_| BitgetTransportError::Timeout)?
+            .map_err(map_reqwest)?;
         if !response.status().is_success() {
             return Err(BitgetTransportError::HttpStatus);
         }
@@ -994,6 +1191,47 @@ mod tests {
 
     fn limits(timeout_ms: u64) -> Result<BitgetTransportLimits, BitgetTransportError> {
         BitgetTransportLimits::new(Duration::from_millis(timeout_ms), 64 * 1024)
+    }
+
+    #[tokio::test]
+    async fn selected_ticker_uses_the_exact_symbol_scoped_uta_route()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut buffer = vec![0_u8; 4096];
+            let length = socket.read(&mut buffer).await?;
+            let request = String::from_utf8_lossy(&buffer[..length]);
+            assert!(request.starts_with(
+                "GET /api/v3/market/tickers?category=USDT-FUTURES&symbol=BTCUSDT HTTP/1.1"
+            ));
+            let body = r#"{"code":"00000","data":[]}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            Ok::<_, std::io::Error>(())
+        });
+        let transport = BitgetHttpTransport::with_endpoint(
+            binding(GatewayMode::Live)?,
+            7,
+            BitgetConfig::for_mode(GatewayMode::Live),
+            endpoint,
+            limits(500)?,
+        )?;
+        let response = transport.fetch_selected_ticker().await?;
+        assert!(response.requested_at_ms > 0);
+        assert!(response.received_at_ms >= response.requested_at_ms);
+        assert_eq!(response.payload, br#"{"code":"00000","data":[]}"#);
+        server.await??;
+        Ok(())
     }
 
     #[tokio::test]

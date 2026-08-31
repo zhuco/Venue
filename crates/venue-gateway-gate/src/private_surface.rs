@@ -484,8 +484,8 @@ fn validate_rules(
     rules: &GateContractRules,
     generation: u64,
 ) -> Result<(), GatePrivateReadError> {
-    if generation == 0
-        || binding.gateway_binding().symbol != rules.instrument.symbol
+    if binding.gateway_binding().validate().is_err()
+        || generation == 0
         || generation != rules.instrument.generation
         || rules.native_symbol.trim().is_empty()
         || rules.instrument.validate().is_err()

@@ -137,10 +137,10 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
                 ));
                 ui.separator();
                 for (key, value) in [
-                    (TextKey::Equity, account.map(|a| a.equity)),
+                    (TextKey::Equity, account.and_then(|a| a.equity)),
                     (
                         TextKey::AvailableMargin,
-                        account.map(|a| a.available_margin),
+                        account.and_then(|a| a.available_margin),
                     ),
                 ] {
                     let amount =
@@ -189,9 +189,10 @@ mod tests {
                 mode: venue_control_protocol::GatewayMode::Live,
                 trading_account_id: "binance-account-1".into(),
                 health: HealthState::Healthy,
-                equity: rust_decimal::Decimal::new(123456, 2),
-                available_margin: rust_decimal::Decimal::new(3456, 2),
-                unrealized_pnl: rust_decimal::Decimal::ZERO,
+                equity: Some(rust_decimal::Decimal::new(123456, 2)),
+                available_margin: Some(rust_decimal::Decimal::new(3456, 2)),
+                unrealized_pnl: Some(rust_decimal::Decimal::ZERO),
+                balances: vec![],
                 private_generation: 1,
                 writer_generation: 1,
                 last_reconciled_ms: 49_000,
@@ -209,7 +210,7 @@ mod tests {
         assert!(selected_account(Some(&snapshot), None).is_none());
         assert!(selected_account(Some(&snapshot), Some("other-account")).is_none());
         assert_eq!(
-            selected_account(Some(&snapshot), Some("binance-account-1")).map(|a| a.equity),
+            selected_account(Some(&snapshot), Some("binance-account-1")).and_then(|a| a.equity),
             Some(rust_decimal::Decimal::new(123456, 2))
         );
         snapshot.accounts[0].venue = venue_control_protocol::VenueId::Okx;

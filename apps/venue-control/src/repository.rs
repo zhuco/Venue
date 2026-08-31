@@ -2,7 +2,8 @@ use std::future::Future;
 
 use thiserror::Error;
 use venue_control_protocol::{
-    CommandReceipt, ControlCommandRequest, ControlSnapshot, GatewayMode, VenueId,
+    CommandReceipt, ControlCommandRequest, ControlSnapshot, ExecutionFactsSnapshot, GatewayMode,
+    NodeProjectionEnvelope, UiAccountScope, VenueId,
 };
 
 use crate::{AccountNodeBinding, ClaimedCommand, ScopedCommandReceipt, StoredEvent};
@@ -41,6 +42,8 @@ pub enum RepositoryError {
     StaleScope,
     #[error("command delivery or receipt does not match durable custody")]
     DeliveryConflict,
+    #[error("control repository does not provide this projection")]
+    Unsupported,
 }
 
 pub trait ControlRepository: Send + Sync {
@@ -52,6 +55,26 @@ pub trait ControlRepository: Send + Sync {
         &self,
         snapshot: &ControlSnapshot,
     ) -> impl Future<Output = Result<SnapshotStoreResult, RepositoryError>> + Send;
+
+    fn load_execution_facts(
+        &self,
+    ) -> impl Future<Output = Result<Option<ExecutionFactsSnapshot>, RepositoryError>> + Send {
+        async { Ok(None) }
+    }
+
+    fn store_execution_facts(
+        &self,
+        _facts: &ExecutionFactsSnapshot,
+    ) -> impl Future<Output = Result<SnapshotStoreResult, RepositoryError>> + Send {
+        async { Err(RepositoryError::Unsupported) }
+    }
+
+    fn merge_node_projection(
+        &self,
+        _projection: &NodeProjectionEnvelope,
+    ) -> impl Future<Output = Result<SnapshotStoreResult, RepositoryError>> + Send {
+        async { Err(RepositoryError::Unsupported) }
+    }
 
     fn enqueue_command(
         &self,
@@ -74,6 +97,7 @@ pub trait ControlRepository: Send + Sync {
 
     fn list_events(
         &self,
+        scope: &UiAccountScope,
         after_sequence: i64,
         limit: u32,
     ) -> impl Future<Output = Result<Vec<StoredEvent>, RepositoryError>> + Send;

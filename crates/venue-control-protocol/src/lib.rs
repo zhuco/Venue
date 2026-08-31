@@ -3,16 +3,17 @@
 //!
 //! These types are query projections and semantic control requests. They never grant physical
 //! mutation authority; an account node must independently validate every accepted request.
-
-use std::collections::BTreeSet;
-
 pub mod accounts;
-
+mod trade;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use venue_domain::Symbol;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+pub use trade::{TradeIntent, TradingAction, TradingOrderType, TradingTimeInForce};
+use venue_domain::{Asset, Symbol};
 pub use venue_gateway_api::{GatewayMode, VenueId};
-
+mod ui_event;
+pub use ui_event::{UiAccountScope, UiEventEnvelope, UiEventKind, UiEventNotification};
 fn deserialize_live_mode<'de, D>(deserializer: D) -> Result<GatewayMode, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -24,7 +25,6 @@ where
         Err(serde::de::Error::custom("mode must be exactly LIVE"))
     }
 }
-
 pub const CONTROL_SCHEMA_VERSION: u16 = 2;
 pub const SNAPSHOT_PATH: &str = "/v2/ui/snapshot";
 pub const EVENT_STREAM_PATH: &str = "/v2/ui/events";
@@ -35,7 +35,12 @@ pub const ACCOUNT_DELIVERY_SCHEMA_VERSION: u16 = 2;
 pub const ACCOUNT_DELIVERY_CLAIM_PATH: &str = "/v2/account-node/deliveries/claim";
 pub const ACCOUNT_DELIVERY_ACK_PATH: &str = "/v2/account-node/deliveries/ack";
 pub const ACCOUNT_DELIVERY_RECEIPT_PATH: &str = "/v2/account-node/deliveries/receipts";
-
+/// Node-to-Control read-model upload. This is exact loopback transport only and conveys no
+/// writer lease, capability, WAL authority, or dispatch permit.
+pub const ACCOUNT_NODE_PROJECTION_PATH: &str = "/v2/account-node/projection";
+pub const COPY_RELATION_PATH: &str = "/v2/copy/relations";
+pub const COPY_RELATION_CANDIDATES_PATH: &str = "/v2/copy/relation-candidates";
+pub const EXECUTION_FACTS_PATH: &str = "/v2/ui/execution-facts";
 /// Exact account-node scope for durable semantic delivery. It is deliberately unrelated to a
 /// gateway capability, writer generation, WAL position, or physical dispatch permit.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -48,7 +53,6 @@ pub struct AccountDeliveryBinding {
     pub instance_id: String,
     pub config_epoch: u64,
 }
-
 impl AccountDeliveryBinding {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.mode != GatewayMode::Live {
@@ -66,14 +70,12 @@ impl AccountDeliveryBinding {
         Ok(())
     }
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountDeliveryKind {
     ControlCommand,
     CopySemanticJob,
 }
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CopySemanticJobDelivery {
     pub job_id: String,
@@ -84,7 +86,6 @@ pub struct CopySemanticJobDelivery {
     pub created_at_ms: u64,
     pub expires_at_ms: u64,
 }
-
 impl CopySemanticJobDelivery {
     fn validate(&self) -> Result<(), ProtocolError> {
         if self.job_id.trim().is_empty() || self.job_digest == [0; 32] {
@@ -99,14 +100,12 @@ impl CopySemanticJobDelivery {
         Ok(())
     }
 }
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum AccountDeliveryPayload {
     ControlCommand(ControlCommandRequest),
     CopySemanticJob(CopySemanticJobDelivery),
 }
-
 impl AccountDeliveryPayload {
     #[must_use]
     pub const fn kind(&self) -> AccountDeliveryKind {
@@ -115,7 +114,6 @@ impl AccountDeliveryPayload {
             Self::CopySemanticJob(_) => AccountDeliveryKind::CopySemanticJob,
         }
     }
-
     fn validate_against(&self, binding: &AccountDeliveryBinding) -> Result<(), ProtocolError> {
         match self {
             Self::ControlCommand(command) => {
@@ -142,7 +140,6 @@ impl AccountDeliveryPayload {
         }
         Ok(())
     }
-
     /// Revalidates a decoded database payload against the exact durable account binding.
     pub fn validate_for_account_delivery(
         &self,
@@ -152,14 +149,12 @@ impl AccountDeliveryPayload {
         self.validate_against(binding)
     }
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountDeliveryPurpose {
     Install,
     ReconcileOnly,
 }
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AccountDeliveryClaimRequest {
     pub schema_version: u16,
@@ -168,7 +163,6 @@ pub struct AccountDeliveryClaimRequest {
     pub lease_duration_ms: u64,
     pub limit: u32,
 }
-
 impl AccountDeliveryClaimRequest {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.schema_version != ACCOUNT_DELIVERY_SCHEMA_VERSION {
@@ -184,7 +178,6 @@ impl AccountDeliveryClaimRequest {
         Ok(())
     }
 }
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AccountDeliveryLease {
     pub schema_version: u16,
@@ -196,7 +189,6 @@ pub struct AccountDeliveryLease {
     pub expires_at_ms: u64,
     pub purpose: AccountDeliveryPurpose,
 }
-
 impl AccountDeliveryLease {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.schema_version != ACCOUNT_DELIVERY_SCHEMA_VERSION {
@@ -214,32 +206,27 @@ impl AccountDeliveryLease {
         }
         Ok(())
     }
-
     #[must_use]
     pub const fn grants_mutation_authority(&self) -> bool {
         false
     }
 }
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AccountDeliveryClaim {
     pub lease: AccountDeliveryLease,
     pub payload: AccountDeliveryPayload,
 }
-
 impl AccountDeliveryClaim {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.lease.validate()?;
         self.payload.validate_against(&self.lease.binding)?;
         Ok(())
     }
-
     #[must_use]
     pub const fn grants_mutation_authority(&self) -> bool {
         false
     }
 }
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AccountDeliveryAck {
     pub schema_version: u16,
@@ -247,7 +234,6 @@ pub struct AccountDeliveryAck {
     pub acknowledged_ms: u64,
     pub durable_inbox_digest: [u8; 32],
 }
-
 impl AccountDeliveryAck {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.schema_version != ACCOUNT_DELIVERY_SCHEMA_VERSION {
@@ -262,13 +248,11 @@ impl AccountDeliveryAck {
         }
         Ok(())
     }
-
     #[must_use]
     pub const fn grants_mutation_authority(&self) -> bool {
         false
     }
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountDeliveryReceiptState {
@@ -277,7 +261,6 @@ pub enum AccountDeliveryReceiptState {
     Unknown,
     Reconciled,
 }
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AccountDeliveryReceipt {
     pub schema_version: u16,
@@ -288,7 +271,6 @@ pub struct AccountDeliveryReceipt {
     pub account_fact_digest: [u8; 32],
     pub detail: String,
 }
-
 impl AccountDeliveryReceipt {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.schema_version != ACCOUNT_DELIVERY_SCHEMA_VERSION {
@@ -318,13 +300,11 @@ impl AccountDeliveryReceipt {
         }
         Ok(())
     }
-
     #[must_use]
     pub const fn grants_mutation_authority(&self) -> bool {
         false
     }
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionState {
@@ -333,7 +313,6 @@ pub enum ConnectionState {
     Degraded,
     Offline,
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthState {
@@ -343,7 +322,6 @@ pub enum HealthState {
     Stopped,
     Unknown,
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StrategyKind {
@@ -351,7 +329,6 @@ pub enum StrategyKind {
     Scalping,
     Copy,
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StrategyLifecycle {
@@ -363,6 +340,12 @@ pub enum StrategyLifecycle {
     Stopped,
     NeedsAttention,
 }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AccountBalanceSummary {
+    pub asset: Asset,
+    pub equity: Decimal,
+    pub available_margin: Option<Decimal>,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AccountSummary {
@@ -371,14 +354,17 @@ pub struct AccountSummary {
     pub mode: GatewayMode,
     pub trading_account_id: String,
     pub health: HealthState,
-    pub equity: Decimal,
-    pub available_margin: Decimal,
-    pub unrealized_pnl: Decimal,
+    /// No scalar aggregate is emitted across assets. `None` means the source supplied balances
+    /// in more than one currency or omitted an account-wide value.
+    pub equity: Option<Decimal>,
+    pub available_margin: Option<Decimal>,
+    pub unrealized_pnl: Option<Decimal>,
+    #[serde(default)]
+    pub balances: Vec<AccountBalanceSummary>,
     pub private_generation: u64,
     pub writer_generation: u64,
     pub last_reconciled_ms: u64,
 }
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StrategySummary {
     pub instance_id: String,
@@ -393,12 +379,12 @@ pub struct StrategySummary {
     pub open_orders: u32,
     pub long_quantity: Decimal,
     pub short_quantity: Decimal,
-    pub realized_pnl: Decimal,
-    pub unrealized_pnl: Decimal,
+    /// Strategy-level PnL is omitted until an adapter supplies a signed value.
+    pub realized_pnl: Option<Decimal>,
+    pub unrealized_pnl: Option<Decimal>,
     pub last_receipt_ms: u64,
     pub attention: Option<String>,
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CopyStatus {
@@ -408,9 +394,10 @@ pub enum CopyStatus {
     Paused,
     NeedsAttention,
 }
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CopyRelationSummary {
+    pub relation_id: String,
+    pub revision: u64,
     pub leader_id: String,
     pub follower_instance_id: String,
     pub symbol: Symbol,
@@ -420,7 +407,205 @@ pub struct CopyRelationSummary {
     pub status: CopyStatus,
     pub last_applied_job: Option<String>,
 }
-
+/// Exact LIVE identity of one endpoint in a Copy relation. This remains a control-plane
+/// declaration; it never represents an account writer, credential, or dispatch authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CopyRelationBinding {
+    pub venue: VenueId,
+    #[serde(deserialize_with = "deserialize_live_mode")]
+    pub mode: GatewayMode,
+    pub trading_account_id: String,
+    pub instance_id: String,
+    pub symbol: Symbol,
+}
+impl CopyRelationBinding {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.mode != GatewayMode::Live {
+            return Err(ProtocolError::Mode);
+        }
+        if !venue_domain::is_canonical_trading_account_id(&self.trading_account_id) {
+            return Err(ProtocolError::AccountId);
+        }
+        if self.instance_id.trim().is_empty() {
+            return Err(ProtocolError::StrategyIdentity);
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CopyRiskPolicy {
+    pub max_total_notional: Decimal,
+    pub max_order_notional: Decimal,
+    pub max_leverage: Decimal,
+}
+impl CopyRiskPolicy {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if !positive(self.max_total_notional)
+            || !positive(self.max_order_notional)
+            || self.max_order_notional > self.max_total_notional
+            || !positive(self.max_leverage)
+        {
+            return Err(ProtocolError::CopyRelationPolicy);
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyLifecyclePolicy {
+    Active,
+    Paused,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CopyRelationConfig {
+    pub relation_id: String,
+    pub leader: CopyRelationBinding,
+    pub follower: CopyRelationBinding,
+    pub allocated_capital: Decimal,
+    pub multiplier: Decimal,
+    pub safety_reserve_rate: Decimal,
+    pub risk: CopyRiskPolicy,
+    pub lifecycle: CopyLifecyclePolicy,
+}
+impl CopyRelationConfig {
+    /// Stable commitment carried by every Copy snapshot and child job.  It deliberately covers
+    /// both endpoints and every policy input, so a row revision alone cannot be replayed under a
+    /// changed risk policy.
+    #[must_use]
+    pub fn policy_digest(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        let leader_symbol = self.leader.symbol.to_string();
+        let follower_symbol = self.follower.symbol.to_string();
+        let allocated_capital = self.allocated_capital.to_string();
+        let multiplier = self.multiplier.to_string();
+        let safety_reserve_rate = self.safety_reserve_rate.to_string();
+        let max_total_notional = self.risk.max_total_notional.to_string();
+        let max_order_notional = self.risk.max_order_notional.to_string();
+        let max_leverage = self.risk.max_leverage.to_string();
+        for value in [
+            self.relation_id.as_str(),
+            self.leader.venue.as_str(),
+            self.leader.trading_account_id.as_str(),
+            self.leader.instance_id.as_str(),
+            &leader_symbol,
+            self.follower.venue.as_str(),
+            self.follower.trading_account_id.as_str(),
+            self.follower.instance_id.as_str(),
+            &follower_symbol,
+            &allocated_capital,
+            &multiplier,
+            &safety_reserve_rate,
+            &max_total_notional,
+            &max_order_notional,
+            &max_leverage,
+            match self.lifecycle {
+                CopyLifecyclePolicy::Active => "active",
+                CopyLifecyclePolicy::Paused => "paused",
+            },
+        ] {
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        digest.finalize().into()
+    }
+}
+/// Versioned query projection for one durable Copy relation configuration.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CopyRelationRecord {
+    pub relation: CopyRelationConfig,
+    pub revision: u64,
+}
+/// A server-derived, credential-free endpoint that may be selected in a Copy relation form.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CopyRelationCandidate {
+    pub binding: CopyRelationBinding,
+    pub lifecycle: StrategyLifecycle,
+    pub config_epoch: u64,
+}
+impl CopyRelationCandidate {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        self.binding.validate()?;
+        if self.config_epoch == 0 {
+            return Err(ProtocolError::CopyRelationRevision);
+        }
+        Ok(())
+    }
+}
+impl CopyRelationRecord {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        self.relation.validate()?;
+        if self.revision == 0 {
+            return Err(ProtocolError::CopyRelationRevision);
+        }
+        Ok(())
+    }
+}
+impl CopyRelationConfig {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if !is_uuid(&self.relation_id) {
+            return Err(ProtocolError::CopyRelationIdentity);
+        }
+        self.leader.validate()?;
+        self.follower.validate()?;
+        if self.leader == self.follower
+            || !positive(self.allocated_capital)
+            || !positive(self.multiplier)
+            || self.safety_reserve_rate.is_sign_negative()
+            || self.safety_reserve_rate >= Decimal::ONE
+        {
+            return Err(ProtocolError::CopyRelationPolicy);
+        }
+        self.risk.validate()
+    }
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CopyRelationUpsertRequest {
+    pub schema_version: u16,
+    /// Client-generated UUID that is held stable until the relation mutation has a terminal receipt.
+    pub request_id: String,
+    pub relation: CopyRelationConfig,
+    /// `0` creates a relation. A positive revision is required for every edit to make retries and
+    /// concurrent operators fail closed instead of silently overwriting risk policy.
+    pub expected_revision: Option<u64>,
+}
+impl CopyRelationUpsertRequest {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.schema_version != CONTROL_SCHEMA_VERSION {
+            return Err(ProtocolError::SchemaVersion);
+        }
+        self.relation.validate()?;
+        if !is_uuid(&self.request_id) {
+            return Err(ProtocolError::CopyRelationIdentity);
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyRelationReceiptState {
+    Created,
+    Updated,
+    Existing,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CopyRelationReceipt {
+    pub schema_version: u16,
+    pub relation_id: String,
+    pub revision: u64,
+    pub state: CopyRelationReceiptState,
+    pub observed_ms: u64,
+}
+impl CopyRelationReceipt {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.schema_version != CONTROL_SCHEMA_VERSION {
+            return Err(ProtocolError::SchemaVersion);
+        }
+        if !is_uuid(&self.relation_id) || self.revision == 0 || self.observed_ms == 0 {
+            return Err(ProtocolError::CopyRelationIdentity);
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UiBar {
     pub open_time_ms: u64,
@@ -430,13 +615,11 @@ pub struct UiBar {
     pub close: Decimal,
     pub volume: Decimal,
 }
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UiBookLevel {
     pub price: Decimal,
     pub quantity: Decimal,
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AggressorSide {
@@ -444,7 +627,6 @@ pub enum AggressorSide {
     Sell,
     Unknown,
 }
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UiTrade {
     pub trade_id: String,
@@ -453,7 +635,6 @@ pub struct UiTrade {
     pub quantity: Decimal,
     pub aggressor: AggressorSide,
 }
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IndicatorValue {
     pub name: String,
@@ -461,7 +642,6 @@ pub struct IndicatorValue {
     pub observed_ms: u64,
     pub source_version: String,
 }
-
 /// One exact LIVE account/symbol scope for a read-only derived market projection. This scope is
 /// intentionally not an execution identity and carries no writer, WAL, credential, or permit.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -472,7 +652,6 @@ pub struct IndicatorBinding {
     pub trading_account_id: String,
     pub symbol: Symbol,
 }
-
 impl IndicatorBinding {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.mode != GatewayMode::Live {
@@ -483,13 +662,11 @@ impl IndicatorBinding {
         }
         Ok(())
     }
-
     #[must_use]
     pub const fn grants_mutation_authority(&self) -> bool {
         false
     }
 }
-
 /// The public-evidence cursor for one input family. `age_ms` is not caller interpretation: it
 /// must exactly equal the containing frame observation time minus this event time.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -501,7 +678,6 @@ pub struct IndicatorProvenance {
     pub age_ms: u64,
     pub feature_version: String,
 }
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IndicatorFeatureValues {
     pub mid_price: Decimal,
@@ -516,7 +692,6 @@ pub struct IndicatorFeatureValues {
     pub expected_move_bps: Decimal,
     pub toxicity: Decimal,
 }
-
 /// A fully-ready, bounded-age FeatureFrame rendered as a secret-free Control projection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IndicatorFrameProjection {
@@ -529,7 +704,6 @@ pub struct IndicatorFrameProjection {
     pub provenance: Vec<IndicatorProvenance>,
     pub values: IndicatorFeatureValues,
 }
-
 impl IndicatorFrameProjection {
     pub fn validate_at(&self, snapshot_generated_ms: u64) -> Result<(), ProtocolError> {
         self.binding.validate()?;
@@ -584,20 +758,17 @@ impl IndicatorFrameProjection {
         }
         Ok(())
     }
-
     #[must_use]
     pub const fn grants_mutation_authority(&self) -> bool {
         false
     }
 }
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IndicatorSnapshot {
     pub schema_version: u16,
     pub generated_ms: u64,
     pub frames: Vec<IndicatorFrameProjection>,
 }
-
 impl IndicatorSnapshot {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.schema_version != CONTROL_SCHEMA_VERSION || self.generated_ms == 0 {
@@ -618,13 +789,11 @@ impl IndicatorSnapshot {
         }
         Ok(())
     }
-
     #[must_use]
     pub const fn grants_mutation_authority(&self) -> bool {
         false
     }
 }
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MarketSummary {
     pub symbol: Symbol,
@@ -639,7 +808,6 @@ pub struct MarketSummary {
     /// Values are computed by Venue indicators and merely rendered by the UI.
     pub indicators: Vec<IndicatorValue>,
 }
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LedgerEntry {
     pub receipt_id: String,
@@ -649,6 +817,19 @@ pub struct LedgerEntry {
     pub state: String,
     pub detail: String,
 }
+mod copy_planning;
+mod execution_facts;
+mod node_projection;
+pub use copy_planning::{
+    CopyPlanningFact, CopyPlanningFactRole, MAX_COPY_PLANNING_FACT_TTL_MS, MAX_COPY_PLANNING_FACTS,
+};
+pub use execution_facts::{
+    AccountHealthFact, AccountRiskFact, CopyDriftFact, CopyExecutionEvidence,
+    CopyExecutionEvidenceEncoding, CopyExecutionFact, CopyExecutionPhaseProjection,
+    CopyExecutionStateProjection, CopyLedgerFact, ExecutionFactBinding, ExecutionFactsSnapshot,
+    ReconciliationFact, SignedFillFact, SignedOrderFact, SignedPositionFact,
+};
+pub use node_projection::NodeProjectionEnvelope;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ControlSnapshot {
@@ -661,7 +842,6 @@ pub struct ControlSnapshot {
     pub markets: Vec<MarketSummary>,
     pub ledger: Vec<LedgerEntry>,
 }
-
 impl ControlSnapshot {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.schema_version != CONTROL_SCHEMA_VERSION {
@@ -682,6 +862,14 @@ impl ControlSnapshot {
                 || (account.last_reconciled_ms != 0 && account.private_generation == 0)
             {
                 return Err(ProtocolError::SnapshotTime);
+            }
+            let mut assets = BTreeSet::new();
+            if account
+                .balances
+                .iter()
+                .any(|balance| !assets.insert(balance.asset.as_str()))
+            {
+                return Err(ProtocolError::DuplicateIdentity);
             }
             if !account_identities.insert((
                 account.venue,
@@ -736,14 +924,15 @@ impl ControlSnapshot {
         Ok(())
     }
 }
-
 fn validate_copy_relations(
     relations: &[CopyRelationSummary],
     strategy_identities: &BTreeSet<&str>,
 ) -> Result<(), ProtocolError> {
     let mut identities = BTreeSet::new();
     for relation in relations {
-        if relation.leader_id.trim().is_empty()
+        if !is_uuid(&relation.relation_id)
+            || relation.revision == 0
+            || relation.leader_id.trim().is_empty()
             || relation.follower_instance_id.trim().is_empty()
             || relation.leader_id == relation.follower_instance_id
             || !strategy_identities.contains(relation.follower_instance_id.as_str())
@@ -755,6 +944,7 @@ fn validate_copy_relations(
             return Err(ProtocolError::SnapshotContent);
         }
         if !identities.insert((
+            relation.relation_id.as_str(),
             relation.leader_id.as_str(),
             relation.follower_instance_id.as_str(),
             &relation.symbol,
@@ -764,7 +954,17 @@ fn validate_copy_relations(
     }
     Ok(())
 }
-
+fn is_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && [8, 13, 18, 23]
+            .into_iter()
+            .all(|index| bytes[index] == b'-')
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
+}
 fn validate_markets(markets: &[MarketSummary], generated_ms: u64) -> Result<(), ProtocolError> {
     let mut market_identities = BTreeSet::new();
     for market in markets {
@@ -786,7 +986,6 @@ fn validate_markets(markets: &[MarketSummary], generated_ms: u64) -> Result<(), 
     }
     Ok(())
 }
-
 fn validate_bars(bars: &[UiBar], generated_ms: u64) -> Result<(), ProtocolError> {
     let mut previous_open_time = None;
     for bar in bars {
@@ -811,7 +1010,6 @@ fn validate_bars(bars: &[UiBar], generated_ms: u64) -> Result<(), ProtocolError>
     }
     Ok(())
 }
-
 fn validate_book(levels: &[UiBookLevel]) -> Result<(), ProtocolError> {
     let mut prices = BTreeSet::new();
     for level in levels {
@@ -824,7 +1022,6 @@ fn validate_book(levels: &[UiBookLevel]) -> Result<(), ProtocolError> {
     }
     Ok(())
 }
-
 fn validate_trades(trades: &[UiTrade], generated_ms: u64) -> Result<(), ProtocolError> {
     let mut identities = BTreeSet::new();
     for trade in trades {
@@ -843,7 +1040,6 @@ fn validate_trades(trades: &[UiTrade], generated_ms: u64) -> Result<(), Protocol
     }
     Ok(())
 }
-
 fn validate_indicators(
     indicators: &[IndicatorValue],
     generated_ms: u64,
@@ -862,7 +1058,6 @@ fn validate_indicators(
     }
     Ok(())
 }
-
 fn validate_ledger(ledger: &[LedgerEntry], generated_ms: u64) -> Result<(), ProtocolError> {
     let mut receipt_identities = BTreeSet::new();
     for entry in ledger {
@@ -882,11 +1077,9 @@ fn validate_ledger(ledger: &[LedgerEntry], generated_ms: u64) -> Result<(), Prot
     }
     Ok(())
 }
-
 fn positive(value: Decimal) -> bool {
     value.is_sign_positive() && !value.is_zero()
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlAction {
@@ -896,7 +1089,6 @@ pub enum ControlAction {
     Flatten,
     Trade,
 }
-
 impl ControlAction {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -908,13 +1100,11 @@ impl ControlAction {
             Self::Trade => "TRADE",
         }
     }
-
     #[must_use]
     pub const fn requires_confirmation(self) -> bool {
         matches!(self, Self::Stop | Self::Flatten)
     }
 }
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ControlCommandRequest {
     pub schema_version: u16,
@@ -931,7 +1121,6 @@ pub struct ControlCommandRequest {
     pub expected_config_epoch: u64,
     pub confirmation: Option<String>,
 }
-
 impl ControlCommandRequest {
     #[must_use]
     pub fn expected_confirmation(&self) -> String {
@@ -947,7 +1136,6 @@ impl ControlCommandRequest {
             self.expected_config_epoch,
         )
     }
-
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.schema_version != CONTROL_SCHEMA_VERSION {
             return Err(ProtocolError::SchemaVersion);
@@ -984,7 +1172,6 @@ impl ControlCommandRequest {
         Ok(())
     }
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandState {
@@ -993,7 +1180,6 @@ pub enum CommandState {
     Rejected,
     Unknown,
 }
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommandReceipt {
     pub schema_version: u16,
@@ -1003,7 +1189,6 @@ pub struct CommandReceipt {
     pub observed_ms: u64,
     pub detail: String,
 }
-
 impl CommandReceipt {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.schema_version != CONTROL_SCHEMA_VERSION {
@@ -1024,141 +1209,6 @@ impl CommandReceipt {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
-pub enum ControlEvent {
-    Snapshot(ControlSnapshot),
-    CommandReceipt(CommandReceipt),
-    Notice { observed_ms: u64, message: String },
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TradingAction {
-    OpenLong,
-    CloseLong,
-    CloseShort,
-    OpenShort,
-    CancelSelectedOrder,
-    CancelAllOrders,
-    SelectSizePreset(usize),
-    ClearSelection,
-    CenterMarket,
-}
-
-impl TradingAction {
-    #[must_use]
-    pub const fn is_order_action(self) -> bool {
-        matches!(
-            self,
-            Self::OpenLong | Self::CloseLong | Self::CloseShort | Self::OpenShort
-        )
-    }
-
-    #[must_use]
-    pub const fn is_close_action(self) -> bool {
-        matches!(self, Self::CloseLong | Self::CloseShort)
-    }
-
-    #[must_use]
-    pub const fn is_ui_only(self) -> bool {
-        matches!(
-            self,
-            Self::SelectSizePreset(_) | Self::ClearSelection | Self::CenterMarket
-        )
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TradingOrderType {
-    Limit,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TradingTimeInForce {
-    Gtc,
-}
-
-/// Secret-free semantic manual-trading request. The account Node must re-read positions and
-/// working orders, normalize quantity through its exchange adapter, run risk, and append the
-/// resulting command to the account WAL before any mutation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TradeIntent {
-    pub action: TradingAction,
-    pub quote_asset: String,
-    pub order_type: TradingOrderType,
-    pub time_in_force: TradingTimeInForce,
-    pub post_only: bool,
-    pub reduce_only: bool,
-    pub selected_price: Option<Decimal>,
-    pub quote_notional: Option<Decimal>,
-    /// UI-observed upper bound for a close. It never replaces the Node's signed position clamp.
-    pub close_quantity_cap: Option<Decimal>,
-    /// Optional explicit selection. `None` means the Node must select the most recent Working
-    /// order within the enclosing account + symbol scope.
-    pub selected_order_id: Option<String>,
-}
-
-impl TradeIntent {
-    pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.action.is_ui_only()
-            || self.quote_asset.trim().is_empty()
-            || self.order_type != TradingOrderType::Limit
-            || self.time_in_force != TradingTimeInForce::Gtc
-            || self.reduce_only != self.action.is_close_action()
-        {
-            return Err(ProtocolError::TradeIntent);
-        }
-        if self.action.is_order_action() {
-            if self.selected_price.is_none_or(|value| !positive(value))
-                || self.quote_notional.is_none_or(|value| !positive(value))
-                || self.selected_order_id.is_some()
-            {
-                return Err(ProtocolError::TradeIntent);
-            }
-            if self.action.is_close_action() {
-                if self.close_quantity_cap.is_none_or(|value| !positive(value)) {
-                    return Err(ProtocolError::TradeIntent);
-                }
-            } else if self.close_quantity_cap.is_some() {
-                return Err(ProtocolError::TradeIntent);
-            }
-            return Ok(());
-        }
-        if self.selected_price.is_some()
-            || self.quote_notional.is_some()
-            || self.close_quantity_cap.is_some()
-        {
-            return Err(ProtocolError::TradeIntent);
-        }
-        match self.action {
-            TradingAction::CancelSelectedOrder => {
-                if self
-                    .selected_order_id
-                    .as_deref()
-                    .is_some_and(|value| value.trim().is_empty())
-                {
-                    return Err(ProtocolError::TradeIntent);
-                }
-            }
-            TradingAction::CancelAllOrders => {
-                if self.selected_order_id.is_some() {
-                    return Err(ProtocolError::TradeIntent);
-                }
-            }
-            _ => return Err(ProtocolError::TradeIntent),
-        }
-        Ok(())
-    }
-
-    #[must_use]
-    pub const fn reduce_only(&self) -> bool {
-        self.reduce_only
-    }
-}
-
 /// Separate from UI control events so legacy Control consumers never need to decode market
 /// projections they did not request. The indicator SSE stream uses this event envelope only.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1166,41 +1216,17 @@ impl TradeIntent {
 pub enum IndicatorEvent {
     Snapshot(IndicatorSnapshot),
 }
-
 impl IndicatorEvent {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         match self {
             Self::Snapshot(snapshot) => snapshot.validate(),
         }
     }
-
     #[must_use]
     pub const fn grants_mutation_authority(&self) -> bool {
         false
     }
 }
-
-impl ControlEvent {
-    pub fn validate(&self) -> Result<(), ProtocolError> {
-        match self {
-            Self::Snapshot(snapshot) => snapshot.validate(),
-            Self::CommandReceipt(receipt) => receipt.validate(),
-            Self::Notice {
-                observed_ms,
-                message,
-            } => {
-                if *observed_ms == 0 {
-                    return Err(ProtocolError::EventTime);
-                }
-                if message.trim().is_empty() {
-                    return Err(ProtocolError::EventContent);
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ProtocolError {
     #[error("unsupported account delivery protocol schema version")]
@@ -1215,6 +1241,12 @@ pub enum ProtocolError {
     AccountId,
     #[error("strategy identity is missing or invalid")]
     StrategyIdentity,
+    #[error("copy relation identity is missing or invalid")]
+    CopyRelationIdentity,
+    #[error("copy relation revision is invalid or stale")]
+    CopyRelationRevision,
+    #[error("copy relation capital, multiplier, lifecycle, or risk policy is invalid")]
+    CopyRelationPolicy,
     #[error("control request identity is missing")]
     RequestIdentity,
     #[error("control request config epoch must be positive")]
@@ -1243,10 +1275,10 @@ pub enum ProtocolError {
     ReceiptTime,
     #[error("rejected or unknown command receipt detail is missing")]
     ReceiptDetail,
-    #[error("control event observed time is missing")]
-    EventTime,
-    #[error("control event content is missing")]
-    EventContent,
+    #[error("UI event scope is not an exact LIVE account binding")]
+    EventScope,
+    #[error("UI event cursor chain is invalid")]
+    EventCursor,
     #[error("account delivery identity is missing")]
     DeliveryIdentity,
     #[error("account delivery payload is missing or malformed")]
@@ -1262,11 +1294,9 @@ pub enum ProtocolError {
     #[error("account delivery receipt transition is malformed")]
     DeliveryReceipt,
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     fn request(action: ControlAction) -> Result<ControlCommandRequest, Box<dyn std::error::Error>> {
         Ok(ControlCommandRequest {
             schema_version: CONTROL_SCHEMA_VERSION,
@@ -1282,7 +1312,6 @@ mod tests {
             confirmation: None,
         })
     }
-
     #[test]
     fn pause_is_semantic_and_never_needs_a_physical_mutation_token()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1294,7 +1323,6 @@ mod tests {
         assert!(!encoded.contains("writer"));
         Ok(())
     }
-
     #[test]
     fn schema_v2_paths_and_mode_are_wire_required() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(CONTROL_SCHEMA_VERSION, 2);
@@ -1311,20 +1339,17 @@ mod tests {
             ACCOUNT_DELIVERY_RECEIPT_PATH,
             "/v2/account-node/deliveries/receipts"
         );
-
         let mut encoded = serde_json::to_value(request(ControlAction::Pause)?)?;
         let object = encoded
             .as_object_mut()
             .ok_or("control request must encode as an object")?;
         object.remove("mode");
         assert!(serde_json::from_value::<ControlCommandRequest>(encoded).is_err());
-
         let mut encoded = serde_json::to_value(request(ControlAction::Pause)?)?;
         encoded["mode"] = serde_json::json!("TEST");
         assert!(serde_json::from_value::<ControlCommandRequest>(encoded).is_err());
         Ok(())
     }
-
     #[test]
     fn account_delivery_is_exact_versioned_and_non_authoritative()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1361,7 +1386,6 @@ mod tests {
         assert_eq!(claim.validate(), Ok(()));
         assert!(!claim.grants_mutation_authority());
         assert!(!lease.grants_mutation_authority());
-
         let ack = AccountDeliveryAck {
             schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
             lease: lease.clone(),
@@ -1370,7 +1394,6 @@ mod tests {
         };
         assert_eq!(ack.validate(), Ok(()));
         assert!(!ack.grants_mutation_authority());
-
         let mut encoded = serde_json::to_value(&claim)?;
         encoded["lease"]["binding"]["mode"] = serde_json::json!("TEST");
         assert!(serde_json::from_value::<AccountDeliveryClaim>(encoded).is_err());
@@ -1379,7 +1402,6 @@ mod tests {
         assert_eq!(wrong_symbol.validate(), Err(ProtocolError::DeliveryBinding));
         Ok(())
     }
-
     #[test]
     fn reconciliation_receipt_requires_reconcile_only_lease_and_account_fact()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1418,7 +1440,6 @@ mod tests {
         assert_eq!(receipt.validate(), Err(ProtocolError::DeliveryReceipt));
         Ok(())
     }
-
     #[test]
     fn stop_and_flatten_require_exact_human_visible_scope() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -1432,14 +1453,12 @@ mod tests {
         }
         Ok(())
     }
-
     #[test]
     fn high_risk_confirmation_cannot_be_replayed_across_any_scope_field()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut command = request(ControlAction::Stop)?;
         command.confirmation = Some(command.expected_confirmation());
         assert_eq!(command.validate(), Ok(()));
-
         let mut changed = command.clone();
         changed.action = ControlAction::Flatten;
         assert_eq!(changed.validate(), Err(ProtocolError::Confirmation));
@@ -1460,7 +1479,6 @@ mod tests {
         assert_eq!(changed.validate(), Err(ProtocolError::Confirmation));
         Ok(())
     }
-
     #[test]
     fn snapshot_rejects_invalid_schema_and_account_identity()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1483,9 +1501,10 @@ mod tests {
             mode: GatewayMode::Live,
             trading_account_id: "not-canonical".to_owned(),
             health: HealthState::Unknown,
-            equity: Decimal::ZERO,
-            available_margin: Decimal::ZERO,
-            unrealized_pnl: Decimal::ZERO,
+            equity: None,
+            available_margin: None,
+            unrealized_pnl: None,
+            balances: Vec::new(),
             private_generation: 0,
             writer_generation: 0,
             last_reconciled_ms: 0,
@@ -1493,7 +1512,6 @@ mod tests {
         assert_eq!(snapshot.validate(), Err(ProtocolError::AccountId));
         Ok(())
     }
-
     #[test]
     fn command_receipt_validates_identity_time_detail_and_round_trips()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1504,7 +1522,6 @@ mod tests {
             serde_json::from_str::<CommandReceipt>(&encoded)?,
             valid_receipt
         );
-
         let mut invalid = valid_receipt.clone();
         invalid.schema_version += 1;
         assert_eq!(invalid.validate(), Err(ProtocolError::SchemaVersion));
@@ -1526,53 +1543,42 @@ mod tests {
         }
         Ok(())
     }
-
     #[test]
-    fn control_event_recursively_validates_and_round_trips()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let event = ControlEvent::Snapshot(snapshot()?);
+    fn scoped_ui_event_has_no_facts_and_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let notification = UiEventNotification {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            event_type: UiEventKind::Snapshot,
+            scope: UiAccountScope {
+                venue: VenueId::Binance,
+                mode: GatewayMode::Live,
+                trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            },
+            observed_ms: 100,
+        };
+        let event = UiEventEnvelope::from_notification(notification, 7, 6)?;
         assert_eq!(event.validate(), Ok(()));
         let encoded = serde_json::to_string(&event)?;
-        assert_eq!(serde_json::from_str::<ControlEvent>(&encoded)?, event);
-
-        let mut invalid_snapshot = snapshot()?;
-        invalid_snapshot.generated_ms = 0;
-        assert_eq!(
-            ControlEvent::Snapshot(invalid_snapshot).validate(),
-            Err(ProtocolError::GeneratedTime)
-        );
-
-        let receipt_event = ControlEvent::CommandReceipt(receipt(CommandState::Unknown, "timeout"));
-        assert_eq!(receipt_event.validate(), Ok(()));
-        let mut invalid_receipt = receipt(CommandState::Unknown, "");
-        invalid_receipt.observed_ms = 0;
-        assert_eq!(
-            ControlEvent::CommandReceipt(invalid_receipt).validate(),
-            Err(ProtocolError::ReceiptTime)
-        );
-        assert_eq!(
-            ControlEvent::Notice {
-                observed_ms: 0,
-                message: "ready".to_owned(),
-            }
-            .validate(),
-            Err(ProtocolError::EventTime)
-        );
-        assert_eq!(
-            ControlEvent::Notice {
-                observed_ms: 10,
-                message: " ".to_owned(),
-            }
-            .validate(),
-            Err(ProtocolError::EventContent)
+        assert_eq!(serde_json::from_str::<UiEventEnvelope>(&encoded)?, event);
+        assert!(!encoded.contains("order"));
+        assert!(!encoded.contains("fill"));
+        assert!(
+            UiEventEnvelope::from_notification(
+                UiEventNotification {
+                    schema_version: CONTROL_SCHEMA_VERSION,
+                    event_type: UiEventKind::Command,
+                    scope: event.scope.clone(),
+                    observed_ms: 100,
+                },
+                7,
+                7,
+            )
+            .is_err()
         );
         Ok(())
     }
-
     #[test]
     fn snapshot_rejects_duplicate_nested_identities() -> Result<(), Box<dyn std::error::Error>> {
         let original = snapshot()?;
-
         let mut duplicate = original.clone();
         duplicate.accounts.push(duplicate.accounts[0].clone());
         assert_eq!(duplicate.validate(), Err(ProtocolError::DuplicateIdentity));
@@ -1592,12 +1598,10 @@ mod tests {
         assert_eq!(duplicate.validate(), Err(ProtocolError::DuplicateIdentity));
         Ok(())
     }
-
     #[test]
     fn snapshot_rejects_invalid_nested_values_times_and_references()
     -> Result<(), Box<dyn std::error::Error>> {
         let original = snapshot()?;
-
         let mut invalid = original.clone();
         invalid.strategies[0].long_quantity = Decimal::NEGATIVE_ONE;
         assert_eq!(invalid.validate(), Err(ProtocolError::SnapshotValue));
@@ -1619,7 +1623,6 @@ mod tests {
         assert_eq!(invalid.validate(), Err(ProtocolError::SnapshotContent));
         Ok(())
     }
-
     #[test]
     fn manual_close_is_reduce_only_and_requires_a_positive_position_cap()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1682,7 +1685,6 @@ mod tests {
         }
         Ok(())
     }
-
     fn receipt(state: CommandState, detail: &str) -> CommandReceipt {
         CommandReceipt {
             schema_version: CONTROL_SCHEMA_VERSION,
@@ -1693,7 +1695,6 @@ mod tests {
             detail: detail.to_owned(),
         }
     }
-
     fn snapshot() -> Result<ControlSnapshot, Box<dyn std::error::Error>> {
         let account_id = "00000000-0000-4000-8000-000000000001".to_owned();
         let symbol: Symbol = "BTC/USDT".parse()?;
@@ -1706,9 +1707,14 @@ mod tests {
                 mode: GatewayMode::Live,
                 trading_account_id: account_id.clone(),
                 health: HealthState::Healthy,
-                equity: Decimal::new(10_000, 0),
-                available_margin: Decimal::new(8_000, 0),
-                unrealized_pnl: Decimal::new(50, 0),
+                equity: Some(Decimal::new(10_000, 0)),
+                available_margin: Some(Decimal::new(8_000, 0)),
+                unrealized_pnl: Some(Decimal::new(50, 0)),
+                balances: vec![AccountBalanceSummary {
+                    asset: Asset::new("USDT")?,
+                    equity: Decimal::new(10_000, 0),
+                    available_margin: Some(Decimal::new(8_000, 0)),
+                }],
                 private_generation: 4,
                 writer_generation: 2,
                 last_reconciled_ms: 90,
@@ -1725,12 +1731,14 @@ mod tests {
                 open_orders: 1,
                 long_quantity: Decimal::ONE,
                 short_quantity: Decimal::ZERO,
-                realized_pnl: Decimal::new(10, 0),
-                unrealized_pnl: Decimal::new(5, 0),
+                realized_pnl: Some(Decimal::new(10, 0)),
+                unrealized_pnl: Some(Decimal::new(5, 0)),
                 last_receipt_ms: 95,
                 attention: None,
             }],
             copy_relations: vec![CopyRelationSummary {
+                relation_id: "00000000-0000-4000-8000-000000000010".to_owned(),
+                revision: 1,
                 leader_id: "leader-btc".to_owned(),
                 follower_instance_id: "copy-btc".to_owned(),
                 symbol: symbol.clone(),
@@ -1785,5 +1793,74 @@ mod tests {
                 detail: String::new(),
             }],
         })
+    }
+    #[test]
+    fn copy_relation_config_requires_exact_live_bindings_and_safe_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let symbol: Symbol = "BTC/USDT".parse()?;
+        let binding = |instance_id: &str| CopyRelationBinding {
+            venue: VenueId::Binance,
+            mode: GatewayMode::Live,
+            trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            instance_id: instance_id.to_owned(),
+            symbol: symbol.clone(),
+        };
+        let request = CopyRelationUpsertRequest {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            request_id: "00000000-0000-4000-8000-000000000011".to_owned(),
+            relation: CopyRelationConfig {
+                relation_id: "00000000-0000-4000-8000-000000000010".to_owned(),
+                leader: binding("leader-btc"),
+                follower: binding("copy-btc"),
+                allocated_capital: Decimal::new(500, 0),
+                multiplier: Decimal::ONE,
+                safety_reserve_rate: Decimal::new(1, 1),
+                risk: CopyRiskPolicy {
+                    max_total_notional: Decimal::new(1_000, 0),
+                    max_order_notional: Decimal::new(100, 0),
+                    max_leverage: Decimal::new(3, 0),
+                },
+                lifecycle: CopyLifecyclePolicy::Paused,
+            },
+            expected_revision: None,
+        };
+        assert_eq!(request.validate(), Ok(()));
+        let digest = request.relation.policy_digest();
+        let mut changed_policy = request.relation.clone();
+        changed_policy.risk.max_order_notional = Decimal::new(99, 0);
+        assert_ne!(digest, changed_policy.policy_digest());
+        let mut changed_binding = request.relation.clone();
+        changed_binding.follower.instance_id = "copy-btc-2".to_owned();
+        assert_ne!(digest, changed_binding.policy_digest());
+        let mut invalid = request.clone();
+        invalid.relation.safety_reserve_rate = Decimal::ONE;
+        assert_eq!(invalid.validate(), Err(ProtocolError::CopyRelationPolicy));
+        let mut invalid = request;
+        invalid.relation.follower = invalid.relation.leader.clone();
+        assert_eq!(invalid.validate(), Err(ProtocolError::CopyRelationPolicy));
+        Ok(())
+    }
+    #[test]
+    fn execution_facts_are_an_explicit_empty_read_model_until_node_signed_evidence_arrives()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let facts = ExecutionFactsSnapshot {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            generated_ms: 100,
+            orders: Vec::new(),
+            positions: Vec::new(),
+            fills: Vec::new(),
+            reconciliation: Vec::new(),
+            copy_ledger: Vec::new(),
+            drift: Vec::new(),
+            execution: Vec::new(),
+            risk: Vec::new(),
+            health: Vec::new(),
+        };
+        assert_eq!(facts.validate(), Ok(()));
+        assert_eq!(
+            serde_json::from_value::<ExecutionFactsSnapshot>(serde_json::to_value(&facts)?)?,
+            facts
+        );
+        Ok(())
     }
 }

@@ -1,3 +1,4 @@
+mod account_gateway;
 mod binding;
 mod config;
 mod credential_probe;
@@ -8,6 +9,7 @@ pub mod portfolio;
 pub mod private;
 mod private_ws;
 mod public;
+mod public_ws;
 mod readback;
 mod recovery;
 mod sign;
@@ -15,6 +17,10 @@ mod transport;
 
 use venue_gateway_api::CapabilityFlags;
 
+pub use account_gateway::{
+    BinanceAccountGateway, BinanceAccountGatewayError, BinanceGridBootstrapMarketFacts,
+    BinancePrivateFillEvent, BinancePublicMarketEvent,
+};
 pub use binding::{BinanceAccountBinding, BinanceBindingError, native_symbol};
 pub use config::{BinanceConfig, endpoints};
 pub use credential_probe::{BinanceCredentialProbe, BinanceProbeError, probe_credentials};
@@ -31,10 +37,12 @@ pub use public::{
     BinanceFormingBar, BinanceKlineInterval, BinancePublic24hTicker, BinancePublicEnvelope,
     BinancePublicError, BinancePublicInstrument, BinancePublicKline, parse_bbo, parse_closed_bar,
     parse_depth_delta, parse_public_exchange_catalog, parse_public_exchange_info,
-    parse_public_market_agg_trade, parse_public_market_bbo, parse_public_market_depth20_snapshot,
-    parse_public_market_kline, parse_public_market_rest_klines, parse_public_market_ticker_array,
-    parse_public_market_ticker_snapshot, parse_public_trade,
+    parse_public_market_agg_trade, parse_public_market_bbo, parse_public_market_depth_delta,
+    parse_public_market_depth20_snapshot, parse_public_market_kline,
+    parse_public_market_rest_depth_snapshot, parse_public_market_rest_klines,
+    parse_public_market_ticker_array, parse_public_market_ticker_snapshot, parse_public_trade,
 };
+pub use public_ws::{BinancePublicWsTransport, BinanceRawPublicFrame, connect_public_ws};
 pub use readback::*;
 pub use recovery::*;
 pub use sign::{BinanceHttpMethod, BinanceRestSignInput, SignedBinanceRestRequest, sign_rest};

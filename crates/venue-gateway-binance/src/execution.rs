@@ -352,6 +352,7 @@ fn validate_common(
         || rules.instrument.symbol != readback.scope().binding().symbol
         || rules.native_symbol != native_symbol(&rules.instrument.symbol)
         || quantity < rules.minimum_quantity
+        || quantity > rules.maximum_quantity
         || quantity <= Decimal::ZERO
         || quantity % rules.instrument.quantity_step != Decimal::ZERO
     {
@@ -366,6 +367,8 @@ fn validate_price_and_notional(
     price: Price,
 ) -> Result<(), BinanceExecutionError> {
     if price.value() % rules.instrument.price_tick.value() != Decimal::ZERO
+        || price.value() < rules.minimum_price
+        || price.value() > rules.maximum_price
         || quantity
             .checked_mul(price.value())
             .ok_or(BinanceExecutionError::Rules)?

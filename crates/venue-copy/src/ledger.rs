@@ -167,9 +167,15 @@ mod tests {
     fn binding() -> Result<DeliveryBinding, Box<dyn std::error::Error>> {
         let ids = identities(1)?;
         Ok(DeliveryBinding {
+            relation: crate::RelationCommitment {
+                relation_id: identities(60)?.job_id,
+                revision: 1,
+                policy_digest: [6; 32],
+            },
             leader_id: ids.job_id,
             follower_id: ids.planning_snapshot_id,
             follower_binding_id: ids.child_order_id,
+            follower_instance_id: "copy-follower".to_owned(),
             account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             instrument: InstrumentIdentity {
                 symbol: "BTC/USDT".parse::<Symbol>()?,

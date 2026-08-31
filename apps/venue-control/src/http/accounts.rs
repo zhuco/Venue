@@ -2,7 +2,9 @@ use super::*;
 use crate::accounts::{AccountError, AccountService, Principal};
 use serde::{Serialize, de::DeserializeOwned};
 use std::collections::BTreeSet;
-use venue_control_protocol::{ControlEvent, ControlSnapshot, accounts::*};
+use venue_control_protocol::{
+    ControlSnapshot, CopyRelationUpsertRequest, ExecutionFactsSnapshot, accounts::*,
+};
 
 pub(super) async fn dispatch_authenticated<R>(
     stream: &mut TcpStream,
@@ -10,7 +12,7 @@ pub(super) async fn dispatch_authenticated<R>(
     request: HttpRequest,
 ) -> Result<(), ()>
 where
-    R: ControlRepository + AccountDeliveryRepository + 'static,
+    R: ControlRepository + AccountDeliveryRepository + CopyRelationRepository + 'static,
 {
     let Some((path, query)) = split_target(&request.target) else {
         return write_error(stream, HttpError::BadRequest)
@@ -74,12 +76,25 @@ where
                 .map_err(|_| ())
         }
         (Method::Get, venue_control_protocol::EVENT_STREAM_PATH) => {
-            let cursor = match event_cursor(query, request.last_event_id) {
-                Ok(cursor) => cursor,
+            let (scope, cursor) = match event_stream_scope(query, request.last_event_id) {
+                Ok(scope) => scope,
                 Err(_) => return account_error(stream, AccountErrorCode::InvalidInput).await,
             };
+            let (Some(accounts), Some(principal)) = (accounts, principal.as_ref()) else {
+                return account_error(stream, AccountErrorCode::Unauthorized).await;
+            };
+            let owned = match accounts.owned_account_ids(principal).await {
+                Ok(ids) => ids,
+                Err(error) => return account_error(stream, error.code).await,
+            };
+            if !owned.contains(&scope.trading_account_id) {
+                return account_error(stream, AccountErrorCode::Forbidden).await;
+            }
+            let Some(token) = request.bearer else {
+                return account_error(stream, AccountErrorCode::Unauthorized).await;
+            };
             write_sse_headers(stream).await.map_err(|_| ())?;
-            stream_scoped_events(stream, state, cursor, request.bearer).await;
+            stream_account_events(stream, state, accounts, token, scope, cursor).await;
             Ok(())
         }
         (Method::Post, venue_control_protocol::COMMAND_PATH)
@@ -102,6 +117,101 @@ where
             let result = dispatch_control(stream, state, request).await;
             let _ = access.rollback().await;
             result
+        }
+        (Method::Get, EXECUTION_FACTS_PATH) if query.is_none() => {
+            let (Some(accounts), Some(principal)) = (accounts, principal.as_ref()) else {
+                return account_error(stream, AccountErrorCode::Unauthorized).await;
+            };
+            let owned = match accounts.owned_account_ids(principal).await {
+                Ok(ids) => ids,
+                Err(error) => return account_error(stream, error.code).await,
+            };
+            let facts = match state.service.execution_facts().await {
+                Ok(facts) => facts,
+                Err(ServiceError::SnapshotUnavailable) => {
+                    return account_error(stream, AccountErrorCode::NotFound).await;
+                }
+                Err(_) => return account_error(stream, AccountErrorCode::Unavailable).await,
+            };
+            let body =
+                serde_json::to_vec(&filter_execution_facts(facts, &owned)).map_err(|_| ())?;
+            write_response(stream, "200 OK", "application/json", "close", &body)
+                .await
+                .map_err(|_| ())
+        }
+        (Method::Get, COPY_RELATION_PATH) if query.is_none() => {
+            let (Some(accounts), Some(principal)) = (accounts, principal.as_ref()) else {
+                return account_error(stream, AccountErrorCode::Unauthorized).await;
+            };
+            let owned = match accounts.owned_account_ids(principal).await {
+                Ok(ids) => ids,
+                Err(error) => return account_error(stream, error.code).await,
+            };
+            let relations = match state.service.copy_relations().await {
+                Ok(relations) => relations,
+                Err(_) => return account_error(stream, AccountErrorCode::Unavailable).await,
+            };
+            let relations: Vec<_> = relations
+                .into_iter()
+                .filter(|record| owns_relation(&owned, &record.relation))
+                .collect();
+            let body = serde_json::to_vec(&relations).map_err(|_| ())?;
+            write_response(stream, "200 OK", "application/json", "close", &body)
+                .await
+                .map_err(|_| ())
+        }
+        (Method::Get, COPY_RELATION_CANDIDATES_PATH) if query.is_none() => {
+            let (Some(accounts), Some(principal)) = (accounts, principal.as_ref()) else {
+                return account_error(stream, AccountErrorCode::Unauthorized).await;
+            };
+            let owned = match accounts.owned_account_ids(principal).await {
+                Ok(ids) => ids,
+                Err(error) => return account_error(stream, error.code).await,
+            };
+            let candidates = match state.service.copy_relation_candidates().await {
+                Ok(candidates) => candidates,
+                Err(_) => return account_error(stream, AccountErrorCode::Unavailable).await,
+            };
+            let candidates: Vec<_> = candidates
+                .into_iter()
+                .filter(|candidate| owned.contains(&candidate.binding.trading_account_id))
+                .collect();
+            let body = serde_json::to_vec(&candidates).map_err(|_| ())?;
+            write_response(stream, "200 OK", "application/json", "close", &body)
+                .await
+                .map_err(|_| ())
+        }
+        (Method::Post, COPY_RELATION_PATH) if query.is_none() && request.json_content => {
+            let (Some(accounts), Some(principal)) = (accounts, principal.as_ref()) else {
+                return account_error(stream, AccountErrorCode::Unauthorized).await;
+            };
+            let relation: CopyRelationUpsertRequest = match decode(&request.body) {
+                Ok(value) => value,
+                Err(error) => return account_error(stream, error.code).await,
+            };
+            let owned = match accounts.owned_account_ids(principal).await {
+                Ok(ids) => ids,
+                Err(error) => return account_error(stream, error.code).await,
+            };
+            if !owns_relation(&owned, &relation.relation) {
+                return account_error(stream, AccountErrorCode::Forbidden).await;
+            }
+            let receipt = match state.service.upsert_copy_relation(&relation, now).await {
+                Ok(receipt) => receipt,
+                Err(ServiceError::CopyRelationRepository(
+                    CopyRelationRepositoryError::Conflict,
+                )) => {
+                    return account_error(stream, AccountErrorCode::Conflict).await;
+                }
+                Err(ServiceError::Protocol(_)) => {
+                    return account_error(stream, AccountErrorCode::InvalidInput).await;
+                }
+                Err(_) => return account_error(stream, AccountErrorCode::Unavailable).await,
+            };
+            let body = serde_json::to_vec(&receipt).map_err(|_| ())?;
+            write_response(stream, "200 OK", "application/json", "close", &body)
+                .await
+                .map_err(|_| ())
         }
         // Indicator projections contain no user/account data.
         (Method::Get, INDICATOR_SNAPSHOT_PATH | INDICATOR_EVENT_STREAM_PATH) => {
@@ -203,31 +313,92 @@ pub(crate) fn filter_snapshot(
     mut snapshot: ControlSnapshot,
     owned: &BTreeSet<String>,
 ) -> ControlSnapshot {
+    // Legacy ledger/relation rows carry instance IDs but no account scope. Build their allow-list
+    // from the unfiltered snapshot so a duplicate ID in another account fails closed.
+    let uniquely_owned_instances = unique_owned_instance_ids(&snapshot.strategies, owned);
     snapshot
         .accounts
         .retain(|a| owned.contains(&a.trading_account_id));
     snapshot
         .strategies
         .retain(|s| owned.contains(&s.trading_account_id));
-    let instances: BTreeSet<_> = snapshot
-        .strategies
-        .iter()
-        .map(|s| s.instance_id.as_str())
-        .collect();
-    snapshot
-        .copy_relations
-        .retain(|r| instances.contains(r.follower_instance_id.as_str()));
+    snapshot.copy_relations.retain(|r| {
+        uniquely_owned_instances.contains(&r.leader_id)
+            && uniquely_owned_instances.contains(&r.follower_instance_id)
+    });
     snapshot
         .ledger
-        .retain(|r| instances.contains(r.instance_id.as_str()));
+        .retain(|r| uniquely_owned_instances.contains(&r.instance_id));
     snapshot
 }
 
-async fn stream_scoped_events<R>(
+fn unique_owned_instance_ids(
+    strategies: &[venue_control_protocol::StrategySummary],
+    owned: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    strategies
+        .iter()
+        .filter(|strategy| owned.contains(&strategy.trading_account_id))
+        .filter(|strategy| {
+            strategies
+                .iter()
+                .filter(|other| other.instance_id == strategy.instance_id)
+                .count()
+                == 1
+        })
+        .map(|strategy| strategy.instance_id.clone())
+        .collect()
+}
+
+fn owns_relation(
+    owned: &BTreeSet<String>,
+    relation: &venue_control_protocol::CopyRelationConfig,
+) -> bool {
+    owned.contains(&relation.leader.trading_account_id)
+        && owned.contains(&relation.follower.trading_account_id)
+}
+
+fn filter_execution_facts(
+    mut facts: ExecutionFactsSnapshot,
+    owned: &BTreeSet<String>,
+) -> ExecutionFactsSnapshot {
+    facts
+        .orders
+        .retain(|fact| owned.contains(&fact.binding.trading_account_id));
+    facts
+        .positions
+        .retain(|fact| owned.contains(&fact.binding.trading_account_id));
+    facts
+        .fills
+        .retain(|fact| owned.contains(&fact.binding.trading_account_id));
+    facts
+        .reconciliation
+        .retain(|fact| owned.contains(&fact.binding.trading_account_id));
+    facts
+        .copy_ledger
+        .retain(|fact| owned.contains(&fact.binding.trading_account_id));
+    facts
+        .drift
+        .retain(|fact| owned.contains(&fact.binding.trading_account_id));
+    facts
+        .execution
+        .retain(|fact| owned.contains(&fact.binding.trading_account_id));
+    facts
+        .risk
+        .retain(|fact| owned.contains(&fact.trading_account_id));
+    facts
+        .health
+        .retain(|fact| owned.contains(&fact.trading_account_id));
+    facts
+}
+
+async fn stream_account_events<R>(
     stream: &mut TcpStream,
     state: &HttpState<R>,
+    accounts: &AccountService,
+    token: SecretValue,
+    scope: UiAccountScope,
     mut cursor: i64,
-    token: Option<SecretValue>,
 ) where
     R: ControlRepository + 'static,
 {
@@ -242,31 +413,25 @@ async fn stream_scoped_events<R>(
     poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            changed=shutdown.changed()=>if changed.is_err() || *shutdown.borrow() { return; },
-            _=keep_alive.tick()=>if write_sse(stream,b": keep-alive\n\n",state.config.request_timeout).await.is_err(){return;},
-            _=poll.tick()=> {
-                let accounts=match &state.access{AccessMode::Accounts(a)=>Some(a.as_ref()),_=>None};
-                let Ok(now)=clock() else{return;};
-                let Ok(principal)=principal(accounts,token.as_ref(),now).await else{return;};
-                let Ok(owned)=owned(accounts,principal.as_ref()).await else{return;};
-                let events=match call(state,state.service.events(cursor,state.config.event_page_limit)).await{Ok(v)=>v,Err(_)=>return};
-                for stored in events {
-                    cursor=stored.sequence;
-                    let event=match stored.event {
-                        ControlEvent::Snapshot(snapshot)=>Some(ControlEvent::Snapshot(filter_snapshot(snapshot,&owned))),
-                        ControlEvent::CommandReceipt(receipt)=>{
-                            match (accounts,principal.as_ref()) {
-                                (Some(a),Some(p)) if a.owns_receipt(p,&receipt.request_id).await.unwrap_or(false)=>Some(ControlEvent::CommandReceipt(receipt)),
-                                _=>None,
-                            }
-                        }
-                        ControlEvent::Notice{..}=>None,
+            changed = shutdown.changed() => if changed.is_err() || *shutdown.borrow() { return; },
+            _ = keep_alive.tick() => if write_sse(stream, b": keep-alive\n\n", state.config.request_timeout).await.is_err() { return; },
+            _ = poll.tick() => {
+                let Ok(now) = clock() else { return; };
+                let Ok(principal) = accounts.authenticate(token.expose(), now).await else { return; };
+                let Ok(owned) = accounts.owned_account_ids(&principal).await else { return; };
+                if !owned.contains(&scope.trading_account_id) { return; }
+                let events = match call(state, state.service.events(&scope, cursor, state.config.event_page_limit)).await {
+                    Ok(events) => events,
+                    Err(_) => return,
+                };
+                for event in events {
+                    let payload = match serde_json::to_string(&event.event) {
+                        Ok(payload) if payload.len() <= state.config.request_body_limit => payload,
+                        _ => return,
                     };
-                    let frame=match event {
-                        Some(event)=>match serde_json::to_string(&event){Ok(body)=>format!("id: {cursor}\nevent: control\ndata: {body}\n\n"),Err(_)=>return},
-                        None=>format!("id: {cursor}\n: scoped\n\n"),
-                    };
-                    if write_sse(stream,frame.as_bytes(),state.config.request_timeout).await.is_err(){return;}
+                    let frame = format!("id: {}\nevent: control\ndata: {payload}\n\n", event.sequence);
+                    if write_sse(stream, frame.as_bytes(), state.config.request_timeout).await.is_err() { return; }
+                    cursor = event.sequence;
                 }
             }
         }
@@ -318,4 +483,75 @@ async fn account_error(stream: &mut TcpStream, code: AccountErrorCode) -> Result
     write_response(stream, status, "application/json", "close", &body)
         .await
         .map_err(|_| ())
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use rust_decimal::Decimal;
+    use venue_control_protocol::{CopyRelationSummary, CopyStatus, LedgerEntry};
+
+    #[test]
+    fn legacy_rows_require_unique_owned_leader_and_follower_instances()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut snapshot = super::super::tests::snapshot()?;
+        let owned = BTreeSet::from([snapshot.strategies[0].trading_account_id.clone()]);
+        let mut leader = snapshot.strategies[0].clone();
+        leader.instance_id = "leader-btc".to_owned();
+        snapshot.strategies.push(leader);
+        snapshot.copy_relations.push(CopyRelationSummary {
+            relation_id: "00000000-0000-4000-8000-000000000010".to_owned(),
+            revision: 1,
+            leader_id: "leader-btc".to_owned(),
+            follower_instance_id: "grid-btc".to_owned(),
+            symbol: "BTC/USDT".parse()?,
+            target_exposure: Decimal::ZERO,
+            actual_exposure: Decimal::ZERO,
+            drift: Decimal::ZERO,
+            status: CopyStatus::Tracking,
+            last_applied_job: None,
+        });
+        snapshot.ledger.push(LedgerEntry {
+            receipt_id: "legacy-receipt".to_owned(),
+            instance_id: "grid-btc".to_owned(),
+            occurred_ms: 100,
+            action: "copy".to_owned(),
+            state: "reconciled".to_owned(),
+            detail: "legacy instance-only row".to_owned(),
+        });
+        let filtered = filter_snapshot(snapshot.clone(), &owned);
+        assert_eq!(filtered.copy_relations.len(), 1);
+        assert_eq!(filtered.ledger.len(), 1);
+
+        let mut ambiguous = snapshot;
+        let mut foreign = ambiguous.strategies[0].clone();
+        foreign.trading_account_id = "00000000-0000-4000-8000-000000000099".to_owned();
+        ambiguous.strategies.push(foreign);
+        let filtered = filter_snapshot(ambiguous, &owned);
+        assert_eq!(filtered.strategies.len(), 2);
+        assert!(filtered.copy_relations.is_empty());
+        assert!(filtered.ledger.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_relation_without_an_owned_leader_is_excluded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut snapshot = super::super::tests::snapshot()?;
+        let owned = BTreeSet::from([snapshot.strategies[0].trading_account_id.clone()]);
+        snapshot.copy_relations.push(CopyRelationSummary {
+            relation_id: "00000000-0000-4000-8000-000000000011".to_owned(),
+            revision: 1,
+            leader_id: "unscoped-leader".to_owned(),
+            follower_instance_id: "grid-btc".to_owned(),
+            symbol: "BTC/USDT".parse()?,
+            target_exposure: Decimal::ZERO,
+            actual_exposure: Decimal::ZERO,
+            drift: Decimal::ZERO,
+            status: CopyStatus::Tracking,
+            last_applied_job: None,
+        });
+        assert!(filter_snapshot(snapshot, &owned).copy_relations.is_empty());
+        Ok(())
+    }
 }

@@ -670,7 +670,7 @@ impl OkxFreshRecoveryCollector {
             pages.push(page);
             match advance {
                 OkxPrivatePageAdvance::Closed => return Ok(()),
-                OkxPrivatePageAdvance::More(next) => request = next,
+                OkxPrivatePageAdvance::More(next) => request = *next,
             }
         }
     }

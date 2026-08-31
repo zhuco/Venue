@@ -1,4 +1,5 @@
 pub mod account;
+mod account_gateway;
 mod binding;
 mod config;
 mod credentials;
@@ -10,6 +11,7 @@ mod order_families;
 pub mod private;
 mod private_ws;
 pub mod public;
+mod public_ws;
 mod recovery;
 pub mod risk;
 mod runtime_recovery;
@@ -18,6 +20,7 @@ mod transport;
 
 use venue_gateway_api::CapabilityFlags;
 
+pub use account_gateway::{BitgetAccountGateway, BitgetAccountGatewayError};
 pub use binding::{BitgetAccountBinding, BitgetBindingError};
 pub use config::BitgetConfig;
 pub use credentials::BitgetCredentials;
@@ -25,6 +28,7 @@ pub use execution::*;
 pub use node_bridge::*;
 pub use order_families::*;
 pub use private_ws::*;
+pub use public_ws::{BitgetPublicWsError, BitgetScalpingBookFrame, BitgetScalpingPublicReceiver};
 pub use recovery::*;
 pub(crate) use runtime_recovery::BitgetRuntimeRecoveryAwaitGuard;
 pub use runtime_recovery::{

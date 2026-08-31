@@ -24,8 +24,8 @@ use crate::sign::ws_auth_signature;
 use crate::{
     BybitCredentials, BybitExecutionError, BybitGatewayBinding, BybitOrderAck,
     BybitPreparedPrivateRequest, BybitPreparedRequest, BybitPrivateStreamProbeEvidence,
-    BybitPublicSource, BybitRawPrivatePayload, BybitRawPublicPayload, linear_instrument_path,
-    parse_order_ack, sign_prepared_request, sign_private_request,
+    BybitPublicSource, BybitRawPrivatePayload, BybitRawPublicPayload, linear_bbo_path,
+    linear_instrument_path, parse_order_ack, sign_prepared_request, sign_private_request,
 };
 
 const PRIVATE_TOPICS: [&str; 4] = [
@@ -83,6 +83,27 @@ pub struct BybitHttpTransport {
 }
 
 impl BybitHttpTransport {
+    /// Rebinds the same authenticated account transport resources to another canonical symbol.
+    /// The returned value carries a distinct binding, so every existing request validation stays
+    /// exact; cloning this read client never creates a mutation writer or credential namespace.
+    pub(crate) fn clone_with_binding(
+        &self,
+        binding: &BybitGatewayBinding,
+    ) -> Result<Self, BybitTransportError> {
+        if binding.gateway_binding().venue != self.binding.venue
+            || binding.gateway_binding().mode != self.binding.mode
+            || binding.gateway_binding().trading_account_id != self.binding.trading_account_id
+        {
+            return Err(BybitTransportError::Binding);
+        }
+        Ok(Self {
+            client: self.client.clone(),
+            binding: binding.gateway_binding().clone(),
+            generation: self.generation,
+            endpoint: self.endpoint.clone(),
+            limits: self.limits,
+        })
+    }
     pub fn new(
         binding: &BybitGatewayBinding,
         generation: u64,
@@ -244,6 +265,56 @@ impl BybitHttpTransport {
             BybitRawPublicPayload::new(
                 binding,
                 BybitPublicSource::LinearInstrument,
+                self.generation,
+                received_at_ms,
+                payload,
+            )
+            .map_err(|_| BybitTransportError::Protocol)
+        };
+        timeout(self.limits.operation_timeout, operation)
+            .await
+            .map_err(|_| BybitTransportError::Timeout)?
+    }
+
+    /// Fetches a one-level live book immediately before a market reduction.  This is public
+    /// data only; it is used to prove the current minimum-notional check, never as a price.
+    pub(crate) async fn fetch_linear_bbo(
+        &self,
+        binding: &BybitGatewayBinding,
+    ) -> Result<BybitRawPublicPayload, BybitTransportError> {
+        binding
+            .validate_request_binding(&self.binding)
+            .map_err(|_| BybitTransportError::Binding)?;
+        let path = linear_bbo_path(binding).map_err(|_| BybitTransportError::Binding)?;
+        let url = format!("{}{}", self.endpoint, path);
+        let operation = async {
+            let mut response = self.client.get(url).send().await.map_err(map_reqwest)?;
+            if !response.status().is_success() {
+                return Err(BybitTransportError::HttpStatus);
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > self.limits.maximum_body_bytes as u64)
+            {
+                return Err(BybitTransportError::BodyTooLarge);
+            }
+            let mut body = BytesMut::new();
+            while let Some(chunk) = response.chunk().await.map_err(map_reqwest)? {
+                let new_length = body
+                    .len()
+                    .checked_add(chunk.len())
+                    .ok_or(BybitTransportError::BodyTooLarge)?;
+                if new_length > self.limits.maximum_body_bytes {
+                    return Err(BybitTransportError::BodyTooLarge);
+                }
+                body.extend_from_slice(&chunk);
+            }
+            let received_at_ms = unix_ms()?;
+            let payload =
+                String::from_utf8(body.to_vec()).map_err(|_| BybitTransportError::Protocol)?;
+            BybitRawPublicPayload::new(
+                binding,
+                BybitPublicSource::RestOrderBook,
                 self.generation,
                 received_at_ms,
                 payload,

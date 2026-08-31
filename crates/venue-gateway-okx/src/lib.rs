@@ -67,8 +67,8 @@ pub use readback::{
     OkxPositionFactSource, OkxPrivatePageAdvance, OkxPrivateReadRequest, OkxPrivateReadScope,
     OkxPrivateReadbackCandidate, OkxPrivateSurface, OkxRawPrivatePage, advance_private_page,
     build_account_config_request, build_algo_orders_request, build_balance_request,
-    build_fills_request, build_positions_request, build_regular_orders_request,
-    complete_private_readback,
+    build_fills_request, build_fills_resume_request, build_positions_request,
+    build_regular_orders_request, complete_private_readback,
 };
 pub use recovery_collector::{
     OKX_FRESH_RECOVERY_SCHEMA_VERSION, OkxFreshRecoveryCollector, OkxFreshRecoveryError,

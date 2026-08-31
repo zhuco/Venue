@@ -398,6 +398,140 @@ fn caller_digest_cannot_create_a_production_applied_receipt()
 }
 
 #[test]
+fn copy_semantic_turn_has_one_canonical_actor_and_owner_without_dispatch_authority()
+-> Result<(), Box<dyn std::error::Error>> {
+    use venue_copy::{
+        CopyAction, CopyIdentityInput, DeliveryBinding, FollowerDeliveryManifest,
+        RelationCommitment, TargetExposurePlan, derive_copy_identities,
+    };
+    use venue_domain::domain::{Amount, Asset, InstrumentIdentity, MarketKind};
+
+    let binding = binding()?;
+    let identities = derive_copy_identities(&CopyIdentityInput {
+        event_id: [1; 16],
+        source_event_id: [2; 16],
+        follower_account_id: [3; 16],
+        follower_binding_id: [4; 16],
+        leader_order_id: [5; 16],
+        revision: 1,
+        action: CopyAction::New,
+    })?;
+    let related = derive_copy_identities(&CopyIdentityInput {
+        event_id: [11; 16],
+        source_event_id: [12; 16],
+        follower_account_id: [13; 16],
+        follower_binding_id: [14; 16],
+        leader_order_id: [15; 16],
+        revision: 1,
+        action: CopyAction::New,
+    })?;
+    let asset = Asset::new("USDT")?;
+    let manifest = FollowerDeliveryManifest {
+        identities,
+        binding: DeliveryBinding {
+            relation: RelationCommitment {
+                relation_id: related.job_id,
+                revision: 1,
+                policy_digest: [6; 32],
+            },
+            leader_id: related.job_id,
+            follower_id: related.planning_snapshot_id,
+            follower_binding_id: related.child_order_id,
+            follower_instance_id: binding.instance_id.clone(),
+            account_id: binding.trading_account_id.clone(),
+            instrument: InstrumentIdentity {
+                symbol: binding.symbol.clone(),
+                market: MarketKind::LinearPerpetual,
+                settlement_asset: Some(asset.clone()),
+            },
+            policy_id: identities.planning_snapshot_id,
+        },
+        plan_digest: [7; 32],
+        snapshot_generation: 8,
+        instrument_generation: 9,
+        issued_at_ms: 100,
+        expires_at_ms: 300,
+    };
+    let target = TargetExposurePlan {
+        snapshot_generation: manifest.snapshot_generation,
+        exposure_ratio: rust_decimal::Decimal::ONE,
+        safe_available_margin: Amount::new(asset.clone(), rust_decimal::Decimal::TEN),
+        effective_follower_capital: Amount::new(asset.clone(), rust_decimal::Decimal::TEN),
+        target_exposure: Amount::new(asset.clone(), rust_decimal::Decimal::TEN),
+        delta_exposure: Amount::new(asset, rust_decimal::Decimal::TEN),
+    };
+    let claim = AccountDeliveryClaim {
+        lease: AccountDeliveryLease {
+            schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
+            delivery_id: "copy:delivery-32".to_owned(),
+            binding: binding.clone(),
+            node_id: NODE.to_owned(),
+            lease_epoch: 1,
+            leased_at_ms: 100,
+            expires_at_ms: 300,
+            purpose: AccountDeliveryPurpose::Install,
+        },
+        payload: AccountDeliveryPayload::CopySemanticJob(
+            venue_control_protocol::CopySemanticJobDelivery {
+                job_id: manifest.identities.job_id.to_string(),
+                job_digest: manifest.plan_digest,
+                symbol: binding.symbol.clone(),
+                manifest: serde_json::to_value(&manifest)?,
+                semantic_job: serde_json::json!({
+                    "target": target,
+                    "leader_intent": {"frozen": true},
+                }),
+                created_at_ms: manifest.issued_at_ms,
+                expires_at_ms: manifest.expires_at_ms,
+            },
+        ),
+    };
+    let mut inbox = new_inbox(MemoryJournal::default())?;
+    let ClaimAcceptance::Install(ack) = inbox.accept_claim(claim, 110)? else {
+        return Err("Copy claim did not produce an ACK".into());
+    };
+    inbox.confirm_acknowledgement(ack.value(), 120)?;
+    let turn = inbox
+        .actor_turn("copy:delivery-32", 130)?
+        .ok_or("Copy actor turn missing")?;
+    let semantic = crate::CopySemanticDelivery::from_actor_turn(&turn, 130)?;
+    assert_eq!(
+        semantic.actor().key.strategy_kind,
+        venue_runtime::StrategyKind::Copy
+    );
+    assert!(semantic.actor().matches_owner(semantic.owner()));
+    assert_eq!(semantic.delivery_digest(), manifest.delivery_digest());
+    let signed_position = venue_copy::AuthoritativePositionSnapshot {
+        binding: manifest.binding.clone(),
+        generation: 10,
+        observed_at_ms: 120,
+        expires_at_ms: 250,
+        exposure: Amount::new(Asset::new("USDT")?, rust_decimal::Decimal::ZERO),
+        fact_digest: [9; 32],
+    };
+    let execution = semantic.execution_request(&signed_position, 130)?;
+    assert_eq!(execution.binding.relation, manifest.binding.relation);
+    assert_eq!(execution.target_generation, manifest.snapshot_generation);
+    assert_eq!(
+        execution.requested_delta_exposure.value,
+        rust_decimal::Decimal::TEN
+    );
+    assert!(!semantic.grants_gateway_capability());
+    assert!(!semantic.grants_writer_lease());
+    assert!(!semantic.grants_wal_authority());
+    assert!(!semantic.grants_dispatch_permit());
+    assert!(matches!(
+        turn.applied(
+            140,
+            digest(8),
+            "cannot claim applied without runtime durable receipt"
+        ),
+        Err(ControlDeliveryError::ActorAppliedUnavailable)
+    ));
+    Ok(())
+}
+
+#[test]
 fn production_delivery_cannot_apply_any_control_action_without_actor_authority()
 -> Result<(), Box<dyn std::error::Error>> {
     for (index, action) in [

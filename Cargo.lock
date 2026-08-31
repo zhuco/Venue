@@ -4739,6 +4739,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror 2.0.19",
  "tokio",
@@ -4758,6 +4759,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.19",
  "venue-domain",
  "venue-gateway-api",
@@ -4798,6 +4800,7 @@ dependencies = [
  "thiserror 2.0.19",
  "venue-domain",
  "venue-gateway-api",
+ "venue-storage",
 ]
 
 [[package]]
@@ -4828,6 +4831,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "venue-domain",
+ "venue-execution",
  "venue-gateway-api",
  "zeroize",
 ]
@@ -4850,6 +4854,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "venue-domain",
+ "venue-execution",
  "venue-gateway-api",
 ]
 
@@ -4892,6 +4897,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "venue-domain",
+ "venue-execution",
  "venue-gateway-api",
 ]
 
@@ -4963,10 +4969,9 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
- "venue",
  "venue-control-protocol",
+ "venue-copy",
  "venue-domain",
- "venue-execution",
  "venue-gateway-api",
  "venue-gateway-binance",
  "venue-gateway-bitget",
@@ -4974,8 +4979,10 @@ dependencies = [
  "venue-gateway-gate",
  "venue-gateway-hyperliquid",
  "venue-gateway-okx",
+ "venue-indicators",
  "venue-runtime",
  "venue-storage",
+ "venue-strategies",
 ]
 
 [[package]]
@@ -5017,6 +5024,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.19",
  "venue-domain",
+ "venue-indicators",
 ]
 
 [[package]]

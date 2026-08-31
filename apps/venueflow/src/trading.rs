@@ -917,8 +917,8 @@ mod tests {
             open_orders: 0,
             long_quantity: long,
             short_quantity: short,
-            realized_pnl: Decimal::ZERO,
-            unrealized_pnl: Decimal::ZERO,
+            realized_pnl: Some(Decimal::ZERO),
+            unrealized_pnl: Some(Decimal::ZERO),
             last_receipt_ms: 1,
             attention: None,
         }

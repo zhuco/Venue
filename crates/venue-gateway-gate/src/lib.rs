@@ -4,6 +4,7 @@
 //! immutable LIVE request binding. It deliberately has no capability issuer, writer, WAL,
 //! owner registry, retry loop, or mutation authority: a safe host must supply those controls.
 
+mod account_gateway;
 mod config;
 mod credentials;
 pub mod endpoints;
@@ -13,6 +14,7 @@ mod orders;
 mod private;
 mod private_surface;
 mod public;
+mod public_ws;
 mod recovery;
 mod recovery_session;
 mod risk;
@@ -20,13 +22,15 @@ mod runtime_recovery;
 mod sign;
 mod transport;
 
+pub use account_gateway::{GateAccountGateway, GateAccountGatewayError};
 pub use config::{GateConfig, GateProductScope};
 pub use credentials::GateCredentials;
 pub use execution::{
     GateAcceptedMutation, GateCancelIntent, GateDispatchUnknown, GateExactOrderReadback,
     GateExactReadbackRequest, GateExecutionError, GateMutationKind, GateMutationSettlement,
-    GatePreparedMutation, GateSettlementFinality, prepare_cancel, prepare_limit_post_only,
-    prepare_reduce_once, settle_exact_readback,
+    GatePreparedMutation, GateSettlementFinality, prepare_cancel,
+    prepare_exact_readback_by_client_id, prepare_limit_post_only, prepare_reduce_once,
+    settle_exact_readback,
 };
 pub use order_families::{
     GATE_STAGE7_ORDER_PROFILE_VERSION, GateStage7OrderFamilyCandidate, GateStage7OrderFamilyError,
@@ -45,6 +49,7 @@ pub use private_surface::{
     validate_private_readback,
 };
 pub use public::*;
+pub use public_ws::{GatePublicWsError, GateScalpingBookFrame, GateScalpingPublicReceiver};
 pub use recovery::{
     GateFreshRecoveryCandidate, GateFreshRecoveryCollector, GateFreshRecoveryError,
     GateFreshRecoveryRawResponse, GateOwnedOpenOrder, GateRecoveryAuthorityRoots,
@@ -57,9 +62,9 @@ pub use recovery_session::GateAuthenticatedRecoverySession;
 pub(crate) use recovery_session::GateAuthenticatedRecoverySessionLease;
 pub use risk::{
     GateContractRules, GateRiskAccountMode, GateRiskError, GateRiskReadback, decimal,
-    decimal_value, dual_position_side, object, parse_dual_position_mode, parse_risk_snapshots,
-    parse_risk_snapshots_with_unified, requires_unified_single_currency, text,
-    validate_risk_readback_window,
+    decimal_value, dual_position_side, object, parse_contract_rules, parse_dual_position_mode,
+    parse_risk_snapshots, parse_risk_snapshots_with_unified, requires_unified_single_currency,
+    text, validate_risk_readback_window,
 };
 pub(crate) use runtime_recovery::GateRuntimeRecoveryAwaitGuard;
 pub use runtime_recovery::{

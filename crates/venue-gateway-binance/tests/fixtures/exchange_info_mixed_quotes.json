@@ -1,0 +1,34 @@
+{
+  "timezone": "UTC",
+  "serverTime": 1720000000000,
+  "symbols": [
+    {
+      "symbol": "BTCUSDT",
+      "pair": "BTCUSDT",
+      "contractType": "PERPETUAL",
+      "status": "TRADING",
+      "baseAsset": "BTC",
+      "quoteAsset": "USDT",
+      "marginAsset": "USDT",
+      "filters": [
+        { "filterType": "PRICE_FILTER", "minPrice": "0.10", "maxPrice": "1000000", "tickSize": "0.10" },
+        { "filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "1000", "stepSize": "0.001" },
+        { "filterType": "MIN_NOTIONAL", "notional": "5" }
+      ]
+    },
+    {
+      "symbol": "SOLUSDC",
+      "pair": "SOLUSDC",
+      "contractType": "PERPETUAL",
+      "status": "TRADING",
+      "baseAsset": "SOL",
+      "quoteAsset": "USDC",
+      "marginAsset": "USDC",
+      "filters": [
+        { "filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "1000000", "tickSize": "0.01" },
+        { "filterType": "LOT_SIZE", "minQty": "0.1", "maxQty": "1000000", "stepSize": "0.1" },
+        { "filterType": "MIN_NOTIONAL", "notional": "5" }
+      ]
+    }
+  ]
+}

@@ -767,6 +767,7 @@ mod tests {
     const ACCOUNT: &[u8] = include_bytes!("../fixtures/account-info-uta2.json");
     const INSTRUMENT: &str = include_str!("../fixtures/instruments-linear.json");
     const BBO: &str = include_str!("../fixtures/orderbook-linear-bbo.json");
+    const MARKET_REDUCE_REQUEST: &str = include_str!("../fixtures/market-reduce-request.json");
     const OPEN: &[u8] = include_bytes!("../fixtures/exact-open-order-linear.json");
     const CANCEL_HISTORY: &[u8] = include_bytes!("../fixtures/cancel-order-history-linear.json");
     const PLACE_ACK: &[u8] = include_bytes!("../fixtures/place-order-ack.json");
@@ -936,6 +937,35 @@ mod tests {
             ),
             Err(BybitExecutionError::Binding)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn market_reduce_request_is_ioc_reduce_only_and_matches_fixture()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let facts = facts(GatewayMode::Live)?;
+        let request = prepare_place_request(
+            &facts.binding,
+            &facts.identity,
+            &facts.rules,
+            &BybitPlaceIntent {
+                client_order_id: "MARKET_REDUCE_1".to_owned(),
+                side: OrderSide::Sell,
+                position_side: PositionSide::Long,
+                kind: BybitOrderKind::Market,
+                quantity: Decimal::new(1, 3),
+                limit_price: None,
+                time_in_force: BybitTimeInForce::ImmediateOrCancel,
+                reduce_only: true,
+            },
+            1_716_863_719_500,
+            Some(&facts.bbo),
+        )?;
+        assert_eq!(
+            std::str::from_utf8(&request.body)?,
+            MARKET_REDUCE_REQUEST.trim()
+        );
+        assert_eq!(request.kind, BybitRequestKind::Place);
         Ok(())
     }
 

@@ -1,7 +1,8 @@
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use venue_control_protocol::{
-    CommandReceipt, CommandState, ControlCommandRequest, ControlEvent, ControlSnapshot,
-    GatewayMode, VenueId,
+    CONTROL_SCHEMA_VERSION, CommandReceipt, CommandState, ControlCommandRequest, ControlSnapshot,
+    ExecutionFactBinding, ExecutionFactsSnapshot, GatewayMode, NodeProjectionEnvelope,
+    UiAccountScope, UiEventEnvelope, UiEventKind, UiEventNotification, VenueId,
 };
 
 use crate::{
@@ -12,7 +13,11 @@ use crate::{
 
 pub const MIGRATION_0001: &str = include_str!("../migrations/0001_control_core.sql");
 pub const MIGRATION_0005: &str = include_str!("../migrations/0005_live_only.sql");
-pub const MIGRATION_0006: &str = include_str!("../migrations/0006_manual_trade_intent.sql");
+pub const MIGRATION_0009: &str = include_str!("../migrations/0009_control_execution_facts.sql");
+pub const MIGRATION_0011: &str = include_str!("../migrations/0011_node_projection_inbox.sql");
+pub const MIGRATION_0012: &str =
+    include_str!("../migrations/0012_node_projection_instance_cursor.sql");
+pub const MIGRATION_0014: &str = include_str!("../migrations/0014_manual_trade_intent.sql");
 
 #[derive(Clone, Debug)]
 pub struct PgControlRepository {
@@ -45,6 +50,31 @@ impl ControlRepository for PgControlRepository {
         }
     }
 
+    async fn load_execution_facts(
+        &self,
+    ) -> Result<Option<ExecutionFactsSnapshot>, RepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        let row = sqlx::query(
+            "SELECT facts_json FROM venue_control_execution_facts WHERE singleton = TRUE",
+        )
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let mut facts = row
+            .map(|row| decode(row.try_get("facts_json").map_err(database_error)?))
+            .transpose()?;
+        if let Some(facts) = facts.as_mut() {
+            crate::copy_ledger_read_model::overlay_durable_copy_facts(&mut transaction, facts)
+                .await?;
+        }
+        transaction.commit().await.map_err(database_error)?;
+        Ok(facts)
+    }
+
     async fn store_snapshot(
         &self,
         snapshot: &ControlSnapshot,
@@ -54,7 +84,6 @@ impl ControlRepository for PgControlRepository {
             .map_err(|_| RepositoryError::CorruptData)?;
         let generated_ms = to_i64(snapshot.generated_ms)?;
         let snapshot_json = encode(snapshot)?;
-        let event_json = encode(&ControlEvent::Snapshot(snapshot.clone()))?;
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         sqlx::query("SELECT pg_advisory_xact_lock(834766813558209236)")
             .execute(&mut *transaction)
@@ -116,18 +145,93 @@ impl ControlRepository for PgControlRepository {
             .map_err(database_error)?;
         }
 
-        let row = sqlx::query(
-            "INSERT INTO venue_control_events (observed_ms, event_json) VALUES ($1, $2) \
-             RETURNING event_sequence",
+        let mut event_sequence = None;
+        for account in &snapshot.accounts {
+            event_sequence = Some(
+                insert_ui_event(
+                    &mut transaction,
+                    snapshot.generated_ms,
+                    UiEventKind::Snapshot,
+                    UiAccountScope {
+                        venue: account.venue,
+                        mode: account.mode,
+                        trading_account_id: account.trading_account_id.clone(),
+                    },
+                )
+                .await?,
+            );
+        }
+        transaction.commit().await.map_err(database_error)?;
+        Ok(SnapshotStoreResult::Inserted {
+            event_sequence: event_sequence.unwrap_or(0),
+        })
+    }
+
+    async fn store_execution_facts(
+        &self,
+        facts: &ExecutionFactsSnapshot,
+    ) -> Result<SnapshotStoreResult, RepositoryError> {
+        facts.validate().map_err(|_| RepositoryError::CorruptData)?;
+        let generated_ms = to_i64(facts.generated_ms)?;
+        let facts_json = encode(facts)?;
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(834766813558209237)")
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        if let Some(row) = sqlx::query(
+            "SELECT generated_ms, facts_json FROM venue_control_execution_facts \
+             WHERE singleton = TRUE FOR UPDATE",
+        )
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        {
+            let current_ms: i64 = row.try_get("generated_ms").map_err(database_error)?;
+            let current: ExecutionFactsSnapshot =
+                decode(row.try_get("facts_json").map_err(database_error)?)?;
+            if current_ms == generated_ms && current == *facts {
+                transaction.rollback().await.map_err(database_error)?;
+                return Ok(SnapshotStoreResult::Unchanged);
+            }
+            if generated_ms <= current_ms {
+                transaction.rollback().await.map_err(database_error)?;
+                return Err(RepositoryError::SnapshotConflict);
+            }
+        }
+        sqlx::query(
+            "INSERT INTO venue_control_execution_facts (singleton, generated_ms, facts_json) \
+             VALUES (TRUE, $1, $2) ON CONFLICT (singleton) DO UPDATE \
+             SET generated_ms = EXCLUDED.generated_ms, facts_json = EXCLUDED.facts_json",
         )
         .bind(generated_ms)
-        .bind(event_json)
-        .fetch_one(&mut *transaction)
+        .bind(facts_json)
+        .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
-        let event_sequence = row.try_get("event_sequence").map_err(database_error)?;
+        let mut event_sequence = None;
+        for scope in execution_fact_scopes(facts) {
+            event_sequence = Some(
+                insert_ui_event(
+                    &mut transaction,
+                    facts.generated_ms,
+                    UiEventKind::ExecutionFacts,
+                    scope,
+                )
+                .await?,
+            );
+        }
         transaction.commit().await.map_err(database_error)?;
-        Ok(SnapshotStoreResult::Inserted { event_sequence })
+        Ok(SnapshotStoreResult::Inserted {
+            event_sequence: event_sequence.unwrap_or(0),
+        })
+    }
+
+    async fn merge_node_projection(
+        &self,
+        projection: &NodeProjectionEnvelope,
+    ) -> Result<SnapshotStoreResult, RepositoryError> {
+        crate::node_projection_postgres::merge(self.pool(), projection).await
     }
 
     async fn enqueue_command(
@@ -144,7 +248,6 @@ impl ControlRepository for PgControlRepository {
         let command_json = encode(command)?;
         let receipt_json = encode(accepted)?;
         let created_ms = to_i64(accepted.observed_ms)?;
-        let event_json = encode(&ControlEvent::CommandReceipt(accepted.clone()))?;
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(&command.request_id)
@@ -233,7 +336,13 @@ impl ControlRepository for PgControlRepository {
                 crate::AccountDeliveryRepositoryError::CorruptData => RepositoryError::CorruptData,
                 _ => RepositoryError::Database,
             })?;
-        insert_event(&mut transaction, created_ms, event_json).await?;
+        insert_ui_event(
+            &mut transaction,
+            accepted.observed_ms,
+            UiEventKind::Command,
+            command_scope(command),
+        )
+        .await?;
         transaction.commit().await.map_err(database_error)?;
         Ok(CommandEnqueueResult::Inserted(accepted.clone()))
     }
@@ -354,7 +463,6 @@ impl ControlRepository for PgControlRepository {
         }
 
         let receipt_json = encode(&scoped.receipt)?;
-        let event_json = encode(&ControlEvent::CommandReceipt(scoped.receipt.clone()))?;
         let observed_ms = to_i64(scoped.receipt.observed_ms)?;
         let inbox_updated = sqlx::query(
             "UPDATE venue_control_command_inbox \
@@ -383,31 +491,58 @@ impl ControlRepository for PgControlRepository {
             transaction.rollback().await.map_err(database_error)?;
             return Err(RepositoryError::DeliveryConflict);
         }
-        insert_event(&mut transaction, observed_ms, event_json).await?;
+        insert_ui_event(
+            &mut transaction,
+            scoped.receipt.observed_ms,
+            UiEventKind::Command,
+            command_scope(&scoped.command),
+        )
+        .await?;
         transaction.commit().await.map_err(database_error)?;
         Ok(CommandSettleResult::Stored(scoped.receipt.clone()))
     }
 
     async fn list_events(
         &self,
+        scope: &UiAccountScope,
         after_sequence: i64,
         limit: u32,
     ) -> Result<Vec<StoredEvent>, RepositoryError> {
+        scope.validate().map_err(|_| RepositoryError::CorruptData)?;
         let rows = sqlx::query(
-            "SELECT event_sequence, event_json FROM venue_control_events \
-             WHERE event_sequence > $1 ORDER BY event_sequence LIMIT $2",
+            "WITH scoped AS ( \
+                 SELECT event_sequence, event_json, \
+                        COALESCE(LAG(event_sequence) OVER (ORDER BY event_sequence), 0) \
+                          AS previous_cursor \
+                 FROM venue_control_events \
+                 WHERE event_json->'scope'->>'venue' = $2 \
+                   AND event_json->'scope'->>'mode' = $3 \
+                   AND event_json->'scope'->>'trading_account_id' = $4 \
+             ) SELECT event_sequence, event_json, previous_cursor FROM scoped \
+               WHERE event_sequence > $1 ORDER BY event_sequence LIMIT $5",
         )
         .bind(after_sequence)
+        .bind(scope.venue.as_str())
+        .bind(scope.mode.as_str())
+        .bind(&scope.trading_account_id)
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await
         .map_err(database_error)?;
         rows.into_iter()
             .map(|row| {
-                Ok(StoredEvent {
-                    sequence: row.try_get("event_sequence").map_err(database_error)?,
-                    event: decode(row.try_get("event_json").map_err(database_error)?)?,
-                })
+                let sequence: i64 = row.try_get("event_sequence").map_err(database_error)?;
+                let previous_cursor: i64 =
+                    row.try_get("previous_cursor").map_err(database_error)?;
+                let notification: UiEventNotification =
+                    decode(row.try_get("event_json").map_err(database_error)?)?;
+                let event = UiEventEnvelope::from_notification(
+                    notification,
+                    u64::try_from(sequence).map_err(|_| RepositoryError::CorruptData)?,
+                    u64::try_from(previous_cursor).map_err(|_| RepositoryError::CorruptData)?,
+                )
+                .map_err(|_| RepositoryError::CorruptData)?;
+                Ok(StoredEvent { sequence, event })
             })
             .collect()
     }
@@ -461,18 +596,89 @@ impl ControlRepository for PgControlRepository {
     }
 }
 
-async fn insert_event(
+pub(crate) async fn insert_ui_event(
     transaction: &mut Transaction<'_, Postgres>,
-    observed_ms: i64,
-    event_json: serde_json::Value,
-) -> Result<(), RepositoryError> {
-    sqlx::query("INSERT INTO venue_control_events (observed_ms, event_json) VALUES ($1, $2)")
-        .bind(observed_ms)
-        .bind(event_json)
-        .execute(&mut **transaction)
-        .await
-        .map_err(database_error)?;
-    Ok(())
+    observed_ms: u64,
+    event_type: UiEventKind,
+    scope: UiAccountScope,
+) -> Result<i64, RepositoryError> {
+    let event = UiEventNotification {
+        schema_version: CONTROL_SCHEMA_VERSION,
+        event_type,
+        scope,
+        observed_ms,
+    };
+    event.validate().map_err(|_| RepositoryError::CorruptData)?;
+    let row = sqlx::query(
+        "INSERT INTO venue_control_events (observed_ms, event_json) VALUES ($1, $2) \
+         RETURNING event_sequence",
+    )
+    .bind(to_i64(observed_ms)?)
+    .bind(encode(&event)?)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    row.try_get("event_sequence").map_err(database_error)
+}
+
+fn command_scope(command: &ControlCommandRequest) -> UiAccountScope {
+    UiAccountScope {
+        venue: command.venue,
+        mode: command.mode,
+        trading_account_id: command.trading_account_id.clone(),
+    }
+}
+
+fn fact_scope(binding: &ExecutionFactBinding) -> UiAccountScope {
+    UiAccountScope {
+        venue: binding.venue,
+        mode: binding.mode,
+        trading_account_id: binding.trading_account_id.clone(),
+    }
+}
+
+fn push_unique_scope(scopes: &mut Vec<UiAccountScope>, scope: UiAccountScope) {
+    if !scopes.contains(&scope) {
+        scopes.push(scope);
+    }
+}
+
+fn execution_fact_scopes(facts: &ExecutionFactsSnapshot) -> Vec<UiAccountScope> {
+    let mut scopes = Vec::new();
+    for binding in facts
+        .orders
+        .iter()
+        .map(|fact| &fact.binding)
+        .chain(facts.positions.iter().map(|fact| &fact.binding))
+        .chain(facts.fills.iter().map(|fact| &fact.binding))
+        .chain(facts.reconciliation.iter().map(|fact| &fact.binding))
+        .chain(facts.copy_ledger.iter().map(|fact| &fact.binding))
+        .chain(facts.drift.iter().map(|fact| &fact.binding))
+        .chain(facts.execution.iter().map(|fact| &fact.binding))
+    {
+        push_unique_scope(&mut scopes, fact_scope(binding));
+    }
+    for fact in &facts.risk {
+        push_unique_scope(
+            &mut scopes,
+            UiAccountScope {
+                venue: fact.venue,
+                mode: fact.mode,
+                trading_account_id: fact.trading_account_id.clone(),
+            },
+        );
+    }
+    for fact in &facts.health {
+        push_unique_scope(
+            &mut scopes,
+            UiAccountScope {
+                venue: fact.venue,
+                mode: fact.mode,
+                trading_account_id: fact.trading_account_id.clone(),
+            },
+        );
+    }
+    scopes
 }
 
 fn encode<T: serde::Serialize>(value: &T) -> Result<serde_json::Value, RepositoryError> {
@@ -502,14 +708,14 @@ fn database_error(_: sqlx::Error) -> RepositoryError {
 
 #[cfg(test)]
 mod migration_tests {
-    use super::MIGRATION_0006;
+    use super::MIGRATION_0014;
 
     #[test]
     fn manual_trade_migration_only_expands_the_command_action_constraint() {
-        assert!(MIGRATION_0006.contains("'TRADE'"));
-        assert!(MIGRATION_0006.contains("venue_control_command_action_v2"));
+        assert!(MIGRATION_0014.contains("'TRADE'"));
+        assert!(MIGRATION_0014.contains("venue_control_command_action_v2"));
         for forbidden in ["execution_writer", "risk_permit", "command_wal"] {
-            assert!(!MIGRATION_0006.contains(forbidden));
+            assert!(!MIGRATION_0014.contains(forbidden));
         }
     }
 }

@@ -6,11 +6,31 @@ use crate::{CopyId, CopyIdentitySet, identity::derive_commitment};
 
 pub const MAX_DELIVERY_TTL_MS: u64 = 5 * 60 * 1_000;
 
+/// Immutable control-plane version selected when a Copy snapshot is made.  It is evidence only;
+/// it cannot authorize a writer or make an old relation configuration current again.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RelationCommitment {
+    pub relation_id: CopyId,
+    pub revision: u64,
+    pub policy_digest: [u8; 32],
+}
+
+impl RelationCommitment {
+    pub fn validate(&self) -> Result<(), DeliveryError> {
+        if self.relation_id.is_nil() || self.revision == 0 || self.policy_digest == [0; 32] {
+            return Err(DeliveryError::Relation);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeliveryBinding {
+    pub relation: RelationCommitment,
     pub leader_id: CopyId,
     pub follower_id: CopyId,
     pub follower_binding_id: CopyId,
+    pub follower_instance_id: String,
     pub account_id: String,
     pub instrument: InstrumentIdentity,
     pub policy_id: CopyId,
@@ -29,10 +49,12 @@ pub struct FollowerDeliveryManifest {
 
 impl FollowerDeliveryManifest {
     pub fn validate(&self, now_ms: u64) -> Result<(), DeliveryError> {
+        self.binding.relation.validate()?;
         if !is_canonical_trading_account_id(&self.binding.account_id)
             || self.binding.leader_id.is_nil()
             || self.binding.follower_id.is_nil()
             || self.binding.follower_binding_id.is_nil()
+            || self.binding.follower_instance_id.trim().is_empty()
             || self.binding.policy_id.is_nil()
             || self.identities.job_id.is_nil()
             || self.identities.planning_snapshot_id.is_nil()
@@ -96,8 +118,12 @@ impl FollowerDeliveryManifest {
                 self.identities.child_order_id.as_bytes(),
                 self.identities.idempotency_key.as_bytes(),
                 self.binding.leader_id.as_bytes(),
+                self.binding.relation.relation_id.as_bytes(),
+                &self.binding.relation.revision.to_be_bytes(),
+                &self.binding.relation.policy_digest,
                 self.binding.follower_id.as_bytes(),
                 self.binding.follower_binding_id.as_bytes(),
+                self.binding.follower_instance_id.as_bytes(),
                 self.binding.account_id.as_bytes(),
                 self.binding.instrument.symbol.base().as_bytes(),
                 self.binding.instrument.symbol.quote().as_bytes(),
@@ -256,6 +282,8 @@ fn state_from_receipt(receipt: PersistedDeliveryReceipt) -> DeliveryState {
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum DeliveryError {
+    #[error("delivery relation revision or policy digest is invalid")]
+    Relation,
     #[error("delivery account binding is not canonical")]
     Binding,
     #[error("delivery linear instrument settlement must exactly match its quote asset")]
@@ -301,9 +329,15 @@ mod tests {
         Ok(FollowerDeliveryManifest {
             identities: primary,
             binding: DeliveryBinding {
+                relation: RelationCommitment {
+                    relation_id: identities(60)?.job_id,
+                    revision: 1,
+                    policy_digest: [6; 32],
+                },
                 leader_id: related.job_id,
                 follower_id: related.planning_snapshot_id,
                 follower_binding_id: related.child_order_id,
+                follower_instance_id: "copy-follower".to_owned(),
                 account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
                 instrument: InstrumentIdentity {
                     symbol: "BTC/USDT".parse::<Symbol>()?,

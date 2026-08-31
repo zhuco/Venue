@@ -20,6 +20,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 venue-domain = { path = "../venue-domain" }
+venue-execution = { path = "../venue-execution" }
 venue-gateway-api = { path = "../venue-gateway-api" }
 
 [lints.rust]

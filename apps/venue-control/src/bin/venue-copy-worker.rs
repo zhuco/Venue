@@ -6,7 +6,9 @@ use std::{env, time::SystemTime};
 use sqlx::postgres::PgPoolOptions;
 use venue_control::{
     CopyObserverScope, CopyWorker, CopyWorkerConfig, MIGRATION_0001, MIGRATION_0002,
-    MIGRATION_0003, MIGRATION_0004, MIGRATION_0005, MIGRATION_0006, PgControlRepository,
+    MIGRATION_0003, MIGRATION_0004, MIGRATION_0005, MIGRATION_0006, MIGRATION_0007, MIGRATION_0008,
+    MIGRATION_0009, MIGRATION_0010, MIGRATION_0011, MIGRATION_0012, MIGRATION_0013, MIGRATION_0014,
+    PgControlRepository,
 };
 use venue_control_protocol::{GatewayMode, VenueId};
 
@@ -33,6 +35,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sqlx::raw_sql(MIGRATION_0004).execute(&pool).await?;
     sqlx::raw_sql(MIGRATION_0005).execute(&pool).await?;
     sqlx::raw_sql(MIGRATION_0006).execute(&pool).await?;
+    sqlx::raw_sql(MIGRATION_0007).execute(&pool).await?;
+    sqlx::raw_sql(MIGRATION_0008).execute(&pool).await?;
+    sqlx::raw_sql(MIGRATION_0009).execute(&pool).await?;
+    sqlx::raw_sql(MIGRATION_0010).execute(&pool).await?;
+    sqlx::raw_sql(MIGRATION_0011).execute(&pool).await?;
+    sqlx::raw_sql(MIGRATION_0012).execute(&pool).await?;
+    sqlx::raw_sql(MIGRATION_0013).execute(&pool).await?;
+    sqlx::raw_sql(MIGRATION_0014).execute(&pool).await?;
     let worker = CopyWorker::new(
         PgControlRepository::new(pool),
         CopyWorkerConfig {
@@ -56,7 +66,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Some(planned) = worker.plan_next(unix_time_ms()?).await? {
+                let now_ms = unix_time_ms()?;
+                if let Some(rejected) = worker.project_next_rejected_delivery().await? {
+                    println!("copy rejected delivery projection result={rejected:?}");
+                }
+                if let Some(projected) = worker.project_next_reconciled_ledger(now_ms).await? {
+                    println!("copy ledger projection result={projected:?}");
+                }
+                if let Some(planned) = worker.plan_next(now_ms).await? {
                     println!(
                         "copy planner committed event={} job={}",
                         planned.observed.event_sequence,

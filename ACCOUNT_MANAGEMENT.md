@@ -44,7 +44,7 @@ cargo run -p venue-control --bin venue-control-server
 cargo run -p venueflow --bin venueflow
 ```
 
-默认监听和连接 `127.0.0.1:39180`。Control 启动时幂等安装 `0001`–`0007` migrations。`VENUE_CONTROL_BIND` 可覆盖监听地址，但服务只允许 loopback；远程 UI 应通过受控 HTTPS 入口转发，Web 使用同源部署。`VENUE_CONTROL_URL` 提供首次 UI 默认地址，已有 UI 配置通过设置修改。
+默认监听和连接 `127.0.0.1:39180`。Control 启动时幂等安装 `0001`–`0015` migrations；`0006`–`0013` 为跟单/投影迁移，`0014` 扩展手动交易语义，`0015` 安装账户管理。`VENUE_CONTROL_BIND` 可覆盖监听地址，但服务只允许 loopback；远程 UI 应通过受控 HTTPS 入口转发，Web 使用同源部署。`VENUE_CONTROL_URL` 提供首次 UI 默认地址，已有 UI 配置通过设置修改。
 
 不要把数据库 URL、主密钥或实际 API Key 粘贴到诊断输出。主密钥丢失无法恢复绑定密文；轮换必须另行设计迁移，不可直接换值后假定旧绑定仍可用。
 

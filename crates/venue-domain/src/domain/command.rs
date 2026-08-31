@@ -209,6 +209,26 @@ impl ExecutionCommand {
         }
     }
 
+    /// Checks data that can be verified without a current account position. Journals use this
+    /// during replay: a historically valid Net reduction must remain readable after inventory
+    /// changes. This does not authorize execution; Net commands still require the current signed
+    /// position check at admission and dispatch.
+    pub fn validate_persisted_shape(&self) -> Result<(), CommandError> {
+        match self {
+            Self::PlaceLimit(command) if command.position_side == PositionSide::Net => {
+                command.validate_shape()
+            }
+            Self::PlaceMarket(command) if command.position_side == PositionSide::Net => {
+                command.validate_shape()
+            }
+            Self::MarketReduce(command) if command.position_side == PositionSide::Net => {
+                command.validate_shape()?;
+                command.validate_generation()
+            }
+            _ => self.validate(),
+        }
+    }
+
     pub fn owner(&self) -> Option<&OrderOwner> {
         match self {
             Self::PlaceLimit(command) => Some(&command.owner),
@@ -919,6 +939,56 @@ mod tests {
         assert_eq!(
             reduce.validate_with_authoritative_position(&net_position(Decimal::ZERO)?),
             Err(CommandError::NetReduceDirection)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_net_shape_does_not_replace_signed_position_validation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let reduce = MarketReduceCommand {
+            command_id: CommandId::new("net_reduce_shape")?,
+            client_order_id: CommandId::new("net_reduce_shape_client")?,
+            owner: test_owner(OrderPurpose::ExposureTakeProfit)?,
+            position_side: PositionSide::Net,
+            side: OrderSide::Sell,
+            quantity: Decimal::ONE,
+            risk_episode_id: CommandId::new("net_shape_episode")?,
+            position_generation: 4,
+        };
+        let execution = ExecutionCommand::MarketReduce(reduce.clone());
+        execution.validate_persisted_shape()?;
+        assert_eq!(execution.validate(), Err(CommandError::PositionSide));
+        reduce.validate_with_authoritative_position(&net_position(Decimal::ONE)?)?;
+        for quantity in [Decimal::ZERO, -Decimal::ONE] {
+            assert_eq!(
+                reduce.validate_with_authoritative_position(&net_position(quantity)?),
+                Err(CommandError::NetReduceDirection)
+            );
+        }
+        let mut invalid = reduce.clone();
+        invalid.position_generation = 0;
+        assert_eq!(
+            ExecutionCommand::MarketReduce(invalid).validate_persisted_shape(),
+            Err(CommandError::PositionGeneration)
+        );
+        let mut invalid = reduce;
+        invalid.quantity = Decimal::ZERO;
+        assert_eq!(
+            ExecutionCommand::MarketReduce(invalid).validate_persisted_shape(),
+            Err(CommandError::Quantity)
+        );
+        let entry = net_limit(OrderPurpose::Entry, OrderSide::Sell, Decimal::ONE)?;
+        ExecutionCommand::PlaceLimit(entry.clone()).validate_persisted_shape()?;
+        assert_eq!(
+            entry.validate_with_authoritative_position(&net_position(Decimal::ONE)?),
+            Err(CommandError::NetOpenDirection)
+        );
+        let mut invalid_hedge = entry;
+        invalid_hedge.position_side = PositionSide::Long;
+        assert_eq!(
+            ExecutionCommand::PlaceLimit(invalid_hedge).validate_persisted_shape(),
+            Err(CommandError::PositionSide)
         );
         Ok(())
     }

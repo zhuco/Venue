@@ -1,9 +1,14 @@
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui;
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex},
+};
 use venue_control_protocol::accounts::SecretValue;
 use venue_control_protocol::{
-    COMMAND_PATH, CommandReceipt, ControlCommandRequest, ControlEvent, ControlSnapshot,
-    EVENT_STREAM_PATH, SNAPSHOT_PATH,
+    COMMAND_PATH, COPY_RELATION_PATH, CommandReceipt, ControlCommandRequest, ControlSnapshot,
+    CopyRelationReceipt, CopyRelationRecord, CopyRelationUpsertRequest, EVENT_STREAM_PATH,
+    SNAPSHOT_PATH, UiAccountScope, UiEventEnvelope,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -21,15 +26,19 @@ pub enum ClientEvent {
     StreamConnected { resumed_after: Option<i64> },
     StreamUnavailable(String),
     CommandUnavailable(String),
+    CopyRelationUnavailable(String),
     EventCursor(i64),
     Snapshot(ControlSnapshot),
     Receipt(CommandReceipt),
-    Notice(String),
+    CopyRelationConfigs(Vec<CopyRelationRecord>),
+    CopyRelationReceipt(CopyRelationReceipt),
 }
 
 pub struct ControlClient {
     events: Receiver<ClientEvent>,
     command_tx: Sender<ControlCommandRequest>,
+    copy_relation_tx: Sender<CopyRelationUpsertRequest>,
+    stream_gates: StreamGates,
     #[cfg(not(target_arch = "wasm32"))]
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(target_arch = "wasm32")]
@@ -48,20 +57,41 @@ impl ControlClient {
     ) -> Self {
         let (event_tx, events) = unbounded();
         let (command_tx, command_rx) = unbounded();
+        let (copy_relation_tx, copy_relation_rx) = unbounded();
+        let stream_gates = StreamGates::default();
 
         #[cfg(not(target_arch = "wasm32"))]
         let stop = {
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            start_native(endpoint, event_tx, command_rx, context, stop.clone(), token);
+            start_native(
+                endpoint,
+                event_tx,
+                command_rx,
+                copy_relation_rx,
+                context,
+                stop.clone(),
+                stream_gates.clone(),
+                token,
+            );
             stop
         };
 
         #[cfg(target_arch = "wasm32")]
-        let web = WebClient::start(endpoint, event_tx, command_rx, context, token);
+        let web = WebClient::start(
+            endpoint,
+            event_tx,
+            command_rx,
+            copy_relation_rx,
+            context,
+            stream_gates.clone(),
+            token,
+        );
 
         Self {
             events,
             command_tx,
+            copy_relation_tx,
+            stream_gates,
             #[cfg(not(target_arch = "wasm32"))]
             stop,
             #[cfg(target_arch = "wasm32")]
@@ -75,8 +105,30 @@ impl ControlClient {
 
     pub fn send(&self, command: ControlCommandRequest) -> Result<(), ClientError> {
         command.validate().map_err(ClientError::Protocol)?;
+        if !self.stream_gates.is_open(&command_scope(&command)) {
+            return Err(ClientError::WriteGateClosed);
+        }
         self.command_tx
             .send(command)
+            .map_err(|_| ClientError::Closed)
+    }
+
+    pub fn send_copy_relation(
+        &self,
+        request: CopyRelationUpsertRequest,
+    ) -> Result<(), ClientError> {
+        request.validate().map_err(ClientError::Protocol)?;
+        if !self
+            .stream_gates
+            .is_open(&copy_scope(&request.relation.leader))
+            || !self
+                .stream_gates
+                .is_open(&copy_scope(&request.relation.follower))
+        {
+            return Err(ClientError::WriteGateClosed);
+        }
+        self.copy_relation_tx
+            .send(request)
             .map_err(|_| ClientError::Closed)
     }
 }
@@ -94,6 +146,98 @@ pub enum ClientError {
     Protocol(venue_control_protocol::ProtocolError),
     #[error("control client is closed")]
     Closed,
+    #[error("the scoped event stream is not currently healthy; writes are closed")]
+    WriteGateClosed,
+}
+
+#[derive(Clone, Default)]
+struct StreamGates(Arc<Mutex<StreamGateState>>);
+
+#[derive(Default)]
+struct StreamGateState {
+    desired: BTreeSet<UiAccountScope>,
+    open: BTreeSet<UiAccountScope>,
+    running: BTreeSet<UiAccountScope>,
+}
+
+impl StreamGates {
+    fn reconcile(&self, scopes: BTreeSet<UiAccountScope>) {
+        if let Ok(mut state) = self.0.lock() {
+            state.desired = scopes;
+            let desired = state.desired.clone();
+            state.open.retain(|scope| desired.contains(scope));
+        }
+    }
+
+    fn is_desired(&self, scope: &UiAccountScope) -> bool {
+        self.0
+            .lock()
+            .is_ok_and(|state| state.desired.contains(scope))
+    }
+
+    fn try_start(&self, scope: &UiAccountScope) -> bool {
+        self.0.lock().is_ok_and(|mut state| {
+            state.desired.contains(scope) && state.running.insert(scope.clone())
+        })
+    }
+
+    fn opened(&self, scope: &UiAccountScope) {
+        if let Ok(mut state) = self.0.lock()
+            && state.desired.contains(scope)
+        {
+            state.open.insert(scope.clone());
+        }
+    }
+
+    fn closed(&self, scope: &UiAccountScope) {
+        if let Ok(mut state) = self.0.lock() {
+            state.open.remove(scope);
+        }
+    }
+
+    fn finished(&self, scope: &UiAccountScope) {
+        if let Ok(mut state) = self.0.lock() {
+            state.open.remove(scope);
+            state.running.remove(scope);
+        }
+    }
+
+    fn is_open(&self, scope: &UiAccountScope) -> bool {
+        self.0.lock().is_ok_and(|state| state.open.contains(scope))
+    }
+}
+
+fn command_scope(command: &ControlCommandRequest) -> UiAccountScope {
+    UiAccountScope {
+        venue: command.venue,
+        mode: command.mode,
+        trading_account_id: command.trading_account_id.clone(),
+    }
+}
+
+fn copy_scope(binding: &venue_control_protocol::CopyRelationBinding) -> UiAccountScope {
+    UiAccountScope {
+        venue: binding.venue,
+        mode: binding.mode,
+        trading_account_id: binding.trading_account_id.clone(),
+    }
+}
+
+fn snapshot_scopes(snapshot: &ControlSnapshot) -> BTreeSet<UiAccountScope> {
+    snapshot
+        .accounts
+        .iter()
+        .map(|account| UiAccountScope {
+            venue: account.venue,
+            mode: account.mode,
+            trading_account_id: account.trading_account_id.clone(),
+        })
+        .chain(snapshot.strategies.iter().map(|strategy| UiAccountScope {
+            venue: strategy.venue,
+            mode: strategy.mode,
+            trading_account_id: strategy.trading_account_id.clone(),
+        }))
+        .collect()
 }
 
 fn path(endpoint: &str, route: &str) -> String {
@@ -111,39 +255,15 @@ fn publish(sender: &Sender<ClientEvent>, context: &egui::Context, event: ClientE
     }
 }
 
-fn publish_control_event(
-    sender: &Sender<ClientEvent>,
-    context: &egui::Context,
-    event: ControlEvent,
-) {
-    if let Err(error) = event.validate() {
-        publish(
-            sender,
-            context,
-            ClientEvent::Notice(format!("ignored invalid Control v2 event: {error}")),
-        );
-        return;
-    }
-    match event {
-        ControlEvent::Snapshot(snapshot) => {
-            publish(sender, context, ClientEvent::Snapshot(snapshot));
-        }
-        ControlEvent::CommandReceipt(receipt) => {
-            publish(sender, context, ClientEvent::Receipt(receipt));
-        }
-        ControlEvent::Notice { message, .. } => {
-            publish(sender, context, ClientEvent::Notice(message));
-        }
-    }
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 fn start_native(
     endpoint: String,
     sender: Sender<ClientEvent>,
     commands: Receiver<ControlCommandRequest>,
+    copy_relations: Receiver<CopyRelationUpsertRequest>,
     context: egui::Context,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stream_gates: StreamGates,
     token: Option<SecretValue>,
 ) {
     let spawn = std::thread::Builder::new()
@@ -167,7 +287,14 @@ fn start_native(
                 }
             };
             runtime.block_on(native_loop(
-                endpoint, sender, commands, context, stop, token,
+                endpoint,
+                sender,
+                commands,
+                copy_relations,
+                context,
+                stop,
+                stream_gates,
+                token,
             ));
         });
     if let Err(error) = spawn {
@@ -180,10 +307,13 @@ async fn native_loop(
     endpoint: String,
     sender: Sender<ClientEvent>,
     commands: Receiver<ControlCommandRequest>,
+    copy_relations: Receiver<CopyRelationUpsertRequest>,
     context: egui::Context,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stream_gates: StreamGates,
     token: Option<SecretValue>,
 ) {
+    let authenticated = token.is_some();
     if token.is_some() && !crate::account_client::safe_endpoint(&endpoint) {
         publish(&sender, &context, ClientEvent::SessionExpired);
         return;
@@ -208,21 +338,27 @@ async fn native_loop(
         }
     };
 
-    fetch_native_snapshot(&client, &endpoint, &sender, &context).await;
-    let stream_sender = sender.clone();
-    let stream_context = context.clone();
-    let stream_client = client.clone();
-    let stream_url = path(&endpoint, EVENT_STREAM_PATH);
-    let stream_stop = stop.clone();
+    let (scope_tx, scope_rx) = tokio::sync::mpsc::unbounded_channel();
+    if let Some(scopes) =
+        fetch_native_snapshot(&client, &endpoint, &sender, &context, authenticated).await
+    {
+        let _ = scope_tx.send(scopes);
+    }
+    if authenticated {
+        fetch_native_copy_relations(&client, &endpoint, &sender, &context).await;
+    }
+    let stream = NativeStreamContext {
+        client: client.clone(),
+        endpoint: endpoint.clone(),
+        sender: sender.clone(),
+        context: context.clone(),
+        stop: stop.clone(),
+        gates: stream_gates.clone(),
+        scope_tx: scope_tx.clone(),
+        authenticated,
+    };
     tokio::spawn(async move {
-        native_event_supervisor(
-            stream_client,
-            stream_url,
-            stream_sender,
-            stream_context,
-            stream_stop,
-        )
-        .await;
+        native_event_supervisor(stream, scope_rx).await;
     });
 
     let mut next_snapshot = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -260,6 +396,10 @@ async fn native_loop(
                         ),
                     }
                 }
+                Ok(response) if response.status().as_u16() == 401 => {
+                    publish(&sender, &context, ClientEvent::SessionExpired);
+                    return;
+                }
                 Ok(response) => publish(
                     &sender,
                     &context,
@@ -276,8 +416,69 @@ async fn native_loop(
             }
         }
 
+        for request in copy_relations.try_iter().take(16) {
+            let response = client
+                .post(path(&endpoint, COPY_RELATION_PATH))
+                .json(&request)
+                .timeout(REQUEST_TIMEOUT)
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    match response.json::<CopyRelationReceipt>().await {
+                        Ok(receipt)
+                            if receipt.validate().is_ok()
+                                && receipt.relation_id == request.relation.relation_id =>
+                        {
+                            publish(&sender, &context, ClientEvent::CopyRelationReceipt(receipt));
+                        }
+                        Ok(_) => publish(
+                            &sender,
+                            &context,
+                            ClientEvent::CopyRelationUnavailable(
+                                "invalid or mismatched copy relation receipt".to_owned(),
+                            ),
+                        ),
+                        Err(error) => publish(
+                            &sender,
+                            &context,
+                            ClientEvent::CopyRelationUnavailable(format!(
+                                "invalid copy relation receipt: {error}"
+                            )),
+                        ),
+                    }
+                }
+                Ok(response) if response.status().as_u16() == 401 => {
+                    publish(&sender, &context, ClientEvent::SessionExpired);
+                    return;
+                }
+                Ok(response) => publish(
+                    &sender,
+                    &context,
+                    ClientEvent::CopyRelationUnavailable(format!(
+                        "copy relation request returned HTTP {}",
+                        response.status()
+                    )),
+                ),
+                Err(error) => publish(
+                    &sender,
+                    &context,
+                    ClientEvent::CopyRelationUnavailable(format!(
+                        "copy relation request failed: {error}"
+                    )),
+                ),
+            }
+        }
+
         if tokio::time::Instant::now() >= next_snapshot {
-            fetch_native_snapshot(&client, &endpoint, &sender, &context).await;
+            if let Some(scopes) =
+                fetch_native_snapshot(&client, &endpoint, &sender, &context, authenticated).await
+            {
+                let _ = scope_tx.send(scopes);
+            }
+            if authenticated {
+                fetch_native_copy_relations(&client, &endpoint, &sender, &context).await;
+            }
             next_snapshot = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -285,33 +486,36 @@ async fn native_loop(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn fetch_native_snapshot(
+async fn fetch_native_copy_relations(
     client: &reqwest::Client,
     endpoint: &str,
     sender: &Sender<ClientEvent>,
     context: &egui::Context,
 ) {
     match client
-        .get(path(endpoint, SNAPSHOT_PATH))
+        .get(path(endpoint, COPY_RELATION_PATH))
         .timeout(REQUEST_TIMEOUT)
         .send()
         .await
     {
         Ok(response) if response.status().is_success() => {
-            match response.json::<ControlSnapshot>().await {
-                Ok(snapshot) if snapshot.validate().is_ok() => {
-                    publish(sender, context, ClientEvent::SnapshotConnected);
-                    publish(sender, context, ClientEvent::Snapshot(snapshot));
+            match response.json::<Vec<CopyRelationRecord>>().await {
+                Ok(configs) if configs.iter().all(|record| record.validate().is_ok()) => {
+                    publish(sender, context, ClientEvent::CopyRelationConfigs(configs))
                 }
                 Ok(_) => publish(
                     sender,
                     context,
-                    ClientEvent::SnapshotUnavailable("snapshot validation failed".to_owned()),
+                    ClientEvent::CopyRelationUnavailable(
+                        "copy relation configuration validation failed".to_owned(),
+                    ),
                 ),
                 Err(error) => publish(
                     sender,
                     context,
-                    ClientEvent::SnapshotUnavailable(format!("invalid snapshot: {error}")),
+                    ClientEvent::CopyRelationUnavailable(format!(
+                        "invalid copy relation configuration: {error}"
+                    )),
                 ),
             }
         }
@@ -321,61 +525,180 @@ async fn fetch_native_snapshot(
         Ok(response) => publish(
             sender,
             context,
-            ClientEvent::SnapshotUnavailable(format!(
-                "snapshot returned HTTP {}",
+            ClientEvent::CopyRelationUnavailable(format!(
+                "copy relation configuration returned HTTP {}",
                 response.status()
             )),
         ),
         Err(error) => publish(
             sender,
             context,
-            ClientEvent::SnapshotUnavailable(format!("snapshot unavailable: {error}")),
+            ClientEvent::CopyRelationUnavailable(format!(
+                "copy relation configuration unavailable: {error}"
+            )),
         ),
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn native_event_supervisor(
+async fn fetch_native_snapshot(
+    client: &reqwest::Client,
+    endpoint: &str,
+    sender: &Sender<ClientEvent>,
+    context: &egui::Context,
+    authenticated: bool,
+) -> Option<BTreeSet<UiAccountScope>> {
+    match client
+        .get(path(endpoint, SNAPSHOT_PATH))
+        .timeout(REQUEST_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            match response.json::<ControlSnapshot>().await {
+                Ok(snapshot) if snapshot.validate().is_ok() => {
+                    let scopes = snapshot_scopes(&snapshot);
+                    publish(sender, context, ClientEvent::SnapshotConnected);
+                    publish(sender, context, ClientEvent::Snapshot(snapshot));
+                    Some(scopes)
+                }
+                Ok(_) => {
+                    publish(
+                        sender,
+                        context,
+                        ClientEvent::SnapshotUnavailable("snapshot validation failed".to_owned()),
+                    );
+                    None
+                }
+                Err(error) => {
+                    publish(
+                        sender,
+                        context,
+                        ClientEvent::SnapshotUnavailable(format!("invalid snapshot: {error}")),
+                    );
+                    None
+                }
+            }
+        }
+        Ok(response) if response.status().as_u16() == 401 => {
+            if authenticated {
+                publish(sender, context, ClientEvent::SessionExpired);
+            } else {
+                publish(
+                    sender,
+                    context,
+                    ClientEvent::SnapshotUnavailable("snapshot returned HTTP 401".to_owned()),
+                );
+            }
+            None
+        }
+        Ok(response) => {
+            publish(
+                sender,
+                context,
+                ClientEvent::SnapshotUnavailable(format!(
+                    "snapshot returned HTTP {}",
+                    response.status()
+                )),
+            );
+            None
+        }
+        Err(error) => {
+            publish(
+                sender,
+                context,
+                ClientEvent::SnapshotUnavailable(format!("snapshot unavailable: {error}")),
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+struct NativeStreamContext {
     client: reqwest::Client,
-    url: String,
+    endpoint: String,
     sender: Sender<ClientEvent>,
     context: egui::Context,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    gates: StreamGates,
+    scope_tx: tokio::sync::mpsc::UnboundedSender<BTreeSet<UiAccountScope>>,
+    authenticated: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn native_event_supervisor(
+    stream: NativeStreamContext,
+    mut scopes: tokio::sync::mpsc::UnboundedReceiver<BTreeSet<UiAccountScope>>,
 ) {
     use std::sync::atomic::Ordering;
 
+    while !stream.stop.load(Ordering::Acquire) {
+        let Some(next_scopes) = scopes.recv().await else {
+            return;
+        };
+        stream.gates.reconcile(next_scopes.clone());
+        for scope in next_scopes {
+            if !stream.gates.try_start(&scope) {
+                continue;
+            }
+            let task_stream = stream.clone();
+            tokio::spawn(async move {
+                native_scoped_event_supervisor(task_stream, scope).await;
+            });
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn native_scoped_event_supervisor(stream: NativeStreamContext, scope: UiAccountScope) {
+    use std::sync::atomic::Ordering;
+    let NativeStreamContext {
+        sender,
+        context,
+        stop,
+        gates,
+        ..
+    } = &stream;
+
     let mut cursor = None;
     let mut backoff = ReconnectBackoff::default();
-    while !stop.load(Ordering::Acquire) {
-        match native_event_stream(&client, &url, cursor, &sender, &context, &stop).await {
+    while !stop.load(Ordering::Acquire) && gates.is_desired(&scope) {
+        gates.closed(&scope);
+        match native_event_stream(&stream, &scope, cursor).await {
             Ok(outcome) => {
-                if outcome.cursor.is_some() {
-                    cursor = outcome.cursor;
-                }
+                cursor = outcome.cursor.or(cursor);
                 if outcome.made_progress {
                     backoff.reset();
                 }
-                if !stop.load(Ordering::Acquire) {
+                if !stop.load(Ordering::Acquire) && gates.is_desired(&scope) {
                     publish(
-                        &sender,
-                        &context,
-                        ClientEvent::StreamUnavailable(
-                            "event stream closed; reconnecting from its last event ID".to_owned(),
-                        ),
+                        sender,
+                        context,
+                        ClientEvent::StreamUnavailable(format!(
+                            "event stream for {} closed; reconnecting from its last event ID",
+                            scope.trading_account_id
+                        )),
                     );
                 }
             }
-            Err(error) if !stop.load(Ordering::Acquire) => publish(
-                &sender,
-                &context,
-                ClientEvent::StreamUnavailable(format!("event stream unavailable: {error}")),
+            Err(error) if !stop.load(Ordering::Acquire) && gates.is_desired(&scope) => publish(
+                sender,
+                context,
+                ClientEvent::StreamUnavailable(format!(
+                    "event stream for {} unavailable: {error}",
+                    scope.trading_account_id
+                )),
             ),
-            Err(_) => return,
+            Err(_) => break,
         }
-        if wait_native_stop(&stop, backoff.next_delay()).await {
-            return;
+        gates.closed(&scope);
+        if wait_native_stop(stop, backoff.next_delay()).await {
+            break;
         }
     }
+    gates.finished(&scope);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -406,22 +729,30 @@ struct StreamOutcome {
 
 #[cfg(not(target_arch = "wasm32"))]
 async fn native_event_stream(
-    client: &reqwest::Client,
-    url: &str,
+    stream: &NativeStreamContext,
+    scope: &UiAccountScope,
     cursor: Option<EventCursor>,
-    sender: &Sender<ClientEvent>,
-    context: &egui::Context,
-    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<StreamOutcome, String> {
     use futures_util::StreamExt as _;
     use std::sync::atomic::Ordering;
+    let NativeStreamContext {
+        client,
+        endpoint,
+        sender,
+        context,
+        stop,
+        gates,
+        scope_tx,
+        authenticated,
+    } = stream;
 
-    let mut request = client
-        .get(url)
-        .header(reqwest::header::ACCEPT, "text/event-stream");
-    if let Some(cursor) = cursor {
-        request = request.header("Last-Event-ID", cursor.to_string());
-    }
+    let request = client
+        .get(event_stream_url(endpoint, scope, cursor))
+        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .header(
+            "Last-Event-ID",
+            cursor.map_or(0, EventCursor::value).to_string(),
+        );
     let response = request.send().await.map_err(|error| error.to_string())?;
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
@@ -433,11 +764,12 @@ async fn native_event_stream(
             resumed_after: cursor.map(EventCursor::value),
         },
     );
+    gates.opened(scope);
     let mut bytes = response.bytes_stream();
     let mut decoder = SseDecoder::default();
     let mut latest_cursor = cursor;
     let mut made_progress = false;
-    while !stop.load(Ordering::Acquire) {
+    while !stop.load(Ordering::Acquire) && gates.is_desired(scope) {
         let next =
             match tokio::time::timeout(std::time::Duration::from_millis(100), bytes.next()).await {
                 Ok(next) => next,
@@ -448,32 +780,16 @@ async fn native_event_stream(
         };
         let chunk = chunk.map_err(|error| error.to_string())?;
         for parsed in decoder.push(&chunk)? {
-            if let (Some(previous), Some(next)) = (latest_cursor, parsed.cursor) {
-                if next < previous {
-                    return Err("event stream cursor moved backwards".to_owned());
-                }
-                if next == previous {
-                    continue;
-                }
-            }
-            let control_event = match parsed.payload {
-                Some(payload) => {
-                    let event = serde_json::from_str::<ControlEvent>(&payload)
-                        .map_err(|error| format!("invalid event frame: {error}"))?;
-                    event
-                        .validate()
-                        .map_err(|error| format!("invalid Control v2 event: {error}"))?;
-                    Some(event)
-                }
-                None => None,
+            let Some(next) = validate_invalidation_frame(&parsed, scope, latest_cursor)? else {
+                continue;
             };
-            if let Some(cursor) = parsed.cursor {
-                latest_cursor = Some(cursor);
-                made_progress = true;
-                publish(sender, context, ClientEvent::EventCursor(cursor.value()));
-            }
-            if let Some(event) = control_event {
-                publish_control_event(sender, context, event);
+            latest_cursor = Some(next);
+            made_progress = true;
+            publish(sender, context, ClientEvent::EventCursor(next.value()));
+            if let Some(scopes) =
+                fetch_native_snapshot(client, endpoint, sender, context, *authenticated).await
+            {
+                let _ = scope_tx.send(scopes);
             }
         }
     }
@@ -505,6 +821,53 @@ impl EventCursor {
 impl std::fmt::Display for EventCursor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_invalidation_frame(
+    frame: &ParsedSseFrame,
+    scope: &UiAccountScope,
+    latest_cursor: Option<EventCursor>,
+) -> Result<Option<EventCursor>, String> {
+    validate_invalidation(scope, latest_cursor, frame.cursor, frame.payload.as_deref())
+}
+
+fn validate_invalidation(
+    scope: &UiAccountScope,
+    latest_cursor: Option<EventCursor>,
+    frame_cursor: Option<EventCursor>,
+    payload: Option<&str>,
+) -> Result<Option<EventCursor>, String> {
+    match (frame_cursor, payload) {
+        (None, None) => Ok(None), // keep-alive comment
+        (Some(_), None) | (None, Some(_)) => {
+            Err("event frame must contain both an ID and a schema-2 envelope".to_owned())
+        }
+        (Some(cursor), Some(payload)) => {
+            let envelope = serde_json::from_str::<UiEventEnvelope>(payload)
+                .map_err(|error| format!("invalid schema-2 invalidation: {error}"))?;
+            envelope
+                .validate()
+                .map_err(|error| format!("invalid schema-2 invalidation: {error}"))?;
+            let envelope_cursor = i64::try_from(envelope.cursor)
+                .map_err(|_| "event cursor exceeds the HTTP stream range".to_owned())?;
+            if cursor != EventCursor(envelope_cursor) {
+                return Err("SSE ID disagrees with the invalidation cursor".to_owned());
+            }
+            if &envelope.scope != scope {
+                return Err("invalidation scope does not match its stream".to_owned());
+            }
+            let previous = latest_cursor.map_or(0, EventCursor::value);
+            if envelope.previous_cursor
+                != u64::try_from(previous).map_err(|_| "event cursor is negative".to_owned())?
+            {
+                return Err(
+                    "invalidation previous_cursor breaks the scoped cursor chain".to_owned(),
+                );
+            }
+            Ok(Some(cursor))
+        }
     }
 }
 
@@ -606,7 +969,9 @@ impl WebClient {
         endpoint: String,
         sender: Sender<ClientEvent>,
         commands: Receiver<ControlCommandRequest>,
+        copy_relations: Receiver<CopyRelationUpsertRequest>,
         context: egui::Context,
+        stream_gates: StreamGates,
         token: Option<SecretValue>,
     ) -> Self {
         let stop = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -614,30 +979,48 @@ impl WebClient {
             publish(&sender, &context, ClientEvent::SessionExpired);
             return Self { stop };
         }
-        if let Some(token) = token.clone() {
-            spawn_web_authenticated_events(
-                endpoint.clone(),
-                sender.clone(),
-                context.clone(),
-                stop.clone(),
-                token,
-            );
-        } else {
-            spawn_web_events(
-                endpoint.clone(),
-                sender.clone(),
-                context.clone(),
-                stop.clone(),
-            );
-        }
+        let (scope_tx, scope_rx) = unbounded();
+        spawn_web_events(
+            endpoint.clone(),
+            sender.clone(),
+            context.clone(),
+            stop.clone(),
+            stream_gates.clone(),
+            scope_rx,
+            scope_tx.clone(),
+            token.clone(),
+        );
         spawn_web_snapshot(
+            endpoint.clone(),
+            sender.clone(),
+            context.clone(),
+            stop.clone(),
+            scope_tx,
+            token.clone(),
+        );
+        spawn_web_copy_relations(
             endpoint.clone(),
             sender.clone(),
             context.clone(),
             stop.clone(),
             token.clone(),
         );
-        spawn_web_commands(endpoint, sender, commands, context, stop.clone(), token);
+        spawn_web_commands(
+            endpoint.clone(),
+            sender.clone(),
+            commands,
+            context.clone(),
+            stop.clone(),
+            token.clone(),
+        );
+        spawn_web_copy_relation_requests(
+            endpoint,
+            sender,
+            copy_relations,
+            context,
+            stop.clone(),
+            token,
+        );
         Self { stop }
     }
 }
@@ -655,37 +1038,100 @@ fn spawn_web_events(
     sender: Sender<ClientEvent>,
     context: egui::Context,
     stop: std::rc::Rc<std::cell::Cell<bool>>,
+    gates: StreamGates,
+    scopes: Receiver<BTreeSet<UiAccountScope>>,
+    scope_tx: Sender<BTreeSet<UiAccountScope>>,
+    token: Option<SecretValue>,
 ) {
+    wasm_bindgen_futures::spawn_local(async move {
+        while !stop.get() {
+            for next_scopes in scopes.try_iter() {
+                gates.reconcile(next_scopes.clone());
+                for scope in next_scopes {
+                    if gates.try_start(&scope) {
+                        spawn_web_scoped_events(
+                            endpoint.clone(),
+                            scope,
+                            sender.clone(),
+                            context.clone(),
+                            stop.clone(),
+                            gates.clone(),
+                            scope_tx.clone(),
+                            token.clone(),
+                        );
+                    }
+                }
+            }
+            wasm_timer(100).await;
+        }
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn duration_ms(duration: std::time::Duration) -> i32 {
+    i32::try_from(duration.as_millis()).unwrap_or(i32::MAX)
+}
+
+fn event_stream_url(endpoint: &str, scope: &UiAccountScope, cursor: Option<EventCursor>) -> String {
+    let url = path(endpoint, EVENT_STREAM_PATH);
+    let after = cursor.map_or(0, EventCursor::value);
+    format!(
+        "{url}?venue={}&mode={}&trading_account_id={}&after={after}",
+        scope.venue.as_str(),
+        scope.mode.as_str(),
+        scope.trading_account_id,
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn spawn_web_scoped_events(
+    endpoint: String,
+    scope: UiAccountScope,
+    sender: Sender<ClientEvent>,
+    context: egui::Context,
+    stop: std::rc::Rc<std::cell::Cell<bool>>,
+    gates: StreamGates,
+    scope_tx: Sender<BTreeSet<UiAccountScope>>,
+    token: Option<SecretValue>,
+) {
+    if let Some(token) = token {
+        spawn_web_authenticated_scoped_events(
+            endpoint, scope, sender, context, stop, gates, scope_tx, token,
+        );
+        return;
+    }
     use std::{cell::Cell, rc::Rc};
     use wasm_bindgen::{JsCast as _, closure::Closure};
 
     wasm_bindgen_futures::spawn_local(async move {
         let mut cursor = None;
         let mut backoff = ReconnectBackoff::default();
-        while !stop.get() {
-            let url = event_stream_url(&endpoint, cursor);
-            let source = match web_sys::EventSource::new(&url) {
-                Ok(source) => source,
-                Err(_) => {
-                    publish(
-                        &sender,
-                        &context,
-                        ClientEvent::StreamUnavailable(
-                            "browser could not open the event stream; snapshot polling remains active"
-                                .to_owned(),
-                        ),
-                    );
-                    wasm_timer(duration_ms(backoff.next_delay())).await;
-                    continue;
-                }
-            };
+        while !stop.get() && gates.is_desired(&scope) {
+            gates.closed(&scope);
+            let source =
+                match web_sys::EventSource::new(&event_stream_url(&endpoint, &scope, cursor)) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        publish(
+                            &sender,
+                            &context,
+                            ClientEvent::StreamUnavailable(format!(
+                                "browser could not open the scoped event stream: {error:?}"
+                            )),
+                        );
+                        wasm_timer(duration_ms(backoff.next_delay())).await;
+                        continue;
+                    }
+                };
             let failed = Rc::new(Cell::new(false));
             let latest_cursor = Rc::new(Cell::new(cursor));
-
             let open_sender = sender.clone();
             let open_context = context.clone();
+            let open_gates = gates.clone();
+            let open_scope = scope.clone();
             let resumed_after = cursor.map(EventCursor::value);
             let open = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+                open_gates.opened(&open_scope);
                 publish(
                     &open_sender,
                     &open_context,
@@ -698,71 +1144,47 @@ fn spawn_web_events(
             let message_context = context.clone();
             let message_failed = failed.clone();
             let message_cursor = latest_cursor.clone();
+            let message_scope = scope.clone();
+            let message_endpoint = endpoint.clone();
+            let message_scopes = scope_tx.clone();
             let message = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
-                let event_id = event.last_event_id();
-                let parsed_cursor = match EventCursor::parse(&event_id) {
-                    Ok(cursor) => cursor,
+                let parsed_cursor = EventCursor::parse(&event.last_event_id());
+                let payload = event.data().as_string();
+                match parsed_cursor.and_then(|id| {
+                    validate_invalidation(
+                        &message_scope,
+                        message_cursor.get(),
+                        Some(id),
+                        payload.as_deref(),
+                    )
+                }) {
+                    Ok(Some(next)) => {
+                        message_cursor.set(Some(next));
+                        publish(
+                            &message_sender,
+                            &message_context,
+                            ClientEvent::EventCursor(next.value()),
+                        );
+                        fetch_web_snapshot_once(
+                            message_endpoint.clone(),
+                            message_sender.clone(),
+                            message_context.clone(),
+                            message_scopes.clone(),
+                            None,
+                        );
+                    }
+                    Ok(None) => {}
                     Err(error) => {
                         message_failed.set(true);
                         publish(
                             &message_sender,
                             &message_context,
                             ClientEvent::StreamUnavailable(format!(
-                                "ignored Control v2 event with invalid last-event-id: {error}"
+                                "invalid scoped schema-2 invalidation: {error}"
                             )),
                         );
-                        return;
                     }
-                };
-                if message_cursor
-                    .get()
-                    .is_some_and(|cursor| parsed_cursor <= cursor)
-                {
-                    return;
                 }
-                let Some(payload) = event.data().as_string() else {
-                    message_failed.set(true);
-                    publish(
-                        &message_sender,
-                        &message_context,
-                        ClientEvent::StreamUnavailable(
-                            "ignored non-text Control v2 event".to_owned(),
-                        ),
-                    );
-                    return;
-                };
-                let control_event = match serde_json::from_str::<ControlEvent>(&payload) {
-                    Ok(control_event) if control_event.validate().is_ok() => control_event,
-                    Ok(_) => {
-                        message_failed.set(true);
-                        publish(
-                            &message_sender,
-                            &message_context,
-                            ClientEvent::StreamUnavailable(
-                                "ignored invalid Control v2 event".to_owned(),
-                            ),
-                        );
-                        return;
-                    }
-                    Err(error) => {
-                        message_failed.set(true);
-                        publish(
-                            &message_sender,
-                            &message_context,
-                            ClientEvent::StreamUnavailable(format!(
-                                "ignored invalid event frame: {error}"
-                            )),
-                        );
-                        return;
-                    }
-                };
-                message_cursor.set(Some(parsed_cursor));
-                publish(
-                    &message_sender,
-                    &message_context,
-                    ClientEvent::EventCursor(parsed_cursor.value()),
-                );
-                publish_control_event(&message_sender, &message_context, control_event);
             }) as Box<dyn FnMut(_)>);
             if source
                 .add_event_listener_with_callback("control", message.as_ref().unchecked_ref())
@@ -770,7 +1192,6 @@ fn spawn_web_events(
             {
                 failed.set(true);
             }
-
             let error_sender = sender.clone();
             let error_context = context.clone();
             let error_failed = failed.clone();
@@ -780,38 +1201,44 @@ fn spawn_web_events(
                     &error_sender,
                     &error_context,
                     ClientEvent::StreamUnavailable(
-                        "event stream disconnected; reconnecting from its last event ID".to_owned(),
+                        "scoped event stream disconnected; writes are closed until it reconnects"
+                            .to_owned(),
                     ),
                 );
             }) as Box<dyn FnMut(_)>);
             source.set_onerror(Some(error.as_ref().unchecked_ref()));
-
-            while !stop.get() && !failed.get() {
+            while !stop.get() && !failed.get() && gates.is_desired(&scope) {
                 wasm_timer(100).await;
             }
             source.close();
+            gates.closed(&scope);
             let next_cursor = latest_cursor.get();
             if next_cursor != cursor {
                 cursor = next_cursor;
                 backoff.reset();
             }
             drop((open, message, error));
-            if !stop.get() {
+            if !stop.get() && gates.is_desired(&scope) {
                 wasm_timer(duration_ms(backoff.next_delay())).await;
             }
         }
+        gates.finished(&scope);
     });
 }
 
 #[cfg(target_arch = "wasm32")]
-fn spawn_web_authenticated_events(
+fn spawn_web_authenticated_scoped_events(
     endpoint: String,
+    scope: UiAccountScope,
     sender: Sender<ClientEvent>,
     context: egui::Context,
     stop: std::rc::Rc<std::cell::Cell<bool>>,
+    gates: StreamGates,
+    scope_tx: Sender<BTreeSet<UiAccountScope>>,
     token: SecretValue,
 ) {
     use futures_util::StreamExt;
+
     wasm_bindgen_futures::spawn_local(async move {
         let Ok(headers) = crate::account_client::authorization_headers(Some(&token)) else {
             return;
@@ -819,17 +1246,19 @@ fn spawn_web_authenticated_events(
         let client = reqwest::Client::new();
         let mut cursor = None;
         let mut backoff = ReconnectBackoff::default();
-        while !stop.get() {
+        while !stop.get() && gates.is_desired(&scope) {
+            gates.closed(&scope);
             let response = client
-                .get(event_stream_url(&endpoint, cursor))
+                .get(event_stream_url(&endpoint, &scope, cursor))
                 .headers(headers.clone())
                 .send()
                 .await;
             if stop.get() {
-                return;
+                break;
             }
             match response {
                 Ok(response) if response.status().is_success() => {
+                    gates.opened(&scope);
                     publish(
                         &sender,
                         &context,
@@ -840,8 +1269,8 @@ fn spawn_web_authenticated_events(
                     let mut stream = response.bytes_stream();
                     let mut decoder = SseDecoder::default();
                     'stream: while let Some(chunk) = stream.next().await {
-                        if stop.get() {
-                            return;
+                        if stop.get() || !gates.is_desired(&scope) {
+                            break;
                         }
                         let Ok(chunk) = chunk else {
                             break;
@@ -850,61 +1279,155 @@ fn spawn_web_authenticated_events(
                             break;
                         };
                         for frame in frames {
-                            if let Some(next) = frame.cursor {
-                                if cursor.is_some_and(|previous| next < previous) {
+                            match validate_invalidation(
+                                &scope,
+                                cursor,
+                                frame.cursor,
+                                frame.payload.as_deref(),
+                            ) {
+                                Ok(Some(next)) => {
+                                    cursor = Some(next);
+                                    backoff.reset();
+                                    publish(
+                                        &sender,
+                                        &context,
+                                        ClientEvent::EventCursor(next.value()),
+                                    );
+                                    fetch_web_snapshot_once(
+                                        endpoint.clone(),
+                                        sender.clone(),
+                                        context.clone(),
+                                        scope_tx.clone(),
+                                        Some(token.clone()),
+                                    );
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    publish(
+                                        &sender,
+                                        &context,
+                                        ClientEvent::StreamUnavailable(format!(
+                                            "invalid scoped schema-2 invalidation: {error}"
+                                        )),
+                                    );
                                     break 'stream;
                                 }
-                                if cursor == Some(next) {
-                                    continue;
-                                }
-                            }
-                            if let Some(payload) = frame.payload {
-                                let Ok(event) = serde_json::from_str::<ControlEvent>(&payload)
-                                else {
-                                    break 'stream;
-                                };
-                                if event.validate().is_err() {
-                                    break 'stream;
-                                }
-                                publish_control_event(&sender, &context, event);
-                            }
-                            if let Some(next) = frame.cursor {
-                                cursor = Some(next);
-                                backoff.reset();
-                                publish(&sender, &context, ClientEvent::EventCursor(next.value()));
                             }
                         }
                     }
                 }
                 Ok(response) if response.status().as_u16() == 401 => {
                     publish(&sender, &context, ClientEvent::SessionExpired);
-                    return;
+                    break;
                 }
-                _ => (),
+                Ok(response) => publish(
+                    &sender,
+                    &context,
+                    ClientEvent::StreamUnavailable(format!(
+                        "scoped event stream returned HTTP {}",
+                        response.status()
+                    )),
+                ),
+                Err(error) => publish(
+                    &sender,
+                    &context,
+                    ClientEvent::StreamUnavailable(format!(
+                        "scoped event stream unavailable: {error}"
+                    )),
+                ),
             }
-            publish(
-                &sender,
-                &context,
-                ClientEvent::StreamUnavailable("authenticated event stream reconnecting".into()),
+            gates.closed(&scope);
+            if !stop.get() && gates.is_desired(&scope) {
+                wasm_timer(duration_ms(backoff.next_delay())).await;
+            }
+        }
+        gates.finished(&scope);
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn spawn_web_snapshot(
+    endpoint: String,
+    sender: Sender<ClientEvent>,
+    context: egui::Context,
+    stop: std::rc::Rc<std::cell::Cell<bool>>,
+    scope_tx: Sender<BTreeSet<UiAccountScope>>,
+    token: Option<SecretValue>,
+) {
+    wasm_bindgen_futures::spawn_local(async move {
+        while !stop.get() {
+            fetch_web_snapshot_once(
+                endpoint.clone(),
+                sender.clone(),
+                context.clone(),
+                scope_tx.clone(),
+                token.clone(),
             );
-            wasm_timer(duration_ms(backoff.next_delay())).await;
+            wasm_timer(3_000).await;
         }
     });
 }
 
 #[cfg(target_arch = "wasm32")]
-fn duration_ms(duration: std::time::Duration) -> i32 {
-    i32::try_from(duration.as_millis()).unwrap_or(i32::MAX)
-}
-
-#[cfg(any(target_arch = "wasm32", test))]
-fn event_stream_url(endpoint: &str, cursor: Option<EventCursor>) -> String {
-    let url = path(endpoint, EVENT_STREAM_PATH);
-    cursor.map_or(url.clone(), |cursor| format!("{url}?after={cursor}"))
+fn fetch_web_snapshot_once(
+    endpoint: String,
+    sender: Sender<ClientEvent>,
+    context: egui::Context,
+    scope_tx: Sender<BTreeSet<UiAccountScope>>,
+    token: Option<SecretValue>,
+) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let Ok(headers) = crate::account_client::authorization_headers(token.as_ref()) else {
+            return;
+        };
+        match reqwest::Client::new()
+            .get(path(&endpoint, SNAPSHOT_PATH))
+            .headers(headers)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<ControlSnapshot>().await {
+                    Ok(snapshot) if snapshot.validate().is_ok() => {
+                        let scopes = snapshot_scopes(&snapshot);
+                        publish(&sender, &context, ClientEvent::SnapshotConnected);
+                        publish(&sender, &context, ClientEvent::Snapshot(snapshot));
+                        let _ = scope_tx.send(scopes);
+                    }
+                    Ok(_) => publish(
+                        &sender,
+                        &context,
+                        ClientEvent::SnapshotUnavailable("snapshot validation failed".to_owned()),
+                    ),
+                    Err(error) => publish(
+                        &sender,
+                        &context,
+                        ClientEvent::SnapshotUnavailable(format!("invalid snapshot: {error}")),
+                    ),
+                }
+            }
+            Ok(response) if response.status().as_u16() == 401 => {
+                publish(&sender, &context, ClientEvent::SessionExpired)
+            }
+            Ok(response) => publish(
+                &sender,
+                &context,
+                ClientEvent::SnapshotUnavailable(format!(
+                    "snapshot returned HTTP {}",
+                    response.status()
+                )),
+            ),
+            Err(error) => publish(
+                &sender,
+                &context,
+                ClientEvent::SnapshotUnavailable(format!("snapshot unavailable: {error}")),
+            ),
+        }
+    });
 }
 
 #[cfg(target_arch = "wasm32")]
-fn spawn_web_snapshot(
+fn spawn_web_copy_relations(
     endpoint: String,
     sender: Sender<ClientEvent>,
     context: egui::Context,
@@ -917,28 +1440,29 @@ fn spawn_web_snapshot(
         };
         while !stop.get() {
             match reqwest::Client::new()
-                .get(path(&endpoint, SNAPSHOT_PATH))
+                .get(path(&endpoint, COPY_RELATION_PATH))
                 .headers(headers.clone())
                 .send()
                 .await
             {
                 Ok(response) if response.status().is_success() => {
-                    match response.json::<ControlSnapshot>().await {
-                        Ok(snapshot) if snapshot.validate().is_ok() => {
-                            publish(&sender, &context, ClientEvent::SnapshotConnected);
-                            publish(&sender, &context, ClientEvent::Snapshot(snapshot));
+                    match response.json::<Vec<CopyRelationRecord>>().await {
+                        Ok(configs) if configs.iter().all(|record| record.validate().is_ok()) => {
+                            publish(&sender, &context, ClientEvent::CopyRelationConfigs(configs))
                         }
                         Ok(_) => publish(
                             &sender,
                             &context,
-                            ClientEvent::SnapshotUnavailable(
-                                "snapshot validation failed".to_owned(),
+                            ClientEvent::CopyRelationUnavailable(
+                                "copy relation configuration validation failed".to_owned(),
                             ),
                         ),
                         Err(error) => publish(
                             &sender,
                             &context,
-                            ClientEvent::SnapshotUnavailable(format!("invalid snapshot: {error}")),
+                            ClientEvent::CopyRelationUnavailable(format!(
+                                "invalid copy relation configuration: {error}"
+                            )),
                         ),
                     }
                 }
@@ -949,15 +1473,17 @@ fn spawn_web_snapshot(
                 Ok(response) => publish(
                     &sender,
                     &context,
-                    ClientEvent::SnapshotUnavailable(format!(
-                        "snapshot returned HTTP {}",
+                    ClientEvent::CopyRelationUnavailable(format!(
+                        "copy relation configuration returned HTTP {}",
                         response.status()
                     )),
                 ),
                 Err(error) => publish(
                     &sender,
                     &context,
-                    ClientEvent::SnapshotUnavailable(format!("snapshot unavailable: {error}")),
+                    ClientEvent::CopyRelationUnavailable(format!(
+                        "copy relation configuration unavailable: {error}"
+                    )),
                 ),
             }
             wasm_timer(3_000).await;
@@ -1012,6 +1538,10 @@ fn spawn_web_commands(
                             ),
                         }
                     }
+                    Ok(response) if response.status().as_u16() == 401 => {
+                        publish(&sender, &context, ClientEvent::SessionExpired);
+                        return;
+                    }
                     Ok(response) => publish(
                         &sender,
                         &context,
@@ -1024,6 +1554,82 @@ fn spawn_web_commands(
                         &sender,
                         &context,
                         ClientEvent::CommandUnavailable(format!("control command failed: {error}")),
+                    ),
+                }
+            }
+            wasm_timer(100).await;
+        }
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn spawn_web_copy_relation_requests(
+    endpoint: String,
+    sender: Sender<ClientEvent>,
+    requests: Receiver<CopyRelationUpsertRequest>,
+    context: egui::Context,
+    stop: std::rc::Rc<std::cell::Cell<bool>>,
+    token: Option<SecretValue>,
+) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let Ok(headers) = crate::account_client::authorization_headers(token.as_ref()) else {
+            return;
+        };
+        while !stop.get() {
+            for request in requests.try_iter().take(16) {
+                match reqwest::Client::new()
+                    .post(path(&endpoint, COPY_RELATION_PATH))
+                    .headers(headers.clone())
+                    .json(&request)
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.status().is_success() => {
+                        match response.json::<CopyRelationReceipt>().await {
+                            Ok(receipt)
+                                if receipt.validate().is_ok()
+                                    && receipt.relation_id == request.relation.relation_id =>
+                            {
+                                publish(
+                                    &sender,
+                                    &context,
+                                    ClientEvent::CopyRelationReceipt(receipt),
+                                );
+                            }
+                            Ok(_) => publish(
+                                &sender,
+                                &context,
+                                ClientEvent::CopyRelationUnavailable(
+                                    "invalid or mismatched copy relation receipt".to_owned(),
+                                ),
+                            ),
+                            Err(error) => publish(
+                                &sender,
+                                &context,
+                                ClientEvent::CopyRelationUnavailable(format!(
+                                    "invalid copy relation receipt: {error}"
+                                )),
+                            ),
+                        }
+                    }
+                    Ok(response) if response.status().as_u16() == 401 => {
+                        publish(&sender, &context, ClientEvent::SessionExpired);
+                        return;
+                    }
+                    Ok(response) => publish(
+                        &sender,
+                        &context,
+                        ClientEvent::CopyRelationUnavailable(format!(
+                            "copy relation request returned HTTP {}",
+                            response.status()
+                        )),
+                    ),
+                    Err(error) => publish(
+                        &sender,
+                        &context,
+                        ClientEvent::CopyRelationUnavailable(format!(
+                            "copy relation request failed: {error}"
+                        )),
                     ),
                 }
             }
@@ -1049,8 +1655,20 @@ async fn wasm_timer(milliseconds: i32) {
 mod tests {
     use super::{
         EventCursor, MAX_SSE_BUFFER_BYTES, RECONNECT_INITIAL, RECONNECT_MAX, ReconnectBackoff,
-        SseDecoder, event_stream_url, parse_sse_frame, path, sse_boundary,
+        SseDecoder, StreamGates, event_stream_url, parse_sse_frame, path, sse_boundary,
+        validate_invalidation_frame,
     };
+    use venue_control_protocol::{
+        CONTROL_SCHEMA_VERSION, GatewayMode, UiAccountScope, UiEventEnvelope, UiEventKind, VenueId,
+    };
+
+    fn scope() -> UiAccountScope {
+        UiAccountScope {
+            venue: VenueId::Binance,
+            mode: GatewayMode::Live,
+            trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+        }
+    }
 
     #[test]
     fn api_paths_preserve_the_control_v2_route() {
@@ -1060,8 +1678,12 @@ mod tests {
         );
         assert_eq!(path("", "/v2/ui/events"), "/v2/ui/events");
         assert_eq!(
-            event_stream_url("http://control:39180", Some(EventCursor(42))),
-            "http://control:39180/v2/ui/events?after=42"
+            event_stream_url("http://control:39180", &scope(), Some(EventCursor(42))),
+            "http://control:39180/v2/ui/events?venue=binance&mode=LIVE&trading_account_id=00000000-0000-4000-8000-000000000001&after=42"
+        );
+        assert_eq!(
+            event_stream_url("http://control:39180", &scope(), None),
+            "http://control:39180/v2/ui/events?venue=binance&mode=LIVE&trading_account_id=00000000-0000-4000-8000-000000000001&after=0"
         );
     }
 
@@ -1075,13 +1697,58 @@ mod tests {
     }
 
     #[test]
-    fn sse_frame_without_data_can_advance_a_cursor() -> Result<(), String> {
+    fn heartbeat_does_not_advance_a_scoped_cursor() -> Result<(), String> {
         let frame = parse_sse_frame("id: 43\n: heartbeat")?;
         assert_eq!(frame.cursor, Some(EventCursor(43)));
         assert_eq!(frame.payload, None);
+        assert!(validate_invalidation_frame(&frame, &scope(), Some(EventCursor(42))).is_err());
         assert_eq!(sse_boundary(b"id: x\r\n\r\nnext"), Some((5, 4)));
         assert_eq!(sse_boundary(b"id: x\n\nnext"), Some((5, 2)));
         Ok(())
+    }
+
+    #[test]
+    fn schema_two_invalidation_requires_exact_scope_and_cursor_chain() -> Result<(), String> {
+        let envelope = UiEventEnvelope {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            cursor: 43,
+            previous_cursor: 42,
+            event_type: UiEventKind::Snapshot,
+            scope: scope(),
+        };
+        let frame = parse_sse_frame(&format!(
+            "id: 43\nevent: control\ndata: {}",
+            serde_json::to_string(&envelope).map_err(|error| error.to_string())?
+        ))?;
+        assert_eq!(
+            validate_invalidation_frame(&frame, &scope(), Some(EventCursor(42)))?,
+            Some(EventCursor(43))
+        );
+        assert!(validate_invalidation_frame(&frame, &scope(), Some(EventCursor(41))).is_err());
+        let mut another_scope = scope();
+        another_scope.trading_account_id = "00000000-0000-4000-8000-000000000002".to_owned();
+        assert!(
+            validate_invalidation_frame(&frame, &another_scope, Some(EventCursor(42))).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_gate_is_open_only_for_its_healthy_scope() {
+        let gates = StreamGates::default();
+        let scope = scope();
+        let mut another_scope = scope.clone();
+        another_scope.trading_account_id = "00000000-0000-4000-8000-000000000002".to_owned();
+        gates.reconcile([scope.clone(), another_scope.clone()].into_iter().collect());
+        assert!(gates.try_start(&scope));
+        gates.opened(&scope);
+        assert!(gates.is_open(&scope));
+        assert!(!gates.is_open(&another_scope));
+        gates.closed(&scope);
+        assert!(!gates.is_open(&scope));
+        gates.reconcile([another_scope.clone()].into_iter().collect());
+        assert!(!gates.is_open(&scope));
+        assert!(!gates.is_open(&another_scope));
     }
 
     #[test]

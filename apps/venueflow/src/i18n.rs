@@ -174,6 +174,17 @@ resources! {
     NoStrategies => "No strategy instances were returned.", "服务端未返回策略实例。";
     CopySubtitle => "target exposure and durable drift", "目标敞口与持久偏差";
     NoCopy => "Waiting for copy projections.", "正在等待跟单投影。";
+    CopyRelationDetails => "Selected relation", "已选跟单关系";
+    CopyRelationBinding => "Exact follower binding", "精确跟单账户绑定";
+    CopyRelationConfiguration => "Copy configuration", "跟单配置";
+    LeaderBindingUnavailable => "Leader account binding is not projected by Control v2.", "Control v2 未投影带单账户绑定。";
+    CopyConfigurationUnavailable => "Capital allocation, multiplier, and risk policy are not projected by Control v2.", "Control v2 未投影资本分配、倍率和风险策略。";
+    CopyEditingUnavailable => "Create and edit are unavailable until Control exposes an authenticated relation configuration endpoint.", "Control 提供经认证的关系配置端点前，不能创建或编辑关系。";
+    LastAppliedJob => "Last applied job", "最近应用任务";
+    NoAppliedJob => "No applied job", "暂无已应用任务";
+    SelectCopyRelation => "Select a relation to inspect its precise follower scope.", "选择一条关系以查看其精确跟单范围。";
+    FollowerInstance => "Follower instance", "跟单实例";
+    RelationStatus => "Relation status", "关系状态";
     Leader => "Leader", "带单账户";
     Follower => "Follower", "跟单账户";
     Target => "Target", "目标";
@@ -185,6 +196,7 @@ resources! {
     Action => "Action", "操作";
     Receipt => "Receipt", "回执";
     Detail => "Detail", "详情";
+    FailureReason => "Failure reason", "失败原因";
     ControlSubtitle => "semantic intents; server revalidation required", "仅提交语义意图；必须由服务端复核";
     NoControl => "No controllable strategy projection is available.", "暂无可控制的策略投影。";
     SelectInstance => "Select instance", "选择实例";
@@ -223,7 +235,7 @@ resources! {
     Indicators => "Local indicators", "本地指标";
     IndicatorPending => "Local indicators are not connected yet; Control indicators are not mixed into Binance local data.", "本地指标尚未接入；不会把 Control 指标静默混入 Binance 本地行情。";
     StopSemantics => "Stop cancels only the selected instance's owned orders and preserves residual custody. Flatten additionally requests signed zero-position convergence.", "停止只撤销所选实例拥有的订单并保留残余仓位托管；平仓还会请求带签名的零仓位收敛。";
-    ConfirmationSemantics => "Pause, Stop, and Flatten require an exact typed scope confirmation. The account node remains authoritative and must independently revalidate every intent.", "暂停、停止与平仓需要输入精确的作用域确认；账户节点始终保持权威并独立复核每个意图。";
+    ConfirmationSemantics => "Pause, Resume, Stop, and Flatten require an exact typed scope confirmation. The account node remains authoritative and must independently revalidate every intent.", "暂停、恢复、停止与平仓需要输入精确的作用域确认；账户节点始终保持权威并独立复核每个意图。";
     SessionReceipts => "This session's command receipts", "本次会话的命令回执";
     AccountProjectionCaveat => "WAL state · runtime Unknown fence · capability freshness: not projected by Control v2", "WAL 状态 · 运行时 Unknown 栅栏 · 能力证据时效：Control v2 尚未投影";
     AccountAuthorityCaveat => "VenueFlow shows writer/private generations and reconciliation age only; it does not infer missing authority from health or ledger text.", "VenueFlow 只显示写入者/私流代际与对账时效，不会根据健康状态或账本文本推断缺失的权威事实。";

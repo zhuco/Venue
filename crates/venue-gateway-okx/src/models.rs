@@ -17,6 +17,8 @@ pub struct InstrumentRow {
     pub tick_sz: String,
     pub lot_sz: String,
     pub min_sz: String,
+    #[serde(default)]
+    pub max_lmt_sz: Option<String>,
     pub ct_val: String,
     pub ct_mult: String,
     pub ct_val_ccy: String,

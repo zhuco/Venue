@@ -1,5 +1,5 @@
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     fs,
     path::{Component, Path, PathBuf},
     process::ExitCode,
@@ -11,21 +11,27 @@ use venue_domain::domain::{
     CancelCommand, CommandId, ExecutionCommand, OrderCommand, OrderOwner, OrderPurpose, OrderSide,
     PositionSide, Price, Symbol,
 };
-use venue_execution::{AccountMutationHost, AccountPhysicalGateway};
 use venue_gateway_api::{CapabilityFlags, GatewayApiError, GatewayBinding, GatewayMode, VenueId};
+use venue_runtime::{
+    AccountPhysicalGateway, StrategyBinding, StrategyInstanceKey, StrategyKind, account::AccountKey,
+};
 
-mod async_gateway;
 mod control_delivery;
 mod control_delivery_storage;
 mod control_http_client;
-mod safe_host;
-mod supervision;
+mod control_loop;
+mod control_shutdown_journal;
+mod copy_delivery_journal;
+mod copy_semantic;
+mod production_resident;
+mod projection_outbox;
+mod resident;
+mod runtime_config;
 
 #[cfg(test)]
 mod control_delivery_tests;
-#[cfg(test)]
-mod safe_host_tests;
 
+pub(crate) use control_delivery::PersistedCopyActorTurn;
 pub use control_delivery::{
     ActorDeliveryCompletion, ActorDeliveryTurn, ClaimAcceptance, ControlDeliveryError,
     ControlDeliveryInbox, ControlDeliveryJournal, ControlDeliveryJournalError,
@@ -39,40 +45,22 @@ pub use control_http_client::{
     MAX_CONTROL_HTTP_REQUEST_BYTES, MAX_CONTROL_HTTP_RESPONSE_BYTES, MAX_CONTROL_HTTP_TIMEOUT,
     MAX_CONTROL_LEASE_DURATION_MS,
 };
-
-pub use async_gateway::{
-    AsyncGatewayBoundaryError, AsyncGatewayCallError, AsyncGatewayTimeouts, AsyncPhysicalGateway,
-    TokioPhysicalGateway, TokioRuntimeDriver, TokioRuntimeRun,
+pub use control_loop::{ControlResidentLoop, ControlResidentLoopError};
+pub(crate) use copy_delivery_journal::{CopyDeliveryJournal, CopyDeliveryJournalError};
+pub use copy_semantic::{CopySemanticDelivery, CopySemanticError, FreshCopyCommandFacts};
+pub use production_resident::{ProductionResident, ResidentCopyReconciliation, ResidentCopyResult};
+pub use projection_outbox::{NodeProjectionOutbox, NodeProjectionOutboxError};
+pub use resident::{
+    GridResidentActor, ResidentActorKind, ResidentControlDelivery, ResidentError, ResidentFact,
+    ResidentLoop, ResidentRecoveryState, ResidentSemanticIntent, ScalpingResidentActor,
+};
+pub use runtime_config::{
+    NODE_RUNTIME_CONFIG_VERSION, NodeControlLoopConfig, NodeGridRecoveryPolicy,
+    NodeGridRuntimeConfig, NodeRuntimeConfig, NodeRuntimeStrategy,
 };
 
-pub use safe_host::{
-    CanaryEvidence, CommandReadbackKey, ControlCompletion, DispatchOutcome, DispatchPermit,
-    FamilyReadbackCoverage, GatewayAcknowledgement, GatewayDispatchResult, GatewayRecoveryPermit,
-    NodeSafetyHost, PhysicalGateway, PreparedDispatch, ReadbackCommandState, SafeHostError,
-    SignedCommandReadback, SignedOwnedOrder, SignedReadbackReceipt, SignedReadbackRequest,
-};
-pub use supervision::{
-    ActorAppliedCanaryReceipt, ActorAppliedControlReceipt, ActorCanaryTurn, ActorControlTurn,
-    CanaryControlRequest, SupervisionError,
-};
 pub use venue_control_protocol::{CommandReceipt, ControlAction, ControlCommandRequest};
 
-const ARTIFACT_COMMANDS: [&str; 14] = [
-    "grid-start",
-    "grid-shadow",
-    "grid-canary",
-    "grid-lifecycle-canary",
-    "grid-canary-recover",
-    "grid-executable-handoff",
-    "grid-external-algo-cancel",
-    "grid-flatten",
-    "grid-stop",
-    "grid-private-evidence-recover",
-    "grid-public-evidence-recover",
-    "grid-restart",
-    "grid-legacy-binance-stop",
-    "grid-legacy-binance-bridge",
-];
 const REQUIRED_NEW_VENUE_GATES: &str = "Owner, WAL, unique account writer fence, signed readback, UNKNOWN reconciliation, Stop/Flatten, and operator-confirmed Canary evidence";
 const LIVE_ARTIFACT_FILE_HARD_LIMIT_BYTES: u64 = 10 * 1024 * 1024;
 const LIVE_ARTIFACT_ROOT_FREEZE_BYTES: u64 = 240 * 1024 * 1024;
@@ -94,8 +82,12 @@ struct RawNodeArguments {
     #[arg(long)]
     artifacts_base: PathBuf,
 
-    /// Existing Stage 7 arguments for Binance, Gate.io, and Bitget. Put them after `--` and omit
-    /// `--artifacts-root`; the node injects the isolated account root.
+    /// Required only for frozen Stage-7 Binance/Gate/Bitget scopes. The file is a strict,
+    /// durable predecessor record; its `handoff_sha256` commits the exact v1 registry entry.
+    #[arg(long)]
+    legacy_v1_handoff: Option<PathBuf>,
+
+    /// The fixed Node resident subcommand and arguments, supplied after `--`.
     #[arg(last = true, allow_hyphen_values = true)]
     runtime_arguments: Vec<OsString>,
 }
@@ -105,6 +97,7 @@ struct RawNodeArguments {
 pub struct NodeLaunch {
     binding: GatewayBinding,
     artifacts_base: PathBuf,
+    legacy_v1_predecessor: Option<venue_runtime::LegacyV1WriterPredecessor>,
     runtime_arguments: Vec<OsString>,
 }
 
@@ -122,9 +115,28 @@ impl NodeLaunch {
         validate_artifacts_base(&raw.artifacts_base)?;
         let binding =
             GatewayBinding::new(expected_venue, raw.mode, raw.trading_account_id, raw.symbol)?;
+        let legacy_v1_predecessor = raw
+            .legacy_v1_handoff
+            .as_deref()
+            .map(load_legacy_v1_predecessor)
+            .transpose()?;
+        let legacy_required = matches!(
+            expected_venue,
+            VenueId::Binance | VenueId::Gate | VenueId::Bitget
+        );
+        if legacy_required != legacy_v1_predecessor.is_some() {
+            return Err(NodeError::LegacyPredecessor);
+        }
+        if legacy_v1_predecessor
+            .as_ref()
+            .is_some_and(|predecessor| predecessor.exchange != expected_venue)
+        {
+            return Err(NodeError::LegacyPredecessor);
+        }
         Ok(Self {
             binding,
             artifacts_base: raw.artifacts_base,
+            legacy_v1_predecessor,
             runtime_arguments: raw.runtime_arguments,
         })
     }
@@ -140,6 +152,11 @@ impl NodeLaunch {
             .join(self.binding.venue.as_str())
             .join(self.binding.mode.as_str())
             .join(&self.binding.trading_account_id)
+    }
+
+    #[must_use]
+    pub const fn legacy_v1_predecessor(&self) -> Option<&venue_runtime::LegacyV1WriterPredecessor> {
+        self.legacy_v1_predecessor.as_ref()
     }
 
     pub fn require_no_runtime_arguments(&self) -> Result<(), NodeError> {
@@ -170,49 +187,6 @@ impl NodeLaunch {
             Err(NodeError::RuntimeScope)
         }
     }
-
-    /// Produces arguments for the frozen Stage 7 deployment entry. The caller cannot override the
-    /// final artifact root, so mode/account roots cannot collide through CLI input.
-    pub fn legacy_runtime_arguments(
-        &self,
-        program_name: &'static str,
-    ) -> Result<Vec<OsString>, NodeError> {
-        if self.runtime_arguments.is_empty()
-            || self
-                .runtime_arguments
-                .iter()
-                .any(is_artifacts_root_argument)
-        {
-            return Err(NodeError::RuntimeArguments);
-        }
-
-        let doctor = self
-            .runtime_arguments
-            .iter()
-            .filter(|argument| argument.as_os_str() == OsStr::new("doctor"))
-            .count();
-        let artifact_commands = self
-            .runtime_arguments
-            .iter()
-            .filter(|argument| {
-                ARTIFACT_COMMANDS
-                    .iter()
-                    .any(|command| argument.as_os_str() == OsStr::new(command))
-            })
-            .count();
-        if doctor + artifact_commands != 1 {
-            return Err(NodeError::RuntimeArguments);
-        }
-
-        let mut arguments = Vec::with_capacity(self.runtime_arguments.len() + 3);
-        arguments.push(OsString::from(program_name));
-        arguments.extend(self.runtime_arguments.iter().cloned());
-        if artifact_commands == 1 {
-            arguments.push(OsString::from("--artifacts-root"));
-            arguments.push(self.artifacts_root().into_os_string());
-        }
-        Ok(arguments)
-    }
 }
 
 #[derive(Debug, Parser)]
@@ -223,6 +197,10 @@ struct RawLiveMvpArguments {
 
 #[derive(Debug, Subcommand)]
 enum RawLiveMvpCommand {
+    Run {
+        #[arg(long)]
+        runtime_config: PathBuf,
+    },
     /// Authenticated read-only startup plus account-WAL recovery; sends no mutation.
     Preflight {
         #[arg(long)]
@@ -256,6 +234,7 @@ enum RawLiveMvpCommand {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LiveMvpCommand {
+    Run(PathBuf),
     Preflight,
     Dispatch(Box<ExecutionCommand>),
 }
@@ -263,6 +242,12 @@ pub enum LiveMvpCommand {
 impl LiveMvpCommand {
     fn from_raw(raw: RawLiveMvpCommand, binding: &GatewayBinding) -> Result<Self, NodeError> {
         match raw {
+            RawLiveMvpCommand::Run { runtime_config } => {
+                if !runtime_config.is_absolute() {
+                    return Err(NodeError::RuntimeConfig);
+                }
+                Ok(Self::Run(runtime_config))
+            }
             RawLiveMvpCommand::Preflight { confirm_live } => {
                 validate_live_confirmation(&confirm_live, binding.venue)?;
                 Ok(Self::Preflight)
@@ -435,25 +420,54 @@ pub fn error_chain(error: &dyn std::error::Error) -> String {
     message
 }
 
-pub fn run_live_mvp<G: AccountPhysicalGateway>(
+fn run_live_mvp_with_loop<G, F>(
     launch: &NodeLaunch,
     command: LiveMvpCommand,
     gateway: G,
-) -> Result<(), NodeError> {
+    run_loop: F,
+) -> Result<(), NodeError>
+where
+    G: AccountPhysicalGateway,
+    F: FnOnce(ControlResidentLoop<G>) -> Result<(), NodeError>,
+{
     let venue = launch.binding().venue;
-    let mut host = AccountMutationHost::open(
-        launch.artifacts_root(),
-        launch.binding().clone(),
-        Decimal::TEN,
-        gateway,
-    )
-    .map_err(|error| NodeError::LiveHost {
-        venue,
-        message: error.to_string(),
-    })?;
     match command {
+        LiveMvpCommand::Run(runtime_config) => {
+            let config = NodeRuntimeConfig::load(&runtime_config, launch.binding())?;
+            reject_scalping_without_public_stream(&config)?;
+            let mut resident = ProductionResident::open_with_symbols(
+                launch,
+                config.configured_symbols(launch.binding())?,
+                gateway,
+            )?;
+            for strategy in &config.strategies {
+                let binding = config.binding_for(strategy)?;
+                match strategy.strategy_kind {
+                    StrategyKind::HedgedGrid => {
+                        let grid = strategy.grid.as_ref().ok_or(NodeError::RuntimeConfig)?;
+                        resident.register_grid_actor(
+                            binding,
+                            config.grid_initial_state(strategy)?,
+                            grid.recovery,
+                            grid.skip_inventory_replenishment_until_recovered,
+                        )?;
+                    }
+                    StrategyKind::Scalping => resident.register_scalping_actor(binding)?,
+                    StrategyKind::Copy => resident.register_actor(binding)?,
+                }
+            }
+            let loopback =
+                ControlResidentLoop::open(launch, &config, resident).map_err(|error| {
+                    NodeError::LiveHost {
+                        venue,
+                        message: error.to_string(),
+                    }
+                })?;
+            run_loop(loopback)
+        }
         LiveMvpCommand::Preflight => {
-            if host.has_unresolved() {
+            let resident = ProductionResident::open(launch, gateway)?;
+            if resident.has_unresolved() {
                 return Err(NodeError::LiveHost {
                     venue,
                     message: "signed recovery left an unresolved mutation".to_owned(),
@@ -463,16 +477,118 @@ pub fn run_live_mvp<G: AccountPhysicalGateway>(
             Ok(())
         }
         LiveMvpCommand::Dispatch(command) => {
-            let outcome = host
-                .dispatch(*command)
-                .map_err(|error| NodeError::LiveHost {
+            let mut resident = ProductionResident::open(launch, gateway)?;
+            let account = AccountKey::new(
+                launch.binding().venue,
+                launch.binding().trading_account_id.clone(),
+            )
+            .map_err(|error| NodeError::LiveHost {
+                venue,
+                message: error.to_string(),
+            })?;
+            let key = StrategyInstanceKey::new(
+                account,
+                StrategyKind::Scalping,
+                "canary",
+                launch.binding().symbol.clone(),
+            )
+            .map_err(|error| NodeError::LiveHost {
+                venue,
+                message: error.to_string(),
+            })?;
+            let binding = StrategyBinding::new(key, "manual-canary", "canary-runtime-v1").map_err(
+                |error| NodeError::LiveHost {
                     venue,
                     message: error.to_string(),
-                })?;
-            println!("{venue} LIVE dispatch outcome: {outcome:?}");
-            Ok(())
+                },
+            )?;
+            resident.register_actor(binding.clone())?;
+            resident.submit_operator_command(&binding, *command)
         }
     }
+}
+
+/// A resident may only host Scalping when its fixed adapter owns a lifecycle-managed, sequenced
+/// public stream. Gate and Bitget own adapter-level websocket receivers which drive their
+/// existing sequenced ingress bridges. The remaining adapters still cannot admit Scalping: a
+/// REST/BBO substitute would leave their actors permanently market-starved.
+fn reject_scalping_without_public_stream(config: &NodeRuntimeConfig) -> Result<(), NodeError> {
+    if config.has_scalping_strategy()
+        && !matches!(
+            config.venue,
+            VenueId::Binance | VenueId::Bitget | VenueId::Gate
+        )
+    {
+        return Err(NodeError::ScalpingPublicStreamUnavailable {
+            venue: config.venue,
+        });
+    }
+    Ok(())
+}
+
+pub fn run_live_mvp<G: AccountPhysicalGateway>(
+    launch: &NodeLaunch,
+    command: LiveMvpCommand,
+    gateway: G,
+) -> Result<(), NodeError> {
+    run_live_mvp_with_loop(launch, command, gateway, ControlResidentLoop::run)
+}
+
+// The fixed non-Binance binaries name their resident route explicitly.  The generic loop pumps
+// only Host-persisted complete signed account facts; it does not recast an adapter's one-shot BBO
+// as a market-book stream or expose an adapter mutation handle.
+#[cfg(feature = "bitget")]
+pub fn run_live_bitget_mvp(
+    launch: &NodeLaunch,
+    command: LiveMvpCommand,
+    gateway: venue_gateway_bitget::BitgetAccountGateway,
+) -> Result<(), NodeError> {
+    run_live_mvp_with_loop(launch, command, gateway, ControlResidentLoop::run_bitget)
+}
+
+#[cfg(feature = "bybit")]
+pub fn run_live_bybit_mvp(
+    launch: &NodeLaunch,
+    command: LiveMvpCommand,
+    gateway: venue_gateway_bybit::BybitAccountGateway,
+) -> Result<(), NodeError> {
+    run_live_mvp_with_loop(launch, command, gateway, ControlResidentLoop::run)
+}
+
+#[cfg(feature = "gate")]
+pub fn run_live_gate_mvp(
+    launch: &NodeLaunch,
+    command: LiveMvpCommand,
+    gateway: venue_gateway_gate::GateAccountGateway,
+) -> Result<(), NodeError> {
+    run_live_mvp_with_loop(launch, command, gateway, ControlResidentLoop::run_gate)
+}
+
+#[cfg(feature = "hyperliquid")]
+pub fn run_live_hyperliquid_mvp(
+    launch: &NodeLaunch,
+    command: LiveMvpCommand,
+    gateway: venue_gateway_hyperliquid::HyperliquidAccountGateway,
+) -> Result<(), NodeError> {
+    run_live_mvp_with_loop(launch, command, gateway, ControlResidentLoop::run)
+}
+
+#[cfg(feature = "okx")]
+pub fn run_live_okx_mvp(
+    launch: &NodeLaunch,
+    command: LiveMvpCommand,
+    gateway: venue_gateway_okx::OkxAccountGateway,
+) -> Result<(), NodeError> {
+    run_live_mvp_with_loop(launch, command, gateway, ControlResidentLoop::run)
+}
+
+#[cfg(feature = "binance")]
+pub fn run_live_binance_mvp(
+    launch: &NodeLaunch,
+    command: LiveMvpCommand,
+    gateway: venue_gateway_binance::BinanceAccountGateway,
+) -> Result<(), NodeError> {
+    run_live_mvp_with_loop(launch, command, gateway, ControlResidentLoop::run_binance)
 }
 
 fn parse_exact_mode(raw: &str) -> Result<GatewayMode, &'static str> {
@@ -491,6 +607,21 @@ fn validate_artifacts_base(path: &Path) -> Result<(), NodeError> {
         return Err(NodeError::ArtifactsBase);
     }
     Ok(())
+}
+
+fn load_legacy_v1_predecessor(
+    path: &Path,
+) -> Result<venue_runtime::LegacyV1WriterPredecessor, NodeError> {
+    if !path.is_absolute() {
+        return Err(NodeError::LegacyPredecessor);
+    }
+    let encoded = fs::read(path).map_err(|_| NodeError::LegacyPredecessor)?;
+    let predecessor: venue_runtime::LegacyV1WriterPredecessor =
+        serde_json::from_slice(&encoded).map_err(|_| NodeError::LegacyPredecessor)?;
+    predecessor
+        .validate()
+        .map_err(|_| NodeError::LegacyPredecessor)?;
+    Ok(predecessor)
 }
 
 fn validate_live_artifact_budget(root: &Path) -> Result<(), NodeError> {
@@ -530,13 +661,6 @@ fn validate_live_artifact_budget(root: &Path) -> Result<(), NodeError> {
     Ok(())
 }
 
-fn is_artifacts_root_argument(argument: &OsString) -> bool {
-    argument.as_os_str() == OsStr::new("--artifacts-root")
-        || argument
-            .to_str()
-            .is_some_and(|argument| argument.starts_with("--artifacts-root="))
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
     #[error(transparent)]
@@ -547,6 +671,10 @@ pub enum NodeError {
     ArtifactsBase,
     #[error("LIVE artifacts exceed the 10 MiB file or 240 MiB freeze budget")]
     ArtifactsBudget,
+    #[error(
+        "legacy v1 predecessor handoff is required only for Binance, Gate, and Bitget and must validate exactly"
+    )]
+    LegacyPredecessor,
     #[error("fixed {0} node adapter isolation metadata is invalid")]
     AdapterIsolation(VenueId),
     #[error("node identity does not match the runtime configuration")]
@@ -565,6 +693,22 @@ pub enum NodeError {
     LiveGateway { venue: VenueId, message: String },
     #[error("{venue} account writer/WAL host failed closed: {message}")]
     LiveHost { venue: VenueId, message: String },
+    #[error(
+        "resident Actor-applied artifacts are absent, incomplete, or do not match their durable anchor"
+    )]
+    ResidentArtifacts,
+    #[error("resident Runtime rejected the durable actor turn or execution-lane admission")]
+    ResidentRuntime,
+    #[error("runtime config is missing, malformed, cross-account, stale, or unsafe")]
+    RuntimeConfig,
+    #[error(
+        "{venue} Run configuration contains Scalping, but this adapter has no lifecycle-managed sequenced public stream receiver"
+    )]
+    ScalpingPublicStreamUnavailable { venue: VenueId },
+    #[error(
+        "{venue} operator canary was denied: current AccountRuntime recovery, configuration, signed turn, and durable identity admission are required before its execution lane may dispatch"
+    )]
+    RuntimeLaneAdmissionRequired { venue: VenueId },
     #[error("root .env could not be loaded")]
     Dotenv,
     #[error("{0} adapter advertised capability before the shared safety closure was integrated")]
@@ -581,6 +725,20 @@ pub enum NodeError {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use venue_runtime::{
+        AccountGatewayResult, AccountHostValidationError, AccountRecoveryReport,
+        AccountRecoveryRequest, AccountRiskEvidence, SignedAccountPositionMode,
+        SignedAccountSnapshot,
+    };
+
     use super::*;
 
     const ACCOUNT: &str = "00000000-0000-4000-8000-000000000001";
@@ -625,6 +783,11 @@ mod tests {
     }
 
     #[test]
+    fn node_manifest_cannot_name_the_mutation_host_crate() {
+        assert!(!include_str!("../Cargo.toml").contains("venue-execution"));
+    }
+
+    #[test]
     fn artifact_roots_are_disjoint_by_venue_and_account() -> Result<(), Box<dyn std::error::Error>>
     {
         let live = NodeLaunch::try_parse_from(VenueId::Bybit, arguments("LIVE"))?;
@@ -636,40 +799,6 @@ mod tests {
         assert_ne!(live.artifacts_root(), okx.artifacts_root());
         assert_ne!(live.artifacts_root(), other_account.artifacts_root());
         assert!(live.artifacts_root().ends_with(Path::new(ACCOUNT)));
-        Ok(())
-    }
-
-    #[test]
-    fn legacy_arguments_receive_only_the_derived_root() -> Result<(), Box<dyn std::error::Error>> {
-        let mut raw = arguments("LIVE");
-        raw.extend([
-            OsString::from("--"),
-            OsString::from("--config"),
-            OsString::from("venue.toml"),
-            OsString::from("grid-stop"),
-        ]);
-        let launch = NodeLaunch::try_parse_from(VenueId::Binance, raw)?;
-        let forwarded = launch.legacy_runtime_arguments("venue-node-binance")?;
-        assert!(forwarded.contains(&OsString::from("--artifacts-root")));
-        assert!(forwarded.contains(&launch.artifacts_root().into_os_string()));
-        Ok(())
-    }
-
-    #[test]
-    fn caller_cannot_override_the_derived_artifact_root() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let mut raw = arguments("LIVE");
-        raw.extend([
-            OsString::from("--"),
-            OsString::from("grid-stop"),
-            OsString::from("--artifacts-root"),
-            OsString::from("C:\\other"),
-        ]);
-        let launch = NodeLaunch::try_parse_from(VenueId::Binance, raw)?;
-        assert!(matches!(
-            launch.legacy_runtime_arguments("venue-node-binance"),
-            Err(NodeError::RuntimeArguments)
-        ));
         Ok(())
     }
 
@@ -759,5 +888,173 @@ mod tests {
             Err(NodeError::ArtifactsBudget)
         ));
         Ok(())
+    }
+
+    fn scalping_runtime_config(
+        venue: VenueId,
+    ) -> Result<NodeRuntimeConfig, Box<dyn std::error::Error>> {
+        Ok(NodeRuntimeConfig {
+            version: NODE_RUNTIME_CONFIG_VERSION,
+            mode: GatewayMode::Live,
+            venue,
+            trading_account_id: ACCOUNT.to_owned(),
+            node_id: "stream-fence".to_owned(),
+            control: NodeControlLoopConfig {
+                loopback_origin: "http://127.0.0.1:8080/".to_owned(),
+                poll_interval_ms: 100,
+                projection_interval_ms: 100,
+                lease_duration_ms: 1_000,
+                claim_limit: 1,
+            },
+            strategies: vec![NodeRuntimeStrategy {
+                strategy_kind: StrategyKind::Scalping,
+                instance_id: "scalping-doge".to_owned(),
+                run_id: "stream-fence".to_owned(),
+                config_digest: "stream-fence-v1".to_owned(),
+                config_epoch: 1,
+                symbol: "DOGE/USDT".parse()?,
+                grid: None,
+                copy_leader_capital: None,
+            }],
+        })
+    }
+
+    #[test]
+    fn run_config_fails_closed_when_scalping_has_no_public_stream_receiver()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for venue in [VenueId::Bybit, VenueId::Okx, VenueId::Hyperliquid] {
+            assert!(matches!(
+                reject_scalping_without_public_stream(&scalping_runtime_config(venue)?),
+                Err(NodeError::ScalpingPublicStreamUnavailable { venue: rejected })
+                    if rejected == venue
+            ));
+        }
+        for venue in [VenueId::Binance, VenueId::Bitget, VenueId::Gate] {
+            assert!(
+                reject_scalping_without_public_stream(&scalping_runtime_config(venue)?).is_ok()
+            );
+        }
+
+        let mut no_scalping = scalping_runtime_config(VenueId::Gate)?;
+        no_scalping.strategies[0].strategy_kind = StrategyKind::Copy;
+        assert!(reject_scalping_without_public_stream(&no_scalping).is_ok());
+        Ok(())
+    }
+
+    struct LaneProofGateway {
+        binding: GatewayBinding,
+        dispatches: Arc<AtomicUsize>,
+    }
+
+    impl AccountPhysicalGateway for LaneProofGateway {
+        type Error = io::Error;
+
+        fn binding(&self) -> &GatewayBinding {
+            &self.binding
+        }
+
+        fn reconcile(
+            &mut self,
+            request: &AccountRecoveryRequest,
+        ) -> Result<AccountRecoveryReport, Self::Error> {
+            if request.binding() != &self.binding || !request.unresolved().is_empty() {
+                return Err(io::Error::other("unexpected recovery scope"));
+            }
+            AccountRecoveryReport::new(self.binding.clone(), 1, Vec::new())
+                .map_err(io::Error::other)
+        }
+
+        fn risk_evidence(&mut self) -> Result<AccountRiskEvidence, AccountHostValidationError> {
+            AccountRiskEvidence::complete(self.binding.clone(), now_ms(), 1, Vec::new(), Vec::new())
+        }
+
+        fn signed_account_snapshot(
+            &mut self,
+            request: &AccountRecoveryRequest,
+        ) -> Result<SignedAccountSnapshot, AccountHostValidationError> {
+            SignedAccountSnapshot::complete(
+                self.binding.clone(),
+                now_ms(),
+                1,
+                1,
+                1,
+                SignedAccountPositionMode::Hedge,
+                Vec::new(),
+                [PositionSide::Long, PositionSide::Short]
+                    .into_iter()
+                    .map(|position_side| venue_runtime::SignedAccountPositionFact {
+                        symbol: self.binding.symbol.clone(),
+                        position_side,
+                        quantity: Decimal::ZERO,
+                        entry_price: None,
+                        mark_price: None,
+                    })
+                    .collect(),
+                "fills:0".to_owned(),
+                request
+                    .unresolved()
+                    .iter()
+                    .map(|command| venue_runtime::SignedUnknownFact {
+                        command_id: command.command_id().clone(),
+                        result: venue_runtime::SignedUnknownResult::Unknown,
+                    })
+                    .collect(),
+            )
+        }
+
+        fn dispatch(
+            &mut self,
+            _permit: venue_runtime::AccountDispatchPermit,
+        ) -> AccountGatewayResult {
+            self.dispatches.fetch_add(1, Ordering::SeqCst);
+            AccountGatewayResult::Unknown
+        }
+    }
+
+    #[test]
+    fn operator_canary_persists_a_runtime_turn_then_dispatches_through_the_host_lane()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let mut raw = live_arguments(&[
+            "canary-place",
+            "--confirm-live",
+            "bybit",
+            "--command-id",
+            "lane-command",
+            "--client-order-id",
+            "lane-client",
+            "--position-side",
+            "long",
+            "--quantity",
+            "1",
+            "--limit-price",
+            "1",
+        ]);
+        raw[8] = temp.path().as_os_str().to_owned();
+        let launch = NodeLaunch::try_parse_from(VenueId::Bybit, raw)?;
+        let command = launch.live_mvp_command()?;
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let gateway = LaneProofGateway {
+            binding: launch.binding().clone(),
+            dispatches: Arc::clone(&dispatches),
+        };
+        run_live_mvp(&launch, command.clone(), gateway)?;
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+        let restarted_dispatches = Arc::new(AtomicUsize::new(0));
+        let restarted = LaneProofGateway {
+            binding: launch.binding().clone(),
+            dispatches: Arc::clone(&restarted_dispatches),
+        };
+        assert!(run_live_mvp(&launch, command, restarted).is_err());
+        assert_eq!(restarted_dispatches.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| duration.as_millis().try_into().ok())
+            .unwrap_or(1)
     }
 }

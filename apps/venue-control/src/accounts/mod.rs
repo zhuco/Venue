@@ -13,7 +13,7 @@ use tokio::sync::Semaphore;
 use venue_control_protocol::accounts::{AccountErrorCode, SecretValue, UserSummary};
 
 pub use crypto::CredentialCipher;
-pub const MIGRATION_0007: &str = include_str!("../../migrations/0007_accounts.sql");
+pub const MIGRATION_0015: &str = include_str!("../../migrations/0015_accounts.sql");
 
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 #[error("account operation failed: {code:?}")]

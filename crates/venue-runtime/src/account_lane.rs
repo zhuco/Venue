@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use sha2::{Digest, Sha256};
-use venue_execution::execution_command_sha256;
+use venue_execution::{AccountDispatchOutcome, execution_command_sha256};
 
 use crate::domain::{
     AccountKey, AccountOrderCapabilityEvidence, AppliedStrategyTurnReceipt, CommandId,
@@ -53,6 +53,34 @@ pub struct CommandIdentityReceipt {
     allocation_record_sha256: [u8; 32],
 }
 
+/// A durable allocation from the account command identity store. It is evidence for lane
+/// admission only: it cannot create a physical dispatch permit or bypass the account WAL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableCommandIdentityAllocation {
+    allocation_sequence: u64,
+    allocation_record_sha256: [u8; 32],
+    cancel_target_family: Option<NativeOrderFamily>,
+}
+
+impl DurableCommandIdentityAllocation {
+    /// Runtime-only conversion of the Host's exact fsynced Prepared receipt. Node and strategy
+    /// code cannot create this from arbitrary bytes or an independently allocated sequence.
+    pub(crate) fn from_host_prepared(
+        allocation_sequence: u64,
+        allocation_record_sha256: [u8; 32],
+        cancel_target_family: Option<NativeOrderFamily>,
+    ) -> Result<Self, AccountLaneError> {
+        if allocation_sequence == 0 || allocation_record_sha256.iter().all(|byte| *byte == 0) {
+            return Err(AccountLaneError::IdentityReceipt);
+        }
+        Ok(Self {
+            allocation_sequence,
+            allocation_record_sha256,
+            cancel_target_family,
+        })
+    }
+}
+
 impl CommandIdentityReceipt {
     /// Called only by the durable account-journal allocator after its output record is fsynced.
     /// Runtime and strategy modules cannot invoke this constructor in production builds.
@@ -83,7 +111,7 @@ impl CommandIdentityReceipt {
             || allocation_sequence == 0
             || allocation_record_sha256.iter().all(|byte| *byte == 0)
             || (matches!(command, ExecutionCommand::Cancel(_)) != cancel_target_family.is_some())
-            || command.validate().is_err()
+            || command.validate_persisted_shape().is_err()
         {
             return Err(AccountLaneError::IdentityReceipt);
         }
@@ -101,6 +129,20 @@ impl CommandIdentityReceipt {
             allocation_sequence,
             allocation_record_sha256,
         })
+    }
+
+    pub(crate) fn from_durable_allocation(
+        applied: &AppliedStrategyTurnReceipt,
+        command: &ExecutionCommand,
+        allocation: DurableCommandIdentityAllocation,
+    ) -> Result<Self, AccountLaneError> {
+        Self::persisted_output_allocation(
+            applied,
+            command,
+            allocation.cancel_target_family,
+            allocation.allocation_sequence,
+            allocation.allocation_record_sha256,
+        )
     }
 
     #[cfg(test)]
@@ -156,7 +198,7 @@ impl AccountExecutionIntent {
             || identity.turn_sequence != token.turn_sequence()
             || identity.command_id != *command.command_id()
             || identity.command_sha256 != command_sha256(&command)?
-            || command.validate().is_err()
+            || command.validate_persisted_shape().is_err()
         {
             return Err(AccountLaneError::Authority);
         }
@@ -961,6 +1003,7 @@ pub(crate) struct AccountExecutionLane {
     pre_wal: Option<PreWalCandidateState>,
     wal_prepared: Option<InFlightMutation>,
     in_flight: Option<InFlightMutation>,
+    host_in_flight: Option<AccountExecutionRequest>,
     unresolved: BTreeMap<CommandId, AccountExecutionRequest>,
     unresolved_by_instance: BTreeMap<StrategyInstanceKey, usize>,
     critical_burst: usize,
@@ -968,6 +1011,10 @@ pub(crate) struct AccountExecutionLane {
 }
 
 impl AccountExecutionLane {
+    pub(crate) fn has_active_command(&self, command_id: &CommandId) -> bool {
+        self.active_command_ids.contains(command_id)
+    }
+
     #[must_use]
     pub fn new(account: AccountKey) -> Self {
         let capability_evidence = AccountOrderCapabilityEvidence::for_account(account.clone());
@@ -981,6 +1028,7 @@ impl AccountExecutionLane {
             pre_wal: None,
             wal_prepared: None,
             in_flight: None,
+            host_in_flight: None,
             unresolved: BTreeMap::new(),
             unresolved_by_instance: BTreeMap::new(),
             critical_burst: 0,
@@ -1005,7 +1053,7 @@ impl AccountExecutionLane {
             || request.config_epoch == 0
             || request.target != binding.key
             || !binding.matches_owner(request.command.mutation_owner())
-            || request.command.validate().is_err()
+            || request.command.validate_persisted_shape().is_err()
             || !request_identity_matches(&request)
         {
             return Err(AccountLaneError::Owner);
@@ -1053,7 +1101,7 @@ impl AccountExecutionLane {
         if dispatch_revision == 0 {
             return Err(AccountLaneError::DispatchRevision);
         }
-        if self.in_flight.is_some() {
+        if self.in_flight.is_some() || self.host_in_flight.is_some() {
             return Err(AccountLaneError::InFlight);
         }
         if self.wal_prepared.is_some() {
@@ -1277,6 +1325,61 @@ impl AccountExecutionLane {
         }
     }
 
+    /// Transfers exactly the already-selected lane candidate to the unified account host. The
+    /// host owns WAL and physical dispatch; this lane retains the request until that host returns
+    /// a durable outcome, so a host failure cannot be retried through another path.
+    pub(crate) fn begin_host_dispatch(&mut self) -> Result<ExecutionCommand, AccountLaneError> {
+        if self.in_flight.is_some() || self.wal_prepared.is_some() || self.host_in_flight.is_some()
+        {
+            return Err(AccountLaneError::InFlight);
+        }
+        let candidate = self
+            .pre_wal
+            .take()
+            .ok_or(AccountLaneError::PreWalCandidateMissing)?;
+        if candidate.revoked {
+            self.pre_wal = Some(candidate);
+            return Err(AccountLaneError::DispatchAuthority);
+        }
+        let command = candidate.request.command.clone();
+        self.host_in_flight = Some(candidate.request);
+        Ok(command)
+    }
+
+    pub(crate) fn record_host_outcome(
+        &mut self,
+        command_id: &CommandId,
+        outcome: AccountDispatchOutcome,
+    ) -> Result<AccountLaneFollowUp, AccountLaneError> {
+        let request = self
+            .host_in_flight
+            .take()
+            .ok_or(AccountLaneError::InFlight)?;
+        if request.command_id() != command_id {
+            self.host_in_flight = Some(request);
+            return Err(AccountLaneError::InFlightIdentity);
+        }
+        match outcome {
+            AccountDispatchOutcome::Accepted { .. } | AccountDispatchOutcome::Rejected { .. } => {
+                self.active_command_ids.remove(command_id);
+                Ok(AccountLaneFollowUp::None)
+            }
+            AccountDispatchOutcome::Unknown => {
+                let target = request.target.clone();
+                self.unresolved.insert(command_id.clone(), request);
+                let count = self
+                    .unresolved_by_instance
+                    .entry(target.clone())
+                    .or_default();
+                *count = count.checked_add(1).ok_or(AccountLaneError::Overflow)?;
+                Ok(AccountLaneFollowUp::ReconcileUnknown {
+                    command_id: command_id.clone(),
+                    target,
+                })
+            }
+        }
+    }
+
     /// Releases a request only when the caller can prove WAL preparation did not happen. If the
     /// filesystem result is uncertain, the caller must classify it as UNKNOWN instead.
     pub(crate) fn abort_before_wal(
@@ -1329,15 +1432,7 @@ impl AccountExecutionLane {
         {
             return Err(AccountLaneError::UnknownProof);
         }
-        self.unresolved.remove(&proof.command_id);
-        let count = self
-            .unresolved_by_instance
-            .get_mut(&request.target)
-            .ok_or(AccountLaneError::UnknownMissing)?;
-        *count = count.checked_sub(1).ok_or(AccountLaneError::Overflow)?;
-        if *count == 0 {
-            self.unresolved_by_instance.remove(&request.target);
-        }
+        let request = self.take_unresolved_unknown(&proof.command_id)?;
         match proof.resolution {
             UnknownResolution::ProvenAccepted | UnknownResolution::ProvenRejected => {
                 self.active_command_ids.remove(&proof.command_id);
@@ -1352,6 +1447,40 @@ impl AccountExecutionLane {
                 })
             }
         }
+    }
+
+    /// Runtime invokes this only from the opaque Host-persisted signed snapshot receipt after
+    /// the matching WAL UNKNOWN was durably transitioned to Accepted or Rejected. There is no
+    /// caller proof or retry path: this only releases the already-dispatched lane identity.
+    pub(crate) fn settle_host_signed_unknown(
+        &mut self,
+        command_id: &CommandId,
+    ) -> Result<(), AccountLaneError> {
+        if !self.unresolved.contains_key(command_id) {
+            return Ok(());
+        }
+        self.take_unresolved_unknown(command_id)?;
+        self.active_command_ids.remove(command_id);
+        Ok(())
+    }
+
+    fn take_unresolved_unknown(
+        &mut self,
+        command_id: &CommandId,
+    ) -> Result<AccountExecutionRequest, AccountLaneError> {
+        let request = self
+            .unresolved
+            .remove(command_id)
+            .ok_or(AccountLaneError::UnknownMissing)?;
+        let count = self
+            .unresolved_by_instance
+            .get_mut(&request.target)
+            .ok_or(AccountLaneError::UnknownMissing)?;
+        *count = count.checked_sub(1).ok_or(AccountLaneError::Overflow)?;
+        if *count == 0 {
+            self.unresolved_by_instance.remove(&request.target);
+        }
+        Ok(request)
     }
 
     /// Installs a mutation whose WAL ended in UNKNOWN before process restart. The caller must
@@ -1373,7 +1502,7 @@ impl AccountExecutionLane {
             || request.config_epoch == 0
             || request.target != binding.key
             || !binding.matches_owner(request.command.mutation_owner())
-            || request.command.validate().is_err()
+            || request.command.validate_persisted_shape().is_err()
             || !request_identity_matches(&request)
         {
             return Err(AccountLaneError::Owner);
@@ -1401,12 +1530,19 @@ impl AccountExecutionLane {
                 .wal_prepared
                 .as_ref()
                 .is_some_and(|prepared| &prepared.request.target == key)
+            || self
+                .host_in_flight
+                .as_ref()
+                .is_some_and(|request| &request.target == key)
             || self.unresolved_by_instance.contains_key(key)
     }
 
     #[must_use]
     pub(crate) const fn has_in_flight(&self) -> bool {
-        self.pre_wal.is_some() || self.wal_prepared.is_some() || self.in_flight.is_some()
+        self.pre_wal.is_some()
+            || self.wal_prepared.is_some()
+            || self.in_flight.is_some()
+            || self.host_in_flight.is_some()
     }
 
     pub(crate) fn discard_all_queued(&mut self) -> Vec<AccountExecutionRequest> {
@@ -1482,6 +1618,10 @@ impl AccountExecutionLane {
                 .pre_wal
                 .as_ref()
                 .is_some_and(|candidate| &candidate.request.target == key)
+            || self
+                .host_in_flight
+                .as_ref()
+                .is_some_and(|request| &request.target == key)
             || self.unresolved_by_instance.contains_key(key)
         {
             return Err(AccountLaneError::InstanceBusy);

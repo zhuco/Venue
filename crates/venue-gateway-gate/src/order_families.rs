@@ -138,7 +138,7 @@ where
 {
     let binding = GateGatewayBinding::new(scope.binding.clone())
         .map_err(|_| GateStage7OrderFamilyError::Scope)?;
-    if binding.gateway_binding().symbol != rules.instrument.symbol
+    if binding.gateway_binding().validate().is_err()
         || rules.instrument.validate().is_err()
         || rules.native_symbol.trim().is_empty()
     {

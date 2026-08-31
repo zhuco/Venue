@@ -1,0 +1,407 @@
+use bytes::Bytes;
+
+use super::*;
+
+const EXCHANGE_INFO: &str = include_str!("../tests/fixtures/exchange_info_btcusdt.json");
+const MIXED_EXCHANGE_INFO: &str = include_str!("../tests/fixtures/exchange_info_mixed_quotes.json");
+const USDT_ASSET_INDEX: &str = include_str!("../tests/fixtures/asset-index-usdt.json");
+const USDC_ASSET_INDEX: &str = include_str!("../tests/fixtures/asset-index-usdc.json");
+const LIMIT_BOOK: &[u8] = include_bytes!("../tests/fixtures/limit-book-ticker.json");
+
+fn limit_fixture() -> Result<
+    (
+        AccountLimitNormalizationIntent,
+        BinanceInstrumentRules,
+        GatewayBinding,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    use venue_domain::domain::{CommandId, OrderOwner, OrderPurpose};
+    use venue_gateway_api::{GatewayMode, VenueId};
+    let symbol = "BTC/USDT".parse()?;
+    let binding = GatewayBinding::new(
+        VenueId::Binance,
+        GatewayMode::Live,
+        "00000000-0000-4000-8000-000000000001",
+        symbol,
+    )?;
+    let rules = parse_instrument_rules(EXCHANGE_INFO, binding.symbol.clone(), 7)?;
+    let intent = AccountLimitNormalizationIntent {
+        command_id: CommandId::new("limit-fixture-command")?,
+        client_order_id: CommandId::new("limit-fixture-client")?,
+        owner: OrderOwner {
+            strategy_instance_id: "copy-test".to_owned(),
+            run_id: "run-test".to_owned(),
+            exchange: "binance".to_owned(),
+            account: binding.trading_account_id.clone(),
+            symbol: binding.symbol.clone(),
+            purpose: OrderPurpose::Entry,
+        },
+        side: OrderSide::Buy,
+        position_side: PositionSide::Long,
+        quote_delta: Decimal::new(10, 0),
+        reduce_only: false,
+    };
+    Ok((intent, rules, binding))
+}
+
+#[test]
+fn limit_normalization_preserves_identity_and_never_rounds_up_quote()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut intent, rules, binding) = limit_fixture()?;
+    let ExecutionCommand::PlaceLimit(buy) =
+        normalize_fresh_limit(&intent, &rules, &binding, LIMIT_BOOK, 1_720_000_000_200)?
+    else {
+        return Err("expected limit".into());
+    };
+    assert_eq!(buy.command_id, intent.command_id);
+    assert_eq!(buy.client_order_id, intent.client_order_id);
+    assert_eq!(buy.owner, intent.owner);
+    assert_eq!(buy.limit_price.value(), Decimal::new(5000, 0));
+    assert_eq!(buy.quantity, Decimal::new(2, 3));
+    intent.side = OrderSide::Sell;
+    intent.position_side = PositionSide::Short;
+    let ExecutionCommand::PlaceLimit(sell) =
+        normalize_fresh_limit(&intent, &rules, &binding, LIMIT_BOOK, 1_720_000_000_200)?
+    else {
+        return Err("expected limit".into());
+    };
+    assert_eq!(sell.limit_price.value(), Decimal::new(50001, 1));
+    assert_eq!(sell.quantity, Decimal::new(1, 3));
+    assert!(sell.quantity * sell.limit_price.value() <= intent.quote_delta);
+    Ok(())
+}
+
+#[test]
+fn one_catalogue_binds_two_canonical_symbols_without_cross_route()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_, _, binding) = limit_fixture()?;
+    let btc: Symbol = "BTC/USDT".parse()?;
+    let sol: Symbol = "SOL/USDC".parse()?;
+    let catalogue = parse_rules_catalog(
+        MIXED_EXCHANGE_INFO,
+        &binding,
+        &BTreeSet::from([btc.clone(), sol.clone()]),
+        17,
+    )?;
+    assert_eq!(catalogue.len(), 2);
+    assert_eq!(catalogue[&btc].instrument.symbol, btc);
+    assert_eq!(catalogue[&sol].instrument.symbol, sol);
+    assert_ne!(
+        catalogue[&"BTC/USDT".parse()?].native_symbol,
+        catalogue[&"SOL/USDC".parse()?].native_symbol
+    );
+    assert!(
+        parse_rules_catalog(
+            MIXED_EXCHANGE_INFO,
+            &binding,
+            &BTreeSet::from(["SOL/USDC".parse()?]),
+            17,
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn limit_normalization_rejects_stale_future_wrong_symbol_empty_and_crossed_book()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (intent, rules, binding) = limit_fixture()?;
+    for now in [1_720_000_000_099, 1_720_000_003_101] {
+        assert!(normalize_fresh_limit(&intent, &rules, &binding, LIMIT_BOOK, now).is_err());
+    }
+    for (field, value) in [
+        ("symbol", Value::from("ETHUSDT")),
+        ("time", Value::Null),
+        ("bidQty", Value::from("0")),
+        ("askPrice", Value::from("5000.00")),
+        ("bidPrice", Value::from("5000.01")),
+        ("askQty", Value::from("NaN")),
+    ] {
+        let mut book: Value = serde_json::from_slice(LIMIT_BOOK)?;
+        book[field] = value;
+        assert!(
+            normalize_fresh_limit(
+                &intent,
+                &rules,
+                &binding,
+                &serde_json::to_vec(&book)?,
+                1_720_000_000_200
+            )
+            .is_err()
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn limit_normalization_rejects_wrong_owner_direction_and_quantity_limits()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (intent, rules, binding) = limit_fixture()?;
+    let mut altered = intent.clone();
+    altered.owner.account = "other-account".to_owned();
+    assert!(
+        normalize_fresh_limit(&altered, &rules, &binding, LIMIT_BOOK, 1_720_000_000_200).is_err()
+    );
+    altered = intent.clone();
+    altered.side = OrderSide::Sell;
+    assert!(
+        normalize_fresh_limit(&altered, &rules, &binding, LIMIT_BOOK, 1_720_000_000_200).is_err()
+    );
+    altered = intent.clone();
+    altered.quote_delta = Decimal::new(4, 0);
+    assert!(
+        normalize_fresh_limit(&altered, &rules, &binding, LIMIT_BOOK, 1_720_000_000_200).is_err()
+    );
+    altered = intent;
+    altered.quote_delta = Decimal::new(10_000_000, 0);
+    assert!(
+        normalize_fresh_limit(&altered, &rules, &binding, LIMIT_BOOK, 1_720_000_000_200).is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn private_stream_fill_keeps_exact_generation_and_never_guesses_client_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_, rules, binding) = limit_fixture()?;
+    let frame = BinanceRawPrivateFrame {
+            binding: binding.clone(),
+            instrument_generation: rules.instrument.generation,
+            private_generation: 9,
+            received_at_ms: 1_720_000_000_100,
+            payload: Bytes::from_static(
+                br#"{"e":"ORDER_TRADE_UPDATE","E":1000,"o":{"s":"BTCUSDT","c":"grid-e1-long-open-l1","x":"TRADE","S":"BUY","ps":"LONG","t":7,"i":11,"l":"0.002","L":"50000","m":true}}"#,
+            ),
+        };
+    let event =
+        normalize_private_stream_fill(frame.clone(), &binding, rules.instrument.generation, 9)?
+            .ok_or("expected fill")?;
+    assert_eq!(event.private_generation, 9);
+    assert_eq!(event.fill.order_id, "11");
+    assert!(
+        matches!(event.client_order_id, FieldState::Known(ref id) if id == "grid-e1-long-open-l1")
+    );
+    assert!(
+        normalize_private_stream_fill(frame, &binding, rules.instrument.generation, 10).is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn public_stream_normalizes_only_bound_supported_market_facts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_, rules, binding) = limit_fixture()?;
+    let frame = BinanceRawPublicFrame {
+            binding: binding.clone(),
+            instrument_generation: rules.instrument.generation,
+            received_at_ms: 1_100,
+            payload: Bytes::from_static(
+                br#"{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":1000,"T":999,"s":"BTCUSDT","a":7,"f":10,"l":11,"p":"100","q":"2","m":false}}"#,
+            ),
+        };
+    let event =
+        normalize_public_stream_event(frame.clone(), &binding, rules.instrument.generation)?
+            .ok_or("expected public trade")?;
+    assert!(matches!(event, BinancePublicMarketEvent::Trade(value) if value.last_trade_id == 11));
+    assert!(
+        normalize_public_stream_event(
+            BinanceRawPublicFrame {
+                instrument_generation: rules.instrument.generation + 1,
+                ..frame
+            },
+            &binding,
+            rules.instrument.generation,
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn private_snapshot_generation_advances_only_as_a_new_collection_candidate() {
+    // Callers install this candidate only after the complete signed collection returns Ok;
+    // rules and connection generation intentionally have no such per-collection counter.
+    assert!(matches!(next_private_generation(41), Ok(42)));
+    assert!(next_private_generation(u64::MAX).is_err());
+}
+
+#[test]
+fn full_account_risk_rejects_unpriced_opening_algo_orders() {
+    assert!(
+        account_entry_order_notionals(
+            EXCHANGE_INFO,
+            br#"[]"#,
+            br#"[{"reduceOnly":false,"closePosition":false}]"#,
+            7,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn full_account_risk_reserves_remaining_regular_order_notional()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert!(account_rules(EXCHANGE_INFO, "BTCUSDT", 7).is_ok());
+    let values = account_entry_order_notionals(
+            EXCHANGE_INFO,
+            br#"[{"symbol":"BTCUSDT","reduceOnly":false,"origQty":"0.002","executedQty":"0","price":"50000"}]"#,
+            br#"[]"#,
+            7,
+        );
+    assert_eq!(
+        values,
+        Ok(vec![AccountRiskAmount {
+            asset: "USDT".parse()?,
+            value: Decimal::new(100, 0),
+        }])
+    );
+    Ok(())
+}
+
+#[test]
+fn full_account_risk_uses_each_symbol_quote_and_a_non_parity_usdc_rate()
+-> Result<(), Box<dyn std::error::Error>> {
+    let positions = account_position_notionals(
+        MIXED_EXCHANGE_INFO,
+        br#"[
+                {"symbol":"BTCUSDT","positionAmt":"0.001","markPrice":"50000","notional":"50"},
+                {"symbol":"SOLUSDC","positionAmt":"1","markPrice":"100","notional":"100"}
+            ]"#,
+        7,
+    )?;
+    let orders = account_entry_order_notionals(
+            MIXED_EXCHANGE_INFO,
+            br#"[
+                {"symbol":"BTCUSDT","reduceOnly":false,"origQty":"0.001","executedQty":"0","price":"50000"},
+                {"symbol":"SOLUSDC","reduceOnly":false,"origQty":"0.1","executedQty":"0","price":"100"}
+            ]"#,
+            br#"[]"#,
+            7,
+        )?;
+    assert_eq!(positions[0].asset, "USDT".parse()?);
+    assert_eq!(positions[1].asset, "USDC".parse()?);
+    assert_eq!(orders[0].asset, "USDT".parse()?);
+    assert_eq!(orders[1].asset, "USDC".parse()?);
+
+    let usdt: Asset = "USDT".parse()?;
+    let usdc: Asset = "USDC".parse()?;
+    let mut usd_per_asset = BTreeMap::new();
+    usd_per_asset.insert(
+        usdt.clone(),
+        crate::portfolio::parse_usd_conversion_evidence(
+            USDT_ASSET_INDEX,
+            usdt.clone(),
+            7,
+            1_720_000_000_050,
+            60_000,
+        )?,
+    );
+    usd_per_asset.insert(
+        usdc.clone(),
+        crate::portfolio::parse_usd_conversion_evidence(
+            USDC_ASSET_INDEX,
+            usdc.clone(),
+            7,
+            1_720_000_000_050,
+            60_000,
+        )?,
+    );
+    let quote_assets = positions
+        .iter()
+        .chain(orders.iter())
+        .map(|amount| amount.asset.clone())
+        .collect::<BTreeSet<_>>();
+    let rates = quote_to_usdt_rates(&quote_assets, &usd_per_asset, 7)?;
+    assert_eq!(rates.len(), 1);
+    assert_eq!(rates[0].asset, usdc);
+    assert_eq!(
+        rates[0].usdt_per_asset,
+        Decimal::new(1_003, 3)
+            .checked_div(Decimal::new(998, 3))
+            .ok_or("decimal division")?
+    );
+    assert_ne!(rates[0].usdt_per_asset, Decimal::ONE);
+    Ok(())
+}
+
+#[test]
+fn full_account_risk_rejects_missing_or_stale_quote_conversion_evidence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let usdt: Asset = "USDT".parse()?;
+    let usdc: Asset = "USDC".parse()?;
+    assert!(
+        crate::portfolio::parse_usd_conversion_evidence(
+            USDC_ASSET_INDEX,
+            usdc.clone(),
+            7,
+            1_720_000_060_001,
+            60_000,
+        )
+        .is_err()
+    );
+    let quote_assets = BTreeSet::from([usdt.clone(), usdc]);
+    let mut only_usdt = BTreeMap::new();
+    only_usdt.insert(
+        usdt.clone(),
+        crate::portfolio::parse_usd_conversion_evidence(
+            USDT_ASSET_INDEX,
+            usdt,
+            7,
+            1_720_000_000_050,
+            60_000,
+        )?,
+    );
+    assert!(quote_to_usdt_rates(&quote_assets, &only_usdt, 7).is_err());
+    Ok(())
+}
+
+#[test]
+fn signed_snapshot_rejects_ambiguous_open_order_ceiling() {
+    let row = serde_json::Map::new();
+    let rows = vec![row; ACCOUNT_WIDE_OPEN_ORDER_ROW_LIMIT];
+    assert!(!account_wide_order_rows_are_complete(&rows, &[]));
+    assert!(!account_wide_order_rows_are_complete(&[], &rows));
+}
+
+#[test]
+fn signed_snapshot_rejects_unrepresentable_close_all_algo() -> Result<(), Box<dyn std::error::Error>>
+{
+    let regular = json_rows_snapshot(br#"[]"#)?;
+    let algo = json_rows_snapshot(
+            br#"[{"symbol":"BTCUSDT","clientAlgoId":"algo-1","algoId":"1","closePosition":true,"quantity":"0","side":"SELL","positionSide":"LONG","triggerPrice":"50000","reduceOnly":true}]"#,
+        )?;
+    assert!(snapshot_order_facts(EXCHANGE_INFO, &regular, &algo, 7).is_err());
+    Ok(())
+}
+
+#[test]
+fn signed_snapshot_fills_reject_duplicate_or_out_of_window_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut cursor = RecentFillsCursor {
+        observed_through_ms: 10,
+        last_trade_id: Some(7),
+        last_event_time_ms: Some(11),
+    };
+    let duplicate = json_rows_snapshot(br#"[{"id":"7","time":"12"}]"#)?;
+    assert!(advance_snapshot_fill_cursor(&mut cursor, &duplicate, 10).is_err());
+    let outside = json_rows_snapshot(br#"[{"id":"8","time":"9"}]"#)?;
+    assert!(advance_snapshot_fill_cursor(&mut cursor, &outside, 10).is_err());
+    Ok(())
+}
+
+#[test]
+fn signed_snapshot_fills_cursor_keeps_symbol_watermarks_and_rejects_sha_legacy() {
+    assert!(matches!(
+        parse_snapshot_fills_cursor(Some(
+            "binance-fills-v1|BTCUSDT,100,7,100;DOGEUSDT,100,,"
+        )),
+        Ok(cursor) if cursor.by_native_symbol.len() == 2
+    ));
+    assert!(
+        parse_snapshot_fills_cursor(Some(
+            "4983f3d75db0d72aeb1e68c57d9f171d981edc3ef31b8ca16c4d5f1caa26dce5",
+        ))
+        .is_err()
+    );
+}

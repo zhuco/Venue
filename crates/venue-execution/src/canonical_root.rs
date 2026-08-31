@@ -8,13 +8,143 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use venue_domain::domain::is_canonical_trading_account_id;
+use venue_domain::domain::{Symbol, is_canonical_trading_account_id};
 use venue_gateway_api::VenueId;
 
 use crate::WriterScope;
 
 const REGISTRY_SCHEMA_VERSION: u16 = 2;
 const REGISTRY_DIRECTORY: &str = "stage7_writer_roots";
+
+/// Explicit, deployment-supplied link to a frozen Stage-7 v1 writer scope. The legacy account
+/// is a product scope (not the new trading UUID), so Runtime must never attempt to derive it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyV1WriterPredecessor {
+    pub exchange: VenueId,
+    pub legacy_product_account: String,
+    pub legacy_symbol: Symbol,
+    pub legacy_owner_scope: String,
+    pub legacy_artifacts_root: PathBuf,
+    pub legacy_lock_sha256: String,
+    pub legacy_lock_path: PathBuf,
+    pub handoff_sha256: String,
+}
+
+/// Retains the exact frozen writer lock through the lifetime of the unified account Host.
+#[derive(Debug)]
+pub struct LegacyV1WriterGuard {
+    _lock: File,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableLegacyV1Handoff {
+    schema_version: u16,
+    scope_sha256: String,
+    scope: WriterScope,
+    canonical_artifacts_root: String,
+    canonical_root_sha256: String,
+    entry_sha256: String,
+}
+
+#[derive(Serialize)]
+struct LegacyV1EntryDigest<'a> {
+    schema_version: u16,
+    scope_sha256: &'a str,
+    scope: &'a WriterScope,
+    canonical_artifacts_root: &'a str,
+    canonical_root_sha256: &'a str,
+}
+
+impl LegacyV1WriterPredecessor {
+    pub fn validate(&self) -> Result<(), Stage7WriterRegistryError> {
+        validate_legacy_predecessor(self, &legacy_v1_registry_root()?)
+    }
+
+    pub fn acquire(&self) -> Result<LegacyV1WriterGuard, Stage7WriterRegistryError> {
+        acquire_legacy_predecessor(self, &legacy_v1_registry_root()?)
+    }
+}
+
+fn validate_legacy_predecessor(
+    predecessor: &LegacyV1WriterPredecessor,
+    registry_root: &Path,
+) -> Result<(), Stage7WriterRegistryError> {
+    if predecessor.legacy_product_account.trim().is_empty()
+        || predecessor.legacy_owner_scope.trim().is_empty()
+        || !predecessor.legacy_artifacts_root.is_absolute()
+        || !valid_sha256(&predecessor.legacy_lock_sha256)
+        || !valid_sha256(&predecessor.handoff_sha256)
+    {
+        return Err(Stage7WriterRegistryError::LegacyPredecessor);
+    }
+    let expected = registry_root.join(format!("{}.lock", predecessor.legacy_lock_sha256));
+    if predecessor.legacy_lock_path != expected {
+        return Err(Stage7WriterRegistryError::LegacyPredecessor);
+    }
+    let canonical_root = fs::canonicalize(&predecessor.legacy_artifacts_root)
+        .map_err(|source| io_error(&predecessor.legacy_artifacts_root, source))?;
+    let canonical_root = canonical_root
+        .to_str()
+        .ok_or(Stage7WriterRegistryError::PathEncoding)?
+        .to_owned();
+    let handoff_path = registry_root.join(format!("{}.json", predecessor.legacy_lock_sha256));
+    let encoded = fs::read(&handoff_path).map_err(|source| io_error(&handoff_path, source))?;
+    if digest_bytes(&encoded) != predecessor.handoff_sha256 {
+        return Err(Stage7WriterRegistryError::LegacyPredecessor);
+    }
+    let handoff = serde_json::from_slice::<DurableLegacyV1Handoff>(&encoded)
+        .map_err(Stage7WriterRegistryError::Decode)?;
+    let expected_scope = WriterScope {
+        exchange: predecessor.exchange.as_str().to_owned(),
+        account: predecessor.legacy_product_account.clone(),
+        symbol: predecessor.legacy_symbol.clone(),
+        owner_scope: predecessor.legacy_owner_scope.clone(),
+    };
+    let scope_sha256 = digest_json(&expected_scope)?;
+    if handoff.schema_version != 1
+        || handoff.scope != expected_scope
+        || handoff.scope_sha256 != scope_sha256
+        || handoff.scope_sha256 != predecessor.legacy_lock_sha256
+        || handoff.canonical_artifacts_root != canonical_root
+        || handoff.canonical_root_sha256 != digest_bytes(canonical_root.as_bytes())
+        || handoff.entry_sha256 != legacy_v1_entry_digest(&handoff)?
+    {
+        return Err(Stage7WriterRegistryError::LegacyPredecessor);
+    }
+    Ok(())
+}
+
+fn legacy_v1_entry_digest(
+    entry: &DurableLegacyV1Handoff,
+) -> Result<String, Stage7WriterRegistryError> {
+    digest_json(&LegacyV1EntryDigest {
+        schema_version: entry.schema_version,
+        scope_sha256: &entry.scope_sha256,
+        scope: &entry.scope,
+        canonical_artifacts_root: &entry.canonical_artifacts_root,
+        canonical_root_sha256: &entry.canonical_root_sha256,
+    })
+}
+
+fn acquire_legacy_predecessor(
+    predecessor: &LegacyV1WriterPredecessor,
+    registry_root: &Path,
+) -> Result<LegacyV1WriterGuard, Stage7WriterRegistryError> {
+    validate_legacy_predecessor(predecessor, registry_root)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&predecessor.legacy_lock_path)
+        .map_err(|source| io_error(&predecessor.legacy_lock_path, source))?;
+    lock.try_lock_exclusive()
+        .map_err(|source| Stage7WriterRegistryError::Lock {
+            path: predecessor.legacy_lock_path.clone(),
+            source,
+        })?;
+    Ok(LegacyV1WriterGuard { _lock: lock })
+}
 
 /// Holds the machine-wide scope lock for the complete lifetime of one account writer entry.
 /// The durable entry remains after this guard is dropped, so a crash cannot make another root
@@ -286,6 +416,17 @@ fn machine_registry_root() -> Result<PathBuf, Stage7WriterRegistryError> {
         .join("v2"))
 }
 
+fn legacy_v1_registry_root() -> Result<PathBuf, Stage7WriterRegistryError> {
+    let v2 = machine_registry_root()?;
+    v2.parent()
+        .map(|root| root.join("v1"))
+        .ok_or(Stage7WriterRegistryError::MachineState)
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Stage7WriterRegistryError {
     #[error("stage-7 canonical writer registry requires absolute paths")]
@@ -296,6 +437,8 @@ pub enum Stage7WriterRegistryError {
     Scope,
     #[error("stage-7 canonical writer registry path cannot be encoded")]
     PathEncoding,
+    #[error("legacy Stage-7 predecessor handoff or exact v1 lock scope is invalid")]
+    LegacyPredecessor,
     #[error("stage-7 canonical writer registry entry is corrupt")]
     Corrupt,
     #[error(
@@ -336,6 +479,107 @@ mod tests {
             symbol: "DOGE/USDT".parse()?,
             owner_scope: "hedged_grid_doge_usdt_primary".to_owned(),
         })
+    }
+
+    fn legacy_predecessor(
+        registry: &Path,
+        artifacts_root: &Path,
+        valid_entry: bool,
+    ) -> Result<LegacyV1WriterPredecessor, Box<dyn std::error::Error>> {
+        fs::create_dir_all(registry)?;
+        fs::create_dir_all(artifacts_root)?;
+        let lock_sha256 = "a".repeat(64);
+        let lock_path = registry.join(format!("{lock_sha256}.lock"));
+        File::create(&lock_path)?;
+        let mut predecessor = LegacyV1WriterPredecessor {
+            exchange: VenueId::Gate,
+            legacy_product_account: "usdt_futures".to_owned(),
+            legacy_symbol: "DOGE/USDT".parse()?,
+            legacy_owner_scope: "hedged_grid_doge_usdt_primary".to_owned(),
+            legacy_artifacts_root: fs::canonicalize(artifacts_root)?,
+            legacy_lock_sha256: lock_sha256,
+            legacy_lock_path: lock_path,
+            handoff_sha256: "0".repeat(64),
+        };
+        let canonical = predecessor
+            .legacy_artifacts_root
+            .to_str()
+            .ok_or("legacy root encoding")?
+            .to_owned();
+        let scope = WriterScope {
+            exchange: predecessor.exchange.as_str().to_owned(),
+            account: predecessor.legacy_product_account.clone(),
+            symbol: predecessor.legacy_symbol.clone(),
+            owner_scope: predecessor.legacy_owner_scope.clone(),
+        };
+        predecessor.legacy_lock_sha256 = digest_json(&scope)?;
+        predecessor.legacy_lock_path =
+            registry.join(format!("{}.lock", predecessor.legacy_lock_sha256));
+        File::create(&predecessor.legacy_lock_path)?;
+        let canonical_root_sha256 = digest_bytes(canonical.as_bytes());
+        let mut entry = DurableLegacyV1Handoff {
+            schema_version: 1,
+            scope_sha256: predecessor.legacy_lock_sha256.clone(),
+            scope,
+            canonical_artifacts_root: canonical,
+            canonical_root_sha256,
+            entry_sha256: String::new(),
+        };
+        entry.entry_sha256 = legacy_v1_entry_digest(&entry)?;
+        if !valid_entry {
+            entry.entry_sha256 = "0".repeat(64);
+        }
+        let handoff = serde_json::json!({
+            "schema_version": 1,
+            "scope_sha256": entry.scope_sha256,
+            "scope": entry.scope,
+            "canonical_artifacts_root": entry.canonical_artifacts_root,
+            "canonical_root_sha256": entry.canonical_root_sha256,
+            "entry_sha256": entry.entry_sha256,
+        });
+        let encoded = serde_json::to_vec(&handoff)?;
+        predecessor.handoff_sha256 = digest_bytes(&encoded);
+        fs::write(
+            registry.join(format!("{}.json", predecessor.legacy_lock_sha256)),
+            encoded,
+        )?;
+        Ok(predecessor)
+    }
+
+    #[test]
+    fn explicit_legacy_predecessor_handoff_binds_root_scope_hash_and_lock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let registry = temporary.path().join("v1");
+        let predecessor = legacy_predecessor(&registry, &temporary.path().join("legacy"), true)?;
+        let first = acquire_legacy_predecessor(&predecessor, &registry)?;
+        assert!(matches!(
+            acquire_legacy_predecessor(&predecessor, &registry),
+            Err(Stage7WriterRegistryError::Lock { .. })
+        ));
+        drop(first);
+        assert!(acquire_legacy_predecessor(&predecessor, &registry).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_predecessor_rejects_tampered_handoff_and_lock_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let registry = temporary.path().join("v1");
+        let predecessor = legacy_predecessor(&registry, &temporary.path().join("legacy"), false)?;
+        assert!(matches!(
+            acquire_legacy_predecessor(&predecessor, &registry),
+            Err(Stage7WriterRegistryError::LegacyPredecessor)
+        ));
+        let valid = legacy_predecessor(&registry, &temporary.path().join("valid"), true)?;
+        let mut wrong_path = valid.clone();
+        wrong_path.legacy_lock_path = registry.join("b".repeat(64) + ".lock");
+        assert!(matches!(
+            acquire_legacy_predecessor(&wrong_path, &registry),
+            Err(Stage7WriterRegistryError::LegacyPredecessor)
+        ));
+        Ok(())
     }
 
     #[test]

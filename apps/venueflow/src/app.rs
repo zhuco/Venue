@@ -196,6 +196,10 @@ impl VenueFlowApp {
                     self.model.last_error = Some(message.clone());
                     self.model.notice(message);
                 }
+                ClientEvent::CopyRelationUnavailable(message) => {
+                    self.model.last_error = Some(message.clone());
+                    self.model.notice(message);
+                }
                 ClientEvent::EventCursor(event_id) => self.model.observe_event_id(event_id),
                 ClientEvent::Snapshot(snapshot) => self.model.apply_snapshot(snapshot),
                 ClientEvent::Receipt(receipt) => {
@@ -206,7 +210,15 @@ impl VenueFlowApp {
                         ));
                     }
                 }
-                ClientEvent::Notice(message) => self.model.notice(message),
+                ClientEvent::CopyRelationConfigs(configs) => {
+                    self.model.apply_copy_relation_configs(configs);
+                }
+                ClientEvent::CopyRelationReceipt(receipt) => {
+                    self.model.notice(format!(
+                        "Copy relation {} revision {} is {:?}",
+                        receipt.relation_id, receipt.revision, receipt.state
+                    ));
+                }
             }
         }
     }

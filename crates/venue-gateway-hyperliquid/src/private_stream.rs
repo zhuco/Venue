@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use rust_decimal::Decimal;
+use serde::Deserialize;
 use venue_domain::domain::{FieldState, OrderSide, OrderState, Price};
 use venue_gateway_api::GatewayMode;
 
@@ -70,6 +71,161 @@ pub struct HyperliquidPrivateSubscription {
     kind: HyperliquidPrivateSubscriptionKind,
     websocket: &'static str,
     body: Vec<u8>,
+}
+
+/// Initial `twapStates` snapshot for the default perp dex. It is intentionally separate from
+/// the long-lived private decoder: bootstrap needs one bounded, complete response before it can
+/// make any account-risk claim.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HyperliquidTwapStatesSnapshot {
+    binding: HyperliquidPrivateStreamBinding,
+    states: Vec<HyperliquidTwapState>,
+}
+
+impl HyperliquidTwapStatesSnapshot {
+    #[must_use]
+    pub const fn binding(&self) -> &HyperliquidPrivateStreamBinding {
+        &self.binding
+    }
+
+    #[must_use]
+    pub fn states(&self) -> &[HyperliquidTwapState] {
+        &self.states
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HyperliquidTwapState {
+    pub twap_id: u64,
+    pub coin: String,
+    pub side: OrderSide,
+    pub quantity: Decimal,
+    pub executed_quantity: Decimal,
+    pub executed_notional: Decimal,
+    pub reduce_only: bool,
+    pub timestamp_ms: u64,
+}
+
+pub fn build_twap_states_subscription(
+    binding: &HyperliquidPrivateStreamBinding,
+) -> Result<Vec<u8>, HyperliquidError> {
+    serde_json::to_vec(&serde_json::json!({
+        "method": "subscribe",
+        "subscription": {"type": "twapStates", "user": binding.scope.user_address(), "dex": ""},
+    }))
+    .map_err(|_| HyperliquidError::Payload)
+}
+
+pub fn parse_twap_states_snapshot(
+    payload: &[u8],
+    binding: &HyperliquidPrivateStreamBinding,
+) -> Result<HyperliquidTwapStatesSnapshot, HyperliquidError> {
+    let envelope: EventEnvelope =
+        serde_json::from_slice(payload).map_err(|_| HyperliquidError::Payload)?;
+    if envelope.channel != "twapStates" {
+        return Err(HyperliquidError::Payload);
+    }
+    let raw: TwapStatesData =
+        serde_json::from_value(envelope.data).map_err(|_| HyperliquidError::Payload)?;
+    if !raw.user.eq_ignore_ascii_case(binding.scope.user_address()) || !raw.dex.is_empty() {
+        return Err(HyperliquidError::Binding);
+    }
+    let mut ids = BTreeSet::new();
+    let states = raw
+        .states
+        .into_iter()
+        .map(|(twap_id, state)| {
+            if twap_id == 0
+                || !ids.insert(twap_id)
+                || !state
+                    .user
+                    .eq_ignore_ascii_case(binding.scope.user_address())
+                || state.coin.is_empty()
+                || state.coin != state.coin.trim()
+                || state.timestamp == 0
+            {
+                return Err(HyperliquidError::Payload);
+            }
+            let quantity = decimal(&state.sz)?;
+            let executed_quantity = decimal(&state.executed_sz)?;
+            let executed_notional = decimal(&state.executed_ntl)?;
+            if quantity <= Decimal::ZERO
+                || executed_quantity.is_sign_negative()
+                || executed_quantity > quantity
+                || executed_notional.is_sign_negative()
+            {
+                return Err(HyperliquidError::Payload);
+            }
+            Ok(HyperliquidTwapState {
+                twap_id,
+                coin: state.coin,
+                side: side(&state.side)?,
+                quantity,
+                executed_quantity,
+                executed_notional,
+                reduce_only: state.reduce_only,
+                timestamp_ms: state.timestamp,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(HyperliquidTwapStatesSnapshot {
+        binding: binding.clone(),
+        states,
+    })
+}
+
+pub fn parse_all_mids_snapshot(
+    payload: &[u8],
+) -> Result<BTreeMap<String, Decimal>, HyperliquidError> {
+    let envelope: EventEnvelope =
+        serde_json::from_slice(payload).map_err(|_| HyperliquidError::Payload)?;
+    if envelope.channel != "allMids" {
+        return Err(HyperliquidError::Payload);
+    }
+    let mids = envelope
+        .data
+        .get("mids")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(HyperliquidError::Payload)?;
+    let mut result = BTreeMap::new();
+    for (coin, value) in mids {
+        if coin.is_empty() || coin != coin.trim() {
+            return Err(HyperliquidError::Payload);
+        }
+        let value = value
+            .as_str()
+            .ok_or(HyperliquidError::Payload)
+            .and_then(decimal)?;
+        if value <= Decimal::ZERO || result.insert(coin.clone(), value).is_some() {
+            return Err(HyperliquidError::Payload);
+        }
+    }
+    if result.is_empty() {
+        return Err(HyperliquidError::Payload);
+    }
+    Ok(result)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TwapStatesData {
+    dex: String,
+    user: String,
+    states: Vec<(u64, TwapStateData)>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TwapStateData {
+    coin: String,
+    user: String,
+    side: String,
+    sz: String,
+    executed_sz: String,
+    executed_ntl: String,
+    #[serde(rename = "reduceOnly")]
+    reduce_only: bool,
+    timestamp: u64,
 }
 
 impl HyperliquidPrivateSubscription {
@@ -457,6 +613,48 @@ fn frame_len(len: usize) -> Result<(), HyperliquidError> {
     if len == 0 || len > MAX_PRIVATE_EVENTS_PER_FRAME {
         Err(HyperliquidError::Payload)
     } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod twap_tests {
+    use super::*;
+    use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
+
+    fn binding() -> Result<HyperliquidPrivateStreamBinding, Box<dyn std::error::Error>> {
+        let gateway = crate::HyperliquidGatewayBinding::new(GatewayBinding::new(
+            VenueId::Hyperliquid,
+            GatewayMode::Live,
+            "00000000-0000-4000-8000-000000000001",
+            "BTC/USDC".parse()?,
+        )?)?;
+        let read = crate::HyperliquidReadBinding::new(
+            gateway,
+            "0x0000000000000000000000000000000000000001",
+        )?;
+        let meta = crate::parse_perp_meta(include_bytes!("../fixtures/perp-meta.json"), &read)?;
+        Ok(HyperliquidPrivateStreamBinding::new(&meta, 7)?)
+    }
+
+    #[test]
+    fn twap_snapshot_requires_exact_user_dex_and_parent_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding()?;
+        let request: serde_json::Value =
+            serde_json::from_slice(&build_twap_states_subscription(&binding)?)?;
+        assert_eq!(request["subscription"]["type"], "twapStates");
+        assert_eq!(
+            request["subscription"]["user"],
+            binding.scope().user_address()
+        );
+        assert_eq!(request["subscription"]["dex"], "");
+        let payload = br#"{"channel":"twapStates","data":{"dex":"","user":"0x0000000000000000000000000000000000000001","states":[[9,{"coin":"BTC","user":"0x0000000000000000000000000000000000000001","side":"B","sz":"2","executedSz":"0.5","executedNtl":"30000","minutes":10,"reduceOnly":false,"randomize":false,"timestamp":1700000000000}]]}}"#;
+        let parsed = parse_twap_states_snapshot(payload, &binding)?;
+        assert_eq!(parsed.states()[0].twap_id, 9);
+        assert_eq!(parsed.states()[0].quantity, Decimal::new(2, 0));
+        let wrong_dex = br#"{"channel":"twapStates","data":{"dex":"other","user":"0x0000000000000000000000000000000000000001","states":[]}}"#;
+        assert!(parse_twap_states_snapshot(wrong_dex, &binding).is_err());
         Ok(())
     }
 }

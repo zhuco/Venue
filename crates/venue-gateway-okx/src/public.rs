@@ -12,6 +12,7 @@ pub struct OkxInstrument {
     instrument: Instrument,
     base_quantity_per_contract: Decimal,
     minimum_base_quantity: Decimal,
+    maximum_limit_contracts: Option<Decimal>,
 }
 
 /// Executable OKX contract size derived from a quote-notional ceiling. Quantities exposed to the
@@ -59,6 +60,11 @@ impl OkxInstrument {
     #[must_use]
     pub const fn minimum_base_quantity(&self) -> Decimal {
         self.minimum_base_quantity
+    }
+
+    #[must_use]
+    pub const fn maximum_limit_contracts(&self) -> Option<Decimal> {
+        self.maximum_limit_contracts
     }
 
     pub(crate) fn validate_scope(&self, config: &OkxConfig) -> Result<(), OkxError> {
@@ -183,6 +189,12 @@ pub fn parse_instrument(
         .ok_or(OkxError::Payload)?;
     let lot_size = positive_decimal(&row.lot_sz)?;
     let minimum_contracts = positive_decimal(&row.min_sz)?;
+    let maximum_limit_contracts = row
+        .max_lmt_sz
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(positive_decimal)
+        .transpose()?;
     let quantity_step = lot_size
         .checked_mul(base_quantity_per_contract)
         .ok_or(OkxError::Payload)?;
@@ -206,6 +218,7 @@ pub fn parse_instrument(
         instrument,
         base_quantity_per_contract,
         minimum_base_quantity,
+        maximum_limit_contracts,
     })
 }
 

@@ -15,12 +15,15 @@ use tokio::{
     time::{self, MissedTickBehavior},
 };
 use venue_control_protocol::{
-    ControlCommandRequest, INDICATOR_EVENT_STREAM_PATH, INDICATOR_SNAPSHOT_PATH,
+    COPY_RELATION_CANDIDATES_PATH, COPY_RELATION_PATH, ControlCommandRequest,
+    CopyRelationUpsertRequest, EXECUTION_FACTS_PATH, GatewayMode, INDICATOR_EVENT_STREAM_PATH,
+    INDICATOR_SNAPSHOT_PATH, UiAccountScope, VenueId,
 };
 
 use crate::{
     AccountDeliveryRepository, AccountDeliveryRepositoryError, ControlRepository, ControlService,
-    IndicatorProjectionError, IndicatorProjectionStore, RepositoryError, ServiceError,
+    CopyRelationRepository, CopyRelationRepositoryError, IndicatorProjectionError,
+    IndicatorProjectionStore, RepositoryError, ServiceError,
     account_node_poll::{
         AccountNodePollError, AccountNodeRoute, MAX_ACCOUNT_NODE_HTTP_TIMEOUT,
         handle_account_node_request,
@@ -154,7 +157,7 @@ pub async fn serve_local<R>(
     shutdown: watch::Receiver<bool>,
 ) -> Result<(), HttpServerError>
 where
-    R: ControlRepository + AccountDeliveryRepository + 'static,
+    R: ControlRepository + AccountDeliveryRepository + CopyRelationRepository + 'static,
 {
     serve_local_with_indicators(
         listener,
@@ -176,7 +179,7 @@ pub async fn serve_local_with_indicators<R>(
     shutdown: watch::Receiver<bool>,
 ) -> Result<(), HttpServerError>
 where
-    R: ControlRepository + AccountDeliveryRepository + 'static,
+    R: ControlRepository + AccountDeliveryRepository + CopyRelationRepository + 'static,
 {
     serve_inner(
         listener,
@@ -197,7 +200,7 @@ pub async fn serve_local_with_accounts<R>(
     shutdown: watch::Receiver<bool>,
 ) -> Result<(), HttpServerError>
 where
-    R: ControlRepository + AccountDeliveryRepository + 'static,
+    R: ControlRepository + AccountDeliveryRepository + CopyRelationRepository + 'static,
 {
     serve_inner(
         listener,
@@ -219,7 +222,7 @@ async fn serve_inner<R>(
     access: AccessMode,
 ) -> Result<(), HttpServerError>
 where
-    R: ControlRepository + AccountDeliveryRepository + 'static,
+    R: ControlRepository + AccountDeliveryRepository + CopyRelationRepository + 'static,
 {
     config.validate()?;
     if !listener.local_addr()?.ip().is_loopback() {
@@ -256,7 +259,7 @@ where
 
 async fn handle_connection<R>(mut stream: TcpStream, state: HttpState<R>)
 where
-    R: ControlRepository + AccountDeliveryRepository + 'static,
+    R: ControlRepository + AccountDeliveryRepository + CopyRelationRepository + 'static,
 {
     let request = match time::timeout(
         state.config.request_timeout,
@@ -283,7 +286,7 @@ async fn dispatch<R>(
     request: HttpRequest,
 ) -> Result<(), ()>
 where
-    R: ControlRepository + AccountDeliveryRepository + 'static,
+    R: ControlRepository + AccountDeliveryRepository + CopyRelationRepository + 'static,
 {
     #[cfg(test)]
     if matches!(state.access, AccessMode::TransportFixture) {
@@ -298,7 +301,7 @@ async fn dispatch_control<R>(
     request: HttpRequest,
 ) -> Result<(), ()>
 where
-    R: ControlRepository + AccountDeliveryRepository + 'static,
+    R: ControlRepository + AccountDeliveryRepository + CopyRelationRepository + 'static,
 {
     let Some((path, query)) = split_target(&request.target) else {
         return write_error(stream, HttpError::BadRequest)
@@ -354,6 +357,63 @@ where
                 .await
                 .map_err(|_| ())
         }
+        (Method::Get, EXECUTION_FACTS_PATH) if query.is_none() => {
+            let facts = match call(state, state.service.execution_facts()).await {
+                Ok(facts) => facts,
+                Err(error) => return write_error(stream, error).await.map_err(|_| ()),
+            };
+            let body = serde_json::to_vec(&facts).map_err(|_| ())?;
+            write_response(stream, "200 OK", "application/json", "close", &body)
+                .await
+                .map_err(|_| ())
+        }
+        (Method::Get, COPY_RELATION_PATH) if query.is_none() => {
+            let relations = match call(state, state.service.copy_relations()).await {
+                Ok(relations) => relations,
+                Err(error) => return write_error(stream, error).await.map_err(|_| ()),
+            };
+            let body = serde_json::to_vec(&relations).map_err(|_| ())?;
+            write_response(stream, "200 OK", "application/json", "close", &body)
+                .await
+                .map_err(|_| ())
+        }
+        (Method::Get, COPY_RELATION_CANDIDATES_PATH) if query.is_none() => {
+            let candidates = match call(state, state.service.copy_relation_candidates()).await {
+                Ok(candidates) => candidates,
+                Err(error) => return write_error(stream, error).await.map_err(|_| ()),
+            };
+            let body = serde_json::to_vec(&candidates).map_err(|_| ())?;
+            write_response(stream, "200 OK", "application/json", "close", &body)
+                .await
+                .map_err(|_| ())
+        }
+        (Method::Post, COPY_RELATION_PATH) if query.is_none() => {
+            let request = match serde_json::from_slice::<CopyRelationUpsertRequest>(&request.body) {
+                Ok(request) => request,
+                Err(_) => {
+                    return write_error(stream, HttpError::BadRequest)
+                        .await
+                        .map_err(|_| ());
+                }
+            };
+            let observed_ms = match now_ms() {
+                Ok(observed_ms) => observed_ms,
+                Err(error) => return write_error(stream, error).await.map_err(|_| ()),
+            };
+            let receipt = match call(
+                state,
+                state.service.upsert_copy_relation(&request, observed_ms),
+            )
+            .await
+            {
+                Ok(receipt) => receipt,
+                Err(error) => return write_error(stream, error).await.map_err(|_| ()),
+            };
+            let body = serde_json::to_vec(&receipt).map_err(|_| ())?;
+            write_response(stream, "200 OK", "application/json", "close", &body)
+                .await
+                .map_err(|_| ())
+        }
         (Method::Post, path) if query.is_none() && AccountNodeRoute::from_path(path).is_some() => {
             let route = AccountNodeRoute::from_path(path).ok_or(())?;
             let observed_ms = match now_ms() {
@@ -390,12 +450,12 @@ where
             .await
         }
         (Method::Get, "/v2/ui/events") => {
-            let cursor = match event_cursor(query, request.last_event_id) {
-                Ok(cursor) => cursor,
+            let (scope, cursor) = match event_stream_scope(query, request.last_event_id) {
+                Ok(value) => value,
                 Err(error) => return write_error(stream, error).await.map_err(|_| ()),
             };
             write_sse_headers(stream).await.map_err(|_| ())?;
-            stream_events(stream, state, cursor).await;
+            stream_events(stream, state, scope, cursor).await;
             Ok(())
         }
         (Method::Get, INDICATOR_EVENT_STREAM_PATH) => {
@@ -438,6 +498,47 @@ fn event_cursor(query: Option<&str>, last_event_id: Option<i64>) -> Result<i64, 
         (None, None) => 0,
     };
     (cursor >= 0).then_some(cursor).ok_or(HttpError::BadRequest)
+}
+
+fn event_stream_scope(
+    query: Option<&str>,
+    last_event_id: Option<i64>,
+) -> Result<(UiAccountScope, i64), HttpError> {
+    let query = query.ok_or(HttpError::BadRequest)?;
+    let mut venue = None;
+    let mut mode = None;
+    let mut account = None;
+    let mut after = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').ok_or(HttpError::BadRequest)?;
+        match key {
+            "venue" if venue.replace(value).is_none() => {}
+            "mode" if mode.replace(value).is_none() => {}
+            "trading_account_id" if account.replace(value).is_none() => {}
+            "after" if after.replace(value).is_none() => {}
+            _ => return Err(HttpError::BadRequest),
+        }
+    }
+    let scope = UiAccountScope {
+        venue: venue
+            .ok_or(HttpError::BadRequest)?
+            .parse::<VenueId>()
+            .map_err(|_| HttpError::BadRequest)?,
+        mode: mode
+            .ok_or(HttpError::BadRequest)?
+            .parse::<GatewayMode>()
+            .map_err(|_| HttpError::BadRequest)?,
+        trading_account_id: account.ok_or(HttpError::BadRequest)?.to_owned(),
+    };
+    scope.validate().map_err(|_| HttpError::BadRequest)?;
+    let query_cursor = after
+        .unwrap_or("0")
+        .parse::<i64>()
+        .map_err(|_| HttpError::BadRequest)?;
+    if query_cursor < 0 || last_event_id.is_some_and(|header| header != query_cursor) {
+        return Err(HttpError::BadRequest);
+    }
+    Ok((scope, query_cursor))
 }
 
 async fn read_request(stream: &mut TcpStream, body_limit: usize) -> Result<HttpRequest, HttpError> {
@@ -575,8 +676,12 @@ async fn call_indicator<R, T>(
     }
 }
 
-async fn stream_events<R>(stream: &mut TcpStream, state: &HttpState<R>, mut cursor: i64)
-where
+async fn stream_events<R>(
+    stream: &mut TcpStream,
+    state: &HttpState<R>,
+    scope: UiAccountScope,
+    mut cursor: i64,
+) where
     R: ControlRepository + 'static,
 {
     let mut shutdown = state.shutdown.clone();
@@ -589,7 +694,7 @@ where
             changed = shutdown.changed() => if changed.is_err() || *shutdown.borrow() { return; },
             _ = keep_alive.tick() => if write_sse(stream, b": keep-alive\n\n", state.config.request_timeout).await.is_err() { return; },
             _ = poll.tick() => {
-                let events = match call(state, state.service.events(cursor, state.config.event_page_limit)).await { Ok(events) => events, Err(_) => return };
+                let events = match call(state, state.service.events(&scope, cursor, state.config.event_page_limit)).await { Ok(events) => events, Err(_) => return };
                 for event in events {
                     let payload = match serde_json::to_string(&event.event) { Ok(payload) if payload.len() <= state.config.request_body_limit => payload, _ => return };
                     let frame = format!("id: {}\nevent: control\ndata: {payload}\n\n", event.sequence);
@@ -730,6 +835,18 @@ fn map_service_error(error: ServiceError) -> HttpError {
             | AccountDeliveryRepositoryError::NumericRange,
         ) => HttpError::BadRequest,
         ServiceError::AccountDeliveryRepository(AccountDeliveryRepositoryError::CorruptData) => {
+            HttpError::Internal
+        }
+        ServiceError::CopyRelationRepository(CopyRelationRepositoryError::Conflict) => {
+            HttpError::Conflict
+        }
+        ServiceError::CopyRelationRepository(CopyRelationRepositoryError::Database) => {
+            HttpError::Unavailable
+        }
+        ServiceError::CopyRelationRepository(CopyRelationRepositoryError::InvalidData) => {
+            HttpError::BadRequest
+        }
+        ServiceError::CopyRelationRepository(CopyRelationRepositoryError::CorruptData) => {
             HttpError::Internal
         }
     }

@@ -1,7 +1,10 @@
 use crate::{
     execution::AccountLaneError,
     runtime::{
-        account::{AccountReconcilerError, MarketHubError, PrivateRouterError, RegistryError},
+        account::{
+            AccountPrivateIngressError, AccountReconcilerError, MarketHubError, PrivateRouterError,
+            RegistryError,
+        },
         strategy::StrategyHostError,
     },
 };
@@ -23,8 +26,14 @@ pub enum AccountRuntimeError {
     ExecutionLane(#[from] AccountLaneError),
     #[error(transparent)]
     ActorApplied(#[from] ActorAppliedError),
+    #[error(transparent)]
+    PrivateIngress(#[from] AccountPrivateIngressError),
     #[error("account is not ready on the requested private generation")]
     AccountUnavailable,
+    #[error("the account private facts journal has not been attached")]
+    PrivateIngressUnavailable,
+    #[error("the account private facts journal is already attached")]
+    PrivateIngressAttached,
     #[error("strategy actor host is missing")]
     ActorMissing,
     #[error("signed reconciliation generation is stale or duplicated")]
@@ -95,6 +104,8 @@ pub enum AccountRuntimeError {
     StrategyTurnAuthority,
     #[error("the exact Actor-applied durable store or WAL head is unavailable")]
     ActorAppliedUnavailable,
+    #[error("resident Host supplied a regressive or inconsistent command WAL head")]
+    ResidentWalHead,
     #[error("Actor-applied storage cannot be replaced after registration or use")]
     ActorAppliedStore,
     #[error("private route plan is stale relative to the committed durable inbox revision")]

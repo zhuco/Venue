@@ -233,6 +233,92 @@ impl OkxHttpTransport {
         })
     }
 
+    /// Public contract catalogue used only to normalize an already signed account-wide read.
+    /// It has no order authority and is deliberately kept beside the selected-instrument fetch so
+    /// both paths enforce the same origin, timeout, and bounded-body limits.
+    pub(crate) async fn fetch_swap_instruments(
+        &self,
+        generation: u64,
+    ) -> Result<OkxHttpResponse, OkxTransportError> {
+        if generation == 0 {
+            return Err(OkxTransportError::Binding);
+        }
+        let path = format!("{}?instType=SWAP", crate::endpoints::INSTRUMENTS);
+        let response = timeout(
+            self.operation_timeout,
+            self.client.get(format!("{}{}", self.origin, path)).send(),
+        )
+        .await
+        .map_err(|_| OkxTransportError::Timeout)?
+        .map_err(|error| {
+            if error.is_timeout() {
+                OkxTransportError::Timeout
+            } else {
+                OkxTransportError::Http
+            }
+        })?;
+        if !response.status().is_success() {
+            return Err(OkxTransportError::HttpStatus(response.status().as_u16()));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > self.max_body_bytes as u64)
+        {
+            return Err(OkxTransportError::BodyTooLarge);
+        }
+        let body = read_bounded_body(response, self.operation_timeout, self.max_body_bytes).await?;
+        Ok(OkxHttpResponse {
+            binding: self.config.gateway_binding().clone(),
+            instrument_generation: generation,
+            received_at_ms: received_at_ms()?,
+            body,
+        })
+    }
+
+    /// Fetches exactly one public book level for the bound instrument.  It remains a bounded
+    /// read-only operation and carries the current instrument generation for fail-closed use by
+    /// physical limit normalization.
+    pub(crate) async fn fetch_bbo(
+        &self,
+        generation: u64,
+    ) -> Result<OkxHttpResponse, OkxTransportError> {
+        if generation == 0 {
+            return Err(OkxTransportError::Binding);
+        }
+        let symbol = &self.config.gateway_binding().symbol;
+        let native = format!("{}-{}-SWAP", symbol.base(), symbol.quote());
+        let path = format!("{}?instId={native}&sz=1", crate::endpoints::BOOKS);
+        let response = timeout(
+            self.operation_timeout,
+            self.client.get(format!("{}{}", self.origin, path)).send(),
+        )
+        .await
+        .map_err(|_| OkxTransportError::Timeout)?
+        .map_err(|error| {
+            if error.is_timeout() {
+                OkxTransportError::Timeout
+            } else {
+                OkxTransportError::Http
+            }
+        })?;
+        if !response.status().is_success() {
+            return Err(OkxTransportError::HttpStatus(response.status().as_u16()));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > self.max_body_bytes as u64)
+        {
+            return Err(OkxTransportError::BodyTooLarge);
+        }
+        let body = read_bounded_body(response, self.operation_timeout, self.max_body_bytes).await?;
+        Ok(OkxHttpResponse {
+            binding: self.config.gateway_binding().clone(),
+            instrument_generation: generation,
+            received_at_ms: received_at_ms()?,
+            body,
+        })
+    }
+
     /// Executes a request-bound authenticated read. This does not collect pages or grant any
     /// capability; callers must wrap the response in `OkxRawPrivatePage` and close the attempt.
     pub async fn execute_read(

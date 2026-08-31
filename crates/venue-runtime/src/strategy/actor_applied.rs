@@ -83,6 +83,19 @@ impl ActorAppliedTurnStore {
         Ok(envelope.applied_private_deliveries)
     }
 
+    pub(crate) fn recovered_actor_checkpoint(
+        &self,
+    ) -> Result<Option<(ActorAppliedReceipt, Vec<u8>)>, ActorAppliedError> {
+        let Some(recovered) = self.recover()? else {
+            return Ok(None);
+        };
+        let envelope = replay_envelope(&recovered)?;
+        Ok(Some((
+            recovered.receipt().clone(),
+            envelope.actor_checkpoint,
+        )))
+    }
+
     pub(crate) fn refresh_binding(
         &mut self,
         binding: StrategyBinding,
@@ -228,6 +241,7 @@ fn commit_identity(digest: &mut Sha256, binding: &StrategyBinding, include_kind:
             match binding.key.strategy_kind {
                 StrategyKind::HedgedGrid => b"hedged_grid",
                 StrategyKind::Scalping => b"scalping",
+                StrategyKind::Copy => b"copy",
             },
         );
     }

@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::domain::{ExchangeId, NativeOrderFamily, OrderOwner, Symbol};
 use venue_storage::ActorAppliedReceipt;
@@ -50,8 +51,11 @@ impl AccountOrderCapabilityEvidence {
                 NativeOrderFamily::UmConditional,
                 NativeOrderFamily::UmAlgo,
             ]),
-            ExchangeId::Gate | ExchangeId::Bitget => BTreeSet::from([NativeOrderFamily::UmOrder]),
-            ExchangeId::Bybit | ExchangeId::Hyperliquid | ExchangeId::Okx => BTreeSet::new(),
+            ExchangeId::Gate
+            | ExchangeId::Bitget
+            | ExchangeId::Bybit
+            | ExchangeId::Hyperliquid
+            | ExchangeId::Okx => BTreeSet::from([NativeOrderFamily::UmOrder]),
         };
         Self {
             account,
@@ -76,6 +80,8 @@ impl AccountOrderCapabilityEvidence {
 pub enum StrategyKind {
     HedgedGrid,
     Scalping,
+    /// A follower-owned semantic Copy actor. It still has no exchange client or writer authority.
+    Copy,
 }
 
 /// Stable logical ownership identity. A controlled process restart may replace `run_id` in its
@@ -209,6 +215,43 @@ impl AppliedStrategyTurnReceipt {
         self.actor_applied.as_ref()
     }
 
+    /// A serializable restart anchor for the already-durable actor checkpoint.  This is an
+    /// integrity expectation only; it cannot create a turn, writer, or dispatch capability.
+    #[must_use]
+    pub fn actor_applied_anchor(&self) -> Option<venue_storage::ActorAppliedAnchor> {
+        self.actor_applied.as_ref().map(ActorAppliedReceipt::anchor)
+    }
+
+    /// Read-only commitment to the exact actor checkpoint that made a semantic turn durable.
+    /// It is suitable for a Control receipt, but cannot be used to reconstruct a turn or a
+    /// physical dispatch permit.
+    #[must_use]
+    pub fn durable_fact_digest(&self) -> Option<[u8; 32]> {
+        let anchor = self.actor_applied_anchor()?;
+        let mut digest = Sha256::new();
+        digest.update(b"venue.runtime.actor-applied.receipt.v1");
+        digest.update(self.token.target().account.exchange.as_str().as_bytes());
+        digest.update(self.token.target().account.account.as_bytes());
+        digest.update(self.token.target().instance_id.as_bytes());
+        digest.update(self.token.target().symbol.to_string().as_bytes());
+        digest.update(self.token.config_epoch().to_le_bytes());
+        digest.update(self.token.turn_sequence().to_le_bytes());
+        digest.update(anchor.journal_root_sha256());
+        digest.update(anchor.journal_tail_sequence().to_le_bytes());
+        digest.update(anchor.checkpoint_sha256());
+        Some(digest.finalize().into())
+    }
+
+    #[must_use]
+    pub fn target(&self) -> &StrategyInstanceKey {
+        self.token.target()
+    }
+
+    #[must_use]
+    pub const fn config_epoch(&self) -> u64 {
+        self.token.config_epoch()
+    }
+
     #[cfg(test)]
     pub(crate) fn test_persisted(token: StrategyTurnToken) -> Self {
         Self {
@@ -279,12 +322,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn adapters_without_an_execution_closure_fail_closed() -> Result<(), AccountModelError> {
+    fn all_resident_venues_admit_their_proven_regular_order_family() -> Result<(), AccountModelError>
+    {
         for exchange in [ExchangeId::Bybit, ExchangeId::Hyperliquid, ExchangeId::Okx] {
             let account = AccountKey::new(exchange, "00000000-0000-0000-0000-000000000001")?;
             let evidence = AccountOrderCapabilityEvidence::for_account(account);
 
-            assert!(!evidence.supports(NativeOrderFamily::UmOrder));
+            assert!(evidence.supports(NativeOrderFamily::UmOrder));
             assert!(!evidence.supports(NativeOrderFamily::UmConditional));
             assert!(!evidence.supports(NativeOrderFamily::UmAlgo));
         }

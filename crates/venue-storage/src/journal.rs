@@ -39,25 +39,37 @@ impl Journal {
     }
 
     pub fn append(&mut self, record: FactRecord) -> Result<u64, StorageError> {
+        self.append_with_sequence(|_| Ok(record))
+            .map(|entry| entry.sequence)
+    }
+
+    /// Builds the record from the exact sequence that will be fsynced.  Callers that embed the
+    /// durable facts cursor in a normalized private event must not guess a sequence before the
+    /// journal has checked its current tail under the append lock.
+    pub fn append_with_sequence(
+        &mut self,
+        build: impl FnOnce(u64) -> Result<FactRecord, StorageError>,
+    ) -> Result<JournalEntry, StorageError> {
+        let sequence = self.next_sequence;
+        let record = build(sequence)?;
         record
             .header
             .validate()
             .map_err(StorageError::InvalidRecord)?;
-        let sequence = self.next_sequence;
         let following_sequence = sequence
             .checked_add(1)
             .ok_or(StorageError::SequenceExhausted)?;
         let entry = JournalEntry { sequence, record };
         let encoded = serde_json::to_vec(&entry).map_err(StorageError::Encode)?;
-        self.jsonl.append(|snapshot| {
+        let entry = self.jsonl.append(|snapshot| {
             let recovery = recover_snapshot(snapshot)?;
             if next_sequence(&recovery.entries)? != self.next_sequence {
                 return Err(StorageError::Sequence);
             }
-            Ok(((), encoded))
+            Ok((entry.clone(), encoded))
         })?;
         self.next_sequence = following_sequence;
-        Ok(sequence)
+        Ok(entry)
     }
 
     pub fn recover(&self) -> Result<JournalRecovery, StorageError> {
@@ -312,6 +324,23 @@ mod tests {
         })?;
         expected.push(b'\n');
         assert_eq!(fs::read(path)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn append_with_sequence_binds_the_record_to_the_fsynced_sequence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("facts.jsonl");
+        let mut journal = Journal::open(&path)?;
+
+        let entry = journal.append_with_sequence(|sequence| {
+            fact("bound", sequence).map_err(|_| StorageError::Sequence)
+        })?;
+
+        assert_eq!(entry.sequence, 1);
+        assert_eq!(entry.record.header.source_sequence, Some(1));
+        assert_eq!(journal.recover()?.entries, vec![entry]);
         Ok(())
     }
 

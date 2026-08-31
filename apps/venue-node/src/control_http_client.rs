@@ -6,15 +6,16 @@ use std::{
 };
 
 use reqwest::{
-    StatusCode, Url,
+    Response, StatusCode, Url,
     header::{CONTENT_LENGTH, CONTENT_TYPE},
     redirect::Policy,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use venue_control_protocol::{
     ACCOUNT_DELIVERY_ACK_PATH, ACCOUNT_DELIVERY_CLAIM_PATH, ACCOUNT_DELIVERY_RECEIPT_PATH,
-    ACCOUNT_DELIVERY_SCHEMA_VERSION, AccountDeliveryAck, AccountDeliveryClaim,
-    AccountDeliveryClaimRequest, AccountDeliveryPurpose, AccountDeliveryReceipt,
+    ACCOUNT_DELIVERY_SCHEMA_VERSION, ACCOUNT_NODE_PROJECTION_PATH, AccountDeliveryAck,
+    AccountDeliveryClaim, AccountDeliveryClaimRequest, AccountDeliveryPurpose,
+    AccountDeliveryReceipt, COPY_RELATION_PATH, CopyRelationRecord, NodeProjectionEnvelope,
 };
 
 use crate::control_delivery::{
@@ -54,6 +55,8 @@ pub struct ControlHttpClient {
     claim_url: Url,
     ack_url: Url,
     receipt_url: Url,
+    projection_url: Url,
+    copy_relation_url: Url,
     max_response_bytes: usize,
     node_token: Option<venue_control_protocol::accounts::SecretValue>,
 }
@@ -72,6 +75,8 @@ impl ControlHttpClient {
         let claim_url = endpoint(&base_url, ACCOUNT_DELIVERY_CLAIM_PATH)?;
         let ack_url = endpoint(&base_url, ACCOUNT_DELIVERY_ACK_PATH)?;
         let receipt_url = endpoint(&base_url, ACCOUNT_DELIVERY_RECEIPT_PATH)?;
+        let projection_url = endpoint(&base_url, ACCOUNT_NODE_PROJECTION_PATH)?;
+        let copy_relation_url = endpoint(&base_url, COPY_RELATION_PATH)?;
         let client = reqwest::Client::builder()
             .redirect(Policy::none())
             .no_proxy()
@@ -85,6 +90,8 @@ impl ControlHttpClient {
             claim_url,
             ack_url,
             receipt_url,
+            projection_url,
+            copy_relation_url,
             max_response_bytes: config.max_response_bytes,
             node_token: std::env::var("VENUE_CONTROL_NODE_TOKEN")
                 .ok()
@@ -136,6 +143,36 @@ impl ControlHttpClient {
         Ok(echoed)
     }
 
+    /// Uploads an already durable, node-owned read projection. The response must be the exact
+    /// envelope, so a retry after an uncertain HTTP result cannot acknowledge a different cursor.
+    pub async fn publish_projection(
+        &self,
+        projection: &NodeProjectionEnvelope,
+    ) -> Result<NodeProjectionEnvelope, ControlHttpClientError> {
+        projection
+            .validate()
+            .map_err(|_| ControlHttpClientError::InvalidRequest)?;
+        let echoed: NodeProjectionEnvelope =
+            self.post_json(&self.projection_url, projection).await?;
+        if echoed != *projection {
+            return Err(ControlHttpClientError::ResponseConflict);
+        }
+        Ok(echoed)
+    }
+
+    /// Reads the current durable relation configurations. The returned data stays configuration
+    /// only: it grants no delivery lease, Actor authority, or execution capability.
+    pub async fn copy_relations(&self) -> Result<Vec<CopyRelationRecord>, ControlHttpClientError> {
+        let relations: Vec<CopyRelationRecord> = self.get_json(&self.copy_relation_url).await?;
+        if relations
+            .iter()
+            .any(|relation| relation.validate().is_err())
+        {
+            return Err(ControlHttpClientError::InvalidResponse);
+        }
+        Ok(relations)
+    }
+
     async fn post_json<T: Serialize + ?Sized, U: DeserializeOwned>(
         &self,
         url: &Url,
@@ -153,13 +190,38 @@ impl ControlHttpClient {
         if let Some(token) = &self.node_token {
             request = request.bearer_auth(token.expose());
         }
-        let mut response = request.send().await.map_err(|error| {
+        let response = request.send().await.map_err(|error| {
             if error.is_timeout() {
                 ControlHttpClientError::Timeout
             } else {
                 ControlHttpClientError::Transport
             }
         })?;
+        self.decode_response(response).await
+    }
+
+    async fn get_json<U: DeserializeOwned>(&self, url: &Url) -> Result<U, ControlHttpClientError> {
+        let mut request = self
+            .client
+            .get(url.clone())
+            .header(CONTENT_TYPE, "application/json");
+        if let Some(token) = &self.node_token {
+            request = request.bearer_auth(token.expose());
+        }
+        let response = request.send().await.map_err(|error| {
+            if error.is_timeout() {
+                ControlHttpClientError::Timeout
+            } else {
+                ControlHttpClientError::Transport
+            }
+        })?;
+        self.decode_response(response).await
+    }
+
+    async fn decode_response<U: DeserializeOwned>(
+        &self,
+        mut response: Response,
+    ) -> Result<U, ControlHttpClientError> {
         if response.status() != StatusCode::OK {
             return Err(match response.status() {
                 StatusCode::CONFLICT => ControlHttpClientError::ResponseConflict,

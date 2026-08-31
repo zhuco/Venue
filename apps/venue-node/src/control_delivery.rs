@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use venue_control_protocol::{
     ACCOUNT_DELIVERY_SCHEMA_VERSION, AccountDeliveryAck, AccountDeliveryBinding,
     AccountDeliveryClaim, AccountDeliveryLease, AccountDeliveryPayload, AccountDeliveryPurpose,
-    AccountDeliveryReceipt, AccountDeliveryReceiptState,
+    AccountDeliveryReceipt, AccountDeliveryReceiptState, CopySemanticJobDelivery,
 };
 
 const EVENT_SCHEMA_VERSION: u16 = 1;
@@ -118,6 +118,17 @@ pub struct ActorDeliveryTurn {
     durable_inbox_root_digest: [u8; 32],
 }
 
+/// The exact copy claim material retained by Node before it may create a physical child. This
+/// is only a recovery envelope; it cannot claim, ACK, or produce a receipt on its own.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PersistedCopyActorTurn {
+    lease: AccountDeliveryLease,
+    job: CopySemanticJobDelivery,
+    durable_inbox_digest: [u8; 32],
+    durable_inbox_sequence: u64,
+    durable_inbox_root_digest: [u8; 32],
+}
+
 impl ActorDeliveryTurn {
     #[must_use]
     pub const fn lease(&self) -> &AccountDeliveryLease {
@@ -149,6 +160,19 @@ impl ActorDeliveryTurn {
         &self.claim.lease.node_id
     }
 
+    pub(crate) fn persist_copy_turn(&self) -> Result<PersistedCopyActorTurn, ControlDeliveryError> {
+        let AccountDeliveryPayload::CopySemanticJob(job) = &self.claim.payload else {
+            return Err(ControlDeliveryError::ActorAppliedUnavailable);
+        };
+        Ok(PersistedCopyActorTurn {
+            lease: self.claim.lease.clone(),
+            job: job.clone(),
+            durable_inbox_digest: self.durable_inbox_digest,
+            durable_inbox_sequence: self.durable_inbox_sequence,
+            durable_inbox_root_digest: self.durable_inbox_root_digest,
+        })
+    }
+
     pub fn applied(
         self,
         _observed_ms: u64,
@@ -156,6 +180,65 @@ impl ActorDeliveryTurn {
         _detail: impl Into<String>,
     ) -> Result<ActorDeliveryCompletion, ControlDeliveryError> {
         Err(ControlDeliveryError::ActorAppliedUnavailable)
+    }
+
+    /// Converts only the runtime's durable Copy Actor receipt into Control's semantic Applied
+    /// completion. The receipt is checked against this exact inbox turn; it does not report a
+    /// physical execution outcome or expose a dispatch permit.
+    pub fn applied_from_copy_runtime(
+        self,
+        applied: &venue_runtime::account::CopyActorAppliedReceipt,
+        observed_ms: u64,
+        detail: impl Into<String>,
+    ) -> Result<ActorDeliveryCompletion, ControlDeliveryError> {
+        let commitment = applied.commitment();
+        if commitment.delivery_digest() != copy_delivery_digest(&self.claim.payload)
+            || commitment.durable_inbox_digest() != self.durable_inbox_digest
+            || commitment.durable_inbox_sequence() != self.durable_inbox_sequence
+            || commitment.durable_inbox_root_digest() != self.durable_inbox_root_digest
+        {
+            return Err(ControlDeliveryError::ActorAppliedUnavailable);
+        }
+        self.complete(
+            AccountDeliveryReceiptState::Applied,
+            observed_ms,
+            applied.account_fact_digest(),
+            detail.into(),
+            Some(ActorDurableAppliedAuthority(())),
+        )
+    }
+
+    /// Converts a generic resident actor's durable checkpoint into `Applied`.  The receipt has
+    /// no physical-execution meaning; its only role is proving that this exact Control command
+    /// reached the addressed Actor before Control observes success.
+    pub fn applied_from_runtime(
+        self,
+        applied: &venue_runtime::AppliedStrategyTurnReceipt,
+        observed_ms: u64,
+        detail: impl Into<String>,
+    ) -> Result<ActorDeliveryCompletion, ControlDeliveryError> {
+        let AccountDeliveryPayload::ControlCommand(command) = &self.claim.payload else {
+            return Err(ControlDeliveryError::ActorAppliedUnavailable);
+        };
+        let target = applied.target();
+        if target.account.exchange.as_str() != command.venue.as_str()
+            || target.account.account != command.trading_account_id
+            || target.instance_id != command.instance_id
+            || target.symbol != command.symbol
+            || applied.config_epoch() != command.expected_config_epoch
+        {
+            return Err(ControlDeliveryError::ActorAppliedUnavailable);
+        }
+        let digest = applied
+            .durable_fact_digest()
+            .ok_or(ControlDeliveryError::ActorAppliedUnavailable)?;
+        self.complete(
+            AccountDeliveryReceiptState::Applied,
+            observed_ms,
+            digest,
+            detail.into(),
+            Some(ActorDurableAppliedAuthority(())),
+        )
     }
 
     #[cfg(test)]
@@ -229,6 +312,36 @@ impl ActorDeliveryTurn {
     }
 
     no_authority_methods!();
+}
+
+impl PersistedCopyActorTurn {
+    /// Delivery leases are intentionally excluded: Control may re-issue the same durable inbox
+    /// turn under a fresh lease after a receipt transport failure. The immutable job and inbox
+    /// commitment must remain byte-for-byte identical.
+    pub(crate) fn same_delivery(&self, other: &Self) -> bool {
+        self.job == other.job
+            && self.durable_inbox_digest == other.durable_inbox_digest
+            && self.durable_inbox_sequence == other.durable_inbox_sequence
+            && self.durable_inbox_root_digest == other.durable_inbox_root_digest
+            && self.lease.binding == other.lease.binding
+            && self.lease.node_id == other.lease.node_id
+    }
+
+    pub(crate) fn restore(&self) -> Result<ActorDeliveryTurn, ControlDeliveryError> {
+        let claim = AccountDeliveryClaim {
+            lease: self.lease.clone(),
+            payload: AccountDeliveryPayload::CopySemanticJob(self.job.clone()),
+        };
+        claim
+            .validate()
+            .map_err(|_| ControlDeliveryError::InvalidCompletion)?;
+        Ok(ActorDeliveryTurn {
+            claim,
+            durable_inbox_digest: self.durable_inbox_digest,
+            durable_inbox_sequence: self.durable_inbox_sequence,
+            durable_inbox_root_digest: self.durable_inbox_root_digest,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -1220,6 +1333,15 @@ fn validate_detail(
     } else {
         Ok(())
     }
+}
+
+fn copy_delivery_digest(payload: &AccountDeliveryPayload) -> [u8; 32] {
+    let AccountDeliveryPayload::CopySemanticJob(job) = payload else {
+        return [0; 32];
+    };
+    serde_json::from_value::<venue_copy::FollowerDeliveryManifest>(job.manifest.clone())
+        .map(|manifest| manifest.delivery_digest())
+        .unwrap_or([0; 32])
 }
 
 fn digest_serialized<T: Serialize + ?Sized>(value: &T) -> Result<[u8; 32], ControlDeliveryError> {

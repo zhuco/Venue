@@ -14,8 +14,14 @@ $allowedDependencies = @(
     'tokio-tungstenite', 'toml', 'tracing', 'tracing-subscriber', 'tungstenite', 'venue-control-protocol',
     'venue-copy', 'venue-domain', 'venue-execution', 'venue-gateway-api', 'venue-gateway-binance', 'venue-gateway-bitget',
     'venue-gateway-bybit', 'venue-gateway-gate', 'venue-gateway-hyperliquid', 'venue-gateway-okx',
-    'venue', 'venue-indicators', 'venue-runtime', 'venue-storage', 'venue-strategies', 'wasm-bindgen', 'wasm-bindgen-futures', 'web-sys'
+    'venue', 'venue-indicators', 'venue-runtime', 'venue-storage', 'venue-strategies', 'wasm-bindgen', 'wasm-bindgen-futures', 'web-sys', 'zeroize'
 )
+# Approved account password/encryption and desktop timezone dependencies are not workspace-wide
+# exemptions. Their concrete uses and tests remain in the owning application only.
+$scopedDependencies = @{
+    'venue-control' = @('argon2', 'ring')
+    'venueflow' = @('time')
+}
 
 function Get-TrackedActivePaths {
     $paths = @(& git -C $repoRoot ls-files)
@@ -58,7 +64,9 @@ function Assert-DependencyAllowlist {
             $violations.Add("workspace package resolves through frozen bak: $($package.name)")
         }
         foreach ($dependency in $package.dependencies) {
-            if ($allowedDependencies -notcontains $dependency.name) {
+            $scoped = $scopedDependencies.ContainsKey($package.name) -and
+                $scopedDependencies[$package.name] -contains $dependency.name
+            if ($allowedDependencies -notcontains $dependency.name -and -not $scoped) {
                 $violations.Add("dependency is not allowlisted: package=$($package.name) dependency=$($dependency.name)")
             }
             if ($dependency.name -eq 'tungstenite' -and $package.name -ne 'venue') {

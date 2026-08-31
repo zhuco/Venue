@@ -36,7 +36,7 @@ impl Behavior<Pane> for PaneBehavior<'_> {
             PaneKind::TradeTape => show_trade_tape(ui, pane, self.model),
             PaneKind::Accounts => show_accounts(ui, self.model),
             PaneKind::Strategies => show_strategies(ui, self.model),
-            PaneKind::CopyRelations => show_copy_relations(ui, self.model),
+            PaneKind::CopyRelations => crate::copy_relation_view::show(ui, self.model, self.client),
             PaneKind::Ledger => show_ledger(ui, self.model),
             PaneKind::TradeDock => crate::trade_dock::show(ui, self.model, self.client),
             PaneKind::Control => show_control(ui, self.model, self.client),
@@ -800,10 +800,45 @@ fn show_accounts(ui: &mut egui::Ui, model: &AppModel) {
                     ui.label(account.mode.to_string());
                     ui.monospace(short_account(&account.trading_account_id));
                     health_label(ui, account.health);
-                    ui.monospace(format_decimal(account.equity, 2));
-                    ui.monospace(format_decimal(account.available_margin, 2));
-                    let pnl = decimal_to_f64(account.unrealized_pnl);
-                    ui.colored_label(theme::value_color(pnl), format!("{pnl:+.2}"));
+                    let balance_equity = account
+                        .balances
+                        .iter()
+                        .map(|balance| {
+                            format!("{} {}", balance.asset, format_decimal(balance.equity, 2))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ui.monospace(if balance_equity.is_empty() {
+                        account
+                            .equity
+                            .map_or_else(|| "—".to_owned(), |value| format_decimal(value, 2))
+                    } else {
+                        balance_equity
+                    });
+                    let balance_margin = account
+                        .balances
+                        .iter()
+                        .map(|balance| {
+                            let value = balance
+                                .available_margin
+                                .map_or_else(|| "—".to_owned(), |value| format_decimal(value, 2));
+                            format!("{} {value}", balance.asset)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ui.monospace(if balance_margin.is_empty() {
+                        account
+                            .available_margin
+                            .map_or_else(|| "—".to_owned(), |value| format_decimal(value, 2))
+                    } else {
+                        balance_margin
+                    });
+                    if let Some(value) = account.unrealized_pnl {
+                        let pnl = decimal_to_f64(value);
+                        ui.colored_label(theme::value_color(pnl), format!("{pnl:+.2}"));
+                    } else {
+                        ui.monospace("—");
+                    }
                     ui.monospace(account.private_generation.to_string());
                     ui.monospace(account.writer_generation.to_string());
                     ui.monospace(format_freshness(freshness_age_ms(
@@ -877,8 +912,15 @@ fn show_strategies(ui: &mut egui::Ui, model: &mut AppModel) {
                     ui.monospace(strategy.open_orders.to_string());
                     ui.monospace(format_decimal(strategy.long_quantity, 4));
                     ui.monospace(format_decimal(strategy.short_quantity, 4));
-                    let pnl = decimal_to_f64(strategy.realized_pnl + strategy.unrealized_pnl);
-                    ui.colored_label(theme::value_color(pnl), format!("{pnl:+.2}"));
+                    match (strategy.realized_pnl, strategy.unrealized_pnl) {
+                        (Some(realized), Some(unrealized)) => {
+                            let pnl = decimal_to_f64(realized + unrealized);
+                            ui.colored_label(theme::value_color(pnl), format!("{pnl:+.2}"));
+                        }
+                        _ => {
+                            ui.monospace("—");
+                        }
+                    }
                     ui.monospace(strategy.config_epoch.to_string());
                     ui.end_row();
                     if let Some(attention) = &strategy.attention {
@@ -888,43 +930,6 @@ fn show_strategies(ui: &mut egui::Ui, model: &mut AppModel) {
                     }
                 }
             });
-    });
-}
-fn show_copy_relations(ui: &mut egui::Ui, model: &AppModel) {
-    let language = model.preferences.language;
-    pane_heading(
-        ui,
-        text(language, TextKey::CopyRelations),
-        text(language, TextKey::CopySubtitle),
-    );
-    let Some(snapshot) = &model.snapshot else {
-        empty(ui, text(language, TextKey::NoCopy));
-        return;
-    };
-    egui::Grid::new("copy-grid").striped(true).show(ui, |ui| {
-        for heading in [
-            TextKey::Leader,
-            TextKey::Follower,
-            TextKey::Symbol,
-            TextKey::Target,
-            TextKey::Actual,
-            TextKey::Drift,
-            TextKey::State,
-        ] {
-            ui.strong(text(language, heading));
-        }
-        ui.end_row();
-        for relation in &snapshot.copy_relations {
-            ui.label(&relation.leader_id);
-            ui.label(&relation.follower_instance_id);
-            ui.label(relation.symbol.to_string());
-            ui.monospace(format_decimal(relation.target_exposure, 4));
-            ui.monospace(format_decimal(relation.actual_exposure, 4));
-            let drift = decimal_to_f64(relation.drift);
-            ui.colored_label(theme::value_color(-drift.abs()), format!("{drift:+.4}"));
-            ui.label(format!("{:?}", relation.status));
-            ui.end_row();
-        }
     });
 }
 fn show_ledger(ui: &mut egui::Ui, model: &AppModel) {
@@ -957,7 +962,20 @@ fn show_ledger(ui: &mut egui::Ui, model: &AppModel) {
                 ui.label(&entry.action);
                 ui.label(&entry.state);
                 ui.monospace(&entry.receipt_id);
-                ui.label(&entry.detail);
+                if entry.detail.trim().is_empty() {
+                    ui.colored_label(theme::TEXT_SECONDARY, text(language, TextKey::None));
+                } else if matches!(entry.state.as_str(), "rejected" | "unknown") {
+                    ui.colored_label(
+                        theme::SELL,
+                        format!(
+                            "{}: {}",
+                            text(language, TextKey::FailureReason),
+                            entry.detail
+                        ),
+                    );
+                } else {
+                    ui.label(&entry.detail);
+                }
                 ui.end_row();
             }
         });
@@ -1340,7 +1358,7 @@ fn local_market<'a>(
     let selection = MarketSelection::binance_usd_m(symbol, interval).ok()?;
     model.local_markets.view(&selection)
 }
-fn pane_heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
+pub(crate) fn pane_heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
     ui.horizontal(|ui| {
         ui.strong(title);
         ui.colored_label(theme::TEXT_SECONDARY, subtitle);
@@ -1348,7 +1366,7 @@ fn pane_heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
     ui.separator();
 }
 
-fn empty(ui: &mut egui::Ui, message: &str) {
+pub(crate) fn empty(ui: &mut egui::Ui, message: &str) {
     ui.centered_and_justified(|ui| {
         ui.colored_label(theme::TEXT_SECONDARY, message);
     });

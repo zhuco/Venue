@@ -1,0 +1,1634 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use rust_decimal::Decimal;
+use serde_json::Value;
+use tokio::runtime::{Builder, Runtime};
+use venue_domain::domain::{
+    Amount, ExecutionCommand, FieldState, Fill, NativeOrderFamily, OrderCommand, OrderSide,
+    OrderState, PositionSide, Price, Symbol,
+};
+use venue_execution::{
+    AccountDispatchPermit, AccountGatewayResult, AccountHostValidationError,
+    AccountInstrumentIdentity, AccountLimitNormalizationIntent, AccountPhysicalGateway,
+    AccountRecoveryOutcome, AccountRecoveryReport, AccountRecoveryRequest, AccountRiskEvidence,
+    SignedAccountBalance, SignedAccountOrderFact, SignedAccountPositionFact,
+    SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
+};
+use venue_gateway_api::GatewayBinding;
+
+use crate::{
+    BITGET_ORDER_PROFILE_VERSION, BitgetAccountBinding, BitgetConfig, BitgetCredentials,
+    BitgetExactOrderReadback, BitgetHttpTransport, BitgetMutationKind, BitgetMutationOutcome,
+    BitgetNodeReadbackCandidate, BitgetOrderFamilyEvidence, BitgetOrderFamilyScope,
+    BitgetTransportError, BitgetTransportLimits, BitgetUnsupportedEvidence,
+    build_account_wide_open_orders_read_request, build_account_wide_positions_read_request,
+    build_ack_readback_request, build_fills_read_request, build_unknown_recovery_readback_request,
+    instrument::{BitgetInstrumentRules, BitgetRawInstrumentPayload, parse_instrument_rules},
+    prepare_node_mutation,
+    private::{BITGET_MAX_FILL_HISTORY_WINDOW_MS, BITGET_MAX_PRIVATE_PAGES},
+    public::{BitgetPublicSource, BitgetRawPublicPayload, BitgetTickerEvent, parse_rest_ticker},
+    settle_ack_readback, settle_unknown_readback,
+};
+
+const MAX_LIMIT_TICKER_AGE_MS: u64 = 5_000;
+
+/// The Bitget UTA account writer. Startup and every dispatched command collect fresh signed
+/// facts; the only physical mutation consumes the runtime host's linear permit.
+pub struct BitgetAccountGateway {
+    runtime: Runtime,
+    config: BitgetConfig,
+    credentials: BitgetCredentials,
+    transport: BitgetHttpTransport,
+    rules: BitgetInstrumentRules,
+    rules_catalog: BTreeMap<Symbol, BitgetInstrumentRules>,
+    private: BitgetNodeReadbackCandidate,
+    next_attempt_id: u64,
+}
+
+impl BitgetAccountGateway {
+    pub fn connect_from_environment(
+        binding: GatewayBinding,
+        limits: BitgetTransportLimits,
+    ) -> Result<Self, BitgetAccountGatewayError> {
+        BitgetAccountBinding::UtaUsdtFuturesHedge
+            .validate_gateway_binding(&binding)
+            .map_err(|_| BitgetAccountGatewayError::Binding)?;
+        let credentials = BitgetCredentials::from_environment()
+            .map_err(|_| BitgetAccountGatewayError::Credentials)?;
+        let runtime = Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(|_| BitgetAccountGatewayError::Runtime)?;
+        let generation = now_ms()?;
+        let transport = BitgetHttpTransport::new(binding, generation, limits)
+            .map_err(BitgetAccountGatewayError::Transport)?;
+        let rules = runtime.block_on(fetch_rules(&transport, generation))?;
+        let private = runtime.block_on(fetch_private(&transport, &credentials, &rules, 1))?;
+        let rules_catalog = BTreeMap::from([(rules.canonical_symbol().clone(), rules.clone())]);
+        Ok(Self {
+            runtime,
+            config: BitgetConfig::for_mode(transport.config().mode()),
+            credentials,
+            transport,
+            rules,
+            rules_catalog,
+            private,
+            next_attempt_id: 2,
+        })
+    }
+
+    fn next_attempt_id(&mut self) -> Result<u64, BitgetAccountGatewayError> {
+        let current = self.next_attempt_id;
+        self.next_attempt_id = self
+            .next_attempt_id
+            .checked_add(1)
+            .ok_or(BitgetAccountGatewayError::Attempt)?;
+        Ok(current)
+    }
+
+    fn binding_for(&self, symbol: &Symbol) -> GatewayBinding {
+        let mut binding = self.transport_binding().clone();
+        binding.symbol = symbol.clone();
+        binding
+    }
+
+    fn refresh_rules_for_symbols<I>(&mut self, symbols: I) -> Result<(), BitgetAccountGatewayError>
+    where
+        I: IntoIterator<Item = Symbol>,
+    {
+        let mut required = self.rules_catalog.keys().cloned().collect::<BTreeSet<_>>();
+        required.extend(symbols);
+        required.insert(self.transport_binding().symbol.clone());
+        let generation = self.transport.generation();
+        let mut refreshed = BTreeMap::new();
+        for symbol in required {
+            let binding = self.binding_for(&symbol);
+            let rules =
+                self.runtime
+                    .block_on(fetch_rules_for(&self.transport, &binding, generation))?;
+            if rules.canonical_symbol() != &symbol {
+                return Err(BitgetAccountGatewayError::Rules);
+            }
+            refreshed.insert(symbol, rules);
+        }
+        self.rules_catalog = refreshed;
+        self.rules = catalog_rule(&self.rules_catalog, &self.transport_binding().symbol)?;
+        Ok(())
+    }
+
+    fn registered_rules(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<BitgetInstrumentRules, BitgetAccountGatewayError> {
+        catalog_rule(&self.rules_catalog, symbol)
+    }
+
+    fn refresh_private_for(&mut self, symbol: &Symbol) -> Result<(), BitgetAccountGatewayError> {
+        if !self.rules_catalog.contains_key(symbol) {
+            return Err(BitgetAccountGatewayError::Rules);
+        }
+        self.refresh_rules_for_symbols(std::iter::empty())?;
+        let rules = self.registered_rules(symbol)?;
+        let attempt = self.next_attempt_id()?;
+        let binding = self.binding_for(symbol);
+        let private = self.runtime.block_on(fetch_private_for(
+            &self.transport,
+            &self.credentials,
+            &binding,
+            &rules,
+            attempt,
+        ))?;
+        self.private = private;
+        Ok(())
+    }
+
+    fn dispatch_permit(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
+        if permit.binding() != self.transport_binding() {
+            return rejected("bitget_preflight_failed");
+        }
+        let symbol = permit.command().mutation_owner().symbol.clone();
+        if self.refresh_private_for(&symbol).is_err() {
+            return rejected("bitget_preflight_failed");
+        }
+        let rules = match self.registered_rules(&symbol) {
+            Ok(value) => value,
+            Err(_) => return rejected("bitget_symbol_unconfigured"),
+        };
+        let attempt = match self.next_attempt_id() {
+            Ok(value) => value,
+            Err(_) => return rejected("bitget_attempt_exhausted"),
+        };
+        let now = match now_ms() {
+            Ok(value) => value,
+            Err(_) => return rejected("bitget_clock"),
+        };
+        let prepared = match prepare_node_mutation(
+            &self.private,
+            &rules,
+            &self.config,
+            permit.command(),
+            attempt,
+            now,
+        ) {
+            Ok(value) => value,
+            Err(_) => return rejected("bitget_intent_rejected"),
+        };
+        match self.runtime.block_on(self.transport.execute_mutation_once(
+            &self.credentials,
+            prepared.into_mutation(),
+            now,
+        )) {
+            Ok(BitgetMutationOutcome::Acknowledged(ack)) => {
+                let request = match build_ack_readback_request(&ack) {
+                    Ok(value) => value,
+                    Err(_) => return AccountGatewayResult::Unknown,
+                };
+                let readback = match now_ms().ok().and_then(|timestamp| {
+                    self.runtime
+                        .block_on(self.transport.execute_exact_readback(
+                            &self.credentials,
+                            request,
+                            timestamp,
+                        ))
+                        .ok()
+                }) {
+                    Some(value) => value,
+                    None => return AccountGatewayResult::Unknown,
+                };
+                match settle_ack_readback(&ack, &readback) {
+                    Ok(settlement) => match settlement.order {
+                        Some(order) => AccountGatewayResult::Accepted {
+                            venue_order_id: order.order_id,
+                        },
+                        None => AccountGatewayResult::Unknown,
+                    },
+                    Err(_) => AccountGatewayResult::Unknown,
+                }
+            }
+            Ok(BitgetMutationOutcome::Rejected) => rejected("bitget_venue_rejected"),
+            // `execute_mutation_once` consumes the request. WAL UNKNOWN recovery below performs
+            // an exact signed lookup only and never rebuilds this mutation.
+            Ok(BitgetMutationOutcome::Unknown(_)) | Err(_) => AccountGatewayResult::Unknown,
+        }
+    }
+
+    fn transport_binding(&self) -> &GatewayBinding {
+        self.transport.binding()
+    }
+}
+
+impl AccountPhysicalGateway for BitgetAccountGateway {
+    type Error = BitgetAccountGatewayError;
+
+    fn binding(&self) -> &GatewayBinding {
+        self.transport_binding()
+    }
+
+    fn current_instrument(
+        &mut self,
+    ) -> Result<AccountInstrumentIdentity, AccountHostValidationError> {
+        self.current_instrument_for(&self.transport_binding().symbol.clone())
+    }
+
+    fn current_instrument_for(
+        &mut self,
+        symbol: &Symbol,
+    ) -> Result<AccountInstrumentIdentity, AccountHostValidationError> {
+        if !self.rules_catalog.contains_key(symbol) {
+            return Err(AccountHostValidationError::Instrument);
+        }
+        self.refresh_rules_for_symbols(std::iter::empty())
+            .map_err(|_| AccountHostValidationError::Instrument)?;
+        let current = self
+            .registered_rules(symbol)
+            .map_err(|_| AccountHostValidationError::Instrument)?;
+        let instrument = current.snapshot.metadata.instrument.clone();
+        instrument
+            .validate()
+            .map_err(|_| AccountHostValidationError::Instrument)?;
+        Ok(AccountInstrumentIdentity {
+            identity: instrument.identity(),
+            rules_generation: instrument.generation,
+        })
+    }
+
+    fn reconcile(
+        &mut self,
+        request: &AccountRecoveryRequest,
+    ) -> Result<AccountRecoveryReport, Self::Error> {
+        if request.binding() != self.transport_binding() {
+            return Err(BitgetAccountGatewayError::Binding);
+        }
+        self.refresh_rules_for_symbols(request.configured_symbols().iter().cloned())?;
+        let observed_at_ms = now_ms()?;
+        let readback_attempt = self.next_attempt_id()?;
+        let mut outcomes = Vec::with_capacity(request.unresolved().len());
+        for command in request.unresolved() {
+            let symbol = &command.mutation_owner().symbol;
+            let rules = self.registered_rules(symbol)?;
+            let binding = self.binding_for(symbol);
+            let client_order_id = match command {
+                ExecutionCommand::Cancel(cancel) => cancel.target_client_order_id.as_str(),
+                _ => command
+                    .native_client_id()
+                    .ok_or(BitgetAccountGatewayError::Readback)?
+                    .as_str(),
+            };
+            let unknown = crate::BitgetUnknownMutation {
+                binding,
+                attempt_id: readback_attempt,
+                generation: rules.snapshot.metadata.instrument.generation,
+                kind: command_kind(command),
+                order_id: None,
+                client_order_id: Some(client_order_id.to_owned()),
+                dispatched_at_ms: observed_at_ms,
+                reason: crate::BitgetUnknownReason::AmbiguousResponse,
+            };
+            let result = build_unknown_recovery_readback_request(
+                &unknown,
+                rules.snapshot.metadata.instrument.generation,
+            )
+            .ok()
+            .and_then(|exact| {
+                now_ms().ok().and_then(|timestamp| {
+                    self.runtime
+                        .block_on(self.transport.execute_exact_readback(
+                            &self.credentials,
+                            exact,
+                            timestamp,
+                        ))
+                        .ok()
+                })
+            });
+            let outcome = match result {
+                Some(readback) if settle_unknown_readback(&unknown, &readback).is_ok() => {
+                    exact_outcome(command, readback)
+                }
+                _ => AccountRecoveryOutcome::still_unknown(command.command_id().clone()),
+            };
+            outcomes.push(outcome);
+        }
+        AccountRecoveryReport::new(self.transport_binding().clone(), observed_at_ms, outcomes)
+            .map_err(|_| BitgetAccountGatewayError::Readback)
+    }
+
+    fn risk_evidence(&mut self) -> Result<AccountRiskEvidence, AccountHostValidationError> {
+        self.refresh_rules_for_symbols(std::iter::empty())
+            .map_err(|_| AccountHostValidationError::RiskEvidence)?;
+        let attempt = self
+            .next_attempt_id()
+            .map_err(|_| AccountHostValidationError::RiskEvidence)?;
+        self.runtime.block_on(fetch_account_wide_risk(
+            &self.transport,
+            &self.credentials,
+            attempt,
+        ))
+    }
+
+    fn signed_account_snapshot(
+        &mut self,
+        request: &AccountRecoveryRequest,
+    ) -> Result<SignedAccountSnapshot, AccountHostValidationError> {
+        if request.binding() != self.transport_binding() {
+            return Err(AccountHostValidationError::SignedSnapshot);
+        }
+        self.refresh_rules_for_symbols(request.configured_symbols().iter().cloned())
+            .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+        let attempt = self
+            .next_attempt_id()
+            .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+        self.runtime.block_on(fetch_account_wide_snapshot(
+            &self.transport,
+            &self.credentials,
+            &self.rules_catalog,
+            attempt,
+            request,
+        ))
+    }
+
+    fn normalize_limit_intent(
+        &mut self,
+        intent: &AccountLimitNormalizationIntent,
+    ) -> Result<ExecutionCommand, AccountHostValidationError> {
+        intent.validate()?;
+        if intent.owner.exchange != self.transport_binding().venue.as_str()
+            || intent.owner.account != self.transport_binding().trading_account_id
+            || !self.rules_catalog.contains_key(&intent.owner.symbol)
+        {
+            return Err(AccountHostValidationError::Scope);
+        }
+        self.refresh_rules_for_symbols(std::iter::empty())
+            .map_err(|_| AccountHostValidationError::Command)?;
+        let rules = self
+            .registered_rules(&intent.owner.symbol)
+            .map_err(|_| AccountHostValidationError::Scope)?;
+        let binding = self.binding_for(&intent.owner.symbol);
+        let response = self
+            .runtime
+            .block_on(self.transport.fetch_ticker_for(&binding))
+            .map_err(|_| AccountHostValidationError::Command)?;
+        let payload =
+            String::from_utf8(response.payload).map_err(|_| AccountHostValidationError::Command)?;
+        let ticker = parse_rest_ticker(
+            BitgetRawPublicPayload::new(
+                BitgetPublicSource::RestTicker,
+                rules.canonical_symbol().clone(),
+                rules.snapshot.metadata.instrument.generation,
+                response.received_at_ms,
+                payload,
+            )
+            .map_err(|_| AccountHostValidationError::Command)?,
+        )
+        .map_err(|_| AccountHostValidationError::Command)?;
+        let normalized = normalize_limit_from_ticker(
+            intent,
+            &rules,
+            &ticker,
+            now_ms().map_err(|_| AccountHostValidationError::Command)?,
+        )?;
+        Ok(normalized)
+    }
+
+    fn dispatch(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
+        self.dispatch_permit(permit)
+    }
+}
+
+fn normalize_limit_from_ticker(
+    intent: &AccountLimitNormalizationIntent,
+    rules: &BitgetInstrumentRules,
+    ticker: &BitgetTickerEvent,
+    now_ms: u64,
+) -> Result<ExecutionCommand, AccountHostValidationError> {
+    intent.validate()?;
+    let metadata = &rules.snapshot.metadata;
+    if intent.owner.symbol != *rules.canonical_symbol()
+        || ticker.bbo.symbol != *rules.canonical_symbol()
+        || intent.position_side == PositionSide::Net
+        || !valid_hedge_limit_direction(intent.position_side, intent.side, intent.reduce_only)
+        || ticker.bbo.exchange_time_ms == 0
+        || ticker.bbo.exchange_time_ms > now_ms
+        || now_ms - ticker.bbo.exchange_time_ms > MAX_LIMIT_TICKER_AGE_MS
+    {
+        return Err(AccountHostValidationError::Command);
+    }
+    let price = match intent.side {
+        OrderSide::Buy => ticker.bbo.bid_price,
+        OrderSide::Sell => ticker.bbo.ask_price,
+    };
+    if ticker.bbo.bid_price >= ticker.bbo.ask_price
+        || !metadata
+            .price
+            .accepts(price.value())
+            .map_err(|_| AccountHostValidationError::Command)?
+    {
+        return Err(AccountHostValidationError::Command);
+    }
+    let quantity = metadata
+        .quantity_for_quote_notional(
+            &Amount::new(
+                metadata.instrument.minimum_notional.asset.clone(),
+                intent.quote_delta,
+            ),
+            Some(price),
+        )
+        .map_err(|_| AccountHostValidationError::Command)?;
+    if rules
+        .maximum_order_quantity
+        .is_some_and(|maximum| quantity > maximum)
+    {
+        return Err(AccountHostValidationError::Command);
+    }
+    Ok(ExecutionCommand::PlaceLimit(OrderCommand {
+        command_id: intent.command_id.clone(),
+        client_order_id: intent.client_order_id.clone(),
+        owner: intent.owner.clone(),
+        side: intent.side,
+        position_side: intent.position_side,
+        quantity,
+        limit_price: price,
+        reduce_only: intent.reduce_only,
+    }))
+}
+
+const fn valid_hedge_limit_direction(
+    position_side: PositionSide,
+    side: OrderSide,
+    reduce_only: bool,
+) -> bool {
+    matches!(
+        (position_side, side, reduce_only),
+        (PositionSide::Long, OrderSide::Buy, false)
+            | (PositionSide::Long, OrderSide::Sell, true)
+            | (PositionSide::Short, OrderSide::Sell, false)
+            | (PositionSide::Short, OrderSide::Buy, true)
+    )
+}
+
+async fn fetch_rules(
+    transport: &BitgetHttpTransport,
+    generation: u64,
+) -> Result<BitgetInstrumentRules, BitgetAccountGatewayError> {
+    fetch_rules_for(transport, transport_binding(transport), generation).await
+}
+
+async fn fetch_rules_for(
+    transport: &BitgetHttpTransport,
+    binding: &GatewayBinding,
+    generation: u64,
+) -> Result<BitgetInstrumentRules, BitgetAccountGatewayError> {
+    let observed_at_ms = now_ms()?;
+    let expires_at_ms = observed_at_ms
+        .checked_add(60_000)
+        .ok_or(BitgetAccountGatewayError::Clock)?;
+    let payload = transport
+        .fetch_instrument_for(binding)
+        .await
+        .map_err(BitgetAccountGatewayError::Transport)?;
+    let payload = String::from_utf8(payload).map_err(|_| BitgetAccountGatewayError::Rules)?;
+    parse_instrument_rules(
+        BitgetRawInstrumentPayload::new(
+            binding.clone(),
+            generation,
+            observed_at_ms,
+            expires_at_ms,
+            payload,
+        )
+        .map_err(|_| BitgetAccountGatewayError::Rules)?,
+        now_ms()?,
+    )
+    .map_err(|_| BitgetAccountGatewayError::Rules)
+}
+
+async fn fetch_private(
+    transport: &BitgetHttpTransport,
+    credentials: &BitgetCredentials,
+    rules: &BitgetInstrumentRules,
+    attempt_id: u64,
+) -> Result<BitgetNodeReadbackCandidate, BitgetAccountGatewayError> {
+    fetch_private_for(
+        transport,
+        credentials,
+        transport_binding(transport),
+        rules,
+        attempt_id,
+    )
+    .await
+}
+
+async fn fetch_private_for(
+    transport: &BitgetHttpTransport,
+    credentials: &BitgetCredentials,
+    binding: &GatewayBinding,
+    rules: &BitgetInstrumentRules,
+    attempt_id: u64,
+) -> Result<BitgetNodeReadbackCandidate, BitgetAccountGatewayError> {
+    let candidate = transport
+        .collect_private_turn_for(
+            credentials,
+            binding,
+            attempt_id,
+            rules.snapshot.metadata.instrument.generation,
+            None,
+            now_ms()?,
+        )
+        .await
+        .map_err(BitgetAccountGatewayError::Transport)?;
+    let expires_at_ms = candidate
+        .observed_at_ms
+        .checked_add(60_000)
+        .ok_or(BitgetAccountGatewayError::Clock)?;
+    BitgetNodeReadbackCandidate::validate(
+        BitgetOrderFamilyScope {
+            binding: candidate.binding.clone(),
+            profile_version: BITGET_ORDER_PROFILE_VERSION,
+            attempt_id: candidate.attempt_id,
+            generation: candidate.generation,
+            observed_at_ms: candidate.observed_at_ms,
+            expires_at_ms,
+        },
+        rules,
+        now_ms()?,
+        [
+            BitgetOrderFamilyEvidence::Regular(Box::new(candidate)),
+            BitgetOrderFamilyEvidence::Unsupported(BitgetUnsupportedEvidence::conditional(
+                BITGET_ORDER_PROFILE_VERSION,
+            )),
+            BitgetOrderFamilyEvidence::Unsupported(BitgetUnsupportedEvidence::algo(
+                BITGET_ORDER_PROFILE_VERSION,
+            )),
+        ],
+    )
+    .map_err(|_| BitgetAccountGatewayError::Readback)
+}
+
+async fn fetch_account_wide_risk(
+    transport: &BitgetHttpTransport,
+    credentials: &BitgetCredentials,
+    attempt_id: u64,
+) -> Result<AccountRiskEvidence, AccountHostValidationError> {
+    let observed_at_ms = now_ms().map_err(|_| AccountHostValidationError::RiskEvidence)?;
+    let positions = transport
+        .execute_private_read(
+            credentials,
+            &build_account_wide_positions_read_request(
+                transport_binding(transport),
+                attempt_id,
+                transport.generation(),
+            ),
+            observed_at_ms,
+        )
+        .await
+        .map_err(|_| AccountHostValidationError::RiskEvidence)?;
+    let orders = fetch_account_wide_open_orders(transport, credentials, attempt_id).await?;
+    let position_notionals = position_notionals(&positions.payload)?;
+    let order_notionals = entry_order_notionals(&orders)?;
+    // Bitget UTA v3 `/trade/unfilled-orders` is the complete current-order surface: it returns
+    // every delegate type on the queried account/category, not only normal orders.  We accept
+    // risk evidence only after this account-wide pagination has classified every row; an
+    // unreviewed conditional/algo row remains a hard failure rather than an omitted exposure.
+    AccountRiskEvidence::complete(
+        transport_binding(transport).clone(),
+        observed_at_ms,
+        transport.generation(),
+        position_notionals,
+        order_notionals,
+    )
+}
+
+async fn fetch_account_wide_snapshot(
+    transport: &BitgetHttpTransport,
+    credentials: &BitgetCredentials,
+    rules_catalog: &BTreeMap<Symbol, BitgetInstrumentRules>,
+    attempt_id: u64,
+    recovery: &AccountRecoveryRequest,
+) -> Result<SignedAccountSnapshot, AccountHostValidationError> {
+    let observed_at_ms = now_ms().map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+    let account = transport
+        .execute_private_read(
+            credentials,
+            &crate::build_account_read_request(
+                transport_binding(transport),
+                attempt_id,
+                transport.generation(),
+            ),
+            observed_at_ms,
+        )
+        .await
+        .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+    let positions = transport
+        .execute_private_read(
+            credentials,
+            &build_account_wide_positions_read_request(
+                transport_binding(transport),
+                attempt_id,
+                transport.generation(),
+            ),
+            observed_at_ms,
+        )
+        .await
+        .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+    let position_rows = snapshot_data_rows(&positions.payload)?;
+    let orders = snapshot_orders(transport, credentials, attempt_id).await?;
+    let previous_fills_cursor = parse_snapshot_fills_cursor(recovery.previous_fills_cursor())?;
+    let (fills, cursor) = snapshot_fills(
+        transport,
+        credentials,
+        attempt_id,
+        observed_at_ms,
+        previous_fills_cursor,
+    )
+    .await?;
+    let unknown_results = snapshot_unknowns(
+        transport,
+        credentials,
+        rules_catalog,
+        recovery,
+        attempt_id,
+        observed_at_ms,
+    )
+    .await?;
+    let balance = crate::account::parse_balance(&snapshot_data(&account.payload)?)
+        .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+    SignedAccountSnapshot::complete_with_fills(
+        transport_binding(transport).clone(),
+        observed_at_ms,
+        transport.generation(),
+        attempt_id,
+        transport.generation(),
+        SignedAccountPositionMode::Hedge,
+        snapshot_order_facts(&orders)?,
+        snapshot_position_facts(&position_rows)?,
+        fills,
+        cursor,
+        unknown_results,
+    )
+    .and_then(|snapshot| {
+        snapshot.with_balances(vec![SignedAccountBalance {
+            asset: balance.asset,
+            equity: balance.wallet_balance,
+            available_margin: Some(balance.available_balance),
+        }])
+    })
+    .map_err(|_| AccountHostValidationError::SignedSnapshot)
+}
+
+async fn snapshot_orders(
+    transport: &BitgetHttpTransport,
+    credentials: &BitgetCredentials,
+    attempt: u64,
+) -> Result<Vec<Value>, AccountHostValidationError> {
+    fetch_account_wide_open_orders(transport, credentials, attempt)
+        .await
+        .map_err(|_| AccountHostValidationError::SignedSnapshot)
+}
+
+async fn snapshot_fills(
+    transport: &BitgetHttpTransport,
+    credentials: &BitgetCredentials,
+    attempt: u64,
+    now: u64,
+    previous_cursor_ms: Option<u64>,
+) -> Result<(Vec<Fill>, String), AccountHostValidationError> {
+    let mut cursor = None;
+    let mut result = Vec::new();
+    let mut seen = BTreeSet::new();
+    let requested_start_ms = previous_cursor_ms
+        .map(|value| value.saturating_sub(BITGET_FILL_CURSOR_OVERLAP_MS).max(1))
+        .unwrap_or_else(|| now.saturating_sub(BITGET_FILL_CURSOR_OVERLAP_MS).max(1));
+    if now.saturating_sub(requested_start_ms) > BITGET_MAX_FILL_HISTORY_WINDOW_MS {
+        return Err(AccountHostValidationError::SignedSnapshot);
+    }
+    let mut max_fill_time_ms = previous_cursor_ms.unwrap_or(0);
+    for index in 0..BITGET_MAX_PRIVATE_PAGES {
+        let request = build_fills_read_request(
+            transport_binding(transport),
+            attempt,
+            transport.generation(),
+            u32::try_from(index).map_err(|_| AccountHostValidationError::SignedSnapshot)?,
+            cursor.as_deref(),
+            Some(requested_start_ms),
+            now,
+        )
+        .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+        let raw = transport
+            .execute_private_read(credentials, &request, now)
+            .await
+            .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+        let data = snapshot_data(&raw.payload)?;
+        let list = data
+            .get("list")
+            .and_then(Value::as_array)
+            .ok_or(AccountHostValidationError::SignedSnapshot)?;
+        for row in list {
+            let time_ms = snapshot_fill_time(row)?;
+            if time_ms < requested_start_ms || time_ms > now {
+                return Err(AccountHostValidationError::SignedSnapshot);
+            }
+            max_fill_time_ms = max_fill_time_ms.max(time_ms);
+            let fill = snapshot_fill(row)?;
+            if !seen.insert((fill.symbol.clone(), fill.fill_id.clone())) {
+                return Err(AccountHostValidationError::SignedSnapshot);
+            }
+            result.push(fill);
+        }
+        cursor = match data.get("cursor") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
+            _ => return Err(AccountHostValidationError::SignedSnapshot),
+        };
+        if cursor.is_none() {
+            let observed_through_ms = now.max(max_fill_time_ms);
+            return Ok((result, format!("bitget-fills-v1|{observed_through_ms}")));
+        }
+    }
+    Err(AccountHostValidationError::SignedSnapshot)
+}
+
+const BITGET_FILL_CURSOR_OVERLAP_MS: u64 = 60_000;
+
+fn parse_snapshot_fills_cursor(
+    value: Option<&str>,
+) -> Result<Option<u64>, AccountHostValidationError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value
+        .strip_prefix("bitget-fills-v1|")
+        // A SHA only commits bytes already read; it cannot select the next account-wide page.
+        .ok_or(AccountHostValidationError::SignedSnapshot)?;
+    let watermark = value
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or(AccountHostValidationError::SignedSnapshot)?;
+    Ok(Some(watermark))
+}
+
+fn snapshot_fill_time(row: &Value) -> Result<u64, AccountHostValidationError> {
+    let text = row
+        .get("cTime")
+        .or_else(|| row.get("createdTime"))
+        .and_then(Value::as_str)
+        .ok_or(AccountHostValidationError::SignedSnapshot)?;
+    text.parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or(AccountHostValidationError::SignedSnapshot)
+}
+
+fn snapshot_data(payload: &str) -> Result<Value, AccountHostValidationError> {
+    let root: Value =
+        serde_json::from_str(payload).map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+    if root.get("code").and_then(Value::as_str) != Some("00000") {
+        return Err(AccountHostValidationError::SignedSnapshot);
+    }
+    root.get("data")
+        .cloned()
+        .ok_or(AccountHostValidationError::SignedSnapshot)
+}
+fn snapshot_data_rows(payload: &str) -> Result<Vec<Value>, AccountHostValidationError> {
+    snapshot_data(payload)?
+        .get("list")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or(AccountHostValidationError::SignedSnapshot)
+}
+fn snapshot_symbol(value: Option<&Value>) -> Result<Symbol, AccountHostValidationError> {
+    let raw = value
+        .and_then(Value::as_str)
+        .ok_or(AccountHostValidationError::SignedSnapshot)?;
+    let base = raw
+        .strip_suffix("USDT")
+        .filter(|v| !v.is_empty())
+        .ok_or(AccountHostValidationError::SignedSnapshot)?;
+    Symbol::new(base, "USDT").map_err(|_| AccountHostValidationError::SignedSnapshot)
+}
+fn snapshot_decimal(value: Option<&Value>) -> Result<Decimal, AccountHostValidationError> {
+    decimal(value).map_err(|_| AccountHostValidationError::SignedSnapshot)
+}
+fn snapshot_position_facts(
+    rows: &[Value],
+) -> Result<Vec<SignedAccountPositionFact>, AccountHostValidationError> {
+    rows.iter()
+        .map(|row| {
+            let item = row
+                .as_object()
+                .ok_or(AccountHostValidationError::SignedSnapshot)?;
+            require_usdt_perpetual(item).map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+            require_text(item, "holdMode", "hedge_mode")
+                .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+            let side = match item.get("posSide").and_then(Value::as_str) {
+                Some("long") => PositionSide::Long,
+                Some("short") => PositionSide::Short,
+                _ => return Err(AccountHostValidationError::SignedSnapshot),
+            };
+            Ok(SignedAccountPositionFact {
+                symbol: snapshot_symbol(item.get("symbol"))?,
+                position_side: side,
+                quantity: snapshot_decimal(item.get("total"))?,
+                entry_price: None,
+                mark_price: match snapshot_decimal(item.get("markPrice"))? {
+                    v if v > Decimal::ZERO => Some(v),
+                    v if v.is_zero() => None,
+                    _ => return Err(AccountHostValidationError::SignedSnapshot),
+                },
+            })
+        })
+        .collect()
+}
+fn snapshot_order_facts(
+    rows: &[Value],
+) -> Result<Vec<SignedAccountOrderFact>, AccountHostValidationError> {
+    rows.iter()
+        .map(|row| {
+            let item = row
+                .as_object()
+                .ok_or(AccountHostValidationError::SignedSnapshot)?;
+            require_usdt_perpetual(item).map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+            require_text(item, "delegateType", "normal")
+                .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+            let side = match item.get("side").and_then(Value::as_str) {
+                Some("buy") => OrderSide::Buy,
+                Some("sell") => OrderSide::Sell,
+                _ => return Err(AccountHostValidationError::SignedSnapshot),
+            };
+            let position_side = match item.get("posSide").and_then(Value::as_str) {
+                Some("long") => PositionSide::Long,
+                Some("short") => PositionSide::Short,
+                _ => return Err(AccountHostValidationError::SignedSnapshot),
+            };
+            let qty = snapshot_decimal(item.get("qty"))?
+                .checked_sub(snapshot_decimal(item.get("cumExecQty"))?)
+                .filter(|v| *v > Decimal::ZERO)
+                .ok_or(AccountHostValidationError::SignedSnapshot)?;
+            Ok(SignedAccountOrderFact {
+                client_order_id: item
+                    .get("clientOid")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+                    .ok_or(AccountHostValidationError::SignedSnapshot)?
+                    .to_owned(),
+                venue_order_id: Some(
+                    item.get("orderId")
+                        .and_then(Value::as_str)
+                        .filter(|v| !v.is_empty())
+                        .ok_or(AccountHostValidationError::SignedSnapshot)?
+                        .to_owned(),
+                ),
+                symbol: snapshot_symbol(item.get("symbol"))?,
+                family: NativeOrderFamily::UmOrder,
+                side,
+                position_side,
+                quantity: qty,
+                limit_price: match snapshot_decimal(item.get("price"))? {
+                    v if v > Decimal::ZERO => Some(v),
+                    v if v.is_zero() => None,
+                    _ => return Err(AccountHostValidationError::SignedSnapshot),
+                },
+                reduce_only: bitget_reduce_only(item)
+                    .map_err(|_| AccountHostValidationError::SignedSnapshot)?,
+                owner: None,
+                external: true,
+                state: Some(snapshot_order_state(
+                    item.get("orderStatus").or_else(|| item.get("status")),
+                )?),
+                filled_quantity: Some(snapshot_decimal(item.get("cumExecQty"))?),
+            })
+        })
+        .collect()
+}
+
+fn snapshot_order_state(value: Option<&Value>) -> Result<OrderState, AccountHostValidationError> {
+    match value.and_then(Value::as_str) {
+        Some("live" | "new") => Ok(OrderState::New),
+        Some("partially_filled" | "partially-filled") => Ok(OrderState::PartiallyFilled),
+        Some("filled") => Ok(OrderState::Filled),
+        Some("cancelled" | "canceled") => Ok(OrderState::Cancelled),
+        Some("rejected") => Ok(OrderState::Rejected),
+        Some("expired") => Ok(OrderState::Expired),
+        _ => Err(AccountHostValidationError::SignedSnapshot),
+    }
+}
+fn snapshot_fill(row: &Value) -> Result<Fill, AccountHostValidationError> {
+    let item = row
+        .as_object()
+        .ok_or(AccountHostValidationError::SignedSnapshot)?;
+    require_usdt_perpetual(item).map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+    let id = item
+        .get("execId")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+        .ok_or(AccountHostValidationError::SignedSnapshot)?
+        .to_owned();
+    let side = match item.get("side").and_then(Value::as_str) {
+        Some("buy") => OrderSide::Buy,
+        Some("sell") => OrderSide::Sell,
+        _ => return Err(AccountHostValidationError::SignedSnapshot),
+    };
+    Ok(Fill {
+        execution_sequence: id
+            .parse()
+            .map(FieldState::Known)
+            .map_err(|_| AccountHostValidationError::SignedSnapshot)?,
+        fill_id: id,
+        order_id: item
+            .get("orderId")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .ok_or(AccountHostValidationError::SignedSnapshot)?
+            .to_owned(),
+        symbol: snapshot_symbol(item.get("symbol"))?,
+        side,
+        position_side: FieldState::Missing,
+        quantity: snapshot_decimal(item.get("execQty"))?,
+        price: Price::new(snapshot_decimal(item.get("execPrice"))?)
+            .map_err(|_| AccountHostValidationError::SignedSnapshot)?,
+        fee: FieldState::Missing,
+        realized_pnl: FieldState::Missing,
+        maker: FieldState::Missing,
+        exchange_time_ms: None,
+    })
+}
+async fn snapshot_unknowns(
+    transport: &BitgetHttpTransport,
+    credentials: &BitgetCredentials,
+    rules_catalog: &BTreeMap<Symbol, BitgetInstrumentRules>,
+    recovery: &AccountRecoveryRequest,
+    attempt: u64,
+    now: u64,
+) -> Result<Vec<SignedUnknownFact>, AccountHostValidationError> {
+    let mut results = Vec::new();
+    for command in recovery.unresolved() {
+        let symbol = &command.mutation_owner().symbol;
+        let rules = catalog_rule(rules_catalog, symbol)
+            .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+        let binding = binding_for_symbol(transport_binding(transport), symbol);
+        let id = match command {
+            ExecutionCommand::Cancel(v) => v.target_client_order_id.as_str(),
+            _ => command
+                .native_client_id()
+                .ok_or(AccountHostValidationError::SignedSnapshot)?
+                .as_str(),
+        };
+        let unknown = crate::BitgetUnknownMutation {
+            binding,
+            attempt_id: attempt,
+            generation: rules.snapshot.metadata.instrument.generation,
+            kind: command_kind(command),
+            order_id: None,
+            client_order_id: Some(id.to_owned()),
+            dispatched_at_ms: now,
+            reason: crate::BitgetUnknownReason::AmbiguousResponse,
+        };
+        let result = match build_unknown_recovery_readback_request(
+            &unknown,
+            rules.snapshot.metadata.instrument.generation,
+        )
+        .ok()
+        {
+            Some(request) => match transport
+                .execute_exact_readback(credentials, request, now)
+                .await
+            {
+                Ok(readback) if settle_unknown_readback(&unknown, &readback).is_ok() => {
+                    match readback.order {
+                        Some(order) if order.state == OrderState::Rejected => {
+                            SignedUnknownResult::Rejected {
+                                reason: "bitget_rejected".to_owned(),
+                            }
+                        }
+                        Some(order) => SignedUnknownResult::Accepted {
+                            venue_order_id: order.order_id,
+                        },
+                        None => SignedUnknownResult::Unknown,
+                    }
+                }
+                _ => SignedUnknownResult::Unknown,
+            },
+            None => SignedUnknownResult::Unknown,
+        };
+        results.push(SignedUnknownFact {
+            command_id: command.command_id().clone(),
+            result,
+        });
+    }
+    Ok(results)
+}
+
+async fn fetch_account_wide_open_orders(
+    transport: &BitgetHttpTransport,
+    credentials: &BitgetCredentials,
+    attempt_id: u64,
+) -> Result<Vec<Value>, AccountHostValidationError> {
+    let mut cursor = None;
+    let mut rows = Vec::new();
+    for page_index in 0..BITGET_MAX_PRIVATE_PAGES {
+        let page_index =
+            u32::try_from(page_index).map_err(|_| AccountHostValidationError::RiskEvidence)?;
+        let request = build_account_wide_open_orders_read_request(
+            transport_binding(transport),
+            attempt_id,
+            transport.generation(),
+            page_index,
+            cursor.as_deref(),
+        )
+        .map_err(|_| AccountHostValidationError::RiskEvidence)?;
+        let raw = transport
+            .execute_private_read(
+                credentials,
+                &request,
+                now_ms().map_err(|_| AccountHostValidationError::RiskEvidence)?,
+            )
+            .await
+            .map_err(|_| AccountHostValidationError::RiskEvidence)?;
+        let data = success_data(&raw.payload)?;
+        let list = data
+            .get("list")
+            .and_then(Value::as_array)
+            .ok_or(AccountHostValidationError::RiskEvidence)?;
+        rows.extend(list.iter().cloned());
+        cursor = match data.get("cursor") {
+            Some(Value::Null) | None => None,
+            Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
+            _ => return Err(AccountHostValidationError::RiskEvidence),
+        };
+        if cursor.is_none() {
+            return Ok(rows);
+        }
+    }
+    Err(AccountHostValidationError::RiskEvidence)
+}
+
+fn position_notionals(payload: &str) -> Result<Vec<Decimal>, AccountHostValidationError> {
+    let data = success_data(payload)?;
+    let rows = data
+        .get("list")
+        .and_then(Value::as_array)
+        .ok_or(AccountHostValidationError::RiskEvidence)?;
+    rows.iter()
+        .map(|row| {
+            let item = row
+                .as_object()
+                .ok_or(AccountHostValidationError::RiskEvidence)?;
+            require_usdt_perpetual(item)?;
+            require_text(item, "holdMode", "hedge_mode")?;
+            let position_side = item
+                .get("posSide")
+                .and_then(Value::as_str)
+                .ok_or(AccountHostValidationError::RiskEvidence)?;
+            if !matches!(position_side, "long" | "short") {
+                return Err(AccountHostValidationError::RiskEvidence);
+            }
+            let quantity = decimal(item.get("total"))?;
+            if quantity.is_sign_negative() {
+                return Err(AccountHostValidationError::RiskEvidence);
+            }
+            if quantity.is_zero() {
+                return Ok(Decimal::ZERO);
+            }
+            let mark = decimal(item.get("markPrice"))?;
+            if mark <= Decimal::ZERO {
+                return Err(AccountHostValidationError::RiskEvidence);
+            }
+            quantity
+                .checked_mul(mark)
+                .ok_or(AccountHostValidationError::Notional)
+        })
+        .filter(|value| !matches!(value, Ok(value) if value.is_zero()))
+        .collect()
+}
+
+fn entry_order_notionals(rows: &[Value]) -> Result<Vec<Decimal>, AccountHostValidationError> {
+    rows.iter()
+        .map(|row| {
+            let item = row
+                .as_object()
+                .ok_or(AccountHostValidationError::RiskEvidence)?;
+            require_usdt_perpetual(item)?;
+            // The UTA endpoint also returns active trigger/strategy delegates.  This runtime
+            // cannot price their latent entry risk, so seeing one rejects admission instead of
+            // pretending a normal-order page proves it absent.
+            require_text(item, "delegateType", "normal")?;
+            let position_side = match item.get("posSide").and_then(Value::as_str) {
+                Some("long") => PositionSide::Long,
+                Some("short") => PositionSide::Short,
+                _ => return Err(AccountHostValidationError::RiskEvidence),
+            };
+            let side = match item.get("side").and_then(Value::as_str) {
+                Some("buy") => OrderSide::Buy,
+                Some("sell") => OrderSide::Sell,
+                _ => return Err(AccountHostValidationError::RiskEvidence),
+            };
+            let reduce_only = bitget_reduce_only(item)?;
+            let entry_direction = matches!(
+                (position_side, side),
+                (PositionSide::Long, OrderSide::Buy) | (PositionSide::Short, OrderSide::Sell)
+            );
+            if let Some(trade_side) = item.get("tradeSide").and_then(Value::as_str) {
+                let consistent = match trade_side {
+                    "open_long" => position_side == PositionSide::Long && side == OrderSide::Buy,
+                    "open_short" => position_side == PositionSide::Short && side == OrderSide::Sell,
+                    "close_long" => position_side == PositionSide::Long && side == OrderSide::Sell,
+                    "close_short" => position_side == PositionSide::Short && side == OrderSide::Buy,
+                    _ => false,
+                };
+                if !consistent {
+                    return Err(AccountHostValidationError::RiskEvidence);
+                }
+            }
+            let quantity = decimal(item.get("qty"))?;
+            let filled = decimal(item.get("cumExecQty"))?;
+            let remaining = quantity
+                .checked_sub(filled)
+                .ok_or(AccountHostValidationError::RiskEvidence)?;
+            if quantity <= Decimal::ZERO || remaining <= Decimal::ZERO {
+                return Err(AccountHostValidationError::RiskEvidence);
+            }
+            if reduce_only {
+                return Ok(Decimal::ZERO);
+            }
+            if !entry_direction {
+                return Err(AccountHostValidationError::RiskEvidence);
+            }
+            let price = decimal(item.get("price"))?;
+            if price <= Decimal::ZERO {
+                return Err(AccountHostValidationError::RiskEvidence);
+            }
+            remaining
+                .checked_mul(price)
+                .ok_or(AccountHostValidationError::Notional)
+        })
+        .filter(|value| !matches!(value, Ok(value) if value.is_zero()))
+        .collect()
+}
+
+fn bitget_reduce_only(
+    item: &serde_json::Map<String, Value>,
+) -> Result<bool, AccountHostValidationError> {
+    match item.get("reduceOnly") {
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(Value::String(value)) if value == "YES" => Ok(true),
+        Some(Value::String(value)) if value == "NO" => Ok(false),
+        _ => Err(AccountHostValidationError::RiskEvidence),
+    }
+}
+
+fn success_data(payload: &str) -> Result<Value, AccountHostValidationError> {
+    let root: Value =
+        serde_json::from_str(payload).map_err(|_| AccountHostValidationError::RiskEvidence)?;
+    let object = root
+        .as_object()
+        .ok_or(AccountHostValidationError::RiskEvidence)?;
+    if object.get("code").and_then(Value::as_str) != Some("00000") {
+        return Err(AccountHostValidationError::RiskEvidence);
+    }
+    object
+        .get("data")
+        .cloned()
+        .ok_or(AccountHostValidationError::RiskEvidence)
+}
+
+fn require_usdt_perpetual(
+    item: &serde_json::Map<String, Value>,
+) -> Result<(), AccountHostValidationError> {
+    require_text(item, "marginCoin", "USDT")?;
+    let native = item
+        .get("symbol")
+        .and_then(Value::as_str)
+        .ok_or(AccountHostValidationError::RiskEvidence)?;
+    if !native.ends_with("USDT") || native.len() <= 4 {
+        return Err(AccountHostValidationError::RiskEvidence);
+    }
+    Ok(())
+}
+
+fn require_text(
+    item: &serde_json::Map<String, Value>,
+    field: &str,
+    expected: &str,
+) -> Result<(), AccountHostValidationError> {
+    if item.get(field).and_then(Value::as_str) == Some(expected) {
+        Ok(())
+    } else {
+        Err(AccountHostValidationError::RiskEvidence)
+    }
+}
+
+fn decimal(value: Option<&Value>) -> Result<Decimal, AccountHostValidationError> {
+    match value {
+        Some(Value::String(value)) => value
+            .parse()
+            .map_err(|_| AccountHostValidationError::RiskEvidence),
+        Some(Value::Number(value)) => value
+            .to_string()
+            .parse()
+            .map_err(|_| AccountHostValidationError::RiskEvidence),
+        _ => Err(AccountHostValidationError::RiskEvidence),
+    }
+}
+
+fn command_kind(command: &ExecutionCommand) -> BitgetMutationKind {
+    match command {
+        ExecutionCommand::Cancel(_) => BitgetMutationKind::Cancel,
+        ExecutionCommand::MarketReduce(_) => BitgetMutationKind::ReduceOnce,
+        _ => BitgetMutationKind::Place,
+    }
+}
+
+fn exact_outcome(
+    command: &ExecutionCommand,
+    readback: BitgetExactOrderReadback,
+) -> AccountRecoveryOutcome {
+    match readback.order {
+        Some(order) if order.state == OrderState::Rejected => AccountRecoveryOutcome::rejected(
+            command.command_id().clone(),
+            "bitget_rejected".to_owned(),
+        ),
+        Some(order) => {
+            AccountRecoveryOutcome::accepted(command.command_id().clone(), order.order_id)
+        }
+        None => AccountRecoveryOutcome::still_unknown(command.command_id().clone()),
+    }
+}
+
+fn rejected(reason: &str) -> AccountGatewayResult {
+    AccountGatewayResult::Rejected {
+        reason: reason.to_owned(),
+    }
+}
+
+fn now_ms() -> Result<u64, BitgetAccountGatewayError> {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| BitgetAccountGatewayError::Clock)?
+            .as_millis(),
+    )
+    .map_err(|_| BitgetAccountGatewayError::Clock)
+}
+
+fn transport_binding(transport: &BitgetHttpTransport) -> &GatewayBinding {
+    transport.binding()
+}
+
+fn binding_for_symbol(binding: &GatewayBinding, symbol: &Symbol) -> GatewayBinding {
+    let mut scoped = binding.clone();
+    scoped.symbol = symbol.clone();
+    scoped
+}
+
+fn catalog_rule(
+    catalog: &BTreeMap<Symbol, BitgetInstrumentRules>,
+    symbol: &Symbol,
+) -> Result<BitgetInstrumentRules, BitgetAccountGatewayError> {
+    catalog
+        .get(symbol)
+        .cloned()
+        .ok_or(BitgetAccountGatewayError::Rules)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BitgetAccountGatewayError {
+    #[error("Bitget gateway binding is invalid")]
+    Binding,
+    #[error("Bitget credentials are unavailable")]
+    Credentials,
+    #[error("Bitget runtime could not start")]
+    Runtime,
+    #[error("Bitget clock is invalid")]
+    Clock,
+    #[error("Bitget account attempt counter overflowed")]
+    Attempt,
+    #[error("Bitget public instrument rules are invalid")]
+    Rules,
+    #[error("Bitget signed account readback is invalid")]
+    Readback,
+    #[error(transparent)]
+    Transport(#[from] BitgetTransportError),
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use venue_domain::domain::{CommandId, OrderOwner, OrderPurpose};
+    use venue_gateway_api::{GatewayMode, VenueId};
+
+    use super::*;
+
+    fn binding() -> Result<GatewayBinding, Box<dyn std::error::Error>> {
+        Ok(GatewayBinding::new(
+            VenueId::Bitget,
+            GatewayMode::Live,
+            "00000000-0000-4000-8000-000000000001",
+            "BTC/USDT".parse()?,
+        )?)
+    }
+
+    const INSTRUMENT_FIXTURE: &str =
+        include_str!("../tests/fixtures/bitget_uta_btcusdt_instrument.json");
+    const TICKER_FIXTURE: &str = include_str!("../tests/fixtures/bitget_uta_btcusdt_ticker.json");
+
+    fn rules() -> Result<BitgetInstrumentRules, Box<dyn std::error::Error>> {
+        Ok(parse_instrument_rules(
+            BitgetRawInstrumentPayload::new(
+                binding()?,
+                7,
+                999_000,
+                1_001_000,
+                INSTRUMENT_FIXTURE.to_owned(),
+            )?,
+            1_000_000,
+        )?)
+    }
+
+    fn ticker(payload: String) -> Result<BitgetTickerEvent, Box<dyn std::error::Error>> {
+        Ok(parse_rest_ticker(BitgetRawPublicPayload::new(
+            BitgetPublicSource::RestTicker,
+            "BTC/USDT".parse()?,
+            7,
+            1_000_000,
+            payload,
+        )?)?)
+    }
+
+    #[test]
+    fn two_symbol_catalog_routes_only_registered_owner_symbol_rules()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let btc: Symbol = "BTC/USDT".parse()?;
+        let eth: Symbol = "ETH/USDT".parse()?;
+        let mut eth_instrument: Value = serde_json::from_str(INSTRUMENT_FIXTURE)?;
+        eth_instrument["data"][0]["symbol"] = json!("ETHUSDT");
+        eth_instrument["data"][0]["baseCoin"] = json!("ETH");
+        let eth_binding = binding_for_symbol(&binding()?, &eth);
+        let eth_rules = parse_instrument_rules(
+            BitgetRawInstrumentPayload::new(
+                eth_binding,
+                7,
+                999_000,
+                1_001_000,
+                eth_instrument.to_string(),
+            )?,
+            1_000_000,
+        )?;
+        let catalog = BTreeMap::from([(btc.clone(), rules()?), (eth.clone(), eth_rules)]);
+        assert_eq!(catalog_rule(&catalog, &btc)?.canonical_symbol(), &btc);
+        let eth_rules = catalog_rule(&catalog, &eth)?;
+        assert_eq!(eth_rules.canonical_symbol(), &eth);
+        assert!(matches!(
+            catalog_rule(&catalog, &"SOL/USDT".parse()?),
+            Err(BitgetAccountGatewayError::Rules)
+        ));
+
+        let mut eth_ticker: Value = serde_json::from_str(TICKER_FIXTURE)?;
+        eth_ticker["data"][0]["symbol"] = json!("ETHUSDT");
+        let ticker = parse_rest_ticker(BitgetRawPublicPayload::new(
+            BitgetPublicSource::RestTicker,
+            eth.clone(),
+            7,
+            1_000_000,
+            eth_ticker.to_string(),
+        )?)?;
+        let mut intent = intent(Decimal::from(10), OrderSide::Buy, PositionSide::Long, false)?;
+        intent.owner.symbol = eth;
+        assert!(matches!(
+            normalize_limit_from_ticker(&intent, &eth_rules, &ticker, 1_000_001)?,
+            ExecutionCommand::PlaceLimit(command) if command.owner.symbol == intent.owner.symbol
+        ));
+        Ok(())
+    }
+
+    fn intent(
+        quote_delta: Decimal,
+        side: OrderSide,
+        position_side: PositionSide,
+        reduce_only: bool,
+    ) -> Result<AccountLimitNormalizationIntent, Box<dyn std::error::Error>> {
+        Ok(AccountLimitNormalizationIntent {
+            command_id: CommandId::new("command_1")?,
+            client_order_id: CommandId::new("client_1")?,
+            owner: OrderOwner {
+                strategy_instance_id: "strategy_1".to_owned(),
+                run_id: "run_1".to_owned(),
+                exchange: "bitget".to_owned(),
+                account: "account_1".to_owned(),
+                symbol: "BTC/USDT".parse()?,
+                purpose: OrderPurpose::Entry,
+            },
+            side,
+            position_side,
+            quote_delta,
+            reduce_only,
+        })
+    }
+
+    #[test]
+    fn normalizer_uses_post_only_bbo_floors_size_and_preserves_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let intent = intent(Decimal::from(10), OrderSide::Buy, PositionSide::Long, false)?;
+        let command = normalize_limit_from_ticker(
+            &intent,
+            &rules()?,
+            &ticker(TICKER_FIXTURE.to_owned())?,
+            1_000_001,
+        )?;
+        let ExecutionCommand::PlaceLimit(command) = command else {
+            return Err("normalizer must return PlaceLimit".into());
+        };
+        assert_eq!(command.command_id, intent.command_id);
+        assert_eq!(command.client_order_id, intent.client_order_id);
+        assert_eq!(command.owner, intent.owner);
+        assert_eq!(command.side, OrderSide::Buy);
+        assert_eq!(command.position_side, PositionSide::Long);
+        assert!(!command.reduce_only);
+        assert_eq!(command.limit_price.value(), Decimal::from(100_000));
+        assert_eq!(command.quantity, Decimal::new(1, 4));
+        Ok(())
+    }
+
+    #[test]
+    fn normalizer_rejects_wrong_symbol_stale_empty_crossed_and_unaligned_tickers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let intent = intent(Decimal::from(10), OrderSide::Buy, PositionSide::Long, false)?;
+        let rules = rules()?;
+        let mut wrong_symbol: serde_json::Value = serde_json::from_str(TICKER_FIXTURE)?;
+        wrong_symbol["data"][0]["symbol"] = json!("ETHUSDT");
+        assert!(ticker(wrong_symbol.to_string()).is_err());
+
+        let stale = ticker(TICKER_FIXTURE.to_owned())?;
+        assert_eq!(
+            normalize_limit_from_ticker(&intent, &rules, &stale, 1_005_001),
+            Err(AccountHostValidationError::Command)
+        );
+
+        let mut empty: serde_json::Value = serde_json::from_str(TICKER_FIXTURE)?;
+        empty["data"] = json!([]);
+        assert!(ticker(empty.to_string()).is_err());
+
+        let mut crossed: serde_json::Value = serde_json::from_str(TICKER_FIXTURE)?;
+        crossed["data"][0]["ask1Price"] = json!("100000.0");
+        assert!(ticker(crossed.to_string()).is_err());
+
+        let mut unaligned: serde_json::Value = serde_json::from_str(TICKER_FIXTURE)?;
+        unaligned["data"][0]["bid1Price"] = json!("100000.05");
+        assert_eq!(
+            normalize_limit_from_ticker(
+                &intent,
+                &rules,
+                &ticker(unaligned.to_string())?,
+                1_000_001,
+            ),
+            Err(AccountHostValidationError::Command)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn normalizer_refuses_minimum_shortfall_wrong_identity_and_invalid_hedge_direction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let ticker = ticker(TICKER_FIXTURE.to_owned())?;
+        let rules = rules()?;
+        let minimum_shortfall =
+            intent(Decimal::from(5), OrderSide::Buy, PositionSide::Long, false)?;
+        assert_eq!(
+            normalize_limit_from_ticker(&minimum_shortfall, &rules, &ticker, 1_000_001),
+            Err(AccountHostValidationError::Command)
+        );
+
+        let mut wrong_identity =
+            intent(Decimal::from(10), OrderSide::Buy, PositionSide::Long, false)?;
+        wrong_identity.owner.symbol = "ETH/USDT".parse()?;
+        assert_eq!(
+            normalize_limit_from_ticker(&wrong_identity, &rules, &ticker, 1_000_001),
+            Err(AccountHostValidationError::Command)
+        );
+
+        let invalid_direction =
+            intent(Decimal::from(10), OrderSide::Buy, PositionSide::Long, true)?;
+        assert_eq!(
+            normalize_limit_from_ticker(&invalid_direction, &rules, &ticker, 1_000_001),
+            Err(AccountHostValidationError::Command)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn signed_account_risk_includes_every_usdt_position() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let payload = json!({
+            "code": "00000",
+            "data": {"list": [
+                {"category":"USDT-FUTURES", "marginCoin":"USDT", "symbol":"BTCUSDT", "holdMode":"hedge_mode", "posSide":"long", "total":"0.1", "markPrice":"100000"},
+                {"category":"USDT-FUTURES", "marginCoin":"USDT", "symbol":"ETHUSDT", "holdMode":"hedge_mode", "posSide":"short", "total":"2", "markPrice":"2000"},
+                {"category":"USDT-FUTURES", "marginCoin":"USDT", "symbol":"DOGEUSDT", "holdMode":"hedge_mode", "posSide":"long", "total":"0", "markPrice":"0"}
+            ]}
+        })
+        .to_string();
+        assert_eq!(
+            position_notionals(&payload)?,
+            vec![Decimal::from(10_000), Decimal::from(4_000)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn entry_risk_reserves_only_remaining_open_entries() -> Result<(), Box<dyn std::error::Error>> {
+        let rows = vec![
+            json!({"category":"USDT-FUTURES", "marginCoin":"USDT", "symbol":"BTCUSDT", "delegateType":"normal", "tradeSide":"open_long", "posSide":"long", "side":"buy", "reduceOnly":"NO", "qty":"0.2", "cumExecQty":"0.05", "price":"100000"}),
+            json!({"category":"USDT-FUTURES", "marginCoin":"USDT", "symbol":"ETHUSDT", "delegateType":"normal", "tradeSide":"open_short", "posSide":"short", "side":"sell", "reduceOnly":"NO", "qty":"2", "cumExecQty":"0", "price":"2000"}),
+            json!({"category":"USDT-FUTURES", "marginCoin":"USDT", "symbol":"DOGEUSDT", "delegateType":"normal", "tradeSide":"close_long", "posSide":"long", "side":"sell", "reduceOnly":"YES", "qty":"1", "cumExecQty":"0", "price":"1"}),
+        ];
+        assert_eq!(
+            entry_order_notionals(&rows)?,
+            vec![Decimal::from(15_000), Decimal::from(4_000)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn account_wide_order_request_never_filters_to_the_selected_symbol()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = build_account_wide_open_orders_read_request(&binding()?, 7, 9, 0, None)?;
+        assert_eq!(request.query, "category=USDT-FUTURES&limit=100");
+        assert!(!request.query.contains("symbol="));
+        assert!(!request.query.contains("delegateType="));
+        let next = build_account_wide_open_orders_read_request(
+            &binding()?,
+            7,
+            9,
+            1,
+            Some("oldest order/id"),
+        )?;
+        assert_eq!(
+            next.query,
+            "category=USDT-FUTURES&limit=100&cursor=oldest%20order%2Fid"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn signed_snapshot_fill_cursor_is_time_watermark_and_legacy_digest_fails_closed() {
+        assert_eq!(
+            parse_snapshot_fills_cursor(Some("bitget-fills-v1|1720000000000")),
+            Ok(Some(1_720_000_000_000))
+        );
+        assert!(
+            parse_snapshot_fills_cursor(Some(
+                "4983f3d75db0d72aeb1e68c57d9f171d981edc3ef31b8ca16c4d5f1caa26dce5"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn non_usdt_or_non_regular_rows_reject_the_complete_risk_turn() {
+        assert!(entry_order_notionals(&[json!({
+            "category":"USDT-FUTURES", "marginCoin":"USDC", "symbol":"BTCUSDC", "delegateType":"normal", "tradeSide":"open_long", "qty":"1", "cumExecQty":"0", "price":"1"
+        })])
+        .is_err());
+        assert!(entry_order_notionals(&[json!({
+            "category":"USDT-FUTURES", "marginCoin":"USDT", "symbol":"BTCUSDT", "delegateType":"conditional", "tradeSide":"open_long", "qty":"1", "cumExecQty":"0", "price":"1"
+        })])
+        .is_err());
+    }
+
+    #[test]
+    fn unfilled_strategy_delegate_blocks_risk_instead_of_being_treated_as_absent() {
+        assert!(
+            entry_order_notionals(&[json!({
+                "category":"USDT-FUTURES", "marginCoin":"USDT", "symbol":"BTCUSDT",
+                "delegateType":"plan_limit", "posSide":"long", "side":"buy",
+                "reduceOnly":"NO", "qty":"1", "cumExecQty":"0", "price":"100000"
+            })])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn current_uta_normal_order_shape_without_legacy_trade_side_is_risk_counted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rows = vec![json!({
+            "category":"USDT-FUTURES", "marginCoin":"USDT", "symbol":"BTCUSDT",
+            "delegateType":"normal", "posSide":"short", "side":"sell",
+            "reduceOnly":"NO", "qty":"0.1", "cumExecQty":"0", "price":"100000"
+        })];
+        assert_eq!(entry_order_notionals(&rows)?, vec![Decimal::from(10_000)]);
+        Ok(())
+    }
+
+    #[test]
+    fn signed_snapshot_rejects_visible_strategy_delegate_instead_of_hiding_it() {
+        let rows = vec![json!({
+            "category":"USDT-FUTURES", "marginCoin":"USDT", "symbol":"BTCUSDT",
+            "delegateType":"plan_limit", "posSide":"long", "side":"buy",
+            "reduceOnly":"NO", "qty":"1", "cumExecQty":"0", "price":"100000",
+            "clientOid":"strategy-visible", "orderId":"strategy-order", "orderStatus":"live"
+        })];
+        assert!(snapshot_order_facts(&rows).is_err());
+    }
+}
