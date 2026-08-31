@@ -591,6 +591,72 @@ fn private_router_delivers_exact_owner_and_never_guesses_unknown_fill() -> Resul
 }
 
 #[test]
+fn manual_private_ack_preserves_strategy_replay_and_copy_remains_excluded()
+-> Result<(), Box<dyn Error>> {
+    let grid = binding(StrategyKind::HedgedGrid, "grid_sol", "SOL/USDT")?;
+    let copy = binding(StrategyKind::Copy, "copy_btc", "BTC/USDT")?;
+    let mut runtime = AccountRuntime::new(account()?);
+    runtime.register_strategy(grid.clone())?;
+    runtime.register_strategy(copy.clone())?;
+    restore_empty_recovery(&mut runtime)?;
+    install_persisted_order_route(
+        &mut runtime,
+        RecoveredOrderRoute::verified(
+            NativeOrderFamily::UmOrder,
+            CommandId::new("cmd_grid_manual")?,
+            "grid_manual_client".to_owned(),
+            Some("grid_manual_venue".to_owned()),
+            owner(&grid, OrderPurpose::Entry),
+        ),
+    )?;
+    runtime.mark_account_ready()?;
+    establish_empty_signed_orders(&mut runtime, 1)?;
+
+    let strategy_before = runtime
+        .actor_applied_stores
+        .get(&grid.key)
+        .ok_or("grid actor store missing")?
+        .recovered_actor_checkpoint()?
+        .ok_or("grid actor checkpoint missing")?
+        .1;
+    runtime.persist_resident_manual_turn(&grid, b"manual-before-fill".to_vec(), false)?;
+    assert!(matches!(
+        runtime.persist_resident_manual_turn(&copy, b"copy-manual".to_vec(), false),
+        Err(AccountRuntimeError::StrategyTurnAuthority)
+    ));
+
+    let mut evidence = EvidenceFixture::new()?;
+    let persisted = evidence.append(1, 100, "manual owned fill")?;
+    let report = route_persisted_private(
+        &mut runtime,
+        private_fact(
+            &persisted,
+            DomainEvent::Fill(fill(&grid, "manual_fill", "grid_manual_venue")?),
+        )?,
+    )?;
+    assert_eq!(report.deliveries.len(), 1);
+    let turn = runtime
+        .begin_private_strategy_turn(&grid)?
+        .ok_or("manual private turn missing")?;
+    assert!(matches!(turn.input(), StrategyInput::Private(_)));
+    runtime.persist_manual_private_strategy_turn(&grid, b"manual-after-fill".to_vec())?;
+    assert_eq!(runtime.applied_private_sequence(), 1);
+    let store = runtime
+        .actor_applied_stores
+        .get(&grid.key)
+        .ok_or("grid actor store missing")?;
+    assert_eq!(
+        store.recovered_actor_checkpoint()?.map(|(_, bytes)| bytes),
+        Some(strategy_before)
+    );
+    assert_eq!(
+        store.recovered_manual_checkpoint()?,
+        Some(b"manual-after-fill".to_vec())
+    );
+    Ok(())
+}
+
+#[test]
 fn conflicting_client_and_venue_identities_are_not_delivered() -> Result<(), Box<dyn Error>> {
     let grid = binding(StrategyKind::HedgedGrid, "grid_sol", "SOL/USDT")?;
     let scalp = binding(StrategyKind::Scalping, "scalp_eth", "ETH/USDT")?;

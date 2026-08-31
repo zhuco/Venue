@@ -1,5 +1,6 @@
 use bytes::Bytes;
 
+use super::account_gateway_limit::normalize_priced_limit;
 use super::*;
 
 const EXCHANGE_INFO: &str = include_str!("../tests/fixtures/exchange_info_btcusdt.json");
@@ -69,6 +70,34 @@ fn limit_normalization_preserves_identity_and_never_rounds_up_quote()
     assert_eq!(sell.limit_price.value(), Decimal::new(50001, 1));
     assert_eq!(sell.quantity, Decimal::new(1, 3));
     assert!(sell.quantity * sell.limit_price.value() <= intent.quote_delta);
+    Ok(())
+}
+
+#[test]
+fn priced_limit_uses_explicit_gtc_price_and_never_fetches_bbo()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (intent, rules, binding) = limit_fixture()?;
+    let priced = AccountPricedLimitIntent {
+        intent,
+        limit_price: Price::new(Decimal::new(5000, 0))?,
+        time_in_force: LimitTimeInForce::Gtc,
+        maximum_quantity: Some(Decimal::new(15, 4)),
+    };
+    let ExecutionCommand::PlaceLimit(command) = normalize_priced_limit(&priced, &rules, &binding)?
+    else {
+        return Err("expected limit".into());
+    };
+    assert_eq!(command.limit_price, priced.limit_price);
+    assert_eq!(command.time_in_force, LimitTimeInForce::Gtc);
+    assert_eq!(command.quantity, Decimal::new(1, 3));
+    assert!(command.quantity * command.limit_price.value() <= priced.intent.quote_delta);
+
+    let mut unaligned = priced.clone();
+    unaligned.limit_price = Price::new(Decimal::new(50001, 2))?;
+    assert_eq!(
+        normalize_priced_limit(&unaligned, &rules, &binding),
+        Err(AccountHostValidationError::Command)
+    );
     Ok(())
 }
 
@@ -380,6 +409,33 @@ fn signed_snapshot_policy_preserves_missing_and_unrepresented_values() {
 
     row.insert("timeInForce".to_owned(), Value::Bool(true));
     assert!(snapshot_limit_time_in_force(&row, "timeInForce").is_err());
+}
+
+#[test]
+fn signed_snapshot_partial_regular_order_keeps_original_quantity_and_filled_amount()
+-> Result<(), Box<dyn std::error::Error>> {
+    let regular = json_rows_snapshot(
+        br#"[
+            {"symbol":"BTCUSDT","orderId":"501","clientOrderId":"partial-regular-1","status":"PARTIALLY_FILLED","side":"BUY","positionSide":"LONG","timeInForce":"GTX","origQty":"0.002","executedQty":"0.0005","price":"50000","reduceOnly":false}
+        ]"#,
+    )?;
+    let facts = snapshot_order_facts(EXCHANGE_INFO, &regular, &[], 7)?;
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].quantity, Decimal::new(2, 3));
+    assert_eq!(facts[0].filled_quantity, Some(Decimal::new(5, 4)));
+    assert_eq!(facts[0].state, Some(OrderState::PartiallyFilled));
+    Ok(())
+}
+
+#[test]
+fn signed_snapshot_uses_order_creation_time_not_update_time() {
+    let mut row = serde_json::Map::new();
+    row.insert("time".to_owned(), Value::from(123_u64));
+    row.insert("updateTime".to_owned(), Value::from(999_u64));
+    assert_eq!(snapshot_created_at_ms(&row, "time"), Ok(Some(123)));
+
+    row.remove("time");
+    assert_eq!(snapshot_created_at_ms(&row, "time"), Ok(None));
 }
 
 #[test]

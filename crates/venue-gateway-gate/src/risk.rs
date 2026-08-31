@@ -13,6 +13,7 @@ pub struct GateContractRules {
     pub instrument: Instrument,
     pub quanto_multiplier: Decimal,
     pub minimum_contracts: Decimal,
+    pub maximum_contracts: Option<Decimal>,
     pub decimal_contracts: bool,
 }
 
@@ -36,6 +37,21 @@ impl GateContractRules {
             return Err(GateRiskError::Quantity);
         }
         if !self.decimal_contracts && contracts.fract() != Decimal::ZERO {
+            return Err(GateRiskError::Quantity);
+        }
+        Ok(contracts)
+    }
+
+    pub fn native_order_contracts_checked(
+        &self,
+        quantity: Decimal,
+    ) -> Result<Decimal, GateRiskError> {
+        let maximum_contracts = self.maximum_contracts.ok_or(GateRiskError::Quantity)?;
+        if maximum_contracts < self.minimum_contracts {
+            return Err(GateRiskError::Quantity);
+        }
+        let contracts = self.native_contracts_checked(quantity)?;
+        if contracts > maximum_contracts {
             return Err(GateRiskError::Quantity);
         }
         Ok(contracts)
@@ -66,6 +82,7 @@ pub fn parse_contract_rules(
     }
     let quanto_multiplier = decimal(item, "quanto_multiplier")?;
     let minimum_contracts = decimal(item, "order_size_min")?.max(Decimal::ONE);
+    let maximum_contracts = Some(decimal(item, "order_size_max")?);
     let price_tick =
         Price::new(decimal(item, "order_price_round")?).map_err(|_| GateRiskError::RiskSnapshot)?;
     let instrument = Instrument {
@@ -83,7 +100,10 @@ pub fn parse_contract_rules(
     instrument
         .validate()
         .map_err(|_| GateRiskError::RiskSnapshot)?;
-    if quanto_multiplier <= Decimal::ZERO || minimum_contracts <= Decimal::ZERO {
+    if quanto_multiplier <= Decimal::ZERO
+        || minimum_contracts <= Decimal::ZERO
+        || maximum_contracts.is_none_or(|maximum| maximum < minimum_contracts)
+    {
         return Err(GateRiskError::Quantity);
     }
     Ok(GateContractRules {
@@ -91,6 +111,7 @@ pub fn parse_contract_rules(
         instrument,
         quanto_multiplier,
         minimum_contracts,
+        maximum_contracts,
         decimal_contracts: item
             .get("enable_decimal")
             .and_then(Value::as_bool)
@@ -416,6 +437,7 @@ mod tests {
             },
             quanto_multiplier: Decimal::new(1, 1),
             minimum_contracts: Decimal::ONE,
+            maximum_contracts: Some(Decimal::from(1000)),
             decimal_contracts: false,
         })
     }
@@ -429,6 +451,14 @@ mod tests {
         );
         assert_eq!(
             rules.native_contracts_checked(Decimal::new(15, 2)),
+            Err(GateRiskError::Quantity)
+        );
+        assert_eq!(
+            rules.native_contracts_checked(Decimal::from(101)),
+            Ok(Decimal::from(1_010))
+        );
+        assert_eq!(
+            rules.native_order_contracts_checked(Decimal::from(101)),
             Err(GateRiskError::Quantity)
         );
         let mut invalid = rules.clone();

@@ -3,6 +3,11 @@ param()
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'venue_build_guard.ps1')
+$venueBuildLease = Enter-VenueBuildGuard -RepoRoot (Split-Path -Parent $PSScriptRoot)
+try {
+Push-Location -LiteralPath (Split-Path -Parent $PSScriptRoot)
+try {
 
 $databaseUrl = $env:VENUE_CONTROL_TEST_DATABASE_URL
 if ([string]::IsNullOrWhiteSpace($databaseUrl)) {
@@ -48,3 +53,5 @@ Invoke-PostgresIntegrationTest -TestTarget 'account_delivery_postgres_integratio
 Invoke-PostgresIntegrationTest -TestTarget 'copy_postgres_integration'
 
 Write-Output 'PostgreSQL integration gate passed: delivery and Copy tests connected to the test database.'
+} finally { Pop-Location }
+} finally { Exit-VenueBuildGuard $venueBuildLease }

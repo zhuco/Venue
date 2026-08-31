@@ -505,6 +505,7 @@ mod tests {
             },
             quanto_multiplier: Decimal::new(1, 1),
             minimum_contracts: Decimal::ONE,
+            maximum_contracts: Some(Decimal::from(1000)),
             decimal_contracts: false,
         })
     }

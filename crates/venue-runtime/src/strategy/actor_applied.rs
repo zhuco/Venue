@@ -18,6 +18,10 @@ struct RuntimeReplayEnvelope {
     config_digest: String,
     applied_private_deliveries: BTreeSet<AppliedPrivateDelivery>,
     actor_checkpoint: Vec<u8>,
+    /// Opaque Node-owned semantic state that shares this actor's one durable checkpoint. It is
+    /// intentionally outside the strategy replay so a control turn cannot replace Grid bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manual_checkpoint: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -96,6 +100,15 @@ impl ActorAppliedTurnStore {
         )))
     }
 
+    /// Returns only the Node-owned control portion of the same durable replay envelope. It is
+    /// never a second checkpoint or an execution authority.
+    pub(crate) fn recovered_manual_checkpoint(&self) -> Result<Option<Vec<u8>>, ActorAppliedError> {
+        let Some(recovered) = self.recover()? else {
+            return Ok(None);
+        };
+        Ok(replay_envelope(&recovered)?.manual_checkpoint)
+    }
+
     pub(crate) fn refresh_binding(
         &mut self,
         binding: StrategyBinding,
@@ -117,6 +130,51 @@ impl ActorAppliedTurnStore {
         private_delivery: Option<AppliedPrivateDelivery>,
         replay_state: Vec<u8>,
     ) -> Result<ActorAppliedReceipt, ActorAppliedError> {
+        self.commit_inner(
+            token,
+            wal,
+            applied_private_sequence,
+            private_delivery,
+            replay_state,
+            None,
+        )
+    }
+
+    /// Replaces only the opaque manual portion while carrying forward the already-verified
+    /// strategy checkpoint byte-for-byte. A manual semantic turn therefore cannot corrupt a
+    /// Grid or Scalping recovery replay.
+    pub(crate) fn commit_manual(
+        &mut self,
+        token: &StrategyTurnToken,
+        wal: DurableWalHead,
+        applied_private_sequence: u64,
+        private_delivery: Option<AppliedPrivateDelivery>,
+        manual_checkpoint: Vec<u8>,
+    ) -> Result<ActorAppliedReceipt, ActorAppliedError> {
+        if manual_checkpoint.is_empty() {
+            return Err(ActorAppliedError::InvalidReplayState);
+        }
+        let recovered = self.recover()?.ok_or(ActorAppliedError::CheckpointDrift)?;
+        let strategy_checkpoint = replay_envelope(&recovered)?.actor_checkpoint;
+        self.commit_inner(
+            token,
+            wal,
+            applied_private_sequence,
+            private_delivery,
+            strategy_checkpoint,
+            Some(manual_checkpoint),
+        )
+    }
+
+    fn commit_inner(
+        &mut self,
+        token: &StrategyTurnToken,
+        wal: DurableWalHead,
+        applied_private_sequence: u64,
+        private_delivery: Option<AppliedPrivateDelivery>,
+        replay_state: Vec<u8>,
+        manual_checkpoint: Option<Vec<u8>>,
+    ) -> Result<ActorAppliedReceipt, ActorAppliedError> {
         self.require_token_binding(token)?;
         let recovered = self.store.recover()?;
         let replay_revision = recovered
@@ -135,16 +193,23 @@ impl ActorAppliedTurnStore {
         let previously_committed_cursor = recovered
             .as_ref()
             .map_or(0, |state| state.receipt().applied_private_sequence());
+        let previous_manual_checkpoint = recovered
+            .as_ref()
+            .map(replay_envelope)
+            .transpose()?
+            .and_then(|envelope| envelope.manual_checkpoint);
         applied_private_deliveries
             .retain(|delivery| delivery.evidence_sequence > previously_committed_cursor);
         if let Some(private_delivery) = private_delivery {
             applied_private_deliveries.insert(private_delivery);
         }
+        let manual_checkpoint = manual_checkpoint.or(previous_manual_checkpoint);
         let replay_state = serde_json::to_vec(&RuntimeReplayEnvelope {
             schema_version: RUNTIME_REPLAY_SCHEMA_VERSION,
             config_digest: self.binding.config_digest.clone(),
             applied_private_deliveries,
             actor_checkpoint: replay_state,
+            manual_checkpoint,
         })
         .map_err(ActorAppliedError::Encode)?;
         self.store.commit(ActorAppliedCommit::new(
@@ -437,6 +502,123 @@ mod tests {
                 b"rollback-wal".to_vec(),
             ),
             Err(ActorAppliedError::WalDrift)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn manual_checkpoint_preserves_strategy_replay_across_later_strategy_turns()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let journal = directory.path().join("applied.jsonl");
+        let checkpoint = directory.path().join("checkpoint.json");
+        let binding = binding()?;
+        let wal = DurableWalHead::new([7; 32], 0, 0)?;
+        let mut store = ActorAppliedTurnStore::create_new(binding.clone(), &journal, &checkpoint)?;
+        store.commit(
+            &token(&binding, 1, 1, 1, 1)?,
+            wal,
+            0,
+            None,
+            b"grid-before".to_vec(),
+        )?;
+        let manual = store.commit_manual(
+            &token(&binding, 1, 1, 1, 2)?,
+            wal,
+            0,
+            None,
+            b"manual-state".to_vec(),
+        )?;
+        assert_eq!(
+            store.recovered_actor_checkpoint()?.map(|(_, bytes)| bytes),
+            Some(b"grid-before".to_vec())
+        );
+        assert_eq!(
+            store.recovered_manual_checkpoint()?,
+            Some(b"manual-state".to_vec())
+        );
+        drop(store);
+        let mut reopened = ActorAppliedTurnStore::open_existing(
+            binding.clone(),
+            journal,
+            checkpoint,
+            manual.anchor(),
+        )?;
+        assert_eq!(
+            reopened
+                .recovered_actor_checkpoint()?
+                .map(|(_, bytes)| bytes),
+            Some(b"grid-before".to_vec())
+        );
+        assert_eq!(
+            reopened.recovered_manual_checkpoint()?,
+            Some(b"manual-state".to_vec())
+        );
+        reopened.commit(
+            &token(&binding, 1, 1, 1, 3)?,
+            wal,
+            0,
+            None,
+            b"grid-after".to_vec(),
+        )?;
+        assert_eq!(
+            reopened
+                .recovered_actor_checkpoint()?
+                .map(|(_, bytes)| bytes),
+            Some(b"grid-after".to_vec())
+        );
+        assert_eq!(
+            reopened.recovered_manual_checkpoint()?,
+            Some(b"manual-state".to_vec())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_replay_without_manual_checkpoint_remains_decodable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let legacy = serde_json::json!({
+            "schema_version": RUNTIME_REPLAY_SCHEMA_VERSION,
+            "config_digest": "config_1",
+            "applied_private_deliveries": [],
+            "actor_checkpoint": [1, 2, 3],
+        });
+        let envelope: RuntimeReplayEnvelope = serde_json::from_value(legacy)?;
+        assert_eq!(envelope.actor_checkpoint, vec![1, 2, 3]);
+        assert_eq!(envelope.manual_checkpoint, None);
+        Ok(())
+    }
+
+    #[test]
+    fn manual_checkpoint_cannot_rebind_an_old_strategy_replay_to_new_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let binding = binding()?;
+        let wal = DurableWalHead::new([7; 32], 0, 0)?;
+        let mut store = ActorAppliedTurnStore::create_new(
+            binding.clone(),
+            directory.path().join("applied.jsonl"),
+            directory.path().join("checkpoint.json"),
+        )?;
+        store.commit(
+            &token(&binding, 1, 1, 1, 1)?,
+            wal,
+            0,
+            None,
+            b"grid-config-1".to_vec(),
+        )?;
+        let mut changed = binding;
+        changed.config_digest = "config_2".to_owned();
+        store.refresh_binding(changed.clone())?;
+        assert!(matches!(
+            store.commit_manual(
+                &token(&changed, 2, 1, 1, 2)?,
+                wal,
+                0,
+                None,
+                b"manual-state".to_vec(),
+            ),
+            Err(ActorAppliedError::CheckpointDrift)
         ));
         Ok(())
     }

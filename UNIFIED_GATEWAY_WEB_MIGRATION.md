@@ -116,7 +116,7 @@ AI 只发起经授权的 operator/control 语义动作，不能直接调用 adap
 - 六所 Node 已组合 Account Runtime、Execution Lane 与 `AccountMutationHost`；Grid/Scalping 的生产私流驱动和物理接线、控制撤单/清仓及多 symbol 常驻调度仍须闭合，不能以纯 reducer 测试替代。
 - 根 package 的旧三所生产 binary 已移除，但服务器上的旧 release、未决 WAL 与运行进程仍须逐所核验和接管；本地删除入口不构成生产退休证明。
 - 六所尚未共同满足同一套启动恢复、Owner 路由、Stop/Flatten、Unknown 收敛和产品级 Canary 契约。
-- 手动 `TradeIntent` 的 Control/UI 入口不等于交易已接通：Node 尚需显式选价归一化、同一 Actor checkpoint 的挂单期望状态、精确撤单及跨重启 delivery 收敛；接线前保持明确拒绝。现有 BBO 自动选价归一化不能替代用户选价。
+- 手动 `TradeIntent` 已有 Node 显式选价、同一 Actor replay 的原始计划、精确自有手动单撤单及只读 delivery 对账；仍须完成与 Grid desired/库存的协同、Copy 绑定支持和全 scope 撤单后才能认定完整闭环。当前不支持的 scope 明确拒绝；BBO 自动选价不能替代用户选价，离线通过不替代生产接管验收。
 - Control 的 loopback API 与 Web 会话、鉴权、同源 BFF 已建立；隔离 fixture 的浏览器验收不替代指定主机的真实 Node/Control/Web 连通与分段性能验收。
 - 已保留主线的用户会话、账户中心与 Binance 凭证加密托管；这些属于 Control 应用层，不进入账户 writer。
   其他交易所的自助凭证接入、面向公众的多用户 Web 登录和付费能力仍未完成，不能由前端页面假装已实现。
@@ -163,6 +163,8 @@ WAL 状态只保留 `Prepared / Submitted / Accepted / Rejected / Unknown`。HTT
 `OrderCommand.time_in_force` 属于不可变命令和 WAL 摘要：历史省略字段的命令按原 PostOnly 契约恢复并保持原序列化字节，Gtc 必须显式编码，禁止用相同 command ID 改政策。签名订单缺失或不支持该字段时保持未知，不得套用命令默认值；即时回读、重启 Unknown 收敛、Owner 归属与 Desired Orders 比较都必须检验政策。旧实单与旧命令契约不符时失败关闭，不改写历史证据。
 
 Grid 和当前 BBO 自动归一化仍固定 PostOnly；只有显式手动限价意图才可选择 Gtc，不能因 adapter 支持普通限价而改变策略的防吃单边界。
+
+显式手动归一化使用 `AccountPricedLimitIntent`：用户价格及政策不可改写，数量按报价预算、平仓基础数量上限和实时 native lot 向下取整；不满足真实规则则拒绝，不向上补足名义价值。该只读转换不授予 mutation，结果仍须由同一 Actor、风险、WAL 和账户 writer 准入。撤最近订单只使用原生创建时间，缺失保持未知，禁止用最后更新时间或本机接收时间替代。
 
 ### 4.3 adapter 契约
 

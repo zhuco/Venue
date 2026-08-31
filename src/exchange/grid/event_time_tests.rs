@@ -22,6 +22,7 @@ fn gate_queued_depth_uses_exchange_time_not_fresh_local_drain_time()
         instrument: instrument()?,
         quanto_multiplier: Decimal::new(10, 0),
         minimum_contracts: Decimal::ONE,
+        maximum_contracts: None,
         decimal_contracts: false,
     };
     let mut market = GatePublicMarket::new(&rules)?;

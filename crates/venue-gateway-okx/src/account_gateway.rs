@@ -14,9 +14,10 @@ use venue_domain::domain::{
 use venue_execution::{
     AccountDispatchPermit, AccountGatewayResult, AccountHostValidationError,
     AccountInstrumentIdentity, AccountLimitNormalizationIntent, AccountPhysicalGateway,
-    AccountRecoveryOutcome, AccountRecoveryReport, AccountRecoveryRequest, AccountRecoveryState,
-    AccountRiskEvidence, SignedAccountBalance, SignedAccountOrderFact, SignedAccountPositionFact,
-    SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
+    AccountPricedLimitIntent, AccountRecoveryOutcome, AccountRecoveryReport,
+    AccountRecoveryRequest, AccountRecoveryState, AccountRiskEvidence, SignedAccountBalance,
+    SignedAccountOrderFact, SignedAccountPositionFact, SignedAccountPositionMode,
+    SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
 };
 use venue_gateway_api::GatewayBinding;
 
@@ -514,6 +515,61 @@ fn normalize_limit_from_bbo(
     Ok(command)
 }
 
+fn normalize_priced_limit(
+    config: &OkxConfig,
+    instrument: &OkxInstrument,
+    priced: &AccountPricedLimitIntent,
+) -> Result<ExecutionCommand, AccountHostValidationError> {
+    let intent = &priced.intent;
+    priced.validate()?;
+    if intent.owner.exchange != config.gateway_binding().venue.as_str()
+        || intent.owner.account != config.gateway_binding().trading_account_id
+        || intent.owner.symbol != config.gateway_binding().symbol
+        || !matches!(
+            (intent.position_side, intent.side, intent.reduce_only),
+            (PositionSide::Long, OrderSide::Buy, false)
+                | (PositionSide::Long, OrderSide::Sell, true)
+                | (PositionSide::Short, OrderSide::Sell, false)
+                | (PositionSide::Short, OrderSide::Buy, true)
+        )
+        || priced.limit_price.value() % instrument.instrument().price_tick.value() != Decimal::ZERO
+    {
+        return Err(AccountHostValidationError::Command);
+    }
+    let cap = priced
+        .quantity_cap()?
+        .checked_mul(priced.limit_price.value())
+        .ok_or(AccountHostValidationError::Notional)?;
+    let quote = Asset::new(config.gateway_binding().symbol.quote())
+        .map_err(|_| AccountHostValidationError::Command)?;
+    let size = instrument
+        .size_for_quote_notional(&Amount::new(quote, cap), priced.limit_price)
+        .map_err(|_| AccountHostValidationError::Command)?;
+    if instrument
+        .maximum_limit_contracts()
+        .is_none_or(|maximum| size.contracts() > maximum)
+        || size.base_quantity() > priced.quantity_cap()?
+        || size.quote_notional().value > intent.quote_delta
+    {
+        return Err(AccountHostValidationError::Command);
+    }
+    let command = ExecutionCommand::PlaceLimit(OrderCommand {
+        time_in_force: priced.time_in_force,
+        command_id: intent.command_id.clone(),
+        client_order_id: intent.client_order_id.clone(),
+        owner: intent.owner.clone(),
+        side: intent.side,
+        position_side: intent.position_side,
+        quantity: size.base_quantity(),
+        limit_price: priced.limit_price,
+        reduce_only: intent.reduce_only,
+    });
+    command
+        .validate()
+        .map_err(|_| AccountHostValidationError::Command)?;
+    Ok(command)
+}
+
 fn floor_to_step(value: Decimal, step: Decimal) -> Result<Decimal, AccountHostValidationError> {
     if value <= Decimal::ZERO || step <= Decimal::ZERO {
         return Err(AccountHostValidationError::Command);
@@ -668,6 +724,15 @@ impl AccountPhysicalGateway for OkxAccountGateway {
             .current_market_bbo()
             .map_err(|_| AccountHostValidationError::Command)?;
         normalize_limit_from_bbo(&self.config, &self.instrument, intent, bbo)
+    }
+
+    fn normalize_priced_limit_intent(
+        &mut self,
+        intent: &AccountPricedLimitIntent,
+    ) -> Result<ExecutionCommand, AccountHostValidationError> {
+        self.refresh_instrument()
+            .map_err(|_| AccountHostValidationError::Command)?;
+        normalize_priced_limit(&self.config, &self.instrument, intent)
     }
 
     fn dispatch(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
@@ -1118,9 +1183,26 @@ fn collect_wide_orders(
                     .checked_mul(rule.base_per_contract)
                     .ok_or(OkxAccountGatewayError::Account)?,
             ),
+            created_at_ms: optional_order_created_at_ms(row)?,
         });
     }
     Ok(())
+}
+
+fn optional_order_created_at_ms(
+    row: &serde_json::Value,
+) -> Result<Option<u64>, OkxAccountGatewayError> {
+    match row.get("cTime") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) if value.is_empty() => Ok(None),
+        Some(serde_json::Value::String(value)) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or(OkxAccountGatewayError::Account)
+            .map(Some),
+        Some(_) => Err(OkxAccountGatewayError::Account),
+    }
 }
 
 fn signed_limit_time_in_force(
@@ -1161,6 +1243,18 @@ mod signed_limit_policy_tests {
             signed_limit_time_in_force(&serde_json::json!({}), NativeOrderFamily::UmOrder),
             None
         );
+    }
+
+    #[test]
+    fn signed_snapshot_uses_native_creation_time_only() {
+        assert!(matches!(
+            optional_order_created_at_ms(&serde_json::json!({"cTime":"1800","uTime":"1900"})),
+            Ok(Some(1800))
+        ));
+        assert!(matches!(
+            optional_order_created_at_ms(&serde_json::json!({"uTime":"1900"})),
+            Ok(None)
+        ));
     }
 }
 
@@ -1708,6 +1802,33 @@ mod tests {
         let mut wrong_leg = limit_intent(Decimal::new(6001, 0))?;
         wrong_leg.position_side = PositionSide::Net;
         assert!(normalize_limit_from_bbo(&config, &instrument, &wrong_leg, bbo).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn priced_limit_keeps_user_price_policy_and_contract_cap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (config, instrument) = limit_config_and_instrument()?;
+        let priced = AccountPricedLimitIntent {
+            intent: limit_intent(Decimal::new(6001, 0))?,
+            limit_price: Price::new(Decimal::new(600_000, 1))?,
+            time_in_force: LimitTimeInForce::Gtc,
+            maximum_quantity: Some(Decimal::new(1, 1)),
+        };
+        let ExecutionCommand::PlaceLimit(command) =
+            normalize_priced_limit(&config, &instrument, &priced)?
+        else {
+            return Err("expected limit".into());
+        };
+        assert_eq!(command.limit_price, priced.limit_price);
+        assert_eq!(command.time_in_force, LimitTimeInForce::Gtc);
+        assert_eq!(command.quantity, Decimal::new(1, 1));
+        assert!(command.quantity <= priced.quantity_cap()?);
+        assert!(command.quantity * command.limit_price.value() <= priced.intent.quote_delta);
+
+        let mut off_tick = priced;
+        off_tick.limit_price = Price::new(Decimal::new(6_000_001, 2))?;
+        assert!(normalize_priced_limit(&config, &instrument, &off_tick).is_err());
         Ok(())
     }
 

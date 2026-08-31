@@ -4,8 +4,8 @@ use rust_decimal::Decimal;
 use venue_domain::domain::ExecutionCommand;
 use venue_execution::{
     AccountCommandStatus, AccountDispatchOutcome, AccountHostError,
-    AccountLimitNormalizationIntent, AccountMutationHost, AccountPhysicalGateway, AccountSymbolSet,
-    HostPreparedCommand, execution_command_sha256,
+    AccountLimitNormalizationIntent, AccountMutationHost, AccountPhysicalGateway,
+    AccountPricedLimitIntent, AccountSymbolSet, HostPreparedCommand, execution_command_sha256,
 };
 use venue_gateway_api::GatewayBinding;
 
@@ -414,6 +414,23 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
         self.prepare_and_admit_operator(runtime, binding, applied, priority, command)
     }
 
+    /// Preserves a user-selected limit price and policy while reusing the same resident Actor
+    /// receipt, account WAL, lane and writer as every strategy-generated command.
+    pub fn normalize_and_prepare_priced_limit(
+        &mut self,
+        runtime: &mut AccountRuntime,
+        binding: &StrategyBinding,
+        applied: &AppliedStrategyTurnReceipt,
+        priority: AccountLanePriority,
+        intent: &AccountPricedLimitIntent,
+    ) -> Result<(), AccountRuntimeHostError<G::Error>> {
+        let command = self
+            .host
+            .normalize_priced_limit_intent(intent)
+            .map_err(AccountRuntimeHostError::Host)?;
+        self.prepare_and_admit_operator(runtime, binding, applied, priority, command)
+    }
+
     /// Compatibility wrapper for the Copy actor's specialized public receipt.
     pub fn normalize_and_prepare_copy_limit(
         &mut self,
@@ -661,6 +678,7 @@ mod tests {
                 SignedAccountPositionMode::Hedge,
                 if state.external_order {
                     vec![SignedAccountOrderFact {
+                        created_at_ms: None,
                         time_in_force: Some(Default::default()),
                         client_order_id: "external-order".to_owned(),
                         venue_order_id: Some("native-external".to_owned()),
@@ -678,6 +696,7 @@ mod tests {
                     }]
                 } else if let Some(ExecutionCommand::PlaceLimit(command)) = &state.command {
                     vec![SignedAccountOrderFact {
+                        created_at_ms: None,
                         time_in_force: Some(Default::default()),
                         client_order_id: command.client_order_id.as_str().to_owned(),
                         venue_order_id: Some(

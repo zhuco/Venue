@@ -11,12 +11,12 @@ pub use account_host::{
     AccountCommandStatus, AccountDispatchOutcome, AccountDispatchPermit, AccountGatewayResult,
     AccountHostError, AccountHostValidationError, AccountInstrumentIdentity,
     AccountLimitNormalizationIntent, AccountMutationHost, AccountPhysicalGateway,
-    AccountQuoteToUsdtRate, AccountRecoveryOutcome, AccountRecoveryReport, AccountRecoveryRequest,
-    AccountRecoveryState, AccountRiskAmount, AccountRiskEvidence, AccountRiskSummary,
-    AccountSymbolSet, COMMAND_JOURNAL_HARD_LIMIT_BYTES, COMMAND_JOURNAL_ROTATE_BYTES,
-    HostPreparedCommand, RuntimeBootstrapReceipt, SignedAccountBalance, SignedAccountOrderFact,
-    SignedAccountPositionFact, SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact,
-    SignedUnknownResult,
+    AccountPricedLimitIntent, AccountQuoteToUsdtRate, AccountRecoveryOutcome,
+    AccountRecoveryReport, AccountRecoveryRequest, AccountRecoveryState, AccountRiskAmount,
+    AccountRiskEvidence, AccountRiskSummary, AccountSymbolSet, COMMAND_JOURNAL_HARD_LIMIT_BYTES,
+    COMMAND_JOURNAL_ROTATE_BYTES, HostPreparedCommand, RuntimeBootstrapReceipt,
+    SignedAccountBalance, SignedAccountOrderFact, SignedAccountPositionFact,
+    SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
 };
 pub use canonical_root::{
     AccountCanonicalRootError, AccountCanonicalRootGuard, LegacyV1WriterGuard,

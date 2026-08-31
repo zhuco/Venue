@@ -285,11 +285,29 @@ impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
                         };
                         match action {
                             Some(venue_control_protocol::ControlAction::Trade) => {
-                                let completion = turn.rejected(
-                                    now,
-                                    [0; 32],
-                                    "manual trade execution is not supported by this resident",
-                                )?;
+                                let completion = match self.resident.apply_manual_trade(binding, &turn) {
+                                    Ok(crate::production_resident::manual::ManualTradeOutcome::Applied(applied)) => turn.applied_from_runtime(
+                                        &applied,
+                                        now,
+                                        "manual trade Accepted and confirmed by a fresh signed account readback",
+                                    )?,
+                                    Ok(crate::production_resident::manual::ManualTradeOutcome::Rejected { applied, detail }) => turn.rejected(
+                                        now,
+                                        applied.durable_fact_digest().ok_or(ControlResidentLoopError::Config)?,
+                                        detail,
+                                    )?,
+                                    Ok(crate::production_resident::manual::ManualTradeOutcome::Unknown { applied, detail }) => turn.unknown(
+                                        now,
+                                        applied.durable_fact_digest().ok_or(ControlResidentLoopError::Config)?,
+                                        detail,
+                                    )?,
+                                    Err(NodeError::ResidentRuntime) => turn.rejected(
+                                        now,
+                                        [0; 32],
+                                        "manual trade was rejected: unsupported binding, unsafe recovery state, or invalid signed scope",
+                                    )?,
+                                    Err(error) => return Err(ControlResidentLoopError::Resident(error)),
+                                };
                                 if !self.submit_actor_completion(
                                     http_runtime,
                                     &instance_id,
@@ -342,10 +360,43 @@ impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
                             }
                         }
                     }
-                    // A reconcile-only delivery remains durable and pending until an adapter
-                    // supplies command-specific, newer signed facts. A snapshot refresh alone
-                    // cannot truthfully declare an Unknown command reconciled.
-                    ControlDeliveryWork::Reconcile(_) => {}
+                    ControlDeliveryWork::Reconcile(turn) => {
+                        let binding = self
+                            .bindings
+                            .get(&instance_id)
+                            .ok_or(ControlResidentLoopError::Config)?;
+                        let is_manual_trade = matches!(
+                            turn.payload(),
+                            venue_control_protocol::AccountDeliveryPayload::ControlCommand(command)
+                                if command.action == venue_control_protocol::ControlAction::Trade
+                        );
+                        if !is_manual_trade {
+                            // Other reconciliation families retain their existing dedicated
+                            // recovery drivers; this path has no authority to infer a result.
+                            continue;
+                        }
+                        match self
+                            .resident
+                            .reconcile_manual_trade(binding, &turn)
+                            .map_err(ControlResidentLoopError::Resident)?
+                        {
+                            crate::production_resident::manual::ManualTradeReconciliation::Pending => {}
+                            crate::production_resident::manual::ManualTradeReconciliation::Reconciled {
+                                account_fact_digest,
+                                detail,
+                            } => {
+                                let completion = turn.reconciled(now, account_fact_digest, detail)?;
+                                if !self.submit_reconciliation(
+                                    http_runtime,
+                                    &instance_id,
+                                    completion,
+                                    now,
+                                )? {
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             self.recover_copy_actor_markers(&instance_id, now)?;
@@ -818,6 +869,27 @@ impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
             .block_on(interruptible(async {
                 driver
                     .submit_actor_completion(completion, now)
+                    .await
+                    .map_err(ControlResidentLoopError::from)
+            }))?
+            .is_some())
+    }
+
+    fn submit_reconciliation(
+        &mut self,
+        http_runtime: &tokio::runtime::Runtime,
+        instance_id: &str,
+        completion: crate::ReconciliationCompletion,
+        now: u64,
+    ) -> Result<bool, ControlResidentLoopError> {
+        let driver = self
+            .drivers
+            .get_mut(instance_id)
+            .ok_or(ControlResidentLoopError::Config)?;
+        Ok(http_runtime
+            .block_on(interruptible(async {
+                driver
+                    .submit_reconciliation(completion, now)
                     .await
                     .map_err(ControlResidentLoopError::from)
             }))?
@@ -1797,5 +1869,7 @@ impl ControlResidentLoopError {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod control_loop_tests;
+#[cfg(test)]
+#[path = "control_loop/manual_trade_e2e_tests.rs"]
+mod manual_trade_e2e_tests;

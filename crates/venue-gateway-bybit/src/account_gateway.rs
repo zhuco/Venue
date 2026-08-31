@@ -9,9 +9,10 @@ use venue_domain::domain::{
 use venue_execution::{
     AccountDispatchPermit, AccountGatewayResult, AccountHostValidationError,
     AccountInstrumentIdentity, AccountLimitNormalizationIntent, AccountPhysicalGateway,
-    AccountRecoveryOutcome, AccountRecoveryReport, AccountRecoveryRequest, AccountRiskEvidence,
-    SignedAccountBalance, SignedAccountOrderFact, SignedAccountPositionFact,
-    SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
+    AccountPricedLimitIntent, AccountRecoveryOutcome, AccountRecoveryReport,
+    AccountRecoveryRequest, AccountRiskEvidence, SignedAccountBalance, SignedAccountOrderFact,
+    SignedAccountPositionFact, SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact,
+    SignedUnknownResult,
 };
 use venue_gateway_api::GatewayBinding;
 
@@ -560,6 +561,60 @@ fn normalize_limit_from_bbo(
     Ok(command)
 }
 
+fn normalize_priced_limit(
+    binding: &BybitGatewayBinding,
+    rules: &BybitLinearInstrumentRules,
+    priced: &AccountPricedLimitIntent,
+) -> Result<ExecutionCommand, AccountHostValidationError> {
+    let intent = &priced.intent;
+    priced.validate()?;
+    if intent.owner.exchange != binding.gateway_binding().venue.as_str()
+        || intent.owner.account != binding.gateway_binding().trading_account_id
+        || intent.owner.symbol != binding.gateway_binding().symbol
+        || !matches!(
+            (intent.position_side, intent.side, intent.reduce_only),
+            (PositionSide::Long, OrderSide::Buy, false)
+                | (PositionSide::Long, OrderSide::Sell, true)
+                | (PositionSide::Short, OrderSide::Sell, false)
+                | (PositionSide::Short, OrderSide::Buy, true)
+        )
+        || rules.raw.binding != *binding.gateway_binding()
+        || rules.instrument.symbol != binding.gateway_binding().symbol
+        || priced.limit_price.value() % rules.instrument.price_tick.value()
+            != rust_decimal::Decimal::ZERO
+        || priced.limit_price < rules.minimum_price
+        || priced.limit_price > rules.maximum_price
+    {
+        return Err(AccountHostValidationError::Command);
+    }
+    let quantity = floor_to_step(priced.quantity_cap()?, rules.instrument.quantity_step)?;
+    let notional = quantity
+        .checked_mul(priced.limit_price.value())
+        .ok_or(AccountHostValidationError::Notional)?;
+    if quantity < rules.minimum_quantity
+        || quantity > rules.maximum_limit_quantity
+        || notional < rules.instrument.minimum_notional.value
+        || notional > intent.quote_delta
+    {
+        return Err(AccountHostValidationError::Command);
+    }
+    let command = ExecutionCommand::PlaceLimit(OrderCommand {
+        time_in_force: priced.time_in_force,
+        command_id: intent.command_id.clone(),
+        client_order_id: intent.client_order_id.clone(),
+        owner: intent.owner.clone(),
+        side: intent.side,
+        position_side: intent.position_side,
+        quantity,
+        limit_price: priced.limit_price,
+        reduce_only: intent.reduce_only,
+    });
+    command
+        .validate()
+        .map_err(|_| AccountHostValidationError::Command)?;
+    Ok(command)
+}
+
 fn floor_to_step(
     value: rust_decimal::Decimal,
     step: rust_decimal::Decimal,
@@ -723,6 +778,19 @@ impl AccountPhysicalGateway for BybitAccountGateway {
             parse_rest_bbo(&scope.binding, raw).map_err(|_| AccountHostValidationError::Command)?;
         let now_ms = unix_ms().map_err(|_| AccountHostValidationError::Command)?;
         normalize_limit_from_bbo(&scope.binding, &scope.rules, intent, &bbo, now_ms)
+    }
+
+    fn normalize_priced_limit_intent(
+        &mut self,
+        intent: &AccountPricedLimitIntent,
+    ) -> Result<ExecutionCommand, AccountHostValidationError> {
+        self.refresh_rules_for(&intent.intent.owner.symbol)
+            .map_err(|_| AccountHostValidationError::Command)?;
+        let scope = self
+            .symbol_catalog
+            .get(&intent.intent.owner.symbol)
+            .ok_or(AccountHostValidationError::Scope)?;
+        normalize_priced_limit(&scope.binding, &scope.rules, intent)
     }
 
     fn dispatch(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
@@ -1231,6 +1299,7 @@ fn snapshot_orders(
                 Some(2) => PositionSide::Short,
                 _ => return Err(AccountHostValidationError::SignedSnapshot),
             };
+            let (quantity, filled_quantity) = signed_order_quantities(&row)?;
             Ok(SignedAccountOrderFact {
                 client_order_id: text(&row, "orderLinkId")?.to_owned(),
                 venue_order_id: Some(text(&row, "orderId")?.to_owned()),
@@ -1239,7 +1308,7 @@ fn snapshot_orders(
                 family,
                 side,
                 position_side,
-                quantity: decimal(row.get("leavesQty"))?,
+                quantity,
                 limit_price: optional_decimal(row.get("price"))?,
                 time_in_force: signed_limit_time_in_force(&row, family),
                 reduce_only: row
@@ -1249,10 +1318,46 @@ fn snapshot_orders(
                 owner: None,
                 external: true,
                 state: Some(bybit_order_state(text(&row, "orderStatus")?)?),
-                filled_quantity: Some(decimal(row.get("cumExecQty"))?),
+                filled_quantity: Some(filled_quantity),
+                created_at_ms: optional_order_created_at_ms(&row)?,
             })
         })
         .collect()
+}
+
+/// Bybit exposes both the original order size and the still-open size.  The canonical order
+/// fact must retain the original size for WAL ownership matching; risk evidence separately uses
+/// `leavesQty`, so a partial fill cannot be counted as a second full entry.
+fn signed_order_quantities(
+    row: &serde_json::Value,
+) -> Result<(rust_decimal::Decimal, rust_decimal::Decimal), AccountHostValidationError> {
+    let quantity = decimal(row.get("qty"))?;
+    let leaves = decimal(row.get("leavesQty"))?;
+    let filled = decimal(row.get("cumExecQty"))?;
+    if quantity < rust_decimal::Decimal::ZERO
+        || leaves < rust_decimal::Decimal::ZERO
+        || filled < rust_decimal::Decimal::ZERO
+        || leaves.checked_add(filled) != Some(quantity)
+    {
+        return Err(AccountHostValidationError::SignedSnapshot);
+    }
+    Ok((quantity, filled))
+}
+
+fn optional_order_created_at_ms(
+    row: &serde_json::Value,
+) -> Result<Option<u64>, AccountHostValidationError> {
+    match row.get("createdTime") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) if value.is_empty() => Ok(None),
+        Some(serde_json::Value::String(value)) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or(AccountHostValidationError::SignedSnapshot)
+            .map(Some),
+        Some(_) => Err(AccountHostValidationError::SignedSnapshot),
+    }
 }
 
 fn signed_limit_time_in_force(
@@ -1268,36 +1373,6 @@ fn signed_limit_time_in_force(
         Some("PostOnly") => Some(LimitTimeInForce::PostOnly),
         Some("GTC") => Some(LimitTimeInForce::Gtc),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod signed_limit_policy_tests {
-    use super::*;
-
-    #[test]
-    fn signed_snapshot_keeps_absent_or_unsupported_policy_unknown() {
-        assert_eq!(
-            signed_limit_time_in_force(
-                &serde_json::json!({"orderType":"Limit","timeInForce":"PostOnly"}),
-                NativeOrderFamily::UmOrder,
-            ),
-            Some(LimitTimeInForce::PostOnly)
-        );
-        assert_eq!(
-            signed_limit_time_in_force(
-                &serde_json::json!({"orderType":"Limit","timeInForce":"GTC"}),
-                NativeOrderFamily::UmOrder,
-            ),
-            Some(LimitTimeInForce::Gtc)
-        );
-        assert_eq!(
-            signed_limit_time_in_force(
-                &serde_json::json!({"orderType":"Limit"}),
-                NativeOrderFamily::UmOrder,
-            ),
-            None
-        );
     }
 }
 
@@ -1792,194 +1867,5 @@ pub enum BybitAccountGatewayError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use rust_decimal::Decimal;
-    use venue_domain::domain::{CommandId, OrderOwner, OrderPurpose, Position};
-    use venue_gateway_api::{GatewayMode, VenueId};
-
-    const INSTRUMENT: &str = include_str!("../fixtures/instruments-linear.json");
-    const BBO: &str = include_str!("../fixtures/orderbook-linear-bbo.json");
-    const EXECUTIONS: &[u8] = include_bytes!("../fixtures/execution-trade-page.json");
-
-    fn limit_facts() -> Result<
-        (
-            BybitGatewayBinding,
-            BybitLinearInstrumentRules,
-            crate::BybitRestBbo,
-        ),
-        Box<dyn std::error::Error>,
-    > {
-        let binding = BybitGatewayBinding::new(GatewayBinding::new(
-            VenueId::Bybit,
-            GatewayMode::Live,
-            "00000000-0000-4000-8000-000000000001",
-            "BTC/USDT".parse()?,
-        )?)?;
-        let rules = parse_linear_instrument(
-            &binding,
-            crate::BybitRawPublicPayload::new(
-                &binding,
-                crate::BybitPublicSource::LinearInstrument,
-                7,
-                10_000,
-                INSTRUMENT.to_owned(),
-            )?,
-        )?;
-        let bbo = parse_rest_bbo(
-            &binding,
-            crate::BybitRawPublicPayload::new(
-                &binding,
-                crate::BybitPublicSource::RestOrderBook,
-                7,
-                10_000,
-                BBO.to_owned(),
-            )?,
-        )?;
-        Ok((binding, rules, bbo))
-    }
-
-    fn limit_intent(
-        quote_delta: Decimal,
-    ) -> Result<AccountLimitNormalizationIntent, Box<dyn std::error::Error>> {
-        Ok(AccountLimitNormalizationIntent {
-            command_id: CommandId::new("bybit_limit")?,
-            client_order_id: CommandId::new("bybit_limit_client")?,
-            owner: OrderOwner {
-                strategy_instance_id: "grid1".to_owned(),
-                run_id: "run1".to_owned(),
-                exchange: "bybit".to_owned(),
-                account: "00000000-0000-4000-8000-000000000001".to_owned(),
-                symbol: "BTC/USDT".parse()?,
-                purpose: OrderPurpose::Entry,
-            },
-            side: OrderSide::Buy,
-            position_side: PositionSide::Long,
-            quote_delta,
-            reduce_only: false,
-        })
-    }
-
-    fn account_wide_execution(
-        binding: &BybitGatewayBinding,
-        page_index: u32,
-        request_cursor: Option<&str>,
-        payload: Vec<u8>,
-    ) -> crate::BybitRawPrivatePayload {
-        crate::BybitRawPrivatePayload {
-            parser_schema_version: crate::BYBIT_PRIVATE_PARSER_SCHEMA_VERSION,
-            binding: binding.gateway_binding().clone(),
-            source: BybitPrivateSource::AccountWideExecutions,
-            native_symbol: "BTCUSDT".to_owned(),
-            generation: 7,
-            attempt_id: 1,
-            page_index,
-            request_cursor: request_cursor.map(str::to_owned),
-            history_window: Some(BybitHistoryWindow {
-                start_ms: 1,
-                end_ms: 2_100,
-            }),
-            lookup: None,
-            request_path: "/v5/execution/list".to_owned(),
-            request_query: "category=linear".to_owned(),
-            request_timestamp_ms: 2_000,
-            received_at_ms: 3_000,
-            payload_sha256: "fixture".to_owned(),
-            payload,
-        }
-    }
-
-    #[test]
-    fn production_profile_is_bounded() {
-        assert_eq!(EXACT_READBACK_MAX_PAGES, 32);
-        assert_eq!(
-            HISTORY_WINDOW_MS,
-            std::time::Duration::from_secs(7 * 24 * 60 * 60).as_millis() as u64
-        );
-    }
-
-    fn reduce(quantity: Decimal) -> Result<MarketReduceCommand, Box<dyn std::error::Error>> {
-        Ok(MarketReduceCommand {
-            command_id: CommandId::new("bybit_reduce")?,
-            client_order_id: CommandId::new("bybit_reduce_client")?,
-            owner: OrderOwner {
-                strategy_instance_id: "grid1".to_owned(),
-                run_id: "run1".to_owned(),
-                exchange: "bybit".to_owned(),
-                account: "00000000-0000-4000-8000-000000000001".to_owned(),
-                symbol: "BTC/USDT".parse()?,
-                purpose: OrderPurpose::ExposureTakeProfit,
-            },
-            position_side: PositionSide::Long,
-            side: venue_domain::domain::OrderSide::Sell,
-            quantity,
-            risk_episode_id: CommandId::new("bybit_episode")?,
-            position_generation: 3,
-        })
-    }
-
-    fn recovery_limit_command(
-        time_in_force: LimitTimeInForce,
-    ) -> Result<ExecutionCommand, Box<dyn std::error::Error>> {
-        Ok(ExecutionCommand::PlaceLimit(OrderCommand {
-            command_id: CommandId::new("bybit_recovery_limit")?,
-            client_order_id: CommandId::new("bybit_recovery_client")?,
-            owner: OrderOwner {
-                strategy_instance_id: "grid1".to_owned(),
-                run_id: "run1".to_owned(),
-                exchange: "bybit".to_owned(),
-                account: "00000000-0000-4000-8000-000000000001".to_owned(),
-                symbol: "BTC/USDT".parse()?,
-                purpose: OrderPurpose::Entry,
-            },
-            side: OrderSide::Buy,
-            position_side: PositionSide::Long,
-            quantity: Decimal::ONE,
-            limit_price: Price::new(Decimal::new(60_000, 0))?,
-            time_in_force,
-            reduce_only: false,
-        }))
-    }
-
-    #[test]
-    fn recovery_limit_policy_mismatch_or_absence_stays_unknown()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let command = recovery_limit_command(LimitTimeInForce::PostOnly)?;
-        assert!(recovery_limit_time_in_force_matches(
-            &command,
-            Some(LimitTimeInForce::PostOnly)
-        ));
-        assert!(!recovery_limit_time_in_force_matches(
-            &command,
-            Some(LimitTimeInForce::Gtc)
-        ));
-        assert!(!recovery_limit_time_in_force_matches(&command, None));
-        Ok(())
-    }
-
-    #[test]
-    fn market_reduce_never_crosses_or_uses_a_wrong_signed_hedge_leg()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let position = Position {
-            symbol: "BTC/USDT".parse()?,
-            side: PositionSide::Long,
-            quantity: Decimal::ONE,
-            entry_price: None,
-            mark_price: None,
-        };
-        assert!(validate_market_reduce_against_position(&reduce(Decimal::ONE)?, &position).is_ok());
-        assert!(
-            validate_market_reduce_against_position(&reduce(Decimal::new(1001, 3))?, &position)
-                .is_err()
-        );
-        let mut wrong_leg = position;
-        wrong_leg.side = PositionSide::Short;
-        assert!(
-            validate_market_reduce_against_position(&reduce(Decimal::ONE)?, &wrong_leg).is_err()
-        );
-        Ok(())
-    }
-
-    #[path = "../../account_gateway_tests.rs"]
-    mod account_gateway_tests;
-}
+#[path = "account_gateway_tests.rs"]
+mod account_gateway_tests;

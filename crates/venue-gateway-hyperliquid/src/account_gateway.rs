@@ -21,10 +21,10 @@ use venue_domain::domain::{
 use venue_execution::{
     AccountDispatchPermit, AccountGatewayResult, AccountHostValidationError,
     AccountInstrumentIdentity, AccountLimitNormalizationIntent, AccountPhysicalGateway,
-    AccountRecoveryOutcome, AccountRecoveryReport, AccountRecoveryRequest, AccountRecoveryState,
-    AccountRiskAmount, AccountRiskEvidence, SignedAccountBalance, SignedAccountOrderFact,
-    SignedAccountPositionFact, SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact,
-    SignedUnknownResult,
+    AccountPricedLimitIntent, AccountRecoveryOutcome, AccountRecoveryReport,
+    AccountRecoveryRequest, AccountRecoveryState, AccountRiskAmount, AccountRiskEvidence,
+    SignedAccountBalance, SignedAccountOrderFact, SignedAccountPositionFact,
+    SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
 };
 use venue_gateway_api::GatewayBinding;
 
@@ -577,6 +577,14 @@ impl AccountPhysicalGateway for HyperliquidAccountGateway {
         self.binding.gateway().gateway_binding()
     }
 
+    fn signed_client_order_id_matches(
+        &self,
+        canonical: &venue_domain::CommandId,
+        signed: &str,
+    ) -> bool {
+        command_cloid(canonical.as_str()) == signed
+    }
+
     fn current_instrument(
         &mut self,
     ) -> Result<AccountInstrumentIdentity, AccountHostValidationError> {
@@ -703,6 +711,15 @@ impl AccountPhysicalGateway for HyperliquidAccountGateway {
             &bbo,
             unix_ms().map_err(|_| AccountHostValidationError::Command)?,
         )
+    }
+
+    fn normalize_priced_limit_intent(
+        &mut self,
+        intent: &AccountPricedLimitIntent,
+    ) -> Result<ExecutionCommand, AccountHostValidationError> {
+        self.refresh_meta()
+            .map_err(|_| AccountHostValidationError::Command)?;
+        normalize_priced_limit(intent, &self.meta)
     }
 
     fn dispatch(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
@@ -989,6 +1006,8 @@ fn signed_order_facts(
             reduce_only: order.reduce_only,
             owner: None,
             external: true,
+            // `timestamp` is the native order creation time in the frontend-open-orders schema.
+            created_at_ms: Some(item.exchange_time_ms),
         });
     }
     Ok(facts)
@@ -1039,6 +1058,7 @@ fn signed_twap_order_facts(
             reduce_only: parent.reduce_only,
             owner: None,
             external: true,
+            created_at_ms: None,
         });
     }
     Ok(facts)
@@ -1117,6 +1137,64 @@ fn normalize_limit_from_bbo(
         quantity,
         limit_price: Price::new(limit_price.value())
             .map_err(|_| AccountHostValidationError::Command)?,
+        reduce_only: intent.reduce_only,
+    }))
+}
+
+fn normalize_priced_limit(
+    priced: &AccountPricedLimitIntent,
+    meta: &HyperliquidPerpMeta,
+) -> Result<ExecutionCommand, AccountHostValidationError> {
+    let intent = &priced.intent;
+    validate_limit_intent_scope(intent, meta.scope.binding().gateway().gateway_binding())?;
+    priced.validate()?;
+    let quantity_step = Decimal::new(1, meta.size_decimals);
+    let quantity = priced
+        .quantity_cap()?
+        .checked_div(quantity_step)
+        .map(|value| value.floor())
+        .and_then(|units| units.checked_mul(quantity_step))
+        .filter(|value| *value >= quantity_step)
+        .ok_or(AccountHostValidationError::Command)?;
+    let notional = quantity
+        .checked_mul(priced.limit_price.value())
+        .ok_or(AccountHostValidationError::Notional)?;
+    if notional > intent.quote_delta {
+        return Err(AccountHostValidationError::Command);
+    }
+    match priced.time_in_force {
+        LimitTimeInForce::PostOnly => {
+            HyperliquidAloOrder::new(
+                meta,
+                intent.side,
+                priced.limit_price.value(),
+                quantity,
+                intent.reduce_only,
+                command_cloid(intent.client_order_id.as_str()),
+            )
+            .map_err(|_| AccountHostValidationError::Command)?;
+        }
+        LimitTimeInForce::Gtc => {
+            HyperliquidGtcOrder::new(
+                meta,
+                intent.side,
+                priced.limit_price.value(),
+                quantity,
+                intent.reduce_only,
+                command_cloid(intent.client_order_id.as_str()),
+            )
+            .map_err(|_| AccountHostValidationError::Command)?;
+        }
+    }
+    Ok(ExecutionCommand::PlaceLimit(OrderCommand {
+        time_in_force: priced.time_in_force,
+        command_id: intent.command_id.clone(),
+        client_order_id: intent.client_order_id.clone(),
+        owner: intent.owner.clone(),
+        side: intent.side,
+        position_side: intent.position_side,
+        quantity,
+        limit_price: priced.limit_price,
         reduce_only: intent.reduce_only,
     }))
 }
@@ -1415,6 +1493,7 @@ mod tests {
     const BOOK: &[u8] = include_bytes!("../fixtures/l2-book.json");
     const IOC_CONTRACT: &str = include_str!("../fixtures/market-reduce-ioc-contract.json");
     const LIMIT_CONTRACT: &str = include_str!("../fixtures/limit-normalization-contract.json");
+    const FRONTEND_ORDERS: &[u8] = include_bytes!("../fixtures/frontend-open-orders-family.json");
     const TWAP_SLICE_FILLS: &str = include_str!("../fixtures/twap-slice-fills.json");
 
     fn market_facts() -> Result<(HyperliquidPerpMeta, HyperliquidBbo), Box<dyn std::error::Error>> {
@@ -1648,6 +1727,44 @@ mod tests {
     }
 
     #[test]
+    fn priced_limit_keeps_user_price_policy_and_cap() -> Result<(), Box<dyn std::error::Error>> {
+        let (meta, bbo) = market_facts()?;
+        let priced = AccountPricedLimitIntent {
+            intent: limit_intent(OrderSide::Buy, PositionSide::Long, false, Decimal::from(10))?,
+            limit_price: bbo.bid.price,
+            time_in_force: LimitTimeInForce::Gtc,
+            maximum_quantity: Some(Decimal::new(1, 1)),
+        };
+        let command = normalize_priced_limit(&priced, &meta)?;
+        let ExecutionCommand::PlaceLimit(order) = command else {
+            return Err("not limit".into());
+        };
+        assert_eq!(order.limit_price, priced.limit_price);
+        assert_eq!(order.time_in_force, LimitTimeInForce::Gtc);
+        assert!(order.quantity <= Decimal::new(1, 1));
+
+        let mut noncanonical = priced;
+        noncanonical.limit_price = Price::new(Decimal::new(650_001_2, 2))?;
+        assert!(normalize_priced_limit(&noncanonical, &meta).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn signed_order_fact_uses_native_frontend_creation_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (meta, _) = market_facts()?;
+        let orders =
+            parse_frontend_open_orders_snapshot(FRONTEND_ORDERS, &meta, 1_700_000_000_010)?;
+        let facts = signed_order_facts(&orders.orders)?;
+        assert_eq!(facts.len(), orders.orders.len());
+        assert_eq!(
+            facts[0].created_at_ms,
+            Some(orders.orders[0].exchange_time_ms)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn limit_normalizer_uses_fresh_bbo_floors_size_and_preserves_identity()
     -> Result<(), Box<dyn std::error::Error>> {
         let (meta, bbo) = market_facts()?;
@@ -1867,6 +1984,7 @@ mod tests {
         assert_eq!(facts[0].family, NativeOrderFamily::UmAlgo);
         assert_eq!(facts[0].quantity, Decimal::new(15, 1));
         assert_eq!(facts[0].limit_price, None);
+        assert_eq!(facts[0].created_at_ms, None);
         assert!(facts[0].external);
         Ok(())
     }

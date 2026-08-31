@@ -45,6 +45,8 @@ mod private_ingress_runtime;
 pub use private_ingress_runtime::{PersistedPrivateDispatchReceipt, PrivateRoutePlan};
 #[path = "production_bootstrap.rs"]
 mod production_bootstrap;
+#[path = "resident_manual_ack.rs"]
+mod resident_manual_ack;
 
 #[derive(Debug)]
 pub struct AccountRuntime {

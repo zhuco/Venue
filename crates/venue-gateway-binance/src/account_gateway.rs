@@ -15,17 +15,20 @@ use venue_domain::domain::{
 use venue_execution::{
     AccountDispatchPermit, AccountGatewayResult, AccountHostValidationError,
     AccountInstrumentIdentity, AccountLimitNormalizationIntent, AccountPhysicalGateway,
-    AccountQuoteToUsdtRate, AccountRecoveryOutcome, AccountRecoveryReport, AccountRecoveryRequest,
-    AccountRiskAmount, AccountRiskEvidence, SignedAccountBalance, SignedAccountOrderFact,
-    SignedAccountPositionFact, SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact,
-    SignedUnknownResult,
+    AccountPricedLimitIntent, AccountQuoteToUsdtRate, AccountRecoveryOutcome,
+    AccountRecoveryReport, AccountRecoveryRequest, AccountRiskAmount, AccountRiskEvidence,
+    SignedAccountBalance, SignedAccountOrderFact, SignedAccountPositionFact,
+    SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
 };
 use venue_gateway_api::{GatewayBinding, PublicMarketBinding};
 
 use crate::private::{RecentFillsCursor, USER_TRADES_PAGE_LIMIT};
 #[path = "account_gateway_limit.rs"]
 mod account_gateway_limit;
-use account_gateway_limit::{normalize_fresh_limit, readback_policy_matches_command};
+use account_gateway_limit::{
+    normalize_fresh_limit, readback_policy_matches_command, snapshot_created_at_ms,
+    snapshot_regular_order_quantities,
+};
 #[path = "account_gateway_symbol_dispatch.rs"]
 mod account_gateway_symbol_dispatch;
 use crate::{
@@ -595,6 +598,13 @@ impl AccountPhysicalGateway for BinanceAccountGateway {
         )
     }
 
+    fn normalize_priced_limit_intent(
+        &mut self,
+        intent: &AccountPricedLimitIntent,
+    ) -> Result<ExecutionCommand, AccountHostValidationError> {
+        account_gateway_limit::normalize_priced_limit_intent(self, intent)
+    }
+
     fn dispatch(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
         self.dispatch_permit(permit)
     }
@@ -1093,11 +1103,9 @@ fn snapshot_order_facts(
     for row in regular_rows {
         let native = snapshot_text(row, "symbol")?;
         let rules = snapshot_rules(catalogue, native, generation)?;
-        let quantity = snapshot_decimal(row, "origQty")?
-            .checked_sub(snapshot_decimal(row, "executedQty")?)
-            .ok_or(AccountHostValidationError::SignedSnapshot)?;
+        let (quantity, filled_quantity) = snapshot_regular_order_quantities(row)?;
         let client_order_id = snapshot_text(row, "clientOrderId")?.to_owned();
-        if quantity <= Decimal::ZERO || !client_ids.insert(client_order_id.clone()) {
+        if !client_ids.insert(client_order_id.clone()) {
             return Err(AccountHostValidationError::SignedSnapshot);
         }
         facts.push(SignedAccountOrderFact {
@@ -1110,11 +1118,12 @@ fn snapshot_order_facts(
             quantity,
             limit_price: snapshot_optional_positive_decimal(row, "price")?,
             time_in_force: snapshot_limit_time_in_force(row, "timeInForce")?,
+            created_at_ms: snapshot_created_at_ms(row, "time")?,
             reduce_only: snapshot_bool(row, "reduceOnly")?,
             owner: None,
             external: true,
             state: Some(snapshot_order_state(snapshot_text(row, "status")?)?),
-            filled_quantity: Some(snapshot_decimal(row, "executedQty")?),
+            filled_quantity: Some(filled_quantity),
         });
     }
     for row in algo_rows {
@@ -1140,6 +1149,7 @@ fn snapshot_order_facts(
             quantity,
             limit_price: snapshot_optional_positive_decimal(row, "triggerPrice")?,
             time_in_force: None,
+            created_at_ms: snapshot_created_at_ms(row, "time")?,
             reduce_only: snapshot_bool(row, "reduceOnly")?,
             owner: None,
             external: true,

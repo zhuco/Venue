@@ -149,6 +149,8 @@ fn replay_gate(
         instrument: request.instrument.clone(),
         quanto_multiplier: quantity_step,
         minimum_contracts: request.minimum_quantity / quantity_step,
+        // Historical risk evidence does not prove a current per-order ceiling.
+        maximum_contracts: None,
         // This field controls order conversion only and is not consulted by the risk parser.
         decimal_contracts: true,
     };

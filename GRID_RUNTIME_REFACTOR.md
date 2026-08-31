@@ -168,6 +168,8 @@ Exchange Account Process
 - 命令只有在账户进程锁仍持有、风险/生命周期仍允许且 `Prepared` 已 fsync 后才能发送；发送前校验失败写 `Rejected`，发送后结果不确定写 `Unknown`。不增加一次性 permit 或不可伪造 receipt 层。
 - outcome 与 Unknown 回读直接按同一本 WAL 的 command、Client Order ID、family 和交易所订单 ID 核对；Transient 或 Unknown 只触发冻结与对账，不自动重试旧命令。
 - 限价政策是命令身份的一部分：`LimitTimeInForce::PostOnly/Gtc` 必须随 wire、签名事实、Unknown 回读、Owner 和 Desired Orders 精确比较。历史命令缺字段只按原 PostOnly 契约恢复且保持 WAL 字节；签名事实缺字段保持未知，不能默认只挂单。Grid 与 BBO 自动归一化仍为 PostOnly，手动 Gtc 不得改变策略防吃单边界。
+- 手动选价归一化必须保持原始价格、政策、Owner 和方向；数量只能按报价预算、签名平仓上限及实时 native lot 向下裁剪。适配器不得改用 BBO，归一化不写 WAL 或发送请求，物理准入仍经同一账户链。订单创建时间缺失保持未知，不能用更新或接收时间推导“最近挂单”。
+- 签名订单的 quantity 表示原始委托量，filled_quantity 单独保留；风险估值仍使用剩余未成交量。归属校验必须同时匹配 adapter 的精确 client ID 编码、native ID 和完整命令语义，不能仅凭交易所订单 ID 认领。Unknown 可恢复归属，但不得因此改成 Accepted 或自动重投。
 
 账户执行调度器负责优先级、实例公平性和单 in-flight；请求离开调度器后只经过风险复核、同一 WAL 和账户进程锁。不同 symbol 或策略共用同一账户 writer。版本迁移时先 Stop 旧进程、确认锁已释放并对账未决命令，再启动新版本；当前阶段不要求内容寻址 executable、跨主机 handoff receipt 或多代 lease 协议。
 
@@ -466,7 +468,7 @@ Actor Applied 早于其后物理命令的 WAL 是正常顺序。重启安装 Act
 `apps/venue-control` 提供幂等命令和本地 HTTP/SSE `/v2`。Control 只提交语义命令及 `instance/config epoch`，Node 接收后写入自身命令 WAL；Control 的数据库状态、delivery ACK 或 receipt 都不授予交易权限。当前阶段只需“命令已接收/已拒绝/已完成”三类终态，不建立第二套 Actor-applied root、跨层 durability receipt 或 delivery lease 证明链。重复命令按稳定 command ID 幂等处理，冲突输入拒绝。
 
 VenueFlow 的 Trade Dock 同样只提交语义 `TradeIntent`：按钮和热键必须先统一为 `TradingAction`；开平仓固定 LIMIT/GTC 并要求选价，平多/平空显式 reduce-only，UI 的 `min(quote preset / price, projected position)` 只作为数量上限，账户 Node 必须再按更新的签名仓位与 adapter 实时规则向下裁剪。撤当前未带显式订单 ID 时只能在同一 `(account, symbol)` 选择最近 Working order，撤全部也只能作用于该 scope。Control 接收不等于物理执行；生产 Actor durable-applied authority、风险、同一 WAL 和账户唯一 writer 全部满足前不得产生 mutation。
-手动交易语义协议与桌面交互继续保留；统一 Node 尚未实现该意图的物理转换时返回明确 Rejected，不把 Trade 当作 Resume 或 Applied，也不得恢复旧 writer 旁路。
+统一 Node 的 `production_resident/manual.rs` 已接入非 Copy Actor 的显式限价及自有手动挂单撤单；稳定 request ID、原始计划和数量上限存于同一 Actor replay 的可选 manual 字段，后续策略 checkpoint 必须保留该字段。恢复验证原绑定和配置，Reconcile 只读原 WAL 与签名事实，不重投；只有精确挂单或完整成交与仓位变化得到签名证明才返回完成。Copy 绑定及会影响 Grid desired 的撤单继续明确 Rejected，不能把部分 scope 撤单称为撤全部。此桥接不代表自动策略协同、生产接管或所有账户能力已验收，也不得恢复旧 writer 旁路。
 
 响应式 `apps/venue-web` 通过同源 BFF 访问相同 Control 契约；浏览器不直连 loopback Control，不读取数据库、WAL、artifacts 或
 交易所 secret。`G:\kol\apps\web` 只提供响应式布局、恢复失败关闭和交互测试参考，全部数据 DTO 和命令按 schema v2 重写。

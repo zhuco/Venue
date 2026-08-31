@@ -133,7 +133,7 @@ pub fn prepare_limit(
         rules.instrument.price_tick.value(),
     )?;
     let contracts = rules
-        .native_contracts_checked(command.quantity)
+        .native_order_contracts_checked(command.quantity)
         .map_err(|_| GateExecutionError::Rules)?;
     let signed_contracts = signed_contracts(contracts, command.side);
     let notional = command
@@ -185,7 +185,7 @@ pub fn prepare_reduce_once(
         &command.owner.symbol,
     )?;
     let contracts = rules
-        .native_contracts_checked(command.quantity)
+        .native_order_contracts_checked(command.quantity)
         .map_err(|_| GateExecutionError::Rules)?;
     let client_order_id = command.client_order_id.as_str().to_owned();
     let body = PlaceBody {
@@ -459,6 +459,8 @@ pub fn prepare_exact_readback_by_client_id(
         GateMutationKind::PlacePostOnly,
         ExpectedOrder {
             order_id: None,
+            // The endpoint proves Gate's exact `t-{canonical}` wire identity; parsed orders
+            // expose their canonical client id, which must still match the WAL command.
             client_order_id: client_order_id.to_owned(),
             side: None,
             position_side: None,
@@ -673,7 +675,7 @@ fn signed_contracts(contracts: Decimal, side: OrderSide) -> Decimal {
     }
 }
 
-fn native_client_id(client_order_id: &str) -> Result<String, GateExecutionError> {
+pub(crate) fn native_client_id(client_order_id: &str) -> Result<String, GateExecutionError> {
     if !(1..=MAX_CLIENT_ORDER_SUFFIX_BYTES).contains(&client_order_id.len())
         || !client_order_id
             .bytes()
@@ -682,6 +684,16 @@ fn native_client_id(client_order_id: &str) -> Result<String, GateExecutionError>
         return Err(GateExecutionError::ClientOrderId);
     }
     Ok(format!("t-{client_order_id}"))
+}
+
+/// Returns a canonical WAL client id only for the exact native form emitted by this adapter.
+/// Other `text` values remain external identities; a prefix alone never proves ownership.
+pub(crate) fn canonical_client_id_from_native(native: &str) -> Option<String> {
+    let canonical = native.strip_prefix("t-")?;
+    native_client_id(canonical)
+        .ok()
+        .filter(|encoded| encoded == native)
+        .map(|_| canonical.to_owned())
 }
 
 fn valid_native_order_id(value: &str) -> bool {
@@ -764,6 +776,7 @@ mod tests {
             },
             quanto_multiplier: Decimal::new(1, 1),
             minimum_contracts: Decimal::ONE,
+            maximum_contracts: Some(Decimal::from(1000)),
             decimal_contracts: false,
         };
         Ok((binding, rules))
@@ -810,6 +823,32 @@ mod tests {
             std::str::from_utf8(request.body())?,
             r#"{"contract":"DOGE_USDT","size":"10","price":"0.1","tif":"poc","reduce_only":false,"text":"t-grid_long_1"}"#
         );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_lookup_binds_canonical_id_to_exact_native_text()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (binding, rules) = facts()?;
+        let request = prepare_exact_readback_by_client_id(&binding, &rules, "grid_long_1")?;
+        assert_eq!(request.endpoint, "/futures/usdt/orders/t-grid_long_1");
+        let readback = GateExactOrderReadback::from_response(
+            &binding,
+            &rules,
+            &request,
+            1_000,
+            1_001,
+            ack_payload("open", ""),
+        )?;
+        assert_eq!(
+            readback.order.client_order_id,
+            FieldState::Known("grid_long_1".to_owned())
+        );
+        assert_eq!(
+            canonical_client_id_from_native("t-grid_long_1"),
+            Some("grid_long_1".to_owned())
+        );
+        assert_eq!(canonical_client_id_from_native("t-bad space"), None);
         Ok(())
     }
 

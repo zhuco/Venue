@@ -14,9 +14,10 @@ use venue_domain::domain::{
 use venue_execution::{
     AccountDispatchPermit, AccountGatewayResult, AccountHostValidationError,
     AccountInstrumentIdentity, AccountLimitNormalizationIntent, AccountPhysicalGateway,
-    AccountRecoveryOutcome, AccountRecoveryReport, AccountRecoveryRequest, AccountRiskEvidence,
-    SignedAccountBalance, SignedAccountOrderFact, SignedAccountPositionFact,
-    SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
+    AccountPricedLimitIntent, AccountRecoveryOutcome, AccountRecoveryReport,
+    AccountRecoveryRequest, AccountRiskEvidence, SignedAccountBalance, SignedAccountOrderFact,
+    SignedAccountPositionFact, SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact,
+    SignedUnknownResult,
 };
 use venue_gateway_api::GatewayBinding;
 
@@ -400,6 +401,25 @@ impl AccountPhysicalGateway for BitgetAccountGateway {
         Ok(normalized)
     }
 
+    fn normalize_priced_limit_intent(
+        &mut self,
+        intent: &AccountPricedLimitIntent,
+    ) -> Result<ExecutionCommand, AccountHostValidationError> {
+        intent.validate()?;
+        if intent.intent.owner.exchange != self.transport_binding().venue.as_str()
+            || intent.intent.owner.account != self.transport_binding().trading_account_id
+            || !self.rules_catalog.contains_key(&intent.intent.owner.symbol)
+        {
+            return Err(AccountHostValidationError::Scope);
+        }
+        self.refresh_rules_for_symbols(std::iter::empty())
+            .map_err(|_| AccountHostValidationError::Command)?;
+        let rules = self
+            .registered_rules(&intent.intent.owner.symbol)
+            .map_err(|_| AccountHostValidationError::Scope)?;
+        normalize_priced_limit(intent, &rules)
+    }
+
     fn dispatch(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
         self.dispatch_permit(permit)
     }
@@ -461,6 +481,54 @@ fn normalize_limit_from_ticker(
         limit_price: price,
         reduce_only: intent.reduce_only,
     }))
+}
+
+fn normalize_priced_limit(
+    intent: &AccountPricedLimitIntent,
+    rules: &BitgetInstrumentRules,
+) -> Result<ExecutionCommand, AccountHostValidationError> {
+    intent.validate()?;
+    let base = &intent.intent;
+    let metadata = &rules.snapshot.metadata;
+    if base.owner.symbol != *rules.canonical_symbol()
+        || base.position_side == PositionSide::Net
+        || !valid_hedge_limit_direction(base.position_side, base.side, base.reduce_only)
+        || !metadata
+            .price
+            .accepts(intent.limit_price.value())
+            .map_err(|_| AccountHostValidationError::Command)?
+    {
+        return Err(AccountHostValidationError::Command);
+    }
+    let cap = intent.quantity_cap()?;
+    let cap = rules
+        .maximum_order_quantity
+        .map_or(cap, |maximum| cap.min(maximum));
+    let quantity = metadata
+        .quantity
+        .floor(cap)
+        .map_err(|_| AccountHostValidationError::Command)?;
+    let notional = metadata
+        .quote_notional(quantity, Some(intent.limit_price))
+        .map_err(|_| AccountHostValidationError::Command)?;
+    if notional.value > base.quote_delta {
+        return Err(AccountHostValidationError::Command);
+    }
+    let command = OrderCommand {
+        time_in_force: intent.time_in_force,
+        command_id: base.command_id.clone(),
+        client_order_id: base.client_order_id.clone(),
+        owner: base.owner.clone(),
+        side: base.side,
+        position_side: base.position_side,
+        quantity,
+        limit_price: intent.limit_price,
+        reduce_only: base.reduce_only,
+    };
+    command
+        .validate()
+        .map_err(|_| AccountHostValidationError::Command)?;
+    Ok(ExecutionCommand::PlaceLimit(command))
 }
 
 const fn valid_hedge_limit_direction(
@@ -870,10 +938,14 @@ fn snapshot_order_facts(
                 Some("short") => PositionSide::Short,
                 _ => return Err(AccountHostValidationError::SignedSnapshot),
             };
-            let qty = snapshot_decimal(item.get("qty"))?
-                .checked_sub(snapshot_decimal(item.get("cumExecQty"))?)
-                .filter(|v| *v > Decimal::ZERO)
+            let quantity = snapshot_decimal(item.get("qty"))?;
+            let filled_quantity = snapshot_decimal(item.get("cumExecQty"))?;
+            let remaining_quantity = quantity
+                .checked_sub(filled_quantity)
                 .ok_or(AccountHostValidationError::SignedSnapshot)?;
+            if quantity <= Decimal::ZERO || remaining_quantity <= Decimal::ZERO {
+                return Err(AccountHostValidationError::SignedSnapshot);
+            }
             Ok(SignedAccountOrderFact {
                 client_order_id: item
                     .get("clientOid")
@@ -892,7 +964,7 @@ fn snapshot_order_facts(
                 family: NativeOrderFamily::UmOrder,
                 side,
                 position_side,
-                quantity: qty,
+                quantity,
                 limit_price: match snapshot_decimal(item.get("price"))? {
                     v if v > Decimal::ZERO => Some(v),
                     v if v.is_zero() => None,
@@ -910,6 +982,9 @@ fn snapshot_order_facts(
                     None | Some(Value::Null) => None,
                     Some(_) => return Err(AccountHostValidationError::SignedSnapshot),
                 },
+                created_at_ms: snapshot_order_created_at_ms(
+                    item.get("cTime").or_else(|| item.get("createdTime")),
+                )?,
                 reduce_only: bitget_reduce_only(item)
                     .map_err(|_| AccountHostValidationError::SignedSnapshot)?,
                 owner: None,
@@ -917,7 +992,7 @@ fn snapshot_order_facts(
                 state: Some(snapshot_order_state(
                     item.get("orderStatus").or_else(|| item.get("status")),
                 )?),
-                filled_quantity: Some(snapshot_decimal(item.get("cumExecQty"))?),
+                filled_quantity: Some(filled_quantity),
             })
         })
         .collect()
@@ -933,6 +1008,23 @@ fn snapshot_order_state(value: Option<&Value>) -> Result<OrderState, AccountHost
         Some("expired") => Ok(OrderState::Expired),
         _ => Err(AccountHostValidationError::SignedSnapshot),
     }
+}
+
+fn snapshot_order_created_at_ms(
+    value: Option<&Value>,
+) -> Result<Option<u64>, AccountHostValidationError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let value = match value {
+        Value::String(value) => value.parse::<u64>().ok(),
+        Value::Number(value) => value.as_u64(),
+        _ => return Err(AccountHostValidationError::SignedSnapshot),
+    };
+    value
+        .filter(|value| *value > 0)
+        .map(Some)
+        .ok_or(AccountHostValidationError::SignedSnapshot)
 }
 fn snapshot_fill(row: &Value) -> Result<Fill, AccountHostValidationError> {
     let item = row
@@ -1477,6 +1569,33 @@ mod tests {
     }
 
     #[test]
+    fn priced_limit_uses_explicit_gtc_price_and_quantity_cap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let priced = AccountPricedLimitIntent {
+            intent: intent(Decimal::from(10), OrderSide::Buy, PositionSide::Long, false)?,
+            limit_price: Price::new(Decimal::from(100_000))?,
+            time_in_force: LimitTimeInForce::Gtc,
+            maximum_quantity: Some(Decimal::new(15, 5)),
+        };
+        let ExecutionCommand::PlaceLimit(command) = normalize_priced_limit(&priced, &rules()?)?
+        else {
+            return Err("expected limit".into());
+        };
+        assert_eq!(command.limit_price, priced.limit_price);
+        assert_eq!(command.time_in_force, LimitTimeInForce::Gtc);
+        assert_eq!(command.quantity, Decimal::new(1, 4));
+        assert!(command.quantity * command.limit_price.value() <= priced.intent.quote_delta);
+
+        let mut unaligned = priced.clone();
+        unaligned.limit_price = Price::new(Decimal::new(1_000_000_005, 4))?;
+        assert_eq!(
+            normalize_priced_limit(&unaligned, &rules()?),
+            Err(AccountHostValidationError::Command)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn normalizer_rejects_wrong_symbol_stale_empty_crossed_and_unaligned_tickers()
     -> Result<(), Box<dyn std::error::Error>> {
         let intent = intent(Decimal::from(10), OrderSide::Buy, PositionSide::Long, false)?;
@@ -1572,6 +1691,23 @@ mod tests {
             entry_order_notionals(&rows)?,
             vec![Decimal::from(15_000), Decimal::from(4_000)]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn signed_snapshot_partial_regular_order_keeps_original_quantity_and_filled_amount()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rows = vec![json!({
+            "category":"USDT-FUTURES", "marginCoin":"USDT", "symbol":"BTCUSDT",
+            "delegateType":"normal", "posSide":"long", "side":"buy",
+            "reduceOnly":"NO", "qty":"0.2", "cumExecQty":"0.05", "price":"100000",
+            "clientOid":"partial-regular-1", "orderId":"501", "orderStatus":"partially_filled"
+        })];
+        let facts = snapshot_order_facts(&rows)?;
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].quantity, Decimal::new(2, 1));
+        assert_eq!(facts[0].filled_quantity, Some(Decimal::new(5, 2)));
+        assert_eq!(facts[0].state, Some(OrderState::PartiallyFilled));
         Ok(())
     }
 
@@ -1685,6 +1821,31 @@ mod tests {
             None
         );
         assert!(snapshot_order_facts(&[row(Some("unexpected"))]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn signed_snapshot_uses_ctime_not_last_update_time() -> Result<(), Box<dyn std::error::Error>> {
+        let row = json!({
+            "category":"USDT-FUTURES", "marginCoin":"USDT", "symbol":"BTCUSDT",
+            "delegateType":"normal", "posSide":"long", "side":"buy",
+            "reduceOnly":"NO", "qty":"0.1", "cumExecQty":"0", "price":"100000",
+            "clientOid":"venue-1", "orderId":"1", "orderStatus":"live",
+            "cTime":"1700000000123", "uTime":"1700000999999"
+        });
+        assert_eq!(
+            snapshot_order_facts(&[row])?[0].created_at_ms,
+            Some(1_700_000_000_123)
+        );
+
+        let no_creation = json!({
+            "category":"USDT-FUTURES", "marginCoin":"USDT", "symbol":"BTCUSDT",
+            "delegateType":"normal", "posSide":"long", "side":"buy",
+            "reduceOnly":"NO", "qty":"0.1", "cumExecQty":"0", "price":"100000",
+            "clientOid":"venue-2", "orderId":"2", "orderStatus":"live",
+            "uTime":"1700000999999"
+        });
+        assert_eq!(snapshot_order_facts(&[no_creation])?[0].created_at_ms, None);
         Ok(())
     }
 }

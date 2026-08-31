@@ -990,6 +990,8 @@ pub fn parse_contract_rules(
         instrument,
         quanto_multiplier,
         minimum_contracts,
+        // The frozen compatibility path cannot authorize new unified-chain orders.
+        maximum_contracts: None,
         decimal_contracts: bool_field(object, "enable_decimal")?,
     })
 }

@@ -23,6 +23,7 @@ fn gate_rule_recheck_requires_every_startup_execution_field()
         instrument: instrument()?,
         quanto_multiplier: Decimal::new(10, 0),
         minimum_contracts: Decimal::ONE,
+        maximum_contracts: None,
         decimal_contracts: false,
     };
     assert!(verify_gate_instrument_rules(&startup, &startup).is_ok());

@@ -19,6 +19,7 @@ use crate::{NodeError, NodeLaunch};
 mod copy;
 #[cfg_attr(not(feature = "binance"), allow(dead_code))]
 pub(crate) mod grid;
+pub(crate) mod manual;
 pub(crate) mod scalping;
 pub use copy::{ResidentCopyReconciliation, ResidentCopyResult};
 pub(crate) mod control;
@@ -702,6 +703,7 @@ impl ProductionResident<venue_gateway_binance::BinanceAccountGateway> {
         };
         let event_id = EventId::new(format!("binance-fill-{}", event.fill.fill_id))
             .map_err(|_| NodeError::ResidentRuntime)?;
+        let manual_fill = event.fill.clone();
         let report = self
             .runtime
             .ingest_private(
@@ -725,6 +727,23 @@ impl ProductionResident<venue_gateway_binance::BinanceAccountGateway> {
                     .get(&delivery.target)
                     .cloned()
                     .ok_or(NodeError::ResidentRuntime)?;
+                if self.manual_owns_fill(&binding, &manual_fill)? {
+                    let turn = self
+                        .runtime
+                        .begin_private_strategy_turn(&binding)
+                        .map_err(resident_error)?
+                        .ok_or(NodeError::ResidentRuntime)?;
+                    if !matches!(turn.input(), StrategyInput::Private(_)) {
+                        return Err(NodeError::ResidentRuntime);
+                    }
+                    let replay = self.manual_checkpoint_bytes(&binding)?;
+                    let applied = self
+                        .runtime
+                        .persist_manual_private_strategy_turn(&binding, replay)
+                        .map_err(resident_error)?;
+                    persist_anchor(&self.artifacts_root, &binding, &applied)?;
+                    continue;
+                }
                 let turn = self
                     .runtime
                     .begin_private_strategy_turn(&binding)

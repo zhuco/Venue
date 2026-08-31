@@ -105,6 +105,7 @@ impl AccountPhysicalGateway for Gateway {
             })
             .transpose()?;
         let order = SignedAccountOrderFact {
+            created_at_ms: None,
             time_in_force: Some(Default::default()),
             client_order_id: "client-e2e".to_owned(),
             venue_order_id: Some("venue-e2e".to_owned()),
@@ -1098,6 +1099,7 @@ fn projection_keeps_owned_orders_when_status_or_cumulative_fill_is_unknown()
         1,
         SignedAccountPositionMode::Net,
         vec![SignedAccountOrderFact {
+            created_at_ms: None,
             time_in_force: Some(Default::default()),
             client_order_id: "copy-open".to_owned(),
             venue_order_id: Some("native-open".to_owned()),

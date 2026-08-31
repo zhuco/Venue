@@ -42,6 +42,7 @@ fn snapshot(
     )?;
     let orders = if open {
         vec![SignedAccountOrderFact {
+            created_at_ms: None,
             time_in_force: Some(row.time_in_force),
             client_order_id: row.client_order_id.as_str().to_owned(),
             venue_order_id: Some("actual-native-1".to_owned()),

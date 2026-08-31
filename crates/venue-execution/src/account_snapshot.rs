@@ -25,10 +25,14 @@ pub struct SignedAccountOrderFact {
     pub family: NativeOrderFamily,
     pub side: OrderSide,
     pub position_side: PositionSide,
+    /// Original order quantity, not leaves quantity. Risk reservations separately use remaining.
     pub quantity: Decimal,
     pub limit_price: Option<Decimal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_in_force: Option<venue_domain::LimitTimeInForce>,
+    /// Native creation time, never a local receive time or last-fill/update time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_ms: Option<u64>,
     pub reduce_only: bool,
     pub owner: Option<OrderOwner>,
     pub external: bool,
@@ -164,6 +168,7 @@ impl SignedAccountSnapshot {
             || fills_cursor.trim().is_empty()
             || open_orders.iter().any(|fact| {
                 fact.client_order_id.trim().is_empty()
+                    || fact.created_at_ms == Some(0)
                     || fact
                         .venue_order_id
                         .as_deref()

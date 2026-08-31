@@ -219,6 +219,7 @@ fn signed_order_cannot_confirm_a_different_or_missing_limit_policy()
     };
     place.time_in_force = LimitTimeInForce::Gtc;
     let mut fact = SignedAccountOrderFact {
+        created_at_ms: None,
         client_order_id: place.client_order_id.as_str().to_owned(),
         venue_order_id: Some("native-policy-1".to_owned()),
         symbol: place.owner.symbol.clone(),
@@ -237,14 +238,20 @@ fn signed_order_cannot_confirm_a_different_or_missing_limit_policy()
     assert!(!command_matches_signed_order(&execution, &fact));
     let legacy = serde_json::to_value(&fact)?;
     assert!(legacy.get("time_in_force").is_none());
+    assert!(legacy.get("created_at_ms").is_none());
     let recovered: SignedAccountOrderFact = serde_json::from_value(legacy.clone())?;
     assert_eq!(recovered.time_in_force, None);
+    assert_eq!(recovered.created_at_ms, None);
     assert_eq!(serde_json::to_value(&recovered)?, legacy);
     assert!(!command_matches_signed_order(&execution, &recovered));
     fact.time_in_force = Some(LimitTimeInForce::PostOnly);
     assert!(!command_matches_signed_order(&execution, &fact));
     fact.time_in_force = Some(LimitTimeInForce::Gtc);
     assert!(command_matches_signed_order(&execution, &fact));
+    fact.created_at_ms = Some(1_700_000_000_125);
+    let recovered: SignedAccountOrderFact = serde_json::from_slice(&serde_json::to_vec(&fact)?)?;
+    assert_eq!(recovered.created_at_ms, fact.created_at_ms);
+    assert!(command_matches_signed_order(&execution, &recovered));
     Ok(())
 }
 

@@ -5,7 +5,7 @@
 ## 1. 文档职责
 
 本文定义 Venue 合并跟单、指标、桌面/Web UI 与六交易所网关后的目标架构、依赖边界和技术栈。
-[`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md) 继续约束当前三所 Stage 7 网格热路径、恢复、接管和实盘准入；
+[`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md) 约束共享账户运行时、网格热路径、旧 Stage 7 恢复接管和实盘准入；
 在目标架构尚未逐项验收前，不得用本文替代现有安全门。
 
 当前统一执行链、旧三所接管和 Web 迁移的实施阶段与完成定义统一查
@@ -217,16 +217,16 @@ Copy planner/job-consumer lease 只允许竞争数据库 job 的规划或投递�
 
 六所规范身份、精确 `LIVE` 模式和账户/交易对 binding 统一由 `venue-gateway-api` 提供。面向当前 10–20 用户的 MVP，Bybit、OKX、Hyperliquid 已采用较小安全闭环：账户进程锁、单一命令 WAL、Owner 字段、10U 风险上限、Unknown 禁重投及签名对账；不复制旧 Stage 7 的分布式 lease、handoff 或多层 receipt。
 
-| Venue | 目标 adapter | 当前权威来源 | 初始准入 |
+| Venue | adapter | 协议与账户接线 | 准入边界 |
 |---|---|---|---|
-| Binance | `venue-gateway-binance` | Portfolio Margin async HTTP/私流、Net/Hedge 腿、regular/Algo/conditional-unsupported、fills cursor、place/cancel/reduce-once 与 ACK 后 exact signed readback 已闭合；Stage 7 capability/WAL/writer 仍是生产权威 | `LIVE`；adapter 静态能力为空，Node 接入前不开放新路径 |
-| Bitget | `venue-gateway-bitget` | UTA LIVE async 私有链路、账户五面同 attempt、normal/unsupported 订单族、place/cancel/reduce-once 与 UNKNOWN exact readback 已闭合；Stage 7 capability/WAL/writer 仍是生产权威 | `LIVE`；adapter 静态能力为空，Node 接入前不开放新路径 |
-| Gate.io | `venue-gateway-gate` | LIVE async 签名 HTTP/私流、账户/Hedge 双腿、regular/profile-explicit-unsupported、fills cursor、post-only place/exact cancel/reduce-once 与 ACK readback 已闭合；Stage 7 capability/WAL/writer 仍是生产权威 | `LIVE`；adapter 静态能力为空，Node 接入前不开放新路径 |
-| Bybit | `venue-gateway-bybit` | UTA2/双向持仓和权限预检；post-only place、exact cancel、signed exact readback | `LIVE`；仅经账户 host permit，账户累计名义仓位上限 10U；已有持仓或未撤入场时拒绝增险 |
-| OKX | `venue-gateway-okx` | Long/Short Cross 预检；SWAP 规则及 `ctVal × ctMult × contracts` 换算；post-only place、exact cancel/readback | `LIVE`；仅经账户 host permit，按张数向下取整；账户累计名义仓位上限 10U |
-| Hyperliquid | `venue-gateway-hyperliquid` | API Wallet 绑定、持仓/open-orders 预检；持久 nonce、ALO place、cloid exact cancel/readback | `LIVE`；仅经账户 host permit，账户累计名义仓位上限 10U；已有持仓或挂单时拒绝增险 |
+| Binance | `venue-gateway-binance` | Portfolio Margin HTTP/私流、账户级事实及 fills cursor、policy-exact 限价/撤单/减仓回读；`account_gateway.rs` 接入统一 Node | 仅 `LIVE`；同一账户 Host/WAL/Lane，旧服务器 release 接管另行验收 |
+| Bitget | `venue-gateway-bitget` | UTA 账户五面同 attempt、订单族完整性、policy-exact 限价/撤单/减仓与 Unknown 回读；`account_gateway.rs` 接入统一 Node | 仅 `LIVE`；同一账户 Host/WAL/Lane，不继承旧 candidate authority |
+| Gate.io | `venue-gateway-gate` | Hedge 双腿、完整订单族、fills cursor、policy-exact 限价/撤单/减仓回读；`account_gateway.rs` 接入统一 Node | 仅 `LIVE`；同一账户 Host/WAL/Lane，真实单笔规则不作为存量仓位上限 |
+| Bybit | `venue-gateway-bybit` | UTA2/双向持仓和权限预检；PostOnly/Gtc 限价、精确撤单与签名回读 | 仅 `LIVE`；经账户 Host，初期账户累计名义风险上限 10U；已有持仓或未撤入场时拒绝增险 |
+| OKX | `venue-gateway-okx` | Long/Short Cross 预检；SWAP `ctVal × ctMult × contracts` 换算；PostOnly/Gtc 限价、精确撤单与签名回读 | 仅 `LIVE`；经账户 Host，按张数向下取整，初期账户累计名义风险上限 10U |
+| Hyperliquid | `venue-gateway-hyperliquid` | API Wallet 绑定、账户预检、持久 nonce；ALO/GTC 限价、cloid 精确撤单与签名回读 | 仅 `LIVE`；经账户 Host，非 USDT 报价真实估值，初期累计风险上限 10U；已有风险时拒绝增险 |
 
-KOL 网关只是协议 fixture 和差异对照来源，不继承其运行开关或实盘准入状态。前三所的生产权威继续来自 Venue 已验收实现。
+KOL 网关只是协议 fixture 和差异对照来源，不继承其运行开关或实盘准入状态。六所当前源码只允许固定 Node 通过统一账户链执行；旧服务器进程是否退休、策略驱动及产品是否验收，须分别提供证据，不能从 adapter 或 fixture 通过推断。
 
 网关只使用生产 endpoint、实盘账户和按 venue/account 隔离的 LIVE 工件。离线 fixture、mock transport 和 parser 测试属于
 测试工具，不是运行模式，也不得连接真实交易所或发送 mutation。

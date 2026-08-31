@@ -95,6 +95,7 @@ impl AccountPhysicalGateway for Gateway {
         if let Some(ExecutionCommand::PlaceLimit(command)) = &state.command {
             if state.open {
                 orders.push(SignedAccountOrderFact {
+                    created_at_ms: None,
                     time_in_force: Some(Default::default()),
                     client_order_id: command.client_order_id.as_str().to_owned(),
                     venue_order_id: Some("native-copy".to_owned()),

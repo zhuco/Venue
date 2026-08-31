@@ -7,6 +7,7 @@
     "is_reduce_only": false,
     "tif": "poc",
     "status": "open",
+    "create_time": "1700000000.125",
     "price": "0.10000",
     "fill_price": "0.10001",
     "text": "t-hgo_e7_long_open_l1"
@@ -19,6 +20,7 @@
     "is_reduce_only": false,
     "tif": "poc",
     "status": "open",
+    "create_time": "1700000001",
     "price": "0.10100",
     "fill_price": "0",
     "text": "t-hgo_e7_short_open_l1"

@@ -26,12 +26,19 @@ const MAX_RISK_EVIDENCE_AGE_MS: u64 = 60_000;
 const RUNTIME_BOOTSTRAP_FILE: &str = "signed-account-bootstrap.json";
 const RUNTIME_CHECKPOINT_LIMIT_BYTES: usize = 5 * 1024 * 1024;
 
+#[path = "account_normalization.rs"]
+mod account_normalization;
+pub use account_normalization::{AccountLimitNormalizationIntent, AccountPricedLimitIntent};
+
 #[path = "account_net_reduce.rs"]
 mod account_net_reduce;
 use account_net_reduce::{
     NetReduceSettlement, PersistedSignedBootstrap, completed_net_reduce_settlement,
     load_previous_signed_bootstrap, validate_recovered_net_reduce_settlements,
 };
+
+#[path = "account_order_identity.rs"]
+mod account_order_identity;
 
 #[path = "account_scope.rs"]
 mod account_scope;
@@ -60,36 +67,12 @@ pub struct AccountRiskSummary {
     candidate_entry: Decimal,
 }
 
-/// Semantic limit intent.  Strategy/Control supplies only quote exposure and immutable identity;
-/// the physical gateway must derive current quantity and a post-only price from fresh venue facts.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AccountLimitNormalizationIntent {
-    pub command_id: CommandId,
-    pub client_order_id: CommandId,
-    pub owner: OrderOwner,
-    pub side: OrderSide,
-    pub position_side: PositionSide,
-    pub quote_delta: Decimal,
-    pub reduce_only: bool,
-}
-
 /// Exact read-only rules identity for the account binding. Copy planning does not consume a
 /// static tick/minimum-notional, which some venues express as a dynamic native rule.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccountInstrumentIdentity {
     pub identity: InstrumentIdentity,
     pub rules_generation: u64,
-}
-
-impl AccountLimitNormalizationIntent {
-    pub fn validate(&self) -> Result<(), AccountHostValidationError> {
-        if self.quote_delta <= Decimal::ZERO || Asset::new(self.owner.symbol.quote()).is_err() {
-            return Err(AccountHostValidationError::Command);
-        }
-        self.owner
-            .validate()
-            .map_err(|_| AccountHostValidationError::Command)
-    }
 }
 
 impl AccountRiskSummary {
@@ -151,6 +134,12 @@ pub trait AccountPhysicalGateway {
         Err(AccountHostValidationError::SignedSnapshot)
     }
 
+    /// Verifies the adapter's wire identity against the original WAL client ID. This grants no
+    /// ownership by itself: the Host also checks native order identity, family and full semantics.
+    fn signed_client_order_id_matches(&self, canonical: &CommandId, signed: &str) -> bool {
+        canonical.as_str() == signed
+    }
+
     /// Current adapter-validated rules identity for the gateway binding. It remains a read-only
     /// fact: callers must still compare its generation to a fresh signed account snapshot before
     /// using it for Copy planning.
@@ -177,6 +166,15 @@ pub trait AccountPhysicalGateway {
     fn normalize_limit_intent(
         &mut self,
         _intent: &AccountLimitNormalizationIntent,
+    ) -> Result<ExecutionCommand, AccountHostValidationError> {
+        Err(AccountHostValidationError::Command)
+    }
+
+    /// Preserves an explicitly selected price and policy while applying fresh native quantity
+    /// rules. It does not authorize execution and cannot fall back to automatic BBO pricing.
+    fn normalize_priced_limit_intent(
+        &mut self,
+        _intent: &AccountPricedLimitIntent,
     ) -> Result<ExecutionCommand, AccountHostValidationError> {
         Err(AccountHostValidationError::Command)
     }
@@ -787,39 +785,6 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
             .collect()
     }
 
-    /// Normalization remains inside the account host so callers cannot manufacture a price or
-    /// quantity. The resulting command still has no side effect until `prepare_for_lane` fsyncs
-    /// it into the sole command WAL.
-    pub fn normalize_limit_intent(
-        &mut self,
-        intent: &AccountLimitNormalizationIntent,
-    ) -> Result<ExecutionCommand, AccountHostError<G::Error>> {
-        intent.validate().map_err(AccountHostError::Validation)?;
-        if intent.owner.exchange != self.binding.venue.as_str()
-            || intent.owner.account != self.binding.trading_account_id
-            || !self.configured_symbols.contains(&intent.owner.symbol)
-        {
-            return Err(AccountHostError::Validation(
-                AccountHostValidationError::Scope,
-            ));
-        }
-        let command = self
-            .gateway
-            .normalize_limit_intent(intent)
-            .map_err(AccountHostError::Validation)?;
-        if !matches!(&command, ExecutionCommand::PlaceLimit(place) if place.time_in_force.is_post_only())
-            || command.command_id() != &intent.command_id
-            || command.native_client_id() != Some(&intent.client_order_id)
-        {
-            return Err(AccountHostError::Validation(
-                AccountHostValidationError::Command,
-            ));
-        }
-        validate_command_scope(&command, &self.binding, &self.configured_symbols)
-            .map_err(AccountHostError::Validation)?;
-        Ok(command)
-    }
-
     pub fn refresh_signed_snapshot(
         &mut self,
     ) -> Result<SignedAccountSnapshot, AccountHostError<G::Error>> {
@@ -1051,47 +1016,6 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
                 .map_err(AccountHostError::Journal)?;
         }
         Ok(())
-    }
-
-    fn enrich_signed_order_owners(&self, snapshot: &mut SignedAccountSnapshot) {
-        for fact in snapshot.open_orders_mut() {
-            // Adapter payload ownership is untrusted input. Begin external and attach the sole
-            // WAL owner only after both native identities and order semantics agree.
-            fact.owner = None;
-            fact.external = true;
-            let Some(command) = self.command_for_signed_order(fact) else {
-                continue;
-            };
-            let Some(owner) = command.owner() else {
-                continue;
-            };
-            fact.owner = Some(owner.clone());
-            fact.external = false;
-        }
-    }
-
-    fn command_for_signed_order(&self, fact: &SignedAccountOrderFact) -> Option<&ExecutionCommand> {
-        let client_id = CommandId::new(fact.client_order_id.clone()).ok()?;
-        let command_id = self.journal.command_id_by_client_id(&client_id)?;
-        if let Some(venue_order_id) = &fact.venue_order_id {
-            match self.journal.client_id_by_venue_order_id(venue_order_id) {
-                Some(mapped_client_id) if mapped_client_id == &client_id => {}
-                Some(_) => return None,
-                None => {
-                    // Before an UNKNOWN's signed Accepted transition, only its same client id
-                    // can be considered; an Accepted receipt without a unique native-id index is
-                    // deliberately not attributed.
-                    if !matches!(
-                        self.journal.receipt(command_id)?.state,
-                        CommandState::Submitted | CommandState::Unknown { .. }
-                    ) {
-                        return None;
-                    }
-                }
-            }
-        }
-        let command = &self.journal.receipt(command_id)?.command;
-        command_matches_signed_order(command, fact).then_some(command)
     }
 
     fn persist_signed_snapshot(
