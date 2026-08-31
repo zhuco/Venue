@@ -51,7 +51,9 @@ struct DurableLegacyV1Handoff {
     schema_version: u16,
     scope_sha256: String,
     scope: WriterScope,
+    #[serde(default)]
     legacy_strategy_instance_id: String,
+    #[serde(default)]
     legacy_run_id: String,
     canonical_artifacts_root: String,
     canonical_root_sha256: String,
@@ -65,6 +67,15 @@ struct LegacyV1EntryDigest<'a> {
     scope: &'a WriterScope,
     legacy_strategy_instance_id: &'a str,
     legacy_run_id: &'a str,
+    canonical_artifacts_root: &'a str,
+    canonical_root_sha256: &'a str,
+}
+
+#[derive(Serialize)]
+struct LegacyV1EntryDigestV1<'a> {
+    schema_version: u16,
+    scope_sha256: &'a str,
+    scope: &'a WriterScope,
     canonical_artifacts_root: &'a str,
     canonical_root_sha256: &'a str,
 }
@@ -127,14 +138,19 @@ fn validate_legacy_predecessor(
         owner_scope: predecessor.legacy_owner_scope.clone(),
     };
     let scope_sha256 = digest_json(&expected_scope)?;
-    if handoff.schema_version != 2
+    let owner_identity_matches = handoff.legacy_strategy_instance_id
+        == predecessor.legacy_strategy_instance_id
+        && handoff.legacy_run_id == predecessor.legacy_run_id;
+    if !matches!(handoff.schema_version, 1 | 2)
         || handoff.scope != expected_scope
         || handoff.scope_sha256 != scope_sha256
         || handoff.scope_sha256 != predecessor.legacy_lock_sha256
         || handoff.canonical_artifacts_root != canonical_root
         || handoff.canonical_root_sha256 != digest_bytes(canonical_root.as_bytes())
-        || handoff.legacy_strategy_instance_id != predecessor.legacy_strategy_instance_id
-        || handoff.legacy_run_id != predecessor.legacy_run_id
+        || (handoff.schema_version == 1
+            && (!handoff.legacy_strategy_instance_id.is_empty()
+                || !handoff.legacy_run_id.is_empty()))
+        || (handoff.schema_version == 2 && !owner_identity_matches)
         || handoff.entry_sha256 != legacy_v1_entry_digest(&handoff)?
     {
         return Err(Stage7WriterRegistryError::LegacyPredecessor);
@@ -149,15 +165,25 @@ fn valid_owner_identity(value: &str) -> bool {
 fn legacy_v1_entry_digest(
     entry: &DurableLegacyV1Handoff,
 ) -> Result<String, Stage7WriterRegistryError> {
-    digest_json(&LegacyV1EntryDigest {
-        schema_version: entry.schema_version,
-        scope_sha256: &entry.scope_sha256,
-        scope: &entry.scope,
-        legacy_strategy_instance_id: &entry.legacy_strategy_instance_id,
-        legacy_run_id: &entry.legacy_run_id,
-        canonical_artifacts_root: &entry.canonical_artifacts_root,
-        canonical_root_sha256: &entry.canonical_root_sha256,
-    })
+    match entry.schema_version {
+        1 => digest_json(&LegacyV1EntryDigestV1 {
+            schema_version: entry.schema_version,
+            scope_sha256: &entry.scope_sha256,
+            scope: &entry.scope,
+            canonical_artifacts_root: &entry.canonical_artifacts_root,
+            canonical_root_sha256: &entry.canonical_root_sha256,
+        }),
+        2 => digest_json(&LegacyV1EntryDigest {
+            schema_version: entry.schema_version,
+            scope_sha256: &entry.scope_sha256,
+            scope: &entry.scope,
+            legacy_strategy_instance_id: &entry.legacy_strategy_instance_id,
+            legacy_run_id: &entry.legacy_run_id,
+            canonical_artifacts_root: &entry.canonical_artifacts_root,
+            canonical_root_sha256: &entry.canonical_root_sha256,
+        }),
+        _ => Err(Stage7WriterRegistryError::LegacyPredecessor),
+    }
 }
 
 fn acquire_legacy_predecessor(
@@ -643,6 +669,49 @@ mod tests {
             acquire_legacy_predecessor(&different_instance, &registry),
             Err(Stage7WriterRegistryError::LegacyPredecessor)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn schema_one_handoff_remains_lock_compatible_until_import_derives_the_owner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let registry = temporary.path().join("v1");
+        let mut predecessor =
+            legacy_predecessor(&registry, &temporary.path().join("legacy"), true)?;
+        let canonical = predecessor
+            .legacy_artifacts_root
+            .to_str()
+            .ok_or("legacy root encoding")?
+            .to_owned();
+        let scope = WriterScope {
+            exchange: predecessor.exchange.as_str().to_owned(),
+            account: predecessor.legacy_product_account.clone(),
+            symbol: predecessor.legacy_symbol.clone(),
+            owner_scope: predecessor.legacy_owner_scope.clone(),
+        };
+        let scope_sha256 = digest_json(&scope)?;
+        let entry_sha256 = digest_json(&LegacyV1EntryDigestV1 {
+            schema_version: 1,
+            scope_sha256: &scope_sha256,
+            scope: &scope,
+            canonical_artifacts_root: &canonical,
+            canonical_root_sha256: &digest_bytes(canonical.as_bytes()),
+        })?;
+        let encoded = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "scope_sha256": scope_sha256,
+            "scope": scope,
+            "canonical_artifacts_root": canonical,
+            "canonical_root_sha256": digest_bytes(predecessor.legacy_artifacts_root.to_string_lossy().as_bytes()),
+            "entry_sha256": entry_sha256,
+        }))?;
+        predecessor.handoff_sha256 = digest_bytes(&encoded);
+        fs::write(
+            registry.join(format!("{}.json", predecessor.legacy_lock_sha256)),
+            encoded,
+        )?;
+        assert!(acquire_legacy_predecessor(&predecessor, &registry).is_ok());
         Ok(())
     }
 

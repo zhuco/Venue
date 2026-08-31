@@ -1648,8 +1648,22 @@ fn frozen_legacy_journal_is_segmented_without_mutating_the_source()
         },
     )?;
     let before = fs::read(&source)?;
+    let owner = command.mutation_owner().clone();
+    let predecessor = LegacyV1WriterPredecessor {
+        exchange: VenueId::Okx,
+        successor_trading_account_id: ACCOUNT.to_owned(),
+        legacy_product_account: owner.account.clone(),
+        legacy_symbol: owner.symbol.clone(),
+        legacy_owner_scope: "legacy-owner-scope".to_owned(),
+        legacy_strategy_instance_id: owner.strategy_instance_id.clone(),
+        legacy_run_id: owner.run_id.clone(),
+        legacy_artifacts_root: fs::canonicalize(&legacy_root)?,
+        legacy_lock_sha256: "0".repeat(64),
+        legacy_lock_path: temporary.path().join("legacy.lock"),
+        handoff_sha256: "0".repeat(64),
+    };
 
-    import_legacy_v1_journal_if_needed(&legacy_root, &destination)?;
+    import_legacy_v1_journal_for_predecessor_if_needed(&predecessor, &destination)?;
 
     assert_eq!(fs::read(&source)?, before);
     assert!(destination.join(LEGACY_V1_IMPORT_FILE).is_file());
@@ -1659,7 +1673,7 @@ fn frozen_legacy_journal_is_segmented_without_mutating_the_source()
     let recovered = CommandJournal::open_segmented(destination.join("commands.jsonl"), &segments)?;
     assert!(!recovered.has_unresolved());
     assert_eq!(recovered.native_order_routes().len(), 1);
-    import_legacy_v1_journal_if_needed(&legacy_root, &destination)?;
+    import_legacy_v1_journal_for_predecessor_if_needed(&predecessor, &destination)?;
     Ok(())
 }
 

@@ -392,8 +392,9 @@ G:\Venue\artifacts\<exchange>\LIVE\<trading_account_id>\
 后续新 WAL 段可追加轮转，但导入前缀不可变；任何中断、篡改、
 空文件或 `Prepared/Submitted/Unknown` 均失败关闭，不清理后重试。此兼容导入只保留既有命令/Owner/路由事实，
 不从旧 checkpoint 推断 Grid 路由、库存或 Actor Applied，后者缺失时仍不得启动 Grid 或新增风险。前驱记录使用
-不可变 v2 handoff，除旧 scope/root 外还必须哈希绑定旧 WAL 的策略实例与 run；任何旧版或两者任一不一致的
-handoff 均拒绝。导入时每一条物理 mutation 的 Owner 都必须匹配这份冻结身份，混合 Owner WAL 不复制。它们仅和
+不可变 v2 handoff，除旧 scope/root 外还必须哈希绑定旧 WAL 的策略实例与 run；两者任一不一致的 handoff 均拒绝。
+既有 v1 handoff 只能在旧锁持有、冻结 WAL 的全部物理 Owner 唯一且由导入核验精确推导时兼容，不能信任配置自由填写。
+导入时每一条物理 mutation 的 Owner 都必须匹配这份冻结身份，混合 Owner WAL 不复制。它们仅和
 状态为 `New`/`PartiallyFilled`、剩余量为正的签名订单的 native/client/full-shape 共同组成 cancellation-only custody
 候选，不可把旧 Owner 重写为新 UUID，也不可成为 Place/Reduce 的授权。
 
