@@ -385,6 +385,12 @@ G:\Venue\artifacts\<exchange>\LIVE\<trading_account_id>\
 
 现有 Stage 7 文件在完成迁移前保持只读兼容；新路径不得继续产生无限增长的 `private_evidence.jsonl` 或复制相同事实到多本 journal。
 
+旧三所切换时，取得 `LegacyV1WriterPredecessor` 的精确旧锁之后，新 Host 可一次性导入冻结且全部终态的
+`commands.jsonl`：先按原 journal 的序号、哈希和状态转换验证，再复制为新 root 中不超过 5 MiB 的历史段，
+并持久化来源绝对路径、字节数和 SHA-256。源文件始终只读；已有导入标记必须精确匹配，任何中断、篡改、
+空文件或 `Prepared/Submitted/Unknown` 均失败关闭，不清理后重试。此兼容导入只保留既有命令/Owner/路由事实，
+不从旧 checkpoint 推断 Grid 路由、库存或 Actor Applied，后者缺失时仍不得启动 Grid 或新增风险。
+
 ### 8.3 重启顺序
 
 1. 取得 `(exchange, trading_account_id)` 账户进程锁；失败则退出，不参与选举或抢占；
@@ -464,7 +470,8 @@ Scalping Node 配置必须显式给出 `scalping.parameter_release_id/owner_scop
 1. 停止旧 writer，确认账户进程锁已释放；读取当前 checkpoint 和命令 WAL，所有 `Submitted/Unknown` 先完成签名对账。
 2. 只读获取账户模式、实时规则、余额、全部持仓腿、支持的订单族、开放订单和必要成交历史；不支持的订单族由 adapter 明确拒绝，不要求伪造空页或永久保存原始报文。
 3. 验证 DOGE 账户累计名义仓位硬上限 10U、数量步长和最小下单量；已有未撤入场命令或非零持仓时不得继续增险。OKX 必须按 `ctVal × ctMult × contracts` 换算基础数量，并按 `lotSz/minSz` 约束可执行张数。
-4. 取得唯一账户进程锁，写入最小 checkpoint 并启动同一本 WAL；发送前落 `Prepared`，结果不确定落 `Unknown`。
+4. 取得唯一账户进程锁，并在旧 root 仍冻结时按上述只读兼容规则导入可验证的终态 WAL；随后写入最小 checkpoint
+   并启动同一本 WAL。发送前落 `Prepared`，结果不确定落 `Unknown`。
 5. 每轮 Canary 的单笔和账户累计名义风险均不得超过 10U，并立即签名回读订单、成交和持仓。AI 可使用持续授权直接执行，
    无需逐次请求人工确认；同一账户可重复多轮，但前一轮必须终态、无 Unknown/未撤增险订单且签名仓位归零后才能再次增险。
    已有持仓账户仍可做只读、撤单、reduce-only、Stop/Flatten。该所全部必需轮次完成并停止后才推进下一家；失败则释放 writer、

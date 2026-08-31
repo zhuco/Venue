@@ -26,6 +26,9 @@
 
 Binance/Gate/Bitget 还必须在分隔符前提供 `--legacy-v1-handoff <绝对JSON路径>`，
 由 `LegacyV1WriterPredecessor` 校验精确旧 registry/绑定。不能伪造记录来跳过真实 writer/WAL 接管。
+前驱锁取得后，Node 仅在旧 `commands.jsonl` 完整、终态且无 `Unknown` 时把它按 5 MiB 段复制到新的
+账户 root，并以来源路径、字节数与 SHA-256 写入一次性导入标记；旧文件绝不改写。旧 Grid checkpoint、
+路由和 Actor Applied 不会由此推测或伪造，缺少它们仍保持失败关闭，不能据此宣称 Grid 已接管。
 Bybit/OKX/Hyperliquid 不接受该前驱参数。初期 Bybit/OKX 的 DOGE 为 `DOGE/USDT`，
 Hyperliquid 为 `DOGE/USDC`，风险必须换算 USDT。
 

@@ -1377,3 +1377,63 @@ fn clean_five_mib_segment_rotates_and_retains_cancel_identity()
     assert_eq!(host.gateway.dispatches, 1);
     Ok(())
 }
+
+#[test]
+fn frozen_legacy_journal_is_segmented_without_mutating_the_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let legacy_root = temporary.path().join("legacy");
+    let destination = root(&temporary);
+    fs::create_dir_all(&legacy_root)?;
+    let source = legacy_root.join("commands.jsonl");
+    let command = command(Decimal::ONE)?;
+    let mut legacy = CommandJournal::open(&source)?;
+    legacy.prepare(command.clone())?;
+    legacy.transition(command.command_id(), CommandState::Submitted)?;
+    legacy.transition(
+        command.command_id(),
+        CommandState::Accepted {
+            venue_order_id: "legacy-native-1".to_owned(),
+        },
+    )?;
+    let before = fs::read(&source)?;
+
+    import_legacy_v1_journal_if_needed(&legacy_root, &destination)?;
+
+    assert_eq!(fs::read(&source)?, before);
+    assert!(destination.join(LEGACY_V1_IMPORT_FILE).is_file());
+    let segments = journal_segment_paths(&destination)?;
+    assert_eq!(segments.len(), 1);
+    assert!(fs::metadata(&segments[0])?.len() <= COMMAND_JOURNAL_ROTATE_BYTES);
+    let recovered = CommandJournal::open_segmented(destination.join("commands.jsonl"), &segments)?;
+    assert!(!recovered.has_unresolved());
+    assert_eq!(recovered.native_order_routes().len(), 1);
+    import_legacy_v1_journal_if_needed(&legacy_root, &destination)?;
+    Ok(())
+}
+
+#[test]
+fn frozen_legacy_journal_with_unknown_is_not_imported() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let legacy_root = temporary.path().join("legacy");
+    let destination = root(&temporary);
+    fs::create_dir_all(&legacy_root)?;
+    let source = legacy_root.join("commands.jsonl");
+    let command = command(Decimal::ONE)?;
+    let mut legacy = CommandJournal::open(&source)?;
+    legacy.prepare(command.clone())?;
+    legacy.transition(command.command_id(), CommandState::Submitted)?;
+    legacy.transition(
+        command.command_id(),
+        CommandState::Unknown {
+            reason: "ambiguous".to_owned(),
+        },
+    )?;
+
+    assert!(matches!(
+        import_legacy_v1_journal_if_needed(&legacy_root, &destination),
+        Err(AccountHostValidationError::LegacyPredecessor)
+    ));
+    assert!(!destination.exists());
+    Ok(())
+}

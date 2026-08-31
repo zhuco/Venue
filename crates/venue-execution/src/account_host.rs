@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -25,6 +25,8 @@ pub const COMMAND_JOURNAL_HARD_LIMIT_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_RISK_EVIDENCE_AGE_MS: u64 = 60_000;
 const RUNTIME_BOOTSTRAP_FILE: &str = "signed-account-bootstrap.json";
 const RUNTIME_CHECKPOINT_LIMIT_BYTES: usize = 5 * 1024 * 1024;
+const LEGACY_V1_IMPORT_FILE: &str = "legacy-v1-journal-import.json";
+const LEGACY_V1_IMPORT_SCHEMA_VERSION: u16 = 1;
 
 #[path = "account_normalization.rs"]
 mod account_normalization;
@@ -663,6 +665,8 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         let legacy = predecessor
             .acquire()
             .map_err(AccountHostError::CanonicalRoot)?;
+        import_legacy_v1_journal_if_needed(&predecessor.legacy_artifacts_root, &artifacts_root)
+            .map_err(AccountHostError::Validation)?;
         let scope = WriterScope {
             exchange: binding.venue.as_str().to_owned(),
             account: binding.trading_account_id.clone(),
@@ -1696,6 +1700,193 @@ pub fn command_matches_readback_order(command: &ExecutionCommand, order: &Order)
         ),
         ExecutionCommand::StopMarketCloseAll(_) => false,
     }
+}
+
+/// One-time custody-preserving import of a frozen Stage-7 command journal.  The caller already
+/// holds the predecessor's exclusive lock, so the source cannot advance while it is verified and
+/// copied.  The source remains untouched; a partial destination intentionally remains fenced
+/// instead of being cleaned or resumed automatically.
+fn import_legacy_v1_journal_if_needed(
+    legacy_root: &Path,
+    destination_root: &Path,
+) -> Result<(), AccountHostValidationError> {
+    let legacy_root =
+        fs::canonicalize(legacy_root).map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+    let source = legacy_root.join("commands.jsonl");
+    let source =
+        fs::canonicalize(&source).map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+    if !source.starts_with(&legacy_root)
+        || !fs::metadata(&source)
+            .map(|metadata| metadata.is_file() && metadata.len() > 0)
+            .unwrap_or(false)
+    {
+        return Err(AccountHostValidationError::LegacyPredecessor);
+    }
+    let source_sha256 = file_sha256(&source)?;
+    let source_bytes = fs::metadata(&source)
+        .map_err(|_| AccountHostValidationError::LegacyPredecessor)?
+        .len();
+    let marker = destination_root.join(LEGACY_V1_IMPORT_FILE);
+    if marker.exists() {
+        let encoded =
+            fs::read(&marker).map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+        let imported: LegacyV1JournalImport = serde_json::from_slice(&encoded)
+            .map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+        if imported.schema_version != LEGACY_V1_IMPORT_SCHEMA_VERSION
+            || imported.source_path != source
+            || imported.source_sha256 != source_sha256
+            || imported.source_bytes != source_bytes
+            || imported.segment_count == 0
+            || journal_segment_paths(destination_root)?.len() != imported.segment_count
+        {
+            return Err(AccountHostValidationError::LegacyPredecessor);
+        }
+        return Ok(());
+    }
+    if destination_root.exists()
+        && fs::read_dir(destination_root)
+            .map_err(|_| AccountHostValidationError::LegacyPredecessor)?
+            .next()
+            .transpose()
+            .map_err(|_| AccountHostValidationError::LegacyPredecessor)?
+            .is_some()
+    {
+        return Err(AccountHostValidationError::LegacyPredecessor);
+    }
+    // This verifies every record's sequence, command hash, state transition, and persisted
+    // command shape before any successor file is created.  An unresolved old command must be
+    // reconciled by the old writer first; it can never be relabelled as a new Host receipt.
+    let legacy_journal =
+        CommandJournal::open(&source).map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+    if legacy_journal.has_unresolved() {
+        return Err(AccountHostValidationError::LegacyPredecessor);
+    }
+    fs::create_dir_all(destination_root)
+        .map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+    let source_file =
+        File::open(&source).map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+    let mut reader = BufReader::new(source_file);
+    let mut line = Vec::new();
+    let mut segment_count = 0_usize;
+    let mut segment: Option<File> = None;
+    let mut segment_bytes = 0_u64;
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+        if read == 0 {
+            break;
+        }
+        let line_bytes =
+            u64::try_from(line.len()).map_err(|_| AccountHostValidationError::JournalBudget)?;
+        if line_bytes == 0 || line_bytes > COMMAND_JOURNAL_ROTATE_BYTES {
+            return Err(AccountHostValidationError::JournalBudget);
+        }
+        if segment.is_none()
+            || segment_bytes
+                .checked_add(line_bytes)
+                .is_none_or(|next| next > COMMAND_JOURNAL_ROTATE_BYTES)
+        {
+            if let Some(file) = segment.take() {
+                file.sync_all()
+                    .map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+            }
+            segment_count = segment_count
+                .checked_add(1)
+                .ok_or(AccountHostValidationError::JournalBudget)?;
+            let path = legacy_import_stage_path(destination_root, segment_count)?;
+            segment = Some(
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .map_err(|_| AccountHostValidationError::LegacyPredecessor)?,
+            );
+            segment_bytes = 0;
+        }
+        segment
+            .as_mut()
+            .ok_or(AccountHostValidationError::LegacyPredecessor)?
+            .write_all(&line)
+            .map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+        segment_bytes = segment_bytes
+            .checked_add(line_bytes)
+            .ok_or(AccountHostValidationError::JournalBudget)?;
+    }
+    if let Some(file) = segment {
+        file.sync_all()
+            .map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+    }
+    if segment_count == 0 {
+        return Err(AccountHostValidationError::LegacyPredecessor);
+    }
+    for index in 1..=segment_count {
+        let source = legacy_import_stage_path(destination_root, index)?;
+        let destination = destination_root.join(format!("commands-{index:06}.jsonl"));
+        fs::rename(source, destination)
+            .map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+    }
+    let marker_body = serde_json::to_vec(&LegacyV1JournalImport {
+        schema_version: LEGACY_V1_IMPORT_SCHEMA_VERSION,
+        source_path: source,
+        source_sha256,
+        source_bytes,
+        segment_count,
+    })
+    .map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+    write_new_synced(&marker, &marker_body)?;
+    Ok(())
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyV1JournalImport {
+    schema_version: u16,
+    source_path: PathBuf,
+    source_sha256: String,
+    source_bytes: u64,
+    segment_count: usize,
+}
+
+fn legacy_import_stage_path(
+    root: &Path,
+    index: usize,
+) -> Result<PathBuf, AccountHostValidationError> {
+    if index == 0 || index > 999_999 {
+        return Err(AccountHostValidationError::JournalBudget);
+    }
+    Ok(root.join(format!(".legacy-v1-import-{index:06}.stage")))
+}
+
+fn file_sha256(path: &Path) -> Result<String, AccountHostValidationError> {
+    let mut file = File::open(path).map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buffer)
+            .map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), AccountHostValidationError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|_| AccountHostValidationError::LegacyPredecessor)
 }
 
 fn command_matches_signed_order(command: &ExecutionCommand, fact: &SignedAccountOrderFact) -> bool {
