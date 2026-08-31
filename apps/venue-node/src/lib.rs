@@ -64,6 +64,9 @@ pub use venue_control_protocol::{CommandReceipt, ControlAction, ControlCommandRe
 const REQUIRED_NEW_VENUE_GATES: &str = "Owner, WAL, unique account writer fence, signed readback, UNKNOWN reconciliation, Stop/Flatten, and operator-confirmed Canary evidence";
 const LIVE_ARTIFACT_FILE_HARD_LIMIT_BYTES: u64 = 10 * 1024 * 1024;
 const LIVE_ARTIFACT_ROOT_FREEZE_BYTES: u64 = 240 * 1024 * 1024;
+// The import marker itself is small, but reserve a full MiB so the preflight bound remains
+// conservative if the frozen journal has many 5 MiB segments.
+const LEGACY_V1_IMPORT_METADATA_RESERVATION_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "venue-node", disable_version_flag = true)]
@@ -172,7 +175,12 @@ impl NodeLaunch {
             .chain(self.runtime_arguments.iter().cloned());
         let raw = RawLiveMvpArguments::try_parse_from(arguments)?;
         let command = LiveMvpCommand::from_raw(raw.command, &self.binding)?;
-        validate_live_artifact_budget(&self.artifacts_base)?;
+        match self.legacy_v1_predecessor.as_ref() {
+            Some(predecessor) => {
+                validate_legacy_v1_import_budget(&self.artifacts_base, predecessor)?;
+            }
+            None => validate_live_artifact_budget(&self.artifacts_base)?,
+        }
         Ok(command)
     }
 
@@ -660,7 +668,33 @@ fn load_legacy_v1_predecessor(
 }
 
 fn validate_live_artifact_budget(root: &Path) -> Result<(), NodeError> {
+    validate_live_artifact_budget_with_reservation(root, 0)
+}
+
+fn validate_legacy_v1_import_budget(
+    artifacts_base: &Path,
+    predecessor: &venue_runtime::LegacyV1WriterPredecessor,
+) -> Result<(), NodeError> {
+    let journal = predecessor.legacy_artifacts_root.join("commands.jsonl");
+    let metadata = fs::symlink_metadata(&journal).map_err(|_| NodeError::LegacyPredecessor)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+        return Err(NodeError::LegacyPredecessor);
+    }
+    let reservation = metadata
+        .len()
+        .checked_add(LEGACY_V1_IMPORT_METADATA_RESERVATION_BYTES)
+        .ok_or(NodeError::ArtifactsBudget)?;
+    validate_live_artifact_budget_with_reservation(artifacts_base, reservation)
+}
+
+fn validate_live_artifact_budget_with_reservation(
+    root: &Path,
+    reservation_bytes: u64,
+) -> Result<(), NodeError> {
     if !root.exists() {
+        if reservation_bytes >= LIVE_ARTIFACT_ROOT_FREEZE_BYTES {
+            return Err(NodeError::ArtifactsBudget);
+        }
         return Ok(());
     }
     let mut total = 0_u64;
@@ -687,11 +721,23 @@ fn validate_live_artifact_budget(root: &Path) -> Result<(), NodeError> {
             if size > LIVE_ARTIFACT_FILE_HARD_LIMIT_BYTES {
                 return Err(NodeError::ArtifactsBudget);
             }
-            total = total.checked_add(size).ok_or(NodeError::ArtifactsBudget)?;
+            total = total
+                .checked_add(size)
+                .and_then(|used| used.checked_add(reservation_bytes))
+                .ok_or(NodeError::ArtifactsBudget)?;
             if total >= LIVE_ARTIFACT_ROOT_FREEZE_BYTES {
                 return Err(NodeError::ArtifactsBudget);
             }
+            total = total
+                .checked_sub(reservation_bytes)
+                .ok_or(NodeError::ArtifactsBudget)?;
         }
+    }
+    if total
+        .checked_add(reservation_bytes)
+        .is_none_or(|used| used >= LIVE_ARTIFACT_ROOT_FREEZE_BYTES)
+    {
+        return Err(NodeError::ArtifactsBudget);
     }
     Ok(())
 }
@@ -920,6 +966,37 @@ mod tests {
         let launch = NodeLaunch::try_parse_from(VenueId::Bybit, raw)?;
         assert!(matches!(
             launch.live_mvp_command(),
+            Err(NodeError::ArtifactsBudget)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_import_reservation_rejects_artifact_budget_breach()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let artifacts = temp.path().join("artifacts");
+        std::fs::create_dir_all(&artifacts)?;
+        let existing = std::fs::File::create(artifacts.join("current.jsonl"))?;
+        existing.set_len(LIVE_ARTIFACT_ROOT_FREEZE_BYTES - 512)?;
+        let legacy = temp.path().join("legacy");
+        std::fs::create_dir_all(&legacy)?;
+        let journal = std::fs::File::create(legacy.join("commands.jsonl"))?;
+        journal.set_len(1024)?;
+        let predecessor = venue_runtime::LegacyV1WriterPredecessor {
+            exchange: VenueId::Binance,
+            successor_trading_account_id: ACCOUNT.to_owned(),
+            legacy_product_account: "stage7-binance-doge".to_owned(),
+            legacy_symbol: "DOGE/USDT".parse()?,
+            legacy_owner_scope: "hedged-grid".to_owned(),
+            legacy_artifacts_root: legacy,
+            legacy_lock_sha256: "0".repeat(64),
+            legacy_lock_path: temp.path().join("legacy.lock"),
+            handoff_sha256: "0".repeat(64),
+        };
+
+        assert!(matches!(
+            validate_legacy_v1_import_budget(&artifacts, &predecessor),
             Err(NodeError::ArtifactsBudget)
         ));
         Ok(())
