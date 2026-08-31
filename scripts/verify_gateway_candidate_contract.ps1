@@ -81,6 +81,7 @@ $credentialNames = @{
     okx = @('OKX_API_KEY', 'OKX_API_SECRET', 'OKX_API_PASSPHRASE')
 }
 $preCredentialVenues = @('bybit', 'hyperliquid', 'okx')
+$legacyPredecessorVenues = @('binance', 'bitget', 'gate')
 
 function Test-MissingEvidenceFailClosed {
     param(
@@ -148,6 +149,13 @@ function Test-MissingEvidenceFailClosed {
                 [StringComparison]::Ordinal
             )) {
                 throw "$Venue $mode 未在凭证读取前拒绝错误的人工确认。"
+            }
+        } elseif ($Venue -in $legacyPredecessorVenues) {
+            if (-not $output.Contains(
+                'legacy v1 predecessor handoff is required only for Binance, Gate, and Bitget and must validate exactly',
+                [StringComparison]::Ordinal
+            )) {
+                throw "$Venue $mode 未在任何凭证或工件 I/O 前拒绝缺少 v1 predecessor。"
             }
         } elseif (-not $output.Contains(
             'runtime arguments must select exactly one fixed deployment command',

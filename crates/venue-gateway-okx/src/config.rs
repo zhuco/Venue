@@ -51,6 +51,7 @@ impl OkxConfig {
 pub mod endpoints {
     pub const TIME: &str = "/api/v5/public/time";
     pub const INSTRUMENTS: &str = "/api/v5/public/instruments";
+    pub const BOOKS: &str = "/api/v5/market/books";
     pub const ACCOUNT_CONFIG: &str = "/api/v5/account/config";
     pub const BALANCES: &str = "/api/v5/account/balance";
     pub const POSITIONS: &str = "/api/v5/account/positions";

@@ -3,8 +3,8 @@ use std::str::FromStr;
 use rust_decimal::Decimal;
 use serde_json::{Map, Value};
 use venue_domain::domain::{
-    AccountRiskSnapshot, Asset, Instrument, LegRiskSnapshot, PositionSide, Price, RiskSourceStatus,
-    Symbol, validate_risk_snapshot_pair,
+    AccountRiskSnapshot, Amount, Asset, Instrument, LegRiskSnapshot, MarketKind, PositionSide,
+    Price, RiskSourceStatus, Symbol, validate_risk_snapshot_pair,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,6 +40,62 @@ impl GateContractRules {
         }
         Ok(contracts)
     }
+}
+
+/// Normalizes one fresh Gate USDT perpetual contract entry. The caller supplies the public
+/// catalogue response and retains its transport ownership; no cached/static contract rule may
+/// be used to admit an account-wide entry risk calculation.
+pub fn parse_contract_rules(
+    value: &Value,
+    symbol: Symbol,
+    generation: u64,
+) -> Result<GateContractRules, GateRiskError> {
+    if generation == 0 || symbol.quote() != "USDT" {
+        return Err(GateRiskError::RiskSnapshot);
+    }
+    let item = object(value)?;
+    let native_symbol = text(item, "name")?.to_owned();
+    if native_symbol != format!("{}_USDT", symbol.base())
+        || item.get("in_delisting").and_then(Value::as_bool) != Some(false)
+        || matches!(
+            item.get("status").and_then(Value::as_str),
+            Some("delisted" | "offline")
+        )
+    {
+        return Err(GateRiskError::RiskSnapshot);
+    }
+    let quanto_multiplier = decimal(item, "quanto_multiplier")?;
+    let minimum_contracts = decimal(item, "order_size_min")?.max(Decimal::ONE);
+    let price_tick =
+        Price::new(decimal(item, "order_price_round")?).map_err(|_| GateRiskError::RiskSnapshot)?;
+    let instrument = Instrument {
+        symbol,
+        market: MarketKind::LinearPerpetual,
+        settlement_asset: Some(Asset::new("USDT").map_err(|_| GateRiskError::RiskSnapshot)?),
+        generation,
+        price_tick,
+        quantity_step: quanto_multiplier,
+        minimum_notional: Amount::new(
+            Asset::new("USDT").map_err(|_| GateRiskError::RiskSnapshot)?,
+            Decimal::ZERO,
+        ),
+    };
+    instrument
+        .validate()
+        .map_err(|_| GateRiskError::RiskSnapshot)?;
+    if quanto_multiplier <= Decimal::ZERO || minimum_contracts <= Decimal::ZERO {
+        return Err(GateRiskError::Quantity);
+    }
+    Ok(GateContractRules {
+        native_symbol,
+        instrument,
+        quanto_multiplier,
+        minimum_contracts,
+        decimal_contracts: item
+            .get("enable_decimal")
+            .and_then(Value::as_bool)
+            .ok_or(GateRiskError::Payload)?,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

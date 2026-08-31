@@ -1361,10 +1361,45 @@ fn show_accounts(ui: &mut egui::Ui, model: &AppModel) {
                     ui.label(account.mode.to_string());
                     ui.monospace(short_account(&account.trading_account_id));
                     health_label(ui, account.health);
-                    ui.monospace(format_decimal(account.equity, 2));
-                    ui.monospace(format_decimal(account.available_margin, 2));
-                    let pnl = decimal_to_f64(account.unrealized_pnl);
-                    ui.colored_label(theme::value_color(pnl), format!("{pnl:+.2}"));
+                    let balance_equity = account
+                        .balances
+                        .iter()
+                        .map(|balance| {
+                            format!("{} {}", balance.asset, format_decimal(balance.equity, 2))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ui.monospace(if balance_equity.is_empty() {
+                        account
+                            .equity
+                            .map_or_else(|| "—".to_owned(), |value| format_decimal(value, 2))
+                    } else {
+                        balance_equity
+                    });
+                    let balance_margin = account
+                        .balances
+                        .iter()
+                        .map(|balance| {
+                            let value = balance
+                                .available_margin
+                                .map_or_else(|| "—".to_owned(), |value| format_decimal(value, 2));
+                            format!("{} {value}", balance.asset)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ui.monospace(if balance_margin.is_empty() {
+                        account
+                            .available_margin
+                            .map_or_else(|| "—".to_owned(), |value| format_decimal(value, 2))
+                    } else {
+                        balance_margin
+                    });
+                    if let Some(value) = account.unrealized_pnl {
+                        let pnl = decimal_to_f64(value);
+                        ui.colored_label(theme::value_color(pnl), format!("{pnl:+.2}"));
+                    } else {
+                        ui.monospace("—");
+                    }
                     ui.monospace(account.private_generation.to_string());
                     ui.monospace(account.writer_generation.to_string());
                     ui.monospace(format_freshness(freshness_age_ms(
@@ -1438,8 +1473,15 @@ fn show_strategies(ui: &mut egui::Ui, model: &mut AppModel) {
                     ui.monospace(strategy.open_orders.to_string());
                     ui.monospace(format_decimal(strategy.long_quantity, 4));
                     ui.monospace(format_decimal(strategy.short_quantity, 4));
-                    let pnl = decimal_to_f64(strategy.realized_pnl + strategy.unrealized_pnl);
-                    ui.colored_label(theme::value_color(pnl), format!("{pnl:+.2}"));
+                    match (strategy.realized_pnl, strategy.unrealized_pnl) {
+                        (Some(realized), Some(unrealized)) => {
+                            let pnl = decimal_to_f64(realized + unrealized);
+                            ui.colored_label(theme::value_color(pnl), format!("{pnl:+.2}"));
+                        }
+                        _ => {
+                            ui.monospace("—");
+                        }
+                    }
                     ui.monospace(strategy.config_epoch.to_string());
                     ui.end_row();
                     if let Some(attention) = &strategy.attention {

@@ -8,20 +8,14 @@ publish = false
 [features]
 default = []
 binance = [
-    "dep:venue",
     "dep:venue-gateway-binance",
-    "venue/hedged-grid-binance",
 ]
 bitget = [
-    "dep:venue",
     "dep:venue-gateway-bitget",
-    "venue/hedged-grid-bitget",
 ]
 bybit = ["dep:venue-gateway-bybit"]
 gate = [
-    "dep:venue",
     "dep:venue-gateway-gate",
-    "venue/hedged-grid-gate",
 ]
 hyperliquid = ["dep:venue-gateway-hyperliquid"]
 okx = ["dep:venue-gateway-okx"]
@@ -65,11 +59,10 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-venue = { path = "../..", optional = true, default-features = false }
+tokio.workspace = true
 venue-control-protocol = { path = "../../crates/venue-control-protocol" }
 venue-copy = { path = "../../crates/venue-copy" }
 venue-domain = { path = "../../crates/venue-domain" }
-venue-execution = { path = "../../crates/venue-execution" }
 venue-gateway-api = { path = "../../crates/venue-gateway-api" }
 venue-gateway-binance = { path = "../../crates/venue-gateway-binance", optional = true }
 venue-gateway-bitget = { path = "../../crates/venue-gateway-bitget", optional = true }
@@ -79,6 +72,8 @@ venue-gateway-hyperliquid = { path = "../../crates/venue-gateway-hyperliquid", o
 venue-gateway-okx = { path = "../../crates/venue-gateway-okx", optional = true }
 venue-runtime = { path = "../../crates/venue-runtime" }
 venue-storage = { path = "../../crates/venue-storage" }
+venue-strategies = { path = "../../crates/venue-strategies" }
+venue-indicators = { path = "../../crates/venue-indicators" }
 
 [dev-dependencies]
 tempfile.workspace = true

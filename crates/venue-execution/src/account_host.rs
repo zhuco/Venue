@@ -1,18 +1,126 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use fs2::FileExt;
 use rust_decimal::Decimal;
-use venue_domain::domain::{CommandId, ExecutionCommand};
+use sha2::{Digest, Sha256};
+use venue_domain::domain::{
+    Asset, CommandId, ExecutionCommand, InstrumentIdentity, MarketKind, NativeOrderFamily,
+    OrderOwner, OrderSide, Position, PositionSide, Price,
+};
 use venue_gateway_api::GatewayBinding;
 
-use crate::{CommandJournal, CommandJournalError, CommandState};
+use crate::{
+    AccountCanonicalRootGuard, CommandJournal, CommandJournalError, CommandState,
+    LegacyV1WriterGuard, LegacyV1WriterPredecessor, WriterScope, acquire_account_canonical_root,
+};
 
 pub const COMMAND_JOURNAL_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
 pub const COMMAND_JOURNAL_HARD_LIMIT_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_RISK_EVIDENCE_AGE_MS: u64 = 60_000;
+const RUNTIME_BOOTSTRAP_FILE: &str = "signed-account-bootstrap.json";
+const RUNTIME_CHECKPOINT_LIMIT_BYTES: usize = 5 * 1024 * 1024;
+
+#[path = "account_net_reduce.rs"]
+mod account_net_reduce;
+use account_net_reduce::{
+    NetReduceSettlement, PersistedSignedBootstrap, completed_net_reduce_settlement,
+    load_previous_signed_bootstrap, validate_recovered_net_reduce_settlements,
+};
+
+#[path = "account_scope.rs"]
+mod account_scope;
+#[path = "account_snapshot.rs"]
+mod account_snapshot;
+#[path = "account_symbols.rs"]
+mod account_symbols;
+use account_scope::{
+    has_open_entry_reservation, is_risk_increasing, snapshot_covers_binding_position_mode,
+    snapshot_covers_configured_symbols, validate_command_scope, wal_entry_reservation_total,
+};
+#[allow(unused_imports)]
+pub use account_snapshot::{
+    AccountQuoteToUsdtRate, AccountRiskAmount, AccountRiskEvidence, RuntimeBootstrapReceipt,
+    SignedAccountBalance, SignedAccountOrderFact, SignedAccountPositionFact,
+    SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
+};
+pub use account_symbols::AccountSymbolSet;
+
+/// Auditable components of the account-level 10U admission calculation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountRiskSummary {
+    signed_positions: Decimal,
+    open_entry_orders: Decimal,
+    wal_entry_reservations: Decimal,
+    candidate_entry: Decimal,
+}
+
+/// Semantic limit intent.  Strategy/Control supplies only quote exposure and immutable identity;
+/// the physical gateway must derive current quantity and a post-only price from fresh venue facts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountLimitNormalizationIntent {
+    pub command_id: CommandId,
+    pub client_order_id: CommandId,
+    pub owner: OrderOwner,
+    pub side: OrderSide,
+    pub position_side: PositionSide,
+    pub quote_delta: Decimal,
+    pub reduce_only: bool,
+}
+
+/// Exact read-only rules identity for the account binding. Copy planning does not consume a
+/// static tick/minimum-notional, which some venues express as a dynamic native rule.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountInstrumentIdentity {
+    pub identity: InstrumentIdentity,
+    pub rules_generation: u64,
+}
+
+impl AccountLimitNormalizationIntent {
+    pub fn validate(&self) -> Result<(), AccountHostValidationError> {
+        if self.quote_delta <= Decimal::ZERO || Asset::new(self.owner.symbol.quote()).is_err() {
+            return Err(AccountHostValidationError::Command);
+        }
+        self.owner
+            .validate()
+            .map_err(|_| AccountHostValidationError::Command)
+    }
+}
+
+impl AccountRiskSummary {
+    #[must_use]
+    pub const fn signed_positions(&self) -> Decimal {
+        self.signed_positions
+    }
+
+    #[must_use]
+    pub const fn open_entry_orders(&self) -> Decimal {
+        self.open_entry_orders
+    }
+
+    #[must_use]
+    pub const fn wal_entry_reservations(&self) -> Decimal {
+        self.wal_entry_reservations
+    }
+
+    #[must_use]
+    pub const fn candidate_entry(&self) -> Decimal {
+        self.candidate_entry
+    }
+
+    pub fn total(&self) -> Result<Decimal, AccountHostValidationError> {
+        self.signed_positions
+            .checked_add(self.open_entry_orders)
+            .and_then(|value| value.checked_add(self.wal_entry_reservations))
+            .and_then(|value| value.checked_add(self.candidate_entry))
+            .ok_or(AccountHostValidationError::Notional)
+    }
+}
 
 /// Minimal production boundary for the current single-machine account process. The gateway can
 /// mutate only by consuming a permit created after the same host persisted `Submitted`.
@@ -27,13 +135,63 @@ pub trait AccountPhysicalGateway {
         request: &AccountRecoveryRequest,
     ) -> Result<AccountRecoveryReport, Self::Error>;
 
+    /// Returns a single complete signed account observation. The default is deliberately
+    /// fail-closed so adding this host to an existing adapter never enables entry risk until the
+    /// adapter has proved its position and open-order coverage.
+    fn risk_evidence(&mut self) -> Result<AccountRiskEvidence, AccountHostValidationError> {
+        Err(AccountHostValidationError::RiskEvidence)
+    }
+
+    /// Adapters must explicitly implement the complete signed collector before Runtime can be
+    /// made Ready.  The default is read-only failure, never an empty-account assertion.
+    fn signed_account_snapshot(
+        &mut self,
+        _request: &AccountRecoveryRequest,
+    ) -> Result<SignedAccountSnapshot, AccountHostValidationError> {
+        Err(AccountHostValidationError::SignedSnapshot)
+    }
+
+    /// Current adapter-validated rules identity for the gateway binding. It remains a read-only
+    /// fact: callers must still compare its generation to a fresh signed account snapshot before
+    /// using it for Copy planning.
+    fn current_instrument(
+        &mut self,
+    ) -> Result<AccountInstrumentIdentity, AccountHostValidationError> {
+        Err(AccountHostValidationError::Instrument)
+    }
+
+    /// Per-symbol variant for a Host that has already registered multiple canonical symbols.
+    /// Existing adapters stay fail-closed for every non-anchor symbol until they implement it.
+    fn current_instrument_for(
+        &mut self,
+        symbol: &venue_domain::domain::Symbol,
+    ) -> Result<AccountInstrumentIdentity, AccountHostValidationError> {
+        if symbol != &self.binding().symbol {
+            return Err(AccountHostValidationError::Instrument);
+        }
+        self.current_instrument()
+    }
+
+    /// Maps semantic quote exposure to a current post-only `PlaceLimit`. Default failure keeps an
+    /// adapter from inheriting entry capability before it proves rules, BBO and side semantics.
+    fn normalize_limit_intent(
+        &mut self,
+        _intent: &AccountLimitNormalizationIntent,
+    ) -> Result<ExecutionCommand, AccountHostValidationError> {
+        Err(AccountHostValidationError::Command)
+    }
+
     fn dispatch(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccountRecoveryRequest {
     binding: GatewayBinding,
+    configured_symbols: AccountSymbolSet,
     unresolved: Vec<ExecutionCommand>,
+    /// The last durably committed native fills watermark. `None` is an intentionally bounded
+    /// first collection; adapters must not silently substitute an unbounded history scan.
+    previous_fills_cursor: Option<String>,
 }
 
 impl AccountRecoveryRequest {
@@ -43,8 +201,18 @@ impl AccountRecoveryRequest {
     }
 
     #[must_use]
+    pub const fn configured_symbols(&self) -> &AccountSymbolSet {
+        &self.configured_symbols
+    }
+
+    #[must_use]
     pub fn unresolved(&self) -> &[ExecutionCommand] {
         &self.unresolved
+    }
+
+    #[must_use]
+    pub fn previous_fills_cursor(&self) -> Option<&str> {
+        self.previous_fills_cursor.as_deref()
     }
 }
 
@@ -119,7 +287,7 @@ impl AccountRecoveryOutcome {
     }
 
     #[must_use]
-    pub const fn command_id(&self) -> &CommandId {
+    pub fn command_id(&self) -> &CommandId {
         &self.command_id
     }
 
@@ -141,6 +309,53 @@ pub struct AccountDispatchPermit {
     binding: GatewayBinding,
     command: ExecutionCommand,
     max_entry_notional: Decimal,
+}
+
+/// Linear proof that this exact command already owns a fsynced `Prepared` record in this
+/// account's sole command WAL. Its fields stay private so a resident or Node caller cannot
+/// manufacture a physical-dispatch capability from a command id.
+#[derive(Debug)]
+pub struct HostPreparedCommand {
+    binding: GatewayBinding,
+    command: ExecutionCommand,
+    command_sha256: [u8; 32],
+    receipt_sequence: u64,
+    record_sha256: [u8; 32],
+    cancel_target_family: Option<NativeOrderFamily>,
+}
+
+impl HostPreparedCommand {
+    #[must_use]
+    pub fn command_id(&self) -> &CommandId {
+        self.command.command_id()
+    }
+
+    #[must_use]
+    pub const fn command(&self) -> &ExecutionCommand {
+        &self.command
+    }
+
+    #[must_use]
+    pub const fn binding(&self) -> &GatewayBinding {
+        &self.binding
+    }
+
+    /// Read-only allocation facts for Runtime's sealed lane admission. They are useless without
+    /// this non-constructible capability, which `dispatch_prepared` re-verifies against the WAL.
+    #[must_use]
+    pub const fn receipt_sequence(&self) -> u64 {
+        self.receipt_sequence
+    }
+
+    #[must_use]
+    pub const fn receipt_digest(&self) -> [u8; 32] {
+        self.record_sha256
+    }
+
+    #[must_use]
+    pub const fn cancel_target_family(&self) -> Option<NativeOrderFamily> {
+        self.cancel_target_family
+    }
 }
 
 impl AccountDispatchPermit {
@@ -174,25 +389,142 @@ pub enum AccountDispatchOutcome {
     Unknown,
 }
 
+/// Read-only projection of the sole command WAL. It is bound to an account and exact durable
+/// receipt, but is neither a dispatch permit nor a way to recover the contained command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountCommandStatus {
+    binding: GatewayBinding,
+    command_id: CommandId,
+    state: CommandState,
+    sequence: u64,
+    record_sha256: [u8; 32],
+}
+
+impl AccountCommandStatus {
+    #[must_use]
+    pub const fn binding(&self) -> &GatewayBinding {
+        &self.binding
+    }
+
+    #[must_use]
+    pub const fn command_id(&self) -> &CommandId {
+        &self.command_id
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> &CommandState {
+        &self.state
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    #[must_use]
+    pub const fn record_sha256(&self) -> [u8; 32] {
+        self.record_sha256
+    }
+}
+
 #[derive(Debug)]
 pub struct AccountMutationHost<G> {
     binding: GatewayBinding,
+    configured_symbols: AccountSymbolSet,
     max_entry_notional: Decimal,
     journal_path: PathBuf,
+    fills_cursor: Option<String>,
+    latest_signed_snapshot: Option<SignedAccountSnapshot>,
+    private_generation_floor: u64,
+    private_generation_offset: u64,
+    last_gateway_private_generation: Option<u64>,
+    net_reduce_settlements: BTreeMap<CommandId, NetReduceSettlement>,
     journal: CommandJournal,
     gateway: G,
+    _canonical_root: Option<AccountCanonicalRootGuard>,
+    _legacy_predecessor: Option<LegacyV1WriterGuard>,
     _account_lock: File,
 }
 
 impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
+    /// Executes a bounded adapter read while the account Host retains the only mutation permit
+    /// issuer. The callback cannot obtain a permit; callers use this for normalized feed pumps.
+    pub fn with_gateway_read<T>(
+        &mut self,
+        operation: impl FnOnce(&mut G) -> Result<T, G::Error>,
+    ) -> Result<T, G::Error> {
+        operation(&mut self.gateway)
+    }
+
+    /// Exposes only adapter-validated rules identity facts. The Host retains every mutation
+    /// authority and performs no configuration-derived market/settlement inference.
+    pub fn current_instrument(
+        &mut self,
+    ) -> Result<AccountInstrumentIdentity, AccountHostError<G::Error>> {
+        self.current_instrument_for(&self.binding.symbol.clone())
+    }
+
+    /// Returns a fresh adapter fact only for an explicitly configured symbol.  The account
+    /// binding remains the common credential/WAL scope; symbol is not inferred from a command.
+    pub fn current_instrument_for(
+        &mut self,
+        symbol: &venue_domain::domain::Symbol,
+    ) -> Result<AccountInstrumentIdentity, AccountHostError<G::Error>> {
+        if !self.configured_symbols.contains(symbol) {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::Scope,
+            ));
+        }
+        let instrument = self
+            .gateway
+            .current_instrument_for(symbol)
+            .map_err(AccountHostError::Validation)?;
+        let valid_market = match instrument.identity.market {
+            MarketKind::Spot => instrument.identity.settlement_asset.is_none(),
+            MarketKind::LinearPerpetual => instrument
+                .identity
+                .settlement_asset
+                .as_ref()
+                .is_some_and(|asset| asset.as_str() == self.binding.symbol.quote()),
+        };
+        if instrument.rules_generation == 0
+            || instrument.identity.symbol != *symbol
+            || !valid_market
+        {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::Instrument,
+            ));
+        }
+        Ok(instrument)
+    }
+
     pub fn open(
         artifacts_root: impl Into<PathBuf>,
         binding: GatewayBinding,
         max_entry_notional: Decimal,
+        gateway: G,
+    ) -> Result<Self, AccountHostError<G::Error>> {
+        Self::open_with_symbols(
+            artifacts_root,
+            binding.clone(),
+            AccountSymbolSet::single(&binding),
+            max_entry_notional,
+            gateway,
+        )
+    }
+
+    pub fn open_with_symbols(
+        artifacts_root: impl Into<PathBuf>,
+        binding: GatewayBinding,
+        configured_symbols: AccountSymbolSet,
+        max_entry_notional: Decimal,
         mut gateway: G,
     ) -> Result<Self, AccountHostError<G::Error>> {
         binding.validate().map_err(AccountHostError::Binding)?;
-        if gateway.binding() != &binding || max_entry_notional != Decimal::TEN {
+        if !configured_symbols.contains(&binding.symbol)
+            || gateway.binding() != &binding
+            || max_entry_notional != Decimal::TEN
+        {
             return Err(AccountHostError::Validation(
                 AccountHostValidationError::Scope,
             ));
@@ -243,9 +575,31 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(AccountHostError::Validation)?;
+        let previous_bootstrap =
+            load_previous_signed_bootstrap(&artifacts_root, &binding, RUNTIME_BOOTSTRAP_FILE)
+                .map_err(AccountHostError::Validation)?;
+        let previous_snapshot = previous_bootstrap
+            .as_ref()
+            .map(|bootstrap| bootstrap.snapshot.clone());
+        let net_reduce_settlements = previous_bootstrap
+            .as_ref()
+            .map_or_else(BTreeMap::new, |bootstrap| {
+                bootstrap.net_reduce_settlements.clone()
+            });
+        validate_recovered_net_reduce_settlements(
+            &journal,
+            previous_snapshot.as_ref(),
+            &net_reduce_settlements,
+        )
+        .map_err(AccountHostError::Validation)?;
+        let fills_cursor = previous_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.fills_cursor().to_owned());
         let request = AccountRecoveryRequest {
             binding: binding.clone(),
+            configured_symbols: configured_symbols.clone(),
             unresolved,
+            previous_fills_cursor: fills_cursor.clone(),
         };
         let report = gateway
             .reconcile(&request)
@@ -255,12 +609,83 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         require_journal_budget(&journal_path).map_err(AccountHostError::Validation)?;
         Ok(Self {
             binding,
+            configured_symbols,
             max_entry_notional,
             journal_path,
+            fills_cursor,
+            private_generation_floor: previous_snapshot
+                .as_ref()
+                .map_or(0, SignedAccountSnapshot::private_generation),
+            latest_signed_snapshot: previous_snapshot,
+            private_generation_offset: 0,
+            last_gateway_private_generation: None,
+            net_reduce_settlements,
             journal,
             gateway,
+            _canonical_root: None,
+            _legacy_predecessor: None,
             _account_lock: account_lock,
         })
+    }
+
+    /// Takes over a frozen Stage-7 scope only from an explicit predecessor record. The legacy
+    /// product account/hash are never inferred from the new trading account; both the exact v1
+    /// lock and the current canonical account lock remain held for the full Host lifetime.
+    pub fn open_with_legacy_v1_predecessor(
+        artifacts_root: impl Into<PathBuf>,
+        binding: GatewayBinding,
+        max_entry_notional: Decimal,
+        gateway: G,
+        predecessor: LegacyV1WriterPredecessor,
+    ) -> Result<Self, AccountHostError<G::Error>> {
+        Self::open_with_symbols_and_legacy_v1_predecessor(
+            artifacts_root,
+            binding.clone(),
+            AccountSymbolSet::single(&binding),
+            max_entry_notional,
+            gateway,
+            predecessor,
+        )
+    }
+
+    pub fn open_with_symbols_and_legacy_v1_predecessor(
+        artifacts_root: impl Into<PathBuf>,
+        binding: GatewayBinding,
+        configured_symbols: AccountSymbolSet,
+        max_entry_notional: Decimal,
+        gateway: G,
+        predecessor: LegacyV1WriterPredecessor,
+    ) -> Result<Self, AccountHostError<G::Error>> {
+        if predecessor.exchange != binding.venue {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::LegacyPredecessor,
+            ));
+        }
+        let artifacts_root = artifacts_root.into();
+        let legacy = predecessor
+            .acquire()
+            .map_err(AccountHostError::CanonicalRoot)?;
+        let scope = WriterScope {
+            exchange: binding.venue.as_str().to_owned(),
+            account: binding.trading_account_id.clone(),
+            symbol: binding.symbol.clone(),
+            owner_scope: "unified_account_runtime".to_owned(),
+        };
+        // Custody root remains the registered legacy root, while the unified runtime keeps its
+        // own bounded WAL/checkpoint root. Rebinding Gate's existing v2 entry would fork writer
+        // custody and is therefore fail-closed.
+        let canonical = acquire_account_canonical_root(&scope, &predecessor.legacy_artifacts_root)
+            .map_err(AccountHostError::CanonicalRoot)?;
+        let mut host = Self::open_with_symbols(
+            artifacts_root,
+            binding,
+            configured_symbols,
+            max_entry_notional,
+            gateway,
+        )?;
+        host._canonical_root = Some(canonical);
+        host._legacy_predecessor = Some(legacy);
+        Ok(host)
     }
 
     #[must_use]
@@ -269,16 +694,518 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
     }
 
     #[must_use]
+    pub const fn configured_symbols(&self) -> &AccountSymbolSet {
+        &self.configured_symbols
+    }
+
+    #[must_use]
     pub fn has_unresolved(&self) -> bool {
         self.journal.has_unresolved()
     }
 
-    pub fn dispatch(
+    /// Read-only WAL commitment for the Runtime's actor-applied store.  It is not a command,
+    /// permit, or mutation capability.
+    pub fn runtime_wal_head(
+        &self,
+    ) -> Result<venue_storage::DurableWalHead, AccountHostError<G::Error>> {
+        self.journal
+            .durable_wal_head()
+            .map_err(AccountHostError::Journal)
+    }
+
+    /// Verifies an Actor checkpoint's former WAL observation against this same recovered WAL.
+    /// This is read-only and is used only by resident startup, never by dispatch.
+    #[must_use]
+    pub fn validates_historical_wal_head(&self, head: venue_storage::DurableWalHead) -> bool {
+        self.journal.validates_historical_wal_head(head)
+    }
+
+    pub fn command_status(
+        &self,
+        command_id: &CommandId,
+    ) -> Result<Option<AccountCommandStatus>, AccountHostError<G::Error>> {
+        let Some(receipt) = self.journal.receipt(command_id) else {
+            return Ok(None);
+        };
+        Ok(Some(AccountCommandStatus {
+            binding: self.binding.clone(),
+            command_id: command_id.clone(),
+            state: receipt.state.clone(),
+            sequence: receipt.sequence,
+            record_sha256: receipt_sha256(receipt).map_err(AccountHostError::Validation)?,
+        }))
+    }
+
+    /// Returns a detached command copied from this account's sole durable WAL receipt. It is
+    /// observability only: the copy cannot construct a prepared proof or dispatch permit.
+    #[must_use]
+    pub fn command_snapshot(&self, command_id: &CommandId) -> Option<ExecutionCommand> {
+        self.journal
+            .receipt(command_id)
+            .map(|receipt| receipt.command.clone())
+    }
+
+    /// Resolves a fill's native venue order id only through the Accepted WAL identity index.
+    /// Ambiguous ids and an order-family mismatch deliberately remain unowned.
+    #[must_use]
+    pub fn command_snapshot_by_venue_order_id(
+        &self,
+        family: NativeOrderFamily,
+        venue_order_id: &str,
+    ) -> Option<ExecutionCommand> {
+        let client_id = self.journal.client_id_by_venue_order_id(venue_order_id)?;
+        let command_id = self.journal.command_id_by_client_id(client_id)?;
+        let command = &self.journal.receipt(command_id)?.command;
+        (command.native_order_family() == Some(family)).then(|| command.clone())
+    }
+
+    /// Complete accepted native identities for one exact Owner, recovered only from this Host's
+    /// command WAL. Submitted/Unknown and ambiguous native ids stay out: Runtime must never
+    /// manufacture a cancel route from a partial exchange observation.
+    #[must_use]
+    pub fn accepted_order_routes_for_owner(
+        &self,
+        owner: &OrderOwner,
+    ) -> Vec<crate::NativeOrderRoute> {
+        self.accepted_order_routes()
+            .into_iter()
+            .filter(|route| route.owner == *owner)
+            .collect()
+    }
+
+    /// Complete accepted routes from this single WAL. The Runtime Host applies its own exact
+    /// registered-owner filter before restoring router state for one actor.
+    #[must_use]
+    pub fn accepted_order_routes(&self) -> Vec<crate::NativeOrderRoute> {
+        self.journal
+            .native_order_routes()
+            .into_iter()
+            .filter(|route| {
+                matches!(route.state, CommandState::Accepted { .. })
+                    && route.venue_order_id.is_some()
+            })
+            .collect()
+    }
+
+    /// Normalization remains inside the account host so callers cannot manufacture a price or
+    /// quantity. The resulting command still has no side effect until `prepare_for_lane` fsyncs
+    /// it into the sole command WAL.
+    pub fn normalize_limit_intent(
+        &mut self,
+        intent: &AccountLimitNormalizationIntent,
+    ) -> Result<ExecutionCommand, AccountHostError<G::Error>> {
+        intent.validate().map_err(AccountHostError::Validation)?;
+        if intent.owner.exchange != self.binding.venue.as_str()
+            || intent.owner.account != self.binding.trading_account_id
+            || !self.configured_symbols.contains(&intent.owner.symbol)
+        {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::Scope,
+            ));
+        }
+        let command = self
+            .gateway
+            .normalize_limit_intent(intent)
+            .map_err(AccountHostError::Validation)?;
+        if !matches!(command, ExecutionCommand::PlaceLimit(_))
+            || command.command_id() != &intent.command_id
+            || command.native_client_id() != Some(&intent.client_order_id)
+        {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::Command,
+            ));
+        }
+        validate_command_scope(&command, &self.binding, &self.configured_symbols)
+            .map_err(AccountHostError::Validation)?;
+        Ok(command)
+    }
+
+    pub fn refresh_signed_snapshot(
+        &mut self,
+    ) -> Result<SignedAccountSnapshot, AccountHostError<G::Error>> {
+        let request = AccountRecoveryRequest {
+            binding: self.binding.clone(),
+            configured_symbols: self.configured_symbols.clone(),
+            unresolved: Vec::new(),
+            previous_fills_cursor: self.fills_cursor.clone(),
+        };
+        let mut snapshot = self
+            .gateway
+            .signed_account_snapshot(&request)
+            .map_err(AccountHostError::Validation)?;
+        self.ratchet_private_generation(&mut snapshot)?;
+        if snapshot.binding() != &self.binding {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::SignedSnapshot,
+            ));
+        }
+        self.enrich_signed_order_owners(&mut snapshot);
+        self.persist_signed_snapshot(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    /// Re-reads the complete signed account snapshot for every unresolved WAL identity, then
+    /// settles only the requested identity from its exact signed result. UNKNOWN remains durable
+    /// and is never resubmitted by this read-only convergence path.
+    pub fn reconcile_command_status(
+        &mut self,
+        command_id: &CommandId,
+    ) -> Result<Option<AccountCommandStatus>, AccountHostError<G::Error>> {
+        let Some(current) = self.journal.receipt(command_id).cloned() else {
+            return Ok(None);
+        };
+        if !matches!(
+            current.state,
+            CommandState::Submitted | CommandState::Unknown { .. }
+        ) {
+            return self.command_status(command_id);
+        }
+        let unresolved = self
+            .journal
+            .unresolved_command_ids()
+            .iter()
+            .map(|id| {
+                self.journal
+                    .receipt(id)
+                    .map(|receipt| receipt.command.clone())
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(AccountHostValidationError::Recovery)
+            .map_err(AccountHostError::Validation)?;
+        let request = AccountRecoveryRequest {
+            binding: self.binding.clone(),
+            configured_symbols: self.configured_symbols.clone(),
+            unresolved,
+            previous_fills_cursor: self.fills_cursor.clone(),
+        };
+        let mut snapshot = self
+            .gateway
+            .signed_account_snapshot(&request)
+            .map_err(AccountHostError::Validation)?;
+        self.ratchet_private_generation(&mut snapshot)?;
+        let now = now_ms().map_err(AccountHostError::Validation)?;
+        if snapshot.binding() != &self.binding
+            || now < snapshot.observed_at_ms()
+            || now.saturating_sub(snapshot.observed_at_ms()) > MAX_RISK_EVIDENCE_AGE_MS
+        {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::SignedSnapshot,
+            ));
+        }
+        let actual = snapshot
+            .unknown_results()
+            .iter()
+            .map(|fact| (fact.command_id.clone(), &fact.result))
+            .collect::<BTreeMap<_, _>>();
+        if actual.len() != request.unresolved.len()
+            || request
+                .unresolved
+                .iter()
+                .any(|command| !actual.contains_key(command.command_id()))
+        {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::SignedSnapshot,
+            ));
+        }
+        match actual
+            .get(command_id)
+            .ok_or(AccountHostValidationError::SignedSnapshot)
+            .map_err(AccountHostError::Validation)?
+        {
+            SignedUnknownResult::Accepted { venue_order_id } => {
+                self.journal
+                    .transition(
+                        command_id,
+                        CommandState::Accepted {
+                            venue_order_id: venue_order_id.clone(),
+                        },
+                    )
+                    .map_err(AccountHostError::Journal)?;
+            }
+            SignedUnknownResult::Rejected { reason } => {
+                self.journal
+                    .transition(
+                        command_id,
+                        CommandState::Rejected {
+                            reason: reason.clone(),
+                        },
+                    )
+                    .map_err(AccountHostError::Journal)?;
+            }
+            SignedUnknownResult::Unknown => {}
+        }
+        self.enrich_signed_order_owners(&mut snapshot);
+        self.persist_signed_snapshot(&snapshot)?;
+        self.command_status(command_id)
+    }
+
+    pub fn durable_runtime_bootstrap(
+        &mut self,
+    ) -> Result<RuntimeBootstrapReceipt, AccountHostError<G::Error>> {
+        self.collect_durable_runtime_snapshot()
+    }
+
+    /// Re-collects the complete signed account state for a Runtime that is already Ready. The
+    /// Host requests every WAL UNKNOWN and settles only exact signed terminal outcomes before
+    /// publishing the replacement checkpoint; a caller cannot clear an UNKNOWN with a snapshot.
+    pub fn durable_runtime_refresh(
+        &mut self,
+    ) -> Result<RuntimeBootstrapReceipt, AccountHostError<G::Error>> {
+        self.collect_durable_runtime_snapshot()
+    }
+
+    fn collect_durable_runtime_snapshot(
+        &mut self,
+    ) -> Result<RuntimeBootstrapReceipt, AccountHostError<G::Error>> {
+        let unresolved = self
+            .journal
+            .unresolved_command_ids()
+            .iter()
+            .map(|command_id| {
+                self.journal
+                    .receipt(command_id)
+                    .map(|receipt| receipt.command.clone())
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(AccountHostValidationError::Recovery)
+            .map_err(AccountHostError::Validation)?;
+        let request = AccountRecoveryRequest {
+            binding: self.binding.clone(),
+            configured_symbols: self.configured_symbols.clone(),
+            unresolved,
+            previous_fills_cursor: self.fills_cursor.clone(),
+        };
+        let mut snapshot = self
+            .gateway
+            .signed_account_snapshot(&request)
+            .map_err(AccountHostError::Validation)?;
+        self.ratchet_private_generation(&mut snapshot)?;
+        self.validate_runtime_snapshot(&snapshot, &request)?;
+        self.settle_signed_unknown_results(&snapshot)?;
+        self.enrich_signed_order_owners(&mut snapshot);
+        let external_order = snapshot.open_orders().iter().any(|fact| fact.external);
+        self.persist_signed_snapshot(&snapshot)?;
+        let risk_fenced = external_order
+            || !snapshot.open_orders().is_empty()
+            || snapshot
+                .positions()
+                .iter()
+                .any(|position| !position.quantity.is_zero())
+            || self.journal.has_unresolved();
+        Ok(RuntimeBootstrapReceipt {
+            snapshot,
+            risk_fenced,
+            wal_head: self.runtime_wal_head()?,
+        })
+    }
+
+    fn validate_runtime_snapshot(
+        &self,
+        snapshot: &SignedAccountSnapshot,
+        request: &AccountRecoveryRequest,
+    ) -> Result<(), AccountHostError<G::Error>> {
+        let now = now_ms().map_err(AccountHostError::Validation)?;
+        if snapshot.binding() != &self.binding
+            || now < snapshot.observed_at_ms()
+            || now.saturating_sub(snapshot.observed_at_ms()) > MAX_RISK_EVIDENCE_AGE_MS
+            || !snapshot_covers_configured_symbols(snapshot, &self.configured_symbols)
+        {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::SignedSnapshot,
+            ));
+        }
+        let actual = snapshot
+            .unknown_results()
+            .iter()
+            .map(|fact| (fact.command_id.clone(), ()))
+            .collect::<BTreeMap<_, _>>();
+        if request.unresolved.len() != actual.len()
+            || request
+                .unresolved
+                .iter()
+                .any(|command| !actual.contains_key(command.command_id()))
+        {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::SignedSnapshot,
+            ));
+        }
+        Ok(())
+    }
+
+    fn settle_signed_unknown_results(
+        &mut self,
+        snapshot: &SignedAccountSnapshot,
+    ) -> Result<(), AccountHostError<G::Error>> {
+        for fact in snapshot.unknown_results() {
+            let state = match &fact.result {
+                SignedUnknownResult::Accepted { venue_order_id } => CommandState::Accepted {
+                    venue_order_id: venue_order_id.clone(),
+                },
+                SignedUnknownResult::Rejected { reason } => CommandState::Rejected {
+                    reason: reason.clone(),
+                },
+                SignedUnknownResult::Unknown => continue,
+            };
+            self.journal
+                .transition(&fact.command_id, state)
+                .map_err(AccountHostError::Journal)?;
+        }
+        Ok(())
+    }
+
+    fn enrich_signed_order_owners(&self, snapshot: &mut SignedAccountSnapshot) {
+        for fact in snapshot.open_orders_mut() {
+            // Adapter payload ownership is untrusted input. Begin external and attach the sole
+            // WAL owner only after both native identities and order semantics agree.
+            fact.owner = None;
+            fact.external = true;
+            let Some(command) = self.command_for_signed_order(fact) else {
+                continue;
+            };
+            let Some(owner) = command.owner() else {
+                continue;
+            };
+            fact.owner = Some(owner.clone());
+            fact.external = false;
+        }
+    }
+
+    fn command_for_signed_order(&self, fact: &SignedAccountOrderFact) -> Option<&ExecutionCommand> {
+        let client_id = CommandId::new(fact.client_order_id.clone()).ok()?;
+        let command_id = self.journal.command_id_by_client_id(&client_id)?;
+        if let Some(venue_order_id) = &fact.venue_order_id {
+            match self.journal.client_id_by_venue_order_id(venue_order_id) {
+                Some(mapped_client_id) if mapped_client_id == &client_id => {}
+                Some(_) => return None,
+                None => {
+                    // Before an UNKNOWN's signed Accepted transition, only its same client id
+                    // can be considered; an Accepted receipt without a unique native-id index is
+                    // deliberately not attributed.
+                    if !matches!(
+                        self.journal.receipt(command_id)?.state,
+                        CommandState::Submitted | CommandState::Unknown { .. }
+                    ) {
+                        return None;
+                    }
+                }
+            }
+        }
+        let command = &self.journal.receipt(command_id)?.command;
+        command_matches_signed_order(command, fact).then_some(command)
+    }
+
+    fn persist_signed_snapshot(
+        &mut self,
+        snapshot: &SignedAccountSnapshot,
+    ) -> Result<(), AccountHostError<G::Error>> {
+        let net_reduce_settlements = self.completed_net_reductions(snapshot)?;
+        let path = self
+            .journal_path
+            .parent()
+            .ok_or(AccountHostValidationError::ArtifactsRoot)
+            .map_err(AccountHostError::Validation)?
+            .join(RUNTIME_BOOTSTRAP_FILE);
+        let encoded = serde_json::to_vec(&PersistedSignedBootstrap {
+            snapshot: snapshot.clone(),
+            net_reduce_settlements: net_reduce_settlements.clone(),
+        })
+        .map_err(|_| AccountHostError::Validation(AccountHostValidationError::SignedSnapshot))?;
+        if encoded.len() > RUNTIME_CHECKPOINT_LIMIT_BYTES {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::SignedSnapshot,
+            ));
+        }
+        let temporary = path.with_extension("tmp");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|source| AccountHostError::Io {
+                path: temporary.clone(),
+                source,
+            })?;
+        file.write_all(&encoded)
+            .map_err(|source| AccountHostError::Io {
+                path: temporary.clone(),
+                source,
+            })?;
+        file.sync_all().map_err(|source| AccountHostError::Io {
+            path: temporary.clone(),
+            source,
+        })?;
+        drop(file);
+        fs::rename(&temporary, &path).map_err(|source| AccountHostError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        crate::journal::sync_parent(&path).map_err(AccountHostError::Journal)?;
+        self.net_reduce_settlements = net_reduce_settlements;
+        self.fills_cursor = Some(snapshot.fills_cursor().to_owned());
+        self.private_generation_floor = snapshot.private_generation();
+        self.latest_signed_snapshot = Some(snapshot.clone());
+        Ok(())
+    }
+
+    fn ratchet_private_generation(
+        &mut self,
+        snapshot: &mut SignedAccountSnapshot,
+    ) -> Result<(), AccountHostError<G::Error>> {
+        let gateway_generation = snapshot.private_generation();
+        if let Some(previous) = self.last_gateway_private_generation {
+            if gateway_generation <= previous {
+                return Err(AccountHostError::Validation(
+                    AccountHostValidationError::SignedSnapshot,
+                ));
+            }
+        } else if gateway_generation <= self.private_generation_floor {
+            let next = self
+                .private_generation_floor
+                .checked_add(1)
+                .ok_or(AccountHostValidationError::SignedSnapshot)
+                .map_err(AccountHostError::Validation)?;
+            self.private_generation_offset = next
+                .checked_sub(gateway_generation)
+                .ok_or(AccountHostValidationError::SignedSnapshot)
+                .map_err(AccountHostError::Validation)?;
+        }
+        let normalized = gateway_generation
+            .checked_add(self.private_generation_offset)
+            .ok_or(AccountHostValidationError::SignedSnapshot)
+            .map_err(AccountHostError::Validation)?;
+        if normalized <= self.private_generation_floor {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::SignedSnapshot,
+            ));
+        }
+        if normalized != gateway_generation {
+            snapshot
+                .rebase_private_generation(normalized)
+                .map_err(AccountHostError::Validation)?;
+        }
+        self.last_gateway_private_generation = Some(gateway_generation);
+        Ok(())
+    }
+
+    /// Fsyncs the sole WAL's `Prepared` record and returns its linear dispatch capability.
+    /// Repeating the exact command returns a capability for the same durable receipt; a changed
+    /// command id or any non-Prepared receipt never receives another capability.
+    pub fn prepare_for_lane(
         &mut self,
         command: ExecutionCommand,
-    ) -> Result<AccountDispatchOutcome, AccountHostError<G::Error>> {
-        validate_command_scope(&command, &self.binding, self.max_entry_notional)
+    ) -> Result<HostPreparedCommand, AccountHostError<G::Error>> {
+        validate_command_scope(&command, &self.binding, &self.configured_symbols)
             .map_err(AccountHostError::Validation)?;
+        self.validate_net_command_against_signed_snapshot(&command)?;
+        let command_id = command.command_id().clone();
+        if let Some(receipt) = self.journal.receipt(&command_id) {
+            if receipt.command != command {
+                return Err(AccountHostError::Validation(
+                    AccountHostValidationError::Duplicate,
+                ));
+            }
+            return self.host_prepared_command(command, receipt);
+        }
         if is_risk_increasing(&command) && self.journal.has_unresolved() {
             return Err(AccountHostError::Validation(
                 AccountHostValidationError::UnknownFence,
@@ -289,25 +1216,81 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
                 AccountHostValidationError::OpenEntryFence,
             ));
         }
+        if is_risk_increasing(&command) {
+            self.require_account_risk_headroom(&command)
+                .map_err(AccountHostError::Validation)?;
+        }
         rotate_if_clean_and_due(&mut self.journal, &self.journal_path)
             .map_err(AccountHostError::Journal)?;
         require_append_budget(&self.journal_path, &command)
             .map_err(AccountHostError::Validation)?;
-        let command_id = command.command_id().clone();
-        if self.journal.receipt(&command_id).is_some() {
+        let receipt = self
+            .journal
+            .prepare(command.clone())
+            .map_err(AccountHostError::Journal)?
+            .clone();
+        self.host_prepared_command(command, &receipt)
+    }
+
+    /// Consumes one Prepared capability after re-reading its exact WAL receipt. In particular,
+    /// this never calls `prepare`: dispatch-after-crash is either the already prepared command
+    /// or a fail-closed error, never a second exchange mutation.
+    pub fn dispatch_prepared(
+        &mut self,
+        prepared: HostPreparedCommand,
+    ) -> Result<AccountDispatchOutcome, AccountHostError<G::Error>> {
+        if prepared.binding != self.binding {
             return Err(AccountHostError::Validation(
-                AccountHostValidationError::Duplicate,
+                AccountHostValidationError::PreparedCommand,
             ));
         }
-        self.journal
-            .prepare(command.clone())
-            .map_err(AccountHostError::Journal)?;
+        let command_id = prepared.command.command_id().clone();
+        let receipt = self
+            .journal
+            .receipt(&command_id)
+            .ok_or(AccountHostError::Validation(
+                AccountHostValidationError::PreparedCommand,
+            ))?;
+        self.verify_prepared_command(&prepared, receipt)?;
+        if let Err(error) = self.validate_net_command_against_signed_snapshot(&prepared.command) {
+            // The exact proof remains Prepared and no gateway call has occurred. Preserve the
+            // signed-position admission failure durably so a stale Net reduction cannot retain
+            // a reservation after its private-generation or freshness fence expires.
+            self.journal
+                .transition(
+                    &command_id,
+                    CommandState::Rejected {
+                        reason: "dispatch_signed_position_recheck_failed".to_owned(),
+                    },
+                )
+                .map_err(AccountHostError::Journal)?;
+            return Err(error);
+        }
+        // A Prepared WAL record may have waited behind the lane. Re-read the signed evidence at
+        // the physical dispatch boundary so neither an expired rate nor a changed account total
+        // can reach the venue merely because admission happened earlier.
+        if is_risk_increasing(&prepared.command)
+            && let Err(error) = self.require_account_risk_headroom(&prepared.command)
+        {
+            // This proof is still exactly Prepared and has not crossed the physical boundary.
+            // Make that non-dispatch durable so its entry reservation cannot survive a failed
+            // final risk check and fence the account forever.
+            self.journal
+                .transition(
+                    &command_id,
+                    CommandState::Rejected {
+                        reason: "dispatch_risk_recheck_failed".to_owned(),
+                    },
+                )
+                .map_err(AccountHostError::Journal)?;
+            return Err(AccountHostError::Validation(error));
+        }
         self.journal
             .transition(&command_id, CommandState::Submitted)
             .map_err(AccountHostError::Journal)?;
         let result = self.gateway.dispatch(AccountDispatchPermit {
             binding: self.binding.clone(),
-            command,
+            command: prepared.command,
             max_entry_notional: self.max_entry_notional,
         });
         let outcome = match result {
@@ -360,6 +1343,310 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
             .map_err(AccountHostError::Journal)?;
         require_journal_budget(&self.journal_path).map_err(AccountHostError::Validation)?;
         Ok(outcome)
+    }
+
+    /// Terminates an exact WAL `Prepared` proof that the resident has deliberately removed from
+    /// its in-memory lane before any physical dispatch.  This cannot affect Submitted or
+    /// Unknown commands: both the proof and current receipt must still be byte-for-byte the
+    /// original Prepared record.
+    pub fn reject_prepared_without_dispatch(
+        &mut self,
+        prepared: &HostPreparedCommand,
+        reason: &str,
+    ) -> Result<(), AccountHostError<G::Error>> {
+        if prepared.binding != self.binding || !valid_text(reason) {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::PreparedCommand,
+            ));
+        }
+        let command_id = prepared.command_id();
+        let receipt = self
+            .journal
+            .receipt(command_id)
+            .ok_or(AccountHostError::Validation(
+                AccountHostValidationError::PreparedCommand,
+            ))?;
+        self.verify_prepared_command(prepared, receipt)?;
+        self.journal
+            .transition(
+                command_id,
+                CommandState::Rejected {
+                    reason: reason.to_owned(),
+                },
+            )
+            .map(|_| ())
+            .map_err(AccountHostError::Journal)
+    }
+
+    /// Test-only convenience; production composition cannot invoke a direct command dispatch.
+    #[cfg(test)]
+    fn dispatch(
+        &mut self,
+        command: ExecutionCommand,
+    ) -> Result<AccountDispatchOutcome, AccountHostError<G::Error>> {
+        let prepared = self.prepare_for_lane(command)?;
+        self.dispatch_prepared(prepared)
+    }
+
+    fn host_prepared_command(
+        &self,
+        command: ExecutionCommand,
+        receipt: &crate::CommandReceipt,
+    ) -> Result<HostPreparedCommand, AccountHostError<G::Error>> {
+        if receipt.command != command || !matches!(receipt.state, CommandState::Prepared) {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::PreparedCommand,
+            ));
+        }
+        let command_sha256 = crate::execution_command_sha256(&command)
+            .map_err(|_| AccountHostError::Validation(AccountHostValidationError::Command))?;
+        if receipt.command_sha256 != hex_sha256(command_sha256) {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::PreparedCommand,
+            ));
+        }
+        Ok(HostPreparedCommand {
+            binding: self.binding.clone(),
+            command,
+            command_sha256,
+            receipt_sequence: receipt.sequence,
+            record_sha256: receipt_sha256(receipt).map_err(AccountHostError::Validation)?,
+            cancel_target_family: self
+                .journal
+                .cancel_target_identity(receipt.command.command_id())
+                .map(|identity| identity.family),
+        })
+    }
+
+    fn verify_prepared_command(
+        &self,
+        prepared: &HostPreparedCommand,
+        receipt: &crate::CommandReceipt,
+    ) -> Result<(), AccountHostError<G::Error>> {
+        if !matches!(receipt.state, CommandState::Prepared)
+            || receipt.command != prepared.command
+            || receipt.sequence != prepared.receipt_sequence
+            || receipt.command_sha256 != hex_sha256(prepared.command_sha256)
+            || receipt_sha256(receipt).map_err(AccountHostError::Validation)?
+                != prepared.record_sha256
+        {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::PreparedCommand,
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_account_risk_headroom(
+        &mut self,
+        command: &ExecutionCommand,
+    ) -> Result<AccountRiskSummary, AccountHostValidationError> {
+        let evidence = self.gateway.risk_evidence()?;
+        evidence.validate_for(&self.binding, now_ms()?)?;
+        let candidate_entry = quote_notional(command)?;
+        let summary = AccountRiskSummary {
+            signed_positions: evidence.signed_position_total()?,
+            open_entry_orders: evidence.open_entry_order_total()?,
+            wal_entry_reservations: wal_entry_reservation_total(&self.journal, &evidence)?,
+            candidate_entry: evidence
+                .value_in_usdt(&candidate_entry.asset, candidate_entry.value)?,
+        };
+        if summary.total()? > self.max_entry_notional {
+            return Err(AccountHostValidationError::AccountRiskLimit);
+        }
+        Ok(summary)
+    }
+
+    fn validate_net_command_against_signed_snapshot(
+        &self,
+        command: &ExecutionCommand,
+    ) -> Result<(), AccountHostError<G::Error>> {
+        let (owner, position_side, position_generation) = match command {
+            ExecutionCommand::PlaceLimit(command) => (&command.owner, command.position_side, None),
+            ExecutionCommand::PlaceMarket(command) => (&command.owner, command.position_side, None),
+            ExecutionCommand::MarketReduce(command) => (
+                &command.owner,
+                command.position_side,
+                Some(command.position_generation),
+            ),
+            ExecutionCommand::StopMarketCloseAll(command) => (
+                &command.owner,
+                command.position_side,
+                Some(command.position_generation),
+            ),
+            ExecutionCommand::StopMarketFullPosition(command) => (
+                &command.owner,
+                command.position_side,
+                Some(command.position_generation),
+            ),
+            ExecutionCommand::Cancel(_) => return Ok(()),
+        };
+        if position_side != PositionSide::Net {
+            return Ok(());
+        }
+        let snapshot = self
+            .latest_signed_snapshot
+            .as_ref()
+            .ok_or(AccountHostValidationError::SignedSnapshot)
+            .map_err(AccountHostError::Validation)?;
+        let now = now_ms().map_err(AccountHostError::Validation)?;
+        if snapshot.binding() != &self.binding
+            || snapshot.position_mode() != SignedAccountPositionMode::Net
+            || now < snapshot.observed_at_ms()
+            || now.saturating_sub(snapshot.observed_at_ms()) > MAX_RISK_EVIDENCE_AGE_MS
+            || position_generation
+                .is_some_and(|generation| generation != snapshot.private_generation())
+        {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::SignedSnapshot,
+            ));
+        }
+        let positions = snapshot
+            .positions()
+            .iter()
+            .filter(|position| {
+                position.symbol == owner.symbol && position.position_side == PositionSide::Net
+            })
+            .collect::<Vec<_>>();
+        let [fact] = positions.as_slice() else {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::SignedSnapshot,
+            ));
+        };
+        let mut quantity = fact.quantity;
+        if matches!(command, ExecutionCommand::MarketReduce(_)) {
+            // An unresolved reduction stays reserved across a later signed generation. A
+            // reconnect must not make an Unknown physical reduction disappear from admission.
+            let reserved = self.pending_net_reduce_quantity(command.command_id(), &owner.symbol)?;
+            let remaining = quantity
+                .abs()
+                .checked_sub(reserved)
+                .filter(|value| !value.is_sign_negative())
+                .ok_or(AccountHostValidationError::SignedSnapshot)
+                .map_err(AccountHostError::Validation)?;
+            quantity = if quantity.is_sign_negative() {
+                -remaining
+            } else {
+                remaining
+            };
+        }
+        let position = Position {
+            symbol: fact.symbol.clone(),
+            side: PositionSide::Net,
+            quantity,
+            entry_price: fact.entry_price.map(Price::new).transpose().map_err(|_| {
+                AccountHostError::Validation(AccountHostValidationError::SignedSnapshot)
+            })?,
+            mark_price: fact.mark_price.map(Price::new).transpose().map_err(|_| {
+                AccountHostError::Validation(AccountHostValidationError::SignedSnapshot)
+            })?,
+        };
+        let valid = match command {
+            ExecutionCommand::PlaceLimit(command) => {
+                command.validate_with_authoritative_position(&position)
+            }
+            ExecutionCommand::PlaceMarket(command) => {
+                command.validate_with_authoritative_position(&position)
+            }
+            ExecutionCommand::MarketReduce(command) => {
+                command.validate_with_authoritative_position(&position)
+            }
+            ExecutionCommand::StopMarketCloseAll(_)
+            | ExecutionCommand::StopMarketFullPosition(_) => {
+                Err(venue_domain::domain::CommandError::PositionSide)
+            }
+            ExecutionCommand::Cancel(_) => Ok(()),
+        };
+        valid.map_err(|_| AccountHostError::Validation(AccountHostValidationError::Command))
+    }
+
+    fn pending_net_reduce_quantity(
+        &self,
+        excluding: &CommandId,
+        symbol: &venue_domain::domain::Symbol,
+    ) -> Result<Decimal, AccountHostError<G::Error>> {
+        self.journal
+            .commands()
+            .filter_map(|candidate| {
+                let ExecutionCommand::MarketReduce(reduce) = candidate else {
+                    return None;
+                };
+                if reduce.command_id == *excluding
+                    || reduce.position_side != PositionSide::Net
+                    || reduce.owner.symbol != *symbol
+                {
+                    return None;
+                }
+                let receipt = self.journal.receipt(&reduce.command_id)?;
+                let retained = match receipt.state {
+                    CommandState::Rejected { .. } => false,
+                    CommandState::Accepted { .. } => {
+                        !self.net_reduce_settlements.contains_key(&reduce.command_id)
+                    }
+                    CommandState::Prepared
+                    | CommandState::Submitted
+                    | CommandState::Unknown { .. } => true,
+                };
+                retained.then_some(reduce.quantity)
+            })
+            .try_fold(Decimal::ZERO, |total, quantity| {
+                total
+                    .checked_add(quantity)
+                    .ok_or(AccountHostError::Validation(
+                        AccountHostValidationError::Notional,
+                    ))
+            })
+    }
+
+    fn completed_net_reductions(
+        &self,
+        snapshot: &SignedAccountSnapshot,
+    ) -> Result<BTreeMap<CommandId, NetReduceSettlement>, AccountHostError<G::Error>> {
+        if snapshot.binding() != &self.binding {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::SignedSnapshot,
+            ));
+        }
+        let mut settlements = self.net_reduce_settlements.clone();
+        if snapshot.position_mode() != SignedAccountPositionMode::Net {
+            return Ok(settlements);
+        }
+        if !snapshot_covers_configured_symbols(snapshot, &self.configured_symbols) {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::SignedSnapshot,
+            ));
+        }
+        let candidates = self
+            .journal
+            .commands()
+            .filter_map(|command| {
+                let ExecutionCommand::MarketReduce(reduce) = command else {
+                    return None;
+                };
+                (reduce.position_side == PositionSide::Net).then_some(reduce.clone())
+            })
+            .collect::<Vec<_>>();
+        for reduce in candidates {
+            if self.net_reduce_settlements.contains_key(&reduce.command_id) {
+                continue;
+            }
+            let Some(receipt) = self.journal.receipt(&reduce.command_id) else {
+                return Err(AccountHostError::Validation(
+                    AccountHostValidationError::Recovery,
+                ));
+            };
+            let CommandState::Accepted { venue_order_id } = &receipt.state else {
+                continue;
+            };
+            let Some(settlement) =
+                completed_net_reduce_settlement(snapshot, &reduce, venue_order_id)
+                    .map_err(AccountHostError::Validation)?
+            else {
+                continue;
+            };
+            settlements.insert(reduce.command_id.clone(), settlement);
+        }
+        Ok(settlements)
     }
 }
 
@@ -432,69 +1719,76 @@ fn validate_artifacts_root(
     Ok(())
 }
 
-fn validate_command_scope(
+fn command_matches_signed_order(command: &ExecutionCommand, fact: &SignedAccountOrderFact) -> bool {
+    if command.native_order_family() != Some(fact.family) {
+        return false;
+    }
+    match command {
+        ExecutionCommand::PlaceLimit(order) => {
+            order.owner.symbol == fact.symbol
+                && order.side == fact.side
+                && order.position_side == fact.position_side
+                && order.quantity == fact.quantity
+                && Some(order.limit_price.value()) == fact.limit_price
+                && order.reduce_only == fact.reduce_only
+        }
+        ExecutionCommand::PlaceMarket(order) => {
+            order.owner.symbol == fact.symbol
+                && order.side == fact.side
+                && order.position_side == fact.position_side
+                && order.quantity == fact.quantity
+                && fact.limit_price.is_none()
+                && !fact.reduce_only
+        }
+        ExecutionCommand::MarketReduce(order) => {
+            order.owner.symbol == fact.symbol
+                && order.side == fact.side
+                && order.position_side == fact.position_side
+                && order.quantity == fact.quantity
+                && fact.limit_price.is_none()
+                && fact.reduce_only
+        }
+        ExecutionCommand::StopMarketFullPosition(order) => {
+            order.owner.symbol == fact.symbol
+                && order.side == fact.side
+                && order.position_side == fact.position_side
+                && order.quantity == fact.quantity
+                && Some(order.trigger_price.value()) == fact.limit_price
+                && fact.reduce_only
+        }
+        ExecutionCommand::StopMarketCloseAll(_) | ExecutionCommand::Cancel(_) => false,
+    }
+}
+
+fn quote_notional(
     command: &ExecutionCommand,
-    binding: &GatewayBinding,
-    max_entry_notional: Decimal,
-) -> Result<(), AccountHostValidationError> {
-    command
-        .validate()
-        .map_err(|_| AccountHostValidationError::Command)?;
-    let owner = command.mutation_owner();
-    if owner.exchange != binding.venue.as_str()
-        || owner.account != binding.trading_account_id
-        || owner.symbol != binding.symbol
-    {
-        return Err(AccountHostValidationError::Scope);
-    }
-    match command {
-        ExecutionCommand::PlaceLimit(limit) if is_risk_increasing(command) => {
-            let notional = limit
-                .quantity
-                .checked_mul(limit.limit_price.value())
-                .ok_or(AccountHostValidationError::Notional)?;
-            if notional <= Decimal::ZERO || notional > max_entry_notional {
-                return Err(AccountHostValidationError::Notional);
-            }
-        }
-        ExecutionCommand::PlaceMarket(_) => {
-            return Err(AccountHostValidationError::MarketEntryDisabled);
-        }
-        ExecutionCommand::PlaceLimit(_)
-        | ExecutionCommand::MarketReduce(_)
-        | ExecutionCommand::StopMarketCloseAll(_)
-        | ExecutionCommand::StopMarketFullPosition(_)
-        | ExecutionCommand::Cancel(_) => {}
-    }
-    Ok(())
+) -> Result<AccountRiskAmount, AccountHostValidationError> {
+    let ExecutionCommand::PlaceLimit(place) = command else {
+        return Err(AccountHostValidationError::Command);
+    };
+    let value = place
+        .quantity
+        .checked_mul(place.limit_price.value())
+        .filter(|notional| *notional > Decimal::ZERO)
+        .ok_or(AccountHostValidationError::Notional)?;
+    let asset = Asset::new(place.owner.symbol.quote())
+        .map_err(|_| AccountHostValidationError::RiskEvidence)?;
+    Ok(AccountRiskAmount { asset, value })
 }
 
-fn is_risk_increasing(command: &ExecutionCommand) -> bool {
-    match command {
-        ExecutionCommand::PlaceLimit(command) => !command.reduce_only,
-        ExecutionCommand::PlaceMarket(_) => true,
-        ExecutionCommand::MarketReduce(_)
-        | ExecutionCommand::StopMarketCloseAll(_)
-        | ExecutionCommand::StopMarketFullPosition(_)
-        | ExecutionCommand::Cancel(_) => false,
-    }
-}
-
-fn has_open_entry_reservation(journal: &CommandJournal) -> bool {
-    journal.commands().any(|command| {
-        let ExecutionCommand::PlaceLimit(place) = command else {
-            return false;
-        };
-        if place.reduce_only || journal.has_accepted_cancel_for(&place.client_order_id) {
-            return false;
-        }
-        journal.receipt(&place.command_id).is_some_and(|receipt| {
-            matches!(
-                receipt.state,
-                CommandState::Accepted { .. } | CommandState::Unknown { .. }
-            )
-        })
+fn sum_notional(values: &[Decimal]) -> Result<Decimal, AccountHostValidationError> {
+    values.iter().try_fold(Decimal::ZERO, |total, notional| {
+        total
+            .checked_add(notional.abs())
+            .ok_or(AccountHostValidationError::Notional)
     })
+}
+
+fn now_ms() -> Result<u64, AccountHostValidationError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AccountHostValidationError::RiskEvidence)?;
+    u64::try_from(elapsed.as_millis()).map_err(|_| AccountHostValidationError::RiskEvidence)
 }
 
 fn require_journal_budget(path: &Path) -> Result<(), AccountHostValidationError> {
@@ -592,6 +1886,18 @@ fn valid_text(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
 }
 
+fn hex_sha256(value: [u8; 32]) -> String {
+    value.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// `CommandReceipt` is a struct-only canonical serde shape. This digest binds the dispatch
+/// capability to the exact fsynced Prepared record, rather than merely to a semantic command.
+fn receipt_sha256(receipt: &crate::CommandReceipt) -> Result<[u8; 32], AccountHostValidationError> {
+    serde_json::to_vec(receipt)
+        .map(|encoded| Sha256::digest(encoded).into())
+        .map_err(|_| AccountHostValidationError::PreparedCommand)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum AccountHostValidationError {
     #[error("account host binding or gateway scope does not match")]
@@ -606,18 +1912,32 @@ pub enum AccountHostValidationError {
     UnknownFence,
     #[error("risk-increasing command is fenced by an existing entry reservation")]
     OpenEntryFence,
+    #[error("complete fresh signed account-risk evidence is required before increasing risk")]
+    RiskEvidence,
+    #[error(
+        "account-wide signed exposure, open entries, WAL reservations, and the candidate exceed 10U"
+    )]
+    AccountRiskLimit,
     #[error("risk-increasing market entry is disabled for the initial LIVE profile")]
     MarketEntryDisabled,
     #[error("entry notional is invalid or exceeds the fixed 10U ceiling")]
     Notional,
     #[error("command identity already exists in the account WAL")]
     Duplicate,
+    #[error("prepared command proof does not match this account's current WAL receipt")]
+    PreparedCommand,
     #[error("command journal requires a clean, reconciled rotation before another mutation")]
     RotationRequired,
     #[error("command journal exceeds the 10 MiB hard limit")]
     JournalHardLimit,
     #[error("command journal size cannot be verified safely")]
     JournalBudget,
+    #[error("complete signed account snapshot is unavailable, stale, or incomplete")]
+    SignedSnapshot,
+    #[error("current adapter-validated instrument is unavailable or inconsistent")]
+    Instrument,
+    #[error("legacy Stage-7 predecessor handoff is missing, inconsistent, or unavailable")]
+    LegacyPredecessor,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -628,6 +1948,8 @@ pub enum AccountHostError<E: std::error::Error + 'static> {
     Validation(AccountHostValidationError),
     #[error(transparent)]
     Journal(CommandJournalError),
+    #[error(transparent)]
+    CanonicalRoot(crate::AccountCanonicalRootError),
     #[error("account artifact I/O failed for {path}")]
     Io {
         path: PathBuf,
@@ -639,348 +1961,9 @@ pub enum AccountHostError<E: std::error::Error + 'static> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{io, io::Write};
+#[path = "account_cursor_tests.rs"]
+mod account_cursor_tests;
 
-    use rust_decimal::Decimal;
-    use tempfile::TempDir;
-    use venue_domain::domain::{
-        CancelCommand, OrderCommand, OrderOwner, OrderPurpose, OrderSide, PositionSide, Price,
-    };
-    use venue_gateway_api::{GatewayMode, VenueId};
-
-    use super::*;
-
-    const ACCOUNT: &str = "00000000-0000-4000-8000-000000000001";
-
-    #[derive(Debug)]
-    struct Gateway {
-        binding: GatewayBinding,
-        result: AccountGatewayResult,
-        dispatches: usize,
-    }
-
-    impl AccountPhysicalGateway for Gateway {
-        type Error = io::Error;
-
-        fn binding(&self) -> &GatewayBinding {
-            &self.binding
-        }
-
-        fn reconcile(
-            &mut self,
-            request: &AccountRecoveryRequest,
-        ) -> Result<AccountRecoveryReport, Self::Error> {
-            let outcomes = request
-                .unresolved()
-                .iter()
-                .map(|command| AccountRecoveryOutcome::still_unknown(command.command_id().clone()))
-                .collect();
-            AccountRecoveryReport::new(self.binding.clone(), 1, outcomes).map_err(io::Error::other)
-        }
-
-        fn dispatch(&mut self, _permit: AccountDispatchPermit) -> AccountGatewayResult {
-            self.dispatches += 1;
-            self.result.clone()
-        }
-    }
-
-    #[derive(Debug)]
-    struct RecoveringGateway {
-        binding: GatewayBinding,
-        dispatches: usize,
-    }
-
-    impl AccountPhysicalGateway for RecoveringGateway {
-        type Error = io::Error;
-
-        fn binding(&self) -> &GatewayBinding {
-            &self.binding
-        }
-
-        fn reconcile(
-            &mut self,
-            request: &AccountRecoveryRequest,
-        ) -> Result<AccountRecoveryReport, Self::Error> {
-            let outcomes = request
-                .unresolved()
-                .iter()
-                .map(|command| {
-                    AccountRecoveryOutcome::accepted(
-                        command.command_id().clone(),
-                        "recovered-order".to_owned(),
-                    )
-                })
-                .collect();
-            AccountRecoveryReport::new(self.binding.clone(), 2, outcomes).map_err(io::Error::other)
-        }
-
-        fn dispatch(&mut self, _permit: AccountDispatchPermit) -> AccountGatewayResult {
-            self.dispatches += 1;
-            AccountGatewayResult::Unknown
-        }
-    }
-
-    fn binding() -> Result<GatewayBinding, Box<dyn std::error::Error>> {
-        Ok(GatewayBinding::new(
-            VenueId::Okx,
-            GatewayMode::Live,
-            ACCOUNT,
-            "DOGE/USDT".parse()?,
-        )?)
-    }
-
-    fn root(temp: &TempDir) -> PathBuf {
-        temp.path().join("okx").join("LIVE").join(ACCOUNT)
-    }
-
-    fn command(notional: Decimal) -> Result<ExecutionCommand, Box<dyn std::error::Error>> {
-        let identity = notional.normalize().to_string().replace('.', "-");
-        Ok(ExecutionCommand::PlaceLimit(OrderCommand {
-            command_id: CommandId::new(format!("cmd-{identity}"))?,
-            client_order_id: CommandId::new(format!("client-{identity}"))?,
-            owner: owner()?,
-            side: OrderSide::Buy,
-            position_side: PositionSide::Long,
-            quantity: Decimal::ONE,
-            limit_price: Price::new(notional)?,
-            reduce_only: false,
-        }))
-    }
-
-    fn indexed_command(index: usize) -> Result<ExecutionCommand, Box<dyn std::error::Error>> {
-        Ok(ExecutionCommand::PlaceLimit(OrderCommand {
-            command_id: CommandId::new(format!("cmd-segment-{index}"))?,
-            client_order_id: CommandId::new(format!("client-segment-{index}"))?,
-            owner: owner()?,
-            side: OrderSide::Buy,
-            position_side: PositionSide::Long,
-            quantity: Decimal::ONE,
-            limit_price: Price::new(Decimal::ONE)?,
-            reduce_only: false,
-        }))
-    }
-
-    fn owner() -> Result<OrderOwner, Box<dyn std::error::Error>> {
-        Ok(OrderOwner {
-            strategy_instance_id: "canary".to_owned(),
-            run_id: "run-1".to_owned(),
-            exchange: "okx".to_owned(),
-            account: ACCOUNT.to_owned(),
-            symbol: "DOGE/USDT".parse()?,
-            purpose: OrderPurpose::Entry,
-        })
-    }
-
-    #[test]
-    fn host_persists_submitted_before_one_dispatch_and_records_unknown()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempfile::tempdir()?;
-        let binding = binding()?;
-        let gateway = Gateway {
-            binding: binding.clone(),
-            result: AccountGatewayResult::Unknown,
-            dispatches: 0,
-        };
-        let mut host = AccountMutationHost::open(root(&temp), binding, Decimal::TEN, gateway)?;
-        assert_eq!(
-            host.dispatch(command(Decimal::TEN)?)?,
-            AccountDispatchOutcome::Unknown
-        );
-        assert!(host.has_unresolved());
-        assert_eq!(host.gateway.dispatches, 1);
-        Ok(())
-    }
-
-    #[test]
-    fn restart_resolves_unknown_by_readback_without_redispatch()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempfile::tempdir()?;
-        let binding = binding()?;
-        {
-            let gateway = Gateway {
-                binding: binding.clone(),
-                result: AccountGatewayResult::Unknown,
-                dispatches: 0,
-            };
-            let mut host =
-                AccountMutationHost::open(root(&temp), binding.clone(), Decimal::TEN, gateway)?;
-            assert_eq!(
-                host.dispatch(command(Decimal::TEN)?)?,
-                AccountDispatchOutcome::Unknown
-            );
-            assert_eq!(host.gateway.dispatches, 1);
-        }
-
-        let gateway = RecoveringGateway {
-            binding: binding.clone(),
-            dispatches: 0,
-        };
-        let mut reopened = AccountMutationHost::open(root(&temp), binding, Decimal::TEN, gateway)?;
-        assert!(!reopened.has_unresolved());
-        assert_eq!(reopened.gateway.dispatches, 0);
-        assert!(matches!(
-            reopened.dispatch(command(Decimal::new(9, 0))?),
-            Err(AccountHostError::Validation(
-                AccountHostValidationError::OpenEntryFence
-            ))
-        ));
-        assert_eq!(reopened.gateway.dispatches, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn host_rejects_more_than_ten_usdt_before_gateway_dispatch()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempfile::tempdir()?;
-        let binding = binding()?;
-        let gateway = Gateway {
-            binding: binding.clone(),
-            result: AccountGatewayResult::Accepted {
-                venue_order_id: "1".to_owned(),
-            },
-            dispatches: 0,
-        };
-        let mut host = AccountMutationHost::open(root(&temp), binding, Decimal::TEN, gateway)?;
-        assert!(matches!(
-            host.dispatch(command(Decimal::new(1001, 2))?),
-            Err(AccountHostError::Validation(
-                AccountHostValidationError::Notional
-            ))
-        ));
-        assert_eq!(host.gateway.dispatches, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn host_requires_an_accepted_cancel_before_another_entry()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempfile::tempdir()?;
-        let binding = binding()?;
-        let gateway = Gateway {
-            binding: binding.clone(),
-            result: AccountGatewayResult::Accepted {
-                venue_order_id: "1".to_owned(),
-            },
-            dispatches: 0,
-        };
-        let mut host = AccountMutationHost::open(root(&temp), binding, Decimal::TEN, gateway)?;
-        assert!(matches!(
-            host.dispatch(command(Decimal::TEN)?)?,
-            AccountDispatchOutcome::Accepted { .. }
-        ));
-        assert!(matches!(
-            host.dispatch(command(Decimal::new(9, 0))?),
-            Err(AccountHostError::Validation(
-                AccountHostValidationError::OpenEntryFence
-            ))
-        ));
-        assert_eq!(host.gateway.dispatches, 1);
-        Ok(())
-    }
-
-    #[test]
-    fn second_host_cannot_acquire_the_same_account_lock() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let temp = tempfile::tempdir()?;
-        let binding = binding()?;
-        let make_gateway = || Gateway {
-            binding: binding.clone(),
-            result: AccountGatewayResult::Unknown,
-            dispatches: 0,
-        };
-        let _first =
-            AccountMutationHost::open(root(&temp), binding.clone(), Decimal::TEN, make_gateway())?;
-        assert!(
-            AccountMutationHost::open(root(&temp), binding.clone(), Decimal::TEN, make_gateway())
-                .is_err()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn five_mib_journal_stops_before_any_new_physical_dispatch()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempfile::tempdir()?;
-        let account_root = root(&temp);
-        fs::create_dir_all(&account_root)?;
-        let journal_path = account_root.join("commands.jsonl");
-        let mut journal = File::create(&journal_path)?;
-        journal.write_all(&vec![b' '; COMMAND_JOURNAL_ROTATE_BYTES as usize])?;
-        journal.sync_all()?;
-
-        assert!(matches!(
-            require_append_budget(&journal_path, &command(Decimal::TEN)?),
-            Err(AccountHostValidationError::RotationRequired)
-        ));
-        assert!(fs::metadata(journal_path)?.len() <= COMMAND_JOURNAL_HARD_LIMIT_BYTES);
-        Ok(())
-    }
-
-    #[test]
-    fn clean_five_mib_segment_rotates_and_retains_cancel_identity()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempfile::tempdir()?;
-        let account_root = root(&temp);
-        fs::create_dir_all(&account_root)?;
-        let journal_path = account_root.join("commands.jsonl");
-        let mut bytes = Vec::new();
-        let mut sequence = 1_u64;
-        let mut index = 0_usize;
-        while bytes.len() < COMMAND_JOURNAL_ROTATE_BYTES as usize {
-            let command = indexed_command(index)?;
-            let hash = crate::execution_command_sha256(&command)?
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            for state in [
-                CommandState::Prepared,
-                CommandState::Submitted,
-                CommandState::Accepted {
-                    venue_order_id: format!("venue-{index}"),
-                },
-            ] {
-                serde_json::to_writer(
-                    &mut bytes,
-                    &crate::CommandReceipt {
-                        sequence,
-                        command: command.clone(),
-                        command_sha256: hash.clone(),
-                        state,
-                    },
-                )?;
-                bytes.push(b'\n');
-                sequence = sequence.checked_add(1).ok_or("sequence overflow")?;
-            }
-            index = index.checked_add(1).ok_or("index overflow")?;
-        }
-        let mut file = File::create(&journal_path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-
-        let binding = binding()?;
-        let gateway = Gateway {
-            binding: binding.clone(),
-            result: AccountGatewayResult::Accepted {
-                venue_order_id: "cancel-1".to_owned(),
-            },
-            dispatches: 0,
-        };
-        let mut host =
-            AccountMutationHost::open(account_root.clone(), binding, Decimal::TEN, gateway)?;
-        assert!(account_root.join("commands-000001.jsonl").is_file());
-        assert_eq!(fs::metadata(&journal_path)?.len(), 0);
-
-        let cancel = ExecutionCommand::Cancel(CancelCommand {
-            command_id: CommandId::new("cancel-segment-0")?,
-            owner: owner()?,
-            target_client_order_id: CommandId::new("client-segment-0")?,
-        });
-        assert!(matches!(
-            host.dispatch(cancel)?,
-            AccountDispatchOutcome::Accepted { .. }
-        ));
-        assert_eq!(host.gateway.dispatches, 1);
-        Ok(())
-    }
-}
+#[cfg(test)]
+#[path = "account_host_tests.rs"]
+mod account_host_tests;

@@ -1,17 +1,25 @@
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use venue_storage::{ActorAppliedAnchor, ActorAppliedReceipt, DurableWalHead};
 
 use super::{AccountHealth, AccountRuntime, AccountRuntimeError, StrategyBinding, StrategyKind};
-use crate::{StrategyTurnToken, strategy::ActorAppliedTurnStore};
+use crate::{
+    StrategyTurnToken,
+    execution::{
+        AccountExecutionIntent, AccountLanePriority, CommandIdentityReceipt,
+        DurableCommandIdentityAllocation,
+    },
+    strategy::ActorAppliedTurnStore,
+};
+use venue_domain::domain::ExecutionCommand;
 
 const COPY_REPLAY_SCHEMA_VERSION: u16 = 1;
 
 /// Immutable Node-inbox facts which a Copy actor must retain in its own durable checkpoint.
 /// This value is semantic data, never a writer lease or physical dispatch permit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CopyActorCommitment {
     delivery_digest: [u8; 32],
     durable_inbox_digest: [u8; 32],
@@ -132,6 +140,66 @@ impl CopyActorAppliedReceipt {
 }
 
 impl AccountRuntime {
+    /// Recovers a semantic receipt only from the already opened, verified Actor checkpoint.
+    /// This does not mint a current turn token or restore any dispatch authority.
+    pub fn recover_copy_actor_applied(
+        &self,
+        binding: &StrategyBinding,
+        commitment: CopyActorCommitment,
+    ) -> Result<Option<CopyActorAppliedReceipt>, AccountRuntimeError> {
+        if binding.key.strategy_kind != StrategyKind::Copy
+            || binding.key.account != self.account
+            || !self.durable_recovery_complete
+            || self
+                .registry
+                .registration(&binding.key)
+                .is_none_or(|registered| registered.binding != *binding)
+        {
+            return Err(AccountRuntimeError::ActorAppliedUnavailable);
+        }
+        let store = self
+            .actor_applied_stores
+            .get(&binding.key)
+            .ok_or(AccountRuntimeError::ActorAppliedUnavailable)?;
+        let Some((actor_applied, checkpoint)) = store.recovered_actor_checkpoint()? else {
+            return Ok(None);
+        };
+        // A later control turn may legitimately replace the latest Copy checkpoint. It cannot
+        // stand in for the requested delivery's Applied receipt.
+        let Ok(replay) = serde_json::from_slice::<CopyActorReplay>(&checkpoint) else {
+            return Ok(None);
+        };
+        if replay.schema_version != COPY_REPLAY_SCHEMA_VERSION || replay.commitment != commitment {
+            return Ok(None);
+        }
+        Ok(Some(CopyActorAppliedReceipt {
+            commitment,
+            actor_applied,
+        }))
+    }
+
+    pub(crate) fn current_copy_actor_turn(
+        &self,
+        binding: &StrategyBinding,
+        applied: &CopyActorAppliedReceipt,
+    ) -> Result<crate::AppliedStrategyTurnReceipt, AccountRuntimeError> {
+        if binding.key.strategy_kind != StrategyKind::Copy
+            || binding.key.account != self.account
+            || self.last_applied_durable.get(&binding.key) != Some(applied.actor_applied())
+        {
+            return Err(AccountRuntimeError::StrategyTurnAuthority);
+        }
+        let token = self
+            .last_applied_turns
+            .get(&binding.key)
+            .cloned()
+            .ok_or(AccountRuntimeError::StrategyTurnAuthority)?;
+        Ok(crate::AppliedStrategyTurnReceipt::persisted(
+            token,
+            applied.actor_applied().clone(),
+        ))
+    }
+
     /// Installs the one durable Copy actor store for an already-registered exact Copy binding.
     /// The mutation WAL head is deliberately absent from this API; it can only arrive from the
     /// account's recovered durable state when `apply_copy_actor_turn` runs.
@@ -235,13 +303,53 @@ impl AccountRuntime {
         })
     }
 
+    /// Admits one Node-derived physical command only when it is bound to the exact durable Copy
+    /// Actor turn. Node may translate Copy's semantic exposure using fresh rules, but it cannot
+    /// construct a lane request, dispatch permit, or alternate WAL path.
+    pub(crate) fn admit_copy_actor_command(
+        &mut self,
+        binding: &StrategyBinding,
+        applied: &CopyActorAppliedReceipt,
+        priority: AccountLanePriority,
+        command: ExecutionCommand,
+        allocation: DurableCommandIdentityAllocation,
+    ) -> Result<(), AccountRuntimeError> {
+        if binding.key.strategy_kind != StrategyKind::Copy
+            || binding.key.account != self.account
+            || self.health != AccountHealth::Ready
+            || !self.durable_recovery_complete
+            || self
+                .registry
+                .registration(&binding.key)
+                .is_none_or(|registered| registered.binding != *binding)
+            || self.last_applied_durable.get(&binding.key) != Some(applied.actor_applied())
+        {
+            return Err(AccountRuntimeError::StrategyTurnAuthority);
+        }
+        let token = self
+            .last_applied_turns
+            .get(&binding.key)
+            .cloned()
+            .ok_or(AccountRuntimeError::StrategyTurnAuthority)?;
+        let durable = self
+            .last_applied_durable
+            .get(&binding.key)
+            .cloned()
+            .ok_or(AccountRuntimeError::StrategyTurnAuthority)?;
+        let turn = crate::AppliedStrategyTurnReceipt::persisted(token, durable);
+        let identity =
+            CommandIdentityReceipt::from_durable_allocation(&turn, &command, allocation)?;
+        let intent = AccountExecutionIntent::from_applied_turn(&turn, priority, command, identity)?;
+        self.enqueue_execution(intent)
+    }
+
     #[must_use]
     pub const fn recovered_wal_head_for_copy(&self) -> Option<DurableWalHead> {
         self.actor_applied_wal_head
     }
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct CopyActorReplay {
     schema_version: u16,
     commitment: CopyActorCommitment,

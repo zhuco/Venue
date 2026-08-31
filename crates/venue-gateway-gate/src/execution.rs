@@ -125,6 +125,7 @@ pub fn prepare_limit_post_only(
         rules,
         &command.owner.exchange,
         &command.owner.account,
+        &command.owner.symbol,
     )?;
     validate_step(
         command.limit_price.value(),
@@ -179,6 +180,7 @@ pub fn prepare_reduce_once(
         rules,
         &command.owner.exchange,
         &command.owner.account,
+        &command.owner.symbol,
     )?;
     let contracts = rules
         .native_contracts_checked(command.quantity)
@@ -233,6 +235,7 @@ pub fn prepare_cancel(
         rules,
         &intent.command.owner.exchange,
         &intent.command.owner.account,
+        &intent.command.owner.symbol,
     )?;
     if !valid_native_order_id(&intent.venue_order_id) {
         return Err(GateExecutionError::Intent);
@@ -436,6 +439,37 @@ pub struct GateExactOrderReadback {
     pub order: Order,
 }
 
+/// Builds an exact signed lookup for a durable client identity during WAL recovery. It grants no
+/// mutation capability and deliberately carries no reconstructed place/cancel request.
+pub fn prepare_exact_readback_by_client_id(
+    binding: &GateGatewayBinding,
+    rules: &GateContractRules,
+    client_order_id: &str,
+) -> Result<GateExactReadbackRequest, GateExecutionError> {
+    validate_scope(binding, rules, rules.instrument.generation)?;
+    let native_client_id = native_client_id(client_order_id)?;
+    exact_readback(
+        binding.gateway_binding(),
+        rules.instrument.generation,
+        GateMutationKind::PlacePostOnly,
+        ExpectedOrder {
+            order_id: None,
+            client_order_id: client_order_id.to_owned(),
+            side: None,
+            position_side: None,
+            quantity: None,
+            limit_price: None,
+            reduce_only: None,
+        },
+        None,
+        1,
+    )
+    .map(|mut request| {
+        request.endpoint = format!("{}/{}", endpoints::FUTURES_ORDER, native_client_id);
+        request
+    })
+}
+
 impl GateExactOrderReadback {
     pub fn from_response(
         binding: &GateGatewayBinding,
@@ -526,7 +560,7 @@ fn validate_scope(
     rules: &GateContractRules,
     generation: u64,
 ) -> Result<(), GateExecutionError> {
-    if binding.gateway_binding().symbol != rules.instrument.symbol
+    if binding.gateway_binding().validate().is_err()
         || generation == 0
         || generation != rules.instrument.generation
         || rules.instrument.validate().is_err()
@@ -543,11 +577,12 @@ fn validate_owner(
     rules: &GateContractRules,
     exchange: &str,
     account: &str,
+    symbol: &venue_domain::domain::Symbol,
 ) -> Result<(), GateExecutionError> {
     validate_scope(binding, rules, rules.instrument.generation)?;
     if exchange != "gate"
         || account != binding.gateway_binding().trading_account_id.as_str()
-        || rules.instrument.symbol != binding.gateway_binding().symbol
+        || symbol != &rules.instrument.symbol
     {
         return Err(GateExecutionError::Binding);
     }

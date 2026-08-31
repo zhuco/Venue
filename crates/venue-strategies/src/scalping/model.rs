@@ -18,6 +18,17 @@ pub enum StrategyKind {
     Scalping,
 }
 
+/// Controller lifecycle target consumed by the pure strategy reducer.  The controller owns how
+/// this target is authorized and persisted; strategy only maps it to safe semantic exits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlTarget {
+    Running,
+    StopAndProtect,
+    FlattenAndStop,
+    EmergencyStop,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StrategyBinding {
     pub strategy_kind: StrategyKind,

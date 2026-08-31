@@ -1198,6 +1198,7 @@ mod tests {
     const PLACE_ACK: &[u8] = include_bytes!("../fixtures/execution-place-ack.json");
     const CANCEL_ACK: &[u8] = include_bytes!("../fixtures/execution-cancel-ack.json");
     const ORDER_DETAIL: &[u8] = include_bytes!("../fixtures/execution-order-detail.json");
+    const MARKET_REDUCE_REQUEST: &str = include_str!("../fixtures/market-reduce-request.json");
 
     fn scope(
         mode: GatewayMode,
@@ -1235,6 +1236,62 @@ mod tests {
             limit_price: Price::new(Decimal::new(60_000, 0))?,
             reduce_only: true,
         })
+    }
+
+    fn market_reduce() -> Result<MarketReduceCommand, Box<dyn std::error::Error>> {
+        Ok(MarketReduceCommand {
+            command_id: CommandId::new("reduce4")?,
+            client_order_id: CommandId::new("00000000000000000000000000000004")?,
+            owner: owner(OrderPurpose::ExposureTakeProfit)?,
+            side: OrderSide::Sell,
+            position_side: PositionSide::Long,
+            quantity: Decimal::new(2, 1),
+            risk_episode_id: CommandId::new("episode4")?,
+            position_generation: 4,
+        })
+    }
+
+    #[test]
+    fn market_reduce_converts_exact_contracts_and_uses_checked_close_direction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (config, instrument, profile) = scope(GatewayMode::Live)?;
+        let command = market_reduce()?;
+        let request = build_place_request(
+            &config,
+            &instrument,
+            &profile,
+            OkxTradeMode::Cross,
+            OkxPlaceIntent::MarketReduce(&command),
+        )?;
+        assert_eq!(
+            std::str::from_utf8(request.body())?,
+            MARKET_REDUCE_REQUEST.trim()
+        );
+        let mut wrong_side = command.clone();
+        wrong_side.side = OrderSide::Buy;
+        assert_eq!(
+            build_place_request(
+                &config,
+                &instrument,
+                &profile,
+                OkxTradeMode::Cross,
+                OkxPlaceIntent::MarketReduce(&wrong_side),
+            ),
+            Err(OkxError::Payload)
+        );
+        let mut off_contract = command;
+        off_contract.quantity = Decimal::new(15, 2);
+        assert_eq!(
+            build_place_request(
+                &config,
+                &instrument,
+                &profile,
+                OkxTradeMode::Cross,
+                OkxPlaceIntent::MarketReduce(&off_contract),
+            ),
+            Err(OkxError::Precision)
+        );
+        Ok(())
     }
 
     fn response(

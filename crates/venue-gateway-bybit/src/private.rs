@@ -35,9 +35,12 @@ pub enum BybitPrivateSource {
     AccountInfo,
     WalletBalance,
     Positions,
+    AccountWidePositions,
     OpenOrders(NativeOrderFamily),
+    AccountWideOpenOrders(NativeOrderFamily),
     OrderHistory(NativeOrderFamily),
     Executions,
+    AccountWideExecutions,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -346,6 +349,15 @@ fn private_request_parts(
                 format!("category={LINEAR}&symbol={native_symbol}&limit={POSITION_PAGE_LIMIT}"),
             )
         }
+        BybitPrivateSource::AccountWidePositions => {
+            if history_window.is_some() || lookup.is_some() {
+                return Err(BybitError::Binding);
+            }
+            (
+                endpoints::POSITIONS,
+                format!("category={LINEAR}&limit={POSITION_PAGE_LIMIT}"),
+            )
+        }
         BybitPrivateSource::OpenOrders(family) => {
             if history_window.is_some() {
                 return Err(BybitError::Binding);
@@ -355,6 +367,18 @@ fn private_request_parts(
                 endpoints::OPEN_ORDERS,
                 format!(
                     "category={LINEAR}&symbol={native_symbol}&openOnly=0&orderFilter={filter}&limit={ORDER_PAGE_LIMIT}"
+                ),
+            )
+        }
+        BybitPrivateSource::AccountWideOpenOrders(family) => {
+            if history_window.is_some() || lookup.is_some() {
+                return Err(BybitError::Binding);
+            }
+            let filter = order_filter(family)?;
+            (
+                endpoints::OPEN_ORDERS,
+                format!(
+                    "category={LINEAR}&openOnly=0&orderFilter={filter}&limit={ORDER_PAGE_LIMIT}"
                 ),
             )
         }
@@ -375,6 +399,19 @@ fn private_request_parts(
                 endpoints::EXECUTIONS,
                 format!(
                     "category={LINEAR}&symbol={native_symbol}&startTime={}&endTime={}&execType=Trade&limit={EXECUTION_PAGE_LIMIT}",
+                    window.start_ms, window.end_ms
+                ),
+            )
+        }
+        BybitPrivateSource::AccountWideExecutions => {
+            let window = history_window.ok_or(BybitError::Clock)?;
+            if lookup.is_some() {
+                return Err(BybitError::Binding);
+            }
+            (
+                endpoints::EXECUTIONS,
+                format!(
+                    "category={LINEAR}&startTime={}&endTime={}&execType=Trade&limit={EXECUTION_PAGE_LIMIT}",
                     window.start_ms, window.end_ms
                 ),
             )

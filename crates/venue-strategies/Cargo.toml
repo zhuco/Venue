@@ -8,12 +8,11 @@ publish = false
 [dependencies]
 rust_decimal.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 venue-domain = { path = "../venue-domain" }
-
-[dev-dependencies]
-serde_json.workspace = true
+venue-indicators = { path = "../venue-indicators" }
 
 [lints.rust]
 unsafe_code = "forbid"

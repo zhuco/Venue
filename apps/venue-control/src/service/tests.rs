@@ -7,8 +7,9 @@ use std::{
 use rust_decimal::Decimal;
 use venue_control_protocol::{
     AccountSummary, CONTROL_SCHEMA_VERSION, CommandReceipt, CommandState, ConnectionState,
-    ControlAction, ControlCommandRequest, ControlEvent, ControlSnapshot, GatewayMode, HealthState,
-    StrategyKind, StrategyLifecycle, StrategySummary, VenueId,
+    ControlAction, ControlCommandRequest, ControlSnapshot, GatewayMode, HealthState, StrategyKind,
+    StrategyLifecycle, StrategySummary, UiAccountScope, UiEventEnvelope, UiEventKind,
+    UiEventNotification, VenueId,
 };
 
 use super::*;
@@ -21,7 +22,7 @@ struct MemoryRepository {
 #[derive(Default)]
 struct MemoryState {
     snapshot: Option<ControlSnapshot>,
-    events: Vec<ControlEvent>,
+    events: Vec<UiEventEnvelope>,
     commands: BTreeMap<String, MemoryCommand>,
 }
 
@@ -67,7 +68,11 @@ impl ControlRepository for MemoryRepository {
                 }
             }
             state.snapshot = Some(snapshot.clone());
-            state.events.push(ControlEvent::Snapshot(snapshot.clone()));
+            push_event(
+                &mut state.events,
+                UiEventKind::Snapshot,
+                snapshot_scope(snapshot),
+            )?;
             Ok(SnapshotStoreResult::Inserted {
                 event_sequence: state.events.len() as i64,
             })
@@ -98,9 +103,11 @@ impl ControlRepository for MemoryRepository {
                     delivery: MemoryDelivery::Pending,
                 },
             );
-            state
-                .events
-                .push(ControlEvent::CommandReceipt(accepted.clone()));
+            push_event(
+                &mut state.events,
+                UiEventKind::Command,
+                command_scope(command),
+            )?;
             Ok(CommandEnqueueResult::Inserted(accepted.clone()))
         });
         ready(result)
@@ -174,9 +181,11 @@ impl ControlRepository for MemoryRepository {
             entry.receipt = scoped.receipt.clone();
             entry.delivery = MemoryDelivery::Settled;
             let receipt = entry.receipt.clone();
-            state
-                .events
-                .push(ControlEvent::CommandReceipt(receipt.clone()));
+            push_event(
+                &mut state.events,
+                UiEventKind::Command,
+                command_scope(&scoped.command),
+            )?;
             Ok(CommandSettleResult::Stored(receipt))
         });
         ready(result)
@@ -184,6 +193,7 @@ impl ControlRepository for MemoryRepository {
 
     fn list_events(
         &self,
+        scope: &UiAccountScope,
         after_sequence: i64,
         limit: u32,
     ) -> impl Future<Output = Result<Vec<StoredEvent>, RepositoryError>> + Send {
@@ -194,7 +204,7 @@ impl ControlRepository for MemoryRepository {
                 .enumerate()
                 .filter_map(|(index, event)| {
                     let sequence = index as i64 + 1;
-                    (sequence > after_sequence).then_some(StoredEvent {
+                    (sequence > after_sequence && event.scope == *scope).then_some(StoredEvent {
                         sequence,
                         event: event.clone(),
                     })
@@ -251,7 +261,7 @@ async fn snapshot_and_events_are_validated_and_monotonic() -> Result<(), Box<dyn
 {
     let service = service_with_snapshot().await?;
     assert_eq!(service.snapshot().await?, snapshot(100, 7)?);
-    assert_eq!(service.events(0, 10).await?.len(), 1);
+    assert_eq!(service.events(&scope(), 0, 10).await?.len(), 1);
     assert_eq!(
         service.publish_snapshot(&snapshot(100, 7)?).await?,
         SnapshotStoreResult::Unchanged
@@ -265,7 +275,7 @@ async fn snapshot_and_events_are_validated_and_monotonic() -> Result<(), Box<dyn
         inserted,
         SnapshotStoreResult::Inserted { event_sequence: 2 }
     );
-    assert_eq!(service.events(1, 10).await?.len(), 1);
+    assert_eq!(service.events(&scope(), 1, 10).await?.len(), 1);
     Ok(())
 }
 
@@ -408,6 +418,61 @@ fn command(action: ControlAction) -> Result<ControlCommandRequest, Box<dyn std::
     })
 }
 
+fn scope() -> UiAccountScope {
+    UiAccountScope {
+        venue: VenueId::Binance,
+        mode: GatewayMode::Live,
+        trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+    }
+}
+
+fn snapshot_scope(snapshot: &ControlSnapshot) -> UiAccountScope {
+    snapshot
+        .accounts
+        .first()
+        .map(|account| UiAccountScope {
+            venue: account.venue,
+            mode: account.mode,
+            trading_account_id: account.trading_account_id.clone(),
+        })
+        .unwrap_or_else(scope)
+}
+
+fn command_scope(command: &ControlCommandRequest) -> UiAccountScope {
+    UiAccountScope {
+        venue: command.venue,
+        mode: command.mode,
+        trading_account_id: command.trading_account_id.clone(),
+    }
+}
+
+fn push_event(
+    events: &mut Vec<UiEventEnvelope>,
+    event_type: UiEventKind,
+    scope: UiAccountScope,
+) -> Result<(), RepositoryError> {
+    let cursor = events.len() as u64 + 1;
+    let previous_cursor = events
+        .iter()
+        .rev()
+        .find(|event| event.scope == scope)
+        .map_or(0, |event| event.cursor);
+    events.push(
+        UiEventEnvelope::from_notification(
+            UiEventNotification {
+                schema_version: CONTROL_SCHEMA_VERSION,
+                event_type,
+                scope,
+                observed_ms: cursor,
+            },
+            cursor,
+            previous_cursor,
+        )
+        .map_err(|_| RepositoryError::CorruptData)?,
+    );
+    Ok(())
+}
+
 fn snapshot(
     generated_ms: u64,
     config_epoch: u64,
@@ -422,9 +487,10 @@ fn snapshot(
             mode: GatewayMode::Live,
             trading_account_id: trading_account_id.clone(),
             health: HealthState::Healthy,
-            equity: Decimal::new(10_000, 0),
-            available_margin: Decimal::new(8_000, 0),
-            unrealized_pnl: Decimal::ZERO,
+            equity: Some(Decimal::new(10_000, 0)),
+            available_margin: Some(Decimal::new(8_000, 0)),
+            unrealized_pnl: Some(Decimal::ZERO),
+            balances: Vec::new(),
             private_generation: 2,
             writer_generation: 1,
             last_reconciled_ms: generated_ms - 1,
@@ -441,8 +507,8 @@ fn snapshot(
             open_orders: 4,
             long_quantity: Decimal::ONE,
             short_quantity: Decimal::ONE,
-            realized_pnl: Decimal::ZERO,
-            unrealized_pnl: Decimal::ZERO,
+            realized_pnl: Some(Decimal::ZERO),
+            unrealized_pnl: Some(Decimal::ZERO),
             last_receipt_ms: generated_ms - 1,
             attention: None,
         }],

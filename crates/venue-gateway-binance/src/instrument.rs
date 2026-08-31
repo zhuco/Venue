@@ -12,6 +12,9 @@ pub struct BinanceInstrumentRules {
     pub native_symbol: String,
     pub instrument: Instrument,
     pub minimum_quantity: Decimal,
+    pub maximum_quantity: Decimal,
+    pub minimum_price: Decimal,
+    pub maximum_price: Decimal,
 }
 
 /// Parses the one USDⓈ-M perpetual entry selected by a canonical symbol.
@@ -91,12 +94,19 @@ fn parse_entry(
     let tick = filter_decimal(entry, "PRICE_FILTER", "tickSize")?;
     let step = filter_decimal(entry, "LOT_SIZE", "stepSize")?;
     let minimum_quantity = filter_decimal(entry, "LOT_SIZE", "minQty")?;
+    let maximum_quantity = filter_decimal(entry, "LOT_SIZE", "maxQty")?;
+    let minimum_price = filter_decimal(entry, "PRICE_FILTER", "minPrice")?;
+    let maximum_price = filter_decimal(entry, "PRICE_FILTER", "maxPrice")?;
     let minimum_notional = filter_decimal(entry, "MIN_NOTIONAL", "notional")?;
     if minimum_quantity <= Decimal::ZERO
         || step <= Decimal::ZERO
         || minimum_notional <= Decimal::ZERO
         || minimum_quantity < step
         || minimum_quantity % step != Decimal::ZERO
+        || maximum_quantity < minimum_quantity
+        || maximum_quantity % step != Decimal::ZERO
+        || minimum_price <= Decimal::ZERO
+        || maximum_price < minimum_price
     {
         return Err(BinanceInstrumentError::Rule);
     }
@@ -117,6 +127,9 @@ fn parse_entry(
         native_symbol: native.to_owned(),
         instrument,
         minimum_quantity,
+        maximum_quantity,
+        minimum_price,
+        maximum_price,
     })
 }
 

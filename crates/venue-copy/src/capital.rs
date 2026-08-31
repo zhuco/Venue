@@ -43,12 +43,24 @@ pub struct TargetExposurePlan {
 
 /// Apply the frozen leader exposure ratio to the follower's lowest safe capital bound.
 ///
-/// A sign flip is rejected even though its arithmetic delta is defined. The caller must first
-/// plan a reduction to zero, wait for confirmed private facts, freeze a new snapshot, and only
-/// then plan the opposite opening exposure.
+/// A target may reverse direction; its arithmetic delta is not an executable order. The Node
+/// must pass it through `plan_copy_execution`, which emits ReduceToZero first and only permits
+/// Adjust after a fresh signed zero position. Refusing the target here would prevent that
+/// two-phase workflow from receiving its immutable planning input.
 pub fn reduce_target_exposure(
     request: &TargetExposureRequest,
 ) -> Result<TargetExposurePlan, TargetExposureError> {
+    reduce_target_exposure_with_multiplier(request, Decimal::ONE)
+}
+
+/// Applies an explicitly frozen relation multiplier without rewriting the signed leader fact.
+pub fn reduce_target_exposure_with_multiplier(
+    request: &TargetExposureRequest,
+    multiplier: Decimal,
+) -> Result<TargetExposurePlan, TargetExposureError> {
+    if multiplier <= Decimal::ZERO {
+        return Err(TargetExposureError::InvalidMultiplier);
+    }
     let snapshot = &request.snapshot;
     validate_snapshot(request)?;
     let valuation_asset = validate_assets(snapshot)?;
@@ -85,14 +97,11 @@ pub fn reduce_target_exposure(
         .leader_target_exposure
         .value
         .checked_div(snapshot.leader_strategy_capital.value)
+        .and_then(|ratio| ratio.checked_mul(multiplier))
         .ok_or(TargetExposureError::ArithmeticOverflow)?;
     let target_exposure = exposure_ratio
         .checked_mul(effective_follower_capital)
         .ok_or(TargetExposureError::ArithmeticOverflow)?;
-
-    if crosses_zero(snapshot.follower_managed_exposure.value, target_exposure) {
-        return Err(TargetExposureError::DirectionFlipRequiresSplit);
-    }
 
     let delta_exposure = target_exposure
         .checked_sub(snapshot.follower_managed_exposure.value)
@@ -144,13 +153,10 @@ fn validate_assets(snapshot: &CapitalSnapshot) -> Result<&Asset, TargetExposureE
     }
 }
 
-const fn crosses_zero(managed: Decimal, target: Decimal) -> bool {
-    (managed.is_sign_positive() && !managed.is_zero() && target.is_sign_negative())
-        || (managed.is_sign_negative() && target.is_sign_positive() && !target.is_zero())
-}
-
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum TargetExposureError {
+    #[error("relation multiplier must be positive")]
+    InvalidMultiplier,
     #[error("capital snapshot generation must be positive")]
     InvalidGeneration,
     #[error("capital snapshot generation does not match the requested generation")]
@@ -169,6 +175,4 @@ pub enum TargetExposureError {
     InvalidSafetyReserve,
     #[error("target exposure arithmetic overflowed decimal precision")]
     ArithmeticOverflow,
-    #[error("cross-zero reversal must close to zero and confirm before opening the opposite side")]
-    DirectionFlipRequiresSplit,
 }

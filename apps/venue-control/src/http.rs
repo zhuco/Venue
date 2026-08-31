@@ -15,8 +15,9 @@ use tokio::{
     time::{self, MissedTickBehavior},
 };
 use venue_control_protocol::{
-    COPY_RELATION_PATH, ControlCommandRequest, CopyRelationUpsertRequest,
-    INDICATOR_EVENT_STREAM_PATH, INDICATOR_SNAPSHOT_PATH,
+    COPY_RELATION_CANDIDATES_PATH, COPY_RELATION_PATH, ControlCommandRequest,
+    CopyRelationUpsertRequest, EXECUTION_FACTS_PATH, GatewayMode, INDICATOR_EVENT_STREAM_PATH,
+    INDICATOR_SNAPSHOT_PATH, UiAccountScope, VenueId,
 };
 
 use crate::{
@@ -280,12 +281,32 @@ where
                 .await
                 .map_err(|_| ())
         }
+        (Method::Get, EXECUTION_FACTS_PATH) if query.is_none() => {
+            let facts = match call(state, state.service.execution_facts()).await {
+                Ok(facts) => facts,
+                Err(error) => return write_error(stream, error).await.map_err(|_| ()),
+            };
+            let body = serde_json::to_vec(&facts).map_err(|_| ())?;
+            write_response(stream, "200 OK", "application/json", "close", &body)
+                .await
+                .map_err(|_| ())
+        }
         (Method::Get, COPY_RELATION_PATH) if query.is_none() => {
             let relations = match call(state, state.service.copy_relations()).await {
                 Ok(relations) => relations,
                 Err(error) => return write_error(stream, error).await.map_err(|_| ()),
             };
             let body = serde_json::to_vec(&relations).map_err(|_| ())?;
+            write_response(stream, "200 OK", "application/json", "close", &body)
+                .await
+                .map_err(|_| ())
+        }
+        (Method::Get, COPY_RELATION_CANDIDATES_PATH) if query.is_none() => {
+            let candidates = match call(state, state.service.copy_relation_candidates()).await {
+                Ok(candidates) => candidates,
+                Err(error) => return write_error(stream, error).await.map_err(|_| ()),
+            };
+            let body = serde_json::to_vec(&candidates).map_err(|_| ())?;
             write_response(stream, "200 OK", "application/json", "close", &body)
                 .await
                 .map_err(|_| ())
@@ -353,12 +374,12 @@ where
             .await
         }
         (Method::Get, "/v2/ui/events") => {
-            let cursor = match event_cursor(query, request.last_event_id) {
-                Ok(cursor) => cursor,
+            let (scope, cursor) = match event_stream_scope(query, request.last_event_id) {
+                Ok(value) => value,
                 Err(error) => return write_error(stream, error).await.map_err(|_| ()),
             };
             write_sse_headers(stream).await.map_err(|_| ())?;
-            stream_events(stream, state, cursor).await;
+            stream_events(stream, state, scope, cursor).await;
             Ok(())
         }
         (Method::Get, INDICATOR_EVENT_STREAM_PATH) => {
@@ -401,6 +422,47 @@ fn event_cursor(query: Option<&str>, last_event_id: Option<i64>) -> Result<i64, 
         (None, None) => 0,
     };
     (cursor >= 0).then_some(cursor).ok_or(HttpError::BadRequest)
+}
+
+fn event_stream_scope(
+    query: Option<&str>,
+    last_event_id: Option<i64>,
+) -> Result<(UiAccountScope, i64), HttpError> {
+    let query = query.ok_or(HttpError::BadRequest)?;
+    let mut venue = None;
+    let mut mode = None;
+    let mut account = None;
+    let mut after = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').ok_or(HttpError::BadRequest)?;
+        match key {
+            "venue" if venue.replace(value).is_none() => {}
+            "mode" if mode.replace(value).is_none() => {}
+            "trading_account_id" if account.replace(value).is_none() => {}
+            "after" if after.replace(value).is_none() => {}
+            _ => return Err(HttpError::BadRequest),
+        }
+    }
+    let scope = UiAccountScope {
+        venue: venue
+            .ok_or(HttpError::BadRequest)?
+            .parse::<VenueId>()
+            .map_err(|_| HttpError::BadRequest)?,
+        mode: mode
+            .ok_or(HttpError::BadRequest)?
+            .parse::<GatewayMode>()
+            .map_err(|_| HttpError::BadRequest)?,
+        trading_account_id: account.ok_or(HttpError::BadRequest)?.to_owned(),
+    };
+    scope.validate().map_err(|_| HttpError::BadRequest)?;
+    let query_cursor = after
+        .unwrap_or("0")
+        .parse::<i64>()
+        .map_err(|_| HttpError::BadRequest)?;
+    if query_cursor < 0 || last_event_id.is_some_and(|header| header != query_cursor) {
+        return Err(HttpError::BadRequest);
+    }
+    Ok((scope, query_cursor))
 }
 
 async fn read_request(stream: &mut TcpStream, body_limit: usize) -> Result<HttpRequest, HttpError> {
@@ -509,8 +571,12 @@ async fn call_indicator<R, T>(
     }
 }
 
-async fn stream_events<R>(stream: &mut TcpStream, state: &HttpState<R>, mut cursor: i64)
-where
+async fn stream_events<R>(
+    stream: &mut TcpStream,
+    state: &HttpState<R>,
+    scope: UiAccountScope,
+    mut cursor: i64,
+) where
     R: ControlRepository + 'static,
 {
     let mut shutdown = state.shutdown.clone();
@@ -523,7 +589,7 @@ where
             changed = shutdown.changed() => if changed.is_err() || *shutdown.borrow() { return; },
             _ = keep_alive.tick() => if write_sse(stream, b": keep-alive\n\n", state.config.request_timeout).await.is_err() { return; },
             _ = poll.tick() => {
-                let events = match call(state, state.service.events(cursor, state.config.event_page_limit)).await { Ok(events) => events, Err(_) => return };
+                let events = match call(state, state.service.events(&scope, cursor, state.config.event_page_limit)).await { Ok(events) => events, Err(_) => return };
                 for event in events {
                     let payload = match serde_json::to_string(&event.event) { Ok(payload) if payload.len() <= state.config.request_body_limit => payload, _ => return };
                     let frame = format!("id: {}\nevent: control\ndata: {payload}\n\n", event.sequence);

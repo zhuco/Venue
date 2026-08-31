@@ -56,9 +56,6 @@ pub fn plan_drift_repair(
     if current == target {
         return Ok(None);
     }
-    if crosses_zero(current, target) {
-        return Err(DriftRepairError::DirectionFlipRequiresSplit);
-    }
     let delta = target
         .checked_sub(current)
         .ok_or(DriftRepairError::ArithmeticOverflow)?;
@@ -132,27 +129,19 @@ fn validate_request(request: &DriftRepairPlanRequest) -> Result<(), DriftRepairE
         .exposure_ratio
         .checked_mul(request.target.effective_follower_capital.value)
         .ok_or(DriftRepairError::ArithmeticOverflow)?;
-    let prior_managed = request
-        .target
-        .target_exposure
-        .value
-        .checked_sub(request.target.delta_exposure.value)
-        .ok_or(DriftRepairError::ArithmeticOverflow)?;
     if request.target.safe_available_margin.value < Decimal::ZERO
         || request.target.effective_follower_capital.value < Decimal::ZERO
         || request.target.effective_follower_capital.value
             > request.target.safe_available_margin.value
         || expected_target != request.target.target_exposure.value
-        || crosses_zero(prior_managed, request.target.target_exposure.value)
     {
         return Err(DriftRepairError::Target);
     }
+    // `delta_exposure` is relative to the frozen capital snapshot's managed exposure, which is
+    // intentionally absent from an authoritative exchange position. It remains asset-bound, but
+    // cannot authenticate a prior position here and is never used to form this repair: the
+    // semantic delta is always target minus the fresh signed position.
     Ok(())
-}
-
-const fn crosses_zero(current: Decimal, target: Decimal) -> bool {
-    (current.is_sign_positive() && !current.is_zero() && target.is_sign_negative())
-        || (current.is_sign_negative() && target.is_sign_positive() && !target.is_zero())
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -173,8 +162,6 @@ pub enum DriftRepairError {
     Asset,
     #[error("target exposure plan is malformed")]
     Target,
-    #[error("cross-zero repair must close and reconcile before a new opposite-side job")]
-    DirectionFlipRequiresSplit,
     #[error("drift repair arithmetic overflowed decimal precision")]
     ArithmeticOverflow,
 }
@@ -184,7 +171,11 @@ mod tests {
     use venue_domain::domain::{Asset, InstrumentIdentity, MarketKind, Symbol};
 
     use super::*;
-    use crate::{CopyAction, CopyIdentityInput, derive_copy_identities};
+    use crate::{
+        CapitalSnapshot, CopyAction, CopyExecutionPhase, CopyIdentityInput,
+        FollowerDeliveryManifest, TargetExposureRequest, derive_copy_identities,
+        plan_copy_execution, reduce_target_exposure,
+    };
 
     fn identities(seed: u8, revision: u32) -> Result<CopyIdentitySet, crate::CopyIdentityError> {
         derive_copy_identities(&CopyIdentityInput {
@@ -201,9 +192,15 @@ mod tests {
     fn binding() -> Result<DeliveryBinding, Box<dyn std::error::Error>> {
         let ids = identities(1, 1)?;
         Ok(DeliveryBinding {
+            relation: crate::RelationCommitment {
+                relation_id: identities(60, 1)?.job_id,
+                revision: 1,
+                policy_digest: [6; 32],
+            },
             leader_id: ids.job_id,
             follower_id: ids.planning_snapshot_id,
             follower_binding_id: ids.child_order_id,
+            follower_instance_id: "copy-follower".to_owned(),
             account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             instrument: InstrumentIdentity {
                 symbol: "BTC/USDT".parse::<Symbol>()?,
@@ -316,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn forged_target_capital_or_delta_relationship_is_rejected()
+    fn forged_target_capital_is_rejected_and_unverifiable_planner_delta_is_not_executed()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut input = request(20, 50)?;
         input.target.exposure_ratio = Decimal::ONE;
@@ -326,19 +323,70 @@ mod tests {
         input.target.effective_follower_capital.value = Decimal::from(1_001);
         assert_eq!(plan_drift_repair(&input), Err(DriftRepairError::Target));
 
+        // The target plan's delta is relative to the capital snapshot's managed exposure, not
+        // this later exchange position. With no prior managed fact in this request, a sign flip
+        // is not forgeable or rejectable here; repair deliberately recomputes from current.
         input = request(20, 50)?;
         input.target.delta_exposure.value = Decimal::from(60);
-        assert_eq!(plan_drift_repair(&input), Err(DriftRepairError::Target));
+        let repair = plan_drift_repair(&input)?.ok_or("drift missing")?;
+        assert_eq!(repair.delta_exposure.value, Decimal::from(30));
         Ok(())
     }
 
     #[test]
-    fn reversal_requires_close_and_new_authoritative_snapshot()
+    fn capital_cross_zero_target_repairs_semantically_then_splits_at_signed_zero()
     -> Result<(), Box<dyn std::error::Error>> {
-        assert_eq!(
-            plan_drift_repair(&request(20, -10)?),
-            Err(DriftRepairError::DirectionFlipRequiresSplit)
-        );
+        let target = reduce_target_exposure(&TargetExposureRequest {
+            expected_generation: 12,
+            now_ms: 500,
+            snapshot: CapitalSnapshot {
+                generation: 12,
+                observed_ms: 100,
+                expires_ms: 1_000,
+                leader_strategy_capital: amount(1_000)?,
+                leader_target_exposure: amount(-10)?,
+                follower_configured_capital: amount(1_000)?,
+                follower_allocated_capital: amount(1_000)?,
+                follower_available_margin: amount(1_000)?,
+                follower_managed_exposure: amount(20)?,
+                margin_safety_reserve_rate: Decimal::ZERO,
+            },
+        })?;
+        assert_eq!(target.target_exposure.value, Decimal::from(-10));
+        assert_eq!(target.delta_exposure.value, Decimal::from(-30));
+
+        let mut drift_input = request(20, 0)?;
+        drift_input.target = target.clone();
+        let repair = plan_drift_repair(&drift_input)?.ok_or("cross-zero drift missing")?;
+        assert_eq!(repair.target_exposure.value, Decimal::from(-10));
+        assert_eq!(repair.delta_exposure.value, Decimal::from(-30));
+
+        // Drift emits only the new semantic job. The shared execution planner owns the required
+        // physical split, first against the fresh positive fact, then against a later signed zero.
+        let manifest = FollowerDeliveryManifest {
+            identities: repair.identities,
+            binding: repair.binding.clone(),
+            plan_digest: [7; 32],
+            snapshot_generation: repair.target_generation,
+            instrument_generation: 1,
+            issued_at_ms: 100,
+            expires_at_ms: 800,
+        };
+        let first = plan_copy_execution(&manifest, &target, &drift_input.position, 500)?;
+        assert_eq!(first.phase, CopyExecutionPhase::ReduceToZero);
+        assert_eq!(first.requested_delta_exposure.value, Decimal::from(-20));
+
+        let zero = AuthoritativePositionSnapshot {
+            binding: drift_input.binding.clone(),
+            generation: 12,
+            observed_at_ms: 500,
+            expires_at_ms: 800,
+            exposure: amount(0)?,
+            fact_digest: [10; 32],
+        };
+        let second = plan_copy_execution(&manifest, &target, &zero, 600)?;
+        assert_eq!(second.phase, CopyExecutionPhase::Adjust);
+        assert_eq!(second.requested_delta_exposure.value, Decimal::from(-10));
         Ok(())
     }
 }

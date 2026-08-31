@@ -6,6 +6,7 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use secrecy::ExposeSecret;
 use tokio::time::timeout;
+use venue_domain::domain::Asset;
 
 use crate::execution::{
     BinanceExactOrderReadback, BinanceMutationAck, BinancePreparedMutation,
@@ -200,6 +201,93 @@ impl BinanceHttpTransport {
             response.payload,
         )
         .map_err(|_| BinanceTransportError::Payload)
+    }
+
+    /// Reads the production USD-M exchange catalogue through the fixed public origin. This is
+    /// intentionally separate from the signed PAPI transport: callers use it only to prove
+    /// fresh contract rules before normalizing account-wide risk.
+    pub async fn fetch_usd_m_exchange_info(
+        &self,
+    ) -> Result<BinanceHttpResponse, BinanceTransportError> {
+        let requested_at_ms = unix_ms()?;
+        let url = format!(
+            "{}/fapi/v1/exchangeInfo",
+            self.config.usd_m_public_rest_origin()
+        );
+        self.send_bounded(self.client.get(url), requested_at_ms, false)
+            .await
+    }
+
+    /// Reads exactly one USD-M asset-index pair from Binance's fixed public origin. The endpoint
+    /// is public and deliberately carries no account credentials; its bounded response is only
+    /// conversion evidence and never an account fact.
+    pub async fn fetch_usd_m_asset_index(
+        &self,
+        asset: &Asset,
+    ) -> Result<BinanceHttpResponse, BinanceTransportError> {
+        let requested_at_ms = unix_ms()?;
+        let url = self.usd_m_asset_index_url(asset)?;
+        self.send_bounded(self.client.get(url), requested_at_ms, false)
+            .await
+    }
+
+    pub(crate) fn usd_m_asset_index_url(
+        &self,
+        asset: &Asset,
+    ) -> Result<String, BinanceTransportError> {
+        let symbol = format!("{}USD", asset.as_str());
+        if symbol.len() > 32 || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return Err(BinanceTransportError::Binding);
+        }
+        Ok(format!(
+            "{}{}?symbol={symbol}",
+            self.config.usd_m_public_rest_origin(),
+            endpoints::USD_M_ASSET_INDEX
+        ))
+    }
+
+    /// Bounded production BBO read used only to normalize a semantic limit intent. It shares the
+    /// adapter client, body limit and LIVE origin; callers still validate symbol/time/price.
+    pub async fn fetch_usd_m_book_ticker(
+        &self,
+        native_symbol: &str,
+    ) -> Result<BinanceHttpResponse, BinanceTransportError> {
+        if native_symbol.is_empty()
+            || !native_symbol
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Err(BinanceTransportError::Binding);
+        }
+        let requested_at_ms = unix_ms()?;
+        let url = format!(
+            "{}/fapi/v1/ticker/bookTicker?symbol={native_symbol}",
+            self.config.usd_m_public_rest_origin()
+        );
+        self.send_bounded(self.client.get(url), requested_at_ms, false)
+            .await
+    }
+
+    /// Bounded credential-free depth snapshot for the public diff-depth bridge.  This is a read
+    /// only market fact; the caller must still require the first queued delta to bridge it.
+    pub async fn fetch_usd_m_depth_snapshot(
+        &self,
+        native_symbol: &str,
+    ) -> Result<BinanceHttpResponse, BinanceTransportError> {
+        if native_symbol.is_empty()
+            || !native_symbol
+                .bytes()
+                .all(|value| value.is_ascii_uppercase() || value.is_ascii_digit())
+        {
+            return Err(BinanceTransportError::Binding);
+        }
+        let requested_at_ms = unix_ms()?;
+        let url = format!(
+            "{}/fapi/v1/depth?symbol={native_symbol}&limit=1000",
+            self.config.usd_m_public_rest_origin()
+        );
+        self.send_bounded(self.client.get(url), requested_at_ms, false)
+            .await
     }
 
     /// Performs exactly one physical mutation dispatch. Timeout, disconnect, and ambiguous server
@@ -637,6 +725,23 @@ mod tests {
             BinanceTransportLimits::new(Duration::from_secs(1), MAX_TRANSPORT_BYTES + 1),
             Err(BinanceTransportError::Limits)
         );
+    }
+
+    #[test]
+    fn asset_index_request_uses_documented_fixed_public_pair()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (config, _, _) = facts("00000000-0000-4000-8000-000000000001")?;
+        let transport = BinanceHttpTransport::new(
+            config,
+            7,
+            17,
+            BinanceTransportLimits::new(Duration::from_secs(1), 1024)?,
+        )?;
+        assert_eq!(
+            transport.usd_m_asset_index_url(&"USDC".parse()?)?,
+            "https://fapi.binance.com/fapi/v1/assetIndex?symbol=USDCUSD"
+        );
+        Ok(())
     }
 
     #[tokio::test]

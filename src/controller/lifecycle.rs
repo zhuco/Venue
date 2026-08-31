@@ -3,16 +3,9 @@ use std::path::Path;
 use crate::{storage::ProjectionStore, strategy::scalping::StrategyBinding};
 use serde::{Deserialize, Serialize};
 
-pub const CONTROL_SCHEMA_VERSION: u16 = 1;
+pub use venue_strategies::scalping::ControlTarget;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ControlTarget {
-    Running,
-    StopAndProtect,
-    FlattenAndStop,
-    EmergencyStop,
-}
+pub const CONTROL_SCHEMA_VERSION: u16 = 1;
 
 /// The controller-owned durable lifecycle record. It contains no exchange client and only emits
 /// a read-only authorization consumed by strategy.

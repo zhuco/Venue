@@ -1,20 +1,25 @@
 mod copy_actor;
+mod host;
 mod market_hub;
 mod model;
 mod physical_recovery;
+mod private_ingress;
 mod private_router;
 mod reconciler;
 mod recovery;
 mod recovery_session;
 mod registry;
+mod resident_turn;
 mod runtime;
 mod runtime_error;
 
+pub use crate::account_lane::{AccountLanePriority, DurableCommandIdentityAllocation};
 pub use crate::{
     AccountKey, AccountModelError, AccountOrderCapabilityEvidence, ExchangeId, StrategyBinding,
     StrategyInstanceKey, StrategyKind,
 };
 pub use copy_actor::{CopyActorAppliedArtifacts, CopyActorAppliedReceipt, CopyActorCommitment};
+pub use host::{AccountRuntimeHost, AccountRuntimeHostError};
 pub use market_hub::{BestBidOffer, MarketHub, MarketHubError, MarketPublish};
 pub use model::{AccountFault, AccountHealth, InstanceLifecycle};
 pub use physical_recovery::{
@@ -22,6 +27,8 @@ pub use physical_recovery::{
     PhysicalRecoveryAuthorityRoots, PhysicalRecoveryManifestError,
     PhysicalRecoveryReadbackManifest, PhysicalRecoveryScope, PhysicalRecoveryUniverseEntry,
 };
+pub(crate) use private_ingress::AccountPrivateIngress;
+pub use private_ingress::{AccountPrivateFactInput, AccountPrivateIngressError};
 pub(crate) use private_router::PrivateRouter;
 pub use private_router::{
     PrivateDelivery, PrivateReconcileRequest, PrivateRouteReport, PrivateRouterError,
@@ -47,6 +54,7 @@ pub use recovery_session::{
 };
 pub use registry::{FlattenPlan, RegistryError, StopPlan, StrategyRegistration};
 pub(crate) use registry::{SignedStopProof, StrategyRegistry};
+pub use resident_turn::ResidentActorAppliedArtifacts;
 pub use runtime::{AccountRuntime, PersistedPrivateDispatchReceipt, PrivateRoutePlan};
 pub use runtime_error::AccountRuntimeError;
 

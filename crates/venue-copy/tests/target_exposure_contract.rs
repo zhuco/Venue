@@ -121,7 +121,8 @@ fn mixed_valuation_assets_fail_before_arithmetic() -> Result<(), Box<dyn std::er
 }
 
 #[test]
-fn cross_zero_reversal_requires_two_confirmed_plans() -> Result<(), Box<dyn std::error::Error>> {
+fn cross_zero_semantic_target_preserves_both_original_endpoints()
+-> Result<(), Box<dyn std::error::Error>> {
     let mut request = base_request()?;
     let asset = Asset::new("USDT")?;
     request.snapshot.leader_strategy_capital = amount(&asset, Decimal::new(100, 0));
@@ -132,9 +133,12 @@ fn cross_zero_reversal_requires_two_confirmed_plans() -> Result<(), Box<dyn std:
     request.snapshot.follower_managed_exposure = amount(&asset, Decimal::new(10, 0));
     request.snapshot.margin_safety_reserve_rate = Decimal::ZERO;
 
+    let plan = reduce_target_exposure(&request)?;
+    assert_eq!(plan.target_exposure.value, Decimal::from(-20));
+    assert_eq!(plan.delta_exposure.value, Decimal::from(-30));
     assert_eq!(
-        reduce_target_exposure(&request),
-        Err(TargetExposureError::DirectionFlipRequiresSplit)
+        plan.target_exposure.value - plan.delta_exposure.value,
+        request.snapshot.follower_managed_exposure.value
     );
     Ok(())
 }

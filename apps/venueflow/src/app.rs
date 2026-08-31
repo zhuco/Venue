@@ -206,7 +206,6 @@ impl VenueFlowApp {
                         receipt.relation_id, receipt.revision, receipt.state
                     ));
                 }
-                ClientEvent::Notice(message) => self.model.notice(message),
             }
         }
     }

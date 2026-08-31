@@ -2,18 +2,22 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use venue_control_protocol::GatewayMode;
+use venue_control_protocol::{CopyRelationRecord, GatewayMode};
 use venue_copy::{
-    CapitalSnapshot, DeliveryBinding, FollowerDeliveryManifest, TargetExposureError,
-    TargetExposurePlan, TargetExposureRequest, derive_copy_identities, reduce_target_exposure,
+    CapitalSnapshot, DeliveryBinding, FollowerDeliveryManifest, RelationCommitment,
+    TargetExposureError, TargetExposurePlan, TargetExposureRequest, derive_copy_identities,
+    reduce_target_exposure_with_multiplier,
 };
 use venue_domain::domain::Amount;
 
 use crate::{
-    CopyApplyResult, CopyCrashReplay, CopyDeliveryClaim, CopyJob, CopyLedgerProjectionInput,
-    CopyObserverScope, CopyRepository, CopyRepositoryError, ObservedCopyIntent,
-    PgControlRepository, ScopedCopyDeliveryReceipt,
+    CopyApplyResult, CopyCrashReplay, CopyDeliveryClaim, CopyExecutionProjectionInput, CopyJob,
+    CopyLedgerProjectionInput, CopyObserverScope, CopyRepository, CopyRepositoryError,
+    ObservedCopyIntent, PgControlRepository, ScopedCopyDeliveryReceipt,
 };
+
+#[path = "copy_ledger_worker.rs"]
+mod ledger_worker;
 
 pub const MIGRATION_0003: &str = include_str!("../migrations/0003_copy_planner_worker.sql");
 
@@ -29,6 +33,12 @@ pub struct FrozenCapitalSnapshot {
     pub follower_available_margin: Amount,
     pub follower_managed_exposure: Amount,
     pub margin_safety_reserve_rate: Decimal,
+    #[serde(default = "unit_multiplier")]
+    pub exposure_multiplier: Decimal,
+}
+
+fn unit_multiplier() -> Decimal {
+    Decimal::ONE
 }
 
 impl FrozenCapitalSnapshot {
@@ -55,6 +65,22 @@ pub struct CopyPlanningSnapshot {
     pub binding: DeliveryBinding,
     pub instrument_generation: u64,
     pub delivery_expires_at_ms: u64,
+}
+
+/// Converts the durable relation row into the immutable commitment embedded in a new leader
+/// snapshot. Existing snapshots/jobs are never rewritten when the relation revision changes.
+pub fn relation_commitment(
+    record: &CopyRelationRecord,
+) -> Result<RelationCommitment, CopyWorkerError> {
+    record
+        .validate()
+        .map_err(|_| CopyWorkerError::InvalidPlanningInput)?;
+    Ok(RelationCommitment {
+        relation_id: venue_copy::CopyId::parse(&record.relation.relation_id)
+            .map_err(|_| CopyWorkerError::InvalidPlanningInput)?,
+        revision: record.revision,
+        policy_digest: record.relation.policy_digest(),
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -197,6 +223,16 @@ impl CopyWorker {
             .await
             .map_err(Into::into)
     }
+
+    pub async fn record_execution(
+        &self,
+        input: &CopyExecutionProjectionInput,
+    ) -> Result<CopyApplyResult, CopyWorkerError> {
+        self.repository
+            .record_copy_execution(input)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 pub(crate) fn plan_observed_copy_job(
@@ -211,17 +247,19 @@ pub(crate) fn plan_observed_copy_job(
         serde_json::from_value(observed.envelope.snapshot.snapshot_payload.clone())
             .map_err(|_| CopyWorkerError::InvalidPlanningInput)?;
     if snapshot.capital.generation != observed.envelope.snapshot.generation
-        || snapshot.binding.account_id != observed.envelope.scope.trading_account_id
         || snapshot.instrument_generation == 0
         || snapshot.delivery_expires_at_ms > observed.envelope.snapshot.expires_at_ms
     {
         return Err(CopyWorkerError::InvalidPlanningInput);
     }
-    let target = reduce_target_exposure(&TargetExposureRequest {
-        expected_generation: observed.envelope.snapshot.generation,
-        now_ms: planned_at_ms,
-        snapshot: snapshot.capital.as_planner_input(),
-    })?;
+    let target = reduce_target_exposure_with_multiplier(
+        &TargetExposureRequest {
+            expected_generation: observed.envelope.snapshot.generation,
+            now_ms: planned_at_ms,
+            snapshot: snapshot.capital.as_planner_input(),
+        },
+        snapshot.capital.exposure_multiplier,
+    )?;
     let identities = derive_copy_identities(&observed.envelope.intent.identity_input)
         .map_err(|_| CopyWorkerError::InvalidPlanningInput)?;
     let semantic = CopySemanticJob {
@@ -344,19 +382,123 @@ mod tests {
     }
 
     #[test]
-    fn stale_capital_and_cross_zero_target_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
+    fn relation_commitment_binds_revision_and_current_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let record = venue_control_protocol::CopyRelationRecord {
+            relation: venue_control_protocol::CopyRelationConfig {
+                relation_id: "00000000-0000-4000-8000-000000000010".to_owned(),
+                leader: venue_control_protocol::CopyRelationBinding {
+                    venue: VenueId::Binance,
+                    mode: GatewayMode::Live,
+                    trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                    instance_id: "leader".to_owned(),
+                    symbol: "BTC/USDT".parse()?,
+                },
+                follower: venue_control_protocol::CopyRelationBinding {
+                    venue: VenueId::Binance,
+                    mode: GatewayMode::Live,
+                    trading_account_id: "00000000-0000-4000-8000-000000000002".to_owned(),
+                    instance_id: "copy-follower".to_owned(),
+                    symbol: "BTC/USDT".parse()?,
+                },
+                allocated_capital: Decimal::from(100),
+                multiplier: Decimal::ONE,
+                safety_reserve_rate: Decimal::ZERO,
+                risk: venue_control_protocol::CopyRiskPolicy {
+                    max_total_notional: Decimal::from(100),
+                    max_order_notional: Decimal::from(10),
+                    max_leverage: Decimal::ONE,
+                },
+                lifecycle: venue_control_protocol::CopyLifecyclePolicy::Active,
+            },
+            revision: 3,
+        };
+        let commitment = relation_commitment(&record)?;
+        assert_eq!(commitment.revision, 3);
+        assert_eq!(commitment.policy_digest, record.relation.policy_digest());
+        Ok(())
+    }
+
+    #[test]
+    fn stale_capital_still_fails_before_job_planning() -> Result<(), Box<dyn std::error::Error>> {
         let stale = observed(100, 0)?;
         assert_eq!(
             plan_observed_copy_job(stale, 301),
             Err(CopyWorkerError::InvalidPlanningInput)
         );
-        let crossing = observed(100, 20)?;
+        Ok(())
+    }
+
+    #[test]
+    fn frozen_multiplier_changes_target_without_rewriting_leader_fact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut input = observed(100, 0)?;
+        let mut snapshot: CopyPlanningSnapshot =
+            serde_json::from_value(input.envelope.snapshot.snapshot_payload.clone())?;
+        snapshot.capital.exposure_multiplier = Decimal::from(2);
+        input.envelope.snapshot.snapshot_payload = serde_json::to_value(&snapshot)?;
+        let planned = plan_observed_copy_job(input.clone(), 101)?;
+        assert_eq!(planned.target.target_exposure.value, Decimal::from(160));
         assert_eq!(
-            plan_observed_copy_job(crossing, 101),
+            planned.frozen_capital.leader_target_exposure.value,
+            Decimal::from(200)
+        );
+        snapshot.capital.exposure_multiplier = Decimal::ZERO;
+        input.envelope.snapshot.snapshot_payload = serde_json::to_value(snapshot)?;
+        assert_eq!(
+            plan_observed_copy_job(input, 101),
             Err(CopyWorkerError::Target(
-                TargetExposureError::DirectionFlipRequiresSplit
+                TargetExposureError::InvalidMultiplier
             ))
         );
+        // Historical immutable snapshots have implicit unit multiplier, not a current relation.
+        let mut old = serde_json::to_value(planned.frozen_capital)?;
+        old.as_object_mut()
+            .ok_or("object")?
+            .remove("exposure_multiplier");
+        let old: FrozenCapitalSnapshot = serde_json::from_value(old)?;
+        assert_eq!(old.exposure_multiplier, Decimal::ONE);
+        Ok(())
+    }
+
+    #[test]
+    fn planned_cross_zero_job_reaches_reduce_then_adjust_with_original_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use venue_copy::{AuthoritativePositionSnapshot, CopyExecutionPhase, plan_copy_execution};
+
+        let observed = observed(100, 20)?;
+        let planned = plan_observed_copy_job(observed.clone(), 101)?;
+        assert_eq!(planned, plan_observed_copy_job(observed, 101)?);
+        assert_eq!(planned.target.target_exposure.value, Decimal::from(-80));
+        assert_eq!(planned.target.delta_exposure.value, Decimal::from(-100));
+        let manifest = &planned.job.manifest;
+        let position = AuthoritativePositionSnapshot {
+            binding: manifest.binding.clone(),
+            generation: 2,
+            observed_at_ms: 101,
+            expires_at_ms: 201,
+            exposure: planned.frozen_capital.follower_managed_exposure.clone(),
+            fact_digest: [7; 32],
+        };
+        let first = plan_copy_execution(manifest, &planned.target, &position, 102)?;
+        assert_eq!(first.phase, CopyExecutionPhase::ReduceToZero);
+        assert_eq!(first.requested_delta_exposure.value, Decimal::from(-20));
+        assert_eq!(first.target_exposure, planned.target.target_exposure);
+        let mut nonzero = position.clone();
+        nonzero.generation += 1;
+        nonzero.exposure.value = Decimal::ONE;
+        assert_eq!(
+            plan_copy_execution(manifest, &planned.target, &nonzero, 103)?.phase,
+            CopyExecutionPhase::ReduceToZero
+        );
+        let mut zero = nonzero;
+        zero.generation += 1;
+        zero.exposure.value = Decimal::ZERO;
+        let second = plan_copy_execution(manifest, &planned.target, &zero, 104)?;
+        assert_eq!(second.phase, CopyExecutionPhase::Adjust);
+        assert_eq!(second.requested_delta_exposure.value, Decimal::from(-80));
+        assert_eq!(second.job_id, first.job_id);
+        assert_eq!(second.delivery_digest, first.delivery_digest);
         Ok(())
     }
 
@@ -398,11 +540,27 @@ mod tests {
                 follower_available_margin: amount(450),
                 follower_managed_exposure: amount(managed_exposure),
                 margin_safety_reserve_rate: Decimal::new(1, 1),
+                exposure_multiplier: Decimal::ONE,
             },
             binding: DeliveryBinding {
+                relation: venue_copy::RelationCommitment {
+                    relation_id: derive_copy_identities(&CopyIdentityInput {
+                        event_id: [60; 16],
+                        source_event_id: [61; 16],
+                        follower_account_id: [62; 16],
+                        follower_binding_id: [63; 16],
+                        leader_order_id: [64; 16],
+                        revision: 1,
+                        action: CopyAction::New,
+                    })?
+                    .job_id,
+                    revision: 1,
+                    policy_digest: [6; 32],
+                },
                 leader_id: related.job_id,
                 follower_id: related.planning_snapshot_id,
                 follower_binding_id: related.child_order_id,
+                follower_instance_id: "copy-follower".to_owned(),
                 account_id: account_id.clone(),
                 instrument: InstrumentIdentity {
                     symbol: "BTC/USDT".parse::<Symbol>()?,

@@ -9,6 +9,7 @@ publish = false
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 venue-domain = { path = "../venue-domain" }
 venue-gateway-api = { path = "../venue-gateway-api" }

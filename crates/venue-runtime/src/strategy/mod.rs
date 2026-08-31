@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 
+use sha2::{Digest, Sha256};
 mod actor_applied;
 
 pub(crate) use actor_applied::{ActorAppliedTurnStore, AppliedPrivateDelivery};
@@ -114,6 +115,44 @@ impl PersistedPrivateFact {
         })
     }
 
+    /// The production account ingress writes the normalized fact to the shared facts journal
+    /// before constructing this value.  Its sequence is therefore the fsynced journal sequence,
+    /// not a caller assertion or an independent raw-payload journal.
+    pub(crate) fn from_persisted_fact_record(
+        sequence: u64,
+        order_family: Option<NativeOrderFamily>,
+        record: FactRecord,
+    ) -> Result<Self, StrategyHostError> {
+        record
+            .header
+            .validate()
+            .map_err(|_| StrategyHostError::PrivateFact)?;
+        if sequence == 0
+            || record.header.source != EventSource::PrivateAccount
+            || record.header.source_sequence != Some(sequence)
+            || matches!(record.event, DomainEvent::Instrument(_))
+            || (matches!(record.event, DomainEvent::Order(_) | DomainEvent::Fill(_))
+                != order_family.is_some())
+        {
+            return Err(StrategyHostError::PrivateFact);
+        }
+        validate_private_domain_event(&record.event)?;
+        let encoded = serde_json::to_vec(&record).map_err(|_| StrategyHostError::PrivateFact)?;
+        let evidence = PrivateEvidenceRef {
+            sequence,
+            generation: record.header.generation,
+            received_at_ms: record.header.received_at_ms,
+            payload_sha256: format!("{:x}", Sha256::digest(encoded)),
+        };
+        Ok(Self {
+            evidence,
+            record,
+            order_family,
+            fact_index: 0,
+            fact_count: 1,
+        })
+    }
+
     #[must_use]
     pub const fn fact_index(&self) -> u32 {
         self.fact_index
@@ -161,7 +200,7 @@ impl PersistedPrivateFact {
     }
 }
 
-fn validate_private_domain_event(event: &DomainEvent) -> Result<(), StrategyHostError> {
+pub(crate) fn validate_private_domain_event(event: &DomainEvent) -> Result<(), StrategyHostError> {
     let valid = match event {
         DomainEvent::Order(order) => order.validate().is_ok(),
         DomainEvent::Fill(fill) => fill.validate().is_ok(),

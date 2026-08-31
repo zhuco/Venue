@@ -83,6 +83,19 @@ impl ActorAppliedTurnStore {
         Ok(envelope.applied_private_deliveries)
     }
 
+    pub(crate) fn recovered_actor_checkpoint(
+        &self,
+    ) -> Result<Option<(ActorAppliedReceipt, Vec<u8>)>, ActorAppliedError> {
+        let Some(recovered) = self.recover()? else {
+            return Ok(None);
+        };
+        let envelope = replay_envelope(&recovered)?;
+        Ok(Some((
+            recovered.receipt().clone(),
+            envelope.actor_checkpoint,
+        )))
+    }
+
     pub(crate) fn refresh_binding(
         &mut self,
         binding: StrategyBinding,

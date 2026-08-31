@@ -1,7 +1,9 @@
 use std::future::Future;
 
 use thiserror::Error;
-use venue_control_protocol::{CopyRelationReceipt, CopyRelationRecord, CopyRelationUpsertRequest};
+use venue_control_protocol::{
+    CopyRelationCandidate, CopyRelationReceipt, CopyRelationRecord, CopyRelationUpsertRequest,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum CopyRelationRepositoryError {
@@ -27,4 +29,11 @@ pub trait CopyRelationRepository: Send + Sync {
     fn list_copy_relations(
         &self,
     ) -> impl Future<Output = Result<Vec<CopyRelationRecord>, CopyRelationRepositoryError>> + Send;
+
+    fn list_copy_relation_candidates(
+        &self,
+    ) -> impl Future<Output = Result<Vec<CopyRelationCandidate>, CopyRelationRepositoryError>> + Send
+    {
+        async { Ok(Vec::new()) }
+    }
 }

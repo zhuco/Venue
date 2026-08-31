@@ -1,5 +1,5 @@
 use venue_control_protocol::{
-    CommandReceipt, CommandState, ControlCommandRequest, ControlEvent, GatewayMode, VenueId,
+    CommandReceipt, CommandState, ControlCommandRequest, GatewayMode, UiEventEnvelope, VenueId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,5 +59,5 @@ impl ScopedCommandReceipt {
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredEvent {
     pub sequence: i64,
-    pub event: ControlEvent,
+    pub event: UiEventEnvelope,
 }

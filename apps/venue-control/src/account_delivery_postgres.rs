@@ -3,9 +3,11 @@ use venue_control_protocol::{
     ACCOUNT_DELIVERY_SCHEMA_VERSION, AccountDeliveryAck, AccountDeliveryBinding,
     AccountDeliveryClaim, AccountDeliveryKind, AccountDeliveryLease, AccountDeliveryPayload,
     AccountDeliveryPurpose, AccountDeliveryReceipt, AccountDeliveryReceiptState,
-    ControlCommandRequest, ControlEvent, CopySemanticJobDelivery, GatewayMode, VenueId,
+    ControlCommandRequest, CopySemanticJobDelivery, GatewayMode, UiAccountScope, UiEventKind,
+    VenueId,
 };
 
+use crate::copy_postgres::ensure_current_relation;
 use crate::{
     AccountDeliveryRepository, AccountDeliveryRepositoryError, CopyJob, DeliveryStoreResult,
     PgControlRepository,
@@ -96,14 +98,6 @@ impl AccountDeliveryRepository for PgControlRepository {
             payload
                 .validate_for_account_delivery(binding)
                 .map_err(|_| AccountDeliveryRepositoryError::CorruptData)?;
-            verify_delivery_source(
-                &mut transaction,
-                row.try_get("source_kind").map_err(database_error)?,
-                row.try_get("source_id").map_err(database_error)?,
-                binding,
-                &payload,
-            )
-            .await?;
             let state: String = row.try_get("delivery_state").map_err(database_error)?;
             let copy_expired_claim = state == "claimed"
                 && row
@@ -117,6 +111,15 @@ impl AccountDeliveryRepository for PgControlRepository {
             } else {
                 AccountDeliveryPurpose::Install
             };
+            verify_delivery_source(
+                &mut transaction,
+                row.try_get("source_kind").map_err(database_error)?,
+                row.try_get("source_id").map_err(database_error)?,
+                binding,
+                &payload,
+                purpose,
+            )
+            .await?;
             let current_epoch: i64 = row.try_get("lease_epoch").map_err(database_error)?;
             let lease_epoch = current_epoch
                 .checked_add(1)
@@ -227,12 +230,7 @@ impl AccountDeliveryRepository for PgControlRepository {
             ack.acknowledged_ms,
         )
         .await?;
-        insert_delivery_wakeup(
-            &mut transaction,
-            ack.acknowledged_ms,
-            &ack.lease.delivery_id,
-        )
-        .await?;
+        insert_delivery_wakeup(&mut transaction, ack.acknowledged_ms, &ack.lease.binding).await?;
         transaction.commit().await.map_err(database_error)?;
         Ok(DeliveryStoreResult::Stored)
     }
@@ -343,7 +341,7 @@ impl AccountDeliveryRepository for PgControlRepository {
         insert_delivery_wakeup(
             &mut transaction,
             receipt.observed_ms,
-            &receipt.lease.delivery_id,
+            &receipt.lease.binding,
         )
         .await?;
         transaction.commit().await.map_err(database_error)?;
@@ -381,28 +379,29 @@ pub(crate) async fn insert_copy_account_delivery(
     job: &CopyJob,
     created_at_ms: u64,
 ) -> Result<(), AccountDeliveryRepositoryError> {
-    let symbol = job.manifest.binding.instrument.symbol.to_string();
-    let scopes = sqlx::query(
-        "SELECT instance_id, config_epoch FROM venue_control_strategy_scopes \
+    let relation = ensure_current_relation(transaction, job)
+        .await
+        .map_err(|_| AccountDeliveryRepositoryError::BindingConflict)?;
+    let follower = &relation.follower;
+    let scope = sqlx::query(
+        "SELECT config_epoch FROM venue_control_strategy_scopes \
          WHERE venue = $1 AND mode = 'LIVE' AND trading_account_id = $2 AND symbol = $3 \
-         ORDER BY instance_id LIMIT 2 FOR SHARE",
+           AND instance_id = $4 FOR SHARE",
     )
-    .bind(job.scope.venue.as_str())
-    .bind(&job.scope.trading_account_id)
-    .bind(&symbol)
-    .fetch_all(&mut **transaction)
+    .bind(follower.venue.as_str())
+    .bind(&follower.trading_account_id)
+    .bind(follower.symbol.to_string())
+    .bind(&follower.instance_id)
+    .fetch_optional(&mut **transaction)
     .await
-    .map_err(database_error)?;
-    if scopes.len() != 1 {
-        return Err(AccountDeliveryRepositoryError::BindingConflict);
-    }
-    let scope = &scopes[0];
+    .map_err(database_error)?
+    .ok_or(AccountDeliveryRepositoryError::BindingConflict)?;
     let binding = AccountDeliveryBinding {
-        venue: job.scope.venue,
+        venue: follower.venue,
         mode: GatewayMode::Live,
-        trading_account_id: job.scope.trading_account_id.clone(),
-        symbol: job.manifest.binding.instrument.symbol.clone(),
-        instance_id: scope.try_get("instance_id").map_err(database_error)?,
+        trading_account_id: follower.trading_account_id.clone(),
+        symbol: follower.symbol.clone(),
+        instance_id: follower.instance_id.clone(),
         config_epoch: from_i64(scope.try_get("config_epoch").map_err(database_error)?)?,
     };
     let job_id = job.identities.job_id.to_string();
@@ -465,7 +464,7 @@ async fn insert_delivery(
     .await
     .map_err(database_error)?;
     if inserted.rows_affected() == 1 {
-        insert_delivery_wakeup(transaction, created_at_ms, &delivery_id).await?;
+        insert_delivery_wakeup(transaction, created_at_ms, binding).await?;
         return Ok(());
     }
     let row = sqlx::query(
@@ -510,21 +509,20 @@ async fn insert_delivery(
 async fn insert_delivery_wakeup(
     transaction: &mut Transaction<'_, Postgres>,
     observed_ms: u64,
-    delivery_id: &str,
+    binding: &AccountDeliveryBinding,
 ) -> Result<(), AccountDeliveryRepositoryError> {
-    let event = ControlEvent::Notice {
+    crate::postgres::insert_ui_event(
+        transaction,
         observed_ms,
-        message: format!("account delivery database state changed: {delivery_id}"),
-    };
-    event
-        .validate()
-        .map_err(|_| AccountDeliveryRepositoryError::InvalidData)?;
-    sqlx::query("INSERT INTO venue_control_events (observed_ms, event_json) VALUES ($1, $2)")
-        .bind(to_i64(observed_ms)?)
-        .bind(encode(&event)?)
-        .execute(&mut **transaction)
-        .await
-        .map_err(database_error)?;
+        UiEventKind::Delivery,
+        UiAccountScope {
+            venue: binding.venue,
+            mode: binding.mode,
+            trading_account_id: binding.trading_account_id.clone(),
+        },
+    )
+    .await
+    .map_err(|_| AccountDeliveryRepositoryError::Database)?;
     Ok(())
 }
 
@@ -534,6 +532,7 @@ async fn verify_delivery_source(
     source_id: String,
     binding: &AccountDeliveryBinding,
     payload: &AccountDeliveryPayload,
+    purpose: AccountDeliveryPurpose,
 ) -> Result<(), AccountDeliveryRepositoryError> {
     match (source_kind.as_str(), payload) {
         ("control_command", AccountDeliveryPayload::ControlCommand(command)) => {
@@ -573,11 +572,27 @@ async fn verify_delivery_source(
             };
             if expected != *wire
                 || source_id != wire.job_id
-                || durable.scope.venue != binding.venue
-                || durable.scope.trading_account_id != binding.trading_account_id
+                || durable.manifest.binding.follower_instance_id != binding.instance_id
                 || durable.manifest.binding.account_id != binding.trading_account_id
+                || durable.scope.venue != binding.venue
+                || durable.scope.mode != binding.mode
+                || durable.manifest.binding.instrument.symbol != binding.symbol
             {
                 return Err(AccountDeliveryRepositoryError::CorruptData);
+            }
+            // The frozen source and exact follower remain mandatory during recovery. A newer
+            // relation may prohibit installation, but cannot prevent reading an old Unknown.
+            if purpose == AccountDeliveryPurpose::Install {
+                let relation = ensure_current_relation(transaction, &durable)
+                    .await
+                    .map_err(|_| AccountDeliveryRepositoryError::BindingConflict)?;
+                if relation.follower.venue != binding.venue
+                    || relation.follower.trading_account_id != binding.trading_account_id
+                    || relation.follower.instance_id != binding.instance_id
+                    || relation.follower.symbol != binding.symbol
+                {
+                    return Err(AccountDeliveryRepositoryError::BindingConflict);
+                }
             }
         }
         _ => return Err(AccountDeliveryRepositoryError::CorruptData),

@@ -1,0 +1,18 @@
+[
+  {
+    "twapId": 9,
+    "fill": {
+      "closedPnl": "0.0",
+      "coin": "BTC",
+      "crossed": true,
+      "fee": "0.3",
+      "feeToken": "USDC",
+      "oid": 201,
+      "px": "65000.0",
+      "side": "B",
+      "sz": "0.2",
+      "time": 1700000000001,
+      "tid": 6001
+    }
+  }
+]

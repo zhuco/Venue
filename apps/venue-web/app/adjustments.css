@@ -1,0 +1,129 @@
+.side {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.stack, .metrics, .metric { min-width: 0; }
+.metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.metric strong { overflow-wrap: anywhere; }
+.table-pages { align-items: center; justify-content: space-between; margin-top: 14px; }
+.table-pages span { color: var(--muted); font-size: 12px; }
+.relation-form input, .relation-form select, .relation-form button, .login button,
+.relation-editor summary { min-height: 44px; }
+.facts dd {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.connection {
+  position: static;
+  width: max-content;
+  max-width: 100%;
+  margin: 0 0 14px auto;
+  box-shadow: none;
+}
+.connection strong,.connection span { display: block; }
+.connection span { margin-top: 2px; color: var(--muted); font-size: 10px; }
+.relation-editor {
+  margin-top: 18px;
+}
+.relation-editor summary {
+  cursor: pointer;
+  color: var(--brand);
+  font-weight: 800;
+}
+.relation-editor[open] summary {
+  margin-bottom: 12px;
+}
+.relation-form {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.relation-form h2 {
+  grid-column: 1/-1;
+}
+.relation-form label {
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.relation-form label small {
+  font-size: 11px;
+  line-height: 1.5;
+}
+.relation-form input,
+.relation-form select {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  padding: 7px;
+  color: var(--ink);
+}
+.relation-form button {
+  min-height: 42px;
+  border: 1px solid var(--brand);
+  border-radius: 8px;
+  background: var(--brand);
+  color: #fff;
+  font-weight: 800;
+}
+@media (max-height: 500px) {
+  .side {
+    padding-block: 16px;
+  }
+  .side > p {
+    margin-block: 10px 16px;
+  }
+  .side small {
+    margin-top: 12px;
+  }
+  .side nav {
+    gap: 2px;
+  }
+  .side nav button {
+    min-height: 44px;
+    padding-block: 7px;
+  }
+}
+@media (min-width: 801px) and (max-width: 1000px) {
+  .facts {
+    grid-template-columns: repeat(3, 1fr);
+  }
+  .facts div:nth-child(2) {
+    grid-column: span 2;
+  }
+  .relation-form {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .relation-form button {
+    grid-column: 1/-1;
+  }
+}
+@media (max-width: 800px) {
+  .metrics { grid-template-columns: minmax(0, 1fr); }
+  .fact-table { margin-inline: 0; }
+  .fact-table table, .fact-table tbody { display: block; }
+  .fact-table thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .fact-table tr { display: grid; gap: 8px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+  .fact-table td { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 10px; padding: 0; border: 0; white-space: normal; overflow-wrap: anywhere; }
+  .fact-table td::before { content: attr(data-label); color: var(--muted); font-size: 11px; }
+  .table-pages button { flex: 0 1 auto; }
+  .menu {
+    width: 52px;
+    height: 52px;
+  }
+  .stack header h1 {
+    font-size: clamp(28px, 9vw, 38px);
+  }
+  .relation-form {
+    grid-template-columns: 1fr;
+  }
+}
+.relation-form input, .relation-form select, .relation-form button, .login button {
+  min-height: 44px;
+}

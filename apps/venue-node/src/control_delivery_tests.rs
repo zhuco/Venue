@@ -402,7 +402,7 @@ fn copy_semantic_turn_has_one_canonical_actor_and_owner_without_dispatch_authori
 -> Result<(), Box<dyn std::error::Error>> {
     use venue_copy::{
         CopyAction, CopyIdentityInput, DeliveryBinding, FollowerDeliveryManifest,
-        TargetExposurePlan, derive_copy_identities,
+        RelationCommitment, TargetExposurePlan, derive_copy_identities,
     };
     use venue_domain::domain::{Amount, Asset, InstrumentIdentity, MarketKind};
 
@@ -429,9 +429,15 @@ fn copy_semantic_turn_has_one_canonical_actor_and_owner_without_dispatch_authori
     let manifest = FollowerDeliveryManifest {
         identities,
         binding: DeliveryBinding {
+            relation: RelationCommitment {
+                relation_id: related.job_id,
+                revision: 1,
+                policy_digest: [6; 32],
+            },
             leader_id: related.job_id,
             follower_id: related.planning_snapshot_id,
             follower_binding_id: related.child_order_id,
+            follower_instance_id: binding.instance_id.clone(),
             account_id: binding.trading_account_id.clone(),
             instrument: InstrumentIdentity {
                 symbol: binding.symbol.clone(),
@@ -495,6 +501,21 @@ fn copy_semantic_turn_has_one_canonical_actor_and_owner_without_dispatch_authori
     );
     assert!(semantic.actor().matches_owner(semantic.owner()));
     assert_eq!(semantic.delivery_digest(), manifest.delivery_digest());
+    let signed_position = venue_copy::AuthoritativePositionSnapshot {
+        binding: manifest.binding.clone(),
+        generation: 10,
+        observed_at_ms: 120,
+        expires_at_ms: 250,
+        exposure: Amount::new(Asset::new("USDT")?, rust_decimal::Decimal::ZERO),
+        fact_digest: [9; 32],
+    };
+    let execution = semantic.execution_request(&signed_position, 130)?;
+    assert_eq!(execution.binding.relation, manifest.binding.relation);
+    assert_eq!(execution.target_generation, manifest.snapshot_generation);
+    assert_eq!(
+        execution.requested_delta_exposure.value,
+        rust_decimal::Decimal::TEN
+    );
     assert!(!semantic.grants_gateway_capability());
     assert!(!semantic.grants_writer_lease());
     assert!(!semantic.grants_wal_authority());

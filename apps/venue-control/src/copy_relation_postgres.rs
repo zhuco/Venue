@@ -1,12 +1,17 @@
 use sqlx::Row;
 use venue_control_protocol::{
-    CONTROL_SCHEMA_VERSION, CopyRelationConfig, CopyRelationReceipt, CopyRelationReceiptState,
-    CopyRelationRecord, CopyRelationUpsertRequest,
+    CONTROL_SCHEMA_VERSION, ControlSnapshot, CopyRelationBinding, CopyRelationCandidate,
+    CopyRelationConfig, CopyRelationReceipt, CopyRelationReceiptState, CopyRelationRecord,
+    CopyRelationUpsertRequest, UiAccountScope, UiEventKind,
 };
 
-use crate::{CopyRelationRepository, CopyRelationRepositoryError, PgControlRepository};
+use crate::{
+    CopyRelationRepository, CopyRelationRepositoryError, PgControlRepository,
+    postgres::insert_ui_event,
+};
 
 pub const MIGRATION_0006: &str = include_str!("../migrations/0006_copy_relation_configs.sql");
+pub const MIGRATION_0010: &str = include_str!("../migrations/0010_copy_relation_request_id.sql");
 
 impl CopyRelationRepository for PgControlRepository {
     async fn upsert_copy_relation(
@@ -22,6 +27,50 @@ impl CopyRelationRepository for PgControlRepository {
         }
         let mut transaction = self.pool().begin().await.map_err(database_error)?;
         let relation_id = &request.relation.relation_id;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(&request.request_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        let replay = sqlx::query(
+            "SELECT relation_id, revision, action, config_json, observed_at_ms \
+             FROM venue_copy_relation_audit WHERE request_id = $1 FOR SHARE",
+        )
+        .bind(&request.request_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if let Some(row) = replay {
+            let durable: CopyRelationConfig =
+                decode(row.try_get("config_json").map_err(database_error)?)?;
+            if row
+                .try_get::<String, _>("relation_id")
+                .map_err(database_error)?
+                != *relation_id
+                || durable != request.relation
+            {
+                return Err(CopyRelationRepositoryError::Conflict);
+            }
+            let action: String = row.try_get("action").map_err(database_error)?;
+            if !matches!(
+                action.as_str(),
+                "created" | "updated" | "paused" | "resumed"
+            ) {
+                return Err(CopyRelationRepositoryError::CorruptData);
+            }
+            let receipt = CopyRelationReceipt {
+                schema_version: CONTROL_SCHEMA_VERSION,
+                relation_id: relation_id.clone(),
+                revision: from_i64(row.try_get("revision").map_err(database_error)?)?,
+                state: CopyRelationReceiptState::Existing,
+                observed_ms: from_i64(row.try_get("observed_at_ms").map_err(database_error)?)?,
+            };
+            receipt
+                .validate()
+                .map_err(|_| CopyRelationRepositoryError::CorruptData)?;
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(receipt);
+        }
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(relation_id)
             .execute(&mut *transaction)
@@ -107,7 +156,10 @@ impl CopyRelationRepository for PgControlRepository {
                 (next, CopyRelationReceiptState::Updated)
             }
         } else {
-            if request.expected_revision.is_some() {
+            if request
+                .expected_revision
+                .is_some_and(|revision| revision != 0)
+            {
                 return Err(CopyRelationRepositoryError::Conflict);
             }
             sqlx::query(
@@ -116,7 +168,7 @@ impl CopyRelationRepository for PgControlRepository {
                   leader_instance_id, leader_symbol, follower_venue, follower_mode, \
                   follower_account_id, follower_instance_id, follower_symbol, lifecycle, \
                   config_json, created_at_ms, updated_at_ms) \
-                 VALUES ($1, 1, $2, 'LIVE', $3, $4, $5, $6, 'LIVE', $7, $8, $9, $10, $11, $12, $13, $13)",
+                 VALUES ($1, 1, $2, 'LIVE', $3, $4, $5, $6, 'LIVE', $7, $8, $9, $10, $11, $12, $12)",
             )
             .bind(relation_id)
             .bind(request.relation.leader.venue.as_str())
@@ -145,6 +197,48 @@ impl CopyRelationRepository for PgControlRepository {
         receipt
             .validate()
             .map_err(|_| CopyRelationRepositoryError::CorruptData)?;
+        if receipt.state != CopyRelationReceiptState::Existing {
+            let action = match (receipt.state, request.relation.lifecycle) {
+                (CopyRelationReceiptState::Created, _) => "created",
+                (_, venue_control_protocol::CopyLifecyclePolicy::Paused) => "paused",
+                (_, venue_control_protocol::CopyLifecyclePolicy::Active) => "resumed",
+            };
+            let policy_digest = request
+                .relation
+                .policy_digest()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            sqlx::query(
+                "INSERT INTO venue_copy_relation_audit \
+                 (relation_id, revision, action, policy_digest, config_json, observed_at_ms, request_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(&receipt.relation_id)
+            .bind(to_i64(receipt.revision)?)
+            .bind(action)
+            .bind(policy_digest)
+            .bind(encode(&request.relation)?)
+            .bind(to_i64(observed_ms)?)
+            .bind(&request.request_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            for binding in [&request.relation.leader, &request.relation.follower] {
+                insert_ui_event(
+                    &mut transaction,
+                    observed_ms,
+                    UiEventKind::CopyRelation,
+                    UiAccountScope {
+                        venue: binding.venue,
+                        mode: binding.mode,
+                        trading_account_id: binding.trading_account_id.clone(),
+                    },
+                )
+                .await
+                .map_err(|_| CopyRelationRepositoryError::Database)?;
+            }
+        }
         transaction.commit().await.map_err(database_error)?;
         Ok(receipt)
     }
@@ -227,6 +321,45 @@ impl CopyRelationRepository for PgControlRepository {
                     .validate()
                     .map_err(|_| CopyRelationRepositoryError::CorruptData)?;
                 Ok(record)
+            })
+            .collect()
+    }
+
+    async fn list_copy_relation_candidates(
+        &self,
+    ) -> Result<Vec<CopyRelationCandidate>, CopyRelationRepositoryError> {
+        let row =
+            sqlx::query("SELECT snapshot_json FROM venue_control_snapshots WHERE singleton = TRUE")
+                .fetch_optional(self.pool())
+                .await
+                .map_err(database_error)?;
+        let Some(row) = row else {
+            return Ok(Vec::new());
+        };
+        let snapshot: ControlSnapshot =
+            decode(row.try_get("snapshot_json").map_err(database_error)?)?;
+        snapshot
+            .validate()
+            .map_err(|_| CopyRelationRepositoryError::CorruptData)?;
+        snapshot
+            .strategies
+            .into_iter()
+            .map(|strategy| {
+                let candidate = CopyRelationCandidate {
+                    binding: CopyRelationBinding {
+                        venue: strategy.venue,
+                        mode: strategy.mode,
+                        trading_account_id: strategy.trading_account_id,
+                        instance_id: strategy.instance_id,
+                        symbol: strategy.symbol,
+                    },
+                    lifecycle: strategy.lifecycle,
+                    config_epoch: strategy.config_epoch,
+                };
+                candidate
+                    .validate()
+                    .map_err(|_| CopyRelationRepositoryError::CorruptData)?;
+                Ok(candidate)
             })
             .collect()
     }

@@ -1,26 +1,26 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::AccountRuntimeError;
+use super::{AccountPrivateIngress, AccountRuntimeError};
 
 use crate::{
     account::recovery_session::PhysicalRecoverySessionIssuer,
     domain::{AccountOrderCapabilityEvidence, AppliedStrategyTurnReceipt, StrategyTurnToken},
     execution::{
         AccountDispatchDecision, AccountExecutionIntent, AccountExecutionLane,
-        AccountExecutionRequest, AccountLaneFollowUp, ExposureEffect,
-        PersistedMutationOutcomeReceipt, PersistedWalPreparedReceipt, PersistedWriterLeaseReceipt,
-        PreWalCandidate, UnknownReadbackProof, WalNotPreparedReceipt,
+        AccountExecutionRequest, AccountLaneFollowUp, AccountLanePriority, CommandIdentityReceipt,
+        DurableCommandIdentityAllocation, ExposureEffect, PersistedMutationOutcomeReceipt,
+        PersistedWalPreparedReceipt, PersistedWriterLeaseReceipt, PreWalCandidate,
+        UnknownReadbackProof, WalNotPreparedReceipt,
     },
     runtime::{
         account::{
-            AccountFault, AccountHealth, AccountKey, AccountPositionMode,
+            AccountFault, AccountHealth, AccountKey, AccountPositionMode, AccountPrivateFactInput,
             AccountReconciliationReport, AccountRecoverySnapshot, DesiredOrderSets, FlattenPlan,
-            InstanceLifecycle, MarketHub, PersistedOrderRouteAppendReceipt,
-            PhysicalRecoveryAuthorityRoots, PhysicalRecoveryDurableRoots,
-            PhysicalRecoveryReadbackManifest, PhysicalRecoverySession, PrivateRouteReport,
-            PrivateRouter, ReconcileScope, RecoveredShutdownMode, RegistryError, SignedOpenOrders,
-            SignedStopProof, StopPlan, StrategyBinding, StrategyInstanceKey, StrategyRegistry,
-            reconcile_open_orders,
+            InstanceLifecycle, MarketHub, PhysicalRecoveryAuthorityRoots,
+            PhysicalRecoveryDurableRoots, PhysicalRecoveryReadbackManifest,
+            PhysicalRecoverySession, PrivateRouteReport, PrivateRouter, ReconcileScope,
+            RecoveredShutdownMode, RegistryError, SignedOpenOrders, SignedStopProof, StopPlan,
+            StrategyBinding, StrategyInstanceKey, StrategyRegistry, reconcile_open_orders,
         },
         strategy::{
             AccountMarketEvent, ActorAppliedTurnStore, AppliedPrivateDelivery,
@@ -32,8 +32,19 @@ use crate::{
 use venue_gateway_api::GatewayMode;
 use venue_storage::DurableWalHead;
 
+#[path = "host_dispatch.rs"]
+mod host_dispatch;
+#[path = "host_route_hydration.rs"]
+mod host_route_hydration;
+#[path = "owner_route_install.rs"]
+mod owner_route_install;
 #[path = "physical_recovery_runtime.rs"]
 mod physical_recovery_runtime;
+#[path = "private_ingress_runtime.rs"]
+mod private_ingress_runtime;
+pub use private_ingress_runtime::{PersistedPrivateDispatchReceipt, PrivateRoutePlan};
+#[path = "production_bootstrap.rs"]
+mod production_bootstrap;
 
 #[derive(Debug)]
 pub struct AccountRuntime {
@@ -47,6 +58,7 @@ pub struct AccountRuntime {
     pub(crate) registry: StrategyRegistry,
     market_hub: MarketHub,
     private_router: PrivateRouter,
+    private_ingress: Option<AccountPrivateIngress>,
     actors: BTreeMap<StrategyInstanceKey, StrategyActorHost>,
     execution_lane: AccountExecutionLane,
     last_instance_orders: BTreeMap<StrategyInstanceKey, (u64, usize)>,
@@ -79,6 +91,9 @@ pub struct AccountRuntime {
     pending_physical_recovery: Option<PhysicalRecoveryReadbackManifest>,
     admitted_physical_recovery: Option<PhysicalRecoveryReadbackManifest>,
     physical_recovery_drifted: bool,
+    production_signed_bootstrap: bool,
+    production_risk_fenced: bool,
+    production_rules_generation: u64,
     physical_recovery_session_issuer: PhysicalRecoverySessionIssuer,
     active_physical_recovery_session: Option<PhysicalRecoverySession>,
     #[cfg(test)]
@@ -88,45 +103,21 @@ pub struct AccountRuntime {
     #[cfg(test)]
     actor_applied_test_directories: Vec<tempfile::TempDir>,
 }
+
+#[derive(Clone, Copy)]
+enum ActorAppliedWalValidation {
+    Current,
+    HostVerifiedHistory,
+}
 #[derive(Clone, Debug)]
 pub(crate) struct ActiveStrategyTurn {
     token: StrategyTurnToken,
-    input: StrategyInput,
+    pub(crate) input: StrategyInput,
 }
 
 #[derive(Clone, Debug)]
 struct PendingPrivateApplication {
     expected: BTreeSet<(StrategyInstanceKey, u32)>,
-}
-
-#[derive(Clone, Debug)]
-pub struct PrivateRoutePlan {
-    base_revision: u64,
-    strategy_state_revision: u64,
-    connection_generation: u64,
-    evidence_sequence: u64,
-    next_router: PrivateRouter,
-    report: PrivateRouteReport,
-}
-
-impl PrivateRoutePlan {
-    #[must_use]
-    pub const fn report(&self) -> &PrivateRouteReport {
-        &self.report
-    }
-}
-
-/// Opaque acknowledgement that every delivery in a route plan was appended to the durable actor
-/// inbox transaction. Only then may AccountRuntime commit router cursor and in-memory mailboxes.
-#[derive(Clone, Debug)]
-pub struct PersistedPrivateDispatchReceipt {
-    plan: PrivateRoutePlan,
-}
-
-impl PersistedPrivateDispatchReceipt {
-    pub(super) fn persisted(plan: PrivateRoutePlan) -> Self {
-        Self { plan }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,6 +135,7 @@ impl AccountRuntime {
             registry: StrategyRegistry::new(account.clone()),
             market_hub: MarketHub::new(),
             private_router: PrivateRouter::new(account.clone()),
+            private_ingress: None,
             actors: BTreeMap::new(),
             execution_lane: AccountExecutionLane::new(account.clone()),
             last_instance_orders: BTreeMap::new(),
@@ -175,6 +167,9 @@ impl AccountRuntime {
             pending_physical_recovery: None,
             admitted_physical_recovery: None,
             physical_recovery_drifted: false,
+            production_signed_bootstrap: false,
+            production_risk_fenced: false,
+            production_rules_generation: 0,
             physical_recovery_session_issuer,
             active_physical_recovery_session: None,
             #[cfg(test)]
@@ -216,6 +211,22 @@ impl AccountRuntime {
     #[must_use]
     pub const fn health(&self) -> AccountHealth {
         self.health
+    }
+
+    /// Read-only lifecycle for a binding already registered by this account runtime. It exposes
+    /// no mutable registry access, turn, lane request, or execution authority.
+    #[must_use]
+    pub fn strategy_lifecycle(&self, binding: &StrategyBinding) -> Option<InstanceLifecycle> {
+        (binding.key.account == self.account)
+            .then(|| self.registry.registration(&binding.key))
+            .flatten()
+            .filter(|registration| registration.binding == *binding)
+            .map(|registration| registration.lifecycle)
+    }
+
+    #[must_use]
+    pub const fn production_new_risk_fenced(&self) -> bool {
+        self.production_risk_fenced
     }
 
     #[must_use]
@@ -279,7 +290,7 @@ impl AccountRuntime {
         self.dispatch_revision = self.dispatch_revision.checked_add(1).unwrap_or(0);
     }
 
-    fn has_pending_private_delivery(&self, key: &StrategyInstanceKey) -> bool {
+    pub(crate) fn has_pending_private_delivery(&self, key: &StrategyInstanceKey) -> bool {
         self.pending_private_applications
             .values()
             .any(|application| application.expected.iter().any(|(target, _)| target == key))
@@ -355,6 +366,29 @@ impl AccountRuntime {
         &mut self,
         store: ActorAppliedTurnStore,
     ) -> Result<(), AccountRuntimeError> {
+        self.install_actor_applied_store_with_wal_validation(
+            store,
+            ActorAppliedWalValidation::Current,
+        )
+    }
+
+    /// Only AccountRuntimeHost calls this after the sole account Host has verified the recovered
+    /// Actor receipt against the exact bounded command-WAL prefix.
+    pub(crate) fn install_host_verified_actor_applied_store(
+        &mut self,
+        store: ActorAppliedTurnStore,
+    ) -> Result<(), AccountRuntimeError> {
+        self.install_actor_applied_store_with_wal_validation(
+            store,
+            ActorAppliedWalValidation::HostVerifiedHistory,
+        )
+    }
+
+    fn install_actor_applied_store_with_wal_validation(
+        &mut self,
+        store: ActorAppliedTurnStore,
+        wal_validation: ActorAppliedWalValidation,
+    ) -> Result<(), AccountRuntimeError> {
         let key = store.binding().key.clone();
         if self
             .registry
@@ -374,7 +408,8 @@ impl AccountRuntime {
                 .registry
                 .registration(&key)
                 .ok_or(AccountRuntimeError::ActorMissing)?;
-            if Some(receipt.wal()) != self.actor_applied_wal_head
+            if (matches!(wal_validation, ActorAppliedWalValidation::Current)
+                && Some(receipt.wal()) != self.actor_applied_wal_head)
                 || receipt.generations().config_epoch() != registration.config_epoch
                 || receipt.generations().connection_generation() > self.connection_generation
                 || store
@@ -786,67 +821,6 @@ impl AccountRuntime {
         self.actors.insert(binding.key.clone(), next_actor);
         self.market_actor_revision = next_actor_revision;
         Ok(true)
-    }
-
-    pub(crate) fn install_order_route(
-        &mut self,
-        receipt: PersistedOrderRouteAppendReceipt,
-    ) -> Result<(), AccountRuntimeError> {
-        if !self.durable_recovery_complete {
-            return Err(AccountRuntimeError::DurableRecoveryRequired);
-        }
-        let (route, previous_root, next_root, append_sequence, record_sha256) =
-            receipt.into_parts();
-        let expected_append_sequence = self
-            .owner_index_tail_sequence
-            .checked_add(1)
-            .ok_or(AccountRuntimeError::OrderRouteReceipt)?;
-        let next_record_count = self
-            .owner_index_record_count
-            .checked_add(1)
-            .ok_or(AccountRuntimeError::OrderRouteReceipt)?;
-        if self.owner_index_root != Some(previous_root)
-            || append_sequence != expected_append_sequence
-            || record_sha256.iter().all(|byte| *byte == 0)
-            || next_root.iter().all(|byte| *byte == 0)
-        {
-            return Err(AccountRuntimeError::OrderRouteReceipt);
-        }
-        let (family, command_id, client_order_id, venue_order_id, owner) = route.into_parts();
-        self.ensure_supported_order_family(family)?;
-        let mut next_router = self.private_router.clone();
-        next_router.bind_order(
-            family,
-            client_order_id,
-            venue_order_id,
-            command_id,
-            owner,
-            &self.registry,
-        )?;
-        let next_revision = self
-            .private_route_revision
-            .checked_add(1)
-            .ok_or(AccountRuntimeError::PrivateApplicationState)?;
-        let current_roots = self
-            .physical_authority_roots
-            .as_ref()
-            .ok_or(AccountRuntimeError::PhysicalRecoveryRequired)?;
-        let next_physical_roots = current_roots
-            .refreshed_owner(next_root)
-            .map_err(|_| AccountRuntimeError::PhysicalRecoveryScopeMismatch)?;
-        self.private_router = next_router;
-        self.private_route_revision = next_revision;
-        self.owner_index_root = Some(next_root);
-        self.owner_index_tail_sequence = append_sequence;
-        self.owner_index_record_count = next_record_count;
-        self.physical_authority_roots = Some(next_physical_roots);
-        self.physical_durable_roots = None;
-        if self.admitted_physical_recovery.is_some()
-            || self.active_physical_recovery_session.is_some()
-        {
-            self.revoke_physical_authority();
-        }
-        Ok(())
     }
 
     pub(crate) fn plan_private_route(
@@ -1291,7 +1265,7 @@ impl AccountRuntime {
         key: &StrategyInstanceKey,
     ) -> Result<Option<StrategyTurn>, AccountRuntimeError> {
         self.reject_drifted_physical_authority()?;
-        if !self.physical_recovery_integration_available() {
+        if !self.physical_recovery_integration_available() && !self.production_signed_bootstrap {
             return Err(AccountRuntimeError::PhysicalRecoveryIntegrationUnavailable);
         }
         if self.physical_recovery_drifted {
@@ -1301,7 +1275,7 @@ impl AccountRuntime {
         if !self.physical_recovery_drifted && !self.physical_turn_authorized() {
             self.stage_physical_recovery_test_fixture()?;
         }
-        if !self.physical_turn_authorized() {
+        if !self.physical_turn_authorized() && !self.production_signed_bootstrap {
             return Err(AccountRuntimeError::PhysicalRecoveryIntegrationUnavailable);
         }
         if self.active_turns.contains_key(key) {
@@ -1601,6 +1575,7 @@ impl AccountRuntime {
         let binding = registration.binding.clone();
         if exposure == ExposureEffect::Increase
             && (self.health != AccountHealth::Ready
+                || self.production_risk_fenced
                 || !lifecycle_allows_new_risk
                 || !self.pending_private_applications.is_empty())
         {
@@ -1621,6 +1596,40 @@ impl AccountRuntime {
         Ok(())
     }
 
+    /// The resident Host calls this only after it has fsynced the exact command's Prepared
+    /// record. The caller supplies no identity bytes: Runtime derives them from that Host proof
+    /// and verifies the actor receipt remains the current durable turn before queueing.
+    pub(crate) fn admit_host_prepared_execution(
+        &mut self,
+        binding: &StrategyBinding,
+        applied: &AppliedStrategyTurnReceipt,
+        priority: AccountLanePriority,
+        command: venue_domain::domain::ExecutionCommand,
+        allocation: DurableCommandIdentityAllocation,
+    ) -> Result<(), AccountRuntimeError> {
+        let token = applied.token();
+        if binding.key.account != self.account
+            || token.target() != &binding.key
+            || !binding.matches_owner(command.mutation_owner())
+            || self.last_applied_turns.get(&binding.key) != Some(token)
+            || self.last_applied_durable.get(&binding.key) != applied.actor_applied()
+        {
+            return Err(AccountRuntimeError::StrategyTurnAuthority);
+        }
+        let identity =
+            CommandIdentityReceipt::from_durable_allocation(applied, &command, allocation)?;
+        let intent =
+            AccountExecutionIntent::from_applied_turn(applied, priority, command, identity)?;
+        self.enqueue_execution(intent)
+    }
+
+    pub(crate) fn has_active_execution(
+        &self,
+        command_id: &venue_domain::domain::CommandId,
+    ) -> bool {
+        self.execution_lane.has_active_command(command_id)
+    }
+
     pub(crate) fn next_execution_for_wal(
         &mut self,
     ) -> Result<Option<PreWalCandidate<'_>>, AccountRuntimeError> {
@@ -1629,6 +1638,7 @@ impl AccountRuntime {
         let private_generation = self.last_reconciliation_generation;
         let private_application_pending = !self.pending_private_applications.is_empty();
         let private_batch_fence_active = self.private_batch_fence_active;
+        let production_risk_fenced = self.production_risk_fenced;
         let registry = &self.registry;
         let applied_turns = &self.last_applied_turns;
         let active_turns = &self.active_turns;
@@ -1661,6 +1671,7 @@ impl AccountRuntime {
                         }
                         !private_application_pending
                             && !private_batch_fence_active
+                            && !production_risk_fenced
                             && !active_turns.contains_key(request.target())
                             && health == AccountHealth::Ready
                             && registration.lifecycle.accepts_new_risk()

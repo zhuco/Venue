@@ -14,8 +14,9 @@ Stage 7 直接重构到统一账户执行链、六所逐家接管和响应式 We
 [`UNIFIED_GATEWAY_WEB_MIGRATION.md`](UNIFIED_GATEWAY_WEB_MIGRATION.md)。本文继续拥有成交热路径、安全不变量和实盘接管最终解释权。
 
 该迁移任务已获得持续实盘授权：AI 可在现有账户 binding 和能力约束内选择交易对，对单账户累计不超过 10U 的名义风险执行
-逐所真实 Canary，并自行使用 CLI 的 `--confirm-live` 等技术确认参数，无需逐次请求人工确认。初期 Bybit、OKX、Hyperliquid
-既有 DOGE binding 仍固定为 `DOGE/USDT`。授权不包含提款、转账、修改账户安全/杠杆/保证金设置、创建凭证、突破 10U、
+逐所真实 Canary，并自行使用 CLI 的 `--confirm-live` 等技术确认参数，无需逐次请求人工确认。初期 Bybit、OKX
+既有 DOGE binding 使用 `DOGE/USDT`，Hyperliquid 永续使用其实际报价资产 `DOGE/USDC`；不得把 USDC 数值直接当作 USDT。
+授权不包含提款、转账、修改账户安全/杠杆/保证金设置、创建凭证、突破 10U、
 Unknown 时增险或双 writer；完整范围和人工协助延后规则以迁移文档第 2.1–2.2 节为准。
 
 `CODEMAP.md` 只负责定位代码。事故时间线、已完成阶段、临时发布号和一次性排障记录不得继续写入长期文档。
@@ -31,8 +32,7 @@ Unknown 时增险或双 writer；完整范围和人工协助延后规则以迁�
 - 所有下单、撤单和市价减仓经过账户内唯一 Execution Lane（执行通道）；
 - Web 面板或 Windows UI 以后只接控制与查询接口，不进入交易热路径。
 
-现有 Stage 7 共享网格运行时是迁移中的可运行实现和行为证据源。除修复阻断等价接管的缺陷外不得新增功能；其生产编排须直接
-收敛到统一 Account Runtime、Execution Lane 和 AccountMutationHost，最终不得保留第二套 writer/WAL/authority 链。
+Stage 7 网格实现仅保留为工件兼容读取和行为证据源；根 package 的三家 `hedged-grid-*` 生产 binary、feature、部署 re-export 与发布脚本已移除。新的生产编排只能经六个固定 Node binary、统一 Account Runtime、Execution Lane 和 AccountMutationHost，绝不保留第二套 writer/WAL/authority 链。
 
 账户级纯内核固定在 `crates/venue-runtime/src/account/`，策略顺序邮箱固定在 `crates/venue-runtime/src/strategy/`，账户执行调度固定在 `crates/venue-runtime/src/account_lane.rs`。配置中的 `trading_account_id` 是本系统生成并稳定保存的内部账户 ID，不要求交易所提供 UUID；同一真实账户跨 symbol/策略复用。
 
@@ -46,7 +46,7 @@ Unknown 时增险或双 writer；完整范围和人工协助延后规则以迁�
 
 现有 Stage 7 的 lease、canonical root、hash-chain receipt、handoff 和恢复 manifest 只作为迁移兼容实现，不得继续扩展，也不得成为 Bybit、OKX、Hyperliquid 接入的前置模板。迁移时优先收敛到上述单账户模型；旧 writer 与新 writer 不得重叠，旧 WAL 中的 Unknown 必须先对账。Bybit、OKX、Hyperliquid 已通过真实只读预检、10U 名义风险校验、最小 WAL/Unknown 恢复测试和逐家 Canary；后续 mutation 仍必须经本文的账户 host，不能因降低复杂度而绕过验收。
 
-Hyperliquid 使用 `HYPERLIQUID_ACCOUNT_ADDRESS`、`HYPERLIQUID_API_WALLET_ADDRESS`、`HYPERLIQUID_API_WALLET_PRIVATE_KEY` 三项必填及 `HYPERLIQUID_VAULT_ADDRESS` 可选；API Wallet 地址必须由私钥推导一致。Stage 7 成交热路径不得遍历历史 WAL；启动时只为未决命令、Client Order ID、Owner 字段和交易所订单 ID 建内存索引。
+Hyperliquid 使用 `HYPERLIQUID_ACCOUNT_ADDRESS`、`HYPERLIQUID_API_WALLET_ADDRESS`、`HYPERLIQUID_API_WALLET_PRIVATE_KEY` 三项必填及 `HYPERLIQUID_VAULT_ADDRESS` 可选；API Wallet 地址必须由私钥推导一致。其 USDC 风险估值经无凭证、只读的公开稳定币基准读取保守 USDC/USD bid 与 USDT/USD ask 后换算，绝不按 1:1 视为 USDT；基准异常、格式变更或读取失败均冻结新增风险。该窄估值读取不链接任何其他六所 adapter。Stage 7 成交热路径不得遍历历史 WAL；启动时只为未决命令、Client Order ID、Owner 字段和交易所订单 ID 建内存索引。
 
 ## 2. 术语
 
@@ -177,6 +177,14 @@ Exchange Account Process
 2. 按 Owner 分配到唯一策略实例；
 3. 比较每个策略的 Desired Orders 与交易所实际订单。
 
+账户快照必须保留每种资产的余额，缺失可用金额或订单累计成交量保持未知，不能填零。账户级采集不得只过滤到启动交易对；
+Net 模式仓位以有符号数量表达，完整列表中不存在的注册交易对才能证明零腿。成交水位与当前 checkpoint 原子提交，恢复读取必须
+携带此前水位并重叠去重；交易所历史保留窗口已丢失恢复锚时失败关闭，不得用终端空页伪造连续性。所有非 USDT 报价风险需携带
+新鲜、同一观测代的真实换算率；汇总风险与每个 WAL 保留额均按各自报价资产换算，不做稳定币 1:1 假设。
+汇率有效期保留来源时间，不能以 HTTP 接收时间重新计时；多请求采集按最早账户事实复核新鲜度，后续分页或 FX 响应不得刷新先前账户事实的有效期。
+
+Net reduce 的 Accepted 不能永久占用已完成减仓量，也不能仅因订单消失而释放：须由同一本 WAL 的 native identity、精确完整成交合量、更新完整仓位和零开放原单证明结算，并与原签名 checkpoint 原子持久化。持久化失败不改变内存预留；Unknown 始终保留最坏情况预留。该 Net 专用判定不得拒绝正常 Hedge 账户快照。
+
 Desired Orders 必须来自恢复 checkpoint 或 Actor applied receipt，绑定当前配置摘要、config epoch 与同一账户持仓模式，并按 family、方向、
 position side、purpose、数量、价格、reduce-only 和条件/Algo 原生语义摘要全量比较，不能只比 Client ID。首次签名对账后，每一代 notice 都撤销上一 applied authority，只有 Actor 应用 notice 后产生的新 turn 才能提交下一代 Desired。完整签名快照必须逐一证明 regular、
 conditional、algo 三个 canonical family 完整或明确不支持，同时声明账户持仓模式，并精确覆盖每个注册 symbol 的
@@ -275,7 +283,8 @@ Desired Orders，期间的新成交须先消费并重新计算目标集合。`Ru
 
 平仓数量不得超过签名库存和已承诺平仓量。
 
-显式 `--skip-inventory-replenishment-until-recovered` 是耐久的无市价补仓模式：低库存时仍可按当前签名库存重建，closing 数量必须由库存裁剪且不得超额，两腿 opening 必须各自保持完整。Stage 7 不得在 reducer 已接受该模式后用重复的无条件低库存门拒绝安装；未显式进入该模式时，低于单格名义的任一腿仍必须先走 WAL 绑定的库存补充。
+显式 Node Grid 配置 `skip_inventory_replenishment_until_recovered`（部署入口可映射为
+`--skip-inventory-replenishment-until-recovered`）是耐久的无市价补仓模式：低库存时仍可按当前签名库存重建，closing 数量必须由库存裁剪且不得超额，两腿 opening 必须各自保持完整。该配置只在缺少本账户 Actor checkpoint 的首次 bootstrap 生效；恢复 checkpoint 或首次尝试后的重启不会再由新 BBO 重建 epoch。Stage 7 不得在 reducer 已接受该模式后用重复的无条件低库存门拒绝安装；未显式进入该模式时，低于单格名义的任一腿仍必须先走 WAL 绑定的库存补充。
 
 ### 6.3 库存恢复后的下一成交重心
 
@@ -375,6 +384,11 @@ G:\Venue\artifacts\<exchange>\LIVE\<trading_account_id>\
 实盘 resident 由进程监督器以 `on-failure` 语义托管：异常非零退出可从相同受准入发布和恢复工件重新启动；应用内显式 Stop 完成撤单后正常退出，监督器不得将其重新拉起。监督器不替代唯一 writer、WAL、签名对账或准入校验。
 
 恢复不要求把整个进程做成分布式系统。单机顺序恢复、一个账户一个 writer 足够当前规模。
+
+Actor Applied 早于其后物理命令的 WAL 是正常顺序。重启安装 Actor 时，应由同一账户 Host 校验其 WAL head 是当前已恢复 WAL 的真实历史前缀，
+不能要求两者尾部完全相等，也不能只比较序号大小而放过伪前缀。该核验属于冷启动，不得让逐成交 dispatch 重新扫描或序列化历史 WAL。
+当前 WAL head 使用带版本的 v2 增量摘要，首个 Prepared 的序号、命令摘要和上一摘要共同推进，状态转换仍落在同一本 WAL。
+无版本字段的既有 head 按 v1 精确验证，冷启动支持 v1/v2 历史前缀；不得重写旧命令或要求逐成交重新序列化全部历史。
 
 ## 9. 动态新增、停止与参数修改
 

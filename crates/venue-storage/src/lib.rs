@@ -11,7 +11,7 @@ mod scalping_risk;
 pub use actor_applied::{
     ActorAppliedAnchor, ActorAppliedCommit, ActorAppliedError, ActorAppliedGenerations,
     ActorAppliedReceipt, ActorAppliedReplayState, ActorAppliedScope, ActorAppliedStore,
-    DurableWalHead, RecoveredActorApplied,
+    DurableWalHead, DurableWalHeadFormat, RecoveredActorApplied,
 };
 pub use checkpoint::{Checkpoint, CheckpointStore, ProjectionStore};
 pub use control_delivery::{OpaqueJournal, OpaqueJournalError, OpaqueJournalRecord};

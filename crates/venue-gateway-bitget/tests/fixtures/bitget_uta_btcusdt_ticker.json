@@ -1,0 +1,20 @@
+{
+  "code": "00000",
+  "msg": "success",
+  "requestTime": 1000,
+  "data": [
+    {
+      "category": "USDT-FUTURES",
+      "symbol": "BTCUSDT",
+      "ts": "1000000",
+      "bid1Price": "100000.0",
+      "bid1Size": "1.2",
+      "ask1Price": "100000.1",
+      "ask1Size": "1.1",
+      "markPrice": "100000.0",
+      "indexPrice": "100000.0",
+      "fundingRate": "0.0001",
+      "lastPrice": "100000.0"
+    }
+  ]
+}

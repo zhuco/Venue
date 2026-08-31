@@ -1,5 +1,9 @@
-use std::collections::{BTreeMap, VecDeque};
-use std::str::FromStr;
+use std::{
+    collections::{BTreeMap, VecDeque},
+    str::FromStr,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -110,6 +114,7 @@ pub struct PendingConfirmation {
 
 #[derive(Clone, Debug)]
 pub struct CopyRelationDraft {
+    pub request_id: String,
     pub relation_id: String,
     pub expected_revision: Option<u64>,
     pub leader_venue: VenueId,
@@ -132,6 +137,7 @@ pub struct CopyRelationDraft {
 impl CopyRelationDraft {
     pub fn new() -> Self {
         Self {
+            request_id: next_copy_request_id(),
             relation_id: String::new(),
             expected_revision: None,
             leader_venue: VenueId::Binance,
@@ -154,6 +160,7 @@ impl CopyRelationDraft {
 
     pub fn from_config(config: &CopyRelationConfig, revision: u64) -> Self {
         Self {
+            request_id: next_copy_request_id(),
             relation_id: config.relation_id.clone(),
             expected_revision: Some(revision),
             leader_venue: config.leader.venue,
@@ -201,6 +208,7 @@ impl CopyRelationDraft {
         };
         let request = CopyRelationUpsertRequest {
             schema_version: CONTROL_SCHEMA_VERSION,
+            request_id: self.request_id.trim().to_owned(),
             relation,
             expected_revision: self.expected_revision,
         };
@@ -209,6 +217,24 @@ impl CopyRelationDraft {
             .map_err(|error| format!("invalid copy relation: {error}"))?;
         Ok(request)
     }
+}
+
+static COPY_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn next_copy_request_id() -> String {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let sequence = u128::from(COPY_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let seed = elapsed ^ sequence;
+    format!(
+        "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
+        (seed >> 96) as u32,
+        (seed >> 80) as u16,
+        (seed >> 64) as u16 & 0x0fff,
+        (seed >> 48) as u16 & 0x0fff,
+        seed as u64 & 0x0000_ffff_ffff_ffff,
+    )
 }
 
 fn binding(
@@ -746,8 +772,8 @@ mod tests {
             open_orders: 0,
             long_quantity: Decimal::ZERO,
             short_quantity: Decimal::ZERO,
-            realized_pnl: Decimal::ZERO,
-            unrealized_pnl: Decimal::ZERO,
+            realized_pnl: Some(Decimal::ZERO),
+            unrealized_pnl: Some(Decimal::ZERO),
             last_receipt_ms: 1,
             attention: None,
         };
@@ -775,8 +801,8 @@ mod tests {
             open_orders: 0,
             long_quantity: Decimal::ZERO,
             short_quantity: Decimal::ZERO,
-            realized_pnl: Decimal::ZERO,
-            unrealized_pnl: Decimal::ZERO,
+            realized_pnl: Some(Decimal::ZERO),
+            unrealized_pnl: Some(Decimal::ZERO),
             last_receipt_ms: 1,
             attention: None,
         };

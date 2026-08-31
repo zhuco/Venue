@@ -145,6 +145,74 @@ impl GateHttpTransport {
             .await
     }
 
+    /// Reads the public USDT contract catalogue from Gate's fixed LIVE origin. This supplies the
+    /// real multiplier/tick evidence required to normalize every account-wide position or order.
+    pub async fn fetch_public_contracts(&self) -> Result<String, GateTransportError> {
+        let url = format!("{}{}", self.endpoint, crate::endpoints::FUTURES_CONTRACTS);
+        let body = self.send_bounded(self.client.get(url)).await?;
+        String::from_utf8(body.to_vec()).map_err(|_| GateTransportError::Protocol)
+    }
+
+    /// Reads a deliberately shallow, sequenced public book from the same fixed LIVE origin as
+    /// the contract catalogue.  Parsing remains at the account boundary because only it owns
+    /// the current rule generation and the normalization freshness decision.
+    pub async fn fetch_public_order_book(&self, path: &str) -> Result<String, GateTransportError> {
+        if !path.starts_with("/futures/usdt/order_book?") {
+            return Err(GateTransportError::Binding);
+        }
+        let url = format!("{}{}", self.endpoint, path);
+        let body = self.send_bounded(self.client.get(url)).await?;
+        String::from_utf8(body.to_vec()).map_err(|_| GateTransportError::Protocol)
+    }
+
+    /// Performs a signed account-wide GET for the risk/snapshot collector only. It is deliberately
+    /// not a mutation surface and does not expose raw signing material to Node.
+    pub async fn execute_account_risk_read(
+        &self,
+        binding: &GateGatewayBinding,
+        credentials: &GateCredentials,
+        rules: &GateContractRules,
+        endpoint: &str,
+        query: &str,
+        timestamp_ms: u64,
+    ) -> Result<String, GateTransportError> {
+        self.validate_binding(binding, rules, rules.instrument.generation)?;
+        if !matches!(
+            endpoint,
+            crate::endpoints::FUTURES_ACCOUNT
+                | crate::endpoints::POSITIONS
+                | crate::endpoints::FUTURES_OPEN_ORDERS
+                | crate::endpoints::FUTURES_FILLS
+        ) || timestamp_ms == 0
+        {
+            return Err(GateTransportError::Binding);
+        }
+        let signed = crate::sign_rest(
+            credentials,
+            timestamp_sec(timestamp_ms)?,
+            "GET",
+            endpoint,
+            query,
+            &[],
+        )
+        .map_err(|_| GateTransportError::Signing)?;
+        let url = if query.is_empty() {
+            format!("{}{}", self.endpoint, endpoint)
+        } else {
+            format!("{}{}?{query}", self.endpoint, endpoint)
+        };
+        let body = timeout(self.limits.operation_timeout, async {
+            let response = add_signed_headers(self.client.get(url), &signed)?
+                .send()
+                .await
+                .map_err(map_reqwest)?;
+            read_response(response, self.limits.maximum_body_bytes).await
+        })
+        .await
+        .map_err(|_| GateTransportError::Timeout)??;
+        String::from_utf8(body.to_vec()).map_err(|_| GateTransportError::Protocol)
+    }
+
     pub(crate) async fn execute_private_read_guarded(
         &self,
         binding: &GateGatewayBinding,
@@ -332,11 +400,22 @@ impl GateHttpTransport {
         if self.binding != *binding.gateway_binding()
             || self.generation != generation
             || rules.instrument.generation != generation
-            || rules.instrument.symbol != binding.gateway_binding().symbol
         {
             return Err(GateTransportError::Binding);
         }
         Ok(())
+    }
+
+    async fn send_bounded(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<Bytes, GateTransportError> {
+        timeout(self.limits.operation_timeout, async {
+            let response = builder.send().await.map_err(map_reqwest)?;
+            read_response(response, self.limits.maximum_body_bytes).await
+        })
+        .await
+        .map_err(|_| GateTransportError::Timeout)?
     }
 
     pub(crate) fn matches_recovery_session(

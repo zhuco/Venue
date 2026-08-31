@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 rust_decimal.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
@@ -18,6 +19,7 @@ venue-domain = { path = "../../crates/venue-domain" }
 venue-indicators = { path = "../../crates/venue-indicators" }
 
 [dev-dependencies]
+reqwest.workspace = true
 tokio.workspace = true
 
 [lints.rust]

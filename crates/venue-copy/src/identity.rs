@@ -51,6 +51,46 @@ impl CopyId {
     pub fn is_nil(&self) -> bool {
         self.0 == [0; UUID_BYTES]
     }
+
+    /// Decodes the relation UUID persisted by Control without adding a UUID runtime dependency.
+    pub fn parse(raw: &str) -> Result<Self, CopyIdentityError> {
+        let bytes = raw.as_bytes();
+        if bytes.len() != 36
+            || [8, 13, 18, 23]
+                .into_iter()
+                .any(|index| bytes[index] != b'-')
+        {
+            return Err(CopyIdentityError::Identifier);
+        }
+        let mut output = [0_u8; UUID_BYTES];
+        let mut output_index = 0;
+        let mut index = 0;
+        while index < bytes.len() {
+            if [8, 13, 18, 23].contains(&index) {
+                index += 1;
+                continue;
+            }
+            let high = hex(bytes[index]).ok_or(CopyIdentityError::Identifier)?;
+            let low = hex(bytes[index + 1]).ok_or(CopyIdentityError::Identifier)?;
+            output[output_index] = (high << 4) | low;
+            output_index += 1;
+            index += 2;
+        }
+        let value = Self(output);
+        if value.is_nil() {
+            return Err(CopyIdentityError::Identifier);
+        }
+        Ok(value)
+    }
+}
+
+const fn hex(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 impl fmt::Display for CopyId {
@@ -151,6 +191,43 @@ pub fn derive_copy_identities(
     })
 }
 
+/// Derives a distinct, replay-stable semantic repair identity from an already durable Copy job
+/// and its signed closing fact. It is data for a drift job only; it grants no delivery, writer,
+/// WAL, or dispatch authority.
+pub fn derive_repair_identities(
+    source_job_id: &CopyId,
+    receipt_sequence: u64,
+    position_fact_digest: &[u8; DIGEST_BYTES],
+) -> Result<CopyIdentitySet, CopyIdentityError> {
+    if source_job_id.is_nil() || receipt_sequence == 0 || *position_fact_digest == [0; DIGEST_BYTES]
+    {
+        return Err(CopyIdentityError::RepairInput);
+    }
+    let sequence = receipt_sequence.to_be_bytes();
+    let job_id = derive_uuid(
+        b"copy-repair-job-v1",
+        &[source_job_id.as_bytes(), &sequence, position_fact_digest],
+    );
+    if job_id == *source_job_id {
+        return Err(CopyIdentityError::RepairInput);
+    }
+    Ok(CopyIdentitySet {
+        job_id,
+        planning_snapshot_id: derive_uuid(
+            b"copy-repair-snapshot-v1",
+            &[source_job_id.as_bytes(), &sequence, position_fact_digest],
+        ),
+        child_order_id: derive_uuid(
+            b"copy-repair-child-v1",
+            &[source_job_id.as_bytes(), &sequence, position_fact_digest],
+        ),
+        idempotency_key: IdempotencyKey(derive(
+            b"copy-repair-key-v1",
+            &[source_job_id.as_bytes(), &sequence, position_fact_digest],
+        )),
+    })
+}
+
 fn derive_uuid(domain: &[u8], parts: &[&[u8]]) -> CopyId {
     let digest = derive(domain, parts);
     let mut bytes = [0_u8; UUID_BYTES];
@@ -158,6 +235,74 @@ fn derive_uuid(domain: &[u8], parts: &[&[u8]]) -> CopyId {
     bytes[6] = (bytes[6] & 0x0f) | 0x50;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     CopyId(bytes)
+}
+
+/// Identity of a position-target observation, not a fabricated exchange order. Account and
+/// strategy bindings remain stable across refreshed facts; each fact pair gets distinct jobs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CopyTargetObservationIdentity {
+    pub input: CopyIdentityInput,
+    pub leader_id: CopyId,
+    pub follower_id: CopyId,
+    pub follower_binding_id: CopyId,
+    pub policy_id: CopyId,
+}
+
+pub fn derive_target_observation_identity(
+    relation: &crate::RelationCommitment,
+    follower_account: &CopyId,
+    leader_binding_digest: &[u8; DIGEST_BYTES],
+    follower_binding_digest: &[u8; DIGEST_BYTES],
+    paired_fact_digest: &[u8; DIGEST_BYTES],
+) -> Result<CopyTargetObservationIdentity, CopyIdentityError> {
+    if relation.validate().is_err()
+        || follower_account.is_nil()
+        || [
+            *leader_binding_digest,
+            *follower_binding_digest,
+            *paired_fact_digest,
+        ]
+        .contains(&[0; DIGEST_BYTES])
+    {
+        return Err(CopyIdentityError::Identifier);
+    }
+    let revision = u32::try_from(relation.revision).map_err(|_| CopyIdentityError::Revision)?;
+    let leader_id = derive_uuid(b"copy-target-leader-v1", &[leader_binding_digest]);
+    let follower_binding_id = derive_uuid(b"copy-target-follower-v1", &[follower_binding_digest]);
+    let policy_id = derive_uuid(
+        b"copy-target-policy-v1",
+        &[
+            relation.relation_id.as_bytes(),
+            &relation.revision.to_be_bytes(),
+            &relation.policy_digest,
+        ],
+    );
+    let event = derive_uuid(
+        b"copy-target-observation-v1",
+        &[
+            policy_id.as_bytes(),
+            leader_id.as_bytes(),
+            follower_binding_id.as_bytes(),
+            paired_fact_digest,
+        ],
+    );
+    let input = CopyIdentityInput {
+        event_id: *event.as_bytes(),
+        source_event_id: *event.as_bytes(),
+        follower_account_id: *follower_account.as_bytes(),
+        follower_binding_id: *follower_binding_id.as_bytes(),
+        leader_order_id: *event.as_bytes(),
+        revision,
+        action: CopyAction::New,
+    };
+    derive_copy_identities(&input)?;
+    Ok(CopyTargetObservationIdentity {
+        input,
+        leader_id,
+        follower_id: *follower_account,
+        follower_binding_id,
+        policy_id,
+    })
 }
 
 fn derive(domain: &[u8], parts: &[&[u8]]) -> [u8; DIGEST_BYTES] {
@@ -181,6 +326,8 @@ pub enum CopyIdentityError {
     Identifier,
     #[error("copy event revision must be positive")]
     Revision,
+    #[error("copy repair identity inputs are incomplete or collide with the source job")]
+    RepairInput,
 }
 
 #[cfg(test)]
@@ -239,6 +386,27 @@ mod tests {
     }
 
     #[test]
+    fn repair_identity_is_stable_distinct_and_binds_the_signed_fact()
+    -> Result<(), CopyIdentityError> {
+        let source = derive_copy_identities(&input())?;
+        let first = derive_repair_identities(&source.job_id, 4, &[7; DIGEST_BYTES])?;
+        assert_eq!(
+            first,
+            derive_repair_identities(&source.job_id, 4, &[7; DIGEST_BYTES])?
+        );
+        assert_ne!(first.job_id, source.job_id);
+        assert_ne!(
+            first,
+            derive_repair_identities(&source.job_id, 5, &[7; DIGEST_BYTES])?
+        );
+        assert_eq!(
+            derive_repair_identities(&source.job_id, 0, &[7; DIGEST_BYTES]),
+            Err(CopyIdentityError::RepairInput)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn malformed_frozen_identity_fails_closed() {
         let mut invalid = input();
         invalid.follower_binding_id = [0; UUID_BYTES];
@@ -252,5 +420,67 @@ mod tests {
             derive_copy_identities(&invalid),
             Err(CopyIdentityError::Revision)
         );
+    }
+
+    #[test]
+    fn target_observation_keeps_binding_but_changes_each_frozen_event()
+    -> Result<(), CopyIdentityError> {
+        let relation = crate::RelationCommitment {
+            relation_id: CopyId::parse("00000000-0000-4000-8000-000000000001")?,
+            revision: 1,
+            policy_digest: [1; DIGEST_BYTES],
+        };
+        let account = CopyId::parse("00000000-0000-4000-8000-000000000002")?;
+        let first = derive_target_observation_identity(
+            &relation,
+            &account,
+            &[2; DIGEST_BYTES],
+            &[3; DIGEST_BYTES],
+            &[4; DIGEST_BYTES],
+        )?;
+        assert_eq!(
+            first,
+            derive_target_observation_identity(
+                &relation,
+                &account,
+                &[2; DIGEST_BYTES],
+                &[3; DIGEST_BYTES],
+                &[4; DIGEST_BYTES]
+            )?
+        );
+        let next = derive_target_observation_identity(
+            &relation,
+            &account,
+            &[2; DIGEST_BYTES],
+            &[3; DIGEST_BYTES],
+            &[5; DIGEST_BYTES],
+        )?;
+        assert_eq!(first.follower_binding_id, next.follower_binding_id);
+        assert_eq!(first.leader_id, next.leader_id);
+        assert_ne!(
+            derive_copy_identities(&first.input)?,
+            derive_copy_identities(&next.input)?
+        );
+        assert!(
+            derive_target_observation_identity(
+                &relation,
+                &account,
+                &[0; DIGEST_BYTES],
+                &[3; DIGEST_BYTES],
+                &[4; DIGEST_BYTES]
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn control_relation_uuid_decodes_to_canonical_copy_identity() {
+        assert_eq!(
+            CopyId::parse("00000000-0000-4000-8000-000000000001").map(|value| value.to_string()),
+            Ok("00000000-0000-4000-8000-000000000001".to_owned())
+        );
+        assert!(CopyId::parse("not-a-uuid").is_err());
+        assert!(CopyId::parse("00000000-0000-0000-0000-000000000000").is_err());
     }
 }

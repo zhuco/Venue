@@ -1,4 +1,6 @@
-//! Regular-only UTA execution profile with explicit canonical unsupported-family evidence.
+//! Bitget UTA has one complete `unfilled-orders` read surface.  The mutation profile remains
+//! regular-only, but unsupported strategy delegates must be observed by that shared read and
+//! fail the regular candidate rather than be declared absent.
 
 use sha2::{Digest, Sha256};
 use venue_gateway_api::GatewayBinding;
@@ -57,10 +59,10 @@ impl BitgetUnsupportedEvidence {
     pub const fn reason(self) -> &'static str {
         match self.family {
             BitgetUnsupportedOrderFamily::Conditional => {
-                "Bitget UTA regular-only profile has no conditional-order read or mutation surface"
+                "Bitget UTA conditional/strategy mutation is outside the regular-only profile; its open rows remain visible on unfilled-orders and fail closed"
             }
             BitgetUnsupportedOrderFamily::Algo => {
-                "Bitget UTA regular-only profile has no algo-order read or mutation surface"
+                "Bitget UTA algo/strategy mutation is outside the regular-only profile; its open rows remain visible on unfilled-orders and fail closed"
             }
         }
     }

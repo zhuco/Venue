@@ -51,31 +51,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 publish = false
-
-[features]
-default = []
-hedged-grid-binance = []
-hedged-grid-gate = []
-hedged-grid-bitget = []
-
-[[bin]]
-name = "venue"
-path = "src/main.rs"
-
-[[bin]]
-name = "hedged-grid-binance"
-path = "src/bin/hedged-grid-binance.rs"
-required-features = ["hedged-grid-binance"]
-
-[[bin]]
-name = "hedged-grid-gate"
-path = "src/bin/hedged-grid-gate.rs"
-required-features = ["hedged-grid-gate"]
-
-[[bin]]
-name = "hedged-grid-bitget"
-path = "src/bin/hedged-grid-bitget.rs"
-required-features = ["hedged-grid-bitget"]
+autobins = false
 
 [[bin]]
 name = "verify-grid-inventory-recovery"

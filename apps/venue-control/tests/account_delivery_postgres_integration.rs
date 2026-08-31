@@ -3,17 +3,22 @@ use std::{env, process, time::SystemTime};
 use rust_decimal::Decimal;
 use sqlx::{Executor, PgPool, postgres::PgPoolOptions};
 use venue_control::{
-    AccountDeliveryRepository, AccountDeliveryRepositoryError, ControlRepository, ControlService,
-    DeliveryStoreResult, MIGRATION_0001, MIGRATION_0002, MIGRATION_0003, MIGRATION_0004,
-    MIGRATION_0005, MIGRATION_0006, PgControlRepository,
+    AccountDeliveryRepository, AccountDeliveryRepositoryError, ControlHttpConfig,
+    ControlRepository, ControlService, DeliveryStoreResult, MIGRATION_0001, MIGRATION_0002,
+    MIGRATION_0003, MIGRATION_0004, MIGRATION_0005, MIGRATION_0006, MIGRATION_0007, MIGRATION_0008,
+    MIGRATION_0009, MIGRATION_0010, MIGRATION_0011, MIGRATION_0012, MIGRATION_0013,
+    PgControlRepository, control_shutdown_channel, serve_local,
 };
 use venue_control_protocol::{
     ACCOUNT_DELIVERY_SCHEMA_VERSION, AccountDeliveryAck, AccountDeliveryBinding,
     AccountDeliveryPurpose, AccountDeliveryReceipt, AccountDeliveryReceiptState, AccountSummary,
     CONTROL_SCHEMA_VERSION, CommandState, ConnectionState, ControlAction, ControlCommandRequest,
-    ControlSnapshot, GatewayMode, HealthState, StrategyKind, StrategyLifecycle, StrategySummary,
-    VenueId,
+    ControlSnapshot, ExecutionFactsSnapshot, GatewayMode, HealthState, NodeProjectionEnvelope,
+    StrategyKind, StrategyLifecycle, StrategySummary, VenueId,
 };
+
+#[path = "copy_postgres/node_source.rs"]
+mod node_copy_source;
 
 #[tokio::test]
 async fn postgres_delivery_lease_ack_unknown_reconcile_and_restart_are_fenced()
@@ -151,6 +156,368 @@ async fn postgres_delivery_lease_ack_unknown_reconcile_and_restart_are_fenced()
     Ok(())
 }
 
+#[tokio::test]
+async fn postgres_projection_cursor_snapshot_and_facts_commit_as_one_unit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = integration_database_url()? else {
+        return Ok(());
+    };
+    let fixture = PgFixture::create(&database_url).await?;
+    fixture.migrate_twice().await?;
+    let repository = PgControlRepository::new(fixture.pool.clone());
+    let first = projection(1, 1, [21; 32], [0; 32], 100)?;
+    assert!(matches!(
+        repository.merge_node_projection(&first).await?,
+        venue_control::SnapshotStoreResult::Inserted { .. }
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM venue_account_node_projection_inbox")
+            .fetch_one(&fixture.pool)
+            .await?,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT generated_ms FROM venue_control_snapshots")
+            .fetch_one(&fixture.pool)
+            .await?,
+        100
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT generated_ms FROM venue_control_execution_facts")
+            .fetch_one(&fixture.pool)
+            .await?,
+        100
+    );
+    assert_eq!(
+        repository.merge_node_projection(&first).await?,
+        venue_control::SnapshotStoreResult::Unchanged
+    );
+    // Simulate the deployed v11 cursor schema, then migrate its real envelope twice. All
+    // destructive DDL is confined to this test's unique search_path schema.
+    sqlx::raw_sql(
+        "ALTER TABLE venue_account_node_projection_inbox DROP CONSTRAINT venue_account_node_projection_inbox_pkey; \
+         ALTER TABLE venue_account_node_projection_inbox DROP COLUMN instance_id; \
+         ALTER TABLE venue_account_node_projection_inbox ADD PRIMARY KEY (venue,mode,trading_account_id,node_id);",
+    ).execute(&fixture.pool).await?;
+    for _ in 0..2 {
+        sqlx::raw_sql(MIGRATION_0012).execute(&fixture.pool).await?;
+    }
+    let migrated_instance: String =
+        sqlx::query_scalar("SELECT instance_id FROM venue_account_node_projection_inbox")
+            .fetch_one(&fixture.pool)
+            .await?;
+    assert_eq!(migrated_instance, first.binding.instance_id);
+    assert_eq!(
+        repository.merge_node_projection(&first).await?,
+        venue_control::SnapshotStoreResult::Unchanged
+    );
+    // Indexed cursor columns and their immutable JSON must agree even on the replay fast path.
+    for tamper in [
+        "UPDATE venue_account_node_projection_inbox SET projection_sequence=2",
+        "UPDATE venue_account_node_projection_inbox SET node_id='wrong-node'",
+        "UPDATE venue_account_node_projection_inbox SET instance_id='wrong-instance'",
+        "UPDATE venue_account_node_projection_inbox SET projection_digest=decode(repeat('ab',32),'hex')",
+    ] {
+        sqlx::query(tamper).execute(&fixture.pool).await?;
+        assert_eq!(
+            repository.merge_node_projection(&first).await,
+            Err(venue_control::RepositoryError::CorruptData)
+        );
+        sqlx::query("UPDATE venue_account_node_projection_inbox SET projection_sequence=$1,node_id=$2,instance_id=$3,projection_digest=$4")
+            .bind(i64::try_from(first.sequence)?).bind(&first.node_id)
+            .bind(&first.binding.instance_id).bind(first.digest.to_vec())
+            .execute(&fixture.pool).await?;
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM venue_control_events")
+            .fetch_one(&fixture.pool)
+            .await?,
+        2
+    );
+    let gap = projection(1, 3, [22; 32], [21; 32], 101)?;
+    assert!(matches!(
+        repository.merge_node_projection(&gap).await,
+        Err(venue_control::RepositoryError::ReplayConflict)
+    ));
+    let rollover = projection(2, 1, [23; 32], [0; 32], 101)?;
+    assert!(matches!(
+        repository.merge_node_projection(&rollover).await?,
+        venue_control::SnapshotStoreResult::Inserted { .. }
+    ));
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_projection_round_trips_over_the_loopback_node_client()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = integration_database_url()? else {
+        return Ok(());
+    };
+    let fixture = PgFixture::create(&database_url).await?;
+    fixture.migrate_twice().await?;
+    let repository = PgControlRepository::new(fixture.pool.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (stop, shutdown) = control_shutdown_channel();
+    let server = tokio::spawn(serve_local(
+        listener,
+        std::sync::Arc::new(ControlService::new(repository.clone())),
+        ControlHttpConfig::default(),
+        shutdown,
+    ));
+    let projection = projection(1, 1, [31; 32], [0; 32], 100)?;
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?
+        .post(format!("http://{address}/v2/account-node/projection"))
+        .json(&projection)
+        .send()
+        .await?;
+    assert!(response.status().is_success());
+    let echoed = response.json::<NodeProjectionEnvelope>().await?;
+    assert_eq!(echoed, projection);
+    assert_eq!(repository.load_snapshot().await?, Some(projection.snapshot));
+    assert_eq!(
+        repository.load_execution_facts().await?,
+        Some(projection.facts)
+    );
+    let _ = stop.send(true);
+    server.await??;
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_node_updates_preserve_sibling_accounts_and_reject_forged_replays()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = integration_database_url()? else {
+        return Ok(());
+    };
+    let fixture = PgFixture::create(&database_url).await?;
+    fixture.migrate_twice().await?;
+    let repository = PgControlRepository::new(fixture.pool.clone());
+    let mut first = projection(1, 1, [41; 32], [0; 32], 200)?;
+    let mut second = projection(1, 1, [42; 32], [0; 32], 100)?;
+    second.binding.venue = VenueId::Bybit;
+    second.binding.trading_account_id = "00000000-0000-4000-8000-000000000002".to_owned();
+    second.binding.instance_id = "grid-bybit".to_owned();
+    second.node_id = "node-projection-b".to_owned();
+    second.snapshot.accounts[0].venue = second.binding.venue;
+    second.snapshot.accounts[0].trading_account_id = second.binding.trading_account_id.clone();
+    second.snapshot.strategies[0].venue = second.binding.venue;
+    second.snapshot.strategies[0].trading_account_id = second.binding.trading_account_id.clone();
+    second.snapshot.strategies[0].instance_id = second.binding.instance_id.clone();
+    for envelope in [&mut first, &mut second] {
+        envelope
+            .facts
+            .health
+            .push(venue_control_protocol::AccountHealthFact {
+                venue: envelope.binding.venue,
+                mode: envelope.binding.mode,
+                trading_account_id: envelope.binding.trading_account_id.clone(),
+                health: HealthState::Healthy,
+                private_generation: 1,
+                last_reconciled_ms: envelope.snapshot.generated_ms - 1,
+                observed_ms: envelope.snapshot.generated_ms,
+                fact_digest: [48; 32],
+            });
+    }
+    repository.merge_node_projection(&first).await?;
+    // Account B is older than A, but this is not a regression in B's own stream.
+    repository.merge_node_projection(&second).await?;
+    let merged = repository
+        .load_snapshot()
+        .await?
+        .ok_or("missing merged snapshot")?;
+    assert_eq!(merged.accounts.len(), 2);
+    assert_eq!(merged.strategies.len(), 2);
+    assert_eq!(merged.generated_ms, 200);
+    assert_eq!(
+        repository
+            .load_execution_facts()
+            .await?
+            .ok_or("missing facts")?
+            .health
+            .len(),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM venue_control_strategy_scopes")
+            .fetch_one(&fixture.pool)
+            .await?,
+        2
+    );
+
+    // Reusing an existing digest must not acknowledge changed content.
+    let mut forged = first.clone();
+    forged.snapshot.accounts[0].equity = Some(Decimal::from(999_999));
+    assert_eq!(
+        repository.merge_node_projection(&forged).await,
+        Err(venue_control::RepositoryError::ReplayConflict)
+    );
+
+    // One account cannot replace another account's globally unique instance ID.
+    let mut collision = second.clone();
+    collision.sequence = 2;
+    collision.previous_digest = second.digest;
+    collision.digest = [43; 32];
+    collision.binding.instance_id = first.binding.instance_id.clone();
+    collision.sequence = 1;
+    collision.previous_digest = [0; 32];
+    collision.snapshot.strategies[0].instance_id = first.binding.instance_id.clone();
+    assert_eq!(
+        repository.merge_node_projection(&collision).await,
+        Err(venue_control::RepositoryError::SnapshotConflict)
+    );
+
+    let mut next = first.clone();
+    next.sequence = 2;
+    next.previous_digest = first.digest;
+    next.digest = [44; 32];
+    next.snapshot.generated_ms = 201;
+    next.facts.generated_ms = 201;
+    next.snapshot.strategies.clear();
+    next.facts.health.clear();
+    repository.merge_node_projection(&next).await?;
+    let merged = repository
+        .load_snapshot()
+        .await?
+        .ok_or("missing snapshot")?;
+    assert_eq!(merged.accounts.len(), 2);
+    assert_eq!(merged.strategies, second.snapshot.strategies);
+    // Empty instance facts cannot erase account-level evidence from another projection.
+    assert_eq!(
+        repository
+            .load_execution_facts()
+            .await?
+            .ok_or("missing facts")?
+            .health
+            .len(),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM venue_control_strategy_scopes")
+            .fetch_one(&fixture.pool)
+            .await?,
+        1
+    );
+    assert_eq!(sqlx::query_scalar::<_, i64>(
+        "SELECT projection_sequence FROM venue_account_node_projection_inbox WHERE node_id='node-projection-b'")
+        .fetch_one(&fixture.pool).await?, 1);
+
+    // The same account process owns independent per-instance outbox cursors.
+    let mut sibling = first.clone();
+    sibling.binding.instance_id = "grid-eth".to_owned();
+    sibling.binding.symbol = "ETH/USDT".parse()?;
+    sibling.snapshot.strategies[0].instance_id = sibling.binding.instance_id.clone();
+    sibling.snapshot.strategies[0].symbol = sibling.binding.symbol.clone();
+    sibling.digest = [45; 32];
+    sibling
+        .facts
+        .positions
+        .push(venue_control_protocol::SignedPositionFact {
+            binding: venue_control_protocol::ExecutionFactBinding {
+                venue: sibling.binding.venue,
+                mode: sibling.binding.mode,
+                trading_account_id: sibling.binding.trading_account_id.clone(),
+                symbol: sibling.binding.symbol.clone(),
+                instance_id: sibling.binding.instance_id.clone(),
+                config_epoch: sibling.binding.config_epoch,
+            },
+            position_side: venue_domain::PositionSide::Net,
+            quantity: Decimal::ONE,
+            entry_price: None,
+            mark_price: None,
+            signed_generation: 1,
+            observed_ms: 199,
+            fact_digest: [47; 32],
+        });
+    repository.merge_node_projection(&sibling).await?;
+    let mut restored = next.clone();
+    restored.sequence = 3;
+    restored.previous_digest = next.digest;
+    restored.digest = [46; 32];
+    restored.snapshot.strategies = first.snapshot.strategies;
+    repository.merge_node_projection(&restored).await?;
+    let merged = repository
+        .load_snapshot()
+        .await?
+        .ok_or("missing sibling snapshot")?;
+    assert_eq!(merged.accounts.len(), 2);
+    assert_eq!(merged.strategies.len(), 3);
+    assert_eq!(
+        repository
+            .load_execution_facts()
+            .await?
+            .ok_or("missing sibling facts")?
+            .positions,
+        sibling.facts.positions
+    );
+    assert_eq!(scalar_projection_cursor_count(&fixture.pool).await?, 3);
+    let mut old_epoch = sibling.clone();
+    old_epoch.node_id = "different-process".to_owned();
+    old_epoch.binding.config_epoch -= 1;
+    old_epoch.snapshot.strategies[0].config_epoch -= 1;
+    old_epoch.facts.positions[0].binding.config_epoch -= 1;
+    old_epoch.snapshot.generated_ms = 300;
+    old_epoch.facts.generated_ms = 300;
+    old_epoch.digest = [49; 32];
+    assert_eq!(
+        repository.merge_node_projection(&old_epoch).await,
+        Err(venue_control::RepositoryError::SnapshotConflict)
+    );
+    assert_eq!(scalar_projection_cursor_count(&fixture.pool).await?, 3);
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+async fn scalar_projection_cursor_count(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT count(*) FROM venue_account_node_projection_inbox")
+        .fetch_one(pool)
+        .await
+}
+
+fn projection(
+    generation: u64,
+    sequence: u64,
+    digest: [u8; 32],
+    previous_digest: [u8; 32],
+    generated_ms: u64,
+) -> Result<NodeProjectionEnvelope, Box<dyn std::error::Error>> {
+    let mut snapshot = snapshot()?;
+    snapshot.generated_ms = generated_ms;
+    snapshot.accounts[0].last_reconciled_ms = generated_ms - 1;
+    snapshot.strategies[0].last_receipt_ms = generated_ms - 1;
+    Ok(NodeProjectionEnvelope {
+        schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
+        binding: binding()?,
+        node_id: "node-projection-a".to_owned(),
+        node_generation: generation,
+        sequence,
+        previous_digest,
+        digest,
+        copy_execution_evidence: Vec::new(),
+        copy_planning_facts: Vec::new(),
+        snapshot,
+        facts: ExecutionFactsSnapshot {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            generated_ms,
+            orders: Vec::new(),
+            positions: Vec::new(),
+            fills: Vec::new(),
+            reconciliation: Vec::new(),
+            copy_ledger: Vec::new(),
+            drift: Vec::new(),
+            execution: Vec::new(),
+            risk: Vec::new(),
+            health: Vec::new(),
+        },
+    })
+}
+
 fn binding() -> Result<AccountDeliveryBinding, Box<dyn std::error::Error>> {
     Ok(AccountDeliveryBinding {
         venue: VenueId::Binance,
@@ -189,9 +556,10 @@ fn snapshot() -> Result<ControlSnapshot, Box<dyn std::error::Error>> {
             mode: binding.mode,
             trading_account_id: binding.trading_account_id.clone(),
             health: HealthState::Healthy,
-            equity: Decimal::from(1_000),
-            available_margin: Decimal::from(900),
-            unrealized_pnl: Decimal::ZERO,
+            equity: Some(Decimal::from(1_000)),
+            available_margin: Some(Decimal::from(900)),
+            unrealized_pnl: Some(Decimal::ZERO),
+            balances: Vec::new(),
             private_generation: 1,
             writer_generation: 1,
             last_reconciled_ms: 99,
@@ -208,8 +576,8 @@ fn snapshot() -> Result<ControlSnapshot, Box<dyn std::error::Error>> {
             open_orders: 0,
             long_quantity: Decimal::ZERO,
             short_quantity: Decimal::ZERO,
-            realized_pnl: Decimal::ZERO,
-            unrealized_pnl: Decimal::ZERO,
+            realized_pnl: Some(Decimal::ZERO),
+            unrealized_pnl: Some(Decimal::ZERO),
             last_receipt_ms: 99,
             attention: None,
         }],
@@ -286,6 +654,13 @@ impl PgFixture {
             sqlx::raw_sql(MIGRATION_0004).execute(&self.pool).await?;
             sqlx::raw_sql(MIGRATION_0005).execute(&self.pool).await?;
             sqlx::raw_sql(MIGRATION_0006).execute(&self.pool).await?;
+            sqlx::raw_sql(MIGRATION_0007).execute(&self.pool).await?;
+            sqlx::raw_sql(MIGRATION_0008).execute(&self.pool).await?;
+            sqlx::raw_sql(MIGRATION_0009).execute(&self.pool).await?;
+            sqlx::raw_sql(MIGRATION_0010).execute(&self.pool).await?;
+            sqlx::raw_sql(MIGRATION_0011).execute(&self.pool).await?;
+            sqlx::raw_sql(MIGRATION_0012).execute(&self.pool).await?;
+            sqlx::raw_sql(MIGRATION_0013).execute(&self.pool).await?;
         }
         Ok(())
     }

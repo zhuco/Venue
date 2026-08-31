@@ -48,7 +48,8 @@ Market / Private / Control Fact
 本任务已获得对现有配置中真实交易账户进行重构验证和小额实盘操作的持续授权。执行本任务的 AI 可以：
 
 - 在 Binance、Gate.io、Bitget、Bybit、OKX、Hyperliquid 的既有可用账户中选择符合账户 binding、能力契约和项目硬约束的交易对；
-  初期 Bybit、OKX、Hyperliquid 的既有 DOGE binding 仍固定使用 `DOGE/USDT`，不得借本授权改绑其他 symbol；
+  初期既有 DOGE binding 保持该基础币：Bybit、OKX 使用 `DOGE/USDT`，Hyperliquid 使用实际永续报价 `DOGE/USDC`；
+  后者必须以真实新鲜汇率验证 USDT 等值风险，不得借报价名称修正改变账户或策略基础币；
 - 在离线门禁、签名预检、唯一 writer 和恢复检查通过后执行真实 place、cancel、必要的 reduce-only、Stop 和 Flatten 验证；
 - 自行传入 CLI 所要求的 `--confirm-live` 或等价技术确认参数，无需为每个 Canary 再请求人工确认；
 - 根据实时 instrument rule 选择价格和数量，但单个账户的现有绝对持仓名义价值、未撤增险订单名义价值与本次新增风险之和
@@ -57,8 +58,8 @@ Market / Private / Control Fact
   才能进入下一轮。若要再次新增风险，更新签名持仓必须已归零；
 - 在一个账户/交易所失败关闭后继续完成其他不依赖该账户的代码、测试、文档和 Web 子任务。
 
-持续授权是操作授权，不是绕过技术门。当前代码主要具备单笔 `max_entry_notional=10`，尚未完整证明账户累计 10U 门；因此在 M1
-完成下列汇总风险实现及故障测试前，AI 不得发送真实新增风险命令，只能执行签名只读预检、撤单、reduce-only、Stop/Flatten 和
+持续授权是操作授权，不是绕过技术门。单笔 `max_entry_notional=10` 不能替代账户累计门；因此在 M1
+完成下列汇总风险、每所真实估值接线及故障测试前，AI 不得发送真实新增风险命令，只能执行签名只读预检、撤单、reduce-only、Stop/Flatten 和
 其他离线任务：
 
 ```text
@@ -109,11 +110,11 @@ AI 只发起经授权的 operator/control 语义动作，不能直接调用 adap
 
 ### 3.2 必须补齐的闭环
 
-- Copy 当前止于 semantic `Applied`，尚未生成 follower 的账户执行意图。
-- Account Runtime、Execution Lane 与 `AccountMutationHost` 尚未组成六所共同的常驻 Node resident。
-- Binance、Gate.io、Bitget 的生产 mutation 仍由 Stage 7 authority/WAL/writer 外壳掌握。
+- Copy 已有 semantic Applied 到同一账户 WAL、签名成交/仓位的物理桥；leader 权威事实自动接入、持续 ledger/drift repair 和完整产品端到端仍须验收。
+- 六所 Node 已组合 Account Runtime、Execution Lane 与 `AccountMutationHost`；Grid/Scalping 的生产私流驱动和物理接线、控制撤单/清仓及多 symbol 常驻调度仍须闭合，不能以纯 reducer 测试替代。
+- 根 package 的旧三所生产 binary 已移除，但服务器上的旧 release、未决 WAL 与运行进程仍须逐所核验和接管；本地删除入口不构成生产退休证明。
 - 六所尚未共同满足同一套启动恢复、Owner 路由、Stop/Flatten、Unknown 收敛和产品级 Canary 契约。
-- Control 仅提供 loopback API；用户 Web 所需的会话、鉴权和同源 BFF 尚未在本工作区建立。
+- Control 的 loopback API 与 Web 会话、鉴权、同源 BFF 已建立；隔离 fixture 的浏览器验收不替代指定主机的真实 Node/Control/Web 连通与分段性能验收。
 - 用户自助凭证托管、多租户权限和付费能力不在当前账户运行时范围内，不能由前端页面假装已实现。
 
 因此，在物理跟单闭环完成前，不得把项目状态描述为“后端完成、只剩 UI”。
@@ -189,6 +190,30 @@ Leader authoritative fact
 
 Copy Actor 输出意图前必须重验：relation revision、leader/follower binding、instrument generation、目标时效、follower 当前签名持仓、
 可用资本、倍率、准备金、单笔/累计限额和账户生命周期。跨零反向分两轮：先 reduce-only 到零，等新私有事实后再开反向风险。
+
+自动规划输入复用 Node 的耐久 projection outbox：外层 `copy_planning_facts` 携带精确 relation/revision/policy、实例 epoch、
+规范 instrument、私有/规则 generation、原始报价敞口和有效窗口，不进入浏览器 DTO。Leader 策略资本必须显式配置，不能取账户权益代替；
+Follower 可用保证金必须来自同轮签名事实。Control 仅配对同报价资产、当前 Running 实例的新鲜双边事实，不按稳定币 1:1 换算。
+worker 在同一数据库事务中冻结输入、规划任务并推进观察游标；倍率作为冻结字段进入纯计算，不改写 Leader 原始敞口。
+同一经济输入的重复上传不产生新任务；旧 revision 任务未签名收敛时仍阻止该关系叠加新任务。新节点的空/暂停投影不得回退使用旧节点事实。
+已经签名收敛并写入 ledger 的任务若仍有漂移，必须等待不早于该收敛仓位的新鲜双边事实，重新验证当前 Active 关系、资本、规则与目标，
+才可产生带 `supersedes_job_id` 的独立修复语义任务。修复身份、窗口和持仓代际来自新观察；历史 projection 只证明来源，不续期旧任务、
+不重投旧 child，也不把历史 `repair` 候选直接作为新风险授权。没有 ledger 的 Accepted、Unknown、Rejected 不因重复目标进入自动修复。
+上游资本规划应保留原始跨零目标和当前敞口，不能在生成语义 job 前拒绝反向目标，也不能把完整跨零 delta 当成一笔可执行订单。
+数据库 observer/job 的账户 scope 是实际接收 job 的 follower；leader 的 venue/account 不得与 follower scope 混为一谈。
+
+原始执行 request 必须早于 Actor Applied 和账户 WAL 耐久保存。每个 immutable job 只允许一个 ReduceToZero child 和一个 Adjust child，
+child 身份不得包含不断推进的签名快照 generation；重启或重复 delivery 不得用新持仓重算已提交 child 的价格、数量或原 request。
+恢复读取同一本 WAL 的原命令，按精确 native order identity 累积规范成交并检查更新的完整仓位腿与开放订单；仅 ACK 或较新仓位不能证明成交。
+过期、暂停或旧 revision job 仍可只读收敛原 child，但不能产生新风险。第二 phase 必须保留第一 phase 的 request/签名零仓证据，重新检查
+当前 relation、有效期和账户风险，并在新 WAL 前单独持久化 Adjust request；不得覆盖第一 phase 的恢复事实。
+第二 phase 的最后一次签名读取仍须证明零仓；若减仓回读与新 request 之间仓位发生变化，应停止续行，不能重新解释已存在的 ReduceToZero child。
+执行结果保留原 request 的仓位代际，另携带完成对账的更新签名仓位；ledger 按该实际仓位匹配，不能用新仓位代际查找旧 request，
+也不能把包含命令和成交的执行摘要当作单独仓位摘要。同一 job/phase 不得借新代际重新绑定命令。关系暂停或改参不阻断既有 child 的只读结果记录。
+Node 通过既有 projection outbox 传输有界、固定编码的原始执行结果，保留 ReduceToZero 与 Adjust 的各自历史；它们不放进浏览器的 UI facts。
+Control 在提交投影游标的同一事务内校验外层 binding、SHA256、内层结果和原始 delivery，记录结果；批次任一项冲突则全部回滚。
+只收到完全相同的回显后，Node 才在既有 Copy journal 标记该结果已投影。结果投影可跳过尚未上传的中间状态，但 Reconciled 必须携带更新签名仓位。
+回传 request 的目标、资产、phase 与 delta 必须由原 immutable job 和统一纯规划语义校验；已有 ReduceToZero 时，Adjust 只能引用其已签名归零后不早于该代的零仓事实。过期结果仍可只读记录，但不能借投影刷新授权。
 
 每个 immutable snapshot、job、manifest、outbox row 和 Actor inbox 都必须耐久绑定精确 relation revision 与 policy digest。关系改参、
 Pause、Stop 或删除时，Control 必须在同一 PostgreSQL 事务内递增 revision 并产生配置变更事件；Planner 和 Node 通过耐久事件/投递消费，
@@ -458,6 +483,8 @@ dispatch 启动 `<20ms`（均不含交易所网络）目标。Web 首次可用 s
 
 - Bybit、OKX、Hyperliquid 的现有 host 命令并入常驻 Node；
 - 六所共用启动、恢复、控制和观测投影；
+- Node→Control 观测上传固定为 loopback `/v2/account-node/projection`：Node 先将 envelope 写入耐久 outbox，按 node generation/sequence/digest 串行重放，Control 在同一 PostgreSQL 事务中提交 cursor、snapshot 与 signed execution facts；重复 envelope 幂等，冲突、跳序、跨账户内容或错误 rollover 一律失败关闭。该回显不是 writer、WAL、capability 或 dispatch authority；
+- 每个实例的 outbox 游标按账户、node_id、instance_id 分开保存；不同实例不可共用一个 sequence。上传仅替换该实例的策略/订单/持仓等投影，账户汇总只接受较新事实，不能删除兄弟实例或其他账户；旧 cursor 的实例键由原 envelope 迁移，缺失或冲突拒绝迁移；
 - adapter capability matrix 决定功能，不在 runtime 复制交易所分支。
 
 #### M5：Web 基础与只读产品
@@ -475,7 +502,7 @@ dispatch 启动 `<20ms`（均不含交易所网络）目标。Web 首次可用 s
 
 #### M7：旧入口退休
 
-- Stage 7 生产调用点、重复 authority 和旧 CLI 清零；
+- 根 package 的 `hedged-grid-{binance,gate,bitget}` binary、Cargo feature、部署 re-export 与发布脚本已清零；其余 Stage 7 代码只可作既有工件读取兼容，不能重新接通 mutation；
 - 旧工件读取兼容有明确保留期限和测试；
 - `CODEMAP.md` 删除已不存在入口，`legacy` 目录只剩仍被真实工件需要的读取代码；
 - 删除前执行全仓引用、发布脚本、服务配置和实盘进程审计。
@@ -496,8 +523,10 @@ scripts/verify_repository_hygiene.ps1
 按影响范围追加：
 
 - `scripts/verify_workspace_quality.ps1`；
-- `scripts/verify_fixed_deployment_binaries.ps1`；
 - `scripts/verify_venue_node_binaries.ps1`；
+- `scripts/verify_venue_node_binary_isolation.ps1`；
+- `scripts/package_venue_node_linux_release.sh --release-id <id> --output-root <absolute-linux-path> --preflight-only`，随后以相同参数去掉预检生成仅含六个固定 Node binary、SHA256SUMS 与 manifest 的版本化目录；
+- `scripts/verify_venue_node_linux_release.ps1`；
 - `scripts/verify_gateway_candidate_contract.ps1`；
 - `scripts/verify_postgres_integration.ps1`；
 - 交易所 adapter contract 和故障注入测试。
@@ -510,6 +539,7 @@ scripts/verify_repository_hygiene.ps1
 npm run typecheck
 npm test
 npm run build
+npm run verify:boundary
 npm run test:e2e
 ```
 

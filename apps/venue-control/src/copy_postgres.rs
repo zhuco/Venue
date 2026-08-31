@@ -1,24 +1,38 @@
 use std::collections::BTreeMap;
 
+#[path = "copy_leader_postgres.rs"]
+mod leader_input;
+#[path = "copy_planning_postgres.rs"]
+mod planning_source;
+
+#[path = "copy_execution_postgres.rs"]
+pub(crate) mod execution_projection;
+#[path = "copy_ledger_postgres.rs"]
+pub(crate) mod ledger_projection;
+
 use sqlx::{Postgres, Row, Transaction};
-use venue_control_protocol::AccountDeliveryReceipt;
+use venue_control_protocol::{AccountDeliveryReceipt, CopyRelationConfig};
 use venue_copy::{
-    CopyLedger, DeliveryReceiptStatus, DeliveryState, DeliveryTracker, LedgerApply,
-    PersistedDeliveryReceipt,
+    CopyExecutionResult, CopyExecutionState, CopyLedger, DeliveryReceiptStatus, DeliveryState,
+    DeliveryTracker, LedgerApply, PersistedDeliveryReceipt,
 };
 
 use crate::copy_worker::plan_observed_copy_job;
 
 use crate::{
-    CopyApplyResult, CopyCrashReplay, CopyDeliveryClaim, CopyDriftProjection, CopyJob,
-    CopyLeaderEnvelope, CopyLeaderIntent, CopyLeaderSnapshot, CopyLedgerProjectionInput,
-    CopyObserverLease, CopyObserverScope, CopyReplayDeliveryState, CopyReplayJob, CopyRepository,
-    CopyRepositoryError, CopyStoreResult, MAX_COPY_DELIVERY_CLAIM_MS, MAX_COPY_OBSERVER_LEASE_MS,
-    ObservedCopyIntent, PgControlRepository, PlannedCopyJob, ScopedCopyDeliveryReceipt,
+    CopyApplyResult, CopyCrashReplay, CopyDeliveryClaim, CopyDriftProjection,
+    CopyExecutionProjectionInput, CopyJob, CopyLeaderEnvelope, CopyLeaderIntent,
+    CopyLeaderSnapshot, CopyLedgerProjectionInput, CopyObserverLease, CopyObserverScope,
+    CopyReplayDeliveryState, CopyReplayJob, CopyRepository, CopyRepositoryError, CopyStoreResult,
+    MAX_COPY_DELIVERY_CLAIM_MS, MAX_COPY_OBSERVER_LEASE_MS, ObservedCopyIntent,
+    PgControlRepository, PlannedCopyJob, ScopedCopyDeliveryReceipt,
     account_delivery_postgres::insert_copy_account_delivery,
 };
 
 pub const MIGRATION_0002: &str = include_str!("../migrations/0002_copy_core.sql");
+pub const MIGRATION_0007: &str = include_str!("../migrations/0007_copy_relation_commitment.sql");
+pub const MIGRATION_0008: &str = include_str!("../migrations/0008_copy_execution_projection.sql");
+pub const MIGRATION_0013: &str = include_str!("../migrations/0013_copy_node_receipt_outbox.sql");
 
 impl PgControlRepository {
     pub async fn load_copy_worker_replay(
@@ -28,7 +42,7 @@ impl PgControlRepository {
     ) -> Result<CopyCrashReplay, CopyRepositoryError> {
         let replay = self.load_copy_replay(scope, replayed_at_ms).await?;
         let rows = sqlx::query(
-            "SELECT j.job_json, p.venue AS plan_venue, p.mode AS plan_mode, \
+            "SELECT j.job_json, j.relation_id, j.relation_revision, j.policy_digest, p.venue AS plan_venue, p.mode AS plan_mode, \
                     p.trading_account_id AS plan_account_id, p.source_event_sequence, \
                     p.capital_snapshot_json, p.target_exposure_json, p.plan_digest, \
                     o.event_sequence, o.event_digest, i.intent_json, i.intent_digest, \
@@ -53,6 +67,7 @@ impl PgControlRepository {
         }
         for row in rows {
             let job: CopyJob = decode(row.try_get("job_json").map_err(database_error)?)?;
+            validate_job_relation_columns(&row, &job)?;
             let plan_venue: String = row.try_get("plan_venue").map_err(database_error)?;
             let plan_mode: String = row.try_get("plan_mode").map_err(database_error)?;
             let plan_account_id: String = row.try_get("plan_account_id").map_err(database_error)?;
@@ -99,6 +114,17 @@ impl PgControlRepository {
             .map_err(|_| CopyRepositoryError::LeaseConflict)?;
         let planned_at = to_i64(planned_at_ms)?;
         let mut transaction = self.pool().begin().await.map_err(database_error)?;
+        advisory_lock(
+            &mut transaction,
+            &format!(
+                "{}:{}",
+                lease.scope.venue.as_str(),
+                lease.scope.trading_account_id
+            ),
+            20_006,
+        )
+        .await?;
+        advisory_lock(&mut transaction, &lease.scope.observer_id, 20_003).await?;
         lock_and_validate_lease(&mut transaction, lease, planned_at).await?;
         let cursor: i64 = sqlx::query(
             "SELECT last_event_sequence FROM venue_copy_observer_cursors \
@@ -110,14 +136,25 @@ impl PgControlRepository {
         .map_err(database_error)?
         .try_get("last_event_sequence")
         .map_err(database_error)?;
-        let Some(observed) =
-            load_next_observed_for_update(&mut transaction, &lease.scope, cursor).await?
-        else {
+        let mut next =
+            load_next_observed_for_update(&mut transaction, &lease.scope, cursor).await?;
+        if next.is_none()
+            && planning_source::store_next_in_transaction(
+                &mut transaction,
+                &lease.scope,
+                planned_at_ms,
+            )
+            .await?
+        {
+            next = load_next_observed_for_update(&mut transaction, &lease.scope, cursor).await?;
+        }
+        let Some(observed) = next else {
             transaction.commit().await.map_err(database_error)?;
             return Ok(None);
         };
         let planned = plan_observed_copy_job(observed, planned_at_ms)
             .map_err(|_| CopyRepositoryError::InvalidData)?;
+        ensure_current_relation(&mut transaction, &planned.job).await?;
         persist_planned_copy_job(&mut transaction, lease, &planned, cursor, planned_at).await?;
         transaction.commit().await.map_err(database_error)?;
         Ok(Some(planned))
@@ -130,141 +167,11 @@ impl CopyRepository for PgControlRepository {
         envelope: &CopyLeaderEnvelope,
         stored_at_ms: u64,
     ) -> Result<CopyStoreResult, CopyRepositoryError> {
-        envelope
-            .validate(stored_at_ms)
-            .map_err(|_| CopyRepositoryError::InvalidData)?;
-        if stored_at_ms < envelope.intent.observed_at_ms {
-            return Err(CopyRepositoryError::InvalidData);
-        }
-        let stored_at = to_i64(stored_at_ms)?;
-        let snapshot_json = encode(&envelope.snapshot)?;
-        let intent_json = encode(&envelope.intent)?;
-        let intent_id = envelope.intent.intent_id.to_string();
-        let snapshot_id = envelope.snapshot.snapshot_id.to_string();
         let mut transaction = self.pool().begin().await.map_err(database_error)?;
-        advisory_lock(&mut transaction, &envelope.scope.observer_id, 20_003).await?;
-        ensure_observer_scope(&mut transaction, &envelope.scope).await?;
-        advisory_lock(&mut transaction, &intent_id, 20_001).await?;
-        advisory_lock(&mut transaction, &snapshot_id, 20_002).await?;
-
-        if let Some(row) = sqlx::query(
-            "SELECT i.observer_id, i.venue, i.mode, i.trading_account_id, i.intent_json, i.intent_digest, \
-                    s.snapshot_json, s.snapshot_digest, o.event_digest, o.event_sequence \
-             FROM venue_copy_leader_intents i \
-             JOIN venue_copy_leader_snapshots s USING (snapshot_id) \
-             JOIN venue_copy_observer_outbox o USING (intent_id) \
-             WHERE i.intent_id = $1 FOR SHARE OF i, s, o",
-        )
-        .bind(&intent_id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(database_error)?
-        {
-            let existing_scope = scope_from_row(&row)?;
-            let existing_intent: CopyLeaderIntent =
-                decode(row.try_get("intent_json").map_err(database_error)?)?;
-            let existing_snapshot: CopyLeaderSnapshot =
-                decode(row.try_get("snapshot_json").map_err(database_error)?)?;
-            let intent_digest = digest(row.try_get("intent_digest").map_err(database_error)?)?;
-            let snapshot_digest = digest(row.try_get("snapshot_digest").map_err(database_error)?)?;
-            let event_digest = digest(row.try_get("event_digest").map_err(database_error)?)?;
-            let sequence = row.try_get("event_sequence").map_err(database_error)?;
-            if existing_scope == envelope.scope
-                && existing_intent == envelope.intent
-                && existing_snapshot == envelope.snapshot
-                && intent_digest == envelope.intent.intent_digest
-                && snapshot_digest == envelope.snapshot.snapshot_digest
-                && event_digest == envelope.outbox_digest
-            {
-                transaction.commit().await.map_err(database_error)?;
-                return Ok(CopyStoreResult::Existing { sequence });
-            }
-            return Err(CopyRepositoryError::ReplayConflict);
-        }
-
-        if let Some(row) = sqlx::query(
-            "SELECT observer_id, venue, mode, trading_account_id, snapshot_json, snapshot_digest \
-             FROM venue_copy_leader_snapshots WHERE snapshot_id = $1 FOR SHARE",
-        )
-        .bind(&snapshot_id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(database_error)?
-        {
-            let existing_scope = scope_from_row(&row)?;
-            let existing_snapshot: CopyLeaderSnapshot =
-                decode(row.try_get("snapshot_json").map_err(database_error)?)?;
-            let existing_digest = digest(row.try_get("snapshot_digest").map_err(database_error)?)?;
-            if existing_scope != envelope.scope
-                || existing_snapshot != envelope.snapshot
-                || existing_digest != envelope.snapshot.snapshot_digest
-            {
-                return Err(CopyRepositoryError::ReplayConflict);
-            }
-        } else {
-            sqlx::query(
-                "INSERT INTO venue_copy_leader_snapshots \
-                 (snapshot_id, observer_id, venue, mode, trading_account_id, generation, \
-                  observed_at_ms, expires_at_ms, snapshot_digest, snapshot_json) \
-                 VALUES ($1, $2, $3, 'LIVE', $4, $5, $6, $7, $8, $9)",
-            )
-            .bind(&snapshot_id)
-            .bind(&envelope.scope.observer_id)
-            .bind(envelope.scope.venue.as_str())
-            .bind(&envelope.scope.trading_account_id)
-            .bind(to_i64(envelope.snapshot.generation)?)
-            .bind(to_i64(envelope.snapshot.observed_at_ms)?)
-            .bind(to_i64(envelope.snapshot.expires_at_ms)?)
-            .bind(envelope.snapshot.snapshot_digest.to_vec())
-            .bind(snapshot_json)
-            .execute(&mut *transaction)
-            .await
-            .map_err(database_error)?;
-        }
-
-        sqlx::query(
-            "INSERT INTO venue_copy_leader_intents \
-             (intent_id, observer_id, venue, mode, trading_account_id, snapshot_id, intent_digest, \
-              intent_json, observed_at_ms, stored_at_ms) \
-             VALUES ($1, $2, $3, 'LIVE', $4, $5, $6, $7, $8, $9)",
-        )
-        .bind(&intent_id)
-        .bind(&envelope.scope.observer_id)
-        .bind(envelope.scope.venue.as_str())
-        .bind(&envelope.scope.trading_account_id)
-        .bind(&snapshot_id)
-        .bind(envelope.intent.intent_digest.to_vec())
-        .bind(intent_json)
-        .bind(to_i64(envelope.intent.observed_at_ms)?)
-        .bind(stored_at)
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        let row = sqlx::query(
-            "INSERT INTO venue_copy_observer_outbox \
-             (observer_id, intent_id, event_digest, created_at_ms) VALUES ($1, $2, $3, $4) \
-             RETURNING event_sequence",
-        )
-        .bind(&envelope.scope.observer_id)
-        .bind(&intent_id)
-        .bind(envelope.outbox_digest.to_vec())
-        .bind(stored_at)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        let sequence = row.try_get("event_sequence").map_err(database_error)?;
-        sqlx::query(
-            "INSERT INTO venue_copy_observer_cursors \
-             (observer_id, last_event_sequence, updated_at_ms) VALUES ($1, 0, $2) \
-             ON CONFLICT (observer_id) DO NOTHING",
-        )
-        .bind(&envelope.scope.observer_id)
-        .bind(stored_at)
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_error)?;
+        let result =
+            leader_input::store_in_transaction(&mut transaction, envelope, stored_at_ms).await?;
         transaction.commit().await.map_err(database_error)?;
-        Ok(CopyStoreResult::Inserted { sequence })
+        Ok(result)
     }
 
     async fn acquire_observer_lease(
@@ -419,6 +326,7 @@ impl CopyRepository for PgControlRepository {
         let committed_at = to_i64(committed_at_ms)?;
         let mut transaction = self.pool().begin().await.map_err(database_error)?;
         lock_and_validate_lease(&mut transaction, lease, committed_at).await?;
+        ensure_current_relation(&mut transaction, job).await?;
         let cursor: i64 = sqlx::query(
             "SELECT last_event_sequence FROM venue_copy_observer_cursors \
              WHERE observer_id = $1 FOR UPDATE",
@@ -473,29 +381,7 @@ impl CopyRepository for PgControlRepository {
         if identity_conflict.is_some() {
             return Err(CopyRepositoryError::ReplayConflict);
         }
-        sqlx::query(
-            "INSERT INTO venue_copy_jobs \
-             (job_id, observer_id, source_event_sequence, intent_id, venue, mode, \
-              trading_account_id, idempotency_key, follower_binding_id, manifest_json, job_json, \
-              job_digest, created_at_ms, expires_at_ms) \
-             VALUES ($1, $2, $3, $4, $5, 'LIVE', $6, $7, $8, $9, $10, $11, $12, $13)",
-        )
-        .bind(&job_id)
-        .bind(&job.scope.observer_id)
-        .bind(job.source_event_sequence)
-        .bind(job.intent_id.to_string())
-        .bind(job.scope.venue.as_str())
-        .bind(&job.scope.trading_account_id)
-        .bind(job.identities.idempotency_key.to_string())
-        .bind(job.manifest.binding.follower_binding_id.to_string())
-        .bind(encode(&job.manifest)?)
-        .bind(encode(job)?)
-        .bind(job.job_digest.to_vec())
-        .bind(to_i64(job.created_at_ms)?)
-        .bind(to_i64(job.manifest.expires_at_ms)?)
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_error)?;
+        insert_copy_job(&mut transaction, job).await?;
         sqlx::query(
             "INSERT INTO venue_copy_observer_inbox \
              (observer_id, event_sequence, event_digest, job_id, consumed_at_ms) \
@@ -782,180 +668,20 @@ impl CopyRepository for PgControlRepository {
         &self,
         input: &CopyLedgerProjectionInput,
     ) -> Result<CopyApplyResult, CopyRepositoryError> {
-        if input.projected_at_ms == 0 {
-            return Err(CopyRepositoryError::InvalidData);
-        }
-        let repair = input
-            .plan_repair()
-            .map_err(|_| CopyRepositoryError::ProjectionConflict)?;
-        let job_id = input.job_id.to_string();
-        let receipt_sequence = to_i64(input.receipt_sequence)?;
-        let binding_id = input.ledger_entry.binding.follower_binding_id.to_string();
-        let account_id = &input.ledger_entry.binding.account_id;
-        let projected_at = to_i64(input.projected_at_ms)?;
         let mut transaction = self.pool().begin().await.map_err(database_error)?;
-
-        if let Some(row) = sqlx::query(
-            "SELECT projection_digest FROM venue_copy_projection_inbox \
-             WHERE job_id = $1 AND receipt_sequence = $2 FOR SHARE",
-        )
-        .bind(&job_id)
-        .bind(receipt_sequence)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(database_error)?
-        {
-            let durable = digest(row.try_get("projection_digest").map_err(database_error)?)?;
-            if durable == input.projection_digest {
-                transaction.commit().await.map_err(database_error)?;
-                return Ok(CopyApplyResult::Existing);
-            }
-            return Err(CopyRepositoryError::ProjectionConflict);
-        }
-
-        let row = sqlx::query(
-            "SELECT j.job_json, r.status, o.projected FROM venue_copy_jobs j \
-             JOIN venue_copy_delivery_receipts r USING (job_id) \
-             JOIN venue_copy_receipt_outbox o USING (job_id, receipt_sequence) \
-             WHERE j.job_id = $1 AND r.receipt_sequence = $2 FOR UPDATE OF o",
-        )
-        .bind(&job_id)
-        .bind(receipt_sequence)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(database_error)?
-        .ok_or(CopyRepositoryError::ProjectionConflict)?;
-        let job: CopyJob = decode(row.try_get("job_json").map_err(database_error)?)?;
-        let status: String = row.try_get("status").map_err(database_error)?;
-        let already_projected: bool = row.try_get("projected").map_err(database_error)?;
-        if already_projected
-            || !matches!(status.as_str(), "applied" | "reconciled")
-            || job.identities.job_id != input.job_id
-            || job.manifest.binding != input.ledger_entry.binding
-        {
-            return Err(CopyRepositoryError::ProjectionConflict);
-        }
-        let projection_lock = format!("{}|{}|{}", job.scope.venue.as_str(), account_id, binding_id);
-        advisory_lock(&mut transaction, &projection_lock, 20_005).await?;
-
-        let rows = sqlx::query(
-            "SELECT entry_json FROM venue_copy_ledger \
-             WHERE venue = $1 AND mode = 'LIVE' AND trading_account_id = $2 \
-               AND follower_binding_id = $3 ORDER BY ledger_sequence FOR SHARE",
-        )
-        .bind(job.scope.venue.as_str())
-        .bind(account_id)
-        .bind(&binding_id)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        let mut ledger = CopyLedger::new(input.ledger_entry.binding.clone());
-        for row in rows {
-            let entry: venue_copy::LedgerEntry =
-                decode(row.try_get("entry_json").map_err(database_error)?)?;
-            ledger
-                .apply(entry)
-                .map_err(|_| CopyRepositoryError::CorruptData)?;
-        }
-        if ledger
-            .apply(input.ledger_entry.clone())
-            .map_err(|_| CopyRepositoryError::ProjectionConflict)?
-            != LedgerApply::Advanced
-        {
-            return Err(CopyRepositoryError::ProjectionConflict);
-        }
-
-        let projection = CopyDriftProjection {
-            source_job_id: input.job_id,
-            receipt_sequence: input.receipt_sequence,
-            position: input.position.clone(),
-            target: input.target.clone(),
-            repair,
-            projected_at_ms: input.projected_at_ms,
-        };
-        if let Some(row) = sqlx::query(
-            "SELECT position_generation FROM venue_copy_drift_projections \
-             WHERE venue = $1 AND mode = 'LIVE' AND trading_account_id = $2 \
-               AND follower_binding_id = $3 FOR UPDATE",
-        )
-        .bind(job.scope.venue.as_str())
-        .bind(account_id)
-        .bind(&binding_id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(database_error)?
-        {
-            let generation: i64 = row.try_get("position_generation").map_err(database_error)?;
-            if from_i64(generation)? > input.position.generation {
-                return Err(CopyRepositoryError::ProjectionConflict);
-            }
-        }
-
-        sqlx::query(
-            "INSERT INTO venue_copy_ledger \
-             (venue, mode, trading_account_id, follower_binding_id, ledger_sequence, generation, \
-              job_id, receipt_sequence, fact_digest, entry_json, projected_at_ms) \
-             VALUES ($1, 'LIVE', $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-        )
-        .bind(job.scope.venue.as_str())
-        .bind(account_id)
-        .bind(&binding_id)
-        .bind(to_i64(input.ledger_entry.sequence)?)
-        .bind(to_i64(input.ledger_entry.generation)?)
-        .bind(&job_id)
-        .bind(receipt_sequence)
-        .bind(input.ledger_entry.fact_digest.to_vec())
-        .bind(encode(&input.ledger_entry)?)
-        .bind(projected_at)
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        sqlx::query(
-            "INSERT INTO venue_copy_drift_projections \
-             (venue, mode, trading_account_id, follower_binding_id, position_generation, \
-              source_job_id, receipt_sequence, projection_json, projected_at_ms) \
-             VALUES ($1, 'LIVE', $2, $3, $4, $5, $6, $7, $8) \
-             ON CONFLICT (venue, mode, trading_account_id, follower_binding_id) DO UPDATE SET \
-               position_generation = EXCLUDED.position_generation, \
-               source_job_id = EXCLUDED.source_job_id, receipt_sequence = EXCLUDED.receipt_sequence, \
-               projection_json = EXCLUDED.projection_json, projected_at_ms = EXCLUDED.projected_at_ms",
-        )
-        .bind(job.scope.venue.as_str())
-        .bind(account_id)
-        .bind(&binding_id)
-        .bind(to_i64(input.position.generation)?)
-        .bind(&job_id)
-        .bind(receipt_sequence)
-        .bind(encode(&projection)?)
-        .bind(projected_at)
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        sqlx::query(
-            "INSERT INTO venue_copy_projection_inbox \
-             (job_id, receipt_sequence, projection_digest, projected_at_ms) VALUES ($1, $2, $3, $4)",
-        )
-        .bind(&job_id)
-        .bind(receipt_sequence)
-        .bind(input.projection_digest.to_vec())
-        .bind(projected_at)
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        let updated = sqlx::query(
-            "UPDATE venue_copy_receipt_outbox SET projected = TRUE \
-             WHERE job_id = $1 AND receipt_sequence = $2 AND projected = FALSE",
-        )
-        .bind(&job_id)
-        .bind(receipt_sequence)
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        if updated.rows_affected() != 1 {
-            return Err(CopyRepositoryError::ProjectionConflict);
-        }
+        let result = ledger_projection::project_in_transaction(&mut transaction, input).await?;
         transaction.commit().await.map_err(database_error)?;
-        Ok(CopyApplyResult::Stored)
+        Ok(result)
+    }
+
+    async fn record_copy_execution(
+        &self,
+        input: &CopyExecutionProjectionInput,
+    ) -> Result<CopyApplyResult, CopyRepositoryError> {
+        let mut transaction = self.pool().begin().await.map_err(database_error)?;
+        let result = execution_projection::record_in_transaction(&mut transaction, input).await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(result)
     }
 
     async fn load_copy_replay(
@@ -1160,6 +886,39 @@ impl CopyRepository for PgControlRepository {
     }
 }
 
+/// The planner never upgrades an already-frozen job to the current relation.  A revision or
+/// digest mismatch is a stable fail-closed condition; the caller must create a new snapshot/job.
+pub(crate) async fn ensure_current_relation(
+    transaction: &mut Transaction<'_, Postgres>,
+    job: &CopyJob,
+) -> Result<CopyRelationConfig, CopyRepositoryError> {
+    let relation = &job.manifest.binding.relation;
+    let row = sqlx::query(
+        "SELECT revision, lifecycle, config_json FROM venue_copy_relation_configs \
+         WHERE relation_id = $1 FOR SHARE",
+    )
+    .bind(relation.relation_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(database_error)?
+    .ok_or(CopyRepositoryError::DeliveryConflict)?;
+    let revision = from_i64(row.try_get("revision").map_err(database_error)?)?;
+    let lifecycle: String = row.try_get("lifecycle").map_err(database_error)?;
+    let config: CopyRelationConfig = decode(row.try_get("config_json").map_err(database_error)?)?;
+    if revision != relation.revision
+        || config.policy_digest() != relation.policy_digest
+        || lifecycle != "active"
+        || config.follower.venue != job.scope.venue
+        || config.follower.trading_account_id != job.scope.trading_account_id
+        || config.follower.trading_account_id != job.manifest.binding.account_id
+        || config.follower.instance_id != job.manifest.binding.follower_instance_id
+        || config.follower.symbol != job.manifest.binding.instrument.symbol
+    {
+        return Err(CopyRepositoryError::DeliveryConflict);
+    }
+    Ok(config)
+}
+
 async fn load_next_observed_for_update(
     transaction: &mut Transaction<'_, Postgres>,
     scope: &CopyObserverScope,
@@ -1183,6 +942,67 @@ async fn load_next_observed_for_update(
     .await
     .map_err(database_error)?;
     row.map(|row| observed_from_row(row, scope)).transpose()
+}
+
+fn validate_job_relation_columns(
+    row: &sqlx::postgres::PgRow,
+    job: &CopyJob,
+) -> Result<(), CopyRepositoryError> {
+    let relation = &job.manifest.binding.relation;
+    if row
+        .try_get::<Option<String>, _>("relation_id")
+        .map_err(database_error)?
+        .as_deref()
+        != Some(relation.relation_id.to_string().as_str())
+        || row
+            .try_get::<Option<i64>, _>("relation_revision")
+            .map_err(database_error)?
+            != Some(to_i64(relation.revision)?)
+        || row
+            .try_get::<Option<Vec<u8>>, _>("policy_digest")
+            .map_err(database_error)?
+            .as_deref()
+            != Some(relation.policy_digest.as_slice())
+    {
+        return Err(CopyRepositoryError::CorruptData);
+    }
+    Ok(())
+}
+
+async fn insert_copy_job(
+    transaction: &mut Transaction<'_, Postgres>,
+    job: &CopyJob,
+) -> Result<(), CopyRepositoryError> {
+    let job_id = job.identities.job_id.to_string();
+    sqlx::query(
+            "INSERT INTO venue_copy_jobs \
+             (job_id, observer_id, source_event_sequence, intent_id, venue, mode, \
+              trading_account_id, idempotency_key, follower_binding_id, relation_id, relation_revision, \
+              policy_digest, manifest_json, job_json, job_digest, created_at_ms, expires_at_ms) \
+             VALUES ($1, $2, $3, $4, $5, 'LIVE', $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+        )
+        .bind(&job_id)
+        .bind(&job.scope.observer_id)
+        .bind(job.source_event_sequence)
+        .bind(job.intent_id.to_string())
+        .bind(job.scope.venue.as_str())
+        .bind(&job.scope.trading_account_id)
+        .bind(job.identities.idempotency_key.to_string())
+        .bind(job.manifest.binding.follower_binding_id.to_string())
+        .bind(job.manifest.binding.relation.relation_id.to_string())
+        .bind(to_i64(job.manifest.binding.relation.revision)?)
+        .bind(job.manifest.binding.relation.policy_digest.to_vec())
+        .bind(encode(&job.manifest)?)
+        .bind(encode(job)?)
+        .bind(job.job_digest.to_vec())
+        .bind(to_i64(job.created_at_ms)?)
+        .bind(to_i64(job.manifest.expires_at_ms)?)
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+    crate::copy_ledger_read_model::notify_repair_change(transaction, job, job.created_at_ms)
+        .await?;
+    Ok(())
 }
 
 async fn persist_planned_copy_job(
@@ -1213,29 +1033,7 @@ async fn persist_planned_copy_job(
     if identity_conflict.is_some() {
         return Err(CopyRepositoryError::ReplayConflict);
     }
-    sqlx::query(
-        "INSERT INTO venue_copy_jobs \
-         (job_id, observer_id, source_event_sequence, intent_id, venue, mode, \
-          trading_account_id, idempotency_key, follower_binding_id, manifest_json, job_json, \
-          job_digest, created_at_ms, expires_at_ms) \
-         VALUES ($1, $2, $3, $4, $5, 'LIVE', $6, $7, $8, $9, $10, $11, $12, $13)",
-    )
-    .bind(&job_id)
-    .bind(&job.scope.observer_id)
-    .bind(job.source_event_sequence)
-    .bind(job.intent_id.to_string())
-    .bind(job.scope.venue.as_str())
-    .bind(&job.scope.trading_account_id)
-    .bind(job.identities.idempotency_key.to_string())
-    .bind(job.manifest.binding.follower_binding_id.to_string())
-    .bind(encode(&job.manifest)?)
-    .bind(encode(job)?)
-    .bind(job.job_digest.to_vec())
-    .bind(to_i64(job.created_at_ms)?)
-    .bind(to_i64(job.manifest.expires_at_ms)?)
-    .execute(&mut **transaction)
-    .await
-    .map_err(database_error)?;
+    insert_copy_job(transaction, job).await?;
     sqlx::query(
         "INSERT INTO venue_copy_plans \
          (job_id, venue, mode, trading_account_id, source_event_sequence, \
@@ -1563,6 +1361,43 @@ const fn receipt_status(status: DeliveryReceiptStatus) -> &'static str {
     }
 }
 
+const fn copy_execution_state(state: CopyExecutionState) -> &'static str {
+    match state {
+        CopyExecutionState::Prepared => "prepared",
+        CopyExecutionState::Submitted => "submitted",
+        CopyExecutionState::Accepted => "accepted",
+        CopyExecutionState::Rejected => "rejected",
+        CopyExecutionState::Unknown => "unknown",
+        CopyExecutionState::Reconciled => "reconciled",
+    }
+}
+
+const fn valid_execution_transition(
+    previous: CopyExecutionState,
+    next: CopyExecutionState,
+) -> bool {
+    match previous {
+        CopyExecutionState::Prepared => matches!(
+            next,
+            CopyExecutionState::Submitted
+                | CopyExecutionState::Accepted
+                | CopyExecutionState::Rejected
+                | CopyExecutionState::Unknown
+                | CopyExecutionState::Reconciled
+        ),
+        CopyExecutionState::Submitted => matches!(
+            next,
+            CopyExecutionState::Accepted
+                | CopyExecutionState::Rejected
+                | CopyExecutionState::Unknown
+                | CopyExecutionState::Reconciled
+        ),
+        CopyExecutionState::Accepted => matches!(next, CopyExecutionState::Reconciled),
+        CopyExecutionState::Unknown => matches!(next, CopyExecutionState::Reconciled),
+        CopyExecutionState::Rejected | CopyExecutionState::Reconciled => false,
+    }
+}
+
 fn database_error(_: sqlx::Error) -> CopyRepositoryError {
     CopyRepositoryError::Database
 }
@@ -1591,7 +1426,8 @@ async fn require_durable_node_receipt(
         DeliveryReceiptStatus::Rejected => ("rejected", "settled"),
     };
     let rows = sqlx::query(
-        "SELECT r.receipt_json FROM venue_account_deliveries d \
+        "SELECT d.delivery_id, d.venue, d.mode, d.trading_account_id, d.symbol, d.instance_id, \
+                r.receipt_json FROM venue_account_deliveries d \
          JOIN venue_account_delivery_receipts r USING (delivery_id) \
          WHERE d.source_kind = 'copy_semantic_job' AND d.source_id = $1 \
            AND d.delivery_state = $2 AND r.receipt_state = $3 FOR SHARE",
@@ -1605,15 +1441,31 @@ async fn require_durable_node_receipt(
     if rows.len() != 1 {
         return Err(CopyRepositoryError::DeliveryConflict);
     }
+    let delivery_id: String = rows[0].try_get("delivery_id").map_err(database_error)?;
+    let venue: String = rows[0].try_get("venue").map_err(database_error)?;
+    let mode: String = rows[0].try_get("mode").map_err(database_error)?;
+    let account_id: String = rows[0]
+        .try_get("trading_account_id")
+        .map_err(database_error)?;
+    let symbol: String = rows[0].try_get("symbol").map_err(database_error)?;
+    let instance_id: String = rows[0].try_get("instance_id").map_err(database_error)?;
     let node: AccountDeliveryReceipt =
         decode(rows[0].try_get("receipt_json").map_err(database_error)?)?;
     node.validate()
         .map_err(|_| CopyRepositoryError::CorruptData)?;
-    if node.observed_ms > receipt.persisted_at_ms
-        || node.lease.binding.venue != job.scope.venue
-        || node.lease.binding.mode != job.scope.mode
-        || node.lease.binding.trading_account_id != job.scope.trading_account_id
-        || node.lease.binding.symbol != job.manifest.binding.instrument.symbol
+    if delivery_id != format!("copy:{job_id}")
+        || venue != job.scope.venue.as_str()
+        || mode != "LIVE"
+        || account_id != job.manifest.binding.account_id
+        || symbol != job.manifest.binding.instrument.symbol.to_string()
+        || instance_id != job.manifest.binding.follower_instance_id
+        || node.observed_ms > receipt.persisted_at_ms
+        || node.lease.delivery_id != delivery_id
+        || node.lease.binding.venue.as_str() != venue
+        || node.lease.binding.mode != venue_control_protocol::GatewayMode::Live
+        || node.lease.binding.trading_account_id != account_id
+        || node.lease.binding.symbol.to_string() != symbol
+        || node.lease.binding.instance_id != instance_id
         || matches!(
             receipt.status,
             DeliveryReceiptStatus::Applied | DeliveryReceiptStatus::Reconciled
@@ -1644,6 +1496,14 @@ mod tests {
         assert!(crate::MIGRATION_0005.contains("CHECK (mode = 'LIVE')"));
         assert!(crate::MIGRATION_0005.contains("COPY_OBSERVER"));
         assert!(!crate::MIGRATION_0005.contains("UPDATE "));
+        assert!(
+            include_str!("../migrations/0007_copy_relation_commitment.sql")
+                .contains("relation_revision")
+        );
+        assert!(
+            include_str!("../migrations/0008_copy_execution_projection.sql")
+                .contains("venue_copy_execution_results")
+        );
     }
 
     #[test]
@@ -1654,5 +1514,21 @@ mod tests {
             Err(CopyRepositoryError::InvalidData)
         );
         assert_eq!(validate_limit(0), Err(CopyRepositoryError::InvalidData));
+    }
+
+    #[test]
+    fn unknown_execution_can_only_converge_by_signed_reconciliation() {
+        assert!(valid_execution_transition(
+            CopyExecutionState::Unknown,
+            CopyExecutionState::Reconciled
+        ));
+        assert!(!valid_execution_transition(
+            CopyExecutionState::Unknown,
+            CopyExecutionState::Prepared
+        ));
+        assert!(!valid_execution_transition(
+            CopyExecutionState::Rejected,
+            CopyExecutionState::Prepared
+        ));
     }
 }

@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use venue_control_protocol::{GatewayMode, VenueId};
 use venue_copy::{
-    AuthoritativePositionSnapshot, CopyId, CopyIdentityInput, CopyIdentitySet, DriftRepairError,
-    DriftRepairPlanRequest, DriftRepairRequest, FollowerDeliveryManifest, LedgerEntry,
+    AuthoritativePositionSnapshot, CopyExecutionResult, CopyExecutionState, CopyId,
+    CopyIdentityInput, CopyIdentitySet, DriftRepairError, DriftRepairPlanRequest,
+    DriftRepairRequest, FollowerDeliveryManifest, LedgerEntry, MAX_REPAIR_TTL_MS,
     PersistedDeliveryReceipt, TargetExposurePlan, derive_copy_identities, plan_drift_repair,
 };
 use venue_domain::domain::is_canonical_trading_account_id;
@@ -253,7 +254,78 @@ pub struct CopyLedgerProjectionInput {
     pub repair_expires_at_ms: u64,
 }
 
+/// A Node-originated execution projection.  It is accepted only as evidence about a prior
+/// semantic delivery and never creates an execution command or retry authorization.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CopyExecutionProjectionInput {
+    pub job_id: CopyId,
+    pub execution: CopyExecutionResult,
+}
+
+impl CopyExecutionProjectionInput {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if self.job_id != self.execution.request.job_id
+            || self.execution.request.delivery_digest == [0; 32]
+            || self.execution.observed_at_ms == 0
+            || (self.execution.state == CopyExecutionState::Reconciled
+                && self.execution.fact_digest == [0; 32])
+        {
+            return Err("copy execution result is incomplete");
+        }
+        match (&self.execution.state, &self.execution.reconciled_position) {
+            (CopyExecutionState::Reconciled, Some(position))
+                if position.binding == self.execution.request.binding
+                    && position.generation > self.execution.request.position_generation
+                    && position.fact_digest != [0; 32]
+                    && position.exposure.asset == self.execution.request.target_exposure.asset
+                    && (self.execution.request.phase
+                        != venue_copy::CopyExecutionPhase::ReduceToZero
+                        || position.exposure.value.is_zero())
+                    && position.observed_at_ms > 0
+                    && position.observed_at_ms <= self.execution.observed_at_ms
+                    && position.expires_at_ms > self.execution.observed_at_ms => {}
+            (CopyExecutionState::Reconciled, _) | (_, Some(_)) => {
+                return Err("copy execution result has no matching closing position");
+            }
+            (_, None) => {}
+        }
+        Ok(())
+    }
+}
+
 impl CopyLedgerProjectionInput {
+    /// Validates the immutable signed fact and capital target at the fact's observation point.
+    /// A later projection can lose repair authority, but expiry must never hide a forged asset,
+    /// target, binding, or generation.
+    pub(crate) fn validate_historical_fact(&self) -> Result<(), DriftRepairError> {
+        let mut verification = self.clone();
+        verification.projected_at_ms = self.position.observed_at_ms;
+        verification.repair_expires_at_ms = self
+            .position
+            .observed_at_ms
+            .checked_add(MAX_REPAIR_TTL_MS)
+            .map(|expires_at_ms| expires_at_ms.min(self.position.expires_at_ms))
+            .ok_or(DriftRepairError::RepairWindow)?;
+        verification.plan_repair().map(|_| ())
+    }
+
+    /// A repair window is either live and bounded or, for historical accounting only, exactly
+    /// the signed position's own expiry. This prevents malformed windows from becoming implicit
+    /// authorization when the projection is late.
+    pub(crate) fn has_valid_or_signed_expired_repair_window(&self) -> bool {
+        if self.projected_at_ms < self.position.observed_at_ms {
+            return false;
+        }
+        if self.repair_expires_at_ms > self.projected_at_ms {
+            return self
+                .repair_expires_at_ms
+                .checked_sub(self.projected_at_ms)
+                .is_some_and(|ttl| ttl > 0 && ttl <= MAX_REPAIR_TTL_MS);
+        }
+        self.position.expires_at_ms <= self.projected_at_ms
+            && self.repair_expires_at_ms == self.position.expires_at_ms
+    }
+
     pub(crate) fn plan_repair(&self) -> Result<Option<DriftRepairRequest>, DriftRepairError> {
         if self.ledger_entry.binding != self.position.binding
             || self.ledger_entry.generation != self.position.generation
@@ -316,7 +388,9 @@ pub struct CopyCrashReplay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use venue_copy::{CopyAction, CopyIdentityInput};
+    use rust_decimal::Decimal;
+    use venue_copy::{CopyAction, CopyIdentityInput, LedgerAttribution};
+    use venue_domain::domain::{Amount, Asset, InstrumentIdentity, MarketKind, Symbol};
 
     fn identity_input() -> CopyIdentityInput {
         CopyIdentityInput {
@@ -413,6 +487,86 @@ mod tests {
         let encoded = serde_json::to_value(identities)?;
         let decoded: CopyIdentitySet = serde_json::from_value(encoded)?;
         assert_eq!(decoded, identities);
+        Ok(())
+    }
+
+    fn historical_projection() -> Result<CopyLedgerProjectionInput, Box<dyn std::error::Error>> {
+        let source = derive_copy_identities(&identity_input())?;
+        let mut repair_input = identity_input();
+        repair_input.revision = 2;
+        let repair = derive_copy_identities(&repair_input)?;
+        let asset = Asset::new("USDT")?;
+        let binding = venue_copy::DeliveryBinding {
+            relation: venue_copy::RelationCommitment {
+                relation_id: derive_copy_identities(&CopyIdentityInput {
+                    revision: 3,
+                    ..identity_input()
+                })?
+                .job_id,
+                revision: 1,
+                policy_digest: [7; 32],
+            },
+            leader_id: source.planning_snapshot_id,
+            follower_id: source.child_order_id,
+            follower_binding_id: repair.child_order_id,
+            follower_instance_id: "copy-btc".to_owned(),
+            account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            instrument: InstrumentIdentity {
+                symbol: "BTC/USDT".parse::<Symbol>()?,
+                market: MarketKind::LinearPerpetual,
+                settlement_asset: Some(asset.clone()),
+            },
+            policy_id: source.job_id,
+        };
+        let position = AuthoritativePositionSnapshot {
+            binding: binding.clone(),
+            generation: 2,
+            observed_at_ms: 100,
+            expires_at_ms: 200,
+            exposure: Amount::new(asset.clone(), Decimal::from(10)),
+            fact_digest: [9; 32],
+        };
+        Ok(CopyLedgerProjectionInput {
+            job_id: source.job_id,
+            receipt_sequence: 2,
+            projection_digest: [9; 32],
+            ledger_entry: LedgerEntry {
+                sequence: 1,
+                generation: position.generation,
+                binding: binding.clone(),
+                attribution: LedgerAttribution::Copy,
+                source_id: source.job_id,
+                fact_digest: position.fact_digest,
+                managed_exposure: position.exposure.clone(),
+            },
+            position,
+            target: TargetExposurePlan {
+                snapshot_generation: 3,
+                exposure_ratio: Decimal::new(1, 1),
+                safe_available_margin: Amount::new(asset.clone(), Decimal::from(100)),
+                effective_follower_capital: Amount::new(asset.clone(), Decimal::from(100)),
+                target_exposure: Amount::new(asset.clone(), Decimal::from(10)),
+                delta_exposure: Amount::new(asset, Decimal::ZERO),
+            },
+            repair_identities: repair,
+            projected_at_ms: 250,
+            repair_expires_at_ms: 200,
+        })
+    }
+
+    #[test]
+    fn expired_signed_fact_can_be_accounted_but_cannot_bypass_target_validation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let input = historical_projection()?;
+        assert!(input.validate_historical_fact().is_ok());
+        assert!(input.has_valid_or_signed_expired_repair_window());
+
+        let mut forged = input;
+        forged.target.target_exposure.asset = Asset::new("USDC")?;
+        assert_eq!(
+            forged.validate_historical_fact(),
+            Err(DriftRepairError::Asset)
+        );
         Ok(())
     }
 }

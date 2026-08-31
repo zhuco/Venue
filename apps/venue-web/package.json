@@ -1,0 +1,28 @@
+{
+  "name": "@venue/web",
+  "version": "0.1.0",
+  "private": true,
+  "engines": { "node": ">=22.18.0" },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build && node scripts/prepare-standalone.mjs",
+    "start": "node .next/standalone/server.js",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test lib/*.test.ts",
+    "test:e2e": "playwright test",
+    "verify:boundary": "node scripts/verify-boundary.mjs"
+  },
+  "dependencies": {
+    "next": "16.3.3",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.58.2",
+    "@types/node": "26.4.0",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.5",
+    "tsx": "4.21.0",
+    "typescript": "7.0.2"
+  }
+}

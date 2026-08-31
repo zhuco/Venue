@@ -111,6 +111,51 @@ function Test-UnauthorizedLiveRejected {
     }
 }
 
+function Test-LegacyPredecessorRequired {
+    param(
+        [Parameter(Mandatory)] [string]$Venue,
+        [Parameter(Mandatory)] [string]$BinaryPath
+    )
+
+    $symbols = @{ binance = 'BTC/USDT'; bitget = 'BTC/USDT'; gate = 'DOGE/USDT' }
+    $probeBase = Join-Path `
+        (Split-Path -Parent $targetRoot) `
+        "venue-node-legacy-predecessor-$Venue-$([Guid]::NewGuid().ToString('N'))"
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $BinaryPath
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in @(
+        '--mode', 'LIVE',
+        '--trading-account-id', '00000000-0000-4000-8000-000000000001',
+        '--symbol', $symbols[$Venue],
+        '--artifacts-base', $probeBase
+    )) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw "无法启动 $Venue legacy predecessor 拒绝探针。"
+    }
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit(15000)) {
+        $process.Kill($true)
+        $process.WaitForExit()
+        throw "$Venue 缺 predecessor 探针未在 15 秒内结束。"
+    }
+    $output = "$($stdout.GetAwaiter().GetResult())`n$($stderr.GetAwaiter().GetResult())"
+    if ($process.ExitCode -eq 0 -or (Test-Path -LiteralPath $probeBase) -or
+        -not $output.Contains(
+            'legacy v1 predecessor handoff is required only for Binance, Gate, and Bitget and must validate exactly',
+            [StringComparison]::Ordinal
+        )) {
+        throw "$Venue 未在任何凭证或工件 I/O 前拒绝缺少 v1 predecessor。"
+    }
+}
+
 function Test-NonProductionModeRejected {
     param(
         [Parameter(Mandatory)] [string]$Venue,
@@ -196,6 +241,9 @@ foreach ($venue in @('binance', 'bitget', 'bybit', 'gate', 'hyperliquid', 'okx')
         $venueEvidence | Add-Member -NotePropertyName live_commands -NotePropertyValue `
             @('preflight', 'canary-place', 'canary-cancel')
         $venueEvidence | Add-Member -NotePropertyName wrong_confirmation_no_io -NotePropertyValue $true
+    } elseif ($venue -in @('binance', 'bitget', 'gate')) {
+        Test-LegacyPredecessorRequired -Venue $venue -BinaryPath $binaryPath
+        $venueEvidence | Add-Member -NotePropertyName legacy_predecessor_required_no_io -NotePropertyValue $true
     }
     $evidence.Add($venueEvidence)
 }

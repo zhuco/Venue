@@ -54,7 +54,9 @@ pub use physical::{
 pub use private_stream::{
     HyperliquidFillStream, HyperliquidFillUpdate, HyperliquidOrderUpdate, HyperliquidPrivateEvent,
     HyperliquidPrivateStreamBinding, HyperliquidPrivateStreamDecoder,
-    HyperliquidPrivateSubscription, HyperliquidPrivateSubscriptionKind, build_private_subscription,
+    HyperliquidPrivateSubscription, HyperliquidPrivateSubscriptionKind, HyperliquidTwapState,
+    HyperliquidTwapStatesSnapshot, build_private_subscription, build_twap_states_subscription,
+    parse_all_mids_snapshot, parse_twap_states_snapshot,
 };
 pub use protocol::{
     HYPERLIQUID_FILL_RESPONSE_LIMIT, HYPERLIQUID_RECENT_FILL_RETENTION_LIMIT,
@@ -63,12 +65,13 @@ pub use protocol::{
     HyperliquidOpenOrder, HyperliquidOpenOrdersSnapshot, HyperliquidOrderFamily,
     HyperliquidOrderFamilyCoverage, HyperliquidOrderLookup, HyperliquidOrderStatus,
     HyperliquidOrderStatusUnknownReason, HyperliquidPayloadScope, HyperliquidPerpMeta,
-    HyperliquidUserFills, build_clearinghouse_state_request, build_frontend_open_orders_request,
-    build_l2_book_request, build_meta_request, build_open_orders_request,
-    build_order_status_request, build_user_fills_by_time_request, parse_clearinghouse_snapshot,
+    HyperliquidTwapSliceFill, HyperliquidUserFills, build_clearinghouse_state_request,
+    build_frontend_open_orders_request, build_l2_book_request, build_meta_request,
+    build_open_orders_request, build_order_status_request, build_user_fills_by_time_request,
+    build_user_twap_slice_fills_request, parse_clearinghouse_snapshot,
     parse_frontend_open_orders_snapshot, parse_l2_book_bbo, parse_open_orders_snapshot,
     parse_order_status, parse_perp_meta, parse_private_user_fills, parse_user_fills_page,
-    parse_ws_bbo, validate_frontend_open_orders_snapshot,
+    parse_user_twap_slice_fills, parse_ws_bbo, validate_frontend_open_orders_snapshot,
 };
 pub use transport::{
     HyperliquidHttpResponse, HyperliquidHttpTransport, HyperliquidPrivateWsTransport,

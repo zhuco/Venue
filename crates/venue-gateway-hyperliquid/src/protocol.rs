@@ -16,9 +16,11 @@ use crate::{
     HyperliquidConfig, HyperliquidError, HyperliquidReadBinding, endpoints,
     models::{
         BboData, BookData, BookLevel, ClearinghouseState, EventEnvelope, FrontendOrderRow,
-        OrderStatusEnvelope, PerpMetaResponse, UserFillRow, UserFillsData,
+        OrderStatusEnvelope, PerpMetaResponse, UserFillRow, UserFillsData, UserTwapSliceFillRow,
     },
 };
+
+pub(crate) mod account;
 
 const MAX_BOOK_LEVELS: usize = 20;
 pub const HYPERLIQUID_FILL_RESPONSE_LIMIT: usize = 2_000;
@@ -132,6 +134,12 @@ pub struct HyperliquidUserFills {
     pub scope: HyperliquidPayloadScope,
     pub is_snapshot: bool,
     pub fills: Vec<HyperliquidFill>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HyperliquidTwapSliceFill {
+    pub twap_id: u64,
+    pub fill: HyperliquidFill,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -423,6 +431,14 @@ pub fn build_user_fills_by_time_request(
             "aggregateByTime": false,
         }),
     )
+}
+
+/// TWAP slice history has no continuation token.  A cap-sized response is therefore rejected by
+/// its parser instead of being mistaken for a complete view of a live parent.
+pub fn build_user_twap_slice_fills_request(
+    meta: &HyperliquidPerpMeta,
+) -> Result<HyperliquidInfoRequest, HyperliquidError> {
+    bound_user_request("userTwapSliceFills", &meta.scope)
 }
 
 pub fn build_order_status_request(
@@ -744,6 +760,15 @@ pub fn parse_user_fills_page(
     meta: &HyperliquidPerpMeta,
     query: &HyperliquidFillQuery,
 ) -> Result<HyperliquidFillPage, HyperliquidError> {
+    parse_user_fills_page_scoped(payload, meta, query, None)
+}
+
+fn parse_user_fills_page_scoped(
+    payload: &[u8],
+    meta: &HyperliquidPerpMeta,
+    query: &HyperliquidFillQuery,
+    universe: Option<&BTreeMap<String, HyperliquidPerpMeta>>,
+) -> Result<HyperliquidFillPage, HyperliquidError> {
     query.validate()?;
     if query.scope != meta.scope {
         return Err(HyperliquidError::Binding);
@@ -781,10 +806,19 @@ pub fn parse_user_fills_page(
             .is_none_or(|after| cursor.key() > after.key())
     }) {
         last_consumed = Some(cursor.clone());
-        if row.coin != meta.scope.native_coin {
+        let scope = if let Some(universe) = universe {
+            // The account endpoint also returns spot trades. They advance its shared cursor,
+            // but are not perpetual facts. An unknown perpetual coin must never be dropped.
+            match account::perp_scope(&row.coin, universe)? {
+                Some(scope) => scope,
+                None => continue,
+            }
+        } else if row.coin == meta.scope.native_coin {
+            &meta.scope
+        } else {
             continue;
-        }
-        fills.push(normalize_fill(row, &meta.scope)?);
+        };
+        fills.push(normalize_fill(row, scope)?);
         if fills.len() == query.limit {
             truncated = true;
             break;
@@ -810,6 +844,36 @@ pub fn parse_user_fills_page(
     })
 }
 
+pub fn parse_user_twap_slice_fills(
+    payload: &[u8],
+    meta: &HyperliquidPerpMeta,
+) -> Result<Vec<HyperliquidTwapSliceFill>, HyperliquidError> {
+    let rows: Vec<UserTwapSliceFillRow> =
+        serde_json::from_slice(payload).map_err(|_| HyperliquidError::Payload)?;
+    if rows.len() >= HYPERLIQUID_FILL_RESPONSE_LIMIT {
+        return Err(HyperliquidError::Payload);
+    }
+    let mut fill_ids = BTreeMap::new();
+    let mut fills = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.twap_id == 0 {
+            return Err(HyperliquidError::Payload);
+        }
+        if row.fill.coin != meta.scope.native_coin {
+            continue;
+        }
+        let fill = normalize_fill(row.fill, &meta.scope)?;
+        if fill_ids.insert(fill.fill.fill_id.clone(), ()).is_some() {
+            return Err(HyperliquidError::Payload);
+        }
+        fills.push(HyperliquidTwapSliceFill {
+            twap_id: row.twap_id,
+            fill,
+        });
+    }
+    Ok(fills)
+}
+
 fn normalize_position(
     row: crate::models::AssetPositionRow,
     meta: &HyperliquidPerpMeta,
@@ -830,6 +894,22 @@ fn normalize_position(
         .map(Price::new)
         .transpose()
         .map_err(|_| HyperliquidError::Payload)?;
+    let mark_price = row
+        .position
+        .position_value
+        .as_deref()
+        .map(decimal)
+        .transpose()?
+        .map(|value| {
+            value
+                .abs()
+                .checked_div(signed.abs())
+                .ok_or(HyperliquidError::Payload)
+        })
+        .transpose()?
+        .map(Price::new)
+        .transpose()
+        .map_err(|_| HyperliquidError::Payload)?;
     Ok(Some(Position {
         symbol: meta.scope.symbol().clone(),
         side: if signed.is_sign_negative() {
@@ -839,7 +919,7 @@ fn normalize_position(
         },
         quantity: signed.abs(),
         entry_price,
-        mark_price: None,
+        mark_price,
     }))
 }
 

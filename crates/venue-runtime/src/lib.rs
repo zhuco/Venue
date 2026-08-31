@@ -13,6 +13,22 @@ pub use authority::{
     AccountKey, AccountModelError, AccountOrderCapabilityEvidence, AppliedStrategyTurnReceipt,
     StrategyBinding, StrategyInstanceKey, StrategyKind, StrategyTurnToken,
 };
+/// Node and adapter composition obtain gateway DTOs through Runtime.  In particular this list
+/// deliberately excludes `AccountMutationHost` and `HostPreparedCommand`: only the resident
+/// Runtime Host can prepare or dispatch a physical mutation.
+pub use venue_execution::{
+    AccountCanonicalRootError, AccountCanonicalRootGuard, AccountCommandStatus,
+    AccountDispatchOutcome, AccountDispatchPermit, AccountGatewayResult, AccountHostError,
+    AccountHostValidationError, AccountInstrumentIdentity, AccountLimitNormalizationIntent,
+    AccountOwnerRouteScope, AccountPhysicalGateway, AccountQuoteToUsdtRate, AccountRecoveryOutcome,
+    AccountRecoveryReport, AccountRecoveryRequest, AccountRiskAmount, AccountRiskEvidence,
+    AccountRiskSummary, AccountSymbolSet, CommandJournal, CommandJournalError, CommandState,
+    DispatchGuard, DurableOwnerRoutes, LegacyV1WriterPredecessor, OwnerRouteFence,
+    OwnerRoutesError, RuntimeBootstrapReceipt, SignedAccountBalance, SignedAccountOrderFact,
+    SignedAccountPositionFact, SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact,
+    SignedUnknownResult, WriterLeaseAuthority, WriterLeaseError, WriterScope, WriterSession,
+    acquire_account_canonical_root,
+};
 pub use venue_gateway_api::VenueId as ExchangeId;
 
 pub(crate) mod domain {
@@ -32,9 +48,10 @@ pub(crate) mod execution {
         AccountDispatchDecision, AccountDispatchPermit, AccountExecutionIntent,
         AccountExecutionRequest, AccountLaneError, AccountLaneFollowUp, AccountLanePriority,
         AccountMutationOutcome, AccountReplanReason, AccountWalPreparedFence,
-        AccountWriterCapability, CommandIdentityReceipt, ExposureEffect,
-        PersistedMutationOutcomeReceipt, PersistedWalPreparedReceipt, PersistedWriterLeaseReceipt,
-        PreWalCandidate, UnknownReadbackProof, UnknownResolution, WalNotPreparedReceipt,
+        AccountWriterCapability, CommandIdentityReceipt, DurableCommandIdentityAllocation,
+        ExposureEffect, PersistedMutationOutcomeReceipt, PersistedWalPreparedReceipt,
+        PersistedWriterLeaseReceipt, PreWalCandidate, UnknownReadbackProof, UnknownResolution,
+        WalNotPreparedReceipt,
     };
 }
 

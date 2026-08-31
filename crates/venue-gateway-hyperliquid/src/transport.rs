@@ -6,6 +6,8 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::CONTENT_TYPE;
+use rust_decimal::Decimal;
+use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
@@ -16,8 +18,11 @@ use crate::action::HyperliquidExchangeRequest;
 use crate::{
     HyperliquidConfig, HyperliquidError, HyperliquidInfoRequest, HyperliquidPrivateStreamBinding,
     HyperliquidPrivateStreamDecoder, HyperliquidPrivateSubscriptionKind, HyperliquidReadBinding,
-    build_private_subscription,
+    build_private_subscription, build_twap_states_subscription, parse_all_mids_snapshot,
+    parse_twap_states_snapshot,
 };
+use venue_domain::domain::Asset;
+use venue_execution::AccountQuoteToUsdtRate;
 
 const MAX_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -25,6 +30,11 @@ const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PRELIVE_FRAMES: usize = 64;
 const PRIVATE_HEARTBEAT_IDLE: Duration = Duration::from_secs(30);
 const PRIVATE_PING: &str = r#"{"method":"ping"}"#;
+// This narrow public valuation source is not a second trading adapter. It keeps the
+// Hyperliquid process independent from the six venue gateways while providing the fresh,
+// non-parity USDC/USDT rate required by the account-wide 10U risk fence.
+const STABLECOIN_BENCHMARK_ORIGIN: &str = "https://api.kraken.com";
+const STABLECOIN_BENCHMARK_TICKER_PATH: &str = "/0/public/Ticker?pair=";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HyperliquidHttpResponse {
@@ -112,6 +122,46 @@ impl HyperliquidHttpTransport {
         .await
     }
 
+    /// The Hyperliquid perp quote is USDC. This narrow, unauthenticated benchmark read uses
+    /// conservative public bid/ask quotes without treating either stablecoin as parity or
+    /// loading another venue adapter into this process.
+    pub(crate) async fn fetch_usdc_to_usdt_rate(
+        &self,
+        private_generation: u64,
+        max_age_ms: u64,
+    ) -> Result<AccountQuoteToUsdtRate, HyperliquidTransportError> {
+        if private_generation == 0 || max_age_ms == 0 {
+            return Err(HyperliquidTransportError::Protocol);
+        }
+        let usdc = self.fetch_stablecoin_usd_ticker("USDC", max_age_ms).await?;
+        let usdt = self.fetch_stablecoin_usd_ticker("USDT", max_age_ms).await?;
+        let rate = usdc
+            .bid_usd_per_asset
+            .checked_div(usdt.ask_usd_per_asset)
+            .filter(|rate| *rate > Decimal::ZERO)
+            .ok_or(HyperliquidTransportError::Protocol)?;
+        Ok(AccountQuoteToUsdtRate {
+            asset: Asset::new("USDC").map_err(|_| HyperliquidTransportError::Protocol)?,
+            usdt_per_asset: rate,
+            observed_at_ms: usdc.observed_at_ms.min(usdt.observed_at_ms),
+            private_generation,
+        })
+    }
+
+    async fn fetch_stablecoin_usd_ticker(
+        &self,
+        asset: &str,
+        max_age_ms: u64,
+    ) -> Result<StablecoinUsdTicker, HyperliquidTransportError> {
+        if asset.is_empty() || !asset.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return Err(HyperliquidTransportError::Protocol);
+        }
+        let url =
+            format!("{STABLECOIN_BENCHMARK_ORIGIN}{STABLECOIN_BENCHMARK_TICKER_PATH}{asset}USD");
+        let response = self.send_public_get(url).await?;
+        parse_stablecoin_usd_ticker(&response, asset, max_age_ms)
+    }
+
     /// Dispatches exactly one already-signed request. The client policy is explicitly `never`, so
     /// timeout, disconnect, and 5xx results return to the WAL owner as UNKNOWN/rejected evidence
     /// instead of replaying a nonce behind its back.
@@ -191,6 +241,127 @@ impl HyperliquidHttpTransport {
             received_at_ms: now_ms()?,
         })
     }
+
+    async fn send_public_get(
+        &self,
+        url: String,
+    ) -> Result<PublicHttpResponse, HyperliquidTransportError> {
+        let mut response = tokio::time::timeout(
+            self.timeout,
+            self.client
+                .get(url)
+                .header("cache-control", "no-cache")
+                .send(),
+        )
+        .await
+        .map_err(|_| HyperliquidTransportError::Timeout)?
+        .map_err(map_http_error)?;
+        if !response.status().is_success() {
+            return Err(HyperliquidTransportError::HttpStatus(
+                response.status().as_u16(),
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > self.max_body_bytes as u64)
+        {
+            return Err(HyperliquidTransportError::BodyTooLarge);
+        }
+        let mut body = BytesMut::new();
+        while let Some(chunk) = tokio::time::timeout(self.timeout, response.chunk())
+            .await
+            .map_err(|_| HyperliquidTransportError::Timeout)?
+            .map_err(map_http_error)?
+        {
+            if body.len().saturating_add(chunk.len()) > self.max_body_bytes {
+                return Err(HyperliquidTransportError::BodyTooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(PublicHttpResponse {
+            body: body.freeze(),
+            received_at_ms: now_ms()?,
+        })
+    }
+}
+
+struct PublicHttpResponse {
+    body: Bytes,
+    received_at_ms: u64,
+}
+
+struct StablecoinUsdTicker {
+    bid_usd_per_asset: Decimal,
+    ask_usd_per_asset: Decimal,
+    observed_at_ms: u64,
+}
+
+fn parse_stablecoin_usd_ticker(
+    response: &PublicHttpResponse,
+    asset: &str,
+    max_age_ms: u64,
+) -> Result<StablecoinUsdTicker, HyperliquidTransportError> {
+    let value: Value =
+        serde_json::from_slice(&response.body).map_err(|_| HyperliquidTransportError::Protocol)?;
+    let root = value
+        .as_object()
+        .ok_or(HyperliquidTransportError::Protocol)?;
+    let errors = root
+        .get("error")
+        .and_then(Value::as_array)
+        .ok_or(HyperliquidTransportError::Protocol)?;
+    if !errors.is_empty() {
+        return Err(HyperliquidTransportError::Protocol);
+    }
+    let pair = stablecoin_ticker_key(asset)?;
+    let item = root
+        .get("result")
+        .and_then(Value::as_object)
+        .and_then(|result| result.get(pair))
+        .and_then(Value::as_object)
+        .ok_or(HyperliquidTransportError::Protocol)?;
+    if response.received_at_ms == 0 || max_age_ms == 0 {
+        return Err(HyperliquidTransportError::Protocol);
+    }
+    let bid_usd_per_asset = ticker_price(item, "b")?;
+    let ask_usd_per_asset = ticker_price(item, "a")?;
+    if bid_usd_per_asset > ask_usd_per_asset {
+        return Err(HyperliquidTransportError::Protocol);
+    }
+    Ok(StablecoinUsdTicker {
+        bid_usd_per_asset,
+        ask_usd_per_asset,
+        observed_at_ms: response.received_at_ms,
+    })
+}
+
+fn stablecoin_ticker_key(asset: &str) -> Result<&'static str, HyperliquidTransportError> {
+    match asset {
+        "USDC" => Ok("USDCUSD"),
+        // Kraken's canonical result key for the requested `USDTUSD` pair includes the legacy
+        // ZUSD quote marker. Keep it exact so a changed product alias fails closed.
+        "USDT" => Ok("USDTZUSD"),
+        _ => Err(HyperliquidTransportError::Protocol),
+    }
+}
+
+fn ticker_price(
+    item: &serde_json::Map<String, Value>,
+    side: &str,
+) -> Result<Decimal, HyperliquidTransportError> {
+    let raw = item
+        .get(side)
+        .and_then(Value::as_array)
+        .and_then(|prices| prices.first())
+        .and_then(Value::as_str)
+        .ok_or(HyperliquidTransportError::Protocol)?;
+    let price = raw
+        .parse::<Decimal>()
+        .map_err(|_| HyperliquidTransportError::Protocol)?;
+    if price <= Decimal::ZERO {
+        return Err(HyperliquidTransportError::Protocol);
+    }
+    Ok(price)
 }
 
 fn map_http_error(error: reqwest::Error) -> HyperliquidTransportError {
@@ -238,6 +409,164 @@ impl std::fmt::Debug for HyperliquidPrivateWsTransport {
 }
 
 impl HyperliquidPrivateWsTransport {
+    pub async fn collect_all_mids(
+        binding: HyperliquidPrivateStreamBinding,
+        timeout: Duration,
+        max_frame_bytes: usize,
+    ) -> Result<std::collections::BTreeMap<String, rust_decimal::Decimal>, HyperliquidTransportError>
+    {
+        validate_limits(timeout, max_frame_bytes)?;
+        let config = HyperliquidConfig::for_binding(binding.scope().binding().gateway());
+        let websocket = WebSocketConfig::default()
+            .max_message_size(Some(max_frame_bytes))
+            .max_frame_size(Some(max_frame_bytes));
+        let (mut socket, _) = tokio::time::timeout(
+            timeout,
+            connect_async_with_config(config.websocket(), Some(websocket), true),
+        )
+        .await
+        .map_err(|_| HyperliquidTransportError::Timeout)?
+        .map_err(|_| HyperliquidTransportError::WebSocket)?;
+        let request = serde_json::json!({"method":"subscribe","subscription":{"type":"allMids"}});
+        let expected = request
+            .get("subscription")
+            .cloned()
+            .ok_or(HyperliquidTransportError::Protocol)?;
+        let body =
+            serde_json::to_string(&request).map_err(|_| HyperliquidTransportError::Protocol)?;
+        socket
+            .send(Message::Text(body.into()))
+            .await
+            .map_err(|_| HyperliquidTransportError::WebSocket)?;
+        tokio::time::timeout(timeout, async {
+            let mut ack = false;
+            loop {
+                match socket
+                    .next()
+                    .await
+                    .ok_or(HyperliquidTransportError::Closed)?
+                    .map_err(|_| HyperliquidTransportError::WebSocket)?
+                {
+                    Message::Text(value) => {
+                        let bytes = value.as_bytes();
+                        if bytes.is_empty() || bytes.len() > max_frame_bytes {
+                            return Err(HyperliquidTransportError::BodyTooLarge);
+                        }
+                        if ack_matches(bytes, &expected)? {
+                            ack = true;
+                            continue;
+                        }
+                        if !ack {
+                            return Err(HyperliquidTransportError::Ack);
+                        }
+                        return parse_all_mids_snapshot(bytes)
+                            .map_err(|_| HyperliquidTransportError::Protocol);
+                    }
+                    Message::Binary(value) => {
+                        if value.is_empty() || value.len() > max_frame_bytes {
+                            return Err(HyperliquidTransportError::BodyTooLarge);
+                        }
+                        if ack_matches(&value, &expected)? {
+                            ack = true;
+                            continue;
+                        }
+                        if !ack {
+                            return Err(HyperliquidTransportError::Ack);
+                        }
+                        return parse_all_mids_snapshot(&value)
+                            .map_err(|_| HyperliquidTransportError::Protocol);
+                    }
+                    Message::Ping(value) => socket
+                        .send(Message::Pong(value))
+                        .await
+                        .map_err(|_| HyperliquidTransportError::WebSocket)?,
+                    Message::Pong(_) => {}
+                    Message::Close(_) => return Err(HyperliquidTransportError::Closed),
+                    Message::Frame(_) => return Err(HyperliquidTransportError::Protocol),
+                }
+            }
+        })
+        .await
+        .map_err(|_| HyperliquidTransportError::Timeout)?
+    }
+
+    /// Opens a short-lived, bounded websocket only to obtain the first scoped `twapStates`
+    /// snapshot. A caller cannot treat an acknowledgement, delta, unknown channel, or timeout as
+    /// an empty parent set.
+    pub async fn collect_twap_states(
+        binding: HyperliquidPrivateStreamBinding,
+        timeout: Duration,
+        max_frame_bytes: usize,
+    ) -> Result<crate::HyperliquidTwapStatesSnapshot, HyperliquidTransportError> {
+        validate_limits(timeout, max_frame_bytes)?;
+        let config = HyperliquidConfig::for_binding(binding.scope().binding().gateway());
+        let websocket = WebSocketConfig::default()
+            .max_message_size(Some(max_frame_bytes))
+            .max_frame_size(Some(max_frame_bytes));
+        let connection = connect_async_with_config(config.websocket(), Some(websocket), true);
+        let (mut socket, _) = tokio::time::timeout(timeout, connection)
+            .await
+            .map_err(|_| HyperliquidTransportError::Timeout)?
+            .map_err(|_| HyperliquidTransportError::WebSocket)?;
+        let request = build_twap_states_subscription(&binding)
+            .map_err(|_| HyperliquidTransportError::Binding)?;
+        let expected = serde_json::from_slice::<serde_json::Value>(&request)
+            .map_err(|_| HyperliquidTransportError::Protocol)?
+            .get("subscription")
+            .cloned()
+            .ok_or(HyperliquidTransportError::Protocol)?;
+        let request =
+            std::str::from_utf8(&request).map_err(|_| HyperliquidTransportError::Protocol)?;
+        tokio::time::timeout(
+            timeout,
+            socket.send(Message::Text(request.to_owned().into())),
+        )
+        .await
+        .map_err(|_| HyperliquidTransportError::Timeout)?
+        .map_err(|_| HyperliquidTransportError::WebSocket)?;
+        tokio::time::timeout(timeout, async {
+            let mut acknowledged = false;
+            loop {
+                let message = socket
+                    .next()
+                    .await
+                    .ok_or(HyperliquidTransportError::Closed)?
+                    .map_err(|_| HyperliquidTransportError::WebSocket)?;
+                match message {
+                    Message::Text(value) => match twap_snapshot_message(
+                        value.as_bytes(),
+                        &expected,
+                        &binding,
+                        acknowledged,
+                        max_frame_bytes,
+                    )? {
+                        Some(snapshot) => return Ok(snapshot),
+                        None => acknowledged = true,
+                    },
+                    Message::Binary(value) => match twap_snapshot_message(
+                        &value,
+                        &expected,
+                        &binding,
+                        acknowledged,
+                        max_frame_bytes,
+                    )? {
+                        Some(snapshot) => return Ok(snapshot),
+                        None => acknowledged = true,
+                    },
+                    Message::Ping(value) => socket
+                        .send(Message::Pong(value))
+                        .await
+                        .map_err(|_| HyperliquidTransportError::WebSocket)?,
+                    Message::Pong(_) => {}
+                    Message::Close(_) => return Err(HyperliquidTransportError::Closed),
+                    Message::Frame(_) => return Err(HyperliquidTransportError::Protocol),
+                }
+            }
+        })
+        .await
+        .map_err(|_| HyperliquidTransportError::Timeout)?
+    }
+
     pub async fn connect(
         binding: HyperliquidPrivateStreamBinding,
         timeout: Duration,
@@ -584,6 +913,30 @@ impl HyperliquidPrivateWsTransport {
     }
 }
 
+fn twap_snapshot_message(
+    payload: &[u8],
+    expected: &serde_json::Value,
+    binding: &HyperliquidPrivateStreamBinding,
+    acknowledged: bool,
+    max_frame_bytes: usize,
+) -> Result<Option<crate::HyperliquidTwapStatesSnapshot>, HyperliquidTransportError> {
+    if payload.is_empty() || payload.len() > max_frame_bytes {
+        return Err(HyperliquidTransportError::BodyTooLarge);
+    }
+    if ack_matches(payload, expected)? {
+        return Ok(None);
+    }
+    if !acknowledged {
+        return Err(HyperliquidTransportError::Ack);
+    }
+    parse_twap_states_snapshot(payload, binding)
+        .map(Some)
+        .map_err(|error| match error {
+            HyperliquidError::Binding => HyperliquidTransportError::Binding,
+            _ => HyperliquidTransportError::Protocol,
+        })
+}
+
 fn ack_matches(
     payload: &[u8],
     expected_subscription: &serde_json::Value,
@@ -720,6 +1073,37 @@ mod tests {
         generation: u64,
     ) -> Result<HyperliquidPrivateStreamBinding, Box<dyn std::error::Error>> {
         private_binding_for(mode, generation, USER, "BTC/USDC", "BTC")
+    }
+
+    #[test]
+    fn public_stablecoin_ticker_requires_fresh_exact_non_parity_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = PublicHttpResponse {
+            body: Bytes::from_static(include_bytes!("../fixtures/usdc-usd-index.json")),
+            received_at_ms: 1_050,
+        };
+        let parsed = parse_stablecoin_usd_ticker(&response, "USDC", 100)?;
+        assert_eq!(parsed.observed_at_ms, 1_050);
+        assert_eq!(parsed.bid_usd_per_asset, Decimal::new(1002, 3));
+        let usdt = PublicHttpResponse {
+            body: Bytes::from_static(include_bytes!("../fixtures/usdt-usd-index.json")),
+            received_at_ms: 1_050,
+        };
+        let usdt = parse_stablecoin_usd_ticker(&usdt, "USDT", 100)?;
+        assert_ne!(
+            parsed
+                .bid_usd_per_asset
+                .checked_div(usdt.ask_usd_per_asset)
+                .ok_or("rate")?,
+            Decimal::ONE
+        );
+        assert!(parse_stablecoin_usd_ticker(&response, "USDT", 100).is_err());
+        let stale = PublicHttpResponse {
+            received_at_ms: 0,
+            ..response
+        };
+        assert!(parse_stablecoin_usd_ticker(&stale, "USDC", 100).is_err());
+        Ok(())
     }
 
     fn private_binding_for(

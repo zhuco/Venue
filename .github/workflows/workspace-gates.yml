@@ -27,9 +27,9 @@ jobs:
       - name: Verify repository hygiene
         shell: pwsh
         run: ./scripts/verify_repository_hygiene.ps1
-      - name: Verify fixed deployment binaries
+      - name: Verify fixed Node release contract
         shell: pwsh
-        run: ./scripts/verify_fixed_deployment_binaries.ps1
+        run: ./scripts/verify_venue_node_linux_release.ps1
       - name: Verify isolated venue node binaries
         shell: pwsh
         run: ./scripts/verify_venue_node_binaries.ps1
@@ -42,6 +42,32 @@ jobs:
       - name: Verify Rust workspace quality
         shell: pwsh
         run: ./scripts/verify_workspace_quality.ps1
+
+  web:
+    name: Responsive Web gate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/venue-web
+    env:
+      VENUE_WEB_QA_DIR: ${{ runner.temp }}/venue-web-qa/results
+      VENUE_WEB_SCREENSHOT_DIR: ${{ runner.temp }}/venue-web-qa/screenshots
+      NO_PROXY: 127.0.0.1,localhost
+      no_proxy: 127.0.0.1,localhost
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/venue-web/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm run verify:boundary
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e -- --workers=1
 
   postgres-integration:
     name: PostgreSQL integration gate

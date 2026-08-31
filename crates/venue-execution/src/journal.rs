@@ -11,8 +11,11 @@ use crate::domain::{
     StopMarketFullPositionCommand,
 };
 use crate::execution_command_sha256;
+use crate::{NativeOrderRoute, NativeOrderRouteKey};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use venue_storage::{DurableWalHead, DurableWalHeadFormat};
 
 /// The WAL keeps the native family beside its client identity so UNKNOWN resolution cannot query
 /// an ordinary UM order endpoint for a PAPI conditional strategy (or the reverse).
@@ -54,6 +57,10 @@ impl CommandState {
 pub struct CommandJournal {
     path: PathBuf,
     receipts: BTreeMap<CommandId, CommandReceipt>,
+    prepared_commands: BTreeMap<CommandId, ExecutionCommand>,
+    first_command_sequences: BTreeMap<CommandId, u64>,
+    current_wal_root: [u8; 32],
+    current_record_count: u64,
     client_ids: BTreeMap<CommandId, CommandId>,
     unresolved_ids: BTreeSet<CommandId>,
     unresolved_entry_or_reduce: usize,
@@ -70,12 +77,76 @@ impl CommandJournal {
         Self::open_segmented(path, &[])
     }
 
+    /// A read-only commitment to the sole command WAL.  Actor-applied checkpoints bind to this
+    /// exact head so a restarted resident cannot reuse a turn against an older command history.
+    pub fn durable_wal_head(&self) -> Result<DurableWalHead, CommandJournalError> {
+        // A command's later state transition does not allocate a new command identity.  The
+        // actor head therefore commits the ordered prepared-command set; Unknown/Accepted state
+        // remains in this same WAL and is separately reconciled by the Host.
+        let tail_sequence = self
+            .next_sequence
+            .checked_sub(1)
+            .ok_or(CommandJournalError::Sequence)?;
+        DurableWalHead::new_v2(
+            self.current_wal_root,
+            tail_sequence,
+            self.current_record_count,
+        )
+        .map_err(|_| CommandJournalError::Sequence)
+    }
+
+    /// Checks a previously committed Actor head against this WAL's replayed record prefix.
+    /// This is startup-only: it rebuilds the requested prefix from first-command sequence facts,
+    /// so dispatch never scans a historical WAL or precomputes every transition head.
+    #[must_use]
+    pub fn validates_historical_wal_head(&self, head: DurableWalHead) -> bool {
+        let tail_sequence = match self.next_sequence.checked_sub(1) {
+            Some(sequence) => sequence,
+            None => return false,
+        };
+        let valid_shape = match head.format_version() {
+            DurableWalHeadFormat::V1 => DurableWalHead::new(
+                head.root_sha256(),
+                head.tail_sequence(),
+                head.record_count(),
+            ),
+            DurableWalHeadFormat::V2 => DurableWalHead::new_v2(
+                head.root_sha256(),
+                head.tail_sequence(),
+                head.record_count(),
+            ),
+        };
+        if valid_shape.is_err() || head.tail_sequence() > tail_sequence {
+            return false;
+        }
+        match head.format_version() {
+            DurableWalHeadFormat::V1 => {
+                let commands = self
+                    .prepared_commands
+                    .iter()
+                    .filter(|(command_id, _)| {
+                        self.first_command_sequences
+                            .get(*command_id)
+                            .is_some_and(|sequence| *sequence <= head.tail_sequence())
+                    })
+                    .map(|(_, command)| command);
+                durable_head_v1_from_ordered(commands, head.tail_sequence())
+                    .is_ok_and(|expected| expected == head)
+            }
+            DurableWalHeadFormat::V2 => self
+                .v2_head_for_prefix(head.tail_sequence())
+                .is_ok_and(|expected| expected == head),
+        }
+    }
+
     pub(crate) fn open_segmented(
         path: impl Into<PathBuf>,
         historical_paths: &[PathBuf],
     ) -> Result<Self, CommandJournalError> {
         let path = path.into();
         let mut receipts: BTreeMap<CommandId, CommandReceipt> = BTreeMap::new();
+        let mut prepared_commands: BTreeMap<CommandId, ExecutionCommand> = BTreeMap::new();
+        let mut first_command_sequences: BTreeMap<CommandId, u64> = BTreeMap::new();
         let mut client_ids: BTreeMap<CommandId, CommandId> = BTreeMap::new();
         let mut next_sequence = 1;
         let mut active_replay = None;
@@ -92,7 +163,7 @@ impl CommandJournal {
                 }
                 receipt
                     .command
-                    .validate()
+                    .validate_persisted_shape()
                     .map_err(CommandJournalError::Command)?;
                 if receipt.command_sha256 != command_hash(&receipt.command)? {
                     return Err(CommandJournalError::Hash);
@@ -115,6 +186,12 @@ impl CommandJournal {
                         return Err(CommandJournalError::Duplicate);
                     }
                 }
+                prepared_commands
+                    .entry(command_id.clone())
+                    .or_insert_with(|| receipt.command.clone());
+                first_command_sequences
+                    .entry(command_id.clone())
+                    .or_insert(receipt.sequence);
                 receipts.insert(command_id, receipt);
                 next_sequence = next_sequence
                     .checked_add(1)
@@ -123,9 +200,20 @@ impl CommandJournal {
         }
         let (active_durable_len, active_existed) =
             active_replay.ok_or(CommandJournalError::Sequence)?;
+        let current_wal_head = durable_head_v2_from_prepared(
+            &prepared_commands,
+            &first_command_sequences,
+            next_sequence
+                .checked_sub(1)
+                .ok_or(CommandJournalError::Sequence)?,
+        )?;
         let mut journal = Self {
             path,
             receipts,
+            prepared_commands,
+            first_command_sequences,
+            current_wal_root: current_wal_head.root_sha256(),
+            current_record_count: current_wal_head.record_count(),
             client_ids,
             unresolved_ids: BTreeSet::new(),
             unresolved_entry_or_reduce: 0,
@@ -172,7 +260,9 @@ impl CommandJournal {
         &mut self,
         command: ExecutionCommand,
     ) -> Result<&CommandReceipt, CommandJournalError> {
-        command.validate().map_err(CommandJournalError::Command)?;
+        command
+            .validate_persisted_shape()
+            .map_err(CommandJournalError::Command)?;
         let command_hash = command_hash(&command)?;
         let command_id = command.command_id().clone();
         if self.receipts.contains_key(&command_id) {
@@ -212,6 +302,10 @@ impl CommandJournal {
             self.client_ids
                 .insert(client_order_id.clone(), command_id.clone());
         }
+        self.prepared_commands.insert(command_id.clone(), command);
+        self.first_command_sequences
+            .insert(command_id.clone(), receipt.sequence);
+        self.append_current_v2_commitment(&receipt.command, receipt.sequence)?;
         self.add_query_indexes(&command_id, &receipt);
         self.receipts.insert(command_id.clone(), receipt);
         self.receipts
@@ -276,7 +370,9 @@ impl CommandJournal {
         let mut receipts = Vec::with_capacity(commands.len().saturating_mul(2));
         let mut sequence = self.next_sequence;
         for command in commands {
-            command.validate().map_err(CommandJournalError::Command)?;
+            command
+                .validate_persisted_shape()
+                .map_err(CommandJournalError::Command)?;
             let command_id = command.command_id().clone();
             if self.receipts.contains_key(&command_id)
                 || !staged_command_ids.insert(command_id.clone())
@@ -314,6 +410,17 @@ impl CommandJournal {
         }
         self.append_batch(&receipts)?;
         self.next_sequence = sequence;
+        for receipt in receipts
+            .iter()
+            .filter(|receipt| matches!(receipt.state, CommandState::Prepared))
+        {
+            let command_id = receipt.command.command_id().clone();
+            self.prepared_commands
+                .insert(command_id.clone(), receipt.command.clone());
+            self.first_command_sequences
+                .insert(command_id, receipt.sequence);
+            self.append_current_v2_commitment(&receipt.command, receipt.sequence)?;
+        }
         for receipt in receipts
             .into_iter()
             .filter(|receipt| matches!(receipt.state, CommandState::Submitted))
@@ -362,6 +469,36 @@ impl CommandJournal {
 
     pub fn receipt(&self, command_id: &CommandId) -> Option<&CommandReceipt> {
         self.receipts.get(command_id)
+    }
+
+    fn append_current_v2_commitment(
+        &mut self,
+        command: &ExecutionCommand,
+        prepared_sequence: u64,
+    ) -> Result<(), CommandJournalError> {
+        let next_count = self
+            .current_record_count
+            .checked_add(1)
+            .ok_or(CommandJournalError::Sequence)?;
+        self.current_wal_root = v2_next_root(
+            self.current_wal_root,
+            prepared_sequence,
+            next_count,
+            command,
+        )?;
+        self.current_record_count = next_count;
+        Ok(())
+    }
+
+    fn v2_head_for_prefix(
+        &self,
+        tail_sequence: u64,
+    ) -> Result<DurableWalHead, CommandJournalError> {
+        durable_head_v2_from_prepared(
+            &self.prepared_commands,
+            &self.first_command_sequences,
+            tail_sequence,
+        )
     }
 
     /// Exposes the latest durable form of each semantic command for read-only recovery checks.
@@ -435,6 +572,38 @@ impl CommandJournal {
         self.venue_order_client_ids
             .get(venue_order_id)
             .and_then(Option::as_ref)
+    }
+
+    /// Read-only order-identity projection rebuilt from this command WAL. It adds no owner
+    /// journal: every route is the exact latest receipt and native identity already persisted
+    /// here. Ambiguous venue ids remain absent rather than being guessed across families.
+    pub fn native_order_routes(&self) -> Vec<NativeOrderRoute> {
+        self.receipts
+            .values()
+            .filter_map(|receipt| {
+                let family = receipt.command.native_order_family()?;
+                let client_id = receipt.command.native_client_id()?.clone();
+                let owner = receipt.command.owner()?.clone();
+                let venue_order_id = match &receipt.state {
+                    CommandState::Accepted { venue_order_id }
+                        if self
+                            .client_id_by_venue_order_id(venue_order_id)
+                            .is_some_and(|mapped| mapped == &client_id) =>
+                    {
+                        Some(venue_order_id.clone())
+                    }
+                    CommandState::Accepted { .. } => return None,
+                    _ => None,
+                };
+                Some(NativeOrderRoute {
+                    command_id: receipt.command.command_id().clone(),
+                    owner,
+                    key: NativeOrderRouteKey { family, client_id },
+                    venue_order_id,
+                    state: receipt.state.clone(),
+                })
+            })
+            .collect()
     }
 
     pub fn order_identity_by_client_id(
@@ -862,7 +1031,7 @@ fn read_all(path: &Path) -> Result<JournalReplay, CommandJournalError> {
 }
 
 #[cfg(unix)]
-fn sync_parent(path: &Path) -> Result<(), CommandJournalError> {
+pub(crate) fn sync_parent(path: &Path) -> Result<(), CommandJournalError> {
     let parent = path.parent().ok_or(CommandJournalError::Sequence)?;
     std::fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
@@ -873,8 +1042,75 @@ fn sync_parent(path: &Path) -> Result<(), CommandJournalError> {
 }
 
 #[cfg(not(unix))]
-fn sync_parent(_path: &Path) -> Result<(), CommandJournalError> {
+pub(crate) fn sync_parent(_path: &Path) -> Result<(), CommandJournalError> {
     Ok(())
+}
+
+fn durable_head_v1_from_ordered<'a>(
+    commands: impl IntoIterator<Item = &'a ExecutionCommand>,
+    tail_sequence: u64,
+) -> Result<DurableWalHead, CommandJournalError> {
+    let ordered = commands.into_iter().collect::<Vec<_>>();
+    let encoded = serde_json::to_vec(&ordered).map_err(|_| CommandJournalError::Hash)?;
+    let mut digest = Sha256::new();
+    digest.update(b"venue.execution.command-wal-head.v1");
+    digest.update(encoded);
+    let record_count = ordered
+        .len()
+        .try_into()
+        .map_err(|_| CommandJournalError::Sequence)?;
+    DurableWalHead::new(digest.finalize().into(), tail_sequence, record_count)
+        .map_err(|_| CommandJournalError::Sequence)
+}
+
+fn durable_head_v2_from_prepared(
+    commands: &BTreeMap<CommandId, ExecutionCommand>,
+    first_command_sequences: &BTreeMap<CommandId, u64>,
+    tail_sequence: u64,
+) -> Result<DurableWalHead, CommandJournalError> {
+    let mut ordered = first_command_sequences
+        .iter()
+        .filter(|(_, sequence)| **sequence <= tail_sequence)
+        .map(|(command_id, sequence)| {
+            commands
+                .get(command_id)
+                .map(|command| (*sequence, command))
+                .ok_or(CommandJournalError::Missing)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ordered.sort_by_key(|(sequence, _)| *sequence);
+    let mut root = v2_empty_root();
+    let mut record_count = 0_u64;
+    for (sequence, command) in ordered {
+        record_count = record_count
+            .checked_add(1)
+            .ok_or(CommandJournalError::Sequence)?;
+        root = v2_next_root(root, sequence, record_count, command)?;
+    }
+    DurableWalHead::new_v2(root, tail_sequence, record_count)
+        .map_err(|_| CommandJournalError::Sequence)
+}
+
+fn v2_empty_root() -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"venue.execution.command-wal-head.v2.empty");
+    digest.finalize().into()
+}
+
+fn v2_next_root(
+    previous_root: [u8; 32],
+    prepared_sequence: u64,
+    record_count: u64,
+    command: &ExecutionCommand,
+) -> Result<[u8; 32], CommandJournalError> {
+    let command_digest = execution_command_sha256(command).map_err(CommandJournalError::Encode)?;
+    let mut digest = Sha256::new();
+    digest.update(b"venue.execution.command-wal-head.v2.append");
+    digest.update(previous_root);
+    digest.update(prepared_sequence.to_be_bytes());
+    digest.update(record_count.to_be_bytes());
+    digest.update(command_digest);
+    Ok(digest.finalize().into())
 }
 
 fn command_hash(command: &ExecutionCommand) -> Result<String, CommandJournalError> {
@@ -985,6 +1221,13 @@ mod tests {
         })
     }
 
+    fn indexed_command(index: usize) -> Result<OrderCommand, Box<dyn std::error::Error>> {
+        let mut planned = command()?;
+        planned.command_id = CommandId::new(format!("incremental_command_{index:05}"))?;
+        planned.client_order_id = CommandId::new(format!("incremental_client_{index:05}"))?;
+        Ok(planned)
+    }
+
     #[test]
     fn command_is_durable_before_submission_and_unknown_blocks_new_risk()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1014,6 +1257,87 @@ mod tests {
                 .map(|receipt| &receipt.state),
             Some(CommandState::Unknown { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn historical_wal_heads_require_an_exact_replayed_prefix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("commands.jsonl");
+        let planned = command()?;
+        let mut journal = CommandJournal::open(&path)?;
+        let empty = journal.durable_wal_head()?;
+        assert_eq!(empty.format_version(), DurableWalHeadFormat::V2);
+
+        journal.prepare_place(planned.clone())?;
+        let prepared = journal.durable_wal_head()?;
+        let legacy_prepared = durable_head_v1_from_ordered(
+            [&ExecutionCommand::PlaceLimit(planned.clone())],
+            prepared.tail_sequence(),
+        )?;
+        journal.transition(&planned.command_id, CommandState::Submitted)?;
+        let submitted = journal.durable_wal_head()?;
+        journal.transition(
+            &planned.command_id,
+            CommandState::Accepted {
+                venue_order_id: "venue-1".to_owned(),
+            },
+        )?;
+        let accepted = journal.durable_wal_head()?;
+
+        assert_eq!(prepared.root_sha256(), submitted.root_sha256());
+        assert_eq!(submitted.root_sha256(), accepted.root_sha256());
+        assert_ne!(prepared.tail_sequence(), submitted.tail_sequence());
+        assert_ne!(submitted.tail_sequence(), accepted.tail_sequence());
+        for head in [empty, prepared, submitted, accepted, legacy_prepared] {
+            assert!(journal.validates_historical_wal_head(head));
+        }
+        let forged_tail = DurableWalHead::new(
+            accepted.root_sha256(),
+            accepted
+                .tail_sequence()
+                .checked_add(1)
+                .ok_or("tail overflow")?,
+            accepted.record_count(),
+        )?;
+        assert!(!journal.validates_historical_wal_head(forged_tail));
+
+        drop(journal);
+        let recovered = CommandJournal::open(path)?;
+        for head in [empty, prepared, submitted, accepted, legacy_prepared] {
+            assert!(recovered.validates_historical_wal_head(head));
+        }
+        assert!(!recovered.validates_historical_wal_head(forged_tail));
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_v2_prepared_growth_reopens_with_exact_current_and_prefix_heads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const COMMANDS: usize = 2_048;
+        let directory = tempdir()?;
+        let path = directory.path().join("commands.jsonl");
+        let mut journal = CommandJournal::open(&path)?;
+        let mut prefix = None;
+        for index in (0..COMMANDS).rev() {
+            let planned = indexed_command(index)?;
+            journal.prepare_place(planned)?;
+            if index == COMMANDS / 2 {
+                prefix = Some(journal.durable_wal_head()?);
+            }
+        }
+        let current = journal.durable_wal_head()?;
+        let prefix = prefix.ok_or("prefix head missing")?;
+        assert_eq!(current.format_version(), DurableWalHeadFormat::V2);
+        assert_eq!(current.record_count(), COMMANDS as u64);
+        assert!(journal.validates_historical_wal_head(prefix));
+        assert!(journal.validates_historical_wal_head(current));
+
+        drop(journal);
+        let reopened = CommandJournal::open(path)?;
+        assert!(reopened.validates_historical_wal_head(prefix));
+        assert!(reopened.validates_historical_wal_head(current));
         Ok(())
     }
 
@@ -1156,6 +1480,52 @@ mod tests {
             journal.prepare_place(conflicting),
             Err(CommandJournalError::Conflict)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn net_reduction_replays_original_wal_without_current_inventory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("commands.jsonl");
+        let entry = command()?;
+        let reduce = MarketReduceCommand {
+            command_id: CommandId::new("net_reduce")?,
+            client_order_id: CommandId::new("net_reduce_client")?,
+            owner: OrderOwner {
+                purpose: OrderPurpose::ExposureTakeProfit,
+                ..entry.owner
+            },
+            position_side: PositionSide::Net,
+            side: OrderSide::Sell,
+            quantity: Decimal::ONE,
+            risk_episode_id: CommandId::new("net_reduce_episode")?,
+            position_generation: 9,
+        };
+        let original = ExecutionCommand::MarketReduce(reduce.clone());
+        let mut journal = CommandJournal::open(&path)?;
+        journal.prepare(original.clone())?;
+        journal.transition(&reduce.command_id, CommandState::Submitted)?;
+        journal.transition(
+            &reduce.command_id,
+            CommandState::Unknown {
+                reason: "connection_lost".to_owned(),
+            },
+        )?;
+        drop(journal);
+        let mut recovered = CommandJournal::open(&path)?;
+        let receipt = recovered
+            .receipt(&reduce.command_id)
+            .ok_or(CommandJournalError::Missing)?;
+        assert_eq!(receipt.command, original);
+        assert!(matches!(receipt.state, CommandState::Unknown { .. }));
+        assert_eq!(recovered.fence_interrupted_dispatches()?, (0, 0));
+        assert_eq!(
+            recovered
+                .receipt(&reduce.command_id)
+                .map(|receipt| &receipt.command),
+            Some(&original)
+        );
         Ok(())
     }
 

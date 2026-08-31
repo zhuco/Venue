@@ -1,7 +1,7 @@
 use venue_control_protocol::{
     AccountDeliveryAck, AccountDeliveryClaim, AccountDeliveryClaimRequest, AccountDeliveryReceipt,
     CONTROL_SCHEMA_VERSION, CommandReceipt, CommandState, ControlCommandRequest, ControlSnapshot,
-    ProtocolError,
+    ExecutionFactsSnapshot, NodeProjectionEnvelope, ProtocolError, UiAccountScope,
 };
 
 use crate::{
@@ -35,6 +35,16 @@ where
         &self,
     ) -> Result<Vec<venue_control_protocol::CopyRelationRecord>, ServiceError> {
         Ok(self.repository.list_copy_relations().await?)
+    }
+
+    pub async fn copy_relation_candidates(
+        &self,
+    ) -> Result<Vec<venue_control_protocol::CopyRelationCandidate>, ServiceError> {
+        let candidates = self.repository.list_copy_relation_candidates().await?;
+        for candidate in &candidates {
+            candidate.validate()?;
+        }
+        Ok(candidates)
     }
 }
 
@@ -129,6 +139,33 @@ where
         Ok(self.repository.store_snapshot(snapshot).await?)
     }
 
+    pub async fn execution_facts(&self) -> Result<ExecutionFactsSnapshot, ServiceError> {
+        let facts = self
+            .repository
+            .load_execution_facts()
+            .await?
+            .ok_or(ServiceError::SnapshotUnavailable)?;
+        facts.validate()?;
+        Ok(facts)
+    }
+
+    /// Signed exchange facts remain a node-owned observation; Control only stores this read model.
+    pub async fn publish_execution_facts(
+        &self,
+        facts: &ExecutionFactsSnapshot,
+    ) -> Result<SnapshotStoreResult, ServiceError> {
+        facts.validate()?;
+        Ok(self.repository.store_execution_facts(facts).await?)
+    }
+
+    pub async fn merge_node_projection(
+        &self,
+        projection: &NodeProjectionEnvelope,
+    ) -> Result<SnapshotStoreResult, ServiceError> {
+        projection.validate()?;
+        Ok(self.repository.merge_node_projection(projection).await?)
+    }
+
     pub async fn submit_command(
         &self,
         command: &ControlCommandRequest,
@@ -211,13 +248,18 @@ where
 
     pub async fn events(
         &self,
+        scope: &UiAccountScope,
         after_sequence: i64,
         limit: u32,
     ) -> Result<Vec<StoredEvent>, ServiceError> {
         if after_sequence < 0 || !(1..=MAX_EVENT_PAGE).contains(&limit) {
             return Err(ServiceError::InvalidLimit);
         }
-        let events = self.repository.list_events(after_sequence, limit).await?;
+        scope.validate()?;
+        let events = self
+            .repository
+            .list_events(scope, after_sequence, limit)
+            .await?;
         for stored in &events {
             if stored.sequence <= after_sequence {
                 return Err(ServiceError::Repository(RepositoryError::CorruptData));

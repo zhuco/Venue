@@ -665,6 +665,90 @@ pub fn parse_public_market_depth20_snapshot(
     ))
 }
 
+/// Parses one Binance USD-M diff-depth frame from the credential-free combined stream. It stays
+/// distinct from the depth20 partial snapshot: a caller must still bridge this delta to a REST
+/// snapshot before treating its book as synchronized.
+pub fn parse_public_market_depth_delta(
+    payload: &str,
+    binding: &PublicMarketBinding,
+    generation: u64,
+) -> Result<BinancePublicEnvelope<MarketDelta>, BinancePublicError> {
+    let (object, expected_native) =
+        public_market_stream_object(payload, binding, generation, "depthUpdate")?;
+    let exchange_event_time_ms = positive_u64(object.get("E"))?;
+    let transaction_time_ms = positive_u64(object.get("T"))?;
+    let first_sequence = positive_u64(object.get("U"))?;
+    let sequence = positive_u64(object.get("u"))?;
+    let previous_sequence = positive_u64(object.get("pu"))?;
+    if sequence < first_sequence || previous_sequence >= first_sequence {
+        return Err(BinancePublicError::Sequence);
+    }
+    let bids = levels(object.get("b"), true)?;
+    let asks = levels(object.get("a"), true)?;
+    if bids.is_empty() && asks.is_empty() {
+        return Err(BinancePublicError::Value);
+    }
+    let fact = MarketDelta {
+        symbol: binding.symbol.clone(),
+        generation,
+        first_sequence,
+        previous_sequence: Some(previous_sequence),
+        sequence,
+        exchange_time_ms: Some(exchange_event_time_ms),
+        bids,
+        asks,
+    };
+    Ok(envelope(
+        payload,
+        expected_native,
+        generation,
+        exchange_event_time_ms,
+        Some(transaction_time_ms),
+        fact,
+    ))
+}
+
+/// Parses Binance USD-M `GET /fapi/v1/depth` into the initial book snapshot for a live
+/// diff-depth bridge. REST has no exchange timestamp here, so the caller must require a queued
+/// websocket delta to bridge this snapshot before treating the book as synchronized.
+pub fn parse_public_market_rest_depth_snapshot(
+    payload: &str,
+    binding: &PublicMarketBinding,
+    generation: u64,
+) -> Result<MarketSnapshot, BinancePublicError> {
+    binding
+        .validate()
+        .map_err(|_| BinancePublicError::Binding)?;
+    if generation == 0 {
+        return Err(BinancePublicError::Generation);
+    }
+    let object = serde_json::from_str::<Value>(payload)
+        .map_err(|_| BinancePublicError::Payload)?
+        .as_object()
+        .cloned()
+        .ok_or(BinancePublicError::Payload)?;
+    let sequence = positive_u64(object.get("lastUpdateId"))?;
+    let bids = levels(object.get("bids"), false)?;
+    let asks = levels(object.get("asks"), false)?;
+    if bids.is_empty() || asks.is_empty() || bids.len() > 1_000 || asks.len() > 1_000 {
+        return Err(BinancePublicError::Value);
+    }
+    if bids.windows(2).any(|pair| pair[0].price <= pair[1].price)
+        || asks.windows(2).any(|pair| pair[0].price >= pair[1].price)
+        || bids[0].price >= asks[0].price
+    {
+        return Err(BinancePublicError::Value);
+    }
+    Ok(MarketSnapshot {
+        symbol: binding.symbol.clone(),
+        generation,
+        sequence,
+        exchange_time_ms: None,
+        bids,
+        asks,
+    })
+}
+
 /// Parses a direct Binance `kline` frame or a combined-stream wrapper. A forming kline remains
 /// adapter-local; only a frame carrying `x=true` becomes a normalized [`PublicBar`].
 pub fn parse_public_market_kline(

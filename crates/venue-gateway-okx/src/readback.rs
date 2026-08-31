@@ -113,6 +113,7 @@ impl OkxPrivateSurface {
 pub struct OkxPrivateReadScope {
     binding: GatewayBinding,
     native_instrument_id: String,
+    account_wide: bool,
     instrument_generation: u64,
     expected_position_mode: OkxPositionMode,
     trade_mode: OkxTradeMode,
@@ -134,6 +135,7 @@ impl OkxPrivateReadScope {
         Ok(Self {
             binding: config.gateway_binding().clone(),
             native_instrument_id: instrument.native_id().to_owned(),
+            account_wide: false,
             instrument_generation: instrument.instrument().generation,
             expected_position_mode,
             trade_mode,
@@ -141,10 +143,31 @@ impl OkxPrivateReadScope {
         })
     }
 
+    /// Binds a signed REST collection to the one account while deliberately omitting `instId`.
+    /// Consumers must normalize every returned contract against fresh public rules; this scope
+    /// grants no permission to treat a selected-symbol read as account-wide evidence.
+    pub fn account_wide(
+        config: &OkxConfig,
+        instrument: &OkxInstrument,
+        expected_position_mode: OkxPositionMode,
+        trade_mode: OkxTradeMode,
+        attempt_id: u64,
+    ) -> Result<Self, OkxError> {
+        let mut scope = Self::new(
+            config,
+            instrument,
+            expected_position_mode,
+            trade_mode,
+            attempt_id,
+        )?;
+        scope.account_wide = true;
+        Ok(scope)
+    }
+
     pub(crate) fn validate_instrument(&self, instrument: &OkxInstrument) -> Result<(), OkxError> {
         if self.binding.venue != VenueId::Okx
             || self.binding.symbol != instrument.instrument().symbol
-            || self.native_instrument_id != instrument.native_id()
+            || (!self.account_wide && self.native_instrument_id != instrument.native_id())
             || self.instrument_generation != instrument.instrument().generation
             || self.instrument_generation == 0
             || self.attempt_id == 0
@@ -162,6 +185,11 @@ impl OkxPrivateReadScope {
     #[must_use]
     pub fn native_instrument_id(&self) -> &str {
         &self.native_instrument_id
+    }
+
+    #[must_use]
+    pub const fn is_account_wide(&self) -> bool {
+        self.account_wide
     }
 
     #[must_use]
@@ -191,6 +219,7 @@ pub struct OkxPrivateReadRequest {
     surface: OkxPrivateSurface,
     page_index: u32,
     request_after: Option<String>,
+    request_before: Option<String>,
     request_path: String,
 }
 
@@ -200,14 +229,16 @@ impl OkxPrivateReadRequest {
         surface: OkxPrivateSurface,
         page_index: u32,
         request_after: Option<&str>,
+        request_before: Option<&str>,
     ) -> Result<Self, OkxError> {
-        validate_page_request(surface, page_index, request_after)?;
-        let request_path = request_path(scope, surface, request_after)?;
+        validate_page_request(surface, page_index, request_after, request_before)?;
+        let request_path = request_path(scope, surface, request_after, request_before)?;
         Ok(Self {
             scope: scope.clone(),
             surface,
             page_index,
             request_after: request_after.map(str::to_owned),
+            request_before: request_before.map(str::to_owned),
             request_path,
         })
     }
@@ -230,6 +261,11 @@ impl OkxPrivateReadRequest {
     #[must_use]
     pub fn request_after(&self) -> Option<&str> {
         self.request_after.as_deref()
+    }
+
+    #[must_use]
+    pub fn request_before(&self) -> Option<&str> {
+        self.request_before.as_deref()
     }
 
     #[must_use]
@@ -265,19 +301,19 @@ impl OkxPrivateReadRequest {
 pub fn build_account_config_request(
     scope: &OkxPrivateReadScope,
 ) -> Result<OkxPrivateReadRequest, OkxError> {
-    OkxPrivateReadRequest::new(scope, OkxPrivateSurface::AccountConfig, 0, None)
+    OkxPrivateReadRequest::new(scope, OkxPrivateSurface::AccountConfig, 0, None, None)
 }
 
 pub fn build_balance_request(
     scope: &OkxPrivateReadScope,
 ) -> Result<OkxPrivateReadRequest, OkxError> {
-    OkxPrivateReadRequest::new(scope, OkxPrivateSurface::Balance, 0, None)
+    OkxPrivateReadRequest::new(scope, OkxPrivateSurface::Balance, 0, None, None)
 }
 
 pub fn build_positions_request(
     scope: &OkxPrivateReadScope,
 ) -> Result<OkxPrivateReadRequest, OkxError> {
-    OkxPrivateReadRequest::new(scope, OkxPrivateSurface::Positions, 0, None)
+    OkxPrivateReadRequest::new(scope, OkxPrivateSurface::Positions, 0, None, None)
 }
 
 pub fn build_regular_orders_request(
@@ -285,7 +321,13 @@ pub fn build_regular_orders_request(
     page_index: u32,
     after: Option<&str>,
 ) -> Result<OkxPrivateReadRequest, OkxError> {
-    OkxPrivateReadRequest::new(scope, OkxPrivateSurface::RegularOrders, page_index, after)
+    OkxPrivateReadRequest::new(
+        scope,
+        OkxPrivateSurface::RegularOrders,
+        page_index,
+        after,
+        None,
+    )
 }
 
 pub fn build_algo_orders_request(
@@ -299,6 +341,7 @@ pub fn build_algo_orders_request(
         OkxPrivateSurface::AlgoOrders(kind),
         page_index,
         after,
+        None,
     )
 }
 
@@ -307,13 +350,21 @@ pub fn build_fills_request(
     page_index: u32,
     after: Option<&str>,
 ) -> Result<OkxPrivateReadRequest, OkxError> {
-    OkxPrivateReadRequest::new(scope, OkxPrivateSurface::Fills, page_index, after)
+    OkxPrivateReadRequest::new(scope, OkxPrivateSurface::Fills, page_index, after, None)
+}
+
+pub fn build_fills_resume_request(
+    scope: &OkxPrivateReadScope,
+    before: &str,
+) -> Result<OkxPrivateReadRequest, OkxError> {
+    OkxPrivateReadRequest::new(scope, OkxPrivateSurface::Fills, 0, None, Some(before))
 }
 
 fn request_path(
     scope: &OkxPrivateReadScope,
     surface: OkxPrivateSurface,
     after: Option<&str>,
+    before: Option<&str>,
 ) -> Result<String, OkxError> {
     let native = scope.native_instrument_id();
     let path = match surface {
@@ -323,37 +374,65 @@ fn request_path(
             endpoints::BALANCES,
             scope.gateway_binding().symbol.quote()
         ),
+        OkxPrivateSurface::Positions if scope.account_wide => {
+            format!("{}?instType=SWAP", endpoints::POSITIONS)
+        }
         OkxPrivateSurface::Positions => {
             format!("{}?instType=SWAP&instId={native}", endpoints::POSITIONS)
         }
         OkxPrivateSurface::RegularOrders => paged_path(
             endpoints::OPEN_ORDERS,
-            &format!("instType=SWAP&instId={native}"),
+            &if scope.account_wide {
+                "instType=SWAP".to_owned()
+            } else {
+                format!("instType=SWAP&instId={native}")
+            },
             after,
+            None,
         )?,
         OkxPrivateSurface::AlgoOrders(kind) => paged_path(
             endpoints::OPEN_ALGO_ORDERS,
-            &format!(
-                "ordType={}&instType=SWAP&instId={native}",
-                kind.query_value()
-            ),
+            &if scope.account_wide {
+                format!("ordType={}&instType=SWAP", kind.query_value())
+            } else {
+                format!(
+                    "ordType={}&instType=SWAP&instId={native}",
+                    kind.query_value()
+                )
+            },
             after,
+            None,
         )?,
         OkxPrivateSurface::Fills => paged_path(
             endpoints::FILLS_HISTORY,
-            &format!("instType=SWAP&instId={native}"),
+            &if scope.account_wide {
+                "instType=SWAP".to_owned()
+            } else {
+                format!("instType=SWAP&instId={native}")
+            },
             after,
+            before,
         )?,
     };
     Ok(path)
 }
 
-fn paged_path(path: &str, query: &str, after: Option<&str>) -> Result<String, OkxError> {
+fn paged_path(
+    path: &str,
+    query: &str,
+    after: Option<&str>,
+    before: Option<&str>,
+) -> Result<String, OkxError> {
     let mut value = format!("{path}?{query}");
     if let Some(after) = after {
         validate_numeric_id(after)?;
         value.push_str("&after=");
         value.push_str(after);
+    }
+    if let Some(before) = before {
+        validate_numeric_id(before)?;
+        value.push_str("&before=");
+        value.push_str(before);
     }
     value.push_str("&limit=100");
     Ok(value)
@@ -363,15 +442,19 @@ fn validate_page_request(
     surface: OkxPrivateSurface,
     page_index: u32,
     request_after: Option<&str>,
+    request_before: Option<&str>,
 ) -> Result<(), OkxError> {
     if surface.paginated() {
-        if (page_index == 0) != request_after.is_none() {
+        if request_after.is_some() && page_index == 0 || request_after.is_none() && page_index > 0 {
             return Err(OkxError::Pagination);
         }
         if let Some(after) = request_after {
             validate_numeric_id(after)?;
         }
-    } else if page_index != 0 || request_after.is_some() {
+        if let Some(before) = request_before {
+            validate_numeric_id(before)?;
+        }
+    } else if page_index != 0 || request_after.is_some() || request_before.is_some() {
         return Err(OkxError::Pagination);
     }
     Ok(())
@@ -385,6 +468,8 @@ pub struct OkxRawPrivatePage {
     pub surface: OkxPrivateSurface,
     pub page_index: u32,
     pub request_after: Option<String>,
+    #[serde(default)]
+    pub request_before: Option<String>,
     pub request_path: String,
     pub received_at_ms: u64,
     pub payload_sha256: String,
@@ -403,6 +488,7 @@ impl OkxRawPrivatePage {
             surface: request.surface,
             page_index: request.page_index,
             request_after: request.request_after.clone(),
+            request_before: request.request_before.clone(),
             request_path: request.request_path.clone(),
             received_at_ms,
             payload_sha256: payload_digest(&payload),
@@ -435,9 +521,19 @@ impl OkxRawPrivatePage {
         {
             return Err(OkxError::Binding);
         }
-        validate_page_request(self.surface, self.page_index, self.request_after.as_deref())?;
+        validate_page_request(
+            self.surface,
+            self.page_index,
+            self.request_after.as_deref(),
+            self.request_before.as_deref(),
+        )?;
         if self.request_path
-            != request_path(&self.scope, self.surface, self.request_after.as_deref())?
+            != request_path(
+                &self.scope,
+                self.surface,
+                self.request_after.as_deref(),
+                self.request_before.as_deref(),
+            )?
         {
             return Err(OkxError::Binding);
         }
@@ -448,7 +544,7 @@ impl OkxRawPrivatePage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OkxPrivatePageAdvance {
     Closed,
-    More(OkxPrivateReadRequest),
+    More(Box<OkxPrivateReadRequest>),
 }
 
 /// Derives the only admissible next signed request from a captured response. A full 100-row page
@@ -470,12 +566,15 @@ pub fn advance_private_page(page: &OkxRawPrivatePage) -> Result<OkxPrivatePageAd
         return Err(OkxError::Pagination);
     }
     let after = ids.last().ok_or(OkxError::Pagination)?;
-    Ok(OkxPrivatePageAdvance::More(OkxPrivateReadRequest::new(
-        &page.scope,
-        page.surface,
-        next_index,
-        Some(after),
-    )?))
+    Ok(OkxPrivatePageAdvance::More(Box::new(
+        OkxPrivateReadRequest::new(
+            &page.scope,
+            page.surface,
+            next_index,
+            Some(after),
+            page.request_before.as_deref(),
+        )?,
+    )))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1248,6 +1347,37 @@ mod tests {
     }
 
     #[test]
+    fn account_wide_scope_omits_inst_id_on_every_risk_bearing_surface()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (config, instrument, _) = setup()?;
+        let scope = OkxPrivateReadScope::account_wide(
+            &config,
+            &instrument,
+            OkxPositionMode::LongShort,
+            OkxTradeMode::Cross,
+            12,
+        )?;
+        assert!(scope.is_account_wide());
+        assert_eq!(
+            build_positions_request(&scope)?.request_path(),
+            "/api/v5/account/positions?instType=SWAP"
+        );
+        assert_eq!(
+            build_regular_orders_request(&scope, 0, None)?.request_path(),
+            "/api/v5/trade/orders-pending?instType=SWAP&limit=100"
+        );
+        assert_eq!(
+            build_algo_orders_request(&scope, OkxAlgoOrderKind::Trigger, 0, None)?.request_path(),
+            "/api/v5/trade/orders-algo-pending?ordType=trigger&instType=SWAP&limit=100"
+        );
+        assert_eq!(
+            build_fills_request(&scope, 0, None)?.request_path(),
+            "/api/v5/trade/fills-history?instType=SWAP&limit=100"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn empty_exact_snapshot_proves_all_families_and_both_zero_hedge_legs()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_, instrument, scope) = setup()?;
@@ -1370,7 +1500,7 @@ mod tests {
         fill.payload = full.into_bytes();
         fill.payload_sha256 = payload_digest(&fill.payload);
         let next = match advance_private_page(fill)? {
-            OkxPrivatePageAdvance::More(request) => request,
+            OkxPrivatePageAdvance::More(request) => *request,
             OkxPrivatePageAdvance::Closed => return Err("full page closed early".into()),
         };
         assert_eq!(next.page_index(), 1);
