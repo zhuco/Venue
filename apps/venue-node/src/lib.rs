@@ -989,6 +989,8 @@ mod tests {
             legacy_product_account: "stage7-binance-doge".to_owned(),
             legacy_symbol: "DOGE/USDT".parse()?,
             legacy_owner_scope: "hedged-grid".to_owned(),
+            legacy_strategy_instance_id: "hedged-grid".to_owned(),
+            legacy_run_id: "primary".to_owned(),
             legacy_artifacts_root: legacy,
             legacy_lock_sha256: "0".repeat(64),
             legacy_lock_path: temp.path().join("legacy.lock"),

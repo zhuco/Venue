@@ -8,7 +8,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use venue_domain::domain::{Symbol, is_canonical_trading_account_id};
+use venue_domain::domain::{OrderOwner, Symbol, is_canonical_trading_account_id};
 use venue_gateway_api::VenueId;
 
 use crate::WriterScope;
@@ -29,6 +29,10 @@ pub struct LegacyV1WriterPredecessor {
     pub legacy_product_account: String,
     pub legacy_symbol: Symbol,
     pub legacy_owner_scope: String,
+    /// The legacy WAL owner is not the new canonical account. These deployment-supplied values
+    /// are compared to every preserved WAL Owner before it may enter the cancellation-only route.
+    pub legacy_strategy_instance_id: String,
+    pub legacy_run_id: String,
     pub legacy_artifacts_root: PathBuf,
     pub legacy_lock_sha256: String,
     pub legacy_lock_path: PathBuf,
@@ -69,6 +73,15 @@ impl LegacyV1WriterPredecessor {
     pub fn acquire(&self) -> Result<LegacyV1WriterGuard, Stage7WriterRegistryError> {
         acquire_legacy_predecessor(self, &legacy_v1_registry_root()?)
     }
+
+    #[must_use]
+    pub fn matches_legacy_owner(&self, owner: &OrderOwner) -> bool {
+        owner.exchange == self.exchange.as_str()
+            && owner.account == self.legacy_product_account
+            && owner.symbol == self.legacy_symbol
+            && owner.strategy_instance_id == self.legacy_strategy_instance_id
+            && owner.run_id == self.legacy_run_id
+    }
 }
 
 fn validate_legacy_predecessor(
@@ -78,6 +91,8 @@ fn validate_legacy_predecessor(
     if !is_canonical_trading_account_id(&predecessor.successor_trading_account_id)
         || predecessor.legacy_product_account.trim().is_empty()
         || predecessor.legacy_owner_scope.trim().is_empty()
+        || !valid_owner_identity(&predecessor.legacy_strategy_instance_id)
+        || !valid_owner_identity(&predecessor.legacy_run_id)
         || !predecessor.legacy_artifacts_root.is_absolute()
         || !valid_sha256(&predecessor.legacy_lock_sha256)
         || !valid_sha256(&predecessor.handoff_sha256)
@@ -119,6 +134,10 @@ fn validate_legacy_predecessor(
         return Err(Stage7WriterRegistryError::LegacyPredecessor);
     }
     Ok(())
+}
+
+fn valid_owner_identity(value: &str) -> bool {
+    !value.trim().is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
 }
 
 fn legacy_v1_entry_digest(
@@ -502,6 +521,8 @@ mod tests {
             legacy_product_account: "usdt_futures".to_owned(),
             legacy_symbol: "DOGE/USDT".parse()?,
             legacy_owner_scope: "hedged_grid_doge_usdt_primary".to_owned(),
+            legacy_strategy_instance_id: "hedged_grid_doge_usdt".to_owned(),
+            legacy_run_id: "primary".to_owned(),
             legacy_artifacts_root: fs::canonicalize(artifacts_root)?,
             legacy_lock_sha256: lock_sha256,
             legacy_lock_path: lock_path,
@@ -565,6 +586,30 @@ mod tests {
         ));
         drop(first);
         assert!(acquire_legacy_predecessor(&predecessor, &registry).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_owner_match_never_substitutes_the_successor_account()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let registry = temporary.path().join("v1");
+        let predecessor = legacy_predecessor(&registry, &temporary.path().join("legacy"), true)?;
+        let owner = OrderOwner {
+            strategy_instance_id: predecessor.legacy_strategy_instance_id.clone(),
+            run_id: predecessor.legacy_run_id.clone(),
+            exchange: predecessor.exchange.as_str().to_owned(),
+            account: predecessor.legacy_product_account.clone(),
+            symbol: predecessor.legacy_symbol.clone(),
+            purpose: venue_domain::domain::OrderPurpose::Reduce,
+        };
+        assert!(predecessor.matches_legacy_owner(&owner));
+        let mut successor_owner = owner.clone();
+        successor_owner.account = predecessor.successor_trading_account_id.clone();
+        assert!(!predecessor.matches_legacy_owner(&successor_owner));
+        let mut different_run = owner;
+        different_run.run_id = "other-run".to_owned();
+        assert!(!predecessor.matches_legacy_owner(&different_run));
         Ok(())
     }
 

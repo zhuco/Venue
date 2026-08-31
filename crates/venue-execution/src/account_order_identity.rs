@@ -74,7 +74,7 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         matched
     }
 
-    fn signed_order_matches_command(
+    pub(super) fn signed_order_matches_command(
         &self,
         command: &ExecutionCommand,
         fact: &SignedAccountOrderFact,

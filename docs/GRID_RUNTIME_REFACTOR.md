@@ -391,7 +391,9 @@ G:\Venue\artifacts\<exchange>\LIVE\<trading_account_id>\
 并持久化来源绝对路径、字节数和 SHA-256 及每个导入段的摘要。源文件始终只读；已有导入标记必须精确匹配，
 后续新 WAL 段可追加轮转，但导入前缀不可变；任何中断、篡改、
 空文件或 `Prepared/Submitted/Unknown` 均失败关闭，不清理后重试。此兼容导入只保留既有命令/Owner/路由事实，
-不从旧 checkpoint 推断 Grid 路由、库存或 Actor Applied，后者缺失时仍不得启动 Grid 或新增风险。
+不从旧 checkpoint 推断 Grid 路由、库存或 Actor Applied，后者缺失时仍不得启动 Grid 或新增风险。前驱记录还须
+显式声明旧 WAL 的策略实例与 run；它们仅和签名订单的 native/client/full-shape 共同组成 cancellation-only custody
+候选，不可把旧 Owner 重写为新 UUID，也不可成为 Place/Reduce 的授权。
 
 ### 8.3 重启顺序
 

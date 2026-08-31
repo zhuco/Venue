@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -324,6 +324,18 @@ pub struct HostPreparedCommand {
     cancel_target_family: Option<NativeOrderFamily>,
 }
 
+/// Read-only evidence for a currently open order that was recovered from the frozen Stage-7
+/// WAL. It deliberately grants neither a new Owner nor a dispatch permit: later cancellation
+/// must retain this exact historical Owner and pass through the ordinary account lane.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LegacyV1CustodyRoute {
+    pub command_id: CommandId,
+    pub owner: OrderOwner,
+    pub family: NativeOrderFamily,
+    pub client_order_id: CommandId,
+    pub venue_order_id: String,
+}
+
 impl HostPreparedCommand {
     #[must_use]
     pub fn command_id(&self) -> &CommandId {
@@ -443,6 +455,7 @@ pub struct AccountMutationHost<G> {
     gateway: G,
     _canonical_root: Option<AccountCanonicalRootGuard>,
     _legacy_predecessor: Option<LegacyV1WriterGuard>,
+    legacy_v1_predecessor: Option<LegacyV1WriterPredecessor>,
     _account_lock: File,
 }
 
@@ -630,6 +643,7 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
             gateway,
             _canonical_root: None,
             _legacy_predecessor: None,
+            legacy_v1_predecessor: None,
             _account_lock: account_lock,
         })
     }
@@ -702,6 +716,7 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         )?;
         host._canonical_root = Some(canonical);
         host._legacy_predecessor = Some(legacy);
+        host.legacy_v1_predecessor = Some(predecessor);
         Ok(host)
     }
 
@@ -802,6 +817,80 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
                     && route.venue_order_id.is_some()
             })
             .collect()
+    }
+
+    /// Refreshes the complete signed account view and returns only open native orders whose
+    /// historical Owner exactly matches the frozen predecessor. This is custody evidence, not
+    /// an adoption of the old Owner: unmatched/external orders remain outside this route and no
+    /// command is appended. The later cancellation path must consume these exact identities.
+    pub fn refresh_legacy_v1_custody_routes(
+        &mut self,
+    ) -> Result<Vec<LegacyV1CustodyRoute>, AccountHostError<G::Error>> {
+        let predecessor = self
+            .legacy_v1_predecessor
+            .as_ref()
+            .ok_or(AccountHostValidationError::LegacyPredecessor)
+            .map_err(AccountHostError::Validation)?
+            .clone();
+        let snapshot = self.refresh_signed_snapshot()?;
+        let now = now_ms().map_err(AccountHostError::Validation)?;
+        if now < snapshot.observed_at_ms()
+            || now.saturating_sub(snapshot.observed_at_ms()) > MAX_RISK_EVIDENCE_AGE_MS
+        {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::SignedSnapshot,
+            ));
+        }
+        let accepted = self.accepted_order_routes();
+        let mut seen = BTreeSet::new();
+        let mut routes = Vec::new();
+        for fact in snapshot.open_orders() {
+            let Some(owner) = fact.owner.as_ref() else {
+                continue;
+            };
+            if fact.external || !predecessor.matches_legacy_owner(owner) {
+                continue;
+            }
+            let Some(venue_order_id) = fact.venue_order_id.as_deref() else {
+                return Err(AccountHostError::Validation(
+                    AccountHostValidationError::LegacyPredecessor,
+                ));
+            };
+            let matching = accepted
+                .iter()
+                .filter(|route| {
+                    route.owner == *owner
+                        && route.key.family == fact.family
+                        && route.key.client_id.as_str() == fact.client_order_id
+                        && route.venue_order_id.as_deref() == Some(venue_order_id)
+                        && self
+                            .journal
+                            .receipt(&route.command_id)
+                            .is_some_and(|receipt| {
+                                self.signed_order_matches_command(&receipt.command, fact)
+                            })
+                })
+                .collect::<Vec<_>>();
+            let [route] = matching.as_slice() else {
+                return Err(AccountHostError::Validation(
+                    AccountHostValidationError::LegacyPredecessor,
+                ));
+            };
+            let identity = (route.key.family, venue_order_id.to_owned());
+            if !seen.insert(identity) {
+                return Err(AccountHostError::Validation(
+                    AccountHostValidationError::LegacyPredecessor,
+                ));
+            }
+            routes.push(LegacyV1CustodyRoute {
+                command_id: route.command_id.clone(),
+                owner: route.owner.clone(),
+                family: route.key.family,
+                client_order_id: route.key.client_id.clone(),
+                venue_order_id: venue_order_id.to_owned(),
+            });
+        }
+        Ok(routes)
     }
 
     pub fn refresh_signed_snapshot(

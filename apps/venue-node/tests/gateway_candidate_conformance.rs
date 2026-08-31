@@ -138,6 +138,8 @@ fn legacy_handoff(
         legacy_product_account: scope.account.clone(),
         legacy_symbol: scope.symbol.clone(),
         legacy_owner_scope: scope.owner_scope.clone(),
+        legacy_strategy_instance_id: "grid-instance".to_owned(),
+        legacy_run_id: "grid-run".to_owned(),
         legacy_artifacts_root: PathBuf::from(canonical_root),
         legacy_lock_sha256: scope_sha256,
         legacy_lock_path: lock.clone(),

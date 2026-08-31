@@ -20,6 +20,54 @@ struct Gateway {
     dispatches: usize,
 }
 
+#[derive(Debug)]
+struct LegacySnapshotGateway {
+    binding: GatewayBinding,
+    snapshot: SignedAccountSnapshot,
+}
+
+impl AccountPhysicalGateway for LegacySnapshotGateway {
+    type Error = io::Error;
+
+    fn binding(&self) -> &GatewayBinding {
+        &self.binding
+    }
+
+    fn reconcile(
+        &mut self,
+        request: &AccountRecoveryRequest,
+    ) -> Result<AccountRecoveryReport, Self::Error> {
+        AccountRecoveryReport::new(
+            self.binding.clone(),
+            1,
+            request
+                .unresolved()
+                .iter()
+                .map(|command| AccountRecoveryOutcome::still_unknown(command.command_id().clone()))
+                .collect(),
+        )
+        .map_err(io::Error::other)
+    }
+
+    fn signed_account_snapshot(
+        &mut self,
+        request: &AccountRecoveryRequest,
+    ) -> Result<SignedAccountSnapshot, AccountHostValidationError> {
+        if request.binding() != &self.binding {
+            return Err(AccountHostValidationError::SignedSnapshot);
+        }
+        Ok(self.snapshot.clone())
+    }
+
+    fn signed_client_order_id_matches(&self, canonical: &CommandId, signed: &str) -> bool {
+        canonical.as_str() == signed
+    }
+
+    fn dispatch(&mut self, _: AccountDispatchPermit) -> AccountGatewayResult {
+        AccountGatewayResult::Unknown
+    }
+}
+
 impl AccountPhysicalGateway for Gateway {
     type Error = io::Error;
 
@@ -252,6 +300,106 @@ fn signed_order_cannot_confirm_a_different_or_missing_limit_policy()
     let recovered: SignedAccountOrderFact = serde_json::from_slice(&serde_json::to_vec(&fact)?)?;
     assert_eq!(recovered.created_at_ms, fact.created_at_ms);
     assert!(command_matches_signed_order(&execution, &recovered));
+    Ok(())
+}
+
+#[test]
+fn legacy_custody_routes_require_the_frozen_owner_wal_and_signed_open_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let binding = GatewayBinding::new(
+        VenueId::Gate,
+        GatewayMode::Live,
+        ACCOUNT,
+        "DOGE/USDT".parse()?,
+    )?;
+    let artifacts = temporary.path().join("gate").join("LIVE").join(ACCOUNT);
+    std::fs::create_dir_all(&artifacts)?;
+    let owner = OrderOwner {
+        strategy_instance_id: "hedged_grid_doge_usdt".to_owned(),
+        run_id: "primary".to_owned(),
+        exchange: "gate".to_owned(),
+        account: "usdt_futures".to_owned(),
+        symbol: binding.symbol.clone(),
+        purpose: OrderPurpose::Entry,
+    };
+    let command = ExecutionCommand::PlaceLimit(OrderCommand {
+        command_id: CommandId::new("legacy-create")?,
+        client_order_id: CommandId::new("legacy-client")?,
+        owner: owner.clone(),
+        side: OrderSide::Buy,
+        position_side: PositionSide::Long,
+        quantity: Decimal::ONE,
+        limit_price: Price::new(Decimal::ONE)?,
+        time_in_force: LimitTimeInForce::PostOnly,
+        reduce_only: false,
+    });
+    let mut journal = CommandJournal::open(artifacts.join("commands.jsonl"))?;
+    journal.prepare(command.clone())?;
+    journal.transition(command.command_id(), CommandState::Submitted)?;
+    journal.transition(
+        command.command_id(),
+        CommandState::Accepted {
+            venue_order_id: "legacy-native".to_owned(),
+        },
+    )?;
+    drop(journal);
+    let ExecutionCommand::PlaceLimit(order) = &command else {
+        return Err("limit command required".into());
+    };
+    let snapshot = SignedAccountSnapshot::complete(
+        binding.clone(),
+        now_ms()?,
+        1,
+        1,
+        1,
+        SignedAccountPositionMode::Hedge,
+        vec![SignedAccountOrderFact {
+            client_order_id: order.client_order_id.as_str().to_owned(),
+            venue_order_id: Some("legacy-native".to_owned()),
+            symbol: order.owner.symbol.clone(),
+            family: command.native_order_family().ok_or("family missing")?,
+            side: order.side,
+            position_side: order.position_side,
+            quantity: order.quantity,
+            limit_price: Some(order.limit_price.value()),
+            time_in_force: Some(order.time_in_force),
+            created_at_ms: Some(1),
+            reduce_only: order.reduce_only,
+            owner: None,
+            external: true,
+            state: Some(OrderState::New),
+            filled_quantity: Some(Decimal::ZERO),
+        }],
+        Vec::new(),
+        "legacy-fills:0".to_owned(),
+        Vec::new(),
+    )?;
+    let gateway = LegacySnapshotGateway {
+        binding: binding.clone(),
+        snapshot,
+    };
+    let mut host = AccountMutationHost::open(artifacts, binding, Decimal::TEN, gateway)?;
+    host.legacy_v1_predecessor = Some(LegacyV1WriterPredecessor {
+        exchange: VenueId::Gate,
+        successor_trading_account_id: ACCOUNT.to_owned(),
+        legacy_product_account: owner.account.clone(),
+        legacy_symbol: owner.symbol.clone(),
+        legacy_owner_scope: "hedged_grid_doge_usdt_primary".to_owned(),
+        legacy_strategy_instance_id: owner.strategy_instance_id.clone(),
+        legacy_run_id: owner.run_id.clone(),
+        legacy_artifacts_root: temporary.path().to_path_buf(),
+        legacy_lock_sha256: "0".repeat(64),
+        legacy_lock_path: temporary.path().join("legacy.lock"),
+        handoff_sha256: "0".repeat(64),
+    });
+
+    let routes = host.refresh_legacy_v1_custody_routes()?;
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0].owner, owner);
+    assert_eq!(routes[0].client_order_id.as_str(), "legacy-client");
+    assert_eq!(routes[0].venue_order_id, "legacy-native");
+    assert_eq!(host.gateway.snapshot.open_orders()[0].owner, None);
     Ok(())
 }
 
