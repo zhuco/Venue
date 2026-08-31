@@ -21,7 +21,7 @@
 - 只允许 `G:\Build\Venue\main`、`slot-1`、`slot-2`。主工作区默认 main，其他工作树按规范路径的 SHA256 稳定映射到两个槽；槽可能共享，因此必须串行持锁。
 - 网关专项固定 slot-1，Node binary 专项固定 slot-2。`-CargoTargetDir` 只接受三个白名单路径，不能指定 PID、时间戳、任意新目录或嵌套 target。
 - `.guard` 保存排他文件锁：所有入口共用两个并发许可，每槽另有独占锁。等待最多60秒后报忙；不得抢锁、另开目录或终止其他任务。
-- 专项脚本持锁直到构建、测试、二进制扫描及产物复制完成；`finally` 释放锁并还原 CARGO_TARGET_DIR、CARGO_BUILD_TARGET_DIR、CARGO_BUILD_BUILD_DIR、CARGO_INCREMENTAL、调试配置、TEMP/TMP 和工作目录。
+- 专项脚本持锁直到构建、测试、二进制扫描及产物复制完成；`finally` 释放锁并还原 CARGO_TARGET_DIR、CARGO_BUILD_TARGET_DIR、CARGO_BUILD_BUILD_DIR、CARGO_INCREMENTAL、RUSTC_WRAPPER、调试配置、TEMP/TMP 和工作目录；环境变量未设置与空字符串须分别恢复。
 - 临时文件固定放在 `.tmp/<slot>`；不按会话创建新的构建缓存。测试自身的小型 fixture 可以使用唯一名称，不得把编译产物放入 fixture 目录。
 
 ## 空间与编译策略
@@ -30,6 +30,7 @@
 - 同时要求物理宿主 F 至少100 GiB空闲、虚拟盘G至少20 GiB空闲。排队后再次检查；超限拒绝新任务，不自动清理。
 - 这是入口准入阈值，不是系统硬配额，也不是编译期间的连续监控。已运行的单次构建可能跨过阈值；直接绕过入口的进程不受脚本锁约束。磁盘情况不明时停下报告，不声称绝对限额。
 - main 开启增量，隔离槽关闭增量；dev/test 保留行号级调试信息，第三方依赖不生成完整调试符号。release 优化配置不变。需要完整调试信息时明确申请临时调整，而不是复制另一份 target。
+- main 使用直接增量编译，guard 内临时设置 `RUSTC_WRAPPER=''`，覆盖 Cargo 全局配置中的外层 wrapper，避免 sccache 拒绝 `CARGO_INCREMENTAL=1`（包括编译器版本探测）。退出或失败后精确恢复原值，不修改全局配置；隔离槽与 hosted CI 保留原 wrapper，`RUSTC_WORKSPACE_WRAPPER` 不变。显式非 sccache 的 `RUSTC_WRAPPER` 或非空 `CARGO_BUILD_RUSTC_WRAPPER` 在准入前拒绝，不静默关闭；主线若需要自定义外层 wrapper，须先明确调整此政策。
 - 局部改动只测试受影响包和直接契约；依赖、公共契约或发布前集中全量验证。保持工具链、features 和构建参数稳定，不常规执行 cargo clean。
 
 ## 清理边界与生效范围

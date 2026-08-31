@@ -39,6 +39,8 @@ $junction = $null
 $originalTarget = $env:CARGO_TARGET_DIR
 $originalTemp = $env:TEMP
 $originalIncremental = $env:CARGO_INCREMENTAL
+$originalWrapper = [Environment]::GetEnvironmentVariable('RUSTC_WRAPPER','Process')
+$originalCargoWrapper = [Environment]::GetEnvironmentVariable('CARGO_BUILD_RUSTC_WRAPPER','Process')
 $script:fixturePlan = [PSCustomObject]@{
     RepoRoot=$repo;Root=$fixture;Slot='main';TargetDirectory=(Join-Path $fixture 'main')
     TempDirectory=(Join-Path $fixture 'tmp');GuardDirectory=(Join-Path $fixture 'locks')
@@ -46,6 +48,7 @@ $script:fixturePlan = [PSCustomObject]@{
     HostRoot=[IO.Path]::GetPathRoot($fixture);GuestRoot=[IO.Path]::GetPathRoot($fixture)
 }
 try {
+    Restore-VenueBuildEnvironment @{RUSTC_WRAPPER=$null;CARGO_BUILD_RUSTC_WRAPPER=$null}
     # Only this test scope substitutes temporary storage; production parameters expose no override.
     function Get-VenueBuildPlan { param($RepoRoot,$Slot,$RequestedTarget) return $script:fixturePlan }
     $null = Test-VenueBuildAdmission $script:fixturePlan
@@ -66,6 +69,7 @@ try {
     Assert-GuardTest ($env:CARGO_TARGET_DIR -eq $script:fixturePlan.TargetDirectory) 'Target is overridden inside lease'
     Assert-GuardTest ($env:CARGO_BUILD_BUILD_DIR -eq $env:CARGO_TARGET_DIR) 'Intermediate build directory cannot escape'
     Assert-GuardTest ($env:CARGO_INCREMENTAL -eq '1') 'Main retains incremental cache'
+    Assert-GuardTest ([object]::Equals([Environment]::GetEnvironmentVariable('RUSTC_WRAPPER','Process'),'')) 'Main explicitly disables the outer wrapper, including Cargo config defaults'
     Assert-GuardThrows { Enter-VenueBuildGuard -RepoRoot $repo -WaitSeconds 0 } 'Nested build'
 
     # Verify the lock is visible in another OS process, not just this PowerShell runspace.
@@ -80,6 +84,22 @@ try {
     Exit-VenueBuildGuard $activeLease
     $activeLease = $null
     Assert-GuardTest ($env:CARGO_TARGET_DIR -eq $originalTarget -and $env:TEMP -eq $originalTemp -and $env:CARGO_INCREMENTAL -eq $originalIncremental) 'Environment is restored'
+    Assert-GuardTest ($null -eq [Environment]::GetEnvironmentVariable('RUSTC_WRAPPER','Process')) 'Unset wrapper is restored'
+
+    foreach ($wrapperSample in @($null,'','sccache','C:\tools\sccache.exe')) {
+        Restore-VenueBuildEnvironment @{RUSTC_WRAPPER=$wrapperSample}
+        $activeLease = Enter-VenueBuildGuard -RepoRoot $repo -WaitSeconds 0
+        Assert-GuardTest ([object]::Equals([Environment]::GetEnvironmentVariable('RUSTC_WRAPPER','Process'),'')) 'Every main lease selects direct incremental compilation'
+        try { throw 'simulated main validation failure' } catch { } finally { Exit-VenueBuildGuard $activeLease; $activeLease=$null }
+        Assert-GuardTest ([object]::Equals([Environment]::GetEnvironmentVariable('RUSTC_WRAPPER','Process'),$wrapperSample)) 'Failure restores unset, empty and sccache wrapper values exactly'
+    }
+    [Environment]::SetEnvironmentVariable('RUSTC_WRAPPER','C:\tools\custom-wrapper.exe','Process')
+    Assert-GuardThrows { Enter-VenueBuildGuard -RepoRoot $repo -WaitSeconds 0 } 'explicit custom compiler wrapper'
+    Assert-GuardTest ($env:RUSTC_WRAPPER -ceq 'C:\tools\custom-wrapper.exe') 'Refusal preserves explicit custom wrapper'
+    Restore-VenueBuildEnvironment @{RUSTC_WRAPPER=$null;CARGO_BUILD_RUSTC_WRAPPER='sccache'}
+    Assert-GuardThrows { Enter-VenueBuildGuard -RepoRoot $repo -WaitSeconds 0 } 'explicit custom compiler wrapper'
+    Assert-GuardTest ($env:CARGO_BUILD_RUSTC_WRAPPER -ceq 'sccache') 'Refusal preserves explicit Cargo wrapper setting'
+    Restore-VenueBuildEnvironment @{CARGO_BUILD_RUSTC_WRAPPER=$null}
 
     $busy = Open-VenueBuildLock (Join-Path $script:fixturePlan.GuardDirectory 'main.lock')
     $externalHandles.Add($busy)
@@ -94,10 +114,14 @@ try {
     $script:assertions++ # Failed permit acquisition did not leak the slot lock.
 
     $script:fixturePlan.Slot = 'slot-1'
+    [Environment]::SetEnvironmentVariable('RUSTC_WRAPPER','venue-test-wrapper','Process')
     $activeLease = Enter-VenueBuildGuard -RepoRoot $repo -WaitSeconds 0
     Assert-GuardTest ($env:CARGO_INCREMENTAL -eq '0') 'Isolated slot disables incremental cache'
+    Assert-GuardTest ($env:RUSTC_WRAPPER -ceq 'venue-test-wrapper') 'Isolated slot keeps the configured wrapper'
     try { throw 'simulated validation failure' } catch { } finally { Exit-VenueBuildGuard $activeLease; $activeLease=$null }
     Assert-GuardTest ($env:CARGO_TARGET_DIR -eq $originalTarget) 'Exception path restores environment'
+    Assert-GuardTest ($env:RUSTC_WRAPPER -ceq 'venue-test-wrapper') 'Isolated slot failure does not change the wrapper'
+    Restore-VenueBuildEnvironment @{RUSTC_WRAPPER=$null}
 
     $scanRoot = Join-Path $fixture 'cache-scan'
     $outside = Join-Path $fixture 'protected-data'
@@ -113,6 +137,7 @@ try {
     [PSCustomObject]@{Passed=$true;Assertions=$script:assertions;CargoStarted=$false;ProductionCacheDeleted=$false;FixtureRoot=$fixture} | ConvertTo-Json
 } finally {
     if ($null -ne $activeLease) { Exit-VenueBuildGuard $activeLease }
+    Restore-VenueBuildEnvironment @{RUSTC_WRAPPER=$originalWrapper;CARGO_BUILD_RUSTC_WRAPPER=$originalCargoWrapper}
     foreach ($handle in $externalHandles) { $handle.Dispose() }
     if ($junction -and (Test-Path -LiteralPath $junction)) { [IO.Directory]::Delete($junction) }
     $resolved = (Resolve-Path -LiteralPath $fixture).ProviderPath

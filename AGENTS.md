@@ -53,7 +53,7 @@
 - Cargo 构建/检查/测试统一使用 `scripts/Invoke-VenueBuild.ps1 -CargoArguments @('check','--locked','-p','venue-runtime')`；专项验证脚本已有同一 guard，直接运行，不要二次套锁。只读空间检查用 `-CheckOnly`。原始 cargo 编译、临时脚本、IDE 或子进程也不得用于绕过限制。
 - 所有工作树合计最多两个受控构建；同槽锁覆盖构建、二进制核验/测试和产物复制。槽满等待最多60秒后报告，不新建目录、不抢锁、不终止其他会话进程；不允许嵌套 guard。
 - 准入预算：`G:\Build\Venue` 普通文件合计150 GiB（含旧目录及临时文件），F宿主空闲至少100 GiB，G至少20 GiB；超限拒绝新构建并报告。检查不跟随重解析点。这是入口准入检查，不是持续运行监控或系统硬配额；单次构建仍可能跨过阈值。
-- main 保留增量，隔离槽关闭增量；dev/test 使用精简调试信息。保持工具链/参数稳定；局部修改只验证受影响包，不反复全量测试、不常规 cargo clean。
+- main 保留增量，并在 guard 内临时以空 RUSTC_WRAPPER 禁用外层编译 wrapper，避免全局 sccache 拒绝增量；finally 精确恢复原值，不改全局配置。隔离槽关闭增量并保留 wrapper；dev/test 使用精简调试信息。保持工具链/参数稳定；局部修改只验证受影响包，不反复全量测试、不常规 cargo clean。
 - 本阶段不自动清理。清理须另行核准精确目录并取得对应槽锁，只能处理已登记且无占用的冷缓存；不得删除整个 Build/项目目录、源码、bak、Git、数据库、发布产物、备份或运行恢复工件。G内删除不保证F的VHDX立即缩小。
 - 旧会话下一次构建前重读本段及 `scripts/BUILD_POLICY.md`。脚本用finally释放锁并恢复环境。GitHub托管CI复用其RUNNER_TEMP下既有target，不套用本机F/G容量阈值。
 

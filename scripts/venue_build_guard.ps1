@@ -110,6 +110,13 @@ function Enter-VenueBuildGuard {
     )
     if (Get-Variable VenueActiveBuildLease -Scope Global -ErrorAction SilentlyContinue) { throw 'Nested build guards are not allowed. Invoke guarded verification scripts directly.' }
     $plan = Get-VenueBuildPlan -RepoRoot $RepoRoot -Slot $Slot -RequestedTarget $RequestedTarget
+    if (-not $plan.HostedCI -and $plan.Slot -eq 'main') {
+        $wrapper = [Environment]::GetEnvironmentVariable('RUSTC_WRAPPER','Process')
+        $cargoWrapper = [Environment]::GetEnvironmentVariable('CARGO_BUILD_RUSTC_WRAPPER','Process')
+        if ($cargoWrapper -or ($wrapper -and [IO.Path]::GetFileName($wrapper) -notin @('sccache','sccache.exe'))) {
+            throw 'Main incremental policy cannot override an explicit custom compiler wrapper. Review the wrapper policy before building.'
+        }
+    }
     $null = Test-VenueBuildAdmission $plan
     [void][IO.Directory]::CreateDirectory($plan.GuardDirectory)
     $handles = [Collections.Generic.List[IDisposable]]::new()
@@ -142,6 +149,11 @@ function Enter-VenueBuildGuard {
             CARGO_INCREMENTAL=$(if ($plan.Slot -eq 'main') {'1'} else {'0'})
             CARGO_PROFILE_DEV_DEBUG='line-tables-only'; CARGO_PROFILE_TEST_DEBUG='line-tables-only'
             TEMP=$plan.TempDirectory; TMP=$plan.TempDirectory
+        }
+        if (-not $plan.HostedCI -and $plan.Slot -eq 'main') {
+            # sccache rejects CARGO_INCREMENTAL=1 even for Cargo's compiler probe.
+            # Main uses direct incremental compilation; isolated slots retain wrappers.
+            $settings.RUSTC_WRAPPER = ''
         }
         foreach ($name in $settings.Keys) {
             $saved[$name] = [Environment]::GetEnvironmentVariable($name,'Process')
