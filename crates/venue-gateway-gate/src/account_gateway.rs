@@ -3,10 +3,9 @@ use crate::{
     GateFillsCursor, GateGatewayBinding, GateHttpTransport, GateMutationDispatch,
     GatePrivateReadSource, GatePrivateReadbackCandidate, GatePublicBinding, GatePublicPayloadKind,
     GatePublicRawPayload, GateRawPrivateResponse, GateTransportError, GateTransportLimits,
-    canonical_client_id_from_native, endpoints, parse_contract_rules,
-    parse_rest_snapshot, prepare_cancel, prepare_exact_readback_by_client_id, prepare_limit,
-    prepare_private_read, prepare_reduce_once, rest_order_book_path, settle_exact_readback,
-    validate_private_readback,
+    canonical_client_id_from_native, endpoints, parse_contract_rules, parse_rest_snapshot,
+    prepare_cancel, prepare_exact_readback_by_client_id, prepare_limit, prepare_private_read,
+    prepare_reduce_once, rest_order_book_path, settle_exact_readback, validate_private_readback,
 };
 use rust_decimal::Decimal;
 use serde_json::Value;

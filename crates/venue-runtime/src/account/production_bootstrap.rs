@@ -22,6 +22,11 @@ impl AccountRuntime {
         {
             return Err(AccountRuntimeError::RecoveryStateMismatch);
         }
+        let mut router = self.private_router.clone();
+        router.activate_generation(
+            snapshot.connection_generation(),
+            self.last_applied_private_sequence,
+        )?;
         self.durable_recovery_complete = true;
         self.recovered_gateway_mode = Some(GatewayMode::Live);
         self.recovered_position_mode = Some(match snapshot.position_mode() {
@@ -29,6 +34,7 @@ impl AccountRuntime {
             SignedAccountPositionMode::Hedge => AccountPositionMode::Hedge,
         });
         self.connection_generation = snapshot.connection_generation();
+        self.private_router = router;
         self.last_reconciliation_generation = snapshot.private_generation();
         self.actor_applied_wal_head = Some(bootstrap.wal_head());
         self.physical_private_generation_floor = snapshot.private_generation();

@@ -243,6 +243,12 @@ impl AccountRuntime {
 
     #[cfg(test)]
     #[must_use]
+    pub(crate) const fn private_router_generation_for_test(&self) -> u64 {
+        self.private_router.active_generation_for_test()
+    }
+
+    #[cfg(test)]
+    #[must_use]
     pub(crate) const fn owner_index_boundary_for_test(&self) -> Option<([u8; 32], u64, u64)> {
         match self.owner_index_root {
             Some(root) => Some((

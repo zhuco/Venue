@@ -25,13 +25,13 @@ mod transport;
 pub use account_gateway::{GateAccountGateway, GateAccountGatewayError};
 pub use config::{GateConfig, GateProductScope};
 pub use credentials::GateCredentials;
+pub(crate) use execution::canonical_client_id_from_native;
 pub use execution::{
     GateAcceptedMutation, GateCancelIntent, GateDispatchUnknown, GateExactOrderReadback,
     GateExactReadbackRequest, GateExecutionError, GateMutationKind, GateMutationSettlement,
     GatePreparedMutation, GateSettlementFinality, prepare_cancel,
     prepare_exact_readback_by_client_id, prepare_limit, prepare_reduce_once, settle_exact_readback,
 };
-pub(crate) use execution::canonical_client_id_from_native;
 pub use order_families::{
     GATE_STAGE7_ORDER_PROFILE_VERSION, GateStage7OrderFamilyCandidate, GateStage7OrderFamilyError,
     GateStage7OrderFamilyEvidence, GateStage7OrderFamilyScope, GateStage7UnsupportedEvidence,

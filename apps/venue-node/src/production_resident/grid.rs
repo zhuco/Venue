@@ -15,6 +15,7 @@ use venue_strategies::hedged_grid::{
 use crate::{NodeError, runtime_config::NodeGridRecoveryPolicy};
 
 const MAX_GRID_CHECKPOINT_BYTES: usize = 1_048_576;
+const MAX_PARTIAL_FILL_SLICES_PER_ORDER: usize = 256;
 
 /// Durable correlation for an order the Grid reducer already owns. It is a projection of the
 /// actor checkpoint, not a second owner, journal, or authority: Host/WAL remain the only source
@@ -27,13 +28,86 @@ pub(crate) struct GridOrderRoute {
     pub accepted_venue_order_id: Option<String>,
 }
 
+/// Durable portions of one exact accepted native order. This is only a checkpoint projection:
+/// private evidence and Host/WAL remain the source of the individual executions. The projection
+/// prevents two partial fills from being mistaken for two complete grid rolls after restart.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GridPartialFill {
+    source_order: GridOrderKey,
+    #[serde(with = "rust_decimal::serde::str")]
+    cumulative_quantity: rust_decimal::Decimal,
+    fills: BTreeMap<String, GridPartialFillSlice>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GridPartialFillSlice {
+    #[serde(with = "rust_decimal::serde::str")]
+    quantity: rust_decimal::Decimal,
+    maker: FieldState<bool>,
+}
+
 /// The complete Grid checkpoint shape used by the production private-fill bridge. A native order
 /// id alone is never enough: restart recovery requires the exact key/client/native triad, so it
 /// cannot infer a grid level from price, side, or current BBO.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct GridBridgeState {
     pub grid: HedgedGridState,
+    #[serde(with = "grid_routes")]
     routes: BTreeMap<GridOrderKey, GridOrderRoute>,
+    #[serde(default)]
+    partial_fills: BTreeMap<String, GridPartialFill>,
+}
+
+/// JSON object keys cannot encode `GridOrderKey` without inventing a lossy string identity.
+/// Persist routes as validated records instead. The only representable legacy map was empty, so
+/// that exact shape remains readable while every non-empty legacy object fails closed.
+mod grid_routes {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+    use venue_strategies::hedged_grid::GridOrderKey;
+
+    use super::GridOrderRoute;
+
+    pub(super) fn serialize<S>(
+        routes: &BTreeMap<GridOrderKey, GridOrderRoute>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        routes.values().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<BTreeMap<GridOrderKey, GridOrderRoute>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum EncodedRoutes {
+            Records(Vec<GridOrderRoute>),
+            LegacyEmpty(BTreeMap<String, serde::de::IgnoredAny>),
+        }
+
+        let encoded = EncodedRoutes::deserialize(deserializer)?;
+        let records = match encoded {
+            EncodedRoutes::Records(records) => records,
+            EncodedRoutes::LegacyEmpty(legacy) if legacy.is_empty() => return Ok(BTreeMap::new()),
+            EncodedRoutes::LegacyEmpty(_) => {
+                return Err(D::Error::custom("legacy grid route object must be empty"));
+            }
+        };
+        let mut routes = BTreeMap::new();
+        for route in records {
+            if routes.insert(route.key.clone(), route).is_some() {
+                return Err(D::Error::custom("duplicate grid route key"));
+            }
+        }
+        Ok(routes)
+    }
 }
 
 pub(crate) struct GridDispatchPlan {
@@ -46,6 +120,7 @@ impl GridBridgeState {
         let state = Self {
             grid,
             routes: BTreeMap::new(),
+            partial_fills: BTreeMap::new(),
         };
         state.validate().map_err(|_| NodeError::ResidentRuntime)?;
         Ok(state)
@@ -86,7 +161,11 @@ impl GridBridgeState {
 
     pub(crate) fn checkpoint_bytes(&self) -> Result<Vec<u8>, NodeError> {
         self.validate().map_err(|_| NodeError::ResidentRuntime)?;
-        serde_json::to_vec(self).map_err(|_| NodeError::ResidentArtifacts)
+        let bytes = serde_json::to_vec(self).map_err(|_| NodeError::ResidentArtifacts)?;
+        if bytes.len() > MAX_GRID_CHECKPOINT_BYTES {
+            return Err(NodeError::ResidentArtifacts);
+        }
+        Ok(bytes)
     }
 
     /// Signed convergence is based on the reducer's current desired set, never on an order count.
@@ -206,23 +285,94 @@ impl GridBridgeState {
         if fill.symbol != self.grid.binding.symbol
             || fill.side != source.side
             || !matches!(fill.position_side, FieldState::Known(value) if value == position)
+            || fill.price != source.price
             || fill.quantity > source.quantity
         {
             return Err(GridBridgeError::Evidence);
         }
-        let decision = self
-            .grid
-            .observe_stream_owned_fill(OwnedGridFill {
-                fill_id: fill.fill_id.clone(),
-                private_generation,
-                source_order: key,
-                fill_price: fill.price,
-                complete: fill.quantity == source.quantity,
-                maker: fill.maker.clone(),
-            })
-            .map_err(GridBridgeError::Reducer)?;
+        let completed = self.record_partial_fill(&key, fill)?;
+        let Some(completed) = completed else {
+            self.validate()?;
+            return Ok(GridDecision::Noop);
+        };
+        let prior_grid = self.grid.clone();
+        let decision = match self.grid.observe_stream_owned_fill(OwnedGridFill {
+            fill_id: fill.fill_id.clone(),
+            private_generation,
+            source_order: key.clone(),
+            fill_price: source.price,
+            complete: true,
+            maker: aggregate_maker(&completed.fills),
+        }) {
+            Ok(decision) => decision,
+            Err(error) => {
+                self.grid = prior_grid;
+                self.partial_fills.insert(fill.order_id.clone(), completed);
+                return Err(GridBridgeError::Reducer(error));
+            }
+        };
+        // Reducer retirement and route retirement are one checkpoint transition. Retaining the
+        // native route after the reducer removes its owned order would make the checkpoint fail
+        // validation and could not safely be replayed as a new order.
+        self.routes.remove(&key);
         self.validate()?;
         Ok(decision)
+    }
+
+    fn record_partial_fill(
+        &mut self,
+        key: &GridOrderKey,
+        fill: &Fill,
+    ) -> Result<Option<GridPartialFill>, GridBridgeError> {
+        let existing = self.partial_fills.get(&fill.order_id);
+        if let Some(existing) = existing
+            && existing.source_order != *key
+        {
+            return Err(GridBridgeError::Evidence);
+        }
+        if let Some(slice) = existing.and_then(|partial| partial.fills.get(&fill.fill_id)) {
+            if slice.quantity != fill.quantity || slice.maker != fill.maker {
+                return Err(GridBridgeError::Evidence);
+            }
+            return Ok(None);
+        }
+        if existing.is_some_and(|partial| partial.fills.len() >= MAX_PARTIAL_FILL_SLICES_PER_ORDER)
+        {
+            return Err(GridBridgeError::Evidence);
+        }
+        let source_quantity = self.require_owned(key)?.quantity;
+        let cumulative_quantity = existing
+            .map(|partial| partial.cumulative_quantity)
+            .unwrap_or_default()
+            .checked_add(fill.quantity)
+            .ok_or(GridBridgeError::Evidence)?;
+        if cumulative_quantity > source_quantity {
+            return Err(GridBridgeError::Evidence);
+        }
+        let partial = self
+            .partial_fills
+            .entry(fill.order_id.clone())
+            .or_insert_with(|| GridPartialFill {
+                source_order: key.clone(),
+                cumulative_quantity: rust_decimal::Decimal::ZERO,
+                fills: BTreeMap::new(),
+            });
+        partial.cumulative_quantity = cumulative_quantity;
+        partial.fills.insert(
+            fill.fill_id.clone(),
+            GridPartialFillSlice {
+                quantity: fill.quantity,
+                maker: fill.maker.clone(),
+            },
+        );
+        if cumulative_quantity == source_quantity {
+            return self
+                .partial_fills
+                .remove(&fill.order_id)
+                .map(Some)
+                .ok_or(GridBridgeError::Evidence);
+        }
+        Ok(None)
     }
 
     /// Converts only the reducer's already-reserved rolling transaction to the one account WAL
@@ -385,7 +535,6 @@ impl GridBridgeState {
         let mut seen_native = BTreeMap::new();
         for (key, route) in &self.routes {
             if key != &route.key
-                || !self.grid.owned_orders.contains_key(key)
                 || seen_clients
                     .insert(route.client_order_id.clone(), key)
                     .is_some()
@@ -399,7 +548,57 @@ impl GridBridgeState {
                 return Err(GridBridgeError::RouteConflict);
             }
         }
+        for (native_order_id, partial) in &self.partial_fills {
+            let Some(route) = self.routes.get(&partial.source_order) else {
+                return Err(GridBridgeError::RouteConflict);
+            };
+            if route.accepted_venue_order_id.as_deref() != Some(native_order_id)
+                || partial.fills.is_empty()
+                || partial.fills.len() > MAX_PARTIAL_FILL_SLICES_PER_ORDER
+                || partial.fills.iter().any(|(fill_id, slice)| {
+                    fill_id.trim().is_empty()
+                        || slice.quantity.is_zero()
+                        || !slice.quantity.is_sign_positive()
+                })
+            {
+                return Err(GridBridgeError::RouteConflict);
+            }
+            let source = self.require_owned(&partial.source_order)?;
+            let quantity = partial
+                .fills
+                .values()
+                .try_fold(rust_decimal::Decimal::ZERO, |total, slice| {
+                    total.checked_add(slice.quantity)
+                })
+                .ok_or(GridBridgeError::Evidence)?;
+            if quantity != partial.cumulative_quantity
+                || quantity.is_zero()
+                || !quantity.is_sign_positive()
+                || quantity >= source.quantity
+            {
+                return Err(GridBridgeError::Evidence);
+            }
+        }
         Ok(())
+    }
+}
+
+fn aggregate_maker(fills: &BTreeMap<String, GridPartialFillSlice>) -> FieldState<bool> {
+    let mut all_maker = true;
+    for fill in fills.values() {
+        match fill.maker {
+            FieldState::Known(true) => {}
+            FieldState::Known(false) => return FieldState::Known(false),
+            FieldState::Missing
+            | FieldState::Null
+            | FieldState::Unavailable { .. }
+            | FieldState::NotApplicable => all_maker = false,
+        }
+    }
+    if all_maker {
+        FieldState::Known(true)
+    } else {
+        FieldState::Missing
     }
 }
 
@@ -506,6 +705,41 @@ mod tests {
     }
 
     #[test]
+    fn route_checkpoint_accepts_only_the_legacy_empty_object_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let initial = initial()?;
+        let bridge = GridBridgeState::bootstrap(initial.clone())?;
+        let mut legacy: serde_json::Value = serde_json::from_slice(&bridge.checkpoint_bytes()?)?;
+        legacy
+            .as_object_mut()
+            .ok_or("grid checkpoint object")?
+            .insert("routes".to_owned(), serde_json::json!({}));
+        let empty_legacy = serde_json::to_vec(&legacy)?;
+        assert!(
+            GridBridgeState::restore_or_bootstrap(
+                Some(empty_legacy),
+                initial.clone(),
+                NodeGridRecoveryPolicy::RequireExisting,
+            )
+            .is_ok()
+        );
+        legacy
+            .as_object_mut()
+            .ok_or("grid checkpoint object")?
+            .insert("routes".to_owned(), serde_json::json!({"old": {}}));
+        let nonempty_legacy = serde_json::to_vec(&legacy)?;
+        assert!(
+            GridBridgeState::restore_or_bootstrap(
+                Some(nonempty_legacy),
+                initial,
+                NodeGridRecoveryPolicy::RequireExisting,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn initial_install_preserves_closing_before_opening_and_refuses_low_inventory()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut state = initial()?;
@@ -538,6 +772,152 @@ mod tests {
             ..inventory
         };
         assert!(low.install_initial_epoch(low_inventory, epoch).is_err());
+        Ok(())
+    }
+
+    fn bridge_with_accepted_order()
+    -> Result<(GridBridgeState, GridOrderKey, GridOrderIntent, String), Box<dyn std::error::Error>>
+    {
+        let mut state = initial()?;
+        state.params.grid_count = 2;
+        let mut bridge = GridBridgeState::bootstrap(state)?;
+        let plan = bridge.install_initial_epoch(
+            GridInventory {
+                private_generation: 2,
+                private_observed_at_ms: 10,
+                mark_price: Price::new(Decimal::new(100, 0))?,
+                long_quantity: Decimal::ONE,
+                short_quantity: Decimal::ONE,
+            },
+            GridEpoch {
+                epoch: 1,
+                anchor_price: Price::new(Decimal::new(100, 0))?,
+                step: Price::new(Decimal::ONE)?,
+                grid_quantity: Decimal::new(5, 2),
+                passive_book_fallback: None,
+            },
+        )?;
+        let accepted = plan
+            .accepted_routes
+            .iter()
+            .enumerate()
+            .map(|(index, (_, _, command_id))| {
+                (command_id.clone(), format!("native-grid-order-{index}"))
+            })
+            .collect::<Vec<_>>();
+        bridge.bind_accepted_plan(&plan, &accepted)?;
+        let (key, route) = bridge
+            .routes
+            .iter()
+            .next()
+            .map(|(key, route)| (key.clone(), route.clone()))
+            .ok_or("accepted route")?;
+        let source = bridge.require_owned(&key)?.clone();
+        let native_order_id = route.accepted_venue_order_id.ok_or("native order id")?;
+        Ok((bridge, key, source, native_order_id))
+    }
+
+    fn owned_fill(
+        fill_id: &str,
+        order_id: &str,
+        source: &GridOrderIntent,
+        quantity: Decimal,
+        price: Price,
+    ) -> Result<Fill, Box<dyn std::error::Error>> {
+        Ok(Fill {
+            fill_id: fill_id.to_owned(),
+            execution_sequence: FieldState::Known(1),
+            order_id: order_id.to_owned(),
+            symbol: "DOGE/USDT".parse()?,
+            side: source.side,
+            position_side: FieldState::Known(match source.key.position {
+                GridPosition::Long => PositionSide::Long,
+                GridPosition::Short => PositionSide::Short,
+            }),
+            quantity,
+            price,
+            fee: FieldState::Missing,
+            realized_pnl: FieldState::Missing,
+            maker: FieldState::Known(true),
+            exchange_time_ms: Some(100),
+        })
+    }
+
+    #[test]
+    fn partial_fills_accumulate_across_checkpoint_and_retire_the_completed_route()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut bridge, key, source, native_order_id) = bridge_with_accepted_order()?;
+        let first_quantity = source
+            .quantity
+            .checked_div(Decimal::new(2, 0))
+            .ok_or("first quantity")?;
+        let remaining_quantity = source
+            .quantity
+            .checked_sub(first_quantity)
+            .ok_or("remaining quantity")?;
+        let first = owned_fill(
+            "partial-fill-1",
+            &native_order_id,
+            &source,
+            first_quantity,
+            source.price,
+        )?;
+        assert_eq!(
+            bridge.observe_persisted_fill(&first, 9)?,
+            GridDecision::Noop
+        );
+        let checkpoint = bridge.checkpoint_bytes()?;
+        let mut decoded: GridBridgeState = serde_json::from_slice(&checkpoint)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        assert_eq!(decoded, bridge);
+        decoded.grid.migrate_checkpoint()?;
+        decoded.validate()?;
+        let mut bridge = GridBridgeState::restore_or_bootstrap(
+            Some(checkpoint),
+            bridge.grid.clone(),
+            NodeGridRecoveryPolicy::RequireExisting,
+        )?;
+        assert_eq!(
+            bridge.observe_persisted_fill(&first, 9)?,
+            GridDecision::Noop
+        );
+        let conflicting_duplicate = owned_fill(
+            "partial-fill-1",
+            &native_order_id,
+            &source,
+            source.quantity,
+            source.price,
+        )?;
+        assert!(
+            bridge
+                .observe_persisted_fill(&conflicting_duplicate, 9)
+                .is_err()
+        );
+        let wrong_price = owned_fill(
+            "partial-fill-2",
+            &native_order_id,
+            &source,
+            remaining_quantity,
+            Price::new(source.price.value() + Decimal::ONE)?,
+        )?;
+        assert!(bridge.observe_persisted_fill(&wrong_price, 9).is_err());
+        let completion = owned_fill(
+            "partial-fill-2",
+            &native_order_id,
+            &source,
+            remaining_quantity,
+            source.price,
+        )?;
+        let decision = bridge.observe_persisted_fill(&completion, 9)?;
+        let GridDecision::Actions(actions) = decision else {
+            return Err("completed maker fill did not produce a rolling action".into());
+        };
+        for action in &actions {
+            bridge.plan_dispatch(action)?;
+        }
+        assert!(!bridge.routes.contains_key(&key));
+        assert!(!bridge.partial_fills.contains_key(&native_order_id));
+        bridge.checkpoint_bytes()?;
         Ok(())
     }
 }

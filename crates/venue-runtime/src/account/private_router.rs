@@ -158,6 +158,12 @@ impl PrivateRouter {
         Ok(())
     }
 
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn active_generation_for_test(&self) -> u64 {
+        self.connection_generation
+    }
+
     pub fn bind_order(
         &mut self,
         family: NativeOrderFamily,

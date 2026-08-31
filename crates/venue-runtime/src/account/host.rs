@@ -888,6 +888,10 @@ mod tests {
         let mut runtime = AccountRuntime::new(AccountKey::new(ExchangeId::Okx, ACCOUNT)?);
         host.bootstrap_runtime(&mut runtime)?;
         assert_eq!(runtime.health(), crate::account::AccountHealth::Ready);
+        assert_eq!(
+            runtime.private_router_generation_for_test(),
+            runtime.connection_generation()
+        );
         assert!(root(&temp).join("signed-account-bootstrap.json").is_file());
         Ok(())
     }
