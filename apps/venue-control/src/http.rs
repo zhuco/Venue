@@ -27,6 +27,19 @@ use crate::{
     },
 };
 
+#[cfg(test)]
+mod account_tests;
+mod accounts;
+
+#[derive(Clone)]
+enum AccessMode {
+    PublicOnly,
+    Accounts(Arc<crate::accounts::AccountService>),
+    // Existing framing/transport unit fixtures run below the authentication boundary.
+    #[cfg(test)]
+    TransportFixture,
+}
+
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HEADER_LINES: usize = 64;
 const MAX_HEADER_LINE_BYTES: usize = 1_024;
@@ -87,6 +100,7 @@ struct HttpState<R> {
     indicators: Arc<IndicatorProjectionStore>,
     config: ControlHttpConfig,
     shutdown: watch::Receiver<bool>,
+    access: AccessMode,
 }
 
 impl<R> Clone for HttpState<R> {
@@ -96,6 +110,7 @@ impl<R> Clone for HttpState<R> {
             indicators: Arc::clone(&self.indicators),
             config: self.config.clone(),
             shutdown: self.shutdown.clone(),
+            access: self.access.clone(),
         }
     }
 }
@@ -104,7 +119,9 @@ struct HttpRequest {
     method: Method,
     target: String,
     last_event_id: Option<i64>,
-    body: Vec<u8>,
+    body: zeroize::Zeroizing<Vec<u8>>,
+    bearer: Option<venue_control_protocol::accounts::SecretValue>,
+    json_content: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -156,7 +173,50 @@ pub async fn serve_local_with_indicators<R>(
     service: Arc<ControlService<R>>,
     indicators: Arc<IndicatorProjectionStore>,
     config: ControlHttpConfig,
+    shutdown: watch::Receiver<bool>,
+) -> Result<(), HttpServerError>
+where
+    R: ControlRepository + AccountDeliveryRepository + 'static,
+{
+    serve_inner(
+        listener,
+        service,
+        indicators,
+        config,
+        shutdown,
+        AccessMode::PublicOnly,
+    )
+    .await
+}
+
+pub async fn serve_local_with_accounts<R>(
+    listener: TcpListener,
+    service: Arc<ControlService<R>>,
+    accounts: Arc<crate::accounts::AccountService>,
+    config: ControlHttpConfig,
+    shutdown: watch::Receiver<bool>,
+) -> Result<(), HttpServerError>
+where
+    R: ControlRepository + AccountDeliveryRepository + 'static,
+{
+    serve_inner(
+        listener,
+        service,
+        Arc::new(IndicatorProjectionStore::default()),
+        config,
+        shutdown,
+        AccessMode::Accounts(accounts),
+    )
+    .await
+}
+
+async fn serve_inner<R>(
+    listener: TcpListener,
+    service: Arc<ControlService<R>>,
+    indicators: Arc<IndicatorProjectionStore>,
+    config: ControlHttpConfig,
     mut shutdown: watch::Receiver<bool>,
+    access: AccessMode,
 ) -> Result<(), HttpServerError>
 where
     R: ControlRepository + AccountDeliveryRepository + 'static,
@@ -171,6 +231,7 @@ where
         indicators,
         config,
         shutdown: shutdown.clone(),
+        access,
     };
     loop {
         tokio::select! {
@@ -217,6 +278,21 @@ where
 }
 
 async fn dispatch<R>(
+    stream: &mut TcpStream,
+    state: &HttpState<R>,
+    request: HttpRequest,
+) -> Result<(), ()>
+where
+    R: ControlRepository + AccountDeliveryRepository + 'static,
+{
+    #[cfg(test)]
+    if matches!(state.access, AccessMode::TransportFixture) {
+        return dispatch_control(stream, state, request).await;
+    }
+    accounts::dispatch_authenticated(stream, state, request).await
+}
+
+async fn dispatch_control<R>(
     stream: &mut TcpStream,
     state: &HttpState<R>,
     request: HttpRequest,
@@ -365,7 +441,7 @@ fn event_cursor(query: Option<&str>, last_event_id: Option<i64>) -> Result<i64, 
 }
 
 async fn read_request(stream: &mut TcpStream, body_limit: usize) -> Result<HttpRequest, HttpError> {
-    let mut bytes = Vec::with_capacity(2_048);
+    let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(2_048));
     let header_end = loop {
         if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
             break index + 4;
@@ -395,12 +471,39 @@ async fn read_request(stream: &mut TcpStream, body_limit: usize) -> Result<HttpR
     };
     let mut content_length = None;
     let mut last_event_id = None;
+    let mut bearer = None;
+    let mut authorization_seen = false;
+    let mut content_type_seen = false;
+    let mut json_content = false;
     for (index, line) in lines.enumerate() {
         if index >= MAX_HEADER_LINES || line.len() > MAX_HEADER_LINE_BYTES {
             return Err(HttpError::PayloadTooLarge);
         }
         let (name, value) = line.split_once(':').ok_or(HttpError::BadRequest)?;
         let value = value.trim();
+        if name.eq_ignore_ascii_case("authorization") {
+            if authorization_seen {
+                return Err(HttpError::BadRequest);
+            }
+            authorization_seen = true;
+            let token = value
+                .strip_prefix("Bearer ")
+                .filter(|v| !v.is_empty() && v.len() <= 256)
+                .ok_or(HttpError::BadRequest)?;
+            bearer = Some(venue_control_protocol::accounts::SecretValue::new(
+                token.to_owned(),
+            ));
+        }
+        if name.eq_ignore_ascii_case("content-type") {
+            if content_type_seen {
+                return Err(HttpError::BadRequest);
+            }
+            content_type_seen = true;
+            json_content = value
+                .split(';')
+                .next()
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"));
+        }
         if name.eq_ignore_ascii_case("content-length")
             && content_length
                 .replace(value.parse::<usize>().map_err(|_| HttpError::BadRequest)?)
@@ -426,7 +529,7 @@ async fn read_request(stream: &mut TcpStream, body_limit: usize) -> Result<HttpR
     if content_length > body_limit || (method == Method::Get && content_length != 0) {
         return Err(HttpError::PayloadTooLarge);
     }
-    let mut body = bytes[header_end..].to_vec();
+    let mut body = zeroize::Zeroizing::new(bytes[header_end..].to_vec());
     if body.len() > content_length {
         return Err(HttpError::BadRequest);
     }
@@ -447,6 +550,8 @@ async fn read_request(stream: &mut TcpStream, body_limit: usize) -> Result<HttpR
         target,
         last_event_id,
         body,
+        bearer,
+        json_content,
     })
 }
 
@@ -546,7 +651,7 @@ async fn write_response(
     body: &[u8],
 ) -> Result<(), std::io::Error> {
     let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: {connection}\r\n\r\n",
         body.len()
     );
     stream.write_all(header.as_bytes()).await?;

@@ -55,6 +55,7 @@ pub struct ControlHttpClient {
     ack_url: Url,
     receipt_url: Url,
     max_response_bytes: usize,
+    node_token: Option<venue_control_protocol::accounts::SecretValue>,
 }
 
 impl ControlHttpClient {
@@ -85,6 +86,9 @@ impl ControlHttpClient {
             ack_url,
             receipt_url,
             max_response_bytes: config.max_response_bytes,
+            node_token: std::env::var("VENUE_CONTROL_NODE_TOKEN")
+                .ok()
+                .map(venue_control_protocol::accounts::SecretValue::new),
         })
     }
 
@@ -141,20 +145,21 @@ impl ControlHttpClient {
         if body.is_empty() || body.len() > MAX_CONTROL_HTTP_REQUEST_BYTES {
             return Err(ControlHttpClientError::RequestTooLarge);
         }
-        let mut response = self
+        let mut request = self
             .client
             .post(url.clone())
             .header(CONTENT_TYPE, "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(|error| {
-                if error.is_timeout() {
-                    ControlHttpClientError::Timeout
-                } else {
-                    ControlHttpClientError::Transport
-                }
-            })?;
+            .body(body);
+        if let Some(token) = &self.node_token {
+            request = request.bearer_auth(token.expose());
+        }
+        let mut response = request.send().await.map_err(|error| {
+            if error.is_timeout() {
+                ControlHttpClientError::Timeout
+            } else {
+                ControlHttpClientError::Transport
+            }
+        })?;
         if response.status() != StatusCode::OK {
             return Err(match response.status() {
                 StatusCode::CONFLICT => ControlHttpClientError::ResponseConflict,

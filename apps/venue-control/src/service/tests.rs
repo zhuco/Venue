@@ -403,6 +403,7 @@ fn command(action: ControlAction) -> Result<ControlCommandRequest, Box<dyn std::
         instance_id: "grid-btc".to_owned(),
         symbol: "BTC/USDT".parse()?,
         action,
+        trade: None,
         expected_config_epoch: 7,
         confirmation: None,
     })

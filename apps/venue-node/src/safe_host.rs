@@ -928,6 +928,7 @@ impl<G: PhysicalGateway> NodeSafetyHost<G> {
         self.lifecycle = match action {
             ControlAction::Pause => HostLifecycle::Paused,
             ControlAction::Resume => HostLifecycle::Active,
+            ControlAction::Trade => HostLifecycle::Active,
             ControlAction::Stop | ControlAction::Flatten => HostLifecycle::Stopping {
                 request_id,
                 action,

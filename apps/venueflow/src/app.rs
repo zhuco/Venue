@@ -16,7 +16,7 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 const STORAGE_KEY: &str = "venueflow-state-v1";
-const PERSISTED_SCHEMA_VERSION: u16 = 4;
+const PERSISTED_SCHEMA_VERSION: u16 = 5;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -40,10 +40,14 @@ pub struct VenueFlowApp {
     model: AppModel,
     workspaces: Workspaces,
     client: ControlClient,
+    account_center: crate::account_center::AccountCenter,
+    connected_endpoint: String,
     #[cfg(not(target_arch = "wasm32"))]
     market_client: Option<LocalMarketClient>,
     show_modules: bool,
     show_settings: bool,
+    show_trading_settings: bool,
+    show_execution_account: bool,
     settings_state: SettingsPanelState,
     show_symbol_picker: bool,
     reconnect: bool,
@@ -71,6 +75,8 @@ impl VenueFlowApp {
             }
         };
         Self {
+            connected_endpoint: model.preferences.endpoint.clone(),
+            account_center: crate::account_center::AccountCenter::default(),
             model,
             workspaces: persisted.workspaces,
             client,
@@ -78,6 +84,8 @@ impl VenueFlowApp {
             market_client,
             show_modules: false,
             show_settings: false,
+            show_trading_settings: false,
+            show_execution_account: false,
             settings_state: SettingsPanelState::default(),
             show_symbol_picker: false,
             reconnect: false,
@@ -170,6 +178,11 @@ impl VenueFlowApp {
                 ClientEvent::SnapshotConnected => {
                     self.model.snapshot_connected();
                 }
+                ClientEvent::SessionExpired => {
+                    self.account_center.clear(&mut self.model);
+                    self.reconnect = true;
+                    break;
+                }
                 ClientEvent::SnapshotUnavailable(message) => {
                     self.model.snapshot_unavailable(message);
                 }
@@ -203,20 +216,37 @@ impl VenueFlowApp {
             return;
         }
         self.reconnect = false;
+        if self.connected_endpoint != self.model.preferences.endpoint {
+            self.account_center.clear(&mut self.model);
+            self.connected_endpoint = self.model.preferences.endpoint.clone();
+        }
         self.model.reconnecting();
-        self.client =
-            ControlClient::connect(self.model.preferences.endpoint.clone(), context.clone());
+        self.client = ControlClient::connect_authenticated(
+            self.model.preferences.endpoint.clone(),
+            context.clone(),
+            self.account_center
+                .session
+                .as_ref()
+                .map(|s| s.token.clone()),
+        );
         self.model.notice("Reconnecting to the Control API");
     }
 }
 
 impl eframe::App for VenueFlowApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.connected_endpoint != self.model.preferences.endpoint {
+            self.reconnect = true;
+            self.reconnect_if_requested(context);
+        }
         let zoom = self.model.preferences.ui_scale.clamp(0.85, 1.35);
         if (context.zoom_factor() - zoom).abs() > 0.001 {
             context.set_zoom_factor(zoom);
         }
         self.drain_client();
+        if self.account_center.poll(&mut self.model, context) {
+            self.reconnect = true;
+        }
         self.reconnect_if_requested(context);
         if std::mem::take(&mut self.model.follow_latest_requested) {
             self.workspaces.follow_dynamic_charts_latest();
@@ -226,34 +256,62 @@ impl eframe::App for VenueFlowApp {
             self.synchronize_local_markets();
             self.drain_local_markets(context);
         }
-        context.request_repaint_after(Duration::from_millis(if cfg!(target_arch = "wasm32") {
-            500
-        } else {
-            250
-        }));
+        let display = &self.model.preferences.trading;
+        context.request_repaint_after(Duration::from_millis(
+            display
+                .book_cadence
+                .millis()
+                .min(display.tape_cadence.millis())
+                .min(display.chart_cadence.millis())
+                .min(250),
+        ));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui.painter()
             .rect_filled(ui.max_rect(), 0.0, theme::BG_PRIMARY);
         ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+        self.model.synchronize_trading_scope();
+        let accepts_trading_input = self.workspaces.active == crate::model::WorkspaceKind::Trading
+            && !ui.ctx().egui_wants_keyboard_input()
+            && !self.show_modules
+            && !self.show_settings
+            && !self.show_trading_settings
+            && !self.show_execution_account
+            && !self.show_symbol_picker
+            && self.model.pending_confirmation.is_none();
+        if accepts_trading_input {
+            let actions = ui.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .filter_map(|event| {
+                        crate::trading::hotkey_action(event, &self.model.preferences.trading)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            for action in actions {
+                crate::trade_dock::apply_action(&mut self.model, &self.client, action);
+            }
+        }
         ui::show_top_bar(
             ui,
             &mut self.model,
             &mut self.workspaces,
             &mut self.show_modules,
-            &mut self.show_settings,
+            &mut self.show_trading_settings,
+            &mut self.show_execution_account,
             &mut self.show_symbol_picker,
         );
 
         let status_height = if self.model.preferences.show_status_bar {
-            28.0
+            54.0
         } else {
             0.0
         };
         let available = egui::vec2(
             ui.available_width(),
-            (ui.available_height() - status_height).max(240.0),
+            (ui.available_height() - status_height).max(0.0),
         );
         ui.allocate_ui(available, |ui| {
             let tree = self.workspaces.active_tree_mut();
@@ -267,6 +325,9 @@ impl eframe::App for VenueFlowApp {
             self.show_settings = true;
             self.settings_state.focus_indicators();
         }
+        if std::mem::take(&mut self.model.trading_settings_requested) {
+            self.show_trading_settings = true;
+        }
         if self.model.preferences.show_status_bar {
             ui::show_status_bar(ui, &self.model);
         }
@@ -279,6 +340,16 @@ impl eframe::App for VenueFlowApp {
             &mut self.settings_state,
             &mut self.model,
             &mut self.reconnect,
+        );
+        // Drop the old session before account UI in this same frame can send to
+        // the destination just edited in settings.
+        self.reconnect_if_requested(&context);
+        crate::trading::show_settings(&context, &mut self.show_trading_settings, &mut self.model);
+        crate::account_center::show(
+            &context,
+            &mut self.show_execution_account,
+            &mut self.account_center,
+            &mut self.model,
         );
         ui::show_modules(
             &context,
@@ -327,7 +398,7 @@ fn load(storage: Option<&dyn eframe::Storage>) -> PersistedState {
     };
     match serde_json::from_str::<PersistedState>(&encoded) {
         Ok(state) if state.schema_version == PERSISTED_SCHEMA_VERSION => state,
-        Ok(state) if matches!(state.schema_version, 2 | 3) => PersistedState {
+        Ok(state) if matches!(state.schema_version, 2..=4) => PersistedState {
             schema_version: PERSISTED_SCHEMA_VERSION,
             preferences: state.preferences,
             workspaces: Workspaces::default(),

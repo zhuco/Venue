@@ -1,9 +1,12 @@
-//! Versioned, secret-free DTOs shared by Venue control services and UI clients.
+//! Versioned DTOs shared by Venue control services and UI clients. Trading projections
+//! are secret-free; `accounts` alone carries redacted, transient authentication inputs.
 //!
 //! These types are query projections and semantic control requests. They never grant physical
 //! mutation authority; an account node must independently validate every accepted request.
 
 use std::collections::BTreeSet;
+
+pub mod accounts;
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -891,6 +894,7 @@ pub enum ControlAction {
     Resume,
     Stop,
     Flatten,
+    Trade,
 }
 
 impl ControlAction {
@@ -901,6 +905,7 @@ impl ControlAction {
             Self::Resume => "RESUME",
             Self::Stop => "STOP",
             Self::Flatten => "FLATTEN",
+            Self::Trade => "TRADE",
         }
     }
 
@@ -921,6 +926,8 @@ pub struct ControlCommandRequest {
     pub instance_id: String,
     pub symbol: Symbol,
     pub action: ControlAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trade: Option<TradeIntent>,
     pub expected_config_epoch: u64,
     pub confirmation: Option<String>,
 }
@@ -956,6 +963,18 @@ impl ControlCommandRequest {
         }
         if self.expected_config_epoch == 0 {
             return Err(ProtocolError::ConfigEpoch);
+        }
+        match (self.action, self.trade.as_ref()) {
+            (ControlAction::Trade, Some(trade)) => {
+                trade.validate()?;
+                if trade.quote_asset != self.symbol.quote() {
+                    return Err(ProtocolError::TradeIntent);
+                }
+            }
+            (ControlAction::Trade, None) | (_, Some(_)) => {
+                return Err(ProtocolError::TradeIntent);
+            }
+            (_, None) => {}
         }
         if self.action.requires_confirmation()
             && self.confirmation.as_deref() != Some(self.expected_confirmation().as_str())
@@ -1011,6 +1030,133 @@ pub enum ControlEvent {
     Snapshot(ControlSnapshot),
     CommandReceipt(CommandReceipt),
     Notice { observed_ms: u64, message: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TradingAction {
+    OpenLong,
+    CloseLong,
+    CloseShort,
+    OpenShort,
+    CancelSelectedOrder,
+    CancelAllOrders,
+    SelectSizePreset(usize),
+    ClearSelection,
+    CenterMarket,
+}
+
+impl TradingAction {
+    #[must_use]
+    pub const fn is_order_action(self) -> bool {
+        matches!(
+            self,
+            Self::OpenLong | Self::CloseLong | Self::CloseShort | Self::OpenShort
+        )
+    }
+
+    #[must_use]
+    pub const fn is_close_action(self) -> bool {
+        matches!(self, Self::CloseLong | Self::CloseShort)
+    }
+
+    #[must_use]
+    pub const fn is_ui_only(self) -> bool {
+        matches!(
+            self,
+            Self::SelectSizePreset(_) | Self::ClearSelection | Self::CenterMarket
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TradingOrderType {
+    Limit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TradingTimeInForce {
+    Gtc,
+}
+
+/// Secret-free semantic manual-trading request. The account Node must re-read positions and
+/// working orders, normalize quantity through its exchange adapter, run risk, and append the
+/// resulting command to the account WAL before any mutation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TradeIntent {
+    pub action: TradingAction,
+    pub quote_asset: String,
+    pub order_type: TradingOrderType,
+    pub time_in_force: TradingTimeInForce,
+    pub post_only: bool,
+    pub reduce_only: bool,
+    pub selected_price: Option<Decimal>,
+    pub quote_notional: Option<Decimal>,
+    /// UI-observed upper bound for a close. It never replaces the Node's signed position clamp.
+    pub close_quantity_cap: Option<Decimal>,
+    /// Optional explicit selection. `None` means the Node must select the most recent Working
+    /// order within the enclosing account + symbol scope.
+    pub selected_order_id: Option<String>,
+}
+
+impl TradeIntent {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.action.is_ui_only()
+            || self.quote_asset.trim().is_empty()
+            || self.order_type != TradingOrderType::Limit
+            || self.time_in_force != TradingTimeInForce::Gtc
+            || self.reduce_only != self.action.is_close_action()
+        {
+            return Err(ProtocolError::TradeIntent);
+        }
+        if self.action.is_order_action() {
+            if self.selected_price.is_none_or(|value| !positive(value))
+                || self.quote_notional.is_none_or(|value| !positive(value))
+                || self.selected_order_id.is_some()
+            {
+                return Err(ProtocolError::TradeIntent);
+            }
+            if self.action.is_close_action() {
+                if self.close_quantity_cap.is_none_or(|value| !positive(value)) {
+                    return Err(ProtocolError::TradeIntent);
+                }
+            } else if self.close_quantity_cap.is_some() {
+                return Err(ProtocolError::TradeIntent);
+            }
+            return Ok(());
+        }
+        if self.selected_price.is_some()
+            || self.quote_notional.is_some()
+            || self.close_quantity_cap.is_some()
+        {
+            return Err(ProtocolError::TradeIntent);
+        }
+        match self.action {
+            TradingAction::CancelSelectedOrder => {
+                if self
+                    .selected_order_id
+                    .as_deref()
+                    .is_some_and(|value| value.trim().is_empty())
+                {
+                    return Err(ProtocolError::TradeIntent);
+                }
+            }
+            TradingAction::CancelAllOrders => {
+                if self.selected_order_id.is_some() {
+                    return Err(ProtocolError::TradeIntent);
+                }
+            }
+            _ => return Err(ProtocolError::TradeIntent),
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn reduce_only(&self) -> bool {
+        self.reduce_only
+    }
 }
 
 /// Separate from UI control events so legacy Control consumers never need to decode market
@@ -1075,6 +1221,8 @@ pub enum ProtocolError {
     ConfigEpoch,
     #[error("high-risk control confirmation does not match the exact scope")]
     Confirmation,
+    #[error("manual trading intent is malformed or contains a UI-only action")]
+    TradeIntent,
     #[error("control snapshot contains a duplicate identity")]
     DuplicateIdentity,
     #[error("control snapshot contains an invalid time or generation")]
@@ -1129,6 +1277,7 @@ mod tests {
             instance_id: "grid-btc".to_owned(),
             symbol: "BTC/USDT".parse()?,
             action,
+            trade: None,
             expected_config_epoch: 7,
             confirmation: None,
         })
@@ -1468,6 +1617,52 @@ mod tests {
         let mut invalid = original;
         invalid.copy_relations[0].follower_instance_id = "missing".to_owned();
         assert_eq!(invalid.validate(), Err(ProtocolError::SnapshotContent));
+        Ok(())
+    }
+
+    #[test]
+    fn manual_close_is_reduce_only_and_requires_a_positive_position_cap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = request(ControlAction::Trade)?;
+        command.trade = Some(TradeIntent {
+            action: TradingAction::CloseLong,
+            quote_asset: "USDT".to_owned(),
+            order_type: TradingOrderType::Limit,
+            time_in_force: TradingTimeInForce::Gtc,
+            post_only: false,
+            reduce_only: true,
+            selected_price: Some(Decimal::new(67_4285, 1)),
+            quote_notional: Some(Decimal::new(100, 0)),
+            close_quantity_cap: Some(Decimal::new(148, 5)),
+            selected_order_id: None,
+        });
+        command.validate()?;
+        assert!(command.trade.as_ref().is_some_and(TradeIntent::reduce_only));
+        let mut invalid = command;
+        if let Some(trade) = invalid.trade.as_mut() {
+            trade.close_quantity_cap = None;
+        }
+        assert_eq!(invalid.validate(), Err(ProtocolError::TradeIntent));
+        Ok(())
+    }
+
+    #[test]
+    fn ui_only_trading_actions_never_cross_the_control_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = request(ControlAction::Trade)?;
+        command.trade = Some(TradeIntent {
+            action: TradingAction::CenterMarket,
+            quote_asset: "USDT".to_owned(),
+            order_type: TradingOrderType::Limit,
+            time_in_force: TradingTimeInForce::Gtc,
+            post_only: false,
+            reduce_only: false,
+            selected_price: None,
+            quote_notional: None,
+            close_quantity_cap: None,
+            selected_order_id: None,
+        });
+        assert_eq!(command.validate(), Err(ProtocolError::TradeIntent));
         Ok(())
     }
 

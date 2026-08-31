@@ -4,7 +4,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use venue_control_protocol::{
     CONTROL_SCHEMA_VERSION, CommandReceipt, CommandState, ConnectionState, ControlAction,
-    ControlCommandRequest, ControlSnapshot, StrategySummary,
+    ControlCommandRequest, ControlSnapshot, StrategySummary, TradeIntent,
 };
 
 use crate::i18n::{Language, TextKey, text};
@@ -13,6 +13,24 @@ const MAX_NOTICES: usize = 8;
 const MAX_RECEIPT_IDS: usize = 256;
 const MAX_COMMANDS: usize = 32;
 pub const DEFAULT_FAVORITE_SYMBOLS: [&str; 4] = ["BTC/USDC", "ETH/USDC", "SOL/USDC", "BNB/USDC"];
+
+/// Public market providers are selected at the UI boundary. Binance is the only provider
+/// currently wired to the native market worker; adding another value requires a real adapter.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum MarketServer {
+    #[default]
+    Binance,
+}
+
+impl MarketServer {
+    pub const ALL: [Self; 1] = [Self::Binance];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Binance => "Binance",
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarketQuote {
@@ -64,26 +82,34 @@ impl WorkspaceKind {
 #[serde(default)]
 pub struct Preferences {
     pub endpoint: String,
+    #[serde(default)]
+    pub market_server: MarketServer,
     pub selected_symbol: String,
+    #[serde(default)]
+    pub execution_account_id: Option<String>,
     pub selected_instance: Option<String>,
     pub ui_scale: f32,
     pub show_status_bar: bool,
     pub language: Language,
     pub favorite_symbols: Vec<String>,
     pub chart: crate::chart_settings::ChartDisplaySettings,
+    pub trading: crate::trading::TradingSettings,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             endpoint: String::new(),
+            market_server: MarketServer::Binance,
             selected_symbol: "BTC/USDC".to_owned(),
+            execution_account_id: None,
             selected_instance: None,
             ui_scale: 1.0,
             show_status_bar: true,
             language: default_language(),
             favorite_symbols: DEFAULT_FAVORITE_SYMBOLS.map(str::to_owned).to_vec(),
             chart: crate::chart_settings::ChartDisplaySettings::default(),
+            trading: crate::trading::TradingSettings::default(),
         }
     }
 }
@@ -131,6 +157,8 @@ pub struct CommandProgress {
 
 #[derive(Debug)]
 pub struct AppModel {
+    pub account_overview: Option<venue_control_protocol::accounts::AccountOverview>,
+    pub account_selection_requested: Option<String>,
     pub preferences: Preferences,
     /// Connectivity of this secret-free Control API client, not the account runtime projection.
     pub connection: ConnectionState,
@@ -161,11 +189,16 @@ pub struct AppModel {
     pub symbol_group: SymbolGroup,
     pub follow_latest_requested: bool,
     pub indicator_settings_requested: bool,
+    pub trading_settings_requested: bool,
+    pub trade_dock: crate::trading::TradeDockState,
     request_sequence: u64,
 }
 
 impl AppModel {
     pub fn new(mut preferences: Preferences) -> Self {
+        // Persisted UI selection is not a restored authenticated session.
+        preferences.execution_account_id = None;
+        preferences.selected_instance = None;
         if preferences.chart.validate().is_err() {
             preferences.chart = crate::chart_settings::ChartDisplaySettings::default();
         }
@@ -179,6 +212,8 @@ impl AppModel {
         };
         Self {
             preferences,
+            account_overview: None,
+            account_selection_requested: None,
             connection: ConnectionState::Connecting,
             control_connection: None,
             snapshot_online: false,
@@ -206,6 +241,8 @@ impl AppModel {
             symbol_group: SymbolGroup::All,
             follow_latest_requested: false,
             indicator_settings_requested: false,
+            trading_settings_requested: false,
+            trade_dock: crate::trading::TradeDockState::default(),
             request_sequence: 0,
         }
     }
@@ -281,6 +318,7 @@ impl AppModel {
             self.preferences.selected_symbol = first.symbol.to_string();
         }
         self.snapshot = Some(snapshot);
+        self.synchronize_trading_scope();
     }
 
     pub fn snapshot_connected(&mut self) {
@@ -399,9 +437,114 @@ impl AppModel {
             instance_id: strategy.instance_id.clone(),
             symbol: strategy.symbol.clone(),
             action,
+            trade: None,
             expected_config_epoch: strategy.config_epoch,
             confirmation: None,
         }
+    }
+
+    pub fn begin_trade_command(
+        &mut self,
+        strategy: &StrategySummary,
+        trade: TradeIntent,
+        now_ms: u64,
+    ) -> ControlCommandRequest {
+        let mut request = self.begin_command(strategy, ControlAction::Trade, now_ms);
+        request.trade = Some(trade);
+        request
+    }
+
+    #[must_use]
+    pub fn selected_trading_strategy(&self) -> Option<StrategySummary> {
+        let account_id = self.preferences.execution_account_id.as_deref()?;
+        let overview = self.account_overview.as_ref()?;
+        let selected = overview.selected_credential_id.as_deref()?;
+        if !overview.credentials.iter().any(|c| {
+            c.credential_id == selected
+                && c.trading_account_id.as_deref() == Some(account_id)
+                && c.selectable(crate::account_center::now_ms())
+        }) {
+            return None;
+        }
+        let snapshot = self.snapshot.as_ref()?;
+        let selected_symbol = self.preferences.selected_symbol.as_str();
+        self.preferences
+            .selected_instance
+            .as_deref()
+            .and_then(|id| {
+                snapshot
+                    .strategies
+                    .iter()
+                    .find(|strategy| strategy.instance_id == id)
+            })
+            .filter(|strategy| {
+                strategy.symbol.to_string() == selected_symbol
+                    && strategy.trading_account_id == account_id
+            })
+            .or_else(|| {
+                snapshot.strategies.iter().find(|strategy| {
+                    strategy.symbol.to_string() == selected_symbol
+                        && strategy.trading_account_id == account_id
+                })
+            })
+            .cloned()
+    }
+
+    pub fn synchronize_trading_scope(&mut self) {
+        let scope = self
+            .selected_trading_strategy()
+            .map(|strategy| crate::trading::TradingScope {
+                venue: strategy.venue.to_string(),
+                trading_account_id: strategy.trading_account_id,
+                symbol: strategy.symbol.to_string(),
+            });
+        self.trade_dock.observe_scope(scope);
+    }
+
+    pub fn select_trading_price(&mut self, symbol: &str, price: Decimal) {
+        if symbol != self.preferences.selected_symbol {
+            return;
+        }
+        if let Err(error) = self.trade_dock.select_price(price) {
+            self.notice(error.to_string());
+        }
+    }
+
+    pub fn clear_account_session(&mut self) {
+        self.account_selection_requested = None;
+        self.account_overview = None;
+        self.preferences.execution_account_id = None;
+        self.preferences.selected_instance = None;
+        self.pending_confirmation = None;
+        self.last_receipt = None;
+        self.commands.clear();
+        self.receipt_ids.clear();
+        self.notices.clear();
+        if let Some(snapshot) = &mut self.snapshot {
+            snapshot.accounts.clear();
+            snapshot.strategies.clear();
+            snapshot.copy_relations.clear();
+            snapshot.ledger.clear();
+        }
+        self.synchronize_trading_scope();
+    }
+
+    pub fn apply_account_overview(
+        &mut self,
+        overview: venue_control_protocol::accounts::AccountOverview,
+    ) {
+        let selected = overview
+            .selected_credential_id
+            .as_deref()
+            .and_then(|id| overview.credentials.iter().find(|c| c.credential_id == id))
+            .and_then(|c| c.trading_account_id.clone());
+        if self.preferences.execution_account_id != selected {
+            self.preferences.selected_instance = None;
+            self.pending_confirmation = None;
+        }
+        self.preferences.execution_account_id = selected;
+        self.account_overview = Some(overview);
+        self.synchronize_trading_scope();
     }
 
     pub fn notice(&mut self, message: impl Into<String>) {
@@ -636,6 +779,7 @@ mod tests {
             instance_id: "grid-btc".to_owned(),
             symbol: "BTC/USDT".parse()?,
             action: ControlAction::Pause,
+            trade: None,
             expected_config_epoch: 1,
             confirmation: None,
         });

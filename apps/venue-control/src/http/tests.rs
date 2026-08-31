@@ -782,11 +782,13 @@ async fn start(
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let (stop, shutdown) = control_shutdown_channel();
-    let task = tokio::spawn(serve_local(
+    let task = tokio::spawn(serve_inner(
         listener,
         Arc::new(ControlService::new(repository)),
+        Arc::new(IndicatorProjectionStore::default()),
         config,
         shutdown,
+        AccessMode::TransportFixture,
     ));
     Ok((address, stop, task))
 }
@@ -806,12 +808,13 @@ async fn start_with_indicators(
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let (stop, shutdown) = control_shutdown_channel();
-    let task = tokio::spawn(serve_local_with_indicators(
+    let task = tokio::spawn(serve_inner(
         listener,
         Arc::new(ControlService::new(repository)),
         indicators,
         config,
         shutdown,
+        AccessMode::TransportFixture,
     ));
     Ok((address, stop, task))
 }
@@ -926,7 +929,9 @@ fn has_scope(snapshot: Option<&ControlSnapshot>, command: &ControlCommandRequest
     })
 }
 
-fn command(action: ControlAction) -> Result<ControlCommandRequest, Box<dyn std::error::Error>> {
+pub(super) fn command(
+    action: ControlAction,
+) -> Result<ControlCommandRequest, Box<dyn std::error::Error>> {
     Ok(ControlCommandRequest {
         schema_version: CONTROL_SCHEMA_VERSION,
         request_id: "request-1".to_owned(),
@@ -936,12 +941,13 @@ fn command(action: ControlAction) -> Result<ControlCommandRequest, Box<dyn std::
         instance_id: "grid-btc".to_owned(),
         symbol: "BTC/USDT".parse()?,
         action,
+        trade: None,
         expected_config_epoch: 7,
         confirmation: None,
     })
 }
 
-fn snapshot() -> Result<ControlSnapshot, Box<dyn std::error::Error>> {
+pub(super) fn snapshot() -> Result<ControlSnapshot, Box<dyn std::error::Error>> {
     Ok(ControlSnapshot {
         schema_version: CONTROL_SCHEMA_VERSION,
         generated_ms: 100,

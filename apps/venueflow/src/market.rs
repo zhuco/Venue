@@ -201,6 +201,10 @@ impl LocalMarketReducer {
             return Err(LocalMarketError::EventFromFuture);
         }
 
+        let exchange_event = !matches!(
+            &envelope.payload,
+            MarketPayload::RestHistory { .. } | MarketPayload::Status { .. }
+        );
         match envelope.payload {
             MarketPayload::RestHistory { bars } => self.apply_history(bars)?,
             MarketPayload::WsBar {
@@ -219,7 +223,9 @@ impl LocalMarketReducer {
 
         self.view.last_event_ms = Some(envelope.event_time_ms);
         self.view.last_received_ms = Some(envelope.received_ms);
-        self.view.latency_ms = Some(envelope.received_ms - envelope.event_time_ms);
+        if exchange_event {
+            self.view.latency_ms = Some(envelope.received_ms - envelope.event_time_ms);
+        }
         Ok(ReduceOutcome::Applied)
     }
 
@@ -584,18 +590,61 @@ fn study_point(values: ChartStudyValues) -> ChartStudyPoint {
     let (macd, macd_signal, macd_histogram) = values.macd.map_or((None, None, None), |value| {
         (Some(value.macd), Some(value.signal), Some(value.histogram))
     });
+    let common = values.common;
+    let (sar, sar_rising) = common
+        .sar
+        .map_or((None, false), |value| (Some(value.value), value.rising));
+    let (supertrend, supertrend_rising) = common
+        .supertrend
+        .map_or((None, false), |value| (Some(value.value), value.rising));
+    let (kdj_k, kdj_d, kdj_j) = common.kdj.map_or((None, None, None), |value| {
+        (Some(value.k), Some(value.d), Some(value.j))
+    });
+    let (stoch_rsi_k, stoch_rsi_d) = common.stoch_rsi.map_or((None, None), |value| {
+        (Some(value.first), Some(value.second))
+    });
+    let (dmi_plus, dmi_minus, dmi_adx) = common.dmi.map_or((None, None, None), |value| {
+        (Some(value.plus_di), Some(value.minus_di), Some(value.adx))
+    });
     ChartStudyPoint {
         sma: values.sma,
+        sma_second: common.sma_extra.second,
+        sma_third: common.sma_extra.third,
         ema: values.ema,
+        ema_second: common.ema_extra.second,
+        ema_third: common.ema_extra.third,
+        wma: common.wma.first,
+        wma_second: common.wma.second,
+        wma_third: common.wma.third,
         bollinger_upper,
         bollinger_middle,
         bollinger_lower,
         vwap: values.vwap,
+        avl: common.avl,
+        trix: common.trix,
+        sar,
+        sar_rising,
+        supertrend,
+        supertrend_rising,
         rsi: values.rsi,
         macd,
         macd_signal,
         macd_histogram,
         atr: values.atr,
+        mfi: common.mfi,
+        kdj_k,
+        kdj_d,
+        kdj_j,
+        obv: common.obv,
+        cci: common.cci,
+        stoch_rsi_k,
+        stoch_rsi_d,
+        williams_r: common.williams_r,
+        dmi_plus,
+        dmi_minus,
+        dmi_adx,
+        momentum: common.momentum,
+        emv: common.emv,
         ..ChartStudyPoint::default()
     }
 }
@@ -957,8 +1006,26 @@ mod tests {
             },
         );
         reducer.apply(live)?;
+        assert_eq!(reducer.view().latency_ms, None);
+        reducer.apply(envelope(
+            &reducer,
+            1_001,
+            MarketPayload::Bbo {
+                bid: Decimal::ONE,
+                ask: Decimal::new(2, 0),
+            },
+        ))?;
         assert_eq!(reducer.view().latency_ms, Some(7));
-        reducer.refresh_staleness(6_008, 5_000);
+        reducer.apply(envelope(
+            &reducer,
+            1_002,
+            MarketPayload::Status {
+                status: MarketStatus::Live,
+                detail: None,
+            },
+        ))?;
+        assert_eq!(reducer.view().latency_ms, Some(7));
+        reducer.refresh_staleness(6_010, 5_000);
         assert_eq!(reducer.view().status, MarketStatus::Stale);
         assert_eq!(
             reducer.view().status_detail.as_deref(),

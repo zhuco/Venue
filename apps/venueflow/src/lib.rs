@@ -1,6 +1,9 @@
+mod account_center;
+mod account_client;
 mod app;
 mod chart;
 mod chart_settings;
+mod chart_view;
 mod client;
 mod i18n;
 #[cfg(not(target_arch = "wasm32"))]
@@ -10,7 +13,10 @@ mod market_client;
 mod model;
 mod order_book_view;
 mod settings_panel;
+mod symbol_picker;
 mod theme;
+mod trade_dock;
+mod trading;
 mod ui;
 mod workspace;
 
@@ -20,7 +26,8 @@ pub use app::VenueFlowApp;
 use wasm_bindgen::{JsCast as _, prelude::*};
 
 /// Starts the same VenueFlow application in an HTML canvas. The Web build is a control-plane
-/// client only and has no exchange, credential, database, or artifact access.
+/// client only. Credential entry is transient account administration transport;
+/// this client has no private exchange connection, database, or artifact access.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(start)]
 pub async fn start_web() -> Result<(), JsValue> {

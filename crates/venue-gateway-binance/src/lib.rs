@@ -1,5 +1,6 @@
 mod binding;
 mod config;
+mod credential_probe;
 mod credentials;
 mod execution;
 mod instrument;
@@ -16,6 +17,7 @@ use venue_gateway_api::CapabilityFlags;
 
 pub use binding::{BinanceAccountBinding, BinanceBindingError, native_symbol};
 pub use config::{BinanceConfig, endpoints};
+pub use credential_probe::{BinanceCredentialProbe, BinanceProbeError, probe_credentials};
 pub use credentials::BinanceCredentials;
 pub use execution::*;
 pub use instrument::{

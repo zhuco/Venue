@@ -1,5 +1,6 @@
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui;
+use venue_control_protocol::accounts::SecretValue;
 use venue_control_protocol::{
     COMMAND_PATH, CommandReceipt, ControlCommandRequest, ControlEvent, ControlSnapshot,
     EVENT_STREAM_PATH, SNAPSHOT_PATH,
@@ -9,13 +10,12 @@ use venue_control_protocol::{
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const RECONNECT_INITIAL: std::time::Duration = std::time::Duration::from_millis(250);
 const RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(5);
-#[cfg(not(target_arch = "wasm32"))]
 const MAX_SSE_BUFFER_BYTES: usize = 2 * 1_024 * 1_024;
-#[cfg(not(target_arch = "wasm32"))]
 const MAX_SSE_FRAME_BYTES: usize = 1_024 * 1_024;
 
 #[derive(Clone, Debug)]
 pub enum ClientEvent {
+    SessionExpired,
     SnapshotConnected,
     SnapshotUnavailable(String),
     StreamConnected { resumed_after: Option<i64> },
@@ -38,18 +38,26 @@ pub struct ControlClient {
 
 impl ControlClient {
     pub fn connect(endpoint: String, context: egui::Context) -> Self {
+        Self::connect_authenticated(endpoint, context, None)
+    }
+
+    pub fn connect_authenticated(
+        endpoint: String,
+        context: egui::Context,
+        token: Option<SecretValue>,
+    ) -> Self {
         let (event_tx, events) = unbounded();
         let (command_tx, command_rx) = unbounded();
 
         #[cfg(not(target_arch = "wasm32"))]
         let stop = {
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            start_native(endpoint, event_tx, command_rx, context, stop.clone());
+            start_native(endpoint, event_tx, command_rx, context, stop.clone(), token);
             stop
         };
 
         #[cfg(target_arch = "wasm32")]
-        let web = WebClient::start(endpoint, event_tx, command_rx, context);
+        let web = WebClient::start(endpoint, event_tx, command_rx, context, token);
 
         Self {
             events,
@@ -136,6 +144,7 @@ fn start_native(
     commands: Receiver<ControlCommandRequest>,
     context: egui::Context,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    token: Option<SecretValue>,
 ) {
     let spawn = std::thread::Builder::new()
         .name("venueflow-control-client".to_owned())
@@ -157,7 +166,9 @@ fn start_native(
                     return;
                 }
             };
-            runtime.block_on(native_loop(endpoint, sender, commands, context, stop));
+            runtime.block_on(native_loop(
+                endpoint, sender, commands, context, stop, token,
+            ));
         });
     if let Err(error) = spawn {
         tracing::error!(%error, "failed to spawn VenueFlow control client");
@@ -171,9 +182,19 @@ async fn native_loop(
     commands: Receiver<ControlCommandRequest>,
     context: egui::Context,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    token: Option<SecretValue>,
 ) {
+    if token.is_some() && !crate::account_client::safe_endpoint(&endpoint) {
+        publish(&sender, &context, ClientEvent::SessionExpired);
+        return;
+    }
+    let Ok(headers) = crate::account_client::authorization_headers(token.as_ref()) else {
+        return;
+    };
     let client = match reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .default_headers(headers)
         .build()
     {
         Ok(client) => client,
@@ -293,6 +314,9 @@ async fn fetch_native_snapshot(
                     ClientEvent::SnapshotUnavailable(format!("invalid snapshot: {error}")),
                 ),
             }
+        }
+        Ok(response) if response.status().as_u16() == 401 => {
+            publish(sender, context, ClientEvent::SessionExpired)
         }
         Ok(response) => publish(
             sender,
@@ -484,7 +508,6 @@ impl std::fmt::Display for EventCursor {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Eq, PartialEq)]
 struct ParsedSseFrame {
     cursor: Option<EventCursor>,
@@ -516,13 +539,11 @@ impl ReconnectBackoff {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Default)]
 struct SseDecoder {
     buffer: Vec<u8>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl SseDecoder {
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<ParsedSseFrame>, String> {
         if self.buffer.len().saturating_add(chunk.len()) > MAX_SSE_BUFFER_BYTES {
@@ -543,7 +564,6 @@ impl SseDecoder {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn sse_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
     let lf = buffer.windows(2).position(|window| window == b"\n\n");
     let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
@@ -556,7 +576,6 @@ fn sse_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn parse_sse_frame(frame: &str) -> Result<ParsedSseFrame, String> {
     let mut cursor = None;
     let mut data = Vec::new();
@@ -588,21 +607,37 @@ impl WebClient {
         sender: Sender<ClientEvent>,
         commands: Receiver<ControlCommandRequest>,
         context: egui::Context,
+        token: Option<SecretValue>,
     ) -> Self {
         let stop = std::rc::Rc::new(std::cell::Cell::new(false));
-        spawn_web_events(
-            endpoint.clone(),
-            sender.clone(),
-            context.clone(),
-            stop.clone(),
-        );
+        if token.is_some() && !crate::account_client::safe_endpoint(&endpoint) {
+            publish(&sender, &context, ClientEvent::SessionExpired);
+            return Self { stop };
+        }
+        if let Some(token) = token.clone() {
+            spawn_web_authenticated_events(
+                endpoint.clone(),
+                sender.clone(),
+                context.clone(),
+                stop.clone(),
+                token,
+            );
+        } else {
+            spawn_web_events(
+                endpoint.clone(),
+                sender.clone(),
+                context.clone(),
+                stop.clone(),
+            );
+        }
         spawn_web_snapshot(
             endpoint.clone(),
             sender.clone(),
             context.clone(),
             stop.clone(),
+            token.clone(),
         );
-        spawn_web_commands(endpoint, sender, commands, context, stop.clone());
+        spawn_web_commands(endpoint, sender, commands, context, stop.clone(), token);
         Self { stop }
     }
 }
@@ -769,6 +804,95 @@ fn spawn_web_events(
 }
 
 #[cfg(target_arch = "wasm32")]
+fn spawn_web_authenticated_events(
+    endpoint: String,
+    sender: Sender<ClientEvent>,
+    context: egui::Context,
+    stop: std::rc::Rc<std::cell::Cell<bool>>,
+    token: SecretValue,
+) {
+    use futures_util::StreamExt;
+    wasm_bindgen_futures::spawn_local(async move {
+        let Ok(headers) = crate::account_client::authorization_headers(Some(&token)) else {
+            return;
+        };
+        let client = reqwest::Client::new();
+        let mut cursor = None;
+        let mut backoff = ReconnectBackoff::default();
+        while !stop.get() {
+            let response = client
+                .get(event_stream_url(&endpoint, cursor))
+                .headers(headers.clone())
+                .send()
+                .await;
+            if stop.get() {
+                return;
+            }
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    publish(
+                        &sender,
+                        &context,
+                        ClientEvent::StreamConnected {
+                            resumed_after: cursor.map(EventCursor::value),
+                        },
+                    );
+                    let mut stream = response.bytes_stream();
+                    let mut decoder = SseDecoder::default();
+                    'stream: while let Some(chunk) = stream.next().await {
+                        if stop.get() {
+                            return;
+                        }
+                        let Ok(chunk) = chunk else {
+                            break;
+                        };
+                        let Ok(frames) = decoder.push(&chunk) else {
+                            break;
+                        };
+                        for frame in frames {
+                            if let Some(next) = frame.cursor {
+                                if cursor.is_some_and(|previous| next < previous) {
+                                    break 'stream;
+                                }
+                                if cursor == Some(next) {
+                                    continue;
+                                }
+                            }
+                            if let Some(payload) = frame.payload {
+                                let Ok(event) = serde_json::from_str::<ControlEvent>(&payload)
+                                else {
+                                    break 'stream;
+                                };
+                                if event.validate().is_err() {
+                                    break 'stream;
+                                }
+                                publish_control_event(&sender, &context, event);
+                            }
+                            if let Some(next) = frame.cursor {
+                                cursor = Some(next);
+                                backoff.reset();
+                                publish(&sender, &context, ClientEvent::EventCursor(next.value()));
+                            }
+                        }
+                    }
+                }
+                Ok(response) if response.status().as_u16() == 401 => {
+                    publish(&sender, &context, ClientEvent::SessionExpired);
+                    return;
+                }
+                _ => (),
+            }
+            publish(
+                &sender,
+                &context,
+                ClientEvent::StreamUnavailable("authenticated event stream reconnecting".into()),
+            );
+            wasm_timer(duration_ms(backoff.next_delay())).await;
+        }
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
 fn duration_ms(duration: std::time::Duration) -> i32 {
     i32::try_from(duration.as_millis()).unwrap_or(i32::MAX)
 }
@@ -785,11 +909,16 @@ fn spawn_web_snapshot(
     sender: Sender<ClientEvent>,
     context: egui::Context,
     stop: std::rc::Rc<std::cell::Cell<bool>>,
+    token: Option<SecretValue>,
 ) {
     wasm_bindgen_futures::spawn_local(async move {
+        let Ok(headers) = crate::account_client::authorization_headers(token.as_ref()) else {
+            return;
+        };
         while !stop.get() {
             match reqwest::Client::new()
                 .get(path(&endpoint, SNAPSHOT_PATH))
+                .headers(headers.clone())
                 .send()
                 .await
             {
@@ -812,6 +941,10 @@ fn spawn_web_snapshot(
                             ClientEvent::SnapshotUnavailable(format!("invalid snapshot: {error}")),
                         ),
                     }
+                }
+                Ok(response) if response.status().as_u16() == 401 => {
+                    publish(&sender, &context, ClientEvent::SessionExpired);
+                    return;
                 }
                 Ok(response) => publish(
                     &sender,
@@ -839,12 +972,17 @@ fn spawn_web_commands(
     commands: Receiver<ControlCommandRequest>,
     context: egui::Context,
     stop: std::rc::Rc<std::cell::Cell<bool>>,
+    token: Option<SecretValue>,
 ) {
     wasm_bindgen_futures::spawn_local(async move {
+        let Ok(headers) = crate::account_client::authorization_headers(token.as_ref()) else {
+            return;
+        };
         while !stop.get() {
             for command in commands.try_iter().take(64) {
                 match reqwest::Client::new()
                     .post(path(&endpoint, COMMAND_PATH))
+                    .headers(headers.clone())
                     .json(&command)
                     .send()
                     .await

@@ -12,6 +12,7 @@ use crate::{
 
 pub const MIGRATION_0001: &str = include_str!("../migrations/0001_control_core.sql");
 pub const MIGRATION_0005: &str = include_str!("../migrations/0005_live_only.sql");
+pub const MIGRATION_0006: &str = include_str!("../migrations/0006_manual_trade_intent.sql");
 
 #[derive(Clone, Debug)]
 pub struct PgControlRepository {
@@ -497,4 +498,18 @@ const fn command_state(state: CommandState) -> &'static str {
 
 fn database_error(_: sqlx::Error) -> RepositoryError {
     RepositoryError::Database
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::MIGRATION_0006;
+
+    #[test]
+    fn manual_trade_migration_only_expands_the_command_action_constraint() {
+        assert!(MIGRATION_0006.contains("'TRADE'"));
+        assert!(MIGRATION_0006.contains("venue_control_command_action_v2"));
+        for forbidden in ["execution_writer", "risk_permit", "command_wal"] {
+            assert!(!MIGRATION_0006.contains(forbidden));
+        }
+    }
 }

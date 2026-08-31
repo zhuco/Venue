@@ -1,11 +1,13 @@
 //! Transport-neutral Venue control-plane core.
 //!
 //! The crate validates schema-v2 projections and semantic commands, then persists them through a
-//! repository boundary. It has no exchange adapter, credential, writer, WAL, or artifact access.
+//! repository boundary. Account administration encrypts credentials and uses read-only
+//! adapter verification; it has no trading writer, command WAL, or artifact access.
 
 mod account_delivery_postgres;
 mod account_delivery_repository;
 mod account_node_poll;
+pub mod accounts;
 mod copy_model;
 mod copy_postgres;
 mod copy_repository;
@@ -42,14 +44,14 @@ pub use copy_worker::{
 };
 pub use http::{
     ControlHttpConfig, HttpServerError, control_shutdown_channel, serve_local,
-    serve_local_with_indicators,
+    serve_local_with_accounts, serve_local_with_indicators,
 };
 pub use indicator_projection::{
     IndicatorProjectionError, IndicatorProjectionStore, IndicatorProjector,
     MAX_INDICATOR_EVENT_PAGE, StoredIndicatorEvent,
 };
 pub use model::{AccountNodeBinding, ClaimedCommand, ScopedCommandReceipt, StoredEvent};
-pub use postgres::{MIGRATION_0001, MIGRATION_0005, PgControlRepository};
+pub use postgres::{MIGRATION_0001, MIGRATION_0005, MIGRATION_0006, PgControlRepository};
 pub use repository::{
     CommandEnqueueResult, CommandSettleResult, ControlRepository, RepositoryError,
     SnapshotStoreResult,

@@ -5,7 +5,7 @@ use sqlx::{Executor, PgPool, postgres::PgPoolOptions};
 use venue_control::{
     AccountDeliveryRepository, AccountDeliveryRepositoryError, ControlRepository, ControlService,
     DeliveryStoreResult, MIGRATION_0001, MIGRATION_0002, MIGRATION_0003, MIGRATION_0004,
-    MIGRATION_0005, PgControlRepository,
+    MIGRATION_0005, MIGRATION_0006, PgControlRepository,
 };
 use venue_control_protocol::{
     ACCOUNT_DELIVERY_SCHEMA_VERSION, AccountDeliveryAck, AccountDeliveryBinding,
@@ -173,6 +173,7 @@ fn command() -> Result<ControlCommandRequest, Box<dyn std::error::Error>> {
         instance_id: binding.instance_id,
         symbol: binding.symbol,
         action: ControlAction::Pause,
+        trade: None,
         expected_config_epoch: binding.config_epoch,
         confirmation: None,
     })
@@ -285,6 +286,7 @@ impl PgFixture {
             sqlx::raw_sql(MIGRATION_0003).execute(&self.pool).await?;
             sqlx::raw_sql(MIGRATION_0004).execute(&self.pool).await?;
             sqlx::raw_sql(MIGRATION_0005).execute(&self.pool).await?;
+            sqlx::raw_sql(MIGRATION_0006).execute(&self.pool).await?;
         }
         Ok(())
     }

@@ -1,5 +1,6 @@
 //! Deterministic, transport-free feature calculation over normalized public market facts.
 
+pub mod catalog;
 pub mod chart;
 mod feature_frame;
 mod public_book;

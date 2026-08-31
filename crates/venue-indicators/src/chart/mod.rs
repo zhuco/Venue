@@ -3,6 +3,7 @@
 //! Canonical state accepts a closed bar once. A forming bar is evaluated by cloning the
 //! state through [`ChartStudyEngine::preview`], so UI previews cannot mutate strategy facts.
 
+mod common;
 mod momentum;
 mod registry;
 mod trend;
@@ -13,6 +14,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use venue_domain::{PublicBar, Symbol};
 
+pub use common::{CommonStudyValues, DirectionalValue, DmiValue, KdjValue, PairValue, TripleValue};
 pub use momentum::{Macd, MacdValue, Rsi};
 pub use registry::{
     ChartIndicatorDescriptor, ChartIndicatorId, ChartIndicatorPlacement, ChartIndicatorRegistry,
@@ -47,6 +49,7 @@ pub struct ChartStudyValues {
     pub rsi: Option<Decimal>,
     pub macd: Option<MacdValue>,
     pub atr: Option<Decimal>,
+    pub common: CommonStudyValues,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -61,13 +64,36 @@ pub struct ChartStudyConfig {
     pub macd_slow_period: usize,
     pub macd_signal_period: usize,
     pub atr_period: usize,
+    pub sma_second_period: usize,
+    pub sma_third_period: usize,
+    pub ema_second_period: usize,
+    pub ema_third_period: usize,
+    pub wma_period: usize,
+    pub wma_second_period: usize,
+    pub wma_third_period: usize,
+    pub trix_period: usize,
+    pub sar_step: Decimal,
+    pub sar_maximum: Decimal,
+    pub supertrend_period: usize,
+    pub supertrend_multiplier: Decimal,
+    pub mfi_period: usize,
+    pub kdj_period: usize,
+    pub kdj_signal_period: usize,
+    pub cci_period: usize,
+    pub stoch_rsi_period: usize,
+    pub stoch_rsi_stochastic_period: usize,
+    pub stoch_rsi_signal_period: usize,
+    pub williams_r_period: usize,
+    pub dmi_period: usize,
+    pub momentum_period: usize,
+    pub emv_period: usize,
 }
 
 impl Default for ChartStudyConfig {
     fn default() -> Self {
         Self {
-            sma_period: 20,
-            ema_period: 20,
+            sma_period: 7,
+            ema_period: 7,
             bollinger_period: 20,
             bollinger_multiplier: Decimal::from(2),
             rsi_period: 14,
@@ -75,6 +101,29 @@ impl Default for ChartStudyConfig {
             macd_slow_period: 26,
             macd_signal_period: 9,
             atr_period: 14,
+            sma_second_period: 25,
+            sma_third_period: 99,
+            ema_second_period: 25,
+            ema_third_period: 99,
+            wma_period: 7,
+            wma_second_period: 25,
+            wma_third_period: 99,
+            trix_period: 12,
+            sar_step: Decimal::new(2, 2),
+            sar_maximum: Decimal::new(20, 2),
+            supertrend_period: 10,
+            supertrend_multiplier: Decimal::from(3),
+            mfi_period: 14,
+            kdj_period: 9,
+            kdj_signal_period: 3,
+            cci_period: 20,
+            stoch_rsi_period: 14,
+            stoch_rsi_stochastic_period: 14,
+            stoch_rsi_signal_period: 3,
+            williams_r_period: 14,
+            dmi_period: 14,
+            momentum_period: 10,
+            emv_period: 14,
         }
     }
 }
@@ -91,6 +140,26 @@ impl ChartStudyConfig {
             self.macd_slow_period,
             self.macd_signal_period,
             self.atr_period,
+            self.sma_second_period,
+            self.sma_third_period,
+            self.ema_second_period,
+            self.ema_third_period,
+            self.wma_period,
+            self.wma_second_period,
+            self.wma_third_period,
+            self.trix_period,
+            self.supertrend_period,
+            self.mfi_period,
+            self.kdj_period,
+            self.kdj_signal_period,
+            self.cci_period,
+            self.stoch_rsi_period,
+            self.stoch_rsi_stochastic_period,
+            self.stoch_rsi_signal_period,
+            self.williams_r_period,
+            self.dmi_period,
+            self.momentum_period,
+            self.emv_period,
         ];
         if periods
             .iter()
@@ -98,6 +167,9 @@ impl ChartStudyConfig {
             || self.macd_fast_period >= self.macd_slow_period
             || self.bollinger_multiplier <= Decimal::ZERO
             || self.bollinger_multiplier > Decimal::from(1_000)
+            || self.sar_step <= Decimal::ZERO
+            || self.sar_maximum < self.sar_step
+            || self.supertrend_multiplier <= Decimal::ZERO
         {
             return Err(ChartIndicatorError::InvalidParameters);
         }
@@ -117,6 +189,7 @@ pub struct ChartStudyEngine {
     rsi: Rsi,
     macd: Macd,
     atr: Atr,
+    common: common::CommonStudyEngine,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,6 +220,7 @@ impl ChartStudyEngine {
                 config.macd_signal_period,
             )?,
             atr: Atr::new(config.atr_period)?,
+            common: common::CommonStudyEngine::new(config)?,
         })
     }
 
@@ -160,6 +234,7 @@ impl ChartStudyEngine {
         self.rsi.reset();
         self.macd.reset();
         self.atr.reset();
+        self.common.reset();
     }
 
     pub fn ingest_closed(
@@ -196,6 +271,7 @@ impl ChartStudyEngine {
             rsi: self.rsi.update(bar)?,
             macd: self.macd.update(bar)?,
             atr: self.atr.update(bar)?,
+            common: self.common.update(bar)?,
         })
     }
 
@@ -289,6 +365,45 @@ mod tests {
         assert!(committed.sma.is_some());
         assert!(committed.rsi.is_some());
         assert!(committed.macd.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn commercial_indicator_set_is_ready_after_default_warmup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut engine = ChartStudyEngine::standard()?;
+        let mut latest = None;
+        for sequence in 1..=140 {
+            latest = Some(engine.ingest_closed(&bar(sequence)?)?);
+        }
+        let values = latest.ok_or("default warmup must emit a value")?;
+        assert!(values.sma.is_some());
+        assert!(values.ema.is_some());
+        assert!(values.bollinger.is_some());
+        assert!(values.vwap.is_some());
+        assert!(values.rsi.is_some());
+        assert!(values.macd.is_some());
+        assert!(values.atr.is_some());
+        assert!(values.common.sma_extra.second.is_some());
+        assert!(values.common.sma_extra.third.is_some());
+        assert!(values.common.ema_extra.second.is_some());
+        assert!(values.common.ema_extra.third.is_some());
+        assert!(values.common.wma.first.is_some());
+        assert!(values.common.wma.second.is_some());
+        assert!(values.common.wma.third.is_some());
+        assert!(values.common.avl.is_some());
+        assert!(values.common.trix.is_some());
+        assert!(values.common.sar.is_some());
+        assert!(values.common.supertrend.is_some());
+        assert!(values.common.mfi.is_some());
+        assert!(values.common.kdj.is_some());
+        assert!(values.common.obv.is_some());
+        assert!(values.common.cci.is_some());
+        assert!(values.common.stoch_rsi.is_some());
+        assert!(values.common.williams_r.is_some());
+        assert!(values.common.dmi.is_some());
+        assert!(values.common.momentum.is_some());
+        assert!(values.common.emv.is_some());
         Ok(())
     }
 

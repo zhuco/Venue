@@ -6,7 +6,7 @@ use std::{env, time::SystemTime};
 use sqlx::postgres::PgPoolOptions;
 use venue_control::{
     CopyObserverScope, CopyWorker, CopyWorkerConfig, MIGRATION_0001, MIGRATION_0002,
-    MIGRATION_0003, MIGRATION_0004, MIGRATION_0005, PgControlRepository,
+    MIGRATION_0003, MIGRATION_0004, MIGRATION_0005, MIGRATION_0006, PgControlRepository,
 };
 use venue_control_protocol::{GatewayMode, VenueId};
 
@@ -32,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sqlx::raw_sql(MIGRATION_0003).execute(&pool).await?;
     sqlx::raw_sql(MIGRATION_0004).execute(&pool).await?;
     sqlx::raw_sql(MIGRATION_0005).execute(&pool).await?;
+    sqlx::raw_sql(MIGRATION_0006).execute(&pool).await?;
     let worker = CopyWorker::new(
         PgControlRepository::new(pool),
         CopyWorkerConfig {

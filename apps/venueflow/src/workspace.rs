@@ -17,6 +17,7 @@ pub enum PaneKind {
     Strategies,
     CopyRelations,
     Ledger,
+    TradeDock,
     Control,
     Diagnostics,
 }
@@ -32,6 +33,10 @@ impl PaneKind {
             Self::Strategies => text(language, TextKey::Strategies),
             Self::CopyRelations => text(language, TextKey::CopyRelations),
             Self::Ledger => text(language, TextKey::ReceiptLedger),
+            Self::TradeDock => match language {
+                Language::SimplifiedChinese => "交易面板",
+                Language::English => "Trade Dock",
+            },
             Self::Control => text(language, TextKey::LifecycleControl),
             Self::Diagnostics => text(language, TextKey::Diagnostics),
         }
@@ -203,9 +208,15 @@ fn build_trading() -> Tree<Pane> {
     let chart = pane(&mut tiles, PaneKind::Chart, 1);
     let book = pane(&mut tiles, PaneKind::OrderBook, 1);
     let strategies = pane(&mut tiles, PaneKind::Strategies, 1);
-    let control = pane(&mut tiles, PaneKind::Control, 1);
+    let trade_dock = pane(&mut tiles, PaneKind::TradeDock, 1);
     let upper = split(&mut tiles, LinearDir::Horizontal, chart, book, 0.76);
-    let lower = split(&mut tiles, LinearDir::Horizontal, strategies, control, 0.72);
+    let lower = split(
+        &mut tiles,
+        LinearDir::Horizontal,
+        strategies,
+        trade_dock,
+        0.62,
+    );
     let root = split(&mut tiles, LinearDir::Vertical, upper, lower, 0.72);
     Tree::new("venueflow-trading", root, tiles)
 }
@@ -305,6 +316,7 @@ mod tests {
             1
         );
         assert!(!kinds.contains(&PaneKind::TradeTape));
+        assert!(kinds.contains(&PaneKind::TradeDock));
     }
 
     #[test]

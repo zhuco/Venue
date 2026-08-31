@@ -432,6 +432,8 @@ G:\Venue\artifacts\<exchange>\LIVE\<trading_account_id>\
 不持有凭证，不直连交易所，不直接下单。Stop/Flatten 必须显示并提交精确 mode、account、symbol、instance、config epoch、action 与人工确认；
 `apps/venue-control` 提供幂等命令和本地 HTTP/SSE `/v2`。Control 只提交语义命令及 `instance/config epoch`，Node 接收后写入自身命令 WAL；Control 的数据库状态、delivery ACK 或 receipt 都不授予交易权限。当前阶段只需“命令已接收/已拒绝/已完成”三类终态，不建立第二套 Actor-applied root、跨层 durability receipt 或 delivery lease 证明链。重复命令按稳定 command ID 幂等处理，冲突输入拒绝。
 
+VenueFlow 的 Trade Dock 同样只提交语义 `TradeIntent`：按钮和热键必须先统一为 `TradingAction`；开平仓固定 LIMIT/GTC 并要求选价，平多/平空显式 reduce-only，UI 的 `min(quote preset / price, projected position)` 只作为数量上限，账户 Node 必须再按更新的签名仓位与 adapter 实时规则向下裁剪。撤当前未带显式订单 ID 时只能在同一 `(account, symbol)` 选择最近 Working order，撤全部也只能作用于该 scope。Control 接收不等于物理执行；生产 Actor durable-applied authority、风险、同一 WAL 和账户唯一 writer 全部满足前不得产生 mutation。
+
 ## 12. 验收标准
 
 代码提交前必须通过：

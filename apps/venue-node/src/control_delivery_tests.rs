@@ -18,7 +18,7 @@ use venue_control_protocol::{
     ACCOUNT_DELIVERY_SCHEMA_VERSION, AccountDeliveryBinding, AccountDeliveryClaim,
     AccountDeliveryLease, AccountDeliveryPayload, AccountDeliveryPurpose,
     AccountDeliveryReceiptState, CONTROL_SCHEMA_VERSION, ControlAction, ControlCommandRequest,
-    GatewayMode, VenueId,
+    GatewayMode, TradeIntent, TradingAction, TradingOrderType, TradingTimeInForce, VenueId,
 };
 use venue_domain::Symbol;
 
@@ -405,6 +405,7 @@ fn production_delivery_cannot_apply_any_control_action_without_actor_authority()
         ControlAction::Resume,
         ControlAction::Stop,
         ControlAction::Flatten,
+        ControlAction::Trade,
     ]
     .into_iter()
     .enumerate()
@@ -903,11 +904,26 @@ fn claim_with_delivery_action(
         instance_id: binding.instance_id.clone(),
         symbol: binding.symbol.clone(),
         action,
+        trade: None,
         expected_config_epoch: binding.config_epoch,
         confirmation: None,
     };
     if action.requires_confirmation() {
         command.confirmation = Some(command.expected_confirmation());
+    }
+    if action == ControlAction::Trade {
+        command.trade = Some(TradeIntent {
+            action: TradingAction::CancelAllOrders,
+            quote_asset: binding.symbol.quote().to_owned(),
+            order_type: TradingOrderType::Limit,
+            time_in_force: TradingTimeInForce::Gtc,
+            post_only: false,
+            reduce_only: false,
+            selected_price: None,
+            quote_notional: None,
+            close_quantity_cap: None,
+            selected_order_id: None,
+        });
     }
     Ok(AccountDeliveryClaim {
         lease: AccountDeliveryLease {

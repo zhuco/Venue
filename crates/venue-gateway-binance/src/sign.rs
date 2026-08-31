@@ -102,10 +102,7 @@ pub fn sign_rest(
     pairs.push(format!("recvWindow={}", input.recv_window_ms));
     pairs.push(format!("timestamp={}", input.timestamp_ms));
     let payload = pairs.join("&");
-    let mut mac = HmacSha256::new_from_slice(credentials.api_secret.expose_secret().as_bytes())
-        .map_err(|_| BinanceAuthError::SigningInput)?;
-    mac.update(payload.as_bytes());
-    let signature = hex(&mac.finalize().into_bytes());
+    let signature = signature_for_payload(credentials, &payload)?;
     Ok(SignedBinanceRestRequest {
         method: input.method,
         origin: config.portfolio_rest_origin(),
@@ -113,6 +110,16 @@ pub fn sign_rest(
         api_key: SecretString::from(credentials.api_key.expose_secret().to_owned()),
         query: SecretString::from(format!("{payload}&signature={signature}")),
     })
+}
+
+pub(crate) fn signature_for_payload(
+    credentials: &BinanceCredentials,
+    payload: &str,
+) -> Result<String, BinanceAuthError> {
+    let mut mac = HmacSha256::new_from_slice(credentials.api_secret.expose_secret().as_bytes())
+        .map_err(|_| BinanceAuthError::SigningInput)?;
+    mac.update(payload.as_bytes());
+    Ok(hex(&mac.finalize().into_bytes()))
 }
 
 fn validate_input(input: &BinanceRestSignInput<'_>) -> Result<(), BinanceAuthError> {

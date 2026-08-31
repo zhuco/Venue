@@ -50,8 +50,46 @@ resources! {
     LifecycleControl => "Lifecycle control", "生命周期控制";
     Diagnostics => "Diagnostics", "诊断";
     Settings => "Settings", "设置";
+    TradingSettings => "Trading settings", "交易设置";
+    DisplayCadence => "Market display", "行情显示";
+    DisplayCadenceHint => "Display sampling only; market ingestion, order receipts and pointer interaction remain immediate.", "仅调整画面更新间隔；行情持续接收，交易回执与鼠标交互不节流。";
+    CandleCadence => "Candles / indicators", "K线 / 指标";
+    MarketDelay => "Market lag", "行情延迟";
+    MarketDelayHint => "Exchange event to local receipt, not HTTP RTT. Includes clock skew. A dash means no fresh measurement.", "交易所事件时间至本机接收时间，并非 HTTP 往返耗时，受时钟偏差影响；无新鲜测量时显示横线。";
+    TradeConnection => "Trading node", "交易节点";
+    NodeStatusHint => "Selected account projection only. Healthy/private/writer generations do not prove that an order can execute; the server must revalidate risk, WAL and writer.", "仅表示所选账户的节点投影；健康及私流/writer 代际不代表能下单，仍须服务器校验 risk、WAL 与 writer。";
+    AvailableMargin => "Available margin", "可用保证金";
+    ValuationCurrencyMissing => "Valuation currency unspecified", "估值币种待提供";
+    FundsHint => "Selected account, server valuation. Currency is not supplied by the current protocol: do not interpret this as the chart's quote asset. Stale values are historical, not spendable balance.", "所选账户的服务器估值；当前协议未提供估值币种，不能当作图表交易对的报价币。过期值仅供参考，不代表可下单余额。";
+    AwaitingNode => "Awaiting node", "等待节点";
+    NoExecutionAccount => "No execution account", "未选择执行账户";
     Modules => "Modules", "模块";
     ResetLayout => "Reset layout", "重置布局";
+    MarketServer => "Market server", "行情服务器";
+    BinancePublic => "Binance public", "Binance 公共行情";
+    ExecutionAccount => "Execution account", "执行账户";
+    SelectExecutionAccount => "Select execution account", "选择执行账户";
+    LoginAccount => "Log in account", "登录账户";
+    Dismiss => "Close", "关闭";
+    ExecutionAccountDescription => "After logging in, load or bind an exchange API key for the execution account. Market-server selection never requires login.", "登录账户后，可为执行账户加载或绑定交易所 API Key；行情服务器选择无需登录。";
+    AccountReadiness => "Execution account readiness", "执行账户准入状态";
+    LoginSession => "VenueFlow account login", "VenueFlow 账户登录";
+    GatewayConnected => "Gateway connected", "网关已连接";
+    ApiKeyBound => "API key bound to this account", "API Key 已绑定此账户";
+    DualPositionVerified => "Hedge / dual-position mode verified", "双向持仓账户模式已验证";
+    AccountNodeVerificationRequired => "The account node must return all three gateway proofs before switching can be armed.", "必须由账户节点返回网关、API Key 绑定和双向持仓三项证据后，才能启用切换。";
+    ProjectedAccounts => "Server-projected accounts", "服务端投影账户";
+    NoProjectedAccounts => "No account projection is available.", "暂无账户投影。";
+    SelectedScope => "UI selected scope:", "UI 当前选择作用域：";
+    SwitchExecutionAccount => "Switch execution account", "切换执行账户";
+    SwitchWaitsForVerification => "Switching remains disabled until the account node verifies the gateway session, API-key binding, and Hedge mode.", "账户节点完成网关会话、API Key 绑定和双向持仓模式验证前，切换保持禁用。";
+    Ready => "ready", "就绪";
+    Pending => "pending", "待确认";
+    Healthy => "healthy", "健康";
+    Recovering => "recovering", "恢复中";
+    NeedsAttention => "needs attention", "需关注";
+    Stopped => "stopped", "已停止";
+    Unknown => "unknown", "未知";
     SearchSymbol => "Search symbol", "搜索交易对";
     NoSymbols => "No matching symbols", "没有匹配的交易对";
     NoSnapshot => "no snapshot", "无快照";
@@ -191,6 +229,81 @@ resources! {
     AccountAuthorityCaveat => "VenueFlow shows writer/private generations and reconciliation age only; it does not infer missing authority from health or ledger text.", "VenueFlow 只显示写入者/私流代际与对账时效，不会根据健康状态或账本文本推断缺失的权威事实。";
 }
 
+macro_rules! indicator_resources {
+    ($($key:ident => $english:literal, $chinese:literal;)+) => {
+        #[allow(dead_code)]
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum IndicatorTextKey { $($key,)+ }
+
+        pub const fn indicator_text(language: Language, key: IndicatorTextKey) -> &'static str {
+            match (language, key) {
+                $((Language::English, IndicatorTextKey::$key) => $english,)+
+                $((Language::SimplifiedChinese, IndicatorTextKey::$key) => $chinese,)+
+            }
+        }
+    };
+}
+
+indicator_resources! {
+    MainTab => "Main", "主图";
+    SubTab => "Sub-chart", "副图";
+    CustomTab => "Custom", "自定义";
+    BacktestTab => "Backtest", "回测测试";
+    GeneralTab => "General", "通用";
+    MainGroup => "Main", "主图";
+    SubGroup => "Sub", "副图";
+    ClosePrice => "Close", "收盘价";
+    Deviation => "Deviation", "标准差倍数";
+    Middle => "Middle", "中轨";
+    OuterBands => "Upper / lower bands", "上轨 / 下轨";
+    BandFill => "Band fill", "通道填充";
+    FillOpacity => "Fill opacity", "填充不透明度";
+    PositiveHistogram => "Positive histogram", "正值柱";
+    NegativeHistogram => "Negative histogram", "负值柱";
+    Step => "Step", "加速因子";
+    Maximum => "Maximum", "最大加速";
+    Multiplier => "Multiplier", "乘数";
+    Fast => "Fast", "快线";
+    Slow => "Slow", "慢线";
+    Signal => "Signal", "信号线";
+    Period => "Period", "周期";
+    Smoothing => "Smoothing", "平滑";
+    RsiPeriod => "RSI", "RSI周期";
+    StochasticPeriod => "Stochastic", "随机周期";
+    Line => "Line", "线条";
+    RisingLine => "Rising line", "上涨线";
+    FallingLine => "Falling line", "下跌线";
+    RisingBackground => "Uptrend fill to candle midpoint", "上涨区域填充（至K线实体中点）";
+    FallingBackground => "Downtrend fill to candle midpoint", "下跌区域填充（至K线实体中点）";
+    Save => "Save", "保存";
+    RestoreDefaults => "Restore defaults", "恢复默认";
+    LiveRedraw => "Changes redraw the chart live", "修改将实时重绘图表";
+    FeatureUnavailable => "This feature is not available yet", "该功能尚未开放";
+    RecalculationFailed => "Indicator recalculation failed", "指标重算失败";
+    MaTitle => "MA - Moving Average", "MA - 移动平均线";
+    EmaTitle => "EMA - Exponential Moving Average", "EMA - 指数移动平均线";
+    WmaTitle => "WMA - Weighted Moving Average", "WMA - 加权移动平均线";
+    BollTitle => "BOLL - Bollinger Bands", "BOLL - 布林带";
+    VwapTitle => "VWAP - Volume Weighted Average Price", "VWAP - 成交量加权均价";
+    AvlTitle => "AVL - Average Value Line", "AVL - 均价线";
+    TrixTitle => "TRIX - Triple Exponential Average", "TRIX - 三重指数平滑";
+    SarTitle => "SAR - Parabolic Stop and Reverse", "SAR - 抛物线转向";
+    SuperTitle => "SUPER - SUPERTREND", "SUPER - SUPERTREND";
+    VolTitle => "VOL - Volume", "VOL - 成交量";
+    MacdTitle => "MACD - Moving Average Convergence Divergence", "MACD - 指数平滑异同移动平均";
+    RsiTitle => "RSI - Relative Strength Index", "RSI - 相对强弱指标";
+    MfiTitle => "MFI - Money Flow Index", "MFI - 资金流量指标";
+    KdjTitle => "KDJ - Stochastic", "KDJ - 随机指标";
+    ObvTitle => "OBV - On Balance Volume", "OBV - 能量潮";
+    CciTitle => "CCI - Commodity Channel Index", "CCI - 顺势指标";
+    StochRsiTitle => "StochRSI - Stochastic RSI", "StochRSI - 随机相对强弱";
+    WilliamsRTitle => "WR - Williams %R", "WR - 威廉指标";
+    DmiTitle => "DMI - Directional Movement Index", "DMI - 趋向指标";
+    MomentumTitle => "MTM - Momentum", "MTM - 动量";
+    EmvTitle => "EMV - Ease of Movement", "EMV - 简易波动指标";
+    AtrTitle => "ATR - Average True Range", "ATR - 平均真实波幅";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +315,13 @@ mod tests {
         assert_eq!(text(Language::English, TextKey::Amplitude), "Amplitude");
         assert_eq!(text(Language::SimplifiedChinese, TextKey::Change), "涨跌幅");
         assert_eq!(text(Language::SimplifiedChinese, TextKey::Total), "累计");
+        assert_eq!(
+            indicator_text(Language::SimplifiedChinese, IndicatorTextKey::LiveRedraw),
+            "修改将实时重绘图表"
+        );
+        assert_eq!(
+            indicator_text(Language::English, IndicatorTextKey::SarTitle),
+            "SAR - Parabolic Stop and Reverse"
+        );
     }
 }

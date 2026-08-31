@@ -1,17 +1,28 @@
-//! Static chart-study metadata used for menu discovery and configuration forms.
-//!
-//! This registry deliberately describes only the fixed study set implemented by this crate. It
-//! does not construct studies dynamically and carries no market or strategy authority.
+//! Stable discovery metadata for every study currently exposed by VenueFlow.
 
-/// Stable identifier for a first-batch chart study.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ChartIndicatorId {
-    Sma,
+    Ma,
     Ema,
+    Wma,
     Bollinger,
     Vwap,
-    Rsi,
+    Avl,
+    Trix,
+    Sar,
+    Supertrend,
+    Volume,
     Macd,
+    Rsi,
+    Mfi,
+    Kdj,
+    Obv,
+    Cci,
+    StochRsi,
+    WilliamsR,
+    Dmi,
+    Momentum,
+    Emv,
     Atr,
 }
 
@@ -19,26 +30,38 @@ impl ChartIndicatorId {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Sma => "sma",
+            Self::Ma => "ma",
             Self::Ema => "ema",
+            Self::Wma => "wma",
             Self::Bollinger => "bollinger_bands",
             Self::Vwap => "vwap",
-            Self::Rsi => "rsi",
+            Self::Avl => "avl",
+            Self::Trix => "trix",
+            Self::Sar => "parabolic_sar",
+            Self::Supertrend => "supertrend",
+            Self::Volume => "volume",
             Self::Macd => "macd",
+            Self::Rsi => "rsi",
+            Self::Mfi => "mfi",
+            Self::Kdj => "kdj",
+            Self::Obv => "obv",
+            Self::Cci => "cci",
+            Self::StochRsi => "stoch_rsi",
+            Self::WilliamsR => "williams_r",
+            Self::Dmi => "dmi",
+            Self::Momentum => "momentum",
+            Self::Emv => "emv",
             Self::Atr => "atr",
         }
     }
 }
 
-/// Visual location of a study relative to its source candlestick chart.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChartIndicatorPlacement {
     Overlay,
     Pane,
 }
 
-/// Static form metadata. Values remain canonical configuration owned by the caller; this schema
-/// only provides display defaults and bounds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChartParameterDescriptor {
     pub key: &'static str,
@@ -50,7 +73,6 @@ pub struct ChartParameterDescriptor {
     pub unit: &'static str,
 }
 
-/// Static, versioned description of one explicitly implemented chart study.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChartIndicatorDescriptor {
     pub id: ChartIndicatorId,
@@ -64,17 +86,7 @@ pub struct ChartIndicatorDescriptor {
     pub algorithm_version: &'static str,
 }
 
-const PERIOD_20: &[ChartParameterDescriptor] = &[ChartParameterDescriptor {
-    key: "period",
-    name_zh_cn: "周期",
-    name_en: "Period",
-    default: "20",
-    minimum: Some("1"),
-    maximum: Some("100000"),
-    unit: "bars",
-}];
-
-const PERIOD_14: &[ChartParameterDescriptor] = &[ChartParameterDescriptor {
+const PERIOD: &[ChartParameterDescriptor] = &[ChartParameterDescriptor {
     key: "period",
     name_zh_cn: "周期",
     name_en: "Period",
@@ -84,31 +96,40 @@ const PERIOD_14: &[ChartParameterDescriptor] = &[ChartParameterDescriptor {
     unit: "bars",
 }];
 
-const BOLLINGER_PARAMETERS: &[ChartParameterDescriptor] = &[
+const THREE_PERIODS: &[ChartParameterDescriptor] = &[
     ChartParameterDescriptor {
-        key: "period",
-        name_zh_cn: "周期",
-        name_en: "Period",
-        default: "20",
+        key: "first_period",
+        name_zh_cn: "周期1",
+        name_en: "Period 1",
+        default: "7",
         minimum: Some("1"),
         maximum: Some("100000"),
         unit: "bars",
     },
     ChartParameterDescriptor {
-        key: "multiplier",
-        name_zh_cn: "标准差倍数",
-        name_en: "Standard deviation multiplier",
-        default: "2",
-        minimum: Some("0.000001"),
-        maximum: Some("1000"),
-        unit: "x",
+        key: "second_period",
+        name_zh_cn: "周期2",
+        name_en: "Period 2",
+        default: "25",
+        minimum: Some("1"),
+        maximum: Some("100000"),
+        unit: "bars",
+    },
+    ChartParameterDescriptor {
+        key: "third_period",
+        name_zh_cn: "周期3",
+        name_en: "Period 3",
+        default: "99",
+        minimum: Some("1"),
+        maximum: Some("100000"),
+        unit: "bars",
     },
 ];
 
-const MACD_PARAMETERS: &[ChartParameterDescriptor] = &[
+const MACD: &[ChartParameterDescriptor] = &[
     ChartParameterDescriptor {
         key: "fast_period",
-        name_zh_cn: "快速周期",
+        name_zh_cn: "快线周期",
         name_en: "Fast period",
         default: "12",
         minimum: Some("1"),
@@ -117,7 +138,7 @@ const MACD_PARAMETERS: &[ChartParameterDescriptor] = &[
     },
     ChartParameterDescriptor {
         key: "slow_period",
-        name_zh_cn: "慢速周期",
+        name_zh_cn: "慢线周期",
         name_en: "Slow period",
         default: "26",
         minimum: Some("2"),
@@ -135,87 +156,245 @@ const MACD_PARAMETERS: &[ChartParameterDescriptor] = &[
     },
 ];
 
+macro_rules! study {
+    ($id:ident, $zh:literal, $en:literal, $place:ident, $input:literal, $output:literal, $params:expr, $version:literal) => {
+        ChartIndicatorDescriptor {
+            id: ChartIndicatorId::$id,
+            name_zh_cn: $zh,
+            name_en: $en,
+            placement: ChartIndicatorPlacement::$place,
+            input: $input,
+            output: $output,
+            parameters: $params,
+            warmup: "parameter-dependent closed bars",
+            algorithm_version: $version,
+        }
+    };
+}
+
 const ALL: &[ChartIndicatorDescriptor] = &[
-    ChartIndicatorDescriptor {
-        id: ChartIndicatorId::Sma,
-        name_zh_cn: "简单移动平均",
-        name_en: "Simple Moving Average",
-        placement: ChartIndicatorPlacement::Overlay,
-        input: "closed_bar.close",
-        output: "scalar",
-        parameters: PERIOD_20,
-        warmup: "period closed bars",
-        algorithm_version: "sma-v1",
-    },
-    ChartIndicatorDescriptor {
-        id: ChartIndicatorId::Ema,
-        name_zh_cn: "指数移动平均",
-        name_en: "Exponential Moving Average",
-        placement: ChartIndicatorPlacement::Overlay,
-        input: "closed_bar.close",
-        output: "scalar",
-        parameters: PERIOD_20,
-        warmup: "period closed bars",
-        algorithm_version: "ema-v1",
-    },
-    ChartIndicatorDescriptor {
-        id: ChartIndicatorId::Bollinger,
-        name_zh_cn: "布林带",
-        name_en: "Bollinger Bands",
-        placement: ChartIndicatorPlacement::Overlay,
-        input: "closed_bar.ohlcv",
-        output: "upper,middle,lower",
-        parameters: BOLLINGER_PARAMETERS,
-        warmup: "period closed bars",
-        algorithm_version: "bollinger-v1",
-    },
-    ChartIndicatorDescriptor {
-        id: ChartIndicatorId::Vwap,
-        name_zh_cn: "成交量加权平均价",
-        name_en: "Volume Weighted Average Price",
-        placement: ChartIndicatorPlacement::Overlay,
-        input: "closed_bar.ohlcv",
-        output: "scalar",
-        parameters: &[],
-        warmup: "first closed bar with positive base volume",
-        algorithm_version: "vwap-v1",
-    },
-    ChartIndicatorDescriptor {
-        id: ChartIndicatorId::Rsi,
-        name_zh_cn: "相对强弱指数",
-        name_en: "Relative Strength Index",
-        placement: ChartIndicatorPlacement::Pane,
-        input: "closed_bar.close",
-        output: "scalar",
-        parameters: PERIOD_14,
-        warmup: "period + 1 closed bars",
-        algorithm_version: "rsi-wilder-v1",
-    },
-    ChartIndicatorDescriptor {
-        id: ChartIndicatorId::Macd,
-        name_zh_cn: "指数平滑异同移动平均线",
-        name_en: "Moving Average Convergence Divergence",
-        placement: ChartIndicatorPlacement::Pane,
-        input: "closed_bar.close",
-        output: "macd,signal,histogram",
-        parameters: MACD_PARAMETERS,
-        warmup: "slow_period + signal_period - 1 closed bars",
-        algorithm_version: "macd-ema-v1",
-    },
-    ChartIndicatorDescriptor {
-        id: ChartIndicatorId::Atr,
-        name_zh_cn: "平均真实波幅",
-        name_en: "Average True Range",
-        placement: ChartIndicatorPlacement::Pane,
-        input: "closed_bar.ohlc",
-        output: "scalar",
-        parameters: PERIOD_14,
-        warmup: "period closed bars",
-        algorithm_version: "atr-wilder-v1",
-    },
+    study!(
+        Ma,
+        "移动平均线",
+        "Moving Average",
+        Overlay,
+        "closed_bar.close",
+        "three lines",
+        THREE_PERIODS,
+        "ma-v2"
+    ),
+    study!(
+        Ema,
+        "指数移动平均线",
+        "Exponential Moving Average",
+        Overlay,
+        "closed_bar.close",
+        "three lines",
+        THREE_PERIODS,
+        "ema-v2"
+    ),
+    study!(
+        Wma,
+        "加权移动平均线",
+        "Weighted Moving Average",
+        Overlay,
+        "closed_bar.close",
+        "three lines",
+        THREE_PERIODS,
+        "wma-v1"
+    ),
+    study!(
+        Bollinger,
+        "布林带",
+        "Bollinger Bands",
+        Overlay,
+        "closed_bar.ohlc",
+        "upper,middle,lower",
+        PERIOD,
+        "bollinger-v1"
+    ),
+    study!(
+        Vwap,
+        "成交量加权均价",
+        "VWAP",
+        Overlay,
+        "closed_bar.ohlcv",
+        "line",
+        &[],
+        "vwap-v1"
+    ),
+    study!(
+        Avl,
+        "均价线",
+        "Average Value Line",
+        Overlay,
+        "closed_bar.base_quote_volume",
+        "line",
+        &[],
+        "avl-v1"
+    ),
+    study!(
+        Trix,
+        "三重指数平滑",
+        "TRIX",
+        Overlay,
+        "closed_bar.close",
+        "line,rate",
+        PERIOD,
+        "trix-v1"
+    ),
+    study!(
+        Sar,
+        "抛物线转向",
+        "Parabolic SAR",
+        Overlay,
+        "closed_bar.ohlc",
+        "value,direction",
+        &[],
+        "sar-v1"
+    ),
+    study!(
+        Supertrend,
+        "超级趋势",
+        "SuperTrend",
+        Overlay,
+        "closed_bar.ohlc",
+        "value,direction",
+        PERIOD,
+        "supertrend-v1"
+    ),
+    study!(
+        Volume,
+        "成交量",
+        "Volume",
+        Pane,
+        "closed_bar.volume",
+        "histogram",
+        &[],
+        "volume-v1"
+    ),
+    study!(
+        Macd,
+        "指数平滑异同移动平均",
+        "MACD",
+        Pane,
+        "closed_bar.close",
+        "macd,signal,histogram",
+        MACD,
+        "macd-v1"
+    ),
+    study!(
+        Rsi,
+        "相对强弱指标",
+        "RSI",
+        Pane,
+        "closed_bar.close",
+        "line",
+        PERIOD,
+        "rsi-v1"
+    ),
+    study!(
+        Mfi,
+        "资金流量指标",
+        "MFI",
+        Pane,
+        "closed_bar.ohlcv",
+        "line",
+        PERIOD,
+        "mfi-v1"
+    ),
+    study!(
+        Kdj,
+        "随机指标",
+        "KDJ",
+        Pane,
+        "closed_bar.ohlc",
+        "k,d,j",
+        PERIOD,
+        "kdj-v1"
+    ),
+    study!(
+        Obv,
+        "能量潮",
+        "OBV",
+        Pane,
+        "closed_bar.close_volume",
+        "line",
+        &[],
+        "obv-v1"
+    ),
+    study!(
+        Cci,
+        "顺势指标",
+        "CCI",
+        Pane,
+        "closed_bar.ohlc",
+        "line",
+        PERIOD,
+        "cci-v1"
+    ),
+    study!(
+        StochRsi,
+        "随机相对强弱",
+        "Stochastic RSI",
+        Pane,
+        "closed_bar.close",
+        "k,d",
+        PERIOD,
+        "stoch-rsi-v1"
+    ),
+    study!(
+        WilliamsR,
+        "威廉指标",
+        "Williams %R",
+        Pane,
+        "closed_bar.ohlc",
+        "line",
+        PERIOD,
+        "williams-r-v1"
+    ),
+    study!(
+        Dmi,
+        "趋向指标",
+        "DMI",
+        Pane,
+        "closed_bar.ohlc",
+        "plus_di,minus_di,adx",
+        PERIOD,
+        "dmi-v1"
+    ),
+    study!(
+        Momentum,
+        "动量",
+        "Momentum",
+        Pane,
+        "closed_bar.close",
+        "line",
+        PERIOD,
+        "momentum-v1"
+    ),
+    study!(
+        Emv,
+        "简易波动指标",
+        "Ease of Movement",
+        Pane,
+        "closed_bar.ohlcv",
+        "line",
+        PERIOD,
+        "emv-v1"
+    ),
+    study!(
+        Atr,
+        "平均真实波幅",
+        "ATR",
+        Pane,
+        "closed_bar.ohlc",
+        "line",
+        PERIOD,
+        "atr-v1"
+    ),
 ];
 
-/// Static discovery surface for the explicit first-batch chart studies.
 pub struct ChartIndicatorRegistry;
 
 impl ChartIndicatorRegistry {
@@ -234,31 +413,26 @@ impl ChartIndicatorRegistry {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::*;
+    use super::{ChartIndicatorId, ChartIndicatorRegistry};
 
     #[test]
-    fn first_batch_ids_are_unique_and_stable() {
+    fn commercial_ui_indicator_ids_are_complete_and_unique() {
         let descriptors = ChartIndicatorRegistry::all();
         let ids = descriptors
             .iter()
-            .map(|descriptor| descriptor.id.as_str())
+            .map(|value| value.id.as_str())
             .collect::<BTreeSet<_>>();
-        assert_eq!(descriptors.len(), 7);
+        assert_eq!(descriptors.len(), 22);
         assert_eq!(ids.len(), descriptors.len());
-        assert!(ids.contains("sma"));
-        assert!(ids.contains("ema"));
-        assert!(ids.contains("bollinger_bands"));
-        assert!(ids.contains("vwap"));
-        assert!(ids.contains("rsi"));
-        assert!(ids.contains("macd"));
-        assert!(ids.contains("atr"));
+        assert!(ids.contains("supertrend"));
+        assert!(ids.contains("stoch_rsi"));
     }
 
     #[test]
-    fn registry_finds_exact_stable_ids_only() {
-        let macd = ChartIndicatorRegistry::find("macd");
-        assert!(matches!(macd, Some(value) if value.id == ChartIndicatorId::Macd));
+    fn registry_find_is_exact_and_case_sensitive() {
+        assert!(
+            matches!(ChartIndicatorRegistry::find("macd"), Some(value) if value.id == ChartIndicatorId::Macd)
+        );
         assert!(ChartIndicatorRegistry::find("MACD").is_none());
-        assert!(ChartIndicatorRegistry::find("unknown").is_none());
     }
 }

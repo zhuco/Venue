@@ -116,7 +116,7 @@ venue-control-protocol -> venue-domain + venue-gateway-api
 venue-execution -> venue-domain + venue-gateway-api
 venue-runtime -> venue-domain + venue-execution + venue-storage + venue-gateway-api
 venue-node-<venue> -> venue-runtime + exactly one venue-gateway-*
-venue-control -> venue-control-protocol + sqlx
+venue-control -> venue-control-protocol + sqlx + credential-admin-only adapter probe
 venueflow / optional Agent -> venue-control-protocol
 venueflow local public market -> venue-gateway-api + public-only adapter surface
 ```
@@ -129,7 +129,7 @@ venueflow local public market -> venue-gateway-api + public-only adapter surface
 - strategy 和 copy 不依赖具体交易所、凭证、native symbol 或物理客户端；
 - `venue-control-protocol` 只含版本化 DTO、错误码和序列化契约，不含 Axum handler、数据库、runtime 或 application service；
 - UI 不依赖 execution、私有/交易 adapter 或数据库；账户查询和命令只依赖版本化 Control protocol。原生桌面端可另依赖
-  `venue-gateway-api` 的 secret-free public binding 和明确 public-only 的 adapter surface，且不得链接凭证、账户、私流或 mutation；
+  `venue-gateway-api` 的 secret-free public binding 和明确 public-only 的 adapter surface，不得调用账户私流或 mutation；账户表单仅允许下述窄凭证管理传输；
 - Control API DTO 不作为交易权威事实，节点必须重新验证；
 - 不复制 Symbol、Money、Order、Position、Fill、InstrumentRule、Capability 或 journal 类型。
 
@@ -274,10 +274,14 @@ Tokio/reqwest/SSE，Web client 使用 reqwest/EventSource。`venue-control-proto
 - KOL 的 leader/follower、binding、目标敞口、漂移、执行状态和账本查询交互；
 - Grid、Scalping、Copy 实例的查询、Pause/Stop/Flatten 与人工确认流程。
 
-删除 Alpha DTO、旧策略 analytics、模拟交易和 UI 内 mutation gate。VenueFlow 不持有交易所凭证，不读取 PostgreSQL 或 artifacts；
+删除 Alpha DTO、旧策略 analytics、模拟交易和 UI 内 mutation gate。VenueFlow 不持久化交易所凭证，不读取 PostgreSQL 或 artifacts；
 账户、策略、账本和控制只调用版本化 Control protocol。原生桌面端允许为行情/K 线直连生产公共 REST/WS，但 binding 必须无账户、
 无 secret、无私流、无下单能力，且 public-only 依赖边界须由构建测试证明。高风险操作必须显示并确认精确
 mode/account/symbol/instance/config epoch/action，服务端和账户 runtime 仍须独立重验。
+
+登录、注册、API 加密绑定、验证和执行账户选择见 [`ACCOUNT_MANAGEMENT.md`](ACCOUNT_MANAGEMENT.md)。这是当前获准的窄账户管理功能，
+不引入付费权限、独立认证服务或多租户控制面。行情选择无需登录；账户表单可短暂持有输入并经版本化账户 API 提交，
+Control 仅作加密存储和 adapter 签名只读探测。API 可访问、Node 状态和交易准入不得混为一谈。
 
 ## 11. Agent 边界
 
@@ -310,7 +314,9 @@ PostgreSQL + SQLx 用于：
 - admission、capability、Canary 和 handoff receipt。
 
 PostgreSQL 不得成为已发物理订单的第二权威 writer。Copy ledger 只消费账户节点的持久执行/私有事实收据，并保存其摘要
-和稳定身份。凭证只来自进程环境或根 `.env`，不得写入 PostgreSQL、TOML、日志、UI 或工件。
+和稳定身份。Node 凭证仍只来自进程环境或根 `.env`。当前获准的 UI 绑定例外只允许账户管理模块在 PostgreSQL 保存
+经过用户/凭证 ID 认证绑定的密文；主密钥仅来自进程环境，UI 不持久化输入，明文不得写入 TOML、日志或工件。
+具体加密、认证、删除和操作边界见 [`ACCOUNT_MANAGEMENT.md`](ACCOUNT_MANAGEMENT.md)。
 
 ## 13. 技术栈
 

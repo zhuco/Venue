@@ -33,7 +33,7 @@ impl BinanceCredentials {
         )
     }
 
-    fn from_secrets(
+    pub fn from_secrets(
         api_key: SecretString,
         api_secret: SecretString,
     ) -> Result<Self, BinanceAuthError> {

@@ -401,12 +401,14 @@ impl SupervisionJournal {
                     control_receipt
                         .validate()
                         .map_err(|_| SupervisionError::ActorReceipt)?;
-                    let expected_state =
-                        if matches!(request.action, ControlAction::Pause | ControlAction::Resume) {
-                            ControlCommandState::Applied
-                        } else {
-                            ControlCommandState::Accepted
-                        };
+                    let expected_state = if matches!(
+                        request.action,
+                        ControlAction::Pause | ControlAction::Resume | ControlAction::Trade
+                    ) {
+                        ControlCommandState::Applied
+                    } else {
+                        ControlCommandState::Accepted
+                    };
                     if control_receipt.request_id != request.request_id
                         || control_receipt.state != expected_state
                     {
@@ -417,6 +419,7 @@ impl SupervisionJournal {
                     lifecycle = match request.action {
                         ControlAction::Pause => RestoredLifecycle::Paused,
                         ControlAction::Resume => RestoredLifecycle::Active,
+                        ControlAction::Trade => RestoredLifecycle::Active,
                         ControlAction::Stop | ControlAction::Flatten => {
                             RestoredLifecycle::Stopping {
                                 request_id: request.request_id,
@@ -587,7 +590,7 @@ impl SupervisionJournal {
         )?;
         let terminal = matches!(
             receipt.request.action,
-            ControlAction::Pause | ControlAction::Resume
+            ControlAction::Pause | ControlAction::Resume | ControlAction::Trade
         );
         let control_receipt = command_receipt(
             &receipt.request.request_id,
@@ -856,7 +859,10 @@ fn validate_lifecycle_action(
         (lifecycle, action),
         (
             RestoredLifecycle::Active,
-            ControlAction::Pause | ControlAction::Stop | ControlAction::Flatten
+            ControlAction::Pause
+                | ControlAction::Stop
+                | ControlAction::Flatten
+                | ControlAction::Trade
         ) | (
             RestoredLifecycle::Paused,
             ControlAction::Resume | ControlAction::Stop | ControlAction::Flatten

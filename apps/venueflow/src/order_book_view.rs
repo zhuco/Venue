@@ -44,7 +44,8 @@ pub fn show(
     language: Language,
     model: &AppModel,
     symbol: &str,
-) {
+) -> Option<Decimal> {
+    let mut selected = None;
     section_title(ui, text(language, TextKey::OrderBook));
     let mode_id = ui.make_persistent_id(("venueflow-book-mode", instance));
     let mut mode = ui.data(|data| data.get_temp::<BookMode>(mode_id).unwrap_or_default());
@@ -85,7 +86,7 @@ pub fn show(
         );
     if mode.shows_asks() {
         for (level, cumulative) in ask_rows.iter().rev() {
-            book_row(
+            if book_row(
                 ui,
                 level,
                 *cumulative,
@@ -93,13 +94,17 @@ pub fn show(
                 theme::SELL,
                 model,
                 symbol,
-            );
+            ) {
+                selected = Some(level.price);
+            }
         }
     }
     price_mid_row(ui, trades, last, bid, ask, model, symbol);
     if mode.shows_bids() {
         for (level, cumulative) in &bid_rows {
-            book_row(ui, level, *cumulative, max_total, theme::BUY, model, symbol);
+            if book_row(ui, level, *cumulative, max_total, theme::BUY, model, symbol) {
+                selected = Some(level.price);
+            }
         }
     }
     ui.add_space(4.0);
@@ -108,6 +113,7 @@ pub fn show(
     trade_header(ui, language, base, quote);
     trade_rows(ui, instance, trades, language, model, symbol);
     ui.data_mut(|data| data.insert_temp(mode_id, mode));
+    selected
 }
 
 fn section_title(ui: &mut egui::Ui, title: &str) {
@@ -185,10 +191,10 @@ fn book_row(
     color: Color32,
     model: &AppModel,
     symbol: &str,
-) {
+) -> bool {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), BOOK_ROW_HEIGHT),
-        Sense::hover(),
+        Sense::click(),
     );
     let painter = ui.painter();
     let depth_ratio = if max_total.is_zero() {
@@ -206,6 +212,14 @@ fn book_row(
     );
     if response.hovered() {
         painter.rect_filled(rect, 0.0, Color32::from_white_alpha(10));
+    }
+    if model.trade_dock.selected_price == Some(level.price) {
+        painter.rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(1.0, theme::WARNING),
+            egui::StrokeKind::Inside,
+        );
     }
     let font = FontId::monospace(11.5);
     painter.text(
@@ -232,6 +246,7 @@ fn book_row(
         font,
         theme::TEXT_PRIMARY,
     );
+    response.clicked()
 }
 
 fn price_mid_row(

@@ -13,16 +13,43 @@ pub struct ChartStudyPoint {
     pub open_time_ms: u64,
     pub confirmed: bool,
     pub sma: Option<Decimal>,
+    pub sma_second: Option<Decimal>,
+    pub sma_third: Option<Decimal>,
     pub ema: Option<Decimal>,
+    pub ema_second: Option<Decimal>,
+    pub ema_third: Option<Decimal>,
+    pub wma: Option<Decimal>,
+    pub wma_second: Option<Decimal>,
+    pub wma_third: Option<Decimal>,
     pub bollinger_upper: Option<Decimal>,
     pub bollinger_middle: Option<Decimal>,
     pub bollinger_lower: Option<Decimal>,
     pub vwap: Option<Decimal>,
+    pub avl: Option<Decimal>,
+    pub trix: Option<Decimal>,
+    pub sar: Option<Decimal>,
+    pub sar_rising: bool,
+    pub supertrend: Option<Decimal>,
+    pub supertrend_rising: bool,
     pub rsi: Option<Decimal>,
     pub macd: Option<Decimal>,
     pub macd_signal: Option<Decimal>,
     pub macd_histogram: Option<Decimal>,
     pub atr: Option<Decimal>,
+    pub mfi: Option<Decimal>,
+    pub kdj_k: Option<Decimal>,
+    pub kdj_d: Option<Decimal>,
+    pub kdj_j: Option<Decimal>,
+    pub obv: Option<Decimal>,
+    pub cci: Option<Decimal>,
+    pub stoch_rsi_k: Option<Decimal>,
+    pub stoch_rsi_d: Option<Decimal>,
+    pub williams_r: Option<Decimal>,
+    pub dmi_plus: Option<Decimal>,
+    pub dmi_minus: Option<Decimal>,
+    pub dmi_adx: Option<Decimal>,
+    pub momentum: Option<Decimal>,
+    pub emv: Option<Decimal>,
 }
 
 /// UI-owned display interval. It deliberately has no exchange-native representation.
@@ -61,7 +88,6 @@ impl ChartInterval {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub const fn duration_ms(self) -> u64 {
         match self {
             Self::OneMinute => 60_000,
@@ -72,6 +98,60 @@ impl ChartInterval {
             Self::OneDay => 24 * 60 * 60_000,
         }
     }
+
+    /// Wall-clock aligned spacing that keeps labels roughly fifteen candles apart.
+    pub const fn timeline_step_ms(self) -> u64 {
+        let bars = match self {
+            Self::OneMinute => 15,
+            Self::FiveMinutes => 12,
+            Self::FifteenMinutes => 16,
+            Self::OneHour => 12,
+            Self::FourHours => 12,
+            Self::OneDay => 14,
+        };
+        self.duration_ms() * bars
+    }
+}
+
+pub fn format_timeline_label(open_time_ms: u64, interval: ChartInterval) -> String {
+    let utc_seconds = i64::try_from(open_time_ms / 1_000).unwrap_or(i64::MAX);
+    let total_seconds = utc_seconds.saturating_add(local_offset_seconds(utc_seconds));
+    let days = total_seconds.div_euclid(86_400);
+    let seconds_of_day = total_seconds.rem_euclid(86_400) as u64;
+    let hour = seconds_of_day / 3_600;
+    let minute = seconds_of_day % 3_600 / 60;
+    let (year, month, day) = civil_date_from_unix_days(days);
+    match interval {
+        ChartInterval::OneMinute | ChartInterval::FiveMinutes | ChartInterval::FifteenMinutes => {
+            format!("{hour:02}:{minute:02}")
+        }
+        ChartInterval::OneHour | ChartInterval::FourHours => {
+            format!("{month:02}-{day:02} {hour:02}:{minute:02}")
+        }
+        ChartInterval::OneDay => format!("{year:04}-{month:02}-{day:02}"),
+    }
+}
+
+fn local_offset_seconds(unix_seconds: i64) -> i64 {
+    time::OffsetDateTime::from_unix_timestamp(unix_seconds)
+        .ok()
+        .and_then(|datetime| time::UtcOffset::local_offset_at(datetime).ok())
+        .map_or(0, |offset| i64::from(offset.whole_seconds()))
+}
+
+fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_phase = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_phase + 2) / 5 + 1;
+    let month = month_phase + if month_phase < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
 }
 
 /// Persisted chart navigation state. `right_offset` counts bars hidden after the window, so a
@@ -170,21 +250,22 @@ impl ChartViewport {
         if delta.is_negative() {
             let from_history = amount.min(self.right_offset);
             self.right_offset = self.right_offset.saturating_sub(from_history);
-            self.right_padding = self
-                .right_padding
-                .saturating_sub(amount.saturating_sub(from_history));
-        } else {
-            let into_padding = amount.min(visible.len().saturating_sub(self.right_padding));
+            let into_padding = amount
+                .saturating_sub(from_history)
+                .min(visible.len().saturating_sub(self.right_padding));
             self.right_padding = self.right_padding.saturating_add(into_padding);
+        } else {
+            let from_padding = amount.min(self.right_padding);
+            self.right_padding = self.right_padding.saturating_sub(from_padding);
             self.right_offset = self
                 .right_offset
-                .saturating_add(amount.saturating_sub(into_padding))
+                .saturating_add(amount.saturating_sub(from_padding))
                 .min(maximum_offset);
         }
     }
 
-    /// Converts a horizontal drag into whole-candle panning. Leftward drags first make room after
-    /// the latest candle, then reveal history; rightward drags return towards live data.
+    /// Converts a horizontal drag into whole-candle panning. Rightward drags reveal older candles;
+    /// leftward drags return towards live data and then make room after the latest candle.
     pub fn pan_by_drag(&mut self, total_bars: usize, chart_width: f32, drag_delta_x: f32) {
         let visible = self.visible_range(total_bars);
         if visible.is_empty() || !chart_width.is_finite() || chart_width <= 0.0 {
@@ -194,7 +275,7 @@ impl ChartViewport {
         if !width_per_bar.is_finite() || width_per_bar <= 0.0 {
             return;
         }
-        let delta_milli_bars = (-drag_delta_x / width_per_bar * 1_000.0).round();
+        let delta_milli_bars = (drag_delta_x / width_per_bar * 1_000.0).round();
         if delta_milli_bars.is_finite() {
             let accumulated = self
                 .drag_remainder_milli_bars
@@ -402,7 +483,10 @@ fn decimal_to_f64(value: rust_decimal::Decimal) -> Option<f64> {
 mod tests {
     use rust_decimal::Decimal;
 
-    use super::{ChartInterval, ChartViewport, PriceRange, bar_center_x, bar_index_at_x};
+    use super::{
+        ChartInterval, ChartViewport, PriceRange, bar_center_x, bar_index_at_x,
+        civil_date_from_unix_days, format_timeline_label, local_offset_seconds,
+    };
     use venue_control_protocol::UiBar;
 
     fn bar(low: i64, high: i64) -> UiBar {
@@ -422,7 +506,7 @@ mod tests {
         assert_eq!(viewport.visible_bars(), 120);
         assert_eq!(viewport.visible_range(500), 380..500);
         viewport.pan_by_bars(500, 200);
-        assert_eq!(viewport.visible_range(500), 300..420);
+        assert_eq!(viewport.visible_range(500), 180..300);
         viewport.pan_by_bars(500, 999);
         assert_eq!(viewport.visible_range(500), 0..120);
         viewport.pan_by_bars(500, -999);
@@ -457,24 +541,24 @@ mod tests {
     #[test]
     fn drag_pans_by_candle_width() {
         let mut viewport = ChartViewport::default();
-        viewport.pan_by_drag(500, 120.0, -20.0);
-        assert_eq!(viewport.right_padding(), 20);
-        assert_eq!(viewport.right_offset(), 0);
         viewport.pan_by_drag(500, 120.0, 20.0);
+        assert_eq!(viewport.right_padding(), 0);
+        assert_eq!(viewport.right_offset(), 20);
+        viewport.pan_by_drag(500, 120.0, -20.0);
         assert_eq!(viewport.right_padding(), 0);
         assert_eq!(viewport.right_offset(), 0);
     }
 
     #[test]
-    fn drag_moves_the_latest_candle_left_before_entering_history() {
+    fn drag_crosses_the_live_boundary_before_entering_history() {
         let mut viewport = ChartViewport::default();
-        viewport.pan_by_bars(500, 60);
+        viewport.pan_by_bars(500, -60);
         assert_eq!(viewport.right_padding(), 60);
         assert_eq!(viewport.visible_range(500), 380..500);
         assert_eq!(viewport.display_slots(120), 180);
 
         viewport.pan_by_bars(500, 100);
-        assert_eq!(viewport.right_padding(), 120);
+        assert_eq!(viewport.right_padding(), 0);
         assert_eq!(viewport.right_offset(), 40);
     }
 
@@ -483,7 +567,7 @@ mod tests {
         let mut viewport = ChartViewport::default();
         viewport.pan_by_bars(500, 130);
         let before = viewport.visible_range(500);
-        assert_eq!(before, 370..490);
+        assert_eq!(before, 250..370);
         assert_eq!(viewport.visible_range(501), before);
     }
 
@@ -547,5 +631,40 @@ mod tests {
         assert_eq!(ChartInterval::OneMinute.label(), "1m");
         assert_eq!(ChartInterval::FourHours.duration_ms(), 14_400_000);
         assert_eq!(ChartInterval::OneDay.duration_ms(), 86_400_000);
+    }
+
+    #[test]
+    fn timeline_steps_are_wall_clock_aligned_and_near_fifteen_bars() {
+        for (interval, expected_bars) in
+            ChartInterval::ALL.into_iter().zip([15, 12, 16, 12, 12, 14])
+        {
+            assert_eq!(
+                interval.timeline_step_ms() / interval.duration_ms(),
+                expected_bars
+            );
+        }
+    }
+
+    #[test]
+    fn timeline_labels_use_readable_local_clock_values() {
+        let new_year_2024 = 1_704_067_200_000;
+        let local_seconds = 1_704_067_200_i64.saturating_add(local_offset_seconds(1_704_067_200));
+        let local_days = local_seconds.div_euclid(86_400);
+        let local_day_seconds = local_seconds.rem_euclid(86_400) as u64;
+        let local_hour = local_day_seconds / 3_600;
+        let local_minute = local_day_seconds % 3_600 / 60;
+        let (year, month, day) = civil_date_from_unix_days(local_days);
+        assert_eq!(
+            format_timeline_label(new_year_2024, ChartInterval::OneMinute),
+            format!("{local_hour:02}:{local_minute:02}")
+        );
+        assert_eq!(
+            format_timeline_label(new_year_2024, ChartInterval::OneHour),
+            format!("{month:02}-{day:02} {local_hour:02}:{local_minute:02}")
+        );
+        assert_eq!(
+            format_timeline_label(new_year_2024, ChartInterval::OneDay),
+            format!("{year:04}-{month:02}-{day:02}")
+        );
     }
 }

@@ -686,6 +686,7 @@ fn control_request(
         instance_id: "grid_btc_primary".to_owned(),
         symbol: binding.symbol.clone(),
         action,
+        trade: None,
         expected_config_epoch: 1,
         confirmation: None,
     };
