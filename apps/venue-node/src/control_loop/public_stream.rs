@@ -1,4 +1,20 @@
 use super::*;
+#[cfg(any(
+    feature = "bitget",
+    feature = "gate",
+    feature = "bybit",
+    feature = "okx",
+    feature = "hyperliquid"
+))]
+mod pending;
+#[cfg(any(
+    feature = "bitget",
+    feature = "gate",
+    feature = "bybit",
+    feature = "okx",
+    feature = "hyperliquid"
+))]
+use pending::PendingPublicFacts;
 // Only the fixed adapter entry can choose a receiver. No config or Control request can supply
 // a socket, endpoint, or public-read capability for another venue.
 #[cfg(any(feature = "bybit", feature = "okx", feature = "hyperliquid"))]
@@ -19,7 +35,7 @@ macro_rules! normalized_public_runner {
                             venue: venue_gateway_api::VenueId::$venue,
                             message: error.to_string(),
                         })?;
-                    receivers.push((binding, receiver));
+                    receivers.push((binding, receiver, PendingPublicFacts::default()));
                 }
                 let mut last_refresh_ms = None;
                 let mut next_receiver = 0;
@@ -27,15 +43,31 @@ macro_rules! normalized_public_runner {
                     let private = refresh_signed_private_if_due(resident, &mut last_refresh_ms)?;
                     let public =
                         pump_public_batch(receivers.len(), &mut next_receiver, |index, wait| {
-                            let (binding, receiver) = &mut receivers[index];
-                            if let Some((received_at_ms, event)) = runtime
-                                .block_on(receiver.next(wait))
-                                .map_err(|error| NodeError::LiveHost {
-                                    venue: venue_gateway_api::VenueId::$venue,
-                                    message: error.to_string(),
-                                })?
-                            {
-                                resident.$publish(binding, received_at_ms, event)?;
+                            let (binding, receiver, pending) = &mut receivers[index];
+                            if pending.is_empty() {
+                                let events =
+                                    runtime.block_on(receiver.next(wait)).map_err(|error| {
+                                        NodeError::LiveHost {
+                                            venue: venue_gateway_api::VenueId::$venue,
+                                            message: error.to_string(),
+                                        }
+                                    })?;
+                                pending.install(&binding.key.symbol, events)?;
+                            }
+                            if let Some((received_at_ms, event)) = pending.pop() {
+                                match event {
+                                    event @ (venue_domain::MarketEvent::Snapshot(_)
+                                    | venue_domain::MarketEvent::Delta(_)) => {
+                                        resident.$publish(binding, received_at_ms, event)?;
+                                    }
+                                    fact => {
+                                        resident.publish_scalping_stream_fact(
+                                            binding,
+                                            received_at_ms,
+                                            fact,
+                                        )?;
+                                    }
+                                }
                                 return Ok(true);
                             }
                             Ok(false)
@@ -49,7 +81,13 @@ macro_rules! normalized_public_runner {
 
 /// Drain queued frames fairly, instead of reading one frame per slow Control poll and allowing
 /// a fast book to fall permanently behind. The frame/time budgets yield back to private work.
-#[cfg(any(feature = "bybit", feature = "okx", feature = "hyperliquid"))]
+#[cfg(any(
+    feature = "bitget",
+    feature = "gate",
+    feature = "bybit",
+    feature = "okx",
+    feature = "hyperliquid"
+))]
 fn pump_public_batch(
     count: usize,
     next_receiver: &mut usize,
@@ -81,7 +119,16 @@ fn pump_public_batch(
     Ok(progress)
 }
 
-#[cfg(all(test, any(feature = "bybit", feature = "okx", feature = "hyperliquid")))]
+#[cfg(all(
+    test,
+    any(
+        feature = "bitget",
+        feature = "gate",
+        feature = "bybit",
+        feature = "okx",
+        feature = "hyperliquid"
+    )
+))]
 mod tests {
     use super::*;
 
@@ -174,7 +221,7 @@ impl ControlResidentLoop<venue_gateway_binance::BinanceAccountGateway> {
 #[cfg(feature = "bitget")]
 impl ControlResidentLoop<venue_gateway_bitget::BitgetAccountGateway> {
     /// Bitget's resident owns the public socket for every configured Scalping actor.  The socket
-    /// yields only adapter-validated `books` records; the existing resident bridge keeps its
+    /// yields adapter-validated public facts; the existing resident bridge keeps its
     /// snapshot hidden until a covering update proves a contiguous book.
     pub fn run_bitget(mut self) -> Result<(), NodeError> {
         let runtime = public_runtime()?;
@@ -197,26 +244,53 @@ impl ControlResidentLoop<venue_gateway_bitget::BitgetAccountGateway> {
                 })?;
             self.resident
                 .register_bitget_scalping_book_bridge(&binding)?;
-            receivers.push((binding, receiver));
+            receivers.push((binding, receiver, PendingPublicFacts::default()));
         }
         let mut last_refresh_ms = None;
+        let mut next_receiver = 0;
         self.run_with_private_pump(move |resident| {
             let private = refresh_signed_private_if_due(resident, &mut last_refresh_ms)?;
-            let mut public = false;
-            for (binding, receiver) in &mut receivers {
-                match runtime.block_on(receiver.next(Duration::from_millis(5))) {
-                    Ok(Some(venue_gateway_bitget::BitgetScalpingBookFrame::Books(message))) => {
-                        public |= resident.ingest_bitget_scalping_book(binding, message)?;
-                    }
-                    Ok(None) | Err(venue_gateway_bitget::BitgetPublicWsError::Idle) => {}
-                    Err(error) => {
-                        return Err(NodeError::LiveHost {
-                            venue: venue_gateway_api::VenueId::Bitget,
-                            message: error.to_string(),
-                        });
+            let public = pump_public_batch(receivers.len(), &mut next_receiver, |index, wait| {
+                use venue_gateway_bitget::BitgetScalpingPublicFrame as Frame;
+                let (binding, receiver, pending) = &mut receivers[index];
+                if pending.is_empty() {
+                    match runtime.block_on(receiver.next(wait)) {
+                        Ok(Some(Frame::Books(message))) => {
+                            resident.ingest_bitget_scalping_book(binding, message)?;
+                            return Ok(true);
+                        }
+                        Ok(Some(Frame::Trades(batch))) => pending.install(
+                            &binding.key.symbol,
+                            batch.trades.into_iter().map(|value| {
+                                (
+                                    value.trade.received_at_ms,
+                                    venue_domain::MarketEvent::Trade(value.trade),
+                                )
+                            }),
+                        )?,
+                        Ok(Some(Frame::ClosedBars(batch))) => pending.install(
+                            &binding.key.symbol,
+                            batch.bars.into_iter().map(|bar| {
+                                (bar.received_at_ms, venue_domain::MarketEvent::Bar(bar))
+                            }),
+                        )?,
+                        Ok(None) | Err(venue_gateway_bitget::BitgetPublicWsError::Idle) => {
+                            return Ok(false);
+                        }
+                        Err(error) => {
+                            return Err(NodeError::LiveHost {
+                                venue: venue_gateway_api::VenueId::Bitget,
+                                message: error.to_string(),
+                            });
+                        }
                     }
                 }
-            }
+                if let Some((time, event)) = pending.pop() {
+                    resident.publish_scalping_stream_fact(binding, time, event)?;
+                    return Ok(true);
+                }
+                Ok(false)
+            })?;
             Ok(private || public)
         })
     }
@@ -251,29 +325,57 @@ impl ControlResidentLoop<venue_gateway_gate::GateAccountGateway> {
                 })?;
             self.resident
                 .register_gate_scalping_book_bridge(&binding, bridge)?;
-            receivers.push((binding, receiver));
+            receivers.push((binding, receiver, PendingPublicFacts::default()));
         }
         let mut last_refresh_ms = None;
+        let mut next_receiver = 0;
         self.run_with_private_pump(move |resident| {
             let private = refresh_signed_private_if_due(resident, &mut last_refresh_ms)?;
-            let mut public = false;
-            for (binding, receiver) in &mut receivers {
-                match runtime.block_on(receiver.next(Duration::from_millis(5))) {
-                    Ok(Some(venue_gateway_gate::GateScalpingBookFrame::Snapshot(snapshot))) => {
-                        public |= resident.ingest_gate_scalping_snapshot(binding, snapshot)?;
-                    }
-                    Ok(Some(venue_gateway_gate::GateScalpingBookFrame::Delta(delta))) => {
-                        public |= resident.ingest_gate_scalping_delta(binding, delta)?;
-                    }
-                    Ok(None) | Err(venue_gateway_gate::GatePublicWsError::Idle) => {}
-                    Err(error) => {
-                        return Err(NodeError::LiveHost {
-                            venue: venue_gateway_api::VenueId::Gate,
-                            message: error.to_string(),
-                        });
+            let public = pump_public_batch(receivers.len(), &mut next_receiver, |index, wait| {
+                use venue_gateway_gate::GateScalpingPublicFrame as Frame;
+                let (binding, receiver, pending) = &mut receivers[index];
+                if pending.is_empty() {
+                    match runtime.block_on(receiver.next(wait)) {
+                        Ok(Some(Frame::Snapshot(snapshot))) => {
+                            resident.ingest_gate_scalping_snapshot(binding, snapshot)?;
+                            return Ok(true);
+                        }
+                        Ok(Some(Frame::Delta(delta))) => {
+                            resident.ingest_gate_scalping_delta(binding, delta)?;
+                            return Ok(true);
+                        }
+                        Ok(Some(Frame::Trades(batch))) => pending.install(
+                            &binding.key.symbol,
+                            batch.trades.into_iter().map(|trade| {
+                                (
+                                    trade.received_at_ms,
+                                    venue_domain::MarketEvent::Trade(trade),
+                                )
+                            }),
+                        )?,
+                        Ok(Some(Frame::ClosedBars(batch))) => pending.install(
+                            &binding.key.symbol,
+                            batch.bars.into_iter().map(|bar| {
+                                (bar.received_at_ms, venue_domain::MarketEvent::Bar(bar))
+                            }),
+                        )?,
+                        Ok(None) | Err(venue_gateway_gate::GatePublicWsError::Idle) => {
+                            return Ok(false);
+                        }
+                        Err(error) => {
+                            return Err(NodeError::LiveHost {
+                                venue: venue_gateway_api::VenueId::Gate,
+                                message: error.to_string(),
+                            });
+                        }
                     }
                 }
-            }
+                if let Some((time, event)) = pending.pop() {
+                    resident.publish_scalping_stream_fact(binding, time, event)?;
+                    return Ok(true);
+                }
+                Ok(false)
+            })?;
             Ok(private || public)
         })
     }

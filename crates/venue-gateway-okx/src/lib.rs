@@ -61,7 +61,10 @@ pub use private_ws::{
     build_private_subscribe, build_ws_login, parse_ws_account, parse_ws_login_ack, parse_ws_orders,
     parse_ws_positions,
 };
-pub use public::{OkxInstrument, OkxNotionalSize, parse_bbo, parse_instrument};
+pub use public::{
+    OkxInstrument, OkxNotionalSize, parse_bbo, parse_closed_1m_candle, parse_instrument,
+    parse_trades,
+};
 pub use public_ws::{OkxPublicWsError, OkxScalpingPublicReceiver};
 pub use readback::{
     OKX_PRIVATE_MAX_PAGES, OKX_PRIVATE_PAGE_LIMIT, OKX_PRIVATE_READBACK_SCHEMA_VERSION,
@@ -156,6 +159,7 @@ mod tests {
         let live = config(GatewayMode::Live)?;
         assert_eq!(live.rest_origin(), "https://www.okx.com");
         assert_eq!(live.public_ws(), "wss://ws.okx.com:8443/ws/v5/public");
+        assert_eq!(live.business_ws(), "wss://ws.okx.com:8443/ws/v5/business");
         assert_eq!(live.private_ws(), "wss://ws.okx.com:8443/ws/v5/private");
         assert_eq!(live.gateway_binding().mode, GatewayMode::Live);
         assert_eq!(live.gateway_binding().symbol.to_string(), "BTC/USDT");

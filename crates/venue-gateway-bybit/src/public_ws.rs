@@ -6,8 +6,9 @@
 //! reconstructed book as a complete snapshot rather than manufacturing a delta predecessor.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     str::FromStr,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -23,7 +24,10 @@ use tokio_tungstenite::{
 use venue_domain::domain::{MarketEvent, MarketLevel, MarketSnapshot, Price};
 use venue_gateway_api::{GatewayBinding, VenueId};
 
-use crate::{BybitGatewayBinding, linear_native_symbol};
+use crate::{
+    BybitGatewayBinding, BybitPublicError, linear_native_symbol, parse_closed_1m_kline,
+    parse_public_trades,
+};
 
 const BOOK_DEPTH: u16 = 50;
 // A depth-50 delta can transiently introduce a new price before the displaced level is removed.
@@ -34,6 +38,8 @@ const MAX_BODY_BYTES: usize = 2 * 1_024 * 1_024;
 const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 const HEARTBEAT_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_TRACKED_TRADES: usize = 1_024;
+static LAST_PUBLIC_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -47,6 +53,9 @@ pub struct BybitScalpingPublicReceiver {
     next_heartbeat_at: Instant,
     heartbeat_sequence: u64,
     heartbeat_pending: bool,
+    bars: ClosedBarGuard,
+    trades: PublicTradeGuard,
+    failed: bool,
 }
 
 impl BybitScalpingPublicReceiver {
@@ -65,7 +74,7 @@ impl BybitScalpingPublicReceiver {
         let binding = BybitGatewayBinding::new(binding).map_err(|_| BybitPublicWsError::Binding)?;
         let native_symbol = linear_native_symbol(&binding.gateway_binding().symbol)
             .map_err(|_| BybitPublicWsError::Binding)?;
-        let generation = now_ms()?;
+        let generation = next_generation()?;
         let websocket = WebSocketConfig::default()
             .max_message_size(Some(max_body_bytes))
             .max_frame_size(Some(max_body_bytes));
@@ -77,8 +86,15 @@ impl BybitScalpingPublicReceiver {
         .await
         .map_err(|_| BybitPublicWsError::Timeout)?
         .map_err(|_| BybitPublicWsError::Disconnected)?;
-        let topic = book_topic(&native_symbol);
-        let subscribe = json!({"op":"subscribe","args":[topic]}).to_string();
+        let subscribe = json!({
+            "op":"subscribe",
+            "args":[
+                book_topic(&native_symbol),
+                kline_topic(&native_symbol),
+                public_trade_topic(&native_symbol),
+            ],
+        })
+        .to_string();
         timeout(
             remaining(deadline)?,
             socket.send(Message::Text(subscribe.into())),
@@ -94,6 +110,9 @@ impl BybitScalpingPublicReceiver {
             next_heartbeat_at: Instant::now() + HEARTBEAT_INTERVAL,
             heartbeat_sequence: 0,
             heartbeat_pending: false,
+            bars: ClosedBarGuard::new(generation),
+            trades: PublicTradeGuard::default(),
+            failed: false,
         })
     }
 
@@ -102,39 +121,44 @@ impl BybitScalpingPublicReceiver {
         self.bridge.generation
     }
 
-    /// Reads at most one frame. Idle, successful subscription acknowledgements, and heartbeat
-    /// traffic do not become strategy facts. Any malformed, rejected, crossed, or out-of-order
-    /// book frame is terminal for this receiver; callers must discard the generation.
+    /// Reads at most one adapter-validated frame. A closed `kline.1` becomes a bar; a forming
+    /// bar, ACK, or heartbeat becomes an empty batch. Public trades retain Bybit's opaque UUID
+    /// and never promote its cross sequence as a continuous normalized predecessor.
     pub async fn next(
         &mut self,
         wait: Duration,
-    ) -> Result<Option<(u64, MarketEvent)>, BybitPublicWsError> {
-        self.send_heartbeat_if_due().await?;
-        let Some(frame) = (match timeout(wait, self.socket.next()).await {
-            Ok(frame) => frame,
-            Err(_) => return Ok(None),
-        }) else {
-            return Err(BybitPublicWsError::Disconnected);
+    ) -> Result<Vec<(u64, MarketEvent)>, BybitPublicWsError> {
+        if self.failed {
+            return Err(BybitPublicWsError::Terminal);
+        }
+        if let Err(error) = self.send_heartbeat_if_due().await {
+            return self.fail(error);
+        }
+        let frame = match timeout(wait, self.socket.next()).await {
+            Ok(Some(Ok(frame))) => frame,
+            Ok(Some(Err(_))) | Ok(None) => return self.fail(BybitPublicWsError::Disconnected),
+            Err(_) => return Ok(Vec::new()),
         };
-        let frame = frame.map_err(|_| BybitPublicWsError::Disconnected)?;
-        match frame {
+        let result = match frame {
             Message::Text(value) => self.parse_text(value.to_string()),
             Message::Binary(value) => String::from_utf8(value.to_vec())
                 .map_err(|_| BybitPublicWsError::Protocol)
                 .and_then(|value| self.parse_text(value)),
-            Message::Ping(value) => {
-                timeout(
-                    self.connect_timeout.min(HEARTBEAT_SEND_TIMEOUT),
-                    self.socket.send(Message::Pong(value)),
-                )
-                .await
-                .map_err(|_| BybitPublicWsError::Timeout)?
-                .map_err(|_| BybitPublicWsError::Disconnected)?;
-                Ok(None)
-            }
-            Message::Pong(_) => Ok(None),
+            Message::Ping(value) => timeout(
+                self.connect_timeout.min(HEARTBEAT_SEND_TIMEOUT),
+                self.socket.send(Message::Pong(value)),
+            )
+            .await
+            .map_err(|_| BybitPublicWsError::Timeout)
+            .and_then(|result| result.map_err(|_| BybitPublicWsError::Disconnected))
+            .map(|_| Vec::new()),
+            Message::Pong(_) => Ok(Vec::new()),
             Message::Close(_) => Err(BybitPublicWsError::Disconnected),
             Message::Frame(_) => Err(BybitPublicWsError::Protocol),
+        };
+        match result {
+            Ok(events) => Ok(events),
+            Err(error) => self.fail(error),
         }
     }
 
@@ -169,7 +193,7 @@ impl BybitScalpingPublicReceiver {
     fn parse_text(
         &mut self,
         payload: String,
-    ) -> Result<Option<(u64, MarketEvent)>, BybitPublicWsError> {
+    ) -> Result<Vec<(u64, MarketEvent)>, BybitPublicWsError> {
         if payload.is_empty() || payload.len() > self.maximum_body_bytes {
             return Err(BybitPublicWsError::BodyTooLarge);
         }
@@ -183,17 +207,197 @@ impl BybitScalpingPublicReceiver {
             return self.handle_control(op, root);
         }
         let received_at_ms = now_ms()?;
-        self.bridge.accept(root, received_at_ms).map(Some)
+        let topic = required_text(root, "topic")?;
+        if topic == book_topic(&self.bridge.native_symbol) {
+            return self
+                .bridge
+                .accept(root, received_at_ms)
+                .map(|event| vec![event]);
+        }
+        if topic == kline_topic(&self.bridge.native_symbol) {
+            return match parse_closed_1m_kline(
+                &payload,
+                &self.bridge.binding,
+                self.bridge.generation,
+                received_at_ms,
+            ) {
+                Ok(bar) => self.bars.accept(bar).map(|bar| {
+                    bar.into_iter()
+                        .map(|bar| (received_at_ms, MarketEvent::Bar(bar)))
+                        .collect()
+                }),
+                Err(BybitPublicError::BarNotClosed) => Ok(Vec::new()),
+                Err(_) => Err(BybitPublicWsError::Protocol),
+            };
+        }
+        if topic == public_trade_topic(&self.bridge.native_symbol) {
+            return parse_public_trades(
+                &payload,
+                &self.bridge.binding,
+                self.bridge.generation,
+                received_at_ms,
+            )
+            .and_then(|trades| {
+                self.trades
+                    .accept(trades)
+                    .map_err(|_| BybitPublicError::Sequence)
+            })
+            .map(|trades| {
+                trades
+                    .into_iter()
+                    .map(|trade| (received_at_ms, MarketEvent::Trade(trade)))
+                    .collect()
+            })
+            .map_err(|_| BybitPublicWsError::Protocol);
+        }
+        Err(BybitPublicWsError::Binding)
     }
 
     fn handle_control(
         &mut self,
         op: &str,
         root: &Map<String, Value>,
-    ) -> Result<Option<(u64, MarketEvent)>, BybitPublicWsError> {
+    ) -> Result<Vec<(u64, MarketEvent)>, BybitPublicWsError> {
         validate_control(op, root)?;
-        Ok(None)
+        Ok(Vec::new())
     }
+
+    fn fail<T>(&mut self, error: BybitPublicWsError) -> Result<T, BybitPublicWsError> {
+        self.failed = true;
+        Err(error)
+    }
+}
+
+#[derive(Default)]
+struct PublicTradeGuard {
+    generation: Option<u64>,
+    by_id: BTreeMap<String, venue_domain::domain::PublicTrade>,
+    order: VecDeque<String>,
+}
+
+impl PublicTradeGuard {
+    fn accept(
+        &mut self,
+        trades: Vec<venue_domain::domain::PublicTrade>,
+    ) -> Result<Vec<venue_domain::domain::PublicTrade>, BybitPublicWsError> {
+        let mut accepted = Vec::with_capacity(trades.len());
+        for trade in trades {
+            if !trade.is_valid() {
+                return Err(BybitPublicWsError::Protocol);
+            }
+            match self.generation {
+                Some(generation) if trade.generation < generation => {
+                    return Err(BybitPublicWsError::Sequence);
+                }
+                Some(generation) if trade.generation == generation => {}
+                _ => {
+                    self.generation = Some(trade.generation);
+                    self.by_id.clear();
+                    self.order.clear();
+                }
+            }
+            let venue_domain::domain::PublicTradeId::Opaque(id) = &trade.aggregate_trade_id else {
+                return Err(BybitPublicWsError::Protocol);
+            };
+            if let Some(previous) = self.by_id.get(id) {
+                if same_trade(previous, &trade) {
+                    continue;
+                }
+                return Err(BybitPublicWsError::Sequence);
+            }
+            let id = id.clone();
+            let _ = self.by_id.insert(id.clone(), trade.clone());
+            self.order.push_back(id);
+            if self.order.len() > MAX_TRACKED_TRADES {
+                if let Some(expired) = self.order.pop_front() {
+                    let _ = self.by_id.remove(&expired);
+                }
+            }
+            accepted.push(trade);
+        }
+        Ok(accepted)
+    }
+}
+
+/// A completed candle may be replayed after subscription or reconnect. Its opening bucket is the
+/// only native identity available, so an exact repeat is suppressed while a changed or older
+/// bucket fences the receiver rather than revising an already emitted strategy fact.
+struct ClosedBarGuard {
+    generation: u64,
+    latest: Option<venue_domain::domain::PublicBar>,
+}
+
+impl ClosedBarGuard {
+    const fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            latest: None,
+        }
+    }
+
+    fn accept(
+        &mut self,
+        bar: venue_domain::domain::PublicBar,
+    ) -> Result<Option<venue_domain::domain::PublicBar>, BybitPublicWsError> {
+        if bar.generation != self.generation {
+            self.generation = bar.generation;
+            self.latest = None;
+        }
+        let Some(previous) = self.latest.as_ref() else {
+            self.latest = Some(bar.clone());
+            return Ok(Some(bar));
+        };
+        if bar.sequence < previous.sequence {
+            return Err(BybitPublicWsError::Sequence);
+        }
+        if bar.sequence == previous.sequence {
+            return if same_bar(previous, &bar) {
+                Ok(None)
+            } else {
+                Err(BybitPublicWsError::Protocol)
+            };
+        }
+        self.latest = Some(bar.clone());
+        Ok(Some(bar))
+    }
+}
+
+fn same_bar(
+    left: &venue_domain::domain::PublicBar,
+    right: &venue_domain::domain::PublicBar,
+) -> bool {
+    left.symbol == right.symbol
+        && left.generation == right.generation
+        && left.sequence == right.sequence
+        && left.open_time_ms == right.open_time_ms
+        && left.close_time_ms == right.close_time_ms
+        && left.interval_ms == right.interval_ms
+        && left.open == right.open
+        && left.high == right.high
+        && left.low == right.low
+        && left.close == right.close
+        && left.base_volume == right.base_volume
+        && left.quote_volume == right.quote_volume
+        && left.trade_count == right.trade_count
+        && left.taker_buy_base_volume == right.taker_buy_base_volume
+        && left.taker_buy_quote_volume == right.taker_buy_quote_volume
+}
+
+fn same_trade(
+    left: &venue_domain::domain::PublicTrade,
+    right: &venue_domain::domain::PublicTrade,
+) -> bool {
+    left.symbol == right.symbol
+        && left.generation == right.generation
+        && left.transaction_time_ms == right.transaction_time_ms
+        && left.aggregate_trade_id == right.aggregate_trade_id
+        && left.first_trade_id == right.first_trade_id
+        && left.last_trade_id == right.last_trade_id
+        && left.ordering == right.ordering
+        && left.price == right.price
+        && left.quantity == right.quantity
+        && left.quote_quantity == right.quote_quantity
+        && left.aggressor == right.aggressor
 }
 
 struct BybitBookBridge {
@@ -275,10 +479,7 @@ impl BybitBookBridge {
             {
                 return Err(BybitPublicWsError::Sequence);
             }
-            self.generation = self
-                .generation
-                .checked_add(1)
-                .ok_or(BybitPublicWsError::Sequence)?;
+            self.generation = next_generation()?;
         }
         self.bids = levels_to_book(&bids)?;
         self.asks = levels_to_book(&asks)?;
@@ -350,6 +551,14 @@ fn remaining(deadline: Instant) -> Result<Duration, BybitPublicWsError> {
 
 fn book_topic(native_symbol: &str) -> String {
     format!("orderbook.{BOOK_DEPTH}.{native_symbol}")
+}
+
+fn kline_topic(native_symbol: &str) -> String {
+    format!("kline.1.{native_symbol}")
+}
+
+fn public_trade_topic(native_symbol: &str) -> String {
+    format!("publicTrade.{native_symbol}")
 }
 
 fn validate_control(op: &str, root: &Map<String, Value>) -> Result<(), BybitPublicWsError> {
@@ -545,6 +754,27 @@ fn now_ms() -> Result<u64, BybitPublicWsError> {
     .map_err(|_| BybitPublicWsError::Clock)
 }
 
+fn next_generation() -> Result<u64, BybitPublicWsError> {
+    let wall_clock = now_ms()?;
+    let mut observed = LAST_PUBLIC_GENERATION.load(Ordering::Relaxed);
+    loop {
+        let candidate = wall_clock.max(
+            observed
+                .checked_add(1)
+                .ok_or(BybitPublicWsError::Sequence)?,
+        );
+        match LAST_PUBLIC_GENERATION.compare_exchange_weak(
+            observed,
+            candidate,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(candidate),
+            Err(current) => observed = current,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum BybitPublicWsError {
     #[error("Bybit public receiver binding is invalid")]
@@ -569,6 +799,8 @@ pub enum BybitPublicWsError {
     Sequence,
     #[error("Bybit public order-book is empty, crossed, or structurally invalid")]
     Book,
+    #[error("Bybit public receiver is terminal after an earlier failure")]
+    Terminal,
 }
 
 #[cfg(test)]
@@ -649,7 +881,7 @@ mod tests {
         let MarketEvent::Snapshot(reset) = reset else {
             return Err(BybitPublicWsError::Protocol);
         };
-        assert_eq!(reset.generation, 8);
+        assert!(reset.generation > 7);
         let duplicate = SNAPSHOT.replace("\"type\": \"snapshot\"", "\"type\": \"delta\"");
         assert_eq!(
             stream_bridge.accept(&root(&duplicate)?, 1_002),
@@ -690,6 +922,79 @@ mod tests {
             ),
             Ok(())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn closed_bar_guard_deduplicates_only_exact_replays() -> Result<(), BybitPublicWsError> {
+        let binding = GatewayBinding::new(
+            VenueId::Bybit,
+            GatewayMode::Live,
+            ACCOUNT,
+            "BTC/USDT"
+                .parse()
+                .map_err(|_| BybitPublicWsError::Binding)?,
+        )
+        .map_err(|_| BybitPublicWsError::Binding)?;
+        let bar = parse_closed_1m_kline(
+            include_str!("../fixtures/public-ws-kline-1m-closed.json"),
+            &binding,
+            7,
+            1_672_324_860_100,
+        )
+        .map_err(|_| BybitPublicWsError::Protocol)?;
+        let mut guard = ClosedBarGuard::new(7);
+        assert!(guard.accept(bar.clone())?.is_some());
+        let mut replay = bar.clone();
+        replay.received_at_ms += 1;
+        assert_eq!(guard.accept(replay)?, None);
+        let mut changed = bar.clone();
+        changed.close =
+            Price::new(Decimal::new(16_676, 0)).map_err(|_| BybitPublicWsError::Protocol)?;
+        assert_eq!(guard.accept(changed), Err(BybitPublicWsError::Protocol));
+        let mut older = bar;
+        older.sequence -= 1;
+        assert_eq!(guard.accept(older), Err(BybitPublicWsError::Sequence));
+        Ok(())
+    }
+
+    #[test]
+    fn public_trade_guard_deduplicates_uuid_and_fences_conflict() -> Result<(), BybitPublicWsError>
+    {
+        let binding = GatewayBinding::new(
+            VenueId::Bybit,
+            GatewayMode::Live,
+            ACCOUNT,
+            "BTC/USDT"
+                .parse()
+                .map_err(|_| BybitPublicWsError::Binding)?,
+        )
+        .map_err(|_| BybitPublicWsError::Binding)?;
+        let trades = parse_public_trades(
+            include_str!("../fixtures/public-ws-trades.json"),
+            &binding,
+            7,
+            1_672_304_486_900,
+        )
+        .map_err(|_| BybitPublicWsError::Protocol)?;
+        let mut guard = PublicTradeGuard::default();
+        assert_eq!(guard.accept(trades.clone())?.len(), 2);
+        assert!(guard.accept(trades.clone())?.is_empty());
+        let mut replay = trades.clone();
+        for trade in &mut replay {
+            trade.exchange_time_ms += 1;
+            trade.received_at_ms += 1;
+        }
+        assert!(guard.accept(replay)?.is_empty());
+        let mut changed = trades.clone();
+        changed[0].quantity += Decimal::ONE;
+        assert_eq!(guard.accept(changed), Err(BybitPublicWsError::Sequence));
+        let mut replacement = trades.clone();
+        for trade in &mut replacement {
+            trade.generation += 1;
+        }
+        assert_eq!(guard.accept(replacement)?.len(), 2);
+        assert_eq!(guard.accept(trades), Err(BybitPublicWsError::Sequence));
         Ok(())
     }
 
@@ -748,8 +1053,11 @@ mod tests {
             BybitScalpingPublicReceiver::connect(binding()?, Duration::from_secs(10), 64 * 1_024)
                 .await?;
         for _ in 0..5 {
-            if let Some((received_at_ms, MarketEvent::Snapshot(snapshot))) =
-                receiver.next(Duration::from_secs(2)).await?
+            if let Some((received_at_ms, MarketEvent::Snapshot(snapshot))) = receiver
+                .next(Duration::from_secs(2))
+                .await?
+                .into_iter()
+                .next()
             {
                 assert!(received_at_ms > 0);
                 assert!(snapshot.sequence > 0);

@@ -56,9 +56,9 @@ fn aggregate_trade_requires_complete_native_identity_and_times()
 -> Result<(), Box<dyn std::error::Error>> {
     let envelope = parse_public_trade(TRADE, &binding()?, 9, 1_720_000_000_330)?;
     let fact = envelope.fact();
-    assert_eq!(fact.aggregate_trade_id, 9_001);
-    assert_eq!(fact.first_trade_id, 8_101);
-    assert_eq!(fact.last_trade_id, 8_103);
+    assert_eq!(fact.aggregate_trade_id, 9_001_u64.into());
+    assert_eq!(fact.first_trade_id, Some(8_101));
+    assert_eq!(fact.last_trade_id, Some(8_103));
     assert_eq!(fact.exchange_time_ms, 1_720_000_000_323);
     assert_eq!(fact.transaction_time_ms, 1_720_000_000_320);
     assert_eq!(fact.quantity, Decimal::new(20, 3));

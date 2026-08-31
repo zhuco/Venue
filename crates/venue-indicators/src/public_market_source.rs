@@ -183,12 +183,20 @@ impl ScalpingPublicMarketSource {
                         frame: None,
                     });
                 }
-                if let Err(source) = self.builder.ingest_book(book, input.received_at_ms) {
+                let Some(source_time_ms) = snapshot.exchange_time_ms.filter(|time_ms| *time_ms > 0)
+                else {
+                    return self.reject(
+                        capture_sequence,
+                        event_generation,
+                        PublicMarketSourceError::Identity,
+                    );
+                };
+                if let Err(source) = self.builder.ingest_book(book, source_time_ms) {
                     return Err(self.feature_failure(capture_sequence, source));
                 }
                 feature_updated = true;
             }
-            MarketEvent::Delta(_delta) => {
+            MarketEvent::Delta(delta) => {
                 if self.generation != Some(event_generation)
                     || book.generation() != Some(event_generation)
                     || !book.bridged()
@@ -199,12 +207,29 @@ impl ScalpingPublicMarketSource {
                         PublicMarketSourceError::Generation,
                     );
                 }
-                if let Err(source) = self.builder.ingest_book(book, input.received_at_ms) {
+                let Some(source_time_ms) = delta.exchange_time_ms.filter(|time_ms| *time_ms > 0)
+                else {
+                    return self.reject(
+                        capture_sequence,
+                        event_generation,
+                        PublicMarketSourceError::Identity,
+                    );
+                };
+                if let Err(source) = self.builder.ingest_book(book, source_time_ms) {
                     return Err(self.feature_failure(capture_sequence, source));
                 }
                 feature_updated = true;
             }
             MarketEvent::Trade(trade) => {
+                // A recorded trade may be queued before its book bridges, but it may never carry
+                // an undeclared cursor or invalid economics into that queue.
+                if !trade.is_valid() || trade.sequence().is_none() {
+                    return self.reject(
+                        capture_sequence,
+                        event_generation,
+                        PublicMarketSourceError::Identity,
+                    );
+                }
                 if self.generation == Some(event_generation)
                     && book.generation() == Some(event_generation)
                     && book.bridged()
@@ -431,7 +456,159 @@ impl From<FeatureBuildError> for PublicMarketSourceError {
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal::Decimal;
+    use venue_domain::{
+        AggressorSide, FieldState, MarketDelta, MarketEvent, MarketLevel, MarketSnapshot, Price,
+        PublicBar, PublicTrade, PublicTradeId, PublicTradeOrdering,
+    };
+
+    use crate::{OrderBook, TRADES_SOURCE};
+
     use super::*;
+
+    const GENERATION: u64 = 1;
+    const NOW_MS: u64 = 1_340_100;
+
+    fn source() -> Result<ScalpingPublicMarketSource, Box<dyn std::error::Error>> {
+        Ok(ScalpingPublicMarketSource::new(
+            "BTC/USDT".parse()?,
+            "scalping-shadow-v1",
+            "0".repeat(64),
+            65_000,
+            NonZeroUsize::new(2_048).ok_or("history")?,
+        )?)
+    }
+
+    fn level(price: i64, quantity: i64) -> Result<MarketLevel, Box<dyn std::error::Error>> {
+        Ok(MarketLevel {
+            price: Price::new(Decimal::from(price))?,
+            quantity: Decimal::from(quantity),
+        })
+    }
+
+    fn snapshot(sequence: u64) -> Result<MarketSnapshot, Box<dyn std::error::Error>> {
+        Ok(MarketSnapshot {
+            symbol: "BTC/USDT".parse()?,
+            generation: GENERATION,
+            sequence,
+            exchange_time_ms: Some(1_340_000),
+            bids: vec![level(99, 4)?],
+            asks: vec![level(101, 1)?],
+        })
+    }
+
+    fn delta(
+        sequence: u64,
+        previous_sequence: u64,
+    ) -> Result<MarketDelta, Box<dyn std::error::Error>> {
+        Ok(MarketDelta {
+            symbol: "BTC/USDT".parse()?,
+            generation: GENERATION,
+            first_sequence: sequence,
+            previous_sequence: Some(previous_sequence),
+            sequence,
+            exchange_time_ms: Some(1_340_000),
+            bids: vec![level(99, 5)?],
+            asks: vec![level(101, 1)?],
+        })
+    }
+
+    fn closed_bar(sequence: u64) -> Result<PublicBar, Box<dyn std::error::Error>> {
+        let open_time_ms = sequence * 60_000;
+        Ok(PublicBar {
+            symbol: "BTC/USDT".parse()?,
+            generation: GENERATION,
+            received_at_ms: open_time_ms + 60_000,
+            sequence,
+            open_time_ms,
+            close_time_ms: open_time_ms + 59_999,
+            interval_ms: 60_000,
+            open: Price::new(Decimal::from(100))?,
+            high: Price::new(Decimal::from(101))?,
+            low: Price::new(Decimal::from(99))?,
+            close: Price::new(Decimal::from(100))?,
+            base_volume: FieldState::Known(Decimal::from(10)),
+            quote_volume: FieldState::Known(Decimal::from(1_000)),
+            trade_count: FieldState::Known(1),
+            taker_buy_base_volume: FieldState::Known(Decimal::from(4)),
+            taker_buy_quote_volume: FieldState::Known(Decimal::from(400)),
+        })
+    }
+
+    fn session_trade(sequence: u64) -> Result<PublicTrade, Box<dyn std::error::Error>> {
+        let exchange_time_ms = 1_340_000 + sequence;
+        Ok(PublicTrade {
+            symbol: "BTC/USDT".parse()?,
+            generation: GENERATION,
+            received_at_ms: exchange_time_ms + 1,
+            exchange_time_ms,
+            transaction_time_ms: exchange_time_ms,
+            aggregate_trade_id: PublicTradeId::Opaque(format!("bybit-{sequence}")),
+            first_trade_id: None,
+            last_trade_id: None,
+            ordering: PublicTradeOrdering::Session { sequence },
+            price: Price::new(Decimal::from(100))?,
+            quantity: Decimal::ONE,
+            quote_quantity: Decimal::from(100),
+            aggressor: FieldState::Known(AggressorSide::Buy),
+        })
+    }
+
+    fn consume(
+        source: &mut ScalpingPublicMarketSource,
+        book: &OrderBook,
+        capture_sequence: &mut u64,
+        event: MarketEvent,
+        received_at_ms: u64,
+    ) -> Result<(), PublicMarketSourceError> {
+        *capture_sequence = capture_sequence.saturating_add(1);
+        source.consume_batched(
+            RecordedPublicEvent {
+                capture_sequence: *capture_sequence,
+                received_at_ms,
+                event,
+            },
+            book,
+            NOW_MS,
+        )?;
+        Ok(())
+    }
+
+    fn bridged_source()
+    -> Result<(ScalpingPublicMarketSource, OrderBook, u64), Box<dyn std::error::Error>> {
+        let mut source = source()?;
+        let mut book = OrderBook::default();
+        let mut capture_sequence = 0;
+
+        let initial = snapshot(1)?;
+        book.apply_snapshot(initial.clone());
+        consume(
+            &mut source,
+            &book,
+            &mut capture_sequence,
+            MarketEvent::Snapshot(initial),
+            1_340_000,
+        )?;
+        let first = delta(2, 1)?;
+        book.apply_delta(first.clone())?;
+        consume(
+            &mut source,
+            &book,
+            &mut capture_sequence,
+            MarketEvent::Delta(first),
+            1_340_001,
+        )?;
+        let second = delta(3, 2)?;
+        book.apply_delta(second.clone())?;
+        consume(
+            &mut source,
+            &book,
+            &mut capture_sequence,
+            MarketEvent::Delta(second),
+            1_340_002,
+        )?;
+        Ok((source, book, capture_sequence))
+    }
 
     #[test]
     fn source_starts_warmup_without_private_inputs() -> Result<(), Box<dyn std::error::Error>> {
@@ -445,6 +622,262 @@ mod tests {
         )?;
         assert_eq!(source.state(), FeatureState::Warmup);
         assert_eq!(source.generation(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn session_observed_window_reaches_ready_after_book_21_bars_and_64_trades()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut source, book, mut capture_sequence) = bridged_source()?;
+        for sequence in 1..=21 {
+            let bar = closed_bar(sequence)?;
+            consume(
+                &mut source,
+                &book,
+                &mut capture_sequence,
+                MarketEvent::Bar(bar.clone()),
+                bar.received_at_ms,
+            )?;
+        }
+        for sequence in 1..=64 {
+            let trade = session_trade(sequence)?;
+            consume(
+                &mut source,
+                &book,
+                &mut capture_sequence,
+                MarketEvent::Trade(trade.clone()),
+                trade.received_at_ms,
+            )?;
+        }
+
+        let frame = source.sample_batched_frame(NOW_MS)?.ok_or("ready frame")?;
+        assert_eq!(source.state(), FeatureState::Ready);
+        assert_eq!(frame.state, FeatureState::Ready);
+        assert_eq!(frame.cursors[TRADES_SOURCE].sequence, 64);
+        assert_eq!(
+            frame.feature_versions[TRADES_SOURCE],
+            "pulse-orderflow-v1-session-observed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn late_book_source_time_cannot_be_refreshed_by_a_new_receipt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut source, mut book, mut capture_sequence) = bridged_source()?;
+        for sequence in 1..=21 {
+            let bar = closed_bar(sequence)?;
+            consume(
+                &mut source,
+                &book,
+                &mut capture_sequence,
+                MarketEvent::Bar(bar.clone()),
+                bar.received_at_ms,
+            )?;
+        }
+        for sequence in 1..=64 {
+            let trade = session_trade(sequence)?;
+            consume(
+                &mut source,
+                &book,
+                &mut capture_sequence,
+                MarketEvent::Trade(trade.clone()),
+                trade.received_at_ms,
+            )?;
+        }
+        assert_eq!(
+            source.sample_batched_frame(NOW_MS)?.ok_or("ready")?.state,
+            FeatureState::Ready
+        );
+
+        let mut late = delta(4, 3)?;
+        late.exchange_time_ms = Some(1_340_001);
+        book.apply_delta(late.clone())?;
+        capture_sequence = capture_sequence.saturating_add(1);
+        let late_now_ms = NOW_MS + 65_001;
+        source.consume_batched(
+            RecordedPublicEvent {
+                capture_sequence,
+                received_at_ms: late_now_ms,
+                event: MarketEvent::Delta(late),
+            },
+            &book,
+            late_now_ms,
+        )?;
+        assert_eq!(source.state(), FeatureState::Stale);
+        assert_eq!(source.sample_batched_frame(late_now_ms)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_book_source_time_warms_unbridged_snapshot_but_fences_ready_book()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut source = source()?;
+        let mut book = OrderBook::default();
+        let mut capture_sequence = 0;
+        let mut initial = snapshot(1)?;
+        initial.exchange_time_ms = None;
+        book.apply_snapshot(initial.clone());
+        consume(
+            &mut source,
+            &book,
+            &mut capture_sequence,
+            MarketEvent::Snapshot(initial),
+            NOW_MS,
+        )?;
+        assert_eq!(source.state(), FeatureState::Warmup);
+
+        let mut bridge = delta(2, 1)?;
+        bridge.exchange_time_ms = None;
+        book.apply_delta(bridge.clone())?;
+        assert_eq!(
+            consume(
+                &mut source,
+                &book,
+                &mut capture_sequence,
+                MarketEvent::Delta(bridge),
+                NOW_MS,
+            ),
+            Err(PublicMarketSourceError::Identity)
+        );
+        assert_eq!(source.state(), FeatureState::DataGap);
+        Ok(())
+    }
+
+    #[test]
+    fn future_source_watermark_is_never_ready() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut source, book, mut capture_sequence) = bridged_source()?;
+        for sequence in 1..=21 {
+            let bar = closed_bar(sequence)?;
+            consume(
+                &mut source,
+                &book,
+                &mut capture_sequence,
+                MarketEvent::Bar(bar.clone()),
+                bar.received_at_ms,
+            )?;
+        }
+        for sequence in 1..=64 {
+            let mut trade = session_trade(sequence)?;
+            if sequence == 64 {
+                trade.exchange_time_ms = NOW_MS + 1;
+                trade.transaction_time_ms = NOW_MS + 1;
+            }
+            consume(
+                &mut source,
+                &book,
+                &mut capture_sequence,
+                MarketEvent::Trade(trade.clone()),
+                trade.received_at_ms,
+            )?;
+        }
+        assert_eq!(source.state(), FeatureState::Stale);
+        assert_eq!(source.sample_batched_frame(NOW_MS)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn session_trade_gap_and_same_generation_ordering_mismatch_fence_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut source, book, mut capture_sequence) = bridged_source()?;
+        let first = session_trade(1)?;
+        consume(
+            &mut source,
+            &book,
+            &mut capture_sequence,
+            MarketEvent::Trade(first.clone()),
+            first.received_at_ms,
+        )?;
+        let gap = session_trade(3)?;
+        assert_eq!(
+            consume(
+                &mut source,
+                &book,
+                &mut capture_sequence,
+                MarketEvent::Trade(gap.clone()),
+                gap.received_at_ms,
+            ),
+            Err(PublicMarketSourceError::Feature(FeatureBuildError::DataGap))
+        );
+        assert_eq!(source.state(), FeatureState::DataGap);
+
+        let (mut source, book, mut capture_sequence) = bridged_source()?;
+        let session = session_trade(1)?;
+        consume(
+            &mut source,
+            &book,
+            &mut capture_sequence,
+            MarketEvent::Trade(session.clone()),
+            session.received_at_ms,
+        )?;
+        let native = PublicTrade {
+            aggregate_trade_id: 2.into(),
+            first_trade_id: Some(2),
+            last_trade_id: Some(2),
+            ordering: PublicTradeOrdering::NativeAggregateId,
+            ..session_trade(2)?
+        };
+        assert_eq!(
+            consume(
+                &mut source,
+                &book,
+                &mut capture_sequence,
+                MarketEvent::Trade(native.clone()),
+                native.received_at_ms,
+            ),
+            Err(PublicMarketSourceError::Feature(FeatureBuildError::DataGap))
+        );
+        assert_eq!(source.state(), FeatureState::DataGap);
+        Ok(())
+    }
+
+    #[test]
+    fn source_fences_unsequenced_and_invalid_public_trades()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut source, book, mut capture_sequence) = bridged_source()?;
+        let mut unsequenced = session_trade(1)?;
+        unsequenced.ordering = PublicTradeOrdering::Unsequenced;
+        assert_eq!(
+            consume(
+                &mut source,
+                &book,
+                &mut capture_sequence,
+                MarketEvent::Trade(unsequenced),
+                1_340_001,
+            ),
+            Err(PublicMarketSourceError::Identity)
+        );
+        assert_eq!(source.state(), FeatureState::DataGap);
+
+        let (mut source, book, mut capture_sequence) = bridged_source()?;
+        let mut zero_cursor = session_trade(1)?;
+        zero_cursor.ordering = PublicTradeOrdering::Session { sequence: 0 };
+        assert_eq!(
+            consume(
+                &mut source,
+                &book,
+                &mut capture_sequence,
+                MarketEvent::Trade(zero_cursor),
+                1_340_001,
+            ),
+            Err(PublicMarketSourceError::Identity)
+        );
+        assert_eq!(source.state(), FeatureState::DataGap);
+
+        let (mut source, book, mut capture_sequence) = bridged_source()?;
+        let mut zero_quantity = session_trade(1)?;
+        zero_quantity.quantity = Decimal::ZERO;
+        assert_eq!(
+            consume(
+                &mut source,
+                &book,
+                &mut capture_sequence,
+                MarketEvent::Trade(zero_quantity),
+                1_340_001,
+            ),
+            Err(PublicMarketSourceError::Identity)
+        );
+        assert_eq!(source.state(), FeatureState::DataGap);
         Ok(())
     }
 }

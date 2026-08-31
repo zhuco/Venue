@@ -7,6 +7,7 @@ pub struct OkxConfig {
     binding: OkxGatewayBinding,
     rest_origin: &'static str,
     public_ws: &'static str,
+    business_ws: &'static str,
     private_ws: &'static str,
 }
 
@@ -17,6 +18,7 @@ impl OkxConfig {
             binding,
             rest_origin: "https://www.okx.com",
             public_ws: "wss://ws.okx.com:8443/ws/v5/public",
+            business_ws: "wss://ws.okx.com:8443/ws/v5/business",
             private_ws: "wss://ws.okx.com:8443/ws/v5/private",
         };
         Ok(config)
@@ -40,6 +42,11 @@ impl OkxConfig {
     #[must_use]
     pub const fn public_ws(&self) -> &'static str {
         self.public_ws
+    }
+
+    #[must_use]
+    pub const fn business_ws(&self) -> &'static str {
+        self.business_ws
     }
 
     #[must_use]

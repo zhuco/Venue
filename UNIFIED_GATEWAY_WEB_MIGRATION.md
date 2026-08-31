@@ -107,14 +107,14 @@ AI 只发起经授权的 operator/control 语义动作，不能直接调用 adap
 - Bybit、OKX、Hyperliquid 已使用较小的 `AccountMutationHost` 安全闭环执行显式预检和 Canary 命令。
 - `venue-copy` 已包含资本、目标敞口、数量、限价、确定性身份、delivery、ledger 和 drift 纯语义。
 - Control/PostgreSQL 已保存 Copy relation、job delivery、claim/ACK/receipt；Node 已能耐久应用 Copy 语义。
-- 六所固定 Node 已接入 adapter-owned 公共盘口；Bybit 重建完整簿、Hyperliquid 使用原生完整 L2 图像，OKX 按 `prevSeqId` 连续桥接。行情只进入共享 MarketHub/FeatureSource；公共接收器和 fixture 通过不代表策略自动出单、私流热路径或逐所接管完成。
+- 六所固定 Node 已接入 adapter-owned 公共盘口及公共成交；Bybit 重建完整簿、Hyperliquid 使用原生完整 L2 图像，OKX 按 `prevSeqId` 连续桥接。成交原生身份与本地 Session cursor 分离，批量事实有界无损轮转；Binance 保留显式原生聚合序列。Bybit/OKX/Gate 仅发布协议确认闭合的 K 线，Bitget/Hyperliquid 形成线不自动提升。行情只进入共享 MarketHub/FeatureSource；公共接收器和 fixture 通过不代表策略自动出单、私流热路径或逐所接管完成。
 - `G:\kol\apps\web` 使用 Next.js 16、React 19、TypeScript 7，已有响应式 shell、角色页面、恢复、SSE、十进制和交互测试。
 
 ### 3.2 必须补齐的闭环
 
 - Copy 已有 semantic Applied 到同一账户 WAL、签名成交/仓位的物理桥；leader 权威事实自动接入、持续 ledger/drift repair 和完整产品端到端仍须验收。
 - 六所 Node 已组合 Account Runtime、Execution Lane 与 `AccountMutationHost`；Grid/Scalping 的生产私流驱动和物理接线、控制撤单/清仓及多 symbol 常驻调度仍须闭合，不能以纯 reducer 测试替代。
-- Scalping 的 FeatureSource frame 已接入真实 engine evaluate 与同一 Actor checkpoint 恢复，配置须显式固定 release、Owner scope 和风险预算；手造候选到 Host 的旧入口已移除。各所完整 trades/bars 输入、签名安全投影、入场确认与退出保护仍未闭合；保护缺失时阻止自动入场，对外不得显示已可运行。
+- Scalping 的 FeatureSource frame 已接入真实 engine evaluate 与同一 Actor checkpoint 恢复，配置须显式固定 release、Owner scope 和风险预算；手造候选到 Host 的旧入口已移除。Bitget/Hyperliquid 权威闭合 bars、六所持续行情实测、签名安全投影、入场确认与退出保护仍未闭合；保护缺失时阻止自动入场，对外不得显示已可运行。Session-observed Ready 仅表示本机窗口完整，详见运行时契约第 4.1 节。
 - 根 package 的旧三所生产 binary 已移除，但服务器上的旧 release、未决 WAL 与运行进程仍须逐所核验和接管；本地删除入口不构成生产退休证明。
 - 六所尚未共同满足同一套启动恢复、Owner 路由、Stop/Flatten、Unknown 收敛和产品级 Canary 契约。
 - 手动 `TradeIntent` 已有 Node 显式选价、同一 Actor replay 的原始计划、精确自有手动单撤单及只读 delivery 对账；仍须完成与 Grid desired/库存的协同、Copy 绑定支持和全 scope 撤单后才能认定完整闭环。当前不支持的 scope 明确拒绝；BBO 自动选价不能替代用户选价，离线通过不替代生产接管验收。
@@ -215,7 +215,7 @@ worker 在同一数据库事务中冻结输入、规划任务并推进观察游�
 
 原始执行 request 必须早于 Actor Applied 和账户 WAL 耐久保存。每个 immutable job 只允许一个 ReduceToZero child 和一个 Adjust child，
 child 身份不得包含不断推进的签名快照 generation；重启或重复 delivery 不得用新持仓重算已提交 child 的价格、数量或原 request。
-尚未过期的 Copy Install 领取窗口必须精确为 `min(领取时间 + 请求租期, 原 job 截止时间)`；Control 数据行、immutable claim 和 Node 校验保持一致，不能因剩余窗口不足完整租期而漏领，也不得续期 job。已领取任务过期后只允许 ReconcileOnly 使用完整对账租期；从未领取即过期的任务不能据此重新执行，解除其规划阻塞仍需独立的安全收口。
+尚未过期的 Copy Install 领取窗口必须精确为 `min(领取时间 + 请求租期, 原 job 截止时间)`；Control 数据行、immutable claim 和 Node 校验保持一致，不能因剩余窗口不足完整租期而漏领，也不得续期 job。已领取任务过期后只允许 ReconcileOnly 使用完整对账租期；从未领取即过期的任务不能重新执行。`copy_planning_expiry.rs`/0016 在同一事务证明双 delivery 从未 claim、无执行或记账，并取得截止时间之后更新的双边事实，才能退休旧投递并建立独立新 job；保留旧 payload/期限，不伪造 Rejected 或 ledger。
 恢复读取同一本 WAL 的原命令，按精确 native order identity 累积规范成交并检查更新的完整仓位腿与开放订单；仅 ACK 或较新仓位不能证明成交。
 过期、暂停或旧 revision job 仍可只读收敛原 child，但不能产生新风险。第二 phase 必须保留第一 phase 的 request/签名零仓证据，重新检查
 当前 relation、有效期和账户风险，并在新 WAL 前单独持久化 Adjust request；不得覆盖第一 phase 的恢复事实。

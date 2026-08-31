@@ -12,6 +12,7 @@ mod nonce;
 mod physical;
 mod private_stream;
 mod protocol;
+mod public;
 mod public_ws;
 mod transport;
 
@@ -74,6 +75,7 @@ pub use protocol::{
     parse_order_status, parse_perp_meta, parse_private_user_fills, parse_user_fills_page,
     parse_user_twap_slice_fills, parse_ws_bbo, validate_frontend_open_orders_snapshot,
 };
+pub use public::{HYPERLIQUID_PUBLIC_MAX_FACTS_PER_FRAME, parse_public_trades};
 pub use public_ws::{HyperliquidPublicWsError, HyperliquidScalpingPublicReceiver};
 pub use transport::{
     HyperliquidHttpResponse, HyperliquidHttpTransport, HyperliquidPrivateWsTransport,

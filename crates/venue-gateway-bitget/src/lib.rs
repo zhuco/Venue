@@ -28,7 +28,7 @@ pub use execution::*;
 pub use node_bridge::*;
 pub use order_families::*;
 pub use private_ws::*;
-pub use public_ws::{BitgetPublicWsError, BitgetScalpingBookFrame, BitgetScalpingPublicReceiver};
+pub use public_ws::{BitgetPublicWsError, BitgetScalpingPublicFrame, BitgetScalpingPublicReceiver};
 pub use recovery::*;
 pub(crate) use runtime_recovery::BitgetRuntimeRecoveryAwaitGuard;
 pub use runtime_recovery::{

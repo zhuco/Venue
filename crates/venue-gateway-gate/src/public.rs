@@ -16,8 +16,8 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use venue_domain::domain::{
-    AggressorSide, FieldState, MarketDelta, MarketLevel, MarketSnapshot, Price, PublicTicker,
-    PublicTrade, Symbol,
+    AggressorSide, FieldState, MarketDelta, MarketLevel, MarketSnapshot, Price, PublicBar,
+    PublicTicker, PublicTrade, PublicTradeId, PublicTradeOrdering, Symbol, UnknownReason,
 };
 
 /// Parser contract revision for the documented Gate futures payload shapes accepted here.
@@ -27,7 +27,11 @@ const CHANNEL_BOOK_DELTA: &str = "futures.order_book_update";
 const CHANNEL_BOOK_TICKER: &str = "futures.book_ticker";
 const CHANNEL_TICKERS: &str = "futures.tickers";
 const CHANNEL_TRADES: &str = "futures.trades";
+const CHANNEL_CANDLES: &str = "futures.candlesticks";
+const ONE_MINUTE_MS: u64 = 60_000;
 const MAX_ORDER_BOOK_DEPTH: u16 = 100;
+/// A receiver keeps one raw frame and at most this many normalized facts from it.
+const MAX_PUBLIC_BATCH_ITEMS: usize = 1_024;
 
 /// The exact canonical/native and quantity-unit relationship chosen for one public stream.
 ///
@@ -125,6 +129,37 @@ pub fn public_subscriptions(
     ]))
 }
 
+/// The public streams needed by the Scalping receiver: its sequenced book plus trades and 1m
+/// forming candles. Gate's documented close marker, rather than a later forming window, is the
+/// only authority for exposing a closed bar.
+pub fn scalping_public_subscriptions(
+    binding: &GatePublicBinding,
+    frequency_ms: u16,
+    level: u16,
+) -> Result<[Value; 3], GatePublicError> {
+    validate_depth(level)?;
+    if !matches!((frequency_ms, level), (20, 20) | (100, 20 | 50 | 100)) {
+        return Err(GatePublicError::Subscription);
+    }
+    Ok([
+        json!({
+            "channel": CHANNEL_BOOK_DELTA,
+            "event": "subscribe",
+            "payload": [binding.native_symbol, format!("{frequency_ms}ms"), level.to_string()],
+        }),
+        json!({
+            "channel": CHANNEL_TRADES,
+            "event": "subscribe",
+            "payload": [binding.native_symbol],
+        }),
+        json!({
+            "channel": CHANNEL_CANDLES,
+            "event": "subscribe",
+            "payload": ["1m", binding.native_symbol],
+        }),
+    ])
+}
+
 /// The hedged-grid contract consumes only a sequenced order book. Keeping its transport scope to
 /// the depth channel prevents unrelated trade/ticker bursts from delaying the exact event-time
 /// book that authorizes mutations; richer market-data consumers keep using `public_subscriptions`.
@@ -157,6 +192,7 @@ pub enum GatePublicPayloadKind {
     WebSocketBookTicker,
     WebSocketTicker,
     WebSocketTrade,
+    WebSocketCandlestick,
 }
 
 /// Raw-payload identity and timing supplied by a public capture worker.
@@ -261,6 +297,96 @@ impl GatePublicRecord<PublicTicker> {
 impl GatePublicRecord<PublicTrade> {
     pub fn market_event(&self) -> venue_domain::domain::MarketEvent {
         venue_domain::domain::MarketEvent::Trade(self.value.clone())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GateFormingBar {
+    pub open_time_ms: u64,
+    pub open: Price,
+    pub high: Price,
+    pub low: Price,
+    pub close: Price,
+    /// Gate candle `v` is documented as contract-size volume and is normalized at parse time.
+    pub base_volume: Decimal,
+    /// Gate documents `w=true` as a closed candle. Its absence is deliberately retained as
+    /// unknown rather than inferred from a later forming update.
+    pub window_closed: Option<bool>,
+}
+
+/// One Gate trade frame: raw evidence is owned once, while the normalized facts are bounded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GatePublicTradeBatch {
+    pub raw: GatePublicRawPayload,
+    pub freshness: GateFreshness,
+    pub trades: Vec<PublicTrade>,
+}
+
+/// One Gate candlestick frame before the receiver applies its documented close marker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GateFormingBarBatch {
+    pub raw: GatePublicRawPayload,
+    pub freshness: GateFreshness,
+    pub bars: Vec<GateFormingBar>,
+}
+
+/// One or more final bars that share exactly one raw Gate frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GatePublicBarBatch {
+    pub raw: GatePublicRawPayload,
+    pub freshness: GateFreshness,
+    pub bars: Vec<PublicBar>,
+}
+
+impl GateFormingBar {
+    /// The cursor is a canonical 1m window identifier derived from the documented start time,
+    /// not a Gate-native contiguous sequence number.
+    pub fn into_closed(
+        self,
+        symbol: Symbol,
+        generation: u64,
+        received_at_ms: u64,
+    ) -> Result<PublicBar, GatePublicError> {
+        let close_time_ms = self
+            .open_time_ms
+            .checked_add(ONE_MINUTE_MS - 1)
+            .ok_or(GatePublicError::Number)?;
+        let sequence = self
+            .open_time_ms
+            .checked_div(ONE_MINUTE_MS)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(GatePublicError::Number)?;
+        let bar = PublicBar {
+            symbol,
+            generation,
+            received_at_ms,
+            sequence,
+            open_time_ms: self.open_time_ms,
+            close_time_ms,
+            interval_ms: ONE_MINUTE_MS,
+            open: self.open,
+            high: self.high,
+            low: self.low,
+            close: self.close,
+            base_volume: FieldState::Known(self.base_volume),
+            quote_volume: FieldState::Unavailable {
+                reason: UnknownReason::Ambiguous,
+            },
+            trade_count: FieldState::Unavailable {
+                reason: UnknownReason::Ambiguous,
+            },
+            taker_buy_base_volume: FieldState::Unavailable {
+                reason: UnknownReason::Ambiguous,
+            },
+            taker_buy_quote_volume: FieldState::Unavailable {
+                reason: UnknownReason::Ambiguous,
+            },
+        };
+        if bar.is_valid() {
+            Ok(bar)
+        } else {
+            Err(GatePublicError::Payload)
+        }
     }
 }
 
@@ -472,6 +598,24 @@ pub fn parse_ws_trades(
     binding: &GatePublicBinding,
     raw: GatePublicRawPayload,
 ) -> Result<Vec<GatePublicRecord<PublicTrade>>, GatePublicError> {
+    let batch = parse_ws_trade_batch(binding, raw)?;
+    Ok(batch
+        .trades
+        .into_iter()
+        .map(|value| GatePublicRecord {
+            raw: batch.raw.clone(),
+            freshness: batch.freshness,
+            value,
+        })
+        .collect())
+}
+
+/// Parses a trade frame without duplicating its raw payload for every trade. New websocket
+/// receivers must use this batch form; the record-per-trade function remains for legacy callers.
+pub fn parse_ws_trade_batch(
+    binding: &GatePublicBinding,
+    raw: GatePublicRawPayload,
+) -> Result<GatePublicTradeBatch, GatePublicError> {
     verify_raw(binding, &raw, GatePublicPayloadKind::WebSocketTrade)?;
     let value = parse_json(&raw.payload)?;
     let envelope = websocket_envelope(&value, CHANNEL_TRADES)?;
@@ -479,7 +623,7 @@ pub fn parse_ws_trades(
     let results = required_value(envelope, "result")?
         .as_array()
         .ok_or(GatePublicError::Payload)?;
-    if results.is_empty() {
+    if results.is_empty() || results.len() > MAX_PUBLIC_BATCH_ITEMS {
         return Err(GatePublicError::Payload);
     }
     let mut previous_id = None;
@@ -504,32 +648,114 @@ pub fn parse_ws_trades(
         let quantity = binding.contracts_to_base(signed_contracts.abs())?;
         let price = required_price(object, "price")?;
         let transaction_time_ms = trade_time_ms(object)?;
-        records.push(GatePublicRecord {
-            raw: raw.clone(),
+        records.push(PublicTrade {
+            symbol: binding.symbol.clone(),
+            generation: raw.generation,
+            received_at_ms: raw.received_at_ms,
+            exchange_time_ms,
+            transaction_time_ms,
+            aggregate_trade_id: PublicTradeId::Numeric(trade_id),
+            first_trade_id: Some(trade_id),
+            last_trade_id: Some(trade_id),
+            ordering: PublicTradeOrdering::Unsequenced,
+            price,
+            quantity,
+            quote_quantity: price
+                .value()
+                .checked_mul(quantity)
+                .ok_or(GatePublicError::Number)?,
+            aggressor: FieldState::Known(aggressor),
+        });
+    }
+    Ok(GatePublicTradeBatch {
+        freshness: GateFreshness {
+            received_at_ms: raw.received_at_ms,
+            exchange_time_ms,
+        },
+        raw,
+        trades: records,
+    })
+}
+
+/// Parses 1m `futures.candlesticks` updates while retaining Gate's optional close marker.
+pub fn parse_ws_forming_bars(
+    binding: &GatePublicBinding,
+    raw: GatePublicRawPayload,
+) -> Result<Vec<GatePublicRecord<GateFormingBar>>, GatePublicError> {
+    let batch = parse_ws_forming_bar_batch(binding, raw)?;
+    Ok(batch
+        .bars
+        .into_iter()
+        .map(|value| GatePublicRecord {
+            raw: batch.raw.clone(),
+            freshness: batch.freshness,
+            value,
+        })
+        .collect())
+}
+
+/// Parses one bounded candle payload without multiplying raw frame storage.
+pub fn parse_ws_forming_bar_batch(
+    binding: &GatePublicBinding,
+    raw: GatePublicRawPayload,
+) -> Result<GateFormingBarBatch, GatePublicError> {
+    verify_raw(binding, &raw, GatePublicPayloadKind::WebSocketCandlestick)?;
+    let value = parse_json(&raw.payload)?;
+    let envelope = websocket_envelope(&value, CHANNEL_CANDLES)?;
+    let exchange_time_ms = required_u64(envelope, "time_ms")?;
+    let values = required_value(envelope, "result")?
+        .as_array()
+        .ok_or(GatePublicError::Payload)?;
+    if values.is_empty() || values.len() > MAX_PUBLIC_BATCH_ITEMS {
+        return Err(GatePublicError::Payload);
+    }
+    let expected_name = format!("1m_{}", binding.native_symbol);
+    let mut starts = BTreeSet::new();
+    values
+        .iter()
+        .map(|value| {
+            let object = value.as_object().ok_or(GatePublicError::Payload)?;
+            if required_string(object, "n")? != expected_name {
+                return Err(GatePublicError::Symbol);
+            }
+            let open_time_ms = seconds_to_ms(required_decimal(object, "t")?)?;
+            if open_time_ms % ONE_MINUTE_MS != 0 || !starts.insert(open_time_ms) {
+                return Err(GatePublicError::Payload);
+            }
+            let open = required_price(object, "o")?;
+            let high = required_price(object, "h")?;
+            let low = required_price(object, "l")?;
+            let close = required_price(object, "c")?;
+            let contracts = required_decimal(object, "v")?;
+            if contracts.is_sign_negative() {
+                return Err(GatePublicError::Payload);
+            }
+            if high < open.max(close) || low > open.min(close) || high < low {
+                return Err(GatePublicError::Payload);
+            }
+            let window_closed = match object.get("w") {
+                Some(value) => Some(value.as_bool().ok_or(GatePublicError::Payload)?),
+                None => None,
+            };
+            Ok(GateFormingBar {
+                open_time_ms,
+                open,
+                high,
+                low,
+                close,
+                base_volume: binding.contracts_to_base(contracts)?,
+                window_closed,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|bars| GateFormingBarBatch {
             freshness: GateFreshness {
                 received_at_ms: raw.received_at_ms,
                 exchange_time_ms,
             },
-            value: PublicTrade {
-                symbol: binding.symbol.clone(),
-                generation: raw.generation,
-                received_at_ms: raw.received_at_ms,
-                exchange_time_ms,
-                transaction_time_ms,
-                aggregate_trade_id: trade_id,
-                first_trade_id: trade_id,
-                last_trade_id: trade_id,
-                price,
-                quantity,
-                quote_quantity: price
-                    .value()
-                    .checked_mul(quantity)
-                    .ok_or(GatePublicError::Number)?,
-                aggressor: FieldState::Known(aggressor),
-            },
-        });
-    }
-    Ok(records)
+            raw,
+            bars,
+        })
 }
 
 /// Holds only a bounded, one-generation order-book bridge. It never opens a connection and does
@@ -1344,6 +1570,46 @@ mod tests {
                 raw(GatePublicPayloadKind::WebSocketTrade, mismatch)?,
             ),
             Err(GatePublicError::Payload)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scalping_subscriptions_are_individual_gate_requests() -> Result<(), GatePublicError> {
+        let requests = scalping_public_subscriptions(&binding()?, 20, 20)?;
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["channel"], CHANNEL_BOOK_DELTA);
+        assert_eq!(requests[1]["channel"], CHANNEL_TRADES);
+        assert_eq!(requests[2]["channel"], CHANNEL_CANDLES);
+        assert!(requests.iter().all(serde_json::Value::is_object));
+        Ok(())
+    }
+
+    #[test]
+    fn closed_candle_fixture_converts_contract_volume_to_base_and_keeps_amount_unknown()
+    -> Result<(), GatePublicError> {
+        let binding = binding()?;
+        let forming = parse_ws_forming_bars(
+            &binding,
+            raw(
+                GatePublicPayloadKind::WebSocketCandlestick,
+                include_str!("../fixtures/public-ws-candle-1m-closed.json"),
+            )?,
+        )?;
+        let record = forming.into_iter().next().ok_or(GatePublicError::Payload)?;
+        let received_at_ms = record.raw.received_at_ms;
+        let bar = record
+            .value
+            .into_closed(binding.symbol.clone(), 7, received_at_ms)?;
+        assert_eq!(bar.sequence, 2);
+        assert_eq!(bar.close_time_ms, 119_999);
+        assert_eq!(bar.received_at_ms, received_at_ms);
+        assert_eq!(bar.base_volume, FieldState::Known(Decimal::from(420)));
+        assert_eq!(
+            bar.quote_volume,
+            FieldState::Unavailable {
+                reason: UnknownReason::Ambiguous
+            }
         );
         Ok(())
     }

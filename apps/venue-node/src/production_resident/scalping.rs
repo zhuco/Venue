@@ -20,6 +20,7 @@ use venue_strategies::scalping::{
 use super::{NodeError, ProductionResident, persist_anchor, resident_error};
 
 mod full_snapshot_book;
+mod trade_window;
 
 #[derive(Clone, Copy)]
 enum BookFeed {
@@ -31,6 +32,7 @@ enum BookFeed {
 pub(crate) struct BitgetScalpingBookBridge {
     sequencer: venue_gateway_bitget::public::BitgetBookSequencer,
     pending_snapshot: Option<venue_gateway_bitget::public::BitgetBooksMessage>,
+    session_generation: Option<u64>,
 }
 
 #[cfg(feature = "bitget")]
@@ -39,6 +41,7 @@ impl BitgetScalpingBookBridge {
         Self {
             sequencer: venue_gateway_bitget::public::BitgetBookSequencer::new(),
             pending_snapshot: None,
+            session_generation: None,
         }
     }
 
@@ -50,6 +53,18 @@ impl BitgetScalpingBookBridge {
     ) -> Result<Vec<(u64, MarketEvent)>, NodeError> {
         use venue_gateway_bitget::public::BitgetBookSequenceStatus;
 
+        match self.session_generation {
+            None => {
+                self.sequencer
+                    .reset_generation(message.raw.generation)
+                    .map_err(|_| NodeError::ResidentRuntime)?;
+                self.session_generation = Some(message.raw.generation);
+            }
+            Some(generation) if generation != message.raw.generation => {
+                return Err(NodeError::ResidentRuntime);
+            }
+            Some(_) => {}
+        }
         let status = self
             .sequencer
             .accept(&message)
@@ -174,7 +189,7 @@ impl GateScalpingBookBridge {
 /// authority remain in Runtime/Host; this state is only the reducer's validated checkpoint.
 pub(crate) struct ScalpingBridgeState {
     engine: ScalpingStrategy,
-    params: ScalpingParams,
+    trade_window: trade_window::ObservedTradeWindow,
 }
 
 impl ScalpingBridgeState {
@@ -193,7 +208,10 @@ impl ScalpingBridgeState {
             None => ScalpingStrategy::new(binding, params.clone())
                 .map_err(|_| NodeError::ResidentRuntime)?,
         };
-        Ok(Self { engine, params })
+        Ok(Self {
+            engine,
+            trade_window: Default::default(),
+        })
     }
 
     fn checkpoint_bytes(&self) -> Result<Vec<u8>, NodeError> {
@@ -202,10 +220,6 @@ impl ScalpingBridgeState {
 
     fn binding(&self) -> &ScalpingStrategyBinding {
         self.engine.binding()
-    }
-
-    fn params(&self) -> &ScalpingParams {
-        &self.params
     }
 }
 
@@ -292,6 +306,9 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         {
             return Err(NodeError::ResidentRuntime);
         }
+        if !self.prepare_scalping_book(binding, &event.event)? {
+            return Ok(false);
+        }
         self.runtime.publish_market(event).map_err(resident_error)
     }
 
@@ -363,6 +380,135 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         }
         Ok(published)
     }
+
+    /// Non-book facts retain their own source times and identities. They share the book's
+    /// canonical synchronization generation, but can neither bridge nor revive a missing book.
+    #[cfg_attr(
+        not(any(
+            test,
+            feature = "bitget",
+            feature = "gate",
+            feature = "bybit",
+            feature = "okx",
+            feature = "hyperliquid"
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn publish_scalping_stream_fact(
+        &mut self,
+        binding: &StrategyBinding,
+        received_at_ms: u64,
+        mut event: MarketEvent,
+    ) -> Result<bool, NodeError> {
+        self.require_registered_scalping_binding(binding, binding.key.account.exchange)?;
+        if !matches!(event, MarketEvent::Trade(_) | MarketEvent::Bar(_)) {
+            return Err(NodeError::ResidentRuntime);
+        }
+        #[cfg(feature = "bitget")]
+        if binding.key.account.exchange == venue_gateway_api::VenueId::Bitget {
+            let bridge = self
+                .scalping_bitget_books
+                .get(&binding.key)
+                .ok_or(NodeError::ResidentRuntime)?;
+            let generation = match &mut event {
+                MarketEvent::Trade(trade) => &mut trade.generation,
+                MarketEvent::Bar(bar) => &mut bar.generation,
+                _ => return Err(NodeError::ResidentRuntime),
+            };
+            if bridge
+                .session_generation
+                .is_some_and(|session| session != *generation)
+            {
+                return Err(NodeError::ResidentRuntime);
+            }
+            let Some(ready_generation) = bridge.sequencer.ready_generation() else {
+                return Ok(false);
+            };
+            // This is the same observed socket session, not a fact imported from a newer socket.
+            // Only the existing book sequencer can advance its canonical synchronization epoch.
+            *generation = ready_generation;
+        }
+        let feed = match binding.key.account.exchange {
+            venue_gateway_api::VenueId::Bybit | venue_gateway_api::VenueId::Hyperliquid => {
+                BookFeed::CompleteWebSocketImages
+            }
+            _ => BookFeed::SequencedDelta,
+        };
+        let book = self
+            .scalping_books
+            .get(&binding.key)
+            .ok_or(NodeError::ResidentRuntime)?;
+        let generation = match &event {
+            MarketEvent::Trade(trade) => trade.generation,
+            MarketEvent::Bar(bar) => bar.generation,
+            _ => return Err(NodeError::ResidentRuntime),
+        };
+        if book.generation() != Some(generation)
+            || (matches!(feed, BookFeed::SequencedDelta) && !book.bridged())
+        {
+            return Ok(false);
+        }
+        if let MarketEvent::Trade(trade) = event {
+            let Some(trade) = self
+                .scalping_bridges
+                .get_mut(&binding.key)
+                .ok_or(NodeError::ResidentRuntime)?
+                .trade_window
+                .accept(trade)?
+            else {
+                return Ok(false);
+            };
+            event = MarketEvent::Trade(trade);
+        }
+        let event = AccountMarketEvent::new(received_at_ms, event)
+            .map_err(|_| NodeError::ResidentRuntime)?;
+        let published = self.publish_scalping_market(binding, event.clone())?;
+        if published {
+            self.drive_features(binding, event, feed)?;
+        }
+        Ok(published)
+    }
+}
+
+impl<G: AccountPhysicalGateway> ProductionResident<G> {
+    /// Continuity is checked before an event can enter MarketHub or an Actor mailbox. Keeping
+    /// the fenced source retains its generation floor; a same-generation snapshot cannot revive it.
+    fn prepare_scalping_book(
+        &mut self,
+        binding: &StrategyBinding,
+        event: &MarketEvent,
+    ) -> Result<bool, NodeError> {
+        let source = self
+            .scalping_features
+            .get_mut(&binding.key)
+            .ok_or(NodeError::ResidentRuntime)?;
+        if source.state() == venue_indicators::FeatureState::DataGap {
+            match event {
+                MarketEvent::Snapshot(snapshot)
+                    if source
+                        .generation()
+                        .is_none_or(|generation| snapshot.generation > generation) => {}
+                _ => return Ok(false),
+            }
+        }
+        let book = self
+            .scalping_books
+            .get_mut(&binding.key)
+            .ok_or(NodeError::ResidentRuntime)?;
+        match event {
+            MarketEvent::Snapshot(snapshot) => book.apply_snapshot(snapshot.clone()),
+            MarketEvent::Delta(delta) => match book.apply_delta_if_fresh(delta.clone()) {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(_) => {
+                    source.fence();
+                    return Ok(false);
+                }
+            },
+            _ => {}
+        }
+        Ok(true)
+    }
 }
 
 #[cfg(feature = "bitget")]
@@ -397,6 +543,15 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             .get_mut(&binding.key)
             .ok_or(NodeError::ResidentRuntime)?
             .accept(message)?;
+        if self
+            .scalping_bitget_books
+            .get(&binding.key)
+            .is_none_or(|bridge| bridge.sequencer.ready_generation().is_none())
+        {
+            if let Some(source) = self.scalping_features.get_mut(&binding.key) {
+                source.fence();
+            }
+        }
         let mut published = false;
         for (received_at_ms, event) in events {
             published |= self.publish_sequenced_scalping_book(binding, received_at_ms, event)?;
@@ -546,19 +701,6 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         event: AccountMarketEvent,
         feed: BookFeed,
     ) -> Result<(), NodeError> {
-        if !matches!(event.event, MarketEvent::Snapshot(_))
-            && !self.scalping_features.contains_key(&binding.key)
-        {
-            // A gap fenced this actor.  Only a new snapshot may recreate its source; later
-            // trade/bar/delta facts are ignored and cannot make it ready or create intent.
-            return Ok(());
-        }
-        let feature_params = self
-            .scalping_bridges
-            .get(&binding.key)
-            .ok_or(NodeError::ResidentRuntime)?
-            .params()
-            .clone();
         let output = {
             let (scalping_books, scalping_features, scalping_capture_sequence) = (
                 &mut self.scalping_books,
@@ -568,24 +710,6 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             let book = scalping_books
                 .get_mut(&binding.key)
                 .ok_or(NodeError::ResidentRuntime)?;
-            match &event.event {
-                MarketEvent::Snapshot(v) => {
-                    book.apply_snapshot(v.clone());
-                    if !scalping_features.contains_key(&binding.key) {
-                        // The bridge owns the exact parameter identity. A source recreated after
-                        // a book gap must use that same release, not a Node-local digest.
-                        scalping_features.insert(
-                            binding.key.clone(),
-                            feature_source(binding, &feature_params)?,
-                        );
-                    }
-                }
-                MarketEvent::Delta(v) if book.apply_delta_if_fresh(v.clone()).is_err() => {
-                    scalping_features.remove(&binding.key);
-                    return Ok(());
-                }
-                _ => {}
-            }
             // Each feature source owns a capture cursor; other symbols must not look like gaps.
             let capture_sequence = scalping_capture_sequence
                 .entry(binding.key.clone())
@@ -984,6 +1108,16 @@ mod tests {
     #[test]
     fn actual_feature_source_frame_blocks_and_durably_checkpoints_the_reducer()
     -> Result<(), Box<dyn std::error::Error>> {
+        feature_checkpoint_with_ordering(false)
+    }
+
+    #[test]
+    fn observed_sparse_trade_session_reaches_the_same_safe_durable_reducer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        feature_checkpoint_with_ordering(true)
+    }
+
+    fn feature_checkpoint_with_ordering(session: bool) -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let (mut resident, state, binding) = setup(directory.path())?;
         let now_ms = now()?;
@@ -1048,23 +1182,37 @@ mod tests {
             )?;
         }
         for aggregate_trade_id in 1..=64_u64 {
-            publish(
-                &mut resident,
-                MarketEvent::Trade(PublicTrade {
-                    symbol: binding.key.symbol.clone(),
-                    generation: 1,
-                    received_at_ms: now_ms,
-                    exchange_time_ms: now_ms,
-                    transaction_time_ms: now_ms,
-                    aggregate_trade_id,
-                    first_trade_id: aggregate_trade_id,
-                    last_trade_id: aggregate_trade_id,
-                    price: Price::new(Decimal::ONE)?,
-                    quantity: Decimal::ONE,
-                    quote_quantity: Decimal::ONE,
-                    aggressor: FieldState::Known(AggressorSide::Buy),
-                }),
-            )?;
+            let trade = MarketEvent::Trade(PublicTrade {
+                symbol: binding.key.symbol.clone(),
+                generation: 1,
+                received_at_ms: now_ms,
+                exchange_time_ms: now_ms,
+                transaction_time_ms: now_ms,
+                aggregate_trade_id: (aggregate_trade_id * 100).into(),
+                first_trade_id: None,
+                last_trade_id: None,
+                ordering: venue_domain::PublicTradeOrdering::Unsequenced,
+                price: Price::new(Decimal::ONE)?,
+                quantity: Decimal::ONE,
+                quote_quantity: Decimal::ONE,
+                aggressor: FieldState::Known(AggressorSide::Buy),
+            });
+            if session {
+                assert!(resident.publish_scalping_stream_fact(&binding, now_ms, trade.clone())?);
+                // A replay does not consume a session cursor or checkpoint another reducer turn.
+                let before = resident.runtime.resident_actor_checkpoint(&binding)?;
+                assert!(!resident.publish_scalping_stream_fact(&binding, now_ms, trade)?);
+                assert_eq!(
+                    resident.runtime.resident_actor_checkpoint(&binding)?,
+                    before
+                );
+            } else if let MarketEvent::Trade(mut trade) = trade {
+                trade.aggregate_trade_id = aggregate_trade_id.into();
+                trade.first_trade_id = Some(aggregate_trade_id);
+                trade.last_trade_id = Some(aggregate_trade_id);
+                trade.ordering = venue_domain::PublicTradeOrdering::NativeAggregateId;
+                publish(&mut resident, MarketEvent::Trade(trade))?;
+            }
         }
         let checkpoint = resident
             .runtime
@@ -1122,7 +1270,7 @@ mod tests {
             Ok(BitgetRawPublicPayload::new(
                 BitgetPublicSource::WebSocketBooks,
                 "DOGE/USDT".parse()?,
-                1,
+                1_700,
                 1_000,
                 payload,
             )?)
@@ -1134,12 +1282,22 @@ mod tests {
             r#"{"arg":{"instType":"usdt-futures","topic":"books","symbol":"DOGEUSDT"},"action":"update","ts":"1002","data":[{"a":[["0.102","20"]],"b":[],"pseq":"99","seq":"101","maxdepth":"50","ts":"1002"}]}"#.to_owned(),
         )?)?;
         let mut bridge = BitgetScalpingBookBridge::new();
-        assert!(bridge.accept(snapshot)?.is_empty());
-        let events = bridge.accept(update)?;
+        assert!(bridge.accept(snapshot.clone())?.is_empty());
+        let events = bridge.accept(update.clone())?;
         assert!(matches!(
             events.as_slice(),
             [(_, MarketEvent::Snapshot(_)), (_, MarketEvent::Delta(_))]
         ));
+        assert_eq!(bridge.sequencer.ready_generation(), Some(1_700));
+        assert_eq!(bridge.session_generation, Some(1_700));
+        assert!(bridge.accept(snapshot)?.is_empty());
+        assert!(bridge.sequencer.ready_generation().is_none());
+        let next = bridge.accept(update.clone())?;
+        assert!(matches!(&next[0].1, MarketEvent::Snapshot(value) if value.generation == 1_701));
+        assert_eq!(bridge.session_generation, Some(1_700));
+        let mut other_session = update;
+        other_session.raw.generation = 1_702;
+        assert!(bridge.accept(other_session).is_err());
         Ok(())
     }
 
@@ -1387,10 +1545,43 @@ mod tests {
                 .ok_or("book")?
                 .bridged()
         );
-        resident.publish_sequenced_scalping_book(&binding, time, delta(99, 100))?;
-        assert!(!resident.scalping_features.contains_key(&binding.key));
-        resident.publish_sequenced_scalping_book(&binding, time, delta(100, 101))?;
-        assert!(!resident.scalping_features.contains_key(&binding.key));
+        let capture = resident
+            .scalping_capture_sequence
+            .get(&binding.key)
+            .copied();
+        assert!(!resident.publish_sequenced_scalping_book(&binding, time, delta(99, 100))?);
+        assert!(!resident.publish_sequenced_scalping_book(&binding, time, delta(100, 101))?);
+        assert_eq!(
+            resident
+                .scalping_features
+                .get(&binding.key)
+                .ok_or("source")?
+                .state(),
+            venue_indicators::FeatureState::DataGap
+        );
+        assert_eq!(
+            resident
+                .scalping_capture_sequence
+                .get(&binding.key)
+                .copied(),
+            capture
+        );
+        assert!(!resident.publish_sequenced_scalping_book(
+            &binding,
+            time,
+            stream_image(binding.key.symbol.clone(), 200, time)?
+        )?);
+        let MarketEvent::Snapshot(mut replacement) =
+            stream_image(binding.key.symbol.clone(), 300, time)?
+        else {
+            return Err("snapshot".into());
+        };
+        replacement.generation = 2;
+        assert!(resident.publish_sequenced_scalping_book(
+            &binding,
+            time,
+            MarketEvent::Snapshot(replacement)
+        )?);
         assert_eq!(state.lock().map_err(|_| "state lock")?.dispatches, 0);
         Ok(())
     }
@@ -1423,12 +1614,11 @@ mod tests {
         let time = now()?;
         for sequence in [10, 90] {
             for binding in [&first, &second] {
+                let event = stream_image(binding.key.symbol.clone(), sequence, time)?;
+                assert!(resident.prepare_scalping_book(binding, &event)?);
                 resident.drive_features(
                     binding,
-                    AccountMarketEvent::new(
-                        time,
-                        stream_image(binding.key.symbol.clone(), sequence, time)?,
-                    )?,
+                    AccountMarketEvent::new(time, event)?,
                     BookFeed::CompleteWebSocketImages,
                 )?;
             }

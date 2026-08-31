@@ -250,6 +250,7 @@ impl AccountMarketEvent {
             || event_generation(&event) == 0
             || event_sequence(&event) == 0
             || embedded_received_at(&event).is_some_and(|embedded| embedded != received_at_ms)
+            || matches!(&event, MarketEvent::Trade(trade) if !trade.is_valid() || trade.sequence().is_none())
             || matches!(&event, MarketEvent::Bar(bar) if !bar.is_valid())
         {
             return Err(StrategyHostError::MarketFact);
@@ -679,7 +680,7 @@ fn event_sequence(event: &MarketEvent) -> u64 {
     match event {
         MarketEvent::Snapshot(value) => value.sequence,
         MarketEvent::Delta(value) => value.sequence,
-        MarketEvent::Trade(value) => value.last_trade_id,
+        MarketEvent::Trade(value) => value.sequence().unwrap_or_default(),
         MarketEvent::Bar(value) => value.sequence,
         MarketEvent::Ticker(value) => value.update_id,
         MarketEvent::MarkFunding(value) => value.exchange_time_ms,
@@ -712,6 +713,7 @@ mod tests {
         domain::{
             AccountBalance, Amount, EventHeader, EventId, FieldState, Fill, Order, OrderPurpose,
             OrderSide, OrderState, Position, PositionSide, Price, PublicBar, PublicTicker,
+            PublicTrade, PublicTradeId, PublicTradeOrdering,
         },
         runtime::account::{AccountKey, ExchangeId, StrategyKind},
         storage::{PersistedPrivateEvidence, PrivateEvidence, PrivateEvidenceJournal},
@@ -795,6 +797,27 @@ mod tests {
                 ask_quantity: Decimal::ONE,
             }),
         )?)
+    }
+
+    fn public_trade(
+        binding: &StrategyBinding,
+        ordering: PublicTradeOrdering,
+    ) -> Result<PublicTrade, Box<dyn Error>> {
+        Ok(PublicTrade {
+            symbol: binding.key.symbol.clone(),
+            generation: 1,
+            received_at_ms: 2_100,
+            exchange_time_ms: 2_000,
+            transaction_time_ms: 1_999,
+            aggregate_trade_id: PublicTradeId::Numeric(5),
+            first_trade_id: Some(5),
+            last_trade_id: Some(5),
+            ordering,
+            price: price(10)?,
+            quantity: Decimal::ONE,
+            quote_quantity: Decimal::from(10),
+            aggressor: FieldState::Known(crate::domain::AggressorSide::Buy),
+        })
     }
 
     fn private_fact(binding: &StrategyBinding) -> Result<PersistedPrivateFact, Box<dyn Error>> {
@@ -1015,6 +1038,44 @@ mod tests {
         assert!(!MarketEventKind::Delta.coalescible());
         assert!(!MarketEventKind::Trade.coalescible());
         assert!(!MarketEventKind::Bar.coalescible());
+    }
+
+    #[test]
+    fn public_trade_requires_declared_nonzero_cursor_and_valid_values() -> Result<(), Box<dyn Error>>
+    {
+        let binding = binding()?;
+        let native = public_trade(&binding, PublicTradeOrdering::NativeAggregateId)?;
+        assert_eq!(
+            AccountMarketEvent::new(native.received_at_ms, MarketEvent::Trade(native))?.sequence(),
+            5
+        );
+
+        let unsequenced = public_trade(&binding, PublicTradeOrdering::Unsequenced)?;
+        assert_eq!(
+            AccountMarketEvent::new(unsequenced.received_at_ms, MarketEvent::Trade(unsequenced)),
+            Err(StrategyHostError::MarketFact)
+        );
+
+        let session_zero = public_trade(&binding, PublicTradeOrdering::Session { sequence: 0 })?;
+        assert_eq!(
+            AccountMarketEvent::new(
+                session_zero.received_at_ms,
+                MarketEvent::Trade(session_zero)
+            ),
+            Err(StrategyHostError::MarketFact)
+        );
+
+        let mut invalid_quantity =
+            public_trade(&binding, PublicTradeOrdering::Session { sequence: 1 })?;
+        invalid_quantity.quantity = Decimal::ZERO;
+        assert_eq!(
+            AccountMarketEvent::new(
+                invalid_quantity.received_at_ms,
+                MarketEvent::Trade(invalid_quantity),
+            ),
+            Err(StrategyHostError::MarketFact)
+        );
+        Ok(())
     }
 
     #[test]

@@ -131,6 +131,11 @@ Exchange Account Process
 - 维护持续更新的 BBO（最优买卖价）和必要深度；
 - 每个事件带交易所时间、接收时间和单调序号；
 - 公共源按真实协议区分完整 WS 图像与 snapshot/delta 桥：OKX 的增量前序必须命中上一 `seqId`，Bybit 在 adapter 内按单调 `u/seq` 重建整簿再输出 Snapshot，Hyperliquid 以完整 L2 的源时间作为快照水位，均不得虚构原生连续编号。完整图像由 Node 的显式只读 `FullSnapshotBook` view 提供就绪语义，不把普通 REST 快照或一次性 BBO 提升为策略输入；FeatureSource capture cursor 按实例隔离，其他 symbol 的事件不能制造假断层。
+- 公共成交身份与连续游标分离：`PublicTradeId` 保留数值或最多 256 字节的无空白 opaque 原生身份；`PublicTradeOrdering` 显式选择 NativeAggregateId、Unsequenced 或 Session。旧记录缺少 ordering 时只视为 Unsequenced，不能从字段名推断连续性。Bybit UUID、Bitget execution id（非 L correlation）、Gate/OKX 数值 id、Hyperliquid `(time,coin,tid)` 均不得伪装成逐笔加一序号。
+- 非原生连续成交在 Node 同代盘口就绪后，由单实例有界去重窗口赋予 Session cursor；同身份同事实重放不推进，冲突、时间回退、无法证明为新事实的已淘汰重放失败关闭。新盘口同步代重建窗口，Bitget 同一物理连接的同步代只由其 book sequencer 推进。FeatureSource/Runtime 拒绝未排序成交，同代原生/session 混用及 cursor 断层失败关闭；成交 freshness 使用交易所成交/发布时间中较早者，盘口使用自身 exchange time，不使用接收时间。就绪盘口缺少源时间则围栏，未来水位不得 Ready；盘口断层在进入 Runtime/Actor 之前拒绝，同代快照不能解除围栏。
+- `pulse-orderflow-v1-session-observed` 的 Ready 只证明本机无损接收窗口满足盘口、64 笔独立成交和 21 根连续闭合 bar，不证明交易所全市场成交完整，也不授予增险权限。单 receiver 最多排队 1024 条规范事实并逐条轮转，Node 成交去重最多 4096 身份；raw batch 不按每笔成交复制。
+- 闭合 bar 必须具备协议确认：Bybit `confirm`、OKX `confirm=1`、Gate `w=true`；形成窗口、后续行情时间越界、缺确认字段均不能使缓存的 forming bar 自动成为完整闭合事实。Bitget/Hyperliquid 当前仍缺权威闭合读取，保持 Warmup，不把只有盘口/成交的接线描述为完整策略。
+- Control poll/重试只推进自己的 deadline，退避期间仍运行同一账户的私有/公共 pump；公共空闲等待最多 5ms，有积压则继续有界排空。该值不是端到端延迟保证：同步签名读取、HTTP、持久化及 reducer 耗时仍须单独测量和消除瓶颈。
 - 慢策略不能阻塞行情读取；仅 Snapshot、Ticker、MarkFunding 可保留最新值，Delta、Trade、Bar 必须进入有界无损队列；
 - 私有或连续行情邮箱满载必须显式失败并封锁相关新增风险，不能静默丢事件；BBO 新鲜度只用连接代、交易所事件时间及同事件族序号，不用本机接收时间，也不比较不同事件族的序号；任一事件族进入新 symbol generation 时必须清空该 symbol 全部旧 watermark、BBO 和 Actor 行情队列。BBO 只参与初装、整网重建及显式再中心化，不参与成交滚动；这些非滚动 mutation turn 的完整签名私有 readback、风险或规则核验若可能超过 BBO 新鲜窗口，必须在任意 WAL/mutation 前再次有界排空并持久化期间已到达的公共帧，再按新的当前时钟复核 BBO；closing wave 的签名确认也可能跨越该窗口，因此在 opening wave 尚未 dispatch 前必须再次持久排空并重采 BBO，只有全量 opening 仍为 post-only 才可发出；刷新只更新数据，不授予 writer、risk 或 dispatch authority。
 - WebSocket 一次建连的 DNS、全部解析地址、TCP、代理 CONNECT、TLS 与 upgrade 共用 10 秒总期限，禁止每个地址重新获得完整超时；失败后的公共、私有及启动连接按有上限指数退避，并用账户/进程/失败代际错峰，禁止固定间隔同步重连风暴。

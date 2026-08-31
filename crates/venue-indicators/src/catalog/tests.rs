@@ -1,5 +1,8 @@
 use rust_decimal::Decimal;
-use venue_domain::{AggressorSide, FieldState, MarketLevel, Price, PublicBar, PublicTrade, Symbol};
+use venue_domain::{
+    AggressorSide, FieldState, MarketLevel, Price, PublicBar, PublicTrade, PublicTradeOrdering,
+    Symbol,
+};
 
 use super::{
     BarIndicator as _, BookIndicator as _, IndicatorError, ScalarPairIndicator as _,
@@ -40,9 +43,10 @@ fn trade(side: AggressorSide) -> Result<PublicTrade, Box<dyn std::error::Error>>
         received_at_ms: 1_001,
         exchange_time_ms: 1_000,
         transaction_time_ms: 1_000,
-        aggregate_trade_id: 1,
-        first_trade_id: 1,
-        last_trade_id: 1,
+        aggregate_trade_id: 1.into(),
+        first_trade_id: Some(1),
+        last_trade_id: Some(1),
+        ordering: PublicTradeOrdering::NativeAggregateId,
         price: Price::new(Decimal::from(100))?,
         quantity: Decimal::from(2),
         quote_quantity: Decimal::from(200),

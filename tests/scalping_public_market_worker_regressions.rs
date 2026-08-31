@@ -215,7 +215,7 @@ fn aggregate_trade_batch_preserves_order_and_samples_latest_output()
     worker.complete(PublicCaptureCompletion::StreamFrame {
         stream: PublicStream::DiffDepth,
         received_at_ms: 23 * 60_000,
-        payload: GAP_12.to_owned(),
+        payload: GAP_12.replace("\"E\":2,\"T\":2", "\"E\":1380000,\"T\":1380000"),
     })?;
     assert_eq!(
         worker.next_effect(23 * 60_000),

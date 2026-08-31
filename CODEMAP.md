@@ -51,7 +51,8 @@ Web 的 Control 用户会话只在 BFF 环境注入，HTTP/SSE 同时保留 Cont
 | 规范交易账户、Instrument、交易对、金额、订单、仓位、成交 | `crates/venue-domain/src/domain/mod.rs` | `identity.rs`、`instrument.rs`、`market.rs::PublicBar` 与 `risk_value.rs` 提供规范领域类型；`order_outcome.rs` 规定 adapter 必须先验签，且仅以新代、完整订单族页面收集到终端 cursor 的证据证明 `ProvenAbsent`；point 404/部分空页保持 `Unresolved`，不能收敛原 UNKNOWN fence；仅 `SignedOrderReadback` 与 `AuthoritativeOrderOutcome` 不可反序列化 |
 | 错误汇总 | `src/error.rs` | 各领域本地错误枚举 |
 | 未领取即过期的 Copy 恢复 | `apps/venue-control/src/copy_planning_expiry.rs` | `0016_copy_expired_unclaimed.sql` 仅扩展双 delivery 数据库状态；锁定并证明从未 claim/执行/记账后，依据更新双边事实原子生成独立 job，保留原 job。`copy_execution_postgres.rs` 拒绝退休后的晚到执行证据；`tests/copy_postgres/unclaimed_expiry.rs` 覆盖重跑迁移、恢复、幂等与负例 |
-| Scalping 真实引擎输入与恢复 | `apps/venue-node/src/production_resident/scalping.rs`、`runtime_config.rs` | 显式 `scalping.parameter_release_id/owner_scope/risk_budget` 绑定纯引擎及 FeatureSource；frame 驱动 evaluate 和既有 Actor checkpoint，原手造 candidate 到 Host 入口已移除。签名安全/保护未接好时禁止自动入场，Control 的 Running 投影降为 NeedsAttention；各所 trades/bars、成交确认及退出保护仍待闭合 |
+| Scalping 真实引擎输入与恢复 | `apps/venue-node/src/production_resident/scalping.rs`、`runtime_config.rs` | 显式 `scalping.parameter_release_id/owner_scope/risk_budget` 绑定纯引擎及 FeatureSource；frame 驱动 evaluate 和既有 Actor checkpoint，原手造 candidate 到 Host 入口已移除。签名安全/保护未接好时禁止自动入场，Control 的 Running 投影降为 NeedsAttention；Bitget/Hyperliquid 闭合 bars、持续行情实测、成交确认及退出保护仍待闭合 |
+| 公共成交身份、批量调度与就绪证据 | `crates/venue-domain/src/domain/market.rs`、`apps/venue-node/src/production_resident/scalping/trade_window.rs` | `PublicTradeId` 数值/opaque 身份与显式 NativeAggregateId/Unsequenced/Session cursor 分离；原生 ID 不伪造连续，Node 同代就绪盘口后有界去重。`control_loop/public_stream/pending.rs` 最多 1024 事实逐条轮转；`control_loop/pump.rs` 把 Control 退避与行情 cadence 分开，同步 HTTP/签名读取延迟仍另行评估。指标 `public_market_source.rs/scalping_features.rs` 区分 native/session-observed Ready；Bybit/OKX/Gate 仅接协议确认闭合 K 线，Bitget/Hyperliquid forming 不提升为闭合事实 |
 
 ## 对冲网格与旧工件兼容定位
 

@@ -232,7 +232,9 @@ fn public_stream_normalizes_only_bound_supported_market_facts()
     let event =
         normalize_public_stream_event(frame.clone(), &binding, rules.instrument.generation)?
             .ok_or("expected public trade")?;
-    assert!(matches!(event, BinancePublicMarketEvent::Trade(value) if value.last_trade_id == 11));
+    assert!(
+        matches!(event, BinancePublicMarketEvent::Trade(value) if value.last_trade_id == Some(11))
+    );
     assert!(
         normalize_public_stream_event(
             BinanceRawPublicFrame {

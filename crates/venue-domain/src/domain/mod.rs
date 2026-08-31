@@ -29,8 +29,9 @@ pub use instrument::{
     MarketKind, Precision, ValueUnit,
 };
 pub use market::{
-    AggressorSide, BARS_SOURCE, BOOK_SOURCE, MarkFunding, MarketDelta, MarketEvent, MarketLevel,
-    MarketSnapshot, PublicBar, PublicTicker, PublicTrade, TRADES_SOURCE,
+    AggressorSide, BARS_SOURCE, BOOK_SOURCE, MAX_OPAQUE_PUBLIC_TRADE_ID_BYTES, MarkFunding,
+    MarketDelta, MarketEvent, MarketLevel, MarketSnapshot, PublicBar, PublicTicker, PublicTrade,
+    PublicTradeId, PublicTradeOrdering, TRADES_SOURCE,
 };
 pub use money::{Amount, AmountError, Asset, Price};
 pub use order::{Fill, Order, OrderError, OrderPurpose, OrderSide, OrderState};

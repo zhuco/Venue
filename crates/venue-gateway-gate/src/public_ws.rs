@@ -1,8 +1,8 @@
-//! Lifecycle-owned, credential-free Gate.io public depth receiver.
+//! Lifecycle-owned, credential-free Gate.io Scalping public receiver.
 //!
 //! The receiver subscribes before fetching the REST baseline, then exposes only the existing
-//! adapter-normalized snapshot and incremental depth records. The caller owns the shared-runtime
-//! bridge and must never substitute ticker data for a missing bridge.
+//! adapter-normalized book, trade, and closed-bar records. The caller owns the shared-runtime
+//! bridge and must never substitute ticker data for a missing book bridge.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,14 +13,14 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
     tungstenite::{Message, protocol::WebSocketConfig},
 };
-use venue_domain::domain::MarketSnapshot;
+use venue_domain::domain::{MarketSnapshot, PublicBar};
 use venue_gateway_api::{GatewayBinding, VenueId};
 
 use crate::{
     GateConfig, GateContractRules, GateGatewayBinding, GateHttpTransport, GateOrderBookBridge,
     GatePublicBinding, GatePublicPayloadKind, GatePublicRawPayload, GateTransportLimits,
-    grid_public_subscriptions, parse_contract_rules, parse_rest_snapshot, parse_ws_delta,
-    rest_order_book_path,
+    parse_contract_rules, parse_rest_snapshot, parse_ws_delta, parse_ws_forming_bar_batch,
+    parse_ws_trade_batch, rest_order_book_path, scalping_public_subscriptions,
 };
 
 const BOOK_DEPTH: u16 = 20;
@@ -29,11 +29,13 @@ const MAX_BUFFERED_DELTAS: usize = 256;
 
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// The two records which may enter Gate's existing snapshot-plus-delta bridge.
+/// Public records produced by the fixed Gate Scalping subscription.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum GateScalpingBookFrame {
+pub enum GateScalpingPublicFrame {
     Snapshot(crate::GatePublicRecord<MarketSnapshot>),
     Delta(crate::GatePublicRecord<crate::GateBookDelta>),
+    Trades(crate::GatePublicTradeBatch),
+    ClosedBars(crate::GatePublicBarBatch),
 }
 
 /// One bounded, read-only Gate public connection for a fixed LIVE symbol.
@@ -43,6 +45,8 @@ pub struct GateScalpingPublicReceiver {
     socket: Socket,
     generation: u64,
     initial_snapshot: Option<crate::GatePublicRecord<MarketSnapshot>>,
+    forming_bar: Option<crate::GateFormingBar>,
+    last_closed_open_time_ms: Option<u64>,
 }
 
 impl GateScalpingPublicReceiver {
@@ -81,15 +85,17 @@ impl GateScalpingPublicReceiver {
         .map_err(|_| GatePublicWsError::Timeout)?
         .map_err(|_| GatePublicWsError::Disconnected)?;
         let subscription =
-            grid_public_subscriptions(&public_binding, BOOK_FREQUENCY_MS, BOOK_DEPTH)
+            scalping_public_subscriptions(&public_binding, BOOK_FREQUENCY_MS, BOOK_DEPTH)
                 .map_err(|_| GatePublicWsError::Protocol)?;
-        timeout(
-            limits.operation_timeout(),
-            socket.send(Message::Text(subscription.to_string().into())),
-        )
-        .await
-        .map_err(|_| GatePublicWsError::Timeout)?
-        .map_err(|_| GatePublicWsError::Disconnected)?;
+        for request in subscription {
+            timeout(
+                limits.operation_timeout(),
+                socket.send(Message::Text(request.to_string().into())),
+            )
+            .await
+            .map_err(|_| GatePublicWsError::Timeout)?
+            .map_err(|_| GatePublicWsError::Disconnected)?;
+        }
         let path = rest_order_book_path(&public_binding, BOOK_DEPTH)
             .map_err(|_| GatePublicWsError::Protocol)?;
         let payload = transport
@@ -112,6 +118,8 @@ impl GateScalpingPublicReceiver {
             socket,
             generation,
             initial_snapshot: Some(initial_snapshot),
+            forming_bar: None,
+            last_closed_open_time_ms: None,
         })
     }
 
@@ -135,9 +143,9 @@ impl GateScalpingPublicReceiver {
     pub async fn next(
         &mut self,
         wait: Duration,
-    ) -> Result<Option<GateScalpingBookFrame>, GatePublicWsError> {
+    ) -> Result<Option<GateScalpingPublicFrame>, GatePublicWsError> {
         if let Some(snapshot) = self.initial_snapshot.take() {
-            return Ok(Some(GateScalpingBookFrame::Snapshot(snapshot)));
+            return Ok(Some(GateScalpingPublicFrame::Snapshot(snapshot)));
         }
         let Some(frame) = timeout(wait, self.socket.next())
             .await
@@ -168,25 +176,119 @@ impl GateScalpingPublicReceiver {
     }
 
     fn parse_text(
-        &self,
+        &mut self,
         payload: String,
-    ) -> Result<Option<GateScalpingBookFrame>, GatePublicWsError> {
+    ) -> Result<Option<GateScalpingPublicFrame>, GatePublicWsError> {
         if is_subscription_ack(&payload) {
             return Ok(None);
         }
+        let channel = serde_json::from_str::<serde_json::Value>(&payload)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("channel")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .ok_or(GatePublicWsError::Protocol)?;
+        let kind = match channel.as_str() {
+            "futures.pong" => return Ok(None),
+            "futures.order_book_update" => GatePublicPayloadKind::WebSocketOrderBookDelta,
+            "futures.trades" => GatePublicPayloadKind::WebSocketTrade,
+            "futures.candlesticks" => GatePublicPayloadKind::WebSocketCandlestick,
+            _ => return Err(GatePublicWsError::Protocol),
+        };
         let raw = GatePublicRawPayload::new(
             &self.public_binding,
-            GatePublicPayloadKind::WebSocketOrderBookDelta,
+            kind,
             self.generation,
             now_ms()?,
             payload,
         )
         .map_err(|_| GatePublicWsError::Protocol)?;
-        parse_ws_delta(&self.public_binding, raw)
-            .map(GateScalpingBookFrame::Delta)
-            .map(Some)
-            .map_err(|_| GatePublicWsError::Protocol)
+        match kind {
+            GatePublicPayloadKind::WebSocketOrderBookDelta => {
+                parse_ws_delta(&self.public_binding, raw)
+                    .map(GateScalpingPublicFrame::Delta)
+                    .map(Some)
+                    .map_err(|_| GatePublicWsError::Protocol)
+            }
+            GatePublicPayloadKind::WebSocketTrade => {
+                parse_ws_trade_batch(&self.public_binding, raw)
+                    .map(GateScalpingPublicFrame::Trades)
+                    .map(Some)
+                    .map_err(|_| GatePublicWsError::Protocol)
+            }
+            GatePublicPayloadKind::WebSocketCandlestick => {
+                let forming = parse_ws_forming_bar_batch(&self.public_binding, raw)
+                    .map_err(|_| GatePublicWsError::Protocol)?;
+                let mut closed = Vec::new();
+                for candidate in forming.bars {
+                    if let Some(bar) = advance_forming_bar(
+                        &mut self.forming_bar,
+                        &mut self.last_closed_open_time_ms,
+                        candidate,
+                        &self.public_binding,
+                        self.generation,
+                        forming.raw.received_at_ms,
+                    )? {
+                        closed.push(bar);
+                    }
+                }
+                Ok(
+                    (!closed.is_empty()).then_some(GateScalpingPublicFrame::ClosedBars(
+                        crate::GatePublicBarBatch {
+                            raw: forming.raw,
+                            freshness: forming.freshness,
+                            bars: closed,
+                        },
+                    )),
+                )
+            }
+            _ => Err(GatePublicWsError::Protocol),
+        }
     }
+}
+
+fn advance_forming_bar(
+    previous: &mut Option<crate::GateFormingBar>,
+    last_closed_open_time_ms: &mut Option<u64>,
+    candidate: crate::GateFormingBar,
+    binding: &GatePublicBinding,
+    generation: u64,
+    received_at_ms: u64,
+) -> Result<Option<PublicBar>, GatePublicWsError> {
+    if let Some(current) = previous.as_ref() {
+        if candidate.open_time_ms < current.open_time_ms {
+            return Err(GatePublicWsError::Protocol);
+        }
+        if candidate.open_time_ms == current.open_time_ms {
+            if last_closed_open_time_ms == &Some(candidate.open_time_ms) {
+                return (current == &candidate)
+                    .then_some(None)
+                    .ok_or(GatePublicWsError::Protocol);
+            }
+            if candidate.window_closed != Some(true) {
+                *previous = Some(candidate);
+                return Ok(None);
+            }
+        }
+    }
+    if last_closed_open_time_ms.is_some_and(|closed| candidate.open_time_ms < closed) {
+        return Err(GatePublicWsError::Protocol);
+    }
+    if candidate.window_closed == Some(true) {
+        let open_time_ms = candidate.open_time_ms;
+        let bar = candidate
+            .clone()
+            .into_closed(binding.symbol.clone(), generation, received_at_ms)
+            .map_err(|_| GatePublicWsError::Protocol)?;
+        *previous = Some(candidate);
+        *last_closed_open_time_ms = Some(open_time_ms);
+        return Ok(Some(bar));
+    }
+    *previous = Some(candidate);
+    Ok(None)
 }
 
 async fn selected_rules(
@@ -217,8 +319,15 @@ fn is_subscription_ack(payload: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(payload)
         .ok()
         .is_some_and(|value| {
-            value.get("channel").and_then(serde_json::Value::as_str)
-                == Some("futures.order_book_update")
+            value
+                .get("channel")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|channel| {
+                    matches!(
+                        channel,
+                        "futures.order_book_update" | "futures.trades" | "futures.candlesticks"
+                    )
+                })
                 && value.get("event").and_then(serde_json::Value::as_str) == Some("subscribe")
                 && value.get("error").is_none_or(serde_json::Value::is_null)
         })
@@ -261,8 +370,73 @@ mod tests {
         assert!(is_subscription_ack(
             r#"{"channel":"futures.order_book_update","event":"subscribe","error":null}"#
         ));
+        assert!(is_subscription_ack(
+            r#"{"channel":"futures.candlesticks","event":"subscribe","error":null}"#
+        ));
         assert!(!is_subscription_ack(
             r#"{"channel":"futures.book_ticker","event":"subscribe"}"#
         ));
+    }
+
+    #[test]
+    fn only_documented_close_marker_emits_a_closed_bar() -> Result<(), Box<dyn std::error::Error>> {
+        let binding = crate::GatePublicBinding::new("DOGE/USDT".parse()?, "DOGE_USDT", 10.into())?;
+        let first = crate::parse_ws_forming_bar_batch(&binding, crate::GatePublicRawPayload::new(
+            &binding, crate::GatePublicPayloadKind::WebSocketCandlestick, 7, 1_000,
+            r#"{"time_ms":120001,"channel":"futures.candlesticks","event":"update","result":[{"t":120,"v":"1","o":"0.1","h":"0.2","l":"0.1","c":"0.15","n":"1m_DOGE_USDT"}]}"#.to_owned(),
+        )?)?.bars.remove(0);
+        let closed_candidate = crate::parse_ws_forming_bar_batch(&binding, crate::GatePublicRawPayload::new(
+            &binding, crate::GatePublicPayloadKind::WebSocketCandlestick, 7, 61_000,
+            r#"{"time_ms":120002,"channel":"futures.candlesticks","event":"update","result":[{"t":120,"v":"2","o":"0.1","h":"0.2","l":"0.1","c":"0.16","n":"1m_DOGE_USDT","w":true}]}"#.to_owned(),
+        )?)?.bars.remove(0);
+        let mut cached = None;
+        let mut last_closed = None;
+        assert!(
+            advance_forming_bar(&mut cached, &mut last_closed, first, &binding, 7, 1_000)?
+                .is_none()
+        );
+        let closed = advance_forming_bar(
+            &mut cached,
+            &mut last_closed,
+            closed_candidate,
+            &binding,
+            7,
+            61_000,
+        )?
+        .ok_or(crate::GatePublicError::Payload)?;
+        assert_eq!(closed.received_at_ms, 61_000);
+        assert_eq!(closed.close.value().to_string(), "0.16");
+        let duplicate = crate::parse_ws_forming_bar_batch(&binding, crate::GatePublicRawPayload::new(
+            &binding, crate::GatePublicPayloadKind::WebSocketCandlestick, 7, 62_000,
+            r#"{"time_ms":120003,"channel":"futures.candlesticks","event":"update","result":[{"t":120,"v":"2","o":"0.1","h":"0.2","l":"0.1","c":"0.16","n":"1m_DOGE_USDT","w":true}]}"#.to_owned(),
+        )?)?.bars.remove(0);
+        assert!(
+            advance_forming_bar(
+                &mut cached,
+                &mut last_closed,
+                duplicate,
+                &binding,
+                7,
+                62_000,
+            )?
+            .is_none()
+        );
+        let conflict = crate::parse_ws_forming_bar_batch(&binding, crate::GatePublicRawPayload::new(
+            &binding, crate::GatePublicPayloadKind::WebSocketCandlestick, 7, 63_000,
+            r#"{"time_ms":120004,"channel":"futures.candlesticks","event":"update","result":[{"t":120,"v":"2","o":"0.1","h":"0.2","l":"0.1","c":"0.17","n":"1m_DOGE_USDT","w":true}]}"#.to_owned(),
+        )?)?.bars.remove(0);
+        assert_eq!(
+            advance_forming_bar(&mut cached, &mut last_closed, conflict, &binding, 7, 63_000),
+            Err(GatePublicWsError::Protocol)
+        );
+        let rollback = crate::parse_ws_forming_bar_batch(&binding, crate::GatePublicRawPayload::new(
+            &binding, crate::GatePublicPayloadKind::WebSocketCandlestick, 7, 64_000,
+            r#"{"time_ms":60005,"channel":"futures.candlesticks","event":"update","result":[{"t":60,"v":"1","o":"0.1","h":"0.1","l":"0.1","c":"0.1","n":"1m_DOGE_USDT","w":true}]}"#.to_owned(),
+        )?)?.bars.remove(0);
+        assert_eq!(
+            advance_forming_bar(&mut cached, &mut last_closed, rollback, &binding, 7, 64_000),
+            Err(GatePublicWsError::Protocol)
+        );
+        Ok(())
     }
 }

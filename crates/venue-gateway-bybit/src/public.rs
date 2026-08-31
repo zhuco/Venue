@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use venue_domain::domain::{
-    Amount, Asset, FieldState, Instrument, MarketKind, MarketLevel, MarketSnapshot, Price, Symbol,
-    UnknownReason,
+    AggressorSide, Amount, Asset, FieldState, Instrument, MarketKind, MarketLevel, MarketSnapshot,
+    Price, PublicBar, PublicTrade, PublicTradeId, PublicTradeOrdering, Symbol, UnknownReason,
 };
 use venue_gateway_api::GatewayBinding;
 
@@ -21,6 +21,8 @@ use crate::{BybitGatewayBinding, endpoints};
 pub const BYBIT_PUBLIC_PARSER_SCHEMA_VERSION: u16 = 1;
 pub const BYBIT_LINEAR_CATEGORY: &str = "linear";
 const BYBIT_LINEAR_CONTRACT_TYPE: &str = "LinearPerpetual";
+const ONE_MINUTE_MS: u64 = 60_000;
+const MAX_PUBLIC_TRADES_PER_PUSH: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -247,6 +249,157 @@ pub fn parse_rest_bbo(
     })
 }
 
+/// Parses one closed Bybit V5 `kline.1` update. The source has no native candle sequence, so
+/// the aligned one-minute opening bucket is the deterministic bar identity, matching the shared
+/// bar contract used by the existing Binance adapter. It is not presented as an exchange sequence.
+pub fn parse_closed_1m_kline(
+    payload: &str,
+    binding: &GatewayBinding,
+    generation: u64,
+    received_at_ms: u64,
+) -> Result<PublicBar, BybitPublicError> {
+    binding.validate().map_err(|_| BybitPublicError::Binding)?;
+    if binding.venue != venue_gateway_api::VenueId::Bybit {
+        return Err(BybitPublicError::Binding);
+    }
+    if generation == 0 {
+        return Err(BybitPublicError::Generation);
+    }
+    if received_at_ms == 0 {
+        return Err(BybitPublicError::Sequence);
+    }
+    let native_symbol = linear_native_symbol(&binding.symbol)?;
+    let root_value = parse_json(payload)?;
+    let root = object(&root_value)?;
+    require_text(root, "topic", &format!("kline.1.{native_symbol}"))?;
+    require_text(root, "type", "snapshot")?;
+    let _exchange_time_ms = required_u64(root, "ts")?;
+    let row = exact_one_object(required_array(root, "data")?)?;
+    if required_string(row, "interval")? != "1"
+        || row.get("confirm").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(BybitPublicError::BarNotClosed);
+    }
+    let open_time_ms = required_u64(row, "start")?;
+    let close_time_ms = required_u64(row, "end")?;
+    let _last_trade_time_ms = required_u64(row, "timestamp")?;
+    let expected_close = open_time_ms
+        .checked_add(ONE_MINUTE_MS - 1)
+        .ok_or(BybitPublicError::Sequence)?;
+    if open_time_ms % ONE_MINUTE_MS != 0 || close_time_ms != expected_close {
+        return Err(BybitPublicError::Sequence);
+    }
+    let sequence = open_time_ms
+        .checked_div(ONE_MINUTE_MS)
+        .and_then(|value| value.checked_add(1))
+        .ok_or(BybitPublicError::Sequence)?;
+    let open = required_price(row, "open")?;
+    let high = required_price(row, "high")?;
+    let low = required_price(row, "low")?;
+    let close = required_price(row, "close")?;
+    let base_volume = non_negative_decimal(row, "volume")?;
+    let quote_volume = non_negative_decimal(row, "turnover")?;
+    let fact = PublicBar {
+        symbol: binding.symbol.clone(),
+        generation,
+        received_at_ms,
+        sequence,
+        open_time_ms,
+        close_time_ms,
+        interval_ms: ONE_MINUTE_MS,
+        open,
+        high,
+        low,
+        close,
+        base_volume: FieldState::Known(base_volume),
+        quote_volume: FieldState::Known(quote_volume),
+        trade_count: FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        },
+        taker_buy_base_volume: FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        },
+        taker_buy_quote_volume: FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        },
+    };
+    fact.is_valid()
+        .then_some(fact)
+        .ok_or(BybitPublicError::Number)
+}
+
+/// Parses a bounded Bybit V5 `publicTrade` snapshot batch. Linear trade IDs are UUIDs, so they
+/// stay opaque; `seq` is parsed as protocol evidence but is not an implied predecessor sequence.
+pub fn parse_public_trades(
+    payload: &str,
+    binding: &GatewayBinding,
+    generation: u64,
+    received_at_ms: u64,
+) -> Result<Vec<PublicTrade>, BybitPublicError> {
+    binding.validate().map_err(|_| BybitPublicError::Binding)?;
+    if binding.venue != venue_gateway_api::VenueId::Bybit {
+        return Err(BybitPublicError::Binding);
+    }
+    if generation == 0 || received_at_ms == 0 {
+        return Err(BybitPublicError::Sequence);
+    }
+    let native_symbol = linear_native_symbol(&binding.symbol)?;
+    let root_value = parse_json(payload)?;
+    let root = object(&root_value)?;
+    require_text(root, "topic", &format!("publicTrade.{native_symbol}"))?;
+    require_text(root, "type", "snapshot")?;
+    let exchange_time_ms = required_u64(root, "ts")?;
+    let rows = required_array(root, "data")?;
+    if rows.is_empty() || rows.len() > MAX_PUBLIC_TRADES_PER_PUSH {
+        return Err(BybitPublicError::Payload);
+    }
+    rows.iter()
+        .map(|value| {
+            let row = object(value)?;
+            if required_string(row, "s")? != native_symbol.as_str() {
+                return Err(BybitPublicError::Binding);
+            }
+            // `seq` is a cross sequence only. Keep it validated as source evidence; its values
+            // can repeat across batches and never satisfy the normalized trade ordering contract.
+            let _source_sequence = required_u64(row, "seq")?;
+            let transaction_time_ms = required_u64(row, "T")?;
+            if transaction_time_ms > exchange_time_ms {
+                return Err(BybitPublicError::Sequence);
+            }
+            let price = required_price(row, "p")?;
+            let quantity = required_positive_decimal(row, "v")?;
+            let quote_quantity = quantity
+                .checked_mul(price.value())
+                .ok_or(BybitPublicError::Number)?;
+            let aggressor = match required_string(row, "S")? {
+                "Buy" => AggressorSide::Buy,
+                "Sell" => AggressorSide::Sell,
+                _ => return Err(BybitPublicError::Payload),
+            };
+            let id = required_string(row, "i")?;
+            let id = PublicTradeId::Opaque(id.to_owned());
+            if !id.is_valid() {
+                return Err(BybitPublicError::Payload);
+            }
+            Ok(PublicTrade {
+                symbol: binding.symbol.clone(),
+                generation,
+                received_at_ms,
+                exchange_time_ms,
+                transaction_time_ms,
+                aggregate_trade_id: id,
+                first_trade_id: None,
+                last_trade_id: None,
+                ordering: PublicTradeOrdering::Unsequenced,
+                price,
+                quantity,
+                quote_quantity,
+                aggressor: FieldState::Known(aggressor),
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BybitBboSequenceStatus {
     Advanced,
@@ -397,6 +550,18 @@ fn required_positive_decimal(
     }
 }
 
+fn non_negative_decimal(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<Decimal, BybitPublicError> {
+    let value = required_decimal(object, field)?;
+    if value.is_sign_negative() {
+        Err(BybitPublicError::Number)
+    } else {
+        Ok(value)
+    }
+}
+
 fn required_price(object: &Map<String, Value>, field: &str) -> Result<Price, BybitPublicError> {
     Price::new(required_decimal(object, field)?).map_err(|_| BybitPublicError::Number)
 }
@@ -471,6 +636,8 @@ pub enum BybitPublicError {
     Product,
     #[error("Bybit public generation is invalid")]
     Generation,
+    #[error("Bybit public kline is not a closed one-minute bar")]
+    BarNotClosed,
 }
 
 #[cfg(test)]
@@ -481,6 +648,8 @@ mod tests {
     const ACCOUNT: &str = "00000000-0000-4000-8000-000000000001";
     const INSTRUMENT_FIXTURE: &str = include_str!("../fixtures/instruments-linear.json");
     const BBO_FIXTURE: &str = include_str!("../fixtures/orderbook-linear-bbo.json");
+    const CLOSED_KLINE_FIXTURE: &str = include_str!("../fixtures/public-ws-kline-1m-closed.json");
+    const PUBLIC_TRADES_FIXTURE: &str = include_str!("../fixtures/public-ws-trades.json");
 
     fn binding(symbol: &str) -> Result<BybitGatewayBinding, Box<dyn std::error::Error>> {
         Ok(BybitGatewayBinding::new(GatewayBinding::new(
@@ -544,6 +713,64 @@ mod tests {
         assert_eq!(bbo.snapshot.exchange_time_ms, Some(1_716_863_718_905));
         assert_eq!(bbo.snapshot.sequence, 230_704);
         assert_eq!(bbo.cross_sequence, 1_432_604_333);
+        Ok(())
+    }
+
+    #[test]
+    fn closed_one_minute_kline_preserves_source_values_and_keeps_missing_fields_unknown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding("BTC/USDT")?;
+        let bar = parse_closed_1m_kline(
+            CLOSED_KLINE_FIXTURE,
+            binding.gateway_binding(),
+            7,
+            1_672_324_860_100,
+        )?;
+        assert_eq!(bar.sequence, 27_872_081);
+        assert_eq!(bar.open_time_ms, 1_672_324_800_000);
+        assert_eq!(bar.close_time_ms, 1_672_324_859_999);
+        assert_eq!(bar.base_volume, FieldState::Known(Decimal::new(2_081, 3)));
+        assert_eq!(
+            bar.quote_volume,
+            FieldState::Known(Decimal::new(346_664_005, 4))
+        );
+        assert!(matches!(bar.trade_count, FieldState::Unavailable { .. }));
+        assert!(bar.is_valid());
+        assert_eq!(
+            parse_closed_1m_kline(
+                &CLOSED_KLINE_FIXTURE.replace("\"confirm\":true", "\"confirm\":false"),
+                binding.gateway_binding(),
+                7,
+                1_672_324_860_100,
+            ),
+            Err(BybitPublicError::BarNotClosed)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn public_trades_keep_bybit_uuid_opaque_and_do_not_promote_cross_sequence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding("BTC/USDT")?;
+        let trades = parse_public_trades(
+            PUBLIC_TRADES_FIXTURE,
+            binding.gateway_binding(),
+            7,
+            1_672_304_486_900,
+        )?;
+        assert_eq!(trades.len(), 2);
+        let Some(trade) = trades.first() else {
+            return Err("expected first trade".into());
+        };
+        assert_eq!(
+            trade.aggregate_trade_id,
+            PublicTradeId::Opaque("20f43950-d8dd-5b31-9112-a178eb6023af".to_owned())
+        );
+        assert_eq!(trade.first_trade_id, None);
+        assert_eq!(trade.last_trade_id, None);
+        assert_eq!(trade.ordering, PublicTradeOrdering::Unsequenced);
+        assert_eq!(trade.quantity, Decimal::new(1, 3));
+        assert_eq!(trade.quote_quantity, Decimal::new(16_578_5, 4));
         Ok(())
     }
 

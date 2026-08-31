@@ -7,7 +7,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,21 +19,32 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
     tungstenite::{Message, protocol::WebSocketConfig},
 };
-use venue_domain::domain::{MarketEvent, MarketLevel, MarketSnapshot, Price};
+use venue_domain::domain::{
+    MarketEvent, MarketLevel, MarketSnapshot, Price, PublicTrade, PublicTradeId,
+};
 use venue_gateway_api::GatewayBinding;
 
 use crate::{
     HyperliquidConfig, HyperliquidError, HyperliquidGatewayBinding,
     models::{BookData, EventEnvelope},
+    parse_public_trades,
     protocol::resolve_perp_meta,
+    public::parse_1m_candle,
 };
 
 const CONNECT_CAP: Duration = Duration::from_secs(10);
 const HEARTBEAT_AFTER: Duration = Duration::from_secs(50);
 const HEARTBEAT_REPLY_CAP: Duration = Duration::from_secs(10);
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_TRACKED_FACTS: usize = 1_024;
+const MAX_STARTUP_FRAMES: usize = 64;
 
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+struct CapturedFrame {
+    received_at_ms: u64,
+    payload: String,
+}
 
 /// A bounded read-only receiver for one actual Hyperliquid `BASE/USDC` perpetual.
 ///
@@ -49,6 +60,9 @@ pub struct HyperliquidScalpingPublicReceiver {
     last_sent_at: tokio::time::Instant,
     heartbeat_deadline: Option<tokio::time::Instant>,
     last_snapshot: Option<(u64, MarketSnapshot)>,
+    startup_frames: VecDeque<CapturedFrame>,
+    trades: BTreeMap<PublicTradeId, PublicTrade>,
+    trade_order: VecDeque<PublicTradeId>,
     failed: bool,
 }
 
@@ -112,7 +126,8 @@ impl HyperliquidScalpingPublicReceiver {
         let websocket = WebSocketConfig::default()
             .max_message_size(Some(max_body_bytes))
             .max_frame_size(Some(max_body_bytes));
-        let (socket, _, native_coin) = timeout(budget, async {
+        let generation = now_ms()?;
+        let (socket, _, native_coin, startup_frames) = timeout(budget, async {
             let (mut socket, response) = connect_async_with_config(endpoint, Some(websocket), true)
                 .await
                 .map_err(|_| HyperliquidPublicWsError::Disconnected)?;
@@ -127,18 +142,50 @@ impl HyperliquidScalpingPublicReceiver {
                 .ok_or(HyperliquidPublicWsError::Disconnected)?
                 .map_err(|_| HyperliquidPublicWsError::Disconnected)?;
             let native_coin = validate_metadata(metadata, &binding, max_body_bytes)?;
-            let request = subscription(&native_coin)?;
-            socket
-                .send(Message::Text(request.into()))
-                .await
-                .map_err(|_| HyperliquidPublicWsError::Disconnected)?;
-            let acknowledgement = socket
-                .next()
-                .await
-                .ok_or(HyperliquidPublicWsError::Disconnected)?
-                .map_err(|_| HyperliquidPublicWsError::Disconnected)?;
-            validate_ack(acknowledgement, &native_coin, max_body_bytes)?;
-            Ok::<_, HyperliquidPublicWsError>((socket, response, native_coin))
+            for kind in ["l2Book", "trades", "candle"] {
+                let request = subscription(&native_coin, kind)?;
+                socket
+                    .send(Message::Text(request.into()))
+                    .await
+                    .map_err(|_| HyperliquidPublicWsError::Disconnected)?;
+            }
+            let mut acknowledged = BTreeSet::new();
+            let mut startup_frames = VecDeque::new();
+            while acknowledged.len() < 3 {
+                let frame = socket
+                    .next()
+                    .await
+                    .ok_or(HyperliquidPublicWsError::Disconnected)?
+                    .map_err(|_| HyperliquidPublicWsError::Disconnected)?;
+                match frame {
+                    Message::Ping(value) => socket
+                        .send(Message::Pong(value))
+                        .await
+                        .map_err(|_| HyperliquidPublicWsError::Disconnected)?,
+                    Message::Pong(_) => {}
+                    Message::Close(_) => return Err(HyperliquidPublicWsError::Disconnected),
+                    Message::Text(value) => capture_startup_frame(
+                        &mut startup_frames,
+                        &mut acknowledged,
+                        value.to_string(),
+                        &native_coin,
+                        max_body_bytes,
+                    )?,
+                    Message::Binary(value) => {
+                        let payload = String::from_utf8(value.to_vec())
+                            .map_err(|_| HyperliquidPublicWsError::Protocol)?;
+                        capture_startup_frame(
+                            &mut startup_frames,
+                            &mut acknowledged,
+                            payload,
+                            &native_coin,
+                            max_body_bytes,
+                        )?;
+                    }
+                    _ => return Err(HyperliquidPublicWsError::Protocol),
+                }
+            }
+            Ok::<_, HyperliquidPublicWsError>((socket, response, native_coin, startup_frames))
         })
         .await
         .map_err(|_| HyperliquidPublicWsError::Timeout)??;
@@ -146,12 +193,15 @@ impl HyperliquidScalpingPublicReceiver {
             binding,
             native_coin,
             socket,
-            generation: now_ms()?,
+            generation,
             max_body_bytes,
             heartbeat_after,
             last_sent_at: tokio::time::Instant::now(),
             heartbeat_deadline: None,
             last_snapshot: None,
+            startup_frames,
+            trades: BTreeMap::new(),
+            trade_order: VecDeque::new(),
             failed: false,
         })
     }
@@ -161,15 +211,18 @@ impl HyperliquidScalpingPublicReceiver {
         self.generation
     }
 
-    /// Receives at most one normalized snapshot.  Idle polls, subscription acknowledgements,
-    /// and websocket/application pongs produce `None`.  Any other invalid, closed, or rejected
+    /// Receives at most one bounded normalized batch. Idle polls, subscription acknowledgements,
+    /// and websocket/application pongs produce an empty vector. Any other invalid, closed, or rejected
     /// input terminally fences this receiver.
     pub async fn next(
         &mut self,
         wait: Duration,
-    ) -> Result<Option<(u64, MarketEvent)>, HyperliquidPublicWsError> {
+    ) -> Result<Vec<(u64, MarketEvent)>, HyperliquidPublicWsError> {
         if self.failed {
             return Err(HyperliquidPublicWsError::Fenced);
+        }
+        if let Some(frame) = self.startup_frames.pop_front() {
+            return self.consume_text(frame.payload, frame.received_at_ms);
         }
         if self.heartbeat_deadline.is_none() && self.last_sent_at.elapsed() >= self.heartbeat_after
         {
@@ -200,16 +253,20 @@ impl HyperliquidScalpingPublicReceiver {
                 {
                     self.send_heartbeat().await?;
                 }
-                return Ok(None);
+                return Ok(Vec::new());
             }
             Ok(None) => return self.fail(HyperliquidPublicWsError::Disconnected),
             Ok(Some(Err(_))) => return self.fail(HyperliquidPublicWsError::Disconnected),
             Ok(Some(Ok(frame))) => frame,
         };
+        let received_at_ms = match now_ms() {
+            Ok(value) => value,
+            Err(error) => return self.fail(error),
+        };
         match frame {
-            Message::Text(value) => self.consume_text(value.to_string()),
+            Message::Text(value) => self.consume_text(value.to_string(), received_at_ms),
             Message::Binary(value) => match String::from_utf8(value.to_vec()) {
-                Ok(value) => self.consume_text(value),
+                Ok(value) => self.consume_text(value, received_at_ms),
                 Err(_) => self.fail(HyperliquidPublicWsError::Protocol),
             },
             Message::Ping(value) => {
@@ -219,9 +276,9 @@ impl HyperliquidScalpingPublicReceiver {
                     Ok(Ok(())) => {}
                 }
                 self.last_sent_at = tokio::time::Instant::now();
-                Ok(None)
+                Ok(Vec::new())
             }
-            Message::Pong(_) => Ok(None),
+            Message::Pong(_) => Ok(Vec::new()),
             Message::Close(_) => self.fail(HyperliquidPublicWsError::Disconnected),
             _ => self.fail(HyperliquidPublicWsError::Protocol),
         }
@@ -248,19 +305,45 @@ impl HyperliquidScalpingPublicReceiver {
     fn consume_text(
         &mut self,
         payload: String,
-    ) -> Result<Option<(u64, MarketEvent)>, HyperliquidPublicWsError> {
+        received_at_ms: u64,
+    ) -> Result<Vec<(u64, MarketEvent)>, HyperliquidPublicWsError> {
         if payload.len() > self.max_body_bytes {
             return self.fail(HyperliquidPublicWsError::BodyTooLarge);
         }
         if is_exact_pong(&payload) {
             self.heartbeat_deadline = None;
-            return Ok(None);
+            return Ok(Vec::new());
         }
-        if is_subscription_ack(&payload, &self.native_coin) {
-            return Ok(None);
+        if ["l2Book", "trades", "candle"]
+            .into_iter()
+            .any(|kind| is_subscription_ack(&payload, &self.native_coin, kind))
+        {
+            return Ok(Vec::new());
         }
         if is_venue_error(&payload) {
             return self.fail(HyperliquidPublicWsError::Rejected);
+        }
+        if let Ok(trades) = parse_public_trades(
+            &payload,
+            &self.binding,
+            &self.native_coin,
+            self.generation,
+            received_at_ms,
+        ) {
+            return self.accept_trades(trades);
+        }
+        if parse_1m_candle(
+            &payload,
+            &self.binding,
+            &self.native_coin,
+            self.generation,
+            received_at_ms,
+        )
+        .is_ok()
+        {
+            // The public candle stream has no closure flag. Do not publish a forming candle
+            // until an authoritative candleSnapshot path confirms this exact 1m bucket.
+            return Ok(Vec::new());
         }
         let snapshot =
             match parse_snapshot(&payload, &self.binding, &self.native_coin, self.generation) {
@@ -276,30 +359,55 @@ impl HyperliquidScalpingPublicReceiver {
                 return self.fail(HyperliquidPublicWsError::Watermark);
             }
             if watermark == *prior_watermark {
-                return Ok(None);
+                return Ok(Vec::new());
             }
         }
         self.last_snapshot = Some((watermark, snapshot.clone()));
-        let received_at_ms = match now_ms() {
-            Ok(value) => value,
-            Err(error) => return self.fail(error),
-        };
-        Ok(Some((received_at_ms, MarketEvent::Snapshot(snapshot))))
+        Ok(vec![(received_at_ms, MarketEvent::Snapshot(snapshot))])
     }
 
     fn fail<T>(&mut self, error: HyperliquidPublicWsError) -> Result<T, HyperliquidPublicWsError> {
         self.failed = true;
         Err(error)
     }
+
+    fn accept_trades(
+        &mut self,
+        trades: Vec<PublicTrade>,
+    ) -> Result<Vec<(u64, MarketEvent)>, HyperliquidPublicWsError> {
+        let mut events = Vec::with_capacity(trades.len());
+        for trade in trades {
+            if let Some(previous) = self.trades.get(&trade.aggregate_trade_id) {
+                if same_trade(previous, &trade) {
+                    continue;
+                }
+                return self.fail(HyperliquidPublicWsError::Watermark);
+            }
+            let id = trade.aggregate_trade_id.clone();
+            let received = trade.received_at_ms;
+            let _ = self.trades.insert(id.clone(), trade.clone());
+            self.trade_order.push_back(id);
+            if self.trade_order.len() > MAX_TRACKED_FACTS {
+                if let Some(oldest) = self.trade_order.pop_front() {
+                    let _ = self.trades.remove(&oldest);
+                }
+            }
+            events.push((received, MarketEvent::Trade(trade)));
+        }
+        Ok(events)
+    }
 }
 
-fn subscription(native_coin: &str) -> Result<String, HyperliquidPublicWsError> {
-    if native_coin.is_empty() || native_coin.contains(['/', ':', '@']) {
+fn subscription(native_coin: &str, kind: &str) -> Result<String, HyperliquidPublicWsError> {
+    if native_coin.is_empty()
+        || native_coin.contains(['/', ':', '@'])
+        || !matches!(kind, "l2Book" | "trades" | "candle")
+    {
         return Err(HyperliquidPublicWsError::Binding);
     }
     serde_json::to_string(&serde_json::json!({
         "method": "subscribe",
-        "subscription": {"type": "l2Book", "coin": native_coin},
+        "subscription": if kind == "candle" { serde_json::json!({"type": kind, "coin": native_coin, "interval": "1m"}) } else { serde_json::json!({"type": kind, "coin": native_coin}) },
     }))
     .map_err(|_| HyperliquidPublicWsError::Protocol)
 }
@@ -342,20 +450,39 @@ fn validate_metadata(
     Ok(metadata.native_coin)
 }
 
-fn validate_ack(
-    frame: Message,
+fn capture_startup_frame(
+    startup_frames: &mut VecDeque<CapturedFrame>,
+    acknowledged: &mut BTreeSet<&'static str>,
+    payload: String,
     native_coin: &str,
     max_body_bytes: usize,
 ) -> Result<(), HyperliquidPublicWsError> {
-    let payload = frame_text(frame, max_body_bytes)?;
+    if payload.len() > max_body_bytes {
+        return Err(HyperliquidPublicWsError::BodyTooLarge);
+    }
     if is_venue_error(&payload) {
         return Err(HyperliquidPublicWsError::Rejected);
     }
-    if is_subscription_ack(&payload, native_coin) {
-        Ok(())
-    } else {
-        Err(HyperliquidPublicWsError::Protocol)
+    if let Some(kind) = ["l2Book", "trades", "candle"]
+        .into_iter()
+        .find(|kind| is_subscription_ack(&payload, native_coin, kind))
+    {
+        return acknowledged
+            .insert(kind)
+            .then_some(())
+            .ok_or(HyperliquidPublicWsError::Protocol);
     }
+    if is_subscription_response(&payload) {
+        return Err(HyperliquidPublicWsError::Protocol);
+    }
+    if startup_frames.len() >= MAX_STARTUP_FRAMES {
+        return Err(HyperliquidPublicWsError::StartupOverflow);
+    }
+    startup_frames.push_back(CapturedFrame {
+        received_at_ms: now_ms()?,
+        payload,
+    });
+    Ok(())
 }
 
 fn frame_text(frame: Message, max_body_bytes: usize) -> Result<String, HyperliquidPublicWsError> {
@@ -400,7 +527,7 @@ struct MetadataResponse {
     payload: serde_json::Value,
 }
 
-fn is_subscription_ack(payload: &str, native_coin: &str) -> bool {
+fn is_subscription_ack(payload: &str, native_coin: &str, kind: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(payload)
         .ok()
         .is_some_and(|value| {
@@ -415,14 +542,27 @@ fn is_subscription_ack(payload: &str, native_coin: &str) -> bool {
                                 .and_then(serde_json::Value::as_object)
                                 .is_some_and(|subscription| {
                                     subscription.get("type").and_then(serde_json::Value::as_str)
-                                        == Some("l2Book")
+                                        == Some(kind)
                                         && subscription
                                             .get("coin")
                                             .and_then(serde_json::Value::as_str)
                                             == Some(native_coin)
+                                        && (kind != "candle"
+                                            || subscription
+                                                .get("interval")
+                                                .and_then(serde_json::Value::as_str)
+                                                == Some("1m"))
                                         && data.get("error").is_none_or(serde_json::Value::is_null)
                                 })
                     })
+        })
+}
+
+fn is_subscription_response(payload: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .is_some_and(|value| {
+            value.get("channel").and_then(serde_json::Value::as_str) == Some("subscriptionResponse")
         })
 }
 
@@ -465,6 +605,13 @@ fn parse_snapshot(
     let data: BookData =
         serde_json::from_value(envelope.data).map_err(|_| HyperliquidPublicWsError::Protocol)?;
     if data.coin != native_coin || data.time == 0 {
+        return Err(HyperliquidPublicWsError::Protocol);
+    }
+    if data.levels[0]
+        .len()
+        .checked_add(data.levels[1].len())
+        .is_none_or(|count| count > MAX_TRACKED_FACTS)
+    {
         return Err(HyperliquidPublicWsError::Protocol);
     }
     let bids = normalize_side(data.levels[0].iter(), true)?;
@@ -531,6 +678,21 @@ fn now_ms() -> Result<u64, HyperliquidPublicWsError> {
     .map_err(|_| HyperliquidPublicWsError::Clock)
 }
 
+fn same_trade(left: &PublicTrade, right: &PublicTrade) -> bool {
+    left.symbol == right.symbol
+        && left.generation == right.generation
+        && left.exchange_time_ms == right.exchange_time_ms
+        && left.transaction_time_ms == right.transaction_time_ms
+        && left.aggregate_trade_id == right.aggregate_trade_id
+        && left.first_trade_id == right.first_trade_id
+        && left.last_trade_id == right.last_trade_id
+        && left.ordering == right.ordering
+        && left.price == right.price
+        && left.quantity == right.quantity
+        && left.quote_quantity == right.quote_quantity
+        && left.aggressor == right.aggressor
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum HyperliquidPublicWsError {
     #[error("Hyperliquid public receiver binding is not a LIVE BASE/USDC perpetual")]
@@ -549,6 +711,8 @@ pub enum HyperliquidPublicWsError {
     Protocol,
     #[error("Hyperliquid public subscription was rejected")]
     Rejected,
+    #[error("Hyperliquid public receiver startup buffer overflowed")]
+    StartupOverflow,
     #[error("Hyperliquid public receiver timed out")]
     Timeout,
     #[error("Hyperliquid snapshot watermark regressed or conflicted")]
@@ -610,23 +774,36 @@ mod tests {
             {
                 return;
             }
-            let Some(Ok(Message::Text(request))) = socket.next().await else {
-                return;
-            };
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(request.as_str()) else {
-                return;
-            };
-            let coin = value
-                .pointer("/subscription/coin")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("BTC");
-            let ack = serde_json::json!({"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"l2Book","coin":coin}}});
-            if socket
-                .send(Message::Text(ack.to_string().into()))
-                .await
-                .is_err()
-            {
-                return;
+            for kind in ["l2Book", "trades", "candle"] {
+                let Some(Ok(Message::Text(request))) = socket.next().await else {
+                    return;
+                };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(request.as_str()) else {
+                    return;
+                };
+                let coin = value
+                    .pointer("/subscription/coin")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("BTC");
+                if value
+                    .pointer("/subscription/type")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(kind)
+                {
+                    return;
+                }
+                let mut subscription = serde_json::json!({"type":kind,"coin":coin});
+                if kind == "candle" {
+                    subscription["interval"] = serde_json::Value::String("1m".to_owned());
+                }
+                let ack = serde_json::json!({"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":subscription}});
+                if socket
+                    .send(Message::Text(ack.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
             }
             for frame in frames {
                 if socket.send(frame).await.is_err() {
@@ -657,6 +834,103 @@ mod tests {
         )
     }
 
+    #[test]
+    fn book_rejects_more_than_1024_levels_per_frame() -> Result<(), Box<dyn std::error::Error>> {
+        let level = serde_json::json!({"px":"100","sz":"1","n":1});
+        let payload = serde_json::json!({"channel":"l2Book","data":{"coin":"BTC","time":1,"levels":[vec![level; 1025], [serde_json::json!({"px":"101","sz":"1","n":1})]]}}).to_string();
+        assert_eq!(
+            parse_snapshot(&payload, &binding("BTC/USDC")?, "BTC", 1),
+            Err(HyperliquidPublicWsError::Protocol)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_buffers_interleaved_public_data_until_all_exact_acks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let task = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut socket) = accept_async(stream).await else {
+                return;
+            };
+            let Some(Ok(Message::Text(_))) = socket.next().await else {
+                return;
+            };
+            let metadata = serde_json::json!({"channel":"post","data":{"id":1,"response":{"type":"info","payload":serde_json::from_str::<serde_json::Value>(META).ok()}}});
+            if socket
+                .send(Message::Text(metadata.to_string().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            for expected in ["l2Book", "trades", "candle"] {
+                let Some(Ok(Message::Text(request))) = socket.next().await else {
+                    return;
+                };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(request.as_str()) else {
+                    return;
+                };
+                if value
+                    .pointer("/subscription/type")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(expected)
+                {
+                    return;
+                }
+            }
+            let ack = |kind: &str| {
+                let mut subscription = serde_json::json!({"type":kind,"coin":"BTC"});
+                if kind == "candle" {
+                    subscription["interval"] = serde_json::Value::String("1m".to_owned());
+                }
+                Message::Text(serde_json::json!({"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":subscription}}).to_string().into())
+            };
+            for message in [
+                frame(1000), ack("l2Book"),
+                Message::Text(r#"{"channel":"trades","data":[{"coin":"BTC","side":"B","px":"100","sz":"1","time":1001,"tid":7}]}"#.into()), ack("trades"),
+                Message::Text(include_str!("../fixtures/public-candle-1m-ws.json").into()), ack("candle"),
+            ] {
+                if socket.send(message).await.is_err() { return; }
+            }
+        });
+        let mut receiver = HyperliquidScalpingPublicReceiver::connect_for_test(
+            binding("BTC/USDC")?,
+            &endpoint,
+            Duration::from_secs(1),
+            4096,
+            Duration::from_secs(1),
+        )
+        .await?;
+        assert_eq!(receiver.startup_frames.len(), 3);
+        let first_received = receiver
+            .startup_frames
+            .front()
+            .ok_or("startup")?
+            .received_at_ms;
+        let first = receiver.next(Duration::from_millis(1)).await?;
+        assert_eq!(first.first().map(|event| event.0), Some(first_received));
+        assert!(matches!(
+            first.first().map(|event| &event.1),
+            Some(MarketEvent::Snapshot(_))
+        ));
+        assert!(matches!(
+            receiver
+                .next(Duration::from_millis(1))
+                .await?
+                .first()
+                .map(|event| &event.1),
+            Some(MarketEvent::Trade(_))
+        ));
+        assert!(receiver.next(Duration::from_millis(1)).await?.is_empty());
+        task.await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn receiver_emits_complete_snapshot_and_ignores_ack_pong_and_duplicate()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -675,9 +949,12 @@ mod tests {
             Duration::from_millis(1),
         )
         .await?;
-        assert_eq!(receiver.next(Duration::from_millis(50)).await?, None);
-        let Some((received, MarketEvent::Snapshot(snapshot))) =
-            receiver.next(Duration::from_millis(50)).await?
+        assert_eq!(receiver.next(Duration::from_millis(50)).await?, Vec::new());
+        let Some((received, MarketEvent::Snapshot(snapshot))) = receiver
+            .next(Duration::from_millis(50))
+            .await?
+            .into_iter()
+            .next()
         else {
             return Err("snapshot".into());
         };
@@ -685,9 +962,9 @@ mod tests {
         assert_eq!(snapshot.sequence, 1000);
         assert_eq!(snapshot.bids.len(), 2);
         assert_eq!(snapshot.asks.len(), 2);
-        assert_eq!(receiver.next(Duration::from_millis(50)).await?, None);
-        assert_eq!(receiver.next(Duration::from_millis(1)).await?, None);
-        assert_eq!(receiver.next(Duration::from_millis(50)).await?, None);
+        assert_eq!(receiver.next(Duration::from_millis(50)).await?, Vec::new());
+        assert_eq!(receiver.next(Duration::from_millis(1)).await?, Vec::new());
+        assert_eq!(receiver.next(Duration::from_millis(50)).await?, Vec::new());
         task.await?;
         Ok(())
     }
@@ -704,8 +981,8 @@ mod tests {
             Duration::from_millis(30),
         )
         .await?;
-        assert_eq!(receiver.next(Duration::from_millis(100)).await?, None);
-        assert_eq!(receiver.next(Duration::from_millis(1)).await?, None);
+        assert_eq!(receiver.next(Duration::from_millis(100)).await?, Vec::new());
+        assert_eq!(receiver.next(Duration::from_millis(1)).await?, Vec::new());
         assert_eq!(
             receiver.next(Duration::from_millis(20)).await,
             Err(HyperliquidPublicWsError::Timeout)
@@ -792,7 +1069,7 @@ mod tests {
             Duration::from_secs(1),
         )
         .await?;
-        assert!(receiver.next(Duration::from_millis(50)).await?.is_some());
+        assert!(!receiver.next(Duration::from_millis(50)).await?.is_empty());
         assert_eq!(
             receiver.next(Duration::from_millis(50)).await,
             Err(HyperliquidPublicWsError::Watermark)

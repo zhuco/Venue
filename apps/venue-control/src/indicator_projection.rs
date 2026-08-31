@@ -196,15 +196,8 @@ fn validate_projection_input(
 }
 
 fn complete_trade(trade: &PublicTrade) -> bool {
-    trade.received_at_ms != 0
-        && trade.exchange_time_ms != 0
-        && trade.transaction_time_ms != 0
-        && trade.aggregate_trade_id != 0
-        && trade.first_trade_id != 0
-        && trade.last_trade_id >= trade.first_trade_id
-        && trade.price.value() > rust_decimal::Decimal::ZERO
-        && trade.quantity > rust_decimal::Decimal::ZERO
-        && trade.quote_quantity > rust_decimal::Decimal::ZERO
+    trade.is_valid()
+        && trade.sequence().is_some()
         && matches!(
             trade.aggressor,
             FieldState::Known(AggressorSide::Buy | AggressorSide::Sell)
@@ -602,9 +595,10 @@ mod tests {
                                 received_at_ms: trade_id + 1,
                                 exchange_time_ms: trade_id + 1,
                                 transaction_time_ms: trade_id + 1,
-                                aggregate_trade_id: trade_id,
-                                first_trade_id: trade_id,
-                                last_trade_id: trade_id,
+                                aggregate_trade_id: trade_id.into(),
+                                first_trade_id: Some(trade_id),
+                                last_trade_id: Some(trade_id),
+                                ordering: venue_domain::PublicTradeOrdering::NativeAggregateId,
                                 price: Price::new(Decimal::from(100))?,
                                 quantity: Decimal::ONE,
                                 quote_quantity: Decimal::from(100),
@@ -729,9 +723,10 @@ mod tests {
                         received_at_ms: 1,
                         exchange_time_ms: 1,
                         transaction_time_ms: 1,
-                        aggregate_trade_id: 1,
-                        first_trade_id: 1,
-                        last_trade_id: 1,
+                        aggregate_trade_id: 1_u64.into(),
+                        first_trade_id: Some(1),
+                        last_trade_id: Some(1),
+                        ordering: venue_domain::PublicTradeOrdering::NativeAggregateId,
                         price: Price::new(Decimal::from(100))?,
                         quantity: -Decimal::ONE,
                         quote_quantity: Decimal::from(100),

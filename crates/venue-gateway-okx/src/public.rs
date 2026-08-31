@@ -1,10 +1,17 @@
 use std::str::FromStr;
 
 use rust_decimal::Decimal;
-use venue_domain::domain::{Amount, Asset, Instrument, MarketKind, Price, PublicTicker};
+use serde::Deserialize;
+use venue_domain::domain::{
+    AggressorSide, Amount, Asset, FieldState, Instrument, MarketKind, Price, PublicBar,
+    PublicTicker, PublicTrade, PublicTradeId, PublicTradeOrdering, UnknownReason,
+};
 
 use crate::models::{BookPush, Envelope, InstrumentRow};
 use crate::{OkxConfig, OkxError};
+
+const ONE_MINUTE_MS: u64 = 60_000;
+const MAX_TRADES_PER_PUSH: usize = 1_024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OkxInstrument {
@@ -272,6 +279,154 @@ pub fn parse_bbo(
     })
 }
 
+/// Parses the public OKX `trades` aggregation. The documented `tradeId` is the last native ID
+/// in an exactly contiguous aggregation described by `count`; `seqId` may repeat and is therefore
+/// deliberately not promoted as a trade identity.
+pub fn parse_trades(
+    payload: &[u8],
+    instrument: &OkxInstrument,
+    received_at_ms: u64,
+) -> Result<Vec<PublicTrade>, OkxError> {
+    if received_at_ms == 0 {
+        return Err(OkxError::Payload);
+    }
+    let push: TradesPush = serde_json::from_slice(payload).map_err(|_| OkxError::Payload)?;
+    if push.arg.channel != "trades" || push.arg.inst_id != instrument.native_id {
+        return Err(OkxError::Binding);
+    }
+    if push.data.is_empty() || push.data.len() > MAX_TRADES_PER_PUSH {
+        return Err(OkxError::Payload);
+    }
+    push.data
+        .into_iter()
+        .map(|row| normalize_trade(row, instrument, received_at_ms))
+        .collect()
+}
+
+/// Parses one closed public OKX `candle1m` record. Its opening timestamp is a stable candle
+/// bucket used for deduplication; it is not represented as a native exchange sequence.
+pub fn parse_closed_1m_candle(
+    payload: &[u8],
+    instrument: &OkxInstrument,
+    received_at_ms: u64,
+) -> Result<PublicBar, OkxError> {
+    if received_at_ms == 0 {
+        return Err(OkxError::Payload);
+    }
+    let push: CandlePush = serde_json::from_slice(payload).map_err(|_| OkxError::Payload)?;
+    if push.arg.channel != "candle1m" || push.arg.inst_id != instrument.native_id {
+        return Err(OkxError::Binding);
+    }
+    let [row] = push.data.as_slice() else {
+        return Err(OkxError::Payload);
+    };
+    let [
+        open_time,
+        open,
+        high,
+        low,
+        close,
+        contracts,
+        base_volume,
+        quote_volume,
+        confirm,
+    ] = row.as_slice()
+    else {
+        return Err(OkxError::Payload);
+    };
+    if confirm != "1" {
+        return Err(OkxError::Sequence);
+    }
+    let open_time_ms = positive_u64(open_time)?;
+    let close_time_ms = open_time_ms
+        .checked_add(ONE_MINUTE_MS - 1)
+        .ok_or(OkxError::Sequence)?;
+    if open_time_ms % ONE_MINUTE_MS != 0 {
+        return Err(OkxError::Sequence);
+    }
+    // Parse `vol` too: it must be a non-negative contract count, and its converted base volume
+    // must agree exactly with the source-provided derivatives `volCcy` field.
+    let contracts = non_negative_decimal(contracts)?;
+    let derived_base_volume = instrument.contracts_to_base(contracts)?;
+    let base_volume = non_negative_decimal(base_volume)?;
+    if base_volume != derived_base_volume {
+        return Err(OkxError::Payload);
+    }
+    let quote_volume = non_negative_decimal(quote_volume)?;
+    let sequence = open_time_ms
+        .checked_div(ONE_MINUTE_MS)
+        .and_then(|value| value.checked_add(1))
+        .ok_or(OkxError::Sequence)?;
+    let fact = PublicBar {
+        symbol: instrument.instrument.symbol.clone(),
+        generation: instrument.instrument.generation,
+        received_at_ms,
+        sequence,
+        open_time_ms,
+        close_time_ms,
+        interval_ms: ONE_MINUTE_MS,
+        open: Price::new(positive_decimal(open)?).map_err(|_| OkxError::Payload)?,
+        high: Price::new(positive_decimal(high)?).map_err(|_| OkxError::Payload)?,
+        low: Price::new(positive_decimal(low)?).map_err(|_| OkxError::Payload)?,
+        close: Price::new(positive_decimal(close)?).map_err(|_| OkxError::Payload)?,
+        base_volume: FieldState::Known(base_volume),
+        quote_volume: FieldState::Known(quote_volume),
+        trade_count: FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        },
+        taker_buy_base_volume: FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        },
+        taker_buy_quote_volume: FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        },
+    };
+    fact.is_valid().then_some(fact).ok_or(OkxError::Payload)
+}
+
+fn normalize_trade(
+    row: TradeRow,
+    instrument: &OkxInstrument,
+    received_at_ms: u64,
+) -> Result<PublicTrade, OkxError> {
+    if row.inst_id != instrument.native_id {
+        return Err(OkxError::Binding);
+    }
+    let last_trade_id = positive_u64(&row.trade_id)?;
+    let count = positive_u64(&row.count)?;
+    let first_trade_id = last_trade_id
+        .checked_sub(count.saturating_sub(1))
+        .filter(|value| *value > 0)
+        .ok_or(OkxError::Sequence)?;
+    let price = Price::new(positive_decimal(&row.px)?).map_err(|_| OkxError::Payload)?;
+    let contracts = positive_decimal(&row.sz)?;
+    let quantity = instrument.contracts_to_base(contracts)?;
+    let quote_quantity = quantity
+        .checked_mul(price.value())
+        .ok_or(OkxError::Payload)?;
+    let aggressor = match row.side.as_str() {
+        "buy" => AggressorSide::Buy,
+        "sell" => AggressorSide::Sell,
+        _ => return Err(OkxError::Payload),
+    };
+    let transaction_time_ms = positive_u64(&row.ts)?;
+    Ok(PublicTrade {
+        symbol: instrument.instrument.symbol.clone(),
+        generation: instrument.instrument.generation,
+        received_at_ms,
+        exchange_time_ms: transaction_time_ms,
+        transaction_time_ms,
+        aggregate_trade_id: PublicTradeId::Numeric(last_trade_id),
+        first_trade_id: Some(first_trade_id),
+        last_trade_id: Some(last_trade_id),
+        ordering: PublicTradeOrdering::Unsequenced,
+        price,
+        quantity,
+        quote_quantity,
+        aggressor: FieldState::Known(aggressor),
+    })
+}
+
 fn one_level(levels: &[Vec<String>]) -> Result<(Price, Decimal), OkxError> {
     let [level] = levels else {
         return Err(OkxError::Payload);
@@ -308,10 +463,51 @@ pub(crate) fn positive_decimal(value: &str) -> Result<Decimal, OkxError> {
     })
 }
 
+fn non_negative_decimal(value: &str) -> Result<Decimal, OkxError> {
+    decimal(value).and_then(|value| {
+        (!value.is_sign_negative())
+            .then_some(value)
+            .ok_or(OkxError::Payload)
+    })
+}
+
 pub(crate) fn positive_u64(value: &str) -> Result<u64, OkxError> {
     u64::from_str(value)
         .map_err(|_| OkxError::Payload)
         .and_then(|value| (value > 0).then_some(value).ok_or(OkxError::Payload))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TradesPush {
+    arg: PublicStreamArg,
+    data: Vec<TradeRow>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TradeRow {
+    inst_id: String,
+    trade_id: String,
+    px: String,
+    sz: String,
+    side: String,
+    ts: String,
+    count: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CandlePush {
+    arg: PublicStreamArg,
+    data: Vec<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicStreamArg {
+    channel: String,
+    inst_id: String,
 }
 
 #[cfg(test)]
@@ -322,6 +518,8 @@ mod tests {
 
     const INSTRUMENT: &[u8] = include_bytes!("../fixtures/linear-swap-instrument.json");
     const BBO: &[u8] = include_bytes!("../fixtures/bbo-tbt.json");
+    const TRADES: &[u8] = include_bytes!("../fixtures/public-ws-trades.json");
+    const CLOSED_CANDLE: &[u8] = include_bytes!("../fixtures/business-ws-candle-1m-closed.json");
 
     fn config() -> Result<OkxConfig, Box<dyn std::error::Error>> {
         Ok(OkxConfig::for_binding(GatewayBinding::new(
@@ -412,6 +610,56 @@ mod tests {
         );
         assert_eq!(
             parse_bbo(BBO, &config, &instrument, 1_787_911_200_499, None),
+            Err(OkxError::Sequence)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn trades_restore_documented_contiguous_native_ids_and_base_quantity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = config()?;
+        let instrument = parse_instrument(INSTRUMENT, &config, 7)?;
+        let trades = parse_trades(TRADES, &instrument, 1_630_048_898_000)?;
+        let [trade] = trades.as_slice() else {
+            return Err("expected one aggregation".into());
+        };
+        assert_eq!(
+            trade.aggregate_trade_id,
+            PublicTradeId::Numeric(130_639_474)
+        );
+        assert_eq!(trade.first_trade_id, Some(130_639_472));
+        assert_eq!(trade.last_trade_id, Some(130_639_474));
+        assert_eq!(trade.ordering, PublicTradeOrdering::Unsequenced);
+        assert_eq!(trade.quantity, Decimal::new(12_060_306, 9));
+        assert_eq!(trade.quote_quantity, Decimal::new(5_091_849_132_894, 10));
+        assert_eq!(trade.aggressor, FieldState::Known(AggressorSide::Buy));
+        let invalid =
+            String::from_utf8_lossy(TRADES).replace("\"count\":\"3\"", "\"count\":\"130639475\"");
+        assert_eq!(
+            parse_trades(invalid.as_bytes(), &instrument, 1_630_048_898_000),
+            Err(OkxError::Sequence)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn closed_one_minute_candle_uses_documented_base_and_quote_volume()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = config()?;
+        let instrument = parse_instrument(INSTRUMENT, &config, 7)?;
+        let candle = parse_closed_1m_candle(CLOSED_CANDLE, &instrument, 1_630_048_860_000)?;
+        assert_eq!(candle.sequence, 27_167_481);
+        assert_eq!(candle.base_volume, FieldState::Known(Decimal::new(15, 1)));
+        assert_eq!(
+            candle.quote_volume,
+            FieldState::Known(Decimal::new(90_030, 0))
+        );
+        assert!(matches!(candle.trade_count, FieldState::Unavailable { .. }));
+        assert!(candle.is_valid());
+        let forming = String::from_utf8_lossy(CLOSED_CANDLE).replace("\"1\"]]}", "\"0\"]]}");
+        assert_eq!(
+            parse_closed_1m_candle(forming.as_bytes(), &instrument, 1_630_048_860_000),
             Err(OkxError::Sequence)
         );
         Ok(())

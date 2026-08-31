@@ -8,7 +8,9 @@ use rust_decimal::{
     prelude::{Signed, ToPrimitive},
 };
 
-use venue_domain::{AggressorSide, FieldState, Price, PublicBar, PublicTrade, Symbol};
+use venue_domain::{
+    AggressorSide, FieldState, Price, PublicBar, PublicTrade, PublicTradeOrdering, Symbol,
+};
 
 use super::{
     BARS_SOURCE, BOOK_SOURCE, FeatureFrame, FeatureState, FeatureValues, PublicBook, SourceCursor,
@@ -16,7 +18,10 @@ use super::{
 };
 
 const BOOK_FEATURE_VERSION: &str = "pulse-mas-depth-ofi-v2";
-const TRADE_FEATURE_VERSION: &str = "pulse-orderflow-v1";
+const TRADE_FEATURE_VERSION_NATIVE_AGGREGATE: &str = "pulse-orderflow-v1-native-aggregate";
+// This version denotes a complete locally observed receiver window, never a claim that the venue
+// published every market trade before or during the window.
+const TRADE_FEATURE_VERSION_SESSION_OBSERVED: &str = "pulse-orderflow-v1-session-observed";
 const BAR_FEATURE_VERSION: &str = "pulse-ta-v1";
 const BAR_VOLUME_FEATURE_VERSION: &str = "pulse-ta-ohlcv-v2";
 const TOXICITY_FEATURE_VERSION: &str = "pulse-mas-flow-toxicity-v2";
@@ -31,7 +36,8 @@ const DECIMAL_SCALE: u32 = 8;
 
 /// Builds generation-scoped book/trade features plus immutable contiguous closed-bar history.
 /// Transport generations fence live book and flow; completed one-minute OHLC survives a reconnect
-/// only when the next bar proves exact time continuity.
+/// only when the next bar proves exact time continuity. A `Ready` session-observed trade window
+/// proves lossless local ingress after session admission, not venue-wide native trade continuity.
 #[derive(Clone, Debug)]
 pub struct ScalpingFeatureBuilder {
     profile: String,
@@ -44,6 +50,7 @@ pub struct ScalpingFeatureBuilder {
     book: Option<BookSample>,
     bars: VecDeque<BarSample>,
     trades: VecDeque<TradeSample>,
+    trade_observation: Option<TradeObservation>,
     previous_top: Option<(Price, Decimal, Price, Decimal)>,
     previous_bar_close: Option<Price>,
     natr_seed_sum: Decimal,
@@ -67,6 +74,12 @@ struct TradeSample {
     generation: u64,
     sequence: u64,
     signed_quantity: Decimal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TradeObservation {
+    NativeAggregate,
+    SessionObserved,
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +117,7 @@ impl ScalpingFeatureBuilder {
             book: None,
             bars: VecDeque::new(),
             trades: VecDeque::new(),
+            trade_observation: None,
             previous_top: None,
             previous_bar_close: None,
             natr_seed_sum: Decimal::ZERO,
@@ -115,7 +129,7 @@ impl ScalpingFeatureBuilder {
     pub fn ingest_book(
         &mut self,
         book: &impl PublicBook,
-        received_at_ms: u64,
+        source_time_ms: u64,
     ) -> Result<(), FeatureBuildError> {
         let symbol = book.symbol().cloned().ok_or(FeatureBuildError::Book)?;
         let generation = book.generation().ok_or(FeatureBuildError::Book)?;
@@ -129,7 +143,7 @@ impl ScalpingFeatureBuilder {
         }
         // OrderBook already proves Binance Futures continuity with `pu`; its update IDs are
         // monotonic but aggregated ranges are not required to be numerically adjacent.
-        self.observe(BOOK_SOURCE, generation, sequence, received_at_ms, false)?;
+        self.observe(BOOK_SOURCE, generation, sequence, source_time_ms, false)?;
         let denominator = best_bid.quantity + best_ask.quantity;
         let mid_price =
             Price::new((best_bid.price.value() + best_ask.price.value()) / Decimal::TWO)
@@ -253,16 +267,31 @@ impl ScalpingFeatureBuilder {
 
     pub fn ingest_trade(&mut self, trade: &PublicTrade) -> Result<(), FeatureBuildError> {
         let book = self.book.as_ref().ok_or(FeatureBuildError::Book)?;
-        if trade.symbol != book.symbol || trade.generation != book.generation {
+        if !trade.is_valid() || trade.symbol != book.symbol || trade.generation != book.generation {
             return Err(FeatureBuildError::Generation);
+        }
+        let sequence = trade.sequence().ok_or(FeatureBuildError::Trade)?;
+        let observation = match trade.ordering {
+            PublicTradeOrdering::NativeAggregateId => TradeObservation::NativeAggregate,
+            PublicTradeOrdering::Session { .. } => TradeObservation::SessionObserved,
+            PublicTradeOrdering::Unsequenced => return Err(FeatureBuildError::Trade),
+        };
+        if self.generation == Some(trade.generation)
+            && self
+                .trade_observation
+                .is_some_and(|current| current != observation)
+        {
+            self.state = FeatureState::DataGap;
+            return Err(FeatureBuildError::DataGap);
         }
         self.observe(
             TRADES_SOURCE,
             trade.generation,
-            trade.aggregate_trade_id,
-            trade.received_at_ms,
+            sequence,
+            trade.transaction_time_ms.min(trade.exchange_time_ms),
             true,
         )?;
+        self.trade_observation = Some(observation);
         let signed_quantity = match trade.aggressor {
             FieldState::Known(AggressorSide::Buy) => trade.quantity,
             FieldState::Known(AggressorSide::Sell) => -trade.quantity,
@@ -270,7 +299,7 @@ impl ScalpingFeatureBuilder {
         };
         self.trades.push_back(TradeSample {
             generation: trade.generation,
-            sequence: trade.aggregate_trade_id,
+            sequence,
             signed_quantity,
         });
         while self.trades.len() > self.maximum_trades.get().max(TRADE_WINDOW) {
@@ -328,7 +357,8 @@ impl ScalpingFeatureBuilder {
             .max()
             .ok_or(FeatureBuildError::Cursor)?;
         let stale = complete
-            && (now_ms.saturating_sub(watermark_ms) > self.max_data_age_ms
+            && (watermark_ms > now_ms
+                || now_ms.saturating_sub(watermark_ms) > self.max_data_age_ms
                 || self.cursors.values().any(|cursor| {
                     watermark_ms.saturating_sub(cursor.event_time_ms) > self.max_data_age_ms
                 }));
@@ -359,7 +389,10 @@ impl ScalpingFeatureBuilder {
             cursors: self.cursors.clone(),
             feature_versions: BTreeMap::from([
                 (BOOK_SOURCE.to_owned(), BOOK_FEATURE_VERSION.to_owned()),
-                (TRADES_SOURCE.to_owned(), TRADE_FEATURE_VERSION.to_owned()),
+                (
+                    TRADES_SOURCE.to_owned(),
+                    trade_feature_version(self.trade_observation).to_owned(),
+                ),
                 (BARS_SOURCE.to_owned(), bar_feature_version.to_owned()),
                 ("toxicity".to_owned(), TOXICITY_FEATURE_VERSION.to_owned()),
                 ("_feature_profile".to_owned(), self.profile.clone()),
@@ -457,6 +490,7 @@ impl ScalpingFeatureBuilder {
             bar.generation = generation;
         }
         self.trades.clear();
+        self.trade_observation = None;
         self.previous_top = None;
     }
 
@@ -466,6 +500,13 @@ impl ScalpingFeatureBuilder {
         self.natr_seed_sum = Decimal::ZERO;
         self.natr_value = None;
         self.natr_samples = 0;
+    }
+}
+
+fn trade_feature_version(observation: Option<TradeObservation>) -> &'static str {
+    match observation {
+        Some(TradeObservation::NativeAggregate) => TRADE_FEATURE_VERSION_NATIVE_AGGREGATE,
+        Some(TradeObservation::SessionObserved) | None => TRADE_FEATURE_VERSION_SESSION_OBSERVED,
     }
 }
 
@@ -584,12 +625,12 @@ mod tests {
 
     use venue_domain::{
         AggressorSide, FieldState, MarketLevel, MarketSnapshot, Price, PublicBar, PublicTrade,
-        Symbol,
+        PublicTradeId, PublicTradeOrdering, Symbol,
     };
 
     use super::{
-        BAR_VOLUME_FEATURE_VERSION, BARS_SOURCE, BarSample, FeatureState, PublicBook,
-        ScalpingFeatureBuilder, derive_bar_features, flow_toxicity,
+        BAR_VOLUME_FEATURE_VERSION, BARS_SOURCE, BarSample, FeatureBuildError, FeatureState,
+        PublicBook, ScalpingFeatureBuilder, TRADES_SOURCE, derive_bar_features, flow_toxicity,
     };
 
     #[derive(Clone, Debug, Default)]
@@ -670,6 +711,29 @@ mod tests {
         Ok(book)
     }
 
+    fn observed_trade(
+        id: PublicTradeId,
+        ordering: PublicTradeOrdering,
+        exchange_time_ms: u64,
+        transaction_time_ms: u64,
+    ) -> Result<PublicTrade, Box<dyn std::error::Error>> {
+        Ok(PublicTrade {
+            symbol: "BTC/USDT".parse()?,
+            generation: 3,
+            received_at_ms: 10_000,
+            exchange_time_ms,
+            transaction_time_ms,
+            aggregate_trade_id: id,
+            first_trade_id: None,
+            last_trade_id: None,
+            ordering,
+            price: Price::new(Decimal::new(100, 0))?,
+            quantity: Decimal::ONE,
+            quote_quantity: Decimal::new(100, 0),
+            aggressor: FieldState::Known(AggressorSide::Buy),
+        })
+    }
+
     #[test]
     fn expected_move_fails_closed_without_ohlc_bars() -> Result<(), Box<dyn std::error::Error>> {
         let mut builder = builder()?;
@@ -682,9 +746,10 @@ mod tests {
             received_at_ms: 100,
             exchange_time_ms: 100,
             transaction_time_ms: 100,
-            aggregate_trade_id: 7,
-            first_trade_id: 7,
-            last_trade_id: 7,
+            aggregate_trade_id: 7.into(),
+            first_trade_id: Some(7),
+            last_trade_id: Some(7),
+            ordering: PublicTradeOrdering::NativeAggregateId,
             price: Price::new(Decimal::new(100, 0))?,
             quantity: Decimal::ONE,
             quote_quantity: Decimal::new(100, 0),
@@ -708,9 +773,10 @@ mod tests {
             received_at_ms: 100,
             exchange_time_ms: 100,
             transaction_time_ms: 100,
-            aggregate_trade_id: 7,
-            first_trade_id: 70,
-            last_trade_id: 70,
+            aggregate_trade_id: 7.into(),
+            first_trade_id: Some(70),
+            last_trade_id: Some(70),
+            ordering: PublicTradeOrdering::NativeAggregateId,
             price: Price::new(Decimal::new(100, 0))?,
             quantity: Decimal::ONE,
             quote_quantity: Decimal::new(100, 0),
@@ -721,11 +787,98 @@ mod tests {
             received_at_ms: 101,
             exchange_time_ms: 101,
             transaction_time_ms: 101,
-            aggregate_trade_id: 8,
-            first_trade_id: 71,
-            last_trade_id: 75,
+            aggregate_trade_id: 8.into(),
+            first_trade_id: Some(71),
+            last_trade_id: Some(75),
             ..first
         })?;
+        assert_eq!(
+            builder.frame(101)?.feature_versions[TRADES_SOURCE],
+            "pulse-orderflow-v1-native-aggregate"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_aggregate_cursor_keeps_the_binance_plus_one_gap_fence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut builder = builder()?;
+        builder.ingest_book(&book()?, 100)?;
+        builder.ingest_trade(&observed_trade(
+            7.into(),
+            PublicTradeOrdering::NativeAggregateId,
+            100,
+            100,
+        )?)?;
+        assert_eq!(
+            builder.ingest_trade(&observed_trade(
+                9.into(),
+                PublicTradeOrdering::NativeAggregateId,
+                101,
+                101,
+            )?),
+            Err(FeatureBuildError::DataGap)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_observed_trades_use_lossless_local_cursor_and_source_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut builder = builder()?;
+        builder.ingest_book(&book()?, 10_000)?;
+        let first = observed_trade(
+            PublicTradeId::Opaque("bybit-1".to_owned()),
+            PublicTradeOrdering::Session { sequence: 1 },
+            900,
+            800,
+        )?;
+        builder.ingest_trade(&first)?;
+        builder.ingest_trade(&observed_trade(
+            PublicTradeId::Opaque("bybit-2".to_owned()),
+            PublicTradeOrdering::Session { sequence: 2 },
+            901,
+            801,
+        )?)?;
+        let frame = builder.frame(10_000)?;
+        assert_eq!(frame.cursors[TRADES_SOURCE].sequence, 2);
+        assert_eq!(frame.cursors[TRADES_SOURCE].event_time_ms, 801);
+        assert_eq!(
+            frame.feature_versions[TRADES_SOURCE],
+            "pulse-orderflow-v1-session-observed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unsequenced_or_mixed_trade_windows_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let mut builder = builder()?;
+        builder.ingest_book(&book()?, 100)?;
+        assert_eq!(
+            builder.ingest_trade(&observed_trade(
+                PublicTradeId::Opaque("bybit".to_owned()),
+                PublicTradeOrdering::Unsequenced,
+                100,
+                100,
+            )?),
+            Err(FeatureBuildError::Trade)
+        );
+
+        builder.ingest_trade(&observed_trade(
+            1.into(),
+            PublicTradeOrdering::NativeAggregateId,
+            101,
+            101,
+        )?)?;
+        assert_eq!(
+            builder.ingest_trade(&observed_trade(
+                PublicTradeId::Opaque("bybit".to_owned()),
+                PublicTradeOrdering::Session { sequence: 2 },
+                102,
+                102,
+            )?),
+            Err(FeatureBuildError::DataGap)
+        );
         Ok(())
     }
 

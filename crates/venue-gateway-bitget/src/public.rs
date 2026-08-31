@@ -15,7 +15,8 @@ use sha2::{Digest, Sha256};
 
 use venue_domain::domain::{
     AggressorSide, FieldState, MarketDelta, MarketEvent, MarketLevel, MarketSnapshot, Price,
-    PublicTicker, PublicTrade, Symbol, UnknownReason,
+    PublicBar, PublicTicker, PublicTrade, PublicTradeId, PublicTradeOrdering, Symbol,
+    UnknownReason,
 };
 
 pub const BITGET_PUBLIC_PARSER_SCHEMA_VERSION: u16 = 1;
@@ -24,6 +25,8 @@ pub const BITGET_UTA_FUTURES_INST_TYPE: &str = "usdt-futures";
 #[cfg(test)]
 const DEFAULT_PUBLIC_FRESHNESS_MS: u64 = 5_000;
 const MAX_BOOK_LEVELS: usize = 1_000;
+const ONE_MINUTE_MS: u64 = 60_000;
+const MAX_PUBLIC_BATCH_ITEMS: usize = 1_024;
 
 /// The source is durable metadata, not a transport capability.  The surrounding runtime owns
 /// recording and retry/backoff effects.
@@ -34,6 +37,7 @@ pub enum BitgetPublicSource {
     RestTicker,
     WebSocketBooks,
     WebSocketPublicTrade,
+    WebSocketKline,
 }
 
 /// A credential-free raw-payload envelope ready for a caller-owned durable journal.
@@ -128,6 +132,12 @@ pub fn public_subscriptions(symbol: &Symbol) -> Result<Value, BitgetPublicError>
                 "topic": "publicTrade",
                 "symbol": native,
             },
+            {
+                "instType": BITGET_UTA_FUTURES_INST_TYPE,
+                "topic": "kline",
+                "symbol": native,
+                "interval": "1m",
+            },
         ],
     }))
 }
@@ -144,6 +154,34 @@ pub fn scalping_book_subscription(symbol: &Symbol) -> Result<Value, BitgetPublic
             "topic": "books",
             "symbol": native,
         }],
+    }))
+}
+
+/// The fixed Scalping subscription includes only the sequenced book, public trades, and forming
+/// 1m candles. The receiver, not this pure request builder, decides when a forming candle can be
+/// promoted to a closed bar.
+pub fn scalping_public_subscription(symbol: &Symbol) -> Result<Value, BitgetPublicError> {
+    let native = native_symbol(symbol)?;
+    Ok(json!({
+        "op": "subscribe",
+        "args": [
+            {
+                "instType": BITGET_UTA_FUTURES_INST_TYPE,
+                "topic": "books",
+                "symbol": native,
+            },
+            {
+                "instType": BITGET_UTA_FUTURES_INST_TYPE,
+                "topic": "publicTrade",
+                "symbol": native,
+            },
+            {
+                "instType": BITGET_UTA_FUTURES_INST_TYPE,
+                "topic": "kline",
+                "symbol": native,
+                "interval": "1m",
+            },
+        ],
     }))
 }
 
@@ -613,6 +651,150 @@ pub struct BitgetPublicTradeEvent {
     pub rpi: FieldState<bool>,
 }
 
+/// A trade fact separated from its shared raw websocket evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BitgetPublicTrade {
+    pub trade: PublicTrade,
+    pub correlation_id: u64,
+    pub rpi: FieldState<bool>,
+}
+
+/// One bounded trade payload. New receivers retain the raw frame once for this entire batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BitgetPublicTradeBatch {
+    pub raw: BitgetRawPublicPayload,
+    pub trades: Vec<BitgetPublicTrade>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BitgetFormingBarEvent {
+    pub raw: BitgetRawPublicPayload,
+    pub open_time_ms: u64,
+    pub open: Price,
+    pub high: Price,
+    pub low: Price,
+    pub close: Price,
+    pub base_volume: Decimal,
+    pub quote_volume: Decimal,
+}
+
+/// A forming candle separated from its shared raw websocket evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BitgetFormingBar {
+    pub open_time_ms: u64,
+    pub open: Price,
+    pub high: Price,
+    pub low: Price,
+    pub close: Price,
+    pub base_volume: Decimal,
+    pub quote_volume: Decimal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BitgetFormingBarBatch {
+    pub raw: BitgetRawPublicPayload,
+    pub bars: Vec<BitgetFormingBar>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BitgetPublicBarEvent {
+    pub raw: BitgetRawPublicPayload,
+    pub bar: PublicBar,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BitgetPublicBarBatch {
+    pub raw: BitgetRawPublicPayload,
+    pub bars: Vec<PublicBar>,
+}
+
+impl BitgetFormingBarEvent {
+    /// This is a canonical 1m-window cursor derived from `start`, not a Bitget-native sequence.
+    pub fn into_closed(self) -> Result<BitgetPublicBarEvent, BitgetPublicError> {
+        let close_time_ms = self
+            .open_time_ms
+            .checked_add(ONE_MINUTE_MS - 1)
+            .ok_or(BitgetPublicError::Payload)?;
+        let sequence = self
+            .open_time_ms
+            .checked_div(ONE_MINUTE_MS)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(BitgetPublicError::Payload)?;
+        let bar = PublicBar {
+            symbol: self.raw.symbol.clone(),
+            generation: self.raw.generation,
+            received_at_ms: self.raw.received_at_ms,
+            sequence,
+            open_time_ms: self.open_time_ms,
+            close_time_ms,
+            interval_ms: ONE_MINUTE_MS,
+            open: self.open,
+            high: self.high,
+            low: self.low,
+            close: self.close,
+            base_volume: FieldState::Known(self.base_volume),
+            quote_volume: FieldState::Known(self.quote_volume),
+            trade_count: FieldState::Unavailable {
+                reason: UnknownReason::SourceOmitted,
+            },
+            taker_buy_base_volume: FieldState::Unavailable {
+                reason: UnknownReason::SourceOmitted,
+            },
+            taker_buy_quote_volume: FieldState::Unavailable {
+                reason: UnknownReason::SourceOmitted,
+            },
+        };
+        if !bar.is_valid() {
+            return Err(BitgetPublicError::Payload);
+        }
+        Ok(BitgetPublicBarEvent { raw: self.raw, bar })
+    }
+}
+
+impl BitgetFormingBar {
+    /// The raw frame passed here is the observation that confirmed the completed window.
+    pub fn into_closed(self, raw: &BitgetRawPublicPayload) -> Result<PublicBar, BitgetPublicError> {
+        let close_time_ms = self
+            .open_time_ms
+            .checked_add(ONE_MINUTE_MS - 1)
+            .ok_or(BitgetPublicError::Payload)?;
+        let sequence = self
+            .open_time_ms
+            .checked_div(ONE_MINUTE_MS)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(BitgetPublicError::Payload)?;
+        let bar = PublicBar {
+            symbol: raw.symbol.clone(),
+            generation: raw.generation,
+            received_at_ms: raw.received_at_ms,
+            sequence,
+            open_time_ms: self.open_time_ms,
+            close_time_ms,
+            interval_ms: ONE_MINUTE_MS,
+            open: self.open,
+            high: self.high,
+            low: self.low,
+            close: self.close,
+            base_volume: FieldState::Known(self.base_volume),
+            quote_volume: FieldState::Known(self.quote_volume),
+            trade_count: FieldState::Unavailable {
+                reason: UnknownReason::SourceOmitted,
+            },
+            taker_buy_base_volume: FieldState::Unavailable {
+                reason: UnknownReason::SourceOmitted,
+            },
+            taker_buy_quote_volume: FieldState::Unavailable {
+                reason: UnknownReason::SourceOmitted,
+            },
+        };
+        if bar.is_valid() {
+            Ok(bar)
+        } else {
+            Err(BitgetPublicError::Payload)
+        }
+    }
+}
+
 #[cfg(test)]
 impl BitgetPublicTradeEvent {
     pub fn market_event(&self) -> MarketEvent {
@@ -624,11 +806,27 @@ impl BitgetPublicTradeEvent {
     }
 }
 
-/// Parses a UTA `publicTrade` frame.  Each returned event carries the unchanged complete raw
-/// frame so the caller can store one raw record and expose normalized per-trade facts.
+/// Legacy record-per-trade view of a UTA `publicTrade` frame.
 pub fn parse_public_trade_message(
     raw: BitgetRawPublicPayload,
 ) -> Result<Vec<BitgetPublicTradeEvent>, BitgetPublicError> {
+    let batch = parse_public_trade_batch(raw)?;
+    Ok(batch
+        .trades
+        .into_iter()
+        .map(|fact| BitgetPublicTradeEvent {
+            raw: batch.raw.clone(),
+            trade: fact.trade,
+            correlation_id: fact.correlation_id,
+            rpi: fact.rpi,
+        })
+        .collect())
+}
+
+/// Parses a bounded UTA public-trade frame without copying its raw payload per trade.
+pub fn parse_public_trade_batch(
+    raw: BitgetRawPublicPayload,
+) -> Result<BitgetPublicTradeBatch, BitgetPublicError> {
     require_source(&raw, BitgetPublicSource::WebSocketPublicTrade)?;
     let root_value = parse_json_object(&raw.payload)?;
     let root = object(&root_value)?;
@@ -642,14 +840,100 @@ pub fn parse_public_trade_message(
         .get("data")
         .and_then(Value::as_array)
         .ok_or(BitgetPublicError::Payload)?;
-    if values.is_empty() {
+    if values.is_empty() || values.len() > MAX_PUBLIC_BATCH_ITEMS {
         return Err(BitgetPublicError::Payload);
     }
     let mut ids = BTreeSet::new();
     values
         .iter()
-        .map(|value| parse_public_trade(raw.clone(), value, &mut ids))
-        .collect()
+        .map(|value| parse_public_trade(&raw, value, &mut ids))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|trades| BitgetPublicTradeBatch { raw, trades })
+}
+
+/// Legacy record-per-candle view of forming UTA 1m candles.
+pub fn parse_public_forming_bars(
+    raw: BitgetRawPublicPayload,
+) -> Result<Vec<BitgetFormingBarEvent>, BitgetPublicError> {
+    let batch = parse_public_forming_bar_batch(raw)?;
+    Ok(batch
+        .bars
+        .into_iter()
+        .map(|bar| BitgetFormingBarEvent {
+            raw: batch.raw.clone(),
+            open_time_ms: bar.open_time_ms,
+            open: bar.open,
+            high: bar.high,
+            low: bar.low,
+            close: bar.close,
+            base_volume: bar.base_volume,
+            quote_volume: bar.quote_volume,
+        })
+        .collect())
+}
+
+/// Parses a bounded UTA K-line payload without copying its raw frame per candle.
+pub fn parse_public_forming_bar_batch(
+    raw: BitgetRawPublicPayload,
+) -> Result<BitgetFormingBarBatch, BitgetPublicError> {
+    require_source(&raw, BitgetPublicSource::WebSocketKline)?;
+    let root_value = parse_json_object(&raw.payload)?;
+    let root = object(&root_value)?;
+    require_websocket_argument(root, &raw.native_symbol, "kline")?;
+    let argument = root
+        .get("arg")
+        .and_then(Value::as_object)
+        .ok_or(BitgetPublicError::Payload)?;
+    if text(argument, "interval")? != "1m" {
+        return Err(BitgetPublicError::Payload);
+    }
+    match text(root, "action")? {
+        "snapshot" | "update" => {}
+        _ => return Err(BitgetPublicError::Payload),
+    }
+    timestamp(root.get("ts"))?;
+    let values = root
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or(BitgetPublicError::Payload)?;
+    if values.is_empty() || values.len() > MAX_PUBLIC_BATCH_ITEMS {
+        return Err(BitgetPublicError::Payload);
+    }
+    let mut starts = BTreeSet::new();
+    values
+        .iter()
+        .map(|value| {
+            let object = object(value)?;
+            let open_time_ms = timestamp(object.get("start"))?;
+            if open_time_ms % ONE_MINUTE_MS != 0 || !starts.insert(open_time_ms) {
+                return Err(BitgetPublicError::Payload);
+            }
+            let open = price(object.get("open"))?;
+            let high = price(object.get("high"))?;
+            let low = price(object.get("low"))?;
+            let close = price(object.get("close"))?;
+            let base_volume = decimal(object.get("volume"))?;
+            let quote_volume = decimal(object.get("turnover"))?;
+            if base_volume.is_sign_negative()
+                || quote_volume.is_sign_negative()
+                || high < open.max(close)
+                || low > open.min(close)
+                || high < low
+            {
+                return Err(BitgetPublicError::Payload);
+            }
+            Ok(BitgetFormingBar {
+                open_time_ms,
+                open,
+                high,
+                low,
+                close,
+                base_volume,
+                quote_volume,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|bars| BitgetFormingBarBatch { raw, bars })
 }
 
 #[cfg(test)]
@@ -668,10 +952,10 @@ pub fn native_symbol(symbol: &Symbol) -> Result<String, BitgetPublicError> {
 }
 
 fn parse_public_trade(
-    raw: BitgetRawPublicPayload,
+    raw: &BitgetRawPublicPayload,
     value: &Value,
     ids: &mut BTreeSet<u64>,
-) -> Result<BitgetPublicTradeEvent, BitgetPublicError> {
+) -> Result<BitgetPublicTrade, BitgetPublicError> {
     let object = object(value)?;
     let execution_id = sequence(object.get("i"), false)?;
     if !ids.insert(execution_id) {
@@ -708,16 +992,16 @@ fn parse_public_trade(
         received_at_ms: raw.received_at_ms,
         exchange_time_ms,
         transaction_time_ms: exchange_time_ms,
-        aggregate_trade_id: correlation_id,
-        first_trade_id: execution_id,
-        last_trade_id: execution_id,
+        aggregate_trade_id: PublicTradeId::Numeric(execution_id),
+        first_trade_id: Some(execution_id),
+        last_trade_id: Some(execution_id),
+        ordering: PublicTradeOrdering::Unsequenced,
         price,
         quantity,
         quote_quantity,
         aggressor,
     };
-    Ok(BitgetPublicTradeEvent {
-        raw,
+    Ok(BitgetPublicTrade {
         trade,
         correlation_id,
         rpi,
@@ -1207,6 +1491,34 @@ mod tests {
     }
 
     #[test]
+    fn forming_kline_uses_a_window_cursor_and_only_known_documented_volumes()
+    -> Result<(), BitgetPublicError> {
+        let payload = r#"{"arg":{"instType":"usdt-futures","topic":"kline","symbol":"DOGEUSDT","interval":"1m"},"action":"update","ts":"120001","data":[{"start":"60000","open":"0.100","high":"0.102","low":"0.099","close":"0.101","volume":"12","turnover":"1.212"}]}"#;
+        let forming =
+            parse_public_forming_bars(raw(BitgetPublicSource::WebSocketKline, 9, payload)?)?;
+        let closed = forming
+            .into_iter()
+            .next()
+            .ok_or(BitgetPublicError::Payload)?
+            .into_closed()?;
+        assert_eq!(closed.bar.sequence, 2);
+        assert_eq!(closed.bar.close_time_ms, 119_999);
+        assert_eq!(closed.bar.received_at_ms, closed.raw.received_at_ms);
+        assert_eq!(closed.bar.base_volume, FieldState::Known(Decimal::from(12)));
+        assert_eq!(
+            closed.bar.quote_volume,
+            FieldState::Known(Decimal::new(1212, 3))
+        );
+        assert_eq!(
+            closed.bar.trade_count,
+            FieldState::Unavailable {
+                reason: UnknownReason::SourceOmitted
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
     fn raw_metadata_hash_and_subscription_are_deterministic() -> Result<(), BitgetPublicError> {
         let payload = raw(BitgetPublicSource::RestTicker, 1, "{}")?;
         assert!(payload.validate().is_ok());
@@ -1220,6 +1532,7 @@ mod tests {
                 "args": [
                     {"instType":"usdt-futures","topic":"books","symbol":"DOGEUSDT"},
                     {"instType":"usdt-futures","topic":"publicTrade","symbol":"DOGEUSDT"},
+                    {"instType":"usdt-futures","topic":"kline","symbol":"DOGEUSDT","interval":"1m"},
                 ],
             })
         );

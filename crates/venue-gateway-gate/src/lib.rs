@@ -49,7 +49,7 @@ pub use private_surface::{
     validate_private_readback,
 };
 pub use public::*;
-pub use public_ws::{GatePublicWsError, GateScalpingBookFrame, GateScalpingPublicReceiver};
+pub use public_ws::{GatePublicWsError, GateScalpingPublicFrame, GateScalpingPublicReceiver};
 pub use recovery::{
     GateFreshRecoveryCandidate, GateFreshRecoveryCollector, GateFreshRecoveryError,
     GateFreshRecoveryRawResponse, GateOwnedOpenOrder, GateRecoveryAuthorityRoots,

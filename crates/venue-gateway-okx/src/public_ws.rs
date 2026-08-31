@@ -4,7 +4,8 @@
 //! OKX fixed it to zero in June 2026, so continuity is proved only by `seqId`/`prevSeqId`.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,13 +21,18 @@ use tokio_tungstenite::{
 use venue_domain::domain::{MarketDelta, MarketEvent, MarketLevel, MarketSnapshot, Price};
 use venue_gateway_api::{GatewayBinding, VenueId};
 
-use crate::{OkxConfig, OkxHttpTransport, OkxInstrument, OkxTransportError, parse_instrument};
+use crate::{
+    OkxConfig, OkxError, OkxHttpTransport, OkxInstrument, OkxTransportError,
+    parse_closed_1m_candle, parse_instrument, parse_trades,
+};
 
 const MAX_BOOK_LEVELS: usize = 400;
 const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HEARTBEAT_IDLE: Duration = Duration::from_secs(25);
 const HEARTBEAT_PONG_DEADLINE: Duration = Duration::from_secs(5);
 const HEARTBEAT_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_TRACKED_TRADES: usize = 1_024;
+static LAST_PUBLIC_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -35,11 +41,22 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub struct OkxScalpingPublicReceiver {
     instrument: OkxInstrument,
     generation: u64,
-    socket: Socket,
+    public_socket: Socket,
+    business_socket: Socket,
     connect_timeout: Duration,
     book: BookBridge,
-    heartbeat: HeartbeatState,
+    public_heartbeat: HeartbeatState,
+    business_heartbeat: HeartbeatState,
+    next_socket: PublicSocket,
+    bars: ClosedBarGuard,
+    trades: TradeGuard,
     failed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicSocket {
+    Public,
+    Business,
 }
 
 impl OkxScalpingPublicReceiver {
@@ -68,7 +85,7 @@ impl OkxScalpingPublicReceiver {
         }
         let config =
             OkxConfig::for_binding(binding.clone()).map_err(|_| OkxPublicWsError::Binding)?;
-        let generation = now_ms()?;
+        let generation = next_generation()?;
         // Rules are public and are mandatory because OKX book sizes are contracts, not base coins.
         let transport = OkxHttpTransport::new(config.clone(), connect_timeout, max_body_bytes)
             .map_err(map_transport)?;
@@ -84,23 +101,62 @@ impl OkxScalpingPublicReceiver {
         let websocket = WebSocketConfig::default()
             .max_message_size(Some(max_body_bytes))
             .max_frame_size(Some(max_body_bytes));
-        let (mut socket, _) = timeout(
+        let (mut public_socket, _) = timeout(
             connect_timeout,
             connect_async_with_config(config.public_ws(), Some(websocket), false),
         )
         .await
         .map_err(|_| OkxPublicWsError::Timeout)?
         .map_err(|_| OkxPublicWsError::Disconnected)?;
-        let request = subscription(&instrument)?;
-        send(&mut socket, Message::Text(request.into()), connect_timeout).await?;
-        await_subscription_ack(&mut socket, &instrument, connect_timeout, max_body_bytes).await?;
+        let request = public_subscription(&instrument)?;
+        send(
+            &mut public_socket,
+            Message::Text(request.into()),
+            connect_timeout,
+        )
+        .await?;
+        await_subscription_acks(
+            &mut public_socket,
+            &instrument,
+            &["books", "trades"],
+            connect_timeout,
+            max_body_bytes,
+        )
+        .await?;
+        let (mut business_socket, _) = timeout(
+            connect_timeout,
+            connect_async_with_config(config.business_ws(), Some(websocket), false),
+        )
+        .await
+        .map_err(|_| OkxPublicWsError::Timeout)?
+        .map_err(|_| OkxPublicWsError::Disconnected)?;
+        let request = business_subscription(&instrument)?;
+        send(
+            &mut business_socket,
+            Message::Text(request.into()),
+            connect_timeout,
+        )
+        .await?;
+        await_subscription_acks(
+            &mut business_socket,
+            &instrument,
+            &["candle1m"],
+            connect_timeout,
+            max_body_bytes,
+        )
+        .await?;
         Ok(Self {
             instrument: instrument.clone(),
             generation,
-            socket,
+            public_socket,
+            business_socket,
             connect_timeout,
             book: BookBridge::new(instrument, generation)?,
-            heartbeat: HeartbeatState::new(Instant::now()),
+            public_heartbeat: HeartbeatState::new(Instant::now()),
+            business_heartbeat: HeartbeatState::new(Instant::now()),
+            next_socket: PublicSocket::Public,
+            bars: ClosedBarGuard::new(generation),
+            trades: TradeGuard::default(),
             failed: false,
         })
     }
@@ -110,89 +166,238 @@ impl OkxScalpingPublicReceiver {
         self.generation
     }
 
-    /// Delivers only a fully bound snapshot or a delta continuous with the immediately preceding
-    /// sequence. Idle polls, ACKs, and pongs have no market meaning and return `None`.
+    /// Delivers one fully bound public batch. The public and business sockets are alternate-first
+    /// so sustained book traffic cannot starve the completed-bar feed.
     pub async fn next(
         &mut self,
         wait: Duration,
-    ) -> Result<Option<(u64, MarketEvent)>, OkxPublicWsError> {
+    ) -> Result<Vec<(u64, MarketEvent)>, OkxPublicWsError> {
         if self.failed {
             return Err(OkxPublicWsError::Terminal);
         }
-        let frame = match timeout(wait, self.socket.next()).await {
-            Ok(Some(Ok(frame))) => frame,
-            Ok(Some(Err(_))) | Ok(None) => return self.fail(OkxPublicWsError::Disconnected),
-            Err(_) => {
-                match self.heartbeat.on_idle(Instant::now()) {
-                    HeartbeatAction::None => {}
-                    HeartbeatAction::Expired => {
-                        return self.fail(OkxPublicWsError::HeartbeatTimeout);
-                    }
-                    HeartbeatAction::Ping => {
-                        let heartbeat_wait = self.connect_timeout.min(HEARTBEAT_SEND_TIMEOUT);
-                        if let Err(error) = send(
-                            &mut self.socket,
-                            Message::Text("ping".into()),
-                            heartbeat_wait,
-                        )
-                        .await
-                        {
-                            return self.fail(error);
-                        }
-                    }
-                }
-                return Ok(None);
-            }
+        let socket = self.next_socket;
+        self.next_socket = match socket {
+            PublicSocket::Public => PublicSocket::Business,
+            PublicSocket::Business => PublicSocket::Public,
         };
-        self.heartbeat.on_received(Instant::now());
-        match frame {
-            Message::Text(text) => self.handle_text(text.as_ref()),
-            Message::Ping(payload) => {
-                if let Err(error) = send(
-                    &mut self.socket,
-                    Message::Pong(payload),
-                    self.connect_timeout.min(HEARTBEAT_SEND_TIMEOUT),
-                )
-                .await
-                {
-                    return self.fail(error);
-                }
-                Ok(None)
-            }
-            Message::Pong(_) => Ok(None),
-            Message::Close(_) => self.fail(OkxPublicWsError::Disconnected),
-            Message::Binary(_) | Message::Frame(_) => self.fail(OkxPublicWsError::Protocol),
+        let result = match socket {
+            PublicSocket::Public => self.next_public(wait).await,
+            PublicSocket::Business => self.next_business(wait).await,
+        };
+        match result {
+            Ok(events) => Ok(events),
+            Err(error) => self.fail(error),
         }
     }
 
-    fn handle_text(
+    async fn next_public(
         &mut self,
-        payload: &str,
-    ) -> Result<Option<(u64, MarketEvent)>, OkxPublicWsError> {
-        if payload == "pong" {
-            return Ok(None);
-        }
-        if is_subscription_ack(payload, self.instrument.native_id()) {
-            return Ok(None);
+        wait: Duration,
+    ) -> Result<Vec<(u64, MarketEvent)>, OkxPublicWsError> {
+        let Some(message) = receive(
+            &mut self.public_socket,
+            &mut self.public_heartbeat,
+            wait,
+            self.connect_timeout,
+        )
+        .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let Message::Text(payload) = message else {
+            return Err(OkxPublicWsError::Protocol);
+        };
+        let payload = payload.as_ref();
+        if payload == "pong"
+            || is_subscription_ack(payload, "books", self.instrument.native_id())
+            || is_subscription_ack(payload, "trades", self.instrument.native_id())
+        {
+            return Ok(Vec::new());
         }
         if is_subscription_rejection(payload) {
-            return self.fail(OkxPublicWsError::SubscriptionRejected);
+            return Err(OkxPublicWsError::SubscriptionRejected);
         }
-        let received_at_ms = match now_ms() {
-            Ok(value) => value,
-            Err(error) => return self.fail(error),
+        let received_at_ms = now_ms()?;
+        match stream_channel(payload)?.as_str() {
+            "books" => self.book.accept(payload, received_at_ms).map(|event| {
+                event
+                    .into_iter()
+                    .map(|event| (received_at_ms, event))
+                    .collect()
+            }),
+            "trades" => parse_trades(payload.as_bytes(), &self.instrument, received_at_ms)
+                .and_then(|events| self.trades.accept(events))
+                .map(|events| {
+                    events
+                        .into_iter()
+                        .map(|event| (received_at_ms, MarketEvent::Trade(event)))
+                        .collect()
+                })
+                .map_err(|_| OkxPublicWsError::Protocol),
+            _ => Err(OkxPublicWsError::Protocol),
+        }
+    }
+
+    async fn next_business(
+        &mut self,
+        wait: Duration,
+    ) -> Result<Vec<(u64, MarketEvent)>, OkxPublicWsError> {
+        let Some(message) = receive(
+            &mut self.business_socket,
+            &mut self.business_heartbeat,
+            wait,
+            self.connect_timeout,
+        )
+        .await?
+        else {
+            return Ok(Vec::new());
         };
-        match self.book.accept(payload, received_at_ms) {
-            Ok(Some(event)) => Ok(Some((received_at_ms, event))),
-            Ok(None) => Ok(None),
-            Err(error) => self.fail(error),
+        let Message::Text(payload) = message else {
+            return Err(OkxPublicWsError::Protocol);
+        };
+        let payload = payload.as_ref();
+        if payload == "pong"
+            || is_subscription_ack(payload, "candle1m", self.instrument.native_id())
+        {
+            return Ok(Vec::new());
         }
+        if is_subscription_rejection(payload) {
+            return Err(OkxPublicWsError::SubscriptionRejected);
+        }
+        if !is_closed_candle(payload, self.instrument.native_id())? {
+            return Ok(Vec::new());
+        }
+        let received_at_ms = now_ms()?;
+        let bar = parse_closed_1m_candle(payload.as_bytes(), &self.instrument, received_at_ms)
+            .map_err(|_| OkxPublicWsError::Protocol)?;
+        self.bars.accept(bar).map(|bar| {
+            bar.into_iter()
+                .map(|bar| (received_at_ms, MarketEvent::Bar(bar)))
+                .collect()
+        })
     }
 
     fn fail<T>(&mut self, error: OkxPublicWsError) -> Result<T, OkxPublicWsError> {
         self.failed = true;
         Err(error)
     }
+}
+
+/// The candle stream can replay the final bucket. Replays must not become extra strategy bars;
+/// a changed payload for that bucket and a lower bucket are both terminal ordering failures.
+struct ClosedBarGuard {
+    generation: u64,
+    latest: Option<venue_domain::domain::PublicBar>,
+}
+
+impl ClosedBarGuard {
+    const fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            latest: None,
+        }
+    }
+
+    fn accept(
+        &mut self,
+        bar: venue_domain::domain::PublicBar,
+    ) -> Result<Option<venue_domain::domain::PublicBar>, OkxPublicWsError> {
+        if bar.generation != self.generation {
+            self.generation = bar.generation;
+            self.latest = None;
+        }
+        let Some(previous) = self.latest.as_ref() else {
+            self.latest = Some(bar.clone());
+            return Ok(Some(bar));
+        };
+        if bar.sequence < previous.sequence {
+            return Err(OkxPublicWsError::Sequence);
+        }
+        if bar.sequence == previous.sequence {
+            return if same_bar(previous, &bar) {
+                Ok(None)
+            } else {
+                Err(OkxPublicWsError::Protocol)
+            };
+        }
+        self.latest = Some(bar.clone());
+        Ok(Some(bar))
+    }
+}
+
+#[derive(Default)]
+struct TradeGuard {
+    latest_by_id: BTreeMap<u64, venue_domain::domain::PublicTrade>,
+    order: VecDeque<u64>,
+}
+
+impl TradeGuard {
+    fn accept(
+        &mut self,
+        trades: Vec<venue_domain::domain::PublicTrade>,
+    ) -> Result<Vec<venue_domain::domain::PublicTrade>, OkxError> {
+        let mut accepted = Vec::with_capacity(trades.len());
+        for trade in trades {
+            let venue_domain::domain::PublicTradeId::Numeric(id) = &trade.aggregate_trade_id else {
+                return Err(OkxError::Sequence);
+            };
+            let id = *id;
+            if let Some(previous) = self.latest_by_id.get(&id) {
+                if same_trade(previous, &trade) {
+                    continue;
+                }
+                return Err(OkxError::Sequence);
+            }
+            let _ = self.latest_by_id.insert(id, trade.clone());
+            self.order.push_back(id);
+            if self.latest_by_id.len() > MAX_TRACKED_TRADES {
+                if let Some(oldest) = self.order.pop_front() {
+                    let _ = self.latest_by_id.remove(&oldest);
+                }
+            }
+            accepted.push(trade);
+        }
+        Ok(accepted)
+    }
+}
+
+fn same_bar(
+    left: &venue_domain::domain::PublicBar,
+    right: &venue_domain::domain::PublicBar,
+) -> bool {
+    left.symbol == right.symbol
+        && left.generation == right.generation
+        && left.sequence == right.sequence
+        && left.open_time_ms == right.open_time_ms
+        && left.close_time_ms == right.close_time_ms
+        && left.interval_ms == right.interval_ms
+        && left.open == right.open
+        && left.high == right.high
+        && left.low == right.low
+        && left.close == right.close
+        && left.base_volume == right.base_volume
+        && left.quote_volume == right.quote_volume
+        && left.trade_count == right.trade_count
+        && left.taker_buy_base_volume == right.taker_buy_base_volume
+        && left.taker_buy_quote_volume == right.taker_buy_quote_volume
+}
+
+fn same_trade(
+    left: &venue_domain::domain::PublicTrade,
+    right: &venue_domain::domain::PublicTrade,
+) -> bool {
+    left.symbol == right.symbol
+        && left.generation == right.generation
+        && left.exchange_time_ms == right.exchange_time_ms
+        && left.transaction_time_ms == right.transaction_time_ms
+        && left.aggregate_trade_id == right.aggregate_trade_id
+        && left.first_trade_id == right.first_trade_id
+        && left.last_trade_id == right.last_trade_id
+        && left.ordering == right.ordering
+        && left.price == right.price
+        && left.quantity == right.quantity
+        && left.quote_quantity == right.quote_quantity
+        && left.aggressor == right.aggressor
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -422,24 +627,41 @@ fn parse_levels(
         .collect()
 }
 
-fn subscription(instrument: &OkxInstrument) -> Result<String, OkxPublicWsError> {
+fn public_subscription(instrument: &OkxInstrument) -> Result<String, OkxPublicWsError> {
     serde_json::to_string(&serde_json::json!({
         "op": "subscribe",
-        "args": [{"channel": "books", "instId": instrument.native_id()}],
+        "args": [
+            {"channel": "books", "instId": instrument.native_id()},
+            {"channel": "trades", "instId": instrument.native_id()},
+        ],
     }))
     .map_err(|_| OkxPublicWsError::Protocol)
 }
 
-async fn await_subscription_ack(
+fn business_subscription(instrument: &OkxInstrument) -> Result<String, OkxPublicWsError> {
+    serde_json::to_string(&serde_json::json!({
+        "op": "subscribe",
+        "args": [{"channel": "candle1m", "instId": instrument.native_id()}],
+    }))
+    .map_err(|_| OkxPublicWsError::Protocol)
+}
+
+async fn await_subscription_acks(
     socket: &mut Socket,
     instrument: &OkxInstrument,
+    channels: &[&str],
     operation_timeout: Duration,
     max_body_bytes: usize,
 ) -> Result<(), OkxPublicWsError> {
-    loop {
+    let mut acknowledged = BTreeSet::new();
+    while acknowledged.len() != channels.len() {
         let text = receive_text(socket, operation_timeout, max_body_bytes).await?;
-        if is_subscription_ack(&text, instrument.native_id()) {
-            return Ok(());
+        if let Some(channel) = subscription_ack_channel(&text, instrument.native_id()) {
+            if channels.contains(&channel.as_str()) {
+                let _ = acknowledged.insert(channel);
+                continue;
+            }
+            return Err(OkxPublicWsError::Protocol);
         }
         if is_subscription_rejection(&text) {
             return Err(OkxPublicWsError::SubscriptionRejected);
@@ -448,6 +670,50 @@ async fn await_subscription_ack(
             continue;
         }
         return Err(OkxPublicWsError::Protocol);
+    }
+    Ok(())
+}
+
+async fn receive(
+    socket: &mut Socket,
+    heartbeat: &mut HeartbeatState,
+    wait: Duration,
+    connect_timeout: Duration,
+) -> Result<Option<Message>, OkxPublicWsError> {
+    let frame = match timeout(wait, socket.next()).await {
+        Ok(Some(Ok(frame))) => frame,
+        Ok(Some(Err(_))) | Ok(None) => return Err(OkxPublicWsError::Disconnected),
+        Err(_) => {
+            match heartbeat.on_idle(Instant::now()) {
+                HeartbeatAction::None => {}
+                HeartbeatAction::Expired => return Err(OkxPublicWsError::HeartbeatTimeout),
+                HeartbeatAction::Ping => {
+                    send(
+                        socket,
+                        Message::Text("ping".into()),
+                        connect_timeout.min(HEARTBEAT_SEND_TIMEOUT),
+                    )
+                    .await?;
+                }
+            }
+            return Ok(None);
+        }
+    };
+    heartbeat.on_received(Instant::now());
+    match frame {
+        Message::Text(_) => Ok(Some(frame)),
+        Message::Ping(payload) => {
+            send(
+                socket,
+                Message::Pong(payload),
+                connect_timeout.min(HEARTBEAT_SEND_TIMEOUT),
+            )
+            .await?;
+            Ok(None)
+        }
+        Message::Pong(_) => Ok(None),
+        Message::Close(_) => Err(OkxPublicWsError::Disconnected),
+        Message::Binary(_) | Message::Frame(_) => Err(OkxPublicWsError::Protocol),
     }
 }
 
@@ -493,21 +759,51 @@ async fn receive_text(
     .map_err(|_| OkxPublicWsError::Timeout)?
 }
 
-fn is_subscription_ack(payload: &str, native_id: &str) -> bool {
+fn subscription_ack_channel(payload: &str, native_id: &str) -> Option<String> {
     serde_json::from_str::<SubscriptionEvent>(payload)
         .ok()
-        .is_some_and(|event| {
-            event.event.as_deref() == Some("subscribe")
-                && event
-                    .arg
-                    .is_some_and(|arg| arg.channel == "books" && arg.inst_id == native_id)
+        .and_then(|event| {
+            (event.event.as_deref() == Some("subscribe"))
+                .then_some(event.arg)
+                .flatten()
+                .filter(|arg| arg.inst_id == native_id)
+                .map(|arg| arg.channel)
         })
+}
+
+fn is_subscription_ack(payload: &str, channel: &str, native_id: &str) -> bool {
+    subscription_ack_channel(payload, native_id).as_deref() == Some(channel)
 }
 
 fn is_subscription_rejection(payload: &str) -> bool {
     serde_json::from_str::<SubscriptionEvent>(payload)
         .ok()
         .is_some_and(|event| event.event.as_deref() == Some("error"))
+}
+
+fn stream_channel(payload: &str) -> Result<String, OkxPublicWsError> {
+    serde_json::from_str::<StreamEnvelope>(payload)
+        .map(|value| value.arg.channel)
+        .map_err(|_| OkxPublicWsError::Protocol)
+}
+
+fn is_closed_candle(payload: &str, native_id: &str) -> Result<bool, OkxPublicWsError> {
+    let value: CandleEnvelope =
+        serde_json::from_str(payload).map_err(|_| OkxPublicWsError::Protocol)?;
+    if value.arg.channel != "candle1m" || value.arg.inst_id != native_id {
+        return Err(OkxPublicWsError::Binding);
+    }
+    let [row] = value.data.as_slice() else {
+        return Err(OkxPublicWsError::Protocol);
+    };
+    let Some(confirm) = row.get(8) else {
+        return Err(OkxPublicWsError::Protocol);
+    };
+    match confirm.as_str() {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(OkxPublicWsError::Protocol),
+    }
 }
 
 fn decimal(value: &str) -> Result<Decimal, OkxPublicWsError> {
@@ -533,6 +829,23 @@ fn now_ms() -> Result<u64, OkxPublicWsError> {
             .as_millis(),
     )
     .map_err(|_| OkxPublicWsError::Clock)
+}
+
+fn next_generation() -> Result<u64, OkxPublicWsError> {
+    let wall_clock = now_ms()?;
+    let mut observed = LAST_PUBLIC_GENERATION.load(Ordering::Relaxed);
+    loop {
+        let candidate = wall_clock.max(observed.checked_add(1).ok_or(OkxPublicWsError::Protocol)?);
+        match LAST_PUBLIC_GENERATION.compare_exchange_weak(
+            observed,
+            candidate,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(candidate),
+            Err(current) => observed = current,
+        }
+    }
 }
 
 fn validate_limits(wait: Duration, bytes: usize) -> Result<(), OkxPublicWsError> {
@@ -581,6 +894,17 @@ struct SubscriptionEvent {
     arg: Option<BookArg>,
 }
 
+#[derive(Deserialize)]
+struct StreamEnvelope {
+    arg: BookArg,
+}
+
+#[derive(Deserialize)]
+struct CandleEnvelope {
+    arg: BookArg,
+    data: Vec<Vec<String>>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum OkxPublicWsError {
     #[error("OKX public receiver binding is invalid")]
@@ -616,6 +940,8 @@ mod tests {
     const INSTRUMENT: &[u8] = include_bytes!("../fixtures/linear-swap-instrument.json");
     const SNAPSHOT: &str = include_str!("../fixtures/books-snapshot.json");
     const UPDATE: &str = include_str!("../fixtures/books-update.json");
+    const TRADES: &[u8] = include_bytes!("../fixtures/public-ws-trades.json");
+    const CLOSED_CANDLE: &[u8] = include_bytes!("../fixtures/business-ws-candle-1m-closed.json");
 
     fn bridge() -> Result<BookBridge, Box<dyn std::error::Error>> {
         let binding = GatewayBinding::new(
@@ -690,10 +1016,12 @@ mod tests {
     fn subscription_ack_is_exact_and_error_is_rejected() {
         assert!(is_subscription_ack(
             r#"{"event":"subscribe","arg":{"channel":"books","instId":"BTC-USDT-SWAP"}}"#,
+            "books",
             "BTC-USDT-SWAP"
         ));
         assert!(!is_subscription_ack(
             r#"{"event":"subscribe","arg":{"channel":"books5","instId":"BTC-USDT-SWAP"}}"#,
+            "books",
             "BTC-USDT-SWAP"
         ));
         assert!(is_subscription_rejection(
@@ -732,6 +1060,40 @@ mod tests {
             heartbeat.on_idle(start + HEARTBEAT_IDLE + Duration::from_secs(1)),
             HeartbeatAction::None
         );
+    }
+
+    #[test]
+    fn trades_and_bars_deduplicate_replays_and_fence_conflicts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = GatewayBinding::new(
+            VenueId::Okx,
+            GatewayMode::Live,
+            "00000000-0000-4000-8000-000000000001",
+            "BTC/USDT".parse()?,
+        )?;
+        let config = OkxConfig::for_binding(binding)?;
+        let instrument = parse_instrument(INSTRUMENT, &config, 7)?;
+        let trade = crate::parse_trades(TRADES, &instrument, 1_630_048_898_000)?;
+        let mut trades = TradeGuard::default();
+        assert_eq!(trades.accept(trade.clone())?.len(), 1);
+        assert!(trades.accept(trade.clone())?.is_empty());
+        let mut changed_trade = trade;
+        changed_trade[0].quantity += Decimal::ONE;
+        assert_eq!(trades.accept(changed_trade), Err(crate::OkxError::Sequence));
+
+        let bar = crate::parse_closed_1m_candle(CLOSED_CANDLE, &instrument, 1_630_048_860_000)?;
+        let mut bars = ClosedBarGuard::new(7);
+        assert!(bars.accept(bar.clone())?.is_some());
+        let mut replay = bar.clone();
+        replay.received_at_ms += 1;
+        assert_eq!(bars.accept(replay)?, None);
+        let mut changed_bar = bar.clone();
+        changed_bar.close = Price::new(Decimal::new(60_021, 0))?;
+        assert_eq!(bars.accept(changed_bar), Err(OkxPublicWsError::Protocol));
+        let mut older = bar;
+        older.sequence -= 1;
+        assert_eq!(bars.accept(older), Err(OkxPublicWsError::Sequence));
+        Ok(())
     }
 
     #[test]

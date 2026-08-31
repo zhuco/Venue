@@ -55,6 +55,7 @@ mod projection_digest;
     feature = "hyperliquid"
 ))]
 mod public_stream;
+mod pump;
 use projection_digest::{envelope_digest, projection_digest_for};
 
 /// The production resident Control loop. Every configured `(symbol, instance, epoch)` receives
@@ -203,49 +204,6 @@ impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
             last_refresh_ms = Some(now);
             Ok(refreshed.private_generation() != 0)
         })
-    }
-
-    fn run_with_private_pump<F>(mut self, mut pump: F) -> Result<(), NodeError>
-    where
-        F: FnMut(&mut ProductionResident<G>) -> Result<bool, NodeError>,
-    {
-        let http_runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| NodeError::ResidentRuntime)?;
-        let mut failures = 0_u32;
-        loop {
-            let now = now_ms().map_err(|_| NodeError::ResidentRuntime)?;
-            // Private adapters execute synchronously, outside this loopback-only Tokio runtime.
-            // `false` is merely an idle bounded read; it never suppresses Control polling.
-            let _private_frame = pump(&mut self.resident)?;
-            match self.tick(&http_runtime, now) {
-                Ok(false) => return Ok(()),
-                Ok(true) => failures = 0,
-                Err(error)
-                    if error.retryable() && failures < MAX_CONSECUTIVE_TRANSPORT_FAILURES =>
-                {
-                    failures = failures.saturating_add(1);
-                    if !wait_or_interrupt(&http_runtime, backoff(failures))
-                        .map_err(|_| NodeError::ResidentRuntime)?
-                    {
-                        return Ok(());
-                    }
-                    continue;
-                }
-                Err(error) => {
-                    return Err(NodeError::LiveHost {
-                        venue: self.resident.runtime().account().exchange,
-                        message: error.to_string(),
-                    });
-                }
-            }
-            if !wait_or_interrupt(&http_runtime, self.poll_interval)
-                .map_err(|_| NodeError::ResidentRuntime)?
-            {
-                return Ok(());
-            }
-        }
     }
 
     fn tick(

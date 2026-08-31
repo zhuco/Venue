@@ -1,0 +1,1 @@
+{"time_ms":120001,"channel":"futures.candlesticks","event":"update","result":[{"t":60,"v":"42","o":"0.100","h":"0.102","l":"0.099","c":"0.101","n":"1m_DOGE_USDT","a":"4.242","w":true}]}
