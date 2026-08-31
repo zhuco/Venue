@@ -1084,7 +1084,7 @@ mod tests {
             binding: launch.binding().clone(),
             dispatches: Arc::clone(&dispatches),
         };
-        run_live_mvp(&launch, command.clone(), gateway)?;
+        assert!(run_live_mvp(&launch, command.clone(), gateway).is_err());
         assert_eq!(dispatches.load(Ordering::SeqCst), 1);
         let restarted_dispatches = Arc::new(AtomicUsize::new(0));
         let restarted = LaneProofGateway {

@@ -348,6 +348,7 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         binding: &StrategyBinding,
         command: ExecutionCommand,
     ) -> Result<(), NodeError> {
+        let command_id = command.command_id().clone();
         let replay = serde_json::to_vec(&ResidentReplay { command: &command })
             .map_err(|_| NodeError::ResidentRuntime)?;
         let applied = self
@@ -374,7 +375,29 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 venue: self.host.binding().venue,
                 message: error.to_string(),
             })?;
-        Ok(())
+        match self
+            .host
+            .command_status(&command_id)
+            .map_err(|error| NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: error.to_string(),
+            })?
+            .map(|status| status.state().clone())
+        {
+            Some(venue_runtime::CommandState::Accepted { .. }) => Ok(()),
+            Some(venue_runtime::CommandState::Rejected { reason }) => Err(NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: format!("operator canary rejected: {reason}"),
+            }),
+            Some(venue_runtime::CommandState::Prepared)
+            | Some(venue_runtime::CommandState::Submitted)
+            | Some(venue_runtime::CommandState::Unknown { .. })
+            | None => Err(NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: "operator canary outcome is unresolved; signed reconciliation is required"
+                    .to_owned(),
+            }),
+        }
     }
 
     /// The shared part of the Binance initial-install path. The concrete adapter owns the only
