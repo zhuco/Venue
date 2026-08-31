@@ -20,7 +20,9 @@ mod transport;
 
 use venue_gateway_api::CapabilityFlags;
 
-pub use account_gateway::{BitgetAccountGateway, BitgetAccountGatewayError};
+pub use account_gateway::{
+    BitgetAccountGateway, BitgetAccountGatewayError, BitgetPrivateFillEvent,
+};
 pub use binding::{BitgetAccountBinding, BitgetBindingError};
 pub use config::BitgetConfig;
 pub use credentials::BitgetCredentials;

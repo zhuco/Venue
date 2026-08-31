@@ -379,6 +379,11 @@ impl BitgetHttpTransport {
         &self.config
     }
 
+    #[must_use]
+    pub(crate) const fn limits(&self) -> BitgetTransportLimits {
+        self.limits
+    }
+
     /// Reads the anchor public instrument rule without credentials.
     pub async fn fetch_selected_instrument(&self) -> Result<Vec<u8>, BitgetTransportError> {
         self.fetch_instrument_for(&self.binding).await
@@ -1479,7 +1484,7 @@ mod tests {
                 ))
                 .await?;
             let _subscribe = websocket.next().await.ok_or("missing subscribe")??;
-            for topic in ["account", "position", "order"] {
+            for topic in ["account", "position", "order", "fill"] {
                 websocket
                     .send(Message::Text(
                         format!(

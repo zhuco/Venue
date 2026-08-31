@@ -235,7 +235,11 @@ impl BitgetAccountGateway {
             &rules,
             attempt,
         ))?;
+        if private.private_generation() != attempt {
+            return Err(BitgetAccountGatewayError::Readback);
+        }
         self.private = private;
+        self.private_generation = attempt;
         self.invalidate_private_stream();
         Ok(())
     }
