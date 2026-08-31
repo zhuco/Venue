@@ -495,6 +495,38 @@ async fn postgres_copy_relation_config_is_live_bound_idempotent_and_revision_fen
     Ok(())
 }
 
+#[tokio::test]
+async fn postgres_copy_relation_requires_live_scope_for_both_endpoints()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = integration_database_url() else {
+        println!(
+            "SKIP: VENUE_CONTROL_TEST_DATABASE_URL is not set; dual endpoint scope test was not run"
+        );
+        return Ok(());
+    };
+    let fixture = PgFixture::create(&database_url, "relation_endpoint_scopes").await?;
+    fixture.migrate_twice().await?;
+    let repository = PgControlRepository::new(fixture.pool.clone());
+    let request = relation_request(None, Decimal::ONE)?;
+
+    assert_eq!(
+        repository.upsert_copy_relation(&request, 100).await,
+        Err(CopyRelationRepositoryError::Conflict)
+    );
+    install_leader_scope(&fixture.pool).await?;
+    assert_eq!(
+        repository.upsert_copy_relation(&request, 101).await,
+        Err(CopyRelationRepositoryError::Conflict)
+    );
+    install_follower_scope(&fixture.pool).await?;
+    assert_eq!(
+        repository.upsert_copy_relation(&request, 102).await?.state,
+        CopyRelationReceiptState::Created
+    );
+    fixture.cleanup().await?;
+    Ok(())
+}
+
 fn relation_request(
     expected_revision: Option<u64>,
     multiplier: Decimal,
@@ -1346,6 +1378,23 @@ async fn scalar_i64(pool: &PgPool, sql: &str) -> Result<i64, sqlx::Error> {
 }
 
 async fn install_account_scope(pool: &PgPool) -> Result<(), sqlx::Error> {
+    install_leader_scope(pool).await?;
+    install_follower_scope(pool).await
+}
+
+async fn install_leader_scope(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO venue_control_strategy_scopes \
+         (instance_id, venue, mode, trading_account_id, symbol, config_epoch, snapshot_generated_ms) \
+         VALUES ('leader-btc', 'bybit', 'LIVE', \
+                 '00000000-0000-4000-8000-000000000002', 'BTC/USDT', 7, 1)",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn install_follower_scope(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO venue_control_strategy_scopes \
          (instance_id, venue, mode, trading_account_id, symbol, config_epoch, snapshot_generated_ms) \

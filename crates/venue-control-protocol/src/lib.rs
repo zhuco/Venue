@@ -548,6 +548,7 @@ impl CopyRelationConfig {
         self.leader.validate()?;
         self.follower.validate()?;
         if self.leader == self.follower
+            || self.leader.trading_account_id == self.follower.trading_account_id
             || !positive(self.allocated_capital)
             || !positive(self.multiplier)
             || self.safety_reserve_rate.is_sign_negative()
@@ -1798,10 +1799,10 @@ mod tests {
     fn copy_relation_config_requires_exact_live_bindings_and_safe_policy()
     -> Result<(), Box<dyn std::error::Error>> {
         let symbol: Symbol = "BTC/USDT".parse()?;
-        let binding = |instance_id: &str| CopyRelationBinding {
+        let binding = |account_id: &str, instance_id: &str| CopyRelationBinding {
             venue: VenueId::Binance,
             mode: GatewayMode::Live,
-            trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            trading_account_id: account_id.to_owned(),
             instance_id: instance_id.to_owned(),
             symbol: symbol.clone(),
         };
@@ -1810,8 +1811,8 @@ mod tests {
             request_id: "00000000-0000-4000-8000-000000000011".to_owned(),
             relation: CopyRelationConfig {
                 relation_id: "00000000-0000-4000-8000-000000000010".to_owned(),
-                leader: binding("leader-btc"),
-                follower: binding("copy-btc"),
+                leader: binding("00000000-0000-4000-8000-000000000001", "leader-btc"),
+                follower: binding("00000000-0000-4000-8000-000000000002", "copy-btc"),
                 allocated_capital: Decimal::new(500, 0),
                 multiplier: Decimal::ONE,
                 safety_reserve_rate: Decimal::new(1, 1),
@@ -1837,6 +1838,9 @@ mod tests {
         assert_eq!(invalid.validate(), Err(ProtocolError::CopyRelationPolicy));
         let mut invalid = request;
         invalid.relation.follower = invalid.relation.leader.clone();
+        assert_eq!(invalid.validate(), Err(ProtocolError::CopyRelationPolicy));
+        let mut invalid = invalid;
+        invalid.relation.follower.instance_id = "copy-btc".to_owned();
         assert_eq!(invalid.validate(), Err(ProtocolError::CopyRelationPolicy));
         Ok(())
     }

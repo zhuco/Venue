@@ -76,22 +76,24 @@ impl CopyRelationRepository for PgControlRepository {
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
-        let follower = &request.relation.follower;
-        let scope = sqlx::query(
-            "SELECT 1 FROM venue_control_strategy_scopes \
-             WHERE venue = $1 AND mode = 'LIVE' AND trading_account_id = $2 AND symbol = $3 \
-               AND instance_id = $4 FOR SHARE",
-        )
-        .bind(follower.venue.as_str())
-        .bind(&follower.trading_account_id)
-        .bind(follower.symbol.to_string())
-        .bind(&follower.instance_id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        if scope.is_none() {
-            return Err(CopyRelationRepositoryError::Conflict);
+        for endpoint in [&request.relation.leader, &request.relation.follower] {
+            let scope = sqlx::query(
+                "SELECT 1 FROM venue_control_strategy_scopes \
+                 WHERE venue = $1 AND mode = 'LIVE' AND trading_account_id = $2 AND symbol = $3 \
+                   AND instance_id = $4 FOR SHARE",
+            )
+            .bind(endpoint.venue.as_str())
+            .bind(&endpoint.trading_account_id)
+            .bind(endpoint.symbol.to_string())
+            .bind(&endpoint.instance_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            if scope.is_none() {
+                return Err(CopyRelationRepositoryError::Conflict);
+            }
         }
+        let follower = &request.relation.follower;
         let follower_conflict = sqlx::query(
             "SELECT relation_id FROM venue_copy_relation_configs \
              WHERE follower_venue = $1 AND follower_account_id = $2 \
