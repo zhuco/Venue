@@ -1,5 +1,12 @@
 # 版本与更新说明
 
+## 未发布：三目标文档收口
+
+- “剩余开发与验收”并入迁移契约，明确交易终端、真实跟单、旧三所接管的各自完成证据、依赖与可复制 Goal 提示词。
+- “停用清单”并入架构第 8 节，“构建规则”并入开发指南第 7 节；删除三份重复文档，保留必要导航。原内容可从 Git 历史恢复。
+- 最新范围为 Binance 优先，Gate.io、Bitget 接管也在本次三目标内；Bybit、OKX、Hyperliquid 与 Scalping 暂缓。下列 alpha.2 的原排期仅描述历史版本，不是当前任务指令。
+- 本次只修改文档和入口，不改代码、依赖、风险门、数据库或部署，不创建/启动长期 Goal；产品版本保持 alpha.2。
+
 ## v0.1.0-alpha.2 — 2026-09-01
 
 工作区整合预览，不代表部署或生产接管完成。
@@ -43,7 +50,7 @@
 
 六所生产策略闭环、旧 writer/WAL 接管、真实 UI 连通/截图/性能验收仍未全部完成；
 Scalping 自动入场安全链、Bitget/Hyperliquid 权威闭合 bar、手动交易完整 scope 协同仍有限制。
-细项见 [剩余工作](REFACTOR_IMPLEMENTATION_GOALS.md)。保留失败关闭，不以版本号扩大实盘授权。
+细项见 [三目标验收](UNIFIED_GATEWAY_WEB_MIGRATION.md#goal-acceptance)。保留失败关闭，不以版本号扩大实盘授权。
 
 源码基线已有 workspace 编译检查、分段回归、Node 112 项单测与 PostgreSQL 25 项集成验证；
 当时发现的 fixture 失败已定向修复。本次仅对文档和版本文件做静态检查，

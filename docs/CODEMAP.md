@@ -2,17 +2,16 @@
 
 更新：2026-09-01
 
-当前 Binance 第一批；其余五所第二批验证与实盘。Scalping 暂缓，下面保留的源码位置不是本轮开发清单。长期文档统一在本目录，仓库根 CODEMAP 仅作导航。
+当前三目标：Binance 交易终端、真实跟单、Binance/Gate.io/Bitget 接管；后续三所与 Scalping 暂缓。下面保留的源码位置不是全部待开发任务。长期文档统一在本目录，仓库根 CODEMAP 仅作导航。
 
 桌面整合入口：`apps/venueflow/src/account_center/vault.rs`（Windows 登录凭证库）、`execution_view.rs` 与 `client/execution.rs`（规范订单/持仓/成交投影）、`market_client/native/history.rs`（历史 K 线补载）、`custom_indicator/`（EMA/ADX 配置和渲染）。共享算法与专项在 `crates/venue-indicators/src/chart/custom_ema_adx.rs`、`custom_ema_adx_tests.rs`；手动输入专项在 `apps/venueflow/src/trading/input_tests.rs`。Web 手动下单仍需沿用 `venue-control-protocol/src/trade.rs` 到 Node 的同一链路补齐，不另建网关。
 
-项目/版本总览见 [`README.md`](../README.md)，开发与合并方式见 [`DEVELOPMENT.md`](DEVELOPMENT.md)，旧方法状态见 [`DEPRECATED.md`](DEPRECATED.md)，产品版本和变更范围见 [`VERSION`](../VERSION) / [`CHANGELOG.md`](CHANGELOG.md)。
+项目/版本总览见 [`README.md`](../README.md)，开发与合并方式见 [`DEVELOPMENT.md`](DEVELOPMENT.md)，旧方法状态见 [停用入口](ARCHITECTURE.md#deprecated)，产品版本和变更范围见 [`VERSION`](../VERSION) / [`CHANGELOG.md`](CHANGELOG.md)。
 
 本文件只回答“当前功能代码在哪里”。合并跟单、六交易所、指标、桌面/Web UI 后的当前 workspace、依赖边界和技术栈查
 [`ARCHITECTURE.md`](ARCHITECTURE.md)；多策略账户运行时、网格、成交热路径、库存恢复、验收和接管统一查
 [`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md)；统一执行链、Stage 7 退休、持续实盘授权、多子任务和 Web 迁移查
-[`UNIFIED_GATEWAY_WEB_MIGRATION.md`](UNIFIED_GATEWAY_WEB_MIGRATION.md)；剩余开发与验收 查
-[`REFACTOR_IMPLEMENTATION_GOALS.md`](REFACTOR_IMPLEMENTATION_GOALS.md)。不要从 `bak/` 或历史提交寻找当前约束。
+[`UNIFIED_GATEWAY_WEB_MIGRATION.md`](UNIFIED_GATEWAY_WEB_MIGRATION.md)，其中 A/B/C 是唯一目标验收，第 7 节提供单主会话启动提示词。不再另设剩余工作清单，不从已移除迁移来源寻找当前约束。
 
 ## 进程、配置与通用领域
 
@@ -23,9 +22,9 @@ Web 的 Control 用户会话只在 BFF 环境注入，HTTP/SSE 同时保留 Cont
 
 | 功能 | 首要入口 | 直接继续 |
 |---|---|---|
-| 统一迁移开发契约 | `UNIFIED_GATEWAY_WEB_MIGRATION.md` | T0–T8 子任务把 Stage 7 直接重构到六所统一 Account Runtime/Execution Lane，闭合 Copy 物理执行并建立响应式 `apps/venue-web`；真实 mutation 全局串行，AI 持续授权和 10U 技术门见第 2.1 节 |
+| 三目标交付契约 | `docs/UNIFIED_GATEWAY_WEB_MIGRATION.md` | A 终端、B 真实跟单、C 旧三所接管；P0–P4 明确依赖与收工。单主会话统筹有界子任务和串行实盘；已有基础不重复开发，持续授权和风险门见第 2.1 节 |
 | 构建、依赖与仓库体积门禁 | `Cargo.toml` | workspace 当前包含根 package、`venue-copy`、`venue-control-protocol`、`venue-domain`、`venue-execution`、`venue-indicators`、`venue-runtime`、`venue-storage`、`venue-strategies`、`venue-gateway-api`、六个 `venue-gateway-*` adapter、`apps/venue-node`、`apps/venue-control` 与 `apps/venueflow`，resolver 固定为 3；workspace 与 `rust-toolchain.toml` 共同锁定 Rust 1.98.0；`.cargo/config.toml` 固定主缓存为 `G:\Build\Venue\main`；`Cargo.lock`；`scripts/verify_repository_hygiene.ps1` 执行体积和运行态文件门禁 |
-| 本机构建资源约束 | `docs/BUILD_POLICY.md` | `Invoke-VenueBuild.ps1` 与 `venue_build_guard.ps1` 管理 main/slot-1/slot-2、最多2个受控构建、150 GiB缓存准入及F/G空闲检查；main 临时关闭外层 wrapper 以保留增量，退出恢复原环境，隔离槽保留 wrapper；专项脚本持锁到验证完成，不自动删除缓存 |
+| 本机构建资源约束 | `docs/DEVELOPMENT.md` | `Invoke-VenueBuild.ps1` 与 `venue_build_guard.ps1` 管理 main/slot-1/slot-2、最多2个受控构建、150 GiB缓存准入及F/G空闲检查；main 临时关闭外层 wrapper 以保留增量，退出恢复原环境，隔离槽保留 wrapper；专项脚本持锁到验证完成，不自动删除缓存 |
 | 目标账户实盘安全与工件预算 | `crates/venue-execution/src/account_host.rs`、`crates/venue-runtime/src/account_lane.rs`、`GRID_RUNTIME_REFACTOR.md` 第 4.4、7、8、11 节 | 账户级进程锁、单一分段命令 WAL、WAL 内 Owner 和 Unknown 签名对账；host 在同一 WAL 持久化 `Submitted` 后才签发一次性 dispatch permit。账户汇总门包含签名仓位、未撤入场单、未决 WAL 风险保留与候选命令；跨报价资产必须由 `account_snapshot.rs` 的新鲜换算事实估值到 USDT，缺证据禁止增险。适配器接线和实盘验收仍须逐所证明。工件根固定 `G:\Venue\artifacts`，轮转、单文件和根预算分别为 5 MiB、10 MiB、256 MiB |
 | 规范签名账户快照与成交恢复 | `crates/venue-execution/src/account_snapshot.rs`、`account_cursor_tests.rs` | 余额保留原资产、未知可用金额不填零；订单状态与已成交量只保留来源明确的值。`AccountRecoveryRequest::previous_fills_cursor` 从当前 checkpoint 恢复，整轮签名快照成功才原子推进游标。HL 的账户级协议在 `crates/venue-gateway-hyperliquid/src/protocol/account.rs`，覆盖非所选币种的仓位/订单/成交、Net 正负数量与保留窗口缺口；单交易对旧 parser 不可冒充账户完整性 |
 | 六所网关身份、模式与能力门禁 | `crates/venue-gateway-api/src/lib.rs` | 规范 venue 固定 Binance、Bitget、Bybit、Gate.io、Hyperliquid、OKX；运行模式只接受精确 `LIVE`，`PublicMarketBinding` 另提供无账户、无凭证、无 mutation 的 Binance USD-M 公共行情 scope；旧 `capability_promotion.rs` 的普通 `promote_capability/authorize` 入口继续固定 `AuthorityUnavailable`，序列化 probe 不能升级能力；Bybit、OKX、Hyperliquid MVP 不复用该旧 authority 链，只消费 `AccountMutationHost` 在 WAL `Submitted` 后签发的一次性不可构造 permit |
@@ -63,7 +62,7 @@ Web 的 Control 用户会话只在 BFF 环境注入，HTTP/SSE 同时保留 Cont
 ## 对冲网格与冻结兼容定位
 
 当前生产组合在 `apps/venue-node/src/production_resident/grid.rs`。下列 Stage 7 路径只作冻结行为/恢复参考，
-不是可运行的旧 CLI；状态和删除条件统一见 [停用清单](DEPRECATED.md)。
+不是可运行的旧 CLI；状态和删除条件统一见 [停用清单](ARCHITECTURE.md#deprecated)。
 
 | 功能 | 首要入口 | 边界 |
 |---|---|---|
@@ -76,7 +75,7 @@ Web 的 Control 用户会话只在 BFF 环境注入，HTTP/SSE 同时保留 Cont
 | 冻结共享行为内核 | `src/runtime/hedged_grid/mod.rs`、`src/runtime/legacy/hedged_grid_live.rs` | 不再称为现行三所生产入口 |
 | 历史配置 | `venue.grid.toml`、`venue.gate.example.toml`、`venue.bitget.example.toml` | 不是 Node runtime JSON；远端运行状态必须实测，不由文档路径推断 |
 | 六所 Node 二进制验证 | `scripts/verify_venue_node_binaries.ps1` | 固定 feature 隔离；不等于实盘接管 |
-| 本地 Ubuntu Node 编译 | `scripts/Build-VenueUbuntu.ps1` | `G:\Build\Venue\ubuntu`，Cargo 复用 slot-2；固定 commit、六 ELF、manifest/SHA256，`-CheckOnly` 零写；详见 [构建政策](BUILD_POLICY.md) |
+| 本地 Ubuntu Node 编译 | `scripts/Build-VenueUbuntu.ps1` | `G:\Build\Venue\ubuntu`，Cargo 复用 slot-2；固定 commit、六 ELF、manifest/SHA256，`-CheckOnly` 零写；详见 [构建政策](DEVELOPMENT.md#build-policy) |
 
 ## 交易所 adapter
 

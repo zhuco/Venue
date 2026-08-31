@@ -3,7 +3,7 @@
 版本与范围见 [项目 README](../README.md)；本页对应 `src/lib.rs` 和 `src/runtime_config.rs` 的实际 CLI，
 替代旧 Stage 7 透传教程。六所 binary 各自只链接一个 adapter，所有交易都经过统一账户链。
 
-当前第一批仅 Binance；其他五所第二批验证与实盘。Scalping 暂缓，本页保留的配置字段不是启用指令。
+当前旧三所按 Binance、Gate.io、Bitget 接管；终端和真实跟单先完善 Binance。后续三所与 Scalping 暂缓，本页保留的配置字段不是启用指令。
 
 ## 构建
 
@@ -16,7 +16,7 @@
 六个 feature 为 `binance / gate / bitget / bybit / okx / hyperliquid`，对应 `venue-node-<feature>`。
 只给所需 feature，不用全 feature 构建发布 binary。六所产物隔离专项
 `scripts/verify_venue_node_binaries.ps1` 自带 guard；Ubuntu 用
-[Build-VenueUbuntu](BUILD_POLICY.md)，不另开 target。
+[Build-VenueUbuntu](DEVELOPMENT.md#build-policy)，不另开 target。
 
 ## 启动契约
 
@@ -66,4 +66,4 @@ WAL 分段 5 MiB、单文件 10 MiB，根预算 256 MiB；未决状态和当前 
 
 六所公共盘口/成交已接入，Bitget/Hyperliquid 权威闭合 bar 尚缺；Scalping 自动入场保护仍未闭合。
 Copy、手动交易与 Grid 已有桥接代码，但完整生产验收和旧服务器接管不能由编译/单测推断。
-后续工作见 [迁移契约](UNIFIED_GATEWAY_WEB_MIGRATION.md)，停用方法见 [清单](DEPRECATED.md)。
+后续工作见 [迁移契约](UNIFIED_GATEWAY_WEB_MIGRATION.md)，停用方法见 [清单](ARCHITECTURE.md#deprecated)。

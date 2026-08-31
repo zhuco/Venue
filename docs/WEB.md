@@ -1,6 +1,6 @@
 # Venue Web
 
-Current scope: Binance first; Gate.io, Bitget, Bybit, OKX and Hyperliquid validation/live acceptance are the second batch. Scalping is deferred. Web order entry is allowed through BFF → Control `TradeIntent` → Node risk/WAL/writer; the complete Web order form and BFF flow are not yet accepted. No browser-side exchange gateway is introduced.
+Current scope: Binance terminal and real copy-trading first, with Binance/Gate.io/Bitget takeover in the same delivery goal. Bybit, OKX, Hyperliquid and Scalping are deferred. Web order entry uses BFF → Control `TradeIntent` → Node risk/WAL/writer; the complete form and submission flow still need acceptance. No browser-side exchange gateway is introduced.
 
 Responsive Control client using schema v2 only. Product version and known limits: [root README](../README.md), [release notes](CHANGELOG.md). Development workflow: [DEVELOPMENT](DEVELOPMENT.md).
 
