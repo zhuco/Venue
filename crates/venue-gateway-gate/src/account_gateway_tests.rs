@@ -1,6 +1,8 @@
 use super::*;
 use crate::{GatePublicError, collect_regular_order_pages, parse_regular_order};
+use bytes::Bytes;
 use venue_domain::domain::{Amount, CommandId, OrderOwner, OrderPurpose};
+use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
 
 const CATALOGUE: &str = r#"[{
     "name":"DOGE_USDT","in_delisting":false,"status":"trading",
@@ -493,6 +495,62 @@ fn signed_snapshot_exports_normalized_account_fill_facts() -> Result<(), Box<dyn
     assert_eq!(
         fills[0].realized_pnl,
         FieldState::Known(Amount::new("USDT".parse()?, Decimal::new(2, 2)))
+    );
+    Ok(())
+}
+
+#[test]
+fn private_user_trade_bridge_queues_one_validated_batch_in_native_order_and_fails_closed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let rules = rules()?;
+    let binding = GateGatewayBinding::new(GatewayBinding::new(
+        VenueId::Gate,
+        GatewayMode::Live,
+        "account_1",
+        rules.instrument.symbol.clone(),
+    )?)?;
+    let frame = GatePrivateWsFrame {
+        binding: binding.gateway_binding().clone(),
+        generation: rules.instrument.generation,
+        received_at_ms: 1_700_000_000_124,
+        channel: "futures.usertrades".to_owned(),
+        payload: Bytes::from_static(
+            br#"{"time":1700000000,"time_ms":1700000000124,"channel":"futures.usertrades","event":"update","result":[{"id":"9","order_id":"3","contract":"DOGE_USDT","size":"-10","price":"0.2","text":"t-ord-etp-s-0123456789abcdef","fee":"-0.01","pnl":"0.02","role":"maker","create_time_ms":"1700000000123"}]}"#,
+        ),
+    };
+    let events = normalize_private_stream_fill(frame.clone(), &binding, &rules, 9)?;
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event.source_private_generation, 9);
+    assert_eq!(event.received_at_ms, 1_700_000_000_124);
+    assert_eq!(event.fill.fill_id, "9");
+    assert_eq!(event.fill.symbol, rules.instrument.symbol);
+    assert!(
+        matches!(event.client_order_id, FieldState::Known(ref id) if id == "ord-etp-s-0123456789abcdef")
+    );
+
+    let mut wrong_symbol = frame.clone();
+    wrong_symbol.payload = Bytes::from_static(
+        br#"{"channel":"futures.usertrades","event":"update","result":[{"id":"9","order_id":"3","contract":"BTC_USDT","size":"-10","price":"0.2","text":"t-ord-etp-s-0123456789abcdef","fee":"-0.01","role":"maker","create_time_ms":"1700000000123"}]}"#,
+    );
+    assert!(normalize_private_stream_fill(wrong_symbol, &binding, &rules, 9).is_err());
+
+    let mut batched = frame.clone();
+    batched.payload =
+        Bytes::from_static(br#"{"channel":"futures.usertrades","event":"update","result":[]}"#);
+    assert!(normalize_private_stream_fill(batched, &binding, &rules, 9).is_err());
+
+    let mut two_trades = frame;
+    two_trades.payload = Bytes::from_static(
+        br#"{"channel":"futures.usertrades","event":"update","result":[{"id":"9","order_id":"3","contract":"DOGE_USDT","size":"-10","price":"0.2","text":"t-ord-etp-s-0123456789abcdef","fee":"-0.01","role":"maker","create_time_ms":"1700000000123"},{"id":"10","order_id":"4","contract":"DOGE_USDT","size":"10","price":"0.21","text":"t-ord-etp-l-0123456789abcdef","fee":"-0.01","role":"taker","create_time_ms":"1700000000124"}]}"#,
+    );
+    let events = normalize_private_stream_fill(two_trades, &binding, &rules, 9)?;
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.fill.fill_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["9", "10"]
     );
     Ok(())
 }

@@ -1,17 +1,18 @@
 use crate::{
     GATE_PRIVATE_PAGE_LIMIT, GATE_STAGE7_ORDER_PROFILE_VERSION, GateContractRules, GateCredentials,
     GateFillsCursor, GateGatewayBinding, GateHttpTransport, GateMutationDispatch,
-    GatePrivateReadSource, GatePrivateReadbackCandidate, GatePublicBinding, GatePublicPayloadKind,
-    GatePublicRawPayload, GateRawPrivateResponse, GateTransportError, GateTransportLimits,
-    canonical_client_id_from_native, endpoints, parse_contract_rules, parse_fill_record,
-    parse_rest_snapshot, prepare_cancel, prepare_exact_readback_by_client_id, prepare_limit,
-    prepare_private_read, prepare_reduce_once, rest_order_book_path, settle_exact_readback,
-    validate_private_readback,
+    GatePrivateReadSource, GatePrivateReadbackCandidate, GatePrivateWsFrame,
+    GatePrivateWsTransport, GatePublicBinding, GatePublicPayloadKind, GatePublicRawPayload,
+    GateRawPrivateResponse, GateTransportError, GateTransportLimits,
+    canonical_client_id_from_native, connect_private_ws, endpoints, parse_contract_rules,
+    parse_fill_record, parse_rest_snapshot, prepare_cancel, prepare_exact_readback_by_client_id,
+    prepare_limit, prepare_private_read, prepare_reduce_once, rest_order_book_path,
+    settle_exact_readback, validate_private_readback,
 };
 use rust_decimal::Decimal;
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::runtime::{Builder, Runtime};
@@ -35,6 +36,7 @@ use account_gateway_priced::normalize_priced_limit;
 
 const LIMIT_BBO_MAX_AGE_MS: u64 = 3_000;
 const LIMIT_BBO_DEPTH: u16 = 20;
+const MAX_PENDING_PRIVATE_FILLS: usize = 256;
 
 /// Production Gate adapter for the account host. The only mutation call consumes the host's
 /// linear permit; all account-wide risk reads remain signed GET requests inside this crate.
@@ -46,7 +48,34 @@ pub struct GateAccountGateway {
     rules: GateContractRules,
     rules_catalog: BTreeMap<Symbol, GateContractRules>,
     private: GatePrivateReadbackCandidate,
+    /// Account-private generation installed by the last complete signed snapshot. This is
+    /// deliberately separate from the immutable contract-rules generation on websocket frames.
+    private_generation: u64,
     next_attempt: u64,
+    private_stream: Option<GatePrivateWsTransport>,
+    private_stream_attempt: Option<u64>,
+    pending_private_fills: VecDeque<GatePrivateFillEvent>,
+}
+
+/// Sanitized execution evidence from one Gate private-stream user-trade notification.  The
+/// authenticated transport frame and its native payload stay inside the adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GatePrivateFillEvent {
+    /// Adapter-local generation of the signed snapshot that authenticated this socket. The
+    /// account runtime maps it to its durable active generation before ingesting the fact.
+    pub source_private_generation: u64,
+    pub received_at_ms: u64,
+    pub fill: Fill,
+    pub client_order_id: FieldState<String>,
+}
+
+/// One bounded, read-only BBO/rules collection used to install a Gate Grid epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GateGridBootstrapMarketFacts {
+    pub rules: GateContractRules,
+    pub bid: Price,
+    pub ask: Price,
+    pub observed_at_ms: u64,
 }
 
 impl GateAccountGateway {
@@ -77,8 +106,117 @@ impl GateAccountGateway {
             transport,
             rules,
             rules_catalog,
+            private_generation: private.attempt,
             private,
             next_attempt: 2,
+            private_stream: None,
+            private_stream_attempt: None,
+            pending_private_fills: VecDeque::new(),
+        })
+    }
+
+    /// Opens once and polls at most one normalized fill. A complete `futures.usertrades`
+    /// notification is validated before its bounded batch is queued; malformed or ambiguous
+    /// user-trade data drops the stream rather than continuing a suspect generation.
+    pub fn poll_private_fill(
+        &mut self,
+    ) -> Result<Option<GatePrivateFillEvent>, GateAccountGatewayError> {
+        if let Some(fill) = self.pending_private_fills.pop_front() {
+            return Ok(Some(fill));
+        }
+        if self.private_generation == 0 {
+            return Err(GateAccountGatewayError::PrivateStream);
+        }
+        if self.private_stream.is_none() {
+            // `private` may have been refreshed for a mutation since the account runtime last
+            // accepted a signed snapshot. A replacement socket cannot be relabelled to that
+            // older snapshot generation, so wait for the next successful signed snapshot.
+            if self.private.attempt != self.private_generation {
+                return Err(GateAccountGatewayError::PrivateStream);
+            }
+            let stream = self.runtime.block_on(connect_private_ws(
+                &self.binding,
+                &self.credentials,
+                &self.rules,
+                &self.private,
+                self.transport.limits(),
+            ))?;
+            self.private_stream = Some(stream);
+            self.private_stream_attempt = Some(self.private_generation);
+        }
+        if self.private_stream_attempt != Some(self.private_generation) {
+            self.private_stream = None;
+            self.private_stream_attempt = None;
+            self.pending_private_fills.clear();
+            return Err(GateAccountGatewayError::PrivateStream);
+        }
+        let result = match self.private_stream.as_mut() {
+            Some(stream) => self.runtime.block_on(stream.poll_raw_frame()),
+            None => return Err(GateAccountGatewayError::PrivateStream),
+        };
+        let normalized = match result {
+            Ok(Some(frame)) => normalize_private_stream_fill(
+                frame,
+                &self.binding,
+                &self.rules,
+                self.private_generation,
+            ),
+            Ok(None) => Ok(Vec::new()),
+            Err(error) => Err(GateAccountGatewayError::Transport(error)),
+        };
+        let fills = match normalized {
+            Ok(fills) => fills,
+            Err(error) => {
+                self.private_stream = None;
+                self.private_stream_attempt = None;
+                self.pending_private_fills.clear();
+                return Err(error);
+            }
+        };
+        if fills.len() > MAX_PENDING_PRIVATE_FILLS {
+            self.private_stream = None;
+            self.private_stream_attempt = None;
+            self.pending_private_fills.clear();
+            return Err(GateAccountGatewayError::PrivateStream);
+        }
+        self.pending_private_fills.extend(fills);
+        Ok(self.pending_private_fills.pop_front())
+    }
+
+    /// Reads current contract rules and one fresh public BBO without installing a new rules
+    /// generation. Drift, malformed books, and stale exchange time all fail closed.
+    pub fn fresh_grid_bootstrap_market(
+        &mut self,
+    ) -> Result<GateGridBootstrapMarketFacts, GateAccountGatewayError> {
+        self.refresh_rules_for_symbols(std::iter::empty())?;
+        let rules = self.rules.clone();
+        let requested_at_ms = now_ms()?;
+        let public_binding = GatePublicBinding::new(
+            rules.instrument.symbol.clone(),
+            rules.native_symbol.clone(),
+            rules.quanto_multiplier,
+        )
+        .map_err(|_| GateAccountGatewayError::Readback)?;
+        let path = rest_order_book_path(&public_binding, LIMIT_BBO_DEPTH)
+            .map_err(|_| GateAccountGatewayError::Readback)?;
+        let payload = self
+            .runtime
+            .block_on(self.transport.fetch_public_order_book(&path))
+            .map_err(GateAccountGatewayError::Transport)?;
+        let received_at_ms = now_ms()?;
+        let (bid, ask, observed_at_ms) = parse_fresh_limit_bbo_facts(
+            &rules,
+            public_binding,
+            payload,
+            requested_at_ms,
+            received_at_ms,
+        )
+        .map_err(|_| GateAccountGatewayError::Readback)?;
+        Ok(GateGridBootstrapMarketFacts {
+            rules,
+            bid: Price::new(bid).map_err(|_| GateAccountGatewayError::Readback)?,
+            ask: Price::new(ask).map_err(|_| GateAccountGatewayError::Readback)?,
+            observed_at_ms,
         })
     }
 
@@ -268,6 +406,64 @@ fn regular_venue_order_id_for_client_id(
         .map(|order| order.order_id.clone())
 }
 
+fn normalize_private_stream_fill(
+    frame: GatePrivateWsFrame,
+    binding: &GateGatewayBinding,
+    rules: &GateContractRules,
+    private_generation: u64,
+) -> Result<Vec<GatePrivateFillEvent>, GateAccountGatewayError> {
+    // The shared private socket also carries orders, positions, and balances. Those authenticated
+    // frames are deliberately not reinterpreted as fills; only the exact official user-trade
+    // update shape can cross this narrow bridge.
+    if frame.channel != "futures.usertrades" {
+        return Ok(Vec::new());
+    }
+    if frame.binding != *binding.gateway_binding()
+        || frame.generation != rules.instrument.generation
+        || frame.received_at_ms == 0
+        || private_generation == 0
+    {
+        return Err(GateAccountGatewayError::PrivateStream);
+    }
+    let value: Value = serde_json::from_slice(&frame.payload)
+        .map_err(|_| GateAccountGatewayError::PrivateStream)?;
+    let message = value
+        .as_object()
+        .ok_or(GateAccountGatewayError::PrivateStream)?;
+    if message.get("channel").and_then(Value::as_str) != Some("futures.usertrades")
+        || message.get("event").and_then(Value::as_str) != Some("update")
+    {
+        return Err(GateAccountGatewayError::PrivateStream);
+    }
+    let result = message
+        .get("result")
+        .and_then(Value::as_array)
+        .ok_or(GateAccountGatewayError::PrivateStream)?;
+    if result.is_empty() || result.len() > MAX_PENDING_PRIVATE_FILLS {
+        return Err(GateAccountGatewayError::PrivateStream);
+    }
+    let mut fills = Vec::with_capacity(result.len());
+    for trade in result {
+        let record = parse_fill_record(trade, &binding.gateway_binding().symbol, rules)
+            .map_err(|_| GateAccountGatewayError::PrivateStream)?;
+        // A timestamp and maker/taker role are both documented native user-trade fields. Treating
+        // their absence or an unrecognized value as a usable fill would silently weaken evidence.
+        if record.fill.symbol != binding.gateway_binding().symbol
+            || record.fill.exchange_time_ms.is_none()
+            || !matches!(record.fill.maker, FieldState::Known(_))
+        {
+            return Err(GateAccountGatewayError::PrivateStream);
+        }
+        fills.push(GatePrivateFillEvent {
+            source_private_generation: private_generation,
+            received_at_ms: frame.received_at_ms,
+            fill: record.fill,
+            client_order_id: record.client_order_id,
+        });
+    }
+    Ok(fills)
+}
+
 impl AccountPhysicalGateway for GateAccountGateway {
     type Error = GateAccountGatewayError;
 
@@ -395,7 +591,7 @@ impl AccountPhysicalGateway for GateAccountGateway {
         let attempt = self
             .next_attempt()
             .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-        self.runtime.block_on(fetch_account_wide_snapshot(
+        let snapshot = self.runtime.block_on(fetch_account_wide_snapshot(
             &self.transport,
             &self.binding,
             &self.credentials,
@@ -403,7 +599,32 @@ impl AccountPhysicalGateway for GateAccountGateway {
             &self.rules_catalog,
             attempt,
             request,
-        ))
+        ))?;
+        if snapshot.private_generation() != attempt {
+            return Err(AccountHostValidationError::SignedSnapshot);
+        }
+        // The socket authentication candidate carries Gate's private user identity. Refresh it
+        // under the same attempt before installing the snapshot generation, so a later reconnect
+        // cannot authenticate with an older candidate and relabel its facts as this snapshot.
+        let private = self
+            .runtime
+            .block_on(fetch_private(
+                &self.transport,
+                &self.binding,
+                &self.credentials,
+                &self.rules,
+                attempt,
+            ))
+            .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+        if private.attempt != snapshot.private_generation() {
+            return Err(AccountHostValidationError::SignedSnapshot);
+        }
+        self.private = private;
+        self.private_generation = snapshot.private_generation();
+        self.private_stream = None;
+        self.private_stream_attempt = None;
+        self.pending_private_fills.clear();
+        Ok(snapshot)
     }
 
     fn normalize_limit_intent(
@@ -462,13 +683,14 @@ async fn fetch_fresh_limit_bbo(
         .await
         .map_err(|_| AccountHostValidationError::Command)?;
     let received_at_ms = now_ms().map_err(|_| AccountHostValidationError::Command)?;
-    parse_fresh_limit_bbo(
+    let (bid, ask, _) = parse_fresh_limit_bbo_facts(
         rules,
         public_binding,
         payload,
         requested_at_ms,
         received_at_ms,
-    )
+    )?;
+    Ok((bid, ask))
 }
 
 fn parse_fresh_limit_bbo(
@@ -478,6 +700,23 @@ fn parse_fresh_limit_bbo(
     requested_at_ms: u64,
     received_at_ms: u64,
 ) -> Result<(Decimal, Decimal), AccountHostValidationError> {
+    let (bid, ask, _) = parse_fresh_limit_bbo_facts(
+        rules,
+        public_binding,
+        payload,
+        requested_at_ms,
+        received_at_ms,
+    )?;
+    Ok((bid, ask))
+}
+
+fn parse_fresh_limit_bbo_facts(
+    rules: &GateContractRules,
+    public_binding: GatePublicBinding,
+    payload: String,
+    requested_at_ms: u64,
+    received_at_ms: u64,
+) -> Result<(Decimal, Decimal, u64), AccountHostValidationError> {
     if requested_at_ms == 0 || received_at_ms < requested_at_ms {
         return Err(AccountHostValidationError::Command);
     }
@@ -518,7 +757,7 @@ fn parse_fresh_limit_bbo(
     if bid >= ask {
         return Err(AccountHostValidationError::Command);
     }
-    Ok((bid, ask))
+    Ok((bid, ask, exchange_time_ms))
 }
 
 fn normalize_limit_from_bbo(
@@ -1531,6 +1770,8 @@ pub enum GateAccountGatewayError {
     Clock,
     #[error("Gate account gateway transport failed: {0}")]
     Transport(GateTransportError),
+    #[error("Gate private fill stream is malformed or no longer bound to this generation")]
+    PrivateStream,
     #[error("Gate contract rules are invalid")]
     Rules,
     #[error("Gate selected contract rules changed during this resident generation")]
