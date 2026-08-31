@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
-const pages = ["总览", "跟单关系", "账户", "订单与持仓", "回执与风险", "控制"];
+const pages = ["总览", "跟单关系", "账户", "订单与持仓", "回执与风险", "交易", "控制"];
 
 export function AppShell({ active, children, state, onLogout, onPage }: Readonly<{ active: number; children: React.ReactNode; state: string; onLogout: () => void; onPage: (index: number) => void; }>) {
   const [open, setOpen] = useState(false); const button = useRef<HTMLButtonElement>(null); const nav = useRef<HTMLElement>(null);

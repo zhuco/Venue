@@ -4,16 +4,7 @@ pub(super) fn readback_policy_matches_command(
     command: &ExecutionCommand,
     order: &venue_domain::domain::Order,
 ) -> bool {
-    match command {
-        ExecutionCommand::PlaceLimit(place) => {
-            order.time_in_force == FieldState::Known(place.time_in_force)
-        }
-        ExecutionCommand::Cancel(_)
-        | ExecutionCommand::PlaceMarket(_)
-        | ExecutionCommand::MarketReduce(_)
-        | ExecutionCommand::StopMarketCloseAll(_)
-        | ExecutionCommand::StopMarketFullPosition(_) => true,
-    }
+    venue_execution::command_matches_readback_order(command, order)
 }
 
 pub(super) fn normalize_fresh_limit(

@@ -109,6 +109,16 @@ fn unknown_limit_readback_requires_the_original_policy() -> Result<(), Box<dyn s
     let orders: Value =
         serde_json::from_str(include_str!("../tests/fixtures/regular_orders.json"))?;
     let mut order = parse_regular_order(&orders[0], &rules.instrument.symbol, &rules)?;
+    let ExecutionCommand::PlaceLimit(place) = &command else {
+        return Err("limit required".into());
+    };
+    order.client_order_id = FieldState::Known(place.client_order_id.as_str().to_owned());
+    order.side = place.side;
+    order.position_side = FieldState::Known(place.position_side);
+    order.quantity = place.quantity;
+    order.limit_price = Some(place.limit_price);
+    order.time_in_force = FieldState::Known(place.time_in_force);
+    order.reduce_only = place.reduce_only;
     assert!(readback_policy_matches_command(&command, &order));
     let ExecutionCommand::PlaceLimit(place) = &mut command else {
         return Err("limit required".into());

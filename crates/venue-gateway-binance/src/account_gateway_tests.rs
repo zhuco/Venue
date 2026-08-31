@@ -450,7 +450,7 @@ fn unknown_limit_readback_requires_the_original_policy() -> Result<(), Box<dyn s
     };
     place.time_in_force = LimitTimeInForce::Gtc;
     let command = ExecutionCommand::PlaceLimit(place);
-    let matching = r#"{"clientOrderId":"limit-fixture-client","orderId":"7","status":"NEW","timeInForce":"GTC"}"#;
+    let matching = r#"{"symbol":"BTCUSDT","clientOrderId":"limit-fixture-client","orderId":"7","status":"NEW","side":"BUY","positionSide":"LONG","timeInForce":"GTC","origQty":"0.002","executedQty":"0","price":"5000","reduceOnly":false}"#;
     assert!(matches!(
         snapshot_exact_regular_result(matching.as_bytes(), &command, "limit-fixture-client"),
         SignedUnknownResult::Accepted { .. }
@@ -463,6 +463,11 @@ fn unknown_limit_readback_requires_the_original_policy() -> Result<(), Box<dyn s
     let missing = br#"{"clientOrderId":"limit-fixture-client","orderId":"7","status":"NEW"}"#;
     assert!(matches!(
         snapshot_exact_regular_result(missing, &command, "limit-fixture-client"),
+        SignedUnknownResult::Unknown
+    ));
+    let wrong_quantity = matching.replace("\"origQty\":\"0.002\"", "\"origQty\":\"0.003\"");
+    assert!(matches!(
+        snapshot_exact_regular_result(wrong_quantity.as_bytes(), &command, "limit-fixture-client"),
         SignedUnknownResult::Unknown
     ));
     Ok(())

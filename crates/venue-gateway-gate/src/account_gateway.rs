@@ -25,7 +25,7 @@ use venue_execution::{
     AccountPricedLimitIntent, AccountRecoveryOutcome, AccountRecoveryReport,
     AccountRecoveryRequest, AccountRiskEvidence, SignedAccountBalance, SignedAccountOrderFact,
     SignedAccountPositionFact, SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact,
-    SignedUnknownResult,
+    SignedUnknownResult, command_matches_readback_order,
 };
 use venue_gateway_api::GatewayBinding;
 
@@ -1119,16 +1119,7 @@ fn readback_policy_matches_command(
     command: &ExecutionCommand,
     order: &venue_domain::domain::Order,
 ) -> bool {
-    match command {
-        ExecutionCommand::PlaceLimit(place) => {
-            order.time_in_force == FieldState::Known(place.time_in_force)
-        }
-        ExecutionCommand::Cancel(_)
-        | ExecutionCommand::PlaceMarket(_)
-        | ExecutionCommand::MarketReduce(_)
-        | ExecutionCommand::StopMarketCloseAll(_)
-        | ExecutionCommand::StopMarketFullPosition(_) => true,
-    }
+    command_matches_readback_order(command, order)
 }
 
 fn snapshot_fills_cursor(

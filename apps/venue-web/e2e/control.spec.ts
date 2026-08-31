@@ -257,6 +257,7 @@ test("captures every operational view and the expanded relation editor without v
     ["账户", "交易账户", "accounts"],
     ["订单与持仓", "订单、持仓与成交", "execution-empty"],
     ["回执与风险", "回执与风险", "receipts-empty"],
+    ["交易", "基础手动交易", "trade"],
     ["跟单关系", "跟单关系", "relation-edit"],
   ]) {
     await openView(page, label, heading);
@@ -282,6 +283,20 @@ test("captures every operational view and the expanded relation editor without v
       .toBe(true);
     await captureView(page, name);
   }
+});
+
+test("submits a Decimal-preserving TradeIntent only after explicit LIVE confirmation", async ({ page }) => {
+  await page.goto("/");
+  await openView(page, "交易", "基础手动交易");
+  await page.getByLabel("限价").fill("100000.0100");
+  await page.getByLabel("报价金额（USDT）").fill("5.00");
+  const accepted = page.waitForResponse((response) => response.url().includes("/api/control/commands") && response.request().method() === "POST");
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "开多", exact: true }).click();
+  const request = (await accepted).request();
+  const body = JSON.parse(request.postData() ?? "{}") as { action?: string; trade?: Record<string, unknown> };
+  expect(body.action).toBe("trade");
+  expect(body.trade).toMatchObject({ action: "open_long", quote_asset: "USDT", order_type: "limit", time_in_force: "gtc", reduce_only: false, selected_price: "100000.0100", quote_notional: "5.00", selected_order_id: null });
 });
 
 test("SSE failure and cursor gaps close writes until a fresh reconnect", async ({

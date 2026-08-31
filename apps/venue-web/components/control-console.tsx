@@ -263,6 +263,47 @@ export function ControlConsole() {
       setError("命令响应中断，结果尚未确认；保留原请求编号，请先恢复连接核对回执。不会自动重发。");
     }
   };
+  const submitTrade = async (input: TradeInput) => {
+    if (!activeStrategy || !session || !writable) return;
+    const commandInput = {
+      venue: activeStrategy.venue,
+      mode: "LIVE" as const,
+      trading_account_id: activeStrategy.trading_account_id,
+      instance_id: activeStrategy.instance_id,
+      symbol: activeStrategy.symbol,
+      action: "trade" as const,
+      trade: input,
+      expected_config_epoch: activeStrategy.config_epoch,
+    };
+    const key = `trade:${commandInput.trading_account_id}:${commandInput.instance_id}:${commandInput.expected_config_epoch}:${JSON.stringify(input)}`;
+    const request_id = pending.current[key] ?? crypto.randomUUID();
+    pending.current[key] = request_id;
+    const summary = input.action === "cancel_all_orders"
+      ? "撤销此账户、交易对和手动 owner 范围内的全部手动订单；自动策略与外部订单不会被撤销。"
+      : input.action === "cancel_selected_order"
+        ? `撤销所选手动订单 ${input.selected_order_id ?? "（由 Node 在同一账户与交易对中选择最近 Working 手动订单）"}。`
+        : `${tradeActionLabel(input.action)} LIMIT/GTC：价格 ${input.selected_price}，报价金额 ${input.quote_notional}${input.reduce_only ? `，reduce-only 上限 ${input.close_quantity_cap}` : ""}。`;
+    if (!window.confirm(`确认提交以下 LIVE TradeIntent：\n${summary}\n\n目标：${commandInput.venue} / ${commandInput.trading_account_id} / ${commandInput.symbol} / epoch ${commandInput.expected_config_epoch}`)) return;
+    setState("recovering");
+    try {
+      const response = await fetch("/api/control/commands", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-venue-csrf": session.csrf },
+        body: JSON.stringify({ ...commandInput, request_id }),
+      });
+      const body = (await response.json()) as Receipt | { error: string };
+      if (!response.ok || "error" in body) {
+        setError("TradeIntent 被拒绝，写入门已关闭。请先核对账户、签名事实和风险状态。");
+        delete pending.current[key];
+        return;
+      }
+      setReceipt(body);
+      if (body.state === "applied" || body.state === "rejected" || body.state === "unknown")
+        delete pending.current[key];
+    } catch {
+      setError("TradeIntent 响应中断，结果尚未确认；保留原请求编号，恢复连接后请核对回执和签名事实。不会自动重发。");
+    }
+  };
   const logout = async () => {
     await fetch("/api/session", { method: "DELETE" });
     setSession(undefined);
@@ -381,6 +422,14 @@ export function ControlConsole() {
             <Receipts snapshot={snapshot} receipt={receipt} facts={facts} />
           )}
           {page === 5 && (
+            <TradeDock
+              facts={facts}
+              strategy={activeStrategy}
+              writable={writable}
+              submit={submitTrade}
+            />
+          )}
+          {page === 6 && (
             <Controls
               strategy={activeStrategy}
               writable={writable}
@@ -1166,6 +1215,125 @@ function display(value: unknown, field: string): string {
       ? fieldValueLabels[field]?.[String(value)] ??
         (fieldValueLabels[field] ? "—" : String(value))
       : "—";
+}
+type TradeAction = "open_long" | "open_short" | "close_long" | "close_short" | "cancel_selected_order" | "cancel_all_orders";
+type TradeInput = {
+  action: TradeAction;
+  quote_asset: string;
+  order_type: "limit";
+  time_in_force: "gtc";
+  post_only: boolean;
+  reduce_only: boolean;
+  selected_price: string | null;
+  quote_notional: string | null;
+  close_quantity_cap: string | null;
+  selected_order_id: string | null;
+};
+const tradeActionLabel = (action: TradeAction) => ({
+  open_long: "开多", open_short: "开空", close_long: "平多", close_short: "平空",
+  cancel_selected_order: "撤当前手动单", cancel_all_orders: "撤本范围全部手动单",
+}[action]);
+const positiveDecimal = (value: string) => /^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(value) && /[1-9]/.test(value);
+
+function TradeDock({
+  facts,
+  strategy,
+  writable,
+  submit,
+}: Readonly<{
+  facts: ExecutionFacts;
+  strategy: Strategy | undefined;
+  writable: boolean;
+  submit: (input: TradeInput) => Promise<void>;
+}>) {
+  const [action, setAction] = useState<TradeAction>("open_long");
+  const [price, setPrice] = useState("");
+  const [notional, setNotional] = useState("");
+  const [closeCap, setCloseCap] = useState("");
+  const [selectedOrderId, setSelectedOrderId] = useState("");
+  if (!strategy) return <Empty />;
+  const quoteAsset = strategy.symbol.split("/")[1] ?? "";
+  const isOrder = ["open_long", "open_short", "close_long", "close_short"].includes(action);
+  const isClose = action === "close_long" || action === "close_short";
+  const scopedOrders = facts.orders.filter((order) =>
+    read(order, "binding.venue") === strategy.venue &&
+    read(order, "binding.trading_account_id") === strategy.trading_account_id &&
+    read(order, "binding.instance_id") === strategy.instance_id &&
+    read(order, "binding.symbol") === strategy.symbol,
+  );
+  const signedCap = facts.positions.find((position) =>
+    read(position, "binding.venue") === strategy.venue &&
+    read(position, "binding.trading_account_id") === strategy.trading_account_id &&
+    read(position, "binding.instance_id") === strategy.instance_id &&
+    read(position, "binding.symbol") === strategy.symbol &&
+    read(position, "position_side") === (action === "close_long" ? "long" : "short"),
+  );
+  const valid = isOrder
+    ? positiveDecimal(price) && positiveDecimal(notional) && (!isClose || positiveDecimal(closeCap))
+    : action === "cancel_selected_order" ? Boolean(selectedOrderId) : true;
+  const send = () => {
+    if (!valid) return;
+    void submit({
+      action,
+      quote_asset: quoteAsset,
+      order_type: "limit",
+      time_in_force: "gtc",
+      post_only: false,
+      reduce_only: isClose,
+      selected_price: isOrder ? price : null,
+      quote_notional: isOrder ? notional : null,
+      close_quantity_cap: isClose ? closeCap : null,
+      selected_order_id: action === "cancel_selected_order" ? selectedOrderId : null,
+    });
+  };
+  return (
+    <section className="stack">
+      <header>
+        <p className="eyebrow">LIVE TradeIntent · Control → Node</p>
+        <h1>基础手动交易</h1>
+        <p>仅构造 LIMIT/GTC 语义意图；Node 会重新核对绑定、签名仓位、实时规则、risk、WAL 与唯一 writer。控制回执不是成交。</p>
+      </header>
+      <section className="panel trade-dock">
+        <dl className="facts">
+          <div><dt>执行目标</dt><dd>{strategy.venue} / {strategy.trading_account_id}</dd></div>
+          <div><dt>交易对 / 实例</dt><dd>{strategy.symbol} / {strategy.instance_id}</dd></div>
+          <div><dt>config epoch</dt><dd>{strategy.config_epoch}</dd></div>
+          <div><dt>状态</dt><dd>{writable ? "连续 SSE 与新鲜签名投影已就绪" : "写入门关闭"}</dd></div>
+        </dl>
+        <div className="trade-fields">
+          <label>动作
+            <select value={action} onChange={(event) => setAction(event.target.value as TradeAction)}>
+              <option value="open_long">开多</option><option value="open_short">开空</option>
+              <option value="close_long">平多（reduce-only）</option><option value="close_short">平空（reduce-only）</option>
+              <option value="cancel_selected_order">撤所选手动订单</option><option value="cancel_all_orders">撤本范围全部手动订单</option>
+            </select>
+          </label>
+          {isOrder && <><label>限价
+            <input inputMode="decimal" onChange={(event) => setPrice(event.target.value.trim())} placeholder="Decimal 字符串" value={price} />
+          </label><label>报价金额（{quoteAsset}）
+            <input inputMode="decimal" onChange={(event) => setNotional(event.target.value.trim())} placeholder="Decimal 字符串" value={notional} />
+          </label></>}
+          {isClose && <label>平仓基础币数量上限
+            <input inputMode="decimal" onChange={(event) => setCloseCap(event.target.value.trim())} placeholder="必须不超过签名持仓" value={closeCap} />
+            {typeof read(signedCap ?? {}, "quantity") === "string" && <small>当前签名数量：{String(read(signedCap ?? {}, "quantity"))}（仅作 UI 上限；Node 再裁剪）</small>}
+          </label>}
+          {action === "cancel_selected_order" && <label>所选手动订单
+            <select value={selectedOrderId} onChange={(event) => setSelectedOrderId(event.target.value)}>
+              <option value="">选择同一实例、账户与交易对内的订单</option>
+              {scopedOrders.map((order) => {
+                const id = read(order, "order_id");
+                return typeof id === "string" ? <option key={id} value={id}>{id} · {display(read(order, "state"), "state")}</option> : null;
+              })}
+            </select>
+            <small>Node 仅接受可证明属于手动 owner 的精确订单；自动、外部或 Unknown 订单会拒绝。</small>
+          </label>}
+        </div>
+        {action === "cancel_all_orders" && <p className="muted">范围精确为当前账户 + 当前交易对 + 当前手动 owner。它不会撤自动策略、跟单或外部订单；不能证明 scope 时 Node 必须拒绝。</p>}
+        <div className="buttons"><button className={isClose || action.startsWith("cancel") ? "danger-button" : ""} disabled={!writable || !valid} onClick={send} type="button">{tradeActionLabel(action)}</button></div>
+        {!writable && <p className="muted">写入门关闭：需要受控会话、连续 SSE 以及最新快照和执行事实。</p>}
+      </section>
+    </section>
+  );
 }
 function Controls({
   strategy,

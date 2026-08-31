@@ -17,7 +17,7 @@ use venue_execution::{
     AccountPricedLimitIntent, AccountRecoveryOutcome, AccountRecoveryReport,
     AccountRecoveryRequest, AccountRiskEvidence, SignedAccountBalance, SignedAccountOrderFact,
     SignedAccountPositionFact, SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact,
-    SignedUnknownResult,
+    SignedUnknownResult, command_matches_readback_order,
 };
 use venue_gateway_api::GatewayBinding;
 
@@ -1113,7 +1113,12 @@ async fn snapshot_unknowns(
                 .execute_exact_readback(credentials, request, now)
                 .await
             {
-                Ok(readback) if settle_unknown_readback(&unknown, &readback).is_ok() => {
+                Ok(readback)
+                    if settle_unknown_readback(&unknown, &readback).is_ok()
+                        && readback.order.as_ref().is_some_and(|order| {
+                            command_matches_readback_order(command, order)
+                        }) =>
+                {
                     match readback.order {
                         Some(order) if order.state == OrderState::Rejected => {
                             SignedUnknownResult::Rejected {

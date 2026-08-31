@@ -10,8 +10,8 @@ use fs2::FileExt;
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
 use venue_domain::domain::{
-    Asset, CommandId, ExecutionCommand, InstrumentIdentity, MarketKind, NativeOrderFamily,
-    OrderOwner, OrderSide, Position, PositionSide, Price,
+    Asset, CommandId, ExecutionCommand, FieldState, InstrumentIdentity, MarketKind,
+    NativeOrderFamily, Order, OrderOwner, OrderSide, OrderState, Position, PositionSide, Price,
 };
 use venue_gateway_api::GatewayBinding;
 
@@ -1641,6 +1641,61 @@ fn validate_artifacts_root(
         return Err(AccountHostValidationError::ArtifactsRoot);
     }
     Ok(())
+}
+
+/// Compares an exact adapter readback to the durable command before an UNKNOWN may settle.
+/// A matching client id alone never proves that a different order carried out this command.
+pub fn command_matches_readback_order(command: &ExecutionCommand, order: &Order) -> bool {
+    let expected_client_id = match command {
+        ExecutionCommand::Cancel(cancel) => cancel.target_client_order_id.as_str(),
+        _ => match command.native_client_id() {
+            Some(client_id) => client_id.as_str(),
+            None => return false,
+        },
+    };
+    if order.client_order_id != FieldState::Known(expected_client_id.to_owned()) {
+        return false;
+    }
+    match command {
+        ExecutionCommand::PlaceLimit(command) => {
+            command.owner.symbol == order.symbol
+                && command.side == order.side
+                && order.position_side == FieldState::Known(command.position_side)
+                && command.quantity == order.quantity
+                && order.limit_price == Some(command.limit_price)
+                && order.time_in_force == FieldState::Known(command.time_in_force)
+                && command.reduce_only == order.reduce_only
+        }
+        ExecutionCommand::PlaceMarket(command) => {
+            command.owner.symbol == order.symbol
+                && command.side == order.side
+                && order.position_side == FieldState::Known(command.position_side)
+                && command.quantity == order.quantity
+                && order.limit_price.is_none()
+                && !order.reduce_only
+        }
+        ExecutionCommand::MarketReduce(command) => {
+            command.owner.symbol == order.symbol
+                && command.side == order.side
+                && order.position_side == FieldState::Known(command.position_side)
+                && command.quantity == order.quantity
+                && order.limit_price.is_none()
+                && order.reduce_only
+        }
+        ExecutionCommand::StopMarketFullPosition(command) => {
+            command.owner.symbol == order.symbol
+                && command.side == order.side
+                && order.position_side == FieldState::Known(command.position_side)
+                && command.quantity == order.quantity
+                && order.limit_price == Some(command.trigger_price)
+                && order.reduce_only
+        }
+        ExecutionCommand::Cancel(_) => matches!(
+            order.state,
+            OrderState::Filled | OrderState::Cancelled | OrderState::Expired | OrderState::Rejected
+        ),
+        ExecutionCommand::StopMarketCloseAll(_) => false,
+    }
 }
 
 fn command_matches_signed_order(command: &ExecutionCommand, fact: &SignedAccountOrderFact) -> bool {

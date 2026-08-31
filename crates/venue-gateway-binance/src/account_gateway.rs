@@ -19,6 +19,7 @@ use venue_execution::{
     AccountRecoveryReport, AccountRecoveryRequest, AccountRiskAmount, AccountRiskEvidence,
     SignedAccountBalance, SignedAccountOrderFact, SignedAccountPositionFact,
     SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
+    command_matches_readback_order,
 };
 use venue_gateway_api::{GatewayBinding, PublicMarketBinding};
 
@@ -1456,46 +1457,30 @@ fn snapshot_exact_regular_result(
     command: &ExecutionCommand,
     client_id: &str,
 ) -> SignedUnknownResult {
-    let value = match serde_json::from_slice::<Value>(payload) {
-        Ok(value) => value,
-        Err(_) => return SignedUnknownResult::Unknown,
+    let order = match str::from_utf8(payload)
+        .ok()
+        .and_then(|raw| crate::private::parse_order(raw, &command.mutation_owner().symbol).ok())
+    {
+        Some(order) => order,
+        None => return SignedUnknownResult::Unknown,
     };
-    let Some(row) = value.as_object() else {
-        return SignedUnknownResult::Unknown;
-    };
-    if row.get("clientOrderId").and_then(Value::as_str) != Some(client_id) {
+    if !command_matches_readback_order(command, &order)
+        || !matches!(&order.client_order_id, FieldState::Known(value) if value == client_id)
+    {
         return SignedUnknownResult::Unknown;
     }
-    if !snapshot_policy_matches_command(row, command) {
-        return SignedUnknownResult::Unknown;
-    }
-    match row.get("status").and_then(Value::as_str) {
-        Some("REJECTED") => SignedUnknownResult::Rejected {
+    match order.state {
+        OrderState::Rejected => SignedUnknownResult::Rejected {
             reason: "binance_rejected".to_owned(),
         },
-        Some("NEW" | "PARTIALLY_FILLED" | "FILLED" | "CANCELED" | "EXPIRED") => {
-            match snapshot_identifier(row, "orderId") {
-                Ok(venue_order_id) => SignedUnknownResult::Accepted { venue_order_id },
-                Err(_) => SignedUnknownResult::Unknown,
-            }
-        }
-        _ => SignedUnknownResult::Unknown,
-    }
-}
-
-fn snapshot_policy_matches_command(
-    row: &serde_json::Map<String, Value>,
-    command: &ExecutionCommand,
-) -> bool {
-    match command {
-        ExecutionCommand::PlaceLimit(place) => {
-            snapshot_limit_time_in_force(row, "timeInForce") == Ok(Some(place.time_in_force))
-        }
-        ExecutionCommand::Cancel(_)
-        | ExecutionCommand::PlaceMarket(_)
-        | ExecutionCommand::MarketReduce(_)
-        | ExecutionCommand::StopMarketCloseAll(_)
-        | ExecutionCommand::StopMarketFullPosition(_) => true,
+        OrderState::New
+        | OrderState::PartiallyFilled
+        | OrderState::Filled
+        | OrderState::Cancelled
+        | OrderState::Expired => SignedUnknownResult::Accepted {
+            venue_order_id: order.order_id,
+        },
+        OrderState::Unknown => SignedUnknownResult::Unknown,
     }
 }
 

@@ -665,6 +665,9 @@ pub fn settle_unknown_readback(
     } else {
         BitgetReadbackFinality::Working
     };
+    if unknown.kind == BitgetMutationKind::Cancel && finality != BitgetReadbackFinality::Terminal {
+        return Err(BitgetExecutionError::Unsettled);
+    }
     Ok(BitgetMutationSettlement {
         order: Some(order),
         finality,
@@ -1297,6 +1300,35 @@ mod tests {
         assert_eq!(
             build_unknown_recovery_readback_request(&unknown, 6),
             Err(BitgetExecutionError::Readback)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_cancel_stays_unsettled_while_the_target_is_working()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = BitgetConfig::for_mode(GatewayMode::Live);
+        let unknown = BitgetUnknownMutation {
+            binding: binding(GatewayMode::Live)?,
+            attempt_id: 9,
+            generation: 7,
+            kind: BitgetMutationKind::Cancel,
+            order_id: Some("123".to_owned()),
+            client_order_id: Some("venue_1".to_owned()),
+            dispatched_at_ms: 100,
+            reason: BitgetUnknownReason::Timeout,
+            expected_time_in_force: None,
+        };
+        let readback = parse_exact_order_readback(
+            &config,
+            build_unknown_readback_request(&unknown)?,
+            101,
+            102,
+            br#"{"code":"00000","data":{"orderId":"123","clientOid":"venue_1","category":"USDT-FUTURES","symbol":"BTCUSDT","orderStatus":"live","side":"buy","posSide":"long","holdMode":"hedge_mode","tradeSide":"open_long","qty":"1","cumExecQty":"0","price":"1","avgPrice":"0","delegateType":"normal"}}"#.to_vec(),
+        )?;
+        assert_eq!(
+            settle_unknown_readback(&unknown, &readback),
+            Err(BitgetExecutionError::Unsettled)
         );
         Ok(())
     }

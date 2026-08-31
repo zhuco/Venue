@@ -3,8 +3,8 @@ use std::{io, io::Write};
 use rust_decimal::Decimal;
 use tempfile::TempDir;
 use venue_domain::domain::{
-    CancelCommand, FieldState, Fill, MarketReduceCommand, OrderCommand, OrderOwner, OrderPurpose,
-    OrderSide, PositionSide, Price,
+    CancelCommand, FieldState, Fill, LimitTimeInForce, MarketReduceCommand, Order, OrderCommand,
+    OrderOwner, OrderPurpose, OrderSide, OrderState, PositionSide, Price,
 };
 use venue_gateway_api::{GatewayMode, VenueId};
 use venue_storage::DurableWalHead;
@@ -252,6 +252,44 @@ fn signed_order_cannot_confirm_a_different_or_missing_limit_policy()
     let recovered: SignedAccountOrderFact = serde_json::from_slice(&serde_json::to_vec(&fact)?)?;
     assert_eq!(recovered.created_at_ms, fact.created_at_ms);
     assert!(command_matches_signed_order(&execution, &recovered));
+    Ok(())
+}
+
+#[test]
+fn unknown_readback_requires_complete_order_semantics_and_terminal_cancel()
+-> Result<(), Box<dyn std::error::Error>> {
+    let command = command(Decimal::ONE)?;
+    let ExecutionCommand::PlaceLimit(place) = &command else {
+        return Err("limit required".into());
+    };
+    let mut order = Order {
+        order_id: "native-readback-1".to_owned(),
+        client_order_id: FieldState::Known(place.client_order_id.as_str().to_owned()),
+        symbol: place.owner.symbol.clone(),
+        side: place.side,
+        position_side: FieldState::Known(place.position_side),
+        purpose: FieldState::Missing,
+        state: OrderState::New,
+        quantity: place.quantity,
+        filled_quantity: Decimal::ZERO,
+        limit_price: Some(place.limit_price),
+        time_in_force: FieldState::Known(LimitTimeInForce::PostOnly),
+        average_price: FieldState::Missing,
+        reduce_only: place.reduce_only,
+    };
+    assert!(command_matches_readback_order(&command, &order));
+    order.limit_price = Some(Price::new(Decimal::from(2))?);
+    assert!(!command_matches_readback_order(&command, &order));
+
+    let cancel = ExecutionCommand::Cancel(CancelCommand {
+        command_id: CommandId::new("cancel-readback-1")?,
+        owner: place.owner.clone(),
+        target_client_order_id: place.client_order_id.clone(),
+    });
+    order.limit_price = Some(place.limit_price);
+    assert!(!command_matches_readback_order(&cancel, &order));
+    order.state = OrderState::Cancelled;
+    assert!(command_matches_readback_order(&cancel, &order));
     Ok(())
 }
 

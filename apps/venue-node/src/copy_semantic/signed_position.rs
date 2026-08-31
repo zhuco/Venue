@@ -33,7 +33,9 @@ pub(super) fn position(
         .collect::<Vec<_>>();
     let valid_legs = match snapshot.position_mode() {
         SignedAccountPositionMode::Net => {
-            rows.len() == 1 && rows[0].position_side == PositionSide::Net
+            // A complete Net snapshot legitimately omits a zero-position symbol. Hedge mode
+            // cannot make the same claim because its long and short legs are independent.
+            rows.is_empty() || (rows.len() == 1 && rows[0].position_side == PositionSide::Net)
         }
         SignedAccountPositionMode::Hedge => {
             rows.len() == 2
@@ -183,6 +185,21 @@ mod tests {
         assert_eq!(
             position(delivery.manifest(), &page, 160)?.exposure.value,
             Decimal::from(-6)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn complete_net_snapshot_absence_is_signed_zero() -> Result<(), Box<dyn std::error::Error>> {
+        let (delivery, _) =
+            delivery_and_request(Decimal::ZERO, 10.into(), CopyExecutionPhase::Adjust, 1)?;
+        let page = snapshot(delivery.manifest(), SignedAccountPositionMode::Net, &[])?;
+
+        let signed = position(delivery.manifest(), &page, 160)?;
+        assert_eq!(signed.exposure.value, Decimal::ZERO);
+        assert_eq!(
+            signed.exposure.asset.as_str(),
+            delivery.manifest().binding.instrument.symbol.quote()
         );
         Ok(())
     }

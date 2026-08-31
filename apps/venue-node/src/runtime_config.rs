@@ -149,7 +149,13 @@ impl NodeRuntimeConfig {
                 return Err(NodeError::RuntimeConfig);
             }
             match (strategy.strategy_kind, &strategy.grid, &strategy.scalping) {
-                (StrategyKind::HedgedGrid, Some(grid), None) if grid.params.validate().is_ok() => {
+                // Only Binance has the complete Grid bootstrap and private-fill bridge today.
+                // Gate and Bitget must reject this configuration until they share that same
+                // Runtime/Lane path; accepting it would create an actor that cannot safely
+                // install or roll its desired orders.
+                (StrategyKind::HedgedGrid, Some(grid), None)
+                    if self.venue == VenueId::Binance && grid.params.validate().is_ok() =>
+                {
                     self.grid_initial_state(strategy)?;
                 }
                 (StrategyKind::Scalping, None, Some(_))
