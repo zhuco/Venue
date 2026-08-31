@@ -114,6 +114,7 @@ AI 只发起经授权的 operator/control 语义动作，不能直接调用 adap
 
 - Copy 已有 semantic Applied 到同一账户 WAL、签名成交/仓位的物理桥；leader 权威事实自动接入、持续 ledger/drift repair 和完整产品端到端仍须验收。
 - 六所 Node 已组合 Account Runtime、Execution Lane 与 `AccountMutationHost`；Grid/Scalping 的生产私流驱动和物理接线、控制撤单/清仓及多 symbol 常驻调度仍须闭合，不能以纯 reducer 测试替代。
+- Scalping 的 FeatureSource 已接收行情，但 `production_resident/scalping.rs` 尚未将其 frame 驱动真实 engine 的 evaluate、checkpoint、签名入场确认与退出保护；手工语义候选通过 WAL 不等于自动策略闭环，保护链缺失时不得开放自动入场。
 - 根 package 的旧三所生产 binary 已移除，但服务器上的旧 release、未决 WAL 与运行进程仍须逐所核验和接管；本地删除入口不构成生产退休证明。
 - 六所尚未共同满足同一套启动恢复、Owner 路由、Stop/Flatten、Unknown 收敛和产品级 Canary 契约。
 - 手动 `TradeIntent` 已有 Node 显式选价、同一 Actor replay 的原始计划、精确自有手动单撤单及只读 delivery 对账；仍须完成与 Grid desired/库存的协同、Copy 绑定支持和全 scope 撤单后才能认定完整闭环。当前不支持的 scope 明确拒绝；BBO 自动选价不能替代用户选价，离线通过不替代生产接管验收。
@@ -214,6 +215,7 @@ worker 在同一数据库事务中冻结输入、规划任务并推进观察游�
 
 原始执行 request 必须早于 Actor Applied 和账户 WAL 耐久保存。每个 immutable job 只允许一个 ReduceToZero child 和一个 Adjust child，
 child 身份不得包含不断推进的签名快照 generation；重启或重复 delivery 不得用新持仓重算已提交 child 的价格、数量或原 request。
+尚未过期的 Copy Install 领取窗口必须精确为 `min(领取时间 + 请求租期, 原 job 截止时间)`；Control 数据行、immutable claim 和 Node 校验保持一致，不能因剩余窗口不足完整租期而漏领，也不得续期 job。已领取任务过期后只允许 ReconcileOnly 使用完整对账租期；从未领取即过期的任务不能据此重新执行，解除其规划阻塞仍需独立的安全收口。
 恢复读取同一本 WAL 的原命令，按精确 native order identity 累积规范成交并检查更新的完整仓位腿与开放订单；仅 ACK 或较新仓位不能证明成交。
 过期、暂停或旧 revision job 仍可只读收敛原 child，但不能产生新风险。第二 phase 必须保留第一 phase 的 request/签名零仓证据，重新检查
 当前 relation、有效期和账户风险，并在新 WAL 前单独持久化 Adjust request；不得覆盖第一 phase 的恢复事实。
@@ -224,6 +226,9 @@ Node 通过既有 projection outbox 传输有界、固定编码的原始执行�
 Control 在提交投影游标的同一事务内校验外层 binding、SHA256、内层结果和原始 delivery，记录结果；批次任一项冲突则全部回滚。
 只收到完全相同的回显后，Node 才在既有 Copy journal 标记该结果已投影。结果投影可跳过尚未上传的中间状态，但 Reconciled 必须携带更新签名仓位。
 回传 request 的目标、资产、phase 与 delta 必须由原 immutable job 和统一纯规划语义校验；已有 ReduceToZero 时，Adjust 只能引用其已签名归零后不早于该代的零仓事实。过期结果仍可只读记录，但不能借投影刷新授权。
+相同规范成交在不同签名快照代重复出现时，成交身份与全部交易字段、摘要必须一致，只允许观测 generation 不同并保留真实较新代；不能因重复回读阻断投影，也不能吞掉数量、方向、价格或订单身份冲突。
+Copy 的 ReconcileOnly 回传须匹配原 delivery ID、账户/实例/epoch binding、完整 immutable payload、当前 request 与 manifest 摘要；只有最终 Adjust 已由原 WAL、精确成交和更新签名仓位收敛，且执行结果携带的仓位与耐久 journal 一致，才能回传 Reconciled。缺失、Pending、Unknown 或中间 ReduceToZero 不得伪造终态；对账后的跨零续行禁用标记保存在原 Copy journal，后续 tick 和重启均不得据此增险。执行投影和 delivery receipt 均保留原身份，由 Control 交叉核验后记账。
+Control 已确认的 Unknown 可在原租期结束前领取精确下一 epoch 的 ReconcileOnly；Node 必须先有同一 Unknown 的耐久回显确认，且新领取时间不早于该事实。未确认 Unknown、普通 Install、Applied 或 Rejected 不适用此提前对账例外；该例外只缩短只读恢复等待，不授予执行权限。
 
 每个 immutable snapshot、job、manifest、outbox row 和 Actor inbox 都必须耐久绑定精确 relation revision 与 policy digest。关系改参、
 Pause、Stop 或删除时，Control 必须在同一 PostgreSQL 事务内递增 revision 并产生配置变更事件；Planner 和 Node 通过耐久事件/投递消费，

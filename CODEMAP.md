@@ -133,6 +133,7 @@ Web 的 Control 用户会话只在 BFF 环境注入，HTTP/SSE 同时保留 Cont
 - 六所候选准入审计：`scripts/verify_gateway_candidate_contract.ps1` 构建/测试六个隔离 LIVE binary，验证非生产模式前置拒绝、非生产 endpoint/header 标记缺失及缺证据时零工件失败关闭；矩阵中的 `not_reached` 和 `writer_enabled=false` 是尚未接线的真实结论，不构成实盘准入。
 - Binance 旧网格测试：`src/runtime/legacy/hedged_grid_live_tests.rs`、`hedged_grid_hot_path.rs` 内测试；共享行为测试位于 `src/runtime/hedged_grid/` 与 `src/runtime/grid/`。
 - Node CLI、配置：`apps/venue-node/src/lib.rs`、`apps/venue-node/src/runtime_config.rs` 和 `src/config.rs` 内测试。
+- Copy 领取窗口：`apps/venue-node/src/control_delivery_claim_window_tests.rs` 与 `apps/venue-control/tests/copy_postgres/claim_window.rs` 验证临期 Install 精确截断、不续期原 job、并发抢领及过期已领取任务仅对账。`apps/venue-node/src/control_loop/copy_reconciliation.rs` 回传 Copy ReconcileOnly 的最终签名结果，`copy_delivery_journal.rs` 持久化只读对账后的跨零续行禁用标记；`control_loop/control_loop_tests.rs` 覆盖 Unknown 原 WAL 重启收敛、不重复 dispatch、原 delivery 精确回传及首次任务前的规划事实发布。
 - 执行、恢复、writer：`tests/*recovery*`、`tests/*writer*`、`tests/*canary*`。
 - 行情与存储：`tests/market.rs`、`tests/storage.rs`。
 - Scalping：`crates/venue-strategies/src/scalping/engine_tests.rs`、`src/runtime/scalping/*tests.rs`、`tests/scalping_*` 与 `tests/legacy_scalping_*`。

@@ -28,6 +28,9 @@ use venue_domain::domain::{Amount, Asset, InstrumentIdentity, MarketKind, Symbol
 #[path = "copy_postgres/execution.rs"]
 mod execution_contract;
 
+#[path = "copy_postgres/claim_window.rs"]
+mod claim_window;
+
 #[tokio::test]
 async fn live_only_migration_rejects_legacy_test_rows_without_rewriting_them()
 -> Result<(), Box<dyn std::error::Error>> {

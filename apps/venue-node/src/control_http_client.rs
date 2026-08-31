@@ -14,8 +14,9 @@ use serde::{Serialize, de::DeserializeOwned};
 use venue_control_protocol::{
     ACCOUNT_DELIVERY_ACK_PATH, ACCOUNT_DELIVERY_CLAIM_PATH, ACCOUNT_DELIVERY_RECEIPT_PATH,
     ACCOUNT_DELIVERY_SCHEMA_VERSION, ACCOUNT_NODE_PROJECTION_PATH, AccountDeliveryAck,
-    AccountDeliveryClaim, AccountDeliveryClaimRequest, AccountDeliveryPurpose,
-    AccountDeliveryReceipt, COPY_RELATION_PATH, CopyRelationRecord, NodeProjectionEnvelope,
+    AccountDeliveryClaim, AccountDeliveryClaimRequest, AccountDeliveryPayload,
+    AccountDeliveryPurpose, AccountDeliveryReceipt, COPY_RELATION_PATH, CopyRelationRecord,
+    NodeProjectionEnvelope,
 };
 
 use crate::control_delivery::{
@@ -329,12 +330,19 @@ fn validate_claim_batch(
             .validate()
             .map_err(|_| ControlHttpClientError::InvalidResponse)?;
         let lease = &claim.lease;
+        let requested_expiry = lease
+            .leased_at_ms
+            .checked_add(request.lease_duration_ms)
+            .ok_or(ControlHttpClientError::InvalidResponse)?;
+        let expected_expiry = match (&claim.payload, lease.purpose) {
+            (AccountDeliveryPayload::CopySemanticJob(job), AccountDeliveryPurpose::Install) => {
+                requested_expiry.min(job.expires_at_ms)
+            }
+            _ => requested_expiry,
+        };
         if lease.binding != request.binding
             || lease.node_id != request.node_id
-            || lease
-                .expires_at_ms
-                .checked_sub(lease.leased_at_ms)
-                .is_none_or(|duration| duration != request.lease_duration_ms)
+            || lease.expires_at_ms != expected_expiry
             || (lease.purpose == AccountDeliveryPurpose::ReconcileOnly && lease.lease_epoch < 2)
             || !delivery_ids.insert(lease.delivery_id.as_str())
             || lease.grants_mutation_authority()

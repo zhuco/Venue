@@ -34,7 +34,7 @@ impl AccountDeliveryRepository for PgControlRepository {
             return Err(AccountDeliveryRepositoryError::InvalidData);
         }
         let leased_at = to_i64(leased_at_ms)?;
-        let expires_at = to_i64(expires_at_ms)?;
+        to_i64(expires_at_ms)?;
         let mut transaction = self.pool().begin().await.map_err(database_error)?;
         let current_scope = sqlx::query(
             "SELECT 1 FROM venue_control_strategy_scopes \
@@ -72,10 +72,10 @@ impl AccountDeliveryRepository for PgControlRepository {
                         AND (d.lease_purpose = 'install' OR d.lease_expires_at_ms <= $7))) \
                AND (d.source_kind = 'control_command' \
                     OR d.delivery_state IN ('acknowledged', 'reconciliation_required') \
-                    OR j.expires_at_ms >= $8 \
+                    OR j.expires_at_ms > $7 \
                     OR (d.delivery_state = 'claimed' AND j.expires_at_ms <= $7)) \
              ORDER BY d.created_at_ms, d.delivery_id \
-             FOR UPDATE OF d SKIP LOCKED LIMIT $9",
+             FOR UPDATE OF d SKIP LOCKED LIMIT $8",
         )
         .bind(binding.venue.as_str())
         .bind(binding.mode.as_str())
@@ -84,7 +84,6 @@ impl AccountDeliveryRepository for PgControlRepository {
         .bind(&binding.instance_id)
         .bind(to_i64(binding.config_epoch)?)
         .bind(leased_at)
-        .bind(expires_at)
         .bind(i64::from(limit))
         .fetch_all(&mut *transaction)
         .await
@@ -120,6 +119,15 @@ impl AccountDeliveryRepository for PgControlRepository {
                 purpose,
             )
             .await?;
+            // A fresh immutable job remains claimable in its final validity window. Its
+            // install lease may shrink to that window, never extend the execution deadline.
+            let claim_expires_at_ms = match (&payload, purpose) {
+                (AccountDeliveryPayload::CopySemanticJob(job), AccountDeliveryPurpose::Install) => {
+                    expires_at_ms.min(job.expires_at_ms)
+                }
+                _ => expires_at_ms,
+            };
+            let claim_expires_at = to_i64(claim_expires_at_ms)?;
             let current_epoch: i64 = row.try_get("lease_epoch").map_err(database_error)?;
             let lease_epoch = current_epoch
                 .checked_add(1)
@@ -131,7 +139,7 @@ impl AccountDeliveryRepository for PgControlRepository {
                 node_id: node_id.to_owned(),
                 lease_epoch: from_i64(lease_epoch)?,
                 leased_at_ms,
-                expires_at_ms,
+                expires_at_ms: claim_expires_at_ms,
                 purpose,
             };
             let claim = AccountDeliveryClaim { lease, payload };
@@ -155,7 +163,7 @@ impl AccountDeliveryRepository for PgControlRepository {
             .bind(node_id)
             .bind(purpose_str(purpose))
             .bind(leased_at)
-            .bind(expires_at)
+            .bind(claim_expires_at)
             .bind(current_epoch)
             .execute(&mut *transaction)
             .await
@@ -173,7 +181,7 @@ impl AccountDeliveryRepository for PgControlRepository {
             .bind(node_id)
             .bind(purpose_str(purpose))
             .bind(leased_at)
-            .bind(expires_at)
+            .bind(claim_expires_at)
             .bind(encode(&claim)?)
             .execute(&mut *transaction)
             .await

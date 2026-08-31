@@ -1211,9 +1211,20 @@ fn validate_next_claim(
     let Some((&previous_epoch, previous)) = delivery.claims.last_key_value() else {
         return Err(());
     };
+    let confirmed_unknown_at = delivery
+        .receipt_confirmed
+        .get(&previous_epoch)
+        .filter(|receipt| receipt.state == AccountDeliveryReceiptState::Unknown)
+        .map(|receipt| receipt.observed_ms);
+    let after_previous_lease = claim.lease.leased_at_ms >= previous.claim.lease.expires_at_ms
+        && received_ms >= previous.claim.lease.expires_at_ms;
+    // A durable Unknown observation has already frozen the preceding Actor result. Its exact
+    // next ReconcileOnly claim may start before the old lease expires, but only after that
+    // Unknown was observed; it still receives no mutation authority.
+    let early_unknown_reconciliation = claim.lease.purpose == AccountDeliveryPurpose::ReconcileOnly
+        && confirmed_unknown_at.is_some_and(|observed_ms| claim.lease.leased_at_ms >= observed_ms);
     if previous_epoch.checked_add(1) != Some(claim.lease.lease_epoch)
-        || claim.lease.leased_at_ms < previous.claim.lease.expires_at_ms
-        || received_ms < previous.claim.lease.expires_at_ms
+        || (!after_previous_lease && !early_unknown_reconciliation)
         || claim.payload != previous.claim.payload
     {
         return Err(());

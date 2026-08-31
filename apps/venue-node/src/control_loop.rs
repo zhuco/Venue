@@ -44,6 +44,7 @@ type FileDriver = ControlDeliveryDriver<OpaqueControlDeliveryJournal>;
 type FileOutbox = NodeProjectionOutbox<OpaqueControlDeliveryJournal>;
 
 mod copy_planning;
+mod copy_reconciliation;
 mod projection_digest;
 #[cfg(any(
     feature = "binance",
@@ -254,6 +255,7 @@ impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
     ) -> Result<bool, ControlResidentLoopError> {
         let ids = self.drivers.keys().cloned().collect::<Vec<_>>();
         for instance_id in ids {
+            let mut copy_reconciliation_turns = Vec::new();
             let Some(work) = ({
                 let driver = self
                     .drivers
@@ -370,6 +372,45 @@ impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
                             venue_control_protocol::AccountDeliveryPayload::ControlCommand(command)
                                 if command.action == venue_control_protocol::ControlAction::Trade
                         );
+                        let is_copy_delivery = matches!(
+                            turn.payload(),
+                            venue_control_protocol::AccountDeliveryPayload::CopySemanticJob(_)
+                        );
+                        if is_copy_delivery {
+                            // Copy reconciliation is completed only after the already durable
+                            // child command has newer signed proof.  Keep the exact lease turn
+                            // until the common status-first pass below has updated its journal.
+                            let venue_control_protocol::AccountDeliveryPayload::CopySemanticJob(
+                                job,
+                            ) = turn.payload()
+                            else {
+                                return Err(ControlResidentLoopError::Copy);
+                            };
+                            let durable = self
+                                .copy_jobs
+                                .get(&instance_id)
+                                .ok_or(ControlResidentLoopError::Config)?
+                                .jobs()
+                                .get(&job.job_id);
+                            if let Some(durable) = durable {
+                                let original = durable
+                                    .turn
+                                    .restore()
+                                    .map_err(|_| ControlResidentLoopError::Copy)?;
+                                if original.payload() != turn.payload()
+                                    || original.lease().delivery_id != turn.lease().delivery_id
+                                    || original.lease().binding != turn.lease().binding
+                                {
+                                    return Err(ControlResidentLoopError::Copy);
+                                }
+                                self.copy_jobs
+                                    .get_mut(&instance_id)
+                                    .ok_or(ControlResidentLoopError::Config)?
+                                    .freeze_cross_zero_continuation(job.job_id.clone())?;
+                            }
+                            copy_reconciliation_turns.push(turn);
+                            continue;
+                        }
                         if !is_manual_trade {
                             // Other reconciliation families retain their existing dedicated
                             // recovery drivers; this path has no authority to infer a result.
@@ -402,6 +443,11 @@ impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
             self.recover_copy_actor_markers(&instance_id, now)?;
             if !self.reconcile_copy_jobs(&instance_id, http_runtime, now)? {
                 return Ok(false);
+            }
+            for turn in copy_reconciliation_turns {
+                if !self.complete_copy_reconciliation_turn(http_runtime, &instance_id, turn, now)? {
+                    return Ok(false);
+                }
             }
             self.advance_control_shutdown(&instance_id)?;
         }
@@ -541,12 +587,13 @@ impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
                             job.relation.clone(),
                             request,
                             job.fills.clone(),
+                            job.reconciliation_only,
                         )
                     })
                 })?
             })
             .collect::<Vec<_>>();
-        for (job_id, turn, relation, request, previous_fills) in pending {
+        for (job_id, turn, relation, request, previous_fills, reconciliation_only) in pending {
             let delivery = CopySemanticDelivery::from_recovered_actor_turn(&turn.restore()?, now)
                 .map_err(|_| ControlResidentLoopError::Copy)?;
             let reconciliation = self
@@ -567,7 +614,7 @@ impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
                     reconciliation.position,
                     reconciliation.fills.clone(),
                 )?;
-            if continue_cross_zero {
+            if continue_cross_zero && !reconciliation_only {
                 let delivery =
                     CopySemanticDelivery::from_recovered_actor_turn(&turn.restore()?, now)
                         .map_err(|_| ControlResidentLoopError::Copy)?;
@@ -1633,12 +1680,31 @@ fn append_reconciled_copy_fill_set(
     }
     for fill in fills {
         let fact = reconciled_copy_fill_fact(fill, position, binding, generated_ms)?;
-        match known.insert(fact.fill_id.clone(), fact.clone()) {
-            Some(existing) if existing != fact => {
-                return Err(ControlResidentLoopError::ProjectionEncoding);
+        match known.get(&fact.fill_id).cloned() {
+            Some(existing) => {
+                // A later signed page may repeat precisely this fill with a newer account
+                // generation. Generation is observation metadata, not a second economic fill;
+                // every other normalized field (including the canonical digest) stays exact.
+                let mut comparable = fact.clone();
+                comparable.signed_generation = existing.signed_generation;
+                if comparable != existing {
+                    return Err(ControlResidentLoopError::ProjectionEncoding);
+                }
+                if fact.signed_generation > existing.signed_generation {
+                    let Some(current) = facts
+                        .iter_mut()
+                        .find(|current| current.fill_id == fact.fill_id)
+                    else {
+                        return Err(ControlResidentLoopError::ProjectionEncoding);
+                    };
+                    *current = fact.clone();
+                    known.insert(fact.fill_id.clone(), fact);
+                }
             }
-            Some(_) => {}
-            None => facts.push(fact),
+            None => {
+                known.insert(fact.fill_id.clone(), fact.clone());
+                facts.push(fact);
+            }
         }
     }
     Ok(())

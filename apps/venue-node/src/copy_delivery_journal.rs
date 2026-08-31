@@ -48,6 +48,10 @@ pub(crate) struct DurableCopyJob {
     /// A zero delta has no child command/WAL to reconcile. This marker records that fact without
     /// presenting semantic Applied as an execution result.
     pub no_physical_delta: bool,
+    /// A ReconcileOnly lease may read this child but must never mint a cross-zero Adjust later,
+    /// including after its lease expires or Node restarts.
+    #[serde(default)]
+    pub reconciliation_only: bool,
     pub execution: Option<CopyExecutionResult>,
     /// Latest command-specific signed position fact returned by recovery. It is retained with
     /// the normalized fills so a later projection never substitutes a new generic snapshot.
@@ -120,6 +124,9 @@ enum Event {
         observed_ms: u64,
     },
     NoPhysicalDelta {
+        job_id: String,
+    },
+    ReconciliationOnly {
         job_id: String,
     },
     NextAdjustPhase {
@@ -322,6 +329,27 @@ impl CopyDeliveryJournal {
         self.append(Event::NoPhysicalDelta { job_id })
     }
 
+    /// This is recovery metadata in the existing Copy journal, not a new authority: an expired
+    /// read-only lease can still prove that this original delivery may no longer create phase two.
+    pub(crate) fn freeze_cross_zero_continuation(
+        &mut self,
+        job_id: String,
+    ) -> Result<(), CopyDeliveryJournalError> {
+        if !self.jobs.contains_key(&job_id) {
+            // An unexecuted/foreign recovery claim has no local child to fence and cannot gain
+            // phase-two authority from this journal.  Leave it pending for Control recovery.
+            return Ok(());
+        }
+        if self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|job| job.reconciliation_only)
+        {
+            return Ok(());
+        }
+        self.append(Event::ReconciliationOnly { job_id })
+    }
+
     /// The next phase is retained before its own Actor Applied/WAL callback. The completed
     /// reduce facts remain immutable in `prior_phases`.
     pub(crate) fn persist_next_adjust_phase(
@@ -329,6 +357,13 @@ impl CopyDeliveryJournal {
         job_id: String,
         request: CopyExecutionRequest,
     ) -> Result<(), CopyDeliveryJournalError> {
+        if self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|job| job.reconciliation_only)
+        {
+            return Err(CopyDeliveryJournalError::Conflict);
+        }
         self.append(Event::NextAdjustPhase { job_id, request })
     }
 
@@ -565,6 +600,7 @@ impl CopyDeliveryJournal {
                                 request: None,
                                 actor_applied_ms: None,
                                 no_physical_delta: false,
+                                reconciliation_only: false,
                                 execution: None,
                                 position: None,
                                 fills: Vec::new(),
@@ -641,6 +677,13 @@ impl CopyDeliveryJournal {
                 job.no_physical_delta = true;
                 Ok(())
             }
+            Event::ReconciliationOnly { job_id } => {
+                let job = jobs
+                    .get_mut(&job_id)
+                    .ok_or(CopyDeliveryJournalError::Corrupt)?;
+                job.reconciliation_only = true;
+                Ok(())
+            }
             Event::NextAdjustPhase { job_id, request } => {
                 let job = jobs
                     .get_mut(&job_id)
@@ -650,7 +693,8 @@ impl CopyDeliveryJournal {
                 else {
                     return Err(CopyDeliveryJournalError::Conflict);
                 };
-                if job.no_physical_delta
+                if job.reconciliation_only
+                    || job.no_physical_delta
                     || execution.state != venue_copy::CopyExecutionState::Reconciled
                     || previous.phase != venue_copy::CopyExecutionPhase::ReduceToZero
                     || !position.exposure.value.is_zero()
@@ -988,6 +1032,7 @@ mod tests {
             request: Some(request.clone()),
             actor_applied_ms: Some(2),
             no_physical_delta: false,
+            reconciliation_only: false,
             execution: Some(CopyExecutionResult {
                 request,
                 state: CopyExecutionState::Unknown,
@@ -1001,6 +1046,69 @@ mod tests {
             prior_phases: Vec::new(),
             projected_executions: Vec::new(),
         })
+    }
+
+    #[test]
+    fn reconciliation_fence_is_replay_safe_and_blocks_the_next_adjust_phase()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("copy-jobs.jsonl");
+        let scope = binding()?;
+        let job = durable_unknown_job()?;
+        let job_id = "copy-job".to_owned();
+        let request = job.request.clone().ok_or("fixture request missing")?;
+        let execution = job.execution.clone().ok_or("fixture execution missing")?;
+        let mut journal = CopyDeliveryJournal::recover(&path, scope.clone())?;
+        journal.retain_delivery(job_id.clone(), job.turn, job.relation)?;
+        journal.persist_request(job_id.clone(), request.clone())?;
+        journal.persist_actor_applied(job_id.clone(), 2)?;
+        journal.persist_execution(job_id.clone(), execution)?;
+        journal.freeze_cross_zero_continuation(job_id.clone())?;
+        journal.freeze_cross_zero_continuation(job_id.clone())?;
+        drop(journal);
+
+        let mut recovered = CopyDeliveryJournal::recover(&path, scope)?;
+        let durable = recovered.jobs().get(&job_id).ok_or("fenced job missing")?;
+        assert!(durable.reconciliation_only);
+        assert_eq!(durable.request.as_ref(), Some(&request));
+        assert_eq!(
+            recovered.persist_next_adjust_phase(job_id.clone(), request.clone()),
+            Err(CopyDeliveryJournalError::Conflict)
+        );
+        assert_eq!(
+            recovered
+                .jobs()
+                .get(&job_id)
+                .and_then(|durable| durable.request.as_ref()),
+            Some(&request)
+        );
+
+        let legacy_job = durable_unknown_job()?;
+        let legacy_relation_id = legacy_job.relation.relation.relation_id.clone();
+        let legacy_checkpoint = StoredCheckpoint {
+            schema_version: SCHEMA_VERSION,
+            binding: binding()?,
+            segment: 1,
+            relations: BTreeMap::from([(legacy_relation_id, legacy_job.relation.clone())]),
+            jobs: BTreeMap::from([(job_id, legacy_job)]),
+        };
+        let mut old_json = serde_json::to_value(legacy_checkpoint)?;
+        old_json
+            .get_mut("jobs")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|jobs| jobs.get_mut("copy-job"))
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("durable job encoding changed")?
+            .remove("reconciliation_only");
+        let restored: StoredCheckpoint = serde_json::from_value(old_json)?;
+        assert!(
+            !restored
+                .jobs
+                .get("copy-job")
+                .ok_or("legacy checkpoint job missing")?
+                .reconciliation_only
+        );
+        Ok(())
     }
 
     #[test]

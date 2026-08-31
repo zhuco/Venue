@@ -478,6 +478,7 @@ VenueFlow 的 Trade Dock 同样只提交语义 `TradeIntent`：按钮和热键�
 Copy delivery 的 semantic Applied 只能表示 Actor 已耐久接收目标。Node 必须继续生成 follower 账户意图，经风险、Owner、同一 WAL、
 唯一 writer 和 adapter dispatch，再以更新签名私有事实写回执行状态、ledger 和 drift。跨零反向先 reduce-only 到零并等待新事实；
 任一 Unknown 禁止重投旧 child。具体阶段和 Web 页面依赖查 `UNIFIED_GATEWAY_WEB_MIGRATION.md`。
+Copy Install 的领取租期精确截断于 immutable job 截止时间，不改变原执行有效期；已领取任务过期后仍可获得完整只读对账窗口。ReconcileOnly 只能用同一 delivery、原 WAL/request、精确成交与更新签名仓位回传最终 Adjust 的 Reconciled，不能把中间归零当作完整目标完成，也不能借对账继续反向增险。Control 同时核验原始执行投影与 delivery receipt 后才进入 ledger。
 
 ## 12. 验收标准
 

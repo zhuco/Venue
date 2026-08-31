@@ -4,6 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,12 +12,15 @@ use venue_control_protocol::{
     ACCOUNT_DELIVERY_SCHEMA_VERSION, AccountDeliveryClaim, AccountDeliveryLease,
     AccountDeliveryPayload, AccountDeliveryPurpose, CONTROL_SCHEMA_VERSION, ControlAction,
     ControlCommandRequest, CopyLifecyclePolicy, CopyRelationBinding, CopyRelationConfig,
-    CopyRelationRecord, CopyRiskPolicy,
+    CopyRelationRecord, CopyRiskPolicy, CopySemanticJobDelivery,
 };
-use venue_copy::{AuthoritativePositionSnapshot, DeliveryBinding, RelationCommitment};
+use venue_copy::{
+    AuthoritativePositionSnapshot, CopyAction, CopyIdentityInput, DeliveryBinding,
+    FollowerDeliveryManifest, RelationCommitment, TargetExposurePlan, derive_copy_identities,
+};
 use venue_domain::{
-    Asset, Fill, InstrumentIdentity, MarketKind, NativeOrderFamily, OrderOwner, OrderSide,
-    OrderState, PositionSide, Price,
+    Asset, ExecutionCommand, Fill, InstrumentIdentity, MarketKind, NativeOrderFamily, OrderCommand,
+    OrderOwner, OrderSide, OrderState, PositionSide, Price,
 };
 use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
 use venue_runtime::{
@@ -927,6 +931,532 @@ async fn fresh_copy_follower_bootstrap_publishes_planning_without_a_control_job(
     Ok(())
 }
 
+#[derive(Default)]
+struct CopyGatewayState {
+    dispatches: usize,
+    generation: u64,
+    command: Option<ExecutionCommand>,
+    unknown: bool,
+    open: bool,
+    filled: rust_decimal::Decimal,
+    fill_time_ms: Option<u64>,
+}
+
+struct CopyGateway {
+    binding: GatewayBinding,
+    state: Arc<std::sync::Mutex<CopyGatewayState>>,
+}
+
+impl AccountPhysicalGateway for CopyGateway {
+    type Error = io::Error;
+
+    fn binding(&self) -> &GatewayBinding {
+        &self.binding
+    }
+
+    fn reconcile(
+        &mut self,
+        request: &AccountRecoveryRequest,
+    ) -> Result<AccountRecoveryReport, Self::Error> {
+        AccountRecoveryReport::new(
+            self.binding.clone(),
+            now_ms().map_err(|_| io::Error::other("clock"))?,
+            request
+                .unresolved()
+                .iter()
+                .map(|command| AccountRecoveryOutcome::still_unknown(command.command_id().clone()))
+                .collect(),
+        )
+        .map_err(io::Error::other)
+    }
+
+    fn risk_evidence(&mut self) -> Result<AccountRiskEvidence, AccountHostValidationError> {
+        AccountRiskEvidence::complete(
+            self.binding.clone(),
+            now_ms().map_err(|_| AccountHostValidationError::RiskEvidence)?,
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn normalize_limit_intent(
+        &mut self,
+        intent: &venue_runtime::AccountLimitNormalizationIntent,
+    ) -> Result<ExecutionCommand, AccountHostValidationError> {
+        Ok(ExecutionCommand::PlaceLimit(OrderCommand {
+            time_in_force: Default::default(),
+            command_id: intent.command_id.clone(),
+            client_order_id: intent.client_order_id.clone(),
+            owner: intent.owner.clone(),
+            side: intent.side,
+            position_side: intent.position_side,
+            quantity: intent.quote_delta,
+            limit_price: Price::new(rust_decimal::Decimal::ONE)
+                .map_err(|_| AccountHostValidationError::Command)?,
+            reduce_only: intent.reduce_only,
+        }))
+    }
+
+    fn signed_account_snapshot(
+        &mut self,
+        request: &AccountRecoveryRequest,
+    ) -> Result<SignedAccountSnapshot, AccountHostValidationError> {
+        let observed_ms = now_ms().map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+        state.generation = state.generation.saturating_add(1);
+        let mut orders = Vec::new();
+        let mut fills = Vec::new();
+        let command = state.command.clone();
+        if let Some(ExecutionCommand::PlaceLimit(command)) = command {
+            if state.open {
+                orders.push(SignedAccountOrderFact {
+                    created_at_ms: None,
+                    time_in_force: Some(command.time_in_force),
+                    client_order_id: command.client_order_id.as_str().to_owned(),
+                    venue_order_id: Some("native-copy".to_owned()),
+                    symbol: self.binding.symbol.clone(),
+                    family: NativeOrderFamily::UmOrder,
+                    side: command.side,
+                    position_side: command.position_side,
+                    quantity: command.quantity,
+                    limit_price: Some(command.limit_price.value()),
+                    reduce_only: command.reduce_only,
+                    owner: Some(command.owner.clone()),
+                    external: false,
+                    state: Some(OrderState::New),
+                    filled_quantity: Some(state.filled),
+                });
+            }
+            if !state.filled.is_zero() {
+                let fill_time_ms = *state.fill_time_ms.get_or_insert(observed_ms);
+                fills.push(Fill {
+                    fill_id: "copy-reconcile-fill".to_owned(),
+                    execution_sequence: FieldState::Missing,
+                    order_id: "native-copy".to_owned(),
+                    symbol: self.binding.symbol.clone(),
+                    side: command.side,
+                    position_side: FieldState::Known(command.position_side),
+                    quantity: state.filled,
+                    price: command.limit_price,
+                    fee: FieldState::Missing,
+                    realized_pnl: FieldState::Missing,
+                    maker: FieldState::Known(true),
+                    exchange_time_ms: Some(fill_time_ms),
+                });
+            }
+        }
+        let long = state.filled.max(rust_decimal::Decimal::ZERO);
+        let short = (-state.filled).max(rust_decimal::Decimal::ZERO);
+        let unknown = state.unknown;
+        SignedAccountSnapshot::complete_with_fills(
+            self.binding.clone(),
+            observed_ms,
+            1,
+            state.generation,
+            1,
+            SignedAccountPositionMode::Hedge,
+            orders,
+            vec![
+                SignedAccountPositionFact {
+                    symbol: self.binding.symbol.clone(),
+                    position_side: PositionSide::Long,
+                    quantity: long,
+                    entry_price: Some(rust_decimal::Decimal::ONE),
+                    mark_price: Some(rust_decimal::Decimal::ONE),
+                },
+                SignedAccountPositionFact {
+                    symbol: self.binding.symbol.clone(),
+                    position_side: PositionSide::Short,
+                    quantity: short,
+                    entry_price: None,
+                    mark_price: Some(rust_decimal::Decimal::ONE),
+                },
+            ],
+            fills,
+            format!("copy:{}", state.generation),
+            request
+                .unresolved()
+                .iter()
+                .map(|command| venue_runtime::SignedUnknownFact {
+                    command_id: command.command_id().clone(),
+                    result: if unknown {
+                        venue_runtime::SignedUnknownResult::Unknown
+                    } else {
+                        venue_runtime::SignedUnknownResult::Accepted {
+                            venue_order_id: "native-copy".to_owned(),
+                        }
+                    },
+                })
+                .collect(),
+        )
+        .map_err(|_| AccountHostValidationError::SignedSnapshot)?
+        .with_balances(vec![SignedAccountBalance {
+            asset: Asset::new("USDT").map_err(|_| AccountHostValidationError::SignedSnapshot)?,
+            equity: rust_decimal::Decimal::from(100),
+            available_margin: Some(rust_decimal::Decimal::from(100)),
+        }])
+    }
+
+    fn current_instrument(
+        &mut self,
+    ) -> Result<AccountInstrumentIdentity, AccountHostValidationError> {
+        Ok(AccountInstrumentIdentity {
+            identity: InstrumentIdentity {
+                symbol: self.binding.symbol.clone(),
+                market: MarketKind::LinearPerpetual,
+                settlement_asset: Some(
+                    Asset::new(self.binding.symbol.quote())
+                        .map_err(|_| AccountHostValidationError::Instrument)?,
+                ),
+            },
+            rules_generation: 1,
+        })
+    }
+
+    fn dispatch(&mut self, permit: venue_runtime::AccountDispatchPermit) -> AccountGatewayResult {
+        let Ok(mut state) = self.state.lock() else {
+            return AccountGatewayResult::Unknown;
+        };
+        state.dispatches = state.dispatches.saturating_add(1);
+        state.command = Some(permit.command().clone());
+        state.open = true;
+        if state.unknown {
+            AccountGatewayResult::Unknown
+        } else {
+            AccountGatewayResult::Accepted {
+                venue_order_id: "native-copy".to_owned(),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn copy_reconcile_only_restarts_unknown_child_and_returns_signed_final_adjust()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let binding = GatewayBinding::new(
+        VenueId::Bybit,
+        GatewayMode::Live,
+        ACCOUNT,
+        "DOGE/USDT".parse()?,
+    )?;
+    let now = now_ms().map_err(|_| "clock")?;
+    let identities = derive_copy_identities(&CopyIdentityInput {
+        event_id: [1; 16],
+        source_event_id: [2; 16],
+        follower_account_id: [3; 16],
+        follower_binding_id: [4; 16],
+        leader_order_id: [5; 16],
+        revision: 1,
+        action: CopyAction::New,
+    })?;
+    let relation_ids = derive_copy_identities(&CopyIdentityInput {
+        event_id: [6; 16],
+        source_event_id: [7; 16],
+        follower_account_id: [8; 16],
+        follower_binding_id: [9; 16],
+        leader_order_id: [10; 16],
+        revision: 1,
+        action: CopyAction::New,
+    })?;
+    let symbol: venue_domain::Symbol = "DOGE/USDT".parse()?;
+    let asset = Asset::new("USDT")?;
+    let amount = |value| venue_domain::Amount::new(asset.clone(), value);
+    let mut manifest = FollowerDeliveryManifest {
+        identities,
+        binding: DeliveryBinding {
+            relation: RelationCommitment {
+                relation_id: relation_ids.job_id,
+                revision: 1,
+                policy_digest: [0; 32],
+            },
+            leader_id: relation_ids.planning_snapshot_id,
+            follower_id: relation_ids.child_order_id,
+            follower_binding_id: identities.planning_snapshot_id,
+            follower_instance_id: "copy-follower".to_owned(),
+            account_id: ACCOUNT.to_owned(),
+            instrument: InstrumentIdentity {
+                symbol: symbol.clone(),
+                market: MarketKind::LinearPerpetual,
+                settlement_asset: Some(Asset::new("USDT")?),
+            },
+            policy_id: relation_ids.child_order_id,
+        },
+        plan_digest: [9; 32],
+        snapshot_generation: 2,
+        instrument_generation: 1,
+        issued_at_ms: now.saturating_sub(10),
+        expires_at_ms: now.saturating_add(60_000),
+    };
+    let relation = CopyRelationRecord {
+        revision: 1,
+        relation: CopyRelationConfig {
+            relation_id: manifest.binding.relation.relation_id.to_string(),
+            leader: CopyRelationBinding {
+                venue: VenueId::Bybit,
+                mode: GatewayMode::Live,
+                trading_account_id: "00000000-0000-4000-8000-000000000002".to_owned(),
+                instance_id: "copy-leader".to_owned(),
+                symbol: symbol.clone(),
+            },
+            follower: CopyRelationBinding {
+                venue: VenueId::Bybit,
+                mode: GatewayMode::Live,
+                trading_account_id: ACCOUNT.to_owned(),
+                instance_id: "copy-follower".to_owned(),
+                symbol: symbol.clone(),
+            },
+            allocated_capital: rust_decimal::Decimal::from(100),
+            multiplier: rust_decimal::Decimal::ONE,
+            safety_reserve_rate: rust_decimal::Decimal::ZERO,
+            risk: CopyRiskPolicy {
+                max_total_notional: rust_decimal::Decimal::from(100),
+                max_order_notional: rust_decimal::Decimal::from(100),
+                max_leverage: rust_decimal::Decimal::ONE,
+            },
+            lifecycle: CopyLifecyclePolicy::Active,
+        },
+    };
+    relation.validate()?;
+    manifest.binding.relation.policy_digest = relation.relation.policy_digest();
+    manifest.validate(now)?;
+    let target = TargetExposurePlan {
+        snapshot_generation: manifest.snapshot_generation,
+        exposure_ratio: rust_decimal::Decimal::new(1, 1),
+        safe_available_margin: amount(rust_decimal::Decimal::from(100)),
+        effective_follower_capital: amount(rust_decimal::Decimal::from(100)),
+        target_exposure: amount(rust_decimal::Decimal::from(10)),
+        delta_exposure: amount(rust_decimal::Decimal::from(10)),
+    };
+    let job = CopySemanticJobDelivery {
+        job_id: manifest.identities.job_id.to_string(),
+        job_digest: manifest.plan_digest,
+        symbol: symbol.clone(),
+        manifest: serde_json::to_value(&manifest)?,
+        semantic_job: serde_json::json!({
+            "target": target,
+            "leader_intent": {"kind": "fixture"}
+        }),
+        created_at_ms: manifest.issued_at_ms,
+        expires_at_ms: manifest.expires_at_ms,
+    };
+    let delivery = AccountDeliveryBinding {
+        venue: VenueId::Bybit,
+        mode: GatewayMode::Live,
+        trading_account_id: ACCOUNT.to_owned(),
+        symbol: symbol.clone(),
+        instance_id: "copy-follower".to_owned(),
+        config_epoch: 1,
+    };
+    let install = AccountDeliveryClaim {
+        lease: AccountDeliveryLease {
+            schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
+            delivery_id: "copy-reconcile-e2e".to_owned(),
+            binding: delivery.clone(),
+            node_id: "copy-reconcile-node".to_owned(),
+            lease_epoch: 1,
+            leased_at_ms: now.saturating_sub(10),
+            expires_at_ms: now.saturating_add(990),
+            purpose: AccountDeliveryPurpose::Install,
+        },
+        payload: AccountDeliveryPayload::CopySemanticJob(job.clone()),
+    };
+    let reconciliation = AccountDeliveryClaim {
+        lease: AccountDeliveryLease {
+            schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
+            delivery_id: install.lease.delivery_id.clone(),
+            binding: delivery,
+            node_id: "copy-reconcile-node".to_owned(),
+            lease_epoch: 2,
+            // The first receipt is deliberately lost.  This second, exact 1s lease starts only
+            // after the original Install lease has expired; it must not rely on accepting a
+            // ReconcileOnly claim while the old lease remains current.
+            leased_at_ms: now.saturating_add(990),
+            expires_at_ms: now.saturating_add(1_990),
+            purpose: AccountDeliveryPurpose::ReconcileOnly,
+        },
+        payload: AccountDeliveryPayload::CopySemanticJob(job),
+    };
+    let (origin, server) =
+        copy_reconciliation_server(install, reconciliation, relation.clone()).await?;
+    let launch = NodeLaunch::try_parse_from(
+        VenueId::Bybit,
+        [
+            "venue-node-bybit",
+            "--mode",
+            "LIVE",
+            "--trading-account-id",
+            ACCOUNT,
+            "--symbol",
+            "DOGE/USDT",
+            "--artifacts-base",
+            temporary.path().to_str().ok_or("non-utf8 temporary path")?,
+        ],
+    )?;
+    let config_digest = manifest
+        .plan_digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let strategy = crate::NodeRuntimeStrategy {
+        strategy_kind: StrategyKind::Copy,
+        instance_id: "copy-follower".to_owned(),
+        run_id: manifest.binding.follower_binding_id.to_string(),
+        config_digest,
+        config_epoch: 1,
+        symbol,
+        copy_leader_capital: None,
+        grid: None,
+    };
+    let config = NodeRuntimeConfig {
+        version: crate::NODE_RUNTIME_CONFIG_VERSION,
+        mode: GatewayMode::Live,
+        venue: VenueId::Bybit,
+        trading_account_id: ACCOUNT.to_owned(),
+        node_id: "copy-reconcile-node".to_owned(),
+        control: crate::NodeControlLoopConfig {
+            loopback_origin: origin,
+            poll_interval_ms: 10,
+            projection_interval_ms: 10,
+            lease_duration_ms: 1_000,
+            claim_limit: 1,
+        },
+        strategies: vec![strategy.clone()],
+    };
+    config.validate(&binding)?;
+    let state = Arc::new(std::sync::Mutex::new(CopyGatewayState {
+        unknown: true,
+        ..CopyGatewayState::default()
+    }));
+    let first_state = Arc::clone(&state);
+    let first_launch = launch.clone();
+    let first_config = config.clone();
+    let first_strategy = strategy.clone();
+    let first_binding = binding.clone();
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| ControlResidentLoopError::Signal)?;
+        let mut resident = ProductionResident::open(
+            &first_launch,
+            CopyGateway {
+                binding: first_binding,
+                state: first_state,
+            },
+        )
+        .map_err(ControlResidentLoopError::Resident)?;
+        resident
+            .register_actor(
+                first_config
+                    .binding_for(&first_strategy)
+                    .map_err(|_| ControlResidentLoopError::Config)?,
+            )
+            .map_err(ControlResidentLoopError::Resident)?;
+        let mut loopback = ControlResidentLoop::open(&first_launch, &first_config, resident)?;
+        match loopback.tick(&runtime, now) {
+            Err(ControlResidentLoopError::Delivery(ControlDeliveryDriverError::Http(
+                crate::ControlHttpClientError::HttpStatus(503),
+            ))) => Ok(()),
+            Ok(_) => Err(ControlResidentLoopError::Config),
+            Err(error) => Err(error),
+        }
+    })
+    .await??;
+    {
+        let mut gateway = state.lock().map_err(|_| "copy gateway lock poisoned")?;
+        gateway.unknown = false;
+        gateway.open = false;
+        gateway.filled = rust_decimal::Decimal::from(10);
+        gateway.fill_time_ms = None;
+    }
+    tokio::time::sleep(Duration::from_millis(1_150)).await;
+    let second_state = Arc::clone(&state);
+    let second_launch = launch.clone();
+    let second_config = config.clone();
+    let second_strategy = strategy.clone();
+    let second_binding = binding.clone();
+    let restarted = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| ControlResidentLoopError::Signal)?;
+        let mut resident = ProductionResident::open(
+            &second_launch,
+            CopyGateway {
+                binding: second_binding,
+                state: second_state,
+            },
+        )
+        .map_err(ControlResidentLoopError::Resident)?;
+        resident
+            .register_actor(
+                second_config
+                    .binding_for(&second_strategy)
+                    .map_err(|_| ControlResidentLoopError::Config)?,
+            )
+            .map_err(ControlResidentLoopError::Resident)?;
+        let mut loopback = ControlResidentLoop::open(&second_launch, &second_config, resident)?;
+        assert_eq!(
+            loopback
+                .copy_jobs
+                .get("copy-follower")
+                .and_then(|journal| journal.jobs().get(&identities.job_id.to_string()))
+                .and_then(|job| job.execution.as_ref())
+                .map(|execution| execution.state),
+            Some(venue_copy::CopyExecutionState::Unknown)
+        );
+        loopback.tick(&runtime, now.saturating_add(1_150))?;
+        Ok::<_, ControlResidentLoopError>(loopback)
+    })
+    .await??;
+    let requests = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .map_err(|_| "copy reconciliation server timed out")???;
+    let receipts = requests
+        .iter()
+        .filter(|(path, _)| path == "/v2/account-node/deliveries/receipts")
+        .map(|(_, body)| {
+            serde_json::from_slice::<venue_control_protocol::AccountDeliveryReceipt>(body)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(
+        receipts.last().map(|receipt| receipt.state),
+        Some(venue_control_protocol::AccountDeliveryReceiptState::Reconciled)
+    );
+    let recovered = restarted
+        .copy_jobs
+        .get("copy-follower")
+        .and_then(|journal| journal.jobs().get(&identities.job_id.to_string()))
+        .ok_or("recovered copy journal missing")?;
+    let position = recovered
+        .execution
+        .as_ref()
+        .and_then(|execution| execution.reconciled_position.as_ref())
+        .ok_or("signed reconciled position missing")?;
+    assert!(
+        position.generation
+            > recovered
+                .request
+                .as_ref()
+                .ok_or("request missing")?
+                .position_generation
+    );
+    assert_eq!(
+        state
+            .lock()
+            .map_err(|_| "copy gateway lock poisoned")?
+            .dispatches,
+        1
+    );
+    Ok(())
+}
+
 #[test]
 fn flatten_physically_cancels_then_reduces_only_after_signed_zero()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1223,7 +1753,7 @@ fn reconciled_copy_fills_share_signed_identity_and_keep_each_completed_phase()
         price: fill.price.value(),
         execution_sequence: Some(7),
         occurred_ms: 100,
-        signed_generation: position.generation,
+        signed_generation: position.generation.saturating_add(1),
         fact_digest: projection_digest_for("fill", &fill)?,
     };
     let mut facts = vec![direct.clone()];
@@ -1256,6 +1786,25 @@ fn reconciled_copy_fills_share_signed_identity_and_keep_each_completed_phase()
         100,
     )?;
     assert_eq!(facts.len(), 1);
+    assert_eq!(
+        facts[0].signed_generation,
+        position.generation.saturating_add(1)
+    );
+
+    let mut conflicting = fill.clone();
+    conflicting.quantity = 2.into();
+    assert!(matches!(
+        append_reconciled_copy_fill_set(
+            &mut facts,
+            &mut known,
+            &reconciled,
+            &position,
+            std::slice::from_ref(&conflicting),
+            &binding,
+            100,
+        ),
+        Err(ControlResidentLoopError::ProjectionEncoding)
+    ));
 
     let mut prior_only = fill;
     prior_only.fill_id = "copy-fill-prior".to_owned();
@@ -1307,6 +1856,65 @@ async fn server(
                 body.clone()
             };
             stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).as_bytes()).await?;
+            stream.write_all(&response).await?;
+            stream.shutdown().await?;
+            paths.push((path, body));
+        }
+        Ok(paths)
+    });
+    Ok((format!("http://{address}/"), handle))
+}
+
+async fn copy_reconciliation_server(
+    install: AccountDeliveryClaim,
+    reconciliation: AccountDeliveryClaim,
+    relations: CopyRelationRecord,
+) -> Result<
+    (
+        String,
+        tokio::task::JoinHandle<Result<Vec<(String, Vec<u8>)>, io::Error>>,
+    ),
+    io::Error,
+> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let handle = tokio::spawn(async move {
+        let mut paths = Vec::new();
+        let mut claims = vec![install, reconciliation].into_iter();
+        let mut first_receipt_is_lost = true;
+        for _ in 0..8 {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "copy test request timed out")
+                })??;
+            let (path, body) = request(&mut stream).await?;
+            let (status, response) = if path.ends_with("/claim") {
+                (
+                    "200 OK",
+                    serde_json::to_vec(&claims.next().into_iter().collect::<Vec<_>>())
+                        .map_err(io::Error::other)?,
+                )
+            } else if path == "/v2/copy/relations" {
+                (
+                    "200 OK",
+                    serde_json::to_vec(&vec![relations.clone()]).map_err(io::Error::other)?,
+                )
+            } else if path == "/v2/account-node/deliveries/receipts" && first_receipt_is_lost {
+                first_receipt_is_lost = false;
+                ("503 Service Unavailable", Vec::new())
+            } else {
+                ("200 OK", body.clone())
+            };
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        response.len()
+                    )
+                    .as_bytes(),
+                )
+                .await?;
             stream.write_all(&response).await?;
             stream.shutdown().await?;
             paths.push((path, body));

@@ -25,6 +25,9 @@ use venue_domain::Symbol;
 const ACCOUNT: &str = "00000000-0000-4000-8000-000000000032";
 const NODE: &str = "venue-node-goal32";
 
+#[path = "control_delivery_claim_window_tests.rs"]
+mod claim_window;
+
 #[derive(Clone, Default)]
 struct MemoryJournal {
     records: Arc<Mutex<Vec<ControlDeliveryJournalRecord>>>,
