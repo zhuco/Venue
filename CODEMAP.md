@@ -40,7 +40,7 @@ Web 的 Control 用户会话只在 BFF 环境注入，HTTP/SSE 同时保留 Cont
 | Control 服务核心 | `apps/venue-control/src/lib.rs` | Control 命令、本地 HTTP/SSE `/v2`、PostgreSQL fencing delivery lease 及 `account_node_poll.rs` 的 bounded claim/ACK/receipt HTTP 路由已落地；repository 始终重验 LIVE scope/lease/sequence，重复 receipt 幂等且冲突关闭；`/v2/copy/relations` 用 PostgreSQL revision、唯一 follower binding 和 JSON/索引列一致性保存配置；`0014_manual_trade_intent.sql` 与 `0015_accounts.sql` 分别提供手动语义命令及窄账户管理，`accounts/` 和 `http/accounts.rs` 负责密码/会话、API 密文、只读验证与归属校验，见 `ACCOUNT_MANAGEMENT.md`；`venue-copy-worker` 只生成语义 job，mutation authority 恒为 false |
 | Copy 执行结果与耐久记账 | `apps/venue-control/src/{copy_execution_postgres,copy_ledger_postgres,copy_ledger_worker}.rs` | 结果以原 immutable job 校验目标/资产/phase/delta；跨零 Adjust 必须接在已签名归零的 Reduce 后。worker tick 从真实 Node receipt 与最终 Adjust 的 Reconciled 仓位原子生成 canonical receipt、ledger 和 drift；Rejected 只关闭原 delivery，不造 ledger。0013 允许经原 Node receipt 交叉核验的无 Copy consumer claim 终态；暂停/过期任务仍可记账但不生成新增风险授权，缺 Node receipt 暂不处理 |
 | Copy 自动规划事实与冻结输入 | `apps/venue-node/src/control_loop/copy_planning.rs`、`apps/venue-control/src/{copy_planning_postgres,copy_planning_input,copy_planning_repair,copy_leader_postgres}.rs` | Node 用签名仓位/保证金、实时 Instrument 和显式 `copy_leader_capital` 产生外层有界事实；worker 配对当前关系的双边新鲜事实，与不可变 envelope/job/游标同事务提交。原始 leader 敞口与冻结倍率分别保留；未收敛旧任务不生成新风险任务。已记账漂移只能由新鲜事实生成独立修复任务，不能续期旧 child。逐所实际来源及产品端到端仍需验收 |
-| VenueFlow 内部运维客户端 | `apps/venueflow/src/main.rs` | `trading.rs`、`trade_dock.rs` 统一按钮、交易设置与非重复热键为同一 `TradingAction`，设置面板按订单参数/数量预设/快捷键双栏呈现，保存 5 档 quote preset/真实映射，在图表或 DOM 选价并经 Control 提交精确 LIVE `TradeIntent`；切换账户/交易对清除选价，文字输入与非 Trading workspace 屏蔽交易热键。顶部全局作用域栏提供与账户登录无关的行情服务器选择和执行账户入口；`account_center.rs` 与 `account_client.rs` 提供注册/登录、临时凭证输入、绑定/验证/删除及会话级执行账户选择；API 验证与 Node 投影分别展示，详见 `ACCOUNT_MANAGEMENT.md`；`copy_relation_view.rs` 编辑跟单关系；native 用 `Last-Event-ID`、Web 用 `after=` 恢复带 scope 的失效通知 SSE，随后重新查询授权快照；原生端以 `market_client.rs` 提供 Binance LIVE 公共行情、`symbol_picker.rs` 提供整行可点击搜索器，`ui.rs`、`chart.rs` 与 `chart_view.rs` 绘制图表并由 `venue-indicators::chart` 计算指标；Web 保持 Control-only；两端均无账户私流、物理交易客户端、WAL、writer 或 artifacts 写权限，表单凭证不持久化 |
+| VenueFlow 内部运维客户端 | `apps/venueflow/src/main.rs` | `trading.rs`、`trade_dock.rs` 统一按钮、交易设置与非重复热键为同一 `TradingAction`，设置面板按订单参数/数量预设/快捷键双栏呈现，保存 5 档 quote preset/真实映射与选价有效期（默认 10 秒，1–300 秒）；交易面板移除清除/回到市场按钮及对应快捷键入口；图表或 DOM 选价到期自动清空，构造意图前再次检查有效期，修改期限立即清空当前价格，不影响已提交的 GTC 订单；有效选价经 Control 提交精确 LIVE `TradeIntent`；交易对切换统一通过 `model.rs::select_symbol` 立即清除选价、订单选择与待确认操作；无可用交易账户时仍按显示交易对清理，取价及提交动作前再次同步作用域；切换账户清除选价，文字输入与非 Trading workspace 屏蔽交易热键。顶部全局作用域栏提供与账户登录无关的行情服务器选择和执行账户入口；`account_center.rs` 与 `account_client.rs` 提供注册/登录、临时凭证输入、绑定/验证/删除及会话级执行账户选择；API 验证与 Node 投影分别展示，详见 `ACCOUNT_MANAGEMENT.md`；`copy_relation_view.rs` 编辑跟单关系；native 用 `Last-Event-ID`、Web 用 `after=` 恢复带 scope 的失效通知 SSE，随后重新查询授权快照；原生端以 `market_client.rs` 提供 Binance LIVE 公共行情、`symbol_picker.rs` 提供整行可点击搜索器，`ui.rs`、`chart.rs` 与 `chart_view.rs` 绘制图表并由 `venue-indicators::chart` 计算指标；Web 保持 Control-only；两端均无账户私流、物理交易客户端、WAL、writer 或 artifacts 写权限，表单凭证不持久化 |
 | 响应式用户 Web | `apps/venue-web/components/control-console.tsx` | Next.js 16 + React 19 + TypeScript、同源 BFF/session、五视口响应式界面；总览/关系/账户/订单/持仓/成交/签名对账/ledger/drift/风险/语义控制复用 schema v2。`lib/projection-scope.ts` 过滤账户与关系、拒绝模糊回执归属，`lib/decimal.ts` 只作精确显示汇总，`lib/realtime.ts` 与 `app/api/events/route.ts` 管理连续事件、超时和恢复门；`e2e/` 仅为隔离 QA。构建与受控部署见 `apps/venue-web/README.md`；页面已建立不等于服务器/实盘验收完成 |
 | Web/CI 发布门禁 | `.github/workflows/workspace-gates.yml`、`apps/venue-web/scripts/verify-boundary.mjs` | CI 使用六 Node 发布契约，另运行 Web typecheck/unit/build/产物负向扫描和五视口 Playwright。BFF 在运行时同时限制路径与 HTTP method，角色只接受显式自有键；扫描只报告文件和规则名，不回显可疑 secret 内容 |
 | 账户 Execution Lane 调度 | `crates/venue-runtime/src/account_lane.rs` | 纯调度负责 Owner、优先级、单 in-flight 和 Unknown fence，不持有 writer/WAL/client。六个 Node binary 由 Account Runtime 组合它与 `AccountMutationHost`；各策略私流驱动、多 symbol 常驻及逐所生产接管仍须分别验收，不能把本地入口统一等同于实盘准入 |
@@ -62,7 +62,7 @@ Web 的 Control 用户会话只在 BFF 环境注入，HTTP/SSE 同时保留 Cont
 | 网格纯状态机、库存、desired ladder、maker fill/滚动 | `crates/venue-strategies/src/hedged_grid/reducer.rs` | `model.rs` 持久化 fill anchor 与 passive-book fallback 穿价证明；只有 maker 成交驱动，taker 只更新库存与对账 |
 | 高暴露浮盈市价减仓 | `crates/venue-strategies/src/hedged_grid/exposure_guard.rs` | `crates/venue-domain/src/domain/risk_snapshot.rs`、`src/runtime/hedged_grid/{risk_snapshot,shadow_evidence}.rs`、`src/runtime/grid/stage7_exposure.rs`；策略 crate 只产出语义结果，持久化和 mutation 仍由根 runtime 承担 |
 | 风险 Shadow 只读验收 | `src/runtime/grid/stage7_exposure_shadow_verifier.rs` | `src/bin/verify-grid-exposure-shadow.rs`；要求 risk-bound admission，逐条交叉核对同 root 原始引用，再按三所固定 raw tuple 语义重放并精确比较 account/目标 leg；全程无凭证、网络和写入，且不等于风险 Live 准入 |
-| Binance Stage 7 冻结生产入口 | `src/runtime/legacy/hedged_grid_live.rs` | checkpoint/stop 兼容在 `src/runtime/legacy/{hedged_grid_hot_path,hedged_grid_recovery,hedged_grid_support}.rs`，当前实盘入口为 `run_binance_stage7_grid`；迁移前仍受既有 admission/handoff 门禁，统一链接管后退出生产调用 |
+| Binance Stage 7 冻结行为参考 | `src/runtime/legacy/hedged_grid_live.rs` | checkpoint/stop 兼容在 `src/runtime/legacy/{hedged_grid_hot_path,hedged_grid_recovery,hedged_grid_support}.rs`；`run_binance_stage7_grid` 是历史组合函数，根生产 binary 已移除。服务器旧 release 的实际退休仍须独立完成 admission/handoff 与逐所接管，不能由源码入口删除推断 |
 | 三家 Stage 7 冻结 runtime | `src/runtime/grid/stage7_grid.rs` | `stage7_resident/fill_drive/exposure/risk_lane/readback/mutation/retry` 保存当前三所网格热路径和行为证据；完整 maker fill、post-only、完整订单族签名回读、Unknown 与重建语义必须提取为统一 runtime 契约，禁止在该入口新增第二套功能 |
 | Stage 7 冻结 Canary/准入 | `src/runtime/grid/stage7_grid_canary.rs` | `stage7_canary_*` 继续保护迁移期实盘并绑定现有配置摘要；新链完成同等门禁和逐所接管前不得删除 |
 | Stage 7 停止接管、清仓、健康、writer root | `src/runtime/grid/stage7_executable_handoff.rs` | schema-1 同 root 升级及 schema-2 跨主机/root 保仓迁移；`crates/venue-execution/src/canonical_root.rs` 以 `(exchange, trading_account_id)` 而非 symbol/Owner 建立机器级 canonical root 与进程锁，`src/runtime/grid/stage7_writer_registry.rs` 保持原 Stage 7 facade，Stage7、旧网格、Scalping Live、Canary 和可写恢复共用；Stop 与到期 `BlockedUnknown` 共用全订单族签名回读的 WAL 收敛与残仓 custody；最终 handoff 的 lease/readback 不得回退或跨 session；immutable receipt 后精确 fence 旧 lease，只有 receipt 绑定的 executable 可激活下一 writer generation；显式 WAL 封存只允许在签名全族为空、零未决和零本地事务边界执行 |
@@ -108,7 +108,7 @@ Web 的 Control 用户会话只在 BFF 环境注入，HTTP/SSE 同时保留 Cont
 
 | 功能 | 首要入口 | 直接继续 |
 |---|---|---|
-| Scalping 策略 | `crates/venue-strategies/src/scalping/mod.rs` | 纯 model/candidate memory/risk 位于 crate；根 `src/strategy/scalping/{engine,checkpoint}.rs` 保留 runtime/storage 宿主组合 |
+| Scalping 策略 | `crates/venue-strategies/src/scalping/mod.rs` | 纯 model/candidate memory/risk、engine 和 checkpoint 位于 crate；根 `src/strategy/scalping/{mod,checkpoint}.rs` 仅保留兼容重导出 |
 | Scalping Shadow/Live resident | `src/runtime/scalping/scalping_resident_process.rs` | `src/runtime/scalping/{scalping_resident,scalping_live_driver,scalping_live_gateway,scalping_live_exit}.rs`；Live gateway 的未知命令恢复与单元测试分别在同目录的 `scalping_live_gateway_recovery.rs`、`scalping_live_gateway_tests.rs`，公开 API 仍由 `runtime` facade 统一导出 |
 | 控制目标与自动编排 | `src/runtime/scalping/scalping_control.rs` | `src/runtime/scalping/binance_auto_shadow.rs` |
 | 公共行情、订单簿、记录与回放 | `src/market/mod.rs` | `src/market/{session,orderbook,recorder,replay}.rs`；`orderbook.rs` 是 `venue-indicators` 的兼容重导出 |
@@ -116,6 +116,9 @@ Web 的 Control 用户会话只在 BFF 环境注入，HTTP/SSE 同时保留 Cont
 | Binance 候选扫描 | `src/market/scanner.rs` | `src/exchange/binance/market_scan.rs`、`src/runtime/scalping/binance_market_scan.rs` |
 
 ## 测试定位
+
+默认按影响面分层验证，不在每次局部修改后重复全工作区回归。UI 局部改动验证客户端及相应交互；单模块修改验证该模块及直接契约；交易安全修改覆盖受影响的风险、WAL、Unknown、恢复和 adapter 路径。
+跨模块契约、依赖变化、架构合并或发布前集中建立全工作区通过基线。基线通过后的增量只重跑受影响专项；纯文档、注释或 lint 标注只做对应静态检查，不使既有业务测试结果失效。记录验证对应的提交/源码范围，构建缓存疑似串用时采用 `G:\Build\Venue` 下隔离子目录，不清空共享缓存。
 
 - 网格 reducer/风险状态测试：`crates/venue-strategies/src/hedged_grid/{reducer_tests,exposure_guard,recovery_tests}.rs`。
 - 交易所 adapter 测试：`src/exchange/{binance,bitget,gate,grid}/` 内的测试文件及各交易所直接测试模块。
@@ -126,6 +129,6 @@ Web 的 Control 用户会话只在 BFF 环境注入，HTTP/SSE 同时保留 Cont
 - Node CLI、配置：`apps/venue-node/src/lib.rs`、`apps/venue-node/src/runtime_config.rs` 和 `src/config.rs` 内测试。
 - 执行、恢复、writer：`tests/*recovery*`、`tests/*writer*`、`tests/*canary*`。
 - 行情与存储：`tests/market.rs`、`tests/storage.rs`。
-- Scalping：`src/strategy/scalping/engine_tests.rs`、`src/runtime/scalping/*tests.rs`、`tests/scalping_*` 与 `tests/legacy_scalping_*`。
+- Scalping：`crates/venue-strategies/src/scalping/engine_tests.rs`、`src/runtime/scalping/*tests.rs`、`tests/scalping_*` 与 `tests/legacy_scalping_*`。
 
 `bak/` 仅在用户点名迁移旧行为时按具体入口只读；不得递归扫描、修改或作为运行时依赖。

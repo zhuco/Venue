@@ -359,6 +359,7 @@ impl AppModel {
         // Persisted UI selection is not a restored authenticated session.
         preferences.execution_account_id = None;
         preferences.selected_instance = None;
+        preferences.trading.normalize_price_validity();
         if preferences.chart.validate().is_err() {
             preferences.chart = crate::chart_settings::ChartDisplaySettings::default();
         }
@@ -477,7 +478,7 @@ impl AppModel {
         if self.preferences.selected_symbol.trim().is_empty()
             && let Some(first) = snapshot.markets.first()
         {
-            self.preferences.selected_symbol = first.symbol.to_string();
+            self.select_symbol(first.symbol.to_string());
         }
         self.snapshot = Some(snapshot);
         self.synchronize_trading_scope();
@@ -656,6 +657,15 @@ impl AppModel {
             .cloned()
     }
 
+    pub fn select_symbol(&mut self, symbol: String) {
+        if self.preferences.selected_symbol != symbol {
+            self.preferences.selected_symbol = symbol;
+            self.trade_dock.clear_selection();
+            self.pending_confirmation = None;
+            self.synchronize_trading_scope();
+        }
+    }
+
     pub fn synchronize_trading_scope(&mut self) {
         let scope = self
             .selected_trading_strategy()
@@ -664,15 +674,34 @@ impl AppModel {
                 trading_account_id: strategy.trading_account_id,
                 symbol: strategy.symbol.to_string(),
             });
-        self.trade_dock.observe_scope(scope);
+        self.trade_dock
+            .observe_scope(&self.preferences.selected_symbol, scope);
     }
 
-    pub fn select_trading_price(&mut self, symbol: &str, price: Decimal) {
+    pub fn refresh_trading_price(&mut self, context: &egui::Context) {
+        let now = context.input(|input| input.time);
+        let validity_seconds = self.preferences.trading.price_validity_seconds;
+        self.trade_dock.expire_price(now, validity_seconds);
+        if let Some(remaining) = self
+            .trade_dock
+            .price_remaining_seconds(now, validity_seconds)
+        {
+            context.request_repaint_after(std::time::Duration::from_secs_f64(remaining));
+        }
+    }
+
+    pub fn select_trading_price(&mut self, symbol: &str, price: Decimal, context: &egui::Context) {
         if symbol != self.preferences.selected_symbol {
             return;
         }
-        if let Err(error) = self.trade_dock.select_price(price) {
+        self.synchronize_trading_scope();
+        if let Err(error) = self
+            .trade_dock
+            .select_price(price, context.input(|input| input.time))
+        {
             self.notice(error.to_string());
+        } else {
+            context.request_repaint();
         }
     }
 
@@ -721,7 +750,7 @@ impl AppModel {
     ) {
         self.preferences.selected_copy_relation = Some(relation_id.to_owned());
         self.preferences.selected_instance = Some(follower_instance_id.to_owned());
-        self.preferences.selected_symbol = symbol.to_owned();
+        self.select_symbol(symbol.to_owned());
     }
 
     pub fn notice(&mut self, message: impl Into<String>) {
@@ -788,6 +817,85 @@ mod tests {
             preferences.favorite_symbols,
             DEFAULT_FAVORITE_SYMBOLS.map(str::to_owned)
         );
+    }
+
+    #[test]
+    fn symbol_switch_immediately_clears_selection_without_an_execution_account() {
+        let context = egui::Context::default();
+        let mut model = AppModel::new(Preferences::default());
+        let price = Decimal::from(100);
+        assert!(model.selected_trading_strategy().is_none());
+        model.select_trading_price("BTC/USDC", price, &context);
+        model.trade_dock.selected_order_id = Some("old-order".to_owned());
+        model.trade_dock.armed_action = Some(venue_control_protocol::TradingAction::OpenLong);
+        model.select_symbol("BTC/USDC".to_owned());
+        assert_eq!(model.trade_dock.selected_price, Some(price));
+
+        model.select_symbol("ETH/USDC".to_owned());
+        assert_eq!(model.trade_dock.selected_price, None);
+        assert_eq!(model.trade_dock.selected_order_id, None);
+        assert_eq!(model.trade_dock.armed_action, None);
+        assert_eq!(model.trade_dock.highlighted_price(&context), None);
+        model.select_trading_price("BTC/USDC", price, &context);
+        assert_eq!(model.trade_dock.selected_price, None);
+
+        model.select_symbol("BTC/USDC".to_owned());
+        assert_eq!(model.trade_dock.selected_price, None);
+        model.select_trading_price("BTC/USDC", price, &context);
+        model.synchronize_trading_scope();
+        assert_eq!(model.trade_dock.selected_price, Some(price));
+    }
+
+    #[test]
+    fn scope_synchronization_clears_price_after_a_direct_preference_change() {
+        let context = egui::Context::default();
+        let mut model = AppModel::new(Preferences::default());
+        model.select_trading_price("BTC/USDC", Decimal::from(100), &context);
+        model.preferences.selected_symbol = "ETH/USDC".to_owned();
+        model.synchronize_trading_scope();
+        assert!(model.selected_trading_strategy().is_none());
+        assert_eq!(model.trade_dock.selected_price, None);
+    }
+
+    #[test]
+    fn price_expiry_clears_the_value_without_pointer_or_market_events() {
+        let context = egui::Context::default();
+        let mut model = AppModel::new(Preferences::default());
+        model.preferences.trading.price_validity_seconds = 3;
+        let price = Decimal::from(100);
+        for time in [1.0, 2.0, 3.5, 4.0, 100.0] {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ui| {
+                    if time == 1.0 {
+                        model.select_trading_price("BTC/USDC", price, ui.ctx());
+                    }
+                    model.refresh_trading_price(ui.ctx());
+                    assert_eq!(
+                        model.trade_dock.selected_price,
+                        (time < 4.0).then_some(price)
+                    );
+                    if time >= 3.5 {
+                        assert_eq!(model.trade_dock.highlighted_price(ui.ctx()), None);
+                    }
+                },
+            );
+            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn invalid_saved_price_validity_uses_the_safe_default() {
+        for seconds in [0, 301, u16::MAX] {
+            let mut preferences = Preferences::default();
+            preferences.trading.price_validity_seconds = seconds;
+            assert!(!preferences.trading.validate());
+            let model = AppModel::new(preferences);
+            assert_eq!(model.preferences.trading.price_validity_seconds, 10);
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -862,11 +970,15 @@ mod tests {
 
     #[test]
     fn selecting_a_copy_relation_updates_only_local_view_selection() {
+        let context = egui::Context::default();
         let mut model = AppModel::new(Preferences::default());
+        model.select_trading_price("BTC/USDT", Decimal::from(100), &context);
+        model.trade_dock.selected_order_id = Some("old-order".to_owned());
+        model.trade_dock.armed_action = Some(venue_control_protocol::TradingAction::OpenLong);
         model.select_copy_relation(
             "00000000-0000-4000-8000-000000000003",
             "copy-btc",
-            "BTC/USDT",
+            "ETH/USDT",
         );
 
         assert_eq!(
@@ -877,7 +989,10 @@ mod tests {
             model.preferences.selected_instance.as_deref(),
             Some("copy-btc")
         );
-        assert_eq!(model.preferences.selected_symbol, "BTC/USDT");
+        assert_eq!(model.preferences.selected_symbol, "ETH/USDT");
+        assert_eq!(model.trade_dock.selected_price, None);
+        assert_eq!(model.trade_dock.selected_order_id, None);
+        assert_eq!(model.trade_dock.armed_action, None);
     }
 
     #[test]

@@ -77,6 +77,8 @@ fn blank_columns_select_the_entire_row_and_star_only_changes_favorite() -> Resul
     for target in ["blank", "symbol", "star"] {
         let context = egui::Context::default();
         let mut model = AppModel::new(Preferences::default());
+        let selected_price = rust_decimal::Decimal::from(100);
+        model.select_trading_price("BTC/USDC", selected_price, &context);
         let mut workspaces = Workspaces::default();
         let mut open = true;
         for _ in 0..3 {
@@ -109,6 +111,7 @@ fn blank_columns_select_the_entire_row_and_star_only_changes_favorite() -> Resul
         click(&context, &mut model, &mut workspaces, &mut open, point);
         if target == "star" {
             assert_eq!(model.preferences.selected_symbol, "BTC/USDC");
+            assert_eq!(model.trade_dock.selected_price, Some(selected_price));
             assert!(
                 !model
                     .preferences
@@ -122,6 +125,8 @@ fn blank_columns_select_the_entire_row_and_star_only_changes_favorite() -> Resul
                 "hit target {target}"
             );
             assert!(!open);
+            assert_eq!(model.trade_dock.selected_price, None);
+            assert_eq!(model.trade_dock.highlighted_price(&context), None);
         }
     }
     Ok(())

@@ -33,146 +33,182 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
     let language = model.preferences.language;
     let snapshot = model.snapshot.as_ref();
     let account = selected_account(snapshot, model.preferences.execution_account_id.as_deref());
-    let current = fresh(snapshot, account, super::now_ms());
+    let current = fresh(snapshot, account, super::now_ms()) && model.snapshot_online;
+    let node_key = if model.preferences.execution_account_id.is_none() {
+        TextKey::NoAccountShort
+    } else if account.is_none() {
+        TextKey::AwaitingNode
+    } else if !current || model.control_connection != Some(ConnectionState::Live) {
+        TextKey::Stale
+    } else if account.is_some_and(|a| a.private_generation == 0 || a.writer_generation == 0) {
+        TextKey::Pending
+    } else {
+        match account.map(|a| a.health) {
+            Some(HealthState::Healthy) => TextKey::Healthy,
+            Some(HealthState::Recovering) => TextKey::Recovering,
+            Some(HealthState::NeedsAttention) => TextKey::NeedsAttention,
+            Some(HealthState::Stopped) => TextKey::Stopped,
+            _ => TextKey::Unknown,
+        }
+    };
+    let mut node_hint = text(language, TextKey::NodeStatusHint).to_owned();
+    if let Some(error) = &model.last_error {
+        node_hint.push_str(&format!("\n{error}"));
+    }
+    if let Some(receipt) = model.last_terminal_receipt() {
+        node_hint.push_str(&format!(
+            "\n{}: {:?} · {}",
+            text(language, TextKey::Receipt),
+            receipt.state,
+            receipt.receipt_id
+        ));
+    }
+    let account_id = model
+        .preferences
+        .execution_account_id
+        .as_deref()
+        .unwrap_or("—");
+    let funds_hint = format!(
+        "{}: {account_id}\n{}",
+        text(language, TextKey::Account),
+        text(language, TextKey::FundsHint)
+    );
     egui::Frame::new()
         .fill(theme::BG_SECONDARY)
-        .inner_margin(egui::Margin::symmetric(10, 4))
+        .inner_margin(egui::Margin::symmetric(10, 3))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
             ui.spacing_mut().interact_size.y = 18.0;
-            ui.horizontal(|ui| {
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    use crate::market::MarketStatus;
-                    let market = model
-                        .local_markets
-                        .view_for_symbol(&model.preferences.selected_symbol);
-                    let status = market.map(|market| market.status);
-                    let live = status == Some(MarketStatus::Live);
-                    let key = match status {
-                        Some(MarketStatus::Live) => TextKey::Online,
-                        Some(MarketStatus::LoadingHistory) => TextKey::LoadingHistory,
-                        Some(MarketStatus::Connecting) => TextKey::Connecting,
-                        Some(MarketStatus::Resyncing) => TextKey::Resyncing,
-                        Some(MarketStatus::Stale) => TextKey::Stale,
-                        _ => TextKey::Offline,
-                    };
-                    let delay = market
-                        .filter(|_| live)
-                        .and_then(|market| market.latency_ms)
-                        .map_or_else(|| "—".to_owned(), |ms| format!("{ms} ms"));
-                    ui.label(
-                        RichText::new(format!(
-                            "● Binance {} · {} {delay}",
-                            text(language, key),
-                            text(language, TextKey::MarketDelay)
-                        ))
-                        .size(12.0)
-                        .color(if live {
-                            theme::BUY
-                        } else {
-                            theme::WARNING
-                        }),
-                    )
-                    .on_hover_text(text(language, TextKey::MarketDelayHint));
-                }
-                #[cfg(target_arch = "wasm32")]
-                ui.small(text(language, TextKey::WebControlOnly));
-                ui.separator();
-                ui.small("Control")
-                    .on_hover_text(super::endpoint_label(&model.preferences.endpoint));
-                super::connection_badge(ui, model.connection, language);
-                ui.separator();
-                let node_key = if model.preferences.execution_account_id.is_none() {
-                    TextKey::NoExecutionAccount
-                } else if account.is_none() {
-                    TextKey::AwaitingNode
-                } else if !current
-                    || !model.snapshot_online
-                    || model.control_connection != Some(ConnectionState::Live)
-                {
-                    TextKey::Stale
-                } else if account
-                    .is_some_and(|a| a.private_generation == 0 || a.writer_generation == 0)
-                {
-                    TextKey::Pending
-                } else {
-                    match account.map(|account| account.health) {
-                        Some(HealthState::Healthy) => TextKey::Healthy,
-                        Some(HealthState::Recovering) => TextKey::Recovering,
-                        Some(HealthState::NeedsAttention) => TextKey::NeedsAttention,
-                        Some(HealthState::Stopped) => TextKey::Stopped,
-                        _ => TextKey::Unknown,
-                    }
-                };
-                ui.label(
-                    RichText::new(format!(
-                        "{}: {}",
-                        text(language, TextKey::TradeConnection),
-                        text(language, node_key)
-                    ))
-                    .size(12.0)
-                    .color(if node_key == TextKey::Healthy {
-                        theme::BUY
-                    } else {
-                        theme::WARNING
-                    }),
-                )
-                .on_hover_text(text(language, TextKey::NodeStatusHint));
-                if let Some(error) = &model.last_error {
-                    ui.colored_label(theme::SELL, "ⓘ").on_hover_text(error);
-                }
-            });
-            ui.horizontal(|ui| {
-                let account_label = model
-                    .preferences
-                    .execution_account_id
-                    .as_deref()
-                    .map(|id| id.chars().take(24).collect::<String>())
-                    .unwrap_or_else(|| text(language, TextKey::None).to_owned());
-                ui.small(format!(
-                    "{}: {account_label}",
-                    text(language, TextKey::Account)
-                ));
-                ui.separator();
-                for (key, value) in [
-                    (TextKey::Equity, account.and_then(|a| a.equity)),
-                    (
-                        TextKey::AvailableMargin,
-                        account.and_then(|a| a.available_margin),
-                    ),
-                ] {
-                    let amount =
-                        value.map_or_else(|| "—".to_owned(), |value| value.normalize().to_string());
-                    ui.label(
-                        RichText::new(format!("{} {amount}", text(language, key)))
-                            .size(12.0)
-                            .color(if current && model.snapshot_online {
-                                theme::TEXT_PRIMARY
+            let total_width = ui.available_width();
+            egui::containers::Sides::new()
+                .shrink_left()
+                .height(18.0)
+                .show(
+                    ui,
+                    |ui| {
+                        let width = ui.available_width();
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            use crate::market::MarketStatus;
+                            let market = model
+                                .local_markets
+                                .view_for_symbol(&model.preferences.selected_symbol);
+                            let live = market.is_some_and(|m| m.status == MarketStatus::Live);
+                            let status = match market.map(|m| m.status) {
+                                Some(MarketStatus::Live) => TextKey::Online,
+                                Some(MarketStatus::LoadingHistory) => TextKey::LoadingHistory,
+                                Some(MarketStatus::Connecting) => TextKey::Connecting,
+                                Some(MarketStatus::Resyncing) => TextKey::Resyncing,
+                                Some(MarketStatus::Stale) => TextKey::Stale,
+                                _ => TextKey::Offline,
+                            };
+                            let delay = market
+                                .filter(|_| live)
+                                .and_then(|m| m.latency_ms)
+                                .map_or_else(|| "—".to_owned(), |ms| format!("{ms} ms"));
+                            status_text(
+                                ui,
+                                width * 0.40,
+                                format!("● Binance {} · {delay}", text(language, status)),
+                                if live { theme::BUY } else { theme::WARNING },
+                                text(language, TextKey::MarketDelayHint),
+                            );
+                        }
+                        #[cfg(target_arch = "wasm32")]
+                        status_text(
+                            ui,
+                            width * 0.40,
+                            text(language, TextKey::ControlFallback).to_owned(),
+                            theme::TEXT_SECONDARY,
+                            text(language, TextKey::WebControlOnly),
+                        );
+                        let (key, color) = match model.connection {
+                            ConnectionState::Live => (TextKey::Online, theme::BUY),
+                            ConnectionState::Connecting => (TextKey::Connecting, theme::WARNING),
+                            ConnectionState::Degraded => (TextKey::Degraded, theme::WARNING),
+                            ConnectionState::Offline => (TextKey::Offline, theme::SELL),
+                        };
+                        status_text(
+                            ui,
+                            width * 0.22,
+                            format!("Control {}", text(language, key)),
+                            color,
+                            super::endpoint_label(&model.preferences.endpoint),
+                        );
+                        status_text(
+                            ui,
+                            (width * 0.38 - 24.0).max(50.0),
+                            format!(
+                                "{}: {}",
+                                text(language, TextKey::TradeConnection),
+                                text(language, node_key)
+                            ),
+                            if node_key == TextKey::Healthy {
+                                theme::BUY
                             } else {
-                                theme::TEXT_SECONDARY
-                            }),
-                    )
-                    .on_hover_text(text(language, TextKey::FundsHint));
-                }
-                if account.is_some() && (!current || !model.snapshot_online) {
-                    ui.colored_label(theme::WARNING, text(language, TextKey::Stale));
-                }
-                if account.is_some() {
-                    ui.small(text(language, TextKey::ValuationCurrencyMissing))
-                        .on_hover_text(text(language, TextKey::FundsHint));
-                }
-                if let Some(receipt) = model.last_terminal_receipt() {
-                    ui.small(format!(
-                        "{}: {:?}",
-                        text(language, TextKey::Receipt),
-                        receipt.state
-                    ))
-                    .on_hover_text(&receipt.receipt_id);
-                }
-            });
+                                theme::WARNING
+                            },
+                            &node_hint,
+                        );
+                    },
+                    |ui| {
+                        let color = if current {
+                            theme::TEXT_PRIMARY
+                        } else {
+                            theme::TEXT_SECONDARY
+                        };
+                        if account.is_some() && !current {
+                            status_text(
+                                ui,
+                                52.0,
+                                text(language, TextKey::Stale).to_owned(),
+                                theme::WARNING,
+                                &funds_hint,
+                            );
+                        }
+                        // Numeric fields are never rounded to fit; ellipsis exposes the exact value on hover.
+                        for (key, value) in [
+                            (TextKey::Equity, account.and_then(|a| a.equity)),
+                            (
+                                TextKey::MarginShort,
+                                account.and_then(|a| a.available_margin),
+                            ),
+                        ] {
+                            let amount =
+                                value.map_or_else(|| "—".to_owned(), |v| v.normalize().to_string());
+                            let marker = if account.is_some() { "*" } else { "" };
+                            let full = format!("{} {amount}{marker}", text(language, key));
+                            status_text(
+                                ui,
+                                if total_width < 1000.0 { 135.0 } else { 180.0 },
+                                full.clone(),
+                                color,
+                                &format!("{full}\n{funds_hint}"),
+                            );
+                        }
+                        if total_width >= 1150.0 {
+                            status_text(
+                                ui,
+                                110.0,
+                                format!("{}: {account_id}", text(language, TextKey::Account)),
+                                theme::TEXT_SECONDARY,
+                                &funds_hint,
+                            );
+                        }
+                    },
+                );
         });
+}
+
+fn status_text(ui: &mut egui::Ui, width: f32, value: String, color: egui::Color32, tooltip: &str) {
+    ui.add_sized(
+        [width.max(20.0), 18.0],
+        egui::Label::new(RichText::new(value).size(11.0).color(color))
+            .truncate()
+            .halign(egui::Align::Min),
+    )
+    .on_hover_text(tooltip);
 }
 
 #[cfg(test)]

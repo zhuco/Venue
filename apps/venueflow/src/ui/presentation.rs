@@ -109,6 +109,8 @@ mod tests {
         assert_eq!(settings.book_cadence.millis(), 250);
         assert_eq!(settings.tape_cadence.millis(), 500);
         assert_eq!(settings.chart_cadence.millis(), 250);
+        assert_eq!(settings.price_validity_seconds, 10);
+        settings.price_validity_seconds = 3;
         settings.tape_cadence = DisplayCadence::Ms1000;
         let restored = serde_json::from_str::<crate::trading::TradingSettings>(
             &serde_json::to_string(&settings)?,

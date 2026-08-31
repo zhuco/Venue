@@ -256,6 +256,10 @@ fn publish(sender: &Sender<ClientEvent>, context: &egui::Context, event: ClientE
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "thread boundary explicitly transfers the independent channels and session state"
+)]
 fn start_native(
     endpoint: String,
     sender: Sender<ClientEvent>,
@@ -303,6 +307,10 @@ fn start_native(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "runtime boundary keeps the same explicit ownership transfer as the thread boundary"
+)]
 async fn native_loop(
     endpoint: String,
     sender: Sender<ClientEvent>,

@@ -7,7 +7,9 @@ use venue_control::{
     ControlRepository, ControlService, DeliveryStoreResult, MIGRATION_0001, MIGRATION_0002,
     MIGRATION_0003, MIGRATION_0004, MIGRATION_0005, MIGRATION_0006, MIGRATION_0007, MIGRATION_0008,
     MIGRATION_0009, MIGRATION_0010, MIGRATION_0011, MIGRATION_0012, MIGRATION_0013, MIGRATION_0014,
-    PgControlRepository, control_shutdown_channel, serve_local,
+    PgControlRepository,
+    accounts::{AccountService, CredentialCipher},
+    control_shutdown_channel, serve_local_with_accounts,
 };
 use venue_control_protocol::{
     ACCOUNT_DELIVERY_SCHEMA_VERSION, AccountDeliveryAck, AccountDeliveryBinding,
@@ -15,6 +17,7 @@ use venue_control_protocol::{
     CONTROL_SCHEMA_VERSION, CommandState, ConnectionState, ControlAction, ControlCommandRequest,
     ControlSnapshot, ExecutionFactsSnapshot, GatewayMode, HealthState, NodeProjectionEnvelope,
     StrategyKind, StrategyLifecycle, StrategySummary, VenueId,
+    accounts::{AccountErrorCode, AccountErrorResponse, SecretValue},
 };
 
 #[path = "copy_postgres/node_source.rs"]
@@ -260,19 +263,42 @@ async fn postgres_projection_round_trips_over_the_loopback_node_client()
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let (stop, shutdown) = control_shutdown_channel();
-    let server = tokio::spawn(serve_local(
+    let node_token = "fixture-node-token-0123456789abcdef";
+    let accounts = std::sync::Arc::new(AccountService::new_with_node_token(
+        fixture.pool.clone(),
+        CredentialCipher::from_key(&[19; 32])?,
+        Some(SecretValue::new(node_token.to_owned())),
+    )?);
+    let server = tokio::spawn(serve_local_with_accounts(
         listener,
         std::sync::Arc::new(ControlService::new(repository.clone())),
+        accounts,
         ControlHttpConfig::default(),
         shutdown,
     ));
     let projection = projection(1, 1, [31; 32], [0; 32], 100)?;
-    let response = reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .no_proxy()
         .connect_timeout(std::time::Duration::from_secs(3))
         .timeout(std::time::Duration::from_secs(5))
-        .build()?
+        .build()?;
+    for token in [None, Some("wrong-node-token-0123456789abcdef")] {
+        let mut request = client
+            .post(format!("http://{address}/v2/account-node/projection"))
+            .json(&projection);
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await?;
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.json::<AccountErrorResponse>().await?.code,
+            AccountErrorCode::Unauthorized
+        );
+    }
+    let response = client
         .post(format!("http://{address}/v2/account-node/projection"))
+        .bearer_auth(node_token)
         .json(&projection)
         .send()
         .await?;

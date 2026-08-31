@@ -104,8 +104,8 @@ impl<T> DurableDeliveryOutput<T> {
 
 #[derive(Debug)]
 pub enum ClaimAcceptance {
-    Install(DurableDeliveryOutput<AccountDeliveryAck>),
-    Reconcile(ReconciliationTurn),
+    Install(Box<DurableDeliveryOutput<AccountDeliveryAck>>),
+    Reconcile(Box<ReconciliationTurn>),
 }
 
 /// Semantic actor input issued only after the exact ACK was accepted by Control and that
@@ -1242,17 +1242,17 @@ fn acceptance(
 ) -> Result<ClaimAcceptance, ControlDeliveryError> {
     match (&accepted.ack, accepted.claim.lease.purpose) {
         (Some(ack), AccountDeliveryPurpose::Install) => {
-            Ok(ClaimAcceptance::Install(DurableDeliveryOutput {
+            Ok(ClaimAcceptance::Install(Box::new(DurableDeliveryOutput {
                 value: ack.clone(),
                 store_result,
                 durable_sequence: accepted.durable_sequence,
-            }))
+            })))
         }
         (None, AccountDeliveryPurpose::ReconcileOnly) => {
-            Ok(ClaimAcceptance::Reconcile(ReconciliationTurn {
+            Ok(ClaimAcceptance::Reconcile(Box::new(ReconciliationTurn {
                 claim: accepted.claim.clone(),
                 durable_inbox_digest: accepted.durable_inbox_digest,
-            }))
+            })))
         }
         _ => Err(ControlDeliveryError::CorruptJournal),
     }

@@ -51,6 +51,17 @@ impl AccountService {
         let node_token = std::env::var("VENUE_CONTROL_NODE_TOKEN")
             .ok()
             .map(SecretValue::new);
+        Self::new_with_node_token(pool, cipher, node_token)
+    }
+
+    /// Production startup uses [`Self::new`] so the Node credential remains environment-sourced.
+    /// This explicit boundary lets integration tests inject an isolated token without mutating
+    /// process-wide environment state.
+    pub fn new_with_node_token(
+        pool: PgPool,
+        cipher: CredentialCipher,
+        node_token: Option<SecretValue>,
+    ) -> Result<Self, AccountError> {
         Ok(Self {
             pool,
             cipher,
