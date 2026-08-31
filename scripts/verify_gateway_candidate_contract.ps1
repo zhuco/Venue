@@ -3,35 +3,14 @@ param([string]$CargoTargetDir)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-
-$repoRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
-
-if (-not $CargoTargetDir) {
-    $targetParent = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
-        'G:\Build\Venue'
-    } else {
-        $env:CARGO_TARGET_DIR
-    }
-    $CargoTargetDir = Join-Path $targetParent "venue-gateway-candidate-contract-target-$PID"
-}
-$targetRoot = [System.IO.Path]::GetFullPath($CargoTargetDir)
-if ($targetRoot.Equals($repoRoot, [StringComparison]::OrdinalIgnoreCase) -or
-    $targetRoot.StartsWith(
-        $repoRoot + [System.IO.Path]::DirectorySeparatorChar,
-        [StringComparison]::OrdinalIgnoreCase
-    )) {
-    throw '网关候选专项构建目录必须位于 worktree 外。'
-}
-New-Item -ItemType Directory -Path $targetRoot -Force | Out-Null
-$cargoTemp = Join-Path `
-    (Split-Path -Parent $targetRoot) `
-    "$([System.IO.Path]::GetFileName($targetRoot))-tmp"
-New-Item -ItemType Directory -Path $cargoTemp -Force | Out-Null
-$env:CARGO_TARGET_DIR = $targetRoot
-$env:CARGO_INCREMENTAL = '0'
-$env:TEMP = $cargoTemp
-$env:TMP = $cargoTemp
-
+. (Join-Path $PSScriptRoot 'venue_build_guard.ps1')
+$repoRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+$venueBuildLease = Enter-VenueBuildGuard -RepoRoot $repoRoot -Slot 'slot-1' -RequestedTarget $CargoTargetDir
+try {
+$targetRoot = $venueBuildLease.TargetDirectory
+$cargoTemp = $venueBuildLease.TempDirectory
+Push-Location -LiteralPath $repoRoot
+try {
 function Invoke-Cargo {
     param([Parameter(Mandatory)] [string[]]$Arguments)
 
@@ -313,3 +292,5 @@ foreach ($venue in @('binance', 'bitget', 'bybit', 'gate', 'hyperliquid', 'okx')
     shared_host_tests = 'actual venue-node --lib test suite'
     coverage = $matrix
 } | ConvertTo-Json -Depth 5
+} finally { Pop-Location }
+} finally { Exit-VenueBuildGuard $venueBuildLease }
