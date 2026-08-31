@@ -714,12 +714,26 @@ where
     pub async fn poll_raw_frame(
         &mut self,
     ) -> Result<Option<GatePrivateWsFrame>, GateTransportError> {
+        let result = self.poll_raw_frame_inner().await;
+        if result.is_err()
+            && let Some(session) = &self.recovery_session
+        {
+            session.revoke();
+        }
+        result
+    }
+
+    async fn poll_raw_frame_inner(
+        &mut self,
+    ) -> Result<Option<GatePrivateWsFrame>, GateTransportError> {
         if let Some(frame) = self.buffered.pop_front() {
             self.buffered_bytes = self.buffered_bytes.saturating_sub(frame.payload.len());
             return Ok(Some(frame));
         }
         if Instant::now() >= self.next_heartbeat_at {
-            self.send_heartbeat().await?;
+            timeout(PRIVATE_READINESS_TIMEOUT, self.send_heartbeat())
+                .await
+                .map_err(|_| GateTransportError::Timeout)??;
         }
         let message = match timeout(PRIVATE_READINESS_TIMEOUT, self.stream.next()).await {
             Err(_) => return Ok(None),
@@ -743,10 +757,13 @@ where
                 }
             }
             Message::Ping(payload) => {
-                self.stream
-                    .send(Message::Pong(payload))
-                    .await
-                    .map_err(map_websocket)?;
+                timeout(
+                    PRIVATE_READINESS_TIMEOUT,
+                    self.stream.send(Message::Pong(payload)),
+                )
+                .await
+                .map_err(|_| GateTransportError::Timeout)?
+                .map_err(map_websocket)?;
                 Ok(None)
             }
             Message::Pong(_) => Ok(None),
@@ -1567,7 +1584,7 @@ mod tests {
         assert!(replacement.is_current());
         server.await??;
         assert!(matches!(
-            private.next_raw_frame().await,
+            private.poll_raw_frame().await,
             Err(GateTransportError::EndOfStream | GateTransportError::Disconnected)
         ));
         assert!(!replacement.is_current());

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{GatePublicError, parse_regular_order};
+use crate::{GatePublicError, collect_regular_order_pages, parse_regular_order};
 use venue_domain::domain::{CommandId, OrderOwner, OrderPurpose};
 
 const CATALOGUE: &str = r#"[{
@@ -56,6 +56,26 @@ fn signed_snapshot_policy_preserves_missing_and_unrepresented_values() {
         Ok(Some(LimitTimeInForce::PostOnly))
     );
     assert!(snapshot_limit_time_in_force(Some(&Value::Bool(true))).is_err());
+}
+
+#[test]
+fn cancel_lookup_uses_the_parser_canonical_client_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let rules = rules()?;
+    let orders = collect_regular_order_pages(
+        [include_str!("../tests/fixtures/regular_orders.json")],
+        &rules.instrument.symbol,
+        &rules,
+    )?;
+    assert_eq!(
+        regular_venue_order_id_for_client_id(&orders.orders, "hgo_e7_long_open_l1"),
+        Some("9001".to_owned())
+    );
+    assert_eq!(
+        regular_venue_order_id_for_client_id(&orders.orders, "t-hgo_e7_long_open_l1"),
+        None
+    );
+    Ok(())
 }
 
 #[test]

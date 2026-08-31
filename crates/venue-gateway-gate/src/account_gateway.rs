@@ -3,7 +3,7 @@ use crate::{
     GateFillsCursor, GateGatewayBinding, GateHttpTransport, GateMutationDispatch,
     GatePrivateReadSource, GatePrivateReadbackCandidate, GatePublicBinding, GatePublicPayloadKind,
     GatePublicRawPayload, GateRawPrivateResponse, GateTransportError, GateTransportLimits,
-    canonical_client_id_from_native, endpoints, native_client_id, parse_contract_rules,
+    canonical_client_id_from_native, endpoints, parse_contract_rules,
     parse_rest_snapshot, prepare_cancel, prepare_exact_readback_by_client_id, prepare_limit,
     prepare_private_read, prepare_reduce_once, rest_order_book_path, settle_exact_readback,
     validate_private_readback,
@@ -16,7 +16,7 @@ use std::{
 };
 use tokio::runtime::{Builder, Runtime};
 use venue_domain::domain::{
-    ExecutionCommand, FieldState, Fill, LimitTimeInForce, NativeOrderFamily, OrderCommand,
+    ExecutionCommand, FieldState, Fill, LimitTimeInForce, NativeOrderFamily, Order, OrderCommand,
     OrderSide, OrderState, PositionSide, Price, Symbol,
 };
 use venue_execution::{
@@ -154,19 +154,10 @@ impl GateAccountGateway {
                 prepare_reduce_once(&self.binding, &rules, command)
             }
             ExecutionCommand::Cancel(command) => {
-                let native_target = match native_client_id(command.target_client_order_id.as_str())
-                {
-                    Ok(value) => value,
-                    Err(_) => return rejected("gate_cancel_identity"),
-                };
-                let target = self
-                    .private
-                    .order_families
-                    .regular()
-                    .orders
-                    .iter()
-                    .find(|order| matches!(&order.client_order_id, FieldState::Known(value) if value == &native_target))
-                    .map(|order| order.order_id.clone());
+                let target = regular_venue_order_id_for_client_id(
+                    &self.private.order_families.regular().orders,
+                    command.target_client_order_id.as_str(),
+                );
                 match target {
                     Some(venue_order_id) => prepare_cancel(
                         &self.binding,
@@ -260,6 +251,21 @@ impl GateAccountGateway {
         ))?;
         normalize_limit_from_bbo(intent, &rules, bid, ask)
     }
+}
+
+/// Gate's parser removes the exchange-only `t-` transport prefix before exposing a client id.
+/// A Host cancel carries that canonical durable id, so comparing it to a freshly re-prefixed id
+/// would reject every exact owned cancel and strand a rolling grid's replacement transaction.
+fn regular_venue_order_id_for_client_id(
+    orders: &[Order],
+    target_client_id: &str,
+) -> Option<String> {
+    orders
+        .iter()
+        .find(|order| {
+            matches!(&order.client_order_id, FieldState::Known(value) if value == target_client_id)
+        })
+        .map(|order| order.order_id.clone())
 }
 
 impl AccountPhysicalGateway for GateAccountGateway {
