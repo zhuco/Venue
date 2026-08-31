@@ -1014,6 +1014,7 @@ impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
                 &wal_fill_owners,
                 binding,
                 self.resident.strategy_lifecycle(binding),
+                self.resident.scalping_entry_safety_unwired(binding),
                 self.resident.runtime().health(),
                 self.resident.has_unresolved(),
                 generated_ms,
@@ -1177,6 +1178,7 @@ fn projection_from_signed(
     wal_fill_owners: &BTreeMap<(venue_domain::Symbol, String), venue_domain::OrderOwner>,
     binding: &StrategyBinding,
     lifecycle: Option<InstanceLifecycle>,
+    scalping_entry_safety_unwired: bool,
     runtime_health: AccountHealth,
     unresolved: bool,
     generated_ms: u64,
@@ -1299,7 +1301,7 @@ fn projection_from_signed(
     let (long_quantity, short_quantity) =
         position_quantities(signed.positions(), &delivery.symbol)?;
     let health = projection_health(runtime_health, unresolved);
-    let strategy_lifecycle = projection_lifecycle(lifecycle, health);
+    let strategy_lifecycle = projection_lifecycle(lifecycle, health, scalping_entry_safety_unwired);
     let snapshot = ControlSnapshot {
         schema_version: CONTROL_SCHEMA_VERSION,
         generated_ms,
@@ -1339,8 +1341,15 @@ fn projection_from_signed(
             realized_pnl: None,
             unrealized_pnl: None,
             last_receipt_ms: signed.observed_at_ms(),
-            attention: (health != HealthState::Healthy)
-                .then(|| "runtime recovery or unresolved state requires attention".to_owned()),
+            attention: if scalping_entry_safety_unwired
+                && lifecycle == Some(InstanceLifecycle::Running)
+                && health == HealthState::Healthy
+            {
+                Some("scalping entry remains blocked: signed safety and StopMarket protection are unavailable".to_owned())
+            } else {
+                (health != HealthState::Healthy)
+                    .then(|| "runtime recovery or unresolved state requires attention".to_owned())
+            },
         }],
         copy_relations: Vec::new(),
         markets: Vec::new(),
@@ -1435,10 +1444,16 @@ fn projection_health(runtime_health: AccountHealth, unresolved: bool) -> HealthS
 fn projection_lifecycle(
     lifecycle: Option<InstanceLifecycle>,
     health: HealthState,
+    scalping_entry_safety_unwired: bool,
 ) -> StrategyLifecycle {
     match lifecycle {
         Some(InstanceLifecycle::Registered | InstanceLifecycle::Recovering) => {
             StrategyLifecycle::Rebuilding
+        }
+        Some(InstanceLifecycle::Running)
+            if health == HealthState::Healthy && scalping_entry_safety_unwired =>
+        {
+            StrategyLifecycle::NeedsAttention
         }
         Some(InstanceLifecycle::Running) if health == HealthState::Healthy => {
             StrategyLifecycle::Running

@@ -1,25 +1,23 @@
-//! Scalping's production handoff starts only after the feature owner has produced one semantic
-//! proposal. This module deliberately does not turn a reference price into an order: Runtime's
-//! MarketHub has no authority to choose rules, size, hedge leg, or a post-only price. The only
-//! physical translation is the account Host's adapter-owned normalization.
+//! Scalping consumes only the feature source's normalized frames and durably checkpoints its pure
+//! reducer. This module deliberately does not turn a reference price into an order: current Node
+//! lacks signed per-instance safety and exchange StopMarket protection, so every entry is blocked.
 
 use std::{
     num::NonZeroUsize,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::Serialize;
-use sha2::{Digest, Sha256};
 use venue_domain::domain::MarketEvent;
-use venue_domain::domain::{CommandId, OrderOwner, OrderSide, PositionSide};
 use venue_runtime::{
-    AccountLimitNormalizationIntent, AccountPhysicalGateway, StrategyBinding, StrategyKind,
-    account::AccountLanePriority, strategy::AccountMarketEvent,
+    AccountPhysicalGateway, StrategyBinding, StrategyKind, account::InstanceLifecycle,
+    strategy::AccountMarketEvent,
 };
-use venue_strategies::scalping::{Direction, SemanticIntent, SemanticPurpose};
+use venue_strategies::scalping::{
+    LifecycleAuthorization, ProtectionState, SafetyProjection, ScalpingCheckpoint, ScalpingParams,
+    ScalpingStrategy, StrategyBinding as ScalpingStrategyBinding,
+};
 
 use super::{NodeError, ProductionResident, persist_anchor, resident_error};
-use crate::ResidentSemanticIntent;
 
 mod full_snapshot_book;
 
@@ -172,20 +170,99 @@ impl GateScalpingBookBridge {
     }
 }
 
-#[derive(Serialize)]
-struct ScalpingSemanticReplay<'a> {
-    intent: &'a SemanticIntent,
-    observed_at_ms: u64,
+/// Node-owned wrapper around the pure reducer. Physical orders, private facts and execution
+/// authority remain in Runtime/Host; this state is only the reducer's validated checkpoint.
+pub(crate) struct ScalpingBridgeState {
+    engine: ScalpingStrategy,
+    params: ScalpingParams,
+}
+
+impl ScalpingBridgeState {
+    fn restore_or_bootstrap(
+        checkpoint: Option<Vec<u8>>,
+        binding: ScalpingStrategyBinding,
+        params: ScalpingParams,
+    ) -> Result<Self, NodeError> {
+        let engine = match checkpoint {
+            Some(bytes) => {
+                let checkpoint = serde_json::from_slice::<ScalpingCheckpoint>(&bytes)
+                    .map_err(|_| NodeError::ResidentRuntime)?;
+                ScalpingStrategy::restore(binding, params.clone(), checkpoint)
+                    .map_err(|_| NodeError::ResidentRuntime)?
+            }
+            None => ScalpingStrategy::new(binding, params.clone())
+                .map_err(|_| NodeError::ResidentRuntime)?,
+        };
+        Ok(Self { engine, params })
+    }
+
+    fn checkpoint_bytes(&self) -> Result<Vec<u8>, NodeError> {
+        serde_json::to_vec(&self.engine.checkpoint()).map_err(|_| NodeError::ResidentRuntime)
+    }
+
+    fn binding(&self) -> &ScalpingStrategyBinding {
+        self.engine.binding()
+    }
+
+    fn params(&self) -> &ScalpingParams {
+        &self.params
+    }
+}
+
+/// Runtime lifecycle is only one input to the pure reducer. It cannot imply that private signed
+/// safety and exchange protection are present, so the latter are projected independently below.
+struct RuntimeScalpingAuthorization {
+    binding: ScalpingStrategyBinding,
+    running: bool,
+}
+
+impl LifecycleAuthorization for RuntimeScalpingAuthorization {
+    fn is_allowed(&self) -> bool {
+        self.running
+    }
+
+    fn matches_at(&self, binding: &ScalpingStrategyBinding, _decision_at_ms: u64) -> bool {
+        binding == &self.binding
+    }
+
+    fn revision(&self) -> u64 {
+        1
+    }
+
+    fn authority_generation(&self) -> u64 {
+        1
+    }
 }
 
 impl<G: AccountPhysicalGateway> ProductionResident<G> {
-    /// Registers the Runtime actor that owns the one Scalping semantic route.  It has no gateway
-    /// access; subsequent physical work is only available through [`submit_scalping_intent`].
-    pub fn register_scalping_actor(&mut self, binding: StrategyBinding) -> Result<(), NodeError> {
-        if binding.key.strategy_kind != StrategyKind::Scalping {
+    /// Registers the Runtime actor and restores the exact pure reducer checkpoint it owns. A
+    /// generic Runtime binding cannot select a parameter release or substitute checkpoint state.
+    pub fn register_scalping_actor(
+        &mut self,
+        binding: StrategyBinding,
+        scalping_binding: ScalpingStrategyBinding,
+    ) -> Result<(), NodeError> {
+        if binding.key.strategy_kind != StrategyKind::Scalping
+            || self.scalping_bindings.contains_key(&binding.key)
+            || self.scalping_bridges.contains_key(&binding.key)
+            || !scalping_binding_matches_runtime(&scalping_binding, &binding)
+        {
             return Err(NodeError::ResidentRuntime);
         }
+        let params = ScalpingParams::for_binding(&scalping_binding);
+        params
+            .validate_for(&scalping_binding)
+            .map_err(|_| NodeError::ResidentRuntime)?;
         self.register_actor(binding.clone())?;
+        let checkpoint = self
+            .runtime
+            .resident_actor_checkpoint(&binding)
+            .map_err(resident_error)?;
+        let bridge = ScalpingBridgeState::restore_or_bootstrap(
+            checkpoint,
+            scalping_binding,
+            params.clone(),
+        )?;
         if self
             .scalping_bindings
             .insert(binding.key.clone(), binding.clone())
@@ -193,19 +270,11 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         {
             return Err(NodeError::ResidentRuntime);
         }
+        self.scalping_bridges.insert(binding.key.clone(), bridge);
         self.scalping_books
             .insert(binding.key.clone(), venue_indicators::OrderBook::default());
-        self.scalping_features.insert(
-            binding.key.clone(),
-            venue_indicators::ScalpingPublicMarketSource::new(
-                binding.key.symbol.clone(),
-                "node_scalping_v1",
-                feature_profile_digest(&binding),
-                1_000,
-                NonZeroUsize::new(256).ok_or(NodeError::ResidentRuntime)?,
-            )
-            .map_err(|_| NodeError::ResidentRuntime)?,
-        );
+        self.scalping_features
+            .insert(binding.key.clone(), feature_source(&binding, &params)?);
         Ok(())
     }
 
@@ -224,6 +293,16 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             return Err(NodeError::ResidentRuntime);
         }
         self.runtime.publish_market(event).map_err(resident_error)
+    }
+
+    /// Until Runtime supplies signed per-instance safety and installed-protection facts, every
+    /// registered Scalping reducer is intentionally blocked from entry. This is read-only status
+    /// for Control projection; it neither changes lifecycle nor grants a capability.
+    #[must_use]
+    pub(crate) fn scalping_entry_safety_unwired(&self, binding: &StrategyBinding) -> bool {
+        binding.key.strategy_kind == StrategyKind::Scalping
+            && self.scalping_bindings.get(&binding.key) == Some(binding)
+            && self.scalping_bridges.contains_key(&binding.key)
     }
 
     /// Only the fixed receiver/bridge feeds this ingress, never an unsequenced REST/BBO poll.
@@ -283,63 +362,6 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             self.drive_features(binding, event, feed)?;
         }
         Ok(published)
-    }
-
-    /// Commits one reducer-produced semantic entry as an Actor Applied turn, then asks the sole
-    /// Host to obtain current adapter rules/BBO and normalize its bounded quote exposure before
-    /// the usual WAL/lane dispatch. No Node code selects a physical price or quantity.
-    pub fn submit_scalping_intent(
-        &mut self,
-        binding: &StrategyBinding,
-        intent: SemanticIntent,
-        observed_at_ms: u64,
-    ) -> Result<CommandId, NodeError> {
-        validate_submission(binding, &intent, observed_at_ms)?;
-        let normalization = normalization_intent(binding, &intent)?;
-        let command_id = normalization.command_id.clone();
-        let replay = serde_json::to_vec(&ScalpingSemanticReplay {
-            intent: &intent,
-            observed_at_ms,
-        })
-        .map_err(|_| NodeError::ResidentRuntime)?;
-        let applied = self
-            .runtime
-            .persist_resident_semantic_turn(binding, replay)
-            .map_err(resident_error)?;
-        persist_anchor(&self.artifacts_root, binding, &applied)?;
-        self.host
-            .normalize_and_prepare_limit(
-                &mut self.runtime,
-                binding,
-                &applied,
-                AccountLanePriority::Normal,
-                &normalization,
-            )
-            .map_err(|error| NodeError::LiveHost {
-                venue: self.host.binding().venue,
-                message: error.to_string(),
-            })?;
-        self.runtime
-            .dispatch_next_with_host(&mut self.host)
-            .map_err(|error| NodeError::LiveHost {
-                venue: self.host.binding().venue,
-                message: error.to_string(),
-            })?;
-        Ok(command_id)
-    }
-
-    /// Consumes the exact semantic output dequeued from the shared resident actor.  This is the
-    /// production handoff for a candidate producer: a Grid, Copy, or caller-constructed semantic
-    /// variant cannot be reinterpreted as a Scalping entry.
-    pub fn dispatch_resident_scalping_intent(
-        &mut self,
-        semantic: ResidentSemanticIntent,
-        observed_at_ms: u64,
-    ) -> Result<CommandId, NodeError> {
-        let ResidentSemanticIntent::Scalping { binding, intent } = semantic else {
-            return Err(NodeError::ResidentRuntime);
-        };
-        self.submit_scalping_intent(&binding, intent, observed_at_ms)
     }
 }
 
@@ -531,62 +553,113 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             // trade/bar/delta facts are ignored and cannot make it ready or create intent.
             return Ok(());
         }
-        let (scalping_books, scalping_features, scalping_capture_sequence) = (
-            &mut self.scalping_books,
-            &mut self.scalping_features,
-            &mut self.scalping_capture_sequence,
-        );
-        let book = scalping_books
-            .get_mut(&binding.key)
-            .ok_or(NodeError::ResidentRuntime)?;
-        match &event.event {
-            MarketEvent::Snapshot(v) => {
-                book.apply_snapshot(v.clone());
-                if !scalping_features.contains_key(&binding.key) {
-                    scalping_features.insert(
-                        binding.key.clone(),
-                        venue_indicators::ScalpingPublicMarketSource::new(
-                            binding.key.symbol.clone(),
-                            "node_scalping_v1",
-                            feature_profile_digest(binding),
-                            1_000,
-                            NonZeroUsize::new(256).ok_or(NodeError::ResidentRuntime)?,
-                        )
-                        .map_err(|_| NodeError::ResidentRuntime)?,
-                    );
+        let feature_params = self
+            .scalping_bridges
+            .get(&binding.key)
+            .ok_or(NodeError::ResidentRuntime)?
+            .params()
+            .clone();
+        let output = {
+            let (scalping_books, scalping_features, scalping_capture_sequence) = (
+                &mut self.scalping_books,
+                &mut self.scalping_features,
+                &mut self.scalping_capture_sequence,
+            );
+            let book = scalping_books
+                .get_mut(&binding.key)
+                .ok_or(NodeError::ResidentRuntime)?;
+            match &event.event {
+                MarketEvent::Snapshot(v) => {
+                    book.apply_snapshot(v.clone());
+                    if !scalping_features.contains_key(&binding.key) {
+                        // The bridge owns the exact parameter identity. A source recreated after
+                        // a book gap must use that same release, not a Node-local digest.
+                        scalping_features.insert(
+                            binding.key.clone(),
+                            feature_source(binding, &feature_params)?,
+                        );
+                    }
                 }
+                MarketEvent::Delta(v) if book.apply_delta_if_fresh(v.clone()).is_err() => {
+                    scalping_features.remove(&binding.key);
+                    return Ok(());
+                }
+                _ => {}
             }
-            MarketEvent::Delta(v) if book.apply_delta_if_fresh(v.clone()).is_err() => {
-                scalping_features.remove(&binding.key);
-                return Ok(());
+            // Each feature source owns a capture cursor; other symbols must not look like gaps.
+            let capture_sequence = scalping_capture_sequence
+                .entry(binding.key.clone())
+                .or_insert(0);
+            *capture_sequence = capture_sequence
+                .checked_add(1)
+                .ok_or(NodeError::ResidentRuntime)?;
+            let source = scalping_features
+                .get_mut(&binding.key)
+                .ok_or(NodeError::ResidentRuntime)?;
+            let input = venue_indicators::RecordedPublicEvent {
+                capture_sequence: *capture_sequence,
+                received_at_ms: event.received_at_ms,
+                event: event.event,
+            };
+            let current_ms = received_ms()?;
+            match feed {
+                BookFeed::SequencedDelta => source.consume(input, book, current_ms),
+                BookFeed::CompleteWebSocketImages => source.consume(
+                    input,
+                    &full_snapshot_book::FullSnapshotBook(book),
+                    current_ms,
+                ),
             }
-            _ => {}
-        }
-        // Each feature source owns a capture cursor; other symbols must not look like gaps.
-        let capture_sequence = scalping_capture_sequence
-            .entry(binding.key.clone())
-            .or_insert(0);
-        *capture_sequence = capture_sequence
-            .checked_add(1)
-            .ok_or(NodeError::ResidentRuntime)?;
-        let source = scalping_features
-            .get_mut(&binding.key)
-            .ok_or(NodeError::ResidentRuntime)?;
-        let input = venue_indicators::RecordedPublicEvent {
-            capture_sequence: *capture_sequence,
-            received_at_ms: event.received_at_ms,
-            event: event.event,
+            .map_err(|_| NodeError::ResidentRuntime)?
         };
-        let current_ms = received_ms()?;
-        match feed {
-            BookFeed::SequencedDelta => source.consume(input, book, current_ms),
-            BookFeed::CompleteWebSocketImages => source.consume(
-                input,
-                &full_snapshot_book::FullSnapshotBook(book),
-                current_ms,
-            ),
+        if let Some(frame) = output.frame {
+            self.evaluate_scalping_frame(binding, frame)?;
         }
-        .map_err(|_| NodeError::ResidentRuntime)?;
+        Ok(())
+    }
+
+    fn evaluate_scalping_frame(
+        &mut self,
+        binding: &StrategyBinding,
+        frame: venue_indicators::FeatureFrame,
+    ) -> Result<(), NodeError> {
+        let pure_binding = self
+            .scalping_bridges
+            .get(&binding.key)
+            .ok_or(NodeError::ResidentRuntime)?
+            .binding()
+            .clone();
+        let authorization = RuntimeScalpingAuthorization {
+            binding: pure_binding,
+            running: self.strategy_lifecycle(binding) == Some(InstanceLifecycle::Running),
+        };
+        // There is no current Node projection proving this instance is flat, has no competing
+        // owner, or has a server-side StopMarket. `Running` therefore cannot become an entry
+        // authorization: the pure reducer records this frame but blocks before preparation.
+        let safety = SafetyProjection {
+            private_snapshot_ready: false,
+            exposure: venue_strategies::scalping::ExposureState::Unknown,
+            execution_unknown: self.has_unresolved(),
+            protection: ProtectionState::Gap,
+            owner_conflict: true,
+            risk_budget_available: false,
+        };
+        let replay = {
+            let bridge = self
+                .scalping_bridges
+                .get_mut(&binding.key)
+                .ok_or(NodeError::ResidentRuntime)?;
+            let _decision = bridge
+                .engine
+                .evaluate(&frame, &safety, &authorization)
+                .map_err(|_| NodeError::ResidentRuntime)?;
+            bridge.checkpoint_bytes()?
+        };
+        let applied = self
+            .runtime
+            .persist_resident_semantic_turn(binding, replay)
+            .map_err(resident_error)?;
+        persist_anchor(&self.artifacts_root, binding, &applied)?;
         Ok(())
     }
 }
@@ -603,86 +676,29 @@ fn received_ms() -> Result<u64, NodeError> {
     u64::try_from(millis).map_err(|_| NodeError::ResidentRuntime)
 }
 
-fn feature_profile_digest(binding: &StrategyBinding) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"venue.node.scalping.feature-profile.v1");
-    digest.update((binding.config_digest.len() as u64).to_be_bytes());
-    digest.update(binding.config_digest.as_bytes());
-    format!("{:x}", digest.finalize())
+fn feature_source(
+    binding: &StrategyBinding,
+    params: &ScalpingParams,
+) -> Result<venue_indicators::ScalpingPublicMarketSource, NodeError> {
+    venue_indicators::ScalpingPublicMarketSource::new(
+        binding.key.symbol.clone(),
+        params.feature_profile.clone(),
+        params.feature_digest.clone(),
+        params.max_data_age_ms,
+        NonZeroUsize::new(256).ok_or(NodeError::ResidentRuntime)?,
+    )
+    .map_err(|_| NodeError::ResidentRuntime)
 }
 
-fn validate_submission(
-    binding: &StrategyBinding,
-    intent: &SemanticIntent,
-    observed_at_ms: u64,
-) -> Result<(), NodeError> {
-    if binding.key.strategy_kind != StrategyKind::Scalping
-        || observed_at_ms == 0
-        || intent.intent_id.trim().is_empty()
-        || intent.symbol != binding.key.symbol
-        || intent.purpose != SemanticPurpose::Entry
-        || intent.valid_until_ms < observed_at_ms
-        || intent.entry_ttl_ms == 0
-        || intent.target_quote.asset.as_str() != binding.key.symbol.quote()
-        || intent.risk_plan.quote_cap.asset.as_str() != binding.key.symbol.quote()
-        || intent.target_quote.value <= rust_decimal::Decimal::ZERO
-        || intent.target_quote.value > intent.risk_plan.quote_cap.value
-        || intent.max_slippage_bps <= rust_decimal::Decimal::ZERO
-    {
-        return Err(NodeError::ResidentRuntime);
-    }
-    Ok(())
-}
-
-fn normalization_intent(
-    binding: &StrategyBinding,
-    intent: &SemanticIntent,
-) -> Result<AccountLimitNormalizationIntent, NodeError> {
-    let (side, position_side) = match intent.direction {
-        Direction::Long => (OrderSide::Buy, PositionSide::Long),
-        Direction::Short => (OrderSide::Sell, PositionSide::Short),
-    };
-    Ok(AccountLimitNormalizationIntent {
-        command_id: stable_id(b"command", binding, intent)?,
-        client_order_id: stable_id(b"client", binding, intent)?,
-        owner: OrderOwner {
-            strategy_instance_id: binding.key.instance_id.clone(),
-            run_id: binding.run_id.clone(),
-            exchange: binding.key.account.exchange.as_str().to_owned(),
-            account: binding.key.account.account.clone(),
-            symbol: binding.key.symbol.clone(),
-            purpose: venue_domain::domain::OrderPurpose::Entry,
-        },
-        side,
-        position_side,
-        quote_delta: intent.target_quote.value,
-        reduce_only: false,
-    })
-}
-
-fn stable_id(
-    label: &[u8],
-    binding: &StrategyBinding,
-    intent: &SemanticIntent,
-) -> Result<CommandId, NodeError> {
-    let mut digest = Sha256::new();
-    digest.update(b"venue.node.scalping.entry.v1");
-    for field in [
-        label,
-        binding.key.account.exchange.as_str().as_bytes(),
-        binding.key.account.account.as_bytes(),
-        binding.key.instance_id.as_bytes(),
-        binding.key.symbol.to_string().as_bytes(),
-        binding.run_id.as_bytes(),
-        binding.config_digest.as_bytes(),
-        intent.intent_id.as_bytes(),
-        intent.idempotency_seed.as_bytes(),
-    ] {
-        digest.update((field.len() as u64).to_be_bytes());
-        digest.update(field);
-    }
-    let raw = format!("sc-{:x}", digest.finalize());
-    CommandId::new(raw[..35].to_owned()).map_err(|_| NodeError::ResidentRuntime)
+fn scalping_binding_matches_runtime(
+    scalping: &ScalpingStrategyBinding,
+    runtime: &StrategyBinding,
+) -> bool {
+    scalping.strategy_instance_id == runtime.key.instance_id
+        && scalping.run_id == runtime.run_id
+        && scalping.exchange == runtime.key.account.exchange.as_str()
+        && scalping.account == runtime.key.account.account
+        && scalping.symbol == runtime.key.symbol
 }
 
 #[cfg(test)]
@@ -694,7 +710,10 @@ mod tests {
     };
 
     use rust_decimal::Decimal;
-    use venue_domain::domain::{Amount, Asset, ExecutionCommand, OrderCommand, Price, Symbol};
+    use venue_domain::domain::{
+        AggressorSide, Amount, Asset, ExecutionCommand, FieldState, MarketDelta, OrderCommand,
+        PositionSide, Price, PublicBar, PublicTrade, Symbol,
+    };
     use venue_gateway_api::{GatewayBinding, VenueId};
     use venue_runtime::{
         AccountDispatchPermit, AccountGatewayResult, AccountHostValidationError,
@@ -704,7 +723,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{NodeLaunch, ResidentFact, ResidentLoop, ScalpingResidentActor};
+    use crate::NodeLaunch;
 
     const ACCOUNT: &str = "00000000-0000-4000-8000-000000000001";
 
@@ -897,100 +916,197 @@ mod tests {
             "run-1",
             "scalp-config",
         )?;
-        resident.register_scalping_actor(binding.clone())?;
+        resident.register_scalping_actor(binding.clone(), scalping_binding(&binding)?)?;
         Ok((resident, state, binding))
     }
 
-    fn intent(now_ms: u64) -> Result<SemanticIntent, Box<dyn std::error::Error>> {
-        let asset = Asset::new("USDT")?;
-        Ok(SemanticIntent {
-            intent_id: "entry-1".to_owned(),
-            symbol: Symbol::new("DOGE", "USDT")?,
-            direction: Direction::Long,
-            purpose: SemanticPurpose::Entry,
-            expert: venue_strategies::scalping::Expert::RangeFade,
-            entry_style: venue_strategies::scalping::EntryStyle::PassiveMaker,
-            exit_template: venue_strategies::scalping::ExitTemplate::FairValue,
-            attempt_cap: 1,
-            max_reprices: 0,
-            risk_plan: venue_strategies::scalping::RiskPlan {
-                risk_per_episode: venue_strategies::scalping::RiskLimit::new(
-                    venue_strategies::scalping::RiskUnit::shadow(),
-                    Decimal::ONE,
-                ),
-                quote_cap: Amount::new(asset.clone(), Decimal::TEN),
-                max_episode_loss: venue_strategies::scalping::RiskLimit::new(
-                    venue_strategies::scalping::RiskUnit::shadow(),
-                    Decimal::ONE,
-                ),
-            },
-            target_quote: Amount::new(asset, Decimal::TEN),
-            reference_price: Price::new(Decimal::ONE)?,
-            max_slippage_bps: Decimal::new(100, 0),
-            valid_until_ms: now_ms.saturating_add(1_000),
-            entry_ttl_ms: 1_000,
-            hard_stop_distance_bps: Decimal::ONE,
-            target_distance_bps: Decimal::ONE,
-            max_hold_ms: 1_000,
-            max_unprotected_ms: 100,
-            requires_server_protection: false,
-            opportunity_key: "opportunity-1".to_owned(),
-            breakout_cursor: None,
-            idempotency_seed: "seed-1".to_owned(),
+    fn scalping_binding(
+        binding: &StrategyBinding,
+    ) -> Result<ScalpingStrategyBinding, Box<dyn std::error::Error>> {
+        Ok(ScalpingStrategyBinding {
+            strategy_kind: venue_strategies::scalping::StrategyKind::Scalping,
+            strategy_instance_id: binding.key.instance_id.clone(),
+            run_id: binding.run_id.clone(),
+            exchange: binding.key.account.exchange.as_str().to_owned(),
+            account: binding.key.account.account.clone(),
+            symbol: binding.key.symbol.clone(),
+            parameter_release_id: "scalping-shadow-v1".to_owned(),
+            owner_scope: binding.key.instance_id.clone(),
+            risk_budget: Amount::new(Asset::new("USDT")?, Decimal::TEN),
         })
     }
 
     #[test]
-    fn semantic_entry_reaches_the_shared_host_wal_and_writer()
+    fn registered_scalping_is_writer_inert_without_a_safety_projection()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
-        let (mut resident, state, binding) = setup(directory.path())?;
-        let observed_at_ms = now()?;
-        let mut resident_loop = ResidentLoop::new(binding.key.account.clone());
-        resident_loop.register_scalping(ScalpingResidentActor::new(
-            binding.clone(),
-            &venue_strategies::scalping::ScalpingParams::phase8(Amount::new(
-                Asset::new("USDT")?,
-                Decimal::TEN,
-            )),
-        ))?;
-        resident_loop.consume(ResidentFact::MarketScalpingCandidate {
-            target: binding.key.clone(),
-            intent: intent(observed_at_ms)?,
-        })?;
-        let semantic = resident_loop
-            .next_intent()
-            .ok_or("semantic candidate missing")?;
-        resident.dispatch_resident_scalping_intent(semantic, observed_at_ms)?;
+        let (resident, state, binding) = setup(directory.path())?;
+        assert!(resident.scalping_entry_safety_unwired(&binding));
         let state = state.lock().map_err(|_| "state lock")?;
-        assert_eq!(state.dispatches, 1);
-        assert_eq!(state.commands.len(), 1);
-        let actor_journal = directory
-            .path()
-            .join("okx")
-            .join("LIVE")
-            .join(ACCOUNT)
-            .join("strategies")
-            .join("scalp-1")
-            .join("actor-applied.jsonl");
-        assert!(!std::fs::read(actor_journal)?.is_empty());
+        assert_eq!(state.dispatches, 0);
+        assert!(state.commands.is_empty());
         Ok(())
     }
 
     #[test]
-    fn expired_semantic_intent_is_rejected_before_the_host_wal()
+    fn malformed_or_other_release_checkpoint_cannot_bootstrap_scalping()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let (_, _, binding) = setup(directory.path())?;
+        let pure_binding = scalping_binding(&binding)?;
+        let params = ScalpingParams::for_binding(&pure_binding);
+        assert!(
+            ScalpingBridgeState::restore_or_bootstrap(
+                Some(br#"not-a-checkpoint"#.to_vec()),
+                pure_binding.clone(),
+                params.clone(),
+            )
+            .is_err()
+        );
+        let other_binding = ScalpingStrategyBinding {
+            parameter_release_id: "other-release".to_owned(),
+            ..pure_binding.clone()
+        };
+        assert!(
+            ScalpingBridgeState::restore_or_bootstrap(
+                Some(
+                    ScalpingBridgeState::restore_or_bootstrap(None, pure_binding, params)?
+                        .checkpoint_bytes()?
+                ),
+                other_binding.clone(),
+                ScalpingParams::for_binding(&other_binding),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn actual_feature_source_frame_blocks_and_durably_checkpoints_the_reducer()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let (mut resident, state, binding) = setup(directory.path())?;
-        let observed_at_ms = now()?;
-        let mut expired = intent(observed_at_ms)?;
-        expired.valid_until_ms = observed_at_ms.saturating_sub(1);
-        assert!(
-            resident
-                .submit_scalping_intent(&binding, expired, observed_at_ms)
-                .is_err()
+        let now_ms = now()?;
+        let publish = |resident: &mut ProductionResident<Gateway>, event: MarketEvent| {
+            let event =
+                AccountMarketEvent::new(now_ms, event).map_err(|_| NodeError::ResidentRuntime)?;
+            assert!(resident.publish_scalping_market(&binding, event.clone())?);
+            resident.drive_features(&binding, event, BookFeed::SequencedDelta)
+        };
+        publish(
+            &mut resident,
+            stream_image(binding.key.symbol.clone(), 10, now_ms)?,
+        )?;
+        publish(
+            &mut resident,
+            MarketEvent::Delta(MarketDelta {
+                symbol: binding.key.symbol.clone(),
+                generation: 1,
+                first_sequence: 11,
+                previous_sequence: Some(10),
+                sequence: 11,
+                exchange_time_ms: Some(now_ms),
+                bids: Vec::new(),
+                asks: Vec::new(),
+            }),
+        )?;
+        publish(
+            &mut resident,
+            MarketEvent::Delta(MarketDelta {
+                symbol: binding.key.symbol.clone(),
+                generation: 1,
+                first_sequence: 12,
+                previous_sequence: Some(11),
+                sequence: 12,
+                exchange_time_ms: Some(now_ms),
+                bids: Vec::new(),
+                asks: Vec::new(),
+            }),
+        )?;
+        for sequence in 1..=21_u64 {
+            let close_time_ms = now_ms.saturating_sub((21_u64.saturating_sub(sequence)) * 60_000);
+            publish(
+                &mut resident,
+                MarketEvent::Bar(PublicBar {
+                    symbol: binding.key.symbol.clone(),
+                    generation: 1,
+                    received_at_ms: now_ms,
+                    sequence,
+                    open_time_ms: close_time_ms.saturating_sub(59_999),
+                    close_time_ms,
+                    interval_ms: 60_000,
+                    open: Price::new(Decimal::ONE)?,
+                    high: Price::new(Decimal::new(101, 2))?,
+                    low: Price::new(Decimal::new(99, 2))?,
+                    close: Price::new(Decimal::ONE)?,
+                    base_volume: FieldState::Known(Decimal::TEN),
+                    quote_volume: FieldState::Known(Decimal::TEN),
+                    trade_count: FieldState::Known(10),
+                    taker_buy_base_volume: FieldState::Known(Decimal::ONE),
+                    taker_buy_quote_volume: FieldState::Known(Decimal::ONE),
+                }),
+            )?;
+        }
+        for aggregate_trade_id in 1..=64_u64 {
+            publish(
+                &mut resident,
+                MarketEvent::Trade(PublicTrade {
+                    symbol: binding.key.symbol.clone(),
+                    generation: 1,
+                    received_at_ms: now_ms,
+                    exchange_time_ms: now_ms,
+                    transaction_time_ms: now_ms,
+                    aggregate_trade_id,
+                    first_trade_id: aggregate_trade_id,
+                    last_trade_id: aggregate_trade_id,
+                    price: Price::new(Decimal::ONE)?,
+                    quantity: Decimal::ONE,
+                    quote_quantity: Decimal::ONE,
+                    aggressor: FieldState::Known(AggressorSide::Buy),
+                }),
+            )?;
+        }
+        let checkpoint = resident
+            .runtime
+            .resident_actor_checkpoint(&binding)?
+            .ok_or("missing scalping checkpoint")?;
+        let checkpoint = serde_json::from_slice::<ScalpingCheckpoint>(&checkpoint)?;
+        assert_eq!(
+            checkpoint
+                .cursors
+                .get("trades")
+                .map(|cursor| cursor.sequence),
+            Some(64)
         );
+        assert!(matches!(
+            resident
+                .scalping_bridges
+                .get(&binding.key)
+                .ok_or("missing bridge")?
+                .engine
+                .state(),
+            venue_strategies::scalping::ScalpingState::Blocked(
+                venue_strategies::scalping::BlockingReason::PrivateSnapshot
+            )
+        ));
         assert_eq!(state.lock().map_err(|_| "state lock")?.dispatches, 0);
+
+        drop(resident);
+        let (restarted, restarted_state, restarted_binding) = setup(directory.path())?;
+        assert_eq!(restarted_binding, binding);
+        assert!(matches!(
+            restarted
+                .scalping_bridges
+                .get(&binding.key)
+                .ok_or("missing restored bridge")?
+                .engine
+                .state(),
+            venue_strategies::scalping::ScalpingState::Bootstrapping
+        ));
+        assert_eq!(
+            restarted_state.lock().map_err(|_| "state lock")?.dispatches,
+            0
+        );
         Ok(())
     }
 
@@ -1291,16 +1407,19 @@ mod tests {
         resident
             .scalping_books
             .insert(second.key.clone(), venue_indicators::OrderBook::default());
-        resident.scalping_features.insert(
+        let second_scalping_binding = scalping_binding(&second)?;
+        let second_params = ScalpingParams::for_binding(&second_scalping_binding);
+        resident.scalping_bridges.insert(
             second.key.clone(),
-            venue_indicators::ScalpingPublicMarketSource::new(
-                second.key.symbol.clone(),
-                "node_scalping_v1",
-                feature_profile_digest(&second),
-                1_000,
-                NonZeroUsize::new(256).ok_or("history")?,
+            ScalpingBridgeState::restore_or_bootstrap(
+                None,
+                second_scalping_binding,
+                second_params.clone(),
             )?,
         );
+        resident
+            .scalping_features
+            .insert(second.key.clone(), feature_source(&second, &second_params)?);
         let time = now()?;
         for sequence in [10, 90] {
             for binding in [&first, &second] {

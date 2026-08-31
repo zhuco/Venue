@@ -367,7 +367,7 @@ async fn fresh_node_pair_automatically_plans_once_and_fences_unsettled_jobs()
     Ok(())
 }
 
-fn advance(envelope: &mut NodeProjectionEnvelope, now_ms: u64, digest: [u8; 32]) {
+pub(super) fn advance(envelope: &mut NodeProjectionEnvelope, now_ms: u64, digest: [u8; 32]) {
     envelope.previous_digest = envelope.digest;
     envelope.digest = digest;
     envelope.sequence += 1;
@@ -375,7 +375,7 @@ fn advance(envelope: &mut NodeProjectionEnvelope, now_ms: u64, digest: [u8; 32])
     envelope.facts.generated_ms = now_ms;
 }
 
-fn fact(
+pub(super) fn fact(
     envelope: &NodeProjectionEnvelope,
     relation: &CopyRelationConfig,
     role: CopyPlanningFactRole,

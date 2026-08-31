@@ -30,6 +30,9 @@ jobs:
       - name: Verify fixed Node release contract
         shell: pwsh
         run: ./scripts/verify_venue_node_linux_release.ps1
+      - name: Verify Linux release orchestration with fake tools
+        shell: pwsh
+        run: ./scripts/test_venue_node_linux_release.ps1
       - name: Verify isolated venue node binaries
         shell: pwsh
         run: ./scripts/verify_venue_node_binaries.ps1

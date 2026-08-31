@@ -38,4 +38,16 @@
 - 不自动删除旧目录，也不安装后台清理任务。后续清理须先登记精确目录、确认无活动使用并取得对应锁；不能因为目录叫 target/Build 就认定全部可删除。
 - 永久保留业务源码、bak、Git、数据库、发布产物、恢复备份、未决WAL和checkpoint。清理G内缓存不保证F上的动态VHDX立即缩小。
 - 全局和项目 AGENTS.md 提供会话规则；旧会话开始下一次构建前需重新读取，必要时重启会话。这不是强制安全沙箱。
-- GitHub托管CI继续使用既有 RUNNER_TEMP 内的 job-owned target，不使用本机F/G盘阈值；保留同目录锁、两项并发和环境恢复，CI空闲下限2 GiB。Linux发布脚本和远程运行环境未改变。
+- GitHub托管CI继续使用既有 RUNNER_TEMP 内的 job-owned target，不使用本机F/G盘阈值；保留同目录锁、两项并发和环境恢复，CI空闲下限2 GiB。
+
+## Linux 六所 Node 发布构建
+
+`package_venue_node_linux_release.sh` 只生成发布目录，不启动 Node、操作账户或部署服务。必须显式指定
+`--release-id`、`--output-root`、`--build-root` 和完整 40 位 `--expected-revision`；源码、发布根和构建根互不包含。
+
+- 源码必须是指定 revision 的干净 Git checkout，工具链为 Rust/Cargo 1.98.0。传输源码时保留可验证的 Git revision，不以缺少 `.git` 的压缩包冒充可发布 checkout。
+- `--preflight-only` 不创建缓存、锁或发布目录；构建/发布所在文件系统均须至少有 20 GiB 空闲。预检通过不代表已经完成 Linux 编译或服务器接管。
+- 同一构建根复用 `cargo-target` 和 `tmp`，持有 `venue-node-build.lock` 后才构建，排队最多 60 秒并重新预检；六所逐个构建，每次一个 Cargo job。不另开时间戳 target，不抢锁或终止其他构建。
+- 不自动删除构建缓存。失败仅可删除本次创建且规范路径校验通过的发布暂存目录；版本化 release 不覆盖，只包含六个固定 Node binary、`SHA256SUMS` 和 `manifest.json`。
+- 20 GiB 是准入阈值，不是持续磁盘配额。正式发布仍需对应源码的验证基线；构建成功不等于 writer、旧 WAL、真实网关或 UI 验收完成。
+- Windows 的 `test_venue_node_linux_release.ps1` 用 Git Bash 和假 Cargo/Rust/flock 检查脚本编排、缓存复用、零写预检、revision 变化及发布竞争；不执行真实 Cargo。真实 Linux 锁和符号链接边界必须在目标主机另外验证，不能用该 fixture 代替。

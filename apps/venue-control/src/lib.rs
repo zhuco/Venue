@@ -41,7 +41,9 @@ pub use copy_model::{
     MAX_COPY_OBSERVER_LEASE_MS, MAX_COPY_SNAPSHOT_TTL_MS, ObservedCopyIntent,
     ScopedCopyDeliveryReceipt,
 };
-pub use copy_postgres::{MIGRATION_0002, MIGRATION_0007, MIGRATION_0008, MIGRATION_0013};
+pub use copy_postgres::{
+    MIGRATION_0002, MIGRATION_0007, MIGRATION_0008, MIGRATION_0013, MIGRATION_0016,
+};
 pub use copy_relation_postgres::{MIGRATION_0006, MIGRATION_0010};
 pub use copy_relation_repository::{CopyRelationRepository, CopyRelationRepositoryError};
 pub use copy_repository::{CopyRepository, CopyRepositoryError};

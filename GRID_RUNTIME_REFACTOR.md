@@ -1,6 +1,6 @@
 # 多策略、多交易所账户运行时与对冲网格开发规范
 
-更新：2026-08-31
+更新：2026-09-01
 
 ## 1. 文档职责
 
@@ -438,6 +438,8 @@ Actor Applied 早于其后物理命令的 WAL 是正常顺序。重启安装 Act
 - 账户进程锁、命令 WAL、Owner、风险和 Unknown 只实现一次；
 - 先保持现有 adapter transport 和网格 reducer 行为等价，再迁移持久化布局或异步 transport。
 
+Scalping Node 配置必须显式给出 `scalping.parameter_release_id/owner_scope/risk_budget`，按纯策略参数生成同一 FeatureSource profile，并从既有 Actor checkpoint 恢复真实引擎。只有产出 frame 才进行 evaluate 和耐久 checkpoint；原手造 Scalping candidate 到 Host 的入口已移除。签名私流安全、成交确认和服务端保护尚未闭合时，引擎禁止自动入场，原本 Running 的对外投影显示 NeedsAttention；Paused/Stopping 不被覆盖。只有盘口、缺少 trades/bars 的接收路径不等于完整策略输入。
+
 ### C. 同账户多交易对
 
 - 引入 Strategy Registry（策略注册表）和 symbol 唯一占用；
@@ -479,6 +481,8 @@ Copy delivery 的 semantic Applied 只能表示 Actor 已耐久接收目标。No
 唯一 writer 和 adapter dispatch，再以更新签名私有事实写回执行状态、ledger 和 drift。跨零反向先 reduce-only 到零并等待新事实；
 任一 Unknown 禁止重投旧 child。具体阶段和 Web 页面依赖查 `UNIFIED_GATEWAY_WEB_MIGRATION.md`。
 Copy Install 的领取租期精确截断于 immutable job 截止时间，不改变原执行有效期；已领取任务过期后仍可获得完整只读对账窗口。ReconcileOnly 只能用同一 delivery、原 WAL/request、精确成交与更新签名仓位回传最终 Adjust 的 Reconciled，不能把中间归零当作完整目标完成，也不能借对账继续反向增险。Control 同时核验原始执行投影与 delivery receipt 后才进入 ledger。
+
+从未领取即过期的 Copy job 只能在双边新观察均晚于旧截止时间、follower 私有 generation 更新且当前关系仍获准时重新规划。Control 在同一事务锁定两条 delivery 及原 job，证明 lease/claim、receipt、execution、ledger 全部不存在，才把两条投递记录标为 `expired_unclaimed` 并建立独立新 job。原 job/payload/截止时间不变，不伪造 Rejected 或 ledger；任一已领取/Unknown 继续阻断。历史退休记录不占未决扫描额度，晚到执行结果不得重新挂回退休 job；该状态不是 WAL 或 Node receipt 状态。
 
 ## 12. 验收标准
 

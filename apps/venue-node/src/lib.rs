@@ -56,7 +56,7 @@ pub use resident::{
 };
 pub use runtime_config::{
     NODE_RUNTIME_CONFIG_VERSION, NodeControlLoopConfig, NodeGridRecoveryPolicy,
-    NodeGridRuntimeConfig, NodeRuntimeConfig, NodeRuntimeStrategy,
+    NodeGridRuntimeConfig, NodeRuntimeConfig, NodeRuntimeStrategy, NodeScalpingRuntimeConfig,
 };
 
 pub use venue_control_protocol::{CommandReceipt, ControlAction, ControlCommandRequest};
@@ -454,7 +454,8 @@ where
                             grid.skip_inventory_replenishment_until_recovered,
                         )?;
                     }
-                    StrategyKind::Scalping => resident.register_scalping_actor(binding)?,
+                    StrategyKind::Scalping => resident
+                        .register_scalping_actor(binding, config.scalping_binding_for(strategy)?)?,
                     StrategyKind::Copy => resident.register_actor(binding)?,
                 }
             }
@@ -948,6 +949,14 @@ mod tests {
                 config_epoch: 1,
                 symbol: "DOGE/USDT".parse()?,
                 grid: None,
+                scalping: Some(NodeScalpingRuntimeConfig {
+                    parameter_release_id: "scalping-shadow-v1".to_owned(),
+                    owner_scope: "scalping-doge".to_owned(),
+                    risk_budget: venue_domain::Amount::new(
+                        venue_domain::Asset::new("USDT")?,
+                        rust_decimal::Decimal::TEN,
+                    ),
+                }),
                 copy_leader_capital: None,
             }],
         })

@@ -8,7 +8,7 @@ use venue_control::{
     CopyObserverScope, CopyWorker, CopyWorkerConfig, MIGRATION_0001, MIGRATION_0002,
     MIGRATION_0003, MIGRATION_0004, MIGRATION_0005, MIGRATION_0006, MIGRATION_0007, MIGRATION_0008,
     MIGRATION_0009, MIGRATION_0010, MIGRATION_0011, MIGRATION_0012, MIGRATION_0013, MIGRATION_0014,
-    PgControlRepository,
+    MIGRATION_0016, PgControlRepository,
 };
 use venue_control_protocol::{GatewayMode, VenueId};
 
@@ -43,6 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sqlx::raw_sql(MIGRATION_0012).execute(&pool).await?;
     sqlx::raw_sql(MIGRATION_0013).execute(&pool).await?;
     sqlx::raw_sql(MIGRATION_0014).execute(&pool).await?;
+    sqlx::raw_sql(MIGRATION_0016).execute(&pool).await?;
     let worker = CopyWorker::new(
         PgControlRepository::new(pool),
         CopyWorkerConfig {

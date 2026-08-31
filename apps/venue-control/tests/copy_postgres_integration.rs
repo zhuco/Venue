@@ -9,7 +9,7 @@ use venue_control::{
     CopyReplayDeliveryState, CopyRepository, CopyWorker, CopyWorkerConfig, FrozenCapitalSnapshot,
     MIGRATION_0001, MIGRATION_0002, MIGRATION_0003, MIGRATION_0004, MIGRATION_0005, MIGRATION_0006,
     MIGRATION_0007, MIGRATION_0008, MIGRATION_0009, MIGRATION_0010, MIGRATION_0011, MIGRATION_0012,
-    MIGRATION_0013, MIGRATION_0014, PgControlRepository, ScopedCopyDeliveryReceipt,
+    MIGRATION_0013, MIGRATION_0014, MIGRATION_0016, PgControlRepository, ScopedCopyDeliveryReceipt,
 };
 use venue_control_protocol::{
     ACCOUNT_DELIVERY_SCHEMA_VERSION, AccountDeliveryAck, AccountDeliveryBinding,
@@ -1412,6 +1412,7 @@ impl PgFixture {
             sqlx::raw_sql(MIGRATION_0012).execute(&self.pool).await?;
             sqlx::raw_sql(MIGRATION_0013).execute(&self.pool).await?;
             sqlx::raw_sql(MIGRATION_0014).execute(&self.pool).await?;
+            sqlx::raw_sql(MIGRATION_0016).execute(&self.pool).await?;
         }
         Ok(())
     }

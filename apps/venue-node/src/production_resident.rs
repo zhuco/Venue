@@ -37,6 +37,7 @@ pub struct ProductionResident<G> {
     grid_bridges: BTreeMap<venue_runtime::StrategyInstanceKey, grid::GridBridgeState>,
     grid_bindings: BTreeMap<venue_runtime::StrategyInstanceKey, StrategyBinding>,
     grid_bootstrap_pending: BTreeSet<venue_runtime::StrategyInstanceKey>,
+    scalping_bridges: BTreeMap<venue_runtime::StrategyInstanceKey, scalping::ScalpingBridgeState>,
     scalping_bindings: BTreeMap<venue_runtime::StrategyInstanceKey, StrategyBinding>,
     scalping_books: BTreeMap<venue_runtime::StrategyInstanceKey, venue_indicators::OrderBook>,
     scalping_features:
@@ -127,6 +128,7 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             grid_bridges: BTreeMap::new(),
             grid_bindings: BTreeMap::new(),
             grid_bootstrap_pending: BTreeSet::new(),
+            scalping_bridges: BTreeMap::new(),
             scalping_bindings: BTreeMap::new(),
             scalping_books: BTreeMap::new(),
             scalping_features: BTreeMap::new(),

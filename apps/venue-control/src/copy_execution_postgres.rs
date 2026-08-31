@@ -74,6 +74,22 @@ pub(crate) async fn record_in_transaction(
         .map_err(database_error)?
         .ok_or(CopyRepositoryError::ProjectionConflict)?;
     let job: CopyJob = decode(row.try_get("job_json").map_err(database_error)?)?;
+    // Retirement takes the same job lock before proving there has never been execution. An
+    // evidence writer that waited behind it must not attach a late result to the retired job.
+    let retired: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM venue_copy_delivery_outbox \
+         WHERE job_id=$1 AND delivery_state='expired_unclaimed') \
+         OR EXISTS(SELECT 1 FROM venue_account_deliveries \
+         WHERE delivery_id=$2 AND delivery_state='expired_unclaimed')",
+    )
+    .bind(&job_id)
+    .bind(format!("copy:{job_id}"))
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    if retired {
+        return Err(CopyRepositoryError::ProjectionConflict);
+    }
     // A relation edit must not prevent read-only recording of an old child's signed
     // outcome. Immutable job/delivery scope still applies; only new planning requires the
     // current active relation.

@@ -5,7 +5,7 @@ ALTER TABLE venue_copy_delivery_outbox
 
 ALTER TABLE venue_copy_delivery_outbox
     ADD CONSTRAINT venue_copy_delivery_claim_fields CHECK (
-        (delivery_state = 'pending'
+        (delivery_state IN ('pending', 'expired_unclaimed')
             AND claimed_by IS NULL AND claim_epoch = 0
             AND claimed_at_ms IS NULL AND claim_expires_at_ms IS NULL)
         OR (delivery_state = 'claimed'

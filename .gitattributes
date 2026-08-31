@@ -1,0 +1,2 @@
+/scripts/package_venue_node_linux_release.sh text eol=lf
+/scripts/fixtures/linux_release_fake_tool.sh text eol=lf

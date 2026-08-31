@@ -7,6 +7,8 @@ use venue_control_protocol::{
     CopyRelationRecord, NodeProjectionEnvelope,
 };
 
+#[path = "copy_planning_expiry.rs"]
+mod expiry;
 #[path = "copy_planning_input.rs"]
 mod input;
 #[path = "copy_planning_repair.rs"]
@@ -105,14 +107,19 @@ pub(super) async fn store_next_in_transaction(
                 unchanged = Some(prior);
             }
         }
-        // Never layer new risk on any unresolved prior job for this relation, including an old
-        // revision. Only canonical terminal receipts/ledger can release this planning fence.
+        // Claims or execution evidence keep the planning fence, including across revisions.
+        // An expired job is eligible only if neither delivery surface ever exposed it.
         let unsettled = sqlx::query(
             "SELECT j.job_json, j.relation_id, j.relation_revision, j.policy_digest FROM venue_copy_jobs j \
              WHERE j.venue=$1 AND j.mode='LIVE' AND j.trading_account_id=$2 \
               AND NOT EXISTS(SELECT 1 FROM venue_copy_ledger l WHERE l.job_id=j.job_id) \
               AND NOT EXISTS(SELECT 1 FROM venue_copy_delivery_receipts r \
-                 WHERE r.job_id=j.job_id AND r.status='rejected') LIMIT 1001",
+                 WHERE r.job_id=j.job_id AND r.status='rejected') \
+              AND NOT EXISTS(SELECT 1 FROM venue_account_deliveries d \
+                 JOIN venue_copy_delivery_outbox o ON o.job_id=j.job_id \
+                 WHERE d.delivery_id=('copy:' || j.job_id) \
+                   AND d.delivery_state='expired_unclaimed' \
+                   AND o.delivery_state='expired_unclaimed') ORDER BY j.job_id LIMIT 1001",
         )
         .bind(scope.venue.as_str())
         .bind(&scope.trading_account_id)
@@ -123,6 +130,7 @@ pub(super) async fn store_next_in_transaction(
             return Err(CopyRepositoryError::InvalidData);
         }
         let mut busy = false;
+        let mut expired = Vec::new();
         for row in unsettled {
             let job: CopyJob = decode(row.try_get("job_json").map_err(database_error)?)?;
             validate_job_relation_columns(&row, &job)?;
@@ -132,13 +140,29 @@ pub(super) async fn store_next_in_transaction(
             {
                 return Err(CopyRepositoryError::CorruptData);
             }
-            busy |= job.manifest.binding.relation.relation_id.to_string()
-                == relation.relation.relation_id;
+            if job.manifest.binding.relation.relation_id.to_string()
+                == relation.relation.relation_id
+            {
+                if expiry::lock_unclaimed_expired(transaction, &job, &leader, &follower, now_ms)
+                    .await?
+                {
+                    expired.push(job);
+                    continue;
+                }
+                busy = true;
+            }
         }
         if busy {
             continue;
         }
-        if let Some(prior) = unchanged {
+        if let Some(prior) = unchanged.filter(|prior| {
+            !expired.iter().any(|job| {
+                job.intent_id == prior.intent_id
+                    && job.identities.planning_snapshot_id == prior.snapshot_id
+                    && venue_copy::derive_copy_identities(&prior.identity_input)
+                        .is_ok_and(|identities| identities == job.identities)
+            })
+        }) {
             let Some(repaired) =
                 repair::from_reconciled_source(transaction, &prior, envelope, &follower, now_ms)
                     .await?
@@ -146,6 +170,12 @@ pub(super) async fn store_next_in_transaction(
                 continue;
             };
             envelope = repaired;
+        }
+        if !expired.is_empty() {
+            expiry::bind_successor(&mut envelope, &expired, now_ms)?;
+            // All candidates remain locked; any later failure to store/plan the new job rolls
+            // back both delivery markers along with the new immutable input.
+            expiry::mark_expired(transaction, &expired, now_ms).await?;
         }
         leader_input::store_in_transaction(transaction, &envelope, now_ms).await?;
         return Ok(true);

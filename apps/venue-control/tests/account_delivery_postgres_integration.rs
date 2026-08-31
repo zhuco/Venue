@@ -7,7 +7,7 @@ use venue_control::{
     ControlRepository, ControlService, DeliveryStoreResult, MIGRATION_0001, MIGRATION_0002,
     MIGRATION_0003, MIGRATION_0004, MIGRATION_0005, MIGRATION_0006, MIGRATION_0007, MIGRATION_0008,
     MIGRATION_0009, MIGRATION_0010, MIGRATION_0011, MIGRATION_0012, MIGRATION_0013, MIGRATION_0014,
-    PgControlRepository,
+    MIGRATION_0016, PgControlRepository,
     accounts::{AccountService, CredentialCipher},
     control_shutdown_channel, serve_local_with_accounts,
 };
@@ -22,6 +22,9 @@ use venue_control_protocol::{
 
 #[path = "copy_postgres/node_source.rs"]
 mod node_copy_source;
+
+#[path = "copy_postgres/unclaimed_expiry.rs"]
+mod unclaimed_expiry;
 
 #[tokio::test]
 async fn postgres_delivery_lease_ack_unknown_reconcile_and_restart_are_fenced()
@@ -689,6 +692,7 @@ impl PgFixture {
             sqlx::raw_sql(MIGRATION_0012).execute(&self.pool).await?;
             sqlx::raw_sql(MIGRATION_0013).execute(&self.pool).await?;
             sqlx::raw_sql(MIGRATION_0014).execute(&self.pool).await?;
+            sqlx::raw_sql(MIGRATION_0016).execute(&self.pool).await?;
         }
         Ok(())
     }

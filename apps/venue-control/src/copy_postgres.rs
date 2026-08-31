@@ -33,6 +33,7 @@ pub const MIGRATION_0002: &str = include_str!("../migrations/0002_copy_core.sql"
 pub const MIGRATION_0007: &str = include_str!("../migrations/0007_copy_relation_commitment.sql");
 pub const MIGRATION_0008: &str = include_str!("../migrations/0008_copy_execution_projection.sql");
 pub const MIGRATION_0013: &str = include_str!("../migrations/0013_copy_node_receipt_outbox.sql");
+pub const MIGRATION_0016: &str = include_str!("../migrations/0016_copy_expired_unclaimed.sql");
 
 impl PgControlRepository {
     pub async fn load_copy_worker_replay(
@@ -798,6 +799,7 @@ impl CopyRepository for PgControlRepository {
             let tracker_matches_outbox = matches!(
                 (state.as_str(), tracker.state()),
                 ("pending" | "claimed", DeliveryState::Pending)
+                    | ("expired_unclaimed", DeliveryState::Pending)
                     | ("reconciliation_required", DeliveryState::Unknown(_))
                     | (
                         "settled",
@@ -810,6 +812,7 @@ impl CopyRepository for PgControlRepository {
                 return Err(CopyRepositoryError::CorruptData);
             }
             let delivery_state = match state.as_str() {
+                "expired_unclaimed" => CopyReplayDeliveryState::Expired,
                 "pending" | "claimed" if job.manifest.expires_at_ms <= replayed_at_ms => {
                     CopyReplayDeliveryState::Expired
                 }

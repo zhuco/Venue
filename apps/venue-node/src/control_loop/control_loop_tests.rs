@@ -35,6 +35,26 @@ use super::*;
 
 const ACCOUNT: &str = "00000000-0000-4000-8000-000000000001";
 
+#[test]
+fn scalping_protection_attention_only_downgrades_a_healthy_running_actor() {
+    assert_eq!(
+        projection_lifecycle(Some(InstanceLifecycle::Running), HealthState::Healthy, true,),
+        StrategyLifecycle::NeedsAttention
+    );
+    assert_eq!(
+        projection_lifecycle(Some(InstanceLifecycle::Paused), HealthState::Healthy, true),
+        StrategyLifecycle::Paused
+    );
+    assert_eq!(
+        projection_lifecycle(
+            Some(InstanceLifecycle::Stopping),
+            HealthState::Healthy,
+            true
+        ),
+        StrategyLifecycle::Stopping
+    );
+}
+
 struct Gateway {
     binding: GatewayBinding,
     private_generation: Arc<AtomicU64>,
@@ -272,6 +292,7 @@ fn signed_private_refresh_enters_runtime_without_a_control_poll()
         config_epoch: 1,
         symbol: binding.symbol.clone(),
         grid: None,
+        scalping: None,
         copy_leader_capital: None,
     };
     let config = NodeRuntimeConfig {
@@ -404,6 +425,7 @@ async fn resident_control_delivery_roundtrip(
             recovery: crate::NodeGridRecoveryPolicy::BootstrapWhenAbsent,
             skip_inventory_replenishment_until_recovered: false,
         }),
+        scalping: None,
     };
     let config = NodeRuntimeConfig {
         version: crate::NODE_RUNTIME_CONFIG_VERSION,
@@ -681,6 +703,7 @@ async fn publisher_uploads_only_fresh_signed_leader_planning_fact()
             rust_decimal::Decimal::from(7),
         )),
         grid: None,
+        scalping: None,
     };
     let config = NodeRuntimeConfig {
         version: crate::NODE_RUNTIME_CONFIG_VERSION,
@@ -840,6 +863,7 @@ async fn fresh_copy_follower_bootstrap_publishes_planning_without_a_control_job(
         symbol: "DOGE/USDT".parse()?,
         copy_leader_capital: None,
         grid: None,
+        scalping: None,
     };
     let config = NodeRuntimeConfig {
         version: crate::NODE_RUNTIME_CONFIG_VERSION,
@@ -1311,6 +1335,7 @@ async fn copy_reconcile_only_restarts_unknown_child_and_returns_signed_final_adj
         symbol,
         copy_leader_capital: None,
         grid: None,
+        scalping: None,
     };
     let config = NodeRuntimeConfig {
         version: crate::NODE_RUNTIME_CONFIG_VERSION,
@@ -1494,6 +1519,7 @@ fn flatten_physically_cancels_then_reduces_only_after_signed_zero()
             recovery: crate::NodeGridRecoveryPolicy::BootstrapWhenAbsent,
             skip_inventory_replenishment_until_recovered: false,
         }),
+        scalping: None,
     };
     let config = NodeRuntimeConfig {
         version: crate::NODE_RUNTIME_CONFIG_VERSION,
@@ -1673,6 +1699,7 @@ fn projection_keeps_owned_orders_when_status_or_cumulative_fill_is_unknown()
         &BTreeMap::new(),
         &binding,
         Some(InstanceLifecycle::Running),
+        false,
         AccountHealth::Ready,
         false,
         1000,

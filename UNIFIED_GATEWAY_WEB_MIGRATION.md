@@ -1,6 +1,6 @@
 # VENUE 统一执行链与 Web 迁移开发契约
 
-更新：2026-08-31
+更新：2026-09-01
 
 ## 1. 文档职责
 
@@ -114,7 +114,7 @@ AI 只发起经授权的 operator/control 语义动作，不能直接调用 adap
 
 - Copy 已有 semantic Applied 到同一账户 WAL、签名成交/仓位的物理桥；leader 权威事实自动接入、持续 ledger/drift repair 和完整产品端到端仍须验收。
 - 六所 Node 已组合 Account Runtime、Execution Lane 与 `AccountMutationHost`；Grid/Scalping 的生产私流驱动和物理接线、控制撤单/清仓及多 symbol 常驻调度仍须闭合，不能以纯 reducer 测试替代。
-- Scalping 的 FeatureSource 已接收行情，但 `production_resident/scalping.rs` 尚未将其 frame 驱动真实 engine 的 evaluate、checkpoint、签名入场确认与退出保护；手工语义候选通过 WAL 不等于自动策略闭环，保护链缺失时不得开放自动入场。
+- Scalping 的 FeatureSource frame 已接入真实 engine evaluate 与同一 Actor checkpoint 恢复，配置须显式固定 release、Owner scope 和风险预算；手造候选到 Host 的旧入口已移除。各所完整 trades/bars 输入、签名安全投影、入场确认与退出保护仍未闭合；保护缺失时阻止自动入场，对外不得显示已可运行。
 - 根 package 的旧三所生产 binary 已移除，但服务器上的旧 release、未决 WAL 与运行进程仍须逐所核验和接管；本地删除入口不构成生产退休证明。
 - 六所尚未共同满足同一套启动恢复、Owner 路由、Stop/Flatten、Unknown 收敛和产品级 Canary 契约。
 - 手动 `TradeIntent` 已有 Node 显式选价、同一 Actor replay 的原始计划、精确自有手动单撤单及只读 delivery 对账；仍须完成与 Grid desired/库存的协同、Copy 绑定支持和全 scope 撤单后才能认定完整闭环。当前不支持的 scope 明确拒绝；BBO 自动选价不能替代用户选价，离线通过不替代生产接管验收。
@@ -541,7 +541,7 @@ scripts/verify_repository_hygiene.ps1
 - `scripts/verify_workspace_quality.ps1`；
 - `scripts/verify_venue_node_binaries.ps1`；
 - `scripts/verify_venue_node_binary_isolation.ps1`；
-- `scripts/package_venue_node_linux_release.sh --release-id <id> --output-root <absolute-linux-path> --preflight-only`，随后以相同参数去掉预检生成仅含六个固定 Node binary、SHA256SUMS 与 manifest 的版本化目录；
+- `scripts/package_venue_node_linux_release.sh --release-id <id> --output-root <absolute-release-root> --build-root <absolute-build-root> --expected-revision <40-hex-commit> --preflight-only`；源码、构建根和发布根互不包含，预检要求干净且精确匹配的 Git checkout、Rust/Cargo 1.98.0 和至少 20 GiB 空闲。随后以相同参数去掉预检，持有固定缓存排他锁、逐所单 job 构建，生成仅含六个固定 Node binary、SHA256SUMS 与 manifest 的版本化目录；不清理缓存、不操作服务，见 `scripts/BUILD_POLICY.md`；
 - `scripts/verify_venue_node_linux_release.ps1`；
 - `scripts/verify_gateway_candidate_contract.ps1`；
 - `scripts/verify_postgres_integration.ps1`；

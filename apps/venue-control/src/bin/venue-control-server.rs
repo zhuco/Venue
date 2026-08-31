@@ -7,7 +7,7 @@ use venue_control::accounts::{AccountService, CredentialCipher, MIGRATION_0015};
 use venue_control::{
     ControlHttpConfig, ControlService, MIGRATION_0001, MIGRATION_0002, MIGRATION_0003,
     MIGRATION_0004, MIGRATION_0005, MIGRATION_0006, MIGRATION_0007, MIGRATION_0008, MIGRATION_0009,
-    MIGRATION_0010, MIGRATION_0011, MIGRATION_0012, MIGRATION_0013, MIGRATION_0014,
+    MIGRATION_0010, MIGRATION_0011, MIGRATION_0012, MIGRATION_0013, MIGRATION_0014, MIGRATION_0016,
     PgControlRepository, control_shutdown_channel, serve_local_with_accounts,
 };
 
@@ -66,5 +66,6 @@ async fn install_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(MIGRATION_0013).execute(pool).await?;
     sqlx::raw_sql(MIGRATION_0014).execute(pool).await?;
     sqlx::raw_sql(MIGRATION_0015).execute(pool).await?;
+    sqlx::raw_sql(MIGRATION_0016).execute(pool).await?;
     Ok(())
 }

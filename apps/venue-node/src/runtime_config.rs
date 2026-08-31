@@ -11,7 +11,13 @@ use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
 use venue_runtime::{
     AccountSymbolSet, StrategyBinding, StrategyInstanceKey, StrategyKind, account::AccountKey,
 };
-use venue_strategies::hedged_grid::{HedgedGridBinding, HedgedGridParams, HedgedGridState};
+use venue_strategies::{
+    hedged_grid::{HedgedGridBinding, HedgedGridParams, HedgedGridState},
+    scalping::{
+        ScalpingParams, StrategyBinding as ScalpingStrategyBinding,
+        StrategyKind as ScalpingStrategyKind,
+    },
+};
 
 pub const NODE_RUNTIME_CONFIG_VERSION: u16 = 1;
 
@@ -49,6 +55,10 @@ pub struct NodeRuntimeStrategy {
     /// for every other actor so a generic strategy record cannot accidentally bootstrap a grid.
     #[serde(default)]
     pub grid: Option<NodeGridRuntimeConfig>,
+    /// The pure Scalping release identity and its strategy-local hard budget. It is mandatory
+    /// for Scalping so a generic actor cannot manufacture a feature profile or checkpoint.
+    #[serde(default)]
+    pub scalping: Option<NodeScalpingRuntimeConfig>,
     /// An opt-in, strategy-scoped Copy leader capital allocation.  Omission disables leader
     /// fact publication; total account equity is never substituted.
     #[serde(default)]
@@ -73,6 +83,13 @@ pub struct NodeGridRuntimeConfig {
     /// intentionally opt-in: ordinary first installation still rejects a leg below one grid.
     #[serde(default)]
     pub skip_inventory_replenishment_until_recovered: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct NodeScalpingRuntimeConfig {
+    pub parameter_release_id: String,
+    pub owner_scope: String,
+    pub risk_budget: Amount,
 }
 
 impl NodeRuntimeConfig {
@@ -131,11 +148,20 @@ impl NodeRuntimeConfig {
             {
                 return Err(NodeError::RuntimeConfig);
             }
-            match (strategy.strategy_kind, &strategy.grid) {
-                (StrategyKind::HedgedGrid, Some(grid)) if grid.params.validate().is_ok() => {
+            match (strategy.strategy_kind, &strategy.grid, &strategy.scalping) {
+                (StrategyKind::HedgedGrid, Some(grid), None) if grid.params.validate().is_ok() => {
                     self.grid_initial_state(strategy)?;
                 }
-                (StrategyKind::HedgedGrid, _) | (_, Some(_)) => {
+                (StrategyKind::Scalping, None, Some(_))
+                    if self.scalping_binding_for(strategy).is_ok_and(|binding| {
+                        ScalpingParams::for_binding(&binding)
+                            .validate_for(&binding)
+                            .is_ok()
+                    }) => {}
+                (StrategyKind::HedgedGrid, _, _)
+                | (StrategyKind::Scalping, _, _)
+                | (_, Some(_), _)
+                | (_, _, Some(_)) => {
                     return Err(NodeError::RuntimeConfig);
                 }
                 _ => {}
@@ -223,6 +249,38 @@ impl NodeRuntimeConfig {
             .map_err(|_| NodeError::RuntimeConfig)
     }
 
+    /// Maps only explicit Node configuration into the pure Scalping binding. This binding has no
+    /// Runtime token or execution authority; it makes the feature profile and checkpoint release
+    /// identity reproducible on restart.
+    pub fn scalping_binding_for(
+        &self,
+        strategy: &NodeRuntimeStrategy,
+    ) -> Result<ScalpingStrategyBinding, NodeError> {
+        let scalping = strategy.scalping.as_ref().ok_or(NodeError::RuntimeConfig)?;
+        if strategy.strategy_kind != StrategyKind::Scalping
+            || scalping.parameter_release_id.trim().is_empty()
+            || scalping.owner_scope.trim().is_empty()
+            || scalping.risk_budget.asset.as_str() != strategy.symbol.quote()
+            || !scalping.risk_budget.value.is_sign_positive()
+            || scalping.risk_budget.value.is_zero()
+        {
+            return Err(NodeError::RuntimeConfig);
+        }
+        let binding = ScalpingStrategyBinding {
+            strategy_kind: ScalpingStrategyKind::Scalping,
+            strategy_instance_id: strategy.instance_id.clone(),
+            run_id: strategy.run_id.clone(),
+            exchange: self.venue.as_str().to_owned(),
+            account: self.trading_account_id.clone(),
+            symbol: strategy.symbol.clone(),
+            parameter_release_id: scalping.parameter_release_id.clone(),
+            owner_scope: scalping.owner_scope.clone(),
+            risk_budget: scalping.risk_budget.clone(),
+        };
+        binding.validate().map_err(|_| NodeError::RuntimeConfig)?;
+        Ok(binding)
+    }
+
     /// Returns only the explicit strategy allocation which passed the exact quote validation at
     /// load time.  It is observation configuration, never a claim on account equity.
     #[must_use]
@@ -270,14 +328,14 @@ mod tests {
           "trading_account_id":"00000000-0000-4000-8000-000000000001","node_id":"node-a",
           "control":{"loopback_origin":"http://127.0.0.1:8080/","poll_interval_ms":100,"projection_interval_ms":100,"lease_duration_ms":1000,"claim_limit":1},
           "strategies":[
-            {"strategy_kind":"scalping","instance_id":"a","run_id":"run-a","config_digest":"digest-a","config_epoch":1,"symbol":"DOGE/USDT"}
+            {"strategy_kind":"scalping","instance_id":"a","run_id":"run-a","config_digest":"digest-a","config_epoch":1,"symbol":"DOGE/USDT","scalping":{"parameter_release_id":"scalping-shadow-v1","owner_scope":"a","risk_budget":{"asset":"USDT","value":"10"}}}
           ]
         }"#;
         std::fs::write(&path, fixture)?;
         assert!(NodeRuntimeConfig::load(&path, &binding).is_ok());
         let two_symbols = fixture.replace(
-            r#"{"strategy_kind":"scalping","instance_id":"a","run_id":"run-a","config_digest":"digest-a","config_epoch":1,"symbol":"DOGE/USDT"}"#,
-            r#"{"strategy_kind":"scalping","instance_id":"a","run_id":"run-a","config_digest":"digest-a","config_epoch":1,"symbol":"DOGE/USDT"},{"strategy_kind":"copy","instance_id":"b","run_id":"run-b","config_digest":"digest-b","config_epoch":1,"symbol":"BTC/USDT"}"#,
+            r#"{"strategy_kind":"scalping","instance_id":"a","run_id":"run-a","config_digest":"digest-a","config_epoch":1,"symbol":"DOGE/USDT","scalping":{"parameter_release_id":"scalping-shadow-v1","owner_scope":"a","risk_budget":{"asset":"USDT","value":"10"}}}"#,
+            r#"{"strategy_kind":"scalping","instance_id":"a","run_id":"run-a","config_digest":"digest-a","config_epoch":1,"symbol":"DOGE/USDT","scalping":{"parameter_release_id":"scalping-shadow-v1","owner_scope":"a","risk_budget":{"asset":"USDT","value":"10"}}},{"strategy_kind":"copy","instance_id":"b","run_id":"run-b","config_digest":"digest-b","config_epoch":1,"symbol":"BTC/USDT"}"#,
         );
         std::fs::write(&path, two_symbols)?;
         let configured = NodeRuntimeConfig::load(&path, &binding)?;
@@ -300,11 +358,22 @@ mod tests {
           "trading_account_id":"00000000-0000-4000-8000-000000000001","node_id":"node-a",
           "control":{"loopback_origin":"http://127.0.0.1:8080/","poll_interval_ms":100,"projection_interval_ms":100,"lease_duration_ms":1000,"claim_limit":1},
           "strategies":[
-            {"strategy_kind":"scalping","instance_id":"a","run_id":"run-a","config_digest":"digest-a","config_epoch":1,"symbol":"DOGE/USDT"},
+            {"strategy_kind":"scalping","instance_id":"a","run_id":"run-a","config_digest":"digest-a","config_epoch":1,"symbol":"DOGE/USDT","scalping":{"parameter_release_id":"scalping-shadow-v1","owner_scope":"a","risk_budget":{"asset":"USDT","value":"10"}}},
             {"strategy_kind":"copy","instance_id":"b","run_id":"run-b","config_digest":"digest-b","config_epoch":1,"symbol":"DOGE/USDT"}
           ]
         }"#;
         std::fs::write(&path, duplicate)?;
+        assert!(matches!(
+            NodeRuntimeConfig::load(&path, &binding),
+            Err(NodeError::RuntimeConfig)
+        ));
+        let missing_scalping = r#"{
+          "version":1,"mode":"LIVE","venue":"bybit",
+          "trading_account_id":"00000000-0000-4000-8000-000000000001","node_id":"node-a",
+          "control":{"loopback_origin":"http://127.0.0.1:8080/","poll_interval_ms":100,"projection_interval_ms":100,"lease_duration_ms":1000,"claim_limit":1},
+          "strategies":[{"strategy_kind":"scalping","instance_id":"a","run_id":"run-a","config_digest":"digest-a","config_epoch":1,"symbol":"DOGE/USDT"}]
+        }"#;
+        std::fs::write(&path, missing_scalping)?;
         assert!(matches!(
             NodeRuntimeConfig::load(&path, &binding),
             Err(NodeError::RuntimeConfig)

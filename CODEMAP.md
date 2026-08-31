@@ -1,6 +1,6 @@
 # VENUE 功能入口
 
-更新：2026-08-31
+更新：2026-09-01
 
 本文件只回答“当前功能代码在哪里”。合并跟单、六交易所、指标、桌面/Web UI 后的目标 workspace、依赖边界和技术栈查
 [`ARCHITECTURE.md`](ARCHITECTURE.md)；多策略账户运行时、网格、成交热路径、库存恢复、验收和接管统一查
@@ -50,6 +50,8 @@ Web 的 Control 用户会话只在 BFF 环境注入，HTTP/SSE 同时保留 Cont
 | 凭证环境读取 | `src/credential_env.rs` | 根 `.env` 仅作本地输入，禁止读取到文档/日志 |
 | 规范交易账户、Instrument、交易对、金额、订单、仓位、成交 | `crates/venue-domain/src/domain/mod.rs` | `identity.rs`、`instrument.rs`、`market.rs::PublicBar` 与 `risk_value.rs` 提供规范领域类型；`order_outcome.rs` 规定 adapter 必须先验签，且仅以新代、完整订单族页面收集到终端 cursor 的证据证明 `ProvenAbsent`；point 404/部分空页保持 `Unresolved`，不能收敛原 UNKNOWN fence；仅 `SignedOrderReadback` 与 `AuthoritativeOrderOutcome` 不可反序列化 |
 | 错误汇总 | `src/error.rs` | 各领域本地错误枚举 |
+| 未领取即过期的 Copy 恢复 | `apps/venue-control/src/copy_planning_expiry.rs` | `0016_copy_expired_unclaimed.sql` 仅扩展双 delivery 数据库状态；锁定并证明从未 claim/执行/记账后，依据更新双边事实原子生成独立 job，保留原 job。`copy_execution_postgres.rs` 拒绝退休后的晚到执行证据；`tests/copy_postgres/unclaimed_expiry.rs` 覆盖重跑迁移、恢复、幂等与负例 |
+| Scalping 真实引擎输入与恢复 | `apps/venue-node/src/production_resident/scalping.rs`、`runtime_config.rs` | 显式 `scalping.parameter_release_id/owner_scope/risk_budget` 绑定纯引擎及 FeatureSource；frame 驱动 evaluate 和既有 Actor checkpoint，原手造 candidate 到 Host 入口已移除。签名安全/保护未接好时禁止自动入场，Control 的 Running 投影降为 NeedsAttention；各所 trades/bars、成交确认及退出保护仍待闭合 |
 
 ## 对冲网格与旧工件兼容定位
 
@@ -77,7 +79,7 @@ Web 的 Control 用户会话只在 BFF 环境注入，HTTP/SSE 同时保留 Cont
 | 当前 Gate 配置/root | `venue.gate.example.toml` | 服务器 `/home/cta/venue/artifacts/gate_doge_usdt`；风险为 Live `3 / 0.05 / 0.30`；发布号和当前订单数以服务器签名 doctor 与 handoff 收据为准，不在长期文档固化 |
 | 当前 Bitget 配置/root | `venue.bitget.example.toml` | 服务器 canonical root 为 `/home/cta/venue/artifacts/bitget_doge_usdt`，风险为 Live `3 / 0.05 / 0.30`；活动 release、运行状态、订单数、pending/WAL 与 custody 只以服务器进程、新鲜签名证据及 writer/handoff 收据为准，不在长期文档固化瞬时值 |
 | 固定 Node 二进制验证 | `scripts/verify_venue_node_binaries.ps1` | 验证六个 `venue-node-*` 是唯一固定 venue 启动产物；旧 hedged-grid 发布准备脚本与生产 binary 已删除 |
-| Linux Node 发布目录 | `scripts/package_venue_node_linux_release.sh` | 只构建并放入版本化目录的六个 `venue-node-*`，附 SHA256SUMS/manifest；`--preflight-only` 只检查发布条件，绝不操作实盘进程、凭证或账户 artifacts；`verify_venue_node_linux_release.ps1` 静态验收该 allow-list |
+| Linux Node 发布目录 | `scripts/package_venue_node_linux_release.sh` | 显式固定 `--expected-revision`、`--build-root` 与独立发布根；干净 Git/Rust 1.98/20 GiB 预检后持锁复用缓存，逐所单 job 生成六个 `venue-node-*` 和 SHA256SUMS/manifest。`--preflight-only` 不创建目录或锁，绝不操作实盘进程、凭证或账户 artifacts；资源边界见 `scripts/BUILD_POLICY.md`，脚本契约验证在 `verify_venue_node_linux_release.ps1` |
 
 ## 交易所 adapter
 
