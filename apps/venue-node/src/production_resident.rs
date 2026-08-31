@@ -50,7 +50,7 @@ pub struct ProductionResident<G> {
         not(any(feature = "binance", feature = "bitget", feature = "gate")),
         allow(dead_code)
     )]
-    scalping_capture_sequence: u64,
+    scalping_capture_sequence: BTreeMap<venue_runtime::StrategyInstanceKey, u64>,
 }
 
 /// The strictly bounded market input needed by the one Grid bootstrap calculation.  The Binance
@@ -133,7 +133,7 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             scalping_bitget_books: BTreeMap::new(),
             #[cfg(feature = "gate")]
             scalping_gate_books: BTreeMap::new(),
-            scalping_capture_sequence: 0,
+            scalping_capture_sequence: BTreeMap::new(),
         })
     }
 

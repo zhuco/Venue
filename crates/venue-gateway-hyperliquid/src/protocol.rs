@@ -70,6 +70,17 @@ pub struct HyperliquidPerpMeta {
     pub trading_enabled: bool,
 }
 
+/// The public metadata facts needed to prove that a canonical `BASE/USDC` binding selects one
+/// bare Hyperliquid perpetual coin.  This deliberately contains no account scope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedHyperliquidPerpMeta {
+    pub native_coin: String,
+    pub asset_index: u32,
+    pub size_decimals: u32,
+    pub max_leverage: u32,
+    pub trading_enabled: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HyperliquidBbo {
     pub scope: HyperliquidPayloadScope,
@@ -541,9 +552,26 @@ pub fn parse_perp_meta(
     payload: &[u8],
     binding: &HyperliquidReadBinding,
 ) -> Result<HyperliquidPerpMeta, HyperliquidError> {
+    let resolved = resolve_perp_meta(payload, binding.gateway().gateway_binding().symbol.clone())?;
+    Ok(HyperliquidPerpMeta {
+        scope: HyperliquidPayloadScope {
+            binding: binding.clone(),
+            native_coin: resolved.native_coin,
+        },
+        asset_index: resolved.asset_index,
+        size_decimals: resolved.size_decimals,
+        max_leverage: resolved.max_leverage,
+        trading_enabled: resolved.trading_enabled,
+    })
+}
+
+pub(crate) fn resolve_perp_meta(
+    payload: &[u8],
+    symbol: Symbol,
+) -> Result<ResolvedHyperliquidPerpMeta, HyperliquidError> {
     let response: PerpMetaResponse =
         serde_json::from_slice(payload).map_err(|_| HyperliquidError::Payload)?;
-    let base = binding.gateway().gateway_binding().symbol.base();
+    let base = symbol.base();
     let mut matches = response
         .universe
         .into_iter()
@@ -557,11 +585,8 @@ pub fn parse_perp_meta(
     {
         return Err(HyperliquidError::Payload);
     }
-    Ok(HyperliquidPerpMeta {
-        scope: HyperliquidPayloadScope {
-            binding: binding.clone(),
-            native_coin: row.name,
-        },
+    Ok(ResolvedHyperliquidPerpMeta {
+        native_coin: row.name,
         asset_index: u32::try_from(index).map_err(|_| HyperliquidError::Payload)?,
         size_decimals: row.sz_decimals,
         max_leverage: row.max_leverage,

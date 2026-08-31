@@ -130,6 +130,7 @@ Exchange Account Process
 - 每个账户进程对同一交易所尽量共享公共连接；
 - 维护持续更新的 BBO（最优买卖价）和必要深度；
 - 每个事件带交易所时间、接收时间和单调序号；
+- 公共源按真实协议区分完整 WS 图像与 snapshot/delta 桥：OKX 的增量前序必须命中上一 `seqId`，Bybit 在 adapter 内按单调 `u/seq` 重建整簿再输出 Snapshot，Hyperliquid 以完整 L2 的源时间作为快照水位，均不得虚构原生连续编号。完整图像由 Node 的显式只读 `FullSnapshotBook` view 提供就绪语义，不把普通 REST 快照或一次性 BBO 提升为策略输入；FeatureSource capture cursor 按实例隔离，其他 symbol 的事件不能制造假断层。
 - 慢策略不能阻塞行情读取；仅 Snapshot、Ticker、MarkFunding 可保留最新值，Delta、Trade、Bar 必须进入有界无损队列；
 - 私有或连续行情邮箱满载必须显式失败并封锁相关新增风险，不能静默丢事件；BBO 新鲜度只用连接代、交易所事件时间及同事件族序号，不用本机接收时间，也不比较不同事件族的序号；任一事件族进入新 symbol generation 时必须清空该 symbol 全部旧 watermark、BBO 和 Actor 行情队列。BBO 只参与初装、整网重建及显式再中心化，不参与成交滚动；这些非滚动 mutation turn 的完整签名私有 readback、风险或规则核验若可能超过 BBO 新鲜窗口，必须在任意 WAL/mutation 前再次有界排空并持久化期间已到达的公共帧，再按新的当前时钟复核 BBO；closing wave 的签名确认也可能跨越该窗口，因此在 opening wave 尚未 dispatch 前必须再次持久排空并重采 BBO，只有全量 opening 仍为 post-only 才可发出；刷新只更新数据，不授予 writer、risk 或 dispatch authority。
 - WebSocket 一次建连的 DNS、全部解析地址、TCP、代理 CONNECT、TLS 与 upgrade 共用 10 秒总期限，禁止每个地址重新获得完整超时；失败后的公共、私有及启动连接按有上限指数退避，并用账户/进程/失败代际错峰，禁止固定间隔同步重连风暴。
@@ -477,12 +478,14 @@ Copy delivery 的 semantic Applied 只能表示 Actor 已耐久接收目标。No
 
 ## 12. 验收标准
 
-代码提交前必须通过：
+局部代码按 package 与直接契约验证，文档/注释只做静态检查；已通过基线后的增量不重复全工作区回归。
+跨模块公共契约、依赖或架构变更及正式发布前集中通过：
 
 ```text
 cargo fmt --all -- --check
-cargo check --all-targets
-cargo test
+cargo check --workspace --all-targets
+cargo test --workspace
+scripts/verify_repository_hygiene.ps1
 ```
 
 还必须覆盖：

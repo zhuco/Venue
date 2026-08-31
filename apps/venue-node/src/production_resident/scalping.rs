@@ -21,6 +21,14 @@ use venue_strategies::scalping::{Direction, SemanticIntent, SemanticPurpose};
 use super::{NodeError, ProductionResident, persist_anchor, resident_error};
 use crate::ResidentSemanticIntent;
 
+mod full_snapshot_book;
+
+#[derive(Clone, Copy)]
+enum BookFeed {
+    SequencedDelta,
+    CompleteWebSocketImages,
+}
+
 #[cfg(feature = "bitget")]
 pub(crate) struct BitgetScalpingBookBridge {
     sequencer: venue_gateway_bitget::public::BitgetBookSequencer,
@@ -218,16 +226,53 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         self.runtime.publish_market(event).map_err(resident_error)
     }
 
-    /// Feeds a Gate or Bitget sequenced depth event through the shared MarketHub and the same
-    /// feature source used by Binance.  This stays private to the two adapter-specific bridges:
-    /// a standalone BBO, ticker, or REST poll has no path into a Scalping feature window.
-    #[cfg_attr(not(any(feature = "bitget", feature = "gate")), allow(dead_code))]
-    fn publish_sequenced_scalping_book(
+    /// Only the fixed receiver/bridge feeds this ingress, never an unsequenced REST/BBO poll.
+    #[cfg_attr(
+        not(any(test, feature = "bitget", feature = "gate", feature = "okx")),
+        allow(dead_code)
+    )]
+    pub(crate) fn publish_sequenced_scalping_book(
         &mut self,
         binding: &StrategyBinding,
         received_at_ms: u64,
         event: MarketEvent,
     ) -> Result<bool, NodeError> {
+        self.publish_stream_book(binding, received_at_ms, event, BookFeed::SequencedDelta)
+    }
+
+    #[cfg_attr(
+        not(any(test, feature = "bybit", feature = "hyperliquid")),
+        allow(dead_code)
+    )]
+    pub(crate) fn publish_full_snapshot_scalping_book(
+        &mut self,
+        binding: &StrategyBinding,
+        received_at_ms: u64,
+        event: MarketEvent,
+    ) -> Result<bool, NodeError> {
+        if !matches!(
+            binding.key.account.exchange,
+            venue_gateway_api::VenueId::Bybit | venue_gateway_api::VenueId::Hyperliquid
+        ) || !matches!(event, MarketEvent::Snapshot(_))
+        {
+            return Err(NodeError::ResidentRuntime);
+        }
+        self.publish_stream_book(
+            binding,
+            received_at_ms,
+            event,
+            BookFeed::CompleteWebSocketImages,
+        )
+    }
+
+    fn publish_stream_book(
+        &mut self,
+        binding: &StrategyBinding,
+        received_at_ms: u64,
+        event: MarketEvent,
+        feed: BookFeed,
+    ) -> Result<bool, NodeError> {
+        self.require_registered_scalping_binding(binding, binding.key.account.exchange)?;
         if !matches!(event, MarketEvent::Snapshot(_) | MarketEvent::Delta(_)) {
             return Err(NodeError::ResidentRuntime);
         }
@@ -235,7 +280,7 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             .map_err(|_| NodeError::ResidentRuntime)?;
         let published = self.publish_scalping_market(binding, event.clone())?;
         if published {
-            self.drive_features(binding, event)?;
+            self.drive_features(binding, event, feed)?;
         }
         Ok(published)
     }
@@ -462,7 +507,7 @@ impl ProductionResident<venue_gateway_binance::BinanceAccountGateway> {
             .map_err(|_| NodeError::ResidentRuntime)?;
         let published = self.publish_scalping_market(&binding, event.clone())?;
         if published {
-            self.drive_features(&binding, event)?;
+            self.drive_features(&binding, event, BookFeed::SequencedDelta)?;
         }
         Ok(published)
     }
@@ -477,6 +522,7 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         &mut self,
         binding: &StrategyBinding,
         event: AccountMarketEvent,
+        feed: BookFeed,
     ) -> Result<(), NodeError> {
         if !matches!(event.event, MarketEvent::Snapshot(_))
             && !self.scalping_features.contains_key(&binding.key)
@@ -516,23 +562,31 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             }
             _ => {}
         }
-        *scalping_capture_sequence = scalping_capture_sequence
+        // Each feature source owns a capture cursor; other symbols must not look like gaps.
+        let capture_sequence = scalping_capture_sequence
+            .entry(binding.key.clone())
+            .or_insert(0);
+        *capture_sequence = capture_sequence
             .checked_add(1)
             .ok_or(NodeError::ResidentRuntime)?;
         let source = scalping_features
             .get_mut(&binding.key)
             .ok_or(NodeError::ResidentRuntime)?;
-        source
-            .consume(
-                venue_indicators::RecordedPublicEvent {
-                    capture_sequence: *scalping_capture_sequence,
-                    received_at_ms: event.received_at_ms,
-                    event: event.event,
-                },
-                book,
-                received_ms()?,
-            )
-            .map_err(|_| NodeError::ResidentRuntime)?;
+        let input = venue_indicators::RecordedPublicEvent {
+            capture_sequence: *capture_sequence,
+            received_at_ms: event.received_at_ms,
+            event: event.event,
+        };
+        let current_ms = received_ms()?;
+        match feed {
+            BookFeed::SequencedDelta => source.consume(input, book, current_ms),
+            BookFeed::CompleteWebSocketImages => source.consume(
+                input,
+                &full_snapshot_book::FullSnapshotBook(book),
+                current_ms,
+            ),
+        }
+        .map_err(|_| NodeError::ResidentRuntime)?;
         Ok(())
     }
 }
@@ -1084,6 +1138,196 @@ mod tests {
         };
         assert!(!book.apply_delta_if_fresh(reverse)?);
         assert!(!book.bridged());
+        Ok(())
+    }
+
+    fn stream_image(
+        symbol: Symbol,
+        sequence: u64,
+        time: u64,
+    ) -> Result<MarketEvent, Box<dyn std::error::Error>> {
+        use venue_domain::{MarketLevel, MarketSnapshot};
+        Ok(MarketEvent::Snapshot(MarketSnapshot {
+            symbol,
+            generation: 1,
+            sequence,
+            exchange_time_ms: Some(time),
+            bids: vec![MarketLevel {
+                price: Price::new(Decimal::ONE)?,
+                quantity: Decimal::TEN,
+            }],
+            asks: vec![MarketLevel {
+                price: Price::new(Decimal::new(101, 2))?,
+                quantity: Decimal::TEN,
+            }],
+        }))
+    }
+
+    #[test]
+    fn complete_ws_images_reach_features_without_inventing_delta_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for venue in [VenueId::Bybit, VenueId::Hyperliquid] {
+            let directory = tempfile::tempdir()?;
+            let (mut resident, state, binding) = setup_for(directory.path(), venue)?;
+            let time = now()?;
+            for sequence in [10, 70, 100] {
+                assert!(resident.publish_full_snapshot_scalping_book(
+                    &binding,
+                    time,
+                    stream_image(binding.key.symbol.clone(), sequence, time)?
+                )?);
+            }
+            let source = resident
+                .scalping_features
+                .get(&binding.key)
+                .ok_or("missing source")?;
+            assert_eq!(source.generation(), Some(1));
+            assert_ne!(source.state(), venue_indicators::FeatureState::DataGap);
+            assert_eq!(
+                resident.scalping_capture_sequence.get(&binding.key),
+                Some(&3)
+            );
+            let book = resident
+                .scalping_books
+                .get(&binding.key)
+                .ok_or("missing book")?;
+            assert_eq!(book.sequence(), Some(100));
+            assert!(
+                !book.bridged(),
+                "full image ingestion must not forge delta continuity"
+            );
+            assert!(venue_indicators::PublicBook::bridged(
+                &full_snapshot_book::FullSnapshotBook(book)
+            ));
+            assert_eq!(state.lock().map_err(|_| "state lock")?.dispatches, 0);
+
+            let mut stale_binding = binding.clone();
+            stale_binding.config_digest = "old-config".to_owned();
+            assert!(
+                resident
+                    .publish_full_snapshot_scalping_book(
+                        &stale_binding,
+                        time,
+                        stream_image(binding.key.symbol.clone(), 101, time)?
+                    )
+                    .is_err()
+            );
+            assert!(
+                resident
+                    .publish_full_snapshot_scalping_book(
+                        &binding,
+                        time,
+                        stream_image("BTC/USDT".parse()?, 101, time)?
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                resident.scalping_capture_sequence.get(&binding.key),
+                Some(&3)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn okx_stream_keeps_real_predecessor_bridge_and_fences_gap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use venue_domain::MarketDelta;
+        let directory = tempfile::tempdir()?;
+        let (mut resident, state, binding) = setup(directory.path())?;
+        let time = now()?;
+        assert!(
+            resident
+                .publish_full_snapshot_scalping_book(
+                    &binding,
+                    time,
+                    stream_image(binding.key.symbol.clone(), 10, time)?
+                )
+                .is_err()
+        );
+        assert!(resident.publish_sequenced_scalping_book(
+            &binding,
+            time,
+            stream_image(binding.key.symbol.clone(), 10, time)?
+        )?);
+        let delta = |previous, sequence| {
+            MarketEvent::Delta(MarketDelta {
+                symbol: binding.key.symbol.clone(),
+                generation: 1,
+                first_sequence: sequence,
+                previous_sequence: Some(previous),
+                sequence,
+                exchange_time_ms: Some(time),
+                bids: Vec::new(),
+                asks: Vec::new(),
+            })
+        };
+        assert!(resident.publish_sequenced_scalping_book(&binding, time, delta(10, 90))?);
+        assert!(
+            resident
+                .scalping_books
+                .get(&binding.key)
+                .ok_or("book")?
+                .bridged()
+        );
+        resident.publish_sequenced_scalping_book(&binding, time, delta(99, 100))?;
+        assert!(!resident.scalping_features.contains_key(&binding.key));
+        resident.publish_sequenced_scalping_book(&binding, time, delta(100, 101))?;
+        assert!(!resident.scalping_features.contains_key(&binding.key));
+        assert_eq!(state.lock().map_err(|_| "state lock")?.dispatches, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn interleaved_symbols_keep_independent_feature_capture_cursors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let (mut resident, state, first) = setup_for(directory.path(), VenueId::Bybit)?;
+        let mut second = first.clone();
+        second.key.symbol = "BTC/USDT".parse()?;
+        second.key.instance_id = "scalp-2".to_owned();
+        // Exercise only per-actor public feature state, without installing any execution route.
+        resident
+            .scalping_books
+            .insert(second.key.clone(), venue_indicators::OrderBook::default());
+        resident.scalping_features.insert(
+            second.key.clone(),
+            venue_indicators::ScalpingPublicMarketSource::new(
+                second.key.symbol.clone(),
+                "node_scalping_v1",
+                feature_profile_digest(&second),
+                1_000,
+                NonZeroUsize::new(256).ok_or("history")?,
+            )?,
+        );
+        let time = now()?;
+        for sequence in [10, 90] {
+            for binding in [&first, &second] {
+                resident.drive_features(
+                    binding,
+                    AccountMarketEvent::new(
+                        time,
+                        stream_image(binding.key.symbol.clone(), sequence, time)?,
+                    )?,
+                    BookFeed::CompleteWebSocketImages,
+                )?;
+            }
+        }
+        for binding in [&first, &second] {
+            assert_eq!(
+                resident.scalping_capture_sequence.get(&binding.key),
+                Some(&2)
+            );
+            assert_ne!(
+                resident
+                    .scalping_features
+                    .get(&binding.key)
+                    .ok_or("source")?
+                    .state(),
+                venue_indicators::FeatureState::DataGap
+            );
+        }
+        assert_eq!(state.lock().map_err(|_| "state lock")?.dispatches, 0);
         Ok(())
     }
 }

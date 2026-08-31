@@ -106,6 +106,7 @@ AI 只发起经授权的 operator/control 语义动作，不能直接调用 adap
 - Bybit、OKX、Hyperliquid 已使用较小的 `AccountMutationHost` 安全闭环执行显式预检和 Canary 命令。
 - `venue-copy` 已包含资本、目标敞口、数量、限价、确定性身份、delivery、ledger 和 drift 纯语义。
 - Control/PostgreSQL 已保存 Copy relation、job delivery、claim/ACK/receipt；Node 已能耐久应用 Copy 语义。
+- 六所固定 Node 已接入 adapter-owned 公共盘口；Bybit 重建完整簿、Hyperliquid 使用原生完整 L2 图像，OKX 按 `prevSeqId` 连续桥接。行情只进入共享 MarketHub/FeatureSource；公共接收器和 fixture 通过不代表策略自动出单、私流热路径或逐所接管完成。
 - `G:\kol\apps\web` 使用 Next.js 16、React 19、TypeScript 7，已有响应式 shell、角色页面、恢复、SSE、十进制和交互测试。
 
 ### 3.2 必须补齐的闭环
@@ -510,9 +511,10 @@ dispatch 启动 `<20ms`（均不含交易所网络）目标。Web 首次可用 s
 
 ## 8. 验收矩阵
 
-### 8.1 每个 Rust 修改
+### 8.1 Rust 分层验证
 
-必须通过：
+默认只检查修改的 package 与直接契约；交易安全修改另覆盖受影响的 risk/WAL/Unknown/恢复专项。文档、注释或 lint 标注不触发业务回归。
+跨模块公共契约、依赖或架构变更及正式发布前集中建立以下基线；基线通过后的局部增量不重复全工作区测试，记录源码范围与专项结果：
 
 ```text
 cargo fmt --all --check
@@ -532,9 +534,10 @@ scripts/verify_repository_hygiene.ps1
 - `scripts/verify_postgres_integration.ps1`；
 - 交易所 adapter contract 和故障注入测试。
 
-### 8.2 每个 Web 修改
+### 8.2 Web 分层验证
 
-必须通过：
+局部 UI 修改只验证客户端、对应交互和受影响视口；认证/BFF/协议变更追加边界与恢复专项。
+正式 Web 发布前集中通过以下完整基线，不在每次样式或文案调整后重复全部 E2E：
 
 ```text
 npm run typecheck

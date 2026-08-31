@@ -18,7 +18,7 @@
 ## 实施与实盘
 
 - 只实现当前获准任务，不创建未被当前需求使用的未来模块、公共 SDK、插件系统或多租户控制面。
-- 完成修改必须执行 `cargo fmt --all --check`、`cargo check --workspace --all-targets`、`cargo test --workspace`、`scripts/verify_repository_hygiene.ps1` 和任务专项验证；失败时不得宣称完成或删除被替代实现。
+- 默认按影响面验证：文档/注释只做静态检查，单模块修改只检查该 package 及直接契约，交易安全修改覆盖受影响的 risk/WAL/Unknown/恢复路径。跨模块公共契约、依赖或架构变更及正式发布前集中执行 `cargo fmt --all --check`、`cargo check --workspace --all-targets`、`cargo test --workspace`、`scripts/verify_repository_hygiene.ps1` 建立基线；基线后的局部增量不重复全工作区测试。记录验证对应的源码范围，相关验证失败时不得宣称完成或删除被替代实现。
 - 实盘 mutation 每个 `(exchange, trading_account_id)` 只允许一个账户级 writer；单机优先使用一个进程锁和一个串行 Execution Lane，多机部署实际出现前不得增加租约选举、分布式 fencing 或可执行文件 handoff 链。先验证，再按交易所逐家 Canary，禁止两个版本同时写同一账户。
 - 策略只输出语义意图；所有 mutation 必须依次经过 risk、同一命令 WAL 和账户级 writer。Owner 只是 WAL 中的 `strategy_id/user_id` 归属字段，不单独建立 authority、journal、root 或 receipt 体系。
 - 初期 Bybit、OKX、Hyperliquid 的 DOGE 账户累计名义仓位硬上限为 10U；已有未撤入场命令或交易所签名读到非零持仓时禁止继续增险。OKX 数量必须以实时 `ctVal × ctMult × contracts` 换算并遵守 `lotSz/minSz`，不得把基础币数量直接当张数。

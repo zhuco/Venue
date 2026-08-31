@@ -12,6 +12,7 @@ mod physical;
 mod private;
 mod private_ws;
 mod public;
+mod public_ws;
 mod readback;
 mod recovery_collector;
 mod sign;
@@ -61,6 +62,7 @@ pub use private_ws::{
     parse_ws_positions,
 };
 pub use public::{OkxInstrument, OkxNotionalSize, parse_bbo, parse_instrument};
+pub use public_ws::{OkxPublicWsError, OkxScalpingPublicReceiver};
 pub use readback::{
     OKX_PRIVATE_MAX_PAGES, OKX_PRIVATE_PAGE_LIMIT, OKX_PRIVATE_READBACK_SCHEMA_VERSION,
     OkxAlgoOrderKind, OkxCanonicalOrder, OkxOrderFamilyReadback, OkxPositionFact,

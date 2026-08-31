@@ -17,8 +17,6 @@ use venue_control_protocol::{
     SignedPositionFact, StrategyKind as ProjectionStrategyKind, StrategyLifecycle, StrategySummary,
 };
 use venue_domain::{FieldState, PositionSide};
-#[cfg(any(feature = "bitget", feature = "gate"))]
-use venue_gateway_api::{GatewayBinding, GatewayMode};
 use venue_runtime::{
     AccountPhysicalGateway, CommandState, StrategyBinding, StrategyKind,
     account::{AccountHealth, InstanceLifecycle},
@@ -47,6 +45,15 @@ type FileOutbox = NodeProjectionOutbox<OpaqueControlDeliveryJournal>;
 
 mod copy_planning;
 mod projection_digest;
+#[cfg(any(
+    feature = "binance",
+    feature = "bitget",
+    feature = "gate",
+    feature = "bybit",
+    feature = "okx",
+    feature = "hyperliquid"
+))]
+mod public_stream;
 use projection_digest::{envelope_digest, projection_digest_for};
 
 /// The production resident Control loop. Every configured `(symbol, instance, epoch)` receives
@@ -989,190 +996,6 @@ impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
         }
         Ok(())
     }
-}
-
-#[cfg(feature = "binance")]
-impl ControlResidentLoop<venue_gateway_binance::BinanceAccountGateway> {
-    /// Binance alone currently supplies the bounded private Grid bridge. Keep that adapter-only
-    /// pump out of the generic node loop so other venue processes cannot acquire a Binance read.
-    pub fn run_binance(mut self) -> Result<(), NodeError> {
-        let grid_bindings = self
-            .bindings
-            .values()
-            .filter(|binding| binding.key.strategy_kind == StrategyKind::HedgedGrid)
-            .cloned()
-            .collect::<Vec<_>>();
-        // Initial installation is one startup transaction, not a market-data retry loop. Its
-        // own signed readback leaves a failed/unknown account Paused; retrying here could create
-        // a second epoch or physical child after an indeterminate gateway outcome.
-        for binding in grid_bindings {
-            if self.resident.take_grid_bootstrap_request(&binding) {
-                self.resident.bootstrap_binance_grid_once(&binding)?;
-            }
-        }
-        self.run_with_private_pump(|resident| {
-            // Both bounded reads are adapter-normalized facts.  A public feed cannot bypass the
-            // same account Runtime/MarketHub, and a private fill remains first for Grid custody.
-            let private_progress = resident.poll_binance_grid_private_once()?;
-            let public_progress = resident.poll_binance_scalping_public_once()?;
-            Ok(private_progress || public_progress)
-        })
-    }
-}
-
-#[cfg(feature = "bitget")]
-impl ControlResidentLoop<venue_gateway_bitget::BitgetAccountGateway> {
-    /// Bitget's resident owns the public socket for every configured Scalping actor.  The socket
-    /// yields only adapter-validated `books` records; the existing resident bridge keeps its
-    /// snapshot hidden until a covering update proves a contiguous book.
-    pub fn run_bitget(mut self) -> Result<(), NodeError> {
-        let runtime = public_runtime()?;
-        let limits = venue_gateway_bitget::BitgetTransportLimits::new(
-            Duration::from_secs(10),
-            2 * 1024 * 1024,
-        )
-        .map_err(|_| NodeError::ResidentRuntime)?;
-        let scalping = self.scalping_bindings()?;
-        let mut receivers = Vec::with_capacity(scalping.len());
-        for binding in scalping {
-            let receiver = runtime
-                .block_on(venue_gateway_bitget::BitgetScalpingPublicReceiver::connect(
-                    public_gateway_binding(&binding)?,
-                    limits,
-                ))
-                .map_err(|error| NodeError::LiveHost {
-                    venue: venue_gateway_api::VenueId::Bitget,
-                    message: error.to_string(),
-                })?;
-            self.resident
-                .register_bitget_scalping_book_bridge(&binding)?;
-            receivers.push((binding, receiver));
-        }
-        let mut last_refresh_ms = None;
-        self.run_with_private_pump(move |resident| {
-            let private = refresh_signed_private_if_due(resident, &mut last_refresh_ms)?;
-            let mut public = false;
-            for (binding, receiver) in &mut receivers {
-                match runtime.block_on(receiver.next(Duration::from_millis(5))) {
-                    Ok(Some(venue_gateway_bitget::BitgetScalpingBookFrame::Books(message))) => {
-                        public |= resident.ingest_bitget_scalping_book(binding, message)?;
-                    }
-                    Ok(None) | Err(venue_gateway_bitget::BitgetPublicWsError::Idle) => {}
-                    Err(error) => {
-                        return Err(NodeError::LiveHost {
-                            venue: venue_gateway_api::VenueId::Bitget,
-                            message: error.to_string(),
-                        });
-                    }
-                }
-            }
-            Ok(private || public)
-        })
-    }
-}
-
-#[cfg(feature = "gate")]
-impl ControlResidentLoop<venue_gateway_gate::GateAccountGateway> {
-    /// Gate's socket is subscribed before its REST baseline is fetched. The resident therefore
-    /// observes the existing snapshot-plus-delta bridge, never an unsequenced REST book.
-    pub fn run_gate(mut self) -> Result<(), NodeError> {
-        let runtime = public_runtime()?;
-        let limits =
-            venue_gateway_gate::GateTransportLimits::new(Duration::from_secs(10), 2 * 1024 * 1024)
-                .map_err(|_| NodeError::ResidentRuntime)?;
-        let scalping = self.scalping_bindings()?;
-        let mut receivers = Vec::with_capacity(scalping.len());
-        for binding in scalping {
-            let receiver = runtime
-                .block_on(venue_gateway_gate::GateScalpingPublicReceiver::connect(
-                    public_gateway_binding(&binding)?,
-                    limits,
-                ))
-                .map_err(|error| NodeError::LiveHost {
-                    venue: venue_gateway_api::VenueId::Gate,
-                    message: error.to_string(),
-                })?;
-            let bridge = receiver
-                .new_book_bridge()
-                .map_err(|error| NodeError::LiveHost {
-                    venue: venue_gateway_api::VenueId::Gate,
-                    message: error.to_string(),
-                })?;
-            self.resident
-                .register_gate_scalping_book_bridge(&binding, bridge)?;
-            receivers.push((binding, receiver));
-        }
-        let mut last_refresh_ms = None;
-        self.run_with_private_pump(move |resident| {
-            let private = refresh_signed_private_if_due(resident, &mut last_refresh_ms)?;
-            let mut public = false;
-            for (binding, receiver) in &mut receivers {
-                match runtime.block_on(receiver.next(Duration::from_millis(5))) {
-                    Ok(Some(venue_gateway_gate::GateScalpingBookFrame::Snapshot(snapshot))) => {
-                        public |= resident.ingest_gate_scalping_snapshot(binding, snapshot)?;
-                    }
-                    Ok(Some(venue_gateway_gate::GateScalpingBookFrame::Delta(delta))) => {
-                        public |= resident.ingest_gate_scalping_delta(binding, delta)?;
-                    }
-                    Ok(None) | Err(venue_gateway_gate::GatePublicWsError::Idle) => {}
-                    Err(error) => {
-                        return Err(NodeError::LiveHost {
-                            venue: venue_gateway_api::VenueId::Gate,
-                            message: error.to_string(),
-                        });
-                    }
-                }
-            }
-            Ok(private || public)
-        })
-    }
-}
-
-#[cfg(any(feature = "bitget", feature = "gate"))]
-impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
-    fn scalping_bindings(&self) -> Result<Vec<StrategyBinding>, NodeError> {
-        Ok(self
-            .bindings
-            .values()
-            .filter(|binding| binding.key.strategy_kind == StrategyKind::Scalping)
-            .cloned()
-            .collect())
-    }
-}
-
-#[cfg(any(feature = "bitget", feature = "gate"))]
-fn public_runtime() -> Result<tokio::runtime::Runtime, NodeError> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|_| NodeError::ResidentRuntime)
-}
-
-#[cfg(any(feature = "bitget", feature = "gate"))]
-fn public_gateway_binding(binding: &StrategyBinding) -> Result<GatewayBinding, NodeError> {
-    GatewayBinding::new(
-        binding.key.account.exchange,
-        GatewayMode::Live,
-        binding.key.account.account.clone(),
-        binding.key.symbol.clone(),
-    )
-    .map_err(|_| NodeError::ResidentRuntime)
-}
-
-#[cfg(any(feature = "bitget", feature = "gate"))]
-fn refresh_signed_private_if_due<G: AccountPhysicalGateway>(
-    resident: &mut ProductionResident<G>,
-    last_refresh_ms: &mut Option<u64>,
-) -> Result<bool, NodeError> {
-    let now = now_ms().map_err(|_| NodeError::ResidentRuntime)?;
-    if last_refresh_ms.is_some_and(|previous| {
-        now.saturating_sub(previous) < MIN_SIGNED_PRIVATE_REFRESH_INTERVAL.as_millis() as u64
-    }) {
-        return Ok(false);
-    }
-    let refreshed = resident.refresh_signed_snapshot()?;
-    *last_refresh_ms = Some(now);
-    Ok(refreshed.private_generation() != 0)
 }
 
 async fn interruptible<T, F>(operation: F) -> Result<Option<T>, ControlResidentLoopError>

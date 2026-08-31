@@ -425,6 +425,7 @@ fn run_live_mvp_with_loop<G, F>(
     command: LiveMvpCommand,
     gateway: G,
     run_loop: F,
+    public_stream_venue: Option<VenueId>,
 ) -> Result<(), NodeError>
 where
     G: AccountPhysicalGateway,
@@ -434,7 +435,7 @@ where
     match command {
         LiveMvpCommand::Run(runtime_config) => {
             let config = NodeRuntimeConfig::load(&runtime_config, launch.binding())?;
-            reject_scalping_without_public_stream(&config)?;
+            reject_scalping_without_public_stream(&config, public_stream_venue)?;
             let mut resident = ProductionResident::open_with_symbols(
                 launch,
                 config.configured_symbols(launch.binding())?,
@@ -508,17 +509,13 @@ where
     }
 }
 
-/// A resident may only host Scalping when its fixed adapter owns a lifecycle-managed, sequenced
-/// public stream. Gate and Bitget own adapter-level websocket receivers which drive their
-/// existing sequenced ingress bridges. The remaining adapters still cannot admit Scalping: a
-/// REST/BBO substitute would leave their actors permanently market-starved.
-fn reject_scalping_without_public_stream(config: &NodeRuntimeConfig) -> Result<(), NodeError> {
-    if config.has_scalping_strategy()
-        && !matches!(
-            config.venue,
-            VenueId::Binance | VenueId::Bitget | VenueId::Gate
-        )
-    {
+/// Admission follows the selected fixed receiver, not merely the configured venue name.
+/// A generic signed-account pump supplies no public feed even when its adapter supports one.
+fn reject_scalping_without_public_stream(
+    config: &NodeRuntimeConfig,
+    public_stream_venue: Option<VenueId>,
+) -> Result<(), NodeError> {
+    if config.has_scalping_strategy() && public_stream_venue != Some(config.venue) {
         return Err(NodeError::ScalpingPublicStreamUnavailable {
             venue: config.venue,
         });
@@ -531,7 +528,7 @@ pub fn run_live_mvp<G: AccountPhysicalGateway>(
     command: LiveMvpCommand,
     gateway: G,
 ) -> Result<(), NodeError> {
-    run_live_mvp_with_loop(launch, command, gateway, ControlResidentLoop::run)
+    run_live_mvp_with_loop(launch, command, gateway, ControlResidentLoop::run, None)
 }
 
 // The fixed non-Binance binaries name their resident route explicitly.  The generic loop pumps
@@ -543,7 +540,13 @@ pub fn run_live_bitget_mvp(
     command: LiveMvpCommand,
     gateway: venue_gateway_bitget::BitgetAccountGateway,
 ) -> Result<(), NodeError> {
-    run_live_mvp_with_loop(launch, command, gateway, ControlResidentLoop::run_bitget)
+    run_live_mvp_with_loop(
+        launch,
+        command,
+        gateway,
+        ControlResidentLoop::run_bitget,
+        Some(VenueId::Bitget),
+    )
 }
 
 #[cfg(feature = "bybit")]
@@ -552,7 +555,13 @@ pub fn run_live_bybit_mvp(
     command: LiveMvpCommand,
     gateway: venue_gateway_bybit::BybitAccountGateway,
 ) -> Result<(), NodeError> {
-    run_live_mvp_with_loop(launch, command, gateway, ControlResidentLoop::run)
+    run_live_mvp_with_loop(
+        launch,
+        command,
+        gateway,
+        ControlResidentLoop::run_bybit,
+        Some(VenueId::Bybit),
+    )
 }
 
 #[cfg(feature = "gate")]
@@ -561,7 +570,13 @@ pub fn run_live_gate_mvp(
     command: LiveMvpCommand,
     gateway: venue_gateway_gate::GateAccountGateway,
 ) -> Result<(), NodeError> {
-    run_live_mvp_with_loop(launch, command, gateway, ControlResidentLoop::run_gate)
+    run_live_mvp_with_loop(
+        launch,
+        command,
+        gateway,
+        ControlResidentLoop::run_gate,
+        Some(VenueId::Gate),
+    )
 }
 
 #[cfg(feature = "hyperliquid")]
@@ -570,7 +585,13 @@ pub fn run_live_hyperliquid_mvp(
     command: LiveMvpCommand,
     gateway: venue_gateway_hyperliquid::HyperliquidAccountGateway,
 ) -> Result<(), NodeError> {
-    run_live_mvp_with_loop(launch, command, gateway, ControlResidentLoop::run)
+    run_live_mvp_with_loop(
+        launch,
+        command,
+        gateway,
+        ControlResidentLoop::run_hyperliquid,
+        Some(VenueId::Hyperliquid),
+    )
 }
 
 #[cfg(feature = "okx")]
@@ -579,7 +600,13 @@ pub fn run_live_okx_mvp(
     command: LiveMvpCommand,
     gateway: venue_gateway_okx::OkxAccountGateway,
 ) -> Result<(), NodeError> {
-    run_live_mvp_with_loop(launch, command, gateway, ControlResidentLoop::run)
+    run_live_mvp_with_loop(
+        launch,
+        command,
+        gateway,
+        ControlResidentLoop::run_okx,
+        Some(VenueId::Okx),
+    )
 }
 
 #[cfg(feature = "binance")]
@@ -588,7 +615,13 @@ pub fn run_live_binance_mvp(
     command: LiveMvpCommand,
     gateway: venue_gateway_binance::BinanceAccountGateway,
 ) -> Result<(), NodeError> {
-    run_live_mvp_with_loop(launch, command, gateway, ControlResidentLoop::run_binance)
+    run_live_mvp_with_loop(
+        launch,
+        command,
+        gateway,
+        ControlResidentLoop::run_binance,
+        Some(VenueId::Binance),
+    )
 }
 
 fn parse_exact_mode(raw: &str) -> Result<GatewayMode, &'static str> {
@@ -922,22 +955,25 @@ mod tests {
     #[test]
     fn run_config_fails_closed_when_scalping_has_no_public_stream_receiver()
     -> Result<(), Box<dyn std::error::Error>> {
-        for venue in [VenueId::Bybit, VenueId::Okx, VenueId::Hyperliquid] {
+        for venue in VenueId::ALL {
+            let config = scalping_runtime_config(venue)?;
             assert!(matches!(
-                reject_scalping_without_public_stream(&scalping_runtime_config(venue)?),
+                reject_scalping_without_public_stream(&config, None),
                 Err(NodeError::ScalpingPublicStreamUnavailable { venue: rejected })
                     if rejected == venue
             ));
-        }
-        for venue in [VenueId::Binance, VenueId::Bitget, VenueId::Gate] {
-            assert!(
-                reject_scalping_without_public_stream(&scalping_runtime_config(venue)?).is_ok()
-            );
+            assert!(reject_scalping_without_public_stream(&config, Some(venue)).is_ok());
+            let other = if venue == VenueId::Binance {
+                VenueId::Okx
+            } else {
+                VenueId::Binance
+            };
+            assert!(reject_scalping_without_public_stream(&config, Some(other)).is_err());
         }
 
         let mut no_scalping = scalping_runtime_config(VenueId::Gate)?;
         no_scalping.strategies[0].strategy_kind = StrategyKind::Copy;
-        assert!(reject_scalping_without_public_stream(&no_scalping).is_ok());
+        assert!(reject_scalping_without_public_stream(&no_scalping, None).is_ok());
         Ok(())
     }
 
