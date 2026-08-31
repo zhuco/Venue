@@ -15,6 +15,7 @@ pub enum PaneKind {
     TradeTape,
     Accounts,
     Strategies,
+    Execution,
     CopyRelations,
     Ledger,
     TradeDock,
@@ -31,6 +32,7 @@ impl PaneKind {
             Self::TradeTape => text(language, TextKey::TradeTape),
             Self::Accounts => text(language, TextKey::Accounts),
             Self::Strategies => text(language, TextKey::Strategies),
+            Self::Execution => text(language, TextKey::Accounts),
             Self::CopyRelations => text(language, TextKey::CopyRelations),
             Self::Ledger => text(language, TextKey::ReceiptLedger),
             Self::TradeDock => match language {
@@ -51,9 +53,18 @@ pub struct Pane {
     pub symbol: Option<String>,
     pub interval: ChartInterval,
     pub viewport: ChartViewport,
+    #[serde(skip)]
+    pub history_requested: bool,
 }
 
 impl Pane {
+    pub fn settings_key(&self) -> String {
+        format!(
+            "chart-{}-{}",
+            self.instance,
+            self.symbol.as_deref().unwrap_or("selected")
+        )
+    }
     fn new(kind: PaneKind, instance: u32) -> Self {
         Self {
             kind,
@@ -61,6 +72,7 @@ impl Pane {
             symbol: None,
             interval: ChartInterval::default(),
             viewport: ChartViewport::default(),
+            history_requested: false,
         }
     }
 
@@ -71,6 +83,7 @@ impl Pane {
             symbol: Some(symbol.to_owned()),
             interval: ChartInterval::default(),
             viewport: ChartViewport::default(),
+            history_requested: false,
         }
     }
 
@@ -109,6 +122,39 @@ impl Default for Workspaces {
 }
 
 impl Workspaces {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn history_prepended(
+        &mut self,
+        selection: &crate::market::MarketSelection,
+        added: usize,
+        selected_symbol: &str,
+    ) {
+        for tree in [
+            &mut self.trading,
+            &mut self.operations,
+            &mut self.multi_chart,
+        ] {
+            for (_, tile) in tree.tiles.iter_mut() {
+                if let Tile::Pane(pane) = tile
+                    && pane.kind == PaneKind::Chart
+                    && pane.interval == selection.interval
+                    && pane.symbol.as_deref().unwrap_or(selected_symbol)
+                        == selection.binding.symbol.to_string()
+                {
+                    pane.viewport.history_prepended(added);
+                }
+            }
+        }
+    }
+    pub fn upgrade_trading_tables(&mut self) {
+        for (_, tile) in self.trading.tiles.iter_mut() {
+            if let Tile::Pane(pane) = tile
+                && pane.kind == PaneKind::Strategies
+            {
+                pane.kind = PaneKind::Execution;
+            }
+        }
+    }
     fn active_tree(&self) -> &Tree<Pane> {
         match self.active {
             WorkspaceKind::Trading => &self.trading,
@@ -207,7 +253,7 @@ fn build_trading() -> Tree<Pane> {
     let mut tiles = Tiles::default();
     let chart = pane(&mut tiles, PaneKind::Chart, 1);
     let book = pane(&mut tiles, PaneKind::OrderBook, 1);
-    let strategies = pane(&mut tiles, PaneKind::Strategies, 1);
+    let strategies = pane(&mut tiles, PaneKind::Execution, 1);
     let trade_dock = pane(&mut tiles, PaneKind::TradeDock, 1);
     let upper = split(&mut tiles, LinearDir::Horizontal, chart, book, 0.76);
     let lower = split(

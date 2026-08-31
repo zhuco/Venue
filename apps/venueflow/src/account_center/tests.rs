@@ -148,9 +148,17 @@ fn login_registration_binding_and_management_render_without_exposing_secrets() {
             }
             assert!(
                 rendered.contains(if language == Language::SimplifiedChinese {
-                    "账户中心"
+                    if page < 2 {
+                        "账户登录"
+                    } else {
+                        "账户中心"
+                    }
                 } else {
-                    "Account center"
+                    if page < 2 {
+                        "Account login"
+                    } else {
+                        "Account center"
+                    }
                 })
             );
             assert!(rendered.contains(match (page, language) {
@@ -165,4 +173,194 @@ fn login_registration_binding_and_management_render_without_exposing_secrets() {
             }));
         }
     }
+}
+
+#[test]
+fn login_and_registration_keep_identical_centered_bounds() {
+    for language in Language::ALL {
+        for size in [egui::vec2(1100.0, 700.0), egui::vec2(850.0, 520.0)] {
+            let context = egui::Context::default();
+            crate::theme::apply(&context);
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let mut model = AppModel::new(Preferences {
+                language,
+                ..Default::default()
+            });
+            let mut state = AccountCenter::default();
+            let mut bounds = Vec::new();
+            for registering in [false, true, false] {
+                state.registering = registering;
+                let mut text = String::new();
+                for _ in 0..3 {
+                    let mut output = context.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(screen),
+                            ..Default::default()
+                        },
+                        |ui| show(ui.ctx(), &mut true, &mut state, &mut model),
+                    );
+                    output.textures_delta.clear();
+                    text.clear();
+                    for shape in output.shapes {
+                        collect_text(&shape.shape, &mut text);
+                    }
+                }
+                let rect = context.memory(|m| m.area_rect(egui::Id::new("account-center")));
+                assert!(rect.is_some());
+                if let Some(rect) = rect {
+                    assert!(screen.contains_rect(rect), "{rect:?} outside {screen:?}");
+                    assert!((rect.center() - screen.center()).length() <= 2.0);
+                    bounds.push(rect);
+                }
+                assert!(!text.contains("Market data needs no login"));
+                assert!(!text.contains("行情无需登录"));
+            }
+            assert!(
+                bounds
+                    .windows(2)
+                    .all(|pair| (pair[0].size() - pair[1].size()).length() <= 1.0)
+            );
+        }
+    }
+}
+
+fn saved_login() -> LoginRequest {
+    LoginRequest {
+        username: "alice".into(),
+        password: SecretValue::new("offline-fixture-password".into()),
+    }
+}
+
+#[test]
+fn restored_session_requires_server_identity_and_does_not_authorize_offline() {
+    let context = egui::Context::default();
+    let mut model = AppModel::new(Preferences::default());
+    let mut state = AccountCenter {
+        restoring: Some(session()),
+        next_refresh_ms: u64::MAX,
+        ..Default::default()
+    };
+    assert!(state.session.is_none() && model.account_overview.is_none());
+    assert!(
+        state
+            .client
+            .test_sender()
+            .send(Err(AccountErrorCode::Unavailable))
+            .is_ok()
+    );
+    assert!(!state.poll(&mut model, &context));
+    assert!(state.session.is_none() && model.account_overview.is_none());
+    assert!(state.restoring.is_some());
+    assert!(
+        state
+            .client
+            .test_sender()
+            .send(Ok(AccountResult::Overview(overview())))
+            .is_ok()
+    );
+    assert!(state.poll(&mut model, &context));
+    assert!(state.session.is_some() && state.restoring.is_none());
+    assert!(model.account_overview.is_some());
+    assert!(model.selected_trading_strategy().is_none());
+}
+
+#[test]
+fn wrong_user_or_expired_session_cannot_restore_an_account() {
+    for mismatch in [false, true] {
+        let mut candidate = session();
+        if mismatch {
+            candidate.user.user_id = "other-user".into();
+        } else {
+            candidate.expires_ms = 1;
+        }
+        let mut state = AccountCenter {
+            restoring: Some(candidate),
+            next_refresh_ms: u64::MAX,
+            ..Default::default()
+        };
+        let mut model = AppModel::new(Preferences::default());
+        assert!(
+            state
+                .client
+                .test_sender()
+                .send(Ok(AccountResult::Overview(overview())))
+                .is_ok()
+        );
+        assert!(state.poll(&mut model, &egui::Context::default()));
+        assert!(state.session.is_none() && state.restoring.is_none());
+        assert!(model.account_overview.is_none());
+    }
+}
+
+#[test]
+fn failed_login_is_never_promoted_to_saved_password() {
+    let mut state = AccountCenter {
+        pending_login: Some(saved_login()),
+        ..Default::default()
+    };
+    let mut model = AppModel::new(Preferences::default());
+    assert!(
+        state
+            .client
+            .test_sender()
+            .send(Err(AccountErrorCode::InvalidLogin))
+            .is_ok()
+    );
+    state.poll(&mut model, &egui::Context::default());
+    assert!(state.saved_login.is_none() && state.pending_login.is_none());
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn system_vault_mock_roundtrip_forget_password_and_invalidate_session() {
+    let mut state = AccountCenter {
+        vault: Some(Vault::fixture("https://control.example.com")),
+        pending_login: Some(saved_login()),
+        remember_password: true,
+        next_refresh_ms: u64::MAX,
+        ..Default::default()
+    };
+    let mut model = AppModel::new(Preferences::default());
+    assert!(
+        state
+            .client
+            .test_sender()
+            .send(Ok(AccountResult::Session(session(), overview())))
+            .is_ok()
+    );
+    assert!(state.poll(&mut model, &egui::Context::default()));
+    assert!(!state.storage_error);
+    let vault = state.vault.as_ref();
+    let stored = vault.and_then(|v| v.load(now_ms()).ok());
+    assert!(stored.is_some_and(|v| v.login.is_some() && v.session.is_some()));
+    state.remember_password = false;
+    state.remember_changed();
+    let stored = state.vault.as_ref().and_then(|v| v.load(now_ms()).ok());
+    assert!(stored.is_some_and(|v| v.login.is_none() && v.session.is_some()));
+    state.clear(&mut model);
+    let stored = state.vault.as_ref().and_then(|v| v.load(now_ms()).ok());
+    assert!(stored.is_some_and(|v| v.login.is_none() && v.session.is_none()));
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn expiry_and_logout_keep_remembered_password_but_never_auto_login() {
+    let mut state = AccountCenter {
+        vault: Some(Vault::fixture("https://control.example.com")),
+        saved_login: Some(saved_login()),
+        session: Some(session()),
+        remember_password: true,
+        ..Default::default()
+    };
+    state.persist();
+    let expired = state.vault.as_ref().and_then(|v| v.load(u64::MAX).ok());
+    assert!(expired.is_some_and(|v| v.login.is_some() && v.session.is_none()));
+    let mut model = AppModel::new(Preferences::default());
+    state.clear(&mut model);
+    let stored = state.vault.as_ref().and_then(|v| v.load(now_ms()).ok());
+    assert!(stored.is_some_and(|v| v.login.is_some() && v.session.is_none()));
+    assert!(state.session.is_none() && state.restoring.is_none());
+    assert!(!state.password.is_empty());
+    assert!(!state.poll(&mut model, &egui::Context::default()));
+    assert!(!state.busy);
 }

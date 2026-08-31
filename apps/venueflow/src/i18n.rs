@@ -35,6 +35,12 @@ macro_rules! resources {
 }
 
 resources! {
+    LimitPriceHint => "Limit price / select book", "输入限价 / 点击盘口";
+    TradeSizeAmount => "Size / amount", "数量 / 金额";
+    EnterBaseSize => "Enter size", "输入数量";
+    OlderBars => "Older bars", "更早K线";
+    HistoryBoundary => "History boundary / cache limit", "已到历史边界 / 缓存上限";
+    OrderSelectionExpired => "Selected order is stale or outside the current scope; reselect it", "委托已过期或不属于当前交易范围，请重新选择";
     Trading => "Trading", "交易";
     Operations => "Operations", "运营";
     MultiChart => "Multi-chart", "多图表";

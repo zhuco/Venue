@@ -8,6 +8,9 @@ use eframe::egui::{self, RichText};
 use venue_control_protocol::accounts::*;
 use zeroize::{Zeroize, Zeroizing};
 
+mod vault;
+use vault::Vault;
+
 #[cfg(test)]
 mod tests;
 
@@ -27,27 +30,127 @@ pub(crate) struct AccountCenter {
     deleting: Option<String>,
     error: Option<AccountErrorCode>,
     next_refresh_ms: u64,
+    vault: Option<Vault>,
+    storage_error: bool,
+    remember_password: bool,
+    saved_login: Option<LoginRequest>,
+    pending_login: Option<LoginRequest>,
+    restoring: Option<SessionResponse>,
+    reconnect_requested: bool,
+    form_visible: bool,
 }
 
 impl AccountCenter {
+    pub fn new(endpoint: &str) -> Self {
+        let mut state = Self {
+            remember_password: Vault::supported(),
+            ..Self::default()
+        };
+        match Vault::open(endpoint) {
+            Ok(vault) => state.vault = vault,
+            Err(()) => state.storage_error = Vault::supported(),
+        }
+        if let Some(vault) = &state.vault {
+            match vault.load(now_ms()) {
+                Ok(saved) => {
+                    if saved.login.is_some() || saved.session.is_some() {
+                        state.remember_password = saved.login.is_some();
+                    }
+                    state.saved_login = saved.login;
+                    state.restoring = saved.session;
+                    state.fill_saved_login();
+                    // Also remove expired sessions from the OS store on startup.
+                    state.persist();
+                }
+                Err(()) => state.storage_error = true,
+            }
+        }
+        state
+    }
+
     pub fn clear(&mut self, model: &mut AppModel) {
-        *self = Self::default();
+        let vault = self.vault.take();
+        let saved_login = self.saved_login.take();
+        let remember_password = self.remember_password;
+        *self = Self {
+            vault,
+            saved_login,
+            remember_password,
+            ..Self::default()
+        };
+        self.persist();
+        self.fill_saved_login();
         model.clear_account_session();
+    }
+
+    fn fill_saved_login(&mut self) {
+        if let Some(login) = &self.saved_login {
+            self.username = login.username.clone();
+            self.password = Zeroizing::new(login.password.expose().to_owned());
+        }
+    }
+
+    fn persist(&mut self) {
+        if let Some(vault) = &self.vault {
+            self.storage_error = vault
+                .save(
+                    self.saved_login.as_ref(),
+                    self.session.as_ref().or(self.restoring.as_ref()),
+                )
+                .is_err();
+        }
+    }
+
+    fn remember_changed(&mut self) {
+        if !self.remember_password {
+            self.saved_login = None;
+            self.pending_login = None;
+            self.persist();
+        }
+    }
+
+    fn logout(&mut self, model: &mut AppModel, context: &egui::Context) {
+        // Clear local state even if the server is temporarily unreachable. The
+        // detached request only revokes the old session and cannot restore it.
+        self.submit(AccountAction::Logout, model, context);
+        self.clear(model);
+        self.reconnect_requested = true;
     }
 
     pub fn poll(&mut self, model: &mut AppModel, context: &egui::Context) -> bool {
         let events = self.client.drain().collect::<Vec<_>>();
-        let mut reconnect = false;
+        let mut reconnect = std::mem::take(&mut self.reconnect_requested);
         for result in events {
             self.busy = false;
             match result {
                 Ok(AccountResult::Session(session, overview)) => {
+                    if session.user != overview.user || session.expires_ms <= now_ms() {
+                        self.clear(model);
+                        self.error = Some(AccountErrorCode::Unauthorized);
+                        reconnect = true;
+                        continue;
+                    }
+                    self.restoring = None;
                     self.session = Some(session);
+                    self.saved_login = self.pending_login.take();
+                    self.persist();
                     model.apply_account_overview(overview);
                     self.error = None;
                     reconnect = true;
                 }
                 Ok(AccountResult::Overview(overview)) => {
+                    let identity = self.session.as_ref().or(self.restoring.as_ref());
+                    if identity.is_none_or(|s| s.user != overview.user || s.expires_ms <= now_ms())
+                    {
+                        self.clear(model);
+                        self.error = Some(AccountErrorCode::Unauthorized);
+                        reconnect = true;
+                        continue;
+                    }
+                    if let Some(session) = self.restoring.take() {
+                        self.session = Some(session);
+                        reconnect = true;
+                    }
                     let old = model.preferences.execution_account_id.clone();
                     model.apply_account_overview(overview);
                     self.error = None;
@@ -58,6 +161,7 @@ impl AccountCenter {
                     reconnect = true;
                 }
                 Err(code) => {
+                    self.pending_login = None;
                     if code == AccountErrorCode::Unauthorized {
                         self.clear(model);
                         reconnect = true;
@@ -67,16 +171,25 @@ impl AccountCenter {
             }
         }
         let now = now_ms();
-        if !self.busy
+        if self.session.is_some()
+            && !self.busy
             && let Some(id) = model.account_selection_requested.take()
         {
             self.submit(AccountAction::Select(id), model, context);
         }
-        if self.session.as_ref().is_some_and(|s| s.expires_ms <= now) {
+        if self
+            .session
+            .as_ref()
+            .or(self.restoring.as_ref())
+            .is_some_and(|s| s.expires_ms <= now)
+        {
             self.clear(model);
             reconnect = true;
         }
-        if self.session.is_some() && !self.busy && now >= self.next_refresh_ms {
+        if (self.session.is_some() || self.restoring.is_some())
+            && !self.busy
+            && now >= self.next_refresh_ms
+        {
             self.submit(AccountAction::Refresh, model, context);
         }
         reconnect
@@ -91,7 +204,10 @@ impl AccountCenter {
         self.next_refresh_ms = now_ms().saturating_add(30_000);
         self.client.submit(
             model.preferences.endpoint.clone(),
-            self.session.as_ref().map(|s| s.token.clone()),
+            self.session
+                .as_ref()
+                .or(self.restoring.as_ref())
+                .map(|s| s.token.clone()),
             action,
             context.clone(),
         );
@@ -112,20 +228,65 @@ pub(crate) fn show(
     model: &mut AppModel,
 ) {
     if !*open {
+        state.form_visible = false;
         return;
     }
+    if !state.form_visible && !state.registering && state.session.is_none() {
+        state.fill_saved_login();
+    }
+    state.form_visible = true;
     let language = model.preferences.language;
+    let login = state.session.is_none();
+    let viewport = context.content_rect().size();
+    let width = (if login { 420.0_f32 } else { 650.0_f32 }).min((viewport.x - 64.0).max(240.0));
     let mut visible = true;
-    egui::Window::new(tr(language,"账户中心","Account center")).open(&mut visible)
-        .resizable(false).collapsible(false).default_width(650.0).show(context,|ui|{
-            ui.set_min_width(600.0);ui.spacing_mut().item_spacing=egui::vec2(10.0,10.0);
-            ui.label(RichText::new(tr(language,"行情无需登录。交易账户和 API 绑定仅属于当前登录用户。","Market data needs no login. Trading accounts and API bindings belong to your user.")).color(theme::TEXT_SECONDARY));
-            ui.separator();
-            ui.add_enabled_ui(!state.busy,|ui|{if state.session.is_none(){show_login(ui,state,model);}else{show_accounts(ui,state,model);}});
-            if state.busy{ui.horizontal(|ui|{ui.spinner();ui.label(tr(language,"正在处理，请稍候…","Working…"));});}
-            if let Some(code)=state.error{ui.colored_label(theme::SELL,error_text(language,code));}
+    let response = egui::Modal::new(egui::Id::new("account-center"))
+        .frame(
+            egui::Frame::new()
+                .fill(theme::BG_SECONDARY)
+                .stroke(egui::Stroke::new(1.0, theme::DIVIDER))
+                .corner_radius(10)
+                .inner_margin(24),
+        )
+        .show(context, |ui| {
+            ui.set_width(width);
+            ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
+            ui.horizontal(|ui| {
+                let title = if login {
+                    tr(language, "账户登录", "Account login")
+                } else {
+                    tr(language, "账户中心", "Account center")
+                };
+                ui.label(RichText::new(title).size(20.0).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("×").clicked() {
+                        visible = false;
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .id_salt("account-center-body")
+                .max_height((viewport.y - 150.0).max(100.0))
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.add_enabled_ui(!state.busy, |ui| {
+                        if login {
+                            show_login(ui, state, model);
+                        } else {
+                            show_accounts(ui, state, model);
+                        }
+                    });
+                    if !login {
+                        show_feedback(ui, state, language);
+                    }
+                });
         });
+    if response.should_close() {
+        visible = false;
+    }
     if !visible {
+        state.form_visible = false;
         state.clear_form_secrets();
         state.adding = false;
         state.deleting = None;
@@ -133,58 +294,140 @@ pub(crate) fn show(
     *open = visible;
 }
 
+fn show_feedback(ui: &mut egui::Ui, state: &AccountCenter, language: Language) {
+    if state.busy {
+        ui.spinner();
+    } else if let Some(code) = state.error {
+        ui.colored_label(theme::SELL, error_text(language, code));
+    } else if state.storage_error {
+        ui.colored_label(
+            theme::WARNING,
+            tr(
+                language,
+                "无法更新系统凭据库，密码或登录状态可能未保存/清除。",
+                "System credential store unavailable; saved login could not be updated.",
+            ),
+        );
+    }
+}
+
 fn show_login(ui: &mut egui::Ui, state: &mut AccountCenter, model: &AppModel) {
     let l = model.preferences.language;
+    let tab_width = (ui.available_width() - 10.0) / 2.0;
     ui.horizontal(|ui| {
-        if ui
-            .selectable_label(!state.registering, tr(l, "登录", "Log in"))
-            .clicked()
-        {
-            state.registering = false;
-            state.clear_form_secrets();
-        }
-        if ui
-            .selectable_label(state.registering, tr(l, "注册", "Register"))
-            .clicked()
-        {
-            state.registering = true;
-            state.clear_form_secrets();
+        for (registering, caption) in [
+            (false, tr(l, "登录", "Log in")),
+            (true, tr(l, "注册", "Register")),
+        ] {
+            let selected = state.registering == registering;
+            let response = ui.add_sized(
+                [tab_width, 32.0],
+                egui::Button::new(RichText::new(caption).size(15.0).color(if selected {
+                    theme::BRAND
+                } else {
+                    theme::TEXT_SECONDARY
+                }))
+                .frame(false),
+            );
+            if selected {
+                ui.painter().hline(
+                    response.rect.x_range(),
+                    response.rect.bottom(),
+                    egui::Stroke::new(2.0, theme::BRAND),
+                );
+            }
+            if response.clicked() && !selected {
+                state.registering = registering;
+                state.clear_form_secrets();
+                state.error = None;
+                if !registering {
+                    state.fill_saved_login();
+                }
+            }
         }
     });
-    field(
+    ui.add_space(4.0);
+    login_field(
         ui,
         tr(l, "用户名", "Username"),
         &mut state.username,
         false,
         64,
+        tr(
+            l,
+            "3–64 位字母、数字或 . _ - @",
+            "3–64 letters, numbers or . _ - @",
+        ),
     );
-    ui.small(tr(
-        l,
-        "3–64 位字母、数字或 . _ - @，不区分大小写",
-        "3–64 letters, numbers or . _ - @; case-insensitive",
-    ));
-    field(
+    login_field(
         ui,
         tr(l, "密码", "Password"),
         &mut state.password,
         true,
         128,
+        if state.registering {
+            tr(l, "至少 15 个字符", "At least 15 characters")
+        } else {
+            ""
+        },
     );
-    if state.registering {
-        field(
-            ui,
-            tr(l, "确认密码", "Confirm password"),
-            &mut state.confirmation,
-            true,
-            128,
-        );
-        ui.small(tr(
+    // Both tabs reserve the same third-field slot, so neither the dialog nor
+    // submit button jumps when switching pages or displaying validation errors.
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), 62.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_min_height(62.0);
+            if state.registering {
+                login_field(
+                    ui,
+                    tr(l, "确认密码", "Confirm password"),
+                    &mut state.confirmation,
+                    true,
+                    128,
+                    "",
+                );
+            }
+        },
+    );
+    let remember = ui.add_enabled(
+        Vault::supported(),
+        egui::Checkbox::new(
+            &mut state.remember_password,
+            tr(l, "保存密码", "Remember password"),
+        ),
+    );
+    remember.clone().on_hover_text(if Vault::supported() {
+        tr(
             l,
-            "密码至少 15 个字符，可使用长口令。",
-            "Use a passphrase of at least 15 characters.",
-        ));
+            "仅保存在当前 Windows 用户的系统凭据库。取消勾选会删除已保存的密码。",
+            "Stored only in this Windows user's credential store. Uncheck to forget the password.",
+        )
+    } else {
+        tr(
+            l,
+            "此平台暂不保存密码或登录状态。",
+            "Persistent login is not available on this platform.",
+        )
+    });
+    if remember.changed() {
+        state.remember_changed();
     }
-    let enabled = !state.username.trim().is_empty()
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), 36.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_min_height(36.0);
+            show_feedback(ui, state, l);
+        },
+    );
+    let valid_username = LoginRequest {
+        username: state.username.clone(),
+        password: SecretValue::new(String::new()),
+    }
+    .normalized_username()
+    .is_some();
+    let enabled = valid_username
         && !state.password.is_empty()
         && (!state.registering
             || (state.password.chars().count() >= 15 && *state.password == *state.confirmation));
@@ -193,14 +436,17 @@ fn show_login(ui: &mut egui::Ui, state: &mut AccountCenter, model: &AppModel) {
     } else {
         tr(l, "登录", "Log in")
     };
-    if ui
-        .add_enabled(enabled, egui::Button::new(caption))
-        .clicked()
-    {
+    let button = egui::Button::new(RichText::new(caption).size(15.0).color(theme::BG_PRIMARY))
+        .fill(theme::BRAND)
+        .min_size(egui::vec2(ui.available_width(), 40.0));
+    if ui.add_enabled(enabled, button).clicked() {
         let request = LoginRequest {
             username: state.username.clone(),
             password: SecretValue::new(std::mem::take(&mut *state.password)),
         };
+        state.pending_login = state.remember_password.then(|| request.clone());
+        state.restoring = None;
+        state.persist();
         state.confirmation.zeroize();
         state.submit(
             if state.registering {
@@ -214,7 +460,39 @@ fn show_login(ui: &mut egui::Ui, state: &mut AccountCenter, model: &AppModel) {
     }
 }
 
-fn show_accounts(ui: &mut egui::Ui, state: &mut AccountCenter, model: &AppModel) {
+fn login_field(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    password: bool,
+    limit: usize,
+    hint: &str,
+) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), 62.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_min_height(62.0);
+            ui.spacing_mut().item_spacing.y = 6.0;
+            ui.label(RichText::new(label).size(13.0));
+            let response = ui.add_sized(
+                [ui.available_width(), 34.0],
+                egui::TextEdit::singleline(value)
+                    .password(password)
+                    .char_limit(limit)
+                    .font(egui::FontId::proportional(14.0))
+                    .hint_text(hint)
+                    .vertical_align(egui::Align::Center),
+            );
+            if password && let Some(mut edit) = egui::TextEdit::load_state(ui.ctx(), response.id) {
+                edit.clear_undoer();
+                edit.store(ui.ctx(), response.id);
+            }
+        },
+    );
+}
+
+fn show_accounts(ui: &mut egui::Ui, state: &mut AccountCenter, model: &mut AppModel) {
     let l = model.preferences.language;
     ui.horizontal(|ui| {
         if let Some(session) = &state.session {
@@ -224,9 +502,12 @@ fn show_accounts(ui: &mut egui::Ui, state: &mut AccountCenter, model: &AppModel)
             state.submit(AccountAction::Refresh, model, ui.ctx());
         }
         if ui.button(tr(l, "退出登录", "Log out")).clicked() {
-            state.submit(AccountAction::Logout, model, ui.ctx());
+            state.logout(model, ui.ctx());
         }
     });
+    if state.session.is_none() {
+        return;
+    }
     ui.horizontal(|ui| {
         ui.heading(tr(l, "交易所 API 管理", "Exchange API management"));
         if ui.button(tr(l, "＋ 添加 API", "+ Add API")).clicked() {

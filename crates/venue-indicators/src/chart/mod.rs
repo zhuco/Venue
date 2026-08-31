@@ -4,6 +4,7 @@
 //! state through [`ChartStudyEngine::preview`], so UI previews cannot mutate strategy facts.
 
 mod common;
+mod custom_ema_adx;
 mod momentum;
 mod registry;
 mod trend;
@@ -15,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use venue_domain::{PublicBar, Symbol};
 
 pub use common::{CommonStudyValues, DirectionalValue, DmiValue, KdjValue, PairValue, TripleValue};
+pub use custom_ema_adx::{EmaAdxConfig, EmaAdxSignal, EmaAdxValues};
 pub use momentum::{Macd, MacdValue, Rsi};
 pub use registry::{
     ChartIndicatorDescriptor, ChartIndicatorId, ChartIndicatorPlacement, ChartIndicatorRegistry,
@@ -42,6 +44,7 @@ pub enum ChartIndicatorError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChartStudyValues {
+    pub custom_ema_adx: Option<EmaAdxValues>,
     pub sma: Option<Decimal>,
     pub ema: Option<Decimal>,
     pub bollinger: Option<BollingerValue>,
@@ -55,6 +58,7 @@ pub struct ChartStudyValues {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChartStudyConfig {
+    pub custom_ema_adx: Option<EmaAdxConfig>,
     pub sma_period: usize,
     pub ema_period: usize,
     pub bollinger_period: usize,
@@ -92,6 +96,7 @@ pub struct ChartStudyConfig {
 impl Default for ChartStudyConfig {
     fn default() -> Self {
         Self {
+            custom_ema_adx: None,
             sma_period: 7,
             ema_period: 7,
             bollinger_period: 20,
@@ -130,6 +135,9 @@ impl Default for ChartStudyConfig {
 
 impl ChartStudyConfig {
     pub fn validate(&self) -> Result<(), ChartIndicatorError> {
+        if let Some(config) = &self.custom_ema_adx {
+            config.validate()?;
+        }
         const MAX_PERIOD: usize = 100_000;
         let periods = [
             self.sma_period,
@@ -180,6 +188,7 @@ impl ChartStudyConfig {
 /// Fixed first-batch study set used by the chart and future explicit adapters.
 #[derive(Clone, Debug)]
 pub struct ChartStudyEngine {
+    custom_ema_adx: Option<custom_ema_adx::EmaAdxStudy>,
     scope: Option<ChartScope>,
     last_close_time_ms: Option<u64>,
     sma: Sma,
@@ -207,6 +216,11 @@ impl ChartStudyEngine {
     pub fn with_config(config: &ChartStudyConfig) -> Result<Self, ChartIndicatorError> {
         config.validate()?;
         Ok(Self {
+            custom_ema_adx: config
+                .custom_ema_adx
+                .as_ref()
+                .map(custom_ema_adx::EmaAdxStudy::new)
+                .transpose()?,
             scope: None,
             last_close_time_ms: None,
             sma: Sma::new(config.sma_period)?,
@@ -225,6 +239,9 @@ impl ChartStudyEngine {
     }
 
     pub fn reset(&mut self) {
+        if let Some(custom) = &mut self.custom_ema_adx {
+            custom.reset();
+        }
         self.scope = None;
         self.last_close_time_ms = None;
         self.sma.reset();
@@ -242,13 +259,16 @@ impl ChartStudyEngine {
         bar: &PublicBar,
     ) -> Result<ChartStudyValues, ChartIndicatorError> {
         self.validate_next(bar)?;
-        let values = self.update_unchecked(bar)?;
-        self.scope = Some(ChartScope {
+        // A failed composite study must not leave partially advanced EMA or signal state.
+        let mut next = self.clone();
+        let values = next.update_unchecked(bar)?;
+        next.scope = Some(ChartScope {
             symbol: bar.symbol.clone(),
             generation: bar.generation,
             interval_ms: bar.interval_ms,
         });
-        self.last_close_time_ms = Some(bar.close_time_ms);
+        next.last_close_time_ms = Some(bar.close_time_ms);
+        *self = next;
         Ok(values)
     }
 
@@ -264,6 +284,11 @@ impl ChartStudyEngine {
         bar: &PublicBar,
     ) -> Result<ChartStudyValues, ChartIndicatorError> {
         Ok(ChartStudyValues {
+            custom_ema_adx: self
+                .custom_ema_adx
+                .as_mut()
+                .map(|study| study.update(bar))
+                .transpose()?,
             sma: self.sma.update(bar)?,
             ema: self.ema.update(bar)?,
             bollinger: self.bollinger.update(bar)?,

@@ -83,6 +83,7 @@ impl Default for IndicatorStyle {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChartDisplaySettings {
+    pub custom_ema_adx: crate::custom_indicator::CustomSettings,
     pub ma_periods: [u32; 3],
     pub ema_periods: [u32; 3],
     pub wma_periods: [u32; 3],
@@ -137,6 +138,7 @@ pub struct ChartDisplaySettings {
 impl Default for ChartDisplaySettings {
     fn default() -> Self {
         Self {
+            custom_ema_adx: crate::custom_indicator::CustomSettings::default(),
             ma_periods: [7, 25, 99],
             ema_periods: [7, 25, 99],
             wma_periods: [7, 25, 99],
@@ -199,6 +201,10 @@ impl Default for ChartDisplaySettings {
 
 impl ChartDisplaySettings {
     pub fn validate(&self) -> Result<(), &'static str> {
+        self.custom_ema_adx
+            .parameters
+            .validate()
+            .map_err(|_| "自定义指标参数无效 / Invalid custom indicator parameters")?;
         let periods = self
             .ma_periods
             .into_iter()
@@ -324,6 +330,10 @@ impl ChartDisplaySettings {
             macd_slow_period: self.macd_slow_period as usize,
             macd_signal_period: self.macd_signal_period as usize,
             atr_period: self.atr_period as usize,
+            custom_ema_adx: self
+                .custom_ema_adx
+                .enabled
+                .then(|| self.custom_ema_adx.parameters.clone()),
         }
     }
 }

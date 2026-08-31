@@ -102,6 +102,7 @@ pub struct Preferences {
     pub language: Language,
     pub favorite_symbols: Vec<String>,
     pub chart: crate::chart_settings::ChartDisplaySettings,
+    pub chart_overrides: BTreeMap<String, crate::chart_settings::ChartDisplaySettings>,
     pub trading: crate::trading::TradingSettings,
 }
 
@@ -119,6 +120,7 @@ impl Default for Preferences {
             language: default_language(),
             favorite_symbols: DEFAULT_FAVORITE_SYMBOLS.map(str::to_owned).to_vec(),
             chart: crate::chart_settings::ChartDisplaySettings::default(),
+            chart_overrides: BTreeMap::new(),
             trading: crate::trading::TradingSettings::default(),
         }
     }
@@ -314,6 +316,7 @@ pub struct CommandProgress {
 
 #[derive(Debug)]
 pub struct AppModel {
+    pub execution: crate::execution_view::ExecutionViewState,
     pub account_overview: Option<venue_control_protocol::accounts::AccountOverview>,
     pub account_selection_requested: Option<String>,
     pub preferences: Preferences,
@@ -337,6 +340,8 @@ pub struct AppModel {
     #[cfg(not(target_arch = "wasm32"))]
     pub local_markets: crate::market::LocalMarketStore,
     #[cfg(not(target_arch = "wasm32"))]
+    pub history_requests: Vec<crate::market::HistoryRequest>,
+    #[cfg(not(target_arch = "wasm32"))]
     pub local_symbols: Vec<String>,
     #[cfg(not(target_arch = "wasm32"))]
     pub local_precisions: BTreeMap<String, (u32, u32)>,
@@ -349,6 +354,7 @@ pub struct AppModel {
     pub symbol_group: SymbolGroup,
     pub follow_latest_requested: bool,
     pub indicator_settings_requested: bool,
+    pub indicator_target: Option<String>,
     pub trading_settings_requested: bool,
     pub trade_dock: crate::trading::TradeDockState,
     request_sequence: u64,
@@ -360,6 +366,9 @@ impl AppModel {
         preferences.execution_account_id = None;
         preferences.selected_instance = None;
         preferences.trading.normalize_price_validity();
+        preferences
+            .chart_overrides
+            .retain(|_, settings| settings.validate().is_ok());
         if preferences.chart.validate().is_err() {
             preferences.chart = crate::chart_settings::ChartDisplaySettings::default();
         }
@@ -373,6 +382,7 @@ impl AppModel {
         };
         Self {
             preferences,
+            execution: crate::execution_view::ExecutionViewState::default(),
             account_overview: None,
             account_selection_requested: None,
             connection: ConnectionState::Connecting,
@@ -392,6 +402,8 @@ impl AppModel {
             #[cfg(not(target_arch = "wasm32"))]
             local_markets,
             #[cfg(not(target_arch = "wasm32"))]
+            history_requests: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
             local_symbols: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             local_precisions: BTreeMap::new(),
@@ -404,6 +416,7 @@ impl AppModel {
             symbol_group: SymbolGroup::All,
             follow_latest_requested: false,
             indicator_settings_requested: false,
+            indicator_target: None,
             trading_settings_requested: false,
             trade_dock: crate::trading::TradeDockState::default(),
             request_sequence: 0,
@@ -673,6 +686,8 @@ impl AppModel {
                 venue: strategy.venue.to_string(),
                 trading_account_id: strategy.trading_account_id,
                 symbol: strategy.symbol.to_string(),
+                instance_id: strategy.instance_id,
+                config_epoch: strategy.config_epoch,
             });
         self.trade_dock
             .observe_scope(&self.preferences.selected_symbol, scope);
@@ -706,6 +721,7 @@ impl AppModel {
     }
 
     pub fn clear_account_session(&mut self) {
+        self.execution = crate::execution_view::ExecutionViewState::default();
         self.account_selection_requested = None;
         self.account_overview = None;
         self.preferences.execution_account_id = None;

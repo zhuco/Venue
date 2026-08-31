@@ -6,6 +6,8 @@ mod chart_settings;
 mod chart_view;
 mod client;
 mod copy_relation_view;
+mod custom_indicator;
+mod execution_view;
 mod i18n;
 #[cfg(not(target_arch = "wasm32"))]
 mod market;

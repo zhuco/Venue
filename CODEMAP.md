@@ -121,6 +121,7 @@ Web 的 Control 用户会话只在 BFF 环境注入，HTTP/SSE 同时保留 Cont
 默认按影响面分层验证，不在每次局部修改后重复全工作区回归。UI 局部改动验证客户端及相应交互；单模块修改验证该模块及直接契约；交易安全修改覆盖受影响的风险、WAL、Unknown、恢复和 adapter 路径。
 跨模块契约、依赖变化、架构合并或发布前集中建立全工作区通过基线。基线通过后的增量只重跑受影响专项；纯文档、注释或 lint 标注只做对应静态检查，不使既有业务测试结果失效。记录验证对应的提交/源码范围，构建缓存疑似串用时使用两个固定隔离槽并持锁核验，不新建目录、不清空共享缓存。
 
+- VenueFlow 图表实时锚点：`apps/venueflow/src/chart.rs` 与 `chart_view.rs`；左键拖动保持固定 K 线宽度、右侧留白占用视窗槽位，新 K 线在拖定位置继续更新。内联测试覆盖连续拖动/松手不回弹、图表与时间轴、缩放及新 K 线到达；“跟随”/“适配”显式恢复右端位置。
 - 网格 reducer/风险状态测试：`crates/venue-strategies/src/hedged_grid/{reducer_tests,exposure_guard,recovery_tests}.rs`。
 - 交易所 adapter 测试：`src/exchange/{binance,bitget,gate,grid}/` 内的测试文件及各交易所直接测试模块。
 - 共享 resident/runtime 测试：`src/runtime/grid/stage7_grid_tests.rs` 统一组合 `stage7_grid_{core,recovery}_tests.rs`，其余专项位于 `stage7_grid_reconciliation_tests.rs`、`stage7_fill_sequence_tests.rs`、`stage7_install_recovery_tests.rs`、`stage7_inventory_recovery_evidence_tests.rs`、`stage7_exposure_composition_tests.rs`、`hedged_grid_runtime_equivalence_tests.rs`、`exposure_runtime_tests.rs` 及各 `stage7_*` 模块内测试。

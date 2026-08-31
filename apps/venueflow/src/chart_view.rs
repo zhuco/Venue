@@ -2,7 +2,10 @@ use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke};
 use venue_control_protocol::UiBar;
 
 use crate::{
-    chart::{ChartStudyPoint, PriceRange, bar_center_x, bar_index_at_x, format_timeline_label},
+    chart::{
+        ChartStudyPoint, PriceRange, bar_center_x, bar_index_at_x, format_timeline_label,
+        timeline_time_at_slot,
+    },
     chart_settings::ChartDisplaySettings,
     i18n::{Language, TextKey, text},
     model::{decimal_to_f64, format_decimal},
@@ -72,7 +75,9 @@ pub(crate) fn candle_plot(
         Pos2::new(plot_rect.left(), content_rect.bottom()),
         plot_rect.max,
     );
-    if response
+    if response.dragged_by(egui::PointerButton::Primary) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    } else if response
         .hover_pos()
         .is_some_and(|point| timeline_rect.contains(point))
     {
@@ -91,11 +96,12 @@ pub(crate) fn candle_plot(
             );
         }
     }
-    if response.dragged() {
-        viewport.pan_by_drag_total(all_bars.len(), plot_rect.width(), response.drag_delta().x);
+    if response.dragged_by(egui::PointerButton::Primary)
+        && let Some(delta) = response.total_drag_delta()
+    {
+        viewport.pan_by_drag_total(all_bars.len(), plot_rect.width(), delta.x);
     }
-    if response.drag_stopped() {
-        viewport.pan_by_drag_total(all_bars.len(), plot_rect.width(), response.drag_delta().x);
+    if response.drag_stopped_by(egui::PointerButton::Primary) {
         viewport.finish_drag();
     }
 
@@ -187,11 +193,12 @@ pub(crate) fn candle_plot(
         [timeline_rect.left_top(), timeline_rect.right_top()],
         Stroke::new(1.0, theme::DIVIDER),
     );
-    for (index, bar) in bars
-        .iter()
-        .enumerate()
-        .filter(|(_, bar)| bar.open_time_ms.is_multiple_of(interval.timeline_step_ms()))
-    {
+    for index in 0..display_slots {
+        let Some(open_time_ms) = timeline_time_at_slot(bars, interval, index)
+            .filter(|time| time.is_multiple_of(interval.timeline_step_ms()))
+        else {
+            continue;
+        };
         let x = bar_center_x(price_rect.left(), price_rect.width(), display_slots, index)
             .unwrap_or(price_rect.left());
         painter.line_segment(
@@ -204,7 +211,7 @@ pub(crate) fn candle_plot(
         painter.text(
             Pos2::new(x, timeline_rect.top() + 4.0),
             Align2::CENTER_TOP,
-            format_timeline_label(bar.open_time_ms, interval),
+            format_timeline_label(open_time_ms, interval),
             FontId::monospace(f32::from(settings.chart_text_size)),
             theme::TEXT_SECONDARY,
         );
@@ -289,6 +296,25 @@ pub(crate) fn candle_plot(
             all_studies,
             price_y,
             settings,
+        );
+        let readout_time = response
+            .hover_pos()
+            .filter(|p| plot_rect.contains(*p))
+            .and_then(|_| selected_index.and_then(|index| bars.get(index)))
+            .or_else(|| all_bars.last())
+            .map_or(0, |bar| bar.open_time_ms);
+        crate::custom_indicator::draw(
+            &painter,
+            price_rect,
+            bars,
+            display_slots,
+            all_studies,
+            &settings.custom_ema_adx,
+            price_y,
+            readout_time,
+            price_scale,
+            settings.chart_text_size,
+            language,
         );
         for (spec, rect) in pane_specs.iter().zip(sub_rects) {
             draw_sub_pane(
@@ -674,6 +700,15 @@ fn overlay_price_range(
         .iter()
         .filter_map(|bar| study_at(studies, bar.open_time_ms))
     {
+        if settings.custom_ema_adx.enabled
+            && let Some(custom) = &point.custom_ema_adx
+        {
+            for value in custom.ema.into_iter().flatten() {
+                let value = decimal_to_f64(value);
+                low = low.min(value);
+                high = high.max(value);
+            }
+        }
         for (style, values) in [
             (settings.ma, [point.sma, point.sma_second, point.sma_third]),
             (settings.ema, [point.ema, point.ema_second, point.ema_third]),
@@ -1330,6 +1365,105 @@ mod tests {
         });
         output.textures_delta.clear();
         output.shapes
+    }
+
+    fn pointer_frame(
+        context: &egui::Context,
+        viewport: &mut crate::chart::ChartViewport,
+        bars: &[UiBar],
+        events: Vec<egui::Event>,
+    ) -> bool {
+        let mut selected = None;
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1_200.0, 500.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                selected = candle_plot(
+                    ui,
+                    bars,
+                    &[],
+                    viewport,
+                    Language::English,
+                    &ChartDisplaySettings::default(),
+                    (2, 2),
+                    crate::chart::ChartInterval::OneMinute,
+                    None,
+                    None,
+                );
+            },
+        );
+        output.textures_delta.clear();
+        selected.is_some()
+    }
+
+    #[test]
+    fn left_drag_in_chart_and_timeline_keeps_padding_after_release() {
+        for y in [200.0, 480.0] {
+            for button in [egui::PointerButton::Primary, egui::PointerButton::Secondary] {
+                let context = egui::Context::default();
+                let mut viewport = crate::chart::ChartViewport::default();
+                let (seed, _) = fixture();
+                let mut bars = seed.into_iter().cycle().take(500).collect::<Vec<_>>();
+                for (index, bar) in bars.iter_mut().enumerate() {
+                    bar.open_time_ms = index as u64 * 60_000;
+                }
+                pointer_frame(&context, &mut viewport, &bars, vec![]);
+                pointer_frame(
+                    &context,
+                    &mut viewport,
+                    &bars,
+                    vec![
+                        egui::Event::PointerMoved(egui::pos2(900.0, y)),
+                        egui::Event::PointerButton {
+                            pos: egui::pos2(900.0, y),
+                            button,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+                pointer_frame(
+                    &context,
+                    &mut viewport,
+                    &bars,
+                    vec![egui::Event::PointerMoved(egui::pos2(800.0, y))],
+                );
+                let first_padding = viewport.right_padding();
+                pointer_frame(
+                    &context,
+                    &mut viewport,
+                    &bars,
+                    vec![egui::Event::PointerMoved(egui::pos2(700.0, y))],
+                );
+                let final_padding = viewport.right_padding();
+                if button == egui::PointerButton::Primary {
+                    assert!(first_padding > 0);
+                    assert!(final_padding > first_padding);
+                } else {
+                    assert_eq!(final_padding, 0);
+                }
+                assert!(!pointer_frame(
+                    &context,
+                    &mut viewport,
+                    &bars,
+                    vec![egui::Event::PointerButton {
+                        pos: egui::pos2(700.0, y),
+                        button,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },]
+                ));
+                pointer_frame(&context, &mut viewport, &bars, vec![]);
+                assert_eq!(viewport.right_padding(), final_padding);
+                assert_eq!(viewport.right_offset(), 0);
+                let visible = viewport.visible_range(bars.len() + 1);
+                assert_eq!(visible.end, bars.len() + 1);
+                assert_eq!(viewport.right_padding(), final_padding);
+            }
+        }
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crossbeam_channel::{Receiver, Sender, unbounded};
+mod execution;
 use eframe::egui;
 use std::{
     collections::BTreeSet,
@@ -20,6 +21,8 @@ const MAX_SSE_FRAME_BYTES: usize = 1_024 * 1_024;
 
 #[derive(Clone, Debug)]
 pub enum ClientEvent {
+    ExecutionFacts(venue_control_protocol::ExecutionFactsSnapshot),
+    ExecutionFactsUnavailable(String),
     SessionExpired,
     SnapshotConnected,
     SnapshotUnavailable(String),
@@ -346,6 +349,15 @@ async fn native_loop(
         }
     };
 
+    if authenticated {
+        execution::start_native(
+            client.clone(),
+            endpoint.clone(),
+            sender.clone(),
+            context.clone(),
+            stop.clone(),
+        );
+    }
     let (scope_tx, scope_rx) = tokio::sync::mpsc::unbounded_channel();
     if let Some(scopes) =
         fetch_native_snapshot(&client, &endpoint, &sender, &context, authenticated).await
@@ -986,6 +998,15 @@ impl WebClient {
         if token.is_some() && !crate::account_client::safe_endpoint(&endpoint) {
             publish(&sender, &context, ClientEvent::SessionExpired);
             return Self { stop };
+        }
+        if let Some(token) = token.clone() {
+            execution::start_web(
+                endpoint.clone(),
+                sender.clone(),
+                context.clone(),
+                stop.clone(),
+                token,
+            );
         }
         let (scope_tx, scope_rx) = unbounded();
         spawn_web_events(

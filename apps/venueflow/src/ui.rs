@@ -10,7 +10,7 @@ use venue_control_protocol::{
 };
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::market::{LocalMarketView, MarketSelection};
+use crate::market::MarketSelection;
 use crate::{
     client::ControlClient,
     i18n::{Language, TextKey, text},
@@ -36,6 +36,7 @@ impl Behavior<Pane> for PaneBehavior<'_> {
             PaneKind::TradeTape => show_trade_tape(ui, pane, self.model),
             PaneKind::Accounts => show_accounts(ui, self.model),
             PaneKind::Strategies => show_strategies(ui, self.model),
+            PaneKind::Execution => crate::execution_view::show(ui, self.model),
             PaneKind::CopyRelations => crate::copy_relation_view::show(ui, self.model, self.client),
             PaneKind::Ledger => show_ledger(ui, self.model),
             PaneKind::TradeDock => crate::trade_dock::show(ui, self.model, self.client),
@@ -460,6 +461,40 @@ fn show_market_watch(ui: &mut egui::Ui, model: &mut AppModel) {
 }
 fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
     let language = model.preferences.language;
+    let settings_key = pane.settings_key();
+    #[cfg(not(target_arch = "wasm32"))]
+    let history_status = MarketSelection::binance_usd_m(
+        pane.symbol
+            .as_deref()
+            .unwrap_or(&model.preferences.selected_symbol),
+        pane.interval,
+    )
+    .ok()
+    .and_then(|selection| model.local_markets.view(&selection))
+    .and_then(|view| {
+        if let Some(error) = &view.history_error {
+            Some(error.clone())
+        } else if view.history_loading {
+            Some(text(language, TextKey::LoadingHistory).into())
+        } else if view.history_exhausted || view.bars.len() >= crate::market::MAX_BARS {
+            Some(text(language, TextKey::HistoryBoundary).into())
+        } else {
+            None
+        }
+    });
+    #[cfg(target_arch = "wasm32")]
+    let history_status: Option<String> = None;
+    let settings_requested = show_chart_toolbar(ui, pane, language, history_status.as_deref());
+    if settings_requested {
+        model.indicator_settings_requested = true;
+        model.indicator_target = Some(settings_key.clone());
+    }
+    let settings = model
+        .preferences
+        .chart_overrides
+        .get(&settings_key)
+        .unwrap_or(&model.preferences.chart)
+        .clone();
     let symbol = pane
         .symbol
         .as_deref()
@@ -469,9 +504,18 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
         .then(|| model.trade_dock.highlighted_price(ui.ctx()))
         .flatten();
     #[cfg(not(target_arch = "wasm32"))]
-    if let Some(local) = local_market(model, &symbol, pane.interval) {
+    if let Ok(selection) = MarketSelection::binance_usd_m(&symbol, pane.interval)
+        && let Err(error) =
+            model
+                .local_markets
+                .configure_chart(&settings_key, &selection, settings.engine_config())
+    {
+        ui.colored_label(theme::WARNING, error.to_string());
+        return;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(local) = model.local_markets.chart_view(&settings_key) {
         let (price_scale, quantity_scale) = model.market_scales(&symbol);
-        let settings_requested = show_chart_toolbar(ui, pane, language);
         let chart = presentation::sample(
             ui,
             ("chart-display", pane.instance),
@@ -481,7 +525,7 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
                 local.status,
                 local.bars.len(),
                 local.bars.first().map(|bar| bar.open_time_ms),
-                model.preferences.chart.clone(),
+                settings.clone(),
             ),
             model.preferences.trading.chart_cadence,
             || (local.bars.clone(), local.studies.clone(), local.last),
@@ -492,17 +536,27 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
             &chart.1,
             &mut pane.viewport,
             language,
-            &model.preferences.chart,
+            &settings,
             (price_scale, quantity_scale),
             pane.interval,
             chart.2,
             highlighted_price,
         );
+        let selection = local.selection.clone();
+        let near_start = pane.viewport.right_offset() > 0
+            && pane.viewport.right_offset() + pane.viewport.visible_bars() + 32 >= chart.0.len();
+        let manual = std::mem::take(&mut pane.history_requested);
+        if (manual || near_start)
+            && let Some(request) = model.local_markets.begin_history(&selection, manual)
+        {
+            model.history_requests.push(request);
+        }
         if let Some(price) = selected_price {
             model.select_trading_price(&symbol, price, ui.ctx());
         }
         if settings_requested {
             model.indicator_settings_requested = true;
+            model.indicator_target = Some(settings_key);
         }
         return;
     }
@@ -535,7 +589,6 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
             ));
         }
     });
-    let settings_requested = show_chart_toolbar(ui, pane, language);
     let chart = presentation::sample(
         ui,
         ("chart-display-control", pane.instance),
@@ -543,7 +596,7 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
             symbol.clone(),
             pane.interval,
             model.connection,
-            model.preferences.chart.clone(),
+            settings.clone(),
             market.bars.len(),
         ),
         model.preferences.trading.chart_cadence,
@@ -555,7 +608,7 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
         &[],
         &mut pane.viewport,
         language,
-        &model.preferences.chart,
+        &settings,
         (8, 8),
         pane.interval,
         Some(chart.1),
@@ -566,11 +619,17 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
     }
     if settings_requested {
         model.indicator_settings_requested = true;
+        model.indicator_target = Some(settings_key);
     }
 }
-fn show_chart_toolbar(ui: &mut egui::Ui, pane: &mut Pane, language: Language) -> bool {
+fn show_chart_toolbar(
+    ui: &mut egui::Ui,
+    pane: &mut Pane,
+    language: Language,
+    history_status: Option<&str>,
+) -> bool {
     let mut settings_requested = false;
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui
             .button(format!("⚙ {}", text(language, TextKey::Indicators)))
             .clicked()
@@ -593,6 +652,16 @@ fn show_chart_toolbar(ui: &mut egui::Ui, pane: &mut Pane, language: Language) ->
         }
         if ui.small_button(text(language, TextKey::Follow)).clicked() {
             pane.viewport.follow_latest();
+        }
+        if let Some(status) = history_status {
+            ui.weak(status);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if ui
+            .small_button(text(language, TextKey::OlderBars))
+            .clicked()
+        {
+            pane.history_requested = true;
         }
         ui.colored_label(
             theme::TEXT_SECONDARY,
@@ -1353,15 +1422,6 @@ fn symbol_tab_text(symbol: &str, details: &str, detail_color: Color32) -> egui::
         },
     );
     job.into()
-}
-#[cfg(not(target_arch = "wasm32"))]
-fn local_market<'a>(
-    model: &'a AppModel,
-    symbol: &str,
-    interval: crate::chart::ChartInterval,
-) -> Option<&'a LocalMarketView> {
-    let selection = MarketSelection::binance_usd_m(symbol, interval).ok()?;
-    model.local_markets.view(&selection)
 }
 pub(crate) fn pane_heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
     ui.horizontal(|ui| {

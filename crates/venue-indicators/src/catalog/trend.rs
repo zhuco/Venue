@@ -781,6 +781,7 @@ pub struct DmiOutput {
 #[derive(Debug, Clone)]
 pub struct Dmi {
     period: usize,
+    adx_period: usize,
     true_range: RmaCore,
     plus_movement: RmaCore,
     minus_movement: RmaCore,
@@ -792,13 +793,20 @@ pub struct Dmi {
 impl Dmi {
     /// Create DMI/ADX.
     pub fn new(period: usize) -> IndicatorResult<Self> {
+        Self::with_periods(period, period)
+    }
+
+    /// Independently configure directional movement and ADX smoothing.
+    pub fn with_periods(period: usize, adx_period: usize) -> IndicatorResult<Self> {
         let period = ensure_period(period)?;
+        let adx_period = ensure_period(adx_period)?;
         Ok(Self {
             period,
+            adx_period,
             true_range: RmaCore::new(period)?,
             plus_movement: RmaCore::new(period)?,
             minus_movement: RmaCore::new(period)?,
-            adx: RmaCore::new(period)?,
+            adx: RmaCore::new(adx_period)?,
             previous: None,
             samples: 0,
         })
@@ -822,7 +830,7 @@ impl Warmup for Dmi {
     }
 
     fn warmup_period(&self) -> usize {
-        self.period.saturating_mul(2)
+        self.period.saturating_add(self.adx_period)
     }
 }
 

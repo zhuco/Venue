@@ -1,5 +1,6 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
+    mod history;
     use std::{
         collections::BTreeSet,
         thread,
@@ -59,6 +60,10 @@ mod native {
 
     #[derive(Clone, Debug, PartialEq)]
     pub enum LocalMarketClientEvent {
+        History {
+            request: crate::market::HistoryRequest,
+            result: Result<Vec<PublicBar>, String>,
+        },
         Market(Box<MarketEnvelope>),
         Quotes(Vec<MarketQuote>),
         Catalog(Vec<MarketInstrument>),
@@ -80,6 +85,7 @@ mod native {
 
     #[derive(Debug)]
     pub struct LocalMarketClient {
+        history_commands: Sender<crate::market::HistoryRequest>,
         commands: Sender<LocalMarketCommand>,
         events: Receiver<LocalMarketClientEvent>,
         worker: Option<thread::JoinHandle<()>>,
@@ -89,11 +95,13 @@ mod native {
         pub fn start() -> Result<Self, LocalMarketClientError> {
             let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
             let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
+            let (history_tx, history_rx) = bounded(MAX_SUBSCRIPTIONS);
             let worker = thread::Builder::new()
                 .name("venueflow-local-market".to_owned())
-                .spawn(move || worker_main(command_rx, event_tx))
+                .spawn(move || worker_main(command_rx, event_tx, history_rx))
                 .map_err(|_| LocalMarketClientError::ThreadStart)?;
             Ok(Self {
+                history_commands: history_tx,
                 commands: command_tx,
                 events: event_rx,
                 worker: Some(worker),
@@ -123,6 +131,15 @@ mod native {
         }
 
         /// Drains at most `limit` events without blocking the UI thread.
+        pub fn load_older(
+            &self,
+            request: crate::market::HistoryRequest,
+        ) -> Result<(), LocalMarketClientError> {
+            self.history_commands
+                .try_send(request)
+                .map_err(|_| LocalMarketClientError::CommandUnavailable)
+        }
+
         pub fn drain(&self, limit: usize) -> Vec<LocalMarketClientEvent> {
             self.events.try_iter().take(limit).collect()
         }
@@ -273,6 +290,7 @@ mod native {
     fn worker_main(
         command_rx: Receiver<LocalMarketCommand>,
         event_tx: Sender<LocalMarketClientEvent>,
+        history_rx: Receiver<crate::market::HistoryRequest>,
     ) {
         let runtime = match Builder::new_multi_thread()
             .worker_threads(2)
@@ -287,13 +305,14 @@ mod native {
                 return;
             }
         };
-        runtime.block_on(supervisor(command_rx, event_tx));
+        runtime.block_on(supervisor(command_rx, event_tx, history_rx));
         runtime.shutdown_background();
     }
 
     async fn supervisor(
         command_rx: Receiver<LocalMarketCommand>,
         event_tx: Sender<LocalMarketClientEvent>,
+        history_rx: Receiver<crate::market::HistoryRequest>,
     ) {
         let (async_tx, mut async_rx) = mpsc::channel(COMMAND_CAPACITY);
         let bridge = tokio::task::spawn_blocking(move || {
@@ -319,6 +338,7 @@ mod native {
                 return;
             }
         };
+        history::start(http.clone(), history_rx, event_tx.clone());
         let proxy = ProxySetting::from_environment("fstream.binance.com");
         let _ = event_tx.try_send(LocalMarketClientEvent::ProxyDetected(proxy.configured()));
         let catalog = match fetch_catalog(&http).await {
@@ -818,7 +838,7 @@ mod native {
                         None => AttemptResult::Failed("local market command bridge ended".to_owned()),
                     };
                 }
-                result = fetch_history(http, selection, generation, DEFAULT_HISTORY_LIMIT) => result,
+                result = fetch_history(http, selection, generation, DEFAULT_HISTORY_LIMIT, None) => result,
             };
             let (bars, received_ms, event_time_ms) = match history {
                 Ok(history) => history,
@@ -843,8 +863,9 @@ mod native {
         selection: &MarketSelection,
         generation: u64,
         limit: usize,
+        before: Option<u64>,
     ) -> Result<(Vec<PublicBar>, u64, u64), String> {
-        let url = rest_klines_url(selection, limit)?;
+        let url = history::url(selection, limit, before)?;
         let response = http
             .get(url)
             .send()

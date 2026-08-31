@@ -1,6 +1,7 @@
 use eframe::egui::{self, Color32, RichText, Stroke};
 use venue_control_protocol::{StrategyLifecycle, TradingAction};
 
+use crate::i18n::{TextKey, text};
 use crate::{client::ControlClient, model::AppModel, theme, trading::build_trade_intent};
 
 pub fn show(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
@@ -52,34 +53,60 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
         ));
     });
     ui.separator();
+    ui.horizontal(|ui| {
+        ui.strong("Limit · GTC");
+        ui.checkbox(&mut model.preferences.trading.post_only, "Post Only");
+    });
     ui.columns(2, |columns| {
         columns[0].horizontal(|ui| {
             ui.small(label(language, "价格", "Price"));
-            let price = model.trade_dock.selected_price.map_or_else(
-                || "—".to_owned(),
-                |value| model.format_market_price(&symbol, value),
-            );
-            ui.label(RichText::new(price).size(15.0).strong().color(theme::BRAND))
-                .on_hover_text(label(
-                    language,
-                    "点击图表或盘口选择限价",
-                    "Select a limit price on the chart or book",
-                ));
+            ui.small(&quote);
         });
+        let mut input = model.trade_dock.price_input.clone();
+        if columns[0]
+            .add(
+                egui::TextEdit::singleline(&mut input)
+                    .hint_text(text(language, TextKey::LimitPriceHint))
+                    .desired_width(f32::INFINITY),
+            )
+            .changed()
+        {
+            model
+                .trade_dock
+                .edit_price(input, columns[0].ctx().input(|input| input.time));
+        }
         columns[1].horizontal(|ui| {
-            ui.small(label(language, "金额", "Amount"));
-            let amount = model
-                .preferences
-                .trading
-                .size_presets
-                .get(model.trade_dock.selected_size_preset)
-                .map_or_else(|| "—".to_owned(), |value| value.normalize().to_string());
-            ui.label(
-                RichText::new(format!("{amount} {quote}"))
-                    .size(15.0)
-                    .strong(),
-            );
+            ui.small(text(language, TextKey::TradeSizeAmount));
+            let previous = model.trade_dock.amount_in_base;
+            egui::ComboBox::from_id_salt("trade-amount-unit")
+                .selected_text(if previous { &base } else { &quote })
+                .width(60.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut model.trade_dock.amount_in_base, false, &quote);
+                    ui.selectable_value(&mut model.trade_dock.amount_in_base, true, &base);
+                });
+            if previous != model.trade_dock.amount_in_base {
+                model.trade_dock.amount_input.clear();
+                model.trade_dock.armed_action = None;
+            }
         });
+        let preset =
+            model.preferences.trading.size_presets[model.trade_dock.selected_size_preset.min(4)];
+        let hint = if model.trade_dock.amount_in_base {
+            text(language, TextKey::EnterBaseSize).to_owned()
+        } else {
+            preset.normalize().to_string()
+        };
+        if columns[1]
+            .add(
+                egui::TextEdit::singleline(&mut model.trade_dock.amount_input)
+                    .hint_text(hint)
+                    .desired_width(f32::INFINITY),
+            )
+            .changed()
+        {
+            model.trade_dock.armed_action = None;
+        }
     });
     ui.horizontal(|ui| {
         let width = ((ui.available_width() - ui.spacing().item_spacing.x * 4.0) / 5.0).max(24.0);
@@ -96,7 +123,8 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
                 .add_sized(
                     [width, 25.0],
                     egui::Button::selectable(
-                        model.trade_dock.selected_size_preset == index,
+                        model.trade_dock.selected_size_preset == index
+                            && model.trade_dock.amount_input.is_empty(),
                         RichText::new(title).size(11.0),
                     )
                     .wrap_mode(egui::TextWrapMode::Truncate),
@@ -208,7 +236,7 @@ fn action_button(
         .hotkeys
         .key_for(action)
         .map_or("—", |key| key.label());
-    let enabled = action_enabled(model, action);
+    let enabled = action_enabled(model, action, ui.ctx().input(|input| input.time));
     let (text_color, fill, stroke) = action_palette(action);
     ui.add_enabled(
         enabled,
@@ -226,28 +254,24 @@ fn action_button(
     .then_some(action)
 }
 
-fn action_enabled(model: &AppModel, action: TradingAction) -> bool {
+fn action_enabled(model: &AppModel, action: TradingAction, now: f64) -> bool {
     let Some(strategy) = model.selected_trading_strategy() else {
         return false;
     };
     if strategy.lifecycle != StrategyLifecycle::Running {
         return false;
     }
-    match action {
-        TradingAction::OpenLong | TradingAction::OpenShort => {
-            model.trade_dock.selected_price.is_some()
-        }
-        TradingAction::CloseLong => {
-            model.trade_dock.selected_price.is_some()
-                && strategy.long_quantity > rust_decimal::Decimal::ZERO
-        }
-        TradingAction::CloseShort => {
-            model.trade_dock.selected_price.is_some()
-                && strategy.short_quantity > rust_decimal::Decimal::ZERO
-        }
-        TradingAction::CancelSelectedOrder | TradingAction::CancelAllOrders => true,
-        _ => true,
+    if action.is_order_action() {
+        return build_trade_intent(
+            &strategy,
+            &model.preferences.trading,
+            &model.trade_dock,
+            action,
+            now,
+        )
+        .is_ok();
     }
+    true
 }
 
 pub fn apply_action(
@@ -262,6 +286,9 @@ pub fn apply_action(
         TradingAction::SelectSizePreset(index) => {
             if index < crate::trading::SIZE_PRESET_COUNT {
                 model.trade_dock.selected_size_preset = index;
+                model.trade_dock.amount_input.clear();
+                model.trade_dock.amount_in_base = false;
+                model.trade_dock.armed_action = None;
             }
             return;
         }
@@ -281,6 +308,16 @@ pub fn apply_action(
     };
     if strategy.lifecycle != StrategyLifecycle::Running {
         model.notice("Trading action rejected: selected strategy is not Running");
+        return;
+    }
+    if action == TradingAction::CancelSelectedOrder
+        && let Some(id) = &model.trade_dock.selected_order_id
+        && !model.execution.order_matches(&strategy, id, now_ms())
+    {
+        model.notice(text(
+            model.preferences.language,
+            TextKey::OrderSelectionExpired,
+        ));
         return;
     }
     model.trade_dock.armed_action = Some(action);

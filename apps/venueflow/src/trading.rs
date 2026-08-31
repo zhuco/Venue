@@ -329,11 +329,19 @@ pub struct TradingScope {
     pub venue: String,
     pub trading_account_id: String,
     pub symbol: String,
+    pub instance_id: String,
+    pub config_epoch: u64,
 }
+
+#[cfg(test)]
+mod input_tests;
 
 #[derive(Clone, Debug, Default)]
 pub struct TradeDockState {
     pub selected_price: Option<Decimal>,
+    pub price_input: String,
+    pub amount_input: String,
+    pub amount_in_base: bool,
     pub selected_order_id: Option<String>,
     pub armed_action: Option<TradingAction>,
     pub selected_size_preset: usize,
@@ -357,6 +365,7 @@ impl TradeDockState {
             return Err(TradePlanError::InvalidPrice);
         }
         self.selected_price = Some(price);
+        self.price_input = price.normalize().to_string();
         self.price_selected_at = Some(now);
         self.armed_action = None;
         Ok(())
@@ -399,13 +408,56 @@ impl TradeDockState {
 
     fn clear_price(&mut self) {
         self.selected_price = None;
+        self.price_input.clear();
         self.price_selected_at = None;
         self.armed_action = None;
     }
 
     pub fn clear_selection(&mut self) {
         self.clear_price();
+        self.amount_input.clear();
         self.selected_order_id = None;
+    }
+
+    pub fn edit_price(&mut self, input: String, now: f64) {
+        self.clear_price();
+        if let Ok(price) = input.trim().parse::<Decimal>() {
+            let _ = self.select_price(price, now);
+        }
+        self.price_input = input;
+    }
+
+    pub fn quote_notional(
+        &self,
+        settings: &TradingSettings,
+        price: Decimal,
+    ) -> Result<Decimal, TradePlanError> {
+        if self.amount_input.trim().is_empty() {
+            if self.amount_in_base {
+                return Err(TradePlanError::InvalidSize);
+            }
+            return settings
+                .size_presets
+                .get(self.selected_size_preset)
+                .copied()
+                .filter(|value| *value > Decimal::ZERO)
+                .ok_or(TradePlanError::InvalidSize);
+        }
+        let amount = self
+            .amount_input
+            .trim()
+            .parse::<Decimal>()
+            .ok()
+            .filter(|value| *value > Decimal::ZERO)
+            .ok_or(TradePlanError::InvalidSize)?;
+        if self.amount_in_base {
+            amount
+                .checked_mul(price)
+                .filter(|value| *value > Decimal::ZERO)
+                .ok_or(TradePlanError::InvalidSize)
+        } else {
+            Ok(amount)
+        }
     }
 }
 
@@ -464,18 +516,17 @@ pub fn build_trade_intent(
     {
         return Err(TradePlanError::ExpiredPrice);
     }
-    let notional = settings
-        .size_presets
-        .get(state.selected_size_preset)
-        .copied()
-        .filter(|value| *value > Decimal::ZERO)
-        .ok_or(TradePlanError::InvalidSize)?;
+    let notional = state.quote_notional(settings, price)?;
     let close_quantity_cap = match action {
         TradingAction::CloseLong => Some(strategy.long_quantity),
         TradingAction::CloseShort => Some(strategy.short_quantity),
         _ => None,
     }
-    .map(|position| position.min(notional / price))
+    .and_then(|position| {
+        notional
+            .checked_div(price)
+            .map(|quantity| position.min(quantity))
+    })
     .filter(|quantity| *quantity > Decimal::ZERO);
     if action.is_close_action() && close_quantity_cap.is_none() {
         return Err(TradePlanError::NoPosition);
@@ -972,6 +1023,8 @@ mod tests {
                 venue: "Binance".to_owned(),
                 trading_account_id: "account-a".to_owned(),
                 symbol: "BTC/USDT".to_owned(),
+                instance_id: "manual".into(),
+                config_epoch: 1,
             }),
         );
         state
@@ -985,6 +1038,8 @@ mod tests {
                 venue: "Binance".to_owned(),
                 trading_account_id: "account-a".to_owned(),
                 symbol: "ETH/USDT".to_owned(),
+                instance_id: "manual".into(),
+                config_epoch: 1,
             }),
         );
         assert_eq!(state.selected_price, None);

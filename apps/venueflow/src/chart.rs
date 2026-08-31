@@ -10,6 +10,7 @@ pub const MAX_VISIBLE_BARS: usize = 400;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ChartStudyPoint {
+    pub custom_ema_adx: Option<venue_indicators::chart::EmaAdxValues>,
     pub open_time_ms: u64,
     pub confirmed: bool,
     pub sma: Option<Decimal>,
@@ -132,6 +133,16 @@ pub fn format_timeline_label(open_time_ms: u64, interval: ChartInterval) -> Stri
     }
 }
 
+pub fn timeline_time_at_slot(bars: &[UiBar], interval: ChartInterval, index: usize) -> Option<u64> {
+    if let Some(bar) = bars.get(index) {
+        return Some(bar.open_time_ms);
+    }
+    let last = bars.last()?;
+    let future_bars = u64::try_from(index.checked_sub(bars.len() - 1)?).ok()?;
+    last.open_time_ms
+        .checked_add(interval.duration_ms().checked_mul(future_bars)?)
+}
+
 fn local_offset_seconds(unix_seconds: i64) -> i64 {
     time::OffsetDateTime::from_unix_timestamp(unix_seconds)
         .ok()
@@ -185,6 +196,10 @@ impl Default for ChartViewport {
 }
 
 impl ChartViewport {
+    #[cfg(any(test, not(target_arch = "wasm32")))]
+    pub fn history_prepended(&mut self, added: usize) {
+        self.last_total_bars = self.last_total_bars.saturating_add(added);
+    }
     pub const fn visible_bars(&self) -> usize {
         self.visible_bars
     }
@@ -193,7 +208,7 @@ impl ChartViewport {
         self.right_offset
     }
 
-    /// Virtual future slots shown after the newest visible candle following a leftward drag.
+    /// Blank slots inside the fixed-width viewport, retained while following live candles.
     #[cfg(test)]
     pub const fn right_padding(&self) -> usize {
         self.right_padding
@@ -236,23 +251,28 @@ impl ChartViewport {
         }
         let maximum_offset = total_bars.saturating_sub(count);
         self.right_offset = self.right_offset.min(maximum_offset);
-        self.right_padding = self.right_padding.min(count);
+        self.right_padding = if self.right_offset > 0 {
+            0
+        } else {
+            self.right_padding.min(count.saturating_sub(1))
+        };
         self.last_total_bars = total_bars;
         let end = total_bars.saturating_sub(self.right_offset);
-        end.saturating_sub(count)..end
+        end.saturating_sub(count.saturating_sub(self.right_padding))..end
     }
 
     /// Positive values pan towards older bars; negative values pan back towards live data.
     pub fn pan_by_bars(&mut self, total_bars: usize, delta: isize) {
         let visible = self.visible_range(total_bars);
-        let maximum_offset = total_bars.saturating_sub(visible.len());
+        let slots = self.display_slots(visible.len());
+        let maximum_offset = total_bars.saturating_sub(slots);
         let amount = delta.unsigned_abs();
         if delta.is_negative() {
             let from_history = amount.min(self.right_offset);
             self.right_offset = self.right_offset.saturating_sub(from_history);
             let into_padding = amount
                 .saturating_sub(from_history)
-                .min(visible.len().saturating_sub(self.right_padding));
+                .min(slots.saturating_sub(1).saturating_sub(self.right_padding));
             self.right_padding = self.right_padding.saturating_add(into_padding);
         } else {
             let from_padding = amount.min(self.right_padding);
@@ -271,7 +291,7 @@ impl ChartViewport {
         if visible.is_empty() || !chart_width.is_finite() || chart_width <= 0.0 {
             return;
         }
-        let width_per_bar = chart_width / visible.len() as f32;
+        let width_per_bar = chart_width / self.display_slots(visible.len()) as f32;
         if !width_per_bar.is_finite() || width_per_bar <= 0.0 {
             return;
         }
@@ -312,28 +332,36 @@ impl ChartViewport {
         requested_visible_bars: usize,
         anchor_ratio: f32,
     ) {
-        let was_following_latest = self.right_offset == 0 && self.right_padding == 0;
         let current = self.visible_range(total_bars);
         if current.is_empty() {
             self.visible_bars = requested_visible_bars.clamp(MIN_VISIBLE_BARS, MAX_VISIBLE_BARS);
             self.right_offset = 0;
             return;
         }
+        let was_following_latest = self.right_offset == 0;
+        let current_slots = self.display_slots(current.len());
         let ratio = anchor_ratio.clamp(0.0, 1.0);
         let current_anchor_offset =
             ((current.len().saturating_sub(1)) as f32 * ratio).round() as usize;
         let anchor_index = current.start.saturating_add(current_anchor_offset);
         self.visible_bars = requested_visible_bars.clamp(MIN_VISIBLE_BARS, MAX_VISIBLE_BARS);
         let new_count = self.visible_bars.min(total_bars);
+        if was_following_latest {
+            // Zoom changes candle density, not the user's chosen live-edge position.
+            self.right_padding = self
+                .right_padding
+                .saturating_mul(new_count)
+                .saturating_add(current_slots / 2)
+                / current_slots;
+            self.right_padding = self.right_padding.min(new_count.saturating_sub(1));
+            return;
+        }
         let new_anchor_offset = ((new_count.saturating_sub(1)) as f32 * ratio).round() as usize;
         let newest_allowed_start = total_bars.saturating_sub(new_count);
         let new_start = anchor_index
             .saturating_sub(new_anchor_offset)
             .min(newest_allowed_start);
         self.right_offset = total_bars.saturating_sub(new_start.saturating_add(new_count));
-        if was_following_latest {
-            self.right_offset = 0;
-        }
     }
 
     /// Positive steps zoom in and negative steps zoom out. Each step is about ten percent of the
@@ -346,7 +374,7 @@ impl ChartViewport {
         if current.is_empty() {
             return;
         }
-        let increment = (current.len() / 10).max(1);
+        let increment = (self.display_slots(current.len()) / 10).max(1);
         let amount = increment.saturating_mul(steps.unsigned_abs());
         let requested = if steps.is_negative() {
             self.visible_bars.saturating_add(amount)
@@ -486,6 +514,7 @@ mod tests {
     use super::{
         ChartInterval, ChartViewport, PriceRange, bar_center_x, bar_index_at_x,
         civil_date_from_unix_days, format_timeline_label, local_offset_seconds,
+        timeline_time_at_slot,
     };
     use venue_control_protocol::UiBar;
 
@@ -510,7 +539,8 @@ mod tests {
         viewport.pan_by_bars(500, 999);
         assert_eq!(viewport.visible_range(500), 0..120);
         viewport.pan_by_bars(500, -999);
-        assert_eq!(viewport.visible_range(500), 380..500);
+        assert_eq!(viewport.visible_range(500), 499..500);
+        assert_eq!(viewport.right_padding(), 119);
         viewport.reset();
         assert_eq!(viewport.visible_range(500), 380..500);
     }
@@ -554,8 +584,9 @@ mod tests {
         let mut viewport = ChartViewport::default();
         viewport.pan_by_bars(500, -60);
         assert_eq!(viewport.right_padding(), 60);
-        assert_eq!(viewport.visible_range(500), 380..500);
-        assert_eq!(viewport.display_slots(120), 180);
+        let visible = viewport.visible_range(500);
+        assert_eq!(visible, 440..500);
+        assert_eq!(viewport.display_slots(visible.len()), 120);
 
         viewport.pan_by_bars(500, 100);
         assert_eq!(viewport.right_padding(), 0);
@@ -569,6 +600,22 @@ mod tests {
         let before = viewport.visible_range(500);
         assert_eq!(before, 250..370);
         assert_eq!(viewport.visible_range(501), before);
+    }
+
+    #[test]
+    fn prepending_history_preserves_the_same_candle_times() {
+        let mut viewport = ChartViewport::default();
+        viewport.pan_by_bars(500, 130);
+        let before = viewport.visible_range(500);
+        viewport.history_prepended(500);
+        assert_eq!(
+            viewport.visible_range(1000),
+            before.start + 500..before.end + 500
+        );
+        assert_eq!(
+            viewport.visible_range(1001),
+            before.start + 500..before.end + 500
+        );
     }
 
     #[test]
@@ -592,6 +639,65 @@ mod tests {
         viewport.finish_drag();
         viewport.pan_by_drag_total(500, 1_200.0, -120.0);
         assert_eq!(viewport.right_padding(), 24);
+    }
+
+    #[test]
+    fn dragging_live_edge_to_center_preserves_candle_width_and_future_anchor() {
+        let mut viewport = ChartViewport::default();
+        let before = viewport.visible_range(500);
+        let slots = viewport.display_slots(before.len());
+        let before_x = bar_center_x(0.0, 1_200.0, slots, before.len() - 1);
+        viewport.pan_by_drag_total(500, 1_200.0, -600.0);
+        viewport.finish_drag();
+        assert_eq!(before_x, Some(1_195.0));
+        for total in 500..520 {
+            let visible = viewport.visible_range(total);
+            assert_eq!(visible, total - 60..total);
+            assert_eq!(viewport.display_slots(visible.len()), slots);
+            assert_eq!(
+                bar_center_x(0.0, 1_200.0, slots, visible.len() - 1),
+                Some(595.0)
+            );
+            assert_eq!(viewport.right_offset(), 0);
+        }
+        viewport.history_prepended(500);
+        assert_eq!(viewport.visible_range(1_019), 959..1_019);
+        assert_eq!(viewport.right_padding(), 60);
+    }
+
+    #[test]
+    fn zoom_preserves_centered_live_edge_and_follow_resets_it() {
+        let mut viewport = ChartViewport::default();
+        viewport.pan_by_bars(500, -60);
+        viewport.set_visible_bars_anchored(500, 60, 0.1);
+        assert_eq!(viewport.right_padding(), 30);
+        assert_eq!(viewport.right_offset(), 0);
+        let visible = viewport.visible_range(501);
+        assert_eq!(visible, 471..501);
+        assert_eq!(viewport.display_slots(visible.len()), 60);
+        viewport.follow_latest();
+        assert_eq!(viewport.visible_range(501), 441..501);
+        assert_eq!(viewport.right_padding(), 0);
+    }
+
+    #[test]
+    fn right_padding_has_future_time_labels_but_no_fabricated_candles() {
+        let mut candle = bar(100, 110);
+        candle.open_time_ms = 60_000;
+        let bars = [candle];
+        assert_eq!(
+            timeline_time_at_slot(&bars, ChartInterval::OneMinute, 0),
+            Some(60_000)
+        );
+        assert_eq!(
+            timeline_time_at_slot(&bars, ChartInterval::OneMinute, 14),
+            Some(900_000)
+        );
+        assert_eq!(
+            timeline_time_at_slot(&[], ChartInterval::OneMinute, 14),
+            None
+        );
+        assert_eq!(bars.len(), 1);
     }
 
     #[test]

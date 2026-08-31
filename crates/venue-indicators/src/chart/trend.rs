@@ -28,12 +28,19 @@ impl Sma {
 
     pub fn update(&mut self, bar: &PublicBar) -> Result<Option<Decimal>, ChartIndicatorError> {
         validate_bar(bar)?;
+        self.update_value(bar.close.value())
+    }
+
+    pub(super) fn update_value(
+        &mut self,
+        value: Decimal,
+    ) -> Result<Option<Decimal>, ChartIndicatorError> {
         self.samples = self.samples.saturating_add(1);
         self.sum = self
             .sum
-            .checked_add(bar.close.value())
+            .checked_add(value)
             .ok_or(ChartIndicatorError::Arithmetic)?;
-        self.closes.push_back(bar.close.value());
+        self.closes.push_back(value);
         if self.closes.len() > self.period {
             let oldest = self
                 .closes

@@ -57,6 +57,7 @@ impl VenueFlowApp {
     pub fn new(creation_context: &eframe::CreationContext<'_>, default_endpoint: String) -> Self {
         theme::apply(&creation_context.egui_ctx);
         let mut persisted = load(creation_context.storage);
+        persisted.workspaces.upgrade_trading_tables();
         if persisted.preferences.endpoint.trim().is_empty() {
             persisted.preferences.endpoint = default_endpoint;
         }
@@ -76,7 +77,7 @@ impl VenueFlowApp {
         };
         Self {
             connected_endpoint: model.preferences.endpoint.clone(),
-            account_center: crate::account_center::AccountCenter::default(),
+            account_center: crate::account_center::AccountCenter::new(&model.preferences.endpoint),
             model,
             workspaces: persisted.workspaces,
             client,
@@ -135,6 +136,22 @@ impl VenueFlowApp {
         };
         for event in client.drain(10_000) {
             match event {
+                LocalMarketClientEvent::History { request, result } => {
+                    match self.model.local_markets.finish_history(&request, result) {
+                        Ok(added) => self.workspaces.history_prepended(
+                            &request.selection,
+                            added,
+                            &self.model.preferences.selected_symbol,
+                        ),
+                        Err(error) => {
+                            let _ = self
+                                .model
+                                .local_markets
+                                .finish_history(&request, Err(error.to_string()));
+                            self.model.notice(format!("History page rejected: {error}"));
+                        }
+                    }
+                }
                 LocalMarketClientEvent::Market(envelope) => {
                     if let Err(error) = self.model.local_markets.apply(*envelope) {
                         self.model
@@ -166,6 +183,14 @@ impl VenueFlowApp {
                 }
             }
         }
+        for request in self.model.history_requests.drain(..) {
+            if let Err(error) = client.load_older(request.clone()) {
+                let _ = self
+                    .model
+                    .local_markets
+                    .finish_history(&request, Err(error.to_string()));
+            }
+        }
         self.model
             .local_markets
             .refresh_staleness(unix_now_ms(), 5_000);
@@ -178,9 +203,17 @@ impl VenueFlowApp {
                 ClientEvent::SnapshotConnected => {
                     self.model.snapshot_connected();
                 }
+                ClientEvent::ExecutionFacts(facts) => self.model.execution.apply(facts),
+                ClientEvent::ExecutionFactsUnavailable(message) => {
+                    self.model.execution.error = Some(message)
+                }
                 ClientEvent::SessionExpired => {
-                    self.account_center.clear(&mut self.model);
-                    self.reconnect = true;
+                    // An unauthenticated bootstrap response must not invalidate
+                    // a vaulted session that the account endpoint is validating.
+                    if self.account_center.session.is_some() {
+                        self.account_center.clear(&mut self.model);
+                        self.reconnect = true;
+                    }
                     break;
                 }
                 ClientEvent::SnapshotUnavailable(message) => {
@@ -229,7 +262,9 @@ impl VenueFlowApp {
         }
         self.reconnect = false;
         if self.connected_endpoint != self.model.preferences.endpoint {
-            self.account_center.clear(&mut self.model);
+            self.model.clear_account_session();
+            self.account_center =
+                crate::account_center::AccountCenter::new(&self.model.preferences.endpoint);
             self.connected_endpoint = self.model.preferences.endpoint.clone();
         }
         self.model.reconnecting();
@@ -336,7 +371,8 @@ impl eframe::App for VenueFlowApp {
         });
         if std::mem::take(&mut self.model.indicator_settings_requested) {
             self.show_settings = true;
-            self.settings_state.focus_indicators();
+            self.settings_state
+                .focus_indicators(self.model.indicator_target.take());
         }
         if std::mem::take(&mut self.model.trading_settings_requested) {
             self.show_trading_settings = true;

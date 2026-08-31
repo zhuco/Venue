@@ -79,10 +79,13 @@ pub struct SettingsPanelState {
     draft: Option<ChartDisplaySettings>,
     original: Option<ChartDisplaySettings>,
     error: Option<String>,
+    target: Option<String>,
 }
 
 impl SettingsPanelState {
-    pub fn focus_indicators(&mut self) {
+    pub fn focus_indicators(&mut self, target: Option<String>) {
+        self.clear();
+        self.target = target;
         self.tab = SettingsTab::Main;
         self.indicator = IndicatorKind::Supertrend;
     }
@@ -105,12 +108,14 @@ pub fn show(
         state.clear();
         return;
     }
-    state
-        .original
-        .get_or_insert_with(|| model.preferences.chart.clone());
-    state
-        .draft
-        .get_or_insert_with(|| model.preferences.chart.clone());
+    let current = state
+        .target
+        .as_ref()
+        .and_then(|key| model.preferences.chart_overrides.get(key))
+        .unwrap_or(&model.preferences.chart)
+        .clone();
+    state.original.get_or_insert_with(|| current.clone());
+    state.draft.get_or_insert(current);
     let language = model.preferences.language;
     let mut window_open = true;
     let mut saved = false;
@@ -135,7 +140,16 @@ pub fn show(
             ui.separator();
             match state.tab {
                 SettingsTab::Main | SettingsTab::Sub => indicator_body(ui, state, language),
-                SettingsTab::Custom | SettingsTab::Backtest => placeholder(ui, language),
+                SettingsTab::Custom => {
+                    if let Some(draft) = &mut state.draft {
+                        crate::custom_indicator::settings_ui(
+                            ui,
+                            &mut draft.custom_ema_adx,
+                            language,
+                        );
+                    }
+                }
+                SettingsTab::Backtest => placeholder(ui, language),
                 SettingsTab::General => general_settings(ui, model, reconnect, language),
             }
             ui.separator();
@@ -143,7 +157,7 @@ pub fn show(
         });
 
     if let Some(draft) = state.draft.clone() {
-        match apply_chart_settings(&draft, model, language) {
+        match apply_chart_settings(&draft, model, language, state.target.as_deref()) {
             Ok(()) => state.error = None,
             Err(error) => state.error = Some(error),
         }
@@ -153,7 +167,7 @@ pub fn show(
     }
     if !window_open {
         if !saved && let Some(original) = state.original.clone() {
-            let _ = apply_chart_settings(&original, model, language);
+            let _ = apply_chart_settings(&original, model, language, state.target.as_deref());
         }
         *open = false;
         state.clear();
@@ -178,7 +192,14 @@ fn top_tabs(
                 (SettingsTab::Backtest, IndicatorTextKey::BacktestTab),
                 (SettingsTab::General, IndicatorTextKey::GeneralTab),
             ] {
-                tab_button(ui, &mut state.tab, tab, indicator_text(language, key));
+                ui.add_enabled_ui(!matches!(tab, SettingsTab::Backtest), |ui| {
+                    tab_button(ui, &mut state.tab, tab, indicator_text(language, key));
+                })
+                .response
+                .on_disabled_hover_text(indicator_text(
+                    language,
+                    IndicatorTextKey::FeatureUnavailable,
+                ));
                 ui.add_space(16.0);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -901,8 +922,16 @@ fn apply_chart_settings(
     settings: &ChartDisplaySettings,
     model: &mut AppModel,
     _language: Language,
+    target: Option<&str>,
 ) -> Result<(), String> {
     settings.validate().map_err(str::to_owned)?;
+    if let Some(target) = target {
+        model
+            .preferences
+            .chart_overrides
+            .insert(target.to_owned(), settings.clone());
+        return Ok(());
+    }
     #[cfg(not(target_arch = "wasm32"))]
     model
         .local_markets
@@ -974,6 +1003,103 @@ const fn indicator_title(kind: IndicatorKind) -> IndicatorTextKey {
 #[cfg(test)]
 mod tests {
     use super::{MAIN_INDICATORS, SUB_INDICATORS, SettingsTab};
+
+    #[test]
+    fn custom_tab_exposes_enable_and_save_in_both_languages() {
+        use eframe::egui;
+        fn collect(shape: &egui::Shape, labels: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => labels.push((
+                    t.galley.job.text.clone(),
+                    egui::Rect::from_min_size(t.pos, t.galley.size()),
+                )),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, labels)),
+                _ => (),
+            }
+        }
+        for language in crate::i18n::Language::ALL {
+            let context = egui::Context::default();
+            crate::theme::apply(&context);
+            let mut model = crate::model::AppModel::new(crate::model::Preferences {
+                language,
+                ..Default::default()
+            });
+            let mut state = super::SettingsPanelState {
+                tab: SettingsTab::Custom,
+                ..Default::default()
+            };
+            let mut open = true;
+            let mut reconnect = false;
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 700.0));
+            let mut labels = Vec::new();
+            for _ in 0..3 {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        super::show(ui.ctx(), &mut open, &mut state, &mut model, &mut reconnect);
+                    },
+                );
+                output.textures_delta.clear();
+                labels.clear();
+                for shape in output.shapes {
+                    collect(&shape.shape, &mut labels);
+                }
+            }
+            let enable = if language == crate::i18n::Language::English {
+                "Enable this study"
+            } else {
+                "启用此指标"
+            };
+            for label in [
+                enable,
+                crate::i18n::indicator_text(language, crate::i18n::IndicatorTextKey::Save),
+            ] {
+                assert!(
+                    labels
+                        .iter()
+                        .any(|(s, r)| s == label && screen.contains_rect(*r)),
+                    "Missing or clipped: {label}"
+                );
+            }
+            assert!(!reconnect);
+        }
+    }
+
+    #[test]
+    fn chart_settings_are_isolated_and_persist_without_private_data()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut model = crate::model::AppModel::new(Default::default());
+        let original = model.preferences.chart.clone();
+        let mut configured = original.clone();
+        configured.ma_periods = [3, 9, 20];
+        configured.custom_ema_adx.enabled = true;
+        configured.custom_ema_adx.parameters.ema_periods = [5, 13, 34];
+        super::apply_chart_settings(
+            &configured,
+            &mut model,
+            crate::i18n::Language::English,
+            Some("chart-a"),
+        )?;
+        assert_eq!(model.preferences.chart, original);
+        assert!(!model.preferences.chart_overrides.contains_key("chart-b"));
+        let restored: crate::model::Preferences =
+            serde_json::from_str(&serde_json::to_string(&model.preferences)?)?;
+        assert_eq!(restored.chart_overrides.get("chart-a"), Some(&configured));
+        super::apply_chart_settings(
+            &original,
+            &mut model,
+            crate::i18n::Language::English,
+            Some("chart-a"),
+        )?;
+        assert_eq!(
+            model.preferences.chart_overrides.get("chart-a"),
+            Some(&original)
+        );
+        Ok(())
+    }
 
     #[test]
     fn settings_expose_only_the_confirmed_main_and_sub_indicator_groups() {

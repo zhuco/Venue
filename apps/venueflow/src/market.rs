@@ -12,7 +12,7 @@ use venue_indicators::chart::{
 
 use crate::chart::{ChartInterval, ChartStudyPoint};
 
-pub const MAX_BARS: usize = 2_000;
+pub const MAX_BARS: usize = 10_000;
 pub const MAX_TRADES: usize = 200;
 pub const MAX_BOOK_LEVELS: usize = 20;
 
@@ -20,6 +20,13 @@ pub const MAX_BOOK_LEVELS: usize = 20;
 pub struct MarketSelection {
     pub binding: PublicMarketBinding,
     pub interval: ChartInterval,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryRequest {
+    pub generation: u64,
+    pub selection: MarketSelection,
+    pub before: u64,
 }
 
 impl MarketSelection {
@@ -87,6 +94,10 @@ pub struct MarketEnvelope {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LocalMarketView {
+    history_started_ms: u64,
+    pub history_loading: bool,
+    pub history_exhausted: bool,
+    pub history_error: Option<String>,
     pub generation: u64,
     pub selection: MarketSelection,
     pub status: MarketStatus,
@@ -107,6 +118,10 @@ pub struct LocalMarketView {
 impl LocalMarketView {
     fn empty(generation: u64, selection: MarketSelection) -> Self {
         Self {
+            history_started_ms: 0,
+            history_loading: false,
+            history_exhausted: false,
+            history_error: None,
             generation,
             selection,
             status: MarketStatus::LoadingHistory,
@@ -139,6 +154,7 @@ pub struct LocalMarketReducer {
     closed_facts: BTreeMap<u64, PublicBar>,
     studies: ChartStudyEngine,
     study_config: ChartStudyConfig,
+    forming_bar: Option<PublicBar>,
 }
 
 impl LocalMarketReducer {
@@ -163,6 +179,7 @@ impl LocalMarketReducer {
             studies: ChartStudyEngine::with_config(&study_config)
                 .map_err(LocalMarketError::Indicator)?,
             study_config,
+            forming_bar: None,
         })
     }
 
@@ -184,6 +201,7 @@ impl LocalMarketReducer {
         self.closed_bars.clear();
         self.closed_facts.clear();
         self.studies.reset();
+        self.forming_bar = None;
         Ok(generation)
     }
 
@@ -245,6 +263,7 @@ impl LocalMarketReducer {
     }
 
     fn apply_history(&mut self, mut bars: Vec<PublicBar>) -> Result<(), LocalMarketError> {
+        self.forming_bar = None;
         bars.sort_by_key(|bar| bar.open_time_ms);
         self.view.bars.clear();
         self.view.studies.clear();
@@ -272,6 +291,9 @@ impl LocalMarketReducer {
         }
         trim_bars(&mut self.view.bars, &mut self.closed_bars);
         trim_studies(&mut self.view.studies);
+        while self.closed_facts.len() > MAX_BARS {
+            self.closed_facts.pop_first();
+        }
         self.view.last = self.view.bars.last().map(|bar| bar.close);
         Ok(())
     }
@@ -291,6 +313,13 @@ impl LocalMarketReducer {
             return Ok(());
         }
         if closed {
+            if self
+                .forming_bar
+                .as_ref()
+                .is_some_and(|forming| forming.open_time_ms <= study_bar.open_time_ms)
+            {
+                self.forming_bar = None;
+            }
             if let Some(existing) = self.closed_facts.get(&bar.open_time_ms) {
                 if existing != &study_bar {
                     self.closed_facts.insert(bar.open_time_ms, study_bar);
@@ -313,6 +342,7 @@ impl LocalMarketReducer {
             }
             self.closed_bars.insert(bar.open_time_ms);
         } else {
+            self.forming_bar = Some(study_bar.clone());
             let values = self
                 .studies
                 .preview(&study_bar)
@@ -328,6 +358,9 @@ impl LocalMarketReducer {
         }
         self.view.last = Some(bar.close);
         upsert_bar(&mut self.view.bars, bar);
+        while self.closed_facts.len() > MAX_BARS {
+            self.closed_facts.pop_first();
+        }
         trim_bars(&mut self.view.bars, &mut self.closed_bars);
         trim_studies(&mut self.view.studies);
         Ok(())
@@ -356,6 +389,9 @@ impl LocalMarketReducer {
         self.view.last = self.view.bars.last().map(|bar| bar.close);
         trim_bars(&mut self.view.bars, &mut self.closed_bars);
         trim_studies(&mut self.view.studies);
+        if let Some(forming) = self.forming_bar.clone() {
+            self.apply_bar(ui_bar_from_public(&forming)?, forming, false)?;
+        }
         Ok(())
     }
 
@@ -438,9 +474,110 @@ pub struct LocalMarketStore {
     generation: u64,
     reducers: BTreeMap<MarketSelection, LocalMarketReducer>,
     study_config: ChartStudyConfig,
+    chart_reducers: BTreeMap<String, LocalMarketReducer>,
 }
 
 impl LocalMarketStore {
+    pub fn begin_history(
+        &mut self,
+        selection: &MarketSelection,
+        retry: bool,
+    ) -> Option<HistoryRequest> {
+        let view = &mut self.reducers.get_mut(selection)?.view;
+        let now = crate::account_center::now_ms();
+        if view.history_loading && now.saturating_sub(view.history_started_ms) > 15_000 {
+            view.history_loading = false;
+            view.history_error = Some("History timed out; retry manually".into());
+        }
+        if view.history_loading
+            || view.history_exhausted
+            || (!retry && view.history_error.is_some())
+            || view.bars.len() >= MAX_BARS
+        {
+            return None;
+        }
+        let before = view.bars.first()?.open_time_ms;
+        if before == 0 {
+            return None;
+        }
+        view.history_loading = true;
+        view.history_started_ms = now;
+        view.history_error = None;
+        Some(HistoryRequest {
+            generation: self.generation,
+            selection: selection.clone(),
+            before,
+        })
+    }
+
+    pub fn finish_history(
+        &mut self,
+        request: &HistoryRequest,
+        result: Result<Vec<PublicBar>, String>,
+    ) -> Result<usize, LocalMarketError> {
+        if request.generation != self.generation {
+            return Ok(0);
+        }
+        let Some(base) = self.reducers.get_mut(&request.selection) else {
+            return Ok(0);
+        };
+        base.view.history_loading = false;
+        let bars = match result {
+            Ok(bars) => bars,
+            Err(error) => {
+                base.view.history_error = Some(error);
+                return Ok(0);
+            }
+        };
+        if base
+            .view
+            .bars
+            .first()
+            .is_none_or(|bar| bar.open_time_ms != request.before)
+        {
+            return Ok(0);
+        }
+        if bars.is_empty() {
+            base.view.history_exhausted = true;
+            return Ok(0);
+        }
+        let mut candidate = base.clone();
+        let mut added = 0;
+        for bar in bars {
+            validate_study_bar(&bar, &request.selection)?;
+            if bar.open_time_ms >= request.before {
+                return Err(LocalMarketError::InvalidBar);
+            }
+            if candidate
+                .closed_facts
+                .insert(bar.open_time_ms, bar)
+                .is_none()
+            {
+                added += 1;
+            }
+        }
+        if candidate.closed_facts.len() + usize::from(candidate.forming_bar.is_some()) > MAX_BARS {
+            base.view.history_exhausted = true;
+            return Ok(0);
+        }
+        candidate.rebuild_studies_and_bars()?;
+        // Rebuild all chart configurations from the same validated history, then commit together.
+        let mut charts = Vec::new();
+        for (key, chart) in self
+            .chart_reducers
+            .iter()
+            .filter(|(_, chart)| chart.view.selection == request.selection)
+        {
+            let mut replacement = candidate.clone();
+            replacement.reconfigure_studies(chart.study_config.clone())?;
+            charts.push((key.clone(), replacement));
+        }
+        *base = candidate;
+        for (key, replacement) in charts {
+            self.chart_reducers.insert(key, replacement);
+        }
+        Ok(added)
+    }
     pub const fn generation(&self) -> u64 {
         self.generation
     }
@@ -472,6 +609,7 @@ impl LocalMarketStore {
         }
         self.generation = generation;
         self.reducers = reducers;
+        self.chart_reducers.clear();
         Ok(Some(generation))
     }
 
@@ -486,7 +624,47 @@ impl LocalMarketStore {
             .reducers
             .get_mut(&envelope.selection)
             .ok_or(LocalMarketError::ScopeMismatch)?;
-        reducer.apply(envelope)
+        let outcome = reducer.apply(envelope.clone())?;
+        for chart in self
+            .chart_reducers
+            .values_mut()
+            .filter(|chart| chart.view.selection == envelope.selection)
+        {
+            chart.apply(envelope.clone())?;
+        }
+        Ok(outcome)
+    }
+
+    pub fn configure_chart(
+        &mut self,
+        key: &str,
+        selection: &MarketSelection,
+        config: ChartStudyConfig,
+    ) -> Result<(), LocalMarketError> {
+        let replace = self
+            .chart_reducers
+            .get(key)
+            .is_none_or(|chart| &chart.view.selection != selection);
+        let base = if replace {
+            self.reducers.get(selection)
+        } else {
+            self.chart_reducers.get(key)
+        };
+        let Some(base) = base else {
+            self.chart_reducers.remove(key);
+            return Ok(());
+        };
+        if !replace && base.study_config == config {
+            return Ok(());
+        }
+        let mut candidate = base.clone();
+        candidate.reconfigure_studies(config)?;
+        self.chart_reducers.insert(key.to_owned(), candidate);
+        Ok(())
+    }
+
+    pub fn chart_view(&self, key: &str) -> Option<&LocalMarketView> {
+        self.chart_reducers.get(key).map(LocalMarketReducer::view)
     }
 
     pub fn view(&self, selection: &MarketSelection) -> Option<&LocalMarketView> {
@@ -502,6 +680,9 @@ impl LocalMarketStore {
 
     pub fn refresh_staleness(&mut self, now_ms: u64, stale_after_ms: u64) {
         for reducer in self.reducers.values_mut() {
+            reducer.refresh_staleness(now_ms, stale_after_ms);
+        }
+        for reducer in self.chart_reducers.values_mut() {
             reducer.refresh_staleness(now_ms, stale_after_ms);
         }
     }
@@ -607,6 +788,7 @@ fn study_point(values: ChartStudyValues) -> ChartStudyPoint {
         (Some(value.plus_di), Some(value.minus_di), Some(value.adx))
     });
     ChartStudyPoint {
+        custom_ema_adx: values.custom_ema_adx,
         sma: values.sma,
         sma_second: common.sma_extra.second,
         sma_third: common.sma_extra.third,
@@ -917,19 +1099,161 @@ mod tests {
     }
 
     #[test]
-    fn bars_are_bounded_to_newest_two_thousand() -> Result<(), LocalMarketError> {
+    fn bars_and_recompute_facts_are_bounded() -> Result<(), LocalMarketError> {
         let mut reducer = LocalMarketReducer::new(selection("BTC/USDT")?)?;
-        let bars = (1_u64..=2_010)
+        let bars = (1_u64..=MAX_BARS as u64 + 10)
             .map(|index| study_bar(index * 60_000, 10))
             .collect::<Result<Vec<_>, _>>()?;
         let result = envelope(
             &reducer,
-            2_011 * 60_000,
+            (MAX_BARS as u64 + 11) * 60_000,
             MarketPayload::RestHistory { bars },
         );
         reducer.apply(result)?;
         assert_eq!(reducer.view().bars.len(), MAX_BARS);
         assert_eq!(reducer.view().bars[0].open_time_ms, 11 * 60_000);
+        Ok(())
+    }
+
+    #[test]
+    fn forming_bar_survives_reconfiguration_and_history_prepend() -> Result<(), LocalMarketError> {
+        let selected = selection("BTC/USDT")?;
+        let mut store = LocalMarketStore::default();
+        store.replace([selected.clone()])?;
+        let history = MarketEnvelope {
+            generation: store.generation(),
+            selection: selected.clone(),
+            event_time_ms: 420_000,
+            received_ms: 420_000,
+            payload: MarketPayload::RestHistory {
+                bars: (4..=6)
+                    .map(|i| study_bar(i * 60_000, 100 + i as i64))
+                    .collect::<Result<Vec<_>, _>>()?,
+            },
+        };
+        store.apply(history)?;
+        let forming = study_bar(420_000, 150)?;
+        store.apply(MarketEnvelope {
+            generation: store.generation(),
+            selection: selected.clone(),
+            event_time_ms: 421_000,
+            received_ms: 421_000,
+            payload: MarketPayload::WsBar {
+                bar: ui_bar_from_public(&forming)?,
+                study_bar: Box::new(forming),
+                closed: false,
+            },
+        })?;
+        let fast = ChartStudyConfig {
+            sma_period: 2,
+            custom_ema_adx: Some(venue_indicators::chart::EmaAdxConfig::default()),
+            ..Default::default()
+        };
+        let slow = ChartStudyConfig {
+            sma_period: 5,
+            ..Default::default()
+        };
+        store.configure_chart("fast", &selected, fast)?;
+        store.configure_chart("slow", &selected, slow)?;
+        let fast = store
+            .chart_view("fast")
+            .ok_or(LocalMarketError::ScopeMismatch)?;
+        assert_eq!(fast.bars.len(), 4);
+        assert!(fast.studies.iter().all(|p| p.custom_ema_adx.is_some()));
+        assert!(
+            store
+                .chart_view("slow")
+                .is_some_and(|v| v.studies.iter().all(|p| p.custom_ema_adx.is_none()))
+        );
+        assert!(
+            !fast
+                .studies
+                .last()
+                .ok_or(LocalMarketError::InvalidBar)?
+                .confirmed
+        );
+        assert!(
+            fast.studies
+                .last()
+                .ok_or(LocalMarketError::InvalidBar)?
+                .sma
+                .is_some()
+        );
+        assert!(
+            store
+                .chart_view("slow")
+                .and_then(|v| v.studies.last())
+                .is_some_and(|v| v.sma.is_none())
+        );
+        let request = store
+            .begin_history(&selected, false)
+            .ok_or(LocalMarketError::InvalidBar)?;
+        assert!(store.begin_history(&selected, false).is_none());
+        assert_eq!(
+            store.finish_history(
+                &request,
+                Ok((1..=3)
+                    .map(|i| study_bar(i * 60_000, 100 + i as i64))
+                    .collect::<Result<Vec<_>, _>>()?)
+            )?,
+            3
+        );
+        let chart = store
+            .chart_view("slow")
+            .ok_or(LocalMarketError::ScopeMismatch)?;
+        assert_eq!(chart.bars.len(), 7);
+        assert_eq!(
+            chart.bars.last().map(|bar| bar.close),
+            Some(Decimal::new(150, 0))
+        );
+        assert!(
+            !chart
+                .studies
+                .last()
+                .ok_or(LocalMarketError::InvalidBar)?
+                .confirmed
+        );
+        assert!(
+            chart
+                .studies
+                .last()
+                .ok_or(LocalMarketError::InvalidBar)?
+                .sma
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn old_or_discontinuous_history_cannot_overwrite_current_chart() -> Result<(), LocalMarketError>
+    {
+        let selected = selection("BTC/USDT")?;
+        let mut store = LocalMarketStore::default();
+        store.replace([selected.clone()])?;
+        store.apply(MarketEnvelope {
+            generation: store.generation(),
+            selection: selected.clone(),
+            event_time_ms: 240_000,
+            received_ms: 240_000,
+            payload: MarketPayload::RestHistory {
+                bars: vec![study_bar(180_000, 100)?],
+            },
+        })?;
+        let request = store
+            .begin_history(&selected, false)
+            .ok_or(LocalMarketError::InvalidBar)?;
+        assert!(
+            store
+                .finish_history(&request, Ok(vec![study_bar(60_000, 99)?]))
+                .is_err()
+        );
+        assert_eq!(store.view(&selected).map(|v| v.bars.len()), Some(1));
+        store.replace([selection("ETH/USDT")?])?;
+        assert_eq!(
+            store.finish_history(&request, Ok(vec![study_bar(120_000, 99)?]))?,
+            0
+        );
+        assert!(store.view(&selected).is_none());
         Ok(())
     }
 

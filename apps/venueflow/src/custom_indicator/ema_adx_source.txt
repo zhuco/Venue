@@ -1,0 +1,156 @@
+// @version=2
+// +-------------------------------------------------------------------------
+// | AICoin 自定义指标 - EMA+ADX+MACD 终极防乱报优化版 (ATR归一化 + 仓位状态机)
+// | 适用：BTC/ETH 日内交易，4h/1h/15m/5m 多周期通用
+// |
+// | 本版核心改动（相对经典版）：
+// |   1. 【ATR归一化】所有原本写死的绝对数值阈值（振幅过滤1.5点/MACD阈值0.03/
+// |      退出缓冲0.8点）全部改为 ATR 动态倍数，同一套参数可跨周期、跨品种通用。
+// |   2. 【仓位状态机】新增虚拟持仓状态 position(1多/-1空/0空仓)，开仓信号会
+// |      检查"是否已在同方向持仓"，平仓信号会检查"是否真的持有对应仓位"，
+// |      从根本上解决平仓信号在中线附近反复刷屏的问题（无需额外冷却即可去重）。
+// |   3. 【价格+K线双重冷却】开仓信号额外加入 ATR倍数价格距离 + 最小K线间隔
+// |      双重冷却（沿用 valuewhen/barslast 自清洁写法），防止短时间内重复开仓。
+// |   4. 【突破ATR缓冲】高低点突破判断叠加ATR缓冲区，减少低周期毛刺。
+// |   5. 【可选量能过滤】默认关闭，可按需开启，进一步过滤插针/操纵行情。
+// |
+// | 注意：barslast() / valuewhen() / atr() 为常见 TDX 类函数，若 AICoin AIScript
+// | 中函数名不同，请对照官方文档替换；本脚本已提供 ATR 的手工计算作为保底方案。
+// +-------------------------------------------------------------------------
+
+screen_name = "EMA+ADX+MACD 终极防乱报优化版(ATR归一化)"
+indicator(precision=2)
+
+// ==================== 1. 参数配置 ====================
+// -- 趋势判定 --
+emaFastP = input(9,   title="EMA 快线")
+emaMidP  = input(21,  title="EMA 中线")
+emaSlowP = input(55,  title="EMA 慢线")
+
+adxDiP   = input(14, title="DI 周期")
+adxP     = input(6,  title="ADX 平滑周期")
+adxMin   = input(15, title="最低趋势 ADX")
+
+macdFastP   = input(12, title="MACD 快线")
+macdSlowP   = input(26, title="MACD 慢线")
+macdSignalP = input(9,  title="MACD 信号线")
+
+// -- ATR 归一化基准 --
+atrPeriod = input(14, title="ATR 周期")
+
+// -- 各类阈值的 ATR 倍数（核心可调参数，跨周期通用的关键）--
+minBarRangeAtrMult   = input(0.35, title="单K振幅过滤(ATR倍数)")      // 原固定1.5点
+macdAtrMult          = input(0.05, title="MACD柱阈值(ATR倍数)")       // 原固定0.03
+exitBufferAtrMult    = input(0.20, title="平仓缓冲区(ATR倍数)")       // 原固定0.8点
+breakoutBufferAtrMult= input(0.10, title="突破缓冲区(ATR倍数)")       // 新增，压制毛刺突破
+
+// -- 突破回看根数 --
+breakoutLookback = input(5, title="突破回看K线数")
+
+// -- 冷却系统（防止短时间内重复开仓）--
+cooldownAtrMult  = input(1.0, title="开仓价格冷却(ATR倍数)")   // 距上次开仓价需达到N倍ATR
+minBarsBetween   = input(6,   title="开仓最少间隔K线数")
+
+// -- 可选成交量过滤 --
+useVolFilter = input(false, title="启用成交量过滤")
+volMaPeriod  = input(20,   title="成交量均线周期")
+volMult      = input(1.2,  title="成交量放大倍数")
+
+// ==================== 2. 基础计算 ====================
+emaFast = ema(close, emaFastP)
+emaMid  = ema(close, emaMidP)
+emaSlow = ema(close, emaSlowP)
+
+// -- ATR 手工计算（若平台内置 atr() 更精确，可直接替换为 atrVal = atr(atrPeriod)）--
+trueRange = max(high - low, max(abs(high - ref(close, 1)), abs(low - ref(close, 1))))
+atrVal    = sma(trueRange, atrPeriod)
+
+// ==================== 3. 趋势环境判定 ====================
+trendBull = emaFast > emaMid && emaMid > emaSlow && emaMid > ref(emaMid, 1)
+trendBear = emaFast < emaMid && emaMid < emaSlow && emaMid < ref(emaMid, 1)
+
+[pdi, mdi, adx, adxr] = dmi(adxDiP, adxP, 1, "SMMA")
+adxOK  = adx >= adxMin
+diBull = pdi > mdi
+diBear = mdi > pdi
+
+[dif, dea, macdHist] = macd(close, macdFastP, macdSlowP, macdSignalP, "EMA", "EMA")
+
+// 核心防乱报：MACD 柱阈值改为 ATR 动态倍数，不再是写死的0.03
+macdThreshold = atrVal * macdAtrMult
+momentumBull  = macdHist > macdThreshold  && macdHist > ref(macdHist, 1)
+momentumBear  = macdHist < -macdThreshold && macdHist < ref(macdHist, 1)
+
+bullEnvironment = trendBull && adxOK && diBull && momentumBull
+bearEnvironment = trendBear && adxOK && diBear && momentumBear
+
+// ==================== 4. 仓位状态机（核心新增） ====================
+// position: 1=持多  -1=持空  0=空仓
+// 用自引用方式模拟持久化状态变量（AIScript无显式var时的经典写法）
+posPrev = ref(position, 1)
+
+// ==================== 5. 开仓信号（ATR振幅过滤 + 突破缓冲 + 状态门控） ====================
+barRangeOK = (high - low) >= atrVal * minBarRangeAtrMult
+
+volOK = useVolFilter ? (volume > sma(volume, volMaPeriod) * volMult) : 1
+
+// 只允许在"未持有同方向仓位"时触发开仓，避免同向信号重复堆叠
+canLong  = posPrev != 1
+canShort = posPrev != -1
+
+breakoutBull = bullEnvironment && close > (ref(highest(high, breakoutLookback), 1) + atrVal * breakoutBufferAtrMult) && close > open && barRangeOK && volOK && canLong
+breakoutBear = bearEnvironment && close < (ref(lowest(low, breakoutLookback), 1)  - atrVal * breakoutBufferAtrMult) && close < open && barRangeOK && volOK && canShort
+
+rawLongEntry  = breakoutBull
+rawShortEntry = breakoutBear
+
+// -- 价格距离 + K线数双重冷却（沿用 valuewhen/barslast 自清洁写法）--
+lastEntryPrice  = valuewhen(rawLongEntry || rawShortEntry, close, 1)
+barsSinceEntry  = barslast(rawLongEntry || rawShortEntry)
+
+priceDistATR = lastEntryPrice == 0 ? 999 : abs(close - lastEntryPrice) / atrVal
+cooldownPass = priceDistATR >= cooldownAtrMult && barsSinceEntry >= minBarsBetween
+
+// 防连续刷屏去重 + 冷却门控，双重把关
+longEntry  = rawLongEntry  && ref(rawLongEntry, 1)  == 0 && cooldownPass
+shortEntry = rawShortEntry && ref(rawShortEntry, 1) == 0 && cooldownPass
+
+// ==================== 6. 平仓信号（ATR缓冲 + 仓位状态门控，天然去重） ====================
+rawLongExit  = (crossdown(close, emaMid) && (emaMid - close) > atrVal * exitBufferAtrMult) || (macdHist < 0 && ref(macdHist, 1) >= 0)
+rawShortExit = (crossup(close, emaMid)    && (close - emaMid) > atrVal * exitBufferAtrMult) || (macdHist > 0 && ref(macdHist, 1) <= 0)
+
+// 关键：只有"确实持有对应方向仓位"时，平仓信号才成立
+// 这一步之后，一旦仓位归零，同一波行情内不会再重复报平仓，无需额外去重逻辑
+longExit  = rawLongExit  && posPrev == 1
+shortExit = rawShortExit && posPrev == -1
+
+// ==================== 7. 仓位状态更新（自引用状态机）====================
+position = longEntry ? 1 : (shortEntry ? -1 : ((posPrev == 1 && longExit) ? 0 : ((posPrev == -1 && shortExit) ? 0 : posPrev)))
+
+// ==================== 8. 启动事件（环境级别，不涉及仓位）====================
+bullStart = bullEnvironment && ref(bullEnvironment, 1) == 0
+bearStart = bearEnvironment && ref(bearEnvironment, 1) == 0
+
+// ==================== 9. 绘图与标签 ====================
+emaSlowColor = trendBull ? "#00E676" : (trendBear ? "#FF1744" : "#9E9E9E")
+
+plotEmaFast = plot(emaFast, title="EMA快线", color="#00E676", lineWidth=2)
+plotEmaMid  = plot(emaMid,  title="EMA中线", color="#FF1744", lineWidth=3)
+plot(emaSlow, title="EMA慢线", color=emaSlowColor, lineWidth=3)
+
+plotText(longEntry,  title="LONG",  text="开多", refSeries=low,  bgColor="#00C853", color="#FFFFFF", fontSize=14, placement="bottom", display=true)
+plotText(shortEntry, title="SHORT", text="开空", refSeries=high, bgColor="#D50000", color="#FFFFFF", fontSize=14, placement="top",    display=true)
+
+plotText(longExit,  title="EXIT",   text="多平", refSeries=high, bgColor="#FF9800", color="#FFFFFF", fontSize=12, placement="top",    display=true)
+plotText(shortExit, title="EXIT",   text="空平", refSeries=low,  bgColor="#FF9800", color="#FFFFFF", fontSize=12, placement="bottom", display=true)
+
+plotText(bullStart, title="START",  text="多启动", refSeries=low,  bgColor="#00E676", color="#FFFFFF", fontSize=10, placement="bottom", display=true)
+plotText(bearStart, title="START",  text="空启动", refSeries=high, bgColor="#FF1744", color="#FFFFFF", fontSize=10, placement="top",    display=true)
+
+// ==================== 10. 预警 ====================
+alertcondition(longEntry,  title="BTC/ETH 做多建仓", direction="buy")
+alertcondition(shortEntry, title="BTC/ETH 做空建仓", direction="sell")
+alertcondition(longExit,   title="BTC/ETH 多单平仓", direction="sell")
+alertcondition(shortExit,  title="BTC/ETH 空单平仓", direction="buy")
+alertcondition(bullStart,  title="BTC/ETH 多头启动", direction="buy")
+alertcondition(bearStart,  title="BTC/ETH 空头启动", direction="sell")
