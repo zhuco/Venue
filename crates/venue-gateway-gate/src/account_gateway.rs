@@ -3,9 +3,10 @@ use crate::{
     GateFillsCursor, GateGatewayBinding, GateHttpTransport, GateMutationDispatch,
     GatePrivateReadSource, GatePrivateReadbackCandidate, GatePublicBinding, GatePublicPayloadKind,
     GatePublicRawPayload, GateRawPrivateResponse, GateTransportError, GateTransportLimits,
-    canonical_client_id_from_native, endpoints, parse_contract_rules, parse_rest_snapshot,
-    prepare_cancel, prepare_exact_readback_by_client_id, prepare_limit, prepare_private_read,
-    prepare_reduce_once, rest_order_book_path, settle_exact_readback, validate_private_readback,
+    canonical_client_id_from_native, endpoints, parse_contract_rules, parse_fill_record,
+    parse_rest_snapshot, prepare_cancel, prepare_exact_readback_by_client_id, prepare_limit,
+    prepare_private_read, prepare_reduce_once, rest_order_book_path, settle_exact_readback,
+    validate_private_readback,
 };
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -1022,50 +1023,21 @@ fn snapshot_fill_facts(
     generation: u64,
 ) -> Result<Vec<Fill>, AccountHostValidationError> {
     let mut ids = BTreeSet::new();
-    rows.iter()
-        .map(|row| {
-            let item = row
-                .as_object()
-                .ok_or(AccountHostValidationError::SignedSnapshot)?;
-            let fill_id = snapshot_id(item.get("id"))?;
-            if !ids.insert(fill_id.clone()) {
-                return Err(AccountHostValidationError::SignedSnapshot);
-            }
-            let symbol = snapshot_symbol(item.get("contract"))?;
-            let rules = snapshot_contract_rules(catalogue, symbol.clone(), generation)?;
-            let signed_size = snapshot_decimal(item.get("size"))?;
-            let quantity = signed_size
-                .abs()
-                .checked_mul(rules.quanto_multiplier)
-                .filter(|value| *value > Decimal::ZERO)
-                .ok_or(AccountHostValidationError::SignedSnapshot)?;
-            let price = Price::new(snapshot_decimal(item.get("price"))?)
-                .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-            let side = if signed_size.is_sign_positive() {
-                OrderSide::Buy
-            } else {
-                OrderSide::Sell
-            };
-            let sequence = fill_id
-                .parse()
-                .map(FieldState::Known)
-                .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-            Ok(Fill {
-                fill_id,
-                execution_sequence: sequence,
-                order_id: snapshot_id(item.get("order_id"))?,
-                symbol,
-                side,
-                position_side: FieldState::Missing,
-                quantity,
-                price,
-                fee: FieldState::Missing,
-                realized_pnl: FieldState::Missing,
-                maker: FieldState::Missing,
-                exchange_time_ms: None,
-            })
-        })
-        .collect()
+    let mut fills = Vec::with_capacity(rows.len());
+    for row in rows {
+        let item = row
+            .as_object()
+            .ok_or(AccountHostValidationError::SignedSnapshot)?;
+        let symbol = snapshot_symbol(item.get("contract"))?;
+        let rules = snapshot_contract_rules(catalogue, symbol.clone(), generation)?;
+        let record = parse_fill_record(row, &symbol, &rules)
+            .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+        if !ids.insert(record.fill.fill_id.clone()) {
+            return Err(AccountHostValidationError::SignedSnapshot);
+        }
+        fills.push(record.fill);
+    }
+    Ok(fills)
 }
 
 async fn snapshot_unknown_results(

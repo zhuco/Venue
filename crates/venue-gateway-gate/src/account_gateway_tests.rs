@@ -1,6 +1,6 @@
 use super::*;
 use crate::{GatePublicError, collect_regular_order_pages, parse_regular_order};
-use venue_domain::domain::{CommandId, OrderOwner, OrderPurpose};
+use venue_domain::domain::{Amount, CommandId, OrderOwner, OrderPurpose};
 
 const CATALOGUE: &str = r#"[{
     "name":"DOGE_USDT","in_delisting":false,"status":"trading",
@@ -470,12 +470,29 @@ fn signed_snapshot_exports_normalized_account_fill_facts() -> Result<(), Box<dyn
         CATALOGUE,
         &[serde_json::json!({
             "id":"9", "order_id":"3", "contract":"DOGE_USDT",
-            "size":"-10", "price":"0.2"
+            "size":"-10", "price":"0.2",
+            "text":"t-ord-etp-s-0123456789abcdef",
+            "fee":"-0.01", "pnl":"0.02", "role":"maker",
+            "create_time_ms":"1700000000123"
         })],
         7,
     )?;
     assert_eq!(fills.len(), 1);
     assert_eq!(fills[0].quantity, Decimal::ONE);
     assert_eq!(fills[0].side, OrderSide::Sell);
+    assert_eq!(
+        fills[0].position_side,
+        FieldState::Known(PositionSide::Short)
+    );
+    assert_eq!(fills[0].maker, FieldState::Known(true));
+    assert_eq!(fills[0].exchange_time_ms, Some(1_700_000_000_123));
+    assert_eq!(
+        fills[0].fee,
+        FieldState::Known(Amount::new("USDT".parse()?, Decimal::new(-1, 2)))
+    );
+    assert_eq!(
+        fills[0].realized_pnl,
+        FieldState::Known(Amount::new("USDT".parse()?, Decimal::new(2, 2)))
+    );
     Ok(())
 }
