@@ -290,6 +290,7 @@ pub fn authorize_recovery_reduce(
         &input.proof.payload_sha256,
     );
     let command = OrderCommand {
+        time_in_force: Default::default(),
         command_id: derived_id("recovery_reduce", &identity)?,
         client_order_id: derived_id("vrr", &identity)?,
         owner: OrderOwner {

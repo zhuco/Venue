@@ -50,6 +50,22 @@ impl OrderOwner {
     }
 }
 
+/// Omitted policy is the historical post-only command encoding. GTC must be explicit so a
+/// durable command can never silently change between maker-only and potentially taking liquidity.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitTimeInForce {
+    #[default]
+    PostOnly,
+    Gtc,
+}
+
+impl LimitTimeInForce {
+    pub const fn is_post_only(&self) -> bool {
+        matches!(self, Self::PostOnly)
+    }
+}
+
 /// A priced limit instruction.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OrderCommand {
@@ -62,6 +78,9 @@ pub struct OrderCommand {
     #[serde(with = "rust_decimal::serde::str")]
     pub quantity: Decimal,
     pub limit_price: Price,
+    // Old WAL hashes use canonical reserialization, so default policy must retain its old bytes.
+    #[serde(default, skip_serializing_if = "LimitTimeInForce::is_post_only")]
+    pub time_in_force: LimitTimeInForce,
     pub reduce_only: bool,
 }
 
@@ -650,6 +669,7 @@ mod tests {
         quantity: Decimal,
     ) -> Result<OrderCommand, Box<dyn std::error::Error>> {
         Ok(OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("net_limit_1")?,
             client_order_id: CommandId::new("net_limit_client_1")?,
             owner: test_owner(purpose)?,
@@ -664,6 +684,7 @@ mod tests {
     #[test]
     fn reduce_only_is_bound_to_semantic_purpose() -> Result<(), Box<dyn std::error::Error>> {
         let command = OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("command_1")?,
             client_order_id: CommandId::new("client_1")?,
             owner: OrderOwner {
@@ -803,6 +824,7 @@ mod tests {
             purpose: OrderPurpose::ExposureTakeProfit,
         };
         let limit = OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("wrong_limit_1")?,
             client_order_id: CommandId::new("wrong_limit_client_1")?,
             owner: owner.clone(),
@@ -939,6 +961,24 @@ mod tests {
         assert_eq!(
             reduce.validate_with_authoritative_position(&net_position(Decimal::ZERO)?),
             Err(CommandError::NetReduceDirection)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn limit_policy_preserves_legacy_bytes_and_commits_gtc_explicitly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let legacy = r#"{"command_id":"net_limit_1","client_order_id":"net_limit_client_1","owner":{"strategy_instance_id":"strategy_1","run_id":"run_1","exchange":"okx","account":"primary","symbol":"BTC/USDT","purpose":"entry"},"side":"buy","position_side":"net","quantity":"1","limit_price":"50000","reduce_only":false}"#;
+        let mut command: OrderCommand = serde_json::from_str(legacy)?;
+        assert_eq!(command.time_in_force, LimitTimeInForce::PostOnly);
+        assert_eq!(serde_json::to_string(&command)?, legacy);
+        command.time_in_force = LimitTimeInForce::Gtc;
+        let gtc = serde_json::to_string(&command)?;
+        assert!(gtc.contains(r#""time_in_force":"gtc""#));
+        assert_ne!(gtc, legacy);
+        assert_eq!(serde_json::from_str::<OrderCommand>(&gtc)?, command);
+        assert!(
+            serde_json::from_str::<OrderCommand>(&gtc.replace("\"gtc\"", "\"unknown\"")).is_err()
         );
         Ok(())
     }

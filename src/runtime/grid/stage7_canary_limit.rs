@@ -46,6 +46,7 @@ pub(super) fn verify_reduce_only_post_only<V: Stage7CanaryVenue>(
     };
     let client_order_id = command_id(format!("{prefix}_{suffix}_{name}_lc"))?;
     let command = crate::domain::OrderCommand {
+        time_in_force: Default::default(),
         command_id: command_id(format!("{prefix}_{suffix}_{name}_lc_cmd"))?,
         client_order_id: client_order_id.clone(),
         owner: canary_owner(binding, OrderPurpose::Reduce),

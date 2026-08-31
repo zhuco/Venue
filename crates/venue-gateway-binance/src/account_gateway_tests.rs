@@ -365,6 +365,52 @@ fn signed_snapshot_rejects_ambiguous_open_order_ceiling() {
 }
 
 #[test]
+fn signed_snapshot_policy_preserves_missing_and_unrepresented_values() {
+    let mut row = serde_json::Map::new();
+    assert_eq!(snapshot_limit_time_in_force(&row, "timeInForce"), Ok(None));
+
+    row.insert("timeInForce".to_owned(), Value::String("IOC".to_owned()));
+    assert_eq!(snapshot_limit_time_in_force(&row, "timeInForce"), Ok(None));
+
+    row.insert("timeInForce".to_owned(), Value::String("GTX".to_owned()));
+    assert_eq!(
+        snapshot_limit_time_in_force(&row, "timeInForce"),
+        Ok(Some(LimitTimeInForce::PostOnly))
+    );
+
+    row.insert("timeInForce".to_owned(), Value::Bool(true));
+    assert!(snapshot_limit_time_in_force(&row, "timeInForce").is_err());
+}
+
+#[test]
+fn unknown_limit_readback_requires_the_original_policy() -> Result<(), Box<dyn std::error::Error>> {
+    let (intent, rules, binding) = limit_fixture()?;
+    let ExecutionCommand::PlaceLimit(mut place) =
+        normalize_fresh_limit(&intent, &rules, &binding, LIMIT_BOOK, 1_720_000_000_200)?
+    else {
+        return Err("limit required".into());
+    };
+    place.time_in_force = LimitTimeInForce::Gtc;
+    let command = ExecutionCommand::PlaceLimit(place);
+    let matching = r#"{"clientOrderId":"limit-fixture-client","orderId":"7","status":"NEW","timeInForce":"GTC"}"#;
+    assert!(matches!(
+        snapshot_exact_regular_result(matching.as_bytes(), &command, "limit-fixture-client"),
+        SignedUnknownResult::Accepted { .. }
+    ));
+    let wrong = matching.replace("GTC", "GTX");
+    assert!(matches!(
+        snapshot_exact_regular_result(wrong.as_bytes(), &command, "limit-fixture-client"),
+        SignedUnknownResult::Unknown
+    ));
+    let missing = br#"{"clientOrderId":"limit-fixture-client","orderId":"7","status":"NEW"}"#;
+    assert!(matches!(
+        snapshot_exact_regular_result(missing, &command, "limit-fixture-client"),
+        SignedUnknownResult::Unknown
+    ));
+    Ok(())
+}
+
+#[test]
 fn signed_snapshot_rejects_unrepresentable_close_all_algo() -> Result<(), Box<dyn std::error::Error>>
 {
     let regular = json_rows_snapshot(br#"[]"#)?;

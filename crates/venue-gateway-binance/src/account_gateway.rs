@@ -8,9 +8,9 @@ use rust_decimal::Decimal;
 use serde_json::Value;
 use tokio::runtime::{Builder, Runtime};
 use venue_domain::domain::{
-    Asset, ExecutionCommand, FieldState, Fill, MarketDelta, MarketSnapshot, NativeOrderFamily,
-    OrderCommand, OrderSide, OrderState, PositionSide, Price, PublicBar, PublicTicker, PublicTrade,
-    Symbol,
+    Asset, ExecutionCommand, FieldState, Fill, LimitTimeInForce, MarketDelta, MarketSnapshot,
+    NativeOrderFamily, OrderCommand, OrderSide, OrderState, PositionSide, Price, PublicBar,
+    PublicTicker, PublicTrade, Symbol,
 };
 use venue_execution::{
     AccountDispatchPermit, AccountGatewayResult, AccountHostValidationError,
@@ -25,7 +25,7 @@ use venue_gateway_api::{GatewayBinding, PublicMarketBinding};
 use crate::private::{RecentFillsCursor, USER_TRADES_PAGE_LIMIT};
 #[path = "account_gateway_limit.rs"]
 mod account_gateway_limit;
-use account_gateway_limit::normalize_fresh_limit;
+use account_gateway_limit::{normalize_fresh_limit, readback_policy_matches_command};
 #[path = "account_gateway_symbol_dispatch.rs"]
 mod account_gateway_symbol_dispatch;
 use crate::{
@@ -483,7 +483,7 @@ impl AccountPhysicalGateway for BinanceAccountGateway {
                             if matches!(
                                 &order.client_order_id,
                                 FieldState::Known(value) if value == client_id
-                            ) =>
+                            ) && readback_policy_matches_command(command, &order) =>
                         {
                             if order.state == OrderState::Rejected {
                                 AccountRecoveryOutcome::rejected(
@@ -1109,6 +1109,7 @@ fn snapshot_order_facts(
             position_side: snapshot_position_side(row)?,
             quantity,
             limit_price: snapshot_optional_positive_decimal(row, "price")?,
+            time_in_force: snapshot_limit_time_in_force(row, "timeInForce")?,
             reduce_only: snapshot_bool(row, "reduceOnly")?,
             owner: None,
             external: true,
@@ -1138,6 +1139,7 @@ fn snapshot_order_facts(
             position_side: snapshot_position_side(row)?,
             quantity,
             limit_price: snapshot_optional_positive_decimal(row, "triggerPrice")?,
+            time_in_force: None,
             reduce_only: snapshot_bool(row, "reduceOnly")?,
             owner: None,
             external: true,
@@ -1420,7 +1422,7 @@ async fn snapshot_unknown_results(
                     )
                     .await
                 {
-                    Ok(page) => snapshot_exact_regular_result(&page.payload, client_id),
+                    Ok(page) => snapshot_exact_regular_result(&page.payload, command, client_id),
                     Err(_) => SignedUnknownResult::Unknown,
                 }
             }
@@ -1439,7 +1441,11 @@ async fn snapshot_unknown_results(
     Ok(values)
 }
 
-fn snapshot_exact_regular_result(payload: &[u8], client_id: &str) -> SignedUnknownResult {
+fn snapshot_exact_regular_result(
+    payload: &[u8],
+    command: &ExecutionCommand,
+    client_id: &str,
+) -> SignedUnknownResult {
     let value = match serde_json::from_slice::<Value>(payload) {
         Ok(value) => value,
         Err(_) => return SignedUnknownResult::Unknown,
@@ -1448,6 +1454,9 @@ fn snapshot_exact_regular_result(payload: &[u8], client_id: &str) -> SignedUnkno
         return SignedUnknownResult::Unknown;
     };
     if row.get("clientOrderId").and_then(Value::as_str) != Some(client_id) {
+        return SignedUnknownResult::Unknown;
+    }
+    if !snapshot_policy_matches_command(row, command) {
         return SignedUnknownResult::Unknown;
     }
     match row.get("status").and_then(Value::as_str) {
@@ -1461,6 +1470,22 @@ fn snapshot_exact_regular_result(payload: &[u8], client_id: &str) -> SignedUnkno
             }
         }
         _ => SignedUnknownResult::Unknown,
+    }
+}
+
+fn snapshot_policy_matches_command(
+    row: &serde_json::Map<String, Value>,
+    command: &ExecutionCommand,
+) -> bool {
+    match command {
+        ExecutionCommand::PlaceLimit(place) => {
+            snapshot_limit_time_in_force(row, "timeInForce") == Ok(Some(place.time_in_force))
+        }
+        ExecutionCommand::Cancel(_)
+        | ExecutionCommand::PlaceMarket(_)
+        | ExecutionCommand::MarketReduce(_)
+        | ExecutionCommand::StopMarketCloseAll(_)
+        | ExecutionCommand::StopMarketFullPosition(_) => true,
     }
 }
 
@@ -1515,6 +1540,21 @@ fn snapshot_bool(
     row.get(field)
         .and_then(Value::as_bool)
         .ok_or(AccountHostValidationError::SignedSnapshot)
+}
+
+fn snapshot_limit_time_in_force(
+    row: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<LimitTimeInForce>, AccountHostValidationError> {
+    match row.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => match value.as_str() {
+            "GTX" => Ok(Some(LimitTimeInForce::PostOnly)),
+            "GTC" => Ok(Some(LimitTimeInForce::Gtc)),
+            _ => Ok(None),
+        },
+        Some(_) => Err(AccountHostValidationError::SignedSnapshot),
+    }
 }
 
 fn snapshot_side(

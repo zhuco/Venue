@@ -85,6 +85,7 @@ fn position(side: PositionSide) -> Result<Position, Box<dyn std::error::Error>> 
 
 fn entry(client_order_id: &str) -> Result<OrderCommand, Box<dyn std::error::Error>> {
     Ok(OrderCommand {
+        time_in_force: Default::default(),
         command_id: CommandId::new("entry_1")?,
         client_order_id: CommandId::new(client_order_id)?,
         owner: owner(OrderPurpose::Entry)?,

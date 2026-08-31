@@ -1019,6 +1019,7 @@ mod tests {
 
         let (config, instrument, profile) = scope(GatewayMode::Live, 7)?;
         let command = OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("place3")?,
             client_order_id: CommandId::new("00000000000000000000000000000003")?,
             owner: OrderOwner {
@@ -1103,6 +1104,7 @@ mod tests {
         };
         let (config, instrument, profile) = scope(GatewayMode::Live, 7)?;
         let command = OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("place3")?,
             client_order_id: CommandId::new("00000000000000000000000000000003")?,
             owner: OrderOwner {
@@ -1172,6 +1174,7 @@ mod tests {
         };
         let (config, instrument, profile) = scope(GatewayMode::Live, 7)?;
         let command = OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("place-once")?,
             client_order_id: CommandId::new("placeonce7")?,
             owner: OrderOwner {
@@ -1264,6 +1267,7 @@ mod tests {
         };
         let (config, instrument, profile) = scope(GatewayMode::Live, 7)?;
         let command = OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("place3")?,
             client_order_id: CommandId::new("00000000000000000000000000000003")?,
             owner: OrderOwner {

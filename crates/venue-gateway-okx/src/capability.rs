@@ -681,7 +681,7 @@ mod tests {
         net::TcpListener,
     };
     use venue_domain::domain::{
-        CommandId, ExecutionCommand, OrderOwner, OrderPurpose, OrderSide, Price,
+        CommandId, ExecutionCommand, LimitTimeInForce, OrderOwner, OrderPurpose, OrderSide, Price,
     };
     use venue_gateway_api::{GatewayMode, VenueId};
 
@@ -867,6 +867,7 @@ mod tests {
 
         let place_client_id = "00000000000000000000000000000003";
         let place = OrderCommand {
+            time_in_force: LimitTimeInForce::Gtc,
             command_id: CommandId::new("probeplace")?,
             client_order_id: CommandId::new(place_client_id)?,
             owner: owner(&config, OrderPurpose::Entry),

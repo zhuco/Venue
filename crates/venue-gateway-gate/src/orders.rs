@@ -3,8 +3,8 @@ use std::{collections::BTreeSet, str::FromStr};
 use rust_decimal::Decimal;
 use serde_json::{Map, Value};
 use venue_domain::domain::{
-    Amount, Asset, FieldState, Fill, Order, OrderSide, OrderState, PositionSide, Price, Symbol,
-    UnknownReason,
+    Amount, Asset, FieldState, Fill, LimitTimeInForce, Order, OrderSide, OrderState, PositionSide,
+    Price, Symbol, UnknownReason,
 };
 
 use crate::{GateContractRules, decimal, decimal_value, object, optional_price, text};
@@ -89,6 +89,7 @@ pub fn parse_regular_order(
             .ok_or(GateOrderPayloadError::Payload)?,
         limit_price: optional_price(item.get("price"))
             .map_err(|_| GateOrderPayloadError::Payload)?,
+        time_in_force: optional_limit_time_in_force(item.get("tif")),
         average_price: optional_price_state(item.get("fill_price"))?,
         reduce_only,
     };
@@ -96,6 +97,23 @@ pub fn parse_regular_order(
         .validate()
         .map_err(|_| GateOrderPayloadError::Payload)?;
     Ok(order)
+}
+
+fn optional_limit_time_in_force(value: Option<&Value>) -> FieldState<LimitTimeInForce> {
+    match value {
+        None => FieldState::Missing,
+        Some(Value::Null) => FieldState::Null,
+        Some(Value::String(value)) => match value.as_str() {
+            "poc" => FieldState::Known(LimitTimeInForce::PostOnly),
+            "gtc" => FieldState::Known(LimitTimeInForce::Gtc),
+            _ => FieldState::Unavailable {
+                reason: UnknownReason::Ambiguous,
+            },
+        },
+        Some(_) => FieldState::Unavailable {
+            reason: UnknownReason::ParseFailure,
+        },
+    }
 }
 
 pub fn parse_fill_record(

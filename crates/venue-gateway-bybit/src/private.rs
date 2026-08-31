@@ -9,8 +9,8 @@ use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use venue_domain::domain::{
-    Amount, Asset, FieldState, Fill, NativeOrderFamily, Order, OrderPurpose, OrderSide, OrderState,
-    Position, PositionSide, Price,
+    Amount, Asset, FieldState, Fill, LimitTimeInForce, NativeOrderFamily, Order, OrderPurpose,
+    OrderSide, OrderState, Position, PositionSide, Price, UnknownReason,
 };
 use venue_gateway_api::GatewayBinding;
 
@@ -1547,6 +1547,7 @@ fn normalize_order(
     let family_fields = validate_order_family(&row, family)?;
     let native_order_type = validate_native_order_type(&row.order_type)?.to_owned();
     let native_time_in_force = validate_native_time_in_force(&row.time_in_force)?.to_owned();
+    let time_in_force = canonical_limit_time_in_force(&native_order_type, &native_time_in_force);
     let reduce_only = row.reduce_only;
     let order = Order {
         order_id: row.order_id,
@@ -1563,6 +1564,7 @@ fn normalize_order(
         quantity: positive_decimal(&row.qty)?,
         filled_quantity: non_negative_decimal(&row.cum_exec_qty)?,
         limit_price: optional_price(&row.price)?,
+        time_in_force,
         average_price: optional_field_price(&row.avg_price)?,
         reduce_only,
     };
@@ -1579,6 +1581,19 @@ fn normalize_order(
         created_at_ms: positive_u64(&row.created_time)?,
         updated_at_ms: positive_u64(&row.updated_time)?,
     })
+}
+
+fn canonical_limit_time_in_force(order_type: &str, value: &str) -> FieldState<LimitTimeInForce> {
+    if order_type != "Limit" {
+        return FieldState::NotApplicable;
+    }
+    match value {
+        "PostOnly" => FieldState::Known(LimitTimeInForce::PostOnly),
+        "GTC" => FieldState::Known(LimitTimeInForce::Gtc),
+        _ => FieldState::Unavailable {
+            reason: UnknownReason::Ambiguous,
+        },
+    }
 }
 
 fn validate_native_order_type(value: &str) -> Result<&str, BybitError> {
@@ -1710,6 +1725,24 @@ mod empty_position_sentinel_tests {
         assert!(position_sequence("-1", false).is_err());
         assert!(position_updated_at("0", false).is_err());
         assert!(position_unrealized_pnl("", false).is_err());
+    }
+
+    #[test]
+    fn native_limit_policy_is_projected_without_inventing_unsupported_values() {
+        assert_eq!(
+            canonical_limit_time_in_force("Limit", "PostOnly"),
+            FieldState::Known(LimitTimeInForce::PostOnly)
+        );
+        assert_eq!(
+            canonical_limit_time_in_force("Limit", "GTC"),
+            FieldState::Known(LimitTimeInForce::Gtc)
+        );
+        assert!(matches!(
+            canonical_limit_time_in_force("Limit", "IOC"),
+            FieldState::Unavailable {
+                reason: UnknownReason::Ambiguous
+            }
+        ));
     }
 }
 fn optional_price(value: &str) -> Result<Option<Price>, BybitError> {

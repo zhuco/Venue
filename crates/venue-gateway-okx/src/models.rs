@@ -97,6 +97,8 @@ pub struct OrderRow {
     pub ord_id: String,
     #[serde(default)]
     pub cl_ord_id: String,
+    #[serde(default)]
+    pub ord_type: String,
     pub side: String,
     pub pos_side: String,
     pub sz: String,

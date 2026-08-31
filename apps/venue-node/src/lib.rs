@@ -267,6 +267,7 @@ impl LiveMvpCommand {
                     PositionSide::Net => return Err(NodeError::LiveCommand),
                 };
                 let command = ExecutionCommand::PlaceLimit(OrderCommand {
+                    time_in_force: Default::default(),
                     command_id: CommandId::new(command_id).map_err(|_| NodeError::LiveCommand)?,
                     client_order_id: CommandId::new(client_order_id)
                         .map_err(|_| NodeError::LiveCommand)?,

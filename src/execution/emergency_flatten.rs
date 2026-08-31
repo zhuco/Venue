@@ -104,6 +104,7 @@ pub fn authorize_emergency_flatten(
     validate_owner(input.owner, input.binding)?;
 
     let command = OrderCommand {
+        time_in_force: Default::default(),
         command_id: input.command_id.clone(),
         client_order_id: input.client_order_id.clone(),
         owner: input.owner.clone(),

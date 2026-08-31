@@ -117,7 +117,9 @@ pub enum HyperliquidError {
 mod tests {
     use super::*;
     use rust_decimal::Decimal;
-    use venue_domain::domain::{FieldState, OrderState, PositionSide, UnknownReason};
+    use venue_domain::domain::{
+        FieldState, LimitTimeInForce, OrderState, PositionSide, UnknownReason,
+    };
     use venue_gateway_api::{GatewayApiError, GatewayBinding, GatewayMode, VenueId};
 
     const PRIVATE_EVENTS: &[u8] = include_bytes!("../fixtures/private-account-events.json");
@@ -327,6 +329,10 @@ mod tests {
         assert_eq!(orders.orders[0].order.filled_quantity, Decimal::new(2, 0));
         assert!(orders.orders[0].order.reduce_only);
         assert_eq!(orders.orders[0].family, HyperliquidOrderFamily::Regular);
+        assert_eq!(
+            orders.orders[0].order.time_in_force,
+            FieldState::Known(LimitTimeInForce::PostOnly)
+        );
         assert_eq!(
             orders.algo_coverage,
             HyperliquidOrderFamilyCoverage::NotCoveredByFrontendOpenOrders

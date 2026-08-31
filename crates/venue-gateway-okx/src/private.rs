@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 
 use rust_decimal::Decimal;
 use venue_domain::domain::{
-    AccountBalance, Amount, Asset, FieldState, Fill, Order, OrderPurpose, OrderSide, OrderState,
-    Position, PositionSide, Price,
+    AccountBalance, Amount, Asset, FieldState, Fill, LimitTimeInForce, Order, OrderPurpose,
+    OrderSide, OrderState, Position, PositionSide, Price, UnknownReason,
 };
 
 use crate::models::{AccountConfigRow, BalanceRow, Envelope, FillRow, OrderRow, PositionRow};
@@ -361,6 +361,7 @@ pub(crate) fn normalize_order_row(
         quantity,
         filled_quantity,
         limit_price: optional_price(&row.px)?,
+        time_in_force: time_in_force_from_order_type(&row.ord_type),
         average_price: optional_price_state(&row.avg_px)?,
         reduce_only,
     };
@@ -369,6 +370,20 @@ pub(crate) fn normalize_order_row(
         order,
         update_time_ms: positive_u64(&row.u_time)?,
     })
+}
+
+pub(crate) fn time_in_force_from_order_type(value: &str) -> FieldState<LimitTimeInForce> {
+    match value {
+        "post_only" => FieldState::Known(LimitTimeInForce::PostOnly),
+        "limit" => FieldState::Known(LimitTimeInForce::Gtc),
+        "market" => FieldState::NotApplicable,
+        "" => FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        },
+        _ => FieldState::Unavailable {
+            reason: UnknownReason::Ambiguous,
+        },
+    }
 }
 
 pub(crate) fn normalize_fill(
@@ -569,6 +584,12 @@ mod tests {
         let orders = parse_orders_page(ORDERS, &config, &instrument, &profile, 100, None)?;
         assert_eq!(orders.state, OkxPageState::Closed);
         assert_eq!(orders.items[0].order.state, OrderState::PartiallyFilled);
+        assert!(matches!(
+            orders.items[0].order.time_in_force,
+            FieldState::Unavailable {
+                reason: UnknownReason::SourceOmitted
+            }
+        ));
         assert_eq!(orders.items[0].order.quantity, Decimal::new(2, 1));
 
         let fills = parse_fills_page(FILLS, &config, &instrument, &profile, 100, None)?;
@@ -587,6 +608,24 @@ mod tests {
         );
         assert_eq!(fills.items[0].fill.maker, FieldState::Known(true));
         Ok(())
+    }
+
+    #[test]
+    fn native_limit_policy_projection_never_guesses() {
+        assert_eq!(
+            time_in_force_from_order_type("post_only"),
+            FieldState::Known(LimitTimeInForce::PostOnly)
+        );
+        assert_eq!(
+            time_in_force_from_order_type("limit"),
+            FieldState::Known(LimitTimeInForce::Gtc)
+        );
+        assert!(matches!(
+            time_in_force_from_order_type("ioc"),
+            FieldState::Unavailable {
+                reason: UnknownReason::Ambiguous
+            }
+        ));
     }
 
     #[test]

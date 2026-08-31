@@ -8,8 +8,8 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use tokio::runtime::{Builder, Runtime};
 use venue_domain::domain::{
-    Amount, Asset, ExecutionCommand, FieldState, Fill, MarketReduceCommand, NativeOrderFamily,
-    OrderCommand, OrderSide, OrderState, PositionSide, Price, Symbol,
+    Amount, Asset, ExecutionCommand, FieldState, Fill, LimitTimeInForce, MarketReduceCommand,
+    NativeOrderFamily, OrderCommand, OrderSide, OrderState, PositionSide, Price, Symbol,
 };
 use venue_execution::{
     AccountDispatchPermit, AccountGatewayResult, AccountHostValidationError,
@@ -21,7 +21,7 @@ use venue_execution::{
 use venue_gateway_api::GatewayBinding;
 
 use crate::execution::{
-    OkxPlaceIntent, build_host_cancel_request, build_host_order_lookup_request,
+    OkxAcceptedOrder, OkxPlaceIntent, build_host_cancel_request, build_host_order_lookup_request,
     build_order_readback_request, build_place_request, parse_host_cancel_ack,
     parse_host_order_lookup, parse_order_detail, parse_place_ack,
 };
@@ -248,9 +248,7 @@ impl OkxAccountGateway {
                     &timestamp,
                 )) {
                     Ok(response) => match parse_place_ack(response.clone(), &request) {
-                        Ok(accepted) => AccountGatewayResult::Accepted {
-                            venue_order_id: accepted.order_id().to_owned(),
-                        },
+                        Ok(accepted) => self.settle_accepted_place(&accepted, "okx_limit_rejected"),
                         Err(OkxError::Rejected) => rejected_response(&response.body),
                         Err(_) => AccountGatewayResult::Unknown,
                     },
@@ -302,36 +300,7 @@ impl OkxAccountGateway {
                 )) {
                     Ok(response) => match parse_place_ack(response.clone(), &request) {
                         Ok(accepted) => {
-                            let readback = match build_order_readback_request(
-                                &self.config,
-                                &self.instrument,
-                                &self.profile,
-                                &accepted,
-                            ) {
-                                Ok(value) => value,
-                                Err(_) => return AccountGatewayResult::Unknown,
-                            };
-                            let readback_timestamp = match okx_timestamp(SystemTime::now()) {
-                                Ok(value) => value,
-                                Err(_) => return AccountGatewayResult::Unknown,
-                            };
-                            let response = self.runtime.block_on(self.transport.execute(
-                                &self.credentials,
-                                &readback,
-                                &readback_timestamp,
-                            ));
-                            let Ok(response) = response else {
-                                return AccountGatewayResult::Unknown;
-                            };
-                            match parse_order_detail(response, &readback) {
-                                Ok(value) if value.order.order.state == OrderState::Rejected => {
-                                    rejected("okx_market_reduce_rejected")
-                                }
-                                Ok(value) => AccountGatewayResult::Accepted {
-                                    venue_order_id: value.order.order.order_id,
-                                },
-                                Err(_) => AccountGatewayResult::Unknown,
-                            }
+                            self.settle_accepted_place(&accepted, "okx_market_reduce_rejected")
                         }
                         Err(OkxError::Rejected) => rejected_response(&response.body),
                         Err(_) => AccountGatewayResult::Unknown,
@@ -344,6 +313,43 @@ impl OkxAccountGateway {
             | ExecutionCommand::StopMarketFullPosition(_) => {
                 rejected("okx_initial_profile_unsupported_command")
             }
+        }
+    }
+
+    fn settle_accepted_place(
+        &self,
+        accepted: &OkxAcceptedOrder,
+        rejected_reason: &str,
+    ) -> AccountGatewayResult {
+        let readback = match build_order_readback_request(
+            &self.config,
+            &self.instrument,
+            &self.profile,
+            accepted,
+        ) {
+            Ok(value) => value,
+            Err(_) => return AccountGatewayResult::Unknown,
+        };
+        let timestamp = match okx_timestamp(SystemTime::now()) {
+            Ok(value) => value,
+            Err(_) => return AccountGatewayResult::Unknown,
+        };
+        let response = self.runtime.block_on(self.transport.execute(
+            &self.credentials,
+            &readback,
+            &timestamp,
+        ));
+        let Ok(response) = response else {
+            return AccountGatewayResult::Unknown;
+        };
+        match parse_order_detail(response, &readback) {
+            Ok(value) if value.order.order.state == OrderState::Rejected => {
+                rejected(rejected_reason)
+            }
+            Ok(value) => AccountGatewayResult::Accepted {
+                venue_order_id: value.order.order.order_id,
+            },
+            Err(_) => AccountGatewayResult::Unknown,
         }
     }
 }
@@ -492,6 +498,7 @@ fn normalize_limit_from_bbo(
         return Err(AccountHostValidationError::Command);
     }
     let command = ExecutionCommand::PlaceLimit(OrderCommand {
+        time_in_force: Default::default(),
         command_id: intent.command_id.clone(),
         client_order_id: intent.client_order_id.clone(),
         owner: intent.owner.clone(),
@@ -1101,6 +1108,7 @@ fn collect_wide_orders(
             position_side,
             quantity,
             limit_price: price,
+            time_in_force: signed_limit_time_in_force(row, family),
             reduce_only,
             owner: None,
             external: true,
@@ -1113,6 +1121,47 @@ fn collect_wide_orders(
         });
     }
     Ok(())
+}
+
+fn signed_limit_time_in_force(
+    row: &serde_json::Value,
+    family: NativeOrderFamily,
+) -> Option<LimitTimeInForce> {
+    if family != NativeOrderFamily::UmOrder {
+        return None;
+    }
+    match row.get("ordType").and_then(serde_json::Value::as_str) {
+        Some("post_only") => Some(LimitTimeInForce::PostOnly),
+        Some("limit") => Some(LimitTimeInForce::Gtc),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod signed_limit_policy_tests {
+    use super::*;
+
+    #[test]
+    fn signed_snapshot_keeps_absent_or_unsupported_policy_unknown() {
+        assert_eq!(
+            signed_limit_time_in_force(
+                &serde_json::json!({"ordType":"post_only"}),
+                NativeOrderFamily::UmOrder,
+            ),
+            Some(LimitTimeInForce::PostOnly)
+        );
+        assert_eq!(
+            signed_limit_time_in_force(
+                &serde_json::json!({"ordType":"limit"}),
+                NativeOrderFamily::UmOrder,
+            ),
+            Some(LimitTimeInForce::Gtc)
+        );
+        assert_eq!(
+            signed_limit_time_in_force(&serde_json::json!({}), NativeOrderFamily::UmOrder),
+            None
+        );
+    }
 }
 
 fn okx_order_state(value: &str) -> Result<OrderState, OkxAccountGatewayError> {
@@ -1266,11 +1315,16 @@ async fn fetch_private_state(
 
 fn okx_recovery_outcome(
     command: &ExecutionCommand,
-    found: Option<(String, OrderState)>,
+    found: Option<(String, OrderState, Option<LimitTimeInForce>)>,
 ) -> AccountRecoveryOutcome {
-    let Some((venue_order_id, state)) = found else {
+    let Some((venue_order_id, state, time_in_force)) = found else {
         return AccountRecoveryOutcome::still_unknown(command.command_id().clone());
     };
+    if matches!(command, ExecutionCommand::PlaceLimit(_)) {
+        if !recovery_limit_time_in_force_matches(command, time_in_force) {
+            return AccountRecoveryOutcome::still_unknown(command.command_id().clone());
+        }
+    }
     if matches!(command, ExecutionCommand::Cancel(_)) {
         return match state {
             OrderState::Cancelled => {
@@ -1292,6 +1346,16 @@ fn okx_recovery_outcome(
         )
     } else {
         AccountRecoveryOutcome::accepted(command.command_id().clone(), venue_order_id)
+    }
+}
+
+fn recovery_limit_time_in_force_matches(
+    command: &ExecutionCommand,
+    observed: Option<LimitTimeInForce>,
+) -> bool {
+    match command {
+        ExecutionCommand::PlaceLimit(order) => observed == Some(order.time_in_force),
+        _ => true,
     }
 }
 
@@ -1449,6 +1513,58 @@ mod tests {
             risk_episode_id: CommandId::new("okx_episode")?,
             position_generation: 3,
         })
+    }
+
+    fn recovery_limit_command(
+        time_in_force: LimitTimeInForce,
+    ) -> Result<ExecutionCommand, Box<dyn std::error::Error>> {
+        Ok(ExecutionCommand::PlaceLimit(OrderCommand {
+            command_id: CommandId::new("okx_recovery_limit")?,
+            client_order_id: CommandId::new("okx_recovery_client")?,
+            owner: OrderOwner {
+                strategy_instance_id: "grid1".to_owned(),
+                run_id: "run1".to_owned(),
+                exchange: "okx".to_owned(),
+                account: "00000000-0000-4000-8000-000000000001".to_owned(),
+                symbol: "BTC/USDT".parse()?,
+                purpose: OrderPurpose::Entry,
+            },
+            side: OrderSide::Buy,
+            position_side: PositionSide::Long,
+            quantity: Decimal::ONE,
+            limit_price: Price::new(Decimal::new(60_000, 0))?,
+            time_in_force,
+            reduce_only: false,
+        }))
+    }
+
+    #[test]
+    fn recovery_limit_policy_mismatch_or_absence_stays_unknown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let command = recovery_limit_command(LimitTimeInForce::Gtc)?;
+        let accepted = okx_recovery_outcome(
+            &command,
+            Some((
+                "7003".to_owned(),
+                OrderState::New,
+                Some(LimitTimeInForce::Gtc),
+            )),
+        );
+        assert!(matches!(
+            accepted.state(),
+            AccountRecoveryState::Accepted { .. }
+        ));
+        for observed in [Some(LimitTimeInForce::PostOnly), None] {
+            let outcome = okx_recovery_outcome(
+                &command,
+                Some(("7003".to_owned(), OrderState::New, observed)),
+            );
+            assert!(matches!(
+                outcome.state(),
+                AccountRecoveryState::StillUnknown
+            ));
+        }
+        Ok(())
     }
 
     #[test]

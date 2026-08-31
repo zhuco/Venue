@@ -1162,6 +1162,7 @@ fn health_order(
         return Err("grid intent did not create a limit command".into());
     };
     Ok(Order {
+        time_in_force: venue_domain::FieldState::Known(Default::default()),
         order_id: command.client_order_id.as_str().to_owned(),
         client_order_id: FieldState::Known(command.client_order_id.as_str().to_owned()),
         symbol: binding.symbol.clone(),

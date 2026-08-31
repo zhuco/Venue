@@ -173,7 +173,9 @@ fn execution_facts(
         let venue_match = row.venue_order_id.as_deref() == Some(venue_order_id);
         if client_match || venue_match {
             // A signed identity conflict is not proof of absence.
-            if !client_match || !venue_match || row.side != side {
+            let wrong_policy = matches!(command, ExecutionCommand::PlaceLimit(place)
+                if row.time_in_force != Some(place.time_in_force));
+            if !client_match || !venue_match || row.side != side || wrong_policy {
                 return Err(CopySemanticError::ExecutionRequest);
             }
             open = true;

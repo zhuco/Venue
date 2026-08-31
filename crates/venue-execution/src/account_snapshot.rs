@@ -27,6 +27,8 @@ pub struct SignedAccountOrderFact {
     pub position_side: PositionSide,
     pub quantity: Decimal,
     pub limit_price: Option<Decimal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_in_force: Option<venue_domain::LimitTimeInForce>,
     pub reduce_only: bool,
     pub owner: Option<OrderOwner>,
     pub external: bool,

@@ -661,6 +661,7 @@ mod tests {
                 SignedAccountPositionMode::Hedge,
                 if state.external_order {
                     vec![SignedAccountOrderFact {
+                        time_in_force: Some(Default::default()),
                         client_order_id: "external-order".to_owned(),
                         venue_order_id: Some("native-external".to_owned()),
                         symbol: self.binding.symbol.clone(),
@@ -677,6 +678,7 @@ mod tests {
                     }]
                 } else if let Some(ExecutionCommand::PlaceLimit(command)) = &state.command {
                     vec![SignedAccountOrderFact {
+                        time_in_force: Some(Default::default()),
                         client_order_id: command.client_order_id.as_str().to_owned(),
                         venue_order_id: Some(
                             if state.unresolved_after_dispatch && state.resolve_unknown_on_snapshot
@@ -781,6 +783,7 @@ mod tests {
 
     fn command() -> Result<ExecutionCommand, Box<dyn std::error::Error>> {
         Ok(ExecutionCommand::PlaceLimit(OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("runtime-host-command")?,
             client_order_id: CommandId::new("runtime-host-client")?,
             owner: OrderOwner {

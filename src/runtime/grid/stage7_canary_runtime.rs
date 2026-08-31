@@ -66,6 +66,7 @@ fn run_stage7_canary<V: Stage7CanaryVenue>(
                 .map_err(|_| Stage7GridError::Notional)?;
         let quantity = canary_quantity(&venue, bid, ask, passive_price)?;
         let passive = crate::domain::OrderCommand {
+            time_in_force: Default::default(),
             command_id: command_id(format!("{prefix}_{suffix}_post_cmd"))?,
             client_order_id: command_id(format!("{prefix}_{suffix}_post"))?,
             owner: canary_owner(&binding, OrderPurpose::Entry),
@@ -316,6 +317,7 @@ pub fn run_bitget_stage7_canary(
                 .map_err(|_| Stage7GridError::Notional)?;
         let quantity = canary_quantity(&venue, bid, ask, passive_price)?;
         let passive = crate::domain::OrderCommand {
+            time_in_force: Default::default(),
             command_id: command_id(format!("bgc_{suffix}_post_cmd"))?,
             client_order_id: command_id(format!("bgc_{suffix}_post"))?,
             owner: canary_owner(&binding, OrderPurpose::Entry),

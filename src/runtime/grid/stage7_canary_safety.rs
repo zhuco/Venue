@@ -304,6 +304,7 @@ mod tests {
 
     fn visible_foreign_order() -> Result<Order, Box<dyn std::error::Error>> {
         Ok(Order {
+            time_in_force: venue_domain::FieldState::Known(Default::default()),
             order_id: "external-1".to_owned(),
             client_order_id: FieldState::Known("external-identity".to_owned()),
             symbol: "DOGE/USDT".parse()?,

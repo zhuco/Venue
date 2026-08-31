@@ -49,6 +49,8 @@ pub struct Order {
     #[serde(with = "rust_decimal::serde::str")]
     pub filled_quantity: Decimal,
     pub limit_price: Option<Price>,
+    #[serde(default, skip_serializing_if = "FieldState::is_missing")]
+    pub time_in_force: FieldState<crate::domain::LimitTimeInForce>,
     pub average_price: FieldState<Price>,
     pub reduce_only: bool,
 }

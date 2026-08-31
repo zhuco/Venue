@@ -20,6 +20,7 @@ fn owner(run_id: &str) -> Result<OrderOwner, Box<dyn std::error::Error>> {
 
 fn command() -> Result<ExecutionCommand, Box<dyn std::error::Error>> {
     Ok(ExecutionCommand::PlaceLimit(OrderCommand {
+        time_in_force: Default::default(),
         command_id: CommandId::new("command-a")?,
         client_order_id: CommandId::new("client-a")?,
         owner: owner("run-a")?,

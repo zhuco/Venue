@@ -640,7 +640,7 @@ mod tests {
             kind: BybitOrderKind::Limit,
             quantity: Decimal::new(1, 3),
             limit_price: Some(Price::new(Decimal::new(60_000, 0))?),
-            time_in_force: BybitTimeInForce::PostOnly,
+            time_in_force: BybitTimeInForce::GoodTillCancelled,
             reduce_only: false,
         })
     }

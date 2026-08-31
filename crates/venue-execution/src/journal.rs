@@ -1203,6 +1203,7 @@ mod tests {
 
     fn command() -> Result<OrderCommand, Box<dyn std::error::Error>> {
         Ok(OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("command_1")?,
             client_order_id: CommandId::new("client_1")?,
             owner: OrderOwner {
@@ -1257,6 +1258,39 @@ mod tests {
                 .map(|receipt| &receipt.state),
             Some(CommandState::Unknown { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn limit_policy_is_part_of_wal_identity_and_survives_recovery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("commands.jsonl");
+        let mut journal = CommandJournal::open(&path)?;
+        let post_only = command()?;
+        journal.prepare_place(post_only.clone())?;
+        let mut changed = post_only.clone();
+        changed.time_in_force = venue_domain::LimitTimeInForce::Gtc;
+        assert!(journal.prepare_place(changed).is_err());
+        let mut gtc = indexed_command(2)?;
+        gtc.time_in_force = venue_domain::LimitTimeInForce::Gtc;
+        journal.prepare_place(gtc.clone())?;
+        drop(journal);
+        let recovered = CommandJournal::open(&path)?;
+        assert_eq!(
+            recovered
+                .receipt(&post_only.command_id)
+                .ok_or("legacy missing")?
+                .command,
+            ExecutionCommand::PlaceLimit(post_only)
+        );
+        assert_eq!(
+            recovered
+                .receipt(&gtc.command_id)
+                .ok_or("GTC missing")?
+                .command,
+            ExecutionCommand::PlaceLimit(gtc)
+        );
         Ok(())
     }
 

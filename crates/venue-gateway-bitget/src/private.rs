@@ -541,6 +541,20 @@ fn parse_order(value: &Value, symbol: &Symbol) -> Result<Order, BitgetPrivateErr
     validate_symbol_category(object, symbol)?;
     let position_side = parse_position_side(text(object, "posSide")?)?;
     let side = parse_side(text(object, "side")?)?;
+    let time_in_force = match object.get("timeInForce") {
+        Some(Value::String(value)) => match value.as_str() {
+            "post_only" => FieldState::Known(venue_domain::domain::LimitTimeInForce::PostOnly),
+            "gtc" => FieldState::Known(venue_domain::domain::LimitTimeInForce::Gtc),
+            _ => FieldState::Unavailable {
+                reason: UnknownReason::Ambiguous,
+            },
+        },
+        Some(Value::Null) => FieldState::Null,
+        Some(_) => FieldState::Unavailable {
+            reason: UnknownReason::ParseFailure,
+        },
+        None => FieldState::Missing,
+    };
     let order = Order {
         order_id: identifier(object.get("orderId"))?,
         client_order_id: client_order_id(object.get("clientOid")),
@@ -554,6 +568,7 @@ fn parse_order(value: &Value, symbol: &Symbol) -> Result<Order, BitgetPrivateErr
             .map_err(|_| BitgetPrivateError::Payload)?,
         limit_price: account::optional_price(object.get("price"))
             .map_err(|_| BitgetPrivateError::Payload)?,
+        time_in_force,
         average_price: optional_price_state(object.get("avgPrice"))?,
         reduce_only: parse_reduce_only(object, position_side, side)?,
     };

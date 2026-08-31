@@ -183,6 +183,7 @@ fn root(temp: &TempDir) -> PathBuf {
 fn command(notional: Decimal) -> Result<ExecutionCommand, Box<dyn std::error::Error>> {
     let identity = notional.normalize().to_string().replace('.', "-");
     Ok(ExecutionCommand::PlaceLimit(OrderCommand {
+        time_in_force: Default::default(),
         command_id: CommandId::new(format!("cmd-{identity}"))?,
         client_order_id: CommandId::new(format!("client-{identity}"))?,
         owner: owner()?,
@@ -196,6 +197,7 @@ fn command(notional: Decimal) -> Result<ExecutionCommand, Box<dyn std::error::Er
 
 fn indexed_command(index: usize) -> Result<ExecutionCommand, Box<dyn std::error::Error>> {
     Ok(ExecutionCommand::PlaceLimit(OrderCommand {
+        time_in_force: Default::default(),
         command_id: CommandId::new(format!("cmd-segment-{index}"))?,
         client_order_id: CommandId::new(format!("client-segment-{index}"))?,
         owner: owner()?,
@@ -205,6 +207,45 @@ fn indexed_command(index: usize) -> Result<ExecutionCommand, Box<dyn std::error:
         limit_price: Price::new(Decimal::ONE)?,
         reduce_only: false,
     }))
+}
+
+#[test]
+fn signed_order_cannot_confirm_a_different_or_missing_limit_policy()
+-> Result<(), Box<dyn std::error::Error>> {
+    use venue_domain::LimitTimeInForce;
+    let mut execution = command(Decimal::ONE)?;
+    let ExecutionCommand::PlaceLimit(place) = &mut execution else {
+        return Err("limit required".into());
+    };
+    place.time_in_force = LimitTimeInForce::Gtc;
+    let mut fact = SignedAccountOrderFact {
+        client_order_id: place.client_order_id.as_str().to_owned(),
+        venue_order_id: Some("native-policy-1".to_owned()),
+        symbol: place.owner.symbol.clone(),
+        family: venue_domain::NativeOrderFamily::UmOrder,
+        side: place.side,
+        position_side: place.position_side,
+        quantity: place.quantity,
+        limit_price: Some(place.limit_price.value()),
+        time_in_force: None,
+        reduce_only: place.reduce_only,
+        owner: Some(place.owner.clone()),
+        external: false,
+        state: Some(venue_domain::OrderState::New),
+        filled_quantity: Some(Decimal::ZERO),
+    };
+    assert!(!command_matches_signed_order(&execution, &fact));
+    let legacy = serde_json::to_value(&fact)?;
+    assert!(legacy.get("time_in_force").is_none());
+    let recovered: SignedAccountOrderFact = serde_json::from_value(legacy.clone())?;
+    assert_eq!(recovered.time_in_force, None);
+    assert_eq!(serde_json::to_value(&recovered)?, legacy);
+    assert!(!command_matches_signed_order(&execution, &recovered));
+    fact.time_in_force = Some(LimitTimeInForce::PostOnly);
+    assert!(!command_matches_signed_order(&execution, &fact));
+    fact.time_in_force = Some(LimitTimeInForce::Gtc);
+    assert!(command_matches_signed_order(&execution, &fact));
+    Ok(())
 }
 
 fn owner() -> Result<OrderOwner, Box<dyn std::error::Error>> {

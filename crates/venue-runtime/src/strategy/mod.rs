@@ -856,6 +856,7 @@ mod tests {
 
     fn valid_order(binding: &StrategyBinding) -> Result<Order, Box<dyn Error>> {
         Ok(Order {
+            time_in_force: venue_domain::FieldState::Known(Default::default()),
             order_id: "venue_1".to_owned(),
             client_order_id: FieldState::Known("client_1".to_owned()),
             symbol: binding.key.symbol.clone(),

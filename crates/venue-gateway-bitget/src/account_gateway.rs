@@ -8,8 +8,8 @@ use rust_decimal::Decimal;
 use serde_json::Value;
 use tokio::runtime::{Builder, Runtime};
 use venue_domain::domain::{
-    Amount, ExecutionCommand, FieldState, Fill, NativeOrderFamily, OrderCommand, OrderSide,
-    OrderState, PositionSide, Price, Symbol,
+    Amount, ExecutionCommand, FieldState, Fill, LimitTimeInForce, NativeOrderFamily, OrderCommand,
+    OrderSide, OrderState, PositionSide, Price, Symbol,
 };
 use venue_execution::{
     AccountDispatchPermit, AccountGatewayResult, AccountHostValidationError,
@@ -288,6 +288,12 @@ impl AccountPhysicalGateway for BitgetAccountGateway {
                 client_order_id: Some(client_order_id.to_owned()),
                 dispatched_at_ms: observed_at_ms,
                 reason: crate::BitgetUnknownReason::AmbiguousResponse,
+                expected_time_in_force: match command {
+                    ExecutionCommand::PlaceLimit(command) => Some(
+                        crate::BitgetTimeInForce::from_limit_time_in_force(command.time_in_force),
+                    ),
+                    _ => None,
+                },
             };
             let result = build_unknown_recovery_readback_request(
                 &unknown,
@@ -445,6 +451,7 @@ fn normalize_limit_from_ticker(
         return Err(AccountHostValidationError::Command);
     }
     Ok(ExecutionCommand::PlaceLimit(OrderCommand {
+        time_in_force: Default::default(),
         command_id: intent.command_id.clone(),
         client_order_id: intent.client_order_id.clone(),
         owner: intent.owner.clone(),
@@ -891,6 +898,18 @@ fn snapshot_order_facts(
                     v if v.is_zero() => None,
                     _ => return Err(AccountHostValidationError::SignedSnapshot),
                 },
+                time_in_force: match item.get("timeInForce") {
+                    Some(Value::String(value)) => match value.as_str() {
+                        "post_only" => Some(LimitTimeInForce::PostOnly),
+                        "gtc" => Some(LimitTimeInForce::Gtc),
+                        // IOC/FOK remain native capabilities but have no canonical limit-policy
+                        // variant. Preserve that absence rather than reclassifying either as maker.
+                        "ioc" | "fok" => None,
+                        _ => return Err(AccountHostValidationError::SignedSnapshot),
+                    },
+                    None | Some(Value::Null) => None,
+                    Some(_) => return Err(AccountHostValidationError::SignedSnapshot),
+                },
                 reduce_only: bitget_reduce_only(item)
                     .map_err(|_| AccountHostValidationError::SignedSnapshot)?,
                 owner: None,
@@ -985,6 +1004,12 @@ async fn snapshot_unknowns(
             client_order_id: Some(id.to_owned()),
             dispatched_at_ms: now,
             reason: crate::BitgetUnknownReason::AmbiguousResponse,
+            expected_time_in_force: match command {
+                ExecutionCommand::PlaceLimit(command) => Some(
+                    crate::BitgetTimeInForce::from_limit_time_in_force(command.time_in_force),
+                ),
+                _ => None,
+            },
         };
         let result = match build_unknown_recovery_readback_request(
             &unknown,
@@ -1630,5 +1655,36 @@ mod tests {
             "clientOid":"strategy-visible", "orderId":"strategy-order", "orderStatus":"live"
         })];
         assert!(snapshot_order_facts(&rows).is_err());
+    }
+
+    #[test]
+    fn signed_snapshot_preserves_time_in_force_without_defaulting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let row = |time_in_force: Option<&str>| {
+            let mut value = json!({
+                "category":"USDT-FUTURES", "marginCoin":"USDT", "symbol":"BTCUSDT",
+                "delegateType":"normal", "posSide":"long", "side":"buy",
+                "reduceOnly":"NO", "qty":"0.1", "cumExecQty":"0", "price":"100000",
+                "clientOid":"venue-1", "orderId":"1", "orderStatus":"live"
+            });
+            if let Some(time_in_force) = time_in_force {
+                value["timeInForce"] = Value::String(time_in_force.to_owned());
+            }
+            value
+        };
+        let gtc = snapshot_order_facts(&[row(Some("gtc"))])?;
+        assert_eq!(
+            gtc.first().and_then(|fact| fact.time_in_force),
+            Some(LimitTimeInForce::Gtc)
+        );
+        let missing = snapshot_order_facts(&[row(None)])?;
+        assert_eq!(missing.first().and_then(|fact| fact.time_in_force), None);
+        let native_only = snapshot_order_facts(&[row(Some("ioc"))])?;
+        assert_eq!(
+            native_only.first().and_then(|fact| fact.time_in_force),
+            None
+        );
+        assert!(snapshot_order_facts(&[row(Some("unexpected"))]).is_err());
+        Ok(())
     }
 }

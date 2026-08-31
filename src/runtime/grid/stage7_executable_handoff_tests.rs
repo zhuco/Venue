@@ -132,6 +132,7 @@ fn stopped_recovery_fences_and_rejects_a_submitted_place_absent_from_signed_fact
     let mut commands = CommandJournal::open(temporary.path().join("commands.jsonl"))?;
     let binding = binding()?;
     let place = OrderCommand {
+        time_in_force: Default::default(),
         command_id: CommandId::new("hgo_e46_long_open_l5_cmd")?,
         client_order_id: CommandId::new("hgo_e46_long_open_l5")?,
         owner: OrderOwner {

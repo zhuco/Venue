@@ -2,7 +2,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use venue_domain::domain::{
-    FieldState, NativeOrderFamily, OrderSide, OrderState, PositionSide, Price,
+    FieldState, LimitTimeInForce, NativeOrderFamily, OrderSide, OrderState, PositionSide, Price,
 };
 use venue_gateway_api::GatewayBinding;
 
@@ -30,6 +30,13 @@ pub enum BybitTimeInForce {
 }
 
 impl BybitTimeInForce {
+    pub(crate) const fn from_limit_time_in_force(value: LimitTimeInForce) -> Self {
+        match value {
+            LimitTimeInForce::PostOnly => Self::PostOnly,
+            LimitTimeInForce::Gtc => Self::GoodTillCancelled,
+        }
+    }
+
     const fn wire(self) -> &'static str {
         match self {
             Self::GoodTillCancelled => "GTC",
@@ -74,6 +81,7 @@ pub struct BybitPreparedRequest {
     pub body: Vec<u8>,
     expected_order_id: Option<String>,
     expected_client_order_id: Option<String>,
+    expected_time_in_force: Option<BybitTimeInForce>,
 }
 
 impl BybitPreparedRequest {
@@ -196,6 +204,7 @@ pub fn prepare_place_request(
         body: serde_json::to_vec(&body).map_err(|_| BybitExecutionError::Payload)?,
         expected_order_id: None,
         expected_client_order_id: Some(intent.client_order_id.clone()),
+        expected_time_in_force: Some(intent.time_in_force),
     })
 }
 
@@ -229,6 +238,7 @@ pub fn prepare_cancel_request(
         body: serde_json::to_vec(&body).map_err(|_| BybitExecutionError::Payload)?,
         expected_order_id: intent.order_id.clone(),
         expected_client_order_id: intent.client_order_id.clone(),
+        expected_time_in_force: None,
     })
 }
 
@@ -261,6 +271,7 @@ pub struct BybitOrderAck {
     pub request_kind: BybitRequestKind,
     pub order_id: Option<String>,
     pub client_order_id: Option<String>,
+    expected_time_in_force: Option<BybitTimeInForce>,
     pub accepted_at_ms: u64,
     pub received_at_ms: u64,
     pub status: BybitAckStatus,
@@ -307,6 +318,7 @@ pub fn parse_order_ack(
         request_kind: request.kind,
         order_id,
         client_order_id,
+        expected_time_in_force: request.expected_time_in_force,
         accepted_at_ms,
         received_at_ms,
         status: BybitAckStatus::AcceptedOnly,
@@ -447,6 +459,21 @@ impl BybitClosedOrderReadback {
             },
             updated_at_ms: item.updated_at_ms,
         }))
+    }
+
+    pub(crate) fn exact_limit_time_in_force(
+        &self,
+    ) -> Result<Option<LimitTimeInForce>, BybitExecutionError> {
+        self.exact_settlement()?;
+        let time_in_force = self
+            .open_orders
+            .first()
+            .map(|item| &item.order.time_in_force)
+            .or_else(|| self.history.first().map(|item| &item.order.time_in_force));
+        Ok(match time_in_force {
+            Some(FieldState::Known(value)) => Some(*value),
+            Some(_) | None => None,
+        })
     }
 }
 
@@ -620,7 +647,11 @@ fn matches_open(order: &BybitOpenOrder, ack: &BybitOrderAck) -> bool {
         (Some(expected), FieldState::Known(actual)) => expected == actual,
         (Some(_), _) => false,
     };
-    order_id_matches && client_id_matches
+    order_id_matches
+        && client_id_matches
+        && ack
+            .expected_time_in_force
+            .is_none_or(|expected| order.native_time_in_force == expected.wire())
 }
 
 fn matches_history(order: &BybitOrderEvidence, ack: &BybitOrderAck) -> bool {
@@ -633,7 +664,11 @@ fn matches_history(order: &BybitOrderEvidence, ack: &BybitOrderAck) -> bool {
         (Some(expected), FieldState::Known(actual)) => expected == actual,
         (Some(_), _) => false,
     };
-    order_id_matches && client_id_matches
+    order_id_matches
+        && client_id_matches
+        && ack
+            .expected_time_in_force
+            .is_none_or(|expected| order.native_time_in_force == expected.wire())
 }
 
 fn lookup_matches_order(lookup: &BybitOrderLookup, order: &venue_domain::domain::Order) -> bool {
@@ -897,6 +932,30 @@ mod tests {
     }
 
     #[test]
+    fn canonical_limit_policy_maps_to_distinct_bybit_wire_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let facts = facts(GatewayMode::Live)?;
+        let mut post_only = limit_intent()?;
+        post_only.time_in_force =
+            BybitTimeInForce::from_limit_time_in_force(LimitTimeInForce::PostOnly);
+        let request = prepare_place_request(
+            &facts.binding,
+            &facts.identity,
+            &facts.rules,
+            &post_only,
+            1_716_863_719_500,
+            None,
+        )?;
+        let body: serde_json::Value = serde_json::from_slice(&request.body)?;
+        assert_eq!(body["timeInForce"], "PostOnly");
+        assert_eq!(
+            BybitTimeInForce::from_limit_time_in_force(LimitTimeInForce::Gtc).wire(),
+            "GTC"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn market_request_requires_ioc_and_fresh_same_generation_bbo()
     -> Result<(), Box<dyn std::error::Error>> {
         let facts = facts(GatewayMode::Live)?;
@@ -1036,6 +1095,10 @@ mod tests {
         )?;
         let readback =
             BybitClosedOrderReadback::from_pages(&facts.binding, 7, &[open], &[history])?;
+        assert_eq!(
+            readback.open_orders[0].order.time_in_force,
+            FieldState::Known(LimitTimeInForce::Gtc)
+        );
         let settlement = settle_order_ack(&facts.binding, &ack, &readback)?;
         assert_eq!(settlement.state, OrderState::New);
         assert_eq!(settlement.finality, BybitSettlementFinality::Working);
@@ -1050,6 +1113,12 @@ mod tests {
         assert_eq!(
             settle_order_ack(&facts.binding, &ack, &pre_ack_request),
             Err(BybitExecutionError::Binding)
+        );
+        let mut wrong_policy = ack.clone();
+        wrong_policy.expected_time_in_force = Some(BybitTimeInForce::PostOnly);
+        assert_eq!(
+            settle_order_ack(&facts.binding, &wrong_policy, &readback),
+            Err(BybitExecutionError::Unsettled)
         );
         let mut pre_ack = readback;
         pre_ack.received_at_ms = ack.received_at_ms - 1;

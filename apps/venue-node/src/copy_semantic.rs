@@ -410,6 +410,7 @@ impl CopySemanticDelivery {
             })
         } else {
             ExecutionCommand::PlaceLimit(OrderCommand {
+                time_in_force: Default::default(),
                 command_id: command_ids.command_id,
                 client_order_id: command_ids.client_order_id,
                 owner,

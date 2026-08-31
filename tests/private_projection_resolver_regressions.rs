@@ -93,6 +93,7 @@ fn accepted_place(
     let command_id = CommandId::new(format!("cmd_{client_id}"))?;
     let client_order_id = CommandId::new(client_id)?;
     journal.prepare_place(OrderCommand {
+        time_in_force: Default::default(),
         command_id: command_id.clone(),
         client_order_id: client_order_id.clone(),
         owner: OrderOwner {
@@ -241,6 +242,7 @@ fn foreign_owner_conflicts_and_unresolved_wal_is_execution_unknown()
 
     let unresolved_id = CommandId::new("unresolved_client")?;
     let unresolved_command = OrderCommand {
+        time_in_force: Default::default(),
         command_id: CommandId::new("unresolved_command")?,
         client_order_id: unresolved_id.clone(),
         owner: OrderOwner {

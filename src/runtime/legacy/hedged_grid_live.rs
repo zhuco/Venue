@@ -1861,6 +1861,7 @@ pub(super) fn place_command(
         GridOrderRole::Close => OrderPurpose::Reduce,
     };
     Ok(GridMutation::Place(OrderCommand {
+        time_in_force: Default::default(),
         command_id,
         client_order_id,
         owner: owner(binding, purpose),

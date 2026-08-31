@@ -664,7 +664,7 @@ fn parse_regular_semantics(
         let time_in_force = row
             .get("timeInForce")
             .and_then(Value::as_str)
-            .filter(|value| matches!(*value, "GTC" | "GTX" | "IOC" | "FOK"))
+            .filter(|value| matches!(*value, "GTC" | "GTX"))
             .ok_or(BinanceReadbackError::OrderFamily)?;
         let reduce_only = row
             .get("reduceOnly")
@@ -680,6 +680,15 @@ fn parse_regular_semantics(
             || !seen.insert(order_id.clone())
             || binding.symbol != order.symbol
             || reduce_only != order.reduce_only
+            || !matches!(
+                order.time_in_force,
+                venue_domain::domain::FieldState::Known(value)
+                    if matches!(
+                        (time_in_force, value),
+                        ("GTC", venue_domain::domain::LimitTimeInForce::Gtc)
+                            | ("GTX", venue_domain::domain::LimitTimeInForce::PostOnly)
+                    )
+            )
         {
             return Err(BinanceReadbackError::OrderFamily);
         }

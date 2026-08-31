@@ -1273,6 +1273,7 @@ mod tests {
         let state = CanaryRunState::create_new(&run_path, binding.clone(), 100)?;
         let mut commands = CommandJournal::open(run_dir.join("commands.jsonl"))?;
         commands.prepare_place(OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("entry_unresolved")?,
             client_order_id: CommandId::new("entry_unresolved_client")?,
             owner: OrderOwner {

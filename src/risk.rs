@@ -339,6 +339,7 @@ mod tests {
             minimum_notional: Amount::new(asset.clone(), Decimal::new(5, 0)),
         };
         let command = OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("canary_1")?,
             client_order_id: CommandId::new("venue_canary_1")?,
             owner: OrderOwner {
@@ -386,6 +387,7 @@ mod tests {
             minimum_notional: Amount::new(asset, Decimal::new(5, 0)),
         };
         let mut command = OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("protect_1")?,
             client_order_id: CommandId::new("venue_protect_1")?,
             owner: OrderOwner {

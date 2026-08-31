@@ -14,7 +14,7 @@ mod symbol;
 
 pub use account::{AccountBalance, AccountError};
 pub use command::{
-    CancelCommand, CommandError, CommandId, ExecutionCommand, MarketOrderCommand,
+    CancelCommand, CommandError, CommandId, ExecutionCommand, LimitTimeInForce, MarketOrderCommand,
     MarketReduceCommand, NativeOrderFamily, OrderCommand, OrderOwner, StopMarketCloseAllCommand,
     StopMarketFullPositionCommand,
 };

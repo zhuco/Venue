@@ -752,6 +752,7 @@ impl ScalpingProtectedGateway {
             PositionSide::Net => return Err(ScalpingLiveGatewayError::Position),
         };
         let command = OrderCommand {
+            time_in_force: Default::default(),
             command_id: command_id(
                 "red",
                 &format!(
@@ -1246,6 +1247,7 @@ impl ScalpingLiveGateway {
         let quantity = quantity_for_intent(intent, &self.instrument, price)?;
         let rounded_entry_notional = quantity * price.value();
         let entry = OrderCommand {
+            time_in_force: Default::default(),
             command_id: command_id("ent", &intent.intent_id)?,
             client_order_id: command_id("ve", &intent.idempotency_seed)?,
             owner: entry_owner(&self.binding),

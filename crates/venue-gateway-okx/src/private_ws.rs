@@ -530,6 +530,8 @@ struct WsOrderRow {
     ord_id: String,
     #[serde(default)]
     cl_ord_id: String,
+    #[serde(default)]
+    ord_type: String,
     side: String,
     pos_side: String,
     sz: String,
@@ -619,6 +621,7 @@ pub fn parse_ws_orders(
                 inst_id: row.inst_id,
                 ord_id: row.ord_id,
                 cl_ord_id: row.cl_ord_id,
+                ord_type: row.ord_type,
                 side: row.side,
                 pos_side: row.pos_side,
                 sz: row.sz,

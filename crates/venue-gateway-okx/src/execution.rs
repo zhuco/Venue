@@ -1,12 +1,14 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use venue_domain::domain::{
-    CancelCommand, FieldState, MarketOrderCommand, MarketReduceCommand, Order, OrderCommand,
-    OrderPurpose, OrderSide, OrderState, PositionSide, Price,
+    CancelCommand, FieldState, LimitTimeInForce, MarketOrderCommand, MarketReduceCommand, Order,
+    OrderCommand, OrderPurpose, OrderSide, OrderState, PositionSide, Price,
 };
 use venue_gateway_api::GatewayBinding;
 
-use crate::private::{OkxAccountLevel, OkxAccountProfile, OkxTimedOrder};
+use crate::private::{
+    OkxAccountLevel, OkxAccountProfile, OkxTimedOrder, time_in_force_from_order_type,
+};
 use crate::public::{decimal, decode_success, positive_decimal, positive_u64};
 use crate::{
     OkxConfig, OkxCredentials, OkxError, OkxHttpResponse, OkxInstrument, OkxPositionMode,
@@ -210,7 +212,7 @@ pub(crate) fn build_host_order_lookup_request(
 pub(crate) fn parse_host_order_lookup(
     response: OkxHttpResponse,
     request: &OkxHostOrderLookupRequest,
-) -> Result<Option<(String, OrderState)>, OkxError> {
+) -> Result<Option<(String, OrderState, Option<LimitTimeInForce>)>, OkxError> {
     validate_http_response(&response, &request.scope)?;
     let envelope = decode_success::<DetailRow>(&response.body)?;
     if envelope.data.is_empty() {
@@ -228,7 +230,14 @@ pub(crate) fn parse_host_order_lookup(
     }
     validate_order_id(&row.ord_id)?;
     let state = parse_order_state(&row.state)?;
-    Ok(Some((row.ord_id.clone(), state)))
+    let time_in_force = match time_in_force_from_order_type(&row.ord_type) {
+        FieldState::Known(value) => Some(value),
+        FieldState::Missing
+        | FieldState::Null
+        | FieldState::Unavailable { .. }
+        | FieldState::NotApplicable => None,
+    };
+    Ok(Some((row.ord_id.clone(), state, time_in_force)))
 }
 
 /// The existing canonical commands are the only admitted place intents. Adapter-specific order
@@ -254,7 +263,7 @@ impl OkxPlaceIntent<'_> {
                     limit_price: Some(command.limit_price),
                     purpose: command.owner.purpose,
                     reduce_only: command.reduce_only,
-                    order_type: "limit",
+                    order_type: limit_order_type(command.time_in_force),
                 })
             }
             Self::Market(command) => {
@@ -286,6 +295,13 @@ impl OkxPlaceIntent<'_> {
                 })
             }
         }
+    }
+}
+
+const fn limit_order_type(value: LimitTimeInForce) -> &'static str {
+    match value {
+        LimitTimeInForce::PostOnly => "post_only",
+        LimitTimeInForce::Gtc => "limit",
     }
 }
 
@@ -918,6 +934,7 @@ struct DetailRow {
     inst_type: String,
     inst_id: String,
     td_mode: String,
+    #[serde(default)]
     ord_type: String,
     ord_id: String,
     cl_ord_id: String,
@@ -1102,6 +1119,7 @@ fn parse_bound_order_detail(
             .checked_mul(scope.base_quantity_per_contract)
             .ok_or(OkxError::Payload)?,
         limit_price: expected_limit_price,
+        time_in_force: time_in_force_from_order_type(&row.ord_type),
         average_price: parse_optional_price(&row.avg_px)?
             .map(FieldState::Known)
             .unwrap_or(FieldState::Missing),
@@ -1227,6 +1245,7 @@ mod tests {
 
     fn limit() -> Result<OrderCommand, Box<dyn std::error::Error>> {
         Ok(OrderCommand {
+            time_in_force: LimitTimeInForce::Gtc,
             command_id: CommandId::new("place3")?,
             client_order_id: CommandId::new("00000000000000000000000000000003")?,
             owner: owner(OrderPurpose::Reduce)?,
@@ -1236,6 +1255,73 @@ mod tests {
             limit_price: Price::new(Decimal::new(60_000, 0))?,
             reduce_only: true,
         })
+    }
+
+    #[test]
+    fn limit_policy_maps_to_distinct_okx_wire_types() -> Result<(), Box<dyn std::error::Error>> {
+        let (config, instrument, profile) = scope(GatewayMode::Live)?;
+        let mut command = limit()?;
+        command.time_in_force = LimitTimeInForce::PostOnly;
+        let post_only = build_place_request(
+            &config,
+            &instrument,
+            &profile,
+            OkxTradeMode::Cross,
+            OkxPlaceIntent::Limit(&command),
+        )?;
+        let body: serde_json::Value = serde_json::from_slice(post_only.body())?;
+        assert_eq!(body["ordType"], "post_only");
+
+        command.time_in_force = LimitTimeInForce::Gtc;
+        let gtc = build_place_request(
+            &config,
+            &instrument,
+            &profile,
+            OkxTradeMode::Cross,
+            OkxPlaceIntent::Limit(&command),
+        )?;
+        let body: serde_json::Value = serde_json::from_slice(gtc.body())?;
+        assert_eq!(body["ordType"], "limit");
+        Ok(())
+    }
+
+    #[test]
+    fn post_only_unknown_readback_does_not_accept_gtc_or_missing_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (config, instrument, profile) = scope(GatewayMode::Live)?;
+        let mut command = limit()?;
+        command.time_in_force = LimitTimeInForce::PostOnly;
+        let request = build_place_request(
+            &config,
+            &instrument,
+            &profile,
+            OkxTradeMode::Cross,
+            OkxPlaceIntent::Limit(&command),
+        )?;
+        let lookup =
+            build_unknown_order_readback_request(&config, &instrument, &profile, &request)?;
+        assert_eq!(
+            parse_unknown_order_readback(
+                response(&config, &instrument, 1_900_000_000_000, ORDER_DETAIL),
+                &lookup,
+            ),
+            Err(OkxError::Binding)
+        );
+        let missing_policy =
+            String::from_utf8(ORDER_DETAIL.to_vec())?.replace("    \"ordType\": \"limit\",\n", "");
+        assert_eq!(
+            parse_unknown_order_readback(
+                OkxHttpResponse {
+                    binding: config.gateway_binding().clone(),
+                    instrument_generation: instrument.instrument().generation,
+                    received_at_ms: 1_900_000_000_000,
+                    body: bytes::Bytes::from(missing_policy),
+                },
+                &lookup,
+            ),
+            Err(OkxError::Binding)
+        );
+        Ok(())
     }
 
     fn market_reduce() -> Result<MarketReduceCommand, Box<dyn std::error::Error>> {

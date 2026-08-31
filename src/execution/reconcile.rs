@@ -296,6 +296,7 @@ mod tests {
 
     fn order(state: OrderState) -> Result<Order, Box<dyn std::error::Error>> {
         Ok(Order {
+            time_in_force: venue_domain::FieldState::Known(Default::default()),
             order_id: "10".to_owned(),
             client_order_id: FieldState::Known("client_1".to_owned()),
             symbol: "DOGE/USDT".parse::<Symbol>()?,
@@ -416,6 +417,7 @@ mod tests {
         let directory = tempdir()?;
         let mut commands = CommandJournal::open(directory.path().join("commands.jsonl"))?;
         let command = crate::domain::OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("command_1")?,
             client_order_id: CommandId::new("client_1")?,
             owner: crate::domain::OrderOwner {
@@ -519,6 +521,7 @@ mod tests {
         let directory = tempdir()?;
         let mut commands = CommandJournal::open(directory.path().join("commands.jsonl"))?;
         let order = crate::domain::OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("order_1")?,
             client_order_id: CommandId::new("client_1")?,
             owner: crate::domain::OrderOwner {

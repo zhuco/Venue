@@ -167,6 +167,7 @@ Exchange Account Process
 - 队列必须有界；Critical 连续服务也必须周期让行 FillRepair/Normal，不能让兄弟实例或普通工作永久饥饿。
 - 命令只有在账户进程锁仍持有、风险/生命周期仍允许且 `Prepared` 已 fsync 后才能发送；发送前校验失败写 `Rejected`，发送后结果不确定写 `Unknown`。不增加一次性 permit 或不可伪造 receipt 层。
 - outcome 与 Unknown 回读直接按同一本 WAL 的 command、Client Order ID、family 和交易所订单 ID 核对；Transient 或 Unknown 只触发冻结与对账，不自动重试旧命令。
+- 限价政策是命令身份的一部分：`LimitTimeInForce::PostOnly/Gtc` 必须随 wire、签名事实、Unknown 回读、Owner 和 Desired Orders 精确比较。历史命令缺字段只按原 PostOnly 契约恢复且保持 WAL 字节；签名事实缺字段保持未知，不能默认只挂单。Grid 与 BBO 自动归一化仍为 PostOnly，手动 Gtc 不得改变策略防吃单边界。
 
 账户执行调度器负责优先级、实例公平性和单 in-flight；请求离开调度器后只经过风险复核、同一 WAL 和账户进程锁。不同 symbol 或策略共用同一账户 writer。版本迁移时先 Stop 旧进程、确认锁已释放并对账未决命令，再启动新版本；当前阶段不要求内容寻址 executable、跨主机 handoff receipt 或多代 lease 协议。
 

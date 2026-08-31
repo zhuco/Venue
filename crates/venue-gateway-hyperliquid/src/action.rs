@@ -4,7 +4,7 @@ use k256::ecdsa::{RecoveryId, Signature, SigningKey};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
-use venue_domain::domain::{FieldState, OrderSide, OrderState, Price};
+use venue_domain::domain::{FieldState, LimitTimeInForce, OrderSide, OrderState, Price};
 use venue_gateway_api::GatewayMode;
 
 use crate::{
@@ -52,12 +52,13 @@ impl HyperliquidSource {
 #[serde(rename_all = "snake_case")]
 pub enum HyperliquidActionKind {
     AloPlace,
+    GtcPlace,
     Cancel,
     IocReduceOnly,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HyperliquidAloOrder {
+struct HyperliquidLimitOrder {
     scope: HyperliquidPayloadScope,
     asset: u32,
     is_buy: bool,
@@ -67,8 +68,14 @@ pub struct HyperliquidAloOrder {
     client_order_id: String,
 }
 
-impl HyperliquidAloOrder {
-    pub fn new(
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HyperliquidAloOrder(HyperliquidLimitOrder);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HyperliquidGtcOrder(HyperliquidLimitOrder);
+
+impl HyperliquidLimitOrder {
+    fn new(
         meta: &HyperliquidPerpMeta,
         side: OrderSide,
         price: Decimal,
@@ -87,10 +94,41 @@ impl HyperliquidAloOrder {
             client_order_id: canonical_client_order_id(client_order_id.into())?,
         })
     }
+}
+
+impl HyperliquidAloOrder {
+    pub fn new(
+        meta: &HyperliquidPerpMeta,
+        side: OrderSide,
+        price: Decimal,
+        size: Decimal,
+        reduce_only: bool,
+        client_order_id: impl Into<String>,
+    ) -> Result<Self, HyperliquidError> {
+        HyperliquidLimitOrder::new(meta, side, price, size, reduce_only, client_order_id).map(Self)
+    }
 
     #[must_use]
     pub const fn scope(&self) -> &HyperliquidPayloadScope {
-        &self.scope
+        &self.0.scope
+    }
+}
+
+impl HyperliquidGtcOrder {
+    pub fn new(
+        meta: &HyperliquidPerpMeta,
+        side: OrderSide,
+        price: Decimal,
+        size: Decimal,
+        reduce_only: bool,
+        client_order_id: impl Into<String>,
+    ) -> Result<Self, HyperliquidError> {
+        HyperliquidLimitOrder::new(meta, side, price, size, reduce_only, client_order_id).map(Self)
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> &HyperliquidPayloadScope {
+        &self.0.scope
     }
 }
 
@@ -348,11 +386,15 @@ impl HyperliquidExchangeReadbackPlan {
                         *side,
                         *limit_price,
                         *original_quantity,
+                        time_in_force.as_deref(),
                         *reduce_only,
                     )
                     || (self.kind == HyperliquidActionKind::AloPlace
                         && (native_order_type != "Limit"
                             || time_in_force.as_deref() != Some("Alo")))
+                    || (self.kind == HyperliquidActionKind::GtcPlace
+                        && (native_order_type != "Limit"
+                            || time_in_force.as_deref() != Some("Gtc")))
                     || (self.kind == HyperliquidActionKind::IocReduceOnly
                         && !matches!(
                             (native_order_type.as_str(), time_in_force.as_deref()),
@@ -388,7 +430,10 @@ impl HyperliquidExchangeReadbackPlan {
 
     fn state_converges(&self, state: OrderState) -> bool {
         match (&self.acknowledgement, self.kind) {
-            (Some(HyperliquidExchangeOutcome::Resting { .. }), HyperliquidActionKind::AloPlace) => {
+            (
+                Some(HyperliquidExchangeOutcome::Resting { .. }),
+                HyperliquidActionKind::AloPlace | HyperliquidActionKind::GtcPlace,
+            ) => {
                 matches!(
                     state,
                     OrderState::New
@@ -399,12 +444,14 @@ impl HyperliquidExchangeReadbackPlan {
             }
             (
                 Some(HyperliquidExchangeOutcome::Filled { .. }),
-                HyperliquidActionKind::IocReduceOnly,
+                HyperliquidActionKind::GtcPlace | HyperliquidActionKind::IocReduceOnly,
             ) => state == OrderState::Filled,
             (Some(HyperliquidExchangeOutcome::Cancelled { .. }), HyperliquidActionKind::Cancel) => {
                 matches!(state, OrderState::Filled | OrderState::Cancelled)
             }
-            (None, HyperliquidActionKind::AloPlace) => state != OrderState::Unknown,
+            (None, HyperliquidActionKind::AloPlace | HyperliquidActionKind::GtcPlace) => {
+                state != OrderState::Unknown
+            }
             (None, HyperliquidActionKind::IocReduceOnly) => matches!(
                 state,
                 OrderState::Filled | OrderState::Cancelled | OrderState::Rejected
@@ -444,6 +491,7 @@ enum ReadbackTarget {
         side: OrderSide,
         limit_price: Price,
         quantity: Decimal,
+        time_in_force: Option<LimitTimeInForce>,
         reduce_only: bool,
     },
     Cancel {
@@ -458,6 +506,7 @@ impl ReadbackTarget {
         side: OrderSide,
         limit_price: Price,
         quantity: Decimal,
+        time_in_force: Option<&str>,
         reduce_only: bool,
     ) -> bool {
         match self {
@@ -466,6 +515,7 @@ impl ReadbackTarget {
                 side: expected_side,
                 limit_price: expected_limit_price,
                 quantity: expected_quantity,
+                time_in_force: expected_time_in_force,
                 reduce_only: expected_reduce_only,
             } => {
                 matches!(
@@ -475,6 +525,13 @@ impl ReadbackTarget {
                 ) && side == *expected_side
                     && limit_price == *expected_limit_price
                     && quantity == *expected_quantity
+                    && expected_time_in_force.is_none_or(|expected| {
+                        matches!(
+                            (expected, time_in_force),
+                            (LimitTimeInForce::PostOnly, Some("Alo"))
+                                | (LimitTimeInForce::Gtc, Some("Gtc"))
+                        )
+                    })
                     && reduce_only == *expected_reduce_only
             }
             Self::Cancel { .. } => true,
@@ -530,7 +587,11 @@ fn validate_acknowledgement(
             Some(HyperliquidExchangeOutcome::Resting { order_id }),
         ) if *order_id > 0 => Ok(()),
         (
-            HyperliquidActionKind::IocReduceOnly,
+            HyperliquidActionKind::GtcPlace,
+            Some(HyperliquidExchangeOutcome::Resting { order_id }),
+        ) if *order_id > 0 => Ok(()),
+        (
+            HyperliquidActionKind::GtcPlace | HyperliquidActionKind::IocReduceOnly,
             Some(HyperliquidExchangeOutcome::Filled {
                 order_id,
                 total_size,
@@ -570,6 +631,52 @@ pub(crate) fn build_alo_place_request(
     order: HyperliquidAloOrder,
     expires_after_ms: Option<u64>,
 ) -> Result<HyperliquidExchangeRequest, HyperliquidError> {
+    build_limit_place_request(
+        credentials,
+        nonce,
+        order.0,
+        LimitTimeInForce::PostOnly,
+        expires_after_ms,
+    )
+}
+
+pub(crate) fn build_gtc_place_request(
+    credentials: &HyperliquidCredentials,
+    nonce: PersistedNonce,
+    order: HyperliquidGtcOrder,
+    expires_after_ms: Option<u64>,
+) -> Result<HyperliquidExchangeRequest, HyperliquidError> {
+    build_limit_place_request(
+        credentials,
+        nonce,
+        order.0,
+        LimitTimeInForce::Gtc,
+        expires_after_ms,
+    )
+}
+
+fn build_limit_place_request(
+    credentials: &HyperliquidCredentials,
+    nonce: PersistedNonce,
+    order: HyperliquidLimitOrder,
+    time_in_force: LimitTimeInForce,
+    expires_after_ms: Option<u64>,
+) -> Result<HyperliquidExchangeRequest, HyperliquidError> {
+    let quantity = decimal_from_wire(&order.size)?;
+    let (wire_tif, kind, acknowledgement) = match time_in_force {
+        LimitTimeInForce::PostOnly => (
+            "Alo",
+            HyperliquidActionKind::AloPlace,
+            ResponseExpectation::Alo,
+        ),
+        LimitTimeInForce::Gtc => (
+            "Gtc",
+            HyperliquidActionKind::GtcPlace,
+            ResponseExpectation::Gtc {
+                expected_size: quantity,
+            },
+        ),
+    };
     let readback_target = ReadbackTarget::Order {
         client_order_id: order.client_order_id.clone(),
         side: if order.is_buy {
@@ -579,7 +686,8 @@ pub(crate) fn build_alo_place_request(
         },
         limit_price: Price::new(decimal_from_wire(&order.price)?)
             .map_err(|_| HyperliquidError::Action)?,
-        quantity: decimal_from_wire(&order.size)?,
+        quantity,
+        time_in_force: Some(time_in_force),
         reduce_only: order.reduce_only,
     };
     let action = Action::Order(OrderAction {
@@ -588,10 +696,10 @@ pub(crate) fn build_alo_place_request(
             asset: order.asset,
             is_buy: order.is_buy,
             price: order.price,
-            size: order.size.clone(),
+            size: order.size,
             reduce_only: order.reduce_only,
             order_type: LimitOrderType {
-                limit: LimitTif { tif: "Alo" },
+                limit: LimitTif { tif: wire_tif },
             },
             client_order_id: order.client_order_id,
         }],
@@ -602,9 +710,9 @@ pub(crate) fn build_alo_place_request(
         credentials,
         nonce,
         expires_after_ms,
-        HyperliquidActionKind::AloPlace,
+        kind,
         ResponseContract {
-            acknowledgement: ResponseExpectation::Alo,
+            acknowledgement,
             readback_target,
         },
         action,
@@ -628,6 +736,7 @@ pub(crate) fn build_ioc_reduce_only_request(
         limit_price: Price::new(decimal_from_wire(&order.price)?)
             .map_err(|_| HyperliquidError::Action)?,
         quantity: expected_size,
+        time_in_force: None,
         reduce_only: true,
     };
     let action = Action::Order(OrderAction {
@@ -703,7 +812,9 @@ pub fn parse_exchange_ack(
         }),
         ExchangeEnvelope::Ok(response) => {
             let expected_type = match request.kind {
-                HyperliquidActionKind::AloPlace | HyperliquidActionKind::IocReduceOnly => "order",
+                HyperliquidActionKind::AloPlace
+                | HyperliquidActionKind::GtcPlace
+                | HyperliquidActionKind::IocReduceOnly => "order",
                 HyperliquidActionKind::Cancel => "cancel",
             };
             if response.kind != expected_type || response.data.statuses.len() != 1 {
@@ -721,7 +832,18 @@ pub fn parse_exchange_ack(
                         order_id: value.oid,
                     })
                 }
-                (ResponseExpectation::Ioc { expected_size }, ExchangeStatus::Filled(value)) => {
+                (ResponseExpectation::Gtc { .. }, ExchangeStatus::Resting(value))
+                    if value.oid > 0 =>
+                {
+                    Ok(HyperliquidExchangeOutcome::Resting {
+                        order_id: value.oid,
+                    })
+                }
+                (
+                    ResponseExpectation::Gtc { expected_size }
+                    | ResponseExpectation::Ioc { expected_size },
+                    ExchangeStatus::Filled(value),
+                ) => {
                     let total_size = decimal_from_wire(&value.total_size)?;
                     let average_price = Price::new(decimal_from_wire(&value.average_price)?)
                         .map_err(|_| HyperliquidError::Response)?;
@@ -760,6 +882,7 @@ pub fn parse_exchange_response(
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ResponseExpectation {
     Alo,
+    Gtc { expected_size: Decimal },
     Ioc { expected_size: Decimal },
     Cancel { order_id: u64 },
 }
@@ -1317,6 +1440,95 @@ mod tests {
             ),
             Err(HyperliquidError::Action)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn gtc_wire_and_readback_policy_must_match() -> Result<(), Box<dyn std::error::Error>> {
+        let meta = meta(GatewayMode::Live, USER)?;
+        let credentials = HyperliquidCredentials::from_values(USER, None, AGENT, AGENT_KEY)?;
+        let mut store = MemoryNonceStore::default();
+        let nonce = reserve_next_nonce(&mut store, AGENT, 1_700_000_000_000)?;
+        let request = build_gtc_place_request(
+            &credentials,
+            nonce,
+            HyperliquidGtcOrder::new(
+                &meta,
+                OrderSide::Buy,
+                Decimal::new(6_500_500, 3),
+                Decimal::new(4, 1),
+                false,
+                "0x00000000000000000000000000000001",
+            )?,
+            None,
+        )?;
+        let body: serde_json::Value = serde_json::from_slice(request.body())?;
+        assert_eq!(body["action"]["orders"][0]["t"]["limit"]["tif"], "Gtc");
+        let acknowledgement = parse_exchange_ack(
+            br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":77}}]}}}"#,
+            &request,
+        )?;
+        let private = HyperliquidPrivateStreamBinding::new(&meta, 9)?;
+        let plan = begin_exchange_readback(&request, Some(&acknowledgement), &private)?;
+        let status_payload = |tif: Option<&str>| {
+            let mut order = serde_json::json!({
+                "children":[], "coin":"BTC", "isPositionTpsl":false,
+                "isTrigger":false, "side":"B", "limitPx":"6500.5", "sz":"0.4",
+                "oid":77, "timestamp":1_700_000_000_001_u64, "reduceOnly":false,
+                "orderType":"Limit", "origSz":"0.4",
+                "triggerCondition":"N/A", "triggerPx":"0.0",
+                "cloid":"0x00000000000000000000000000000001"
+            });
+            if let Some(value) = tif {
+                order["tif"] = serde_json::json!(value);
+            }
+            serde_json::to_vec(&serde_json::json!({
+                "status":"order", "order":{"order":order, "status":"open",
+                "statusTimestamp":1_700_000_000_002_u64}
+            }))
+        };
+        let matching =
+            crate::parse_order_status(&status_payload(Some("Gtc"))?, &meta, plan.lookup())?;
+        assert!(matches!(
+            plan.reconcile(Some(&matching))?,
+            HyperliquidExchangeConvergence::Confirmed { order_id: 77, .. }
+        ));
+        let filled_ack = parse_exchange_ack(
+            br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"filled":{"totalSz":"0.4","avgPx":"6500.5","oid":77}}]}}}"#,
+            &request,
+        )?;
+        let filled_plan = begin_exchange_readback(&request, Some(&filled_ack), &private)?;
+        let mut filled_payload: serde_json::Value =
+            serde_json::from_slice(&status_payload(Some("Gtc"))?)?;
+        filled_payload["order"]["order"]["sz"] = serde_json::json!("0");
+        filled_payload["order"]["status"] = serde_json::json!("filled");
+        let filled_status = crate::parse_order_status(
+            &serde_json::to_vec(&filled_payload)?,
+            &meta,
+            filled_plan.lookup(),
+        )?;
+        assert!(matches!(
+            filled_plan.reconcile(Some(&filled_status))?,
+            HyperliquidExchangeConvergence::Confirmed {
+                order_id: 77,
+                state: OrderState::Filled,
+                ..
+            }
+        ));
+        assert_eq!(
+            parse_exchange_ack(
+                br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"filled":{"totalSz":"0.5","avgPx":"6500.5","oid":77}}]}}}"#,
+                &request,
+            ),
+            Err(HyperliquidError::Response)
+        );
+        let mismatched =
+            crate::parse_order_status(&status_payload(Some("Alo"))?, &meta, plan.lookup())?;
+        assert_eq!(
+            plan.reconcile(Some(&mismatched)),
+            Err(HyperliquidError::Readback)
+        );
+        assert!(crate::parse_order_status(&status_payload(None)?, &meta, plan.lookup()).is_err());
         Ok(())
     }
 

@@ -1014,6 +1014,7 @@ mod tests {
             Decimal::ZERO,
             Decimal::ONE,
             vec![Order {
+                time_in_force: venue_domain::FieldState::Known(Default::default()),
                 symbol: "SOL/USDC".parse()?,
                 order_id: "foreign".to_owned(),
                 client_order_id: crate::domain::FieldState::Missing,
@@ -1063,6 +1064,7 @@ mod tests {
         let binding = hedged_grid_live::phase_one_binding()?;
         let mut journal = CommandJournal::open(fixture.root.join(hedged_grid_live::COMMAND_FILE))?;
         journal.prepare_place(OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("hgo_e1_long_open_l1_cmd")?,
             client_order_id: CommandId::new("hgo_e1_long_open_l1")?,
             owner: OrderOwner {

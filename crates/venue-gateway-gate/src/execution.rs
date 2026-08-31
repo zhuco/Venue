@@ -2,8 +2,8 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::Value;
 use venue_domain::domain::{
-    CancelCommand, FieldState, MarketReduceCommand, Order, OrderCommand, OrderSide, OrderState,
-    PositionSide, Price,
+    CancelCommand, FieldState, LimitTimeInForce, MarketReduceCommand, Order, OrderCommand,
+    OrderSide, OrderState, PositionSide, Price,
 };
 use venue_gateway_api::GatewayBinding;
 
@@ -29,6 +29,7 @@ struct ExpectedOrder {
     position_side: Option<PositionSide>,
     quantity: Option<Decimal>,
     limit_price: Option<Price>,
+    time_in_force: Option<LimitTimeInForce>,
     reduce_only: Option<bool>,
 }
 
@@ -114,7 +115,7 @@ impl GatePreparedMutation {
     }
 }
 
-pub fn prepare_limit_post_only(
+pub fn prepare_limit(
     binding: &GateGatewayBinding,
     rules: &GateContractRules,
     command: &OrderCommand,
@@ -147,7 +148,7 @@ pub fn prepare_limit_post_only(
         contract: &rules.native_symbol,
         size: decimal_wire(signed_contracts),
         price: decimal_wire(command.limit_price.value()),
-        tif: "poc",
+        tif: limit_time_in_force_wire(command.time_in_force),
         reduce_only: command.reduce_only,
         text: native_client_id(&client_order_id)?,
     };
@@ -163,6 +164,7 @@ pub fn prepare_limit_post_only(
             position_side: Some(command.position_side),
             quantity: Some(command.quantity),
             limit_price: Some(command.limit_price),
+            time_in_force: Some(command.time_in_force),
             reduce_only: Some(command.reduce_only),
         },
         None,
@@ -206,6 +208,7 @@ pub fn prepare_reduce_once(
             position_side: Some(command.position_side),
             quantity: Some(command.quantity),
             limit_price: None,
+            time_in_force: None,
             reduce_only: Some(true),
         },
         Some((
@@ -257,6 +260,7 @@ pub fn prepare_cancel(
             position_side: None,
             quantity: None,
             limit_price: None,
+            time_in_force: None,
             reduce_only: None,
         },
         reduce_episode: None,
@@ -363,6 +367,7 @@ pub(crate) fn parse_mutation_ack(
     expected.position_side = known_position_side(&order);
     expected.quantity = Some(order.quantity);
     expected.limit_price = order.limit_price;
+    expected.time_in_force = known_time_in_force(&order);
     expected.reduce_only = Some(order.reduce_only);
     let readback = exact_readback(
         &request.binding,
@@ -459,6 +464,7 @@ pub fn prepare_exact_readback_by_client_id(
             position_side: None,
             quantity: None,
             limit_price: None,
+            time_in_force: None,
             reduce_only: None,
         },
         None,
@@ -609,6 +615,9 @@ fn matches_expected(order: &Order, expected: &ExpectedOrder) -> bool {
             .limit_price
             .is_none_or(|value| Some(value) == order.limit_price)
         && expected
+            .time_in_force
+            .is_none_or(|value| Some(value) == known_time_in_force(order))
+        && expected
             .reduce_only
             .is_none_or(|value| value == order.reduce_only)
 }
@@ -621,7 +630,25 @@ fn same_order_semantics(left: &Order, right: &Order) -> bool {
         && left.position_side == right.position_side
         && left.quantity == right.quantity
         && left.limit_price == right.limit_price
+        && left.time_in_force == right.time_in_force
         && left.reduce_only == right.reduce_only
+}
+
+const fn limit_time_in_force_wire(value: LimitTimeInForce) -> &'static str {
+    match value {
+        LimitTimeInForce::PostOnly => "poc",
+        LimitTimeInForce::Gtc => "gtc",
+    }
+}
+
+fn known_time_in_force(order: &Order) -> Option<LimitTimeInForce> {
+    match order.time_in_force {
+        FieldState::Known(value) => Some(value),
+        FieldState::Missing
+        | FieldState::Null
+        | FieldState::Unavailable { .. }
+        | FieldState::NotApplicable => None,
+    }
 }
 
 fn known_position_side(order: &Order) -> Option<PositionSide> {
@@ -755,6 +782,7 @@ mod tests {
 
     fn limit() -> Result<OrderCommand, Box<dyn std::error::Error>> {
         Ok(OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("command")?,
             client_order_id: CommandId::new("grid_long_1")?,
             owner: owner(OrderPurpose::Entry)?,
@@ -768,7 +796,7 @@ mod tests {
 
     fn ack_payload(status: &str, finish_as: &str) -> String {
         format!(
-            r#"{{"id":"9001","contract":"DOGE_USDT","size":"10","left":"10","is_reduce_only":false,"status":"{status}","finish_as":"{finish_as}","price":"0.1","fill_price":"0","text":"t-grid_long_1"}}"#
+            r#"{{"id":"9001","contract":"DOGE_USDT","size":"10","left":"10","is_reduce_only":false,"tif":"poc","status":"{status}","finish_as":"{finish_as}","price":"0.1","fill_price":"0","text":"t-grid_long_1"}}"#
         )
     }
 
@@ -776,12 +804,65 @@ mod tests {
     fn post_only_preserves_contract_count_poc_reduce_and_client_identity()
     -> Result<(), Box<dyn std::error::Error>> {
         let (binding, rules) = facts()?;
-        let request = prepare_limit_post_only(&binding, &rules, &limit()?)?;
+        let request = prepare_limit(&binding, &rules, &limit()?)?;
         assert_eq!(request.kind(), GateMutationKind::PlacePostOnly);
         assert_eq!(
             std::str::from_utf8(request.body())?,
             r#"{"contract":"DOGE_USDT","size":"10","price":"0.1","tif":"poc","reduce_only":false,"text":"t-grid_long_1"}"#
         );
+        Ok(())
+    }
+
+    #[test]
+    fn gtc_wire_and_exact_readback_policy_are_bound() -> Result<(), Box<dyn std::error::Error>> {
+        let (binding, rules) = facts()?;
+        let mut command = limit()?;
+        command.time_in_force = LimitTimeInForce::Gtc;
+        let request = prepare_limit(&binding, &rules, &command)?;
+        assert_eq!(
+            std::str::from_utf8(request.body())?,
+            r#"{"contract":"DOGE_USDT","size":"10","price":"0.1","tif":"gtc","reduce_only":false,"text":"t-grid_long_1"}"#
+        );
+        let accepted = parse_mutation_ack(
+            &binding,
+            &rules,
+            request,
+            ack_payload("open", "")
+                .replace("\"poc\"", "\"gtc\"")
+                .as_bytes(),
+            1_000,
+        )?;
+        let exact = ack_payload("open", "").replace("\"poc\"", "\"gtc\"");
+        let readback = GateExactOrderReadback::from_response(
+            &binding,
+            &rules,
+            &accepted.readback,
+            1_001,
+            1_002,
+            exact.clone(),
+        )?;
+        assert_eq!(
+            settle_exact_readback(&accepted.readback, &readback)?.finality,
+            GateSettlementFinality::Working
+        );
+        let mismatched = GateExactOrderReadback::from_response(
+            &binding,
+            &rules,
+            &accepted.readback,
+            1_003,
+            1_004,
+            ack_payload("open", ""),
+        );
+        assert_eq!(mismatched, Err(GateExecutionError::Readback));
+        let missing = GateExactOrderReadback::from_response(
+            &binding,
+            &rules,
+            &accepted.readback,
+            1_003,
+            1_004,
+            exact.replace("\"tif\":\"gtc\",", ""),
+        );
+        assert_eq!(missing, Err(GateExecutionError::Readback));
         Ok(())
     }
 
@@ -792,7 +873,7 @@ mod tests {
         let accepted = parse_mutation_ack(
             &binding,
             &rules,
-            prepare_limit_post_only(&binding, &rules, &limit()?)?,
+            prepare_limit(&binding, &rules, &limit()?)?,
             ack_payload("open", "").as_bytes(),
             1_000,
         )?;
@@ -814,8 +895,7 @@ mod tests {
     fn timeout_plan_uses_exact_client_readback_and_never_reconstructs_a_place()
     -> Result<(), Box<dyn std::error::Error>> {
         let (binding, rules) = facts()?;
-        let unknown =
-            mutation_unknown(prepare_limit_post_only(&binding, &rules, &limit()?)?, 1_000)?;
+        let unknown = mutation_unknown(prepare_limit(&binding, &rules, &limit()?)?, 1_000)?;
         assert_eq!(
             unknown.readback.endpoint,
             "/futures/usdt/orders/t-grid_long_1"
@@ -830,13 +910,13 @@ mod tests {
         let mut command = limit()?;
         command.quantity = Decimal::new(15, 2);
         assert_eq!(
-            prepare_limit_post_only(&binding, &rules, &command),
+            prepare_limit(&binding, &rules, &command),
             Err(GateExecutionError::Rules)
         );
         let mut command = limit()?;
         command.client_order_id = CommandId::new("12345678901234567890123456789")?;
         assert_eq!(
-            prepare_limit_post_only(&binding, &rules, &command),
+            prepare_limit(&binding, &rules, &command),
             Err(GateExecutionError::ClientOrderId)
         );
         Ok(())

@@ -118,6 +118,7 @@ fn signed_fill_without_client_id_uses_durable_accepted_order_identity()
     let client_order_id = "hgo_e1_long_open_l1";
     let command_id = CommandId::new("place_e1_long_open_l1")?;
     let command = OrderCommand {
+        time_in_force: Default::default(),
         command_id: command_id.clone(),
         client_order_id: CommandId::new(client_order_id)?,
         owner: OrderOwner {

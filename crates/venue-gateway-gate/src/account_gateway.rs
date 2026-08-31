@@ -7,8 +7,8 @@ use rust_decimal::Decimal;
 use serde_json::Value;
 use tokio::runtime::{Builder, Runtime};
 use venue_domain::domain::{
-    ExecutionCommand, FieldState, Fill, NativeOrderFamily, OrderCommand, OrderSide, OrderState,
-    PositionSide, Price, Symbol,
+    ExecutionCommand, FieldState, Fill, LimitTimeInForce, NativeOrderFamily, OrderCommand,
+    OrderSide, OrderState, PositionSide, Price, Symbol,
 };
 use venue_execution::{
     AccountDispatchPermit, AccountGatewayResult, AccountHostValidationError,
@@ -25,8 +25,8 @@ use crate::{
     GatePrivateReadSource, GatePrivateReadbackCandidate, GatePublicBinding, GatePublicPayloadKind,
     GatePublicRawPayload, GateRawPrivateResponse, GateTransportError, GateTransportLimits,
     endpoints, parse_contract_rules, parse_rest_snapshot, prepare_cancel,
-    prepare_exact_readback_by_client_id, prepare_limit_post_only, prepare_private_read,
-    prepare_reduce_once, rest_order_book_path, settle_exact_readback, validate_private_readback,
+    prepare_exact_readback_by_client_id, prepare_limit, prepare_private_read, prepare_reduce_once,
+    rest_order_book_path, settle_exact_readback, validate_private_readback,
 };
 
 const LIMIT_BBO_MAX_AGE_MS: u64 = 3_000;
@@ -145,9 +145,7 @@ impl GateAccountGateway {
             Err(_) => return rejected("gate_symbol_unconfigured"),
         };
         let prepared = match permit.command() {
-            ExecutionCommand::PlaceLimit(command) => {
-                prepare_limit_post_only(&self.binding, &rules, command)
-            }
+            ExecutionCommand::PlaceLimit(command) => prepare_limit(&self.binding, &rules, command),
             ExecutionCommand::MarketReduce(command) => {
                 prepare_reduce_once(&self.binding, &rules, command)
             }
@@ -327,16 +325,22 @@ impl AccountPhysicalGateway for GateAccountGateway {
                                 .ok()
                         })
                     }) {
-                    Some(readback) if readback.order.state == OrderState::Rejected => {
+                    Some(readback)
+                        if readback_policy_matches_command(command, &readback.order)
+                            && readback.order.state == OrderState::Rejected =>
+                    {
                         AccountRecoveryOutcome::rejected(
                             command.command_id().clone(),
                             "gate_rejected".to_owned(),
                         )
                     }
-                    Some(readback) => AccountRecoveryOutcome::accepted(
-                        command.command_id().clone(),
-                        readback.order.order_id,
-                    ),
+                    Some(readback) if readback_policy_matches_command(command, &readback.order) => {
+                        AccountRecoveryOutcome::accepted(
+                            command.command_id().clone(),
+                            readback.order.order_id,
+                        )
+                    }
+                    Some(_) => AccountRecoveryOutcome::still_unknown(command.command_id().clone()),
                     None => AccountRecoveryOutcome::still_unknown(command.command_id().clone()),
                 };
             outcomes.push(outcome);
@@ -513,6 +517,7 @@ fn normalize_limit_from_bbo(
         .native_contracts_checked(quantity)
         .map_err(|_| AccountHostValidationError::Command)?;
     let command = OrderCommand {
+        time_in_force: Default::default(),
         command_id: intent.command_id.clone(),
         client_order_id: intent.client_order_id.clone(),
         owner: intent.owner.clone(),
@@ -951,6 +956,7 @@ fn snapshot_regular_order_facts(
                 position_side,
                 quantity,
                 limit_price: snapshot_optional_price(item.get("price"))?,
+                time_in_force: snapshot_limit_time_in_force(item.get("tif"))?,
                 reduce_only,
                 owner: None,
                 external: true,
@@ -1047,14 +1053,20 @@ async fn snapshot_unknown_results(
                     .execute_exact_readback(binding, credentials, &rules, &exact, timestamp)
                     .await
                 {
-                    Ok(readback) if readback.order.state == OrderState::Rejected => {
+                    Ok(readback)
+                        if readback_policy_matches_command(command, &readback.order)
+                            && readback.order.state == OrderState::Rejected =>
+                    {
                         SignedUnknownResult::Rejected {
                             reason: "gate_rejected".to_owned(),
                         }
                     }
-                    Ok(readback) => SignedUnknownResult::Accepted {
-                        venue_order_id: readback.order.order_id,
-                    },
+                    Ok(readback) if readback_policy_matches_command(command, &readback.order) => {
+                        SignedUnknownResult::Accepted {
+                            venue_order_id: readback.order.order_id,
+                        }
+                    }
+                    Ok(_) => SignedUnknownResult::Unknown,
                     Err(_) => SignedUnknownResult::Unknown,
                 },
                 None => SignedUnknownResult::Unknown,
@@ -1067,6 +1079,22 @@ async fn snapshot_unknown_results(
         });
     }
     Ok(results)
+}
+
+fn readback_policy_matches_command(
+    command: &ExecutionCommand,
+    order: &venue_domain::domain::Order,
+) -> bool {
+    match command {
+        ExecutionCommand::PlaceLimit(place) => {
+            order.time_in_force == FieldState::Known(place.time_in_force)
+        }
+        ExecutionCommand::Cancel(_)
+        | ExecutionCommand::PlaceMarket(_)
+        | ExecutionCommand::MarketReduce(_)
+        | ExecutionCommand::StopMarketCloseAll(_)
+        | ExecutionCommand::StopMarketFullPosition(_) => true,
+    }
 }
 
 fn snapshot_fills_cursor(
@@ -1174,6 +1202,20 @@ fn snapshot_optional_price(
         Ok(Some(value))
     } else {
         Err(AccountHostValidationError::SignedSnapshot)
+    }
+}
+
+fn snapshot_limit_time_in_force(
+    value: Option<&Value>,
+) -> Result<Option<LimitTimeInForce>, AccountHostValidationError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => match value.as_str() {
+            "poc" => Ok(Some(LimitTimeInForce::PostOnly)),
+            "gtc" => Ok(Some(LimitTimeInForce::Gtc)),
+            _ => Ok(None),
+        },
+        Some(_) => Err(AccountHostValidationError::SignedSnapshot),
     }
 }
 
@@ -1481,7 +1523,7 @@ pub enum GateAccountGatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::GatePublicError;
+    use crate::{GatePublicError, parse_regular_order};
     use venue_domain::domain::{CommandId, OrderOwner, OrderPurpose};
 
     const CATALOGUE: &str = r#"[{
@@ -1524,6 +1566,53 @@ mod tests {
             quote_delta,
             reduce_only,
         })
+    }
+
+    #[test]
+    fn signed_snapshot_policy_preserves_missing_and_unrepresented_values() {
+        assert_eq!(snapshot_limit_time_in_force(None), Ok(None));
+        assert_eq!(
+            snapshot_limit_time_in_force(Some(&Value::String("ioc".to_owned()))),
+            Ok(None)
+        );
+        assert_eq!(
+            snapshot_limit_time_in_force(Some(&Value::String("poc".to_owned()))),
+            Ok(Some(LimitTimeInForce::PostOnly))
+        );
+        assert!(snapshot_limit_time_in_force(Some(&Value::Bool(true))).is_err());
+    }
+
+    #[test]
+    fn unknown_limit_readback_requires_the_original_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rules = rules()?;
+        let intent = limit_intent(
+            OrderPurpose::Entry,
+            OrderSide::Buy,
+            PositionSide::Long,
+            false,
+            Decimal::from(10),
+        )?;
+        let mut command = normalize_limit_from_bbo(
+            &intent,
+            &rules,
+            Decimal::new(1000, 4),
+            Decimal::new(1001, 4),
+        )?;
+        let orders: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/regular_orders.json"))?;
+        let mut order = parse_regular_order(&orders[0], &rules.instrument.symbol, &rules)?;
+        assert!(readback_policy_matches_command(&command, &order));
+        let ExecutionCommand::PlaceLimit(place) = &mut command else {
+            return Err("limit required".into());
+        };
+        place.time_in_force = LimitTimeInForce::Gtc;
+        assert!(!readback_policy_matches_command(&command, &order));
+        order.time_in_force = FieldState::Known(LimitTimeInForce::Gtc);
+        assert!(readback_policy_matches_command(&command, &order));
+        order.time_in_force = FieldState::Missing;
+        assert!(!readback_policy_matches_command(&command, &order));
+        Ok(())
     }
 
     fn public_binding(rules: &GateContractRules) -> Result<GatePublicBinding, GatePublicError> {

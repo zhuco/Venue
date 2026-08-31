@@ -105,6 +105,7 @@ impl AccountPhysicalGateway for Gateway {
             })
             .transpose()?;
         let order = SignedAccountOrderFact {
+            time_in_force: Some(Default::default()),
             client_order_id: "client-e2e".to_owned(),
             venue_order_id: Some("venue-e2e".to_owned()),
             symbol: symbol.clone(),
@@ -423,6 +424,7 @@ async fn resident_control_delivery_roundtrip(
     let create = venue_domain::CommandId::new("recovered-e2e")?;
     wal.prepare(venue_domain::ExecutionCommand::PlaceLimit(
         venue_domain::OrderCommand {
+            time_in_force: Default::default(),
             command_id: create.clone(),
             client_order_id: venue_domain::CommandId::new("client-e2e")?,
             owner: OrderOwner {
@@ -988,6 +990,7 @@ fn flatten_physically_cancels_then_reduces_only_after_signed_zero()
     let create = venue_domain::CommandId::new("recovered-shutdown-order")?;
     wal.prepare(venue_domain::ExecutionCommand::PlaceLimit(
         venue_domain::OrderCommand {
+            time_in_force: Default::default(),
             command_id: create.clone(),
             client_order_id: venue_domain::CommandId::new("client-e2e")?,
             owner: OrderOwner {
@@ -1095,6 +1098,7 @@ fn projection_keeps_owned_orders_when_status_or_cumulative_fill_is_unknown()
         1,
         SignedAccountPositionMode::Net,
         vec![SignedAccountOrderFact {
+            time_in_force: Some(Default::default()),
             client_order_id: "copy-open".to_owned(),
             venue_order_id: Some("native-open".to_owned()),
             symbol: binding.key.symbol.clone(),

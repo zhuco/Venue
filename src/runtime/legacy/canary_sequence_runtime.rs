@@ -220,6 +220,7 @@ mod tests {
 
     fn bnb_command(symbol: Symbol) -> Result<OrderCommand, Box<dyn std::error::Error>> {
         Ok(OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("cmd_bnb_1")?,
             client_order_id: CommandId::new("vcn_bnb_1")?,
             owner: OrderOwner {

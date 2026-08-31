@@ -406,6 +406,7 @@ fn terminal_source_order(
     client_order_id: &CommandId,
 ) -> Result<Order, Box<dyn std::error::Error>> {
     Ok(Order {
+        time_in_force: venue_domain::FieldState::Known(Default::default()),
         order_id: "venue-source-order".to_owned(),
         client_order_id: FieldState::Known(client_order_id.as_str().to_owned()),
         symbol: binding.symbol.clone(),

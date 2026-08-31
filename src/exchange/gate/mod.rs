@@ -1032,6 +1032,7 @@ pub fn parse_order(
     };
     let state = gate_order_state(object, quantity, left)?;
     let order = Order {
+        time_in_force: crate::domain::FieldState::Missing,
         order_id: identifier(object.get("id"))?,
         client_order_id: gate_client_order_id(object.get("text")),
         symbol: symbol.clone(),

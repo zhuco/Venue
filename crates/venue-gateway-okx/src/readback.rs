@@ -854,6 +854,7 @@ struct StrictOrderRow {
     inst_id: String,
     td_mode: String,
     category: String,
+    #[serde(default)]
     ord_type: String,
     ord_id: String,
     #[serde(default)]
@@ -896,7 +897,7 @@ fn complete_regular_pages(
         for row in rows {
             if row.td_mode != trade_mode.wire_value()
                 || row.category != "normal"
-                || !regular_order_type(&row.ord_type)
+                || (!row.ord_type.is_empty() && !regular_order_type(&row.ord_type))
             {
                 return Err(OkxError::Binding);
             }
@@ -911,6 +912,7 @@ fn complete_regular_pages(
                     inst_id: row.inst_id.clone(),
                     ord_id: row.ord_id.clone(),
                     cl_ord_id: row.cl_ord_id.clone(),
+                    ord_type: row.ord_type.clone(),
                     side: row.side.clone(),
                     pos_side: row.pos_side.clone(),
                     sz: row.sz.clone(),
@@ -1037,6 +1039,7 @@ fn complete_algo_pages(
                 quantity,
                 filled_quantity: Decimal::ZERO,
                 limit_price: None,
+                time_in_force: FieldState::NotApplicable,
                 average_price: FieldState::Missing,
                 reduce_only: semantic_reduce,
             };

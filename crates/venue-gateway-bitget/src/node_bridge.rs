@@ -130,7 +130,7 @@ pub fn prepare_node_mutation(
                 position_side: command.position_side,
                 quantity: command.quantity,
                 limit_price: command.limit_price,
-                time_in_force: BitgetTimeInForce::PostOnly,
+                time_in_force: BitgetTimeInForce::from_limit_time_in_force(command.time_in_force),
                 reduce_only: command.reduce_only,
             },
             now_ms,
@@ -404,6 +404,7 @@ mod tests {
         let (rules, candidate) = node_candidate(GatewayMode::Live)?;
         let config = BitgetConfig::for_mode(GatewayMode::Live);
         let place = ExecutionCommand::PlaceLimit(OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("place_1")?,
             client_order_id: CommandId::new("venue_place_1")?,
             owner: owner(OrderPurpose::Entry)?,

@@ -4,8 +4,8 @@ use rust_decimal::Decimal;
 use serde_json::{Map, Value};
 
 use venue_domain::domain::{
-    AccountBalance, Amount, Asset, FieldState, Fill, Order, OrderSide, OrderState, Position,
-    PositionSide, Price, Symbol, UnknownReason,
+    AccountBalance, Amount, Asset, FieldState, Fill, LimitTimeInForce, Order, OrderSide,
+    OrderState, Position, PositionSide, Price, Symbol, UnknownReason,
 };
 
 #[path = "fill_pagination.rs"]
@@ -297,6 +297,7 @@ pub fn parse_open_conditional_orders(
                 quantity: positive_decimal(item, "quantity")?,
                 filled_quantity: Decimal::ZERO,
                 limit_price: optional_limit_price(item.get("price"))?,
+                time_in_force: FieldState::Missing,
                 average_price: FieldState::Missing,
                 reduce_only,
             };
@@ -332,6 +333,7 @@ pub fn parse_open_algo_order_facts(
                 quantity,
                 filled_quantity: Decimal::ZERO,
                 limit_price: None,
+                time_in_force: FieldState::Missing,
                 average_price: FieldState::Missing,
                 reduce_only,
             };
@@ -508,6 +510,7 @@ fn order(value: &Value, expected: &Symbol) -> Result<Order, PrivateParseError> {
         quantity: decimal(item, "origQty")?,
         filled_quantity: decimal(item, "executedQty")?,
         limit_price: known_price(item.get("price")),
+        time_in_force: optional_limit_time_in_force(item.get("timeInForce")),
         average_price: optional_price(item.get("avgPrice")),
         reduce_only: bool_value(item, "reduceOnly")?,
     };
@@ -812,6 +815,23 @@ fn optional_price(value: Option<&Value>) -> FieldState<Price> {
             },
             Err(_) => FieldState::Unavailable {
                 reason: UnknownReason::ParseFailure,
+            },
+        },
+        Some(_) => FieldState::Unavailable {
+            reason: UnknownReason::ParseFailure,
+        },
+    }
+}
+
+fn optional_limit_time_in_force(value: Option<&Value>) -> FieldState<LimitTimeInForce> {
+    match value {
+        None => FieldState::Missing,
+        Some(Value::Null) => FieldState::Null,
+        Some(Value::String(value)) => match value.as_str() {
+            "GTX" => FieldState::Known(LimitTimeInForce::PostOnly),
+            "GTC" => FieldState::Known(LimitTimeInForce::Gtc),
+            _ => FieldState::Unavailable {
+                reason: UnknownReason::Ambiguous,
             },
         },
         Some(_) => FieldState::Unavailable {

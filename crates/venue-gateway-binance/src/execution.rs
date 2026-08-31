@@ -1,7 +1,8 @@
 use rust_decimal::Decimal;
 use serde_json::Value;
 use venue_domain::domain::{
-    ExecutionCommand, FieldState, Order, OrderSide, OrderState, PositionSide, Price,
+    ExecutionCommand, FieldState, LimitTimeInForce, Order, OrderSide, OrderState, PositionSide,
+    Price,
 };
 use venue_gateway_api::GatewayBinding;
 
@@ -291,7 +292,10 @@ pub fn prepare_execution_command(
                 position_side: command.position_side,
                 quantity: command.quantity,
                 limit_price: command.limit_price,
-                time_in_force: BinanceTimeInForce::PostOnly,
+                time_in_force: match command.time_in_force {
+                    LimitTimeInForce::PostOnly => BinanceTimeInForce::PostOnly,
+                    LimitTimeInForce::Gtc => BinanceTimeInForce::GoodTillCancelled,
+                },
                 reduce_only: command.reduce_only,
             },
         ),
@@ -408,6 +412,7 @@ pub struct BinanceMutationAck {
     pub kind: BinanceMutationKind,
     pub order_id: String,
     pub client_order_id: String,
+    time_in_force: Option<LimitTimeInForce>,
     pub accepted_at_ms: u64,
     pub received_at_ms: u64,
 }
@@ -451,6 +456,7 @@ pub fn parse_mutation_ack(
         kind: request.kind,
         order_id,
         client_order_id: client_order_id.to_owned(),
+        time_in_force: request.limit_time_in_force()?,
         accepted_at_ms,
         received_at_ms,
     })
@@ -490,7 +496,12 @@ pub fn parse_exact_order_readback(
         &order.client_order_id,
         FieldState::Known(value) if value == &ack.client_order_id
     );
-    if order.order_id != ack.order_id || !client_matches {
+    if order.order_id != ack.order_id
+        || !client_matches
+        || ack.time_in_force.is_some_and(|expected| {
+            !matches!(order.time_in_force, FieldState::Known(actual) if actual == expected)
+        })
+    {
         return Err(BinanceExecutionError::Readback);
     }
     Ok(BinanceExactOrderReadback {
@@ -502,6 +513,23 @@ pub fn parse_exact_order_readback(
         order,
         raw_payload: page.payload.to_vec(),
     })
+}
+
+impl BinancePreparedMutation {
+    fn limit_time_in_force(&self) -> Result<Option<LimitTimeInForce>, BinanceExecutionError> {
+        if self.kind != BinanceMutationKind::PlaceLimit {
+            return Ok(None);
+        }
+        match self
+            .parameters
+            .iter()
+            .find_map(|(name, value)| (name == "timeInForce").then_some(value.as_str()))
+        {
+            Some("GTX") => Ok(Some(LimitTimeInForce::PostOnly)),
+            Some("GTC") => Ok(Some(LimitTimeInForce::Gtc)),
+            _ => Err(BinanceExecutionError::Intent),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -648,6 +676,7 @@ mod tests {
         build_regular_orders_request, complete_private_readback, parse_instrument_rules,
     };
     use bytes::Bytes;
+    use venue_domain::domain::{CommandId, OrderCommand, OrderOwner, OrderPurpose};
     use venue_gateway_api::{GatewayMode, VenueId};
 
     const EXCHANGE_INFO: &str = include_str!("../tests/fixtures/exchange_info_btcusdt.json");
@@ -730,6 +759,27 @@ mod tests {
             time_in_force: BinanceTimeInForce::PostOnly,
             reduce_only: false,
         })
+    }
+
+    fn gtc_command() -> Result<ExecutionCommand, Box<dyn std::error::Error>> {
+        Ok(ExecutionCommand::PlaceLimit(OrderCommand {
+            command_id: CommandId::new("gtc-command")?,
+            client_order_id: CommandId::new("venue_place_1")?,
+            owner: OrderOwner {
+                strategy_instance_id: "manual".to_owned(),
+                run_id: "gtc".to_owned(),
+                exchange: "binance".to_owned(),
+                account: "00000000-0000-4000-8000-000000000001".to_owned(),
+                symbol: "BTC/USDT".parse()?,
+                purpose: OrderPurpose::Entry,
+            },
+            side: OrderSide::Buy,
+            position_side: PositionSide::Long,
+            quantity: Decimal::new(2, 3),
+            limit_price: Price::new(Decimal::new(50_000, 0))?,
+            time_in_force: LimitTimeInForce::Gtc,
+            reduce_only: false,
+        }))
     }
 
     #[test]
@@ -865,6 +915,40 @@ mod tests {
         assert_eq!(
             parse_exact_order_readback(&ack, &exact_request, &stale_page),
             Err(BinanceExecutionError::Binding)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gtc_wire_and_exact_readback_policy_are_bound() -> Result<(), Box<dyn std::error::Error>> {
+        let facts = facts("00000000-0000-4000-8000-000000000001")?;
+        let request = prepare_execution_command(&facts.rules, &facts.readback, &gtc_command()?)?;
+        assert!(
+            request
+                .parameters()
+                .contains(&("timeInForce".to_owned(), "GTC".to_owned()))
+        );
+        let ack = parse_mutation_ack(&request, facts.readback.scope(), ACK, 2_000)?;
+        let exact_request = request.exact_readback_request(facts.readback.scope())?;
+        let gtc = std::str::from_utf8(EXACT)?.replace("\"GTX\"", "\"GTC\"");
+        let exact =
+            BinanceRawPrivatePage::new(&exact_request, 2_100, 2_200, Bytes::from(gtc.clone()))?;
+        assert!(parse_exact_order_readback(&ack, &exact_request, &exact).is_ok());
+        let post_only =
+            BinanceRawPrivatePage::new(&exact_request, 2_100, 2_200, Bytes::from_static(EXACT))?;
+        assert_eq!(
+            parse_exact_order_readback(&ack, &exact_request, &post_only),
+            Err(BinanceExecutionError::Readback)
+        );
+        let missing = BinanceRawPrivatePage::new(
+            &exact_request,
+            2_100,
+            2_200,
+            Bytes::from(gtc.replace("\"timeInForce\":\"GTC\",", "")),
+        )?;
+        assert_eq!(
+            parse_exact_order_readback(&ack, &exact_request, &missing),
+            Err(BinanceExecutionError::Readback)
         );
         Ok(())
     }

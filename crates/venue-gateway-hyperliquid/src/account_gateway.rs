@@ -14,8 +14,9 @@ use rust_decimal::Decimal;
 use sha3::{Digest, Keccak256};
 use tokio::runtime::{Builder, Runtime};
 use venue_domain::domain::{
-    Asset, ExecutionCommand, InstrumentIdentity, MarketKind, MarketReduceCommand,
-    NativeOrderFamily, OrderCommand, OrderSide, OrderState, Position, PositionSide, Price,
+    Asset, ExecutionCommand, FieldState, InstrumentIdentity, LimitTimeInForce, MarketKind,
+    MarketReduceCommand, NativeOrderFamily, OrderCommand, OrderSide, OrderState, Position,
+    PositionSide, Price,
 };
 use venue_execution::{
     AccountDispatchPermit, AccountGatewayResult, AccountHostValidationError,
@@ -29,9 +30,9 @@ use venue_gateway_api::GatewayBinding;
 
 use crate::action::{
     HyperliquidAloOrder, HyperliquidCancel, HyperliquidExchangeConvergence,
-    HyperliquidExchangeOutcome, HyperliquidIocReduceOnlyOrder, begin_exchange_readback,
-    build_alo_place_request, build_cancel_request, build_ioc_reduce_only_request,
-    parse_exchange_ack,
+    HyperliquidExchangeOutcome, HyperliquidGtcOrder, HyperliquidIocReduceOnlyOrder,
+    begin_exchange_readback, build_alo_place_request, build_cancel_request,
+    build_gtc_place_request, build_ioc_reduce_only_request, parse_exchange_ack,
 };
 use crate::{
     HYPERLIQUID_FILL_RESPONSE_LIMIT, HYPERLIQUID_RECENT_FILL_RETENTION_LIMIT, HyperliquidBbo,
@@ -269,18 +270,36 @@ impl HyperliquidAccountGateway {
                     Err(_) => return rejected("hyperliquid_nonce"),
                 };
                 let cloid = command_cloid(command.client_order_id.as_str());
-                let order = match HyperliquidAloOrder::new(
-                    &self.meta,
-                    command.side,
-                    command.limit_price.value(),
-                    command.quantity,
-                    command.reduce_only,
-                    cloid,
-                ) {
-                    Ok(value) => value,
-                    Err(_) => return rejected("hyperliquid_intent_rejected"),
-                };
-                build_alo_place_request(&self.credentials, nonce, order, expires_after_ms)
+                match command.time_in_force {
+                    LimitTimeInForce::PostOnly => {
+                        let order = match HyperliquidAloOrder::new(
+                            &self.meta,
+                            command.side,
+                            command.limit_price.value(),
+                            command.quantity,
+                            command.reduce_only,
+                            cloid,
+                        ) {
+                            Ok(value) => value,
+                            Err(_) => return rejected("hyperliquid_intent_rejected"),
+                        };
+                        build_alo_place_request(&self.credentials, nonce, order, expires_after_ms)
+                    }
+                    LimitTimeInForce::Gtc => {
+                        let order = match HyperliquidGtcOrder::new(
+                            &self.meta,
+                            command.side,
+                            command.limit_price.value(),
+                            command.quantity,
+                            command.reduce_only,
+                            cloid,
+                        ) {
+                            Ok(value) => value,
+                            Err(_) => return rejected("hyperliquid_intent_rejected"),
+                        };
+                        build_gtc_place_request(&self.credentials, nonce, order, expires_after_ms)
+                    }
+                }
             }
             ExecutionCommand::Cancel(command) => {
                 let lookup = match HyperliquidOrderLookup::client_order_id(command_cloid(
@@ -352,17 +371,10 @@ impl HyperliquidAccountGateway {
             .block_on(self.transport.post_exchange(request.binding(), &request))
         {
             Ok(response) => match parse_exchange_ack(&response.body, &request) {
-                Ok(outcome @ HyperliquidExchangeOutcome::Filled { .. })
-                    if matches!(permit.command(), ExecutionCommand::MarketReduce(_)) =>
-                {
-                    self.confirm_market_reduce_readback(&request, &outcome)
-                }
-                Ok(HyperliquidExchangeOutcome::Resting { order_id })
-                | Ok(HyperliquidExchangeOutcome::Filled { order_id, .. })
-                | Ok(HyperliquidExchangeOutcome::Cancelled { order_id }) => {
-                    AccountGatewayResult::Accepted {
-                        venue_order_id: order_id.to_string(),
-                    }
+                Ok(outcome @ HyperliquidExchangeOutcome::Resting { .. })
+                | Ok(outcome @ HyperliquidExchangeOutcome::Filled { .. })
+                | Ok(outcome @ HyperliquidExchangeOutcome::Cancelled { .. }) => {
+                    self.confirm_exchange_readback(&request, &outcome)
                 }
                 Ok(HyperliquidExchangeOutcome::Rejected { reason }) => {
                     AccountGatewayResult::Rejected { reason }
@@ -373,7 +385,7 @@ impl HyperliquidAccountGateway {
         }
     }
 
-    fn confirm_market_reduce_readback(
+    fn confirm_exchange_readback(
         &mut self,
         request: &crate::action::HyperliquidExchangeRequest,
         acknowledgement: &HyperliquidExchangeOutcome,
@@ -596,8 +608,10 @@ impl AccountPhysicalGateway for HyperliquidAccountGateway {
             };
             let lookup = HyperliquidOrderLookup::client_order_id(command_cloid(client_id))
                 .map_err(|_| HyperliquidAccountGatewayError::Readback)?;
-            let status = self.order_status(&lookup)?;
-            outcomes.push(hyperliquid_recovery_outcome(command, status));
+            outcomes.push(hyperliquid_recovery_status_outcome(
+                command,
+                self.order_status(&lookup),
+            ));
         }
         AccountRecoveryReport::new(
             self.binding.gateway().gateway_binding().clone(),
@@ -947,6 +961,16 @@ fn signed_order_facts(
         if client_order_id.trim().is_empty() || !order.quantity.is_sign_positive() {
             return Err(HyperliquidAccountGatewayError::Account);
         }
+        let time_in_force = match item.family {
+            crate::HyperliquidOrderFamily::Regular => match order.time_in_force {
+                FieldState::Known(value) => Some(value),
+                FieldState::Missing
+                | FieldState::Null
+                | FieldState::Unavailable { .. }
+                | FieldState::NotApplicable => return Err(HyperliquidAccountGatewayError::Account),
+            },
+            crate::HyperliquidOrderFamily::Conditional => None,
+        };
         facts.push(SignedAccountOrderFact {
             client_order_id,
             venue_order_id: Some(order.order_id.clone()),
@@ -961,6 +985,7 @@ fn signed_order_facts(
             state: Some(order.state),
             filled_quantity: Some(order.filled_quantity),
             limit_price: order.limit_price.map(|price| price.value()),
+            time_in_force,
             reduce_only: order.reduce_only,
             owner: None,
             external: true,
@@ -1010,6 +1035,7 @@ fn signed_twap_order_facts(
             // The TWAP parent has no resting limit. Its mark is only a checked valuation
             // input above and must never be published as an exchange limit order price.
             limit_price: None,
+            time_in_force: None,
             reduce_only: parent.reduce_only,
             owner: None,
             external: true,
@@ -1082,6 +1108,7 @@ fn normalize_limit_from_bbo(
     )
     .map_err(|_| AccountHostValidationError::Command)?;
     Ok(ExecutionCommand::PlaceLimit(OrderCommand {
+        time_in_force: Default::default(),
         command_id: intent.command_id.clone(),
         client_order_id: intent.client_order_id.clone(),
         owner: intent.owner.clone(),
@@ -1182,6 +1209,11 @@ fn hyperliquid_recovery_outcome(
         HyperliquidOrderStatus::Unknown { .. } => {
             AccountRecoveryOutcome::still_unknown(command.command_id().clone())
         }
+        status @ HyperliquidOrderStatus::Known { .. }
+            if !hyperliquid_recovery_policy_matches(command, &status) =>
+        {
+            AccountRecoveryOutcome::still_unknown(command.command_id().clone())
+        }
         HyperliquidOrderStatus::Known {
             order_id, state, ..
         } if matches!(command, ExecutionCommand::Cancel(_)) => match state {
@@ -1207,6 +1239,41 @@ fn hyperliquid_recovery_outcome(
         HyperliquidOrderStatus::Known { order_id, .. } => {
             AccountRecoveryOutcome::accepted(command.command_id().clone(), order_id.to_string())
         }
+    }
+}
+
+fn hyperliquid_recovery_status_outcome(
+    command: &ExecutionCommand,
+    status: Result<HyperliquidOrderStatus, HyperliquidAccountGatewayError>,
+) -> AccountRecoveryOutcome {
+    match status {
+        Ok(status) => hyperliquid_recovery_outcome(command, status),
+        Err(_) => AccountRecoveryOutcome::still_unknown(command.command_id().clone()),
+    }
+}
+
+fn hyperliquid_recovery_policy_matches(
+    command: &ExecutionCommand,
+    status: &HyperliquidOrderStatus,
+) -> bool {
+    match (command, status) {
+        (
+            ExecutionCommand::PlaceLimit(command),
+            HyperliquidOrderStatus::Known {
+                native_order_type,
+                time_in_force,
+                ..
+            },
+        ) => {
+            native_order_type == "Limit"
+                && matches!(
+                    (command.time_in_force, time_in_force.as_deref()),
+                    (LimitTimeInForce::PostOnly, Some("Alo"))
+                        | (LimitTimeInForce::Gtc, Some("Gtc"))
+                )
+        }
+        (ExecutionCommand::PlaceLimit(_), HyperliquidOrderStatus::Unknown { .. }) => false,
+        _ => true,
     }
 }
 
@@ -1525,6 +1592,56 @@ mod tests {
         );
         assert!(matches!(
             outcome.state(),
+            venue_execution::AccountRecoveryState::StillUnknown
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn limit_recovery_policy_mismatch_or_missing_stays_unknown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (meta, _) = market_facts()?;
+        let command = ExecutionCommand::PlaceLimit(OrderCommand {
+            time_in_force: LimitTimeInForce::Gtc,
+            command_id: CommandId::new("hyper_policy")?,
+            client_order_id: CommandId::new("hyper_policy_client")?,
+            owner: OrderOwner {
+                strategy_instance_id: "grid1".to_owned(),
+                run_id: "run1".to_owned(),
+                exchange: "hyperliquid".to_owned(),
+                account: "00000000-0000-4000-8000-000000000001".to_owned(),
+                symbol: "BTC/USDC".parse()?,
+                purpose: OrderPurpose::Entry,
+            },
+            side: OrderSide::Buy,
+            position_side: PositionSide::Long,
+            quantity: Decimal::new(4, 1),
+            limit_price: Price::new(Decimal::new(6_500_500, 3))?,
+            reduce_only: false,
+        });
+        let lookup = HyperliquidOrderLookup::client_order_id(command_cloid("hyper_policy_client"))?;
+        let payload = serde_json::json!({
+            "status":"order",
+            "order":{"order":{
+                "children":[], "coin":"BTC", "isPositionTpsl":false,
+                "isTrigger":false, "side":"B", "limitPx":"6500.5", "sz":"0.4",
+                "oid":77, "timestamp":1_700_000_000_001_u64, "reduceOnly":false,
+                "orderType":"Limit", "origSz":"0.4", "tif":"Alo",
+                "triggerCondition":"N/A", "triggerPx":"0.0",
+                "cloid":command_cloid("hyper_policy_client")
+            }, "status":"open", "statusTimestamp":1_700_000_000_002_u64}
+        });
+        let mismatched = parse_order_status(&serde_json::to_vec(&payload)?, &meta, &lookup)?;
+        assert!(matches!(
+            hyperliquid_recovery_outcome(&command, mismatched).state(),
+            venue_execution::AccountRecoveryState::StillUnknown
+        ));
+        assert!(matches!(
+            hyperliquid_recovery_status_outcome(
+                &command,
+                Err(HyperliquidAccountGatewayError::Readback)
+            )
+            .state(),
             venue_execution::AccountRecoveryState::StillUnknown
         ));
         Ok(())

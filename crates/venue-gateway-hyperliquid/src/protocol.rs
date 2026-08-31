@@ -7,8 +7,8 @@ use std::{
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use venue_domain::domain::{
-    AccountBalance, Asset, FieldState, Fill, MarketLevel, Order, OrderSide, OrderState, Position,
-    PositionSide, Price, Symbol, UnknownReason,
+    AccountBalance, Asset, FieldState, Fill, LimitTimeInForce, MarketLevel, Order, OrderSide,
+    OrderState, Position, PositionSide, Price, Symbol, UnknownReason,
 };
 use venue_gateway_api::GatewayMode;
 
@@ -1127,6 +1127,14 @@ fn normalize_open_order(
     };
     let client_order_id = row.cloid.map(canonical_cloid).transpose()?;
     let child_order_ids = row.children.iter().map(|child| child.oid).collect();
+    let time_in_force = match family {
+        HyperliquidOrderFamily::Regular => match row.tif.as_deref() {
+            Some("Alo") => FieldState::Known(LimitTimeInForce::PostOnly),
+            Some("Gtc") => FieldState::Known(LimitTimeInForce::Gtc),
+            _ => return Err(HyperliquidError::OrderFamily),
+        },
+        HyperliquidOrderFamily::Conditional => FieldState::NotApplicable,
+    };
     let order = Order {
         order_id: row.oid.to_string(),
         client_order_id: client_order_id
@@ -1148,6 +1156,7 @@ fn normalize_open_order(
         limit_price: Some(
             Price::new(decimal(&row.limit_px)?).map_err(|_| HyperliquidError::Payload)?,
         ),
+        time_in_force,
         average_price: FieldState::Unavailable {
             reason: UnknownReason::SourceOmitted,
         },

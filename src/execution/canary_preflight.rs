@@ -127,6 +127,7 @@ pub fn authorize_canary_preflight(
     };
     let quantity = minimum_compliant_quantity(input.instrument, input.reference_price)?;
     let order = OrderCommand {
+        time_in_force: Default::default(),
         command_id: crate::domain::CommandId::new("canary-preflight")
             .map_err(CanaryPreflightError::Command)?,
         client_order_id: crate::domain::CommandId::new("canary-preflight-client")

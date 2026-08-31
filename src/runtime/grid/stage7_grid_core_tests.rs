@@ -370,6 +370,7 @@ fn stage7_rejects_missing_signed_order_family_coverage() -> Result<(), Box<dyn s
 fn stage7_rejects_nonregular_rows_without_a_wal_owner() -> Result<(), Box<dyn std::error::Error>> {
     let mut readback = shadow_readback()?;
     let conditional = Order {
+        time_in_force: venue_domain::FieldState::Known(Default::default()),
         order_id: "conditional-7".to_owned(),
         client_order_id: FieldState::Known("external-conditional".to_owned()),
         symbol: "DOGE/USDT".parse()?,
@@ -470,6 +471,7 @@ fn resident_fill_hot_path_dispatches_while_risk_worker_is_blocked()
             original_venue_order_id = Some(venue_order_id.clone());
         }
         signed_orders.push(Order {
+            time_in_force: venue_domain::FieldState::Known(Default::default()),
             order_id: venue_order_id.clone(),
             client_order_id: FieldState::Known(venue_order_id.clone()),
             symbol: binding.symbol.clone(),
@@ -1091,6 +1093,7 @@ fn stage7_shadow_observes_predecessor_orders_without_adopting_or_mutating_them()
     let binding = gate_binding(&cfg)?;
     let mut readback = shadow_readback()?;
     readback.orders.push(Order {
+        time_in_force: venue_domain::FieldState::Known(Default::default()),
         order_id: "predecessor-order".to_owned(),
         client_order_id: FieldState::Known("legacy-owner-order".to_owned()),
         symbol: binding.symbol.clone(),

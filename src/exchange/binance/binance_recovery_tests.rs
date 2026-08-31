@@ -13,6 +13,7 @@ fn post_only_limit_parameters_keep_hedge_identity_without_reduce_only()
         (PositionSide::Short, "SHORT", OrderSide::Sell),
     ] {
         let command = OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("post_only_command")?,
             client_order_id: CommandId::new("venue_post_only_1")?,
             owner: OrderOwner {
@@ -46,6 +47,7 @@ fn post_only_limit_parameters_keep_hedge_identity_without_reduce_only()
 fn recovery_reduce_parameters_are_ioc_and_keep_explicit_hedge_reduction()
 -> Result<(), Box<dyn std::error::Error>> {
     let command = OrderCommand {
+        time_in_force: Default::default(),
         command_id: CommandId::new("recovery_reduce_1")?,
         client_order_id: CommandId::new("vrr_1")?,
         owner: OrderOwner {

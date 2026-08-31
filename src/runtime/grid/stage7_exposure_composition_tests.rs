@@ -935,6 +935,7 @@ fn terminal_reduction_order(
     client_order_id: &str,
 ) -> Result<Order, Box<dyn std::error::Error>> {
     Ok(Order {
+        time_in_force: venue_domain::FieldState::Known(Default::default()),
         order_id: "venue-risk-reduce-1".to_owned(),
         client_order_id: FieldState::Known(client_order_id.to_owned()),
         symbol: command.owner.symbol.clone(),

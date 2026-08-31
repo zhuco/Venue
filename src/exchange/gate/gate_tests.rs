@@ -735,6 +735,7 @@ fn numeric_zero_price_is_unavailable_instead_of_a_parse_failure() -> Result<(), 
 fn gate_reduce_only_side_maps_to_the_existing_hedge_leg() -> Result<(), GateError> {
     let rules = rules()?;
     let command = OrderCommand {
+        time_in_force: Default::default(),
         command_id: CommandId::new("grid_reduce_command").map_err(|_| GateError::Command)?,
         client_order_id: CommandId::new("hgo_e1_long_close_l1").map_err(|_| GateError::Command)?,
         owner: OrderOwner {

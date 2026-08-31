@@ -807,7 +807,7 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
             .gateway
             .normalize_limit_intent(intent)
             .map_err(AccountHostError::Validation)?;
-        if !matches!(command, ExecutionCommand::PlaceLimit(_))
+        if !matches!(&command, ExecutionCommand::PlaceLimit(place) if place.time_in_force.is_post_only())
             || command.command_id() != &intent.command_id
             || command.native_client_id() != Some(&intent.client_order_id)
         {
@@ -1730,6 +1730,7 @@ fn command_matches_signed_order(command: &ExecutionCommand, fact: &SignedAccount
                 && order.position_side == fact.position_side
                 && order.quantity == fact.quantity
                 && Some(order.limit_price.value()) == fact.limit_price
+                && Some(order.time_in_force) == fact.time_in_force
                 && order.reduce_only == fact.reduce_only
         }
         ExecutionCommand::PlaceMarket(order) => {

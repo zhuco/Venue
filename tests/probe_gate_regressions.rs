@@ -31,6 +31,7 @@ fn binding() -> Result<CanaryEvidenceBinding, Box<dyn std::error::Error>> {
 
 fn command() -> Result<OrderCommand, Box<dyn std::error::Error>> {
     Ok(OrderCommand {
+        time_in_force: Default::default(),
         command_id: CommandId::new("sol_probe_place_1")?,
         client_order_id: CommandId::new("sol_probe_client_1")?,
         owner: OrderOwner {

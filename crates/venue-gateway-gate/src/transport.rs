@@ -1181,6 +1181,7 @@ mod tests {
             decimal_contracts: false,
         };
         let command = OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("command")?,
             client_order_id: CommandId::new("grid_long_1")?,
             owner: OrderOwner {
@@ -1302,7 +1303,7 @@ mod tests {
     }
 
     fn ack() -> &'static str {
-        r#"{"id":"9001","contract":"DOGE_USDT","size":"10","left":"10","is_reduce_only":false,"status":"open","finish_as":"","price":"0.1","fill_price":"0","text":"t-grid_long_1"}"#
+        r#"{"id":"9001","contract":"DOGE_USDT","size":"10","left":"10","is_reduce_only":false,"tif":"poc","status":"open","finish_as":"","price":"0.1","fill_price":"0","text":"t-grid_long_1"}"#
     }
 
     #[test]
@@ -1323,7 +1324,7 @@ mod tests {
     async fn signed_test_http_never_changes_mode_and_ack_returns_exact_readback()
     -> Result<(), TestError> {
         let (binding, credentials, rules, command) = facts()?;
-        let request = crate::prepare_limit_post_only(&binding, &rules, &command)?;
+        let request = crate::prepare_limit(&binding, &rules, &command)?;
         let expected_body = std::str::from_utf8(request.body())?.to_owned();
         let (endpoint, server) = http_mock(Some(response(ack())), Duration::ZERO).await?;
         let limits = GateTransportLimits::new(Duration::from_secs(2), 16 * 1024)?;
@@ -1356,7 +1357,7 @@ mod tests {
                 &binding,
                 &credentials,
                 &rules,
-                crate::prepare_limit_post_only(&binding, &rules, &command)?,
+                crate::prepare_limit(&binding, &rules, &command)?,
                 1_700_000_000_000,
             )
             .await?;
@@ -1380,7 +1381,7 @@ mod tests {
                 &binding,
                 &credentials,
                 &rules,
-                crate::prepare_limit_post_only(&binding, &rules, &command)?,
+                crate::prepare_limit(&binding, &rules, &command)?,
                 1_700_000_000_000,
             )
             .await?;

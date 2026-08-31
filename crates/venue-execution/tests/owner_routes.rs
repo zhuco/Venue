@@ -36,6 +36,7 @@ fn place(
     instance: &str,
 ) -> Result<ExecutionCommand, Box<dyn std::error::Error>> {
     Ok(ExecutionCommand::PlaceLimit(OrderCommand {
+        time_in_force: Default::default(),
         command_id: CommandId::new(command_id)?,
         client_order_id: CommandId::new(client_id)?,
         owner: owner(instance)?,

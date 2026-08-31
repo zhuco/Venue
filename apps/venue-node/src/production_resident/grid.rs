@@ -112,6 +112,7 @@ impl GridBridgeState {
                         }
                     && actual.quantity == desired.quantity
                     && actual.limit_price == Some(desired.price.value())
+                    && actual.time_in_force == Some(venue_domain::LimitTimeInForce::PostOnly)
                     && actual.reduce_only == desired.reduce_only
                     && matches!(
                         actual.state,
@@ -300,6 +301,7 @@ impl GridBridgeState {
             self.reserve_client_route(order.key.clone(), client.clone())?;
             let command_id = stable_identifier(b"place", &self.grid.binding, &order.key)?;
             commands.push(ExecutionCommand::PlaceLimit(OrderCommand {
+                time_in_force: Default::default(),
                 command_id: command_id.clone(),
                 client_order_id: client.clone(),
                 owner: owner_for_order(&self.grid, order),
@@ -350,6 +352,7 @@ impl GridBridgeState {
             self.reserve_client_route(order.key.clone(), client.clone())?;
             let command_id = stable_identifier(b"place", &self.grid.binding, &order.key)?;
             commands.push(ExecutionCommand::PlaceLimit(OrderCommand {
+                time_in_force: Default::default(),
                 command_id: command_id.clone(),
                 client_order_id: client.clone(),
                 owner: owner_for_order(&self.grid, &order),

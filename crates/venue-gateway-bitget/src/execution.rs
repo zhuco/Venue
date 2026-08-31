@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use venue_domain::domain::{
-    FieldState, Order, OrderSide, OrderState, Position, PositionSide, Price,
+    FieldState, LimitTimeInForce, Order, OrderSide, OrderState, Position, PositionSide, Price,
 };
 use venue_gateway_api::GatewayBinding;
 
@@ -29,6 +29,13 @@ impl BitgetTimeInForce {
             Self::ImmediateOrCancel => "ioc",
             Self::FillOrKill => "fok",
             Self::PostOnly => "post_only",
+        }
+    }
+
+    pub const fn from_limit_time_in_force(value: LimitTimeInForce) -> Self {
+        match value {
+            LimitTimeInForce::PostOnly => Self::PostOnly,
+            LimitTimeInForce::Gtc => Self::GoodTillCancelled,
         }
     }
 }
@@ -75,6 +82,7 @@ pub struct BitgetPreparedMutation {
     pub(crate) body: Vec<u8>,
     pub(crate) expected_order_id: Option<String>,
     pub(crate) expected_client_order_id: Option<String>,
+    pub(crate) expected_time_in_force: Option<BitgetTimeInForce>,
 }
 
 impl BitgetPreparedMutation {
@@ -145,6 +153,7 @@ pub fn prepare_place_request(
         rules.snapshot.metadata.instrument.generation,
         BitgetMutationKind::Place,
         &intent.client_order_id,
+        Some(intent.time_in_force),
         body,
     )
 }
@@ -189,6 +198,7 @@ pub fn prepare_reduce_once_request(
         rules.snapshot.metadata.instrument.generation,
         BitgetMutationKind::ReduceOnce,
         &intent.client_order_id,
+        None,
         body,
     )
 }
@@ -227,6 +237,7 @@ pub fn prepare_cancel_request(
         body,
         expected_order_id: intent.order_id.clone(),
         expected_client_order_id: intent.client_order_id.clone(),
+        expected_time_in_force: None,
     })
 }
 
@@ -236,6 +247,7 @@ fn prepared_place(
     generation: u64,
     kind: BitgetMutationKind,
     client_order_id: &str,
+    expected_time_in_force: Option<BitgetTimeInForce>,
     body: PlaceWire<'_>,
 ) -> Result<BitgetPreparedMutation, BitgetExecutionError> {
     Ok(BitgetPreparedMutation {
@@ -247,6 +259,7 @@ fn prepared_place(
         body: serde_json::to_vec(&body).map_err(|_| BitgetExecutionError::Payload)?,
         expected_order_id: None,
         expected_client_order_id: Some(client_order_id.to_owned()),
+        expected_time_in_force,
     })
 }
 
@@ -289,6 +302,7 @@ pub struct BitgetMutationAck {
     pub status: BitgetAckStatus,
     pub payload_sha256: String,
     pub raw_payload: Vec<u8>,
+    pub expected_time_in_force: Option<BitgetTimeInForce>,
 }
 
 pub fn parse_mutation_ack(
@@ -336,6 +350,7 @@ pub fn parse_mutation_ack(
         status: BitgetAckStatus::AcceptedOnly,
         payload_sha256: payload_digest(payload),
         raw_payload: payload.to_vec(),
+        expected_time_in_force: request.expected_time_in_force,
     })
 }
 
@@ -356,6 +371,7 @@ pub struct BitgetUnknownMutation {
     pub client_order_id: Option<String>,
     pub dispatched_at_ms: u64,
     pub reason: BitgetUnknownReason,
+    pub expected_time_in_force: Option<BitgetTimeInForce>,
 }
 
 pub(crate) fn into_unknown(
@@ -372,6 +388,7 @@ pub(crate) fn into_unknown(
         client_order_id: request.expected_client_order_id,
         dispatched_at_ms,
         reason,
+        expected_time_in_force: request.expected_time_in_force,
     }
 }
 
@@ -396,6 +413,7 @@ pub struct BitgetExactReadbackRequest {
     pub lookup: BitgetOrderLookup,
     pub not_before_ms: u64,
     pub expected_kind: BitgetMutationKind,
+    pub expected_time_in_force: Option<BitgetTimeInForce>,
     pub(crate) query: String,
 }
 
@@ -409,6 +427,7 @@ pub fn build_ack_readback_request(
         BitgetOrderLookup::OrderId(ack.order_id.clone()),
         ack.received_at_ms,
         ack.kind,
+        ack.expected_time_in_force,
     )
 }
 
@@ -440,6 +459,7 @@ pub fn build_unknown_recovery_readback_request(
         lookup,
         unknown.dispatched_at_ms,
         unknown.kind,
+        unknown.expected_time_in_force,
     )
 }
 
@@ -450,6 +470,7 @@ fn build_readback(
     lookup: BitgetOrderLookup,
     not_before_ms: u64,
     expected_kind: BitgetMutationKind,
+    expected_time_in_force: Option<BitgetTimeInForce>,
 ) -> Result<BitgetExactReadbackRequest, BitgetExecutionError> {
     if attempt_id == 0 || generation == 0 || not_before_ms == 0 {
         return Err(BitgetExecutionError::Binding);
@@ -471,6 +492,7 @@ fn build_readback(
         lookup,
         not_before_ms,
         expected_kind,
+        expected_time_in_force,
         query,
     })
 }
@@ -481,6 +503,7 @@ pub struct BitgetExactOrderReadback {
     pub requested_at_ms: u64,
     pub received_at_ms: u64,
     pub order: Option<Order>,
+    pub actual_time_in_force: Option<BitgetTimeInForce>,
     pub payload_sha256: String,
     pub raw_payload: Vec<u8>,
 }
@@ -502,11 +525,14 @@ pub fn parse_exact_order_readback(
     if object.get("code").and_then(Value::as_str) != Some("00000") {
         return Err(BitgetExecutionError::VenueRejected);
     }
-    let order = match object.get("data") {
-        None | Some(Value::Null) => None,
-        Some(value) => Some(
-            parse_regular_order(value, &request.binding.symbol)
-                .map_err(|_| BitgetExecutionError::Payload)?,
+    let (order, actual_time_in_force) = match object.get("data") {
+        None | Some(Value::Null) => (None, None),
+        Some(value) => (
+            Some(
+                parse_regular_order(value, &request.binding.symbol)
+                    .map_err(|_| BitgetExecutionError::Payload)?,
+            ),
+            native_time_in_force(value)?,
         ),
     };
     if order
@@ -520,9 +546,24 @@ pub fn parse_exact_order_readback(
         requested_at_ms,
         received_at_ms,
         order,
+        actual_time_in_force,
         payload_sha256: payload_digest(&payload),
         raw_payload: payload,
     })
+}
+
+fn native_time_in_force(value: &Value) -> Result<Option<BitgetTimeInForce>, BitgetExecutionError> {
+    match value.get("timeInForce") {
+        Some(Value::String(value)) => match value.as_str() {
+            "post_only" => Ok(Some(BitgetTimeInForce::PostOnly)),
+            "gtc" => Ok(Some(BitgetTimeInForce::GoodTillCancelled)),
+            "ioc" => Ok(Some(BitgetTimeInForce::ImmediateOrCancel)),
+            "fok" => Ok(Some(BitgetTimeInForce::FillOrKill)),
+            _ => Err(BitgetExecutionError::Payload),
+        },
+        None | Some(Value::Null) => Ok(None),
+        Some(_) => Err(BitgetExecutionError::Payload),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -547,6 +588,7 @@ pub fn settle_ack_readback(
         || ack.generation != readback.request.generation
         || ack.kind != readback.request.expected_kind
         || readback.request.not_before_ms != ack.received_at_ms
+        || readback.request.expected_time_in_force != ack.expected_time_in_force
         || readback
             .order
             .as_ref()
@@ -557,6 +599,17 @@ pub fn settle_ack_readback(
     let Some(order) = readback.order.clone() else {
         return Err(BitgetExecutionError::Unsettled);
     };
+    if ack.kind == BitgetMutationKind::Place
+        && !matches!(
+            (
+                readback.request.expected_time_in_force,
+                readback.actual_time_in_force,
+            ),
+            (Some(expected), Some(actual)) if expected == actual
+        )
+    {
+        return Err(BitgetExecutionError::Readback);
+    }
     let terminal = matches!(
         order.state,
         OrderState::Filled | OrderState::Cancelled | OrderState::Expired | OrderState::Rejected
@@ -583,6 +636,7 @@ pub fn settle_unknown_readback(
         || readback.request.generation < unknown.generation
         || unknown.kind != readback.request.expected_kind
         || readback.request.not_before_ms != unknown.dispatched_at_ms
+        || readback.request.expected_time_in_force != unknown.expected_time_in_force
     {
         return Err(BitgetExecutionError::Readback);
     }
@@ -592,6 +646,17 @@ pub fn settle_unknown_readback(
             finality: BitgetReadbackFinality::AbsentAtReadback,
         });
     };
+    if unknown.kind == BitgetMutationKind::Place
+        && !matches!(
+            (
+                readback.request.expected_time_in_force,
+                readback.actual_time_in_force,
+            ),
+            (Some(expected), Some(actual)) if expected == actual
+        )
+    {
+        return Err(BitgetExecutionError::Readback);
+    }
     let finality = if matches!(
         order.state,
         OrderState::Filled | OrderState::Cancelled | OrderState::Expired | OrderState::Rejected
@@ -925,6 +990,145 @@ mod tests {
     }
 
     #[test]
+    fn gtc_wire_and_readback_policy_must_match() -> Result<(), Box<dyn std::error::Error>> {
+        let live = binding(GatewayMode::Live)?;
+        let config = BitgetConfig::for_mode(GatewayMode::Live);
+        let rules = rules(GatewayMode::Live)?;
+        let request = prepare_place_request(
+            &live,
+            &config,
+            &rules,
+            9,
+            &BitgetPlaceIntent {
+                client_order_id: "venue_gtc".to_owned(),
+                side: OrderSide::Buy,
+                position_side: PositionSide::Long,
+                quantity: Decimal::new(1, 3),
+                limit_price: Price::new(Decimal::from(50_000))?,
+                time_in_force: BitgetTimeInForce::GoodTillCancelled,
+                reduce_only: false,
+            },
+            60,
+        )?;
+        let wire: Value = serde_json::from_slice(&request.body)?;
+        assert_eq!(wire["timeInForce"], "gtc");
+        let ack_payload = json!({
+            "code":"00000", "requestTime":100,
+            "data":{"orderId":"123", "clientOid":"venue_gtc"}
+        })
+        .to_string();
+        let ack = parse_mutation_ack(&config, &request, ack_payload.as_bytes(), 101)?;
+        let detail = |time_in_force: Option<&str>| {
+            let mut order = json!({
+                "orderId":"123", "clientOid":"venue_gtc", "category":"USDT-FUTURES",
+                "symbol":"BTCUSDT", "orderStatus":"live", "side":"buy",
+                "posSide":"long", "holdMode":"hedge_mode", "tradeSide":"open_long",
+                "qty":"0.001", "cumExecQty":"0", "price":"50000", "avgPrice":"0",
+                "delegateType":"normal"
+            });
+            if let Some(value) = time_in_force {
+                order["timeInForce"] = Value::String(value.to_owned());
+            }
+            json!({"code":"00000", "data":order})
+                .to_string()
+                .into_bytes()
+        };
+        let matching = parse_exact_order_readback(
+            &config,
+            build_ack_readback_request(&ack)?,
+            102,
+            103,
+            detail(Some("gtc")),
+        )?;
+        assert!(settle_ack_readback(&ack, &matching).is_ok());
+        for value in [Some("post_only"), None] {
+            let readback = parse_exact_order_readback(
+                &config,
+                build_ack_readback_request(&ack)?,
+                102,
+                103,
+                detail(value),
+            )?;
+            assert_eq!(
+                settle_ack_readback(&ack, &readback),
+                Err(BitgetExecutionError::Readback)
+            );
+        }
+        let mut ack_without_policy = ack.clone();
+        ack_without_policy.expected_time_in_force = None;
+        let readback = parse_exact_order_readback(
+            &config,
+            build_ack_readback_request(&ack_without_policy)?,
+            102,
+            103,
+            detail(None),
+        )?;
+        assert_eq!(
+            settle_ack_readback(&ack_without_policy, &readback),
+            Err(BitgetExecutionError::Readback)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_ioc_and_fok_remain_exact_readback_policies() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let live = binding(GatewayMode::Live)?;
+        let config = BitgetConfig::for_mode(GatewayMode::Live);
+        let rules = rules(GatewayMode::Live)?;
+        for (time_in_force, wire_time_in_force) in [
+            (BitgetTimeInForce::ImmediateOrCancel, "ioc"),
+            (BitgetTimeInForce::FillOrKill, "fok"),
+        ] {
+            let request = prepare_place_request(
+                &live,
+                &config,
+                &rules,
+                9,
+                &BitgetPlaceIntent {
+                    client_order_id: "venue_native_tif".to_owned(),
+                    side: OrderSide::Buy,
+                    position_side: PositionSide::Long,
+                    quantity: Decimal::new(1, 3),
+                    limit_price: Price::new(Decimal::from(50_000))?,
+                    time_in_force,
+                    reduce_only: false,
+                },
+                60,
+            )?;
+            let wire: Value = serde_json::from_slice(&request.body)?;
+            assert_eq!(wire["timeInForce"], wire_time_in_force);
+            let ack_payload = json!({
+                "code":"00000", "requestTime":100,
+                "data":{"orderId":"123", "clientOid":"venue_native_tif"}
+            })
+            .to_string();
+            let ack = parse_mutation_ack(&config, &request, ack_payload.as_bytes(), 101)?;
+            let detail = json!({
+                "code":"00000", "data":{
+                    "orderId":"123", "clientOid":"venue_native_tif", "category":"USDT-FUTURES",
+                    "symbol":"BTCUSDT", "orderStatus":"live", "side":"buy",
+                    "posSide":"long", "holdMode":"hedge_mode", "tradeSide":"open_long",
+                    "qty":"0.001", "cumExecQty":"0", "price":"50000", "avgPrice":"0",
+                    "delegateType":"normal", "timeInForce":wire_time_in_force
+                }
+            })
+            .to_string()
+            .into_bytes();
+            let readback = parse_exact_order_readback(
+                &config,
+                build_ack_readback_request(&ack)?,
+                102,
+                103,
+                detail,
+            )?;
+            assert_eq!(readback.actual_time_in_force, Some(time_in_force));
+            assert!(settle_ack_readback(&ack, &readback).is_ok());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn cancel_identity_is_exact_and_mode_bound() -> Result<(), Box<dyn std::error::Error>> {
         let live = binding(GatewayMode::Live)?;
         let request = prepare_cancel_request(
@@ -1021,6 +1225,7 @@ mod tests {
             client_order_id: Some("venue_1".to_owned()),
             dispatched_at_ms: 100,
             reason: BitgetUnknownReason::Timeout,
+            expected_time_in_force: Some(BitgetTimeInForce::PostOnly),
         };
         let config = BitgetConfig::for_mode(GatewayMode::Live);
         let readback = parse_exact_order_readback(
@@ -1033,6 +1238,47 @@ mod tests {
         assert_eq!(
             settle_unknown_readback(&unknown, &readback)?.finality,
             BitgetReadbackFinality::AbsentAtReadback
+        );
+        let detail = |time_in_force: Option<&str>| {
+            let mut order = json!({
+                "orderId":"123", "clientOid":"venue_1", "category":"USDT-FUTURES",
+                "symbol":"BTCUSDT", "orderStatus":"live", "side":"buy",
+                "posSide":"long", "holdMode":"hedge_mode", "tradeSide":"open_long",
+                "qty":"0.001", "cumExecQty":"0", "price":"50000", "avgPrice":"0",
+                "delegateType":"normal"
+            });
+            if let Some(value) = time_in_force {
+                order["timeInForce"] = Value::String(value.to_owned());
+            }
+            json!({"code":"00000", "data":order})
+                .to_string()
+                .into_bytes()
+        };
+        for value in [Some("gtc"), None] {
+            let readback = parse_exact_order_readback(
+                &config,
+                build_unknown_readback_request(&unknown)?,
+                101,
+                102,
+                detail(value),
+            )?;
+            assert_eq!(
+                settle_unknown_readback(&unknown, &readback),
+                Err(BitgetExecutionError::Readback)
+            );
+        }
+        let mut unknown_without_policy = unknown.clone();
+        unknown_without_policy.expected_time_in_force = None;
+        let readback = parse_exact_order_readback(
+            &config,
+            build_unknown_readback_request(&unknown_without_policy)?,
+            101,
+            102,
+            detail(None),
+        )?;
+        assert_eq!(
+            settle_unknown_readback(&unknown_without_policy, &readback),
+            Err(BitgetExecutionError::Readback)
         );
 
         let recovered = build_unknown_recovery_readback_request(&unknown, 8)?;

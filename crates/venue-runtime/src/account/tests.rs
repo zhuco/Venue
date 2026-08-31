@@ -59,6 +59,7 @@ fn open_order(
     client_order_id: &str,
 ) -> Result<Order, Box<dyn Error>> {
     Ok(Order {
+        time_in_force: venue_domain::FieldState::Known(Default::default()),
         order_id: venue_order_id.to_owned(),
         client_order_id: FieldState::Known(client_order_id.to_owned()),
         symbol: binding.key.symbol.clone(),
@@ -166,6 +167,7 @@ fn place_intent(
     priority: AccountLanePriority,
 ) -> Result<AccountExecutionIntent, Box<dyn Error>> {
     let command = ExecutionCommand::PlaceLimit(OrderCommand {
+        time_in_force: Default::default(),
         command_id: CommandId::new(format!("cmd_{suffix}"))?,
         client_order_id: CommandId::new(format!("client_{suffix}"))?,
         owner: owner(binding, OrderPurpose::Entry),
@@ -345,6 +347,7 @@ fn set_desired(
                 Some(desired_price),
                 false,
                 None,
+                Some(venue_domain::LimitTimeInForce::PostOnly),
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -667,6 +670,7 @@ fn execution_reserves_create_identity_and_cancel_requires_exact_owner_family()
         .latest_applied_turn_receipt(&grid.key)
         .ok_or("applied actor turn missing")?;
     let reused_native_id = ExecutionCommand::PlaceLimit(OrderCommand {
+        time_in_force: Default::default(),
         command_id: CommandId::new("cmd_reuse_native")?,
         client_order_id: CommandId::new("cancel_target")?,
         owner: owner(&grid, OrderPurpose::Entry),

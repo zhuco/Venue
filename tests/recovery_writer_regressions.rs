@@ -190,6 +190,7 @@ fn proof() -> RecoveryObservationProof {
 
 fn entry_command() -> Result<OrderCommand, Box<dyn std::error::Error>> {
     Ok(OrderCommand {
+        time_in_force: Default::default(),
         command_id: CommandId::new("entry_1")?,
         client_order_id: CommandId::new("client_1")?,
         owner: OrderOwner {

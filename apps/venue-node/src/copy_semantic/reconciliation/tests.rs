@@ -42,6 +42,7 @@ fn snapshot(
     )?;
     let orders = if open {
         vec![SignedAccountOrderFact {
+            time_in_force: Some(row.time_in_force),
             client_order_id: row.client_order_id.as_str().to_owned(),
             venue_order_id: Some("actual-native-1".to_owned()),
             symbol: row.owner.symbol.clone(),
@@ -162,5 +163,20 @@ fn client_and_venue_id_must_resolve_to_the_same_open_order()
     let (command, _) = fixture()?;
     let page = snapshot(&command, Vec::new(), true)?;
     assert!(execution_facts(&command, "conflicting-native-id", &page, &[], 100, 160).is_err());
+    Ok(())
+}
+
+#[test]
+fn matching_copy_identity_does_not_hide_a_different_limit_policy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut command, _) = fixture()?;
+    let page = snapshot(&command, Vec::new(), true)?;
+    let ExecutionCommand::PlaceLimit(place) = &mut command else {
+        return Err("limit required".into());
+    };
+    place.time_in_force = venue_domain::LimitTimeInForce::Gtc;
+    assert!(execution_facts(&command, "actual-native-1", &page, &[], 100, 160).is_err());
+    let matching = snapshot(&command, Vec::new(), true)?;
+    assert!(execution_facts(&command, "actual-native-1", &matching, &[], 100, 160)?.open);
     Ok(())
 }

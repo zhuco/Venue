@@ -300,6 +300,7 @@ pub struct DesiredOrder {
     limit_price: Option<Price>,
     reduce_only: bool,
     semantic_fingerprint: Option<OrderFamilySemanticFingerprint>,
+    time_in_force: Option<venue_domain::LimitTimeInForce>,
 }
 
 impl DesiredOrder {
@@ -319,10 +320,12 @@ impl DesiredOrder {
         limit_price: Option<Price>,
         reduce_only: bool,
         semantic_fingerprint: Option<OrderFamilySemanticFingerprint>,
+        time_in_force: Option<venue_domain::LimitTimeInForce>,
     ) -> Result<Self, AccountReconcilerError> {
         let client_order_id = client_order_id.into();
         if client_order_id.trim().is_empty()
             || !side_matches_purpose(family, purpose, position_side, side, reduce_only)
+            || (family == NativeOrderFamily::UmOrder) != time_in_force.is_some()
             || !desired_family_semantics_valid(
                 family,
                 purpose,
@@ -344,6 +347,7 @@ impl DesiredOrder {
             limit_price,
             reduce_only,
             semantic_fingerprint,
+            time_in_force,
         })
     }
 
@@ -366,6 +370,9 @@ impl DesiredOrder {
                 NativeOrderFamily::UmOrder => {
                     self.quantity == Some(order.quantity)
                         && order.limit_price == self.limit_price
+                        && self
+                            .time_in_force
+                            .is_some_and(|policy| order.time_in_force == FieldState::Known(policy))
                         && self.semantic_fingerprint.is_none()
                         && semantic_fingerprint.is_none()
                 }
@@ -837,6 +844,7 @@ fn signed_order_semantics_valid(family: NativeOrderFamily, order: &Order) -> boo
         NativeOrderFamily::UmOrder => {
             order.validate().is_ok()
                 && order.limit_price.is_some()
+                && matches!(order.time_in_force, FieldState::Known(_))
                 && !matches!(purpose, OrderPurpose::ExposureTakeProfit)
         }
         NativeOrderFamily::UmConditional => {
@@ -1019,6 +1027,11 @@ mod tests {
             NativeOrderFamily::UmAlgo => (Decimal::ONE, None, true),
         };
         Ok(Order {
+            time_in_force: if family == NativeOrderFamily::UmOrder {
+                FieldState::Known(venue_domain::LimitTimeInForce::PostOnly)
+            } else {
+                FieldState::NotApplicable
+            },
             order_id: order_id.to_owned(),
             client_order_id: FieldState::Known(format!("client_{order_id}")),
             symbol: "BTC/USDT".parse()?,
@@ -1264,6 +1277,7 @@ mod tests {
             Some(Price::new(Decimal::new(100, 0))?),
             false,
             None,
+            Some(venue_domain::LimitTimeInForce::PostOnly),
         )?;
         let closing_net = DesiredOrder::verified(
             NativeOrderFamily::UmOrder,
@@ -1275,6 +1289,7 @@ mod tests {
             Some(Price::new(Decimal::new(99, 0))?),
             true,
             None,
+            Some(venue_domain::LimitTimeInForce::PostOnly),
         )?;
         assert_eq!(
             DesiredOrder::verified(
@@ -1287,6 +1302,7 @@ mod tests {
                 Some(Price::new(Decimal::new(99, 0))?),
                 false,
                 None,
+                Some(venue_domain::LimitTimeInForce::PostOnly),
             ),
             Err(AccountReconcilerError::DesiredSemantics)
         );
@@ -1411,6 +1427,7 @@ mod tests {
                 Some(price),
                 false,
                 None,
+                Some(venue_domain::LimitTimeInForce::PostOnly),
             )
             .is_ok()
         );
@@ -1425,6 +1442,7 @@ mod tests {
                 Some(price),
                 false,
                 None,
+                Some(venue_domain::LimitTimeInForce::PostOnly),
             ),
             Err(AccountReconcilerError::DesiredSemantics)
         );
@@ -1438,6 +1456,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
                 None,
             ),
             Err(AccountReconcilerError::DesiredSemantics)
@@ -1453,6 +1472,7 @@ mod tests {
                 None,
                 false,
                 Some(semantic_fingerprint(NativeOrderFamily::UmConditional, 'c')?),
+                None,
             )
             .is_ok()
         );
@@ -1467,6 +1487,7 @@ mod tests {
                 None,
                 true,
                 Some(semantic_fingerprint(NativeOrderFamily::UmAlgo, 'd')?),
+                None,
             )
             .is_ok()
         );
@@ -1481,8 +1502,63 @@ mod tests {
                 None,
                 false,
                 Some(semantic_fingerprint(NativeOrderFamily::UmAlgo, 'e')?),
+                None,
             ),
             Err(AccountReconcilerError::DesiredSemantics)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn limit_policy_must_be_known_and_match_durable_desired_order() -> Result<(), Box<dyn Error>> {
+        use venue_domain::LimitTimeInForce;
+        let family = NativeOrderFamily::UmOrder;
+        let mut actual = signed_order(
+            family,
+            "policy-1",
+            OrderPurpose::Entry,
+            PositionSide::Long,
+            OrderSide::Buy,
+        )?;
+        let desired = DesiredOrder::verified(
+            family,
+            "client_policy-1",
+            OrderPurpose::Entry,
+            OrderSide::Buy,
+            PositionSide::Long,
+            Some(actual.quantity),
+            actual.limit_price,
+            false,
+            None,
+            Some(LimitTimeInForce::Gtc),
+        )?;
+        assert!(!desired.matches(family, &actual, None));
+        actual.time_in_force = FieldState::Known(LimitTimeInForce::Gtc);
+        assert!(desired.matches(family, &actual, None));
+        assert!(signed_order_semantics_valid(family, &actual));
+        actual.time_in_force = FieldState::Missing;
+        assert!(!desired.matches(family, &actual, None));
+        assert!(!signed_order_semantics_valid(family, &actual));
+        let legacy = serde_json::to_value(&actual)?;
+        assert!(legacy.get("time_in_force").is_none());
+        let recovered: Order = serde_json::from_value(legacy.clone())?;
+        assert_eq!(recovered.time_in_force, FieldState::Missing);
+        assert_eq!(serde_json::to_value(&recovered)?, legacy);
+        assert!(!desired.matches(family, &recovered, None));
+        assert!(
+            DesiredOrder::verified(
+                family,
+                "missing",
+                OrderPurpose::Entry,
+                OrderSide::Buy,
+                PositionSide::Long,
+                Some(actual.quantity),
+                actual.limit_price,
+                false,
+                None,
+                None
+            )
+            .is_err()
         );
         Ok(())
     }

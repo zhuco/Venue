@@ -857,6 +857,7 @@ mod tests {
         quantity: Decimal,
     ) -> Result<(OrderCommand, Order), Box<dyn std::error::Error>> {
         let command = OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new(format!("{name}_cmd"))?,
             client_order_id: CommandId::new(format!("{name}_client"))?,
             owner: OrderOwner {
@@ -874,6 +875,7 @@ mod tests {
             reduce_only: false,
         };
         let order = Order {
+            time_in_force: venue_domain::FieldState::Known(Default::default()),
             order_id: format!("{name}_venue"),
             client_order_id: FieldState::Known(command.client_order_id.as_str().to_owned()),
             symbol: binding.symbol.clone(),
@@ -960,6 +962,7 @@ mod tests {
         let temporary = tempfile::tempdir()?;
         let binding = binding()?;
         let opening = OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("opening_cmd")?,
             client_order_id: CommandId::new("opening_client")?,
             owner: OrderOwner {
@@ -995,6 +998,7 @@ mod tests {
         let temporary = tempfile::tempdir()?;
         let binding = binding()?;
         let opening = OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("submitted_opening_cmd")?,
             client_order_id: CommandId::new("submitted_opening_client")?,
             owner: OrderOwner {
@@ -1034,6 +1038,7 @@ mod tests {
         let temporary = tempfile::tempdir()?;
         let binding = binding()?;
         let command = OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new(format!("hgf_r_{}", "b".repeat(24)))?,
             client_order_id: CommandId::new(format!("hgf_m_{}", "a".repeat(24)))?,
             owner: OrderOwner {
@@ -1163,6 +1168,7 @@ mod tests {
         let temporary = tempfile::tempdir()?;
         let binding = binding()?;
         let command = OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("ordinary_unknown_command")?,
             client_order_id: CommandId::new("ordinary_unknown_client")?,
             owner: OrderOwner {
@@ -1268,6 +1274,7 @@ mod tests {
             hedge_position: true,
             positions: Vec::new(),
             orders: vec![Order {
+                time_in_force: venue_domain::FieldState::Known(Default::default()),
                 order_id: "foreign".to_owned(),
                 client_order_id: FieldState::Missing,
                 symbol: binding.symbol.clone(),

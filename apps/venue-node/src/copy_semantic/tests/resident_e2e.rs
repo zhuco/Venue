@@ -62,6 +62,7 @@ impl AccountPhysicalGateway for Gateway {
         intent: &AccountLimitNormalizationIntent,
     ) -> Result<ExecutionCommand, AccountHostValidationError> {
         Ok(ExecutionCommand::PlaceLimit(OrderCommand {
+            time_in_force: Default::default(),
             command_id: intent.command_id.clone(),
             client_order_id: intent.client_order_id.clone(),
             owner: intent.owner.clone(),
@@ -94,6 +95,7 @@ impl AccountPhysicalGateway for Gateway {
         if let Some(ExecutionCommand::PlaceLimit(command)) = &state.command {
             if state.open {
                 orders.push(SignedAccountOrderFact {
+                    time_in_force: Some(Default::default()),
                     client_order_id: command.client_order_id.as_str().to_owned(),
                     venue_order_id: Some("native-copy".to_owned()),
                     symbol: self.binding.symbol.clone(),

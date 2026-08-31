@@ -1,5 +1,21 @@
 use super::*;
 
+pub(super) fn readback_policy_matches_command(
+    command: &ExecutionCommand,
+    order: &venue_domain::domain::Order,
+) -> bool {
+    match command {
+        ExecutionCommand::PlaceLimit(place) => {
+            order.time_in_force == FieldState::Known(place.time_in_force)
+        }
+        ExecutionCommand::Cancel(_)
+        | ExecutionCommand::PlaceMarket(_)
+        | ExecutionCommand::MarketReduce(_)
+        | ExecutionCommand::StopMarketCloseAll(_)
+        | ExecutionCommand::StopMarketFullPosition(_) => true,
+    }
+}
+
 pub(super) fn normalize_fresh_limit(
     intent: &AccountLimitNormalizationIntent,
     rules: &BinanceInstrumentRules,
@@ -76,6 +92,7 @@ pub(super) fn normalize_fresh_limit(
         return Err(AccountHostValidationError::Command);
     }
     Ok(ExecutionCommand::PlaceLimit(OrderCommand {
+        time_in_force: Default::default(),
         command_id: intent.command_id.clone(),
         client_order_id: intent.client_order_id.clone(),
         owner: intent.owner.clone(),

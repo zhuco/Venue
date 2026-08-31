@@ -754,6 +754,7 @@ mod tests {
             intent: &AccountLimitNormalizationIntent,
         ) -> Result<ExecutionCommand, AccountHostValidationError> {
             Ok(ExecutionCommand::PlaceLimit(OrderCommand {
+                time_in_force: Default::default(),
                 command_id: intent.command_id.clone(),
                 client_order_id: intent.client_order_id.clone(),
                 owner: intent.owner.clone(),

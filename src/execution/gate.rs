@@ -354,6 +354,7 @@ mod tests {
 
     fn command() -> Result<OrderCommand, Box<dyn std::error::Error>> {
         Ok(OrderCommand {
+            time_in_force: Default::default(),
             command_id: CommandId::new("canary_1")?,
             client_order_id: CommandId::new("venue_canary_1")?,
             owner: OrderOwner {

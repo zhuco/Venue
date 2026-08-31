@@ -1067,6 +1067,7 @@ pub fn parse_order(value: &Value, symbol: &Symbol) -> Result<Order, BitgetError>
     let quantity = decimal(object, "qty")?;
     let filled_quantity = optional_decimal(object.get("cumExecQty"))?;
     let order = Order {
+        time_in_force: crate::domain::FieldState::Missing,
         order_id: identifier(object.get("orderId"))?,
         client_order_id: client_order_id(object.get("clientOid")),
         symbol: symbol.clone(),

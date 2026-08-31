@@ -267,6 +267,7 @@ pub fn run_binance_canary(
         CanaryRunState::create_new(run_dir.join("run.json"), run_binding, preflight_now_ms)?;
     let mut commands = CommandJournal::open(run_dir.join("commands.jsonl"))?;
     let command = OrderCommand {
+        time_in_force: Default::default(),
         command_id: CommandId::new(format!("cmd_{started_at_ms}"))?,
         client_order_id: CommandId::new(format!("vcn_{started_at_ms}"))?,
         owner: owner.clone(),
