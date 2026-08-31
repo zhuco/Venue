@@ -3,6 +3,7 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::Serialize;
@@ -60,7 +61,10 @@ pub struct ProductionResident<G> {
 /// types lets the bootstrap path be exercised against the real Host/WAL composition without
 /// granting a fake gateway any mutation capability.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(not(feature = "binance"), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "binance", feature = "bitget", feature = "gate")),
+    allow(dead_code)
+)]
 pub(crate) struct GridBootstrapMarket {
     pub(crate) bid: Price,
     pub(crate) ask: Price,
@@ -288,7 +292,10 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
     /// Consumes the one permitted first-install attempt. Checkpoint recovery never sets this
     /// flag, so a restart cannot manufacture another epoch from fresh BBO after an earlier
     /// accepted, rejected, or Unknown installation attempt.
-    #[cfg_attr(not(feature = "binance"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(feature = "binance", feature = "bitget", feature = "gate")),
+        allow(dead_code)
+    )]
     pub(crate) fn take_grid_bootstrap_request(&mut self, binding: &StrategyBinding) -> bool {
         self.grid_bindings
             .get(&binding.key)
@@ -436,6 +443,25 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         }
     }
 
+    /// A consumed initial-install request may not be retried, but it must leave the registered
+    /// actor unable to accept risk when its required signed/public evidence was unavailable.
+    pub(crate) fn fail_grid_bootstrap(
+        &mut self,
+        binding: &StrategyBinding,
+    ) -> Result<(), NodeError> {
+        if self.grid_bindings.get(&binding.key) != Some(binding) {
+            return Err(NodeError::ResidentRuntime);
+        }
+        if self.strategy_lifecycle(binding)
+            == Some(venue_runtime::account::InstanceLifecycle::Paused)
+        {
+            return Ok(());
+        }
+        self.runtime
+            .request_pause(&binding.key)
+            .map_err(resident_error)
+    }
+
     /// Cancels at most one currently-open Stage-7 order through the same Host/WAL/lane before a
     /// replacement Grid may bootstrap.  The old Owner is never registered as a strategy: the
     /// Host re-derives this route from the exact Runtime generation and rejects every other kind
@@ -539,7 +565,10 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
     /// The shared part of the Binance initial-install path. The concrete adapter owns the only
     /// production market read; tests inject the already-normalized bounded facts and still pass
     /// through the account Host, WAL and execution lane below.
-    #[cfg_attr(not(feature = "binance"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(feature = "binance", feature = "bitget", feature = "gate")),
+        allow(dead_code)
+    )]
     pub(crate) fn bootstrap_grid_from_signed_market(
         &mut self,
         binding: &StrategyBinding,
@@ -556,7 +585,10 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         result
     }
 
-    #[cfg_attr(not(feature = "binance"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(feature = "binance", feature = "bitget", feature = "gate")),
+        allow(dead_code)
+    )]
     fn bootstrap_grid_from_signed_market_inner(
         &mut self,
         binding: &StrategyBinding,
@@ -577,11 +609,14 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         {
             return Err(NodeError::ResidentRuntime);
         }
+        let now_ms = unix_now_ms()?;
         if market.observed_at_ms < snapshot.observed_at_ms()
             || market
                 .observed_at_ms
                 .saturating_sub(snapshot.observed_at_ms())
                 > 3_000
+            || market.observed_at_ms > now_ms
+            || now_ms.saturating_sub(market.observed_at_ms) > 3_000
         {
             return Err(NodeError::ResidentRuntime);
         }
@@ -996,6 +1031,16 @@ fn resident_error(error: venue_runtime::account::AccountRuntimeError) -> NodeErr
     NodeError::ResidentRuntime
 }
 
+fn unix_now_ms() -> Result<u64, NodeError> {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| NodeError::ResidentRuntime)?
+            .as_millis(),
+    )
+    .map_err(|_| NodeError::ResidentRuntime)
+}
+
 #[cfg(feature = "binance")]
 impl ProductionResident<venue_gateway_binance::BinanceAccountGateway> {
     /// First-install Grid path. The gateway reads only current BBO/rules; the Host obtains the
@@ -1046,6 +1091,88 @@ impl ProductionResident<venue_gateway_binance::BinanceAccountGateway> {
             "binance",
             GridPrivateFillFact {
                 source_private_generation: event.private_generation,
+                received_at_ms: event.received_at_ms,
+                fill: event.fill,
+            },
+        )
+    }
+}
+
+#[cfg(feature = "bitget")]
+impl ProductionResident<venue_gateway_bitget::BitgetAccountGateway> {
+    /// Installs the first Grid epoch from the one signed account snapshot and the BBO reconstructed
+    /// by the caller's same-socket Bitget `books` bridge. No REST/ticker market read is allowed
+    /// between those facts and the first durable semantic turn.
+    pub(crate) fn bootstrap_bitget_grid_from_sequenced_bbo(
+        &mut self,
+        binding: &StrategyBinding,
+        gateway_binding: &venue_gateway_api::GatewayBinding,
+        snapshot: venue_runtime::SignedAccountSnapshot,
+        bbo: scalping::BitgetGridBootstrapBbo,
+    ) -> Result<(), NodeError> {
+        if snapshot.binding() != gateway_binding
+            || gateway_binding.venue != self.host.binding().venue
+            || gateway_binding.trading_account_id != self.host.binding().trading_account_id
+            || gateway_binding.symbol != binding.key.symbol
+        {
+            self.fail_grid_bootstrap(binding)?;
+            return Err(NodeError::ResidentRuntime);
+        }
+        let rules = match self.host.with_gateway_read(|gateway| {
+            gateway.grid_bootstrap_rules(gateway_binding, snapshot.rules_generation())
+        }) {
+            Ok(rules) => rules,
+            Err(error) => {
+                self.fail_grid_bootstrap(binding)?;
+                return Err(NodeError::LiveHost {
+                    venue: self.host.binding().venue,
+                    message: error.to_string(),
+                });
+            }
+        };
+        let maximum_quantity = match rules
+            .maximum_order_quantity
+            .filter(|maximum| *maximum >= rules.snapshot.metadata.quantity.minimum)
+        {
+            Some(maximum) => maximum,
+            None => {
+                self.fail_grid_bootstrap(binding)?;
+                return Err(NodeError::ResidentRuntime);
+            }
+        };
+        self.bootstrap_grid_from_signed_market(
+            binding,
+            snapshot,
+            GridBootstrapMarket {
+                bid: bbo.bid,
+                ask: bbo.ask,
+                price_tick: rules.snapshot.metadata.instrument.price_tick,
+                quantity_step: rules.snapshot.metadata.instrument.quantity_step,
+                minimum_quantity: rules.snapshot.metadata.quantity.minimum,
+                maximum_quantity,
+                minimum_notional: rules.snapshot.metadata.instrument.minimum_notional.value,
+                observed_at_ms: bbo.observed_at_ms,
+            },
+        )
+    }
+
+    /// The authenticated UTA `fill` source is converted to the Runtime-owned facts journal
+    /// before any Grid reducer runs; stream authorization is checked by the adapter.
+    pub(crate) fn poll_bitget_grid_private_once(&mut self) -> Result<bool, NodeError> {
+        let event = self
+            .host
+            .with_gateway_read(|gateway| gateway.poll_private_fill())
+            .map_err(|error| NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: error.to_string(),
+            })?;
+        let Some(event) = event else {
+            return Ok(false);
+        };
+        self.consume_grid_private_fill(
+            "bitget",
+            GridPrivateFillFact {
+                source_private_generation: event.source_private_generation,
                 received_at_ms: event.received_at_ms,
                 fill: event.fill,
             },

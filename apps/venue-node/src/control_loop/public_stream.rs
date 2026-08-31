@@ -222,16 +222,77 @@ impl ControlResidentLoop<venue_gateway_binance::BinanceAccountGateway> {
 }
 
 #[cfg(feature = "bitget")]
+fn bootstrap_bitget_grid_once(
+    resident: &mut ProductionResident<venue_gateway_bitget::BitgetAccountGateway>,
+    runtime: &tokio::runtime::Runtime,
+    limits: venue_gateway_bitget::BitgetTransportLimits,
+    binding: &StrategyBinding,
+) -> Result<(), NodeError> {
+    let result = (|| {
+        let gateway_binding = public_gateway_binding(binding)?;
+        let mut receiver = runtime
+            .block_on(
+                venue_gateway_bitget::BitgetScalpingPublicReceiver::connect_books_only(
+                    gateway_binding.clone(),
+                    limits,
+                ),
+            )
+            .map_err(|error| NodeError::LiveHost {
+                venue: venue_gateway_api::VenueId::Bitget,
+                message: error.to_string(),
+            })?;
+        // The socket is intentionally connected first, but no public payload is used until the
+        // complete signed Host snapshot seals its matching rules/private generation.
+        let snapshot = resident.refresh_signed_snapshot()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut bridge = crate::production_resident::scalping::BitgetGridBootstrapBookBridge::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(NodeError::ResidentRuntime);
+            }
+            match runtime.block_on(receiver.next(remaining.min(Duration::from_millis(250)))) {
+                Ok(Some(venue_gateway_bitget::BitgetScalpingPublicFrame::Books(message))) => {
+                    if let Some(bbo) = bridge.accept(message)? {
+                        return resident.bootstrap_bitget_grid_from_sequenced_bbo(
+                            binding,
+                            &gateway_binding,
+                            snapshot,
+                            bbo,
+                        );
+                    }
+                }
+                Ok(None) | Err(venue_gateway_bitget::BitgetPublicWsError::Idle) => {}
+                Ok(Some(_)) => return Err(NodeError::ResidentRuntime),
+                Err(error) => {
+                    return Err(NodeError::LiveHost {
+                        venue: venue_gateway_api::VenueId::Bitget,
+                        message: error.to_string(),
+                    });
+                }
+            }
+        }
+    })();
+    if result.is_err() {
+        resident.fail_grid_bootstrap(binding)?;
+    }
+    result
+}
+
+#[cfg(feature = "bitget")]
 impl ControlResidentLoop<venue_gateway_bitget::BitgetAccountGateway> {
-    /// Bitget's resident owns the public socket for every configured Scalping actor.  The socket
-    /// yields adapter-validated public facts; the existing resident bridge keeps its
-    /// snapshot hidden until a covering update proves a contiguous book.
+    /// Bitget Grid obtains one BBO only through a short-lived sequenced-books connection, then
+    /// uses the same authenticated private pump as every other Grid actor. Scalping remains
+    /// independently optional and cannot broaden that bootstrap public subscription.
     pub fn run_bitget(mut self) -> Result<(), NodeError> {
-        if self
+        let grid_bindings = self
             .bindings
             .values()
-            .any(|binding| binding.key.strategy_kind == StrategyKind::HedgedGrid)
-        {
+            .filter(|binding| binding.key.strategy_kind == StrategyKind::HedgedGrid)
+            .cloned()
+            .collect::<Vec<_>>();
+        let has_grid = !grid_bindings.is_empty();
+        if has_grid {
             while self.resident.cancel_legacy_v1_grid_custody_once()? {}
         }
         let runtime = public_runtime()?;
@@ -240,6 +301,18 @@ impl ControlResidentLoop<venue_gateway_bitget::BitgetAccountGateway> {
             2 * 1024 * 1024,
         )
         .map_err(|_| NodeError::ResidentRuntime)?;
+        let mut installed_from_signed_snapshot = false;
+        for binding in &grid_bindings {
+            if self.resident.take_grid_bootstrap_request(binding) {
+                bootstrap_bitget_grid_once(&mut self.resident, &runtime, limits, binding)?;
+                installed_from_signed_snapshot = true;
+            }
+        }
+        // A restored Grid has no initial BBO request, but a new process still needs an exact
+        // Host snapshot before it may attach a private stream to that restored runtime state.
+        if has_grid && !installed_from_signed_snapshot {
+            self.resident.refresh_signed_snapshot()?;
+        }
         let scalping = self.scalping_bindings()?;
         let mut receivers = Vec::with_capacity(scalping.len());
         for binding in scalping {
@@ -256,10 +329,17 @@ impl ControlResidentLoop<venue_gateway_bitget::BitgetAccountGateway> {
                 .register_bitget_scalping_book_bridge(&binding)?;
             receivers.push((binding, receiver, PendingPublicFacts::default()));
         }
-        let mut last_refresh_ms = None;
+        let mut last_refresh_ms = has_grid
+            .then(|| now_ms().map_err(|_| NodeError::ResidentRuntime))
+            .transpose()?;
         let mut next_receiver = 0;
         self.run_with_private_pump(move |resident| {
-            let private = refresh_signed_private_if_due(resident, &mut last_refresh_ms)?;
+            let private_fill = if has_grid {
+                resident.poll_bitget_grid_private_once()?
+            } else {
+                false
+            };
+            let private_snapshot = refresh_signed_private_if_due(resident, &mut last_refresh_ms)?;
             let public = pump_public_batch(receivers.len(), &mut next_receiver, |index, wait| {
                 use venue_gateway_bitget::BitgetScalpingPublicFrame as Frame;
                 let (binding, receiver, pending) = &mut receivers[index];
@@ -301,7 +381,7 @@ impl ControlResidentLoop<venue_gateway_bitget::BitgetAccountGateway> {
                 }
                 Ok(false)
             })?;
-            Ok(private || public)
+            Ok(private_fill || private_snapshot || public)
         })
     }
 }

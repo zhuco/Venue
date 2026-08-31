@@ -140,6 +140,7 @@ Exchange Account Process
 - Control poll/重试只推进自己的 deadline，退避期间仍运行同一账户的私有/公共 pump；公共空闲等待最多 5ms，有积压则继续有界排空。该值不是端到端延迟保证：同步签名读取、HTTP、持久化及 reducer 耗时仍须单独测量和消除瓶颈。
 - 慢策略不能阻塞行情读取；仅 Snapshot、Ticker、MarkFunding 可保留最新值，Delta、Trade、Bar 必须进入有界无损队列；
 - 私有或连续行情邮箱满载必须显式失败并封锁相关新增风险，不能静默丢事件；BBO 新鲜度只用连接代、交易所事件时间及同事件族序号，不用本机接收时间，也不比较不同事件族的序号；任一事件族进入新 symbol generation 时必须清空该 symbol 全部旧 watermark、BBO 和 Actor 行情队列。BBO 只参与初装、整网重建及显式再中心化，不参与成交滚动；这些非滚动 mutation turn 的完整签名私有 readback、风险或规则核验若可能超过 BBO 新鲜窗口，必须在任意 WAL/mutation 前再次有界排空并持久化期间已到达的公共帧，再按新的当前时钟复核 BBO；closing wave 的签名确认也可能跨越该窗口，因此在 opening wave 尚未 dispatch 前必须再次持久排空并重采 BBO，只有全量 opening 仍为 post-only 才可发出；刷新只更新数据，不授予 writer、risk 或 dispatch authority。
+- Bitget Grid 初装专用 books-only WS 必须先建立、再取得一次完整签名 Host snapshot；只接受同一 socket generation、同 symbol 的原生 `snapshot` 与首个覆盖 `snapshot.seq + 1` 的 `update`，并以规范 `OrderBook` 实际重建后的 best bid/ask 作为 BBO。BBO 时间只取该 update 的交易所 `ts`，在首个 WAL 前同时满足不早于签名 snapshot、非未来且当前年龄不超过 3 秒；gap、reset、重连、错 symbol、缺深度、缺 `maxOrderQty`、规则 generation/identity 漂移或超时均暂停已消费的初装请求，禁止 REST/ticker 替代、自动重连后重投或创建第二 epoch。
 - WebSocket 一次建连的 DNS、全部解析地址、TCP、代理 CONNECT、TLS 与 upgrade 共用 10 秒总期限，禁止每个地址重新获得完整超时；失败后的公共、私有及启动连接按有上限指数退避，并用账户/进程/失败代际错峰，禁止固定间隔同步重连风暴。
 
 ### 4.2 Private Router（私有事件路由器）

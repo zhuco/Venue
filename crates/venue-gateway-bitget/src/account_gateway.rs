@@ -177,6 +177,26 @@ impl BitgetAccountGateway {
         Ok(self.pending_private_fills.pop_front())
     }
 
+    /// Returns the exact bounded rules image installed by the preceding complete signed snapshot.
+    /// This is read-only: a Grid bootstrap must not refresh rules between that snapshot and its
+    /// sequenced public BBO, because doing so would detach the prospective WAL from its Host
+    /// generation.
+    pub fn grid_bootstrap_rules(
+        &self,
+        binding: &GatewayBinding,
+        rules_generation: u64,
+    ) -> Result<BitgetInstrumentRules, BitgetAccountGatewayError> {
+        let expected = self.binding_for(&binding.symbol);
+        if binding != &expected
+            || rules_generation == 0
+            || rules_generation != self.transport.generation()
+        {
+            return Err(BitgetAccountGatewayError::Rules);
+        }
+        let rules = self.registered_rules(&binding.symbol)?;
+        validate_grid_bootstrap_rules(rules, binding, rules_generation, now_ms()?)
+    }
+
     fn next_attempt_id(&mut self) -> Result<u64, BitgetAccountGatewayError> {
         let current = self.next_attempt_id;
         self.next_attempt_id = self
@@ -556,6 +576,26 @@ impl AccountPhysicalGateway for BitgetAccountGateway {
     fn dispatch(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
         self.dispatch_permit(permit)
     }
+}
+
+fn validate_grid_bootstrap_rules(
+    rules: BitgetInstrumentRules,
+    binding: &GatewayBinding,
+    rules_generation: u64,
+    now_ms: u64,
+) -> Result<BitgetInstrumentRules, BitgetAccountGatewayError> {
+    if rules.raw.binding != *binding
+        || rules.raw.generation != rules_generation
+        || rules.snapshot.metadata.instrument.generation != rules_generation
+        || now_ms < rules.raw.observed_at_ms
+        || now_ms >= rules.raw.expires_at_ms
+        || rules
+            .maximum_order_quantity
+            .is_none_or(|maximum| maximum < rules.snapshot.metadata.quantity.minimum)
+    {
+        return Err(BitgetAccountGatewayError::Rules);
+    }
+    Ok(rules)
 }
 
 fn normalize_limit_from_ticker(
@@ -1634,6 +1674,20 @@ mod tests {
             )?,
             1_000_000,
         )?)
+    }
+
+    #[test]
+    fn grid_bootstrap_rules_require_the_snapshot_generation_and_bounded_maximum()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding()?;
+        let accepted = validate_grid_bootstrap_rules(rules()?, &binding, 7, 1_000_000)?;
+        assert_eq!(accepted.canonical_symbol(), &binding.symbol);
+        assert!(validate_grid_bootstrap_rules(rules()?, &binding, 8, 1_000_000).is_err());
+        let mut no_maximum = rules()?;
+        no_maximum.maximum_order_quantity = None;
+        assert!(validate_grid_bootstrap_rules(no_maximum, &binding, 7, 1_000_000).is_err());
+        assert!(validate_grid_bootstrap_rules(rules()?, &binding, 7, 1_001_000).is_err());
+        Ok(())
     }
 
     fn ticker(payload: String) -> Result<BitgetTickerEvent, Box<dyn std::error::Error>> {

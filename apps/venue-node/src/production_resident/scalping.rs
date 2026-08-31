@@ -7,7 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use venue_domain::domain::MarketEvent;
+use venue_domain::domain::{MarketEvent, Price};
 use venue_runtime::{
     AccountPhysicalGateway, StrategyBinding, StrategyKind, account::InstanceLifecycle,
     strategy::AccountMarketEvent,
@@ -100,6 +100,119 @@ impl BitgetScalpingBookBridge {
                 self.pending_snapshot = None;
                 Ok(Vec::new())
             }
+        }
+    }
+}
+
+/// The one-shot Grid bootstrap reader accepts no ticker or REST image.  It reconstructs BBO only
+/// after the same public socket has supplied a native snapshot and a covering update; a gap is a
+/// terminal first-install failure rather than an invitation to create another Grid epoch.
+#[cfg(feature = "bitget")]
+pub(crate) struct BitgetGridBootstrapBookBridge {
+    sequencer: venue_gateway_bitget::public::BitgetBookSequencer,
+    pending_snapshot: Option<venue_gateway_bitget::public::BitgetBooksMessage>,
+    book: venue_indicators::OrderBook,
+    session_generation: Option<u64>,
+}
+
+#[cfg(feature = "bitget")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BitgetGridBootstrapBbo {
+    pub(crate) bid: Price,
+    pub(crate) ask: Price,
+    pub(crate) observed_at_ms: u64,
+}
+
+#[cfg(feature = "bitget")]
+impl BitgetGridBootstrapBookBridge {
+    pub(crate) fn new() -> Self {
+        Self {
+            sequencer: venue_gateway_bitget::public::BitgetBookSequencer::new(),
+            pending_snapshot: None,
+            book: venue_indicators::OrderBook::default(),
+            session_generation: None,
+        }
+    }
+
+    pub(crate) fn accept(
+        &mut self,
+        message: venue_gateway_bitget::public::BitgetBooksMessage,
+    ) -> Result<Option<BitgetGridBootstrapBbo>, NodeError> {
+        use venue_gateway_bitget::public::BitgetBookSequenceStatus;
+
+        match self.session_generation {
+            None => {
+                self.sequencer
+                    .reset_generation(message.raw.generation)
+                    .map_err(|_| NodeError::ResidentRuntime)?;
+                self.session_generation = Some(message.raw.generation);
+            }
+            Some(generation) if generation != message.raw.generation => {
+                return Err(NodeError::ResidentRuntime);
+            }
+            Some(_) => {}
+        }
+        let status = self
+            .sequencer
+            .accept(&message)
+            .map_err(|_| NodeError::ResidentRuntime)?;
+        match status {
+            BitgetBookSequenceStatus::Snapshot { .. } => {
+                self.pending_snapshot = Some(message);
+                self.book = venue_indicators::OrderBook::default();
+                Ok(None)
+            }
+            BitgetBookSequenceStatus::Bridged { generation, .. } => {
+                let snapshot = self
+                    .pending_snapshot
+                    .take()
+                    .ok_or(NodeError::ResidentRuntime)?;
+                let MarketEvent::Snapshot(snapshot) = snapshot
+                    .normalize(generation)
+                    .map_err(|_| NodeError::ResidentRuntime)?
+                else {
+                    return Err(NodeError::ResidentRuntime);
+                };
+                let MarketEvent::Delta(delta) = message
+                    .normalize(generation)
+                    .map_err(|_| NodeError::ResidentRuntime)?
+                else {
+                    return Err(NodeError::ResidentRuntime);
+                };
+                self.book.apply_snapshot(snapshot);
+                // `OrderBook` independently requires that this delta advances and either spans
+                // snapshot.seq + 1 or names the snapshot as its immediate predecessor.
+                if !self
+                    .book
+                    .apply_delta_if_fresh(delta)
+                    .map_err(|_| NodeError::ResidentRuntime)?
+                    || !self.book.bridged()
+                {
+                    return Err(NodeError::ResidentRuntime);
+                }
+                let bid = self
+                    .book
+                    .bids()
+                    .first()
+                    .map(|level| level.price)
+                    .ok_or(NodeError::ResidentRuntime)?;
+                let ask = self
+                    .book
+                    .asks()
+                    .first()
+                    .map(|level| level.price)
+                    .ok_or(NodeError::ResidentRuntime)?;
+                if bid >= ask || message.exchange_time_ms == 0 {
+                    return Err(NodeError::ResidentRuntime);
+                }
+                Ok(Some(BitgetGridBootstrapBbo {
+                    bid,
+                    ask,
+                    observed_at_ms: message.exchange_time_ms,
+                }))
+            }
+            BitgetBookSequenceStatus::Updated { .. }
+            | BitgetBookSequenceStatus::ResetRequired { .. } => Err(NodeError::ResidentRuntime),
         }
     }
 }
@@ -1298,6 +1411,49 @@ mod tests {
         let mut other_session = update;
         other_session.raw.generation = 1_702;
         assert!(bridge.accept(other_session).is_err());
+        Ok(())
+    }
+
+    #[cfg(feature = "bitget")]
+    #[test]
+    fn bitget_grid_bbo_requires_a_contiguous_snapshot_plus_update()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use venue_gateway_bitget::public::{
+            BitgetPublicSource, BitgetRawPublicPayload, parse_books_message,
+        };
+
+        let raw = |payload: String| -> Result<BitgetRawPublicPayload, Box<dyn std::error::Error>> {
+            Ok(BitgetRawPublicPayload::new(
+                BitgetPublicSource::WebSocketBooks,
+                "DOGE/USDT".parse()?,
+                1_700,
+                1_000,
+                payload,
+            )?)
+        };
+        let snapshot = parse_books_message(raw(
+            r#"{"arg":{"instType":"usdt-futures","topic":"books","symbol":"DOGEUSDT"},"action":"snapshot","ts":"1001","data":[{"a":[["0.101","20"]],"b":[["0.100","10"]],"pseq":"0","seq":"100","maxdepth":"50","ts":"1000"}]}"#.to_owned(),
+        )?)?;
+        let uncovered = parse_books_message(raw(
+            r#"{"arg":{"instType":"usdt-futures","topic":"books","symbol":"DOGEUSDT"},"action":"update","ts":"1002","data":[{"a":[["0.102","20"]],"b":[],"pseq":"99","seq":"100","maxdepth":"50","ts":"1002"}]}"#.to_owned(),
+        )?)?;
+        let bridge = parse_books_message(raw(
+            r#"{"arg":{"instType":"usdt-futures","topic":"books","symbol":"DOGEUSDT"},"action":"update","ts":"1003","data":[{"a":[["0.102","20"]],"b":[],"pseq":"99","seq":"101","maxdepth":"50","ts":"1003"}]}"#.to_owned(),
+        )?)?;
+        let mut rejected = BitgetGridBootstrapBookBridge::new();
+        assert!(rejected.accept(snapshot.clone())?.is_none());
+        assert!(rejected.accept(uncovered).is_err());
+
+        let mut accepted = BitgetGridBootstrapBookBridge::new();
+        assert!(accepted.accept(snapshot)?.is_none());
+        assert_eq!(
+            accepted.accept(bridge)?,
+            Some(BitgetGridBootstrapBbo {
+                bid: Price::new(Decimal::new(100, 3))?,
+                ask: Price::new(Decimal::new(101, 3))?,
+                observed_at_ms: 1_003,
+            })
+        );
         Ok(())
     }
 
