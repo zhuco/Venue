@@ -704,7 +704,7 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         // custody and is therefore fail-closed.
         let canonical = acquire_account_canonical_root(&scope, &predecessor.legacy_artifacts_root)
             .map_err(AccountHostError::CanonicalRoot)?;
-        import_legacy_v1_journal_if_needed(&predecessor.legacy_artifacts_root, &artifacts_root)
+        import_legacy_v1_journal_for_predecessor_if_needed(&predecessor, &artifacts_root)
             .map_err(AccountHostError::Validation)?;
         let mut host = Self::open_with_symbols_and_account_lock(
             artifacts_root,
@@ -850,6 +850,17 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
             };
             if fact.external || !predecessor.matches_legacy_owner(owner) {
                 continue;
+            }
+            if !matches!(
+                fact.state,
+                Some(OrderState::New | OrderState::PartiallyFilled)
+            ) || fact
+                .filled_quantity
+                .is_none_or(|filled| filled < Decimal::ZERO || filled >= fact.quantity)
+            {
+                return Err(AccountHostError::Validation(
+                    AccountHostValidationError::LegacyPredecessor,
+                ));
             }
             let Some(venue_order_id) = fact.venue_order_id.as_deref() else {
                 return Err(AccountHostError::Validation(
@@ -1810,6 +1821,32 @@ pub fn command_matches_readback_order(command: &ExecutionCommand, order: &Order)
 /// holds the predecessor's exclusive lock, so the source cannot advance while it is verified and
 /// copied.  The source remains untouched; a partial destination intentionally remains fenced
 /// instead of being cleaned or resumed automatically.
+/// Verifies that every preserved physical mutation belongs to the exact immutable predecessor
+/// Owner before importing its frozen WAL. A matching legacy scope alone is insufficient: the
+/// successor must never select an arbitrary strategy/run from a mixed historical journal.
+fn import_legacy_v1_journal_for_predecessor_if_needed(
+    predecessor: &LegacyV1WriterPredecessor,
+    destination_root: &Path,
+) -> Result<(), AccountHostValidationError> {
+    let legacy_root = fs::canonicalize(&predecessor.legacy_artifacts_root)
+        .map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+    let source = legacy_root.join("commands.jsonl");
+    let source =
+        fs::canonicalize(&source).map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+    if !source.starts_with(&legacy_root) {
+        return Err(AccountHostValidationError::LegacyPredecessor);
+    }
+    let journal =
+        CommandJournal::open(&source).map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+    if journal
+        .commands()
+        .any(|command| !predecessor.matches_legacy_owner(command.mutation_owner()))
+    {
+        return Err(AccountHostValidationError::LegacyPredecessor);
+    }
+    import_legacy_v1_journal_if_needed(&legacy_root, destination_root)
+}
+
 fn import_legacy_v1_journal_if_needed(
     legacy_root: &Path,
     destination_root: &Path,

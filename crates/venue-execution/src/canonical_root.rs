@@ -51,6 +51,8 @@ struct DurableLegacyV1Handoff {
     schema_version: u16,
     scope_sha256: String,
     scope: WriterScope,
+    legacy_strategy_instance_id: String,
+    legacy_run_id: String,
     canonical_artifacts_root: String,
     canonical_root_sha256: String,
     entry_sha256: String,
@@ -61,6 +63,8 @@ struct LegacyV1EntryDigest<'a> {
     schema_version: u16,
     scope_sha256: &'a str,
     scope: &'a WriterScope,
+    legacy_strategy_instance_id: &'a str,
+    legacy_run_id: &'a str,
     canonical_artifacts_root: &'a str,
     canonical_root_sha256: &'a str,
 }
@@ -123,12 +127,14 @@ fn validate_legacy_predecessor(
         owner_scope: predecessor.legacy_owner_scope.clone(),
     };
     let scope_sha256 = digest_json(&expected_scope)?;
-    if handoff.schema_version != 1
+    if handoff.schema_version != 2
         || handoff.scope != expected_scope
         || handoff.scope_sha256 != scope_sha256
         || handoff.scope_sha256 != predecessor.legacy_lock_sha256
         || handoff.canonical_artifacts_root != canonical_root
         || handoff.canonical_root_sha256 != digest_bytes(canonical_root.as_bytes())
+        || handoff.legacy_strategy_instance_id != predecessor.legacy_strategy_instance_id
+        || handoff.legacy_run_id != predecessor.legacy_run_id
         || handoff.entry_sha256 != legacy_v1_entry_digest(&handoff)?
     {
         return Err(Stage7WriterRegistryError::LegacyPredecessor);
@@ -147,6 +153,8 @@ fn legacy_v1_entry_digest(
         schema_version: entry.schema_version,
         scope_sha256: &entry.scope_sha256,
         scope: &entry.scope,
+        legacy_strategy_instance_id: &entry.legacy_strategy_instance_id,
+        legacy_run_id: &entry.legacy_run_id,
         canonical_artifacts_root: &entry.canonical_artifacts_root,
         canonical_root_sha256: &entry.canonical_root_sha256,
     })
@@ -545,9 +553,11 @@ mod tests {
         File::create(&predecessor.legacy_lock_path)?;
         let canonical_root_sha256 = digest_bytes(canonical.as_bytes());
         let mut entry = DurableLegacyV1Handoff {
-            schema_version: 1,
+            schema_version: 2,
             scope_sha256: predecessor.legacy_lock_sha256.clone(),
             scope,
+            legacy_strategy_instance_id: predecessor.legacy_strategy_instance_id.clone(),
+            legacy_run_id: predecessor.legacy_run_id.clone(),
             canonical_artifacts_root: canonical,
             canonical_root_sha256,
             entry_sha256: String::new(),
@@ -557,9 +567,11 @@ mod tests {
             entry.entry_sha256 = "0".repeat(64);
         }
         let handoff = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "scope_sha256": entry.scope_sha256,
             "scope": entry.scope,
+            "legacy_strategy_instance_id": entry.legacy_strategy_instance_id,
+            "legacy_run_id": entry.legacy_run_id,
             "canonical_artifacts_root": entry.canonical_artifacts_root,
             "canonical_root_sha256": entry.canonical_root_sha256,
             "entry_sha256": entry.entry_sha256,
@@ -610,6 +622,27 @@ mod tests {
         let mut different_run = owner;
         different_run.run_id = "other-run".to_owned();
         assert!(!predecessor.matches_legacy_owner(&different_run));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_predecessor_rejects_handoff_with_a_different_owner_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let registry = temporary.path().join("v1");
+        let predecessor = legacy_predecessor(&registry, &temporary.path().join("legacy"), true)?;
+        let mut different_owner = predecessor.clone();
+        different_owner.legacy_run_id = "other-run".to_owned();
+        assert!(matches!(
+            acquire_legacy_predecessor(&different_owner, &registry),
+            Err(Stage7WriterRegistryError::LegacyPredecessor)
+        ));
+        let mut different_instance = predecessor;
+        different_instance.legacy_strategy_instance_id = "other-instance".to_owned();
+        assert!(matches!(
+            acquire_legacy_predecessor(&different_instance, &registry),
+            Err(Stage7WriterRegistryError::LegacyPredecessor)
+        ));
         Ok(())
     }
 

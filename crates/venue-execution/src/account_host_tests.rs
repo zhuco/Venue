@@ -404,6 +404,109 @@ fn legacy_custody_routes_require_the_frozen_owner_wal_and_signed_open_identity()
 }
 
 #[test]
+fn legacy_custody_routes_reject_terminal_or_fully_filled_signed_orders()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let binding = GatewayBinding::new(
+        VenueId::Gate,
+        GatewayMode::Live,
+        ACCOUNT,
+        "DOGE/USDT".parse()?,
+    )?;
+    let artifacts = temporary.path().join("gate").join("LIVE").join(ACCOUNT);
+    std::fs::create_dir_all(&artifacts)?;
+    let owner = OrderOwner {
+        strategy_instance_id: "hedged_grid_doge_usdt".to_owned(),
+        run_id: "primary".to_owned(),
+        exchange: "gate".to_owned(),
+        account: "usdt_futures".to_owned(),
+        symbol: binding.symbol.clone(),
+        purpose: OrderPurpose::Entry,
+    };
+    let command = ExecutionCommand::PlaceLimit(OrderCommand {
+        command_id: CommandId::new("legacy-terminal-create")?,
+        client_order_id: CommandId::new("legacy-terminal-client")?,
+        owner: owner.clone(),
+        side: OrderSide::Buy,
+        position_side: PositionSide::Long,
+        quantity: Decimal::ONE,
+        limit_price: Price::new(Decimal::ONE)?,
+        time_in_force: LimitTimeInForce::PostOnly,
+        reduce_only: false,
+    });
+    let mut journal = CommandJournal::open(artifacts.join("commands.jsonl"))?;
+    journal.prepare(command.clone())?;
+    journal.transition(command.command_id(), CommandState::Submitted)?;
+    journal.transition(
+        command.command_id(),
+        CommandState::Accepted {
+            venue_order_id: "legacy-terminal-native".to_owned(),
+        },
+    )?;
+    drop(journal);
+    let ExecutionCommand::PlaceLimit(order) = &command else {
+        return Err("limit command required".into());
+    };
+    let snapshot = SignedAccountSnapshot::complete(
+        binding.clone(),
+        now_ms()?,
+        1,
+        1,
+        1,
+        SignedAccountPositionMode::Hedge,
+        vec![SignedAccountOrderFact {
+            client_order_id: order.client_order_id.as_str().to_owned(),
+            venue_order_id: Some("legacy-terminal-native".to_owned()),
+            symbol: order.owner.symbol.clone(),
+            family: command.native_order_family().ok_or("family missing")?,
+            side: order.side,
+            position_side: order.position_side,
+            quantity: order.quantity,
+            limit_price: Some(order.limit_price.value()),
+            time_in_force: Some(order.time_in_force),
+            created_at_ms: Some(1),
+            reduce_only: order.reduce_only,
+            owner: None,
+            external: true,
+            state: Some(OrderState::Filled),
+            filled_quantity: Some(Decimal::ONE),
+        }],
+        Vec::new(),
+        "legacy-fills:terminal".to_owned(),
+        Vec::new(),
+    )?;
+    let mut host = AccountMutationHost::open(
+        artifacts,
+        binding.clone(),
+        Decimal::TEN,
+        LegacySnapshotGateway {
+            binding: binding.clone(),
+            snapshot,
+        },
+    )?;
+    host.legacy_v1_predecessor = Some(LegacyV1WriterPredecessor {
+        exchange: VenueId::Gate,
+        successor_trading_account_id: ACCOUNT.to_owned(),
+        legacy_product_account: owner.account.clone(),
+        legacy_symbol: owner.symbol.clone(),
+        legacy_owner_scope: "hedged_grid_doge_usdt_primary".to_owned(),
+        legacy_strategy_instance_id: owner.strategy_instance_id.clone(),
+        legacy_run_id: owner.run_id.clone(),
+        legacy_artifacts_root: temporary.path().to_path_buf(),
+        legacy_lock_sha256: "0".repeat(64),
+        legacy_lock_path: temporary.path().join("legacy.lock"),
+        handoff_sha256: "0".repeat(64),
+    });
+    assert!(matches!(
+        host.refresh_legacy_v1_custody_routes(),
+        Err(AccountHostError::Validation(
+            AccountHostValidationError::LegacyPredecessor
+        ))
+    ));
+    Ok(())
+}
+
+#[test]
 fn unknown_readback_requires_complete_order_semantics_and_terminal_cancel()
 -> Result<(), Box<dyn std::error::Error>> {
     let command = command(Decimal::ONE)?;
@@ -1557,6 +1660,58 @@ fn frozen_legacy_journal_is_segmented_without_mutating_the_source()
     assert!(!recovered.has_unresolved());
     assert_eq!(recovered.native_order_routes().len(), 1);
     import_legacy_v1_journal_if_needed(&legacy_root, &destination)?;
+    Ok(())
+}
+
+#[test]
+fn frozen_legacy_journal_rejects_a_mixed_owner_before_copying()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let legacy_root = temporary.path().join("legacy");
+    let destination = root(&temporary);
+    fs::create_dir_all(&legacy_root)?;
+    let source = legacy_root.join("commands.jsonl");
+    let command = command(Decimal::ONE)?;
+    let owner = command.mutation_owner().clone();
+    let mut foreign = command.clone();
+    let ExecutionCommand::PlaceLimit(order) = &mut foreign else {
+        return Err("limit command required".into());
+    };
+    order.command_id = CommandId::new("foreign-legacy-command")?;
+    order.client_order_id = CommandId::new("foreign-legacy-client")?;
+    order.owner.run_id = "other-run".to_owned();
+    let mut legacy = CommandJournal::open(&source)?;
+    for (entry, venue_order_id) in [
+        (&command, "legacy-native-owner"),
+        (&foreign, "legacy-native-foreign"),
+    ] {
+        legacy.prepare(entry.clone())?;
+        legacy.transition(entry.command_id(), CommandState::Submitted)?;
+        legacy.transition(
+            entry.command_id(),
+            CommandState::Accepted {
+                venue_order_id: venue_order_id.to_owned(),
+            },
+        )?;
+    }
+    let predecessor = LegacyV1WriterPredecessor {
+        exchange: VenueId::Okx,
+        successor_trading_account_id: ACCOUNT.to_owned(),
+        legacy_product_account: owner.account.clone(),
+        legacy_symbol: owner.symbol.clone(),
+        legacy_owner_scope: "legacy-owner-scope".to_owned(),
+        legacy_strategy_instance_id: owner.strategy_instance_id.clone(),
+        legacy_run_id: owner.run_id.clone(),
+        legacy_artifacts_root: fs::canonicalize(&legacy_root)?,
+        legacy_lock_sha256: "0".repeat(64),
+        legacy_lock_path: temporary.path().join("legacy.lock"),
+        handoff_sha256: "0".repeat(64),
+    };
+    assert!(matches!(
+        import_legacy_v1_journal_for_predecessor_if_needed(&predecessor, &destination),
+        Err(AccountHostValidationError::LegacyPredecessor)
+    ));
+    assert!(!destination.exists());
     Ok(())
 }
 

@@ -27,8 +27,9 @@
 Binance/Gate/Bitget 还必须在分隔符前提供 `--legacy-v1-handoff <绝对JSON路径>`，
 由 `LegacyV1WriterPredecessor` 校验精确旧 registry/绑定及目标 `trading_account_id`。启动同时持有旧 writer
 锁和新账户 `writer.lock`，不能伪造记录或以另一账户复用前驱来跳过真实 writer/WAL 接管。
-handoff 还必须明确旧 WAL 的 `strategy_instance_id` 与 `run_id`；它们只用于把精确旧 Owner 限定为
-后续 cancellation-only custody 候选，绝不替换成新 UUID 或授予新开仓权限。
+handoff 为不可变 v2 记录，必须哈希绑定旧 WAL 的 `strategy_instance_id` 与 `run_id`；导入的每条物理
+mutation 都须匹配该冻结 Owner。它们只用于把精确旧 Owner 限定为后续 cancellation-only custody 候选，
+绝不替换成新 UUID 或授予新开仓权限。
 前驱锁取得后，Node 仅在旧 `commands.jsonl` 完整、终态且无 `Unknown` 时把它按 5 MiB 段复制到新的
 账户 root，并以来源路径、字节数与 SHA-256、每个导入段的 SHA-256 写入一次性导入标记；后续新段可以正常
 轮转，但任一已导入段篡改均拒绝启动。旧文件绝不改写。旧 Grid checkpoint、

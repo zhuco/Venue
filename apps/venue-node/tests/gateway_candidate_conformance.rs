@@ -25,6 +25,8 @@ struct LegacyHandoffFixture<'a> {
     schema_version: u16,
     scope_sha256: &'a str,
     scope: &'a WriterScope,
+    legacy_strategy_instance_id: &'a str,
+    legacy_run_id: &'a str,
     canonical_artifacts_root: &'a str,
     canonical_root_sha256: &'a str,
     entry_sha256: &'a str,
@@ -35,6 +37,8 @@ struct LegacyEntryFixture<'a> {
     schema_version: u16,
     scope_sha256: &'a str,
     scope: &'a WriterScope,
+    legacy_strategy_instance_id: &'a str,
+    legacy_run_id: &'a str,
     canonical_artifacts_root: &'a str,
     canonical_root_sha256: &'a str,
 }
@@ -83,7 +87,7 @@ fn legacy_registry_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(root.join("stage7_writer_roots").join("v1"))
 }
 
-/// Creates the same durable v1 handoff shape that production validates: its scope digest names
+/// Creates the same durable v2 handoff shape that production validates: its scope digest names
 /// both registry files, the handoff commits its canonical root, and Node rereads the exact file.
 fn legacy_handoff(
     venue: VenueId,
@@ -105,22 +109,28 @@ fn legacy_handoff(
         owner_scope: "hedged_grid_fixture".to_owned(),
     };
     let scope_sha256 = digest(&serde_json::to_vec(&scope)?);
+    let legacy_strategy_instance_id = "grid-instance";
+    let legacy_run_id = "grid-run";
     let registry = legacy_registry_root()?;
     fs::create_dir_all(&registry)?;
     let lock = registry.join(format!("{scope_sha256}.lock"));
     fs::write(&lock, [])?;
     let canonical_root_sha256 = digest(canonical_root.as_bytes());
     let entry_sha256 = digest(&serde_json::to_vec(&LegacyEntryFixture {
-        schema_version: 1,
+        schema_version: 2,
         scope_sha256: &scope_sha256,
         scope: &scope,
+        legacy_strategy_instance_id,
+        legacy_run_id,
         canonical_artifacts_root: &canonical_root,
         canonical_root_sha256: &canonical_root_sha256,
     })?);
     let handoff = LegacyHandoffFixture {
-        schema_version: 1,
+        schema_version: 2,
         scope_sha256: &scope_sha256,
         scope: &scope,
+        legacy_strategy_instance_id,
+        legacy_run_id,
         canonical_artifacts_root: &canonical_root,
         canonical_root_sha256: &canonical_root_sha256,
         entry_sha256: &entry_sha256,
@@ -138,8 +148,8 @@ fn legacy_handoff(
         legacy_product_account: scope.account.clone(),
         legacy_symbol: scope.symbol.clone(),
         legacy_owner_scope: scope.owner_scope.clone(),
-        legacy_strategy_instance_id: "grid-instance".to_owned(),
-        legacy_run_id: "grid-run".to_owned(),
+        legacy_strategy_instance_id: legacy_strategy_instance_id.to_owned(),
+        legacy_run_id: legacy_run_id.to_owned(),
         legacy_artifacts_root: PathBuf::from(canonical_root),
         legacy_lock_sha256: scope_sha256,
         legacy_lock_path: lock.clone(),
