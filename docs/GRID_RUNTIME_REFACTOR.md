@@ -144,6 +144,8 @@ Exchange Account Process
 
 ### 4.2 Private Router（私有事件路由器）
 
+Adapter 的原生私有流 generation 可以是规则代或本地 snapshot attempt，不能直接当作 Runtime generation。adapter 必须先证明 socket 只绑定其最后一次完整签名快照；Node 再以 Runtime 当前 Host-normalized private generation 写入事实 journal，处理冷重启时 Host 对 gateway counter 的 rebase。签名刷新、candidate 漂移、断线、坏帧或有界队列超限时清空未交付规范事件并失败关闭，禁止给旧 frame 重标、保留 raw payload 或自动重连重投。
+
 - 每个账户共享一套用户流；
 - 原始事件先完成领域校验，再把规范订单、成交与连续游标写入当前 checkpoint/facts；原始 wire payload 仅用于短期排障，不是永久恢复依赖；
 - 一条事件产生多条事实时整批校验、整批路由；失败时不推进该连接游标。当前规模不建立独立 Actor inbox/root/receipt 证明链；

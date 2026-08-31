@@ -72,6 +72,15 @@ pub(crate) struct GridBootstrapMarket {
     pub(crate) observed_at_ms: u64,
 }
 
+/// Private stream adapters expose only the normalized fact needed by the shared Grid path. The
+/// exchange frame and credentials stay inside its gateway, while the account Runtime remains the
+/// sole durable generation and delivery authority.
+struct GridPrivateFillFact {
+    source_private_generation: u64,
+    received_at_ms: u64,
+    fill: venue_domain::Fill,
+}
+
 impl<G: AccountPhysicalGateway> ProductionResident<G> {
     pub fn open(launch: &NodeLaunch, gateway: G) -> Result<Self, NodeError> {
         Self::open_with_symbols(launch, AccountSymbolSet::single(launch.binding()), gateway)
@@ -717,143 +726,28 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         Ok(())
     }
 
-    #[cfg_attr(not(feature = "binance"), allow(dead_code))]
-    fn pause_grid_after_bootstrap_failure(
+    /// Applies one adapter-normalized fill through the sole Runtime/Host composition. This shared
+    /// path deliberately knows no native private protocol: adapters must establish the stream,
+    /// generation, symbol and client identity before this bounded fact can enter the journal.
+    fn consume_grid_private_fill(
         &mut self,
-        binding: &StrategyBinding,
-    ) -> Result<(), NodeError> {
-        self.runtime
-            .request_pause(&binding.key)
-            .map_err(resident_error)
-    }
-}
-
-#[derive(Serialize)]
-struct ResidentReplay<'a> {
-    command: &'a ExecutionCommand,
-}
-
-#[derive(Serialize)]
-struct ResidentControlReplay {
-    action: ControlAction,
-}
-
-fn actor_artifacts(root: &Path) -> Result<ResidentActorAppliedArtifacts, NodeError> {
-    let journal = root.join(ACTOR_APPLIED_JOURNAL);
-    let checkpoint = root.join(ACTOR_APPLIED_CHECKPOINT);
-    let anchor = root.join(ACTOR_APPLIED_ANCHOR);
-    let existing = [journal.exists(), checkpoint.exists(), anchor.exists()];
-    match existing {
-        [false, false, false] => Ok(ResidentActorAppliedArtifacts::create_new(
-            journal, checkpoint,
-        )),
-        [true, true, true] => {
-            let encoded = fs::read(anchor).map_err(|_| NodeError::ResidentArtifacts)?;
-            let anchor = serde_json::from_slice::<ActorAppliedAnchor>(&encoded)
-                .map_err(|_| NodeError::ResidentArtifacts)?;
-            Ok(ResidentActorAppliedArtifacts::open_existing(
-                journal, checkpoint, anchor,
-            ))
-        }
-        _ => Err(NodeError::ResidentArtifacts),
-    }
-}
-
-fn persist_anchor(
-    artifacts_root: &Path,
-    binding: &StrategyBinding,
-    applied: &AppliedStrategyTurnReceipt,
-) -> Result<(), NodeError> {
-    let anchor = applied
-        .actor_applied_anchor()
-        .ok_or(NodeError::ResidentRuntime)?;
-    persist_actor_anchor(artifacts_root, binding, &anchor)
-}
-
-fn persist_actor_anchor(
-    artifacts_root: &Path,
-    binding: &StrategyBinding,
-    anchor: &ActorAppliedAnchor,
-) -> Result<(), NodeError> {
-    let path = artifacts_root
-        .join("strategies")
-        .join(&binding.key.instance_id)
-        .join(ACTOR_APPLIED_ANCHOR);
-    let encoded = serde_json::to_vec(anchor).map_err(|_| NodeError::ResidentArtifacts)?;
-    let temporary = path.with_extension("tmp");
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temporary)
-        .map_err(|_| NodeError::ResidentArtifacts)?;
-    file.write_all(&encoded)
-        .map_err(|_| NodeError::ResidentArtifacts)?;
-    file.sync_all().map_err(|_| NodeError::ResidentArtifacts)?;
-    drop(file);
-    fs::rename(temporary, &path).map_err(|_| NodeError::ResidentArtifacts)?;
-    #[cfg(unix)]
-    fs::File::open(path.parent().ok_or(NodeError::ResidentArtifacts)?)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| NodeError::ResidentArtifacts)?;
-    Ok(())
-}
-
-fn resident_error(error: venue_runtime::account::AccountRuntimeError) -> NodeError {
-    let _ = error;
-    NodeError::ResidentRuntime
-}
-
-#[cfg(feature = "binance")]
-impl ProductionResident<venue_gateway_binance::BinanceAccountGateway> {
-    /// First-install Grid path. The gateway reads only current BBO/rules; the Host obtains the
-    /// complete signed snapshot. Missing hedge legs, low inventory, stale BBO or any batch
-    /// admission failure stop before dispatch.
-    pub fn bootstrap_binance_grid_once(
-        &mut self,
-        binding: &StrategyBinding,
-    ) -> Result<(), NodeError> {
-        let snapshot = self.refresh_signed_snapshot()?;
-        let market = self
-            .host
-            .with_gateway_read(|gateway| gateway.fresh_grid_bootstrap_market())
-            .map_err(|error| NodeError::LiveHost {
-                venue: self.host.binding().venue,
-                message: error.to_string(),
-            })?;
-        self.bootstrap_grid_from_signed_market(
-            binding,
-            snapshot,
-            GridBootstrapMarket {
-                bid: market.bid,
-                ask: market.ask,
-                price_tick: market.rules.instrument.price_tick,
-                quantity_step: market.rules.instrument.quantity_step,
-                minimum_quantity: market.rules.minimum_quantity,
-                maximum_quantity: market.rules.maximum_quantity,
-                minimum_notional: market.rules.instrument.minimum_notional.value,
-                observed_at_ms: market.observed_at_ms,
-            },
-        )
-    }
-    /// Reads at most one bounded Binance private frame, fsyncs its normalized Fill through the
-    /// shared account facts journal, then applies the exact routed Grid reducer turn. No raw
-    /// payload is retained and this path contains no BBO/REST request.
-    pub fn poll_binance_grid_private_once(&mut self) -> Result<bool, NodeError> {
+        venue: &str,
+        event: GridPrivateFillFact,
+    ) -> Result<bool, NodeError> {
         use venue_domain::domain::{DomainEvent, EventId, NativeOrderFamily};
         use venue_runtime::{account::AccountPrivateFactInput, strategy::StrategyInput};
 
-        let event = self
-            .host
-            .with_gateway_read(|gateway| gateway.poll_private_fill())
-            .map_err(|error| NodeError::LiveHost {
-                venue: self.host.binding().venue,
-                message: error.to_string(),
-            })?;
-        let Some(event) = event else {
-            return Ok(false);
-        };
-        let event_id = EventId::new(format!("binance-fill-{}", event.fill.fill_id))
+        // The adapter proves its stream is bound to this nonzero native snapshot generation.
+        // Host may rebase that counter across restart; facts must therefore carry the Runtime's
+        // active durable generation, never an adapter-local value that happens to be stale.
+        if event.source_private_generation == 0 {
+            return Err(NodeError::ResidentRuntime);
+        }
+        let active_private_generation = self.runtime.active_private_generation();
+        if active_private_generation == 0 {
+            return Err(NodeError::ResidentRuntime);
+        }
+        let event_id = EventId::new(format!("{venue}-fill-{}", event.fill.fill_id))
             .map_err(|_| NodeError::ResidentRuntime)?;
         let manual_fill = event.fill.clone();
         let report = self
@@ -861,7 +755,7 @@ impl ProductionResident<venue_gateway_binance::BinanceAccountGateway> {
             .ingest_private(
                 AccountPrivateFactInput::new(
                     event_id,
-                    event.private_generation,
+                    active_private_generation,
                     event.received_at_ms,
                     Some(NativeOrderFamily::UmOrder),
                     DomainEvent::Fill(event.fill),
@@ -1013,6 +907,210 @@ impl ProductionResident<venue_gateway_binance::BinanceAccountGateway> {
             }
         }
         Ok(true)
+    }
+
+    #[cfg_attr(not(feature = "binance"), allow(dead_code))]
+    fn pause_grid_after_bootstrap_failure(
+        &mut self,
+        binding: &StrategyBinding,
+    ) -> Result<(), NodeError> {
+        self.runtime
+            .request_pause(&binding.key)
+            .map_err(resident_error)
+    }
+}
+
+#[derive(Serialize)]
+struct ResidentReplay<'a> {
+    command: &'a ExecutionCommand,
+}
+
+#[derive(Serialize)]
+struct ResidentControlReplay {
+    action: ControlAction,
+}
+
+fn actor_artifacts(root: &Path) -> Result<ResidentActorAppliedArtifacts, NodeError> {
+    let journal = root.join(ACTOR_APPLIED_JOURNAL);
+    let checkpoint = root.join(ACTOR_APPLIED_CHECKPOINT);
+    let anchor = root.join(ACTOR_APPLIED_ANCHOR);
+    let existing = [journal.exists(), checkpoint.exists(), anchor.exists()];
+    match existing {
+        [false, false, false] => Ok(ResidentActorAppliedArtifacts::create_new(
+            journal, checkpoint,
+        )),
+        [true, true, true] => {
+            let encoded = fs::read(anchor).map_err(|_| NodeError::ResidentArtifacts)?;
+            let anchor = serde_json::from_slice::<ActorAppliedAnchor>(&encoded)
+                .map_err(|_| NodeError::ResidentArtifacts)?;
+            Ok(ResidentActorAppliedArtifacts::open_existing(
+                journal, checkpoint, anchor,
+            ))
+        }
+        _ => Err(NodeError::ResidentArtifacts),
+    }
+}
+
+fn persist_anchor(
+    artifacts_root: &Path,
+    binding: &StrategyBinding,
+    applied: &AppliedStrategyTurnReceipt,
+) -> Result<(), NodeError> {
+    let anchor = applied
+        .actor_applied_anchor()
+        .ok_or(NodeError::ResidentRuntime)?;
+    persist_actor_anchor(artifacts_root, binding, &anchor)
+}
+
+fn persist_actor_anchor(
+    artifacts_root: &Path,
+    binding: &StrategyBinding,
+    anchor: &ActorAppliedAnchor,
+) -> Result<(), NodeError> {
+    let path = artifacts_root
+        .join("strategies")
+        .join(&binding.key.instance_id)
+        .join(ACTOR_APPLIED_ANCHOR);
+    let encoded = serde_json::to_vec(anchor).map_err(|_| NodeError::ResidentArtifacts)?;
+    let temporary = path.with_extension("tmp");
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|_| NodeError::ResidentArtifacts)?;
+    file.write_all(&encoded)
+        .map_err(|_| NodeError::ResidentArtifacts)?;
+    file.sync_all().map_err(|_| NodeError::ResidentArtifacts)?;
+    drop(file);
+    fs::rename(temporary, &path).map_err(|_| NodeError::ResidentArtifacts)?;
+    #[cfg(unix)]
+    fs::File::open(path.parent().ok_or(NodeError::ResidentArtifacts)?)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| NodeError::ResidentArtifacts)?;
+    Ok(())
+}
+
+fn resident_error(error: venue_runtime::account::AccountRuntimeError) -> NodeError {
+    let _ = error;
+    NodeError::ResidentRuntime
+}
+
+#[cfg(feature = "binance")]
+impl ProductionResident<venue_gateway_binance::BinanceAccountGateway> {
+    /// First-install Grid path. The gateway reads only current BBO/rules; the Host obtains the
+    /// complete signed snapshot. Missing hedge legs, low inventory, stale BBO or any batch
+    /// admission failure stop before dispatch.
+    pub fn bootstrap_binance_grid_once(
+        &mut self,
+        binding: &StrategyBinding,
+    ) -> Result<(), NodeError> {
+        let snapshot = self.refresh_signed_snapshot()?;
+        let market = self
+            .host
+            .with_gateway_read(|gateway| gateway.fresh_grid_bootstrap_market())
+            .map_err(|error| NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: error.to_string(),
+            })?;
+        self.bootstrap_grid_from_signed_market(
+            binding,
+            snapshot,
+            GridBootstrapMarket {
+                bid: market.bid,
+                ask: market.ask,
+                price_tick: market.rules.instrument.price_tick,
+                quantity_step: market.rules.instrument.quantity_step,
+                minimum_quantity: market.rules.minimum_quantity,
+                maximum_quantity: market.rules.maximum_quantity,
+                minimum_notional: market.rules.instrument.minimum_notional.value,
+                observed_at_ms: market.observed_at_ms,
+            },
+        )
+    }
+    /// Reads at most one bounded Binance private frame, fsyncs its normalized Fill through the
+    /// shared account facts journal, then applies the exact routed Grid reducer turn. No raw
+    /// payload is retained and this path contains no BBO/REST request.
+    pub fn poll_binance_grid_private_once(&mut self) -> Result<bool, NodeError> {
+        let event = self
+            .host
+            .with_gateway_read(|gateway| gateway.poll_private_fill())
+            .map_err(|error| NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: error.to_string(),
+            })?;
+        let Some(event) = event else {
+            return Ok(false);
+        };
+        self.consume_grid_private_fill(
+            "binance",
+            GridPrivateFillFact {
+                source_private_generation: event.private_generation,
+                received_at_ms: event.received_at_ms,
+                fill: event.fill,
+            },
+        )
+    }
+}
+
+#[cfg(feature = "gate")]
+impl ProductionResident<venue_gateway_gate::GateAccountGateway> {
+    /// Gate follows the same signed-inventory and bounded-BBO first-install transaction as
+    /// Binance. Its gateway validates Gate-native contract semantics before this adapter-neutral
+    /// Grid surface is constructed.
+    pub fn bootstrap_gate_grid_once(&mut self, binding: &StrategyBinding) -> Result<(), NodeError> {
+        let snapshot = self.refresh_signed_snapshot()?;
+        let market = self
+            .host
+            .with_gateway_read(|gateway| gateway.fresh_grid_bootstrap_market())
+            .map_err(|error| NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: error.to_string(),
+            })?;
+        let maximum_quantity = market
+            .rules
+            .maximum_contracts
+            .and_then(|contracts| contracts.checked_mul(market.rules.quanto_multiplier))
+            .filter(|quantity| *quantity >= market.rules.minimum_quantity())
+            .ok_or(NodeError::ResidentRuntime)?;
+        self.bootstrap_grid_from_signed_market(
+            binding,
+            snapshot,
+            GridBootstrapMarket {
+                bid: market.bid,
+                ask: market.ask,
+                price_tick: market.rules.instrument.price_tick,
+                quantity_step: market.rules.instrument.quantity_step,
+                minimum_quantity: market.rules.minimum_quantity(),
+                maximum_quantity,
+                minimum_notional: market.rules.instrument.minimum_notional.value,
+                observed_at_ms: market.observed_at_ms,
+            },
+        )
+    }
+
+    /// The Gate adapter has already authenticated, bounded and normalized the native
+    /// `futures.usertrades` update. Runtime still owns durable fact ingress and every resulting
+    /// Grid mutation through the one account lane.
+    pub fn poll_gate_grid_private_once(&mut self) -> Result<bool, NodeError> {
+        let event = self
+            .host
+            .with_gateway_read(|gateway| gateway.poll_private_fill())
+            .map_err(|error| NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: error.to_string(),
+            })?;
+        let Some(event) = event else {
+            return Ok(false);
+        };
+        self.consume_grid_private_fill(
+            "gate",
+            GridPrivateFillFact {
+                source_private_generation: event.source_private_generation,
+                received_at_ms: event.received_at_ms,
+                fill: event.fill,
+            },
+        )
     }
 }
 

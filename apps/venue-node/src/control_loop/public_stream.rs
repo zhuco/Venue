@@ -308,15 +308,23 @@ impl ControlResidentLoop<venue_gateway_bitget::BitgetAccountGateway> {
 
 #[cfg(feature = "gate")]
 impl ControlResidentLoop<venue_gateway_gate::GateAccountGateway> {
-    /// Gate's socket is subscribed before its REST baseline is fetched. The resident therefore
-    /// observes the existing snapshot-plus-delta bridge, never an unsequenced REST book.
+    /// Gate's Grid first installs from complete signed account facts and a bounded fresh BBO.
+    /// Thereafter authenticated fills are pumped before optional Scalping public facts so the
+    /// shared Runtime owns both routes without a second account writer.
     pub fn run_gate(mut self) -> Result<(), NodeError> {
-        if self
+        let grid_bindings = self
             .bindings
             .values()
-            .any(|binding| binding.key.strategy_kind == StrategyKind::HedgedGrid)
-        {
+            .filter(|binding| binding.key.strategy_kind == StrategyKind::HedgedGrid)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !grid_bindings.is_empty() {
             while self.resident.cancel_legacy_v1_grid_custody_once()? {}
+        }
+        for binding in grid_bindings {
+            if self.resident.take_grid_bootstrap_request(&binding) {
+                self.resident.bootstrap_gate_grid_once(&binding)?;
+            }
         }
         let runtime = public_runtime()?;
         let limits =
@@ -347,7 +355,8 @@ impl ControlResidentLoop<venue_gateway_gate::GateAccountGateway> {
         let mut last_refresh_ms = None;
         let mut next_receiver = 0;
         self.run_with_private_pump(move |resident| {
-            let private = refresh_signed_private_if_due(resident, &mut last_refresh_ms)?;
+            let private_fill = resident.poll_gate_grid_private_once()?;
+            let private_snapshot = refresh_signed_private_if_due(resident, &mut last_refresh_ms)?;
             let public = pump_public_batch(receivers.len(), &mut next_receiver, |index, wait| {
                 use venue_gateway_gate::GateScalpingPublicFrame as Frame;
                 let (binding, receiver, pending) = &mut receivers[index];
@@ -393,7 +402,7 @@ impl ControlResidentLoop<venue_gateway_gate::GateAccountGateway> {
                 }
                 Ok(false)
             })?;
-            Ok(private || public)
+            Ok(private_fill || private_snapshot || public)
         })
     }
 }

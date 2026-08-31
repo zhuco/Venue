@@ -134,13 +134,16 @@ impl GateAccountGateway {
             if self.private.attempt != self.private_generation {
                 return Err(GateAccountGatewayError::PrivateStream);
             }
-            let stream = self.runtime.block_on(connect_private_ws(
-                &self.binding,
-                &self.credentials,
-                &self.rules,
-                &self.private,
-                self.transport.limits(),
-            ))?;
+            let stream = self
+                .runtime
+                .block_on(connect_private_ws(
+                    &self.binding,
+                    &self.credentials,
+                    &self.rules,
+                    &self.private,
+                    self.transport.limits(),
+                ))
+                .map_err(GateAccountGatewayError::Transport)?;
             self.private_stream = Some(stream);
             self.private_stream_attempt = Some(self.private_generation);
         }
@@ -693,6 +696,7 @@ async fn fetch_fresh_limit_bbo(
     Ok((bid, ask))
 }
 
+#[cfg(test)]
 fn parse_fresh_limit_bbo(
     rules: &GateContractRules,
     public_binding: GatePublicBinding,

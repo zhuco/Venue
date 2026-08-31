@@ -506,7 +506,7 @@ fn private_user_trade_bridge_queues_one_validated_batch_in_native_order_and_fail
     let binding = GateGatewayBinding::new(GatewayBinding::new(
         VenueId::Gate,
         GatewayMode::Live,
-        "account_1",
+        "11111111-1111-4111-8111-111111111111",
         rules.instrument.symbol.clone(),
     )?)?;
     let frame = GatePrivateWsFrame {

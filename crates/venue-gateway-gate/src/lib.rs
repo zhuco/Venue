@@ -22,7 +22,9 @@ mod runtime_recovery;
 mod sign;
 mod transport;
 
-pub use account_gateway::{GateAccountGateway, GateAccountGatewayError};
+pub use account_gateway::{
+    GateAccountGateway, GateAccountGatewayError, GateGridBootstrapMarketFacts, GatePrivateFillEvent,
+};
 pub use config::{GateConfig, GateProductScope};
 pub use credentials::GateCredentials;
 pub(crate) use execution::canonical_client_id_from_native;

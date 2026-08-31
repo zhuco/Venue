@@ -236,6 +236,14 @@ impl AccountRuntime {
         self.connection_generation
     }
 
+    /// The active, Host-normalized private generation. Adapters may bind their native stream to
+    /// a different local counter; only this durable generation can label facts entering the
+    /// Runtime after restart rebasing.
+    #[must_use]
+    pub const fn active_private_generation(&self) -> u64 {
+        self.last_reconciliation_generation
+    }
+
     #[must_use]
     pub(crate) const fn applied_private_sequence(&self) -> u64 {
         self.last_applied_private_sequence
