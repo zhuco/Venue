@@ -3,9 +3,11 @@
 更新：2026-09-01
 
 本文说明已提交源码的架构；“有实现”“已通过离线测试”“已完成生产接管”是三个不同结论。
-版本和产品概览见 [README](README.md)，代码定位见 [CODEMAP](CODEMAP.md)，开发方式见
+版本和产品概览见 [README](../README.md)，代码定位见 [CODEMAP](CODEMAP.md)，开发方式见
 [DEVELOPMENT](DEVELOPMENT.md)。交易安全、网格语义和接管以 [运行时契约](GRID_RUNTIME_REFACTOR.md) 为准；
 剩余验收见 [迁移契约](UNIFIED_GATEWAY_WEB_MIGRATION.md)，旧入口见 [停用清单](DEPRECATED.md)。
+
+实施分批：Binance 第一批；Gate.io、Bitget、Bybit、OKX、Hyperliquid 第二批验证与实盘。Scalping 暂缓，保留已有接口及保护，不阻塞当前收工。
 
 ## 1. 当前组成与边界
 
@@ -32,7 +34,7 @@ VenueFlow（native / WASM）─────────────┤
 
 原生 VenueFlow 另有无凭证 Binance 公共行情通道；WASM 保持 Control-only。公共行情不授予交易权限。
 Node 的 Control polling、BFF 到 Control 的当前连接均限制为 loopback，不应把拓扑解释为已支持任意远程直连。
-远程访问须有受控 HTTPS 边界；UI、数据库和 Copy worker 都不能直接发送交易请求。
+远程访问须有受控 HTTPS 边界；Web/UI 可以发起手动交易语义，BFF、Control、数据库和 Copy worker 不直接调用交易所 mutation；账户 Node 统一执行。
 
 ## 2. 源码职责
 
@@ -117,7 +119,7 @@ Node 仍从环境/根 `.env` 读凭证，Control 不自动把密文安装到 Nod
 | 网络 | Tokio、reqwest 0.12、tokio-tungstenite 0.26；既有 blocking transport 逐步等价迁移 |
 | 领域/存储 | rust_decimal、serde/serde_json、SQLx 0.8 + PostgreSQL；无第二套 ORM |
 | 安全/日志 | secrecy + zeroize；Control 密码 argon2、加密 ring；tracing |
-| 桌面/WASM | eframe/egui 0.36.1、egui_tiles 0.17.1、WGPU；native Tokio/reqwest，WASM EventSource |
+| 桌面/WASM | eframe/egui 0.36.1、egui_tiles 0.17.1、WGPU；native Tokio/reqwest，WASM EventSource；Windows 专用 keyring 3.6.3 |
 | 用户 Web | Next.js 16.3.3、React/React DOM 19.2.8、TypeScript 7.0.2；同源 BFF，standalone 发布 |
 | Web 验证 | TypeScript 检查、Node 单测、边界扫描、Playwright 1.58.2；当前没有 ESLint/Biome 门禁 |
 | Ubuntu 编译 | 本机 Rust + Zig 0.16.0 + cargo-zigbuild 0.23.0，x86-64 GNU/Linux glibc 2.35 基线 |
@@ -133,6 +135,8 @@ Web 已有总览、关系、账户、订单、持仓、成交、对账、ledger/
 不是 VenueFlow WASM 的改名。WASM 是内部 canvas 客户端。真实服务器连通、五视口截图、易用性和分段性能仍需部署验收。
 BFF 当前使用受控部署会话，不等同于已完成面向公众的多用户自助平台。
 
+VenueFlow 已纳入历史 K 线补载、图表留白/缩放、执行事实视图与手动金额输入；EMA/ADX 算法在 `venue-indicators`，UI 只负责配置与渲染。Windows 的 Venue 登录资料/会话可存系统凭证库，不进入界面普通持久化；交易所 API Key 不在该记录中。Web 下单页面/BFF 闭环仍待完成，不因桌面已有 Trade Dock 而标记 Web 已支持。
+
 技术栈外部支持核对（2026-09-01）：Next.js 16 仍在官方 Active LTS，React 文档当前为 19.2；
 Web 默认沿用 CI 的 Node.js 24 LTS，项目最低要求 22.18 不等于任意更高主版本都获验收。
 Node 20/23/25 已 EOL，不作为新部署基线。Next 16 的 `next build` 不自动执行 lint；
@@ -144,12 +148,12 @@ Node 20/23/25 已 EOL，不作为新部署基线。Next 16 的 `next build` 不�
 
 本机 Cargo 统一走 `scripts/Invoke-VenueBuild.ps1`，只复用 `G:\Build\Venue\main、slot-1、slot-2`；
 禁止旧文档中的 PID target。两个并发构建、150 GiB 总预算和 F/G 空间准入见
-[BUILD_POLICY](scripts/BUILD_POLICY.md)。文档变更仅做静态检查，不重复业务全量测试。
+[BUILD_POLICY](BUILD_POLICY.md)。文档变更仅做静态检查，不重复业务全量测试。
 
 Ubuntu 默认本机 `Build-VenueUbuntu.ps1` 交叉编译后上传，专用根为 `G:\Build\Venue\ubuntu`，
 Cargo 仍复用 slot-2。服务器不承担日常编译；产物有 manifest、源码 commit 与 SHA256，
 编译/上传均不等于启动 writer 或完成接管。
 
-产品预览版本以 [VERSION](VERSION) 为准，版本范围见 [CHANGELOG](CHANGELOG.md)。
+产品预览版本以 [VERSION](../VERSION) 为准，版本范围见 [CHANGELOG](CHANGELOG.md)。
 旧三所的 `--legacy-v1-handoff` 前驱记录仍是当前启动前置条件，不能因 Stage 7 binary 已删除而绕过。
-六所策略闭环、旧 writer/WAL 接管和真实 UI 验收完成前，保持 alpha，不宣称“后端已全部完成”。
+当前第一批 Binance 策略、接管和真实 UI 验收未完成，保持 alpha；其他五所列第二批，Scalping 暂缓，不宣称“后端已全部完成”。

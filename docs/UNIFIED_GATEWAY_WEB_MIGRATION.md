@@ -19,6 +19,10 @@
 
 ## 2. 已批准结果
 
+本轮按两批收口：第一批只完善 Binance 的统一网关、Grid/Copy、手动交易与 Web；Gate.io、Bitget、Bybit、OKX、Hyperliquid 全部列入第二批验证与实盘，保留现有实现，不作为第一批完成的阻塞项。
+Scalping 暂缓处理，既有实现保持失败关闭，不开发、不开放自动交易，也不作为两批收工门槛。文中涉及 Scalping 的内容仅记录既有架构与后续恢复工作时的约束。
+Web 可以发起下单；它提交 `TradeIntent`，由 BFF→Control→Node→同一 risk/WAL/writer 执行，不在浏览器或 BFF 内另建交易所网关。当前已有后端与桌面手动交易桥，Web 表单/BFF 下单完整闭环仍待实现和验收。
+
 最终只保留一条生产 mutation 链：
 
 ```text
@@ -49,6 +53,8 @@ Market / Private / Control Fact
 ### 2.1 持续实盘授权
 
 本任务已获得对现有配置中真实交易账户进行重构验证和小额实盘操作的持续授权。执行本任务的 AI 可以：
+
+用户所说的 10U 是单笔名义价值上限，允许同一账户多次测试，也可能存在已有持仓。下列账户累计 10U、非零仓位拒绝新增风险等是当前实现的更严格技术门，不是把用户授权重新解释为累计测试额度；本次目录与文档整理不修改这些执行门。真实验证按批次推进，第二批不自动在第一批期间启动。
 
 - 在 Binance、Gate.io、Bitget、Bybit、OKX、Hyperliquid 的既有可用账户中选择符合账户 binding、能力契约和项目硬约束的交易对；
   初期既有 DOGE binding 保持该基础币：Bybit、OKX 使用 `DOGE/USDT`，Hyperliquid 使用实际永续报价 `DOGE/USDC`；
@@ -113,7 +119,7 @@ AI 只发起经授权的 operator/control 语义动作，不能直接调用 adap
 - 六所固定 Node 已接入 adapter-owned 公共盘口及公共成交；Bybit 重建完整簿、Hyperliquid 使用原生完整 L2 图像，OKX 按 `prevSeqId` 连续桥接。成交原生身份与本地 Session cursor 分离，批量事实有界无损轮转；Binance 保留显式原生聚合序列。Bybit/OKX/Gate 仅发布协议确认闭合的 K 线，Bitget/Hyperliquid 形成线不自动提升。行情只进入共享 MarketHub/FeatureSource；公共接收器和 fixture 通过不代表策略自动出单、私流热路径或逐所接管完成。
 - 当前 `apps/venue-web` 已采用 Next.js 16、React 19、TypeScript 和同源 BFF，包含响应式页面、会话、恢复、SSE、十进制及隔离交互测试；旧 KOL Web 只是行为参考，不是运行依赖。
 
-### 3.2 必须补齐的闭环
+### 3.2 已知缺口（按批次安排，Scalping 暂缓）
 
 - Copy 已有 semantic Applied 到同一账户 WAL、签名成交/仓位的物理桥；leader 权威事实自动接入、持续 ledger/drift repair 和完整产品端到端仍须验收。
 - 六所 Node 已组合 Account Runtime、Execution Lane 与 `AccountMutationHost`；Grid/Scalping 的生产私流驱动和物理接线、控制撤单/清仓及多 symbol 常驻调度仍须闭合，不能以纯 reducer 测试替代。
@@ -269,19 +275,13 @@ reconciliation 字段组合出等价且不误导的状态。
 
 不得在同一阶段同时重写 adapter transport、策略 reducer 和持久化格式。先把既有行为接到统一账户链，再逐项替换 transport 或布局。
 
-### 5.2 逐所顺序
+### 5.2 两批顺序
 
-代码和离线测试可以交错推进，真实 mutation 接管必须串行：
+第一批：Binance。完成该所网关、Grid/Copy、Web 手动下单和真实 UI 验收后独立收工，不等待其他交易所。
 
-1. Binance；
-2. Gate.io；
-3. Bitget；
-4. Bybit；
-5. OKX；
-6. Hyperliquid。
+第二批：Gate.io、Bitget、Bybit、OKX、Hyperliquid。沿用第一批共享链，逐所补齐差异、验证和实盘接管；真实 mutation 串行，不同时接管多个账户。第二批开始时再核验账户与能力，不把已有 adapter 代码视为验收通过。
 
-前三所完成从 Stage 7 到统一链的接管；后三所把现有 Canary host 纳入同一个常驻 Account Runtime。某所未完成退出条件时，
-不得以“adapter 已支持下单”为理由推进该所的 Copy 产品准入。
+Scalping 不在两批任务内。某所未完成退出条件时，不得以“adapter 已支持下单”为理由推进该所的 Copy 产品准入。
 
 ### 5.3 单所实施模板
 
@@ -389,7 +389,7 @@ Browser
 2. 只读总览：账户节点、策略、网关健康、Copy relation 和执行状态；
 3. Copy relation 创建/编辑、目标/实际/漂移、job/receipt/ledger；
 4. 订单、持仓、成交和 reconciliation；
-5. Pause/Resume/Stop/Flatten 与分层风险开关；
+5. Binance 手动限价/撤单表单与签名执行状态、Pause/Resume/Stop/Flatten；手动下单必须复用 `TradeIntent` 和同一账户执行链，不能把 Control 已接收显示为已成交；
 6. KOL/follower 产品页和必要角色视图；
 7. 经另行批准的用户自助注册、邀请、账户接入和凭证验证；最小受控会话认证已属于 Web 基础，不得延后到本步骤。
 
@@ -400,7 +400,7 @@ Browser
 页面功能完成后必须使用真实浏览器和实际 Control 投影逐页截图、复核并迭代，不能只凭组件测试判断布局合理。至少覆盖：
 
 - `390×844` 手机竖屏、`844×390` 手机横屏、`768×1024` 平板、`1440×900` 和 `1920×1080` 桌面；
-- 总览、Copy relation 列表/详情/编辑、账户、订单、持仓、成交、ledger/drift、网关健康、Pause/Stop/Flatten 确认；
+- 总览、Copy relation 列表/详情/编辑、账户、手动下单/撤单、订单、持仓、成交、ledger/drift、网关健康、Pause/Stop/Flatten 确认；
 - loading、empty、error、offline、stale snapshot、SSE reconnect、Rejected、Unknown 和 Reconciled；
 - 中英文长文本、极大/极小十进制、长交易对/账户 ID、多行错误和大量列表。
 
@@ -446,6 +446,8 @@ dispatch 启动 `<20ms`（均不含交易所网络）目标。Web 首次可用 s
 
 ### 7.1 多子任务执行方式
 
+以下是获准实现任务的有界拆分，不是文档/目录整理时自动启动全部开发的指令。T3 第一批只处理 Binance，T6 包含 Web 手动下单；其余五所 T3/T7/T8 均后移至第二批。Scalping 子任务暂停。
+
 本任务必须按有界子任务执行，由一个协调任务维护依赖、集成、全仓门禁和最终人工协助清单。各子任务只修改明确负责的目录；
 共享 DTO、WAL/Owner 契约和 migration 先由契约子任务落地并通过测试，消费者再接入。推荐拆分如下：
 
@@ -457,7 +459,7 @@ dispatch 启动 `<20ms`（均不含交易所网络）目标。Web 首次可用 s
 | T3 交易所接入 | 每次只负责一个 `venue-gateway-*` 与对应 Node binding | T1 | adapter contract、恢复、Canary、接管证据 |
 | T4 Control/投影 | `apps/venue-control`、SQLx migration、schema v2 | T0、T2 | 查询、命令、ledger/drift、Web BFF 契约 |
 | T5 Web 基础 | `apps/venue-web` shell、BFF、session、SSE、CSS | T0、T4 契约 | 响应式壳、恢复门、只读总览 |
-| T6 Web 产品页 | Copy/账户/订单/风险/控制页面 | T4、T5 | 桌面/移动端关键流程 |
+| T6 Web 产品页 | Copy/账户/手动下单/订单/风险/控制页面 | T4、T5 | Binance 桌面/移动端关键流程 |
 | T7 质量与发布 | scripts、CI、二进制隔离、PG/Web E2E | 各实现子任务 | 全仓和产品门禁报告 |
 | T8 旧入口清理 | Stage 7/旁路入口、兼容读取、CODEMAP | T1–T7 与逐所接管 | 调用点清零、兼容范围、删除证明 |
 
@@ -482,7 +484,7 @@ dispatch 启动 `<20ms`（均不含交易所网络）目标。Web 首次可用 s
 #### M1：统一账户执行脊柱
 
 - Account Runtime 组合 Registry、Private Router、Execution Lane、AccountMutationHost 和 Reconciler；
-- Grid、Scalping、Copy 使用同一个规范 intent；
+- Grid、Copy、手动交易使用同一个规范 intent；Scalping 保留接口但暂停接入验收；
 - 六个固定 Node binary 只链接一个 adapter；
 - 账户级 writer/WAL/Unknown 契约测试不含交易所分支。
 
@@ -493,15 +495,15 @@ dispatch 启动 `<20ms`（均不含交易所网络）目标。Web 首次可用 s
 - 重复 delivery 幂等，Unknown 不重投，跨零分两轮；
 - 在 mock/fixture 环境完成崩溃边界和端到端测试。
 
-#### M3：旧三所接管
+#### M3：第一批 Binance 接管
 
-- Binance、Gate.io、Bitget 按第 5 节模板逐家接管；
+- Binance 按第 5 节模板完成接管；Gate.io、Bitget 后移第二批；
 - 每家先完成行为等价测试，再做单账户串行 Canary；可重复多轮，但任意时刻只有一轮持有 writer；
 - 当前一所完成 Stop 和签名收敛后才推进下一所。
 
-#### M4：六所统一 resident
+#### M4：第二批五所验证与接管
 
-- Bybit、OKX、Hyperliquid 的现有 host 命令并入常驻 Node；
+- Gate.io、Bitget、Bybit、OKX、Hyperliquid 沿用现有常驻 Node/host，补齐能力差异并逐所验证，不重建网关；
 - 六所共用启动、恢复、控制和观测投影；
 - Node→Control 观测上传固定为 loopback `/v2/account-node/projection`：Node 先将 envelope 写入耐久 outbox，按 node generation/sequence/digest 串行重放，Control 在同一 PostgreSQL 事务中提交 cursor、snapshot 与 signed execution facts；重复 envelope 幂等，冲突、跳序、跨账户内容或错误 rollover 一律失败关闭。该回显不是 writer、WAL、capability 或 dispatch authority；
 - 每个实例的 outbox 游标按账户、node_id、instance_id 分开保存；不同实例不可共用一个 sequence。上传仅替换该实例的策略/订单/持仓等投影，账户汇总只接受较新事实，不能删除兄弟实例或其他账户；旧 cursor 的实例键由原 envelope 迁移，缺失或冲突拒绝迁移；
@@ -516,9 +518,9 @@ dispatch 启动 `<20ms`（均不含交易所网络）目标。Web 首次可用 s
 
 #### M6：受控写操作与产品验收
 
-- Web 高风险命令、幂等、审计和失败关闭验收；
+- 第一批完成 Binance Web 下单/撤单与高风险控制的幂等、审计和失败关闭验收；
 - Copy 单账户、单关系、小额 Canary；
-- 六所逐家产品准入，不因网关准入自动扩大 Copy 准入。
+- Binance 第一批独立准入；其余五所第二批逐家准入，不因网关准入自动扩大 Copy 准入。M4 不阻塞第一批 M5/M6。
 
 #### M7：旧入口退休
 
@@ -546,7 +548,7 @@ scripts/verify_repository_hygiene.ps1
 - `scripts/verify_workspace_quality.ps1`；
 - `scripts/verify_venue_node_binaries.ps1`；
 - `scripts/verify_venue_node_binary_isolation.ps1`；
-- 默认 `scripts/Build-VenueUbuntu.ps1 -ExpectedRevision <40位commit> -ReleaseId <id> -CheckOnly`，可显式指定干净 `-SourceRoot`；预检后去掉 `-CheckOnly`，在本机受控 slot-2 编译六所 Linux ELF 产物至 `G:\Build\Venue\ubuntu\releases/<id>`。固定 GNU/Linux glibc 2.35 target、精确工具版本、源码 revision、SHA256 与不可覆盖的 manifest，专项为 `test_venue_ubuntu_build.ps1`。不在弱集成服务器日常编译；Linux 构建机仍可使用 `package_venue_node_linux_release.sh` 备用，不启动服务，完整约束见 `scripts/BUILD_POLICY.md`；
+- 默认 `scripts/Build-VenueUbuntu.ps1 -ExpectedRevision <40位commit> -ReleaseId <id> -CheckOnly`，可显式指定干净 `-SourceRoot`；预检后去掉 `-CheckOnly`，在本机受控 slot-2 编译六所 Linux ELF 产物至 `G:\Build\Venue\ubuntu\releases/<id>`。固定 GNU/Linux glibc 2.35 target、精确工具版本、源码 revision、SHA256 与不可覆盖的 manifest，专项为 `test_venue_ubuntu_build.ps1`。不在弱集成服务器日常编译；Linux 构建机仍可使用 `package_venue_node_linux_release.sh` 备用，不启动服务，完整约束见 `docs/BUILD_POLICY.md`；
 - `scripts/verify_venue_node_linux_release.ps1`；
 - `scripts/verify_gateway_candidate_contract.ps1`；
 - `scripts/verify_postgres_integration.ps1`；
@@ -592,26 +594,26 @@ CI 还必须负向扫描 Web 产物和源码，拒绝旧 `/v1` endpoint、`TESTN
 
 ## 9. 完成定义
 
-只有同时满足以下条件，整个长任务才完成：
+第一批独立完成定义如下；第二批是单独排期，不再把全部六所或 Scalping 作为第一批收工门槛：
 
 1. 六个固定 Node binary 均通过同一账户 Runtime 和 Execution Lane 进行所有生产 mutation。
 2. Binance、Gate.io、Bitget 不再有 Stage 7 生产 writer 调用点；Bybit、OKX、Hyperliquid 不再有旁路 Canary writer。
-3. Grid、Scalping、Copy 都只能输出规范语义意图，无法直接访问 adapter mutation。
+3. 第一批 Grid、Copy 和手动交易只能输出规范语义意图，无法直接访问 adapter mutation；Scalping 暂缓。
 4. Copy 从 leader 权威事实到 follower 签名成交/持仓、ledger 和 drift repair 形成耐久闭环。
-5. 六所各自通过能力契约、恢复、Unknown、Stop/Flatten、单 writer 和小额 Canary。
-6. `apps/venue-web` 完成响应式主要页面、BFF、恢复门、关键控制和桌面/移动端验收。
+5. Binance 通过能力契约、恢复、Unknown、Stop/Flatten、单 writer 和小额 Canary；其他五所列入第二批，不标记通过。
+6. `apps/venue-web` 完成 Binance 响应式主要页面、手动下单/撤单、BFF、恢复门、关键控制和桌面/移动端验收。
 7. 指定主机上的 Gateway、Control、BFF 和 Web 已完成真实连通、分段响应速度评估、关键页面截图复核和至少一轮布局/交互调整。
 8. VenueFlow 明确定位为内部工具，不与 Web 维护两套用户产品逻辑。
 9. 旧生产入口、重复文档入口和无调用兼容代码已按安全退出条件清理。
 10. 全仓质量、二进制隔离、PostgreSQL、Web 构建和仓库卫生门禁全部通过。
 
+第二批沿用以上共享成果，对其余五所分别完成能力差异、恢复、产品流程、真实 Canary 与 UI 连通验收。Scalping 只有另行恢复范围后才安排。
+
 ## 10. 明确不做
 
 - 不重写已经满足契约的交易所签名和协议实现；
 - 不把 `G:\kol` 的 Rust 后端、网关、数据库或多服务拓扑搬入 Venue；
-- 不让 Web、BFF、Control 或 PostgreSQL 直接下单；
+- Web 允许发起下单，但 BFF、Control、PostgreSQL 不持有物理 writer，执行统一交给 Node；
 - 不在迁移中同时运行两个 writer；
-- 不以删除旧链代码代替旧 WAL、订单和持仓接管；
 - 不为“六所统一”伪造交易所不支持的能力；
 - 不在凭证托管方案获批前开放用户自助提交交易所 secret；
-- 不修改或依赖 `bak/`，除非用户另行点名具体旧行为。

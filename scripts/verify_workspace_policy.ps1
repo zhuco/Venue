@@ -16,11 +16,11 @@ $allowedDependencies = @(
     'venue-gateway-bybit', 'venue-gateway-gate', 'venue-gateway-hyperliquid', 'venue-gateway-okx',
     'venue', 'venue-indicators', 'venue-runtime', 'venue-storage', 'venue-strategies', 'wasm-bindgen', 'wasm-bindgen-futures', 'web-sys', 'zeroize'
 )
-# Approved account password/encryption and desktop timezone dependencies are not workspace-wide
+# Approved account password/encryption, desktop timezone and OS vault dependencies are not workspace-wide
 # exemptions. Their concrete uses and tests remain in the owning application only.
 $scopedDependencies = @{
     'venue-control' = @('argon2', 'ring')
-    'venueflow' = @('time')
+    'venueflow' = @('time', 'keyring')
 }
 
 function Get-TrackedActivePaths {

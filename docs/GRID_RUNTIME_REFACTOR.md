@@ -6,6 +6,8 @@
 
 本文是多策略、多交易所实盘和对冲网格的唯一长期开发契约，说明当前采用的架构、边界、成交热路径、恢复规则、迁移顺序与验收要求。
 
+当前实施范围：第一批 Binance，第二批 Gate.io、Bitget、Bybit、OKX、Hyperliquid 验证与实盘；Scalping 暂缓，相关段落只保留已有安全约束，不作为本轮开发或收工要求。Web 可以提交手动交易语义，仍由 Node 的唯一账户执行链下单。目录整理不变更风险、WAL 或已存在的仓位。
+
 [`ARCHITECTURE.md`](ARCHITECTURE.md) 说明合并跟单、六交易所网关、指标和桌面 UI 后的当前 workspace。六所是网关目标覆盖，
 网关只接受精确 `LIVE` 并只使用生产 endpoint；这不自动扩大当前 Stage 7 网格的三所实盘准入，新增交易所仍必须独立完成策略、恢复和接管验收。
 本文现有 Shadow/verify 是策略与工件证据流程，不是第三种网关运行模式。
@@ -392,7 +394,7 @@ G:\Venue\artifacts\<exchange>\LIVE\<trading_account_id>\
 
 实盘 resident 由进程监督器以 `on-failure` 语义托管：异常非零退出可从相同受准入发布和恢复工件重新启动；应用内显式 Stop 完成撤单后正常退出，监督器不得将其重新拉起。监督器不替代唯一 writer、WAL、签名对账或准入校验。
 
-Ubuntu Node 发布默认先在本机通过 `scripts/Build-VenueUbuntu.ps1` 交叉编译；独立版本化产物位于 `G:\Build\Venue\ubuntu\releases`，复用现有 slot-2 构建锁。弱集成服务器只接收产物并核验哈希、架构和动态库，不承担日常 Cargo 编译。编译/上传不授权启动 writer，也不替代原 WAL、旧 writer 停止及签名接管证据；构建入口与资源边界见 `scripts/BUILD_POLICY.md`。
+Ubuntu Node 发布默认先在本机通过 `scripts/Build-VenueUbuntu.ps1` 交叉编译；独立版本化产物位于 `G:\Build\Venue\ubuntu\releases`，复用现有 slot-2 构建锁。弱集成服务器只接收产物并核验哈希、架构和动态库，不承担日常 Cargo 编译。编译/上传不授权启动 writer，也不替代原 WAL、旧 writer 停止及签名接管证据；构建入口与资源边界见 `docs/BUILD_POLICY.md`。
 
 恢复不要求把整个进程做成分布式系统。单机顺序恢复、一个账户一个 writer 足够当前规模。
 
@@ -455,7 +457,7 @@ Scalping Node 配置必须显式给出 `scalping.parameter_release_id/owner_scop
 
 ### D. 逐交易所迁移
 
-真实 mutation 按 Binance、Gate.io、Bitget、Bybit、OKX、Hyperliquid 的顺序逐家推进，交易所之间不并行接管：
+第一批只接管 Binance；其余五所列入第二批验证与实盘。每批内部真实 mutation 逐家串行，第二批不阻塞第一批独立收工：
 
 1. 停止旧 writer，确认账户进程锁已释放；读取当前 checkpoint 和命令 WAL，所有 `Submitted/Unknown` 先完成签名对账。
 2. 只读获取账户模式、实时规则、余额、全部持仓腿、支持的订单族、开放订单和必要成交历史；不支持的订单族由 adapter 明确拒绝，不要求伪造空页或永久保存原始报文。
@@ -503,7 +505,7 @@ Copy Install 的领取租期精确截断于 immutable job 截止时间，不改�
 ./scripts/verify_repository_hygiene.ps1
 ```
 
-本机缓存与 Ubuntu 本地交叉编译按 `scripts/BUILD_POLICY.md`；文档更新只做静态检查，不能因本文列出全量门禁就每次重跑。
+本机缓存与 Ubuntu 本地交叉编译按 `docs/BUILD_POLICY.md`；文档更新只做静态检查，不能因本文列出全量门禁就每次重跑。
 
 还必须覆盖：
 
@@ -539,7 +541,6 @@ Copy Install 的领取租期精确截断于 immutable job 截止时间，不改�
 - 在网格/账户 Runtime 内嵌 Web 面板或 Windows UI；获准的独立 `apps/venue-web` 和 VenueFlow 可开发无凭证 Control 客户端，
   但不得进入成交热路径或持有账户私流、writer、WAL 与 mutation 客户端；
 - 为未来功能预建未被当前任务使用的模块；
-- 让 `bak/` 参与构建、运行或持久化。
 
 只有当单机账户进程的 CPU、网络或交易所连接上限被实测证明不足时，才讨论拆分独立网关。当前规模下不提前增加这类复杂度。
 

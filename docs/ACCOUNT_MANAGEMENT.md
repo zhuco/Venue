@@ -1,6 +1,6 @@
 # 账户与 API 管理
 
-入口：[README](README.md) / [开发指南](DEVELOPMENT.md)。本页描述已提交的 Control 账户管理与客户端边界，不包含其他工作区未提交的实验功能。
+入口：[README](../README.md) / [开发指南](DEVELOPMENT.md)。本页描述 Control 账户管理及本次一并提交的桌面凭证库边界。
 
 ## 产品边界
 
@@ -25,7 +25,9 @@ Node 的生产执行接线和实盘准入仍受 `GRID_RUNTIME_REFACTOR.md` 约�
 
 本次获准的 UI 绑定对原“凭证仅来自环境”的限制增加一个窄例外：
 
-- UI 仅在表单和请求期间持有输入，使用掩码、清理密码编辑历史，不写入界面持久化配置、日志、URL、错误信息或 artifacts。
+- 交易所 API Key 仅在 UI 表单和请求期间持有，使用掩码、清理编辑历史，不写入界面配置、系统登录凭证库、日志、URL、错误信息或 artifacts。
+- Windows 桌面可通过 `account_center/vault.rs` 保存 Venue 登录资料及会话至系统凭证库，按 Control endpoint 隔离，过期会话丢弃；记住密码开关控制登录资料保存。非 Windows 无本地凭证库回退。记录不经过 eframe 普通配置，不包含交易所 API Key 或账户投影。
+- `keyring =3.6.3` 仅启用 Windows native 后端，限定在 VenueFlow；现有 `secrecy/zeroize` 只负责内存清理，`ring` 只提供密码学原语，均不能替代系统凭证库。复用 lockfile 依赖，专项以 mock store 验证保存/恢复/退出/过期，不访问用户真实凭证库。
 - 仅向显式配置的 HTTPS 或本机 HTTP 地址提交。更改 Control 地址时，先丢弃旧会话及异步回复；匿名行情不受影响。
 - Control 的账户管理模块使用 AES-256-GCM 随机 nonce 加密凭证，认证附加数据绑定用户和凭证 ID；PostgreSQL 仅保存密文、Key 指纹、掩码和非秘密验证结果。
 - 加密主密钥只来自 `VENUE_ACCOUNT_MASTER_KEY` 进程环境变量，为 Base64 编码的 32 字节随机值。缺失、格式错误或解密认证失败均拒绝；不得把主密钥存入数据库、TOML、日志或仓库。重启必须使用同一主密钥，应由运维在仓库外安全备份。

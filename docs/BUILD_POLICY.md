@@ -1,0 +1,73 @@
+# 本机 Rust 构建约束
+
+适用 Windows 本机及其全部 Venue 工作树。保留现有源码、Git、数据库、发布包和历史目录，本阶段不执行自动清理。
+
+## 入口
+
+```powershell
+# 只检查路径、容量和预算；不编译，不创建缓存，不删除文件。
+./scripts/Invoke-VenueBuild.ps1 -CheckOnly
+
+# 按改动影响面验证；参数使用数组，不传 --target-dir / --config。
+./scripts/Invoke-VenueBuild.ps1 -CargoArguments @('check','--locked','-p','venue-runtime')
+./scripts/Invoke-VenueBuild.ps1 -CargoArguments @('test','--locked','-p','venue-runtime')
+
+# 以下专项入口自带锁，直接执行，不再套一层 Invoke-VenueBuild。
+./scripts/verify_venue_node_binaries.ps1
+```
+
+## 固定缓存与锁
+
+- 只允许 `G:\Build\Venue\main`、`slot-1`、`slot-2`。主工作区默认 main，其他工作树按规范路径的 SHA256 稳定映射到两个槽；槽可能共享，因此必须串行持锁。
+- 网关专项固定 slot-1，Node binary 专项固定 slot-2。`-CargoTargetDir` 只接受三个白名单路径，不能指定 PID、时间戳、任意新目录或嵌套 target。
+- `.guard` 保存排他文件锁：所有入口共用两个并发许可，每槽另有独占锁。等待最多60秒后报忙；不得抢锁、另开目录或终止其他任务。
+- 专项脚本持锁直到构建、测试、二进制扫描及产物复制完成；`finally` 释放锁并还原 CARGO_TARGET_DIR、CARGO_BUILD_TARGET_DIR、CARGO_BUILD_BUILD_DIR、CARGO_INCREMENTAL、RUSTC_WRAPPER、调试配置、TEMP/TMP 和工作目录；环境变量未设置与空字符串须分别恢复。
+- 临时文件固定放在 `.tmp/<slot>`；不按会话创建新的构建缓存。测试自身的小型 fixture 可以使用唯一名称，不得把编译产物放入 fixture 目录。
+
+## 空间与编译策略
+
+- 准入时检查 `G:\Build\Venue` 下普通文件合计不超过150 GiB（包含旧目录和临时文件）；跳过重解析点，拒绝受控路径上的重解析点。
+- 同时要求物理宿主 F 至少100 GiB空闲、虚拟盘G至少20 GiB空闲。排队后再次检查；超限拒绝新任务，不自动清理。
+- 这是入口准入阈值，不是系统硬配额，也不是编译期间的连续监控。已运行的单次构建可能跨过阈值；直接绕过入口的进程不受脚本锁约束。磁盘情况不明时停下报告，不声称绝对限额。
+- main 开启增量，隔离槽关闭增量；dev/test 保留行号级调试信息，第三方依赖不生成完整调试符号。release 优化配置不变。需要完整调试信息时明确申请临时调整，而不是复制另一份 target。
+- main 使用直接增量编译，guard 内临时设置 `RUSTC_WRAPPER=''`，覆盖 Cargo 全局配置中的外层 wrapper，避免 sccache 拒绝 `CARGO_INCREMENTAL=1`（包括编译器版本探测）。退出或失败后精确恢复原值，不修改全局配置；隔离槽与 hosted CI 保留原 wrapper，`RUSTC_WORKSPACE_WRAPPER` 不变。显式非 sccache 的 `RUSTC_WRAPPER` 或非空 `CARGO_BUILD_RUSTC_WRAPPER` 在准入前拒绝，不静默关闭；主线若需要自定义外层 wrapper，须先明确调整此政策。
+- 局部改动只测试受影响包和直接契约；依赖、公共契约或发布前集中全量验证。保持工具链、features 和构建参数稳定，不常规执行 cargo clean。
+
+## 清理边界与生效范围
+
+- 不自动删除旧目录，也不安装后台清理任务。后续清理须先登记精确目录、确认无活动使用并取得对应锁；不能因为目录叫 target/Build 就认定全部可删除。
+- 构建缓存清理不得删除业务源码、Git、数据库、发布产物、恢复备份、未决WAL和checkpoint。项目目录整理须另行明确授权；清理G内缓存不保证F上的动态VHDX立即缩小。
+- 全局和项目 AGENTS.md 提供会话规则；旧会话开始下一次构建前需重新读取，必要时重启会话。这不是强制安全沙箱。
+- GitHub托管CI继续使用既有 RUNNER_TEMP 内的 job-owned target，不使用本机F/G盘阈值；保留同目录锁、两项并发和环境恢复，CI空闲下限2 GiB。
+
+## 本地 Ubuntu 六所 Node 编译（默认发布入口）
+
+`45.77.253.180` 只接收本机编译好的产物并执行运行核验，不承担日常 Cargo 编译。Windows 本机使用既有
+Rust/Cargo 1.98.0、cargo-zigbuild 0.23.0、Zig 0.16.0 和 `x86_64-unknown-linux-gnu` 标准库，不依赖 WSL/Docker。
+交叉目标固定为 `x86_64-unknown-linux-gnu.2.35`，即 x86-64 GNU/Linux、glibc 2.35 基线；上传后仍需检查服务器动态库兼容性。
+版本后缀和缓存环境使用 [cargo-zigbuild 官方契约](https://github.com/rust-cross/cargo-zigbuild#specify-glibc-version)。
+
+```powershell
+# SourceRoot 必须为指定 commit 的干净 checkout，不包含工作区未提交的开发改动。
+./scripts/Build-VenueUbuntu.ps1 -SourceRoot G:\Build\Venue\ubuntu\source -ExpectedRevision <完整40位commit> -ReleaseId <版本号> -CheckOnly
+# 预检后去掉 -CheckOnly 编译六所；脚本不自动上传或启动服务。
+./scripts/test_venue_ubuntu_build.ps1
+```
+
+- 专用根为 `G:\Build\Venue\ubuntu`：`source` 可存固定 revision 的独立 checkout，`releases/<版本号>` 仅含六 binary、SHA256SUMS、manifest；工具缓存为 `zig-cache/zig-local-cache/zigbuild-cache`。源码只用干净 Git clone/bundle，不复制 `.env`、账户工件或未提交文件；已有 checkout 不自动 reset。
+- Cargo 仍使用既有 `slot-2` 锁和两个全局并发许可，其自动目标子目录 `slot-2/x86_64-unknown-linux-gnu/release` 不是另设 target root。六所按顺序、每次两个 Cargo jobs；全部目录计入 150 GiB 总预算。不清理 Windows 缓存，不安装工具、不改全局配置。
+- `-CheckOnly` 不新建输出、锁或缓存；正式构建前后均校验 HEAD 和干净状态，manifest 另记录构建入口/辅助/guard 脚本哈希，运行期间脚本变动则拒绝发布。源码 checkout 必须由构建独占，其他任务不得在构建期间同步或编辑；前后 Git 检查不是文件系统只读沙箱。输出要求 ELF64/x86-64，拒绝误复制 Windows exe；目录原子转为新 release，已有 release 不覆盖。失败保留缓存和本次 `.stage.*` 目录，不把不完整目录当发布包。
+- 入口持锁覆盖构建、ELF/哈希核验和复制，finally 还原 Cargo/Zig 环境并释放锁。版本化产物仅表示编译完成；签名 preflight、旧 writer/WAL 接管、真实网关、UI 和性能验收仍单独执行。
+- 脚本专项只跑静态/离线 fixture 和受影响编译，不因构建入口修改重跑全业务测试；`test_venue_ubuntu_build.ps1` 的小型验证工件保留在专用根，不执行交易或服务操作。
+
+## Linux 主机本地打包（备用，不在弱服务器日常使用）
+
+`package_venue_node_linux_release.sh` 只生成发布目录，不启动 Node、操作账户或部署服务。必须显式指定
+`--release-id`、`--output-root`、`--build-root` 和完整 40 位 `--expected-revision`；源码、发布根和构建根互不包含。
+
+- 源码必须是指定 revision 的干净 Git checkout，工具链为 Rust/Cargo 1.98.0。传输源码时保留可验证的 Git revision，不以缺少 `.git` 的压缩包冒充可发布 checkout。
+- `--preflight-only` 不创建缓存、锁或发布目录；构建/发布所在文件系统均须至少有 20 GiB 空闲。预检通过不代表已经完成 Linux 编译或服务器接管。
+- 同一构建根复用 `cargo-target` 和 `tmp`，持有 `venue-node-build.lock` 后才构建，排队最多 60 秒并重新预检；六所逐个构建，每次一个 Cargo job。不另开时间戳 target，不抢锁或终止其他构建。
+- 不自动删除构建缓存。失败仅可删除本次创建且规范路径校验通过的发布暂存目录；版本化 release 不覆盖，只包含六个固定 Node binary、`SHA256SUMS` 和 `manifest.json`。
+- 20 GiB 是准入阈值，不是持续磁盘配额。正式发布仍需对应源码的验证基线；构建成功不等于 writer、旧 WAL、真实网关或 UI 验收完成。
+- Windows 的 `test_venue_node_linux_release.ps1` 用 Git Bash 和假 Cargo/Rust/flock 检查脚本编排、缓存复用、零写预检、revision 变化及发布竞争；不执行真实 Cargo。真实 Linux 锁和符号链接边界必须在目标主机另外验证，不能用该 fixture 代替。

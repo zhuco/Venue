@@ -7,7 +7,7 @@
 ## 1. 工作区与环境
 
 主工作区 `G:\Venue`，隔离工作树用于开发；只修改当前获准范围，不顺手清理他人的改动。
-`bak/` 冻结；禁止扫描/修改迁移来源来代替当前代码。秘密只通过规定的环境/根 `.env` 注入，日志中不输出值。
+长期文档集中在 `docs/`，源码按 `apps/`、`crates/`、根兼容 `src/` 分工；`bak/` 已退出项目维护范围，用户已授权删除且不备份。秘密只通过规定的环境/根 `.env` 注入，日志中不输出值。
 
 Rust/Cargo 1.98.0，Web 默认 Node.js 24 + npm lockfile。数据库为 PostgreSQL + SQLx，
 集成测试使用独立测试数据库/随机 schema；不要把主线 `.env` 的生产连接直接当作测试库。
@@ -38,7 +38,7 @@ Windows 所有 Cargo 命令都经过 guard。下面是需要全量基线时的�
 
 ## 3. 构建缓存与 Ubuntu
 
-[BUILD_POLICY](scripts/BUILD_POLICY.md) 是完整构建约束。仅有
+[BUILD_POLICY](BUILD_POLICY.md) 是完整构建约束。仅有
 `G:\Build\Venue\main`、`slot-1`、`slot-2` 三个 Cargo 缓存；两个受控构建并发，槽等待最长 60 秒。
 禁止按 PID/任务建 target、绕过 CARGO_TARGET_DIR、常规 cargo clean 或终止别人的构建。
 总预算 150 GiB、F 空闲 100 GiB、G 空闲 20 GiB；不足时报告，不自行删缓存。
@@ -50,10 +50,10 @@ Ubuntu 默认通过 `scripts/Build-VenueUbuntu.ps1` 本机编译；先对干净�
 
 ## 4. 本地应用
 
-- [Node README](apps/venue-node/README.md) 说明真实 CLI、runtime JSON 和旧三家前驱记录要求。
+- [Node README](NODE.md) 说明真实 CLI、runtime JSON 和旧三家前驱记录要求。
 - [账户管理](ACCOUNT_MANAGEMENT.md) 说明 Control/桌面启动环境；运行前先受控 build，
   再从 guard 选择的固定缓存启动已构建 binary，不用长期 `cargo run` 占用构建槽。
-- [Web README](apps/venue-web/README.md) 说明 BFF 会话、同源 HTTPS、npm 验证与五视口测试。
+- [Web README](WEB.md) 说明 BFF 会话、同源 HTTPS、npm 验证与五视口测试。
 - 所有真实交易须重新满足单 writer、风险、WAL、签名事实和获准任务范围；文档更新不触发实盘测试。
 
 UI 完成标准包括移动/桌面布局截图、空/错误/离线状态、作用域与确认交互、网关联通和分段延迟。
@@ -63,7 +63,7 @@ UI 完成标准包括移动/桌面布局截图、空/错误/离线状态、作�
 
 先查停用清单再改调用点。已删除 CLI 不恢复；冻结兼容只修正必需恢复问题，不增加新策略或新授权层。
 旧持久化字段不能为符合新类型而回写。只有生产调用点清零、行为等价、恢复兼容和实盘接管证据齐全，
-才可删除被替代的执行壳。`bak/` 不在本轮清理范围。
+才可删除被替代的执行壳。删除迁移来源目录不改变当前执行代码的安全约束。
 
 依赖审计先查 workspace/lockfile，再看官方兼容与支持政策；“版本较旧”“本项目不再新增调用”
 与“上游已弃用”分别记录。不批量更新依赖来凑最新版，不预装新的 ORM/HTTP/runtime。
@@ -76,5 +76,5 @@ UI 完成标准包括移动/桌面布局截图、空/错误/离线状态、作�
 3. 在隔离树验证并提交本批改动；建立主线回退分支，优先 `merge --ff-only`，不做 hard reset。
 4. 必要时仅暂存精确重叠文件，按具体 stash OID 恢复并核对内容，不全工作区盲目 stash/pop。
 5. 合并后核对提交及原本地文件哈希；不把未验证的他人改动算进当前版本。
-6. 产品号在 [VERSION](VERSION)，变更范围在 [CHANGELOG](CHANGELOG.md)；本地 tag 指向准确提交，
+6. 产品号在 [VERSION](../VERSION)，变更范围在 [CHANGELOG](CHANGELOG.md)；本地 tag 指向准确提交，
    不自动 push、发布安装包或改变服务器服务。

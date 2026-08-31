@@ -4,7 +4,7 @@
 
 本页管理项目自己的旧方法和功能，不宣称同名上游库已经弃用。
 “入口已删除”不等于历史源码全删，“源码冻结”不等于远端旧进程已停止。
-本轮只清理失效文档和标记状态；不删除代码、数据库、`bak/` 或运行恢复工件。
+长期说明统一在 `docs/`，旧路径仅保留必要导航。用户已授权删除 `bak/` 且不备份；数据库和运行恢复工件不在清理范围。
 
 ## 1. 已停用的生产入口
 
@@ -13,7 +13,7 @@
 | 根 `hedged-grid-binance/gate/bitget` binary、对应 feature 和旧发布入口 | 根 manifest 已移除；使用 `apps/venue-node` 六个固定 binary。不得按旧教程恢复 |
 | Node 后透传 Stage 7 的 `grid-stop`、`grid-external-algo-cancel`、`grid-legacy-binance-stop` 等 | 当前 Node 不接受这些子命令；常驻模式使用 `run --runtime-config`，实例动作通过 Control 语义命令，范围见 Node README |
 | 旧 Scalping 手造 candidate 直送 Host 的组合路径 | 生产不再从旧壳进入；Node 消费真实 FeatureSource/engine/Actor checkpoint，保护缺失仍禁止自动入场 |
-| KOL 重复网关/后端、旧 `/v1` DTO、UI 模拟交易/旧 mutation gate | 不迁移为新系统运行依赖；Web 重写为 schema v2/BFF，UI 不直接交易 |
+| KOL 重复网关/后端、旧 `/v1` DTO、UI 模拟交易/旧 mutation gate | 不迁移为运行依赖；Web 使用 schema v2/BFF，可以提交下单语义，由 Node 统一执行 |
 | PID/会话专用 Cargo target、随手指定 `--target-dir` | 停用；仅 main/slot-1/slot-2 与受控脚本 |
 | 弱服务器上的日常 Cargo 编译 | 不作默认方案；本机 `Build-VenueUbuntu.ps1` 编译后受控上传，Linux 打包脚本只是备用 |
 
@@ -30,7 +30,9 @@
 | `crates/venue-runtime/src/account/physical_recovery*`、各 adapter 旧 recovery collector | 迁移兼容，不发行当前账户 writer 权限 | 对应恢复数据与契约有替代并验证 |
 | `crates/venue-gateway-api/src/capability_promotion.rs` 的普通 `promote/authorize` | 保持 `AuthorityUnavailable`；probe 不能提升成交易权限 | 旧契约引用清零，不破坏失败关闭测试 |
 | 根 package 直接 `tungstenite` 与现有阻塞 transport | 本项目冻结例外；不增加旧调用点 | 行为等价、延迟和断线恢复验证后逐步替换 |
-| `bak/`、`G:\kol` | 冻结迁移参考，不构建/运行 | 不在当前授权清理范围 |
+| `G:\kol` | 外部 UI 行为参考，不构建/运行 | 本项目清理不删除外部项目 |
+
+Scalping 暂缓开发与实盘验收，不因已有菜单、engine 或行情 Ready 就开放自动交易。Binance 为第一批，其余五所第二批验证与实盘。
 
 ## 3. 仍在使用，不能误删
 
