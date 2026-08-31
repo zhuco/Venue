@@ -1,342 +1,178 @@
-use eframe::egui::{self, Align, Color32, Frame, Layout, Margin, RichText, Stroke};
+use eframe::egui::{self, Color32, RichText, Stroke};
 use venue_control_protocol::{StrategyLifecycle, TradingAction};
 
 use crate::{client::ControlClient, model::AppModel, theme, trading::build_trade_intent};
 
 pub fn show(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
+    if let Some(action) = controls(ui, model) {
+        apply_action(model, client, action, ui.ctx());
+    }
+}
+
+// Rendering produces the same semantic action as keyboard input, with no network side effect.
+pub(crate) fn controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAction> {
+    model.refresh_trading_price(ui.ctx());
+    egui::ScrollArea::vertical()
+        .id_salt("trade-dock-scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| compact_controls(ui, model))
+        .inner
+}
+
+fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAction> {
     let language = model.preferences.language;
     let strategy = model.selected_trading_strategy();
-    let symbol = strategy.as_ref().map_or_else(
-        || model.preferences.selected_symbol.clone(),
-        |strategy| strategy.symbol.to_string(),
-    );
-    let (base_asset, quote_asset) = symbol_assets(&symbol);
-    let selected_size = model
-        .preferences
-        .trading
-        .size_presets
-        .get(model.trade_dock.selected_size_preset)
-        .copied();
+    let symbol = model.preferences.selected_symbol.clone();
+    let (base, quote) = symbol_assets(&symbol);
+    let mut action = None;
+    ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+    ui.spacing_mut().interact_size.y = 22.0;
+    ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
 
     ui.horizontal(|ui| {
-        if let Some(strategy) = &strategy {
-            ui.colored_label(
-                theme::SELL,
-                RichText::new(format!("● {}", strategy.mode)).strong(),
-            );
-            ui.strong(strategy.venue.to_string());
-            ui.monospace(strategy.symbol.to_string());
+        let running = strategy
+            .as_ref()
+            .is_some_and(|strategy| strategy.lifecycle == StrategyLifecycle::Running);
+        let scope = if model.preferences.execution_account_id.is_none() {
+            crate::i18n::text(language, crate::i18n::TextKey::NoExecutionAccount)
+        } else if running {
+            "LIVE"
         } else {
-            ui.colored_label(
-                theme::WARNING,
-                RichText::new(label(language, "● 未选择作用域", "● No scope")).strong(),
-            );
-            ui.monospace(&symbol);
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            status_badge(
-                ui,
-                if model.preferences.trading.hotkeys_enabled {
-                    "KEY ON"
-                } else {
-                    "KEY OFF"
-                },
-                model.preferences.trading.hotkeys_enabled,
-            );
-            status_badge(
-                ui,
-                if model.preferences.trading.post_only {
-                    "PO ON"
-                } else {
-                    "PO OFF"
-                },
-                model.preferences.trading.post_only,
-            );
-            status_badge(ui, "GTC", false);
-            status_badge(ui, "LMT", false);
-        });
-    });
-
-    ui.add_space(6.0);
-    summary_frame().show(ui, |ui| {
-        ui.columns(2, |columns| {
-            columns[0].label(
-                RichText::new(label(language, "选中价格", "SELECTED PRICE"))
-                    .small()
-                    .color(theme::TEXT_SECONDARY),
-            );
-            match model.trade_dock.selected_price {
-                Some(price) => {
-                    columns[0].monospace(
-                        RichText::new(model.format_market_price(&symbol, price))
-                            .size(20.0)
-                            .strong()
-                            .color(theme::BRAND_HOVER),
-                    );
-                }
-                None => {
-                    columns[0].label(
-                        RichText::new(label(
-                            language,
-                            "点击图表或盘口选择价格",
-                            "Click chart or book to select",
-                        ))
-                        .color(theme::WARNING),
-                    );
-                }
-            }
-            columns[1].label(
-                RichText::new(label(language, "默认数量", "DEFAULT SIZE"))
-                    .small()
-                    .color(theme::TEXT_SECONDARY),
-            );
-            if let Some(size) = selected_size {
-                columns[1].monospace(
-                    RichText::new(format!("{} {quote_asset}", size.normalize()))
-                        .size(20.0)
-                        .strong(),
-                );
-            }
-        });
-        if let Some(action) = model.trade_dock.armed_action {
-            ui.add_space(3.0);
-            ui.colored_label(
-                theme::WARNING,
-                format!(
-                    "{}: {}",
-                    label(language, "待执行", "ARMED"),
-                    action_name(language, action)
-                ),
-            );
-        }
-    });
-
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
+            crate::i18n::text(language, crate::i18n::TextKey::TradingUnavailable)
+        };
         ui.label(
-            RichText::new(format!(
-                "{} · {}",
-                label(language, "数量", "SIZE"),
-                quote_asset
-            ))
-            .strong(),
-        );
-        let spacing = ui.spacing().item_spacing.x;
-        let button_width = ((ui.available_width() - spacing * 4.0)
-            / crate::trading::SIZE_PRESET_COUNT as f32)
-            .max(44.0);
+            RichText::new(format!("● {scope}  {symbol}"))
+                .size(12.0)
+                .color(if running { theme::BUY } else { theme::WARNING }),
+        )
+        .on_hover_text(label(
+            language,
+            "下单须有精确账户、交易对和运行中的作用域；服务端再次验证。",
+            "An exact account, symbol and running scope are required; the server revalidates.",
+        ));
+    });
+    ui.separator();
+    ui.columns(2, |columns| {
+        columns[0].horizontal(|ui| {
+            ui.small(label(language, "价格", "Price"));
+            let price = model.trade_dock.selected_price.map_or_else(
+                || "—".to_owned(),
+                |value| model.format_market_price(&symbol, value),
+            );
+            ui.label(RichText::new(price).size(15.0).strong().color(theme::BRAND))
+                .on_hover_text(label(
+                    language,
+                    "点击图表或盘口选择限价",
+                    "Select a limit price on the chart or book",
+                ));
+        });
+        columns[1].horizontal(|ui| {
+            ui.small(label(language, "金额", "Amount"));
+            let amount = model
+                .preferences
+                .trading
+                .size_presets
+                .get(model.trade_dock.selected_size_preset)
+                .map_or_else(|| "—".to_owned(), |value| value.normalize().to_string());
+            ui.label(
+                RichText::new(format!("{amount} {quote}"))
+                    .size(15.0)
+                    .strong(),
+            );
+        });
+    });
+    ui.horizontal(|ui| {
+        let width = ((ui.available_width() - ui.spacing().item_spacing.x * 4.0) / 5.0).max(24.0);
         for index in 0..crate::trading::SIZE_PRESET_COUNT {
-            let Some(value) = model.preferences.trading.size_presets.get(index).copied() else {
-                continue;
-            };
+            let value = model.preferences.trading.size_presets[index];
+            let title = value.normalize().to_string();
             let key = model
                 .preferences
                 .trading
                 .hotkeys
                 .key_for(TradingAction::SelectSizePreset(index))
                 .map_or("—", |key| key.label());
-            let selected = model.trade_dock.selected_size_preset == index;
             if ui
                 .add_sized(
-                    [button_width, 30.0],
-                    egui::Button::selectable(selected, format!("{}  [{key}]", value.normalize())),
+                    [width, 25.0],
+                    egui::Button::selectable(
+                        model.trade_dock.selected_size_preset == index,
+                        RichText::new(title).size(11.0),
+                    )
+                    .wrap_mode(egui::TextWrapMode::Truncate),
                 )
+                .on_hover_text(format!("{} {quote} · {key}", value.normalize()))
                 .clicked()
             {
-                apply_action(model, client, TradingAction::SelectSizePreset(index));
+                action = Some(TradingAction::SelectSizePreset(index));
             }
         }
     });
-
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        let spacing = ui.spacing().item_spacing.x;
-        let button_width = ((ui.available_width() - spacing * 3.0) / 4.0).max(64.0);
-        action_button(
-            ui,
-            model,
-            client,
-            TradingAction::OpenLong,
-            label(language, "开多", "Open Long"),
-            button_width,
-        );
-        action_button(
-            ui,
-            model,
-            client,
-            TradingAction::CloseLong,
-            label(language, "平多", "Close Long"),
-            button_width,
-        );
-        action_button(
-            ui,
-            model,
-            client,
-            TradingAction::CloseShort,
-            label(language, "平空", "Close Short"),
-            button_width,
-        );
-        action_button(
-            ui,
-            model,
-            client,
-            TradingAction::OpenShort,
-            label(language, "开空", "Open Short"),
-            button_width,
-        );
-    });
-
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        let button_width = ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0).max(90.0);
-        action_button(
-            ui,
-            model,
-            client,
-            TradingAction::CancelSelectedOrder,
-            label(language, "撤当前", "Cancel Current"),
-            button_width,
-        );
-        action_button(
-            ui,
-            model,
-            client,
-            TradingAction::CancelAllOrders,
-            label(language, "撤全部", "Cancel All"),
-            button_width,
-        );
-    });
-
-    ui.add_space(6.0);
-    position_frame().show(ui, |ui| {
-        if let Some(strategy) = &strategy {
-            ui.columns(3, |columns| {
-                position_value(
-                    &mut columns[0],
-                    "LONG",
-                    &format!("{} {base_asset}", strategy.long_quantity.normalize()),
-                    theme::BUY,
-                );
-                position_value(
-                    &mut columns[1],
-                    "SHORT",
-                    &format!("{} {base_asset}", strategy.short_quantity.normalize()),
-                    theme::SELL,
-                );
-                position_value(
-                    &mut columns[2],
-                    "PnL",
-                    &format!(
-                        "{:+} {quote_asset}",
-                        strategy.unrealized_pnl.round_dp(2).normalize()
-                    ),
-                    theme::value_color(
-                        strategy
-                            .unrealized_pnl
-                            .to_string()
-                            .parse::<f64>()
-                            .unwrap_or(0.0),
-                    ),
-                );
-            });
-        } else {
-            ui.label(
-                RichText::new(label(
-                    language,
-                    "选择一个运行中的交易作用域后显示持仓",
-                    "Select a running trading scope to show positions",
-                ))
-                .color(theme::TEXT_SECONDARY),
-            );
-        }
-    });
-
-    if let Some(strategy) = &strategy
-        && strategy.lifecycle != StrategyLifecycle::Running
-    {
-        ui.add_space(4.0);
-        ui.colored_label(
-            theme::WARNING,
-            label(
-                language,
-                "当前作用域未运行，交易动作已锁定",
-                "Current scope is not Running; trade actions are locked",
-            ),
-        );
+    let primary = [
+        TradingAction::OpenLong,
+        TradingAction::CloseLong,
+        TradingAction::CloseShort,
+        TradingAction::OpenShort,
+    ];
+    let columns = if ui.available_width() >= 480.0 { 4 } else { 2 };
+    for row in primary.chunks(columns) {
+        ui.horizontal(|ui| {
+            let width = (ui.available_width() - ui.spacing().item_spacing.x * (columns - 1) as f32)
+                / columns as f32;
+            for candidate in row {
+                if let Some(clicked) = action_button(ui, model, *candidate, width) {
+                    action = Some(clicked);
+                }
+            }
+        });
     }
-
-    ui.add_space(6.0);
-    ui.separator();
-    ui.add_space(3.0);
     ui.horizontal(|ui| {
-        let hotkey_status = if model.preferences.trading.hotkeys_enabled {
-            label(language, "快捷键 已启用", "Hotkeys enabled")
-        } else {
-            label(language, "快捷键 已停用", "Hotkeys disabled")
-        };
-        ui.label(RichText::new(hotkey_status).small().color(
-            if model.preferences.trading.hotkeys_enabled {
-                theme::BUY
-            } else {
-                theme::TEXT_SECONDARY
-            },
-        ))
-        .on_hover_text(label(
-            language,
-            "按钮与键盘共用同一 TradingAction",
-            "Buttons and keyboard share the same TradingAction",
-        ));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui
-                .button(format!(
-                    "⚙ {}",
-                    label(language, "交易设置", "Trading Settings")
-                ))
-                .clicked()
-            {
-                model.trading_settings_requested = true;
+        let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+        for candidate in [
+            TradingAction::CancelSelectedOrder,
+            TradingAction::CancelAllOrders,
+        ] {
+            if let Some(clicked) = action_button(ui, model, candidate, width) {
+                action = Some(clicked);
             }
-        });
+        }
     });
-}
-
-fn status_badge(ui: &mut egui::Ui, text: &str, active: bool) {
-    Frame::new()
-        .fill(if active {
-            Color32::from_rgb(24, 49, 42)
-        } else {
-            theme::BG_SECONDARY
-        })
-        .stroke(Stroke::new(
-            1.0,
-            if active { theme::BUY } else { theme::DIVIDER },
-        ))
-        .corner_radius(3)
-        .inner_margin(Margin::symmetric(6, 2))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).monospace().small());
+    if let Some(armed) = model.trade_dock.armed_action {
+        ui.colored_label(theme::WARNING, action_name(language, armed));
+    }
+    if strategy.is_some() {
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            let long = strategy.as_ref().map_or_else(
+                || "—".to_owned(),
+                |s| s.long_quantity.normalize().to_string(),
+            );
+            let short = strategy.as_ref().map_or_else(
+                || "—".to_owned(),
+                |s| s.short_quantity.normalize().to_string(),
+            );
+            let pnl = strategy.as_ref().map_or_else(
+                || "—".to_owned(),
+                |s| s.unrealized_pnl.normalize().to_string(),
+            );
+            ui.label(
+                RichText::new(format!("{} {long} {base}", label(language, "多", "Long")))
+                    .size(11.0)
+                    .color(theme::BUY),
+            );
+            ui.label(
+                RichText::new(format!("{} {short} {base}", label(language, "空", "Short")))
+                    .size(11.0)
+                    .color(theme::SELL),
+            );
+            ui.label(
+                RichText::new(format!("PnL {pnl} {quote}"))
+                    .size(11.0)
+                    .color(theme::TEXT_SECONDARY),
+            );
         });
-}
-
-fn summary_frame() -> Frame {
-    Frame::new()
-        .fill(theme::BG_SECONDARY)
-        .stroke(Stroke::new(1.0, theme::DIVIDER))
-        .corner_radius(3)
-        .inner_margin(Margin::same(9))
-}
-
-fn position_frame() -> Frame {
-    Frame::new()
-        .fill(theme::BG_SECONDARY)
-        .stroke(Stroke::new(1.0, theme::DIVIDER))
-        .corner_radius(3)
-        .inner_margin(Margin::same(7))
-}
-
-fn position_value(ui: &mut egui::Ui, title: &str, value: &str, color: Color32) {
-    ui.label(RichText::new(title).small().strong().color(color));
-    ui.monospace(RichText::new(value).strong());
+    }
+    action
 }
 
 fn symbol_assets(symbol: &str) -> (String, String) {
@@ -361,12 +197,11 @@ fn action_palette(action: TradingAction) -> (Color32, Color32, Color32) {
 }
 fn action_button(
     ui: &mut egui::Ui,
-    model: &mut AppModel,
-    client: &ControlClient,
+    model: &AppModel,
     action: TradingAction,
-    title: &str,
     width: f32,
-) {
+) -> Option<TradingAction> {
+    let title = action_name(model.preferences.language, action);
     let key = model
         .preferences
         .trading
@@ -375,22 +210,20 @@ fn action_button(
         .map_or("—", |key| key.label());
     let enabled = action_enabled(model, action);
     let (text_color, fill, stroke) = action_palette(action);
-    if ui
-        .add_enabled(
-            enabled,
-            egui::Button::new(
-                RichText::new(format!("{title}  {key}"))
-                    .strong()
-                    .color(text_color),
-            )
-            .fill(fill)
-            .stroke(Stroke::new(1.0, stroke))
-            .min_size(egui::vec2(width, 34.0)),
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(
+            RichText::new(format!("{title}  {key}"))
+                .size(12.0)
+                .strong()
+                .color(text_color),
         )
-        .clicked()
-    {
-        apply_action(model, client, action);
-    }
+        .fill(fill)
+        .stroke(Stroke::new(1.0, stroke))
+        .min_size(egui::vec2(width, 30.0)),
+    )
+    .clicked()
+    .then_some(action)
 }
 
 fn action_enabled(model: &AppModel, action: TradingAction) -> bool {
@@ -417,7 +250,14 @@ fn action_enabled(model: &AppModel, action: TradingAction) -> bool {
     }
 }
 
-pub fn apply_action(model: &mut AppModel, client: &ControlClient, action: TradingAction) {
+pub fn apply_action(
+    model: &mut AppModel,
+    client: &ControlClient,
+    action: TradingAction,
+    context: &egui::Context,
+) {
+    model.synchronize_trading_scope();
+    model.refresh_trading_price(context);
     match action {
         TradingAction::SelectSizePreset(index) => {
             if index < crate::trading::SIZE_PRESET_COUNT {
@@ -449,6 +289,7 @@ pub fn apply_action(model: &mut AppModel, client: &ControlClient, action: Tradin
         &model.preferences.trading,
         &model.trade_dock,
         action,
+        context.input(|input| input.time),
     ) {
         Ok(intent) => intent,
         Err(error) => {
@@ -486,7 +327,10 @@ const fn label<'a>(language: crate::i18n::Language, chinese: &'a str, english: &
     }
 }
 
-const fn action_name(language: crate::i18n::Language, action: TradingAction) -> &'static str {
+pub(crate) const fn action_name(
+    language: crate::i18n::Language,
+    action: TradingAction,
+) -> &'static str {
     match action {
         TradingAction::OpenLong => label(language, "开多", "Open Long"),
         TradingAction::CloseLong => label(language, "平多", "Close Long"),

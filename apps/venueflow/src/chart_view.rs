@@ -42,6 +42,7 @@ pub(crate) fn candle_plot(
     settings: &ChartDisplaySettings,
     scales: (usize, usize),
     interval: crate::chart::ChartInterval,
+    market_price: Option<rust_decimal::Decimal>,
     selected_price: Option<rust_decimal::Decimal>,
 ) -> Option<rust_decimal::Decimal> {
     let (price_scale, quantity_scale) = scales;
@@ -302,47 +303,52 @@ pub(crate) fn candle_plot(
             );
         }
     }
-    if let Some(last) = bars.last() {
-        let y = price_y(decimal_to_f64(last.close));
-        painter.line_segment(
-            [
-                Pos2::new(price_rect.left(), y),
-                Pos2::new(price_rect.right(), y),
-            ],
-            Stroke::new(1.0, theme::BRAND_HOVER),
-        );
-    }
-    if let Some(price) = selected_price {
+    for (price, color) in [
+        (
+            market_price.or_else(|| all_bars.last().map(|bar| bar.close)),
+            theme::BUY,
+        ),
+        (selected_price, theme::WARNING),
+    ] {
+        let Some(price) = price.filter(|price| *price > rust_decimal::Decimal::ZERO) else {
+            continue;
+        };
         let y = price_y(decimal_to_f64(price));
         if price_rect.top() <= y && y <= price_rect.bottom() {
-            painter.line_segment(
-                [
+            painter.extend(egui::Shape::dashed_line(
+                &[
                     Pos2::new(price_rect.left(), y),
                     Pos2::new(price_rect.right(), y),
                 ],
-                Stroke::new(1.5, theme::WARNING),
-            );
+                Stroke::new(1.0, color),
+                5.0,
+                4.0,
+            ));
         }
     }
     if let Some(pointer) = response
         .hover_pos()
         .filter(|point| content_rect.contains(*point))
     {
-        painter.line_segment(
-            [
+        painter.extend(egui::Shape::dashed_line(
+            &[
                 Pos2::new(pointer.x, content_rect.top()),
                 Pos2::new(pointer.x, content_rect.bottom()),
             ],
             Stroke::new(1.0, theme::TEXT_SECONDARY),
-        );
+            5.0,
+            4.0,
+        ));
         if price_rect.contains(pointer) {
-            painter.line_segment(
-                [
+            painter.extend(egui::Shape::dashed_line(
+                &[
                     Pos2::new(price_rect.left(), pointer.y),
                     Pos2::new(price_rect.right(), pointer.y),
                 ],
                 Stroke::new(1.0, theme::TEXT_SECONDARY),
-            );
+                5.0,
+                4.0,
+            ));
             if let Some(price) =
                 price_range.y_to_price(price_rect.top(), price_rect.height(), pointer.y)
             {

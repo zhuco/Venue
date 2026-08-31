@@ -212,7 +212,7 @@ pub(crate) fn show(
                 });
         });
     if let Some(symbol) = selected {
-        model.preferences.selected_symbol = symbol;
+        model.select_symbol(symbol);
         model.symbol_filter.clear();
         workspaces.follow_dynamic_charts_latest();
         *open = false;

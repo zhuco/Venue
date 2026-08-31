@@ -184,7 +184,7 @@ pub fn show_top_bar(
                                                 );
                                             }
                                             if response.clicked() {
-                                                model.preferences.selected_symbol = symbol;
+                                                model.select_symbol(symbol);
                                                 workspaces.follow_dynamic_charts_latest();
                                             }
                                         }
@@ -423,7 +423,7 @@ fn show_market_watch(ui: &mut egui::Ui, model: &mut AppModel) {
                         .selectable_label(model.preferences.selected_symbol == symbol, &symbol)
                         .clicked()
                     {
-                        model.preferences.selected_symbol = symbol.clone();
+                        model.select_symbol(symbol.clone());
                         model.follow_latest_requested = true;
                     }
                     #[cfg(not(target_arch = "wasm32"))]
@@ -465,6 +465,9 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
         .as_deref()
         .unwrap_or(&model.preferences.selected_symbol)
         .to_owned();
+    let highlighted_price = (symbol == model.preferences.selected_symbol)
+        .then(|| model.trade_dock.highlighted_price(ui.ctx()))
+        .flatten();
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(local) = local_market(model, &symbol, pane.interval) {
         let (price_scale, quantity_scale) = model.market_scales(&symbol);
@@ -481,7 +484,7 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
                 model.preferences.chart.clone(),
             ),
             model.preferences.trading.chart_cadence,
-            || (local.bars.clone(), local.studies.clone()),
+            || (local.bars.clone(), local.studies.clone(), local.last),
         );
         let selected_price = crate::chart_view::candle_plot(
             ui,
@@ -492,10 +495,11 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
             &model.preferences.chart,
             (price_scale, quantity_scale),
             pane.interval,
-            model.trade_dock.selected_price,
+            chart.2,
+            highlighted_price,
         );
         if let Some(price) = selected_price {
-            model.select_trading_price(&symbol, price);
+            model.select_trading_price(&symbol, price, ui.ctx());
         }
         if settings_requested {
             model.indicator_settings_requested = true;
@@ -532,7 +536,7 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
         }
     });
     let settings_requested = show_chart_toolbar(ui, pane, language);
-    let bars = presentation::sample(
+    let chart = presentation::sample(
         ui,
         ("chart-display-control", pane.instance),
         (
@@ -543,21 +547,22 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
             market.bars.len(),
         ),
         model.preferences.trading.chart_cadence,
-        || market.bars.clone(),
+        || (market.bars.clone(), market.last),
     );
     let selected_price = crate::chart_view::candle_plot(
         ui,
-        &bars,
+        &chart.0,
         &[],
         &mut pane.viewport,
         language,
         &model.preferences.chart,
         (8, 8),
         pane.interval,
-        model.trade_dock.selected_price,
+        Some(chart.1),
+        highlighted_price,
     );
     if let Some(price) = selected_price {
-        model.select_trading_price(&symbol, price);
+        model.select_trading_price(&symbol, price, ui.ctx());
     }
     if settings_requested {
         model.indicator_settings_requested = true;
@@ -652,7 +657,7 @@ fn show_order_book(ui: &mut egui::Ui, pane: &Pane, model: &mut AppModel) {
             &symbol,
         );
         if let Some(price) = selected_price {
-            model.select_trading_price(&symbol, price);
+            model.select_trading_price(&symbol, price, ui.ctx());
         }
         return;
     }
@@ -696,7 +701,7 @@ fn show_order_book(ui: &mut egui::Ui, pane: &Pane, model: &mut AppModel) {
         &symbol,
     );
     if let Some(price) = selected_price {
-        model.select_trading_price(&symbol, price);
+        model.select_trading_price(&symbol, price, ui.ctx());
     }
 }
 fn show_trade_tape(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
@@ -867,7 +872,7 @@ fn show_strategies(ui: &mut egui::Ui, model: &mut AppModel) {
                         .clicked()
                     {
                         model.preferences.selected_instance = Some(strategy.instance_id.clone());
-                        model.preferences.selected_symbol = strategy.symbol.to_string();
+                        model.select_symbol(strategy.symbol.to_string());
                     }
                     ui.label(format!("{:?}", strategy.kind));
                     ui.label(strategy.venue.to_string());

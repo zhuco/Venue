@@ -272,6 +272,7 @@ impl eframe::App for VenueFlowApp {
             .rect_filled(ui.max_rect(), 0.0, theme::BG_PRIMARY);
         ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
         self.model.synchronize_trading_scope();
+        self.model.refresh_trading_price(ui.ctx());
         let accepts_trading_input = self.workspaces.active == crate::model::WorkspaceKind::Trading
             && !ui.ctx().egui_wants_keyboard_input()
             && !self.show_modules
@@ -291,7 +292,7 @@ impl eframe::App for VenueFlowApp {
                     .collect::<Vec<_>>()
             });
             for action in actions {
-                crate::trade_dock::apply_action(&mut self.model, &self.client, action);
+                crate::trade_dock::apply_action(&mut self.model, &self.client, action, ui.ctx());
             }
         }
         ui::show_top_bar(
@@ -305,7 +306,7 @@ impl eframe::App for VenueFlowApp {
         );
 
         let status_height = if self.model.preferences.show_status_bar {
-            54.0
+            26.0
         } else {
             0.0
         };
