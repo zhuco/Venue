@@ -11,6 +11,7 @@
 /artifacts/
 /venue.local.toml
 /logs/
+/\.playwright-cli/
 /data/
 *.log
 *.jsonl
