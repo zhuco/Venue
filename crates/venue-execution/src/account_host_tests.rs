@@ -2285,7 +2285,7 @@ fn managed_grid_batch_values_once_and_allows_multiple_ten_u_children()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
     let binding = binding()?;
-    let gateway = managed_batch_gateway(
+    let mut gateway = managed_batch_gateway(
         &binding,
         [
             AccountGatewayResult::Accepted {
@@ -2295,6 +2295,26 @@ fn managed_grid_batch_values_once_and_allows_multiple_ten_u_children()
                 venue_order_id: "grid-native-2".to_owned(),
             },
         ],
+    )?;
+    let mut positions = gateway.snapshot.positions().to_vec();
+    positions.push(SignedAccountPositionFact {
+        symbol: "ETH/USDT".parse()?,
+        position_side: PositionSide::Long,
+        quantity: Decimal::ONE,
+        entry_price: Some(Decimal::from(2_000)),
+        mark_price: Some(Decimal::from(2_100)),
+    });
+    gateway.snapshot = SignedAccountSnapshot::complete(
+        binding.clone(),
+        now_ms()?,
+        1,
+        1,
+        1,
+        SignedAccountPositionMode::Hedge,
+        Vec::new(),
+        positions,
+        "managed-batch:entry-with-unrelated-position".to_owned(),
+        Vec::new(),
     )?;
     let mut host = AccountMutationHost::open(root(&temp), binding, Decimal::TEN, gateway)?;
     let _bootstrap = host.durable_runtime_bootstrap()?;
@@ -2377,7 +2397,27 @@ fn managed_grid_startup_cancel_is_single_surface_exact_and_bypasses_entry_unknow
     );
     assert!(host.has_unresolved());
 
-    let mut refreshed = managed_signed_order(&binding, owner()?, false, 3)?;
+    let base = managed_signed_order(&binding, owner()?, false, 3)?;
+    let mut positions = base.positions().to_vec();
+    positions.push(SignedAccountPositionFact {
+        symbol: "ETH/USDT".parse()?,
+        position_side: PositionSide::Long,
+        quantity: Decimal::ONE,
+        entry_price: Some(Decimal::from(2_000)),
+        mark_price: Some(Decimal::from(2_100)),
+    });
+    let mut refreshed = SignedAccountSnapshot::complete(
+        binding.clone(),
+        now_ms()?,
+        1,
+        3,
+        1,
+        SignedAccountPositionMode::Hedge,
+        base.open_orders().to_vec(),
+        positions,
+        "managed-batch:unrelated-position".to_owned(),
+        Vec::new(),
+    )?;
     host.enrich_signed_order_owners(&mut refreshed);
     host.latest_signed_snapshot = Some(refreshed);
     host.last_gateway_private_generation = Some(3);

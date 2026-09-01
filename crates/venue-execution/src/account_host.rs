@@ -1998,10 +1998,6 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
                 .values()
                 .any(|candidate| !same_owner_scope(candidate, owner))
             || owner.purpose != OrderPurpose::Entry
-            || snapshot
-                .positions()
-                .iter()
-                .any(|position| position.symbol != owner.symbol)
             || !exact_signed_orders
             || (!allow_unresolved_cancellation && self.journal.has_unresolved())
         {
