@@ -305,7 +305,7 @@ Desired Orders，期间的新成交须先消费并重新计算目标集合。`Ru
 平仓数量不得超过签名库存和已承诺平仓量。
 
 显式 Node Grid 配置 `skip_inventory_replenishment_until_recovered`（部署入口可映射为
-`--skip-inventory-replenishment-until-recovered`）是耐久的无市价补仓模式：低库存时仍可按当前签名库存重建，closing 数量必须由库存裁剪且不得超额，两腿 opening 必须各自保持完整。首次 bootstrap 在同一 Actor Applied checkpoint 中保持 `Eligible / Attempted / Confirmed`：旧单接管产生的精确未安装 checkpoint 仍为 Eligible；读取外部签名事实或 BBO 前必须先持久化 Attempted；只有完整订单集合得到更新签名确认后才持久化 Confirmed。Attempted 重启保持 Paused 并只对账，不得由新 BBO 重建 epoch 或重投任何部分 Accepted/Unknown 批次。Stage 7 不得在 reducer 已接受无市价补仓模式后用重复的无条件低库存门拒绝安装；未显式进入该模式时，低于单格名义的任一腿仍必须先走 WAL 绑定的库存补充。
+`--skip-inventory-replenishment-until-recovered`）是初次恢复期间的耐久无市价补仓闩锁：低库存时仍可按当前签名库存重建，closing 数量必须由库存裁剪且不得超额，两腿 opening 必须各自保持完整；签名库存恢复后 reducer 清除该闩锁，后续 Running 重启必须接受已清除的 checkpoint，不得重新启用或因其不再等于启动配置而拒绝。反向用配置关闭仍处于耐久开启状态的闩锁仍失败关闭。首次 bootstrap 在同一 Actor Applied checkpoint 中保持 `Eligible / Attempted / Confirmed`：旧单接管产生的精确未安装 checkpoint 仍为 Eligible；读取外部签名事实或 BBO 前必须先持久化 Attempted；只有完整订单集合得到更新签名确认后才持久化 Confirmed。Attempted 重启保持 Paused 并只对账，不得由新 BBO 重建 epoch 或重投任何部分 Accepted/Unknown 批次。Stage 7 不得在 reducer 已接受无市价补仓模式后用重复的无条件低库存门拒绝安装；未显式进入该模式时，低于单格名义的任一腿仍必须先走 WAL 绑定的库存补充。
 
 账户的广义生产风险 fence 不因 Grid 接管而清除：任一非零仓位、开放订单、外部订单或未决 WAL 仍保持 fence。新 Runtime 只可在 Host 证明当前签名 Hedge 订单面与 WAL Owner（含 purpose）一一对应、无外部/额外订单、无 Unknown 且 Actor Applied 与配置代仍为当前值后，安装不可序列化的内存 `Exact` 权限；它至多消费为一个 `Batch`。空订单面首次安装只允许最多 200 条 post-only Place；滚动批次必须恰为两条 post-only Place 加一条针对旧签名面的 Cancel。Host 对整个批次只读取一次新鲜汇率/风险证据，但逐条维持不超过 10U；批次以单次 durability barrier 写入 Prepared，仍逐条经过原 WAL 和唯一 writer。第一条 Rejected/Unknown、签名刷新、重连、Pause、改参或代际变化立即撤销权限并在物理派发前拒绝剩余 Prepared；只有新签名面再次精确确认后才可恢复，禁止自动重投。
 

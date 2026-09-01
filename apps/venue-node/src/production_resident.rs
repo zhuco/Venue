@@ -331,23 +331,11 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         if first_bootstrap && recovery == crate::NodeGridRecoveryPolicy::RequireExisting {
             return Err(NodeError::ResidentArtifacts);
         }
-        if bridge.grid.suppress_replenishment_until_inventory_recovers
-            != skip_inventory_replenishment_until_recovered
-        {
-            if skip_inventory_replenishment_until_recovered
-                && bridge.grid.phase == venue_strategies::hedged_grid::GridPhase::Recovering
-                && !bootstrap_requires_reconciliation
-            {
-                bridge
-                    .grid
-                    .request_restart_without_replenishment()
-                    .map_err(|_| NodeError::ResidentRuntime)?;
-            } else {
-                // The durable checkpoint is the mode authority after bootstrap. A changed config
-                // digest must not silently turn this market-order avoidance latch off or on.
-                return Err(NodeError::ResidentRuntime);
-            }
-        }
+        apply_grid_restart_replenishment_policy(
+            &mut bridge,
+            skip_inventory_replenishment_until_recovered,
+            bootstrap_requires_reconciliation,
+        )?;
         let key = binding.key.clone();
         self.grid_bridges.insert(key.clone(), bridge);
         self.grid_bindings.insert(key.clone(), binding);
@@ -1273,6 +1261,34 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
     }
 }
 
+fn apply_grid_restart_replenishment_policy(
+    bridge: &mut grid::GridBridgeState,
+    skip_until_recovered: bool,
+    bootstrap_requires_reconciliation: bool,
+) -> Result<(), NodeError> {
+    match (
+        bridge.grid.suppress_replenishment_until_inventory_recovers,
+        skip_until_recovered,
+    ) {
+        (false, true)
+            if bridge.grid.phase == venue_strategies::hedged_grid::GridPhase::Recovering
+                && !bootstrap_requires_reconciliation =>
+        {
+            bridge
+                .grid
+                .request_restart_without_replenishment()
+                .map_err(|_| NodeError::ResidentRuntime)
+        }
+        // The configured option is an initial-recovery latch, not a permanent mode. Once a
+        // signed inventory has cleared it, a normal Running restart must not re-arm it or reject
+        // the durable checkpoint.
+        (false, true) | (false, false) | (true, true) => Ok(()),
+        // Turning an already-durable suppression latch off still requires a new config identity;
+        // otherwise a restart could silently enable market replenishment.
+        (true, false) => Err(NodeError::ResidentRuntime),
+    }
+}
+
 #[derive(Serialize)]
 struct ResidentReplay<'a> {
     command: &'a ExecutionCommand,
@@ -1859,6 +1875,23 @@ mod bootstrap_tests {
         let stage = AccountHostValidationError::RiskEvidenceStage("quote_rates");
         let message = grid_bootstrap_admission_error(VenueId::Binance, &stage).to_string();
         assert!(message.contains("failed closed at quote_rates"));
+    }
+
+    #[test]
+    fn recovered_restart_keeps_the_initial_replenishment_latch_cleared()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut bridge = grid::GridBridgeState::bootstrap(initial(1)?)?;
+        apply_grid_restart_replenishment_policy(&mut bridge, true, false)?;
+        assert!(bridge.grid.suppress_replenishment_until_inventory_recovers);
+
+        bridge.grid.phase = venue_strategies::hedged_grid::GridPhase::Running;
+        bridge.grid.suppress_replenishment_until_inventory_recovers = false;
+        apply_grid_restart_replenishment_policy(&mut bridge, true, false)?;
+        assert!(!bridge.grid.suppress_replenishment_until_inventory_recovers);
+
+        bridge.grid.suppress_replenishment_until_inventory_recovers = true;
+        assert!(apply_grid_restart_replenishment_policy(&mut bridge, false, false).is_err());
+        Ok(())
     }
 
     #[test]
