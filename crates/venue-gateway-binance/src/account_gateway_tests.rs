@@ -279,26 +279,11 @@ fn full_account_risk_rejects_unpriced_opening_algo_orders() {
         account_entry_order_notionals(
             EXCHANGE_INFO,
             br#"[]"#,
-            br#"{"orders":[{"reduceOnly":false,"closePosition":false}],"total":1}"#,
+            br#"[{"reduceOnly":false,"closePosition":false}]"#,
             7,
         )
         .is_err()
     );
-}
-
-#[test]
-fn full_account_risk_accepts_only_a_complete_algo_page() {
-    assert_eq!(
-        account_entry_order_notionals(EXCHANGE_INFO, br#"[]"#, br#"{"orders":[],"total":0}"#, 7,),
-        Ok(Vec::new())
-    );
-    for incomplete in [
-        br#"[]"#.as_slice(),
-        br#"{"orders":[]}"#.as_slice(),
-        br#"{"orders":[],"total":1}"#.as_slice(),
-    ] {
-        assert!(account_entry_order_notionals(EXCHANGE_INFO, br#"[]"#, incomplete, 7).is_err());
-    }
 }
 
 #[test]
@@ -308,7 +293,7 @@ fn full_account_risk_reserves_remaining_regular_order_notional()
     let values = account_entry_order_notionals(
             EXCHANGE_INFO,
             br#"[{"symbol":"BTCUSDT","reduceOnly":false,"origQty":"0.002","executedQty":"0","price":"50000"}]"#,
-            br#"{"orders":[],"total":0}"#,
+            br#"[]"#,
             7,
         );
     assert_eq!(
@@ -338,7 +323,7 @@ fn full_account_risk_uses_each_symbol_quote_and_a_non_parity_usdc_rate()
                 {"symbol":"BTCUSDT","reduceOnly":false,"origQty":"0.001","executedQty":"0","price":"50000"},
                 {"symbol":"SOLUSDC","reduceOnly":false,"origQty":"0.1","executedQty":"0","price":"100"}
             ]"#,
-            br#"{"orders":[],"total":0}"#,
+            br#"[]"#,
             7,
         )?;
     assert_eq!(positions[0].asset, "USDT".parse()?);

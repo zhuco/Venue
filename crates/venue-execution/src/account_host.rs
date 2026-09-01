@@ -2772,6 +2772,8 @@ pub enum AccountHostValidationError {
     OpenEntryFence,
     #[error("complete fresh signed account-risk evidence is required before increasing risk")]
     RiskEvidence,
+    #[error("complete fresh signed account-risk evidence failed closed at {0}")]
+    RiskEvidenceStage(&'static str),
     #[error(
         "account-wide signed exposure, open entries, WAL reservations, and the candidate exceed 10U"
     )]

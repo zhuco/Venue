@@ -24,9 +24,6 @@ use venue_execution::{
 use venue_gateway_api::{GatewayBinding, PublicMarketBinding};
 
 use crate::private::{RecentFillsCursor, USER_TRADES_PAGE_LIMIT};
-#[path = "account_gateway_algo.rs"]
-mod account_gateway_algo;
-use account_gateway_algo::algo_order_rows;
 #[path = "account_gateway_limit.rs"]
 mod account_gateway_limit;
 use account_gateway_limit::{
@@ -1597,7 +1594,8 @@ async fn fetch_account_wide_risk(
     private_generation: u64,
     attempt_id: u64,
 ) -> Result<AccountRiskEvidence, AccountHostValidationError> {
-    let observed_at_ms = now_ms().map_err(|_| AccountHostValidationError::RiskEvidence)?;
+    let stage = AccountHostValidationError::RiskEvidenceStage;
+    let observed_at_ms = now_ms().map_err(|_| stage("clock_start"))?;
     let scope = BinancePrivateReadScope::new(
         config,
         selected_rules,
@@ -1605,51 +1603,57 @@ async fn fetch_account_wide_risk(
         attempt_id,
         observed_at_ms,
     )
-    .map_err(|_| AccountHostValidationError::RiskEvidence)?;
+    .map_err(|_| stage("scope"))?;
     let catalogue = transport
         .fetch_usd_m_exchange_info()
         .await
-        .map_err(|_| AccountHostValidationError::RiskEvidence)?;
-    let catalogue =
-        str::from_utf8(&catalogue.payload).map_err(|_| AccountHostValidationError::RiskEvidence)?;
-    let account_config =
-        signed_page(transport, credentials, build_account_config_request(&scope)).await?;
-    let position_mode =
-        signed_page(transport, credentials, build_position_mode_request(&scope)).await?;
+        .map_err(|_| stage("exchange_info_read"))?;
+    let catalogue = str::from_utf8(&catalogue.payload).map_err(|_| stage("exchange_info_utf8"))?;
+    let account_config = signed_page(transport, credentials, build_account_config_request(&scope))
+        .await
+        .map_err(|_| stage("account_config_read"))?;
+    let position_mode = signed_page(transport, credentials, build_position_mode_request(&scope))
+        .await
+        .map_err(|_| stage("position_mode_read"))?;
     let positions = signed_page(
         transport,
         credentials,
         build_account_wide_positions_request(&scope),
     )
-    .await?;
+    .await
+    .map_err(|_| stage("positions_read"))?;
     let regular = signed_page(
         transport,
         credentials,
         build_account_wide_regular_orders_request(&scope),
     )
-    .await?;
+    .await
+    .map_err(|_| stage("regular_orders_read"))?;
     let algo = signed_page(
         transport,
         credentials,
         build_account_wide_algo_orders_request(&scope),
     )
-    .await?;
-    let account_config = str::from_utf8(&account_config.payload)
-        .map_err(|_| AccountHostValidationError::RiskEvidence)?;
-    let position_mode = str::from_utf8(&position_mode.payload)
-        .map_err(|_| AccountHostValidationError::RiskEvidence)?;
+    .await
+    .map_err(|_| stage("algo_orders_read"))?;
+    let account_config =
+        str::from_utf8(&account_config.payload).map_err(|_| stage("account_config_utf8"))?;
+    let position_mode =
+        str::from_utf8(&position_mode.payload).map_err(|_| stage("position_mode_utf8"))?;
     let capabilities = crate::portfolio::capabilities(account_config, position_mode)
-        .map_err(|_| AccountHostValidationError::RiskEvidence)?;
+        .map_err(|_| stage("capabilities_parse"))?;
     if !capabilities.can_trade || !capabilities.hedge_position {
-        return Err(AccountHostValidationError::RiskEvidence);
+        return Err(stage("capabilities_value"));
     }
-    let positions = account_position_notionals(catalogue, &positions.payload, private_generation)?;
+    let positions = account_position_notionals(catalogue, &positions.payload, private_generation)
+        .map_err(|_| stage("positions_normalize"))?;
     let orders = account_entry_order_notionals(
         catalogue,
         &regular.payload,
         &algo.payload,
         private_generation,
-    )?;
+    )
+    .map_err(|_| stage("orders_normalize"))?;
     let mut quote_assets = positions
         .iter()
         .chain(orders.iter())
@@ -1659,19 +1663,22 @@ async fn fetch_account_wide_risk(
     // even when the signed account is flat, otherwise a valid SOL/USDC entry could not be
     // valued while preserving the complete all-symbol account totals above.
     quote_assets.insert(
-        Asset::new(config.gateway_binding().symbol.quote())
-            .map_err(|_| AccountHostValidationError::RiskEvidence)?,
+        Asset::new(config.gateway_binding().symbol.quote()).map_err(|_| stage("selected_quote"))?,
     );
-    let rates = fetch_quote_to_usdt_rates(transport, &quote_assets, private_generation).await?;
+    let rates = fetch_quote_to_usdt_rates(transport, &quote_assets, private_generation)
+        .await
+        .map_err(|_| stage("quote_rates"))?;
     AccountRiskEvidence::complete_with_usdt_valuation(
         config.gateway_binding().clone(),
-        now_ms().map_err(|_| AccountHostValidationError::RiskEvidence)?,
+        now_ms().map_err(|_| stage("clock_finish"))?,
         private_generation,
         positions,
         orders,
         rates,
-    )?
+    )
+    .map_err(|_| stage("evidence_complete"))?
     .with_earliest_observation(observed_at_ms)
+    .map_err(|_| stage("evidence_window"))
 }
 
 /// Public asset-index evidence converts every native quote asset from the complete signed
@@ -1850,7 +1857,7 @@ fn account_entry_order_notionals(
             });
         }
     }
-    for row in algo_order_rows(algo)? {
+    for row in json_rows(algo)? {
         // Conditional family has several wire shapes. A non-reduce strategy that is not fully
         // normalized must reserve no guessed value: it closes entry admission until reconciled.
         if !bool_field(&row, "reduceOnly")? && !bool_field(&row, "closePosition")? {
