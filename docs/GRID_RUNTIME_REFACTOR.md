@@ -252,6 +252,11 @@ conditional、algo 三个 canonical family 完整或明确不支持，同时声�
 4. 若仍有无法由成交或在途 WAL 解释的缺单，立即进入 `ResettingGrid` 并按该账户事实重建；
 5. 周期健康检查只做审计和报警，不承担首次发现缺单的正确性责任。
 
+冷启动签名页中的成交必须在下一次签名刷新推进 durable fill cursor 之前进入同一 Actor facts/checkpoint；
+若当前订单面只能由多笔 WAL-owned 签名成交解释，Node 先按签名执行顺序固定全部 reducer transaction，
+再逐批经过同一 WAL/writer 做两补一撤，直至 Desired Orders 精确收敛。滚动批次全部 Accepted 后必须在同一
+checkpoint 清除对应 pending transaction；不得把已结算 transaction 留给下次重启误判为未决，也不得仅凭缺单补账。
+
 ### 5.4 急行情穿价恢复
 
 owned maker fill 的滚动价格来自既有 epoch。急涨成交后快速回落时，替代 Buy 可能已高于新 Ask；反向行情同理。

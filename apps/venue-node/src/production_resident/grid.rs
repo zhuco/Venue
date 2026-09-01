@@ -155,6 +155,7 @@ mod grid_routes {
 pub(crate) struct GridDispatchPlan {
     pub commands: Vec<ExecutionCommand>,
     accepted_routes: Vec<(GridOrderKey, CommandId, CommandId)>,
+    transaction_id: Option<String>,
 }
 
 impl GridBridgeState {
@@ -456,6 +457,16 @@ impl GridBridgeState {
             .collect()
     }
 
+    /// Signed restart catch-up may consume only a fill whose native order id is still attached
+    /// to this durable Grid checkpoint. WAL ownership alone is not enough to resurrect a retired
+    /// route or reinterpret an unrelated execution on the same symbol.
+    pub(crate) fn has_accepted_route_for_fill(&self, fill: &Fill) -> bool {
+        self.routes.values().any(|route| {
+            route.accepted_venue_order_id.as_deref() == Some(fill.order_id.as_str())
+                && self.grid.owned_orders.contains_key(&route.key)
+        })
+    }
+
     /// Establishes the stable client id before Host prepares the order. A duplicated client id or
     /// a route for a non-owned key fails closed rather than being reassigned to a nearby level.
     pub(crate) fn reserve_client_route(
@@ -689,6 +700,17 @@ impl GridBridgeState {
                 .ok_or(GridBridgeError::Evidence)?;
             self.bind_accepted_native(key, client, venue_order_id)?;
         }
+        if let Some(transaction_id) = plan.transaction_id.as_deref()
+            && !matches!(
+                self.grid
+                    .settle_transaction(transaction_id, true)
+                    .map_err(GridBridgeError::Reducer)?,
+                GridDecision::Noop
+            )
+        {
+            return Err(GridBridgeError::Evidence);
+        }
+        self.validate()?;
         Ok(())
     }
 
@@ -739,6 +761,7 @@ impl GridBridgeState {
         Ok(GridDispatchPlan {
             commands,
             accepted_routes,
+            transaction_id: Some(transaction.id.clone()),
         })
     }
 
@@ -778,6 +801,7 @@ impl GridBridgeState {
         Ok(GridDispatchPlan {
             commands,
             accepted_routes,
+            transaction_id: None,
         })
     }
 
@@ -1310,8 +1334,19 @@ mod tests {
             return Err("completed maker fill did not produce a rolling action".into());
         };
         for action in &actions {
-            bridge.plan_dispatch(action)?;
+            let plan = bridge.plan_dispatch(action)?;
+            assert!(!bridge.grid.pending_transactions.is_empty());
+            let accepted = plan
+                .accepted_routes
+                .iter()
+                .enumerate()
+                .map(|(index, (_, _, command_id))| {
+                    (command_id.clone(), format!("native-rolling-order-{index}"))
+                })
+                .collect::<Vec<_>>();
+            bridge.bind_accepted_plan(&plan, &accepted)?;
         }
+        assert!(bridge.grid.pending_transactions.is_empty());
         assert!(!bridge.routes.contains_key(&key));
         assert!(!bridge.partial_fills.contains_key(&native_order_id));
         bridge.checkpoint_bytes()?;

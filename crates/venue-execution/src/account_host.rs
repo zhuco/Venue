@@ -897,6 +897,13 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         self.legacy_v1_custody_routes_from_snapshot(snapshot)
     }
 
+    /// Returns the already-persisted signed recovery page without issuing another exchange read.
+    /// This is evidence for pre-surface fill catch-up only; it grants no dispatch capability.
+    #[must_use]
+    pub fn latest_signed_snapshot(&self) -> Option<&SignedAccountSnapshot> {
+        self.latest_signed_snapshot.as_ref()
+    }
+
     fn legacy_v1_custody_routes_from_snapshot(
         &self,
         snapshot: &SignedAccountSnapshot,

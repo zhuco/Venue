@@ -21,6 +21,7 @@ use crate::{NodeError, NodeLaunch};
 mod copy;
 #[cfg_attr(not(feature = "binance"), allow(dead_code))]
 pub(crate) mod grid;
+mod grid_recovery;
 pub(crate) mod manual;
 pub(crate) mod scalping;
 pub use copy::{ResidentCopyReconciliation, ResidentCopyResult};
@@ -377,14 +378,7 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 .get(&key)
                 .cloned()
                 .ok_or(NodeError::ResidentRuntime)?;
-            let expected = self
-                .grid_bridges
-                .get(&key)
-                .ok_or(NodeError::ResidentRuntime)?
-                .expected_signed_surface()?;
-            self.host
-                .confirm_managed_grid_surface(&mut self.runtime, &binding, expected)
-                .map_err(|_| NodeError::ResidentRuntime)?;
+            self.recover_grid_from_latest_signed_fills(&binding)?;
         }
         Ok(())
     }
@@ -1155,23 +1149,25 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                     .flat_map(|plan| plan.commands.iter().cloned())
                     .collect::<Vec<_>>();
                 if !commands.is_empty()
-                    && self
-                        .host
-                        .prepare_and_admit_managed_grid_batch(
-                            &mut self.runtime,
-                            &binding,
-                            &applied,
-                            venue_runtime::account::AccountLanePriority::Normal,
-                            signed_surface,
-                            &commands,
-                        )
-                        .is_err()
+                    && let Err(error) = self.host.prepare_and_admit_managed_grid_batch(
+                        &mut self.runtime,
+                        &binding,
+                        &applied,
+                        venue_runtime::account::AccountLanePriority::Normal,
+                        signed_surface,
+                        &commands,
+                    )
                 {
-                    self.host
-                        .reject_prepared_batch(&mut self.runtime, "grid_rolling_batch_rejected")
-                        .map_err(|_| NodeError::ResidentRuntime)?;
-                    self.pause_grid_after_bootstrap_failure(&binding)?;
-                    return Err(NodeError::ResidentRuntime);
+                    let _cleanup = self
+                        .host
+                        .reject_prepared_batch(&mut self.runtime, "grid_rolling_batch_rejected");
+                    let _pause = self.pause_grid_after_bootstrap_failure(&binding);
+                    return Err(NodeError::LiveHost {
+                        venue: self.host.binding().venue,
+                        message: format!(
+                            "Grid rolling batch admission rejected before dispatch: {error}"
+                        ),
+                    });
                 }
                 let command_count = plans.iter().map(|plan| plan.commands.len()).sum::<usize>();
                 for _ in 0..command_count {
@@ -1229,16 +1225,23 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                         .map_err(resident_error)?;
                     persist_anchor(&self.artifacts_root, &binding, &accepted_turn)?;
                     let confirmed = self.refresh_signed_snapshot()?;
+                    if confirmed.private_generation() <= private_generation {
+                        self.pause_grid_after_bootstrap_failure(&binding)?;
+                        return Err(NodeError::ResidentRuntime);
+                    }
+                    let exact = self
+                        .grid_bridges
+                        .get(&delivery.target)
+                        .ok_or(NodeError::ResidentRuntime)?
+                        .signed_desired_matches(confirmed.open_orders());
+                    if !exact {
+                        self.recover_grid_from_signed_fills(&binding, confirmed)?;
+                        continue;
+                    }
                     let bridge = self
                         .grid_bridges
                         .get(&delivery.target)
                         .ok_or(NodeError::ResidentRuntime)?;
-                    if confirmed.private_generation() <= private_generation
-                        || !bridge.signed_desired_matches(confirmed.open_orders())
-                    {
-                        self.pause_grid_after_bootstrap_failure(&binding)?;
-                        return Err(NodeError::ResidentRuntime);
-                    }
                     let expected = bridge.expected_signed_surface()?;
                     self.host
                         .confirm_managed_grid_surface(&mut self.runtime, &binding, expected)

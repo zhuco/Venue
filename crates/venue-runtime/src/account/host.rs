@@ -435,6 +435,13 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
             .map_err(AccountRuntimeHostError::Host)
     }
 
+    /// Clones the Host-persisted signed page so a resident can durably apply its fill facts before
+    /// asking Host to seal an exact Grid surface. No gateway read or mutation occurs here.
+    #[must_use]
+    pub fn latest_signed_snapshot(&self) -> Option<venue_execution::SignedAccountSnapshot> {
+        self.host.latest_signed_snapshot().cloned()
+    }
+
     /// Admits an operator-generated semantic command only after the sole Host has fsynced the
     /// corresponding WAL record. The prepared proof never leaves this resident wrapper.
     pub fn prepare_and_admit_operator(
