@@ -310,14 +310,14 @@ fn registration_button_requires_the_server_password_contract() {
     let mut state = AccountCenter {
         registering: true,
         username: "venueflow-test".into(),
-        password: Zeroizing::new("too-short".into()),
-        confirmation: Zeroizing::new("too-short".into()),
+        password: Zeroizing::new("1234567".into()),
+        confirmation: Zeroizing::new("1234567".into()),
         ..Default::default()
     };
     assert!(!login_submit_enabled(&state));
-    state.password = Zeroizing::new("test-account-password".into());
+    state.password = Zeroizing::new("12345678".into());
     assert!(!login_submit_enabled(&state));
-    state.confirmation = Zeroizing::new("test-account-password".into());
+    state.confirmation = Zeroizing::new("12345678".into());
     assert!(login_submit_enabled(&state));
 }
 

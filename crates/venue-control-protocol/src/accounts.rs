@@ -12,6 +12,7 @@ pub const CREDENTIALS_PATH: &str = "/v2/account/credentials";
 pub const VERIFY_PATH: &str = "/v2/account/credentials/verify";
 pub const DELETE_PATH: &str = "/v2/account/credentials/delete";
 pub const SELECT_PATH: &str = "/v2/account/select";
+pub const MIN_PASSWORD_CHARS: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct SecretValue(SecretString);
@@ -55,7 +56,7 @@ impl LoginRequest {
         .then(|| name.to_ascii_lowercase())
     }
     pub fn valid_password(&self) -> bool {
-        (15..=128).contains(&self.password.expose().chars().count())
+        (MIN_PASSWORD_CHARS..=128).contains(&self.password.expose().chars().count())
             && self.password.expose().len() <= 512
     }
 }
@@ -187,6 +188,20 @@ mod tests {
         };
         assert_eq!(request.normalized_username().as_deref(), Some("alice"));
         assert!(request.valid_password());
+        assert!(
+            !LoginRequest {
+                username: "alice".into(),
+                password: SecretValue::new("1234567".into()),
+            }
+            .valid_password()
+        );
+        assert!(
+            LoginRequest {
+                username: "alice".into(),
+                password: SecretValue::new("12345678".into()),
+            }
+            .valid_password()
+        );
         assert!(!format!("{request:?}").contains("a safe long passphrase"));
         let decoded = serde_json::from_str::<LoginRequest>(
             r#"{"username":"alice","password":"secret","admin":true}"#,

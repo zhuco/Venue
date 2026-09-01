@@ -364,17 +364,21 @@ fn show_login(ui: &mut egui::Ui, state: &mut AccountCenter, model: &AppModel) {
             "3–64 letters, numbers or . _ - @",
         ),
     );
+    let password_hint = if state.registering {
+        match l {
+            Language::SimplifiedChinese => format!("至少 {MIN_PASSWORD_CHARS} 个字符"),
+            Language::English => format!("At least {MIN_PASSWORD_CHARS} characters"),
+        }
+    } else {
+        String::new()
+    };
     login_field(
         ui,
         tr(l, "密码", "Password"),
         &mut state.password,
         true,
         128,
-        if state.registering {
-            tr(l, "至少 15 个字符", "At least 15 characters")
-        } else {
-            ""
-        },
+        &password_hint,
     );
     if state.registering {
         login_field(
@@ -455,7 +459,8 @@ fn login_submit_enabled(state: &AccountCenter) -> bool {
     valid_username
         && !state.password.is_empty()
         && (!state.registering
-            || (state.password.chars().count() >= 15 && *state.password == *state.confirmation))
+            || (state.password.chars().count() >= MIN_PASSWORD_CHARS
+                && *state.password == *state.confirmation))
 }
 
 fn login_field(
