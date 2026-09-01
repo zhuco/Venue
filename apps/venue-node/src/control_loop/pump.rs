@@ -38,9 +38,7 @@ impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
                         failures = 0;
                         self.poll_interval
                     }
-                    Err(error)
-                        if error.retryable() && failures < MAX_CONSECUTIVE_TRANSPORT_FAILURES =>
-                    {
+                    Err(error) if error.retryable() => {
                         failures = failures.saturating_add(1);
                         backoff(failures)
                     }
@@ -119,5 +117,12 @@ mod tests {
             ),
             MIN_SIGNED_PRIVATE_REFRESH_INTERVAL
         );
+    }
+
+    #[test]
+    fn direct_control_http_failure_remains_retryable_at_capped_backoff() {
+        let error = ControlResidentLoopError::Http(crate::ControlHttpClientError::HttpStatus(500));
+        assert!(error.retryable());
+        assert_eq!(backoff(u32::MAX), MAX_BACKOFF);
     }
 }

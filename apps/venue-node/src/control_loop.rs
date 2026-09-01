@@ -33,7 +33,6 @@ use crate::{
     production_resident::control::{cancel_command, reduce_command},
 };
 
-const MAX_CONSECUTIVE_TRANSPORT_FAILURES: u32 = 8;
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
 // A complete account snapshot is a comparatively expensive signed read.  It is deliberately
 // independent of Control's delivery cadence: a fast local poll must not turn into an exchange
@@ -1985,7 +1984,11 @@ impl ControlResidentLoopError {
     fn retryable(&self) -> bool {
         matches!(
             self,
-            Self::Delivery(ControlDeliveryDriverError::Http(
+            Self::Http(
+                crate::ControlHttpClientError::Transport
+                    | crate::ControlHttpClientError::Timeout
+                    | crate::ControlHttpClientError::HttpStatus(_)
+            ) | Self::Delivery(ControlDeliveryDriverError::Http(
                 crate::ControlHttpClientError::Transport
                     | crate::ControlHttpClientError::Timeout
                     | crate::ControlHttpClientError::HttpStatus(_)
