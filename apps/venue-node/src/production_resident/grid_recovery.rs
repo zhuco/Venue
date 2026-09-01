@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
 
-use venue_domain::domain::{
-    CommandId, DomainEvent, EventId, NativeOrderFamily, OrderOwner, OrderPurpose, OrderState,
-};
+use venue_domain::domain::{CommandId, DomainEvent, EventId, NativeOrderFamily, OrderOwner};
 use venue_gateway_api::VenueId;
 use venue_runtime::{
     SignedAccountSnapshot, StrategyBinding,
@@ -17,6 +15,40 @@ const MAX_SIGNED_GRID_CATCH_UP_ROUNDS: usize = 64;
 const MAX_SIGNED_GRID_CATCH_UP_FILLS: usize = 1_000;
 
 impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
+    /// Continues only the exact reducer transactions whose complete deterministic command set is
+    /// proven absent from Host WAL by registration. The current signed surface must still prove
+    /// every cancellation target before each batch; any WAL presence takes the paused path.
+    pub(super) fn resume_grid_unsubmitted_transactions(
+        &mut self,
+        binding: &StrategyBinding,
+    ) -> Result<(), NodeError> {
+        let mut snapshot = self
+            .host
+            .latest_signed_snapshot()
+            .ok_or_else(|| self.grid_recovery_error("signed Grid resume snapshot is missing"))?;
+        let plans = self
+            .grid_bridges
+            .get(&binding.key)
+            .ok_or(NodeError::ResidentRuntime)?
+            .pending_dispatch_plans()
+            .map_err(|error| {
+                self.grid_recovery_error(&format!(
+                    "pending Grid transaction could not be reconstructed: {error}"
+                ))
+            })?;
+        if plans.is_empty() {
+            return Err(
+                self.grid_recovery_error("pending Grid resume was selected without a transaction")
+            );
+        }
+        for plan in &plans {
+            let signed_surface = self.prove_pending_grid_surface(binding, &snapshot)?;
+            self.dispatch_recovered_grid_plan(binding, signed_surface, plan)?;
+            snapshot = self.refresh_signed_snapshot()?;
+        }
+        self.recover_grid_from_signed_fills(binding, snapshot)
+    }
+
     /// Applies only WAL-owned signed fills that explain an exact managed-surface gap. This path
     /// runs before startup surface confirmation and after a rolling readback observes a second
     /// concurrent fill. Missing orders without signed fills never enter the reducer.
@@ -59,7 +91,6 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
                 return Ok(());
             }
 
-            let mut signed_surface = signed_managed_surface(binding, &snapshot)?;
             let fills = snapshot
                 .fills()
                 .iter()
@@ -95,9 +126,9 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
                 ));
             }
             for plan in plans {
+                let signed_surface = self.prove_pending_grid_surface(binding, &snapshot)?;
                 self.dispatch_recovered_grid_plan(binding, signed_surface, &plan)?;
                 snapshot = self.refresh_signed_snapshot()?;
-                signed_surface = signed_managed_surface(binding, &snapshot)?;
             }
         }
         Err(self.grid_recovery_error(
@@ -276,6 +307,13 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
         signed_surface: BTreeMap<CommandId, OrderOwner>,
         plan: &GridDispatchPlan,
     ) -> Result<(), NodeError> {
+        self.host
+            .confirm_managed_grid_surface(&mut self.runtime, binding, signed_surface.clone())
+            .map_err(|error| {
+                self.grid_recovery_error(&format!(
+                    "signed Grid recovery surface authority was rejected: {error}"
+                ))
+            })?;
         let replay = self
             .grid_bridges
             .get(&binding.key)
@@ -356,6 +394,27 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
         persist_anchor(&self.artifacts_root, binding, &accepted_turn)
     }
 
+    fn prove_pending_grid_surface(
+        &self,
+        binding: &StrategyBinding,
+        snapshot: &SignedAccountSnapshot,
+    ) -> Result<BTreeMap<CommandId, OrderOwner>, NodeError> {
+        let bridge = self
+            .grid_bridges
+            .get(&binding.key)
+            .ok_or(NodeError::ResidentRuntime)?;
+        if !bridge.signed_pending_surface_matches(snapshot.open_orders()) {
+            return Err(self.grid_recovery_error(
+                "signed Grid pre-dispatch surface differs from the durable pending checkpoint",
+            ));
+        }
+        bridge.expected_pending_signed_surface().map_err(|error| {
+            self.grid_recovery_error(&format!(
+                "signed Grid pre-dispatch checkpoint surface is invalid: {error}"
+            ))
+        })
+    }
+
     fn grid_recovery_error(&self, message: &str) -> NodeError {
         grid_recovery_error_for(self.host.binding().venue, message)
     }
@@ -366,30 +425,4 @@ fn grid_recovery_error_for(venue: VenueId, message: impl Into<String>) -> NodeEr
         venue,
         message: message.into(),
     }
-}
-
-fn signed_managed_surface(
-    binding: &StrategyBinding,
-    snapshot: &SignedAccountSnapshot,
-) -> Result<BTreeMap<CommandId, OrderOwner>, NodeError> {
-    let mut surface = BTreeMap::new();
-    for order in snapshot.open_orders() {
-        let client = CommandId::new(order.client_order_id.clone())
-            .map_err(|_| NodeError::ResidentRuntime)?;
-        let owner = order.owner.clone().ok_or(NodeError::ResidentRuntime)?;
-        if order.external
-            || order.symbol != binding.key.symbol
-            || order.family != NativeOrderFamily::UmOrder
-            || !binding.matches_owner(&owner)
-            || !matches!(owner.purpose, OrderPurpose::Entry | OrderPurpose::Reduce)
-            || !matches!(
-                order.state,
-                Some(OrderState::New | OrderState::PartiallyFilled)
-            )
-            || surface.insert(client, owner).is_some()
-        {
-            return Err(NodeError::ResidentRuntime);
-        }
-    }
-    Ok(surface)
 }

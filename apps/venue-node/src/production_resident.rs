@@ -92,6 +92,21 @@ pub(crate) struct PrivateFillFact {
     pub(crate) fill: venue_domain::Fill,
 }
 
+fn all_pending_grid_commands_are_absent<S, E>(
+    pending_transactions: &[(String, Vec<venue_domain::CommandId>)],
+    mut command_status: impl FnMut(&venue_domain::CommandId) -> Result<Option<S>, E>,
+) -> Result<bool, E> {
+    for command_id in pending_transactions
+        .iter()
+        .flat_map(|(_, command_ids)| command_ids)
+    {
+        if command_status(command_id)?.is_some() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 impl<G: AccountPhysicalGateway> ProductionResident<G> {
     pub fn open(launch: &NodeLaunch, gateway: G) -> Result<Self, NodeError> {
         Self::open_with_symbols(launch, AccountSymbolSet::single(launch.binding()), gateway)
@@ -295,35 +310,22 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         let pending_transactions = bridge
             .pending_transaction_command_ids()
             .map_err(|_| NodeError::ResidentRuntime)?;
-        // A checkpoint is written before rolling commands reach Host.  Only an exact absence of
-        // every deterministic command id proves that the local reservation never crossed the
-        // WAL boundary; restore it to a reconciliation reset.  Any WAL fact (including a clear
-        // rejection) remains paused for signed exchange reconciliation rather than being replayed.
-        let abandoned_unsubmitted = if pending_transactions.is_empty() {
+        // A checkpoint is written before rolling commands reach Host. Only exact absence of every
+        // deterministic command id proves that the same reserved transaction never crossed the
+        // WAL boundary and remains eligible for signed-surface recovery. Any WAL fact (including
+        // a clear rejection) remains paused for signed exchange reconciliation and is not replayed.
+        let resume_unsubmitted = if pending_transactions.is_empty() {
             false
         } else {
-            let all_absent = pending_transactions
-                .iter()
-                .flat_map(|(_, ids)| ids)
-                .try_fold(true, |_, id| {
-                    self.host
-                        .command_status(id)
-                        .map_err(|_| NodeError::ResidentRuntime)
-                        .map(|status| status.is_none())
-                })?;
-            if all_absent {
-                bridge
-                    .abandon_unsubmitted_transactions_for_reconciliation(
-                        &pending_transactions
-                            .iter()
-                            .map(|(id, _)| id.clone())
-                            .collect::<Vec<_>>(),
-                    )
-                    .map_err(|_| NodeError::ResidentRuntime)?;
-                true
-            } else {
-                false
-            }
+            let all_absent = all_pending_grid_commands_are_absent(&pending_transactions, |id| {
+                self.host
+                    .command_status(id)
+                    .map_err(|error| NodeError::LiveHost {
+                        venue: self.host.binding().venue,
+                        message: format!("pending Grid command WAL classification failed: {error}"),
+                    })
+            })?;
+            all_absent
         };
         let first_bootstrap = bridge.needs_initial_bootstrap();
         let reset_rebuild = confirm_reset_rebuild && bridge.needs_reset_rebuild();
@@ -339,24 +341,14 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         let key = binding.key.clone();
         self.grid_bridges.insert(key.clone(), bridge);
         self.grid_bindings.insert(key.clone(), binding);
-        if abandoned_unsubmitted {
+        if resume_unsubmitted {
             let binding = self
                 .grid_bindings
                 .get(&key)
                 .cloned()
                 .ok_or(NodeError::ResidentRuntime)?;
-            let replay = self
-                .grid_bridges
-                .get(&key)
-                .ok_or(NodeError::ResidentRuntime)?
-                .checkpoint_bytes()?;
-            let applied = self
-                .runtime
-                .persist_resident_semantic_turn(&binding, replay)
-                .map_err(resident_error)?;
-            persist_anchor(&self.artifacts_root, &binding, &applied)?;
-        }
-        if first_bootstrap || reset_rebuild {
+            self.resume_grid_unsubmitted_transactions(&binding)?;
+        } else if first_bootstrap || reset_rebuild {
             self.grid_bootstrap_pending.insert(key.clone());
         } else if bootstrap_requires_reconciliation {
             self.runtime.request_pause(&key).map_err(resident_error)?;
@@ -1626,7 +1618,7 @@ mod bootstrap_tests {
     use venue_runtime::{
         AccountDispatchPermit, AccountGatewayResult, AccountHostValidationError,
         AccountPhysicalGateway, AccountRecoveryOutcome, AccountRecoveryReport,
-        AccountRecoveryRequest, AccountRiskEvidence, SignedAccountPositionFact,
+        AccountRecoveryRequest, AccountRiskEvidence, CommandState, SignedAccountPositionFact,
         SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
     };
     use venue_runtime::{AccountKey, StrategyBinding, StrategyInstanceKey, StrategyKind};
@@ -1891,6 +1883,41 @@ mod bootstrap_tests {
 
         bridge.grid.suppress_replenishment_until_inventory_recovers = true;
         assert!(apply_grid_restart_replenishment_policy(&mut bridge, false, false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn every_pending_wal_state_blocks_resume_even_when_not_last()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let command_ids = (0..6)
+            .map(|index| venue_domain::CommandId::new(format!("pending-grid-{index}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let pending = vec![("transaction".to_owned(), command_ids.clone())];
+        let states = [
+            CommandState::Prepared,
+            CommandState::Submitted,
+            CommandState::Accepted {
+                venue_order_id: "native".to_owned(),
+            },
+            CommandState::Rejected {
+                reason: "rejected".to_owned(),
+            },
+            CommandState::Unknown {
+                reason: "unknown".to_owned(),
+            },
+        ];
+        for (index, state) in states.into_iter().enumerate() {
+            let present = command_ids[index].clone();
+            assert!(!all_pending_grid_commands_are_absent(
+                &pending,
+                |command_id| {
+                    Ok::<_, io::Error>((command_id == &present).then(|| state.clone()))
+                }
+            )?);
+        }
+        assert!(all_pending_grid_commands_are_absent(&pending, |_| {
+            Ok::<_, io::Error>(None::<CommandState>)
+        })?);
         Ok(())
     }
 

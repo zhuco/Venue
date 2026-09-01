@@ -269,9 +269,7 @@ Grid bridge 对同一已接受 native order 的部分成交必须在策略 check
 公共 socket/journal 只在 resident 公共 turn 推进，供初装、整网重建和再中心化使用；它的缺失或过期不阻塞完整成交的滚动 dispatch。`mutation_dispatched`、`private_reconcile_required` 与 `recenter_required` 继续区分已发批次、后续私有对账和 reducer 明确要求的整网重心迁移；BBO 不再产生成交滚动的等待状态。
 
 最小 Checkpoint 与最终公共/WAL 门之间的崩溃也按整批恢复：重启先把 `Prepared` 证明为未 dispatch、把
-`Submitted` 围栏为 `Unknown`；若所有替代单身份均不在 WAL，才可恢复原 cancel target 并 recenter。任一替代单
-已进入 WAL 时，整个 pending transaction 必须进入 `BlockedUnknown`，禁止单条复活；只有全部 WAL 身份收敛且
-更新一代全订单族签名回读重建出实际 owned 集合后，才清除 pending 并继续 reset/running。
+`Submitted` 围栏为 `Unknown`；只有全部 deterministic command id 在 Host WAL 中绝对不存在，且由 checkpoint 推导的预派发订单面（仍有 accepted route 的当前订单，加每个 pending transaction 的原 cancel target，排除未提交 replacement）与当前签名订单在 client/native/owner/订单形状及全集上完全一致，才可用同一 transaction、同一命令 ID 继续整批，不得从当前订单面自证、重新分配身份或按当前价格再规划。任一命令已进入 WAL（包括明确 Rejected）时，整个 pending transaction 必须保持暂停并进入签名对账，禁止单条复活；只有全部 WAL 身份收敛且更新一代全订单族签名回读重建出实际 owned 集合后，才清除 pending 并继续 reset/running。
 
 重建 place 收到 Accepted 后不得先把本地 4×N 张订单记为 `Running`；若安装窗口继续成交或订单消失，
 Checkpoint 与健康报告都必须保持过渡态，直到更新一代签名 open-orders 精确收敛。

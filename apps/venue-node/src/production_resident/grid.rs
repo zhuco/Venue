@@ -273,28 +273,6 @@ impl GridBridgeState {
             .collect()
     }
 
-    /// Drops only routes created by transactions proven never to have reached this Host WAL.
-    /// The reducer restores the old cancellation target and moves to reconciliation; no exchange
-    /// request is emitted here.
-    pub(crate) fn abandon_unsubmitted_transactions_for_reconciliation(
-        &mut self,
-        transaction_ids: &[String],
-    ) -> Result<(), GridBridgeError> {
-        let replacements = self
-            .grid
-            .pending_transactions
-            .values()
-            .flat_map(|transaction| transaction.places.iter().map(|order| order.key.clone()))
-            .collect::<Vec<_>>();
-        self.grid
-            .abandon_unsubmitted_transactions_for_reconciliation(transaction_ids)
-            .map_err(GridBridgeError::Reducer)?;
-        for key in replacements {
-            self.routes.remove(&key);
-        }
-        self.validate()
-    }
-
     pub(crate) fn mark_bootstrap_attempted(&mut self) -> Result<(), GridBridgeError> {
         if !self.needs_initial_bootstrap() {
             return Err(GridBridgeError::BootstrapState);
@@ -405,8 +383,114 @@ impl GridBridgeState {
     /// Retired routes are deliberately ignored: a completed rolling cancellation is historical,
     /// while every current desired key must retain its exact client/native/order-shape triad.
     pub(crate) fn signed_desired_matches(&self, orders: &[SignedAccountOrderFact]) -> bool {
-        orders.len() == self.grid.owned_orders.len()
-            && self.grid.owned_orders.iter().all(|(key, desired)| {
+        self.signed_orders_match(orders, &self.grid.owned_orders)
+    }
+
+    pub(crate) fn expected_signed_surface(
+        &self,
+    ) -> Result<BTreeMap<CommandId, OrderOwner>, NodeError> {
+        self.grid
+            .owned_orders
+            .iter()
+            .map(|(key, desired)| {
+                let route = self.routes.get(key).ok_or(NodeError::ResidentRuntime)?;
+                if route.accepted_venue_order_id.is_none() {
+                    return Err(NodeError::ResidentRuntime);
+                }
+                Ok((
+                    route.client_order_id.clone(),
+                    owner_for_order(&self.grid, desired),
+                ))
+            })
+            .collect()
+    }
+
+    /// Returns the checkpoint-derived exchange surface that must exist immediately before the
+    /// next reserved rolling batch. Accepted current orders remain live, each pending
+    /// transaction contributes its original cancellation target, and its unsubmitted
+    /// replacements are deliberately excluded.
+    pub(crate) fn expected_pending_signed_surface(
+        &self,
+    ) -> Result<BTreeMap<CommandId, OrderOwner>, GridBridgeError> {
+        self.pending_pre_dispatch_orders()?
+            .iter()
+            .map(|(key, desired)| {
+                let route = self.routes.get(key).ok_or(GridBridgeError::UnknownOrder)?;
+                if route.accepted_venue_order_id.is_none() {
+                    return Err(GridBridgeError::Evidence);
+                }
+                Ok((
+                    route.client_order_id.clone(),
+                    owner_for_order(&self.grid, desired),
+                ))
+            })
+            .collect()
+    }
+
+    /// Proves the complete pre-dispatch order shape against the durable checkpoint. A caller may
+    /// not derive its expectation from the same signed snapshot it is trying to authorize.
+    pub(crate) fn signed_pending_surface_matches(&self, orders: &[SignedAccountOrderFact]) -> bool {
+        self.pending_pre_dispatch_orders()
+            .is_ok_and(|expected| self.signed_orders_match(orders, &expected))
+    }
+
+    fn pending_pre_dispatch_orders(
+        &self,
+    ) -> Result<BTreeMap<GridOrderKey, GridOrderIntent>, GridBridgeError> {
+        self.validate()?;
+        let mut expected = BTreeMap::new();
+        for (key, desired) in &self.grid.owned_orders {
+            let route = self.routes.get(key).ok_or(GridBridgeError::UnknownOrder)?;
+            if route.accepted_venue_order_id.is_some() {
+                expected.insert(key.clone(), desired.clone());
+                continue;
+            }
+            let reserved_replacement = self
+                .grid
+                .pending_transactions
+                .values()
+                .any(|transaction| transaction.places.iter().any(|order| &order.key == key));
+            if !reserved_replacement {
+                return Err(GridBridgeError::Evidence);
+            }
+        }
+        for transaction in self.grid.pending_transactions.values() {
+            let cancelled = transaction
+                .cancelled_order
+                .as_ref()
+                .ok_or(GridBridgeError::Evidence)?;
+            if cancelled.key != transaction.cancel
+                || self
+                    .routes
+                    .get(&transaction.cancel)
+                    .and_then(|route| route.accepted_venue_order_id.as_ref())
+                    .is_none()
+                || expected
+                    .insert(transaction.cancel.clone(), cancelled.clone())
+                    .is_some()
+            {
+                return Err(GridBridgeError::Evidence);
+            }
+            for replacement in &transaction.places {
+                let route = self
+                    .routes
+                    .get(&replacement.key)
+                    .ok_or(GridBridgeError::UnknownOrder)?;
+                if route.accepted_venue_order_id.is_some() {
+                    return Err(GridBridgeError::Evidence);
+                }
+            }
+        }
+        Ok(expected)
+    }
+
+    fn signed_orders_match(
+        &self,
+        orders: &[SignedAccountOrderFact],
+        expected: &BTreeMap<GridOrderKey, GridOrderIntent>,
+    ) -> bool {
+        orders.len() == expected.len()
+            && expected.iter().all(|(key, desired)| {
                 let Some(route) = self.routes.get(key) else {
                     return false;
                 };
@@ -430,31 +514,15 @@ impl GridBridgeState {
                         && actual.limit_price == Some(desired.price.value())
                         && actual.time_in_force == Some(venue_domain::LimitTimeInForce::PostOnly)
                         && actual.reduce_only == desired.reduce_only
+                        && actual.filled_quantity.is_some_and(|filled| {
+                            filled >= rust_decimal::Decimal::ZERO && filled < actual.quantity
+                        })
                         && matches!(
                             actual.state,
                             Some(OrderState::New | OrderState::PartiallyFilled)
                         )
                 })
             })
-    }
-
-    pub(crate) fn expected_signed_surface(
-        &self,
-    ) -> Result<BTreeMap<CommandId, OrderOwner>, NodeError> {
-        self.grid
-            .owned_orders
-            .iter()
-            .map(|(key, desired)| {
-                let route = self.routes.get(key).ok_or(NodeError::ResidentRuntime)?;
-                if route.accepted_venue_order_id.is_none() {
-                    return Err(NodeError::ResidentRuntime);
-                }
-                Ok((
-                    route.client_order_id.clone(),
-                    owner_for_order(&self.grid, desired),
-                ))
-            })
-            .collect()
     }
 
     /// Signed restart catch-up may consume only a fill whose native order id is still attached
@@ -654,6 +722,19 @@ impl GridBridgeState {
         self.plan_transaction(transaction)
     }
 
+    /// Rebuilds only the command bytes for reducer transactions already present in the verified
+    /// checkpoint. The caller may use these plans only after Host proves every deterministic
+    /// command id is absent from WAL and the current signed surface still contains every exact
+    /// cancellation target. No new route or transaction identity is allocated here.
+    pub(crate) fn pending_dispatch_plans(&self) -> Result<Vec<GridDispatchPlan>, GridBridgeError> {
+        self.validate()?;
+        self.grid
+            .pending_transactions
+            .values()
+            .map(|transaction| self.transaction_plan_from_routes(transaction))
+            .collect()
+    }
+
     pub(crate) fn install_initial_epoch(
         &mut self,
         inventory: GridInventory,
@@ -718,17 +799,37 @@ impl GridBridgeState {
         &mut self,
         transaction: &GridTransaction,
     ) -> Result<GridDispatchPlan, GridBridgeError> {
-        let cancelled = self
+        for order in &transaction.places {
+            let client = stable_identifier(b"client", &self.grid.binding, &order.key)?;
+            self.reserve_client_route(order.key.clone(), client)?;
+        }
+        self.validate()?;
+        self.transaction_plan_from_routes(transaction)
+    }
+
+    fn transaction_plan_from_routes(
+        &self,
+        transaction: &GridTransaction,
+    ) -> Result<GridDispatchPlan, GridBridgeError> {
+        let cancelled_route = self
             .routes
             .get(&transaction.cancel)
-            .ok_or(GridBridgeError::UnknownOrder)?
-            .client_order_id
-            .clone();
+            .ok_or(GridBridgeError::UnknownOrder)?;
+        if cancelled_route.accepted_venue_order_id.is_none() {
+            return Err(GridBridgeError::Evidence);
+        }
+        let cancelled = cancelled_route.client_order_id.clone();
         let mut commands = Vec::with_capacity(3);
         let mut accepted_routes = Vec::with_capacity(2);
         for order in &transaction.places {
+            let route = self
+                .routes
+                .get(&order.key)
+                .ok_or(GridBridgeError::UnknownOrder)?;
             let client = stable_identifier(b"client", &self.grid.binding, &order.key)?;
-            self.reserve_client_route(order.key.clone(), client.clone())?;
+            if route.client_order_id != client || route.accepted_venue_order_id.is_some() {
+                return Err(GridBridgeError::RouteConflict);
+            }
             let command_id = stable_identifier(b"place", &self.grid.binding, &order.key)?;
             commands.push(ExecutionCommand::PlaceLimit(OrderCommand {
                 time_in_force: Default::default(),
@@ -757,7 +858,6 @@ impl GridBridgeState {
             ),
             target_client_order_id: cancelled,
         }));
-        self.validate()?;
         Ok(GridDispatchPlan {
             commands,
             accepted_routes,
@@ -1264,6 +1364,87 @@ mod tests {
         })
     }
 
+    fn signed_orders_for(
+        bridge: &GridBridgeState,
+        expected: &BTreeMap<GridOrderKey, GridOrderIntent>,
+    ) -> Result<Vec<SignedAccountOrderFact>, Box<dyn std::error::Error>> {
+        expected
+            .iter()
+            .map(|(key, desired)| {
+                let route = bridge.routes.get(key).ok_or("route")?;
+                Ok(SignedAccountOrderFact {
+                    client_order_id: route.client_order_id.as_str().to_owned(),
+                    venue_order_id: route.accepted_venue_order_id.clone(),
+                    symbol: bridge.grid.binding.symbol.clone(),
+                    family: venue_domain::NativeOrderFamily::UmOrder,
+                    side: desired.side,
+                    position_side: match desired.key.position {
+                        GridPosition::Long => PositionSide::Long,
+                        GridPosition::Short => PositionSide::Short,
+                    },
+                    quantity: desired.quantity,
+                    limit_price: Some(desired.price.value()),
+                    time_in_force: Some(venue_domain::LimitTimeInForce::PostOnly),
+                    created_at_ms: Some(1),
+                    reduce_only: desired.reduce_only,
+                    owner: Some(owner_for_order(&bridge.grid, desired)),
+                    external: false,
+                    state: Some(OrderState::New),
+                    filled_quantity: Some(Decimal::ZERO),
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pending_resume_surface_is_checkpoint_derived_and_shape_exact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut bridge, _key, source, native_order_id) = bridge_with_accepted_order()?;
+        let fill = owned_fill(
+            "resume-surface-fill",
+            &native_order_id,
+            &source,
+            source.quantity,
+            source.price,
+        )?;
+        let GridDecision::Actions(actions) = bridge.observe_persisted_fill(&fill, 9)? else {
+            return Err("complete fill did not reserve a transaction".into());
+        };
+        let plan = bridge.plan_dispatch(&actions[0])?;
+        let before_dispatch = bridge.pending_pre_dispatch_orders()?;
+        let signed = signed_orders_for(&bridge, &before_dispatch)?;
+        assert!(bridge.signed_pending_surface_matches(&signed));
+        assert_eq!(
+            bridge.expected_pending_signed_surface()?.len(),
+            signed.len()
+        );
+
+        let mut wrong_native = signed.clone();
+        wrong_native[0].venue_order_id = Some("wrong-native".to_owned());
+        assert!(!bridge.signed_pending_surface_matches(&wrong_native));
+        let mut wrong_shape = signed.clone();
+        wrong_shape[0].quantity += Decimal::new(1, 2);
+        assert!(!bridge.signed_pending_surface_matches(&wrong_shape));
+        let mut missing = signed.clone();
+        missing.pop();
+        assert!(!bridge.signed_pending_surface_matches(&missing));
+        let mut extra = signed.clone();
+        extra.push(signed[0].clone());
+        assert!(!bridge.signed_pending_surface_matches(&extra));
+
+        let accepted = plan
+            .accepted_routes
+            .iter()
+            .enumerate()
+            .map(|(index, (_, _, command_id))| {
+                (command_id.clone(), format!("resume-native-{index}"))
+            })
+            .collect::<Vec<_>>();
+        bridge.bind_accepted_plan(&plan, &accepted)?;
+        assert!(!bridge.signed_pending_surface_matches(&signed));
+        Ok(())
+    }
+
     #[test]
     fn partial_fills_accumulate_across_checkpoint_and_retire_the_completed_route()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1336,6 +1517,16 @@ mod tests {
         for action in &actions {
             let plan = bridge.plan_dispatch(action)?;
             assert!(!bridge.grid.pending_transactions.is_empty());
+            let checkpoint = bridge.checkpoint_bytes()?;
+            let restored = GridBridgeState::restore_or_bootstrap(
+                Some(checkpoint),
+                bridge.grid.clone(),
+                NodeGridRecoveryPolicy::RequireExisting,
+            )?;
+            let resumed = restored.pending_dispatch_plans()?;
+            assert_eq!(resumed.len(), 1);
+            assert_eq!(resumed[0].commands, plan.commands);
+            bridge = restored;
             let accepted = plan
                 .accepted_routes
                 .iter()
