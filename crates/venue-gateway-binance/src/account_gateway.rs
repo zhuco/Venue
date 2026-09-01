@@ -24,6 +24,9 @@ use venue_execution::{
 use venue_gateway_api::{GatewayBinding, PublicMarketBinding};
 
 use crate::private::{RecentFillsCursor, USER_TRADES_PAGE_LIMIT};
+#[path = "account_gateway_algo.rs"]
+mod account_gateway_algo;
+use account_gateway_algo::algo_order_rows;
 #[path = "account_gateway_limit.rs"]
 mod account_gateway_limit;
 use account_gateway_limit::{
@@ -1855,35 +1858,6 @@ fn account_entry_order_notionals(
         }
     }
     Ok(notionals)
-}
-
-fn algo_order_rows(
-    payload: &[u8],
-) -> Result<Vec<serde_json::Map<String, Value>>, AccountHostValidationError> {
-    let value: Value =
-        serde_json::from_slice(payload).map_err(|_| AccountHostValidationError::RiskEvidence)?;
-    let page = value
-        .as_object()
-        .ok_or(AccountHostValidationError::RiskEvidence)?;
-    let orders = page
-        .get("orders")
-        .and_then(Value::as_array)
-        .ok_or(AccountHostValidationError::RiskEvidence)?;
-    let total = page
-        .get("total")
-        .and_then(Value::as_u64)
-        .ok_or(AccountHostValidationError::RiskEvidence)?;
-    if usize::try_from(total).ok() != Some(orders.len()) {
-        return Err(AccountHostValidationError::RiskEvidence);
-    }
-    orders
-        .iter()
-        .map(|row| {
-            row.as_object()
-                .cloned()
-                .ok_or(AccountHostValidationError::RiskEvidence)
-        })
-        .collect()
 }
 
 fn account_rules(
