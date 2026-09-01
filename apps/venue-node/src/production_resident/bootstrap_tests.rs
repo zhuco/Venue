@@ -27,6 +27,8 @@ struct State {
     dispatches: usize,
     accept_dispatch: bool,
     risk_evidence_fails: bool,
+    long_quantity: Decimal,
+    short_quantity: Decimal,
     open_orders: Vec<SignedAccountOrderFact>,
 }
 
@@ -101,15 +103,17 @@ impl AccountPhysicalGateway for Gateway {
                 SignedAccountPositionFact {
                     symbol: self.binding.symbol.clone(),
                     position_side: PositionSide::Long,
-                    quantity: Decimal::ZERO,
-                    entry_price: None,
+                    quantity: state.long_quantity,
+                    entry_price: (state.long_quantity != Decimal::ZERO)
+                        .then_some(Decimal::new(100, 0)),
                     mark_price: Some(Decimal::new(100, 0)),
                 },
                 SignedAccountPositionFact {
                     symbol: self.binding.symbol.clone(),
                     position_side: PositionSide::Short,
-                    quantity: Decimal::ZERO,
-                    entry_price: None,
+                    quantity: state.short_quantity,
+                    entry_price: (state.short_quantity != Decimal::ZERO)
+                        .then_some(Decimal::new(100, 0)),
                     mark_price: Some(Decimal::new(100, 0)),
                 },
             ],
@@ -257,6 +261,8 @@ fn resident(
         dispatches: 0,
         accept_dispatch: false,
         risk_evidence_fails: false,
+        long_quantity: Decimal::ZERO,
+        short_quantity: Decimal::ZERO,
         open_orders: Vec::new(),
     }));
     let gateway = Gateway {
@@ -299,7 +305,12 @@ fn existing_grid_restart_signs_cancels_empty_and_rebuilds_higher_epoch()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let (mut resident, state, binding) = resident(directory.path(), 2)?;
-    state.lock().map_err(|_| "state")?.accept_dispatch = true;
+    {
+        let mut state = state.lock().map_err(|_| "state")?;
+        state.accept_dispatch = true;
+        state.long_quantity = Decimal::new(12, 2);
+        state.short_quantity = Decimal::new(12, 2);
+    }
     assert!(resident.take_grid_bootstrap_request(&binding)?);
     let snapshot = resident.refresh_signed_snapshot()?;
     resident
@@ -325,6 +336,10 @@ fn existing_grid_restart_signs_cancels_empty_and_rebuilds_higher_epoch()
         first_order_count
     );
     drop(resident);
+
+    // A real adapter process restarts its private generation at one while the Host keeps the
+    // prior durable floor. Preserve exchange orders, but reset only this process-local counter.
+    state.lock().map_err(|_| "state")?.generation = 0;
 
     let second_launch = launch(directory.path())?;
     let gateway = Gateway {
@@ -369,14 +384,14 @@ fn existing_grid_restart_signs_cancels_empty_and_rebuilds_higher_epoch()
         .ok_or("rebuild preview")?
         .clone();
     assert_eq!(preview.grid.phase, GridPhase::ResettingGrid);
-    assert!(preview.grid.suppress_replenishment_until_inventory_recovers);
+    assert!(!preview.grid.suppress_replenishment_until_inventory_recovers);
     assert_eq!(
         preview.grid.observe_inventory(GridInventory {
             private_generation: snapshot.private_generation(),
             private_observed_at_ms: snapshot.observed_at_ms(),
             mark_price: Price::new(Decimal::new(100, 0))?,
-            long_quantity: Decimal::ZERO,
-            short_quantity: Decimal::ZERO,
+            long_quantity: Decimal::new(12, 2),
+            short_quantity: Decimal::new(12, 2),
         })?,
         GridDecision::Noop
     );
@@ -395,6 +410,128 @@ fn existing_grid_restart_signs_cancels_empty_and_rebuilds_higher_epoch()
     assert_eq!(
         state.lock().map_err(|_| "state")?.open_orders.len(),
         rebuilt.expected_signed_surface()?.len()
+    );
+
+    let (raw_private_generation, filled_order, dispatches_before) = {
+        let mut state = state.lock().map_err(|_| "state")?;
+        let filled_order = state
+            .open_orders
+            .iter()
+            .find(|order| !order.reduce_only)
+            .cloned()
+            .ok_or("rebuilt entry order")?;
+        let filled_native = filled_order
+            .venue_order_id
+            .as_deref()
+            .ok_or("rebuilt native order")?
+            .to_owned();
+        state
+            .open_orders
+            .retain(|order| order.venue_order_id.as_deref() != Some(filled_native.as_str()));
+        (state.generation, filled_order, state.dispatches)
+    };
+    let normalized_private_generation = reopened.runtime().active_private_generation();
+    assert!(normalized_private_generation > raw_private_generation);
+    assert_eq!(
+        reopened
+            .host
+            .normalize_current_gateway_private_generation(raw_private_generation)?,
+        normalized_private_generation
+    );
+    let facts_path = reopened.artifacts_root.join("facts.jsonl");
+    let facts_before = std::fs::read_to_string(&facts_path)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    let fill = Fill {
+        fill_id: "restart-ratchet-first-fill".to_owned(),
+        execution_sequence: FieldState::Known(1),
+        order_id: filled_order
+            .venue_order_id
+            .clone()
+            .ok_or("rebuilt native order")?,
+        symbol: filled_order.symbol,
+        side: filled_order.side,
+        position_side: FieldState::Known(filled_order.position_side),
+        quantity: filled_order.quantity,
+        price: Price::new(filled_order.limit_price.ok_or("rebuilt limit price")?)?,
+        fee: FieldState::Missing,
+        realized_pnl: FieldState::Missing,
+        maker: FieldState::Known(true),
+        exchange_time_ms: Some(now()?),
+    };
+    let mut stale_fill = fill.clone();
+    stale_fill.fill_id = "restart-ratchet-stale-fill".to_owned();
+    let consumed = reopened.consume_private_fill(
+        "bybit",
+        PrivateFillFact {
+            source_private_generation: raw_private_generation,
+            received_at_ms: now()?,
+            fill,
+        },
+    );
+    let facts_after = std::fs::read_to_string(&facts_path)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    let consumed = consumed.map_err(|error| {
+        let (dispatches_after, raw_after, open_after) = state
+            .lock()
+            .map(|state| {
+                (
+                    state.dispatches,
+                    state.generation,
+                    state.open_orders.len(),
+                )
+            })
+            .unwrap_or_default();
+        let fill_recorded = reopened.grid_bridges.get(&binding.key).is_some_and(|bridge| {
+            bridge
+                .grid
+                .owned_fill_records
+                .contains_key("restart-ratchet-first-fill")
+        });
+        let lifecycle = reopened.strategy_lifecycle(&binding);
+        let health = reopened.runtime.health();
+        let fault = reopened.runtime.fault_reason();
+        io::Error::other(format!(
+            "restart-ratcheted private fill failed with facts {facts_before}->{facts_after}, dispatches {dispatches_before}->{dispatches_after}, raw {raw_private_generation}->{raw_after}, open {open_after}, fill_recorded {fill_recorded}, lifecycle {lifecycle:?}, health {health:?}, fault {fault:?}: {error}"
+        ))
+    })?;
+    assert!(consumed);
+    let observed = reopened
+        .grid_bridges
+        .get(&binding.key)
+        .and_then(|bridge| {
+            bridge
+                .grid
+                .owned_fill_records
+                .get("restart-ratchet-first-fill")
+        })
+        .ok_or("restart fill record")?;
+    assert_eq!(observed.private_generation, normalized_private_generation);
+    assert_eq!(
+        state.lock().map_err(|_| "state")?.dispatches,
+        dispatches_before + 3
+    );
+    assert!(
+        reopened
+            .consume_private_fill(
+                "bybit",
+                PrivateFillFact {
+                    source_private_generation: raw_private_generation,
+                    received_at_ms: now()?,
+                    fill: stale_fill,
+                },
+            )
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&facts_path)
+            .unwrap_or_default()
+            .lines()
+            .count(),
+        facts_after
     );
     Ok(())
 }

@@ -115,6 +115,19 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
             .with_gateway_read(operation)
             .map_err(|error| AccountRuntimeHostError::Host(AccountHostError::Gateway(error)))
     }
+
+    /// Normalizes one adapter-local private generation only when it is still bound to the
+    /// Host's latest complete signed snapshot. This exposes neither the restart offset nor any
+    /// mutation authority to the resident.
+    pub fn normalize_current_gateway_private_generation(
+        &self,
+        gateway_generation: u64,
+    ) -> Result<u64, AccountRuntimeHostError<G::Error>> {
+        self.host
+            .normalize_current_gateway_private_generation(gateway_generation)
+            .map_err(AccountHostError::Validation)
+            .map_err(AccountRuntimeHostError::Host)
+    }
     pub fn open(
         artifacts_root: impl Into<PathBuf>,
         binding: GatewayBinding,

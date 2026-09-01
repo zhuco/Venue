@@ -521,6 +521,31 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         operation(&mut self.gateway)
     }
 
+    /// Maps the current adapter-local private generation into the Host's durable generation
+    /// domain. A restarted adapter may begin at one while the persisted account generation is
+    /// much higher; only the exact raw generation used by the latest signed snapshot is accepted.
+    pub fn normalize_current_gateway_private_generation(
+        &self,
+        gateway_generation: u64,
+    ) -> Result<u64, AccountHostValidationError> {
+        let snapshot = self
+            .latest_signed_snapshot
+            .as_ref()
+            .ok_or(AccountHostValidationError::SignedSnapshot)?;
+        let normalized = gateway_generation
+            .checked_add(self.private_generation_offset)
+            .ok_or(AccountHostValidationError::SignedSnapshot)?;
+        if gateway_generation == 0
+            || self.last_gateway_private_generation != Some(gateway_generation)
+            || normalized == 0
+            || normalized != self.private_generation_floor
+            || normalized != snapshot.private_generation()
+        {
+            return Err(AccountHostValidationError::SignedSnapshot);
+        }
+        Ok(normalized)
+    }
+
     /// Exposes only adapter-validated rules identity facts. The Host retains every mutation
     /// authority and performs no configuration-derived market/settlement inference.
     pub fn current_instrument(

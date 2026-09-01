@@ -97,6 +97,55 @@ impl AccountPhysicalGateway for Gateway {
     }
 }
 
+#[test]
+fn restarted_gateway_private_generation_maps_only_from_latest_signed_snapshot()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let binding = binding()?;
+    let first_snapshot = managed_signed_order(&binding, owner()?, false, 7)?;
+    let mut first = AccountMutationHost::open(
+        root(&temp),
+        binding.clone(),
+        Decimal::TEN,
+        LegacySnapshotGateway {
+            binding: binding.clone(),
+            snapshot: first_snapshot,
+        },
+    )?;
+    let first_signed = first.refresh_signed_snapshot()?;
+    assert_eq!(first_signed.private_generation(), 7);
+    assert_eq!(first.normalize_current_gateway_private_generation(7)?, 7);
+    drop(first);
+
+    let restarted_snapshot = managed_signed_order(&binding, owner()?, false, 1)?;
+    let mut restarted = AccountMutationHost::open(
+        root(&temp),
+        binding.clone(),
+        Decimal::TEN,
+        LegacySnapshotGateway {
+            binding,
+            snapshot: restarted_snapshot,
+        },
+    )?;
+    let normalized = restarted.refresh_signed_snapshot()?;
+    assert_eq!(normalized.private_generation(), 8);
+    assert_eq!(
+        restarted.normalize_current_gateway_private_generation(1)?,
+        8
+    );
+    assert!(
+        restarted
+            .normalize_current_gateway_private_generation(0)
+            .is_err()
+    );
+    assert!(
+        restarted
+            .normalize_current_gateway_private_generation(2)
+            .is_err()
+    );
+    Ok(())
+}
+
 #[derive(Debug)]
 struct RecoveringGateway {
     binding: GatewayBinding,

@@ -1139,14 +1139,22 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         use venue_domain::domain::{DomainEvent, EventId, NativeOrderFamily};
         use venue_runtime::{account::AccountPrivateFactInput, strategy::StrategyInput};
 
-        // The adapter proves its socket is bound to the exact signed private snapshot. Runtime's
-        // durable facts journal is separately keyed by the connection generation used by its
-        // private router; neither generation may be substituted for the other.
+        // The adapter proves its socket is bound to the exact raw generation used by the latest
+        // signed private snapshot. Host alone maps that process-local value into its durable
+        // restart-ratcheted domain. Runtime's facts journal remains separately keyed by the
+        // connection generation used by its private router.
         let active_private_generation = self.runtime.active_private_generation();
         let connection_generation = self.runtime.connection_generation();
-        if event.source_private_generation == 0
-            || event.source_private_generation != active_private_generation
-            || connection_generation == 0
+        let normalized_private_generation = self
+            .host
+            .normalize_current_gateway_private_generation(event.source_private_generation)
+            .map_err(|error| NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: format!(
+                    "private stream generation is outside the current signed snapshot: {error}"
+                ),
+            })?;
+        if normalized_private_generation != active_private_generation || connection_generation == 0
         {
             return Err(NodeError::ResidentRuntime);
         }
@@ -1165,9 +1173,18 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 )
                 .map_err(|_| NodeError::ResidentRuntime)?,
             )
-            .map_err(resident_error)?;
+            .map_err(|error| NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: format!("private fact journal or route commit failed: {error}"),
+            })?;
         if report.reconcile.is_some() || report.duplicate || report.pending_batch {
-            return Err(NodeError::ResidentRuntime);
+            return Err(NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: format!(
+                    "private fact did not produce one complete new route: reconcile={:?}, duplicate={}, pending_batch={}",
+                    report.reconcile, report.duplicate, report.pending_batch
+                ),
+            });
         }
         for delivery in report.deliveries {
             if let Some(binding) = self.manual_bindings.get(&delivery.target).cloned() {
@@ -1199,17 +1216,27 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 let turn = self
                     .runtime
                     .begin_private_strategy_turn(&binding)
-                    .map_err(resident_error)?
-                    .ok_or(NodeError::ResidentRuntime)?;
+                    .map_err(|error| NodeError::LiveHost {
+                        venue: self.host.binding().venue,
+                        message: format!("Grid private turn could not begin: {error}"),
+                    })?
+                    .ok_or_else(|| NodeError::LiveHost {
+                        venue: self.host.binding().venue,
+                        message: "Grid private route produced no actor turn".to_owned(),
+                    })?;
                 let StrategyInput::Private(fact) = turn.input() else {
-                    return Err(NodeError::ResidentRuntime);
+                    return Err(NodeError::LiveHost {
+                        venue: self.host.binding().venue,
+                        message: "Grid private route was preceded by a non-private actor turn"
+                            .to_owned(),
+                    });
                 };
                 let DomainEvent::Fill(fill) = fact.record().event.clone() else {
                     return Err(NodeError::ResidentRuntime);
                 };
                 // The persisted fact header carries the router connection generation. Grid's
                 // reducer cursor is the separately signed private generation validated above.
-                let private_generation = active_private_generation;
+                let private_generation = normalized_private_generation;
                 let signed_surface = self
                     .grid_bridges
                     .get(&delivery.target)
@@ -1221,14 +1248,23 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                     .ok_or(NodeError::ResidentRuntime)?;
                 let decision = bridge
                     .observe_persisted_fill(&fill, private_generation)
-                    .map_err(|_| NodeError::ResidentRuntime)?;
+                    .map_err(|error| NodeError::LiveHost {
+                        venue: self.host.binding().venue,
+                        message: format!(
+                            "Grid reducer rejected private fill {}: {error}",
+                            fill.fill_id
+                        ),
+                    })?;
                 let plans = match &decision {
                     venue_strategies::hedged_grid::GridDecision::Noop => Vec::new(),
                     venue_strategies::hedged_grid::GridDecision::Actions(actions) => actions
                         .iter()
                         .map(|action| bridge.plan_dispatch(action))
                         .collect::<Result<Vec<_>, _>>()
-                        .map_err(|_| NodeError::ResidentRuntime)?,
+                        .map_err(|error| NodeError::LiveHost {
+                            venue: self.host.binding().venue,
+                            message: format!("Grid private fill dispatch plan is invalid: {error}"),
+                        })?,
                     venue_strategies::hedged_grid::GridDecision::Blocked => {
                         return Err(NodeError::ResidentRuntime);
                     }
