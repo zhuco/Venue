@@ -3,6 +3,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -11,7 +15,8 @@ use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
 use venue_domain::domain::{
     Asset, CancelCommand, CommandId, ExecutionCommand, FieldState, InstrumentIdentity, MarketKind,
-    NativeOrderFamily, Order, OrderOwner, OrderSide, OrderState, Position, PositionSide, Price,
+    NativeOrderFamily, Order, OrderOwner, OrderPurpose, OrderSide, OrderState, Position,
+    PositionSide, Price,
 };
 use venue_gateway_api::GatewayBinding;
 
@@ -323,6 +328,17 @@ pub struct HostPreparedCommand {
     receipt_sequence: u64,
     record_sha256: [u8; 32],
     cancel_target_family: Option<NativeOrderFamily>,
+    entry_admission: EntryAdmission,
+}
+
+#[derive(Clone, Debug)]
+enum EntryAdmission {
+    AccountTotal,
+    ManagedGrid {
+        private_generation: u64,
+        batch_command_ids: Arc<BTreeSet<CommandId>>,
+        batch_live: Arc<AtomicBool>,
+    },
 }
 
 /// Read-only evidence for a currently open order that was recovered from the frozen Stage-7
@@ -335,6 +351,39 @@ pub struct LegacyV1CustodyRoute {
     pub family: NativeOrderFamily,
     pub client_order_id: CommandId,
     pub venue_order_id: String,
+}
+
+/// Linear Host proof of one exact, fresh signed Hedge surface. It is intentionally neither
+/// cloneable nor serializable and can authorize at most one managed Grid batch.
+#[derive(Debug)]
+pub struct ManagedGridSurfaceReceipt {
+    binding: GatewayBinding,
+    owner: OrderOwner,
+    private_generation: u64,
+    expected_open_orders: BTreeMap<CommandId, OrderOwner>,
+    surface_sha256: [u8; 32],
+}
+
+impl ManagedGridSurfaceReceipt {
+    #[must_use]
+    pub const fn binding(&self) -> &GatewayBinding {
+        &self.binding
+    }
+
+    #[must_use]
+    pub const fn owner(&self) -> &OrderOwner {
+        &self.owner
+    }
+
+    #[must_use]
+    pub const fn private_generation(&self) -> u64 {
+        self.private_generation
+    }
+
+    #[must_use]
+    pub const fn surface_sha256(&self) -> [u8; 32] {
+        self.surface_sha256
+    }
 }
 
 impl HostPreparedCommand {
@@ -451,6 +500,7 @@ pub struct AccountMutationHost<G> {
     private_generation_floor: u64,
     private_generation_offset: u64,
     last_gateway_private_generation: Option<u64>,
+    last_managed_grid_consumed_generation: Option<u64>,
     net_reduce_settlements: BTreeMap<CommandId, NetReduceSettlement>,
     journal: CommandJournal,
     gateway: G,
@@ -639,6 +689,7 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
             latest_signed_snapshot: previous_snapshot,
             private_generation_offset: 0,
             last_gateway_private_generation: None,
+            last_managed_grid_consumed_generation: None,
             net_reduce_settlements,
             journal,
             gateway,
@@ -1260,6 +1311,150 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         &mut self,
         command: ExecutionCommand,
     ) -> Result<HostPreparedCommand, AccountHostError<G::Error>> {
+        self.prepare_for_lane_with_admission(command, EntryAdmission::AccountTotal)
+    }
+
+    /// Seals one exact signed Hedge surface for the Runtime's target-specific Grid authority.
+    /// The expected set is caller-supplied only as a narrowing commitment: Host independently
+    /// requires every signed order to have the exact WAL-enriched owner and rejects all extras.
+    pub fn confirm_managed_grid_surface(
+        &mut self,
+        owner: &OrderOwner,
+        expected_open_orders: BTreeMap<CommandId, OrderOwner>,
+    ) -> Result<ManagedGridSurfaceReceipt, AccountHostError<G::Error>> {
+        let private_generation = self
+            .validate_managed_grid_surface(owner, &expected_open_orders, true)
+            .map_err(AccountHostError::Validation)?;
+        let encoded = serde_json::to_vec(&(
+            &self.binding,
+            owner,
+            private_generation,
+            &expected_open_orders,
+        ))
+        .map_err(|_| {
+            AccountHostError::Validation(AccountHostValidationError::ManagedGridSurface)
+        })?;
+        Ok(ManagedGridSurfaceReceipt {
+            binding: self.binding.clone(),
+            owner: owner.clone(),
+            private_generation,
+            expected_open_orders,
+            surface_sha256: Sha256::digest(encoded).into(),
+        })
+    }
+
+    /// Consumes one exact signed-surface proof and fsyncs a bounded Grid batch. Quote-to-USDT
+    /// evidence is collected once for the batch; every risk-increasing child remains <=10U.
+    pub fn prepare_managed_grid_batch_for_lane(
+        &mut self,
+        surface: ManagedGridSurfaceReceipt,
+        commands: &[ExecutionCommand],
+    ) -> Result<Vec<HostPreparedCommand>, AccountHostError<G::Error>> {
+        if surface.binding != self.binding
+            || commands.is_empty()
+            || !managed_grid_batch_shape(&surface.expected_open_orders, commands)
+            || commands.iter().any(|command| {
+                !matches!(
+                    command,
+                    ExecutionCommand::PlaceLimit(_) | ExecutionCommand::Cancel(_)
+                ) || !same_owner_scope(command.mutation_owner(), &surface.owner)
+                    || matches!(command, ExecutionCommand::PlaceLimit(order)
+                        if (order.reduce_only && order.owner.purpose != OrderPurpose::Reduce)
+                            || (!order.reduce_only
+                                && order.owner.purpose != OrderPurpose::Entry))
+            })
+            || commands
+                .iter()
+                .map(ExecutionCommand::command_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != commands.len()
+        {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::ManagedGridSurface,
+            ));
+        }
+        let confirmed_generation = self
+            .validate_managed_grid_surface(&surface.owner, &surface.expected_open_orders, true)
+            .map_err(AccountHostError::Validation)?;
+        if confirmed_generation != surface.private_generation {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::ManagedGridSurface,
+            ));
+        }
+        if self
+            .last_managed_grid_consumed_generation
+            .is_some_and(|generation| confirmed_generation <= generation)
+        {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::ManagedGridSurface,
+            ));
+        }
+        self.last_managed_grid_consumed_generation = Some(confirmed_generation);
+        let now = now_ms().map_err(AccountHostError::Validation)?;
+        let evidence = self
+            .gateway
+            .risk_evidence()
+            .map_err(AccountHostError::Validation)?;
+        evidence
+            .validate_for(&self.binding, now)
+            .map_err(AccountHostError::Validation)?;
+        for command in commands
+            .iter()
+            .filter(|command| matches!(command, ExecutionCommand::PlaceLimit(_)))
+        {
+            let candidate = quote_notional(command).map_err(AccountHostError::Validation)?;
+            let candidate_usdt = evidence
+                .value_in_usdt(&candidate.asset, candidate.value)
+                .map_err(AccountHostError::Validation)?;
+            if candidate_usdt > self.max_entry_notional {
+                return Err(AccountHostError::Validation(
+                    AccountHostValidationError::Notional,
+                ));
+            }
+        }
+        let admission = EntryAdmission::ManagedGrid {
+            private_generation: surface.private_generation,
+            batch_command_ids: Arc::new(
+                commands
+                    .iter()
+                    .map(ExecutionCommand::command_id)
+                    .cloned()
+                    .collect(),
+            ),
+            batch_live: Arc::new(AtomicBool::new(true)),
+        };
+        if self.journal.has_unresolved() {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::UnknownFence,
+            ));
+        }
+        rotate_if_clean_and_due(&mut self.journal, &self.journal_path)
+            .map_err(AccountHostError::Journal)?;
+        for command in commands {
+            require_append_budget(&self.journal_path, command)
+                .map_err(AccountHostError::Validation)?;
+        }
+        self.journal
+            .prepare_batch(commands.to_vec())
+            .map_err(AccountHostError::Journal)?;
+        commands
+            .iter()
+            .cloned()
+            .map(|command| {
+                let receipt = self.journal.receipt(command.command_id()).ok_or(
+                    AccountHostError::Validation(AccountHostValidationError::PreparedCommand),
+                )?;
+                self.host_prepared_command(command, receipt, admission.clone())
+            })
+            .collect()
+    }
+
+    fn prepare_for_lane_with_admission(
+        &mut self,
+        command: ExecutionCommand,
+        entry_admission: EntryAdmission,
+    ) -> Result<HostPreparedCommand, AccountHostError<G::Error>> {
         validate_command_scope(&command, &self.binding, &self.configured_symbols)
             .map_err(AccountHostError::Validation)?;
         self.validate_net_command_against_signed_snapshot(&command)?;
@@ -1270,19 +1465,23 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
                     AccountHostValidationError::Duplicate,
                 ));
             }
-            return self.host_prepared_command(command, receipt);
+            return self.host_prepared_command(command, receipt, entry_admission);
         }
         if is_risk_increasing(&command) && self.journal.has_unresolved() {
             return Err(AccountHostError::Validation(
                 AccountHostValidationError::UnknownFence,
             ));
         }
-        if is_risk_increasing(&command) && has_open_entry_reservation(&self.journal) {
+        if is_risk_increasing(&command)
+            && matches!(&entry_admission, EntryAdmission::AccountTotal)
+            && has_open_entry_reservation(&self.journal)
+        {
             return Err(AccountHostError::Validation(
                 AccountHostValidationError::OpenEntryFence,
             ));
         }
-        if is_risk_increasing(&command) {
+        if is_risk_increasing(&command) && matches!(&entry_admission, EntryAdmission::AccountTotal)
+        {
             self.require_account_risk_headroom(&command)
                 .map_err(AccountHostError::Validation)?;
         }
@@ -1295,7 +1494,7 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
             .prepare(command.clone())
             .map_err(AccountHostError::Journal)?
             .clone();
-        self.host_prepared_command(command, &receipt)
+        self.host_prepared_command(command, &receipt, entry_admission)
     }
 
     /// The sole legacy mutation entrance.  It re-derives the route from the latest persisted
@@ -1349,7 +1548,7 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
                     AccountHostValidationError::Duplicate,
                 ));
             }
-            return self.host_prepared_command(command, receipt);
+            return self.host_prepared_command(command, receipt, EntryAdmission::AccountTotal);
         }
         rotate_if_clean_and_due(&mut self.journal, &self.journal_path)
             .map_err(AccountHostError::Journal)?;
@@ -1360,7 +1559,7 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
             .prepare(command.clone())
             .map_err(AccountHostError::Journal)?
             .clone();
-        self.host_prepared_command(command, &receipt)
+        self.host_prepared_command(command, &receipt, EntryAdmission::AccountTotal)
     }
 
     /// Consumes one Prepared capability after re-reading its exact WAL receipt. In particular,
@@ -1376,6 +1575,10 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
             ));
         }
         let command_id = prepared.command.command_id().clone();
+        let managed_batch_live = match &prepared.entry_admission {
+            EntryAdmission::ManagedGrid { batch_live, .. } => Some(batch_live.clone()),
+            EntryAdmission::AccountTotal => None,
+        };
         let receipt = self
             .journal
             .receipt(&command_id)
@@ -1384,6 +1587,9 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
             ))?;
         self.verify_prepared_command(&prepared, receipt)?;
         if let Err(error) = self.validate_net_command_against_signed_snapshot(&prepared.command) {
+            if let Some(batch_live) = &managed_batch_live {
+                batch_live.store(false, Ordering::Release);
+            }
             // The exact proof remains Prepared and no gateway call has occurred. Preserve the
             // signed-position admission failure durably so a stale Net reduction cannot retain
             // a reservation after its private-generation or freshness fence expires.
@@ -1400,9 +1606,48 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         // A Prepared WAL record may have waited behind the lane. Re-read the signed evidence at
         // the physical dispatch boundary so neither an expired rate nor a changed account total
         // can reach the venue merely because admission happened earlier.
-        if is_risk_increasing(&prepared.command)
-            && let Err(error) = self.require_account_risk_headroom(&prepared.command)
-        {
+        let entry_recheck = match &prepared.entry_admission {
+            EntryAdmission::AccountTotal if is_risk_increasing(&prepared.command) => Some(
+                self.require_account_risk_headroom(&prepared.command)
+                    .map(|_| ()),
+            ),
+            EntryAdmission::AccountTotal => None,
+            EntryAdmission::ManagedGrid {
+                private_generation,
+                batch_command_ids,
+                batch_live,
+            } => {
+                let current_generation = self
+                    .latest_signed_snapshot
+                    .as_ref()
+                    .map(SignedAccountSnapshot::private_generation);
+                let unresolved_is_only_prepared_batch = self
+                    .journal
+                    .unresolved_command_ids()
+                    .iter()
+                    .all(|unresolved_id| {
+                        batch_command_ids.contains(unresolved_id)
+                            && self.journal.receipt(unresolved_id).is_some_and(|receipt| {
+                                matches!(receipt.state, CommandState::Prepared)
+                            })
+                    });
+                Some(
+                    if !batch_live.load(Ordering::Acquire)
+                        || !batch_command_ids.contains(&command_id)
+                        || !unresolved_is_only_prepared_batch
+                        || current_generation != Some(*private_generation)
+                    {
+                        Err(AccountHostValidationError::UnknownFence)
+                    } else {
+                        Ok(())
+                    },
+                )
+            }
+        };
+        if let Some(Err(error)) = entry_recheck {
+            if let Some(batch_live) = &managed_batch_live {
+                batch_live.store(false, Ordering::Release);
+            }
             // This proof is still exactly Prepared and has not crossed the physical boundary.
             // Make that non-dispatch durable so its entry reservation cannot survive a failed
             // final risk check and fence the account forever.
@@ -1414,6 +1659,11 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
                     },
                 )
                 .map_err(AccountHostError::Journal)?;
+            if managed_batch_live.is_some() {
+                return Ok(AccountDispatchOutcome::Rejected {
+                    reason: "dispatch_risk_recheck_failed".to_owned(),
+                });
+            }
             return Err(AccountHostError::Validation(error));
         }
         self.journal
@@ -1470,6 +1720,11 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
                 AccountDispatchOutcome::Unknown
             }
         };
+        if !matches!(outcome, AccountDispatchOutcome::Accepted { .. })
+            && let Some(batch_live) = managed_batch_live
+        {
+            batch_live.store(false, Ordering::Release);
+        }
         rotate_if_clean_and_due(&mut self.journal, &self.journal_path)
             .map_err(AccountHostError::Journal)?;
         require_journal_budget(&self.journal_path).map_err(AccountHostError::Validation)?;
@@ -1523,6 +1778,7 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         &self,
         command: ExecutionCommand,
         receipt: &crate::CommandReceipt,
+        entry_admission: EntryAdmission,
     ) -> Result<HostPreparedCommand, AccountHostError<G::Error>> {
         if receipt.command != command || !matches!(receipt.state, CommandState::Prepared) {
             return Err(AccountHostError::Validation(
@@ -1546,6 +1802,7 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
                 .journal
                 .cancel_target_identity(receipt.command.command_id())
                 .map(|identity| identity.family),
+            entry_admission,
         })
     }
 
@@ -1566,6 +1823,71 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
             ));
         }
         Ok(())
+    }
+
+    fn validate_managed_grid_surface(
+        &self,
+        owner: &OrderOwner,
+        expected_open_orders: &BTreeMap<CommandId, OrderOwner>,
+        require_fresh_snapshot: bool,
+    ) -> Result<u64, AccountHostValidationError> {
+        let now = now_ms()?;
+        let snapshot = self
+            .latest_signed_snapshot
+            .as_ref()
+            .ok_or(AccountHostValidationError::ManagedGridSurface)?;
+        let mut signed_client_owners = BTreeMap::new();
+        let mut signed_native_ids = BTreeSet::new();
+        let exact_signed_orders = snapshot.open_orders().iter().all(|order| {
+            let (Ok(client_order_id), Some(native_id), Some(candidate_owner)) = (
+                CommandId::new(order.client_order_id.clone()),
+                order.venue_order_id.as_deref(),
+                order.owner.as_ref(),
+            ) else {
+                return false;
+            };
+            !order.external
+                && order.symbol == owner.symbol
+                && order.family == NativeOrderFamily::UmOrder
+                && valid_text(native_id)
+                && signed_native_ids.insert(native_id.to_owned())
+                && matches!(
+                    order.state,
+                    Some(OrderState::New | OrderState::PartiallyFilled)
+                )
+                && order
+                    .filled_quantity
+                    .is_some_and(|filled| filled >= Decimal::ZERO && filled < order.quantity)
+                && ((order.reduce_only && candidate_owner.purpose == OrderPurpose::Reduce)
+                    || (!order.reduce_only && candidate_owner.purpose == OrderPurpose::Entry))
+                && same_owner_scope(candidate_owner, owner)
+                && signed_client_owners
+                    .insert(client_order_id, candidate_owner.clone())
+                    .is_none()
+        }) && signed_client_owners == *expected_open_orders;
+        if snapshot.binding() != &self.binding
+            || snapshot.position_mode() != SignedAccountPositionMode::Hedge
+            || (require_fresh_snapshot
+                && (now < snapshot.observed_at_ms()
+                    || now.saturating_sub(snapshot.observed_at_ms()) > MAX_RISK_EVIDENCE_AGE_MS))
+            || self.configured_symbols.iter().count() != 1
+            || !self.configured_symbols.contains(&owner.symbol)
+            || !snapshot_covers_configured_symbols(snapshot, &self.configured_symbols)
+            || self.last_gateway_private_generation.is_none()
+            || expected_open_orders
+                .values()
+                .any(|candidate| !same_owner_scope(candidate, owner))
+            || owner.purpose != OrderPurpose::Entry
+            || snapshot
+                .positions()
+                .iter()
+                .any(|position| position.symbol != owner.symbol)
+            || !exact_signed_orders
+            || self.journal.has_unresolved()
+        {
+            return Err(AccountHostValidationError::ManagedGridSurface);
+        }
+        Ok(snapshot.private_generation())
     }
 
     fn require_account_risk_headroom(
@@ -1779,6 +2101,26 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         }
         Ok(settlements)
     }
+}
+
+fn managed_grid_batch_shape(
+    signed_surface: &BTreeMap<CommandId, OrderOwner>,
+    commands: &[ExecutionCommand],
+) -> bool {
+    let post_only_limit = |command: &ExecutionCommand| {
+        matches!(command, ExecutionCommand::PlaceLimit(order)
+            if order.time_in_force == venue_domain::LimitTimeInForce::PostOnly)
+    };
+    if signed_surface.is_empty() {
+        return commands.len() <= 200 && commands.iter().all(post_only_limit);
+    }
+    matches!(
+        commands,
+        [first, second, ExecutionCommand::Cancel(cancel)]
+            if post_only_limit(first)
+                && post_only_limit(second)
+                && signed_surface.get(&cancel.target_client_order_id) == Some(&cancel.owner)
+    )
 }
 
 fn apply_recovery(
@@ -2266,6 +2608,14 @@ fn quote_notional(
     Ok(AccountRiskAmount { asset, value })
 }
 
+fn same_owner_scope(left: &OrderOwner, right: &OrderOwner) -> bool {
+    left.strategy_instance_id == right.strategy_instance_id
+        && left.run_id == right.run_id
+        && left.exchange == right.exchange
+        && left.account == right.account
+        && left.symbol == right.symbol
+}
+
 fn sum_notional(values: &[Decimal]) -> Result<Decimal, AccountHostValidationError> {
     values.iter().try_fold(Decimal::ZERO, |total, notional| {
         total
@@ -2430,6 +2780,8 @@ pub enum AccountHostValidationError {
     MarketEntryDisabled,
     #[error("entry notional is invalid or exceeds the fixed 10U ceiling")]
     Notional,
+    #[error("managed Grid entry requires one exact signed Hedge owner surface")]
+    ManagedGridSurface,
     #[error("command identity already exists in the account WAL")]
     Duplicate,
     #[error("prepared command proof does not match this account's current WAL receipt")]

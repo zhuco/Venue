@@ -355,6 +355,68 @@ impl CommandJournal {
         self.prepare(ExecutionCommand::Cancel(command))
     }
 
+    /// Persists one already-admitted batch as `Prepared` with a single durability barrier.
+    /// No child is `Submitted` here: the account lane still crosses the physical boundary one
+    /// command at a time and can durably reject the untouched suffix after the first failure.
+    pub fn prepare_batch(
+        &mut self,
+        commands: Vec<ExecutionCommand>,
+    ) -> Result<(), CommandJournalError> {
+        if commands.is_empty() {
+            return Ok(());
+        }
+        let mut staged_client_ids = BTreeSet::new();
+        let mut staged_command_ids = BTreeSet::new();
+        let mut receipts = Vec::with_capacity(commands.len());
+        let mut sequence = self.next_sequence;
+        for command in commands {
+            command
+                .validate_persisted_shape()
+                .map_err(CommandJournalError::Command)?;
+            let command_id = command.command_id().clone();
+            if self.receipts.contains_key(&command_id)
+                || !staged_command_ids.insert(command_id.clone())
+            {
+                return Err(CommandJournalError::Conflict);
+            }
+            if let Some(client_id) = command.native_client_id()
+                && (self.client_ids.contains_key(client_id)
+                    || !staged_client_ids.insert(client_id.clone()))
+            {
+                return Err(CommandJournalError::ClientId);
+            }
+            if let ExecutionCommand::Cancel(cancel) = &command {
+                validate_cancel_target(&self.receipts, &self.client_ids, cancel)?;
+            }
+            receipts.push(CommandReceipt {
+                sequence,
+                command_sha256: command_hash(&command)?,
+                command,
+                state: CommandState::Prepared,
+            });
+            sequence = sequence
+                .checked_add(1)
+                .ok_or(CommandJournalError::Sequence)?;
+        }
+        self.append_batch(&receipts)?;
+        self.next_sequence = sequence;
+        for receipt in receipts {
+            let command_id = receipt.command.command_id().clone();
+            if let Some(client_id) = receipt.command.native_client_id() {
+                self.client_ids
+                    .insert(client_id.clone(), command_id.clone());
+            }
+            self.prepared_commands
+                .insert(command_id.clone(), receipt.command.clone());
+            self.first_command_sequences
+                .insert(command_id.clone(), receipt.sequence);
+            self.append_current_v2_commitment(&receipt.command, receipt.sequence)?;
+            self.add_query_indexes(&command_id, &receipt);
+            self.receipts.insert(command_id, receipt);
+        }
+        Ok(())
+    }
+
     /// Persists one already-decided physical batch with a single durability barrier. Every
     /// command still has the same Prepared -> Submitted recovery history; only the writes are
     /// grouped so a grid fill never pays one fsync per child mutation.

@@ -54,6 +54,21 @@ impl AccountRuntime {
         refresh: &RuntimeBootstrapReceipt,
     ) -> Result<venue_execution::SignedAccountSnapshot, AccountRuntimeError> {
         let snapshot = refresh.snapshot();
+        if let Some(authority) = self.managed_grid_authority.take() {
+            let key = match authority {
+                super::ManagedGridAuthority::Exact { key, .. }
+                | super::ManagedGridAuthority::Batch { key, .. } => key,
+            };
+            if self
+                .registry
+                .registration(&key)
+                .is_some_and(|registration| {
+                    registration.lifecycle == super::InstanceLifecycle::Running
+                })
+            {
+                self.registry.mark_recovering(&key)?;
+            }
+        }
         let binding = snapshot.binding();
         let position_mode = match snapshot.position_mode() {
             SignedAccountPositionMode::Net => AccountPositionMode::Net,

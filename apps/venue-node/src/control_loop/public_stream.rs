@@ -207,7 +207,7 @@ impl ControlResidentLoop<venue_gateway_binance::BinanceAccountGateway> {
         // own signed readback leaves a failed/unknown account Paused; retrying here could create
         // a second epoch or physical child after an indeterminate gateway outcome.
         for binding in grid_bindings {
-            if self.resident.take_grid_bootstrap_request(&binding) {
+            if self.resident.take_grid_bootstrap_request(&binding)? {
                 self.resident.bootstrap_binance_grid_once(&binding)?;
             }
         }
@@ -303,7 +303,7 @@ impl ControlResidentLoop<venue_gateway_bitget::BitgetAccountGateway> {
         .map_err(|_| NodeError::ResidentRuntime)?;
         let mut installed_from_signed_snapshot = false;
         for binding in &grid_bindings {
-            if self.resident.take_grid_bootstrap_request(binding) {
+            if self.resident.take_grid_bootstrap_request(binding)? {
                 bootstrap_bitget_grid_once(&mut self.resident, &runtime, limits, binding)?;
                 installed_from_signed_snapshot = true;
             }
@@ -402,7 +402,7 @@ impl ControlResidentLoop<venue_gateway_gate::GateAccountGateway> {
             while self.resident.cancel_legacy_v1_grid_custody_once()? {}
         }
         for binding in grid_bindings {
-            if self.resident.take_grid_bootstrap_request(&binding) {
+            if self.resident.take_grid_bootstrap_request(&binding)? {
                 self.resident.bootstrap_gate_grid_once(&binding)?;
             }
         }

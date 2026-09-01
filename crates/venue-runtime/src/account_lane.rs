@@ -691,6 +691,10 @@ pub struct PersistedMutationOutcomeReceipt {
 }
 
 impl PersistedMutationOutcomeReceipt {
+    pub(super) const fn outcome(&self) -> AccountMutationOutcome {
+        self.outcome
+    }
+
     /// Called only after the exact mutation outcome record is durable in the account WAL.
     pub(super) fn persisted(
         permit: &AccountDispatchPermit,
@@ -1595,6 +1599,13 @@ impl AccountExecutionLane {
 
     pub(crate) fn discard_queued_risk_increases(&mut self) -> Vec<AccountExecutionRequest> {
         self.discard_queued_matching(|request| request.exposure() == ExposureEffect::Increase)
+    }
+
+    pub(crate) fn discard_queued_commands(
+        &mut self,
+        command_ids: &BTreeSet<CommandId>,
+    ) -> Vec<AccountExecutionRequest> {
+        self.discard_queued_matching(|request| command_ids.contains(request.command_id()))
     }
 
     pub(crate) fn discard_queued_instance_risk_increases(

@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use venue_storage::ActorAppliedAnchor;
 
-use super::{AccountHealth, AccountRuntime, AccountRuntimeError, StrategyBinding, StrategyKind};
+use super::{
+    AccountHealth, AccountRuntime, AccountRuntimeError, InstanceLifecycle, StrategyBinding,
+    StrategyKind,
+};
 use crate::{
     AppliedStrategyTurnReceipt, StrategyTurnToken,
     strategy::{ActorAppliedTurnStore, StrategyInput, StrategyTurn},
@@ -237,10 +240,22 @@ impl AccountRuntime {
             return Err(AccountRuntimeError::AccountUnavailable);
         }
         if self.production_new_risk_fenced() {
-            // A complete signed bootstrap with inventory or UNKNOWN remains a valid control and
-            // reduction host.  Keep this actor paused rather than rejecting startup or granting
-            // it entry authority; the account-wide Host fence still rejects new risk.
-            self.registry.pause(&binding.key)?;
+            if binding.key.strategy_kind == StrategyKind::HedgedGrid
+                && self
+                    .registry
+                    .registration(&binding.key)
+                    .is_some_and(|registration| {
+                        matches!(
+                            registration.lifecycle,
+                            InstanceLifecycle::Registered | InstanceLifecycle::Recovering
+                        )
+                    })
+            {
+                self.registry.mark_recovering(&binding.key)?;
+            } else if binding.key.strategy_kind != StrategyKind::HedgedGrid {
+                // Manual/Copy/Scalping have no target-specific exception to the broad fence.
+                self.registry.pause(&binding.key)?;
+            }
         } else {
             self.registry.mark_running(&binding.key)?;
         }

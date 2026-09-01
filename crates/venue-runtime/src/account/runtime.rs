@@ -7,10 +7,10 @@ use crate::{
     domain::{AccountOrderCapabilityEvidence, AppliedStrategyTurnReceipt, StrategyTurnToken},
     execution::{
         AccountDispatchDecision, AccountExecutionIntent, AccountExecutionLane,
-        AccountExecutionRequest, AccountLaneFollowUp, AccountLanePriority, CommandIdentityReceipt,
-        DurableCommandIdentityAllocation, ExposureEffect, PersistedMutationOutcomeReceipt,
-        PersistedWalPreparedReceipt, PersistedWriterLeaseReceipt, PreWalCandidate,
-        UnknownReadbackProof, WalNotPreparedReceipt,
+        AccountExecutionRequest, AccountLaneFollowUp, AccountLanePriority, AccountMutationOutcome,
+        CommandIdentityReceipt, DurableCommandIdentityAllocation, ExposureEffect,
+        PersistedMutationOutcomeReceipt, PersistedWalPreparedReceipt, PersistedWriterLeaseReceipt,
+        PreWalCandidate, UnknownReadbackProof, WalNotPreparedReceipt,
     },
     runtime::{
         account::{
@@ -95,6 +95,8 @@ pub struct AccountRuntime {
     physical_recovery_drifted: bool,
     production_signed_bootstrap: bool,
     production_risk_fenced: bool,
+    managed_grid_authority: Option<ManagedGridAuthority>,
+    managed_grid_batch: Option<ManagedGridBatchFence>,
     production_rules_generation: u64,
     physical_recovery_session_issuer: PhysicalRecoverySessionIssuer,
     active_physical_recovery_session: Option<PhysicalRecoverySession>,
@@ -120,6 +122,30 @@ pub(crate) struct ActiveStrategyTurn {
 #[derive(Clone, Debug)]
 struct PendingPrivateApplication {
     expected: BTreeSet<(StrategyInstanceKey, u32)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ManagedGridAuthority {
+    Exact {
+        key: StrategyInstanceKey,
+        private_generation: u64,
+        config_epoch: u64,
+        surface_sha256: [u8; 32],
+    },
+    Batch {
+        key: StrategyInstanceKey,
+        private_generation: u64,
+        config_epoch: u64,
+        turn_sequence: u64,
+        command_ids: BTreeSet<venue_domain::domain::CommandId>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedGridBatchFence {
+    key: StrategyInstanceKey,
+    private_generation: u64,
+    command_ids: BTreeSet<venue_domain::domain::CommandId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,6 +197,8 @@ impl AccountRuntime {
             physical_recovery_drifted: false,
             production_signed_bootstrap: false,
             production_risk_fenced: false,
+            managed_grid_authority: None,
+            managed_grid_batch: None,
             production_rules_generation: 0,
             physical_recovery_session_issuer,
             active_physical_recovery_session: None,
@@ -229,6 +257,151 @@ impl AccountRuntime {
     #[must_use]
     pub const fn production_new_risk_fenced(&self) -> bool {
         self.production_risk_fenced
+    }
+
+    pub(crate) fn install_managed_grid_surface(
+        &mut self,
+        binding: &StrategyBinding,
+        private_generation: u64,
+        surface_sha256: [u8; 32],
+    ) -> Result<(), AccountRuntimeError> {
+        let registration = self
+            .registry
+            .registration(&binding.key)
+            .ok_or(AccountRuntimeError::ActorMissing)?;
+        let same_exact = matches!(
+            self.managed_grid_authority.as_ref(),
+            Some(ManagedGridAuthority::Exact {
+                key,
+                private_generation: existing_generation,
+                config_epoch,
+                surface_sha256: existing_surface,
+            }) if key == &binding.key
+                && *existing_generation == private_generation
+                && *config_epoch == registration.config_epoch
+                && *existing_surface == surface_sha256
+        );
+        let newer_than_consumed_batch = self.managed_grid_batch.as_ref().is_none_or(|batch| {
+            batch.key == binding.key
+                && private_generation > batch.private_generation
+                && !batch
+                    .command_ids
+                    .iter()
+                    .any(|command_id| self.execution_lane.has_active_command(command_id))
+        });
+        if binding.key.strategy_kind != crate::StrategyKind::HedgedGrid
+            || registration.binding != *binding
+            || !matches!(
+                registration.lifecycle,
+                InstanceLifecycle::Registered
+                    | InstanceLifecycle::Recovering
+                    | InstanceLifecycle::Running
+            )
+            || self.health != AccountHealth::Ready
+            || !self.production_signed_bootstrap
+            || !self.durable_recovery_complete
+            || private_generation != self.last_reconciliation_generation
+            || private_generation == 0
+            || surface_sha256.iter().all(|byte| *byte == 0)
+            || !self.pending_private_applications.is_empty()
+            || self.private_batch_fence_active
+            || (!same_exact && self.managed_grid_authority.is_some())
+            || !newer_than_consumed_batch
+        {
+            return Err(AccountRuntimeError::RiskFenced);
+        }
+        if same_exact {
+            return Ok(());
+        }
+        let config_epoch = registration.config_epoch;
+        self.registry.mark_running(&binding.key)?;
+        self.managed_grid_batch = None;
+        self.managed_grid_authority = Some(ManagedGridAuthority::Exact {
+            key: binding.key.clone(),
+            private_generation,
+            config_epoch,
+            surface_sha256,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn begin_managed_grid_batch(
+        &mut self,
+        binding: &StrategyBinding,
+        applied: &AppliedStrategyTurnReceipt,
+        private_generation: u64,
+        surface_sha256: [u8; 32],
+        command_ids: BTreeSet<venue_domain::domain::CommandId>,
+    ) -> Result<(), AccountRuntimeError> {
+        let token = applied.token();
+        let registration = self
+            .registry
+            .registration(&binding.key)
+            .ok_or(AccountRuntimeError::ActorMissing)?;
+        let expected = ManagedGridAuthority::Exact {
+            key: binding.key.clone(),
+            private_generation,
+            config_epoch: registration.config_epoch,
+            surface_sha256,
+        };
+        if command_ids.is_empty()
+            || command_ids.len() > 256
+            || self.managed_grid_authority.as_ref() != Some(&expected)
+            || token.target() != &binding.key
+            || self.last_applied_turns.get(&binding.key) != Some(token)
+            || self.last_applied_durable.get(&binding.key) != applied.actor_applied()
+            || registration.lifecycle != InstanceLifecycle::Running
+        {
+            return Err(AccountRuntimeError::RiskFenced);
+        }
+        self.managed_grid_batch = Some(ManagedGridBatchFence {
+            key: binding.key.clone(),
+            private_generation,
+            command_ids: command_ids.clone(),
+        });
+        self.managed_grid_authority = Some(ManagedGridAuthority::Batch {
+            key: binding.key.clone(),
+            private_generation,
+            config_epoch: registration.config_epoch,
+            turn_sequence: token.turn_sequence(),
+            command_ids,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn abort_managed_grid_batch(
+        &mut self,
+        key: &StrategyInstanceKey,
+    ) -> Result<(), AccountRuntimeError> {
+        if let Some(batch) = self
+            .managed_grid_batch
+            .take()
+            .filter(|batch| &batch.key == key)
+        {
+            let _discarded = self
+                .execution_lane
+                .discard_queued_commands(&batch.command_ids);
+            self.managed_grid_authority = None;
+            self.registry.pause(key)?;
+        }
+        Ok(())
+    }
+
+    fn revoke_managed_grid_for(&mut self, key: &StrategyInstanceKey) {
+        if self
+            .managed_grid_authority
+            .as_ref()
+            .is_some_and(|authority| {
+                matches!(
+                    authority,
+                    ManagedGridAuthority::Exact { key: target, .. }
+                        | ManagedGridAuthority::Batch { key: target, .. }
+                        if target == key
+                )
+            })
+        {
+            self.managed_grid_authority = None;
+        }
     }
 
     #[must_use]
@@ -304,6 +477,7 @@ impl AccountRuntime {
     fn invalidate_dispatch_authority_fail_closed(&mut self) {
         self.execution_lane.revoke_pre_wal_candidate();
         self.dispatch_revision = self.dispatch_revision.checked_add(1).unwrap_or(0);
+        self.managed_grid_authority = None;
     }
 
     pub(crate) fn has_pending_private_delivery(&self, key: &StrategyInstanceKey) -> bool {
@@ -784,6 +958,8 @@ impl AccountRuntime {
         self.strategy_state_revision = next_state_revision;
         self.install_dispatch_revision(next_dispatch_revision);
         self.private_batch_fence_active = false;
+        self.managed_grid_authority = None;
+        self.managed_grid_batch = None;
         self.connection_generation = connection_generation;
         self.last_reconciliation_generation = 0;
         self.last_instance_orders.clear();
@@ -1202,6 +1378,7 @@ impl AccountRuntime {
         let next_state_revision = self.next_strategy_state_revision()?;
         let next_dispatch_revision = self.next_dispatch_revision()?;
         self.registry = next_registry;
+        self.revoke_managed_grid_for(key);
         self.actors.insert(key.clone(), next_actor);
         self.strategy_state_revision = next_state_revision;
         let _revoked = self
@@ -1223,6 +1400,7 @@ impl AccountRuntime {
         let next_state_revision = self.next_strategy_state_revision()?;
         let next_dispatch_revision = self.next_dispatch_revision()?;
         self.registry = next_registry;
+        self.revoke_managed_grid_for(key);
         self.actors.insert(key.clone(), next_actor);
         self.strategy_state_revision = next_state_revision;
         let _revoked = self
@@ -1245,6 +1423,10 @@ impl AccountRuntime {
             return Ok(());
         }
         if self.execution_lane.instance_has_dispatched_or_unknown(key)
+            || self
+                .managed_grid_batch
+                .as_ref()
+                .is_some_and(|batch| &batch.key == key)
             || self.active_turns.contains_key(key)
         {
             return Err(AccountRuntimeError::ParameterChangeBusy);
@@ -1270,6 +1452,7 @@ impl AccountRuntime {
         let next_state_revision = self.next_strategy_state_revision()?;
         let next_dispatch_revision = self.next_dispatch_revision()?;
         self.registry = next_registry;
+        self.revoke_managed_grid_for(key);
         self.actors.insert(key.clone(), next_actor);
         self.strategy_state_revision = next_state_revision;
         let _discarded_old_configuration = self.execution_lane.discard_queued_instance(key);
@@ -1568,6 +1751,21 @@ impl AccountRuntime {
         &mut self,
         intent: AccountExecutionIntent,
     ) -> Result<(), AccountRuntimeError> {
+        self.enqueue_execution_inner(intent, false)
+    }
+
+    fn enqueue_managed_grid_execution(
+        &mut self,
+        intent: AccountExecutionIntent,
+    ) -> Result<(), AccountRuntimeError> {
+        self.enqueue_execution_inner(intent, true)
+    }
+
+    fn enqueue_execution_inner(
+        &mut self,
+        intent: AccountExecutionIntent,
+        managed_grid: bool,
+    ) -> Result<(), AccountRuntimeError> {
         let registration = self
             .registry
             .registration(intent.target())
@@ -1596,9 +1794,10 @@ impl AccountRuntime {
         let exposure = intent.exposure();
         let lifecycle_allows_new_risk = registration.lifecycle.accepts_new_risk();
         let binding = registration.binding.clone();
+        let managed_grid_allows = managed_grid && self.managed_grid_batch_allows_intent(&intent);
         if exposure == ExposureEffect::Increase
             && (self.health != AccountHealth::Ready
-                || self.production_risk_fenced
+                || (self.production_risk_fenced && !managed_grid_allows)
                 || !lifecycle_allows_new_risk
                 || !self.pending_private_applications.is_empty())
         {
@@ -1617,6 +1816,23 @@ impl AccountRuntime {
         self.execution_lane = next_lane;
         self.private_route_revision = next_route_revision;
         Ok(())
+    }
+
+    fn managed_grid_batch_allows_intent(&self, intent: &AccountExecutionIntent) -> bool {
+        matches!(
+            self.managed_grid_authority.as_ref(),
+            Some(ManagedGridAuthority::Batch {
+                key,
+                private_generation,
+                config_epoch,
+                turn_sequence,
+                command_ids,
+            }) if key == intent.target()
+                && *private_generation == intent.admission_private_generation()
+                && *config_epoch == intent.config_epoch()
+                && *turn_sequence == intent.turn_sequence()
+                && command_ids.contains(intent.command().command_id())
+        )
     }
 
     /// The resident Host calls this only after it has fsynced the exact command's Prepared
@@ -1644,6 +1860,31 @@ impl AccountRuntime {
         let intent =
             AccountExecutionIntent::from_applied_turn(applied, priority, command, identity)?;
         self.enqueue_execution(intent)
+    }
+
+    pub(crate) fn admit_host_prepared_managed_grid_execution(
+        &mut self,
+        binding: &StrategyBinding,
+        applied: &AppliedStrategyTurnReceipt,
+        priority: AccountLanePriority,
+        command: venue_domain::domain::ExecutionCommand,
+        allocation: DurableCommandIdentityAllocation,
+    ) -> Result<(), AccountRuntimeError> {
+        let token = applied.token();
+        if binding.key.strategy_kind != crate::StrategyKind::HedgedGrid
+            || binding.key.account != self.account
+            || token.target() != &binding.key
+            || !binding.matches_owner(command.mutation_owner())
+            || self.last_applied_turns.get(&binding.key) != Some(token)
+            || self.last_applied_durable.get(&binding.key) != applied.actor_applied()
+        {
+            return Err(AccountRuntimeError::StrategyTurnAuthority);
+        }
+        let identity =
+            CommandIdentityReceipt::from_durable_allocation(applied, &command, allocation)?;
+        let intent =
+            AccountExecutionIntent::from_applied_turn(applied, priority, command, identity)?;
+        self.enqueue_managed_grid_execution(intent)
     }
 
     /// Accepts the Host-sealed migration exception only for an exact legacy cancellation route.
@@ -1709,6 +1950,8 @@ impl AccountRuntime {
         let private_application_pending = !self.pending_private_applications.is_empty();
         let private_batch_fence_active = self.private_batch_fence_active;
         let production_risk_fenced = self.production_risk_fenced;
+        let managed_grid_authority = self.managed_grid_authority.clone();
+        let managed_grid_batch = self.managed_grid_batch.clone();
         let registry = &self.registry;
         let applied_turns = &self.last_applied_turns;
         let active_turns = &self.active_turns;
@@ -1736,12 +1979,26 @@ impl AccountRuntime {
                         {
                             return false;
                         }
+                        let managed_grid_allows =
+                            managed_grid_request_allowed(managed_grid_authority.as_ref(), request);
+                        let managed_grid_child = managed_grid_batch.as_ref().is_some_and(|batch| {
+                            batch.key == *request.target()
+                                && batch.command_ids.contains(request.command().command_id())
+                        });
+                        if managed_grid_child {
+                            return managed_grid_allows
+                                && !private_application_pending
+                                && !private_batch_fence_active
+                                && !active_turns.contains_key(request.target())
+                                && health == AccountHealth::Ready
+                                && registration.lifecycle.accepts_new_risk();
+                        }
                         if request.exposure() != ExposureEffect::Increase {
                             return true;
                         }
                         !private_application_pending
                             && !private_batch_fence_active
-                            && !production_risk_fenced
+                            && (!production_risk_fenced || managed_grid_allows)
                             && !active_turns.contains_key(request.target())
                             && health == AccountHealth::Ready
                             && registration.lifecycle.accepts_new_risk()
@@ -1761,6 +2018,9 @@ impl AccountRuntime {
         let private_generation = self.last_reconciliation_generation;
         let private_application_pending = !self.pending_private_applications.is_empty();
         let private_batch_fence_active = self.private_batch_fence_active;
+        let production_risk_fenced = self.production_risk_fenced;
+        let managed_grid_authority = self.managed_grid_authority.clone();
+        let managed_grid_batch = self.managed_grid_batch.clone();
         let registry = &self.registry;
         let applied_turns = &self.last_applied_turns;
         let active_turns = &self.active_turns;
@@ -1790,11 +2050,26 @@ impl AccountRuntime {
                         {
                             return false;
                         }
+                        let managed_grid_allows =
+                            managed_grid_request_allowed(managed_grid_authority.as_ref(), request);
+                        let managed_grid_child = managed_grid_batch.as_ref().is_some_and(|batch| {
+                            batch.key == *request.target()
+                                && batch.command_ids.contains(request.command().command_id())
+                        });
+                        if managed_grid_child {
+                            return managed_grid_allows
+                                && !private_application_pending
+                                && !private_batch_fence_active
+                                && !active_turns.contains_key(request.target())
+                                && health == AccountHealth::Ready
+                                && registration.lifecycle.accepts_new_risk();
+                        }
                         if request.exposure() != ExposureEffect::Increase {
                             return true;
                         }
                         !private_application_pending
                             && !private_batch_fence_active
+                            && (!production_risk_fenced || managed_grid_allows)
                             && !active_turns.contains_key(request.target())
                             && health == AccountHealth::Ready
                             && registration.lifecycle.accepts_new_risk()
@@ -1818,7 +2093,11 @@ impl AccountRuntime {
         &mut self,
         receipt: PersistedMutationOutcomeReceipt,
     ) -> Result<AccountLaneFollowUp, AccountRuntimeError> {
+        let managed_grid_failed = receipt.outcome() != AccountMutationOutcome::Confirmed;
         let follow_up = self.execution_lane.record_outcome(receipt);
+        if managed_grid_failed {
+            self.managed_grid_authority = None;
+        }
         self.physical_authority_roots = None;
         self.physical_durable_roots = None;
         self.actor_applied_wal_head = None;
@@ -1831,6 +2110,7 @@ impl AccountRuntime {
         &mut self,
         receipt: WalNotPreparedReceipt,
     ) -> Result<AccountLaneFollowUp, AccountRuntimeError> {
+        self.managed_grid_authority = None;
         Ok(self.execution_lane.abort_before_wal(receipt)?)
     }
 
@@ -2028,6 +2308,26 @@ impl AccountRuntime {
         self.revoke_physical_authority();
         Ok(binding)
     }
+}
+
+fn managed_grid_request_allowed(
+    authority: Option<&ManagedGridAuthority>,
+    request: &AccountExecutionRequest,
+) -> bool {
+    matches!(
+        authority,
+        Some(ManagedGridAuthority::Batch {
+            key,
+            private_generation,
+            config_epoch,
+            turn_sequence,
+            command_ids,
+        }) if key == request.target()
+            && *private_generation == request.admission_private_generation()
+            && *config_epoch == request.config_epoch()
+            && *turn_sequence == request.turn_sequence()
+            && command_ids.contains(request.command_id())
+    )
 }
 
 #[cfg(test)]

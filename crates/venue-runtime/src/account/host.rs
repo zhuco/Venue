@@ -1,18 +1,21 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 use rust_decimal::Decimal;
-use venue_domain::domain::ExecutionCommand;
+use venue_domain::domain::{CommandId, ExecutionCommand, OrderOwner, OrderPurpose};
 use venue_execution::{
     AccountCommandStatus, AccountDispatchOutcome, AccountHostError,
     AccountLimitNormalizationIntent, AccountMutationHost, AccountPhysicalGateway,
     AccountPricedLimitIntent, AccountSymbolSet, HostPreparedCommand, LegacyV1CustodyRoute,
-    execution_command_sha256,
+    ManagedGridSurfaceReceipt, execution_command_sha256,
 };
 use venue_gateway_api::GatewayBinding;
 
 use super::{
     AccountKey, AccountLanePriority, AccountModelError, AccountRuntime, AccountRuntimeError,
-    CopyActorAppliedReceipt, ResidentActorAppliedArtifacts, StrategyBinding,
+    CopyActorAppliedReceipt, ResidentActorAppliedArtifacts, StrategyBinding, StrategyInstanceKey,
 };
 use crate::{AppliedStrategyTurnReceipt, execution::DurableCommandIdentityAllocation};
 
@@ -24,6 +27,8 @@ pub struct AccountRuntimeHost<G> {
     account: AccountKey,
     host: AccountMutationHost<G>,
     prepared: BTreeMap<venue_domain::domain::CommandId, PreparedLaneAdmission>,
+    managed_grid_prepared: BTreeSet<venue_domain::domain::CommandId>,
+    managed_grid_batch_target: Option<crate::StrategyInstanceKey>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -44,6 +49,50 @@ struct PreparedAdmissionCommitment {
 struct PreparedLaneAdmission {
     commitment: PreparedAdmissionCommitment,
     proof: HostPreparedCommand,
+}
+
+fn managed_grid_scope_owner(binding: &StrategyBinding) -> OrderOwner {
+    OrderOwner {
+        strategy_instance_id: binding.key.instance_id.clone(),
+        run_id: binding.run_id.clone(),
+        exchange: binding.key.account.exchange.as_str().to_owned(),
+        account: binding.key.account.account.clone(),
+        symbol: binding.key.symbol.clone(),
+        purpose: OrderPurpose::Entry,
+    }
+}
+
+fn managed_surface_receipt_matches(
+    receipt: &ManagedGridSurfaceReceipt,
+    binding: &StrategyBinding,
+    owner: &OrderOwner,
+) -> bool {
+    receipt.binding().venue.as_str() == binding.key.account.exchange.as_str()
+        && receipt.binding().trading_account_id == binding.key.account.account
+        && receipt.binding().symbol == binding.key.symbol
+        && receipt.owner() == owner
+        && receipt.private_generation() > 0
+        && !receipt.surface_sha256().iter().all(|byte| *byte == 0)
+}
+
+fn managed_grid_batch_shape(
+    signed_surface: &BTreeMap<CommandId, OrderOwner>,
+    commands: &[ExecutionCommand],
+) -> bool {
+    let post_only_limit = |command: &ExecutionCommand| {
+        matches!(command, ExecutionCommand::PlaceLimit(order)
+            if order.time_in_force == venue_domain::LimitTimeInForce::PostOnly)
+    };
+    if signed_surface.is_empty() {
+        return commands.len() <= 200 && commands.iter().all(post_only_limit);
+    }
+    matches!(
+        commands,
+        [first, second, ExecutionCommand::Cancel(cancel)]
+            if post_only_limit(first)
+                && post_only_limit(second)
+                && signed_surface.get(&cancel.target_client_order_id) == Some(&cancel.owner)
+    )
 }
 
 impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
@@ -93,6 +142,8 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
             account,
             host,
             prepared: BTreeMap::new(),
+            managed_grid_prepared: BTreeSet::new(),
+            managed_grid_batch_target: None,
         })
     }
 
@@ -135,6 +186,8 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
             account,
             host,
             prepared: BTreeMap::new(),
+            managed_grid_prepared: BTreeSet::new(),
+            managed_grid_batch_target: None,
         })
     }
 
@@ -404,39 +457,204 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
             .host
             .prepare_for_lane(command)
             .map_err(AccountRuntimeHostError::Host)?;
-        let command_id = prepared.command_id().clone();
-        let commitment = PreparedAdmissionCommitment::new(binding, applied, priority, &prepared)
+        self.admit_prepared_operator(runtime, binding, applied, priority, prepared, false)
+    }
+
+    /// Installs only an in-memory, target-specific Grid authority after Host proves the caller's
+    /// expected set is exactly the fresh signed WAL-owned surface. A later refresh revokes it.
+    pub fn confirm_managed_grid_surface(
+        &mut self,
+        runtime: &mut AccountRuntime,
+        binding: &StrategyBinding,
+        expected_open_orders: BTreeMap<CommandId, OrderOwner>,
+    ) -> Result<(), AccountRuntimeHostError<G::Error>> {
+        if binding.key.strategy_kind != crate::StrategyKind::HedgedGrid
+            || runtime.account() != &self.account
+            || binding.key.account != self.account
+        {
+            return Err(AccountRuntimeHostError::Scope);
+        }
+        let owner = managed_grid_scope_owner(binding);
+        let receipt = self
+            .host
+            .confirm_managed_grid_surface(&owner, expected_open_orders)
+            .map_err(AccountRuntimeHostError::Host)?;
+        if !managed_surface_receipt_matches(&receipt, binding, &owner) {
+            return Err(AccountRuntimeHostError::Scope);
+        }
+        runtime
+            .install_managed_grid_surface(
+                binding,
+                receipt.private_generation(),
+                receipt.surface_sha256(),
+            )
             .map_err(AccountRuntimeHostError::Runtime)?;
+        self.managed_grid_batch_target = None;
+        Ok(())
+    }
+
+    /// Consumes one exact Grid surface into one bounded batch. Initial installation is Place-only
+    /// and capped at 200 children; a rolling transaction is exactly two PlaceLimit plus one
+    /// Cancel of the previously signed surface. There is no second batch before signed refresh.
+    pub fn prepare_and_admit_managed_grid_batch(
+        &mut self,
+        runtime: &mut AccountRuntime,
+        binding: &StrategyBinding,
+        applied: &AppliedStrategyTurnReceipt,
+        priority: AccountLanePriority,
+        expected_open_orders: BTreeMap<CommandId, OrderOwner>,
+        commands: &[ExecutionCommand],
+    ) -> Result<(), AccountRuntimeHostError<G::Error>> {
+        if binding.key.strategy_kind != crate::StrategyKind::HedgedGrid
+            || priority != AccountLanePriority::Normal
+            || commands.is_empty()
+            || commands.len() > 200
+            || runtime.account() != &self.account
+            || binding.key.account != self.account
+            || commands.iter().any(|command| {
+                command.mutation_owner().exchange != self.account.exchange.as_str()
+                    || command.mutation_owner().account != self.account.account
+                    || !binding.matches_owner(command.mutation_owner())
+                    || !matches!(
+                        command,
+                        ExecutionCommand::PlaceLimit(_) | ExecutionCommand::Cancel(_)
+                    )
+            })
+            || commands
+                .iter()
+                .map(ExecutionCommand::command_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != commands.len()
+            || !managed_grid_batch_shape(&expected_open_orders, commands)
+        {
+            return Err(AccountRuntimeHostError::Scope);
+        }
+        let owner = managed_grid_scope_owner(binding);
+        let surface = self
+            .host
+            .confirm_managed_grid_surface(&owner, expected_open_orders)
+            .map_err(AccountRuntimeHostError::Host)?;
+        if !managed_surface_receipt_matches(&surface, binding, &owner) {
+            return Err(AccountRuntimeHostError::Scope);
+        }
+        let private_generation = surface.private_generation();
+        let surface_sha256 = surface.surface_sha256();
+        let command_ids = commands
+            .iter()
+            .map(|command| command.command_id().clone())
+            .collect::<BTreeSet<_>>();
+        runtime
+            .begin_managed_grid_batch(
+                binding,
+                applied,
+                private_generation,
+                surface_sha256,
+                command_ids,
+            )
+            .map_err(AccountRuntimeHostError::Runtime)?;
+        self.managed_grid_batch_target = Some(binding.key.clone());
+        let prepared = match self
+            .host
+            .prepare_managed_grid_batch_for_lane(surface, commands)
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                runtime
+                    .abort_managed_grid_batch(&binding.key)
+                    .map_err(AccountRuntimeHostError::Runtime)?;
+                self.managed_grid_batch_target = None;
+                return Err(AccountRuntimeHostError::Host(error));
+            }
+        };
+        let mut prepared = prepared.into_iter();
+        while let Some(proof) = prepared.next() {
+            if let Err(error) =
+                self.admit_prepared_operator(runtime, binding, applied, priority, proof, true)
+            {
+                for untouched in prepared {
+                    self.host
+                        .reject_prepared_without_dispatch(
+                            &untouched,
+                            "managed_grid_batch_admission_failed",
+                        )
+                        .map_err(AccountRuntimeHostError::Host)?;
+                }
+                runtime
+                    .abort_managed_grid_batch(&binding.key)
+                    .map_err(AccountRuntimeHostError::Runtime)?;
+                self.managed_grid_batch_target = None;
+                self.reject_prepared_batch(runtime, "managed_grid_batch_admission_failed")?;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn admit_prepared_operator(
+        &mut self,
+        runtime: &mut AccountRuntime,
+        binding: &StrategyBinding,
+        applied: &AppliedStrategyTurnReceipt,
+        priority: AccountLanePriority,
+        prepared: HostPreparedCommand,
+        managed_grid: bool,
+    ) -> Result<(), AccountRuntimeHostError<G::Error>> {
+        let command_id = prepared.command_id().clone();
+        let commitment =
+            match PreparedAdmissionCommitment::new(binding, applied, priority, &prepared) {
+                Ok(commitment) => commitment,
+                Err(error) => {
+                    self.host
+                        .reject_prepared_without_dispatch(&prepared, "runtime_admission_failed")
+                        .map_err(AccountRuntimeHostError::Host)?;
+                    return Err(AccountRuntimeHostError::Runtime(error));
+                }
+            };
         if let Some(existing) = self.prepared.get(&command_id) {
             if existing.commitment == commitment && runtime.has_active_execution(&command_id) {
                 return Ok(());
             }
             return Err(AccountRuntimeHostError::PreparedAdmissionConflict);
         }
-        let allocation = DurableCommandIdentityAllocation::from_host_prepared(
+        let allocation = match DurableCommandIdentityAllocation::from_host_prepared(
             prepared.receipt_sequence(),
             prepared.receipt_digest(),
             prepared.cancel_target_family(),
-        )
-        .map_err(|error| {
-            AccountRuntimeHostError::Runtime(AccountRuntimeError::ExecutionLane(error))
-        })?;
-        runtime
-            .admit_host_prepared_execution(
+        ) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                self.host
+                    .reject_prepared_without_dispatch(&prepared, "runtime_admission_failed")
+                    .map_err(AccountRuntimeHostError::Host)?;
+                return Err(AccountRuntimeHostError::Runtime(
+                    AccountRuntimeError::ExecutionLane(error),
+                ));
+            }
+        };
+        let admission = if managed_grid {
+            runtime.admit_host_prepared_managed_grid_execution(
                 binding,
                 applied,
                 priority,
                 prepared.command().clone(),
                 allocation,
             )
-            .map_err(AccountRuntimeHostError::Runtime)?;
-        runtime
-            .advance_resident_wal_head(
-                self.host
-                    .runtime_wal_head()
-                    .map_err(AccountRuntimeHostError::Host)?,
+        } else {
+            runtime.admit_host_prepared_execution(
+                binding,
+                applied,
+                priority,
+                prepared.command().clone(),
+                allocation,
             )
-            .map_err(AccountRuntimeHostError::Runtime)?;
+        };
+        if let Err(error) = admission {
+            self.host
+                .reject_prepared_without_dispatch(&prepared, "runtime_admission_failed")
+                .map_err(AccountRuntimeHostError::Host)?;
+            return Err(AccountRuntimeHostError::Runtime(error));
+        }
         self.prepared.insert(
             command_id.clone(),
             PreparedLaneAdmission {
@@ -444,6 +662,16 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
                 proof: prepared,
             },
         );
+        if managed_grid {
+            self.managed_grid_prepared.insert(command_id);
+        }
+        runtime
+            .advance_resident_wal_head(
+                self.host
+                    .runtime_wal_head()
+                    .map_err(AccountRuntimeHostError::Host)?,
+            )
+            .map_err(AccountRuntimeHostError::Runtime)?;
         Ok(())
     }
 
@@ -610,7 +838,25 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
         if reason.trim().is_empty() || runtime.account() != &self.account {
             return Err(AccountRuntimeHostError::Scope);
         }
-        self.reject_queued_prepared(reason)?;
+        if let Some(target) = self.managed_grid_batch_target.take().or_else(|| {
+            self.managed_grid_prepared.iter().find_map(|command_id| {
+                self.prepared
+                    .get(command_id)
+                    .map(|admission| admission.commitment.target.clone())
+            })
+        }) {
+            runtime
+                .abort_managed_grid_batch(&target)
+                .map_err(AccountRuntimeHostError::Runtime)?;
+        }
+        let command_ids = std::mem::take(&mut self.managed_grid_prepared);
+        for command_id in command_ids {
+            if let Some(admission) = self.prepared.remove(&command_id) {
+                self.host
+                    .reject_prepared_without_dispatch(&admission.proof, reason)
+                    .map_err(AccountRuntimeHostError::Host)?;
+            }
+        }
         runtime
             .advance_resident_wal_head(
                 self.host
@@ -618,6 +864,25 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
                     .map_err(AccountRuntimeHostError::Host)?,
             )
             .map_err(AccountRuntimeHostError::Runtime)
+    }
+
+    /// Retires only the managed Grid batch owned by `key`.  Control transitions call this before
+    /// changing Runtime lifecycle so a queued cancellation cannot remain Prepared after the
+    /// matching batch authority has been revoked.
+    pub fn reject_prepared_managed_grid_batch(
+        &mut self,
+        runtime: &mut AccountRuntime,
+        key: &StrategyInstanceKey,
+        reason: &str,
+    ) -> Result<(), AccountRuntimeHostError<G::Error>> {
+        if self
+            .managed_grid_batch_target
+            .as_ref()
+            .is_some_and(|target| target != key)
+        {
+            return Err(AccountRuntimeHostError::Scope);
+        }
+        self.reject_prepared_batch(runtime, reason)
     }
 
     pub(crate) fn runtime_wal_head(
@@ -637,6 +902,7 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
             .remove(command_id)
             .ok_or(AccountRuntimeHostError::PreparedProof)?
             .proof;
+        self.managed_grid_prepared.remove(command_id);
         if prepared.command_id() != command_id {
             return Err(AccountRuntimeHostError::PreparedProof);
         }
@@ -1034,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn nonflat_signed_account_is_ready_for_read_only_but_fenced_from_new_risk()
+    fn nonflat_signed_account_is_ready_but_keeps_the_account_risk_fence()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let binding = binding()?;
@@ -1048,7 +1314,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_refresh_unfences_a_signed_zero_position_without_resuming_lifecycle()
+    fn signed_refresh_does_not_resume_an_operator_paused_lifecycle()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let binding = binding()?;
@@ -1246,8 +1512,8 @@ mod tests {
         host.refresh_runtime_signed_snapshot(&mut runtime)?;
 
         assert!(!host.has_unresolved());
-        // The signed Accepted outcome is now an actual owned open entry, so it no longer is an
-        // UNKNOWN fence but it still correctly prevents another entry until reconciliation.
+        // The exact WAL-owned order remains in the broad account fence. Only a separately
+        // confirmed target-specific managed Grid surface can consume that fence for one batch.
         assert!(runtime.production_new_risk_fenced());
         assert_eq!(state.lock().map_err(|_| "lock")?.dispatches, 1);
         Ok(())

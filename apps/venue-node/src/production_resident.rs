@@ -272,10 +272,46 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             .runtime
             .resident_actor_checkpoint(&binding)
             .map_err(resident_error)?;
-        let first_bootstrap =
-            checkpoint.is_none() && recovery == crate::NodeGridRecoveryPolicy::BootstrapWhenAbsent;
         let mut bridge =
             grid::GridBridgeState::restore_or_bootstrap(checkpoint, initial, recovery)?;
+        let pending_transactions = bridge
+            .pending_transaction_command_ids()
+            .map_err(|_| NodeError::ResidentRuntime)?;
+        // A checkpoint is written before rolling commands reach Host.  Only an exact absence of
+        // every deterministic command id proves that the local reservation never crossed the
+        // WAL boundary; restore it to a reconciliation reset.  Any WAL fact (including a clear
+        // rejection) remains paused for signed exchange reconciliation rather than being replayed.
+        let abandoned_unsubmitted = if pending_transactions.is_empty() {
+            false
+        } else {
+            let all_absent = pending_transactions
+                .iter()
+                .flat_map(|(_, ids)| ids)
+                .try_fold(true, |_, id| {
+                    self.host
+                        .command_status(id)
+                        .map_err(|_| NodeError::ResidentRuntime)
+                        .map(|status| status.is_none())
+                })?;
+            if all_absent {
+                bridge
+                    .abandon_unsubmitted_transactions_for_reconciliation(
+                        &pending_transactions
+                            .iter()
+                            .map(|(id, _)| id.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(|_| NodeError::ResidentRuntime)?;
+                true
+            } else {
+                false
+            }
+        };
+        let first_bootstrap = bridge.needs_initial_bootstrap();
+        let bootstrap_requires_reconciliation = bridge.bootstrap_requires_reconciliation();
+        if first_bootstrap && recovery == crate::NodeGridRecoveryPolicy::RequireExisting {
+            return Err(NodeError::ResidentArtifacts);
+        }
         if bridge.grid.suppress_replenishment_until_inventory_recovers
             != skip_inventory_replenishment_until_recovered
         {
@@ -295,24 +331,81 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         let key = binding.key.clone();
         self.grid_bridges.insert(key.clone(), bridge);
         self.grid_bindings.insert(key.clone(), binding);
+        if abandoned_unsubmitted {
+            let binding = self
+                .grid_bindings
+                .get(&key)
+                .cloned()
+                .ok_or(NodeError::ResidentRuntime)?;
+            let replay = self
+                .grid_bridges
+                .get(&key)
+                .ok_or(NodeError::ResidentRuntime)?
+                .checkpoint_bytes()?;
+            let applied = self
+                .runtime
+                .persist_resident_semantic_turn(&binding, replay)
+                .map_err(resident_error)?;
+            persist_anchor(&self.artifacts_root, &binding, &applied)?;
+        }
         if first_bootstrap {
-            self.grid_bootstrap_pending.insert(key);
+            self.grid_bootstrap_pending.insert(key.clone());
+        } else if bootstrap_requires_reconciliation {
+            self.runtime.request_pause(&key).map_err(resident_error)?;
+        } else {
+            let binding = self
+                .grid_bindings
+                .get(&key)
+                .cloned()
+                .ok_or(NodeError::ResidentRuntime)?;
+            let expected = self
+                .grid_bridges
+                .get(&key)
+                .ok_or(NodeError::ResidentRuntime)?
+                .expected_signed_surface()?;
+            self.host
+                .confirm_managed_grid_surface(&mut self.runtime, &binding, expected)
+                .map_err(|_| NodeError::ResidentRuntime)?;
         }
         Ok(())
     }
 
-    /// Consumes the one permitted first-install attempt. Checkpoint recovery never sets this
-    /// flag, so a restart cannot manufacture another epoch from fresh BBO after an earlier
-    /// accepted, rejected, or Unknown installation attempt.
+    /// Consumes the one permitted first-install attempt. A checkpoint containing an epoch never
+    /// sets this flag, so a restart cannot manufacture another epoch after an earlier accepted,
+    /// rejected, or Unknown installation attempt. An exact uninstalled checkpoint produced only
+    /// by predecessor cancellation remains eligible for the successor's first epoch.
     #[cfg_attr(
         not(any(feature = "binance", feature = "bitget", feature = "gate")),
         allow(dead_code)
     )]
-    pub(crate) fn take_grid_bootstrap_request(&mut self, binding: &StrategyBinding) -> bool {
-        self.grid_bindings
-            .get(&binding.key)
-            .is_some_and(|registered| registered == binding)
-            && self.grid_bootstrap_pending.remove(&binding.key)
+    pub(crate) fn take_grid_bootstrap_request(
+        &mut self,
+        binding: &StrategyBinding,
+    ) -> Result<bool, NodeError> {
+        if self.grid_bindings.get(&binding.key) != Some(binding)
+            || !self.grid_bootstrap_pending.contains(&binding.key)
+        {
+            return Ok(false);
+        }
+        let replay = {
+            let bridge = self
+                .grid_bridges
+                .get_mut(&binding.key)
+                .ok_or(NodeError::ResidentRuntime)?;
+            bridge
+                .mark_bootstrap_attempted()
+                .map_err(|_| NodeError::ResidentRuntime)?;
+            bridge.checkpoint_bytes()?
+        };
+        let applied = self
+            .runtime
+            .persist_resident_semantic_turn(binding, replay)
+            .map_err(resident_error)?;
+        persist_anchor(&self.artifacts_root, binding, &applied)?;
+        if !self.grid_bootstrap_pending.remove(&binding.key) {
+            return Err(NodeError::ResidentRuntime);
+        }
+        Ok(true)
     }
 
     pub fn register_actor_with_anchor(
@@ -439,6 +532,21 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             .persist_resident_semantic_turn(binding, replay)
             .map_err(resident_error)?;
         persist_anchor(&self.artifacts_root, binding, &applied)?;
+        if matches!(
+            action,
+            ControlAction::Pause
+                | ControlAction::Resume
+                | ControlAction::Stop
+                | ControlAction::Flatten
+        ) {
+            self.host
+                .reject_prepared_managed_grid_batch(
+                    &mut self.runtime,
+                    &binding.key,
+                    "grid_control_transition",
+                )
+                .map_err(|_| NodeError::ResidentRuntime)?;
+        }
         let result = match action {
             ControlAction::Pause => self.runtime.request_pause(&binding.key).map(|_| ()),
             ControlAction::Resume => self.runtime.request_resume(&binding.key).map(|_| ()),
@@ -565,7 +673,9 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
     /// Host re-derives this route from the exact Runtime generation and rejects every other kind
     /// of mutation.  Call again only after this method has signedly converged the first route.
     pub fn cancel_legacy_v1_grid_custody_once(&mut self) -> Result<bool, NodeError> {
-        self.refresh_signed_snapshot()?;
+        // Startup bootstrap and the prior successful cancellation both leave a fresh, persisted
+        // Host snapshot. Reuse that exact generation for the next route instead of doubling the
+        // exchange-wide signed reads in the finite predecessor-drain loop.
         let routes = self
             .host
             .legacy_v1_custody_routes_from_current_snapshot()
@@ -738,6 +848,14 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             long_quantity: long.quantity,
             short_quantity: short.quantity,
         };
+        let signed_surface = self
+            .grid_bridges
+            .get(&binding.key)
+            .ok_or(NodeError::ResidentRuntime)?
+            .expected_signed_surface()?;
+        self.host
+            .confirm_managed_grid_surface(&mut self.runtime, binding, signed_surface.clone())
+            .map_err(|_| NodeError::ResidentRuntime)?;
         let (plan, replay) = {
             let bridge = self
                 .grid_bridges
@@ -788,24 +906,23 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
 
         // All admission occurs before the first dispatch. The Host's durable reservations make
         // the later candidates see the entire batch, including the opening wave.
-        for command in &plan.commands {
-            if self
-                .host
-                .prepare_and_admit_operator(
-                    &mut self.runtime,
-                    binding,
-                    &applied,
-                    venue_runtime::account::AccountLanePriority::Normal,
-                    command.clone(),
-                )
-                .is_err()
-            {
-                self.host
-                    .reject_prepared_batch(&mut self.runtime, "grid_bootstrap_batch_rejected")
-                    .map_err(|_| NodeError::ResidentRuntime)?;
-                self.pause_grid_after_bootstrap_failure(binding)?;
-                return Err(NodeError::ResidentRuntime);
-            }
+        if self
+            .host
+            .prepare_and_admit_managed_grid_batch(
+                &mut self.runtime,
+                binding,
+                &applied,
+                venue_runtime::account::AccountLanePriority::Normal,
+                signed_surface,
+                &plan.commands,
+            )
+            .is_err()
+        {
+            self.host
+                .reject_prepared_batch(&mut self.runtime, "grid_bootstrap_batch_rejected")
+                .map_err(|_| NodeError::ResidentRuntime)?;
+            self.pause_grid_after_bootstrap_failure(binding)?;
+            return Err(NodeError::ResidentRuntime);
         }
         for _ in &plan.commands {
             if self
@@ -813,6 +930,9 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 .dispatch_next_with_host(&mut self.host)
                 .is_err()
             {
+                self.host
+                    .reject_prepared_batch(&mut self.runtime, "grid_bootstrap_dispatch_stopped")
+                    .map_err(|_| NodeError::ResidentRuntime)?;
                 self.pause_grid_after_bootstrap_failure(binding)?;
                 return Err(NodeError::ResidentRuntime);
             }
@@ -827,6 +947,9 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             if let venue_runtime::CommandState::Accepted { venue_order_id } = status.state() {
                 accepted.push((command.command_id().clone(), venue_order_id.clone()));
             } else {
+                self.host
+                    .reject_prepared_batch(&mut self.runtime, "grid_bootstrap_nonaccepted")
+                    .map_err(|_| NodeError::ResidentRuntime)?;
                 self.pause_grid_after_bootstrap_failure(binding)?;
                 return Err(NodeError::ResidentRuntime);
             }
@@ -856,6 +979,29 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             self.pause_grid_after_bootstrap_failure(binding)?;
             return Err(NodeError::ResidentRuntime);
         }
+        let replay = {
+            let bridge = self
+                .grid_bridges
+                .get_mut(&binding.key)
+                .ok_or(NodeError::ResidentRuntime)?;
+            bridge
+                .mark_bootstrap_confirmed()
+                .map_err(|_| NodeError::ResidentRuntime)?;
+            bridge.checkpoint_bytes()?
+        };
+        let confirmed_turn = self
+            .runtime
+            .persist_resident_semantic_turn(binding, replay)
+            .map_err(resident_error)?;
+        persist_anchor(&self.artifacts_root, binding, &confirmed_turn)?;
+        let expected = self
+            .grid_bridges
+            .get(&binding.key)
+            .ok_or(NodeError::ResidentRuntime)?
+            .expected_signed_surface()?;
+        self.host
+            .confirm_managed_grid_surface(&mut self.runtime, binding, expected)
+            .map_err(|_| NodeError::ResidentRuntime)?;
         Ok(())
     }
 
@@ -945,6 +1091,11 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 // The persisted fact header carries the router connection generation. Grid's
                 // reducer cursor is the separately signed private generation validated above.
                 let private_generation = active_private_generation;
+                let signed_surface = self
+                    .grid_bridges
+                    .get(&delivery.target)
+                    .ok_or(NodeError::ResidentRuntime)?
+                    .expected_signed_surface()?;
                 let bridge = self
                     .grid_bridges
                     .get_mut(&delivery.target)
@@ -969,38 +1120,44 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                     .persist_private_strategy_turn(&binding, replay)
                     .map_err(resident_error)?;
                 persist_anchor(&self.artifacts_root, &binding, &applied)?;
-                for plan in &plans {
-                    for command in &plan.commands {
-                        if self
-                            .host
-                            .prepare_and_admit_operator(
-                                &mut self.runtime,
-                                &binding,
-                                &applied,
-                                venue_runtime::account::AccountLanePriority::Normal,
-                                command.clone(),
-                            )
-                            .is_err()
-                        {
-                            self.host
-                                .reject_prepared_batch(
-                                    &mut self.runtime,
-                                    "grid_rolling_batch_rejected",
-                                )
-                                .map_err(|_| NodeError::ResidentRuntime)?;
-                            self.pause_grid_after_bootstrap_failure(&binding)?;
-                            return Err(NodeError::ResidentRuntime);
-                        }
-                    }
+                let commands = plans
+                    .iter()
+                    .flat_map(|plan| plan.commands.iter().cloned())
+                    .collect::<Vec<_>>();
+                if !commands.is_empty()
+                    && self
+                        .host
+                        .prepare_and_admit_managed_grid_batch(
+                            &mut self.runtime,
+                            &binding,
+                            &applied,
+                            venue_runtime::account::AccountLanePriority::Normal,
+                            signed_surface,
+                            &commands,
+                        )
+                        .is_err()
+                {
+                    self.host
+                        .reject_prepared_batch(&mut self.runtime, "grid_rolling_batch_rejected")
+                        .map_err(|_| NodeError::ResidentRuntime)?;
+                    self.pause_grid_after_bootstrap_failure(&binding)?;
+                    return Err(NodeError::ResidentRuntime);
                 }
                 let command_count = plans.iter().map(|plan| plan.commands.len()).sum::<usize>();
                 for _ in 0..command_count {
-                    self.runtime
-                        .dispatch_next_with_host(&mut self.host)
-                        .map_err(|error| NodeError::LiveHost {
+                    if let Err(error) = self.runtime.dispatch_next_with_host(&mut self.host) {
+                        self.host
+                            .reject_prepared_batch(
+                                &mut self.runtime,
+                                "grid_rolling_dispatch_stopped",
+                            )
+                            .map_err(|_| NodeError::ResidentRuntime)?;
+                        self.pause_grid_after_bootstrap_failure(&binding)?;
+                        return Err(NodeError::LiveHost {
                             venue: self.host.binding().venue,
                             message: error.to_string(),
-                        })?;
+                        });
+                    }
                 }
                 let mut accepted = Vec::new();
                 for plan in &plans {
@@ -1018,6 +1175,12 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                         {
                             accepted.push((command.command_id().clone(), venue_order_id.clone()));
                         } else {
+                            self.host
+                                .reject_prepared_batch(
+                                    &mut self.runtime,
+                                    "grid_rolling_nonaccepted",
+                                )
+                                .map_err(|_| NodeError::ResidentRuntime)?;
                             self.pause_grid_after_bootstrap_failure(&binding)?;
                             return Err(NodeError::ResidentRuntime);
                         }
@@ -1046,6 +1209,10 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                         self.pause_grid_after_bootstrap_failure(&binding)?;
                         return Err(NodeError::ResidentRuntime);
                     }
+                    let expected = bridge.expected_signed_surface()?;
+                    self.host
+                        .confirm_managed_grid_surface(&mut self.runtime, &binding, expected)
+                        .map_err(|_| NodeError::ResidentRuntime)?;
                 }
             }
         }
@@ -1619,6 +1786,7 @@ mod bootstrap_tests {
     fn bootstrap_batch_risk_failure_dispatches_nothing() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let (mut resident, state, binding) = resident(directory.path(), 2)?;
+        assert!(resident.take_grid_bootstrap_request(&binding)?);
         let snapshot = resident.refresh_signed_snapshot()?;
         assert!(
             resident
@@ -1628,6 +1796,58 @@ mod bootstrap_tests {
         assert_eq!(state.lock().map_err(|_| "state")?.dispatches, 0);
         assert_eq!(
             resident.strategy_lifecycle(&binding),
+            Some(venue_runtime::account::InstanceLifecycle::Paused)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn custody_only_actor_checkpoint_rearms_first_bootstrap_after_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let (mut resident, state, binding) = resident(directory.path(), 2)?;
+        let replay = resident
+            .grid_bridges
+            .get(&binding.key)
+            .ok_or("grid bridge")?
+            .checkpoint_bytes()?;
+        let applied = resident
+            .runtime
+            .persist_resident_semantic_turn(&binding, replay)?;
+        persist_anchor(&resident.artifacts_root, &binding, &applied)?;
+        drop(resident);
+
+        let second_launch = launch(directory.path())?;
+        let gateway = Gateway {
+            binding: second_launch.binding().clone(),
+            state: state.clone(),
+        };
+        let mut reopened = ProductionResident::open(&second_launch, gateway)?;
+        reopened.register_grid_actor(
+            binding.clone(),
+            initial(2)?,
+            NodeGridRecoveryPolicy::BootstrapWhenAbsent,
+            true,
+        )?;
+        assert!(reopened.take_grid_bootstrap_request(&binding)?);
+        assert!(!reopened.take_grid_bootstrap_request(&binding)?);
+        drop(reopened);
+
+        let third_launch = launch(directory.path())?;
+        let gateway = Gateway {
+            binding: third_launch.binding().clone(),
+            state,
+        };
+        let mut fenced = ProductionResident::open(&third_launch, gateway)?;
+        fenced.register_grid_actor(
+            binding.clone(),
+            initial(2)?,
+            NodeGridRecoveryPolicy::BootstrapWhenAbsent,
+            true,
+        )?;
+        assert!(!fenced.take_grid_bootstrap_request(&binding)?);
+        assert_eq!(
+            fenced.strategy_lifecycle(&binding),
             Some(venue_runtime::account::InstanceLifecycle::Paused)
         );
         Ok(())

@@ -231,7 +231,7 @@ fn root(temp: &TempDir) -> PathBuf {
 fn command(notional: Decimal) -> Result<ExecutionCommand, Box<dyn std::error::Error>> {
     let identity = notional.normalize().to_string().replace('.', "-");
     Ok(ExecutionCommand::PlaceLimit(OrderCommand {
-        time_in_force: Default::default(),
+        time_in_force: LimitTimeInForce::PostOnly,
         command_id: CommandId::new(format!("cmd-{identity}"))?,
         client_order_id: CommandId::new(format!("client-{identity}"))?,
         owner: owner()?,
@@ -1870,5 +1870,455 @@ fn frozen_legacy_journal_with_unknown_is_not_imported() -> Result<(), Box<dyn st
         Err(AccountHostValidationError::LegacyPredecessor)
     ));
     assert!(!destination.exists());
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ManagedBatchGateway {
+    binding: GatewayBinding,
+    snapshot: SignedAccountSnapshot,
+    outcomes: std::collections::VecDeque<AccountGatewayResult>,
+    risk_reads: usize,
+    dispatches: usize,
+}
+
+impl AccountPhysicalGateway for ManagedBatchGateway {
+    type Error = io::Error;
+
+    fn binding(&self) -> &GatewayBinding {
+        &self.binding
+    }
+
+    fn reconcile(
+        &mut self,
+        request: &AccountRecoveryRequest,
+    ) -> Result<AccountRecoveryReport, Self::Error> {
+        AccountRecoveryReport::new(
+            self.binding.clone(),
+            1,
+            request
+                .unresolved()
+                .iter()
+                .map(|command| AccountRecoveryOutcome::still_unknown(command.command_id().clone()))
+                .collect(),
+        )
+        .map_err(io::Error::other)
+    }
+
+    fn signed_account_snapshot(
+        &mut self,
+        _: &AccountRecoveryRequest,
+    ) -> Result<SignedAccountSnapshot, AccountHostValidationError> {
+        Ok(self.snapshot.clone())
+    }
+
+    fn risk_evidence(&mut self) -> Result<AccountRiskEvidence, AccountHostValidationError> {
+        self.risk_reads = self.risk_reads.saturating_add(1);
+        risk_evidence(self.binding.clone(), vec![Decimal::from(400)], Vec::new())
+    }
+
+    fn dispatch(&mut self, _: AccountDispatchPermit) -> AccountGatewayResult {
+        self.dispatches = self.dispatches.saturating_add(1);
+        self.outcomes
+            .pop_front()
+            .unwrap_or(AccountGatewayResult::Unknown)
+    }
+}
+
+fn managed_batch_gateway(
+    binding: &GatewayBinding,
+    outcomes: impl IntoIterator<Item = AccountGatewayResult>,
+) -> Result<ManagedBatchGateway, Box<dyn std::error::Error>> {
+    Ok(ManagedBatchGateway {
+        binding: binding.clone(),
+        snapshot: SignedAccountSnapshot::complete(
+            binding.clone(),
+            now_ms()?,
+            1,
+            1,
+            1,
+            SignedAccountPositionMode::Hedge,
+            Vec::new(),
+            vec![
+                SignedAccountPositionFact {
+                    symbol: binding.symbol.clone(),
+                    position_side: PositionSide::Long,
+                    quantity: Decimal::from(2),
+                    entry_price: Some(Decimal::from(100)),
+                    mark_price: Some(Decimal::from(100)),
+                },
+                SignedAccountPositionFact {
+                    symbol: binding.symbol.clone(),
+                    position_side: PositionSide::Short,
+                    quantity: Decimal::ONE,
+                    entry_price: Some(Decimal::from(100)),
+                    mark_price: Some(Decimal::from(100)),
+                },
+            ],
+            "managed-batch:0".to_owned(),
+            Vec::new(),
+        )?,
+        outcomes: outcomes.into_iter().collect(),
+        risk_reads: 0,
+        dispatches: 0,
+    })
+}
+
+fn managed_signed_order(
+    binding: &GatewayBinding,
+    owner: OrderOwner,
+    external: bool,
+    private_generation: u64,
+) -> Result<SignedAccountSnapshot, Box<dyn std::error::Error>> {
+    SignedAccountSnapshot::complete(
+        binding.clone(),
+        now_ms()?,
+        1,
+        private_generation,
+        1,
+        SignedAccountPositionMode::Hedge,
+        vec![SignedAccountOrderFact {
+            created_at_ms: None,
+            time_in_force: Some(LimitTimeInForce::PostOnly),
+            client_order_id: "managed-client-1".to_owned(),
+            venue_order_id: Some("managed-native-1".to_owned()),
+            symbol: binding.symbol.clone(),
+            family: NativeOrderFamily::UmOrder,
+            side: OrderSide::Buy,
+            position_side: PositionSide::Long,
+            quantity: Decimal::ONE,
+            limit_price: Some(Decimal::TEN),
+            reduce_only: false,
+            owner: Some(owner),
+            external,
+            state: Some(OrderState::New),
+            filled_quantity: Some(Decimal::ZERO),
+        }],
+        vec![
+            SignedAccountPositionFact {
+                symbol: binding.symbol.clone(),
+                position_side: PositionSide::Long,
+                quantity: Decimal::from(2),
+                entry_price: Some(Decimal::from(100)),
+                mark_price: Some(Decimal::from(100)),
+            },
+            SignedAccountPositionFact {
+                symbol: binding.symbol.clone(),
+                position_side: PositionSide::Short,
+                quantity: Decimal::ONE,
+                entry_price: Some(Decimal::from(100)),
+                mark_price: Some(Decimal::from(100)),
+            },
+        ],
+        "managed-batch:1".to_owned(),
+        Vec::new(),
+    )
+    .map_err(Into::into)
+}
+
+#[test]
+fn managed_grid_surface_rejects_external_and_wrong_purpose_ownership()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let binding = binding()?;
+    let exact_owner = owner()?;
+    let mut gateway = managed_batch_gateway(&binding, [])?;
+    gateway.snapshot = managed_signed_order(&binding, exact_owner.clone(), true, 1)?;
+    let mut host = AccountMutationHost::open(root(&temp), binding.clone(), Decimal::TEN, gateway)?;
+    let _bootstrap = host.durable_runtime_bootstrap()?;
+    let expected = BTreeMap::from([(CommandId::new("managed-client-1")?, exact_owner.clone())]);
+    assert!(matches!(
+        host.confirm_managed_grid_surface(&exact_owner, expected),
+        Err(AccountHostError::Validation(
+            AccountHostValidationError::ManagedGridSurface
+        ))
+    ));
+
+    host.gateway.snapshot = managed_signed_order(&binding, exact_owner.clone(), false, 1)?;
+    host.latest_signed_snapshot = Some(host.gateway.snapshot.clone());
+    let wrong_owner = OrderOwner {
+        purpose: OrderPurpose::Protection,
+        ..exact_owner.clone()
+    };
+    let wrong_expected = BTreeMap::from([(CommandId::new("managed-client-1")?, wrong_owner)]);
+    assert!(matches!(
+        host.confirm_managed_grid_surface(&exact_owner, wrong_expected),
+        Err(AccountHostError::Validation(
+            AccountHostValidationError::ManagedGridSurface
+        ))
+    ));
+
+    let duplicate_base = managed_signed_order(&binding, exact_owner.clone(), false, 2)?;
+    let repeated = duplicate_base
+        .open_orders()
+        .first()
+        .cloned()
+        .ok_or("signed order")?;
+    let duplicate = SignedAccountSnapshot::complete(
+        binding.clone(),
+        now_ms()?,
+        1,
+        2,
+        1,
+        SignedAccountPositionMode::Hedge,
+        vec![repeated.clone(), repeated],
+        duplicate_base.positions().to_vec(),
+        "managed-batch:duplicate".to_owned(),
+        Vec::new(),
+    )?;
+    host.latest_signed_snapshot = Some(duplicate);
+    let missing_second = BTreeMap::from([
+        (CommandId::new("managed-client-1")?, exact_owner.clone()),
+        (CommandId::new("managed-client-2")?, exact_owner.clone()),
+    ]);
+    assert!(matches!(
+        host.confirm_managed_grid_surface(&exact_owner, missing_second),
+        Err(AccountHostError::Validation(
+            AccountHostValidationError::ManagedGridSurface
+        ))
+    ));
+    Ok(())
+}
+
+#[test]
+fn managed_grid_host_rejects_non_post_only_oversized_and_large_reduce_children()
+-> Result<(), Box<dyn std::error::Error>> {
+    let binding = binding()?;
+
+    let temp = tempfile::tempdir()?;
+    let gateway = managed_batch_gateway(&binding, [])?;
+    let mut host = AccountMutationHost::open(root(&temp), binding.clone(), Decimal::TEN, gateway)?;
+    let _bootstrap = host.durable_runtime_bootstrap()?;
+    let surface = host.confirm_managed_grid_surface(&owner()?, BTreeMap::new())?;
+    let mut gtc = indexed_command(20)?;
+    let ExecutionCommand::PlaceLimit(gtc_order) = &mut gtc else {
+        return Err("limit required".into());
+    };
+    gtc_order.time_in_force = LimitTimeInForce::Gtc;
+    assert!(matches!(
+        host.prepare_managed_grid_batch_for_lane(surface, &[gtc]),
+        Err(AccountHostError::Validation(
+            AccountHostValidationError::ManagedGridSurface
+        ))
+    ));
+
+    let temp = tempfile::tempdir()?;
+    let gateway = managed_batch_gateway(&binding, [])?;
+    let mut host = AccountMutationHost::open(root(&temp), binding.clone(), Decimal::TEN, gateway)?;
+    let _bootstrap = host.durable_runtime_bootstrap()?;
+    let surface = host.confirm_managed_grid_surface(&owner()?, BTreeMap::new())?;
+    let oversized = (0..201)
+        .map(|index| indexed_command(index + 100))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(matches!(
+        host.prepare_managed_grid_batch_for_lane(surface, &oversized),
+        Err(AccountHostError::Validation(
+            AccountHostValidationError::ManagedGridSurface
+        ))
+    ));
+
+    let temp = tempfile::tempdir()?;
+    let gateway = managed_batch_gateway(&binding, [])?;
+    let mut host = AccountMutationHost::open(root(&temp), binding, Decimal::TEN, gateway)?;
+    let _bootstrap = host.durable_runtime_bootstrap()?;
+    let surface = host.confirm_managed_grid_surface(&owner()?, BTreeMap::new())?;
+    let mut reduce = indexed_command(30)?;
+    let ExecutionCommand::PlaceLimit(reduce_order) = &mut reduce else {
+        return Err("limit required".into());
+    };
+    reduce_order.owner.purpose = OrderPurpose::Reduce;
+    reduce_order.reduce_only = true;
+    reduce_order.limit_price = Price::new(Decimal::from(11))?;
+    assert!(matches!(
+        host.prepare_managed_grid_batch_for_lane(surface, &[reduce]),
+        Err(AccountHostError::Validation(
+            AccountHostValidationError::Notional
+        ))
+    ));
+    Ok(())
+}
+
+#[test]
+fn managed_grid_batch_values_once_and_allows_multiple_ten_u_children()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let binding = binding()?;
+    let gateway = managed_batch_gateway(
+        &binding,
+        [
+            AccountGatewayResult::Accepted {
+                venue_order_id: "grid-native-1".to_owned(),
+            },
+            AccountGatewayResult::Accepted {
+                venue_order_id: "grid-native-2".to_owned(),
+            },
+        ],
+    )?;
+    let mut host = AccountMutationHost::open(root(&temp), binding, Decimal::TEN, gateway)?;
+    let _bootstrap = host.durable_runtime_bootstrap()?;
+    let surface = host.confirm_managed_grid_surface(&owner()?, BTreeMap::new())?;
+    let mut commands = [indexed_command(1)?, indexed_command(2)?];
+    for command in &mut commands {
+        let ExecutionCommand::PlaceLimit(place) = command else {
+            return Err("managed batch requires limit entries".into());
+        };
+        place.limit_price = Price::new(Decimal::TEN)?;
+    }
+    let prepared = host.prepare_managed_grid_batch_for_lane(surface, &commands)?;
+    assert_eq!(host.gateway.risk_reads, 1);
+    for proof in prepared {
+        assert!(matches!(
+            host.dispatch_prepared(proof)?,
+            AccountDispatchOutcome::Accepted { .. }
+        ));
+    }
+    assert_eq!(host.gateway.risk_reads, 1);
+    assert_eq!(host.gateway.dispatches, 2);
+    let stale_surface = host.confirm_managed_grid_surface(&owner()?, BTreeMap::new())?;
+    assert!(matches!(
+        host.prepare_managed_grid_batch_for_lane(stale_surface, &[indexed_command(40)?]),
+        Err(AccountHostError::Validation(
+            AccountHostValidationError::ManagedGridSurface
+        ))
+    ));
+    Ok(())
+}
+
+#[test]
+fn managed_grid_unknown_stops_the_remaining_prepared_entry_before_dispatch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let binding = binding()?;
+    let gateway = managed_batch_gateway(
+        &binding,
+        [
+            AccountGatewayResult::Unknown,
+            AccountGatewayResult::Accepted {
+                venue_order_id: "must-not-dispatch".to_owned(),
+            },
+        ],
+    )?;
+    let mut host = AccountMutationHost::open(root(&temp), binding, Decimal::TEN, gateway)?;
+    let _bootstrap = host.durable_runtime_bootstrap()?;
+    let surface = host.confirm_managed_grid_surface(&owner()?, BTreeMap::new())?;
+    let commands = [indexed_command(3)?, indexed_command(4)?];
+    let mut prepared = host
+        .prepare_managed_grid_batch_for_lane(surface, &commands)?
+        .into_iter();
+    assert_eq!(
+        host.dispatch_prepared(prepared.next().ok_or("first proof")?)?,
+        AccountDispatchOutcome::Unknown
+    );
+    assert!(matches!(
+        host.dispatch_prepared(prepared.next().ok_or("second proof")?)?,
+        AccountDispatchOutcome::Rejected { .. }
+    ));
+    assert_eq!(host.gateway.dispatches, 1);
+    Ok(())
+}
+
+#[test]
+fn managed_grid_rejection_stops_the_remaining_prepared_entry_before_dispatch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let binding = binding()?;
+    let gateway = managed_batch_gateway(
+        &binding,
+        [
+            AccountGatewayResult::Rejected {
+                reason: "venue_rejected".to_owned(),
+            },
+            AccountGatewayResult::Accepted {
+                venue_order_id: "must-not-dispatch".to_owned(),
+            },
+        ],
+    )?;
+    let mut host = AccountMutationHost::open(root(&temp), binding, Decimal::TEN, gateway)?;
+    let _bootstrap = host.durable_runtime_bootstrap()?;
+    let surface = host.confirm_managed_grid_surface(&owner()?, BTreeMap::new())?;
+    let commands = [indexed_command(5)?, indexed_command(6)?];
+    let mut prepared = host
+        .prepare_managed_grid_batch_for_lane(surface, &commands)?
+        .into_iter();
+    assert!(matches!(
+        host.dispatch_prepared(prepared.next().ok_or("first proof")?)?,
+        AccountDispatchOutcome::Rejected { .. }
+    ));
+    assert!(matches!(
+        host.dispatch_prepared(prepared.next().ok_or("second proof")?)?,
+        AccountDispatchOutcome::Rejected { .. }
+    ));
+    assert_eq!(host.gateway.dispatches, 1);
+    Ok(())
+}
+
+#[test]
+fn managed_grid_second_place_rejection_stops_the_rolling_cancel()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let binding = binding()?;
+    let gateway = managed_batch_gateway(
+        &binding,
+        [
+            AccountGatewayResult::Accepted {
+                venue_order_id: "managed-native-1".to_owned(),
+            },
+            AccountGatewayResult::Accepted {
+                venue_order_id: "rolling-native-1".to_owned(),
+            },
+            AccountGatewayResult::Rejected {
+                reason: "rolling_rejected".to_owned(),
+            },
+            AccountGatewayResult::Accepted {
+                venue_order_id: "cancel-must-not-dispatch".to_owned(),
+            },
+        ],
+    )?;
+    let mut host = AccountMutationHost::open(root(&temp), binding.clone(), Decimal::TEN, gateway)?;
+    let _bootstrap = host.durable_runtime_bootstrap()?;
+    let surface = host.confirm_managed_grid_surface(&owner()?, BTreeMap::new())?;
+    let mut existing = indexed_command(7)?;
+    let ExecutionCommand::PlaceLimit(existing_place) = &mut existing else {
+        return Err("existing limit required".into());
+    };
+    existing_place.client_order_id = CommandId::new("managed-client-1")?;
+    existing_place.limit_price = Price::new(Decimal::TEN)?;
+    let existing_proof = host
+        .prepare_managed_grid_batch_for_lane(surface, &[existing])?
+        .pop()
+        .ok_or("existing proof")?;
+    assert!(matches!(
+        host.dispatch_prepared(existing_proof)?,
+        AccountDispatchOutcome::Accepted { .. }
+    ));
+
+    let mut refreshed = managed_signed_order(&binding, owner()?, false, 2)?;
+    host.enrich_signed_order_owners(&mut refreshed);
+    host.latest_signed_snapshot = Some(refreshed);
+    host.last_gateway_private_generation = Some(2);
+    let expected = BTreeMap::from([(CommandId::new("managed-client-1")?, owner()?)]);
+    let surface = host.confirm_managed_grid_surface(&owner()?, expected)?;
+    let cancel = ExecutionCommand::Cancel(CancelCommand {
+        command_id: CommandId::new("rolling-cancel")?,
+        owner: owner()?,
+        target_client_order_id: CommandId::new("managed-client-1")?,
+    });
+    let commands = [indexed_command(8)?, indexed_command(9)?, cancel];
+    let mut prepared = host
+        .prepare_managed_grid_batch_for_lane(surface, &commands)?
+        .into_iter();
+    assert!(matches!(
+        host.dispatch_prepared(prepared.next().ok_or("first place")?)?,
+        AccountDispatchOutcome::Accepted { .. }
+    ));
+    assert!(matches!(
+        host.dispatch_prepared(prepared.next().ok_or("second place")?)?,
+        AccountDispatchOutcome::Rejected { .. }
+    ));
+    assert!(matches!(
+        host.dispatch_prepared(prepared.next().ok_or("cancel")?)?,
+        AccountDispatchOutcome::Rejected { .. }
+    ));
+    assert_eq!(host.gateway.dispatches, 3);
     Ok(())
 }
