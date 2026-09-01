@@ -2,6 +2,7 @@ use bytes::Bytes;
 
 use super::account_gateway_limit::normalize_priced_limit;
 use super::*;
+use crate::BinanceRawPrivateFrame;
 
 const EXCHANGE_INFO: &str = include_str!("../tests/fixtures/exchange_info_btcusdt.json");
 const MIXED_EXCHANGE_INFO: &str = include_str!("../tests/fixtures/exchange_info_mixed_quotes.json");
@@ -220,16 +221,102 @@ fn private_stream_fill_keeps_exact_generation_and_never_guesses_client_identity(
             ),
         };
     let event =
-        normalize_private_stream_fill(frame.clone(), &binding, rules.instrument.generation, 9)?
+        normalize_private_stream_event(frame.clone(), &binding, rules.instrument.generation, 9)?
             .ok_or("expected fill")?;
+    let BinancePrivateAccountEvent::Fill(event) = event else {
+        return Err("expected normalized fill event".into());
+    };
     assert_eq!(event.private_generation, 9);
     assert_eq!(event.fill.order_id, "11");
     assert!(
         matches!(event.client_order_id, FieldState::Known(ref id) if id == "grid-e1-long-open-l1")
     );
     assert!(
-        normalize_private_stream_fill(frame, &binding, rules.instrument.generation, 10).is_err()
+        normalize_private_stream_event(frame, &binding, rules.instrument.generation, 10).is_err()
     );
+    Ok(())
+}
+
+#[test]
+fn private_stream_terminal_order_and_expiry_request_signed_reconciliation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_, rules, binding) = limit_fixture()?;
+    let terminal = BinanceRawPrivateFrame {
+        binding: binding.clone(),
+        instrument_generation: rules.instrument.generation,
+        private_generation: 9,
+        received_at_ms: 1_720_000_000_100,
+        payload: Bytes::from_static(
+            br#"{"e":"ORDER_TRADE_UPDATE","E":1000,"o":{"s":"BTCUSDT","c":"grid-e1-long-open-l1","x":"CANCELED","S":"BUY","ps":"LONG","i":11}}"#,
+        ),
+    };
+    assert!(matches!(
+        normalize_private_stream_event(terminal, &binding, rules.instrument.generation, 9)?,
+        Some(BinancePrivateAccountEvent::ReconcileRequired {
+            private_generation: 9,
+            ..
+        })
+    ));
+    for payload in [
+        br#"{"e":"ORDER_TRADE_UPDATE","E":1000,"o":{"s":"BTCUSDT","c":"grid-e1-long-open-l1","x":"AMENDMENT","X":"NEW","S":"BUY","ps":"LONG","i":11}}"#.as_slice(),
+        br#"{"e":"ORDER_TRADE_UPDATE","E":1000,"o":{"s":"BTCUSDT","c":"grid-e1-long-open-l1","x":"CALCULATED","X":"FILLED","S":"SELL","ps":"LONG","i":11}}"#.as_slice(),
+        br#"{"e":"ACCOUNT_CONFIG_UPDATE","E":1000,"T":999,"ac":{"s":"BTCUSDT","l":10}}"#.as_slice(),
+    ] {
+        assert!(matches!(
+            normalize_private_stream_event(
+                BinanceRawPrivateFrame {
+                    binding: binding.clone(),
+                    instrument_generation: rules.instrument.generation,
+                    private_generation: 9,
+                    received_at_ms: 1_720_000_000_100,
+                    payload: Bytes::copy_from_slice(payload),
+                },
+                &binding,
+                rules.instrument.generation,
+                9,
+            )?,
+            Some(BinancePrivateAccountEvent::ReconcileRequired { .. })
+        ));
+    }
+    let expired = BinanceRawPrivateFrame {
+        binding: binding.clone(),
+        instrument_generation: rules.instrument.generation,
+        private_generation: 9,
+        received_at_ms: 1_720_000_000_101,
+        payload: Bytes::from_static(
+            br#"{"e":"listenKeyExpired","E":1001,"listenKey":"[redacted]"}"#,
+        ),
+    };
+    assert!(
+        normalize_private_stream_event(expired, &binding, rules.instrument.generation, 9).is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn private_stream_reconnect_backoff_is_bounded_exponential_and_staggered() {
+    let first = private_stream_reconnect_delay(10, 1, 1);
+    let second = private_stream_reconnect_delay(10, 1, 2);
+    assert!(first >= Duration::from_secs(1));
+    assert!(second >= Duration::from_secs(2));
+    assert!(second > first);
+    assert_ne!(first, private_stream_reconnect_delay(11, 1, 1));
+    assert!(private_stream_reconnect_delay(10, 1, u32::MAX) <= PRIVATE_STREAM_MAX_RECONNECT_DELAY);
+}
+
+#[test]
+fn one_private_stream_outage_reports_once_until_a_valid_frame()
+-> Result<(), Box<dyn std::error::Error>> {
+    let now = Instant::now();
+    let mut state = PrivateStreamReconnectState::default();
+    assert!(state.record_failure(now, 10, 1));
+    assert!(state.waiting(now));
+    let retry_at = state.retry_deadline().ok_or("retry deadline")?;
+    assert!(!state.waiting(retry_at));
+    assert!(!state.record_failure(retry_at, 10, 2));
+    state.record_valid_frame();
+    assert!(!state.waiting(retry_at));
+    assert!(state.record_failure(retry_at, 10, 3));
     Ok(())
 }
 

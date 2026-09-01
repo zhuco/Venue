@@ -19,7 +19,7 @@ use venue_gateway_api::CapabilityFlags;
 
 pub use account_gateway::{
     BinanceAccountGateway, BinanceAccountGatewayError, BinanceGridBootstrapMarketFacts,
-    BinancePrivateFillEvent, BinancePublicMarketEvent,
+    BinancePrivateAccountEvent, BinancePrivateFillEvent, BinancePublicMarketEvent,
 };
 pub use binding::{BinanceAccountBinding, BinanceBindingError, native_symbol};
 pub use config::{BinanceConfig, endpoints};

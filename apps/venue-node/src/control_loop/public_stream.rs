@@ -206,15 +206,25 @@ impl ControlResidentLoop<venue_gateway_binance::BinanceAccountGateway> {
         // Initial installation is one startup transaction, not a market-data retry loop. Its
         // own signed readback leaves a failed/unknown account Paused; retrying here could create
         // a second epoch or physical child after an indeterminate gateway outcome.
-        for binding in grid_bindings {
+        for binding in &grid_bindings {
             if self.resident.take_grid_bootstrap_request(&binding)? {
                 self.resident.bootstrap_binance_grid_once(&binding)?;
             }
         }
-        self.run_with_private_pump(|resident| {
+        let mut last_grid_supervision = std::time::Instant::now();
+        self.run_with_private_pump(move |resident| {
             // Both bounded reads are adapter-normalized facts.  A public feed cannot bypass the
             // same account Runtime/MarketHub, and a private fill remains first for Grid custody.
-            let private_progress = resident.poll_binance_grid_private_once()?;
+            let mut private_progress = false;
+            for binding in &grid_bindings {
+                private_progress |= resident.poll_binance_grid_private_once(binding)?;
+            }
+            if last_grid_supervision.elapsed() >= Duration::from_secs(10 * 60) {
+                for binding in &grid_bindings {
+                    private_progress |= resident.supervise_binance_grid_once(binding)?;
+                }
+                last_grid_supervision = std::time::Instant::now();
+            }
             let public_progress = resident.poll_binance_scalping_public_once()?;
             Ok(private_progress || public_progress)
         })

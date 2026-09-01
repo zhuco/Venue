@@ -31,7 +31,7 @@ pub(super) fn dispatch_catalog_permit(
         };
     // This is an ephemeral read scope over the same credentials and account Host, not a second
     // gateway or writer. The selected rule binding is required by Binance's exact readback.
-    let transport = match BinanceHttpTransport::new(
+    let mut transport = match BinanceHttpTransport::new(
         config.clone(),
         rules.instrument.generation,
         gateway.private_generation,
@@ -40,6 +40,12 @@ pub(super) fn dispatch_catalog_permit(
         Ok(value) => value,
         Err(_) => return rejected("binance_symbol_transport"),
     };
+    if transport
+        .inherit_synchronized_clock(&gateway.transport)
+        .is_err()
+    {
+        return rejected("binance_clock");
+    }
     let attempt = match gateway.take_attempt_id() {
         Ok(value) => value,
         Err(_) => return rejected("binance_attempt"),
@@ -59,7 +65,7 @@ pub(super) fn dispatch_catalog_permit(
         Ok(value) => value,
         Err(_) => return rejected("binance_intent_rejected"),
     };
-    let timestamp = match now_ms() {
+    let timestamp = match transport.signing_timestamp_ms() {
         Ok(value) => value,
         Err(_) => return rejected("binance_clock"),
     };

@@ -1,5 +1,5 @@
 use std::{
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,6 +20,7 @@ use crate::{
 
 const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_TRANSPORT_BYTES: usize = 2 * 1024 * 1024;
+const TIME_SYNC_ATTEMPTS: usize = 6;
 static NEXT_TRANSPORT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +75,8 @@ pub struct BinanceHttpTransport {
     limits: BinanceTransportLimits,
     instance_serial: u64,
     fixed_endpoint: bool,
+    clock_offset_ms: AtomicI64,
+    clock_synchronized: AtomicBool,
 }
 
 impl BinanceHttpTransport {
@@ -148,7 +151,69 @@ impl BinanceHttpTransport {
             limits,
             instance_serial,
             fixed_endpoint: require_fixed_endpoint,
+            clock_offset_ms: AtomicI64::new(0),
+            clock_synchronized: AtomicBool::new(cfg!(test)),
         })
+    }
+
+    /// Installs the lowest-RTT midpoint sample from Binance before any signed request. A newly
+    /// constructed production transport is deliberately unusable for signing until this succeeds.
+    pub async fn synchronize_clock(&self) -> Result<(), BinanceTransportError> {
+        self.clock_synchronized.store(false, Ordering::Release);
+        let mut best = None;
+        for _ in 0..TIME_SYNC_ATTEMPTS {
+            let before = unix_ms()?;
+            let response = match self
+                .send_bounded(
+                    self.client
+                        .get(format!("{}{}", self.endpoint, endpoints::SERVER_TIME)),
+                    before,
+                    false,
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(_) => continue,
+            };
+            let server_time = serde_json::from_slice::<serde_json::Value>(&response.payload)
+                .ok()
+                .and_then(|value| value.get("serverTime").and_then(serde_json::Value::as_u64));
+            let Some(server_time) = server_time else {
+                continue;
+            };
+            let round_trip_ms = response.received_at_ms.saturating_sub(before);
+            let midpoint = before.saturating_add(round_trip_ms / 2);
+            let offset = time_offset_ms(server_time, midpoint);
+            if best.is_none_or(|(best_rtt, _)| round_trip_ms < best_rtt) {
+                best = Some((round_trip_ms, offset));
+            }
+        }
+        let (_, offset) = best.ok_or(BinanceTransportError::Clock)?;
+        self.clock_offset_ms.store(offset, Ordering::Relaxed);
+        self.clock_synchronized.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn inherit_synchronized_clock(
+        &mut self,
+        previous: &Self,
+    ) -> Result<(), BinanceTransportError> {
+        if !previous.clock_synchronized.load(Ordering::Acquire) {
+            return Err(BinanceTransportError::Clock);
+        }
+        self.clock_offset_ms.store(
+            previous.clock_offset_ms.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.clock_synchronized.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn signing_timestamp_ms(&self) -> Result<u64, BinanceTransportError> {
+        if !self.clock_synchronized.load(Ordering::Acquire) {
+            return Err(BinanceTransportError::Clock);
+        }
+        authoritative_timestamp(unix_ms()?, self.clock_offset_ms.load(Ordering::Relaxed))
     }
 
     #[must_use]
@@ -183,7 +248,7 @@ impl BinanceHttpTransport {
         timestamp_ms: u64,
     ) -> Result<BinanceRawPrivatePage, BinanceTransportError> {
         self.validate_scope(request.scope())?;
-        let response = self
+        let response = match self
             .execute_signed(
                 credentials,
                 request.scope(),
@@ -193,7 +258,24 @@ impl BinanceHttpTransport {
                 timestamp_ms,
                 false,
             )
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(BinanceTransportError::TimestampRejected) => {
+                self.synchronize_clock().await?;
+                self.execute_signed(
+                    credentials,
+                    request.scope(),
+                    request.method(),
+                    request.path(),
+                    request.parameters(),
+                    self.signing_timestamp_ms()?,
+                    false,
+                )
+                .await?
+            }
+            Err(error) => return Err(error),
+        };
         BinanceRawPrivatePage::new(
             request,
             response.requested_at_ms,
@@ -303,7 +385,7 @@ impl BinanceHttpTransport {
         request
             .validate(scope)
             .map_err(|_| BinanceTransportError::Binding)?;
-        let response = self
+        let response = match self
             .execute_signed(
                 credentials,
                 scope,
@@ -313,7 +395,15 @@ impl BinanceHttpTransport {
                 timestamp_ms,
                 true,
             )
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(BinanceTransportError::TimestampRejected) => {
+                self.synchronize_clock().await?;
+                return Err(BinanceTransportError::TimestampRejected);
+            }
+            Err(error) => return Err(error),
+        };
         parse_mutation_ack(request, scope, &response.payload, response.received_at_ms)
             .map_err(|_| BinanceTransportError::Ack)
     }
@@ -350,7 +440,7 @@ impl BinanceHttpTransport {
             .execute_read(
                 credentials,
                 &exact_request,
-                match unix_ms() {
+                match self.signing_timestamp_ms() {
                     Ok(value) => value,
                     Err(error) => {
                         return BinancePhysicalMutationOutcome::AckedReadbackUnknown { ack, error };
@@ -432,7 +522,7 @@ impl BinanceHttpTransport {
         timestamp_ms: u64,
         mutation: bool,
     ) -> Result<BinanceHttpResponse, BinanceTransportError> {
-        if timestamp_ms == 0 || timestamp_ms < scope.requested_at_ms() {
+        if timestamp_ms == 0 || !self.clock_synchronized.load(Ordering::Acquire) {
             return Err(BinanceTransportError::Clock);
         }
         let parameter_refs = parameters
@@ -452,13 +542,12 @@ impl BinanceHttpTransport {
             },
         )
         .map_err(|_| BinanceTransportError::Signing)?;
-        self.send_signed(signed, timestamp_ms, mutation).await
+        self.send_signed(signed, mutation).await
     }
 
     async fn send_signed(
         &self,
         signed: SignedBinanceRestRequest,
-        requested_at_ms: u64,
         mutation: bool,
     ) -> Result<BinanceHttpResponse, BinanceTransportError> {
         if signed.origin() != self.config.portfolio_rest_origin()
@@ -474,7 +563,7 @@ impl BinanceHttpTransport {
             BinanceHttpMethod::Put => self.client.put(url),
         }
         .header("X-MBX-APIKEY", signed.api_key());
-        self.send_bounded(builder, requested_at_ms, mutation).await
+        self.send_bounded(builder, unix_ms()?, mutation).await
     }
 
     async fn send_bounded(
@@ -488,13 +577,7 @@ impl BinanceHttpTransport {
             .map_err(|_| BinanceTransportError::Timeout)?
             .map_err(map_reqwest)?;
         let status = response.status().as_u16();
-        if !response.status().is_success() {
-            return if mutation && (status >= 500 || status == 408) {
-                Err(BinanceTransportError::AmbiguousStatus(status))
-            } else {
-                Err(BinanceTransportError::HttpStatus(status))
-            };
-        }
+        let successful = response.status().is_success();
         if response
             .content_length()
             .is_some_and(|length| length > self.limits.maximum_body_bytes as u64)
@@ -518,6 +601,9 @@ impl BinanceHttpTransport {
         })
         .await
         .map_err(|_| BinanceTransportError::Timeout)??;
+        if !successful {
+            return Err(classify_http_error(status, &payload, mutation));
+        }
         Ok(BinanceHttpResponse {
             requested_at_ms,
             received_at_ms: unix_ms()?,
@@ -575,6 +661,37 @@ fn unix_ms() -> Result<u64, BinanceTransportError> {
     u64::try_from(millis).map_err(|_| BinanceTransportError::Clock)
 }
 
+fn authoritative_timestamp(local_ms: u64, offset_ms: i64) -> Result<u64, BinanceTransportError> {
+    if offset_ms >= 0 {
+        local_ms
+            .checked_add(offset_ms as u64)
+            .ok_or(BinanceTransportError::Clock)
+    } else {
+        local_ms
+            .checked_sub(offset_ms.unsigned_abs())
+            .ok_or(BinanceTransportError::Clock)
+    }
+}
+
+fn time_offset_ms(server_time_ms: u64, local_midpoint_ms: u64) -> i64 {
+    let difference = i128::from(server_time_ms) - i128::from(local_midpoint_ms);
+    difference.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+fn classify_http_error(status: u16, payload: &[u8], mutation: bool) -> BinanceTransportError {
+    if serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|value| value.get("code").and_then(serde_json::Value::as_i64))
+        == Some(-1021)
+    {
+        BinanceTransportError::TimestampRejected
+    } else if mutation && (status >= 500 || status == 408) {
+        BinanceTransportError::AmbiguousStatus(status)
+    } else {
+        BinanceTransportError::HttpStatus(status)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum BinanceTransportError {
     #[error("Binance transport limits are invalid or exceed the hard maximum")]
@@ -601,6 +718,8 @@ pub enum BinanceTransportError {
     Payload,
     #[error("Binance transport clock is invalid or regressed")]
     Clock,
+    #[error("Binance explicitly rejected the signed request timestamp")]
+    TimestampRejected,
     #[error("Binance transport protocol state is invalid")]
     Protocol,
     #[error("Binance private stream ended")]
@@ -645,6 +764,7 @@ mod tests {
 
     enum Behavior {
         Body(&'static [u8]),
+        Status(u16, &'static [u8]),
         Partial(&'static [u8], usize),
         Delay(Duration),
     }
@@ -668,6 +788,14 @@ mod tests {
                     Behavior::Body(body) => {
                         let header = format!(
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes()).await;
+                        let _ = stream.write_all(body).await;
+                    }
+                    Behavior::Status(status, body) => {
+                        let header = format!(
+                            "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             body.len()
                         );
                         let _ = stream.write_all(header.as_bytes()).await;
@@ -809,6 +937,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timestamp_rejected_mutation_resyncs_clock_but_never_replays_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let credentials = BinanceCredentials::from_values("key", "secret")?;
+        let (config, _, scope) = facts("00000000-0000-4000-8000-000000000001")?;
+        let server_time = unix_ms()?;
+        let time_payload: &'static [u8] = Box::leak(
+            format!(r#"{{"serverTime":{server_time}}}"#)
+                .into_bytes()
+                .into_boxed_slice(),
+        );
+        let mut behaviors = vec![Behavior::Status(
+            400,
+            br#"{"code":-1021,"msg":"timestamp outside recvWindow"}"#,
+        )];
+        behaviors.extend((0..TIME_SYNC_ATTEMPTS).map(|_| Behavior::Body(time_payload)));
+        let (endpoint, count) = fake_http(behaviors).await?;
+        let transport = BinanceHttpTransport::with_endpoint(
+            config,
+            7,
+            17,
+            endpoint,
+            BinanceTransportLimits::new(Duration::from_secs(1), 4096)?,
+        )?;
+        let request =
+            prepared_for_transport_test(&scope, BinanceMutationKind::PlaceLimit, "venue_place_1");
+
+        assert_eq!(
+            transport
+                .dispatch_once(&credentials, &scope, &request, unix_ms()?)
+                .await,
+            Err(BinanceTransportError::TimestampRejected)
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1 + TIME_SYNC_ATTEMPTS,
+            "one mutation plus bounded read-only clock samples"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn successful_ack_is_followed_by_one_separately_signed_exact_readback()
     -> Result<(), Box<dyn std::error::Error>> {
         let credentials = BinanceCredentials::from_values("key", "secret")?;
@@ -856,6 +1025,86 @@ mod tests {
             format!("{:?}", transport.create_listen_key(&credentials).await?).contains("redacted")
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn server_clock_uses_midpoint_sample_before_signed_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (config, _, _) = facts("00000000-0000-4000-8000-000000000001")?;
+        let server_time = unix_ms()?.saturating_add(250);
+        let payload: &'static [u8] = Box::leak(
+            format!(r#"{{"serverTime":{server_time}}}"#)
+                .into_bytes()
+                .into_boxed_slice(),
+        );
+        let (endpoint, count) = fake_http(
+            (0..TIME_SYNC_ATTEMPTS)
+                .map(|_| Behavior::Body(payload))
+                .collect(),
+        )
+        .await?;
+        let transport = BinanceHttpTransport::with_endpoint(
+            config,
+            7,
+            17,
+            endpoint,
+            BinanceTransportLimits::new(Duration::from_secs(1), 1024)?,
+        )?;
+        transport.synchronize_clock().await?;
+        let signed = transport.signing_timestamp_ms()?;
+        assert!(signed >= server_time.saturating_sub(50));
+        assert_eq!(count.load(Ordering::SeqCst), TIME_SYNC_ATTEMPTS);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signed_wire_offset_never_relabels_local_request_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let credentials = BinanceCredentials::from_values("key", "secret")?;
+        let (config, _, scope) = facts("00000000-0000-4000-8000-000000000001")?;
+        for offset in [-5_000_i64, 5_000_i64] {
+            let (endpoint, _) = fake_http(vec![Behavior::Body(ACCOUNT)]).await?;
+            let transport = BinanceHttpTransport::with_endpoint(
+                config.clone(),
+                7,
+                17,
+                endpoint,
+                BinanceTransportLimits::new(Duration::from_secs(1), 4096)?,
+            )?;
+            transport.clock_offset_ms.store(offset, Ordering::Relaxed);
+            transport.clock_synchronized.store(true, Ordering::Release);
+            let before = unix_ms()?;
+            let page = transport
+                .execute_read(
+                    &credentials,
+                    &build_account_request(&scope)?,
+                    transport.signing_timestamp_ms()?,
+                )
+                .await?;
+            assert!(page.requested_at_ms >= before);
+            assert!(page.received_at_ms >= page.requested_at_ms);
+            assert!(page.received_at_ms.saturating_sub(page.requested_at_ms) < 1_000);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn midpoint_offset_and_checked_adjustment_match_clock_contract() {
+        assert_eq!(time_offset_ms(10_090, 10_050), 40);
+        assert_eq!(authoritative_timestamp(20_000, 40), Ok(20_040));
+        assert_eq!(authoritative_timestamp(20_000, -40), Ok(19_960));
+        assert_eq!(
+            authoritative_timestamp(u64::MAX, 1),
+            Err(BinanceTransportError::Clock)
+        );
+        assert_eq!(
+            classify_http_error(400, br#"{"code":-1021,"msg":"timestamp"}"#, false),
+            BinanceTransportError::TimestampRejected
+        );
+        assert_eq!(
+            classify_http_error(503, br#"{"code":-1000}"#, true),
+            BinanceTransportError::AmbiguousStatus(503)
+        );
     }
 
     #[tokio::test]

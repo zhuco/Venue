@@ -662,6 +662,197 @@ fn concurrent_signed_fills_are_staged_before_pending_batches_restore_the_full_su
 }
 
 #[test]
+fn periodic_signed_supervision_drains_unexplained_gap_before_one_rebuild()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let (mut resident, state, binding) = resident(directory.path(), 3)?;
+    {
+        let mut state = state.lock().map_err(|_| "state")?;
+        state.accept_dispatch = true;
+        state.long_quantity = Decimal::new(12, 2);
+        state.short_quantity = Decimal::new(12, 2);
+    }
+    assert!(resident.take_grid_bootstrap_request(&binding)?);
+    let snapshot = resident.refresh_signed_snapshot()?;
+    resident.bootstrap_grid_from_signed_market(&binding, snapshot, market()?)?;
+    let initial_count = state.lock().map_err(|_| "state")?.open_orders.len();
+    {
+        let mut state = state.lock().map_err(|_| "state")?;
+        state.open_orders.pop().ok_or("installed order")?;
+        assert_eq!(state.open_orders.len(), initial_count - 1);
+    }
+
+    assert!(resident.supervise_grid_signed_surface_once(&binding)?);
+    assert!(state.lock().map_err(|_| "state")?.open_orders.is_empty());
+    assert!(resident.take_grid_bootstrap_request(&binding)?);
+    let snapshot = resident.refresh_signed_snapshot()?;
+    resident.bootstrap_grid_from_signed_market(&binding, snapshot, market()?)?;
+    assert_eq!(
+        state.lock().map_err(|_| "state")?.open_orders.len(),
+        initial_count
+    );
+    assert!(!resident.supervise_grid_signed_surface_once(&binding)?);
+    Ok(())
+}
+
+#[test]
+fn periodic_signed_supervision_never_cancels_when_surface_has_an_external_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let (mut resident, state, binding) = resident(directory.path(), 3)?;
+    {
+        let mut state = state.lock().map_err(|_| "state")?;
+        state.accept_dispatch = true;
+        state.long_quantity = Decimal::new(12, 2);
+        state.short_quantity = Decimal::new(12, 2);
+    }
+    assert!(resident.take_grid_bootstrap_request(&binding)?);
+    let snapshot = resident.refresh_signed_snapshot()?;
+    resident.bootstrap_grid_from_signed_market(&binding, snapshot, market()?)?;
+    let (dispatches, order_count) = {
+        let mut state = state.lock().map_err(|_| "state")?;
+        let mut external = state.open_orders.first().cloned().ok_or("grid order")?;
+        external.client_order_id = "external-order".to_owned();
+        external.venue_order_id = Some("external-native".to_owned());
+        external.owner = None;
+        external.external = true;
+        state.open_orders.push(external);
+        (state.dispatches, state.open_orders.len())
+    };
+
+    assert!(
+        resident
+            .supervise_grid_signed_surface_once(&binding)
+            .is_err()
+    );
+    let state = state.lock().map_err(|_| "state")?;
+    assert_eq!(state.dispatches, dispatches);
+    assert_eq!(state.open_orders.len(), order_count);
+    Ok(())
+}
+
+#[test]
+fn periodic_signed_supervision_never_resets_a_pending_unknown_rolling_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let (mut resident, state, binding) = resident(directory.path(), 3)?;
+    {
+        let mut state = state.lock().map_err(|_| "state")?;
+        state.accept_dispatch = true;
+        state.long_quantity = Decimal::new(12, 2);
+        state.short_quantity = Decimal::new(12, 2);
+    }
+    assert!(resident.take_grid_bootstrap_request(&binding)?);
+    let snapshot = resident.refresh_signed_snapshot()?;
+    resident.bootstrap_grid_from_signed_market(&binding, snapshot, market()?)?;
+    let dispatches = {
+        let mut state = state.lock().map_err(|_| "state")?;
+        let order = state
+            .open_orders
+            .iter()
+            .find(|order| !order.reduce_only)
+            .cloned()
+            .ok_or("entry order")?;
+        let fill = Fill {
+            fill_id: "unknown-rolling-fill".to_owned(),
+            execution_sequence: FieldState::Known(1),
+            order_id: order.venue_order_id.clone().ok_or("native order")?,
+            symbol: order.symbol.clone(),
+            side: order.side,
+            position_side: FieldState::Known(order.position_side),
+            quantity: order.quantity,
+            price: Price::new(order.limit_price.ok_or("limit price")?)?,
+            fee: FieldState::Missing,
+            realized_pnl: FieldState::Missing,
+            maker: FieldState::Known(true),
+            exchange_time_ms: Some(now()?),
+        };
+        state
+            .open_orders
+            .retain(|candidate| candidate.venue_order_id != order.venue_order_id);
+        state.fills = vec![fill];
+        state.accept_dispatch = false;
+        state.dispatches
+    };
+
+    assert!(
+        resident
+            .supervise_grid_signed_surface_once(&binding)
+            .is_err()
+    );
+    let after_unknown = state.lock().map_err(|_| "state")?.dispatches;
+    assert_eq!(after_unknown, dispatches + 1);
+    assert!(
+        resident
+            .supervise_grid_signed_surface_once(&binding)
+            .is_err()
+    );
+    assert_eq!(state.lock().map_err(|_| "state")?.dispatches, after_unknown);
+    Ok(())
+}
+
+#[test]
+fn signed_supervision_recovers_missed_fill_before_considering_reset()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let (mut resident, state, binding) = resident(directory.path(), 3)?;
+    {
+        let mut state = state.lock().map_err(|_| "state")?;
+        state.accept_dispatch = true;
+        state.long_quantity = Decimal::new(12, 2);
+        state.short_quantity = Decimal::new(12, 2);
+    }
+    assert!(resident.take_grid_bootstrap_request(&binding)?);
+    let snapshot = resident.refresh_signed_snapshot()?;
+    resident.bootstrap_grid_from_signed_market(&binding, snapshot, market()?)?;
+    let (initial_count, dispatches, fill) = {
+        let mut state = state.lock().map_err(|_| "state")?;
+        let order = state
+            .open_orders
+            .iter()
+            .find(|order| !order.reduce_only)
+            .cloned()
+            .ok_or("entry order")?;
+        let fill = Fill {
+            fill_id: "missed-private-fill".to_owned(),
+            execution_sequence: FieldState::Known(1),
+            order_id: order.venue_order_id.clone().ok_or("native order")?,
+            symbol: order.symbol.clone(),
+            side: order.side,
+            position_side: FieldState::Known(order.position_side),
+            quantity: order.quantity,
+            price: Price::new(order.limit_price.ok_or("limit price")?)?,
+            fee: FieldState::Missing,
+            realized_pnl: FieldState::Missing,
+            maker: FieldState::Known(true),
+            exchange_time_ms: Some(now()?),
+        };
+        let initial_count = state.open_orders.len();
+        let dispatches = state.dispatches;
+        state
+            .open_orders
+            .retain(|candidate| candidate.venue_order_id != order.venue_order_id);
+        state.fills = vec![fill.clone()];
+        (initial_count, dispatches, fill)
+    };
+
+    assert!(!resident.supervise_grid_signed_surface_once(&binding)?);
+    let state = state.lock().map_err(|_| "state")?;
+    assert_eq!(state.dispatches, dispatches + 3);
+    assert_eq!(state.open_orders.len(), initial_count);
+    assert!(
+        resident
+            .grid_bridges
+            .get(&binding.key)
+            .ok_or("bridge")?
+            .grid
+            .owned_fill_records
+            .contains_key(&fill.fill_id)
+    );
+    Ok(())
+}
+
+#[test]
 fn bootstrap_admission_error_retains_risk_stage() {
     let stage = AccountHostValidationError::RiskEvidenceStage("quote_rates");
     let message = grid_bootstrap_admission_error(VenueId::Binance, &stage).to_string();

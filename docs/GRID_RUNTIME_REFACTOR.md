@@ -244,6 +244,8 @@ conditional、algo 三个 canonical family 完整或明确不支持，同时声�
 
 ### 5.3 每代签名回读的订单完整性
 
+Binance 账户 adapter 在任何签名私有读取之前必须完成 `/papi/v1/time` 的六次有界采样，使用最低 RTT 样本的本机发送/接收中点计算偏移；未同步的 transport 不得签名。后续 private generation 只能继承已验证偏移，显式时间戳拒绝或进程重建则先重新同步，mutation 本身仍只发送一次。私有 listen-key 每 30 分钟续期；续期失败、`listenKeyExpired`、断流或坏帧必须淘汰旧 socket，并先推进一代完整签名回读后再建流，禁止给旧帧换代。
+
 每次完整签名回读依次执行：
 
 1. 消费这一代中可证明的完整成交；
@@ -251,6 +253,8 @@ conditional、algo 三个 canonical family 完整或明确不支持，同时声�
 3. 比较策略目标订单键与实际可见订单键；
 4. 若仍有无法由成交或在途 WAL 解释的缺单，立即进入 `ResettingGrid` 并按该账户事实重建；
 5. 周期健康检查只做审计和报警，不承担首次发现缺单的正确性责任。
+
+Binance resident 同时在终态订单/账户私流事件后的下一调度 turn 触发上述回读，并保留 10 分钟兜底监督。兜底周期不是容忍缺单的窗口：私流成交仍即时滚动；显式终态事件、断流或过期会立即回读。私流失败代际使用有上限指数退避并按连接、私有代际错峰，等待期间行情与 Control pump 继续推进。无法由签名成交解释的严格子集只允许走耐久撤净和一次新 BBO/新 epoch 重建；额外订单、形状漂移、Unknown 或不一致 Owner 继续失败关闭。
 
 Host 推进 adapter 查询游标后，必须把尚未由 resident 明确 ACK 的规范签名成交继续原序携带到后续签名页及重启 checkpoint；ACK 只能发生在该成交的 facts 路由和 Actor checkpoint 均已 fsync 后。刷新先于 Actor、进程在两者之间退出或下一页无新增成交，都不得永久吞掉成交。
 若当前订单面只能由多笔 WAL-owned 签名成交解释，Node 先按签名执行顺序固定全部 reducer transaction，

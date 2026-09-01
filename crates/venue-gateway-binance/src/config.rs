@@ -94,6 +94,7 @@ impl BinanceConfig {
 }
 
 pub mod endpoints {
+    pub const SERVER_TIME: &str = "/papi/v1/time";
     pub const USD_M_ASSET_INDEX: &str = "/fapi/v1/assetIndex";
     pub const LISTEN_KEY: &str = "/papi/v1/listenKey";
     pub const ACCOUNT: &str = "/papi/v1/account";

@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     str,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rust_decimal::Decimal;
@@ -30,23 +30,30 @@ use account_gateway_limit::{
     normalize_fresh_limit, readback_policy_matches_command, snapshot_created_at_ms,
     snapshot_regular_order_quantities,
 };
+#[path = "account_gateway_private_stream.rs"]
+mod account_gateway_private_stream;
+pub use account_gateway_private_stream::{BinancePrivateAccountEvent, BinancePrivateFillEvent};
+#[cfg(test)]
+use account_gateway_private_stream::{
+    PRIVATE_STREAM_MAX_RECONNECT_DELAY, private_stream_reconnect_delay,
+};
+use account_gateway_private_stream::{PrivateStreamReconnectState, normalize_private_stream_event};
 #[path = "account_gateway_symbol_dispatch.rs"]
 mod account_gateway_symbol_dispatch;
 use crate::{
     BinanceAccountBinding, BinanceConfig, BinanceCredentials, BinanceHttpTransport,
     BinanceInstrumentRules, BinancePhysicalMutationOutcome, BinancePrivateReadScope,
     BinancePrivateReadbackCandidate, BinancePrivateWsTransport, BinancePublicKline,
-    BinancePublicWsTransport, BinanceRawPrivateFrame, BinanceRawPublicFrame, BinanceTransportError,
-    BinanceTransportLimits, build_account_config_request, build_account_request,
-    build_account_wide_algo_orders_request, build_account_wide_positions_request,
-    build_account_wide_regular_orders_request, build_algo_orders_request,
-    build_exact_order_for_native_symbol_request, build_exact_order_request,
-    build_fills_for_native_symbol_request, build_fills_request, build_position_mode_request,
-    build_positions_request, build_regular_orders_request, complete_private_readback,
-    connect_private_ws, connect_public_ws, parse_instrument_rules, parse_native_instrument_rules,
-    parse_public_market_agg_trade, parse_public_market_bbo, parse_public_market_depth_delta,
-    parse_public_market_kline, parse_public_market_rest_depth_snapshot, prepare_execution_command,
-    settle_mutation_ack,
+    BinancePublicWsTransport, BinanceRawPublicFrame, BinanceTransportError, BinanceTransportLimits,
+    build_account_config_request, build_account_request, build_account_wide_algo_orders_request,
+    build_account_wide_positions_request, build_account_wide_regular_orders_request,
+    build_algo_orders_request, build_exact_order_for_native_symbol_request,
+    build_exact_order_request, build_fills_for_native_symbol_request, build_fills_request,
+    build_position_mode_request, build_positions_request, build_regular_orders_request,
+    complete_private_readback, connect_private_ws, connect_public_ws, parse_instrument_rules,
+    parse_native_instrument_rules, parse_public_market_agg_trade, parse_public_market_bbo,
+    parse_public_market_depth_delta, parse_public_market_kline,
+    parse_public_market_rest_depth_snapshot, prepare_execution_command, settle_mutation_ack,
 };
 
 /// Binance Portfolio Margin implementation of the one-account host boundary. Raw transport
@@ -65,21 +72,14 @@ pub struct BinanceAccountGateway {
     private_generation: u64,
     next_attempt_id: u64,
     private_stream: Option<BinancePrivateWsTransport>,
+    private_stream_keepalive_at: Option<Instant>,
+    private_stream_reconnect: PrivateStreamReconnectState,
     public_stream: Option<BinancePublicWsTransport>,
     public_stream_failed: bool,
     public_snapshot_pending: bool,
 }
 
-/// Sanitized, normalized Binance private-stream execution evidence. The listen key and native
-/// frame never leave the adapter; callers still have to persist the corresponding DomainEvent
-/// through the account runtime before a strategy consumes it.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BinancePrivateFillEvent {
-    pub private_generation: u64,
-    pub received_at_ms: u64,
-    pub fill: Fill,
-    pub client_order_id: FieldState<String>,
-}
+const PRIVATE_STREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// One normalized, read-only public fact from the fixed Binance combined stream.  It is not a
 /// strategy decision and has no relation to private account generations or mutation authority.
@@ -138,6 +138,9 @@ impl BinanceAccountGateway {
             limits,
         )
         .map_err(BinanceAccountGatewayError::Transport)?;
+        runtime
+            .block_on(transport.synchronize_clock())
+            .map_err(BinanceAccountGatewayError::Transport)?;
         let rules_by_symbol = runtime.block_on(fetch_rules_catalog(
             &transport,
             &binding,
@@ -168,6 +171,8 @@ impl BinanceAccountGateway {
             private_generation,
             next_attempt_id: 2,
             private_stream: None,
+            private_stream_keepalive_at: None,
+            private_stream_reconnect: PrivateStreamReconnectState::default(),
             public_stream: None,
             public_stream_failed: false,
             public_snapshot_pending: true,
@@ -213,6 +218,7 @@ impl BinanceAccountGateway {
         // A stream is bound to the prior complete signed collection. Never relabel its frames as
         // a newer private generation: the caller must open the replacement stream explicitly.
         self.private_stream = None;
+        self.private_stream_keepalive_at = None;
         Ok(())
     }
 
@@ -224,13 +230,17 @@ impl BinanceAccountGateway {
         &self,
         private_generation: u64,
     ) -> Result<BinanceHttpTransport, BinanceAccountGatewayError> {
-        BinanceHttpTransport::new(
+        let mut transport = BinanceHttpTransport::new(
             self.config.clone(),
             self.rules.instrument.generation,
             private_generation,
             self.transport.recovery_limits(),
         )
-        .map_err(BinanceAccountGatewayError::Transport)
+        .map_err(BinanceAccountGatewayError::Transport)?;
+        transport
+            .inherit_synchronized_clock(&self.transport)
+            .map_err(BinanceAccountGatewayError::Transport)?;
+        Ok(transport)
     }
 
     /// Opens (once) and polls the bounded private execution stream. This method is strictly
@@ -238,37 +248,106 @@ impl BinanceAccountGateway {
     /// the same generation or fabricates a newer signed snapshot.
     pub fn poll_private_fill(
         &mut self,
-    ) -> Result<Option<BinancePrivateFillEvent>, BinanceAccountGatewayError> {
+    ) -> Result<Option<BinancePrivateAccountEvent>, BinanceAccountGatewayError> {
         if self.private_stream.is_none() {
-            let listen_key = self
+            if self.private_stream_reconnect.waiting(Instant::now()) {
+                return Ok(None);
+            }
+            let listen_key = match self
                 .runtime
-                .block_on(self.transport.create_listen_key(&self.credentials))?;
-            let stream = self.runtime.block_on(connect_private_ws(
+                .block_on(self.transport.create_listen_key(&self.credentials))
+            {
+                Ok(listen_key) => listen_key,
+                Err(_) => {
+                    return if self.record_private_stream_failure() {
+                        Err(BinanceAccountGatewayError::PrivateStream)
+                    } else {
+                        Ok(None)
+                    };
+                }
+            };
+            let stream = match self.runtime.block_on(connect_private_ws(
                 &self.config,
                 self.rules.instrument.generation,
                 self.private_generation,
                 listen_key,
                 self.transport.recovery_limits(),
-            ))?;
+            )) {
+                Ok(stream) => stream,
+                Err(_) => {
+                    return if self.record_private_stream_failure() {
+                        Err(BinanceAccountGatewayError::PrivateStream)
+                    } else {
+                        Ok(None)
+                    };
+                }
+            };
             self.private_stream = Some(stream);
+            self.private_stream_keepalive_at =
+                Some(Instant::now() + PRIVATE_STREAM_KEEPALIVE_INTERVAL);
+        }
+        if self
+            .private_stream_keepalive_at
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            let result = match self.private_stream.as_ref() {
+                Some(_) => self
+                    .runtime
+                    .block_on(self.transport.keepalive_listen_key(&self.credentials)),
+                None => Err(BinanceTransportError::Protocol),
+            };
+            if result.is_err() {
+                return if self.record_private_stream_failure() {
+                    Err(BinanceAccountGatewayError::PrivateStream)
+                } else {
+                    Ok(None)
+                };
+            }
+            self.private_stream_keepalive_at =
+                Some(Instant::now() + PRIVATE_STREAM_KEEPALIVE_INTERVAL);
         }
         let result = match self.private_stream.as_mut() {
             Some(stream) => self.runtime.block_on(stream.poll_raw_frame()),
             None => return Err(BinanceAccountGatewayError::PrivateStream),
         };
         match result {
-            Ok(Some(frame)) => normalize_private_stream_fill(
+            Ok(Some(frame)) => match normalize_private_stream_event(
                 frame,
                 self.config.gateway_binding(),
                 self.rules.instrument.generation,
                 self.private_generation,
-            ),
+            ) {
+                Ok(event) => {
+                    self.private_stream_reconnect.record_valid_frame();
+                    Ok(event)
+                }
+                Err(error) => {
+                    if self.record_private_stream_failure() {
+                        Err(error)
+                    } else {
+                        Ok(None)
+                    }
+                }
+            },
             Ok(None) => Ok(None),
-            Err(error) => {
-                self.private_stream = None;
-                Err(BinanceAccountGatewayError::Transport(error))
+            Err(_) => {
+                if self.record_private_stream_failure() {
+                    Err(BinanceAccountGatewayError::PrivateStream)
+                } else {
+                    Ok(None)
+                }
             }
         }
+    }
+
+    fn record_private_stream_failure(&mut self) -> bool {
+        self.private_stream = None;
+        self.private_stream_keepalive_at = None;
+        self.private_stream_reconnect.record_failure(
+            Instant::now(),
+            self.connection_generation,
+            self.private_generation,
+        )
     }
 
     /// Opens exactly one bounded public stream and returns at most one normalized event. A
@@ -471,41 +550,49 @@ impl AccountPhysicalGateway for BinanceAccountGateway {
             // Preserve UNKNOWN in the WAL and let the next signed reconciliation turn retry the
             // read only; this path never reconstructs or re-dispatches the mutation.
             let outcome = match build_exact_order_request(self.private.scope(), client_id) {
-                Ok(exact) => match now_ms().ok().and_then(|timestamp| {
-                    self.runtime
-                        .block_on(
-                            self.transport
-                                .execute_read(&self.credentials, &exact, timestamp),
-                        )
+                Ok(exact) => {
+                    match self
+                        .transport
+                        .signing_timestamp_ms()
                         .ok()
-                }) {
-                    Some(page) => match str::from_utf8(&page.payload).ok().and_then(|payload| {
-                        crate::private::parse_order(payload, &command.mutation_owner().symbol).ok()
-                    }) {
-                        Some(order)
-                            if matches!(
-                                &order.client_order_id,
-                                FieldState::Known(value) if value == client_id
-                            ) && readback_policy_matches_command(command, &order) =>
-                        {
-                            if order.state == OrderState::Rejected {
-                                AccountRecoveryOutcome::rejected(
-                                    command.command_id().clone(),
-                                    "binance_rejected".to_owned(),
-                                )
-                            } else {
-                                AccountRecoveryOutcome::accepted(
-                                    command.command_id().clone(),
-                                    order.order_id,
-                                )
+                        .and_then(|timestamp| {
+                            self.runtime
+                                .block_on(self.transport.execute_read(
+                                    &self.credentials,
+                                    &exact,
+                                    timestamp,
+                                ))
+                                .ok()
+                        }) {
+                        Some(page) => match str::from_utf8(&page.payload).ok().and_then(|payload| {
+                            crate::private::parse_order(payload, &command.mutation_owner().symbol)
+                                .ok()
+                        }) {
+                            Some(order)
+                                if matches!(
+                                    &order.client_order_id,
+                                    FieldState::Known(value) if value == client_id
+                                ) && readback_policy_matches_command(command, &order) =>
+                            {
+                                if order.state == OrderState::Rejected {
+                                    AccountRecoveryOutcome::rejected(
+                                        command.command_id().clone(),
+                                        "binance_rejected".to_owned(),
+                                    )
+                                } else {
+                                    AccountRecoveryOutcome::accepted(
+                                        command.command_id().clone(),
+                                        order.order_id,
+                                    )
+                                }
                             }
-                        }
-                        Some(_) | None => {
-                            AccountRecoveryOutcome::still_unknown(command.command_id().clone())
-                        }
-                    },
-                    None => AccountRecoveryOutcome::still_unknown(command.command_id().clone()),
-                },
+                            Some(_) | None => {
+                                AccountRecoveryOutcome::still_unknown(command.command_id().clone())
+                            }
+                        },
+                        None => AccountRecoveryOutcome::still_unknown(command.command_id().clone()),
+                    }
+                }
                 Err(_) => AccountRecoveryOutcome::still_unknown(command.command_id().clone()),
             };
             outcomes.push(outcome);
@@ -559,6 +646,7 @@ impl AccountPhysicalGateway for BinanceAccountGateway {
         self.transport = transport;
         self.private_generation = next_private_generation;
         self.private_stream = None;
+        self.private_stream_keepalive_at = None;
         Ok(snapshot)
     }
 
@@ -698,7 +786,13 @@ async fn fetch_private(
         let request = request.map_err(|_| BinanceAccountGatewayError::Readback)?;
         pages.push(
             transport
-                .execute_read(credentials, &request, now_ms()?)
+                .execute_read(
+                    credentials,
+                    &request,
+                    transport
+                        .signing_timestamp_ms()
+                        .map_err(BinanceAccountGatewayError::Transport)?,
+                )
                 .await
                 .map_err(BinanceAccountGatewayError::Transport)?,
         );
@@ -713,7 +807,13 @@ async fn fetch_private(
     .map_err(|_| BinanceAccountGatewayError::Readback)?;
     pages.push(
         transport
-            .execute_read(credentials, &fills, now_ms()?)
+            .execute_read(
+                credentials,
+                &fills,
+                transport
+                    .signing_timestamp_ms()
+                    .map_err(BinanceAccountGatewayError::Transport)?,
+            )
             .await
             .map_err(BinanceAccountGatewayError::Transport)?,
     );
@@ -858,37 +958,6 @@ async fn fetch_account_wide_snapshot(
     .map_err(|_| AccountHostValidationError::SignedSnapshot)
 }
 
-fn normalize_private_stream_fill(
-    frame: BinanceRawPrivateFrame,
-    binding: &GatewayBinding,
-    rules_generation: u64,
-    private_generation: u64,
-) -> Result<Option<BinancePrivateFillEvent>, BinanceAccountGatewayError> {
-    if frame.binding != *binding
-        || frame.instrument_generation != rules_generation
-        || frame.private_generation != private_generation
-        || frame.received_at_ms == 0
-    {
-        return Err(BinanceAccountGatewayError::PrivateStream);
-    }
-    let payload =
-        str::from_utf8(&frame.payload).map_err(|_| BinanceAccountGatewayError::PrivateStream)?;
-    let Some(stream) = crate::private::parse_stream_fill(payload, &binding.symbol)
-        .map_err(|_| BinanceAccountGatewayError::PrivateStream)?
-    else {
-        return Ok(None);
-    };
-    if stream.fill.symbol != binding.symbol || stream.fill.fill_id.trim().is_empty() {
-        return Err(BinanceAccountGatewayError::PrivateStream);
-    }
-    Ok(Some(BinancePrivateFillEvent {
-        private_generation: frame.private_generation,
-        received_at_ms: frame.received_at_ms,
-        fill: stream.fill,
-        client_order_id: stream.client_order_id,
-    }))
-}
-
 fn normalize_public_stream_event(
     frame: BinanceRawPublicFrame,
     binding: &GatewayBinding,
@@ -1026,7 +1095,9 @@ async fn signed_snapshot_page(
         .execute_read(
             credentials,
             &request,
-            now_ms().map_err(|_| AccountHostValidationError::SignedSnapshot)?,
+            transport
+                .signing_timestamp_ms()
+                .map_err(|_| AccountHostValidationError::SignedSnapshot)?,
         )
         .await
         .map_err(|_| AccountHostValidationError::SignedSnapshot)
@@ -1258,7 +1329,9 @@ async fn snapshot_fills_cursor(
                 .execute_read(
                     credentials,
                     &request,
-                    now_ms().map_err(|_| AccountHostValidationError::SignedSnapshot)?,
+                    transport
+                        .signing_timestamp_ms()
+                        .map_err(|_| AccountHostValidationError::SignedSnapshot)?,
                 )
                 .await
                 .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
@@ -1427,7 +1500,9 @@ async fn snapshot_unknown_results(
                     .execute_read(
                         credentials,
                         &exact,
-                        now_ms().map_err(|_| AccountHostValidationError::SignedSnapshot)?,
+                        transport
+                            .signing_timestamp_ms()
+                            .map_err(|_| AccountHostValidationError::SignedSnapshot)?,
                     )
                     .await
                 {
@@ -1787,7 +1862,9 @@ async fn signed_page(
         .execute_read(
             credentials,
             &request,
-            now_ms().map_err(|_| AccountHostValidationError::RiskEvidence)?,
+            transport
+                .signing_timestamp_ms()
+                .map_err(|_| AccountHostValidationError::RiskEvidence)?,
         )
         .await
         .map_err(|_| AccountHostValidationError::RiskEvidence)

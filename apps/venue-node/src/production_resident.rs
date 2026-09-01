@@ -22,6 +22,7 @@ mod copy;
 #[cfg_attr(not(feature = "binance"), allow(dead_code))]
 pub(crate) mod grid;
 mod grid_recovery;
+use grid_recovery::SignedGridRecoveryOutcome;
 pub(crate) mod manual;
 pub(crate) mod scalping;
 pub use copy::{ResidentCopyReconciliation, ResidentCopyResult};
@@ -244,6 +245,78 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 venue: self.host.binding().venue,
                 message: error.to_string(),
             })
+    }
+
+    /// Periodic private supervision compares semantics, not a target count. A missing child may
+    /// be retired only by a complete signed snapshot; surviving children still drain through the
+    /// same WAL lane before the venue-specific caller installs one replacement epoch.
+    #[cfg_attr(not(any(feature = "binance", test)), allow(dead_code))]
+    pub(crate) fn supervise_grid_signed_surface_once(
+        &mut self,
+        binding: &StrategyBinding,
+    ) -> Result<bool, NodeError> {
+        let snapshot = self.refresh_signed_snapshot()?;
+        let exact = self
+            .grid_bridges
+            .get(&binding.key)
+            .ok_or(NodeError::ResidentRuntime)?
+            .signed_desired_matches(snapshot.open_orders());
+        if exact {
+            return match self.recover_grid_from_signed_fills(binding, snapshot)? {
+                SignedGridRecoveryOutcome::Converged => Ok(false),
+                SignedGridRecoveryOutcome::UnexplainedSurface => Err(self.grid_recovery_error(
+                    "signed Grid surface was exact before recovery but did not converge",
+                )),
+            };
+        }
+        // A complete stream outage can leave a valid signed fill waiting in the next snapshot.
+        // Preserve the ordinary two-place/one-cancel reducer path before declaring unexplained
+        // drift. If that convergence cannot prove the whole surface, startup reset re-reads the
+        // latest signed facts and drains only its exact owned subset.
+        match self.recover_grid_from_signed_fills(binding, snapshot)? {
+            SignedGridRecoveryOutcome::Converged => return Ok(false),
+            SignedGridRecoveryOutcome::UnexplainedSurface => {}
+        }
+        self.require_grid_reset_wal_safe(binding)?;
+        self.reset_grid_on_startup(binding)?;
+        Ok(true)
+    }
+
+    fn require_grid_reset_wal_safe(&self, binding: &StrategyBinding) -> Result<(), NodeError> {
+        let bridge = self
+            .grid_bridges
+            .get(&binding.key)
+            .ok_or(NodeError::ResidentRuntime)?;
+        let pending_transactions = bridge
+            .pending_transaction_command_ids()
+            .map_err(|_| NodeError::ResidentRuntime)?;
+        let expected = bridge
+            .pending_dispatch_plans()
+            .map_err(|_| NodeError::ResidentRuntime)?
+            .into_iter()
+            .flat_map(|plan| plan.commands)
+            .collect::<Vec<_>>();
+        if expected.iter().any(|command| {
+            self.host
+                .command_snapshot(command.command_id())
+                .is_some_and(|actual| actual != *command)
+        }) {
+            return Err(self.grid_recovery_error(
+                "periodic Grid reset found conflicting pending WAL command bytes",
+            ));
+        }
+        let disposition = classify_pending_grid_wal(&pending_transactions, |command_id| {
+            self.host
+                .command_status(command_id)
+                .map(|status| status.map(|status| status.state().clone()))
+        })
+        .map_err(|error| self.grid_recovery_error(&error.to_string()))?;
+        if disposition == PendingGridWalDisposition::RequiresSignedReconciliation {
+            return Err(self.grid_recovery_error(
+                "periodic Grid reset is fenced by Prepared, Submitted, Accepted, or Unknown WAL",
+            ));
+        }
+        Ok(())
     }
 
     /// Reads the current adapter-validated rules identity through the sole account Host. This
@@ -729,10 +802,7 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
 
     /// A consumed initial-install request may not be retried, but it must leave the registered
     /// actor unable to accept risk when its required signed/public evidence was unavailable.
-    #[cfg_attr(
-        not(any(feature = "binance", feature = "bitget", feature = "gate")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(any(feature = "bitget", feature = "gate")), allow(dead_code))]
     pub(crate) fn fail_grid_bootstrap(
         &mut self,
         binding: &StrategyBinding,
@@ -1280,7 +1350,14 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                     self.pause_grid_after_bootstrap_failure(&binding)?;
                     return Err(NodeError::ResidentRuntime);
                 }
-                self.recover_grid_from_signed_fills(&binding, confirmed)?;
+                if self.recover_grid_from_signed_fills(&binding, confirmed)?
+                    != SignedGridRecoveryOutcome::Converged
+                {
+                    self.pause_grid_after_bootstrap_failure(&binding)?;
+                    return Err(self.grid_recovery_error(
+                        "private Grid fill recovery did not converge from signed facts",
+                    ));
+                }
             }
         }
         Ok(true)
@@ -1483,25 +1560,62 @@ impl ProductionResident<venue_gateway_binance::BinanceAccountGateway> {
     /// Reads at most one bounded Binance private frame, fsyncs its normalized Fill through the
     /// shared account facts journal, then applies the exact routed Grid reducer turn. No raw
     /// payload is retained and this path contains no BBO/REST request.
-    pub fn poll_binance_grid_private_once(&mut self) -> Result<bool, NodeError> {
-        let event = self
+    pub fn poll_binance_grid_private_once(
+        &mut self,
+        binding: &StrategyBinding,
+    ) -> Result<bool, NodeError> {
+        let event = match self
             .host
             .with_gateway_read(|gateway| gateway.poll_private_fill())
-            .map_err(|error| NodeError::LiveHost {
-                venue: self.host.binding().venue,
-                message: error.to_string(),
-            })?;
+        {
+            Ok(event) => event,
+            Err(venue_runtime::account::AccountRuntimeHostError::Gateway(
+                venue_gateway_binance::BinanceAccountGatewayError::PrivateStream
+                | venue_gateway_binance::BinanceAccountGatewayError::Transport(
+                    venue_gateway_binance::BinanceTransportError::Disconnected
+                    | venue_gateway_binance::BinanceTransportError::EndOfStream
+                    | venue_gateway_binance::BinanceTransportError::Timeout
+                    | venue_gateway_binance::BinanceTransportError::Protocol,
+                ),
+            )) => return self.supervise_binance_grid_once(binding).map(|_| true),
+            Err(error) => {
+                return Err(NodeError::LiveHost {
+                    venue: self.host.binding().venue,
+                    message: error.to_string(),
+                });
+            }
+        };
         let Some(event) = event else {
             return Ok(false);
         };
-        self.consume_private_fill(
-            "binance",
-            PrivateFillFact {
-                source_private_generation: event.private_generation,
-                received_at_ms: event.received_at_ms,
-                fill: event.fill,
-            },
-        )
+        match event {
+            venue_gateway_binance::BinancePrivateAccountEvent::Fill(event) => self
+                .consume_private_fill(
+                    "binance",
+                    PrivateFillFact {
+                        source_private_generation: event.private_generation,
+                        received_at_ms: event.received_at_ms,
+                        fill: event.fill,
+                    },
+                ),
+            venue_gateway_binance::BinancePrivateAccountEvent::ReconcileRequired { .. } => {
+                self.supervise_binance_grid_once(binding).map(|_| true)
+            }
+        }
+    }
+
+    /// Compares the complete signed Binance order surface with the reducer's exact desired
+    /// routes. Missed authenticated fills are recovered first; an otherwise unexplained gap is
+    /// drained through WAL-owned cancels and rebuilt once from a fresh BBO and signed inventory.
+    pub fn supervise_binance_grid_once(
+        &mut self,
+        binding: &StrategyBinding,
+    ) -> Result<bool, NodeError> {
+        let reset = self.supervise_grid_signed_surface_once(binding)?;
+        if reset && self.take_grid_bootstrap_request(binding)? {
+            self.bootstrap_binance_grid_once(binding)?;
+        }
+        Ok(reset)
     }
 }
 

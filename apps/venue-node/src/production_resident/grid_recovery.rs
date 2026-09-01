@@ -20,6 +20,12 @@ const MAX_SIGNED_GRID_CATCH_UP_FILLS: usize = 1_000;
 const GRID_STARTUP_RECONCILIATION_STEPS_PER_TARGET: usize = 8;
 const GRID_STARTUP_RECONCILIATION_FIXED_STEPS: usize = 64;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SignedGridRecoveryOutcome {
+    Converged,
+    UnexplainedSurface,
+}
+
 impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
     /// A place-only install persists its semantic routes before the first physical child. If a
     /// process stops mid-batch, bind only exact WAL-Accepted children, discard Absent/Rejected
@@ -464,14 +470,19 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
             .host
             .latest_signed_snapshot()
             .ok_or_else(|| self.grid_recovery_error("signed Grid recovery snapshot is missing"))?;
-        self.recover_grid_from_signed_fills(binding, snapshot)
+        match self.recover_grid_from_signed_fills(binding, snapshot)? {
+            SignedGridRecoveryOutcome::Converged => Ok(()),
+            SignedGridRecoveryOutcome::UnexplainedSurface => Err(self.grid_recovery_error(
+                "managed Grid surface differs, but no WAL-owned signed fill explains it",
+            )),
+        }
     }
 
     pub(super) fn recover_grid_from_signed_fills(
         &mut self,
         binding: &StrategyBinding,
         mut snapshot: SignedAccountSnapshot,
-    ) -> Result<(), NodeError> {
+    ) -> Result<SignedGridRecoveryOutcome, NodeError> {
         let mut applied_fills = 0_usize;
         for _ in 0..MAX_SIGNED_GRID_CATCH_UP_ROUNDS {
             let fills = self.unique_owned_signed_grid_fills(binding, &snapshot)?;
@@ -525,9 +536,7 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
                     .signed_pending_surface_matches(snapshot.open_orders())
                 {
                     if applied_this_round == 0 {
-                        return Err(self.grid_recovery_error(
-                            "managed Grid pending surface differs, but no new WAL-owned signed fill explains it",
-                        ));
+                        return Ok(SignedGridRecoveryOutcome::UnexplainedSurface);
                     }
                     snapshot = self.refresh_signed_snapshot()?;
                     continue;
@@ -558,27 +567,13 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
                             "signed Grid catch-up converged but surface confirmation failed: {error}"
                         ))
                     })?;
-                return Ok(());
+                return Ok(SignedGridRecoveryOutcome::Converged);
             }
             if applied_this_round > 0 {
                 snapshot = self.refresh_signed_snapshot()?;
                 continue;
             }
-            let desired_count = self
-                .grid_bridges
-                .get(&binding.key)
-                .ok_or(NodeError::ResidentRuntime)?
-                .expected_signed_surface()
-                .map_err(|error| {
-                    self.grid_recovery_error(&format!(
-                        "managed Grid desired surface is invalid during catch-up: {error}"
-                    ))
-                })?
-                .len();
-            return Err(self.grid_recovery_error(&format!(
-                "managed Grid surface differs, but no new WAL-owned signed fill explains it: desired_orders={desired_count}, signed_orders={}",
-                snapshot.open_orders().len()
-            )));
+            return Ok(SignedGridRecoveryOutcome::UnexplainedSurface);
         }
         Err(self.grid_recovery_error(
             "signed Grid fill catch-up exceeded its bounded convergence rounds",
@@ -932,7 +927,7 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
         })
     }
 
-    fn grid_recovery_error(&self, message: &str) -> NodeError {
+    pub(super) fn grid_recovery_error(&self, message: &str) -> NodeError {
         grid_recovery_error_for(self.host.binding().venue, message)
     }
 }
