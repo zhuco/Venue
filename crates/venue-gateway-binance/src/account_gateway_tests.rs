@@ -9,6 +9,22 @@ const USDT_ASSET_INDEX: &str = include_str!("../tests/fixtures/asset-index-usdt.
 const USDC_ASSET_INDEX: &str = include_str!("../tests/fixtures/asset-index-usdc.json");
 const LIMIT_BOOK: &[u8] = include_bytes!("../tests/fixtures/limit-book-ticker.json");
 
+#[test]
+fn signed_snapshot_balance_accepts_the_portfolio_account_shape()
+-> Result<(), Box<dyn std::error::Error>> {
+    let balances = snapshot_balances(include_bytes!("../fixtures/portfolio-account.json"))?;
+    assert_eq!(balances.len(), 1);
+    assert_eq!(balances[0].asset.as_str(), "USD");
+    assert_eq!(balances[0].equity, Decimal::new(1000, 0));
+    assert_eq!(balances[0].available_margin, Some(Decimal::new(900, 0)));
+    Ok(())
+}
+
+#[test]
+fn signed_snapshot_balance_rejects_an_asset_array_from_another_account_surface() {
+    assert!(snapshot_balances(br#"{"assets":[]}"#).is_err());
+}
+
 fn limit_fixture() -> Result<
     (
         AccountLimitNormalizationIntent,

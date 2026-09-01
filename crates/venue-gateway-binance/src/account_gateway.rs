@@ -997,17 +997,16 @@ fn snapshot_balances(
 ) -> Result<Vec<SignedAccountBalance>, AccountHostValidationError> {
     let payload =
         str::from_utf8(payload).map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-    crate::private::parse_account(payload)
-        .map_err(|_| AccountHostValidationError::SignedSnapshot)?
-        .into_iter()
-        .map(|balance| {
-            Ok(SignedAccountBalance {
-                asset: balance.asset,
-                equity: balance.wallet_balance,
-                available_margin: Some(balance.available_balance),
-            })
-        })
-        .collect()
+    let balance = crate::portfolio::parse_account_balance(payload)
+        .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+    let usd = Asset::new("USD").map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+    Ok(vec![SignedAccountBalance {
+        // PAPI accountEquity and totalAvailableBalance are portfolio-wide USD values. They must
+        // not be labelled as a stablecoin until a same-generation conversion proves that rate.
+        asset: usd,
+        equity: balance.wallet_balance,
+        available_margin: Some(balance.available_balance),
+    }])
 }
 
 fn account_wide_order_rows_are_complete(
