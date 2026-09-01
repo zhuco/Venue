@@ -300,6 +300,7 @@ Desired Orders，期间的新成交须先消费并重新计算目标集合。`Ru
 - 网格层数来自配置 `grid_count`；
 - 每个层级包含 long-open、long-close、short-open、short-close 四种语义订单，但平仓单可受真实库存限制；
 - closing wave（平仓批次）先于 opening wave（开仓批次）；
+- Binance 初装/重建在 closing wave 完成后、每个 opening 进入物理边界前重新读取不超过 3 秒的同规则 BBO；任一 opening 已穿价、行情过期或规则漂移时，剩余 Prepared opening 必须终态拒绝且不得发送，已接受子集转签名撤净后使用新 epoch 重建；Gate/Bitget 接管前须分别接入同等的原生刷新源；
 - maker（挂单成交）驱动滚动，taker（吃单成交）只进入库存和对账，不伪造成网格动作；
 - 滚动补撤保持固定目标层数；补单会穿价、批次拒绝或订单集合无法证明时，转签名重建。
 

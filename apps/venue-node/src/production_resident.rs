@@ -925,17 +925,31 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
     /// The shared part of the Binance initial-install path. The concrete adapter owns the only
     /// production market read; tests inject the already-normalized bounded facts and still pass
     /// through the account Host, WAL and execution lane below.
-    #[cfg_attr(
-        not(any(feature = "binance", feature = "bitget", feature = "gate")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(any(feature = "bitget", feature = "gate", test)), allow(dead_code))]
     pub(crate) fn bootstrap_grid_from_signed_market(
         &mut self,
         binding: &StrategyBinding,
         snapshot: venue_runtime::SignedAccountSnapshot,
         market: GridBootstrapMarket,
     ) -> Result<(), NodeError> {
-        let result = self.bootstrap_grid_from_signed_market_inner(binding, snapshot, market);
+        self.bootstrap_grid_from_signed_market_with_refresh(binding, snapshot, market, |_| Ok(None))
+    }
+
+    fn bootstrap_grid_from_signed_market_with_refresh(
+        &mut self,
+        binding: &StrategyBinding,
+        snapshot: venue_runtime::SignedAccountSnapshot,
+        market: GridBootstrapMarket,
+        refresh_opening_market: impl FnMut(
+            &mut AccountRuntimeHost<G>,
+        ) -> Result<Option<GridBootstrapMarket>, NodeError>,
+    ) -> Result<(), NodeError> {
+        let result = self.bootstrap_grid_from_signed_market_inner(
+            binding,
+            snapshot,
+            market,
+            refresh_opening_market,
+        );
         if result.is_err() {
             // Registration starts the generic actor so it can own the sole account route, but a
             // Grid without an exactly signed desired surface is never allowed to keep accepting
@@ -954,6 +968,10 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         binding: &StrategyBinding,
         snapshot: venue_runtime::SignedAccountSnapshot,
         market: GridBootstrapMarket,
+        mut refresh_opening_market: impl FnMut(
+            &mut AccountRuntimeHost<G>,
+        )
+            -> Result<Option<GridBootstrapMarket>, NodeError>,
     ) -> Result<(), NodeError> {
         use rust_decimal::Decimal;
         use venue_domain::domain::PositionSide;
@@ -1070,6 +1088,13 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             }) {
                 return Err(NodeError::ResidentRuntime);
             }
+            if !grid_install_commands_are_ordered_and_passive(&plan.commands, &market) {
+                return Err(NodeError::LiveHost {
+                    venue,
+                    message: "Grid bootstrap contains a crossing post-only order or an invalid wave order"
+                        .to_owned(),
+                });
+            }
             let replay = bridge.checkpoint_bytes()?;
             (plan, replay)
         };
@@ -1101,7 +1126,42 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 &error,
             ));
         }
-        for _ in &plan.commands {
+        for command in &plan.commands {
+            if matches!(command, ExecutionCommand::PlaceLimit(order) if !order.reduce_only) {
+                match refresh_opening_market(&mut self.host) {
+                    Ok(Some(opening_market))
+                        if grid_opening_market_matches(
+                            &market,
+                            &opening_market,
+                            unix_now_ms()?,
+                        ) && grid_command_is_passive(command, &opening_market) => {}
+                    Ok(Some(_)) => {
+                        self.host
+                            .reject_prepared_batch(
+                                &mut self.runtime,
+                                "grid_bootstrap_opening_book_crossed",
+                            )
+                            .map_err(|_| NodeError::ResidentRuntime)?;
+                        self.pause_grid_after_bootstrap_failure(binding)?;
+                        return Err(NodeError::LiveHost {
+                            venue,
+                            message: "Grid opening wave became crossing or stale after closing-wave dispatch"
+                                .to_owned(),
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.host
+                            .reject_prepared_batch(
+                                &mut self.runtime,
+                                "grid_bootstrap_opening_book_unavailable",
+                            )
+                            .map_err(|_| NodeError::ResidentRuntime)?;
+                        self.pause_grid_after_bootstrap_failure(binding)?;
+                        return Err(error);
+                    }
+                }
+            }
             if self
                 .runtime
                 .dispatch_next_with_host(&mut self.host)
@@ -1544,6 +1604,50 @@ fn grid_bootstrap_admission_error(
     }
 }
 
+fn grid_install_commands_are_ordered_and_passive(
+    commands: &[ExecutionCommand],
+    market: &GridBootstrapMarket,
+) -> bool {
+    let mut opening_started = false;
+    commands.iter().all(|command| {
+        let ExecutionCommand::PlaceLimit(order) = command else {
+            return false;
+        };
+        if !order.reduce_only {
+            opening_started = true;
+        } else if opening_started {
+            return false;
+        }
+        grid_command_is_passive(command, market)
+    })
+}
+
+fn grid_command_is_passive(command: &ExecutionCommand, market: &GridBootstrapMarket) -> bool {
+    let ExecutionCommand::PlaceLimit(order) = command else {
+        return false;
+    };
+    match order.side {
+        venue_domain::domain::OrderSide::Buy => order.limit_price.value() < market.ask.value(),
+        venue_domain::domain::OrderSide::Sell => order.limit_price.value() > market.bid.value(),
+    }
+}
+
+fn grid_opening_market_matches(
+    planned: &GridBootstrapMarket,
+    refreshed: &GridBootstrapMarket,
+    now_ms: u64,
+) -> bool {
+    refreshed.bid < refreshed.ask
+        && refreshed.price_tick == planned.price_tick
+        && refreshed.quantity_step == planned.quantity_step
+        && refreshed.minimum_quantity == planned.minimum_quantity
+        && refreshed.maximum_quantity == planned.maximum_quantity
+        && refreshed.minimum_notional == planned.minimum_notional
+        && refreshed.observed_at_ms >= planned.observed_at_ms
+        && refreshed.observed_at_ms <= now_ms
+        && now_ms.saturating_sub(refreshed.observed_at_ms) <= 3_000
+}
+
 fn unix_now_ms() -> Result<u64, NodeError> {
     u64::try_from(
         SystemTime::now()
@@ -1582,7 +1686,8 @@ impl ProductionResident<venue_gateway_binance::BinanceAccountGateway> {
                 venue: self.host.binding().venue,
                 message: error.to_string(),
             })?;
-        self.bootstrap_grid_from_signed_market(
+        let venue = self.host.binding().venue;
+        self.bootstrap_grid_from_signed_market_with_refresh(
             binding,
             snapshot,
             GridBootstrapMarket {
@@ -1594,6 +1699,24 @@ impl ProductionResident<venue_gateway_binance::BinanceAccountGateway> {
                 maximum_quantity: market.rules.maximum_quantity,
                 minimum_notional: market.rules.instrument.minimum_notional.value,
                 observed_at_ms: market.observed_at_ms,
+            },
+            move |host| {
+                let market = host
+                    .with_gateway_read(|gateway| gateway.fresh_grid_bootstrap_market())
+                    .map_err(|error| NodeError::LiveHost {
+                        venue,
+                        message: error.to_string(),
+                    })?;
+                Ok(Some(GridBootstrapMarket {
+                    bid: market.bid,
+                    ask: market.ask,
+                    price_tick: market.rules.instrument.price_tick,
+                    quantity_step: market.rules.instrument.quantity_step,
+                    minimum_quantity: market.rules.minimum_quantity,
+                    maximum_quantity: market.rules.maximum_quantity,
+                    minimum_notional: market.rules.instrument.minimum_notional.value,
+                    observed_at_ms: market.observed_at_ms,
+                }))
             },
         )
     }

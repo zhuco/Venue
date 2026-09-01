@@ -305,6 +305,89 @@ fn bootstrap_batch_risk_failure_dispatches_nothing() -> Result<(), Box<dyn std::
 }
 
 #[test]
+fn bootstrap_rechecks_each_opening_after_the_closing_wave_and_never_sends_a_crossing_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let (mut resident, state, binding) = resident(directory.path(), 2)?;
+    {
+        let mut state = state.lock().map_err(|_| "state")?;
+        state.accept_dispatch = true;
+        state.long_quantity = Decimal::new(12, 2);
+        state.short_quantity = Decimal::new(12, 2);
+    }
+    assert!(resident.take_grid_bootstrap_request(&binding)?);
+    let snapshot = resident.refresh_signed_snapshot()?;
+    let initial_market = market()?;
+    let mut moved_market = initial_market.clone();
+    moved_market.bid = Price::new(Decimal::new(997, 1))?;
+    moved_market.ask = Price::new(Decimal::new(998, 1))?;
+    moved_market.observed_at_ms = now()?;
+
+    assert!(
+        resident
+            .bootstrap_grid_from_signed_market_with_refresh(
+                &binding,
+                snapshot,
+                initial_market,
+                move |_| Ok(Some(moved_market.clone())),
+            )
+            .is_err()
+    );
+    let state_guard = state.lock().map_err(|_| "state")?;
+    assert!(state_guard.dispatches > 0);
+    assert!(!state_guard.open_orders.is_empty());
+    assert!(
+        state_guard
+            .open_orders
+            .iter()
+            .all(|order| order.reduce_only)
+    );
+    assert_eq!(
+        resident.strategy_lifecycle(&binding),
+        Some(venue_runtime::account::InstanceLifecycle::Paused)
+    );
+    drop(state_guard);
+    drop(resident);
+
+    state.lock().map_err(|_| "state")?.generation = 0;
+    let second_launch = launch(directory.path())?;
+    let gateway = Gateway {
+        binding: second_launch.binding().clone(),
+        state: state.clone(),
+    };
+    let mut reopened = ProductionResident::open(&second_launch, gateway)?;
+    reopened.register_grid_actor(
+        binding.clone(),
+        initial(2)?,
+        NodeGridRecoveryPolicy::BootstrapWhenAbsent,
+        true,
+    )?;
+    assert!(state.lock().map_err(|_| "state")?.open_orders.is_empty());
+    assert!(reopened.take_grid_bootstrap_request(&binding)?);
+    let snapshot = reopened.refresh_signed_snapshot()?;
+    let stable_market = market()?;
+    let opening_market = stable_market.clone();
+    reopened.bootstrap_grid_from_signed_market_with_refresh(
+        &binding,
+        snapshot,
+        stable_market,
+        move |_| {
+            let mut opening_market = opening_market.clone();
+            opening_market.observed_at_ms = now().map_err(|_| NodeError::ResidentRuntime)?;
+            Ok(Some(opening_market))
+        },
+    )?;
+    assert!(
+        reopened
+            .grid_bridges
+            .get(&binding.key)
+            .ok_or("rebuilt grid")?
+            .signed_desired_matches(&state.lock().map_err(|_| "state")?.open_orders)
+    );
+    Ok(())
+}
+
+#[test]
 fn existing_grid_restart_signs_cancels_empty_and_rebuilds_higher_epoch()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
