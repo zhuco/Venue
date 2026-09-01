@@ -364,13 +364,20 @@ impl AccountRuntime {
 
     fn turn_private_generation(&self, input: &StrategyInput) -> u64 {
         match input {
-            // A persisted private fact is only routed after its generation was fenced by the
-            // account router. The applied checkpoint remains bound to the current runtime
-            // authority generation, so a later signed reconciliation cannot be rolled back by
-            // an older raw-evidence generation.
-            StrategyInput::Private(fact) => self
-                .actor_private_generation()
-                .max(fact.evidence().generation()),
+            // A private fact's evidence generation belongs to the connection/router journal.
+            // Actor authority remains bound to the independently signed private generation;
+            // mixing the two would make a timestamp-like connection generation unrecoverable.
+            StrategyInput::Private(fact) => {
+                let signed_private_generation = self.actor_private_generation();
+                if signed_private_generation == 0 {
+                    // Pre-bootstrap durable recovery has no signed private snapshot yet. Its
+                    // persisted evidence generation is the only nonzero recovery floor; once a
+                    // signed snapshot exists this fallback is never used.
+                    fact.evidence().generation()
+                } else {
+                    signed_private_generation
+                }
+            }
             StrategyInput::Reconciliation(notice) => notice.private_generation,
             StrategyInput::Control(_) | StrategyInput::Market(_) => self.actor_private_generation(),
         }

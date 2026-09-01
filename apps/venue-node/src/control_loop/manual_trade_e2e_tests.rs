@@ -39,6 +39,7 @@ struct GatewayState {
     private_generation: u64,
     dispatches: usize,
     return_unknown: bool,
+    fail_signed_snapshot_after_dispatch: bool,
     accepted_order: Option<OrderCommand>,
 }
 
@@ -88,6 +89,9 @@ impl AccountPhysicalGateway for ManualGateway {
             .state
             .lock()
             .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+        if state.fail_signed_snapshot_after_dispatch && state.dispatches > 0 {
+            return Err(AccountHostValidationError::SignedSnapshot);
+        }
         state.private_generation = state.private_generation.saturating_add(1);
         let private_generation = state.private_generation;
         let open_orders = state
@@ -115,7 +119,7 @@ impl AccountPhysicalGateway for ManualGateway {
         SignedAccountSnapshot::complete(
             self.binding.clone(),
             now_ms().map_err(|_| AccountHostValidationError::SignedSnapshot)?,
-            1,
+            10_000,
             private_generation,
             1,
             SignedAccountPositionMode::Hedge,
@@ -272,6 +276,7 @@ fn initialized_resident(
         private_generation: 0,
         dispatches: 0,
         return_unknown,
+        fail_signed_snapshot_after_dispatch: false,
         accepted_order: None,
     }));
     let strategy = binding()?;
@@ -450,6 +455,11 @@ fn manual_private_fill_is_durably_acknowledged_by_manual_actor()
         },
     )?);
     assert!(std::fs::metadata(journal_path)?.len() > journal_before);
+    // The connection generation is deliberately much larger than the signed private generation.
+    // A subsequent Actor turn must remain bound to the latter and therefore stay writable.
+    resident
+        .apply_control_action(&strategy, ControlAction::Pause)
+        .map_err(|error| io::Error::other(format!("manual pause after fill: {error}")))?;
     Ok(())
 }
 
@@ -467,6 +477,7 @@ fn nonmanual_strategy_kinds_reject_trade_before_checkpoint_or_dispatch()
             private_generation: 0,
             dispatches: 0,
             return_unknown: false,
+            fail_signed_snapshot_after_dispatch: false,
             accepted_order: None,
         }));
         let mut resident = open_resident(&launch, state.clone())?;
@@ -531,6 +542,34 @@ fn manual_unknown_survives_restart_without_redispatch() -> Result<(), Box<dyn st
             &strategy,
             &actor_turn(root.path(), "unknown-after-restart")?
         )?,
+        crate::production_resident::manual::ManualTradeOutcome::Unknown { .. }
+    ));
+    assert_eq!(
+        state
+            .lock()
+            .map_err(|_| "gateway mutex poisoned")?
+            .dispatches,
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn accepted_manual_trade_with_failed_signed_readback_is_unknown_and_never_redispatched()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let (mut resident, state, strategy, _launch) = initialized_resident(root.path(), false)?;
+    state
+        .lock()
+        .map_err(|_| "gateway mutex poisoned")?
+        .fail_signed_snapshot_after_dispatch = true;
+
+    assert!(matches!(
+        resident.apply_manual_trade(&strategy, &actor_turn(root.path(), "readback-fails")?)?,
+        crate::production_resident::manual::ManualTradeOutcome::Unknown { .. }
+    ));
+    assert!(matches!(
+        resident.apply_manual_trade(&strategy, &actor_turn(root.path(), "readback-redelivery")?)?,
         crate::production_resident::manual::ManualTradeOutcome::Unknown { .. }
     ));
     assert_eq!(

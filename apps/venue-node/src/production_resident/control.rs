@@ -134,7 +134,7 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         command_id: &CommandId,
     ) -> Result<Option<CommandState>, NodeError> {
         self.host
-            .reconcile_command_status(command_id)
+            .reconcile_runtime_command_status(&mut self.runtime, command_id)
             .map(|status| status.map(|status| status.state().clone()))
             .map_err(|error| NodeError::LiveHost {
                 venue: self.host.binding().venue,

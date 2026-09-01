@@ -1146,6 +1146,14 @@ mod live_mode_compatibility_tests {
     fn live_physical_recovery_scope_tag_remains_two() {
         assert_eq!(mode_tag(GatewayMode::Live), 2);
     }
+
+    #[test]
+    fn strategy_kind_tags_preserve_pre_manual_artifacts() {
+        assert_eq!(strategy_kind_tag(StrategyKind::HedgedGrid), 1);
+        assert_eq!(strategy_kind_tag(StrategyKind::Scalping), 2);
+        assert_eq!(strategy_kind_tag(StrategyKind::Copy), 3);
+        assert_eq!(strategy_kind_tag(StrategyKind::Manual), 4);
+    }
 }
 
 fn nonzero_digest(value: &[u8; 32]) -> bool {

@@ -168,6 +168,60 @@ impl GridBridgeState {
         Ok(bytes)
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_test_accepted_open_route(
+        &mut self,
+        chosen_venue_order_id: &str,
+    ) -> Result<ExecutionCommand, NodeError> {
+        let plan = self
+            .install_initial_epoch(
+                GridInventory {
+                    private_generation: 1,
+                    private_observed_at_ms: 1,
+                    mark_price: venue_domain::Price::new(rust_decimal::Decimal::new(100, 0))
+                        .map_err(|_| NodeError::ResidentRuntime)?,
+                    long_quantity: rust_decimal::Decimal::ONE,
+                    short_quantity: rust_decimal::Decimal::ONE,
+                },
+                GridEpoch {
+                    epoch: 1,
+                    anchor_price: venue_domain::Price::new(rust_decimal::Decimal::new(100, 0))
+                        .map_err(|_| NodeError::ResidentRuntime)?,
+                    step: venue_domain::Price::new(rust_decimal::Decimal::ONE)
+                        .map_err(|_| NodeError::ResidentRuntime)?,
+                    grid_quantity: rust_decimal::Decimal::new(5, 2),
+                    passive_book_fallback: None,
+                },
+            )
+            .map_err(|_| NodeError::ResidentRuntime)?;
+        let chosen = plan
+            .commands
+            .iter()
+            .find(|command| {
+                matches!(command, ExecutionCommand::PlaceLimit(order) if !order.reduce_only)
+            })
+            .cloned()
+            .ok_or(NodeError::ResidentRuntime)?;
+        let accepted = plan
+            .accepted_routes
+            .iter()
+            .enumerate()
+            .map(|(index, (_, _, command_id))| {
+                (
+                    command_id.clone(),
+                    if command_id == chosen.command_id() {
+                        chosen_venue_order_id.to_owned()
+                    } else {
+                        format!("unused-test-native-{index}")
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        self.bind_accepted_plan(&plan, &accepted)
+            .map_err(|_| NodeError::ResidentRuntime)?;
+        Ok(chosen)
+    }
+
     /// Signed convergence is based on the reducer's current desired set, never on an order count.
     /// Retired routes are deliberately ignored: a completed rolling cancellation is historical,
     /// while every current desired key must retain its exact client/native/order-shape triad.

@@ -184,8 +184,12 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         previous_fills: &[Fill],
     ) -> Result<ResidentCopyReconciliation, CopySemanticError> {
         delivery.bind_recovery_actor(binding)?;
-        let result =
-            delivery.reconcile_execution_command(&mut self.host, request, previous_fills)?;
+        let result = delivery.reconcile_execution_command(
+            &mut self.host,
+            &mut self.runtime,
+            request,
+            previous_fills,
+        )?;
         Ok(ResidentCopyReconciliation {
             execution: result.execution,
             position: result.position,

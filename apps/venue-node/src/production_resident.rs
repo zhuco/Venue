@@ -859,7 +859,9 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 let DomainEvent::Fill(fill) = fact.record().event.clone() else {
                     return Err(NodeError::ResidentRuntime);
                 };
-                let private_generation = fact.record().header.generation;
+                // The persisted fact header carries the router connection generation. Grid's
+                // reducer cursor is the separately signed private generation validated above.
+                let private_generation = active_private_generation;
                 let bridge = self
                     .grid_bridges
                     .get_mut(&delivery.target)
@@ -1273,7 +1275,7 @@ mod bootstrap_tests {
     };
 
     use rust_decimal::Decimal;
-    use venue_domain::domain::{Asset, PositionSide};
+    use venue_domain::domain::{Asset, FieldState, Fill, PositionSide};
     use venue_gateway_api::{GatewayBinding, VenueId};
     use venue_runtime::{
         AccountDispatchPermit, AccountGatewayResult, AccountHostValidationError,
@@ -1292,6 +1294,7 @@ mod bootstrap_tests {
     struct State {
         generation: u64,
         dispatches: usize,
+        accept_dispatch: bool,
     }
 
     struct Gateway {
@@ -1354,7 +1357,7 @@ mod bootstrap_tests {
             SignedAccountSnapshot::complete(
                 self.binding.clone(),
                 now,
-                1,
+                10_000,
                 generation,
                 1,
                 SignedAccountPositionMode::Hedge,
@@ -1392,7 +1395,11 @@ mod bootstrap_tests {
                 return AccountGatewayResult::Unknown;
             };
             state.dispatches = state.dispatches.saturating_add(1);
-            AccountGatewayResult::Unknown
+            if !state.accept_dispatch {
+                return AccountGatewayResult::Unknown;
+            }
+            let venue_order_id = format!("grid-native-{}", state.dispatches);
+            AccountGatewayResult::Accepted { venue_order_id }
         }
     }
 
@@ -1481,6 +1488,7 @@ mod bootstrap_tests {
         let state = Arc::new(Mutex::new(State {
             generation: 0,
             dispatches: 0,
+            accept_dispatch: false,
         }));
         let gateway = Gateway {
             binding: launch.binding().clone(),
@@ -1511,6 +1519,82 @@ mod bootstrap_tests {
         assert_eq!(
             resident.strategy_lifecycle(&binding),
             Some(venue_runtime::account::InstanceLifecycle::Paused)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shared_grid_private_fill_uses_signed_private_generation_not_connection_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let (mut resident, state, binding) = resident(directory.path(), 1)?;
+        state.lock().map_err(|_| "state")?.accept_dispatch = true;
+        let (command, replay) = {
+            let bridge = resident
+                .grid_bridges
+                .get_mut(&binding.key)
+                .ok_or("grid bridge")?;
+            let command = bridge.install_test_accepted_open_route("grid-native-1")?;
+            (command, bridge.checkpoint_bytes()?)
+        };
+        let applied = resident
+            .runtime
+            .persist_resident_semantic_turn(&binding, replay)?;
+        persist_anchor(&resident.artifacts_root, &binding, &applied)?;
+        resident.host.prepare_and_admit_operator(
+            &mut resident.runtime,
+            &binding,
+            &applied,
+            venue_runtime::account::AccountLanePriority::Normal,
+            command.clone(),
+        )?;
+        resident
+            .runtime
+            .dispatch_next_with_host(&mut resident.host)?;
+        let ExecutionCommand::PlaceLimit(signed_order) = command else {
+            return Err("test route is not a limit order".into());
+        };
+        let source_private_generation = resident.runtime().active_private_generation();
+        assert!(resident.runtime().connection_generation() > source_private_generation);
+        assert!(
+            resident
+                .consume_private_fill(
+                    "bybit",
+                    PrivateFillFact {
+                        source_private_generation,
+                        received_at_ms: now()?,
+                        fill: Fill {
+                            fill_id: "grid-private-generation".to_owned(),
+                            execution_sequence: FieldState::Known(1),
+                            order_id: "grid-native-1".to_owned(),
+                            symbol: signed_order.owner.symbol,
+                            side: signed_order.side,
+                            position_side: FieldState::Known(signed_order.position_side),
+                            quantity: signed_order.quantity,
+                            price: signed_order.limit_price,
+                            fee: FieldState::Missing,
+                            realized_pnl: FieldState::Missing,
+                            maker: FieldState::Known(false),
+                            exchange_time_ms: Some(now()?),
+                        },
+                    },
+                )
+                .map_err(|error| io::Error::other(format!("private fill: {error}")))?
+        );
+        let observed = resident
+            .grid_bridges
+            .get(&binding.key)
+            .and_then(|bridge| {
+                bridge
+                    .grid
+                    .owned_fill_records
+                    .get("grid-private-generation")
+            })
+            .ok_or("grid fill record")?;
+        assert_eq!(observed.private_generation, source_private_generation);
+        assert_ne!(
+            observed.private_generation,
+            resident.runtime().connection_generation()
         );
         Ok(())
     }

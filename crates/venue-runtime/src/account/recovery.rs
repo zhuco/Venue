@@ -924,17 +924,18 @@ fn commit_strategy_binding(digest: &mut Sha256, binding: &StrategyBinding) {
 
 fn commit_strategy_key(digest: &mut Sha256, key: &StrategyInstanceKey) {
     commit_account_key(digest, &key.account);
-    commit_bytes(
-        digest,
-        &[match key.strategy_kind {
-            crate::domain::StrategyKind::HedgedGrid => 1,
-            crate::domain::StrategyKind::Scalping => 2,
-            crate::domain::StrategyKind::Copy => 3,
-            crate::domain::StrategyKind::Manual => 4,
-        }],
-    );
+    commit_bytes(digest, &[strategy_kind_tag(key.strategy_kind)]);
     commit_str(digest, &key.instance_id);
     commit_str(digest, &key.symbol.to_string());
+}
+
+const fn strategy_kind_tag(kind: crate::domain::StrategyKind) -> u8 {
+    match kind {
+        crate::domain::StrategyKind::HedgedGrid => 1,
+        crate::domain::StrategyKind::Scalping => 2,
+        crate::domain::StrategyKind::Copy => 3,
+        crate::domain::StrategyKind::Manual => 4,
+    }
 }
 
 fn commit_account_key(digest: &mut Sha256, account: &AccountKey) {
@@ -1015,5 +1016,16 @@ mod live_mode_compatibility_tests {
     #[test]
     fn live_recovery_commitment_tag_remains_two() {
         assert_eq!(gateway_mode_tag(GatewayMode::Live), 2);
+    }
+
+    #[test]
+    fn strategy_kind_tags_preserve_pre_manual_recovery_commitments() {
+        assert_eq!(
+            strategy_kind_tag(crate::domain::StrategyKind::HedgedGrid),
+            1
+        );
+        assert_eq!(strategy_kind_tag(crate::domain::StrategyKind::Scalping), 2);
+        assert_eq!(strategy_kind_tag(crate::domain::StrategyKind::Copy), 3);
+        assert_eq!(strategy_kind_tag(crate::domain::StrategyKind::Manual), 4);
     }
 }

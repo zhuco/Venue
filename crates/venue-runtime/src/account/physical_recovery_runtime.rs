@@ -714,6 +714,19 @@ const fn strategy_kind_tag(kind: crate::StrategyKind) -> u8 {
     }
 }
 
+#[cfg(test)]
+mod strategy_kind_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn strategy_kind_tags_preserve_pre_manual_authority_roots() {
+        assert_eq!(strategy_kind_tag(crate::StrategyKind::HedgedGrid), 1);
+        assert_eq!(strategy_kind_tag(crate::StrategyKind::Scalping), 2);
+        assert_eq!(strategy_kind_tag(crate::StrategyKind::Copy), 3);
+        assert_eq!(strategy_kind_tag(crate::StrategyKind::Manual), 4);
+    }
+}
+
 fn commit_turn_token(digest: &mut Sha256, token: &crate::StrategyTurnToken) {
     commit_strategy_key(digest, token.target());
     commit_u64(digest, token.connection_generation());

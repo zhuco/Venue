@@ -231,13 +231,65 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
             .map_err(AccountRuntimeHostError::Runtime)
     }
 
-    pub fn reconcile_command_status(
+    /// Reconciles one durable command and immediately mirrors the resulting Host WAL head and
+    /// every exact registered Accepted route into Runtime. This path is read-only at the venue:
+    /// an Unknown may converge, but the command is never dispatched again.
+    pub fn reconcile_runtime_command_status(
         &mut self,
+        runtime: &mut AccountRuntime,
         command_id: &venue_domain::domain::CommandId,
     ) -> Result<Option<AccountCommandStatus>, AccountRuntimeHostError<G::Error>> {
+        if runtime.account() != &self.account {
+            return Err(AccountRuntimeHostError::Scope);
+        }
+        let current = self
+            .host
+            .command_status(command_id)
+            .map_err(AccountRuntimeHostError::Host)?;
+        if current.as_ref().is_some_and(|status| {
+            matches!(
+                status.state(),
+                venue_execution::CommandState::Submitted
+                    | venue_execution::CommandState::Unknown { .. }
+            )
+        }) {
+            // The Runtime-aware durable refresh asks for every unresolved identity, settles only
+            // signed outcomes, installs the new private generation/risk fence and hydrates routes.
+            // It never dispatches, so an Unknown cannot become a retry.
+            self.refresh_runtime_signed_snapshot(runtime)?;
+        } else {
+            self.sync_runtime_wal_and_registered_routes(runtime)?;
+        }
         self.host
-            .reconcile_command_status(command_id)
+            .command_status(command_id)
             .map_err(AccountRuntimeHostError::Host)
+    }
+
+    fn sync_runtime_wal_and_registered_routes(
+        &self,
+        runtime: &mut AccountRuntime,
+    ) -> Result<(), AccountRuntimeHostError<G::Error>> {
+        runtime
+            .advance_resident_wal_head(
+                self.host
+                    .runtime_wal_head()
+                    .map_err(AccountRuntimeHostError::Host)?,
+            )
+            .map_err(AccountRuntimeHostError::Runtime)?;
+        let routes = self
+            .host
+            .accepted_order_routes()
+            .into_iter()
+            .filter(|route| {
+                runtime
+                    .registry
+                    .active_bindings()
+                    .any(|binding| binding.matches_owner(&route.owner))
+            })
+            .collect();
+        runtime
+            .hydrate_host_wal_routes(routes)
+            .map_err(AccountRuntimeHostError::Runtime)
     }
 
     /// Collects and fsyncs a complete signed adapter snapshot through the sole Host, then makes
@@ -311,14 +363,11 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
             // The rejection records are part of the same Host WAL but were appended after the
             // signed snapshot receipt.  Advance through this Host-only path so later actor
             // receipts cannot bind an obsolete pre-rejection head.
-            runtime
-                .advance_resident_wal_head(
-                    self.host
-                        .runtime_wal_head()
-                        .map_err(AccountRuntimeHostError::Host)?,
-                )
-                .map_err(AccountRuntimeHostError::Runtime)?;
         }
+        // durable_runtime_refresh may have settled Unknown -> Accepted. Rebuild the exact
+        // registered route before any subsequent private fill or Actor receipt can be handled.
+        // This also advances through any Prepared rejection appended just above.
+        self.sync_runtime_wal_and_registered_routes(runtime)?;
         Ok(snapshot)
     }
 
@@ -649,8 +698,8 @@ mod tests {
     use rust_decimal::Decimal;
     use tempfile::TempDir;
     use venue_domain::domain::{
-        CommandId, ExecutionCommand, NativeOrderFamily, OrderCommand, OrderOwner, OrderPurpose,
-        OrderSide, PositionSide, Price,
+        CommandId, DomainEvent, EventId, ExecutionCommand, FieldState, Fill, NativeOrderFamily,
+        OrderCommand, OrderOwner, OrderPurpose, OrderSide, PositionSide, Price,
     };
     use venue_execution::{
         AccountGatewayResult, AccountHostValidationError, AccountRecoveryOutcome,
@@ -661,6 +710,7 @@ mod tests {
     use venue_gateway_api::{GatewayMode, VenueId};
 
     use super::*;
+    use crate::account::AccountPrivateFactInput;
     use crate::{ExchangeId, StrategyBinding, StrategyInstanceKey, StrategyKind};
 
     const ACCOUNT: &str = "00000000-0000-4000-8000-000000000001";
@@ -1200,6 +1250,85 @@ mod tests {
         // UNKNOWN fence but it still correctly prevents another entry until reconciliation.
         assert!(runtime.production_new_risk_fenced());
         assert_eq!(state.lock().map_err(|_| "lock")?.dispatches, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_to_accepted_syncs_wal_and_routes_fill_without_redispatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let binding = binding()?;
+        let (gateway, state) = gateway(binding.clone(), Decimal::ZERO, false, true);
+        let mut host = AccountRuntimeHost::open(root(&temp), binding.clone(), gateway)?;
+        let command = command()?;
+        let command_id = command.command_id().clone();
+        let owner = command.mutation_owner().clone();
+        let prepared = host.host.prepare_for_lane(command)?;
+        assert!(matches!(
+            host.host.dispatch_prepared(prepared)?,
+            AccountDispatchOutcome::Unknown
+        ));
+
+        let account = AccountKey::new(ExchangeId::Okx, ACCOUNT)?;
+        let strategy = StrategyBinding::new(
+            StrategyInstanceKey::new(
+                account.clone(),
+                StrategyKind::Copy,
+                owner.strategy_instance_id.clone(),
+                owner.symbol.clone(),
+            )?,
+            owner.run_id.clone(),
+            "unknown-route-config",
+        )?;
+        let mut runtime = AccountRuntime::new(account);
+        runtime.register_strategy(strategy.clone())?;
+        host.bootstrap_runtime(&mut runtime)?;
+        runtime.attach_private_ingress(temp.path().join("unknown-route-private-facts.jsonl"))?;
+        let wal_before = runtime.actor_applied_wal_head.ok_or("missing WAL head")?;
+
+        let mut gateway_state = state.lock().map_err(|_| "lock")?;
+        gateway_state.resolve_unknown_on_snapshot = true;
+        gateway_state.private_generation = 2;
+        drop(gateway_state);
+        let status = host
+            .reconcile_runtime_command_status(&mut runtime, &command_id)?
+            .ok_or("missing reconciled status")?;
+        assert!(matches!(
+            status.state(),
+            venue_execution::CommandState::Accepted { venue_order_id }
+                if venue_order_id == "resolved-order"
+        ));
+
+        let wal_after = runtime.actor_applied_wal_head.ok_or("missing WAL head")?;
+        assert!(wal_after.tail_sequence() > wal_before.tail_sequence());
+        assert_eq!(state.lock().map_err(|_| "lock")?.dispatches, 1);
+        let connection_generation = runtime.connection_generation();
+        let report = runtime.ingest_private(AccountPrivateFactInput::new(
+            EventId::new("unknown-accepted-fill")?,
+            connection_generation,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis()
+                .try_into()?,
+            Some(NativeOrderFamily::UmOrder),
+            DomainEvent::Fill(Fill {
+                fill_id: "unknown-accepted-fill".to_owned(),
+                execution_sequence: FieldState::Known(1),
+                order_id: "resolved-order".to_owned(),
+                symbol: owner.symbol,
+                side: OrderSide::Buy,
+                position_side: FieldState::Known(PositionSide::Long),
+                quantity: Decimal::ONE,
+                price: Price::new(Decimal::ONE)?,
+                fee: FieldState::Missing,
+                realized_pnl: FieldState::Missing,
+                maker: FieldState::Known(true),
+                exchange_time_ms: None,
+            }),
+        )?)?;
+        assert_eq!(report.deliveries.len(), 1);
+        assert_eq!(report.deliveries[0].target, strategy.key);
+        assert!(report.reconcile.is_none());
         Ok(())
     }
 

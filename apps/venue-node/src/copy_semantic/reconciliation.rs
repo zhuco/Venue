@@ -8,7 +8,8 @@ use venue_copy::{
 };
 use venue_domain::domain::{ExecutionCommand, FieldState, Fill, NativeOrderFamily, PositionSide};
 use venue_runtime::{
-    AccountPhysicalGateway, CommandState, SignedAccountSnapshot, account::AccountRuntimeHost,
+    AccountPhysicalGateway, CommandState, SignedAccountSnapshot,
+    account::{AccountRuntime, AccountRuntimeHost},
 };
 
 use super::{CopyCommandIds, CopySemanticDelivery, CopySemanticError, same_copy_owner};
@@ -26,6 +27,7 @@ impl CopySemanticDelivery {
     pub(crate) fn reconcile_execution_command<G: AccountPhysicalGateway>(
         &self,
         host: &mut AccountRuntimeHost<G>,
+        runtime: &mut AccountRuntime,
         request: &CopyExecutionRequest,
         previous_fills: &[Fill],
     ) -> Result<CopyReconciliation, CopySemanticError> {
@@ -44,7 +46,7 @@ impl CopySemanticDelivery {
             return Err(CopySemanticError::ExecutionCommand);
         }
         let status = host
-            .reconcile_command_status(&ids.command_id)
+            .reconcile_runtime_command_status(runtime, &ids.command_id)
             .map_err(|_| CopySemanticError::RuntimeUnavailable)?
             .ok_or(CopySemanticError::RuntimeUnavailable)?;
         let snapshot = host

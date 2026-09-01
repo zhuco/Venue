@@ -362,14 +362,16 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         let mut rejected = Vec::new();
         let mut pending = false;
         for command in &plan.commands {
-            let status = self
-                .host
-                .command_status(command.command_id())
-                .map_err(|error| NodeError::LiveHost {
-                    venue: self.host.binding().venue,
-                    message: error.to_string(),
-                })?
-                .ok_or(NodeError::ResidentRuntime)?;
+            let status = match self.host.command_status(command.command_id()) {
+                Ok(Some(status)) => status,
+                Ok(None) | Err(_) => {
+                    return Ok(ManualTradeOutcome::Unknown {
+                        applied,
+                        detail: "manual trade crossed a durable boundary but its WAL status could not be confirmed"
+                            .to_owned(),
+                    });
+                }
+            };
             match status.state() {
                 venue_runtime::CommandState::Accepted { venue_order_id } => {
                     accepted.insert(command.command_id().clone(), venue_order_id.clone());
@@ -391,23 +393,36 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 detail: "manual trade batch is durably pending signed reconciliation".to_owned(),
             });
         }
-        if !rejected.is_empty() {
-            return Ok(ManualTradeOutcome::Rejected {
-                applied,
-                detail: format!("manual trade command was rejected: {}", rejected.join("; ")),
-            });
+        match classify_manual_terminal_batch(&accepted, &rejected) {
+            ManualTerminalBatchClassification::Unknown(detail) => {
+                return Ok(ManualTradeOutcome::Unknown { applied, detail });
+            }
+            ManualTerminalBatchClassification::Rejected(detail) => {
+                return Ok(ManualTradeOutcome::Rejected { applied, detail });
+            }
+            ManualTerminalBatchClassification::ReadyForSignedReadback => {}
         }
-        let commands = plan
-            .commands
-            .iter()
-            .map(|planned| {
-                self.host
-                    .command_snapshot(planned.command_id())
-                    .map(|command| (planned.command_id().clone(), command))
-                    .ok_or(NodeError::ResidentRuntime)
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let snapshot = self.refresh_signed_snapshot()?;
+        let mut commands = BTreeMap::new();
+        for planned in &plan.commands {
+            let Some(command) = self.host.command_snapshot(planned.command_id()) else {
+                return Ok(ManualTradeOutcome::Unknown {
+                    applied,
+                    detail: "manual trade crossed a durable boundary but its WAL command snapshot is unavailable"
+                        .to_owned(),
+                });
+            };
+            commands.insert(planned.command_id().clone(), command);
+        }
+        let snapshot = match self.refresh_signed_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                return Ok(ManualTradeOutcome::Unknown {
+                    applied,
+                    detail: "manual trade is durable but fresh signed readback is unavailable"
+                        .to_owned(),
+                });
+            }
+        };
         if !signed_plan_matches(&plan.commands, &commands, &accepted, &snapshot) {
             return Ok(ManualTradeOutcome::Unknown {
                 applied,
@@ -444,7 +459,7 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         for planned in &plan.commands {
             let status = self
                 .host
-                .reconcile_command_status(planned.command_id())
+                .reconcile_runtime_command_status(&mut self.runtime, planned.command_id())
                 .map_err(|error| NodeError::LiveHost {
                     venue: self.host.binding().venue,
                     message: error.to_string(),
@@ -809,6 +824,32 @@ fn signed_plan_matches(
     })
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum ManualTerminalBatchClassification {
+    ReadyForSignedReadback,
+    Rejected(String),
+    Unknown(String),
+}
+
+fn classify_manual_terminal_batch(
+    accepted: &BTreeMap<CommandId, String>,
+    rejected: &[String],
+) -> ManualTerminalBatchClassification {
+    if rejected.is_empty() {
+        return ManualTerminalBatchClassification::ReadyForSignedReadback;
+    }
+    if accepted.is_empty() {
+        return ManualTerminalBatchClassification::Rejected(format!(
+            "manual trade command was rejected: {}",
+            rejected.join("; ")
+        ));
+    }
+    ManualTerminalBatchClassification::Unknown(format!(
+        "manual trade batch was only partially accepted; reconciliation is required: {}",
+        rejected.join("; ")
+    ))
+}
+
 /// Canary success requires the account-WAL acceptance and a newer complete signed account fact.
 /// A full fill is accepted only when exact fills and the addressed position delta cover it.
 pub(crate) fn signed_operator_canary_matches(
@@ -1119,6 +1160,29 @@ mod tests {
     use super::*;
 
     const ACCOUNT: &str = "00000000-0000-4000-8000-000000000001";
+
+    #[test]
+    fn multi_command_partial_acceptance_requires_unknown_reconciliation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let accepted = BTreeMap::from([(
+            CommandId::new("manual-batch-accepted")?,
+            "venue-order-accepted".to_owned(),
+        )]);
+        let rejected = vec!["second command rejected".to_owned()];
+        assert!(matches!(
+            classify_manual_terminal_batch(&accepted, &rejected),
+            ManualTerminalBatchClassification::Unknown(_)
+        ));
+        assert_eq!(
+            classify_manual_terminal_batch(&accepted, &[]),
+            ManualTerminalBatchClassification::ReadyForSignedReadback
+        );
+        assert!(matches!(
+            classify_manual_terminal_batch(&BTreeMap::new(), &rejected),
+            ManualTerminalBatchClassification::Rejected(_)
+        ));
+        Ok(())
+    }
 
     fn binding() -> Result<GatewayBinding, Box<dyn std::error::Error>> {
         Ok(GatewayBinding::new(
