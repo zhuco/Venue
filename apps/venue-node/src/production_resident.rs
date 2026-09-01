@@ -871,7 +871,9 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             private_observed_at_ms: snapshot.observed_at_ms(),
             mark_price: mark,
             long_quantity: long.quantity,
-            short_quantity: short.quantity,
+            // Binance reports the Hedge short leg as a signed negative quantity; Grid inventory
+            // is per-leg capacity and is therefore always stored as an absolute quantity.
+            short_quantity: short.quantity.abs(),
         };
         let signed_surface = self
             .grid_bridges
@@ -880,7 +882,10 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             .expected_signed_surface()?;
         self.host
             .confirm_managed_grid_surface(&mut self.runtime, binding, signed_surface.clone())
-            .map_err(|_| NodeError::ResidentRuntime)?;
+            .map_err(|error| NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: format!("Grid signed-empty-surface admission rejected: {error}"),
+            })?;
         let (plan, replay) = {
             let bridge = self
                 .grid_bridges

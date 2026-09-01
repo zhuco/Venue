@@ -67,6 +67,10 @@ pub(crate) struct GridBridgeState {
     /// first epoch and receives one separately durable, signed-empty-surface rebuild attempt.
     #[serde(default)]
     reset_rebuild_attempted: bool,
+    /// Versioned only to let a checkpoint that failed before the physical boundary under an older
+    /// validation implementation take one explicitly confirmed repair retry.
+    #[serde(default)]
+    reset_rebuild_attempt_version: u16,
     #[serde(with = "grid_routes")]
     routes: BTreeMap<GridOrderKey, GridOrderRoute>,
     #[serde(default)]
@@ -136,6 +140,7 @@ impl GridBridgeState {
             grid,
             bootstrap_state: GridBootstrapState::Eligible,
             reset_rebuild_attempted: false,
+            reset_rebuild_attempt_version: 0,
             routes: BTreeMap::new(),
             partial_fills: BTreeMap::new(),
         };
@@ -203,7 +208,7 @@ impl GridBridgeState {
 
     pub(crate) fn needs_reset_rebuild(&self) -> bool {
         self.bootstrap_state == GridBootstrapState::Attempted
-            && !self.reset_rebuild_attempted
+            && (!self.reset_rebuild_attempted || self.reset_rebuild_attempt_version < 2)
             && self.grid.phase == venue_strategies::hedged_grid::GridPhase::ResettingGrid
             && self.grid.epoch.is_none()
             && self.grid.inventory.is_none()
@@ -279,6 +284,7 @@ impl GridBridgeState {
             return Err(GridBridgeError::BootstrapState);
         }
         self.reset_rebuild_attempted = true;
+        self.reset_rebuild_attempt_version = 2;
         self.validate()
     }
 

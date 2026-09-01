@@ -306,7 +306,8 @@ Desired Orders，期间的新成交须先消费并重新计算目标集合。`Ru
 
 已完成的 `ResettingGrid` 若持久化为签名空面，只有操作者在该次 `run` 显式提供与交易所精确一致的
 `--confirm-reset-rebuild` 才能获得一次新的安装尝试；该标记先随 Actor Applied 持久化，普通启动、
-`Attempted`、`Rejected` 或 `Unknown` 不得借此重试。
+`Attempted`、`Rejected` 或 `Unknown` 不得借此重试。仅当旧实现的 checkpoint 已证明在任何
+`Prepared` 前被本地验证拒绝时，版本化迁移可在同一显式确认下给一次修复重试；已跨越 WAL 的状态不适用。
 
 ### 6.3 库存恢复后的下一成交重心
 
