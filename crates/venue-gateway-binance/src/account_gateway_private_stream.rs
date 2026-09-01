@@ -49,6 +49,14 @@ impl PrivateStreamReconnectState {
         self.outage_reported = false;
     }
 
+    /// A completed websocket handshake establishes a new loss boundary. Keep the accumulated
+    /// failure count until one valid account frame arrives, but require a newly established
+    /// socket loss to trigger its own signed reconciliation edge.
+    pub(super) fn record_connected(&mut self) {
+        self.retry_at = None;
+        self.outage_reported = false;
+    }
+
     #[cfg(test)]
     pub(super) fn retry_deadline(&self) -> Option<Instant> {
         self.retry_at
@@ -73,6 +81,9 @@ pub(super) fn private_stream_reconnect_delay(
 /// adapter; the account runtime still persists the resulting domain fact before strategy use.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BinancePrivateFillEvent {
+    /// Process-local generation of the authenticated socket that carried the raw frame.
+    pub stream_private_generation: u64,
+    /// Latest complete signed account generation under which the adapter admitted the frame.
     pub private_generation: u64,
     pub received_at_ms: u64,
     pub fill: Fill,
@@ -83,6 +94,7 @@ pub struct BinancePrivateFillEvent {
 pub enum BinancePrivateAccountEvent {
     Fill(BinancePrivateFillEvent),
     ReconcileRequired {
+        stream_private_generation: u64,
         private_generation: u64,
         received_at_ms: u64,
     },
@@ -92,11 +104,14 @@ pub(super) fn normalize_private_stream_event(
     frame: BinanceRawPrivateFrame,
     binding: &GatewayBinding,
     rules_generation: u64,
-    private_generation: u64,
+    stream_private_generation: u64,
+    active_private_generation: u64,
 ) -> Result<Option<BinancePrivateAccountEvent>, BinanceAccountGatewayError> {
     if frame.binding != *binding
         || frame.instrument_generation != rules_generation
-        || frame.private_generation != private_generation
+        || frame.private_generation != stream_private_generation
+        || stream_private_generation == 0
+        || active_private_generation < stream_private_generation
         || frame.received_at_ms == 0
     {
         return Err(BinanceAccountGatewayError::PrivateStream);
@@ -140,7 +155,8 @@ pub(super) fn normalize_private_stream_event(
         };
         return Ok(
             reconcile.then_some(BinancePrivateAccountEvent::ReconcileRequired {
-                private_generation: frame.private_generation,
+                stream_private_generation: frame.private_generation,
+                private_generation: active_private_generation,
                 received_at_ms: frame.received_at_ms,
             }),
         );
@@ -150,7 +166,8 @@ pub(super) fn normalize_private_stream_event(
     }
     Ok(Some(BinancePrivateAccountEvent::Fill(
         BinancePrivateFillEvent {
-            private_generation: frame.private_generation,
+            stream_private_generation: frame.private_generation,
+            private_generation: active_private_generation,
             received_at_ms: frame.received_at_ms,
             fill: stream.fill,
             client_order_id: stream.client_order_id,

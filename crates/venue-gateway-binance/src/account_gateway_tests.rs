@@ -208,7 +208,7 @@ fn limit_normalization_rejects_wrong_owner_direction_and_quantity_limits()
 }
 
 #[test]
-fn private_stream_fill_keeps_exact_generation_and_never_guesses_client_identity()
+fn private_stream_fill_keeps_socket_generation_and_admits_against_current_snapshot()
 -> Result<(), Box<dyn std::error::Error>> {
     let (_, rules, binding) = limit_fixture()?;
     let frame = BinanceRawPrivateFrame {
@@ -220,19 +220,35 @@ fn private_stream_fill_keeps_exact_generation_and_never_guesses_client_identity(
                 br#"{"e":"ORDER_TRADE_UPDATE","E":1000,"o":{"s":"BTCUSDT","c":"grid-e1-long-open-l1","x":"TRADE","S":"BUY","ps":"LONG","t":7,"i":11,"l":"0.002","L":"50000","m":true}}"#,
             ),
         };
-    let event =
-        normalize_private_stream_event(frame.clone(), &binding, rules.instrument.generation, 9)?
-            .ok_or("expected fill")?;
+    let event = normalize_private_stream_event(
+        frame.clone(),
+        &binding,
+        rules.instrument.generation,
+        9,
+        10,
+    )?
+    .ok_or("expected fill")?;
     let BinancePrivateAccountEvent::Fill(event) = event else {
         return Err("expected normalized fill event".into());
     };
-    assert_eq!(event.private_generation, 9);
+    assert_eq!(event.stream_private_generation, 9);
+    assert_eq!(event.private_generation, 10);
     assert_eq!(event.fill.order_id, "11");
     assert!(
         matches!(event.client_order_id, FieldState::Known(ref id) if id == "grid-e1-long-open-l1")
     );
     assert!(
-        normalize_private_stream_event(frame, &binding, rules.instrument.generation, 10).is_err()
+        normalize_private_stream_event(
+            frame.clone(),
+            &binding,
+            rules.instrument.generation,
+            10,
+            10
+        )
+        .is_err()
+    );
+    assert!(
+        normalize_private_stream_event(frame, &binding, rules.instrument.generation, 9, 8).is_err()
     );
     Ok(())
 }
@@ -251,9 +267,10 @@ fn private_stream_terminal_order_and_expiry_request_signed_reconciliation()
         ),
     };
     assert!(matches!(
-        normalize_private_stream_event(terminal, &binding, rules.instrument.generation, 9)?,
+        normalize_private_stream_event(terminal, &binding, rules.instrument.generation, 9, 10)?,
         Some(BinancePrivateAccountEvent::ReconcileRequired {
-            private_generation: 9,
+            stream_private_generation: 9,
+            private_generation: 10,
             ..
         })
     ));
@@ -274,6 +291,7 @@ fn private_stream_terminal_order_and_expiry_request_signed_reconciliation()
                 &binding,
                 rules.instrument.generation,
                 9,
+                10,
             )?,
             Some(BinancePrivateAccountEvent::ReconcileRequired { .. })
         ));
@@ -288,7 +306,8 @@ fn private_stream_terminal_order_and_expiry_request_signed_reconciliation()
         ),
     };
     assert!(
-        normalize_private_stream_event(expired, &binding, rules.instrument.generation, 9).is_err()
+        normalize_private_stream_event(expired, &binding, rules.instrument.generation, 9, 10)
+            .is_err()
     );
     Ok(())
 }
@@ -314,9 +333,11 @@ fn one_private_stream_outage_reports_once_until_a_valid_frame()
     let retry_at = state.retry_deadline().ok_or("retry deadline")?;
     assert!(!state.waiting(retry_at));
     assert!(!state.record_failure(retry_at, 10, 2));
+    state.record_connected();
+    assert!(state.record_failure(retry_at, 10, 3));
     state.record_valid_frame();
     assert!(!state.waiting(retry_at));
-    assert!(state.record_failure(retry_at, 10, 3));
+    assert!(state.record_failure(retry_at, 10, 4));
     Ok(())
 }
 

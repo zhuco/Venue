@@ -215,10 +215,9 @@ impl BinanceAccountGateway {
         self.private = private;
         self.rules_by_symbol = current;
         self.private_generation = next_private_generation;
-        // A stream is bound to the prior complete signed collection. Never relabel its frames as
-        // a newer private generation: the caller must open the replacement stream explicitly.
-        self.private_stream = None;
-        self.private_stream_keepalive_at = None;
+        // The authenticated account stream has its own immutable socket generation. A complete
+        // REST refresh advances account authority but does not invalidate that socket or discard
+        // frames accumulated while mutations were being confirmed.
         Ok(())
     }
 
@@ -243,15 +242,10 @@ impl BinanceAccountGateway {
         Ok(transport)
     }
 
-    /// Opens (once) and polls the bounded private execution stream. This method is strictly
-    /// read-only. A disconnect drops the stream and returns an error; it never reconnects under
-    /// the same generation or fabricates a newer signed snapshot.
-    pub fn poll_private_fill(
-        &mut self,
-    ) -> Result<Option<BinancePrivateAccountEvent>, BinanceAccountGatewayError> {
+    fn ensure_private_stream(&mut self) -> Result<bool, BinanceAccountGatewayError> {
         if self.private_stream.is_none() {
             if self.private_stream_reconnect.waiting(Instant::now()) {
-                return Ok(None);
+                return Ok(false);
             }
             let listen_key = match self
                 .runtime
@@ -262,7 +256,7 @@ impl BinanceAccountGateway {
                     return if self.record_private_stream_failure() {
                         Err(BinanceAccountGatewayError::PrivateStream)
                     } else {
-                        Ok(None)
+                        Ok(false)
                     };
                 }
             };
@@ -278,13 +272,36 @@ impl BinanceAccountGateway {
                     return if self.record_private_stream_failure() {
                         Err(BinanceAccountGatewayError::PrivateStream)
                     } else {
-                        Ok(None)
+                        Ok(false)
                     };
                 }
             };
             self.private_stream = Some(stream);
             self.private_stream_keepalive_at =
                 Some(Instant::now() + PRIVATE_STREAM_KEEPALIVE_INTERVAL);
+            self.private_stream_reconnect.record_connected();
+        }
+        Ok(true)
+    }
+
+    /// Establishes the authenticated account stream before startup cancellation or placement.
+    /// It does not consume a frame and does not obtain mutation authority.
+    pub fn prime_private_stream(&mut self) -> Result<(), BinanceAccountGatewayError> {
+        if self.ensure_private_stream()? {
+            Ok(())
+        } else {
+            Err(BinanceAccountGatewayError::PrivateStream)
+        }
+    }
+
+    /// Opens (once) and polls the bounded private execution stream. This method is strictly
+    /// read-only. A disconnect drops the stream and returns an error; it never reconnects under
+    /// the same generation or fabricates a newer signed snapshot.
+    pub fn poll_private_fill(
+        &mut self,
+    ) -> Result<Option<BinancePrivateAccountEvent>, BinanceAccountGatewayError> {
+        if !self.ensure_private_stream()? {
+            return Ok(None);
         }
         if self
             .private_stream_keepalive_at
@@ -310,11 +327,17 @@ impl BinanceAccountGateway {
             Some(stream) => self.runtime.block_on(stream.poll_raw_frame()),
             None => return Err(BinanceAccountGatewayError::PrivateStream),
         };
+        let stream_private_generation = self
+            .private_stream
+            .as_ref()
+            .map(BinancePrivateWsTransport::private_generation)
+            .ok_or(BinanceAccountGatewayError::PrivateStream)?;
         match result {
             Ok(Some(frame)) => match normalize_private_stream_event(
                 frame,
                 self.config.gateway_binding(),
                 self.rules.instrument.generation,
+                stream_private_generation,
                 self.private_generation,
             ) {
                 Ok(event) => {
@@ -645,8 +668,6 @@ impl AccountPhysicalGateway for BinanceAccountGateway {
                 }))?;
         self.transport = transport;
         self.private_generation = next_private_generation;
-        self.private_stream = None;
-        self.private_stream_keepalive_at = None;
         Ok(snapshot)
     }
 

@@ -599,16 +599,18 @@ fn projection_compaction_sibling(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn run_live_mvp_with_loop<G, F>(
+fn run_live_mvp_with_loop<G, F, P>(
     launch: &NodeLaunch,
     command: LiveMvpCommand,
     gateway: G,
     run_loop: F,
     public_stream_venue: Option<VenueId>,
+    prepare_run: P,
 ) -> Result<(), NodeError>
 where
     G: AccountPhysicalGateway,
     F: FnOnce(ControlResidentLoop<G>) -> Result<(), NodeError>,
+    P: FnOnce(&mut ProductionResident<G>, &NodeRuntimeConfig) -> Result<(), NodeError>,
 {
     let venue = launch.binding().venue;
     match command {
@@ -630,6 +632,7 @@ where
                 config.configured_symbols(launch.binding())?,
                 gateway,
             )?;
+            prepare_run(&mut resident, &config)?;
             for strategy in &config.strategies {
                 let binding = config.binding_for(strategy)?;
                 match strategy.strategy_kind {
@@ -721,7 +724,14 @@ pub fn run_live_mvp<G: AccountPhysicalGateway>(
     command: LiveMvpCommand,
     gateway: G,
 ) -> Result<(), NodeError> {
-    run_live_mvp_with_loop(launch, command, gateway, ControlResidentLoop::run, None)
+    run_live_mvp_with_loop(
+        launch,
+        command,
+        gateway,
+        ControlResidentLoop::run,
+        None,
+        |_, _| Ok(()),
+    )
 }
 
 // The fixed non-Binance binaries name their resident route explicitly.  The generic loop pumps
@@ -739,6 +749,7 @@ pub fn run_live_bitget_mvp(
         gateway,
         ControlResidentLoop::run_bitget,
         Some(VenueId::Bitget),
+        |_, _| Ok(()),
     )
 }
 
@@ -754,6 +765,7 @@ pub fn run_live_bybit_mvp(
         gateway,
         ControlResidentLoop::run_bybit,
         Some(VenueId::Bybit),
+        |_, _| Ok(()),
     )
 }
 
@@ -769,6 +781,7 @@ pub fn run_live_gate_mvp(
         gateway,
         ControlResidentLoop::run_gate,
         Some(VenueId::Gate),
+        |_, _| Ok(()),
     )
 }
 
@@ -784,6 +797,7 @@ pub fn run_live_hyperliquid_mvp(
         gateway,
         ControlResidentLoop::run_hyperliquid,
         Some(VenueId::Hyperliquid),
+        |_, _| Ok(()),
     )
 }
 
@@ -799,6 +813,7 @@ pub fn run_live_okx_mvp(
         gateway,
         ControlResidentLoop::run_okx,
         Some(VenueId::Okx),
+        |_, _| Ok(()),
     )
 }
 
@@ -814,6 +829,16 @@ pub fn run_live_binance_mvp(
         gateway,
         ControlResidentLoop::run_binance,
         Some(VenueId::Binance),
+        |resident, config| {
+            if config
+                .strategies
+                .iter()
+                .any(|strategy| strategy.strategy_kind == StrategyKind::HedgedGrid)
+            {
+                resident.prime_binance_private_stream_once()?;
+            }
+            Ok(())
+        },
     )
 }
 

@@ -1209,10 +1209,10 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         use venue_domain::domain::{DomainEvent, EventId, NativeOrderFamily};
         use venue_runtime::{account::AccountPrivateFactInput, strategy::StrategyInput};
 
-        // The adapter proves its socket is bound to the exact raw generation used by the latest
-        // signed private snapshot. Host alone maps that process-local value into its durable
-        // restart-ratcheted domain. Runtime's facts journal remains separately keyed by the
-        // connection generation used by its private router.
+        // The adapter separately proves the immutable socket generation and binds the dequeued
+        // frame to its latest complete signed snapshot generation. Host alone maps that snapshot
+        // generation into its durable restart-ratcheted domain. Runtime's facts journal remains
+        // separately keyed by the connection generation used by its private router.
         let active_private_generation = self.runtime.active_private_generation();
         let connection_generation = self.runtime.connection_generation();
         let normalized_private_generation = self
@@ -1227,6 +1227,28 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         if normalized_private_generation != active_private_generation || connection_generation == 0
         {
             return Err(NodeError::ResidentRuntime);
+        }
+        if let Some(owner) = self.owner_for_signed_fill(&event.fill) {
+            if let Some((key, _)) = self
+                .grid_bindings
+                .iter()
+                .find(|(_, binding)| binding.matches_owner(&owner))
+            {
+                let application = self
+                    .grid_bridges
+                    .get(key)
+                    .ok_or(NodeError::ResidentRuntime)?
+                    .signed_fill_application(&event.fill)
+                    .map_err(|error| NodeError::LiveHost {
+                        venue: self.host.binding().venue,
+                        message: format!(
+                            "private Grid fill conflicts with its durable record: {error}"
+                        ),
+                    })?;
+                if application == grid::SignedGridFillApplication::ExactDuplicate {
+                    return Ok(true);
+                }
+            }
         }
         let event_id = EventId::new(format!("{venue}-fill-{}", event.fill.fill_id))
             .map_err(|_| NodeError::ResidentRuntime)?;
@@ -1247,6 +1269,13 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 venue: self.host.binding().venue,
                 message: format!("private fact journal or route commit failed: {error}"),
             })?;
+        if report.duplicate
+            && report.reconcile.is_none()
+            && !report.pending_batch
+            && report.deliveries.is_empty()
+        {
+            return Ok(true);
+        }
         if report.reconcile.is_some() || report.duplicate || report.pending_batch {
             return Err(NodeError::LiveHost {
                 venue: self.host.binding().venue,
@@ -1527,6 +1556,17 @@ fn unix_now_ms() -> Result<u64, NodeError> {
 
 #[cfg(feature = "binance")]
 impl ProductionResident<venue_gateway_binance::BinanceAccountGateway> {
+    /// Opens the authenticated account stream before any startup Grid mutation. Signed REST
+    /// refreshes keep this socket alive, so fills during drain/rebuild remain observable.
+    pub fn prime_binance_private_stream_once(&mut self) -> Result<(), NodeError> {
+        self.host
+            .with_gateway_read(|gateway| gateway.prime_private_stream())
+            .map_err(|error| NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: error.to_string(),
+            })
+    }
+
     /// First-install Grid path. The gateway reads only current BBO/rules; the Host obtains the
     /// complete signed snapshot. Missing hedge legs, low inventory, stale BBO or any batch
     /// admission failure stop before dispatch.

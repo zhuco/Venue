@@ -482,7 +482,7 @@ fn existing_grid_restart_signs_cancels_empty_and_rebuilds_higher_epoch()
         PrivateFillFact {
             source_private_generation: raw_private_generation,
             received_at_ms: now()?,
-            fill,
+            fill: fill.clone(),
         },
     );
     let facts_after = std::fs::read_to_string(&facts_path)
@@ -525,6 +525,36 @@ fn existing_grid_restart_signs_cancels_empty_and_rebuilds_higher_epoch()
         })
         .ok_or("restart fill record")?;
     assert_eq!(observed.private_generation, normalized_private_generation);
+    assert_eq!(
+        state.lock().map_err(|_| "state")?.dispatches,
+        dispatches_before + 3
+    );
+    let facts_after_first_fill = std::fs::read_to_string(&facts_path)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    let replay_private_generation = state.lock().map_err(|_| "state")?.generation;
+    assert_eq!(
+        reopened
+            .host
+            .normalize_current_gateway_private_generation(replay_private_generation)?,
+        reopened.runtime().active_private_generation()
+    );
+    assert!(reopened.consume_private_fill(
+        "bybit",
+        PrivateFillFact {
+            source_private_generation: replay_private_generation,
+            received_at_ms: now()?,
+            fill,
+        },
+    )?);
+    assert_eq!(
+        std::fs::read_to_string(&facts_path)
+            .unwrap_or_default()
+            .lines()
+            .count(),
+        facts_after_first_fill
+    );
     assert_eq!(
         state.lock().map_err(|_| "state")?.dispatches,
         dispatches_before + 3

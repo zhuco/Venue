@@ -145,7 +145,7 @@ Exchange Account Process
 
 ### 4.2 Private Router（私有事件路由器）
 
-Adapter 的原生私有流 generation 可以是规则代或本地 snapshot attempt，不能直接当作 Runtime generation。adapter 必须先证明 socket 只绑定其最后一次完整签名快照；Host 仅在 frame 的 raw generation 等于该快照使用的 gateway generation，且 `raw + restart offset` 同时等于最新持久签名 generation 与 Runtime 当前 generation 时返回 normalized generation，Node 才可写入事实 journal。冷重启时 gateway counter 可从 1 重新开始，但 offset 不对 Node 暴露；0、旧流、签名刷新后的迟到 frame 或任意调用方自填 normalized 值都必须在落盘前失败关闭。签名刷新、candidate 漂移、断线、坏帧或有界队列超限时清空未交付规范事件，禁止给旧 frame 重标、保留 raw payload 或自动重连重投。
+Adapter 的私有 socket generation 与完整签名 snapshot generation 是两个独立事实，均不能直接当作 Runtime generation。socket generation 在一次认证连接内固定，adapter 必须逐帧证明其 raw generation 精确等于当前 socket；完整签名刷新不得因此主动断开仍有效的 socket 或丢弃刷新期间已到达的帧。adapter 在出队时同时保留 raw socket generation，并绑定当时最新完整签名 snapshot generation；Host 仅在后者经 restart offset 后同时等于最新持久签名 generation 与 Runtime 当前 generation 时返回 normalized generation，Node 才可写入事实 journal。冷重启时 gateway counter 可从 1 重新开始，但 offset 不对 Node 暴露；0、非当前 socket、未来 socket、非当前签名代或任意调用方自填 normalized 值都必须在落盘前失败关闭。断线、坏帧、candidate 漂移或有界队列超限时清空未交付规范事件并触发签名监督；禁止改写 raw socket generation、保留 raw payload 或自动重投 mutation。
 
 - 每个账户共享一套用户流；
 - 原始事件先完成领域校验，再把规范订单、成交与连续游标写入当前 checkpoint/facts；原始 wire payload 仅用于短期排障，不是永久恢复依赖；
@@ -274,7 +274,7 @@ Grid bridge 对同一已接受 native order 的部分成交必须在策略 check
 
 公共 socket/journal 只在 resident 公共 turn 推进，供初装、整网重建和再中心化使用；它的缺失或过期不阻塞完整成交的滚动 dispatch。`mutation_dispatched`、`private_reconcile_required` 与 `recenter_required` 继续区分已发批次、后续私有对账和 reducer 明确要求的整网重心迁移；BBO 不再产生成交滚动的等待状态。
 
-每次已有 Grid 冷启动都固定执行“签名确认、撤旧、重建”，不得恢复旧价位的 pending transaction：先消费与 checkpoint accepted route 精确匹配且尚未耐久应用的签名成交，再逐字节核对 pending 的全部 deterministic command 与 Host WAL。只有全部子命令为 Absent 或终态 Rejected、且 rollback 后的 client/native/owner/订单形状与最新签名全集精确一致，才可保留成交事实、丢弃未提交 replacement 并进入一个耐久 reconciliation episode。Host 取得账户锁后、Actor 注册前先把崩溃遗留 `Prepared` 原地终结为 `Rejected`；该状态证明未跨越已 fsync 的 `Submitted`，因此不派发原 ID，再按新 attempt/epoch 身份继续。`Submitted` 在同一阶段转为 `Unknown` 并只做签名对账；`Unknown` 或命令字节不一致一律暂停，旧 ID 不重投。
+每次已有 Grid 冷启动都固定执行“校时、先建立认证用户流、签名确认、撤旧、按当前 BBO/仓位重建”，不得恢复旧价位的 pending transaction。用户流必须在首个启动 mutation 前建连，并贯穿签名确认与重建；先消费与 checkpoint accepted route 精确匹配且尚未耐久应用的签名成交，再逐字节核对 pending 的全部 deterministic command 与 Host WAL。只有全部子命令为 Absent 或终态 Rejected、且 rollback 后的 client/native/owner/订单形状与最新签名全集精确一致，才可保留成交事实、丢弃未提交 replacement 并进入一个耐久 reconciliation episode。Host 取得账户锁后、Actor 注册前先把崩溃遗留 `Prepared` 原地终结为 `Rejected`；该状态证明未跨越已 fsync 的 `Submitted`，因此不派发原 ID，再按新 attempt/epoch 身份继续。`Submitted` 在同一阶段转为 `Unknown` 并只做签名对账；`Unknown` 或命令字节不一致一律暂停，旧 ID 不重投。
 
 episode 按 checkpoint key 串行选择一个受管订单，以 Critical 优先级经同一 Host/WAL/writer 发一条 Cancel；目标必须是该代完整签名 surface 的成员。命令 ID 绑定 episode sequence、target 与持久 attempt，明确 Rejected 后只能使用新的 attempt ID，最多三次；恢复出的精确 Prepared 先原地终结再换 ID，Submitted 或 Unknown 不得换 ID。Accepted 只有在更新签名页证明该目标已消失后才从 Desired 删除。撤单窗口的新完整成交先写 facts/Actor，退休旧 route 并更新库存，但不得再生成旧 epoch 的两补一撤。受管签名面精确为空后，使用最新库存、规则和 BBO 安装 `old_epoch + 1`；不平仓，也不以旧中心恢复。
 
