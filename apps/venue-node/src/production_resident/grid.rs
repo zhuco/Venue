@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -820,6 +820,46 @@ impl GridBridgeState {
         self.signed_orders_match(orders, &self.grid.owned_orders)
     }
 
+    /// During a startup reset the signed venue surface may be a strict subset of the stopped
+    /// writer's checkpoint because orders can fill while no private consumer is resident.  Exact
+    /// route, owner and immutable order shape still prove every surviving child; only signed
+    /// absence is allowed to retire a missing child.  An extra or shape-changed order remains a
+    /// hard failure and no physical command is inferred from the snapshot.
+    pub(crate) fn settle_signed_absent_reconciliation_orders(
+        &mut self,
+        orders: &[SignedAccountOrderFact],
+    ) -> Result<usize, GridBridgeError> {
+        if self.startup_reconciliation.is_none()
+            || self.grid.phase != GridPhase::ResettingGrid
+            || !self.grid.pending_transactions.is_empty()
+        {
+            return Err(GridBridgeError::Evidence);
+        }
+        let mut present = BTreeSet::new();
+        for actual in orders {
+            let Some(key) = self.grid.owned_orders.iter().find_map(|(key, desired)| {
+                self.signed_order_matches(actual, key, desired)
+                    .then_some(key.clone())
+            }) else {
+                return Err(GridBridgeError::Evidence);
+            };
+            if !present.insert(key) {
+                return Err(GridBridgeError::Evidence);
+            }
+        }
+        let absent = self
+            .grid
+            .owned_orders
+            .keys()
+            .filter(|key| !present.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in &absent {
+            self.settle_reconciliation_cancel(key)?;
+        }
+        Ok(absent.len())
+    }
+
     pub(crate) fn expected_signed_surface(
         &self,
     ) -> Result<BTreeMap<CommandId, OrderOwner>, NodeError> {
@@ -925,41 +965,50 @@ impl GridBridgeState {
     ) -> bool {
         orders.len() == expected.len()
             && expected.iter().all(|(key, desired)| {
-                let Some(route) = self.routes.get(key) else {
-                    return false;
-                };
-                let Some(native) = route.accepted_venue_order_id.as_deref() else {
-                    return false;
-                };
-                let expected_filled_quantity = self
-                    .partial_fills
-                    .get(native)
-                    .map(|partial| partial.cumulative_quantity)
-                    .unwrap_or_default();
-                orders.iter().any(|actual| {
-                    !actual.external
-                        && actual.owner.as_ref() == Some(&owner_for_order(&self.grid, desired))
-                        && actual.client_order_id == route.client_order_id.as_str()
-                        && actual.venue_order_id.as_deref() == Some(native)
-                        && actual.family == venue_domain::NativeOrderFamily::UmOrder
-                        && actual.symbol == self.grid.binding.symbol
-                        && actual.side == desired.side
-                        && actual.position_side
-                            == match desired.key.position {
-                                GridPosition::Long => PositionSide::Long,
-                                GridPosition::Short => PositionSide::Short,
-                            }
-                        && actual.quantity == desired.quantity
-                        && actual.limit_price == Some(desired.price.value())
-                        && actual.time_in_force == Some(venue_domain::LimitTimeInForce::PostOnly)
-                        && actual.reduce_only == desired.reduce_only
-                        && actual.filled_quantity == Some(expected_filled_quantity)
-                        && matches!(
-                            actual.state,
-                            Some(OrderState::New | OrderState::PartiallyFilled)
-                        )
-                })
+                orders
+                    .iter()
+                    .any(|actual| self.signed_order_matches(actual, key, desired))
             })
+    }
+
+    fn signed_order_matches(
+        &self,
+        actual: &SignedAccountOrderFact,
+        key: &GridOrderKey,
+        desired: &GridOrderIntent,
+    ) -> bool {
+        let Some(route) = self.routes.get(key) else {
+            return false;
+        };
+        let Some(native) = route.accepted_venue_order_id.as_deref() else {
+            return false;
+        };
+        let expected_filled_quantity = self
+            .partial_fills
+            .get(native)
+            .map(|partial| partial.cumulative_quantity)
+            .unwrap_or_default();
+        !actual.external
+            && actual.owner.as_ref() == Some(&owner_for_order(&self.grid, desired))
+            && actual.client_order_id == route.client_order_id.as_str()
+            && actual.venue_order_id.as_deref() == Some(native)
+            && actual.family == venue_domain::NativeOrderFamily::UmOrder
+            && actual.symbol == self.grid.binding.symbol
+            && actual.side == desired.side
+            && actual.position_side
+                == match desired.key.position {
+                    GridPosition::Long => PositionSide::Long,
+                    GridPosition::Short => PositionSide::Short,
+                }
+            && actual.quantity == desired.quantity
+            && actual.limit_price == Some(desired.price.value())
+            && actual.time_in_force == Some(venue_domain::LimitTimeInForce::PostOnly)
+            && actual.reduce_only == desired.reduce_only
+            && actual.filled_quantity == Some(expected_filled_quantity)
+            && matches!(
+                actual.state,
+                Some(OrderState::New | OrderState::PartiallyFilled)
+            )
     }
 
     /// Classifies a signed overlap before facts append. Exact partial duplicates are checked

@@ -316,6 +316,8 @@ Desired Orders，期间的新成交须先消费并重新计算目标集合。`Ru
 
 启动 reconciliation episode 已持久化、所有旧 target 逐一得到 WAL 与签名消失证明且完整受管订单面为空后，允许同一启动自动获得一次 `old_epoch + 1` 安装；不再要求 `--confirm-reset-rebuild`。这项自动化只覆盖撤旧后的新 epoch，不允许复活任何旧 Place/Replace；机会在 place 计划写入 Actor checkpoint 时即耐久消费，失败后监督器只能保持 Paused/NeedsAttention。Rejected 使用新 attempt/epoch 身份；精确 Prepared 原地终结，Unknown 或 Submitted 仍失败关闭。
 
+停机期间旧单可能成交，因此启动签名订单面允许是 checkpoint 受管面的严格子集：每个仍开放订单必须继续精确匹配 Owner、client/native id、方向、数量、价格、TIF 与已知成交量；签名缺失的旧 child 只可在已持久化 reconciliation episode 中按“已消失”退役，再撤销剩余 child。任何额外订单、形状变化或 unresolved mutation 仍失败关闭。最终必须再次签名证明受管面为空，才可按最新签名仓位和当前 BBO 建立更高 epoch；不得恢复旧中心或重投旧 Place。
+
 ### 6.3 库存恢复后的下一成交重心
 
 库存不足时，状态机进入恢复流程。补足库存后不立刻用旧中心重建，而是：

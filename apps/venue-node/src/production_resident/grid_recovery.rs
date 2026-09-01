@@ -150,6 +150,19 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
             }
         }
         snapshot = self.refresh_signed_snapshot()?;
+        let settled_absent = self
+            .grid_bridges
+            .get_mut(&binding.key)
+            .ok_or(NodeError::ResidentRuntime)?
+            .settle_signed_absent_reconciliation_orders(snapshot.open_orders())
+            .map_err(|error| {
+                self.grid_recovery_error(&format!(
+                    "startup Grid signed subset could not retire absent orders: {error}"
+                ))
+            })?;
+        if settled_absent > 0 {
+            self.persist_grid_reconciliation_checkpoint(binding)?;
+        }
         if !self
             .grid_bridges
             .get(&binding.key)
@@ -189,6 +202,21 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
             }
             if applied_fill {
                 snapshot = self.refresh_signed_snapshot()?;
+                continue;
+            }
+
+            let settled_absent = self
+                .grid_bridges
+                .get_mut(&binding.key)
+                .ok_or(NodeError::ResidentRuntime)?
+                .settle_signed_absent_reconciliation_orders(snapshot.open_orders())
+                .map_err(|error| {
+                    self.grid_recovery_error(&format!(
+                        "startup Grid signed subset changed outside owned routes: {error}"
+                    ))
+                })?;
+            if settled_absent > 0 {
+                self.persist_grid_reconciliation_checkpoint(binding)?;
                 continue;
             }
 

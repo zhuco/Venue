@@ -337,6 +337,17 @@ fn existing_grid_restart_signs_cancels_empty_and_rebuilds_higher_epoch()
     );
     drop(resident);
 
+    // Two old children are absent while no writer/private consumer is resident. The signed facts
+    // do not prove whether they filled or were cancelled, and deliberately contain no replayable
+    // fill rows. Startup reset must not invent that cause: it retires only the signed-absent
+    // children, cancels the survivors and rebuilds from fresh signed inventory.
+    {
+        let mut state = state.lock().map_err(|_| "state")?;
+        state.open_orders.drain(..2);
+        state.long_quantity = Decimal::new(18, 2);
+        state.short_quantity = Decimal::new(6, 2);
+    }
+
     // A real adapter process restarts its private generation at one while the Host keeps the
     // prior durable floor. Preserve exchange orders, but reset only this process-local counter.
     state.lock().map_err(|_| "state")?.generation = 0;
