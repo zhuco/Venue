@@ -375,9 +375,9 @@ impl BinanceAccountGateway {
             next_private_generation,
             attempt,
         ))?;
-        self.transport = transport;
-        self.private_generation = next_private_generation;
-        self.private_stream = None;
+        // Risk evidence is a fresh admission candidate, not an installed account snapshot.
+        // Installing its generation here would invalidate Runtime's exact signed Grid surface
+        // without publishing the matching snapshot or reconnecting the private ingress.
         Ok(evidence)
     }
 }
