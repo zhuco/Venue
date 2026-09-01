@@ -8,11 +8,16 @@ use venue_runtime::{
     strategy::StrategyInput,
 };
 
-use super::{ProductionResident, grid::GridDispatchPlan, persist_anchor};
+use super::{
+    ProductionResident,
+    grid::{GridDispatchPlan, SignedGridFillApplication},
+    persist_anchor,
+};
 use crate::NodeError;
 
 const MAX_SIGNED_GRID_CATCH_UP_ROUNDS: usize = 64;
 const MAX_SIGNED_GRID_CATCH_UP_FILLS: usize = 1_000;
+const MAX_SIGNED_GRID_RESUME_BATCHES: usize = 64;
 
 impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
     /// Continues only the exact reducer transactions whose complete deterministic command set is
@@ -26,50 +31,64 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
             .host
             .latest_signed_snapshot()
             .ok_or_else(|| self.grid_recovery_error("signed Grid resume snapshot is missing"))?;
-        let mut snapshot =
-            self.converge_signed_grid_fills_before_pending_resume(binding, snapshot)?;
-        let pending_command_ids = self
-            .grid_bridges
-            .get(&binding.key)
-            .ok_or(NodeError::ResidentRuntime)?
-            .pending_transaction_command_ids()
-            .map_err(|error| {
-                self.grid_recovery_error(&format!(
-                    "pending Grid transaction ids could not be reconstructed: {error}"
-                ))
-            })?;
-        if !super::all_pending_grid_commands_are_absent(&pending_command_ids, |id| {
-            self.host.command_status(id).map_err(|error| {
-                self.grid_recovery_error(&format!(
-                    "pending Grid command WAL classification failed: {error}"
-                ))
-            })
-        })? {
-            return Err(self.grid_recovery_error(
-                "a staged Grid catch-up command already exists in WAL; signed reconciliation is required",
-            ));
-        }
-        let plans = self
-            .grid_bridges
-            .get(&binding.key)
-            .ok_or(NodeError::ResidentRuntime)?
-            .pending_dispatch_plans()
-            .map_err(|error| {
-                self.grid_recovery_error(&format!(
-                    "pending Grid transaction could not be reconstructed: {error}"
-                ))
-            })?;
-        if plans.is_empty() {
-            return Err(
-                self.grid_recovery_error("pending Grid resume was selected without a transaction")
-            );
-        }
-        for plan in &plans {
+        let mut snapshot = snapshot;
+        let mut resumed_batches = 0_usize;
+        loop {
+            snapshot = self.converge_signed_grid_fills_before_pending_resume(binding, snapshot)?;
+            let pending_command_ids = self
+                .grid_bridges
+                .get(&binding.key)
+                .ok_or(NodeError::ResidentRuntime)?
+                .pending_transaction_command_ids()
+                .map_err(|error| {
+                    self.grid_recovery_error(&format!(
+                        "pending Grid transaction ids could not be reconstructed: {error}"
+                    ))
+                })?;
+            if !super::all_pending_grid_commands_are_absent(&pending_command_ids, |id| {
+                self.host.command_status(id).map_err(|error| {
+                    self.grid_recovery_error(&format!(
+                        "pending Grid command WAL classification failed: {error}"
+                    ))
+                })
+            })? {
+                return Err(self.grid_recovery_error(
+                    "a staged Grid catch-up command already exists in WAL; signed reconciliation is required",
+                ));
+            }
+            let plan = self
+                .grid_bridges
+                .get(&binding.key)
+                .ok_or(NodeError::ResidentRuntime)?
+                .pending_dispatch_plans()
+                .map_err(|error| {
+                    self.grid_recovery_error(&format!(
+                        "pending Grid transaction could not be reconstructed: {error}"
+                    ))
+                })?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    self.grid_recovery_error(
+                        "pending Grid resume was selected without a transaction",
+                    )
+                })?;
             let signed_surface = self.prove_pending_grid_surface(binding, &snapshot)?;
-            self.dispatch_recovered_grid_plan(binding, signed_surface, plan)?;
+            if resumed_batches >= MAX_SIGNED_GRID_RESUME_BATCHES {
+                return Err(self
+                    .grid_recovery_error("pending Grid resume exceeded its bounded batch budget"));
+            }
+            self.dispatch_recovered_grid_plan(binding, signed_surface, &plan)?;
+            resumed_batches = resumed_batches.saturating_add(1);
             snapshot = self.refresh_signed_snapshot()?;
+            let pending_remain = self
+                .grid_bridges
+                .get(&binding.key)
+                .is_some_and(|bridge| !bridge.grid.pending_transactions.is_empty());
+            if !pending_remain {
+                return self.recover_grid_from_signed_fills(binding, snapshot);
+            }
         }
-        self.recover_grid_from_signed_fills(binding, snapshot)
     }
 
     /// A stopped writer can accumulate additional fills after the first pending checkpoint. Apply
@@ -82,27 +101,23 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
     ) -> Result<SignedAccountSnapshot, NodeError> {
         let mut applied_fills = 0_usize;
         for _ in 0..MAX_SIGNED_GRID_CATCH_UP_ROUNDS {
-            let fills = snapshot
-                .fills()
-                .iter()
-                .filter(|fill| {
-                    self.owner_for_signed_fill(fill)
-                        .is_some_and(|owner| binding.matches_owner(&owner))
-                        && self
-                            .grid_bridges
-                            .get(&binding.key)
-                            .is_some_and(|bridge| bridge.needs_signed_fill_application(fill))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            applied_fills = applied_fills.saturating_add(fills.len());
+            let fills = self.unique_owned_signed_grid_fills(binding, &snapshot)?;
+            let mut applied_this_round = 0_usize;
+            for fill in fills {
+                match self.classify_signed_grid_fill(binding, &fill)? {
+                    SignedGridFillApplication::Apply => {
+                        let _plans = self.stage_signed_grid_fill(binding, &snapshot, fill)?;
+                        applied_this_round = applied_this_round.saturating_add(1);
+                    }
+                    SignedGridFillApplication::ExactDuplicate
+                    | SignedGridFillApplication::Irrelevant => {}
+                }
+            }
+            applied_fills = applied_fills.saturating_add(applied_this_round);
             if applied_fills > MAX_SIGNED_GRID_CATCH_UP_FILLS {
                 return Err(self.grid_recovery_error(
                     "signed Grid pre-resume fill catch-up exceeded its bounded fill budget",
                 ));
-            }
-            for fill in fills {
-                let _plans = self.stage_signed_grid_fill(binding, &snapshot, fill)?;
             }
             snapshot = self.refresh_signed_snapshot()?;
             if self
@@ -112,14 +127,14 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
             {
                 return Ok(snapshot);
             }
-            let has_new_signed_fill = snapshot.fills().iter().any(|fill| {
-                self.owner_for_signed_fill(fill)
-                    .is_some_and(|owner| binding.matches_owner(&owner))
-                    && self
-                        .grid_bridges
-                        .get(&binding.key)
-                        .is_some_and(|bridge| bridge.needs_signed_fill_application(fill))
-            });
+            let mut has_new_signed_fill = false;
+            for fill in self.unique_owned_signed_grid_fills(binding, &snapshot)? {
+                if self.classify_signed_grid_fill(binding, &fill)?
+                    == SignedGridFillApplication::Apply
+                {
+                    has_new_signed_fill = true;
+                }
+            }
             if !has_new_signed_fill {
                 return Err(self.grid_recovery_error(
                     "pending Grid surface differs after a fresh signed read, but no new WAL-owned fill explains it",
@@ -173,39 +188,33 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
                 return Ok(());
             }
 
-            let fills = snapshot
-                .fills()
-                .iter()
-                .filter(|fill| {
-                    self.owner_for_signed_fill(fill)
-                        .is_some_and(|owner| binding.matches_owner(&owner))
-                        && self
-                            .grid_bridges
-                            .get(&binding.key)
-                            .is_some_and(|bridge| bridge.needs_signed_fill_application(fill))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            if fills.is_empty() {
+            let fills = self.unique_owned_signed_grid_fills(binding, &snapshot)?;
+            let mut applied_this_round = 0_usize;
+            let mut plans = Vec::new();
+            for fill in fills {
+                match self.classify_signed_grid_fill(binding, &fill)? {
+                    SignedGridFillApplication::Apply => {
+                        plans.extend(self.stage_signed_grid_fill(binding, &snapshot, fill)?);
+                        applied_this_round = applied_this_round.saturating_add(1);
+                    }
+                    SignedGridFillApplication::ExactDuplicate
+                    | SignedGridFillApplication::Irrelevant => {}
+                }
+            }
+            if applied_this_round == 0 {
                 return Err(self.grid_recovery_error(
                     "managed Grid surface differs, but no new WAL-owned signed fill explains it",
                 ));
             }
-            applied_fills = applied_fills.saturating_add(fills.len());
+            applied_fills = applied_fills.saturating_add(applied_this_round);
             if applied_fills > MAX_SIGNED_GRID_CATCH_UP_FILLS {
                 return Err(self.grid_recovery_error(
                     "signed Grid fill catch-up exceeded its bounded fill budget",
                 ));
             }
-
-            let mut plans = Vec::new();
-            for fill in fills {
-                plans.extend(self.stage_signed_grid_fill(binding, &snapshot, fill)?);
-            }
             if plans.is_empty() {
-                return Err(self.grid_recovery_error(
-                    "signed Grid fills changed no complete owned order while the surface still differs",
-                ));
+                snapshot = self.refresh_signed_snapshot()?;
+                continue;
             }
             for plan in plans {
                 let signed_surface = self.prove_pending_grid_surface(binding, &snapshot)?;
@@ -216,6 +225,50 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
         Err(self.grid_recovery_error(
             "signed Grid fill catch-up exceeded its bounded convergence rounds",
         ))
+    }
+
+    fn unique_owned_signed_grid_fills(
+        &self,
+        binding: &StrategyBinding,
+        snapshot: &SignedAccountSnapshot,
+    ) -> Result<Vec<venue_domain::Fill>, NodeError> {
+        let mut by_id = BTreeMap::<String, venue_domain::Fill>::new();
+        let mut fills = Vec::new();
+        for fill in snapshot.fills() {
+            if let Some(previous) = by_id.get(&fill.fill_id) {
+                if previous != fill {
+                    return Err(self.grid_recovery_error(
+                        "one signed Grid snapshot contains conflicting duplicate fill identities",
+                    ));
+                }
+                continue;
+            }
+            by_id.insert(fill.fill_id.clone(), fill.clone());
+            if self
+                .owner_for_signed_fill(fill)
+                .is_some_and(|owner| binding.matches_owner(&owner))
+            {
+                fills.push(fill.clone());
+            }
+        }
+        Ok(fills)
+    }
+
+    fn classify_signed_grid_fill(
+        &self,
+        binding: &StrategyBinding,
+        fill: &venue_domain::Fill,
+    ) -> Result<SignedGridFillApplication, NodeError> {
+        self.grid_bridges
+            .get(&binding.key)
+            .ok_or(NodeError::ResidentRuntime)?
+            .signed_fill_application(fill)
+            .map_err(|error| {
+                self.grid_recovery_error(&format!(
+                    "signed Grid fill {} conflicts with its durable route: {error}",
+                    fill.fill_id
+                ))
+            })
     }
 
     fn stage_signed_grid_fill(

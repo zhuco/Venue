@@ -273,7 +273,7 @@ Grid bridge 对同一已接受 native order 的部分成交必须在策略 check
 
 生产冷启动恢复私有游标还必须同时验证 Host 已核验的 Actor Applied 头与完整 `facts.jsonl` 尾部：每条事实的 journal 序号、header source sequence、PrivateAccount 来源、header 与规范私有事件均须一致有效；当前 Runtime 与 PrivateRouter 游标只能在 Actor 游标精确命中已验证 facts 尾部时同步前移。仅有 checkpoint 数字、重标记事实、断序、坏尾或 Actor/facts 任一方向不一致都失败关闭，不得据此投递或恢复 mutation。
 
-writer 停止后若旧 pending transaction 尚未进入 WAL 而其余受管订单继续成交，启动恢复必须先把更新签名页中仍命中 checkpoint accepted route、且尚未耐久应用的成交全部写入同一 facts/Actor checkpoint；随后重新核验旧、新全部 deterministic command id 均不在 WAL，并用扩展后的完整 pending 预派发订单面匹配当前交易所。只有该全集精确一致才可串行恢复批次；不得先恢复旧 pending、忽略停机窗口成交或放宽为订单数量比较。
+writer 停止后若旧 pending transaction 尚未进入 WAL 而其余受管订单继续成交，启动恢复必须先把更新签名页中仍命中 checkpoint accepted route、且尚未耐久应用的成交全部写入同一 facts/Actor checkpoint；同页 fill identity 先按完整不可变内容去重，已 checkpoint 的 partial slice 也须精确匹配数量、maker 与源订单语义后才可跳过。pending 的原 cancel target 若已成交，原 transaction 已不可复放并失败关闭。随后重新核验旧、新全部 deterministic command id 均不在 WAL，并用扩展后的完整 pending 预派发订单面匹配当前交易所。只有该全集精确一致才可串行恢复批次；不得先恢复旧 pending、忽略停机窗口成交或放宽为订单数量比较。
 
 重建 place 收到 Accepted 后不得先把本地 4×N 张订单记为 `Running`；若安装窗口继续成交或订单消失，
 Checkpoint 与健康报告都必须保持过渡态，直到更新一代签名 open-orders 精确收敛。
