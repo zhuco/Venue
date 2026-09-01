@@ -432,6 +432,7 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         binding: StrategyBinding,
         _expected_anchor: Option<ActorAppliedAnchor>,
     ) -> Result<(), NodeError> {
+        let venue = self.host.binding().venue;
         let actor_root = self
             .artifacts_root
             .join("strategies")
@@ -439,14 +440,23 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         fs::create_dir_all(&actor_root).map_err(|_| NodeError::ResidentArtifacts)?;
         self.runtime
             .register_strategy(binding.clone())
-            .map_err(resident_error)?;
+            .map_err(|error| NodeError::LiveHost {
+                venue,
+                message: format!("resident strategy registration failed: {error}"),
+            })?;
         let artifacts = actor_artifacts(&actor_root)?;
         self.host
             .install_resident_actor_applied_artifacts(&mut self.runtime, &binding, artifacts)
-            .map_err(|_| NodeError::ResidentRuntime)?;
+            .map_err(|error| NodeError::LiveHost {
+                venue,
+                message: format!("resident Actor-applied recovery failed: {error}"),
+            })?;
         self.runtime
             .activate_resident_strategy(&binding)
-            .map_err(resident_error)
+            .map_err(|error| NodeError::LiveHost {
+                venue,
+                message: format!("resident strategy activation failed: {error}"),
+            })
     }
 
     /// Control actions are first represented by the durable resident Actor checkpoint, then
