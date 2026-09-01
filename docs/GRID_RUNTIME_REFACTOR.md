@@ -304,6 +304,10 @@ Desired Orders，期间的新成交须先消费并重新计算目标集合。`Ru
 
 账户的广义生产风险 fence 不因 Grid 接管而清除：任一非零仓位、开放订单、外部订单或未决 WAL 仍保持 fence。新 Runtime 只可在 Host 证明当前签名 Hedge 订单面与 WAL Owner（含 purpose）一一对应、无外部/额外订单、无 Unknown 且 Actor Applied 与配置代仍为当前值后，安装不可序列化的内存 `Exact` 权限；它至多消费为一个 `Batch`。空订单面首次安装只允许最多 200 条 post-only Place；滚动批次必须恰为两条 post-only Place 加一条针对旧签名面的 Cancel。Host 对整个批次只读取一次新鲜汇率/风险证据，但逐条维持不超过 10U；批次以单次 durability barrier 写入 Prepared，仍逐条经过原 WAL 和唯一 writer。第一条 Rejected/Unknown、签名刷新、重连、Pause、改参或代际变化立即撤销权限并在物理派发前拒绝剩余 Prepared；只有新签名面再次精确确认后才可恢复，禁止自动重投。
 
+已完成的 `ResettingGrid` 若持久化为签名空面，只有操作者在该次 `run` 显式提供与交易所精确一致的
+`--confirm-reset-rebuild` 才能获得一次新的安装尝试；该标记先随 Actor Applied 持久化，普通启动、
+`Attempted`、`Rejected` 或 `Unknown` 不得借此重试。
+
 ### 6.3 库存恢复后的下一成交重心
 
 库存不足时，状态机进入恢复流程。补足库存后不立刻用旧中心重建，而是：

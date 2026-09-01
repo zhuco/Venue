@@ -19,11 +19,13 @@ fn run() -> Result<(), NodeError> {
     let launch = NodeLaunch::from_environment(VenueId::Binance)?;
     let command = launch.live_mvp_command()?;
     let symbols = match &command {
-        LiveMvpCommand::Run(path) => NodeRuntimeConfig::load(path, launch.binding())?
-            .configured_symbols(launch.binding())?
-            .iter()
-            .cloned()
-            .collect(),
+        LiveMvpCommand::Run { runtime_config, .. } => {
+            NodeRuntimeConfig::load(runtime_config, launch.binding())?
+                .configured_symbols(launch.binding())?
+                .iter()
+                .cloned()
+                .collect()
+        }
         LiveMvpCommand::Preflight | LiveMvpCommand::Dispatch(_) => {
             BTreeSet::from([launch.binding().symbol.clone()])
         }

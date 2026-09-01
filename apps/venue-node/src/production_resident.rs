@@ -262,6 +262,23 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         recovery: crate::NodeGridRecoveryPolicy,
         skip_inventory_replenishment_until_recovered: bool,
     ) -> Result<(), NodeError> {
+        self.register_grid_actor_with_reset_rebuild_confirmation(
+            binding,
+            initial,
+            recovery,
+            skip_inventory_replenishment_until_recovered,
+            false,
+        )
+    }
+
+    pub fn register_grid_actor_with_reset_rebuild_confirmation(
+        &mut self,
+        binding: StrategyBinding,
+        initial: venue_strategies::hedged_grid::HedgedGridState,
+        recovery: crate::NodeGridRecoveryPolicy,
+        skip_inventory_replenishment_until_recovered: bool,
+        confirm_reset_rebuild: bool,
+    ) -> Result<(), NodeError> {
         if binding.key.strategy_kind != venue_runtime::StrategyKind::HedgedGrid
             || self.grid_bridges.contains_key(&binding.key)
         {
@@ -308,6 +325,7 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             }
         };
         let first_bootstrap = bridge.needs_initial_bootstrap();
+        let reset_rebuild = confirm_reset_rebuild && bridge.needs_reset_rebuild();
         let bootstrap_requires_reconciliation = bridge.bootstrap_requires_reconciliation();
         if first_bootstrap && recovery == crate::NodeGridRecoveryPolicy::RequireExisting {
             return Err(NodeError::ResidentArtifacts);
@@ -317,6 +335,7 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         {
             if skip_inventory_replenishment_until_recovered
                 && bridge.grid.phase == venue_strategies::hedged_grid::GridPhase::Recovering
+                && !bootstrap_requires_reconciliation
             {
                 bridge
                     .grid
@@ -348,7 +367,7 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 .map_err(resident_error)?;
             persist_anchor(&self.artifacts_root, &binding, &applied)?;
         }
-        if first_bootstrap {
+        if first_bootstrap || reset_rebuild {
             self.grid_bootstrap_pending.insert(key.clone());
         } else if bootstrap_requires_reconciliation {
             self.runtime.request_pause(&key).map_err(resident_error)?;
@@ -392,9 +411,15 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 .grid_bridges
                 .get_mut(&binding.key)
                 .ok_or(NodeError::ResidentRuntime)?;
-            bridge
-                .mark_bootstrap_attempted()
-                .map_err(|_| NodeError::ResidentRuntime)?;
+            if bridge.needs_initial_bootstrap() {
+                bridge
+                    .mark_bootstrap_attempted()
+                    .map_err(|_| NodeError::ResidentRuntime)?;
+            } else {
+                bridge
+                    .mark_reset_rebuild_attempted()
+                    .map_err(|_| NodeError::ResidentRuntime)?;
+            }
             bridge.checkpoint_bytes()?
         };
         let applied = self

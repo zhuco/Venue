@@ -176,7 +176,7 @@ impl NodeLaunch {
             .chain(self.runtime_arguments.iter().cloned());
         let raw = RawLiveMvpArguments::try_parse_from(arguments)?;
         let command = LiveMvpCommand::from_raw(raw.command, &self.binding)?;
-        if !matches!(&command, LiveMvpCommand::Run(_)) {
+        if !matches!(&command, LiveMvpCommand::Run { .. }) {
             match self.legacy_v1_predecessor.as_ref() {
                 Some(predecessor) => {
                     validate_legacy_v1_import_budget(&self.artifacts_base, predecessor)?;
@@ -211,6 +211,10 @@ enum RawLiveMvpCommand {
     Run {
         #[arg(long)]
         runtime_config: PathBuf,
+        /// Explicitly authorizes one rebuild of a checkpointed, operator-reset empty Grid.
+        /// This does not authorize a retry after a failed/unknown physical batch.
+        #[arg(long)]
+        confirm_reset_rebuild: Option<String>,
     },
     /// Authenticated read-only startup plus account-WAL recovery; sends no mutation.
     Preflight {
@@ -245,7 +249,10 @@ enum RawLiveMvpCommand {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LiveMvpCommand {
-    Run(PathBuf),
+    Run {
+        runtime_config: PathBuf,
+        confirm_reset_rebuild: bool,
+    },
     Preflight,
     Dispatch(Box<ExecutionCommand>),
 }
@@ -253,11 +260,22 @@ pub enum LiveMvpCommand {
 impl LiveMvpCommand {
     fn from_raw(raw: RawLiveMvpCommand, binding: &GatewayBinding) -> Result<Self, NodeError> {
         match raw {
-            RawLiveMvpCommand::Run { runtime_config } => {
+            RawLiveMvpCommand::Run {
+                runtime_config,
+                confirm_reset_rebuild,
+            } => {
                 if !runtime_config.is_absolute() {
                     return Err(NodeError::RuntimeConfig);
                 }
-                Ok(Self::Run(runtime_config))
+                let confirm_reset_rebuild = confirm_reset_rebuild
+                    .as_deref()
+                    .map(|value| validate_live_confirmation(value, binding.venue))
+                    .transpose()?
+                    .is_some();
+                Ok(Self::Run {
+                    runtime_config,
+                    confirm_reset_rebuild,
+                })
             }
             RawLiveMvpCommand::Preflight { confirm_live } => {
                 validate_live_confirmation(&confirm_live, binding.venue)?;
@@ -579,7 +597,10 @@ where
 {
     let venue = launch.binding().venue;
     match command {
-        LiveMvpCommand::Run(runtime_config) => {
+        LiveMvpCommand::Run {
+            runtime_config,
+            confirm_reset_rebuild,
+        } => {
             let config = NodeRuntimeConfig::load(&runtime_config, launch.binding())?;
             reject_scalping_without_public_stream(&config, public_stream_venue)?;
             prepare_run_projection_artifacts(launch, &config)?;
@@ -599,11 +620,12 @@ where
                 match strategy.strategy_kind {
                     StrategyKind::HedgedGrid => {
                         let grid = strategy.grid.as_ref().ok_or(NodeError::RuntimeConfig)?;
-                        resident.register_grid_actor(
+                        resident.register_grid_actor_with_reset_rebuild_confirmation(
                             binding,
                             config.grid_initial_state(strategy)?,
                             grid.recovery,
                             grid.skip_inventory_replenishment_until_recovered,
+                            confirm_reset_rebuild,
                         )?;
                     }
                     StrategyKind::Scalping => resident

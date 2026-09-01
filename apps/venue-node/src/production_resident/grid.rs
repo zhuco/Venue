@@ -63,6 +63,10 @@ pub(crate) struct GridBridgeState {
     pub grid: HedgedGridState,
     #[serde(default)]
     bootstrap_state: GridBootstrapState,
+    /// A completed reset may deliberately leave an uninstalled shape. It is distinct from the
+    /// first epoch and receives one separately durable, signed-empty-surface rebuild attempt.
+    #[serde(default)]
+    reset_rebuild_attempted: bool,
     #[serde(with = "grid_routes")]
     routes: BTreeMap<GridOrderKey, GridOrderRoute>,
     #[serde(default)]
@@ -131,6 +135,7 @@ impl GridBridgeState {
         let state = Self {
             grid,
             bootstrap_state: GridBootstrapState::Eligible,
+            reset_rebuild_attempted: false,
             routes: BTreeMap::new(),
             partial_fills: BTreeMap::new(),
         };
@@ -196,6 +201,19 @@ impl GridBridgeState {
         self.bootstrap_state == GridBootstrapState::Eligible && self.has_uninstalled_shape()
     }
 
+    pub(crate) fn needs_reset_rebuild(&self) -> bool {
+        self.bootstrap_state == GridBootstrapState::Attempted
+            && !self.reset_rebuild_attempted
+            && self.grid.phase == venue_strategies::hedged_grid::GridPhase::ResettingGrid
+            && self.grid.epoch.is_none()
+            && self.grid.inventory.is_none()
+            && self.grid.owned_orders.is_empty()
+            && self.grid.pending_transactions.is_empty()
+            && self.grid.pending_replenishments.is_empty()
+            && self.routes.is_empty()
+            && self.partial_fills.is_empty()
+    }
+
     pub(crate) fn bootstrap_requires_reconciliation(&self) -> bool {
         self.bootstrap_state == GridBootstrapState::Attempted
             || !self.grid.pending_transactions.is_empty()
@@ -253,6 +271,14 @@ impl GridBridgeState {
             return Err(GridBridgeError::BootstrapState);
         }
         self.bootstrap_state = GridBootstrapState::Attempted;
+        self.validate()
+    }
+
+    pub(crate) fn mark_reset_rebuild_attempted(&mut self) -> Result<(), GridBridgeError> {
+        if !self.needs_reset_rebuild() {
+            return Err(GridBridgeError::BootstrapState);
+        }
+        self.reset_rebuild_attempted = true;
         self.validate()
     }
 
