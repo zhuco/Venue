@@ -451,8 +451,16 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         }) {
             pending_wal = PendingGridWalDisposition::RequiresSignedReconciliation;
         }
-        let terminally_drained_rebuild_rearmed = pending_wal
-            != PendingGridWalDisposition::RequiresSignedReconciliation
+        let lifecycle_allows_terminal_rearm = matches!(
+            self.strategy_lifecycle(&binding),
+            Some(
+                venue_runtime::account::InstanceLifecycle::Registered
+                    | venue_runtime::account::InstanceLifecycle::Recovering
+                    | venue_runtime::account::InstanceLifecycle::Running
+            )
+        );
+        let terminally_drained_rebuild_rearmed = lifecycle_allows_terminal_rearm
+            && pending_wal != PendingGridWalDisposition::RequiresSignedReconciliation
             && !self.host.has_unresolved()
             && self
                 .host

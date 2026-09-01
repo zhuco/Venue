@@ -92,6 +92,8 @@ struct GridStartupReconciliation {
     rebuild_attempted: bool,
 }
 
+const TERMINAL_REBUILD_REARM_VERSION: u16 = 1;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SignedGridFillApplication {
     Apply,
@@ -123,6 +125,10 @@ pub(crate) struct GridBridgeState {
     reconciliation_sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     startup_reconciliation: Option<GridStartupReconciliation>,
+    /// A terminally incomplete place batch may consume one durable recovery generation. After
+    /// that version is consumed, later partial batches are still drained but cannot auto-rebuild.
+    #[serde(default)]
+    terminal_rebuild_rearm_version: u16,
 }
 
 /// JSON object keys cannot encode `GridOrderKey` without inventing a lossy string identity.
@@ -194,6 +200,7 @@ impl GridBridgeState {
             partial_fills: BTreeMap::new(),
             reconciliation_sequence: 0,
             startup_reconciliation: None,
+            terminal_rebuild_rearm_version: 0,
         };
         state.validate().map_err(|_| NodeError::ResidentRuntime)?;
         Ok(state)
@@ -441,7 +448,16 @@ impl GridBridgeState {
             }
             self.startup_reconciliation = None;
         }
+        let allow_rebuild = self.terminal_rebuild_rearm_version < TERMINAL_REBUILD_REARM_VERSION;
         self.start_reconciliation_episode()?;
+        if allow_rebuild {
+            self.terminal_rebuild_rearm_version = TERMINAL_REBUILD_REARM_VERSION;
+        } else {
+            self.startup_reconciliation
+                .as_mut()
+                .ok_or(GridBridgeError::Evidence)?
+                .rebuild_attempted = true;
+        }
         if self.grid.owned_orders.is_empty() {
             self.grid
                 .reset_orders_settled()
@@ -469,11 +485,12 @@ impl GridBridgeState {
                 .startup_reconciliation
                 .as_ref()
                 .is_some_and(|episode| episode.rebuild_attempted && episode.attempts.is_empty());
-        if !stranded {
+        if !stranded || self.terminal_rebuild_rearm_version >= TERMINAL_REBUILD_REARM_VERSION {
             return Ok(false);
         }
         self.startup_reconciliation = None;
         self.start_reconciliation_episode()?;
+        self.terminal_rebuild_rearm_version = TERMINAL_REBUILD_REARM_VERSION;
         self.validate()?;
         Ok(true)
     }
@@ -1558,6 +1575,7 @@ impl GridBridgeState {
     fn validate(&self) -> Result<(), GridBridgeError> {
         if (self.bootstrap_state == GridBootstrapState::Eligible && !self.has_uninstalled_shape())
             || (self.bootstrap_state == GridBootstrapState::Confirmed && self.grid.epoch.is_none())
+            || self.terminal_rebuild_rearm_version > TERMINAL_REBUILD_REARM_VERSION
         {
             return Err(GridBridgeError::BootstrapState);
         }

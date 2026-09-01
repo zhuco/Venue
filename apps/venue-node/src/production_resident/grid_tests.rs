@@ -782,6 +782,8 @@ fn terminal_rejected_reconciliation_rebuild_rearms_only_after_signed_drain_shape
     assert_eq!(bridge.next_install_epoch()?, 3);
 
     let checkpoint = bridge.checkpoint_bytes()?;
+    let checkpoint_value: serde_json::Value = serde_json::from_slice(&checkpoint)?;
+    assert_eq!(checkpoint_value["terminal_rebuild_rearm_version"], 1);
     let restored = GridBridgeState::restore_or_bootstrap(
         Some(checkpoint.clone()),
         bridge.grid.clone(),
@@ -792,6 +794,7 @@ fn terminal_rejected_reconciliation_rebuild_rearms_only_after_signed_drain_shape
 
     let mut stranded: serde_json::Value = serde_json::from_slice(&checkpoint)?;
     stranded["startup_reconciliation"]["rebuild_attempted"] = serde_json::Value::Bool(true);
+    stranded["terminal_rebuild_rearm_version"] = serde_json::Value::from(0);
     let mut stranded = GridBridgeState::restore_or_bootstrap(
         Some(serde_json::to_vec(&stranded)?),
         bridge.grid.clone(),
@@ -801,6 +804,37 @@ fn terminal_rejected_reconciliation_rebuild_rearms_only_after_signed_drain_shape
     assert!(stranded.rearm_terminally_drained_rebuild()?);
     assert!(stranded.needs_reconciliation_rebuild());
     assert_eq!(stranded.next_install_epoch()?, 3);
+    assert!(!stranded.rearm_terminally_drained_rebuild()?);
+    let rearmed_checkpoint: serde_json::Value =
+        serde_json::from_slice(&stranded.checkpoint_bytes()?)?;
+    assert_eq!(rearmed_checkpoint["terminal_rebuild_rearm_version"], 1);
+
+    let _second_failed_places = bridge.install_rebuilt_epoch(
+        GridInventory {
+            private_generation: 21,
+            private_observed_at_ms: 21,
+            mark_price: Price::new(Decimal::new(102, 0))?,
+            long_quantity: Decimal::ONE,
+            short_quantity: Decimal::ONE,
+        },
+        GridEpoch {
+            epoch: 3,
+            anchor_price: Price::new(Decimal::new(102, 0))?,
+            step: Price::new(Decimal::ONE)?,
+            grid_quantity: Decimal::new(5, 2),
+            passive_book_fallback: None,
+        },
+    )?;
+    bridge.begin_unconfirmed_install_reconciliation()?;
+    assert!(!bridge.needs_reconciliation_rebuild());
+    assert!(bridge.next_install_epoch().is_err());
+    let second_checkpoint = bridge.checkpoint_bytes()?;
+    let mut second = GridBridgeState::restore_or_bootstrap(
+        Some(second_checkpoint),
+        bridge.grid.clone(),
+        NodeGridRecoveryPolicy::RequireExisting,
+    )?;
+    assert!(!second.rearm_terminally_drained_rebuild()?);
     Ok(())
 }
 
