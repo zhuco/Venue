@@ -22,10 +22,33 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
         &mut self,
         binding: &StrategyBinding,
     ) -> Result<(), NodeError> {
-        let mut snapshot = self
+        let snapshot = self
             .host
             .latest_signed_snapshot()
             .ok_or_else(|| self.grid_recovery_error("signed Grid resume snapshot is missing"))?;
+        let mut snapshot =
+            self.converge_signed_grid_fills_before_pending_resume(binding, snapshot)?;
+        let pending_command_ids = self
+            .grid_bridges
+            .get(&binding.key)
+            .ok_or(NodeError::ResidentRuntime)?
+            .pending_transaction_command_ids()
+            .map_err(|error| {
+                self.grid_recovery_error(&format!(
+                    "pending Grid transaction ids could not be reconstructed: {error}"
+                ))
+            })?;
+        if !super::all_pending_grid_commands_are_absent(&pending_command_ids, |id| {
+            self.host.command_status(id).map_err(|error| {
+                self.grid_recovery_error(&format!(
+                    "pending Grid command WAL classification failed: {error}"
+                ))
+            })
+        })? {
+            return Err(self.grid_recovery_error(
+                "a staged Grid catch-up command already exists in WAL; signed reconciliation is required",
+            ));
+        }
         let plans = self
             .grid_bridges
             .get(&binding.key)
@@ -47,6 +70,65 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
             snapshot = self.refresh_signed_snapshot()?;
         }
         self.recover_grid_from_signed_fills(binding, snapshot)
+    }
+
+    /// A stopped writer can accumulate additional fills after the first pending checkpoint. Apply
+    /// all newly signed, still-routed fills to the Actor before authorizing any old transaction;
+    /// the resulting complete pending surface must then match the exchange exactly.
+    fn converge_signed_grid_fills_before_pending_resume(
+        &mut self,
+        binding: &StrategyBinding,
+        mut snapshot: SignedAccountSnapshot,
+    ) -> Result<SignedAccountSnapshot, NodeError> {
+        let mut applied_fills = 0_usize;
+        for _ in 0..MAX_SIGNED_GRID_CATCH_UP_ROUNDS {
+            let fills = snapshot
+                .fills()
+                .iter()
+                .filter(|fill| {
+                    self.owner_for_signed_fill(fill)
+                        .is_some_and(|owner| binding.matches_owner(&owner))
+                        && self
+                            .grid_bridges
+                            .get(&binding.key)
+                            .is_some_and(|bridge| bridge.needs_signed_fill_application(fill))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            applied_fills = applied_fills.saturating_add(fills.len());
+            if applied_fills > MAX_SIGNED_GRID_CATCH_UP_FILLS {
+                return Err(self.grid_recovery_error(
+                    "signed Grid pre-resume fill catch-up exceeded its bounded fill budget",
+                ));
+            }
+            for fill in fills {
+                let _plans = self.stage_signed_grid_fill(binding, &snapshot, fill)?;
+            }
+            snapshot = self.refresh_signed_snapshot()?;
+            if self
+                .grid_bridges
+                .get(&binding.key)
+                .is_some_and(|bridge| bridge.signed_pending_surface_matches(snapshot.open_orders()))
+            {
+                return Ok(snapshot);
+            }
+            let has_new_signed_fill = snapshot.fills().iter().any(|fill| {
+                self.owner_for_signed_fill(fill)
+                    .is_some_and(|owner| binding.matches_owner(&owner))
+                    && self
+                        .grid_bridges
+                        .get(&binding.key)
+                        .is_some_and(|bridge| bridge.needs_signed_fill_application(fill))
+            });
+            if !has_new_signed_fill {
+                return Err(self.grid_recovery_error(
+                    "pending Grid surface differs after a fresh signed read, but no new WAL-owned fill explains it",
+                ));
+            }
+        }
+        Err(self.grid_recovery_error(
+            "signed Grid pre-resume catch-up exceeded its bounded convergence rounds",
+        ))
     }
 
     /// Applies only WAL-owned signed fills that explain an exact managed-surface gap. This path
@@ -100,7 +182,7 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
                         && self
                             .grid_bridges
                             .get(&binding.key)
-                            .is_some_and(|bridge| bridge.has_accepted_route_for_fill(fill))
+                            .is_some_and(|bridge| bridge.needs_signed_fill_application(fill))
                 })
                 .cloned()
                 .collect::<Vec<_>>();

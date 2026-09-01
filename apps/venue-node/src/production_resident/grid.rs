@@ -497,6 +497,11 @@ impl GridBridgeState {
                 let Some(native) = route.accepted_venue_order_id.as_deref() else {
                     return false;
                 };
+                let expected_filled_quantity = self
+                    .partial_fills
+                    .get(native)
+                    .map(|partial| partial.cumulative_quantity)
+                    .unwrap_or_default();
                 orders.iter().any(|actual| {
                     !actual.external
                         && actual.owner.as_ref() == Some(&owner_for_order(&self.grid, desired))
@@ -514,9 +519,7 @@ impl GridBridgeState {
                         && actual.limit_price == Some(desired.price.value())
                         && actual.time_in_force == Some(venue_domain::LimitTimeInForce::PostOnly)
                         && actual.reduce_only == desired.reduce_only
-                        && actual.filled_quantity.is_some_and(|filled| {
-                            filled >= rust_decimal::Decimal::ZERO && filled < actual.quantity
-                        })
+                        && actual.filled_quantity == Some(expected_filled_quantity)
                         && matches!(
                             actual.state,
                             Some(OrderState::New | OrderState::PartiallyFilled)
@@ -533,6 +536,16 @@ impl GridBridgeState {
             route.accepted_venue_order_id.as_deref() == Some(fill.order_id.as_str())
                 && self.grid.owned_orders.contains_key(&route.key)
         })
+    }
+
+    /// A signed overlap may repeat a partial fill that is already checkpointed. Such a slice is
+    /// evidence for the current surface but must not consume another facts-journal sequence.
+    pub(crate) fn needs_signed_fill_application(&self, fill: &Fill) -> bool {
+        self.has_accepted_route_for_fill(fill)
+            && !self
+                .partial_fills
+                .get(&fill.order_id)
+                .is_some_and(|partial| partial.fills.contains_key(&fill.fill_id))
     }
 
     /// Establishes the stable client id before Host prepares the order. A duplicated client id or
@@ -1425,6 +1438,9 @@ mod tests {
         let mut wrong_shape = signed.clone();
         wrong_shape[0].quantity += Decimal::new(1, 2);
         assert!(!bridge.signed_pending_surface_matches(&wrong_shape));
+        let mut wrong_filled_quantity = signed.clone();
+        wrong_filled_quantity[0].filled_quantity = Some(Decimal::new(1, 2));
+        assert!(!bridge.signed_pending_surface_matches(&wrong_filled_quantity));
         let mut missing = signed.clone();
         missing.pop();
         assert!(!bridge.signed_pending_surface_matches(&missing));
@@ -1442,6 +1458,65 @@ mod tests {
             .collect::<Vec<_>>();
         bridge.bind_accepted_plan(&plan, &accepted)?;
         assert!(!bridge.signed_pending_surface_matches(&signed));
+        Ok(())
+    }
+
+    #[test]
+    fn stopped_writer_extends_pending_surface_with_later_signed_fills()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut bridge, _first_key, first_source, first_native) = bridge_with_accepted_order()?;
+        let accepted_before = bridge
+            .routes
+            .values()
+            .filter(|route| route.accepted_venue_order_id.is_some())
+            .count();
+        let first = owned_fill(
+            "stopped-writer-fill-1",
+            &first_native,
+            &first_source,
+            first_source.quantity,
+            first_source.price,
+        )?;
+        let GridDecision::Actions(first_actions) = bridge.observe_persisted_fill(&first, 9)? else {
+            return Err("first stopped-writer fill did not reserve a transaction".into());
+        };
+        let _first_plan = bridge.plan_dispatch(&first_actions[0])?;
+
+        let (second_source, second_native) = bridge
+            .routes
+            .iter()
+            .find_map(|(key, route)| {
+                route
+                    .accepted_venue_order_id
+                    .as_ref()
+                    .filter(|_| bridge.grid.owned_orders.contains_key(key))
+                    .and_then(|native| {
+                        bridge
+                            .grid
+                            .owned_orders
+                            .get(key)
+                            .map(|source| (source.clone(), native.clone()))
+                    })
+            })
+            .ok_or("second accepted route")?;
+        let second = owned_fill(
+            "stopped-writer-fill-2",
+            &second_native,
+            &second_source,
+            second_source.quantity,
+            second_source.price,
+        )?;
+        let GridDecision::Actions(second_actions) = bridge.observe_persisted_fill(&second, 9)?
+        else {
+            return Err("second stopped-writer fill did not reserve a transaction".into());
+        };
+        let _second_plan = bridge.plan_dispatch(&second_actions[0])?;
+
+        assert_eq!(bridge.pending_dispatch_plans()?.len(), 2);
+        let before_dispatch = bridge.pending_pre_dispatch_orders()?;
+        assert_eq!(before_dispatch.len(), accepted_before - 2);
+        let signed = signed_orders_for(&bridge, &before_dispatch)?;
+        assert!(bridge.signed_pending_surface_matches(&signed));
         Ok(())
     }
 
@@ -1464,10 +1539,12 @@ mod tests {
             first_quantity,
             source.price,
         )?;
+        assert!(bridge.needs_signed_fill_application(&first));
         assert_eq!(
             bridge.observe_persisted_fill(&first, 9)?,
             GridDecision::Noop
         );
+        assert!(!bridge.needs_signed_fill_application(&first));
         let checkpoint = bridge.checkpoint_bytes()?;
         let mut decoded: GridBridgeState = serde_json::from_slice(&checkpoint)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -1510,7 +1587,9 @@ mod tests {
             remaining_quantity,
             source.price,
         )?;
+        assert!(bridge.needs_signed_fill_application(&completion));
         let decision = bridge.observe_persisted_fill(&completion, 9)?;
+        assert!(!bridge.needs_signed_fill_application(&completion));
         let GridDecision::Actions(actions) = decision else {
             return Err("completed maker fill did not produce a rolling action".into());
         };
