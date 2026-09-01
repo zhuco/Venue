@@ -1847,7 +1847,7 @@ fn account_entry_order_notionals(
             });
         }
     }
-    for row in json_rows(algo)? {
+    for row in algo_order_rows(algo)? {
         // Conditional family has several wire shapes. A non-reduce strategy that is not fully
         // normalized must reserve no guessed value: it closes entry admission until reconciled.
         if !bool_field(&row, "reduceOnly")? && !bool_field(&row, "closePosition")? {
@@ -1855,6 +1855,35 @@ fn account_entry_order_notionals(
         }
     }
     Ok(notionals)
+}
+
+fn algo_order_rows(
+    payload: &[u8],
+) -> Result<Vec<serde_json::Map<String, Value>>, AccountHostValidationError> {
+    let value: Value =
+        serde_json::from_slice(payload).map_err(|_| AccountHostValidationError::RiskEvidence)?;
+    let page = value
+        .as_object()
+        .ok_or(AccountHostValidationError::RiskEvidence)?;
+    let orders = page
+        .get("orders")
+        .and_then(Value::as_array)
+        .ok_or(AccountHostValidationError::RiskEvidence)?;
+    let total = page
+        .get("total")
+        .and_then(Value::as_u64)
+        .ok_or(AccountHostValidationError::RiskEvidence)?;
+    if usize::try_from(total).ok() != Some(orders.len()) {
+        return Err(AccountHostValidationError::RiskEvidence);
+    }
+    orders
+        .iter()
+        .map(|row| {
+            row.as_object()
+                .cloned()
+                .ok_or(AccountHostValidationError::RiskEvidence)
+        })
+        .collect()
 }
 
 fn account_rules(
