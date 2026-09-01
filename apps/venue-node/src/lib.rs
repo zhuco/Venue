@@ -475,10 +475,7 @@ fn prepare_run_projection_artifacts(
         .build()
         .map_err(|_| NodeError::ResidentRuntime)?;
     for (strategy, path) in config.strategies.iter().zip(projection_paths) {
-        if !projection_compatibility_candidates(&path)
-            .iter()
-            .any(|candidate| candidate.exists())
-        {
+        if !projection_requires_compatibility_drain(&path)? {
             continue;
         }
         validate_projection_compatibility_files(&path)?;
@@ -545,6 +542,24 @@ fn validate_projection_compatibility_files(path: &Path) -> Result<(), NodeError>
         }
     }
     Ok(())
+}
+
+fn projection_requires_compatibility_drain(path: &Path) -> Result<bool, NodeError> {
+    for candidate in projection_compatibility_candidates(path) {
+        match fs::symlink_metadata(candidate) {
+            Ok(metadata)
+                if metadata.file_type().is_file() && !metadata.file_type().is_symlink() =>
+            {
+                if metadata.len() > LIVE_ARTIFACT_FILE_HARD_LIMIT_BYTES {
+                    return Ok(true);
+                }
+            }
+            Ok(_) => return Err(NodeError::ArtifactsBudget),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(NodeError::ArtifactsBudget),
+        }
+    }
+    Ok(false)
 }
 
 fn projection_compatibility_candidates(path: &Path) -> [PathBuf; 3] {
@@ -1161,7 +1176,10 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("projection.jsonl");
         let projection = std::fs::File::create(&path)?;
+        projection.set_len(1024)?;
+        assert!(!projection_requires_compatibility_drain(&path)?);
         projection.set_len(LIVE_ARTIFACT_FILE_HARD_LIMIT_BYTES + 1)?;
+        assert!(projection_requires_compatibility_drain(&path)?);
         assert!(validate_projection_compatibility_files(&path).is_ok());
         assert!(
             validate_projection_compatibility_budget(temp.path(), std::slice::from_ref(&path))

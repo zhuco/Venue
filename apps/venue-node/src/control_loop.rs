@@ -1941,11 +1941,6 @@ fn completion_unless_expired<T>(
     }
 }
 
-fn backoff(failures: u32) -> Duration {
-    let exponent = failures.saturating_sub(1).min(6);
-    Duration::from_millis(100_u64.saturating_mul(1_u64 << exponent)).min(MAX_BACKOFF)
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum ControlResidentLoopError {
     #[error("node runtime configuration is invalid")]
@@ -1978,27 +1973,6 @@ pub enum ControlResidentLoopError {
     CopyJournal(#[from] crate::CopyDeliveryJournalError),
     #[error(transparent)]
     ShutdownJournal(#[from] crate::control_shutdown_journal::ControlShutdownJournalError),
-}
-
-impl ControlResidentLoopError {
-    fn retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::Http(
-                crate::ControlHttpClientError::Transport
-                    | crate::ControlHttpClientError::Timeout
-                    | crate::ControlHttpClientError::HttpStatus(_)
-            ) | Self::Delivery(ControlDeliveryDriverError::Http(
-                crate::ControlHttpClientError::Transport
-                    | crate::ControlHttpClientError::Timeout
-                    | crate::ControlHttpClientError::HttpStatus(_)
-            )) | Self::Outbox(NodeProjectionOutboxError::Http(
-                crate::ControlHttpClientError::Transport
-                    | crate::ControlHttpClientError::Timeout
-                    | crate::ControlHttpClientError::HttpStatus(_)
-            ))
-        )
-    }
 }
 
 #[cfg(test)]

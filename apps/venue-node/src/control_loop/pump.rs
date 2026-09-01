@@ -3,6 +3,32 @@ use std::time::Instant;
 
 const MARKET_IDLE_CADENCE: Duration = Duration::from_millis(5);
 
+fn backoff(failures: u32) -> Duration {
+    let exponent = failures.saturating_sub(1).min(6);
+    Duration::from_millis(100_u64.saturating_mul(1_u64 << exponent)).min(MAX_BACKOFF)
+}
+
+impl ControlResidentLoopError {
+    fn retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Http(
+                crate::ControlHttpClientError::Transport
+                    | crate::ControlHttpClientError::Timeout
+                    | crate::ControlHttpClientError::HttpStatus(_)
+            ) | Self::Delivery(ControlDeliveryDriverError::Http(
+                crate::ControlHttpClientError::Transport
+                    | crate::ControlHttpClientError::Timeout
+                    | crate::ControlHttpClientError::HttpStatus(_)
+            )) | Self::Outbox(NodeProjectionOutboxError::Http(
+                crate::ControlHttpClientError::Transport
+                    | crate::ControlHttpClientError::Timeout
+                    | crate::ControlHttpClientError::HttpStatus(_)
+            ))
+        )
+    }
+}
+
 impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
     pub(super) fn run_with_private_pump<F>(mut self, mut pump: F) -> Result<(), NodeError>
     where
