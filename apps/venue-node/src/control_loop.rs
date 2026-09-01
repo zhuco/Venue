@@ -211,6 +211,14 @@ impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
         http_runtime: &tokio::runtime::Runtime,
         now: u64,
     ) -> Result<bool, ControlResidentLoopError> {
+        if self.last_projection_ms == 0 {
+            // The first projection registers the exact durable strategy scope in Control. An
+            // empty production database must see that scope before a claim can be authorized.
+            if !self.publish_projections(http_runtime, now)? {
+                return Ok(false);
+            }
+            self.last_projection_ms = now;
+        }
         let ids = self.drivers.keys().cloned().collect::<Vec<_>>();
         for instance_id in ids {
             let mut copy_reconciliation_turns = Vec::new();

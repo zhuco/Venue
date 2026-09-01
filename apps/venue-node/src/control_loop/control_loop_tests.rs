@@ -547,10 +547,10 @@ async fn resident_control_delivery_roundtrip(
     assert_eq!(
         requests.iter().map(|(path, _)| path).collect::<Vec<_>>(),
         vec![
+            "/v2/account-node/projection",
             "/v2/account-node/deliveries/claim",
             "/v2/account-node/deliveries/ack",
             "/v2/account-node/deliveries/receipts",
-            "/v2/account-node/projection",
             "/v2/account-node/deliveries/claim",
             "/v2/account-node/projection",
         ]
@@ -757,9 +757,9 @@ async fn publisher_uploads_only_fresh_signed_leader_planning_fact()
     assert_eq!(
         requests.iter().map(|(path, _)| path).collect::<Vec<_>>(),
         vec![
-            "/v2/account-node/deliveries/claim",
             "/v2/copy/relations",
             "/v2/account-node/projection",
+            "/v2/account-node/deliveries/claim",
         ]
     );
     let projection_body = requests
@@ -1863,15 +1863,12 @@ async fn server(
     let address = listener.local_addr()?;
     let handle = tokio::spawn(async move {
         let mut paths = Vec::new();
-        for index in 0..count {
+        let mut first_claim = Some(claim);
+        for _ in 0..count {
             let (mut stream, _) = listener.accept().await?;
             let (path, body) = request(&mut stream).await?;
             let response = if path.ends_with("/claim") {
-                if index == 0 {
-                    claim.clone()
-                } else {
-                    b"[]".to_vec()
-                }
+                first_claim.take().unwrap_or_else(|| b"[]".to_vec())
             } else if path == "/v2/copy/relations" {
                 serde_json::to_vec(&relations).map_err(io::Error::other)?
             } else {
@@ -1904,7 +1901,7 @@ async fn copy_reconciliation_server(
         let mut paths = Vec::new();
         let mut claims = vec![install, reconciliation].into_iter();
         let mut first_receipt_is_lost = true;
-        for _ in 0..8 {
+        for _ in 0..10 {
             let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
                 .await
                 .map_err(|_| {
