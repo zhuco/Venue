@@ -8,7 +8,7 @@ use venue_runtime::{
     strategy::StrategyInput,
 };
 
-use super::{ProductionResident, grid::GridDispatchPlan, persist_anchor, resident_error};
+use super::{ProductionResident, grid::GridDispatchPlan, persist_anchor};
 use crate::NodeError;
 
 const MAX_SIGNED_GRID_CATCH_UP_ROUNDS: usize = 64;
@@ -318,11 +318,20 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
             .grid_bridges
             .get(&binding.key)
             .ok_or(NodeError::ResidentRuntime)?
-            .checkpoint_bytes()?;
+            .checkpoint_bytes()
+            .map_err(|error| {
+                self.grid_recovery_error(&format!(
+                    "signed Grid recovery checkpoint could not be re-encoded: {error}"
+                ))
+            })?;
         let applied = self
             .runtime
             .persist_resident_semantic_turn(binding, replay)
-            .map_err(resident_error)?;
+            .map_err(|error| {
+                self.grid_recovery_error(&format!(
+                    "signed Grid recovery dispatch turn could not persist: {error}"
+                ))
+            })?;
         persist_anchor(&self.artifacts_root, binding, &applied)?;
         if let Err(error) = self.host.prepare_and_admit_managed_grid_batch(
             &mut self.runtime,
@@ -377,6 +386,7 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
                 }
             }
         }
+        let venue = self.host.binding().venue;
         let replay = {
             let bridge = self
                 .grid_bridges
@@ -384,13 +394,27 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
                 .ok_or(NodeError::ResidentRuntime)?;
             bridge
                 .bind_accepted_plan(plan, &accepted)
-                .map_err(|_| NodeError::ResidentRuntime)?;
-            bridge.checkpoint_bytes()?
+                .map_err(|error| {
+                    grid_recovery_error_for(
+                        venue,
+                        format!("signed Grid accepted routes could not settle: {error}"),
+                    )
+                })?;
+            bridge.checkpoint_bytes().map_err(|error| {
+                grid_recovery_error_for(
+                    venue,
+                    format!("signed Grid accepted checkpoint could not encode: {error}"),
+                )
+            })?
         };
         let accepted_turn = self
             .runtime
             .persist_resident_semantic_turn(binding, replay)
-            .map_err(resident_error)?;
+            .map_err(|error| {
+                self.grid_recovery_error(&format!(
+                    "signed Grid accepted dispatch turn could not persist: {error}"
+                ))
+            })?;
         persist_anchor(&self.artifacts_root, binding, &accepted_turn)
     }
 
