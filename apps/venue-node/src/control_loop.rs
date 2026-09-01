@@ -254,27 +254,30 @@ impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
                         match action {
                             Some(venue_control_protocol::ControlAction::Trade) => {
                                 let completion = match self.resident.apply_manual_trade(binding, &turn) {
-                                    Ok(crate::production_resident::manual::ManualTradeOutcome::Applied(applied)) => turn.applied_from_runtime(
+                                    Ok(crate::production_resident::manual::ManualTradeOutcome::Applied(applied)) => completion_unless_expired(turn.applied_from_runtime(
                                         &applied,
-                                        now,
+                                        fresh_completion_ms()?,
                                         "manual trade Accepted and confirmed by a fresh signed account readback",
-                                    )?,
-                                    Ok(crate::production_resident::manual::ManualTradeOutcome::Rejected { applied, detail }) => turn.rejected(
-                                        now,
+                                    ))?,
+                                    Ok(crate::production_resident::manual::ManualTradeOutcome::Rejected { applied, detail }) => completion_unless_expired(turn.rejected(
+                                        fresh_completion_ms()?,
                                         applied.durable_fact_digest().ok_or(ControlResidentLoopError::Config)?,
                                         detail,
-                                    )?,
-                                    Ok(crate::production_resident::manual::ManualTradeOutcome::Unknown { applied, detail }) => turn.unknown(
-                                        now,
+                                    ))?,
+                                    Ok(crate::production_resident::manual::ManualTradeOutcome::Unknown { applied, detail }) => completion_unless_expired(turn.unknown(
+                                        fresh_completion_ms()?,
                                         applied.durable_fact_digest().ok_or(ControlResidentLoopError::Config)?,
                                         detail,
-                                    )?,
-                                    Err(NodeError::ResidentRuntime) => turn.rejected(
-                                        now,
+                                    ))?,
+                                    Err(NodeError::ResidentRuntime) => completion_unless_expired(turn.rejected(
+                                        fresh_completion_ms()?,
                                         [0; 32],
                                         "manual trade was rejected: unsupported binding, unsafe recovery state, or invalid signed scope",
-                                    )?,
+                                    ))?,
                                     Err(error) => return Err(ControlResidentLoopError::Resident(error)),
+                                };
+                                let Some(completion) = completion else {
+                                    continue;
                                 };
                                 if !self.submit_actor_completion(
                                     http_runtime,
@@ -286,9 +289,19 @@ impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
                                 }
                             }
                             Some(action) => {
+                                let venue_control_protocol::AccountDeliveryPayload::ControlCommand(
+                                    command,
+                                ) = turn.payload()
+                                else {
+                                    return Err(ControlResidentLoopError::Config);
+                                };
                                 let applied = self
                                     .resident
-                                    .apply_control_action(binding, action)
+                                    .apply_control_delivery(
+                                        binding,
+                                        &turn.lease().delivery_id,
+                                        command,
+                                    )
                                     .map_err(ControlResidentLoopError::Resident)?;
                                 if matches!(
                                     action,
@@ -301,11 +314,15 @@ impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
                                         .begin(action)
                                         .map_err(|_| ControlResidentLoopError::ControlShutdown)?;
                                 }
-                                let completion = turn.applied_from_runtime(
-                                    &applied,
-                                    now,
-                                    control_applied_detail(action),
-                                )?;
+                                let completion =
+                                    completion_unless_expired(turn.applied_from_runtime(
+                                        &applied,
+                                        fresh_completion_ms()?,
+                                        control_applied_detail(action),
+                                    ))?;
+                                let Some(completion) = completion else {
+                                    continue;
+                                };
                                 if !self.submit_actor_completion(
                                     http_runtime,
                                     &instance_id,
@@ -378,8 +395,52 @@ impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
                             continue;
                         }
                         if !is_manual_trade {
-                            // Other reconciliation families retain their existing dedicated
-                            // recovery drivers; this path has no authority to infer a result.
+                            let venue_control_protocol::AccountDeliveryPayload::ControlCommand(
+                                command,
+                            ) = turn.payload()
+                            else {
+                                continue;
+                            };
+                            if let Some(account_fact_digest) = self
+                                .resident
+                                .reconcile_control_delivery(
+                                    binding,
+                                    &turn.lease().delivery_id,
+                                    command,
+                                )
+                                .map_err(ControlResidentLoopError::Resident)?
+                            {
+                                if matches!(
+                                    command.action,
+                                    venue_control_protocol::ControlAction::Stop
+                                        | venue_control_protocol::ControlAction::Flatten
+                                ) && self
+                                    .shutdowns
+                                    .get(&instance_id)
+                                    .and_then(ControlShutdownJournal::operation)
+                                    .is_none_or(|operation| operation.action != command.action)
+                                {
+                                    continue;
+                                }
+                                let completion = completion_unless_expired(turn.reconciled(
+                                    fresh_completion_ms()?,
+                                    account_fact_digest,
+                                    "exact request-bound lifecycle Actor checkpoint and Runtime state reconciled",
+                                ))?;
+                                if let Some(completion) = completion
+                                    && !self.submit_reconciliation(
+                                        http_runtime,
+                                        &instance_id,
+                                        completion,
+                                        fresh_completion_ms()?,
+                                    )?
+                                {
+                                    return Ok(false);
+                                }
+                            }
+                            // Stop/Flatten keep their dedicated signed shutdown recovery after
+                            // the semantic receipt. An older action-only checkpoint remains
+                            // unresolved for an operator.
                             continue;
                         }
                         match self
@@ -392,7 +453,14 @@ impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
                                 account_fact_digest,
                                 detail,
                             } => {
-                                let completion = turn.reconciled(now, account_fact_digest, detail)?;
+                                let completion = completion_unless_expired(turn.reconciled(
+                                    fresh_completion_ms()?,
+                                    account_fact_digest,
+                                    detail,
+                                ))?;
+                                let Some(completion) = completion else {
+                                    continue;
+                                };
                                 if !self.submit_reconciliation(
                                     http_runtime,
                                     &instance_id,
@@ -1858,6 +1926,20 @@ fn now_ms() -> Result<u64, ()> {
         .as_millis()
         .try_into()
         .map_err(|_| ())
+}
+
+fn fresh_completion_ms() -> Result<u64, ControlResidentLoopError> {
+    now_ms().map_err(|_| ControlResidentLoopError::Signal)
+}
+
+fn completion_unless_expired<T>(
+    completion: Result<T, crate::ControlDeliveryError>,
+) -> Result<Option<T>, ControlResidentLoopError> {
+    match completion {
+        Ok(completion) => Ok(Some(completion)),
+        Err(crate::ControlDeliveryError::LeaseExpired) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn backoff(failures: u32) -> Duration {

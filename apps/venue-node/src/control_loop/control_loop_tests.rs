@@ -394,7 +394,7 @@ async fn resident_control_delivery_roundtrip(
             expires_at_ms: now.saturating_add(990),
             purpose: AccountDeliveryPurpose::Install,
         },
-        payload: AccountDeliveryPayload::ControlCommand(command),
+        payload: AccountDeliveryPayload::ControlCommand(command.clone()),
     };
     let (origin, server) = server(serde_json::to_vec(&vec![claim])?, 6, Vec::new()).await?;
     let launch = NodeLaunch::try_parse_from(
@@ -504,7 +504,9 @@ async fn resident_control_delivery_roundtrip(
         let wal_path = launch.artifacts_root().join("commands.jsonl");
         let wal_before = fs::read(&wal_path).map_err(|_| ControlResidentLoopError::Config)?;
         let mut loopback = ControlResidentLoop::open(&launch, &config, resident)?;
-        loopback.tick(&runtime, now)?;
+        // The claim is created after this tick timestamp. Completion must sample a fresh clock
+        // after poll/ACK/fsync/apply instead of reusing this pre-lease value.
+        loopback.tick(&runtime, now.saturating_sub(20))?;
         loopback.tick(&runtime, now.saturating_add(20))?;
         if action == ControlAction::Trade {
             let actor = config
@@ -583,6 +585,24 @@ async fn resident_control_delivery_roundtrip(
     assert_eq!(
         envelope.facts.fills[0].position_side,
         Some(PositionSide::Long)
+    );
+    let exact_binding = loopback
+        .bindings
+        .get("grid-doge")
+        .cloned()
+        .ok_or("binding missing")?;
+    assert_eq!(
+        loopback
+            .resident
+            .reconcile_control_delivery(&exact_binding, "delivery-e2e", &command,)?
+            .is_some(),
+        action == ControlAction::Pause,
+    );
+    assert!(
+        loopback
+            .resident
+            .reconcile_control_delivery(&exact_binding, "wrong-delivery", &command)?
+            .is_none()
     );
     // The snapshot also contains an unowned same-symbol order. Flatten may be semantically
     // accepted, but no cancellation can be admitted until an operator resolves that scope

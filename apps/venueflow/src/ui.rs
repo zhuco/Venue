@@ -1104,36 +1104,38 @@ fn show_control(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient)
         return;
     };
     ui.separator();
-    ui.label(format!(
-        "{}: {}",
-        text(language, TextKey::Venue),
-        strategy.venue
-    ));
-    ui.label(format!(
-        "{}: {}",
-        text(language, TextKey::Mode),
-        strategy.mode
-    ));
-    ui.label(format!(
-        "{}: {}",
-        text(language, TextKey::Account),
-        strategy.trading_account_id
-    ));
-    ui.label(format!(
-        "{}: {}",
-        text(language, TextKey::Symbol),
-        strategy.symbol
-    ));
-    ui.label(format!(
-        "{}: {}",
-        text(language, TextKey::Epoch),
-        strategy.config_epoch
-    ));
-    lifecycle_label(ui, strategy.lifecycle);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(format!(
+            "{}: {}",
+            text(language, TextKey::Venue),
+            strategy.venue
+        ));
+        ui.label(format!(
+            "{}: {}",
+            text(language, TextKey::Mode),
+            strategy.mode
+        ));
+        ui.monospace(format!(
+            "{}: {}",
+            text(language, TextKey::Account),
+            short_account(&strategy.trading_account_id)
+        ));
+        ui.label(format!(
+            "{}: {}",
+            text(language, TextKey::Symbol),
+            strategy.symbol
+        ));
+        ui.label(format!(
+            "{}: {}",
+            text(language, TextKey::Epoch),
+            strategy.config_epoch
+        ));
+        lifecycle_label(ui, strategy.lifecycle);
+    });
     if let Some(attention) = &strategy.attention {
-        ui.colored_label(theme::WARNING, attention);
+        ui.small(RichText::new(attention).color(theme::WARNING));
     }
-    ui.add_space(8.0);
+    ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
         for (action, label) in [
             (ControlAction::Pause, text(language, TextKey::Pause)),
@@ -1151,9 +1153,10 @@ fn show_control(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient)
             }
         }
     });
-    ui.separator();
-    ui.small(text(language, TextKey::StopSemantics));
-    ui.small(text(language, TextKey::ConfirmationSemantics));
+    ui.horizontal_wrapped(|ui| {
+        ui.small(text(language, TextKey::StopSemantics));
+        ui.small(text(language, TextKey::ConfirmationSemantics));
+    });
     if !model.commands.is_empty() {
         ui.separator();
         ui.strong(text(language, TextKey::SessionReceipts));

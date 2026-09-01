@@ -6,8 +6,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::Serialize;
-use venue_control_protocol::ControlAction;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use venue_control_protocol::{ControlAction, ControlCommandRequest};
 use venue_domain::domain::{ExecutionCommand, Price};
 use venue_runtime::{
     AccountPhysicalGateway, AccountSymbolSet, AppliedStrategyTurnReceipt, StrategyBinding,
@@ -349,8 +350,90 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         if action == ControlAction::Trade {
             return Err(NodeError::ResidentRuntime);
         }
-        let replay = serde_json::to_vec(&ResidentControlReplay { action })
+        let replay = serde_json::to_vec(&ResidentControlReplay::legacy(action))
             .map_err(|_| NodeError::ResidentRuntime)?;
+        self.apply_persisted_control_action(binding, action, replay)
+    }
+
+    /// Persists the exact Control delivery identity with the semantic lifecycle turn. A later
+    /// ReconcileOnly lease may use this checkpoint as evidence, but an older action-only
+    /// checkpoint can never be mistaken for the current request.
+    pub fn apply_control_delivery(
+        &mut self,
+        binding: &StrategyBinding,
+        delivery_id: &str,
+        command: &ControlCommandRequest,
+    ) -> Result<AppliedStrategyTurnReceipt, NodeError> {
+        if command.action == ControlAction::Trade || delivery_id.trim().is_empty() {
+            return Err(NodeError::ResidentRuntime);
+        }
+        let replay = ResidentControlReplay::for_delivery(delivery_id, command)?;
+        let encoded = serde_json::to_vec(&replay).map_err(|_| NodeError::ResidentRuntime)?;
+        self.apply_persisted_control_action(binding, command.action, encoded)
+    }
+
+    /// Returns a read-only commitment only when the latest Runtime-verified Actor checkpoint is
+    /// bound to this exact request and its in-memory lifecycle already reflects the requested
+    /// Pause/Resume transition. It never replays an action or grants mutation authority.
+    pub fn reconcile_control_delivery(
+        &self,
+        binding: &StrategyBinding,
+        delivery_id: &str,
+        command: &ControlCommandRequest,
+    ) -> Result<Option<[u8; 32]>, NodeError> {
+        if command.action == ControlAction::Trade || delivery_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let Some(encoded) = self
+            .runtime
+            .resident_actor_checkpoint(binding)
+            .map_err(resident_error)?
+        else {
+            return Ok(None);
+        };
+        let recovered = serde_json::from_slice::<ResidentControlReplay>(&encoded)
+            .map_err(|_| NodeError::ResidentRuntime)?;
+        let expected = ResidentControlReplay::for_delivery(delivery_id, command)?;
+        if recovered != expected {
+            return Ok(None);
+        }
+        let lifecycle = self.strategy_lifecycle(binding);
+        let converged = match command.action {
+            ControlAction::Pause => {
+                lifecycle == Some(venue_runtime::account::InstanceLifecycle::Paused)
+            }
+            ControlAction::Resume => matches!(
+                lifecycle,
+                Some(
+                    venue_runtime::account::InstanceLifecycle::Recovering
+                        | venue_runtime::account::InstanceLifecycle::Running
+                )
+            ),
+            ControlAction::Stop | ControlAction::Flatten => {
+                lifecycle == Some(venue_runtime::account::InstanceLifecycle::Stopping)
+            }
+            ControlAction::Trade => false,
+        };
+        if !converged {
+            return Ok(None);
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"venue.node.control-reconciliation.v1");
+        digest.update(binding.key.account.exchange.as_str().as_bytes());
+        digest.update(binding.key.account.account.as_bytes());
+        digest.update(binding.key.instance_id.as_bytes());
+        digest.update(binding.key.symbol.to_string().as_bytes());
+        digest.update(binding.config_digest.as_bytes());
+        digest.update(encoded);
+        Ok(Some(digest.finalize().into()))
+    }
+
+    fn apply_persisted_control_action(
+        &mut self,
+        binding: &StrategyBinding,
+        action: ControlAction,
+        replay: Vec<u8>,
+    ) -> Result<AppliedStrategyTurnReceipt, NodeError> {
         let applied = self
             .runtime
             .persist_resident_semantic_turn(binding, replay)
@@ -985,9 +1068,36 @@ struct ResidentReplay<'a> {
     command: &'a ExecutionCommand,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct ResidentControlReplay {
     action: ControlAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_sha256: Option<[u8; 32]>,
+}
+
+impl ResidentControlReplay {
+    fn legacy(action: ControlAction) -> Self {
+        Self {
+            action,
+            request_id: None,
+            delivery_id: None,
+            request_sha256: None,
+        }
+    }
+
+    fn for_delivery(delivery_id: &str, command: &ControlCommandRequest) -> Result<Self, NodeError> {
+        let encoded = serde_json::to_vec(command).map_err(|_| NodeError::ResidentRuntime)?;
+        Ok(Self {
+            action: command.action,
+            request_id: Some(command.request_id.clone()),
+            delivery_id: Some(delivery_id.to_owned()),
+            request_sha256: Some(Sha256::digest(encoded).into()),
+        })
+    }
 }
 
 fn actor_artifacts(root: &Path) -> Result<ResidentActorAppliedArtifacts, NodeError> {
