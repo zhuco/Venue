@@ -321,7 +321,7 @@ Desired Orders，期间的新成交须先消费并重新计算目标集合。`Ru
 
 账户的广义生产风险 fence 不因 Grid 接管而清除：任一非零仓位、开放订单、外部订单或未决 WAL 仍保持 fence。新 Runtime 只可在 Host 证明当前签名 Hedge 订单面与 WAL Owner（含 purpose）一一对应、无外部/额外订单且 Actor Applied 与配置代仍为当前值后安装不可序列化的内存 `Exact` 权限；它至多消费为一个 `Batch`。空订单面安装只允许最多 200 条 post-only Place；滚动批次必须恰为两条 post-only Place 加一条针对旧签名面的 Cancel。启动撤单是唯一窄例外：可在无新增风险的 Critical lane 中逐条消费精确签名成员，即使存在无关 Unknown 也不读取 entry risk，但仍须持久 WAL、单 writer 与派发前更新签名目标校验。Host 对含 Place 的批次只读取一次新鲜汇率/风险证据，且逐条维持不超过 10U；第一条 Rejected/Unknown、签名刷新、重连、Pause、改参或代际变化立即撤销剩余增险权限，禁止自动重投。
 
-启动 reconciliation episode 已持久化、所有旧 target 逐一得到 WAL 与签名消失证明且完整受管订单面为空后，允许同一启动自动获得一次 `old_epoch + 1` 安装；不再要求 `--confirm-reset-rebuild`。这项自动化只覆盖撤旧后的新 epoch，不允许复活任何旧 Place/Replace；机会在 place 计划写入 Actor checkpoint 时即耐久消费，失败后监督器只能保持 Paused/NeedsAttention。Rejected 使用新 attempt/epoch 身份；精确 Prepared 原地终结，Unknown 或 Submitted 仍失败关闭。
+启动 reconciliation episode 已持久化、所有旧 target 逐一得到 WAL 与签名消失证明且完整受管订单面为空后，允许同一启动自动获得一次 `old_epoch + 1` 安装；不再要求 `--confirm-reset-rebuild`。这项自动化只覆盖撤旧后的新 epoch，不允许复活任何旧 Place/Replace；机会在 place 计划写入 Actor checkpoint 时即耐久消费。若该批次只有 Absent/Rejected 与可精确绑定的 Accepted 子集，下一次恢复必须撤净 Accepted 子集、以新的 reconciliation operation 和更高 epoch 重建；不得重投旧 Place。精确 Prepared 原地终结，Unknown 或 Submitted 仍保持 Paused/NeedsAttention 且不重投。
 
 停机期间旧单可能成交，因此启动签名订单面允许是 checkpoint 受管面的严格子集：每个仍开放订单必须继续精确匹配 Owner、client/native id、方向、数量、价格、TIF 与已知成交量；签名缺失的旧 child 只可在已持久化 reconciliation episode 中按“已消失”退役，再撤销剩余 child。任何额外订单、形状变化或 unresolved mutation 仍失败关闭。最终必须再次签名证明受管面为空，才可按最新签名仓位和当前 BBO 建立更高 epoch；不得恢复旧中心或重投旧 Place。
 

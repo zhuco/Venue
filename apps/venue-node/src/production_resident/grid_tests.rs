@@ -739,7 +739,7 @@ fn partial_first_install_enters_cancel_drain_before_a_new_epoch()
 }
 
 #[test]
-fn failed_reconciliation_rebuild_cannot_retry_after_checkpoint()
+fn terminal_rejected_reconciliation_rebuild_rearms_only_after_signed_drain_shape()
 -> Result<(), Box<dyn std::error::Error>> {
     let (mut bridge, _key, _source, _native) = bridge_with_accepted_order()?;
     bridge.mark_bootstrap_confirmed()?;
@@ -778,17 +778,29 @@ fn failed_reconciliation_rebuild_cannot_retry_after_checkpoint()
         .is_err()
     );
     bridge.begin_unconfirmed_install_reconciliation()?;
-    assert!(!bridge.needs_reconciliation_rebuild());
-    assert!(bridge.next_install_epoch().is_err());
+    assert!(bridge.needs_reconciliation_rebuild());
+    assert_eq!(bridge.next_install_epoch()?, 3);
 
     let checkpoint = bridge.checkpoint_bytes()?;
     let restored = GridBridgeState::restore_or_bootstrap(
-        Some(checkpoint),
+        Some(checkpoint.clone()),
         bridge.grid.clone(),
         NodeGridRecoveryPolicy::RequireExisting,
     )?;
-    assert!(!restored.needs_reconciliation_rebuild());
-    assert!(restored.next_install_epoch().is_err());
+    assert!(restored.needs_reconciliation_rebuild());
+    assert_eq!(restored.next_install_epoch()?, 3);
+
+    let mut stranded: serde_json::Value = serde_json::from_slice(&checkpoint)?;
+    stranded["startup_reconciliation"]["rebuild_attempted"] = serde_json::Value::Bool(true);
+    let mut stranded = GridBridgeState::restore_or_bootstrap(
+        Some(serde_json::to_vec(&stranded)?),
+        bridge.grid.clone(),
+        NodeGridRecoveryPolicy::RequireExisting,
+    )?;
+    assert!(!stranded.needs_reconciliation_rebuild());
+    assert!(stranded.rearm_terminally_drained_rebuild()?);
+    assert!(stranded.needs_reconciliation_rebuild());
+    assert_eq!(stranded.next_install_epoch()?, 3);
     Ok(())
 }
 

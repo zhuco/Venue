@@ -451,6 +451,19 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         }) {
             pending_wal = PendingGridWalDisposition::RequiresSignedReconciliation;
         }
+        let terminally_drained_rebuild_rearmed = pending_wal
+            != PendingGridWalDisposition::RequiresSignedReconciliation
+            && !self.host.has_unresolved()
+            && self
+                .host
+                .latest_signed_snapshot()
+                .is_some_and(|snapshot| snapshot.open_orders().is_empty())
+            && bridge
+                .rearm_terminally_drained_rebuild()
+                .map_err(|error| NodeError::LiveHost {
+                    venue: self.host.binding().venue,
+                    message: format!("terminal Grid rebuild could not re-arm: {error}"),
+                })?;
         let restart_from_signed_surface = matches!(
             pending_wal,
             PendingGridWalDisposition::AllAbsent
@@ -473,7 +486,15 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         let key = binding.key.clone();
         self.grid_bridges.insert(key.clone(), bridge);
         self.grid_bindings.insert(key.clone(), binding);
-        if unconfirmed_install {
+        if terminally_drained_rebuild_rearmed {
+            let binding = self
+                .grid_bindings
+                .get(&key)
+                .cloned()
+                .ok_or(NodeError::ResidentRuntime)?;
+            self.persist_grid_reconciliation_checkpoint(&binding)?;
+            self.grid_bootstrap_pending.insert(key.clone());
+        } else if unconfirmed_install {
             let binding = self
                 .grid_bindings
                 .get(&key)

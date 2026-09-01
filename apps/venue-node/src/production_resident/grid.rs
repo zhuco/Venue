@@ -431,15 +431,51 @@ impl GridBridgeState {
         ) {
             return Err(GridBridgeError::Evidence);
         }
-        if self.startup_reconciliation.is_none() {
-            self.start_reconciliation_episode()?;
+        if self.startup_reconciliation.is_some() {
+            let completed_install_attempt = self
+                .startup_reconciliation
+                .as_ref()
+                .is_some_and(|episode| episode.rebuild_attempted && episode.attempts.is_empty());
+            if !completed_install_attempt {
+                return Err(GridBridgeError::Evidence);
+            }
+            self.startup_reconciliation = None;
         }
+        self.start_reconciliation_episode()?;
         if self.grid.owned_orders.is_empty() {
             self.grid
                 .reset_orders_settled()
                 .map_err(GridBridgeError::Reducer)?;
         }
         self.validate()
+    }
+
+    /// Schema-1 residents could drain a terminally Rejected partial rebuild but retain the prior
+    /// episode's consumed rebuild bit. Only an exactly empty reducer surface with no cancel
+    /// attempt in flight may advance to a fresh episode; the caller separately proves the signed
+    /// venue surface empty and Host WAL free of unresolved outcomes before persisting this repair.
+    pub(crate) fn rearm_terminally_drained_rebuild(&mut self) -> Result<bool, GridBridgeError> {
+        let stranded = matches!(
+            self.bootstrap_state,
+            GridBootstrapState::Attempted | GridBootstrapState::Confirmed
+        ) && self.grid.phase == GridPhase::ResettingGrid
+            && self.grid.epoch.is_some()
+            && self.grid.owned_orders.is_empty()
+            && self.grid.pending_transactions.is_empty()
+            && self.grid.pending_replenishments.is_empty()
+            && self.routes.is_empty()
+            && self.partial_fills.is_empty()
+            && self
+                .startup_reconciliation
+                .as_ref()
+                .is_some_and(|episode| episode.rebuild_attempted && episode.attempts.is_empty());
+        if !stranded {
+            return Ok(false);
+        }
+        self.startup_reconciliation = None;
+        self.start_reconciliation_episode()?;
+        self.validate()?;
+        Ok(true)
     }
 
     /// Returns the exact deterministic WAL ids of every locally reserved rolling transaction.

@@ -396,7 +396,7 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
         Err(self.grid_recovery_error("startup Grid reconciliation exceeded its bounded budget"))
     }
 
-    fn persist_grid_reconciliation_checkpoint(
+    pub(super) fn persist_grid_reconciliation_checkpoint(
         &mut self,
         binding: &StrategyBinding,
     ) -> Result<venue_runtime::AppliedStrategyTurnReceipt, NodeError> {
