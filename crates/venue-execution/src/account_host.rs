@@ -930,6 +930,30 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         self.latest_signed_snapshot.as_ref()
     }
 
+    /// Removes only fills whose resident route and Actor checkpoint are already durable. Until
+    /// this acknowledgement, every subsequent signed page replays the exact fill even though the
+    /// adapter cursor has advanced, closing the refresh-before-Actor crash window.
+    pub fn acknowledge_signed_fills(
+        &mut self,
+        fill_ids: &[String],
+    ) -> Result<(), AccountHostError<G::Error>> {
+        let mut identities = BTreeMap::new();
+        if fill_ids.iter().any(|fill_id| {
+            fill_id.trim().is_empty() || identities.insert(fill_id.clone(), ()).is_some()
+        }) {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::SignedSnapshot,
+            ));
+        }
+        let Some(mut snapshot) = self.latest_signed_snapshot.clone() else {
+            return Err(AccountHostError::Validation(
+                AccountHostValidationError::SignedSnapshot,
+            ));
+        };
+        snapshot.acknowledge_fills(&identities);
+        self.replace_persisted_signed_snapshot(&snapshot)
+    }
+
     fn legacy_v1_custody_routes_from_snapshot(
         &self,
         snapshot: &SignedAccountSnapshot,
@@ -1032,7 +1056,10 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         }
         self.enrich_signed_order_owners(&mut snapshot);
         self.persist_signed_snapshot(&snapshot)?;
-        Ok(snapshot)
+        self.latest_signed_snapshot
+            .clone()
+            .ok_or(AccountHostValidationError::SignedSnapshot)
+            .map_err(AccountHostError::Validation)
     }
 
     /// Re-reads the complete signed account snapshot for every unresolved WAL identity, then
@@ -1183,6 +1210,11 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
                 .iter()
                 .any(|position| !position.quantity.is_zero())
             || self.journal.has_unresolved();
+        let snapshot = self
+            .latest_signed_snapshot
+            .clone()
+            .ok_or(AccountHostValidationError::SignedSnapshot)
+            .map_err(AccountHostError::Validation)?;
         Ok(RuntimeBootstrapReceipt {
             snapshot,
             risk_fenced,
@@ -1245,6 +1277,19 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
     }
 
     fn persist_signed_snapshot(
+        &mut self,
+        snapshot: &SignedAccountSnapshot,
+    ) -> Result<(), AccountHostError<G::Error>> {
+        let mut snapshot = snapshot.clone();
+        if let Some(previous) = &self.latest_signed_snapshot {
+            snapshot
+                .prepend_unacknowledged_fills(previous.fills())
+                .map_err(AccountHostError::Validation)?;
+        }
+        self.replace_persisted_signed_snapshot(&snapshot)
+    }
+
+    fn replace_persisted_signed_snapshot(
         &mut self,
         snapshot: &SignedAccountSnapshot,
     ) -> Result<(), AccountHostError<G::Error>> {

@@ -463,6 +463,17 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
         self.host.latest_signed_snapshot().cloned()
     }
 
+    /// Acknowledges signed fills only after the resident has fsynced both its fact route and Actor
+    /// checkpoint. The execution Host keeps all other fills replayable across refreshes/restarts.
+    pub fn acknowledge_signed_fills(
+        &mut self,
+        fill_ids: &[String],
+    ) -> Result<(), AccountRuntimeHostError<G::Error>> {
+        self.host
+            .acknowledge_signed_fills(fill_ids)
+            .map_err(AccountRuntimeHostError::Host)
+    }
+
     /// Admits an operator-generated semantic command only after the sole Host has fsynced the
     /// corresponding WAL record. The prepared proof never leaves this resident wrapper.
     pub fn prepare_and_admit_operator(

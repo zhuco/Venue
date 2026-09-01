@@ -474,6 +474,72 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
     ) -> Result<(), NodeError> {
         let mut applied_fills = 0_usize;
         for _ in 0..MAX_SIGNED_GRID_CATCH_UP_ROUNDS {
+            let fills = self.unique_owned_signed_grid_fills(binding, &snapshot)?;
+            let mut applied_this_round = 0_usize;
+            let mut consumed_fill_ids = Vec::new();
+            for fill in fills {
+                match self.classify_signed_grid_fill(binding, &fill)? {
+                    SignedGridFillApplication::Apply => {
+                        let fill_id = fill.fill_id.clone();
+                        let _plans = self.stage_signed_grid_fill(binding, &snapshot, fill)?;
+                        consumed_fill_ids.push(fill_id);
+                        applied_this_round = applied_this_round.saturating_add(1);
+                    }
+                    SignedGridFillApplication::ExactDuplicate => {
+                        consumed_fill_ids.push(fill.fill_id.clone());
+                    }
+                    SignedGridFillApplication::Irrelevant => {}
+                }
+            }
+            if !consumed_fill_ids.is_empty() {
+                self.host
+                    .acknowledge_signed_fills(&consumed_fill_ids)
+                    .map_err(|error| {
+                        self.grid_recovery_error(&format!(
+                            "signed Grid fill acknowledgement could not persist: {error}"
+                        ))
+                    })?;
+            }
+            applied_fills = applied_fills.saturating_add(applied_this_round);
+            if applied_fills > MAX_SIGNED_GRID_CATCH_UP_FILLS {
+                return Err(self.grid_recovery_error(
+                    "signed Grid fill catch-up exceeded its bounded fill budget",
+                ));
+            }
+
+            let pending = self
+                .grid_bridges
+                .get(&binding.key)
+                .ok_or(NodeError::ResidentRuntime)?
+                .pending_dispatch_plans()
+                .map_err(|error| {
+                    self.grid_recovery_error(&format!(
+                        "durable pending Grid plans are invalid: {error}"
+                    ))
+                })?;
+            if !pending.is_empty() {
+                if !self
+                    .grid_bridges
+                    .get(&binding.key)
+                    .ok_or(NodeError::ResidentRuntime)?
+                    .signed_pending_surface_matches(snapshot.open_orders())
+                {
+                    if applied_this_round == 0 {
+                        return Err(self.grid_recovery_error(
+                            "managed Grid pending surface differs, but no new WAL-owned signed fill explains it",
+                        ));
+                    }
+                    snapshot = self.refresh_signed_snapshot()?;
+                    continue;
+                }
+                for plan in pending {
+                    let signed_surface = self.prove_pending_grid_surface(binding, &snapshot)?;
+                    self.dispatch_recovered_grid_plan(binding, signed_surface, &plan)?;
+                    snapshot = self.refresh_signed_snapshot()?;
+                }
+                continue;
+            }
+
             let exact = self
                 .grid_bridges
                 .get(&binding.key)
@@ -489,45 +555,30 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
                     .confirm_managed_grid_surface(&mut self.runtime, binding, expected)
                     .map_err(|error| {
                         self.grid_recovery_error(&format!(
-                        "signed Grid catch-up converged but surface confirmation failed: {error}"
-                    ))
+                            "signed Grid catch-up converged but surface confirmation failed: {error}"
+                        ))
                     })?;
                 return Ok(());
             }
-
-            let fills = self.unique_owned_signed_grid_fills(binding, &snapshot)?;
-            let mut applied_this_round = 0_usize;
-            let mut plans = Vec::new();
-            for fill in fills {
-                match self.classify_signed_grid_fill(binding, &fill)? {
-                    SignedGridFillApplication::Apply => {
-                        plans.extend(self.stage_signed_grid_fill(binding, &snapshot, fill)?);
-                        applied_this_round = applied_this_round.saturating_add(1);
-                    }
-                    SignedGridFillApplication::ExactDuplicate
-                    | SignedGridFillApplication::Irrelevant => {}
-                }
-            }
-            if applied_this_round == 0 {
-                return Err(self.grid_recovery_error(
-                    "managed Grid surface differs, but no new WAL-owned signed fill explains it",
-                ));
-            }
-            applied_fills = applied_fills.saturating_add(applied_this_round);
-            if applied_fills > MAX_SIGNED_GRID_CATCH_UP_FILLS {
-                return Err(self.grid_recovery_error(
-                    "signed Grid fill catch-up exceeded its bounded fill budget",
-                ));
-            }
-            if plans.is_empty() {
+            if applied_this_round > 0 {
                 snapshot = self.refresh_signed_snapshot()?;
                 continue;
             }
-            for plan in plans {
-                let signed_surface = self.prove_pending_grid_surface(binding, &snapshot)?;
-                self.dispatch_recovered_grid_plan(binding, signed_surface, &plan)?;
-                snapshot = self.refresh_signed_snapshot()?;
-            }
+            let desired_count = self
+                .grid_bridges
+                .get(&binding.key)
+                .ok_or(NodeError::ResidentRuntime)?
+                .expected_signed_surface()
+                .map_err(|error| {
+                    self.grid_recovery_error(&format!(
+                        "managed Grid desired surface is invalid during catch-up: {error}"
+                    ))
+                })?
+                .len();
+            return Err(self.grid_recovery_error(&format!(
+                "managed Grid surface differs, but no new WAL-owned signed fill explains it: desired_orders={desired_count}, signed_orders={}",
+                snapshot.open_orders().len()
+            )));
         }
         Err(self.grid_recovery_error(
             "signed Grid fill catch-up exceeded its bounded convergence rounds",

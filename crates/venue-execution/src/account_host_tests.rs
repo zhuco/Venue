@@ -1119,6 +1119,90 @@ fn net_settlement_tracking_does_not_reject_hedge_bootstrap()
 }
 
 #[test]
+fn signed_fill_remains_durable_across_refresh_and_restart_until_actor_acknowledges_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let binding = binding()?;
+    let gateway = || Gateway {
+        binding: binding.clone(),
+        result: AccountGatewayResult::Unknown,
+        dispatches: 0,
+    };
+    let positions = vec![
+        SignedAccountPositionFact {
+            symbol: binding.symbol.clone(),
+            position_side: PositionSide::Long,
+            quantity: Decimal::ZERO,
+            entry_price: None,
+            mark_price: Some(Decimal::ONE),
+        },
+        SignedAccountPositionFact {
+            symbol: binding.symbol.clone(),
+            position_side: PositionSide::Short,
+            quantity: Decimal::ZERO,
+            entry_price: None,
+            mark_price: Some(Decimal::ONE),
+        },
+    ];
+    let mut host =
+        AccountMutationHost::open(root(&temp), binding.clone(), Decimal::TEN, gateway())?;
+    let fill = net_fill("durable-grid-fill", "venue-order-1", Decimal::ONE)?;
+    let first = SignedAccountSnapshot::complete_with_fills(
+        binding.clone(),
+        now_ms()?,
+        1,
+        1,
+        1,
+        SignedAccountPositionMode::Hedge,
+        Vec::new(),
+        positions.clone(),
+        vec![fill.clone()],
+        "fills:1".to_owned(),
+        Vec::new(),
+    )?;
+    host.persist_signed_snapshot(&first)?;
+    let second = SignedAccountSnapshot::complete(
+        binding.clone(),
+        now_ms()?,
+        1,
+        2,
+        1,
+        SignedAccountPositionMode::Hedge,
+        Vec::new(),
+        positions,
+        "fills:2".to_owned(),
+        Vec::new(),
+    )?;
+    host.persist_signed_snapshot(&second)?;
+    assert_eq!(
+        host.latest_signed_snapshot()
+            .map(SignedAccountSnapshot::fills),
+        Some([fill.clone()].as_slice())
+    );
+    drop(host);
+
+    let mut reopened =
+        AccountMutationHost::open(root(&temp), binding.clone(), Decimal::TEN, gateway())?;
+    assert_eq!(
+        reopened
+            .latest_signed_snapshot()
+            .map(SignedAccountSnapshot::fills),
+        Some([fill].as_slice())
+    );
+    reopened.acknowledge_signed_fills(&["durable-grid-fill".to_owned()])?;
+    drop(reopened);
+
+    let final_host =
+        AccountMutationHost::open(root(&temp), binding.clone(), Decimal::TEN, gateway())?;
+    assert!(
+        final_host
+            .latest_signed_snapshot()
+            .is_some_and(|snapshot| snapshot.fills().is_empty())
+    );
+    Ok(())
+}
+
+#[test]
 fn one_host_accepts_two_symbols_only_when_the_signed_hedge_legs_cover_both()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;

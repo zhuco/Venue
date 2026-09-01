@@ -30,6 +30,7 @@ struct State {
     long_quantity: Decimal,
     short_quantity: Decimal,
     open_orders: Vec<SignedAccountOrderFact>,
+    fills: Vec<Fill>,
 }
 
 struct Gateway {
@@ -91,7 +92,8 @@ impl AccountPhysicalGateway for Gateway {
             .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
         state.generation = state.generation.saturating_add(1);
         let generation = state.generation;
-        SignedAccountSnapshot::complete(
+        let fills = std::mem::take(&mut state.fills);
+        SignedAccountSnapshot::complete_with_fills(
             self.binding.clone(),
             now,
             10_000,
@@ -117,6 +119,7 @@ impl AccountPhysicalGateway for Gateway {
                     mark_price: Some(Decimal::new(100, 0)),
                 },
             ],
+            fills,
             format!("fills:{generation}"),
             request
                 .unresolved()
@@ -264,6 +267,7 @@ fn resident(
         long_quantity: Decimal::ZERO,
         short_quantity: Decimal::ZERO,
         open_orders: Vec::new(),
+        fills: Vec::new(),
     }));
     let gateway = Gateway {
         binding: launch.binding().clone(),
@@ -548,6 +552,116 @@ fn existing_grid_restart_signs_cancels_empty_and_rebuilds_higher_epoch()
 }
 
 #[test]
+fn concurrent_signed_fills_are_staged_before_pending_batches_restore_the_full_surface()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let (mut resident, state, binding) = resident(directory.path(), 3)?;
+    {
+        let mut state = state.lock().map_err(|_| "state")?;
+        state.accept_dispatch = true;
+        state.long_quantity = Decimal::new(12, 2);
+        state.short_quantity = Decimal::new(12, 2);
+    }
+    assert!(resident.take_grid_bootstrap_request(&binding)?);
+    let snapshot = resident.refresh_signed_snapshot()?;
+    resident.bootstrap_grid_from_signed_market(&binding, snapshot, market()?)?;
+
+    let (raw_generation, dispatches_before, expected_count, first_fill, second_fill) = {
+        let mut state = state.lock().map_err(|_| "state")?;
+        let selected = state
+            .open_orders
+            .iter()
+            .filter(|order| !order.reduce_only)
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>();
+        let [first, second] = selected.as_slice() else {
+            return Err("two entry orders".into());
+        };
+        let make_fill = |id: &str,
+                         sequence: u64,
+                         order: &SignedAccountOrderFact|
+         -> Result<Fill, Box<dyn std::error::Error>> {
+            Ok(Fill {
+                fill_id: id.to_owned(),
+                execution_sequence: FieldState::Known(sequence),
+                order_id: order.venue_order_id.clone().ok_or("signed native order")?,
+                symbol: order.symbol.clone(),
+                side: order.side,
+                position_side: FieldState::Known(order.position_side),
+                quantity: order.quantity,
+                price: Price::new(order.limit_price.ok_or("signed limit price")?)?,
+                fee: FieldState::Missing,
+                realized_pnl: FieldState::Missing,
+                maker: FieldState::Known(true),
+                exchange_time_ms: Some(now()?),
+            })
+        };
+        let first_fill = make_fill("burst-fill-1", 1, first)?;
+        let second_fill = make_fill("burst-fill-2", 2, second)?;
+        let filled_native = [first_fill.order_id.as_str(), second_fill.order_id.as_str()];
+        let expected_count = state.open_orders.len();
+        state.open_orders.retain(|order| {
+            order
+                .venue_order_id
+                .as_deref()
+                .is_none_or(|native| !filled_native.contains(&native))
+        });
+        state.fills = vec![first_fill.clone(), second_fill.clone()];
+        (
+            state.generation,
+            state.dispatches,
+            expected_count,
+            first_fill,
+            second_fill,
+        )
+    };
+
+    assert!(resident.consume_private_fill(
+        "bybit",
+        PrivateFillFact {
+            source_private_generation: raw_generation,
+            received_at_ms: now()?,
+            fill: first_fill,
+        },
+    )?);
+    let state = state.lock().map_err(|_| "state")?;
+    assert_eq!(state.dispatches, dispatches_before + 6);
+    assert_eq!(state.open_orders.len(), expected_count);
+    drop(state);
+    let bridge = resident
+        .grid_bridges
+        .get(&binding.key)
+        .ok_or("grid bridge")?;
+    assert!(bridge.pending_dispatch_plans()?.is_empty());
+    assert!(
+        bridge.signed_desired_matches(
+            resident
+                .host
+                .latest_signed_snapshot()
+                .ok_or("latest signed snapshot")?
+                .open_orders()
+        )
+    );
+    assert!(bridge.grid.owned_fill_records.contains_key("burst-fill-1"));
+    assert!(
+        bridge
+            .grid
+            .owned_fill_records
+            .contains_key(&second_fill.fill_id)
+    );
+    assert!(
+        resident
+            .host
+            .latest_signed_snapshot()
+            .ok_or("latest signed snapshot")?
+            .fills()
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
 fn bootstrap_admission_error_retains_risk_stage() {
     let stage = AccountHostValidationError::RiskEvidenceStage("quote_rates");
     let message = grid_bootstrap_admission_error(VenueId::Binance, &stage).to_string();
@@ -627,35 +741,53 @@ fn custody_only_actor_checkpoint_rearms_first_bootstrap_after_restart()
 fn shared_grid_private_fill_uses_signed_private_generation_not_connection_generation()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
-    let (mut resident, state, binding) = resident(directory.path(), 1)?;
-    state.lock().map_err(|_| "state")?.accept_dispatch = true;
-    let (command, replay) = {
-        let bridge = resident
-            .grid_bridges
-            .get_mut(&binding.key)
-            .ok_or("grid bridge")?;
-        let command = bridge.install_test_accepted_open_route("grid-native-1")?;
-        (command, bridge.checkpoint_bytes()?)
+    let (mut resident, state, binding) = resident(directory.path(), 3)?;
+    {
+        let mut state = state.lock().map_err(|_| "state")?;
+        state.accept_dispatch = true;
+        state.long_quantity = Decimal::new(12, 2);
+        state.short_quantity = Decimal::new(12, 2);
+    }
+    assert!(resident.take_grid_bootstrap_request(&binding)?);
+    let snapshot = resident.refresh_signed_snapshot()?;
+    resident.bootstrap_grid_from_signed_market(&binding, snapshot, market()?)?;
+    let (source_private_generation, signed_order) = {
+        let state = state.lock().map_err(|_| "state")?;
+        (
+            state.generation,
+            state
+                .open_orders
+                .iter()
+                .find(|order| !order.reduce_only)
+                .cloned()
+                .ok_or("signed Grid order")?,
+        )
     };
-    let applied = resident
-        .runtime
-        .persist_resident_semantic_turn(&binding, replay)?;
-    persist_anchor(&resident.artifacts_root, &binding, &applied)?;
-    resident.host.prepare_and_admit_operator(
-        &mut resident.runtime,
-        &binding,
-        &applied,
-        venue_runtime::account::AccountLanePriority::Normal,
-        command.clone(),
-    )?;
-    resident
-        .runtime
-        .dispatch_next_with_host(&mut resident.host)?;
-    let ExecutionCommand::PlaceLimit(signed_order) = command else {
-        return Err("test route is not a limit order".into());
-    };
-    let source_private_generation = resident.runtime().active_private_generation();
     assert!(resident.runtime().connection_generation() > source_private_generation);
+    let fill = Fill {
+        fill_id: "grid-private-generation".to_owned(),
+        execution_sequence: FieldState::Known(1),
+        order_id: signed_order
+            .venue_order_id
+            .clone()
+            .ok_or("signed native order")?,
+        symbol: signed_order.symbol,
+        side: signed_order.side,
+        position_side: FieldState::Known(signed_order.position_side),
+        quantity: signed_order.quantity,
+        price: Price::new(signed_order.limit_price.ok_or("signed limit price")?)?,
+        fee: FieldState::Missing,
+        realized_pnl: FieldState::Missing,
+        maker: FieldState::Known(true),
+        exchange_time_ms: Some(now()?),
+    };
+    {
+        let mut state = state.lock().map_err(|_| "state")?;
+        state
+            .open_orders
+            .retain(|order| order.venue_order_id.as_deref() != Some(fill.order_id.as_str()));
+        state.fills.push(fill.clone());
+    }
     assert!(
         resident
             .consume_private_fill(
@@ -663,20 +795,7 @@ fn shared_grid_private_fill_uses_signed_private_generation_not_connection_genera
                 PrivateFillFact {
                     source_private_generation,
                     received_at_ms: now()?,
-                    fill: Fill {
-                        fill_id: "grid-private-generation".to_owned(),
-                        execution_sequence: FieldState::Known(1),
-                        order_id: "grid-native-1".to_owned(),
-                        symbol: signed_order.owner.symbol,
-                        side: signed_order.side,
-                        position_side: FieldState::Known(signed_order.position_side),
-                        quantity: signed_order.quantity,
-                        price: signed_order.limit_price,
-                        fee: FieldState::Missing,
-                        realized_pnl: FieldState::Missing,
-                        maker: FieldState::Known(false),
-                        exchange_time_ms: Some(now()?),
-                    },
+                    fill,
                 },
             )
             .map_err(|error| io::Error::other(format!("private fill: {error}")))?

@@ -307,6 +307,34 @@ impl SignedAccountSnapshot {
         &self.fills
     }
 
+    /// Carries adapter-signed fills across later account refreshes until the resident Actor has
+    /// durably consumed them. Existing order is retained because reducer application order is
+    /// part of the inventory transition; an identity with different bytes fails closed.
+    pub(crate) fn prepend_unacknowledged_fills(
+        &mut self,
+        previous: &[Fill],
+    ) -> Result<(), AccountHostValidationError> {
+        let mut identities = BTreeMap::<String, Fill>::new();
+        let mut merged = Vec::with_capacity(previous.len().saturating_add(self.fills.len()));
+        for fill in previous.iter().chain(self.fills.iter()) {
+            if let Some(existing) = identities.get(&fill.fill_id) {
+                if existing != fill {
+                    return Err(AccountHostValidationError::SignedSnapshot);
+                }
+                continue;
+            }
+            identities.insert(fill.fill_id.clone(), fill.clone());
+            merged.push(fill.clone());
+        }
+        self.fills = merged;
+        Ok(())
+    }
+
+    pub(crate) fn acknowledge_fills(&mut self, fill_ids: &BTreeMap<String, ()>) {
+        self.fills
+            .retain(|fill| !fill_ids.contains_key(&fill.fill_id));
+    }
+
     #[must_use]
     pub fn fills_cursor(&self) -> &str {
         &self.fills_cursor

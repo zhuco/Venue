@@ -1237,11 +1237,6 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 // The persisted fact header carries the router connection generation. Grid's
                 // reducer cursor is the separately signed private generation validated above.
                 let private_generation = normalized_private_generation;
-                let signed_surface = self
-                    .grid_bridges
-                    .get(&delivery.target)
-                    .ok_or(NodeError::ResidentRuntime)?
-                    .expected_signed_surface()?;
                 let bridge = self
                     .grid_bridges
                     .get_mut(&delivery.target)
@@ -1255,7 +1250,7 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                             fill.fill_id
                         ),
                     })?;
-                let plans = match &decision {
+                let _plans = match &decision {
                     venue_strategies::hedged_grid::GridDecision::Noop => Vec::new(),
                     venue_strategies::hedged_grid::GridDecision::Actions(actions) => actions
                         .iter()
@@ -1275,109 +1270,17 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                     .persist_private_strategy_turn(&binding, replay)
                     .map_err(resident_error)?;
                 persist_anchor(&self.artifacts_root, &binding, &applied)?;
-                let commands = plans
-                    .iter()
-                    .flat_map(|plan| plan.commands.iter().cloned())
-                    .collect::<Vec<_>>();
-                if !commands.is_empty()
-                    && let Err(error) = self.host.prepare_and_admit_managed_grid_batch(
-                        &mut self.runtime,
-                        &binding,
-                        &applied,
-                        venue_runtime::account::AccountLanePriority::Normal,
-                        signed_surface,
-                        &commands,
-                    )
-                {
-                    let _cleanup = self
-                        .host
-                        .reject_prepared_batch(&mut self.runtime, "grid_rolling_batch_rejected");
-                    let _pause = self.pause_grid_after_bootstrap_failure(&binding);
-                    return Err(NodeError::LiveHost {
-                        venue: self.host.binding().venue,
-                        message: format!(
-                            "Grid rolling batch admission rejected before dispatch: {error}"
-                        ),
-                    });
+                // A private frame proves the fill, but it does not prove the complete account
+                // surface at the dispatch boundary. Refresh first, fold every concurrently signed
+                // fill into the durable Actor, then drain its pending batches one at a time from
+                // the exact pre-dispatch surface. This keeps a burst of fills from authorizing a
+                // rolling batch against the stale pre-fill order set.
+                let confirmed = self.refresh_signed_snapshot()?;
+                if confirmed.private_generation() <= private_generation {
+                    self.pause_grid_after_bootstrap_failure(&binding)?;
+                    return Err(NodeError::ResidentRuntime);
                 }
-                let command_count = plans.iter().map(|plan| plan.commands.len()).sum::<usize>();
-                for _ in 0..command_count {
-                    if let Err(error) = self.runtime.dispatch_next_with_host(&mut self.host) {
-                        self.host
-                            .reject_prepared_batch(
-                                &mut self.runtime,
-                                "grid_rolling_dispatch_stopped",
-                            )
-                            .map_err(|_| NodeError::ResidentRuntime)?;
-                        self.pause_grid_after_bootstrap_failure(&binding)?;
-                        return Err(NodeError::LiveHost {
-                            venue: self.host.binding().venue,
-                            message: error.to_string(),
-                        });
-                    }
-                }
-                let mut accepted = Vec::new();
-                for plan in &plans {
-                    for command in &plan.commands {
-                        let status = self
-                            .host
-                            .command_status(command.command_id())
-                            .map_err(|error| NodeError::LiveHost {
-                                venue: self.host.binding().venue,
-                                message: error.to_string(),
-                            })?
-                            .ok_or(NodeError::ResidentRuntime)?;
-                        if let venue_runtime::CommandState::Accepted { venue_order_id } =
-                            status.state()
-                        {
-                            accepted.push((command.command_id().clone(), venue_order_id.clone()));
-                        } else {
-                            self.host
-                                .reject_prepared_batch(
-                                    &mut self.runtime,
-                                    "grid_rolling_nonaccepted",
-                                )
-                                .map_err(|_| NodeError::ResidentRuntime)?;
-                            self.pause_grid_after_bootstrap_failure(&binding)?;
-                            return Err(NodeError::ResidentRuntime);
-                        }
-                    }
-                }
-                for plan in &plans {
-                    bridge
-                        .bind_accepted_plan(plan, &accepted)
-                        .map_err(|_| NodeError::ResidentRuntime)?;
-                }
-                if !plans.is_empty() {
-                    let replay = bridge.checkpoint_bytes()?;
-                    let accepted_turn = self
-                        .runtime
-                        .persist_resident_semantic_turn(&binding, replay)
-                        .map_err(resident_error)?;
-                    persist_anchor(&self.artifacts_root, &binding, &accepted_turn)?;
-                    let confirmed = self.refresh_signed_snapshot()?;
-                    if confirmed.private_generation() <= private_generation {
-                        self.pause_grid_after_bootstrap_failure(&binding)?;
-                        return Err(NodeError::ResidentRuntime);
-                    }
-                    let exact = self
-                        .grid_bridges
-                        .get(&delivery.target)
-                        .ok_or(NodeError::ResidentRuntime)?
-                        .signed_desired_matches(confirmed.open_orders());
-                    if !exact {
-                        self.recover_grid_from_signed_fills(&binding, confirmed)?;
-                        continue;
-                    }
-                    let bridge = self
-                        .grid_bridges
-                        .get(&delivery.target)
-                        .ok_or(NodeError::ResidentRuntime)?;
-                    let expected = bridge.expected_signed_surface()?;
-                    self.host
-                        .confirm_managed_grid_surface(&mut self.runtime, &binding, expected)
-                        .map_err(|_| NodeError::ResidentRuntime)?;
-                }
+                self.recover_grid_from_signed_fills(&binding, confirmed)?;
             }
         }
         Ok(true)
