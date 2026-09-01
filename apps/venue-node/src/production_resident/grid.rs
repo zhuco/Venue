@@ -17,6 +17,29 @@ use crate::{NodeError, runtime_config::NodeGridRecoveryPolicy};
 const MAX_GRID_CHECKPOINT_BYTES: usize = 1_048_576;
 const MAX_PARTIAL_FILL_SLICES_PER_ORDER: usize = 256;
 
+pub(super) fn minimum_grid_quantity(
+    order_notional: rust_decimal::Decimal,
+    anchor: rust_decimal::Decimal,
+    step: rust_decimal::Decimal,
+    grid_count: u8,
+    quantity_step: rust_decimal::Decimal,
+) -> Result<rust_decimal::Decimal, NodeError> {
+    let outer = step
+        .checked_mul(rust_decimal::Decimal::from(grid_count))
+        .ok_or(NodeError::ResidentRuntime)?;
+    let minimum_open = anchor
+        .checked_sub(outer)
+        .filter(|value| *value > rust_decimal::Decimal::ZERO)
+        .ok_or(NodeError::ResidentRuntime)?;
+    order_notional
+        .checked_div(minimum_open)
+        .and_then(|raw| raw.checked_div(quantity_step))
+        .map(|raw_steps| raw_steps.ceil())
+        .and_then(|steps| steps.checked_mul(quantity_step))
+        .filter(|quantity| *quantity > rust_decimal::Decimal::ZERO)
+        .ok_or(NodeError::ResidentRuntime)
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum GridBootstrapState {
@@ -903,6 +926,19 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn bootstrap_quantity_covers_the_lowest_opening_level() -> Result<(), NodeError> {
+        let anchor = Decimal::new(10_199, 2);
+        let step = Decimal::new(20, 2);
+        let quantity =
+            minimum_grid_quantity(Decimal::new(5, 0), anchor, step, 10, Decimal::new(1, 2))?;
+        let lowest_open = anchor - step * Decimal::from(10_u8);
+        assert_eq!(quantity, Decimal::new(6, 2));
+        assert!(quantity * lowest_open >= Decimal::new(5, 0));
+        assert!(quantity * (anchor + step * Decimal::from(10_u8)) < Decimal::new(10, 0));
+        Ok(())
+    }
 
     fn initial() -> Result<HedgedGridState, Box<dyn std::error::Error>> {
         let binding = HedgedGridBinding {

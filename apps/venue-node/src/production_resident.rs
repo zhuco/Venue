@@ -896,15 +896,13 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             let anchor = anchor - anchor % tick;
             let step_raw = anchor * bridge.grid.params.spacing_rate;
             let step = step_raw - step_raw % tick;
-            let max_open = anchor.checked_add(step).ok_or(NodeError::ResidentRuntime)?;
-            let quantity_raw = bridge
-                .grid
-                .params
-                .order_notional
-                .value
-                .checked_div(max_open)
-                .ok_or(NodeError::ResidentRuntime)?;
-            let quantity = (quantity_raw / market.quantity_step).ceil() * market.quantity_step;
+            let quantity = grid::minimum_grid_quantity(
+                bridge.grid.params.order_notional.value,
+                anchor,
+                step,
+                bridge.grid.params.grid_count,
+                market.quantity_step,
+            )?;
             if quantity < market.minimum_quantity || quantity > market.maximum_quantity {
                 return Err(NodeError::ResidentRuntime);
             }
