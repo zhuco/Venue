@@ -179,6 +179,25 @@ where
         if snapshot.generated_ms > observed_ms {
             return Err(ServiceError::InvalidObservedTime);
         }
+        let strategy = snapshot
+            .strategies
+            .iter()
+            .find(|strategy| {
+                strategy.venue == command.venue
+                    && strategy.mode == command.mode
+                    && strategy.trading_account_id == command.trading_account_id
+                    && strategy.instance_id == command.instance_id
+                    && strategy.symbol == command.symbol
+                    && strategy.config_epoch == command.expected_config_epoch
+            })
+            .ok_or(ServiceError::StaleOrMismatchedScope)?;
+        if command.action == venue_control_protocol::ControlAction::Trade
+            && strategy.kind != venue_control_protocol::StrategyKind::Manual
+        {
+            return Err(ServiceError::InvalidDelivery(
+                "Trade commands require an exact Manual strategy binding",
+            ));
+        }
         if !self.repository.has_current_strategy_scope(command).await? {
             return Err(ServiceError::StaleOrMismatchedScope);
         }

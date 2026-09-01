@@ -80,6 +80,9 @@ impl AccountOrderCapabilityEvidence {
 pub enum StrategyKind {
     HedgedGrid,
     Scalping,
+    /// A dormant terminal-owned actor. It emits no autonomous intent; explicit Control Trade
+    /// deliveries still traverse the same Runtime, account lane, WAL, and physical writer.
+    Manual,
     /// A follower-owned semantic Copy actor. It still has no exchange client or writer authority.
     Copy,
 }

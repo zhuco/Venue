@@ -464,7 +464,9 @@ where
                     }
                     StrategyKind::Scalping => resident
                         .register_scalping_actor(binding, config.scalping_binding_for(strategy)?)?,
-                    StrategyKind::Copy => resident.register_actor(binding)?,
+                    StrategyKind::Manual | StrategyKind::Copy => {
+                        resident.register_actor(binding)?
+                    }
                 }
             }
             let loopback =

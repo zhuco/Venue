@@ -8,8 +8,8 @@ use rust_decimal::Decimal;
 use venue_control_protocol::{
     AccountSummary, CONTROL_SCHEMA_VERSION, CommandReceipt, CommandState, ConnectionState,
     ControlAction, ControlCommandRequest, ControlSnapshot, GatewayMode, HealthState, StrategyKind,
-    StrategyLifecycle, StrategySummary, UiAccountScope, UiEventEnvelope, UiEventKind,
-    UiEventNotification, VenueId,
+    StrategyLifecycle, StrategySummary, TradeIntent, TradingAction, TradingOrderType,
+    TradingTimeInForce, UiAccountScope, UiEventEnvelope, UiEventKind, UiEventNotification, VenueId,
 };
 
 use super::*;
@@ -296,6 +296,40 @@ async fn submission_fails_closed_for_stale_scope_and_bad_confirmation()
         service.submit_command(&stop, 101).await,
         Err(ServiceError::Protocol(_))
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn trade_submission_requires_exact_manual_strategy_kind()
+-> Result<(), Box<dyn std::error::Error>> {
+    let service = service_with_snapshot().await?;
+    let mut trade = command(ControlAction::Trade)?;
+    trade.trade = Some(TradeIntent {
+        action: TradingAction::CancelAllOrders,
+        quote_asset: "USDT".to_owned(),
+        order_type: TradingOrderType::Limit,
+        time_in_force: TradingTimeInForce::Gtc,
+        post_only: false,
+        reduce_only: false,
+        selected_price: None,
+        quote_notional: None,
+        close_quantity_cap: None,
+        selected_order_id: None,
+    });
+    assert_eq!(
+        service.submit_command(&trade, 101).await,
+        Err(ServiceError::InvalidDelivery(
+            "Trade commands require an exact Manual strategy binding"
+        ))
+    );
+
+    let mut manual = snapshot(102, 7)?;
+    manual.strategies[0].kind = StrategyKind::Manual;
+    service.publish_snapshot(&manual).await?;
+    assert_eq!(
+        service.submit_command(&trade, 103).await?.state,
+        CommandState::Accepted
+    );
     Ok(())
 }
 

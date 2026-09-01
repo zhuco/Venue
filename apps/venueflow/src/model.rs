@@ -648,26 +648,17 @@ impl AppModel {
         }
         let snapshot = self.snapshot.as_ref()?;
         let selected_symbol = self.preferences.selected_symbol.as_str();
-        self.preferences
-            .selected_instance
-            .as_deref()
-            .and_then(|id| {
-                snapshot
-                    .strategies
-                    .iter()
-                    .find(|strategy| strategy.instance_id == id)
-            })
-            .filter(|strategy| {
-                strategy.symbol.to_string() == selected_symbol
-                    && strategy.trading_account_id == account_id
-            })
-            .or_else(|| {
-                snapshot.strategies.iter().find(|strategy| {
-                    strategy.symbol.to_string() == selected_symbol
-                        && strategy.trading_account_id == account_id
-                })
-            })
-            .cloned()
+        let mut candidates = snapshot.strategies.iter().filter(|strategy| {
+            strategy.kind == venue_control_protocol::StrategyKind::Manual
+                && strategy.symbol.to_string() == selected_symbol
+                && strategy.trading_account_id == account_id
+        });
+        match self.preferences.selected_instance.as_deref() {
+            Some(instance_id) => candidates
+                .find(|strategy| strategy.instance_id == instance_id)
+                .cloned(),
+            None => candidates.next().cloned(),
+        }
     }
 
     pub fn select_symbol(&mut self, symbol: String) {
@@ -818,6 +809,7 @@ mod tests {
         CONTROL_SCHEMA_VERSION, CommandReceipt, ConnectionState, ControlAction,
         ControlCommandRequest, ControlSnapshot, GatewayMode, StrategyKind, StrategyLifecycle,
         StrategySummary, VenueId,
+        accounts::{AccountOverview, ApiVerificationState, CredentialSummary, UserSummary},
     };
 
     use super::{
@@ -871,6 +863,130 @@ mod tests {
         model.synchronize_trading_scope();
         assert!(model.selected_trading_strategy().is_none());
         assert_eq!(model.trade_dock.selected_price, None);
+    }
+
+    fn trading_model_with_strategies(
+        strategies: Vec<StrategySummary>,
+        selected_instance: &str,
+    ) -> AppModel {
+        let account_id = "00000000-0000-4000-8000-000000000001";
+        let now = crate::account_center::now_ms();
+        let mut model = AppModel::new(Preferences {
+            selected_symbol: "BTC/USDC".to_owned(),
+            selected_instance: Some(selected_instance.to_owned()),
+            ..Preferences::default()
+        });
+        model.apply_account_overview(AccountOverview {
+            user: UserSummary {
+                user_id: "fixture-user".to_owned(),
+                username: "fixture".to_owned(),
+            },
+            credentials: vec![CredentialSummary {
+                credential_id: "fixture-credential".to_owned(),
+                label: "fixture".to_owned(),
+                venue: VenueId::Binance,
+                masked_key: "••••1234".to_owned(),
+                trading_account_id: Some(account_id.to_owned()),
+                verification: ApiVerificationState::Verified,
+                verified_ms: Some(now),
+                expires_ms: Some(now.saturating_add(60_000)),
+                api_reachable: true,
+                dual_position: true,
+                account_mode: Some("fixture".to_owned()),
+                has_exposure: Some(false),
+            }],
+            selected_credential_id: Some("fixture-credential".to_owned()),
+        });
+        model.apply_snapshot(ControlSnapshot {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            generated_ms: now,
+            connection: ConnectionState::Live,
+            accounts: Vec::new(),
+            strategies,
+            copy_relations: Vec::new(),
+            markets: Vec::new(),
+            ledger: Vec::new(),
+        });
+        model.preferences.selected_instance = Some(selected_instance.to_owned());
+        model
+    }
+
+    fn trading_strategy(
+        kind: StrategyKind,
+        instance_id: &str,
+    ) -> Result<StrategySummary, Box<dyn std::error::Error>> {
+        Ok(StrategySummary {
+            instance_id: instance_id.to_owned(),
+            kind,
+            venue: VenueId::Binance,
+            mode: GatewayMode::Live,
+            trading_account_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            symbol: "BTC/USDC".parse()?,
+            lifecycle: StrategyLifecycle::Running,
+            config_epoch: 1,
+            open_orders: 0,
+            long_quantity: Decimal::ZERO,
+            short_quantity: Decimal::ZERO,
+            realized_pnl: Some(Decimal::ZERO),
+            unrealized_pnl: Some(Decimal::ZERO),
+            last_receipt_ms: 1,
+            attention: None,
+        })
+    }
+
+    #[test]
+    fn trade_dock_never_selects_grid_scalping_or_copy_instances()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for kind in [
+            StrategyKind::Grid,
+            StrategyKind::Scalping,
+            StrategyKind::Copy,
+        ] {
+            let model = trading_model_with_strategies(
+                vec![trading_strategy(kind, "non-manual-btc")?],
+                "non-manual-btc",
+            );
+            assert!(
+                model.selected_trading_strategy().is_none(),
+                "{kind:?} was selected"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn trade_dock_rejects_a_non_manual_selection_even_when_manual_exists()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let model = trading_model_with_strategies(
+            vec![
+                trading_strategy(StrategyKind::Grid, "grid-btc")?,
+                trading_strategy(StrategyKind::Manual, "manual-btc")?,
+            ],
+            "grid-btc",
+        );
+        let selected = model.selected_trading_strategy();
+        assert!(selected.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn trade_dock_accepts_the_selected_manual_instance() -> Result<(), Box<dyn std::error::Error>> {
+        let model = trading_model_with_strategies(
+            vec![trading_strategy(StrategyKind::Manual, "manual-btc")?],
+            "manual-btc",
+        );
+        let selected = model.selected_trading_strategy();
+        assert_eq!(
+            selected.as_ref().map(|strategy| strategy.kind),
+            Some(StrategyKind::Manual)
+        );
+        assert_eq!(
+            selected
+                .as_ref()
+                .map(|strategy| strategy.instance_id.as_str()),
+            Some("manual-btc")
+        );
+        Ok(())
     }
 
     #[test]

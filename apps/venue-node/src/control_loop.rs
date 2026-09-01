@@ -1429,6 +1429,7 @@ fn projection_kind(kind: StrategyKind) -> ProjectionStrategyKind {
     match kind {
         StrategyKind::HedgedGrid => ProjectionStrategyKind::Grid,
         StrategyKind::Scalping => ProjectionStrategyKind::Scalping,
+        StrategyKind::Manual => ProjectionStrategyKind::Manual,
         StrategyKind::Copy => ProjectionStrategyKind::Copy,
     }
 }

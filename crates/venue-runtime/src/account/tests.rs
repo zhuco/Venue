@@ -591,11 +591,12 @@ fn private_router_delivers_exact_owner_and_never_guesses_unknown_fill() -> Resul
 }
 
 #[test]
-fn manual_private_ack_preserves_strategy_replay_and_copy_remains_excluded()
--> Result<(), Box<dyn Error>> {
-    let grid = binding(StrategyKind::HedgedGrid, "grid_sol", "SOL/USDT")?;
+fn manual_private_ack_is_exclusive_to_manual_actor() -> Result<(), Box<dyn Error>> {
+    let manual = binding(StrategyKind::Manual, "manual_sol", "SOL/USDT")?;
+    let grid = binding(StrategyKind::HedgedGrid, "grid_eth", "ETH/USDT")?;
     let copy = binding(StrategyKind::Copy, "copy_btc", "BTC/USDT")?;
     let mut runtime = AccountRuntime::new(account()?);
+    runtime.register_strategy(manual.clone())?;
     runtime.register_strategy(grid.clone())?;
     runtime.register_strategy(copy.clone())?;
     restore_empty_recovery(&mut runtime)?;
@@ -603,10 +604,10 @@ fn manual_private_ack_preserves_strategy_replay_and_copy_remains_excluded()
         &mut runtime,
         RecoveredOrderRoute::verified(
             NativeOrderFamily::UmOrder,
-            CommandId::new("cmd_grid_manual")?,
-            "grid_manual_client".to_owned(),
-            Some("grid_manual_venue".to_owned()),
-            owner(&grid, OrderPurpose::Entry),
+            CommandId::new("cmd_manual")?,
+            "manual_client".to_owned(),
+            Some("manual_venue".to_owned()),
+            owner(&manual, OrderPurpose::Entry),
         ),
     )?;
     runtime.mark_account_ready()?;
@@ -614,12 +615,16 @@ fn manual_private_ack_preserves_strategy_replay_and_copy_remains_excluded()
 
     let strategy_before = runtime
         .actor_applied_stores
-        .get(&grid.key)
-        .ok_or("grid actor store missing")?
+        .get(&manual.key)
+        .ok_or("manual actor store missing")?
         .recovered_actor_checkpoint()?
         .ok_or("grid actor checkpoint missing")?
         .1;
-    runtime.persist_resident_manual_turn(&grid, b"manual-before-fill".to_vec(), false)?;
+    runtime.persist_resident_manual_turn(&manual, b"manual-before-fill".to_vec(), false)?;
+    assert!(matches!(
+        runtime.persist_resident_manual_turn(&grid, b"grid-manual".to_vec(), false),
+        Err(AccountRuntimeError::StrategyTurnAuthority)
+    ));
     assert!(matches!(
         runtime.persist_resident_manual_turn(&copy, b"copy-manual".to_vec(), false),
         Err(AccountRuntimeError::StrategyTurnAuthority)
@@ -631,20 +636,20 @@ fn manual_private_ack_preserves_strategy_replay_and_copy_remains_excluded()
         &mut runtime,
         private_fact(
             &persisted,
-            DomainEvent::Fill(fill(&grid, "manual_fill", "grid_manual_venue")?),
+            DomainEvent::Fill(fill(&manual, "manual_fill", "manual_venue")?),
         )?,
     )?;
     assert_eq!(report.deliveries.len(), 1);
     let turn = runtime
-        .begin_private_strategy_turn(&grid)?
+        .begin_private_strategy_turn(&manual)?
         .ok_or("manual private turn missing")?;
     assert!(matches!(turn.input(), StrategyInput::Private(_)));
-    runtime.persist_manual_private_strategy_turn(&grid, b"manual-after-fill".to_vec())?;
+    runtime.persist_manual_private_strategy_turn(&manual, b"manual-after-fill".to_vec())?;
     assert_eq!(runtime.applied_private_sequence(), 1);
     let store = runtime
         .actor_applied_stores
-        .get(&grid.key)
-        .ok_or("grid actor store missing")?;
+        .get(&manual.key)
+        .ok_or("manual actor store missing")?;
     assert_eq!(
         store.recovered_actor_checkpoint()?.map(|(_, bytes)| bytes),
         Some(strategy_before)

@@ -16,8 +16,8 @@ use venue_control_protocol::{
     TradingTimeInForce,
 };
 use venue_domain::{
-    Asset, ExecutionCommand, InstrumentIdentity, MarketKind, NativeOrderFamily, OrderCommand,
-    OrderState, PositionSide,
+    Asset, ExecutionCommand, FieldState, Fill, InstrumentIdentity, MarketKind, NativeOrderFamily,
+    OrderCommand, OrderSide, OrderState, PositionSide, Price,
 };
 use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
 use venue_runtime::{
@@ -233,7 +233,7 @@ fn binding() -> Result<StrategyBinding, Box<dyn std::error::Error>> {
     Ok(StrategyBinding::new(
         StrategyInstanceKey::new(
             venue_runtime::AccountKey::new(VenueId::Bybit, ACCOUNT.to_owned())?,
-            StrategyKind::HedgedGrid,
+            StrategyKind::Manual,
             INSTANCE_ID,
             "DOGE/USDT".parse()?,
         )?,
@@ -277,11 +277,11 @@ fn initialized_resident(
     let strategy = binding()?;
     let mut seed = open_resident(&launch, state.clone())?;
     seed.register_actor(strategy.clone())?;
-    // A Pause is a normal durable Grid actor turn. Reopening through the resident bootstrap is
+    // A Pause is a normal durable Manual actor turn. Reopening through the resident bootstrap is
     // what promotes the exact recovered binding back to Running; calling Resume alone only
     // correctly enters Recovering and therefore cannot authorize a manual opening order.
     seed.apply_control_action(&strategy, ControlAction::Pause)
-        .map_err(|error| io::Error::other(format!("grid pause: {error}")))?;
+        .map_err(|error| io::Error::other(format!("manual pause: {error}")))?;
     drop(seed);
     let mut resident = open_resident(&launch, state.clone())?;
     resident.register_actor(strategy.clone())?;
@@ -393,6 +393,112 @@ fn manual_trade_redelivery_and_restart_never_redispatches() -> Result<(), Box<dy
             .dispatches,
         1
     );
+    Ok(())
+}
+
+#[test]
+fn manual_private_fill_is_durably_acknowledged_by_manual_actor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let (mut resident, _state, strategy, launch) = initialized_resident(root.path(), false)?;
+    assert!(is_applied(resident.apply_manual_trade(
+        &strategy,
+        &actor_turn(root.path(), "fill-owner")?
+    )?));
+
+    let journal_path = launch
+        .artifacts_root()
+        .join("strategies")
+        .join(INSTANCE_ID)
+        .join("actor-applied.jsonl");
+    let journal_before = std::fs::metadata(&journal_path)?.len();
+    let fill = Fill {
+        fill_id: "manual-private-fill".to_owned(),
+        execution_sequence: FieldState::Known(1),
+        order_id: "manual-venue-order".to_owned(),
+        symbol: strategy.key.symbol.clone(),
+        side: OrderSide::Buy,
+        position_side: FieldState::Known(PositionSide::Long),
+        quantity: Decimal::ONE,
+        price: Price::new(Decimal::ONE)?,
+        fee: FieldState::Missing,
+        realized_pnl: FieldState::Missing,
+        maker: FieldState::Known(true),
+        exchange_time_ms: Some(now_ms()?),
+    };
+    assert!(resident.manual_owns_fill(&strategy, &fill)?);
+    let source_private_generation = resident.runtime().active_private_generation();
+    let stale_private_generation = source_private_generation.saturating_add(1);
+    assert!(
+        resident
+            .consume_private_fill(
+                "bybit",
+                crate::production_resident::PrivateFillFact {
+                    source_private_generation: stale_private_generation,
+                    received_at_ms: now_ms()?,
+                    fill: fill.clone(),
+                },
+            )
+            .is_err()
+    );
+    assert!(resident.consume_private_fill(
+        "bybit",
+        crate::production_resident::PrivateFillFact {
+            source_private_generation,
+            received_at_ms: now_ms()?,
+            fill,
+        },
+    )?);
+    assert!(std::fs::metadata(journal_path)?.len() > journal_before);
+    Ok(())
+}
+
+#[test]
+fn nonmanual_strategy_kinds_reject_trade_before_checkpoint_or_dispatch()
+-> Result<(), Box<dyn std::error::Error>> {
+    for kind in [
+        StrategyKind::HedgedGrid,
+        StrategyKind::Scalping,
+        StrategyKind::Copy,
+    ] {
+        let root = tempfile::tempdir()?;
+        let launch = launch(root.path())?;
+        let state = Arc::new(Mutex::new(GatewayState {
+            private_generation: 0,
+            dispatches: 0,
+            return_unknown: false,
+            accepted_order: None,
+        }));
+        let mut resident = open_resident(&launch, state.clone())?;
+        let strategy = StrategyBinding::new(
+            StrategyInstanceKey::new(
+                venue_runtime::AccountKey::new(VenueId::Bybit, ACCOUNT.to_owned())?,
+                kind,
+                INSTANCE_ID,
+                "DOGE/USDT".parse()?,
+            )?,
+            "manual-e2e-run",
+            "manual-e2e-config",
+        )?;
+        resident.register_actor(strategy.clone())?;
+        assert!(matches!(
+            resident.apply_manual_trade(&strategy, &actor_turn(root.path(), "wrong-kind")?),
+            Err(crate::NodeError::ResidentRuntime)
+        ));
+        assert!(
+            resident
+                .runtime()
+                .resident_manual_checkpoint(&strategy)?
+                .is_none()
+        );
+        assert_eq!(
+            state
+                .lock()
+                .map_err(|_| "gateway mutex poisoned")?
+                .dispatches,
+            0
+        );
+    }
     Ok(())
 }
 

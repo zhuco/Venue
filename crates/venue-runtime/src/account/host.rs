@@ -184,6 +184,13 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
             .command_snapshot_by_venue_order_id(family, venue_order_id)
     }
 
+    pub(crate) fn accepted_order_routes_for_owner(
+        &self,
+        owner: &venue_domain::domain::OrderOwner,
+    ) -> Vec<venue_execution::NativeOrderRoute> {
+        self.host.accepted_order_routes_for_owner(owner)
+    }
+
     /// Production actor recovery must flow through the sole Host so a checkpoint may bind to a
     /// verified older WAL prefix but never to a caller-supplied or unrelated WAL head.
     pub fn install_resident_actor_applied_artifacts(

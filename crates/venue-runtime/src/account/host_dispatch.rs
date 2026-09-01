@@ -35,6 +35,11 @@ impl AccountRuntime {
             return Err(AccountRuntimeHostError::PreparedProof);
         }
         let outcome = host.dispatch_prepared_for_lane(&command_id)?;
+        let accepted_owner = matches!(
+            outcome,
+            venue_execution::AccountDispatchOutcome::Accepted { .. }
+        )
+        .then(|| command.mutation_owner().clone());
         self.advance_resident_wal_head(host.runtime_wal_head()?)
             .map_err(AccountRuntimeHostError::Runtime)?;
         let follow_up = self
@@ -43,6 +48,10 @@ impl AccountRuntime {
             .map_err(|error| {
                 AccountRuntimeHostError::Runtime(AccountRuntimeError::ExecutionLane(error))
             })?;
+        if let Some(owner) = accepted_owner {
+            self.hydrate_host_wal_routes(host.accepted_order_routes_for_owner(&owner))
+                .map_err(AccountRuntimeHostError::Runtime)?;
+        }
         Ok(Some(follow_up))
     }
 }

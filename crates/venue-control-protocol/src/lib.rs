@@ -327,6 +327,7 @@ pub enum HealthState {
 pub enum StrategyKind {
     Grid,
     Scalping,
+    Manual,
     Copy,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

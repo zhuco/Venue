@@ -1117,6 +1117,7 @@ const fn strategy_kind_tag(kind: StrategyKind) -> u8 {
         StrategyKind::HedgedGrid => 1,
         StrategyKind::Scalping => 2,
         StrategyKind::Copy => 3,
+        StrategyKind::Manual => 4,
     }
 }
 

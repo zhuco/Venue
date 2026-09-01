@@ -710,6 +710,7 @@ const fn strategy_kind_tag(kind: crate::StrategyKind) -> u8 {
         crate::StrategyKind::HedgedGrid => 1,
         crate::StrategyKind::Scalping => 2,
         crate::StrategyKind::Copy => 3,
+        crate::StrategyKind::Manual => 4,
     }
 }
 

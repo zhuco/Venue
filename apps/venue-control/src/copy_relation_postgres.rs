@@ -346,6 +346,7 @@ impl CopyRelationRepository for PgControlRepository {
         snapshot
             .strategies
             .into_iter()
+            .filter(|strategy| copy_candidate_kind(strategy.kind))
             .map(|strategy| {
                 let candidate = CopyRelationCandidate {
                     binding: CopyRelationBinding {
@@ -364,6 +365,27 @@ impl CopyRelationRepository for PgControlRepository {
                 Ok(candidate)
             })
             .collect()
+    }
+}
+
+fn copy_candidate_kind(kind: venue_control_protocol::StrategyKind) -> bool {
+    kind != venue_control_protocol::StrategyKind::Manual
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use venue_control_protocol::StrategyKind;
+
+    #[test]
+    fn manual_terminal_actor_is_not_a_copy_relation_candidate() {
+        assert!(!super::copy_candidate_kind(StrategyKind::Manual));
+        for kind in [
+            StrategyKind::Grid,
+            StrategyKind::Scalping,
+            StrategyKind::Copy,
+        ] {
+            assert!(super::copy_candidate_kind(kind));
+        }
     }
 }
 

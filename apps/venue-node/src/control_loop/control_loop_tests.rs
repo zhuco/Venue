@@ -29,7 +29,6 @@ use venue_runtime::{
     SignedAccountBalance, SignedAccountOrderFact, SignedAccountPositionFact,
     SignedAccountPositionMode, SignedAccountSnapshot, StrategyKind,
 };
-use venue_strategies::hedged_grid::HedgedGridParams;
 
 use super::*;
 
@@ -413,18 +412,14 @@ async fn resident_control_delivery_roundtrip(
         ],
     )?;
     let strategy = crate::NodeRuntimeStrategy {
-        strategy_kind: StrategyKind::HedgedGrid,
+        strategy_kind: StrategyKind::Manual,
         instance_id: "grid-doge".to_owned(),
         run_id: "run-e2e".to_owned(),
         config_digest: "config-e2e".to_owned(),
         config_epoch: 1,
         symbol: "DOGE/USDT".parse()?,
         copy_leader_capital: None,
-        grid: Some(crate::NodeGridRuntimeConfig {
-            params: HedgedGridParams::fixed_release(Asset::new("USDT")?, 1)?,
-            recovery: crate::NodeGridRecoveryPolicy::BootstrapWhenAbsent,
-            skip_inventory_replenishment_until_recovered: false,
-        }),
+        grid: None,
         scalping: None,
     };
     let config = NodeRuntimeConfig {
@@ -566,6 +561,10 @@ async fn resident_control_delivery_roundtrip(
         .map(|(_, body)| body)
         .ok_or("projection request missing")?;
     let envelope: NodeProjectionEnvelope = serde_json::from_slice(projection_body)?;
+    assert_eq!(
+        envelope.snapshot.strategies[0].kind,
+        venue_control_protocol::StrategyKind::Manual
+    );
     assert_eq!(envelope.snapshot.accounts[0].equity, None);
     assert_eq!(envelope.snapshot.accounts[0].balances.len(), 1);
     assert_eq!(
@@ -1507,18 +1506,14 @@ fn flatten_physically_cancels_then_reduces_only_after_signed_zero()
         ],
     )?;
     let strategy = crate::NodeRuntimeStrategy {
-        strategy_kind: StrategyKind::HedgedGrid,
+        strategy_kind: StrategyKind::Manual,
         instance_id: "grid-doge".to_owned(),
         run_id: "run-e2e".to_owned(),
         config_digest: "config-e2e".to_owned(),
         config_epoch: 1,
         symbol: "DOGE/USDT".parse()?,
         copy_leader_capital: None,
-        grid: Some(crate::NodeGridRuntimeConfig {
-            params: HedgedGridParams::fixed_release(Asset::new("USDT")?, 10)?,
-            recovery: crate::NodeGridRecoveryPolicy::BootstrapWhenAbsent,
-            skip_inventory_replenishment_until_recovered: false,
-        }),
+        grid: None,
         scalping: None,
     };
     let config = NodeRuntimeConfig {

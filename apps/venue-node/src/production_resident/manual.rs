@@ -161,9 +161,9 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         binding: &StrategyBinding,
         turn: &ActorDeliveryTurn,
     ) -> Result<ManualTradeOutcome, NodeError> {
-        if binding.key.strategy_kind == StrategyKind::Copy {
-            // Copy's latest actor receipt is its recovery commitment. A generic manual turn
-            // would make that commitment ambiguous, so this is an explicit lifecycle boundary.
+        if binding.key.strategy_kind != StrategyKind::Manual {
+            // A terminal command has its own dormant actor identity. Reusing Grid, Scalping, or
+            // Copy would let an operator command replace that strategy's recovery commitment.
             return Err(NodeError::ResidentRuntime);
         }
         let trade = match turn.payload() {
@@ -313,12 +313,14 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             admitted = admitted.saturating_add(1);
         }
         for _ in 0..admitted {
-            self.runtime
-                .dispatch_next_with_host(&mut self.host)
-                .map_err(|error| NodeError::LiveHost {
-                    venue: self.host.binding().venue,
-                    message: error.to_string(),
-                })?;
+            if let Err(error) = self.runtime.dispatch_next_with_host(&mut self.host) {
+                return Ok(ManualTradeOutcome::Unknown {
+                    applied,
+                    detail: format!(
+                        "manual trade dispatch crossed a durable boundary but local completion is uncertain: {error}"
+                    ),
+                });
+            }
         }
         self.confirm_manual_plan(&plan, applied)
     }
@@ -423,6 +425,9 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         binding: &StrategyBinding,
         turn: &ReconciliationTurn,
     ) -> Result<ManualTradeReconciliation, NodeError> {
+        if binding.key.strategy_kind != StrategyKind::Manual {
+            return Err(NodeError::ResidentRuntime);
+        }
         let command = manual_trade_command(turn.payload())?;
         let (plan_key, request_id, delivery_digest) = manual_command_key(command)?;
         let state = self.manual_actor_state(binding)?;
@@ -491,9 +496,8 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         }
     }
 
-    /// A manual fill is consumed before the Grid reducer only when its WAL client identity is
-    /// present in the recovered manual checkpoint. Prefixes and native string shapes are not
-    /// ownership evidence.
+    /// A Manual fill is consumed only when its WAL client identity is present in the recovered
+    /// Manual checkpoint. Prefixes and native string shapes are not ownership evidence.
     #[cfg_attr(not(feature = "binance"), allow(dead_code))]
     pub(crate) fn manual_owns_fill(
         &self,
@@ -1127,7 +1131,7 @@ mod tests {
 
     fn owner() -> Result<OrderOwner, Box<dyn std::error::Error>> {
         Ok(OrderOwner {
-            strategy_instance_id: "grid-a".to_owned(),
+            strategy_instance_id: "manual-a".to_owned(),
             run_id: "run-a".to_owned(),
             exchange: "binance".to_owned(),
             account: ACCOUNT.to_owned(),
@@ -1140,8 +1144,8 @@ mod tests {
         Ok(StrategyBinding::new(
             venue_runtime::StrategyInstanceKey::new(
                 venue_runtime::AccountKey::new(venue_runtime::ExchangeId::Binance, ACCOUNT)?,
-                StrategyKind::HedgedGrid,
-                "grid-a",
+                StrategyKind::Manual,
+                "manual-a",
                 "DOGE/USDT".parse()?,
             )?,
             "run-a",
@@ -1156,7 +1160,7 @@ mod tests {
             venue: VenueId::Binance,
             mode: GatewayMode::Live,
             trading_account_id: ACCOUNT.to_owned(),
-            instance_id: "grid-a".to_owned(),
+            instance_id: "manual-a".to_owned(),
             symbol: "DOGE/USDT".parse()?,
             action: ControlAction::Trade,
             trade: Some(TradeIntent {

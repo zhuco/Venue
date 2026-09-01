@@ -57,10 +57,10 @@ CLI 没有旧 `grid-*` 子命令；Stop/Flatten/手动 GTC/reduce-only 等走常
 
 - `mode / venue / trading_account_id / node_id`，必须与外层启动 binding 一致；
 - `control.loopback_origin / poll_interval_ms / projection_interval_ms / lease_duration_ms / claim_limit`；
-- 非空 `strategies`：`strategy_kind / instance_id / run_id / config_digest / config_epoch / symbol`；
+- 非空 `strategies`：`strategy_kind / instance_id / run_id / config_digest / config_epoch / symbol`；`manual` 是终端专用 dormant actor，不产生自动策略意图，且不得携带 Grid/Scalping 配置；
 - Grid 还需 `grid.params`、`grid.recovery` 及可选库存恢复开关；
 - Scalping 还需 `scalping.parameter_release_id / owner_scope / risk_budget`；
-- `copy_leader_capital` 仅显式启用时发布 leader 资本事实，不用账户总权益代替。
+- `copy_leader_capital` 仅在非 Manual actor 显式启用时发布 leader 资本事实，不用账户总权益代替。
 
 精确 enum 和界限以 `src/runtime_config.rs` 为准；当前 loader 要求首次配置 `config_epoch=1`。
 不要把旧 `venue.grid.toml` 当作 runtime JSON。为避免误启实盘，本页不提供可直接交易的示例账户/config。
@@ -73,5 +73,5 @@ Unknown 只签名对账，不重投。preflight 也不能与同账户现有 writ
 WAL 分段 5 MiB、单文件 10 MiB，根预算 256 MiB；未决状态和当前 checkpoint 永不作普通缓存清理。
 
 六所公共盘口/成交已接入，Bitget/Hyperliquid 权威闭合 bar 尚缺；Scalping 自动入场保护仍未闭合。
-Copy、手动交易与 Grid 已有桥接代码，但完整生产验收和旧服务器接管不能由编译/单测推断。
+Copy、手动交易与 Grid 已有桥接代码；终端必须绑定 `manual` actor，不能借用会自动运行的 Grid/Scalping 或拒绝通用手动 turn 的 Copy。完整生产验收和旧服务器接管不能由编译/单测推断。
 后续工作见 [迁移契约](UNIFIED_GATEWAY_WEB_MIGRATION.md)，停用方法见 [清单](ARCHITECTURE.md#deprecated)。

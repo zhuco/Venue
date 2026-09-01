@@ -35,6 +35,7 @@ pub struct ProductionResident<G> {
     runtime: AccountRuntime,
     host: AccountRuntimeHost<G>,
     artifacts_root: PathBuf,
+    manual_bindings: BTreeMap<venue_runtime::StrategyInstanceKey, StrategyBinding>,
     grid_bridges: BTreeMap<venue_runtime::StrategyInstanceKey, grid::GridBridgeState>,
     grid_bindings: BTreeMap<venue_runtime::StrategyInstanceKey, StrategyBinding>,
     grid_bootstrap_pending: BTreeSet<venue_runtime::StrategyInstanceKey>,
@@ -83,10 +84,10 @@ pub(crate) struct GridBootstrapMarket {
     not(any(feature = "binance", feature = "bitget", feature = "gate")),
     allow(dead_code)
 )]
-struct GridPrivateFillFact {
-    source_private_generation: u64,
-    received_at_ms: u64,
-    fill: venue_domain::Fill,
+pub(crate) struct PrivateFillFact {
+    pub(crate) source_private_generation: u64,
+    pub(crate) received_at_ms: u64,
+    pub(crate) fill: venue_domain::Fill,
 }
 
 impl<G: AccountPhysicalGateway> ProductionResident<G> {
@@ -142,6 +143,7 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             runtime,
             host,
             artifacts_root: launch.artifacts_root(),
+            manual_bindings: BTreeMap::new(),
             grid_bridges: BTreeMap::new(),
             grid_bindings: BTreeMap::new(),
             grid_bootstrap_pending: BTreeSet::new(),
@@ -241,7 +243,12 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
     }
 
     pub fn register_actor(&mut self, binding: StrategyBinding) -> Result<(), NodeError> {
-        self.register_actor_with_anchor(binding, None)
+        let manual = binding.key.strategy_kind == venue_runtime::StrategyKind::Manual;
+        self.register_actor_with_anchor(binding.clone(), None)?;
+        if manual {
+            self.manual_bindings.insert(binding.key.clone(), binding);
+        }
+        Ok(())
     }
 
     /// Registers a Grid actor and restores its state only from the matching Runtime-owned Actor
@@ -776,33 +783,34 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         not(any(feature = "binance", feature = "bitget", feature = "gate")),
         allow(dead_code)
     )]
-    fn consume_grid_private_fill(
+    pub(crate) fn consume_private_fill(
         &mut self,
         venue: &str,
-        event: GridPrivateFillFact,
+        event: PrivateFillFact,
     ) -> Result<bool, NodeError> {
         use venue_domain::domain::{DomainEvent, EventId, NativeOrderFamily};
         use venue_runtime::{account::AccountPrivateFactInput, strategy::StrategyInput};
 
-        // The adapter proves its stream is bound to this nonzero native snapshot generation.
-        // Host may rebase that counter across restart; facts must therefore carry the Runtime's
-        // active durable generation, never an adapter-local value that happens to be stale.
-        if event.source_private_generation == 0 {
-            return Err(NodeError::ResidentRuntime);
-        }
+        // The adapter proves its socket is bound to the exact signed private snapshot. Runtime's
+        // durable facts journal is separately keyed by the connection generation used by its
+        // private router; neither generation may be substituted for the other.
         let active_private_generation = self.runtime.active_private_generation();
-        if active_private_generation == 0 {
+        let connection_generation = self.runtime.connection_generation();
+        if event.source_private_generation == 0
+            || event.source_private_generation != active_private_generation
+            || connection_generation == 0
+        {
             return Err(NodeError::ResidentRuntime);
         }
         let event_id = EventId::new(format!("{venue}-fill-{}", event.fill.fill_id))
             .map_err(|_| NodeError::ResidentRuntime)?;
-        let manual_fill = event.fill.clone();
+        let routed_fill = event.fill.clone();
         let report = self
             .runtime
             .ingest_private(
                 AccountPrivateFactInput::new(
                     event_id,
-                    active_private_generation,
+                    connection_generation,
                     event.received_at_ms,
                     Some(NativeOrderFamily::UmOrder),
                     DomainEvent::Fill(event.fill),
@@ -814,29 +822,32 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             return Err(NodeError::ResidentRuntime);
         }
         for delivery in report.deliveries {
+            if let Some(binding) = self.manual_bindings.get(&delivery.target).cloned() {
+                if !self.manual_owns_fill(&binding, &routed_fill)? {
+                    return Err(NodeError::ResidentRuntime);
+                }
+                let turn = self
+                    .runtime
+                    .begin_private_strategy_turn(&binding)
+                    .map_err(resident_error)?
+                    .ok_or(NodeError::ResidentRuntime)?;
+                if !matches!(turn.input(), StrategyInput::Private(_)) {
+                    return Err(NodeError::ResidentRuntime);
+                }
+                let replay = self.manual_checkpoint_bytes(&binding)?;
+                let applied = self
+                    .runtime
+                    .persist_manual_private_strategy_turn(&binding, replay)
+                    .map_err(resident_error)?;
+                persist_anchor(&self.artifacts_root, &binding, &applied)?;
+                continue;
+            }
             if self.grid_bridges.contains_key(&delivery.target) {
                 let binding = self
                     .grid_bindings
                     .get(&delivery.target)
                     .cloned()
                     .ok_or(NodeError::ResidentRuntime)?;
-                if self.manual_owns_fill(&binding, &manual_fill)? {
-                    let turn = self
-                        .runtime
-                        .begin_private_strategy_turn(&binding)
-                        .map_err(resident_error)?
-                        .ok_or(NodeError::ResidentRuntime)?;
-                    if !matches!(turn.input(), StrategyInput::Private(_)) {
-                        return Err(NodeError::ResidentRuntime);
-                    }
-                    let replay = self.manual_checkpoint_bytes(&binding)?;
-                    let applied = self
-                        .runtime
-                        .persist_manual_private_strategy_turn(&binding, replay)
-                        .map_err(resident_error)?;
-                    persist_anchor(&self.artifacts_root, &binding, &applied)?;
-                    continue;
-                }
                 let turn = self
                     .runtime
                     .begin_private_strategy_turn(&binding)
@@ -1099,9 +1110,9 @@ impl ProductionResident<venue_gateway_binance::BinanceAccountGateway> {
         let Some(event) = event else {
             return Ok(false);
         };
-        self.consume_grid_private_fill(
+        self.consume_private_fill(
             "binance",
-            GridPrivateFillFact {
+            PrivateFillFact {
                 source_private_generation: event.private_generation,
                 received_at_ms: event.received_at_ms,
                 fill: event.fill,
@@ -1181,9 +1192,9 @@ impl ProductionResident<venue_gateway_bitget::BitgetAccountGateway> {
         let Some(event) = event else {
             return Ok(false);
         };
-        self.consume_grid_private_fill(
+        self.consume_private_fill(
             "bitget",
-            GridPrivateFillFact {
+            PrivateFillFact {
                 source_private_generation: event.source_private_generation,
                 received_at_ms: event.received_at_ms,
                 fill: event.fill,
@@ -1242,9 +1253,9 @@ impl ProductionResident<venue_gateway_gate::GateAccountGateway> {
         let Some(event) = event else {
             return Ok(false);
         };
-        self.consume_grid_private_fill(
+        self.consume_private_fill(
             "gate",
-            GridPrivateFillFact {
+            PrivateFillFact {
                 source_private_generation: event.source_private_generation,
                 received_at_ms: event.received_at_ms,
                 fill: event.fill,

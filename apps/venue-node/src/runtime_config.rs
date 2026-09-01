@@ -148,6 +148,11 @@ impl NodeRuntimeConfig {
             {
                 return Err(NodeError::RuntimeConfig);
             }
+            if strategy.strategy_kind == StrategyKind::Manual
+                && strategy.copy_leader_capital.is_some()
+            {
+                return Err(NodeError::RuntimeConfig);
+            }
             match (strategy.strategy_kind, &strategy.grid, &strategy.scalping) {
                 // Binance, Gate and Bitget install Grid only from complete signed inventory plus
                 // a bounded fresh BBO, then route authenticated fills through the same Runtime
@@ -383,6 +388,56 @@ mod tests {
           "strategies":[{"strategy_kind":"scalping","instance_id":"a","run_id":"run-a","config_digest":"digest-a","config_epoch":1,"symbol":"DOGE/USDT"}]
         }"#;
         std::fs::write(&path, missing_scalping)?;
+        assert!(matches!(
+            NodeRuntimeConfig::load(&path, &binding),
+            Err(NodeError::RuntimeConfig)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn manual_actor_is_dormant_configuration_without_strategy_specific_payloads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = GatewayBinding::new(
+            VenueId::Binance,
+            GatewayMode::Live,
+            "00000000-0000-4000-8000-000000000001",
+            "SOL/USDC".parse::<Symbol>()?,
+        )?;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("node-runtime.json");
+        let fixture = r#"{
+          "version":1,"mode":"LIVE","venue":"binance",
+          "trading_account_id":"00000000-0000-4000-8000-000000000001","node_id":"node-manual",
+          "control":{"loopback_origin":"http://127.0.0.1:39180/","poll_interval_ms":100,"projection_interval_ms":100,"lease_duration_ms":1000,"claim_limit":1},
+          "strategies":[{"strategy_kind":"manual","instance_id":"terminal_sol_usdc","run_id":"run-a","config_digest":"manual-v1","config_epoch":1,"symbol":"SOL/USDC"}]
+        }"#;
+        std::fs::write(&path, fixture)?;
+        let config = NodeRuntimeConfig::load(&path, &binding)?;
+        let strategy = config.strategies.first().ok_or("missing manual actor")?;
+        assert_eq!(strategy.strategy_kind, StrategyKind::Manual);
+        assert!(strategy.grid.is_none());
+        assert!(strategy.scalping.is_none());
+        assert!(!config.has_scalping_strategy());
+
+        std::fs::write(
+            &path,
+            fixture.replace(
+                "\"symbol\":\"SOL/USDC\"}",
+                "\"symbol\":\"SOL/USDC\",\"scalping\":{\"parameter_release_id\":\"x\",\"owner_scope\":\"x\",\"risk_budget\":{\"asset\":\"USDC\",\"value\":\"1\"}}}",
+            ),
+        )?;
+        assert!(matches!(
+            NodeRuntimeConfig::load(&path, &binding),
+            Err(NodeError::RuntimeConfig)
+        ));
+        std::fs::write(
+            &path,
+            fixture.replace(
+                "\"symbol\":\"SOL/USDC\"}",
+                "\"symbol\":\"SOL/USDC\",\"copy_leader_capital\":{\"asset\":\"USDC\",\"value\":\"1\"}}",
+            ),
+        )?;
         assert!(matches!(
             NodeRuntimeConfig::load(&path, &binding),
             Err(NodeError::RuntimeConfig)

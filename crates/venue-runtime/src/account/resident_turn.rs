@@ -147,8 +147,7 @@ impl AccountRuntime {
         self.persist_and_acknowledge_strategy_turn(&binding.key, replay_state)
     }
 
-    /// Commits a manual-control replay without replacing the registered strategy's opaque
-    /// checkpoint. Copy has a specialized recovery receipt and deliberately remains excluded.
+    /// Commits a manual-control replay only for the dormant terminal actor.
     pub fn persist_resident_manual_turn(
         &mut self,
         binding: &StrategyBinding,
@@ -156,7 +155,7 @@ impl AccountRuntime {
         permits_risk_increase: bool,
     ) -> Result<AppliedStrategyTurnReceipt, AccountRuntimeError> {
         if manual_checkpoint.is_empty()
-            || binding.key.strategy_kind == StrategyKind::Copy
+            || binding.key.strategy_kind != StrategyKind::Manual
             || binding.key.account != self.account
             || !self.durable_recovery_complete
             || self.active_turns.contains_key(&binding.key)
@@ -181,15 +180,14 @@ impl AccountRuntime {
         self.persist_resident_manual_checkpoint(binding, manual_checkpoint, None)
     }
 
-    /// Atomically acknowledges the active private delivery as manual-owned while retaining the
-    /// strategy replay. This prevents a manual fill from reaching the Grid reducer.
+    /// Atomically acknowledges the active private delivery for the dormant terminal actor.
     pub fn persist_manual_private_strategy_turn(
         &mut self,
         binding: &StrategyBinding,
         manual_checkpoint: Vec<u8>,
     ) -> Result<AppliedStrategyTurnReceipt, AccountRuntimeError> {
         if manual_checkpoint.is_empty()
-            || binding.key.strategy_kind == StrategyKind::Copy
+            || binding.key.strategy_kind != StrategyKind::Manual
             || binding.key.account != self.account
             || !matches!(
                 self.active_turns.get(&binding.key).map(|turn| &turn.input),
