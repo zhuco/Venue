@@ -62,7 +62,7 @@ Web 的 Control 用户会话只在 BFF 环境注入，HTTP/SSE 同时保留 Cont
 ## 对冲网格与冻结兼容定位
 
 当前生产组合在 `apps/venue-node/src/production_resident/grid.rs`，签名成交补账与多成交收敛在同目录
-`grid_recovery.rs`。下列 Stage 7 路径只作冻结行为/恢复参考，
+`grid_recovery.rs`；纯状态回归与 resident 启动崩溃回归分别拆在 `grid_tests.rs`、`bootstrap_tests.rs`，避免生产入口承载测试实现。下列 Stage 7 路径只作冻结行为/恢复参考，
 不是可运行的旧 CLI；状态和删除条件统一见 [停用清单](ARCHITECTURE.md#deprecated)。
 
 | 功能 | 首要入口 | 边界 |

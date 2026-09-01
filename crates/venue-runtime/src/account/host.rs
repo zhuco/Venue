@@ -95,6 +95,14 @@ fn managed_grid_batch_shape(
     )
 }
 
+fn managed_grid_cancel_drain_shape(
+    signed_surface: &BTreeMap<CommandId, OrderOwner>,
+    commands: &[ExecutionCommand],
+) -> bool {
+    matches!(commands, [ExecutionCommand::Cancel(cancel)]
+        if signed_surface.get(&cancel.target_client_order_id) == Some(&cancel.owner))
+}
+
 impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
     /// Runs one adapter read through the already-owned account gateway. The callback receives no
     /// Host permit and therefore cannot create a physical mutation; production feed pumps use it
@@ -502,7 +510,8 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
 
     /// Consumes one exact Grid surface into one bounded batch. Initial installation is Place-only
     /// and capped at 200 children; a rolling transaction is exactly two PlaceLimit plus one
-    /// Cancel of the previously signed surface. There is no second batch before signed refresh.
+    /// Cancel, while startup reconciliation admits one Critical Cancel at a time. There is no
+    /// second batch before signed refresh.
     pub fn prepare_and_admit_managed_grid_batch(
         &mut self,
         runtime: &mut AccountRuntime,
@@ -513,7 +522,10 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
         commands: &[ExecutionCommand],
     ) -> Result<(), AccountRuntimeHostError<G::Error>> {
         if binding.key.strategy_kind != crate::StrategyKind::HedgedGrid
-            || priority != AccountLanePriority::Normal
+            || !matches!(
+                priority,
+                AccountLanePriority::Normal | AccountLanePriority::Critical
+            )
             || commands.is_empty()
             || commands.len() > 200
             || runtime.account() != &self.account
@@ -533,15 +545,29 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
                 .collect::<BTreeSet<_>>()
                 .len()
                 != commands.len()
-            || !managed_grid_batch_shape(&expected_open_orders, commands)
+            || match priority {
+                AccountLanePriority::Normal => {
+                    !managed_grid_batch_shape(&expected_open_orders, commands)
+                }
+                AccountLanePriority::Critical => {
+                    !managed_grid_cancel_drain_shape(&expected_open_orders, commands)
+                }
+                AccountLanePriority::FillRepair => true,
+            }
         {
             return Err(AccountRuntimeHostError::Scope);
         }
         let owner = managed_grid_scope_owner(binding);
-        let surface = self
-            .host
-            .confirm_managed_grid_surface(&owner, expected_open_orders)
-            .map_err(AccountRuntimeHostError::Host)?;
+        let surface = match priority {
+            AccountLanePriority::Normal => self
+                .host
+                .confirm_managed_grid_surface(&owner, expected_open_orders),
+            AccountLanePriority::Critical => self
+                .host
+                .confirm_managed_grid_cancellation_surface(&owner, expected_open_orders),
+            AccountLanePriority::FillRepair => return Err(AccountRuntimeHostError::Scope),
+        }
+        .map_err(AccountRuntimeHostError::Host)?;
         if !managed_surface_receipt_matches(&surface, binding, &owner) {
             return Err(AccountRuntimeHostError::Scope);
         }
@@ -551,6 +577,11 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
             .iter()
             .map(|command| command.command_id().clone())
             .collect::<BTreeSet<_>>();
+        if priority == AccountLanePriority::Critical {
+            runtime
+                .install_managed_grid_surface(binding, private_generation, surface_sha256)
+                .map_err(AccountRuntimeHostError::Runtime)?;
+        }
         runtime
             .begin_managed_grid_batch(
                 binding,

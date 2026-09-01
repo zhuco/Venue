@@ -982,6 +982,77 @@ impl HedgedGridState {
         self.observe_owned_fill_inner(fill, true)
     }
 
+    /// Consumes a complete owned execution that races a signed startup cancellation. The old
+    /// epoch is already frozen, so the fill retires its exact route without creating another
+    /// rolling transaction; inventory deltas and immutable fill evidence remain durable.
+    pub fn retire_owned_fill_during_reset(
+        &mut self,
+        fill: OwnedGridFill,
+    ) -> Result<(), HedgedGridError> {
+        if self.phase != GridPhase::ResettingGrid
+            || !self.pending_transactions.is_empty()
+            || !fill.complete
+            || fill.fill_id.trim().is_empty()
+            || fill.private_generation == 0
+        {
+            return Err(HedgedGridError::Phase);
+        }
+        let maker = match fill.maker {
+            FieldState::Known(value) => Some(value),
+            FieldState::Missing
+            | FieldState::Null
+            | FieldState::Unavailable { .. }
+            | FieldState::NotApplicable => None,
+        };
+        if let Some(record) = self.owned_fill_records.get(&fill.fill_id) {
+            if record.source_order.key != fill.source_order
+                || record.fill_price != fill.fill_price
+                || (record.maker.is_some() && maker.is_some() && record.maker != maker)
+            {
+                return Err(HedgedGridError::FillConflict);
+            }
+            return Ok(());
+        }
+        let epoch = self.epoch.as_ref().ok_or(HedgedGridError::Phase)?;
+        if fill.source_order.epoch != epoch.epoch {
+            return Err(HedgedGridError::UnknownFill);
+        }
+        let source_order = self
+            .owned_orders
+            .remove(&fill.source_order)
+            .ok_or(HedgedGridError::UnknownFill)?;
+        let adjustment = match source_order.key.position {
+            GridPosition::Long => &mut self.stream_inventory_adjustments.long,
+            GridPosition::Short => &mut self.stream_inventory_adjustments.short,
+        };
+        *adjustment = match source_order.key.role {
+            GridOrderRole::Open => adjustment
+                .checked_add(source_order.quantity)
+                .ok_or(HedgedGridError::Rolling)?,
+            GridOrderRole::Close => adjustment
+                .checked_sub(source_order.quantity)
+                .ok_or(HedgedGridError::Rolling)?,
+        };
+        let retired_without_action = maker == Some(true);
+        self.owned_fill_records.insert(
+            fill.fill_id.clone(),
+            OwnedGridFillRecord {
+                source_order: source_order.clone(),
+                fill_price: fill.fill_price,
+                private_generation: fill.private_generation,
+                maker,
+                grid_action_emitted: false,
+                retired_without_action,
+            },
+        );
+        if retired_without_action {
+            self.seen_fill_ids
+                .insert(fill.fill_id, source_order.key.clone());
+        }
+        self.reconcile_order_sequences();
+        Ok(())
+    }
+
     fn observe_owned_fill_inner(
         &mut self,
         fill: OwnedGridFill,

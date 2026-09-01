@@ -314,7 +314,9 @@ impl AccountRuntime {
             return Ok(());
         }
         let config_epoch = registration.config_epoch;
-        self.registry.mark_running(&binding.key)?;
+        if registration.lifecycle != InstanceLifecycle::Running {
+            self.registry.mark_running(&binding.key)?;
+        }
         self.managed_grid_batch = None;
         self.managed_grid_authority = Some(ManagedGridAuthority::Exact {
             key: binding.key.clone(),

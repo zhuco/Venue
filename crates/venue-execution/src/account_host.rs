@@ -338,6 +338,7 @@ enum EntryAdmission {
         private_generation: u64,
         batch_command_ids: Arc<BTreeSet<CommandId>>,
         batch_live: Arc<AtomicBool>,
+        cancellation_drain: bool,
     },
 }
 
@@ -1329,8 +1330,33 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         owner: &OrderOwner,
         expected_open_orders: BTreeMap<CommandId, OrderOwner>,
     ) -> Result<ManagedGridSurfaceReceipt, AccountHostError<G::Error>> {
+        self.confirm_managed_grid_surface_inner(owner, expected_open_orders, false)
+    }
+
+    /// Seals the same exact signed surface for one cancellation-only Grid drain. An unrelated
+    /// Unknown may remain in WAL because this authority cannot create risk and the target must
+    /// still be present in the fresh signed surface consumed by the following preparation.
+    pub fn confirm_managed_grid_cancellation_surface(
+        &mut self,
+        owner: &OrderOwner,
+        expected_open_orders: BTreeMap<CommandId, OrderOwner>,
+    ) -> Result<ManagedGridSurfaceReceipt, AccountHostError<G::Error>> {
+        self.confirm_managed_grid_surface_inner(owner, expected_open_orders, true)
+    }
+
+    fn confirm_managed_grid_surface_inner(
+        &mut self,
+        owner: &OrderOwner,
+        expected_open_orders: BTreeMap<CommandId, OrderOwner>,
+        allow_unresolved_cancellation: bool,
+    ) -> Result<ManagedGridSurfaceReceipt, AccountHostError<G::Error>> {
         let private_generation = self
-            .validate_managed_grid_surface(owner, &expected_open_orders, true)
+            .validate_managed_grid_surface(
+                owner,
+                &expected_open_orders,
+                true,
+                allow_unresolved_cancellation,
+            )
             .map_err(AccountHostError::Validation)?;
         let encoded = serde_json::to_vec(&(
             &self.binding,
@@ -1381,8 +1407,16 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
                 AccountHostValidationError::ManagedGridSurface,
             ));
         }
+        let cancellation_drain = commands
+            .iter()
+            .all(|command| matches!(command, ExecutionCommand::Cancel(_)));
         let confirmed_generation = self
-            .validate_managed_grid_surface(&surface.owner, &surface.expected_open_orders, true)
+            .validate_managed_grid_surface(
+                &surface.owner,
+                &surface.expected_open_orders,
+                true,
+                cancellation_drain,
+            )
             .map_err(AccountHostError::Validation)?;
         if confirmed_generation != surface.private_generation {
             return Err(AccountHostError::Validation(
@@ -1398,29 +1432,31 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
             ));
         }
         self.last_managed_grid_consumed_generation = Some(confirmed_generation);
-        let evidence = self
-            .gateway
-            .risk_evidence()
-            .map_err(AccountHostError::Validation)?;
-        // The gateway may need several signed/public reads to assemble one account-wide proof.
-        // Validate against a clock sampled after that collection; using the pre-read clock makes
-        // every correctly timestamped fresh proof appear to come from the future.
-        let now = now_ms().map_err(AccountHostError::Validation)?;
-        evidence
-            .validate_for(&self.binding, now)
-            .map_err(AccountHostError::Validation)?;
-        for command in commands
-            .iter()
-            .filter(|command| matches!(command, ExecutionCommand::PlaceLimit(_)))
-        {
-            let candidate = quote_notional(command).map_err(AccountHostError::Validation)?;
-            let candidate_usdt = evidence
-                .value_in_usdt(&candidate.asset, candidate.value)
+        if !cancellation_drain {
+            let evidence = self
+                .gateway
+                .risk_evidence()
                 .map_err(AccountHostError::Validation)?;
-            if candidate_usdt > self.max_entry_notional {
-                return Err(AccountHostError::Validation(
-                    AccountHostValidationError::Notional,
-                ));
+            // The gateway may need several signed/public reads to assemble one account-wide proof.
+            // Validate against a clock sampled after that collection; using the pre-read clock makes
+            // every correctly timestamped fresh proof appear to come from the future.
+            let now = now_ms().map_err(AccountHostError::Validation)?;
+            evidence
+                .validate_for(&self.binding, now)
+                .map_err(AccountHostError::Validation)?;
+            for command in commands
+                .iter()
+                .filter(|command| matches!(command, ExecutionCommand::PlaceLimit(_)))
+            {
+                let candidate = quote_notional(command).map_err(AccountHostError::Validation)?;
+                let candidate_usdt = evidence
+                    .value_in_usdt(&candidate.asset, candidate.value)
+                    .map_err(AccountHostError::Validation)?;
+                if candidate_usdt > self.max_entry_notional {
+                    return Err(AccountHostError::Validation(
+                        AccountHostValidationError::Notional,
+                    ));
+                }
             }
         }
         let admission = EntryAdmission::ManagedGrid {
@@ -1433,8 +1469,9 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
                     .collect(),
             ),
             batch_live: Arc::new(AtomicBool::new(true)),
+            cancellation_drain,
         };
-        if self.journal.has_unresolved() {
+        if !cancellation_drain && self.journal.has_unresolved() {
             return Err(AccountHostError::Validation(
                 AccountHostValidationError::UnknownFence,
             ));
@@ -1626,21 +1663,23 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
                 private_generation,
                 batch_command_ids,
                 batch_live,
+                cancellation_drain,
             } => {
                 let current_generation = self
                     .latest_signed_snapshot
                     .as_ref()
                     .map(SignedAccountSnapshot::private_generation);
-                let unresolved_is_only_prepared_batch = self
-                    .journal
-                    .unresolved_command_ids()
-                    .iter()
-                    .all(|unresolved_id| {
-                        batch_command_ids.contains(unresolved_id)
-                            && self.journal.receipt(unresolved_id).is_some_and(|receipt| {
-                                matches!(receipt.state, CommandState::Prepared)
-                            })
-                    });
+                let unresolved_is_only_prepared_batch = *cancellation_drain
+                    || self
+                        .journal
+                        .unresolved_command_ids()
+                        .iter()
+                        .all(|unresolved_id| {
+                            batch_command_ids.contains(unresolved_id)
+                                && self.journal.receipt(unresolved_id).is_some_and(|receipt| {
+                                    matches!(receipt.state, CommandState::Prepared)
+                                })
+                        });
                 Some(
                     if !batch_live.load(Ordering::Acquire)
                         || !batch_command_ids.contains(&command_id)
@@ -1840,6 +1879,7 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         owner: &OrderOwner,
         expected_open_orders: &BTreeMap<CommandId, OrderOwner>,
         require_fresh_snapshot: bool,
+        allow_unresolved_cancellation: bool,
     ) -> Result<u64, AccountHostValidationError> {
         let now = now_ms()?;
         let snapshot = self
@@ -1893,7 +1933,7 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
                 .iter()
                 .any(|position| position.symbol != owner.symbol)
             || !exact_signed_orders
-            || self.journal.has_unresolved()
+            || (!allow_unresolved_cancellation && self.journal.has_unresolved())
         {
             return Err(AccountHostValidationError::ManagedGridSurface);
         }
@@ -2123,6 +2163,11 @@ fn managed_grid_batch_shape(
     };
     if signed_surface.is_empty() {
         return commands.len() <= 200 && commands.iter().all(post_only_limit);
+    }
+    if matches!(commands, [ExecutionCommand::Cancel(cancel)]
+        if signed_surface.get(&cancel.target_client_order_id) == Some(&cancel.owner))
+    {
+        return true;
     }
     matches!(
         commands,

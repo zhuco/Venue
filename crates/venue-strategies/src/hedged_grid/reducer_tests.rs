@@ -951,6 +951,49 @@ fn installing_a_new_epoch_retires_superseded_unemitted_maker_facts()
 }
 
 #[test]
+fn startup_reset_fill_retires_the_old_order_without_rolling_actions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut state = HedgedGridState::new_with_params(binding()?, HedgedGridParams::phase_one(3)?)?;
+    let _ = state.observe_inventory(inventory(1, Decimal::new(15, 2), Decimal::new(15, 2))?)?;
+    let _ = state.install_epoch(epoch(1)?)?;
+    let source = GridOrderKey {
+        epoch: 1,
+        position: GridPosition::Long,
+        role: GridOrderRole::Open,
+        level: 1,
+    };
+    let event = fill(
+        &state,
+        "startup-reset-fill",
+        source.clone(),
+        true,
+        FieldState::Known(true),
+    )?;
+    let _ = state.request_reset(GridResetReason::Reconciliation)?;
+
+    state.retire_owned_fill_during_reset(event.clone())?;
+    assert!(!state.owned_orders.contains_key(&source));
+    assert!(state.pending_transactions.is_empty());
+    let record = state
+        .owned_fill_records
+        .get("startup-reset-fill")
+        .ok_or("missing reset fill record")?;
+    assert!(record.retired_without_action);
+    assert!(!record.grid_action_emitted);
+    assert_eq!(state.seen_fill_ids.get("startup-reset-fill"), Some(&source));
+    state.retire_owned_fill_during_reset(event.clone())?;
+
+    let mut conflict = event;
+    conflict.maker = FieldState::Known(false);
+    assert_eq!(
+        state.retire_owned_fill_during_reset(conflict),
+        Err(HedgedGridError::FillConflict)
+    );
+    state.migrate_checkpoint()?;
+    Ok(())
+}
+
+#[test]
 fn retired_fill_and_schema_two_migration_reject_tampering_or_live_debt()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut state = HedgedGridState::new_with_params(binding()?, HedgedGridParams::phase_one(3)?)?;

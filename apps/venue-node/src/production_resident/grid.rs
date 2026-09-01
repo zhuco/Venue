@@ -8,7 +8,7 @@ use venue_domain::domain::{
 };
 use venue_runtime::SignedAccountOrderFact;
 use venue_strategies::hedged_grid::{
-    GridAction, GridDecision, GridEpoch, GridInventory, GridOrderIntent, GridOrderKey,
+    GridAction, GridDecision, GridEpoch, GridInventory, GridOrderIntent, GridOrderKey, GridPhase,
     GridPosition, GridTransaction, HedgedGridError, HedgedGridState, OwnedGridFill,
 };
 
@@ -78,6 +78,20 @@ struct GridPartialFillSlice {
     maker: FieldState<bool>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GridReconciliationAttempt {
+    key: GridOrderKey,
+    attempt: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GridStartupReconciliation {
+    operation_sequence: u64,
+    attempts: Vec<GridReconciliationAttempt>,
+    #[serde(default)]
+    rebuild_attempted: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SignedGridFillApplication {
     Apply,
@@ -105,6 +119,10 @@ pub(crate) struct GridBridgeState {
     routes: BTreeMap<GridOrderKey, GridOrderRoute>,
     #[serde(default)]
     partial_fills: BTreeMap<String, GridPartialFill>,
+    #[serde(default)]
+    reconciliation_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    startup_reconciliation: Option<GridStartupReconciliation>,
 }
 
 /// JSON object keys cannot encode `GridOrderKey` without inventing a lossy string identity.
@@ -174,6 +192,8 @@ impl GridBridgeState {
             reset_rebuild_attempt_version: 0,
             routes: BTreeMap::new(),
             partial_fills: BTreeMap::new(),
+            reconciliation_sequence: 0,
+            startup_reconciliation: None,
         };
         state.validate().map_err(|_| NodeError::ResidentRuntime)?;
         Ok(state)
@@ -255,6 +275,173 @@ impl GridBridgeState {
             || !self.grid.pending_transactions.is_empty()
     }
 
+    pub(crate) fn needs_reconciliation_rebuild(&self) -> bool {
+        matches!(
+            self.bootstrap_state,
+            GridBootstrapState::Attempted | GridBootstrapState::Confirmed
+        ) && self.grid.phase == GridPhase::ResettingGrid
+            && self.grid.epoch.is_some()
+            && self.grid.owned_orders.is_empty()
+            && self.grid.pending_transactions.is_empty()
+            && self.grid.pending_replenishments.is_empty()
+            && self.routes.is_empty()
+            && self.partial_fills.is_empty()
+            && self
+                .startup_reconciliation
+                .as_ref()
+                .is_some_and(|episode| !episode.rebuild_attempted)
+    }
+
+    pub(crate) fn has_startup_reconciliation(&self) -> bool {
+        self.startup_reconciliation.is_some()
+    }
+
+    pub(crate) fn has_unconfirmed_install_surface(&self) -> bool {
+        matches!(
+            self.bootstrap_state,
+            GridBootstrapState::Attempted | GridBootstrapState::Confirmed
+        ) && self.grid.phase == GridPhase::Running
+            && self.grid.epoch.is_some()
+            && self.grid.pending_transactions.is_empty()
+            && self.grid.pending_replenishments.is_empty()
+            && self.routes.len() == self.grid.owned_orders.len()
+            && self
+                .grid
+                .owned_orders
+                .keys()
+                .all(|key| self.routes.contains_key(key))
+            && (self.bootstrap_state == GridBootstrapState::Attempted
+                || self.startup_reconciliation.is_some())
+    }
+
+    /// Reconstructs the exact place-only batch whose semantic checkpoint was durable before
+    /// dispatch. Host WAL bytes, rather than order count or signed presence alone, classify every
+    /// child after a crash.
+    pub(crate) fn unconfirmed_install_plan(&self) -> Result<GridDispatchPlan, GridBridgeError> {
+        if !self.has_unconfirmed_install_surface() {
+            return Err(GridBridgeError::Evidence);
+        }
+        let mut orders = self.grid.owned_orders.values().cloned().collect::<Vec<_>>();
+        orders.sort_by_key(|order| (!order.reduce_only, order.key.clone()));
+        let mut commands = Vec::with_capacity(orders.len());
+        let mut accepted_routes = Vec::with_capacity(orders.len());
+        for order in orders {
+            let client = stable_identifier(b"client", &self.grid.binding, &order.key)?;
+            let route = self
+                .routes
+                .get(&order.key)
+                .ok_or(GridBridgeError::UnknownOrder)?;
+            if route.client_order_id != client {
+                return Err(GridBridgeError::RouteConflict);
+            }
+            let command_id = stable_identifier(b"place", &self.grid.binding, &order.key)?;
+            commands.push(ExecutionCommand::PlaceLimit(OrderCommand {
+                time_in_force: Default::default(),
+                command_id: command_id.clone(),
+                client_order_id: client.clone(),
+                owner: owner_for_order(&self.grid, &order),
+                side: order.side,
+                position_side: match order.key.position {
+                    GridPosition::Long => PositionSide::Long,
+                    GridPosition::Short => PositionSide::Short,
+                },
+                quantity: order.quantity,
+                limit_price: order.price,
+                reduce_only: order.reduce_only,
+            }));
+            accepted_routes.push((order.key, client, command_id));
+        }
+        Ok(GridDispatchPlan {
+            commands,
+            accepted_routes,
+            transaction_id: None,
+        })
+    }
+
+    pub(crate) fn bind_accepted_install_routes(
+        &mut self,
+        plan: &GridDispatchPlan,
+        accepted: &[(CommandId, String)],
+    ) -> Result<(), GridBridgeError> {
+        if !self.has_unconfirmed_install_surface() || plan.transaction_id.is_some() {
+            return Err(GridBridgeError::Evidence);
+        }
+        for (key, _, command_id) in &plan.accepted_routes {
+            let route = self.routes.get(key).ok_or(GridBridgeError::UnknownOrder)?;
+            if let Some(existing) = route.accepted_venue_order_id.as_deref()
+                && accepted.iter().find_map(|(accepted_id, native)| {
+                    (accepted_id == command_id).then_some(native.as_str())
+                }) != Some(existing)
+            {
+                return Err(GridBridgeError::Evidence);
+            }
+        }
+        for (key, client, command_id) in &plan.accepted_routes {
+            let Some(native) = accepted
+                .iter()
+                .find_map(|(accepted_id, native)| (accepted_id == command_id).then_some(native))
+            else {
+                continue;
+            };
+            let route = self.routes.get(key).ok_or(GridBridgeError::UnknownOrder)?;
+            if route.client_order_id != *client {
+                return Err(GridBridgeError::RouteConflict);
+            }
+            match route.accepted_venue_order_id.as_deref() {
+                Some(existing) if existing == native => {}
+                Some(_) => return Err(GridBridgeError::RouteConflict),
+                None => self.bind_accepted_native(key, client, native.clone())?,
+            }
+        }
+        self.validate()
+    }
+
+    /// Converts a crashed place-only install into the same durable cancellation drain used by a
+    /// normal startup. WAL-Accepted routes remain owned; every absent or Rejected child is removed
+    /// before the fresh signed surface is compared.
+    pub(crate) fn begin_unconfirmed_install_reconciliation(
+        &mut self,
+    ) -> Result<(), GridBridgeError> {
+        if !self.has_unconfirmed_install_surface()
+            || self
+                .startup_reconciliation
+                .as_ref()
+                .is_some_and(|episode| !episode.attempts.is_empty())
+        {
+            return Err(GridBridgeError::Evidence);
+        }
+        let absent = self
+            .routes
+            .iter()
+            .filter_map(|(key, route)| route.accepted_venue_order_id.is_none().then(|| key.clone()))
+            .collect::<Vec<_>>();
+        for key in absent {
+            self.routes.remove(&key);
+            self.grid
+                .owned_orders
+                .remove(&key)
+                .ok_or(GridBridgeError::UnknownOrder)?;
+        }
+        if !matches!(
+            self.grid
+                .request_reset(venue_strategies::hedged_grid::GridResetReason::Reconciliation)
+                .map_err(GridBridgeError::Reducer)?,
+            GridDecision::Actions(actions)
+                if actions.iter().all(|action| matches!(action, GridAction::Reset { .. }))
+        ) {
+            return Err(GridBridgeError::Evidence);
+        }
+        if self.startup_reconciliation.is_none() {
+            self.start_reconciliation_episode()?;
+        }
+        if self.grid.owned_orders.is_empty() {
+            self.grid
+                .reset_orders_settled()
+                .map_err(GridBridgeError::Reducer)?;
+        }
+        self.validate()
+    }
+
     /// Returns the exact deterministic WAL ids of every locally reserved rolling transaction.
     /// The checkpoint has no native ids for replacement routes until Host records Accepted, so a
     /// restart may classify only these ids; it must never infer whether an exchange mutation ran.
@@ -280,6 +467,223 @@ impl GridBridgeState {
             .collect()
     }
 
+    /// Rolls back only locally projected replacements whose complete command families are proven
+    /// absent or terminally Rejected in Host WAL. The consumed fills remain durable; exact live
+    /// cancellation targets are restored before the whole signed surface is rebuilt.
+    pub(crate) fn abandon_pending_for_reconciliation(
+        &mut self,
+        transaction_ids: &[String],
+    ) -> Result<(), GridBridgeError> {
+        let transactions = self
+            .grid
+            .pending_transactions
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for transaction in &transactions {
+            for replacement in &transaction.places {
+                let route = self
+                    .routes
+                    .get(&replacement.key)
+                    .ok_or(GridBridgeError::UnknownOrder)?;
+                if route.accepted_venue_order_id.is_some() {
+                    return Err(GridBridgeError::Evidence);
+                }
+            }
+        }
+        if !matches!(
+            self.grid
+                .abandon_unsubmitted_transactions_for_reconciliation(transaction_ids)
+                .map_err(GridBridgeError::Reducer)?,
+            GridDecision::Actions(actions)
+                if actions.iter().all(|action| matches!(action, GridAction::Reset { .. }))
+        ) {
+            return Err(GridBridgeError::Evidence);
+        }
+        for transaction in transactions {
+            for replacement in transaction.places {
+                self.routes.remove(&replacement.key);
+            }
+        }
+        self.start_reconciliation_episode()?;
+        self.validate()
+    }
+
+    pub(crate) fn begin_startup_reconciliation(&mut self) -> Result<(), GridBridgeError> {
+        if self.bootstrap_state != GridBootstrapState::Confirmed
+            || self.grid.phase != GridPhase::Running
+            || !self.grid.pending_transactions.is_empty()
+            || self.grid.owned_orders.is_empty()
+            || self.routes.is_empty()
+        {
+            return Err(GridBridgeError::Evidence);
+        }
+        if !matches!(
+            self.grid
+                .request_reset(venue_strategies::hedged_grid::GridResetReason::Reconciliation)
+                .map_err(GridBridgeError::Reducer)?,
+            GridDecision::Actions(actions)
+                if actions.iter().all(|action| matches!(action, GridAction::Reset { .. }))
+        ) {
+            return Err(GridBridgeError::Evidence);
+        }
+        self.start_reconciliation_episode()?;
+        self.validate()
+    }
+
+    fn start_reconciliation_episode(&mut self) -> Result<(), GridBridgeError> {
+        if self.startup_reconciliation.is_some()
+            || self.grid.phase != GridPhase::ResettingGrid
+            || !self.grid.pending_transactions.is_empty()
+        {
+            return Err(GridBridgeError::Evidence);
+        }
+        self.reconciliation_sequence = self
+            .reconciliation_sequence
+            .checked_add(1)
+            .ok_or(GridBridgeError::Evidence)?;
+        self.startup_reconciliation = Some(GridStartupReconciliation {
+            operation_sequence: self.reconciliation_sequence,
+            attempts: Vec::new(),
+            rebuild_attempted: false,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn reconciliation_target(&self) -> Result<Option<GridOrderKey>, GridBridgeError> {
+        if self.startup_reconciliation.is_none() || self.grid.phase != GridPhase::ResettingGrid {
+            return Err(GridBridgeError::Evidence);
+        }
+        Ok(self.grid.owned_orders.keys().next().cloned())
+    }
+
+    pub(crate) fn reconciliation_attempt(
+        &self,
+        key: &GridOrderKey,
+    ) -> Result<Option<u16>, GridBridgeError> {
+        let reconciliation = self
+            .startup_reconciliation
+            .as_ref()
+            .ok_or(GridBridgeError::Evidence)?;
+        Ok(reconciliation
+            .attempts
+            .iter()
+            .find(|attempt| &attempt.key == key)
+            .map(|attempt| attempt.attempt))
+    }
+
+    pub(crate) fn advance_reconciliation_attempt(
+        &mut self,
+        key: &GridOrderKey,
+    ) -> Result<u16, GridBridgeError> {
+        if !self.grid.owned_orders.contains_key(key) {
+            return Err(GridBridgeError::UnknownOrder);
+        }
+        let reconciliation = self
+            .startup_reconciliation
+            .as_mut()
+            .ok_or(GridBridgeError::Evidence)?;
+        let attempt = if let Some(current) = reconciliation
+            .attempts
+            .iter_mut()
+            .find(|attempt| &attempt.key == key)
+        {
+            if current.attempt >= 3 {
+                return Err(GridBridgeError::Evidence);
+            }
+            current.attempt = current
+                .attempt
+                .checked_add(1)
+                .ok_or(GridBridgeError::Evidence)?;
+            current.attempt
+        } else {
+            reconciliation.attempts.push(GridReconciliationAttempt {
+                key: key.clone(),
+                attempt: 1,
+            });
+            reconciliation
+                .attempts
+                .sort_by(|left, right| left.key.cmp(&right.key));
+            1
+        };
+        self.validate()?;
+        Ok(attempt)
+    }
+
+    pub(crate) fn reconciliation_cancel_plan(
+        &self,
+        key: &GridOrderKey,
+        attempt: u16,
+    ) -> Result<GridDispatchPlan, GridBridgeError> {
+        if !matches!(
+            self.bootstrap_state,
+            GridBootstrapState::Attempted | GridBootstrapState::Confirmed
+        ) || self.grid.phase != GridPhase::ResettingGrid
+            || !self.grid.pending_transactions.is_empty()
+            || self.reconciliation_attempt(key)? != Some(attempt)
+        {
+            return Err(GridBridgeError::Evidence);
+        }
+        let order = self.require_owned(key)?;
+        let route = self.routes.get(key).ok_or(GridBridgeError::UnknownOrder)?;
+        if route.accepted_venue_order_id.is_none() {
+            return Err(GridBridgeError::Evidence);
+        }
+        Ok(GridDispatchPlan {
+            commands: vec![ExecutionCommand::Cancel(CancelCommand {
+                command_id: reconciliation_cancel_identifier(
+                    &self.grid.binding,
+                    self.startup_reconciliation
+                        .as_ref()
+                        .ok_or(GridBridgeError::Evidence)?
+                        .operation_sequence,
+                    attempt,
+                    key,
+                )?,
+                owner: owner_for_order(&self.grid, order),
+                target_client_order_id: route.client_order_id.clone(),
+            })],
+            accepted_routes: Vec::new(),
+            transaction_id: None,
+        })
+    }
+
+    pub(crate) fn settle_reconciliation_cancel(
+        &mut self,
+        key: &GridOrderKey,
+    ) -> Result<(), GridBridgeError> {
+        if self.grid.phase != GridPhase::ResettingGrid
+            || !self.grid.pending_transactions.is_empty()
+            || self.startup_reconciliation.is_none()
+        {
+            return Err(GridBridgeError::Evidence);
+        }
+        let route = self
+            .routes
+            .remove(key)
+            .ok_or(GridBridgeError::UnknownOrder)?;
+        if let Some(native) = route.accepted_venue_order_id {
+            self.partial_fills.remove(&native);
+        }
+        self.grid
+            .owned_orders
+            .remove(key)
+            .ok_or(GridBridgeError::UnknownOrder)?;
+        let reconciliation = self
+            .startup_reconciliation
+            .as_mut()
+            .ok_or(GridBridgeError::Evidence)?;
+        reconciliation
+            .attempts
+            .retain(|attempt| &attempt.key != key);
+        if self.grid.owned_orders.is_empty() {
+            self.grid
+                .reset_orders_settled()
+                .map_err(GridBridgeError::Reducer)?;
+        }
+        self.validate()
+    }
+
     pub(crate) fn mark_bootstrap_attempted(&mut self) -> Result<(), GridBridgeError> {
         if !self.needs_initial_bootstrap() {
             return Err(GridBridgeError::BootstrapState);
@@ -297,6 +701,7 @@ impl GridBridgeState {
         self.validate()
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_bootstrap_confirmed(&mut self) -> Result<(), GridBridgeError> {
         if self.bootstrap_state != GridBootstrapState::Attempted
             || self.grid.epoch.is_none()
@@ -310,6 +715,28 @@ impl GridBridgeState {
         }
         self.bootstrap_state = GridBootstrapState::Confirmed;
         self.validate()
+    }
+
+    pub(crate) fn confirm_installed_surface(&mut self) -> Result<(), GridBridgeError> {
+        match self.bootstrap_state {
+            GridBootstrapState::Attempted | GridBootstrapState::Confirmed
+                if self.grid.phase == GridPhase::Running
+                    && self.grid.epoch.is_some()
+                    && !self.routes.is_empty()
+                    && self
+                        .routes
+                        .values()
+                        .all(|route| route.accepted_venue_order_id.is_some()) =>
+            {
+                self.validate()?;
+                self.bootstrap_state = GridBootstrapState::Confirmed;
+                self.startup_reconciliation = None;
+                self.validate()
+            }
+            GridBootstrapState::Eligible
+            | GridBootstrapState::Attempted
+            | GridBootstrapState::Confirmed => Err(GridBridgeError::BootstrapState),
+        }
     }
 
     fn has_uninstalled_shape(&self) -> bool {
@@ -695,14 +1122,21 @@ impl GridBridgeState {
             return Ok(GridDecision::Noop);
         };
         let prior_grid = self.grid.clone();
-        let decision = match self.grid.observe_stream_owned_fill(OwnedGridFill {
+        let owned_fill = OwnedGridFill {
             fill_id: fill.fill_id.clone(),
             private_generation,
             source_order: key.clone(),
             fill_price: source.price,
             complete: true,
             maker: aggregate_maker(&completed.fills),
-        }) {
+        };
+        let decision = match if self.startup_reconciliation.is_some() {
+            self.grid
+                .retire_owned_fill_during_reset(owned_fill)
+                .map(|()| GridDecision::Noop)
+        } else {
+            self.grid.observe_stream_owned_fill(owned_fill)
+        } {
             Ok(decision) => decision,
             Err(error) => {
                 self.grid = prior_grid;
@@ -714,6 +1148,9 @@ impl GridBridgeState {
         // native route after the reducer removes its owned order would make the checkpoint fail
         // validation and could not safely be replayed as a new order.
         self.routes.remove(&key);
+        if let Some(reconciliation) = self.startup_reconciliation.as_mut() {
+            reconciliation.attempts.retain(|attempt| attempt.key != key);
+        }
         self.validate()?;
         Ok(decision)
     }
@@ -830,6 +1267,62 @@ impl GridBridgeState {
             return Err(GridBridgeError::Evidence);
         };
         self.plan_places(&actions)
+    }
+
+    pub(crate) fn install_rebuilt_epoch(
+        &mut self,
+        inventory: GridInventory,
+        epoch: GridEpoch,
+    ) -> Result<GridDispatchPlan, GridBridgeError> {
+        if !self.needs_reconciliation_rebuild()
+            || self
+                .grid
+                .epoch
+                .as_ref()
+                .is_none_or(|current| epoch.epoch <= current.epoch)
+        {
+            return Err(GridBridgeError::BootstrapState);
+        }
+        if !matches!(
+            self.grid
+                .observe_inventory(inventory)
+                .map_err(GridBridgeError::Reducer)?,
+            GridDecision::Noop
+        ) {
+            return Err(GridBridgeError::Evidence);
+        }
+        let GridDecision::Actions(actions) = self
+            .grid
+            .install_epoch(epoch)
+            .map_err(GridBridgeError::Reducer)?
+        else {
+            return Err(GridBridgeError::Evidence);
+        };
+        self.startup_reconciliation
+            .as_mut()
+            .ok_or(GridBridgeError::Evidence)?
+            .rebuild_attempted = true;
+        let plan = self.plan_places(&actions)?;
+        self.validate()?;
+        Ok(plan)
+    }
+
+    pub(crate) fn next_install_epoch(&self) -> Result<u64, GridBridgeError> {
+        if self.bootstrap_state == GridBootstrapState::Attempted
+            && self.grid.epoch.is_none()
+            && self.grid.owned_orders.is_empty()
+            && self.routes.is_empty()
+        {
+            Ok(1)
+        } else if self.needs_reconciliation_rebuild() {
+            self.grid
+                .epoch
+                .as_ref()
+                .and_then(|epoch| epoch.epoch.checked_add(1))
+                .ok_or(GridBridgeError::Evidence)
+        } else {
+            Err(GridBridgeError::BootstrapState)
+        }
     }
 
     pub(crate) fn bind_accepted_plan(
@@ -1031,6 +1524,33 @@ impl GridBridgeState {
                 return Err(GridBridgeError::Evidence);
             }
         }
+        if let Some(reconciliation) = &self.startup_reconciliation {
+            if !matches!(
+                self.bootstrap_state,
+                GridBootstrapState::Attempted | GridBootstrapState::Confirmed
+            ) || self.reconciliation_sequence == 0
+                || reconciliation.operation_sequence != self.reconciliation_sequence
+                || !matches!(
+                    self.grid.phase,
+                    GridPhase::ResettingGrid | GridPhase::Running
+                )
+                || (self.grid.phase == GridPhase::Running
+                    && (!reconciliation.rebuild_attempted || !reconciliation.attempts.is_empty()))
+                || self.grid.epoch.is_none()
+                || !self.grid.pending_transactions.is_empty()
+                || reconciliation
+                    .attempts
+                    .windows(2)
+                    .any(|pair| pair[0].key >= pair[1].key)
+                || reconciliation.attempts.iter().any(|attempt| {
+                    attempt.attempt == 0
+                        || attempt.attempt > 3
+                        || !self.grid.owned_orders.contains_key(&attempt.key)
+                })
+            {
+                return Err(GridBridgeError::Evidence);
+            }
+        }
         Ok(())
     }
 }
@@ -1089,6 +1609,21 @@ fn stable_identifier(
     CommandId::new(raw[..36].to_owned()).map_err(|_| GridBridgeError::Evidence)
 }
 
+fn reconciliation_cancel_identifier(
+    binding: &venue_strategies::hedged_grid::HedgedGridBinding,
+    operation_sequence: u64,
+    attempt: u16,
+    key: &GridOrderKey,
+) -> Result<CommandId, GridBridgeError> {
+    let encoded = serde_json::to_vec(&(binding, operation_sequence, attempt, key))
+        .map_err(|_| GridBridgeError::Evidence)?;
+    let mut digest = Sha256::new();
+    digest.update(b"venue.node.grid.reconciliation.cancel.v1");
+    digest.update(encoded);
+    let raw = format!("gr-{:x}", digest.finalize());
+    CommandId::new(raw[..36].to_owned()).map_err(|_| GridBridgeError::Evidence)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum GridBridgeError {
     #[error("grid order route is missing or no longer owned")]
@@ -1106,620 +1641,5 @@ pub(crate) enum GridBridgeError {
 }
 
 #[cfg(test)]
-mod tests {
-    use rust_decimal::Decimal;
-    use venue_domain::domain::Price;
-    use venue_domain::domain::{Asset, Symbol};
-    use venue_strategies::hedged_grid::{
-        GridEpoch, GridInventory, HedgedGridBinding, HedgedGridParams, HedgedGridState,
-    };
-
-    use super::*;
-
-    #[test]
-    fn bootstrap_quantity_covers_the_lowest_opening_level() -> Result<(), NodeError> {
-        let anchor = Decimal::new(10_199, 2);
-        let step = Decimal::new(20, 2);
-        let quantity =
-            minimum_grid_quantity(Decimal::new(5, 0), anchor, step, 10, Decimal::new(1, 2))?;
-        let lowest_open = anchor - step * Decimal::from(10_u8);
-        assert_eq!(quantity, Decimal::new(6, 2));
-        assert!(quantity * lowest_open >= Decimal::new(5, 0));
-        assert!(quantity * (anchor + step * Decimal::from(10_u8)) < Decimal::new(10, 0));
-        Ok(())
-    }
-
-    fn initial() -> Result<HedgedGridState, Box<dyn std::error::Error>> {
-        let binding = HedgedGridBinding {
-            strategy_instance_id: "grid_doge".to_owned(),
-            run_id: "run_a".to_owned(),
-            exchange: "binance".to_owned(),
-            account: "account_a".to_owned(),
-            symbol: "DOGE/USDT".parse::<Symbol>()?,
-            config_version: "abc123".to_owned(),
-            owner_scope: "grid_doge".to_owned(),
-        };
-        Ok(HedgedGridState::new_with_params(
-            binding,
-            HedgedGridParams::fixed_release(Asset::new("USDT")?, 10)?,
-        )?)
-    }
-
-    #[test]
-    fn recovery_requires_verified_checkpoint_or_explicit_first_bootstrap()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let initial = initial()?;
-        assert!(
-            GridBridgeState::restore_or_bootstrap(
-                None,
-                initial.clone(),
-                NodeGridRecoveryPolicy::RequireExisting,
-            )
-            .is_err()
-        );
-        let bridge = GridBridgeState::restore_or_bootstrap(
-            None,
-            initial.clone(),
-            NodeGridRecoveryPolicy::BootstrapWhenAbsent,
-        )?;
-        let restored = GridBridgeState::restore_or_bootstrap(
-            Some(bridge.checkpoint_bytes()?),
-            initial,
-            NodeGridRecoveryPolicy::RequireExisting,
-        )?;
-        assert_eq!(restored.grid.binding.symbol, "DOGE/USDT".parse()?);
-        Ok(())
-    }
-
-    #[test]
-    fn uninstalled_actor_checkpoint_rearms_only_before_an_epoch_is_planned()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let initial = initial()?;
-        let bridge = GridBridgeState::bootstrap(initial.clone())?;
-        let mut legacy_uninstalled: serde_json::Value =
-            serde_json::from_slice(&bridge.checkpoint_bytes()?)?;
-        legacy_uninstalled
-            .as_object_mut()
-            .ok_or("grid checkpoint object")?
-            .remove("bootstrap_state");
-        let restored = GridBridgeState::restore_or_bootstrap(
-            Some(serde_json::to_vec(&legacy_uninstalled)?),
-            initial.clone(),
-            NodeGridRecoveryPolicy::BootstrapWhenAbsent,
-        )?;
-        assert!(restored.needs_initial_bootstrap());
-
-        let mut planned = GridBridgeState::bootstrap(initial.clone())?;
-        planned.mark_bootstrap_attempted()?;
-        let plan = planned.install_initial_epoch(
-            GridInventory {
-                private_generation: 2,
-                private_observed_at_ms: 10,
-                mark_price: Price::new(Decimal::new(100, 0))?,
-                long_quantity: Decimal::ONE,
-                short_quantity: Decimal::ONE,
-            },
-            GridEpoch {
-                epoch: 1,
-                anchor_price: Price::new(Decimal::new(100, 0))?,
-                step: Price::new(Decimal::ONE)?,
-                grid_quantity: Decimal::new(5, 2),
-                passive_book_fallback: None,
-            },
-        )?;
-        assert!(!planned.needs_initial_bootstrap());
-        assert!(planned.bootstrap_requires_reconciliation());
-        let mut legacy_planned: serde_json::Value =
-            serde_json::from_slice(&planned.checkpoint_bytes()?)?;
-        legacy_planned
-            .as_object_mut()
-            .ok_or("grid checkpoint object")?
-            .remove("bootstrap_state");
-        let legacy_planned = GridBridgeState::restore_or_bootstrap(
-            Some(serde_json::to_vec(&legacy_planned)?),
-            initial.clone(),
-            NodeGridRecoveryPolicy::BootstrapWhenAbsent,
-        )?;
-        assert!(!legacy_planned.needs_initial_bootstrap());
-        assert!(legacy_planned.bootstrap_requires_reconciliation());
-        let accepted = plan
-            .accepted_routes
-            .iter()
-            .enumerate()
-            .map(|(index, (_, _, command_id))| {
-                (command_id.clone(), format!("confirmed-native-{index}"))
-            })
-            .collect::<Vec<_>>();
-        planned.bind_accepted_plan(&plan, &accepted)?;
-        planned.mark_bootstrap_confirmed()?;
-        let confirmed = GridBridgeState::restore_or_bootstrap(
-            Some(planned.checkpoint_bytes()?),
-            initial,
-            NodeGridRecoveryPolicy::BootstrapWhenAbsent,
-        )?;
-        assert!(!confirmed.needs_initial_bootstrap());
-        assert!(!confirmed.bootstrap_requires_reconciliation());
-        Ok(())
-    }
-
-    #[test]
-    fn signed_grid_surface_is_bijective_and_owner_purpose_exact()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut bridge = GridBridgeState::bootstrap(initial()?)?;
-        let _chosen = bridge.install_test_accepted_open_route("chosen-native")?;
-        let mut orders = bridge
-            .grid
-            .owned_orders
-            .iter()
-            .map(|(key, desired)| {
-                let route = bridge.routes.get(key).ok_or("route")?;
-                Ok::<_, Box<dyn std::error::Error>>(SignedAccountOrderFact {
-                    client_order_id: route.client_order_id.as_str().to_owned(),
-                    venue_order_id: route.accepted_venue_order_id.clone(),
-                    symbol: bridge.grid.binding.symbol.clone(),
-                    family: venue_domain::NativeOrderFamily::UmOrder,
-                    side: desired.side,
-                    position_side: match desired.key.position {
-                        GridPosition::Long => PositionSide::Long,
-                        GridPosition::Short => PositionSide::Short,
-                    },
-                    quantity: desired.quantity,
-                    limit_price: Some(desired.price.value()),
-                    time_in_force: Some(venue_domain::LimitTimeInForce::PostOnly),
-                    created_at_ms: Some(1),
-                    reduce_only: desired.reduce_only,
-                    owner: Some(owner_for_order(&bridge.grid, desired)),
-                    external: false,
-                    state: Some(OrderState::New),
-                    filled_quantity: Some(Decimal::ZERO),
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        assert!(bridge.signed_desired_matches(&orders));
-
-        let mut wrong_purpose = orders.clone();
-        wrong_purpose[0].owner.as_mut().ok_or("owner")?.purpose = OrderPurpose::Protection;
-        assert!(!bridge.signed_desired_matches(&wrong_purpose));
-
-        let extra = orders[0].clone();
-        orders.push(extra);
-        assert!(!bridge.signed_desired_matches(&orders));
-        Ok(())
-    }
-
-    #[test]
-    fn route_checkpoint_accepts_only_the_legacy_empty_object_shape()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let initial = initial()?;
-        let bridge = GridBridgeState::bootstrap(initial.clone())?;
-        let mut legacy: serde_json::Value = serde_json::from_slice(&bridge.checkpoint_bytes()?)?;
-        legacy
-            .as_object_mut()
-            .ok_or("grid checkpoint object")?
-            .insert("routes".to_owned(), serde_json::json!({}));
-        let empty_legacy = serde_json::to_vec(&legacy)?;
-        assert!(
-            GridBridgeState::restore_or_bootstrap(
-                Some(empty_legacy),
-                initial.clone(),
-                NodeGridRecoveryPolicy::RequireExisting,
-            )
-            .is_ok()
-        );
-        legacy
-            .as_object_mut()
-            .ok_or("grid checkpoint object")?
-            .insert("routes".to_owned(), serde_json::json!({"old": {}}));
-        let nonempty_legacy = serde_json::to_vec(&legacy)?;
-        assert!(
-            GridBridgeState::restore_or_bootstrap(
-                Some(nonempty_legacy),
-                initial,
-                NodeGridRecoveryPolicy::RequireExisting,
-            )
-            .is_err()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn initial_install_preserves_closing_before_opening_and_refuses_low_inventory()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut state = initial()?;
-        state.params.grid_count = 1;
-        let mut bridge = GridBridgeState::bootstrap(state)?;
-        bridge.mark_bootstrap_attempted()?;
-        let inventory = GridInventory {
-            private_generation: 2,
-            private_observed_at_ms: 10,
-            mark_price: Price::new(Decimal::new(100, 0))?,
-            long_quantity: Decimal::ONE,
-            short_quantity: Decimal::ONE,
-        };
-        let epoch = GridEpoch {
-            epoch: 1,
-            anchor_price: Price::new(Decimal::new(100, 0))?,
-            step: Price::new(Decimal::ONE)?,
-            grid_quantity: Decimal::new(5, 2),
-            passive_book_fallback: None,
-        };
-        let plan = bridge.install_initial_epoch(inventory.clone(), epoch.clone())?;
-        assert!(plan.commands.len() >= 4);
-        let reduces = plan.commands.iter().take(2).all(
-            |command| matches!(command, ExecutionCommand::PlaceLimit(order) if order.reduce_only),
-        );
-        assert!(reduces);
-        let mut low = GridBridgeState::bootstrap(initial()?)?;
-        low.mark_bootstrap_attempted()?;
-        low.grid.params.grid_count = 1;
-        let low_inventory = GridInventory {
-            long_quantity: Decimal::ZERO,
-            ..inventory
-        };
-        assert!(low.install_initial_epoch(low_inventory, epoch).is_err());
-        Ok(())
-    }
-
-    fn bridge_with_accepted_order()
-    -> Result<(GridBridgeState, GridOrderKey, GridOrderIntent, String), Box<dyn std::error::Error>>
-    {
-        let mut state = initial()?;
-        state.params.grid_count = 2;
-        let mut bridge = GridBridgeState::bootstrap(state)?;
-        bridge.mark_bootstrap_attempted()?;
-        let plan = bridge.install_initial_epoch(
-            GridInventory {
-                private_generation: 2,
-                private_observed_at_ms: 10,
-                mark_price: Price::new(Decimal::new(100, 0))?,
-                long_quantity: Decimal::ONE,
-                short_quantity: Decimal::ONE,
-            },
-            GridEpoch {
-                epoch: 1,
-                anchor_price: Price::new(Decimal::new(100, 0))?,
-                step: Price::new(Decimal::ONE)?,
-                grid_quantity: Decimal::new(5, 2),
-                passive_book_fallback: None,
-            },
-        )?;
-        let accepted = plan
-            .accepted_routes
-            .iter()
-            .enumerate()
-            .map(|(index, (_, _, command_id))| {
-                (command_id.clone(), format!("native-grid-order-{index}"))
-            })
-            .collect::<Vec<_>>();
-        bridge.bind_accepted_plan(&plan, &accepted)?;
-        let (key, route) = bridge
-            .routes
-            .iter()
-            .next()
-            .map(|(key, route)| (key.clone(), route.clone()))
-            .ok_or("accepted route")?;
-        let source = bridge.require_owned(&key)?.clone();
-        let native_order_id = route.accepted_venue_order_id.ok_or("native order id")?;
-        Ok((bridge, key, source, native_order_id))
-    }
-
-    fn owned_fill(
-        fill_id: &str,
-        order_id: &str,
-        source: &GridOrderIntent,
-        quantity: Decimal,
-        price: Price,
-    ) -> Result<Fill, Box<dyn std::error::Error>> {
-        Ok(Fill {
-            fill_id: fill_id.to_owned(),
-            execution_sequence: FieldState::Known(1),
-            order_id: order_id.to_owned(),
-            symbol: "DOGE/USDT".parse()?,
-            side: source.side,
-            position_side: FieldState::Known(match source.key.position {
-                GridPosition::Long => PositionSide::Long,
-                GridPosition::Short => PositionSide::Short,
-            }),
-            quantity,
-            price,
-            fee: FieldState::Missing,
-            realized_pnl: FieldState::Missing,
-            maker: FieldState::Known(true),
-            exchange_time_ms: Some(100),
-        })
-    }
-
-    fn signed_orders_for(
-        bridge: &GridBridgeState,
-        expected: &BTreeMap<GridOrderKey, GridOrderIntent>,
-    ) -> Result<Vec<SignedAccountOrderFact>, Box<dyn std::error::Error>> {
-        expected
-            .iter()
-            .map(|(key, desired)| {
-                let route = bridge.routes.get(key).ok_or("route")?;
-                Ok(SignedAccountOrderFact {
-                    client_order_id: route.client_order_id.as_str().to_owned(),
-                    venue_order_id: route.accepted_venue_order_id.clone(),
-                    symbol: bridge.grid.binding.symbol.clone(),
-                    family: venue_domain::NativeOrderFamily::UmOrder,
-                    side: desired.side,
-                    position_side: match desired.key.position {
-                        GridPosition::Long => PositionSide::Long,
-                        GridPosition::Short => PositionSide::Short,
-                    },
-                    quantity: desired.quantity,
-                    limit_price: Some(desired.price.value()),
-                    time_in_force: Some(venue_domain::LimitTimeInForce::PostOnly),
-                    created_at_ms: Some(1),
-                    reduce_only: desired.reduce_only,
-                    owner: Some(owner_for_order(&bridge.grid, desired)),
-                    external: false,
-                    state: Some(OrderState::New),
-                    filled_quantity: Some(Decimal::ZERO),
-                })
-            })
-            .collect()
-    }
-
-    #[test]
-    fn pending_resume_surface_is_checkpoint_derived_and_shape_exact()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (mut bridge, _key, source, native_order_id) = bridge_with_accepted_order()?;
-        let fill = owned_fill(
-            "resume-surface-fill",
-            &native_order_id,
-            &source,
-            source.quantity,
-            source.price,
-        )?;
-        let GridDecision::Actions(actions) = bridge.observe_persisted_fill(&fill, 9)? else {
-            return Err("complete fill did not reserve a transaction".into());
-        };
-        let plan = bridge.plan_dispatch(&actions[0])?;
-        let before_dispatch = bridge.pending_pre_dispatch_orders()?;
-        let signed = signed_orders_for(&bridge, &before_dispatch)?;
-        assert!(bridge.signed_pending_surface_matches(&signed));
-        assert_eq!(
-            bridge.expected_pending_signed_surface()?.len(),
-            signed.len()
-        );
-
-        let mut wrong_native = signed.clone();
-        wrong_native[0].venue_order_id = Some("wrong-native".to_owned());
-        assert!(!bridge.signed_pending_surface_matches(&wrong_native));
-        let mut wrong_shape = signed.clone();
-        wrong_shape[0].quantity += Decimal::new(1, 2);
-        assert!(!bridge.signed_pending_surface_matches(&wrong_shape));
-        let mut wrong_filled_quantity = signed.clone();
-        wrong_filled_quantity[0].filled_quantity = Some(Decimal::new(1, 2));
-        assert!(!bridge.signed_pending_surface_matches(&wrong_filled_quantity));
-        let mut missing = signed.clone();
-        missing.pop();
-        assert!(!bridge.signed_pending_surface_matches(&missing));
-        let mut extra = signed.clone();
-        extra.push(signed[0].clone());
-        assert!(!bridge.signed_pending_surface_matches(&extra));
-
-        let accepted = plan
-            .accepted_routes
-            .iter()
-            .enumerate()
-            .map(|(index, (_, _, command_id))| {
-                (command_id.clone(), format!("resume-native-{index}"))
-            })
-            .collect::<Vec<_>>();
-        bridge.bind_accepted_plan(&plan, &accepted)?;
-        assert!(!bridge.signed_pending_surface_matches(&signed));
-        Ok(())
-    }
-
-    #[test]
-    fn stopped_writer_extends_pending_surface_with_later_signed_fills()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (mut bridge, _first_key, first_source, first_native) = bridge_with_accepted_order()?;
-        let accepted_before = bridge
-            .routes
-            .values()
-            .filter(|route| route.accepted_venue_order_id.is_some())
-            .count();
-        let first = owned_fill(
-            "stopped-writer-fill-1",
-            &first_native,
-            &first_source,
-            first_source.quantity,
-            first_source.price,
-        )?;
-        let GridDecision::Actions(first_actions) = bridge.observe_persisted_fill(&first, 9)? else {
-            return Err("first stopped-writer fill did not reserve a transaction".into());
-        };
-        let _first_plan = bridge.plan_dispatch(&first_actions[0])?;
-        let (cancel_source, cancel_native) = bridge
-            .grid
-            .pending_transactions
-            .values()
-            .next()
-            .and_then(|transaction| {
-                transaction.cancelled_order.as_ref().and_then(|source| {
-                    bridge
-                        .routes
-                        .get(&transaction.cancel)
-                        .and_then(|route| route.accepted_venue_order_id.clone())
-                        .map(|native| (source.clone(), native))
-                })
-            })
-            .ok_or("pending cancellation route")?;
-        let filled_cancel_target = owned_fill(
-            "stopped-writer-cancel-target-fill",
-            &cancel_native,
-            &cancel_source,
-            cancel_source.quantity,
-            cancel_source.price,
-        )?;
-        assert!(
-            bridge
-                .signed_fill_application(&filled_cancel_target)
-                .is_err()
-        );
-
-        let (second_source, second_native) = bridge
-            .routes
-            .iter()
-            .find_map(|(key, route)| {
-                route
-                    .accepted_venue_order_id
-                    .as_ref()
-                    .filter(|_| bridge.grid.owned_orders.contains_key(key))
-                    .and_then(|native| {
-                        bridge
-                            .grid
-                            .owned_orders
-                            .get(key)
-                            .map(|source| (source.clone(), native.clone()))
-                    })
-            })
-            .ok_or("second accepted route")?;
-        let second = owned_fill(
-            "stopped-writer-fill-2",
-            &second_native,
-            &second_source,
-            second_source.quantity,
-            second_source.price,
-        )?;
-        let GridDecision::Actions(second_actions) = bridge.observe_persisted_fill(&second, 9)?
-        else {
-            return Err("second stopped-writer fill did not reserve a transaction".into());
-        };
-        let _second_plan = bridge.plan_dispatch(&second_actions[0])?;
-
-        assert_eq!(bridge.pending_dispatch_plans()?.len(), 2);
-        let before_dispatch = bridge.pending_pre_dispatch_orders()?;
-        assert_eq!(before_dispatch.len(), accepted_before - 2);
-        let signed = signed_orders_for(&bridge, &before_dispatch)?;
-        assert!(bridge.signed_pending_surface_matches(&signed));
-        Ok(())
-    }
-
-    #[test]
-    fn partial_fills_accumulate_across_checkpoint_and_retire_the_completed_route()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (mut bridge, key, source, native_order_id) = bridge_with_accepted_order()?;
-        let first_quantity = source
-            .quantity
-            .checked_div(Decimal::new(2, 0))
-            .ok_or("first quantity")?;
-        let remaining_quantity = source
-            .quantity
-            .checked_sub(first_quantity)
-            .ok_or("remaining quantity")?;
-        let first = owned_fill(
-            "partial-fill-1",
-            &native_order_id,
-            &source,
-            first_quantity,
-            source.price,
-        )?;
-        assert_eq!(
-            bridge.signed_fill_application(&first)?,
-            SignedGridFillApplication::Apply
-        );
-        assert_eq!(
-            bridge.observe_persisted_fill(&first, 9)?,
-            GridDecision::Noop
-        );
-        assert_eq!(
-            bridge.signed_fill_application(&first)?,
-            SignedGridFillApplication::ExactDuplicate
-        );
-        let checkpoint = bridge.checkpoint_bytes()?;
-        let mut decoded: GridBridgeState = serde_json::from_slice(&checkpoint)
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        assert_eq!(decoded, bridge);
-        decoded.grid.migrate_checkpoint()?;
-        decoded.validate()?;
-        let mut bridge = GridBridgeState::restore_or_bootstrap(
-            Some(checkpoint),
-            bridge.grid.clone(),
-            NodeGridRecoveryPolicy::RequireExisting,
-        )?;
-        assert_eq!(
-            bridge.observe_persisted_fill(&first, 9)?,
-            GridDecision::Noop
-        );
-        let conflicting_duplicate = owned_fill(
-            "partial-fill-1",
-            &native_order_id,
-            &source,
-            source.quantity,
-            source.price,
-        )?;
-        assert!(
-            bridge
-                .signed_fill_application(&conflicting_duplicate)
-                .is_err()
-        );
-        let mut maker_conflict = first.clone();
-        maker_conflict.maker = FieldState::Known(false);
-        assert!(bridge.signed_fill_application(&maker_conflict).is_err());
-        assert!(
-            bridge
-                .observe_persisted_fill(&conflicting_duplicate, 9)
-                .is_err()
-        );
-        let wrong_price = owned_fill(
-            "partial-fill-2",
-            &native_order_id,
-            &source,
-            remaining_quantity,
-            Price::new(source.price.value() + Decimal::ONE)?,
-        )?;
-        assert!(bridge.signed_fill_application(&wrong_price).is_err());
-        assert!(bridge.observe_persisted_fill(&wrong_price, 9).is_err());
-        let completion = owned_fill(
-            "partial-fill-2",
-            &native_order_id,
-            &source,
-            remaining_quantity,
-            source.price,
-        )?;
-        assert_eq!(
-            bridge.signed_fill_application(&completion)?,
-            SignedGridFillApplication::Apply
-        );
-        let decision = bridge.observe_persisted_fill(&completion, 9)?;
-        assert_eq!(
-            bridge.signed_fill_application(&completion)?,
-            SignedGridFillApplication::ExactDuplicate
-        );
-        let GridDecision::Actions(actions) = decision else {
-            return Err("completed maker fill did not produce a rolling action".into());
-        };
-        for action in &actions {
-            let plan = bridge.plan_dispatch(action)?;
-            assert!(!bridge.grid.pending_transactions.is_empty());
-            let checkpoint = bridge.checkpoint_bytes()?;
-            let restored = GridBridgeState::restore_or_bootstrap(
-                Some(checkpoint),
-                bridge.grid.clone(),
-                NodeGridRecoveryPolicy::RequireExisting,
-            )?;
-            let resumed = restored.pending_dispatch_plans()?;
-            assert_eq!(resumed.len(), 1);
-            assert_eq!(resumed[0].commands, plan.commands);
-            bridge = restored;
-            let accepted = plan
-                .accepted_routes
-                .iter()
-                .enumerate()
-                .map(|(index, (_, _, command_id))| {
-                    (command_id.clone(), format!("native-rolling-order-{index}"))
-                })
-                .collect::<Vec<_>>();
-            bridge.bind_accepted_plan(&plan, &accepted)?;
-        }
-        assert!(bridge.grid.pending_transactions.is_empty());
-        assert!(!bridge.routes.contains_key(&key));
-        assert!(!bridge.partial_fills.contains_key(&native_order_id));
-        bridge.checkpoint_bytes()?;
-        Ok(())
-    }
-}
+#[path = "grid_tests.rs"]
+mod tests;

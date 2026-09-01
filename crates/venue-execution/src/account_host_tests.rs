@@ -1292,6 +1292,13 @@ fn restart_fences_an_undispatched_prepared_record_without_redispatch()
     };
     let mut reopened = AccountMutationHost::open(root(&temp), binding, Decimal::TEN, gateway)?;
     assert!(matches!(
+        reopened
+            .command_status(command(Decimal::TEN)?.command_id())?
+            .ok_or("fenced status")?
+            .state(),
+        CommandState::Rejected { reason } if reason == "recovery_proved_never_dispatched"
+    ));
+    assert!(matches!(
         reopened.prepare_for_lane(command(Decimal::TEN)?),
         Err(AccountHostError::Validation(
             AccountHostValidationError::PreparedCommand
@@ -2183,6 +2190,103 @@ fn managed_grid_batch_values_once_and_allows_multiple_ten_u_children()
             AccountHostValidationError::ManagedGridSurface
         ))
     ));
+    Ok(())
+}
+
+#[test]
+fn managed_grid_startup_cancel_is_single_surface_exact_and_bypasses_entry_unknown_fence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let binding = binding()?;
+    let gateway = managed_batch_gateway(
+        &binding,
+        [
+            AccountGatewayResult::Accepted {
+                venue_order_id: "managed-native-1".to_owned(),
+            },
+            AccountGatewayResult::Unknown,
+            AccountGatewayResult::Accepted {
+                venue_order_id: "managed-native-1".to_owned(),
+            },
+        ],
+    )?;
+    let mut host = AccountMutationHost::open(root(&temp), binding.clone(), Decimal::TEN, gateway)?;
+    let _bootstrap = host.durable_runtime_bootstrap()?;
+
+    let surface = host.confirm_managed_grid_surface(&owner()?, BTreeMap::new())?;
+    let mut existing = indexed_command(60)?;
+    let ExecutionCommand::PlaceLimit(existing_place) = &mut existing else {
+        return Err("existing limit required".into());
+    };
+    existing_place.client_order_id = CommandId::new("managed-client-1")?;
+    existing_place.limit_price = Price::new(Decimal::TEN)?;
+    let existing = host
+        .prepare_managed_grid_batch_for_lane(surface, &[existing])?
+        .pop()
+        .ok_or("existing proof")?;
+    assert!(matches!(
+        host.dispatch_prepared(existing)?,
+        AccountDispatchOutcome::Accepted { .. }
+    ));
+
+    let mut signed_after_install = managed_signed_order(&binding, owner()?, false, 2)?;
+    host.enrich_signed_order_owners(&mut signed_after_install);
+    host.latest_signed_snapshot = Some(signed_after_install);
+    host.last_gateway_private_generation = Some(2);
+    let unresolved = host.prepare_for_lane(ExecutionCommand::Cancel(CancelCommand {
+        command_id: CommandId::new("unresolved-cancel")?,
+        owner: owner()?,
+        target_client_order_id: CommandId::new("managed-client-1")?,
+    }))?;
+    assert_eq!(
+        host.dispatch_prepared(unresolved)?,
+        AccountDispatchOutcome::Unknown
+    );
+    assert!(host.has_unresolved());
+
+    let mut refreshed = managed_signed_order(&binding, owner()?, false, 3)?;
+    host.enrich_signed_order_owners(&mut refreshed);
+    host.latest_signed_snapshot = Some(refreshed);
+    host.last_gateway_private_generation = Some(3);
+    let expected = BTreeMap::from([(CommandId::new("managed-client-1")?, owner()?)]);
+    let cancellation = |command_id: &str| -> Result<ExecutionCommand, Box<dyn std::error::Error>> {
+        Ok(ExecutionCommand::Cancel(CancelCommand {
+            command_id: CommandId::new(command_id)?,
+            owner: owner()?,
+            target_client_order_id: CommandId::new("managed-client-1")?,
+        }))
+    };
+    assert!(matches!(
+        host.confirm_managed_grid_surface(&owner()?, expected.clone()),
+        Err(AccountHostError::Validation(
+            AccountHostValidationError::ManagedGridSurface
+        ))
+    ));
+    let invalid_surface =
+        host.confirm_managed_grid_cancellation_surface(&owner()?, expected.clone())?;
+    assert!(matches!(
+        host.prepare_managed_grid_batch_for_lane(
+            invalid_surface,
+            &[cancellation("drain-a")?, cancellation("drain-b")?]
+        ),
+        Err(AccountHostError::Validation(
+            AccountHostValidationError::ManagedGridSurface
+        ))
+    ));
+
+    let risk_reads_before_cancel = host.gateway.risk_reads;
+    let surface = host.confirm_managed_grid_cancellation_surface(&owner()?, expected)?;
+    let cancel = host
+        .prepare_managed_grid_batch_for_lane(surface, &[cancellation("drain-c")?])?
+        .pop()
+        .ok_or("cancel proof")?;
+    assert_eq!(host.gateway.risk_reads, risk_reads_before_cancel);
+    assert!(matches!(
+        host.dispatch_prepared(cancel)?,
+        AccountDispatchOutcome::Accepted { .. }
+    ));
+    assert_eq!(host.gateway.risk_reads, risk_reads_before_cancel);
+    assert_eq!(host.gateway.dispatches, 3);
     Ok(())
 }
 

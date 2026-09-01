@@ -268,12 +268,15 @@ Grid bridge 对同一已接受 native order 的部分成交必须在策略 check
 
 公共 socket/journal 只在 resident 公共 turn 推进，供初装、整网重建和再中心化使用；它的缺失或过期不阻塞完整成交的滚动 dispatch。`mutation_dispatched`、`private_reconcile_required` 与 `recenter_required` 继续区分已发批次、后续私有对账和 reducer 明确要求的整网重心迁移；BBO 不再产生成交滚动的等待状态。
 
-最小 Checkpoint 与最终公共/WAL 门之间的崩溃也按整批恢复：重启先把 `Prepared` 证明为未 dispatch、把
-`Submitted` 围栏为 `Unknown`；只有全部 deterministic command id 在 Host WAL 中绝对不存在，且由 checkpoint 推导的预派发订单面（仍有 accepted route 的当前订单，加每个 pending transaction 的原 cancel target，排除未提交 replacement）与当前签名订单在 client/native/owner/订单形状及全集上完全一致，才可用同一 transaction、同一命令 ID 继续整批，不得从当前订单面自证、重新分配身份或按当前价格再规划。任一命令已进入 WAL（包括明确 Rejected）时，整个 pending transaction 必须保持暂停并进入签名对账，禁止单条复活；只有全部 WAL 身份收敛且更新一代全订单族签名回读重建出实际 owned 集合后，才清除 pending 并继续 reset/running。
+每次已有 Grid 冷启动都固定执行“签名确认、撤旧、重建”，不得恢复旧价位的 pending transaction：先消费与 checkpoint accepted route 精确匹配且尚未耐久应用的签名成交，再逐字节核对 pending 的全部 deterministic command 与 Host WAL。只有全部子命令为 Absent 或终态 Rejected、且 rollback 后的 client/native/owner/订单形状与最新签名全集精确一致，才可保留成交事实、丢弃未提交 replacement 并进入一个耐久 reconciliation episode。Host 取得账户锁后、Actor 注册前先把崩溃遗留 `Prepared` 原地终结为 `Rejected`；该状态证明未跨越已 fsync 的 `Submitted`，因此不派发原 ID，再按新 attempt/epoch 身份继续。`Submitted` 在同一阶段转为 `Unknown` 并只做签名对账；`Unknown` 或命令字节不一致一律暂停，旧 ID 不重投。
+
+episode 按 checkpoint key 串行选择一个受管订单，以 Critical 优先级经同一 Host/WAL/writer 发一条 Cancel；目标必须是该代完整签名 surface 的成员。命令 ID 绑定 episode sequence、target 与持久 attempt，明确 Rejected 后只能使用新的 attempt ID，最多三次；恢复出的精确 Prepared 先原地终结再换 ID，Submitted 或 Unknown 不得换 ID。Accepted 只有在更新签名页证明该目标已消失后才从 Desired 删除。撤单窗口的新完整成交先写 facts/Actor，退休旧 route 并更新库存，但不得再生成旧 epoch 的两补一撤。受管签名面精确为空后，使用最新库存、规则和 BBO 安装 `old_epoch + 1`；不平仓，也不以旧中心恢复。
+
+place-only 安装若在任意子命令或持久边界中断，下一启动从 checkpoint 重建完整命令字节：只给 WAL Accepted 子命令绑定其 native id，Absent/Rejected 子命令从投影删除，精确 Prepared 在原 WAL 终结为 Rejected，Submitted/Unknown 失败关闭；已接受子集随后进入同一撤单 episode。每个 episode 只耐久消费一次更高 epoch 自动重建机会；该 place 批次未能全量签名确认时暂停，后续监督器重启不得再创建第二个 epoch。这样部分成功的“半张网”不能直接变成 Running，也不能重投原 place ID。
 
 生产冷启动恢复私有游标还必须同时验证 Host 已核验的 Actor Applied 头与完整 `facts.jsonl` 尾部：每条事实的 journal 序号、header source sequence、PrivateAccount 来源、header 与规范私有事件均须一致有效；当前 Runtime 与 PrivateRouter 游标只能在 Actor 游标精确命中已验证 facts 尾部时同步前移。仅有 checkpoint 数字、重标记事实、断序、坏尾或 Actor/facts 任一方向不一致都失败关闭，不得据此投递或恢复 mutation。
 
-writer 停止后若旧 pending transaction 尚未进入 WAL 而其余受管订单继续成交，启动恢复必须先把更新签名页中仍命中 checkpoint accepted route、且尚未耐久应用的成交全部写入同一 facts/Actor checkpoint；同页 fill identity 先按完整不可变内容去重，已 checkpoint 的 partial slice 也须精确匹配数量、maker 与源订单语义后才可跳过。pending 的原 cancel target 若已成交，原 transaction 已不可复放并失败关闭。随后重新核验旧、新全部 deterministic command id 均不在 WAL，并用扩展后的完整 pending 预派发订单面匹配当前交易所。只有该全集精确一致才可串行恢复批次；不得先恢复旧 pending、忽略停机窗口成交或放宽为订单数量比较。
+writer 停止后若旧 pending transaction 尚未进入 WAL 而其余受管订单继续成交，启动必须先把更新签名页中仍命中 checkpoint accepted route、且尚未耐久应用的成交全部写入同一 facts/Actor checkpoint；同页 fill identity 按完整不可变内容去重，已 checkpoint 的 partial slice 也须精确匹配数量、maker 与源订单语义后才可跳过。随后回滚 pending 的乐观 replacement，并按上述 episode 撤净仍存在的实际 owned 集合；不得先续发旧 pending、忽略停机窗口成交或放宽为订单数量比较。
 
 重建 place 收到 Accepted 后不得先把本地 4×N 张订单记为 `Running`；若安装窗口继续成交或订单消失，
 Checkpoint 与健康报告都必须保持过渡态，直到更新一代签名 open-orders 精确收敛。
@@ -307,14 +310,11 @@ Desired Orders，期间的新成交须先消费并重新计算目标集合。`Ru
 平仓数量不得超过签名库存和已承诺平仓量。
 
 显式 Node Grid 配置 `skip_inventory_replenishment_until_recovered`（部署入口可映射为
-`--skip-inventory-replenishment-until-recovered`）是初次恢复期间的耐久无市价补仓闩锁：低库存时仍可按当前签名库存重建，closing 数量必须由库存裁剪且不得超额，两腿 opening 必须各自保持完整；签名库存恢复后 reducer 清除该闩锁，后续 Running 重启必须接受已清除的 checkpoint，不得重新启用或因其不再等于启动配置而拒绝。反向用配置关闭仍处于耐久开启状态的闩锁仍失败关闭。首次 bootstrap 在同一 Actor Applied checkpoint 中保持 `Eligible / Attempted / Confirmed`：旧单接管产生的精确未安装 checkpoint 仍为 Eligible；读取外部签名事实或 BBO 前必须先持久化 Attempted；只有完整订单集合得到更新签名确认后才持久化 Confirmed。Attempted 重启保持 Paused 并只对账，不得由新 BBO 重建 epoch 或重投任何部分 Accepted/Unknown 批次。Stage 7 不得在 reducer 已接受无市价补仓模式后用重复的无条件低库存门拒绝安装；未显式进入该模式时，低于单格名义的任一腿仍必须先走 WAL 绑定的库存补充。
+`--skip-inventory-replenishment-until-recovered`）是初次恢复期间的耐久无市价补仓闩锁：低库存时仍可按当前签名库存重建，closing 数量必须由库存裁剪且不得超额，两腿 opening 必须各自保持完整；签名库存恢复后 reducer 清除该闩锁，后续 Running 重启必须接受已清除的 checkpoint，不得重新启用或因其不再等于启动配置而拒绝。反向用配置关闭仍处于耐久开启状态的闩锁仍失败关闭。首次 bootstrap 在同一 Actor Applied checkpoint 中保持 `Eligible / Attempted / Confirmed`：旧单接管产生的精确未安装 checkpoint 仍为 Eligible；读取外部签名事实或 BBO 前必须先持久化 Attempted；只有完整订单集合得到更新签名确认后才持久化 Confirmed。Attempted 重启不得重投原 place 批次：按 WAL 绑定 Accepted 子集，撤净后以更高 epoch 重建；任一 Unknown 仍保持 Paused。Stage 7 不得在 reducer 已接受无市价补仓模式后用重复的无条件低库存门拒绝安装；未显式进入该模式时，低于单格名义的任一腿仍必须先走 WAL 绑定的库存补充。
 
-账户的广义生产风险 fence 不因 Grid 接管而清除：任一非零仓位、开放订单、外部订单或未决 WAL 仍保持 fence。新 Runtime 只可在 Host 证明当前签名 Hedge 订单面与 WAL Owner（含 purpose）一一对应、无外部/额外订单、无 Unknown 且 Actor Applied 与配置代仍为当前值后，安装不可序列化的内存 `Exact` 权限；它至多消费为一个 `Batch`。空订单面首次安装只允许最多 200 条 post-only Place；滚动批次必须恰为两条 post-only Place 加一条针对旧签名面的 Cancel。Host 对整个批次只读取一次新鲜汇率/风险证据，但逐条维持不超过 10U；批次以单次 durability barrier 写入 Prepared，仍逐条经过原 WAL 和唯一 writer。第一条 Rejected/Unknown、签名刷新、重连、Pause、改参或代际变化立即撤销权限并在物理派发前拒绝剩余 Prepared；只有新签名面再次精确确认后才可恢复，禁止自动重投。
+账户的广义生产风险 fence 不因 Grid 接管而清除：任一非零仓位、开放订单、外部订单或未决 WAL 仍保持 fence。新 Runtime 只可在 Host 证明当前签名 Hedge 订单面与 WAL Owner（含 purpose）一一对应、无外部/额外订单且 Actor Applied 与配置代仍为当前值后安装不可序列化的内存 `Exact` 权限；它至多消费为一个 `Batch`。空订单面安装只允许最多 200 条 post-only Place；滚动批次必须恰为两条 post-only Place 加一条针对旧签名面的 Cancel。启动撤单是唯一窄例外：可在无新增风险的 Critical lane 中逐条消费精确签名成员，即使存在无关 Unknown 也不读取 entry risk，但仍须持久 WAL、单 writer 与派发前更新签名目标校验。Host 对含 Place 的批次只读取一次新鲜汇率/风险证据，且逐条维持不超过 10U；第一条 Rejected/Unknown、签名刷新、重连、Pause、改参或代际变化立即撤销剩余增险权限，禁止自动重投。
 
-已完成的 `ResettingGrid` 若持久化为签名空面，只有操作者在该次 `run` 显式提供与交易所精确一致的
-`--confirm-reset-rebuild` 才能获得一次新的安装尝试；该标记先随 Actor Applied 持久化，普通启动、
-`Attempted`、`Rejected` 或 `Unknown` 不得借此重试。仅当旧实现的 checkpoint 已证明在任何
-`Prepared` 前被本地验证拒绝时，版本化迁移可在同一显式确认下给一次修复重试；已跨越 WAL 的状态不适用。
+启动 reconciliation episode 已持久化、所有旧 target 逐一得到 WAL 与签名消失证明且完整受管订单面为空后，允许同一启动自动获得一次 `old_epoch + 1` 安装；不再要求 `--confirm-reset-rebuild`。这项自动化只覆盖撤旧后的新 epoch，不允许复活任何旧 Place/Replace；机会在 place 计划写入 Actor checkpoint 时即耐久消费，失败后监督器只能保持 Paused/NeedsAttention。Rejected 使用新 attempt/epoch 身份；精确 Prepared 原地终结，Unknown 或 Submitted 仍失败关闭。
 
 ### 6.3 库存恢复后的下一成交重心
 

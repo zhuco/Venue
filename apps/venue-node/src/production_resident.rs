@@ -92,19 +92,40 @@ pub(crate) struct PrivateFillFact {
     pub(crate) fill: venue_domain::Fill,
 }
 
-fn all_pending_grid_commands_are_absent<S, E>(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingGridWalDisposition {
+    AllAbsent,
+    TerminalRejectedOrAbsent,
+    RequiresSignedReconciliation,
+}
+
+fn classify_pending_grid_wal<E>(
     pending_transactions: &[(String, Vec<venue_domain::CommandId>)],
-    mut command_status: impl FnMut(&venue_domain::CommandId) -> Result<Option<S>, E>,
-) -> Result<bool, E> {
+    mut command_state: impl FnMut(
+        &venue_domain::CommandId,
+    ) -> Result<Option<venue_runtime::CommandState>, E>,
+) -> Result<PendingGridWalDisposition, E> {
+    let mut rejected = false;
     for command_id in pending_transactions
         .iter()
         .flat_map(|(_, command_ids)| command_ids)
     {
-        if command_status(command_id)?.is_some() {
-            return Ok(false);
+        match command_state(command_id)? {
+            None => {}
+            Some(venue_runtime::CommandState::Rejected { .. }) => rejected = true,
+            Some(
+                venue_runtime::CommandState::Prepared
+                | venue_runtime::CommandState::Submitted
+                | venue_runtime::CommandState::Accepted { .. }
+                | venue_runtime::CommandState::Unknown { .. },
+            ) => return Ok(PendingGridWalDisposition::RequiresSignedReconciliation),
         }
     }
-    Ok(true)
+    Ok(if rejected {
+        PendingGridWalDisposition::TerminalRejectedOrAbsent
+    } else {
+        PendingGridWalDisposition::AllAbsent
+    })
 }
 
 impl<G: AccountPhysicalGateway> ProductionResident<G> {
@@ -310,25 +331,63 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         let pending_transactions = bridge
             .pending_transaction_command_ids()
             .map_err(|_| NodeError::ResidentRuntime)?;
-        // A checkpoint is written before rolling commands reach Host. Only exact absence of every
-        // deterministic command id proves that the same reserved transaction never crossed the
-        // WAL boundary and remains eligible for signed-surface recovery. Any WAL fact (including
-        // a clear rejection) remains paused for signed exchange reconciliation and is not replayed.
-        let resume_unsubmitted = if pending_transactions.is_empty() {
-            false
+        let pending_expected_commands = bridge
+            .pending_dispatch_plans()
+            .map_err(|_| NodeError::ResidentRuntime)?
+            .into_iter()
+            .flat_map(|plan| plan.commands)
+            .collect::<Vec<_>>();
+        for expected in &pending_expected_commands {
+            let status = self
+                .host
+                .command_status(expected.command_id())
+                .map_err(|error| NodeError::LiveHost {
+                    venue: self.host.binding().venue,
+                    message: format!("pending Grid command WAL lookup failed: {error}"),
+                })?;
+            if status.is_some()
+                && self.host.command_snapshot(expected.command_id()).as_ref() != Some(expected)
+            {
+                return Err(NodeError::LiveHost {
+                    venue: self.host.binding().venue,
+                    message: "pending Grid command WAL bytes differ from checkpoint".to_owned(),
+                });
+            }
+        }
+        // Host open has already fenced crash-window Prepared records to terminal Rejected and
+        // Submitted records to Unknown. Exact Absent/Rejected families may therefore abandon the
+        // old projection into signed-surface reset; Accepted/Unknown stay paused and no old id is
+        // ever dispatched here.
+        let mut pending_wal = if pending_transactions.is_empty() {
+            PendingGridWalDisposition::AllAbsent
         } else {
-            let all_absent = all_pending_grid_commands_are_absent(&pending_transactions, |id| {
+            classify_pending_grid_wal(&pending_transactions, |id| {
                 self.host
                     .command_status(id)
+                    .map(|status| status.map(|status| status.state().clone()))
                     .map_err(|error| NodeError::LiveHost {
                         venue: self.host.binding().venue,
                         message: format!("pending Grid command WAL classification failed: {error}"),
                     })
-            })?;
-            all_absent
+            })?
         };
+        if pending_expected_commands.iter().any(|expected| {
+            self.host
+                .command_snapshot(expected.command_id())
+                .is_some_and(|actual| actual != *expected)
+        }) {
+            pending_wal = PendingGridWalDisposition::RequiresSignedReconciliation;
+        }
+        let restart_from_signed_surface = matches!(
+            pending_wal,
+            PendingGridWalDisposition::AllAbsent
+                | PendingGridWalDisposition::TerminalRejectedOrAbsent
+        );
         let first_bootstrap = bridge.needs_initial_bootstrap();
         let reset_rebuild = confirm_reset_rebuild && bridge.needs_reset_rebuild();
+        let reconciliation_rebuild = bridge.needs_reconciliation_rebuild();
+        let unconfirmed_install = bridge.has_unconfirmed_install_surface();
+        let has_installed_epoch = bridge.grid.epoch.is_some();
         let bootstrap_requires_reconciliation = bridge.bootstrap_requires_reconciliation();
         if first_bootstrap && recovery == crate::NodeGridRecoveryPolicy::RequireExisting {
             return Err(NodeError::ResidentArtifacts);
@@ -341,14 +400,26 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         let key = binding.key.clone();
         self.grid_bridges.insert(key.clone(), bridge);
         self.grid_bindings.insert(key.clone(), binding);
-        if resume_unsubmitted {
+        if unconfirmed_install {
             let binding = self
                 .grid_bindings
                 .get(&key)
                 .cloned()
                 .ok_or(NodeError::ResidentRuntime)?;
-            self.resume_grid_unsubmitted_transactions(&binding)?;
-        } else if first_bootstrap || reset_rebuild {
+            self.recover_unconfirmed_grid_install_on_startup(&binding)?;
+        } else if !first_bootstrap
+            && !reset_rebuild
+            && !reconciliation_rebuild
+            && has_installed_epoch
+            && restart_from_signed_surface
+        {
+            let binding = self
+                .grid_bindings
+                .get(&key)
+                .cloned()
+                .ok_or(NodeError::ResidentRuntime)?;
+            self.reset_grid_on_startup(&binding)?;
+        } else if first_bootstrap || reset_rebuild || reconciliation_rebuild {
             self.grid_bootstrap_pending.insert(key.clone());
         } else if bootstrap_requires_reconciliation {
             self.runtime.request_pause(&key).map_err(resident_error)?;
@@ -389,10 +460,12 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 bridge
                     .mark_bootstrap_attempted()
                     .map_err(|_| NodeError::ResidentRuntime)?;
-            } else {
+            } else if bridge.needs_reset_rebuild() {
                 bridge
                     .mark_reset_rebuild_attempted()
                     .map_err(|_| NodeError::ResidentRuntime)?;
+            } else if !bridge.needs_reconciliation_rebuild() {
+                return Err(NodeError::ResidentRuntime);
             }
             bridge.checkpoint_bytes()?
         };
@@ -870,11 +943,19 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 venue: self.host.binding().venue,
                 message: format!("Grid signed-empty-surface admission rejected: {error}"),
             })?;
+        let venue = self.host.binding().venue;
         let (plan, replay) = {
             let bridge = self
                 .grid_bridges
                 .get_mut(&binding.key)
                 .ok_or(NodeError::ResidentRuntime)?;
+            let epoch_number =
+                bridge
+                    .next_install_epoch()
+                    .map_err(|error| NodeError::LiveHost {
+                        venue,
+                        message: format!("Grid next install epoch is invalid: {error}"),
+                    })?;
             let anchor = (market.bid.value() + market.ask.value()) / Decimal::from(2_u8);
             let tick = market.price_tick.value();
             let anchor = anchor - anchor % tick;
@@ -891,15 +972,27 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 return Err(NodeError::ResidentRuntime);
             }
             let epoch = GridEpoch {
-                epoch: 1,
+                epoch: epoch_number,
                 anchor_price: Price::new(anchor).map_err(|_| NodeError::ResidentRuntime)?,
                 step: Price::new(step).map_err(|_| NodeError::ResidentRuntime)?,
                 grid_quantity: quantity,
                 passive_book_fallback: None,
             };
-            let plan = bridge
-                .install_initial_epoch(inventory, epoch)
-                .map_err(|_| NodeError::ResidentRuntime)?;
+            let plan = if epoch_number == 1 {
+                bridge
+                    .install_initial_epoch(inventory, epoch)
+                    .map_err(|error| NodeError::LiveHost {
+                        venue,
+                        message: format!("initial Grid epoch planning failed: {error}"),
+                    })?
+            } else {
+                bridge
+                    .install_rebuilt_epoch(inventory, epoch)
+                    .map_err(|error| NodeError::LiveHost {
+                        venue,
+                        message: format!("reconciled Grid epoch planning failed: {error}"),
+                    })?
+            };
             if plan.commands.iter().any(|command| {
                 matches!(command, ExecutionCommand::PlaceLimit(order)
                     if !order.reduce_only
@@ -975,7 +1068,10 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 .ok_or(NodeError::ResidentRuntime)?;
             bridge
                 .bind_accepted_plan(&plan, &accepted)
-                .map_err(|_| NodeError::ResidentRuntime)?;
+                .map_err(|error| NodeError::LiveHost {
+                    venue,
+                    message: format!("Grid Accepted routes could not bind: {error}"),
+                })?;
             bridge.checkpoint_bytes()?
         };
         let accepted_turn = self
@@ -991,7 +1087,10 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         let exact = bridge.signed_desired_matches(confirmed.open_orders());
         if confirmed.private_generation() <= snapshot.private_generation() || !exact {
             self.pause_grid_after_bootstrap_failure(binding)?;
-            return Err(NodeError::ResidentRuntime);
+            return Err(NodeError::LiveHost {
+                venue,
+                message: "Grid install did not reach an exact newer signed surface".to_owned(),
+            });
         }
         let replay = {
             let bridge = self
@@ -999,8 +1098,11 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 .get_mut(&binding.key)
                 .ok_or(NodeError::ResidentRuntime)?;
             bridge
-                .mark_bootstrap_confirmed()
-                .map_err(|_| NodeError::ResidentRuntime)?;
+                .confirm_installed_surface()
+                .map_err(|error| NodeError::LiveHost {
+                    venue,
+                    message: format!("Grid installed surface state is invalid: {error}"),
+                })?;
             bridge.checkpoint_bytes()?
         };
         let confirmed_turn = self
@@ -1015,7 +1117,10 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             .expected_signed_surface()?;
         self.host
             .confirm_managed_grid_surface(&mut self.runtime, binding, expected)
-            .map_err(|_| NodeError::ResidentRuntime)?;
+            .map_err(|error| NodeError::LiveHost {
+                venue,
+                message: format!("Grid final signed surface confirmation failed: {error}"),
+            })?;
         Ok(())
     }
 
@@ -1605,463 +1710,4 @@ impl ProductionResident<venue_gateway_gate::GateAccountGateway> {
 }
 
 #[cfg(test)]
-mod bootstrap_tests {
-    use std::{
-        io,
-        sync::{Arc, Mutex},
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    use rust_decimal::Decimal;
-    use venue_domain::domain::{Asset, FieldState, Fill, PositionSide};
-    use venue_gateway_api::{GatewayBinding, VenueId};
-    use venue_runtime::{
-        AccountDispatchPermit, AccountGatewayResult, AccountHostValidationError,
-        AccountPhysicalGateway, AccountRecoveryOutcome, AccountRecoveryReport,
-        AccountRecoveryRequest, AccountRiskEvidence, CommandState, SignedAccountPositionFact,
-        SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
-    };
-    use venue_runtime::{AccountKey, StrategyBinding, StrategyInstanceKey, StrategyKind};
-    use venue_strategies::hedged_grid::{HedgedGridBinding, HedgedGridParams, HedgedGridState};
-
-    use super::*;
-    use crate::NodeGridRecoveryPolicy;
-
-    const ACCOUNT: &str = "00000000-0000-4000-8000-000000000001";
-
-    struct State {
-        generation: u64,
-        dispatches: usize,
-        accept_dispatch: bool,
-    }
-
-    struct Gateway {
-        binding: GatewayBinding,
-        state: Arc<Mutex<State>>,
-    }
-
-    impl AccountPhysicalGateway for Gateway {
-        type Error = io::Error;
-
-        fn binding(&self) -> &GatewayBinding {
-            &self.binding
-        }
-
-        fn reconcile(
-            &mut self,
-            request: &AccountRecoveryRequest,
-        ) -> Result<AccountRecoveryReport, Self::Error> {
-            AccountRecoveryReport::new(
-                self.binding.clone(),
-                now().map_err(io::Error::other)?,
-                request
-                    .unresolved()
-                    .iter()
-                    .map(|command| {
-                        AccountRecoveryOutcome::still_unknown(command.command_id().clone())
-                    })
-                    .collect(),
-            )
-            .map_err(io::Error::other)
-        }
-
-        fn risk_evidence(&mut self) -> Result<AccountRiskEvidence, AccountHostValidationError> {
-            let generation = self
-                .state
-                .lock()
-                .map_err(|_| AccountHostValidationError::RiskEvidence)?
-                .generation
-                .max(1);
-            AccountRiskEvidence::complete(
-                self.binding.clone(),
-                now().map_err(|_| AccountHostValidationError::RiskEvidence)?,
-                generation,
-                Vec::new(),
-                Vec::new(),
-            )
-        }
-
-        fn signed_account_snapshot(
-            &mut self,
-            request: &AccountRecoveryRequest,
-        ) -> Result<SignedAccountSnapshot, AccountHostValidationError> {
-            let now = now().map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-            state.generation = state.generation.saturating_add(1);
-            let generation = state.generation;
-            SignedAccountSnapshot::complete(
-                self.binding.clone(),
-                now,
-                10_000,
-                generation,
-                1,
-                SignedAccountPositionMode::Hedge,
-                Vec::new(),
-                vec![
-                    SignedAccountPositionFact {
-                        symbol: self.binding.symbol.clone(),
-                        position_side: PositionSide::Long,
-                        quantity: Decimal::ZERO,
-                        entry_price: None,
-                        mark_price: Some(Decimal::new(100, 0)),
-                    },
-                    SignedAccountPositionFact {
-                        symbol: self.binding.symbol.clone(),
-                        position_side: PositionSide::Short,
-                        quantity: Decimal::ZERO,
-                        entry_price: None,
-                        mark_price: Some(Decimal::new(100, 0)),
-                    },
-                ],
-                format!("fills:{generation}"),
-                request
-                    .unresolved()
-                    .iter()
-                    .map(|command| SignedUnknownFact {
-                        command_id: command.command_id().clone(),
-                        result: SignedUnknownResult::Unknown,
-                    })
-                    .collect(),
-            )
-        }
-
-        fn dispatch(&mut self, _permit: AccountDispatchPermit) -> AccountGatewayResult {
-            let Ok(mut state) = self.state.lock() else {
-                return AccountGatewayResult::Unknown;
-            };
-            state.dispatches = state.dispatches.saturating_add(1);
-            if !state.accept_dispatch {
-                return AccountGatewayResult::Unknown;
-            }
-            let venue_order_id = format!("grid-native-{}", state.dispatches);
-            AccountGatewayResult::Accepted { venue_order_id }
-        }
-    }
-
-    fn now() -> Result<u64, &'static str> {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "clock")?
-            .as_millis()
-            .try_into()
-            .map_err(|_| "clock")
-    }
-
-    fn launch(root: &std::path::Path) -> Result<NodeLaunch, Box<dyn std::error::Error>> {
-        Ok(NodeLaunch::try_parse_from(
-            VenueId::Bybit,
-            [
-                "venue-node-bybit",
-                "--mode",
-                "LIVE",
-                "--trading-account-id",
-                ACCOUNT,
-                "--symbol",
-                "DOGE/USDT",
-                "--artifacts-base",
-                root.to_str().ok_or("non-utf8 test root")?,
-            ],
-        )?)
-    }
-
-    fn binding() -> Result<StrategyBinding, Box<dyn std::error::Error>> {
-        let account = AccountKey::new(VenueId::Bybit, ACCOUNT.to_owned())?;
-        let key = StrategyInstanceKey::new(
-            account,
-            StrategyKind::HedgedGrid,
-            "grid-bootstrap".to_owned(),
-            "DOGE/USDT".parse()?,
-        )?;
-        Ok(StrategyBinding::new(
-            key,
-            "run-bootstrap",
-            "grid-bootstrap-config",
-        )?)
-    }
-
-    fn initial(grid_count: u8) -> Result<HedgedGridState, Box<dyn std::error::Error>> {
-        Ok(HedgedGridState::new_with_params(
-            HedgedGridBinding {
-                strategy_instance_id: "grid-bootstrap".to_owned(),
-                run_id: "run-bootstrap".to_owned(),
-                exchange: "bybit".to_owned(),
-                account: ACCOUNT.to_owned(),
-                symbol: "DOGE/USDT".parse()?,
-                config_version: "grid-bootstrap-config".to_owned(),
-                owner_scope: "grid-bootstrap".to_owned(),
-            },
-            HedgedGridParams::fixed_release(Asset::new("USDT")?, grid_count)?,
-        )?)
-    }
-
-    fn market() -> Result<GridBootstrapMarket, Box<dyn std::error::Error>> {
-        Ok(GridBootstrapMarket {
-            bid: Price::new(Decimal::new(998, 1))?,
-            ask: Price::new(Decimal::new(1002, 1))?,
-            price_tick: Price::new(Decimal::new(1, 1))?,
-            quantity_step: Decimal::new(1, 2),
-            minimum_quantity: Decimal::new(1, 2),
-            maximum_quantity: Decimal::new(1000, 0),
-            minimum_notional: Decimal::new(5, 0),
-            observed_at_ms: now()?,
-        })
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn resident(
-        root: &std::path::Path,
-        grid_count: u8,
-    ) -> Result<
-        (
-            ProductionResident<Gateway>,
-            Arc<Mutex<State>>,
-            StrategyBinding,
-        ),
-        Box<dyn std::error::Error>,
-    > {
-        let launch = launch(root)?;
-        let state = Arc::new(Mutex::new(State {
-            generation: 0,
-            dispatches: 0,
-            accept_dispatch: false,
-        }));
-        let gateway = Gateway {
-            binding: launch.binding().clone(),
-            state: state.clone(),
-        };
-        let mut resident = ProductionResident::open(&launch, gateway)?;
-        let binding = binding()?;
-        resident.register_grid_actor(
-            binding.clone(),
-            initial(grid_count)?,
-            NodeGridRecoveryPolicy::BootstrapWhenAbsent,
-            true,
-        )?;
-        Ok((resident, state, binding))
-    }
-
-    #[test]
-    fn bootstrap_batch_risk_failure_dispatches_nothing() -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let (mut resident, state, binding) = resident(directory.path(), 2)?;
-        assert!(resident.take_grid_bootstrap_request(&binding)?);
-        let snapshot = resident.refresh_signed_snapshot()?;
-        assert!(
-            resident
-                .bootstrap_grid_from_signed_market(&binding, snapshot, market()?)
-                .is_err()
-        );
-        assert_eq!(state.lock().map_err(|_| "state")?.dispatches, 0);
-        assert_eq!(
-            resident.strategy_lifecycle(&binding),
-            Some(venue_runtime::account::InstanceLifecycle::Paused)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn bootstrap_admission_error_retains_risk_stage() {
-        let stage = AccountHostValidationError::RiskEvidenceStage("quote_rates");
-        let message = grid_bootstrap_admission_error(VenueId::Binance, &stage).to_string();
-        assert!(message.contains("failed closed at quote_rates"));
-    }
-
-    #[test]
-    fn recovered_restart_keeps_the_initial_replenishment_latch_cleared()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut bridge = grid::GridBridgeState::bootstrap(initial(1)?)?;
-        apply_grid_restart_replenishment_policy(&mut bridge, true, false)?;
-        assert!(bridge.grid.suppress_replenishment_until_inventory_recovers);
-
-        bridge.grid.phase = venue_strategies::hedged_grid::GridPhase::Running;
-        bridge.grid.suppress_replenishment_until_inventory_recovers = false;
-        apply_grid_restart_replenishment_policy(&mut bridge, true, false)?;
-        assert!(!bridge.grid.suppress_replenishment_until_inventory_recovers);
-
-        bridge.grid.suppress_replenishment_until_inventory_recovers = true;
-        assert!(apply_grid_restart_replenishment_policy(&mut bridge, false, false).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn every_pending_wal_state_blocks_resume_even_when_not_last()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let command_ids = (0..6)
-            .map(|index| venue_domain::CommandId::new(format!("pending-grid-{index}")))
-            .collect::<Result<Vec<_>, _>>()?;
-        let pending = vec![("transaction".to_owned(), command_ids.clone())];
-        let states = [
-            CommandState::Prepared,
-            CommandState::Submitted,
-            CommandState::Accepted {
-                venue_order_id: "native".to_owned(),
-            },
-            CommandState::Rejected {
-                reason: "rejected".to_owned(),
-            },
-            CommandState::Unknown {
-                reason: "unknown".to_owned(),
-            },
-        ];
-        for (index, state) in states.into_iter().enumerate() {
-            let present = command_ids[index].clone();
-            assert!(!all_pending_grid_commands_are_absent(
-                &pending,
-                |command_id| {
-                    Ok::<_, io::Error>((command_id == &present).then(|| state.clone()))
-                }
-            )?);
-        }
-        assert!(all_pending_grid_commands_are_absent(&pending, |_| {
-            Ok::<_, io::Error>(None::<CommandState>)
-        })?);
-        Ok(())
-    }
-
-    #[test]
-    fn custody_only_actor_checkpoint_rearms_first_bootstrap_after_restart()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let (mut resident, state, binding) = resident(directory.path(), 2)?;
-        let replay = resident
-            .grid_bridges
-            .get(&binding.key)
-            .ok_or("grid bridge")?
-            .checkpoint_bytes()?;
-        let applied = resident
-            .runtime
-            .persist_resident_semantic_turn(&binding, replay)?;
-        persist_anchor(&resident.artifacts_root, &binding, &applied)?;
-        drop(resident);
-
-        let second_launch = launch(directory.path())?;
-        let gateway = Gateway {
-            binding: second_launch.binding().clone(),
-            state: state.clone(),
-        };
-        let mut reopened = ProductionResident::open(&second_launch, gateway)?;
-        reopened.register_grid_actor(
-            binding.clone(),
-            initial(2)?,
-            NodeGridRecoveryPolicy::BootstrapWhenAbsent,
-            true,
-        )?;
-        assert!(reopened.take_grid_bootstrap_request(&binding)?);
-        assert!(!reopened.take_grid_bootstrap_request(&binding)?);
-        drop(reopened);
-
-        let third_launch = launch(directory.path())?;
-        let gateway = Gateway {
-            binding: third_launch.binding().clone(),
-            state,
-        };
-        let mut fenced = ProductionResident::open(&third_launch, gateway)?;
-        fenced.register_grid_actor(
-            binding.clone(),
-            initial(2)?,
-            NodeGridRecoveryPolicy::BootstrapWhenAbsent,
-            true,
-        )?;
-        assert!(!fenced.take_grid_bootstrap_request(&binding)?);
-        assert_eq!(
-            fenced.strategy_lifecycle(&binding),
-            Some(venue_runtime::account::InstanceLifecycle::Paused)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn shared_grid_private_fill_uses_signed_private_generation_not_connection_generation()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let (mut resident, state, binding) = resident(directory.path(), 1)?;
-        state.lock().map_err(|_| "state")?.accept_dispatch = true;
-        let (command, replay) = {
-            let bridge = resident
-                .grid_bridges
-                .get_mut(&binding.key)
-                .ok_or("grid bridge")?;
-            let command = bridge.install_test_accepted_open_route("grid-native-1")?;
-            (command, bridge.checkpoint_bytes()?)
-        };
-        let applied = resident
-            .runtime
-            .persist_resident_semantic_turn(&binding, replay)?;
-        persist_anchor(&resident.artifacts_root, &binding, &applied)?;
-        resident.host.prepare_and_admit_operator(
-            &mut resident.runtime,
-            &binding,
-            &applied,
-            venue_runtime::account::AccountLanePriority::Normal,
-            command.clone(),
-        )?;
-        resident
-            .runtime
-            .dispatch_next_with_host(&mut resident.host)?;
-        let ExecutionCommand::PlaceLimit(signed_order) = command else {
-            return Err("test route is not a limit order".into());
-        };
-        let source_private_generation = resident.runtime().active_private_generation();
-        assert!(resident.runtime().connection_generation() > source_private_generation);
-        assert!(
-            resident
-                .consume_private_fill(
-                    "bybit",
-                    PrivateFillFact {
-                        source_private_generation,
-                        received_at_ms: now()?,
-                        fill: Fill {
-                            fill_id: "grid-private-generation".to_owned(),
-                            execution_sequence: FieldState::Known(1),
-                            order_id: "grid-native-1".to_owned(),
-                            symbol: signed_order.owner.symbol,
-                            side: signed_order.side,
-                            position_side: FieldState::Known(signed_order.position_side),
-                            quantity: signed_order.quantity,
-                            price: signed_order.limit_price,
-                            fee: FieldState::Missing,
-                            realized_pnl: FieldState::Missing,
-                            maker: FieldState::Known(false),
-                            exchange_time_ms: Some(now()?),
-                        },
-                    },
-                )
-                .map_err(|error| io::Error::other(format!("private fill: {error}")))?
-        );
-        let observed = resident
-            .grid_bridges
-            .get(&binding.key)
-            .and_then(|bridge| {
-                bridge
-                    .grid
-                    .owned_fill_records
-                    .get("grid-private-generation")
-            })
-            .ok_or("grid fill record")?;
-        assert_eq!(observed.private_generation, source_private_generation);
-        assert_ne!(
-            observed.private_generation,
-            resident.runtime().connection_generation()
-        );
-        drop(resident);
-
-        let second_launch = launch(directory.path())?;
-        let gateway = Gateway {
-            binding: second_launch.binding().clone(),
-            state,
-        };
-        let mut reopened = ProductionResident::open(&second_launch, gateway)?;
-        reopened.register_actor(binding.clone())?;
-        let recovered_checkpoint = reopened
-            .runtime
-            .resident_actor_checkpoint(&binding)?
-            .ok_or("recovered grid checkpoint")?;
-        reopened
-            .runtime
-            .persist_resident_semantic_turn(&binding, recovered_checkpoint)?;
-        Ok(())
-    }
-}
+mod bootstrap_tests;
