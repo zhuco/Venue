@@ -63,6 +63,7 @@ pub use venue_control_protocol::{CommandReceipt, ControlAction, ControlCommandRe
 
 const REQUIRED_NEW_VENUE_GATES: &str = "Owner, WAL, unique account writer fence, signed readback, UNKNOWN reconciliation, Stop/Flatten, and operator-confirmed Canary evidence";
 const LIVE_ARTIFACT_FILE_HARD_LIMIT_BYTES: u64 = 10 * 1024 * 1024;
+const LEGACY_PROJECTION_COMPACTION_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
 const LIVE_ARTIFACT_ROOT_FREEZE_BYTES: u64 = 240 * 1024 * 1024;
 // The import marker itself is small, but reserve a full MiB so the preflight bound remains
 // conservative if the frozen journal has many 5 MiB segments.
@@ -175,11 +176,13 @@ impl NodeLaunch {
             .chain(self.runtime_arguments.iter().cloned());
         let raw = RawLiveMvpArguments::try_parse_from(arguments)?;
         let command = LiveMvpCommand::from_raw(raw.command, &self.binding)?;
-        match self.legacy_v1_predecessor.as_ref() {
-            Some(predecessor) => {
-                validate_legacy_v1_import_budget(&self.artifacts_base, predecessor)?;
+        if !matches!(&command, LiveMvpCommand::Run(_)) {
+            match self.legacy_v1_predecessor.as_ref() {
+                Some(predecessor) => {
+                    validate_legacy_v1_import_budget(&self.artifacts_base, predecessor)?;
+                }
+                None => validate_live_artifact_budget(&self.artifacts_base)?,
             }
-            None => validate_live_artifact_budget(&self.artifacts_base)?,
         }
         Ok(command)
     }
@@ -429,6 +432,140 @@ pub fn error_chain(error: &dyn std::error::Error) -> String {
     message
 }
 
+/// Repairs and drains only the runtime-configured projection scopes before the account Host is
+/// opened. This is the sole compatibility entrance for pre-rotation projection files: after it
+/// returns, the ordinary strict 10 MiB/root budget is applied again before any resident pump.
+fn prepare_run_projection_artifacts(
+    launch: &NodeLaunch,
+    config: &NodeRuntimeConfig,
+) -> Result<(), NodeError> {
+    let projection_paths = config
+        .strategies
+        .iter()
+        .map(|strategy| Ok(scoped_control_root(launch, strategy)?.join("projection.jsonl")))
+        .collect::<Result<Vec<_>, NodeError>>()?;
+    validate_projection_compatibility_budget(&launch.artifacts_base, &projection_paths)?;
+    let client = ControlHttpClient::new(ControlHttpClientConfig::local(
+        config.control.loopback_origin.clone(),
+    ))
+    .map_err(|error| NodeError::LiveHost {
+        venue: config.venue,
+        message: error.to_string(),
+    })?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| NodeError::ResidentRuntime)?;
+    for (strategy, path) in config.strategies.iter().zip(projection_paths) {
+        if !projection_compatibility_candidates(&path)
+            .iter()
+            .any(|candidate| candidate.exists())
+        {
+            continue;
+        }
+        validate_projection_compatibility_files(&path)?;
+        let delivery = venue_control_protocol::AccountDeliveryBinding {
+            venue: config.venue,
+            mode: config.mode,
+            trading_account_id: config.trading_account_id.clone(),
+            symbol: strategy.symbol.clone(),
+            instance_id: strategy.instance_id.clone(),
+            config_epoch: strategy.config_epoch,
+        };
+        let mut outbox = NodeProjectionOutbox::recover(
+            OpaqueControlDeliveryJournal::open(path).map_err(|error| NodeError::LiveHost {
+                venue: config.venue,
+                message: error.to_string(),
+            })?,
+            delivery,
+            config.node_id.clone(),
+        )
+        .map_err(|error| NodeError::LiveHost {
+            venue: config.venue,
+            message: error.to_string(),
+        })?;
+        if outbox.pending_len() > 0 {
+            runtime
+                .block_on(outbox.flush(&client))
+                .map_err(|error| NodeError::LiveHost {
+                    venue: config.venue,
+                    message: error.to_string(),
+                })?;
+        }
+        if outbox.pending_len() != 0 {
+            return Err(NodeError::ArtifactsBudget);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn scoped_control_root(
+    launch: &NodeLaunch,
+    strategy: &NodeRuntimeStrategy,
+) -> Result<PathBuf, NodeError> {
+    if strategy.instance_id.is_empty() || strategy.config_epoch == 0 {
+        return Err(NodeError::RuntimeConfig);
+    }
+    Ok(launch
+        .artifacts_root()
+        .join("control")
+        .join(strategy.symbol.to_string().replace('/', "_"))
+        .join(&strategy.instance_id)
+        .join(strategy.config_epoch.to_string()))
+}
+
+fn validate_projection_compatibility_files(path: &Path) -> Result<(), NodeError> {
+    for candidate in projection_compatibility_candidates(path) {
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata)
+                if metadata.file_type().is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.len() <= LEGACY_PROJECTION_COMPACTION_LIMIT_BYTES => {}
+            Ok(_) => return Err(NodeError::ArtifactsBudget),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(NodeError::ArtifactsBudget),
+        }
+    }
+    Ok(())
+}
+
+fn projection_compatibility_candidates(path: &Path) -> [PathBuf; 3] {
+    [
+        path.to_path_buf(),
+        projection_compaction_sibling(path, "next"),
+        projection_compaction_sibling(path, "previous"),
+    ]
+}
+
+fn validate_projection_compatibility_budget(
+    root: &Path,
+    projection_paths: &[PathBuf],
+) -> Result<(), NodeError> {
+    let mut allowances = Vec::with_capacity(projection_paths.len().saturating_mul(3));
+    for path in projection_paths {
+        for candidate in projection_compatibility_candidates(path) {
+            let relative = candidate
+                .strip_prefix(root)
+                .map_err(|_| NodeError::ArtifactsBudget)?;
+            if relative.as_os_str().is_empty()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
+            {
+                return Err(NodeError::ArtifactsBudget);
+            }
+            allowances.push((candidate, LEGACY_PROJECTION_COMPACTION_LIMIT_BYTES));
+        }
+    }
+    validate_live_artifact_budget_with_allowances(root, 0, &allowances)
+}
+
+fn projection_compaction_sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(format!(".compact.{suffix}"));
+    PathBuf::from(value)
+}
+
 fn run_live_mvp_with_loop<G, F>(
     launch: &NodeLaunch,
     command: LiveMvpCommand,
@@ -445,6 +582,13 @@ where
         LiveMvpCommand::Run(runtime_config) => {
             let config = NodeRuntimeConfig::load(&runtime_config, launch.binding())?;
             reject_scalping_without_public_stream(&config, public_stream_venue)?;
+            prepare_run_projection_artifacts(launch, &config)?;
+            match launch.legacy_v1_predecessor() {
+                Some(predecessor) => {
+                    validate_legacy_v1_import_budget(&launch.artifacts_base, predecessor)?;
+                }
+                None => validate_live_artifact_budget(&launch.artifacts_base)?,
+            }
             let mut resident = ProductionResident::open_with_symbols(
                 launch,
                 config.configured_symbols(launch.binding())?,
@@ -693,11 +837,23 @@ fn validate_live_artifact_budget_with_reservation(
     root: &Path,
     reservation_bytes: u64,
 ) -> Result<(), NodeError> {
+    validate_live_artifact_budget_with_allowances(root, reservation_bytes, &[])
+}
+
+fn validate_live_artifact_budget_with_allowances(
+    root: &Path,
+    reservation_bytes: u64,
+    allowances: &[(PathBuf, u64)],
+) -> Result<(), NodeError> {
     if !root.exists() {
         if reservation_bytes >= LIVE_ARTIFACT_ROOT_FREEZE_BYTES {
             return Err(NodeError::ArtifactsBudget);
         }
         return Ok(());
+    }
+    let root_metadata = fs::symlink_metadata(root).map_err(|_| NodeError::ArtifactsBudget)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(NodeError::ArtifactsBudget);
     }
     let mut total = 0_u64;
     let mut pending = vec![root.to_path_buf()];
@@ -720,7 +876,11 @@ fn validate_live_artifact_budget_with_reservation(
                 .metadata()
                 .map_err(|_| NodeError::ArtifactsBudget)?
                 .len();
-            if size > LIVE_ARTIFACT_FILE_HARD_LIMIT_BYTES {
+            let file_limit = allowances
+                .iter()
+                .find_map(|(path, limit)| (entry.path() == *path).then_some(*limit))
+                .unwrap_or(LIVE_ARTIFACT_FILE_HARD_LIMIT_BYTES);
+            if size > file_limit {
                 return Err(NodeError::ArtifactsBudget);
             }
             total = total
@@ -968,6 +1128,40 @@ mod tests {
         let launch = NodeLaunch::try_parse_from(VenueId::Bybit, raw)?;
         assert!(matches!(
             launch.live_mvp_command(),
+            Err(NodeError::ArtifactsBudget)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_projection_is_only_eligible_for_exact_scope_preparation_before_strict_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("projection.jsonl");
+        let projection = std::fs::File::create(&path)?;
+        projection.set_len(LIVE_ARTIFACT_FILE_HARD_LIMIT_BYTES + 1)?;
+        assert!(validate_projection_compatibility_files(&path).is_ok());
+        assert!(
+            validate_projection_compatibility_budget(temp.path(), std::slice::from_ref(&path))
+                .is_ok()
+        );
+        assert!(matches!(
+            validate_live_artifact_budget(temp.path()),
+            Err(NodeError::ArtifactsBudget)
+        ));
+        projection.set_len(LEGACY_PROJECTION_COMPACTION_LIMIT_BYTES + 1)?;
+        assert!(matches!(
+            validate_projection_compatibility_files(&path),
+            Err(NodeError::ArtifactsBudget)
+        ));
+
+        let outside = temp
+            .path()
+            .parent()
+            .ok_or("missing parent")?
+            .join("outside.jsonl");
+        assert!(matches!(
+            validate_projection_compatibility_budget(temp.path(), &[outside]),
             Err(NodeError::ArtifactsBudget)
         ));
         Ok(())

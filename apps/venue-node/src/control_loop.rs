@@ -1087,28 +1087,36 @@ impl<G: AccountPhysicalGateway> ControlResidentLoop<G> {
                     .outboxes
                     .get_mut(&instance_id)
                     .ok_or(ControlResidentLoopError::Config)?;
-                let (sequence, previous_digest) = outbox.next_cursor(1);
-                let digest = envelope_digest(
-                    &projection.0,
-                    &projection.1,
-                    &copy_execution_evidence,
-                    &copy_planning_facts,
-                    sequence,
-                    previous_digest,
-                )?;
-                outbox.enqueue(NodeProjectionEnvelope {
-                    schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
-                    binding: delivery,
-                    node_id,
-                    node_generation: 1,
-                    sequence,
-                    previous_digest,
-                    digest,
-                    copy_execution_evidence,
-                    copy_planning_facts,
-                    snapshot: projection.0,
-                    facts: projection.1,
-                })?;
+                // A transport outage may leave one durable envelope pending. Drain that exact
+                // identity first; manufacturing later snapshots while it is unresolved would
+                // grow the outbox and could skip the projection cursor after restart.
+                if outbox.pending_len() == 0 {
+                    let (sequence, previous_digest) = outbox.next_cursor(1);
+                    let digest = envelope_digest(
+                        &projection.0,
+                        &projection.1,
+                        &copy_execution_evidence,
+                        &copy_planning_facts,
+                        sequence,
+                        previous_digest,
+                    )?;
+                    let enqueued = outbox.enqueue_if_idle(NodeProjectionEnvelope {
+                        schema_version: ACCOUNT_DELIVERY_SCHEMA_VERSION,
+                        binding: delivery,
+                        node_id,
+                        node_generation: 1,
+                        sequence,
+                        previous_digest,
+                        digest,
+                        copy_execution_evidence,
+                        copy_planning_facts,
+                        snapshot: projection.0,
+                        facts: projection.1,
+                    })?;
+                    if !enqueued {
+                        return Err(ControlResidentLoopError::ProjectionScope);
+                    }
+                }
                 http_runtime.block_on(interruptible(async {
                     outbox
                         .flush(&self.client)
@@ -1184,15 +1192,7 @@ fn scoped_root(
     launch: &NodeLaunch,
     strategy: &crate::NodeRuntimeStrategy,
 ) -> Result<PathBuf, ControlResidentLoopError> {
-    if strategy.instance_id.is_empty() || strategy.config_epoch == 0 {
-        return Err(ControlResidentLoopError::Config);
-    }
-    Ok(launch
-        .artifacts_root()
-        .join("control")
-        .join(strategy.symbol.to_string().replace('/', "_"))
-        .join(&strategy.instance_id)
-        .join(strategy.config_epoch.to_string()))
+    crate::scoped_control_root(launch, strategy).map_err(|_| ControlResidentLoopError::Config)
 }
 
 fn delivery_binding(binding: &StrategyBinding) -> AccountDeliveryBinding {

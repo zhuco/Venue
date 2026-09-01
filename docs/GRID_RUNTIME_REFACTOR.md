@@ -382,6 +382,7 @@ G:\Venue\artifacts\<exchange>\LIVE\<trading_account_id>\
 - 所有追加文件达到 5 MiB 即关闭并轮转，任何单文件硬上限为 10 MiB；新实现不得创建无上限单体 JSONL；
 - 原始私流默认不落盘；显式诊断时只保留两个 5 MiB 滚动段，总量不超过 10 MiB。它不是恢复依据，旧段可直接覆盖；
 - `commands` 与 `facts` 使用 5 MiB 小分段。已终态且被更新一代签名对账覆盖的段可压缩或删除；含未决 Unknown 的段保持只读，后续写入新段，因此单文件仍不增长；
+- Node→Control 投影 outbox 只在全部 envelope 已精确 ACK 时压缩为 scope root 与最后 `(node_generation, sequence, digest)` 游标；未决 envelope 绝不丢弃，网络失败时先重放该精确 envelope、不得继续追加新快照。每次 append 按外层 JSONL 的真实编码长度在写前执行 10 MiB 硬围栏；大文件收到精确 ACK 时直接原子改写为已确认游标及剩余未决 envelope，不先追加 ACK。append 与压缩共用稳定旁路锁，替换以锁内复验的旧 next-sequence 围栏，先 fsync 新文件并保留可恢复前驱，再原子切换。旧版无轮转文件及其临时前驱只允许在运行配置的精确 scope、32 MiB 兼容上限内先恢复和排空；兼容前先从 artifacts root 开始做不跟随链接的全树结构扫描，精确主文件或临时前驱均不存在时不得创建目录或锁文件；随后必须重新通过普通 10 MiB/240 MiB 门，且全过程在 resident mutation loop 前完成；
 - checkpoint 使用同目录临时文件、fsync、rename 原子替换，写入后不得超过 5 MiB；超过说明状态设计错误并冻结新增风险；
 - 整个 `G:\Venue\artifacts` 默认预算为 256 MiB；达到 200 MiB 告警并清理已覆盖历史段，达到 240 MiB 冻结新增风险并要求人工归档，保留余量只供撤单、reduce-only、Unknown 对账和 checkpoint；
 - 清理只针对已关闭、已对账覆盖且不被 Unknown 引用的历史段。迁移旧工件前先生成清单并确认当前 writer 已停止，禁止直接递归删除整个目录。

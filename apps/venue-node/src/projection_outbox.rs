@@ -14,6 +14,8 @@ use crate::{
 
 const PROJECTION_OUTBOX_SCHEMA_VERSION: u16 = 1;
 const MAX_PROJECTION_RECORD_BYTES: usize = 2 * 1024 * 1024;
+const PROJECTION_ROTATE_BYTES: u64 = 5 * 1024 * 1024;
+const PROJECTION_FILE_HARD_LIMIT_BYTES: u64 = 10 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProjectionIdentity {
@@ -38,6 +40,13 @@ enum OutboxEvent {
         envelope: Box<NodeProjectionEnvelope>,
     },
     Acknowledged {
+        node_generation: u64,
+        sequence: u64,
+        digest: [u8; 32],
+    },
+    /// Minimal acknowledged cursor retained after physical history compaction. It cannot create
+    /// a pending delivery or authorize a command; it only prevents sequence regression.
+    Cursor {
         node_generation: u64,
         sequence: u64,
         digest: [u8; 32],
@@ -101,6 +110,7 @@ impl<J: ControlDeliveryJournal> NodeProjectionOutbox<J> {
                 node_id: outbox.identity.node_id.clone(),
             })?;
         }
+        outbox.compact_if_due()?;
         Ok(outbox)
     }
 
@@ -125,6 +135,29 @@ impl<J: ControlDeliveryJournal> NodeProjectionOutbox<J> {
         })
     }
 
+    /// Production publisher admission: one unresolved projection blocks creation of every later
+    /// cursor until the exact oldest envelope is echoed and durably acknowledged.
+    pub fn enqueue_if_idle(
+        &mut self,
+        envelope: NodeProjectionEnvelope,
+    ) -> Result<bool, NodeProjectionOutboxError> {
+        if !self.pending.is_empty() {
+            return Ok(false);
+        }
+        self.compact_if_due()?;
+        if let Err(error) = self.enqueue(envelope.clone()) {
+            if !matches!(
+                &error,
+                NodeProjectionOutboxError::Journal(ControlDeliveryJournalError::StorageLimit)
+            ) || !self.compact_acknowledged_history()?
+            {
+                return Err(error);
+            }
+            self.enqueue(envelope)?;
+        }
+        Ok(true)
+    }
+
     /// Replays the oldest exact envelope first. A transport failure leaves its durable record
     /// pending for the next resident turn; no retry can skip a cursor gap.
     pub async fn flush(
@@ -138,13 +171,10 @@ impl<J: ControlDeliveryJournal> NodeProjectionOutbox<J> {
             .map(|(key, envelope)| (*key, envelope.clone()))
         {
             client.publish_projection(&envelope).await?;
-            self.append(OutboxEvent::Acknowledged {
-                node_generation: key.0,
-                sequence: key.1,
-                digest: envelope.digest,
-            })?;
+            self.acknowledge(key, &envelope)?;
             acknowledged.push(envelope);
         }
+        self.compact_if_due()?;
         Ok(acknowledged)
     }
 
@@ -215,7 +245,11 @@ impl<J: ControlDeliveryJournal> NodeProjectionOutbox<J> {
         if payload.len() > MAX_PROJECTION_RECORD_BYTES {
             return Err(NodeProjectionOutboxError::RecordTooLarge);
         }
-        let sequence = self.journal.append(self.next_record_sequence, &payload)?;
+        let sequence = self.journal.append_bounded(
+            self.next_record_sequence,
+            &payload,
+            PROJECTION_FILE_HARD_LIMIT_BYTES,
+        )?;
         if sequence != self.next_record_sequence {
             return Err(NodeProjectionOutboxError::JournalSequence);
         }
@@ -223,6 +257,106 @@ impl<J: ControlDeliveryJournal> NodeProjectionOutbox<J> {
         self.next_record_sequence = self
             .next_record_sequence
             .checked_add(1)
+            .ok_or(NodeProjectionOutboxError::SequenceOverflow)?;
+        Ok(())
+    }
+
+    fn compact_if_due(&mut self) -> Result<bool, NodeProjectionOutboxError> {
+        if !self.pending.is_empty() || self.journal.storage_len()? <= PROJECTION_ROTATE_BYTES {
+            return Ok(false);
+        }
+        self.compact_acknowledged_history()
+    }
+
+    fn compact_acknowledged_history(&mut self) -> Result<bool, NodeProjectionOutboxError> {
+        if !self.pending.is_empty() {
+            return Ok(false);
+        }
+        let Some((node_generation, sequence, digest)) = self.last_enqueued else {
+            return Ok(false);
+        };
+        let root = encode_event(OutboxEvent::Root {
+            binding: self.identity.binding.clone(),
+            node_id: self.identity.node_id.clone(),
+        })?;
+        let cursor = encode_event(OutboxEvent::Cursor {
+            node_generation,
+            sequence,
+            digest,
+        })?;
+        self.journal.compact_bounded(
+            self.next_record_sequence,
+            &[root, cursor],
+            PROJECTION_FILE_HARD_LIMIT_BYTES,
+        )?;
+        self.next_record_sequence = 3;
+        Ok(true)
+    }
+
+    fn acknowledge(
+        &mut self,
+        key: (u64, u64),
+        envelope: &NodeProjectionEnvelope,
+    ) -> Result<(), NodeProjectionOutboxError> {
+        let event = OutboxEvent::Acknowledged {
+            node_generation: key.0,
+            sequence: key.1,
+            digest: envelope.digest,
+        };
+        if self.journal.storage_len()? <= PROJECTION_ROTATE_BYTES {
+            match self.append(event) {
+                Ok(()) => return Ok(()),
+                Err(NodeProjectionOutboxError::Journal(
+                    ControlDeliveryJournalError::StorageLimit,
+                )) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.compact_acknowledgement(key, envelope)
+    }
+
+    /// Control has already echoed this exact envelope, but the old journal is too large to grow
+    /// safely. Atomically replace it with the acknowledged cursor plus any later pending
+    /// envelopes. A failed replacement leaves the old pending fact intact for idempotent replay.
+    fn compact_acknowledgement(
+        &mut self,
+        key: (u64, u64),
+        envelope: &NodeProjectionEnvelope,
+    ) -> Result<(), NodeProjectionOutboxError> {
+        if self.pending.get(&key) != Some(envelope) {
+            return Err(NodeProjectionOutboxError::CorruptJournal);
+        }
+        let mut payloads = vec![
+            encode_event(OutboxEvent::Root {
+                binding: self.identity.binding.clone(),
+                node_id: self.identity.node_id.clone(),
+            })?,
+            encode_event(OutboxEvent::Cursor {
+                node_generation: key.0,
+                sequence: key.1,
+                digest: envelope.digest,
+            })?,
+        ];
+        for (pending_key, pending) in &self.pending {
+            if *pending_key == key {
+                continue;
+            }
+            if *pending_key <= key {
+                return Err(NodeProjectionOutboxError::CorruptJournal);
+            }
+            payloads.push(encode_event(OutboxEvent::Enqueued {
+                envelope: Box::new(pending.clone()),
+            })?);
+        }
+        self.journal.compact_bounded(
+            self.next_record_sequence,
+            &payloads,
+            PROJECTION_FILE_HARD_LIMIT_BYTES,
+        )?;
+        self.pending.remove(&key);
+        self.next_record_sequence = u64::try_from(payloads.len())
+            .ok()
+            .and_then(|length| length.checked_add(1))
             .ok_or(NodeProjectionOutboxError::SequenceOverflow)?;
         Ok(())
     }
@@ -270,9 +404,36 @@ impl<J: ControlDeliveryJournal> NodeProjectionOutbox<J> {
                 }
                 self.pending.remove(&key);
             }
+            OutboxEvent::Cursor {
+                node_generation,
+                sequence,
+                digest,
+            } => {
+                if record_sequence != 2
+                    || self.last_enqueued.is_some()
+                    || !self.pending.is_empty()
+                    || node_generation == 0
+                    || sequence == 0
+                    || digest == [0; 32]
+                {
+                    return Err(NodeProjectionOutboxError::CorruptJournal);
+                }
+                self.last_enqueued = Some((node_generation, sequence, digest));
+            }
         }
         Ok(())
     }
+}
+
+fn encode_event(event: OutboxEvent) -> Result<Vec<u8>, NodeProjectionOutboxError> {
+    let payload = serde_json::to_vec(&PersistedRecord {
+        schema_version: PROJECTION_OUTBOX_SCHEMA_VERSION,
+        event,
+    })?;
+    if payload.len() > MAX_PROJECTION_RECORD_BYTES {
+        return Err(NodeProjectionOutboxError::RecordTooLarge);
+    }
+    Ok(payload)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -357,9 +518,16 @@ mod tests {
         let first = projection(binding.clone(), 1, 1, [7; 32], [0; 32], 100)?;
         outbox.enqueue(first.clone())?;
         assert_eq!(outbox.pending_len(), 1);
-        let recovered = NodeProjectionOutbox::recover(journal, binding.clone(), "node-a")?;
+        let recovered = NodeProjectionOutbox::recover(journal.clone(), binding.clone(), "node-a")?;
         assert_eq!(recovered.pending_len(), 1);
         assert_eq!(recovered.oldest_pending(), Some(&first));
+
+        let later = projection(binding.clone(), 1, 2, [8; 32], [7; 32], 101)?;
+        assert!(!outbox.enqueue_if_idle(later)?);
+        assert_eq!(
+            journal.0.lock().map_err(|_| "memory journal lock")?.len(),
+            2
+        );
 
         let mut gap = projection(binding, 1, 3, [8; 32], [7; 32], 101)?;
         assert!(matches!(
@@ -372,6 +540,134 @@ mod tests {
             outbox.enqueue(gap),
             Err(NodeProjectionOutboxError::Sequence)
         ));
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct CompactingJournal {
+        records: Arc<Mutex<Vec<ControlDeliveryJournalRecord>>>,
+        physical_len: Arc<Mutex<u64>>,
+    }
+
+    impl ControlDeliveryJournal for CompactingJournal {
+        fn recover(
+            &mut self,
+        ) -> Result<Vec<ControlDeliveryJournalRecord>, ControlDeliveryJournalError> {
+            self.records
+                .lock()
+                .map(|records| records.clone())
+                .map_err(|_| ControlDeliveryJournalError::Unavailable)
+        }
+
+        fn append(
+            &mut self,
+            expected_sequence: u64,
+            payload: &[u8],
+        ) -> Result<u64, ControlDeliveryJournalError> {
+            let mut records = self
+                .records
+                .lock()
+                .map_err(|_| ControlDeliveryJournalError::Unavailable)?;
+            if expected_sequence != records.len() as u64 + 1 {
+                return Err(ControlDeliveryJournalError::SequenceConflict);
+            }
+            records.push(ControlDeliveryJournalRecord {
+                sequence: expected_sequence,
+                payload: payload.to_vec(),
+            });
+            Ok(expected_sequence)
+        }
+
+        fn storage_len(&self) -> Result<u64, ControlDeliveryJournalError> {
+            self.physical_len
+                .lock()
+                .map(|value| *value)
+                .map_err(|_| ControlDeliveryJournalError::Unavailable)
+        }
+
+        fn compact(
+            &mut self,
+            expected_next_sequence: u64,
+            payloads: &[Vec<u8>],
+        ) -> Result<(), ControlDeliveryJournalError> {
+            let mut records = self
+                .records
+                .lock()
+                .map_err(|_| ControlDeliveryJournalError::Unavailable)?;
+            if expected_next_sequence != records.len() as u64 + 1 {
+                return Err(ControlDeliveryJournalError::SequenceConflict);
+            }
+            *records = payloads
+                .iter()
+                .enumerate()
+                .map(|(offset, payload)| ControlDeliveryJournalRecord {
+                    sequence: offset as u64 + 1,
+                    payload: payload.clone(),
+                })
+                .collect();
+            *self
+                .physical_len
+                .lock()
+                .map_err(|_| ControlDeliveryJournalError::Unavailable)? = 1024;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn acknowledged_projection_history_compacts_without_regressing_the_delivery_cursor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let journal = CompactingJournal {
+            records: Arc::new(Mutex::new(Vec::new())),
+            physical_len: Arc::new(Mutex::new(0)),
+        };
+        let binding = binding()?;
+        let mut outbox = NodeProjectionOutbox::recover(journal.clone(), binding.clone(), "node-a")?;
+        let envelope = projection(binding.clone(), 1, 1, [7; 32], [0; 32], 100)?;
+        outbox.enqueue(envelope.clone())?;
+        outbox.append(OutboxEvent::Acknowledged {
+            node_generation: 1,
+            sequence: 1,
+            digest: envelope.digest,
+        })?;
+        *journal
+            .physical_len
+            .lock()
+            .map_err(|_| "physical length lock")? = PROJECTION_ROTATE_BYTES + 1;
+        assert!(outbox.compact_if_due()?);
+        assert_eq!(outbox.next_cursor(1), (2, [7; 32]));
+        drop(outbox);
+
+        let recovered = NodeProjectionOutbox::recover(journal, binding, "node-a")?;
+        assert_eq!(recovered.next_cursor(1), (2, [7; 32]));
+        assert_eq!(recovered.pending_len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_pending_projection_compacts_the_echo_without_appending_an_ack()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let journal = CompactingJournal {
+            records: Arc::new(Mutex::new(Vec::new())),
+            physical_len: Arc::new(Mutex::new(0)),
+        };
+        let binding = binding()?;
+        let mut outbox = NodeProjectionOutbox::recover(journal.clone(), binding.clone(), "node-a")?;
+        let envelope = projection(binding.clone(), 1, 1, [7; 32], [0; 32], 100)?;
+        outbox.enqueue(envelope.clone())?;
+        *journal
+            .physical_len
+            .lock()
+            .map_err(|_| "physical length lock")? = PROJECTION_ROTATE_BYTES + 1;
+
+        outbox.acknowledge((1, 1), &envelope)?;
+        assert_eq!(outbox.pending_len(), 0);
+        assert_eq!(outbox.next_cursor(1), (2, [7; 32]));
+        assert_eq!(journal.records.lock().map_err(|_| "records lock")?.len(), 2);
+        drop(outbox);
+
+        let recovered = NodeProjectionOutbox::recover(journal, binding, "node-a")?;
+        assert_eq!(recovered.pending_len(), 0);
+        assert_eq!(recovered.next_cursor(1), (2, [7; 32]));
         Ok(())
     }
 

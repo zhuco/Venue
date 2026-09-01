@@ -210,6 +210,10 @@ impl JsonlSnapshot {
     pub(crate) const fn truncated_tail(&self) -> bool {
         self.truncated_tail
     }
+
+    pub(crate) const fn complete_length(&self) -> u64 {
+        self.complete_length
+    }
 }
 
 fn lock(file: &File, path: &Path) -> Result<(), StorageError> {

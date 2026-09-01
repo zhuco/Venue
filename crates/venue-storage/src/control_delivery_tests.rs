@@ -5,6 +5,103 @@ use tempfile::tempdir;
 use super::*;
 
 #[test]
+fn compact_replaces_only_the_exact_fenced_history_and_preserves_append_sequence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("projection.jsonl");
+    let mut journal = OpaqueJournal::open(&path)?;
+    journal.append(1, b"old-a")?;
+    journal.append(2, b"old-b")?;
+
+    assert!(matches!(
+        journal.compact(2, &[b"root".to_vec(), b"cursor".to_vec()]),
+        Err(OpaqueJournalError::SequenceConflict { actual: 3, .. })
+    ));
+    journal.compact(3, &[b"root".to_vec(), b"cursor".to_vec()])?;
+    assert_eq!(
+        journal.recover()?,
+        vec![
+            OpaqueJournalRecord {
+                sequence: 1,
+                payload: b"root".to_vec(),
+            },
+            OpaqueJournalRecord {
+                sequence: 2,
+                payload: b"cursor".to_vec(),
+            },
+        ]
+    );
+    assert_eq!(journal.append(3, b"next")?, 3);
+    drop(journal);
+
+    let mut recovered = OpaqueJournal::open(path)?;
+    assert_eq!(
+        recovered
+            .recover()?
+            .into_iter()
+            .map(|record| record.payload)
+            .collect::<Vec<_>>(),
+        vec![b"root".to_vec(), b"cursor".to_vec(), b"next".to_vec()]
+    );
+    Ok(())
+}
+
+#[test]
+fn bounded_append_and_compaction_reject_before_replacing_durable_bytes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("projection.jsonl");
+    let mut journal = OpaqueJournal::open(&path)?;
+    assert!(matches!(
+        journal.append_bounded(1, b"root", 1),
+        Err(OpaqueJournalError::FileLimitExceeded)
+    ));
+    assert_eq!(fs::metadata(&path)?.len(), 0);
+
+    journal.append(1, b"root")?;
+    let durable = fs::read(&path)?;
+    assert!(matches!(
+        journal.compact_bounded(2, &[vec![255; 1024]], 1),
+        Err(OpaqueJournalError::FileLimitExceeded)
+    ));
+    assert_eq!(fs::read(&path)?, durable);
+    assert!(!compaction_path(&path, "next").exists());
+    assert!(!compaction_path(&path, "previous").exists());
+    Ok(())
+}
+
+#[test]
+fn interrupted_compaction_recovers_old_before_swap_and_new_after_swap()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("projection.jsonl");
+    let previous = compaction_path(&path, "previous");
+    let next = compaction_path(&path, "next");
+    let mut old = OpaqueJournal::open(&path)?;
+    old.append(1, b"old")?;
+    drop(old);
+
+    fs::rename(&path, &previous)?;
+    fs::write(&next, b"partial replacement")?;
+    let mut rolled_back = OpaqueJournal::open(&path)?;
+    assert_eq!(rolled_back.recover()?[0].payload, b"old");
+    assert!(!previous.exists());
+    assert!(!next.exists());
+    drop(rolled_back);
+
+    fs::rename(&path, &previous)?;
+    let replacement_path = directory.path().join("replacement.jsonl");
+    let mut replacement = OpaqueJournal::open(&replacement_path)?;
+    replacement.append(1, b"new")?;
+    drop(replacement);
+    fs::rename(replacement_path, &path)?;
+    let mut committed = OpaqueJournal::open(&path)?;
+    assert_eq!(committed.recover()?[0].payload, b"new");
+    assert!(!previous.exists());
+    Ok(())
+}
+
+#[test]
 fn crash_tail_is_repaired_before_the_expected_sequence_append()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
@@ -165,13 +262,12 @@ fn complete_malformed_line_fails_closed_without_tail_repair()
 }
 
 #[test]
-fn append_fails_closed_for_a_missing_or_invalid_parent_directory()
+fn open_fails_closed_for_a_missing_or_invalid_parent_directory()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
     let missing_path = directory.path().join("missing").join("control.jsonl");
-    let mut missing = OpaqueJournal::open(&missing_path)?;
     assert!(matches!(
-        missing.append(1, b"root"),
+        OpaqueJournal::open(&missing_path),
         Err(OpaqueJournalError::Storage(StorageError::Io { .. }))
     ));
     assert!(!missing_path.exists());
@@ -179,9 +275,8 @@ fn append_fails_closed_for_a_missing_or_invalid_parent_directory()
     let not_directory = directory.path().join("not-a-directory");
     fs::write(&not_directory, b"file")?;
     let invalid_path = not_directory.join("control.jsonl");
-    let mut invalid = OpaqueJournal::open(&invalid_path)?;
     assert!(matches!(
-        invalid.append(1, b"root"),
+        OpaqueJournal::open(&invalid_path),
         Err(OpaqueJournalError::Storage(StorageError::Io { .. }))
     ));
     assert!(!invalid_path.exists());

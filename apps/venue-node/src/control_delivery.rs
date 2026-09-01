@@ -57,6 +57,40 @@ pub trait ControlDeliveryJournal {
         expected_sequence: u64,
         payload: &[u8],
     ) -> Result<u64, ControlDeliveryJournalError>;
+
+    fn append_bounded(
+        &mut self,
+        expected_sequence: u64,
+        payload: &[u8],
+        _maximum_file_bytes: u64,
+    ) -> Result<u64, ControlDeliveryJournalError> {
+        self.append(expected_sequence, payload)
+    }
+
+    /// Physical size is advisory and carries no business authority. In-memory fixtures return
+    /// zero; file journals expose their exact current byte length.
+    fn storage_len(&self) -> Result<u64, ControlDeliveryJournalError> {
+        Ok(0)
+    }
+
+    /// Rewrites only transport replay state after the caller proves no delivery is pending.
+    /// Implementations must fence on the old next sequence and durably install every payload.
+    fn compact(
+        &mut self,
+        _expected_next_sequence: u64,
+        _payloads: &[Vec<u8>],
+    ) -> Result<(), ControlDeliveryJournalError> {
+        Err(ControlDeliveryJournalError::Unavailable)
+    }
+
+    fn compact_bounded(
+        &mut self,
+        expected_next_sequence: u64,
+        payloads: &[Vec<u8>],
+        _maximum_file_bytes: u64,
+    ) -> Result<(), ControlDeliveryJournalError> {
+        self.compact(expected_next_sequence, payloads)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -67,6 +101,8 @@ pub enum ControlDeliveryJournalError {
     SequenceConflict,
     #[error("shared durable journal is corrupt")]
     Corrupt,
+    #[error("shared durable journal would exceed its physical file bound")]
+    StorageLimit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
