@@ -1914,6 +1914,8 @@ impl AccountPhysicalGateway for ManagedBatchGateway {
 
     fn risk_evidence(&mut self) -> Result<AccountRiskEvidence, AccountHostValidationError> {
         self.risk_reads = self.risk_reads.saturating_add(1);
+        // Keep the collection window non-zero so a pre-read validation clock would fail.
+        std::thread::sleep(std::time::Duration::from_millis(5));
         risk_evidence(self.binding.clone(), vec![Decimal::from(400)], Vec::new())
     }
 

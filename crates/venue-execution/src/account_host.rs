@@ -1391,11 +1391,14 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
             ));
         }
         self.last_managed_grid_consumed_generation = Some(confirmed_generation);
-        let now = now_ms().map_err(AccountHostError::Validation)?;
         let evidence = self
             .gateway
             .risk_evidence()
             .map_err(AccountHostError::Validation)?;
+        // The gateway may need several signed/public reads to assemble one account-wide proof.
+        // Validate against a clock sampled after that collection; using the pre-read clock makes
+        // every correctly timestamped fresh proof appear to come from the future.
+        let now = now_ms().map_err(AccountHostError::Validation)?;
         evidence
             .validate_for(&self.binding, now)
             .map_err(AccountHostError::Validation)?;
