@@ -25,6 +25,7 @@ pub const COMMAND_JOURNAL_HARD_LIMIT_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_RISK_EVIDENCE_AGE_MS: u64 = 60_000;
 const RUNTIME_BOOTSTRAP_FILE: &str = "signed-account-bootstrap.json";
 const RUNTIME_CHECKPOINT_LIMIT_BYTES: usize = 5 * 1024 * 1024;
+const ACCOUNT_WRITER_LOCK_FILE: &str = "writer.lock";
 const LEGACY_V1_IMPORT_FILE: &str = "legacy-v1-journal-import.json";
 const LEGACY_V1_IMPORT_SCHEMA_VERSION: u16 = 2;
 
@@ -566,7 +567,7 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
             path: artifacts_root.clone(),
             source,
         })?;
-        let lock_path = artifacts_root.join("writer.lock");
+        let lock_path = artifacts_root.join(ACCOUNT_WRITER_LOCK_FILE);
         let account_lock = match preheld_account_lock {
             Some(lock) => lock,
             None => acquire_account_writer_lock(&lock_path)?,
@@ -692,7 +693,8 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         let legacy = predecessor
             .acquire()
             .map_err(AccountHostError::CanonicalRoot)?;
-        let account_lock = acquire_account_writer_lock(&artifacts_root.join("writer.lock"))?;
+        let account_lock =
+            acquire_account_writer_lock(&artifacts_root.join(ACCOUNT_WRITER_LOCK_FILE))?;
         let scope = WriterScope {
             exchange: binding.venue.as_str().to_owned(),
             account: binding.trading_account_id.clone(),
@@ -1991,16 +1993,7 @@ fn import_legacy_v1_journal_if_needed(
         }
         return Ok(());
     }
-    if destination_root.exists()
-        && fs::read_dir(destination_root)
-            .map_err(|_| AccountHostValidationError::LegacyPredecessor)?
-            .next()
-            .transpose()
-            .map_err(|_| AccountHostValidationError::LegacyPredecessor)?
-            .is_some()
-    {
-        return Err(AccountHostValidationError::LegacyPredecessor);
-    }
+    validate_legacy_import_destination(destination_root)?;
     // This verifies every record's sequence, command hash, state transition, and persisted
     // command shape before any successor file is created.  An unresolved old command must be
     // reconciled by the old writer first; it can never be relabelled as a new Host receipt.
@@ -2097,6 +2090,32 @@ fn import_legacy_v1_journal_if_needed(
     })
     .map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
     write_new_synced(&marker, &marker_body)?;
+    Ok(())
+}
+
+fn validate_legacy_import_destination(
+    destination_root: &Path,
+) -> Result<(), AccountHostValidationError> {
+    if !destination_root.exists() {
+        return Ok(());
+    }
+    for entry in
+        fs::read_dir(destination_root).map_err(|_| AccountHostValidationError::LegacyPredecessor)?
+    {
+        let entry = entry.map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+        let file_type = entry
+            .file_type()
+            .map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+        let metadata = entry
+            .metadata()
+            .map_err(|_| AccountHostValidationError::LegacyPredecessor)?;
+        if entry.file_name() != ACCOUNT_WRITER_LOCK_FILE
+            || !file_type.is_file()
+            || metadata.len() != 0
+        {
+            return Err(AccountHostValidationError::LegacyPredecessor);
+        }
+    }
     Ok(())
 }
 

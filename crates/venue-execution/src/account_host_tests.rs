@@ -1661,6 +1661,9 @@ fn frozen_legacy_journal_is_segmented_without_mutating_the_source()
     let legacy_root = temporary.path().join("legacy");
     let destination = root(&temporary);
     fs::create_dir_all(&legacy_root)?;
+    fs::create_dir_all(&destination)?;
+    let _account_lock =
+        acquire_account_writer_lock::<std::io::Error>(&destination.join(ACCOUNT_WRITER_LOCK_FILE))?;
     let source = legacy_root.join("commands.jsonl");
     let command = command(Decimal::ONE)?;
     let mut legacy = CommandJournal::open(&source)?;
@@ -1691,6 +1694,10 @@ fn frozen_legacy_journal_is_segmented_without_mutating_the_source()
     import_legacy_v1_journal_for_predecessor_if_needed(&predecessor, &destination)?;
 
     assert_eq!(fs::read(&source)?, before);
+    assert_eq!(
+        fs::metadata(destination.join(ACCOUNT_WRITER_LOCK_FILE))?.len(),
+        0
+    );
     assert!(destination.join(LEGACY_V1_IMPORT_FILE).is_file());
     let segments = journal_segment_paths(&destination)?;
     assert_eq!(segments.len(), 1);
@@ -1699,6 +1706,37 @@ fn frozen_legacy_journal_is_segmented_without_mutating_the_source()
     assert!(!recovered.has_unresolved());
     assert_eq!(recovered.native_order_routes().len(), 1);
     import_legacy_v1_journal_for_predecessor_if_needed(&predecessor, &destination)?;
+    Ok(())
+}
+
+#[test]
+fn frozen_legacy_import_rejects_every_destination_entry_except_the_empty_writer_lock()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+
+    let extra = temporary.path().join("extra");
+    fs::create_dir_all(&extra)?;
+    fs::File::create(extra.join(ACCOUNT_WRITER_LOCK_FILE))?;
+    fs::File::create(extra.join("foreign.jsonl"))?;
+    assert!(matches!(
+        validate_legacy_import_destination(&extra),
+        Err(AccountHostValidationError::LegacyPredecessor)
+    ));
+
+    let nonzero = temporary.path().join("nonzero");
+    fs::create_dir_all(&nonzero)?;
+    fs::write(nonzero.join(ACCOUNT_WRITER_LOCK_FILE), b"not-empty")?;
+    assert!(matches!(
+        validate_legacy_import_destination(&nonzero),
+        Err(AccountHostValidationError::LegacyPredecessor)
+    ));
+
+    let directory = temporary.path().join("directory");
+    fs::create_dir_all(directory.join(ACCOUNT_WRITER_LOCK_FILE))?;
+    assert!(matches!(
+        validate_legacy_import_destination(&directory),
+        Err(AccountHostValidationError::LegacyPredecessor)
+    ));
     Ok(())
 }
 
