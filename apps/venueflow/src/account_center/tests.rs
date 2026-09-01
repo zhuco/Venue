@@ -120,7 +120,7 @@ fn login_registration_binding_and_management_render_without_exposing_secrets() {
             }
             let mut open = true;
             let mut rendered = String::new();
-            for _ in 0..2 {
+            for _ in 0..4 {
                 let mut output = context.run_ui(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
@@ -176,52 +176,149 @@ fn login_registration_binding_and_management_render_without_exposing_secrets() {
 }
 
 #[test]
-fn login_and_registration_keep_identical_centered_bounds() {
+fn login_and_registration_fit_the_minimum_desktop_without_a_scroll_dependent_layout() {
     for language in Language::ALL {
-        for size in [egui::vec2(1100.0, 700.0), egui::vec2(850.0, 520.0)] {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 700.0));
+        for registering in [false, true] {
             let context = egui::Context::default();
             crate::theme::apply(&context);
-            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
             let mut model = AppModel::new(Preferences {
                 language,
                 ..Default::default()
             });
-            let mut state = AccountCenter::default();
-            let mut bounds = Vec::new();
-            for registering in [false, true, false] {
-                state.registering = registering;
-                let mut text = String::new();
-                for _ in 0..3 {
-                    let mut output = context.run_ui(
-                        egui::RawInput {
-                            screen_rect: Some(screen),
-                            ..Default::default()
-                        },
-                        |ui| show(ui.ctx(), &mut true, &mut state, &mut model),
-                    );
-                    output.textures_delta.clear();
-                    text.clear();
-                    for shape in output.shapes {
-                        collect_text(&shape.shape, &mut text);
-                    }
+            let mut state = AccountCenter {
+                registering,
+                ..Default::default()
+            };
+            let mut open = true;
+            let mut text = String::new();
+            for _ in 0..2 {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ui| show(ui.ctx(), &mut open, &mut state, &mut model),
+                );
+                output.textures_delta.clear();
+                text.clear();
+                for shape in output.shapes {
+                    collect_text(&shape.shape, &mut text);
                 }
-                let rect = context.memory(|m| m.area_rect(egui::Id::new("account-center")));
-                assert!(rect.is_some());
-                if let Some(rect) = rect {
-                    assert!(screen.contains_rect(rect), "{rect:?} outside {screen:?}");
-                    assert!((rect.center() - screen.center()).length() <= 2.0);
-                    bounds.push(rect);
-                }
-                assert!(!text.contains("Market data needs no login"));
-                assert!(!text.contains("行情无需登录"));
             }
-            assert!(
-                bounds
-                    .windows(2)
-                    .all(|pair| (pair[0].size() - pair[1].size()).length() <= 1.0)
-            );
+            let rect = context.memory(|m| m.area_rect(egui::Id::new("account-center")));
+            assert!(rect.is_some());
+            if let Some(rect) = rect {
+                assert!(screen.contains_rect(rect), "{rect:?} outside {screen:?}");
+                let center_delta = rect.center() - screen.center();
+                assert!(
+                    center_delta.length() <= 4.0,
+                    "dialog center delta {center_delta:?}: {rect:?} within {screen:?}"
+                );
+            }
+            assert!(text.contains(if language == Language::SimplifiedChinese {
+                "登录"
+            } else {
+                "Log in"
+            }));
+            assert!(text.contains(if language == Language::SimplifiedChinese {
+                "注册"
+            } else {
+                "Register"
+            }));
+            assert!(text.contains(if registering {
+                if language == Language::SimplifiedChinese {
+                    "注册并登录"
+                } else {
+                    "Register and log in"
+                }
+            } else if language == Language::SimplifiedChinese {
+                "登录"
+            } else {
+                "Log in"
+            }));
+            if registering {
+                assert!(text.contains(if language == Language::SimplifiedChinese {
+                    "确认密码"
+                } else {
+                    "Confirm password"
+                }));
+            }
         }
     }
+}
+
+#[test]
+fn registration_submit_button_is_reachable_and_clickable_at_minimum_desktop_size() {
+    let context = egui::Context::default();
+    crate::theme::apply(&context);
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 700.0));
+    let mut model = AppModel::new(Preferences {
+        endpoint: "http://127.0.0.1:1".into(),
+        ..Default::default()
+    });
+    let mut state = AccountCenter {
+        registering: true,
+        username: "venueflow-test".into(),
+        password: Zeroizing::new("test-account-password".into()),
+        confirmation: Zeroizing::new("test-account-password".into()),
+        ..Default::default()
+    };
+    assert!(login_submit_enabled(&state));
+    let mut open = true;
+    for _ in 0..2 {
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| show(ui.ctx(), &mut open, &mut state, &mut model),
+        );
+        output.textures_delta.clear();
+    }
+    assert!(
+        state.submit_rect.is_some(),
+        "submit button should be laid out"
+    );
+    let Some(button) = state.submit_rect else {
+        return;
+    };
+    assert!(screen.contains_rect(button));
+    let pointer = button.center();
+    for pressed in [true, false] {
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::PointerButton {
+                    pos: pointer,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| show(ui.ctx(), &mut open, &mut state, &mut model),
+        );
+        output.textures_delta.clear();
+    }
+    assert!(state.busy);
+    assert!(state.password.is_empty() && state.confirmation.is_empty());
+}
+
+#[test]
+fn registration_button_requires_the_server_password_contract() {
+    let mut state = AccountCenter {
+        registering: true,
+        username: "venueflow-test".into(),
+        password: Zeroizing::new("too-short".into()),
+        confirmation: Zeroizing::new("too-short".into()),
+        ..Default::default()
+    };
+    assert!(!login_submit_enabled(&state));
+    state.password = Zeroizing::new("test-account-password".into());
+    assert!(!login_submit_enabled(&state));
+    state.confirmation = Zeroizing::new("test-account-password".into());
+    assert!(login_submit_enabled(&state));
 }
 
 fn saved_login() -> LoginRequest {

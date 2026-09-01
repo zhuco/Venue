@@ -14,6 +14,9 @@ use vault::Vault;
 #[cfg(test)]
 mod tests;
 
+const LOGIN_DIALOG_WIDTH: f32 = 520.0;
+const ACCOUNT_DIALOG_WIDTH: f32 = 760.0;
+
 #[derive(Default)]
 pub(crate) struct AccountCenter {
     pub session: Option<SessionResponse>,
@@ -38,6 +41,9 @@ pub(crate) struct AccountCenter {
     restoring: Option<SessionResponse>,
     reconnect_requested: bool,
     form_visible: bool,
+    credential_index: usize,
+    #[cfg(test)]
+    submit_rect: Option<egui::Rect>,
 }
 
 impl AccountCenter {
@@ -238,7 +244,12 @@ pub(crate) fn show(
     let language = model.preferences.language;
     let login = state.session.is_none();
     let viewport = context.content_rect().size();
-    let width = (if login { 420.0_f32 } else { 650.0_f32 }).min((viewport.x - 64.0).max(240.0));
+    let width = if login {
+        LOGIN_DIALOG_WIDTH
+    } else {
+        ACCOUNT_DIALOG_WIDTH
+    }
+    .min((viewport.x - 64.0).max(320.0));
     let mut visible = true;
     let response = egui::Modal::new(egui::Id::new("account-center"))
         .frame(
@@ -265,22 +276,16 @@ pub(crate) fn show(
                 });
             });
             ui.add_space(6.0);
-            egui::ScrollArea::vertical()
-                .id_salt("account-center-body")
-                .max_height((viewport.y - 150.0).max(100.0))
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    ui.add_enabled_ui(!state.busy, |ui| {
-                        if login {
-                            show_login(ui, state, model);
-                        } else {
-                            show_accounts(ui, state, model);
-                        }
-                    });
-                    if !login {
-                        show_feedback(ui, state, language);
-                    }
-                });
+            ui.add_enabled_ui(!state.busy, |ui| {
+                if login {
+                    show_login(ui, state, model);
+                } else {
+                    show_accounts(ui, state, model);
+                }
+            });
+            if !login {
+                show_feedback(ui, state, language);
+            }
         });
     if response.should_close() {
         visible = false;
@@ -371,25 +376,16 @@ fn show_login(ui: &mut egui::Ui, state: &mut AccountCenter, model: &AppModel) {
             ""
         },
     );
-    // Both tabs reserve the same third-field slot, so neither the dialog nor
-    // submit button jumps when switching pages or displaying validation errors.
-    ui.allocate_ui_with_layout(
-        egui::vec2(ui.available_width(), 62.0),
-        egui::Layout::top_down(egui::Align::Min),
-        |ui| {
-            ui.set_min_height(62.0);
-            if state.registering {
-                login_field(
-                    ui,
-                    tr(l, "确认密码", "Confirm password"),
-                    &mut state.confirmation,
-                    true,
-                    128,
-                    "",
-                );
-            }
-        },
-    );
+    if state.registering {
+        login_field(
+            ui,
+            tr(l, "确认密码", "Confirm password"),
+            &mut state.confirmation,
+            true,
+            128,
+            "",
+        );
+    }
     let remember = ui.add_enabled(
         Vault::supported(),
         egui::Checkbox::new(
@@ -413,24 +409,8 @@ fn show_login(ui: &mut egui::Ui, state: &mut AccountCenter, model: &AppModel) {
     if remember.changed() {
         state.remember_changed();
     }
-    ui.allocate_ui_with_layout(
-        egui::vec2(ui.available_width(), 36.0),
-        egui::Layout::top_down(egui::Align::Min),
-        |ui| {
-            ui.set_min_height(36.0);
-            show_feedback(ui, state, l);
-        },
-    );
-    let valid_username = LoginRequest {
-        username: state.username.clone(),
-        password: SecretValue::new(String::new()),
-    }
-    .normalized_username()
-    .is_some();
-    let enabled = valid_username
-        && !state.password.is_empty()
-        && (!state.registering
-            || (state.password.chars().count() >= 15 && *state.password == *state.confirmation));
+    show_feedback(ui, state, l);
+    let enabled = login_submit_enabled(state);
     let caption = if state.registering {
         tr(l, "注册并登录", "Register and log in")
     } else {
@@ -439,7 +419,12 @@ fn show_login(ui: &mut egui::Ui, state: &mut AccountCenter, model: &AppModel) {
     let button = egui::Button::new(RichText::new(caption).size(15.0).color(theme::BG_PRIMARY))
         .fill(theme::BRAND)
         .min_size(egui::vec2(ui.available_width(), 40.0));
-    if ui.add_enabled(enabled, button).clicked() {
+    let response = ui.add_enabled(enabled, button);
+    #[cfg(test)]
+    {
+        state.submit_rect = Some(response.rect);
+    }
+    if response.clicked() {
         let request = LoginRequest {
             username: state.username.clone(),
             password: SecretValue::new(std::mem::take(&mut *state.password)),
@@ -458,6 +443,19 @@ fn show_login(ui: &mut egui::Ui, state: &mut AccountCenter, model: &AppModel) {
             ui.ctx(),
         );
     }
+}
+
+fn login_submit_enabled(state: &AccountCenter) -> bool {
+    let valid_username = LoginRequest {
+        username: state.username.clone(),
+        password: SecretValue::new(String::new()),
+    }
+    .normalized_username()
+    .is_some();
+    valid_username
+        && !state.password.is_empty()
+        && (!state.registering
+            || (state.password.chars().count() >= 15 && *state.password == *state.confirmation))
 }
 
 fn login_field(
@@ -518,12 +516,12 @@ fn show_accounts(ui: &mut egui::Ui, state: &mut AccountCenter, model: &mut AppMo
     });
     if state.adding {
         show_add(ui, state, model);
-        ui.separator();
+        return;
     }
     let credentials = model
         .account_overview
         .as_ref()
-        .map(|v| v.credentials.as_slice())
+        .map(|v| v.credentials.clone())
         .unwrap_or_default();
     if credentials.is_empty() {
         ui.label(tr(
@@ -532,41 +530,147 @@ fn show_accounts(ui: &mut egui::Ui, state: &mut AccountCenter, model: &mut AppMo
             "No API is bound. Add a Binance API, verify it, then select the execution account.",
         ));
     }
-    egui::ScrollArea::vertical().max_height(350.0).show(ui,|ui|{
-        for credential in credentials{
-            egui::Frame::group(ui.style()).show(ui,|ui|{
-                ui.set_min_width(550.0);
-                ui.horizontal(|ui|{ui.strong(&credential.label);ui.label("Binance");ui.monospace(&credential.masked_key);});
-                ui.horizontal(|ui|{
-                    let ready=credential.selectable(now_ms());
-                    let status=if credential.verification==ApiVerificationState::Verified&&!ready{tr(l,"验证已过期","Verification expired")}else{verification_text(l,&credential.verification)};
-                    ui.colored_label(if ready{theme::BUY}else{theme::WARNING},status);
-                    ui.label(if ready{tr(l,"API 可访问 · 双向持仓","API reachable · Hedge mode")}else{tr(l,"API / 账户模式待验证","API / account mode requires verification")});
-                });
-                ui.small(node_status(l,model,credential,now_ms()));
-                if let Some(mode)=&credential.account_mode{ui.small(mode);}
-                if let Some(account)=&credential.trading_account_id{ui.small(format!("{}: {account}",tr(l,"交易账户","Trading account")));}
-                ui.horizontal(|ui|{
-                    if ui.button(tr(l,"验证 API","Verify API")).clicked(){state.submit(AccountAction::Verify(credential.credential_id.clone()),model,ui.ctx());}
-                    let selected=model.account_overview.as_ref().and_then(|v|v.selected_credential_id.as_deref())==Some(credential.credential_id.as_str());
-                    if ui.add_enabled(credential.selectable(now_ms())&&!selected,egui::Button::new(if selected{tr(l,"当前执行账户","Current execution account")}else{tr(l,"设为执行账户","Use for execution")})).clicked(){state.submit(AccountAction::Select(credential.credential_id.clone()),model,ui.ctx());}
-                    if ui.button(tr(l,"删除绑定","Remove binding")).clicked(){state.deleting=Some(credential.credential_id.clone());state.password.zeroize();}
-                });
-                if state.deleting.as_deref()==Some(credential.credential_id.as_str()){
-                    ui.colored_label(theme::WARNING,tr(l,"仅删除 Venue 绑定，不撤销币安 Key。存在持仓、挂单或运行账户时会拒绝删除。","Removes only the Venue binding, not the Binance key. Exposure, orders or a running account block removal."));
-                    field(ui,tr(l,"确认登录密码","Confirm login password"),&mut state.password,true,128);
-                    ui.horizontal(|ui|{
-                        if ui.add_enabled(!state.password.is_empty(),egui::Button::new(tr(l,"确认删除","Confirm removal"))).clicked(){
-                            let request=DeleteCredentialRequest{credential_id:credential.credential_id.clone(),password:SecretValue::new(std::mem::take(&mut *state.password))};
-                            state.submit(AccountAction::Delete(request),model,ui.ctx());state.deleting=None;
-                        }
-                        if ui.button(tr(l,"取消","Cancel")).clicked(){state.deleting=None;state.password.zeroize();}
-                    });
+    if !credentials.is_empty() {
+        state.credential_index = state.credential_index.min(credentials.len() - 1);
+        if credentials.len() > 1 {
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        state.credential_index > 0,
+                        egui::Button::new(tr(l, "上一项", "Previous")),
+                    )
+                    .clicked()
+                {
+                    state.credential_index -= 1;
+                    state.deleting = None;
+                    state.password.zeroize();
+                }
+                ui.label(format!(
+                    "{}/{}",
+                    state.credential_index + 1,
+                    credentials.len()
+                ));
+                if ui
+                    .add_enabled(
+                        state.credential_index + 1 < credentials.len(),
+                        egui::Button::new(tr(l, "下一项", "Next")),
+                    )
+                    .clicked()
+                {
+                    state.credential_index += 1;
+                    state.deleting = None;
+                    state.password.zeroize();
+                }
+            });
+        }
+        show_credential(ui, state, model, &credentials[state.credential_index]);
+    }
+    ui.small(tr(l,"验证只读取交易所，不下单、不修改账户模式。选择账户不会启动策略。","Verification only reads exchange state; it never trades or changes account mode. Selecting an account does not start a strategy."));
+}
+
+fn show_credential(
+    ui: &mut egui::Ui,
+    state: &mut AccountCenter,
+    model: &mut AppModel,
+    credential: &CredentialSummary,
+) {
+    let l = model.preferences.language;
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_min_width(620.0);
+        ui.horizontal(|ui| {
+            ui.strong(&credential.label);
+            ui.label("Binance");
+            ui.monospace(&credential.masked_key);
+        });
+        ui.horizontal(|ui| {
+            let ready = credential.selectable(now_ms());
+            let status = if credential.verification == ApiVerificationState::Verified && !ready {
+                tr(l, "验证已过期", "Verification expired")
+            } else {
+                verification_text(l, &credential.verification)
+            };
+            ui.colored_label(if ready { theme::BUY } else { theme::WARNING }, status);
+            ui.label(if ready {
+                tr(l, "API 可访问 · 双向持仓", "API reachable · Hedge mode")
+            } else {
+                tr(l, "API / 账户模式待验证", "API / account mode requires verification")
+            });
+        });
+        ui.small(node_status(l, model, credential, now_ms()));
+        if let Some(mode) = &credential.account_mode {
+            ui.small(mode);
+        }
+        if let Some(account) = &credential.trading_account_id {
+            ui.small(format!(
+                "{}: {account}",
+                tr(l, "交易账户", "Trading account")
+            ));
+        }
+        ui.horizontal(|ui| {
+            if ui.button(tr(l, "验证 API", "Verify API")).clicked() {
+                state.submit(AccountAction::Verify(credential.credential_id.clone()), model, ui.ctx());
+            }
+            let selected = model
+                .account_overview
+                .as_ref()
+                .and_then(|v| v.selected_credential_id.as_deref())
+                == Some(credential.credential_id.as_str());
+            if ui
+                .add_enabled(
+                    credential.selectable(now_ms()) && !selected,
+                    egui::Button::new(if selected {
+                        tr(l, "当前执行账户", "Current execution account")
+                    } else {
+                        tr(l, "设为执行账户", "Use for execution")
+                    }),
+                )
+                .clicked()
+            {
+                state.submit(AccountAction::Select(credential.credential_id.clone()), model, ui.ctx());
+            }
+            if ui.button(tr(l, "删除绑定", "Remove binding")).clicked() {
+                state.deleting = Some(credential.credential_id.clone());
+                state.password.zeroize();
+            }
+        });
+        if state.deleting.as_deref() == Some(credential.credential_id.as_str()) {
+            ui.colored_label(
+                theme::WARNING,
+                tr(
+                    l,
+                    "仅删除 Venue 绑定，不撤销币安 Key。存在持仓、挂单或运行账户时会拒绝删除。",
+                    "Removes only the Venue binding, not the Binance key. Exposure, orders or a running account block removal.",
+                ),
+            );
+            field(
+                ui,
+                tr(l, "确认登录密码", "Confirm login password"),
+                &mut state.password,
+                true,
+                128,
+            );
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !state.password.is_empty(),
+                        egui::Button::new(tr(l, "确认删除", "Confirm removal")),
+                    )
+                    .clicked()
+                {
+                    let request = DeleteCredentialRequest {
+                        credential_id: credential.credential_id.clone(),
+                        password: SecretValue::new(std::mem::take(&mut *state.password)),
+                    };
+                    state.submit(AccountAction::Delete(request), model, ui.ctx());
+                    state.deleting = None;
+                }
+                if ui.button(tr(l, "取消", "Cancel")).clicked() {
+                    state.deleting = None;
+                    state.password.zeroize();
                 }
             });
         }
     });
-    ui.small(tr(l,"验证只读取交易所，不下单、不修改账户模式。选择账户不会启动策略。","Verification only reads exchange state; it never trades or changes account mode. Selecting an account does not start a strategy."));
 }
 
 fn show_add(ui: &mut egui::Ui, state: &mut AccountCenter, model: &AppModel) {
