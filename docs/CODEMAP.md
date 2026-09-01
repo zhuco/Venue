@@ -75,7 +75,7 @@ Web 的 Control 用户会话只在 BFF 环境注入，HTTP/SSE 同时保留 Cont
 | 冻结共享行为内核 | `src/runtime/hedged_grid/mod.rs`、`src/runtime/legacy/hedged_grid_live.rs` | 不再称为现行三所生产入口 |
 | 历史配置 | `venue.grid.toml`、`venue.gate.example.toml`、`venue.bitget.example.toml` | 不是 Node runtime JSON；远端运行状态必须实测，不由文档路径推断 |
 | 六所 Node 二进制验证 | `scripts/verify_venue_node_binaries.ps1` | 固定 feature 隔离；不等于实盘接管 |
-| 本地 Ubuntu Node 编译 | `scripts/Build-VenueUbuntu.ps1` | `G:\Build\Venue\ubuntu`，Cargo 复用 slot-2；固定 commit、六 ELF、manifest/SHA256，`-CheckOnly` 零写；详见 [构建政策](DEVELOPMENT.md#build-policy) |
+| 本地 Ubuntu Node/Control 编译 | `scripts/Build-VenueUbuntu.ps1` | `G:\Build\Venue\ubuntu`，Cargo 复用 slot-2；默认 Nodes 为六 ELF，`-Component Control` 为 Control/Copy 两个 ELF，均绑定固定 commit 与 manifest/SHA256，`-CheckOnly` 零写；详见 [构建政策](DEVELOPMENT.md#build-policy) |
 
 ## 交易所 adapter
 

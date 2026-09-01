@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory)][string]$ExpectedRevision,
     [Parameter(Mandatory)][string]$ReleaseId,
     [string]$SourceRoot = (Split-Path -Parent $PSScriptRoot),
+    [ValidateSet('Nodes','Control')][string]$Component = 'Nodes',
     [switch]$CheckOnly
 )
 Set-StrictMode -Version Latest
@@ -39,12 +40,13 @@ try {
 } finally { Pop-Location }
 
 $target = 'x86_64-unknown-linux-gnu.2.35'
-$binaries = @('binance','bitget','bybit','gate','hyperliquid','okx')
+$nodeVenues = @('binance','bitget','bybit','gate','hyperliquid','okx')
+$controlBinaries = @('venue-control-server','venue-copy-worker')
 $builderFiles = @($PSCommandPath,(Join-Path $PSScriptRoot 'ubuntu_build_helpers.ps1'),(Join-Path $PSScriptRoot 'venue_build_guard.ps1'))
 $builderHashes = @{}
 foreach ($file in $builderFiles) { $builderHashes[[IO.Path]::GetFileName($file)] = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant() }
 if ($CheckOnly) {
-    [PSCustomObject]@{ Source=$source; Revision=$ExpectedRevision; Target=$target; Cache=$plan.TargetDirectory; Release=$paths.Release; Tools=$versions }
+    [PSCustomObject]@{ Source=$source; Revision=$ExpectedRevision; Component=$Component; Target=$target; Cache=$plan.TargetDirectory; Release=$paths.Release; Tools=$versions }
     return
 }
 
@@ -74,17 +76,31 @@ try {
     $records = @()
     Push-Location -LiteralPath $source
     try {
-        foreach ($venue in $binaries) {
-            $binary = 'venue-node-' + $venue
-            & cargo zigbuild --locked --release -p venue-node --no-default-features --features $venue --bin $binary --target $target
-            if ($LASTEXITCODE -ne 0) { throw "Ubuntu build failed for $binary; cache and partial stage are retained." }
-            $artifact = Join-Path $lease.TargetDirectory ('x86_64-unknown-linux-gnu\release\' + $binary)
-            Assert-VenuePlainPath $artifact
-            Assert-VenueUbuntuElf $artifact
-            $destination = Join-Path $stage $binary
-            [IO.File]::Copy($artifact,$destination,$false)
-            $records += [ordered]@{name=$binary;sha256=(Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()}
-            $null = Test-VenueBuildAdmission $lease.Plan
+        if ($Component -ceq 'Nodes') {
+            foreach ($venue in $nodeVenues) {
+                $binary = 'venue-node-' + $venue
+                & cargo zigbuild --locked --release -p venue-node --no-default-features --features $venue --bin $binary --target $target
+                if ($LASTEXITCODE -ne 0) { throw "Ubuntu build failed for $binary; cache and partial stage are retained." }
+                $artifact = Join-Path $lease.TargetDirectory ('x86_64-unknown-linux-gnu\release\' + $binary)
+                Assert-VenuePlainPath $artifact
+                Assert-VenueUbuntuElf $artifact
+                $destination = Join-Path $stage $binary
+                [IO.File]::Copy($artifact,$destination,$false)
+                $records += [ordered]@{name=$binary;sha256=(Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()}
+                $null = Test-VenueBuildAdmission $lease.Plan
+            }
+        } else {
+            foreach ($binary in $controlBinaries) {
+                & cargo zigbuild --locked --release -p venue-control --bin $binary --target $target
+                if ($LASTEXITCODE -ne 0) { throw "Ubuntu build failed for $binary; cache and partial stage are retained." }
+                $artifact = Join-Path $lease.TargetDirectory ('x86_64-unknown-linux-gnu\release\' + $binary)
+                Assert-VenuePlainPath $artifact
+                Assert-VenueUbuntuElf $artifact
+                $destination = Join-Path $stage $binary
+                [IO.File]::Copy($artifact,$destination,$false)
+                $records += [ordered]@{name=$binary;sha256=(Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()}
+                $null = Test-VenueBuildAdmission $lease.Plan
+            }
         }
     } finally { Pop-Location }
     Assert-VenueUbuntuRevision $source $ExpectedRevision
@@ -94,7 +110,7 @@ try {
         }
     }
     $manifest = [ordered]@{
-        release_id=$ReleaseId; git_revision=$ExpectedRevision; platform='linux'; target=$target
+        release_id=$ReleaseId; git_revision=$ExpectedRevision; component=$Component.ToLowerInvariant(); platform='linux'; target=$target
         minimum_glibc='2.35'; tools=$versions; binaries=$records
         builder=$builderHashes
     }
@@ -103,7 +119,7 @@ try {
     [IO.File]::WriteAllText((Join-Path $stage 'SHA256SUMS'), ($checksums + "`n"), [Text.UTF8Encoding]::new($false))
     $expected = @($records | ForEach-Object { $_.name }) + @('manifest.json','SHA256SUMS')
     $actual = @(Get-ChildItem -LiteralPath $stage -Force)
-    if ($actual.Count -ne 8 -or @($actual | Where-Object { $_.PSIsContainer -or $_.Name -cnotin $expected }).Count) {
+    if ($actual.Count -ne ($records.Count + 2) -or @($actual | Where-Object { $_.PSIsContainer -or $_.Name -cnotin $expected }).Count) {
         throw 'Ubuntu stage contains a non-allow-listed entry.'
     }
     # Directory.Move refuses an existing destination, including a release created concurrently.

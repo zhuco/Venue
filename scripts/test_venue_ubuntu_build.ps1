@@ -71,6 +71,7 @@ Assert-Rejected { Assert-VenueUbuntuRevision $repo $revision }
 $entry = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Build-VenueUbuntu.ps1') -Raw
 foreach ($required in @("-Slot 'slot-2'",'Enter-VenueBuildGuard','Exit-VenueBuildGuard',
     'Restore-VenueBuildEnvironment','--locked --release -p venue-node',
+    "[ValidateSet('Nodes','Control')]",'--locked --release -p venue-control',
     '--no-default-features --features $venue','--target $target',
     'x86_64-unknown-linux-gnu.2.35','Assert-VenueUbuntuElf','[IO.Directory]::Move',
     'Assert-VenueUbuntuRevision $source $ExpectedRevision')) {
