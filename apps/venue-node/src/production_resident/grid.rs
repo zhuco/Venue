@@ -68,7 +68,7 @@ pub(crate) struct GridBridgeState {
     #[serde(default)]
     reset_rebuild_attempted: bool,
     /// Versioned only to let a checkpoint that failed before the physical boundary under an older
-    /// validation implementation take one explicitly confirmed repair retry.
+    /// validation implementation take one explicitly confirmed repair retry per repair version.
     #[serde(default)]
     reset_rebuild_attempt_version: u16,
     #[serde(with = "grid_routes")]
@@ -208,7 +208,7 @@ impl GridBridgeState {
 
     pub(crate) fn needs_reset_rebuild(&self) -> bool {
         self.bootstrap_state == GridBootstrapState::Attempted
-            && (!self.reset_rebuild_attempted || self.reset_rebuild_attempt_version < 2)
+            && (!self.reset_rebuild_attempted || self.reset_rebuild_attempt_version < 3)
             && self.grid.phase == venue_strategies::hedged_grid::GridPhase::ResettingGrid
             && self.grid.epoch.is_none()
             && self.grid.inventory.is_none()
@@ -284,7 +284,7 @@ impl GridBridgeState {
             return Err(GridBridgeError::BootstrapState);
         }
         self.reset_rebuild_attempted = true;
-        self.reset_rebuild_attempt_version = 2;
+        self.reset_rebuild_attempt_version = 3;
         self.validate()
     }
 
