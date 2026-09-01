@@ -936,23 +936,24 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
 
         // All admission occurs before the first dispatch. The Host's durable reservations make
         // the later candidates see the entire batch, including the opening wave.
-        if self
-            .host
-            .prepare_and_admit_managed_grid_batch(
-                &mut self.runtime,
-                binding,
-                &applied,
-                venue_runtime::account::AccountLanePriority::Normal,
-                signed_surface,
-                &plan.commands,
-            )
-            .is_err()
-        {
+        if let Err(error) = self.host.prepare_and_admit_managed_grid_batch(
+            &mut self.runtime,
+            binding,
+            &applied,
+            venue_runtime::account::AccountLanePriority::Normal,
+            signed_surface,
+            &plan.commands,
+        ) {
             self.host
                 .reject_prepared_batch(&mut self.runtime, "grid_bootstrap_batch_rejected")
                 .map_err(|_| NodeError::ResidentRuntime)?;
             self.pause_grid_after_bootstrap_failure(binding)?;
-            return Err(NodeError::ResidentRuntime);
+            return Err(NodeError::LiveHost {
+                venue: self.host.binding().venue,
+                message: format!(
+                    "Grid bootstrap batch admission rejected before dispatch: {error}"
+                ),
+            });
         }
         for _ in &plan.commands {
             if self
