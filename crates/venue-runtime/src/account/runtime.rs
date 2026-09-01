@@ -626,8 +626,53 @@ impl AccountRuntime {
             }
             self.turn_sequences
                 .insert(key.clone(), receipt.turn_sequence());
+            if matches!(
+                wal_validation,
+                ActorAppliedWalValidation::HostVerifiedHistory
+            ) && self.production_signed_bootstrap
+            {
+                let recovered_deliveries = store.recovered_private_deliveries()?;
+                self.restore_host_verified_production_private_cursor(
+                    receipt.applied_private_sequence(),
+                    &recovered_deliveries,
+                )?;
+            }
         }
         self.actor_applied_stores.insert(key, store);
+        Ok(())
+    }
+
+    fn restore_host_verified_production_private_cursor(
+        &mut self,
+        recovered_cursor: u64,
+        recovered_deliveries: &BTreeSet<AppliedPrivateDelivery>,
+    ) -> Result<(), AccountRuntimeError> {
+        let durable_facts_tail = self
+            .private_ingress
+            .as_ref()
+            .ok_or(AccountRuntimeError::PrivateIngressUnavailable)?
+            .durable_tail_sequence()?;
+        if !self.pending_private_applications.is_empty()
+            || recovered_deliveries
+                .iter()
+                .any(|delivery| delivery.evidence_sequence > recovered_cursor)
+            || durable_facts_tail < self.last_applied_private_sequence
+        {
+            return Err(AccountRuntimeError::PrivateApplicationState);
+        }
+        if recovered_cursor <= self.last_applied_private_sequence {
+            return (durable_facts_tail == self.last_applied_private_sequence)
+                .then_some(())
+                .ok_or(AccountRuntimeError::PrivateApplicationState);
+        }
+        if recovered_cursor != durable_facts_tail {
+            return Err(AccountRuntimeError::PrivateApplicationState);
+        }
+        self.private_router.restore_durable_evidence_cursor(
+            self.last_applied_private_sequence,
+            recovered_cursor,
+        )?;
+        self.last_applied_private_sequence = recovered_cursor;
         Ok(())
     }
 

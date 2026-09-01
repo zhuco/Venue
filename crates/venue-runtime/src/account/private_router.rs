@@ -158,6 +158,27 @@ impl PrivateRouter {
         Ok(())
     }
 
+    /// Advances an already-active production generation only from a separately verified durable
+    /// Actor/facts equality. The router cannot derive this cursor and refuses a gap, regression,
+    /// or incomplete batch.
+    pub(crate) fn restore_durable_evidence_cursor(
+        &mut self,
+        expected_current: u64,
+        recovered_cursor: u64,
+    ) -> Result<(), PrivateRouterError> {
+        if self.connection_generation == 0
+            || self.pending_evidence.is_some()
+            || self.last_evidence_sequence != expected_current
+            || recovered_cursor <= expected_current
+        {
+            return Err(PrivateRouterError::Generation);
+        }
+        self.last_evidence_sequence = recovered_cursor;
+        self.last_evidence_digest = None;
+        self.last_evidence_fact_count = 0;
+        Ok(())
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) const fn active_generation_for_test(&self) -> u64 {

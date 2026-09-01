@@ -2046,6 +2046,22 @@ mod bootstrap_tests {
             observed.private_generation,
             resident.runtime().connection_generation()
         );
+        drop(resident);
+
+        let second_launch = launch(directory.path())?;
+        let gateway = Gateway {
+            binding: second_launch.binding().clone(),
+            state,
+        };
+        let mut reopened = ProductionResident::open(&second_launch, gateway)?;
+        reopened.register_actor(binding.clone())?;
+        let recovered_checkpoint = reopened
+            .runtime
+            .resident_actor_checkpoint(&binding)?
+            .ok_or("recovered grid checkpoint")?;
+        reopened
+            .runtime
+            .persist_resident_semantic_turn(&binding, recovered_checkpoint)?;
         Ok(())
     }
 }

@@ -271,6 +271,8 @@ Grid bridge 对同一已接受 native order 的部分成交必须在策略 check
 最小 Checkpoint 与最终公共/WAL 门之间的崩溃也按整批恢复：重启先把 `Prepared` 证明为未 dispatch、把
 `Submitted` 围栏为 `Unknown`；只有全部 deterministic command id 在 Host WAL 中绝对不存在，且由 checkpoint 推导的预派发订单面（仍有 accepted route 的当前订单，加每个 pending transaction 的原 cancel target，排除未提交 replacement）与当前签名订单在 client/native/owner/订单形状及全集上完全一致，才可用同一 transaction、同一命令 ID 继续整批，不得从当前订单面自证、重新分配身份或按当前价格再规划。任一命令已进入 WAL（包括明确 Rejected）时，整个 pending transaction 必须保持暂停并进入签名对账，禁止单条复活；只有全部 WAL 身份收敛且更新一代全订单族签名回读重建出实际 owned 集合后，才清除 pending 并继续 reset/running。
 
+生产冷启动恢复私有游标还必须同时验证 Host 已核验的 Actor Applied 头与完整 `facts.jsonl` 尾部：每条事实的 journal 序号、header source sequence、PrivateAccount 来源、header 与规范私有事件均须一致有效；当前 Runtime 与 PrivateRouter 游标只能在 Actor 游标精确命中已验证 facts 尾部时同步前移。仅有 checkpoint 数字、重标记事实、断序、坏尾或 Actor/facts 任一方向不一致都失败关闭，不得据此投递或恢复 mutation。
+
 重建 place 收到 Accepted 后不得先把本地 4×N 张订单记为 `Running`；若安装窗口继续成交或订单消失，
 Checkpoint 与健康报告都必须保持过渡态，直到更新一代签名 open-orders 精确收敛。
 
