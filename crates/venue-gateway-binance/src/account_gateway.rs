@@ -355,15 +355,14 @@ impl BinanceAccountGateway {
     }
 
     fn account_risk_evidence(&mut self) -> Result<AccountRiskEvidence, AccountHostValidationError> {
-        let attempt = self
-            .take_attempt_id()
-            .map_err(|_| AccountHostValidationError::RiskEvidence)?;
+        let stage = AccountHostValidationError::RiskEvidenceStage;
+        let attempt = self.take_attempt_id().map_err(|_| stage("attempt"))?;
         let next_private_generation = self
             .next_private_generation()
-            .map_err(|_| AccountHostValidationError::RiskEvidence)?;
+            .map_err(|_| stage("private_generation"))?;
         let transport = self
             .transport_for_private_generation(next_private_generation)
-            .map_err(|_| AccountHostValidationError::RiskEvidence)?;
+            .map_err(|_| stage("transport"))?;
         let evidence = self.runtime.block_on(fetch_account_wide_risk(
             &transport,
             &self.credentials,

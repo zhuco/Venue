@@ -944,16 +944,17 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             signed_surface,
             &plan.commands,
         ) {
-            self.host
-                .reject_prepared_batch(&mut self.runtime, "grid_bootstrap_batch_rejected")
-                .map_err(|_| NodeError::ResidentRuntime)?;
-            self.pause_grid_after_bootstrap_failure(binding)?;
-            return Err(NodeError::LiveHost {
-                venue: self.host.binding().venue,
-                message: format!(
-                    "Grid bootstrap batch admission rejected before dispatch: {error}"
-                ),
-            });
+            // Admission can reject before it creates any Prepared record. Cleanup is still
+            // attempted, but an empty-batch cleanup result must never erase the actionable
+            // signed-risk or surface error that stopped dispatch.
+            let _cleanup = self
+                .host
+                .reject_prepared_batch(&mut self.runtime, "grid_bootstrap_batch_rejected");
+            let _pause = self.pause_grid_after_bootstrap_failure(binding);
+            return Err(grid_bootstrap_admission_error(
+                self.host.binding().venue,
+                &error,
+            ));
         }
         for _ in &plan.commands {
             if self
@@ -1362,6 +1363,16 @@ fn persist_actor_anchor(
 fn resident_error(error: venue_runtime::account::AccountRuntimeError) -> NodeError {
     let _ = error;
     NodeError::ResidentRuntime
+}
+
+fn grid_bootstrap_admission_error(
+    venue: venue_gateway_api::VenueId,
+    error: &impl std::fmt::Display,
+) -> NodeError {
+    NodeError::LiveHost {
+        venue,
+        message: format!("Grid bootstrap batch admission rejected before dispatch: {error}"),
+    }
 }
 
 fn unix_now_ms() -> Result<u64, NodeError> {
@@ -1830,6 +1841,13 @@ mod bootstrap_tests {
             Some(venue_runtime::account::InstanceLifecycle::Paused)
         );
         Ok(())
+    }
+
+    #[test]
+    fn bootstrap_admission_error_retains_risk_stage() {
+        let stage = AccountHostValidationError::RiskEvidenceStage("quote_rates");
+        let message = grid_bootstrap_admission_error(VenueId::Binance, &stage).to_string();
+        assert!(message.contains("failed closed at quote_rates"));
     }
 
     #[test]
