@@ -119,6 +119,30 @@ impl AccountPrivateIngress {
         }
         Ok(recovery.entries.last().map_or(0, |entry| entry.sequence))
     }
+
+    pub(crate) fn durable_records_after(
+        &self,
+        sequence: u64,
+    ) -> Result<Vec<(u64, FactRecord)>, AccountPrivateIngressError> {
+        let recovery = self.facts.recover()?;
+        if recovery.truncated_tail
+            || recovery.entries.iter().any(|entry| {
+                entry.record.header.validate().is_err()
+                    || entry.record.header.source != EventSource::PrivateAccount
+                    || entry.record.header.source_sequence != Some(entry.sequence)
+                    || matches!(entry.record.event, DomainEvent::Instrument(_))
+                    || validate_private_domain_event(&entry.record.event).is_err()
+            })
+        {
+            return Err(AccountPrivateIngressError::Input);
+        }
+        Ok(recovery
+            .entries
+            .into_iter()
+            .filter(|entry| entry.sequence > sequence)
+            .map(|entry| (entry.sequence, entry.record))
+            .collect())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -206,6 +230,30 @@ mod tests {
             AccountPrivateIngress::open(path)?.durable_tail_sequence()?,
             2
         );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_records_after_returns_only_valid_contiguous_suffix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("facts.jsonl");
+        let mut ingress = AccountPrivateIngress::open(path)?;
+        for (event_id, received_at_ms) in [("funding_suffix_1", 100), ("funding_suffix_2", 101)] {
+            ingress.persist(AccountPrivateFactInput::new(
+                EventId::new(event_id)?,
+                7,
+                received_at_ms,
+                None,
+                DomainEvent::Funding(Amount::new(Asset::new("USDT")?, Decimal::ONE)),
+            )?)?;
+        }
+
+        let suffix = ingress.durable_records_after(1)?;
+        assert_eq!(suffix.len(), 1);
+        assert_eq!(suffix[0].0, 2);
+        assert_eq!(suffix[0].1.header.source_sequence, Some(2));
+        assert!(matches!(suffix[0].1.event, DomainEvent::Funding(_)));
         Ok(())
     }
 

@@ -678,6 +678,45 @@ impl AccountRuntime {
         Ok(())
     }
 
+    pub(crate) fn host_unapplied_private_records_after(
+        &self,
+        recovered_cursor: u64,
+    ) -> Result<Vec<(u64, venue_domain::domain::FactRecord)>, AccountRuntimeError> {
+        self.private_ingress
+            .as_ref()
+            .ok_or(AccountRuntimeError::PrivateIngressUnavailable)?
+            .durable_records_after(recovered_cursor)
+            .map_err(AccountRuntimeError::from)
+    }
+
+    /// Advances only the in-memory ingress evidence cursor after Host proves every skipped Grid
+    /// fill against the complete signed snapshot and Accepted WAL Owner. The Actor checkpoint is
+    /// deliberately not changed: startup Grid recovery must persist and apply those same signed
+    /// fills at new contiguous evidence sequences before it may become Running.
+    pub(crate) fn cover_host_signed_grid_private_gap(
+        &mut self,
+        recovered_cursor: u64,
+        covered_tail: u64,
+    ) -> Result<(), AccountRuntimeError> {
+        let durable_tail = self
+            .private_ingress
+            .as_ref()
+            .ok_or(AccountRuntimeError::PrivateIngressUnavailable)?
+            .durable_tail_sequence()?;
+        if recovered_cursor != self.last_applied_private_sequence
+            || covered_tail <= recovered_cursor
+            || covered_tail != durable_tail
+            || !self.pending_private_applications.is_empty()
+            || !self.completed_private_sequences.is_empty()
+        {
+            return Err(AccountRuntimeError::PrivateApplicationState);
+        }
+        self.private_router
+            .restore_durable_evidence_cursor(recovered_cursor, covered_tail)?;
+        self.last_applied_private_sequence = covered_tail;
+        Ok(())
+    }
+
     /// Installs the complete durable ownership and unresolved-WAL recovery result. Runtime
     /// connectivity cannot become Ready until this succeeds, including for an empty new account.
     pub(crate) fn restore_durable_state(

@@ -4,7 +4,7 @@ use std::{
 };
 
 use rust_decimal::Decimal;
-use venue_domain::domain::{CommandId, ExecutionCommand, OrderOwner, OrderPurpose};
+use venue_domain::domain::{CommandId, DomainEvent, ExecutionCommand, OrderOwner, OrderPurpose};
 use venue_execution::{
     AccountCommandStatus, AccountDispatchOutcome, AccountHostError,
     AccountLimitNormalizationIntent, AccountMutationHost, AccountPhysicalGateway,
@@ -16,6 +16,7 @@ use venue_gateway_api::GatewayBinding;
 use super::{
     AccountKey, AccountLanePriority, AccountModelError, AccountRuntime, AccountRuntimeError,
     CopyActorAppliedReceipt, ResidentActorAppliedArtifacts, StrategyBinding, StrategyInstanceKey,
+    StrategyKind,
 };
 use crate::{AppliedStrategyTurnReceipt, execution::DurableCommandIdentityAllocation};
 
@@ -279,14 +280,15 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
         let store = artifacts
             .open_store(binding.clone())
             .map_err(AccountRuntimeHostError::Runtime)?;
-        if let Some(recovered) = store
+        let recovered = store
             .recover()
             .map_err(AccountRuntimeError::ActorApplied)
-            .map_err(AccountRuntimeHostError::Runtime)?
-            && !self
+            .map_err(AccountRuntimeHostError::Runtime)?;
+        if recovered.as_ref().is_some_and(|recovered| {
+            !self
                 .host
                 .validates_historical_wal_head(recovered.receipt().wal())
-        {
+        }) {
             return Err(AccountRuntimeHostError::Runtime(
                 AccountRuntimeError::ActorAppliedStore,
             ));
@@ -300,8 +302,76 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
         runtime
             .hydrate_host_wal_routes(routes)
             .map_err(AccountRuntimeHostError::Runtime)?;
+        if let Some(recovered) = recovered.as_ref() {
+            self.cover_host_signed_grid_private_gap(
+                runtime,
+                binding,
+                recovered.receipt().applied_private_sequence(),
+            )?;
+        }
         runtime
             .install_host_verified_actor_applied_store(store)
+            .map_err(AccountRuntimeHostError::Runtime)
+    }
+
+    fn cover_host_signed_grid_private_gap(
+        &self,
+        runtime: &mut AccountRuntime,
+        binding: &StrategyBinding,
+        recovered_cursor: u64,
+    ) -> Result<(), AccountRuntimeHostError<G::Error>> {
+        if runtime.applied_private_sequence() > recovered_cursor {
+            return Ok(());
+        }
+        let records = runtime
+            .host_unapplied_private_records_after(recovered_cursor)
+            .map_err(AccountRuntimeHostError::Runtime)?;
+        if records.is_empty() {
+            return Ok(());
+        }
+        if binding.key.strategy_kind != StrategyKind::HedgedGrid {
+            return Err(AccountRuntimeHostError::Runtime(
+                AccountRuntimeError::PrivateApplicationState,
+            ));
+        }
+        let snapshot = self.host.latest_signed_snapshot().ok_or_else(|| {
+            AccountRuntimeHostError::Runtime(AccountRuntimeError::PrivateApplicationState)
+        })?;
+        let routes = self.host.accepted_order_routes();
+        let mut prior = recovered_cursor;
+        for (sequence, record) in &records {
+            if prior.checked_add(1) != Some(*sequence) {
+                return Err(AccountRuntimeHostError::Runtime(
+                    AccountRuntimeError::PrivateApplicationState,
+                ));
+            }
+            prior = *sequence;
+            let DomainEvent::Fill(fill) = &record.event else {
+                return Err(AccountRuntimeHostError::Runtime(
+                    AccountRuntimeError::PrivateApplicationState,
+                ));
+            };
+            let signed_matches = snapshot
+                .fills()
+                .iter()
+                .filter(|signed| *signed == fill)
+                .count()
+                == 1;
+            let owned_routes = routes
+                .iter()
+                .filter(|route| {
+                    route.venue_order_id.as_deref() == Some(fill.order_id.as_str())
+                        && binding.matches_owner(&route.owner)
+                })
+                .count();
+            if !signed_matches || owned_routes != 1 {
+                return Err(AccountRuntimeHostError::Runtime(
+                    AccountRuntimeError::PrivateApplicationState,
+                ));
+            }
+        }
+        runtime
+            .cover_host_signed_grid_private_gap(recovered_cursor, prior)
             .map_err(AccountRuntimeHostError::Runtime)
     }
 
@@ -1052,6 +1122,7 @@ mod tests {
     struct GatewayState {
         dispatches: usize,
         signed_quantity: Decimal,
+        signed_fills: Vec<Fill>,
         external_order: bool,
         unresolved_after_dispatch: bool,
         resolve_unknown_on_snapshot: bool,
@@ -1134,7 +1205,7 @@ mod tests {
             if state.missing_position_leg {
                 let _missing = positions.pop();
             }
-            SignedAccountSnapshot::complete(
+            SignedAccountSnapshot::complete_with_fills(
                 self.binding.clone(),
                 observed_at_ms,
                 1,
@@ -1189,6 +1260,7 @@ mod tests {
                     Vec::new()
                 },
                 positions,
+                state.signed_fills.clone(),
                 "fills:0".to_owned(),
                 if state.unresolved_after_dispatch {
                     request
@@ -1284,6 +1356,106 @@ mod tests {
             limit_price: Price::new(Decimal::ONE)?,
             reduce_only: false,
         }))
+    }
+
+    fn grid_command(
+        binding: &StrategyBinding,
+    ) -> Result<ExecutionCommand, Box<dyn std::error::Error>> {
+        Ok(ExecutionCommand::PlaceLimit(OrderCommand {
+            time_in_force: Default::default(),
+            command_id: CommandId::new("grid-gap-command")?,
+            client_order_id: CommandId::new("grid-gap-client")?,
+            owner: OrderOwner {
+                strategy_instance_id: binding.key.instance_id.clone(),
+                run_id: binding.run_id.clone(),
+                exchange: binding.key.account.exchange.as_str().to_owned(),
+                account: binding.key.account.account.clone(),
+                symbol: binding.key.symbol.clone(),
+                purpose: OrderPurpose::Entry,
+            },
+            side: OrderSide::Buy,
+            position_side: PositionSide::Long,
+            quantity: Decimal::ONE,
+            limit_price: Price::new(Decimal::ONE)?,
+            reduce_only: false,
+        }))
+    }
+
+    #[test]
+    fn host_covers_only_an_exact_signed_grid_fill_gap() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let gateway_binding = binding()?;
+        let account = AccountKey::new(ExchangeId::Okx, ACCOUNT)?;
+        let grid = StrategyBinding::new(
+            StrategyInstanceKey::new(
+                account.clone(),
+                StrategyKind::HedgedGrid,
+                "grid-gap",
+                gateway_binding.symbol.clone(),
+            )?,
+            "grid-gap-run",
+            "grid-gap-config",
+        )?;
+        let (gateway, state) = gateway(gateway_binding.clone(), Decimal::ZERO, false, false);
+        let mut host = AccountRuntimeHost::open(root(&temp), gateway_binding, gateway)?;
+        let prepared = host.host.prepare_for_lane(grid_command(&grid)?)?;
+        assert!(matches!(
+            host.host.dispatch_prepared(prepared)?,
+            AccountDispatchOutcome::Accepted { .. }
+        ));
+        let fill = Fill {
+            fill_id: "grid-gap-fill".to_owned(),
+            execution_sequence: FieldState::Known(1),
+            order_id: "order-1".to_owned(),
+            symbol: grid.key.symbol.clone(),
+            side: OrderSide::Buy,
+            position_side: FieldState::Known(PositionSide::Long),
+            quantity: Decimal::ONE,
+            price: Price::new(Decimal::ONE)?,
+            fee: FieldState::Missing,
+            realized_pnl: FieldState::Missing,
+            maker: FieldState::Known(true),
+            exchange_time_ms: Some(100),
+        };
+        let mut mismatched_fill = fill.clone();
+        mismatched_fill.fill_id = "different-signed-fill".to_owned();
+        state.lock().map_err(|_| "lock")?.signed_fills = vec![mismatched_fill];
+
+        let facts_path = temp.path().join("grid-gap-facts.jsonl");
+        let mut ingress =
+            crate::account::private_ingress::AccountPrivateIngress::open(facts_path.clone())?;
+        ingress.persist(AccountPrivateFactInput::new(
+            EventId::new("grid-gap-fill")?,
+            1,
+            100,
+            Some(NativeOrderFamily::UmOrder),
+            DomainEvent::Fill(fill.clone()),
+        )?)?;
+        drop(ingress);
+
+        let mut runtime = AccountRuntime::new(account);
+        runtime.register_strategy(grid.clone())?;
+        runtime.attach_private_ingress(facts_path)?;
+        host.bootstrap_runtime(&mut runtime)?;
+        assert_eq!(runtime.applied_private_sequence(), 0);
+        assert!(matches!(
+            host.cover_host_signed_grid_private_gap(&mut runtime, &grid, 0),
+            Err(AccountRuntimeHostError::Runtime(
+                AccountRuntimeError::PrivateApplicationState
+            ))
+        ));
+
+        let mut gateway_state = state.lock().map_err(|_| "lock")?;
+        gateway_state.signed_fills = vec![fill];
+        gateway_state.private_generation = 2;
+        drop(gateway_state);
+        host.refresh_runtime_signed_snapshot(&mut runtime)?;
+
+        host.cover_host_signed_grid_private_gap(&mut runtime, &grid, 0)?;
+
+        assert_eq!(runtime.applied_private_sequence(), 1);
+        assert_eq!(runtime.host_unapplied_private_records_after(0)?.len(), 1);
+        Ok(())
     }
 
     #[test]

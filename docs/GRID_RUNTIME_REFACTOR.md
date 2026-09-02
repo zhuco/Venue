@@ -283,7 +283,7 @@ episode 按 checkpoint key 串行选择一个受管订单，以 Critical 优先�
 
 place-only 安装若在任意子命令或持久边界中断，下一启动从 checkpoint 重建完整命令字节：只给 WAL Accepted 子命令绑定其 native id，Absent/Rejected 子命令从投影删除，精确 Prepared 在原 WAL 终结为 Rejected，Submitted/Unknown 失败关闭；已接受子集随后进入同一撤单 episode。每个持久 reconciliation episode 只耐久消费一次更高 epoch 自动重建机会；同一 episode 的后续监督或重启不得再创建第二个 epoch。若该新 place 批次本身再次部分失败，它必须暂停并形成新的、带新 operation sequence 的撤净 episode；只有完整签名空表面与无 unresolved WAL 再次成立后，该新 episode 才可安装一次下一 epoch。这样部分成功的“半张网”不能直接变成 Running，也不能重投原 place ID。
 
-生产冷启动恢复私有游标还必须同时验证 Host 已核验的 Actor Applied 头与完整 `facts.jsonl` 尾部：每条事实的 journal 序号、header source sequence、PrivateAccount 来源、header 与规范私有事件均须一致有效；当前 Runtime 与 PrivateRouter 游标只能在 Actor 游标精确命中已验证 facts 尾部时同步前移。仅有 checkpoint 数字、重标记事实、断序、坏尾或 Actor/facts 任一方向不一致都失败关闭，不得据此投递或恢复 mutation。
+生产冷启动恢复私有游标还必须同时验证 Host 已核验的 Actor Applied 头与完整 `facts.jsonl` 尾部：每条事实的 journal 序号、header source sequence、PrivateAccount 来源、header 与规范私有事件均须一致有效；通常只有 Actor 游标精确命中已验证 facts 尾部时才同步 Runtime 与 PrivateRouter。唯一允许的前写崩溃窗口是 Grid 的 facts 尾部领先 Actor：领先段必须全部是同一 Host 最新完整签名页中逐字节唯一匹配的成交，并各自精确命中同一本 WAL 的 Accepted native id 与该 Grid Owner；Host 只覆盖本次内存证据游标，启动恢复仍须把这些签名成交以新的连续 facts 序号重新持久化并写入 Actor checkpoint 后才可 Running。任一非成交、缺失、重复、Owner/WAL 不一致、重标记、断序或坏尾都失败关闭；不得改写或截断原 facts，也不得恢复或重投 mutation。
 
 writer 停止后若旧 pending transaction 尚未进入 WAL 而其余受管订单继续成交，启动必须先把更新签名页中仍命中 checkpoint accepted route、且尚未耐久应用的成交全部写入同一 facts/Actor checkpoint；同页 fill identity 按完整不可变内容去重，已 checkpoint 的 partial slice 也须精确匹配数量、maker 与源订单语义后才可跳过。随后回滚 pending 的乐观 replacement，并按上述 episode 撤净仍存在的实际 owned 集合；不得先续发旧 pending、忽略停机窗口成交或放宽为订单数量比较。
 
