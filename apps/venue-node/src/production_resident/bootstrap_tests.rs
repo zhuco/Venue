@@ -188,6 +188,42 @@ fn now() -> Result<u64, &'static str> {
         .map_err(|_| "clock")
 }
 
+#[test]
+fn terminal_accepted_grid_family_is_distinct_from_unknown() -> Result<(), Box<dyn std::error::Error>>
+{
+    let accepted = venue_domain::CommandId::new("accepted-grid-child")?;
+    let rejected = venue_domain::CommandId::new("rejected-grid-child")?;
+    let pending = vec![(
+        "roll-terminal-family".to_owned(),
+        vec![accepted.clone(), rejected.clone()],
+    )];
+    let terminal = classify_pending_grid_wal(&pending, |command_id| {
+        Ok::<_, &'static str>(Some(if command_id == &accepted {
+            venue_runtime::CommandState::Accepted {
+                venue_order_id: "native-accepted-grid-child".to_owned(),
+            }
+        } else {
+            venue_runtime::CommandState::Rejected {
+                reason: "venue_rejected".to_owned(),
+            }
+        }))
+    })?;
+    assert_eq!(
+        terminal,
+        PendingGridWalDisposition::TerminalAcceptedRejectedOrAbsent
+    );
+    let unresolved = classify_pending_grid_wal(&pending, |_| {
+        Ok::<_, &'static str>(Some(venue_runtime::CommandState::Unknown {
+            reason: "transport".to_owned(),
+        }))
+    })?;
+    assert_eq!(
+        unresolved,
+        PendingGridWalDisposition::RequiresSignedReconciliation
+    );
+    Ok(())
+}
+
 fn launch(root: &std::path::Path) -> Result<NodeLaunch, Box<dyn std::error::Error>> {
     Ok(NodeLaunch::try_parse_from(
         VenueId::Bybit,

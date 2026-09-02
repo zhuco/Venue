@@ -468,6 +468,59 @@ fn pending_pre_dispatch_surface_is_checkpoint_derived_and_shape_exact()
 }
 
 #[test]
+fn terminal_accepted_rolling_child_is_kept_only_for_signed_cancellation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut bridge, _key, source, native_order_id) = bridge_with_accepted_order()?;
+    bridge.mark_bootstrap_confirmed()?;
+    let fill = owned_fill(
+        "partial-terminal-roll",
+        &native_order_id,
+        &source,
+        source.quantity,
+        source.price,
+    )?;
+    let GridDecision::Actions(actions) = bridge.observe_persisted_fill(&fill, 9)? else {
+        return Err("complete fill did not reserve a transaction".into());
+    };
+    let GridAction::Dispatch(transaction) = &actions[0] else {
+        return Err("rolling action".into());
+    };
+    let transaction = transaction.clone();
+    let plan = bridge.plan_dispatch(&actions[0])?;
+    let (accepted_key, _, accepted_command_id) = plan
+        .accepted_routes
+        .first()
+        .cloned()
+        .ok_or("accepted replacement")?;
+    let rejected_key = plan
+        .accepted_routes
+        .get(1)
+        .map(|(key, _, _)| key.clone())
+        .ok_or("rejected replacement")?;
+    bridge.bind_accepted_pending_routes(&[(
+        accepted_command_id,
+        "native-partial-terminal-roll".to_owned(),
+    )])?;
+    bridge.abandon_pending_for_reconciliation(std::slice::from_ref(&transaction.id))?;
+
+    assert_eq!(bridge.grid.phase, GridPhase::ResettingGrid);
+    assert!(bridge.grid.pending_transactions.is_empty());
+    assert!(bridge.grid.owned_orders.contains_key(&accepted_key));
+    assert!(!bridge.grid.owned_orders.contains_key(&rejected_key));
+    assert!(bridge.grid.owned_orders.contains_key(&transaction.cancel));
+    assert_eq!(
+        bridge
+            .routes
+            .get(&accepted_key)
+            .and_then(|route| route.accepted_venue_order_id.as_deref()),
+        Some("native-partial-terminal-roll")
+    );
+    let signed = signed_orders_for(&bridge, &bridge.grid.owned_orders)?;
+    assert!(bridge.signed_desired_matches(&signed));
+    Ok(())
+}
+
+#[test]
 fn stopped_writer_extends_pending_surface_with_later_signed_fills()
 -> Result<(), Box<dyn std::error::Error>> {
     let (mut bridge, _first_key, first_source, first_native) = bridge_with_accepted_order()?;

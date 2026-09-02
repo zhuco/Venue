@@ -97,6 +97,7 @@ pub(crate) struct PrivateFillFact {
 enum PendingGridWalDisposition {
     AllAbsent,
     TerminalRejectedOrAbsent,
+    TerminalAcceptedRejectedOrAbsent,
     RequiresSignedReconciliation,
 }
 
@@ -107,6 +108,7 @@ fn classify_pending_grid_wal<E>(
     ) -> Result<Option<venue_runtime::CommandState>, E>,
 ) -> Result<PendingGridWalDisposition, E> {
     let mut rejected = false;
+    let mut accepted = false;
     for command_id in pending_transactions
         .iter()
         .flat_map(|(_, command_ids)| command_ids)
@@ -114,15 +116,17 @@ fn classify_pending_grid_wal<E>(
         match command_state(command_id)? {
             None => {}
             Some(venue_runtime::CommandState::Rejected { .. }) => rejected = true,
+            Some(venue_runtime::CommandState::Accepted { .. }) => accepted = true,
             Some(
                 venue_runtime::CommandState::Prepared
                 | venue_runtime::CommandState::Submitted
-                | venue_runtime::CommandState::Accepted { .. }
                 | venue_runtime::CommandState::Unknown { .. },
             ) => return Ok(PendingGridWalDisposition::RequiresSignedReconciliation),
         }
     }
-    Ok(if rejected {
+    Ok(if accepted {
+        PendingGridWalDisposition::TerminalAcceptedRejectedOrAbsent
+    } else if rejected {
         PendingGridWalDisposition::TerminalRejectedOrAbsent
     } else {
         PendingGridWalDisposition::AllAbsent
@@ -451,6 +455,31 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         }) {
             pending_wal = PendingGridWalDisposition::RequiresSignedReconciliation;
         }
+        if pending_wal == PendingGridWalDisposition::TerminalAcceptedRejectedOrAbsent {
+            let mut accepted = Vec::new();
+            for expected in &pending_expected_commands {
+                let status = self
+                    .host
+                    .command_status(expected.command_id())
+                    .map_err(|error| NodeError::LiveHost {
+                        venue: self.host.binding().venue,
+                        message: format!("terminal Grid accepted child WAL lookup failed: {error}"),
+                    })?;
+                if let Some(status) = status
+                    && let venue_runtime::CommandState::Accepted { venue_order_id } = status.state()
+                {
+                    accepted.push((expected.command_id().clone(), venue_order_id.clone()));
+                }
+            }
+            bridge
+                .bind_accepted_pending_routes(&accepted)
+                .map_err(|error| NodeError::LiveHost {
+                    venue: self.host.binding().venue,
+                    message: format!(
+                        "terminal Grid accepted children could not bind to checkpoint: {error}"
+                    ),
+                })?;
+        }
         let lifecycle_allows_terminal_rearm = matches!(
             self.strategy_lifecycle(&binding),
             Some(
@@ -476,6 +505,7 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             pending_wal,
             PendingGridWalDisposition::AllAbsent
                 | PendingGridWalDisposition::TerminalRejectedOrAbsent
+                | PendingGridWalDisposition::TerminalAcceptedRejectedOrAbsent
         );
         let first_bootstrap = bridge.needs_initial_bootstrap();
         let reset_rebuild = confirm_reset_rebuild && bridge.needs_reset_rebuild();

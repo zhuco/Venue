@@ -593,9 +593,57 @@ impl GridBridgeState {
             .collect()
     }
 
+    /// Binds only WAL-Accepted children from a crashed rolling batch. The caller has already
+    /// rejected Prepared/Submitted/Unknown states and checked the exact command bytes. Accepted
+    /// replacements remain owned solely so the startup reconciliation lane can signedly cancel
+    /// them; no old Place or Cancel is dispatched again.
+    pub(crate) fn bind_accepted_pending_routes(
+        &mut self,
+        accepted: &[(CommandId, String)],
+    ) -> Result<(), GridBridgeError> {
+        if accepted.is_empty() || self.grid.pending_transactions.is_empty() {
+            return Err(GridBridgeError::Evidence);
+        }
+        let expected = self
+            .pending_transaction_command_ids()?
+            .into_iter()
+            .flat_map(|(_, command_ids)| command_ids)
+            .collect::<BTreeSet<_>>();
+        if accepted.iter().any(|(command_id, venue_order_id)| {
+            !expected.contains(command_id) || venue_order_id.trim().is_empty()
+        }) || accepted
+            .iter()
+            .map(|(command_id, _)| command_id)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != accepted.len()
+        {
+            return Err(GridBridgeError::Evidence);
+        }
+        let transactions = self
+            .grid
+            .pending_transactions
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for transaction in transactions {
+            for replacement in transaction.places {
+                let command_id = stable_identifier(b"place", &self.grid.binding, &replacement.key)?;
+                let Some(native) = accepted.iter().find_map(|(accepted_id, native)| {
+                    (accepted_id == &command_id).then_some(native)
+                }) else {
+                    continue;
+                };
+                let client = stable_identifier(b"client", &self.grid.binding, &replacement.key)?;
+                self.bind_accepted_native(&replacement.key, &client, native.clone())?;
+            }
+        }
+        self.validate()
+    }
+
     /// Rolls back only locally projected replacements whose complete command families are proven
-    /// absent or terminally Rejected in Host WAL. The consumed fills remain durable; exact live
-    /// cancellation targets are restored before the whole signed surface is rebuilt.
+    /// terminal in Host WAL. The consumed fills remain durable; exact live cancellation targets
+    /// are restored, while WAL-Accepted replacements stay owned only for signed cancellation.
     pub(crate) fn abandon_pending_for_reconciliation(
         &mut self,
         transaction_ids: &[String],
@@ -606,6 +654,7 @@ impl GridBridgeState {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        let mut accepted_replacements = Vec::new();
         for transaction in &transactions {
             for replacement in &transaction.places {
                 let route = self
@@ -613,7 +662,7 @@ impl GridBridgeState {
                     .get(&replacement.key)
                     .ok_or(GridBridgeError::UnknownOrder)?;
                 if route.accepted_venue_order_id.is_some() {
-                    return Err(GridBridgeError::Evidence);
+                    accepted_replacements.push((replacement.clone(), route.clone()));
                 }
             }
         }
@@ -630,6 +679,12 @@ impl GridBridgeState {
             for replacement in transaction.places {
                 self.routes.remove(&replacement.key);
             }
+        }
+        for (replacement, route) in accepted_replacements {
+            self.grid
+                .owned_orders
+                .insert(replacement.key.clone(), replacement);
+            self.routes.insert(route.key.clone(), route);
         }
         self.start_reconciliation_episode()?;
         self.validate()
