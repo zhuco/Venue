@@ -633,8 +633,27 @@ where
                 gateway,
             )?;
             prepare_run(&mut resident, &config)?;
-            for strategy in &config.strategies {
-                let binding = config.binding_for(strategy)?;
+            let bindings = config
+                .strategies
+                .iter()
+                .map(|strategy| config.binding_for(strategy))
+                .collect::<Result<Vec<_>, _>>()?;
+            for binding in &bindings {
+                resident.preregister_actor_binding(binding.clone())?;
+            }
+            let mut installation_order = bindings
+                .iter()
+                .enumerate()
+                .map(|(index, binding)| {
+                    resident
+                        .actor_recovered_private_sequence(binding)
+                        .map(|cursor| (std::cmp::Reverse(cursor), index))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            installation_order.sort_unstable();
+            for (_, index) in installation_order {
+                let strategy = &config.strategies[index];
+                let binding = bindings[index].clone();
                 match strategy.strategy_kind {
                     StrategyKind::HedgedGrid => {
                         let grid = strategy.grid.as_ref().ok_or(NodeError::RuntimeConfig)?;

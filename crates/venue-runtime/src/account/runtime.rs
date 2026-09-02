@@ -4,7 +4,9 @@ use super::{AccountPrivateIngress, AccountRuntimeError};
 
 use crate::{
     account::recovery_session::PhysicalRecoverySessionIssuer,
-    domain::{AccountOrderCapabilityEvidence, AppliedStrategyTurnReceipt, StrategyTurnToken},
+    domain::{
+        AccountOrderCapabilityEvidence, AppliedStrategyTurnReceipt, OrderOwner, StrategyTurnToken,
+    },
     execution::{
         AccountDispatchDecision, AccountExecutionIntent, AccountExecutionLane,
         AccountExecutionRequest, AccountLaneFollowUp, AccountLanePriority, AccountMutationOutcome,
@@ -526,6 +528,13 @@ impl AccountRuntime {
         Ok(())
     }
 
+    #[must_use]
+    pub fn has_exact_strategy_binding(&self, binding: &StrategyBinding) -> bool {
+        self.registry
+            .registration(&binding.key)
+            .is_some_and(|registration| registration.binding == *binding)
+    }
+
     fn actor_private_generation(&self) -> u64 {
         if self.last_reconciliation_generation > 0 {
             self.last_reconciliation_generation
@@ -676,6 +685,48 @@ impl AccountRuntime {
         )?;
         self.last_applied_private_sequence = recovered_cursor;
         Ok(())
+    }
+
+    pub(crate) fn restore_host_verified_production_private_prefix(
+        &mut self,
+        recovered_cursor: u64,
+        recovered_deliveries: &BTreeSet<AppliedPrivateDelivery>,
+    ) -> Result<(), AccountRuntimeError> {
+        let durable_facts_tail = self
+            .private_ingress
+            .as_ref()
+            .ok_or(AccountRuntimeError::PrivateIngressUnavailable)?
+            .durable_tail_sequence()?;
+        if !self.production_signed_bootstrap
+            || !self.pending_private_applications.is_empty()
+            || recovered_deliveries
+                .iter()
+                .any(|delivery| delivery.evidence_sequence > recovered_cursor)
+            || durable_facts_tail < self.last_applied_private_sequence
+            || recovered_cursor > durable_facts_tail
+        {
+            return Err(AccountRuntimeError::PrivateApplicationState);
+        }
+        if recovered_cursor <= self.last_applied_private_sequence {
+            return Ok(());
+        }
+        self.private_router.restore_durable_evidence_cursor(
+            self.last_applied_private_sequence,
+            recovered_cursor,
+        )?;
+        self.last_applied_private_sequence = recovered_cursor;
+        Ok(())
+    }
+
+    pub(crate) fn host_has_exact_registered_grid_owner(&self, owner: &OrderOwner) -> bool {
+        self.registry
+            .registrations()
+            .filter(|registration| {
+                registration.binding.key.strategy_kind == super::StrategyKind::HedgedGrid
+                    && registration.binding.matches_owner(owner)
+            })
+            .count()
+            == 1
     }
 
     pub(crate) fn host_unapplied_private_records_after(

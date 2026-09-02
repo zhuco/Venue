@@ -5,7 +5,9 @@ use std::{
 };
 
 use rust_decimal::Decimal;
-use venue_domain::domain::{Asset, FieldState, Fill, NativeOrderFamily, OrderState, PositionSide};
+use venue_domain::domain::{
+    Asset, DomainEvent, EventId, FieldState, Fill, NativeOrderFamily, OrderState, PositionSide,
+};
 use venue_gateway_api::{GatewayBinding, VenueId};
 use venue_runtime::{
     AccountDispatchPermit, AccountGatewayResult, AccountHostValidationError,
@@ -13,7 +15,10 @@ use venue_runtime::{
     AccountRiskEvidence, SignedAccountOrderFact, SignedAccountPositionFact,
     SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
 };
-use venue_runtime::{AccountKey, StrategyBinding, StrategyInstanceKey, StrategyKind};
+use venue_runtime::{
+    AccountKey, StrategyBinding, StrategyInstanceKey, StrategyKind,
+    account::AccountPrivateFactInput,
+};
 use venue_strategies::hedged_grid::{GridDecision, GridInventory, GridPhase};
 use venue_strategies::hedged_grid::{HedgedGridBinding, HedgedGridParams, HedgedGridState};
 
@@ -699,6 +704,108 @@ fn existing_grid_restart_signs_cancels_empty_and_rebuilds_higher_epoch()
             .lines()
             .count(),
         facts_after
+    );
+    Ok(())
+}
+
+#[test]
+fn restart_replays_a_signed_fill_persisted_before_actor_ack()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let (mut resident, state, binding) = resident(directory.path(), 2)?;
+    {
+        let mut gateway = state.lock().map_err(|_| "state")?;
+        gateway.accept_dispatch = true;
+        gateway.long_quantity = Decimal::new(12, 2);
+        gateway.short_quantity = Decimal::new(12, 2);
+    }
+    assert!(resident.take_grid_bootstrap_request(&binding)?);
+    let snapshot = resident.refresh_signed_snapshot()?;
+    resident.bootstrap_grid_from_signed_market(&binding, snapshot, market()?)?;
+
+    let (fill, dispatches_before) = {
+        let mut gateway = state.lock().map_err(|_| "state")?;
+        let order = gateway
+            .open_orders
+            .iter()
+            .find(|order| !order.reduce_only)
+            .cloned()
+            .ok_or("opening Grid order")?;
+        let native_order_id = order.venue_order_id.clone().ok_or("opening native id")?;
+        gateway
+            .open_orders
+            .retain(|open| open.venue_order_id.as_deref() != Some(native_order_id.as_str()));
+        match order.position_side {
+            PositionSide::Long => gateway.long_quantity += order.quantity,
+            PositionSide::Short => gateway.short_quantity += order.quantity,
+            PositionSide::Net => return Err("Grid order cannot use net position side".into()),
+        }
+        let fill = Fill {
+            fill_id: "crash-before-actor-ack".to_owned(),
+            execution_sequence: FieldState::Known(1),
+            order_id: native_order_id,
+            symbol: order.symbol,
+            side: order.side,
+            position_side: FieldState::Known(order.position_side),
+            quantity: order.quantity,
+            price: Price::new(order.limit_price.ok_or("opening limit price")?)?,
+            fee: FieldState::Missing,
+            realized_pnl: FieldState::Missing,
+            maker: FieldState::Known(true),
+            exchange_time_ms: Some(now()?),
+        };
+        gateway.fills.push(fill.clone());
+        (fill, gateway.dispatches)
+    };
+    let private_generation = resident.runtime().connection_generation();
+    let report = resident
+        .runtime
+        .ingest_private(AccountPrivateFactInput::new(
+            EventId::new("crash-before-actor-ack")?,
+            private_generation,
+            now()?,
+            Some(NativeOrderFamily::UmOrder),
+            DomainEvent::Fill(fill),
+        )?)?;
+    assert_eq!(report.deliveries.len(), 1);
+    assert_eq!(
+        state.lock().map_err(|_| "state")?.dispatches,
+        dispatches_before
+    );
+    let facts_path = resident.artifacts_root.join("facts.jsonl");
+    assert_eq!(std::fs::read_to_string(&facts_path)?.lines().count(), 1);
+    drop(resident);
+
+    state.lock().map_err(|_| "state")?.generation = 0;
+    let second_launch = launch(directory.path())?;
+    let gateway = Gateway {
+        binding: second_launch.binding().clone(),
+        state: state.clone(),
+    };
+    let mut reopened = ProductionResident::open(&second_launch, gateway)?;
+    reopened.preregister_actor_binding(binding.clone())?;
+    reopened.register_grid_actor(
+        binding.clone(),
+        initial(2)?,
+        NodeGridRecoveryPolicy::BootstrapWhenAbsent,
+        true,
+    )?;
+
+    assert_eq!(std::fs::read_to_string(&facts_path)?.lines().count(), 2);
+    assert!(
+        reopened
+            .grid_bridges
+            .get(&binding.key)
+            .is_some_and(|bridge| bridge
+                .grid
+                .owned_fill_records
+                .contains_key("crash-before-actor-ack"))
+    );
+    assert!(
+        reopened
+            .runtime
+            .resident_actor_checkpoint(&binding)?
+            .is_some()
     );
     Ok(())
 }

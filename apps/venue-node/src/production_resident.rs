@@ -366,6 +366,40 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
         Ok(())
     }
 
+    pub(crate) fn preregister_actor_binding(
+        &mut self,
+        binding: StrategyBinding,
+    ) -> Result<(), NodeError> {
+        if self.runtime.has_exact_strategy_binding(&binding) {
+            return Ok(());
+        }
+        let venue = self.host.binding().venue;
+        self.runtime
+            .register_strategy(binding)
+            .map_err(|error| NodeError::LiveHost {
+                venue,
+                message: format!("resident strategy preregistration failed: {error}"),
+            })
+    }
+
+    pub(crate) fn actor_recovered_private_sequence(
+        &self,
+        binding: &StrategyBinding,
+    ) -> Result<u64, NodeError> {
+        let venue = self.host.binding().venue;
+        let actor_root = self
+            .artifacts_root
+            .join("strategies")
+            .join(&binding.key.instance_id);
+        let artifacts = actor_artifacts(&actor_root)?;
+        self.host
+            .resident_actor_recovered_private_sequence(binding, artifacts)
+            .map_err(|error| NodeError::LiveHost {
+                venue,
+                message: format!("resident Actor recovery cursor failed: {error}"),
+            })
+    }
+
     /// Registers a Grid actor and restores its state only from the matching Runtime-owned Actor
     /// Applied checkpoint. The bridge is deliberately absent for a generic actor: a Grid route
     /// cannot be reconstructed from BBO, side, or an exchange order id alone.
@@ -623,12 +657,14 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             .join("strategies")
             .join(&binding.key.instance_id);
         fs::create_dir_all(&actor_root).map_err(|_| NodeError::ResidentArtifacts)?;
-        self.runtime
-            .register_strategy(binding.clone())
-            .map_err(|error| NodeError::LiveHost {
-                venue,
-                message: format!("resident strategy registration failed: {error}"),
-            })?;
+        if !self.runtime.has_exact_strategy_binding(&binding) {
+            self.runtime
+                .register_strategy(binding.clone())
+                .map_err(|error| NodeError::LiveHost {
+                    venue,
+                    message: format!("resident strategy registration failed: {error}"),
+                })?;
+        }
         let artifacts = actor_artifacts(&actor_root)?;
         self.host
             .install_resident_actor_applied_artifacts(&mut self.runtime, &binding, artifacts)

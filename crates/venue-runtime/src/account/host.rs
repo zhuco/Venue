@@ -16,7 +16,6 @@ use venue_gateway_api::GatewayBinding;
 use super::{
     AccountKey, AccountLanePriority, AccountModelError, AccountRuntime, AccountRuntimeError,
     CopyActorAppliedReceipt, ResidentActorAppliedArtifacts, StrategyBinding, StrategyInstanceKey,
-    StrategyKind,
 };
 use crate::{AppliedStrategyTurnReceipt, execution::DurableCommandIdentityAllocation};
 
@@ -303,9 +302,18 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
             .hydrate_host_wal_routes(routes)
             .map_err(AccountRuntimeHostError::Runtime)?;
         if let Some(recovered) = recovered.as_ref() {
+            let recovered_deliveries = store
+                .recovered_private_deliveries()
+                .map_err(AccountRuntimeError::ActorApplied)
+                .map_err(AccountRuntimeHostError::Runtime)?;
+            runtime
+                .restore_host_verified_production_private_prefix(
+                    recovered.receipt().applied_private_sequence(),
+                    &recovered_deliveries,
+                )
+                .map_err(AccountRuntimeHostError::Runtime)?;
             self.cover_host_signed_grid_private_gap(
                 runtime,
-                binding,
                 recovered.receipt().applied_private_sequence(),
             )?;
         }
@@ -314,14 +322,51 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
             .map_err(AccountRuntimeHostError::Runtime)
     }
 
+    /// Reads and validates one configured Actor cursor before any Actor is installed so Node can
+    /// install the account's recovered stores from the highest global private cursor downward.
+    /// This grants no Runtime state, route, lifecycle, WAL, or mutation authority.
+    pub fn resident_actor_recovered_private_sequence(
+        &self,
+        binding: &StrategyBinding,
+        artifacts: ResidentActorAppliedArtifacts,
+    ) -> Result<u64, AccountRuntimeHostError<G::Error>> {
+        let store = artifacts
+            .open_store(binding.clone())
+            .map_err(AccountRuntimeHostError::Runtime)?;
+        let recovered = store
+            .recover()
+            .map_err(AccountRuntimeError::ActorApplied)
+            .map_err(AccountRuntimeHostError::Runtime)?;
+        let Some(recovered) = recovered else {
+            return Ok(0);
+        };
+        if !self
+            .host
+            .validates_historical_wal_head(recovered.receipt().wal())
+        {
+            return Err(AccountRuntimeHostError::Runtime(
+                AccountRuntimeError::ActorAppliedStore,
+            ));
+        }
+        Ok(recovered.receipt().applied_private_sequence())
+    }
+
     fn cover_host_signed_grid_private_gap(
         &self,
         runtime: &mut AccountRuntime,
-        binding: &StrategyBinding,
         recovered_cursor: u64,
     ) -> Result<(), AccountRuntimeHostError<G::Error>> {
         if runtime.applied_private_sequence() > recovered_cursor {
-            return Ok(());
+            return runtime
+                .host_unapplied_private_records_after(runtime.applied_private_sequence())
+                .map_err(AccountRuntimeHostError::Runtime)
+                .and_then(|records| {
+                    records.is_empty().then_some(()).ok_or_else(|| {
+                        AccountRuntimeHostError::Runtime(
+                            AccountRuntimeError::PrivateApplicationState,
+                        )
+                    })
+                });
         }
         let records = runtime
             .host_unapplied_private_records_after(recovered_cursor)
@@ -329,16 +374,12 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
         if records.is_empty() {
             return Ok(());
         }
-        if binding.key.strategy_kind != StrategyKind::HedgedGrid {
-            return Err(AccountRuntimeHostError::Runtime(
-                AccountRuntimeError::PrivateApplicationState,
-            ));
-        }
         let snapshot = self.host.latest_signed_snapshot().ok_or_else(|| {
             AccountRuntimeHostError::Runtime(AccountRuntimeError::PrivateApplicationState)
         })?;
         let routes = self.host.accepted_order_routes();
         let mut prior = recovered_cursor;
+        let mut suffix_fills = BTreeMap::new();
         for (sequence, record) in &records {
             if prior.checked_add(1) != Some(*sequence) {
                 return Err(AccountRuntimeHostError::Runtime(
@@ -351,6 +392,11 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
                     AccountRuntimeError::PrivateApplicationState,
                 ));
             };
+            if suffix_fills.insert(fill.fill_id.as_str(), fill).is_some() {
+                return Err(AccountRuntimeHostError::Runtime(
+                    AccountRuntimeError::PrivateApplicationState,
+                ));
+            }
             let signed_matches = snapshot
                 .fills()
                 .iter()
@@ -359,12 +405,12 @@ impl<G: AccountPhysicalGateway> AccountRuntimeHost<G> {
                 == 1;
             let owned_routes = routes
                 .iter()
-                .filter(|route| {
-                    route.venue_order_id.as_deref() == Some(fill.order_id.as_str())
-                        && binding.matches_owner(&route.owner)
-                })
-                .count();
-            if !signed_matches || owned_routes != 1 {
+                .filter(|route| route.venue_order_id.as_deref() == Some(fill.order_id.as_str()))
+                .collect::<Vec<_>>();
+            if !signed_matches
+                || owned_routes.len() != 1
+                || !runtime.host_has_exact_registered_grid_owner(&owned_routes[0].owner)
+            {
                 return Err(AccountRuntimeHostError::Runtime(
                     AccountRuntimeError::PrivateApplicationState,
                 ));
@@ -1435,11 +1481,11 @@ mod tests {
 
         let mut runtime = AccountRuntime::new(account);
         runtime.register_strategy(grid.clone())?;
-        runtime.attach_private_ingress(facts_path)?;
+        runtime.attach_private_ingress(facts_path.clone())?;
         host.bootstrap_runtime(&mut runtime)?;
         assert_eq!(runtime.applied_private_sequence(), 0);
         assert!(matches!(
-            host.cover_host_signed_grid_private_gap(&mut runtime, &grid, 0),
+            host.cover_host_signed_grid_private_gap(&mut runtime, 0),
             Err(AccountRuntimeHostError::Runtime(
                 AccountRuntimeError::PrivateApplicationState
             ))
@@ -1451,10 +1497,37 @@ mod tests {
         drop(gateway_state);
         host.refresh_runtime_signed_snapshot(&mut runtime)?;
 
-        host.cover_host_signed_grid_private_gap(&mut runtime, &grid, 0)?;
+        host.cover_host_signed_grid_private_gap(&mut runtime, 0)?;
 
         assert_eq!(runtime.applied_private_sequence(), 1);
         assert_eq!(runtime.host_unapplied_private_records_after(0)?.len(), 1);
+
+        let mut duplicate_ingress =
+            crate::account::private_ingress::AccountPrivateIngress::open(facts_path)?;
+        for event_id in ["grid-gap-duplicate-1", "grid-gap-duplicate-2"] {
+            duplicate_ingress.persist(AccountPrivateFactInput::new(
+                EventId::new(event_id)?,
+                2,
+                101,
+                Some(NativeOrderFamily::UmOrder),
+                DomainEvent::Fill(
+                    state
+                        .lock()
+                        .map_err(|_| "lock")?
+                        .signed_fills
+                        .first()
+                        .ok_or("signed fill missing")?
+                        .clone(),
+                ),
+            )?)?;
+        }
+        drop(duplicate_ingress);
+        assert!(matches!(
+            host.cover_host_signed_grid_private_gap(&mut runtime, 1),
+            Err(AccountRuntimeHostError::Runtime(
+                AccountRuntimeError::PrivateApplicationState
+            ))
+        ));
         Ok(())
     }
 
