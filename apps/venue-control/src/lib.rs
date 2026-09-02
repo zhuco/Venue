@@ -17,6 +17,7 @@ mod copy_repository;
 mod copy_worker;
 mod http;
 mod indicator_projection;
+pub mod kol_mvp;
 mod model;
 mod node_projection_postgres;
 mod postgres;
@@ -58,6 +59,10 @@ pub use http::{
 pub use indicator_projection::{
     IndicatorProjectionError, IndicatorProjectionStore, IndicatorProjector,
     MAX_INDICATOR_EVENT_PAGE, StoredIndicatorEvent,
+};
+pub use kol_mvp::{
+    BINANCE_EXECUTOR_ADVISORY_LOCK, BinanceExecutorSingleton, ExecutorSingletonError,
+    MIGRATION_0017,
 };
 pub use model::{AccountNodeBinding, ClaimedCommand, ScopedCommandReceipt, StoredEvent};
 pub use postgres::{

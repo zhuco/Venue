@@ -139,8 +139,8 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
     let primary = [
         TradingAction::OpenLong,
         TradingAction::CloseLong,
-        TradingAction::CloseShort,
         TradingAction::OpenShort,
+        TradingAction::CloseShort,
     ];
     let columns = if ui.available_width() >= 480.0 { 4 } else { 2 };
     for row in primary.chunks(columns) {

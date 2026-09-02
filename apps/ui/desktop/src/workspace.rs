@@ -32,7 +32,10 @@ impl PaneKind {
             Self::TradeTape => text(language, TextKey::TradeTape),
             Self::Accounts => text(language, TextKey::Accounts),
             Self::Strategies => text(language, TextKey::Strategies),
-            Self::Execution => text(language, TextKey::Accounts),
+            Self::Execution => match language {
+                Language::SimplifiedChinese => "账户与交易记录",
+                Language::English => "Account & trade records",
+            },
             Self::CopyRelations => text(language, TextKey::CopyRelations),
             Self::Ledger => text(language, TextKey::ReceiptLedger),
             Self::TradeDock => match language {
@@ -261,9 +264,9 @@ fn build_trading() -> Tree<Pane> {
         LinearDir::Horizontal,
         strategies,
         trade_dock,
-        0.62,
+        0.76,
     );
-    let root = split(&mut tiles, LinearDir::Vertical, upper, lower, 0.72);
+    let root = split(&mut tiles, LinearDir::Vertical, upper, lower, 0.64);
     Tree::new("venueflow-trading", root, tiles)
 }
 

@@ -4,13 +4,18 @@ use eframe::egui;
 use std::sync::Arc;
 use text::{Key, text};
 use venue_control_protocol::{ExecutionFactBinding, ExecutionFactsSnapshot, GatewayMode, VenueId};
+use venue_domain::OrderState;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum Tab {
     #[default]
     Positions,
-    Orders,
+    CurrentOrders,
+    OrderHistory,
     Fills,
+    PositionHistory,
+    Bots,
+    Assets,
 }
 
 #[derive(Debug, Default)]
@@ -89,8 +94,12 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel) {
     ui.horizontal_wrapped(|ui| {
         for (tab, key) in [
             (Tab::Positions, Key::Positions),
-            (Tab::Orders, Key::Orders),
+            (Tab::CurrentOrders, Key::CurrentOrders),
+            (Tab::OrderHistory, Key::OrderHistory),
             (Tab::Fills, Key::Fills),
+            (Tab::PositionHistory, Key::PositionHistory),
+            (Tab::Bots, Key::Bots),
+            (Tab::Assets, Key::Assets),
         ] {
             ui.selectable_value(&mut model.execution.tab, tab, text(language, key));
         }
@@ -135,6 +144,18 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel) {
             ui.colored_label(theme::WARNING, text(language, Key::Stale));
         }
     });
+    match model.execution.tab {
+        Tab::Positions | Tab::CurrentOrders | Tab::Assets => {
+            ui.weak(text(language, Key::CurrentSource));
+        }
+        Tab::Fills => {
+            ui.weak(text(language, Key::FillsScope));
+        }
+        Tab::Bots => {
+            ui.weak(text(language, Key::BotsSource));
+        }
+        Tab::OrderHistory | Tab::PositionHistory => {}
+    }
     let symbol = model
         .execution
         .current_symbol
@@ -161,7 +182,7 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel) {
                             Key::Instance,
                             Key::Time,
                         ],
-                        Tab::Orders => &[
+                        Tab::CurrentOrders => &[
                             Key::Symbol,
                             Key::Side,
                             Key::Price,
@@ -183,6 +204,16 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel) {
                             Key::FillId,
                             Key::Time,
                         ],
+                        Tab::OrderHistory | Tab::PositionHistory => &[],
+                        Tab::Bots => &[
+                            Key::Symbol,
+                            Key::Instance,
+                            Key::Kind,
+                            Key::State,
+                            Key::Long,
+                            Key::Short,
+                        ],
+                        Tab::Assets => &[Key::Asset, Key::Equity, Key::Available],
                     };
                     for key in headings {
                         ui.weak(text(language, *key));
@@ -207,8 +238,12 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel) {
                                 ui.end_row();
                             }
                         }
-                        Tab::Orders => {
-                            for row in facts.orders.iter().filter(|row| included(&row.binding)) {
+                        Tab::CurrentOrders => {
+                            for row in facts
+                                .orders
+                                .iter()
+                                .filter(|row| included(&row.binding) && is_current_order(row.state))
+                            {
                                 count += 1;
                                 let actionable = fresh
                                     && fresh_time(row.observed_ms, now)
@@ -271,11 +306,61 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel) {
                                 ui.end_row();
                             }
                         }
+                        Tab::OrderHistory | Tab::PositionHistory => {}
+                        Tab::Bots => {
+                            if let Some(snapshot) = &model.snapshot {
+                                for strategy in snapshot.strategies.iter().filter(|strategy| {
+                                    strategy.venue == venue
+                                        && strategy.mode == GatewayMode::Live
+                                        && strategy.trading_account_id == account
+                                        && symbol.as_ref().is_none_or(|selected| {
+                                            strategy.symbol.to_string() == *selected
+                                        })
+                                }) {
+                                    count += 1;
+                                    ui.label(strategy.symbol.to_string());
+                                    ui.label(&strategy.instance_id);
+                                    ui.label(format!("{:?}", strategy.kind));
+                                    ui.label(format!("{:?}", strategy.lifecycle));
+                                    decimal(ui, Some(strategy.long_quantity));
+                                    decimal(ui, Some(strategy.short_quantity));
+                                    ui.end_row();
+                                }
+                            }
+                        }
+                        Tab::Assets => {
+                            if let Some(account_summary) =
+                                model.snapshot.as_ref().and_then(|snapshot| {
+                                    snapshot.accounts.iter().find(|summary| {
+                                        summary.venue == venue
+                                            && summary.mode == GatewayMode::Live
+                                            && summary.trading_account_id == account
+                                    })
+                                })
+                            {
+                                for balance in &account_summary.balances {
+                                    count += 1;
+                                    ui.label(balance.asset.to_string());
+                                    decimal(ui, Some(balance.equity));
+                                    decimal(ui, balance.available_margin);
+                                    ui.end_row();
+                                }
+                            }
+                        }
                     }
                 });
         });
-    if count == 0 {
-        ui.weak(text(language, Key::Empty));
+    match model.execution.tab {
+        Tab::OrderHistory => {
+            ui.weak(text(language, Key::OrderHistoryUnavailable));
+        }
+        Tab::PositionHistory => {
+            ui.weak(text(language, Key::PositionHistoryUnavailable));
+        }
+        _ if count == 0 => {
+            ui.weak(text(language, Key::Empty));
+        }
+        _ => {}
     }
     if let Some((binding, order)) = selected_row {
         model.select_symbol(binding.symbol.to_string());
@@ -283,6 +368,14 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel) {
         model.synchronize_trading_scope();
         model.trade_dock.selected_order_id = order;
     }
+}
+
+fn is_current_order(state: Option<OrderState>) -> bool {
+    state.is_none()
+        || matches!(
+            state,
+            Some(OrderState::New | OrderState::PartiallyFilled | OrderState::Unknown)
+        )
 }
 
 fn decimal(ui: &mut egui::Ui, value: Option<rust_decimal::Decimal>) {
@@ -302,6 +395,17 @@ mod tests {
         assert!(!fresh_time(1, 20_000));
         assert!(!fresh_time(25_000, 20_000));
         assert!(fresh_time(19_000, 20_000));
+    }
+    #[test]
+    fn current_and_historical_orders_are_separated_without_hiding_unknown_rows() {
+        assert!(is_current_order(None));
+        assert!(is_current_order(Some(OrderState::New)));
+        assert!(is_current_order(Some(OrderState::PartiallyFilled)));
+        assert!(is_current_order(Some(OrderState::Unknown)));
+        assert!(!is_current_order(Some(OrderState::Filled)));
+        assert!(!is_current_order(Some(OrderState::Cancelled)));
+        assert!(!is_current_order(Some(OrderState::Expired)));
+        assert!(!is_current_order(Some(OrderState::Rejected)));
     }
     #[test]
     fn account_filter_never_crosses_venue_account_or_symbol()

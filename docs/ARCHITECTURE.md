@@ -1,216 +1,137 @@
-# VENUE 当前架构与技术栈
+# VENUE 当前代码与 Binance KOL MVP 目标架构
 
-更新：2026-09-01
+更新：2026-09-02
 
-本文说明已提交源码的架构；“有实现”“已通过离线测试”“已完成生产接管”是三个不同结论。
-版本和产品概览见 [README](../README.md)，代码定位见 [CODEMAP](CODEMAP.md)，开发方式见
-[DEVELOPMENT](DEVELOPMENT.md)。交易安全、网格语义和接管以 [运行时契约](GRID_RUNTIME_REFACTOR.md) 为准；
-剩余验收见 [迁移契约](UNIFIED_GATEWAY_WEB_MIGRATION.md)，旧入口见 [停用清单](ARCHITECTURE.md#deprecated)。
+本文同时说明“仓库已经有什么”和“下一步要变成什么”。已提交代码、离线测试和真实业务可用是三个不同结论；目标架构尚未实现的部分不得描述为已上线。
 
-当前三目标：Binance 交易终端和真实跟单优先，旧三所按 Binance、Gate.io、Bitget 接管。Bybit、OKX、Hyperliquid 与 Scalping 暂缓；具体验收只在迁移契约维护。
+当前唯一产品契约见 [`KOL_COPY_MVP.md`](KOL_COPY_MVP.md)，代码入口见 [`CODEMAP.md`](CODEMAP.md)，开发与构建见
+[`DEVELOPMENT.md`](DEVELOPMENT.md)。冻结 Grid/旧 Node 的保护边界见 [`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md)。
 
-## 1. 当前组成与边界
+## 1. 当前产品范围
 
-根 `Cargo.toml` 是一个包含 19 个 Rust package 的 workspace；根 `venue` package 只保留共享 facade、
-历史行为兼容与两个离线 verifier。活动应用在 `apps/`，领域和网关在 `crates/`。`apps/venue-web`
-是独立 npm 应用，不是 Rust package。`bak/` 与 `G:\kol` 均非构建或运行依赖。
+- 只支持 Binance Portfolio Margin UM；必须验证统一账户、UM 交易权限和双向持仓。
+- 初期最多 5 个由管理员开通的 KOL、200 个启用跟单账户；容量必须覆盖单个 KOL 对全部 200 个账户的突发扇出。
+- 用户通过某个 KOL 的邀请链接进入，注册事务默认建立该 KOL 的唯一归属。
+- 用户可登录、绑定/验证自己的 Binance API Key、设置并暂停跟单。
+- KOL 可使用基础交易终端操作自己的主账户，并编辑自己的公开页面标题和说明。
+- Copy 只由 KOL 的 Binance 认证账户流真实成交增量触发，并以签名 REST 补查恢复，目标是尽快开始跟随下单。
+- Grid、Scalping、Gate.io、Bitget、Bybit、OKX、Hyperliquid、收费、公开市场和高可用均不在当前范围。
+
+## 2. 目标进程拓扑
 
 ```text
-Venue Web（Next.js）→ 同源 BFF ──────────┐
-VenueFlow（native / WASM）─────────────┤
-                                      ↓
-                    venue-control（loopback HTTP/SSE /v2）
-                    PostgreSQL：账户、delivery、投影、ledger
-                    venue-copy-worker：纯语义规划，不交易
-                                      ↓
-                    venue-node-<venue>（每个账户一个进程）
-                    AccountRuntimeHost / Strategy Actor
-                    → Execution Lane → risk / Owner
-                    → 同一命令 WAL → 唯一账户 writer
-                    → 唯一链接的交易所 adapter
-                                      ↓
-                                   交易所
+Browser
+  -> Venue Web / same-origin BFF
+  -> venue-control
+       -> PostgreSQL：用户、KOL、邀请、凭证密文、关系、成交去重、命令、投影
+       -> venue-executor-binance（单部署实例，多账户异步执行）
+            -> 最多 5 条 KOL 私流
+            -> 每个跟随账户一个进程内顺序队列
+            -> Binance Portfolio Margin API
 ```
 
-原生 VenueFlow 另有无凭证 Binance 公共行情通道；WASM 保持 Control-only。公共行情不授予交易权限。
-Node 的 Control polling、BFF 到 Control 的当前连接均限制为 loopback，不应把拓扑解释为已支持任意远程直连。
-远程访问须有受控 HTTPS 边界；Web/UI 可以发起手动交易语义，BFF、Control、数据库和 Copy worker 不直接调用交易所 mutation；账户 Node 统一执行。
+目标部署不为每个账户启动进程，不为终端或 Copy 创建 Strategy Actor。跟随账户默认不保持完整私流；发送后签名查单并周期对账。若实测 REST 限频或状态时效不足，再按证据增加有界私流，不预先复制旧 Private Router。
 
-## 2. 源码职责
+## 3. 组件职责
 
-| 层 | 当前入口与职责 |
-|---|---|
-| 规范领域 | `crates/venue-domain`：Symbol、Decimal 金额、订单、仓位、成交、Instrument、行情规范类型 |
-| 六所适配器 | `crates/venue-gateway-*`：签名、原生协议/身份、账户模式、数量单位、规则、行情、私流及签名回读 |
-| 适配器契约 | `crates/venue-gateway-api`：精确 LIVE binding、规范能力；旧 probe promotion 不授予新链权限 |
-| 策略与指标 | `venue-strategies` 的 Grid/Scalping reducer；`venue-copy` 的纯资本/目标规划；`venue-indicators` 的规范行情指标与图表算法 |
-| 账户运行时 | `venue-runtime/src/account/`、`strategy/`、`account_lane.rs`：注册、路由、Actor、生命周期与公平执行 |
-| 交易执行 | `venue-execution/src/account_host.rs`：账户锁、风险、WAL、Unknown、dispatch；`account_normalization.rs` 保持用户限价与数量上限 |
-| 耐久 I/O | `venue-storage`：JSONL、Actor checkpoint、Control delivery 等存储；不额外拥有 writer |
-| Node 组合 | `apps/venue-node/src/production_resident/` 与 `control_loop/`：Grid/Scalping/Copy/手动意图接线、行情、投递及投影 |
-| Control | `apps/venue-control`：schema v2 HTTP/SSE、SQLx repository、账户管理、Copy planner/ledger；无物理交易权 |
-| UI | `apps/venueflow`：Rust 运维桌面/WASM；`apps/venue-web`：响应式用户 Web 与同源 BFF |
-| 冻结兼容 | 根 `src/runtime/grid`、`src/runtime/scalping`、`src/runtime/legacy`：历史工件与行为参考，不是 Node 生产入口 |
-
-依赖方向：domain 不依赖业务；strategy/copy 不依赖 adapter；adapter 不依赖 runtime 或 UI；
-Node 组合 runtime 和一个 adapter；Control/UI 只使用所需规范契约。Control 的 Binance 凭证管理探测是
-明确的签名只读例外，不能将其扩展为订单客户端。不得复制领域类型、指标算法、归一化或 WAL。
-
-`venue-runtime` 当前公开组合为 `account / account_lane / strategy / shared`；
-不要按旧架构图新建不存在的 `runtime/grid、runtime/scalping、runtime/copy` package 子树。
-策略组合已经在 Node 中，历史 facade 与纯策略库各自保留现有职责。
-
-## 3. 账户与执行不变量
-
-- 账户键为 `(exchange, trading_account_id)`；后者是稳定内部 UUID，不是交易所产品名、API Key 或 symbol。
-- 一个账户一个进程锁和 Execution Lane；同一 symbol 只能归属一个策略实例。同账户多 symbol 的产品验收仍需单独证明。
-- Actor 只输出语义意图；Runtime 校验后进入风险/Owner、同一命令 WAL、账户 writer、adapter。
-- WAL 状态只有 `Prepared / Submitted / Accepted / Rejected / Unknown`。Host 持久化 Submitted 后提供当前实现的
-  一次性 dispatch permit；它不是另一套 writer、journal 或可持久化的授权服务。
-- Unknown 冻结新增风险并签名对账，禁止自动重投。ACK、Applied、Accepted 均不等于成交或目标完成。
-- 所有交易数量使用 Decimal，OKX 依实时 `ctVal × ctMult × contracts` 转换；不能把基础币数量当张数。
-- 当前 10U 约束同时保留单笔门和更严格的账户累计门；已有仓位/增险挂单时不得通过测试继续增险。
-  修改该政策不是文档整理的副作用，细则见运行时契约。
-- 本地恢复工件固定 `G:\Venue\artifacts`；轮转 5 MiB、单文件 10 MiB、根预算 256 MiB。未决 WAL、
-  Unknown 事实和当前 checkpoint 不得删除。原始私流不作永久恢复依据。
-
-## 4. 六所能力的真实边界
-
-六个固定 binary 均经统一账户链。它们复用执行逻辑，不代表所有账户产品、订单族和策略都通用。
-
-| 所 | 当前 adapter 产品边界 | 公共行情/闭合 K 线 |
+| 组件 | 目标职责 | 明确不做 |
 |---|---|---|
-| Binance | Portfolio Margin UM；桌面无凭证行情为 USD-M 公共源 | 盘口、聚合成交及闭合 bar |
-| Gate.io | USDT 永续、账户与 Hedge 能力按实时预检 | 盘口、成交；bar 要求 `w=true` |
-| Bitget | UTA v3；不支持的条件/策略订单拒绝准入 | 盘口、成交；权威闭合 bar 未闭合 |
-| Bybit | V5 UTA2 linear、双向持仓 | 重建完整簿、UUID 成交；bar 要求 `confirm` |
-| OKX | V5 SWAP、Long/Short + Cross | `prevSeqId` 接桥、成交；业务 WS bar 要求 `confirm=1` |
-| Hyperliquid | 主账户/API Wallet、原生 Net 持仓 | 完整 L2、原生成交；权威闭合 bar 未闭合 |
+| Venue Web/BFF | KOL落地页、邀请注册、登录、API绑定、跟单设置、KOL文案编辑和基础终端 | 不接收或返回解密后的API Secret，不直连Binance |
+| venue-control | 认证、授权、KOL/邀请/关系、凭证加密与只读验证、查询投影 | 不直接发送交易所mutation |
+| PostgreSQL | 业务事实和唯一耐久命令账本 | 不保存明文凭证或原始私流payload |
+| venue-executor-binance | KOL私流、成交归一化、快速fan-out、账户顺序队列、规则/数量校验、下单与签名查单 | 不运行Grid/Scalping，不建立Actor/checkpoint/local WAL |
+| Binance adapter | 签名、原生symbol/数量/持仓模式、订单与成交协议转换 | 不包含用户、KOL、邀请或页面逻辑 |
 
-成交身份 `PublicTradeId` 与连续性 `PublicTradeOrdering` 分开。非连续原生 ID 只有在同代盘口就绪后才由
-Node 有界去重并分配 Session cursor；不能伪造成交易所连续序号。FeatureSource 拒绝未知连续性、断层、
-冲突或源时间过期；接收时间不能刷新数据有效期。forming bar 不自动变成 closed bar。
+Control、Web 和 Executor 复用现有 Tokio、reqwest、tokio-tungstenite、serde、rust_decimal、SQLx、secrecy、zeroize 和 ring；不为本轮引入第二套 ORM、数据库或消息队列。
 
-Scalping 的 Session-observed Ready 只证明本机输入窗口完整，不证明全市场成交完整，更不授予增险权限。
-保护投影、入场确认和退出链尚未闭合时禁止自动入场。5ms 公共空闲 poll 不是端到端响应速度承诺。
+## 4. 关键数据关系
 
-## 5. Copy、手动交易与控制面
+```text
+KOL 1 ── N Invite
+KOL 1 ── 1 LeaderTradingAccount
+KOL 1 ── N FollowerBinding ── 1 VenueUser
+VenueUser 1 ── N ApiCredential ── 1 TradingAccount
+FollowerBinding 1 ── 1 CopySetting ── 1 ActiveFollowerTradingAccount
+KOL Fills ── TargetRevision ── N CopyCommand（按跟随账户最新目标）
+```
 
-Copy 的纯规划、确定性 job、跨零 ReduceToZero/Adjust、Node 到统一 WAL 的物理桥、签名成交/仓位回读、
-Control ledger/drift 代码及从未领取即过期任务的重新规划已经存在。中间归零不等于最终反向目标完成；
-Unknown、过期与跨重启必须绑定原 job/WAL，不能靠 ACK 造 ledger。逐所 leader 事实自动来源与持续产品闭环尚需验收。
+- 一个用户在 MVP 中最多绑定一个 KOL；邀请码由服务端解析，客户端不能提交任意 `kol_id`。
+- 一个启用 KOL 只有一个主交易账户和策略资本配置；一个普通用户同时最多启用一个跟随账户。Venue 关系不授予 KOL 登录或切换跟随者 Binance 账户的能力。
+- 邀请归属只建立业务关系，不自动启用实盘跟单。用户完成 API 验证、设置额度并明确确认后才启用。
+- KOL 只能编辑自己的公开内容并查看脱敏汇总；不能查看跟随者 API Key/Secret，也不能以跟随者身份下单。
+- 用户可暂停或撤销后续跟单；暂停不自动平仓，页面必须明确提示当前仓位仍由用户承担。
 
-手动 `TradeIntent` 已有显式 LIMIT/GTC 选价、同一 Actor replay 和自有手动单撤单桥。
-Copy 绑定、影响 Grid desired 的撤单及完整 scope 协同仍有限制，不支持时明确拒绝。
-Stop 默认撤自有单且不主动平仓；Flatten 必须以更新签名零持仓证明完成。
+## 5. 快速跟单数据流
 
-Control 使用自有 Tokio HTTP/SSE 实现，不是 Axum/FastAPI 服务。PostgreSQL 保存业务任务、会话、投递与账本，
-不是交易 WAL 或第二个 writer。数据库 delivery lease 只控制任务领取，不控制账户 writer 选举。
-schema v2、Node runtime JSON 配置 v1、WAL 的版本与产品版本彼此独立。
+```text
+KOL Binance TRADE 成交
+-> Executor 从认证账户流解析、按 exchange trade id 去重
+-> PostgreSQL 同一批量事务保存 LeaderFill、关系目标版本及可发送的 CopyCommand
+-> 有界并发投递到各账户顺序队列
+-> 按 multiplier、限额、实时步长与 positionSide 生成跟随订单
+-> Binance
+-> ACK 后精确查单；超时进入 ReconcileRequired 并按同一 clientOrderId 查询
+-> 订单/成交/失败投影返回用户页面
+```
 
-账户注册/登录、Binance API 密文托管与只读验证的已提交边界见 [账户文档](ACCOUNT_MANAGEMENT.md)。
-Node 仍从环境/根 `.env` 读凭证，Control 不自动把密文安装到 Node。API 可访问、Node 在线与交易准入不能混为一谈。
+不按按钮点击、`NEW` 订单或本地推测状态触发 Copy。每个部分成交都持久化并更新关系目标，但同一腿已有在途命令时只合并为最新目标，不强制每个成交发送一张订单。源成交唯一键为 `(leader_account, symbol, exchange_trade_id)`；物理命令唯一键绑定关系 revision、目标 revision、跟随账户、symbol、position side 与 phase。平仓在领域层必须是只减仓意图，发送前按跟随账户同代新鲜签名持仓裁剪；Portfolio Margin UM Hedge Mode 的原生请求使用明确 `positionSide`，不发送该模式禁止的 `reduceOnly` 参数。
 
-## 6. UI 与技术栈
+## 6. 最小执行与故障语义
 
-| 层 | 仓库采用的技术（不是“全为最新版”声明） |
-|---|---|
-| Rust | 2024 edition、Rust/Cargo 1.98.0；`rust-toolchain.toml` 与 workspace 对齐 |
-| 网络 | Tokio、reqwest 0.12、tokio-tungstenite 0.26；既有 blocking transport 逐步等价迁移 |
-| 领域/存储 | rust_decimal、serde/serde_json、SQLx 0.8 + PostgreSQL；无第二套 ORM |
-| 安全/日志 | secrecy + zeroize；Control 密码 argon2、加密 ring；tracing |
-| 桌面/WASM | eframe/egui 0.36.1、egui_tiles 0.17.1、WGPU；native Tokio/reqwest，WASM EventSource；Windows 专用 keyring 3.6.3 |
-| 用户 Web | Next.js 16.3.3、React/React DOM 19.2.8、TypeScript 7.0.2；同源 BFF，standalone 发布 |
-| Web 验证 | TypeScript 检查、Node 单测、边界扫描、Playwright 1.58.2；当前没有 ESLint/Biome 门禁 |
-| Ubuntu 编译 | 本机 Rust + Zig 0.16.0 + cargo-zigbuild 0.23.0，x86-64 GNU/Linux glibc 2.35 基线 |
+- 目标部署中的单个 Binance Executor 是新链唯一交易出口；同一账户命令在进程内严格顺序执行。
+- 命令发送前写 PostgreSQL；稳定 `clientOrderId` 有唯一约束。
+- 状态只保留 `Pending / Sending / Accepted / Rejected / ReconcileRequired / Reconciled`，以及仅发送前可用的 `Cancelled`。
+- `ReconcileRequired` 表示请求可能已被交易所接收；确认前不重发，并暂停该账户后续增险。
+- 一个账户认证、限频、余额或查单失败只暂停该账户，不退出整个 Executor。
+- 全局并发和每账户队列必须有界；429 按 Binance 响应退避，不能通过无限任务或线程提高速度。
+- 当前不做多 Executor 选举、分布式 fencing、每账户进程锁、writer lease、JSONL WAL、Actor receipt 或恢复 manifest。
 
-精确依赖以各 manifest 和 lockfile 为准，不因文档审计批量升级。
-当前 `@types/node` 为 26.4.0，而 CI 运行 Node 24；类型包主版本不代表实际 runtime 已升级，
-新增 Node API 必须在 Node 24 验证，不能只凭类型检查判断兼容。本轮保留依赖，不把这一差异自动认定为运行故障。
-`arc-swap / parking_lot / crossbeam-channel / bytes / bitflags` 等按既有用途复用，不为未来功能预装；
-SQLite/rusqlite、Axum、Python/FastAPI、MQTT、Hummingbot、Condor runtime 均不是当前核心运行依赖。
-直接 `tungstenite` 是项目冻结例外，不是“该上游库已弃用”；不得新增旧调用点。
+## 7. 凭证与权限
 
-Web 已有总览、关系、账户、订单、持仓、成交、对账、ledger/drift 与控制界面；它是独立 DOM 响应式产品，
-不是 VenueFlow WASM 的改名。WASM 是内部 canvas 客户端。真实服务器连通、五视口截图、易用性和分段性能仍需部署验收。
-BFF 当前使用受控部署会话，不等同于已完成面向公众的多用户自助平台。
+- 密码继续使用 Argon2id；服务端会话使用随机 token 摘要，浏览器使用 Secure/HttpOnly/SameSite Cookie 和 CSRF 防护。
+- API Key/Secret 在 Control 使用 AES-256-GCM 随机 nonce 加密，AAD 绑定用户与 credential ID；PostgreSQL 只保存密文、指纹、掩码和验证结果。
+- 加密主密钥来自部署环境中的 `VENUE_ACCOUNT_MASTER_KEY`，不得入库、入 Git 或进入日志。MVP 先复用现有实现，密钥轮换/KMS 在真实需要前不扩展。
+- 只有 Control 验证路径和 Binance Executor 可短时解密；KOL、浏览器、Copy配置和投影永远不获得明文。
+- API 必须开启读取和 UM 交易、关闭提现；部署要求用户将 Key 限定到 Executor 出口 IP。权限、Portfolio Margin、UM 与双向持仓任一不满足即不可启用。
 
-VenueFlow 已纳入历史 K 线补载、图表留白/缩放、执行事实视图与手动金额输入；EMA/ADX 算法在 `venue-indicators`，UI 只负责配置与渲染。Windows 的 Venue 登录资料/会话可存系统凭证库，不进入界面普通持久化；交易所 API Key 不在该记录中。Web 下单页面/BFF 闭环仍待完成，不因桌面已有 Trade Dock 而标记 Web 已支持。
+## 8. 当前代码复用与冻结
 
-技术栈外部支持核对（2026-09-01）：Next.js 16 仍在官方 Active LTS，React 文档当前为 19.2；
-Web 默认沿用 CI 的 Node.js 24 LTS，项目最低要求 22.18 不等于任意更高主版本都获验收。
-Node 20/23/25 已 EOL，不作为新部署基线。Next 16 的 `next build` 不自动执行 lint；
-不能把构建通过写成 ESLint 通过。详见 [Next 支持政策](https://nextjs.org/support-policy)、
-[React 版本](https://react.dev/versions)、[Node 发布表](https://nodejs.org/en/about/previous-releases)、
-[Next 16 变更](https://nextjs.org/blog/next-16)。本次不是完整漏洞扫描或依赖升级验收。
+直接复用：
 
-## 7. 构建、版本与退出条件
+- `apps/venue-control/src/accounts/` 的注册、登录、会话和凭证加密；
+- `crates/venue-gateway-binance/src/credential_probe.rs` 的只读验证；
+- Binance adapter 的签名、规则、订单、成交和双向持仓协议；
+- `venue-domain` 的规范类型、Decimal 和 Symbol；
+- `apps/ui/web` 的 Next.js/BFF、安全响应头与响应式基础；
+- 现有 Copy 纯数量计算中经过专项验证且不依赖 Actor/WAL 的部分。
 
-本机 Cargo 统一走 `scripts/Invoke-VenueBuild.ps1`，只复用 `G:\Build\Venue\main、slot-1、slot-2`；
-禁止旧文档中的 PID target。两个并发构建、150 GiB 总预算和 F/G 空间准入见
-[构建规则](DEVELOPMENT.md#build-policy)。文档变更仅做静态检查，不重复业务全量测试。
+冻结、不作为新链依赖：
 
-Ubuntu 默认本机 `Build-VenueUbuntu.ps1` 交叉编译后上传，专用根为 `G:\Build\Venue\ubuntu`，
-Cargo 仍复用 slot-2。服务器不承担日常编译；产物有 manifest、源码 commit 与 SHA256，
-编译/上传均不等于启动 writer 或完成接管。
+- `apps/venue-node` 的每账户 resident、AccountRuntimeHost、Execution Lane 和 Actor 组合；
+- 旧 Copy delivery/Actor Applied/ledger recovery 链；
+- 本地 JSONL WAL、facts/checkpoint、writer lease、canonical root 与 handoff；
+- Grid/Scalping 和 Gate.io、Bitget、Bybit、OKX、Hyperliquid 接管路径。
 
-产品预览版本以 [VERSION](../VERSION) 为准，版本范围见 [CHANGELOG](CHANGELOG.md)。
-旧三所的 `--legacy-v1-handoff` 前驱记录仍是当前启动前置条件，不能因 Stage 7 binary 已删除而绕过。
-当前终端、真实跟单与旧三所接管未全部验收，保持 alpha；后续三所与 Scalping 不进入本次任务，不宣称“后端已全部完成”。
+冻结代码可继续编译或接受必要维护，但不得为了“复用”把其复杂恢复契约带入 MVP。新旧链按 `trading_account_id` 严格互斥；旧工件不得自动删除。
+
+## 9. 容量与演进
+
+初始形态只部署一个 Binance Executor。最多 5 个 KOL 常驻私流，跟随账户共享进程和连接池；KOL 成交突发以有界异步 fan-out 处理。
+2 核 4 GiB 是否可承载目标数量必须由 5 KOL/200 模拟跟随账户压测决定，文档不预先承诺。
+
+只有单实例资源或 Binance 限频被测量证明不足时，才把账户按稳定哈希静态分配到少量 Executor 分片。分片仍由数据库保证一个账户只有一个活动归属；本轮不实现自动迁移、选主或热备。
+
+## 10. 当前完成度
+
+仓库已经有账户认证、Binance凭证密文、只读探测、Web运维页面、手动语义协议和复杂Copy/Grid代码；尚未有面向公众的邀请注册、KOL页面、浏览器自助API绑定、轻量多账户Executor或真实快速跟单闭环。
+
+完成标准只以 [`KOL_COPY_MVP.md`](KOL_COPY_MVP.md) 为准。文档更新本身不启动服务、不迁移账户，也不表示实盘已可用。
 
 <a id="deprecated"></a>
 
-## 8. 停用、冻结与替代入口
+## 11. 停用与兼容入口
 
-本页管理项目自己的旧方法和功能，不宣称同名上游库已经弃用。
-“入口已删除”不等于历史源码全删，“源码冻结”不等于远端旧进程已停止。
-长期说明统一在 `docs/`，旧路径仅保留必要导航。用户已授权删除 `bak/` 且不备份；数据库和运行恢复工件不在清理范围。
-
-### 1. 已停用的生产入口
-
-| 旧入口/方案 | 状态与替代 |
-|---|---|
-| 根 `hedged-grid-binance/gate/bitget` binary、对应 feature 和旧发布入口 | 根 manifest 已移除；使用 `apps/venue-node` 六个固定 binary。不得按旧教程恢复 |
-| Node 后透传 Stage 7 的 `grid-stop`、`grid-external-algo-cancel`、`grid-legacy-binance-stop` 等 | 当前 Node 不接受这些子命令；常驻模式使用 `run --runtime-config`，实例动作通过 Control 语义命令，范围见 Node README |
-| 旧 Scalping 手造 candidate 直送 Host 的组合路径 | 生产不再从旧壳进入；Node 消费真实 FeatureSource/engine/Actor checkpoint，保护缺失仍禁止自动入场 |
-| KOL 重复网关/后端、旧 `/v1` DTO、UI 模拟交易/旧 mutation gate | 不迁移为运行依赖；Web 使用 schema v2/BFF，可以提交下单语义，由 Node 统一执行 |
-| PID/会话专用 Cargo target、随手指定 `--target-dir` | 停用；仅 main/slot-1/slot-2 与受控脚本 |
-| 弱服务器上的日常 Cargo 编译 | 不作默认方案；本机 `Build-VenueUbuntu.ps1` 编译后受控上传，Linux 打包脚本只是备用 |
-
-根 package 仍有两个离线 verifier：`verify-grid-inventory-recovery` 与 `verify-grid-exposure-shadow`。
-其中 Shadow 是旧证据名称，不是可选择的交易所运行模式。
-
-### 2. 冻结保留，不作新入口
-
-| 方法/源码范围 | 当前用途 | 删除前提 |
-|---|---|---|
-| `src/runtime/grid/stage7_*`、`src/runtime/legacy/hedged_grid_live.rs::run_binance_stage7_grid` | 历史行为、工件与恢复证据；无根生产 binary | 逐所新链等价与旧 writer/WAL 接管证明齐全 |
-| `src/runtime/scalping/*live*` 与旧控制/自动选币组合 | 恢复和策略行为参考，不重新接旧 writer | 对应 Node 安全输入、保护/退出及恢复契约验收 |
-| `src/execution/external_algo_cleanup.rs`、旧 recovery_writer/Canary 壳 | 历史精确身份与证据契约，不能作为新链旁路 | 调用和恢复依赖清零，保留必要只读解析 |
-| `crates/venue-runtime/src/account/physical_recovery*`、各 adapter 旧 recovery collector | 迁移兼容，不发行当前账户 writer 权限 | 对应恢复数据与契约有替代并验证 |
-| `crates/venue-gateway-api/src/capability_promotion.rs` 的普通 `promote/authorize` | 保持 `AuthorityUnavailable`；probe 不能提升成交易权限 | 旧契约引用清零，不破坏失败关闭测试 |
-| 根 package 直接 `tungstenite` 与现有阻塞 transport | 本项目冻结例外；不增加旧调用点 | 行为等价、延迟和断线恢复验证后逐步替换 |
-| `G:\kol` | 外部 UI 行为参考，不构建/运行 | 本项目清理不删除外部项目 |
-
-Scalping 暂缓开发与实盘验收，不因已有菜单、engine 或行情 Ready 就开放自动交易；交易所排期以三目标契约为准。
-
-### 3. 仍在使用，不能误删
-
-- `preflight`、`canary-place`、`canary-cancel` 与 `run` 都是当前 Node 子命令；Canary 不是已删除功能，
-  它仍须经 Runtime/Host/Lane/WAL，不能作为旁路。
-- `--legacy-v1-handoff`：当前 Binance/Gate/Bitget 的外层启动参数必须提供已验证前驱记录；
-  Bybit/OKX/Hyperliquid 不接受该记录。它是接管保护，不是旧生产命令。
-- `venue-execution` 中的账户 canonical root/锁、writer lease 及前驱记录，仍可能被当前 Host 引用；
-  不能因名字含 legacy/lease 就整体删除。
-- Actor durable-applied、Control delivery/inbox/outbox 与存储版本字段仍有当前调用；
-  它们不是另一套物理 writer，也不能不做兼容就更名或删除。
-- `PublicTradeOrdering::Unsequenced` 是旧记录安全读取状态，不是可直接喂策略的“默认连续流”。
-- VenueFlow WASM 仍是内部客户端；独立 Next.js Web 并不意味着 WASM 应删除。
-
-### 4. 技术栈纠偏
-
-当前实际版本和官方支持来源集中在 [架构技术栈](ARCHITECTURE.md)。
-Node.js 24 是 CI/默认 Web 基线；不要沿用已 EOL 的 Node 20/23/25。
-Next.js 16 不再提供 `next lint`，也不在 `next build` 中自动 lint；当前仓库未安装专用 JS linter。
-Axum、FastAPI、SQLite ORM、MQTT、Condor/Hummingbot 核心都不是现行实现，不能写成已依赖服务。
-本轮没有批量升级依赖，也没有执行完整 CVE/供应链审计。
+- 根 `hedged-grid-*` 旧生产 binary、旧 `/v1` KOL 后端、模拟交易 DTO 和 PID target 不得恢复为新入口。
+- `apps/venue-node` 六个 binary、Stage 7、旧 recovery collector 和 Actor Applied 仍可能被冻结代码或工件读取；删除前必须证明没有调用、运行账户或恢复依赖。
+- `G:\kol` 是外部 UI 参考，不是本 workspace 的构建或运行依赖。
+- Node.js 24、Rust 1.98.0、Next.js 16.3.3、React 19.2.8、TypeScript 7.0.2 等当前锁定版本不因架构文档更新而批量升级。

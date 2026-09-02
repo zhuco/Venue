@@ -16,7 +16,7 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 const STORAGE_KEY: &str = "venueflow-state-v1";
-const PERSISTED_SCHEMA_VERSION: u16 = 5;
+const PERSISTED_SCHEMA_VERSION: u16 = 6;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -445,20 +445,36 @@ fn load(storage: Option<&dyn eframe::Storage>) -> PersistedState {
     let Some(encoded) = storage.and_then(|storage| storage.get_string(STORAGE_KEY)) else {
         return PersistedState::default();
     };
-    match serde_json::from_str::<PersistedState>(&encoded) {
-        Ok(state) if state.schema_version == PERSISTED_SCHEMA_VERSION => state,
-        Ok(state) if matches!(state.schema_version, 2..=4) => PersistedState {
+    serde_json::from_str::<PersistedState>(&encoded)
+        .map(migrate_persisted_state)
+        .unwrap_or_default()
+}
+
+fn migrate_persisted_state(mut state: PersistedState) -> PersistedState {
+    match state.schema_version {
+        PERSISTED_SCHEMA_VERSION => state,
+        5 => {
+            // Schema 6 changes the product default from crossing GTC to maker-only. Apply the
+            // new default once; subsequent user changes are preserved under schema 6.
+            state.schema_version = PERSISTED_SCHEMA_VERSION;
+            state.preferences.trading.post_only = true;
+            state
+        }
+        2..=4 => PersistedState {
             schema_version: PERSISTED_SCHEMA_VERSION,
-            preferences: state.preferences,
+            preferences: {
+                state.preferences.trading.post_only = true;
+                state.preferences
+            },
             workspaces: Workspaces::default(),
         },
-        Ok(_) | Err(_) => PersistedState::default(),
+        _ => PersistedState::default(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PERSISTED_SCHEMA_VERSION, PersistedState};
+    use super::{PERSISTED_SCHEMA_VERSION, PersistedState, migrate_persisted_state};
 
     #[test]
     fn persisted_state_contains_only_ui_preferences_and_layout() {
@@ -480,5 +496,24 @@ mod tests {
         ] {
             assert!(value.get(forbidden).is_none());
         }
+    }
+
+    #[test]
+    fn schema_five_migrates_once_to_maker_only_without_overriding_future_choices() {
+        let mut old = PersistedState::default();
+        old.schema_version = 5;
+        old.preferences.trading.post_only = false;
+        let migrated = migrate_persisted_state(old);
+        assert_eq!(migrated.schema_version, PERSISTED_SCHEMA_VERSION);
+        assert!(migrated.preferences.trading.post_only);
+
+        let mut current = migrated;
+        current.preferences.trading.post_only = false;
+        assert!(
+            !migrate_persisted_state(current)
+                .preferences
+                .trading
+                .post_only
+        );
     }
 }

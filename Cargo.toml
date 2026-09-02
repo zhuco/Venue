@@ -3,7 +3,7 @@ members = [
     ".",
     "apps/venue-control",
     "apps/venue-node",
-    "apps/venueflow",
+    "apps/ui/desktop",
     "crates/venue-copy",
     "crates/venue-control-protocol",
     "crates/venue-domain",

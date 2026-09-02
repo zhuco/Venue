@@ -263,8 +263,8 @@ fn position_hotkey_rows() -> [(TradingAction, &'static str, &'static str); 4] {
     [
         (TradingAction::OpenLong, "开多", "Open Long"),
         (TradingAction::CloseLong, "平多", "Close Long"),
-        (TradingAction::CloseShort, "平空", "Close Short"),
         (TradingAction::OpenShort, "开空", "Open Short"),
+        (TradingAction::CloseShort, "平空", "Close Short"),
     ]
 }
 

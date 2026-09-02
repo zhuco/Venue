@@ -1,12 +1,12 @@
 # VENUE Workspace Rules
 
-活动代码由根 `Cargo.toml` 声明的 Rust workspace（根 package、`apps/`、`crates/`）及独立 `apps/venue-web` npm 应用组成；长期说明统一在 `docs/`。当前三目标为 Binance 交易终端、真实跟单、Binance/Gate.io/Bitget 接管；其余三所与 Scalping 暂缓。
+活动代码由根 `Cargo.toml` 声明的 Rust workspace（根 package、`apps/`、`crates/`）及独立 `apps/ui/web` npm 应用组成；两套 UI 统一位于 `apps/ui/`：`desktop` 是 VenueFlow/egui 桌面终端，`web` 是 Next.js/BFF 用户 Web，先读 `apps/ui/README.md` 判定入口。长期说明统一在 `docs/`。当前唯一产品目标是 Binance KOL 跟单 MVP：邀请注册、登录、API Key 绑定与验证、KOL 交易终端、快速跟单和 KOL 落地页。初期全站不超过 5 个启用 KOL、200 个启用跟单账户；Grid、Gate.io、Bitget 及其余交易所迁移与 Scalping 暂缓。
 
 ## 最短读取路径
 
 1. 先读 `CODEMAP.md`，按任务只打开对应入口和直接依赖。
-2. 对冲网格架构、库存恢复重心、共享运行时、部署或实盘接管任务必须完整阅读 `docs/GRID_RUNTIME_REFACTOR.md`。
-3. 开发范围查 `docs/UNIFIED_GATEWAY_WEB_MIGRATION.md`；Web 可提交下单语义，物理执行仍统一由 Node 完成。
+2. 当前开发范围、目标架构和验收统一查 `docs/KOL_COPY_MVP.md`。
+3. 只有维护冻结 Grid/旧 Node、处理其已有仓位或工件时，才完整阅读 `docs/GRID_RUNTIME_REFACTOR.md`；该旧运行时不得成为 KOL MVP 的依赖模板。
 
 ## 目录与旧实现
 
@@ -17,20 +17,21 @@
 ## 实施与实盘
 
 - 只实现当前获准任务，不创建未被当前需求使用的未来模块、公共 SDK、插件系统或多租户控制面。
-- 默认按影响面验证：文档/注释只做静态检查，单模块修改只检查该 package 及直接契约，交易安全修改覆盖受影响的 risk/WAL/Unknown/恢复路径。跨模块公共契约、依赖或架构变更及正式发布前集中执行 `cargo fmt --all --check`、`cargo check --workspace --all-targets`、`cargo test --workspace`、`scripts/verify_repository_hygiene.ps1` 建立基线；基线后的局部增量不重复全工作区测试。记录验证对应的源码范围，相关验证失败时不得宣称完成或删除被替代实现。
-- 实盘 mutation 每个 `(exchange, trading_account_id)` 只允许一个账户级 writer；单机优先使用一个进程锁和一个串行 Execution Lane，多机部署实际出现前不得增加租约选举、分布式 fencing 或可执行文件 handoff 链。先验证，再按交易所逐家 Canary，禁止两个版本同时写同一账户。
-- 策略只输出语义意图；所有 mutation 必须依次经过 risk、同一命令 WAL 和账户级 writer。Owner 只是 WAL 中的 `strategy_id/user_id` 归属字段，不单独建立 authority、journal、root 或 receipt 体系。
-- 初期 Bybit、OKX、Hyperliquid 的 DOGE 账户累计名义仓位硬上限为 10U；已有未撤入场命令或交易所签名读到非零持仓时禁止继续增险。OKX 数量必须以实时 `ctVal × ctMult × contracts` 换算并遵守 `lotSz/minSz`，不得把基础币数量直接当张数。
-- WAL 状态保持最小集合 `Prepared / Submitted / Accepted / Rejected / Unknown`；请求结果不确定时持久化 `Unknown`、冻结该账户新增风险并以签名订单/成交查询收敛，禁止自动重投。撤单和 reduce-only 降险仍可继续。
-- 本地运行工件根固定为 `G:\Venue\artifacts`。追加文件在 5 MiB 轮转，任何单文件不得超过 10 MiB；原始私流默认不落盘，诊断时最多两个 5 MiB 滚动段；整个根默认预算 256 MiB。必须保留未决 WAL、当前 checkpoint、成交游标及 Unknown 关联事实；已对账覆盖的历史段可压缩或删除，原始 wire payload 不得作为永久恢复前提。
+- 默认按影响面验证：文档/注释只做静态检查，单模块修改只检查该 package 及直接契约，交易安全修改覆盖受影响的命令幂等、账户顺序队列、签名查单、数量/权限与超时待对账路径。跨模块公共契约、依赖或架构变更及正式发布前集中执行 `cargo fmt --all --check`、`cargo check --workspace --all-targets`、`cargo test --workspace`、`scripts/verify_repository_hygiene.ps1` 建立基线；基线后的局部增量不重复全工作区测试。记录验证对应的源码范围，相关验证失败时不得宣称完成或删除被替代实现。
+- KOL MVP 只允许一个 `venue-executor-binance` 部署实例管理新链账户；账户在进程内使用独立串行队列和有界全局并发，不为每个账户启动进程、Actor、writer lease 或本地 WAL。PostgreSQL 命令账本、稳定 `clientOrderId` 和超时后的签名查单是唯一新链耐久边界。
+- 新链与冻结旧 Node 必须按 `trading_account_id` 互斥分配；同一真实账户不得同时由两条路径下单。旧账户的未决 WAL、Unknown、仓位和工件未安全收敛前不得迁入新链，也不得为推进 MVP 删除或伪造旧状态。
+- 请求结果不确定时把新链命令置为 `ReconcileRequired`，按同一 `clientOrderId` 查询订单/成交；确认前不重发。该状态只暂停对应账户的后续增险，不建立 authority、root、receipt、manifest 或事件回放体系。
+- KOL 成交复制只按 Binance 认证账户流的真实成交增量触发，并以签名 REST 补查恢复，不按页面点击或 NEW 订单触发；双向持仓必须保留 `positionSide`。平仓在领域层是只减仓意图，发送前按跟随账户同代新鲜签名持仓向下裁剪；Portfolio Margin UM Hedge Mode 的原生订单不得发送 Binance 禁止的 `reduceOnly` 参数。
+- `G:\Venue\artifacts` 仅保留冻结旧运行时的恢复工件；其未决 WAL、checkpoint、成交游标及 Unknown 事实不得删除。KOL MVP 的用户、关系、成交去重、命令和对账状态进入 PostgreSQL，不新增本地恢复 journal。
 
 ## 代码与配置
 
 - 手写源文件最多 2000 个物理行；入口文件只声明、组合和重导出，新增行为超限前按职责拆分。
 - `domain` 不依赖业务模块；交易所原始协议只存在于 `exchange`；策略不得依赖具体交易所、凭证、原生字段或物理订单客户端。
-- 同一策略族跨交易所复用 reducer 和 runtime；交易所差异只进入 adapter、能力证据、execution profile 或 deployment binding。
+- 当前 KOL MVP 不建立通用策略 runtime；交易所原始差异仍只进入 adapter。未来 Grid 应由配置与签名订单/双向持仓事实计算目标订单并收敛，不恢复 Actor/checkpoint 作为新架构前置。
 - 规范交易对使用大写 `BASE/QUOTE` 的 `domain::Symbol`；native symbol 不越过 adapter。
-- 配置必须恰好选择 Binance、Gate.io、Bitget、Bybit、OKX、Hyperliquid 之一，网关运行模式只允许精确 `LIVE`；不得新增测试网、demo、Shadow 或隐式布尔模式。离线 fixture、mock 和集成测试是验证手段，不是运行模式。凭证只来自进程环境或根 `.env`，不得写进 TOML、日志、错误或工件。
+- KOL MVP 只准入 Binance Portfolio Margin UM 的精确 `LIVE`；其余 adapter 代码冻结且不扩大验收范围。不得新增测试网、demo、Shadow 或隐式布尔模式。离线 fixture、mock 和集成测试是验证手段，不是运行模式。
+- 用户 API Key 由 Control 使用现有 AES-256-GCM 边界加密后存 PostgreSQL；只有验证流程和 Binance Executor 可短时解密。明文不得进入浏览器响应、KOL 页面、TOML、日志、错误或工件，也不得由 KOL 查看。API 必须具备读取与 UM 交易权限、关闭提现，并验证 Portfolio Margin 统一账户与双向持仓。
 - 禁止复制规范类型、指标算法、归一化、订单事实或 journal；禁止用 `unsafe`、`unwrap`、`expect`、`panic!` 处理运行时外部输入。
 - 注释只解释边界、不变量、失败语义和非显然原因，不复述代码。
 - Git 只跟踪源码、配置、长期文档、脚本与小型协议 fixture；禁止跟踪 `bak/`、构建/发布目录、工具链、凭证、运行日志、数据库和 `artifacts/`。清理 `artifacts` 必须按上述活跃恢复集与历史归档边界执行，禁止删除未决 WAL、Unknown 关联事实或当前 checkpoint。
@@ -60,5 +61,6 @@
 ## 文档同步
 
 - 目录、模块、package、binary、CLI 或主要功能入口变化时，同一修改更新 `docs/CODEMAP.md`。
-- 本轮网格架构、状态机、参数、验收、迁移顺序或接管流程变化时，同一修改更新 `docs/GRID_RUNTIME_REFACTOR.md`。
+- KOL 产品范围、邀请、账户验证、复制语义、性能门或执行架构变化时，同一修改更新 `docs/KOL_COPY_MVP.md`。
+- 只有冻结 Grid/旧 Node 的兼容边界变化时更新 `docs/GRID_RUNTIME_REFACTOR.md`。
 - 长期文档只保留入口、当前约束、契约与验收；不积累已完成阶段记录、临时计划和事故流水。

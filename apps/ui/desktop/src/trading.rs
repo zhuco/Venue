@@ -204,8 +204,8 @@ impl Default for HotkeyMapping {
         Self {
             open_long: TradingKey::A,
             close_long: TradingKey::S,
-            close_short: TradingKey::D,
-            open_short: TradingKey::F,
+            close_short: TradingKey::F,
+            open_short: TradingKey::D,
             cancel_selected: TradingKey::Q,
             cancel_all: TradingKey::E,
             size_presets: [
@@ -292,7 +292,7 @@ pub struct TradingSettings {
 impl Default for TradingSettings {
     fn default() -> Self {
         Self {
-            post_only: false,
+            post_only: true,
             price_validity_seconds: DEFAULT_PRICE_VALIDITY_SECONDS,
             size_presets: [
                 Decimal::new(25, 0),
@@ -571,8 +571,8 @@ pub fn executable_actions() -> [TradingAction; 11] {
     [
         TradingAction::OpenLong,
         TradingAction::CloseLong,
-        TradingAction::CloseShort,
         TradingAction::OpenShort,
+        TradingAction::CloseShort,
         TradingAction::CancelSelectedOrder,
         TradingAction::CancelAllOrders,
         TradingAction::SelectSizePreset(0),
@@ -987,6 +987,29 @@ mod tests {
         assert_eq!(
             mapping.key_for(TradingAction::CloseLong),
             Some(TradingKey::Z)
+        );
+    }
+
+    #[test]
+    fn default_position_hotkeys_follow_long_then_short_order() {
+        let settings = TradingSettings::default();
+        assert!(settings.post_only);
+        assert!(settings.hotkeys_enabled);
+        assert_eq!(
+            settings.hotkeys.action_for(TradingKey::A),
+            Some(TradingAction::OpenLong)
+        );
+        assert_eq!(
+            settings.hotkeys.action_for(TradingKey::S),
+            Some(TradingAction::CloseLong)
+        );
+        assert_eq!(
+            settings.hotkeys.action_for(TradingKey::D),
+            Some(TradingAction::OpenShort)
+        );
+        assert_eq!(
+            settings.hotkeys.action_for(TradingKey::F),
+            Some(TradingAction::CloseShort)
         );
     }
 

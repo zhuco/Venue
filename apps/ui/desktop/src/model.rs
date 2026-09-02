@@ -19,7 +19,9 @@ use crate::i18n::{Language, TextKey, text};
 const MAX_NOTICES: usize = 8;
 const MAX_RECEIPT_IDS: usize = 256;
 const MAX_COMMANDS: usize = 32;
-pub const DEFAULT_FAVORITE_SYMBOLS: [&str; 4] = ["BTC/USDC", "ETH/USDC", "SOL/USDC", "BNB/USDC"];
+pub const DEFAULT_SELECTED_SYMBOL: &str = "BTC/USDC";
+#[cfg(not(target_arch = "wasm32"))]
+pub const PREFERRED_SYMBOL_ORDER: [&str; 4] = ["BTC/USDC", "ETH/USDC", "SOL/USDC", "BNB/USDC"];
 
 /// Public market providers are selected at the UI boundary. Binance is the only provider
 /// currently wired to the native market worker; adding another value requires a real adapter.
@@ -111,14 +113,14 @@ impl Default for Preferences {
         Self {
             endpoint: String::new(),
             market_server: MarketServer::Binance,
-            selected_symbol: "BTC/USDC".to_owned(),
+            selected_symbol: DEFAULT_SELECTED_SYMBOL.to_owned(),
             execution_account_id: None,
             selected_instance: None,
             selected_copy_relation: None,
             ui_scale: 1.0,
             show_status_bar: true,
             language: default_language(),
-            favorite_symbols: DEFAULT_FAVORITE_SYMBOLS.map(str::to_owned).to_vec(),
+            favorite_symbols: vec![DEFAULT_SELECTED_SYMBOL.to_owned()],
             chart: crate::chart_settings::ChartDisplaySettings::default(),
             chart_overrides: BTreeMap::new(),
             trading: crate::trading::TradingSettings::default(),
@@ -365,6 +367,16 @@ impl AppModel {
         // Persisted UI selection is not a restored authenticated session.
         preferences.execution_account_id = None;
         preferences.selected_instance = None;
+        let mut symbol_tabs = Vec::new();
+        for symbol in preferences.favorite_symbols.drain(..) {
+            if !symbol.trim().is_empty() && !symbol_tabs.contains(&symbol) {
+                symbol_tabs.push(symbol);
+            }
+        }
+        if !symbol_tabs.contains(&preferences.selected_symbol) {
+            symbol_tabs.push(preferences.selected_symbol.clone());
+        }
+        preferences.favorite_symbols = symbol_tabs;
         preferences.trading.normalize_price_validity();
         preferences
             .chart_overrides
@@ -636,6 +648,13 @@ impl AppModel {
 
     #[must_use]
     pub fn selected_trading_strategy(&self) -> Option<StrategySummary> {
+        if !self
+            .preferences
+            .favorite_symbols
+            .contains(&self.preferences.selected_symbol)
+        {
+            return None;
+        }
         let account_id = self.preferences.execution_account_id.as_deref()?;
         let overview = self.account_overview.as_ref()?;
         let selected = overview.selected_credential_id.as_deref()?;
@@ -662,12 +681,40 @@ impl AppModel {
     }
 
     pub fn select_symbol(&mut self, symbol: String) {
+        if !self.preferences.favorite_symbols.contains(&symbol) {
+            self.preferences.favorite_symbols.push(symbol.clone());
+        }
         if self.preferences.selected_symbol != symbol {
             self.preferences.selected_symbol = symbol;
             self.trade_dock.clear_selection();
             self.pending_confirmation = None;
             self.synchronize_trading_scope();
         }
+    }
+
+    pub fn close_symbol_tab(&mut self, symbol: &str) -> bool {
+        let Some(index) = self
+            .preferences
+            .favorite_symbols
+            .iter()
+            .position(|item| item == symbol)
+        else {
+            return false;
+        };
+        self.preferences.favorite_symbols.remove(index);
+        if self.preferences.selected_symbol == symbol {
+            if self.preferences.favorite_symbols.is_empty() {
+                self.trade_dock.clear_selection();
+                self.pending_confirmation = None;
+                self.synchronize_trading_scope();
+            } else {
+                let next = self.preferences.favorite_symbols
+                    [index.min(self.preferences.favorite_symbols.len() - 1)]
+                .clone();
+                self.select_symbol(next);
+            }
+        }
+        true
     }
 
     pub fn synchronize_trading_scope(&mut self) {
@@ -768,10 +815,10 @@ impl AppModel {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn preferred_symbol_rank(symbol: &str) -> usize {
-    DEFAULT_FAVORITE_SYMBOLS
+    PREFERRED_SYMBOL_ORDER
         .iter()
         .position(|preferred| *preferred == symbol)
-        .unwrap_or(DEFAULT_FAVORITE_SYMBOLS.len())
+        .unwrap_or(PREFERRED_SYMBOL_ORDER.len())
 }
 
 pub const fn requires_operator_confirmation(action: ControlAction) -> bool {
@@ -813,18 +860,29 @@ mod tests {
     };
 
     use super::{
-        AppModel, DEFAULT_FAVORITE_SYMBOLS, PendingConfirmation, Preferences, freshness_age_ms,
+        AppModel, DEFAULT_SELECTED_SYMBOL, PendingConfirmation, Preferences, freshness_age_ms,
         requires_operator_confirmation,
     };
 
     #[test]
-    fn defaults_select_and_pin_the_four_usdc_markets() {
+    fn defaults_open_only_the_selected_market_tab() {
         let preferences = Preferences::default();
-        assert_eq!(preferences.selected_symbol, "BTC/USDC");
+        assert_eq!(preferences.selected_symbol, DEFAULT_SELECTED_SYMBOL);
         assert_eq!(
             preferences.favorite_symbols,
-            DEFAULT_FAVORITE_SYMBOLS.map(str::to_owned)
+            vec![DEFAULT_SELECTED_SYMBOL.to_owned()]
         );
+    }
+
+    #[test]
+    fn symbol_tabs_can_close_and_keep_a_valid_active_market() {
+        let mut model = AppModel::new(Preferences::default());
+        model.select_symbol("ETH/USDC".to_owned());
+        assert!(model.close_symbol_tab("ETH/USDC"));
+        assert_eq!(model.preferences.selected_symbol, "BTC/USDC");
+        assert_eq!(model.preferences.favorite_symbols, vec!["BTC/USDC"]);
+        assert!(model.close_symbol_tab("BTC/USDC"));
+        assert!(model.preferences.favorite_symbols.is_empty());
     }
 
     #[test]
@@ -1045,7 +1103,7 @@ mod tests {
         );
         assert_eq!(
             &model.local_symbols[..4],
-            &DEFAULT_FAVORITE_SYMBOLS.map(str::to_owned)
+            &["BTC/USDC", "ETH/USDC", "SOL/USDC", "BNB/USDC"].map(str::to_owned)
         );
         assert_eq!(model.local_symbols[4], "XRP/USDT");
     }

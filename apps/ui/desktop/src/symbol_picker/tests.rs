@@ -77,6 +77,9 @@ fn blank_columns_select_the_entire_row_and_star_only_changes_favorite() -> Resul
     for target in ["blank", "symbol", "star"] {
         let context = egui::Context::default();
         let mut model = AppModel::new(Preferences::default());
+        model.preferences.favorite_symbols = ["BTC/USDC", "ETH/USDC", "SOL/USDC", "BNB/USDC"]
+            .map(str::to_owned)
+            .to_vec();
         let selected_price = rust_decimal::Decimal::from(100);
         model.select_trading_price("BTC/USDC", selected_price, &context);
         let mut workspaces = Workspaces::default();

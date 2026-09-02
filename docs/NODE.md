@@ -1,9 +1,10 @@
-# Venue Node：六个固定账户节点
+# Venue Node：冻结的六所账户节点
 
-版本与范围见 [项目 README](../README.md)；本页对应 `src/lib.rs` 和 `src/runtime_config.rs` 的实际 CLI，
-替代旧 Stage 7 透传教程。六所 binary 各自只链接一个 adapter，所有交易都经过统一账户链。
+本页只描述仓库中已经提交的旧 `venue-node-*` CLI 和恢复边界，供维护既有账户与工件使用。当前产品目标见
+[Binance KOL 跟单 MVP](KOL_COPY_MVP.md)：新用户、KOL 终端和跟单统一进入计划中的单个多账户 Binance Executor，
+不得继续扩展这里的每账户 Node、Actor、Checkpoint、handoff 或本地 WAL。
 
-当前旧三所按 Binance、Gate.io、Bitget 接管；终端和真实跟单先完善 Binance。后续三所与 Scalping 暂缓，本页保留的配置字段不是启用指令。
+所有旧 Node、Grid、Scalping 及六所接管均冻结；本页保留的构建、启动和配置字段不是新部署或启用指令。任何旧账户未完成签名收敛前不得加入新 Executor，新旧实现也不得同时写同一账户。
 
 ## 构建
 
@@ -74,4 +75,4 @@ WAL 分段 5 MiB、单文件 10 MiB，根预算 256 MiB；未决状态和当前 
 
 六所公共盘口/成交已接入，Bitget/Hyperliquid 权威闭合 bar 尚缺；Scalping 自动入场保护仍未闭合。
 Copy、手动交易与 Grid 已有桥接代码；终端必须绑定 `manual` actor，不能借用会自动运行的 Grid/Scalping 或拒绝通用手动 turn 的 Copy。完整生产验收和旧服务器接管不能由编译/单测推断。
-后续工作见 [迁移契约](UNIFIED_GATEWAY_WEB_MIGRATION.md)，停用方法见 [清单](ARCHITECTURE.md#deprecated)。
+当前开发顺序见 [KOL MVP 契约](KOL_COPY_MVP.md)，旧实现边界见 [运行时兼容说明](GRID_RUNTIME_REFACTOR.md)，停用方法见 [清单](ARCHITECTURE.md#deprecated)。

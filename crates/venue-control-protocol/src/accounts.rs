@@ -13,6 +13,8 @@ pub const VERIFY_PATH: &str = "/v2/account/credentials/verify";
 pub const DELETE_PATH: &str = "/v2/account/credentials/delete";
 pub const SELECT_PATH: &str = "/v2/account/select";
 pub const MIN_PASSWORD_CHARS: usize = 8;
+pub const MIN_INVITE_CODE_CHARS: usize = 24;
+pub const MAX_INVITE_CODE_CHARS: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct SecretValue(SecretString);
@@ -58,6 +60,48 @@ impl LoginRequest {
     pub fn valid_password(&self) -> bool {
         (MIN_PASSWORD_CHARS..=128).contains(&self.password.expose().chars().count())
             && self.password.expose().len() <= 512
+    }
+}
+
+/// Registration input for the KOL MVP. The invite is resolved again inside the same database
+/// transaction that creates the user and immutable KOL binding.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterRequest {
+    pub username: String,
+    pub password: SecretValue,
+    pub invite_code: String,
+}
+
+impl RegisterRequest {
+    pub fn normalized_username(&self) -> Option<String> {
+        let name = self.username.trim();
+        (name.len() >= 3
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-@".contains(&byte)))
+        .then(|| name.to_ascii_lowercase())
+    }
+
+    pub fn valid_password(&self) -> bool {
+        (MIN_PASSWORD_CHARS..=128).contains(&self.password.expose().chars().count())
+            && self.password.expose().len() <= 512
+    }
+
+    pub fn normalized_invite_code(&self) -> Option<String> {
+        let code = self.invite_code.trim();
+        ((MIN_INVITE_CODE_CHARS..=MAX_INVITE_CODE_CHARS).contains(&code.len())
+            && code
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+        .then(|| code.to_owned())
+    }
+
+    pub fn valid(&self) -> bool {
+        self.normalized_username().is_some()
+            && self.valid_password()
+            && self.normalized_invite_code().is_some()
     }
 }
 
@@ -207,5 +251,26 @@ mod tests {
             r#"{"username":"alice","password":"secret","admin":true}"#,
         );
         assert!(decoded.is_err());
+    }
+
+    #[test]
+    fn registration_requires_a_bounded_url_safe_invite() {
+        let request = RegisterRequest {
+            username: "Alice".into(),
+            password: SecretValue::new("a safe long passphrase".into()),
+            invite_code: "Abcdefghijklmnop_1234567".into(),
+        };
+        assert!(request.valid());
+        assert_eq!(
+            request.normalized_invite_code().as_deref(),
+            Some("Abcdefghijklmnop_1234567")
+        );
+        let unknown = serde_json::from_str::<RegisterRequest>(
+            r#"{"username":"alice","password":"a safe passphrase","invite_code":"Abcdefghijklmnop_1234567","kol_id":"forged"}"#,
+        );
+        assert!(unknown.is_err());
+        let mut invalid = request;
+        invalid.invite_code = "contains/slash-and-is-not-valid".into();
+        assert!(!invalid.valid());
     }
 }

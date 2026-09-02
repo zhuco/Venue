@@ -130,16 +130,13 @@ pub fn show_top_bar(
                                 }
                             }
                             ui.separator();
-                            let selected_symbol = model.preferences.selected_symbol.clone();
                             egui::ScrollArea::horizontal()
                                 .id_salt("favorite-symbol-tabs")
                                 .auto_shrink([false, true])
                                 .show(ui, |ui| {
                                     ui.horizontal_centered(|ui| {
-                                        let mut tabs = model.preferences.favorite_symbols.clone();
-                                        if !tabs.contains(&selected_symbol) {
-                                            tabs.push(selected_symbol.clone());
-                                        }
+                                        let tabs = model.preferences.favorite_symbols.clone();
+                                        let mut close_requested = None;
                                         for symbol in tabs {
                                             let quote = local_quote(model, &symbol);
                                             let details = quote.map_or_else(
@@ -162,19 +159,35 @@ pub fn show_top_bar(
                                                         quote.change_percent_24h,
                                                     ))
                                                 });
-                                            let response = ui.add_sized(
-                                                [150.0, 44.0],
-                                                egui::Button::new(symbol_tab_text(
-                                                    &symbol,
-                                                    &details,
-                                                    detail_color,
-                                                ))
-                                                .fill(if selected {
-                                                    theme::PANEL
-                                                } else {
-                                                    theme::BG_SECONDARY
-                                                }),
-                                            );
+                                            let response = ui
+                                                .horizontal(|ui| {
+                                                    let tab = ui.add_sized(
+                                                        [126.0, 44.0],
+                                                        egui::Button::new(symbol_tab_text(
+                                                            &symbol,
+                                                            &details,
+                                                            detail_color,
+                                                        ))
+                                                        .fill(if selected {
+                                                            theme::PANEL
+                                                        } else {
+                                                            theme::BG_SECONDARY
+                                                        }),
+                                                    );
+                                                    let close = ui
+                                                        .add(egui::Button::new("×").frame(false))
+                                                        .on_hover_text(match language {
+                                                            Language::SimplifiedChinese => {
+                                                                "关闭交易对"
+                                                            }
+                                                            Language::English => "Close market",
+                                                        });
+                                                    if close.clicked() {
+                                                        close_requested = Some(symbol.clone());
+                                                    }
+                                                    tab
+                                                })
+                                                .inner;
                                             if selected {
                                                 ui.painter().line_segment(
                                                     [
@@ -185,8 +198,16 @@ pub fn show_top_bar(
                                                 );
                                             }
                                             if response.clicked() {
-                                                model.select_symbol(symbol);
+                                                model.select_symbol(symbol.clone());
                                                 workspaces.follow_dynamic_charts_latest();
+                                            }
+                                        }
+                                        if let Some(symbol) = close_requested
+                                            && model.close_symbol_tab(&symbol)
+                                        {
+                                            workspaces.follow_dynamic_charts_latest();
+                                            if model.preferences.favorite_symbols.is_empty() {
+                                                picker_requested.set(true);
                                             }
                                         }
                                         if ui
