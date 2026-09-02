@@ -10,17 +10,12 @@ pub(super) fn dispatch_catalog_permit(
     if gateway.refresh_private().is_err() {
         return rejected("binance_preflight_failed");
     }
-    let Some(rules) = gateway
-        .rules_by_symbol
-        .get(&permit.command().mutation_owner().symbol)
-        .cloned()
-    else {
+    let command_symbol = &permit.command().mutation_owner().symbol;
+    let Some(rules) = gateway.rules_by_symbol.get(command_symbol).cloned() else {
         return rejected("binance_unconfigured_symbol");
     };
-    let binding = match binding_for_symbol(
-        gateway.config.gateway_binding(),
-        permit.command().mutation_owner().symbol.clone(),
-    ) {
+    let binding = match binding_for_symbol(gateway.config.gateway_binding(), command_symbol.clone())
+    {
         Ok(value) => value,
         Err(_) => return rejected("binance_symbol_binding"),
     };
@@ -46,20 +41,25 @@ pub(super) fn dispatch_catalog_permit(
     {
         return rejected("binance_clock");
     }
-    let attempt = match gateway.take_attempt_id() {
-        Ok(value) => value,
-        Err(_) => return rejected("binance_attempt"),
-    };
-    let private = match gateway.runtime.block_on(fetch_private(
-        &transport,
-        &gateway.credentials,
-        &config,
-        &rules,
-        gateway.private_generation,
-        attempt,
-    )) {
-        Ok(value) => value,
-        Err(_) => return rejected("binance_symbol_preflight"),
+    let private = if uses_refreshed_anchor_private(gateway.config.gateway_binding(), command_symbol)
+    {
+        gateway.private.clone()
+    } else {
+        let attempt = match gateway.take_attempt_id() {
+            Ok(value) => value,
+            Err(_) => return rejected("binance_attempt"),
+        };
+        match gateway.runtime.block_on(fetch_private(
+            &transport,
+            &gateway.credentials,
+            &config,
+            &rules,
+            gateway.private_generation,
+            attempt,
+        )) {
+            Ok(value) => value,
+            Err(_) => return rejected("binance_symbol_preflight"),
+        }
     };
     let prepared = match prepare_execution_command(&rules, &private, permit.command()) {
         Ok(value) => value,
@@ -92,4 +92,11 @@ pub(super) fn dispatch_catalog_permit(
         | BinancePhysicalMutationOutcome::AckedReadbackUnknown { .. }
         | BinancePhysicalMutationOutcome::DispatchUnknown { .. } => AccountGatewayResult::Unknown,
     }
+}
+
+pub(super) fn uses_refreshed_anchor_private(
+    account_binding: &GatewayBinding,
+    command_symbol: &Symbol,
+) -> bool {
+    &account_binding.symbol == command_symbol
 }

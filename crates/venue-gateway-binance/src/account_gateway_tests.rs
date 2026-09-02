@@ -1,6 +1,7 @@
 use bytes::Bytes;
 
 use super::account_gateway_limit::normalize_priced_limit;
+use super::account_gateway_symbol_dispatch::uses_refreshed_anchor_private;
 use super::*;
 use crate::BinanceRawPrivateFrame;
 
@@ -9,6 +10,18 @@ const MIXED_EXCHANGE_INFO: &str = include_str!("../tests/fixtures/exchange_info_
 const USDT_ASSET_INDEX: &str = include_str!("../tests/fixtures/asset-index-usdt.json");
 const USDC_ASSET_INDEX: &str = include_str!("../tests/fixtures/asset-index-usdc.json");
 const LIMIT_BOOK: &[u8] = include_bytes!("../tests/fixtures/limit-book-ticker.json");
+
+#[test]
+fn dispatch_reuses_only_the_fresh_anchor_private_candidate()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_, _, binding) = limit_fixture()?;
+    assert!(uses_refreshed_anchor_private(&binding, &binding.symbol));
+    assert!(!uses_refreshed_anchor_private(
+        &binding,
+        &"ETH/USDC".parse()?
+    ));
+    Ok(())
+}
 
 #[test]
 fn signed_snapshot_balance_accepts_the_portfolio_account_shape()
