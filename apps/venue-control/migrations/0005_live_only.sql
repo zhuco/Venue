@@ -36,7 +36,7 @@ BEGIN
         OR EXISTS (SELECT 1 FROM venue_account_deliveries
                    WHERE source_kind NOT IN ('control_command', 'copy_semantic_job'))
         OR EXISTS (SELECT 1 FROM venue_account_delivery_claims
-                   WHERE claim_json ->> 'schema_version' IS DISTINCT FROM '2')
+                   WHERE claim_json #>> '{lease,schema_version}' IS DISTINCT FROM '2')
         OR EXISTS (SELECT 1 FROM venue_account_delivery_acks
                    WHERE ack_json ->> 'schema_version' IS DISTINCT FROM '2')
         OR EXISTS (SELECT 1 FROM venue_account_delivery_receipts

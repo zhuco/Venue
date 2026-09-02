@@ -100,7 +100,7 @@ async fn live_only_migration_rejects_legacy_delivery_schema_without_rewriting_it
            (delivery_id, lease_epoch, node_id, purpose, leased_at_ms, expires_at_ms, claim_json)
            VALUES
            ('legacy-schema', 1, 'legacy-node', 'install', 1, 2,
-            '{"schema_version":1}'::jsonb);"#,
+            '{"lease":{"schema_version":1},"payload":{}}'::jsonb);"#,
     )
     .execute(&fixture.pool)
     .await?;
@@ -115,7 +115,52 @@ async fn live_only_migration_rejects_legacy_delivery_schema_without_rewriting_it
         scalar_i64(
             &fixture.pool,
             "SELECT count(*) FROM venue_account_delivery_claims \
-             WHERE claim_json ->> 'schema_version' = '1'"
+             WHERE claim_json #>> '{lease,schema_version}' = '1'"
+        )
+        .await?,
+        1
+    );
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_only_migration_accepts_current_nested_delivery_claim_schema()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = integration_database_url() else {
+        println!(
+            "SKIP: VENUE_CONTROL_TEST_DATABASE_URL is not set; nested delivery schema migration test was not run"
+        );
+        return Ok(());
+    };
+    let fixture = PgFixture::create(&database_url, "current_delivery_schema").await?;
+    sqlx::raw_sql(MIGRATION_0001).execute(&fixture.pool).await?;
+    sqlx::raw_sql(MIGRATION_0002).execute(&fixture.pool).await?;
+    sqlx::raw_sql(MIGRATION_0003).execute(&fixture.pool).await?;
+    sqlx::raw_sql(MIGRATION_0004).execute(&fixture.pool).await?;
+    sqlx::raw_sql(
+        r#"INSERT INTO venue_account_deliveries
+           (delivery_id, source_kind, source_id, venue, mode, trading_account_id, symbol,
+            instance_id, config_epoch, payload_json, created_at_ms, updated_at_ms)
+           VALUES
+           ('current-schema', 'control_command', 'current-command', 'binance', 'LIVE',
+            '00000000-0000-4000-8000-000000000001', 'BTC/USDT', 'grid-btc', 1,
+            '{}'::jsonb, 1, 1);
+           INSERT INTO venue_account_delivery_claims
+           (delivery_id, lease_epoch, node_id, purpose, leased_at_ms, expires_at_ms, claim_json)
+           VALUES
+           ('current-schema', 1, 'current-node', 'install', 1, 2,
+            '{"lease":{"schema_version":2},"payload":{}}'::jsonb);"#,
+    )
+    .execute(&fixture.pool)
+    .await?;
+
+    sqlx::raw_sql(MIGRATION_0005).execute(&fixture.pool).await?;
+    assert_eq!(
+        scalar_i64(
+            &fixture.pool,
+            "SELECT count(*) FROM venue_account_delivery_claims \
+             WHERE claim_json #>> '{lease,schema_version}' = '2'"
         )
         .await?,
         1
