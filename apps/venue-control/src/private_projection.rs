@@ -256,21 +256,34 @@ impl BinancePrivateProjectionStore {
         let rows = sqlx::query("SELECT observed_ms,position_json FROM venue_binance_position_history WHERE trading_account_id=$1 AND owner_user_id=$2 ORDER BY observed_ms DESC,symbol,position_side LIMIT 500")
             .bind(&source.trading_account_id).bind(&source.owner_user_id).fetch_all(&self.pool).await
             .map_err(|_| PrivateProjectionError::Unavailable)?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(TerminalPositionHistoryEntry {
-                    observed_ms: unsigned(
-                        row.try_get("observed_ms")
-                            .map_err(|_| PrivateProjectionError::Unavailable)?,
-                    )?,
-                    position: serde_json::from_value(
-                        row.try_get("position_json")
-                            .map_err(|_| PrivateProjectionError::Unavailable)?,
-                    )
-                    .map_err(|_| PrivateProjectionError::Unavailable)?,
-                })
-            })
-            .collect()
+        let mut latest_inventory = BTreeMap::new();
+        let mut history = Vec::new();
+        for row in rows {
+            let entry = TerminalPositionHistoryEntry {
+                observed_ms: unsigned(
+                    row.try_get("observed_ms")
+                        .map_err(|_| PrivateProjectionError::Unavailable)?,
+                )?,
+                position: serde_json::from_value(
+                    row.try_get("position_json")
+                        .map_err(|_| PrivateProjectionError::Unavailable)?,
+                )
+                .map_err(|_| PrivateProjectionError::Unavailable)?,
+            };
+            let key = (
+                entry.position.symbol.to_string(),
+                entry.position.position_side,
+            );
+            if latest_inventory
+                .get(&key)
+                .is_some_and(|position| same_position_inventory(position, &entry.position))
+            {
+                continue;
+            }
+            latest_inventory.insert(key, entry.position.clone());
+            history.push(entry);
+        }
+        Ok(history)
     }
 }
 
@@ -410,11 +423,21 @@ async fn persist_position_changes(
         }
     }
     for (key, position) in &new {
-        if old.get(key) != Some(position) {
+        if old
+            .get(key)
+            .is_none_or(|prior| !same_position_inventory(prior, position))
+        {
             insert_position_history(tx, source, current.observed_ms, position).await?;
         }
     }
     Ok(())
+}
+
+fn same_position_inventory(left: &TerminalPosition, right: &TerminalPosition) -> bool {
+    left.symbol == right.symbol
+        && left.position_side == right.position_side
+        && left.quantity == right.quantity
+        && left.entry_price == right.entry_price
 }
 
 async fn insert_position_history(

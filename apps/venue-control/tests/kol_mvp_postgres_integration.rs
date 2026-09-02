@@ -688,6 +688,7 @@ async fn private_projection_is_subscribed_persisted_and_owner_scoped()
         1,
         "fills-1",
         Decimal::new(2, 3),
+        Decimal::new(50_100, 0),
         true,
     )?;
     store.persist(&source, &snapshot, 111).await?;
@@ -698,14 +699,26 @@ async fn private_projection_is_subscribed_persisted_and_owner_scoped()
         2,
         "fills-2",
         Decimal::new(3, 3),
+        Decimal::new(50_100, 0),
         false,
     )?;
     store.persist(&source, &snapshot, 121).await?;
+    let snapshot = projection_snapshot(
+        source.trading_account_id.clone(),
+        "BTC/USDT".parse()?,
+        130,
+        3,
+        "fills-3",
+        Decimal::new(3, 3),
+        Decimal::new(50_200, 0),
+        false,
+    )?;
+    store.persist(&source, &snapshot, 131).await?;
     let owned = store
         .load_owned(&user, &credential)
         .await?
         .ok_or("missing projection")?;
-    assert_eq!(owned.private_generation, 2);
+    assert_eq!(owned.private_generation, 3);
     assert_eq!(owned.fills.len(), 1);
     assert_eq!(owned.position_history.len(), 2);
     assert!(store.load_owned(&other, &credential).await?.is_none());
@@ -720,6 +733,7 @@ fn projection_snapshot(
     private_generation: u64,
     cursor: &str,
     quantity: Decimal,
+    mark_price: Decimal,
     include_fill: bool,
 ) -> Result<SignedAccountSnapshot, Box<dyn std::error::Error>> {
     let binding =
@@ -755,7 +769,7 @@ fn projection_snapshot(
             position_side: PositionSide::Long,
             quantity,
             entry_price: Some(Decimal::new(50_000, 0)),
-            mark_price: Some(Decimal::new(50_100, 0)),
+            mark_price: Some(mark_price),
         }],
         fills,
         cursor.to_owned(),
@@ -819,6 +833,7 @@ async fn terminal_post_only_command_is_idempotent_owner_scoped_and_durable()
                 1,
                 "terminal-cursor",
                 Decimal::new(5, 3),
+                Decimal::new(50_100, 0),
                 false,
             )?,
             now + 3,
