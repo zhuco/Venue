@@ -1,13 +1,13 @@
 # 开发、验证与合并
 
-本指南只说明当前工作方式，不自动启动 [三目标验收](UNIFIED_GATEWAY_WEB_MIGRATION.md#goal-acceptance) 中的任务。
-先读 [CODEMAP](CODEMAP.md) 定位；涉及账户运行时、网格或部署时完整读 [运行时契约](GRID_RUNTIME_REFACTOR.md)。
+本指南只说明当前工作方式，不自动启动 [Binance KOL 跟单 MVP](KOL_COPY_MVP.md) 中的任务。
+先读 [CODEMAP](CODEMAP.md) 定位；当前产品范围和阶段门统一读 [KOL MVP 契约](KOL_COPY_MVP.md)。只有维护冻结旧 Node、Grid 或其运行工件时，才完整读 [旧运行时契约](GRID_RUNTIME_REFACTOR.md)。
 业务边界见 [ARCHITECTURE](ARCHITECTURE.md)，旧方法状态见 [停用入口](ARCHITECTURE.md#deprecated)。
 
 ## 1. 工作区与环境
 
 主工作区 `G:\Venue`，隔离工作树用于开发；只修改当前获准范围，不顺手清理他人的改动。
-长期文档集中在 `docs/`，源码按 `apps/`、`crates/`、根兼容 `src/` 分工；`bak/` 已退出项目维护范围，用户已授权删除且不备份。秘密只通过规定的环境/根 `.env` 注入，日志中不输出值。
+长期文档集中在 `docs/`，源码按 `apps/`、`crates/`、根兼容 `src/` 分工；`bak/` 已退出项目维护范围，用户已授权删除且不备份。部署主密钥、数据库地址和旧 Node 凭证只从规定环境/根 `.env` 注入；用户 Binance API Key/Secret 由 Control 加密后存 PostgreSQL，任何明文都不写日志、配置或工件。
 
 Rust/Cargo 1.98.0，Web 默认 Node.js 24 + npm lockfile。数据库为 PostgreSQL + SQLx，
 集成测试使用独立测试数据库/随机 schema；不要把主线 `.env` 的生产连接直接当作测试库。
@@ -19,7 +19,7 @@ Rust/Cargo 1.98.0，Web 默认 Node.js 24 + npm lockfile。数据库为 PostgreS
 |---|---|
 | 文档/注释/产品预览版本 | 引用路径、命令与 manifest 一致性、`git diff --check`、仓库卫生 |
 | 单一 Rust 模块 | 受影响 package 和直接契约；不重复全 workspace |
-| 交易安全 | 对应 risk/WAL/Unknown/恢复/adapter 故障路径 |
+| 交易安全 | 新链覆盖命令幂等、账户串行、`ReconcileRequired` 与 adapter 故障路径；冻结旧链维护另覆盖 risk/WAL/Unknown/恢复 |
 | Web/UI | 对应 typecheck/单测/构建与交互；布局变更再截图 |
 | 公共契约、依赖、架构代码或正式发布 | 集中建立 fmt/check/test workspace 基线及所需专项；后续局部增量不重跑无关测试 |
 
@@ -42,14 +42,14 @@ Windows 所有 Cargo 命令都经过 guard。下面是需要全量基线时的�
 
 ## 4. 本地应用
 
-- [Node README](NODE.md) 说明真实 CLI、runtime JSON 和旧三家前驱记录要求。
+- [Node README](NODE.md) 只说明冻结旧 CLI、runtime JSON 和旧三家前驱记录要求。
 - [账户管理](ACCOUNT_MANAGEMENT.md) 说明 Control/桌面启动环境；运行前先受控 build，
   再从 guard 选择的固定缓存启动已构建 binary，不用长期 `cargo run` 占用构建槽。
 - [Web README](WEB.md) 说明 BFF 会话、同源 HTTPS、npm 验证与五视口测试。
-- 所有真实交易须重新满足单 writer、风险、WAL、签名事实和获准任务范围；文档更新不触发实盘测试。
+- 新 KOL 链真实交易须满足唯一 `venue-executor-binance`、账户内串行、PostgreSQL 命令账本、签名回读和获准风险范围；冻结旧 Node 维护仍遵守原 writer/WAL 契约。文档更新不触发实盘测试。
 
 UI 完成标准包括移动/桌面布局截图、空/错误/离线状态、作用域与确认交互、网关联通和分段延迟。
-本地 fixture/BFF 性能报告不能代替 Node→交易所的实际延迟；未完成项目保持待验收。
+本地 fixture/BFF 性能报告不能代替 Executor→Binance 的实际延迟；冻结旧 Node 的历史结果也不能代替新链验收。
 
 ## 5. 旧代码与技术选型
 
@@ -115,7 +115,7 @@ UI 完成标准包括移动/桌面布局截图、空/错误/离线状态、作�
 - 全局和项目 AGENTS.md 提供会话规则；旧会话开始下一次构建前需重新读取，必要时重启会话。这不是强制安全沙箱。
 - GitHub托管CI继续使用既有 RUNNER_TEMP 内的 job-owned target，不使用本机F/G盘阈值；保留同目录锁、两项并发和环境恢复，CI空闲下限2 GiB。
 
-### 本地 Ubuntu Node 与 Control 编译（默认发布入口）
+### 现有 Ubuntu Node 与 Control 编译（冻结入口）
 
 `45.77.253.180` 只接收本机编译好的产物并执行运行核验，不承担日常 Cargo 编译。Windows 本机使用既有
 Rust/Cargo 1.98.0、cargo-zigbuild 0.23.0、Zig 0.16.0 和 `x86_64-unknown-linux-gnu` 标准库，不依赖 WSL/Docker。
@@ -128,14 +128,14 @@ Rust/Cargo 1.98.0、cargo-zigbuild 0.23.0、Zig 0.16.0 和 `x86_64-unknown-linux
 # 预检后去掉 -CheckOnly 编译六所；脚本不自动上传或启动服务。
 ./scripts/test_venue_ubuntu_build.ps1
 
-# Control/Copy 使用同一入口、slot-2 与目标；产物仅为两个当前业务 binary。
+# 这是当前已提交的 Control/Copy 构建入口，不是 KOL MVP 发布入口。
 ./scripts/Build-VenueUbuntu.ps1 -SourceRoot G:\Build\Venue\ubuntu\source -ExpectedRevision <完整40位commit> -ReleaseId <版本号> -Component Control -CheckOnly
 ```
 
-- 专用根为 `G:\Build\Venue\ubuntu`：`source` 可存固定 revision 的独立 checkout；默认 Nodes release 仅含六个 Node binary，Control release 仅含 `venue-control-server`、`venue-copy-worker`，两者均另含 SHA256SUMS 与 manifest。工具缓存为 `zig-cache/zig-local-cache/zigbuild-cache`。源码只用干净 Git clone/bundle，不复制 `.env`、账户工件或未提交文件；已有 checkout 不自动 reset。
+- 专用根为 `G:\Build\Venue\ubuntu`：`source` 可存固定 revision 的独立 checkout；当前脚本的 Nodes release 仅含六个冻结 Node binary，Control release 仅含 `venue-control-server`、`venue-copy-worker`，两者均另含 SHA256SUMS 与 manifest。P3 必须把 `venue-executor-binance` 纳入受控构建并从 MVP 发布清单移除旧 Copy 入口后才能发布。工具缓存为 `zig-cache/zig-local-cache/zigbuild-cache`。源码只用干净 Git clone/bundle，不复制 `.env`、账户工件或未提交文件；已有 checkout 不自动 reset。
 - Cargo 仍使用既有 `slot-2` 锁和两个全局并发许可，其自动目标子目录 `slot-2/x86_64-unknown-linux-gnu/release` 不是另设 target root。六所按顺序、每次两个 Cargo jobs；全部目录计入 150 GiB 总预算。不清理 Windows 缓存，不安装工具、不改全局配置。
 - `-CheckOnly` 不新建输出、锁或缓存；正式构建前后均校验 HEAD 和干净状态，manifest 另记录构建入口/辅助/guard 脚本哈希，运行期间脚本变动则拒绝发布。源码 checkout 必须由构建独占，其他任务不得在构建期间同步或编辑；前后 Git 检查不是文件系统只读沙箱。输出要求 ELF64/x86-64，拒绝误复制 Windows exe；目录原子转为新 release，已有 release 不覆盖。失败保留缓存和本次 `.stage.*` 目录，不把不完整目录当发布包。
-- 入口持锁覆盖构建、ELF/哈希核验和复制，finally 还原 Cargo/Zig 环境并释放锁。版本化产物仅表示编译完成；签名 preflight、旧 writer/WAL 接管、真实网关、UI 和性能验收仍单独执行。
+- 入口持锁覆盖构建、ELF/哈希核验和复制，finally 还原 Cargo/Zig 环境并释放锁。版本化产物仅表示编译完成；KOL MVP 仍须完成 API/双向持仓验证、Executor/Binance、UI、容量和真实 Canary 验收。冻结旧链的签名 preflight 与 writer/WAL 接管另行处理。
 - 脚本专项只跑静态/离线 fixture 和受影响编译，不因构建入口修改重跑全业务测试；`test_venue_ubuntu_build.ps1` 的小型验证工件保留在专用根，不执行交易或服务操作。
 
 ### Linux 主机本地打包（备用，不在弱服务器日常使用）

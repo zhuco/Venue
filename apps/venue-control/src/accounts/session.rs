@@ -75,28 +75,40 @@ impl AccountService {
         user: UserSummary,
         now_ms: u64,
     ) -> Result<SessionResponse, AccountError> {
-        let token = crypto::new_token()?;
-        let expires_ms = now_ms
-            .checked_add(SESSION_LIFETIME_MS)
-            .ok_or(error(Code::InvalidInput))?;
         let mut tx = self.pool.begin().await.map_err(database_error)?;
         sqlx::query("SELECT user_id FROM venue_users WHERE user_id=$1 FOR UPDATE")
             .bind(&user.user_id)
             .fetch_one(&mut *tx)
             .await
             .map_err(database_error)?;
+        let session = self
+            .create_session_in_transaction(&mut tx, user, now_ms)
+            .await?;
+        tx.commit().await.map_err(database_error)?;
+        Ok(session)
+    }
+
+    pub(super) async fn create_session_in_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        user: UserSummary,
+        now_ms: u64,
+    ) -> Result<SessionResponse, AccountError> {
+        let token = crypto::new_token()?;
+        let expires_ms = now_ms
+            .checked_add(SESSION_LIFETIME_MS)
+            .ok_or(error(Code::InvalidInput))?;
         sqlx::query("DELETE FROM venue_user_sessions WHERE expires_ms <= $1 OR token_hash IN (SELECT token_hash FROM venue_user_sessions WHERE user_id=$2 ORDER BY expires_ms DESC OFFSET 9)")
-            .bind(ms(now_ms)?).bind(&user.user_id).execute(&mut *tx).await.map_err(database_error)?;
+            .bind(ms(now_ms)?).bind(&user.user_id).execute(&mut **tx).await.map_err(database_error)?;
         sqlx::query(
             "INSERT INTO venue_user_sessions (token_hash,user_id,expires_ms) VALUES ($1,$2,$3)",
         )
         .bind(crypto::fingerprint(token.expose().as_bytes()))
         .bind(&user.user_id)
         .bind(ms(expires_ms)?)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(database_error)?;
-        tx.commit().await.map_err(database_error)?;
         Ok(SessionResponse {
             user,
             token,
@@ -157,7 +169,10 @@ impl AccountService {
         }
     }
 
-    async fn password_hash(&self, password: SecretValue) -> Result<String, AccountError> {
+    pub(super) async fn password_hash(
+        &self,
+        password: SecretValue,
+    ) -> Result<String, AccountError> {
         let permit = self
             .password_slots
             .clone()

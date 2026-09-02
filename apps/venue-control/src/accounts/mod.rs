@@ -3,6 +3,7 @@
 
 mod credentials;
 mod crypto;
+mod kol;
 mod session;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -12,6 +13,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use venue_control_protocol::accounts::{AccountErrorCode, SecretValue, UserSummary};
 
+pub(crate) use credentials::credential_scope;
 pub use crypto::CredentialCipher;
 pub const MIGRATION_0015: &str = include_str!("../../migrations/0015_accounts.sql");
 

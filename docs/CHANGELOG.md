@@ -1,10 +1,17 @@
 # 版本与更新说明
 
-## 未发布：三目标文档收口
+## 未发布：Binance KOL 跟单 MVP 架构收敛
+
+- 当前唯一下一步目标调整为 Binance KOL 跟单 MVP：邀请注册、登录、API Key 绑定验证、基础 KOL 交易终端、快速真实跟单和 KOL 自助页面说明。
+- 目标架构收敛为 Web/BFF、Control、PostgreSQL 和单个多账户 Binance Executor；最多 5 个 KOL、200 个启用跟单账户，不为每个账户建立进程、Actor、Checkpoint 或本地 WAL。
+- 旧 Grid、六所 Node、Gate.io/Bitget 接管及复杂迁移链冻结；保留既有源码和恢复事实，但不作为 MVP 前置，新旧执行链不得同时写同一账户。
+- 新增 [`KOL_COPY_MVP.md`](KOL_COPY_MVP.md) 作为产品、架构、P0–P5 开发顺序、安全和 2核4G 容量验收的唯一长期契约；P0 同步加入 0017 数据约束、KOL/终端协议及单 Executor 数据库锁边界，但 HTTP、页面、物理执行与实盘闭环仍未完成。
+
+## 先前未发布记录：三目标文档收口（范围已停止）
 
 - “剩余开发与验收”并入迁移契约，明确交易终端、真实跟单、旧三所接管的各自完成证据、依赖与可复制 Goal 提示词。
-- “停用清单”并入架构第 8 节，“构建规则”并入开发指南第 7 节；删除三份重复文档，保留必要导航。原内容可从 Git 历史恢复。
-- 最新范围为 Binance 优先，Gate.io、Bitget 接管也在本次三目标内；Bybit、OKX、Hyperliquid 与 Scalping 暂缓。下列 alpha.2 的原排期仅描述历史版本，不是当前任务指令。
+- “停用清单”并入当时的架构文档，“构建规则”并入开发指南；删除三份重复文档，保留必要导航。原内容可从 Git 历史恢复。
+- 当时范围为 Binance 优先，并包含 Gate.io、Bitget 接管；该范围现已停止。下列 alpha.2 的原排期仅描述历史版本，不是当前任务指令。
 - 本次只修改文档和入口，不改代码、依赖、风险门、数据库或部署，不创建/启动长期 Goal；产品版本保持 alpha.2。
 
 ## v0.1.0-alpha.2 — 2026-09-01
@@ -50,7 +57,7 @@
 
 六所生产策略闭环、旧 writer/WAL 接管、真实 UI 连通/截图/性能验收仍未全部完成；
 Scalping 自动入场安全链、Bitget/Hyperliquid 权威闭合 bar、手动交易完整 scope 协同仍有限制。
-细项见 [三目标验收](UNIFIED_GATEWAY_WEB_MIGRATION.md#goal-acceptance)。保留失败关闭，不以版本号扩大实盘授权。
+这些是 alpha.1 的历史限制；当前开发和验收只以 [KOL MVP 契约](KOL_COPY_MVP.md) 为准。保留失败关闭，不以版本号扩大实盘授权。
 
 源码基线已有 workspace 编译检查、分段回归、Node 112 项单测与 PostgreSQL 25 项集成验证；
 当时发现的 fixture 失败已定向修复。本次仅对文档和版本文件做静态检查，

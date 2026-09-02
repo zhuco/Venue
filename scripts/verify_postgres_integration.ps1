@@ -51,7 +51,8 @@ function Invoke-PostgresIntegrationTest {
 
 Invoke-PostgresIntegrationTest -TestTarget 'account_delivery_postgres_integration'
 Invoke-PostgresIntegrationTest -TestTarget 'copy_postgres_integration'
+Invoke-PostgresIntegrationTest -TestTarget 'kol_mvp_postgres_integration'
 
-Write-Output 'PostgreSQL integration gate passed: delivery and Copy tests connected to the test database.'
+Write-Output 'PostgreSQL integration gate passed: delivery, Copy, and KOL MVP tests connected to the test database.'
 } finally { Pop-Location }
 } finally { Exit-VenueBuildGuard $venueBuildLease }

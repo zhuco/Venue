@@ -15,8 +15,13 @@ mod copy_relation_postgres;
 mod copy_relation_repository;
 mod copy_repository;
 mod copy_worker;
+pub mod executor_exchange;
+pub mod executor_secret;
+pub mod executor_store;
 mod http;
 mod indicator_projection;
+pub mod kol_executor;
+pub mod kol_mvp;
 mod model;
 mod node_projection_postgres;
 mod postgres;
@@ -58,6 +63,14 @@ pub use http::{
 pub use indicator_projection::{
     IndicatorProjectionError, IndicatorProjectionStore, IndicatorProjector,
     MAX_INDICATOR_EVENT_PAGE, StoredIndicatorEvent,
+};
+pub use kol_executor::{
+    AccountSerialScheduler, BinanceCommandLedger, BinanceCommandLedgerError, ClaimedBinanceCommand,
+    KolSourceFill, MAX_ENABLED_FOLLOWERS, MAX_ENABLED_KOLS,
+};
+pub use kol_mvp::{
+    BINANCE_EXECUTOR_ADVISORY_LOCK, BinanceExecutorSingleton, ExecutorSingletonError,
+    MIGRATION_0017, MIGRATION_0018,
 };
 pub use model::{AccountNodeBinding, ClaimedCommand, ScopedCommandReceipt, StoredEvent};
 pub use postgres::{

@@ -10,6 +10,40 @@ use venue_control_protocol::{
     CommandReceipt, CommandState, ControlAction, ControlSnapshot, accounts::*,
 };
 
+const INVITE_CODE: &str = "Safe_Kol_Invite_Code_00001";
+
+fn registration(username: &str) -> RegisterRequest {
+    RegisterRequest {
+        username: username.into(),
+        password: login(username).password,
+        invite_code: INVITE_CODE.into(),
+    }
+}
+
+async fn seed_enabled_invite(fixture: &Fixture) -> TestResult {
+    let kol = fixture.service.register(login("kol"), now()).await?;
+    let account_id = "00000000-0000-4000-8000-000000000701";
+    sqlx::query("INSERT INTO venue_user_trading_accounts (trading_account_id,user_id,venue,exchange_identity_hash) VALUES ($1,$2,'binance',$3)")
+        .bind(account_id)
+        .bind(&kol.user.user_id)
+        .bind([7_u8; 32].as_slice())
+        .execute(&fixture.pool)
+        .await?;
+    sqlx::query("INSERT INTO venue_kol_profiles (kol_user_id,leader_trading_account_id,public_name,public_title,public_description,strategy_capital,profile_state,active_slot,created_ms,updated_ms) VALUES ($1,$2,'KOL','Title','','100','enabled',1,$3,$3)")
+        .bind(&kol.user.user_id)
+        .bind(account_id)
+        .bind(i64::try_from(now())?)
+        .execute(&fixture.pool)
+        .await?;
+    sqlx::query("INSERT INTO venue_kol_invites (invite_id,kol_user_id,code_hash,invite_state,created_ms) VALUES ('00000000-0000-4000-8000-000000000702',$1,$2,'active',$3)")
+        .bind(&kol.user.user_id)
+        .bind(ring::digest::digest(&ring::digest::SHA256, INVITE_CODE.as_bytes()).as_ref())
+        .bind(i64::try_from(now())?)
+        .execute(&fixture.pool)
+        .await?;
+    Ok(())
+}
+
 struct Server {
     endpoint: String,
     stop: watch::Sender<bool>,
@@ -96,6 +130,7 @@ async fn postgres_http_account_lifecycle_requires_session_json_and_ownership() -
     let Some(f) = Fixture::create().await? else {
         return Ok(());
     };
+    seed_enabled_invite(&f).await?;
     let s = Server::start(&f).await?;
     code(
         s.get(SESSION_PATH, None).send().await?,
@@ -128,21 +163,23 @@ async fn postgres_http_account_lifecycle_requires_session_json_and_ownership() -
             .is_empty()
     );
     let alice = s
-        .post(REGISTER_PATH, None, &login("alice"))
+        .post(REGISTER_PATH, None, &registration("alice"))
         .send()
         .await?
         .error_for_status()?
         .json::<SessionResponse>()
         .await?;
     let bob = s
-        .post(REGISTER_PATH, None, &login("bob"))
+        .post(REGISTER_PATH, None, &registration("bob"))
         .send()
         .await?
         .error_for_status()?
         .json::<SessionResponse>()
         .await?;
     code(
-        s.post(REGISTER_PATH, None, &login("Alice")).send().await?,
+        s.post(REGISTER_PATH, None, &registration("Alice"))
+            .send()
+            .await?,
         409,
         AccountErrorCode::UsernameUnavailable,
     )

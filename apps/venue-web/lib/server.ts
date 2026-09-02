@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 import type { Role, Session } from "./types";
 
 const cookieName = "venue_session";
+const kolCookieName = "venue_kol_session";
 /** The BFF is deliberately not a general-purpose outbound proxy. */
 export function controlOrigin(): string | undefined {
   const raw = process.env.VENUE_CONTROL_ORIGIN ?? "http://127.0.0.1:39180";
@@ -24,6 +25,9 @@ const controlMethods = {
 } satisfies Record<string, string[]>;
 type ControlPath = keyof typeof controlMethods;
 const cookieOptions = () => ({ httpOnly: true, secure: true, sameSite: "strict" as const, path: "/", maxAge: 15 * 60 });
+const kolCookieOptions = () => ({ httpOnly: true, secure: true, sameSite: "lax" as const, path: "/", maxAge: 12 * 60 * 60 });
+
+export type KolSession = { token: string; user: { user_id: string; username: string }; expires_ms: number; csrf: string; };
 
 function encode(value: string): string { return Buffer.from(value).toString("base64url"); }
 function decode(value: string): string | undefined { try { return Buffer.from(value, "base64url").toString("utf8"); } catch { return undefined; } }
@@ -48,6 +52,35 @@ export function getSession(request: NextRequest): Session | undefined {
   const raw = decode(payload); if (!raw) return undefined;
   try { const parsed: unknown = JSON.parse(raw); return isValidSession(parsed) ? parsed : undefined; } catch { return undefined; }
 }
+
+function isValidKolSession(value: unknown): value is KolSession {
+  if (!value || typeof value !== "object") return false;
+  const session = value as Partial<KolSession>;
+  return typeof session.token === "string" && /^[0-9a-f]{64}$/i.test(session.token)
+    && !!session.user && typeof session.user.user_id === "string" && /^[0-9a-f-]{36}$/i.test(session.user.user_id)
+    && typeof session.user.username === "string" && session.user.username.length >= 3 && session.user.username.length <= 64
+    && typeof session.csrf === "string" && session.csrf.length >= 16
+    && typeof session.expires_ms === "number" && Number.isSafeInteger(session.expires_ms) && session.expires_ms > Date.now();
+}
+
+export function getKolSession(request: NextRequest): KolSession | undefined {
+  const material = signingMaterial(); const signed = request.cookies.get(kolCookieName)?.value;
+  if (!material || !signed) return undefined;
+  const [payload, proof] = signed.split("."); if (!payload || !proof || !same(sessionSignature(payload, material), proof)) return undefined;
+  const raw = decode(payload); if (!raw) return undefined;
+  try { const parsed: unknown = JSON.parse(raw); return isValidKolSession(parsed) ? parsed : undefined; } catch { return undefined; }
+}
+
+export function issueKolSession(response: NextResponse, value: { token: string; user: { user_id: string; username: string }; expires_ms: number }): KolSession | undefined {
+  const material = signingMaterial();
+  if (!material || !/^[0-9a-f]{64}$/i.test(value.token) || !Number.isSafeInteger(value.expires_ms) || value.expires_ms <= Date.now()) return undefined;
+  const session: KolSession = { ...value, csrf: randomUUID() };
+  const payload = encode(JSON.stringify(session));
+  response.cookies.set(kolCookieName, `${payload}.${sessionSignature(payload, material)}`, kolCookieOptions());
+  return session;
+}
+
+export function clearKolSession(response: NextResponse): void { response.cookies.set(kolCookieName, "", { ...kolCookieOptions(), maxAge: 0 }); }
 
 export function issueSession(response: NextResponse): Session | undefined {
   const material = signingMaterial();
@@ -87,6 +120,13 @@ export function logoutResponse(): NextResponse {
   return response;
 }
 
+export function allowKolWrite(request: NextRequest): { session: KolSession } | Response {
+  const session = getKolSession(request);
+  if (!session) return NextResponse.json({ error: "session_required" }, { status: 401, headers: noStore() });
+  if (!allowedOrigin(request) || request.headers.get("x-venue-csrf") !== session.csrf) return NextResponse.json({ error: "request_rejected" }, { status: 403, headers: noStore() });
+  return { session };
+}
+
 export function noStore(): HeadersInit { return { "Cache-Control": "no-store", "Referrer-Policy": "same-origin", "X-Content-Type-Options": "nosniff" }; }
 export function allowedOrigin(request: NextRequest): boolean {
   const origin = request.headers.get("origin"); const host = request.headers.get("host");
@@ -115,6 +155,41 @@ export function controlHeaders(initial?: HeadersInit): Headers {
   const token = process.env.VENUE_WEB_CONTROL_SESSION_TOKEN;
   if (token) headers.set("authorization", `Bearer ${token}`);
   return headers;
+}
+
+export function kolControlHeaders(token: string, initial?: HeadersInit): Headers {
+  const headers = new Headers(initial);
+  headers.delete("authorization");
+  headers.set("authorization", `Bearer ${token}`);
+  return headers;
+}
+
+export async function kolControl(path: "/v2/account/register" | "/v2/account/login" | "/v2/account/logout" | "/v2/account/session" | "/v2/account/credentials" | "/v2/account/credentials/verify" | "/v2/account/credentials/delete" | "/v2/account/select" | "/v2/kol/profile" | "/v2/kol/follow/settings" | "/v2/kol/follow/lifecycle", init?: RequestInit, token?: string): Promise<Response> {
+  const methods: Record<string, string[]> = {
+    "/v2/account/register": ["POST"], "/v2/account/login": ["POST"], "/v2/account/logout": ["POST"],
+    "/v2/account/session": ["GET"], "/v2/account/credentials": ["POST"],
+    "/v2/account/credentials/verify": ["POST"], "/v2/account/credentials/delete": ["POST"],
+    "/v2/account/select": ["POST"], "/v2/kol/profile": ["GET", "POST"],
+    "/v2/kol/follow/settings": ["GET", "POST"], "/v2/kol/follow/lifecycle": ["POST"],
+  };
+  if (!methods[path]?.includes(init?.method ?? "GET")) return Response.json({ error: "control_route_rejected" }, { status: 400, headers: jsonHeaders() });
+  const origin = controlOrigin();
+  if (!origin) return Response.json({ error: "control_origin_rejected" }, { status: 503, headers: jsonHeaders() });
+  try {
+    const headers = token ? kolControlHeaders(token, init?.headers) : new Headers(init?.headers);
+    headers.set("content-type", "application/json");
+    const timeout = AbortSignal.timeout(10_000);
+    const response = await fetch(`${origin}${path}`, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout, cache: "no-store", redirect: "error", headers });
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers: response.headers });
+  } catch { return Response.json({ error: "control_unavailable" }, { status: 503, headers: jsonHeaders() }); }
+}
+
+export async function resolveKolInvite(inviteCode: string): Promise<Response> {
+  if (!/^[A-Za-z0-9_-]{24,64}$/.test(inviteCode)) return Response.json({ error: "invite_not_found" }, { status: 404, headers: jsonHeaders() });
+  const origin = controlOrigin();
+  if (!origin) return Response.json({ error: "control_origin_rejected" }, { status: 503, headers: jsonHeaders() });
+  try { return await fetch(`${origin}/v2/public/kol/invites/${inviteCode}`, { cache: "no-store", redirect: "error", signal: AbortSignal.timeout(10_000) }); }
+  catch { return Response.json({ error: "control_unavailable" }, { status: 503, headers: jsonHeaders() }); }
 }
 
 export async function control(path: ControlPath, init?: RequestInit): Promise<Response> {

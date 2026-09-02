@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import test from "node:test";
-import { NextRequest } from "next/server";
-import { bootstrapResponse, control, controlHeaders, controlOrigin, isValidSession, logoutResponse, sessionSignature } from "./server";
+import { NextRequest, NextResponse } from "next/server";
+import { bootstrapResponse, control, controlHeaders, controlOrigin, getKolSession, isValidSession, issueKolSession, logoutResponse, sessionSignature } from "./server";
 
 test("Control authorization uses only the server user session, never caller or Node credentials", async () => {
   const prior = process.env.VENUE_WEB_CONTROL_SESSION_TOKEN;
@@ -35,6 +35,20 @@ test("Control authorization uses only the server user session, never caller or N
 test("session signatures are HMACs and not concatenated hashes", () => {
   const payload = "payload"; const material = "unit-material";
   assert.equal(sessionSignature(payload, material), createHmac("sha256", material).update(payload).digest("base64url"));
+});
+
+test("KOL user sessions keep the Control token inside an HttpOnly signed cookie", () => {
+  const prior = process.env.VENUE_WEB_SESSION_SIGNING_KEY;
+  process.env.VENUE_WEB_SESSION_SIGNING_KEY = "kol-signing-material";
+  try {
+    const issued = NextResponse.json({ ok: true });
+    const session = issueKolSession(issued, { token: "a".repeat(64), user: { user_id: "00000000-0000-4000-8000-000000000001", username: "alice" }, expires_ms: Date.now() + 60_000 });
+    assert.ok(session);
+    const cookie = issued.headers.get("set-cookie") ?? "";
+    assert.match(cookie, /HttpOnly/i); assert.match(cookie, /Secure/i); assert.match(cookie, /SameSite=Lax/i);
+    const request = new NextRequest("https://venue.test/api/kol/auth/session", { headers: { cookie: cookie.split(";")[0] } });
+    assert.equal(getKolSession(request)?.token, "a".repeat(64));
+  } finally { if (prior === undefined) delete process.env.VENUE_WEB_SESSION_SIGNING_KEY; else process.env.VENUE_WEB_SESSION_SIGNING_KEY = prior; }
 });
 
 test("decoded sessions fail closed on type, expiry and role mismatches", () => {
