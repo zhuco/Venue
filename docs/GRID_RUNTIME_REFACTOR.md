@@ -280,7 +280,7 @@ Grid bridge 对同一已接受 native order 的部分成交必须在策略 check
 
 episode 按 checkpoint key 串行选择一个受管订单，以 Critical 优先级经同一 Host/WAL/writer 发一条 Cancel；目标必须是该代完整签名 surface 的成员。命令 ID 绑定 episode sequence、target 与持久 attempt，明确 Rejected 后只能使用新的 attempt ID，最多三次；恢复出的精确 Prepared 先原地终结再换 ID，Submitted 或 Unknown 不得换 ID。Accepted 只有在更新签名页证明该目标已消失后才从 Desired 删除。撤单窗口的新完整成交先写 facts/Actor，退休旧 route 并更新库存，但不得再生成旧 epoch 的两补一撤。受管签名面精确为空后，使用最新库存、规则和 BBO 安装 `old_epoch + 1`；不平仓，也不以旧中心恢复。
 
-place-only 安装若在任意子命令或持久边界中断，下一启动从 checkpoint 重建完整命令字节：只给 WAL Accepted 子命令绑定其 native id，Absent/Rejected 子命令从投影删除，精确 Prepared 在原 WAL 终结为 Rejected，Submitted/Unknown 失败关闭；已接受子集随后进入同一撤单 episode。每个 episode 只耐久消费一次更高 epoch 自动重建机会；该 place 批次未能全量签名确认时暂停，后续监督器重启不得再创建第二个 epoch。这样部分成功的“半张网”不能直接变成 Running，也不能重投原 place ID。
+place-only 安装若在任意子命令或持久边界中断，下一启动从 checkpoint 重建完整命令字节：只给 WAL Accepted 子命令绑定其 native id，Absent/Rejected 子命令从投影删除，精确 Prepared 在原 WAL 终结为 Rejected，Submitted/Unknown 失败关闭；已接受子集随后进入同一撤单 episode。每个持久 reconciliation episode 只耐久消费一次更高 epoch 自动重建机会；同一 episode 的后续监督或重启不得再创建第二个 epoch。若该新 place 批次本身再次部分失败，它必须暂停并形成新的、带新 operation sequence 的撤净 episode；只有完整签名空表面与无 unresolved WAL 再次成立后，该新 episode 才可安装一次下一 epoch。这样部分成功的“半张网”不能直接变成 Running，也不能重投原 place ID。
 
 生产冷启动恢复私有游标还必须同时验证 Host 已核验的 Actor Applied 头与完整 `facts.jsonl` 尾部：每条事实的 journal 序号、header source sequence、PrivateAccount 来源、header 与规范私有事件均须一致有效；当前 Runtime 与 PrivateRouter 游标只能在 Actor 游标精确命中已验证 facts 尾部时同步前移。仅有 checkpoint 数字、重标记事实、断序、坏尾或 Actor/facts 任一方向不一致都失败关闭，不得据此投递或恢复 mutation。
 
@@ -323,7 +323,7 @@ Desired Orders，期间的新成交须先消费并重新计算目标集合。`Ru
 
 账户的广义生产风险 fence 不因 Grid 接管而清除：任一非零仓位、开放订单、外部订单或未决 WAL 仍保持 fence。新 Runtime 只可在 Host 证明当前签名 Hedge 订单面与 WAL Owner（含 purpose）一一对应、无外部/额外订单且 Actor Applied 与配置代仍为当前值后安装不可序列化的内存 `Exact` 权限；它至多消费为一个 `Batch`。空订单面安装只允许最多 200 条 post-only Place；滚动批次必须恰为两条 post-only Place 加一条针对旧签名面的 Cancel。启动撤单是唯一窄例外：可在无新增风险的 Critical lane 中逐条消费精确签名成员，即使存在无关 Unknown 也不读取 entry risk，但仍须持久 WAL、单 writer 与派发前更新签名目标校验。Host 对含 Place 的批次只读取一次新鲜汇率/风险证据，且逐条维持不超过 10U；第一条 Rejected/Unknown、签名刷新、重连、Pause、改参或代际变化立即撤销剩余增险权限，禁止自动重投。
 
-启动 reconciliation episode 已持久化、所有旧 target 逐一得到 WAL 与签名消失证明且完整受管订单面为空后，允许同一启动自动获得一次 `old_epoch + 1` 安装；不再要求 `--confirm-reset-rebuild`。这项自动化只覆盖撤旧后的新 epoch，不允许复活任何旧 Place/Replace；机会在 place 计划写入 Actor checkpoint 时即耐久消费。若该批次只有 Absent/Rejected 与可精确绑定的 Accepted 子集，下一次恢复必须撤净 Accepted 子集；checkpoint 中持久的一次性 terminal-rearm 版本尚未消费时，才允许以新的 reconciliation operation 和更高 epoch 重建，消费后再次发生同类失败只撤净并保持 Paused，不得继续递增 epoch。不得重投旧 Place。精确 Prepared 原地终结，Unknown 或 Submitted 仍保持 Paused/NeedsAttention 且不重投。
+启动 reconciliation episode 已持久化、所有旧 target 逐一得到 WAL 与签名消失证明且完整受管订单面为空后，允许该 episode 自动获得一次 `old_epoch + 1` 安装；不再要求 `--confirm-reset-rebuild`。这项自动化只覆盖撤旧后的新 epoch，不允许复活任何旧 Place/Replace；机会在 place 计划写入 Actor checkpoint 时即耐久消费。若该批次只有 Absent/Rejected 与可精确绑定的 Accepted 子集，下一次恢复必须撤净 Accepted 子集；`terminal_rebuild_rearm_version` 只标识 checkpoint 兼容语义，不能充当账户终身重建次数。撤净后必须开始新的 reconciliation operation，由新 episode 的 `rebuild_attempted` 限制一次下一 epoch；同一 episode 不得继续递增 epoch，也不得重投旧 Place。精确 Prepared 原地终结，Unknown 或 Submitted 仍保持 Paused/NeedsAttention 且不重投。
 
 停机期间旧单可能成交，因此启动签名订单面允许是 checkpoint 受管面的严格子集：每个仍开放订单必须继续精确匹配 Owner、client/native id、方向、数量、价格、TIF 与已知成交量；签名缺失的旧 child 只可在已持久化 reconciliation episode 中按“已消失”退役，再撤销剩余 child。任何额外订单、形状变化或 unresolved mutation 仍失败关闭。最终必须再次签名证明受管面为空，才可按最新签名仓位和当前 BBO 建立更高 epoch；不得恢复旧中心或重投旧 Place。
 

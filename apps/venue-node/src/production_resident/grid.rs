@@ -125,8 +125,9 @@ pub(crate) struct GridBridgeState {
     reconciliation_sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     startup_reconciliation: Option<GridStartupReconciliation>,
-    /// A terminally incomplete place batch may consume one durable recovery generation. After
-    /// that version is consumed, later partial batches are still drained but cannot auto-rebuild.
+    /// Checkpoint schema marker for terminally incomplete place-batch recovery. The one-shot
+    /// rebuild budget belongs to each `startup_reconciliation` episode, not to this account-wide
+    /// compatibility marker.
     #[serde(default)]
     terminal_rebuild_rearm_version: u16,
 }
@@ -448,16 +449,11 @@ impl GridBridgeState {
             }
             self.startup_reconciliation = None;
         }
-        let allow_rebuild = self.terminal_rebuild_rearm_version < TERMINAL_REBUILD_REARM_VERSION;
         self.start_reconciliation_episode()?;
-        if allow_rebuild {
-            self.terminal_rebuild_rearm_version = TERMINAL_REBUILD_REARM_VERSION;
-        } else {
-            self.startup_reconciliation
-                .as_mut()
-                .ok_or(GridBridgeError::Evidence)?
-                .rebuild_attempted = true;
-        }
+        // The episode itself owns the one-shot rebuild bit. A later partial install has a new
+        // operation sequence and must be able to drain and rebuild once more; the schema marker
+        // is not an account-lifetime attempt budget.
+        self.terminal_rebuild_rearm_version = TERMINAL_REBUILD_REARM_VERSION;
         if self.grid.owned_orders.is_empty() {
             self.grid
                 .reset_orders_settled()
@@ -466,7 +462,7 @@ impl GridBridgeState {
         self.validate()
     }
 
-    /// Schema-1 residents could drain a terminally Rejected partial rebuild but retain the prior
+    /// A resident can finish draining a terminally Rejected partial rebuild while retaining that
     /// episode's consumed rebuild bit. Only an exactly empty reducer surface with no cancel
     /// attempt in flight may advance to a fresh episode; the caller separately proves the signed
     /// venue surface empty and Host WAL free of unresolved outcomes before persisting this repair.
@@ -485,7 +481,7 @@ impl GridBridgeState {
                 .startup_reconciliation
                 .as_ref()
                 .is_some_and(|episode| episode.rebuild_attempted && episode.attempts.is_empty());
-        if !stranded || self.terminal_rebuild_rearm_version >= TERMINAL_REBUILD_REARM_VERSION {
+        if !stranded {
             return Ok(false);
         }
         self.startup_reconciliation = None;
