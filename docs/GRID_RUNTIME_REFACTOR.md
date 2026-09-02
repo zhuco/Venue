@@ -270,7 +270,7 @@ owned maker fill 的滚动价格来自既有 epoch。急涨成交后快速回落
 
 用户流与签名成交两条入口共用同一最终门：reducer 先固定语义动作和最小 Checkpoint，随后直接进入 WAL 和唯一 writer dispatch，不查询 BBO 或逐单订单详情。Binance `GTX`、Gate `poc`、Bitget `post_only` 是最终防吃单栅栏；快速反转导致穿价时，交易所只能明确拒绝替代单，运行时持久记录精确结果并转更新一代全订单族签名对账。禁止把价格钳到盘口、转换 taker、重新使用旧命令或在拒绝后自动重试。
 
-Grid bridge 对同一已接受 native order 的部分成交必须在策略 checkpoint 按精确 native id、不可变 fill id 和累计数量持久化；累计恰好等于原委托量时才一次调用 reducer，并在同一 checkpoint 退休已成交 route。partial 的重复 id 内容不一致、数量超原单、价格偏离原 PostOnly 委托或 checkpoint 路由无法完整反序列化都失败关闭。复杂 Grid key 以已校验 route 记录列表持久化，不以 JSON map key 或价格/方向推导；只兼容旧空 route checkpoint，非空旧对象拒绝恢复。
+Grid bridge 对同一已接受 native order 的部分成交必须在策略 checkpoint 按精确 native id、不可变 fill id 和累计数量持久化；累计恰好等于原委托量时才一次调用 reducer，并在同一 checkpoint 退休已成交 route。完成后用户流重连或签名补查若重放任一早期 slice，必须以 native order id 从 Host/WAL 找回精确 Accepted `PlaceLimit` 命令，再与 reducer 的完整 source key、确定性 command/client id、订单语义和 maker 完成记录共同证明重复；不得按价格猜测、再次滚动或因 route 已退休而退出。partial 的重复 id 内容不一致、数量超原单、价格偏离原 PostOnly 委托或 checkpoint 路由无法完整反序列化都失败关闭。复杂 Grid key 以已校验 route 记录列表持久化，不以 JSON map key 或价格/方向推导；只兼容旧空 route checkpoint，非空旧对象拒绝恢复。
 
 公共 socket/journal 只在 resident 公共 turn 推进，供初装、整网重建和再中心化使用；它的缺失或过期不阻塞完整成交的滚动 dispatch。`mutation_dispatched`、`private_reconcile_required` 与 `recenter_required` 继续区分已发批次、后续私有对账和 reducer 明确要求的整网重心迁移；BBO 不再产生成交滚动的等待状态。
 

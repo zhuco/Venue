@@ -929,6 +929,22 @@ fn partial_fills_accumulate_across_checkpoint_and_retire_the_completed_route()
         bridge.signed_fill_application(&completion)?,
         SignedGridFillApplication::ExactDuplicate
     );
+    assert_eq!(
+        bridge.signed_fill_application(&first)?,
+        SignedGridFillApplication::Irrelevant
+    );
+    let accepted_command = bridge.place_command_for_order(&source)?;
+    assert_eq!(
+        bridge.signed_retired_fill_application(&first, &accepted_command)?,
+        SignedGridFillApplication::ExactDuplicate
+    );
+    let mut retired_conflict = first.clone();
+    retired_conflict.maker = FieldState::Known(false);
+    assert!(
+        bridge
+            .signed_retired_fill_application(&retired_conflict, &accepted_command)
+            .is_err()
+    );
     let GridDecision::Actions(actions) = decision else {
         return Err("completed maker fill did not produce a rolling action".into());
     };

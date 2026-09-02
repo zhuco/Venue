@@ -1318,16 +1318,13 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
             return Err(NodeError::ResidentRuntime);
         }
         if let Some(owner) = self.owner_for_signed_fill(&event.fill) {
-            if let Some((key, _)) = self
+            if let Some((_, binding)) = self
                 .grid_bindings
                 .iter()
                 .find(|(_, binding)| binding.matches_owner(&owner))
             {
                 let application = self
-                    .grid_bridges
-                    .get(key)
-                    .ok_or(NodeError::ResidentRuntime)?
-                    .signed_fill_application(&event.fill)
+                    .classify_signed_grid_fill(binding, &event.fill)
                     .map_err(|error| NodeError::LiveHost {
                         venue: self.host.binding().venue,
                         message: format!(
@@ -1425,19 +1422,34 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 // The persisted fact header carries the router connection generation. Grid's
                 // reducer cursor is the separately signed private generation validated above.
                 let private_generation = normalized_private_generation;
+                let application = self.classify_signed_grid_fill(&binding, &fill)?;
                 let bridge = self
                     .grid_bridges
                     .get_mut(&delivery.target)
                     .ok_or(NodeError::ResidentRuntime)?;
-                let decision = bridge
-                    .observe_persisted_fill(&fill, private_generation)
-                    .map_err(|error| NodeError::LiveHost {
-                        venue: self.host.binding().venue,
-                        message: format!(
-                            "Grid reducer rejected private fill {}: {error}",
-                            fill.fill_id
-                        ),
-                    })?;
+                let decision = match application {
+                    grid::SignedGridFillApplication::ExactDuplicate => {
+                        venue_strategies::hedged_grid::GridDecision::Noop
+                    }
+                    grid::SignedGridFillApplication::Apply => bridge
+                        .observe_persisted_fill(&fill, private_generation)
+                        .map_err(|error| NodeError::LiveHost {
+                            venue: self.host.binding().venue,
+                            message: format!(
+                                "Grid reducer rejected private fill {}: {error}",
+                                fill.fill_id
+                            ),
+                        })?,
+                    grid::SignedGridFillApplication::Irrelevant => {
+                        return Err(NodeError::LiveHost {
+                            venue: self.host.binding().venue,
+                            message: format!(
+                                "Grid private fill {} has no current or retired WAL route",
+                                fill.fill_id
+                            ),
+                        });
+                    }
+                };
                 let _plans = match &decision {
                     venue_strategies::hedged_grid::GridDecision::Noop => Vec::new(),
                     venue_strategies::hedged_grid::GridDecision::Actions(actions) => actions

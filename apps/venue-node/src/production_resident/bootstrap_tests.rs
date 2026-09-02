@@ -665,6 +665,163 @@ fn existing_grid_restart_signs_cancels_empty_and_rebuilds_higher_epoch()
 }
 
 #[test]
+fn retired_partial_replay_uses_exact_accepted_wal_command() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let (mut resident, state, binding) = resident(directory.path(), 2)?;
+    {
+        let mut state = state.lock().map_err(|_| "state")?;
+        state.accept_dispatch = true;
+        state.long_quantity = Decimal::new(12, 2);
+        state.short_quantity = Decimal::new(12, 2);
+    }
+    assert!(resident.take_grid_bootstrap_request(&binding)?);
+    let snapshot = resident.refresh_signed_snapshot()?;
+    resident.bootstrap_grid_from_signed_market(&binding, snapshot, market()?)?;
+    let (signed_order, dispatches_before) = {
+        let state = state.lock().map_err(|_| "state")?;
+        (
+            state
+                .open_orders
+                .iter()
+                .find(|order| !order.reduce_only)
+                .cloned()
+                .ok_or("signed Grid order")?,
+            state.dispatches,
+        )
+    };
+    let (source, native_order_id) = {
+        let bridge = resident
+            .grid_bridges
+            .get(&binding.key)
+            .ok_or("Grid bridge")?;
+        let source = bridge
+            .grid
+            .owned_orders
+            .values()
+            .find(|source| {
+                source.side == signed_order.side
+                    && source.quantity == signed_order.quantity
+                    && source.price.value() == signed_order.limit_price.unwrap_or_default()
+                    && source.reduce_only == signed_order.reduce_only
+                    && match source.key.position {
+                        venue_strategies::hedged_grid::GridPosition::Long => {
+                            signed_order.position_side == PositionSide::Long
+                        }
+                        venue_strategies::hedged_grid::GridPosition::Short => {
+                            signed_order.position_side == PositionSide::Short
+                        }
+                    }
+            })
+            .cloned()
+            .ok_or("owned Grid order")?;
+        (
+            source,
+            signed_order
+                .venue_order_id
+                .clone()
+                .ok_or("accepted native order")?,
+        )
+    };
+    let first_quantity = source
+        .quantity
+        .checked_div(Decimal::new(2, 0))
+        .ok_or("partial quantity")?;
+    let remaining_quantity = source
+        .quantity
+        .checked_sub(first_quantity)
+        .ok_or("remaining quantity")?;
+    let make_fill = |fill_id: &str, quantity: Decimal| Fill {
+        fill_id: fill_id.to_owned(),
+        execution_sequence: FieldState::Known(1),
+        order_id: native_order_id.clone(),
+        symbol: binding.key.symbol.clone(),
+        side: source.side,
+        position_side: FieldState::Known(match source.key.position {
+            venue_strategies::hedged_grid::GridPosition::Long => PositionSide::Long,
+            venue_strategies::hedged_grid::GridPosition::Short => PositionSide::Short,
+        }),
+        quantity,
+        price: source.price,
+        fee: FieldState::Missing,
+        realized_pnl: FieldState::Missing,
+        maker: FieldState::Known(true),
+        exchange_time_ms: Some(100),
+    };
+    let first = make_fill("retired-partial-first", first_quantity);
+    let completion = make_fill("retired-partial-completion", remaining_quantity);
+    {
+        let bridge = resident
+            .grid_bridges
+            .get_mut(&binding.key)
+            .ok_or("Grid bridge")?;
+        assert_eq!(
+            bridge.observe_persisted_fill(&first, 9)?,
+            GridDecision::Noop
+        );
+        assert!(matches!(
+            bridge.observe_persisted_fill(&completion, 9)?,
+            GridDecision::Actions(_)
+        ));
+        assert_eq!(
+            bridge.signed_fill_application(&first)?,
+            grid::SignedGridFillApplication::Irrelevant
+        );
+    }
+    assert_eq!(
+        resident.classify_signed_grid_fill(&binding, &first)?,
+        grid::SignedGridFillApplication::ExactDuplicate
+    );
+    let facts_path = resident.artifacts_root.join("facts.jsonl");
+    let facts_before = std::fs::read_to_string(&facts_path)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    let source_private_generation = state.lock().map_err(|_| "state")?.generation;
+    assert!(resident.consume_private_fill(
+        "bybit",
+        PrivateFillFact {
+            source_private_generation,
+            received_at_ms: now()?,
+            fill: first.clone(),
+        },
+    )?);
+    assert_eq!(
+        std::fs::read_to_string(&facts_path)
+            .unwrap_or_default()
+            .lines()
+            .count(),
+        facts_before
+    );
+    assert_eq!(
+        state.lock().map_err(|_| "state")?.dispatches,
+        dispatches_before
+    );
+    let mut conflict = first;
+    conflict.maker = FieldState::Known(false);
+    assert!(
+        resident
+            .consume_private_fill(
+                "bybit",
+                PrivateFillFact {
+                    source_private_generation,
+                    received_at_ms: now()?,
+                    fill: conflict,
+                },
+            )
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&facts_path)
+            .unwrap_or_default()
+            .lines()
+            .count(),
+        facts_before
+    );
+    Ok(())
+}
+
+#[test]
 fn concurrent_signed_fills_are_staged_before_pending_batches_restore_the_full_surface()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

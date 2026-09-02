@@ -1117,6 +1117,59 @@ impl GridBridgeState {
         Ok(SignedGridFillApplication::Apply)
     }
 
+    /// Classifies a replay for an already retired native order. The caller must obtain
+    /// `accepted_command` from Host/WAL by this fill's native order id; price or side alone are
+    /// never enough to recover ownership after the live route has been retired.
+    pub(crate) fn signed_retired_fill_application(
+        &self,
+        fill: &Fill,
+        accepted_command: &ExecutionCommand,
+    ) -> Result<SignedGridFillApplication, GridBridgeError> {
+        fill.validate().map_err(|_| GridBridgeError::Evidence)?;
+        let mut matched = None;
+        for record in self.grid.owned_fill_records.values() {
+            let source = &record.source_order;
+            let expected = self.place_command_for_order(source)?;
+            if &expected != accepted_command {
+                continue;
+            }
+            if matched.replace(record).is_some() {
+                return Err(GridBridgeError::Evidence);
+            }
+        }
+        let Some(record) = matched else {
+            return Ok(SignedGridFillApplication::Irrelevant);
+        };
+        if record.maker != Some(true)
+            || !record.grid_action_emitted
+            || !matches!(fill.maker, FieldState::Known(true))
+            || !self.signed_fill_matches_order(fill, &record.source_order)
+        {
+            return Err(GridBridgeError::Evidence);
+        }
+        Ok(SignedGridFillApplication::ExactDuplicate)
+    }
+
+    fn place_command_for_order(
+        &self,
+        source: &GridOrderIntent,
+    ) -> Result<ExecutionCommand, GridBridgeError> {
+        Ok(ExecutionCommand::PlaceLimit(OrderCommand {
+            time_in_force: Default::default(),
+            command_id: stable_identifier(b"place", &self.grid.binding, &source.key)?,
+            client_order_id: stable_identifier(b"client", &self.grid.binding, &source.key)?,
+            owner: owner_for_order(&self.grid, source),
+            side: source.side,
+            position_side: match source.key.position {
+                GridPosition::Long => PositionSide::Long,
+                GridPosition::Short => PositionSide::Short,
+            },
+            quantity: source.quantity,
+            limit_price: source.price,
+            reduce_only: source.reduce_only,
+        }))
+    }
+
     fn signed_fill_matches_order(&self, fill: &Fill, source: &GridOrderIntent) -> bool {
         let position = match source.key.position {
             GridPosition::Long => PositionSide::Long,
@@ -1196,6 +1249,13 @@ impl GridBridgeState {
         fill.validate().map_err(|_| GridBridgeError::Evidence)?;
         if private_generation == 0 {
             return Err(GridBridgeError::Evidence);
+        }
+        match self.signed_fill_application(fill)? {
+            SignedGridFillApplication::ExactDuplicate => return Ok(GridDecision::Noop),
+            SignedGridFillApplication::Irrelevant => {
+                return Err(GridBridgeError::UnknownOrder);
+            }
+            SignedGridFillApplication::Apply => {}
         }
         let key = self
             .routes

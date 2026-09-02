@@ -607,18 +607,35 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
         Ok(fills)
     }
 
-    fn classify_signed_grid_fill(
+    pub(super) fn classify_signed_grid_fill(
         &self,
         binding: &StrategyBinding,
         fill: &venue_domain::Fill,
     ) -> Result<SignedGridFillApplication, NodeError> {
-        self.grid_bridges
+        let bridge = self
+            .grid_bridges
             .get(&binding.key)
-            .ok_or(NodeError::ResidentRuntime)?
-            .signed_fill_application(fill)
+            .ok_or(NodeError::ResidentRuntime)?;
+        let application = bridge.signed_fill_application(fill).map_err(|error| {
+            self.grid_recovery_error(&format!(
+                "signed Grid fill {} conflicts with its durable route: {error}",
+                fill.fill_id
+            ))
+        })?;
+        if application != SignedGridFillApplication::Irrelevant {
+            return Ok(application);
+        }
+        let Some(accepted_command) = self
+            .host
+            .command_snapshot_by_venue_order_id(NativeOrderFamily::UmOrder, &fill.order_id)
+        else {
+            return Ok(SignedGridFillApplication::Irrelevant);
+        };
+        bridge
+            .signed_retired_fill_application(fill, &accepted_command)
             .map_err(|error| {
                 self.grid_recovery_error(&format!(
-                    "signed Grid fill {} conflicts with its durable route: {error}",
+                    "signed Grid fill {} conflicts with its retired WAL route: {error}",
                     fill.fill_id
                 ))
             })
@@ -739,23 +756,38 @@ impl<G: venue_runtime::AccountPhysicalGateway> ProductionResident<G> {
                 "signed Grid private actor turn did not contain a Fill",
             ));
         };
+        let application = self.classify_signed_grid_fill(binding, &fill)?;
         let bridge = self.grid_bridges.get_mut(&binding.key).ok_or_else(|| {
             grid_recovery_error_for(
                 self.host.binding().venue,
                 "signed Grid bridge disappeared before private actor application",
             )
         })?;
-        let decision = bridge
-            .observe_persisted_fill(&fill, snapshot.private_generation())
-            .map_err(|error| {
-                grid_recovery_error_for(
+        let decision = match application {
+            SignedGridFillApplication::ExactDuplicate => {
+                venue_strategies::hedged_grid::GridDecision::Noop
+            }
+            SignedGridFillApplication::Apply => bridge
+                .observe_persisted_fill(&fill, snapshot.private_generation())
+                .map_err(|error| {
+                    grid_recovery_error_for(
+                        self.host.binding().venue,
+                        format!(
+                            "signed Grid reducer rejected fill {}: {error}",
+                            fill.fill_id
+                        ),
+                    )
+                })?,
+            SignedGridFillApplication::Irrelevant => {
+                return Err(grid_recovery_error_for(
                     self.host.binding().venue,
                     format!(
-                        "signed Grid reducer rejected fill {}: {error}",
+                        "signed Grid fill {} has no current or retired WAL route",
                         fill.fill_id
                     ),
-                )
-            })?;
+                ));
+            }
+        };
         let plans = match &decision {
             venue_strategies::hedged_grid::GridDecision::Noop => Vec::new(),
             venue_strategies::hedged_grid::GridDecision::Actions(actions) => actions
