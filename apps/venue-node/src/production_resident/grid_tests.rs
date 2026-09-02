@@ -19,6 +19,32 @@ fn bootstrap_quantity_covers_the_lowest_opening_level() -> Result<(), NodeError>
     Ok(())
 }
 
+#[test]
+fn execution_profile_rounds_only_when_minimum_notional_requires_another_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    let profile = GridExecutionProfile::new(
+        Decimal::new(1, 2),
+        Decimal::new(1, 2),
+        Decimal::new(1_000, 0),
+        Decimal::new(5, 0),
+    )?;
+
+    assert_eq!(
+        profile.normalize_quantity(Decimal::new(5, 2), Decimal::new(9_919, 2))?,
+        Decimal::new(6, 2)
+    );
+    assert_eq!(
+        profile.normalize_quantity(Decimal::new(5, 2), Decimal::new(101, 0))?,
+        Decimal::new(5, 2)
+    );
+    assert!(
+        profile
+            .normalize_quantity(Decimal::new(4, 2), Decimal::new(9_919, 2))
+            .is_err()
+    );
+    Ok(())
+}
+
 fn initial() -> Result<HedgedGridState, Box<dyn std::error::Error>> {
     let binding = HedgedGridBinding {
         strategy_instance_id: "grid_doge".to_owned(),
@@ -256,6 +282,12 @@ fn bridge_with_accepted_order()
     let mut state = initial()?;
     state.params.grid_count = 2;
     let mut bridge = GridBridgeState::bootstrap(state)?;
+    bridge.set_execution_profile(GridExecutionProfile::new(
+        Decimal::new(1, 2),
+        Decimal::new(1, 2),
+        Decimal::new(1_000, 0),
+        Decimal::new(5, 0),
+    )?)?;
     bridge.mark_bootstrap_attempted()?;
     let plan = bridge.install_initial_epoch(
         GridInventory {
@@ -291,6 +323,40 @@ fn bridge_with_accepted_order()
     let source = bridge.require_owned(&key)?.clone();
     let native_order_id = route.accepted_venue_order_id.ok_or("native order id")?;
     Ok((bridge, key, source, native_order_id))
+}
+
+#[test]
+fn legacy_running_checkpoint_without_execution_profile_cannot_plan_a_roll()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut bridge, _key, source, native_order_id) = bridge_with_accepted_order()?;
+    bridge.mark_bootstrap_confirmed()?;
+    let mut legacy: serde_json::Value = serde_json::from_slice(&bridge.checkpoint_bytes()?)?;
+    legacy
+        .as_object_mut()
+        .ok_or("grid checkpoint object")?
+        .remove("execution_profile");
+    let mut expected = initial()?;
+    expected.params.grid_count = 2;
+    let mut restored = GridBridgeState::restore_or_bootstrap(
+        Some(serde_json::to_vec(&legacy)?),
+        expected,
+        NodeGridRecoveryPolicy::BootstrapWhenAbsent,
+    )?;
+    let fill = owned_fill(
+        "legacy-profile-fill",
+        &native_order_id,
+        &source,
+        source.quantity,
+        source.price,
+    )?;
+    let GridDecision::Actions(actions) = restored.observe_persisted_fill(&fill, 9)? else {
+        return Err("legacy fill did not reserve a transaction".into());
+    };
+    assert!(matches!(
+        restored.plan_dispatch(&actions[0]),
+        Err(GridBridgeError::ExecutionProfile)
+    ));
+    Ok(())
 }
 
 fn owned_fill(

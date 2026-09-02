@@ -31,6 +31,7 @@ struct State {
     short_quantity: Decimal,
     open_orders: Vec<SignedAccountOrderFact>,
     fills: Vec<Fill>,
+    commands: Vec<ExecutionCommand>,
 }
 
 struct Gateway {
@@ -141,6 +142,7 @@ impl AccountPhysicalGateway for Gateway {
             return AccountGatewayResult::Unknown;
         }
         let venue_order_id = format!("grid-native-{}", state.dispatches);
+        state.commands.push(permit.command().clone());
         match permit.command() {
             ExecutionCommand::PlaceLimit(order) => {
                 state.open_orders.push(SignedAccountOrderFact {
@@ -268,6 +270,7 @@ fn resident(
         short_quantity: Decimal::ZERO,
         open_orders: Vec::new(),
         fills: Vec::new(),
+        commands: Vec::new(),
     }));
     let gateway = Gateway {
         binding: launch.binding().clone(),
@@ -928,6 +931,130 @@ fn concurrent_signed_fills_are_staged_before_pending_batches_restore_the_full_su
             .fills()
             .is_empty()
     );
+    Ok(())
+}
+
+#[test]
+fn concurrent_fill_rolls_never_emit_a_sub_minimum_notional_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let (mut resident, state, binding) = resident(directory.path(), 3)?;
+    {
+        let mut state = state.lock().map_err(|_| "state")?;
+        state.accept_dispatch = true;
+        state.long_quantity = Decimal::new(402, 2);
+        state.short_quantity = Decimal::new(23, 2);
+    }
+    assert!(resident.take_grid_bootstrap_request(&binding)?);
+    let snapshot = resident.refresh_signed_snapshot()?;
+    resident.bootstrap_grid_from_signed_market(&binding, snapshot, market()?)?;
+
+    let (raw_generation, dispatches_before, expected_count, first_fill) = {
+        let mut state = state.lock().map_err(|_| "state")?;
+        let short_close = state
+            .open_orders
+            .iter()
+            .find(|order| order.position_side == PositionSide::Short && order.reduce_only)
+            .cloned()
+            .ok_or("short close")?;
+        let long_open = state
+            .open_orders
+            .iter()
+            .find(|order| order.position_side == PositionSide::Long && !order.reduce_only)
+            .cloned()
+            .ok_or("long open")?;
+        let other_short_closes = state
+            .open_orders
+            .iter()
+            .filter(|order| {
+                order.position_side == PositionSide::Short
+                    && order.reduce_only
+                    && order.venue_order_id != short_close.venue_order_id
+            })
+            .map(|order| order.quantity)
+            .sum::<Decimal>();
+        assert_eq!(state.short_quantity, Decimal::new(23, 2));
+        assert_eq!(short_close.quantity, Decimal::new(6, 2));
+        assert_eq!(other_short_closes, Decimal::new(12, 2));
+        assert_eq!(
+            state.short_quantity - short_close.quantity - other_short_closes,
+            Decimal::new(5, 2)
+        );
+        let exchange_time_ms = now()?;
+        let make_fill = |id: &str,
+                         sequence: u64,
+                         order: &SignedAccountOrderFact|
+         -> Result<Fill, Box<dyn std::error::Error>> {
+            Ok(Fill {
+                fill_id: id.to_owned(),
+                execution_sequence: FieldState::Known(sequence),
+                order_id: order.venue_order_id.clone().ok_or("signed native order")?,
+                symbol: order.symbol.clone(),
+                side: order.side,
+                position_side: FieldState::Known(order.position_side),
+                quantity: order.quantity,
+                price: Price::new(order.limit_price.ok_or("signed limit price")?)?,
+                fee: FieldState::Missing,
+                realized_pnl: FieldState::Missing,
+                maker: FieldState::Known(true),
+                exchange_time_ms: Some(exchange_time_ms),
+            })
+        };
+        let first_fill = make_fill("minimum-notional-short-close", 1, &short_close)?;
+        let second_fill = make_fill("minimum-notional-long-open", 2, &long_open)?;
+        let filled_native = [first_fill.order_id.as_str(), second_fill.order_id.as_str()];
+        let expected_count = state.open_orders.len();
+        state.open_orders.retain(|order| {
+            order
+                .venue_order_id
+                .as_deref()
+                .is_none_or(|native| !filled_native.contains(&native))
+        });
+        state.fills = vec![first_fill.clone(), second_fill];
+        (
+            state.generation,
+            state.dispatches,
+            expected_count,
+            first_fill,
+        )
+    };
+
+    assert!(resident.consume_private_fill(
+        "bybit",
+        PrivateFillFact {
+            source_private_generation: raw_generation,
+            received_at_ms: now()?,
+            fill: first_fill,
+        },
+    )?);
+    let state = state.lock().map_err(|_| "state")?;
+    assert_eq!(state.dispatches, dispatches_before + 6);
+    assert_eq!(state.open_orders.len(), expected_count);
+    let rolling_commands = &state.commands[dispatches_before..];
+    assert_eq!(rolling_commands.len(), 6);
+    let rounded_short_close = rolling_commands
+        .iter()
+        .find_map(|command| match command {
+            ExecutionCommand::PlaceLimit(order)
+                if order.position_side == PositionSide::Short && order.reduce_only =>
+            {
+                Some(order)
+            }
+            _ => None,
+        })
+        .ok_or("rounded short close")?;
+    assert_eq!(rounded_short_close.quantity, Decimal::new(6, 2));
+    assert!(
+        rounded_short_close.quantity * rounded_short_close.limit_price.value()
+            >= Decimal::new(5, 0)
+    );
+    assert!(rolling_commands.iter().all(|command| match command {
+        ExecutionCommand::PlaceLimit(order) => {
+            order.quantity * order.limit_price.value() >= Decimal::new(5, 0)
+        }
+        ExecutionCommand::Cancel(_) => true,
+        _ => false,
+    }));
     Ok(())
 }
 

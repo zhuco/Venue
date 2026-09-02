@@ -314,10 +314,11 @@ Desired Orders，期间的新成交须先消费并重新计算目标集合。`Ru
 若 `价格 × 数量` 不足：
 
 1. 首次完整网格必须以最外层最低 opening 价格计算所需数量，再按数量精度向上取整；不得只按 anchor 或第一档计算后让外层订单跌破最小名义；
-2. 再次验证名义价值；
-3. 不得向下取整或提交必然拒绝的订单。
+2. 成交滚动产生的两张补单也必须在 Actor checkpoint 和 WAL 命令标识形成前，以同一 `quantity_step` 恰好增加一步；典型 `0.05 × 99.19 < 5` 必须生成 `0.06`，增加一步后仍不足实时最小名义则失败关闭并转签名重建，不能继续抬量或把必然拒绝的订单交给 adapter；
+3. 再次验证名义价值；
+4. 不得向下取整或提交必然拒绝的订单。
 
-平仓数量不得超过签名库存和已承诺平仓量。
+平仓补单通常不得超过签名库存扣除已承诺平仓量后的余额；仅当该余额已满足数量精度但低于交易所最小名义时，允许恰好增加一个 `quantity_step`。该订单仍必须保持 reduce-only、不得使仓位翻向或增险，并继续受单笔 10U 与最大数量硬门限制。
 
 显式 Node Grid 配置 `skip_inventory_replenishment_until_recovered`（部署入口可映射为
 `--skip-inventory-replenishment-until-recovered`）是初次恢复期间的耐久无市价补仓闩锁：低库存时仍可按当前签名库存重建，closing 数量必须由库存裁剪且不得超额，两腿 opening 必须各自保持完整；签名库存恢复后 reducer 清除该闩锁，后续 Running 重启必须接受已清除的 checkpoint，不得重新启用或因其不再等于启动配置而拒绝。反向用配置关闭仍处于耐久开启状态的闩锁仍失败关闭。首次 bootstrap 在同一 Actor Applied checkpoint 中保持 `Eligible / Attempted / Confirmed`：旧单接管产生的精确未安装 checkpoint 仍为 Eligible；读取外部签名事实或 BBO 前必须先持久化 Attempted；只有完整订单集合得到更新签名确认后才持久化 Confirmed。Attempted 重启不得重投原 place 批次：按 WAL 绑定 Accepted 子集，撤净后以更高 epoch 重建；任一 Unknown 仍保持 Paused。Stage 7 不得在 reducer 已接受无市价补仓模式后用重复的无条件低库存门拒绝安装；未显式进入该模式时，低于单格名义的任一腿仍必须先走 WAL 绑定的库存补充。

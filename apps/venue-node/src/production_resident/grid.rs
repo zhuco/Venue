@@ -107,6 +107,10 @@ pub(crate) enum SignedGridFillApplication {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct GridBridgeState {
     pub grid: HedgedGridState,
+    /// Adapter-neutral execution precision sealed with the installed epoch. Rolling must use the
+    /// same minimum-notional quantity before checkpoint/WAL identities are derived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    execution_profile: Option<GridExecutionProfile>,
     #[serde(default)]
     bootstrap_state: GridBootstrapState,
     /// A completed reset may deliberately leave an uninstalled shape. It is distinct from the
@@ -190,10 +194,83 @@ pub(crate) struct GridDispatchPlan {
     transaction_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct GridExecutionProfile {
+    #[serde(with = "rust_decimal::serde::str")]
+    quantity_step: rust_decimal::Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    minimum_quantity: rust_decimal::Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    maximum_quantity: rust_decimal::Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    minimum_notional: rust_decimal::Decimal,
+}
+
+impl GridExecutionProfile {
+    pub(crate) fn new(
+        quantity_step: rust_decimal::Decimal,
+        minimum_quantity: rust_decimal::Decimal,
+        maximum_quantity: rust_decimal::Decimal,
+        minimum_notional: rust_decimal::Decimal,
+    ) -> Result<Self, GridBridgeError> {
+        let profile = Self {
+            quantity_step,
+            minimum_quantity,
+            maximum_quantity,
+            minimum_notional,
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    fn normalize_quantity(
+        &self,
+        quantity: rust_decimal::Decimal,
+        price: rust_decimal::Decimal,
+    ) -> Result<rust_decimal::Decimal, GridBridgeError> {
+        if quantity < self.minimum_quantity
+            || quantity > self.maximum_quantity
+            || quantity % self.quantity_step != rust_decimal::Decimal::ZERO
+            || price <= rust_decimal::Decimal::ZERO
+        {
+            return Err(GridBridgeError::ExecutionProfile);
+        }
+        if quantity
+            .checked_mul(price)
+            .is_some_and(|notional| notional >= self.minimum_notional)
+        {
+            return Ok(quantity);
+        }
+        quantity
+            .checked_add(self.quantity_step)
+            .filter(|value| {
+                *value <= self.maximum_quantity
+                    && *value % self.quantity_step == rust_decimal::Decimal::ZERO
+                    && value
+                        .checked_mul(price)
+                        .is_some_and(|notional| notional >= self.minimum_notional)
+            })
+            .ok_or(GridBridgeError::ExecutionProfile)
+    }
+
+    fn validate(&self) -> Result<(), GridBridgeError> {
+        if self.quantity_step <= rust_decimal::Decimal::ZERO
+            || self.minimum_quantity <= rust_decimal::Decimal::ZERO
+            || self.maximum_quantity < self.minimum_quantity
+            || self.minimum_notional <= rust_decimal::Decimal::ZERO
+            || self.minimum_quantity % self.quantity_step != rust_decimal::Decimal::ZERO
+        {
+            return Err(GridBridgeError::ExecutionProfile);
+        }
+        Ok(())
+    }
+}
+
 impl GridBridgeState {
     pub(crate) fn bootstrap(grid: HedgedGridState) -> Result<Self, NodeError> {
         let state = Self {
             grid,
+            execution_profile: None,
             bootstrap_state: GridBootstrapState::Eligible,
             reset_rebuild_attempted: false,
             reset_rebuild_attempt_version: 0,
@@ -1401,7 +1478,65 @@ impl GridBridgeState {
         let GridAction::Dispatch(transaction) = action else {
             return Err(GridBridgeError::UnsupportedAction);
         };
-        self.plan_transaction(transaction)
+        self.normalize_pending_transaction(transaction)?;
+        let transaction = self
+            .grid
+            .pending_transactions
+            .get(&transaction.id)
+            .cloned()
+            .ok_or(GridBridgeError::Evidence)?;
+        self.plan_transaction(&transaction)
+    }
+
+    pub(crate) fn set_execution_profile(
+        &mut self,
+        profile: GridExecutionProfile,
+    ) -> Result<(), GridBridgeError> {
+        profile.validate()?;
+        if !self.grid.pending_transactions.is_empty() {
+            return Err(GridBridgeError::ExecutionProfile);
+        }
+        self.execution_profile = Some(profile);
+        self.validate()
+    }
+
+    fn normalize_pending_transaction(
+        &mut self,
+        expected: &GridTransaction,
+    ) -> Result<(), GridBridgeError> {
+        let profile = self
+            .execution_profile
+            .clone()
+            .ok_or(GridBridgeError::ExecutionProfile)?;
+        let transaction = self
+            .grid
+            .pending_transactions
+            .get(&expected.id)
+            .cloned()
+            .filter(|transaction| transaction == expected)
+            .ok_or(GridBridgeError::Evidence)?;
+        let mut normalized = transaction.clone();
+        for order in &mut normalized.places {
+            order.quantity = profile.normalize_quantity(order.quantity, order.price.value())?;
+        }
+        if normalized == transaction {
+            return Ok(());
+        }
+        for order in &normalized.places {
+            let owned = self
+                .grid
+                .owned_orders
+                .get_mut(&order.key)
+                .ok_or(GridBridgeError::UnknownOrder)?;
+            if owned.key != order.key || owned.price != order.price {
+                return Err(GridBridgeError::Evidence);
+            }
+            owned.quantity = order.quantity;
+        }
+        self.grid
+            .pending_transactions
+            .insert(normalized.id.clone(), normalized);
+        self.validate()
     }
 
     /// Rebuilds only the command bytes for reducer transactions already present in the verified
@@ -1654,6 +1789,10 @@ impl GridBridgeState {
         if (self.bootstrap_state == GridBootstrapState::Eligible && !self.has_uninstalled_shape())
             || (self.bootstrap_state == GridBootstrapState::Confirmed && self.grid.epoch.is_none())
             || self.terminal_rebuild_rearm_version > TERMINAL_REBUILD_REARM_VERSION
+            || self
+                .execution_profile
+                .as_ref()
+                .is_some_and(|profile| profile.validate().is_err())
         {
             return Err(GridBridgeError::BootstrapState);
         }
@@ -1817,6 +1956,8 @@ pub(crate) enum GridBridgeError {
     UnsupportedAction,
     #[error("grid bootstrap state crossed an invalid durable boundary")]
     BootstrapState,
+    #[error("grid execution precision or minimum notional is invalid")]
+    ExecutionProfile,
     #[error("grid reducer rejected the persisted private fill: {0}")]
     Reducer(HedgedGridError),
 }

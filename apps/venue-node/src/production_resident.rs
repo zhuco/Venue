@@ -1061,6 +1061,16 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 message: format!("Grid signed-empty-surface admission rejected: {error}"),
             })?;
         let venue = self.host.binding().venue;
+        let execution_profile = grid::GridExecutionProfile::new(
+            market.quantity_step,
+            market.minimum_quantity,
+            market.maximum_quantity,
+            market.minimum_notional,
+        )
+        .map_err(|error| NodeError::LiveHost {
+            venue,
+            message: format!("Grid execution profile is invalid: {error}"),
+        })?;
         let (plan, replay) = {
             let bridge = self
                 .grid_bridges
@@ -1095,6 +1105,12 @@ impl<G: AccountPhysicalGateway> ProductionResident<G> {
                 grid_quantity: quantity,
                 passive_book_fallback: None,
             };
+            bridge
+                .set_execution_profile(execution_profile)
+                .map_err(|error| NodeError::LiveHost {
+                    venue,
+                    message: format!("Grid execution profile could not be installed: {error}"),
+                })?;
             let plan = if epoch_number == 1 {
                 bridge
                     .install_initial_epoch(inventory, epoch)
