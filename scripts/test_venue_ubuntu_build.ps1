@@ -77,6 +77,12 @@ foreach ($required in @("-Slot 'slot-2'",'Enter-VenueBuildGuard','Exit-VenueBuil
     'Assert-VenueUbuntuRevision $source $ExpectedRevision')) {
     if (-not $entry.Contains($required,[StringComparison]::Ordinal)) { throw "Missing build contract: $required" }
 }
+if ($entry -notmatch '\$controlBinaries\s*=\s*@\(''venue-control-server'',''venue-executor-binance''\)') {
+    throw 'Control release must contain venue-control-server and venue-executor-binance.'
+}
+if ($entry.Contains("'venue-copy-worker'",[StringComparison]::Ordinal)) {
+    throw 'Frozen venue-copy-worker must not remain in the KOL Control release.'
+}
 if ($entry -match '(?im)^\s*(ssh|scp|Remove-Item|Stop-Process|cargo clean)\b') { throw 'Build entry must not deploy, delete or stop processes.' }
 $passed++
 Write-Output "Ubuntu build validation passed: $passed checks. Small fixtures retained at $fixture"

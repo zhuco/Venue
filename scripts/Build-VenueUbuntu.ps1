@@ -41,7 +41,7 @@ try {
 
 $target = 'x86_64-unknown-linux-gnu.2.35'
 $nodeVenues = @('binance','bitget','bybit','gate','hyperliquid','okx')
-$controlBinaries = @('venue-control-server','venue-copy-worker')
+$controlBinaries = @('venue-control-server','venue-executor-binance')
 $builderFiles = @($PSCommandPath,(Join-Path $PSScriptRoot 'ubuntu_build_helpers.ps1'),(Join-Path $PSScriptRoot 'venue_build_guard.ps1'))
 $builderHashes = @{}
 foreach ($file in $builderFiles) { $builderHashes[[IO.Path]::GetFileName($file)] = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant() }
