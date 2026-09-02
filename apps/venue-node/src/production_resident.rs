@@ -1728,6 +1728,7 @@ impl ProductionResident<venue_gateway_binance::BinanceAccountGateway> {
                 message: error.to_string(),
             })?;
         let venue = self.host.binding().venue;
+        let mut opening_rules_revalidated = false;
         self.bootstrap_grid_from_signed_market_with_refresh(
             binding,
             snapshot,
@@ -1742,12 +1743,18 @@ impl ProductionResident<venue_gateway_binance::BinanceAccountGateway> {
                 observed_at_ms: market.observed_at_ms,
             },
             move |host| {
-                let market = host
-                    .with_gateway_read(|gateway| gateway.fresh_grid_bootstrap_market())
-                    .map_err(|error| NodeError::LiveHost {
-                        venue,
-                        message: error.to_string(),
-                    })?;
+                let market = if opening_rules_revalidated {
+                    host.with_gateway_read(|gateway| {
+                        gateway.fresh_grid_opening_market_after_rules_validation()
+                    })
+                } else {
+                    host.with_gateway_read(|gateway| gateway.fresh_grid_bootstrap_market())
+                }
+                .map_err(|error| NodeError::LiveHost {
+                    venue,
+                    message: error.to_string(),
+                })?;
+                opening_rules_revalidated = true;
                 Ok(Some(GridBootstrapMarket {
                     bid: market.bid,
                     ask: market.ask,

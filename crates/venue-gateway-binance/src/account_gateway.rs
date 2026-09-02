@@ -452,6 +452,25 @@ impl BinanceAccountGateway {
         )
     }
 
+    /// Reads only a fresh BBO after the opening wave has already revalidated this gateway's
+    /// immutable rules. Bootstrap calls the full rules endpoint once after the closing wave, then
+    /// uses this bounded public read for each remaining opening child so a large exchange-info
+    /// payload is not downloaded before every individual order.
+    pub fn fresh_grid_opening_market_after_rules_validation(
+        &mut self,
+    ) -> Result<BinanceGridBootstrapMarketFacts, BinanceAccountGatewayError> {
+        let rules = self.rules.clone();
+        let response = self
+            .runtime
+            .block_on(self.transport.fetch_usd_m_book_ticker(&rules.native_symbol))?;
+        parse_grid_bootstrap_bbo(
+            &response.payload,
+            self.config.gateway_binding(),
+            &rules,
+            now_ms()?,
+        )
+    }
+
     fn dispatch_permit(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
         account_gateway_symbol_dispatch::dispatch_catalog_permit(self, permit)
     }
