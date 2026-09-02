@@ -315,6 +315,19 @@ pub struct AccountDispatchPermit {
     binding: GatewayBinding,
     command: ExecutionCommand,
     max_entry_notional: Decimal,
+    managed_grid_rolling_batch: Option<ManagedGridRollingDispatchPermit>,
+}
+
+/// Host-sealed identity for one normal Grid rolling transaction. It carries no standalone
+/// dispatch authority: only the linear `AccountDispatchPermit` can transport it to an adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedGridRollingDispatchPermit {
+    binding: GatewayBinding,
+    symbol: venue_domain::domain::Symbol,
+    batch_sha256: [u8; 32],
+    signed_private_generation: u64,
+    child_index: u8,
+    child_count: u8,
 }
 
 /// Linear proof that this exact command already owns a fsynced `Prepared` record in this
@@ -339,6 +352,7 @@ enum EntryAdmission {
         batch_command_ids: Arc<BTreeSet<CommandId>>,
         batch_live: Arc<AtomicBool>,
         cancellation_drain: bool,
+        rolling_dispatch: Option<ManagedGridRollingDispatchPermit>,
     },
 }
 
@@ -435,6 +449,43 @@ impl AccountDispatchPermit {
     #[must_use]
     pub const fn max_entry_notional(&self) -> Decimal {
         self.max_entry_notional
+    }
+
+    #[must_use]
+    pub const fn managed_grid_rolling_batch(&self) -> Option<&ManagedGridRollingDispatchPermit> {
+        self.managed_grid_rolling_batch.as_ref()
+    }
+}
+
+impl ManagedGridRollingDispatchPermit {
+    #[must_use]
+    pub const fn binding(&self) -> &GatewayBinding {
+        &self.binding
+    }
+
+    #[must_use]
+    pub const fn symbol(&self) -> &venue_domain::domain::Symbol {
+        &self.symbol
+    }
+
+    #[must_use]
+    pub const fn batch_sha256(&self) -> [u8; 32] {
+        self.batch_sha256
+    }
+
+    #[must_use]
+    pub const fn signed_private_generation(&self) -> u64 {
+        self.signed_private_generation
+    }
+
+    #[must_use]
+    pub const fn child_index(&self) -> u8 {
+        self.child_index
+    }
+
+    #[must_use]
+    pub const fn child_count(&self) -> u8 {
+        self.child_count
     }
 }
 
@@ -1529,17 +1580,30 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
                 }
             }
         }
-        let admission = EntryAdmission::ManagedGrid {
-            private_generation: surface.private_generation,
-            batch_command_ids: Arc::new(
-                commands
-                    .iter()
-                    .map(ExecutionCommand::command_id)
-                    .cloned()
-                    .collect(),
-            ),
-            batch_live: Arc::new(AtomicBool::new(true)),
-            cancellation_drain,
+        let batch_command_ids: Arc<BTreeSet<CommandId>> = Arc::new(
+            commands
+                .iter()
+                .map(ExecutionCommand::command_id)
+                .cloned()
+                .collect(),
+        );
+        let batch_live = Arc::new(AtomicBool::new(true));
+        let rolling_batch_sha256 = if matches!(
+            commands,
+            [
+                ExecutionCommand::PlaceLimit(_),
+                ExecutionCommand::PlaceLimit(_),
+                ExecutionCommand::Cancel(_)
+            ]
+        ) {
+            let encoded =
+                serde_json::to_vec(&(&self.binding, surface.private_generation, commands))
+                    .map_err(|_| {
+                        AccountHostError::Validation(AccountHostValidationError::ManagedGridSurface)
+                    })?;
+            Some(Sha256::digest(encoded).into())
+        } else {
+            None
         };
         if !cancellation_drain && self.journal.has_unresolved() {
             return Err(AccountHostError::Validation(
@@ -1558,11 +1622,34 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
         commands
             .iter()
             .cloned()
-            .map(|command| {
+            .enumerate()
+            .map(|(child_index, command)| {
+                let child_index = u8::try_from(child_index).map_err(|_| {
+                    AccountHostError::Validation(AccountHostValidationError::ManagedGridSurface)
+                })?;
                 let receipt = self.journal.receipt(command.command_id()).ok_or(
                     AccountHostError::Validation(AccountHostValidationError::PreparedCommand),
                 )?;
-                self.host_prepared_command(command, receipt, admission.clone())
+                let rolling_dispatch =
+                    rolling_batch_sha256.map(|batch_sha256| ManagedGridRollingDispatchPermit {
+                        binding: self.binding.clone(),
+                        symbol: surface.owner.symbol.clone(),
+                        batch_sha256,
+                        signed_private_generation: surface.private_generation,
+                        child_index,
+                        child_count: 3,
+                    });
+                self.host_prepared_command(
+                    command,
+                    receipt,
+                    EntryAdmission::ManagedGrid {
+                        private_generation: surface.private_generation,
+                        batch_command_ids: batch_command_ids.clone(),
+                        batch_live: batch_live.clone(),
+                        cancellation_drain,
+                        rolling_dispatch,
+                    },
+                )
             })
             .collect()
     }
@@ -1696,6 +1783,12 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
             EntryAdmission::ManagedGrid { batch_live, .. } => Some(batch_live.clone()),
             EntryAdmission::AccountTotal => None,
         };
+        let managed_grid_rolling_batch = match &prepared.entry_admission {
+            EntryAdmission::ManagedGrid {
+                rolling_dispatch, ..
+            } => rolling_dispatch.clone(),
+            EntryAdmission::AccountTotal => None,
+        };
         let receipt = self
             .journal
             .receipt(&command_id)
@@ -1734,6 +1827,7 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
                 batch_command_ids,
                 batch_live,
                 cancellation_drain,
+                ..
             } => {
                 let current_generation = self
                     .latest_signed_snapshot
@@ -1792,6 +1886,7 @@ impl<G: AccountPhysicalGateway> AccountMutationHost<G> {
             binding: self.binding.clone(),
             command: prepared.command,
             max_entry_notional: self.max_entry_notional,
+            managed_grid_rolling_batch,
         });
         let outcome = match result {
             AccountGatewayResult::Accepted { venue_order_id } if valid_text(&venue_order_id) => {

@@ -2020,6 +2020,7 @@ struct ManagedBatchGateway {
     outcomes: std::collections::VecDeque<AccountGatewayResult>,
     risk_reads: usize,
     dispatches: usize,
+    rolling_dispatches: Vec<Option<ManagedGridRollingDispatchPermit>>,
 }
 
 impl AccountPhysicalGateway for ManagedBatchGateway {
@@ -2059,8 +2060,10 @@ impl AccountPhysicalGateway for ManagedBatchGateway {
         risk_evidence(self.binding.clone(), vec![Decimal::from(400)], Vec::new())
     }
 
-    fn dispatch(&mut self, _: AccountDispatchPermit) -> AccountGatewayResult {
+    fn dispatch(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
         self.dispatches = self.dispatches.saturating_add(1);
+        self.rolling_dispatches
+            .push(permit.managed_grid_rolling_batch().cloned());
         self.outcomes
             .pop_front()
             .unwrap_or(AccountGatewayResult::Unknown)
@@ -2103,6 +2106,7 @@ fn managed_batch_gateway(
         outcomes: outcomes.into_iter().collect(),
         risk_reads: 0,
         dispatches: 0,
+        rolling_dispatches: Vec::new(),
     })
 }
 
@@ -2460,6 +2464,75 @@ fn managed_grid_startup_cancel_is_single_surface_exact_and_bypasses_entry_unknow
     ));
     assert_eq!(host.gateway.risk_reads, risk_reads_before_cancel);
     assert_eq!(host.gateway.dispatches, 3);
+    Ok(())
+}
+
+#[test]
+fn managed_grid_rolling_permits_seal_one_ordered_three_child_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let binding = binding()?;
+    let gateway = managed_batch_gateway(
+        &binding,
+        (1..=4).map(|index| AccountGatewayResult::Accepted {
+            venue_order_id: format!("managed-native-{index}"),
+        }),
+    )?;
+    let mut host = AccountMutationHost::open(root(&temp), binding.clone(), Decimal::TEN, gateway)?;
+    let _bootstrap = host.durable_runtime_bootstrap()?;
+
+    let surface = host.confirm_managed_grid_surface(&owner()?, BTreeMap::new())?;
+    let mut existing = indexed_command(70)?;
+    let ExecutionCommand::PlaceLimit(existing_place) = &mut existing else {
+        return Err("existing limit required".into());
+    };
+    existing_place.client_order_id = CommandId::new("managed-client-1")?;
+    existing_place.limit_price = Price::new(Decimal::TEN)?;
+    let existing = host
+        .prepare_managed_grid_batch_for_lane(surface, &[existing])?
+        .pop()
+        .ok_or("existing proof")?;
+    assert!(matches!(
+        host.dispatch_prepared(existing)?,
+        AccountDispatchOutcome::Accepted { .. }
+    ));
+
+    let mut refreshed = managed_signed_order(&binding, owner()?, false, 2)?;
+    host.enrich_signed_order_owners(&mut refreshed);
+    host.latest_signed_snapshot = Some(refreshed);
+    host.last_gateway_private_generation = Some(2);
+    let expected = BTreeMap::from([(CommandId::new("managed-client-1")?, owner()?)]);
+    let surface = host.confirm_managed_grid_surface(&owner()?, expected)?;
+    let rolling = [
+        indexed_command(71)?,
+        indexed_command(72)?,
+        ExecutionCommand::Cancel(CancelCommand {
+            command_id: CommandId::new("rolling-cancel-sealed")?,
+            owner: owner()?,
+            target_client_order_id: CommandId::new("managed-client-1")?,
+        }),
+    ];
+    for proof in host.prepare_managed_grid_batch_for_lane(surface, &rolling)? {
+        assert!(matches!(
+            host.dispatch_prepared(proof)?,
+            AccountDispatchOutcome::Accepted { .. }
+        ));
+    }
+
+    assert_eq!(host.gateway.rolling_dispatches.len(), 4);
+    assert!(host.gateway.rolling_dispatches[0].is_none());
+    let sealed = host.gateway.rolling_dispatches[1..]
+        .iter()
+        .map(|permit| permit.as_ref().ok_or("rolling permit"))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (index, permit) in sealed.iter().enumerate() {
+        assert_eq!(permit.binding(), &binding);
+        assert_eq!(permit.symbol(), &binding.symbol);
+        assert_eq!(permit.signed_private_generation(), 2);
+        assert_eq!(permit.child_index(), u8::try_from(index)?);
+        assert_eq!(permit.child_count(), 3);
+        assert_eq!(permit.batch_sha256(), sealed[0].batch_sha256());
+    }
     Ok(())
 }
 

@@ -302,7 +302,7 @@ Desired Orders，期间的新成交须先消费并重新计算目标集合。`Ru
 - 网格层数来自配置 `grid_count`；
 - 每个层级包含 long-open、long-close、short-open、short-close 四种语义订单，但平仓单可受真实库存限制；
 - closing wave（平仓批次）先于 opening wave（开仓批次）；
-- Binance 初装/重建在 closing wave 完成后先完整重验一次规则和 BBO，随后每个 opening 进入物理边界前只重新读取不超过 3 秒的同规则 BBO；不得仅为刷新 BBO 而给每张 opening 重复下载完整 exchange-info。每条物理 dispatch 仍须在签名 preflight 中重验同一规则全集并刷新配置锚点的完整私有候选；命令仍属于该锚点时必须复用刚刷新的同代候选，不得立即重复读取，跨 symbol 命令则继续独立读取精确 scope。首次规则重验失败、任一 opening 已穿价或行情过期时，剩余 Prepared opening 必须终态拒绝且不得发送，已接受子集转签名撤净后使用新 epoch 重建；Gate/Bitget 接管前须分别接入同等的原生刷新源；
+- Binance 初装/重建在 closing wave 完成后先完整重验一次规则和 BBO，随后每个 opening 进入物理边界前只重新读取不超过 3 秒的同规则 BBO；不得仅为刷新 BBO 而给每张 opening 重复下载完整 exchange-info。普通物理 dispatch 在签名 preflight 中重验同一规则全集并刷新配置锚点的完整私有候选；命令仍属于该锚点时必须复用刚刷新的同代候选，不得立即重复读取，跨 symbol 命令则继续独立读取精确 scope。正常成交滚动仅可凭 Host 封存的有序 `2 PlaceLimit + 1 Cancel` 批次摘要、child index、账户/symbol 与签名 private generation，在第一个 child 完整预检后复用同一 adapter private/rules generation，最多 10 秒；三个 child 仍各自经过 WAL Submitted、单次 dispatch 和精确签名回读。错序、混批、超时、generation/rules 漂移、Rejected、Unknown 或非该批次调用均立即清除复用状态并恢复完整预检，绝不自动重投。首次规则重验失败、任一 opening 已穿价或行情过期时，剩余 Prepared opening 必须终态拒绝且不得发送，已接受子集转签名撤净后使用新 epoch 重建；Gate/Bitget 接管前须分别接入同等的原生刷新源；
 - maker（挂单成交）驱动滚动，taker（吃单成交）只进入库存和对账，不伪造成网格动作；
 - 滚动补撤保持固定目标层数；补单会穿价、批次拒绝或订单集合无法证明时，转签名重建。
 

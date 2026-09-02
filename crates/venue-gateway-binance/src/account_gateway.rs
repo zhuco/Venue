@@ -77,6 +77,7 @@ pub struct BinanceAccountGateway {
     public_stream: Option<BinancePublicWsTransport>,
     public_stream_failed: bool,
     public_snapshot_pending: bool,
+    rolling_dispatch_cache: Option<account_gateway_symbol_dispatch::BinanceRollingDispatchCache>,
 }
 
 const PRIVATE_STREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -176,6 +177,7 @@ impl BinanceAccountGateway {
             public_stream: None,
             public_stream_failed: false,
             public_snapshot_pending: true,
+            rolling_dispatch_cache: None,
         })
     }
 
@@ -189,6 +191,7 @@ impl BinanceAccountGateway {
     }
 
     fn refresh_private(&mut self) -> Result<(), BinanceAccountGatewayError> {
+        self.rolling_dispatch_cache = None;
         let current = self.runtime.block_on(fetch_rules_catalog(
             &self.transport,
             self.config.gateway_binding(),
@@ -244,6 +247,7 @@ impl BinanceAccountGateway {
 
     fn ensure_private_stream(&mut self) -> Result<bool, BinanceAccountGatewayError> {
         if self.private_stream.is_none() {
+            self.rolling_dispatch_cache = None;
             if self.private_stream_reconnect.waiting(Instant::now()) {
                 return Ok(false);
             }
@@ -364,6 +368,7 @@ impl BinanceAccountGateway {
     }
 
     fn record_private_stream_failure(&mut self) -> bool {
+        self.rolling_dispatch_cache = None;
         self.private_stream = None;
         self.private_stream_keepalive_at = None;
         self.private_stream_reconnect.record_failure(
