@@ -12,6 +12,36 @@ const USDC_ASSET_INDEX: &str = include_str!("../tests/fixtures/asset-index-usdc.
 const LIMIT_BOOK: &[u8] = include_bytes!("../tests/fixtures/limit-book-ticker.json");
 
 #[test]
+fn signed_snapshot_collection_retries_only_the_read_and_stays_bounded() {
+    let mut calls = 0_u8;
+    let mut delays = Vec::new();
+    let recovered = retry_signed_snapshot_collection(
+        || {
+            calls = calls.saturating_add(1);
+            if calls < 3 { Err("transient") } else { Ok(7) }
+        },
+        |delay| delays.push(delay),
+    );
+    assert_eq!(recovered, Ok(7));
+    assert_eq!(calls, 3);
+    assert_eq!(
+        delays,
+        vec![Duration::from_millis(250), Duration::from_millis(500)]
+    );
+
+    let mut failed_calls = 0_u8;
+    let failed: Result<(), &str> = retry_signed_snapshot_collection(
+        || {
+            failed_calls = failed_calls.saturating_add(1);
+            Err("persistent")
+        },
+        |_| {},
+    );
+    assert_eq!(failed, Err("persistent"));
+    assert_eq!(failed_calls, 3);
+}
+
+#[test]
 fn dispatch_reuses_only_the_fresh_anchor_private_candidate()
 -> Result<(), Box<dyn std::error::Error>> {
     let (_, _, binding) = limit_fixture()?;

@@ -81,6 +81,8 @@ pub struct BinanceAccountGateway {
 }
 
 const PRIVATE_STREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const SIGNED_SNAPSHOT_COLLECTION_ATTEMPTS: u8 = 3;
+const SIGNED_SNAPSHOT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 
 /// One normalized, read-only public fact from the fixed Binance combined stream.  It is not a
 /// strategy decision and has no relation to private account generations or mutation authority.
@@ -668,28 +670,35 @@ impl AccountPhysicalGateway for BinanceAccountGateway {
         {
             return Err(AccountHostValidationError::SignedSnapshot);
         }
-        let attempt = self
-            .take_attempt_id()
-            .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-        let next_private_generation = self
-            .next_private_generation()
-            .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-        let transport = self
-            .transport_for_private_generation(next_private_generation)
-            .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-        let snapshot =
-            self.runtime
-                .block_on(fetch_account_wide_snapshot(BinanceSnapshotCollection {
-                    transport: &transport,
-                    credentials: &self.credentials,
-                    config: &self.config,
-                    selected_rules: &self.rules,
-                    connection_generation: self.connection_generation,
-                    private_generation: next_private_generation,
-                    rules_generation: self.rules.instrument.generation,
-                    attempt_id: attempt,
-                    recovery: request,
-                }))?;
+        self.rolling_dispatch_cache = None;
+        let (snapshot, transport, next_private_generation) = retry_signed_snapshot_collection(
+            || {
+                let attempt = self
+                    .take_attempt_id()
+                    .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+                let next_private_generation = self
+                    .next_private_generation()
+                    .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+                let transport = self
+                    .transport_for_private_generation(next_private_generation)
+                    .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+                let snapshot = self.runtime.block_on(fetch_account_wide_snapshot(
+                    BinanceSnapshotCollection {
+                        transport: &transport,
+                        credentials: &self.credentials,
+                        config: &self.config,
+                        selected_rules: &self.rules,
+                        connection_generation: self.connection_generation,
+                        private_generation: next_private_generation,
+                        rules_generation: self.rules.instrument.generation,
+                        attempt_id: attempt,
+                        recovery: request,
+                    },
+                ))?;
+                Ok((snapshot, transport, next_private_generation))
+            },
+            std::thread::sleep,
+        )?;
         self.transport = transport;
         self.private_generation = next_private_generation;
         Ok(snapshot)
@@ -740,6 +749,23 @@ impl AccountPhysicalGateway for BinanceAccountGateway {
 
     fn dispatch(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
         self.dispatch_permit(permit)
+    }
+}
+
+fn retry_signed_snapshot_collection<T, E>(
+    mut collect: impl FnMut() -> Result<T, E>,
+    mut wait: impl FnMut(Duration),
+) -> Result<T, E> {
+    let mut attempt = 1_u8;
+    loop {
+        match collect() {
+            Ok(value) => return Ok(value),
+            Err(_) if attempt < SIGNED_SNAPSHOT_COLLECTION_ATTEMPTS => {
+                wait(SIGNED_SNAPSHOT_RETRY_BASE_DELAY * u32::from(attempt));
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
