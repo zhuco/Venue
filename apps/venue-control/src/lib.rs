@@ -15,6 +15,10 @@ mod copy_relation_postgres;
 mod copy_relation_repository;
 mod copy_repository;
 mod copy_worker;
+pub mod executor_exchange;
+pub mod executor_runtime;
+pub mod executor_secret;
+pub mod executor_store;
 mod http;
 mod indicator_projection;
 pub mod kol_mvp;
@@ -52,6 +56,7 @@ pub use copy_worker::{
     CopyPlanningSnapshot, CopySemanticJob, CopyWorker, CopyWorkerConfig, CopyWorkerError,
     FrozenCapitalSnapshot, MIGRATION_0003, PlannedCopyJob, relation_commitment,
 };
+pub use executor_store::PlannedCopyCommand;
 pub use http::{
     ControlHttpConfig, HttpServerError, control_shutdown_channel, serve_local,
     serve_local_with_accounts, serve_local_with_indicators,

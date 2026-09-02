@@ -123,7 +123,7 @@ KOL Binance TRADE 成交
 
 ## 10. 当前完成度
 
-仓库已经有账户认证、Binance凭证密文、只读探测、Web运维页面、手动语义协议和复杂Copy/Grid代码；尚未有面向公众的邀请注册、KOL页面、浏览器自助API绑定、轻量多账户Executor或真实快速跟单闭环。
+仓库已有邀请注册、KOL 页面、真实用户 Cookie BFF、浏览器自助 API 绑定与跟单设置；P3-B 已把单例锁、源成交去重、目标/确定性命令生成、owner-scoped 密文、Pending activation 双账户基线与重启/超时 readback 状态机接成 PostgreSQL+mock 离线循环。生产 Binance 私流、规则/仓位/部分成交签名读回和真实 transport 尚未进入 binary，因此不存在可用的快速跟单闭环或实盘准入。
 
 完成标准只以 [`KOL_COPY_MVP.md`](KOL_COPY_MVP.md) 为准。文档更新本身不启动服务、不迁移账户，也不表示实盘已可用。
 

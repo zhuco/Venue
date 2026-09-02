@@ -299,6 +299,16 @@ P0 已落地的边界是 `0017_kol_copy_mvp.sql`、`venue-control-protocol::kol`
 - 实现 KOL 成交去重、断线补查、双腿目标计算、目标合并、实时规则归一化和轻量命令账本。
 - 在统一 Binance adapter 内补齐 `PlaceMarket`，复用现有市场减仓、签名回读和错误解析；不创建旁路 HTTP client。
 - 把 KOL 基础终端接到同一命令账本和账户队列，支持显式 `positionSide` 的市价/限价开平仓、精确撤单及签名订单/成交/仓位回显。
+
+当前预备边界：Binance adapter 的 Hedge Mode 市价开仓预备路径显式携带 `positionSide` 且从不序列化 Binance 禁止的 `reduceOnly`；`kol_executor.rs` 已持久化领取 Pending、同账户 Sending/ReconcileRequired 栅栏和 `Accepted/Rejected/ReconcileRequired/Reconciled/Cancelled` 的单向状态迁移。它不含私流、目标计算、解密、传输或 binary，尚不构成 P3 完成。
+
+离线调度层进一步固定为中心化有界 round-robin：每个账户最多一个 in-flight，单账户积压最多 16，全局最多 32 个 in-flight；该层不创建每账户 task、Actor 或恢复 journal。`source_fill_from_private` 只接收 Binance adapter 已认证且带明确 Long/Short 腿的成交，`scaled_copy_quantity` 只做已持久化源成交后的比例计算。私流连接、密文解密、签名发送、精确回读、重启对账与 `venue-executor-binance` binary 尚未接通，不能将这些纯离线边界视为 P3 完成。
+
+P3-A 已接通受限依赖边界：`PgExecutorStore` 在 PostgreSQL 中按 native trade identity 去重源成交、读取未终态命令，并只在 Pending activation 的 relation revision 匹配时提升为 Active；`ExecutorSecretProvider` 只用 `(credential_id, owner_user_id)` 查询密文并复用 AES-256-GCM AAD 解密为不可序列化的 adapter 密钥容器。
+
+P3-B 将这些边界组合成离线可验证的 `BinanceExecutorRuntime`：同一事务内对源成交去重、推进 relation/腿目标并生成不超过 36 字符的确定性命令 ID；重启先对 `Sending/Accepted/ReconcileRequired` 做同 ID readback，超时和损坏响应只进入 `ReconcileRequired`，绝不回到 Pending 或重发；每个账户只领取最旧 Pending。启用请求只在 KOL 与 follower 两次签名基线都干净时提升，任一基线失败则拒绝。PostgreSQL+mock 集成 fixture 覆盖重复成交、重启、超时、拒单和启用成功。
+
+这仍不是 P3 完成或实盘准入：`venue-executor-binance` 还没有把生产 Binance 私流、按账户规则/仓位读回、完整/部分成交投影与真实 `BinanceHttpTransport` 组装成部署循环；其当前 binary 必须继续失败关闭，不能作为生产 writer 启动。真实网络、真实 Canary 和 2核4G 主机仍属外部验收。
 - 实现 Pending/Sending/Accepted/Rejected/ReconcileRequired/Reconciled、重启恢复、账户隔离和 UI 投影。
 
 完成门：离线端到端证明终端与跟单不会争抢同一账户，且重复事件、重启、超时、响应损坏、部分成交、两腿并存和关系暂停均不重复下单、不跨零、不拖垮其他账户。

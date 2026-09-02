@@ -132,7 +132,7 @@ Rust/Cargo 1.98.0、cargo-zigbuild 0.23.0、Zig 0.16.0 和 `x86_64-unknown-linux
 ./scripts/Build-VenueUbuntu.ps1 -SourceRoot G:\Build\Venue\ubuntu\source -ExpectedRevision <完整40位commit> -ReleaseId <版本号> -Component Control -CheckOnly
 ```
 
-- 专用根为 `G:\Build\Venue\ubuntu`：`source` 可存固定 revision 的独立 checkout；当前脚本的 Nodes release 仅含六个冻结 Node binary，Control release 仅含 `venue-control-server`、`venue-copy-worker`，两者均另含 SHA256SUMS 与 manifest。P3 必须把 `venue-executor-binance` 纳入受控构建并从 MVP 发布清单移除旧 Copy 入口后才能发布。工具缓存为 `zig-cache/zig-local-cache/zigbuild-cache`。源码只用干净 Git clone/bundle，不复制 `.env`、账户工件或未提交文件；已有 checkout 不自动 reset。
+- 专用根为 `G:\Build\Venue\ubuntu`：`source` 可存固定 revision 的独立 checkout；当前脚本的 Nodes release 仅含六个冻结 Node binary，Control release 仅含 `venue-control-server`、`venue-copy-worker`，两者均另含 SHA256SUMS 与 manifest。P3 的生产 transport 闭合后，才可把 `venue-executor-binance` 纳入受控构建并从 KOL 发布清单移除旧 Copy 入口；离线发布和回滚清单见 [`KOL_EXECUTOR_RELEASE.md`](KOL_EXECUTOR_RELEASE.md)。工具缓存为 `zig-cache/zig-local-cache/zigbuild-cache`。源码只用干净 Git clone/bundle，不复制 `.env`、账户工件或未提交文件；已有 checkout 不自动 reset。
 - Cargo 仍使用既有 `slot-2` 锁和两个全局并发许可，其自动目标子目录 `slot-2/x86_64-unknown-linux-gnu/release` 不是另设 target root。六所按顺序、每次两个 Cargo jobs；全部目录计入 150 GiB 总预算。不清理 Windows 缓存，不安装工具、不改全局配置。
 - `-CheckOnly` 不新建输出、锁或缓存；正式构建前后均校验 HEAD 和干净状态，manifest 另记录构建入口/辅助/guard 脚本哈希，运行期间脚本变动则拒绝发布。源码 checkout 必须由构建独占，其他任务不得在构建期间同步或编辑；前后 Git 检查不是文件系统只读沙箱。输出要求 ELF64/x86-64，拒绝误复制 Windows exe；目录原子转为新 release，已有 release 不覆盖。失败保留缓存和本次 `.stage.*` 目录，不把不完整目录当发布包。
 - 入口持锁覆盖构建、ELF/哈希核验和复制，finally 还原 Cargo/Zig 环境并释放锁。版本化产物仅表示编译完成；KOL MVP 仍须完成 API/双向持仓验证、Executor/Binance、UI、容量和真实 Canary 验收。冻结旧链的签名 preflight 与 writer/WAL 接管另行处理。
