@@ -839,6 +839,30 @@ fn terminal_rejected_reconciliation_rebuild_rearms_only_after_signed_drain_shape
 }
 
 #[test]
+fn signed_empty_surface_prunes_routes_orphaned_by_fill_burst_before_rebuild()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut bridge, _key, _source, _native) = bridge_with_accepted_order()?;
+    bridge.mark_bootstrap_confirmed()?;
+    bridge.begin_startup_reconciliation()?;
+    let orphaned = bridge.routes.len();
+    assert!(orphaned > 0);
+
+    // This is the durable shape produced when signed fill catch-up retires the reducer's last
+    // owned orders while earlier startup cancels are still becoming absent at the venue.
+    bridge.grid.owned_orders.clear();
+    bridge.grid.reset_orders_settled()?;
+    assert_eq!(
+        bridge.settle_signed_absent_reconciliation_orders(&[])?,
+        orphaned
+    );
+    assert!(bridge.routes.is_empty());
+    assert!(bridge.needs_reconciliation_rebuild());
+    assert_eq!(bridge.next_install_epoch()?, 2);
+    bridge.checkpoint_bytes()?;
+    Ok(())
+}
+
+#[test]
 fn partial_fills_accumulate_across_checkpoint_and_retire_the_completed_route()
 -> Result<(), Box<dyn std::error::Error>> {
     let (mut bridge, key, source, native_order_id) = bridge_with_accepted_order()?;

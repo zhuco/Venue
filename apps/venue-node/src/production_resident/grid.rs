@@ -910,7 +910,29 @@ impl GridBridgeState {
         for key in &absent {
             self.settle_reconciliation_cancel(key)?;
         }
-        Ok(absent.len())
+        // A burst of signed fills can retire the reducer's last owned orders before previously
+        // Accepted startup cancels become visible as absent. Those route projections no longer
+        // have a reducer source key, so they cannot be settled by the loop above. They may be
+        // discarded only after the same complete signed snapshot proves the whole surface empty.
+        let orphaned = if self.grid.owned_orders.is_empty() && orders.is_empty() {
+            self.routes
+                .keys()
+                .filter(|key| !self.grid.owned_orders.contains_key(*key))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for key in &orphaned {
+            self.routes
+                .remove(key)
+                .ok_or(GridBridgeError::UnknownOrder)?;
+        }
+        self.validate()?;
+        absent
+            .len()
+            .checked_add(orphaned.len())
+            .ok_or(GridBridgeError::Evidence)
     }
 
     pub(crate) fn expected_signed_surface(

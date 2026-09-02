@@ -272,6 +272,8 @@ owned maker fill 的滚动价格来自既有 epoch。急涨成交后快速回落
 
 Grid bridge 对同一已接受 native order 的部分成交必须在策略 checkpoint 按精确 native id、不可变 fill id 和累计数量持久化；累计恰好等于原委托量时才一次调用 reducer，并在同一 checkpoint 退休已成交 route。完成后用户流重连或签名补查若重放任一早期 slice，必须以 native order id 从 Host/WAL 找回精确 Accepted `PlaceLimit` 命令，再与 reducer 的完整 source key、确定性 command/client id、订单语义和 maker 完成记录共同证明重复；不得按价格猜测、再次滚动或因 route 已退休而退出。partial 的重复 id 内容不一致、数量超原单、价格偏离原 PostOnly 委托或 checkpoint 路由无法完整反序列化都失败关闭。复杂 Grid key 以已校验 route 记录列表持久化，不以 JSON map key 或价格/方向推导；只兼容旧空 route checkpoint，非空旧对象拒绝恢复。
 
+启动重置中若成交补查已退休 reducer 的全部 `owned_orders`，但较早 Accepted 的撤单仍留下 route 投影，只有同一份完整签名快照证明交易所表面确实为空时才可清除这些无 source 的孤儿 route，并持久化后进入下一 epoch；非空、额外或形状变化的签名表面继续失败关闭。
+
 公共 socket/journal 只在 resident 公共 turn 推进，供初装、整网重建和再中心化使用；它的缺失或过期不阻塞完整成交的滚动 dispatch。`mutation_dispatched`、`private_reconcile_required` 与 `recenter_required` 继续区分已发批次、后续私有对账和 reducer 明确要求的整网重心迁移；BBO 不再产生成交滚动的等待状态。
 
 每次已有 Grid 冷启动都固定执行“校时、先建立认证用户流、签名确认、撤旧、按当前 BBO/仓位重建”，不得恢复旧价位的 pending transaction。用户流必须在首个启动 mutation 前建连，并贯穿签名确认与重建；先消费与 checkpoint accepted route 精确匹配且尚未耐久应用的签名成交，再逐字节核对 pending 的全部 deterministic command 与 Host WAL。只有全部子命令为 Absent 或终态 Rejected、且 rollback 后的 client/native/owner/订单形状与最新签名全集精确一致，才可保留成交事实、丢弃未提交 replacement 并进入一个耐久 reconciliation episode。Host 取得账户锁后、Actor 注册前先把崩溃遗留 `Prepared` 原地终结为 `Rejected`；该状态证明未跨越已 fsync 的 `Submitted`，因此不派发原 ID，再按新 attempt/epoch 身份继续。`Submitted` 在同一阶段转为 `Unknown` 并只做签名对账；`Unknown` 或命令字节不一致一律暂停，旧 ID 不重投。
