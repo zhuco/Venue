@@ -8,7 +8,7 @@ use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use venue_control_protocol::kol::ExecutorCommandState;
-use venue_domain::domain::{FieldState, OrderSide, PositionSide};
+use venue_domain::domain::{FieldState, OrderSide, PositionSide, Symbol};
 use venue_gateway_binance::BinancePrivateFillEvent;
 
 /// Fixed KOL MVP scheduling bounds. One central executor owns these queues; they are data
@@ -29,6 +29,11 @@ pub struct ClaimedBinanceCommand {
     pub owner_user_id: String,
     pub trading_account_id: String,
     pub credential_id: String,
+    pub symbol: Symbol,
+    pub side: OrderSide,
+    pub position_side: PositionSide,
+    pub quantity: Decimal,
+    pub reducing: bool,
     pub client_order_id: String,
     pub state: ExecutorCommandState,
 }
@@ -257,7 +262,7 @@ impl BinanceCommandLedger {
              ORDER BY c.created_ms,c.command_id LIMIT 1 FOR UPDATE SKIP LOCKED) \
              UPDATE venue_binance_commands c SET command_state='sending',sending_ms=$2,updated_ms=$2 \
              FROM candidate WHERE c.command_id=candidate.command_id \
-             RETURNING c.command_id,c.owner_user_id,c.trading_account_id,c.credential_id,c.client_order_id,c.command_state",
+             RETURNING c.command_id,c.owner_user_id,c.trading_account_id,c.credential_id,c.symbol,c.order_side,c.position_side,c.requested_quantity,c.command_phase,c.client_order_id,c.command_state",
         )
         .bind(trading_account_id)
         .bind(now)
@@ -327,6 +332,40 @@ fn claimed(row: sqlx::postgres::PgRow) -> Result<ClaimedBinanceCommand, BinanceC
         credential_id: row
             .try_get("credential_id")
             .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
+        symbol: row
+            .try_get::<String, _>("symbol")
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+            .parse()
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
+        side: match row
+            .try_get::<String, _>("order_side")
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+            .as_str()
+        {
+            "buy" => OrderSide::Buy,
+            "sell" => OrderSide::Sell,
+            _ => return Err(BinanceCommandLedgerError::Unavailable),
+        },
+        position_side: match row
+            .try_get::<String, _>("position_side")
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+            .as_str()
+        {
+            "long" => PositionSide::Long,
+            "short" => PositionSide::Short,
+            _ => return Err(BinanceCommandLedgerError::Unavailable),
+        },
+        quantity: row
+            .try_get::<String, _>("requested_quantity")
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+            .parse()
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
+        reducing: matches!(
+            row.try_get::<String, _>("command_phase")
+                .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+                .as_str(),
+            "close"
+        ),
         client_order_id: row
             .try_get("client_order_id")
             .map_err(|_| BinanceCommandLedgerError::Unavailable)?,

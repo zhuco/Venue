@@ -123,9 +123,9 @@ KOL Binance TRADE 成交
 
 ## 10. 当前完成度
 
-仓库已有邀请注册、KOL 页面、真实用户 Cookie BFF、浏览器自助 API 绑定与跟单设置；P3-B 已把单例锁、源成交去重、目标/确定性命令生成、owner-scoped 密文、Pending activation 双账户基线与重启/超时 readback 状态机接成 PostgreSQL+mock 离线循环。生产 Binance 私流、规则/仓位/部分成交签名读回和真实 transport 尚未进入 binary，因此不存在可用的快速跟单闭环或实盘准入。
+仓库已有邀请注册、KOL 页面、真实用户 Cookie BFF、浏览器自助 API 绑定与跟单设置。`venue-executor-binance` 是唯一生产组装入口：它只接受明确 `LIVE`、受限 PostgreSQL URL 和现有主密钥配置，取得 PostgreSQL advisory singleton 后，先完成 Pending activation 的双账户签名基线与未终态同 ID 回读，再为已激活 KOL 账户建立认证私流。私流只接纳 `ORDER_TRADE_UPDATE/TRADE` 的规范成交，数据库按 native trade ID 去重；断线、listenKey 过期或账户语义缺口以有界退避重连并触发签名 REST 订单/成交/仓位补读。Binance MARKET 发送与精确回读复用同一 adapter，绝无 mock、testnet 或 dry-run 运行模式。
 
-完成标准只以 [`KOL_COPY_MVP.md`](KOL_COPY_MVP.md) 为准。文档更新本身不启动服务、不迁移账户，也不表示实盘已可用。
+完成标准只以 [`KOL_COPY_MVP.md`](KOL_COPY_MVP.md) 为准。真实凭证联调、2 核 4 GiB 压测和隔离账户 Canary 仍是外部验收；文档更新本身不启动服务、不迁移账户，也不表示实盘已可用。
 
 <a id="deprecated"></a>
 

@@ -46,7 +46,7 @@ Windows 所有 Cargo 命令都经过 guard。下面是需要全量基线时的�
 - [账户管理](ACCOUNT_MANAGEMENT.md) 说明 Control/桌面启动环境；运行前先受控 build，
   再从 guard 选择的固定缓存启动已构建 binary，不用长期 `cargo run` 占用构建槽。
 - [Web README](WEB.md) 说明 BFF 会话、同源 HTTPS、npm 验证与五视口测试。
-- 新 KOL 链真实交易须满足唯一 `venue-executor-binance`、账户内串行、PostgreSQL 命令账本、签名回读和获准风险范围；冻结旧 Node 维护仍遵守原 writer/WAL 契约。文档更新不触发实盘测试。
+- 新 KOL 链只由 `venue-executor-binance` 执行：它要求精确 `VENUE_EXECUTOR_MODE=LIVE`、`VENUE_EXECUTOR_DATABASE_URL` 的 PostgreSQL URL 和现有 credential master key，取得 advisory singleton 后先 activation baseline/未终态 readback，再建立已激活 KOL 私流并进入有界循环。缺配置、权限、规则或基线失败一律 fail-closed；没有 mock/dry-run/testnet 运行模式。SIGINT/SIGTERM 停止循环、关闭私流并释放锁。冻结旧 Node 维护仍遵守原 writer/WAL 契约。文档更新不触发实盘测试。
 
 UI 完成标准包括移动/桌面布局截图、空/错误/离线状态、作用域与确认交互、网关联通和分段延迟。
 本地 fixture/BFF 性能报告不能代替 Executor→Binance 的实际延迟；冻结旧 Node 的历史结果也不能代替新链验收。

@@ -308,7 +308,9 @@ P3-A 已接通受限依赖边界：`PgExecutorStore` 在 PostgreSQL 中按 nativ
 
 P3-B 将这些边界组合成离线可验证的 `BinanceExecutorRuntime`：同一事务内对源成交去重、推进 relation/腿目标并生成不超过 36 字符的确定性命令 ID；重启先对 `Sending/Accepted/ReconcileRequired` 做同 ID readback，超时和损坏响应只进入 `ReconcileRequired`，绝不回到 Pending 或重发；每个账户只领取最旧 Pending。启用请求只在 KOL 与 follower 两次签名基线都干净时提升，任一基线失败则拒绝。PostgreSQL+mock 集成 fixture 覆盖重复成交、重启、超时、拒单和启用成功。
 
-这仍不是 P3 完成或实盘准入：`venue-executor-binance` 还没有把生产 Binance 私流、按账户规则/仓位读回、完整/部分成交投影与真实 `BinanceHttpTransport` 组装成部署循环；其当前 binary 必须继续失败关闭，不能作为生产 writer 启动。真实网络、真实 Canary 和 2核4G 主机仍属外部验收。
+P3-C 已闭合 production adapter 与 binary：`BinanceHttpExecution` 使用固定 `BinanceHttpTransport` 的签名、`exchangeInfo` 规则、`prepare_place_market` 与一次 POST 后精确回读。数量按 stepSize 向下归一，低于 minQty/minNotional 或缺签名价格、规则、Hedge 腿即拒绝；Hedge MARKET 开仓不传 `reduceOnly`。ACK、accountTradeList 和 position risk 必须共同收敛才进入 Reconciled，部分成交、订单缺失、仓位不符或响应不明保持 Accepted/Unknown；超时、断连和损坏 ACK 只按原 clientOrderId 查询，绝不再次 POST。
+
+`venue-executor-binance` 只接受 `VENUE_EXECUTOR_MODE=LIVE`、`VENUE_EXECUTOR_DATABASE_URL` 的 PostgreSQL URL 与既有 credential master key；无 mock、dry-run 或 testnet 配置。它持有 advisory singleton，启动先完成 Pending activation 的双账户签名基线并恢复未终态命令，随后对已激活 KOL 账户建立 listenKey 私流。只把 `ORDER_TRADE_UPDATE/TRADE` 映射为规范成交；重复 WS/REST 成交由 `(account,native symbol,native trade id)` 去重，断线、过期和 gap 触发签名 REST 补读与状态对账，原始帧不持久化。SIGINT/SIGTERM 令循环停止、私流析构并释放锁。真实凭证联调、2核4G复验和真实 Canary 仍是外部验收，不构成实盘准入。
 - 实现 Pending/Sending/Accepted/Rejected/ReconcileRequired/Reconciled、重启恢复、账户隔离和 UI 投影。
 
 完成门：离线端到端证明终端与跟单不会争抢同一账户，且重复事件、重启、超时、响应损坏、部分成交、两腿并存和关系暂停均不重复下单、不跨零、不拖垮其他账户。

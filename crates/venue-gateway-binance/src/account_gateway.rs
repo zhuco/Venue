@@ -35,9 +35,12 @@ mod account_gateway_private_stream;
 pub use account_gateway_private_stream::{BinancePrivateAccountEvent, BinancePrivateFillEvent};
 #[cfg(test)]
 use account_gateway_private_stream::{
-    PRIVATE_STREAM_MAX_RECONNECT_DELAY, private_stream_reconnect_delay,
+    PRIVATE_STREAM_MAX_RECONNECT_DELAY, normalize_private_stream_event,
+    private_stream_reconnect_delay,
 };
-use account_gateway_private_stream::{PrivateStreamReconnectState, normalize_private_stream_event};
+use account_gateway_private_stream::{
+    PrivateStreamReconnectState, normalize_private_stream_event_for_symbols,
+};
 #[path = "account_gateway_symbol_dispatch.rs"]
 mod account_gateway_symbol_dispatch;
 use crate::{
@@ -125,6 +128,17 @@ impl BinanceAccountGateway {
     ) -> Result<Self, BinanceAccountGatewayError> {
         let credentials = BinanceCredentials::from_environment()
             .map_err(|_| BinanceAccountGatewayError::Credentials)?;
+        Self::connect_with_credentials_for_symbols(binding, symbols, credentials, limits)
+    }
+
+    /// Credential-owning hosts such as the KOL executor decrypt from their approved database
+    /// boundary. This constructor deliberately has no API-key environment fallback.
+    pub fn connect_with_credentials_for_symbols(
+        binding: GatewayBinding,
+        symbols: BTreeSet<Symbol>,
+        credentials: BinanceCredentials,
+        limits: BinanceTransportLimits,
+    ) -> Result<Self, BinanceAccountGatewayError> {
         let config = BinanceConfig::for_binding(BinanceAccountBinding::PortfolioMarginUm, &binding)
             .map_err(|_| BinanceAccountGatewayError::Binding)?;
         let runtime = Builder::new_current_thread()
@@ -339,9 +353,10 @@ impl BinanceAccountGateway {
             .map(BinancePrivateWsTransport::private_generation)
             .ok_or(BinanceAccountGatewayError::PrivateStream)?;
         match result {
-            Ok(Some(frame)) => match normalize_private_stream_event(
+            Ok(Some(frame)) => match normalize_private_stream_event_for_symbols(
                 frame,
                 self.config.gateway_binding(),
+                &self.rules_by_symbol.keys().cloned().collect(),
                 self.rules.instrument.generation,
                 stream_private_generation,
                 self.private_generation,
@@ -367,6 +382,31 @@ impl BinanceAccountGateway {
                 }
             }
         }
+    }
+
+    /// Performs a new complete signed account read after a private-stream loss boundary. The
+    /// returned fills are normalized facts only; raw REST pages and listen keys never leave the
+    /// adapter. The durable caller deduplicates their native trade IDs against stream fills.
+    pub fn reconcile_private_stream_gap(
+        &mut self,
+    ) -> Result<Vec<BinancePrivateAccountEvent>, BinanceAccountGatewayError> {
+        self.refresh_private()?;
+        let received_at_ms = now_ms()?;
+        Ok(self
+            .private
+            .fills()
+            .iter()
+            .cloned()
+            .map(|fill| {
+                BinancePrivateAccountEvent::Fill(BinancePrivateFillEvent {
+                    stream_private_generation: self.private_generation,
+                    private_generation: self.private_generation,
+                    received_at_ms,
+                    client_order_id: FieldState::Missing,
+                    fill,
+                })
+            })
+            .collect())
     }
 
     fn record_private_stream_failure(&mut self) -> bool {

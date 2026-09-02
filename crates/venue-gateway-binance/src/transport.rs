@@ -223,6 +223,20 @@ impl BinanceHttpTransport {
         &self.config
     }
 
+    /// Public execution composition may construct a same-generation signed read scope, but it
+    /// cannot select another endpoint or mutate this transport's binding.
+    #[must_use]
+    pub const fn instrument_generation(&self) -> u64 {
+        self.instrument_generation
+    }
+
+    /// Public execution composition may construct a same-generation signed read scope, but it
+    /// cannot select another endpoint or mutate this transport's binding.
+    #[must_use]
+    pub const fn private_generation(&self) -> u64 {
+        self.private_generation
+    }
+
     pub(crate) const fn recovery_instrument_generation(&self) -> u64 {
         self.instrument_generation
     }

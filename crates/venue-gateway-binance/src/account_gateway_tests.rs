@@ -297,6 +297,37 @@ fn private_stream_fill_keeps_socket_generation_and_admits_against_current_snapsh
 }
 
 #[test]
+fn private_stream_admits_each_enabled_kol_symbol_without_retaining_the_frame()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_, rules, binding) = limit_fixture()?;
+    let eth: Symbol = "ETH/USDT".parse()?;
+    let symbols = BTreeSet::from([binding.symbol.clone(), eth.clone()]);
+    let event = normalize_private_stream_event_for_symbols(
+        BinanceRawPrivateFrame {
+            binding: binding.clone(),
+            instrument_generation: rules.instrument.generation,
+            private_generation: 9,
+            received_at_ms: 1_720_000_000_100,
+            payload: Bytes::from_static(
+                br#"{"e":"ORDER_TRADE_UPDATE","E":1000,"o":{"s":"ETHUSDT","c":"kol-eth-1","x":"TRADE","S":"SELL","ps":"SHORT","t":8,"i":12,"l":"0.02","L":"3000","m":false}}"#,
+            ),
+        },
+        &binding,
+        &symbols,
+        rules.instrument.generation,
+        9,
+        10,
+    )?
+    .ok_or("expected fill")?;
+    let BinancePrivateAccountEvent::Fill(event) = event else {
+        return Err("expected normalized fill event".into());
+    };
+    assert_eq!(event.fill.symbol, eth);
+    assert_eq!(event.fill.fill_id, "8");
+    Ok(())
+}
+
+#[test]
 fn private_stream_terminal_order_and_expiry_request_signed_reconciliation()
 -> Result<(), Box<dyn std::error::Error>> {
     let (_, rules, binding) = limit_fixture()?;

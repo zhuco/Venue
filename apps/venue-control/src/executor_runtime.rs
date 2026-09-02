@@ -105,12 +105,20 @@ where
                 (Ok(leader), Ok(follower)) => {
                     matches!(
                         self.exchange
-                            .activation_baseline(&activation.leader_trading_account_id, leader)
+                            .activation_baseline(
+                                &activation.leader_trading_account_id,
+                                &activation.symbols,
+                                leader,
+                            )
                             .await,
                         Ok(AccountBaseline::Clean)
                     ) && matches!(
                         self.exchange
-                            .activation_baseline(&activation.follower_trading_account_id, follower)
+                            .activation_baseline(
+                                &activation.follower_trading_account_id,
+                                &activation.symbols,
+                                follower,
+                            )
                             .await,
                         Ok(AccountBaseline::Clean)
                     )
@@ -300,6 +308,11 @@ fn request(command: &ClaimedBinanceCommand) -> ExecutionRequest {
         command_id: command.command_id.clone(),
         client_order_id: command.client_order_id.clone(),
         trading_account_id: command.trading_account_id.clone(),
+        symbol: command.symbol.clone(),
+        side: command.side,
+        position_side: command.position_side,
+        quantity: command.quantity,
+        reducing: command.reducing,
     }
 }
 
@@ -316,12 +329,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_keeps_the_durable_identities_verbatim() {
+    fn request_keeps_the_durable_identities_verbatim() -> Result<(), Box<dyn std::error::Error>> {
         let command = ClaimedBinanceCommand {
             command_id: "command".into(),
             owner_user_id: "owner".into(),
             trading_account_id: "account".into(),
             credential_id: "credential".into(),
+            symbol: "BTC/USDT".parse()?,
+            side: venue_domain::domain::OrderSide::Buy,
+            position_side: venue_domain::domain::PositionSide::Long,
+            quantity: rust_decimal::Decimal::new(1, 3),
+            reducing: false,
             client_order_id: "client".into(),
             state: ExecutorCommandState::ReconcileRequired,
         };
@@ -331,7 +349,13 @@ mod tests {
                 command_id: "command".into(),
                 client_order_id: "client".into(),
                 trading_account_id: "account".into(),
+                symbol: "BTC/USDT".parse()?,
+                side: venue_domain::domain::OrderSide::Buy,
+                position_side: venue_domain::domain::PositionSide::Long,
+                quantity: rust_decimal::Decimal::new(1, 3),
+                reducing: false,
             }
         );
+        Ok(())
     }
 }

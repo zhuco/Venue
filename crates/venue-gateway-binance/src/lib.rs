@@ -16,6 +16,7 @@ mod sign;
 mod transport;
 
 use venue_gateway_api::CapabilityFlags;
+pub use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
 
 pub use account_gateway::{
     BinanceAccountGateway, BinanceAccountGatewayError, BinanceGridBootstrapMarketFacts,

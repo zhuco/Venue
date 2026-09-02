@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     str,
     time::{Duration, Instant},
 };
@@ -100,9 +101,28 @@ pub enum BinancePrivateAccountEvent {
     },
 }
 
+#[cfg(test)]
 pub(super) fn normalize_private_stream_event(
     frame: BinanceRawPrivateFrame,
     binding: &GatewayBinding,
+    rules_generation: u64,
+    stream_private_generation: u64,
+    active_private_generation: u64,
+) -> Result<Option<BinancePrivateAccountEvent>, BinanceAccountGatewayError> {
+    normalize_private_stream_event_for_symbols(
+        frame,
+        binding,
+        &BTreeSet::from([binding.symbol.clone()]),
+        rules_generation,
+        stream_private_generation,
+        active_private_generation,
+    )
+}
+
+pub(super) fn normalize_private_stream_event_for_symbols(
+    frame: BinanceRawPrivateFrame,
+    binding: &GatewayBinding,
+    symbols: &BTreeSet<venue_domain::domain::Symbol>,
     rules_generation: u64,
     stream_private_generation: u64,
     active_private_generation: u64,
@@ -127,7 +147,19 @@ pub(super) fn normalize_private_stream_event(
     if event == "listenKeyExpired" {
         return Err(BinanceAccountGatewayError::PrivateStream);
     }
-    let Some(stream) = crate::private::parse_stream_fill(payload, &binding.symbol)
+    let stream_symbol = value
+        .get("o")
+        .and_then(Value::as_object)
+        .and_then(|order| order.get("s"))
+        .and_then(Value::as_str)
+        .and_then(|native| {
+            symbols
+                .iter()
+                .find(|symbol| crate::native_symbol(symbol) == native)
+        });
+    let Some(Some(stream)) = stream_symbol
+        .map(|symbol| crate::private::parse_stream_fill(payload, symbol))
+        .transpose()
         .map_err(|_| BinanceAccountGatewayError::PrivateStream)?
     else {
         let reconcile = match event {
@@ -161,7 +193,7 @@ pub(super) fn normalize_private_stream_event(
             }),
         );
     };
-    if stream.fill.symbol != binding.symbol || stream.fill.fill_id.trim().is_empty() {
+    if !symbols.contains(&stream.fill.symbol) || stream.fill.fill_id.trim().is_empty() {
         return Err(BinanceAccountGatewayError::PrivateStream);
     }
     Ok(Some(BinancePrivateAccountEvent::Fill(

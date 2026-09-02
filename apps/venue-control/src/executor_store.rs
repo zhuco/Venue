@@ -1,6 +1,6 @@
 //! PostgreSQL facts owned by the singleton executor; no local journal is created.
 
-use std::str::FromStr;
+use std::{collections::BTreeSet, str::FromStr};
 
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -40,12 +40,71 @@ pub struct PendingActivation {
     pub follower_user_id: String,
     pub follower_trading_account_id: String,
     pub follower_credential_id: String,
+    pub symbols: BTreeSet<venue_domain::domain::Symbol>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveKolPrivateSource {
+    pub kol_user_id: String,
+    pub leader_trading_account_id: String,
+    pub credential_id: String,
+    pub symbols: Vec<venue_domain::domain::Symbol>,
 }
 
 impl PgExecutorStore {
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Selects at most the enabled KOL account streams. A leader credential must be unique and
+    /// fresh; ambiguity is fail-closed before any decryption or listenKey request.
+    pub async fn active_kol_private_sources(
+        &self,
+        now_ms: u64,
+    ) -> Result<Vec<ActiveKolPrivateSource>, BinanceCommandLedgerError> {
+        let rows = sqlx::query("SELECT p.kol_user_id,p.leader_trading_account_id,ARRAY_AGG(DISTINCT symbols.value ORDER BY symbols.value) AS symbols,(SELECT c.credential_id FROM venue_api_credentials c WHERE c.user_id=p.kol_user_id AND c.trading_account_id=p.leader_trading_account_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' AND COALESCE((c.verification_json->>'expires_ms')::bigint,0)>$1 ORDER BY c.created_ms,c.credential_id LIMIT 1) AS credential_id,(SELECT count(*) FROM venue_api_credentials c WHERE c.user_id=p.kol_user_id AND c.trading_account_id=p.leader_trading_account_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' AND COALESCE((c.verification_json->>'expires_ms')::bigint,0)>$1) AS credential_count FROM venue_kol_profiles p JOIN venue_kol_follow_relations r ON r.kol_user_id=p.kol_user_id AND r.leader_trading_account_id=p.leader_trading_account_id AND r.relation_state='active' CROSS JOIN LATERAL jsonb_array_elements_text(r.allowed_symbols) AS symbols(value) WHERE p.profile_state='enabled' GROUP BY p.kol_user_id,p.leader_trading_account_id ORDER BY p.kol_user_id")
+            .bind(ms(now_ms)?)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+        if rows.len() > crate::kol_executor::MAX_ENABLED_KOLS {
+            return Err(BinanceCommandLedgerError::Conflict);
+        }
+        let mut sources = Vec::with_capacity(rows.len());
+        for row in rows {
+            let count: i64 = row
+                .try_get("credential_count")
+                .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+            if count != 1 {
+                return Err(BinanceCommandLedgerError::Conflict);
+            }
+            let raw_symbols: Vec<String> = row
+                .try_get("symbols")
+                .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+            let symbols = raw_symbols
+                .into_iter()
+                .map(|value| value.parse())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| BinanceCommandLedgerError::Conflict)?;
+            if symbols.is_empty() {
+                return Err(BinanceCommandLedgerError::Conflict);
+            }
+            sources.push(ActiveKolPrivateSource {
+                kol_user_id: row
+                    .try_get("kol_user_id")
+                    .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
+                leader_trading_account_id: row
+                    .try_get("leader_trading_account_id")
+                    .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
+                credential_id: row
+                    .try_get::<Option<String>, _>("credential_id")
+                    .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+                    .ok_or(BinanceCommandLedgerError::Conflict)?,
+                symbols,
+            });
+        }
+        Ok(sources)
     }
 
     /// Durable native trade identity makes repeated WS frames and restart replay idempotent.
@@ -199,7 +258,7 @@ impl PgExecutorStore {
     pub async fn recover_nonterminal(
         &self,
     ) -> Result<Vec<ClaimedBinanceCommand>, BinanceCommandLedgerError> {
-        let rows = sqlx::query("SELECT command_id,owner_user_id,trading_account_id,credential_id,client_order_id,command_state FROM venue_binance_commands WHERE command_state IN ('pending','sending','accepted','reconcile_required') ORDER BY created_ms,command_id")
+        let rows = sqlx::query("SELECT command_id,owner_user_id,trading_account_id,credential_id,symbol,order_side,position_side,requested_quantity,command_phase,client_order_id,command_state FROM venue_binance_commands WHERE command_state IN ('pending','sending','accepted','reconcile_required') ORDER BY created_ms,command_id")
             .fetch_all(&self.pool).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
         rows.into_iter().map(recovery_row).collect()
     }
@@ -267,7 +326,7 @@ impl PgExecutorStore {
         &self,
         now_ms: u64,
     ) -> Result<Vec<PendingActivation>, BinanceCommandLedgerError> {
-        let rows = sqlx::query("SELECT a.relation_id,a.relation_revision,r.kol_user_id,r.leader_trading_account_id,r.follower_user_id,r.follower_trading_account_id,r.credential_id AS follower_credential_id,(SELECT c.credential_id FROM venue_api_credentials c WHERE c.user_id=r.kol_user_id AND c.trading_account_id=r.leader_trading_account_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' AND COALESCE((c.verification_json->>'expires_ms')::bigint,0)>$1 ORDER BY c.created_ms,c.credential_id LIMIT 1) AS leader_credential_id,(SELECT count(*) FROM venue_api_credentials c WHERE c.user_id=r.kol_user_id AND c.trading_account_id=r.leader_trading_account_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' AND COALESCE((c.verification_json->>'expires_ms')::bigint,0)>$1) AS leader_credential_count FROM venue_kol_activation_requests a JOIN venue_kol_follow_relations r ON r.relation_id=a.relation_id WHERE a.request_state='pending' AND r.relation_state='paused' ORDER BY a.requested_ms,a.relation_id")
+        let rows = sqlx::query("SELECT a.relation_id,a.relation_revision,r.kol_user_id,r.leader_trading_account_id,r.follower_user_id,r.follower_trading_account_id,r.credential_id AS follower_credential_id,r.allowed_symbols,(SELECT c.credential_id FROM venue_api_credentials c WHERE c.user_id=r.kol_user_id AND c.trading_account_id=r.leader_trading_account_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' AND COALESCE((c.verification_json->>'expires_ms')::bigint,0)>$1 ORDER BY c.created_ms,c.credential_id LIMIT 1) AS leader_credential_id,(SELECT count(*) FROM venue_api_credentials c WHERE c.user_id=r.kol_user_id AND c.trading_account_id=r.leader_trading_account_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' AND COALESCE((c.verification_json->>'expires_ms')::bigint,0)>$1) AS leader_credential_count FROM venue_kol_activation_requests a JOIN venue_kol_follow_relations r ON r.relation_id=a.relation_id WHERE a.request_state='pending' AND r.relation_state='paused' ORDER BY a.requested_ms,a.relation_id")
             .bind(ms(now_ms)?)
             .fetch_all(&self.pool).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
         let mut pending = Vec::with_capacity(rows.len());
@@ -277,6 +336,23 @@ impl PgExecutorStore {
                 .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
             if count != 1 {
                 continue;
+            }
+            let symbols = row
+                .try_get::<serde_json::Value, _>("allowed_symbols")
+                .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+                .as_array()
+                .ok_or(BinanceCommandLedgerError::Conflict)?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or(BinanceCommandLedgerError::Conflict)?
+                        .parse()
+                        .map_err(|_| BinanceCommandLedgerError::Conflict)
+                })
+                .collect::<Result<BTreeSet<_>, _>>()?;
+            if symbols.is_empty() {
+                return Err(BinanceCommandLedgerError::Conflict);
             }
             pending.push(PendingActivation {
                 relation_id: row
@@ -306,6 +382,7 @@ impl PgExecutorStore {
                 follower_credential_id: row
                     .try_get("follower_credential_id")
                     .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
+                symbols,
             });
         }
         Ok(pending)
@@ -357,6 +434,40 @@ fn recovery_row(
         credential_id: row
             .try_get("credential_id")
             .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
+        symbol: row
+            .try_get::<String, _>("symbol")
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+            .parse()
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
+        side: match row
+            .try_get::<String, _>("order_side")
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+            .as_str()
+        {
+            "buy" => venue_domain::domain::OrderSide::Buy,
+            "sell" => venue_domain::domain::OrderSide::Sell,
+            _ => return Err(BinanceCommandLedgerError::Unavailable),
+        },
+        position_side: match row
+            .try_get::<String, _>("position_side")
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+            .as_str()
+        {
+            "long" => venue_domain::domain::PositionSide::Long,
+            "short" => venue_domain::domain::PositionSide::Short,
+            _ => return Err(BinanceCommandLedgerError::Unavailable),
+        },
+        quantity: row
+            .try_get::<String, _>("requested_quantity")
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+            .parse()
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
+        reducing: matches!(
+            row.try_get::<String, _>("command_phase")
+                .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+                .as_str(),
+            "close"
+        ),
         client_order_id: row
             .try_get("client_order_id")
             .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
