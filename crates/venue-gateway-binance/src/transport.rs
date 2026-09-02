@@ -5,7 +5,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use secrecy::ExposeSecret;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use venue_domain::domain::Asset;
 
 use crate::execution::{
@@ -21,6 +21,8 @@ use crate::{
 const MAX_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_TRANSPORT_BYTES: usize = 2 * 1024 * 1024;
 const TIME_SYNC_ATTEMPTS: usize = 6;
+const EXACT_READBACK_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(250), Duration::from_millis(500)];
 static NEXT_TRANSPORT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -247,8 +249,28 @@ impl BinanceHttpTransport {
         request: &BinancePrivateReadRequest,
         timestamp_ms: u64,
     ) -> Result<BinanceRawPrivatePage, BinanceTransportError> {
+        match self
+            .execute_read_once(credentials, request, timestamp_ms)
+            .await
+        {
+            Ok(page) => Ok(page),
+            Err(BinanceTransportError::TimestampRejected) => {
+                self.synchronize_clock().await?;
+                self.execute_read_once(credentials, request, self.signing_timestamp_ms()?)
+                    .await
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    async fn execute_read_once(
+        &self,
+        credentials: &BinanceCredentials,
+        request: &BinancePrivateReadRequest,
+        timestamp_ms: u64,
+    ) -> Result<BinanceRawPrivatePage, BinanceTransportError> {
         self.validate_scope(request.scope())?;
-        let response = match self
+        let response = self
             .execute_signed(
                 credentials,
                 request.scope(),
@@ -258,24 +280,7 @@ impl BinanceHttpTransport {
                 timestamp_ms,
                 false,
             )
-            .await
-        {
-            Ok(response) => response,
-            Err(BinanceTransportError::TimestampRejected) => {
-                self.synchronize_clock().await?;
-                self.execute_signed(
-                    credentials,
-                    request.scope(),
-                    request.method(),
-                    request.path(),
-                    request.parameters(),
-                    self.signing_timestamp_ms()?,
-                    false,
-                )
-                .await?
-            }
-            Err(error) => return Err(error),
-        };
+            .await?;
         BinanceRawPrivatePage::new(
             request,
             response.requested_at_ms,
@@ -408,8 +413,8 @@ impl BinanceHttpTransport {
             .map_err(|_| BinanceTransportError::Ack)
     }
 
-    /// Dispatches once and then performs one separately signed exact lookup. Failure of either
-    /// network operation never causes a second mutation dispatch.
+    /// Dispatches once and then performs a bounded set of separately signed exact lookups.
+    /// Readback retries never cause a second mutation dispatch.
     pub async fn dispatch_then_exact_readback(
         &self,
         credentials: &BinanceCredentials,
@@ -436,34 +441,46 @@ impl BinanceHttpTransport {
                 };
             }
         };
-        let page = match self
-            .execute_read(
-                credentials,
-                &exact_request,
-                match self.signing_timestamp_ms() {
-                    Ok(value) => value,
-                    Err(error) => {
-                        return BinancePhysicalMutationOutcome::AckedReadbackUnknown { ack, error };
-                    }
-                },
-            )
-            .await
-        {
-            Ok(page) => page,
-            Err(error) => {
-                return BinancePhysicalMutationOutcome::AckedReadbackUnknown { ack, error };
+        let mut readback = self
+            .exact_order_readback_once(credentials, &ack, &exact_request)
+            .await;
+        for delay in EXACT_READBACK_RETRY_DELAYS {
+            if readback.is_ok() {
+                break;
             }
-        };
-        match parse_exact_order_readback(&ack, &exact_request, &page) {
+            sleep(delay).await;
+            readback = self
+                .exact_order_readback_once(credentials, &ack, &exact_request)
+                .await;
+        }
+        match readback {
             Ok(readback) => BinancePhysicalMutationOutcome::ReadBack {
                 ack,
                 readback: Box::new(readback),
             },
-            Err(_) => BinancePhysicalMutationOutcome::AckedReadbackUnknown {
-                ack,
-                error: BinanceTransportError::Ack,
-            },
+            Err(error) => BinancePhysicalMutationOutcome::AckedReadbackUnknown { ack, error },
         }
+    }
+
+    async fn exact_order_readback_once(
+        &self,
+        credentials: &BinanceCredentials,
+        ack: &BinanceMutationAck,
+        request: &BinancePrivateReadRequest,
+    ) -> Result<BinanceExactOrderReadback, BinanceTransportError> {
+        let timestamp_ms = self.signing_timestamp_ms()?;
+        let page = match self
+            .execute_read_once(credentials, request, timestamp_ms)
+            .await
+        {
+            Ok(page) => page,
+            Err(BinanceTransportError::TimestampRejected) => {
+                self.synchronize_clock().await?;
+                return Err(BinanceTransportError::TimestampRejected);
+            }
+            Err(error) => return Err(error),
+        };
+        parse_exact_order_readback(ack, request, &page).map_err(|_| BinanceTransportError::Ack)
     }
 
     pub async fn create_listen_key(
@@ -769,13 +786,30 @@ mod tests {
         Delay(Duration),
     }
 
+    #[derive(Default)]
+    struct RequestCounts {
+        posts: AtomicUsize,
+        deletes: AtomicUsize,
+        signed_gets: AtomicUsize,
+        time_gets: AtomicUsize,
+    }
+
     async fn fake_http(
         behaviors: Vec<Behavior>,
     ) -> Result<(String, Arc<AtomicUsize>), Box<dyn std::error::Error>> {
+        let (endpoint, count, _) = fake_http_tracked(behaviors).await?;
+        Ok((endpoint, count))
+    }
+
+    async fn fake_http_tracked(
+        behaviors: Vec<Behavior>,
+    ) -> Result<(String, Arc<AtomicUsize>, Arc<RequestCounts>), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let count = Arc::new(AtomicUsize::new(0));
         let accepted = Arc::clone(&count);
+        let request_counts = Arc::new(RequestCounts::default());
+        let observed = Arc::clone(&request_counts);
         tokio::spawn(async move {
             for behavior in behaviors {
                 let Ok((mut stream, _)) = listener.accept().await else {
@@ -783,7 +817,24 @@ mod tests {
                 };
                 accepted.fetch_add(1, Ordering::SeqCst);
                 let mut request = vec![0_u8; 16 * 1024];
-                let _ = stream.read(&mut request).await;
+                let Ok(read_bytes) = stream.read(&mut request).await else {
+                    return;
+                };
+                let request = &request[..read_bytes];
+                if request.starts_with(b"POST ") {
+                    observed.posts.fetch_add(1, Ordering::SeqCst);
+                } else if request.starts_with(b"DELETE ") {
+                    observed.deletes.fetch_add(1, Ordering::SeqCst);
+                } else if request.starts_with(b"GET ") {
+                    if request
+                        .windows(b" /papi/v1/time".len())
+                        .any(|window| window == b" /papi/v1/time")
+                    {
+                        observed.time_gets.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        observed.signed_gets.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
                 match behavior {
                     Behavior::Body(body) => {
                         let header = format!(
@@ -813,7 +864,7 @@ mod tests {
                 }
             }
         });
-        Ok((format!("http://{address}"), count))
+        Ok((format!("http://{address}"), count, request_counts))
     }
 
     fn facts(
@@ -1002,6 +1053,131 @@ mod tests {
                 if ack.order_id == "401" && readback.order.order_id == "401"
         ));
         assert_eq!(count.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn acknowledged_mutation_retries_only_the_exact_readback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let credentials = BinanceCredentials::from_values("key", "secret")?;
+        let (config, _, scope) = facts("00000000-0000-4000-8000-000000000001")?;
+        let (endpoint, count, methods) = fake_http_tracked(vec![
+            Behavior::Body(ACK),
+            Behavior::Status(500, br#"{"code":-1000,"msg":"transient"}"#),
+            Behavior::Partial(EXACT, EXACT.len() / 2),
+            Behavior::Body(EXACT),
+        ])
+        .await?;
+        let transport = BinanceHttpTransport::with_endpoint(
+            config,
+            7,
+            17,
+            endpoint,
+            BinanceTransportLimits::new(Duration::from_secs(1), 4096)?,
+        )?;
+        let request =
+            prepared_for_transport_test(&scope, BinanceMutationKind::PlaceLimit, "venue_place_1");
+
+        let outcome = transport
+            .dispatch_then_exact_readback(&credentials, &scope, &request, unix_ms()?)
+            .await;
+        assert!(matches!(
+            outcome,
+            BinancePhysicalMutationOutcome::ReadBack { .. }
+        ));
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2 + EXACT_READBACK_RETRY_DELAYS.len(),
+            "one mutation and three read-only exact lookups"
+        );
+        assert_eq!(methods.posts.load(Ordering::SeqCst), 1);
+        assert_eq!(methods.deletes.load(Ordering::SeqCst), 0);
+        assert_eq!(methods.signed_gets.load(Ordering::SeqCst), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persistent_exact_readback_failure_is_unknown_without_replaying_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let credentials = BinanceCredentials::from_values("key", "secret")?;
+        let (config, _, scope) = facts("00000000-0000-4000-8000-000000000001")?;
+        let (endpoint, count, methods) = fake_http_tracked(vec![
+            Behavior::Body(ACK),
+            Behavior::Status(500, br#"{"code":-1000,"msg":"transient"}"#),
+            Behavior::Status(500, br#"{"code":-1000,"msg":"transient"}"#),
+            Behavior::Status(500, br#"{"code":-1000,"msg":"transient"}"#),
+        ])
+        .await?;
+        let transport = BinanceHttpTransport::with_endpoint(
+            config,
+            7,
+            17,
+            endpoint,
+            BinanceTransportLimits::new(Duration::from_secs(1), 4096)?,
+        )?;
+        let request =
+            prepared_for_transport_test(&scope, BinanceMutationKind::PlaceLimit, "venue_place_1");
+
+        let outcome = transport
+            .dispatch_then_exact_readback(&credentials, &scope, &request, unix_ms()?)
+            .await;
+        assert!(matches!(
+            outcome,
+            BinancePhysicalMutationOutcome::AckedReadbackUnknown { .. }
+        ));
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2 + EXACT_READBACK_RETRY_DELAYS.len(),
+            "the acknowledged mutation is never replayed"
+        );
+        assert_eq!(methods.posts.load(Ordering::SeqCst), 1);
+        assert_eq!(methods.deletes.load(Ordering::SeqCst), 0);
+        assert_eq!(methods.signed_gets.load(Ordering::SeqCst), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exact_readback_timestamp_rejection_consumes_one_outer_attempt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let credentials = BinanceCredentials::from_values("key", "secret")?;
+        let (config, _, scope) = facts("00000000-0000-4000-8000-000000000001")?;
+        let server_time = unix_ms()?;
+        let time_payload: &'static [u8] = Box::leak(
+            format!(r#"{{"serverTime":{server_time}}}"#)
+                .into_bytes()
+                .into_boxed_slice(),
+        );
+        let mut behaviors = vec![
+            Behavior::Body(ACK),
+            Behavior::Status(
+                400,
+                br#"{"code":-1021,"msg":"timestamp outside recvWindow"}"#,
+            ),
+        ];
+        behaviors.extend((0..TIME_SYNC_ATTEMPTS).map(|_| Behavior::Body(time_payload)));
+        behaviors.push(Behavior::Body(EXACT));
+        let (endpoint, count, methods) = fake_http_tracked(behaviors).await?;
+        let transport = BinanceHttpTransport::with_endpoint(
+            config,
+            7,
+            17,
+            endpoint,
+            BinanceTransportLimits::new(Duration::from_secs(1), 4096)?,
+        )?;
+        let request =
+            prepared_for_transport_test(&scope, BinanceMutationKind::PlaceLimit, "venue_place_1");
+
+        let outcome = transport
+            .dispatch_then_exact_readback(&credentials, &scope, &request, unix_ms()?)
+            .await;
+        assert!(matches!(
+            outcome,
+            BinancePhysicalMutationOutcome::ReadBack { .. }
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 3 + TIME_SYNC_ATTEMPTS);
+        assert_eq!(methods.posts.load(Ordering::SeqCst), 1);
+        assert_eq!(methods.signed_gets.load(Ordering::SeqCst), 2);
+        assert_eq!(methods.time_gets.load(Ordering::SeqCst), TIME_SYNC_ATTEMPTS);
         Ok(())
     }
 

@@ -245,7 +245,7 @@ conditional、algo 三个 canonical family 完整或明确不支持，同时声�
 ### 5.3 每代签名回读的订单完整性
 
 Binance 账户 adapter 在任何签名私有读取之前必须完成 `/papi/v1/time` 的六次有界采样，使用最低 RTT 样本的本机发送/接收中点计算偏移；未同步的 transport 不得签名。后续 private generation 只能继承已验证偏移，显式时间戳拒绝或进程重建则先重新同步，mutation 本身仍只发送一次。私有 listen-key 每 30 分钟续期；续期失败、`listenKeyExpired`、断流或坏帧必须淘汰旧 socket，并先推进一代完整签名回读后再建流，禁止给旧帧换代。
-完整账户签名快照由多个只读端点组成，任一瞬时 transport/解析失败最多只可对整份读取再尝试两次，固定短退避 `250ms / 500ms`；每次使用新 attempt，失败候选不推进 private generation、不落盘。三次仍失败即失败关闭。该机制不得包裹 mutation、ACK 或 Submitted 后的物理请求，绝不能借“重试读取”重发订单。
+完整账户签名快照由多个只读端点组成，任一瞬时 transport/解析失败最多只可对整份读取再尝试两次，固定短退避 `250ms / 500ms`；每次使用新 attempt，失败候选不推进 private generation、不落盘。三次仍失败即失败关闭。mutation 的 POST/DELETE 始终只允许一次物理发送；收到 ACK 后的精确订单 GET 可使用同样的三次上限与 `250ms / 500ms` 退避，每次重新签名，成功后按精确订单事实收敛，持续失败则保持 Unknown。只读重试不得包裹或重发 mutation。
 
 每次完整签名回读依次执行：
 
