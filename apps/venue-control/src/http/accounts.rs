@@ -3,7 +3,14 @@ use crate::accounts::{AccountError, AccountService, Principal};
 use serde::{Serialize, de::DeserializeOwned};
 use std::collections::BTreeSet;
 use venue_control_protocol::{
-    ControlSnapshot, CopyRelationUpsertRequest, ExecutionFactsSnapshot, accounts::*,
+    ControlSnapshot, CopyRelationUpsertRequest, ExecutionFactsSnapshot,
+    accounts::*,
+    kol::{
+        FollowLifecycleRequest, FollowSettingsUpsertRequest, KOL_EXECUTION_STATUS_PATH,
+        KOL_FOLLOW_LIFECYCLE_PATH, KOL_FOLLOW_SETTINGS_PATH, KOL_PROFILE_PATH,
+        KOL_TERMINAL_ACCOUNT_PATH, KOL_TERMINAL_ORDER_PATH, KolProfileUpdateRequest,
+        TerminalOrderRequest, TerminalProjectionRequest,
+    },
 };
 
 pub(super) async fn dispatch_authenticated<R>(
@@ -24,7 +31,34 @@ where
         _ => None,
     };
     let now = now_ms().map_err(|_| ())?;
-    if path.starts_with("/v2/account/") {
+    if let Some(invite_code) = path.strip_prefix("/v2/public/kol/invites/") {
+        if request.method != Method::Get || query.is_some() {
+            return account_error(stream, AccountErrorCode::InvalidInput).await;
+        }
+        let Some(accounts) = accounts else {
+            return account_error(stream, AccountErrorCode::Unavailable).await;
+        };
+        return match accounts.resolve_invite(invite_code, now).await {
+            Ok(resolution) => match encode(&resolution) {
+                Ok(body) => write_response(stream, "200 OK", "application/json", "close", &body)
+                    .await
+                    .map_err(|_| ()),
+                Err(error) => account_error(stream, error.code).await,
+            },
+            Err(error) => account_error(stream, error.code).await,
+        };
+    }
+    if path.starts_with("/v2/account/")
+        || matches!(
+            path,
+            KOL_PROFILE_PATH
+                | KOL_FOLLOW_SETTINGS_PATH
+                | KOL_FOLLOW_LIFECYCLE_PATH
+                | KOL_TERMINAL_ACCOUNT_PATH
+                | KOL_TERMINAL_ORDER_PATH
+                | KOL_EXECUTION_STATUS_PATH
+        )
+    {
         let Some(accounts) = accounts else {
             return account_error(stream, AccountErrorCode::Unavailable).await;
         };
@@ -229,7 +263,11 @@ async fn account_request(
 ) -> Result<zeroize::Zeroizing<Vec<u8>>, AccountError> {
     match (request.method, path) {
         (Method::Post, REGISTER_PATH) => {
-            return encode(&accounts.register(decode(&request.body)?, now).await?);
+            return encode(
+                &accounts
+                    .register_with_invite(decode::<RegisterRequest>(&request.body)?, now)
+                    .await?,
+            );
         }
         (Method::Post, LOGIN_PATH) => {
             return encode(&accounts.login(decode(&request.body)?, now).await?);
@@ -241,6 +279,58 @@ async fn account_request(
     })?;
     let principal = accounts.authenticate(token.expose(), now).await?;
     match (request.method, path) {
+        (Method::Get, KOL_PROFILE_PATH) => encode(&accounts.own_kol_profile(&principal).await?),
+        (Method::Get, KOL_FOLLOW_SETTINGS_PATH) => {
+            encode(&accounts.follow_relation(&principal).await?)
+        }
+        (Method::Post, KOL_PROFILE_PATH) => encode(
+            &accounts
+                .update_own_kol_profile(
+                    &principal,
+                    decode::<KolProfileUpdateRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
+        (Method::Post, KOL_FOLLOW_SETTINGS_PATH) => encode(
+            &accounts
+                .upsert_follow_settings(
+                    &principal,
+                    decode::<FollowSettingsUpsertRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
+        (Method::Post, KOL_FOLLOW_LIFECYCLE_PATH) => encode(
+            &accounts
+                .request_follow_lifecycle(
+                    &principal,
+                    decode::<FollowLifecycleRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
+        (Method::Post, KOL_TERMINAL_ACCOUNT_PATH) => encode(
+            &accounts
+                .terminal_account_projection(
+                    &principal,
+                    decode::<TerminalProjectionRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
+        (Method::Post, KOL_TERMINAL_ORDER_PATH) => encode(
+            &accounts
+                .enqueue_terminal_order(
+                    &principal,
+                    decode::<TerminalOrderRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
+        (Method::Get, KOL_EXECUTION_STATUS_PATH) => {
+            encode(&accounts.terminal_executions(&principal).await?)
+        }
         (Method::Get, SESSION_PATH | CREDENTIALS_PATH) => {
             encode(&accounts.overview(&principal, now).await?)
         }

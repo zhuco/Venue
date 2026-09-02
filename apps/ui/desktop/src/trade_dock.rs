@@ -1,12 +1,18 @@
 use eframe::egui::{self, Color32, RichText, Stroke};
-use venue_control_protocol::{StrategyLifecycle, TradingAction};
+use venue_control_protocol::TradingAction;
+use venue_control_protocol::kol::{
+    TERMINAL_SCHEMA_VERSION, TerminalAction, TerminalOrderKind, TerminalOrderRequest,
+};
 
 use crate::i18n::{TextKey, text};
-use crate::{client::ControlClient, model::AppModel, theme, trading::build_trade_intent};
+use crate::{client::ControlClient, model::AppModel, theme};
 
 pub fn show(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
     if let Some(action) = controls(ui, model) {
         apply_action(model, client, action, ui.ctx());
+    }
+    if let Some(side) = model.trade_dock.market_close_requested.take() {
+        submit_market_close(model, client, side);
     }
 }
 
@@ -22,7 +28,7 @@ pub(crate) fn controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<Tradin
 
 fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAction> {
     let language = model.preferences.language;
-    let strategy = model.selected_trading_strategy();
+    let private_ready = model.execution.private_fresh(now_ms());
     let symbol = model.preferences.selected_symbol.clone();
     let (base, quote) = symbol_assets(&symbol);
     let mut action = None;
@@ -31,12 +37,9 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
     ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
 
     ui.horizontal(|ui| {
-        let running = strategy
-            .as_ref()
-            .is_some_and(|strategy| strategy.lifecycle == StrategyLifecycle::Running);
         let scope = if model.preferences.execution_account_id.is_none() {
             crate::i18n::text(language, crate::i18n::TextKey::NoExecutionAccount)
-        } else if running {
+        } else if private_ready {
             "LIVE"
         } else {
             crate::i18n::text(language, crate::i18n::TextKey::TradingUnavailable)
@@ -44,7 +47,11 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
         ui.label(
             RichText::new(format!("● {scope}  {symbol}"))
                 .size(12.0)
-                .color(if running { theme::BUY } else { theme::WARNING }),
+                .color(if private_ready {
+                    theme::BUY
+                } else {
+                    theme::WARNING
+                }),
         )
         .on_hover_text(label(
             language,
@@ -54,7 +61,7 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
     });
     ui.separator();
     ui.horizontal(|ui| {
-        ui.strong("Limit · GTC");
+        ui.strong("Limit · Post Only");
         ui.checkbox(&mut model.preferences.trading.post_only, "Post Only");
     });
     ui.columns(2, |columns| {
@@ -156,6 +163,50 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
     }
     ui.horizontal(|ui| {
         let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+        for (side, action, title) in [
+            (
+                venue_domain::PositionSide::Long,
+                TradingAction::CloseLong,
+                label(language, "市价平多", "Market Close Long"),
+            ),
+            (
+                venue_domain::PositionSide::Short,
+                TradingAction::CloseShort,
+                label(language, "市价平空", "Market Close Short"),
+            ),
+        ] {
+            let quantity = model
+                .execution
+                .position_quantity(&symbol, side)
+                .map_or(rust_decimal::Decimal::ZERO, |value| value);
+            let armed = model.trade_dock.armed_action == Some(action);
+            if ui
+                .add_enabled(
+                    private_ready && quantity > rust_decimal::Decimal::ZERO,
+                    egui::Button::new(if armed {
+                        format!("确认 {title}")
+                    } else {
+                        title.to_owned()
+                    })
+                    .min_size(egui::vec2(width, 28.0)),
+                )
+                .on_hover_text(label(
+                    language,
+                    "第二次点击确认；Executor 下单前按最新签名仓位再次裁剪。",
+                    "Click twice to confirm; Executor re-clips against the latest signed position.",
+                ))
+                .clicked()
+            {
+                if armed {
+                    model.trade_dock.market_close_requested = Some(side);
+                } else {
+                    model.trade_dock.armed_action = Some(action);
+                }
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
         for candidate in [
             TradingAction::CancelSelectedOrder,
             TradingAction::CancelAllOrders,
@@ -168,20 +219,16 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
     if let Some(armed) = model.trade_dock.armed_action {
         ui.colored_label(theme::WARNING, action_name(language, armed));
     }
-    if strategy.is_some() {
+    if model.execution.private_projection.is_some() {
         ui.separator();
         ui.horizontal_wrapped(|ui| {
-            let long = strategy.as_ref().map_or_else(
-                || "—".to_owned(),
-                |s| s.long_quantity.normalize().to_string(),
-            );
-            let short = strategy.as_ref().map_or_else(
-                || "—".to_owned(),
-                |s| s.short_quantity.normalize().to_string(),
-            );
-            let pnl = strategy
-                .as_ref()
-                .and_then(|s| s.unrealized_pnl)
+            let long = model
+                .execution
+                .position_quantity(&symbol, venue_domain::PositionSide::Long)
+                .map_or_else(|| "—".to_owned(), |value| value.normalize().to_string());
+            let short = model
+                .execution
+                .position_quantity(&symbol, venue_domain::PositionSide::Short)
                 .map_or_else(|| "—".to_owned(), |value| value.normalize().to_string());
             ui.label(
                 RichText::new(format!("{} {long} {base}", label(language, "多", "Long")))
@@ -192,11 +239,6 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
                 RichText::new(format!("{} {short} {base}", label(language, "空", "Short")))
                     .size(11.0)
                     .color(theme::SELL),
-            );
-            ui.label(
-                RichText::new(format!("PnL {pnl} {quote}"))
-                    .size(11.0)
-                    .color(theme::TEXT_SECONDARY),
             );
         });
     }
@@ -255,23 +297,13 @@ fn action_button(
 }
 
 fn action_enabled(model: &AppModel, action: TradingAction, now: f64) -> bool {
-    let Some(strategy) = model.selected_trading_strategy() else {
-        return false;
-    };
-    if strategy.lifecycle != StrategyLifecycle::Running {
+    if !model.execution.private_fresh(now_ms()) || !model.preferences.trading.post_only {
         return false;
     }
     if action.is_order_action() {
-        return build_trade_intent(
-            &strategy,
-            &model.preferences.trading,
-            &model.trade_dock,
-            action,
-            now,
-        )
-        .is_ok();
+        return terminal_request_parts(model, action, now).is_ok();
     }
-    true
+    false
 }
 
 pub fn apply_action(
@@ -302,50 +334,168 @@ pub fn apply_action(
         }
         _ => {}
     }
-    let Some(strategy) = model.selected_trading_strategy() else {
-        model.notice("Trading action rejected: no exact account and symbol scope");
-        return;
-    };
-    if strategy.lifecycle != StrategyLifecycle::Running {
-        model.notice("Trading action rejected: selected strategy is not Running");
-        return;
-    }
-    if action == TradingAction::CancelSelectedOrder
-        && let Some(id) = &model.trade_dock.selected_order_id
-        && !model.execution.order_matches(&strategy, id, now_ms())
-    {
-        model.notice(text(
-            model.preferences.language,
-            TextKey::OrderSelectionExpired,
-        ));
+    if matches!(
+        action,
+        TradingAction::CancelSelectedOrder | TradingAction::CancelAllOrders
+    ) {
+        model.notice("Cancel is not enabled until exact Binance order cancellation is connected");
         return;
     }
     model.trade_dock.armed_action = Some(action);
-    let intent = match build_trade_intent(
-        &strategy,
-        &model.preferences.trading,
-        &model.trade_dock,
-        action,
-        context.input(|input| input.time),
-    ) {
-        Ok(intent) => intent,
+    let request = match build_terminal_request(model, action, context.input(|input| input.time)) {
+        Ok(request) => request,
         Err(error) => {
             model.notice(format!("Trading action rejected: {error}"));
             return;
         }
     };
-    let request = model.begin_trade_command(&strategy, intent, now_ms());
-    if request.validate().is_err() {
-        model.notice("Trading action rejected: malformed semantic intent");
-        return;
-    }
-    match client.send(request.clone()) {
+    match client.send_terminal(request) {
         Ok(()) => {
-            model.record_submission(request);
             model.trade_dock.armed_action = None;
-            model.notice(format!("Submitted {:?} semantic intent", action));
+            model.notice(format!(
+                "Submitted {:?} to the Binance Executor ledger",
+                action
+            ));
         }
         Err(error) => model.notice(format!("Trading request rejected locally: {error}")),
+    }
+}
+
+fn terminal_request_parts(
+    model: &AppModel,
+    action: TradingAction,
+    now: f64,
+) -> Result<
+    (
+        String,
+        venue_domain::Symbol,
+        TerminalAction,
+        rust_decimal::Decimal,
+        rust_decimal::Decimal,
+        Option<rust_decimal::Decimal>,
+    ),
+    crate::trading::TradePlanError,
+> {
+    let credential_id = model
+        .account_overview
+        .as_ref()
+        .and_then(|overview| overview.selected_credential_id.clone())
+        .ok_or(crate::trading::TradePlanError::UiOnlyAction)?;
+    let symbol = model
+        .preferences
+        .selected_symbol
+        .parse()
+        .map_err(|_| crate::trading::TradePlanError::UiOnlyAction)?;
+    let price = model
+        .trade_dock
+        .selected_price
+        .ok_or(crate::trading::TradePlanError::MissingPrice)?;
+    if model
+        .trade_dock
+        .price_remaining_seconds(now, model.preferences.trading.price_validity_seconds)
+        .is_none()
+    {
+        return Err(crate::trading::TradePlanError::ExpiredPrice);
+    }
+    let quote_notional = model
+        .trade_dock
+        .quote_notional(&model.preferences.trading, price)?;
+    let terminal_action = match action {
+        TradingAction::OpenLong => TerminalAction::OpenLong,
+        TradingAction::CloseLong => TerminalAction::CloseLong,
+        TradingAction::OpenShort => TerminalAction::OpenShort,
+        TradingAction::CloseShort => TerminalAction::CloseShort,
+        _ => return Err(crate::trading::TradePlanError::UiOnlyAction),
+    };
+    let close_cap = terminal_action
+        .is_close()
+        .then(|| {
+            model.execution.position_quantity(
+                &model.preferences.selected_symbol,
+                terminal_action.position_side(),
+            )
+        })
+        .flatten()
+        .filter(|quantity| *quantity > rust_decimal::Decimal::ZERO);
+    if terminal_action.is_close() && close_cap.is_none() {
+        return Err(crate::trading::TradePlanError::NoPosition);
+    }
+    Ok((
+        credential_id,
+        symbol,
+        terminal_action,
+        price,
+        quote_notional,
+        close_cap,
+    ))
+}
+
+fn build_terminal_request(
+    model: &mut AppModel,
+    action: TradingAction,
+    now: f64,
+) -> Result<TerminalOrderRequest, crate::trading::TradePlanError> {
+    let (credential_id, symbol, action, price, quote_notional, close_quantity_cap) =
+        terminal_request_parts(model, action, now)?;
+    Ok(TerminalOrderRequest {
+        schema_version: TERMINAL_SCHEMA_VERSION,
+        request_id: model.next_terminal_request_id(),
+        credential_id,
+        symbol,
+        action,
+        order_kind: TerminalOrderKind::LimitPostOnly,
+        quote_notional,
+        limit_price: Some(price),
+        close_quantity_cap,
+        market_risk_confirmed: false,
+    })
+}
+
+fn submit_market_close(
+    model: &mut AppModel,
+    client: &ControlClient,
+    side: venue_domain::PositionSide,
+) {
+    let Some(credential_id) = model
+        .account_overview
+        .as_ref()
+        .and_then(|overview| overview.selected_credential_id.clone())
+    else {
+        return;
+    };
+    let Ok(symbol) = model.preferences.selected_symbol.parse() else {
+        return;
+    };
+    let Some(close_quantity_cap) = model
+        .execution
+        .position_quantity(&model.preferences.selected_symbol, side)
+        .filter(|quantity| *quantity > rust_decimal::Decimal::ZERO)
+    else {
+        return;
+    };
+    let action = if side == venue_domain::PositionSide::Long {
+        TerminalAction::CloseLong
+    } else {
+        TerminalAction::CloseShort
+    };
+    let request = TerminalOrderRequest {
+        schema_version: TERMINAL_SCHEMA_VERSION,
+        request_id: model.next_terminal_request_id(),
+        credential_id,
+        symbol,
+        action,
+        order_kind: TerminalOrderKind::Market,
+        quote_notional: rust_decimal::Decimal::ZERO,
+        limit_price: None,
+        close_quantity_cap: Some(close_quantity_cap),
+        market_risk_confirmed: true,
+    };
+    match client.send_terminal(request) {
+        Ok(()) => {
+            model.trade_dock.armed_action = None;
+            model.notice("Submitted confirmed market close to the Binance Executor ledger");
+        }
+        Err(error) => model.notice(format!("Market close rejected locally: {error}")),
     }
 }
 

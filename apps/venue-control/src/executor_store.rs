@@ -11,7 +11,7 @@ use crate::kol_executor::{
     BinanceCommandLedger, BinanceCommandLedgerError, ClaimedBinanceCommand, KolSourceFill,
     scaled_copy_quantity,
 };
-use venue_control_protocol::kol::ExecutorCommandState;
+use venue_control_protocol::kol::{ExecutorCommandState, TerminalOrderKind};
 
 #[derive(Clone)]
 pub struct PgExecutorStore {
@@ -258,7 +258,7 @@ impl PgExecutorStore {
     pub async fn recover_nonterminal(
         &self,
     ) -> Result<Vec<ClaimedBinanceCommand>, BinanceCommandLedgerError> {
-        let rows = sqlx::query("SELECT command_id,owner_user_id,trading_account_id,credential_id,symbol,order_side,position_side,requested_quantity,command_phase,client_order_id,command_state FROM venue_binance_commands WHERE command_state IN ('pending','sending','accepted','reconcile_required') ORDER BY created_ms,command_id")
+        let rows = sqlx::query("SELECT command_id,owner_user_id,trading_account_id,credential_id,symbol,order_side,position_side,requested_quantity,command_phase,order_kind,limit_price,client_order_id,command_state FROM venue_binance_commands WHERE command_state IN ('pending','sending','accepted','reconcile_required') ORDER BY created_ms,command_id")
             .fetch_all(&self.pool).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
         rows.into_iter().map(recovery_row).collect()
     }
@@ -462,6 +462,8 @@ fn recovery_row(
             .map_err(|_| BinanceCommandLedgerError::Unavailable)?
             .parse()
             .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
+        order_kind: terminal_order_kind(&row)?,
+        limit_price: optional_decimal(&row, "limit_price")?,
         reducing: matches!(
             row.try_get::<String, _>("command_phase")
                 .map_err(|_| BinanceCommandLedgerError::Unavailable)?
@@ -473,6 +475,33 @@ fn recovery_row(
             .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
         state,
     })
+}
+fn terminal_order_kind(
+    row: &sqlx::postgres::PgRow,
+) -> Result<TerminalOrderKind, BinanceCommandLedgerError> {
+    match row
+        .try_get::<String, _>("order_kind")
+        .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+        .as_str()
+    {
+        "market" => Ok(TerminalOrderKind::Market),
+        "limit_post_only" => Ok(TerminalOrderKind::LimitPostOnly),
+        _ => Err(BinanceCommandLedgerError::Unavailable),
+    }
+}
+
+fn optional_decimal(
+    row: &sqlx::postgres::PgRow,
+    field: &str,
+) -> Result<Option<Decimal>, BinanceCommandLedgerError> {
+    row.try_get::<Option<String>, _>(field)
+        .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| BinanceCommandLedgerError::Unavailable)
+        })
+        .transpose()
 }
 fn ms(value: u64) -> Result<i64, BinanceCommandLedgerError> {
     i64::try_from(value).map_err(|_| BinanceCommandLedgerError::Conflict)

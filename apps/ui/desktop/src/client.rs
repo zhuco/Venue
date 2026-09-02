@@ -1,4 +1,4 @@
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 mod execution;
 use eframe::egui;
 use std::{
@@ -6,6 +6,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 use venue_control_protocol::accounts::SecretValue;
+use venue_control_protocol::kol::{
+    ExecutorCommandSummary, TerminalAccountProjection, TerminalOrderRequest,
+    TerminalProjectionRequest,
+};
 use venue_control_protocol::{
     COMMAND_PATH, COPY_RELATION_PATH, CommandReceipt, ControlCommandRequest, ControlSnapshot,
     CopyRelationReceipt, CopyRelationRecord, CopyRelationUpsertRequest, EVENT_STREAM_PATH,
@@ -23,6 +27,9 @@ const MAX_SSE_FRAME_BYTES: usize = 1_024 * 1_024;
 pub enum ClientEvent {
     ExecutionFacts(venue_control_protocol::ExecutionFactsSnapshot),
     ExecutionFactsUnavailable(String),
+    TerminalAccountProjection(Option<TerminalAccountProjection>),
+    TerminalExecutions(Vec<ExecutorCommandSummary>),
+    TerminalAccountUnavailable(String),
     SessionExpired,
     SnapshotConnected,
     SnapshotUnavailable(String),
@@ -40,6 +47,8 @@ pub enum ClientEvent {
 pub struct ControlClient {
     events: Receiver<ClientEvent>,
     command_tx: Sender<ControlCommandRequest>,
+    terminal_order_tx: Sender<TerminalOrderRequest>,
+    terminal_projection_tx: Sender<TerminalProjectionRequest>,
     copy_relation_tx: Sender<CopyRelationUpsertRequest>,
     stream_gates: StreamGates,
     #[cfg(not(target_arch = "wasm32"))]
@@ -60,6 +69,8 @@ impl ControlClient {
     ) -> Self {
         let (event_tx, events) = unbounded();
         let (command_tx, command_rx) = unbounded();
+        let (terminal_order_tx, terminal_order_rx) = unbounded();
+        let (terminal_projection_tx, terminal_projection_rx) = bounded(1);
         let (copy_relation_tx, copy_relation_rx) = unbounded();
         let stream_gates = StreamGates::default();
 
@@ -70,6 +81,8 @@ impl ControlClient {
                 endpoint,
                 event_tx,
                 command_rx,
+                terminal_order_rx,
+                terminal_projection_rx,
                 copy_relation_rx,
                 context,
                 stop.clone(),
@@ -93,6 +106,8 @@ impl ControlClient {
         Self {
             events,
             command_tx,
+            terminal_order_tx,
+            terminal_projection_tx,
             copy_relation_tx,
             stream_gates,
             #[cfg(not(target_arch = "wasm32"))]
@@ -114,6 +129,21 @@ impl ControlClient {
         self.command_tx
             .send(command)
             .map_err(|_| ClientError::Closed)
+    }
+
+    pub fn send_terminal(&self, request: TerminalOrderRequest) -> Result<(), ClientError> {
+        request
+            .validate()
+            .map_err(|_| ClientError::TerminalProtocol)?;
+        self.terminal_order_tx
+            .send(request)
+            .map_err(|_| ClientError::Closed)
+    }
+
+    pub fn subscribe_terminal(&self, request: TerminalProjectionRequest) {
+        if request.validate().is_ok() {
+            let _ = self.terminal_projection_tx.try_send(request);
+        }
     }
 
     pub fn send_copy_relation(
@@ -147,6 +177,8 @@ impl Drop for ControlClient {
 pub enum ClientError {
     #[error("control command does not satisfy the protocol: {0}")]
     Protocol(venue_control_protocol::ProtocolError),
+    #[error("terminal request does not satisfy the protocol")]
+    TerminalProtocol,
     #[error("control client is closed")]
     Closed,
     #[error("the scoped event stream is not currently healthy; writes are closed")]
@@ -267,6 +299,8 @@ fn start_native(
     endpoint: String,
     sender: Sender<ClientEvent>,
     commands: Receiver<ControlCommandRequest>,
+    terminal_orders: Receiver<TerminalOrderRequest>,
+    terminal_projection: Receiver<TerminalProjectionRequest>,
     copy_relations: Receiver<CopyRelationUpsertRequest>,
     context: egui::Context,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -297,6 +331,8 @@ fn start_native(
                 endpoint,
                 sender,
                 commands,
+                terminal_orders,
+                terminal_projection,
                 copy_relations,
                 context,
                 stop,
@@ -318,6 +354,8 @@ async fn native_loop(
     endpoint: String,
     sender: Sender<ClientEvent>,
     commands: Receiver<ControlCommandRequest>,
+    terminal_orders: Receiver<TerminalOrderRequest>,
+    terminal_projection: Receiver<TerminalProjectionRequest>,
     copy_relations: Receiver<CopyRelationUpsertRequest>,
     context: egui::Context,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -356,6 +394,7 @@ async fn native_loop(
             sender.clone(),
             context.clone(),
             stop.clone(),
+            terminal_projection,
         );
     }
     let (scope_tx, scope_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -383,6 +422,58 @@ async fn native_loop(
 
     let mut next_snapshot = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
     while !stop.load(std::sync::atomic::Ordering::Acquire) {
+        for request in terminal_orders.try_iter().take(32) {
+            let response = client
+                .post(path(
+                    &endpoint,
+                    venue_control_protocol::kol::KOL_TERMINAL_ORDER_PATH,
+                ))
+                .json(&request)
+                .timeout(REQUEST_TIMEOUT)
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    match response.json::<ExecutorCommandSummary>().await {
+                        Ok(summary)
+                            if summary.validate().is_ok()
+                                && summary.request_id.as_deref()
+                                    == Some(request.request_id.as_str()) =>
+                        {
+                            publish(
+                                &sender,
+                                &context,
+                                ClientEvent::TerminalExecutions(vec![summary]),
+                            );
+                        }
+                        _ => publish(
+                            &sender,
+                            &context,
+                            ClientEvent::CommandUnavailable(
+                                "invalid terminal command receipt".to_owned(),
+                            ),
+                        ),
+                    }
+                }
+                Ok(response) if response.status().as_u16() == 401 => {
+                    publish(&sender, &context, ClientEvent::SessionExpired);
+                    return;
+                }
+                Ok(response) => publish(
+                    &sender,
+                    &context,
+                    ClientEvent::CommandUnavailable(format!(
+                        "terminal command returned HTTP {}",
+                        response.status()
+                    )),
+                ),
+                Err(error) => publish(
+                    &sender,
+                    &context,
+                    ClientEvent::CommandUnavailable(format!("terminal command failed: {error}")),
+                ),
+            }
+        }
         for command in commands.try_iter().take(64) {
             let response = client
                 .post(path(&endpoint, COMMAND_PATH))

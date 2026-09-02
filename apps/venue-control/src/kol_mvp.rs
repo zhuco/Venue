@@ -3,6 +3,7 @@
 use sqlx::{Connection, PgConnection};
 
 pub const MIGRATION_0017: &str = include_str!("../migrations/0017_kol_copy_mvp.sql");
+pub const MIGRATION_0018: &str = include_str!("../migrations/0018_kol_follow_activation.sql");
 
 /// Stable process-wide identity for the single Binance executor. The session that owns this
 /// advisory lock is dedicated and never returned to a connection pool.

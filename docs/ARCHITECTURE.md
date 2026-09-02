@@ -1,6 +1,6 @@
 # VENUE 当前代码与 Binance KOL MVP 目标架构
 
-更新：2026-09-02
+更新：2026-09-03
 
 本文同时说明“仓库已经有什么”和“下一步要变成什么”。已提交代码、离线测试和真实业务可用是三个不同结论；目标架构尚未实现的部分不得描述为已上线。
 
@@ -20,14 +20,13 @@
 ## 2. 目标进程拓扑
 
 ```text
-Browser
-  -> Venue Web / same-origin BFF
-  -> venue-control
-       -> PostgreSQL：用户、KOL、邀请、凭证密文、关系、成交去重、命令、投影
-       -> venue-executor-binance（单部署实例，多账户异步执行）
-            -> 最多 5 条 KOL 私流
-            -> 每个跟随账户一个进程内顺序队列
-            -> Binance Portfolio Margin API
+Browser -> Venue Web / same-origin BFF（邀请、账户、KOL 页面） -> venue-control
+VenueFlow Desktop（用户作用域终端投影与命令） -------------> venue-control
+                                                                  -> PostgreSQL
+                                                                  -> venue-executor-binance
+                                                                       -> 最多 5 条 KOL 私流
+                                                                       -> 账户内顺序队列
+                                                                       -> Binance Portfolio Margin API
 ```
 
 目标部署不为每个账户启动进程，不为终端或 Copy 创建 Strategy Actor。跟随账户默认不保持完整私流；发送后签名查单并周期对账。若实测 REST 限频或状态时效不足，再按证据增加有界私流，不预先复制旧 Private Router。
@@ -36,7 +35,8 @@ Browser
 
 | 组件 | 目标职责 | 明确不做 |
 |---|---|---|
-| Venue Web/BFF | KOL落地页、邀请注册、登录、API绑定、跟单设置、KOL文案编辑和基础终端 | 不接收或返回解密后的API Secret，不直连Binance |
+| Venue Web/BFF | KOL落地页、邀请注册、登录、API绑定、跟单设置和KOL文案编辑 | 不接收或返回解密后的API Secret，不直连Binance |
+| VenueFlow Desktop | Binance风格行情、可增删交易对、私有账户多标签、Post Only四动作和市价平仓 | 不持有API Secret，不直连私流，不自行判定成交 |
 | venue-control | 认证、授权、KOL/邀请/关系、凭证加密与只读验证、查询投影 | 不直接发送交易所mutation |
 | PostgreSQL | 业务事实和唯一耐久命令账本 | 不保存明文凭证或原始私流payload |
 | venue-executor-binance | KOL私流、成交归一化、快速fan-out、账户顺序队列、规则/数量校验、下单与签名查单 | 不运行Grid/Scalping，不建立Actor/checkpoint/local WAL |
@@ -123,7 +123,7 @@ KOL Binance TRADE 成交
 
 ## 10. 当前完成度
 
-仓库已有邀请注册、KOL 页面、真实用户 Cookie BFF、浏览器自助 API 绑定与跟单设置。`venue-executor-binance` 是唯一生产组装入口：它只接受明确 `LIVE`、受限 PostgreSQL URL 和现有主密钥配置，取得 PostgreSQL advisory singleton 后，先完成 Pending activation 的双账户签名基线与未终态同 ID 回读，再为已激活 KOL 账户建立认证私流。私流只接纳 `ORDER_TRADE_UPDATE/TRADE` 的规范成交，数据库按 native trade ID 去重；断线、listenKey 过期或账户语义缺口以有界退避重连并触发签名 REST 订单/成交/仓位补读。Binance MARKET 发送与精确回读复用同一 adapter，绝无 mock、testnet 或 dry-run 运行模式。
+仓库已有邀请/KOL/跟单入口、唯一生产 `venue-executor-binance`、账户级私流+签名 REST 投影、Post Only/市价平仓命令账本和 VenueFlow 桌面消费链。Executor 取得 PostgreSQL advisory singleton 后执行 activation、未终态同 ID 回读和有界私流；投影先持久化再按用户返回。旧 Binance LIVE scope 同时在 Control 入账与 Executor 抢占处拒绝，旧状态不会按时间自动释放。精确撤单、真实凭证 Canary 和 2核4G容量门仍未完成。
 
 完成标准只以 [`KOL_COPY_MVP.md`](KOL_COPY_MVP.md) 为准。真实凭证联调、2 核 4 GiB 压测和隔离账户 Canary 仍是外部验收；文档更新本身不启动服务、不迁移账户，也不表示实盘已可用。
 

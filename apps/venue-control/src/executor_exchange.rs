@@ -10,11 +10,12 @@ use rust_decimal::Decimal;
 use venue_domain::domain::{FieldState, OrderSide, OrderState, PositionSide, Symbol};
 use venue_gateway_binance::{BinanceAccountGateway, BinanceCredentials};
 use venue_gateway_binance::{
-    BinanceHttpTransport, BinanceMarketIntent, BinancePhysicalMutationOutcome,
-    BinancePrivateReadScope, build_account_config_request, build_account_request,
-    build_algo_orders_request, build_exact_order_request, build_fills_request,
-    build_position_mode_request, build_positions_request, build_regular_orders_request,
-    complete_private_readback, parse_instrument_rules, prepare_place_market,
+    BinanceHttpTransport, BinanceMarketIntent, BinancePhysicalMutationOutcome, BinancePlaceIntent,
+    BinancePrivateReadScope, BinanceTimeInForce, build_account_config_request,
+    build_account_request, build_algo_orders_request, build_exact_order_request,
+    build_fills_request, build_position_mode_request, build_positions_request,
+    build_regular_orders_request, complete_private_readback, parse_instrument_rules,
+    prepare_place_limit, prepare_place_market,
     private::{RecentFillsCursor, parse_order},
 };
 use venue_gateway_binance::{GatewayBinding, GatewayMode, VenueId};
@@ -28,9 +29,16 @@ pub struct ExecutionRequest {
     pub side: OrderSide,
     pub position_side: PositionSide,
     pub quantity: Decimal,
+    pub order_kind: ExecutionOrderKind,
     /// A close is only a domain-level reduction. The Binance Hedge request deliberately omits
     /// native reduceOnly and relies on side, leg, clipped quantity, and signed convergence.
     pub reducing: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecutionOrderKind {
+    Market,
+    LimitPostOnly { price: Decimal },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -276,22 +284,43 @@ impl BinanceExecution for BinanceHttpExecution {
     ) -> Result<ExecutionReadback, BinanceExecutionError> {
         let before = self.snapshot(request, &credentials).await?;
         let rules = rules_for_request(&self.transport, request, &before).await?;
-        let quantity = normalize_quantity(request.quantity, &rules)?;
-        check_minimum_notional(&before, request.position_side, quantity, &rules)?;
         let before_position = position_quantity(&before, request.position_side)?;
+        let requested_quantity = if request.reducing {
+            request.quantity.min(before_position.max(Decimal::ZERO))
+        } else {
+            request.quantity
+        };
+        let quantity = normalize_quantity(requested_quantity, &rules)?;
+        check_minimum_notional(&before, request.position_side, quantity, &rules)?;
         self.pre_dispatch_positions
             .insert(request.client_order_id.clone(), before_position);
-        let prepared = prepare_place_market(
-            &rules,
-            &before,
-            &BinanceMarketIntent {
-                client_order_id: request.client_order_id.clone(),
-                side: request.side,
-                position_side: request.position_side,
-                quantity,
-                reduce_only: request.reducing,
-            },
-        )
+        let prepared = match request.order_kind {
+            ExecutionOrderKind::Market => prepare_place_market(
+                &rules,
+                &before,
+                &BinanceMarketIntent {
+                    client_order_id: request.client_order_id.clone(),
+                    side: request.side,
+                    position_side: request.position_side,
+                    quantity,
+                    reduce_only: request.reducing,
+                },
+            ),
+            ExecutionOrderKind::LimitPostOnly { price } => prepare_place_limit(
+                &rules,
+                &before,
+                &BinancePlaceIntent {
+                    client_order_id: request.client_order_id.clone(),
+                    side: request.side,
+                    position_side: request.position_side,
+                    quantity,
+                    limit_price: venue_domain::domain::Price::new(price)
+                        .map_err(|_| BinanceExecutionError::Invalid)?,
+                    time_in_force: BinanceTimeInForce::PostOnly,
+                    reduce_only: request.reducing,
+                },
+            ),
+        }
         .map_err(|_| BinanceExecutionError::Invalid)?;
         match self
             .transport
@@ -345,7 +374,7 @@ impl BinanceExecution for BinanceHttpExecution {
             self.pre_dispatch_positions.remove(&request.client_order_id);
             return Ok(ExecutionReadback::Rejected);
         }
-        if order.state != OrderState::Filled || order.filled_quantity != request.quantity {
+        if order.state != OrderState::Filled || order.filled_quantity <= Decimal::ZERO {
             return Ok(ExecutionReadback::Accepted);
         }
         let Some(before_position) = self
@@ -358,7 +387,13 @@ impl BinanceExecution for BinanceHttpExecution {
             return Ok(ExecutionReadback::Accepted);
         };
         let after = self.snapshot(request, &credentials).await?;
-        let result = converged(request, request.quantity, before_position, &after, &order);
+        let result = converged(
+            request,
+            order.filled_quantity,
+            before_position,
+            &after,
+            &order,
+        );
         if result == ExecutionReadback::Reconciled {
             self.pre_dispatch_positions.remove(&request.client_order_id);
         }
@@ -467,6 +502,7 @@ fn validate_request_binding(
         || request.symbol != binding.symbol
         || request.position_side == PositionSide::Net
         || request.quantity <= Decimal::ZERO
+        || matches!(request.order_kind, ExecutionOrderKind::LimitPostOnly { price } if price <= Decimal::ZERO)
         || request.reducing
             != matches!(
                 (request.position_side, request.side),
@@ -651,6 +687,7 @@ mod tests {
             side: OrderSide::Buy,
             position_side: PositionSide::Long,
             quantity: Decimal::new(1, 3),
+            order_kind: ExecutionOrderKind::Market,
             reducing: false,
         };
         let mut exchange = MockBinanceExecution::default();

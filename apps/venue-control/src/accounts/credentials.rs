@@ -113,7 +113,7 @@ impl AccountService {
         .await
     }
 
-    async fn verify_with<F, Fut>(
+    pub(super) async fn verify_with<F, Fut>(
         &self,
         principal: &Principal,
         id: &str,
@@ -382,10 +382,14 @@ impl AccountService {
 #[cfg(test)]
 mod tests;
 
-fn scope(principal: &Principal, id: &str) -> String {
-    format!("venue-api-v1:{}:{id}", principal.user.user_id)
+pub(crate) fn credential_scope(user_id: &str, credential_id: &str) -> String {
+    format!("venue-api-v1:{user_id}:{credential_id}")
 }
-fn decode_summary(value: serde_json::Value) -> Result<CredentialSummary, AccountError> {
+
+fn scope(principal: &Principal, id: &str) -> String {
+    credential_scope(&principal.user.user_id, id)
+}
+pub(super) fn decode_summary(value: serde_json::Value) -> Result<CredentialSummary, AccountError> {
     serde_json::from_value(value).map_err(|_| error(Code::Unavailable))
 }
 fn encode_summary(value: &CredentialSummary) -> Result<serde_json::Value, AccountError> {

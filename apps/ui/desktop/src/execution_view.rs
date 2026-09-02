@@ -3,6 +3,7 @@ use crate::{model::AppModel, theme};
 use eframe::egui;
 use std::sync::Arc;
 use text::{Key, text};
+use venue_control_protocol::kol::{ExecutorCommandSummary, TerminalAccountProjection};
 use venue_control_protocol::{ExecutionFactBinding, ExecutionFactsSnapshot, GatewayMode, VenueId};
 use venue_domain::OrderState;
 
@@ -22,31 +23,70 @@ enum Tab {
 pub struct ExecutionViewState {
     pub facts: Option<Arc<ExecutionFactsSnapshot>>,
     pub error: Option<String>,
+    pub private_error: Option<String>,
+    pub private_projection: Option<Arc<TerminalAccountProjection>>,
+    pub terminal_executions: Vec<ExecutorCommandSummary>,
     received_ms: u64,
     tab: Tab,
     current_symbol: bool,
 }
 
 impl ExecutionViewState {
-    pub fn order_matches(
-        &self,
-        strategy: &venue_control_protocol::StrategySummary,
-        order_id: &str,
-        now: u64,
-    ) -> bool {
-        self.fresh(now)
-            && self.facts.as_ref().is_some_and(|facts| {
-                facts.orders.iter().any(|row| {
-                    row.order_id == order_id
-                        && fresh_time(row.observed_ms, now)
-                        && row.binding.venue == strategy.venue
-                        && row.binding.mode == strategy.mode
-                        && row.binding.trading_account_id == strategy.trading_account_id
-                        && row.binding.symbol == strategy.symbol
-                        && row.binding.instance_id == strategy.instance_id
-                        && row.binding.config_epoch == strategy.config_epoch
+    pub fn apply_private(&mut self, projection: Option<TerminalAccountProjection>) {
+        if let Some(projection) = projection {
+            if projection.validate().is_err()
+                || self.private_projection.as_ref().is_some_and(|old| {
+                    old.credential_id == projection.credential_id
+                        && old.observed_ms > projection.observed_ms
                 })
+            {
+                self.private_error =
+                    Some("Invalid or regressing private account projection".into());
+                return;
+            }
+            self.received_ms = crate::account_center::now_ms();
+            self.private_projection = Some(Arc::new(projection));
+            self.private_error = None;
+        } else {
+            self.private_error = None;
+        }
+    }
+
+    pub fn apply_terminal_executions(&mut self, executions: Vec<ExecutorCommandSummary>) {
+        if executions.iter().any(|summary| summary.validate().is_err()) {
+            self.private_error = Some("Invalid terminal execution history".into());
+        } else if executions.len() == 1 {
+            let summary = executions[0].clone();
+            self.terminal_executions
+                .retain(|old| old.command_id != summary.command_id);
+            self.terminal_executions.insert(0, summary);
+        } else {
+            self.terminal_executions = executions;
+        }
+    }
+
+    pub fn private_fresh(&self, now: u64) -> bool {
+        self.private_error.is_none()
+            && fresh_time(self.received_ms, now)
+            && self
+                .private_projection
+                .as_ref()
+                .is_some_and(|projection| fresh_time(projection.observed_ms, now))
+    }
+
+    pub fn position_quantity(
+        &self,
+        symbol: &str,
+        side: venue_domain::PositionSide,
+    ) -> Option<rust_decimal::Decimal> {
+        self.private_projection
+            .as_ref()?
+            .positions
+            .iter()
+            .find(|position| {
+                position.symbol.to_string() == symbol && position.position_side == side
             })
+            .map(|position| position.quantity)
     }
     pub fn apply(&mut self, facts: ExecutionFactsSnapshot) {
         if facts.validate().is_err()
@@ -123,6 +163,20 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel) {
     };
     if model.preferences.execution_account_id.as_deref() != Some(account.as_str()) {
         ui.weak(text(language, Key::NoAccount));
+        return;
+    }
+    if model.execution.tab != Tab::Bots {
+        if let Some(projection) = model.execution.private_projection.clone()
+            && projection.trading_account_id == account
+        {
+            show_private_projection(ui, model, &projection);
+        } else {
+            ui.weak(text(language, Key::Waiting));
+            ui.small("等待唯一 Binance Executor 返回签名私有账户投影");
+            if let Some(error) = &model.execution.private_error {
+                ui.colored_label(theme::WARNING, error);
+            }
+        }
         return;
     }
     let Some(facts) = model.execution.facts.clone() else {
@@ -367,6 +421,204 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel) {
         model.preferences.selected_instance = Some(binding.instance_id);
         model.synchronize_trading_scope();
         model.trade_dock.selected_order_id = order;
+    }
+}
+
+fn show_private_projection(
+    ui: &mut egui::Ui,
+    model: &mut AppModel,
+    projection: &TerminalAccountProjection,
+) {
+    let language = model.preferences.language;
+    let now = crate::account_center::now_ms();
+    let fresh = model.execution.private_fresh(now);
+    ui.horizontal(|ui| {
+        ui.small(format!(
+            "{} · {}",
+            text(language, Key::Signed),
+            timestamp(projection.observed_ms)
+        ));
+        if !fresh {
+            ui.colored_label(theme::WARNING, text(language, Key::Stale));
+        }
+    });
+    ui.weak(text(language, Key::CurrentSource));
+    let selected_symbol = model
+        .execution
+        .current_symbol
+        .then(|| model.preferences.selected_symbol.clone());
+    let included = |symbol: &venue_domain::Symbol| {
+        selected_symbol
+            .as_ref()
+            .is_none_or(|selected| symbol.to_string() == *selected)
+    };
+    let mut count = 0_usize;
+    egui::ScrollArea::both()
+        .id_salt("private-execution-table-scroll")
+        .show(ui, |ui| {
+            egui::Grid::new(("private-execution-table", model.execution.tab as u8))
+                .striped(true)
+                .min_col_width(72.0)
+                .spacing([18.0, 8.0])
+                .show(ui, |ui| {
+                    let headings: &[Key] = match model.execution.tab {
+                        Tab::Positions => &[
+                            Key::Symbol,
+                            Key::Side,
+                            Key::Size,
+                            Key::Entry,
+                            Key::Mark,
+                            Key::Time,
+                        ],
+                        Tab::CurrentOrders => &[
+                            Key::Symbol,
+                            Key::Side,
+                            Key::Price,
+                            Key::Size,
+                            Key::Filled,
+                            Key::State,
+                            Key::ReduceOnly,
+                            Key::OrderId,
+                            Key::Time,
+                        ],
+                        Tab::OrderHistory => &[
+                            Key::Symbol,
+                            Key::Side,
+                            Key::Price,
+                            Key::Size,
+                            Key::State,
+                            Key::OrderId,
+                            Key::Time,
+                        ],
+                        Tab::Fills => &[
+                            Key::Symbol,
+                            Key::Side,
+                            Key::Price,
+                            Key::Size,
+                            Key::OrderId,
+                            Key::FillId,
+                            Key::Time,
+                        ],
+                        Tab::PositionHistory => &[
+                            Key::Symbol,
+                            Key::Side,
+                            Key::Size,
+                            Key::Entry,
+                            Key::Mark,
+                            Key::Time,
+                        ],
+                        Tab::Assets => &[Key::Asset, Key::Equity, Key::Available],
+                        Tab::Bots => &[],
+                    };
+                    for key in headings {
+                        ui.weak(text(language, *key));
+                    }
+                    ui.end_row();
+                    match model.execution.tab {
+                        Tab::Positions => {
+                            for row in projection
+                                .positions
+                                .iter()
+                                .filter(|row| included(&row.symbol))
+                            {
+                                count += 1;
+                                ui.label(row.symbol.to_string());
+                                ui.label(format!("{:?}", row.position_side));
+                                decimal(ui, Some(row.quantity));
+                                decimal(ui, row.entry_price);
+                                decimal(ui, row.mark_price);
+                                ui.weak(timestamp(projection.observed_ms));
+                                ui.end_row();
+                            }
+                        }
+                        Tab::CurrentOrders => {
+                            for row in projection
+                                .open_orders
+                                .iter()
+                                .filter(|row| included(&row.symbol))
+                            {
+                                count += 1;
+                                ui.label(row.symbol.to_string());
+                                ui.label(format!("{:?} / {:?}", row.order_side, row.position_side));
+                                decimal(ui, row.limit_price);
+                                decimal(ui, Some(row.quantity));
+                                decimal(ui, row.filled_quantity);
+                                ui.label(format!("{:?}", row.state));
+                                ui.label(if row.reduce_only { "✓" } else { "—" });
+                                ui.monospace(
+                                    row.native_order_id
+                                        .as_deref()
+                                        .map_or(row.client_order_id.as_str(), |value| value),
+                                );
+                                ui.weak(row.created_ms.map_or_else(|| "—".into(), timestamp));
+                                ui.end_row();
+                            }
+                        }
+                        Tab::OrderHistory => {
+                            for row in model.execution.terminal_executions.iter().filter(|row| {
+                                row.trading_account_id == projection.trading_account_id
+                                    && included(&row.symbol)
+                            }) {
+                                count += 1;
+                                ui.label(row.symbol.to_string());
+                                ui.label(format!("{:?} / {:?}", row.order_side, row.position_side));
+                                decimal(ui, row.limit_price);
+                                decimal(ui, row.requested_quantity);
+                                ui.label(format!("{:?}", row.state));
+                                ui.monospace(
+                                    row.native_order_id
+                                        .as_deref()
+                                        .map_or(row.command_id.as_str(), |value| value),
+                                );
+                                ui.weak(timestamp(row.updated_ms));
+                                ui.end_row();
+                            }
+                        }
+                        Tab::Fills => {
+                            for row in projection.fills.iter().filter(|row| included(&row.symbol)) {
+                                count += 1;
+                                ui.label(row.symbol.to_string());
+                                ui.label(format!("{:?} / {:?}", row.order_side, row.position_side));
+                                decimal(ui, Some(row.price));
+                                decimal(ui, Some(row.quantity));
+                                ui.monospace(&row.native_order_id);
+                                ui.monospace(&row.native_trade_id);
+                                ui.weak(row.occurred_ms.map_or_else(|| "—".into(), timestamp));
+                                ui.end_row();
+                            }
+                        }
+                        Tab::PositionHistory => {
+                            for entry in projection
+                                .position_history
+                                .iter()
+                                .filter(|entry| included(&entry.position.symbol))
+                            {
+                                let row = &entry.position;
+                                count += 1;
+                                ui.label(row.symbol.to_string());
+                                ui.label(format!("{:?}", row.position_side));
+                                decimal(ui, Some(row.quantity));
+                                decimal(ui, row.entry_price);
+                                decimal(ui, row.mark_price);
+                                ui.weak(timestamp(entry.observed_ms));
+                                ui.end_row();
+                            }
+                        }
+                        Tab::Assets => {
+                            for row in &projection.assets {
+                                count += 1;
+                                ui.label(&row.asset);
+                                decimal(ui, Some(row.equity));
+                                decimal(ui, row.available_margin);
+                                ui.end_row();
+                            }
+                        }
+                        Tab::Bots => {}
+                    }
+                });
+        });
+    if count == 0 {
+        ui.weak(text(language, Key::Empty));
     }
 }
 

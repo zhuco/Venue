@@ -207,6 +207,15 @@ impl VenueFlowApp {
                 ClientEvent::ExecutionFactsUnavailable(message) => {
                     self.model.execution.error = Some(message)
                 }
+                ClientEvent::TerminalAccountProjection(projection) => {
+                    self.model.execution.apply_private(projection)
+                }
+                ClientEvent::TerminalExecutions(executions) => {
+                    self.model.execution.apply_terminal_executions(executions)
+                }
+                ClientEvent::TerminalAccountUnavailable(message) => {
+                    self.model.execution.private_error = Some(message)
+                }
                 ClientEvent::SessionExpired => {
                     // An unauthenticated bootstrap response must not invalidate
                     // a vaulted session that the account endpoint is validating.
@@ -278,6 +287,41 @@ impl VenueFlowApp {
         );
         self.model.notice("Reconnecting to the Control API");
     }
+
+    fn synchronize_private_projection(&self) {
+        let Some(credential_id) = self
+            .model
+            .account_overview
+            .as_ref()
+            .and_then(|overview| overview.selected_credential_id.clone())
+        else {
+            return;
+        };
+        let symbols = self
+            .model
+            .preferences
+            .favorite_symbols
+            .iter()
+            .chain(std::iter::once(&self.model.preferences.selected_symbol))
+            .filter_map(|symbol| symbol.parse().ok())
+            .fold(Vec::new(), |mut values, symbol| {
+                if !values.contains(&symbol)
+                    && values.len() < venue_control_protocol::kol::MAX_ALLOWED_SYMBOLS
+                {
+                    values.push(symbol);
+                }
+                values
+            });
+        if symbols.is_empty() {
+            return;
+        }
+        self.client
+            .subscribe_terminal(venue_control_protocol::kol::TerminalProjectionRequest {
+                schema_version: venue_control_protocol::kol::TERMINAL_PROJECTION_SCHEMA_VERSION,
+                credential_id,
+                symbols,
+            });
+    }
 }
 
 impl eframe::App for VenueFlowApp {
@@ -295,6 +339,7 @@ impl eframe::App for VenueFlowApp {
             self.reconnect = true;
         }
         self.reconnect_if_requested(context);
+        self.synchronize_private_projection();
         if std::mem::take(&mut self.model.follow_latest_requested) {
             self.workspaces.follow_dynamic_charts_latest();
         }

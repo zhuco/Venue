@@ -4,9 +4,12 @@ use std::collections::BTreeSet;
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use venue_domain::{PositionSide, Symbol, is_canonical_trading_account_id};
+use venue_domain::{OrderSide, PositionSide, Symbol, is_canonical_trading_account_id};
 
 pub const KOL_SCHEMA_VERSION: u16 = 1;
+/// Terminal order wire v2 replaces the ambiguous legacy limit-GTC shape with explicit
+/// post-only limits and confirmed close-only market orders.
+pub const TERMINAL_SCHEMA_VERSION: u16 = 2;
 pub const KOL_INVITE_RESOLVE_PATH: &str = "/v2/public/kol/invites";
 pub const KOL_PROFILE_PATH: &str = "/v2/kol/profile";
 pub const KOL_FOLLOW_SETTINGS_PATH: &str = "/v2/kol/follow/settings";
@@ -14,12 +17,175 @@ pub const KOL_FOLLOW_LIFECYCLE_PATH: &str = "/v2/kol/follow/lifecycle";
 pub const KOL_TERMINAL_ORDER_PATH: &str = "/v2/kol/terminal/orders";
 pub const KOL_TERMINAL_CANCEL_PATH: &str = "/v2/kol/terminal/orders/cancel";
 pub const KOL_EXECUTION_STATUS_PATH: &str = "/v2/kol/executions";
+pub const KOL_TERMINAL_ACCOUNT_PATH: &str = "/v2/kol/terminal/account";
 
-pub const MAX_KOL_NAME_CHARS: usize = 64;
-pub const MAX_KOL_TITLE_CHARS: usize = 120;
+pub const MAX_KOL_NAME_CHARS: usize = 40;
+pub const MAX_KOL_TITLE_CHARS: usize = 80;
 pub const MAX_KOL_DESCRIPTION_CHARS: usize = 2_000;
 pub const MAX_ALLOWED_SYMBOLS: usize = 32;
 pub const MAX_DEVIATION_BPS: u32 = 5_000;
+pub const TERMINAL_PROJECTION_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalPositionMode {
+    Hedge,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalOrderState {
+    New,
+    PartiallyFilled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalProjectionRequest {
+    pub schema_version: u16,
+    pub credential_id: String,
+    pub symbols: Vec<Symbol>,
+}
+
+impl TerminalProjectionRequest {
+    pub fn validate(&self) -> Result<(), KolProtocolError> {
+        let symbols = self.symbols.iter().collect::<BTreeSet<_>>();
+        if self.schema_version != TERMINAL_PROJECTION_SCHEMA_VERSION
+            || !canonical_id(&self.credential_id)
+            || self.symbols.is_empty()
+            || self.symbols.len() > MAX_ALLOWED_SYMBOLS
+            || symbols.len() != self.symbols.len()
+        {
+            return Err(KolProtocolError::TerminalProjection);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalPosition {
+    pub symbol: Symbol,
+    pub position_side: PositionSide,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub quantity: Decimal,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub entry_price: Option<Decimal>,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub mark_price: Option<Decimal>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalPositionHistoryEntry {
+    pub observed_ms: u64,
+    pub position: TerminalPosition,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalOpenOrder {
+    pub client_order_id: String,
+    pub native_order_id: Option<String>,
+    pub symbol: Symbol,
+    pub order_side: OrderSide,
+    pub position_side: PositionSide,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub quantity: Decimal,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub filled_quantity: Option<Decimal>,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub limit_price: Option<Decimal>,
+    pub post_only: bool,
+    pub reduce_only: bool,
+    pub state: TerminalOrderState,
+    pub created_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalFill {
+    pub native_trade_id: String,
+    pub native_order_id: String,
+    pub symbol: Symbol,
+    pub order_side: OrderSide,
+    pub position_side: PositionSide,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub quantity: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub price: Decimal,
+    pub maker: Option<bool>,
+    pub occurred_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalAsset {
+    pub asset: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub equity: Decimal,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub available_margin: Option<Decimal>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalAccountProjection {
+    pub schema_version: u16,
+    pub credential_id: String,
+    pub trading_account_id: String,
+    pub observed_ms: u64,
+    pub persisted_ms: u64,
+    pub private_generation: u64,
+    pub position_mode: TerminalPositionMode,
+    pub positions: Vec<TerminalPosition>,
+    #[serde(default)]
+    pub position_history: Vec<TerminalPositionHistoryEntry>,
+    pub open_orders: Vec<TerminalOpenOrder>,
+    pub fills: Vec<TerminalFill>,
+    pub assets: Vec<TerminalAsset>,
+}
+
+impl TerminalAccountProjection {
+    pub fn validate(&self) -> Result<(), KolProtocolError> {
+        if self.schema_version != TERMINAL_PROJECTION_SCHEMA_VERSION
+            || !canonical_id(&self.credential_id)
+            || !is_canonical_trading_account_id(&self.trading_account_id)
+            || self.observed_ms == 0
+            || self.persisted_ms < self.observed_ms
+            || self.private_generation == 0
+            || self.positions.iter().any(|position| {
+                position.position_side == PositionSide::Net
+                    || position.quantity == Decimal::MAX
+                    || position.quantity == Decimal::MIN
+            })
+            || self
+                .position_history
+                .iter()
+                .any(|entry| entry.observed_ms == 0)
+            || self.open_orders.iter().any(|order| {
+                order.client_order_id.trim().is_empty()
+                    || order.position_side == PositionSide::Net
+                    || !positive(order.quantity)
+            })
+            || self.fills.iter().any(|fill| {
+                fill.native_trade_id.trim().is_empty()
+                    || fill.native_order_id.trim().is_empty()
+                    || fill.position_side == PositionSide::Net
+                    || !positive(fill.quantity)
+                    || !positive(fill.price)
+            })
+            || self.assets.iter().any(|asset| {
+                asset.asset.trim().is_empty()
+                    || asset.equity == Decimal::MAX
+                    || asset.equity == Decimal::MIN
+            })
+        {
+            return Err(KolProtocolError::TerminalProjection);
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -178,6 +344,25 @@ pub struct FollowLifecycleRequest {
     pub risk_confirmed: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FollowRelationSummary {
+    pub relation_id: String,
+    pub state: FollowLifecycleState,
+    pub revision: u64,
+    pub settings: FollowRiskSettings,
+    pub activation_requested: bool,
+}
+
+impl FollowRelationSummary {
+    pub fn validate(&self) -> Result<(), KolProtocolError> {
+        if !canonical_id(&self.relation_id) || self.revision == 0 {
+            return Err(KolProtocolError::Identity);
+        }
+        self.settings.validate()
+    }
+}
+
 impl FollowLifecycleRequest {
     pub fn validate(&self) -> Result<(), KolProtocolError> {
         if self.schema_version != KOL_SCHEMA_VERSION
@@ -221,7 +406,7 @@ impl TerminalAction {
 #[serde(rename_all = "snake_case")]
 pub enum TerminalOrderKind {
     Market,
-    LimitGtc,
+    LimitPostOnly,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -244,21 +429,25 @@ pub struct TerminalOrderRequest {
 
 impl TerminalOrderRequest {
     pub fn validate(&self) -> Result<(), KolProtocolError> {
-        if self.schema_version != KOL_SCHEMA_VERSION
+        if self.schema_version != TERMINAL_SCHEMA_VERSION
             || !canonical_id(&self.request_id)
             || !canonical_id(&self.credential_id)
-            || !positive(self.quote_notional)
         {
             return Err(KolProtocolError::TerminalOrder);
         }
         match self.order_kind {
             TerminalOrderKind::Market => {
-                if self.limit_price.is_some() || !self.market_risk_confirmed {
+                if !self.action.is_close()
+                    || self.limit_price.is_some()
+                    || !self.market_risk_confirmed
+                    || self.quote_notional != Decimal::ZERO
+                {
                     return Err(KolProtocolError::TerminalOrder);
                 }
             }
-            TerminalOrderKind::LimitGtc => {
-                if self.limit_price.is_none_or(|price| !positive(price))
+            TerminalOrderKind::LimitPostOnly => {
+                if !positive(self.quote_notional)
+                    || self.limit_price.is_none_or(|price| !positive(price))
                     || self.market_risk_confirmed
                 {
                     return Err(KolProtocolError::TerminalOrder);
@@ -288,7 +477,7 @@ pub struct TerminalCancelRequest {
 
 impl TerminalCancelRequest {
     pub fn validate(&self) -> Result<(), KolProtocolError> {
-        if self.schema_version != KOL_SCHEMA_VERSION
+        if self.schema_version != TERMINAL_SCHEMA_VERSION
             || !canonical_id(&self.request_id)
             || !canonical_id(&self.credential_id)
             || !bounded_plain(&self.native_order_id, 1, 128)
@@ -312,6 +501,14 @@ pub enum ExecutorCommandPhase {
     Open,
     Close,
     Cancel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorOrderKind {
+    Market,
+    LimitPostOnly,
+    CancelExact,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -352,6 +549,12 @@ pub struct ExecutorCommandSummary {
     pub trading_account_id: String,
     pub symbol: Symbol,
     pub position_side: Option<PositionSide>,
+    pub order_side: Option<OrderSide>,
+    pub order_kind: ExecutorOrderKind,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub requested_quantity: Option<Decimal>,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub limit_price: Option<Decimal>,
     pub state: ExecutorCommandState,
     pub native_order_id: Option<String>,
     pub created_ms: u64,
@@ -370,6 +573,12 @@ impl ExecutorCommandSummary {
             || self.created_ms == 0
             || self.updated_ms < self.created_ms
             || (self.phase == ExecutorCommandPhase::Cancel) != self.position_side.is_none()
+            || (self.phase == ExecutorCommandPhase::Cancel) != self.order_side.is_none()
+            || (self.phase == ExecutorCommandPhase::Cancel)
+                != (self.order_kind == ExecutorOrderKind::CancelExact)
+            || (self.order_kind == ExecutorOrderKind::LimitPostOnly) != self.limit_price.is_some()
+            || (self.phase != ExecutorCommandPhase::Cancel)
+                != self.requested_quantity.is_some_and(positive)
             || self
                 .position_side
                 .is_some_and(|side| side == PositionSide::Net)
@@ -404,6 +613,8 @@ pub enum KolProtocolError {
     TerminalOrder,
     #[error("executor command summary is invalid")]
     CommandSummary,
+    #[error("terminal account projection is invalid")]
+    TerminalProjection,
 }
 
 fn validate_profile_text(
@@ -489,23 +700,26 @@ mod tests {
     fn terminal_market_and_close_semantics_are_explicit() -> Result<(), Box<dyn std::error::Error>>
     {
         let mut order = TerminalOrderRequest {
-            schema_version: KOL_SCHEMA_VERSION,
+            schema_version: TERMINAL_SCHEMA_VERSION,
             request_id: ID_1.into(),
             credential_id: ID_2.into(),
             symbol: "BTC/USDT".parse()?,
             action: TerminalAction::OpenLong,
             order_kind: TerminalOrderKind::Market,
-            quote_notional: Decimal::new(10, 0),
+            quote_notional: Decimal::ZERO,
             limit_price: None,
             close_quantity_cap: None,
             market_risk_confirmed: true,
         };
-        assert_eq!(order.validate(), Ok(()));
+        assert_eq!(order.validate(), Err(KolProtocolError::TerminalOrder));
         order.action = TerminalAction::CloseShort;
         assert_eq!(order.validate(), Err(KolProtocolError::TerminalOrder));
         order.close_quantity_cap = Some(Decimal::new(2, 3));
         assert_eq!(order.validate(), Ok(()));
-        order.order_kind = TerminalOrderKind::LimitGtc;
+        order.action = TerminalAction::OpenLong;
+        order.close_quantity_cap = None;
+        order.order_kind = TerminalOrderKind::LimitPostOnly;
+        order.quote_notional = Decimal::new(10, 0);
         order.market_risk_confirmed = false;
         order.limit_price = Some(Decimal::new(67_000, 0));
         assert_eq!(order.validate(), Ok(()));

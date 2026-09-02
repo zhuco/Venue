@@ -1,22 +1,34 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rust_decimal::Decimal;
 use sqlx::{Executor, PgPool, postgres::PgPoolOptions};
+use venue_control::accounts::AccountService;
 use venue_control::{
-    BinanceExecutorSingleton, ExecutorSingletonError, MIGRATION_0017, accounts::MIGRATION_0015,
+    BinanceExecutorSingleton, ExecutorSingletonError, MIGRATION_0001, MIGRATION_0017,
+    MIGRATION_0018, MIGRATION_0019, MIGRATION_0020, accounts::MIGRATION_0015,
 };
 use venue_control::{
     KolSourceFill,
     executor_exchange::{ExecutionReadback, MockBinanceExecution},
     executor_runtime::BinanceExecutorRuntime,
     executor_store::PgExecutorStore,
+    private_projection::{ActiveProjectionSource, BinancePrivateProjectionStore},
 };
 use venue_control::{
     accounts::CredentialCipher,
     executor_secret::{ExecutorSecretError, ExecutorSecretProvider},
 };
-use venue_control_protocol::accounts::{BindCredentialRequest, SecretValue};
-use venue_control_protocol::kol::ExecutorCommandState;
-use venue_domain::domain::{OrderSide, PositionSide};
+use venue_control_protocol::accounts::{BindCredentialRequest, LoginRequest, SecretValue};
+use venue_control_protocol::kol::{
+    ExecutorCommandState, ExecutorOrderKind, TERMINAL_SCHEMA_VERSION, TerminalAction,
+    TerminalOrderKind, TerminalOrderRequest,
+};
+use venue_domain::domain::{Asset, FieldState, Fill, OrderSide, PositionSide, Price};
+use venue_execution::{
+    SignedAccountBalance, SignedAccountPositionFact, SignedAccountPositionMode,
+    SignedAccountSnapshot,
+};
+use venue_gateway_binance::{GatewayBinding, GatewayMode, VenueId};
 
 #[tokio::test]
 async fn kol_mvp_migration_is_idempotent_and_enforces_capacity_and_ownership()
@@ -537,6 +549,13 @@ async fn executor_store_claim_is_atomic_and_transitions_only_forward()
     )
     .await?;
     let store = PgExecutorStore::new(fixture.pool.clone());
+    sqlx::query("INSERT INTO venue_control_strategy_scopes (instance_id,venue,mode,trading_account_id,symbol,config_epoch,snapshot_generated_ms) VALUES ($1,'binance','LIVE',$2,'BTC/USDT',1,1)")
+        .bind(id(942)).bind(&account).execute(&fixture.pool).await?;
+    assert!(store.claim_next_command(&account, 2).await?.is_none());
+    sqlx::query("DELETE FROM venue_control_strategy_scopes WHERE trading_account_id=$1")
+        .bind(&account)
+        .execute(&fixture.pool)
+        .await?;
     let left = store.clone();
     let right = store.clone();
     let (first, second) = tokio::join!(
@@ -631,6 +650,226 @@ async fn executor_store_promotes_only_the_matching_pending_activation()
     Ok(())
 }
 
+#[tokio::test]
+async fn private_projection_is_subscribed_persisted_and_owner_scoped()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = integration_database_url()? else {
+        return Ok(());
+    };
+    let fixture = Fixture::create(&database_url).await?;
+    fixture.migrate_twice().await?;
+    let user = id(960);
+    let other = id(961);
+    let account = id(962);
+    let credential = id(963);
+    seed_verified_account(&fixture.pool, &user, &account, &credential, 71).await?;
+    sqlx::query("UPDATE venue_api_credentials SET verification_json='{\"verification\":\"verified\"}'::jsonb WHERE credential_id=$1")
+        .bind(&credential).execute(&fixture.pool).await?;
+    sqlx::query("INSERT INTO venue_users (user_id,username,password_hash,created_ms) VALUES ($1,'projection-other','test',1)")
+        .bind(&other).execute(&fixture.pool).await?;
+    let store = BinancePrivateProjectionStore::new(fixture.pool.clone());
+    let symbol: venue_domain::domain::Symbol = "BTC/USDT".parse()?;
+    store
+        .subscribe(&user, &credential, std::slice::from_ref(&symbol), 100)
+        .await?;
+    let sources = store.active_sources(101).await?;
+    assert_eq!(sources.len(), 1);
+    let source = ActiveProjectionSource {
+        owner_user_id: user.clone(),
+        credential_id: credential.clone(),
+        trading_account_id: account.clone(),
+        symbols: [symbol.clone()].into_iter().collect(),
+        previous_fills_cursor: None,
+    };
+    let snapshot = projection_snapshot(
+        account.clone(),
+        symbol.clone(),
+        110,
+        1,
+        "fills-1",
+        Decimal::new(2, 3),
+        true,
+    )?;
+    store.persist(&source, &snapshot, 111).await?;
+    let snapshot = projection_snapshot(
+        account,
+        symbol,
+        120,
+        2,
+        "fills-2",
+        Decimal::new(3, 3),
+        false,
+    )?;
+    store.persist(&source, &snapshot, 121).await?;
+    let owned = store
+        .load_owned(&user, &credential)
+        .await?
+        .ok_or("missing projection")?;
+    assert_eq!(owned.private_generation, 2);
+    assert_eq!(owned.fills.len(), 1);
+    assert_eq!(owned.position_history.len(), 2);
+    assert!(store.load_owned(&other, &credential).await?.is_none());
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+fn projection_snapshot(
+    account: String,
+    symbol: venue_domain::domain::Symbol,
+    observed_ms: u64,
+    private_generation: u64,
+    cursor: &str,
+    quantity: Decimal,
+    include_fill: bool,
+) -> Result<SignedAccountSnapshot, Box<dyn std::error::Error>> {
+    let binding =
+        GatewayBinding::new(VenueId::Binance, GatewayMode::Live, account, symbol.clone())?;
+    let fills = if include_fill {
+        vec![Fill {
+            fill_id: "native-trade-1".into(),
+            execution_sequence: FieldState::Known(1),
+            order_id: "native-order-1".into(),
+            symbol: symbol.clone(),
+            side: OrderSide::Buy,
+            position_side: FieldState::Known(PositionSide::Long),
+            quantity: Decimal::new(1, 3),
+            price: Price::new(Decimal::new(50_000, 0))?,
+            fee: FieldState::Missing,
+            realized_pnl: FieldState::Missing,
+            maker: FieldState::Known(true),
+            exchange_time_ms: Some(observed_ms - 1),
+        }]
+    } else {
+        Vec::new()
+    };
+    Ok(SignedAccountSnapshot::complete_with_fills(
+        binding,
+        observed_ms,
+        1,
+        private_generation,
+        1,
+        SignedAccountPositionMode::Hedge,
+        Vec::new(),
+        vec![SignedAccountPositionFact {
+            symbol,
+            position_side: PositionSide::Long,
+            quantity,
+            entry_price: Some(Decimal::new(50_000, 0)),
+            mark_price: Some(Decimal::new(50_100, 0)),
+        }],
+        fills,
+        cursor.to_owned(),
+        Vec::new(),
+    )?
+    .with_balances(vec![SignedAccountBalance {
+        asset: Asset::new("USDT")?,
+        equity: Decimal::new(1_000, 0),
+        available_margin: Some(Decimal::new(800, 0)),
+    }])?)
+}
+
+#[tokio::test]
+async fn terminal_post_only_command_is_idempotent_owner_scoped_and_durable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = integration_database_url()? else {
+        return Ok(());
+    };
+    let fixture = Fixture::create(&database_url).await?;
+    fixture.migrate_twice().await?;
+    let service = AccountService::new_with_node_token(
+        fixture.pool.clone(),
+        CredentialCipher::from_key(&[9_u8; 32])?,
+        None,
+    )?;
+    let now = test_now_ms()?;
+    let session = service
+        .register(
+            LoginRequest {
+                username: "terminal-owner".into(),
+                password: SecretValue::new("safe terminal password".into()),
+            },
+            now,
+        )
+        .await?;
+    let principal = service
+        .authenticate(session.token.expose(), now + 1)
+        .await?;
+    let account = id(972);
+    let credential = id(973);
+    sqlx::query("INSERT INTO venue_user_trading_accounts (trading_account_id,user_id,venue,exchange_identity_hash) VALUES ($1,$2,'binance',$3)")
+        .bind(&account).bind(&principal.user.user_id).bind(vec![72_u8; 32]).execute(&fixture.pool).await?;
+    sqlx::query("INSERT INTO venue_api_credentials (credential_id,user_id,label,key_fingerprint,masked_key,encrypted_credentials,trading_account_id,verification_json,created_ms) VALUES ($1,$2,'terminal',$3,'***',decode('00','hex'),$4,'{\"verification\":\"verified\"}'::jsonb,$5)")
+        .bind(&credential).bind(&principal.user.user_id).bind(vec![73_u8; 32]).bind(&account).bind(i64::try_from(now)?).execute(&fixture.pool).await?;
+    let symbol: venue_domain::domain::Symbol = "BTC/USDT".parse()?;
+    let projection_store = BinancePrivateProjectionStore::new(fixture.pool.clone());
+    let source = ActiveProjectionSource {
+        owner_user_id: principal.user.user_id.clone(),
+        credential_id: credential.clone(),
+        trading_account_id: account,
+        symbols: [symbol.clone()].into_iter().collect(),
+        previous_fills_cursor: None,
+    };
+    projection_store
+        .persist(
+            &source,
+            &projection_snapshot(
+                source.trading_account_id.clone(),
+                symbol.clone(),
+                now + 2,
+                1,
+                "terminal-cursor",
+                Decimal::new(5, 3),
+                false,
+            )?,
+            now + 3,
+        )
+        .await?;
+    let request = TerminalOrderRequest {
+        schema_version: TERMINAL_SCHEMA_VERSION,
+        request_id: id(974),
+        credential_id: credential,
+        symbol,
+        action: TerminalAction::OpenLong,
+        order_kind: TerminalOrderKind::LimitPostOnly,
+        quote_notional: Decimal::new(100, 0),
+        limit_price: Some(Decimal::new(50_000, 0)),
+        close_quantity_cap: None,
+        market_risk_confirmed: false,
+    };
+    let first = service
+        .enqueue_terminal_order(&principal, request.clone(), now + 4)
+        .await?;
+    let replay = service
+        .enqueue_terminal_order(&principal, request, now + 5)
+        .await?;
+    assert_eq!(first.command_id, replay.command_id);
+    assert_eq!(first.order_kind, ExecutorOrderKind::LimitPostOnly);
+    assert_eq!(first.requested_quantity, Some(Decimal::new(2, 3)));
+    assert_eq!(service.terminal_executions(&principal).await?.len(), 1);
+    sqlx::query("INSERT INTO venue_control_strategy_scopes (instance_id,venue,mode,trading_account_id,symbol,config_epoch,snapshot_generated_ms) VALUES ($1,'binance','LIVE',$2,'BTC/USDT',1,$3)")
+        .bind(id(975)).bind(&source.trading_account_id).bind(i64::try_from(now)?).execute(&fixture.pool).await?;
+    let fenced = TerminalOrderRequest {
+        schema_version: TERMINAL_SCHEMA_VERSION,
+        request_id: id(976),
+        credential_id: source.credential_id,
+        symbol: "BTC/USDT".parse()?,
+        action: TerminalAction::OpenLong,
+        order_kind: TerminalOrderKind::LimitPostOnly,
+        quote_notional: Decimal::new(100, 0),
+        limit_price: Some(Decimal::new(50_000, 0)),
+        close_quantity_cap: None,
+        market_risk_confirmed: false,
+    };
+    assert!(
+        service
+            .enqueue_terminal_order(&principal, fenced, now + 6)
+            .await
+            .is_err()
+    );
+    fixture.cleanup().await?;
+    Ok(())
+}
+
 fn integration_database_url() -> Result<Option<String>, Box<dyn std::error::Error>> {
     match std::env::var("VENUE_CONTROL_TEST_DATABASE_URL") {
         Ok(value) => Ok(Some(value)),
@@ -647,6 +886,12 @@ fn integration_database_url() -> Result<Option<String>, Box<dyn std::error::Erro
             Ok(None)
         }
     }
+}
+
+fn test_now_ms() -> Result<u64, Box<dyn std::error::Error>> {
+    Ok(u64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+    )?)
 }
 
 struct Fixture {
@@ -687,8 +932,12 @@ impl Fixture {
 
     async fn migrate_twice(&self) -> Result<(), sqlx::Error> {
         for _ in 0..2 {
+            sqlx::raw_sql(MIGRATION_0001).execute(&self.pool).await?;
             sqlx::raw_sql(MIGRATION_0015).execute(&self.pool).await?;
             sqlx::raw_sql(MIGRATION_0017).execute(&self.pool).await?;
+            sqlx::raw_sql(MIGRATION_0018).execute(&self.pool).await?;
+            sqlx::raw_sql(MIGRATION_0019).execute(&self.pool).await?;
+            sqlx::raw_sql(MIGRATION_0020).execute(&self.pool).await?;
         }
         Ok(())
     }

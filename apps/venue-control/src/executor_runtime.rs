@@ -10,8 +10,8 @@ use venue_gateway_binance::BinanceCredentials;
 
 use crate::{
     executor_exchange::{
-        AccountBaseline, BinanceActivationBaseline, BinanceExecution, ExecutionReadback,
-        ExecutionRequest,
+        AccountBaseline, BinanceActivationBaseline, BinanceExecution, ExecutionOrderKind,
+        ExecutionReadback, ExecutionRequest,
     },
     executor_secret::{ExecutorSecretError, ExecutorSecretProvider},
     executor_store::PgExecutorStore,
@@ -312,6 +312,14 @@ fn request(command: &ClaimedBinanceCommand) -> ExecutionRequest {
         side: command.side,
         position_side: command.position_side,
         quantity: command.quantity,
+        order_kind: match command.order_kind {
+            venue_control_protocol::kol::TerminalOrderKind::Market => ExecutionOrderKind::Market,
+            venue_control_protocol::kol::TerminalOrderKind::LimitPostOnly => {
+                ExecutionOrderKind::LimitPostOnly {
+                    price: command.limit_price.unwrap_or(rust_decimal::Decimal::ZERO),
+                }
+            }
+        },
         reducing: command.reducing,
     }
 }
@@ -339,6 +347,8 @@ mod tests {
             side: venue_domain::domain::OrderSide::Buy,
             position_side: venue_domain::domain::PositionSide::Long,
             quantity: rust_decimal::Decimal::new(1, 3),
+            order_kind: venue_control_protocol::kol::TerminalOrderKind::Market,
+            limit_price: None,
             reducing: false,
             client_order_id: "client".into(),
             state: ExecutorCommandState::ReconcileRequired,
@@ -353,6 +363,7 @@ mod tests {
                 side: venue_domain::domain::OrderSide::Buy,
                 position_side: venue_domain::domain::PositionSide::Long,
                 quantity: rust_decimal::Decimal::new(1, 3),
+                order_kind: ExecutionOrderKind::Market,
                 reducing: false,
             }
         );

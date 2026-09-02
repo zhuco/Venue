@@ -22,11 +22,13 @@ pub mod executor_secret;
 pub mod executor_store;
 mod http;
 mod indicator_projection;
+pub mod kol_executor;
 pub mod kol_mvp;
 pub mod kol_private_source;
 mod model;
 mod node_projection_postgres;
 mod postgres;
+pub mod private_projection;
 mod repository;
 mod service;
 
@@ -67,15 +69,20 @@ pub use indicator_projection::{
     IndicatorProjectionError, IndicatorProjectionStore, IndicatorProjector,
     MAX_INDICATOR_EVENT_PAGE, StoredIndicatorEvent,
 };
+pub use kol_executor::{
+    AccountSerialScheduler, BinanceCommandLedger, BinanceCommandLedgerError, ClaimedBinanceCommand,
+    KolSourceFill, MAX_ENABLED_FOLLOWERS, MAX_ENABLED_KOLS,
+};
 pub use kol_mvp::{
     BINANCE_EXECUTOR_ADVISORY_LOCK, BinanceExecutorSingleton, ExecutorSingletonError,
-    MIGRATION_0017,
+    MIGRATION_0017, MIGRATION_0018,
 };
 pub use model::{AccountNodeBinding, ClaimedCommand, ScopedCommandReceipt, StoredEvent};
 pub use postgres::{
     MIGRATION_0001, MIGRATION_0005, MIGRATION_0009, MIGRATION_0011, MIGRATION_0012, MIGRATION_0014,
     PgControlRepository,
 };
+pub use private_projection::{MIGRATION_0019, MIGRATION_0020};
 pub use repository::{
     CommandEnqueueResult, CommandSettleResult, ControlRepository, RepositoryError,
     SnapshotStoreResult,

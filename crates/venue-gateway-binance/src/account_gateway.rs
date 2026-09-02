@@ -33,6 +33,8 @@ use account_gateway_limit::{
 #[path = "account_gateway_private_stream.rs"]
 mod account_gateway_private_stream;
 pub use account_gateway_private_stream::{BinancePrivateAccountEvent, BinancePrivateFillEvent};
+#[path = "account_gateway_projection.rs"]
+mod account_gateway_projection;
 #[cfg(test)]
 use account_gateway_private_stream::{
     PRIVATE_STREAM_MAX_RECONNECT_DELAY, normalize_private_stream_event,

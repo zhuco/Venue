@@ -14,7 +14,7 @@
 
 1. 用户可从 KOL 专属链接进入页面、注册、登录，并在注册事务中默认归属该 KOL。
 2. 用户可绑定自己的 Binance API Key，系统可验证真实账户身份、API 权限、Portfolio Margin 统一账户、UM 交易能力和双向持仓模式。
-3. KOL 可在基础 Web 交易终端查看自己的双向持仓、活动订单和真实成交，并执行市价或 GTC 限价开多、平多、开空、平空及精确撤单。
+3. KOL 可在 VenueFlow 桌面交易终端查看自己的双向持仓、活动订单、真实成交、仓位历史和资产，并执行默认 Post Only 限价开多、平多、开空、平空及二次确认的市价平仓；精确撤单只在服务端确认订单归属后开放。
 4. 用户明确确认风险参数并启用后，KOL 的真实成交可尽可能快地复制到跟随账户。
 5. 初期全站最多 5 个启用 KOL、200 个启用跟单账户；容量测试必须覆盖单个 KOL 一次成交扇出全部 200 个账户。
 6. KOL 可修改自己的公开页面名称、标题和说明；固定平台风险提示不可修改。
@@ -92,7 +92,8 @@ KOL 可编辑字段限定为：公开名称（1–40 字）、页面标题（1�
 
 ### 5.1 进程职责
 
-- `venue-web`：公开 HTTPS 页面、注册/登录/API 绑定/KOL 页面、基础终端和状态 UI；浏览器不直连 Control、PostgreSQL 或 Binance。
+- `venue-web`：公开 HTTPS 页面、邀请注册、登录、API 绑定、跟单设置和 KOL 页面；浏览器不直连 Control、PostgreSQL 或 Binance。
+- `apps/ui/desktop`：Binance 风格 VenueFlow 桌面终端；只消费 Control 的用户作用域私有投影和命令状态，不持有 API Secret，也不直连 Binance 私流。
 - `venue-control`：认证、邀请归属、KOL 页面、API 密文管理、只读验证、关系配置、终端命令授权、查询投影和任务持久化；不直接执行物理订单。
 - PostgreSQL：保存用户、归属、页面、加密凭证、关系、KOL 成交游标、目标版本、终端/跟单轻量命令账本和执行投影。
 - `venue-executor-binance`：初期新链唯一物理交易进程。它可抽取现有 `venue-copy-worker` 的纯逻辑，但后者及旧 Node 不得继续作为第二个生产跟单入口。
@@ -108,6 +109,8 @@ Executor 使用 Tokio 异步任务管理所有账户：
 Executor 以部署副本数 1 运行，并在启动时取得一个 PostgreSQL 全局 advisory lock；取锁失败立即退出。它不是每账户 lease、选举或 handoff。数据库连接或全局锁丢失后停止产生新订单，只允许对已提交命令做只读收敛。
 
 基础终端与自动跟单共用这个 Executor、Binance adapter、账户串行队列和命令账本，不建立第二个手动交易 writer。Control 只验证 KOL 对本人账户的命令并写入账本；Executor 再按签名账户事实执行。终端不得接受客户端自造账户归属、数量归一化结果或 `clientOrderId`。
+
+桌面每次打开或切换账户时只向 Control 续订短期投影需求。Executor 有界接入认证私流，并以签名 REST 形成账户级完整快照；仓位、活动订单、成交和资产先进入 PostgreSQL，再由 Control 按登录用户与 credential 双重作用域返回。仓位历史只从上线后真实快照变化累积，不伪造历史回填；历史委托当前只展示新 Executor 命令账本，不冒充 Binance 全量历史订单。
 
 ### 5.2 新旧互斥
 
@@ -160,7 +163,7 @@ KOL 必须配置正数的策略资本；跟随者配置分配资金、倍率、�
 
 为优先满足快速复制，MVP 的增仓使用 Binance UM `MARKET`，减仓使用绑定明确 `positionSide` 且不超过 dispatch 前同代新鲜签名腿数量的市场减仓。实现 P3 必须补齐并专项验证现有 Binance adapter 尚未开放的 `PlaceMarket` 路径；不得从旧旁路直接拼 HTTP 请求。
 
-KOL 终端只支持 `MARKET` 和 `LIMIT + GTC`。每次开仓同时受管理员为该 KOL 配置的允许交易对、单笔名义和账户总名义上限约束；市价单需明确二次确认，限价单需使用新鲜 BBO 校验价格偏离。撤单是独立耐久命令，只能以服务端确认属于该 KOL 账户的原生订单身份精确撤销。终端订单与 Copy 一样，只有签名订单/成交/仓位回读完成后才显示最终状态。
+KOL 终端开仓和平仓默认只使用 `LIMIT + GTX(Post Only)`；Maker-only 设置默认开启，关闭时禁止交易而不是退化成 taker 限价。市价只开放双向持仓腿的平仓，必须二次确认，并在 Executor 发送前按同代新鲜签名仓位再次向下裁剪。撤单是独立耐久命令，只能以服务端确认属于该 KOL 账户的原生订单身份精确撤销；该链路未完成前桌面按钮保持禁用。终端订单与 Copy 一样，只有签名订单/成交/仓位回读完成后才显示最终状态。
 
 增仓发送前必须使用共享的新鲜价格进行名义价值和价格偏离检查；超过用户配置的最大偏离、价格过期、规则缺失或最小/最大数量不满足时拒绝该次执行。市场单无法保证最终成交价，页面必须在启用前明确提示滑点风险。
 
@@ -238,7 +241,7 @@ Pending -> Sending -> Accepted -> Reconciled
 - `crates/venue-gateway-binance`：签名、校时、凭证 probe、账户身份、Portfolio Margin UM 规则、KOL 私流、订单/成交/仓位解析和精确回读。
 - `crates/venue-domain`：Symbol、Decimal、OrderSide、PositionSide、订单和成交规范类型。
 - `crates/venue-copy`：仅复用能直接证明正确且不依赖 Actor/delivery/manifest 的纯数量、资本和价格计算；不要求保留旧 Copy orchestration。
-- `apps/ui/web`：现有响应式设计、同源 BFF、安全头、Decimal 展示和实时状态组件；必须替换受控环境会话，而不是另造第二个 Web。
+- `apps/ui/web`：邀请、账户与 KOL 公共页面；`apps/ui/desktop`：桌面交易终端。两个 UI 保持同级目录并由 `apps/ui/README.md` 明确入口，不能混作同一客户端。
 - SQLx/PostgreSQL、Tokio、reqwest、tokio-tungstenite、secrecy、zeroize、tracing 等现有依赖，不为本 MVP 引入第二套框架。
 
 ### 9.2 冻结而不迁移
@@ -257,12 +260,12 @@ Pending -> Sending -> Accepted -> Reconciled
 - 在 `apps/venue-control/migrations/` 增量增加 KOL、邀请、唯一归属、跟单设置、源成交/目标版本、命令账本和执行投影表；不改写旧 migration 或旧恢复记录。
 - 在 `apps/venue-control/src/accounts/`、HTTP/service/repository 现有边界内扩展用户会话、KOL 权限和凭证授权；不建立第二个认证服务。
 - 在 `crates/venue-control-protocol` 增量加入邀请、KOL 页面、终端和跟单状态 DTO；不复用旧 Node delivery DTO 作为新 Executor 协议。
-- 在 `crates/venue-gateway-binance` 补齐 Portfolio Margin UM 认证账户流、开仓 `PlaceMarket`、GTC 限价、精确撤单和同代签名回读；不复制签名 HTTP client。
-- 在现有 `apps/ui/web` 增加 `/join/<invite_code>`、注册/登录、API 管理、跟单状态、KOL 页面编辑和 `/terminal`；不新建第二个前端。
+- 在 `crates/venue-gateway-binance` 补齐 Portfolio Margin UM 认证账户流、Post Only 限价、市价平仓、精确撤单和同代签名回读；不复制签名 HTTP client。
+- 在现有 `apps/ui/web` 增加 `/join/<invite_code>`、注册/登录、API 管理、跟单状态和 KOL 页面编辑；桌面终端只位于同级的 `apps/ui/desktop`。
 
 这样只新增一个 binary 和一组局部模块，旧 Grid/六所 Node 不迁移、不改数据格式，也不成为交付依赖。
 
-P0 已落地的边界是 `0017_kol_copy_mvp.sql`、`venue-control-protocol::kol`、邀请注册 DTO 及 `kol_mvp.rs` 的独占 PostgreSQL advisory lock；它们只固定数据库/线协议/单实例契约。当前仍没有 `venue-executor-binance` 物理循环、KOL HTTP repository 或用户页面，不能据此启动实盘。
+当前已落地 `0017`–`0020` 数据契约、邀请/KOL/跟单 HTTP、唯一 `venue-executor-binance`、私流与签名 REST 投影、Post Only/市价平仓命令账本及桌面消费链。真实凭证联调、旧账户迁移、精确撤单和 2 核 4 GiB/真实 Canary 仍须按验收门执行；存在旧 `venue_control_strategy_scopes` 的账户在 Control 入账与 Executor 抢占两处均保持拒绝。
 
 ## 10. P0–P5 开发计划
 

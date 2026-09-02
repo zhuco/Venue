@@ -44,6 +44,15 @@ pub struct BinancePlaceIntent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceMarketIntent {
+    pub client_order_id: String,
+    pub side: OrderSide,
+    pub position_side: PositionSide,
+    pub quantity: Decimal,
+    pub reduce_only: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BinanceCancelIntent {
     pub client_order_id: String,
 }
@@ -59,6 +68,7 @@ pub struct BinanceReduceOnceIntent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BinanceMutationKind {
     PlaceLimit,
+    PlaceMarket,
     Cancel,
     ReduceOnce,
 }
@@ -111,9 +121,9 @@ impl BinancePreparedMutation {
     #[must_use]
     pub const fn method(&self) -> BinanceHttpMethod {
         match self.kind {
-            BinanceMutationKind::PlaceLimit | BinanceMutationKind::ReduceOnce => {
-                BinanceHttpMethod::Post
-            }
+            BinanceMutationKind::PlaceLimit
+            | BinanceMutationKind::PlaceMarket
+            | BinanceMutationKind::ReduceOnce => BinanceHttpMethod::Post,
             BinanceMutationKind::Cancel => BinanceHttpMethod::Delete,
         }
     }
@@ -178,6 +188,47 @@ pub fn prepare_place_limit(
         rules,
         readback,
         BinanceMutationKind::PlaceLimit,
+        parameters,
+        intent.client_order_id.clone(),
+    )
+}
+
+/// Prepares an explicit market order. The caller must have already applied current-price and
+/// notional guards; Hedge Mode deliberately omits native `reduceOnly`.
+pub fn prepare_place_market(
+    rules: &BinanceInstrumentRules,
+    readback: &BinancePrivateReadbackCandidate,
+    intent: &BinanceMarketIntent,
+) -> Result<BinancePreparedMutation, BinanceExecutionError> {
+    validate_common(rules, readback, &intent.client_order_id, intent.quantity)?;
+    validate_direction(
+        readback.position_mode,
+        intent.position_side,
+        intent.side,
+        intent.reduce_only,
+    )?;
+    let mut parameters = vec![
+        ("symbol".to_owned(), rules.native_symbol.clone()),
+        ("side".to_owned(), side_wire(intent.side).to_owned()),
+        ("type".to_owned(), "MARKET".to_owned()),
+        ("quantity".to_owned(), decimal_wire(intent.quantity)),
+        (
+            "positionSide".to_owned(),
+            position_side_wire(intent.position_side).to_owned(),
+        ),
+        ("newOrderRespType".to_owned(), "RESULT".to_owned()),
+        (
+            "newClientOrderId".to_owned(),
+            intent.client_order_id.clone(),
+        ),
+    ];
+    if readback.position_mode == BinancePositionMode::Net {
+        parameters.push(("reduceOnly".to_owned(), intent.reduce_only.to_string()));
+    }
+    prepared(
+        rules,
+        readback,
+        BinanceMutationKind::PlaceMarket,
         parameters,
         intent.client_order_id.clone(),
     )
@@ -272,8 +323,8 @@ pub fn prepare_reduce_once(
 }
 
 /// Translates the account-node's canonical command without weakening either command validation or
-/// the adapter's same-generation mutation checks. Unsupported native families and opening market
-/// orders stay closed until their exact Binance surfaces are represented by this adapter.
+/// the adapter's same-generation mutation checks. Unsupported native families stay closed until
+/// their exact Binance surfaces are represented by this adapter.
 pub fn prepare_execution_command(
     rules: &BinanceInstrumentRules,
     readback: &BinancePrivateReadbackCandidate,
@@ -316,9 +367,18 @@ pub fn prepare_execution_command(
                 client_order_id: command.target_client_order_id.as_str().to_owned(),
             },
         ),
-        ExecutionCommand::PlaceMarket(_)
-        | ExecutionCommand::StopMarketCloseAll(_)
-        | ExecutionCommand::StopMarketFullPosition(_) => {
+        ExecutionCommand::PlaceMarket(command) => prepare_place_market(
+            rules,
+            readback,
+            &BinanceMarketIntent {
+                client_order_id: command.client_order_id.as_str().to_owned(),
+                position_side: command.position_side,
+                side: command.side,
+                quantity: command.quantity,
+                reduce_only: command.reduce_only,
+            },
+        ),
+        ExecutionCommand::StopMarketCloseAll(_) | ExecutionCommand::StopMarketFullPosition(_) => {
             Err(BinanceExecutionError::UnsupportedCommand)
         }
     }
@@ -387,10 +447,19 @@ fn validate_place_direction(
     mode: BinancePositionMode,
     intent: &BinancePlaceIntent,
 ) -> Result<(), BinanceExecutionError> {
+    validate_direction(mode, intent.position_side, intent.side, intent.reduce_only)
+}
+
+fn validate_direction(
+    mode: BinancePositionMode,
+    position_side: PositionSide,
+    side: OrderSide,
+    reduce_only: bool,
+) -> Result<(), BinanceExecutionError> {
     let valid = match mode {
-        BinancePositionMode::Net => intent.position_side == PositionSide::Net,
+        BinancePositionMode::Net => position_side == PositionSide::Net,
         BinancePositionMode::Hedge => matches!(
-            (intent.position_side, intent.side, intent.reduce_only),
+            (position_side, side, reduce_only),
             (PositionSide::Long, OrderSide::Buy, false)
                 | (PositionSide::Long, OrderSide::Sell, true)
                 | (PositionSide::Short, OrderSide::Sell, false)
@@ -637,6 +706,15 @@ pub(crate) fn prepared_for_transport_test(
             ("timeInForce".to_owned(), "GTX".to_owned()),
             ("quantity".to_owned(), "0.002".to_owned()),
             ("price".to_owned(), "50000".to_owned()),
+            ("positionSide".to_owned(), "LONG".to_owned()),
+            ("newOrderRespType".to_owned(), "RESULT".to_owned()),
+            ("newClientOrderId".to_owned(), client_order_id.to_owned()),
+        ],
+        BinanceMutationKind::PlaceMarket => vec![
+            ("symbol".to_owned(), native_symbol(&scope.binding().symbol)),
+            ("side".to_owned(), "BUY".to_owned()),
+            ("type".to_owned(), "MARKET".to_owned()),
+            ("quantity".to_owned(), "0.002".to_owned()),
             ("positionSide".to_owned(), "LONG".to_owned()),
             ("newOrderRespType".to_owned(), "RESULT".to_owned()),
             ("newClientOrderId".to_owned(), client_order_id.to_owned()),

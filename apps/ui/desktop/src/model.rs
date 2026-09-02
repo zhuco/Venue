@@ -11,7 +11,7 @@ use venue_control_protocol::{
     CONTROL_SCHEMA_VERSION, CommandReceipt, CommandState, ConnectionState, ControlAction,
     ControlCommandRequest, ControlSnapshot, CopyLifecyclePolicy, CopyRelationBinding,
     CopyRelationConfig, CopyRelationRecord, CopyRelationUpsertRequest, CopyRiskPolicy, GatewayMode,
-    StrategySummary, TradeIntent, VenueId,
+    StrategySummary, VenueId,
 };
 
 use crate::i18n::{Language, TextKey, text};
@@ -635,15 +635,9 @@ impl AppModel {
         }
     }
 
-    pub fn begin_trade_command(
-        &mut self,
-        strategy: &StrategySummary,
-        trade: TradeIntent,
-        now_ms: u64,
-    ) -> ControlCommandRequest {
-        let mut request = self.begin_command(strategy, ControlAction::Trade, now_ms);
-        request.trade = Some(trade);
-        request
+    pub fn next_terminal_request_id(&mut self) -> String {
+        self.request_sequence = self.request_sequence.saturating_add(1);
+        next_copy_request_id()
     }
 
     #[must_use]
@@ -790,6 +784,8 @@ impl AppModel {
         if self.preferences.execution_account_id != selected {
             self.preferences.selected_instance = None;
             self.pending_confirmation = None;
+            self.execution.private_projection = None;
+            self.execution.terminal_executions.clear();
         }
         self.preferences.execution_account_id = selected;
         self.account_overview = Some(overview);

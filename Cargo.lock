@@ -4758,6 +4758,7 @@ dependencies = [
  "venue-control-protocol",
  "venue-copy",
  "venue-domain",
+ "venue-execution",
  "venue-gateway-binance",
  "venue-indicators",
  "zeroize",

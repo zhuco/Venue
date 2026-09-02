@@ -37,6 +37,8 @@ const LEGACY_V1_IMPORT_SCHEMA_VERSION: u16 = 2;
 #[path = "account_normalization.rs"]
 mod account_normalization;
 pub use account_normalization::{AccountLimitNormalizationIntent, AccountPricedLimitIntent};
+#[path = "account_recovery_request.rs"]
+mod account_recovery_request;
 
 #[path = "account_net_reduce.rs"]
 mod account_net_reduce;

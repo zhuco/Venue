@@ -1,5 +1,9 @@
 use super::{ClientEvent, path, publish};
 use futures_util::StreamExt;
+use venue_control_protocol::kol::{
+    ExecutorCommandSummary, KOL_EXECUTION_STATUS_PATH, KOL_TERMINAL_ACCOUNT_PATH,
+    TerminalAccountProjection, TerminalProjectionRequest,
+};
 use venue_control_protocol::{EXECUTION_FACTS_PATH, ExecutionFactsSnapshot};
 
 const BODY_LIMIT: usize = 4 * 1024 * 1024;
@@ -53,6 +57,92 @@ fn unavailable(message: &str) -> Box<ClientEvent> {
     Box::new(ClientEvent::ExecutionFactsUnavailable(message.to_owned()))
 }
 
+fn terminal_unavailable(message: &str) -> Box<ClientEvent> {
+    Box::new(ClientEvent::TerminalAccountUnavailable(message.to_owned()))
+}
+
+async fn fetch_terminal_projection(
+    client: &reqwest::Client,
+    endpoint: &str,
+    request: &TerminalProjectionRequest,
+) -> Result<Option<TerminalAccountProjection>, Box<ClientEvent>> {
+    let response = client
+        .post(path(endpoint, KOL_TERMINAL_ACCOUNT_PATH))
+        .json(request)
+        .send()
+        .await
+        .map_err(|_| terminal_unavailable("Private account projection connection failed"))?;
+    if response.status().as_u16() == 401 {
+        return Err(Box::new(ClientEvent::SessionExpired));
+    }
+    if !response.status().is_success() {
+        return Err(terminal_unavailable(&format!(
+            "Private account projection HTTP {}",
+            response.status().as_u16()
+        )));
+    }
+    let bytes = bounded_body(response).await?;
+    let projection: Option<TerminalAccountProjection> = serde_json::from_slice(&bytes)
+        .map_err(|_| terminal_unavailable("Private account projection validation failed"))?;
+    if projection
+        .as_ref()
+        .is_some_and(|value| value.validate().is_err())
+    {
+        return Err(terminal_unavailable(
+            "Private account projection validation failed",
+        ));
+    }
+    Ok(projection)
+}
+
+async fn fetch_terminal_executions(
+    client: &reqwest::Client,
+    endpoint: &str,
+) -> Result<Vec<ExecutorCommandSummary>, Box<ClientEvent>> {
+    let response = client
+        .get(path(endpoint, KOL_EXECUTION_STATUS_PATH))
+        .send()
+        .await
+        .map_err(|_| terminal_unavailable("Terminal execution history connection failed"))?;
+    if response.status().as_u16() == 401 {
+        return Err(Box::new(ClientEvent::SessionExpired));
+    }
+    if !response.status().is_success() {
+        return Err(terminal_unavailable(&format!(
+            "Terminal execution history HTTP {}",
+            response.status().as_u16()
+        )));
+    }
+    let values: Vec<ExecutorCommandSummary> =
+        serde_json::from_slice(&bounded_body(response).await?)
+            .map_err(|_| terminal_unavailable("Terminal execution history validation failed"))?;
+    if values.iter().any(|value| value.validate().is_err()) {
+        return Err(terminal_unavailable(
+            "Terminal execution history validation failed",
+        ));
+    }
+    Ok(values)
+}
+
+async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, Box<ClientEvent>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > BODY_LIMIT as u64)
+    {
+        return Err(terminal_unavailable("Private response body too large"));
+    }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| terminal_unavailable("Private response body unavailable"))?;
+        if bytes.len().saturating_add(chunk.len()) > BODY_LIMIT {
+            return Err(terminal_unavailable("Private response body too large"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 // A slow read endpoint must not stall command delivery. Only one read is in flight.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn start_native(
@@ -61,9 +151,38 @@ pub(super) fn start_native(
     sender: crossbeam_channel::Sender<ClientEvent>,
     context: eframe::egui::Context,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    projection_requests: crossbeam_channel::Receiver<TerminalProjectionRequest>,
 ) {
     tokio::spawn(async move {
+        let mut projection_request = None;
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
+            for request in projection_requests.try_iter() {
+                projection_request = Some(request);
+            }
+            if let Some(request) = projection_request.as_ref() {
+                let event = match tokio::time::timeout(
+                    super::REQUEST_TIMEOUT,
+                    fetch_terminal_projection(&client, &endpoint, request),
+                )
+                .await
+                {
+                    Ok(Ok(projection)) => ClientEvent::TerminalAccountProjection(projection),
+                    Ok(Err(event)) => *event,
+                    Err(_) => *terminal_unavailable("Private account projection request timed out"),
+                };
+                let expired = matches!(event, ClientEvent::SessionExpired);
+                publish(&sender, &context, event);
+                if expired {
+                    break;
+                }
+                if let Ok(executions) = fetch_terminal_executions(&client, &endpoint).await {
+                    publish(
+                        &sender,
+                        &context,
+                        ClientEvent::TerminalExecutions(executions),
+                    );
+                }
+            }
             let event =
                 match tokio::time::timeout(super::REQUEST_TIMEOUT, fetch(&client, &endpoint)).await
                 {

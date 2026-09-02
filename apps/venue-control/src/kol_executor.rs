@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, VecDeque};
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
-use venue_control_protocol::kol::ExecutorCommandState;
+use venue_control_protocol::kol::{ExecutorCommandState, TerminalOrderKind};
 use venue_domain::domain::{FieldState, OrderSide, PositionSide, Symbol};
 use venue_gateway_binance::BinancePrivateFillEvent;
 
@@ -33,6 +33,8 @@ pub struct ClaimedBinanceCommand {
     pub side: OrderSide,
     pub position_side: PositionSide,
     pub quantity: Decimal,
+    pub order_kind: venue_control_protocol::kol::TerminalOrderKind,
+    pub limit_price: Option<Decimal>,
     pub reducing: bool,
     pub client_order_id: String,
     pub state: ExecutorCommandState,
@@ -256,13 +258,16 @@ impl BinanceCommandLedger {
             "WITH candidate AS ( \
              SELECT c.command_id FROM venue_binance_commands c \
              WHERE c.trading_account_id=$1 AND c.command_state='pending' \
+             AND NOT EXISTS (SELECT 1 FROM venue_control_strategy_scopes legacy \
+                 WHERE legacy.venue='binance' AND legacy.mode='LIVE' \
+                 AND legacy.trading_account_id=c.trading_account_id) \
              AND NOT EXISTS (SELECT 1 FROM venue_binance_commands blocked \
                  WHERE blocked.trading_account_id=c.trading_account_id \
                  AND blocked.command_state IN ('sending','reconcile_required')) \
              ORDER BY c.created_ms,c.command_id LIMIT 1 FOR UPDATE SKIP LOCKED) \
              UPDATE venue_binance_commands c SET command_state='sending',sending_ms=$2,updated_ms=$2 \
              FROM candidate WHERE c.command_id=candidate.command_id \
-             RETURNING c.command_id,c.owner_user_id,c.trading_account_id,c.credential_id,c.symbol,c.order_side,c.position_side,c.requested_quantity,c.command_phase,c.client_order_id,c.command_state",
+             RETURNING c.command_id,c.owner_user_id,c.trading_account_id,c.credential_id,c.symbol,c.order_side,c.position_side,c.requested_quantity,c.command_phase,c.order_kind,c.limit_price,c.client_order_id,c.command_state",
         )
         .bind(trading_account_id)
         .bind(now)
@@ -360,6 +365,8 @@ fn claimed(row: sqlx::postgres::PgRow) -> Result<ClaimedBinanceCommand, BinanceC
             .map_err(|_| BinanceCommandLedgerError::Unavailable)?
             .parse()
             .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
+        order_kind: terminal_order_kind(&row)?,
+        limit_price: optional_decimal(&row, "limit_price")?,
         reducing: matches!(
             row.try_get::<String, _>("command_phase")
                 .map_err(|_| BinanceCommandLedgerError::Unavailable)?
@@ -371,6 +378,34 @@ fn claimed(row: sqlx::postgres::PgRow) -> Result<ClaimedBinanceCommand, BinanceC
             .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
         state,
     })
+}
+
+fn terminal_order_kind(
+    row: &sqlx::postgres::PgRow,
+) -> Result<TerminalOrderKind, BinanceCommandLedgerError> {
+    match row
+        .try_get::<String, _>("order_kind")
+        .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+        .as_str()
+    {
+        "market" => Ok(TerminalOrderKind::Market),
+        "limit_post_only" => Ok(TerminalOrderKind::LimitPostOnly),
+        _ => Err(BinanceCommandLedgerError::Unavailable),
+    }
+}
+
+fn optional_decimal(
+    row: &sqlx::postgres::PgRow,
+    field: &str,
+) -> Result<Option<Decimal>, BinanceCommandLedgerError> {
+    row.try_get::<Option<String>, _>(field)
+        .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| BinanceCommandLedgerError::Unavailable)
+        })
+        .transpose()
 }
 
 fn state_name(state: ExecutorCommandState) -> &'static str {

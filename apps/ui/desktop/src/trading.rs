@@ -345,6 +345,7 @@ pub struct TradeDockState {
     pub selected_order_id: Option<String>,
     pub armed_action: Option<TradingAction>,
     pub selected_size_preset: usize,
+    pub market_close_requested: Option<venue_domain::PositionSide>,
     price_selected_at: Option<f64>,
     display_symbol: String,
     scope: Option<TradingScope>,
@@ -477,6 +478,10 @@ pub enum TradePlanError {
     UiOnlyAction,
 }
 
+#[allow(
+    dead_code,
+    reason = "frozen legacy Node contract retained only by regression tests"
+)]
 pub fn build_trade_intent(
     strategy: &StrategySummary,
     settings: &TradingSettings,
