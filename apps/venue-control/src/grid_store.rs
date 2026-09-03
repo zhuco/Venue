@@ -1212,10 +1212,14 @@ async fn cancel_pending_risk_commands(
     now_ms: u64,
 ) -> Result<(), GridStoreError> {
     sqlx::query(
-        "UPDATE venue_binance_commands SET command_state='cancelled',\
+        "WITH cancelled AS (UPDATE venue_binance_commands SET command_state='cancelled',\
          sanitized_error_code='lifecycle_fenced',terminal_ms=$1,updated_ms=$1 \
          WHERE command_origin='grid' AND grid_instance_id=$2 AND command_state='pending' \
-           AND command_phase<>'cancel'",
+           AND command_phase<>'cancel' RETURNING command_id) \
+         UPDATE venue_binance_grid_order_owners owner SET order_state='terminal',\
+         last_seen_ms=GREATEST(owner.last_seen_ms,$1) FROM cancelled \
+         WHERE owner.place_command_id=cancelled.command_id AND owner.native_order_id IS NULL \
+           AND owner.order_state='working'",
     )
     .bind(ms(now_ms)?)
     .bind(instance_id)
