@@ -204,6 +204,55 @@ fn terminal_chrome_hides_symbol_close_until_hover_and_removes_brand_wordmark() {
 }
 
 #[test]
+fn terminal_chrome_keeps_both_rows_at_the_top_of_the_window() {
+    let context = egui::Context::default();
+    theme::apply(&context);
+    let mut model = AppModel::new(crate::model::Preferences::default());
+    model.preferences.favorite_symbols = vec!["BTC/USDC".into()];
+    model.preferences.selected_symbol = "BTC/USDC".into();
+    let mut workspaces = Workspaces::default();
+    let mut modules = false;
+    let mut trading = false;
+    let mut accounts = false;
+    let mut picker = false;
+    let mut frame = context.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1900.0, 990.0),
+            )),
+            ..Default::default()
+        },
+        |ui| {
+            show_top_bar(
+                ui,
+                &mut model,
+                &mut workspaces,
+                &mut modules,
+                &mut trading,
+                &mut accounts,
+                &mut picker,
+            );
+        },
+    );
+    frame.textures_delta.clear();
+    let mut labels = Vec::new();
+    for shape in frame.shapes {
+        collect_text(&shape.shape, &mut labels);
+    }
+    let symbol = labels
+        .iter()
+        .find(|(label, _)| label == "BTC/USDC")
+        .map(|(_, rect)| *rect)
+        .expect("symbol tab");
+    assert!(
+        symbol.top() <= 60.0,
+        "symbol tabs start at {}px",
+        symbol.top()
+    );
+}
+
+#[test]
 fn status_bar_is_one_line_with_funds_visible_at_supported_widths() {
     for language in Language::ALL {
         for width in [850.0, 1100.0, 1680.0] {

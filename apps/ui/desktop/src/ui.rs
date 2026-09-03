@@ -97,7 +97,7 @@ pub fn show_top_bar(
                     ui,
                     |ui| {
                         let drag = ui.allocate_response(
-                            ui.available_size_before_wrap(),
+                            egui::vec2(ui.available_width(), 30.0),
                             egui::Sense::click_and_drag(),
                         );
                         #[cfg(not(target_arch = "wasm32"))]
@@ -197,6 +197,9 @@ pub fn show_top_bar(
             egui::ScrollArea::horizontal()
                 .id_salt("favorite-symbol-tabs")
                 .auto_shrink([false, true])
+                .max_height(40.0)
+                .min_scrolled_height(40.0)
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .show(ui, |ui| {
                     ui.horizontal_centered(|ui| {
                         show_symbol_tabs(ui, model, workspaces, &picker_requested);
