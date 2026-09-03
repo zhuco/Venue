@@ -277,16 +277,17 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel) {
                         Tab::Positions => {
                             for row in facts.positions.iter().filter(|row| included(&row.binding)) {
                                 count += 1;
-                                if ui
-                                    .selectable_label(false, row.binding.symbol.to_string())
-                                    .clicked()
-                                {
+                                if symbol_link(
+                                    ui,
+                                    &row.binding.symbol,
+                                    &model.preferences.selected_symbol,
+                                ) {
                                     selected_row = Some((row.binding.clone(), None));
                                 }
                                 ui.label(format!("{:?}", row.position_side));
-                                decimal(ui, Some(row.quantity));
-                                decimal(ui, row.entry_price);
-                                decimal(ui, row.mark_price);
+                                market_quantity(ui, model, &row.binding.symbol, Some(row.quantity));
+                                market_price(ui, model, &row.binding.symbol, row.entry_price);
+                                market_price(ui, model, &row.binding.symbol, row.mark_price);
                                 ui.label(&row.binding.instance_id);
                                 ui.weak(timestamp(row.observed_ms));
                                 ui.end_row();
@@ -312,24 +313,25 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel) {
                                                 && s.config_epoch == row.binding.config_epoch
                                         })
                                     });
-                                if ui
-                                    .add_enabled(
-                                        actionable,
-                                        egui::Button::selectable(
-                                            model.trade_dock.selected_order_id.as_deref()
-                                                == Some(row.order_id.as_str()),
-                                            row.binding.symbol.to_string(),
-                                        ),
-                                    )
-                                    .clicked()
-                                {
-                                    selected_row =
-                                        Some((row.binding.clone(), Some(row.order_id.clone())));
+                                if symbol_link(
+                                    ui,
+                                    &row.binding.symbol,
+                                    &model.preferences.selected_symbol,
+                                ) {
+                                    selected_row = Some((
+                                        row.binding.clone(),
+                                        actionable.then(|| row.order_id.clone()),
+                                    ));
                                 }
                                 ui.label(format!("{:?} / {:?}", row.side, row.position_side));
-                                decimal(ui, row.limit_price);
-                                decimal(ui, Some(row.quantity));
-                                decimal(ui, row.filled_quantity);
+                                market_price(ui, model, &row.binding.symbol, row.limit_price);
+                                market_quantity(ui, model, &row.binding.symbol, Some(row.quantity));
+                                market_quantity(
+                                    ui,
+                                    model,
+                                    &row.binding.symbol,
+                                    row.filled_quantity,
+                                );
                                 ui.label(
                                     row.state
                                         .map_or_else(|| "—".into(), |state| format!("{state:?}")),
@@ -418,6 +420,7 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel) {
     }
     if let Some((binding, order)) = selected_row {
         model.select_symbol(binding.symbol.to_string());
+        model.follow_latest_requested = true;
         model.preferences.selected_instance = Some(binding.instance_id);
         model.synchronize_trading_scope();
         model.trade_dock.selected_order_id = order;
@@ -453,6 +456,7 @@ fn show_private_projection(
             .is_none_or(|selected| symbol.to_string() == *selected)
     };
     let mut count = 0_usize;
+    let mut requested_symbol = None;
     egui::ScrollArea::both()
         .id_salt("private-execution-table-scroll")
         .show(ui, |ui| {
@@ -522,11 +526,14 @@ fn show_private_projection(
                                 .filter(|row| included(&row.symbol))
                             {
                                 count += 1;
-                                ui.label(row.symbol.to_string());
+                                if symbol_link(ui, &row.symbol, &model.preferences.selected_symbol)
+                                {
+                                    requested_symbol = Some(row.symbol.to_string());
+                                }
                                 ui.label(format!("{:?}", row.position_side));
-                                decimal(ui, Some(row.quantity));
-                                decimal(ui, row.entry_price);
-                                decimal(ui, row.mark_price);
+                                market_quantity(ui, model, &row.symbol, Some(row.quantity));
+                                market_price(ui, model, &row.symbol, row.entry_price);
+                                market_price(ui, model, &row.symbol, row.mark_price);
                                 ui.weak(timestamp(projection.observed_ms));
                                 ui.end_row();
                             }
@@ -538,11 +545,14 @@ fn show_private_projection(
                                 .filter(|row| included(&row.symbol))
                             {
                                 count += 1;
-                                ui.label(row.symbol.to_string());
+                                if symbol_link(ui, &row.symbol, &model.preferences.selected_symbol)
+                                {
+                                    requested_symbol = Some(row.symbol.to_string());
+                                }
                                 ui.label(format!("{:?} / {:?}", row.order_side, row.position_side));
-                                decimal(ui, row.limit_price);
-                                decimal(ui, Some(row.quantity));
-                                decimal(ui, row.filled_quantity);
+                                market_price(ui, model, &row.symbol, row.limit_price);
+                                market_quantity(ui, model, &row.symbol, Some(row.quantity));
+                                market_quantity(ui, model, &row.symbol, row.filled_quantity);
                                 ui.label(format!("{:?}", row.state));
                                 ui.label(if row.reduce_only { "✓" } else { "—" });
                                 ui.monospace(
@@ -562,8 +572,8 @@ fn show_private_projection(
                                 count += 1;
                                 ui.label(row.symbol.to_string());
                                 ui.label(format!("{:?} / {:?}", row.order_side, row.position_side));
-                                decimal(ui, row.limit_price);
-                                decimal(ui, row.requested_quantity);
+                                market_price(ui, model, &row.symbol, row.limit_price);
+                                market_quantity(ui, model, &row.symbol, row.requested_quantity);
                                 ui.label(format!("{:?}", row.state));
                                 ui.monospace(
                                     row.native_order_id
@@ -579,8 +589,8 @@ fn show_private_projection(
                                 count += 1;
                                 ui.label(row.symbol.to_string());
                                 ui.label(format!("{:?} / {:?}", row.order_side, row.position_side));
-                                decimal(ui, Some(row.price));
-                                decimal(ui, Some(row.quantity));
+                                market_price(ui, model, &row.symbol, Some(row.price));
+                                market_quantity(ui, model, &row.symbol, Some(row.quantity));
                                 ui.monospace(&row.native_order_id);
                                 ui.monospace(&row.native_trade_id);
                                 ui.weak(row.occurred_ms.map_or_else(|| "—".into(), timestamp));
@@ -597,9 +607,9 @@ fn show_private_projection(
                                 count += 1;
                                 ui.label(row.symbol.to_string());
                                 ui.label(format!("{:?}", row.position_side));
-                                decimal(ui, Some(row.quantity));
-                                decimal(ui, row.entry_price);
-                                decimal(ui, row.mark_price);
+                                market_quantity(ui, model, &row.symbol, Some(row.quantity));
+                                market_price(ui, model, &row.symbol, row.entry_price);
+                                market_price(ui, model, &row.symbol, row.mark_price);
                                 ui.weak(timestamp(entry.observed_ms));
                                 ui.end_row();
                             }
@@ -620,6 +630,53 @@ fn show_private_projection(
     if count == 0 {
         ui.weak(text(language, Key::Empty));
     }
+    if let Some(symbol) = requested_symbol {
+        model.select_symbol(symbol);
+        model.follow_latest_requested = true;
+    }
+}
+
+fn symbol_link(ui: &mut egui::Ui, symbol: &venue_domain::Symbol, selected_symbol: &str) -> bool {
+    let value = symbol.to_string();
+    ui.add(
+        egui::Button::selectable(value == selected_symbol, &value)
+            .frame(false)
+            .sense(egui::Sense::click()),
+    )
+    .on_hover_text("打开或切换到该交易对图表")
+    .clicked()
+}
+
+fn market_price(
+    ui: &mut egui::Ui,
+    model: &AppModel,
+    symbol: &venue_domain::Symbol,
+    value: Option<rust_decimal::Decimal>,
+) {
+    ui.monospace(market_price_text(model, symbol, value));
+}
+
+fn market_price_text(
+    model: &AppModel,
+    symbol: &venue_domain::Symbol,
+    value: Option<rust_decimal::Decimal>,
+) -> String {
+    value.map_or_else(
+        || "—".into(),
+        |value| model.format_market_price(&symbol.to_string(), value),
+    )
+}
+
+fn market_quantity(
+    ui: &mut egui::Ui,
+    model: &AppModel,
+    symbol: &venue_domain::Symbol,
+    value: Option<rust_decimal::Decimal>,
+) {
+    ui.monospace(value.map_or_else(
+        || "—".into(),
+        |value| model.format_market_quantity(&symbol.to_string(), value),
+    ));
 }
 
 fn is_current_order(state: Option<OrderState>) -> bool {
@@ -658,6 +715,22 @@ mod tests {
         assert!(!is_current_order(Some(OrderState::Cancelled)));
         assert!(!is_current_order(Some(OrderState::Expired)));
         assert!(!is_current_order(Some(OrderState::Rejected)));
+    }
+    #[test]
+    fn private_mark_price_uses_the_exchange_symbol_precision()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut model = AppModel::new(crate::model::Preferences::default());
+        model.local_precisions.insert("SOL/USDC".into(), (4, 3));
+        let symbol: venue_domain::Symbol = "SOL/USDC".parse()?;
+        assert_eq!(
+            market_price_text(
+                &model,
+                &symbol,
+                Some(rust_decimal::Decimal::new(123_456_789, 6))
+            ),
+            "123.4568"
+        );
+        Ok(())
     }
     #[test]
     fn account_filter_never_crosses_venue_account_or_symbol()

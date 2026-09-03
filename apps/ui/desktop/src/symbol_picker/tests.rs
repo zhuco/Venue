@@ -134,3 +134,43 @@ fn blank_columns_select_the_entire_row_and_star_only_changes_favorite() -> Resul
     }
     Ok(())
 }
+
+#[test]
+fn large_catalog_renders_only_visible_rows_and_filtered_rows_remain_clickable() -> Result<(), String>
+{
+    let context = egui::Context::default();
+    let mut model = AppModel::new(Preferences::default());
+    model.local_symbols = (0..600)
+        .map(|index| format!("COIN{index:03}/USDC"))
+        .collect();
+    model.symbol_group = SymbolGroup::All;
+    model.symbol_filter = "599".into();
+    let mut workspaces = Workspaces::default();
+    let mut open = true;
+    for _ in 0..3 {
+        frame(&context, &mut model, &mut workspaces, &mut open, vec![]);
+    }
+    let labels = frame(&context, &mut model, &mut workspaces, &mut open, vec![]);
+    let result = labels
+        .iter()
+        .find(|(text, _)| text == "COIN599/USDC")
+        .map(|(_, rect)| *rect)
+        .ok_or("filtered symbol not rendered")?;
+    assert!(
+        labels
+            .iter()
+            .filter(|(text, _)| text.starts_with("COIN"))
+            .count()
+            < 30
+    );
+    click(
+        &context,
+        &mut model,
+        &mut workspaces,
+        &mut open,
+        result.center(),
+    );
+    assert_eq!(model.preferences.selected_symbol, "COIN599/USDC");
+    assert!(!open);
+    Ok(())
+}

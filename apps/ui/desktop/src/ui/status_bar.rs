@@ -33,12 +33,28 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
     let language = model.preferences.language;
     let snapshot = model.snapshot.as_ref();
     let account = selected_account(snapshot, model.preferences.execution_account_id.as_deref());
-    let current = fresh(snapshot, account, super::now_ms()) && model.snapshot_online;
+    let now = super::now_ms();
+    let account_current = fresh(snapshot, account, now) && model.snapshot_online;
+    let private_projection = model
+        .execution
+        .private_projection
+        .as_ref()
+        .filter(|projection| {
+            model.preferences.execution_account_id.as_deref()
+                == Some(projection.trading_account_id.as_str())
+        });
+    let private_current = private_projection.is_some() && model.execution.private_fresh(now);
     let node_key = if model.preferences.execution_account_id.is_none() {
         TextKey::NoAccountShort
+    } else if private_projection.is_some() {
+        if private_current {
+            TextKey::Healthy
+        } else {
+            TextKey::Stale
+        }
     } else if account.is_none() {
         TextKey::AwaitingNode
-    } else if !current || model.control_connection != Some(ConnectionState::Live) {
+    } else if !account_current || model.control_connection != Some(ConnectionState::Live) {
         TextKey::Stale
     } else if account.is_some_and(|a| a.private_generation == 0 || a.writer_generation == 0) {
         TextKey::Pending
@@ -52,6 +68,18 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
         }
     };
     let mut node_hint = text(language, TextKey::NodeStatusHint).to_owned();
+    if private_projection.is_some() {
+        node_hint = match language {
+            crate::i18n::Language::SimplifiedChinese => {
+                "交易连接依据 Binance Executor 的签名私有账户投影；旧交易节点快照不再覆盖此状态。"
+                    .to_owned()
+            }
+            crate::i18n::Language::English => {
+                "Trading connectivity follows the Binance Executor signed private projection; a legacy node snapshot cannot override it."
+                    .to_owned()
+            }
+        };
+    }
     if let Some(error) = &model.last_error {
         node_hint.push_str(&format!("\n{error}"));
     }
@@ -123,19 +151,52 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
                             theme::TEXT_SECONDARY,
                             text(language, TextKey::WebControlOnly),
                         );
-                        let (key, color) = match model.connection {
-                            ConnectionState::Live => (TextKey::Online, theme::BUY),
-                            ConnectionState::Connecting => (TextKey::Connecting, theme::WARNING),
-                            ConnectionState::Degraded => (TextKey::Degraded, theme::WARNING),
-                            ConnectionState::Offline => (TextKey::Offline, theme::SELL),
+                        let (control_label, color) = match (
+                            model.snapshot_online,
+                            model.event_stream_online,
+                            model.connection,
+                        ) {
+                            (true, true, _) => (
+                                format!("Control {}", text(language, TextKey::Online)),
+                                theme::BUY,
+                            ),
+                            (true, false, _) => (
+                                match language {
+                                    crate::i18n::Language::SimplifiedChinese => {
+                                        "Control 在线 · SSE 重连".to_owned()
+                                    }
+                                    crate::i18n::Language::English => {
+                                        "Control online · SSE reconnecting".to_owned()
+                                    }
+                                },
+                                theme::WARNING,
+                            ),
+                            (false, _, ConnectionState::Connecting) => (
+                                format!("Control {}", text(language, TextKey::Connecting)),
+                                theme::WARNING,
+                            ),
+                            (false, _, ConnectionState::Offline) => (
+                                format!("Control {}", text(language, TextKey::Offline)),
+                                theme::SELL,
+                            ),
+                            _ => (
+                                format!("Control {}", text(language, TextKey::Degraded)),
+                                theme::WARNING,
+                            ),
                         };
-                        status_text(
-                            ui,
-                            width * 0.22,
-                            format!("Control {}", text(language, key)),
-                            color,
-                            super::endpoint_label(&model.preferences.endpoint),
-                        );
+                        let mut control_hint =
+                            super::endpoint_label(&model.preferences.endpoint).to_owned();
+                        if model.snapshot_online && !model.event_stream_online {
+                            control_hint.push_str(match language {
+                                crate::i18n::Language::SimplifiedChinese => {
+                                    "\n快照接口可用；SSE 事件流正在重连。"
+                                }
+                                crate::i18n::Language::English => {
+                                    "\nSnapshot API is available; the SSE stream is reconnecting."
+                                }
+                            });
+                        }
+                        status_text(ui, width * 0.22, control_label, color, &control_hint);
                         status_text(
                             ui,
                             (width * 0.38 - 24.0).max(50.0),
@@ -153,12 +214,12 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
                         );
                     },
                     |ui| {
-                        let color = if current {
+                        let color = if account_current {
                             theme::TEXT_PRIMARY
                         } else {
                             theme::TEXT_SECONDARY
                         };
-                        if account.is_some() && !current {
+                        if account.is_some() && !account_current {
                             status_text(
                                 ui,
                                 52.0,

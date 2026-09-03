@@ -87,23 +87,26 @@ pub(crate) fn show(
                 });
             });
             ui.separator();
+            ui.horizontal(|ui| {
+                ui.strong("★");
+                ui.add_sized(
+                    [118.0, 24.0],
+                    egui::Label::new(text(language, TextKey::Symbol)),
+                );
+                ui.add_sized(
+                    [130.0, 24.0],
+                    egui::Label::new(text(language, TextKey::Last)),
+                );
+                ui.add_sized([100.0, 24.0], egui::Label::new("24h %"));
+                ui.add_sized([170.0, 24.0], egui::Label::new("24h Quote Volume"));
+            });
             egui::ScrollArea::vertical()
-                .max_height(520.0)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.strong("★");
-                        ui.add_sized(
-                            [118.0, 24.0],
-                            egui::Label::new(text(language, TextKey::Symbol)),
-                        );
-                        ui.add_sized(
-                            [130.0, 24.0],
-                            egui::Label::new(text(language, TextKey::Last)),
-                        );
-                        ui.add_sized([100.0, 24.0], egui::Label::new("24h %"));
-                        ui.add_sized([170.0, 24.0], egui::Label::new("24h Quote Volume"));
-                    });
-                    for (index, symbol) in filtered.iter().enumerate() {
+                .id_salt("symbol-picker-markets")
+                .max_height(488.0)
+                .show_rows(ui, 32.0, filtered.len(), |ui, rows| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for index in rows {
+                        let symbol = &filtered[index];
                         let favorite = model.preferences.favorite_symbols.contains(symbol);
                         let is_selected = model.preferences.selected_symbol == *symbol;
                         let row_width = ui.available_width();

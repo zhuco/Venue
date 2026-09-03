@@ -161,8 +161,9 @@ pub fn show_top_bar(
                                                 });
                                             let response = ui
                                                 .horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing.x = 0.0;
                                                     let tab = ui.add_sized(
-                                                        [126.0, 44.0],
+                                                        [124.0, 44.0],
                                                         egui::Button::new(symbol_tab_text(
                                                             &symbol,
                                                             &details,
@@ -175,7 +176,18 @@ pub fn show_top_bar(
                                                         }),
                                                     );
                                                     let close = ui
-                                                        .add(egui::Button::new("×").frame(false))
+                                                        .add_sized(
+                                                            [28.0, 44.0],
+                                                            egui::Button::new(
+                                                                RichText::new("×").size(16.0),
+                                                            )
+                                                            .fill(if selected {
+                                                                theme::PANEL
+                                                            } else {
+                                                                theme::BG_SECONDARY
+                                                            })
+                                                            .frame(true),
+                                                        )
                                                         .on_hover_text(match language {
                                                             Language::SimplifiedChinese => {
                                                                 "关闭交易对"
@@ -297,23 +309,6 @@ pub fn show_top_bar(
                                     Language::English => "Search markets",
                                 }),
                         );
-                        if search_response.has_focus() && symbol_filter == filter_before {
-                            let fallback = ui.input(|input| {
-                                input
-                                    .events
-                                    .iter()
-                                    .filter_map(|event| match event {
-                                        egui::Event::Text(value) | egui::Event::Paste(value) => {
-                                            Some(value.as_str())
-                                        }
-                                        _ => None,
-                                    })
-                                    .collect::<String>()
-                            });
-                            if !fallback.is_empty() {
-                                symbol_filter.push_str(&fallback);
-                            }
-                        }
                         if search_response.has_focus() || symbol_filter != filter_before {
                             picker_requested.set(true);
                         }
