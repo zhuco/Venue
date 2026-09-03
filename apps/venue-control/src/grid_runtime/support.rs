@@ -453,10 +453,6 @@ pub(super) fn desired_valid_for_market(
                     .quantity
                     .checked_mul(order.limit_price)
                     .is_some_and(|notional| notional >= rules.instrument.minimum_notional.value)
-                && match order.key.order_side() {
-                    OrderSide::Buy => order.limit_price < market.ask.value(),
-                    OrderSide::Sell => order.limit_price > market.bid.value(),
-                }
         })
 }
 
