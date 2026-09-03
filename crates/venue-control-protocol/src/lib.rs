@@ -4,6 +4,7 @@
 //! These types are query projections and semantic control requests. They never grant physical
 //! mutation authority; an account node must independently validate every accepted request.
 pub mod accounts;
+pub mod grid;
 pub mod kol;
 mod trade;
 use rust_decimal::Decimal;

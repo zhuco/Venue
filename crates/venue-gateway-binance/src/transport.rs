@@ -68,6 +68,15 @@ pub struct BinanceHttpResponse {
     pub payload: Bytes,
 }
 
+/// Opaque, short-lived mutation dispatch material. Scope validation and signing are completed
+/// before this value is returned; API-key and signature material remain hidden and are zeroized
+/// by their secret containers when the value is dropped.
+pub struct BinancePreparedDispatch {
+    scope: BinancePrivateReadScope,
+    mutation: BinancePreparedMutation,
+    signed: SignedBinanceRestRequest,
+}
+
 pub struct BinanceHttpTransport {
     client: reqwest::Client,
     config: BinanceConfig,
@@ -211,7 +220,9 @@ impl BinanceHttpTransport {
         Ok(())
     }
 
-    pub(crate) fn signing_timestamp_ms(&self) -> Result<u64, BinanceTransportError> {
+    /// Returns the authoritative Binance-adjusted signing timestamp without network I/O. A new
+    /// production transport remains fail-closed until [`Self::synchronize_clock`] succeeds.
+    pub fn signing_timestamp_ms(&self) -> Result<u64, BinanceTransportError> {
         if !self.clock_synchronized.load(Ordering::Acquire) {
             return Err(BinanceTransportError::Clock);
         }
@@ -235,6 +246,22 @@ impl BinanceHttpTransport {
     #[must_use]
     pub const fn private_generation(&self) -> u64 {
         self.private_generation
+    }
+
+    /// Rebinds only the process-local evidence generations while retaining the fixed endpoint,
+    /// HTTP pool and synchronized clock. The caller must hold its account/symbol serialization
+    /// lock and must discard every scope or prepared dispatch from the previous generation.
+    pub fn rebind_generations(
+        &mut self,
+        instrument_generation: u64,
+        private_generation: u64,
+    ) -> Result<(), BinanceTransportError> {
+        if instrument_generation == 0 || private_generation == 0 {
+            return Err(BinanceTransportError::Binding);
+        }
+        self.instrument_generation = instrument_generation;
+        self.private_generation = private_generation;
+        Ok(())
     }
 
     pub(crate) const fn recovery_instrument_generation(&self) -> u64 {
@@ -427,6 +454,103 @@ impl BinanceHttpTransport {
             .map_err(|_| BinanceTransportError::Ack)
     }
 
+    /// Completes all local validation and signing without starting an HTTP request. The returned
+    /// value may be held only briefly before [`Self::dispatch_prepared_once_observed`] so the
+    /// timestamp remains within Binance's receive window.
+    pub fn prepare_dispatch(
+        &self,
+        credentials: &BinanceCredentials,
+        scope: &BinancePrivateReadScope,
+        request: &BinancePreparedMutation,
+        timestamp_ms: u64,
+    ) -> Result<BinancePreparedDispatch, BinanceTransportError> {
+        self.validate_scope(scope)?;
+        request
+            .validate(scope)
+            .map_err(|_| BinanceTransportError::Binding)?;
+        if timestamp_ms == 0 || !self.clock_synchronized.load(Ordering::Acquire) {
+            return Err(BinanceTransportError::Clock);
+        }
+        let parameter_refs = request
+            .parameters()
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        let signed = sign_rest(
+            credentials,
+            &self.config,
+            &BinanceRestSignInput {
+                binding: scope.binding(),
+                method: request.method(),
+                path: request.path(),
+                parameters: &parameter_refs,
+                recv_window_ms: 5_000,
+                timestamp_ms,
+            },
+        )
+        .map_err(|_| BinanceTransportError::Signing)?;
+        Ok(BinancePreparedDispatch {
+            scope: scope.clone(),
+            mutation: request.clone(),
+            signed,
+        })
+    }
+
+    /// Invokes the observer exactly once at the transport send-entry boundary. The callback
+    /// receives no request or credential material and runs immediately before the reqwest send
+    /// future is first polled. It is not proof of an exchange acknowledgement; timeout and
+    /// disconnect remain UNKNOWN and must still be reconciled.
+    pub async fn dispatch_prepared_once_observed<F>(
+        &self,
+        prepared: BinancePreparedDispatch,
+        on_send_entry: F,
+    ) -> Result<BinanceMutationAck, BinanceTransportError>
+    where
+        F: FnOnce() + Send,
+    {
+        self.validate_scope(&prepared.scope)?;
+        prepared
+            .mutation
+            .validate(&prepared.scope)
+            .map_err(|_| BinanceTransportError::Binding)?;
+        let response = match self
+            .send_signed_observed(prepared.signed, true, on_send_entry)
+            .await
+        {
+            Ok(response) => response,
+            Err(BinanceTransportError::TimestampRejected) => {
+                self.synchronize_clock().await?;
+                return Err(BinanceTransportError::TimestampRejected);
+            }
+            Err(error) => return Err(error),
+        };
+        parse_mutation_ack(
+            &prepared.mutation,
+            &prepared.scope,
+            &response.payload,
+            response.received_at_ms,
+        )
+        .map_err(|_| BinanceTransportError::Ack)
+    }
+
+    /// Performs the same single mutation dispatch as [`Self::dispatch_once`] and invokes the
+    /// observer at its send-entry boundary after local validation and signing.
+    pub async fn dispatch_once_observed<F>(
+        &self,
+        credentials: &BinanceCredentials,
+        scope: &BinancePrivateReadScope,
+        request: &BinancePreparedMutation,
+        timestamp_ms: u64,
+        on_send_entry: F,
+    ) -> Result<BinanceMutationAck, BinanceTransportError>
+    where
+        F: FnOnce() + Send,
+    {
+        let prepared = self.prepare_dispatch(credentials, scope, request, timestamp_ms)?;
+        self.dispatch_prepared_once_observed(prepared, on_send_entry)
+            .await
+    }
+
     /// Dispatches once and then performs a bounded set of separately signed exact lookups.
     /// Readback retries never cause a second mutation dispatch.
     pub async fn dispatch_then_exact_readback(
@@ -597,13 +721,55 @@ impl BinanceHttpTransport {
         self.send_bounded(builder, unix_ms()?, mutation).await
     }
 
+    async fn send_signed_observed<F>(
+        &self,
+        signed: SignedBinanceRestRequest,
+        mutation: bool,
+        on_send_entry: F,
+    ) -> Result<BinanceHttpResponse, BinanceTransportError>
+    where
+        F: FnOnce() + Send,
+    {
+        if signed.origin() != self.config.portfolio_rest_origin()
+            || !signed.authentication_material_is_present()
+        {
+            return Err(BinanceTransportError::Binding);
+        }
+        let url = format!("{}{}?{}", self.endpoint, signed.path(), signed.query());
+        let builder = match signed.method() {
+            BinanceHttpMethod::Get => self.client.get(url),
+            BinanceHttpMethod::Post => self.client.post(url),
+            BinanceHttpMethod::Delete => self.client.delete(url),
+            BinanceHttpMethod::Put => self.client.put(url),
+        }
+        .header("X-MBX-APIKEY", signed.api_key());
+        self.send_bounded_observed(builder, unix_ms()?, mutation, on_send_entry)
+            .await
+    }
+
     async fn send_bounded(
         &self,
         builder: reqwest::RequestBuilder,
         requested_at_ms: u64,
         mutation: bool,
     ) -> Result<BinanceHttpResponse, BinanceTransportError> {
-        let response = timeout(self.limits.operation_timeout, builder.send())
+        self.send_bounded_observed(builder, requested_at_ms, mutation, || {})
+            .await
+    }
+
+    async fn send_bounded_observed<F>(
+        &self,
+        builder: reqwest::RequestBuilder,
+        requested_at_ms: u64,
+        mutation: bool,
+        on_send_entry: F,
+    ) -> Result<BinanceHttpResponse, BinanceTransportError>
+    where
+        F: FnOnce() + Send,
+    {
+        let send = builder.send();
+        on_send_entry();
+        let response = timeout(self.limits.operation_timeout, send)
             .await
             .map_err(|_| BinanceTransportError::Timeout)?
             .map_err(map_reqwest)?;
@@ -921,6 +1087,26 @@ mod tests {
     }
 
     #[test]
+    fn serialized_generation_rebind_invalidates_every_prior_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (config, _, old_scope) = facts("00000000-0000-4000-8000-000000000001")?;
+        let limits = BinanceTransportLimits::new(Duration::from_secs(1), 1_024)?;
+        let mut transport = BinanceHttpTransport::new(config.clone(), 7, 17, limits)?;
+        assert!(transport.signing_timestamp_ms().is_ok());
+        transport.rebind_generations(8, 18)?;
+        assert_eq!(
+            transport.validate_scope(&old_scope),
+            Err(BinanceTransportError::Binding)
+        );
+        let rules =
+            parse_instrument_rules(EXCHANGE_INFO, config.gateway_binding().symbol.clone(), 8)?;
+        let new_scope = BinancePrivateReadScope::new(&config, &rules, 18, 12, 901)?;
+        assert!(transport.validate_scope(&new_scope).is_ok());
+        assert!(transport.signing_timestamp_ms().is_ok());
+        Ok(())
+    }
+
+    #[test]
     fn asset_index_request_uses_documented_fixed_public_pair()
     -> Result<(), Box<dyn std::error::Error>> {
         let (config, _, _) = facts("00000000-0000-4000-8000-000000000001")?;
@@ -998,6 +1184,56 @@ mod tests {
         };
         assert!(error.is_unknown_dispatch());
         assert_eq!(count.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_entry_observer_fires_once_only_after_presend_validation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let credentials = BinanceCredentials::from_values("key", "secret")?;
+        let (config, _, scope) = facts("00000000-0000-4000-8000-000000000001")?;
+        let (endpoint, requests) = fake_http(vec![Behavior::Body(ACK)]).await?;
+        let transport = BinanceHttpTransport::with_endpoint(
+            config,
+            7,
+            17,
+            endpoint,
+            BinanceTransportLimits::new(Duration::from_secs(1), 4096)?,
+        )?;
+        let request =
+            prepared_for_transport_test(&scope, BinanceMutationKind::PlaceLimit, "venue_place_1");
+        let send_entries = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&send_entries);
+
+        let prepared = transport.prepare_dispatch(&credentials, &scope, &request, unix_ms()?)?;
+        assert_eq!(send_entries.load(Ordering::SeqCst), 0);
+        transport
+            .dispatch_prepared_once_observed(prepared, move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+            })
+            .await?;
+        assert_eq!(send_entries.load(Ordering::SeqCst), 1);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        let (_, _, wrong_scope) = facts("00000000-0000-4000-8000-000000000002")?;
+        let rejected_entries = Arc::new(AtomicUsize::new(0));
+        let rejected = Arc::clone(&rejected_entries);
+        assert_eq!(
+            transport
+                .dispatch_once_observed(
+                    &credentials,
+                    &wrong_scope,
+                    &request,
+                    unix_ms()?,
+                    move || {
+                        rejected.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
+                .await,
+            Err(BinanceTransportError::Binding)
+        );
+        assert_eq!(rejected_entries.load(Ordering::SeqCst), 0);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
         Ok(())
     }
 

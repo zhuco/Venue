@@ -260,7 +260,7 @@ fn private_stream_fill_keeps_socket_generation_and_admits_against_current_snapsh
             private_generation: 9,
             received_at_ms: 1_720_000_000_100,
             payload: Bytes::from_static(
-                br#"{"e":"ORDER_TRADE_UPDATE","E":1000,"o":{"s":"BTCUSDT","c":"grid-e1-long-open-l1","x":"TRADE","S":"BUY","ps":"LONG","t":7,"i":11,"l":"0.002","L":"50000","m":true}}"#,
+                br#"{"e":"ORDER_TRADE_UPDATE","E":1000,"o":{"s":"BTCUSDT","c":"grid-e1-long-open-l1","x":"TRADE","X":"FILLED","S":"BUY","ps":"LONG","t":7,"i":11,"q":"0.002","l":"0.002","z":"0.002","L":"50000","m":true}}"#,
             ),
         };
     let event = normalize_private_stream_event(
@@ -277,6 +277,11 @@ fn private_stream_fill_keeps_socket_generation_and_admits_against_current_snapsh
     assert_eq!(event.stream_private_generation, 9);
     assert_eq!(event.private_generation, 10);
     assert_eq!(event.fill.order_id, "11");
+    assert_eq!(event.native_order_id(), "11");
+    assert_eq!(
+        event.complete_order_progress(),
+        Some((Decimal::new(2, 3), Decimal::new(2, 3), OrderState::Filled))
+    );
     assert!(
         matches!(event.client_order_id, FieldState::Known(ref id) if id == "grid-e1-long-open-l1")
     );
@@ -309,7 +314,7 @@ fn private_stream_admits_each_enabled_kol_symbol_without_retaining_the_frame()
             private_generation: 9,
             received_at_ms: 1_720_000_000_100,
             payload: Bytes::from_static(
-                br#"{"e":"ORDER_TRADE_UPDATE","E":1000,"o":{"s":"ETHUSDT","c":"kol-eth-1","x":"TRADE","S":"SELL","ps":"SHORT","t":8,"i":12,"l":"0.02","L":"3000","m":false}}"#,
+                br#"{"e":"ORDER_TRADE_UPDATE","E":1000,"o":{"s":"ETHUSDT","c":"kol-eth-1","x":"TRADE","X":"PARTIALLY_FILLED","S":"SELL","ps":"SHORT","t":8,"i":12,"q":"0.05","l":"0.02","z":"0.02","L":"3000","m":false}}"#,
             ),
         },
         &binding,

@@ -4,8 +4,8 @@
 
 本文同时说明“仓库已经有什么”和“下一步要变成什么”。已提交代码、离线测试和真实业务可用是三个不同结论；目标架构尚未实现的部分不得描述为已上线。
 
-当前唯一产品契约见 [`KOL_COPY_MVP.md`](KOL_COPY_MVP.md)，代码入口见 [`CODEMAP.md`](CODEMAP.md)，开发与构建见
-[`DEVELOPMENT.md`](DEVELOPMENT.md)。冻结 Grid/旧 Node 的保护边界见 [`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md)。
+KOL 产品契约见 [`KOL_COPY_MVP.md`](KOL_COPY_MVP.md)，Binance Grid 重建契约见
+[`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md)，代码入口见 [`CODEMAP.md`](CODEMAP.md)，开发与构建见 [`DEVELOPMENT.md`](DEVELOPMENT.md)。
 
 ## 1. 当前产品范围
 
@@ -15,7 +15,7 @@
 - 用户可登录、绑定/验证自己的 Binance API Key、设置并暂停跟单。
 - KOL 可使用基础交易终端操作自己的主账户，并编辑自己的公开页面标题和说明。
 - Copy 只由 KOL 的 Binance 认证账户流真实成交增量触发，并以签名 REST 补查恢复，目标是尽快开始跟随下单。
-- Grid、Scalping、Gate.io、Bitget、Bybit、OKX、Hyperliquid、收费、公开市场和高可用均不在当前范围。
+- Binance Grid 正迁入统一 Executor；Scalping、Gate.io、Bitget、Bybit、OKX、Hyperliquid、收费、公开市场和高可用均不在当前范围。
 
 ## 2. 目标进程拓扑
 
@@ -38,8 +38,8 @@ VenueFlow Desktop（用户作用域终端投影与命令） -------------> venue
 | Venue Web/BFF | KOL落地页、邀请注册、登录、API绑定、跟单设置和KOL文案编辑 | 不接收或返回解密后的API Secret，不直连Binance |
 | VenueFlow Desktop | Binance风格行情、可增删交易对、私有账户多标签、Post Only四动作和市价平仓 | 不持有API Secret，不直连私流，不自行判定成交 |
 | venue-control | 认证、授权、KOL/邀请/关系、凭证加密与只读验证、查询投影 | 不直接发送交易所mutation |
-| PostgreSQL | 业务事实和唯一耐久命令账本 | 不保存明文凭证或原始私流payload |
-| venue-executor-binance | KOL私流、成交归一化、快速fan-out、账户顺序队列、规则/数量校验、下单与签名查单 | 不运行Grid/Scalping，不建立Actor/checkpoint/local WAL |
+| PostgreSQL | 业务事实、唯一耐久命令账本和 Grid 批内派发顺序 | 不保存明文凭证或原始私流payload |
+| venue-executor-binance | KOL私流、成交归一化、快速fan-out、事实驱动Grid、账户顺序队列、规则/数量校验、下单与签名查单 | 不运行Scalping，不建立Actor/checkpoint/local WAL |
 | Binance adapter | 签名、原生symbol/数量/持仓模式、订单与成交协议转换 | 不包含用户、KOL、邀请或页面逻辑 |
 
 Control、Web 和 Executor 复用现有 Tokio、reqwest、tokio-tungstenite、serde、rust_decimal、SQLx、secrecy、zeroize 和 ring；不为本轮引入第二套 ORM、数据库或消息队列。
@@ -80,11 +80,17 @@ KOL Binance TRADE 成交
 
 - 目标部署中的单个 Binance Executor 是新链唯一交易出口；同一账户命令在进程内严格顺序执行。
 - 命令发送前写 PostgreSQL；稳定 `clientOrderId` 有唯一约束。
+- Grid 热路径目标是从认证成交到去重/单次规划，再以一个事务提交成交分配、anchor/desired surface、订单归属和完整命令批次，提交成功后立即唤醒账户队列。预热态“事件收到→事务提交并唤醒”p95 不超过 10 ms；交易所发送和 ACK 不计入该指标。
+- Grid 批次使用 `grid_batch_id` 与 1 起始的 `dispatch_sequence` 持久排序，单批最多 16 个 mutation；计划变化但无需 mutation 时仍提交 0 命令收据。非空批次先并发启动全部 Place；只有全部 Place 越过本地 transport send-entry 后才启动 Cancel，不等待 HTTP ACK。任一 Place 未进入发送即失败时，本批 Cancel 不发送；发送后的不确定结果只按原 ID 对账，绝不重发。
+- 连续认证私流可在新鲜签名基线、连续序列和新鲜 BBO 门内推进成交增量，不为每笔成交同步等待完整签名 REST；任一门失效立即停止 mutation，并以签名 REST 异步补漏/恢复。
 - 状态只保留 `Pending / Sending / Accepted / Rejected / ReconcileRequired / Reconciled`，以及仅发送前可用的 `Cancelled`。
-- `ReconcileRequired` 表示请求可能已被交易所接收；确认前不重发，并暂停该账户后续增险。
+- Post Only 放单在精确签名回读证明不可变订单语义及原生身份后完成命令并释放账户队列；活动订单的后续成交/撤销由私有投影承接。市价命令仍须成交与同代签名仓位收敛。
+- `Accepted / ReconcileRequired` 的精确签名回读使用 PostgreSQL 持久化的 500 ms 起、8 s 封顶指数退避；未到期仍封锁该账户但不发起网络读取。`ReconcileRequired` 表示请求可能已被交易所接收；确认前不重发，并暂停该账户后续增险。
 - 一个账户认证、限频、余额或查单失败只暂停该账户，不退出整个 Executor。
 - 全局并发和每账户队列必须有界；429 按 Binance 响应退避，不能通过无限任务或线程提高速度。
 - 当前不做多 Executor 选举、分布式 fencing、每账户进程锁、writer lease、JSONL WAL、Actor receipt 或恢复 manifest。
+
+迁移 `0023_binance_grid_hot_batch.sql` 提供最小批次收据、Grid 必填批次 ID、1–16 顺序约束、历史 Grid 单命令 legacy 批次回填及索引；`0024_binance_grid_batch_chain.sql` 再绑定输入 desired 摘要、唯一前驱和实例批次尾，使跨微批成交能连续规划而不能越过前批签名确认出网。Copy/终端批次字段保持 `NULL/NULL`。认证私流成交的 socket 代、签名 baseline 代和订单进度上下文只能全空或全有效。当前代码已接通原子 Store、提交唤醒、严格领取、一次性热令牌和事件至 send-entry 计时；未完成 PostgreSQL 实库压力、真实 Binance Canary 与预热 p95 验收前，不得描述为已经上线或已满足 10 ms。
 
 ## 7. 凭证与权限
 
@@ -110,7 +116,7 @@ KOL Binance TRADE 成交
 - `apps/venue-node` 的每账户 resident、AccountRuntimeHost、Execution Lane 和 Actor 组合；
 - 旧 Copy delivery/Actor Applied/ledger recovery 链；
 - 本地 JSONL WAL、facts/checkpoint、writer lease、canonical root 与 handoff；
-- Grid/Scalping 和 Gate.io、Bitget、Bybit、OKX、Hyperliquid 接管路径。
+- 旧 Grid/Scalping 和 Gate.io、Bitget、Bybit、OKX、Hyperliquid 接管路径。
 
 冻结代码可继续编译或接受必要维护，但不得为了“复用”把其复杂恢复契约带入 MVP。新旧链按 `trading_account_id` 严格互斥；旧工件不得自动删除。
 
@@ -123,7 +129,7 @@ KOL Binance TRADE 成交
 
 ## 10. 当前完成度
 
-仓库已有邀请/KOL/跟单入口、唯一生产 `venue-executor-binance`、账户级私流+签名 REST 投影、Post Only/市价平仓命令账本和 VenueFlow 桌面消费链。Executor 取得 PostgreSQL advisory singleton 后执行 activation、未终态同 ID 回读和有界私流；投影先持久化再按用户返回。旧 Binance LIVE scope 同时在 Control 入账与 Executor 抢占处拒绝，旧状态不会按时间自动释放。精确撤单、真实凭证 Canary 和 2核4G容量门仍未完成。
+仓库已有邀请/KOL/跟单/Grid 入口、唯一生产 `venue-executor-binance`、账户级私流+签名 REST 投影、Post Only/市价平仓/精确撤单命令账本和 VenueFlow 桌面消费链。Executor 取得 PostgreSQL advisory singleton 后执行 activation、未终态同 ID 回读和有界私流；投影先持久化再按用户返回。旧 Binance LIVE scope 同时在 Control 入账与 Executor 抢占处拒绝，旧状态不会按时间自动释放。真实凭证 Canary 和 2核4G容量门仍未完成。
 
 完成标准只以 [`KOL_COPY_MVP.md`](KOL_COPY_MVP.md) 为准。真实凭证联调、2 核 4 GiB 压测和隔离账户 Canary 仍是外部验收；文档更新本身不启动服务、不迁移账户，也不表示实盘已可用。
 

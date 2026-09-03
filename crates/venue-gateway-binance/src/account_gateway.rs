@@ -322,6 +322,32 @@ impl BinanceAccountGateway {
     pub fn poll_private_fill(
         &mut self,
     ) -> Result<Option<BinancePrivateAccountEvent>, BinanceAccountGatewayError> {
+        self.poll_private_fill_timed()
+            .map(|event| event.map(|(_, event)| event))
+    }
+
+    /// Returns the local monotonic receive boundary with the normalized event. This timestamp is
+    /// process-local and exists only so a caller can cap a micro-burst from its first frame.
+    pub fn poll_private_fill_timed(
+        &mut self,
+    ) -> Result<Option<(Instant, BinancePrivateAccountEvent)>, BinanceAccountGatewayError> {
+        self.poll_private_fill_timed_with_budget(Duration::from_millis(1))
+    }
+
+    /// Uses only the caller's remaining readiness budget. This is intended for draining the
+    /// already-established stream after a first fill, so several frames share one total window.
+    pub fn poll_private_fill_with_budget(
+        &mut self,
+        remaining: Duration,
+    ) -> Result<Option<BinancePrivateAccountEvent>, BinanceAccountGatewayError> {
+        self.poll_private_fill_timed_with_budget(remaining)
+            .map(|event| event.map(|(_, event)| event))
+    }
+
+    fn poll_private_fill_timed_with_budget(
+        &mut self,
+        remaining: Duration,
+    ) -> Result<Option<(Instant, BinancePrivateAccountEvent)>, BinanceAccountGatewayError> {
         if !self.ensure_private_stream()? {
             return Ok(None);
         }
@@ -346,9 +372,12 @@ impl BinanceAccountGateway {
                 Some(Instant::now() + PRIVATE_STREAM_KEEPALIVE_INTERVAL);
         }
         let result = match self.private_stream.as_mut() {
-            Some(stream) => self.runtime.block_on(stream.poll_raw_frame()),
+            Some(stream) => self
+                .runtime
+                .block_on(stream.poll_raw_frame_with_budget(remaining)),
             None => return Err(BinanceAccountGatewayError::PrivateStream),
         };
+        let received_at = Instant::now();
         let stream_private_generation = self
             .private_stream
             .as_ref()
@@ -365,7 +394,7 @@ impl BinanceAccountGateway {
             ) {
                 Ok(event) => {
                     self.private_stream_reconnect.record_valid_frame();
-                    Ok(event)
+                    Ok(event.map(|event| (received_at, event)))
                 }
                 Err(error) => {
                     if self.record_private_stream_failure() {
@@ -405,6 +434,9 @@ impl BinanceAccountGateway {
                     private_generation: self.private_generation,
                     received_at_ms,
                     client_order_id: FieldState::Missing,
+                    original_quantity: FieldState::Missing,
+                    cumulative_filled_quantity: FieldState::Missing,
+                    order_state: FieldState::Missing,
                     fill,
                 })
             })
@@ -1130,7 +1162,7 @@ fn normalize_public_stream_event(
     normalized.map_err(|_| BinanceAccountGatewayError::PublicStream)
 }
 
-fn parse_grid_bootstrap_bbo(
+pub(crate) fn parse_grid_bootstrap_bbo(
     payload: &[u8],
     binding: &GatewayBinding,
     rules: &BinanceInstrumentRules,

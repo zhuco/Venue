@@ -207,14 +207,27 @@ impl VenueFlowApp {
                 ClientEvent::ExecutionFactsUnavailable(message) => {
                     self.model.execution.error = Some(message)
                 }
-                ClientEvent::TerminalAccountProjection(projection) => {
-                    self.model.execution.apply_private(projection)
-                }
+                ClientEvent::TerminalAccountProjection(projection) => self
+                    .model
+                    .execution
+                    .apply_private(projection, &mut self.model.trade_dock),
                 ClientEvent::TerminalExecutions(executions) => {
                     self.model.execution.apply_terminal_executions(executions)
                 }
                 ClientEvent::TerminalAccountUnavailable(message) => {
                     self.model.execution.private_error = Some(message)
+                }
+                ClientEvent::GridInstances(instances) => {
+                    self.model.execution.grid.apply_instances(instances)
+                }
+                ClientEvent::GridMutationApplied(summary) => {
+                    self.model.execution.grid.apply_summary(*summary)
+                }
+                ClientEvent::GridUnavailable(message) => {
+                    self.model.execution.grid.list_unavailable(message)
+                }
+                ClientEvent::GridMutationUnavailable(message) => {
+                    self.model.execution.grid.mutation_unavailable(message)
                 }
                 ClientEvent::SessionExpired => {
                     // An unauthenticated bootstrap response must not invalidate

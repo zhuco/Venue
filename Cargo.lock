@@ -4745,6 +4745,8 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "base64",
+ "futures-util",
+ "parking_lot",
  "reqwest",
  "ring",
  "rust_decimal",
@@ -4755,12 +4757,14 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.19",
  "tokio",
+ "tracing",
  "venue-control-protocol",
  "venue-copy",
  "venue-domain",
  "venue-execution",
  "venue-gateway-binance",
  "venue-indicators",
+ "venue-strategies",
  "zeroize",
 ]
 

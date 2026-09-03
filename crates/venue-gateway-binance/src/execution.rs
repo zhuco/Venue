@@ -65,6 +65,95 @@ pub struct BinanceReduceOnceIntent {
     pub private_generation: u64,
 }
 
+/// Same-generation, Hedge-Mode-only preparation boundary for a Grid batch which has already
+/// passed the host's signed-projection CAS. It carries no dispatch capability or credentials:
+/// the singleton executor must still claim durable commands and sign each mutation exactly once.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceGridDispatchFence {
+    scope: BinancePrivateReadScope,
+    rules: BinanceInstrumentRules,
+}
+
+impl BinanceGridDispatchFence {
+    pub fn new(
+        config: &crate::BinanceConfig,
+        rules: BinanceInstrumentRules,
+        private_generation: u64,
+        attempt_id: u64,
+        requested_at_ms: u64,
+    ) -> Result<Self, BinanceExecutionError> {
+        if config.account_binding() != crate::BinanceAccountBinding::PortfolioMarginUm {
+            return Err(BinanceExecutionError::Binding);
+        }
+        let scope = BinancePrivateReadScope::new(
+            config,
+            &rules,
+            private_generation,
+            attempt_id,
+            requested_at_ms,
+        )
+        .map_err(|_| BinanceExecutionError::Binding)?;
+        Ok(Self { scope, rules })
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> &BinancePrivateReadScope {
+        &self.scope
+    }
+
+    #[must_use]
+    pub const fn rules(&self) -> &BinanceInstrumentRules {
+        &self.rules
+    }
+
+    /// Prepares only Binance GTX orders with an explicit LONG/SHORT direction. The committed
+    /// Grid plan is responsible for balance, inventory and reservation authority.
+    pub fn prepare_place_limit(
+        &self,
+        intent: &BinancePlaceIntent,
+    ) -> Result<BinancePreparedMutation, BinanceExecutionError> {
+        validate_grid_common(
+            &self.rules,
+            &self.scope,
+            &intent.client_order_id,
+            intent.quantity,
+        )?;
+        validate_price_and_notional(&self.rules, intent.quantity, intent.limit_price)?;
+        if intent.time_in_force != BinanceTimeInForce::PostOnly {
+            return Err(BinanceExecutionError::Intent);
+        }
+        validate_place_direction(BinancePositionMode::Hedge, intent)?;
+        prepared_for_scope(
+            &self.rules,
+            &self.scope,
+            BinanceMutationKind::PlaceLimit,
+            place_limit_parameters(&self.rules, intent, BinancePositionMode::Hedge),
+            intent.client_order_id.clone(),
+        )
+    }
+
+    /// Prepares one exact client-order-id cancellation under the same Grid plan fence.
+    pub fn prepare_cancel(
+        &self,
+        intent: &BinanceCancelIntent,
+    ) -> Result<BinancePreparedMutation, BinanceExecutionError> {
+        validate_grid_binding(&self.rules, &self.scope, &intent.client_order_id)?;
+        prepared_for_scope(
+            &self.rules,
+            &self.scope,
+            BinanceMutationKind::Cancel,
+            vec![
+                ("symbol".to_owned(), self.rules.native_symbol.clone()),
+                (
+                    "origClientOrderId".to_owned(),
+                    intent.client_order_id.clone(),
+                ),
+            ],
+            intent.client_order_id.clone(),
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BinanceMutationKind {
     PlaceLimit,
@@ -161,29 +250,7 @@ pub fn prepare_place_limit(
     validate_common(rules, readback, &intent.client_order_id, intent.quantity)?;
     validate_price_and_notional(rules, intent.quantity, intent.limit_price)?;
     validate_place_direction(readback.position_mode, intent)?;
-    let mut parameters = vec![
-        ("symbol".to_owned(), rules.native_symbol.clone()),
-        ("side".to_owned(), side_wire(intent.side).to_owned()),
-        ("type".to_owned(), "LIMIT".to_owned()),
-        (
-            "timeInForce".to_owned(),
-            intent.time_in_force.wire().to_owned(),
-        ),
-        ("quantity".to_owned(), decimal_wire(intent.quantity)),
-        ("price".to_owned(), decimal_wire(intent.limit_price.value())),
-        (
-            "positionSide".to_owned(),
-            position_side_wire(intent.position_side).to_owned(),
-        ),
-        ("newOrderRespType".to_owned(), "RESULT".to_owned()),
-        (
-            "newClientOrderId".to_owned(),
-            intent.client_order_id.clone(),
-        ),
-    ];
-    if readback.position_mode == BinancePositionMode::Net {
-        parameters.push(("reduceOnly".to_owned(), intent.reduce_only.to_string()));
-    }
+    let parameters = place_limit_parameters(rules, intent, readback.position_mode);
     prepared(
         rules,
         readback,
@@ -391,16 +458,90 @@ fn prepared(
     parameters: Vec<(String, String)>,
     client_order_id: String,
 ) -> Result<BinancePreparedMutation, BinanceExecutionError> {
+    prepared_for_scope(rules, readback.scope(), kind, parameters, client_order_id)
+}
+
+fn prepared_for_scope(
+    rules: &BinanceInstrumentRules,
+    scope: &BinancePrivateReadScope,
+    kind: BinanceMutationKind,
+    parameters: Vec<(String, String)>,
+    client_order_id: String,
+) -> Result<BinancePreparedMutation, BinanceExecutionError> {
     let request = BinancePreparedMutation {
-        binding: readback.scope().binding().clone(),
+        binding: scope.binding().clone(),
         instrument_generation: rules.instrument.generation,
-        private_generation: readback.scope().private_generation(),
+        private_generation: scope.private_generation(),
         kind,
         parameters,
         client_order_id,
     };
-    request.validate(readback.scope())?;
+    request.validate(scope)?;
     Ok(request)
+}
+
+fn place_limit_parameters(
+    rules: &BinanceInstrumentRules,
+    intent: &BinancePlaceIntent,
+    position_mode: BinancePositionMode,
+) -> Vec<(String, String)> {
+    let mut parameters = vec![
+        ("symbol".to_owned(), rules.native_symbol.clone()),
+        ("side".to_owned(), side_wire(intent.side).to_owned()),
+        ("type".to_owned(), "LIMIT".to_owned()),
+        (
+            "timeInForce".to_owned(),
+            intent.time_in_force.wire().to_owned(),
+        ),
+        ("quantity".to_owned(), decimal_wire(intent.quantity)),
+        ("price".to_owned(), decimal_wire(intent.limit_price.value())),
+        (
+            "positionSide".to_owned(),
+            position_side_wire(intent.position_side).to_owned(),
+        ),
+        ("newOrderRespType".to_owned(), "RESULT".to_owned()),
+        (
+            "newClientOrderId".to_owned(),
+            intent.client_order_id.clone(),
+        ),
+    ];
+    if position_mode == BinancePositionMode::Net {
+        parameters.push(("reduceOnly".to_owned(), intent.reduce_only.to_string()));
+    }
+    parameters
+}
+
+fn validate_grid_binding(
+    rules: &BinanceInstrumentRules,
+    scope: &BinancePrivateReadScope,
+    client_order_id: &str,
+) -> Result<(), BinanceExecutionError> {
+    validate_client_order_id(client_order_id).map_err(|_| BinanceExecutionError::Intent)?;
+    if rules.instrument.generation == 0
+        || rules.instrument.generation != scope.instrument_generation()
+        || rules.instrument.symbol != scope.binding().symbol
+        || rules.native_symbol != native_symbol(&rules.instrument.symbol)
+    {
+        return Err(BinanceExecutionError::Binding);
+    }
+    Ok(())
+}
+
+fn validate_grid_common(
+    rules: &BinanceInstrumentRules,
+    scope: &BinancePrivateReadScope,
+    client_order_id: &str,
+    quantity: Decimal,
+) -> Result<(), BinanceExecutionError> {
+    validate_grid_binding(rules, scope, client_order_id)?;
+    if quantity < rules.minimum_quantity
+        || quantity > rules.maximum_quantity
+        || quantity <= Decimal::ZERO
+        || quantity % rules.instrument.quantity_step != Decimal::ZERO
+    {
+        return Err(BinanceExecutionError::Rules);
+    }
+    Ok(())
 }
 
 fn validate_common(
@@ -839,6 +980,19 @@ mod tests {
         })
     }
 
+    fn grid_fence() -> Result<BinanceGridDispatchFence, Box<dyn std::error::Error>> {
+        let binding = GatewayBinding::new(
+            VenueId::Binance,
+            GatewayMode::Live,
+            "00000000-0000-4000-8000-000000000001",
+            "BTC/USDT".parse()?,
+        )?;
+        let config =
+            BinanceConfig::for_binding(BinanceAccountBinding::PortfolioMarginUm, &binding)?;
+        let rules = parse_instrument_rules(EXCHANGE_INFO, binding.symbol.clone(), 7)?;
+        Ok(BinanceGridDispatchFence::new(&config, rules, 17, 12, 901)?)
+    }
+
     fn gtc_command() -> Result<ExecutionCommand, Box<dyn std::error::Error>> {
         Ok(ExecutionCommand::PlaceLimit(OrderCommand {
             command_id: CommandId::new("gtc-command")?,
@@ -924,6 +1078,46 @@ mod tests {
                 },
             ),
             Err(BinanceExecutionError::Position)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn committed_grid_fence_prepares_only_exact_hedge_post_only_mutations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = grid_fence()?;
+        let place = fence.prepare_place_limit(&place_intent()?)?;
+        assert_eq!(place.kind(), BinanceMutationKind::PlaceLimit);
+        assert_eq!(place.private_generation(), 17);
+        assert_eq!(place.instrument_generation(), 7);
+        assert!(
+            place
+                .parameters()
+                .contains(&("timeInForce".to_owned(), "GTX".to_owned()))
+        );
+        assert!(
+            place
+                .parameters()
+                .iter()
+                .all(|(key, _)| key != "reduceOnly")
+        );
+
+        let cancel = fence.prepare_cancel(&BinanceCancelIntent {
+            client_order_id: "venue_regular_1".to_owned(),
+        })?;
+        assert_eq!(cancel.kind(), BinanceMutationKind::Cancel);
+
+        let mut gtc = place_intent()?;
+        gtc.time_in_force = BinanceTimeInForce::GoodTillCancelled;
+        assert_eq!(
+            fence.prepare_place_limit(&gtc),
+            Err(BinanceExecutionError::Intent)
+        );
+        let mut wrong_direction = place_intent()?;
+        wrong_direction.side = OrderSide::Sell;
+        assert_eq!(
+            fence.prepare_place_limit(&wrong_direction),
+            Err(BinanceExecutionError::Intent)
         );
         Ok(())
     }

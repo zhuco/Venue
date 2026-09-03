@@ -1,5 +1,6 @@
 mod exposure_guard;
 mod model;
+mod planner;
 mod reducer;
 
 pub use exposure_guard::{
@@ -13,5 +14,13 @@ pub use model::{
     HEDGED_GRID_SCHEMA_VERSION, HedgedGridBinding, HedgedGridError, HedgedGridParams,
     InventoryDeficiency, InventoryRecoveryState, MAX_GRID_COUNT, MIN_GRID_COUNT, OwnedGridFill,
     OwnedGridFillRecord, PassiveBookFallbackAnchor,
+};
+pub use planner::{
+    GRID_PLANNER_SCHEMA_VERSION, GridBestBook, GridBlockedReason, GridCloseReservations,
+    GridConvergenceFacts, GridExposureReduction, GridInstrumentLimits, GridInventoryAdjustment,
+    GridMakerFill, GridPlan, GridPlanDirective, GridPlanner, GridPlannerConfig, GridPlannerControl,
+    GridPlannerError, GridPlannerInput, GridProfitReductionPolicy, GridReplenishmentPolicy,
+    GridResetPolicy, GridResetTrigger, GridRiskConversion, GridRiskFacts, GridRollingAnchor,
+    GridSemanticOrderKey,
 };
 pub use reducer::{HedgedGridState, desired_orders};

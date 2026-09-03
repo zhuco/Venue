@@ -2,8 +2,7 @@
 
 当前版本：**v0.1.0-alpha.2 · 开发预览**（[版本定义](VERSION) / [更新说明](docs/CHANGELOG.md)）。
 
-仓库包含既有多交易所交易内核、用户 Web 和内部桌面客户端。当前唯一产品目标已收敛为 Binance KOL 跟单 MVP：
-新用户从 KOL 邀请链接注册、登录、绑定并验证 Binance API Key，KOL 使用交易终端开单，跟随账户尽快复制其认证账户流中的真实成交；初期全站不超过 5 个启用 KOL、200 个启用跟单账户。Grid 与 Gate.io、Bitget 及其余交易所迁移暂停。本版本仍是开发预览，不是可无人值守上线的稳定版。
+仓库包含既有多交易所交易内核、用户 Web 和内部桌面客户端。当前产品目标是 Binance KOL 跟单 MVP 与事实驱动 Binance 对冲网格共用单例 Executor；旧 Node/Actor/WAL 网格接管路线停止。Gate.io、Bitget 及其余交易所迁移仍暂停。本版本仍是开发预览，不是可无人值守上线的稳定版。
 
 ## 当前功能
 
@@ -11,7 +10,7 @@
 |---|---|---|
 | Binance KOL MVP | Control 已有注册/登录、API 密文与 Portfolio Margin 只读验证；Web、Copy 与手动交易已有可复用部件 | 邀请归属、公开登录/绑定页面、KOL 文案与终端、轻量多账户 Executor、真实快速跟单闭环 |
 | 六所网关/旧 Node | Binance、Gate.io、Bitget、Bybit、OKX、Hyperliquid adapter 及旧 Host/Lane/WAL 代码 | 当前冻结；不继续逐所接管，不作为 KOL MVP 执行路径 |
-| Copy/Grid | 已有纯规划、关系、Grid reducer 与复杂 Actor/恢复实现 | 旧 Copy/Actor 链冻结；未来 Grid 改为交易所事实驱动收敛，本轮不实施 |
+| Copy/Grid | Copy 已进入统一 Executor；Binance Grid 正重写为配置+签名事实→Planner→Reconciler | 旧 Copy/Actor/Grid 接管链退出；新 Grid 需通过故障、重启与实盘 Canary |
 | Scalping | 保留既有实现与失败关闭 | 暂缓处理，不进入当前 MVP 验收 |
 | 手动交易/账户 | 显式限价语义；Control 登录和 Binance 凭证加密验证 | KOL Web 终端、跟随者自助绑定、权限与真实连通验收 |
 | UI | VenueFlow 原生/WASM 与独立响应式 Web/BFF | 面向用户的邀请落地页、注册登录、API绑定、跟单状态和KOL可编辑说明 |

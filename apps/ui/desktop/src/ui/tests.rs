@@ -381,9 +381,9 @@ fn order_panel_primary_buttons_fit_and_short_panels_can_scroll_to_cancellations(
             }
         }
         let expected: &[&str] = if scroll {
-            &["撤当前", "撤全部"]
+            &["撤选中", "撤全部"]
         } else {
-            &["开多", "平多", "平空", "开空", "撤当前", "撤全部"]
+            &["开多", "平多", "平空", "开空", "撤选中", "撤全部"]
         };
         for prefix in expected {
             assert!(

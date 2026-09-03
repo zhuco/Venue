@@ -8,6 +8,8 @@ publish = false
 [dependencies]
 argon2.workspace = true
 base64.workspace = true
+futures-util.workspace = true
+parking_lot.workspace = true
 ring.workspace = true
 secrecy.workspace = true
 zeroize.workspace = true
@@ -18,12 +20,14 @@ rust_decimal.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 venue-control-protocol = { path = "../../crates/venue-control-protocol" }
 venue-copy = { path = "../../crates/venue-copy" }
 venue-domain = { path = "../../crates/venue-domain" }
 venue-execution = { path = "../../crates/venue-execution" }
 venue-indicators = { path = "../../crates/venue-indicators" }
 venue-gateway-binance = { path = "../../crates/venue-gateway-binance" }
+venue-strategies = { path = "../../crates/venue-strategies" }
 
 [dev-dependencies]
 reqwest.workspace = true

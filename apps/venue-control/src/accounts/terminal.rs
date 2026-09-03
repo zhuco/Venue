@@ -2,21 +2,99 @@
 
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
-use sqlx::Row;
+use sqlx::{PgConnection, Row};
 use venue_control_protocol::{
     accounts::AccountErrorCode as Code,
     kol::{
         ExecutorCommandOrigin, ExecutorCommandPhase, ExecutorCommandState, ExecutorCommandSummary,
-        ExecutorOrderKind, TerminalAction, TerminalOrderKind, TerminalOrderRequest,
+        ExecutorOrderKind, TerminalAction, TerminalCancelRequest, TerminalOrderKind,
+        TerminalOrderRequest,
     },
 };
 use venue_domain::domain::{OrderSide, PositionSide};
 
 use super::{AccountError, AccountService, Principal, database_error, error, ms};
+use crate::{
+    executor_store::{account_queue_has_capacity, lock_account_command_queue},
+    kol_executor::BinanceCommandLedgerError,
+};
 
 const MAX_TERMINAL_PROJECTION_AGE_MS: u64 = 15_000;
 
 impl AccountService {
+    pub async fn enqueue_terminal_cancel(
+        &self,
+        principal: &Principal,
+        request: TerminalCancelRequest,
+        now_ms: u64,
+    ) -> Result<ExecutorCommandSummary, AccountError> {
+        request.validate().map_err(|_| error(Code::InvalidInput))?;
+        let projection =
+            crate::private_projection::BinancePrivateProjectionStore::new(self.pool.clone())
+                .load_owned(&principal.user.user_id, &request.credential_id)
+                .await
+                .map_err(|_| error(Code::Unavailable))?
+                .ok_or(error(Code::VerificationRequired))?;
+        if projection.observed_ms > now_ms
+            || now_ms.saturating_sub(projection.observed_ms) > MAX_TERMINAL_PROJECTION_AGE_MS
+        {
+            return Err(error(Code::VerificationRequired));
+        }
+        let selected = projection
+            .open_orders
+            .iter()
+            .find(|order| {
+                order.symbol == request.symbol
+                    && order.native_order_id.as_deref() == Some(&request.native_order_id)
+            })
+            .ok_or(error(Code::Conflict))?;
+        if selected.client_order_id.trim().is_empty() {
+            return Err(error(Code::Conflict));
+        }
+        reject_legacy_writer(&self.pool, &projection.trading_account_id).await?;
+        let digest: [u8; 32] =
+            Sha256::digest(serde_json::to_vec(&request).map_err(|_| error(Code::InvalidInput))?)
+                .into();
+        let command_id = super::crypto::opaque_id()?;
+        let client_order_id =
+            terminal_client_order_id(&principal.user.user_id, &request.request_id);
+        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let queue_depth = lock_account_command_queue(
+            &mut *tx,
+            &principal.user.user_id,
+            &projection.trading_account_id,
+            &request.credential_id,
+        )
+        .await
+        .map_err(account_admission_error)?;
+        if let Some(row) =
+            load_terminal_command(&mut *tx, &principal.user.user_id, &request.request_id).await?
+        {
+            validate_replay_digest(&row, &digest)?;
+            let summary = command_summary(&row)?;
+            tx.commit().await.map_err(database_error)?;
+            return Ok(summary);
+        }
+        if !account_queue_has_capacity(queue_depth, 1) {
+            return Err(error(Code::RateLimited));
+        }
+        let inserted = sqlx::query("INSERT INTO venue_binance_commands (command_id,command_origin,request_id,owner_user_id,trading_account_id,credential_id,symbol,command_phase,order_kind,rule_version,selected_native_order_id,client_order_id,command_state,source_digest,created_ms,updated_ms) VALUES ($1,'terminal',$2,$3,$4,$5,$6,'cancel','cancel_exact',$7,$8,$9,'pending',$10,$11,$11) ON CONFLICT (owner_user_id,request_id) WHERE command_origin='terminal' DO NOTHING")
+            .bind(&command_id).bind(&request.request_id).bind(&principal.user.user_id)
+            .bind(&projection.trading_account_id).bind(&request.credential_id)
+            .bind(request.symbol.to_string())
+            .bind(format!("binance-pm-um-projection-{}", projection.private_generation))
+            .bind(&request.native_order_id).bind(client_order_id).bind(digest.as_slice())
+            .bind(ms(now_ms)?).execute(&mut *tx).await.map_err(database_error)?;
+        let row = sqlx::query("SELECT command_id,request_id,command_origin,command_phase,order_kind,order_side,requested_quantity,limit_price,trading_account_id,symbol,position_side,command_state,native_order_id,created_ms,updated_ms,sanitized_error_code,source_digest FROM venue_binance_commands WHERE owner_user_id=$1 AND request_id=$2 AND command_origin='terminal' FOR SHARE")
+            .bind(&principal.user.user_id).bind(&request.request_id).fetch_one(&mut *tx).await.map_err(database_error)?;
+        if inserted.rows_affected() == 0 {
+            validate_replay_digest(&row, &digest)?;
+        }
+        let summary = command_summary(&row)?;
+        tx.commit().await.map_err(database_error)?;
+        Ok(summary)
+    }
+
     pub async fn enqueue_terminal_order(
         &self,
         principal: &Principal,
@@ -78,17 +156,7 @@ impl AccountService {
         // A legacy account-node scope is a fail-closed ownership fence. It is deliberately not
         // age-expired here: only an explicit, audited migration may release an old writer after
         // its WAL, Unknown outcomes and positions have converged.
-        let legacy_owned: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM venue_control_strategy_scopes \
-             WHERE venue='binance' AND mode='LIVE' AND trading_account_id=$1)",
-        )
-        .bind(&projection.trading_account_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(database_error)?;
-        if legacy_owned {
-            return Err(error(Code::Conflict));
-        }
+        reject_legacy_writer(&self.pool, &projection.trading_account_id).await?;
         let digest: [u8; 32] =
             Sha256::digest(serde_json::to_vec(&request).map_err(|_| error(Code::InvalidInput))?)
                 .into();
@@ -101,6 +169,25 @@ impl AccountService {
             TerminalOrderKind::LimitPostOnly => "limit_post_only",
         };
         let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let queue_depth = lock_account_command_queue(
+            &mut *tx,
+            &principal.user.user_id,
+            &projection.trading_account_id,
+            &request.credential_id,
+        )
+        .await
+        .map_err(account_admission_error)?;
+        if let Some(row) =
+            load_terminal_command(&mut *tx, &principal.user.user_id, &request.request_id).await?
+        {
+            validate_replay_digest(&row, &digest)?;
+            let summary = command_summary(&row)?;
+            tx.commit().await.map_err(database_error)?;
+            return Ok(summary);
+        }
+        if !account_queue_has_capacity(queue_depth, 1) {
+            return Err(error(Code::RateLimited));
+        }
         let inserted = sqlx::query("INSERT INTO venue_binance_commands (command_id,command_origin,request_id,owner_user_id,trading_account_id,credential_id,symbol,position_side,command_phase,order_kind,order_side,requested_quantity,limit_price,rule_version,client_order_id,command_state,source_digest,created_ms,updated_ms) VALUES ($1,'terminal',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pending',$15,$16,$16) ON CONFLICT (owner_user_id,request_id) WHERE command_origin='terminal' DO NOTHING")
             .bind(&command_id).bind(&request.request_id).bind(&principal.user.user_id)
             .bind(&projection.trading_account_id).bind(&request.credential_id).bind(request.symbol.to_string())
@@ -110,10 +197,8 @@ impl AccountService {
             .bind(digest.as_slice()).bind(ms(now_ms)?).execute(&mut *tx).await.map_err(database_error)?;
         let row = sqlx::query("SELECT command_id,request_id,command_origin,command_phase,order_kind,order_side,requested_quantity,limit_price,trading_account_id,symbol,position_side,command_state,native_order_id,created_ms,updated_ms,sanitized_error_code,source_digest FROM venue_binance_commands WHERE owner_user_id=$1 AND request_id=$2 AND command_origin='terminal' FOR SHARE")
             .bind(&principal.user.user_id).bind(&request.request_id).fetch_one(&mut *tx).await.map_err(database_error)?;
-        let durable_digest: Option<Vec<u8>> =
-            row.try_get("source_digest").map_err(database_error)?;
-        if inserted.rows_affected() == 0 && durable_digest.as_deref() != Some(digest.as_slice()) {
-            return Err(error(Code::Conflict));
+        if inserted.rows_affected() == 0 {
+            validate_replay_digest(&row, &digest)?;
         }
         let summary = command_summary(&row)?;
         tx.commit().await.map_err(database_error)?;
@@ -130,10 +215,62 @@ impl AccountService {
     }
 }
 
+async fn load_terminal_command(
+    connection: &mut PgConnection,
+    owner_user_id: &str,
+    request_id: &str,
+) -> Result<Option<sqlx::postgres::PgRow>, AccountError> {
+    sqlx::query("SELECT command_id,request_id,command_origin,command_phase,order_kind,order_side,requested_quantity,limit_price,trading_account_id,symbol,position_side,command_state,native_order_id,created_ms,updated_ms,sanitized_error_code,source_digest FROM venue_binance_commands WHERE owner_user_id=$1 AND request_id=$2 AND command_origin='terminal' FOR SHARE")
+        .bind(owner_user_id)
+        .bind(request_id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(database_error)
+}
+
+fn validate_replay_digest(
+    row: &sqlx::postgres::PgRow,
+    expected: &[u8; 32],
+) -> Result<(), AccountError> {
+    let durable_digest: Option<Vec<u8>> = row.try_get("source_digest").map_err(database_error)?;
+    if durable_digest.as_deref() != Some(expected.as_slice()) {
+        return Err(error(Code::Conflict));
+    }
+    Ok(())
+}
+
+fn account_admission_error(source: BinanceCommandLedgerError) -> AccountError {
+    match source {
+        BinanceCommandLedgerError::Conflict => error(Code::VerificationRequired),
+        BinanceCommandLedgerError::Unavailable => error(Code::Unavailable),
+    }
+}
+
+async fn reject_legacy_writer(
+    pool: &sqlx::PgPool,
+    trading_account_id: &str,
+) -> Result<(), AccountError> {
+    // This is the only exclusivity lock retained by the new chain: it prevents two physical
+    // writers, but it does not prevent manual, Copy and Grid commands sharing one Executor queue.
+    let legacy_owned: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM venue_control_strategy_scopes \
+         WHERE venue='binance' AND mode='LIVE' AND trading_account_id=$1)",
+    )
+    .bind(trading_account_id)
+    .fetch_one(pool)
+    .await
+    .map_err(database_error)?;
+    if legacy_owned {
+        return Err(error(Code::Conflict));
+    }
+    Ok(())
+}
+
 fn command_summary(row: &sqlx::postgres::PgRow) -> Result<ExecutorCommandSummary, AccountError> {
     let origin = match text(row, "command_origin")?.as_str() {
         "copy" => ExecutorCommandOrigin::Copy,
         "terminal" => ExecutorCommandOrigin::Terminal,
+        "grid" => ExecutorCommandOrigin::Grid,
         _ => return Err(error(Code::Unavailable)),
     };
     let phase = match text(row, "command_phase")?.as_str() {

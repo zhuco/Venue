@@ -36,7 +36,7 @@ impl Behavior<Pane> for PaneBehavior<'_> {
             PaneKind::TradeTape => show_trade_tape(ui, pane, self.model),
             PaneKind::Accounts => show_accounts(ui, self.model),
             PaneKind::Strategies => show_strategies(ui, self.model),
-            PaneKind::Execution => crate::execution_view::show(ui, self.model),
+            PaneKind::Execution => crate::execution_view::show(ui, self.model, self.client),
             PaneKind::CopyRelations => crate::copy_relation_view::show(ui, self.model, self.client),
             PaneKind::Ledger => show_ledger(ui, self.model),
             PaneKind::TradeDock => crate::trade_dock::show(ui, self.model, self.client),

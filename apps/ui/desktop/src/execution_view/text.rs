@@ -39,7 +39,6 @@ pub enum Key {
     OrderHistoryUnavailable,
     FillsScope,
     PositionHistoryUnavailable,
-    BotsSource,
 }
 
 pub fn text(language: Language, key: Key) -> &'static str {
@@ -101,10 +100,6 @@ pub fn text(language: Language, key: Key) -> &'static str {
         Key::PositionHistoryUnavailable => (
             "当前协议尚未提供仓位历史投影；不会用成交记录反推或伪造仓位历史。",
             "Position-history projection is not available; fills are not used to infer it.",
-        ),
-        Key::BotsSource => (
-            "当前仅显示旧运行时策略投影；新 Binance Executor 未投影为交易机器人。",
-            "Shows legacy runtime strategy projections only; the new Binance Executor is not a bot projection.",
         ),
     };
     match language {

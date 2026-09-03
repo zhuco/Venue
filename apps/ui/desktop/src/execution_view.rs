@@ -1,5 +1,10 @@
 mod text;
-use crate::{model::AppModel, theme};
+use crate::{
+    client::ControlClient,
+    model::AppModel,
+    theme,
+    trading::{TerminalOrderSelection, TradeDockState},
+};
 use eframe::egui;
 use std::sync::Arc;
 use text::{Key, text};
@@ -27,14 +32,19 @@ pub struct ExecutionViewState {
     pub terminal_executions_error: Option<String>,
     pub private_projection: Option<Arc<TerminalAccountProjection>>,
     pub terminal_executions: Vec<ExecutorCommandSummary>,
+    pub grid: crate::grid_view::GridViewState,
     facts_received_ms: u64,
     private_received_ms: u64,
     tab: Tab,
-    current_symbol: bool,
+    pub(crate) current_symbol: bool,
 }
 
 impl ExecutionViewState {
-    pub fn apply_private(&mut self, projection: Option<TerminalAccountProjection>) {
+    pub fn apply_private(
+        &mut self,
+        projection: Option<TerminalAccountProjection>,
+        trade_dock: &mut TradeDockState,
+    ) {
         if let Some(projection) = projection {
             if projection.validate().is_err()
                 || self.private_projection.as_ref().is_some_and(|old| {
@@ -46,10 +56,18 @@ impl ExecutionViewState {
                     Some("Invalid or regressing private account projection".into());
                 return;
             }
+            if trade_dock
+                .terminal_order_selection
+                .as_ref()
+                .is_some_and(|selection| !selection_exists(selection, &projection))
+            {
+                trade_dock.clear_order_selection();
+            }
             self.private_received_ms = crate::account_center::now_ms();
             self.private_projection = Some(Arc::new(projection));
             self.private_error = None;
         } else {
+            trade_dock.clear_order_selection();
             self.private_error = None;
         }
     }
@@ -130,6 +148,18 @@ fn fresh_time(time: u64, now: u64) -> bool {
     time > 0 && time <= now.saturating_add(2_000) && now.saturating_sub(time) <= 15_000
 }
 
+fn selection_exists(
+    selection: &TerminalOrderSelection,
+    projection: &TerminalAccountProjection,
+) -> bool {
+    selection.credential_id == projection.credential_id
+        && selection.trading_account_id == projection.trading_account_id
+        && projection.open_orders.iter().any(|order| {
+            order.symbol == selection.symbol
+                && order.native_order_id.as_deref() == Some(selection.native_order_id.as_str())
+        })
+}
+
 fn matches_account(
     binding: &ExecutionFactBinding,
     venue: VenueId,
@@ -142,7 +172,7 @@ fn matches_account(
         && symbol.is_none_or(|symbol| binding.symbol.to_string() == symbol)
 }
 
-pub fn show(ui: &mut egui::Ui, model: &mut AppModel) {
+pub fn show(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
     let language = model.preferences.language;
     ui.horizontal_wrapped(|ui| {
         for (tab, key) in [
@@ -176,6 +206,12 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel) {
     };
     if model.preferences.execution_account_id.as_deref() != Some(account.as_str()) {
         ui.weak(text(language, Key::NoAccount));
+        return;
+    }
+    if model.execution.tab == Tab::Bots {
+        if let Some(credential) = selected.cloned() {
+            crate::grid_view::show(ui, model, client, &credential, &account);
+        }
         return;
     }
     if model.execution.tab != Tab::Bots {
@@ -218,9 +254,7 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel) {
         Tab::Fills => {
             ui.weak(text(language, Key::FillsScope));
         }
-        Tab::Bots => {
-            ui.weak(text(language, Key::BotsSource));
-        }
+        Tab::Bots => {}
         Tab::OrderHistory | Tab::PositionHistory => {}
     }
     let symbol = model
@@ -457,6 +491,7 @@ fn show_private_projection(
     };
     let mut count = 0_usize;
     let mut requested_symbol = None;
+    let mut requested_order = None;
     egui::ScrollArea::both()
         .id_salt("private-execution-table-scroll")
         .show(ui, |ui| {
@@ -547,9 +582,43 @@ fn show_private_projection(
                                 .filter(|row| included(&row.symbol))
                             {
                                 count += 1;
-                                if symbol_link(ui, &row.symbol, &model.preferences.selected_symbol)
+                                let selection =
+                                    row.native_order_id.as_deref().map(|native_order_id| {
+                                        TerminalOrderSelection {
+                                            credential_id: projection.credential_id.clone(),
+                                            trading_account_id: projection
+                                                .trading_account_id
+                                                .clone(),
+                                            symbol: row.symbol.clone(),
+                                            native_order_id: native_order_id.to_owned(),
+                                        }
+                                    });
+                                let selected = selection.as_ref().is_some_and(|selection| {
+                                    model
+                                        .trade_dock
+                                        .terminal_order_selection
+                                        .as_ref()
+                                        .is_some_and(|current| current == selection)
+                                });
+                                let symbol = row.symbol.to_string();
+                                if ui
+                                    .add(
+                                        egui::Button::selectable(selected, &symbol)
+                                            .frame(false)
+                                            .sense(egui::Sense::click()),
+                                    )
+                                    .on_hover_text(if selection.is_some() {
+                                        "选择此委托并打开对应交易对图表"
+                                    } else {
+                                        "打开对应交易对图表；此行缺少交易所委托号，不能撤单"
+                                    })
+                                    .clicked()
                                 {
-                                    requested_symbol = Some(row.symbol.to_string());
+                                    if let Some(selection) = selection.clone() {
+                                        requested_order = Some(selection);
+                                    } else {
+                                        requested_symbol = Some(symbol);
+                                    }
                                 }
                                 ui.label(format!("{:?} / {:?}", row.order_side, row.position_side));
                                 market_price(ui, model, &row.symbol, row.limit_price);
@@ -557,11 +626,20 @@ fn show_private_projection(
                                 market_quantity(ui, model, &row.symbol, row.filled_quantity);
                                 ui.label(format!("{:?}", row.state));
                                 ui.label(if row.reduce_only { "✓" } else { "—" });
-                                ui.monospace(
-                                    row.native_order_id
-                                        .as_deref()
-                                        .map_or(row.client_order_id.as_str(), |value| value),
-                                );
+                                if let Some(native_order_id) = row.native_order_id.as_deref() {
+                                    if ui
+                                        .selectable_label(selected, native_order_id)
+                                        .on_hover_text(
+                                            "选择此委托用于精确撤单；同时打开对应交易对图表",
+                                        )
+                                        .clicked()
+                                    {
+                                        requested_order = selection;
+                                    }
+                                } else {
+                                    ui.monospace(&row.client_order_id)
+                                        .on_hover_text("缺少交易所委托号，不能精确撤单");
+                                }
                                 ui.weak(row.created_ms.map_or_else(|| "—".into(), timestamp));
                                 ui.end_row();
                             }
@@ -632,7 +710,11 @@ fn show_private_projection(
     if count == 0 {
         ui.weak(text(language, Key::Empty));
     }
-    if let Some(symbol) = requested_symbol {
+    if let Some(selection) = requested_order {
+        model.select_symbol(selection.symbol.to_string());
+        model.trade_dock.select_terminal_order(selection);
+        model.follow_latest_requested = true;
+    } else if let Some(symbol) = requested_symbol {
         model.select_symbol(symbol);
         model.follow_latest_requested = true;
     }
@@ -734,7 +816,7 @@ mod tests {
     fn private_projection(account: &str, observed_ms: u64) -> TerminalAccountProjection {
         TerminalAccountProjection {
             schema_version: venue_control_protocol::kol::TERMINAL_PROJECTION_SCHEMA_VERSION,
-            credential_id: "credential-a".into(),
+            credential_id: "00000000-0000-4000-8000-000000000002".into(),
             trading_account_id: account.into(),
             observed_ms,
             persisted_ms: observed_ms,
@@ -745,6 +827,23 @@ mod tests {
             open_orders: vec![],
             fills: vec![],
             assets: vec![],
+        }
+    }
+
+    fn open_order(symbol: venue_domain::Symbol) -> venue_control_protocol::kol::TerminalOpenOrder {
+        venue_control_protocol::kol::TerminalOpenOrder {
+            client_order_id: "client-order-a".into(),
+            native_order_id: Some("123456".into()),
+            symbol,
+            order_side: venue_domain::OrderSide::Buy,
+            position_side: venue_domain::PositionSide::Long,
+            quantity: rust_decimal::Decimal::ONE,
+            filled_quantity: Some(rust_decimal::Decimal::ZERO),
+            limit_price: Some(rust_decimal::Decimal::new(100, 0)),
+            post_only: true,
+            reduce_only: false,
+            state: venue_control_protocol::kol::TerminalOrderState::New,
+            created_ms: Some(18_000),
         }
     }
 
@@ -768,6 +867,33 @@ mod tests {
         assert!(!state.private_ready(None, 20_000));
         state.private_received_ms = 1;
         assert!(!state.private_ready(Some("account-a"), 20_000));
+    }
+    #[test]
+    fn refreshed_projection_clears_a_selected_order_only_after_it_disappears()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let account_id = "00000000-0000-4000-8000-000000000001";
+        let symbol: venue_domain::Symbol = "SOL/USDC".parse()?;
+        let mut first = private_projection(account_id, 19_000);
+        first.open_orders.push(open_order(symbol.clone()));
+        let mut state = ExecutionViewState::default();
+        let mut trade_dock = TradeDockState::default();
+        trade_dock.select_terminal_order(TerminalOrderSelection {
+            credential_id: first.credential_id.clone(),
+            trading_account_id: first.trading_account_id.clone(),
+            symbol,
+            native_order_id: "123456".into(),
+        });
+
+        state.apply_private(Some(first), &mut trade_dock);
+        assert!(trade_dock.terminal_order_selection.is_some());
+
+        state.apply_private(
+            Some(private_projection(account_id, 20_000)),
+            &mut trade_dock,
+        );
+        assert!(trade_dock.terminal_order_selection.is_none());
+        assert!(trade_dock.selected_order_id.is_none());
+        Ok(())
     }
     #[test]
     fn current_and_historical_orders_are_separated_without_hiding_unknown_rows() {

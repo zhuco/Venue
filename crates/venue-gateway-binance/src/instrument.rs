@@ -2,7 +2,9 @@ use std::str::FromStr;
 
 use rust_decimal::Decimal;
 use serde_json::{Map, Value};
-use venue_domain::domain::{Amount, Asset, Instrument, MarketKind, Price, Symbol};
+use venue_domain::domain::{
+    Amount, Asset, Instrument, InstrumentMetadata, MarketKind, Precision, Price, Symbol,
+};
 
 use crate::native_symbol;
 
@@ -15,6 +17,23 @@ pub struct BinanceInstrumentRules {
     pub maximum_quantity: Decimal,
     pub minimum_price: Decimal,
     pub maximum_price: Decimal,
+}
+
+impl BinanceInstrumentRules {
+    /// Converts Binance rule evidence into the exchange-neutral planner metadata. Native maximum
+    /// bounds remain explicit fields on this type and must be passed alongside the metadata.
+    pub fn metadata(&self) -> Result<InstrumentMetadata, BinanceInstrumentError> {
+        InstrumentMetadata::new(
+            self.instrument.clone(),
+            Precision::new(self.instrument.price_tick.value(), self.minimum_price)
+                .map_err(|_| BinanceInstrumentError::Rule)?,
+            Precision::new(self.instrument.quantity_step, self.minimum_quantity)
+                .map_err(|_| BinanceInstrumentError::Rule)?,
+            None,
+            true,
+        )
+        .map_err(|_| BinanceInstrumentError::Rule)
+    }
 }
 
 /// Parses the one USDⓈ-M perpetual entry selected by a canonical symbol.

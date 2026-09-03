@@ -119,11 +119,23 @@ where
     pub async fn poll_raw_frame(
         &mut self,
     ) -> Result<Option<BinanceRawPrivateFrame>, BinanceTransportError> {
+        self.poll_raw_frame_with_budget(READINESS_TIMEOUT).await
+    }
+
+    /// Polls an established stream with a caller's remaining micro-batch budget, capped at the
+    /// normal 1 ms readiness wait. A zero budget never polls the socket.
+    pub async fn poll_raw_frame_with_budget(
+        &mut self,
+        remaining: Duration,
+    ) -> Result<Option<BinanceRawPrivateFrame>, BinanceTransportError> {
+        let Some(readiness) = private_readiness_budget(remaining) else {
+            return Ok(None);
+        };
         if Instant::now() >= self.next_heartbeat_at {
             self.send(Message::Ping(Bytes::new())).await?;
             self.next_heartbeat_at = Instant::now() + HEARTBEAT_INTERVAL;
         }
-        let message = match timeout(READINESS_TIMEOUT, self.stream.next()).await {
+        let message = match timeout(readiness, self.stream.next()).await {
             Err(_) => return Ok(None),
             Ok(None) => return Err(BinanceTransportError::EndOfStream),
             Ok(Some(Err(error))) => return Err(map_websocket(error)),
@@ -162,6 +174,10 @@ where
             payload,
         })
     }
+}
+
+fn private_readiness_budget(remaining: Duration) -> Option<Duration> {
+    (!remaining.is_zero()).then(|| remaining.min(READINESS_TIMEOUT))
 }
 
 pub async fn connect_private_ws(
@@ -326,6 +342,19 @@ mod tests {
             crate::BinanceAccountBinding::PortfolioMarginUm,
             &binding,
         )?)
+    }
+
+    #[test]
+    fn caller_budget_is_zero_safe_and_capped_by_the_normal_readiness_wait() {
+        assert_eq!(private_readiness_budget(Duration::ZERO), None);
+        assert_eq!(
+            private_readiness_budget(Duration::from_micros(250)),
+            Some(Duration::from_micros(250))
+        );
+        assert_eq!(
+            private_readiness_budget(Duration::from_millis(10)),
+            Some(READINESS_TIMEOUT)
+        );
     }
 
     #[tokio::test]

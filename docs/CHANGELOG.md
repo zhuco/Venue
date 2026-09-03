@@ -1,6 +1,13 @@
 # 版本与更新说明
 
-## 未发布：Binance KOL 跟单 MVP 架构收敛
+## v0.1.0-alpha.3 — 2026-09-03
+
+- Binance KOL、桌面手动交易与新对冲 Grid 统一进入单个多账户 Executor；Grid 使用 PostgreSQL 命令账本、签名私有事实、稳定 `clientOrderId` 和超时签名查单，不恢复 Actor/checkpoint/WAL。
+- 新增 Grid 生命周期、配置、目标订单面、订单归属、成交分配、热批次和跨微批前驱链。每笔完整 Maker 成交独立重算，通常形成 2 Place + 1 Cancel；相邻成交可连续持久化，但后批出网等待前批全部签名确认。
+- 桌面终端接入真实私有持仓、当前/历史委托、成交、仓位历史、Grid 与资产，多标签交易对、账户备注、Maker 默认、快捷键和精确撤单/市价平仓均走同一新链。
+- 旧 Binance Grid 未完成安全收敛前仍按账户互斥，不能与新 Executor 并行写同一账户。真实 PostgreSQL、Binance Canary 和 10 ms p95 以发布验收记录为准。
+
+## 先前未发布：Binance KOL 跟单 MVP 架构收敛
 
 - 当前唯一下一步目标调整为 Binance KOL 跟单 MVP：邀请注册、登录、API Key 绑定验证、基础 KOL 交易终端、快速真实跟单和 KOL 自助页面说明。
 - 目标架构收敛为 Web/BFF、Control、PostgreSQL 和单个多账户 Binance Executor；最多 5 个 KOL、200 个启用跟单账户，不为每个账户建立进程、Actor、Checkpoint 或本地 WAL。

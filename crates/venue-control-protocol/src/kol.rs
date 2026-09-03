@@ -493,6 +493,7 @@ impl TerminalCancelRequest {
 pub enum ExecutorCommandOrigin {
     Copy,
     Terminal,
+    Grid,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

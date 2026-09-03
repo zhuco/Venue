@@ -4,6 +4,7 @@ mod config;
 mod credential_probe;
 mod credentials;
 mod execution;
+mod grid_market;
 mod instrument;
 pub mod portfolio;
 pub mod private;
@@ -27,6 +28,7 @@ pub use config::{BinanceConfig, endpoints};
 pub use credential_probe::{BinanceCredentialProbe, BinanceProbeError, probe_credentials};
 pub use credentials::BinanceCredentials;
 pub use execution::*;
+pub use grid_market::BinanceGridMarketReader;
 pub use instrument::{
     BinanceInstrumentError, BinanceInstrumentRules, parse_instrument_rules,
     parse_native_instrument_rules,
@@ -49,7 +51,7 @@ pub use recovery::*;
 pub use sign::{BinanceHttpMethod, BinanceRestSignInput, SignedBinanceRestRequest, sign_rest};
 pub use transport::{
     BinanceHttpResponse, BinanceHttpTransport, BinancePhysicalMutationOutcome,
-    BinanceTransportError, BinanceTransportLimits,
+    BinancePreparedDispatch, BinanceTransportError, BinanceTransportLimits,
 };
 
 /// Adapter protocol completeness never grants runtime mutation authority. Stage 7 remains the

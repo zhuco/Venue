@@ -1,12 +1,12 @@
 # Binance KOL 跟单 MVP 长期契约
 
-更新：2026-09-02
+更新：2026-09-03
 
 ## 1. 文档职责
 
-本文定义 VENUE 下一阶段唯一获准的产品目标：完成可供真实用户使用的 Binance KOL 跟单 MVP。本文拥有该 MVP 的产品流程、进程拓扑、成交语义、安全边界、开发顺序和验收标准；旧网格迁移文档只继续约束仍在运行的旧实现，不得反向要求新跟单链引入 Actor、Checkpoint、handoff 或每账户进程。
+本文定义可供真实用户使用的 Binance KOL 跟单 MVP，拥有其产品流程、成交语义、安全边界和验收标准。Binance Grid 的当前重建契约由 [`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md) 管理；两者共用单例 Executor，但都不得引入 Actor、Checkpoint、handoff 或每账户进程。
 
-本阶段只做 Binance。旧 Grid、Gate.io、Bitget 的迁移、接管和功能开发全部暂停；Bybit、OKX、Hyperliquid、Scalping 同样不进入本阶段。暂停不等于删除其源码、运行工件或恢复事实。
+本阶段只做 Binance。旧 Grid 接管路线停止，新的事实驱动 Binance Grid 与 KOL 共用执行链；Gate.io、Bitget、Bybit、OKX、Hyperliquid、Scalping 仍暂停。暂停不等于删除其运行工件或恢复事实。
 
 ## 2. 目标与非目标
 
@@ -26,7 +26,7 @@
 - 收费、分佣、结算、返佣、排行榜、社交、站内信、公开策略市场和任意多层代理关系。
 - 一个用户同时绑定多个 KOL、任何用户或管理员换绑 KOL、KOL 代用户创建 API Key 或修改交易所账户模式。
 - 抄送 KOL 的未成交委托、条件单、止损单或撤单；MVP 只复制权威成交造成的仓位变化。
-- 以旧 Grid/Runtime 迁移完成作为跟单上线前置，也不在本阶段重构或清理旧三所代码。
+- 以旧 Grid/Runtime 接管完成作为跟单上线前置；Binance Grid 重建独立验收，不能阻塞 KOL 跟单账户。
 - 多 Executor 分片、跨机器选举、分布式 lease、复杂服务网格和高可用切换。
 - 自动平掉用户启用跟单前的外部仓位，或在暂停跟单时自动清仓。
 
@@ -96,7 +96,7 @@ KOL 可编辑字段限定为：公开名称（1–40 字）、页面标题（1�
 - `apps/ui/desktop`：Binance 风格 VenueFlow 桌面终端；只消费 Control 的用户作用域私有投影和命令状态，不持有 API Secret，也不直连 Binance 私流。
 - `venue-control`：认证、邀请归属、KOL 页面、API 密文管理、只读验证、关系配置、终端命令授权、查询投影和任务持久化；不直接执行物理订单。
 - PostgreSQL：保存用户、归属、页面、加密凭证、关系、KOL 成交游标、目标版本、终端/跟单轻量命令账本和执行投影。
-- `venue-executor-binance`：初期新链唯一物理交易进程。它可抽取现有 `venue-copy-worker` 的纯逻辑，但后者及旧 Node 不得继续作为第二个生产跟单入口。
+- `venue-executor-binance`：初期新链唯一物理交易进程，承载终端、跟单与 Binance Grid；旧 Copy worker、旧 Grid writer 及旧 Node 不得继续作为第二个生产入口。
 
 Executor 使用 Tokio 异步任务管理所有账户：
 
@@ -131,6 +131,8 @@ Executor 以部署副本数 1 运行，并在启动时取得一个 PostgreSQL �
 
 每条 KOL 成交先以 `(kol_trading_account_id, native_symbol, native_trade_id)` 唯一写入 PostgreSQL，再更新该 KOL 在规范交易对上的 `LONG` 和 `SHORT` 两条仓位目标。私流重连后用签名成交查询从已提交游标重叠补齐；同 ID 同内容是重复，同 ID 不同内容为冲突并暂停该 KOL。
 
+同一私流 worker 收到首笔成交后，以本地单调接收时刻为起点收集最多 1 ms、最多 5 笔且 stream/private generation 相同的短突发；单笔不等待第二笔，窗口到期即交付。整批先在一个 PostgreSQL 事务中锁定一次签名基线并逐成交幂等持久化；成功后把完整批次交给 Grid，并等待其计划和命令事务完成，才执行同账户的 KOL 目标与命令规划，避免跟单抢占共用账户队列。Grid 确认失败、关闭或超时，以及后续 KOL 规划失败，都会退役该 worker 并触发签名恢复，但不得撤销或丢弃已经持久化的账户成交。`ReconcileRequired` 不并入成交批，必须保留并立即触发签名校正。
+
 MVP 只支持 Hedge Mode，`LONG` 与 `SHORT` 独立计算，不把两腿合并成净仓：
 
 ```text
@@ -163,7 +165,7 @@ KOL 必须配置正数的策略资本；跟随者配置分配资金、倍率、�
 
 为优先满足快速复制，MVP 的增仓使用 Binance UM `MARKET`，减仓使用绑定明确 `positionSide` 且不超过 dispatch 前同代新鲜签名腿数量的市场减仓。实现 P3 必须补齐并专项验证现有 Binance adapter 尚未开放的 `PlaceMarket` 路径；不得从旧旁路直接拼 HTTP 请求。
 
-KOL 终端开仓和平仓默认只使用 `LIMIT + GTX(Post Only)`；Maker-only 设置默认开启，关闭时禁止交易而不是退化成 taker 限价。市价只开放双向持仓腿的平仓，必须二次确认，并在 Executor 发送前按同代新鲜签名仓位再次向下裁剪。撤单是独立耐久命令，只能以服务端确认属于该 KOL 账户的原生订单身份精确撤销；该链路未完成前桌面按钮保持禁用。终端订单与 Copy 一样，只有签名订单/成交/仓位回读完成后才显示最终状态。
+KOL 终端开仓和平仓默认只使用 `LIMIT + GTX(Post Only)`；Maker-only 设置默认开启，关闭时禁止交易而不是退化成 taker 限价。市价只开放双向持仓腿的平仓，必须二次确认，并在 Executor 发送前按同代新鲜签名仓位再次向下裁剪。撤单是独立耐久命令，只能以服务端确认属于该 KOL 账户的原生订单身份精确撤销；桌面只对当前选中的、带原生身份的活动委托开放按钮，不提供账户级批量撤单。终端订单与 Copy 一样，只有签名订单/成交/仓位回读完成后才显示最终状态。
 
 增仓发送前必须使用共享的新鲜价格进行名义价值和价格偏离检查；超过用户配置的最大偏离、价格过期、规则缺失或最小/最大数量不满足时拒绝该次执行。市场单无法保证最终成交价，页面必须在启用前明确提示滑点风险。
 
@@ -194,10 +196,10 @@ Pending -> Sending -> Accepted -> Reconciled
 - `Pending` 必须已提交事务后才允许发送。
 - 发送前原子切换为 `Sending`；崩溃恢复看到 `Sending` 时按同一 `clientOrderId` 查询，禁止直接再次 POST。
 - HTTP 超时、连接中断、响应无法解析或 ACK 身份不一致记为 `ReconcileRequired`。该跟随账户暂停新订单；其他账户继续。
-- `Accepted` 只代表交易所接受，不代表成交。只有精确订单/成交以及更新签名仓位相互一致才记 `Reconciled`，UI 才能显示“跟单完成”。
+- `Accepted` 只代表交易所接受，不代表成交。Post Only 放单命令在精确签名回读逐字段证明活动订单存在后即记 `Reconciled`，订单后续成交/撤销由私有投影跟踪，不能以一张长期挂单占住账户队列；市价与成交复制仍须订单、成交及更新签名仓位相互一致才记 `Reconciled`。
 - `Rejected` 不自动重发原命令；后续新的 KOL 目标可产生新的确定性命令。
 - 重复 KOL 帧、重复数据库轮询、进程重启和重复页面操作只能返回已有记录，不得产生第二个物理订单。
-- `ReconcileRequired` 在有界精确回读后仍无法收敛时保持该状态并标记账户 `NeedsAttention`；不得用一次 404 证明未下单。
+- `Accepted / ReconcileRequired` 的精确签名回读按 PostgreSQL 中的尝试次数和下次时间执行 500 ms 起、8 s 封顶的确定性指数退避；未到期仍保持账户栅栏但不访问 Binance。无法收敛时保持 `ReconcileRequired` 并标记账户 `NeedsAttention`；不得用一次 404 证明未下单。
 
 账本是订单幂等和故障收敛的必要最小机制，不承担策略历史回放、权限证明链或多进程选举。
 
@@ -265,7 +267,7 @@ Pending -> Sending -> Accepted -> Reconciled
 
 这样只新增一个 binary 和一组局部模块，旧 Grid/六所 Node 不迁移、不改数据格式，也不成为交付依赖。
 
-当前已落地 `0017`–`0020` 数据契约、邀请/KOL/跟单 HTTP、唯一 `venue-executor-binance`、私流与签名 REST 投影、Post Only/市价平仓命令账本及桌面消费链。真实凭证联调、旧账户迁移、精确撤单和 2 核 4 GiB/真实 Canary 仍须按验收门执行；存在旧 `venue_control_strategy_scopes` 的账户在 Control 入账与 Executor 抢占两处均保持拒绝。
+当前已落地 `0017`–`0022` 数据契约、邀请/KOL/跟单/Grid HTTP、唯一 `venue-executor-binance`、私流与签名 REST 投影、Post Only/市价平仓/精确撤单命令账本、耐久签名回读退避及桌面消费链。真实凭证联调、旧账户迁移和 2 核 4 GiB/真实 Canary 仍须按验收门执行；存在旧 `venue_control_strategy_scopes` 的账户在 Control 入账与 Executor 抢占两处均保持拒绝。
 
 ## 10. P0–P5 开发计划
 
@@ -311,7 +313,7 @@ P3-A 已接通受限依赖边界：`PgExecutorStore` 在 PostgreSQL 中按 nativ
 
 P3-B 将这些边界组合成离线可验证的 `BinanceExecutorRuntime`：同一事务内对源成交去重、推进 relation/腿目标并生成不超过 36 字符的确定性命令 ID；重启先对 `Sending/Accepted/ReconcileRequired` 做同 ID readback，超时和损坏响应只进入 `ReconcileRequired`，绝不回到 Pending 或重发；每个账户只领取最旧 Pending。启用请求只在 KOL 与 follower 两次签名基线都干净时提升，任一基线失败则拒绝。PostgreSQL+mock 集成 fixture 覆盖重复成交、重启、超时、拒单和启用成功。
 
-P3-C 已闭合 production adapter 与 binary：`BinanceHttpExecution` 使用固定 `BinanceHttpTransport` 的签名、`exchangeInfo` 规则、`prepare_place_market` 与一次 POST 后精确回读。数量按 stepSize 向下归一，低于 minQty/minNotional 或缺签名价格、规则、Hedge 腿即拒绝；Hedge MARKET 开仓不传 `reduceOnly`。ACK、accountTradeList 和 position risk 必须共同收敛才进入 Reconciled，部分成交、订单缺失、仓位不符或响应不明保持 Accepted/Unknown；超时、断连和损坏 ACK 只按原 clientOrderId 查询，绝不再次 POST。
+P3-C 已闭合 production adapter 与 binary：`BinanceHttpExecution` 使用固定 `BinanceHttpTransport` 的签名、`exchangeInfo` 规则、`prepare_place_market` 与一次 POST 后精确回读。数量按 stepSize 向下归一，低于 minQty/minNotional 或缺签名价格、规则、Hedge 腿即拒绝；Hedge MARKET 开仓不传 `reduceOnly`。Post Only 只有 clientOrderId、symbol、side、positionSide、规则归一数量、价格和 GTX 全部匹配签名活动订单才完成放单命令；市价仍须 ACK、accountTradeList 和 position risk 共同收敛。部分成交、订单缺失、仓位不符或响应不明保持 Accepted/Unknown；超时、断连和损坏 ACK 只按原 clientOrderId 查询，绝不再次 POST。
 
 `venue-executor-binance` 只接受 `VENUE_EXECUTOR_MODE=LIVE`、`VENUE_EXECUTOR_DATABASE_URL` 的 PostgreSQL URL 与既有 credential master key；无 mock、dry-run 或 testnet 配置。它持有 advisory singleton，启动先完成 Pending activation 的双账户签名基线并恢复未终态命令，随后对已激活 KOL 账户建立 listenKey 私流。只把 `ORDER_TRADE_UPDATE/TRADE` 映射为规范成交；重复 WS/REST 成交由 `(account,native symbol,native trade id)` 去重，断线、过期和 gap 触发签名 REST 补读与状态对账，原始帧不持久化。终端签名投影的单次补读失败在原工作线程内按 250ms–2s 有界退避，连续 5 次失败才重建连接；失败期间不续期旧快照或放宽下单新鲜度门。SIGINT/SIGTERM 令循环停止、私流析构并释放锁。真实凭证联调、2核4G复验和真实 Canary 仍是外部验收，不构成实盘准入。
 - 实现 Pending/Sending/Accepted/Rejected/ReconcileRequired/Reconciled、重启恢复、账户隔离和 UI 投影。

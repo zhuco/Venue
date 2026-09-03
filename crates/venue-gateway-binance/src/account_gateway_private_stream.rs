@@ -4,8 +4,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use rust_decimal::Decimal;
 use serde_json::Value;
-use venue_domain::domain::{FieldState, Fill};
+use venue_domain::domain::{FieldState, Fill, OrderState};
 use venue_gateway_api::GatewayBinding;
 
 use super::BinanceAccountGatewayError;
@@ -89,6 +90,34 @@ pub struct BinancePrivateFillEvent {
     pub received_at_ms: u64,
     pub fill: Fill,
     pub client_order_id: FieldState<String>,
+    pub original_quantity: FieldState<Decimal>,
+    pub cumulative_filled_quantity: FieldState<Decimal>,
+    pub order_state: FieldState<OrderState>,
+}
+
+impl BinancePrivateFillEvent {
+    /// Returns the exact authenticated order progress required by the Grid fast path. A normal
+    /// KOL fill may still be consumed without it, but must not be used to infer order completion.
+    #[must_use]
+    pub fn complete_order_progress(&self) -> Option<(Decimal, Decimal, OrderState)> {
+        match (
+            &self.original_quantity,
+            &self.cumulative_filled_quantity,
+            &self.order_state,
+        ) {
+            (
+                FieldState::Known(original),
+                FieldState::Known(cumulative),
+                FieldState::Known(state @ (OrderState::PartiallyFilled | OrderState::Filled)),
+            ) => Some((*original, *cumulative, *state)),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn native_order_id(&self) -> &str {
+        &self.fill.order_id
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -203,6 +232,9 @@ pub(super) fn normalize_private_stream_event_for_symbols(
             received_at_ms: frame.received_at_ms,
             fill: stream.fill,
             client_order_id: stream.client_order_id,
+            original_quantity: stream.original_quantity,
+            cumulative_filled_quantity: stream.cumulative_filled_quantity,
+            order_state: stream.order_state,
         },
     )))
 }

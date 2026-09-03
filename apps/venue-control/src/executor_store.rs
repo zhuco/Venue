@@ -1,17 +1,78 @@
 //! PostgreSQL facts owned by the singleton executor; no local journal is created.
 
-use std::{collections::BTreeSet, str::FromStr};
+use std::{collections::BTreeSet, ops::Deref, str::FromStr};
 
 use rust_decimal::Decimal;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
 
-use crate::kol_executor::{
-    BinanceCommandLedger, BinanceCommandLedgerError, ClaimedBinanceCommand, KolSourceFill,
-    scaled_copy_quantity,
+use crate::{
+    executor_exchange::ReconciledCloseReservation,
+    kol_executor::{
+        BinanceCommandLedger, BinanceCommandLedgerError, ClaimedBinanceBatch,
+        ClaimedBinanceCommand, ClaimedBinanceOrder, KolSourceFill, MAX_ACCOUNT_QUEUE_DEPTH,
+        scaled_copy_quantity,
+    },
 };
-use venue_control_protocol::kol::{ExecutorCommandState, TerminalOrderKind};
+use venue_control_protocol::kol::ExecutorCommandState;
+
+pub const MIGRATION_0022: &str = include_str!("../migrations/0022_binance_reconcile_backoff.sql");
+
+const RECONCILE_BASE_DELAY_MS: u64 = 500;
+const RECONCILE_MAX_DELAY_MS: u64 = 8_000;
+const RECONCILE_MAX_ATTEMPTS: u32 = 31;
+
+/// Locks every non-deleted credential row for one trading account before a producer observes the
+/// shared command depth. Holding this row lock through the caller's insert and commit makes
+/// terminal, Copy and Grid admission one account-level critical section without adding a process
+/// lease or a second writer authority.
+pub(crate) async fn lock_account_command_queue(
+    connection: &mut PgConnection,
+    owner_user_id: &str,
+    trading_account_id: &str,
+    credential_id: &str,
+) -> Result<usize, BinanceCommandLedgerError> {
+    let credential_rows = sqlx::query(
+        "SELECT credential_id,user_id FROM venue_api_credentials \
+         WHERE trading_account_id=$1 AND deleted_ms IS NULL \
+         ORDER BY credential_id FOR UPDATE",
+    )
+    .bind(trading_account_id)
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+    let mut owns_active_credential = false;
+    for row in credential_rows {
+        let locked_credential_id: String = row
+            .try_get("credential_id")
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+        let locked_user_id: String = row
+            .try_get("user_id")
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+        owns_active_credential |=
+            locked_credential_id == credential_id && locked_user_id == owner_user_id;
+    }
+    if !owns_active_credential {
+        return Err(BinanceCommandLedgerError::Conflict);
+    }
+    let raw_depth: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM venue_binance_commands \
+         WHERE trading_account_id=$1 \
+         AND command_state IN ('pending','sending','accepted','reconcile_required')",
+    )
+    .bind(trading_account_id)
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+    usize::try_from(raw_depth).map_err(|_| BinanceCommandLedgerError::Conflict)
+}
+
+#[must_use]
+pub(crate) const fn account_queue_has_capacity(current: usize, additional: usize) -> bool {
+    current <= MAX_ACCOUNT_QUEUE_DEPTH
+        && additional <= MAX_ACCOUNT_QUEUE_DEPTH.saturating_sub(current)
+}
 
 #[derive(Clone)]
 pub struct PgExecutorStore {
@@ -51,6 +112,41 @@ pub struct ActiveKolPrivateSource {
     pub symbols: Vec<venue_domain::domain::Symbol>,
 }
 
+/// A nonterminal command together with its durable signed-readback schedule. Pending and Sending
+/// rows do not have a readback deadline; Accepted and ReconcileRequired rows always do after 0022.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoverableBinanceCommand {
+    pub command: ClaimedBinanceCommand,
+    pub grid_batch_id: Option<String>,
+    pub dispatch_sequence: Option<u16>,
+    pub reconcile_attempts: u32,
+    pub next_reconcile_ms: Option<u64>,
+}
+
+impl RecoverableBinanceCommand {
+    pub fn reconciliation_due(&self, now_ms: u64) -> Result<bool, BinanceCommandLedgerError> {
+        match self.command.state {
+            ExecutorCommandState::Sending => Ok(true),
+            ExecutorCommandState::Accepted | ExecutorCommandState::ReconcileRequired => self
+                .next_reconcile_ms
+                .map(|deadline| deadline <= now_ms)
+                .ok_or(BinanceCommandLedgerError::Conflict),
+            ExecutorCommandState::Pending => Ok(false),
+            ExecutorCommandState::Rejected
+            | ExecutorCommandState::Reconciled
+            | ExecutorCommandState::Cancelled => Err(BinanceCommandLedgerError::Conflict),
+        }
+    }
+}
+
+impl Deref for RecoverableBinanceCommand {
+    type Target = ClaimedBinanceCommand;
+
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
+}
+
 impl PgExecutorStore {
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
@@ -61,10 +157,9 @@ impl PgExecutorStore {
     /// fresh; ambiguity is fail-closed before any decryption or listenKey request.
     pub async fn active_kol_private_sources(
         &self,
-        now_ms: u64,
+        _now_ms: u64,
     ) -> Result<Vec<ActiveKolPrivateSource>, BinanceCommandLedgerError> {
-        let rows = sqlx::query("SELECT p.kol_user_id,p.leader_trading_account_id,ARRAY_AGG(DISTINCT symbols.value ORDER BY symbols.value) AS symbols,(SELECT c.credential_id FROM venue_api_credentials c WHERE c.user_id=p.kol_user_id AND c.trading_account_id=p.leader_trading_account_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' AND COALESCE((c.verification_json->>'expires_ms')::bigint,0)>$1 ORDER BY c.created_ms,c.credential_id LIMIT 1) AS credential_id,(SELECT count(*) FROM venue_api_credentials c WHERE c.user_id=p.kol_user_id AND c.trading_account_id=p.leader_trading_account_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' AND COALESCE((c.verification_json->>'expires_ms')::bigint,0)>$1) AS credential_count FROM venue_kol_profiles p JOIN venue_kol_follow_relations r ON r.kol_user_id=p.kol_user_id AND r.leader_trading_account_id=p.leader_trading_account_id AND r.relation_state='active' CROSS JOIN LATERAL jsonb_array_elements_text(r.allowed_symbols) AS symbols(value) WHERE p.profile_state='enabled' GROUP BY p.kol_user_id,p.leader_trading_account_id ORDER BY p.kol_user_id")
-            .bind(ms(now_ms)?)
+        let rows = sqlx::query("SELECT p.kol_user_id,p.leader_trading_account_id,ARRAY_AGG(DISTINCT symbols.value ORDER BY symbols.value) AS symbols,(SELECT c.credential_id FROM venue_api_credentials c WHERE c.user_id=p.kol_user_id AND c.trading_account_id=p.leader_trading_account_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' ORDER BY c.created_ms,c.credential_id LIMIT 1) AS credential_id,(SELECT count(*) FROM venue_api_credentials c WHERE c.user_id=p.kol_user_id AND c.trading_account_id=p.leader_trading_account_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified') AS credential_count FROM venue_kol_profiles p JOIN venue_kol_follow_relations r ON r.kol_user_id=p.kol_user_id AND r.leader_trading_account_id=p.leader_trading_account_id AND r.relation_state='active' CROSS JOIN LATERAL jsonb_array_elements_text(r.allowed_symbols) AS symbols(value) WHERE p.profile_state='enabled' GROUP BY p.kol_user_id,p.leader_trading_account_id ORDER BY p.kol_user_id")
             .fetch_all(&self.pool)
             .await
             .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
@@ -216,6 +311,16 @@ impl PgExecutorStore {
             if blocked || target == observed {
                 continue;
             }
+            let account_queue_depth = lock_account_command_queue(
+                &mut *tx,
+                &owner_user_id,
+                &trading_account_id,
+                &credential_id,
+            )
+            .await?;
+            if !account_queue_has_capacity(account_queue_depth, 1) {
+                continue;
+            }
             let opening = target > observed;
             let command_phase = if opening { "open" } else { "close" };
             let order_side = order_for(fill.position_side, opening);
@@ -253,14 +358,15 @@ impl PgExecutorStore {
         Ok(planned)
     }
 
-    /// Restart recovery only returns identities to read back. It deliberately does not make a
-    /// Sending or ReconcileRequired command eligible for another POST.
+    /// Restart recovery returns the immutable identity and durable readback schedule. It
+    /// deliberately does not make a Sending or ReconcileRequired command eligible for another
+    /// POST.
     pub async fn recover_nonterminal(
         &self,
-    ) -> Result<Vec<ClaimedBinanceCommand>, BinanceCommandLedgerError> {
-        let rows = sqlx::query("SELECT command_id,owner_user_id,trading_account_id,credential_id,symbol,order_side,position_side,requested_quantity,command_phase,order_kind,limit_price,client_order_id,command_state FROM venue_binance_commands WHERE command_state IN ('pending','sending','accepted','reconcile_required') ORDER BY created_ms,command_id")
+    ) -> Result<Vec<RecoverableBinanceCommand>, BinanceCommandLedgerError> {
+        let rows = sqlx::query("SELECT command_id,owner_user_id,trading_account_id,credential_id,symbol,order_side,position_side,requested_quantity,command_phase,order_kind,limit_price,selected_native_order_id,target_client_order_id,client_order_id,native_order_id,command_state,reconcile_attempts,next_reconcile_ms,grid_batch_id,dispatch_sequence FROM venue_binance_commands WHERE command_state IN ('pending','sending','accepted','reconcile_required') ORDER BY created_ms,COALESCE(grid_batch_id,command_id),COALESCE(dispatch_sequence,0),command_id")
             .fetch_all(&self.pool).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-        rows.into_iter().map(recovery_row).collect()
+        rows.into_iter().map(recoverable_command).collect()
     }
 
     /// Atomically changes one committed Pending command to Sending. The underlying PostgreSQL
@@ -275,6 +381,96 @@ impl PgExecutorStore {
             .await
     }
 
+    /// Claims one non-Grid command or one durable Grid batch suffix. The ledger commits every
+    /// returned child as `Sending` before the caller can enter the exchange mutation boundary.
+    pub async fn claim_next_command_batch(
+        &self,
+        trading_account_id: &str,
+        now_ms: u64,
+    ) -> Result<Option<ClaimedBinanceBatch>, BinanceCommandLedgerError> {
+        BinanceCommandLedger::new(self.pool.clone())
+            .claim_next_batch(trading_account_id, now_ms)
+            .await
+    }
+
+    /// Returns only the short projection-lag window left by earlier completed maker closes.
+    /// Pending work is intentionally excluded: account serialization already fences in-flight
+    /// mutation, and future commands must not reserve quantity merely because they are queued.
+    pub async fn reconciled_close_reservations(
+        &self,
+        command: &ClaimedBinanceCommand,
+    ) -> Result<Vec<ReconciledCloseReservation>, BinanceCommandLedgerError> {
+        if command.state != ExecutorCommandState::Sending {
+            return Err(BinanceCommandLedgerError::Conflict);
+        }
+        let (side, target_position_side, reducing) = match &command.order {
+            ClaimedBinanceOrder::Market {
+                side,
+                position_side,
+                reducing,
+                ..
+            }
+            | ClaimedBinanceOrder::LimitPostOnly {
+                side,
+                position_side,
+                reducing,
+                ..
+            } => (*side, *position_side, *reducing),
+            ClaimedBinanceOrder::CancelExact { .. } => return Ok(Vec::new()),
+        };
+        if !reducing {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT prior.client_order_id,prior.requested_quantity,prior.updated_ms,\
+             projection.observed_ms \
+             FROM venue_binance_commands prior \
+             JOIN venue_binance_account_projections projection \
+               ON projection.credential_id=$2 AND projection.owner_user_id=$3 \
+              AND projection.trading_account_id=$4 \
+             WHERE prior.command_id<>$1 AND prior.credential_id=$2 \
+               AND prior.owner_user_id=$3 AND prior.trading_account_id=$4 \
+               AND prior.symbol=$5 AND prior.command_phase='close' \
+               AND prior.order_kind='limit_post_only' AND prior.order_side=$6 \
+               AND prior.position_side=$7 AND prior.command_state='reconciled' \
+               AND prior.updated_ms>projection.observed_ms \
+             ORDER BY prior.updated_ms,prior.command_id",
+        )
+        .bind(&command.command_id)
+        .bind(&command.credential_id)
+        .bind(&command.owner_user_id)
+        .bind(&command.trading_account_id)
+        .bind(command.symbol.to_string())
+        .bind(order_side(side))
+        .bind(position_side(target_position_side))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+        rows.into_iter()
+            .map(|row| {
+                let quantity = decimal(&row, "requested_quantity")?;
+                let reconciled_ms = unsigned_ms(&row, "updated_ms")?;
+                let projection_observed_ms = unsigned_ms(&row, "observed_ms")?;
+                if quantity <= Decimal::ZERO || reconciled_ms <= projection_observed_ms {
+                    return Err(BinanceCommandLedgerError::Conflict);
+                }
+                Ok(ReconciledCloseReservation {
+                    credential_id: command.credential_id.clone(),
+                    trading_account_id: command.trading_account_id.clone(),
+                    symbol: command.symbol.clone(),
+                    client_order_id: row
+                        .try_get("client_order_id")
+                        .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
+                    side,
+                    position_side: target_position_side,
+                    quantity,
+                    reconciled_ms,
+                    projection_observed_ms,
+                })
+            })
+            .collect()
+    }
+
     /// Exposes only the command ledger's forward-only transition table. In particular, callers
     /// cannot turn Sending back into Pending after a timeout.
     pub async fn transition_command(
@@ -287,6 +483,85 @@ impl PgExecutorStore {
         BinanceCommandLedger::new(self.pool.clone())
             .settle(command_id, next, now_ms, sanitized_error_code)
             .await
+    }
+
+    /// Atomically binds exact signed-readback identity to a forward-only ledger transition.
+    pub async fn transition_command_with_readback(
+        &self,
+        command_id: &str,
+        next: ExecutorCommandState,
+        now_ms: u64,
+        sanitized_error_code: Option<&str>,
+        native_order_id: Option<&str>,
+    ) -> Result<(), BinanceCommandLedgerError> {
+        BinanceCommandLedger::new(self.pool.clone())
+            .settle_with_readback(
+                command_id,
+                next,
+                now_ms,
+                sanitized_error_code,
+                native_order_id,
+            )
+            .await
+    }
+
+    /// Records one failed or still-pending signed readback without releasing the account fence.
+    /// The predicate includes the durable attempt so concurrent workers cannot shorten or skip a
+    /// deadline. This never returns a command to Pending and therefore cannot authorize a POST.
+    pub async fn defer_reconciliation(
+        &self,
+        command: &RecoverableBinanceCommand,
+        next_state: ExecutorCommandState,
+        now_ms: u64,
+        sanitized_error_code: Option<&str>,
+        native_order_id: Option<&str>,
+    ) -> Result<(), BinanceCommandLedgerError> {
+        let current_state = command.command.state;
+        if !matches!(
+            current_state,
+            ExecutorCommandState::Accepted | ExecutorCommandState::ReconcileRequired
+        ) || !matches!(
+            next_state,
+            ExecutorCommandState::Accepted | ExecutorCommandState::ReconcileRequired
+        ) || (current_state == ExecutorCommandState::ReconcileRequired
+            && next_state != ExecutorCommandState::ReconcileRequired)
+            || sanitized_error_code.is_some_and(|value| value.is_empty() || value.len() > 64)
+            || invalid_native_order_id(native_order_id)
+        {
+            return Err(BinanceCommandLedgerError::Conflict);
+        }
+        let next_attempt = command
+            .reconcile_attempts
+            .saturating_add(1)
+            .min(RECONCILE_MAX_ATTEMPTS);
+        let deadline = now_ms
+            .checked_add(reconcile_delay_ms(next_attempt))
+            .ok_or(BinanceCommandLedgerError::Conflict)?;
+        let changed = sqlx::query(
+            "UPDATE venue_binance_commands SET command_state=$1,reconcile_attempts=$2,\
+             next_reconcile_ms=$3,sanitized_error_code=$4,\
+             native_order_id=COALESCE(native_order_id,$5),updated_ms=$6 \
+             WHERE command_id=$7 AND command_state=$8 AND reconcile_attempts=$9 \
+             AND ($5::text IS NULL OR native_order_id IS NULL OR native_order_id=$5)",
+        )
+        .bind(state_name(next_state))
+        .bind(i32::try_from(next_attempt).map_err(|_| BinanceCommandLedgerError::Conflict)?)
+        .bind(ms(deadline)?)
+        .bind(sanitized_error_code)
+        .bind(native_order_id)
+        .bind(ms(now_ms)?)
+        .bind(&command.command.command_id)
+        .bind(state_name(current_state))
+        .bind(
+            i32::try_from(command.reconcile_attempts)
+                .map_err(|_| BinanceCommandLedgerError::Conflict)?,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+        (changed.rows_affected() == 1)
+            .then_some(())
+            .ok_or(BinanceCommandLedgerError::Conflict)
     }
 
     /// A successful, independently signed baseline is the only path that promotes a requested
@@ -324,10 +599,9 @@ impl PgExecutorStore {
     /// credentials deliberately do not enter the executor's decryption boundary.
     pub async fn pending_activations(
         &self,
-        now_ms: u64,
+        _now_ms: u64,
     ) -> Result<Vec<PendingActivation>, BinanceCommandLedgerError> {
-        let rows = sqlx::query("SELECT a.relation_id,a.relation_revision,r.kol_user_id,r.leader_trading_account_id,r.follower_user_id,r.follower_trading_account_id,r.credential_id AS follower_credential_id,r.allowed_symbols,(SELECT c.credential_id FROM venue_api_credentials c WHERE c.user_id=r.kol_user_id AND c.trading_account_id=r.leader_trading_account_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' AND COALESCE((c.verification_json->>'expires_ms')::bigint,0)>$1 ORDER BY c.created_ms,c.credential_id LIMIT 1) AS leader_credential_id,(SELECT count(*) FROM venue_api_credentials c WHERE c.user_id=r.kol_user_id AND c.trading_account_id=r.leader_trading_account_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' AND COALESCE((c.verification_json->>'expires_ms')::bigint,0)>$1) AS leader_credential_count FROM venue_kol_activation_requests a JOIN venue_kol_follow_relations r ON r.relation_id=a.relation_id WHERE a.request_state='pending' AND r.relation_state='paused' ORDER BY a.requested_ms,a.relation_id")
-            .bind(ms(now_ms)?)
+        let rows = sqlx::query("SELECT a.relation_id,a.relation_revision,r.kol_user_id,r.leader_trading_account_id,r.follower_user_id,r.follower_trading_account_id,r.credential_id AS follower_credential_id,r.allowed_symbols,(SELECT c.credential_id FROM venue_api_credentials c WHERE c.user_id=r.kol_user_id AND c.trading_account_id=r.leader_trading_account_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' ORDER BY c.created_ms,c.credential_id LIMIT 1) AS leader_credential_id,(SELECT count(*) FROM venue_api_credentials c WHERE c.user_id=r.kol_user_id AND c.trading_account_id=r.leader_trading_account_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified') AS leader_credential_count FROM venue_kol_activation_requests a JOIN venue_kol_follow_relations r ON r.relation_id=a.relation_id WHERE a.request_state='pending' AND r.relation_state='paused' ORDER BY a.requested_ms,a.relation_id")
             .fetch_all(&self.pool).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
         let mut pending = Vec::with_capacity(rows.len());
         for row in rows {
@@ -405,104 +679,89 @@ impl PgExecutorStore {
     }
 }
 
-fn recovery_row(
+fn recoverable_command(
     row: sqlx::postgres::PgRow,
-) -> Result<ClaimedBinanceCommand, BinanceCommandLedgerError> {
-    let state = match row
-        .try_get::<String, _>("command_state")
+) -> Result<RecoverableBinanceCommand, BinanceCommandLedgerError> {
+    let grid_batch_id = row
+        .try_get::<Option<String>, _>("grid_batch_id")
+        .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+    let dispatch_sequence = row
+        .try_get::<Option<i64>, _>("dispatch_sequence")
         .map_err(|_| BinanceCommandLedgerError::Unavailable)?
-        .as_str()
-    {
-        "pending" => venue_control_protocol::kol::ExecutorCommandState::Pending,
-        "sending" => venue_control_protocol::kol::ExecutorCommandState::Sending,
-        "accepted" => venue_control_protocol::kol::ExecutorCommandState::Accepted,
-        "reconcile_required" => {
-            venue_control_protocol::kol::ExecutorCommandState::ReconcileRequired
+        .map(|value| u16::try_from(value).map_err(|_| BinanceCommandLedgerError::Conflict))
+        .transpose()?;
+    match (&grid_batch_id, dispatch_sequence) {
+        (None, None) => {}
+        (Some(batch_id), Some(sequence))
+            if !batch_id.trim().is_empty()
+                && batch_id.len() <= 64
+                && (1..=16).contains(&sequence) => {}
+        _ => return Err(BinanceCommandLedgerError::Conflict),
+    }
+    let raw_attempts: i32 = row
+        .try_get("reconcile_attempts")
+        .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+    let reconcile_attempts = u32::try_from(raw_attempts)
+        .ok()
+        .filter(|value| *value <= RECONCILE_MAX_ATTEMPTS)
+        .ok_or(BinanceCommandLedgerError::Conflict)?;
+    let next_reconcile_ms = row
+        .try_get::<Option<i64>, _>("next_reconcile_ms")
+        .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+        .map(|value| u64::try_from(value).map_err(|_| BinanceCommandLedgerError::Conflict))
+        .transpose()?;
+    let command = crate::kol_executor::claimed(row)?;
+    let schedule_valid = match command.state {
+        ExecutorCommandState::Accepted | ExecutorCommandState::ReconcileRequired => {
+            next_reconcile_ms.is_some_and(|value| value > 0)
         }
-        _ => return Err(BinanceCommandLedgerError::Unavailable),
+        ExecutorCommandState::Pending | ExecutorCommandState::Sending => {
+            reconcile_attempts == 0 && next_reconcile_ms.is_none()
+        }
+        ExecutorCommandState::Rejected
+        | ExecutorCommandState::Reconciled
+        | ExecutorCommandState::Cancelled => false,
     };
-    Ok(ClaimedBinanceCommand {
-        command_id: row
-            .try_get("command_id")
-            .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
-        owner_user_id: row
-            .try_get("owner_user_id")
-            .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
-        trading_account_id: row
-            .try_get("trading_account_id")
-            .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
-        credential_id: row
-            .try_get("credential_id")
-            .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
-        symbol: row
-            .try_get::<String, _>("symbol")
-            .map_err(|_| BinanceCommandLedgerError::Unavailable)?
-            .parse()
-            .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
-        side: match row
-            .try_get::<String, _>("order_side")
-            .map_err(|_| BinanceCommandLedgerError::Unavailable)?
-            .as_str()
-        {
-            "buy" => venue_domain::domain::OrderSide::Buy,
-            "sell" => venue_domain::domain::OrderSide::Sell,
-            _ => return Err(BinanceCommandLedgerError::Unavailable),
-        },
-        position_side: match row
-            .try_get::<String, _>("position_side")
-            .map_err(|_| BinanceCommandLedgerError::Unavailable)?
-            .as_str()
-        {
-            "long" => venue_domain::domain::PositionSide::Long,
-            "short" => venue_domain::domain::PositionSide::Short,
-            _ => return Err(BinanceCommandLedgerError::Unavailable),
-        },
-        quantity: row
-            .try_get::<String, _>("requested_quantity")
-            .map_err(|_| BinanceCommandLedgerError::Unavailable)?
-            .parse()
-            .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
-        order_kind: terminal_order_kind(&row)?,
-        limit_price: optional_decimal(&row, "limit_price")?,
-        reducing: matches!(
-            row.try_get::<String, _>("command_phase")
-                .map_err(|_| BinanceCommandLedgerError::Unavailable)?
-                .as_str(),
-            "close"
-        ),
-        client_order_id: row
-            .try_get("client_order_id")
-            .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
-        state,
+    if !schedule_valid {
+        return Err(BinanceCommandLedgerError::Conflict);
+    }
+    Ok(RecoverableBinanceCommand {
+        command,
+        grid_batch_id,
+        dispatch_sequence,
+        reconcile_attempts,
+        next_reconcile_ms,
     })
 }
-fn terminal_order_kind(
-    row: &sqlx::postgres::PgRow,
-) -> Result<TerminalOrderKind, BinanceCommandLedgerError> {
-    match row
-        .try_get::<String, _>("order_kind")
-        .map_err(|_| BinanceCommandLedgerError::Unavailable)?
-        .as_str()
-    {
-        "market" => Ok(TerminalOrderKind::Market),
-        "limit_post_only" => Ok(TerminalOrderKind::LimitPostOnly),
-        _ => Err(BinanceCommandLedgerError::Unavailable),
+
+const fn reconcile_delay_ms(attempt: u32) -> u64 {
+    let shift = if attempt > 4 { 4 } else { attempt };
+    let delay = RECONCILE_BASE_DELAY_MS << shift;
+    if delay > RECONCILE_MAX_DELAY_MS {
+        RECONCILE_MAX_DELAY_MS
+    } else {
+        delay
     }
 }
 
-fn optional_decimal(
-    row: &sqlx::postgres::PgRow,
-    field: &str,
-) -> Result<Option<Decimal>, BinanceCommandLedgerError> {
-    row.try_get::<Option<String>, _>(field)
-        .map_err(|_| BinanceCommandLedgerError::Unavailable)?
-        .map(|value| {
-            value
-                .parse()
-                .map_err(|_| BinanceCommandLedgerError::Unavailable)
-        })
-        .transpose()
+fn invalid_native_order_id(native_order_id: Option<&str>) -> bool {
+    native_order_id.is_some_and(|value| {
+        value.trim().is_empty() || value.len() > 128 || value.chars().any(char::is_whitespace)
+    })
 }
+
+const fn state_name(state: ExecutorCommandState) -> &'static str {
+    match state {
+        ExecutorCommandState::Pending => "pending",
+        ExecutorCommandState::Sending => "sending",
+        ExecutorCommandState::Accepted => "accepted",
+        ExecutorCommandState::Rejected => "rejected",
+        ExecutorCommandState::ReconcileRequired => "reconcile_required",
+        ExecutorCommandState::Reconciled => "reconciled",
+        ExecutorCommandState::Cancelled => "cancelled",
+    }
+}
+
 fn ms(value: u64) -> Result<i64, BinanceCommandLedgerError> {
     i64::try_from(value).map_err(|_| BinanceCommandLedgerError::Conflict)
 }
@@ -523,6 +782,14 @@ fn position_side(side: venue_domain::domain::PositionSide) -> &'static str {
 fn decimal(row: &sqlx::postgres::PgRow, field: &str) -> Result<Decimal, BinanceCommandLedgerError> {
     Decimal::from_str(
         &row.try_get::<String, _>(field)
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
+    )
+    .map_err(|_| BinanceCommandLedgerError::Conflict)
+}
+
+fn unsigned_ms(row: &sqlx::postgres::PgRow, field: &str) -> Result<u64, BinanceCommandLedgerError> {
+    u64::try_from(
+        row.try_get::<i64, _>(field)
             .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
     )
     .map_err(|_| BinanceCommandLedgerError::Conflict)
@@ -561,4 +828,85 @@ fn deterministic_id(
         .map(|value| format!("{value:02x}"))
         .collect::<String>();
     format!("k{}", &encoded[..35])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maker_close_reservation_is_bounded_by_the_signed_projection() {
+        let source = include_str!("executor_store.rs");
+        assert!(source.contains("prior.order_kind='limit_post_only'"));
+        assert!(source.contains("prior.command_state='reconciled'"));
+        assert!(source.contains("prior.updated_ms>projection.observed_ms"));
+        assert!(source.contains("projection.credential_id=$2"));
+        assert!(!source.contains(concat!(
+            "prior.command_state IN ('pending'",
+            ",'sending','accepted','reconcile_required','reconciled')"
+        )));
+    }
+
+    #[test]
+    fn reconciliation_backoff_is_deterministic_and_capped() {
+        assert_eq!(reconcile_delay_ms(0), 500);
+        assert_eq!(reconcile_delay_ms(1), 1_000);
+        assert_eq!(reconcile_delay_ms(2), 2_000);
+        assert_eq!(reconcile_delay_ms(3), 4_000);
+        assert_eq!(reconcile_delay_ms(4), 8_000);
+        assert_eq!(reconcile_delay_ms(31), 8_000);
+    }
+
+    #[test]
+    fn account_queue_capacity_includes_every_new_command_in_the_same_transaction() {
+        assert!(account_queue_has_capacity(0, MAX_ACCOUNT_QUEUE_DEPTH));
+        assert!(account_queue_has_capacity(MAX_ACCOUNT_QUEUE_DEPTH - 1, 1));
+        assert!(account_queue_has_capacity(MAX_ACCOUNT_QUEUE_DEPTH, 0));
+        assert!(!account_queue_has_capacity(MAX_ACCOUNT_QUEUE_DEPTH, 1));
+        assert!(!account_queue_has_capacity(MAX_ACCOUNT_QUEUE_DEPTH + 1, 0));
+        assert!(!account_queue_has_capacity(15, 2));
+    }
+
+    #[test]
+    fn unresolved_command_is_not_due_before_its_durable_deadline()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let command = RecoverableBinanceCommand {
+            command: ClaimedBinanceCommand {
+                command_id: "command".into(),
+                owner_user_id: "owner".into(),
+                trading_account_id: "account".into(),
+                credential_id: "credential".into(),
+                symbol: "BTC/USDT".parse()?,
+                order: ClaimedBinanceOrder::Market {
+                    side: venue_domain::domain::OrderSide::Buy,
+                    position_side: venue_domain::domain::PositionSide::Long,
+                    quantity: Decimal::new(1, 3),
+                    reducing: false,
+                },
+                client_order_id: "client".into(),
+                native_order_id: None,
+                state: ExecutorCommandState::ReconcileRequired,
+            },
+            grid_batch_id: None,
+            dispatch_sequence: None,
+            reconcile_attempts: 2,
+            next_reconcile_ms: Some(2_000),
+        };
+        assert!(!command.reconciliation_due(1_999)?);
+        assert!(command.reconciliation_due(2_000)?);
+        Ok(())
+    }
+
+    #[test]
+    fn migration_backfills_and_constrains_the_durable_schedule() {
+        for required in [
+            "reconcile_attempts",
+            "next_reconcile_ms",
+            "venue_binance_command_reconcile_schedule_trigger",
+            "BETWEEN 0 AND 31",
+            "clock_timestamp()",
+        ] {
+            assert!(MIGRATION_0022.contains(required), "missing {required}");
+        }
+    }
 }

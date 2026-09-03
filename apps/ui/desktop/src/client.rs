@@ -1,13 +1,16 @@
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 mod execution;
+mod grid;
+mod terminal;
 use eframe::egui;
+pub(crate) use grid::GridMutation;
 use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex},
 };
 use venue_control_protocol::accounts::SecretValue;
 use venue_control_protocol::kol::{
-    ExecutorCommandSummary, TerminalAccountProjection, TerminalOrderRequest,
+    ExecutorCommandSummary, TerminalAccountProjection, TerminalCancelRequest, TerminalOrderRequest,
     TerminalProjectionRequest,
 };
 use venue_control_protocol::{
@@ -30,6 +33,10 @@ pub enum ClientEvent {
     TerminalAccountProjection(Option<TerminalAccountProjection>),
     TerminalExecutions(Vec<ExecutorCommandSummary>),
     TerminalAccountUnavailable(String),
+    GridInstances(Vec<venue_control_protocol::grid::GridInstanceSummary>),
+    GridMutationApplied(Box<venue_control_protocol::grid::GridInstanceSummary>),
+    GridUnavailable(String),
+    GridMutationUnavailable(String),
     SessionExpired,
     SnapshotConnected,
     SnapshotUnavailable(String),
@@ -48,8 +55,10 @@ pub struct ControlClient {
     events: Receiver<ClientEvent>,
     command_tx: Sender<ControlCommandRequest>,
     terminal_order_tx: Sender<TerminalOrderRequest>,
+    terminal_cancel_tx: Sender<TerminalCancelRequest>,
     terminal_projection_tx: Sender<TerminalProjectionRequest>,
     copy_relation_tx: Sender<CopyRelationUpsertRequest>,
+    grid_mutation_tx: Sender<GridMutation>,
     stream_gates: StreamGates,
     #[cfg(not(target_arch = "wasm32"))]
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -70,8 +79,10 @@ impl ControlClient {
         let (event_tx, events) = unbounded();
         let (command_tx, command_rx) = unbounded();
         let (terminal_order_tx, terminal_order_rx) = unbounded();
+        let (terminal_cancel_tx, terminal_cancel_rx) = unbounded();
         let (terminal_projection_tx, terminal_projection_rx) = bounded(1);
         let (copy_relation_tx, copy_relation_rx) = unbounded();
+        let (grid_mutation_tx, grid_mutation_rx) = unbounded();
         let stream_gates = StreamGates::default();
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -82,8 +93,10 @@ impl ControlClient {
                 event_tx,
                 command_rx,
                 terminal_order_rx,
+                terminal_cancel_rx,
                 terminal_projection_rx,
                 copy_relation_rx,
+                grid_mutation_rx,
                 context,
                 stop.clone(),
                 stream_gates.clone(),
@@ -98,6 +111,7 @@ impl ControlClient {
             event_tx,
             command_rx,
             copy_relation_rx,
+            grid_mutation_rx,
             context,
             stream_gates.clone(),
             token,
@@ -107,8 +121,10 @@ impl ControlClient {
             events,
             command_tx,
             terminal_order_tx,
+            terminal_cancel_tx,
             terminal_projection_tx,
             copy_relation_tx,
+            grid_mutation_tx,
             stream_gates,
             #[cfg(not(target_arch = "wasm32"))]
             stop,
@@ -140,6 +156,15 @@ impl ControlClient {
             .map_err(|_| ClientError::Closed)
     }
 
+    pub fn send_terminal_cancel(&self, request: TerminalCancelRequest) -> Result<(), ClientError> {
+        request
+            .validate()
+            .map_err(|_| ClientError::TerminalProtocol)?;
+        self.terminal_cancel_tx
+            .send(request)
+            .map_err(|_| ClientError::Closed)
+    }
+
     pub fn subscribe_terminal(&self, request: TerminalProjectionRequest) {
         if request.validate().is_ok() {
             let _ = self.terminal_projection_tx.try_send(request);
@@ -164,6 +189,15 @@ impl ControlClient {
             .send(request)
             .map_err(|_| ClientError::Closed)
     }
+
+    pub(crate) fn send_grid(&self, mutation: GridMutation) -> Result<(), ClientError> {
+        if !mutation.validate() {
+            return Err(ClientError::GridProtocol);
+        }
+        self.grid_mutation_tx
+            .send(mutation)
+            .map_err(|_| ClientError::Closed)
+    }
 }
 
 impl Drop for ControlClient {
@@ -179,6 +213,8 @@ pub enum ClientError {
     Protocol(venue_control_protocol::ProtocolError),
     #[error("terminal request does not satisfy the protocol")]
     TerminalProtocol,
+    #[error("grid request does not satisfy the protocol")]
+    GridProtocol,
     #[error("control client is closed")]
     Closed,
     #[error("the scoped event stream is not currently healthy; writes are closed")]
@@ -300,8 +336,10 @@ fn start_native(
     sender: Sender<ClientEvent>,
     commands: Receiver<ControlCommandRequest>,
     terminal_orders: Receiver<TerminalOrderRequest>,
+    terminal_cancellations: Receiver<TerminalCancelRequest>,
     terminal_projection: Receiver<TerminalProjectionRequest>,
     copy_relations: Receiver<CopyRelationUpsertRequest>,
+    grid_mutations: Receiver<GridMutation>,
     context: egui::Context,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     stream_gates: StreamGates,
@@ -332,8 +370,10 @@ fn start_native(
                 sender,
                 commands,
                 terminal_orders,
+                terminal_cancellations,
                 terminal_projection,
                 copy_relations,
+                grid_mutations,
                 context,
                 stop,
                 stream_gates,
@@ -355,8 +395,10 @@ async fn native_loop(
     sender: Sender<ClientEvent>,
     commands: Receiver<ControlCommandRequest>,
     terminal_orders: Receiver<TerminalOrderRequest>,
+    terminal_cancellations: Receiver<TerminalCancelRequest>,
     terminal_projection: Receiver<TerminalProjectionRequest>,
     copy_relations: Receiver<CopyRelationUpsertRequest>,
+    grid_mutations: Receiver<GridMutation>,
     context: egui::Context,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     stream_gates: StreamGates,
@@ -396,6 +438,23 @@ async fn native_loop(
             stop.clone(),
             terminal_projection,
         );
+        terminal::start_native(
+            client.clone(),
+            endpoint.clone(),
+            sender.clone(),
+            context.clone(),
+            stop.clone(),
+            terminal_orders,
+            terminal_cancellations,
+        );
+        grid::start_native(
+            client.clone(),
+            endpoint.clone(),
+            sender.clone(),
+            context.clone(),
+            stop.clone(),
+            grid_mutations,
+        );
     }
     let (scope_tx, scope_rx) = tokio::sync::mpsc::unbounded_channel();
     if let Some(scopes) =
@@ -422,58 +481,6 @@ async fn native_loop(
 
     let mut next_snapshot = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
     while !stop.load(std::sync::atomic::Ordering::Acquire) {
-        for request in terminal_orders.try_iter().take(32) {
-            let response = client
-                .post(path(
-                    &endpoint,
-                    venue_control_protocol::kol::KOL_TERMINAL_ORDER_PATH,
-                ))
-                .json(&request)
-                .timeout(REQUEST_TIMEOUT)
-                .send()
-                .await;
-            match response {
-                Ok(response) if response.status().is_success() => {
-                    match response.json::<ExecutorCommandSummary>().await {
-                        Ok(summary)
-                            if summary.validate().is_ok()
-                                && summary.request_id.as_deref()
-                                    == Some(request.request_id.as_str()) =>
-                        {
-                            publish(
-                                &sender,
-                                &context,
-                                ClientEvent::TerminalExecutions(vec![summary]),
-                            );
-                        }
-                        _ => publish(
-                            &sender,
-                            &context,
-                            ClientEvent::CommandUnavailable(
-                                "invalid terminal command receipt".to_owned(),
-                            ),
-                        ),
-                    }
-                }
-                Ok(response) if response.status().as_u16() == 401 => {
-                    publish(&sender, &context, ClientEvent::SessionExpired);
-                    return;
-                }
-                Ok(response) => publish(
-                    &sender,
-                    &context,
-                    ClientEvent::CommandUnavailable(format!(
-                        "terminal command returned HTTP {}",
-                        response.status()
-                    )),
-                ),
-                Err(error) => publish(
-                    &sender,
-                    &context,
-                    ClientEvent::CommandUnavailable(format!("terminal command failed: {error}")),
-                ),
-            }
-        }
         for command in commands.try_iter().take(64) {
             let response = client
                 .post(path(&endpoint, COMMAND_PATH))
@@ -1081,6 +1088,7 @@ impl WebClient {
         sender: Sender<ClientEvent>,
         commands: Receiver<ControlCommandRequest>,
         copy_relations: Receiver<CopyRelationUpsertRequest>,
+        grid_mutations: Receiver<GridMutation>,
         context: egui::Context,
         stream_gates: StreamGates,
         token: Option<SecretValue>,
@@ -1090,13 +1098,21 @@ impl WebClient {
             publish(&sender, &context, ClientEvent::SessionExpired);
             return Self { stop };
         }
-        if let Some(token) = token.clone() {
+        if let Some(auth_token) = token.clone() {
             execution::start_web(
                 endpoint.clone(),
                 sender.clone(),
                 context.clone(),
                 stop.clone(),
-                token,
+                auth_token.clone(),
+            );
+            grid::start_web(
+                endpoint.clone(),
+                sender.clone(),
+                context.clone(),
+                stop.clone(),
+                auth_token,
+                grid_mutations,
             );
         }
         let (scope_tx, scope_rx) = unbounded();

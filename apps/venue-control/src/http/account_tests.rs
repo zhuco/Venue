@@ -7,7 +7,14 @@ use crate::{
     },
 };
 use venue_control_protocol::{
-    CommandReceipt, CommandState, ControlAction, ControlSnapshot, accounts::*,
+    CommandReceipt, CommandState, ControlAction, ControlSnapshot,
+    accounts::*,
+    grid::{
+        GRID_INSTANCES_PATH, GRID_LIFECYCLE_PATH, GRID_SCHEMA_VERSION, GridConfig,
+        GridConfigUpdateRequest, GridInstanceCreateRequest, GridInstanceState, GridInstanceSummary,
+        GridInventoryReplenishment, GridLifecycleAction, GridLifecycleRequest, GridProfitReduction,
+        GridResetPolicy,
+    },
 };
 
 const INVITE_CODE: &str = "Safe_Kol_Invite_Code_00001";
@@ -122,6 +129,34 @@ fn binding() -> BindCredentialRequest {
         label: "Primary account".into(),
         api_key: SecretValue::new("A".repeat(32)),
         api_secret: SecretValue::new("S".repeat(32)),
+    }
+}
+
+fn grid_config(order_notional: i64) -> GridConfig {
+    GridConfig {
+        order_notional: rust_decimal::Decimal::new(order_notional, 0),
+        spacing_rate: rust_decimal::Decimal::new(2, 3),
+        grid_levels: 10,
+        max_total_notional: rust_decimal::Decimal::new(1_000, 0),
+        inventory_replenishment: GridInventoryReplenishment {
+            enabled: false,
+            minimum_inventory_notional: rust_decimal::Decimal::new(10, 0),
+            target_inventory_notional: rust_decimal::Decimal::new(20, 0),
+            max_single_replenishment_notional: rust_decimal::Decimal::new(10, 0),
+        },
+        profit_reduction: GridProfitReduction {
+            enabled: false,
+            inventory_equity_multiple: rust_decimal::Decimal::new(3, 0),
+            minimum_unrealized_profit_rate: rust_decimal::Decimal::new(5, 2),
+            reduction_fraction: rust_decimal::Decimal::new(3, 1),
+            max_single_reduce_notional: rust_decimal::Decimal::new(100, 0),
+        },
+        reset_policy: GridResetPolicy {
+            stale_market_ms: 5_000,
+            stale_private_ms: 15_000,
+            convergence_timeout_ms: 30_000,
+            max_consecutive_failures: 3,
+        },
     }
 }
 
@@ -262,6 +297,239 @@ async fn postgres_http_account_lifecycle_requires_session_json_and_ownership() -
     assert_eq!(restored.user.user_id, alice.user.user_id);
     assert_ne!(restored.token.expose(), alice.token.expose());
     s.stop().await?;
+    f.cleanup().await
+}
+
+#[tokio::test]
+async fn postgres_http_grid_is_user_scoped_and_running_config_is_revisioned() -> TestResult {
+    let Some(f) = Fixture::create().await? else {
+        return Ok(());
+    };
+    let alice = f.service.register(login("grid-alice"), now()).await?;
+    let bob = f.service.register(login("grid-bob"), now()).await?;
+    let principal = f.service.authenticate(alice.token.expose(), now()).await?;
+    let mut credential = f
+        .service
+        .bind_credential(&principal, binding(), now())
+        .await?;
+    let account_id = "00000000-0000-4000-8000-000000000801";
+    sqlx::query(
+        "INSERT INTO venue_user_trading_accounts \
+         (trading_account_id,user_id,venue,exchange_identity_hash) \
+         VALUES ($1,$2,'binance',$3)",
+    )
+    .bind(account_id)
+    .bind(&alice.user.user_id)
+    .bind([8_u8; 32].as_slice())
+    .execute(&f.pool)
+    .await?;
+    credential.trading_account_id = Some(account_id.to_owned());
+    credential.verification = ApiVerificationState::Verified;
+    credential.verified_ms = Some(now());
+    credential.api_reachable = true;
+    credential.dual_position = true;
+    sqlx::query(
+        "UPDATE venue_api_credentials SET trading_account_id=$1,verification_json=$2 \
+         WHERE credential_id=$3",
+    )
+    .bind(account_id)
+    .bind(serde_json::to_value(&credential)?)
+    .bind(&credential.credential_id)
+    .execute(&f.pool)
+    .await?;
+
+    let server = Server::start(&f).await?;
+    code(
+        server.get(GRID_INSTANCES_PATH, None).send().await?,
+        401,
+        AccountErrorCode::Unauthorized,
+    )
+    .await?;
+    assert!(
+        server
+            .get(GRID_INSTANCES_PATH, Some(&bob))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Vec<GridInstanceSummary>>()
+            .await?
+            .is_empty()
+    );
+
+    let create = GridInstanceCreateRequest {
+        schema_version: GRID_SCHEMA_VERSION,
+        request_id: "00000000-0000-4000-8000-000000000802".to_owned(),
+        credential_id: credential.credential_id.clone(),
+        symbol: "BTC/USDT".parse()?,
+        config: grid_config(10),
+    };
+    let created = server
+        .post(GRID_INSTANCES_PATH, Some(&alice), &create)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<GridInstanceSummary>()
+        .await?;
+    assert_eq!(created.state, GridInstanceState::Draft);
+    assert_eq!(created.trading_account_id, account_id);
+    assert_eq!(created.credential_id, credential.credential_id);
+    assert_eq!(
+        server
+            .get(GRID_INSTANCES_PATH, Some(&alice))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Vec<GridInstanceSummary>>()
+            .await?
+            .len(),
+        1
+    );
+
+    let foreign_update = GridConfigUpdateRequest {
+        schema_version: GRID_SCHEMA_VERSION,
+        request_id: "00000000-0000-4000-8000-000000000803".to_owned(),
+        instance_id: created.instance_id.clone(),
+        expected_revision: created.revision,
+        config: grid_config(11),
+    };
+    code(
+        server
+            .post(GRID_INSTANCES_PATH, Some(&bob), &foreign_update)
+            .send()
+            .await?,
+        403,
+        AccountErrorCode::Forbidden,
+    )
+    .await?;
+
+    let invalid_start = GridLifecycleRequest {
+        schema_version: GRID_SCHEMA_VERSION,
+        request_id: "00000000-0000-4000-8000-000000000804".to_owned(),
+        instance_id: created.instance_id.clone(),
+        expected_revision: created.revision,
+        action: GridLifecycleAction::Start,
+        risk_confirmed: false,
+        positions_remain_acknowledged: false,
+    };
+    code(
+        server
+            .post(GRID_LIFECYCLE_PATH, Some(&alice), &invalid_start)
+            .send()
+            .await?,
+        400,
+        AccountErrorCode::InvalidInput,
+    )
+    .await?;
+    let start = GridLifecycleRequest {
+        risk_confirmed: true,
+        ..invalid_start
+    };
+    credential.api_reachable = false;
+    sqlx::query("UPDATE venue_api_credentials SET verification_json=$1 WHERE credential_id=$2")
+        .bind(serde_json::to_value(&credential)?)
+        .bind(&credential.credential_id)
+        .execute(&f.pool)
+        .await?;
+    code(
+        server
+            .post(GRID_LIFECYCLE_PATH, Some(&alice), &start)
+            .send()
+            .await?,
+        409,
+        AccountErrorCode::VerificationRequired,
+    )
+    .await?;
+    credential.api_reachable = true;
+    sqlx::query("UPDATE venue_api_credentials SET verification_json=$1 WHERE credential_id=$2")
+        .bind(serde_json::to_value(&credential)?)
+        .bind(&credential.credential_id)
+        .execute(&f.pool)
+        .await?;
+    let starting = server
+        .post(GRID_LIFECYCLE_PATH, Some(&alice), &start)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<GridInstanceSummary>()
+        .await?;
+    assert_eq!(starting.state, GridInstanceState::StartPending);
+
+    let settled_ms = now().saturating_add(1);
+    sqlx::query(
+        "UPDATE venue_binance_grid_instances SET instance_state='running',revision=revision+1,\
+         dirty=FALSE,convergence_started_ms=NULL,updated_ms=$1 WHERE instance_id=$2",
+    )
+    .bind(i64::try_from(settled_ms)?)
+    .bind(&created.instance_id)
+    .execute(&f.pool)
+    .await?;
+    let running = server
+        .get(GRID_INSTANCES_PATH, Some(&alice))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<GridInstanceSummary>>()
+        .await?
+        .into_iter()
+        .next()
+        .ok_or("missing running Grid")?;
+    assert_eq!(running.state, GridInstanceState::Running);
+    let update = GridConfigUpdateRequest {
+        schema_version: GRID_SCHEMA_VERSION,
+        request_id: "00000000-0000-4000-8000-000000000805".to_owned(),
+        instance_id: running.instance_id.clone(),
+        expected_revision: running.revision,
+        config: grid_config(12),
+    };
+    let updated = server
+        .post(GRID_INSTANCES_PATH, Some(&alice), &update)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<GridInstanceSummary>()
+        .await?;
+    assert_eq!(updated.state, GridInstanceState::Running);
+    assert_eq!(updated.config_revision, 2);
+    assert_eq!(
+        updated.config.order_notional,
+        rust_decimal::Decimal::new(12, 0)
+    );
+
+    let stop_without_ack = GridLifecycleRequest {
+        schema_version: GRID_SCHEMA_VERSION,
+        request_id: "00000000-0000-4000-8000-000000000806".to_owned(),
+        instance_id: updated.instance_id.clone(),
+        expected_revision: updated.revision,
+        action: GridLifecycleAction::Stop,
+        risk_confirmed: false,
+        positions_remain_acknowledged: false,
+    };
+    code(
+        server
+            .post(GRID_LIFECYCLE_PATH, Some(&alice), &stop_without_ack)
+            .send()
+            .await?,
+        400,
+        AccountErrorCode::InvalidInput,
+    )
+    .await?;
+    let stopped = server
+        .post(
+            GRID_LIFECYCLE_PATH,
+            Some(&alice),
+            &GridLifecycleRequest {
+                positions_remain_acknowledged: true,
+                ..stop_without_ack
+            },
+        )
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<GridInstanceSummary>()
+        .await?;
+    assert_eq!(stopped.state, GridInstanceState::StopPending);
+
+    server.stop().await?;
     f.cleanup().await
 }
 

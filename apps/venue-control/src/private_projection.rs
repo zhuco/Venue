@@ -8,17 +8,22 @@ use venue_control_protocol::kol::{
     TerminalOpenOrder, TerminalOrderState, TerminalPosition, TerminalPositionHistoryEntry,
     TerminalPositionMode,
 };
-use venue_domain::domain::{FieldState, LimitTimeInForce, OrderState, PositionSide, Symbol};
+use venue_domain::domain::{FieldState, Fill, LimitTimeInForce, OrderState, PositionSide, Symbol};
 use venue_execution::SignedAccountSnapshot;
+use venue_gateway_binance::BinancePrivateFillEvent;
 
 const PROJECTION_SUBSCRIPTION_MS: u64 = 45_000;
 const HISTORY_LIMIT: i64 = 500;
 const MAX_ACTIVE_PROJECTION_WORKERS: i64 = 32;
+pub const PRIVATE_STREAM_FILL_BATCH_LIMIT: usize = 5;
 pub const MIGRATION_0019: &str = include_str!("../migrations/0019_binance_account_projection.sql");
 pub const MIGRATION_0020: &str = include_str!("../migrations/0020_binance_post_only_terminal.sql");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActiveProjectionSource {
+    /// Set only for an enabled KOL leader. Its signed fill suffix must be committed to the copy
+    /// ledger before this source's durable account-projection cursor may advance.
+    pub kol_user_id: Option<String>,
     pub owner_user_id: String,
     pub credential_id: String,
     pub trading_account_id: String,
@@ -99,43 +104,90 @@ impl BinancePrivateProjectionStore {
         &self,
         now_ms: u64,
     ) -> Result<Vec<ActiveProjectionSource>, PrivateProjectionError> {
-        let rows = sqlx::query("SELECT s.owner_user_id,s.credential_id,s.trading_account_id,s.symbols,p.projection_json FROM venue_binance_projection_subscriptions s JOIN venue_api_credentials c ON c.credential_id=s.credential_id AND c.user_id=s.owner_user_id AND c.trading_account_id=s.trading_account_id LEFT JOIN venue_binance_account_projections p ON p.credential_id=s.credential_id WHERE s.expires_ms>$1 AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' ORDER BY s.requested_ms DESC,s.credential_id LIMIT $2")
+        let kol_rows = sqlx::query(
+            "WITH active_kol AS (\
+               SELECT p.kol_user_id,p.leader_trading_account_id,\
+                 jsonb_agg(DISTINCT symbols.value ORDER BY symbols.value) AS symbols \
+               FROM venue_kol_profiles p \
+               JOIN venue_kol_follow_relations r ON r.kol_user_id=p.kol_user_id \
+                 AND r.leader_trading_account_id=p.leader_trading_account_id \
+                 AND r.relation_state='active' \
+               CROSS JOIN LATERAL jsonb_array_elements_text(r.allowed_symbols) AS symbols(value) \
+               WHERE p.profile_state='enabled' \
+               GROUP BY p.kol_user_id,p.leader_trading_account_id\
+             ) \
+             SELECT k.kol_user_id,k.kol_user_id AS owner_user_id,\
+               credentials.credential_id,k.leader_trading_account_id AS trading_account_id,\
+               k.symbols,p.projection_json,credentials.credential_count \
+             FROM active_kol k \
+             CROSS JOIN LATERAL (\
+               SELECT min(c.credential_id) AS credential_id,count(*) AS credential_count \
+               FROM venue_api_credentials c \
+               WHERE c.user_id=k.kol_user_id \
+                 AND c.trading_account_id=k.leader_trading_account_id \
+                 AND c.deleted_ms IS NULL \
+                 AND c.verification_json->>'verification'='verified'\
+             ) credentials \
+             LEFT JOIN venue_binance_account_projections p \
+               ON p.credential_id=credentials.credential_id \
+             ORDER BY k.kol_user_id LIMIT $1",
+        )
+        .bind(crate::kol_executor::MAX_ENABLED_KOLS as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PrivateProjectionError::Unavailable)?;
+        let grid_rows = sqlx::query(
+            "SELECT i.owner_user_id,i.credential_id,i.trading_account_id,\
+             jsonb_agg(DISTINCT i.symbol ORDER BY i.symbol) AS symbols,p.projection_json \
+             FROM venue_binance_grid_instances i \
+             JOIN venue_api_credentials c ON c.credential_id=i.credential_id \
+               AND c.user_id=i.owner_user_id AND c.trading_account_id=i.trading_account_id \
+             LEFT JOIN venue_binance_account_projections p ON p.credential_id=i.credential_id \
+             WHERE i.instance_state IN ('start_pending','running','paused','stop_pending',\
+               'blocked','reset_required','needs_attention') \
+               AND c.deleted_ms IS NULL \
+               AND c.verification_json->>'verification'='verified' \
+             GROUP BY i.owner_user_id,i.credential_id,i.trading_account_id,p.projection_json \
+             ORDER BY i.credential_id LIMIT $1",
+        )
+        .bind(MAX_ACTIVE_PROJECTION_WORKERS)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PrivateProjectionError::Unavailable)?;
+        let ui_rows = sqlx::query("SELECT s.owner_user_id,s.credential_id,s.trading_account_id,s.symbols,p.projection_json FROM venue_binance_projection_subscriptions s JOIN venue_api_credentials c ON c.credential_id=s.credential_id AND c.user_id=s.owner_user_id AND c.trading_account_id=s.trading_account_id LEFT JOIN venue_binance_account_projections p ON p.credential_id=s.credential_id WHERE s.expires_ms>$1 AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' ORDER BY s.requested_ms DESC,s.credential_id LIMIT $2")
             .bind(ms(now_ms)?)
             .bind(MAX_ACTIVE_PROJECTION_WORKERS)
             .fetch_all(&self.pool)
             .await
             .map_err(|_| PrivateProjectionError::Unavailable)?;
-        rows.into_iter()
-            .map(|row| {
-                let symbols: serde_json::Value = row
-                    .try_get("symbols")
-                    .map_err(|_| PrivateProjectionError::Unavailable)?;
-                let symbols = serde_json::from_value::<Vec<Symbol>>(symbols)
-                    .map_err(|_| PrivateProjectionError::Unavailable)?
-                    .into_iter()
-                    .collect::<BTreeSet<_>>();
-                if symbols.is_empty() {
-                    return Err(PrivateProjectionError::Unavailable);
-                }
-                let projection: Option<serde_json::Value> = row
-                    .try_get("projection_json")
-                    .map_err(|_| PrivateProjectionError::Unavailable)?;
-                let previous_fills_cursor = projection
-                    .and_then(|value| value.get("fills_cursor").cloned())
-                    .and_then(|value| value.as_str().map(ToOwned::to_owned));
-                Ok(ActiveProjectionSource {
-                    owner_user_id: row
-                        .try_get("owner_user_id")
-                        .map_err(|_| PrivateProjectionError::Unavailable)?,
-                    credential_id: row
-                        .try_get("credential_id")
-                        .map_err(|_| PrivateProjectionError::Unavailable)?,
-                    trading_account_id: row
-                        .try_get("trading_account_id")
-                        .map_err(|_| PrivateProjectionError::Unavailable)?,
-                    symbols,
-                    previous_fills_cursor,
-                })
+        let mut by_credential = BTreeMap::<String, ActiveProjectionSource>::new();
+        let mut priority = Vec::new();
+        for row in kol_rows {
+            let credential_count: i64 = row
+                .try_get("credential_count")
+                .map_err(|_| PrivateProjectionError::Unavailable)?;
+            if credential_count != 1 {
+                return Err(PrivateProjectionError::Unavailable);
+            }
+            let kol_user_id: String = row
+                .try_get("kol_user_id")
+                .map_err(|_| PrivateProjectionError::Unavailable)?;
+            let source = projection_source(&row, Some(kol_user_id))?;
+            merge_projection_source(&mut by_credential, &mut priority, source)?;
+        }
+        for row in grid_rows.into_iter().chain(ui_rows) {
+            let source = projection_source(&row, None)?;
+            merge_projection_source(&mut by_credential, &mut priority, source)?;
+        }
+        let max_workers = usize::try_from(MAX_ACTIVE_PROJECTION_WORKERS)
+            .map_err(|_| PrivateProjectionError::Unavailable)?;
+        priority
+            .into_iter()
+            .take(max_workers)
+            .map(|credential_id| {
+                by_credential
+                    .remove(&credential_id)
+                    .ok_or(PrivateProjectionError::Unavailable)
             })
             .collect()
     }
@@ -205,6 +257,122 @@ impl BinancePrivateProjectionStore {
         Ok(projection)
     }
 
+    /// Persists one authenticated stream fill without advancing the signed projection cursor.
+    /// The current signed generation is locked and checked first, so a reconnect or a racing
+    /// signed refresh turns this into a harmless fallback instead of applying an event to the
+    /// wrong baseline. The periodic signed snapshot remains the restart authority.
+    pub async fn persist_stream_fill(
+        &self,
+        source: &ActiveProjectionSource,
+        event: &BinancePrivateFillEvent,
+    ) -> Result<(), PrivateProjectionError> {
+        self.persist_stream_fills(source, std::slice::from_ref(event))
+            .await
+    }
+
+    /// Commits one private-stream micro-burst atomically. The signed projection baseline is
+    /// locked once for the whole burst; a mixed generation or conflicting native trade identity
+    /// rejects the complete transaction so Grid never observes only a prefix of the burst.
+    pub async fn persist_stream_fills(
+        &self,
+        source: &ActiveProjectionSource,
+        events: &[BinancePrivateFillEvent],
+    ) -> Result<(), PrivateProjectionError> {
+        let prepared = prepare_stream_fill_batch(source, events)?;
+        let batch_generation = events
+            .first()
+            .map(|event| event.private_generation)
+            .ok_or(PrivateProjectionError::Invalid)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PrivateProjectionError::Unavailable)?;
+        let baseline = sqlx::query(
+            "SELECT owner_user_id,trading_account_id,observed_ms,private_generation \
+             FROM venue_binance_account_projections WHERE credential_id=$1 FOR UPDATE",
+        )
+        .bind(&source.credential_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| PrivateProjectionError::Unavailable)?
+        .ok_or(PrivateProjectionError::Unavailable)?;
+        let owner_user_id: String = baseline
+            .try_get("owner_user_id")
+            .map_err(|_| PrivateProjectionError::Unavailable)?;
+        let trading_account_id: String = baseline
+            .try_get("trading_account_id")
+            .map_err(|_| PrivateProjectionError::Unavailable)?;
+        let observed_ms = unsigned(
+            baseline
+                .try_get("observed_ms")
+                .map_err(|_| PrivateProjectionError::Unavailable)?,
+        )?;
+        let private_generation = unsigned(
+            baseline
+                .try_get("private_generation")
+                .map_err(|_| PrivateProjectionError::Unavailable)?,
+        )?;
+        if owner_user_id != source.owner_user_id
+            || trading_account_id != source.trading_account_id
+            || private_generation != batch_generation
+            || events
+                .iter()
+                .any(|event| observed_ms >= event.received_at_ms)
+        {
+            return Err(PrivateProjectionError::Invalid);
+        }
+
+        for fill in prepared {
+            let changed = sqlx::query(
+                "INSERT INTO venue_binance_account_fills \
+                 (trading_account_id,owner_user_id,native_trade_id,symbol,occurred_ms,observed_ms,fill_json,\
+                  stream_private_generation,baseline_private_generation,original_quantity,\
+                  cumulative_filled_quantity,order_state,client_order_id) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+                 ON CONFLICT (trading_account_id,symbol,native_trade_id) DO UPDATE SET \
+                  observed_ms=GREATEST(venue_binance_account_fills.observed_ms,EXCLUDED.observed_ms),\
+                  stream_private_generation=COALESCE(venue_binance_account_fills.stream_private_generation,EXCLUDED.stream_private_generation),\
+                  baseline_private_generation=COALESCE(venue_binance_account_fills.baseline_private_generation,EXCLUDED.baseline_private_generation),\
+                  original_quantity=COALESCE(venue_binance_account_fills.original_quantity,EXCLUDED.original_quantity),\
+                  cumulative_filled_quantity=COALESCE(venue_binance_account_fills.cumulative_filled_quantity,EXCLUDED.cumulative_filled_quantity),\
+                  order_state=COALESCE(venue_binance_account_fills.order_state,EXCLUDED.order_state),\
+                  client_order_id=COALESCE(venue_binance_account_fills.client_order_id,EXCLUDED.client_order_id) \
+                 WHERE venue_binance_account_fills.owner_user_id=EXCLUDED.owner_user_id \
+                   AND venue_binance_account_fills.fill_json=EXCLUDED.fill_json \
+                   AND (venue_binance_account_fills.stream_private_generation IS NULL OR (\
+                     venue_binance_account_fills.stream_private_generation=EXCLUDED.stream_private_generation \
+                     AND venue_binance_account_fills.baseline_private_generation=EXCLUDED.baseline_private_generation \
+                     AND venue_binance_account_fills.original_quantity=EXCLUDED.original_quantity \
+                     AND venue_binance_account_fills.cumulative_filled_quantity=EXCLUDED.cumulative_filled_quantity \
+                     AND venue_binance_account_fills.order_state=EXCLUDED.order_state \
+                     AND venue_binance_account_fills.client_order_id=EXCLUDED.client_order_id))",
+            )
+            .bind(&source.trading_account_id)
+            .bind(&source.owner_user_id)
+            .bind(&fill.native_trade_id)
+            .bind(&fill.symbol)
+            .bind(fill.occurred_ms)
+            .bind(fill.observed_ms)
+            .bind(fill.payload)
+            .bind(fill.stream_generation)
+            .bind(fill.baseline_generation)
+            .bind(fill.original)
+            .bind(fill.cumulative)
+            .bind(fill.state)
+            .bind(fill.client)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PrivateProjectionError::Unavailable)?;
+            if changed.rows_affected() != 1 {
+                return Err(PrivateProjectionError::Invalid);
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(|_| PrivateProjectionError::Unavailable)
+    }
+
     pub async fn load_owned(
         &self,
         owner_user_id: &str,
@@ -219,6 +387,7 @@ impl BinancePrivateProjectionStore {
         let mut stored: StoredProjection =
             serde_json::from_value(payload).map_err(|_| PrivateProjectionError::Unavailable)?;
         let source = ActiveProjectionSource {
+            kol_user_id: None,
             owner_user_id: owner_user_id.to_owned(),
             credential_id: credential_id.to_owned(),
             trading_account_id,
@@ -287,6 +456,75 @@ impl BinancePrivateProjectionStore {
     }
 }
 
+fn projection_source(
+    row: &sqlx::postgres::PgRow,
+    kol_user_id: Option<String>,
+) -> Result<ActiveProjectionSource, PrivateProjectionError> {
+    let symbols: serde_json::Value = row
+        .try_get("symbols")
+        .map_err(|_| PrivateProjectionError::Unavailable)?;
+    let symbols = serde_json::from_value::<Vec<Symbol>>(symbols)
+        .map_err(|_| PrivateProjectionError::Unavailable)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if symbols.is_empty() {
+        return Err(PrivateProjectionError::Unavailable);
+    }
+    let projection: Option<serde_json::Value> = row
+        .try_get("projection_json")
+        .map_err(|_| PrivateProjectionError::Unavailable)?;
+    let previous_fills_cursor = projection
+        .and_then(|value| value.get("fills_cursor").cloned())
+        .and_then(|value| value.as_str().map(ToOwned::to_owned));
+    Ok(ActiveProjectionSource {
+        kol_user_id,
+        owner_user_id: row
+            .try_get("owner_user_id")
+            .map_err(|_| PrivateProjectionError::Unavailable)?,
+        credential_id: row
+            .try_get("credential_id")
+            .map_err(|_| PrivateProjectionError::Unavailable)?,
+        trading_account_id: row
+            .try_get("trading_account_id")
+            .map_err(|_| PrivateProjectionError::Unavailable)?,
+        symbols,
+        previous_fills_cursor,
+    })
+}
+
+fn merge_projection_source(
+    by_credential: &mut BTreeMap<String, ActiveProjectionSource>,
+    priority: &mut Vec<String>,
+    source: ActiveProjectionSource,
+) -> Result<(), PrivateProjectionError> {
+    if !priority.iter().any(|value| value == &source.credential_id) {
+        priority.push(source.credential_id.clone());
+    }
+    match by_credential.get_mut(&source.credential_id) {
+        Some(current) => {
+            if current.owner_user_id != source.owner_user_id
+                || current.trading_account_id != source.trading_account_id
+                || (current.kol_user_id.is_some()
+                    && source.kol_user_id.is_some()
+                    && current.kol_user_id != source.kol_user_id)
+            {
+                return Err(PrivateProjectionError::Unavailable);
+            }
+            current.symbols.extend(source.symbols);
+            if current.kol_user_id.is_none() {
+                current.kol_user_id = source.kol_user_id;
+            }
+            if current.previous_fills_cursor.is_none() {
+                current.previous_fills_cursor = source.previous_fills_cursor;
+            }
+        }
+        None => {
+            by_credential.insert(source.credential_id.clone(), source);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct StoredProjection {
     fills_cursor: String,
@@ -337,27 +575,7 @@ fn project(
     let fills = snapshot
         .fills()
         .iter()
-        .map(|fill| {
-            let position_side = match fill.position_side {
-                FieldState::Known(side) if side != PositionSide::Net => side,
-                _ => return Err(PrivateProjectionError::Invalid),
-            };
-            let maker = match fill.maker {
-                FieldState::Known(value) => Some(value),
-                _ => None,
-            };
-            Ok(TerminalFill {
-                native_trade_id: fill.fill_id.clone(),
-                native_order_id: fill.order_id.clone(),
-                symbol: fill.symbol.clone(),
-                order_side: fill.side,
-                position_side,
-                quantity: fill.quantity,
-                price: fill.price.value(),
-                maker,
-                occurred_ms: fill.exchange_time_ms,
-            })
-        })
+        .map(terminal_fill)
         .collect::<Result<Vec<_>, _>>()?;
     let assets = snapshot
         .balances()
@@ -386,6 +604,158 @@ fn project(
         .validate()
         .map_err(|_| PrivateProjectionError::Invalid)?;
     Ok(projection)
+}
+
+fn terminal_fill(fill: &Fill) -> Result<TerminalFill, PrivateProjectionError> {
+    let position_side = match fill.position_side {
+        FieldState::Known(side) if side != PositionSide::Net => side,
+        _ => return Err(PrivateProjectionError::Invalid),
+    };
+    let maker = match fill.maker {
+        FieldState::Known(value) => Some(value),
+        _ => None,
+    };
+    Ok(TerminalFill {
+        native_trade_id: fill.fill_id.clone(),
+        native_order_id: fill.order_id.clone(),
+        symbol: fill.symbol.clone(),
+        order_side: fill.side,
+        position_side,
+        quantity: fill.quantity,
+        price: fill.price.value(),
+        maker,
+        occurred_ms: fill.exchange_time_ms,
+    })
+}
+
+struct PreparedStreamFill {
+    native_trade_id: String,
+    symbol: String,
+    occurred_ms: Option<i64>,
+    observed_ms: i64,
+    payload: serde_json::Value,
+    stream_generation: Option<i64>,
+    baseline_generation: Option<i64>,
+    original: Option<String>,
+    cumulative: Option<String>,
+    state: Option<&'static str>,
+    client: Option<String>,
+}
+
+fn prepare_stream_fill_batch(
+    source: &ActiveProjectionSource,
+    events: &[BinancePrivateFillEvent],
+) -> Result<Vec<PreparedStreamFill>, PrivateProjectionError> {
+    if events.is_empty() || events.len() > PRIVATE_STREAM_FILL_BATCH_LIMIT {
+        return Err(PrivateProjectionError::Invalid);
+    }
+    let generation = events
+        .first()
+        .map(|event| (event.stream_private_generation, event.private_generation))
+        .ok_or(PrivateProjectionError::Invalid)?;
+    let mut identities = BTreeMap::<(String, String), &BinancePrivateFillEvent>::new();
+    let mut prepared = Vec::with_capacity(events.len());
+    for event in events {
+        if event.stream_private_generation == 0
+            || event.private_generation < event.stream_private_generation
+            || (event.stream_private_generation, event.private_generation) != generation
+            || event.received_at_ms == 0
+            || !source.symbols.contains(&event.fill.symbol)
+            || event
+                .fill
+                .exchange_time_ms
+                .is_none_or(|occurred| occurred == 0 || event.received_at_ms < occurred)
+        {
+            return Err(PrivateProjectionError::Invalid);
+        }
+        let key = (event.fill.symbol.to_string(), event.fill.fill_id.clone());
+        if identities
+            .insert(key, event)
+            .is_some_and(|prior| !same_stream_fill_identity(prior, event))
+        {
+            return Err(PrivateProjectionError::Invalid);
+        }
+        let fill = terminal_fill(&event.fill)?;
+        let payload = serde_json::to_value(&fill).map_err(|_| PrivateProjectionError::Invalid)?;
+        let context = stream_fill_context(event)?;
+        let (stream_generation, baseline_generation, original, cumulative, state, client) =
+            match context {
+                Some((original, cumulative, state, client)) => (
+                    Some(
+                        i64::try_from(event.stream_private_generation)
+                            .map_err(|_| PrivateProjectionError::Invalid)?,
+                    ),
+                    Some(
+                        i64::try_from(event.private_generation)
+                            .map_err(|_| PrivateProjectionError::Invalid)?,
+                    ),
+                    Some(original.to_string()),
+                    Some(cumulative.to_string()),
+                    Some(state),
+                    Some(client),
+                ),
+                None => (None, None, None, None, None, None),
+            };
+        prepared.push(PreparedStreamFill {
+            native_trade_id: fill.native_trade_id,
+            symbol: fill.symbol.to_string(),
+            occurred_ms: fill.occurred_ms.map(ms).transpose()?,
+            observed_ms: ms(event.received_at_ms)?,
+            payload,
+            stream_generation,
+            baseline_generation,
+            original,
+            cumulative,
+            state,
+            client,
+        });
+    }
+    Ok(prepared)
+}
+
+fn same_stream_fill_identity(
+    left: &BinancePrivateFillEvent,
+    right: &BinancePrivateFillEvent,
+) -> bool {
+    left.stream_private_generation == right.stream_private_generation
+        && left.private_generation == right.private_generation
+        && left.fill == right.fill
+        && left.client_order_id == right.client_order_id
+        && left.original_quantity == right.original_quantity
+        && left.cumulative_filled_quantity == right.cumulative_filled_quantity
+        && left.order_state == right.order_state
+}
+
+fn stream_fill_context(
+    event: &BinancePrivateFillEvent,
+) -> Result<
+    Option<(
+        rust_decimal::Decimal,
+        rust_decimal::Decimal,
+        &'static str,
+        String,
+    )>,
+    PrivateProjectionError,
+> {
+    let Some((original, cumulative, state)) = event.complete_order_progress() else {
+        return Ok(None);
+    };
+    let client = match &event.client_order_id {
+        FieldState::Known(value)
+            if !value.trim().is_empty()
+                && value.len() <= 36
+                && !value.chars().any(char::is_whitespace) =>
+        {
+            value.clone()
+        }
+        _ => return Ok(None),
+    };
+    let state = match state {
+        OrderState::PartiallyFilled => "partially_filled",
+        OrderState::Filled => "filled",
+        _ => return Err(PrivateProjectionError::Invalid),
+    };
+    Ok(Some((original, cumulative, state, client)))
 }
 
 async fn persist_position_changes(
@@ -484,4 +854,94 @@ fn ms(value: u64) -> Result<i64, PrivateProjectionError> {
 
 fn unsigned(value: i64) -> Result<u64, PrivateProjectionError> {
     u64::try_from(value).map_err(|_| PrivateProjectionError::Unavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal::Decimal;
+    use venue_domain::domain::{OrderSide, Price};
+
+    fn source() -> Result<ActiveProjectionSource, Box<dyn std::error::Error>> {
+        Ok(ActiveProjectionSource {
+            kol_user_id: None,
+            owner_user_id: "owner".to_owned(),
+            credential_id: "credential".to_owned(),
+            trading_account_id: "account".to_owned(),
+            symbols: ["BTC/USDT".parse()?].into_iter().collect(),
+            previous_fills_cursor: None,
+        })
+    }
+
+    fn stream_fill(
+        fill_id: &str,
+        cumulative: Decimal,
+        state: OrderState,
+    ) -> Result<BinancePrivateFillEvent, Box<dyn std::error::Error>> {
+        Ok(BinancePrivateFillEvent {
+            stream_private_generation: 3,
+            private_generation: 3,
+            received_at_ms: 200,
+            fill: Fill {
+                fill_id: fill_id.to_owned(),
+                execution_sequence: FieldState::Known(7),
+                order_id: "order-1".to_owned(),
+                symbol: "BTC/USDT".parse()?,
+                side: OrderSide::Buy,
+                position_side: FieldState::Known(PositionSide::Long),
+                quantity: Decimal::new(1, 3),
+                price: Price::new(Decimal::new(100_000, 0))?,
+                fee: FieldState::Missing,
+                realized_pnl: FieldState::Missing,
+                maker: FieldState::Known(true),
+                exchange_time_ms: Some(199),
+            },
+            client_order_id: FieldState::Known("client-1".to_owned()),
+            original_quantity: FieldState::Known(Decimal::new(2, 3)),
+            cumulative_filled_quantity: FieldState::Known(cumulative),
+            order_state: FieldState::Known(state),
+        })
+    }
+
+    #[test]
+    fn one_stream_fill_reuses_the_batch_contract() -> Result<(), Box<dyn std::error::Error>> {
+        let event = stream_fill("trade-1", Decimal::new(1, 3), OrderState::PartiallyFilled)?;
+        assert_eq!(prepare_stream_fill_batch(&source()?, &[event])?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn partial_and_full_executions_from_one_order_share_a_batch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let partial = stream_fill("trade-1", Decimal::new(1, 3), OrderState::PartiallyFilled)?;
+        let mut full = stream_fill("trade-2", Decimal::new(2, 3), OrderState::Filled)?;
+        full.fill.execution_sequence = FieldState::Known(8);
+        full.received_at_ms = 201;
+        full.fill.exchange_time_ms = Some(200);
+        assert_eq!(
+            prepare_stream_fill_batch(&source()?, &[partial, full])?.len(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_generation_or_conflicting_trade_identity_rejects_the_whole_batch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let partial = stream_fill("trade-1", Decimal::new(1, 3), OrderState::PartiallyFilled)?;
+        let mut mixed_generation = stream_fill("trade-2", Decimal::new(2, 3), OrderState::Filled)?;
+        mixed_generation.private_generation = 4;
+        assert_eq!(
+            prepare_stream_fill_batch(&source()?, &[partial.clone(), mixed_generation]).err(),
+            Some(PrivateProjectionError::Invalid)
+        );
+
+        let mut conflicting_identity = partial.clone();
+        conflicting_identity.fill.quantity = Decimal::new(2, 3);
+        assert_eq!(
+            prepare_stream_fill_batch(&source()?, &[partial, conflicting_identity]).err(),
+            Some(PrivateProjectionError::Invalid)
+        );
+        Ok(())
+    }
 }

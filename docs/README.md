@@ -1,8 +1,8 @@
 # VENUE 文档目录
 
-当前只围绕一个结果：完成 Binance KOL 跟单 MVP。新用户通过 KOL 邀请链接注册，登录并绑定 API Key；系统验证 Portfolio Margin UM 统一账户、UM 交易权限与双向持仓，随后由 Binance 多账户 Executor 快速复制 KOL 认证账户流中的真实成交。初期全站不超过 5 个启用 KOL、200 个启用跟单账户。
+当前围绕两个共用执行底座的结果：完成 Binance KOL 跟单 MVP，并把 Binance 对冲网格重建为交易所事实驱动的收敛循环。两者统一使用单例多账户 Executor、PostgreSQL 命令账本和签名查单。
 
-Grid、Gate.io、Bitget、其余交易所和 Scalping 均暂停，不作为当前验收或新执行链前置。冻结旧 Node 仍按原工件处理，但不得与新链写入同一真实账户。
+旧 Grid 接管路线停止；Gate.io、Bitget、其余交易所和 Scalping 仍暂停。冻结旧 Node 仍按原工件处理，但不得与新链写入同一真实账户。
 
 ## 阅读入口
 

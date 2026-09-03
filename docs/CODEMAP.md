@@ -1,10 +1,10 @@
 # VENUE 功能入口
 
-更新：2026-09-02
+更新：2026-09-03
 
-当前唯一目标是 Binance KOL 跟单 MVP；初期全站最多 5 个启用 KOL、200 个启用跟单账户。Grid、Scalping 和其余交易所迁移暂停。下面多数 Runtime/Node 入口是已提交代码或冻结兼容位置，不等于新 MVP 的目标调用链。长期文档统一在本目录，仓库根 CODEMAP 仅作导航。
+当前目标是 Binance KOL 跟单 MVP 与事实驱动 Binance 对冲网格共用单例 `venue-executor-binance`；初期全站最多 5 个启用 KOL、200 个启用跟单账户。Scalping 和其余交易所迁移暂停。下面多数 Runtime/Node 入口是已提交代码或冻结兼容位置，不等于新链调用链。长期文档统一在本目录，仓库根 CODEMAP 仅作导航。
 
-当前可复用入口：`apps/venue-control/src/accounts/`（注册、登录、会话、凭证密文、邀请码归属、KOL、跟单与终端命令）、`crates/venue-gateway-binance/src/{credential_probe,account_gateway,execution}.rs`（Portfolio Margin UM 验证、私流/签名 REST、Post Only 与市价平仓）及同级 `apps/ui/{web,desktop}`。两套 UI 的入口判断先看 `apps/ui/README.md`。KOL MVP 已落地 `0017`–`0020`、版本化终端/投影 DTO、用户作用域私有投影、双重旧 writer 门禁和唯一 `venue-executor-binance` 组装；启动仅在 explicit LIVE、PostgreSQL 和既有主密钥均有效时进行。
+当前可复用入口：`apps/venue-control/src/accounts/`（注册、登录、会话、凭证密文、邀请码归属、KOL、跟单、终端和 Grid 生命周期）、`crates/venue-gateway-binance/src/{credential_probe,account_gateway,execution,grid_market}.rs`（Portfolio Margin UM 验证、私流/签名 REST、Post Only、市价平仓与 Grid 公开事实）及同级 `apps/ui/{web,desktop}`。两套 UI 的入口判断先看 `apps/ui/README.md`。新链由 `0017`–`0024`、版本化终端/Grid/投影 DTO、用户作用域私有投影、旧 writer 门禁和唯一 `venue-executor-binance` 组装；启动仅在 explicit LIVE、PostgreSQL 和既有主密钥均有效时进行。
 
 项目/版本总览见 [`README.md`](../README.md)，开发与合并方式见 [`DEVELOPMENT.md`](DEVELOPMENT.md)，旧方法状态见 [停用入口](ARCHITECTURE.md#deprecated)，产品版本和变更范围见 [`VERSION`](../VERSION) / [`CHANGELOG.md`](CHANGELOG.md)。
 
@@ -43,11 +43,14 @@ Node 投影摘要辅助位于 `apps/venue-node/src/control_loop/projection_diges
 | 策略 Actor 宿主与邮箱 | `crates/venue-runtime/src/strategy/mod.rs` | 私有事实与 Delta/Trade/Bar 有界无损；仅 Snapshot/Ticker/MarkFunding 合并；私有 burst 64 后让行对账/控制；一个实例一个 runtime-issued turn，durable applied receipt 后才可 Running/输出授权意图；`src/runtime/strategy/mod.rs` 只兼容重导出 |
 | 共享私有事实调度 | `crates/venue-runtime/src/shared/private_facts.rs` | effect 调度、session generation/ticket、周期刷新、退避与 readiness/snapshot；单 in-flight 且证据尾绑定，跨 generation 结果拒绝；根 worker 仅保留兼容 facade 与 Binance 协议/REST/WS 组合，不持有 writer/WAL/mutation |
 | 旧 Copy 规划与 Node 桥 | `crates/venue-copy/src/lib.rs`、`apps/venue-node/src/production_resident/copy.rs` | 仅复用不依赖 Actor/WAL 的纯 Decimal 数量计算；delivery、Actor、journal、跨层 receipt 与恢复链冻结，不是新 MVP 的执行入口 |
-| 版本化 Control 协议 | `crates/venue-control-protocol/src/{lib,accounts,kol}.rs` | 既有 schema v2 Node/Control DTO 保持冻结；KOL schema v1 固定邀请/跟单，终端命令 schema v2 明确 Post Only 与确认后的 close-only Market，私有投影独立 schema v1；不复用旧 delivery/Actor 协议，也不授予物理交易权限 |
-| Control 服务核心 | `apps/venue-control/src/{lib,accounts/{kol,terminal},private_projection,kol_executor,kol_private_source,executor_config,executor_store,executor_secret,executor_exchange,executor_runtime,bin/venue-executor-binance,http/accounts}.rs` | `0017`–`0020` 提供容量、归属、activation、源成交/目标、命令账本与用户作用域私有投影。Executor 以 private WS 事件触发并以账户级签名 REST 快照持久化仓位/活动委托/成交/资产；命令以稳定 clientOrderId 回读，市价平仓在发送前重裁剪。Control 入账和 Executor 抢占均拒绝仍有旧 Binance LIVE scope 的账户。|
+| 版本化 Control 协议 | `crates/venue-control-protocol/src/{lib,accounts,kol,grid}.rs` | 既有 schema v2 Node/Control DTO 保持冻结；KOL schema v1 固定邀请/跟单，终端命令 schema v2 明确 Post Only、确认后的 close-only Market 与精确撤单；Grid schema v1 明确配置、状态、生命周期确认和四类语义订单键；不复用旧 delivery/Actor 协议，也不授予物理交易权限 |
+| Control 与统一 Executor | `apps/venue-control/src/{lib,accounts/{kol,terminal,grid},private_projection,kol_executor,grid_store,grid_runtime,grid_hot_dispatch,executor_config,executor_store,executor_secret,executor_exchange{,/grid_batch},executor_runtime,bin/venue-executor-binance,http/accounts}.rs` | `0017`–`0024` 提供容量、归属、Grid 配置/目标面/归属/成交分配、命令账本、用户作用域私有投影、签名回读退避、Grid 热批次及跨微批前驱链。Executor 以私流唤醒并持久化账户投影；终端、Copy 与 Grid 共用账户串行队列和稳定 clientOrderId。热批次用一次性进程内令牌精确匹配数据库摘要、账户、symbol、私有代与规则代，命中时不做同步完整 REST 预检；缺失、过期、重启或不匹配只走签名冷路径。所有 Place 并发越过 send-entry 后才启动 Cancel，ACK/不确定结果随后逐单签名回读。新链只拒绝仍有旧 Binance LIVE writer scope 的账户。|
+| Binance Grid 热批次迁移 | `apps/venue-control/migrations/{0023_binance_grid_hot_batch,0024_binance_grid_batch_chain}.sql`、`apps/venue-control/tests/binance_grid_hot_batch_migration.rs` | 0023 建立 0–16 条命令的原子收据与批内 Place-before-Cancel 顺序；0024 把每批绑定到所消费的 desired 摘要和唯一前驱。相邻私流成交可继续规划为独立后继批，但领取后批前必须确认前批全部 Reconciled；未确认 Place 不冒充签名订单，也不得被后批选作撤单目标。PostgreSQL 实库压力、真实 Canary 与预热 p95 尚未验收，不能宣称 10 ms 已达成。|
+| Binance Grid 纯规划 | `crates/venue-strategies/src/hedged_grid/{planner,planner_tests}.rs` | 配置、实时规则/BBO、同代签名双腿仓位、本实例订单面、外部平仓预留与批量成交确定性地产生四类 Maker 目标、补库存、盈利减仓、Blocked/Reset/Stop；不持有 Actor、checkpoint、WAL 或交易所客户端 |
+| Binance Grid 行情与规则证据 | `crates/venue-gateway-binance/src/grid_market.rs` | 每次读取新鲜 BBO，按有界周期刷新完整规则并在变化时提升 generation；盈利风险使用显式 quote→USD 证据，不假定 USDT/USDC 恒等于 USD |
 | Copy 执行结果与耐久记账 | `apps/venue-control/src/{copy_execution_postgres,copy_ledger_postgres,copy_ledger_worker}.rs` | 结果以原 immutable job 校验目标/资产/phase/delta；跨零 Adjust 必须接在已签名归零的 Reduce 后。worker tick 从真实 Node receipt 与最终 Adjust 的 Reconciled 仓位原子生成 canonical receipt、ledger 和 drift；Rejected 只关闭原 delivery，不造 ledger。0013 允许经原 Node receipt 交叉核验的无 Copy consumer claim 终态；暂停/过期任务仍可记账但不生成新增风险授权，缺 Node receipt 暂不处理 |
 | Copy 自动规划事实与冻结输入 | `apps/venue-node/src/control_loop/copy_planning.rs`、`apps/venue-control/src/{copy_planning_postgres,copy_planning_input,copy_planning_repair,copy_leader_postgres}.rs` | Node 用签名仓位/保证金、实时 Instrument 和显式 `copy_leader_capital` 产生外层有界事实；worker 配对当前关系的双边新鲜事实，与不可变 envelope/job/游标同事务提交。原始 leader 敞口与冻结倍率分别保留；未收敛旧任务不生成新风险任务。已记账漂移只能由新鲜事实生成独立修复任务，不能续期旧 child。逐所实际来源及产品端到端仍需验收 |
-| VenueFlow 桌面运维客户端 | `apps/ui/desktop/src/main.rs` | `trading.rs`、`trade_dock.rs` 统一按钮、交易设置与非重复热键为同一 `TradingAction`；动作按“开多、平多、开空、平空”显示，默认 `A/S/D/F`，Maker-only 默认开启。`workspace.rs` 固定币安式图表/盘口/下单/底部账户区，交易对标签可关闭并新增。`execution_view.rs` 的仓位、当前委托、历史成交、仓位历史和资产只读新私有投影，历史委托只读新命令账本，缺失时不回退旧 Node；交易机器人仍展示冻结旧运行时事实。Post Only 四动作与二次确认市价平仓进入唯一 Executor，精确撤单未接通前保持禁用。|
+| VenueFlow 桌面运维客户端 | `apps/ui/desktop/src/main.rs` | `trading.rs`、`trade_dock.rs` 统一按钮、交易设置与非重复热键为同一 `TradingAction`；动作按“开多、平多、开空、平空”显示，默认 `A/S/D/F`，Maker-only 默认开启。`workspace.rs` 固定币安式图表/盘口/下单/底部账户区，交易对标签可关闭并新增。`execution_view.rs` 的仓位、当前委托、历史成交、仓位历史和资产只读新私有投影，历史委托只读新命令账本；`grid_view.rs` 与 `client/grid.rs` 管理新 Grid 配置和生命周期，并保留冻结旧策略只读区。Post Only 四动作、二次确认市价平仓与选中委托精确撤单进入唯一 Executor。|
 | 响应式用户 Web | `apps/ui/web/components/control-console.tsx` | Next.js 16 + React 19 + TypeScript、同源 BFF/session、五视口响应式界面；总览/关系/账户/订单/持仓/成交/签名对账/ledger/drift/风险/语义控制复用 schema v2。`lib/projection-scope.ts` 过滤账户与关系、拒绝模糊回执归属，`lib/decimal.ts` 只作精确显示汇总，`lib/realtime.ts` 与 `app/api/events/route.ts` 管理连续事件、超时和恢复门；`e2e/` 仅为隔离 QA。构建与受控部署见 `docs/WEB.md`；页面已建立不等于服务器/实盘验收完成 |
 | Web/CI 发布门禁 | `.github/workflows/workspace-gates.yml`、`apps/ui/web/scripts/verify-boundary.mjs` | CI 使用六 Node 发布契约，另运行 Web typecheck/unit/build/产物负向扫描和五视口 Playwright。BFF 在运行时同时限制路径与 HTTP method，角色只接受显式自有键；扫描只报告文件和规则名，不回显可疑 secret 内容 |
 | KOL 离线容量与发布演练 | `apps/venue-control/tests/{kol_executor_capacity,kol_mvp_postgres_integration}.rs`、`scripts/Invoke-KolCanaryDrill.ps1`、`docs/KOL_EXECUTOR_RELEASE.md` | 确定性 5 KOL / 200 follower 中心调度 fixture 与 PostgreSQL+mock 端到端场景覆盖有界队列、源成交去重、重启回读、超时栅栏及拒单；脚本必须显式 `-OfflineFixture`，拒绝进程内 Binance 凭证并只调用受控 Rust 构建入口。它不是 2核4G 实机容量证明或真实 Canary |
@@ -63,13 +66,12 @@ Node 投影摘要辅助位于 `apps/venue-node/src/control_loop/projection_diges
 
 ## 对冲网格与冻结兼容定位
 
-冻结旧 Grid 的最后提交组合在 `apps/venue-node/src/production_resident/grid.rs`，签名成交补账与多成交收敛在同目录
-`grid_recovery.rs`；纯状态回归与 resident 启动崩溃回归分别拆在 `grid_tests.rs`、`bootstrap_tests.rs`，避免生产入口承载测试实现。下列 Stage 7 路径只作冻结行为/恢复参考，
-不是可运行的旧 CLI；状态和删除条件统一见 [停用清单](ARCHITECTURE.md#deprecated)。
+新 Binance Grid 的活动入口是 `venue-control` 的 Grid Store/Runtime、共享 Executor、Binance Grid Market Reader 与纯 Planner；它根据签名事实重布网络，不采用旧订单。冻结旧 Grid 的最后提交组合仍在 `apps/venue-node/src/production_resident/grid.rs`，签名成交补账与多成交收敛在同目录 `grid_recovery.rs`。下列 Stage 7 路径只作旧工件恢复与行为核对参考；删除门统一见 [`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md#81-旧迁移代码删除门)。
 
 | 功能 | 首要入口 | 边界 |
 |---|---|---|
-| Grid 参数、状态机、库存与 desired orders | `crates/venue-strategies/src/hedged_grid/{model,reducer}.rs` | 共享纯策略；根 `src/strategy/hedged_grid` 仅重导出 |
+| 新 Grid 配置、持久目标与收敛 | `crates/venue-control-protocol/src/grid.rs`、`apps/venue-control/src/grid_store.rs`、`apps/venue-control/src/grid_store/{surface,reads,types}.rs`、`apps/venue-control/src/grid_runtime.rs`、`apps/venue-control/migrations/{0021_binance_grid,0023_binance_grid_hot_batch,0024_binance_grid_batch_chain}.sql` | `surface.rs` 原子提交 rolling anchor、完整 desired surface 与 plan CAS；其余边界保存版本化配置、订单归属、成交分配、生命周期栅栏和分支唯一批次尾，重启只依赖 PostgreSQL 与新鲜交易所事实。|
+| Grid 参数、状态机、库存与 desired orders | `crates/venue-strategies/src/hedged_grid/{planner,model,reducer}.rs` | `planner.rs` 是新链无状态入口；旧 reducer/model 仍为共享类型和冻结行为参考；根 `src/strategy/hedged_grid` 仅重导出 |
 | 高暴露浮盈减仓 | `crates/venue-strategies/src/hedged_grid/exposure_guard.rs` | 只输出语义结果；冻结旧 dispatch 位于 Node 账户链，当前 MVP 不调用 |
 | 库存/暴露离线 verifier | `src/bin/verify-grid-{inventory-recovery,exposure-shadow}.rs` | 读取旧工件，Shadow 不构成 gateway mode |
 | 冻结 Grid/Canary/成交热路径 | `src/runtime/grid/stage7_grid.rs`、`stage7_resident.rs`、`stage7_grid_canary.rs` | 保留行为与恢复证据；根旧三所 binary 已删除，不作为新 writer 入口 |
@@ -128,7 +130,7 @@ Node 投影摘要辅助位于 `apps/venue-node/src/control_loop/projection_diges
 跨模块契约、依赖变化、架构合并或发布前集中建立全工作区通过基线。基线通过后的增量只重跑受影响专项；纯文档、注释或 lint 标注只做对应静态检查，不使既有业务测试结果失效。记录验证对应的提交/源码范围，构建缓存疑似串用时使用两个固定隔离槽并持锁核验，不新建目录、不清空共享缓存。
 
 - VenueFlow 图表实时锚点：`apps/ui/desktop/src/chart.rs` 与 `chart_view.rs`；左键拖动保持固定 K 线宽度、右侧留白占用视窗槽位，新 K 线在拖定位置继续更新。内联测试覆盖连续拖动/松手不回弹、图表与时间轴、缩放及新 K 线到达；“跟随”/“适配”显式恢复右端位置。
-- 网格 reducer/风险状态测试：`crates/venue-strategies/src/hedged_grid/{reducer_tests,exposure_guard,recovery_tests}.rs`。
+- 新 Grid 规划/持久化/运行时测试：`crates/venue-strategies/src/hedged_grid/planner_tests.rs`、`apps/venue-control/src/grid_runtime.rs` 内联测试、`apps/venue-control/tests/{grid_store_postgres_integration,binance_grid_hot_batch_migration}.rs`；旧 reducer/风险状态回归仍位于 `crates/venue-strategies/src/hedged_grid/{reducer_tests,exposure_guard,recovery_tests}.rs`。
 - 交易所 adapter 测试：`src/exchange/{binance,bitget,gate,grid}/` 内的测试文件及各交易所直接测试模块。
 - 共享 resident/runtime 测试：`src/runtime/grid/stage7_grid_tests.rs` 统一组合 `stage7_grid_{core,recovery}_tests.rs`，其余专项位于 `stage7_grid_reconciliation_tests.rs`、`stage7_fill_sequence_tests.rs`、`stage7_install_recovery_tests.rs`、`stage7_inventory_recovery_evidence_tests.rs`、`stage7_exposure_composition_tests.rs`、`hedged_grid_runtime_equivalence_tests.rs`、`exposure_runtime_tests.rs` 及各 `stage7_*` 模块内测试。
 - 账户运行时架构契约：`crates/venue-runtime/src/account/{tests,recovery_tests}.rs`、`account/tests/runtime_safety_tests.rs` 及 `account/{private_router,market_hub,reconciler}.rs`、`strategy/mod.rs`、`account_lane.rs` 内测试；运行时错误集中在 `account/runtime_error.rs`；覆盖多 symbol/family 隔离、durable inbox/applied cursor、Actor turn ack、Owner/Cancel 路由、邮箱与执行公平性、WAL 五状态/Unknown/恢复清单、配置 epoch、Pause/Stop 残仓 custody/Flatten、三订单族能力与签名订单全语义、Net/Hedge 完整持仓腿；通用 command journal、writer lease 与账户 canonical root 测试位于 `crates/venue-execution/src/`。

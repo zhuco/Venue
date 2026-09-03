@@ -36,6 +36,14 @@ pub struct PrivateReadback {
 pub struct StreamFill {
     pub fill: Fill,
     pub client_order_id: FieldState<String>,
+    /// Original order quantity reported by the authenticated order update. Older signed-fill
+    /// fixtures do not carry this value, so absence remains explicit and is never inferred from
+    /// the last-fill quantity.
+    pub original_quantity: FieldState<Decimal>,
+    /// Cumulative executed quantity after this trade. Grid fast-path completion requires this
+    /// value together with `original_quantity` and `order_state`.
+    pub cumulative_filled_quantity: FieldState<Decimal>,
+    pub order_state: FieldState<OrderState>,
 }
 
 /// Explicit signed account capabilities required before an exchange-side protection command can
@@ -435,10 +443,82 @@ pub fn parse_stream_fill(
     };
     fill.validate()
         .map_err(PrivateParseError::OrderValidation)?;
+    let original_quantity = optional_decimal(order.get("q"));
+    let cumulative_filled_quantity = optional_decimal(order.get("z"));
+    let order_state = optional_stream_order_state(order.get("X"));
+    validate_stream_order_progress(
+        fill.quantity,
+        &original_quantity,
+        &cumulative_filled_quantity,
+        &order_state,
+    )?;
     Ok(Some(StreamFill {
         fill,
         client_order_id: optional_text(order.get("c")),
+        original_quantity,
+        cumulative_filled_quantity,
+        order_state,
     }))
+}
+
+fn validate_stream_order_progress(
+    last_filled_quantity: Decimal,
+    original_quantity: &FieldState<Decimal>,
+    cumulative_filled_quantity: &FieldState<Decimal>,
+    order_state: &FieldState<OrderState>,
+) -> Result<(), PrivateParseError> {
+    let original = match original_quantity {
+        FieldState::Known(quantity) => Some(quantity),
+        _ => None,
+    };
+    let cumulative = match cumulative_filled_quantity {
+        FieldState::Known(quantity) => Some(quantity),
+        _ => None,
+    };
+    let state = match order_state {
+        FieldState::Known(state) => Some(state),
+        _ => None,
+    };
+    if original.is_some_and(|quantity| *quantity <= Decimal::ZERO)
+        || cumulative
+            .is_some_and(|quantity| *quantity <= Decimal::ZERO || last_filled_quantity > *quantity)
+    {
+        return Err(PrivateParseError::Fill);
+    }
+    if let (Some(original), Some(cumulative)) = (original, cumulative)
+        && *cumulative > *original
+    {
+        return Err(PrivateParseError::Fill);
+    }
+    if let Some(state) = state {
+        if !matches!(state, OrderState::PartiallyFilled | OrderState::Filled) {
+            return Err(PrivateParseError::Fill);
+        }
+        if let (Some(original), Some(cumulative)) = (original, cumulative)
+            && ((*state == OrderState::PartiallyFilled && *cumulative >= *original)
+                || (*state == OrderState::Filled && *cumulative != *original))
+        {
+            return Err(PrivateParseError::Fill);
+        }
+    }
+    Ok(())
+}
+
+fn optional_stream_order_state(value: Option<&Value>) -> FieldState<OrderState> {
+    match value {
+        None => FieldState::Missing,
+        Some(Value::Null) => FieldState::Null,
+        Some(Value::String(value)) => match value.as_str() {
+            "PARTIALLY_FILLED" => FieldState::Known(OrderState::PartiallyFilled),
+            "FILLED" => FieldState::Known(OrderState::Filled),
+            _ => FieldState::Unavailable {
+                reason: UnknownReason::ParseFailure,
+            },
+        },
+        Some(_) => FieldState::Unavailable {
+            reason: UnknownReason::ParseFailure,
+        },
+    }
 }
 
 fn array(payload: &str) -> Result<Vec<Value>, PrivateParseError> {
@@ -1027,12 +1107,12 @@ mod tests {
         let symbol: Symbol = "SOL/USDC".parse()?;
         let cases = [
             (
-                r#"{"e":"ORDER_TRADE_UPDATE","E":1000,"T":999,"o":{"s":"SOLUSDC","c":"hgo_e1_long_open_l1","x":"TRADE","S":"BUY","ps":"LONG","t":7,"i":11,"l":"0.25","L":"100.125","n":"0.001","N":"USDC","rp":"0","ma":"USDC","m":true}}"#,
+                r#"{"e":"ORDER_TRADE_UPDATE","E":1000,"T":999,"o":{"s":"SOLUSDC","c":"hgo_e1_long_open_l1","x":"TRADE","X":"FILLED","S":"BUY","ps":"LONG","t":7,"i":11,"q":"0.25","l":"0.25","z":"0.25","L":"100.125","n":"0.001","N":"USDC","rp":"0","ma":"USDC","m":true}}"#,
                 r#"[{"symbol":"SOLUSDC","id":7,"orderId":11,"side":"BUY","positionSide":"LONG","qty":"0.25","price":"100.125","commission":"0.001","commissionAsset":"USDC","realizedPnl":"0","marginAsset":"USDC","maker":true,"time":999}]"#,
                 true,
             ),
             (
-                r#"{"e":"ORDER_TRADE_UPDATE","E":1000,"T":999,"o":{"s":"SOLUSDC","c":"hgo_e1_long_open_l1","x":"TRADE","S":"BUY","ps":"LONG","t":7,"i":11,"l":"0.25","L":"100.125","n":"0.001","N":"USDC","rp":"0","ma":"USDC","m":false}}"#,
+                r#"{"e":"ORDER_TRADE_UPDATE","E":1000,"T":999,"o":{"s":"SOLUSDC","c":"hgo_e1_long_open_l1","x":"TRADE","X":"FILLED","S":"BUY","ps":"LONG","t":7,"i":11,"q":"0.25","l":"0.25","z":"0.25","L":"100.125","n":"0.001","N":"USDC","rp":"0","ma":"USDC","m":false}}"#,
                 r#"[{"symbol":"SOLUSDC","id":7,"orderId":11,"side":"BUY","positionSide":"LONG","qty":"0.25","price":"100.125","commission":"0.001","commissionAsset":"USDC","realizedPnl":"0","marginAsset":"USDC","maker":false,"time":999}]"#,
                 false,
             ),
@@ -1046,6 +1126,15 @@ mod tests {
             assert_eq!(stream.fill.execution_sequence, FieldState::Known(7));
             assert_eq!(stream.fill.maker, FieldState::Known(expected_maker));
             assert_eq!(stream.fill.price.value(), Decimal::new(100125, 3));
+            assert_eq!(
+                stream.original_quantity,
+                FieldState::Known(Decimal::new(25, 2))
+            );
+            assert_eq!(
+                stream.cumulative_filled_quantity,
+                FieldState::Known(Decimal::new(25, 2))
+            );
+            assert_eq!(stream.order_state, FieldState::Known(OrderState::Filled));
             assert_eq!(
                 stream.client_order_id,
                 FieldState::Known("hgo_e1_long_open_l1".to_owned())
@@ -1064,6 +1153,26 @@ mod tests {
         )?
         .ok_or("missing stream fill")?;
         assert!(matches!(fill.fill.maker, FieldState::Missing));
+        assert!(matches!(fill.original_quantity, FieldState::Missing));
+        assert!(matches!(
+            fill.cumulative_filled_quantity,
+            FieldState::Missing
+        ));
+        assert!(matches!(fill.order_state, FieldState::Missing));
+        Ok(())
+    }
+
+    #[test]
+    fn stream_fill_rejects_inconsistent_authenticated_order_progress()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let symbol: Symbol = "SOL/USDC".parse()?;
+        for payload in [
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1000,"o":{"s":"SOLUSDC","c":"grid","x":"TRADE","X":"FILLED","S":"BUY","ps":"LONG","t":7,"i":11,"q":"1","l":"0.4","z":"0.9","L":"100","m":true}}"#,
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1000,"o":{"s":"SOLUSDC","c":"grid","x":"TRADE","X":"PARTIALLY_FILLED","S":"BUY","ps":"LONG","t":7,"i":11,"q":"1","l":"0.4","z":"1","L":"100","m":true}}"#,
+            r#"{"e":"ORDER_TRADE_UPDATE","E":1000,"o":{"s":"SOLUSDC","c":"grid","x":"TRADE","X":"PARTIALLY_FILLED","S":"BUY","ps":"LONG","t":7,"i":11,"q":"1","l":"0.8","z":"0.4","L":"100","m":true}}"#,
+        ] {
+            assert!(parse_stream_fill(payload, &symbol).is_err());
+        }
         Ok(())
     }
 

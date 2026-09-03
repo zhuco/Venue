@@ -1,12 +1,12 @@
 # VENUE Workspace Rules
 
-活动代码由根 `Cargo.toml` 声明的 Rust workspace（根 package、`apps/`、`crates/`）及独立 `apps/ui/web` npm 应用组成；两套 UI 统一位于 `apps/ui/`：`desktop` 是 VenueFlow/egui 桌面终端，`web` 是 Next.js/BFF 用户 Web，先读 `apps/ui/README.md` 判定入口。长期说明统一在 `docs/`。当前唯一产品目标是 Binance KOL 跟单 MVP：邀请注册、登录、API Key 绑定与验证、KOL 交易终端、快速跟单和 KOL 落地页。初期全站不超过 5 个启用 KOL、200 个启用跟单账户；Grid、Gate.io、Bitget 及其余交易所迁移与 Scalping 暂缓。
+活动代码由根 `Cargo.toml` 声明的 Rust workspace（根 package、`apps/`、`crates/`）及独立 `apps/ui/web` npm 应用组成；两套 UI 统一位于 `apps/ui/`：`desktop` 是 VenueFlow/egui 桌面终端，`web` 是 Next.js/BFF 用户 Web，先读 `apps/ui/README.md` 判定入口。长期说明统一在 `docs/`。当前产品目标是 Binance KOL 跟单 MVP 与 Binance 对冲网格迁入同一个 `venue-executor-binance`；新网格由签名事实驱动，不依赖 Actor/checkpoint/WAL。初期全站不超过 5 个启用 KOL、200 个启用跟单账户；Gate.io、Bitget 及其余交易所迁移与 Scalping 暂缓。
 
 ## 最短读取路径
 
 1. 先读 `CODEMAP.md`，按任务只打开对应入口和直接依赖。
-2. 当前开发范围、目标架构和验收统一查 `docs/KOL_COPY_MVP.md`。
-3. 只有维护冻结 Grid/旧 Node、处理其已有仓位或工件时，才完整阅读 `docs/GRID_RUNTIME_REFACTOR.md`；该旧运行时不得成为 KOL MVP 的依赖模板。
+2. KOL 开发范围与验收查 `docs/KOL_COPY_MVP.md`。
+3. Binance Grid 迁移、冻结旧 Grid/Node 或已有仓位/工件处理必须完整阅读 `docs/GRID_RUNTIME_REFACTOR.md`；旧运行时不得成为新网格或 KOL MVP 的依赖模板。
 
 ## 目录与旧实现
 
@@ -18,7 +18,7 @@
 
 - 只实现当前获准任务，不创建未被当前需求使用的未来模块、公共 SDK、插件系统或多租户控制面。
 - 默认按影响面验证：文档/注释只做静态检查，单模块修改只检查该 package 及直接契约，交易安全修改覆盖受影响的命令幂等、账户顺序队列、签名查单、数量/权限与超时待对账路径。跨模块公共契约、依赖或架构变更及正式发布前集中执行 `cargo fmt --all --check`、`cargo check --workspace --all-targets`、`cargo test --workspace`、`scripts/verify_repository_hygiene.ps1` 建立基线；基线后的局部增量不重复全工作区测试。记录验证对应的源码范围，相关验证失败时不得宣称完成或删除被替代实现。
-- KOL MVP 只允许一个 `venue-executor-binance` 部署实例管理新链账户；账户在进程内使用独立串行队列和有界全局并发，不为每个账户启动进程、Actor、writer lease 或本地 WAL。PostgreSQL 命令账本、稳定 `clientOrderId` 和超时后的签名查单是唯一新链耐久边界。
+- 新链只允许一个 `venue-executor-binance` 部署实例管理 KOL、终端与 Binance Grid 账户；账户在进程内使用独立串行队列和有界全局并发，不为每个账户启动进程、Actor、writer lease 或本地 WAL。PostgreSQL 命令账本、稳定 `clientOrderId` 和超时后的签名查单是唯一新链耐久边界。
 - 新链与冻结旧 Node 必须按 `trading_account_id` 互斥分配；同一真实账户不得同时由两条路径下单。旧账户的未决 WAL、Unknown、仓位和工件未安全收敛前不得迁入新链，也不得为推进 MVP 删除或伪造旧状态。
 - 请求结果不确定时把新链命令置为 `ReconcileRequired`，按同一 `clientOrderId` 查询订单/成交；确认前不重发。该状态只暂停对应账户的后续增险，不建立 authority、root、receipt、manifest 或事件回放体系。
 - KOL 成交复制只按 Binance 认证账户流的真实成交增量触发，并以签名 REST 补查恢复，不按页面点击或 NEW 订单触发；双向持仓必须保留 `positionSide`。平仓在领域层是只减仓意图，发送前按跟随账户同代新鲜签名持仓向下裁剪；Portfolio Margin UM Hedge Mode 的原生订单不得发送 Binance 禁止的 `reduceOnly` 参数。
@@ -28,7 +28,7 @@
 
 - 手写源文件最多 2000 个物理行；入口文件只声明、组合和重导出，新增行为超限前按职责拆分。
 - `domain` 不依赖业务模块；交易所原始协议只存在于 `exchange`；策略不得依赖具体交易所、凭证、原生字段或物理订单客户端。
-- 当前 KOL MVP 不建立通用策略 runtime；交易所原始差异仍只进入 adapter。未来 Grid 应由配置与签名订单/双向持仓事实计算目标订单并收敛，不恢复 Actor/checkpoint 作为新架构前置。
+- 不建立通用策略 runtime；交易所原始差异仍只进入 adapter。Binance Grid 由配置与签名订单/双向持仓事实计算目标订单并收敛，不恢复 Actor/checkpoint 作为新架构前置。
 - 规范交易对使用大写 `BASE/QUOTE` 的 `domain::Symbol`；native symbol 不越过 adapter。
 - KOL MVP 只准入 Binance Portfolio Margin UM 的精确 `LIVE`；其余 adapter 代码冻结且不扩大验收范围。不得新增测试网、demo、Shadow 或隐式布尔模式。离线 fixture、mock 和集成测试是验证手段，不是运行模式。
 - 用户 API Key 由 Control 使用现有 AES-256-GCM 边界加密后存 PostgreSQL；只有验证流程和 Binance Executor 可短时解密。明文不得进入浏览器响应、KOL 页面、TOML、日志、错误或工件，也不得由 KOL 查看。API 必须具备读取与 UM 交易权限、关闭提现，并验证 Portfolio Margin 统一账户与双向持仓。

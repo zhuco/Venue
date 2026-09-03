@@ -3,6 +3,7 @@
 
 mod credentials;
 mod crypto;
+mod grid;
 mod kol;
 mod session;
 mod terminal;

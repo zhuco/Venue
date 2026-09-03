@@ -5,11 +5,16 @@ use std::collections::BTreeSet;
 use venue_control_protocol::{
     ControlSnapshot, CopyRelationUpsertRequest, ExecutionFactsSnapshot,
     accounts::*,
+    grid::{
+        GRID_INSTANCES_PATH, GRID_LIFECYCLE_PATH, GridConfigUpdateRequest,
+        GridInstanceCreateRequest, GridLifecycleRequest,
+    },
     kol::{
         FollowLifecycleRequest, FollowSettingsUpsertRequest, KOL_EXECUTION_STATUS_PATH,
         KOL_FOLLOW_LIFECYCLE_PATH, KOL_FOLLOW_SETTINGS_PATH, KOL_PROFILE_PATH,
-        KOL_TERMINAL_ACCOUNT_PATH, KOL_TERMINAL_ORDER_PATH, KolProfileUpdateRequest,
-        TerminalOrderRequest, TerminalProjectionRequest,
+        KOL_TERMINAL_ACCOUNT_PATH, KOL_TERMINAL_CANCEL_PATH, KOL_TERMINAL_ORDER_PATH,
+        KolProfileUpdateRequest, TerminalCancelRequest, TerminalOrderRequest,
+        TerminalProjectionRequest,
     },
 };
 
@@ -56,7 +61,10 @@ where
                 | KOL_FOLLOW_LIFECYCLE_PATH
                 | KOL_TERMINAL_ACCOUNT_PATH
                 | KOL_TERMINAL_ORDER_PATH
+                | KOL_TERMINAL_CANCEL_PATH
                 | KOL_EXECUTION_STATUS_PATH
+                | GRID_INSTANCES_PATH
+                | GRID_LIFECYCLE_PATH
         )
     {
         let Some(accounts) = accounts else {
@@ -328,9 +336,60 @@ async fn account_request(
                 )
                 .await?,
         ),
+        (Method::Post, KOL_TERMINAL_CANCEL_PATH) => encode(
+            &accounts
+                .enqueue_terminal_cancel(
+                    &principal,
+                    decode::<TerminalCancelRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
         (Method::Get, KOL_EXECUTION_STATUS_PATH) => {
             encode(&accounts.terminal_executions(&principal).await?)
         }
+        (Method::Get, GRID_INSTANCES_PATH) => encode(&accounts.grid_instances(&principal).await?),
+        (Method::Post, GRID_INSTANCES_PATH) => {
+            let value: serde_json::Value = decode(&request.body)?;
+            if value.get("instance_id").is_some() {
+                encode(
+                    &accounts
+                        .update_grid_config(
+                            &principal,
+                            serde_json::from_value::<GridConfigUpdateRequest>(value).map_err(
+                                |_| AccountError {
+                                    code: AccountErrorCode::InvalidInput,
+                                },
+                            )?,
+                            now,
+                        )
+                        .await?,
+                )
+            } else {
+                encode(
+                    &accounts
+                        .create_grid_instance(
+                            &principal,
+                            serde_json::from_value::<GridInstanceCreateRequest>(value).map_err(
+                                |_| AccountError {
+                                    code: AccountErrorCode::InvalidInput,
+                                },
+                            )?,
+                            now,
+                        )
+                        .await?,
+                )
+            }
+        }
+        (Method::Post, GRID_LIFECYCLE_PATH) => encode(
+            &accounts
+                .request_grid_lifecycle(
+                    &principal,
+                    decode::<GridLifecycleRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
         (Method::Get, SESSION_PATH | CREDENTIALS_PATH) => {
             encode(&accounts.overview(&principal, now).await?)
         }

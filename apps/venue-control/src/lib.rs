@@ -20,6 +20,9 @@ pub mod executor_exchange;
 pub mod executor_runtime;
 pub mod executor_secret;
 pub mod executor_store;
+mod grid_hot_dispatch;
+pub mod grid_runtime;
+pub mod grid_store;
 mod http;
 mod indicator_projection;
 pub mod kol_executor;
@@ -60,7 +63,20 @@ pub use copy_worker::{
     CopyPlanningSnapshot, CopySemanticJob, CopyWorker, CopyWorkerConfig, CopyWorkerError,
     FrozenCapitalSnapshot, MIGRATION_0003, PlannedCopyJob, relation_commitment,
 };
-pub use executor_store::{ActiveKolPrivateSource, PlannedCopyCommand};
+pub use executor_store::{
+    ActiveKolPrivateSource, MIGRATION_0022, PlannedCopyCommand, RecoverableBinanceCommand,
+};
+pub use grid_hot_dispatch::{GridHotDispatchCache, GridHotDispatchToken};
+pub use grid_runtime::{
+    BinanceGridRuntime, BinanceGridRuntimeError, GRID_PRIVATE_STREAM_CHANNEL_CAPACITY,
+    GridPrivateStreamSignal,
+};
+pub use grid_store::{
+    BinanceGridStore, GridCommandIntent, GridCommandStatus, GridConvergenceUpdate,
+    GridDesiredOrder, GridDesiredSurface, GridFillAllocation, GridLedgerCommand,
+    GridLedgerCommandRecord, GridOrderOwnership, GridOwnedOrderState, GridRuntimeRecord,
+    GridStoreError, MAX_GRID_DESIRED_ORDERS, MIGRATION_0021,
+};
 pub use http::{
     ControlHttpConfig, HttpServerError, control_shutdown_channel, serve_local,
     serve_local_with_accounts, serve_local_with_indicators,
@@ -88,3 +104,6 @@ pub use repository::{
     SnapshotStoreResult,
 };
 pub use service::{ControlService, ServiceError};
+
+pub const MIGRATION_0023: &str = include_str!("../migrations/0023_binance_grid_hot_batch.sql");
+pub const MIGRATION_0024: &str = include_str!("../migrations/0024_binance_grid_batch_chain.sql");

@@ -1,7 +1,8 @@
 use eframe::egui::{self, Color32, RichText, Stroke};
 use venue_control_protocol::TradingAction;
 use venue_control_protocol::kol::{
-    TERMINAL_SCHEMA_VERSION, TerminalAction, TerminalOrderKind, TerminalOrderRequest,
+    TERMINAL_SCHEMA_VERSION, TerminalAction, TerminalCancelRequest, TerminalOrderKind,
+    TerminalOrderRequest,
 };
 
 use crate::i18n::{TextKey, text};
@@ -334,6 +335,44 @@ fn action_disabled_reason(model: &AppModel, action: TradingAction, now: f64) -> 
             .to_owned(),
         );
     }
+    if action == TradingAction::CancelAllOrders {
+        return Some(
+            label(
+                language,
+                "不提供全撤；请在当前委托表选择一张订单后精确撤销",
+                "Cancel all is unavailable; select one open order for exact cancellation",
+            )
+            .to_owned(),
+        );
+    }
+    if action == TradingAction::CancelSelectedOrder {
+        return terminal_cancel_selection(model).err().map(|error| {
+            label(
+                language,
+                match error {
+                    CancelSelectionError::Missing => "请先在当前委托表点击有交易所委托号的一行",
+                    CancelSelectionError::ScopeChanged => {
+                        "所选委托不属于当前交易账户或交易对，请重新选择"
+                    }
+                    CancelSelectionError::Disappeared => {
+                        "所选委托已不在最新活动委托投影中，请刷新后重新选择"
+                    }
+                },
+                match error {
+                    CancelSelectionError::Missing => {
+                        "Select an open-order row with an exchange order ID first"
+                    }
+                    CancelSelectionError::ScopeChanged => {
+                        "The selected order is outside the current account or symbol; select again"
+                    }
+                    CancelSelectionError::Disappeared => {
+                        "The selected order is absent from the latest open-order projection"
+                    }
+                },
+            )
+            .to_owned()
+        });
+    }
     if !model.preferences.trading.post_only {
         return Some(
             label(
@@ -402,11 +441,42 @@ pub fn apply_action(
         }
         _ => {}
     }
-    if matches!(
-        action,
-        TradingAction::CancelSelectedOrder | TradingAction::CancelAllOrders
-    ) {
-        model.notice("Cancel is not enabled until exact Binance order cancellation is connected");
+    if action == TradingAction::CancelAllOrders {
+        if let Some(reason) =
+            action_disabled_reason(model, action, context.input(|input| input.time))
+        {
+            model.notice(reason);
+        }
+        return;
+    }
+    if action == TradingAction::CancelSelectedOrder {
+        if let Some(reason) =
+            action_disabled_reason(model, action, context.input(|input| input.time))
+        {
+            model.notice(reason);
+            return;
+        }
+        let selection = match terminal_cancel_selection(model) {
+            Ok(selection) => selection.clone(),
+            Err(_) => {
+                model.notice("Selected order is no longer cancellable");
+                return;
+            }
+        };
+        let request = TerminalCancelRequest {
+            schema_version: TERMINAL_SCHEMA_VERSION,
+            request_id: model.next_terminal_request_id(),
+            credential_id: selection.credential_id,
+            symbol: selection.symbol,
+            native_order_id: selection.native_order_id,
+        };
+        match client.send_terminal_cancel(request) {
+            Ok(()) => {
+                model.trade_dock.clear_order_selection();
+                model.notice("Submitted exact order cancellation to the Binance Executor ledger");
+            }
+            Err(error) => model.notice(format!("Exact cancellation rejected locally: {error}")),
+        }
         return;
     }
     if let Some(reason) = action_disabled_reason(model, action, context.input(|input| input.time)) {
@@ -431,6 +501,46 @@ pub fn apply_action(
         }
         Err(error) => model.notice(format!("Trading request rejected locally: {error}")),
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CancelSelectionError {
+    Missing,
+    ScopeChanged,
+    Disappeared,
+}
+
+fn terminal_cancel_selection(
+    model: &AppModel,
+) -> Result<&crate::trading::TerminalOrderSelection, CancelSelectionError> {
+    let selection = model
+        .trade_dock
+        .terminal_order_selection
+        .as_ref()
+        .ok_or(CancelSelectionError::Missing)?;
+    let selected_credential = model
+        .account_overview
+        .as_ref()
+        .and_then(|overview| overview.selected_credential_id.as_deref());
+    if selected_credential != Some(selection.credential_id.as_str())
+        || model.preferences.execution_account_id.as_deref()
+            != Some(selection.trading_account_id.as_str())
+        || model.preferences.selected_symbol != selection.symbol.to_string()
+    {
+        return Err(CancelSelectionError::ScopeChanged);
+    }
+    let projection = model
+        .execution
+        .private_projection_for(Some(&selection.trading_account_id))
+        .filter(|projection| projection.credential_id == selection.credential_id)
+        .ok_or(CancelSelectionError::ScopeChanged)?;
+    if !projection.open_orders.iter().any(|order| {
+        order.symbol == selection.symbol
+            && order.native_order_id.as_deref() == Some(selection.native_order_id.as_str())
+    }) {
+        return Err(CancelSelectionError::Disappeared);
+    }
+    Ok(selection)
 }
 
 fn terminal_request_parts(
@@ -595,7 +705,7 @@ pub(crate) const fn action_name(
         TradingAction::CloseLong => label(language, "平多", "Close Long"),
         TradingAction::CloseShort => label(language, "平空", "Close Short"),
         TradingAction::OpenShort => label(language, "开空", "Open Short"),
-        TradingAction::CancelSelectedOrder => label(language, "撤当前", "Cancel Current"),
+        TradingAction::CancelSelectedOrder => label(language, "撤选中", "Cancel Selected"),
         TradingAction::CancelAllOrders => label(language, "撤全部", "Cancel All"),
         TradingAction::SelectSizePreset(_) => label(language, "数量预设", "Size Preset"),
         TradingAction::ClearSelection => label(language, "清除", "Clear"),

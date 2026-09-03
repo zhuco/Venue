@@ -343,6 +343,7 @@ pub struct TradeDockState {
     pub amount_input: String,
     pub amount_in_base: bool,
     pub selected_order_id: Option<String>,
+    pub terminal_order_selection: Option<TerminalOrderSelection>,
     pub armed_action: Option<TradingAction>,
     pub selected_size_preset: usize,
     pub market_close_requested: Option<venue_domain::PositionSide>,
@@ -417,7 +418,17 @@ impl TradeDockState {
     pub fn clear_selection(&mut self) {
         self.clear_price();
         self.amount_input.clear();
+        self.clear_order_selection();
+    }
+
+    pub fn clear_order_selection(&mut self) {
         self.selected_order_id = None;
+        self.terminal_order_selection = None;
+    }
+
+    pub fn select_terminal_order(&mut self, selection: TerminalOrderSelection) {
+        self.selected_order_id = Some(selection.native_order_id.clone());
+        self.terminal_order_selection = Some(selection);
     }
 
     pub fn edit_price(&mut self, input: String, now: f64) {
@@ -460,6 +471,14 @@ impl TradeDockState {
             Ok(amount)
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalOrderSelection {
+    pub credential_id: String,
+    pub trading_account_id: String,
+    pub symbol: venue_domain::Symbol,
+    pub native_order_id: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]

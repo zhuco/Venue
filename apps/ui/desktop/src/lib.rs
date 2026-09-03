@@ -8,6 +8,7 @@ mod client;
 mod copy_relation_view;
 mod custom_indicator;
 mod execution_view;
+mod grid_view;
 mod i18n;
 #[cfg(not(target_arch = "wasm32"))]
 mod market;
