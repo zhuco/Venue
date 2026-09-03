@@ -317,7 +317,7 @@ impl BinanceCommandLedger {
                     AND (current_batch.predecessor_batch_id IS NULL OR NOT EXISTS (\
                       SELECT 1 FROM venue_binance_commands predecessor \
                       WHERE predecessor.grid_batch_id=current_batch.predecessor_batch_id \
-                        AND predecessor.command_state<>'reconciled')))) \
+                        AND predecessor.command_state NOT IN ('reconciled','rejected','cancelled'))))) \
              AND NOT EXISTS (SELECT 1 FROM venue_control_strategy_scopes legacy \
                  WHERE legacy.venue='binance' AND legacy.mode='LIVE' \
                  AND legacy.trading_account_id=c.trading_account_id) \
@@ -387,8 +387,8 @@ impl BinanceCommandLedger {
                  WHERE current_batch.batch_id=c.grid_batch_id \
                    AND (current_batch.predecessor_batch_id IS NULL OR NOT EXISTS (\
                      SELECT 1 FROM venue_binance_commands predecessor \
-                     WHERE predecessor.grid_batch_id=current_batch.predecessor_batch_id \
-                       AND predecessor.command_state<>'reconciled')))) \
+                    WHERE predecessor.grid_batch_id=current_batch.predecessor_batch_id \
+                      AND predecessor.command_state NOT IN ('reconciled','rejected','cancelled'))))) \
              AND NOT EXISTS (SELECT 1 FROM venue_control_strategy_scopes legacy \
                  WHERE legacy.venue='binance' AND legacy.mode='LIVE' \
                  AND legacy.trading_account_id=c.trading_account_id) \
@@ -1355,7 +1355,10 @@ mod tests {
             .map(|start| &source[start..])
             .expect("batch claim");
         assert!(claim.contains("current_batch.predecessor_batch_id IS NULL"));
-        assert!(claim.contains("predecessor.command_state<>'reconciled'"));
+        assert!(
+            claim
+                .contains("predecessor.command_state NOT IN ('reconciled','rejected','cancelled')")
+        );
         assert!(claim.contains("FOR UPDATE OF batch"));
     }
 }
