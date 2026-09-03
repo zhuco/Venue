@@ -14,7 +14,7 @@ fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("VenueFlow — Venue Control Workstation")
-            .with_decorations(true)
+            .with_decorations(false)
             .with_maximized(true)
             .with_inner_size([1_680.0, 1_000.0])
             .with_min_inner_size([1_100.0, 700.0]),

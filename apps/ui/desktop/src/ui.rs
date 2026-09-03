@@ -1,4 +1,4 @@
-use eframe::egui::{self, Align2, Color32, FontId, RichText, Stroke};
+use eframe::egui::{self, Align2, FontId, RichText, Stroke};
 mod presentation;
 mod status_bar;
 #[cfg(test)]
@@ -71,7 +71,7 @@ pub fn show_top_bar(
     egui::Frame::new()
         .fill(theme::BG_SECONDARY)
         .stroke(Stroke::new(1.0, theme::DIVIDER))
-        .inner_margin(egui::Margin::symmetric(10, 3))
+        .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
             let language = model.preferences.language;
             let mut reset_requested = false;
@@ -80,246 +80,157 @@ pub fn show_top_bar(
             let mut market_server = model.preferences.market_server;
             let account_overview = model.account_overview.clone();
             let mut account_selection_requested = None;
-            let account_label = model
-                .preferences
-                .execution_account_id
-                .as_deref()
-                .map(|account| {
-                    format!(
-                        "{} {}",
-                        text(language, TextKey::ExecutionAccount),
-                        short_account(account)
-                    )
+            let account_label = account_overview
+                .as_ref()
+                .and_then(|overview| {
+                    overview.credentials.iter().find(|credential| {
+                        overview.selected_credential_id.as_deref()
+                            == Some(credential.credential_id.as_str())
+                    })
                 })
-                .unwrap_or_else(|| {
-                    model
-                        .account_overview
-                        .as_ref()
-                        .map(|v| {
-                            format!(
-                                "{} · {}",
-                                v.user.username,
-                                text(language, TextKey::ExecutionAccount)
-                            )
-                        })
-                        .unwrap_or_else(|| text(language, TextKey::LoginAccount).to_owned())
-                });
+                .map(|credential| credential.label.clone())
+                .unwrap_or_else(|| text(language, TextKey::ExecutionAccount).to_owned());
             let ((), search_response) = egui::containers::Sides::new()
                 .shrink_left()
-                .height(48.0)
+                .height(30.0)
                 .show(
                     ui,
                     |ui| {
+                        let drag = ui.allocate_response(
+                            ui.available_size_before_wrap(),
+                            egui::Sense::click_and_drag(),
+                        );
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if drag.double_clicked() {
+                            toggle_maximized(ui.ctx());
+                        } else if drag.drag_started() {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        }
+                    },
+                    |ui| {
                         ui.horizontal_centered(|ui| {
-                            ui.label(
-                                RichText::new("VENUEFLOW")
-                                    .strong()
-                                    .size(16.0)
-                                    .color(theme::BRAND_HOVER),
+                            let filter_before = symbol_filter.clone();
+                            let search_response = ui.add_sized(
+                                [150.0, 26.0],
+                                egui::TextEdit::singleline(&mut symbol_filter).hint_text(
+                                    match language {
+                                        Language::SimplifiedChinese => "搜索交易对",
+                                        Language::English => "Search markets",
+                                    },
+                                ),
                             );
-                            ui.separator();
-                            for workspace in WorkspaceKind::ALL {
-                                if ui
-                                    .selectable_label(
-                                        workspaces.active == workspace,
-                                        workspace.label(language),
-                                    )
-                                    .clicked()
-                                {
-                                    workspaces.active = workspace;
-                                }
+                            if search_response.has_focus() || symbol_filter != filter_before {
+                                picker_requested.set(true);
                             }
-                            ui.separator();
-                            egui::ScrollArea::horizontal()
-                                .id_salt("favorite-symbol-tabs")
-                                .auto_shrink([false, true])
-                                .show(ui, |ui| {
-                                    ui.horizontal_centered(|ui| {
-                                        let tabs = model.preferences.favorite_symbols.clone();
-                                        let mut close_requested = None;
-                                        for symbol in tabs {
-                                            let quote = local_quote(model, &symbol);
-                                            let details = quote.map_or_else(
-                                                || "—  —".to_owned(),
-                                                |quote| {
-                                                    format!(
-                                                        "{} {:+.2}%",
-                                                        model.format_market_price(
-                                                            &symbol, quote.last
-                                                        ),
-                                                        quote.change_percent_24h
-                                                    )
-                                                },
-                                            );
+                            egui::ComboBox::from_id_salt("market-server")
+                                .width(94.0)
+                                .selected_text(format!("行情 · {}", market_server.label()))
+                                .show_ui(ui, |ui| {
+                                    for server in crate::model::MarketServer::ALL {
+                                        ui.selectable_value(
+                                            &mut market_server,
+                                            server,
+                                            server.label(),
+                                        );
+                                    }
+                                });
+                            if let Some(overview) = &account_overview {
+                                egui::ComboBox::from_id_salt("execution-account-selection")
+                                    .width(112.0)
+                                    .selected_text(&account_label)
+                                    .show_ui(ui, |ui| {
+                                        for credential in &overview.credentials {
                                             let selected =
-                                                model.preferences.selected_symbol == symbol;
-                                            let detail_color =
-                                                quote.map_or(theme::TEXT_SECONDARY, |quote| {
-                                                    theme::value_color(decimal_to_f64(
-                                                        quote.change_percent_24h,
-                                                    ))
-                                                });
-                                            let response = ui
-                                                .horizontal(|ui| {
-                                                    ui.spacing_mut().item_spacing.x = 0.0;
-                                                    let tab = ui.add_sized(
-                                                        [124.0, 44.0],
-                                                        egui::Button::new(symbol_tab_text(
-                                                            &symbol,
-                                                            &details,
-                                                            detail_color,
-                                                        ))
-                                                        .fill(if selected {
-                                                            theme::PANEL
-                                                        } else {
-                                                            theme::BG_SECONDARY
-                                                        }),
-                                                    );
-                                                    let close = ui
-                                                        .add_sized(
-                                                            [28.0, 44.0],
-                                                            egui::Button::new(
-                                                                RichText::new("×").size(16.0),
-                                                            )
-                                                            .fill(if selected {
-                                                                theme::PANEL
-                                                            } else {
-                                                                theme::BG_SECONDARY
-                                                            })
-                                                            .frame(true),
-                                                        )
-                                                        .on_hover_text(match language {
-                                                            Language::SimplifiedChinese => {
-                                                                "关闭交易对"
-                                                            }
-                                                            Language::English => "Close market",
-                                                        });
-                                                    if close.clicked() {
-                                                        close_requested = Some(symbol.clone());
-                                                    }
-                                                    tab
-                                                })
-                                                .inner;
-                                            if selected {
-                                                ui.painter().line_segment(
-                                                    [
-                                                        response.rect.left_top(),
-                                                        response.rect.right_top(),
-                                                    ],
-                                                    Stroke::new(2.0, theme::BRAND),
-                                                );
-                                            }
-                                            if response.clicked() {
-                                                model.select_symbol(symbol.clone());
-                                                workspaces.follow_dynamic_charts_latest();
-                                            }
-                                        }
-                                        if let Some(symbol) = close_requested
-                                            && model.close_symbol_tab(&symbol)
-                                        {
-                                            workspaces.follow_dynamic_charts_latest();
-                                            if model.preferences.favorite_symbols.is_empty() {
-                                                picker_requested.set(true);
+                                                overview.selected_credential_id.as_deref()
+                                                    == Some(credential.credential_id.as_str());
+                                            if ui
+                                                .add_enabled(
+                                                    credential.selectable(
+                                                        crate::account_center::now_ms(),
+                                                    ),
+                                                    egui::Button::selectable(
+                                                        selected,
+                                                        format!(
+                                                            "{} · {}",
+                                                            credential.label, credential.masked_key
+                                                        ),
+                                                    ),
+                                                )
+                                                .clicked()
+                                            {
+                                                account_selection_requested =
+                                                    Some(credential.credential_id.clone());
                                             }
                                         }
                                         if ui
-                                            .add_sized([32.0, 44.0], egui::Button::new("+"))
+                                            .button(text(language, TextKey::SelectExecutionAccount))
                                             .clicked()
                                         {
-                                            picker_requested.set(true);
+                                            *show_execution_account = true;
                                         }
                                     });
-                                });
+                            }
+                            let user_label = account_overview
+                                .as_ref()
+                                .map(|a| a.user.username.as_str())
+                                .unwrap_or_else(|| text(language, TextKey::LoginAccount));
+                            if ui.button(user_label).clicked() {
+                                *show_execution_account = true;
+                            }
+                            if ui
+                                .button(text(language, TextKey::TradingSettings))
+                                .clicked()
+                            {
+                                *show_trading_settings = true;
+                            }
+                            if ui.button(text(language, TextKey::Modules)).clicked() {
+                                *show_modules = true;
+                            }
+                            #[cfg(not(target_arch = "wasm32"))]
+                            window_controls(ui);
+                            search_response
                         })
                         .inner
                     },
-                    |ui| {
-                        if ui
-                            .button(text(language, TextKey::TradingSettings))
-                            .clicked()
-                        {
-                            *show_trading_settings = true;
-                        }
-                        if ui.button(text(language, TextKey::Modules)).clicked() {
-                            *show_modules = true;
-                        }
-                        if ui.button(text(language, TextKey::ResetLayout)).clicked() {
-                            reset_requested = true;
-                        }
-                        let user_label = account_overview
-                            .as_ref()
-                            .map(|a| a.user.username.as_str())
-                            .unwrap_or_else(|| text(language, TextKey::LoginAccount));
-                        if ui.button(user_label).clicked() {
-                            *show_execution_account = true;
-                        }
-                        if let Some(overview) = &account_overview {
-                            egui::ComboBox::from_id_salt("execution-account-selection")
-                                .selected_text(&account_label)
-                                .show_ui(ui, |ui| {
-                                    for credential in &overview.credentials {
-                                        let selected = overview.selected_credential_id.as_deref()
-                                            == Some(credential.credential_id.as_str());
-                                        if ui
-                                            .add_enabled(
-                                                credential
-                                                    .selectable(crate::account_center::now_ms()),
-                                                egui::Button::selectable(
-                                                    selected,
-                                                    format!(
-                                                        "{} · {}",
-                                                        credential.label, credential.masked_key
-                                                    ),
-                                                ),
-                                            )
-                                            .clicked()
-                                        {
-                                            account_selection_requested =
-                                                Some(credential.credential_id.clone());
-                                        }
-                                    }
-                                    if ui
-                                        .button(text(language, TextKey::SelectExecutionAccount))
-                                        .clicked()
-                                    {
-                                        *show_execution_account = true;
-                                    }
-                                });
-                        }
-                        egui::ComboBox::from_id_salt("market-server")
-                            .width(125.0)
+                );
+            ui.separator();
+            egui::ScrollArea::horizontal()
+                .id_salt("favorite-symbol-tabs")
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        show_symbol_tabs(ui, model, workspaces, &picker_requested);
+                        egui::ComboBox::from_id_salt("workspace-layout")
+                            .width(116.0)
                             .selected_text(format!(
-                                "{}: {}",
-                                text(language, TextKey::MarketServer),
-                                market_server.label()
+                                "{} · {}",
+                                match language {
+                                    Language::SimplifiedChinese => "布局管理",
+                                    Language::English => "Layout",
+                                },
+                                workspaces.active.label(language)
                             ))
                             .show_ui(ui, |ui| {
-                                for server in crate::model::MarketServer::ALL {
-                                    ui.selectable_value(&mut market_server, server, server.label());
+                                for workspace in WorkspaceKind::ALL {
+                                    ui.selectable_value(
+                                        &mut workspaces.active,
+                                        workspace,
+                                        workspace.label(language),
+                                    );
+                                }
+                                ui.separator();
+                                if ui.button(text(language, TextKey::ResetLayout)).clicked() {
+                                    reset_requested = true;
+                                    ui.close();
                                 }
                             });
-                        let filter_before = symbol_filter.clone();
-                        let search_response = ui.add_sized(
-                            [180.0, 30.0],
-                            egui::TextEdit::singleline(&mut symbol_filter)
-                                .horizontal_align(egui::Align::LEFT)
-                                .vertical_align(egui::Align::Center)
-                                .hint_text(match language {
-                                    Language::SimplifiedChinese => "搜索交易对",
-                                    Language::English => "Search markets",
-                                }),
-                        );
-                        if search_response.has_focus() || symbol_filter != filter_before {
-                            picker_requested.set(true);
-                        }
-                        search_response
-                    },
-                );
+                    });
+                });
             if model.preferences.market_server != market_server {
                 model.preferences.market_server = market_server;
-                if account_selection_requested.is_some() {
-                    model.account_selection_requested = account_selection_requested;
-                }
+            }
+            if account_selection_requested.is_some() {
+                model.account_selection_requested = account_selection_requested;
             }
             model.symbol_filter = symbol_filter;
             *show_symbol_picker = picker_requested.get();
@@ -327,8 +238,137 @@ pub fn show_top_bar(
                 workspaces.restore_active();
                 model.notice("Restored the active workspace layout");
             }
-            crate::symbol_picker::show(&search_response, show_symbol_picker, model, workspaces);
+            let mut popup_anchor = search_response;
+            let popup_top = ui.min_rect().bottom();
+            popup_anchor.rect = egui::Rect::from_min_max(
+                egui::pos2(popup_anchor.rect.left(), popup_top - 1.0),
+                egui::pos2(popup_anchor.rect.right(), popup_top),
+            );
+            crate::symbol_picker::show(&popup_anchor, show_symbol_picker, model, workspaces);
         });
+}
+
+fn show_symbol_tabs(
+    ui: &mut egui::Ui,
+    model: &mut AppModel,
+    workspaces: &mut Workspaces,
+    picker_requested: &std::cell::Cell<bool>,
+) {
+    let tabs = model.preferences.favorite_symbols.clone();
+    let mut close_requested = None;
+    for symbol in tabs {
+        let quote = local_quote(model, &symbol);
+        let details = quote.map_or_else(
+            || "—  —".to_owned(),
+            |quote| {
+                format!(
+                    "{} {:+.2}%",
+                    model.format_market_price(&symbol, quote.last),
+                    quote.change_percent_24h
+                )
+            },
+        );
+        let selected = model.preferences.selected_symbol == symbol;
+        let detail_color = quote.map_or(theme::TEXT_SECONDARY, |quote| {
+            theme::value_color(decimal_to_f64(quote.change_percent_24h))
+        });
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(152.0, 40.0), egui::Sense::click());
+        ui.painter().rect_filled(
+            rect,
+            0.0,
+            if selected {
+                theme::PANEL
+            } else if response.hovered() {
+                theme::BG_PRIMARY
+            } else {
+                theme::BG_SECONDARY
+            },
+        );
+        if selected {
+            ui.painter().line_segment(
+                [rect.left_top(), rect.right_top()],
+                Stroke::new(2.0, theme::BRAND),
+            );
+        }
+        ui.painter().text(
+            rect.left_top() + egui::vec2(10.0, 6.0),
+            Align2::LEFT_TOP,
+            &symbol,
+            FontId::proportional(12.0),
+            if selected {
+                theme::BRAND_HOVER
+            } else {
+                theme::TEXT_PRIMARY
+            },
+        );
+        ui.painter().text(
+            rect.left_bottom() + egui::vec2(10.0, -6.0),
+            Align2::LEFT_BOTTOM,
+            details,
+            FontId::monospace(10.0),
+            detail_color,
+        );
+        let close_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.right() - 26.0, rect.top()),
+            rect.right_bottom(),
+        );
+        let close = ui.interact(
+            close_rect,
+            ui.make_persistent_id(("close-symbol-tab", &symbol)),
+            egui::Sense::click(),
+        );
+        if response.hovered() || close.hovered() {
+            ui.painter().text(
+                close_rect.center(),
+                Align2::CENTER_CENTER,
+                "×",
+                FontId::proportional(16.0),
+                if close.hovered() {
+                    theme::TEXT_PRIMARY
+                } else {
+                    theme::TEXT_SECONDARY
+                },
+            );
+        }
+        if close.clicked() {
+            close_requested = Some(symbol.clone());
+        } else if response.clicked() {
+            model.select_symbol(symbol);
+            workspaces.follow_dynamic_charts_latest();
+        }
+    }
+    if let Some(symbol) = close_requested
+        && model.close_symbol_tab(&symbol)
+    {
+        workspaces.follow_dynamic_charts_latest();
+        if model.preferences.favorite_symbols.is_empty() {
+            picker_requested.set(true);
+        }
+    }
+    if ui.add_sized([40.0, 40.0], egui::Button::new("+")).clicked() {
+        picker_requested.set(true);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn window_controls(ui: &mut egui::Ui) {
+    if ui.add_sized([32.0, 26.0], egui::Button::new("—")).clicked() {
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+    }
+    if ui.add_sized([32.0, 26.0], egui::Button::new("□")).clicked() {
+        toggle_maximized(ui.ctx());
+    }
+    if ui.add_sized([32.0, 26.0], egui::Button::new("×")).clicked() {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn toggle_maximized(context: &egui::Context) {
+    let maximized = context.input(|input| input.viewport().maximized.unwrap_or(false));
+    context.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
 }
 pub fn show_status_bar(ui: &mut egui::Ui, model: &AppModel) {
     status_bar::show(ui, model);
@@ -1419,28 +1459,6 @@ pub(crate) fn favorite_rank(favorites: &[String], symbol: &str) -> usize {
 }
 pub(crate) fn local_quote<'a>(model: &'a AppModel, symbol: &str) -> Option<&'a MarketQuote> {
     model.local_quotes.get(symbol)
-}
-fn symbol_tab_text(symbol: &str, details: &str, detail_color: Color32) -> egui::WidgetText {
-    let mut job = egui::text::LayoutJob::default();
-    job.append(
-        symbol,
-        0.0,
-        egui::TextFormat {
-            font_id: FontId::proportional(12.5),
-            color: theme::TEXT_PRIMARY,
-            ..Default::default()
-        },
-    );
-    job.append(
-        &format!("\n{details}"),
-        0.0,
-        egui::TextFormat {
-            font_id: FontId::monospace(11.0),
-            color: detail_color,
-            ..Default::default()
-        },
-    );
-    job.into()
 }
 pub(crate) fn pane_heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
     ui.horizontal(|ui| {

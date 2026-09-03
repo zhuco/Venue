@@ -433,19 +433,6 @@ fn show_private_projection(
     projection: &TerminalAccountProjection,
 ) {
     let language = model.preferences.language;
-    let now = crate::account_center::now_ms();
-    let fresh = model.execution.private_fresh(now);
-    ui.horizontal(|ui| {
-        ui.small(format!(
-            "{} · {}",
-            text(language, Key::Signed),
-            timestamp(projection.observed_ms)
-        ));
-        if !fresh {
-            ui.colored_label(theme::WARNING, text(language, Key::Stale));
-        }
-    });
-    ui.weak(text(language, Key::CurrentSource));
     let selected_symbol = model
         .execution
         .current_symbol
@@ -472,6 +459,7 @@ fn show_private_projection(
                             Key::Size,
                             Key::Entry,
                             Key::Mark,
+                            Key::CurrentPnl,
                             Key::Time,
                         ],
                         Tab::CurrentOrders => &[
@@ -534,6 +522,7 @@ fn show_private_projection(
                                 market_quantity(ui, model, &row.symbol, Some(row.quantity));
                                 market_price(ui, model, &row.symbol, row.entry_price);
                                 market_price(ui, model, &row.symbol, row.mark_price);
+                                position_pnl(ui, row);
                                 ui.weak(timestamp(projection.observed_ms));
                                 ui.end_row();
                             }
@@ -636,6 +625,36 @@ fn show_private_projection(
     }
 }
 
+fn position_pnl(ui: &mut egui::Ui, position: &venue_control_protocol::kol::TerminalPosition) {
+    let pnl = position_pnl_value(position);
+    if let Some(pnl) = pnl {
+        let color = if pnl >= rust_decimal::Decimal::ZERO {
+            theme::BUY
+        } else {
+            theme::SELL
+        };
+        ui.colored_label(color, pnl.normalize().to_string());
+    } else {
+        ui.label("—");
+    }
+}
+
+fn position_pnl_value(
+    position: &venue_control_protocol::kol::TerminalPosition,
+) -> Option<rust_decimal::Decimal> {
+    position
+        .entry_price
+        .zip(position.mark_price)
+        .and_then(|(entry, mark)| {
+            let movement = match position.position_side {
+                venue_domain::PositionSide::Long => mark.checked_sub(entry),
+                venue_domain::PositionSide::Short => entry.checked_sub(mark),
+                venue_domain::PositionSide::Net => mark.checked_sub(entry),
+            }?;
+            movement.checked_mul(position.quantity)
+        })
+}
+
 fn symbol_link(ui: &mut egui::Ui, symbol: &venue_domain::Symbol, selected_symbol: &str) -> bool {
     let value = symbol.to_string();
     ui.add(
@@ -729,6 +748,26 @@ mod tests {
                 Some(rust_decimal::Decimal::new(123_456_789, 6))
             ),
             "123.4568"
+        );
+        Ok(())
+    }
+    #[test]
+    fn current_position_pnl_respects_hedge_side() -> Result<(), Box<dyn std::error::Error>> {
+        let symbol: venue_domain::Symbol = "SOL/USDC".parse()?;
+        let position = |position_side| venue_control_protocol::kol::TerminalPosition {
+            symbol: symbol.clone(),
+            position_side,
+            quantity: rust_decimal::Decimal::new(2, 0),
+            entry_price: Some(rust_decimal::Decimal::new(100, 0)),
+            mark_price: Some(rust_decimal::Decimal::new(103, 0)),
+        };
+        assert_eq!(
+            position_pnl_value(&position(venue_domain::PositionSide::Long)),
+            Some(rust_decimal::Decimal::new(6, 0))
+        );
+        assert_eq!(
+            position_pnl_value(&position(venue_domain::PositionSide::Short)),
+            Some(rust_decimal::Decimal::new(-6, 0))
         );
         Ok(())
     }

@@ -589,11 +589,7 @@ fn show_credential(
         });
         ui.horizontal(|ui| {
             let ready = credential.selectable(now_ms());
-            let status = if credential.verification == ApiVerificationState::Verified && !ready {
-                tr(l, "验证已过期", "Verification expired")
-            } else {
-                verification_text(l, &credential.verification)
-            };
+            let status = verification_text(l, &credential.verification);
             ui.colored_label(if ready { theme::BUY } else { theme::WARNING }, status);
             ui.label(if ready {
                 tr(l, "API 可访问 · 双向持仓", "API reachable · Hedge mode")

@@ -66,7 +66,7 @@ pub(crate) fn candle_plot(
     }
 
     let plot_rect = response.rect.shrink2(egui::vec2(8.0, 8.0));
-    let timeline_height = 22.0_f32.min(plot_rect.height() * 0.18);
+    let timeline_height = 16.0_f32.min(plot_rect.height() * 0.14);
     let content_rect = Rect::from_min_max(
         plot_rect.min,
         Pos2::new(plot_rect.right(), plot_rect.bottom() - timeline_height),
@@ -209,7 +209,7 @@ pub(crate) fn candle_plot(
             Stroke::new(1.0, theme::CHART_GRID),
         );
         painter.text(
-            Pos2::new(x, timeline_rect.top() + 4.0),
+            Pos2::new(x, timeline_rect.top() + 2.0),
             Align2::CENTER_TOP,
             format_timeline_label(open_time_ms, interval),
             FontId::monospace(f32::from(settings.chart_text_size)),

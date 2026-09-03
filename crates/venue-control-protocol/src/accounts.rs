@@ -175,7 +175,6 @@ impl CredentialSummary {
             && self.dual_position
             && self.trading_account_id.is_some()
             && self.verified_ms.is_some_and(|t| t <= now_ms)
-            && self.expires_ms.is_some_and(|t| now_ms < t)
     }
 }
 
@@ -272,5 +271,24 @@ mod tests {
         let mut invalid = request;
         invalid.invite_code = "contains/slash-and-is-not-valid".into();
         assert!(!invalid.valid());
+    }
+
+    #[test]
+    fn verified_api_binding_does_not_expire_on_a_ui_timer() {
+        let summary = CredentialSummary {
+            credential_id: "credential".into(),
+            label: "主账户".into(),
+            venue: crate::VenueId::Binance,
+            masked_key: "••••1234".into(),
+            trading_account_id: Some("account".into()),
+            verification: ApiVerificationState::Verified,
+            verified_ms: Some(100),
+            expires_ms: Some(200),
+            api_reachable: true,
+            dual_position: true,
+            account_mode: Some("Portfolio Margin · UM".into()),
+            has_exposure: Some(false),
+        };
+        assert!(summary.selectable(10_000));
     }
 }

@@ -12,23 +12,18 @@ use venue_control_protocol::{
 use venue_gateway_binance::{BinanceCredentials, BinanceProbeError, probe_credentials};
 use zeroize::Zeroizing;
 
-const VERIFICATION_TTL_MS: u64 = 5 * 60 * 1_000;
-
 impl AccountService {
     pub async fn overview(
         &self,
         principal: &Principal,
-        now_ms: u64,
+        _now_ms: u64,
     ) -> Result<AccountOverview, AccountError> {
         let rows = sqlx::query("SELECT verification_json FROM venue_api_credentials WHERE user_id=$1 AND deleted_ms IS NULL ORDER BY created_ms,credential_id")
             .bind(&principal.user.user_id).fetch_all(&self.pool).await.map_err(database_error)?;
         let mut credentials = Vec::with_capacity(rows.len());
         for row in rows {
-            let mut summary =
+            let summary =
                 decode_summary(row.try_get("verification_json").map_err(database_error)?)?;
-            if summary.expires_ms.is_none_or(|time| time <= now_ms) {
-                summary.api_reachable = false;
-            }
             credentials.push(summary);
         }
         Ok(AccountOverview {
@@ -180,7 +175,10 @@ impl AccountService {
                     summary.trading_account_id = Some(account_id);
                     summary.verification = State::Verified;
                     summary.verified_ms = Some(probe.observed_ms);
-                    summary.expires_ms = probe.observed_ms.checked_add(VERIFICATION_TTL_MS);
+                    // A successful binding remains selected across UI sessions. Runtime order
+                    // admission still requires a fresh signed private projection and fails closed
+                    // when Binance revokes the key, permissions, or account access.
+                    summary.expires_ms = None;
                     summary.api_reachable = true;
                     summary.dual_position = true;
                     summary.account_mode = Some("Portfolio Margin · UM".into());
