@@ -179,8 +179,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 enum ProjectionMessage {
-    Snapshot(ActiveProjectionSource, SignedAccountSnapshot),
-    Stopped(String),
+    Snapshot {
+        worker_id: u64,
+        source: ActiveProjectionSource,
+        snapshot: SignedAccountSnapshot,
+    },
+    Stopped {
+        credential_id: String,
+        worker_id: u64,
+    },
+}
+
+struct ProjectionWorker {
+    id: u64,
+    source: ActiveProjectionSource,
+    stop: tokio::sync::watch::Sender<bool>,
 }
 
 async fn run_projection_supervisor(
@@ -189,24 +202,30 @@ async fn run_projection_supervisor(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(32);
-    let mut workers =
-        BTreeMap::<String, (ActiveProjectionSource, tokio::sync::watch::Sender<bool>)>::new();
+    let mut workers = BTreeMap::<String, ProjectionWorker>::new();
+    let mut next_worker_id = 0_u64;
     let mut discovery = tokio::time::interval(PROJECTION_DISCOVERY_INTERVAL);
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    for (_, (_, stop)) in workers { let _ = stop.send(true); }
+                    for (_, worker) in workers { let _ = worker.stop.send(true); }
                     return;
                 }
             }
             message = message_rx.recv() => match message {
-                Some(ProjectionMessage::Snapshot(source, snapshot)) => {
-                    if let Ok(now) = now_ms() {
+                Some(ProjectionMessage::Snapshot { worker_id, source, snapshot }) => {
+                    if is_current_worker(&workers, &source.credential_id, worker_id)
+                        && let Ok(now) = now_ms()
+                    {
                         let _ = projection_store.persist(&source, &snapshot, now).await;
                     }
                 }
-                Some(ProjectionMessage::Stopped(credential_id)) => { workers.remove(&credential_id); }
+                Some(ProjectionMessage::Stopped { credential_id, worker_id }) => {
+                    if is_current_worker(&workers, &credential_id, worker_id) {
+                        workers.remove(&credential_id);
+                    }
+                }
                 None => return,
             },
             _ = discovery.tick() => {
@@ -215,19 +234,31 @@ async fn run_projection_supervisor(
                 let active_by_id = active.into_iter().map(|source| (source.credential_id.clone(), source)).collect::<BTreeMap<_, _>>();
                 let stale = workers.keys().filter(|id| !active_by_id.contains_key(*id)).cloned().collect::<Vec<_>>();
                 for id in stale {
-                    if let Some((_, stop)) = workers.remove(&id) { let _ = stop.send(true); }
+                    if let Some(worker) = workers.remove(&id) { let _ = worker.stop.send(true); }
                 }
                 for (credential_id, source) in active_by_id {
-                    if workers.get(&credential_id).is_some_and(|(existing, _)| same_subscription(existing, &source)) { continue; }
-                    if let Some((_, stop)) = workers.remove(&credential_id) { let _ = stop.send(true); }
+                    if workers.get(&credential_id).is_some_and(|worker| same_subscription(&worker.source, &source)) { continue; }
+                    if let Some(worker) = workers.remove(&credential_id) { let _ = worker.stop.send(true); }
                     let Ok(credentials) = secrets.credentials(&source.credential_id, &source.owner_user_id).await else { continue; };
                     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-                    workers.insert(credential_id, (source.clone(), stop_tx));
-                    spawn_projection_worker(source, credentials, stop_rx, message_tx.clone());
+                    next_worker_id = next_worker_id.saturating_add(1);
+                    let worker_id = next_worker_id;
+                    workers.insert(credential_id, ProjectionWorker { id: worker_id, source: source.clone(), stop: stop_tx });
+                    spawn_projection_worker(worker_id, source, credentials, stop_rx, message_tx.clone());
                 }
             }
         }
     }
+}
+
+fn is_current_worker(
+    workers: &BTreeMap<String, ProjectionWorker>,
+    credential_id: &str,
+    worker_id: u64,
+) -> bool {
+    workers
+        .get(credential_id)
+        .is_some_and(|worker| worker.id == worker_id)
 }
 
 fn same_subscription(left: &ActiveProjectionSource, right: &ActiveProjectionSource) -> bool {
@@ -238,6 +269,7 @@ fn same_subscription(left: &ActiveProjectionSource, right: &ActiveProjectionSour
 }
 
 fn spawn_projection_worker(
+    worker_id: u64,
     source: ActiveProjectionSource,
     credentials: venue_gateway_binance::BinanceCredentials,
     stop: tokio::sync::watch::Receiver<bool>,
@@ -279,7 +311,11 @@ fn spawn_projection_worker(
                         .ok()?;
                     fills_cursor = Some(snapshot.fills_cursor().to_owned());
                     if sender
-                        .blocking_send(ProjectionMessage::Snapshot(source.clone(), snapshot))
+                        .blocking_send(ProjectionMessage::Snapshot {
+                            worker_id,
+                            source: source.clone(),
+                            snapshot,
+                        })
                         .is_err()
                     {
                         return None;
@@ -293,7 +329,10 @@ fn spawn_projection_worker(
             Some(())
         })();
         let _ = result;
-        let _ = sender.blocking_send(ProjectionMessage::Stopped(credential_id));
+        let _ = sender.blocking_send(ProjectionMessage::Stopped {
+            credential_id,
+            worker_id,
+        });
     });
 }
 
@@ -302,4 +341,38 @@ fn now_ms() -> Result<u64, std::io::Error> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(std::io::Error::other)?;
     u64::try_from(elapsed.as_millis()).map_err(std::io::Error::other)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn source(credential_id: &str) -> ActiveProjectionSource {
+        ActiveProjectionSource {
+            owner_user_id: "owner".to_owned(),
+            credential_id: credential_id.to_owned(),
+            trading_account_id: "account".to_owned(),
+            symbols: BTreeSet::new(),
+            previous_fills_cursor: None,
+        }
+    }
+
+    #[test]
+    fn stopped_message_only_matches_the_worker_that_created_it() {
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let mut workers = BTreeMap::new();
+        workers.insert(
+            "credential".to_owned(),
+            ProjectionWorker {
+                id: 2,
+                source: source("credential"),
+                stop,
+            },
+        );
+
+        assert!(!is_current_worker(&workers, "credential", 1));
+        assert!(is_current_worker(&workers, "credential", 2));
+        assert!(!is_current_worker(&workers, "other", 2));
+    }
 }

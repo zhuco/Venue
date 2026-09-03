@@ -161,6 +161,22 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
             }
         });
     }
+    let now = ui.ctx().input(|input| input.time);
+    if let Some(reason) = action_disabled_reason(model, TradingAction::OpenLong, now) {
+        ui.colored_label(theme::WARNING, reason);
+    } else if model.preferences.trading.hotkeys_enabled {
+        ui.small(label(
+            language,
+            "快捷键已启用；输入框聚焦或弹窗打开时暂停。",
+            "Hotkeys active; paused while editing text or while a dialog is open.",
+        ));
+    } else {
+        ui.small(label(
+            language,
+            "快捷键已在设置中关闭。",
+            "Hotkeys are disabled in Settings.",
+        ));
+    }
     ui.horizontal(|ui| {
         let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
         for (side, action, title) in [
@@ -278,9 +294,10 @@ fn action_button(
         .hotkeys
         .key_for(action)
         .map_or("—", |key| key.label());
-    let enabled = action_enabled(model, action, ui.ctx().input(|input| input.time));
+    let disabled_reason = action_disabled_reason(model, action, ui.ctx().input(|input| input.time));
+    let enabled = disabled_reason.is_none();
     let (text_color, fill, stroke) = action_palette(action);
-    ui.add_enabled(
+    let response = ui.add_enabled(
         enabled,
         egui::Button::new(
             RichText::new(format!("{title}  {key}"))
@@ -291,19 +308,65 @@ fn action_button(
         .fill(fill)
         .stroke(Stroke::new(1.0, stroke))
         .min_size(egui::vec2(width, 30.0)),
-    )
-    .clicked()
-    .then_some(action)
+    );
+    let response = if let Some(reason) = disabled_reason {
+        response.on_disabled_hover_text(reason)
+    } else {
+        response
+    };
+    response.clicked().then_some(action)
 }
 
-fn action_enabled(model: &AppModel, action: TradingAction, now: f64) -> bool {
-    if !model.execution.private_fresh(now_ms()) || !model.preferences.trading.post_only {
-        return false;
+fn action_disabled_reason(model: &AppModel, action: TradingAction, now: f64) -> Option<String> {
+    let language = model.preferences.language;
+    if !model.execution.private_fresh(now_ms()) {
+        return Some(
+            label(
+                language,
+                "私有账户数据已过期，等待 Executor 刷新后才可下单",
+                "Private account data is stale; orders resume after an Executor refresh",
+            )
+            .to_owned(),
+        );
     }
-    if action.is_order_action() {
-        return terminal_request_parts(model, action, now).is_ok();
+    if !model.preferences.trading.post_only {
+        return Some(
+            label(
+                language,
+                "请启用 Post Only；当前限价终端仅发送 Maker 单",
+                "Enable Post Only; the limit terminal only sends maker orders",
+            )
+            .to_owned(),
+        );
     }
-    false
+    if !action.is_order_action() {
+        return Some(
+            label(
+                language,
+                "该操作尚未接入 Binance Executor",
+                "This action is not connected to the Binance Executor yet",
+            )
+            .to_owned(),
+        );
+    }
+    terminal_request_parts(model, action, now)
+        .err()
+        .map(|error| {
+            let chinese = match error {
+                crate::trading::TradePlanError::MissingPrice => "请先点击图表或订单簿选择限价",
+                crate::trading::TradePlanError::ExpiredPrice => "所选价格已过期，请重新选择",
+                crate::trading::TradePlanError::InvalidPrice => "所选价格无效",
+                crate::trading::TradePlanError::InvalidSize => "请输入有效的下单金额",
+                crate::trading::TradePlanError::NoPosition => "对应方向没有可平仓位",
+                crate::trading::TradePlanError::UiOnlyAction => {
+                    "未选择可交易的 Binance 账户或交易对"
+                }
+            };
+            match language {
+                crate::i18n::Language::SimplifiedChinese => chinese.to_owned(),
+                crate::i18n::Language::English => error.to_string(),
+            }
+        })
 }
 
 pub fn apply_action(
@@ -339,6 +402,10 @@ pub fn apply_action(
         TradingAction::CancelSelectedOrder | TradingAction::CancelAllOrders
     ) {
         model.notice("Cancel is not enabled until exact Binance order cancellation is connected");
+        return;
+    }
+    if let Some(reason) = action_disabled_reason(model, action, context.input(|input| input.time)) {
+        model.notice(reason);
         return;
     }
     model.trade_dock.armed_action = Some(action);
