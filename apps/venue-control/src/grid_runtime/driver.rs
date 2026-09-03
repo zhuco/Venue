@@ -51,6 +51,7 @@ impl BinanceGridRuntime {
                     ColdTurn::Private(None) => private_stream = None,
                     ColdTurn::Completed(Ok(_)) => cold_due = false,
                     ColdTurn::Completed(Err(error)) => {
+                        eprintln!("Binance Grid cold turn failed and will retry: {error}");
                         tracing::warn!(
                             target: "venue_control::grid_runtime",
                             error = %error,
