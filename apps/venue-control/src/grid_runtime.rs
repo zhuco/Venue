@@ -167,6 +167,10 @@ impl BinanceGridRuntime {
             match self.process(record.clone()).await {
                 Ok(changed) => progressed = progressed.saturating_add(usize::from(changed)),
                 Err(error) => {
+                    eprintln!(
+                        "Binance Grid instance {} turn failed: {error}",
+                        record.instance.instance_id
+                    );
                     let code = match error {
                         BinanceGridRuntimeError::Market => "market_unavailable",
                         BinanceGridRuntimeError::PrivateProjection => "private_unavailable",
