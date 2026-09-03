@@ -313,7 +313,7 @@ P3-B 将这些边界组合成离线可验证的 `BinanceExecutorRuntime`：同�
 
 P3-C 已闭合 production adapter 与 binary：`BinanceHttpExecution` 使用固定 `BinanceHttpTransport` 的签名、`exchangeInfo` 规则、`prepare_place_market` 与一次 POST 后精确回读。数量按 stepSize 向下归一，低于 minQty/minNotional 或缺签名价格、规则、Hedge 腿即拒绝；Hedge MARKET 开仓不传 `reduceOnly`。ACK、accountTradeList 和 position risk 必须共同收敛才进入 Reconciled，部分成交、订单缺失、仓位不符或响应不明保持 Accepted/Unknown；超时、断连和损坏 ACK 只按原 clientOrderId 查询，绝不再次 POST。
 
-`venue-executor-binance` 只接受 `VENUE_EXECUTOR_MODE=LIVE`、`VENUE_EXECUTOR_DATABASE_URL` 的 PostgreSQL URL 与既有 credential master key；无 mock、dry-run 或 testnet 配置。它持有 advisory singleton，启动先完成 Pending activation 的双账户签名基线并恢复未终态命令，随后对已激活 KOL 账户建立 listenKey 私流。只把 `ORDER_TRADE_UPDATE/TRADE` 映射为规范成交；重复 WS/REST 成交由 `(account,native symbol,native trade id)` 去重，断线、过期和 gap 触发签名 REST 补读与状态对账，原始帧不持久化。SIGINT/SIGTERM 令循环停止、私流析构并释放锁。真实凭证联调、2核4G复验和真实 Canary 仍是外部验收，不构成实盘准入。
+`venue-executor-binance` 只接受 `VENUE_EXECUTOR_MODE=LIVE`、`VENUE_EXECUTOR_DATABASE_URL` 的 PostgreSQL URL 与既有 credential master key；无 mock、dry-run 或 testnet 配置。它持有 advisory singleton，启动先完成 Pending activation 的双账户签名基线并恢复未终态命令，随后对已激活 KOL 账户建立 listenKey 私流。只把 `ORDER_TRADE_UPDATE/TRADE` 映射为规范成交；重复 WS/REST 成交由 `(account,native symbol,native trade id)` 去重，断线、过期和 gap 触发签名 REST 补读与状态对账，原始帧不持久化。终端签名投影的单次补读失败在原工作线程内按 250ms–2s 有界退避，连续 5 次失败才重建连接；失败期间不续期旧快照或放宽下单新鲜度门。SIGINT/SIGTERM 令循环停止、私流析构并释放锁。真实凭证联调、2核4G复验和真实 Canary 仍是外部验收，不构成实盘准入。
 - 实现 Pending/Sending/Accepted/Rejected/ReconcileRequired/Reconciled、重启恢复、账户隔离和 UI 投影。
 
 完成门：离线端到端证明终端与跟单不会争抢同一账户，且重复事件、重启、超时、响应损坏、部分成交、两腿并存和关系暂停均不重复下单、不跨零、不拖垮其他账户。

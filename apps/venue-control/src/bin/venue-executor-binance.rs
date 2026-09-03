@@ -23,6 +23,7 @@ const EXECUTOR_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const EXECUTOR_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const PROJECTION_DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 const PROJECTION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const MAX_CONSECUTIVE_PROJECTION_FAILURES: u32 = 5;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -300,15 +301,29 @@ fn spawn_projection_worker(
             let _ = gateway.prime_private_stream();
             let mut fills_cursor = source.previous_fills_cursor.clone();
             let mut refresh_at = std::time::Instant::now();
+            let mut consecutive_snapshot_failures = 0_u32;
             while !*stop.borrow() {
                 let private_changed = match gateway.poll_private_fill() {
                     Ok(Some(_)) | Err(_) => true,
                     Ok(None) => false,
                 };
-                if private_changed || std::time::Instant::now() >= refresh_at {
-                    let snapshot = gateway
-                        .signed_projection_snapshot(fills_cursor.clone())
-                        .ok()?;
+                if (private_changed && consecutive_snapshot_failures == 0)
+                    || std::time::Instant::now() >= refresh_at
+                {
+                    let snapshot = match gateway.signed_projection_snapshot(fills_cursor.clone()) {
+                        Ok(snapshot) => snapshot,
+                        Err(_) => {
+                            consecutive_snapshot_failures =
+                                consecutive_snapshot_failures.saturating_add(1);
+                            let Some(delay) = projection_retry_delay(consecutive_snapshot_failures)
+                            else {
+                                return None;
+                            };
+                            refresh_at = std::time::Instant::now() + delay;
+                            continue;
+                        }
+                    };
+                    consecutive_snapshot_failures = 0;
                     fills_cursor = Some(snapshot.fills_cursor().to_owned());
                     if sender
                         .blocking_send(ProjectionMessage::Snapshot {
@@ -334,6 +349,14 @@ fn spawn_projection_worker(
             worker_id,
         });
     });
+}
+
+fn projection_retry_delay(consecutive_failures: u32) -> Option<std::time::Duration> {
+    if consecutive_failures >= MAX_CONSECUTIVE_PROJECTION_FAILURES {
+        return None;
+    }
+    let shift = consecutive_failures.saturating_sub(1).min(4);
+    Some(std::time::Duration::from_millis(250_u64 << shift))
 }
 
 fn now_ms() -> Result<u64, std::io::Error> {
@@ -374,5 +397,18 @@ mod tests {
         assert!(!is_current_worker(&workers, "credential", 1));
         assert!(is_current_worker(&workers, "credential", 2));
         assert!(!is_current_worker(&workers, "other", 2));
+    }
+
+    #[test]
+    fn projection_snapshot_failures_retry_before_reconnecting_the_worker() {
+        assert_eq!(
+            projection_retry_delay(1),
+            Some(std::time::Duration::from_millis(250))
+        );
+        assert_eq!(
+            projection_retry_delay(4),
+            Some(std::time::Duration::from_secs(2))
+        );
+        assert_eq!(projection_retry_delay(5), None);
     }
 }

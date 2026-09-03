@@ -245,10 +245,37 @@ fn terminal_chrome_keeps_both_rows_at_the_top_of_the_window() {
         .find(|(label, _)| label == "BTC/USDC")
         .map(|(_, rect)| *rect)
         .expect("symbol tab");
+    let trading = labels
+        .iter()
+        .find(|(label, _)| label == text(model.preferences.language, TextKey::TradingSettings))
+        .map(|(_, rect)| *rect)
+        .expect("trading settings");
+    let add_tab = labels
+        .iter()
+        .find(|(label, _)| label == "+")
+        .map(|(_, rect)| *rect)
+        .expect("add tab");
+    let layout = labels
+        .iter()
+        .find(|(label, _)| label.starts_with("布局管理") || label.starts_with("Layout"))
+        .map(|(_, rect)| *rect)
+        .expect("layout manager");
     assert!(
         symbol.top() <= 60.0,
         "symbol tabs start at {}px",
         symbol.top()
+    );
+    assert!(
+        (add_tab.center().y - trading.center().y).abs() <= 4.0,
+        "add_tab={add_tab:?}, trading={trading:?}"
+    );
+    assert!(
+        (add_tab.center().y - layout.center().y).abs() <= 4.0,
+        "add_tab={add_tab:?}, layout={layout:?}"
+    );
+    assert!(
+        layout.left() >= 1_700.0,
+        "layout manager is not right aligned"
     );
 }
 
