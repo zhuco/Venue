@@ -42,6 +42,10 @@ fn desired_digest_binds_anchor_and_entire_surface() -> Result<(), Box<dyn std::e
     let mut close_order = order.clone();
     close_order.key.role = ProtocolOrderRole::Close;
     assert!(order_priority(&close_order) < order_priority(&order));
+    assert_eq!(
+        desired_digest(&anchor, &[order.clone(), close_order.clone()]),
+        desired_digest(&anchor, &[close_order, order.clone()])
+    );
     assert_ne!(
         digest,
         desired_digest(&changed_anchor, std::slice::from_ref(&order))

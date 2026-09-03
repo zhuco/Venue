@@ -277,7 +277,7 @@ pub(super) fn desired_orders(
             limit_price: intent.price.value(),
         });
     }
-    result.sort_by_key(order_priority);
+    result.sort_by_key(|order| order.key.encoded());
     Ok(result)
 }
 
@@ -415,7 +415,9 @@ pub(super) fn desired_digest(anchor: &GridRollingAnchor, orders: &[GridDesiredOr
     hasher.update(anchor.anchor_price.value().to_string());
     hasher.update(anchor.step.value().to_string());
     hasher.update(anchor.grid_quantity.to_string());
-    for order in orders {
+    let mut canonical = orders.iter().collect::<Vec<_>>();
+    canonical.sort_by_key(|order| order.key.encoded());
+    for order in canonical {
         hasher.update(order.key.encoded());
         hasher.update(&order.client_order_id);
         hasher.update(order.quantity.to_string());
