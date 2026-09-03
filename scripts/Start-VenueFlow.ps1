@@ -13,6 +13,7 @@ if (-not (Test-Path -LiteralPath $UiPath -PathType Leaf)) {
 }
 
 $forward = "127.0.0.1:${ControlPort}:127.0.0.1:${ControlPort}"
+$endpoint = "http://127.0.0.1:$ControlPort/v2/account/session"
 $listener = Get-NetTCPConnection -State Listen -LocalPort $ControlPort -ErrorAction SilentlyContinue
 if (-not $listener) {
     $ssh = Start-Process ssh.exe -ArgumentList @(
@@ -35,6 +36,19 @@ if (-not $listener) {
     }
     if (-not (Get-NetTCPConnection -State Listen -LocalPort $ControlPort -ErrorAction SilentlyContinue)) {
         throw "SSH Control tunnel did not listen on 127.0.0.1:$ControlPort."
+    }
+}
+
+try {
+    $response = Invoke-WebRequest -UseBasicParsing -Uri $endpoint -TimeoutSec 5
+    if ([int]$response.StatusCode -lt 200 -or [int]$response.StatusCode -ge 500) {
+        throw "Control account endpoint returned HTTP $([int]$response.StatusCode)."
+    }
+}
+catch {
+    $status = $_.Exception.Response | ForEach-Object { [int]$_.StatusCode }
+    if ($status -notin @(401, 403)) {
+        throw "Control account endpoint is not reachable through 127.0.0.1:$ControlPort."
     }
 }
 
