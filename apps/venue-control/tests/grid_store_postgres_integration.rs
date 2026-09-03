@@ -757,7 +757,7 @@ async fn exercise(pool: &PgPool) -> TestResult {
         .load_owned(&owner, &second)
         .await?
         .ok_or("missing second grid")?;
-    let second_pending = store
+    store
         .request_lifecycle(
             &owner,
             &lifecycle(
@@ -767,6 +767,15 @@ async fn exercise(pool: &PgPool) -> TestResult {
                 GridLifecycleAction::Start,
             ),
             now + 4,
+        )
+        .await?;
+    let second_running = store
+        .settle_runtime_state(
+            &second,
+            GridInstanceState::StartPending,
+            GridInstanceState::Running,
+            None,
+            now + 5,
         )
         .await?;
     let initial_key = GridOrderSemanticKey {
@@ -1054,8 +1063,8 @@ async fn exercise(pool: &PgPool) -> TestResult {
         command_id: id(41),
         client_order_id: "g-other-grid-close-1".into(),
         instance_id: second.clone(),
-        config_revision: second_pending.config_revision,
-        plan_revision: second_pending.plan_revision,
+        config_revision: second_running.config_revision,
+        plan_revision: second_running.plan_revision,
         semantic_key: "profit:short:close:1".into(),
         rule_version: "binance-pm-um-rules-7".into(),
         source_digest: [15; 32],
@@ -1104,7 +1113,7 @@ async fn exercise(pool: &PgPool) -> TestResult {
     let second_reset = store
         .settle_runtime_state(
             &second,
-            GridInstanceState::StartPending,
+            GridInstanceState::Running,
             GridInstanceState::ResetRequired,
             Some("surface_conflict"),
             now + 20,
@@ -1112,7 +1121,7 @@ async fn exercise(pool: &PgPool) -> TestResult {
         .await?;
     assert_eq!(
         second_reset.config_revision,
-        second_pending.config_revision + 1
+        second_running.config_revision + 1
     );
     let second_config_rows: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM venue_binance_grid_config_revisions WHERE instance_id=$1",
@@ -1125,7 +1134,7 @@ async fn exercise(pool: &PgPool) -> TestResult {
         store
             .settle_runtime_state(
                 &second,
-                GridInstanceState::StartPending,
+                GridInstanceState::Running,
                 GridInstanceState::ResetRequired,
                 Some("surface_conflict"),
                 now + 21,
