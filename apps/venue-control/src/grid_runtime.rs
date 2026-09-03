@@ -1408,6 +1408,9 @@ impl BinanceGridRuntime {
             if let Some(owner) = ownership.get_mut(&order.client_order_id) {
                 validate_owned_order(record, owner, order)?;
                 if owner.state == GridOwnedOrderState::Terminal {
+                    if projection.observed_ms <= owner.last_seen_ms {
+                        continue;
+                    }
                     return Err(BinanceGridRuntimeError::SurfaceConflict);
                 }
                 owner.native_order_id = order.native_order_id.clone();

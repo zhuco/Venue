@@ -412,16 +412,16 @@ pub(super) fn desired_digest(anchor: &GridRollingAnchor, orders: &[GridDesiredOr
     let mut hasher = Sha256::new();
     hasher.update(anchor.revision.to_be_bytes());
     hasher.update(anchor.instrument_generation.to_be_bytes());
-    hasher.update(anchor.anchor_price.value().to_string());
-    hasher.update(anchor.step.value().to_string());
-    hasher.update(anchor.grid_quantity.to_string());
+    hasher.update(anchor.anchor_price.value().normalize().to_string());
+    hasher.update(anchor.step.value().normalize().to_string());
+    hasher.update(anchor.grid_quantity.normalize().to_string());
     let mut canonical = orders.iter().collect::<Vec<_>>();
     canonical.sort_by_key(|order| order.key.encoded());
     for order in canonical {
         hasher.update(order.key.encoded());
         hasher.update(&order.client_order_id);
-        hasher.update(order.quantity.to_string());
-        hasher.update(order.limit_price.to_string());
+        hasher.update(order.quantity.normalize().to_string());
+        hasher.update(order.limit_price.normalize().to_string());
     }
     hasher.finalize().into()
 }

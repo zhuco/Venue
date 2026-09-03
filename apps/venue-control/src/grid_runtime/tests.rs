@@ -35,6 +35,12 @@ fn desired_digest_binds_anchor_and_entire_surface() -> Result<(), Box<dyn std::e
         limit_price: Decimal::new(99, 0),
     };
     let digest = desired_digest(&anchor, std::slice::from_ref(&order));
+    let mut scaled_anchor = anchor.clone();
+    scaled_anchor.grid_quantity.rescale(4);
+    let mut scaled_order = order.clone();
+    scaled_order.quantity.rescale(4);
+    scaled_order.limit_price.rescale(4);
+    assert_eq!(digest, desired_digest(&scaled_anchor, &[scaled_order]));
     let mut changed_anchor = anchor.clone();
     changed_anchor.instrument_generation += 1;
     let mut changed_order = order.clone();
