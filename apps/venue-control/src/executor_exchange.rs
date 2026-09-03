@@ -327,10 +327,11 @@ impl BinanceHttpExecution {
         )
         .map_err(|_| BinanceExecutionError::Invalid)?;
         let initial_cursor = self.fills_cursor.unwrap_or(RecentFillsCursor {
-            // A fresh executor has no persisted fill cursor in this narrow order adapter. Start
-            // from the fixed Binance window and fail closed if the first page cannot prove it is
-            // complete; a later private-stream integration owns durable cursor recovery.
-            observed_through_ms: now.saturating_sub(7 * 24 * 60 * 60 * 1_000),
+            // Execution preflight needs a complete current account/order surface, not historical
+            // fill recovery. Starting immediately before this signed snapshot keeps the one-page
+            // read complete even for active accounts; durable fill recovery belongs to the
+            // central authenticated projection.
+            observed_through_ms: now.saturating_sub(1),
             last_trade_id: None,
             last_event_time_ms: None,
         });

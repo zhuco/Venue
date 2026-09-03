@@ -538,11 +538,46 @@ impl BinanceCommandLedger {
         let changed = changed.ok_or(BinanceCommandLedgerError::Conflict)?;
         if next == ExecutorCommandState::Reconciled {
             synchronize_grid_owner(&mut tx, &changed, now).await?;
+        } else if matches!(
+            next,
+            ExecutorCommandState::Rejected | ExecutorCommandState::Cancelled
+        ) {
+            terminalize_unsubmitted_grid_owner(&mut tx, &changed, now).await?;
         }
         tx.commit()
             .await
             .map_err(|_| BinanceCommandLedgerError::Unavailable)
     }
+}
+
+async fn terminalize_unsubmitted_grid_owner(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    command: &sqlx::postgres::PgRow,
+    now: i64,
+) -> Result<(), BinanceCommandLedgerError> {
+    let origin: String = command
+        .try_get("command_origin")
+        .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+    let phase: String = command
+        .try_get("command_phase")
+        .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+    let native_order_id: Option<String> = command
+        .try_get("native_order_id")
+        .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+    if origin != "grid" || phase == "cancel" || native_order_id.is_some() {
+        return Ok(());
+    }
+    sqlx::query(
+        "UPDATE venue_binance_grid_order_owners SET order_state='terminal',\
+         last_seen_ms=GREATEST(last_seen_ms,$1) WHERE place_command_id=$2 \
+         AND native_order_id IS NULL AND order_state='working'",
+    )
+    .bind(now)
+    .bind(command_id_from_row(command)?)
+    .execute(&mut **tx)
+    .await
+    .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
