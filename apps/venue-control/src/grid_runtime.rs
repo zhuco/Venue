@@ -1460,9 +1460,11 @@ impl BinanceGridRuntime {
             }
         }
         for owner in ownership.values_mut() {
+            // An older central snapshot cannot disprove a newer signed placement readback.
             if !orders.contains_key(&owner.client_order_id)
                 && owner.state == GridOwnedOrderState::Working
                 && owner.native_order_id.is_some()
+                && projection.observed_ms > owner.last_seen_ms
             {
                 owner.state = GridOwnedOrderState::Terminal;
                 owner.last_seen_ms = owner

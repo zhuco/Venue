@@ -457,7 +457,7 @@ pub(super) fn desired_valid_for_market(
 }
 
 pub(super) fn empty_digest() -> [u8; 32] {
-    Sha256::digest(b"venue-grid-empty-v1").into()
+    Sha256::digest(b"venue-grid-empty-desired-v1").into()
 }
 
 pub(super) fn empty_surface(
