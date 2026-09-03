@@ -52,6 +52,8 @@ use batch::*;
 mod driver;
 #[path = "grid_runtime/fast_path.rs"]
 mod fast_path;
+#[path = "grid_runtime/fills.rs"]
+mod fills;
 #[path = "grid_runtime/stream_overlay.rs"]
 mod stream_overlay;
 use fast_path::GridHotPathState;
@@ -398,6 +400,11 @@ impl BinanceGridRuntime {
         })
         .map_err(|_| BinanceGridRuntimeError::Planner)?;
 
+        if requires_private_surface_retry(&plan.directive) {
+            self.block_if_running(&record, "private_surface_unsettled", now)
+                .await?;
+            return Ok(false);
+        }
         match plan.directive {
             GridPlanDirective::Blocked { reason } => {
                 self.block_if_running(&record, blocked_code(reason), now)
@@ -1487,46 +1494,6 @@ impl BinanceGridRuntime {
             intents,
             other_close_reservations: reservations,
         })
-    }
-
-    async fn load_fill_batch(
-        &self,
-        record: &GridRuntimeRecord,
-        actual: &ActualSurface,
-        included_through_ms: u64,
-    ) -> Result<Vec<GridFillAllocation>, BinanceGridRuntimeError> {
-        let fills = self
-            .store
-            .load_unallocated_fills(&record.instance.instance_id, 0, MAX_FILL_BATCH)
-            .await?;
-        if fills.len() == usize::from(MAX_FILL_BATCH) {
-            return Err(BinanceGridRuntimeError::Facts);
-        }
-        let mut unique = BTreeMap::new();
-        for fill in fills {
-            // REST may return fills newer than its position/order baseline. Wait for the next
-            // signed baseline; otherwise a fill can move the anchor without being allocated.
-            if fill.observed_ms > included_through_ms {
-                continue;
-            }
-            let owner = actual
-                .ownership
-                .get(&fill.client_order_id)
-                .ok_or(BinanceGridRuntimeError::Facts)?;
-            if fill.instance_id != record.instance.instance_id
-                || fill.trading_account_id != record.instance.trading_account_id
-                || fill.symbol != record.instance.symbol
-                || !fill_matches_owner(&fill, owner)
-            {
-                return Err(BinanceGridRuntimeError::Facts);
-            }
-            if let Some(previous) = unique.insert(fill.native_trade_id.clone(), fill.clone())
-                && previous != fill
-            {
-                return Err(BinanceGridRuntimeError::Facts);
-            }
-        }
-        Ok(unique.into_values().collect())
     }
 
     async fn add_command_reservations(

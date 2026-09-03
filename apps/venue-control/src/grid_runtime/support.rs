@@ -533,3 +533,72 @@ pub(super) fn now_ms() -> Result<u64, BinanceGridRuntimeError> {
         .try_into()
         .map_err(|_| BinanceGridRuntimeError::Clock)
 }
+
+pub(super) fn require_complete_fill_baseline(
+    mut observed_times: impl Iterator<Item = u64>,
+    included_through_ms: u64,
+) -> Result<(), BinanceGridRuntimeError> {
+    // Never filter a mixed REST batch and pass the remainder to the planner: orders may already
+    // be absent while their repair fills await a newer baseline, falsely requesting a reset.
+    if observed_times.any(|time| time > included_through_ms) {
+        return Err(BinanceGridRuntimeError::PrivateProjection);
+    }
+    Ok(())
+}
+
+pub(super) fn requires_private_surface_retry(
+    directive: &venue_strategies::hedged_grid::GridPlanDirective,
+) -> bool {
+    matches!(
+        directive,
+        venue_strategies::hedged_grid::GridPlanDirective::ResetRequired {
+            trigger: GridResetTrigger::IncompleteOwnedSurface
+                | GridResetTrigger::CompletedFillStillOpen,
+            ..
+        }
+    )
+}
+
+#[cfg(test)]
+mod fill_baseline_tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_signed_surface_cannot_enter_destructive_reset() {
+        let directive = |trigger| venue_strategies::hedged_grid::GridPlanDirective::ResetRequired {
+            trigger,
+            cancel_owned_orders: true,
+            keep_positions: true,
+            require_fresh_facts: true,
+        };
+        assert!(requires_private_surface_retry(&directive(
+            GridResetTrigger::IncompleteOwnedSurface
+        )));
+        assert!(requires_private_surface_retry(&directive(
+            GridResetTrigger::CompletedFillStillOpen
+        )));
+        assert!(!requires_private_surface_retry(&directive(
+            GridResetTrigger::Manual
+        )));
+        assert!(!requires_private_surface_retry(&directive(
+            GridResetTrigger::InstrumentGenerationChanged
+        )));
+    }
+
+    #[test]
+    fn mixed_receipt_batch_defers_the_whole_plan_instead_of_hiding_fills() {
+        assert_eq!(
+            require_complete_fill_baseline([90, 120].into_iter(), 100),
+            Err(BinanceGridRuntimeError::PrivateProjection)
+        );
+        assert_eq!(
+            require_complete_fill_baseline([120, 90].into_iter(), 100),
+            Err(BinanceGridRuntimeError::PrivateProjection)
+        );
+        assert_eq!(
+            require_complete_fill_baseline([90, 120].into_iter(), 120),
+            Ok(())
+        );
+        assert_eq!(require_complete_fill_baseline([].into_iter(), 100), Ok(()));
+    }
+}

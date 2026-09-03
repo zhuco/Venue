@@ -127,7 +127,7 @@ Node 投影摘要辅助位于 `apps/venue-node/src/control_loop/projection_diges
 
 ## 测试定位
 
-账户成交观察时间回归：`apps/venue-control/tests/support/projection_fill_observation.rs` 由 `kol_mvp_postgres_integration` 组合；覆盖 REST 拉取期间成交、签名重读修复与重复私流的稳定身份。`private_projection.rs` 保留订单/持仓的快照起始时间，成交使用接收后的持久化时间；历史倒置时间通过 `account_gateway_projection.rs::replay_projection_fills_from` 定向签名补查，不重置 Grid。冷规划只消费已被后续签名基线覆盖的成交。
+账户成交观察时间回归：`apps/venue-control/tests/support/projection_fill_observation.rs` 由 `kol_mvp_postgres_integration` 组合；覆盖 REST 拉取期间成交、签名重读修复与重复私流的稳定身份。`private_projection.rs` 保留订单/持仓的快照起始时间，成交使用接收后的持久化时间；历史倒置时间通过 `account_gateway_projection.rs::replay_projection_fills_from` 定向签名补查。`grid_runtime/fills.rs` 在任何成交尚未被后续签名基线覆盖时推迟整轮冷规划，不允许过滤后形成假缺单；不完整订单面或成交单仍在快照中的情况只等待私有事实收敛，不触发撤单重置。对应边界测试位于 `grid_runtime/support.rs`。
 
 默认按影响面分层验证，不在每次局部修改后重复全工作区回归。UI 局部改动验证客户端及相应交互；单模块修改验证该模块及直接契约；KOL 新链交易安全修改覆盖命令幂等、账户串行、`ReconcileRequired`、数量/权限和 Binance adapter；冻结旧链维护才覆盖风险、WAL、Unknown 与恢复路径。
 跨模块契约、依赖变化、架构合并或发布前集中建立全工作区通过基线。基线通过后的增量只重跑受影响专项；纯文档、注释或 lint 标注只做对应静态检查，不使既有业务测试结果失效。记录验证对应的提交/源码范围，构建缓存疑似串用时使用两个固定隔离槽并持锁核验，不新建目录、不清空共享缓存。
