@@ -334,6 +334,10 @@ impl BinanceGridRuntime {
 
         let market = self.refresh_market(&record, now).await?;
         let risk = self.risk_facts(&record, &projection, &private, now).await?;
+        // Market and quote-to-USD evidence are timestamped after their asynchronous HTTP
+        // responses arrive. Re-sample the planner clock so fresh evidence cannot appear to come
+        // from the future merely because this turn began before those requests completed.
+        let now = now_ms()?;
         let fills = self.load_fill_batch(&record, &actual).await?;
         let planner_fills = fills
             .iter()
