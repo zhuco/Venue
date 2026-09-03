@@ -28,7 +28,9 @@ pub(crate) fn controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<Tradin
 
 fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAction> {
     let language = model.preferences.language;
-    let private_ready = model.execution.private_fresh(now_ms());
+    let private_ready = model
+        .execution
+        .private_ready(model.preferences.execution_account_id.as_deref(), now_ms());
     let symbol = model.preferences.selected_symbol.clone();
     let (base, quote) = symbol_assets(&symbol);
     let mut action = None;
@@ -319,7 +321,10 @@ fn action_button(
 
 fn action_disabled_reason(model: &AppModel, action: TradingAction, now: f64) -> Option<String> {
     let language = model.preferences.language;
-    if !model.execution.private_fresh(now_ms()) {
+    if !model
+        .execution
+        .private_ready(model.preferences.execution_account_id.as_deref(), now_ms())
+    {
         return Some(
             label(
                 language,

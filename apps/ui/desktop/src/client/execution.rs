@@ -143,7 +143,9 @@ async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, Box<Client
     Ok(bytes)
 }
 
-// A slow read endpoint must not stall command delivery. Only one read is in flight.
+// Public facts, signed account state, and execution history have independent freshness needs.
+// Keeping their polls independent prevents one slow response from aging the others past the
+// trading safety window; command delivery already runs on a separate task.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn start_native(
     client: reqwest::Client,
@@ -153,6 +155,68 @@ pub(super) fn start_native(
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     projection_requests: crossbeam_channel::Receiver<TerminalProjectionRequest>,
 ) {
+    let facts_client = client.clone();
+    let facts_endpoint = endpoint.clone();
+    let facts_sender = sender.clone();
+    let facts_context = context.clone();
+    let facts_stop = stop.clone();
+    tokio::spawn(async move {
+        while !facts_stop.load(std::sync::atomic::Ordering::Acquire) {
+            let event = match tokio::time::timeout(
+                super::REQUEST_TIMEOUT,
+                fetch(&facts_client, &facts_endpoint),
+            )
+            .await
+            {
+                Ok(Ok(facts)) => ClientEvent::ExecutionFacts(facts),
+                Ok(Err(event)) => *event,
+                Err(_) => *unavailable("Execution facts request timed out"),
+            };
+            if facts_stop.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            let expired = matches!(event, ClientEvent::SessionExpired);
+            publish(&facts_sender, &facts_context, event);
+            if expired {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+
+    let history_client = client.clone();
+    let history_endpoint = endpoint.clone();
+    let history_sender = sender.clone();
+    let history_context = context.clone();
+    let history_stop = stop.clone();
+    tokio::spawn(async move {
+        while !history_stop.load(std::sync::atomic::Ordering::Acquire) {
+            let event = match tokio::time::timeout(
+                super::REQUEST_TIMEOUT,
+                fetch_terminal_executions(&history_client, &history_endpoint),
+            )
+            .await
+            {
+                Ok(Ok(executions)) => Some(ClientEvent::TerminalExecutions(executions)),
+                Ok(Err(event)) if matches!(event.as_ref(), ClientEvent::SessionExpired) => {
+                    Some(*event)
+                }
+                Ok(Err(_)) | Err(_) => None,
+            };
+            if history_stop.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            if let Some(event) = event {
+                let expired = matches!(event, ClientEvent::SessionExpired);
+                publish(&history_sender, &history_context, event);
+                if expired {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+    });
+
     tokio::spawn(async move {
         let mut projection_request = None;
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
@@ -175,28 +239,6 @@ pub(super) fn start_native(
                 if expired {
                     break;
                 }
-                if let Ok(executions) = fetch_terminal_executions(&client, &endpoint).await {
-                    publish(
-                        &sender,
-                        &context,
-                        ClientEvent::TerminalExecutions(executions),
-                    );
-                }
-            }
-            let event =
-                match tokio::time::timeout(super::REQUEST_TIMEOUT, fetch(&client, &endpoint)).await
-                {
-                    Ok(Ok(facts)) => ClientEvent::ExecutionFacts(facts),
-                    Ok(Err(event)) => *event,
-                    Err(_) => *unavailable("Execution facts request timed out"),
-                };
-            if stop.load(std::sync::atomic::Ordering::Acquire) {
-                break;
-            }
-            let expired = matches!(event, ClientEvent::SessionExpired);
-            publish(&sender, &context, event);
-            if expired {
-                break;
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }

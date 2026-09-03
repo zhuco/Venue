@@ -130,7 +130,7 @@ fn top_button_opens_trading_settings_without_a_trade_dock() {
 }
 
 #[test]
-fn terminal_chrome_hides_symbol_close_until_hover_and_removes_brand_wordmark() {
+fn terminal_chrome_shows_product_name_and_hides_symbol_close_until_hover() {
     let context = egui::Context::default();
     theme::apply(&context);
     let mut model = AppModel::new(crate::model::Preferences::default());
@@ -175,7 +175,7 @@ fn terminal_chrome_hides_symbol_close_until_hover_and_removes_brand_wordmark() {
         &mut accounts,
         &mut picker,
     );
-    assert!(!labels.iter().any(|(label, _)| label == "VENUEFLOW"));
+    assert!(labels.iter().any(|(label, _)| label == "VenueFlow"));
     let symbol = labels
         .iter()
         .find(|(label, _)| label == "BTC/USDC")

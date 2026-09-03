@@ -97,16 +97,24 @@ pub fn show_top_bar(
                 .show(
                     ui,
                     |ui| {
-                        let drag = ui.allocate_response(
-                            egui::vec2(ui.available_width(), 30.0),
-                            egui::Sense::click_and_drag(),
-                        );
-                        #[cfg(not(target_arch = "wasm32"))]
-                        if drag.double_clicked() {
-                            toggle_maximized(ui.ctx());
-                        } else if drag.drag_started() {
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                        }
+                        ui.horizontal_centered(|ui| {
+                            ui.label(
+                                RichText::new("VenueFlow")
+                                    .strong()
+                                    .color(theme::TEXT_PRIMARY),
+                            )
+                            .on_hover_text(format!("VenueFlow {}", product_version()));
+                            let drag = ui.allocate_response(
+                                egui::vec2(ui.available_width(), 30.0),
+                                egui::Sense::click_and_drag(),
+                            );
+                            #[cfg(not(target_arch = "wasm32"))]
+                            if drag.double_clicked() {
+                                toggle_maximized(ui.ctx());
+                            } else if drag.drag_started() {
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                            }
+                        });
                     },
                     |ui| {
                         ui.horizontal_centered(|ui| {
@@ -171,12 +179,13 @@ pub fn show_top_bar(
                             let filter_before = symbol_filter.clone();
                             let search_response = ui.add_sized(
                                 [150.0, 26.0],
-                                egui::TextEdit::singleline(&mut symbol_filter).hint_text(
-                                    match language {
+                                egui::TextEdit::singleline(&mut symbol_filter)
+                                    .hint_text(match language {
                                         Language::SimplifiedChinese => "搜索交易对",
                                         Language::English => "Search markets",
-                                    },
-                                ),
+                                    })
+                                    .horizontal_align(egui::Align::Min)
+                                    .vertical_align(egui::Align::Center),
                             );
                             if search_response.has_focus() || symbol_filter != filter_before {
                                 picker_requested.set(true);
@@ -268,6 +277,10 @@ pub fn show_top_bar(
             );
             crate::symbol_picker::show(&popup_anchor, show_symbol_picker, model, workspaces);
         });
+}
+
+fn product_version() -> &'static str {
+    include_str!("../../../../VERSION").trim()
 }
 
 fn show_symbol_tabs(

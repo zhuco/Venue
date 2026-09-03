@@ -24,9 +24,11 @@ pub struct ExecutionViewState {
     pub facts: Option<Arc<ExecutionFactsSnapshot>>,
     pub error: Option<String>,
     pub private_error: Option<String>,
+    pub terminal_executions_error: Option<String>,
     pub private_projection: Option<Arc<TerminalAccountProjection>>,
     pub terminal_executions: Vec<ExecutorCommandSummary>,
-    received_ms: u64,
+    facts_received_ms: u64,
+    private_received_ms: u64,
     tab: Tab,
     current_symbol: bool,
 }
@@ -44,7 +46,7 @@ impl ExecutionViewState {
                     Some("Invalid or regressing private account projection".into());
                 return;
             }
-            self.received_ms = crate::account_center::now_ms();
+            self.private_received_ms = crate::account_center::now_ms();
             self.private_projection = Some(Arc::new(projection));
             self.private_error = None;
         } else {
@@ -54,23 +56,34 @@ impl ExecutionViewState {
 
     pub fn apply_terminal_executions(&mut self, executions: Vec<ExecutorCommandSummary>) {
         if executions.iter().any(|summary| summary.validate().is_err()) {
-            self.private_error = Some("Invalid terminal execution history".into());
+            self.terminal_executions_error = Some("Invalid terminal execution history".into());
         } else if executions.len() == 1 {
             let summary = executions[0].clone();
             self.terminal_executions
                 .retain(|old| old.command_id != summary.command_id);
             self.terminal_executions.insert(0, summary);
+            self.terminal_executions_error = None;
         } else {
             self.terminal_executions = executions;
+            self.terminal_executions_error = None;
         }
     }
 
-    pub fn private_fresh(&self, now: u64) -> bool {
+    pub fn private_projection_for(
+        &self,
+        trading_account_id: Option<&str>,
+    ) -> Option<&TerminalAccountProjection> {
+        let trading_account_id = trading_account_id?;
+        self.private_projection
+            .as_deref()
+            .filter(|projection| projection.trading_account_id == trading_account_id)
+    }
+
+    pub fn private_ready(&self, trading_account_id: Option<&str>, now: u64) -> bool {
         self.private_error.is_none()
-            && fresh_time(self.received_ms, now)
+            && fresh_time(self.private_received_ms, now)
             && self
-                .private_projection
-                .as_ref()
+                .private_projection_for(trading_account_id)
                 .is_some_and(|projection| fresh_time(projection.observed_ms, now))
     }
 
@@ -98,14 +111,14 @@ impl ExecutionViewState {
             self.error = Some("Invalid or regressing execution facts".into());
             return;
         }
-        self.received_ms = crate::account_center::now_ms();
+        self.facts_received_ms = crate::account_center::now_ms();
         self.facts = Some(Arc::new(facts));
         self.error = None;
     }
 
     pub fn fresh(&self, now: u64) -> bool {
         self.error.is_none()
-            && fresh_time(self.received_ms, now)
+            && fresh_time(self.facts_received_ms, now)
             && self
                 .facts
                 .as_ref()
@@ -717,12 +730,44 @@ fn timestamp(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn private_projection(account: &str, observed_ms: u64) -> TerminalAccountProjection {
+        TerminalAccountProjection {
+            schema_version: venue_control_protocol::kol::TERMINAL_PROJECTION_SCHEMA_VERSION,
+            credential_id: "credential-a".into(),
+            trading_account_id: account.into(),
+            observed_ms,
+            persisted_ms: observed_ms,
+            private_generation: 1,
+            position_mode: venue_control_protocol::kol::TerminalPositionMode::Hedge,
+            positions: vec![],
+            position_history: vec![],
+            open_orders: vec![],
+            fills: vec![],
+            assets: vec![],
+        }
+    }
+
     #[test]
     fn stale_and_future_facts_are_not_actionable() {
         assert!(!fresh_time(0, 100));
         assert!(!fresh_time(1, 20_000));
         assert!(!fresh_time(25_000, 20_000));
         assert!(fresh_time(19_000, 20_000));
+    }
+
+    #[test]
+    fn private_readiness_uses_the_exact_selected_account_and_private_receive_time() {
+        let mut state = ExecutionViewState {
+            private_projection: Some(Arc::new(private_projection("account-a", 19_000))),
+            private_received_ms: 19_500,
+            ..ExecutionViewState::default()
+        };
+        assert!(state.private_ready(Some("account-a"), 20_000));
+        assert!(!state.private_ready(Some("account-b"), 20_000));
+        assert!(!state.private_ready(None, 20_000));
+        state.private_received_ms = 1;
+        assert!(!state.private_ready(Some("account-a"), 20_000));
     }
     #[test]
     fn current_and_historical_orders_are_separated_without_hiding_unknown_rows() {
