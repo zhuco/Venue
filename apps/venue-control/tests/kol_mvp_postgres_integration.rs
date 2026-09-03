@@ -469,16 +469,17 @@ async fn runtime_reconciles_mocked_restart_timeout_and_rejection_without_reposti
     let store = PgExecutorStore::new(fixture.pool.clone());
     let secrets = ExecutorSecretProvider::new(fixture.pool.clone(), cipher);
     let mut runtime = BinanceExecutorRuntime::new(store, exchange, secrets);
-    assert_eq!(runtime.recover_once().await?, 1);
+    // The account drain continues after a terminal placement, then stops at the first Unknown.
+    assert_eq!(runtime.recover_once().await?, 2);
     assert_eq!(
         command_state(&fixture.pool, &reconciled).await?,
         "reconciled"
     );
-    assert_eq!(runtime.recover_once().await?, 1);
     assert_eq!(
         command_state(&fixture.pool, &unknown).await?,
         "reconcile_required"
     );
+    assert_eq!(command_state(&fixture.pool, &rejected).await?, "pending");
     let initial_schedule: (i32, i64) = sqlx::query_as(
         "SELECT reconcile_attempts,next_reconcile_ms FROM venue_binance_commands WHERE command_id=$1",
     )
@@ -1696,6 +1697,9 @@ async fn insert_sending_grid_batch(
     tx.commit().await?;
     Ok(client_ids)
 }
+
+#[path = "support/projection_fill_observation.rs"]
+mod projection_fill_observation;
 
 fn integration_database_url() -> Result<Option<String>, Box<dyn std::error::Error>> {
     match std::env::var("VENUE_CONTROL_TEST_DATABASE_URL") {

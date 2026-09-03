@@ -65,11 +65,19 @@ impl BinanceGridMarketReader {
             .transport
             .fetch_usd_m_book_ticker(&rules.native_symbol)
             .await?;
+        // Binance may update the book while HTTP is in flight. Validate against receipt time,
+        // not the caller's pre-request clock, without changing the exchange event timestamp.
+        let received_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| BinanceAccountGatewayError::Clock)?
+            .as_millis()
+            .try_into()
+            .map_err(|_| BinanceAccountGatewayError::Clock)?;
         super::account_gateway::parse_grid_bootstrap_bbo(
             &response.payload,
             &self.binding,
             rules,
-            now_ms,
+            received_ms,
         )
     }
 
@@ -181,6 +189,30 @@ fn same_rules_ignoring_generation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bbo_during_fetch_requires_receipt_clock_and_keeps_staleness_guard()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rules = parse_instrument_rules(
+            include_str!("../tests/fixtures/exchange_info_btcusdt.json"),
+            "BTC/USDT".parse()?,
+            1,
+        )?;
+        let binding = GatewayBinding::new(
+            venue_gateway_api::VenueId::Binance,
+            venue_gateway_api::GatewayMode::Live,
+            "00000000-0000-4000-8000-000000000001".to_owned(),
+            "BTC/USDT".parse()?,
+        )?;
+        let payload = br#"{"symbol":"BTCUSDT","time":1100,"bidPrice":"50000","askPrice":"50001"}"#;
+        let parse = |now| {
+            super::super::account_gateway::parse_grid_bootstrap_bbo(payload, &binding, &rules, now)
+        };
+        assert!(parse(1000).is_err());
+        assert_eq!(parse(1200)?.observed_at_ms, 1100);
+        assert!(parse(4101).is_err());
+        Ok(())
+    }
 
     #[test]
     fn rule_comparison_ignores_only_generation() -> Result<(), Box<dyn std::error::Error>> {

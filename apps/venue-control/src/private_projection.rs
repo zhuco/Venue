@@ -179,6 +179,34 @@ impl BinancePrivateProjectionStore {
             let source = projection_source(&row, None)?;
             merge_projection_source(&mut by_credential, &mut priority, source)?;
         }
+        for source in by_credential.values_mut() {
+            let rows = sqlx::query("SELECT symbol,MIN(occurred_ms) AS replay_from FROM venue_binance_account_fills WHERE trading_account_id=$1 AND owner_user_id=$2 AND observed_ms<occurred_ms GROUP BY symbol")
+                .bind(&source.trading_account_id).bind(&source.owner_user_id)
+                .fetch_all(&self.pool).await.map_err(|_| PrivateProjectionError::Unavailable)?;
+            let mut from = BTreeMap::new();
+            for row in rows {
+                let symbol: String = row
+                    .try_get("symbol")
+                    .map_err(|_| PrivateProjectionError::Unavailable)?;
+                let symbol: Symbol = symbol
+                    .parse()
+                    .map_err(|_| PrivateProjectionError::Invalid)?;
+                let time: i64 = row
+                    .try_get("replay_from")
+                    .map_err(|_| PrivateProjectionError::Unavailable)?;
+                source.symbols.insert(symbol.clone());
+                from.insert(
+                    symbol,
+                    u64::try_from(time).map_err(|_| PrivateProjectionError::Invalid)?,
+                );
+            }
+            source.previous_fills_cursor =
+                venue_gateway_binance::BinanceAccountGateway::replay_projection_fills_from(
+                    source.previous_fills_cursor.as_deref(),
+                    &from,
+                )
+                .map_err(|_| PrivateProjectionError::Invalid)?;
+        }
         let max_workers = usize::try_from(MAX_ACTIVE_PROJECTION_WORKERS)
             .map_err(|_| PrivateProjectionError::Unavailable)?;
         priority
@@ -225,11 +253,16 @@ impl BinancePrivateProjectionStore {
         }
         persist_position_changes(&mut tx, source, previous.as_ref(), &projection).await?;
         for fill in &projection.fills {
+            // Account/order freshness remains the snapshot start; a later REST fill is first
+            // observed only after collection completes. Never freshen the entire snapshot.
+            if fill.occurred_ms.is_some_and(|time| time > persisted_ms) {
+                return Err(PrivateProjectionError::Invalid);
+            }
             let payload =
                 serde_json::to_value(fill).map_err(|_| PrivateProjectionError::Invalid)?;
-            sqlx::query("INSERT INTO venue_binance_account_fills (trading_account_id,owner_user_id,native_trade_id,symbol,occurred_ms,observed_ms,fill_json) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (trading_account_id,symbol,native_trade_id) DO NOTHING")
+            sqlx::query("INSERT INTO venue_binance_account_fills (trading_account_id,owner_user_id,native_trade_id,symbol,occurred_ms,observed_ms,fill_json) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (trading_account_id,symbol,native_trade_id) DO UPDATE SET observed_ms=EXCLUDED.observed_ms WHERE venue_binance_account_fills.observed_ms<venue_binance_account_fills.occurred_ms AND venue_binance_account_fills.owner_user_id=EXCLUDED.owner_user_id AND venue_binance_account_fills.fill_json=EXCLUDED.fill_json")
                 .bind(&source.trading_account_id).bind(&source.owner_user_id).bind(&fill.native_trade_id)
-                .bind(fill.symbol.to_string()).bind(fill.occurred_ms.map(ms).transpose()?).bind(ms(projection.observed_ms)?).bind(payload)
+                .bind(fill.symbol.to_string()).bind(fill.occurred_ms.map(ms).transpose()?).bind(ms(persisted_ms)?).bind(payload)
                 .execute(&mut *tx).await.map_err(|_| PrivateProjectionError::Unavailable)?;
         }
         for order in &projection.open_orders {
@@ -331,7 +364,7 @@ impl BinancePrivateProjectionStore {
                   cumulative_filled_quantity,order_state,client_order_id) \
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
                  ON CONFLICT (trading_account_id,symbol,native_trade_id) DO UPDATE SET \
-                  observed_ms=GREATEST(venue_binance_account_fills.observed_ms,EXCLUDED.observed_ms),\
+                  observed_ms=CASE WHEN venue_binance_account_fills.observed_ms<venue_binance_account_fills.occurred_ms THEN EXCLUDED.observed_ms ELSE venue_binance_account_fills.observed_ms END,\
                   stream_private_generation=COALESCE(venue_binance_account_fills.stream_private_generation,EXCLUDED.stream_private_generation),\
                   baseline_private_generation=COALESCE(venue_binance_account_fills.baseline_private_generation,EXCLUDED.baseline_private_generation),\
                   original_quantity=COALESCE(venue_binance_account_fills.original_quantity,EXCLUDED.original_quantity),\

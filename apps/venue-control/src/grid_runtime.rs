@@ -76,7 +76,8 @@ pub enum BinanceGridRuntimeError {
 }
 
 impl From<GridStoreError> for BinanceGridRuntimeError {
-    fn from(_: GridStoreError) -> Self {
+    fn from(error: GridStoreError) -> Self {
+        eprintln!("Binance Grid storage operation failed: {error}");
         Self::Store
     }
 }
@@ -342,7 +343,9 @@ impl BinanceGridRuntime {
         // responses arrive. Re-sample the planner clock so fresh evidence cannot appear to come
         // from the future merely because this turn began before those requests completed.
         let now = now_ms()?;
-        let fills = self.load_fill_batch(&record, &actual).await?;
+        let fills = self
+            .load_fill_batch(&record, &actual, projection.observed_ms)
+            .await?;
         let planner_fills = fills
             .iter()
             .filter(|fill| fill.config_revision == record.instance.config_revision)
@@ -1490,6 +1493,7 @@ impl BinanceGridRuntime {
         &self,
         record: &GridRuntimeRecord,
         actual: &ActualSurface,
+        included_through_ms: u64,
     ) -> Result<Vec<GridFillAllocation>, BinanceGridRuntimeError> {
         let fills = self
             .store
@@ -1500,6 +1504,11 @@ impl BinanceGridRuntime {
         }
         let mut unique = BTreeMap::new();
         for fill in fills {
+            // REST may return fills newer than its position/order baseline. Wait for the next
+            // signed baseline; otherwise a fill can move the anchor without being allocated.
+            if fill.observed_ms > included_through_ms {
+                continue;
+            }
             let owner = actual
                 .ownership
                 .get(&fill.client_order_id)
