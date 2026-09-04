@@ -228,6 +228,16 @@ async fn authorized_grant(
     connection: &mut sqlx::PgConnection,
     user: &str,
 ) -> Result<i64, AccountError> {
-    sqlx::query_scalar("SELECT g.revision FROM venue_kol_profiles p JOIN venue_leader_bot_permissions g ON g.kol_user_id=p.kol_user_id WHERE p.kol_user_id=$1 AND p.profile_state='enabled' AND g.enabled FOR UPDATE OF p,g")
-        .bind(user).fetch_optional(connection).await.map_err(database_error)?.ok_or(error(Code::Forbidden))
+    // Administrators take this lock before changing the grant. Read the grant in a subsequent
+    // statement so a waiter sees the committed revocation without permission-table UPDATE rights.
+    sqlx::query("SELECT kol_user_id FROM venue_kol_profiles WHERE kol_user_id=$1 AND profile_state='enabled' FOR UPDATE")
+        .bind(user).fetch_optional(&mut *connection).await.map_err(database_error)?.ok_or(error(Code::Forbidden))?;
+    sqlx::query_scalar(
+        "SELECT revision FROM venue_leader_bot_permissions WHERE kol_user_id=$1 AND enabled",
+    )
+    .bind(user)
+    .fetch_optional(connection)
+    .await
+    .map_err(database_error)?
+    .ok_or(error(Code::Forbidden))
 }

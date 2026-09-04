@@ -139,6 +139,81 @@ async fn leader_bot_grant_is_owned_revisioned_and_revocation_drains_without_resu
 }
 
 #[tokio::test]
+async fn creation_waiting_for_admin_lock_observes_committed_revocation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(url) = integration_database_url()? else {
+        return Ok(());
+    };
+    let fixture = Fixture::create(&url).await?;
+    fixture.migrate_twice().await?;
+    let service = AccountService::new_with_node_token(
+        fixture.pool.clone(),
+        CredentialCipher::from_key(&[12; 32])?,
+        None,
+    )?;
+    let now = test_now_ms()?;
+    let session = service
+        .register(
+            LoginRequest {
+                username: "leader-revoke-race".into(),
+                password: SecretValue::new("leader fixture password".into()),
+            },
+            now,
+        )
+        .await?;
+    let principal = service
+        .authenticate(session.token.expose(), now + 1)
+        .await?;
+    let user = &principal.user.user_id;
+    let account = id(9101);
+    let credential = id(9102);
+    provision_account(&fixture.pool, user, &account, &credential, 62).await?;
+    insert_kol_profile(&fixture.pool, user, &account, 1).await?;
+    set_permission(&fixture.pool, user, true, 0, "fixture-admin", now + 2).await?;
+
+    let mut admin = fixture.pool.begin().await?;
+    sqlx::query("SELECT kol_user_id FROM venue_kol_profiles WHERE kol_user_id=$1 FOR UPDATE")
+        .bind(user)
+        .fetch_one(&mut *admin)
+        .await?;
+    sqlx::query(
+        "UPDATE venue_leader_bot_permissions SET enabled=false,revision=2 WHERE kol_user_id=$1",
+    )
+    .bind(user)
+    .execute(&mut *admin)
+    .await?;
+    let creation = service.create_leader_bot(
+        &principal,
+        LeaderBotCreateRequest {
+            schema_version: 1,
+            request_id: id(9103),
+            credential_id: credential,
+        },
+        now + 3,
+    );
+    tokio::pin!(creation);
+    tokio::select! {
+        _ = &mut creation => return Err("creation bypassed administrator lock".into()),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+    }
+    admin.commit().await?;
+    assert_eq!(
+        creation
+            .await
+            .err()
+            .ok_or("revoked creation admitted")?
+            .code,
+        AccountErrorCode::Forbidden
+    );
+    let bots: i64 = sqlx::query_scalar("SELECT count(*) FROM venue_leader_bots")
+        .fetch_one(&fixture.pool)
+        .await?;
+    assert_eq!(bots, 0);
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn order_mirror_plans_once_and_revocation_cancels_only_definitely_unsent_children()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(url) = integration_database_url()? else {
