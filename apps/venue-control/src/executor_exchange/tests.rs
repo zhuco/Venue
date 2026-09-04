@@ -126,6 +126,18 @@ fn hot_token(now: u64) -> Result<crate::GridHotDispatchToken, Box<dyn std::error
 }
 
 #[test]
+fn clock_refresh_is_hourly_with_background_only_retry() {
+    assert_eq!(
+        clock_refresh_delay(true),
+        std::time::Duration::from_secs(3_600)
+    );
+    assert_eq!(
+        clock_refresh_delay(false),
+        std::time::Duration::from_secs(60)
+    );
+}
+
+#[test]
 fn prepared_account_transport_is_the_shared_dispatch_transport()
 -> Result<(), Box<dyn std::error::Error>> {
     let router = BinanceExecutionRouter::new(venue_gateway_binance::BinanceTransportLimits::new(

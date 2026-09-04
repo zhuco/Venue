@@ -300,6 +300,41 @@ impl BinanceExecutionRouter {
             .cloned()
             .ok_or(BinanceExecutionError::Unavailable)
     }
+
+    pub async fn maintain_clocks(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        let mut delay = std::time::Duration::from_secs(3_600);
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { return; }
+                }
+                _ = tokio::time::sleep(delay) => {
+                    let prepared = self.exchanges.lock().ok().map(|exchanges| exchanges.values().cloned().collect::<Vec<_>>());
+                    let Some(prepared) = prepared else { return; };
+                    let mut complete = true;
+                    for exchange in prepared {
+                        let refresh = match exchange.try_lock() {
+                            Ok(exchange) => exchange.transport.prepare_clock_refresh(),
+                            Err(_) => { complete = false; continue; }
+                        };
+                        tokio::select! {
+                            _ = shutdown.changed() => return,
+                            result = refresh => {
+                                if result.is_err() { complete = false; }
+                            }
+                        }
+                    }
+                    tracing::info!(target: "venue_control::grid_hot_path", complete,
+                        "Scheduled Binance clock refresh completed outside order execution");
+                    delay = clock_refresh_delay(complete);
+                }
+            }
+        }
+    }
+}
+
+fn clock_refresh_delay(complete: bool) -> std::time::Duration {
+    std::time::Duration::from_secs(if complete { 3_600 } else { 60 })
 }
 
 impl BinanceHttpExecution {

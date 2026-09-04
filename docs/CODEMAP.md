@@ -6,6 +6,8 @@
 
 Grid 快速补撤确认位于 `apps/venue-control/src/executor_exchange/grid_batch.rs`，完整 RESULT 由 `crates/venue-gateway-binance/src/execution.rs` 保留；不确定结果按同 ID 对账。`BinanceExecutionRouter::prepare_account_transports` 在策略私流基线启用前预热实际共享下单连接的签名时钟，不占用成交热路径。`account_stream_projection.rs` 在启动 REST 基线之上维护连续认证用户流的订单与双腿仓位，正常运行不定时拉全账户 REST；`account_gateway_projection.rs` 仅处理异常恢复读，`account_gateway_risk.rs` 保留完整账户风险读辅助。`grid_runtime/stream_overlay.rs` 按成交更新数量与加权开仓均价。`grid_runtime/risk.rs` 只在存在盈利减仓候选时单独签名读取 PM 权益；此查询不进入普通成交补撤路径。
 
+`BinanceExecutionRouter::maintain_clocks` 每小时后台刷新已创建的下单连接时钟；`BinanceHttpTransport::prepare_clock_refresh` 复用连接池并原子更新偏差，不持有账户锁等待网络。`account_stream_projection.rs` 按规范成交增量核对双腿数量与实际仓位及成交覆盖，不要求两类消息时间戳精确相等。
+
 当前目标是 Binance KOL 跟单 MVP 与事实驱动 Binance 对冲网格共用单例 `venue-executor-binance`；初期全站最多 5 个启用 KOL、200 个启用跟单账户。Scalping 和其余交易所迁移暂停。下面多数 Runtime/Node 入口是已提交代码或冻结兼容位置，不等于新链调用链。长期文档统一在本目录，仓库根 CODEMAP 仅作导航。
 
 当前可复用入口：`apps/venue-control/src/accounts/`（注册、登录、会话、凭证密文、邀请码归属、KOL、跟单、终端和 Grid 生命周期）、`crates/venue-gateway-binance/src/{credential_probe,account_gateway,execution,grid_market}.rs`（Portfolio Margin UM 验证、私流/签名 REST、Post Only、市价平仓与 Grid 公开事实）及同级 `apps/ui/{web,desktop}`。两套 UI 的入口判断先看 `apps/ui/README.md`。新链由 `0017`–`0024`、版本化终端/Grid/投影 DTO、用户作用域私有投影、旧 writer 门禁和唯一 `venue-executor-binance` 组装；启动仅在 explicit LIVE、PostgreSQL 和既有主密钥均有效时进行。

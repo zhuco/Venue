@@ -74,6 +74,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // nonterminal commands before this process establishes any KOL event source.
     runtime.recover_once().await?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let clock_router = exchange.clone();
+    let clock_shutdown = shutdown_rx.clone();
+    let clock_task =
+        tokio::spawn(async move { clock_router.maintain_clocks(clock_shutdown).await });
     let (grid_signal_tx, grid_signal_rx) =
         tokio::sync::mpsc::channel(GRID_PRIVATE_STREAM_CHANNEL_CAPACITY);
     let (grid_recovery_tx, grid_recovery_rx) =
@@ -120,6 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let result = runtime.run_until_shutdown(shutdown_rx).await;
     let _ = shutdown_tx.send(true);
+    clock_task.await?;
     grid_task.await??;
     singleton.release().await?;
     result?;

@@ -17,6 +17,8 @@ pub(super) struct AccountStreamProjection {
     baseline: SignedAccountSnapshot,
     orders: BTreeMap<String, SignedAccountOrderFact>,
     positions: BTreeMap<(Symbol, PositionSide), SignedAccountPositionFact>,
+    expected_quantities: BTreeMap<(Symbol, PositionSide), Decimal>,
+    seen_trades: BTreeMap<(Symbol, u64), crate::private::StreamFill>,
     position_times: BTreeMap<(Symbol, PositionSide), u64>,
     trade_times: BTreeMap<(Symbol, PositionSide), u64>,
     trade_cursors: BTreeMap<Symbol, (u64, u64)>,
@@ -40,6 +42,17 @@ impl AccountStreamProjection {
                 .cloned()
                 .map(|position| ((position.symbol.clone(), position.position_side), position))
                 .collect(),
+            expected_quantities: baseline
+                .positions()
+                .iter()
+                .map(|position| {
+                    (
+                        (position.symbol.clone(), position.position_side),
+                        position.quantity,
+                    )
+                })
+                .collect(),
+            seen_trades: BTreeMap::new(),
             position_times: BTreeMap::new(),
             trade_times: BTreeMap::new(),
             trade_cursors: BTreeMap::new(),
@@ -166,6 +179,53 @@ impl AccountStreamProjection {
             let execution = text(order, "x")?;
             if execution == "TRADE" {
                 let id = order.get("t").and_then(Value::as_u64).ok_or_else(invalid)?;
+                let payload = std::str::from_utf8(&frame.payload).map_err(|_| invalid())?;
+                let normalized = crate::private::parse_stream_fill(payload, &symbol)
+                    .map_err(|_| invalid())?
+                    .ok_or_else(invalid)?;
+                let identity = (symbol.clone(), id);
+                if let Some(previous) = self.seen_trades.get(&identity) {
+                    return if previous == &normalized {
+                        Ok(())
+                    } else {
+                        Err(invalid())
+                    };
+                }
+                if self
+                    .trade_cursors
+                    .get(&symbol)
+                    .is_some_and(|previous| id <= previous.0)
+                {
+                    return Err(invalid());
+                }
+                let key = (symbol.clone(), side);
+                let before = self
+                    .expected_quantities
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO);
+                let opening = matches!(
+                    (side, normalized.fill.side),
+                    (PositionSide::Long, OrderSide::Buy) | (PositionSide::Short, OrderSide::Sell)
+                );
+                let after = if opening {
+                    before.checked_add(normalized.fill.quantity)
+                } else {
+                    before.checked_sub(normalized.fill.quantity)
+                }
+                .filter(|quantity| *quantity >= Decimal::ZERO)
+                .ok_or_else(invalid)?;
+                self.expected_quantities.insert(key, after);
+                self.seen_trades.insert(identity, normalized);
+                while self.seen_trades.len() > 256 {
+                    let oldest = self
+                        .seen_trades
+                        .iter()
+                        .min_by_key(|(_, fill)| fill.fill.exchange_time_ms)
+                        .map(|(key, _)| key.clone())
+                        .ok_or_else(invalid)?;
+                    self.seen_trades.remove(&oldest);
+                }
                 let previous = self
                     .trade_cursors
                     .entry(symbol.clone())
@@ -236,11 +296,20 @@ impl AccountStreamProjection {
             self.position_times
                 .get(key)
                 .is_none_or(|position| position < time)
-        }) || self
-            .position_times
-            .iter()
-            .any(|(key, time)| self.trade_times.get(key).is_none_or(|trade| trade < time));
+        }) || self.expected_quantities.iter().any(|(key, expected)| {
+            self.positions.get(key).map(|position| position.quantity) != Some(*expected)
+        }) || self.positions.iter().any(|(key, position)| {
+            self.expected_quantities
+                .get(key)
+                .copied()
+                .unwrap_or(Decimal::ZERO)
+                != position.quantity
+        });
         if incomplete && observed_ms.saturating_sub(self.last_change_received_ms) > 5_000 {
+            eprintln!(
+                "Authenticated position quantities or trade coverage did not converge: trade_times={:?} position_times={:?}",
+                self.trade_times, self.position_times
+            );
             return Err(invalid());
         }
         if observed_ms <= self.last_published_ms || incomplete {

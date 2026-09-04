@@ -58,7 +58,7 @@ fn apply(
 }
 
 const NEW: &str = r#"{"e":"ORDER_TRADE_UPDATE","fs":"UM","E":120,"T":119,"o":{"s":"SOLUSDC","c":"grid-new","i":44,"S":"BUY","ps":"LONG","x":"NEW","X":"NEW","o":"LIMIT","f":"GTX","q":"2","z":"0","p":"100","R":false}}"#;
-const FILL: &str = r#"{"e":"ORDER_TRADE_UPDATE","fs":"UM","E":132,"T":130,"o":{"s":"SOLUSDC","c":"grid-new","i":44,"S":"BUY","ps":"LONG","x":"TRADE","t":45,"X":"FILLED","o":"LIMIT","f":"GTX","q":"2","z":"2","p":"100","R":false}}"#;
+const FILL: &str = r#"{"e":"ORDER_TRADE_UPDATE","fs":"UM","E":132,"T":130,"o":{"s":"SOLUSDC","c":"grid-new","i":44,"S":"BUY","ps":"LONG","x":"TRADE","t":45,"X":"FILLED","o":"LIMIT","f":"GTX","q":"2","z":"2","l":"2","L":"100","p":"100","R":false}}"#;
 const POSITION: &str = r#"{"e":"ACCOUNT_UPDATE","fs":"UM","E":131,"T":130,"a":{"m":"ORDER","P":[{"s":"SOLUSDC","ps":"LONG","pa":"3","ep":"100","up":"0"}]}}"#;
 
 #[test]
@@ -157,6 +157,7 @@ fn partial_duplicate_and_cross_burst_second_leg_keep_exact_inventory()
     let mut state = state()?;
     apply(&mut state, NEW)?;
     let partial = FILL
+        .replace("\"l\":\"2\"", "\"l\":\"1\"")
         .replace("\"z\":\"2\"", "\"z\":\"1\"")
         .replace("\"X\":\"FILLED\"", "\"X\":\"PARTIALLY_FILLED\"");
     apply(&mut state, &partial)?;
@@ -190,5 +191,47 @@ fn partial_duplicate_and_cross_burst_second_leg_keep_exact_inventory()
     assert_eq!(second.positions()[1].quantity, Decimal::from(3));
     assert_eq!(second.open_orders().len(), 1);
     assert!(second.fills_cursor().contains(",47,230"));
+    Ok(())
+}
+
+#[test]
+fn later_account_update_time_does_not_require_another_trade()
+-> Result<(), Box<dyn std::error::Error>> {
+    for position_first in [false, true] {
+        let mut state = state()?;
+        apply(&mut state, NEW)?;
+        let later = POSITION.replace("\"T\":130", "\"T\":131");
+        if position_first {
+            apply(&mut state, &later)?;
+        }
+        apply(&mut state, FILL)?;
+        if !position_first {
+            apply(&mut state, &later)?;
+        }
+        assert!(state.snapshot(5_201, 2)?.is_some());
+        // An ORDER balance/fee notification can repeat the unchanged position later.
+        apply(
+            &mut state,
+            &POSITION
+                .replace("\"T\":130", "\"T\":140")
+                .replace("\"E\":131", "\"E\":141"),
+        )?;
+        assert!(state.snapshot(5_202, 2)?.is_some());
+    }
+    Ok(())
+}
+
+#[test]
+fn matching_timestamps_cannot_hide_conflicting_position_quantity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut state = state()?;
+    apply(&mut state, NEW)?;
+    apply(&mut state, FILL)?;
+    apply(
+        &mut state,
+        &POSITION.replace("\"pa\":\"3\"", "\"pa\":\"4\""),
+    )?;
+    assert!(state.snapshot(200, 2)?.is_none());
+    assert!(state.snapshot(5_201, 2).is_err());
     Ok(())
 }

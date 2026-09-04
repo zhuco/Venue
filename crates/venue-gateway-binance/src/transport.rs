@@ -1,5 +1,8 @@
 use std::{
-    sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -86,8 +89,8 @@ pub struct BinanceHttpTransport {
     limits: BinanceTransportLimits,
     instance_serial: u64,
     fixed_endpoint: bool,
-    clock_offset_ms: AtomicI64,
-    clock_synchronized: AtomicBool,
+    clock_offset_ms: Arc<AtomicI64>,
+    clock_synchronized: Arc<AtomicBool>,
 }
 
 impl BinanceHttpTransport {
@@ -162,15 +165,16 @@ impl BinanceHttpTransport {
             limits,
             instance_serial,
             fixed_endpoint: require_fixed_endpoint,
-            clock_offset_ms: AtomicI64::new(0),
-            clock_synchronized: AtomicBool::new(cfg!(test)),
+            clock_offset_ms: Arc::new(AtomicI64::new(0)),
+            clock_synchronized: Arc::new(AtomicBool::new(cfg!(test))),
         })
     }
 
     /// Installs the lowest-RTT midpoint sample from Binance before any signed request. A newly
     /// constructed production transport is deliberately unusable for signing until this succeeds.
     pub async fn synchronize_clock(&self) -> Result<(), BinanceTransportError> {
-        self.clock_synchronized.store(false, Ordering::Release);
+        // Refreshing an already valid clock must not disable concurrent order signing while
+        // waiting for public time responses. An initial failure still leaves it unusable.
         let mut best = None;
         for _ in 0..TIME_SYNC_ATTEMPTS {
             let before = unix_ms()?;
@@ -203,6 +207,26 @@ impl BinanceHttpTransport {
         self.clock_offset_ms.store(offset, Ordering::Relaxed);
         self.clock_synchronized.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// A time-only future sharing this transport's HTTP pool and clock. It owns no mutation
+    /// dispatch material and does not borrow the caller's account execution lock across I/O.
+    pub fn prepare_clock_refresh(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), BinanceTransportError>> + Send + 'static {
+        let probe = Self {
+            client: self.client.clone(),
+            config: self.config.clone(),
+            instrument_generation: self.instrument_generation,
+            private_generation: self.private_generation,
+            endpoint: self.endpoint.clone(),
+            limits: self.limits,
+            instance_serial: self.instance_serial,
+            fixed_endpoint: self.fixed_endpoint,
+            clock_offset_ms: Arc::clone(&self.clock_offset_ms),
+            clock_synchronized: Arc::clone(&self.clock_synchronized),
+        };
+        async move { probe.synchronize_clock().await }
     }
 
     pub(crate) fn inherit_synchronized_clock(
@@ -1474,6 +1498,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detached_refresh_keeps_signing_available_when_public_time_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (config, _, _) = facts("00000000-0000-4000-8000-000000000001")?;
+        let (endpoint, _) = fake_http(
+            (0..TIME_SYNC_ATTEMPTS)
+                .map(|_| Behavior::Body(b"{}"))
+                .collect(),
+        )
+        .await?;
+        let transport = BinanceHttpTransport::with_endpoint(
+            config,
+            7,
+            17,
+            endpoint,
+            BinanceTransportLimits::new(Duration::from_secs(1), 1024)?,
+        )?;
+        transport.clock_offset_ms.store(123, Ordering::Relaxed);
+        let refresh = transport.prepare_clock_refresh();
+        assert!(transport.signing_timestamp_ms().is_ok());
+        assert!(refresh.await.is_err());
+        assert_eq!(transport.clock_offset_ms.load(Ordering::Relaxed), 123);
+        assert!(transport.signing_timestamp_ms().is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn server_clock_uses_midpoint_sample_before_signed_time()
     -> Result<(), Box<dyn std::error::Error>> {
         let (config, _, _) = facts("00000000-0000-4000-8000-000000000001")?;
@@ -1496,7 +1546,8 @@ mod tests {
             endpoint,
             BinanceTransportLimits::new(Duration::from_secs(1), 1024)?,
         )?;
-        transport.synchronize_clock().await?;
+        transport.clock_synchronized.store(false, Ordering::Release);
+        transport.prepare_clock_refresh().await?;
         let signed = transport.signing_timestamp_ms()?;
         assert!(signed >= server_time.saturating_sub(50));
         assert_eq!(count.load(Ordering::SeqCst), TIME_SYNC_ATTEMPTS);
