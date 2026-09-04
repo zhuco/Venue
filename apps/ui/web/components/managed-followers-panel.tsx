@@ -72,6 +72,7 @@ export function ManagedFollowersPanel({ csrf }: { csrf: string }) {
     <dialog ref={dialog} className="managed-dialog" aria-labelledby="managed-title" onCancel={event => { event.preventDefault(); close(); }}>
       <h2 id="managed-title">添加托管 API Key</h2><p>填写标签、API Key 和 API Secret。支持一次添加多个账户，最多 10 个。</p>
       <p className="muted">仅支持 Binance Portfolio Margin · UM · 双向持仓；开启读取及 UM 交易权限，关闭提现。密钥加密保存后只显示掩码。</p>
+      {error && <div className="notice error" role="alert">{error}<button type="button" disabled={busy} onClick={() => void refresh()}>刷新连接</button></div>}
       <form onSubmit={event => void save(event)}>
         <div className="managed-rows">{rows.map((row, index) => <fieldset key={row.id} disabled={busy || row.status !== "editing"} className="managed-row"><legend>账户 {index + 1}{row.status === "saved" ? " · 已保存" : ""}</legend>
           <label>账户标签<input aria-label={`账户 ${index + 1} 标签`} value={row.label} onChange={e => edit(row.id,"label",e.target.value)} required maxLength={64} autoComplete="off" /></label>
