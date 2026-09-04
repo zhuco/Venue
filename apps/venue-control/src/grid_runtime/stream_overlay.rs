@@ -47,7 +47,28 @@ pub(super) fn apply_stream_overlay(
     owners: &[GridOrderOwnership],
     events: &[BinancePrivateFillEvent],
 ) -> Result<GridStreamOverlay, GridStreamOverlayError> {
-    validate_baseline(record, baseline, events)?;
+    apply_stream_overlay_inner(record, baseline, owners, events, false)
+}
+
+/// The caller must bind this continuation to the cached record revision, predecessor batch,
+/// private/socket generations and monotonic event sequence before allowing a dirty record.
+pub(super) fn apply_stream_continuation(
+    record: &GridRuntimeRecord,
+    baseline: &TerminalAccountProjection,
+    owners: &[GridOrderOwnership],
+    events: &[BinancePrivateFillEvent],
+) -> Result<GridStreamOverlay, GridStreamOverlayError> {
+    apply_stream_overlay_inner(record, baseline, owners, events, true)
+}
+
+fn apply_stream_overlay_inner(
+    record: &GridRuntimeRecord,
+    baseline: &TerminalAccountProjection,
+    owners: &[GridOrderOwnership],
+    events: &[BinancePrivateFillEvent],
+    validated_continuation: bool,
+) -> Result<GridStreamOverlay, GridStreamOverlayError> {
+    validate_baseline(record, baseline, events, validated_continuation)?;
     let owner_indices = validate_owners(record, baseline, owners)?;
 
     let mut projection = baseline.clone();
@@ -189,6 +210,7 @@ fn validate_baseline(
     record: &GridRuntimeRecord,
     baseline: &TerminalAccountProjection,
     events: &[BinancePrivateFillEvent],
+    validated_continuation: bool,
 ) -> Result<(), GridStreamOverlayError> {
     record
         .instance
@@ -199,7 +221,7 @@ fn validate_baseline(
         .map_err(|_| GridStreamOverlayError::Baseline)?;
     if events.is_empty()
         || record.instance.state != GridInstanceState::Running
-        || record.instance.dirty
+        || (record.instance.dirty && !validated_continuation)
         || baseline.position_mode != TerminalPositionMode::Hedge
         || baseline.credential_id != record.instance.credential_id
         || baseline.trading_account_id != record.instance.trading_account_id
@@ -256,24 +278,27 @@ fn validate_owners(
             || clients
                 .insert(owner.client_order_id.clone(), index)
                 .is_some()
-            || owner
-                .native_order_id
-                .as_ref()
-                .is_none_or(|native| native.trim().is_empty() || !native_ids.insert(native.clone()))
+            || owner.native_order_id.as_ref().is_some_and(|native| {
+                native.trim().is_empty() || !native_ids.insert(native.clone())
+            })
         {
             return Err(GridStreamOverlayError::Ownership);
         }
         let order = unique_open_order_index(projection, &owner.client_order_id)?;
         match (owner.state, order) {
             (GridOwnedOrderState::Working, Some(order)) => {
-                if owner.config_revision != record.instance.config_revision
+                if owner.native_order_id.is_none()
+                    || owner.config_revision != record.instance.config_revision
                     || !working_semantic_keys.insert(owner.key.encoded())
                 {
                     return Err(GridStreamOverlayError::Ownership);
                 }
                 validate_open_owner(owner, &projection.open_orders[order])?;
             }
-            (GridOwnedOrderState::Terminal, None) => {}
+            // A command rejected before submission never acquired a native ID. Historical
+            // zero-fill terminal records cannot invalidate unrelated live order evidence.
+            (GridOwnedOrderState::Terminal, None)
+                if owner.native_order_id.is_some() || owner.filled_quantity.is_zero() => {}
             _ => return Err(GridStreamOverlayError::Ownership),
         }
     }
@@ -1117,6 +1142,180 @@ mod tests {
         assert_eq!(
             position_quantity(&overlaid.projection, PositionSide::Long)?,
             Decimal::from(12)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dirty_cross_microbatch_continuation_applies_second_leg_without_recovery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let owners = vec![
+            owner(
+                "live-long",
+                "native-long",
+                PositionSide::Long,
+                GridOrderRole::Open,
+                1,
+            )?,
+            owner(
+                "live-short",
+                "native-short",
+                PositionSide::Short,
+                GridOrderRole::Close,
+                2,
+            )?,
+        ];
+        let baseline = projection(&owners)?;
+        let first = owner_event(
+            &owners[0],
+            1,
+            owners[0].quantity,
+            owners[0].quantity,
+            OrderState::Filled,
+        )?;
+        let second = owner_event(
+            &owners[1],
+            2,
+            owners[1].quantity,
+            owners[1].quantity,
+            OrderState::Filled,
+        )?;
+        let mut record = record()?;
+        let first_overlay = apply_stream_overlay(&record, &baseline, &owners, &[first])?;
+        record.instance.dirty = true;
+        assert_eq!(
+            apply_stream_overlay(
+                &record,
+                &first_overlay.projection,
+                &first_overlay.owners,
+                std::slice::from_ref(&second)
+            ),
+            Err(GridStreamOverlayError::Baseline)
+        );
+        let second_overlay = apply_stream_continuation(
+            &record,
+            &first_overlay.projection,
+            &first_overlay.owners,
+            &[second],
+        )?;
+        assert_eq!(second_overlay.fills.len(), 1);
+        assert!(second_overlay.projection.open_orders.is_empty());
+        assert_eq!(
+            position_quantity(&second_overlay.projection, PositionSide::Long)?,
+            Decimal::from(12)
+        );
+        assert_eq!(
+            position_quantity(&second_overlay.projection, PositionSide::Short)?,
+            Decimal::from(8)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unsent_terminal_history_does_not_block_live_paired_fills()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let working = vec![
+            owner(
+                "live-long",
+                "native-long",
+                PositionSide::Long,
+                GridOrderRole::Open,
+                1,
+            )?,
+            owner(
+                "live-short",
+                "native-short",
+                PositionSide::Short,
+                GridOrderRole::Close,
+                2,
+            )?,
+        ];
+        let baseline = projection(&working)?;
+        let events = working
+            .iter()
+            .enumerate()
+            .map(|(index, owner)| {
+                owner_event(
+                    owner,
+                    u64::try_from(index + 1)?,
+                    owner.quantity,
+                    owner.quantity,
+                    OrderState::Filled,
+                )
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let mut owners = working;
+        for index in 0..1248 {
+            let mut historical = owner(
+                &format!("unsent-{index}"),
+                "unused",
+                PositionSide::Long,
+                GridOrderRole::Open,
+                1,
+            )?;
+            historical.config_revision = 1;
+            historical.plan_revision = 3;
+            historical.state = GridOwnedOrderState::Terminal;
+            historical.native_order_id = None;
+            owners.push(historical);
+        }
+        let overlaid = apply_stream_overlay(&record()?, &baseline, &owners, &events)?;
+        assert_eq!(overlaid.fills.len(), 2);
+        assert!(overlaid.projection.open_orders.is_empty());
+        assert_eq!(&overlaid.owners[2..], &owners[2..]);
+        assert_eq!(
+            position_quantity(&overlaid.projection, PositionSide::Long)?,
+            Decimal::from(12)
+        );
+        assert_eq!(
+            position_quantity(&overlaid.projection, PositionSide::Short)?,
+            Decimal::from(8)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_native_identity_is_rejected_for_working_or_filled_owners()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let working = owner(
+            "live",
+            "native-live",
+            PositionSide::Long,
+            GridOrderRole::Open,
+            1,
+        )?;
+        let baseline = projection(std::slice::from_ref(&working))?;
+        let fill = owner_event(
+            &working,
+            1,
+            working.quantity,
+            working.quantity,
+            OrderState::Filled,
+        )?;
+        let mut invalid = working.clone();
+        invalid.native_order_id = None;
+        assert_eq!(
+            apply_stream_overlay(
+                &record()?,
+                &baseline,
+                &[invalid],
+                std::slice::from_ref(&fill)
+            ),
+            Err(GridStreamOverlayError::Ownership)
+        );
+        let mut historical = owner(
+            "invalid-history",
+            "unused",
+            PositionSide::Short,
+            GridOrderRole::Open,
+            2,
+        )?;
+        historical.native_order_id = None;
+        historical.state = GridOwnedOrderState::Terminal;
+        historical.filled_quantity = Decimal::ONE;
+        assert_eq!(
+            apply_stream_overlay(&record()?, &baseline, &[working, historical], &[fill]),
+            Err(GridStreamOverlayError::Ownership)
         );
         Ok(())
     }

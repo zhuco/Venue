@@ -553,9 +553,23 @@ impl BinanceGridRuntime {
         if !projected_continuation && !surface_is_exact(&prior, &baseline_actual)? {
             return Err(BinanceGridRuntimeError::SurfaceConflict);
         }
-        let mut overlaid =
+        let overlay = if projected_continuation {
+            super::stream_overlay::apply_stream_continuation(
+                &record,
+                &baseline,
+                &owners,
+                &fresh_events,
+            )
+        } else {
             super::stream_overlay::apply_stream_overlay(&record, &baseline, &owners, &fresh_events)
-                .map_err(|_| BinanceGridRuntimeError::Facts)?;
+        };
+        let mut overlaid = overlay.map_err(|error| {
+            tracing::warn!(target: "venue_control::grid_hot_path",
+                instance_id = %record.instance.instance_id,
+                overlay_error = ?error, projected_continuation,
+                "Grid authenticated fill overlay rejected");
+            BinanceGridRuntimeError::Facts
+        })?;
         for position in overlaid
             .projection
             .positions
