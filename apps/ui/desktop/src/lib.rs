@@ -8,6 +8,7 @@ mod chart_view;
 mod client;
 mod copy_relation_view;
 mod custom_indicator;
+mod diagnostics;
 mod execution_view;
 mod grid_view;
 mod i18n;
@@ -29,6 +30,7 @@ mod ui;
 mod workspace;
 
 pub use app::VenueFlowApp;
+pub use diagnostics::init_diagnostics;
 pub use server_connection::default_control_endpoint;
 
 #[cfg(target_arch = "wasm32")]

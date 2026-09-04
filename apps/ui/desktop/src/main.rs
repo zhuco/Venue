@@ -4,10 +4,7 @@ use eframe::egui;
 use venueflow::VenueFlowApp;
 
 fn main() -> eframe::Result {
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .without_time()
-        .init();
+    venueflow::init_diagnostics();
 
     let endpoint = venueflow::default_control_endpoint();
     let native_options = eframe::NativeOptions {

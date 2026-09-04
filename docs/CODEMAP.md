@@ -2,6 +2,8 @@
 
 Binance 网格各层职责、目录和实际调用链见 [策略开发与运行结构](GRID_STRATEGY_ARCHITECTURE.md)。
 
+桌面诊断入口为 `apps/ui/desktop/src/diagnostics.rs`：警告写入用户本地 UI 日志，后台连接不依赖启动器 stdout 管道。
+
 Control 部署由 `bin/venue-control-server.rs` 用迁移身份验证 schema，再以 `VENUE_CONTROL_RUNTIME_DATABASE_URL` 连接受限运行角色；`bin/venue-leader-bot-admin.rs` 的 `migrate` 子命令只安装迁移。`scripts/Build-VenueUbuntu.ps1 -Component Control` 同包输出 Control、Executor 与管理员工具。
 
 桌面当前执行账户的 Control 事件订阅与写入门由 `apps/ui/desktop/src/client/stream_gates.rs` 管理；切换账户直接更新订阅范围，迟到的全账户快照不得重新启用旧范围。账户私有投影仍由 `client/execution.rs` 按所选凭证轮询。
