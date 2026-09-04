@@ -27,6 +27,8 @@ async fn mock_submit_is_stable_by_client_order_id() -> Result<(), Box<dyn std::e
         },
         known_native_order_id: None,
         reconciled_close_reservations: Vec::new(),
+        market_baseline: None,
+        copy_risk: None,
     };
     let mut exchange = MockBinanceExecution::default();
     assert_eq!(
@@ -53,7 +55,8 @@ fn grid_place_request(index: usize) -> Result<ExecutionRequest, Box<dyn std::err
         credential_id: "credential-a".into(),
         trading_account_id: "account-a".into(),
         symbol: "BTC/USDT".parse()?,
-        order_kind: ExecutionOrderKind::LimitPostOnly {
+        order_kind: ExecutionOrderKind::Limit {
+            time_in_force: venue_domain::LimitTimeInForce::PostOnly,
             side: OrderSide::Buy,
             position_side: PositionSide::Long,
             quantity: Decimal::new(1, 3),
@@ -62,6 +65,8 @@ fn grid_place_request(index: usize) -> Result<ExecutionRequest, Box<dyn std::err
         },
         known_native_order_id: None,
         reconciled_close_reservations: Vec::new(),
+        market_baseline: None,
+        copy_risk: None,
     })
 }
 
@@ -79,6 +84,8 @@ fn grid_cancel_request(index: usize) -> Result<ExecutionRequest, Box<dyn std::er
         },
         known_native_order_id: None,
         reconciled_close_reservations: Vec::new(),
+        market_baseline: None,
+        copy_risk: None,
     })
 }
 
@@ -397,7 +404,8 @@ fn restart_market_terminal_requires_a_persisted_pre_dispatch_position_baseline()
         restart_terminal_decision(&market, true),
         ExecutionReadback::Unknown
     );
-    let post_only = ExecutionOrderKind::LimitPostOnly {
+    let post_only = ExecutionOrderKind::Limit {
+        time_in_force: venue_domain::LimitTimeInForce::PostOnly,
         side: OrderSide::Buy,
         position_side: PositionSide::Long,
         quantity: Decimal::ONE,
@@ -428,6 +436,8 @@ fn projection_lag_reservation_requires_exact_persisted_context()
         },
         known_native_order_id: None,
         reconciled_close_reservations: Vec::new(),
+        market_baseline: None,
+        copy_risk: None,
     };
     let mut reservation = ReconciledCloseReservation {
         credential_id: "credential-a".into(),
@@ -537,7 +547,8 @@ fn exact_limit_readback_requires_every_immutable_semantic() -> Result<(), Box<dy
         credential_id: "credential-a".into(),
         trading_account_id: "account-a".into(),
         symbol: "BTC/USDT".parse()?,
-        order_kind: ExecutionOrderKind::LimitPostOnly {
+        order_kind: ExecutionOrderKind::Limit {
+            time_in_force: venue_domain::LimitTimeInForce::PostOnly,
             side: OrderSide::Buy,
             position_side: PositionSide::Long,
             quantity: Decimal::new(29, 4),
@@ -546,6 +557,8 @@ fn exact_limit_readback_requires_every_immutable_semantic() -> Result<(), Box<dy
         },
         known_native_order_id: None,
         reconciled_close_reservations: Vec::new(),
+        market_baseline: None,
+        copy_risk: None,
     };
     let mut order = Order {
         order_id: "native-1".into(),
@@ -589,7 +602,8 @@ fn exact_reducing_readback_accepts_only_a_normalized_downward_clip()
         credential_id: "credential-a".into(),
         trading_account_id: "account-a".into(),
         symbol: "BTC/USDT".parse()?,
-        order_kind: ExecutionOrderKind::LimitPostOnly {
+        order_kind: ExecutionOrderKind::Limit {
+            time_in_force: venue_domain::LimitTimeInForce::PostOnly,
             side: OrderSide::Sell,
             position_side: PositionSide::Long,
             quantity: Decimal::new(5, 3),
@@ -598,6 +612,8 @@ fn exact_reducing_readback_accepts_only_a_normalized_downward_clip()
         },
         known_native_order_id: None,
         reconciled_close_reservations: Vec::new(),
+        market_baseline: None,
+        copy_risk: None,
     };
     let mut order = Order {
         order_id: "native-close".into(),

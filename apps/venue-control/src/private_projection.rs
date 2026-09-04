@@ -1,5 +1,7 @@
 //! Secret-free Binance private-account projection shared by the singleton Executor and Control.
 
+mod terminal_positions;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::{PgPool, Row};
@@ -14,7 +16,7 @@ use venue_gateway_binance::BinancePrivateFillEvent;
 
 const PROJECTION_SUBSCRIPTION_MS: u64 = 45_000;
 const HISTORY_LIMIT: i64 = 500;
-const MAX_ACTIVE_PROJECTION_WORKERS: i64 = 32;
+const MAX_ACTIVE_PROJECTION_WORKERS: i64 = 232;
 pub const PRIVATE_STREAM_FILL_BATCH_LIMIT: usize = 5;
 pub const MIGRATION_0019: &str = include_str!("../migrations/0019_binance_account_projection.sql");
 pub const MIGRATION_0020: &str = include_str!("../migrations/0020_binance_post_only_terminal.sql");
@@ -199,7 +201,7 @@ impl BinancePrivateProjectionStore {
                SELECT min(c.credential_id) AS credential_id,count(*) AS credential_count \
                FROM venue_api_credentials c \
                WHERE c.user_id=k.kol_user_id \
-                 AND c.trading_account_id=k.leader_trading_account_id \
+                 AND c.trading_account_id=k.leader_trading_account_id AND c.credential_id=COALESCE((SELECT b.credential_id FROM venue_leader_bots b WHERE b.owner_user_id=k.kol_user_id),c.credential_id) \
                  AND c.deleted_ms IS NULL \
                  AND c.verification_json->>'verification'='verified'\
              ) credentials \
@@ -235,6 +237,8 @@ impl BinancePrivateProjectionStore {
             .fetch_all(&self.pool)
             .await
             .map_err(|_| PrivateProjectionError::Unavailable)?;
+        let follower_rows=sqlx::query("SELECT r.follower_user_id AS owner_user_id,r.credential_id,r.follower_trading_account_id AS trading_account_id,r.allowed_symbols AS symbols,p.projection_json FROM venue_kol_follow_relations r JOIN venue_api_credentials c ON c.credential_id=r.credential_id AND c.user_id=r.follower_user_id AND c.trading_account_id=r.follower_trading_account_id LEFT JOIN venue_binance_account_projections p ON p.credential_id=r.credential_id WHERE c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' AND ((r.relation_state='active' AND r.baseline_json->>'target_model'='2') OR EXISTS(SELECT 1 FROM venue_order_mirrors m WHERE m.relation_id=r.relation_id AND m.mirror_state NOT IN ('terminal','blocked'))) ORDER BY r.relation_id LIMIT 200")
+            .fetch_all(&self.pool).await.map_err(|_|PrivateProjectionError::Unavailable)?;
         let mut by_credential = BTreeMap::<String, ActiveProjectionSource>::new();
         let mut priority = Vec::new();
         for row in kol_rows {
@@ -250,7 +254,7 @@ impl BinancePrivateProjectionStore {
             let source = projection_source(&row, Some(kol_user_id))?;
             merge_projection_source(&mut by_credential, &mut priority, source)?;
         }
-        for row in grid_rows.into_iter().chain(ui_rows) {
+        for row in follower_rows.into_iter().chain(grid_rows).chain(ui_rows) {
             let source = projection_source(&row, None)?;
             merge_projection_source(&mut by_credential, &mut priority, source)?;
         }
@@ -532,6 +536,8 @@ impl BinancePrivateProjectionStore {
         };
         stored.projection.fills = self.load_fills(&source).await?;
         stored.projection.position_history = self.load_position_history(&source).await?;
+        self.apply_terminal_position_refresh(owner_user_id, &mut stored.projection)
+            .await?;
         stored
             .projection
             .validate()
@@ -705,6 +711,11 @@ fn project(
                 quantity: order.quantity,
                 filled_quantity: order.filled_quantity,
                 limit_price: order.limit_price,
+                time_in_force: if order.family == venue_domain::NativeOrderFamily::UmOrder {
+                    order.time_in_force
+                } else {
+                    None
+                },
                 post_only: order.time_in_force == Some(LimitTimeInForce::PostOnly),
                 reduce_only: order.reduce_only,
                 state,

@@ -132,7 +132,7 @@ async fn execute(
     if !safe_endpoint(&endpoint) {
         return Err(AccountErrorCode::InvalidInput);
     }
-    let builder = reqwest::Client::builder();
+    let builder = crate::server_connection::http_client_builder(&endpoint);
     #[cfg(not(target_arch = "wasm32"))]
     let builder = builder
         .connect_timeout(std::time::Duration::from_secs(5))

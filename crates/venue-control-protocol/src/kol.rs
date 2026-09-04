@@ -96,6 +96,8 @@ pub struct TerminalOpenOrder {
     pub filled_quantity: Option<Decimal>,
     #[serde(default, with = "rust_decimal::serde::str_option")]
     pub limit_price: Option<Decimal>,
+    #[serde(default)]
+    pub time_in_force: Option<venue_domain::LimitTimeInForce>,
     pub post_only: bool,
     pub reduce_only: bool,
     pub state: TerminalOrderState,
@@ -509,6 +511,7 @@ pub enum ExecutorCommandPhase {
 pub enum ExecutorOrderKind {
     Market,
     LimitPostOnly,
+    LimitGtc,
     CancelExact,
 }
 
@@ -585,7 +588,13 @@ impl ExecutorCommandSummary {
             || (self.phase == ExecutorCommandPhase::Cancel) != self.order_side.is_none()
             || (self.phase == ExecutorCommandPhase::Cancel)
                 != (self.order_kind == ExecutorOrderKind::CancelExact)
-            || (self.order_kind == ExecutorOrderKind::LimitPostOnly) != self.limit_price.is_some()
+            || matches!(
+                self.order_kind,
+                ExecutorOrderKind::LimitPostOnly | ExecutorOrderKind::LimitGtc
+            ) != self.limit_price.is_some()
+            || (self.order_kind == ExecutorOrderKind::LimitGtc
+                && self.origin != ExecutorCommandOrigin::Copy)
+            || self.limit_price.is_some_and(|price| !positive(price))
             || (self.phase != ExecutorCommandPhase::Cancel)
                 != self.requested_quantity.is_some_and(positive)
             || self
@@ -824,6 +833,41 @@ mod tests {
         summary.requested_quantity = None;
         summary.limit_price = None;
         assert_eq!(summary.validate(), Ok(()));
+        Ok(())
+    }
+
+    #[test]
+    fn copy_gtc_history_preserves_limit_price_without_admitting_gtc_for_other_origins()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut summary = ExecutorCommandSummary {
+            command_id: ID_1.into(),
+            request_id: None,
+            origin: ExecutorCommandOrigin::Copy,
+            phase: ExecutorCommandPhase::Open,
+            trading_account_id: ID_2.into(),
+            symbol: "SOL/USDC".parse()?,
+            position_side: Some(PositionSide::Long),
+            order_side: Some(OrderSide::Buy),
+            order_kind: ExecutorOrderKind::LimitGtc,
+            requested_quantity: Some(Decimal::ONE),
+            limit_price: Some(Decimal::from(80)),
+            state: ExecutorCommandState::Pending,
+            native_order_id: None,
+            created_ms: 1,
+            updated_ms: 1,
+            sanitized_error_code: None,
+        };
+        let wire = serde_json::to_string(&summary)?;
+        serde_json::from_str::<ExecutorCommandSummary>(&wire)?.validate()?;
+        for price in [None, Some(Decimal::ZERO), Some(Decimal::NEGATIVE_ONE)] {
+            summary.limit_price = price;
+            assert_eq!(summary.validate(), Err(KolProtocolError::CommandSummary));
+        }
+        summary.limit_price = Some(Decimal::from(80));
+        for origin in [ExecutorCommandOrigin::Terminal, ExecutorCommandOrigin::Grid] {
+            summary.origin = origin;
+            assert_eq!(summary.validate(), Err(KolProtocolError::CommandSummary));
+        }
         Ok(())
     }
 }

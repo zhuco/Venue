@@ -1,18 +1,19 @@
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 mod execution;
 mod grid;
+mod leader_bot;
+mod stream_gates;
 mod terminal;
 use eframe::egui;
 pub(crate) use grid::GridMutation;
-use std::{
-    collections::BTreeSet,
-    sync::{Arc, Mutex},
-};
+use std::collections::BTreeSet;
+use stream_gates::StreamGates;
 use venue_control_protocol::accounts::SecretValue;
 use venue_control_protocol::kol::{
     ExecutorCommandSummary, TerminalAccountProjection, TerminalCancelRequest, TerminalOrderRequest,
     TerminalProjectionRequest,
 };
+use venue_control_protocol::terminal_position::TerminalPositionActionRequest;
 use venue_control_protocol::{
     COMMAND_PATH, COPY_RELATION_PATH, CommandReceipt, ControlCommandRequest, ControlSnapshot,
     CopyRelationReceipt, CopyRelationRecord, CopyRelationUpsertRequest, EVENT_STREAM_PATH,
@@ -37,13 +38,24 @@ pub enum ClientEvent {
     TerminalSubmissionUnavailable {
         request_id: String,
         message: String,
+        definitely_not_submitted: bool,
     },
     TerminalExecutionsUnavailable(String),
-    TerminalAccountUnavailable(String),
+    TerminalAccountUnavailable {
+        credential_id: String,
+        message: String,
+    },
     GridInstances(Vec<venue_control_protocol::grid::GridInstanceSummary>),
     GridMutationApplied(Box<venue_control_protocol::grid::GridInstanceSummary>),
     GridUnavailable(String),
     GridMutationUnavailable(String),
+    LeaderBotAccess(venue_control_protocol::leader_bot::LeaderBotAccess),
+    LeaderBotMutationApplied(venue_control_protocol::leader_bot::LeaderBotAccess),
+    LeaderBotUnavailable {
+        mutation: bool,
+        definitive: bool,
+        message: String,
+    },
     SessionExpired,
     SnapshotConnected,
     SnapshotUnavailable(String),
@@ -65,6 +77,7 @@ pub struct ControlClient {
     command_tx: Sender<ControlCommandRequest>,
     terminal_order_tx: Sender<TerminalOrderRequest>,
     terminal_cancel_tx: Sender<TerminalCancelRequest>,
+    terminal_position_tx: Sender<TerminalPositionActionRequest>,
     terminal_projection_tx: Sender<TerminalProjectionRequest>,
     copy_relation_tx: Sender<CopyRelationUpsertRequest>,
     grid_mutation_tx: Sender<GridMutation>,
@@ -89,10 +102,14 @@ impl ControlClient {
         let (command_tx, command_rx) = unbounded();
         let (terminal_order_tx, terminal_order_rx) = unbounded();
         let (terminal_cancel_tx, terminal_cancel_rx) = unbounded();
+        let (terminal_position_tx, terminal_position_rx) = bounded(1);
         let (terminal_projection_tx, terminal_projection_rx) = bounded(1);
         let (copy_relation_tx, copy_relation_rx) = unbounded();
         let (grid_mutation_tx, grid_mutation_rx) = unbounded();
         let stream_gates = StreamGates::default();
+        if token.is_some() {
+            stream_gates.select(None);
+        }
 
         #[cfg(not(target_arch = "wasm32"))]
         let stop = {
@@ -103,6 +120,7 @@ impl ControlClient {
                 command_rx,
                 terminal_order_rx,
                 terminal_cancel_rx,
+                terminal_position_rx,
                 terminal_projection_rx,
                 copy_relation_rx,
                 grid_mutation_rx,
@@ -131,6 +149,7 @@ impl ControlClient {
             command_tx,
             terminal_order_tx,
             terminal_cancel_tx,
+            terminal_position_tx,
             terminal_projection_tx,
             copy_relation_tx,
             grid_mutation_tx,
@@ -178,6 +197,22 @@ impl ControlClient {
         if request.validate().is_ok() {
             let _ = self.terminal_projection_tx.try_send(request);
         }
+    }
+
+    pub fn select_execution_scope(&self, scope: Option<UiAccountScope>) {
+        self.stream_gates.select(scope);
+    }
+
+    pub fn send_position_action(
+        &self,
+        request: TerminalPositionActionRequest,
+    ) -> Result<(), ClientError> {
+        request
+            .validate()
+            .map_err(|_| ClientError::TerminalProtocol)?;
+        self.terminal_position_tx
+            .try_send(request)
+            .map_err(|_| ClientError::Closed)
     }
 
     pub fn send_copy_relation(
@@ -228,63 +263,6 @@ pub enum ClientError {
     Closed,
     #[error("the scoped event stream is not currently healthy; writes are closed")]
     WriteGateClosed,
-}
-
-#[derive(Clone, Default)]
-struct StreamGates(Arc<Mutex<StreamGateState>>);
-
-#[derive(Default)]
-struct StreamGateState {
-    desired: BTreeSet<UiAccountScope>,
-    open: BTreeSet<UiAccountScope>,
-    running: BTreeSet<UiAccountScope>,
-}
-
-impl StreamGates {
-    fn reconcile(&self, scopes: BTreeSet<UiAccountScope>) {
-        if let Ok(mut state) = self.0.lock() {
-            state.desired = scopes;
-            let desired = state.desired.clone();
-            state.open.retain(|scope| desired.contains(scope));
-        }
-    }
-
-    fn is_desired(&self, scope: &UiAccountScope) -> bool {
-        self.0
-            .lock()
-            .is_ok_and(|state| state.desired.contains(scope))
-    }
-
-    fn try_start(&self, scope: &UiAccountScope) -> bool {
-        self.0.lock().is_ok_and(|mut state| {
-            state.desired.contains(scope) && state.running.insert(scope.clone())
-        })
-    }
-
-    fn opened(&self, scope: &UiAccountScope) {
-        if let Ok(mut state) = self.0.lock()
-            && state.desired.contains(scope)
-        {
-            state.open.insert(scope.clone());
-        }
-    }
-
-    fn closed(&self, scope: &UiAccountScope) {
-        if let Ok(mut state) = self.0.lock() {
-            state.open.remove(scope);
-        }
-    }
-
-    fn finished(&self, scope: &UiAccountScope) {
-        if let Ok(mut state) = self.0.lock() {
-            state.open.remove(scope);
-            state.running.remove(scope);
-        }
-    }
-
-    fn is_open(&self, scope: &UiAccountScope) -> bool {
-        self.0.lock().is_ok_and(|state| state.open.contains(scope))
-    }
 }
 
 fn command_scope(command: &ControlCommandRequest) -> UiAccountScope {
@@ -346,6 +324,7 @@ fn start_native(
     commands: Receiver<ControlCommandRequest>,
     terminal_orders: Receiver<TerminalOrderRequest>,
     terminal_cancellations: Receiver<TerminalCancelRequest>,
+    terminal_positions: Receiver<TerminalPositionActionRequest>,
     terminal_projection: Receiver<TerminalProjectionRequest>,
     copy_relations: Receiver<CopyRelationUpsertRequest>,
     grid_mutations: Receiver<GridMutation>,
@@ -380,6 +359,7 @@ fn start_native(
                 commands,
                 terminal_orders,
                 terminal_cancellations,
+                terminal_positions,
                 terminal_projection,
                 copy_relations,
                 grid_mutations,
@@ -405,6 +385,7 @@ async fn native_loop(
     commands: Receiver<ControlCommandRequest>,
     terminal_orders: Receiver<TerminalOrderRequest>,
     terminal_cancellations: Receiver<TerminalCancelRequest>,
+    terminal_positions: Receiver<TerminalPositionActionRequest>,
     terminal_projection: Receiver<TerminalProjectionRequest>,
     copy_relations: Receiver<CopyRelationUpsertRequest>,
     grid_mutations: Receiver<GridMutation>,
@@ -421,7 +402,7 @@ async fn native_loop(
     let Ok(headers) = crate::account_client::authorization_headers(token.as_ref()) else {
         return;
     };
-    let client = match reqwest::Client::builder()
+    let client = match crate::server_connection::http_client_builder(&endpoint)
         .connect_timeout(std::time::Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
         .default_headers(headers)
@@ -455,6 +436,7 @@ async fn native_loop(
             stop.clone(),
             terminal_orders,
             terminal_cancellations,
+            terminal_positions,
         );
         grid::start_native(
             client.clone(),
@@ -762,11 +744,12 @@ async fn native_event_supervisor(
     use std::sync::atomic::Ordering;
 
     while !stream.stop.load(Ordering::Acquire) {
-        let Some(next_scopes) = scopes.recv().await else {
-            return;
-        };
-        stream.gates.reconcile(next_scopes.clone());
-        for scope in next_scopes {
+        match tokio::time::timeout(std::time::Duration::from_millis(100), scopes.recv()).await {
+            Ok(Some(next_scopes)) => stream.gates.reconcile(next_scopes),
+            Ok(None) => return,
+            Err(_) => {}
+        }
+        for scope in stream.gates.desired() {
             if !stream.gates.try_start(&scope) {
                 continue;
             }
@@ -793,7 +776,15 @@ async fn native_scoped_event_supervisor(stream: NativeStreamContext, scope: UiAc
     let mut backoff = ReconnectBackoff::default();
     while !stop.load(Ordering::Acquire) && gates.is_desired(&scope) {
         gates.closed(&scope);
-        match native_event_stream(&stream, &scope, cursor).await {
+        let outcome = tokio::select! {
+            outcome = native_event_stream(&stream, &scope, cursor) => outcome,
+            _ = async {
+                while !stop.load(Ordering::Acquire) && gates.is_desired(&scope) {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            } => break,
+        };
+        match outcome {
             Ok(outcome) => {
                 cursor = outcome.cursor.or(cursor);
                 if outcome.made_progress {
@@ -880,7 +871,16 @@ async fn native_event_stream(
             "Last-Event-ID",
             cursor.map_or(0, EventCursor::value).to_string(),
         );
-    let response = request.send().await.map_err(|error| error.to_string())?;
+    let response = tokio::time::timeout(REQUEST_TIMEOUT, request.send())
+        .await
+        .map_err(|_| "event stream connection timed out".to_owned())?
+        .map_err(|error| error.to_string())?;
+    if stop.load(Ordering::Acquire) || !gates.is_desired(scope) {
+        return Ok(StreamOutcome {
+            cursor,
+            made_progress: false,
+        });
+    }
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
     }
@@ -905,6 +905,9 @@ async fn native_event_stream(
         let Some(chunk) = next else {
             break;
         };
+        if stop.load(Ordering::Acquire) || !gates.is_desired(scope) {
+            break;
+        }
         let chunk = chunk.map_err(|error| error.to_string())?;
         for parsed in decoder.push(&chunk)? {
             let Some(next) = validate_invalidation_frame(&parsed, scope, latest_cursor)? else {

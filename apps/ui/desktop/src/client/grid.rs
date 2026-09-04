@@ -13,6 +13,8 @@ pub(crate) enum GridMutation {
     Create(GridInstanceCreateRequest),
     Update(GridConfigUpdateRequest),
     Lifecycle(GridLifecycleRequest),
+    LeaderCreate(venue_control_protocol::leader_bot::LeaderBotCreateRequest),
+    LeaderLifecycle(venue_control_protocol::leader_bot::LeaderBotLifecycleRequest),
 }
 
 impl GridMutation {
@@ -21,6 +23,8 @@ impl GridMutation {
             Self::Create(request) => request.validate().is_ok(),
             Self::Update(request) => request.validate().is_ok(),
             Self::Lifecycle(request) => request.validate().is_ok(),
+            Self::LeaderCreate(request) => request.valid(),
+            Self::LeaderLifecycle(request) => request.valid(),
         }
     }
 
@@ -28,6 +32,10 @@ impl GridMutation {
         match self {
             Self::Create(_) | Self::Update(_) => GRID_INSTANCES_PATH,
             Self::Lifecycle(_) => GRID_LIFECYCLE_PATH,
+            Self::LeaderCreate(_) => venue_control_protocol::leader_bot::LEADER_BOT_PATH,
+            Self::LeaderLifecycle(_) => {
+                venue_control_protocol::leader_bot::LEADER_BOT_LIFECYCLE_PATH
+            }
         }
     }
 
@@ -38,6 +46,7 @@ impl GridMutation {
             }
             Self::Update(request) => summary.instance_id == request.instance_id,
             Self::Lifecycle(request) => summary.instance_id == request.instance_id,
+            Self::LeaderCreate(_) | Self::LeaderLifecycle(_) => false,
         }
     }
 }
@@ -81,6 +90,9 @@ async fn submit(
         GridMutation::Create(request) => builder.json(request),
         GridMutation::Update(request) => builder.json(request),
         GridMutation::Lifecycle(request) => builder.json(request),
+        GridMutation::LeaderCreate(_) | GridMutation::LeaderLifecycle(_) => {
+            return Err(mutation_unavailable("wrong mutation route"));
+        }
     }
     .send()
     .await
@@ -201,6 +213,20 @@ pub(super) fn start_native(
             if expired {
                 break;
             }
+            let event = match tokio::time::timeout(
+                super::REQUEST_TIMEOUT,
+                super::leader_bot::fetch(&poll_client, &poll_endpoint),
+            )
+            .await
+            {
+                Ok(event) => event,
+                Err(_) => ClientEvent::LeaderBotUnavailable {
+                    mutation: false,
+                    definitive: false,
+                    message: "带单权限查询超时".into(),
+                },
+            };
+            publish(&poll_sender, &poll_context, event);
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
     });
@@ -208,6 +234,26 @@ pub(super) fn start_native(
     tokio::spawn(async move {
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
             for mutation in mutations.try_iter().take(16) {
+                if matches!(
+                    mutation,
+                    GridMutation::LeaderCreate(_) | GridMutation::LeaderLifecycle(_)
+                ) {
+                    let event = match tokio::time::timeout(
+                        super::REQUEST_TIMEOUT,
+                        super::leader_bot::submit(&client, &endpoint, &mutation),
+                    )
+                    .await
+                    {
+                        Ok(event) => event,
+                        Err(_) => ClientEvent::LeaderBotUnavailable {
+                            mutation: true,
+                            definitive: false,
+                            message: "带单操作未确认，可重试原请求".into(),
+                        },
+                    };
+                    publish(&sender, &context, event);
+                    continue;
+                }
                 let event = match tokio::time::timeout(
                     super::REQUEST_TIMEOUT,
                     submit(&client, &endpoint, &mutation),
@@ -259,8 +305,18 @@ pub(super) fn start_web(
                     break;
                 }
                 next_poll_ms = now_ms.saturating_add(3_000);
+                let event = super::leader_bot::fetch(&client, &endpoint).await;
+                publish(&sender, &context, event);
             }
             for mutation in mutations.try_iter().take(16) {
+                if matches!(
+                    mutation,
+                    GridMutation::LeaderCreate(_) | GridMutation::LeaderLifecycle(_)
+                ) {
+                    let event = super::leader_bot::submit(&client, &endpoint, &mutation).await;
+                    publish(&sender, &context, event);
+                    continue;
+                }
                 let event = match submit(&client, &endpoint, &mutation).await {
                     Ok(summary) => ClientEvent::GridMutationApplied(Box::new(summary)),
                     Err(event) => *event,

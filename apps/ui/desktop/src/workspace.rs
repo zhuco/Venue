@@ -56,6 +56,7 @@ pub struct Pane {
     pub symbol: Option<String>,
     pub interval: ChartInterval,
     pub viewport: ChartViewport,
+    pub trading_display: crate::chart_trading::ChartTradingSettings,
     #[serde(skip)]
     pub history_requested: bool,
 }
@@ -75,6 +76,7 @@ impl Pane {
             symbol: None,
             interval: ChartInterval::default(),
             viewport: ChartViewport::default(),
+            trading_display: crate::chart_trading::ChartTradingSettings::default(),
             history_requested: false,
         }
     }
@@ -86,6 +88,7 @@ impl Pane {
             symbol: Some(symbol.to_owned()),
             interval: ChartInterval::default(),
             viewport: ChartViewport::default(),
+            trading_display: crate::chart_trading::ChartTradingSettings::default(),
             history_requested: false,
         }
     }

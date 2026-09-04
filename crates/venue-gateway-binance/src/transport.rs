@@ -1255,6 +1255,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_market_uses_one_post_and_no_private_preflight()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use venue_domain::domain::{OrderSide, PositionSide};
+        for (side, position_side, reducing) in [
+            (OrderSide::Sell, PositionSide::Long, true),
+            (OrderSide::Buy, PositionSide::Short, true),
+            (OrderSide::Buy, PositionSide::Long, false),
+            (OrderSide::Sell, PositionSide::Short, false),
+        ] {
+            let credentials = BinanceCredentials::from_values("key", "secret")?;
+            let (config, rules, scope) = facts("00000000-0000-4000-8000-000000000001")?;
+            let (endpoint, count, counts) = fake_http_tracked(vec![Behavior::Status(
+                400,
+                br#"{"code":-2022,"msg":"fixture rejection"}"#,
+            )])
+            .await?;
+            let transport = BinanceHttpTransport::with_endpoint(
+                config,
+                7,
+                17,
+                endpoint,
+                BinanceTransportLimits::new(Duration::from_secs(1), 4096)?,
+            )?;
+            let prepared = crate::prepare_terminal_market(
+                &rules,
+                &scope,
+                &crate::BinanceMarketIntent {
+                    client_order_id: "manual-fixture".into(),
+                    side,
+                    position_side,
+                    quantity: rules.instrument.quantity_step,
+                    reduce_only: reducing,
+                },
+            )?;
+            assert!(
+                !prepared
+                    .parameters()
+                    .iter()
+                    .any(|(name, _)| name == "reduceOnly")
+            );
+            assert!(
+                prepared
+                    .parameters()
+                    .iter()
+                    .any(|(name, value)| name == "type" && value == "MARKET")
+            );
+            assert!(
+                prepared
+                    .parameters()
+                    .iter()
+                    .any(|(name, value)| name == "newOrderRespType" && value == "RESULT")
+            );
+            assert_eq!(
+                transport
+                    .dispatch_once(&credentials, &scope, &prepared, unix_ms()?)
+                    .await,
+                Err(BinanceTransportError::ApiRejected(-2022))
+            );
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            assert_eq!(counts.posts.load(Ordering::SeqCst), 1);
+            assert_eq!(counts.signed_gets.load(Ordering::SeqCst), 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn manual_open_reaches_exchange_once_without_private_reads()
     -> Result<(), Box<dyn std::error::Error>> {
         use venue_domain::domain::{OrderSide, PositionSide, Price};

@@ -11,6 +11,10 @@ use venue_control_protocol::kol::ExecutorCommandState;
 use venue_domain::domain::{FieldState, Fill, OrderSide, PositionSide, Symbol};
 use venue_gateway_binance::BinancePrivateFillEvent;
 
+mod copy_gate;
+pub(crate) use copy_gate::cancel_pending_copy_commands;
+use copy_gate::lock_account_claim;
+
 /// Fixed KOL MVP scheduling bounds. One central executor owns these queues; they are data
 /// structures, not per-account tasks or durable journals.
 pub const MAX_ENABLED_KOLS: usize = 5;
@@ -26,6 +30,7 @@ pub struct BinanceCommandLedger {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaimedBinanceCommand {
     pub origin: venue_control_protocol::kol::ExecutorCommandOrigin,
+    pub copy_risk: Option<crate::executor_exchange::CopyRiskContext>,
     pub command_id: String,
     pub owner_user_id: String,
     pub trading_account_id: String,
@@ -71,12 +76,13 @@ pub enum ClaimedBinanceOrder {
         quantity: Decimal,
         reducing: bool,
     },
-    LimitPostOnly {
+    Limit {
         side: OrderSide,
         position_side: PositionSide,
         quantity: Decimal,
         price: Decimal,
         reducing: bool,
+        time_in_force: venue_domain::LimitTimeInForce,
     },
     CancelExact {
         native_order_id: Option<String>,
@@ -284,6 +290,8 @@ impl<T> AccountSerialScheduler<T> {
         self.global_in_flight -= 1;
         if !queue.queued.is_empty() {
             self.ready.push_back(trading_account_id.to_owned());
+        } else {
+            self.accounts.remove(trading_account_id);
         }
         Ok(())
     }
@@ -308,10 +316,17 @@ impl BinanceCommandLedger {
         now_ms: u64,
     ) -> Result<Option<ClaimedBinanceCommand>, BinanceCommandLedgerError> {
         let now = i64::try_from(now_ms).map_err(|_| BinanceCommandLedgerError::Conflict)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+        lock_account_claim(&mut tx, trading_account_id, now).await?;
         let row = sqlx::query(
             "WITH candidate AS ( \
              SELECT c.command_id FROM venue_binance_commands c \
              WHERE c.trading_account_id=$1 AND c.command_state='pending' \
+             AND NOT EXISTS (SELECT 1 FROM venue_terminal_position_commands action LEFT JOIN venue_binance_commands parent ON parent.command_id=action.reverse_parent_id WHERE action.command_id=c.command_id AND (NOT action.released OR (action.reverse_parent_id IS NOT NULL AND parent.command_state<>'reconciled'))) \
              AND (c.command_origin<>'grid' OR EXISTS (SELECT 1 \
                   FROM venue_binance_grid_mutation_batches current_batch \
                   WHERE current_batch.batch_id=c.grid_batch_id \
@@ -339,13 +354,16 @@ impl BinanceCommandLedger {
              LIMIT 1 FOR UPDATE SKIP LOCKED) \
              UPDATE venue_binance_commands c SET command_state='sending',sending_ms=$2,updated_ms=$2 \
              FROM candidate WHERE c.command_id=candidate.command_id \
-             RETURNING c.command_id,c.command_origin,c.owner_user_id,c.trading_account_id,c.credential_id,c.symbol,c.order_side,c.position_side,c.requested_quantity,c.command_phase,c.order_kind,c.limit_price,c.selected_native_order_id,c.target_client_order_id,c.client_order_id,c.native_order_id,c.command_state",
+             RETURNING c.command_id,c.command_origin,c.owner_user_id,c.trading_account_id,c.credential_id,c.symbol,c.order_side,c.position_side,c.requested_quantity,c.command_phase,c.order_kind,c.limit_price,c.selected_native_order_id,c.target_client_order_id,c.client_order_id,c.native_order_id,c.command_state,c.copy_risk",
         )
         .bind(trading_account_id)
         .bind(now)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
         row.map(claimed).transpose()
     }
 
@@ -367,22 +385,12 @@ impl BinanceCommandLedger {
             .begin()
             .await
             .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-        let credentials = sqlx::query(
-            "SELECT credential_id FROM venue_api_credentials \
-             WHERE trading_account_id=$1 AND deleted_ms IS NULL \
-             ORDER BY credential_id FOR UPDATE",
-        )
-        .bind(trading_account_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-        if credentials.is_empty() {
-            return Err(BinanceCommandLedgerError::Conflict);
-        }
+        lock_account_claim(&mut tx, trading_account_id, now).await?;
         let candidate = sqlx::query(
             "SELECT c.command_id,c.command_origin,c.grid_batch_id,c.dispatch_sequence \
              FROM venue_binance_commands c \
              WHERE c.trading_account_id=$1 AND c.command_state='pending' \
+             AND NOT EXISTS (SELECT 1 FROM venue_terminal_position_commands action LEFT JOIN venue_binance_commands parent ON parent.command_id=action.reverse_parent_id WHERE action.command_id=c.command_id AND (NOT action.released OR (action.reverse_parent_id IS NOT NULL AND parent.command_state<>'reconciled'))) \
              AND (c.command_origin<>'grid' OR EXISTS (SELECT 1 \
                  FROM venue_binance_grid_mutation_batches current_batch \
                  WHERE current_batch.batch_id=c.grid_batch_id \
@@ -453,7 +461,7 @@ impl BinanceCommandLedger {
              RETURNING c.command_id,c.command_origin,c.owner_user_id,c.trading_account_id,c.credential_id,c.symbol,\
                c.order_side,c.position_side,c.requested_quantity,c.command_phase,c.order_kind,\
                c.limit_price,c.selected_native_order_id,c.target_client_order_id,c.client_order_id,\
-               c.native_order_id,c.command_state,c.grid_batch_id,c.dispatch_sequence",
+               c.native_order_id,c.command_state,c.grid_batch_id,c.dispatch_sequence,c.copy_risk",
         )
         .bind(trading_account_id)
         .bind(grid_batch_id.as_deref())
@@ -493,6 +501,26 @@ impl BinanceCommandLedger {
         sanitized_error_code: Option<&str>,
         native_order_id: Option<&str>,
     ) -> Result<(), BinanceCommandLedgerError> {
+        self.settle_with_execution(
+            command_id,
+            next,
+            now_ms,
+            sanitized_error_code,
+            native_order_id,
+            None,
+        )
+        .await
+    }
+
+    pub async fn settle_with_execution(
+        &self,
+        command_id: &str,
+        next: ExecutorCommandState,
+        now_ms: u64,
+        sanitized_error_code: Option<&str>,
+        native_order_id: Option<&str>,
+        execution: Option<&crate::executor_exchange::MarketSettlement>,
+    ) -> Result<(), BinanceCommandLedgerError> {
         if native_order_id.is_some_and(|value| {
             value.trim().is_empty() || value.len() > 128 || value.chars().any(char::is_whitespace)
         }) {
@@ -515,15 +543,26 @@ impl BinanceCommandLedger {
             .begin()
             .await
             .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+        if execution.is_some() {
+            sqlx::query("SELECT r.relation_id FROM venue_kol_follow_relations r JOIN venue_binance_commands c ON c.relation_id=r.relation_id WHERE c.command_id=$1 FOR UPDATE OF r")
+                .bind(command_id).fetch_all(&mut *tx).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+        }
+        sqlx::query("SELECT m.mirror_id FROM venue_order_mirrors m JOIN venue_binance_commands c ON c.mirror_order_id=m.mirror_id WHERE c.command_id=$1 FOR UPDATE OF m")
+            .bind(command_id).fetch_all(&mut *tx).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+        let execution_json = execution
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|_| BinanceCommandLedgerError::Conflict)?;
         let changed = sqlx::query(
             "UPDATE venue_binance_commands SET command_state=$1,accepted_ms=COALESCE($2,accepted_ms), \
              terminal_ms=COALESCE($3,terminal_ms),sanitized_error_code=$4, \
-             native_order_id=COALESCE(native_order_id,$5),updated_ms=$6 \
+             native_order_id=COALESCE(native_order_id,$5),updated_ms=$6, \
+             signed_settlement=COALESCE(signed_settlement,$9) \
              WHERE command_id=$7 AND command_state = ANY($8) \
              AND ($5::text IS NULL OR native_order_id IS NULL OR native_order_id=$5) \
              RETURNING command_id,command_origin,command_phase,order_kind,trading_account_id,grid_instance_id,\
                        symbol,client_order_id,target_client_order_id,selected_native_order_id,\
-                       native_order_id",
+                       native_order_id,relation_id,position_side,market_baseline,requested_quantity,mirror_order_id",
         )
         .bind(state_name(next))
         .bind(accepted_ms)
@@ -533,11 +572,18 @@ impl BinanceCommandLedger {
         .bind(now)
         .bind(command_id)
         .bind(states)
+        .bind(execution_json)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
         let changed = changed.ok_or(BinanceCommandLedgerError::Conflict)?;
+        let mirrored =
+            crate::order_mirror::settle_mirror_command(&mut tx, &changed, state_name(next), now)
+                .await?;
         if next == ExecutorCommandState::Reconciled {
+            if !mirrored {
+                copy_gate::settle_copy_target(&mut tx, &changed, execution, now).await?;
+            }
             synchronize_grid_owner(&mut tx, &changed, now).await?;
         } else if matches!(
             next,
@@ -545,6 +591,14 @@ impl BinanceCommandLedger {
         ) {
             terminalize_unsubmitted_grid_owner(&mut tx, &changed, now).await?;
         }
+        crate::executor_store::settle_reverse_child(
+            &mut tx,
+            command_id,
+            next,
+            now,
+            sanitized_error_code,
+        )
+        .await?;
         tx.commit()
             .await
             .map_err(|_| BinanceCommandLedgerError::Unavailable)
@@ -773,6 +827,12 @@ pub(crate) fn claimed(
             "copy" => venue_control_protocol::kol::ExecutorCommandOrigin::Copy,
             _ => return Err(BinanceCommandLedgerError::Conflict),
         },
+        copy_risk: row
+            .try_get::<Option<serde_json::Value>, _>("copy_risk")
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| BinanceCommandLedgerError::Conflict)?,
         command_id: row
             .try_get("command_id")
             .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
@@ -852,14 +912,12 @@ fn claimed_batch(
                 }
                 match &command.order {
                     ClaimedBinanceOrder::CancelExact { .. } => cancellation_seen = true,
-                    ClaimedBinanceOrder::Market { .. }
-                    | ClaimedBinanceOrder::LimitPostOnly { .. }
+                    ClaimedBinanceOrder::Market { .. } | ClaimedBinanceOrder::Limit { .. }
                         if cancellation_seen =>
                     {
                         return Err(BinanceCommandLedgerError::Conflict);
                     }
-                    ClaimedBinanceOrder::Market { .. }
-                    | ClaimedBinanceOrder::LimitPostOnly { .. } => {}
+                    ClaimedBinanceOrder::Market { .. } | ClaimedBinanceOrder::Limit { .. } => {}
                 }
             }
         }
@@ -1026,13 +1084,18 @@ fn claimed_order(
             quantity: required_quantity(row)?,
             reducing: phase == "close",
         }),
-        "limit_post_only" => Ok(ClaimedBinanceOrder::LimitPostOnly {
+        kind @ ("limit_post_only" | "limit_gtc") => Ok(ClaimedBinanceOrder::Limit {
             side: required_order_side(row)?,
             position_side: required_position_side(row)?,
             quantity: required_quantity(row)?,
             price: optional_decimal(row, "limit_price")?
                 .ok_or(BinanceCommandLedgerError::Unavailable)?,
             reducing: phase == "close",
+            time_in_force: if kind == "limit_gtc" {
+                venue_domain::LimitTimeInForce::Gtc
+            } else {
+                venue_domain::LimitTimeInForce::PostOnly
+            },
         }),
         "cancel_exact" if phase == "cancel" => {
             let native_order_id = optional_native_id(row, "selected_native_order_id")?;

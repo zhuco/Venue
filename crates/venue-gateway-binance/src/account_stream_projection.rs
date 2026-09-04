@@ -178,16 +178,16 @@ impl AccountStreamProjection {
                 return Err(invalid());
             }
             let prior = self.orders.get(&client);
+            let execution = text(order, "x")?;
             if prior.is_some_and(|prior| {
                 prior.venue_order_id.as_deref() != Some(native.as_str())
                     || prior.symbol != symbol
                     || prior.position_side != side
-                    || prior.quantity != quantity
+                    || (prior.quantity != quantity && execution != "AMENDMENT")
                     || prior.filled_quantity.is_some_and(|before| before > filled)
             }) {
                 return Err(invalid());
             }
-            let execution = text(order, "x")?;
             if execution == "TRADE" {
                 let id = order.get("t").and_then(Value::as_u64).ok_or_else(invalid)?;
                 let payload = std::str::from_utf8(&frame.payload).map_err(|_| invalid())?;

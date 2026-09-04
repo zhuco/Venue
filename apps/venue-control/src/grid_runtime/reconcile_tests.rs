@@ -258,7 +258,7 @@ async fn exercise(pool: &sqlx::PgPool) -> TestResult {
     assert!(
         batch.commands[..2]
             .iter()
-            .all(|command| matches!(command.order, ClaimedBinanceOrder::LimitPostOnly { .. }))
+            .all(|command| matches!(command.order, ClaimedBinanceOrder::Limit { .. }))
     );
     let ClaimedBinanceOrder::CancelExact {
         target_client_order_id,
@@ -347,6 +347,7 @@ fn projection(
             filled_quantity: Some(Decimal::ZERO),
             limit_price: Some(order.limit_price),
             post_only: true,
+            time_in_force: Some(venue_domain::LimitTimeInForce::PostOnly),
             reduce_only: false,
             state: TerminalOrderState::New,
             created_ms: Some(now - 5),

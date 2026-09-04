@@ -727,6 +727,7 @@ mod tests {
                 filled_quantity: Some(owner.filled_quantity),
                 limit_price: Some(owner.limit_price),
                 post_only: true,
+                time_in_force: Some(venue_domain::LimitTimeInForce::PostOnly),
                 reduce_only: false,
                 state: if owner.filled_quantity.is_zero() {
                     TerminalOrderState::New

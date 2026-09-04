@@ -127,7 +127,11 @@ resources! {
     SubmitIntent => "Submit intent", "提交意图";
     SettingsTitle => "VenueFlow settings", "VenueFlow 设置";
     Language => "Language", "语言";
-    ControlUrl => "Control API base URL", "Control API 地址";
+    ControlUrl => "Server address", "服务器地址";
+    DefaultServer => "Restore default server", "恢复默认服务器";
+    ApplyServer => "Apply and connect", "应用并连接";
+    ServerAddressHint => "The default server is ready to use. Apply changes to connect; switching servers requires a new login.", "默认服务器可直接使用。修改后点击应用并连接；切换服务器需要重新登录。";
+    InvalidServerAddress => "Enter an HTTPS address. HTTP is allowed only for a local service; do not include credentials or query parameters.", "请输入 HTTPS 地址，本机服务可用 HTTP；地址不能包含密码或查询参数。";
     WebSameOrigin => "Web builds may leave this empty to use the current origin.", "Web 版本可留空并使用当前站点地址。";
     Reconnect => "Reconnect", "重新连接";
     LocalSymbol => "Local Binance USD-M symbol (canonical BASE/USDT or BASE/USDC)", "本地 Binance USD-M 交易对（规范格式 BASE/USDT 或 BASE/USDC）";

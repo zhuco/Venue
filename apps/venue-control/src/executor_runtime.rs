@@ -16,9 +16,9 @@ use venue_gateway_binance::BinanceCredentials;
 
 use crate::{
     executor_exchange::{
-        AccountBaseline, BinanceActivationBaseline, BinanceExecution, ExecutionOrderKind,
-        ExecutionOutcome, ExecutionReadback, ExecutionRequest, GridBatchCommandOutcome,
-        GridBatchExecutionContext, GridBatchSubmitError,
+        BinanceActivationBaseline, BinanceExecution, ExecutionOrderKind, ExecutionOutcome,
+        ExecutionReadback, ExecutionRequest, GridBatchCommandOutcome, GridBatchExecutionContext,
+        GridBatchSubmitError,
     },
     executor_secret::{ExecutorSecretError, ExecutorSecretProvider},
     executor_store::{PgExecutorStore, RecoverableBinanceCommand},
@@ -29,9 +29,13 @@ use crate::{
 };
 
 const EXECUTOR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+mod terminal_positions;
 const ACTIVATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const ACCOUNT_DRAIN_QUANTUM: usize = MAX_ACCOUNT_QUEUE_DEPTH;
 
+mod dispatch;
+
+#[cfg(test)]
 enum ActivationTurn<T> {
     Stop,
     Retry,
@@ -168,9 +172,8 @@ where
     }
 
     async fn recover_commands_once(&mut self) -> Result<usize, BinanceCommandLedgerError> {
-        let commands = self.store.recover_nonterminal().await?;
         let recovery_ms = now_ms()?;
-        let accounts = account_recovery_groups(commands);
+        let accounts = recover_account_groups(&self.store).await?;
         let mut scheduler = AccountSerialScheduler::new(MAX_GLOBAL_IN_FLIGHT);
         for (account, unresolved) in accounts {
             match unresolved {
@@ -189,31 +192,39 @@ where
             }
         }
         let mut tasks = tokio::task::JoinSet::new();
+        let mut task_accounts = BTreeMap::new();
         let mut processed = 0_usize;
         loop {
             while let Some(queued) = scheduler.claim_next() {
                 let store = self.store.clone();
                 let exchange = self.exchange.clone();
                 let secrets = Arc::clone(&self.secrets);
-                tasks.spawn(async move {
-                    let account = queued.trading_account_id;
-                    let result =
-                        execute_scheduled(store, exchange, secrets, &account, queued.command)
-                            .await?;
-                    Ok::<_, BinanceCommandLedgerError>((account, result))
+                let account = queued.trading_account_id;
+                let worker_account = account.clone();
+                let task = tasks.spawn(async move {
+                    execute_scheduled(store, exchange, secrets, &worker_account, queued.command)
+                        .await
                 });
+                task_accounts.insert(task.id(), account);
             }
             if tasks.is_empty() {
                 break;
             }
-            let joined = tasks
-                .join_next()
-                .await
-                .ok_or(BinanceCommandLedgerError::Unavailable)?
-                .map_err(|_| BinanceCommandLedgerError::Unavailable)??;
-            scheduler.settle(&joined.0)?;
-            processed = processed.saturating_add(joined.1.processed);
-            if joined.1.quantum_exhausted {
+            let (id, result) = match tasks.join_next_with_id().await {
+                Some(Ok(result)) => result,
+                Some(Err(error)) => (error.id(), Err(BinanceCommandLedgerError::Unavailable)),
+                None => return Err(BinanceCommandLedgerError::Unavailable),
+            };
+            let account = task_accounts
+                .remove(&id)
+                .ok_or(BinanceCommandLedgerError::Conflict)?;
+            scheduler.settle(&account)?;
+            let Ok(turn) = result else {
+                tracing::warn!("Binance account recovery failed; durable work retained");
+                continue;
+            };
+            processed = processed.saturating_add(turn.processed);
+            if turn.quantum_exhausted {
                 // One coalesced permit starts a fresh fair discovery round after all accounts in
                 // this round have released their scheduler slots.
                 self.command_wake.wake();
@@ -224,102 +235,54 @@ where
 
     async fn process_pending_activations(&mut self) -> Result<(), BinanceCommandLedgerError> {
         for activation in self.store.pending_activations(now_ms()?).await? {
-            let leader = self
-                .secrets
-                .credentials(&activation.leader_credential_id, &activation.leader_user_id)
-                .await;
-            let follower = self
-                .secrets
-                .credentials(
-                    &activation.follower_credential_id,
-                    &activation.follower_user_id,
-                )
-                .await;
-            let clean = match (leader, follower) {
-                (Ok(leader), Ok(follower)) => {
-                    matches!(
-                        self.exchange
-                            .activation_baseline(
-                                &activation.leader_trading_account_id,
-                                &activation.symbols,
-                                leader,
-                            )
-                            .await,
-                        Ok(AccountBaseline::Clean)
-                    ) && matches!(
-                        self.exchange
-                            .activation_baseline(
-                                &activation.follower_trading_account_id,
-                                &activation.symbols,
-                                follower,
-                            )
-                            .await,
-                        Ok(AccountBaseline::Clean)
+            let result = async {
+                let follower = self
+                    .secrets
+                    .credentials(
+                        &activation.follower_credential_id,
+                        &activation.follower_user_id,
                     )
-                }
-                _ => false,
-            };
-            if clean {
+                    .await
+                    .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+                let follower = self
+                    .exchange
+                    .activation_baseline(
+                        &activation.follower_trading_account_id,
+                        &activation.symbols,
+                        follower,
+                    )
+                    .await
+                    .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+                let leader = self
+                    .secrets
+                    .credentials(&activation.leader_credential_id, &activation.leader_user_id)
+                    .await
+                    .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+                let leader = self
+                    .exchange
+                    .activation_baseline(
+                        &activation.leader_trading_account_id,
+                        &activation.symbols,
+                        leader,
+                    )
+                    .await
+                    .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
                 self.store
-                    .complete_activation(&activation.relation_id, activation.revision, now_ms()?)
-                    .await?;
-            } else {
+                    .complete_activation(&activation, &leader, &follower, now_ms()?)
+                    .await
+            }
+            .await;
+            if result.is_err() {
                 self.store
-                    .reject_activation(&activation.relation_id, now_ms()?, "baseline_failed")
+                    .reject_activation(&activation, now_ms()?, "baseline_failed")
                     .await?;
             }
         }
         Ok(())
     }
-
-    /// Notifications minimize commit-to-claim latency while the bounded poll remains the durable
-    /// recovery fallback. The loop owns no in-memory command authority: stopping it merely leaves
-    /// rows for the next singleton to recover.
-    pub async fn run_until_shutdown(
-        &mut self,
-        mut shutdown: tokio::sync::watch::Receiver<bool>,
-    ) -> Result<(), BinanceCommandLedgerError> {
-        let mut activation = tokio::time::interval_at(
-            tokio::time::Instant::now() + ACTIVATION_POLL_INTERVAL,
-            ACTIVATION_POLL_INTERVAL,
-        );
-        activation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            if *shutdown.borrow() {
-                return Ok(());
-            }
-            let _ = self.recover_commands_once().await?;
-            tokio::select! {
-                biased;
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return Ok(());
-                    }
-                }
-                () = self.command_wake.notified() => {}
-                () = tokio::time::sleep(EXECUTOR_POLL_INTERVAL) => {}
-                _ = activation.tick() => {
-                    // Activation performs only signed reads and CAS-protected PostgreSQL state
-                    // changes. A newly committed order command may cancel this low-priority
-                    // future; an already committed activation is durable and an unfinished
-                    // transaction rolls back.
-                    match select_activation_turn(
-                        &mut shutdown,
-                        self.command_wake.clone(),
-                        self.process_pending_activations(),
-                    )
-                    .await
-                    {
-                        ActivationTurn::Stop => return Ok(()),
-                        ActivationTurn::Retry | ActivationTurn::CommandWake => {}
-                        ActivationTurn::Completed(result) => result?,
-                    }
-                }
-            }
-        }
-    }
 }
 
+#[cfg(test)]
 async fn select_activation_turn<F>(
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     command_wake: CommandWake,
@@ -389,6 +352,16 @@ fn account_recovery_groups(
         .collect()
 }
 
+async fn recover_account_groups(
+    store: &PgExecutorStore,
+) -> Result<BTreeMap<String, Option<Vec<RecoverableBinanceCommand>>>, BinanceCommandLedgerError> {
+    let mut groups = account_recovery_groups(store.recover_nonterminal().await?);
+    for account in store.dirty_copy_accounts().await? {
+        groups.entry(account).or_insert(None);
+    }
+    Ok(groups)
+}
+
 async fn execute_scheduled<E, S>(
     store: PgExecutorStore,
     mut exchange: E,
@@ -406,9 +379,19 @@ where
     while processed < ACCOUNT_DRAIN_QUANTUM {
         let current = match next.take() {
             Some(ScheduledCommand::Claim) => {
-                let Some(command) = store.claim_next_command_batch(account, now_ms()?).await?
-                else {
-                    break;
+                let command = match store.claim_next_command_batch(account, now_ms()?).await? {
+                    Some(command) => command,
+                    None => {
+                        if !store.plan_dirty_copy_target(account, now_ms()?).await? {
+                            break;
+                        }
+                        let Some(command) =
+                            store.claim_next_command_batch(account, now_ms()?).await?
+                        else {
+                            break;
+                        };
+                        command
+                    }
                 };
                 ScheduledCommand::Claimed(command)
             }
@@ -428,6 +411,7 @@ where
         if !continue_account_drain(processed, last_decision) {
             break;
         }
+        store.plan_dirty_copy_target(account, now_ms()?).await?;
         next = Some(ScheduledCommand::Claim);
     }
     Ok(AccountDrainResult {
@@ -451,6 +435,15 @@ where
         if batch.grid_context.is_some() || batch.commands.len() != 1 {
             return Err(BinanceCommandLedgerError::Conflict);
         }
+        let command = batch
+            .commands
+            .pop()
+            .ok_or(BinanceCommandLedgerError::Conflict)?;
+        return submit(store, exchange, secrets, command).await;
+    }
+    if batch.commands.len() == 1
+        && matches!(batch.commands[0].order, ClaimedBinanceOrder::Market { .. })
+    {
         let command = batch
             .commands
             .pop()
@@ -721,6 +714,12 @@ where
             return Ok(drain_after_persisted_state(ExecutorCommandState::Rejected));
         }
     };
+    if command.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Terminal
+        && matches!(command.order, ClaimedBinanceOrder::Market { .. })
+        && store.is_position_command(&command.command_id).await?
+    {
+        return terminal_positions::submit_position(store, exchange, &command, credentials).await;
+    }
     let reservations = match store.reconciled_close_reservations(&command).await {
         Ok(reservations) => reservations,
         Err(error) => {
@@ -750,6 +749,53 @@ where
             .await?;
         return Ok(drain_after_persisted_state(ExecutorCommandState::Rejected));
     }
+    if matches!(request.order_kind, ExecutionOrderKind::Market { .. }) {
+        match exchange.prepare_market(&request, &credentials).await {
+            Ok(Some(baseline)) => {
+                if let Err(error) = store
+                    .persist_market_baseline(&command.command_id, &baseline)
+                    .await
+                {
+                    store
+                        .transition_command(
+                            &command.command_id,
+                            ExecutorCommandState::Rejected,
+                            now_ms()?,
+                            Some(ledger_not_dispatched_code(error)),
+                        )
+                        .await?;
+                    return Ok(AccountDrainDecision::Continue);
+                }
+                request.market_baseline = Some(baseline);
+            }
+            result => {
+                let code = result.err().map_or("market_baseline_missing", |error| {
+                    error.not_dispatched_code()
+                });
+                store
+                    .transition_command(
+                        &command.command_id,
+                        ExecutorCommandState::Rejected,
+                        now_ms()?,
+                        Some(code),
+                    )
+                    .await?;
+                return Ok(AccountDrainDecision::Continue);
+            }
+        }
+    }
+    store.prepare_mirror_request(&command, &mut request).await?;
+    if !crate::order_mirror::mirror_send_allowed(store, &command, now_ms()?).await? {
+        store
+            .transition_command(
+                &command.command_id,
+                ExecutorCommandState::Rejected,
+                now_ms()?,
+                Some("mirror_authorization_changed"),
+            )
+            .await?;
+        return Ok(AccountDrainDecision::Continue);
+    }
     match exchange.submit(&request, credentials).await {
         Ok(result) => settle_submit_result(store, &command, result).await,
         Err(error) => {
@@ -773,6 +819,10 @@ async fn settle_submit_result(
     command: &ClaimedBinanceCommand,
     result: ExecutionOutcome,
 ) -> Result<AccountDrainDecision, BinanceCommandLedgerError> {
+    let result = require_signed_mirror_fact(command, result);
+    store
+        .record_mirror_order_fact(command, &result, now_ms()?)
+        .await?;
     if matches!(
         result.state,
         ExecutionReadback::Accepted | ExecutionReadback::Reconciled
@@ -835,12 +885,11 @@ async fn settle_submit_result(
             if result.state == ExecutionReadback::Reconciled || completes_on_signed_accept(command)
             {
                 store
-                    .transition_command_with_readback(
+                    .reconcile_with_execution(
                         &command.command_id,
-                        ExecutorCommandState::Reconciled,
                         now_ms()?,
-                        None,
                         result.native_order_id.as_deref(),
+                        result.market_settlement.as_ref(),
                     )
                     .await?;
                 return Ok(drain_after_persisted_state(
@@ -939,20 +988,51 @@ async fn readback_with_credentials<E>(
 where
     E: BinanceExecution + Send,
 {
-    let result = exchange.readback(&request(command), credentials).await;
+    let result = if command.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Terminal
+        && matches!(command.order, ClaimedBinanceOrder::Market { .. })
+        && store.is_position_command(&command.command_id).await?
+    {
+        if !store.position_was_prepared(&command.command_id).await? {
+            store
+                .transition_command(
+                    &command.command_id,
+                    ExecutorCommandState::Rejected,
+                    now_ms()?,
+                    Some("position_not_dispatched"),
+                )
+                .await?;
+            return Ok(AccountDrainDecision::Continue);
+        }
+        terminal_positions::readback_position(store, exchange, command, credentials).await
+    } else {
+        let mut read_request = request(command);
+        store
+            .prepare_mirror_request(command, &mut read_request)
+            .await?;
+        if matches!(read_request.order_kind, ExecutionOrderKind::Market { .. }) {
+            read_request.market_baseline = store.market_baseline(&command.command_id).await?;
+        }
+        exchange.readback(&read_request, credentials).await
+    };
+    let result = result.map(|outcome| require_signed_mirror_fact(command, outcome));
+    if let Ok(outcome) = &result {
+        store
+            .record_mirror_order_fact(command, outcome, now_ms()?)
+            .await?;
+    }
     match result {
         Ok(ExecutionOutcome {
             state: ExecutionReadback::Reconciled,
             native_order_id,
+            market_settlement,
             ..
         }) => {
             store
-                .transition_command_with_readback(
+                .reconcile_with_execution(
                     &command.command_id,
-                    ExecutorCommandState::Reconciled,
                     now_ms()?,
-                    None,
                     native_order_id.as_deref(),
+                    market_settlement.as_ref(),
                 )
                 .await?;
             Ok(drain_after_persisted_state(
@@ -1055,11 +1135,26 @@ where
     }
 }
 
-/// A post-only placement is durably complete once an independently signed exact readback proves
-/// that the immutable order exists. Its later fill/cancel lifecycle belongs to the private
-/// projection and order-ownership tables, so it must not monopolize the account command queue.
+// Mirror settlement needs cumulative execution facts, not only an acknowledged order identity.
+fn require_signed_mirror_fact(
+    command: &ClaimedBinanceCommand,
+    mut result: ExecutionOutcome,
+) -> ExecutionOutcome {
+    if command.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Copy
+        && !matches!(command.order, ClaimedBinanceOrder::Market { .. })
+        && matches!(
+            result.state,
+            ExecutionReadback::Accepted | ExecutionReadback::Reconciled
+        )
+        && result.order_fact.is_none()
+    {
+        result.state = ExecutionReadback::Unknown;
+    }
+    result
+}
+
 fn completes_on_signed_accept(command: &ClaimedBinanceCommand) -> bool {
-    matches!(&command.order, ClaimedBinanceOrder::LimitPostOnly { .. })
+    matches!(&command.order, ClaimedBinanceOrder::Limit { .. })
 }
 
 fn request(command: &ClaimedBinanceCommand) -> ExecutionRequest {
@@ -1075,18 +1170,20 @@ fn request(command: &ClaimedBinanceCommand) -> ExecutionRequest {
             quantity: *quantity,
             reducing: *reducing,
         },
-        ClaimedBinanceOrder::LimitPostOnly {
+        ClaimedBinanceOrder::Limit {
             side,
             position_side,
             quantity,
             price,
             reducing,
-        } => ExecutionOrderKind::LimitPostOnly {
+            time_in_force,
+        } => ExecutionOrderKind::Limit {
             side: *side,
             position_side: *position_side,
             quantity: *quantity,
             price: *price,
             reducing: *reducing,
+            time_in_force: *time_in_force,
         },
         ClaimedBinanceOrder::CancelExact {
             native_order_id,
@@ -1106,6 +1203,8 @@ fn request(command: &ClaimedBinanceCommand) -> ExecutionRequest {
         order_kind,
         known_native_order_id: command.native_order_id.clone(),
         reconciled_close_reservations: Vec::new(),
+        market_baseline: None,
+        copy_risk: command.copy_risk.clone(),
     }
 }
 
@@ -1180,12 +1279,14 @@ mod tests {
         Ok(RecoverableBinanceCommand {
             command: ClaimedBinanceCommand {
                 origin: venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
+                copy_risk: None,
                 command_id: command_id.into(),
                 owner_user_id: "owner".into(),
                 trading_account_id: account.into(),
                 credential_id: "credential".into(),
                 symbol: "BTC/USDT".parse()?,
-                order: ClaimedBinanceOrder::LimitPostOnly {
+                order: ClaimedBinanceOrder::Limit {
+                    time_in_force: venue_domain::LimitTimeInForce::PostOnly,
                     side: venue_domain::domain::OrderSide::Buy,
                     position_side: venue_domain::domain::PositionSide::Long,
                     quantity: rust_decimal::Decimal::new(1, 3),
@@ -1205,6 +1306,40 @@ mod tests {
             )
             .then_some(1),
         })
+    }
+
+    #[test]
+    fn mirror_ack_without_exact_fact_stays_unknown() -> Result<(), Box<dyn std::error::Error>> {
+        let mut command = recoverable(
+            "account",
+            "mirror",
+            None,
+            None,
+            ExecutorCommandState::Sending,
+        )?
+        .command;
+        command.origin = venue_control_protocol::kol::ExecutorCommandOrigin::Copy;
+        for state in [ExecutionReadback::Accepted, ExecutionReadback::Reconciled] {
+            let ack = ExecutionOutcome {
+                state,
+                native_order_id: Some("123".into()),
+                exchange_error_code: None,
+                market_settlement: None,
+                order_fact: None,
+            };
+            assert_eq!(
+                require_signed_mirror_fact(&command, ack.clone()).state,
+                ExecutionReadback::Unknown
+            );
+            let mut exact = ack;
+            exact.order_fact = Some(crate::executor_exchange::ExactOrderFact {
+                quantity: rust_decimal::Decimal::ONE,
+                filled_quantity: rust_decimal::Decimal::ZERO,
+                terminal: false,
+            });
+            assert_eq!(require_signed_mirror_fact(&command, exact).state, state);
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -1417,6 +1552,7 @@ mod tests {
     fn request_keeps_the_durable_identities_verbatim() -> Result<(), Box<dyn std::error::Error>> {
         let command = ClaimedBinanceCommand {
             origin: venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
+            copy_risk: None,
             command_id: "command".into(),
             owner_user_id: "owner".into(),
             trading_account_id: "account".into(),
@@ -1449,6 +1585,8 @@ mod tests {
                 },
                 known_native_order_id: Some("native-1".into()),
                 reconciled_close_reservations: Vec::new(),
+                market_baseline: None,
+                copy_risk: None,
             }
         );
         assert!(!completes_on_signed_accept(&command));
@@ -1460,12 +1598,14 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let command = ClaimedBinanceCommand {
             origin: venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
+            copy_risk: None,
             command_id: "command".into(),
             owner_user_id: "owner".into(),
             trading_account_id: "account".into(),
             credential_id: "credential".into(),
             symbol: "BTC/USDT".parse()?,
-            order: ClaimedBinanceOrder::LimitPostOnly {
+            order: ClaimedBinanceOrder::Limit {
+                time_in_force: venue_domain::LimitTimeInForce::PostOnly,
                 side: venue_domain::domain::OrderSide::Buy,
                 position_side: venue_domain::domain::PositionSide::Long,
                 quantity: rust_decimal::Decimal::new(1, 3),
@@ -1485,6 +1625,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let command = ClaimedBinanceCommand {
             origin: venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
+            copy_risk: None,
             command_id: "cancel-command".into(),
             owner_user_id: "owner".into(),
             trading_account_id: "account".into(),
@@ -1513,6 +1654,8 @@ mod tests {
                 },
                 known_native_order_id: Some("321".into()),
                 reconciled_close_reservations: Vec::new(),
+                market_baseline: None,
+                copy_risk: None,
             }
         );
         Ok(())

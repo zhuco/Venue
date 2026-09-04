@@ -922,6 +922,7 @@ mod native {
         commands: &mut mpsc::Receiver<LocalMarketCommand>,
         emitter: &mut EventEmitter,
     ) -> Option<LocalMarketCommand> {
+        tracing::warn!(generation, attempt, reason = %error, "public market subscription resync");
         if emitter
             .status_all(generation, selections, MarketStatus::Resyncing, Some(error))
             .is_err()

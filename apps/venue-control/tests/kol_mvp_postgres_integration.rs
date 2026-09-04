@@ -1,5 +1,16 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[path = "support/kol_activation.rs"]
+mod kol_activation;
+#[path = "support/kol_continuous_dispatch.rs"]
+mod kol_continuous_dispatch;
+#[path = "support/kol_copy_convergence.rs"]
+mod kol_copy_convergence;
+#[path = "support/kol_copy_lifecycle.rs"]
+mod kol_copy_lifecycle;
+#[path = "support/leader_order_mirror.rs"]
+mod leader_order_mirror;
+
 use rust_decimal::Decimal;
 use sqlx::{Executor, PgPool, postgres::PgPoolOptions};
 use venue_control::accounts::AccountService;
@@ -787,6 +798,7 @@ async fn runtime_only_activates_after_two_clean_mocked_signed_baselines()
     }
     insert_kol_profile(&fixture.pool, &kol, &leader, 1).await?;
     insert_invite(&fixture.pool, &invite, &kol, 170).await?;
+    kol_activation::authorize_leader(&fixture.pool, &kol, &leader, &kol_credential).await?;
     sqlx::query("INSERT INTO venue_user_kol_bindings (user_id,kol_user_id,invite_id,bound_ms) VALUES ($1,$2,$3,1)")
         .bind(&follower).bind(&kol).bind(&invite).execute(&fixture.pool).await?;
     sqlx::query("INSERT INTO venue_kol_follow_relations (relation_id,follower_user_id,kol_user_id,leader_trading_account_id,follower_trading_account_id,credential_id,relation_state,allocated_capital,multiplier,max_order_notional,max_total_notional,max_deviation_bps,allowed_symbols,revision,created_ms,updated_ms) VALUES ($1,$2,$3,$4,$5,$6,'paused','100','1','20','100',100,'[\"BTC/USDT\"]'::jsonb,1,1,1)")
@@ -795,8 +807,17 @@ async fn runtime_only_activates_after_two_clean_mocked_signed_baselines()
         .bind(&relation).bind(id(970)).execute(&fixture.pool).await?;
     let store = PgExecutorStore::new(fixture.pool.clone());
     let secrets = ExecutorSecretProvider::new(fixture.pool.clone(), cipher);
-    let mut runtime =
-        BinanceExecutorRuntime::new(store.clone(), MockBinanceExecution::default(), secrets);
+    let baseline_ms = test_now_ms()?;
+    let mut exchange = MockBinanceExecution::default();
+    exchange.set_baseline(
+        leader.clone(),
+        kol_activation::baseline(&leader, 170, baseline_ms, Decimal::ONE)?,
+    );
+    exchange.set_baseline(
+        follower_account.clone(),
+        kol_activation::baseline(&follower_account, 171, baseline_ms, Decimal::ZERO)?,
+    );
+    let mut runtime = BinanceExecutorRuntime::new(store.clone(), exchange, secrets);
     assert_eq!(runtime.recover_once().await?, 0);
     assert_eq!(
         command_state_value(
@@ -1027,6 +1048,7 @@ async fn executor_store_promotes_only_the_matching_pending_activation()
     .await?;
     insert_kol_profile(&fixture.pool, &kol, &leader, 1).await?;
     insert_invite(&fixture.pool, &invite, &kol, 130).await?;
+    kol_activation::authorize_leader(&fixture.pool, &kol, &leader, &kol_credential).await?;
     sqlx::query("INSERT INTO venue_user_kol_bindings (user_id,kol_user_id,invite_id,bound_ms) VALUES ($1,$2,$3,1)")
         .bind(&follower).bind(&kol).bind(&invite).execute(&fixture.pool).await?;
     sqlx::query("INSERT INTO venue_kol_follow_relations (relation_id,follower_user_id,kol_user_id,leader_trading_account_id,follower_trading_account_id,credential_id,relation_state,allocated_capital,multiplier,max_order_notional,max_total_notional,max_deviation_bps,allowed_symbols,revision,created_ms,updated_ms) VALUES ($1,$2,$3,$4,$5,$6,'paused','100','1','20','100',100,'[\"BTC/USDT\"]'::jsonb,1,1,1)")
@@ -1034,7 +1056,23 @@ async fn executor_store_promotes_only_the_matching_pending_activation()
     sqlx::query("INSERT INTO venue_kol_activation_requests (relation_id,request_id,relation_revision,request_state,requested_ms,updated_ms) VALUES ($1,$2,1,'pending',1,1)")
         .bind(&relation).bind(id(930)).execute(&fixture.pool).await?;
     let store = PgExecutorStore::new(fixture.pool.clone());
-    assert!(store.complete_activation(&relation, 2, 2).await.is_err());
+    sqlx::query("UPDATE venue_api_credentials SET verification_json='{\"verification\":\"verified\"}'::jsonb WHERE credential_id=ANY($1)")
+        .bind(vec![&kol_credential, &follower_credential]).execute(&fixture.pool).await?;
+    let activation = store
+        .pending_activations(2)
+        .await?
+        .pop()
+        .ok_or("missing activation")?;
+    let mut wrong = activation.clone();
+    wrong.revision = 2;
+    let leader_baseline = kol_activation::baseline(&leader, 130, 1, Decimal::ONE)?;
+    let follower_baseline = kol_activation::baseline(&follower_account, 131, 1, Decimal::ZERO)?;
+    assert!(
+        store
+            .complete_activation(&wrong, &leader_baseline, &follower_baseline, 2)
+            .await
+            .is_err()
+    );
     let before: String = sqlx::query_scalar(
         "SELECT relation_state FROM venue_kol_follow_relations WHERE relation_id=$1",
     )
@@ -1042,7 +1080,9 @@ async fn executor_store_promotes_only_the_matching_pending_activation()
     .fetch_one(&fixture.pool)
     .await?;
     assert_eq!(before, "paused");
-    store.complete_activation(&relation, 1, 2).await?;
+    store
+        .complete_activation(&activation, &leader_baseline, &follower_baseline, 2)
+        .await?;
     let state: String = sqlx::query_scalar(
         "SELECT relation_state FROM venue_kol_follow_relations WHERE relation_id=$1",
     )
@@ -1707,6 +1747,8 @@ async fn insert_sending_grid_batch(
 
 #[path = "support/projection_fill_observation.rs"]
 mod projection_fill_observation;
+#[path = "support/terminal_positions.rs"]
+mod terminal_positions;
 
 fn integration_database_url() -> Result<Option<String>, Box<dyn std::error::Error>> {
     match std::env::var("VENUE_CONTROL_TEST_DATABASE_URL") {
@@ -1774,7 +1816,22 @@ impl Fixture {
             sqlx::raw_sql(MIGRATION_0022).execute(&self.pool).await?;
             sqlx::raw_sql(MIGRATION_0023).execute(&self.pool).await?;
             sqlx::raw_sql(MIGRATION_0024).execute(&self.pool).await?;
+            sqlx::raw_sql(venue_control::MIGRATION_0025)
+                .execute(&self.pool)
+                .await?;
+            sqlx::raw_sql(venue_control::MIGRATION_0026)
+                .execute(&self.pool)
+                .await?;
+            sqlx::raw_sql(venue_control::MIGRATION_0027)
+                .execute(&self.pool)
+                .await?;
+            sqlx::raw_sql(venue_control::MIGRATION_0028)
+                .execute(&self.pool)
+                .await?;
         }
+        sqlx::raw_sql(venue_control::MIGRATION_0029)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1871,7 +1928,7 @@ async fn insert_follow_relation(
     credential_id: &str,
     active_slot: i16,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO venue_kol_follow_relations (relation_id,follower_user_id,kol_user_id,leader_trading_account_id,follower_trading_account_id,credential_id,relation_state,active_slot,allocated_capital,multiplier,max_order_notional,max_total_notional,max_deviation_bps,allowed_symbols,revision,created_ms,updated_ms) VALUES ($1,$2,$3,$4,$5,$6,'active',$7,'1000','1','100','1000',100,'[\"BTC/USDT\"]'::jsonb,1,1,1)")
+    sqlx::query("INSERT INTO venue_kol_follow_relations (relation_id,follower_user_id,kol_user_id,leader_trading_account_id,follower_trading_account_id,credential_id,relation_state,active_slot,allocated_capital,multiplier,max_order_notional,max_total_notional,max_deviation_bps,allowed_symbols,baseline_json,revision,created_ms,updated_ms) VALUES ($1,$2,$3,$4,$5,$6,'active',$7,'1000','1','100','1000',100,'[\"BTC/USDT\"]'::jsonb,'{\"target_model\":1,\"baseline_ms\":1}'::jsonb,1,1,1)")
         .bind(relation_id)
         .bind(follower_user_id)
         .bind(kol_user_id)

@@ -9,8 +9,7 @@ fn main() -> eframe::Result {
         .without_time()
         .init();
 
-    let endpoint =
-        std::env::var("VENUE_CONTROL_URL").unwrap_or_else(|_| "http://127.0.0.1:39180".to_owned());
+    let endpoint = venueflow::default_control_endpoint();
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("VenueFlow — Venue Control Workstation")

@@ -15,7 +15,8 @@ pub(crate) fn show(ui: &mut egui::Ui, model: &crate::model::AppModel) {
             row.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Terminal
                 && Some(row.trading_account_id.as_str())
                     == model.preferences.execution_account_id.as_deref()
-                && row.symbol.to_string() == model.preferences.selected_symbol
+                && (model.execution.terminal_request_id.is_some()
+                    || row.symbol.to_string() == model.preferences.selected_symbol)
                 && model
                     .execution
                     .terminal_request_id
@@ -26,43 +27,29 @@ pub(crate) fn show(ui: &mut egui::Ui, model: &crate::model::AppModel) {
     if let Some(error) = &model.execution.terminal_submission_error {
         ui.separator();
         ui.colored_label(crate::theme::SELL, error);
-    } else if let Some(row) = row {
+    } else if let Some(row) = row.filter(|row| {
+        row.sanitized_error_code.is_some()
+            || matches!(
+                row.state,
+                ExecutorCommandState::Rejected
+                    | ExecutorCommandState::ReconcileRequired
+                    | ExecutorCommandState::Cancelled
+            )
+    }) {
         ui.separator();
-        let color = if matches!(
-            row.state,
-            ExecutorCommandState::Rejected | ExecutorCommandState::ReconcileRequired
-        ) {
-            crate::theme::WARNING
-        } else {
-            crate::theme::TEXT_SECONDARY
-        };
+        let color = crate::theme::WARNING;
         ui.colored_label(
             color,
             format!(
-                "{} · {}",
-                choose(language, "最近委托", "Latest command"),
+                "{} · {} · {}",
+                row.symbol,
+                choose(language, "委托", "Order"),
                 command_state(row.state, language)
             ),
         );
         if row.sanitized_error_code.is_some() {
             ui.colored_label(color, command_reason(row, language));
         }
-        ui.add(egui::Label::new(egui::RichText::new(&row.command_id).small()).truncate())
-            .on_hover_text(&row.command_id);
-    } else if model.execution.terminal_request_id.is_some() {
-        ui.separator();
-        ui.colored_label(
-            crate::theme::WARNING,
-            choose(
-                language,
-                "已进入发送队列，等待服务端回执；此时不代表已挂单。",
-                "Queued for submission; awaiting server receipt. Not yet a working order.",
-            ),
-        );
-    }
-    if let Some(id) = &model.execution.terminal_request_id {
-        ui.add(egui::Label::new(egui::RichText::new(format!("request: {id}")).small()).truncate())
-            .on_hover_text(id);
     }
 }
 
@@ -120,6 +107,26 @@ pub(crate) fn command_reason(summary: &ExecutorCommandSummary, language: Languag
         .into();
     }
     let (zh, en) = match code {
+        "position_not_dispatched" => (
+            "服务重启前尚未发送市价操作，请根据最新持仓重新提交。",
+            "Market action was not sent before restart. Review current positions before submitting again.",
+        ),
+        "position_changed_or_unavailable" => (
+            "仓位已变化、账户数据暂不可用或权限已变化，未发送本次市价操作；请查看刷新后的持仓。",
+            "Position, account data or permissions changed; market action was not sent. Check refreshed positions.",
+        ),
+        "reverse_position_not_flat" => (
+            "原方向仍有持仓，未执行反向开仓；请检查运行中的策略及剩余仓位。",
+            "The original leg is not flat; reverse opening was not sent. Check remaining exposure and running strategies.",
+        ),
+        "market_partial_fill" => (
+            "市价委托结束但只部分成交，未继续反开；请查看剩余仓位。",
+            "Market order ended with a partial fill; reversal was not continued. Check remaining exposure.",
+        ),
+        "market_not_filled" => (
+            "市价委托结束且没有成交，未继续反开。",
+            "Market order ended without a fill; reversal was not continued.",
+        ),
         "not_dispatched_quantity_zero" => (
             "按交易对数量步长向下取整后为零，未发单。",
             "Quantity rounds down to zero at the symbol's step size; not sent.",
@@ -200,10 +207,7 @@ pub(crate) fn command_state(state: ExecutorCommandState, language: Language) -> 
         ExecutorCommandState::Accepted => ("已接受，待确认", "Accepted; awaiting confirmation"),
         ExecutorCommandState::Rejected => ("已拒绝", "Rejected"),
         ExecutorCommandState::ReconcileRequired => ("结果未知，正在查单", "Unknown; reconciling"),
-        ExecutorCommandState::Reconciled => (
-            "命令已核对（非成交状态）",
-            "Command reconciled; not fill status",
-        ),
+        ExecutorCommandState::Reconciled => ("已处理", "Processed"),
         ExecutorCommandState::Cancelled => ("发送前已取消", "Cancelled before dispatch"),
     };
     choose(language, zh, en)
@@ -279,7 +283,7 @@ mod tests {
                 ExecutorCommandState::Reconciled,
                 Language::SimplifiedChinese
             ),
-            "命令已核对（非成交状态）"
+            "已处理"
         );
         assert_eq!(
             command_state(
@@ -288,5 +292,82 @@ mod tests {
             ),
             "结果未知，正在查单"
         );
+    }
+
+    #[test]
+    fn normal_submission_is_silent_but_failures_keep_the_reason()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use venue_control_protocol::kol::{
+            ExecutorCommandOrigin, ExecutorCommandPhase, ExecutorOrderKind,
+        };
+        let mut model = crate::model::AppModel::new(crate::model::Preferences::default());
+        model.preferences.execution_account_id = Some("account-fixture".into());
+        model.preferences.selected_symbol = "DOGE/USDC".into();
+        model
+            .execution
+            .begin_terminal_submission("request-fixture".into());
+        assert!(render_feedback(&model).is_empty());
+        model
+            .execution
+            .terminal_executions
+            .push(ExecutorCommandSummary {
+                command_id: "command-fixture".into(),
+                request_id: Some("request-fixture".into()),
+                origin: ExecutorCommandOrigin::Terminal,
+                phase: ExecutorCommandPhase::Open,
+                trading_account_id: "account-fixture".into(),
+                symbol: "DOGE/USDC".parse()?,
+                position_side: Some(venue_domain::PositionSide::Long),
+                order_side: Some(venue_domain::OrderSide::Buy),
+                order_kind: ExecutorOrderKind::LimitPostOnly,
+                requested_quantity: Some(1.into()),
+                limit_price: Some(1.into()),
+                state: ExecutorCommandState::Pending,
+                native_order_id: None,
+                created_ms: 1,
+                updated_ms: 1,
+                sanitized_error_code: None,
+            });
+        for state in [
+            ExecutorCommandState::Pending,
+            ExecutorCommandState::Sending,
+            ExecutorCommandState::Accepted,
+            ExecutorCommandState::Reconciled,
+        ] {
+            model.execution.terminal_executions[0].state = state;
+            assert!(render_feedback(&model).is_empty());
+        }
+        model.execution.terminal_executions[0].state = ExecutorCommandState::Rejected;
+        model.execution.terminal_executions[0].sanitized_error_code = Some("binance_-2019".into());
+        let rendered = render_feedback(&model);
+        assert!(rendered.contains("保证金不足") && rendered.contains("已拒绝"));
+        assert!(!rendered.contains("command-fixture") && !rendered.contains("request-fixture"));
+        model.execution.terminal_executions[0].state = ExecutorCommandState::ReconcileRequired;
+        model.execution.terminal_executions[0].sanitized_error_code =
+            Some("dispatch_unknown".into());
+        assert!(render_feedback(&model).contains("不要重复下单"));
+        model.preferences.execution_account_id = Some("other-account".into());
+        assert!(render_feedback(&model).is_empty());
+        model.execution.terminal_submission_error = Some("提交连接失败".into());
+        assert!(render_feedback(&model).contains("提交连接失败"));
+        Ok(())
+    }
+
+    fn render_feedback(model: &crate::model::AppModel) -> String {
+        fn collect(shape: &egui::Shape, text: &mut String) {
+            match shape {
+                egui::Shape::Text(value) => text.push_str(&value.galley.job.text),
+                egui::Shape::Vec(values) => values.iter().for_each(|value| collect(value, text)),
+                _ => (),
+            }
+        }
+        let context = egui::Context::default();
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| show(ui, model));
+        output.textures_delta.clear();
+        let mut text = String::new();
+        for shape in output.shapes {
+            collect(&shape.shape, &mut text);
+        }
+        text
     }
 }

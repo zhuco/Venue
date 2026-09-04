@@ -540,7 +540,7 @@ impl AccountRiskEvidence {
         })
     }
 
-    pub(super) fn validate_for(
+    pub fn validate_for(
         &self,
         binding: &GatewayBinding,
         now_ms: u64,
@@ -586,15 +586,15 @@ impl AccountRiskEvidence {
         Ok(self)
     }
 
-    pub(super) fn signed_position_total(&self) -> Result<Decimal, AccountHostValidationError> {
+    pub fn signed_position_total(&self) -> Result<Decimal, AccountHostValidationError> {
         sum_notional(&self.signed_position_notionals)
     }
 
-    pub(super) fn open_entry_order_total(&self) -> Result<Decimal, AccountHostValidationError> {
+    pub fn open_entry_order_total(&self) -> Result<Decimal, AccountHostValidationError> {
         sum_notional(&self.open_entry_order_notionals)
     }
 
-    pub(super) fn value_in_usdt(
+    pub fn value_in_usdt(
         &self,
         asset: &Asset,
         value: Decimal,

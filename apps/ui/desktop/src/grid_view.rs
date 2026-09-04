@@ -27,6 +27,7 @@ enum EditorMode {
 #[derive(Clone, Debug)]
 struct GridEditor {
     mode: EditorMode,
+    credential_id: String,
     symbol: String,
     order_notional: String,
     spacing_rate: String,
@@ -48,9 +49,10 @@ struct GridEditor {
 }
 
 impl GridEditor {
-    fn create(symbol: &str) -> Self {
+    fn create(symbol: &str, credential_id: &str) -> Self {
         Self {
             mode: EditorMode::Create,
+            credential_id: credential_id.to_owned(),
             symbol: symbol.to_owned(),
             order_notional: "10".to_owned(),
             spacing_rate: "0.002".to_owned(),
@@ -79,6 +81,7 @@ impl GridEditor {
                 instance_id: instance.instance_id.clone(),
                 revision: instance.revision,
             },
+            credential_id: instance.credential_id.clone(),
             symbol: instance.symbol.to_string(),
             order_notional: number(config.order_notional),
             spacing_rate: number(config.spacing_rate),
@@ -295,8 +298,11 @@ pub fn show(
             ))
             .clicked()
         {
-            model.execution.grid.editor =
-                Some(GridEditor::create(&model.preferences.selected_symbol));
+            model.execution.grid.mutation_error = None;
+            model.execution.grid.editor = Some(GridEditor::create(
+                &model.preferences.selected_symbol,
+                &credential.credential_id,
+            ));
         }
         let selected = selected_visible_instance(&model.execution.grid, &visible).cloned();
         if ui
@@ -315,6 +321,7 @@ pub fn show(
             .clicked()
             && let Some(instance) = selected
         {
+            model.execution.grid.mutation_error = None;
             model.execution.grid.editor = Some(GridEditor::update(&instance));
         }
         if model.execution.grid.pending {
@@ -332,7 +339,7 @@ pub fn show(
     ui.add_space(4.0);
     new_grid_table(ui, model, &visible);
     lifecycle_controls(ui, model, &visible, credential_ready, &mut action);
-    editor(ui, model, credential_ready, &mut action);
+    editor(ui, model, credential, credential_ready, &mut action);
 
     if let Some(action) = action {
         dispatch(model, client, credential, action);
@@ -501,6 +508,7 @@ fn lifecycle_controls(
 fn editor(
     ui: &mut egui::Ui,
     model: &mut AppModel,
+    credential: &CredentialSummary,
     credential_ready: bool,
     action: &mut Option<UiAction>,
 ) {
@@ -508,122 +516,171 @@ fn editor(
         return;
     };
     let language = model.preferences.language;
-    ui.add_space(10.0);
-    egui::CollapsingHeader::new(tr(language, "Grid 配置", "Grid configuration"))
-        .default_open(true)
-        .show(ui, |ui| {
-            egui::Grid::new("grid-config-editor")
-                .num_columns(2)
-                .spacing([10.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label(tr(language, "交易对", "Symbol"));
-                    ui.add_enabled(
-                        matches!(&draft.mode, EditorMode::Create),
-                        egui::TextEdit::singleline(&mut draft.symbol).desired_width(120.0),
-                    );
-                    ui.end_row();
-                    ui.label(tr(language, "委托策略", "Order policy"));
-                    ui.strong(tr(language, "仅 Maker（固定）", "Maker only (fixed)"));
-                    ui.end_row();
-                    input(
-                        ui,
-                        tr(language, "单层名义价值", "Order notional"),
-                        &mut draft.order_notional,
-                    );
-                    input(
-                        ui,
-                        tr(language, "间距率", "Spacing rate"),
-                        &mut draft.spacing_rate,
-                    );
-                    input(ui, tr(language, "层数", "Levels"), &mut draft.grid_levels);
-                    input(
-                        ui,
-                        tr(language, "总名义上限", "Total notional cap"),
-                        &mut draft.max_total_notional,
-                    );
-                    ui.checkbox(
-                        &mut draft.replenish_enabled,
-                        tr(language, "低库存自动补充", "Inventory replenishment"),
-                    );
-                    ui.end_row();
-                    input(
-                        ui,
-                        tr(language, "最低库存", "Minimum inventory"),
-                        &mut draft.minimum_inventory_notional,
-                    );
-                    input(
-                        ui,
-                        tr(language, "目标库存", "Target inventory"),
-                        &mut draft.target_inventory_notional,
-                    );
-                    input(
-                        ui,
-                        tr(language, "单次补充上限", "Replenishment cap"),
-                        &mut draft.max_single_replenishment_notional,
-                    );
-                    ui.checkbox(
-                        &mut draft.reduce_enabled,
-                        tr(
-                            language,
-                            "库存过多且盈利时减仓",
-                            "Profitable excess reduction",
-                        ),
-                    );
-                    ui.end_row();
-                    input(
-                        ui,
-                        tr(language, "库存权益倍数", "Inventory/equity multiple"),
-                        &mut draft.inventory_equity_multiple,
-                    );
-                    input(
-                        ui,
-                        tr(language, "最低浮盈率", "Minimum profit rate"),
-                        &mut draft.minimum_unrealized_profit_rate,
-                    );
-                    input(
-                        ui,
-                        tr(language, "减仓比例", "Reduction fraction"),
-                        &mut draft.reduction_fraction,
-                    );
-                    input(
-                        ui,
-                        tr(language, "单次减仓上限", "Reduction cap"),
-                        &mut draft.max_single_reduce_notional,
-                    );
-                    input(
-                        ui,
-                        tr(language, "行情过期 ms", "Market stale ms"),
-                        &mut draft.stale_market_ms,
-                    );
-                    input(
-                        ui,
-                        tr(language, "私有事实过期 ms", "Private stale ms"),
-                        &mut draft.stale_private_ms,
-                    );
-                    input(
-                        ui,
-                        tr(language, "收敛超时 ms", "Convergence timeout ms"),
-                        &mut draft.convergence_timeout_ms,
-                    );
-                    input(
-                        ui,
-                        tr(language, "连续失败阈值", "Failure threshold"),
-                        &mut draft.max_consecutive_failures,
-                    );
+    let pending = model.execution.grid.pending;
+    let scope_current = draft.credential_id == credential.credential_id;
+    let viewport = ui.ctx().content_rect().size();
+    let response = egui::Modal::new(egui::Id::new("grid-config-dialog"))
+        .frame(
+            egui::Frame::new()
+                .fill(theme::BG_SECONDARY)
+                .stroke(egui::Stroke::new(1.0, theme::DIVIDER))
+                .corner_radius(10)
+                .inner_margin(24),
+        )
+        .show(ui.ctx(), |ui| {
+            ui.set_width(520.0_f32.min((viewport.x - 64.0).max(280.0)));
+            ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
+            ui.horizontal(|ui| {
+                let title = match draft.mode {
+                    EditorMode::Create => tr(language, "新建 Grid 机器人", "New Grid robot"),
+                    EditorMode::Update { .. } => {
+                        tr(language, "编辑 Grid 配置", "Edit Grid configuration")
+                    }
+                };
+                ui.heading(title);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled(!pending, egui::Button::new("×")).clicked() {
+                        model.execution.grid.editor = None;
+                    }
                 });
+            });
+            ui.label(format!(
+                "{} · Binance",
+                instance_credential_label(model, &draft.credential_id)
+            ));
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .id_salt("grid-config-dialog-scroll")
+                .max_height((viewport.y - 280.0).clamp(120.0, 620.0))
+                .show(ui, |ui| {
+                    ui.add_enabled_ui(!pending && scope_current, |ui| {
+                        egui::Grid::new("grid-config-editor")
+                            .num_columns(2)
+                            .spacing([10.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.label(tr(language, "交易对", "Symbol"));
+                                ui.add_enabled(
+                                    matches!(&draft.mode, EditorMode::Create),
+                                    egui::TextEdit::singleline(&mut draft.symbol)
+                                        .desired_width(120.0),
+                                );
+                                ui.end_row();
+                                ui.label(tr(language, "委托策略", "Order policy"));
+                                ui.strong(tr(language, "仅 Maker（固定）", "Maker only (fixed)"));
+                                ui.end_row();
+                                input(
+                                    ui,
+                                    tr(language, "单层名义价值", "Order notional"),
+                                    &mut draft.order_notional,
+                                );
+                                input(
+                                    ui,
+                                    tr(language, "间距率", "Spacing rate"),
+                                    &mut draft.spacing_rate,
+                                );
+                                input(ui, tr(language, "层数", "Levels"), &mut draft.grid_levels);
+                                input(
+                                    ui,
+                                    tr(language, "总名义上限", "Total notional cap"),
+                                    &mut draft.max_total_notional,
+                                );
+                                ui.checkbox(
+                                    &mut draft.replenish_enabled,
+                                    tr(language, "低库存自动补充", "Inventory replenishment"),
+                                );
+                                ui.end_row();
+                                input(
+                                    ui,
+                                    tr(language, "最低库存", "Minimum inventory"),
+                                    &mut draft.minimum_inventory_notional,
+                                );
+                                input(
+                                    ui,
+                                    tr(language, "目标库存", "Target inventory"),
+                                    &mut draft.target_inventory_notional,
+                                );
+                                input(
+                                    ui,
+                                    tr(language, "单次补充上限", "Replenishment cap"),
+                                    &mut draft.max_single_replenishment_notional,
+                                );
+                                ui.checkbox(
+                                    &mut draft.reduce_enabled,
+                                    tr(
+                                        language,
+                                        "库存过多且盈利时减仓",
+                                        "Profitable excess reduction",
+                                    ),
+                                );
+                                ui.end_row();
+                                input(
+                                    ui,
+                                    tr(language, "库存权益倍数", "Inventory/equity multiple"),
+                                    &mut draft.inventory_equity_multiple,
+                                );
+                                input(
+                                    ui,
+                                    tr(language, "最低浮盈率", "Minimum profit rate"),
+                                    &mut draft.minimum_unrealized_profit_rate,
+                                );
+                                input(
+                                    ui,
+                                    tr(language, "减仓比例", "Reduction fraction"),
+                                    &mut draft.reduction_fraction,
+                                );
+                                input(
+                                    ui,
+                                    tr(language, "单次减仓上限", "Reduction cap"),
+                                    &mut draft.max_single_reduce_notional,
+                                );
+                                input(
+                                    ui,
+                                    tr(language, "行情过期 ms", "Market stale ms"),
+                                    &mut draft.stale_market_ms,
+                                );
+                                input(
+                                    ui,
+                                    tr(language, "私有事实过期 ms", "Private stale ms"),
+                                    &mut draft.stale_private_ms,
+                                );
+                                input(
+                                    ui,
+                                    tr(language, "收敛超时 ms", "Convergence timeout ms"),
+                                    &mut draft.convergence_timeout_ms,
+                                );
+                                input(
+                                    ui,
+                                    tr(language, "连续失败阈值", "Failure threshold"),
+                                    &mut draft.max_consecutive_failures,
+                                );
+                            });
+                    });
+                });
+            ui.separator();
+            if let Some(error) = &model.execution.grid.mutation_error {
+                ui.colored_label(theme::WARNING, error);
+            }
             ui.horizontal(|ui| {
                 let editor_current = editor_is_current(&draft, &model.execution.grid.instances);
                 let save = ui
                     .add_enabled(
-                        !model.execution.grid.pending
+                        !pending
+                            && scope_current
                             && editor_current
                             && (credential_ready
                                 || matches!(&draft.mode, EditorMode::Update { .. })),
                         egui::Button::new(tr(language, "保存配置", "Save")),
                     )
                     .clicked();
-                if ui.button(tr(language, "取消", "Cancel")).clicked() {
+                if ui
+                    .add_enabled(!pending, egui::Button::new(tr(language, "取消", "Cancel")))
+                    .clicked()
+                {
                     model.execution.grid.editor = None;
+                }
+                if pending {
+                    ui.spinner();
+                    ui.weak(tr(language, "等待 Control 确认", "Waiting for Control"));
                 }
                 if save {
                     match draft.config() {
@@ -647,7 +704,16 @@ fn editor(
                     }
                 }
             });
-            if !editor_is_current(&draft, &model.execution.grid.instances) {
+            if !scope_current {
+                ui.colored_label(
+                    theme::WARNING,
+                    tr(
+                        language,
+                        "账户已切换，请关闭后重新打开配置。",
+                        "The account changed; close and reopen the configuration.",
+                    ),
+                );
+            } else if !editor_is_current(&draft, &model.execution.grid.instances) {
                 ui.colored_label(
                     theme::WARNING,
                     tr(
@@ -658,7 +724,9 @@ fn editor(
                 );
             }
         });
-    if model.execution.grid.editor.is_some() {
+    if response.should_close() && !pending && action.is_none() {
+        model.execution.grid.editor = None;
+    } else if model.execution.grid.editor.is_some() {
         model.execution.grid.editor = Some(draft);
     }
 }
@@ -953,7 +1021,8 @@ mod tests {
         state: GridInstanceState,
         revision: u64,
     ) -> Result<GridInstanceSummary, Box<dyn std::error::Error>> {
-        let config = GridEditor::create("BTC/USDT").config()?;
+        let config =
+            GridEditor::create("BTC/USDT", "00000000-0000-4000-8000-000000000010").config()?;
         let attention_code = matches!(
             state,
             GridInstanceState::Blocked
@@ -986,7 +1055,7 @@ mod tests {
 
     #[test]
     fn editor_builds_explicit_inventory_profit_and_reset_policies() {
-        let editor = GridEditor::create("BTC/USDT");
+        let editor = GridEditor::create("BTC/USDT", "00000000-0000-4000-8000-000000000010");
         let config = editor.config();
         assert!(config.is_ok());
         let Ok(config) = config else {
@@ -995,6 +1064,118 @@ mod tests {
         assert!(!config.inventory_replenishment.enabled);
         assert!(!config.profit_reduction.enabled);
         assert_eq!(config.reset_policy.max_consecutive_failures, 3);
+    }
+
+    #[test]
+    fn configuration_dialog_keeps_save_visible_and_fences_stale_or_switched_accounts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let credential = CredentialSummary {
+            credential_id: "00000000-0000-4000-8000-000000000010".into(),
+            label: "Dialog test account".into(),
+            venue: venue_control_protocol::VenueId::Binance,
+            masked_key: "masked".into(),
+            trading_account_id: Some("00000000-0000-4000-8000-000000000101".into()),
+            verification: venue_control_protocol::accounts::ApiVerificationState::Verified,
+            verified_ms: Some(100),
+            expires_ms: None,
+            api_reachable: true,
+            dual_position: true,
+            account_mode: Some("portfolio_margin_um".into()),
+            has_exposure: Some(false),
+        };
+        for case in [
+            "create", "update", "pending", "switched", "stale", "invalid",
+        ] {
+            let context = egui::Context::default();
+            crate::theme::apply(&context);
+            let mut model = AppModel::new(crate::model::Preferences {
+                language: Language::English,
+                ..Default::default()
+            });
+            let instance = summary(
+                "00000000-0000-4000-8000-000000000201",
+                "00000000-0000-4000-8000-000000000101",
+                GridInstanceState::Running,
+                1,
+            )?;
+            let mut draft = if matches!(case, "update" | "stale") {
+                GridEditor::update(&instance)
+            } else {
+                GridEditor::create("BTC/USDT", &credential.credential_id)
+            };
+            model.execution.grid.instances = vec![instance];
+            if case == "switched" {
+                draft.credential_id = "another-account".into();
+            }
+            if case == "stale" {
+                model.execution.grid.instances[0].revision = 2;
+            }
+            if case == "invalid" {
+                draft.order_notional = "invalid".into();
+            }
+            model.execution.grid.pending = case == "pending";
+            model.execution.grid.editor = Some(draft);
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 700.0));
+            let mut action = None;
+            let mut save_rect = None;
+            for _ in 0..3 {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        editor(ui, &mut model, &credential, true, &mut action);
+                    },
+                );
+                output.textures_delta.clear();
+                for shape in output.shapes {
+                    if let egui::Shape::Text(text) = shape.shape
+                        && text.galley.job.text == "Save"
+                    {
+                        save_rect = Some(egui::Rect::from_min_size(text.pos, text.galley.size()));
+                    }
+                }
+            }
+            assert!(
+                context
+                    .memory(|m| m.area_rect(egui::Id::new("grid-config-dialog")))
+                    .is_some_and(|rect| screen.contains_rect(rect)),
+                "{case}: dialog must fit the minimum window"
+            );
+            let rect = save_rect.ok_or("Save must remain visible below the scrolling form")?;
+            assert!(screen.contains_rect(rect));
+            for pressed in [true, false] {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events: vec![egui::Event::PointerButton {
+                            pos: rect.center(),
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                        ..Default::default()
+                    },
+                    |ui| editor(ui, &mut model, &credential, true, &mut action),
+                );
+                output.textures_delta.clear();
+            }
+            match case {
+                "create" => assert!(matches!(action, Some(UiAction::Create { .. }))),
+                "update" => assert!(matches!(action, Some(UiAction::Update { revision: 1, .. }))),
+                "invalid" => {
+                    assert!(action.is_none());
+                    assert!(model.execution.grid.mutation_error.is_some());
+                }
+                _ => assert!(action.is_none(), "{case}: must not submit"),
+            }
+            assert!(
+                model.execution.grid.editor.is_some(),
+                "retain draft until a confirmed result"
+            );
+        }
+        Ok(())
     }
 
     #[test]

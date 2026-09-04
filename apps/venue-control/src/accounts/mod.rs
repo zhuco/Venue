@@ -5,6 +5,7 @@ mod credentials;
 mod crypto;
 mod grid;
 mod kol;
+mod leader_bot;
 mod session;
 mod terminal;
 #[cfg(test)]

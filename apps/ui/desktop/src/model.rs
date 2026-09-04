@@ -105,6 +105,7 @@ pub struct Preferences {
     pub favorite_symbols: Vec<String>,
     pub chart: crate::chart_settings::ChartDisplaySettings,
     pub chart_overrides: BTreeMap<String, crate::chart_settings::ChartDisplaySettings>,
+    pub chart_alerts: crate::chart_trading::AlertBook,
     pub trading: crate::trading::TradingSettings,
 }
 
@@ -123,6 +124,7 @@ impl Default for Preferences {
             favorite_symbols: vec![DEFAULT_SELECTED_SYMBOL.to_owned()],
             chart: crate::chart_settings::ChartDisplaySettings::default(),
             chart_overrides: BTreeMap::new(),
+            chart_alerts: crate::chart_trading::AlertBook::default(),
             trading: crate::trading::TradingSettings::default(),
         }
     }

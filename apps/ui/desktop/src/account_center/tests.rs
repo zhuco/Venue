@@ -82,6 +82,51 @@ fn saved_selection_is_not_authentication_and_api_success_is_not_node_online() {
 }
 
 #[test]
+fn switching_execution_account_keeps_authenticated_connection_and_clears_old_private_state() {
+    let context = egui::Context::default();
+    let mut model = AppModel::new(Preferences::default());
+    model.apply_account_overview(overview());
+    model.execution.private_error = Some("old account failure".into());
+    let mut state = AccountCenter {
+        session: Some(session()),
+        next_refresh_ms: u64::MAX,
+        ..Default::default()
+    };
+    let mut next = overview();
+    let mut selected = credential();
+    selected.credential_id = "second-binding".into();
+    selected.trading_account_id = Some("00000000-0000-4000-8000-000000000002".into());
+    next.selected_credential_id = Some(selected.credential_id.clone());
+    next.credentials.push(selected.clone());
+    assert!(
+        state
+            .client
+            .test_sender()
+            .send(Ok(AccountResult::Overview(next)))
+            .is_ok()
+    );
+    assert!(!state.poll(&mut model, &context));
+    assert_eq!(
+        model.preferences.execution_account_id,
+        selected.trading_account_id
+    );
+    assert!(model.execution.private_error.is_none());
+    assert!(state.session.is_some());
+
+    let mut removed = overview();
+    removed.selected_credential_id = None;
+    assert!(
+        state
+            .client
+            .test_sender()
+            .send(Ok(AccountResult::Overview(removed)))
+            .is_ok()
+    );
+    assert!(state.poll(&mut model, &context));
+    assert!(model.preferences.execution_account_id.is_none());
+}
+
+#[test]
 fn account_connection_uses_the_same_private_projection_as_positions()
 -> Result<(), Box<dyn std::error::Error>> {
     use venue_control_protocol::kol::{

@@ -1,6 +1,8 @@
 use rust_decimal::Decimal;
+mod terminal_market;
 mod terminal_open;
 use serde_json::Value;
+pub use terminal_market::prepare_terminal_market;
 pub use terminal_open::prepare_terminal_open_limit;
 use venue_domain::domain::{
     ExecutionCommand, FieldState, LimitTimeInForce, Order, OrderSide, OrderState, PositionSide,
@@ -276,6 +278,21 @@ pub fn prepare_place_market(
         intent.side,
         intent.reduce_only,
     )?;
+    let parameters = market_parameters(rules, intent, readback.position_mode);
+    prepared(
+        rules,
+        readback,
+        BinanceMutationKind::PlaceMarket,
+        parameters,
+        intent.client_order_id.clone(),
+    )
+}
+
+fn market_parameters(
+    rules: &BinanceInstrumentRules,
+    intent: &BinanceMarketIntent,
+    mode: BinancePositionMode,
+) -> Vec<(String, String)> {
     let mut parameters = vec![
         ("symbol".to_owned(), rules.native_symbol.clone()),
         ("side".to_owned(), side_wire(intent.side).to_owned()),
@@ -291,16 +308,10 @@ pub fn prepare_place_market(
             intent.client_order_id.clone(),
         ),
     ];
-    if readback.position_mode == BinancePositionMode::Net {
+    if mode == BinancePositionMode::Net {
         parameters.push(("reduceOnly".to_owned(), intent.reduce_only.to_string()));
     }
-    prepared(
-        rules,
-        readback,
-        BinanceMutationKind::PlaceMarket,
-        parameters,
-        intent.client_order_id.clone(),
-    )
+    parameters
 }
 
 pub fn prepare_cancel(

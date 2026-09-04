@@ -407,6 +407,7 @@ fn signed_partial_order_is_a_fact_change_not_a_surface_conflict()
         filled_quantity: Some(Decimal::ONE),
         limit_price: Some(wanted.limit_price),
         post_only: true,
+        time_in_force: Some(venue_domain::LimitTimeInForce::PostOnly),
         reduce_only: false,
         state: TerminalOrderState::PartiallyFilled,
         created_ms: Some(1),

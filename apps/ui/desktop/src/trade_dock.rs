@@ -285,7 +285,7 @@ fn action_palette(action: TradingAction) -> (Color32, Color32, Color32) {
         _ => (theme::TEXT_PRIMARY, theme::BG_SECONDARY, theme::DIVIDER),
     }
 }
-fn action_button(
+pub(crate) fn action_button(
     ui: &mut egui::Ui,
     model: &AppModel,
     action: TradingAction,
@@ -359,6 +359,7 @@ fn action_disabled_reason(model: &AppModel, action: TradingAction, now: f64) -> 
                     CancelSelectionError::Disappeared => {
                         "所选委托已不在最新活动委托投影中，请刷新后重新选择"
                     }
+                    CancelSelectionError::Pending => "该委托的撤单结果未确认，请勿重复提交",
                 },
                 match error {
                     CancelSelectionError::Missing => {
@@ -370,6 +371,7 @@ fn action_disabled_reason(model: &AppModel, action: TradingAction, now: f64) -> 
                     CancelSelectionError::Disappeared => {
                         "The selected order is absent from the latest open-order projection"
                     }
+                    CancelSelectionError::Pending => "Cancellation is unconfirmed; do not resubmit",
                 },
             )
             .to_owned()
@@ -468,13 +470,18 @@ pub fn apply_action(
         let request = TerminalCancelRequest {
             schema_version: TERMINAL_SCHEMA_VERSION,
             request_id: model.next_terminal_request_id(),
-            credential_id: selection.credential_id,
-            symbol: selection.symbol,
-            native_order_id: selection.native_order_id,
+            credential_id: selection.credential_id.clone(),
+            symbol: selection.symbol.clone(),
+            native_order_id: selection.native_order_id.clone(),
         };
         let request_id = request.request_id.clone();
         match client.send_terminal_cancel(request) {
             Ok(()) => {
+                model.execution.chart_orders.submitted_cancel(
+                    selection,
+                    request_id.clone(),
+                    context,
+                );
                 model.execution.begin_terminal_submission(request_id);
                 model.trade_dock.clear_order_selection();
                 model.notice("Submitted exact order cancellation to the Binance Executor ledger");
@@ -496,8 +503,15 @@ pub fn apply_action(
         }
     };
     let request_id = request.request_id.clone();
-    match client.send_terminal(request) {
+    match client.send_terminal(request.clone()) {
         Ok(()) => {
+            if let Some(account) = model.preferences.execution_account_id.clone() {
+                model
+                    .execution
+                    .chart_orders
+                    .submitted_order(account, request, context);
+            }
+            context.request_repaint();
             model.execution.begin_terminal_submission(request_id);
             model.trade_dock.armed_action = None;
             model.notice(format!(
@@ -514,6 +528,7 @@ enum CancelSelectionError {
     Missing,
     ScopeChanged,
     Disappeared,
+    Pending,
 }
 
 fn terminal_cancel_selection(
@@ -545,6 +560,9 @@ fn terminal_cancel_selection(
             && order.native_order_id.as_deref() == Some(selection.native_order_id.as_str())
     }) {
         return Err(CancelSelectionError::Disappeared);
+    }
+    if model.execution.chart_orders.is_pending(selection) {
+        return Err(CancelSelectionError::Pending);
     }
     Ok(selection)
 }
@@ -644,49 +662,7 @@ fn submit_market_close(
     client: &ControlClient,
     side: venue_domain::PositionSide,
 ) {
-    let Some(credential_id) = model
-        .account_overview
-        .as_ref()
-        .and_then(|overview| overview.selected_credential_id.clone())
-    else {
-        return;
-    };
-    let Ok(symbol) = model.preferences.selected_symbol.parse() else {
-        return;
-    };
-    let Some(close_quantity_cap) = model
-        .execution
-        .position_quantity(&model.preferences.selected_symbol, side)
-        .filter(|quantity| *quantity > rust_decimal::Decimal::ZERO)
-    else {
-        return;
-    };
-    let action = if side == venue_domain::PositionSide::Long {
-        TerminalAction::CloseLong
-    } else {
-        TerminalAction::CloseShort
-    };
-    let request = TerminalOrderRequest {
-        schema_version: TERMINAL_SCHEMA_VERSION,
-        request_id: model.next_terminal_request_id(),
-        credential_id,
-        symbol,
-        action,
-        order_kind: TerminalOrderKind::Market,
-        quote_notional: rust_decimal::Decimal::ZERO,
-        limit_price: None,
-        close_quantity_cap: Some(close_quantity_cap),
-        market_risk_confirmed: true,
-    };
-    let request_id = request.request_id.clone();
-    match client.send_terminal(request) {
-        Ok(()) => {
-            model.execution.begin_terminal_submission(request_id);
-            model.trade_dock.armed_action = None;
-            model.notice("Submitted confirmed market close to the Binance Executor ledger");
-        }
-        Err(error) => local_failure(model, format!("市价平仓未提交 [local_rejected]：{error}")),
-    }
+    crate::execution_view::submit_confirmed_close(model, client, side);
 }
 
 fn local_failure(model: &mut AppModel, reason: String) {

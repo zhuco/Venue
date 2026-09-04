@@ -16,6 +16,11 @@ use venue_control_protocol::{
         KolProfileUpdateRequest, TerminalCancelRequest, TerminalOrderRequest,
         TerminalProjectionRequest,
     },
+    leader_bot::{
+        LEADER_BOT_LIFECYCLE_PATH, LEADER_BOT_PATH, LeaderBotCreateRequest,
+        LeaderBotLifecycleRequest, MIRROR_ORDERS_PATH,
+    },
+    terminal_position::{TERMINAL_POSITION_ACTION_PATH, TerminalPositionActionRequest},
 };
 
 pub(super) async fn dispatch_authenticated<R>(
@@ -61,10 +66,14 @@ where
                 | KOL_FOLLOW_LIFECYCLE_PATH
                 | KOL_TERMINAL_ACCOUNT_PATH
                 | KOL_TERMINAL_ORDER_PATH
+                | TERMINAL_POSITION_ACTION_PATH
                 | KOL_TERMINAL_CANCEL_PATH
                 | KOL_EXECUTION_STATUS_PATH
                 | GRID_INSTANCES_PATH
                 | GRID_LIFECYCLE_PATH
+                | LEADER_BOT_PATH
+                | LEADER_BOT_LIFECYCLE_PATH
+                | MIRROR_ORDERS_PATH
         )
     {
         let Some(accounts) = accounts else {
@@ -295,6 +304,26 @@ async fn account_request(
     let principal = accounts.authenticate(token.expose(), now).await?;
     match (request.method, path) {
         (Method::Get, KOL_PROFILE_PATH) => encode(&accounts.own_kol_profile(&principal).await?),
+        (Method::Get, LEADER_BOT_PATH) => encode(&accounts.leader_bot_access(&principal).await?),
+        (Method::Get, MIRROR_ORDERS_PATH) => encode(&accounts.own_mirror_orders(&principal).await?),
+        (Method::Post, LEADER_BOT_PATH) => encode(
+            &accounts
+                .create_leader_bot(
+                    &principal,
+                    decode::<LeaderBotCreateRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
+        (Method::Post, LEADER_BOT_LIFECYCLE_PATH) => encode(
+            &accounts
+                .request_leader_bot_lifecycle(
+                    &principal,
+                    decode::<LeaderBotLifecycleRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
         (Method::Get, KOL_FOLLOW_SETTINGS_PATH) => {
             encode(&accounts.follow_relation(&principal).await?)
         }
@@ -339,6 +368,15 @@ async fn account_request(
                 .enqueue_terminal_order(
                     &principal,
                     decode::<TerminalOrderRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
+        (Method::Post, TERMINAL_POSITION_ACTION_PATH) => encode(
+            &accounts
+                .enqueue_position_action(
+                    &principal,
+                    decode::<TerminalPositionActionRequest>(&request.body)?,
                     now,
                 )
                 .await?,

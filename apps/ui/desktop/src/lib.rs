@@ -3,6 +3,7 @@ mod account_client;
 mod app;
 mod chart;
 mod chart_settings;
+mod chart_trading;
 mod chart_view;
 mod client;
 mod copy_relation_view;
@@ -10,12 +11,14 @@ mod custom_indicator;
 mod execution_view;
 mod grid_view;
 mod i18n;
+mod leader_bot_view;
 #[cfg(not(target_arch = "wasm32"))]
 mod market;
 #[cfg(not(target_arch = "wasm32"))]
 mod market_client;
 mod model;
 mod order_book_view;
+mod server_connection;
 mod settings_panel;
 mod symbol_picker;
 mod terminal_feedback;
@@ -26,6 +29,7 @@ mod ui;
 mod workspace;
 
 pub use app::VenueFlowApp;
+pub use server_connection::default_control_endpoint;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{JsCast as _, prelude::*};

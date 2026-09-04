@@ -21,7 +21,7 @@
 - 新链只允许一个 `venue-executor-binance` 部署实例管理 KOL、终端与 Binance Grid 账户；账户在进程内使用独立串行队列和有界全局并发，不为每个账户启动进程、Actor、writer lease 或本地 WAL。PostgreSQL 命令账本、稳定 `clientOrderId` 和超时后的签名查单是唯一新链耐久边界。
 - 新链与冻结旧 Node 必须按 `trading_account_id` 互斥分配；同一真实账户不得同时由两条路径下单。旧账户的未决 WAL、Unknown、仓位和工件未安全收敛前不得迁入新链，也不得为推进 MVP 删除或伪造旧状态。
 - 请求结果不确定时把新链命令置为 `ReconcileRequired`，按同一 `clientOrderId` 查询订单/成交；确认前不重发。该状态只暂停对应账户的后续增险，不建立 authority、root、receipt、manifest 或事件回放体系。
-- KOL 成交复制只按 Binance 认证账户流的真实成交增量触发，并以签名 REST 补查恢复，不按页面点击或 NEW 订单触发；双向持仓必须保留 `positionSide`。平仓在领域层是只减仓意图，发送前按跟随账户同代新鲜签名持仓向下裁剪；Portfolio Margin UM Hedge Mode 的原生订单不得发送 Binance 禁止的 `reduceOnly` 参数。
+- KOL 当前按认证账户流及签名 REST 恢复的普通限价挂单事实同步，保留 GTC/PostOnly、价格和 `positionSide`；不按页面点击复制，不以市价单追补成交或仓位差异。带单机器人默认拒绝，须按用户显式授权，发送前再次验证；撤权/暂停保留原身份对账并撤销程序子单剩余量，详见 `docs/LEADER_ORDER_MIRROR.md`。平仓在领域层是只减仓意图，发送前按跟随账户同代新鲜签名持仓向下裁剪；Portfolio Margin UM Hedge Mode 的原生订单不得发送 Binance 禁止的 `reduceOnly` 参数。
 - `G:\Venue\artifacts` 仅保留冻结旧运行时的恢复工件；其未决 WAL、checkpoint、成交游标及 Unknown 事实不得删除。KOL MVP 的用户、关系、成交去重、命令和对账状态进入 PostgreSQL，不新增本地恢复 journal。
 
 ## 代码与配置

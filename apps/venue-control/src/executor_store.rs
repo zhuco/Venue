@@ -1,5 +1,8 @@
 //! PostgreSQL facts owned by the singleton executor; no local journal is created.
 
+mod terminal_positions;
+pub(crate) use terminal_positions::settle_reverse_child;
+
 use std::{collections::BTreeSet, ops::Deref, str::FromStr};
 
 use rust_decimal::Decimal;
@@ -16,6 +19,11 @@ use crate::{
     },
 };
 use venue_control_protocol::kol::ExecutorCommandState;
+
+mod activation;
+mod copy_drain;
+mod copy_targets;
+mod market;
 
 pub const MIGRATION_0022: &str = include_str!("../migrations/0022_binance_reconcile_backoff.sql");
 
@@ -105,6 +113,7 @@ pub struct PlannedCopyCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingActivation {
     pub relation_id: String,
+    pub request_id: String,
     pub revision: u64,
     pub leader_user_id: String,
     pub leader_trading_account_id: String,
@@ -159,6 +168,9 @@ impl Deref for RecoverableBinanceCommand {
 }
 
 impl PgExecutorStore {
+    pub(crate) fn mirror_pool(&self) -> &PgPool {
+        &self.pool
+    }
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -170,7 +182,7 @@ impl PgExecutorStore {
         &self,
         _now_ms: u64,
     ) -> Result<Vec<ActiveKolPrivateSource>, BinanceCommandLedgerError> {
-        let rows = sqlx::query("SELECT p.kol_user_id,p.leader_trading_account_id,ARRAY_AGG(DISTINCT symbols.value ORDER BY symbols.value) AS symbols,(SELECT c.credential_id FROM venue_api_credentials c WHERE c.user_id=p.kol_user_id AND c.trading_account_id=p.leader_trading_account_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' ORDER BY c.created_ms,c.credential_id LIMIT 1) AS credential_id,(SELECT count(*) FROM venue_api_credentials c WHERE c.user_id=p.kol_user_id AND c.trading_account_id=p.leader_trading_account_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified') AS credential_count FROM venue_kol_profiles p JOIN venue_kol_follow_relations r ON r.kol_user_id=p.kol_user_id AND r.leader_trading_account_id=p.leader_trading_account_id AND r.relation_state='active' CROSS JOIN LATERAL jsonb_array_elements_text(r.allowed_symbols) AS symbols(value) WHERE p.profile_state='enabled' GROUP BY p.kol_user_id,p.leader_trading_account_id ORDER BY p.kol_user_id")
+        let rows = sqlx::query("SELECT p.kol_user_id,p.leader_trading_account_id,ARRAY_AGG(DISTINCT symbols.value ORDER BY symbols.value) AS symbols,(SELECT c.credential_id FROM venue_api_credentials c WHERE c.user_id=p.kol_user_id AND c.trading_account_id=p.leader_trading_account_id AND c.credential_id=COALESCE((SELECT b.credential_id FROM venue_leader_bots b WHERE b.owner_user_id=p.kol_user_id),c.credential_id) AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' ORDER BY c.created_ms,c.credential_id LIMIT 1) AS credential_id,(SELECT count(*) FROM venue_api_credentials c WHERE c.user_id=p.kol_user_id AND c.trading_account_id=p.leader_trading_account_id AND c.credential_id=COALESCE((SELECT b.credential_id FROM venue_leader_bots b WHERE b.owner_user_id=p.kol_user_id),c.credential_id) AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified') AS credential_count FROM venue_kol_profiles p JOIN venue_kol_follow_relations r ON r.kol_user_id=p.kol_user_id AND r.leader_trading_account_id=p.leader_trading_account_id AND r.relation_state='active' CROSS JOIN LATERAL jsonb_array_elements_text(r.allowed_symbols) AS symbols(value) WHERE p.profile_state='enabled' GROUP BY p.kol_user_id,p.leader_trading_account_id ORDER BY p.kol_user_id")
             .fetch_all(&self.pool)
             .await
             .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
@@ -236,137 +248,7 @@ impl PgExecutorStore {
         fill: &KolSourceFill,
         now_ms: u64,
     ) -> Result<Vec<PlannedCopyCommand>, BinanceCommandLedgerError> {
-        let now = ms(now_ms)?;
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-        let inserted = sqlx::query("INSERT INTO venue_kol_source_fills (kol_trading_account_id,kol_user_id,native_symbol,native_trade_id,symbol,order_side,position_side,quantity,price,occurred_ms,observed_ms,payload_digest) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING")
-            .bind(&fill.leader_trading_account_id).bind(kol_user_id).bind(&fill.native_symbol).bind(&fill.native_trade_id)
-            .bind(&fill.symbol).bind(order_side(fill.order_side)).bind(position_side(fill.position_side))
-            .bind(fill.quantity.to_string()).bind(fill.price.to_string()).bind(ms(fill.occurred_ms)?).bind(ms(fill.observed_ms)?).bind(fill.payload_digest.as_slice())
-            .execute(&mut *tx).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-        if inserted.rows_affected() != 1 {
-            tx.commit()
-                .await
-                .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-            return Ok(Vec::new());
-        }
-        let relations = sqlx::query("SELECT r.relation_id,r.follower_user_id,r.follower_trading_account_id,r.credential_id,r.allocated_capital,r.multiplier,p.strategy_capital FROM venue_kol_follow_relations r JOIN venue_kol_profiles p ON p.kol_user_id=r.kol_user_id WHERE r.kol_user_id=$1 AND r.leader_trading_account_id=$2 AND r.relation_state='active' AND r.allowed_symbols @> jsonb_build_array($3::text) ORDER BY r.relation_id FOR UPDATE OF r")
-            .bind(kol_user_id).bind(&fill.leader_trading_account_id).bind(&fill.symbol)
-            .fetch_all(&mut *tx).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-        let mut planned = Vec::with_capacity(relations.len());
-        for relation in relations {
-            let relation_id: String = relation
-                .try_get("relation_id")
-                .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-            let owner_user_id: String = relation
-                .try_get("follower_user_id")
-                .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-            let trading_account_id: String = relation
-                .try_get("follower_trading_account_id")
-                .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-            let credential_id: String = relation
-                .try_get("credential_id")
-                .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-            let allocated = decimal(&relation, "allocated_capital")?;
-            let multiplier = decimal(&relation, "multiplier")?;
-            let strategy = decimal(&relation, "strategy_capital")?;
-            let delta = scaled_copy_quantity(fill.quantity, allocated, strategy, multiplier)?;
-            let existing = sqlx::query("SELECT target_quantity,observed_quantity,target_revision FROM venue_kol_copy_targets WHERE relation_id=$1 AND symbol=$2 AND position_side=$3 FOR UPDATE")
-                .bind(&relation_id).bind(&fill.symbol).bind(position_side(fill.position_side)).fetch_optional(&mut *tx).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-            let previous_target = existing
-                .as_ref()
-                .map(|row| decimal(row, "target_quantity"))
-                .transpose()?
-                .unwrap_or(Decimal::ZERO);
-            let observed = existing
-                .as_ref()
-                .map(|row| decimal(row, "observed_quantity"))
-                .transpose()?
-                .unwrap_or(Decimal::ZERO);
-            let previous_revision = existing
-                .as_ref()
-                .map(|row| {
-                    row.try_get::<i64, _>("target_revision")
-                        .map_err(|_| BinanceCommandLedgerError::Unavailable)
-                })
-                .transpose()?
-                .unwrap_or(0);
-            let increasing = matches!(
-                (fill.position_side, fill.order_side),
-                (
-                    venue_domain::domain::PositionSide::Long,
-                    venue_domain::domain::OrderSide::Buy
-                ) | (
-                    venue_domain::domain::PositionSide::Short,
-                    venue_domain::domain::OrderSide::Sell
-                )
-            );
-            let target = if increasing {
-                previous_target
-                    .checked_add(delta)
-                    .ok_or(BinanceCommandLedgerError::Conflict)?
-            } else {
-                previous_target.checked_sub(delta).unwrap_or(Decimal::ZERO)
-            };
-            let revision = previous_revision
-                .checked_add(1)
-                .ok_or(BinanceCommandLedgerError::Conflict)?;
-            sqlx::query("INSERT INTO venue_kol_copy_targets (relation_id,symbol,position_side,copyable_quantity,target_quantity,observed_quantity,target_revision,last_native_symbol,last_native_trade_id,dirty,updated_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,true,$10) ON CONFLICT (relation_id,symbol,position_side) DO UPDATE SET copyable_quantity=EXCLUDED.copyable_quantity,target_quantity=EXCLUDED.target_quantity,target_revision=EXCLUDED.target_revision,last_native_symbol=EXCLUDED.last_native_symbol,last_native_trade_id=EXCLUDED.last_native_trade_id,dirty=true,updated_ms=EXCLUDED.updated_ms")
-                .bind(&relation_id).bind(&fill.symbol).bind(position_side(fill.position_side)).bind(target.to_string()).bind(target.to_string()).bind(observed.to_string()).bind(revision).bind(&fill.native_symbol).bind(&fill.native_trade_id).bind(now)
-                .execute(&mut *tx).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-            let blocked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_binance_commands WHERE relation_id=$1 AND symbol=$2 AND position_side=$3 AND command_state IN ('pending','sending','accepted','reconcile_required'))")
-                .bind(&relation_id).bind(&fill.symbol).bind(position_side(fill.position_side)).fetch_one(&mut *tx).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-            if blocked || target == observed {
-                continue;
-            }
-            let account_queue_depth = lock_account_command_queue(
-                &mut *tx,
-                &owner_user_id,
-                &trading_account_id,
-                &credential_id,
-            )
-            .await?;
-            if !account_queue_has_capacity(account_queue_depth, 1) {
-                continue;
-            }
-            let opening = target > observed;
-            let command_phase = if opening { "open" } else { "close" };
-            let order_side = order_for(fill.position_side, opening);
-            let command_id = deterministic_id(
-                &relation_id,
-                &fill.symbol,
-                fill.position_side,
-                revision,
-                command_phase,
-            );
-            let requested = if opening {
-                target - observed
-            } else {
-                observed - target
-            };
-            let inserted = sqlx::query("INSERT INTO venue_binance_commands (command_id,command_origin,relation_id,relation_revision,target_revision,owner_user_id,trading_account_id,credential_id,symbol,position_side,command_phase,order_kind,order_side,requested_quantity,target_quantity,rule_version,client_order_id,command_state,source_digest,created_ms,updated_ms) SELECT $1,'copy',$2,r.revision,$3,$4,$5,$6,$7,$8,$9,'market',$10,$11,$12,'binance-pm-um-v1',$13,'pending',$14,$15,$15 FROM venue_kol_follow_relations r WHERE r.relation_id=$2 AND r.relation_state='active' ON CONFLICT DO NOTHING")
-                .bind(&command_id).bind(&relation_id).bind(revision).bind(&owner_user_id).bind(&trading_account_id).bind(&credential_id).bind(&fill.symbol).bind(position_side(fill.position_side)).bind(command_phase).bind(order_side).bind(requested.to_string()).bind(target.to_string()).bind(&command_id).bind(fill.payload_digest.as_slice()).bind(now)
-                .execute(&mut *tx).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-            if inserted.rows_affected() == 1 {
-                sqlx::query("UPDATE venue_kol_copy_targets SET dirty=false,updated_ms=$1 WHERE relation_id=$2 AND symbol=$3 AND position_side=$4 AND target_revision=$5")
-                    .bind(now).bind(&relation_id).bind(&fill.symbol).bind(position_side(fill.position_side)).bind(revision).execute(&mut *tx).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-                planned.push(PlannedCopyCommand {
-                    command_id: command_id.clone(),
-                    client_order_id: command_id,
-                    relation_id,
-                    trading_account_id,
-                    target_revision: u64::try_from(revision)
-                        .map_err(|_| BinanceCommandLedgerError::Conflict)?,
-                });
-            }
-        }
-        tx.commit()
-            .await
-            .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-        Ok(planned)
+        copy_targets::record_source_fill_and_plan(self, kol_user_id, fill, now_ms).await
     }
 
     /// Restart recovery returns the immutable identity and durable readback schedule. It
@@ -375,7 +257,7 @@ impl PgExecutorStore {
     pub async fn recover_nonterminal(
         &self,
     ) -> Result<Vec<RecoverableBinanceCommand>, BinanceCommandLedgerError> {
-        let rows = sqlx::query("SELECT command_id,command_origin,owner_user_id,trading_account_id,credential_id,symbol,order_side,position_side,requested_quantity,command_phase,order_kind,limit_price,selected_native_order_id,target_client_order_id,client_order_id,native_order_id,command_state,reconcile_attempts,next_reconcile_ms,grid_batch_id,dispatch_sequence FROM venue_binance_commands WHERE command_state IN ('pending','sending','accepted','reconcile_required') ORDER BY created_ms,COALESCE(grid_batch_id,command_id),COALESCE(dispatch_sequence,0),command_id")
+        let rows = sqlx::query("SELECT command_id,command_origin,owner_user_id,trading_account_id,credential_id,symbol,order_side,position_side,requested_quantity,command_phase,order_kind,limit_price,selected_native_order_id,target_client_order_id,client_order_id,native_order_id,command_state,reconcile_attempts,next_reconcile_ms,grid_batch_id,dispatch_sequence,copy_risk FROM venue_binance_commands WHERE command_state IN ('pending','sending','accepted','reconcile_required') ORDER BY created_ms,COALESCE(grid_batch_id,command_id),COALESCE(dispatch_sequence,0),command_id")
             .fetch_all(&self.pool).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
         rows.into_iter().map(recoverable_command).collect()
     }
@@ -421,7 +303,7 @@ impl PgExecutorStore {
                 reducing,
                 ..
             }
-            | ClaimedBinanceOrder::LimitPostOnly {
+            | ClaimedBinanceOrder::Limit {
                 side,
                 position_side,
                 reducing,
@@ -442,7 +324,7 @@ impl PgExecutorStore {
              WHERE prior.command_id<>$1 AND prior.credential_id=$2 \
                AND prior.owner_user_id=$3 AND prior.trading_account_id=$4 \
                AND prior.symbol=$5 AND prior.command_phase='close' \
-               AND prior.order_kind='limit_post_only' AND prior.order_side=$6 \
+               AND (prior.order_kind='limit_post_only' OR prior.order_kind='limit_gtc') AND prior.order_side=$6 \
                AND prior.position_side=$7 AND prior.command_state='reconciled' \
                AND prior.updated_ms>projection.observed_ms \
              ORDER BY prior.updated_ms,prior.command_id",
@@ -575,44 +457,13 @@ impl PgExecutorStore {
             .ok_or(BinanceCommandLedgerError::Conflict)
     }
 
-    /// A successful, independently signed baseline is the only path that promotes a requested
-    /// relation. The singleton owns the slot allocation transaction.
-    pub async fn complete_activation(
-        &self,
-        relation_id: &str,
-        revision: u64,
-        baseline_ms: u64,
-    ) -> Result<(), BinanceCommandLedgerError> {
-        let revision = i64::try_from(revision).map_err(|_| BinanceCommandLedgerError::Conflict)?;
-        let now = ms(baseline_ms)?;
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-        let slot: Option<i16> = sqlx::query_scalar("SELECT s::smallint FROM generate_series(1,200) s WHERE NOT EXISTS (SELECT 1 FROM venue_kol_follow_relations r WHERE r.active_slot=s) LIMIT 1")
-            .fetch_optional(&mut *tx).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-        let slot = slot.ok_or(BinanceCommandLedgerError::Conflict)?;
-        let changed = sqlx::query("UPDATE venue_kol_follow_relations r SET relation_state='active',active_slot=$1,baseline_json=$2,attention_code=NULL,updated_ms=$3 FROM venue_kol_activation_requests a WHERE r.relation_id=$4 AND a.relation_id=r.relation_id AND a.request_state='pending' AND a.relation_revision=$5 AND r.relation_state='paused' AND r.revision=$5")
-            .bind(slot).bind(json!({"baseline_ms": baseline_ms})).bind(now).bind(relation_id).bind(revision)
-            .execute(&mut *tx).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-        if changed.rows_affected() != 1 {
-            return Err(BinanceCommandLedgerError::Conflict);
-        }
-        sqlx::query("UPDATE venue_kol_activation_requests SET request_state='completed',updated_ms=$1 WHERE relation_id=$2 AND request_state='pending'")
-            .bind(now).bind(relation_id).execute(&mut *tx).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-        tx.commit()
-            .await
-            .map_err(|_| BinanceCommandLedgerError::Unavailable)
-    }
-
     /// Returns only a uniquely selected, still-verified leader credential. Ambiguous or stale
     /// credentials deliberately do not enter the executor's decryption boundary.
     pub async fn pending_activations(
         &self,
         _now_ms: u64,
     ) -> Result<Vec<PendingActivation>, BinanceCommandLedgerError> {
-        let rows = sqlx::query("SELECT a.relation_id,a.relation_revision,r.kol_user_id,r.leader_trading_account_id,r.follower_user_id,r.follower_trading_account_id,r.credential_id AS follower_credential_id,r.allowed_symbols,(SELECT c.credential_id FROM venue_api_credentials c WHERE c.user_id=r.kol_user_id AND c.trading_account_id=r.leader_trading_account_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' ORDER BY c.created_ms,c.credential_id LIMIT 1) AS leader_credential_id,(SELECT count(*) FROM venue_api_credentials c WHERE c.user_id=r.kol_user_id AND c.trading_account_id=r.leader_trading_account_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified') AS leader_credential_count FROM venue_kol_activation_requests a JOIN venue_kol_follow_relations r ON r.relation_id=a.relation_id WHERE a.request_state='pending' AND r.relation_state='paused' ORDER BY a.requested_ms,a.relation_id")
+        let rows = sqlx::query("SELECT a.relation_id,a.request_id,a.relation_revision,r.kol_user_id,r.leader_trading_account_id,r.follower_user_id,r.follower_trading_account_id,r.credential_id AS follower_credential_id,r.allowed_symbols,(SELECT c.credential_id FROM venue_api_credentials c WHERE c.user_id=r.kol_user_id AND c.trading_account_id=r.leader_trading_account_id AND c.credential_id=COALESCE((SELECT b.credential_id FROM venue_leader_bots b WHERE b.owner_user_id=r.kol_user_id),c.credential_id) AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' ORDER BY c.created_ms,c.credential_id LIMIT 1) AS leader_credential_id,(SELECT count(*) FROM venue_api_credentials c WHERE c.user_id=r.kol_user_id AND c.trading_account_id=r.leader_trading_account_id AND c.credential_id=COALESCE((SELECT b.credential_id FROM venue_leader_bots b WHERE b.owner_user_id=r.kol_user_id),c.credential_id) AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified') AS leader_credential_count FROM venue_kol_activation_requests a JOIN venue_kol_follow_relations r ON r.relation_id=a.relation_id WHERE a.request_state='pending' AND r.relation_state='paused' ORDER BY a.requested_ms,a.relation_id")
             .fetch_all(&self.pool).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
         let mut pending = Vec::with_capacity(rows.len());
         for row in rows {
@@ -642,6 +493,9 @@ impl PgExecutorStore {
             pending.push(PendingActivation {
                 relation_id: row
                     .try_get("relation_id")
+                    .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
+                request_id: row
+                    .try_get("request_id")
                     .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
                 revision: u64::try_from(
                     row.try_get::<i64, _>("relation_revision")
@@ -675,18 +529,18 @@ impl PgExecutorStore {
 
     pub async fn reject_activation(
         &self,
-        relation_id: &str,
+        activation: &PendingActivation,
         now_ms: u64,
         reason: &str,
     ) -> Result<(), BinanceCommandLedgerError> {
         if reason.is_empty() || reason.len() > 64 {
             return Err(BinanceCommandLedgerError::Conflict);
         }
-        let changed = sqlx::query("UPDATE venue_kol_activation_requests SET request_state='rejected',sanitized_reason=$1,updated_ms=$2 WHERE relation_id=$3 AND request_state='pending'")
-            .bind(reason).bind(ms(now_ms)?).bind(relation_id).execute(&self.pool).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
-        (changed.rows_affected() == 1)
-            .then_some(())
-            .ok_or(BinanceCommandLedgerError::Conflict)
+        sqlx::query("UPDATE venue_kol_activation_requests SET request_state='rejected',sanitized_reason=$1,updated_ms=$2 WHERE relation_id=$3 AND request_id=$4 AND relation_revision=$5 AND request_state='pending'")
+            .bind(reason).bind(ms(now_ms)?).bind(&activation.relation_id)
+            .bind(&activation.request_id).bind(ms(activation.revision)?)
+            .execute(&self.pool).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+        Ok(())
     }
 }
 
@@ -884,6 +738,7 @@ mod tests {
         let command = RecoverableBinanceCommand {
             command: ClaimedBinanceCommand {
                 origin: venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
+                copy_risk: None,
                 command_id: "command".into(),
                 owner_user_id: "owner".into(),
                 trading_account_id: "account".into(),

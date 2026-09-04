@@ -5,6 +5,10 @@ use venue_control_protocol::kol::{
     ExecutorCommandSummary, KOL_TERMINAL_CANCEL_PATH, KOL_TERMINAL_ORDER_PATH,
     TerminalCancelRequest, TerminalOrderRequest,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use venue_control_protocol::terminal_position::{
+    TERMINAL_POSITION_ACTION_PATH, TerminalPositionActionRequest,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn start_native(
@@ -15,9 +19,26 @@ pub(super) fn start_native(
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     orders: crossbeam_channel::Receiver<TerminalOrderRequest>,
     cancellations: crossbeam_channel::Receiver<TerminalCancelRequest>,
+    positions: crossbeam_channel::Receiver<TerminalPositionActionRequest>,
 ) {
     tokio::spawn(async move {
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
+            for request in positions.try_iter().take(1) {
+                if submit(
+                    &client,
+                    &endpoint,
+                    &sender,
+                    &context,
+                    TERMINAL_POSITION_ACTION_PATH,
+                    &request.request_id,
+                    &request,
+                    "持仓操作",
+                )
+                .await
+                {
+                    return;
+                }
+            }
             for request in orders.try_iter().take(32) {
                 if submit(
                     &client,
@@ -90,6 +111,7 @@ async fn submit<T: serde::Serialize>(
                     context,
                     ClientEvent::TerminalSubmissionUnavailable {
                         request_id: request_id.into(),
+                        definitely_not_submitted: false,
                         message: format!(
                             "{label} 回执无效，结果尚未确认；请核对历史委托，不要重复下单 [invalid_receipt]"
                         ),
@@ -104,6 +126,7 @@ async fn submit<T: serde::Serialize>(
                 context,
                 ClientEvent::TerminalSubmissionUnavailable {
                     request_id: request_id.into(),
+                    definitely_not_submitted: true,
                     message: crate::terminal_feedback::http_error(
                         401,
                         br#"{"code":"unauthorized"}"#,
@@ -121,6 +144,7 @@ async fn submit<T: serde::Serialize>(
                 context,
                 ClientEvent::TerminalSubmissionUnavailable {
                     request_id: request_id.into(),
+                    definitely_not_submitted: (400..500).contains(&status) && status != 408,
                     message: crate::terminal_feedback::http_error(status, &body),
                 },
             );
@@ -132,6 +156,7 @@ async fn submit<T: serde::Serialize>(
                 context,
                 ClientEvent::TerminalSubmissionUnavailable {
                     request_id: request_id.into(),
+                    definitely_not_submitted: false,
                     message: format!(
                         "{label} {}；结果尚未确认，请核对历史委托，不要重复下单 [{}]",
                         if error.is_timeout() {

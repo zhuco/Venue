@@ -31,7 +31,7 @@ impl Behavior<Pane> for PaneBehavior<'_> {
     fn pane_ui(&mut self, ui: &mut egui::Ui, _tile_id: TileId, pane: &mut Pane) -> UiResponse {
         theme::panel_frame().show(ui, |ui| match pane.kind {
             PaneKind::MarketWatch => show_market_watch(ui, self.model),
-            PaneKind::Chart => show_chart(ui, pane, self.model),
+            PaneKind::Chart => show_chart(ui, pane, self.model, self.client),
             PaneKind::OrderBook => show_order_book(ui, pane, self.model),
             PaneKind::TradeTape => show_trade_tape(ui, pane, self.model),
             PaneKind::Accounts => show_accounts(ui, self.model),
@@ -544,7 +544,7 @@ fn show_market_watch(ui: &mut egui::Ui, model: &mut AppModel) {
             });
     });
 }
-fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
+fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: &ControlClient) {
     let language = model.preferences.language;
     let settings_key = pane.settings_key();
     #[cfg(not(target_arch = "wasm32"))]
@@ -588,6 +588,18 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
     let highlighted_price = (symbol == model.preferences.selected_symbol)
         .then(|| model.trade_dock.highlighted_price(ui.ctx()))
         .flatten();
+    crate::chart_trading::quick_order(ui, model, client, &symbol, &pane.trading_display);
+    if pane.trading_display.alerts {
+        crate::chart_trading::show_alerts(ui, model, &symbol);
+    }
+    if pane.trading_display.liquidation {
+        ui.weak(if language == Language::SimplifiedChinese {
+            "暂无强平价数据"
+        } else {
+            "Liquidation price unavailable"
+        });
+    }
+    let overlays = crate::chart_trading::collect(model, &symbol, &pane.trading_display);
     #[cfg(not(target_arch = "wasm32"))]
     if let Ok(selection) = MarketSelection::binance_usd_m(&symbol, pane.interval)
         && let Err(error) =
@@ -613,7 +625,15 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
                 settings.clone(),
             ),
             model.preferences.trading.chart_cadence,
-            || (local.bars.clone(), local.studies.clone(), local.last),
+            || {
+                (
+                    local.bars.clone(),
+                    local.studies.clone(),
+                    local.last,
+                    local.bid,
+                    local.ask,
+                )
+            },
         );
         let selected_price = crate::chart_view::candle_plot(
             ui,
@@ -626,6 +646,9 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
             pane.interval,
             chart.2,
             highlighted_price,
+            &pane.trading_display,
+            &overlays,
+            (chart.3, chart.4),
         );
         let selection = local.selection.clone();
         let near_start = pane.viewport.right_offset() > 0
@@ -685,7 +708,7 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
             market.bars.len(),
         ),
         model.preferences.trading.chart_cadence,
-        || (market.bars.clone(), market.last),
+        || (market.bars.clone(), market.last, market.bid, market.ask),
     );
     let selected_price = crate::chart_view::candle_plot(
         ui,
@@ -698,6 +721,9 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel) {
         pane.interval,
         Some(chart.1),
         highlighted_price,
+        &pane.trading_display,
+        &overlays,
+        (Some(chart.2), Some(chart.3)),
     );
     if let Some(price) = selected_price {
         model.select_trading_price(&symbol, price, ui.ctx());
@@ -731,6 +757,7 @@ fn show_chart_toolbar(
                 pane.viewport.reset();
             }
         }
+        crate::chart_trading::menu_button(ui, &mut pane.trading_display, language);
         ui.separator();
         if ui.small_button(text(language, TextKey::Fit)).clicked() {
             pane.viewport.reset();

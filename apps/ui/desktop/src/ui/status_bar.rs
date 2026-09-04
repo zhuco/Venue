@@ -33,6 +33,21 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
     } else {
         TextKey::Stale
     };
+    let node_status = if account_id.is_some() && model.execution.private_error.is_some() {
+        match language {
+            crate::i18n::Language::SimplifiedChinese => "账户刷新失败",
+            crate::i18n::Language::English => "Account refresh failed",
+        }
+    } else if private_projection
+        .is_some_and(|projection| projection.observed_ms > now.saturating_add(2_000))
+    {
+        match language {
+            crate::i18n::Language::SimplifiedChinese => "本机与服务器时钟不一致",
+            crate::i18n::Language::English => "Client/server clock mismatch",
+        }
+    } else {
+        text(language, node_key)
+    };
     let mut node_hint = match language {
         crate::i18n::Language::SimplifiedChinese => {
             "交易连接与账户资金统一依据选中账户的 Binance Executor 签名私有投影。"
@@ -45,6 +60,23 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
     };
     if let Some(error) = &model.last_error {
         node_hint.push_str(&format!("\n{error}"));
+    }
+    if let Some(error) = &model.execution.private_error {
+        node_hint.push_str(&format!("\n{error}"));
+    }
+    if let Some(projection) = private_projection {
+        node_hint.push_str(&match language {
+            crate::i18n::Language::SimplifiedChinese => format!(
+                "\n服务器账户事实距今 {:.1} 秒；桌面上次接收距今 {:.1} 秒。超过 15 秒视为过期。",
+                now.saturating_sub(projection.observed_ms) as f64 / 1000.0,
+                now.saturating_sub(model.execution.private_received_ms()) as f64 / 1000.0,
+            ),
+            crate::i18n::Language::English => format!(
+                "\nServer facts age: {:.1}s; last desktop receipt: {:.1}s ago. Stale after 15s.",
+                now.saturating_sub(projection.observed_ms) as f64 / 1000.0,
+                now.saturating_sub(model.execution.private_received_ms()) as f64 / 1000.0,
+            ),
+        });
     }
     if let Some(receipt) = model.last_terminal_receipt() {
         node_hint.push_str(&format!(
@@ -112,7 +144,17 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
                                 width * 0.40,
                                 format!("● Binance {} · {delay}", text(language, status)),
                                 if live { theme::BUY } else { theme::WARNING },
-                                text(language, TextKey::MarketDelayHint),
+                                &market
+                                    .and_then(|view| view.status_detail.as_deref())
+                                    .map_or_else(
+                                        || text(language, TextKey::MarketDelayHint).to_owned(),
+                                        |detail| {
+                                            format!(
+                                                "{}\n{detail}",
+                                                text(language, TextKey::MarketDelayHint)
+                                            )
+                                        },
+                                    ),
                             );
                         }
                         #[cfg(target_arch = "wasm32")]
@@ -143,6 +185,17 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
                                 },
                                 theme::WARNING,
                             ),
+                            (false, true, _) => (
+                                match language {
+                                    crate::i18n::Language::SimplifiedChinese => {
+                                        "Control 快照重连 · SSE 在线".to_owned()
+                                    }
+                                    crate::i18n::Language::English => {
+                                        "Control snapshot retry · SSE online".to_owned()
+                                    }
+                                },
+                                theme::WARNING,
+                            ),
                             (false, _, ConnectionState::Connecting) => (
                                 format!("Control {}", text(language, TextKey::Connecting)),
                                 theme::WARNING,
@@ -168,6 +221,9 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
                                 }
                             });
                         }
+                        if let Some(error) = &model.last_error {
+                            control_hint.push_str(&format!("\n{error}"));
+                        }
                         status_text(ui, width * 0.22, control_label, color, &control_hint);
                         status_text(
                             ui,
@@ -175,7 +231,7 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
                             format!(
                                 "{}: {}",
                                 text(language, TextKey::TradeConnection),
-                                text(language, node_key)
+                                node_status
                             ),
                             if node_key == TextKey::Healthy {
                                 theme::BUY

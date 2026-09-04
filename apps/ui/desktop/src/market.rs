@@ -155,6 +155,8 @@ pub struct LocalMarketReducer {
     studies: ChartStudyEngine,
     study_config: ChartStudyConfig,
     forming_bar: Option<PublicBar>,
+    last_price_event_ms: u64,
+    last_bar_event_ms: u64,
 }
 
 impl LocalMarketReducer {
@@ -180,6 +182,8 @@ impl LocalMarketReducer {
                 .map_err(LocalMarketError::Indicator)?,
             study_config,
             forming_bar: None,
+            last_price_event_ms: 0,
+            last_bar_event_ms: 0,
         })
     }
 
@@ -202,6 +206,8 @@ impl LocalMarketReducer {
         self.closed_facts.clear();
         self.studies.reset();
         self.forming_bar = None;
+        self.last_price_event_ms = 0;
+        self.last_bar_event_ms = 0;
         Ok(generation)
     }
 
@@ -229,7 +235,7 @@ impl LocalMarketReducer {
                 bar,
                 study_bar,
                 closed,
-            } => self.apply_bar(bar, *study_bar, closed)?,
+            } => self.apply_bar(bar, *study_bar, closed, envelope.event_time_ms)?,
             MarketPayload::BookSnapshot { bids, asks } => self.apply_book(bids, asks)?,
             MarketPayload::Bbo { bid, ask } => self.apply_bbo(bid, ask)?,
             MarketPayload::Trade(trade) => self.apply_trade(trade)?,
@@ -295,14 +301,20 @@ impl LocalMarketReducer {
             self.closed_facts.pop_first();
         }
         self.view.last = self.view.bars.last().map(|bar| bar.close);
+        self.last_price_event_ms = self
+            .closed_facts
+            .last_key_value()
+            .map_or(0, |(_, bar)| bar.close_time_ms);
+        self.last_bar_event_ms = 0;
         Ok(())
     }
 
     fn apply_bar(
         &mut self,
-        bar: UiBar,
-        study_bar: PublicBar,
+        mut bar: UiBar,
+        mut study_bar: PublicBar,
         closed: bool,
+        event_time_ms: u64,
     ) -> Result<(), LocalMarketError> {
         validate_bar(&bar, self.view.selection.interval)?;
         validate_study_bar(&study_bar, &self.view.selection)?;
@@ -311,6 +323,36 @@ impl LocalMarketReducer {
         }
         if self.closed_bars.contains(&bar.open_time_ms) && !closed {
             return Ok(());
+        }
+        if !closed && event_time_ms < self.last_bar_event_ms {
+            return Ok(());
+        }
+        if !closed {
+            self.last_bar_event_ms = event_time_ms;
+            // Kline and aggregate trades arrive independently. Preserve newer prints in
+            // the forming preview without counting their volume a second time.
+            for trade in &self.view.trades {
+                if trade.occurred_ms > event_time_ms
+                    && trade.occurred_ms >= bar.open_time_ms
+                    && trade.occurred_ms
+                        < bar
+                            .open_time_ms
+                            .saturating_add(self.view.selection.interval.duration_ms())
+                {
+                    apply_print_to_bar(&mut study_bar, trade.price)?;
+                }
+            }
+            bar = ui_bar_from_public(&study_bar)?;
+        }
+        if event_time_ms >= self.last_price_event_ms
+            && self
+                .view
+                .bars
+                .last()
+                .is_none_or(|latest| bar.open_time_ms >= latest.open_time_ms)
+        {
+            self.view.last = Some(bar.close);
+            self.last_price_event_ms = event_time_ms;
         }
         if closed {
             if self
@@ -356,7 +398,6 @@ impl LocalMarketReducer {
                 },
             );
         }
-        self.view.last = Some(bar.close);
         upsert_bar(&mut self.view.bars, bar);
         while self.closed_facts.len() > MAX_BARS {
             self.closed_facts.pop_first();
@@ -367,6 +408,7 @@ impl LocalMarketReducer {
     }
 
     fn rebuild_studies_and_bars(&mut self) -> Result<(), LocalMarketError> {
+        let live_price = self.view.last;
         self.studies = ChartStudyEngine::with_config(&self.study_config)
             .map_err(LocalMarketError::Indicator)?;
         self.view.studies.clear();
@@ -390,8 +432,14 @@ impl LocalMarketReducer {
         trim_bars(&mut self.view.bars, &mut self.closed_bars);
         trim_studies(&mut self.view.studies);
         if let Some(forming) = self.forming_bar.clone() {
-            self.apply_bar(ui_bar_from_public(&forming)?, forming, false)?;
+            self.apply_bar(
+                ui_bar_from_public(&forming)?,
+                forming,
+                false,
+                self.last_bar_event_ms,
+            )?;
         }
+        self.view.last = live_price.or(self.view.last);
         Ok(())
     }
 
@@ -453,7 +501,30 @@ impl LocalMarketReducer {
         {
             return Ok(());
         }
-        self.view.last = Some(trade.price);
+        if trade.occurred_ms >= self.last_price_event_ms {
+            if let Some(mut forming) = self.forming_bar.clone()
+                && trade.occurred_ms >= forming.open_time_ms
+                && trade.occurred_ms <= forming.close_time_ms
+            {
+                apply_print_to_bar(&mut forming, trade.price)?;
+                let values = self
+                    .studies
+                    .preview(&forming)
+                    .map_err(LocalMarketError::Indicator)?;
+                upsert_bar(&mut self.view.bars, ui_bar_from_public(&forming)?);
+                upsert_study(
+                    &mut self.view.studies,
+                    ChartStudyPoint {
+                        open_time_ms: forming.open_time_ms,
+                        confirmed: false,
+                        ..study_point(values)
+                    },
+                );
+                self.forming_bar = Some(forming);
+            }
+            self.view.last = Some(trade.price);
+            self.last_price_event_ms = trade.occurred_ms;
+        }
         self.view.trades.push(trade);
         self.view.trades.sort_by(|left, right| {
             left.occurred_ms
@@ -749,6 +820,14 @@ fn validate_study_bar(
     Ok(())
 }
 
+fn apply_print_to_bar(bar: &mut PublicBar, price: Decimal) -> Result<(), LocalMarketError> {
+    let price = venue_domain::Price::new(price).map_err(|_| LocalMarketError::InvalidTrade)?;
+    bar.close = price;
+    bar.high = bar.high.max(price);
+    bar.low = bar.low.min(price);
+    Ok(())
+}
+
 fn ui_bar_from_public(bar: &PublicBar) -> Result<UiBar, LocalMarketError> {
     let FieldState::Known(volume) = bar.base_volume else {
         return Err(LocalMarketError::InvalidBar);
@@ -978,6 +1057,76 @@ mod tests {
         );
         assert_eq!(selection("btcusdt"), Err(LocalMarketError::InvalidSymbol));
         assert_eq!(selection("BTC/USD"), Err(LocalMarketError::InvalidBinding));
+        Ok(())
+    }
+
+    #[test]
+    fn live_prints_update_candle_shape_color_and_price_together() -> Result<(), LocalMarketError> {
+        let mut reducer = LocalMarketReducer::new(selection("BTC/USDT")?)?;
+        reducer.apply(envelope(
+            &reducer,
+            120_000,
+            MarketPayload::RestHistory {
+                bars: vec![study_bar(60_000, 100)?],
+            },
+        ))?;
+        let forming = study_bar(120_000, 101)?;
+        reducer.apply(envelope(
+            &reducer,
+            120_100,
+            MarketPayload::WsBar {
+                bar: ui_bar_from_public(&forming)?,
+                study_bar: Box::new(forming.clone()),
+                closed: false,
+            },
+        ))?;
+        let before = reducer.view().bars[0].clone();
+        for (time, price) in [(120_200, 105), (120_300, 95)] {
+            reducer.apply(envelope(
+                &reducer,
+                time,
+                MarketPayload::Trade(UiTrade {
+                    trade_id: time.to_string(),
+                    occurred_ms: time,
+                    price: Decimal::from(price),
+                    quantity: Decimal::ONE,
+                    aggressor: AggressorSide::Buy,
+                }),
+            ))?;
+            let candle = &reducer.view().bars[1];
+            assert_eq!(candle.close, Decimal::from(price));
+            assert_eq!(reducer.view().last, Some(candle.close));
+            assert_eq!(candle.close >= candle.open, price > 100);
+            assert_eq!(candle.high, Decimal::from(105));
+            assert_eq!(candle.volume, Decimal::from(10));
+            assert_eq!(reducer.view().bars[0], before);
+        }
+        assert_eq!(reducer.view().bars[1].low, Decimal::from(95));
+        // A lagging kline must not revert a newer trade, body or wick.
+        reducer.apply(envelope(
+            &reducer,
+            120_150,
+            MarketPayload::WsBar {
+                bar: ui_bar_from_public(&forming)?,
+                study_bar: Box::new(forming),
+                closed: false,
+            },
+        ))?;
+        assert_eq!(reducer.view().bars[1].close, Decimal::from(95));
+        assert_eq!(reducer.view().bars[1].high, Decimal::from(105));
+        reducer.apply(envelope(
+            &reducer,
+            120_310,
+            MarketPayload::Trade(UiTrade {
+                trade_id: "late".into(),
+                occurred_ms: 120_250,
+                price: Decimal::from(104),
+                quantity: Decimal::ONE,
+                aggressor: AggressorSide::Buy,
+            }),
+        ))?;
+        assert_eq!(reducer.view().last, Some(Decimal::from(95)));
+        assert_eq!(reducer.view().bars[1].close, Decimal::from(95));
         Ok(())
     }
 
