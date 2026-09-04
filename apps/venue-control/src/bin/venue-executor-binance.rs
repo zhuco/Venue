@@ -363,6 +363,9 @@ async fn run_projection_supervisor(
                         worker_id,
                         healthy,
                     );
+                    if current && !healthy {
+                        let _ = projection_store.invalidate_stream(&credential_id).await;
+                    }
                     let _ = completion.send(current && healthy);
                 }
                 Some(ProjectionMessage::Stopped { credential_id, worker_id }) => {
@@ -399,7 +402,11 @@ async fn run_projection_supervisor(
                     let in_flight = workers.get(&id).is_some_and(|worker| worker.persistence_in_flight);
                     hot_dispatch.invalidate_credential(&id);
                     if let Some(worker) = workers.get(&id) { let _ = worker.stop.send(true); }
-                    if !in_flight { workers.remove(&id); }
+                    if !in_flight {
+                        let _ = projection_store.invalidate_stream(&id).await;
+                        let _ = grid_signal.try_send(GridPrivateStreamSignal::Invalidate { credential_id: id.clone() });
+                        workers.remove(&id);
+                    }
                 }
                 for (credential_id, source) in active_by_id {
                     if workers.get(&credential_id).is_some_and(|worker| same_subscription(&worker.source, &source)) { continue; }
@@ -408,7 +415,12 @@ async fn run_projection_supervisor(
                         if let Some(worker) = workers.get(&credential_id) { let _ = worker.stop.send(true); }
                         continue;
                     }
-                    if let Some(worker) = workers.remove(&credential_id) { let _ = worker.stop.send(true); }
+                    if let Some(worker) = workers.remove(&credential_id) {
+                        let _ = worker.stop.send(true);
+                        hot_dispatch.invalidate_credential(&credential_id);
+                        let _ = projection_store.invalidate_stream(&credential_id).await;
+                        let _ = grid_signal.try_send(GridPrivateStreamSignal::Invalidate { credential_id: credential_id.clone() });
+                    }
                     let Ok(credentials) = secrets.credentials(&source.credential_id, &source.owner_user_id).await else { continue; };
                     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
                     let (reconcile_tx, reconcile_rx) = std::sync::mpsc::sync_channel(1);
