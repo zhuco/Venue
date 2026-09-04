@@ -13,11 +13,11 @@ use venue_control_protocol::{
     kol::{TerminalAccountProjection, TerminalPositionMode},
 };
 use venue_domain::domain::{FieldState, PositionSide, Price};
-use venue_gateway_binance::{BinanceGridBootstrapMarketFacts, BinancePrivateFillEvent};
+use venue_gateway_binance::{BinanceGridReferenceFacts, BinancePrivateFillEvent};
 use venue_strategies::hedged_grid::{
-    GridBestBook, GridCloseReservations, GridConvergenceFacts, GridInstrumentLimits, GridMakerFill,
+    GridCloseReservations, GridConvergenceFacts, GridInstrumentLimits, GridMakerFill,
     GridOrderIntent, GridOrderKey, GridPlanDirective, GridPlanner, GridPlannerControl,
-    GridPlannerInput,
+    GridPlannerInput, GridReferencePrice,
 };
 
 use super::{
@@ -40,6 +40,10 @@ const MAX_CACHED_STREAM_FILLS: usize = 64;
 
 #[derive(Debug)]
 pub enum GridPrivateStreamSignal {
+    ProjectionReady {
+        credential_id: String,
+        completion: oneshot::Sender<bool>,
+    },
     Fill {
         source: ActiveProjectionSource,
         event: BinancePrivateFillEvent,
@@ -81,12 +85,16 @@ pub(super) struct GridHotPathState {
     command_wake: CommandWake,
     dispatch_cache: crate::GridHotDispatchCache,
     records: BTreeMap<String, GridRuntimeRecord>,
-    markets: BTreeMap<String, BinanceGridBootstrapMarketFacts>,
-    conversions: BTreeMap<String, venue_gateway_binance::portfolio::UsdConversionEvidence>,
+    markets: BTreeMap<String, BinanceGridReferenceFacts>,
     streams: BTreeMap<String, GridStreamCache>,
 }
 
 impl GridHotPathState {
+    pub(super) fn recent_stream(&self, instance_id: &str, now: u64, max_age: u64) -> bool {
+        self.streams.get(instance_id).is_some_and(|cache| {
+            cache.last_received_ms <= now && now - cache.last_received_ms <= max_age
+        })
+    }
     pub(super) fn new(
         receiver: Option<mpsc::Receiver<GridPrivateStreamSignal>>,
         recovery_requests: Option<mpsc::Sender<String>>,
@@ -100,7 +108,6 @@ impl GridHotPathState {
             dispatch_cache,
             records: BTreeMap::new(),
             markets: BTreeMap::new(),
-            conversions: BTreeMap::new(),
             streams: BTreeMap::new(),
         }
     }
@@ -124,11 +131,7 @@ impl GridHotPathState {
         });
     }
 
-    pub(super) fn cache_market(
-        &mut self,
-        instance_id: String,
-        facts: BinanceGridBootstrapMarketFacts,
-    ) {
+    pub(super) fn cache_market(&mut self, instance_id: String, facts: BinanceGridReferenceFacts) {
         let changed_credential = self
             .markets
             .get(&instance_id)
@@ -143,14 +146,6 @@ impl GridHotPathState {
 
     pub(super) fn wake_commands(&self) {
         self.command_wake.wake();
-    }
-
-    pub(super) fn cache_conversion(
-        &mut self,
-        instance: String,
-        conversion: venue_gateway_binance::portfolio::UsdConversionEvidence,
-    ) {
-        self.conversions.insert(instance, conversion);
     }
 
     fn invalidate_credential(&mut self, credential_id: &str) {
@@ -183,6 +178,49 @@ pub(super) async fn receive_private_signal(
 }
 
 impl BinanceGridRuntime {
+    /// Fold only the already acknowledged live surface. No market/equity HTTP or new orders
+    /// may run while the private receiver waits for its new baseline to be installed.
+    async fn settle_stream_projection(
+        &mut self,
+        credential_id: &str,
+    ) -> Result<(), BinanceGridRuntimeError> {
+        let records = self.store.list_runtime_instances().await?;
+        for record in records.iter().filter(|record| {
+            record.instance.credential_id == credential_id
+                && record.instance.state == GridInstanceState::Running
+        }) {
+            let projection = self
+                .projections
+                .load_owned(&record.owner_user_id, credential_id)
+                .await?
+                .ok_or(BinanceGridRuntimeError::PrivateProjection)?;
+            let owners = self
+                .store
+                .load_owned_orders(&record.instance.instance_id)
+                .await?;
+            let actual = self
+                .synchronize_actual_surface(record, &projection, owners, now_ms()?)
+                .await?;
+            let Some(desired) = self
+                .store
+                .load_desired_orders(&record.instance.instance_id)
+                .await?
+            else {
+                continue;
+            };
+            if surface_is_exact(&desired, &actual)? && record.instance.dirty {
+                self.finish_reconcile(
+                    record,
+                    &projection,
+                    &desired,
+                    super::ReconcileResult::Converged,
+                    now_ms()?,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
     pub(super) async fn handle_private_signal(
         &mut self,
         signal: GridPrivateStreamSignal,
@@ -190,6 +228,18 @@ impl BinanceGridRuntime {
         deferred: &mut VecDeque<GridPrivateStreamSignal>,
     ) {
         let (source, mut events) = match signal {
+            GridPrivateStreamSignal::ProjectionReady {
+                credential_id,
+                completion,
+            } => {
+                self.hot_path.invalidate_credential(&credential_id);
+                let healthy = self.settle_stream_projection(&credential_id).await.is_ok();
+                if let Ok(records) = self.store.list_runtime_instances().await {
+                    self.hot_path.replace_records(&records);
+                }
+                let _ = completion.send(healthy);
+                return;
+            }
             GridPrivateStreamSignal::Fill { source, event } => (source, vec![event]),
             GridPrivateStreamSignal::FillBatch {
                 source,
@@ -393,12 +443,17 @@ impl BinanceGridRuntime {
             .get(&record.instance.instance_id)
             .cloned()
             .ok_or(BinanceGridRuntimeError::Market)?;
-        if market.observed_at_ms > now
-            || now.saturating_sub(market.observed_at_ms)
-                > record.instance.config.reset_policy.stale_market_ms
-        {
-            return Err(BinanceGridRuntimeError::Market);
-        }
+        let reference_event = events
+            .iter()
+            .max_by_key(|event| event.fill.exchange_time_ms)
+            .ok_or(BinanceGridRuntimeError::Facts)?;
+        let reference_price = GridReferencePrice {
+            price: reference_event.fill.price,
+            observed_at_ms: reference_event
+                .fill
+                .exchange_time_ms
+                .ok_or(BinanceGridRuntimeError::Facts)?,
+        };
 
         let (
             baseline,
@@ -437,7 +492,7 @@ impl BinanceGridRuntime {
             }
             let projection = self
                 .projections
-                .load_owned(&record.owner_user_id, &record.instance.credential_id)
+                .load_healthy_owned(&record.owner_user_id, &record.instance.credential_id)
                 .await?
                 .ok_or(BinanceGridRuntimeError::PrivateProjection)?;
             let desired = self
@@ -467,8 +522,11 @@ impl BinanceGridRuntime {
             || baseline.private_generation != private_generation
             || baseline.position_mode != TerminalPositionMode::Hedge
             || baseline.observed_ms > now
-            || now.saturating_sub(baseline.observed_ms)
-                > record.instance.config.reset_policy.stale_private_ms
+            || events.iter().any(|event| {
+                event.received_at_ms > now
+                    || now.saturating_sub(event.received_at_ms)
+                        > record.instance.config.reset_policy.stale_private_ms
+            })
             || !desired_valid_for_market(&record, &prior, &market)
         {
             return Err(BinanceGridRuntimeError::Facts);
@@ -485,9 +543,6 @@ impl BinanceGridRuntime {
         if fresh_events.is_empty() {
             return Ok(());
         }
-        if seen.len().saturating_add(fresh_events.len()) > MAX_CACHED_STREAM_FILLS {
-            return Err(BinanceGridRuntimeError::Facts);
-        }
         let first_received_ms = fresh_events
             .iter()
             .map(|event| event.received_at_ms)
@@ -498,37 +553,29 @@ impl BinanceGridRuntime {
         if !projected_continuation && !surface_is_exact(&prior, &baseline_actual)? {
             return Err(BinanceGridRuntimeError::SurfaceConflict);
         }
-        let overlaid =
+        let mut overlaid =
             super::stream_overlay::apply_stream_overlay(&record, &baseline, &owners, &fresh_events)
                 .map_err(|_| BinanceGridRuntimeError::Facts)?;
+        for position in overlaid
+            .projection
+            .positions
+            .iter_mut()
+            .filter(|position| position.symbol == record.instance.symbol)
+        {
+            position.mark_price = Some(reference_price.price.value());
+        }
         if overlaid.latest_event_ms > now {
             return Err(BinanceGridRuntimeError::Clock);
         }
         let mut actual = actual_surface(&record, &overlaid.projection, &overlaid.owners)?;
         self.add_command_reservations(&record, &overlaid.projection, &mut actual)
             .await?;
-        let private = private_facts(&record, &overlaid.projection, &actual)?;
-        let risk = if record.instance.config.profit_reduction.enabled {
-            let conversion = self
-                .hot_path
-                .conversions
-                .get(&record.instance.instance_id)
-                .filter(|conversion| {
-                    conversion.private_generation == private_generation
-                        && conversion.observed_at_ms <= now
-                        && now.saturating_sub(conversion.observed_at_ms)
-                            <= record.instance.config.reset_policy.stale_market_ms
-                })
-                .ok_or(BinanceGridRuntimeError::Market)?;
-            Some(Self::risk_from_conversion(
-                &record,
-                &overlaid.projection,
-                &private,
-                conversion.clone(),
-            )?)
-        } else {
-            None
-        };
+        let mut private = private_facts(&record, &overlaid.projection, &actual)?;
+        private.inventory.private_observed_at_ms = overlaid.latest_event_ms;
+        // Settle execution-driven rolling first. Profit reduction is evaluated by the cold
+        // supervisor against a fresh PM equity read; it must not gate ordinary replenishment.
+        let mut config = planner_config(&record)?;
+        config.profit_reduction = None;
         let unallocated = self
             .store
             .load_unallocated_fills(&record.instance.instance_id, 0, MAX_FILL_BATCH)
@@ -552,7 +599,7 @@ impl BinanceGridRuntime {
             )
         };
         let plan = GridPlanner::plan(&GridPlannerInput {
-            config: planner_config(&record)?,
+            config,
             instrument: market
                 .rules
                 .metadata()
@@ -565,11 +612,8 @@ impl BinanceGridRuntime {
                 maximum_price: Price::new(market.rules.maximum_price)
                     .map_err(|_| BinanceGridRuntimeError::Facts)?,
             },
-            book: GridBestBook {
-                bid: market.bid,
-                ask: market.ask,
-                observed_at_ms: market.observed_at_ms,
-            },
+            book: None,
+            reference_price: Some(reference_price),
             inventory: private.inventory,
             owned_orders: projected_orders,
             maker_fills,
@@ -585,7 +629,7 @@ impl BinanceGridRuntime {
                 pending_since_ms: None,
                 consecutive_failures: 0,
             },
-            risk,
+            risk: None,
             control: GridPlannerControl::Run,
             now_ms: now,
         })
@@ -730,13 +774,8 @@ impl BinanceGridRuntime {
         if committed.receipt.command_count != 0 {
             // The durable batch already exists.  Token publication is only an acceleration, so
             // no local clock arithmetic may skip the command wake after commit.
-            let valid_until_ms = signed_observed_ms
-                .saturating_add(record.instance.config.reset_policy.stale_private_ms)
-                .min(
-                    market
-                        .observed_at_ms
-                        .saturating_add(record.instance.config.reset_policy.stale_market_ms),
-                );
+            let valid_until_ms = first_received_ms
+                .saturating_add(record.instance.config.reset_policy.stale_private_ms);
             let _ = self
                 .hot_path
                 .dispatch_cache
@@ -781,6 +820,14 @@ impl BinanceGridRuntime {
         }
         for event in &fresh_events {
             seen.insert(event.fill.fill_id.clone(), event.clone());
+        }
+        while seen.len() > MAX_CACHED_STREAM_FILLS {
+            let oldest = seen
+                .iter()
+                .min_by_key(|(_, event)| event.received_at_ms)
+                .map(|(id, _)| id.clone())
+                .ok_or(BinanceGridRuntimeError::Facts)?;
+            seen.remove(&oldest);
         }
         provisional_clients.extend(placed_clients);
         pending_cancel_targets.extend(cancelled_clients);

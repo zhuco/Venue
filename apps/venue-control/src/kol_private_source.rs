@@ -96,7 +96,8 @@ pub async fn persist_private_event(
                 .record_source_fill_and_plan(source.kol_user_id(), &fill, now_ms)
                 .await
         }
-        BinancePrivateAccountEvent::ReconcileRequired { .. } => Ok(Vec::new()),
+        BinancePrivateAccountEvent::ReconcileRequired { .. }
+        | BinancePrivateAccountEvent::RefreshRecommended => Ok(Vec::new()),
     }
 }
 
@@ -114,7 +115,8 @@ pub async fn persist_private_event_for_account(
                 .record_source_fill_and_plan(kol_user_id, &fill, now_ms)
                 .await
         }
-        BinancePrivateAccountEvent::ReconcileRequired { .. } => Ok(Vec::new()),
+        BinancePrivateAccountEvent::ReconcileRequired { .. }
+        | BinancePrivateAccountEvent::RefreshRecommended => Ok(Vec::new()),
     }
 }
 

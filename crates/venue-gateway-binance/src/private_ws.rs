@@ -22,7 +22,8 @@ use crate::{BinanceConfig, BinanceTransportError, BinanceTransportLimits};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READINESS_TIMEOUT: Duration = Duration::from_millis(1);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct BinanceListenKey {
     binding: GatewayBinding,
@@ -88,6 +89,8 @@ pub struct BinancePrivateWsTransport<S = MaybeTlsStream<TcpStream>> {
     listen_key: BinanceListenKey,
     limits: BinanceTransportLimits,
     next_heartbeat_at: Instant,
+    last_received_at: Instant,
+    last_received_at_ms: u64,
 }
 
 impl<S> BinancePrivateWsTransport<S>
@@ -114,6 +117,10 @@ where
         &self.endpoint
     }
 
+    pub fn last_received_at_ms(&self) -> u64 {
+        self.last_received_at_ms
+    }
+
     /// Polls at most one frame with the fixed 1 ms post-handshake readiness budget. Idle sockets
     /// return `None`; disconnects fail closed and require a new, higher private generation.
     pub async fn poll_raw_frame(
@@ -131,6 +138,9 @@ where
         let Some(readiness) = private_readiness_budget(remaining) else {
             return Ok(None);
         };
+        if Instant::now().duration_since(self.last_received_at) >= HEARTBEAT_TIMEOUT {
+            return Err(BinanceTransportError::Timeout);
+        }
         if Instant::now() >= self.next_heartbeat_at {
             self.send(Message::Ping(Bytes::new())).await?;
             self.next_heartbeat_at = Instant::now() + HEARTBEAT_INTERVAL;
@@ -141,6 +151,8 @@ where
             Ok(Some(Err(error))) => return Err(map_websocket(error)),
             Ok(Some(Ok(message))) => message,
         };
+        self.last_received_at = Instant::now();
+        self.last_received_at_ms = unix_ms()?;
         match message {
             Message::Text(value) => self.frame(value.as_bytes()).map(Some),
             Message::Binary(_) => Err(BinanceTransportError::Protocol),
@@ -249,6 +261,8 @@ async fn connect_private_ws_endpoint(
         listen_key,
         limits,
         next_heartbeat_at: Instant::now() + HEARTBEAT_INTERVAL,
+        last_received_at: Instant::now(),
+        last_received_at_ms: unix_ms()?,
     })
 }
 
@@ -355,6 +369,46 @@ mod tests {
             private_readiness_budget(Duration::from_millis(10)),
             Some(READINESS_TIMEOUT)
         );
+    }
+
+    #[tokio::test]
+    async fn idle_poll_does_not_renew_coverage_and_missing_heartbeats_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (local, _peer) = tokio::io::duplex(1024);
+        let stream = WebSocketStream::from_raw_socket(
+            local,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let config = config()?;
+        let listen_key = BinanceListenKey::from_response(
+            config.gateway_binding(),
+            7,
+            9,
+            br#"{"listenKey":"test-only"}"#,
+        )?;
+        let mut transport = BinancePrivateWsTransport {
+            stream,
+            binding: config.gateway_binding().clone(),
+            instrument_generation: 7,
+            private_generation: 9,
+            endpoint: "test".into(),
+            listen_key,
+            limits: BinanceTransportLimits::new(Duration::from_secs(1), 4096)?,
+            next_heartbeat_at: Instant::now() + HEARTBEAT_INTERVAL,
+            last_received_at: Instant::now(),
+            last_received_at_ms: 123,
+        };
+        assert!(transport.poll_raw_frame().await?.is_none());
+        assert_eq!(transport.last_received_at_ms(), 123);
+        transport.last_received_at = Instant::now() - HEARTBEAT_TIMEOUT;
+        assert!(matches!(
+            transport.poll_raw_frame().await,
+            Err(BinanceTransportError::Timeout)
+        ));
+        assert_eq!(transport.last_received_at_ms(), 123);
+        Ok(())
     }
 
     #[tokio::test]

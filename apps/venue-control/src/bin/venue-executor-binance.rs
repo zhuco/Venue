@@ -28,7 +28,7 @@ use venue_gateway_binance::{
 const EXECUTOR_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const EXECUTOR_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const PROJECTION_DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
-const PROJECTION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const STREAM_PROJECTION_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const GRID_PRIVATE_RECOVERY_CHANNEL_CAPACITY: usize = 32;
 const MAX_PROJECTION_RETRY_SHIFT: u32 = 5;
 const PRIVATE_STREAM_FILL_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(1);
@@ -96,7 +96,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         grid_recovery_tx,
         command_wake,
         hot_dispatch,
-    );
+    )
+    .with_risk_credentials(secrets.clone());
     let grid_task = tokio::spawn(grid_runtime.run_until_shutdown(shutdown_rx.clone()));
     let signal_shutdown = shutdown_tx.clone();
     tokio::spawn(async move {
@@ -125,6 +126,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 enum ProjectionMessage {
+    StreamSnapshot {
+        worker_id: u64,
+        source: ActiveProjectionSource,
+        snapshot: SignedAccountSnapshot,
+        completion: std::sync::mpsc::SyncSender<Result<Option<bool>, ()>>,
+    },
     Invalidate {
         credential_id: String,
         worker_id: u64,
@@ -190,6 +197,7 @@ async fn run_projection_supervisor(
                 Some(ProjectionMessage::Invalidate { credential_id, worker_id }) => {
                     if is_current_worker(&workers, &credential_id, worker_id) {
                         hot_dispatch.invalidate_credential(&credential_id);
+                        let _ = projection_store.invalidate_stream(&credential_id).await;
                         let _ = grid_signal
                             .try_send(GridPrivateStreamSignal::Invalidate { credential_id });
                     }
@@ -252,6 +260,28 @@ async fn run_projection_supervisor(
                     } else {
                         let _ = completion.send(false);
                     }
+                }
+                Some(ProjectionMessage::StreamSnapshot { worker_id, source, snapshot, completion }) => {
+                    if !is_current_worker(&workers, &source.credential_id, worker_id) {
+                        let _ = completion.send(Err(()));
+                        continue;
+                    }
+                    let ready = projection_store.stream_surface_settled(&source, &snapshot).await;
+                    if !matches!(ready, Ok(Some(true))) {
+                        let _ = completion.send(ready.map_err(|_| ()));
+                        continue;
+                    }
+                    let persisted = match now_ms() {
+                        Ok(now) => projection_store.persist(&source, &snapshot, now).await.is_ok(),
+                        Err(_) => false,
+                    };
+                    if !persisted { let _ = completion.send(Err(())); continue; }
+                    let (ready, settled) = tokio::sync::oneshot::channel();
+                    let warmed = tokio::time::timeout(PROJECTION_PERSISTENCE_TIMEOUT, async {
+                        grid_signal.send(GridPrivateStreamSignal::ProjectionReady { credential_id: source.credential_id, completion: ready }).await.map_err(|_| ())?;
+                        settled.await.map_err(|_| ())
+                    }).await;
+                    let _ = completion.send(if matches!(warmed, Ok(Ok(true))) { Ok(Some(true)) } else { Err(()) });
                 }
                 Some(ProjectionMessage::Snapshot {
                     worker_id,
@@ -326,6 +356,7 @@ async fn run_projection_supervisor(
                 Some(ProjectionMessage::Stopped { credential_id, worker_id }) => {
                     if is_current_worker(&workers, &credential_id, worker_id) {
                         hot_dispatch.invalidate_credential(&credential_id);
+                        let _ = projection_store.invalidate_stream(&credential_id).await;
                         let _ = grid_signal
                             .try_send(GridPrivateStreamSignal::Invalidate {
                                 credential_id: credential_id.clone(),
@@ -621,12 +652,16 @@ fn same_subscription(left: &ActiveProjectionSource, right: &ActiveProjectionSour
 enum PrivatePollAction {
     Idle,
     StreamFill(BinancePrivateFillEvent),
+    RefreshRecommended,
     SignedCorrection,
 }
 
 fn private_poll_action(event: Option<BinancePrivateAccountEvent>) -> PrivatePollAction {
     match event {
         Some(BinancePrivateAccountEvent::Fill(event)) => PrivatePollAction::StreamFill(event),
+        Some(BinancePrivateAccountEvent::RefreshRecommended) => {
+            PrivatePollAction::RefreshRecommended
+        }
         Some(BinancePrivateAccountEvent::ReconcileRequired { .. }) => {
             PrivatePollAction::SignedCorrection
         }
@@ -689,6 +724,7 @@ where
                 signed_correction = true;
                 break;
             }
+            Ok(Some(BinancePrivateAccountEvent::RefreshRecommended)) => {}
             Ok(None) => break,
         }
     }
@@ -708,6 +744,7 @@ fn spawn_projection_worker(
     hot_dispatch: GridHotDispatchCache,
     sender: tokio::sync::mpsc::Sender<ProjectionMessage>,
 ) {
+    let async_runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         let credential_id = source.credential_id.clone();
         let result = (|| {
@@ -745,6 +782,12 @@ fn spawn_projection_worker(
             let initial = gateway
                 .signed_projection_snapshot(fills_cursor.clone())
                 .ok()?;
+            gateway.install_stream_projection(initial.clone()).ok()?;
+            let mut baseline_fill_ids = initial
+                .fills()
+                .iter()
+                .map(|fill| (fill.symbol.clone(), fill.fill_id.clone()))
+                .collect::<std::collections::BTreeSet<_>>();
             fills_cursor = Some(initial.fills_cursor().to_owned());
             let (initial_completion, initial_settled) = std::sync::mpsc::sync_channel(1);
             sender
@@ -758,9 +801,22 @@ fn spawn_projection_worker(
             if !initial_settled.recv().ok()? {
                 return None;
             }
-            let mut refresh_at = std::time::Instant::now() + PROJECTION_POLL_INTERVAL;
+            let mut refresh_at = std::time::Instant::now();
+            let mut publish_at = std::time::Instant::now() + STREAM_PROJECTION_INTERVAL;
             let mut consecutive_snapshot_failures = 0_u32;
             let mut deferred_private_event = None;
+            let mut pending_snapshot: Option<(
+                std::sync::mpsc::Receiver<
+                    Result<
+                        venue_gateway_binance::BinanceCompletedProjection,
+                        venue_gateway_binance::BinanceAccountGatewayError,
+                    >,
+                >,
+                u64,
+            )> = None;
+            let mut fill_epoch = 0_u64;
+            let mut recovering = false;
+            let mut publish_deferred = 0_u32;
             while !*stop.borrow() {
                 let forced_reconcile = match reconcile.try_recv() {
                     Ok(()) => true,
@@ -772,6 +828,8 @@ fn spawn_projection_worker(
                         PrivatePollAction::SignedCorrection,
                         std::time::Instant::now(),
                     )
+                } else if recovering && pending_snapshot.is_some() {
+                    (PrivatePollAction::Idle, std::time::Instant::now())
                 } else if let Some(event) = deferred_private_event.take() {
                     (private_poll_action(Some(event)), std::time::Instant::now())
                 } else {
@@ -791,11 +849,26 @@ fn spawn_projection_worker(
                 };
                 let (private_changed, signed_correction) = match action {
                     PrivatePollAction::StreamFill(event) => {
-                        let burst =
+                        if baseline_fill_ids
+                            .contains(&(event.fill.symbol.clone(), event.fill.fill_id.clone()))
+                        {
+                            continue;
+                        }
+                        fill_epoch = fill_epoch.saturating_add(1);
+                        let mut burst =
                             collect_private_fill_burst(event, action_received_at, |remaining| {
                                 gateway.poll_private_fill_with_budget(remaining)
                             });
+                        burst.events.retain(|event| {
+                            !baseline_fill_ids
+                                .contains(&(event.fill.symbol.clone(), event.fill.fill_id.clone()))
+                        });
                         deferred_private_event = burst.deferred;
+                        if recovering {
+                            // The signed cursor repairs all fills observed across a genuine gap.
+                            // The new baseline includes these buffered gap events before rolling.
+                            continue;
+                        }
                         let (completion, settled) = std::sync::mpsc::sync_channel(1);
                         if sender
                             .blocking_send(ProjectionMessage::StreamFills {
@@ -814,9 +887,12 @@ fn spawn_projection_worker(
                         (true, burst.signed_correction)
                     }
                     PrivatePollAction::SignedCorrection => (true, true),
+                    PrivatePollAction::RefreshRecommended => (true, false),
                     PrivatePollAction::Idle => (false, false),
                 };
-                if signed_correction || std::time::Instant::now() >= refresh_at {
+                if signed_correction {
+                    recovering = true;
+                    refresh_at = std::time::Instant::now();
                     hot_dispatch.invalidate_credential(&credential_id);
                     sender
                         .blocking_send(ProjectionMessage::Invalidate {
@@ -824,35 +900,114 @@ fn spawn_projection_worker(
                             worker_id,
                         })
                         .ok()?;
-                    let snapshot = match gateway.signed_projection_snapshot(fills_cursor.clone()) {
-                        Ok(snapshot) => snapshot,
+                }
+                let ready = pending_snapshot
+                    .as_ref()
+                    .and_then(|(receiver, epoch)| match receiver.try_recv() {
+                        Ok(result) => Some((result, *epoch)),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => Some((
+                            Err(venue_gateway_binance::BinanceAccountGatewayError::Readback),
+                            *epoch,
+                        )),
+                    });
+                if let Some((result, started_epoch)) = ready {
+                    pending_snapshot = None;
+                    match result {
+                        Ok(completed) if recovering || started_epoch == fill_epoch => {
+                            let snapshot = completed.snapshot().clone();
+                            let snapshot_for_install = snapshot.clone();
+                            baseline_fill_ids = snapshot
+                                .fills()
+                                .iter()
+                                .map(|fill| (fill.symbol.clone(), fill.fill_id.clone()))
+                                .collect();
+                            fills_cursor = Some(snapshot.fills_cursor().to_owned());
+                            let (completion, settled) = std::sync::mpsc::sync_channel(1);
+                            sender
+                                .blocking_send(ProjectionMessage::Snapshot {
+                                    worker_id,
+                                    source: source.clone(),
+                                    snapshot,
+                                    completion,
+                                })
+                                .ok()?;
+                            if !settled.recv().ok()? {
+                                return None;
+                            }
+                            gateway.accept_projection_read(completed).ok()?;
+                            gateway
+                                .install_stream_projection(snapshot_for_install)
+                                .ok()?;
+                            recovering = false;
+                            consecutive_snapshot_failures = 0;
+                            publish_at = std::time::Instant::now() + STREAM_PROJECTION_INTERVAL;
+                        }
+                        Ok(_) => {
+                            // Never replace a live post-fill projection with a REST collection
+                            // which began before that fill. Re-read without blocking the stream.
+                            refresh_at = std::time::Instant::now();
+                        }
                         Err(_) => {
                             consecutive_snapshot_failures =
                                 consecutive_snapshot_failures.saturating_add(1);
                             let delay = projection_retry_delay(consecutive_snapshot_failures);
                             refresh_at = std::time::Instant::now() + delay;
-                            std::thread::sleep(delay);
-                            continue;
                         }
-                    };
-                    consecutive_snapshot_failures = 0;
-                    fills_cursor = Some(snapshot.fills_cursor().to_owned());
-                    let (completion, settled) = std::sync::mpsc::sync_channel(1);
-                    if sender
-                        .blocking_send(ProjectionMessage::Snapshot {
-                            worker_id,
-                            source: source.clone(),
-                            snapshot,
-                            completion,
-                        })
-                        .is_err()
-                    {
-                        return None;
                     }
-                    if !settled.recv().ok()? {
-                        return None;
+                }
+                if recovering
+                    && gateway.private_stream_recovery_ready()
+                    && pending_snapshot.is_none()
+                    && std::time::Instant::now() >= refresh_at
+                {
+                    let read = gateway.prepare_projection_read(fills_cursor.clone()).ok()?;
+                    let (completed, receiver) = std::sync::mpsc::sync_channel(1);
+                    async_runtime.spawn(async move {
+                        let _ = completed.send(read.collect().await);
+                    });
+                    pending_snapshot = Some((receiver, fill_epoch));
+                }
+                if !recovering && !private_changed && std::time::Instant::now() >= publish_at {
+                    if let Some(snapshot) = gateway.stream_projection_snapshot().map_err(|error| {
+                        tracing::warn!(target: "venue_control::grid_hot_path", %error, "Authenticated account projection lost continuity; rebuilding baseline");
+                    }).ok()? {
+                        let observed = snapshot.observed_at_ms();
+                        let next_cursor = snapshot.fills_cursor().to_owned();
+                        let (completion, settled) = std::sync::mpsc::sync_channel(1);
+                        sender
+                            .blocking_send(ProjectionMessage::StreamSnapshot {
+                                worker_id,
+                                source: source.clone(),
+                                snapshot,
+                                completion,
+                            })
+                            .ok()?;
+                        match settled.recv().ok()?.ok()? {
+                            Some(true) => {
+                                gateway.accept_stream_projection(observed);
+                                fills_cursor = Some(next_cursor);
+                                publish_deferred = 0;
+                            }
+                            Some(false) => {
+                                publish_deferred = publish_deferred.saturating_add(1);
+                            }
+                            None => publish_deferred = 0,
+                        }
+                        if publish_deferred >= 10 {
+                            tracing::warn!(target: "venue_control::grid_hot_path", "Quiescent stream order surface differs from the durable target; requesting signed correction");
+                            recovering = true;
+                            refresh_at = std::time::Instant::now();
+                            hot_dispatch.invalidate_credential(&credential_id);
+                            sender
+                                .blocking_send(ProjectionMessage::Invalidate {
+                                    credential_id: credential_id.clone(),
+                                    worker_id,
+                                })
+                                .ok()?;
+                        }
                     }
-                    refresh_at = std::time::Instant::now() + PROJECTION_POLL_INTERVAL;
+                    publish_at = std::time::Instant::now() + STREAM_PROJECTION_INTERVAL;
                 }
                 if !private_changed {
                     std::thread::sleep(std::time::Duration::from_millis(1));

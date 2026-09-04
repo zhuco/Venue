@@ -1,10 +1,10 @@
 # VENUE 功能入口
 
-更新：2026-09-03
+更新：2026-09-04
 
 认证成交与 REST 的去重边界位于 `apps/venue-control/src/private_projection.rs`：价格、数量及订单进度按精确 Decimal 数值相等比较，兼容历史 JSON 中的尾零，其他字段仍精确匹配；实库回归位于 `tests/support/projection_fill_observation.rs`。
 
-Grid 快速补撤确认位于 `apps/venue-control/src/executor_exchange/grid_batch.rs`，完整 RESULT 由 `crates/venue-gateway-binance/src/execution.rs` 复用规范订单解析器保留；缺证据走耐久对账，普通补撤不逐单回读。`grid_runtime/risk.rs` 复用签名投影与汇率热缓存计算风险，`grid_runtime/stream_overlay.rs` 按成交更新数量与加权开仓均价；相关回归在 `executor_exchange/grid_result_tests.rs` 和流投影测试中。
+Grid 快速补撤确认位于 `apps/venue-control/src/executor_exchange/grid_batch.rs`，完整 RESULT 由 `crates/venue-gateway-binance/src/execution.rs` 保留；不确定结果按同 ID 对账。`account_stream_projection.rs` 在启动 REST 基线之上维护连续认证用户流的订单与双腿仓位，正常运行不定时拉全账户 REST；`account_gateway_projection.rs` 仅处理异常恢复读，`account_gateway_risk.rs` 保留完整账户风险读辅助。`grid_runtime/stream_overlay.rs` 按成交更新数量与加权开仓均价。`grid_runtime/risk.rs` 只在存在盈利减仓候选时单独签名读取 PM 权益；此查询不进入普通成交补撤路径。
 
 当前目标是 Binance KOL 跟单 MVP 与事实驱动 Binance 对冲网格共用单例 `venue-executor-binance`；初期全站最多 5 个启用 KOL、200 个启用跟单账户。Scalping 和其余交易所迁移暂停。下面多数 Runtime/Node 入口是已提交代码或冻结兼容位置，不等于新链调用链。长期文档统一在本目录，仓库根 CODEMAP 仅作导航。
 
@@ -51,7 +51,7 @@ Node 投影摘要辅助位于 `apps/venue-node/src/control_loop/projection_diges
 | Control 与统一 Executor | `apps/venue-control/src/{lib,accounts/{kol,terminal,grid},private_projection,kol_executor,grid_store,grid_runtime,grid_hot_dispatch,executor_config,executor_store,executor_secret,executor_exchange{,/grid_batch},executor_runtime,bin/venue-executor-binance,http/accounts}.rs` | `0017`–`0024` 提供容量、归属、Grid 配置/目标面/归属/成交分配、命令账本、用户作用域私有投影、签名回读退避、Grid 热批次及跨微批前驱链。Executor 以私流唤醒并持久化账户投影；终端、Copy 与 Grid 共用账户串行队列和稳定 clientOrderId。热批次用一次性进程内令牌精确匹配数据库摘要、账户、symbol、私有代与规则代，命中时不做同步完整 REST 预检；缺失、过期、重启或不匹配只走签名冷路径。所有 Place 并发越过 send-entry 后才启动 Cancel，ACK/不确定结果随后逐单签名回读。新链只拒绝仍有旧 Binance LIVE writer scope 的账户。|
 | Binance Grid 热批次迁移 | `apps/venue-control/migrations/{0023_binance_grid_hot_batch,0024_binance_grid_batch_chain}.sql`、`apps/venue-control/tests/binance_grid_hot_batch_migration.rs` | 0023 建立 0–16 条命令的原子收据与批内 Place-before-Cancel 顺序；0024 把每批绑定到所消费的 desired 摘要和唯一前驱。相邻私流成交可继续规划为独立后继批，但领取后批前必须确认前批全部 Reconciled；未确认 Place 不冒充签名订单，也不得被后批选作撤单目标。PostgreSQL 实库压力、真实 Canary 与预热 p95 尚未验收，不能宣称 10 ms 已达成。|
 | Binance Grid 纯规划 | `crates/venue-strategies/src/hedged_grid/{planner,planner_tests}.rs` | 配置、实时规则/BBO、同代签名双腿仓位、本实例订单面、外部平仓预留与批量成交确定性地产生四类 Maker 目标、补库存、盈利减仓、Blocked/Reset/Stop；不持有 Actor、checkpoint、WAL 或交易所客户端 |
-| Binance Grid 行情与规则证据 | `crates/venue-gateway-binance/src/grid_market.rs` | 每次读取新鲜 BBO，按有界周期刷新完整规则并在变化时提升 generation；盈利风险使用显式 quote→USD 证据，不假定 USDT/USDC 恒等于 USD |
+| Binance Grid 行情与规则证据 | `crates/venue-gateway-binance/src/grid_market.rs` | 新 Grid 不依赖 BBO：热路径用认证成交价，冷路径用公开标记价与规则；盈利减仓候选使用显式 quote→USD 和单独 PM 权益核验。旧 BBO reader 只保留既有调用兼容 |
 | Copy 执行结果与耐久记账 | `apps/venue-control/src/{copy_execution_postgres,copy_ledger_postgres,copy_ledger_worker}.rs` | 结果以原 immutable job 校验目标/资产/phase/delta；跨零 Adjust 必须接在已签名归零的 Reduce 后。worker tick 从真实 Node receipt 与最终 Adjust 的 Reconciled 仓位原子生成 canonical receipt、ledger 和 drift；Rejected 只关闭原 delivery，不造 ledger。0013 允许经原 Node receipt 交叉核验的无 Copy consumer claim 终态；暂停/过期任务仍可记账但不生成新增风险授权，缺 Node receipt 暂不处理 |
 | Copy 自动规划事实与冻结输入 | `apps/venue-node/src/control_loop/copy_planning.rs`、`apps/venue-control/src/{copy_planning_postgres,copy_planning_input,copy_planning_repair,copy_leader_postgres}.rs` | Node 用签名仓位/保证金、实时 Instrument 和显式 `copy_leader_capital` 产生外层有界事实；worker 配对当前关系的双边新鲜事实，与不可变 envelope/job/游标同事务提交。原始 leader 敞口与冻结倍率分别保留；未收敛旧任务不生成新风险任务。已记账漂移只能由新鲜事实生成独立修复任务，不能续期旧 child。逐所实际来源及产品端到端仍需验收 |
 | VenueFlow 桌面运维客户端 | `apps/ui/desktop/src/main.rs` | `trading.rs`、`trade_dock.rs` 统一按钮、交易设置与非重复热键为同一 `TradingAction`；动作按“开多、平多、开空、平空”显示，默认 `A/S/D/F`，Maker-only 默认开启。`workspace.rs` 固定币安式图表/盘口/下单/底部账户区，交易对标签可关闭并新增。`execution_view.rs` 的仓位、当前委托、历史成交、仓位历史和资产只读新私有投影，历史委托只读新命令账本；`grid_view.rs` 与 `client/grid.rs` 管理新 Grid 配置和生命周期，并保留冻结旧策略只读区。Post Only 四动作、二次确认市价平仓与选中委托精确撤单进入唯一 Executor。|

@@ -123,6 +123,9 @@ impl BinancePrivateFillEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BinancePrivateAccountEvent {
     Fill(BinancePrivateFillEvent),
+    /// Ordinary account/order change folded into the adapter's live read model. This is not
+    /// a request for REST; execution facts continue on the same authenticated socket.
+    RefreshRecommended,
     ReconcileRequired {
         stream_private_generation: u64,
         private_generation: u64,
@@ -182,6 +185,43 @@ pub(super) fn normalize_private_stream_event_for_symbols(
     if event == "listenKeyExpired" {
         return Err(BinanceAccountGatewayError::PrivateStream);
     }
+    if matches!(event, "balanceUpdate" | "outboundAccountPosition") {
+        return Ok(Some(BinancePrivateAccountEvent::RefreshRecommended));
+    }
+    if event == "ACCOUNT_UPDATE"
+        && value.get("fs").and_then(Value::as_str) == Some("UM")
+        && value
+            .pointer("/a/m")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| {
+                matches!(
+                    reason,
+                    "ORDER"
+                        | "FUNDING_FEE"
+                        | "DEPOSIT"
+                        | "WITHDRAW"
+                        | "ASSET_TRANSFER"
+                        | "MARGIN_TRANSFER"
+                )
+            })
+        && value
+            .pointer("/a/P")
+            .and_then(Value::as_array)
+            .is_none_or(|positions| {
+                positions.iter().all(|position| {
+                    position
+                        .get("s")
+                        .and_then(Value::as_str)
+                        .is_some_and(|native| {
+                            symbols
+                                .iter()
+                                .any(|symbol| crate::native_symbol(symbol) == native)
+                        })
+                })
+            })
+    {
+        return Ok(Some(BinancePrivateAccountEvent::RefreshRecommended));
+    }
     let stream_symbol = value
         .get("o")
         .and_then(Value::as_object)
@@ -223,13 +263,15 @@ pub(super) fn normalize_private_stream_event_for_symbols(
                     .and_then(Value::as_str)
                     .ok_or(BinanceAccountGatewayError::PrivateStream)?;
                 let status = order.get("X").and_then(Value::as_str);
-                execution != "NEW"
-                    || status.is_some_and(|status| {
-                        matches!(
-                            status,
-                            "CANCELED" | "EXPIRED" | "REJECTED" | "EXPIRED_IN_MATCH" | "FILLED"
-                        )
+                if stream_symbol.is_some()
+                    && matches!(execution, "NEW" | "CANCELED" | "EXPIRED")
+                    && status.is_some_and(|status| {
+                        matches!(status, "NEW" | "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH")
                     })
+                {
+                    return Ok(Some(BinancePrivateAccountEvent::RefreshRecommended));
+                }
+                true
             }
             // Other authenticated account events can change inventory, order semantics,
             // leverage, liquidation custody, or algo orders and therefore require signed facts.

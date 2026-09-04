@@ -58,6 +58,31 @@ async fn exercise(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> {
         Err(PrivateProjectionError::Invalid)
     );
     let projection = store.persist(&source, &snapshot, 120).await?;
+    assert!(
+        store
+            .load_healthy_owned(&source.owner_user_id, &source.credential_id)
+            .await?
+            .is_some()
+    );
+    store.invalidate_stream(&source.credential_id).await?;
+    assert!(
+        store
+            .load_healthy_owned(&source.owner_user_id, &source.credential_id)
+            .await?
+            .is_none()
+    );
+    assert!(
+        store
+            .load_owned(&source.owner_user_id, &source.credential_id)
+            .await?
+            .is_some(),
+        "disconnection preserves read-only historical facts"
+    );
+    store.persist(&source, &snapshot, 120).await?;
+    assert_eq!(
+        store.stream_surface_settled(&source, &snapshot).await?,
+        Some(true)
+    );
     assert_eq!(
         projection.observed_ms, 100,
         "do not falsely freshen order/position evidence"

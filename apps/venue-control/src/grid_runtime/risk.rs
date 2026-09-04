@@ -11,6 +11,29 @@ impl BinanceGridRuntime {
         if !record.instance.config.profit_reduction.enabled {
             return Ok(None);
         }
+        let minimum_profit = record
+            .instance
+            .config
+            .profit_reduction
+            .minimum_unrealized_profit_rate;
+        if !private.positions.iter().any(|position| {
+            let (Some(entry), Some(mark)) = (position.entry_price, position.mark_price) else {
+                return false;
+            };
+            if position.quantity <= Decimal::ZERO || mark <= Decimal::ZERO {
+                return false;
+            }
+            let profit = match position.position_side {
+                PositionSide::Long => mark.checked_sub(entry),
+                PositionSide::Short => entry.checked_sub(mark),
+                _ => None,
+            };
+            profit
+                .and_then(|profit| profit.checked_div(mark))
+                .is_some_and(|profit| profit >= minimum_profit)
+        }) {
+            return Ok(None);
+        }
         let state = self
             .markets
             .get(&record.instance.instance_id)
@@ -25,9 +48,24 @@ impl BinanceGridRuntime {
                 tracing::warn!(target: "venue_control::grid_hot_path", %error, "Grid quote-to-USD evidence refresh failed");
                 BinanceGridRuntimeError::Market
             })?;
-        self.hot_path
-            .cache_conversion(record.instance.instance_id.clone(), conversion.clone());
-        Self::risk_from_conversion(record, projection, private, conversion).map(Some)
+        let credentials = self
+            .risk_credentials
+            .as_ref()
+            .ok_or(BinanceGridRuntimeError::Facts)?
+            .load(&record.instance.credential_id, &record.owner_user_id)
+            .await
+            .map_err(|_| BinanceGridRuntimeError::Facts)?;
+        let (equity, _) = state
+            .account_equity(&credentials, projection.private_generation)
+            .await
+            .map_err(|_| BinanceGridRuntimeError::Facts)?;
+        let mut verified = projection.clone();
+        verified.assets = vec![venue_control_protocol::kol::TerminalAsset {
+            asset: "USD".to_owned(),
+            equity,
+            available_margin: None,
+        }];
+        Self::risk_from_conversion(record, &verified, private, conversion).map(Some)
     }
 
     pub(super) fn risk_from_conversion(

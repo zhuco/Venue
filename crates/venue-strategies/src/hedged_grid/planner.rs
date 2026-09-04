@@ -64,6 +64,14 @@ pub struct GridBestBook {
     pub observed_at_ms: u64,
 }
 
+/// A real trade or mark observation, not a fabricated bid/ask spread. Post-only enforcement
+/// belongs to the exchange when the strategy intentionally does not consume a live order book.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GridReferencePrice {
+    pub price: Price,
+    pub observed_at_ms: u64,
+}
+
 /// Adapter-normalized exchange filters missing from canonical metadata. Native filter names and
 /// symbols stay outside the strategy boundary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -159,7 +167,8 @@ pub struct GridPlannerInput {
     pub config: GridPlannerConfig,
     pub instrument: InstrumentMetadata,
     pub instrument_limits: GridInstrumentLimits,
-    pub book: GridBestBook,
+    pub book: Option<GridBestBook>,
+    pub reference_price: Option<GridReferencePrice>,
     pub inventory: GridInventory,
     pub owned_orders: Vec<GridOrderIntent>,
     pub maker_fills: Vec<GridMakerFill>,
@@ -511,14 +520,29 @@ fn validate_instrument(
 }
 
 fn validate_market_facts(input: &GridPlannerInput) -> Option<GridBlockedReason> {
+    if let Some(reference) = &input.reference_price {
+        if input.book.is_some()
+            || input.now_ms == 0
+            || reference.observed_at_ms == 0
+            || reference.observed_at_ms > input.now_ms
+        {
+            return Some(GridBlockedReason::InvalidMarketFacts);
+        }
+        return (input.now_ms.saturating_sub(reference.observed_at_ms)
+            > input.config.reset_policy.max_private_age_ms)
+            .then_some(GridBlockedReason::StaleMarketFacts);
+    }
+    let Some(book) = &input.book else {
+        return Some(GridBlockedReason::InvalidMarketFacts);
+    };
     if input.now_ms == 0
-        || input.book.observed_at_ms == 0
-        || input.book.observed_at_ms > input.now_ms
-        || input.book.bid >= input.book.ask
+        || book.observed_at_ms == 0
+        || book.observed_at_ms > input.now_ms
+        || book.bid >= book.ask
     {
         return Some(GridBlockedReason::InvalidMarketFacts);
     }
-    if input.now_ms.saturating_sub(input.book.observed_at_ms)
+    if input.now_ms.saturating_sub(book.observed_at_ms)
         > input.config.reset_policy.max_market_age_ms
     {
         return Some(GridBlockedReason::StaleMarketFacts);
@@ -585,11 +609,7 @@ fn initial_surface(
     input: &GridPlannerInput,
 ) -> Result<(GridRollingAnchor, Vec<GridOrderIntent>), GridPlannerError> {
     let midpoint = input
-        .book
-        .bid
-        .value()
-        .checked_add(input.book.ask.value())
-        .and_then(|value| value.checked_div(Decimal::from(2)))
+        .reference_value()
         .ok_or(GridPlannerError::Arithmetic)?;
     let anchor_value = input
         .instrument
@@ -783,7 +803,10 @@ fn rolled_surface(
             .owned_orders
             .iter()
             .any(|owned| owned.key == order.key)
-            && crosses_book(order, &input.book)
+            && input
+                .book
+                .as_ref()
+                .is_some_and(|book| crosses_book(order, book))
     }) {
         return Err(GridResetTrigger::PriceWouldCrossBook);
     }
@@ -869,7 +892,7 @@ fn infer_anchor(
         }
     }
     let step_value = differences.into_iter().min().unwrap_or_else(|| {
-        let midpoint = (input.book.bid.value() + input.book.ask.value()) / Decimal::from(2);
+        let midpoint = input.reference_value().unwrap_or(Decimal::ZERO);
         ceil_to_step(
             midpoint * input.config.spacing_rate,
             input.instrument.price.step,
@@ -880,11 +903,7 @@ fn infer_anchor(
         return Err(GridResetTrigger::InvalidOwnedOrder);
     }
     let midpoint = input
-        .book
-        .bid
-        .value()
-        .checked_add(input.book.ask.value())
-        .and_then(|value| value.checked_div(Decimal::from(2)))
+        .reference_value()
         .ok_or(GridResetTrigger::RollingConflict)?;
     let anchor_value = input
         .instrument
@@ -1418,6 +1437,16 @@ fn validate_generated_orders(
 }
 
 impl GridPlannerInput {
+    fn reference_value(&self) -> Option<Decimal> {
+        if let Some(reference) = &self.reference_price {
+            return Some(reference.price.value());
+        }
+        let book = self.book.as_ref()?;
+        book.bid
+            .value()
+            .checked_add(book.ask.value())?
+            .checked_div(Decimal::from(2))
+    }
     fn price_within_limits(&self, price: Price) -> bool {
         price >= self.instrument_limits.minimum_price
             && price <= self.instrument_limits.maximum_price

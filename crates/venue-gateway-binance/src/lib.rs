@@ -20,15 +20,16 @@ use venue_gateway_api::CapabilityFlags;
 pub use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
 
 pub use account_gateway::{
-    BinanceAccountGateway, BinanceAccountGatewayError, BinanceGridBootstrapMarketFacts,
-    BinancePrivateAccountEvent, BinancePrivateFillEvent, BinancePublicMarketEvent,
+    BinanceAccountGateway, BinanceAccountGatewayError, BinanceCompletedProjection,
+    BinanceGridBootstrapMarketFacts, BinancePrivateAccountEvent, BinancePrivateFillEvent,
+    BinanceProjectionRead, BinancePublicMarketEvent,
 };
 pub use binding::{BinanceAccountBinding, BinanceBindingError, native_symbol};
 pub use config::{BinanceConfig, endpoints};
 pub use credential_probe::{BinanceCredentialProbe, BinanceProbeError, probe_credentials};
 pub use credentials::BinanceCredentials;
 pub use execution::*;
-pub use grid_market::BinanceGridMarketReader;
+pub use grid_market::{BinanceGridMarketReader, BinanceGridReferenceFacts};
 pub use instrument::{
     BinanceInstrumentError, BinanceInstrumentRules, parse_instrument_rules,
     parse_native_instrument_rules,

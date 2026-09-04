@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
-use venue_domain::domain::{Asset, Symbol};
+use venue_domain::domain::{Asset, Price, Symbol};
 use venue_gateway_api::GatewayBinding;
 
 use crate::{
@@ -11,6 +11,13 @@ use crate::{
 };
 
 const RULE_REFRESH_INTERVAL_MS: u64 = 60_000;
+
+#[derive(Clone, Debug)]
+pub struct BinanceGridReferenceFacts {
+    pub rules: BinanceInstrumentRules,
+    pub price: Price,
+    pub observed_at_ms: u64,
+}
 
 /// Credential-free, bounded Binance market reader used by the singleton Grid coordinator.
 /// Rule generations are stable content fingerprints: a changed exchange rule set changes the
@@ -23,6 +30,97 @@ pub struct BinanceGridMarketReader {
 }
 
 impl BinanceGridMarketReader {
+    /// A candidate profit reduction needs PM's actual USD equity. This reads only /account;
+    /// neither orders nor positions are polled, and no credential is retained by this reader.
+    pub async fn account_equity(
+        &self,
+        credentials: &crate::BinanceCredentials,
+        private_generation: u64,
+    ) -> Result<(rust_decimal::Decimal, u64), BinanceAccountGatewayError> {
+        let rules = self
+            .rules
+            .as_ref()
+            .ok_or(BinanceAccountGatewayError::Instrument)?;
+        let config =
+            BinanceConfig::for_binding(BinanceAccountBinding::PortfolioMarginUm, &self.binding)
+                .map_err(|_| BinanceAccountGatewayError::Binding)?;
+        let transport = BinanceHttpTransport::new(
+            config.clone(),
+            rules.instrument.generation,
+            private_generation,
+            self.transport.recovery_limits(),
+        )?;
+        transport.synchronize_clock().await?;
+        let observed = transport.signing_timestamp_ms()?;
+        let scope =
+            crate::BinancePrivateReadScope::new(&config, rules, private_generation, 1, observed)
+                .map_err(|_| BinanceAccountGatewayError::Readback)?;
+        let request = crate::build_account_request(&scope)
+            .map_err(|_| BinanceAccountGatewayError::Readback)?;
+        let response = transport
+            .execute_read(credentials, &request, observed)
+            .await?;
+        let payload = std::str::from_utf8(&response.payload)
+            .map_err(|_| BinanceAccountGatewayError::Readback)?;
+        let account = crate::portfolio::parse_account_balance(payload)
+            .map_err(|_| BinanceAccountGatewayError::Readback)?;
+        Ok((account.wallet_balance, response.received_at_ms))
+    }
+    /// Grid rolling needs filters and a real reference price, not bid/ask availability.
+    /// A flat first start uses the public mark; existing inventory uses its signed mark.
+    pub async fn refresh_reference(
+        &mut self,
+        reference: Option<(Price, u64)>,
+        now_ms: u64,
+    ) -> Result<BinanceGridReferenceFacts, BinanceAccountGatewayError> {
+        if self.rules.is_none()
+            || now_ms.saturating_sub(self.last_rules_check_ms) >= RULE_REFRESH_INTERVAL_MS
+        {
+            self.refresh_rules(now_ms).await?;
+        }
+        let rules = self
+            .rules
+            .as_ref()
+            .ok_or(BinanceAccountGatewayError::Instrument)?
+            .clone();
+        let (price, observed_at_ms) = match reference {
+            Some(value) => value,
+            None => {
+                let response = self
+                    .transport
+                    .fetch_usd_m_mark_price(&rules.native_symbol)
+                    .await?;
+                let value: serde_json::Value = serde_json::from_slice(&response.payload)
+                    .map_err(|_| BinanceAccountGatewayError::Readback)?;
+                if value.get("symbol").and_then(serde_json::Value::as_str)
+                    != Some(rules.native_symbol.as_str())
+                {
+                    return Err(BinanceAccountGatewayError::Readback);
+                }
+                let price = value
+                    .get("markPrice")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| value.parse().ok())
+                    .and_then(|value| Price::new(value).ok())
+                    .ok_or(BinanceAccountGatewayError::Readback)?;
+                let observed = value
+                    .get("time")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|time| {
+                        *time > 0
+                            && *time <= response.received_at_ms
+                            && response.received_at_ms - *time <= 5_000
+                    })
+                    .ok_or(BinanceAccountGatewayError::Readback)?;
+                (price, observed)
+            }
+        };
+        Ok(BinanceGridReferenceFacts {
+            rules,
+            price,
+            observed_at_ms,
+        })
+    }
     pub fn new(
         binding: GatewayBinding,
         limits: BinanceTransportLimits,

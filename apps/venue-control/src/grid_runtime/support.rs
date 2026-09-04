@@ -10,7 +10,7 @@ use venue_control_protocol::{
     kol::{ExecutorCommandState, TerminalAccountProjection, TerminalOpenOrder, TerminalPosition},
 };
 use venue_domain::domain::{OrderSide, PositionSide, Price};
-use venue_gateway_binance::BinanceGridBootstrapMarketFacts;
+use venue_gateway_binance::BinanceGridReferenceFacts;
 use venue_strategies::hedged_grid::{
     GridBlockedReason, GridCloseReservations, GridInventory, GridOrderIntent, GridOrderRole,
     GridPlanner, GridPosition, GridResetTrigger, GridRollingAnchor,
@@ -429,7 +429,7 @@ pub(super) fn desired_digest(anchor: &GridRollingAnchor, orders: &[GridDesiredOr
 pub(super) fn desired_valid_for_market(
     record: &GridRuntimeRecord,
     desired: &GridDesiredSurface,
-    market: &BinanceGridBootstrapMarketFacts,
+    market: &BinanceGridReferenceFacts,
 ) -> bool {
     let rules = &market.rules;
     let Some(anchor) = record.instance.anchor.as_ref() else {

@@ -18,14 +18,14 @@ use venue_domain::domain::{
     AccountRiskSnapshot, Amount, Asset, LegRiskSnapshot, PositionSide, Price, RiskSourceStatus,
 };
 use venue_gateway_binance::{
-    BinanceGridBootstrapMarketFacts, BinanceGridMarketReader, BinanceTransportLimits,
-    GatewayBinding, GatewayMode, VenueId,
+    BinanceGridMarketReader, BinanceGridReferenceFacts, BinanceTransportLimits, GatewayBinding,
+    GatewayMode, VenueId,
 };
 use venue_strategies::hedged_grid::{
-    GridBestBook, GridCloseReservations, GridConvergenceFacts, GridExposureReduction,
-    GridInstrumentLimits, GridInventoryAdjustment, GridMakerFill, GridOrderIntent, GridOrderKey,
-    GridPlanDirective, GridPlanner, GridPlannerConfig, GridPlannerControl, GridPlannerInput,
-    GridPosition, GridProfitReductionPolicy, GridReplenishmentPolicy, GridResetPolicy,
+    GridCloseReservations, GridConvergenceFacts, GridExposureReduction, GridInstrumentLimits,
+    GridInventoryAdjustment, GridMakerFill, GridOrderIntent, GridOrderKey, GridPlanDirective,
+    GridPlanner, GridPlannerConfig, GridPlannerControl, GridPlannerInput, GridPosition,
+    GridProfitReductionPolicy, GridReferencePrice, GridReplenishmentPolicy, GridResetPolicy,
     GridRiskConversion, GridRiskFacts, GridRollingAnchor,
 };
 
@@ -99,9 +99,18 @@ pub struct BinanceGridRuntime {
     transport_limits: BinanceTransportLimits,
     markets: BTreeMap<String, BinanceGridMarketReader>,
     hot_path: GridHotPathState,
+    risk_credentials: Option<crate::executor_secret::ExecutorSecretProvider>,
+    started_ms: u64,
 }
 
 impl BinanceGridRuntime {
+    pub fn with_risk_credentials(
+        mut self,
+        credentials: crate::executor_secret::ExecutorSecretProvider,
+    ) -> Self {
+        self.risk_credentials = Some(credentials);
+        self
+    }
     #[must_use]
     pub fn new(
         store: BinanceGridStore,
@@ -160,6 +169,8 @@ impl BinanceGridRuntime {
                 command_wake,
                 hot_dispatch,
             ),
+            risk_credentials: None,
+            started_ms: now_ms().unwrap_or(u64::MAX),
         }
     }
 
@@ -175,6 +186,13 @@ impl BinanceGridRuntime {
                         "Binance Grid instance {} turn failed: {error}",
                         record.instance.instance_id
                     );
+                    if error == BinanceGridRuntimeError::Market
+                        && record.instance.state == GridInstanceState::Running
+                    {
+                        // Public mark/rules supervision is not the user execution stream.
+                        // Keep fill-driven rolling active; do not produce a cold mutation.
+                        continue;
+                    }
                     let code = match error {
                         BinanceGridRuntimeError::Market => "market_unavailable",
                         BinanceGridRuntimeError::PrivateProjection => "private_unavailable",
@@ -236,9 +254,9 @@ impl BinanceGridRuntime {
             _ => {}
         }
         let now = now_ms()?;
-        let Some(projection) = self
+        let Some(mut projection) = self
             .projections
-            .load_owned(&record.owner_user_id, &record.instance.credential_id)
+            .load_healthy_owned(&record.owner_user_id, &record.instance.credential_id)
             .await?
         else {
             if self.settle_lifecycle_timeout(&record, now).await? {
@@ -248,7 +266,18 @@ impl BinanceGridRuntime {
                 .await?;
             return Ok(false);
         };
+        if now.saturating_sub(projection.observed_ms)
+            > record.instance.config.reset_policy.stale_private_ms
+            && self.hot_path.recent_stream(
+                &record.instance.instance_id,
+                now,
+                record.instance.config.reset_policy.stale_private_ms,
+            )
+        {
+            return Ok(false);
+        }
         if projection.trading_account_id != record.instance.trading_account_id
+            || projection.observed_ms < self.started_ms
             || projection.credential_id != record.instance.credential_id
             || projection.position_mode != TerminalPositionMode::Hedge
             || projection.observed_ms > now
@@ -265,6 +294,14 @@ impl BinanceGridRuntime {
             .store
             .load_owned_orders(&record.instance.instance_id)
             .await?;
+        let reference = self.refresh_market(&record, &projection, now).await?;
+        for position in projection
+            .positions
+            .iter_mut()
+            .filter(|position| position.symbol == record.instance.symbol)
+        {
+            position.mark_price = Some(reference.price.value());
+        }
         let mut actual = self
             .synchronize_actual_surface(&record, &projection, ownership, now)
             .await?;
@@ -292,7 +329,7 @@ impl BinanceGridRuntime {
             if let Some(desired) = desired.as_ref()
                 && !desired.orders.is_empty()
             {
-                let market = self.refresh_market(&record, now).await?;
+                let market = self.refresh_market(&record, &projection, now).await?;
                 if !desired_valid_for_market(&record, &desired, &market) {
                     self.store
                         .settle_runtime_state(
@@ -340,8 +377,14 @@ impl BinanceGridRuntime {
             record = updated;
         }
 
-        let market = self.refresh_market(&record, now).await?;
-        let risk = self.risk_facts(&record, &projection, &private, now).await?;
+        let market = self.refresh_market(&record, &projection, now).await?;
+        let risk = match self.risk_facts(&record, &projection, &private, now).await {
+            Ok(risk) => risk,
+            Err(error) => {
+                tracing::warn!(target: "venue_control::grid_hot_path", %error, "Profit reduction verification unavailable; ordinary Grid rolling remains active");
+                None
+            }
+        };
         // Market and quote-to-USD evidence are timestamped after their asynchronous HTTP
         // responses arrive. Re-sample the planner clock so fresh evidence cannot appear to come
         // from the future merely because this turn began before those requests completed.
@@ -361,8 +404,12 @@ impl BinanceGridRuntime {
                 .load_grid_fill_totals(&record.instance.instance_id)
                 .await?
         };
+        let mut config = planner_config(&record)?;
+        if risk.is_none() {
+            config.profit_reduction = None;
+        }
         let plan = GridPlanner::plan(&GridPlannerInput {
-            config: planner_config(&record)?,
+            config,
             instrument: market
                 .rules
                 .metadata()
@@ -375,11 +422,11 @@ impl BinanceGridRuntime {
                 maximum_price: Price::new(market.rules.maximum_price)
                     .map_err(|_| BinanceGridRuntimeError::Facts)?,
             },
-            book: GridBestBook {
-                bid: market.bid,
-                ask: market.ask,
+            book: None,
+            reference_price: Some(GridReferencePrice {
+                price: market.price,
                 observed_at_ms: market.observed_at_ms,
-            },
+            }),
             inventory: private.inventory,
             owned_orders: actual.intents.clone(),
             maker_fills: maker_fill_hints(&planner_fills, &actual, &fill_totals)?,
@@ -489,8 +536,9 @@ impl BinanceGridRuntime {
     async fn refresh_market(
         &mut self,
         record: &GridRuntimeRecord,
+        _projection: &TerminalAccountProjection,
         now: u64,
-    ) -> Result<BinanceGridBootstrapMarketFacts, BinanceGridRuntimeError> {
+    ) -> Result<BinanceGridReferenceFacts, BinanceGridRuntimeError> {
         let id = record.instance.instance_id.clone();
         if !self.markets.contains_key(&id) {
             let binding = GatewayBinding::new(
@@ -509,10 +557,10 @@ impl BinanceGridRuntime {
             .get_mut(&id)
             .ok_or(BinanceGridRuntimeError::Market)?;
         let facts = state
-            .refresh(now)
+            .refresh_reference(None, now)
             .await
             .map_err(|error| {
-                tracing::warn!(target: "venue_control::grid_hot_path", %error, "Grid BBO or instrument refresh failed");
+                tracing::warn!(target: "venue_control::grid_hot_path", %error, "Grid reference price or instrument refresh failed");
                 BinanceGridRuntimeError::Market
             })?;
         self.hot_path.cache_market(id, facts.clone());
@@ -664,7 +712,7 @@ impl BinanceGridRuntime {
         record: &GridRuntimeRecord,
         projection: &TerminalAccountProjection,
         actual: &ActualSurface,
-        market: &BinanceGridBootstrapMarketFacts,
+        market: &BinanceGridReferenceFacts,
         action: MarketAction,
         fills: Vec<GridFillAllocation>,
         now: u64,
@@ -1214,7 +1262,7 @@ impl BinanceGridRuntime {
             if self.settle_lifecycle_timeout(record, now).await? {
                 return Ok(true);
             }
-            let _ = self.refresh_market(record, now).await?;
+            let _ = self.refresh_market(record, projection, now).await?;
             self.store
                 .settle_runtime_state(
                     &record.instance.instance_id,
@@ -1845,7 +1893,7 @@ fn fill_matches_owner(fill: &GridFillAllocation, owner: &GridOrderOwnership) -> 
 fn action_digest(
     record: &GridRuntimeRecord,
     projection: &TerminalAccountProjection,
-    market: &BinanceGridBootstrapMarketFacts,
+    market: &BinanceGridReferenceFacts,
     action: &MarketAction,
 ) -> Result<[u8; 32], BinanceGridRuntimeError> {
     let value = serde_json::to_vec(&(

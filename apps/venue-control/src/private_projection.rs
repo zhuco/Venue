@@ -47,6 +47,81 @@ pub enum PrivateProjectionError {
 }
 
 impl BinancePrivateProjectionStore {
+    pub async fn invalidate_stream(
+        &self,
+        credential_id: &str,
+    ) -> Result<(), PrivateProjectionError> {
+        sqlx::query("UPDATE venue_binance_account_projections SET projection_json=jsonb_set(projection_json,'{stream_healthy}','false'::jsonb) WHERE credential_id=$1")
+            .bind(credential_id).execute(&self.pool).await.map_err(|_| PrivateProjectionError::Unavailable)?;
+        Ok(())
+    }
+
+    pub async fn load_healthy_owned(
+        &self,
+        owner: &str,
+        credential: &str,
+    ) -> Result<Option<TerminalAccountProjection>, PrivateProjectionError> {
+        let healthy: Option<bool> = sqlx::query_scalar("SELECT COALESCE((projection_json->>'stream_healthy')::boolean,false) FROM venue_binance_account_projections WHERE credential_id=$1 AND owner_user_id=$2")
+            .bind(credential).bind(owner).fetch_optional(&self.pool).await.map_err(|_| PrivateProjectionError::Unavailable)?;
+        if healthy != Some(true) {
+            return Ok(None);
+        }
+        self.load_owned(owner, credential).await
+    }
+    /// A live projection must not replace the continuation cache while REST RESULT and user
+    /// stream order acknowledgements are still crossing. This is local ledger validation only.
+    /// None means commands are in flight, not evidence of a broken user stream.
+    pub async fn stream_surface_settled(
+        &self,
+        source: &ActiveProjectionSource,
+        snapshot: &SignedAccountSnapshot,
+    ) -> Result<Option<bool>, PrivateProjectionError> {
+        let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_binance_commands WHERE trading_account_id=$1 AND command_state IN ('pending','sending','accepted','reconcile_required'))")
+            .bind(&source.trading_account_id).fetch_one(&self.pool).await.map_err(|_| PrivateProjectionError::Unavailable)?;
+        if pending {
+            return Ok(None);
+        }
+        let rows = sqlx::query("SELECT d.client_order_id,d.quantity,d.limit_price FROM venue_binance_grid_desired_orders d JOIN venue_binance_grid_instances i ON i.instance_id=d.instance_id WHERE i.trading_account_id=$1 AND i.owner_user_id=$2 AND i.instance_state='running'")
+            .bind(&source.trading_account_id).bind(&source.owner_user_id).fetch_all(&self.pool).await.map_err(|_| PrivateProjectionError::Unavailable)?;
+        for row in rows {
+            let client: String = row
+                .try_get("client_order_id")
+                .map_err(|_| PrivateProjectionError::Unavailable)?;
+            let quantity: String = row
+                .try_get("quantity")
+                .map_err(|_| PrivateProjectionError::Unavailable)?;
+            let price: String = row
+                .try_get("limit_price")
+                .map_err(|_| PrivateProjectionError::Unavailable)?;
+            let quantity: rust_decimal::Decimal = quantity
+                .parse()
+                .map_err(|_| PrivateProjectionError::Invalid)?;
+            let price: rust_decimal::Decimal =
+                price.parse().map_err(|_| PrivateProjectionError::Invalid)?;
+            if !snapshot.open_orders().iter().any(|order| {
+                order.client_order_id == client
+                    && order
+                        .filled_quantity
+                        .and_then(|filled| order.quantity.checked_sub(filled))
+                        .is_some_and(|remaining| {
+                            remaining > rust_decimal::Decimal::ZERO && remaining <= quantity
+                        })
+                    && order.limit_price == Some(price)
+            }) {
+                return Ok(Some(false));
+            }
+        }
+        let retired: Vec<String> = sqlx::query_scalar("SELECT o.client_order_id FROM venue_binance_grid_order_owners o JOIN venue_binance_grid_instances i ON i.instance_id=o.instance_id LEFT JOIN venue_binance_grid_desired_orders d ON d.client_order_id=o.client_order_id WHERE i.trading_account_id=$1 AND i.owner_user_id=$2 AND i.instance_state='running' AND d.client_order_id IS NULL")
+            .bind(&source.trading_account_id).bind(&source.owner_user_id).fetch_all(&self.pool).await.map_err(|_| PrivateProjectionError::Unavailable)?;
+        if snapshot
+            .open_orders()
+            .iter()
+            .any(|order| retired.contains(&order.client_order_id))
+        {
+            return Ok(Some(false));
+        }
+        Ok(Some(true))
+    }
     #[must_use]
     pub const fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -273,6 +348,8 @@ impl BinancePrivateProjectionStore {
                 .execute(&mut *tx).await.map_err(|_| PrivateProjectionError::Unavailable)?;
         }
         let stored = StoredProjection {
+            stream_healthy: true,
+            balance_observed_ms: Some(snapshot.balance_observed_at_ms()),
             fills_cursor: snapshot.fills_cursor().to_owned(),
             projection: projection.clone(),
         };
@@ -293,7 +370,7 @@ impl BinancePrivateProjectionStore {
     /// Persists one authenticated stream fill without advancing the signed projection cursor.
     /// The current signed generation is locked and checked first, so a reconnect or a racing
     /// signed refresh turns this into a harmless fallback instead of applying an event to the
-    /// wrong baseline. The periodic signed snapshot remains the restart authority.
+    /// wrong baseline. Restart and genuine stream gaps use a new signed REST bootstrap.
     pub async fn persist_stream_fill(
         &self,
         source: &ActiveProjectionSource,
@@ -586,6 +663,10 @@ fn merge_projection_source(
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct StoredProjection {
+    #[serde(default)]
+    balance_observed_ms: Option<u64>,
+    #[serde(default)]
+    stream_healthy: bool,
     fills_cursor: String,
     projection: TerminalAccountProjection,
 }

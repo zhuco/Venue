@@ -374,6 +374,26 @@ impl BinanceHttpTransport {
         ))
     }
 
+    pub async fn fetch_usd_m_mark_price(
+        &self,
+        native_symbol: &str,
+    ) -> Result<BinanceHttpResponse, BinanceTransportError> {
+        if native_symbol.is_empty()
+            || !native_symbol
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Err(BinanceTransportError::Binding);
+        }
+        let requested_at_ms = unix_ms()?;
+        let url = format!(
+            "{}/fapi/v1/premiumIndex?symbol={native_symbol}",
+            self.config.usd_m_public_rest_origin()
+        );
+        self.send_bounded(self.client.get(url), requested_at_ms, false)
+            .await
+    }
+
     /// Bounded production BBO read used only to normalize a semantic limit intent. It shares the
     /// adapter client, body limit and LIVE origin; callers still validate symbol/time/price.
     pub async fn fetch_usd_m_book_ticker(

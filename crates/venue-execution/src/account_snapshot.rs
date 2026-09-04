@@ -115,6 +115,10 @@ pub struct SignedAccountSnapshot {
     #[serde(default)]
     balances: Vec<SignedAccountBalance>,
     unknown_results: Vec<SignedUnknownFact>,
+    /// Set only for a live read model derived from uninterrupted authenticated stream updates.
+    /// Unchanged account balances retain this REST observation time, not the newer socket time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream_rest_baseline_ms: Option<u64>,
 }
 
 impl SignedAccountSnapshot {
@@ -227,7 +231,23 @@ impl SignedAccountSnapshot {
             fills_cursor,
             balances: Vec::new(),
             unknown_results,
+            stream_rest_baseline_ms: None,
         })
+    }
+
+    pub fn with_stream_origin(
+        mut self,
+        rest_baseline_ms: u64,
+    ) -> Result<Self, AccountHostValidationError> {
+        if rest_baseline_ms == 0 || rest_baseline_ms > self.observed_at_ms {
+            return Err(AccountHostValidationError::SignedSnapshot);
+        }
+        self.stream_rest_baseline_ms = Some(rest_baseline_ms);
+        Ok(self)
+    }
+
+    pub fn balance_observed_at_ms(&self) -> u64 {
+        self.stream_rest_baseline_ms.unwrap_or(self.observed_at_ms)
     }
 
     #[must_use]

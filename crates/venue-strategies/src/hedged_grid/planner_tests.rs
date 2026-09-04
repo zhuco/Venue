@@ -56,11 +56,12 @@ fn input() -> Result<GridPlannerInput, Box<dyn std::error::Error>> {
             minimum_price: Price::new(Decimal::new(1, 1))?,
             maximum_price: Price::new(Decimal::from(1_000))?,
         },
-        book: GridBestBook {
+        book: Some(GridBestBook {
             bid: Price::new(Decimal::new(999, 1))?,
             ask: Price::new(Decimal::new(1001, 1))?,
             observed_at_ms: 10_000,
-        },
+        }),
+        reference_price: None,
         inventory: GridInventory {
             private_generation: 31,
             private_observed_at_ms: 10_000,
@@ -96,6 +97,80 @@ fn initialized_input() -> Result<GridPlannerInput, Box<dyn std::error::Error>> {
     value.rolling_anchor = Some(anchor);
     value.owned_orders = orders;
     Ok(value)
+}
+
+#[test]
+fn reference_only_grid_starts_and_rolls_one_or_two_fills_without_bbo()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut value = input()?;
+    value.book = None;
+    value.reference_price = Some(GridReferencePrice {
+        price: Price::new(Decimal::from(100))?,
+        observed_at_ms: 10_000,
+    });
+    let (anchor, orders) = converge(GridPlanner::plan(&value)?)?;
+    assert_eq!(orders.len(), 12);
+    for count in [1_usize, 2] {
+        let mut rolled = value.clone();
+        rolled.rolling_anchor = Some(anchor.clone());
+        let sources = [
+            take_order(&orders, GridPosition::Long, GridOrderRole::Open, 1)?,
+            take_order(&orders, GridPosition::Short, GridOrderRole::Close, 1)?,
+        ];
+        rolled.owned_orders = orders
+            .iter()
+            .filter(|order| {
+                !sources[..count]
+                    .iter()
+                    .any(|source| source.key == order.key)
+            })
+            .cloned()
+            .collect();
+        rolled.maker_fills = sources[..count]
+            .iter()
+            .enumerate()
+            .map(|(index, source)| GridMakerFill {
+                fill_id: format!("reference-fill-{index}"),
+                source_order: source.clone(),
+                complete: true,
+                maker: true,
+            })
+            .collect();
+        let (_, desired) = converge(GridPlanner::plan(&rolled)?)?;
+        assert_eq!(
+            diff_counts(&rolled.owned_orders, &desired),
+            (count * 2, count)
+        );
+        assert_unique_diff(&rolled.owned_orders, &desired)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn reference_only_grid_rejects_stale_future_and_ambiguous_price_sources()
+-> Result<(), Box<dyn std::error::Error>> {
+    for observed in [0, 9_000, 10_101] {
+        let mut value = input()?;
+        value.book = None;
+        value.reference_price = Some(GridReferencePrice {
+            price: Price::new(Decimal::from(100))?,
+            observed_at_ms: observed,
+        });
+        assert!(matches!(
+            GridPlanner::plan(&value)?.directive,
+            GridPlanDirective::Blocked { .. }
+        ));
+    }
+    let mut ambiguous = input()?;
+    ambiguous.reference_price = Some(GridReferencePrice {
+        price: Price::new(Decimal::from(100))?,
+        observed_at_ms: 10_000,
+    });
+    assert!(matches!(
+        GridPlanner::plan(&ambiguous)?.directive,
+        GridPlanDirective::Blocked { .. }
+    ));
+    Ok(())
 }
 
 fn take_order(
@@ -280,8 +355,8 @@ fn resting_crossed_orders_preserve_surface_until_signed_fills_arrive()
         let mut value = initialized_input()?;
         let original = value.owned_orders.clone();
         let anchor = value.rolling_anchor.clone();
-        value.book.bid = Price::new(Decimal::from(bid))?;
-        value.book.ask = Price::new(Decimal::from(ask))?;
+        value.book.as_mut().ok_or("book fixture")?.bid = Price::new(Decimal::from(bid))?;
+        value.book.as_mut().ok_or("book fixture")?.ask = Price::new(Decimal::from(ask))?;
         let (after_anchor, desired) = converge(GridPlanner::plan(&value)?)?;
         assert_eq!(diff_counts(&original, &desired), (0, 0));
         assert_eq!(Some(after_anchor), anchor);
@@ -299,8 +374,9 @@ fn first_fill_rolls_while_crossed_counterpart_is_still_in_signed_snapshot()
         GridOrderRole::Open,
         1,
     )?;
-    value.book.bid = Price::new(source.price.value() - Decimal::new(1, 1))?;
-    value.book.ask = source.price;
+    value.book.as_mut().ok_or("book fixture")?.bid =
+        Price::new(source.price.value() - Decimal::new(1, 1))?;
+    value.book.as_mut().ok_or("book fixture")?.ask = source.price;
     value.owned_orders.retain(|order| order.key != source.key);
     value.maker_fills.push(GridMakerFill {
         fill_id: "first-of-pair".to_owned(),
@@ -332,8 +408,8 @@ fn crossing_new_maker_target_waits_without_consuming_fill_or_resetting_anchor()
         maker: true,
     });
     let normal_book = value.book.clone();
-    value.book.bid = Price::new(Decimal::from(104))?;
-    value.book.ask = Price::new(Decimal::from(105))?;
+    value.book.as_mut().ok_or("book fixture")?.bid = Price::new(Decimal::from(104))?;
+    value.book.as_mut().ok_or("book fixture")?.ask = Price::new(Decimal::from(105))?;
     for _ in 0..5 {
         assert_eq!(
             GridPlanner::plan(&value)?.directive,
@@ -364,8 +440,9 @@ fn crossed_pair_in_separate_batches_keeps_epoch_and_two_place_one_cancel_per_fil
         GridOrderRole::Close,
         1,
     )?;
-    value.book.bid = Price::new(first.price.value() - Decimal::new(1, 1))?;
-    value.book.ask = first.price;
+    value.book.as_mut().ok_or("book fixture")?.bid =
+        Price::new(first.price.value() - Decimal::new(1, 1))?;
+    value.book.as_mut().ok_or("book fixture")?.ask = first.price;
     value.owned_orders.retain(|order| order.key != first.key);
     value.maker_fills = vec![GridMakerFill {
         fill_id: "pair-first".to_owned(),
@@ -479,8 +556,8 @@ fn two_same_lane_maker_fills_have_deterministic_unique_places_and_cancels()
     )?;
     let mut value = initialized;
     // Both sell fills move the signed book upward while keeping every surviving maker passive.
-    value.book.bid = Price::new(Decimal::new(1005, 1))?;
-    value.book.ask = Price::new(Decimal::new(1015, 1))?;
+    value.book.as_mut().ok_or("book fixture")?.bid = Price::new(Decimal::new(1005, 1))?;
+    value.book.as_mut().ok_or("book fixture")?.ask = Price::new(Decimal::new(1015, 1))?;
     value
         .owned_orders
         .retain(|order| order.key != first.key && order.key != second.key);
@@ -510,7 +587,7 @@ fn two_same_lane_maker_fills_have_deterministic_unique_places_and_cancels()
 fn stale_facts_block_without_mutation_while_convergence_failures_require_reset()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut stale = initialized_input()?;
-    stale.book.observed_at_ms = 1;
+    stale.book.as_mut().ok_or("book fixture")?.observed_at_ms = 1;
     assert_eq!(
         GridPlanner::plan(&stale)?.directive,
         GridPlanDirective::Blocked {
@@ -728,8 +805,8 @@ fn rolled_orders_raise_fixed_quantity_to_meet_minimum_notional_at_new_price()
         Some(Decimal::new(52, 3))
     );
     value.owned_orders.retain(|order| order.key != source.key);
-    value.book.bid = Price::new(Decimal::new(995, 1))?;
-    value.book.ask = Price::new(Decimal::new(997, 1))?;
+    value.book.as_mut().ok_or("book fixture")?.bid = Price::new(Decimal::new(995, 1))?;
+    value.book.as_mut().ok_or("book fixture")?.ask = Price::new(Decimal::new(997, 1))?;
     value.maker_fills.push(GridMakerFill {
         fill_id: "roll-below-minimum".to_owned(),
         source_order: source,
@@ -762,7 +839,7 @@ fn rolled_orders_raise_fixed_quantity_to_meet_minimum_notional_at_new_price()
 fn stop_never_flattens_and_structural_conflicts_reset_only_owned_orders()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut stop = input()?;
-    stop.book.observed_at_ms = 1;
+    stop.book.as_mut().ok_or("book fixture")?.observed_at_ms = 1;
     stop.control = GridPlannerControl::Stop;
     assert_eq!(
         GridPlanner::plan(&stop)?.directive,
