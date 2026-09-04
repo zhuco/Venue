@@ -353,6 +353,9 @@ impl BinancePrivateProjectionStore {
                 .iter()
                 .any(|event| observed_ms >= event.received_at_ms)
         {
+            tracing::warn!(target: "venue_control::grid_hot_path", generation_matches = private_generation == batch_generation,
+                event_after_baseline = events.iter().all(|event| observed_ms < event.received_at_ms),
+                "Authenticated fill baseline comparison failed");
             return Err(PrivateProjectionError::Invalid);
         }
 
@@ -398,6 +401,7 @@ impl BinancePrivateProjectionStore {
             .await
             .map_err(|_| PrivateProjectionError::Unavailable)?;
             if changed.rows_affected() != 1 {
+                tracing::warn!(target: "venue_control::grid_hot_path", "Authenticated fill conflicts with an existing durable fill");
                 return Err(PrivateProjectionError::Invalid);
             }
         }

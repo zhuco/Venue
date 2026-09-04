@@ -163,6 +163,12 @@ pub(super) fn normalize_private_stream_event_for_symbols(
         || active_private_generation < stream_private_generation
         || frame.received_at_ms == 0
     {
+        eprintln!(
+            "Binance private frame binding rejected: rule_match={} socket_match={} active_generation_valid={}",
+            frame.instrument_generation == rules_generation,
+            frame.private_generation == stream_private_generation,
+            active_private_generation >= stream_private_generation
+        );
         return Err(BinanceAccountGatewayError::PrivateStream);
     }
     let payload =
@@ -186,10 +192,25 @@ pub(super) fn normalize_private_stream_event_for_symbols(
                 .iter()
                 .find(|symbol| crate::native_symbol(symbol) == native)
         });
+    if event == "ORDER_TRADE_UPDATE"
+        && value
+            .get("o")
+            .and_then(|order| order.get("x"))
+            .and_then(Value::as_str)
+            == Some("TRADE")
+    {
+        eprintln!(
+            "Binance authenticated trade frame: symbol_in_scope={}",
+            stream_symbol.is_some()
+        );
+    }
     let Some(Some(stream)) = stream_symbol
         .map(|symbol| crate::private::parse_stream_fill(payload, symbol))
         .transpose()
-        .map_err(|_| BinanceAccountGatewayError::PrivateStream)?
+        .map_err(|error| {
+            eprintln!("Binance authenticated fill normalization failed: {error}");
+            BinanceAccountGatewayError::PrivateStream
+        })?
     else {
         let reconcile = match event {
             "ORDER_TRADE_UPDATE" => {

@@ -427,11 +427,9 @@ async fn persist_stream_fill_batch_turn(
     events: &[BinancePrivateFillEvent],
     now_ms: u64,
 ) -> StreamFillBatchOutcome {
-    if projection_store
-        .persist_stream_fills(source, events)
-        .await
-        .is_err()
-    {
+    tracing::info!(target: "venue_control::grid_hot_path", fill_count = events.len(), "Authenticated fill burst received for persistence");
+    if let Err(error) = projection_store.persist_stream_fills(source, events).await {
+        tracing::warn!(target: "venue_control::grid_hot_path", error = %error, "Authenticated fill persistence failed before Grid planning");
         return StreamFillBatchOutcome::FailedBeforePersistence;
     }
     let store = executor_store.clone();
@@ -782,10 +780,13 @@ fn spawn_projection_worker(
                             (private_poll_action(Some(event)), received_at)
                         }
                         Ok(None) => (PrivatePollAction::Idle, std::time::Instant::now()),
-                        Err(_) => (
-                            PrivatePollAction::SignedCorrection,
-                            std::time::Instant::now(),
-                        ),
+                        Err(error) => {
+                            tracing::warn!(target: "venue_control::grid_hot_path", error = %error, "Authenticated stream polling failed; requesting signed correction");
+                            (
+                                PrivatePollAction::SignedCorrection,
+                                std::time::Instant::now(),
+                            )
+                        }
                     }
                 };
                 let (private_changed, signed_correction) = match action {
