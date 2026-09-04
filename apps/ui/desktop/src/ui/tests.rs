@@ -338,6 +338,63 @@ fn status_bar_is_one_line_with_funds_visible_at_supported_widths() {
 }
 
 #[test]
+fn footer_execution_account_uses_the_selected_credential_label() {
+    use venue_control_protocol::accounts::*;
+    let context = egui::Context::default();
+    theme::apply(&context);
+    let mut model = AppModel::new(crate::model::Preferences::default());
+    model.apply_account_overview(AccountOverview {
+        user: UserSummary {
+            user_id: "fixture-user".into(),
+            username: "alice".into(),
+        },
+        selected_credential_id: Some("fixture-key".into()),
+        credentials: vec![CredentialSummary {
+            credential_id: "fixture-key".into(),
+            label: "常用币安账户".into(),
+            venue: venue_control_protocol::VenueId::Binance,
+            masked_key: "••••1234".into(),
+            trading_account_id: Some("00000000-0000-4000-8000-000000000001".into()),
+            verification: ApiVerificationState::Verified,
+            verified_ms: Some(1),
+            expires_ms: None,
+            api_reachable: true,
+            dual_position: true,
+            account_mode: Some("Portfolio Margin · UM".into()),
+            has_exposure: None,
+        }],
+    });
+    let mut labels = Vec::new();
+    for _ in 0..3 {
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1680.0, 26.0),
+                )),
+                ..Default::default()
+            },
+            |ui| show_status_bar(ui, &model),
+        );
+        output.textures_delta.clear();
+        labels.clear();
+        for shape in output.shapes {
+            collect_text(&shape.shape, &mut labels);
+        }
+    }
+    assert!(
+        labels
+            .iter()
+            .any(|(label, _)| label.contains("常用币安账户"))
+    );
+    assert!(
+        !labels
+            .iter()
+            .any(|(label, _)| label.contains("00000000-0000"))
+    );
+}
+
+#[test]
 fn order_panel_primary_buttons_fit_and_short_panels_can_scroll_to_cancellations() {
     for (size, scroll) in [
         (egui::vec2(680.0, 260.0), false),

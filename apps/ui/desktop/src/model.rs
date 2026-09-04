@@ -772,6 +772,17 @@ impl AppModel {
         self.synchronize_trading_scope();
     }
 
+    pub fn selected_execution_credential(
+        &self,
+    ) -> Option<&venue_control_protocol::accounts::CredentialSummary> {
+        let overview = self.account_overview.as_ref()?;
+        let selected = overview.selected_credential_id.as_deref()?;
+        overview
+            .credentials
+            .iter()
+            .find(|credential| credential.credential_id == selected)
+    }
+
     pub fn apply_account_overview(
         &mut self,
         overview: venue_control_protocol::accounts::AccountOverview,
@@ -794,6 +805,8 @@ impl AppModel {
             self.execution.terminal_executions.clear();
             self.execution.private_error = None;
             self.execution.terminal_executions_error = None;
+            self.execution.terminal_request_id = None;
+            self.execution.terminal_submission_error = None;
             self.trade_dock.clear_order_selection();
         }
         self.preferences.execution_account_id = selected;

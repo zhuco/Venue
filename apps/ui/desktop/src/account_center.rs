@@ -15,7 +15,7 @@ use vault::Vault;
 mod tests;
 
 const LOGIN_DIALOG_WIDTH: f32 = 520.0;
-const ACCOUNT_DIALOG_WIDTH: f32 = 760.0;
+const ACCOUNT_DIALOG_WIDTH: f32 = 1_040.0;
 
 #[derive(Default)]
 pub(crate) struct AccountCenter {
@@ -41,7 +41,6 @@ pub(crate) struct AccountCenter {
     restoring: Option<SessionResponse>,
     reconnect_requested: bool,
     form_visible: bool,
-    credential_index: usize,
     #[cfg(test)]
     submit_rect: Option<egui::Rect>,
 }
@@ -535,45 +534,147 @@ fn show_accounts(ui: &mut egui::Ui, state: &mut AccountCenter, model: &mut AppMo
             "No API is bound. Add a Binance API, verify it, then select the execution account.",
         ));
     }
-    if !credentials.is_empty() {
-        state.credential_index = state.credential_index.min(credentials.len() - 1);
-        if credentials.len() > 1 {
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        state.credential_index > 0,
-                        egui::Button::new(tr(l, "上一项", "Previous")),
-                    )
-                    .clicked()
-                {
-                    state.credential_index -= 1;
-                    state.deleting = None;
-                    state.password.zeroize();
-                }
-                ui.label(format!(
-                    "{}/{}",
-                    state.credential_index + 1,
-                    credentials.len()
-                ));
-                if ui
-                    .add_enabled(
-                        state.credential_index + 1 < credentials.len(),
-                        egui::Button::new(tr(l, "下一项", "Next")),
-                    )
-                    .clicked()
-                {
-                    state.credential_index += 1;
-                    state.deleting = None;
-                    state.password.zeroize();
-                }
-            });
-        }
-        show_credential(ui, state, model, &credentials[state.credential_index]);
+    show_credentials_table(ui, state, model, &credentials);
+    if let Some(credential) = credentials
+        .iter()
+        .find(|credential| state.deleting.as_deref() == Some(credential.credential_id.as_str()))
+    {
+        show_remove_confirmation(ui, state, model, credential);
     }
     ui.small(tr(l,"验证只读取交易所，不下单、不修改账户模式。选择账户不会启动策略。","Verification only reads exchange state; it never trades or changes account mode. Selecting an account does not start a strategy."));
+    ui.small(tr(l, "登录会话由 Windows 凭据库保存；API 验证和本次会话的执行账户选择由服务器保存，重启后恢复。", "Windows stores the login session; the server stores API verification and this session's execution account selection, restored on restart."));
 }
 
-fn show_credential(
+fn show_credentials_table(
+    ui: &mut egui::Ui,
+    state: &mut AccountCenter,
+    model: &mut AppModel,
+    credentials: &[CredentialSummary],
+) {
+    let l = model.preferences.language;
+    let widths = [155.0, 70.0, 145.0, 135.0, 105.0, 140.0, 100.0];
+    egui::ScrollArea::both()
+        .id_salt("account-api-table-scroll")
+        .max_height((ui.ctx().content_rect().height() - 380.0).clamp(96.0, 380.0))
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            egui::Grid::new("account-api-table")
+                .striped(true)
+                .spacing([10.0, 10.0])
+                .show(ui, |ui| {
+                    for (heading, width) in [
+                        tr(l, "备注 / API Key", "Label / API Key"),
+                        tr(l, "交易所", "Exchange"),
+                        tr(l, "账户类型", "Account type"),
+                        tr(l, "交易账户", "Trading account"),
+                        tr(l, "验证", "Verification"),
+                        tr(l, "执行账户", "Execution account"),
+                        tr(l, "删除账户", "Remove account"),
+                    ]
+                    .into_iter()
+                    .zip(widths)
+                    {
+                        ui.add_sized(
+                            [width, 24.0],
+                            egui::Label::new(RichText::new(heading).strong()).truncate(),
+                        );
+                    }
+                    ui.end_row();
+                    for credential in credentials {
+                        account_cell(ui, widths[0], |ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(&credential.label).strong())
+                                    .truncate(),
+                            )
+                            .on_hover_text(&credential.label);
+                            ui.small(&credential.masked_key);
+                        });
+                        account_cell(ui, widths[1], |ui| {
+                            ui.label(format!("{:?}", credential.venue));
+                        });
+                        account_cell(ui, widths[2], |ui| {
+                            ui.label(credential.account_mode.as_deref().unwrap_or(tr(
+                                l,
+                                "待验证",
+                                "Unverified",
+                            )));
+                            if credential.dual_position {
+                                ui.small(tr(l, "双向持仓", "Hedge mode"));
+                            }
+                        });
+                        account_cell(ui, widths[3], |ui| {
+                            let account = credential.trading_account_id.as_deref().unwrap_or("—");
+                            ui.add(egui::Label::new(account).truncate())
+                                .on_hover_text(account);
+                            ui.small(private_account_status(l, model, credential, now_ms()));
+                        });
+                        account_cell(ui, widths[4], |ui| {
+                            ui.colored_label(
+                                if credential.selectable(now_ms()) {
+                                    theme::BUY
+                                } else {
+                                    theme::WARNING
+                                },
+                                verification_text(l, &credential.verification),
+                            );
+                            if ui.button(tr(l, "验证 API", "Verify API")).clicked() {
+                                state.submit(
+                                    AccountAction::Verify(credential.credential_id.clone()),
+                                    model,
+                                    ui.ctx(),
+                                );
+                            }
+                        });
+                        account_cell(ui, widths[5], |ui| {
+                            let selected =
+                                model
+                                    .selected_execution_credential()
+                                    .is_some_and(|current| {
+                                        current.credential_id == credential.credential_id
+                                    });
+                            if ui
+                                .add_enabled(
+                                    credential.selectable(now_ms()) && !selected,
+                                    egui::Button::new(if selected {
+                                        tr(l, "当前执行账户", "Current account")
+                                    } else {
+                                        tr(l, "设为执行账户", "Use for execution")
+                                    }),
+                                )
+                                .clicked()
+                            {
+                                state.submit(
+                                    AccountAction::Select(credential.credential_id.clone()),
+                                    model,
+                                    ui.ctx(),
+                                );
+                            }
+                        });
+                        account_cell(ui, widths[6], |ui| {
+                            if ui.button(tr(l, "删除账户", "Remove account")).clicked() {
+                                state.deleting = Some(credential.credential_id.clone());
+                                state.password.zeroize();
+                            }
+                        });
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+fn account_cell(ui: &mut egui::Ui, width: f32, content: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 62.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_max_width(width);
+            ui.spacing_mut().item_spacing.y = 4.0;
+            content(ui);
+        },
+    );
+}
+
+fn show_remove_confirmation(
     ui: &mut egui::Ui,
     state: &mut AccountCenter,
     model: &mut AppModel,
@@ -581,60 +682,7 @@ fn show_credential(
 ) {
     let l = model.preferences.language;
     egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.set_min_width(620.0);
-        ui.horizontal(|ui| {
-            ui.strong(&credential.label);
-            ui.label("Binance");
-            ui.monospace(&credential.masked_key);
-        });
-        ui.horizontal(|ui| {
-            let ready = credential.selectable(now_ms());
-            let status = verification_text(l, &credential.verification);
-            ui.colored_label(if ready { theme::BUY } else { theme::WARNING }, status);
-            ui.label(if ready {
-                tr(l, "API 可访问 · 双向持仓", "API reachable · Hedge mode")
-            } else {
-                tr(l, "API / 账户模式待验证", "API / account mode requires verification")
-            });
-        });
-        ui.small(node_status(l, model, credential, now_ms()));
-        if let Some(mode) = &credential.account_mode {
-            ui.small(mode);
-        }
-        if let Some(account) = &credential.trading_account_id {
-            ui.small(format!(
-                "{}: {account}",
-                tr(l, "交易账户", "Trading account")
-            ));
-        }
-        ui.horizontal(|ui| {
-            if ui.button(tr(l, "验证 API", "Verify API")).clicked() {
-                state.submit(AccountAction::Verify(credential.credential_id.clone()), model, ui.ctx());
-            }
-            let selected = model
-                .account_overview
-                .as_ref()
-                .and_then(|v| v.selected_credential_id.as_deref())
-                == Some(credential.credential_id.as_str());
-            if ui
-                .add_enabled(
-                    credential.selectable(now_ms()) && !selected,
-                    egui::Button::new(if selected {
-                        tr(l, "当前执行账户", "Current execution account")
-                    } else {
-                        tr(l, "设为执行账户", "Use for execution")
-                    }),
-                )
-                .clicked()
-            {
-                state.submit(AccountAction::Select(credential.credential_id.clone()), model, ui.ctx());
-            }
-            if ui.button(tr(l, "删除绑定", "Remove binding")).clicked() {
-                state.deleting = Some(credential.credential_id.clone());
-                state.password.zeroize();
-            }
-        });
-        if state.deleting.as_deref() == Some(credential.credential_id.as_str()) {
+            ui.strong(format!("{} · {}", tr(l, "删除账户", "Remove account"), credential.label));
             ui.colored_label(
                 theme::WARNING,
                 tr(
@@ -670,7 +718,6 @@ fn show_credential(
                     state.password.zeroize();
                 }
             });
-        }
     });
 }
 
@@ -736,38 +783,35 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String, password: bool, lim
         }
     });
 }
-fn node_status(
+fn private_account_status(
     l: Language,
     model: &AppModel,
     credential: &CredentialSummary,
     now: u64,
 ) -> &'static str {
-    use venue_control_protocol::HealthState;
-    let snapshot = model.snapshot.as_ref().filter(|s| {
-        model.snapshot_online
-            && now
-                .checked_sub(s.generated_ms)
-                .is_some_and(|age| age <= 15_000)
-    });
-    let account = snapshot.and_then(|s| {
-        s.accounts.iter().find(|a| {
-            credential.trading_account_id.as_deref() == Some(a.trading_account_id.as_str())
-        })
-    });
-    match account.map(|a| a.health) {
-        Some(HealthState::Healthy) => {
-            tr(l, "执行节点：报告正常", "Execution node: reports healthy")
-        }
-        Some(HealthState::Recovering) => tr(l, "执行节点：恢复中", "Execution node: recovering"),
-        Some(HealthState::NeedsAttention) => {
-            tr(l, "执行节点：需要处理", "Execution node: needs attention")
-        }
-        Some(HealthState::Stopped) => tr(l, "执行节点：已停止", "Execution node: stopped"),
-        Some(HealthState::Unknown) | None => tr(
+    let account = credential.trading_account_id.as_deref();
+    let projection = model
+        .execution
+        .private_projection_for(account)
+        .filter(|projection| projection.credential_id == credential.credential_id);
+    if projection.is_none() {
+        tr(
             l,
-            "执行节点：未连接或暂无新鲜状态",
-            "Execution node: disconnected or no fresh status",
-        ),
+            "交易连接：未订阅或等待账户数据",
+            "Trading connection: not subscribed or awaiting account data",
+        )
+    } else if model.execution.private_ready(account, now) {
+        tr(
+            l,
+            "交易连接：签名账户数据正常",
+            "Trading connection: signed account data is current",
+        )
+    } else {
+        tr(
+            l,
+            "交易连接：数据过期或正在重连",
+            "Trading connection: stale data or reconnecting",
+        )
     }
 }
 fn tr<'a>(language: Language, zh: &'a str, en: &'a str) -> &'a str {

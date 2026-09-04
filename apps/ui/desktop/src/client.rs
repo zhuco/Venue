@@ -34,6 +34,10 @@ pub enum ClientEvent {
     },
     TerminalExecutions(Vec<ExecutorCommandSummary>),
     TerminalExecutionUpdated(ExecutorCommandSummary),
+    TerminalSubmissionUnavailable {
+        request_id: String,
+        message: String,
+    },
     TerminalExecutionsUnavailable(String),
     TerminalAccountUnavailable(String),
     GridInstances(Vec<venue_control_protocol::grid::GridInstanceSummary>),

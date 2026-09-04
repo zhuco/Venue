@@ -55,6 +55,9 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
         ));
     }
     let account_id = account_id.unwrap_or("—");
+    let account_label = model
+        .selected_execution_credential()
+        .map_or("—", |credential| credential.label.as_str());
     let asset = private_projection.and_then(|projection| {
         selected_account_asset(&projection.assets, &model.preferences.selected_symbol)
     });
@@ -208,8 +211,11 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
                         if total_width >= 1150.0 {
                             status_text(
                                 ui,
-                                110.0,
-                                format!("{}: {account_id}", text(language, TextKey::Account)),
+                                150.0,
+                                format!(
+                                    "{}: {account_label}",
+                                    text(language, TextKey::ExecutionAccount)
+                                ),
                                 theme::TEXT_SECONDARY,
                                 &funds_hint,
                             );

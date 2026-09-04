@@ -28,6 +28,8 @@ pub struct ExecutionViewState {
     pub terminal_executions_error: Option<String>,
     pub private_projection: Option<Arc<TerminalAccountProjection>>,
     pub terminal_executions: Vec<ExecutorCommandSummary>,
+    pub terminal_request_id: Option<String>,
+    pub terminal_submission_error: Option<String>,
     pub grid: crate::grid_view::GridViewState,
     private_received_ms: u64,
     tab: Tab,
@@ -35,6 +37,11 @@ pub struct ExecutionViewState {
 }
 
 impl ExecutionViewState {
+    pub fn begin_terminal_submission(&mut self, request_id: String) {
+        self.terminal_request_id = Some(request_id);
+        self.terminal_submission_error = None;
+    }
+
     pub fn apply_private(
         &mut self,
         projection: Option<TerminalAccountProjection>,
@@ -73,6 +80,13 @@ impl ExecutionViewState {
         if executions.iter().any(|summary| summary.validate().is_err()) {
             self.terminal_executions_error = Some("Invalid terminal execution history".into());
         } else {
+            if self.terminal_request_id.as_deref().is_some_and(|id| {
+                executions
+                    .iter()
+                    .any(|summary| summary.request_id.as_deref() == Some(id))
+            }) {
+                self.terminal_submission_error = None;
+            }
             self.terminal_executions = executions;
             self.terminal_executions_error = None;
         }
@@ -82,6 +96,9 @@ impl ExecutionViewState {
         if summary.validate().is_err() {
             self.terminal_executions_error = Some("Invalid terminal execution receipt".into());
             return;
+        }
+        if self.terminal_request_id.is_some() && summary.request_id == self.terminal_request_id {
+            self.terminal_submission_error = None;
         }
         self.terminal_executions
             .retain(|old| old.command_id != summary.command_id);
@@ -278,6 +295,7 @@ fn show_private_projection(
                             Key::Price,
                             Key::Size,
                             Key::State,
+                            Key::Reason,
                             Key::OrderId,
                             Key::Time,
                         ],
@@ -405,7 +423,19 @@ fn show_private_projection(
                                 ui.label(format!("{:?} / {:?}", row.order_side, row.position_side));
                                 market_price(ui, model, &row.symbol, row.limit_price);
                                 market_quantity(ui, model, &row.symbol, row.requested_quantity);
-                                ui.label(format!("{:?}", row.state));
+                                ui.label(crate::terminal_feedback::command_state(
+                                    row.state, language,
+                                ));
+                                ui.add_sized(
+                                    [260.0, 32.0],
+                                    egui::Label::new(crate::terminal_feedback::command_reason(
+                                        row, language,
+                                    ))
+                                    .truncate(),
+                                )
+                                .on_hover_text(
+                                    crate::terminal_feedback::command_reason(row, language),
+                                );
                                 ui.monospace(
                                     row.native_order_id
                                         .as_deref()
@@ -644,7 +674,12 @@ mod tests {
         first.validate()?;
         second.validate()?;
         let mut state = ExecutionViewState::default();
+        state.begin_terminal_submission(first.request_id.clone().ok_or("request missing")?);
+        state.terminal_submission_error = Some("request timed out".into());
+        state.apply_terminal_executions(vec![second.clone()]);
+        assert!(state.terminal_submission_error.is_some());
         state.apply_terminal_executions(vec![first.clone(), second.clone()]);
+        assert!(state.terminal_submission_error.is_none());
         state.apply_terminal_executions(vec![second]);
         assert_eq!(state.terminal_executions.len(), 1);
         state.apply_terminal_execution(first);

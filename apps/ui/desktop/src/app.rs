@@ -228,6 +228,17 @@ impl VenueFlowApp {
                 ClientEvent::TerminalExecutionsUnavailable(message) => {
                     self.model.execution.terminal_executions_error = Some(message)
                 }
+                ClientEvent::TerminalSubmissionUnavailable {
+                    request_id,
+                    message,
+                } => {
+                    if self.model.execution.terminal_request_id.as_deref()
+                        == Some(request_id.as_str())
+                    {
+                        self.model.execution.terminal_submission_error = Some(message.clone());
+                        self.model.notice(message);
+                    }
+                }
                 ClientEvent::TerminalAccountUnavailable(message) => {
                     self.model.execution.private_error = Some(message)
                 }

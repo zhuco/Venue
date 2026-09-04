@@ -18,6 +18,7 @@ mod model;
 mod order_book_view;
 mod settings_panel;
 mod symbol_picker;
+mod terminal_feedback;
 mod theme;
 mod trade_dock;
 mod trading;

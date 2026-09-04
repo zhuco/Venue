@@ -62,6 +62,7 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
             "An exact account, symbol and running scope are required; the server revalidates.",
         ));
     });
+    crate::terminal_feedback::show(ui, model);
     ui.separator();
     ui.horizontal(|ui| {
         ui.strong("Limit · Post Only");
@@ -445,7 +446,7 @@ pub fn apply_action(
         if let Some(reason) =
             action_disabled_reason(model, action, context.input(|input| input.time))
         {
-            model.notice(reason);
+            local_failure(model, reason);
         }
         return;
     }
@@ -453,13 +454,13 @@ pub fn apply_action(
         if let Some(reason) =
             action_disabled_reason(model, action, context.input(|input| input.time))
         {
-            model.notice(reason);
+            local_failure(model, reason);
             return;
         }
         let selection = match terminal_cancel_selection(model) {
             Ok(selection) => selection.clone(),
             Err(_) => {
-                model.notice("Selected order is no longer cancellable");
+                local_failure(model, "选中委托已不能撤销 [selection_unavailable]".into());
                 return;
             }
         };
@@ -470,36 +471,40 @@ pub fn apply_action(
             symbol: selection.symbol,
             native_order_id: selection.native_order_id,
         };
+        let request_id = request.request_id.clone();
         match client.send_terminal_cancel(request) {
             Ok(()) => {
+                model.execution.begin_terminal_submission(request_id);
                 model.trade_dock.clear_order_selection();
                 model.notice("Submitted exact order cancellation to the Binance Executor ledger");
             }
-            Err(error) => model.notice(format!("Exact cancellation rejected locally: {error}")),
+            Err(error) => local_failure(model, format!("撤单未提交 [local_rejected]：{error}")),
         }
         return;
     }
     if let Some(reason) = action_disabled_reason(model, action, context.input(|input| input.time)) {
-        model.notice(reason);
+        local_failure(model, reason);
         return;
     }
     model.trade_dock.armed_action = Some(action);
     let request = match build_terminal_request(model, action, context.input(|input| input.time)) {
         Ok(request) => request,
         Err(error) => {
-            model.notice(format!("Trading action rejected: {error}"));
+            local_failure(model, format!("下单未提交 [local_rejected]：{error}"));
             return;
         }
     };
+    let request_id = request.request_id.clone();
     match client.send_terminal(request) {
         Ok(()) => {
+            model.execution.begin_terminal_submission(request_id);
             model.trade_dock.armed_action = None;
             model.notice(format!(
                 "Submitted {:?} to the Binance Executor ledger",
                 action
             ));
         }
-        Err(error) => model.notice(format!("Trading request rejected locally: {error}")),
+        Err(error) => local_failure(model, format!("下单未提交 [local_rejected]：{error}")),
     }
 }
 
@@ -672,13 +677,21 @@ fn submit_market_close(
         close_quantity_cap: Some(close_quantity_cap),
         market_risk_confirmed: true,
     };
+    let request_id = request.request_id.clone();
     match client.send_terminal(request) {
         Ok(()) => {
+            model.execution.begin_terminal_submission(request_id);
             model.trade_dock.armed_action = None;
             model.notice("Submitted confirmed market close to the Binance Executor ledger");
         }
-        Err(error) => model.notice(format!("Market close rejected locally: {error}")),
+        Err(error) => local_failure(model, format!("市价平仓未提交 [local_rejected]：{error}")),
     }
+}
+
+fn local_failure(model: &mut AppModel, reason: String) {
+    model.execution.terminal_request_id = None;
+    model.execution.terminal_submission_error = Some(reason.clone());
+    model.notice(reason);
 }
 
 fn now_ms() -> u64 {

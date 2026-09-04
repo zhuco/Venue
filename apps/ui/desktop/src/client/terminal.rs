@@ -88,23 +88,41 @@ async fn submit<T: serde::Serialize>(
                 _ => publish(
                     sender,
                     context,
-                    ClientEvent::CommandUnavailable(format!("invalid {label} command receipt")),
+                    ClientEvent::TerminalSubmissionUnavailable {
+                        request_id: request_id.into(),
+                        message: format!(
+                            "{label} 回执无效，结果尚未确认；请核对历史委托，不要重复下单 [invalid_receipt]"
+                        ),
+                    },
                 ),
             }
             false
         }
         Ok(response) if response.status().as_u16() == 401 => {
+            publish(
+                sender,
+                context,
+                ClientEvent::TerminalSubmissionUnavailable {
+                    request_id: request_id.into(),
+                    message: crate::terminal_feedback::http_error(
+                        401,
+                        br#"{"code":"unauthorized"}"#,
+                    ),
+                },
+            );
             publish(sender, context, ClientEvent::SessionExpired);
             true
         }
         Ok(response) => {
+            let status = response.status().as_u16();
+            let body = safe_error_body(response).await;
             publish(
                 sender,
                 context,
-                ClientEvent::CommandUnavailable(format!(
-                    "{label} returned HTTP {}",
-                    response.status()
-                )),
+                ClientEvent::TerminalSubmissionUnavailable {
+                    request_id: request_id.into(),
+                    message: crate::terminal_feedback::http_error(status, &body),
+                },
             );
             false
         }
@@ -112,9 +130,38 @@ async fn submit<T: serde::Serialize>(
             publish(
                 sender,
                 context,
-                ClientEvent::CommandUnavailable(format!("{label} failed: {error}")),
+                ClientEvent::TerminalSubmissionUnavailable {
+                    request_id: request_id.into(),
+                    message: format!(
+                        "{label} {}；结果尚未确认，请核对历史委托，不要重复下单 [{}]",
+                        if error.is_timeout() {
+                            "请求超时"
+                        } else {
+                            "连接异常"
+                        },
+                        if error.is_timeout() {
+                            "request_timeout"
+                        } else {
+                            "transport_unavailable"
+                        }
+                    ),
+                },
             );
             false
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn safe_error_body(response: reqwest::Response) -> Vec<u8> {
+    use futures_util::StreamExt;
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(Ok(chunk)) = stream.next().await {
+        if body.len().saturating_add(chunk.len()) > 8_192 {
+            return Vec::new();
+        }
+        body.extend_from_slice(&chunk);
+    }
+    body
 }

@@ -205,6 +205,28 @@ async fn ordinary_terminal_reads_only_its_verified_account_projection() -> TestR
     assert_eq!(owned.assets.len(), 1);
     assert_eq!(owned.position_history.len(), 1);
     assert_eq!(owned.position_history[0].position, owned.positions[0]);
+    s.post(
+        SELECT_PATH,
+        Some(&alice),
+        &CredentialRequest {
+            credential_id: credential.credential_id.clone(),
+        },
+    )
+    .send()
+    .await?
+    .error_for_status()?;
+    let restarted = AccountService::new(f.pool.clone(), CredentialCipher::from_key(&[17; 32])?)?;
+    let restored_principal = restarted.authenticate(alice.token.expose(), now()).await?;
+    let restored = restarted.overview(&restored_principal, now()).await?;
+    assert_eq!(
+        restored.selected_credential_id.as_deref(),
+        Some(credential.credential_id.as_str())
+    );
+    assert_eq!(
+        restored.credentials[0].verification,
+        ApiVerificationState::Verified
+    );
+    assert_eq!(restored.credentials[0].verified_ms, Some(observed));
     verify_grid_history(&f, &s, &alice, &bob, &credential, account).await?;
     code(
         s.post(KOL_TERMINAL_ACCOUNT_PATH, None, &request)

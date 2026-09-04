@@ -81,14 +81,8 @@ pub fn show_top_bar(
             let mut workspace_selection = workspaces.active;
             let account_overview = model.account_overview.clone();
             let mut account_selection_requested = None;
-            let account_label = account_overview
-                .as_ref()
-                .and_then(|overview| {
-                    overview.credentials.iter().find(|credential| {
-                        overview.selected_credential_id.as_deref()
-                            == Some(credential.credential_id.as_str())
-                    })
-                })
+            let account_label = model
+                .selected_execution_credential()
                 .map(|credential| credential.label.clone())
                 .unwrap_or_else(|| text(language, TextKey::ExecutionAccount).to_owned());
             let ((), search_response) = egui::containers::Sides::new()

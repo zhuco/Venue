@@ -75,10 +75,73 @@ fn saved_selection_is_not_authentication_and_api_success_is_not_node_online() {
     model.apply_account_overview(overview());
     assert!(credential().selectable(now_ms()));
     assert_eq!(
-        node_status(Language::SimplifiedChinese, &model, &credential(), now_ms()),
-        "执行节点：未连接或暂无新鲜状态"
+        private_account_status(Language::SimplifiedChinese, &model, &credential(), now_ms()),
+        "交易连接：未订阅或等待账户数据"
     );
     assert!(model.selected_trading_strategy().is_none());
+}
+
+#[test]
+fn account_connection_uses_the_same_private_projection_as_positions()
+-> Result<(), Box<dyn std::error::Error>> {
+    use venue_control_protocol::kol::{
+        TERMINAL_PROJECTION_SCHEMA_VERSION, TerminalAccountProjection, TerminalPositionMode,
+    };
+    let mut model = AppModel::new(Preferences::default());
+    let mut selected = credential();
+    selected.credential_id = "00000000-0000-4000-8000-000000000002".into();
+    let observed = now_ms();
+    model.execution.apply_private(
+        Some(TerminalAccountProjection {
+            schema_version: TERMINAL_PROJECTION_SCHEMA_VERSION,
+            credential_id: selected.credential_id.clone(),
+            trading_account_id: selected
+                .trading_account_id
+                .clone()
+                .ok_or("missing fixture account")?,
+            observed_ms: observed,
+            persisted_ms: observed,
+            private_generation: 1,
+            position_mode: TerminalPositionMode::Hedge,
+            positions: vec![],
+            position_history: vec![],
+            open_orders: vec![],
+            fills: vec![],
+            assets: vec![],
+        }),
+        &mut model.trade_dock,
+    );
+    assert!(model.snapshot.is_none());
+    assert_eq!(
+        private_account_status(Language::SimplifiedChinese, &model, &selected, observed),
+        "交易连接：签名账户数据正常"
+    );
+    assert_eq!(
+        private_account_status(
+            Language::SimplifiedChinese,
+            &model,
+            &selected,
+            observed + 16_000
+        ),
+        "交易连接：数据过期或正在重连"
+    );
+    let mut other_binding = selected.clone();
+    other_binding.credential_id = "00000000-0000-4000-8000-000000000003".into();
+    assert_eq!(
+        private_account_status(
+            Language::SimplifiedChinese,
+            &model,
+            &other_binding,
+            observed
+        ),
+        "交易连接：未订阅或等待账户数据"
+    );
+    model.execution.private_error = Some("fixture disconnected".into());
+    assert_eq!(
+        private_account_status(Language::SimplifiedChinese, &model, &selected, observed),
+        "交易连接：数据过期或正在重连"
+    );
+    Ok(())
 }
 
 fn collect_text(shape: &egui::Shape, output: &mut String) {
@@ -94,6 +157,74 @@ fn collect_text(shape: &egui::Shape, output: &mut String) {
         }
         _ => (),
     }
+}
+
+#[test]
+fn credential_management_is_a_table_with_all_rows_and_no_card_pager() {
+    let context = egui::Context::default();
+    crate::theme::apply(&context);
+    let mut model = AppModel::new(Preferences::default());
+    let mut accounts = overview();
+    accounts.credentials = (0..3)
+        .map(|index| {
+            let mut value = credential();
+            value.credential_id = format!("fixture-binding-{index}");
+            value.label = format!("账户备注-{index}");
+            value
+        })
+        .collect();
+    accounts.selected_credential_id = Some(accounts.credentials[1].credential_id.clone());
+    model.apply_account_overview(accounts);
+    let mut state = AccountCenter {
+        session: Some(session()),
+        ..Default::default()
+    };
+    let mut visible = true;
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+    let mut rendered = String::new();
+    for _ in 0..3 {
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| show(ui.ctx(), &mut visible, &mut state, &mut model),
+        );
+        output.textures_delta.clear();
+        rendered.clear();
+        for shape in output.shapes {
+            collect_text(&shape.shape, &mut rendered);
+        }
+    }
+    assert!(
+        context
+            .memory(|memory| memory.area_rect(egui::Id::new("account-center")))
+            .is_some_and(|rect| screen.contains_rect(rect))
+    );
+    for required in [
+        "备注 / API Key",
+        "交易所",
+        "账户类型",
+        "交易账户",
+        "验证 API",
+        "设为执行账户",
+        "当前执行账户",
+        "删除账户",
+        "账户备注-0",
+        "账户备注-1",
+        "账户备注-2",
+    ] {
+        assert!(
+            rendered.contains(required),
+            "missing {required}: {rendered}"
+        );
+    }
+    assert!(!rendered.contains("上一项") && !rendered.contains("下一项"));
+    assert!(
+        model
+            .selected_execution_credential()
+            .is_some_and(|credential| credential.label == "账户备注-1")
+    );
 }
 
 #[test]
@@ -358,6 +489,17 @@ fn restored_session_requires_server_identity_and_does_not_authorize_offline() {
     assert!(state.poll(&mut model, &context));
     assert!(state.session.is_some() && state.restoring.is_none());
     assert!(model.account_overview.is_some());
+    assert_eq!(
+        model
+            .selected_execution_credential()
+            .map(|credential| credential.label.as_str()),
+        Some("主账户")
+    );
+    assert!(
+        model
+            .selected_execution_credential()
+            .is_some_and(|credential| credential.selectable(now_ms()))
+    );
     assert!(model.selected_trading_strategy().is_none());
 }
 
