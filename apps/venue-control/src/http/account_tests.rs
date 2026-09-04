@@ -205,6 +205,7 @@ async fn ordinary_terminal_reads_only_its_verified_account_projection() -> TestR
     assert_eq!(owned.assets.len(), 1);
     assert_eq!(owned.position_history.len(), 1);
     assert_eq!(owned.position_history[0].position, owned.positions[0]);
+    verify_grid_history(&f, &s, &alice, &bob, &credential, account).await?;
     code(
         s.post(KOL_TERMINAL_ACCOUNT_PATH, None, &request)
             .send()
@@ -236,6 +237,119 @@ async fn ordinary_terminal_reads_only_its_verified_account_projection() -> TestR
     .await?;
     s.stop().await?;
     f.cleanup().await
+}
+
+async fn verify_grid_history(
+    f: &Fixture,
+    server: &Server,
+    owner: &SessionResponse,
+    other: &SessionResponse,
+    credential: &CredentialSummary,
+    account: &str,
+) -> TestResult {
+    use crate::grid_store::{
+        BinanceGridStore, GridCommandIntent, GridDesiredOrder, GridLedgerCommand,
+    };
+    use venue_control_protocol::{
+        grid::{GridOrderRole, GridOrderSemanticKey},
+        kol::{ExecutorCommandOrigin, ExecutorCommandSummary, KOL_EXECUTION_STATUS_PATH},
+    };
+    let created = server
+        .post(
+            GRID_INSTANCES_PATH,
+            Some(owner),
+            &GridInstanceCreateRequest {
+                schema_version: GRID_SCHEMA_VERSION,
+                request_id: "00000000-0000-4000-8000-000000000712".into(),
+                credential_id: credential.credential_id.clone(),
+                symbol: "BTC/USDT".parse()?,
+                config: grid_config(10),
+            },
+        )
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<GridInstanceSummary>()
+        .await?;
+    // Isolated database fixture only: no Executor or exchange is connected to this schema.
+    sqlx::query("UPDATE venue_binance_grid_instances SET instance_state='running',plan_revision=1 WHERE instance_id=$1")
+        .bind(&created.instance_id).execute(&f.pool).await?;
+    let key = GridOrderSemanticKey {
+        position_side: venue_domain::PositionSide::Long,
+        role: GridOrderRole::Open,
+        level: 1,
+        sequence: 1,
+    };
+    let command = GridLedgerCommand {
+        command_id: format!("gp-{}", "a".repeat(55)),
+        client_order_id: "vgp-history-fixture".into(),
+        instance_id: created.instance_id,
+        config_revision: 1,
+        plan_revision: 1,
+        semantic_key: key.encoded(),
+        rule_version: "binance-pm-um-history-fixture".into(),
+        source_digest: [19; 32],
+        intent: GridCommandIntent::LimitPostOnly {
+            key: key.clone(),
+            quantity: rust_decimal::Decimal::new(1, 3),
+            limit_price: rust_decimal::Decimal::from(49_900),
+        },
+    };
+    let store = BinanceGridStore::new(f.pool.clone());
+    let planned_ms = now();
+    store
+        .commit_plan_surface(
+            &command.instance_id,
+            created.revision,
+            1,
+            1,
+            1,
+            None,
+            command.source_digest,
+            &[GridDesiredOrder {
+                key,
+                client_order_id: command.client_order_id.clone(),
+                quantity: rust_decimal::Decimal::new(1, 3),
+                limit_price: rust_decimal::Decimal::from(49_900),
+            }],
+            planned_ms,
+            planned_ms,
+        )
+        .await?;
+    store.enqueue_command(&command, now()).await?;
+    let response = server
+        .get(KOL_EXECUTION_STATUS_PATH, Some(owner))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let history = response.json::<Vec<ExecutorCommandSummary>>().await?;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].command_id, command.command_id);
+    assert_eq!(history[0].origin, ExecutorCommandOrigin::Grid);
+    assert_eq!(history[0].trading_account_id, account);
+    history[0].validate()?;
+    let foreign = server
+        .get(KOL_EXECUTION_STATUS_PATH, Some(other))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<ExecutorCommandSummary>>()
+        .await?;
+    assert!(foreign.is_empty());
+    code(
+        server.get(KOL_EXECUTION_STATUS_PATH, None).send().await?,
+        401,
+        AccountErrorCode::Unauthorized,
+    )
+    .await?;
+    Ok(())
 }
 
 async fn seed_enabled_invite(fixture: &Fixture) -> TestResult {

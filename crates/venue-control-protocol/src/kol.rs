@@ -565,7 +565,15 @@ pub struct ExecutorCommandSummary {
 
 impl ExecutorCommandSummary {
     pub fn validate(&self) -> Result<(), KolProtocolError> {
-        if !canonical_id(&self.command_id)
+        // Grid stores bounded opaque ledger IDs, not account UUIDs. Keep the stricter
+        // identity contract for terminal/copy commands and every account/request ID.
+        let valid_command_id = match self.origin {
+            ExecutorCommandOrigin::Grid => bounded_plain(&self.command_id, 1, 128),
+            ExecutorCommandOrigin::Copy | ExecutorCommandOrigin::Terminal => {
+                canonical_id(&self.command_id)
+            }
+        };
+        if !valid_command_id
             || !is_canonical_trading_account_id(&self.trading_account_id)
             || self
                 .request_id
@@ -743,6 +751,79 @@ mod tests {
             serde_json::to_string(&ExecutorCommandState::ReconcileRequired)?,
             r#""reconcile_required""#
         );
+        Ok(())
+    }
+
+    #[test]
+    fn grid_command_history_preserves_opaque_ledger_ids() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut summary = ExecutorCommandSummary {
+            command_id: format!("gp-{}", "a".repeat(55)),
+            request_id: None,
+            origin: ExecutorCommandOrigin::Grid,
+            phase: ExecutorCommandPhase::Open,
+            trading_account_id: ID_1.into(),
+            symbol: "SOL/USDC".parse()?,
+            position_side: Some(PositionSide::Long),
+            order_side: Some(OrderSide::Buy),
+            order_kind: ExecutorOrderKind::LimitPostOnly,
+            requested_quantity: Some(Decimal::new(5, 2)),
+            limit_price: Some(Decimal::from(80)),
+            state: ExecutorCommandState::Reconciled,
+            native_order_id: Some("123456789".into()),
+            created_ms: 10,
+            updated_ms: 20,
+            sanitized_error_code: None,
+        };
+        for phase in [ExecutorCommandPhase::Open, ExecutorCommandPhase::Close] {
+            summary.phase = phase;
+            assert_eq!(summary.validate(), Ok(()));
+            let decoded: ExecutorCommandSummary =
+                serde_json::from_str(&serde_json::to_string(&summary)?)?;
+            assert_eq!(decoded, summary);
+            decoded.validate()?;
+        }
+        for origin in [ExecutorCommandOrigin::Terminal, ExecutorCommandOrigin::Copy] {
+            summary.origin = origin;
+            assert_eq!(summary.validate(), Err(KolProtocolError::CommandSummary));
+            let mut canonical = summary.clone();
+            canonical.command_id = ID_2.into();
+            assert_eq!(canonical.validate(), Ok(()));
+        }
+        summary.origin = ExecutorCommandOrigin::Grid;
+        for invalid in [
+            String::new(),
+            " ".into(),
+            "gp-\ninvalid".into(),
+            "a".repeat(129),
+        ] {
+            let mut invalid_summary = summary.clone();
+            invalid_summary.command_id = invalid;
+            assert_eq!(
+                invalid_summary.validate(),
+                Err(KolProtocolError::CommandSummary)
+            );
+        }
+        let mut invalid_account = summary.clone();
+        invalid_account.trading_account_id = summary.command_id.clone();
+        assert_eq!(
+            invalid_account.validate(),
+            Err(KolProtocolError::CommandSummary)
+        );
+        let mut invalid_request = summary.clone();
+        invalid_request.request_id = Some(summary.command_id.clone());
+        assert_eq!(
+            invalid_request.validate(),
+            Err(KolProtocolError::CommandSummary)
+        );
+        summary.command_id = format!("gc-{}", "b".repeat(55));
+        summary.phase = ExecutorCommandPhase::Cancel;
+        summary.order_kind = ExecutorOrderKind::CancelExact;
+        summary.position_side = None;
+        summary.order_side = None;
+        summary.requested_quantity = None;
+        summary.limit_price = None;
+        assert_eq!(summary.validate(), Ok(()));
         Ok(())
     }
 }
