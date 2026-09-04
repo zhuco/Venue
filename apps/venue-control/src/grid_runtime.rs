@@ -62,6 +62,8 @@ pub use fast_path::{GRID_PRIVATE_STREAM_CHANNEL_CAPACITY, GridPrivateStreamSigna
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum BinanceGridRuntimeError {
+    #[error("Grid cold convergence was superseded by a newer durable revision")]
+    Superseded,
     #[error("grid storage is unavailable")]
     Store,
     #[error("signed private projection is unavailable")]
@@ -80,6 +82,12 @@ pub enum BinanceGridRuntimeError {
 
 impl From<GridStoreError> for BinanceGridRuntimeError {
     fn from(error: GridStoreError) -> Self {
+        if error == GridStoreError::Conflict {
+            // A hot authenticated-fill batch uses the same revision CAS as the cold supervisor.
+            // Its committed revision is the authoritative next input, so a cold reader that began
+            // earlier must reload rather than report an unavailable store or change lifecycle.
+            return Self::Superseded;
+        }
         eprintln!("Binance Grid storage operation failed: {error}");
         Self::Store
     }
@@ -181,6 +189,14 @@ impl BinanceGridRuntime {
         for record in records {
             match self.process(record.clone()).await {
                 Ok(changed) => progressed = progressed.saturating_add(usize::from(changed)),
+                Err(BinanceGridRuntimeError::Superseded) => {
+                    tracing::debug!(
+                        target: "venue_control::grid_runtime",
+                        instance_id = %record.instance.instance_id,
+                        "Grid cold turn was superseded by an authenticated mutation batch"
+                    );
+                    continue;
+                }
                 Err(error) => {
                     eprintln!(
                         "Binance Grid instance {} turn failed: {error}",
@@ -234,7 +250,9 @@ impl BinanceGridRuntime {
                             }
                             continue;
                         }
-                        BinanceGridRuntimeError::Store | BinanceGridRuntimeError::Clock => continue,
+                        BinanceGridRuntimeError::Superseded
+                        | BinanceGridRuntimeError::Store
+                        | BinanceGridRuntimeError::Clock => continue,
                     };
                     let _ = self.block_if_running(&record, code, now_ms()?).await;
                 }
@@ -1702,6 +1720,23 @@ impl BinanceGridRuntime {
                 .await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod runtime_error_tests {
+    use super::*;
+
+    #[test]
+    fn durable_cas_conflict_only_supersedes_a_cold_turn() {
+        assert_eq!(
+            BinanceGridRuntimeError::from(GridStoreError::Conflict),
+            BinanceGridRuntimeError::Superseded
+        );
+        assert_eq!(
+            BinanceGridRuntimeError::from(GridStoreError::Unavailable),
+            BinanceGridRuntimeError::Store
+        );
     }
 }
 
