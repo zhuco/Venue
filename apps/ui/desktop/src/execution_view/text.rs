@@ -35,6 +35,7 @@ pub enum Key {
     OrderHistoryScope,
     FillsScope,
     PositionHistoryScope,
+    AssetsScope,
 }
 
 pub fn text(language: Language, key: Key) -> &'static str {
@@ -89,6 +90,10 @@ pub fn text(language: Language, key: Key) -> &'static str {
         Key::PositionHistoryScope => (
             "最近 500 条仓位变更，数量为 0 表示该腿已平；不包含绑定前完整历史或已实现盈亏。",
             "Last 500 observed position changes; zero quantity means that leg closed. Not full pre-binding history or realized PnL.",
+        ),
+        Key::AssetsScope => (
+            "最近一次签名资产快照；USD 是统一账户计价，不等于 USDC 余额。资产不随仓位事件实时刷新。",
+            "Latest signed asset snapshot. USD is portfolio valuation, not a USDC balance. Position events do not refresh balances.",
         ),
     };
     match language {

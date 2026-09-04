@@ -228,6 +228,9 @@ fn show_private_projection(
     if model.execution.tab == Tab::Fills {
         ui.small(text(language, Key::FillsScope));
     }
+    if model.execution.tab == Tab::Assets {
+        ui.small(text(language, Key::AssetsScope));
+    }
     let selected_symbol = model
         .execution
         .current_symbol

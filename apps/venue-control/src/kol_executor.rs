@@ -1329,9 +1329,7 @@ mod tests {
             .map(|offset| settle_start + offset)
             .expect("settlement boundary");
         let settle = &source[settle_start..settle_end];
-        let begin = settle
-            .find(".pool\n            .begin()")
-            .expect("transaction begin");
+        let begin = settle.find(".begin()").expect("transaction begin");
         let command_update = settle
             .find("UPDATE venue_binance_commands SET command_state")
             .expect("command update");

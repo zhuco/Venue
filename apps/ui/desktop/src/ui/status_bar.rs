@@ -7,12 +7,15 @@ use crate::{
     theme,
 };
 
-fn selected_quote_asset<'a>(
+fn selected_account_asset<'a>(
     assets: &'a [TerminalAsset],
     selected_symbol: &str,
 ) -> Option<&'a TerminalAsset> {
     let quote = selected_symbol.split_once('/')?.1;
-    assets.iter().find(|asset| asset.asset == quote)
+    assets
+        .iter()
+        .find(|asset| asset.asset == quote)
+        .or_else(|| assets.iter().find(|asset| asset.asset == "USD"))
 }
 
 pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
@@ -53,17 +56,17 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
     }
     let account_id = account_id.unwrap_or("—");
     let asset = private_projection.and_then(|projection| {
-        selected_quote_asset(&projection.assets, &model.preferences.selected_symbol)
+        selected_account_asset(&projection.assets, &model.preferences.selected_symbol)
     });
     let funds_hint = format!(
         "{}: {account_id}\n{}",
         text(language, TextKey::Account),
         match language {
             crate::i18n::Language::SimplifiedChinese => {
-                "资金与交易连接使用同一份 Binance Executor 签名私有投影。"
+                "资金来自同一账户最近的签名资产快照；USD 为统一账户计价，不转换为当前交易对报价币。资产不随仓位事件实时刷新。"
             }
             crate::i18n::Language::English => {
-                "Funds and trading connectivity use the same signed Binance Executor projection."
+                "Latest signed asset snapshot for the same account. USD is portfolio valuation, not converted to the symbol quote. Position events do not refresh balances."
             }
         }
     );
@@ -245,10 +248,28 @@ mod tests {
             },
         ];
         assert_eq!(
-            selected_quote_asset(&assets, "SOL/USDC").map(|asset| asset.equity),
+            selected_account_asset(&assets, "SOL/USDC").map(|asset| asset.equity),
             Some(rust_decimal::Decimal::new(2, 0))
         );
-        assert!(selected_quote_asset(&assets, "SOL/FDUSD").is_none());
-        assert!(selected_quote_asset(&assets, "INVALID").is_none());
+        assert!(selected_account_asset(&assets, "SOL/FDUSD").is_none());
+        assert!(selected_account_asset(&assets, "INVALID").is_none());
+    }
+
+    #[test]
+    fn portfolio_usd_valuation_is_visible_without_relabeling_it_as_usdc() {
+        let assets = vec![TerminalAsset {
+            asset: "USD".into(),
+            equity: rust_decimal::Decimal::new(15397, 2),
+            available_margin: Some(rust_decimal::Decimal::new(14499, 2)),
+        }];
+        for symbol in ["SOL/USDC", "BTC/USDT"] {
+            let selected = selected_account_asset(&assets, symbol);
+            assert_eq!(selected.map(|asset| asset.asset.as_str()), Some("USD"));
+            assert_eq!(selected.map(|asset| asset.equity), Some(assets[0].equity));
+            assert_eq!(
+                selected.and_then(|asset| asset.available_margin),
+                assets[0].available_margin
+            );
+        }
     }
 }

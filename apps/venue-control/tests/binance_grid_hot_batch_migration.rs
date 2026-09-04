@@ -39,7 +39,13 @@ fn grid_hot_batch_migration_preserves_legacy_rows_and_bounds_new_batches() {
         assert!(MIGRATION_0023.contains(required), "missing {required}");
     }
 
-    assert!(MIGRATION_0023.contains("WHERE command_origin = 'grid'\n  AND grid_batch_id IS NULL"));
+    assert!(
+        MIGRATION_0023
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("WHERE command_origin = 'grid' AND grid_batch_id IS NULL")
+    );
     assert!(!MIGRATION_0023.contains("'legacy:'"));
     assert!(!MIGRATION_0023.contains("UPDATE venue_binance_account_fills"));
 }
