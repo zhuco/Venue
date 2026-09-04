@@ -625,6 +625,8 @@ pub struct BinanceMutationAck {
     time_in_force: Option<LimitTimeInForce>,
     pub accepted_at_ms: u64,
     pub received_at_ms: u64,
+    /// Full RESULT response, when present. Identity-only ACKs never imply an order state.
+    pub order: Option<Order>,
 }
 
 pub fn parse_mutation_ack(
@@ -664,11 +666,18 @@ pub fn parse_mutation_ack(
         instrument_generation: request.instrument_generation,
         private_generation: request.private_generation,
         kind: request.kind,
-        order_id,
+        order_id: order_id.clone(),
         client_order_id: client_order_id.to_owned(),
         time_in_force: request.limit_time_in_force()?,
         accepted_at_ms,
         received_at_ms,
+        order: std::str::from_utf8(payload)
+            .ok()
+            .and_then(|payload| crate::private::parse_order(payload, &request.binding.symbol).ok())
+            .filter(|order| {
+                order.order_id == order_id
+                    && order.client_order_id == FieldState::Known(client_order_id.to_owned())
+            }),
     })
 }
 
@@ -1174,6 +1183,19 @@ mod tests {
         let facts = facts("00000000-0000-4000-8000-000000000001")?;
         let request = prepare_place_limit(&facts.rules, &facts.readback, &place_intent()?)?;
         let ack = parse_mutation_ack(&request, facts.readback.scope(), ACK, 2_000)?;
+        assert!(ack.order.is_some());
+        let mut identity_only: serde_json::Value = serde_json::from_slice(ACK)?;
+        identity_only["status"] = serde_json::Value::Null;
+        let identity_ack = parse_mutation_ack(
+            &request,
+            facts.readback.scope(),
+            &serde_json::to_vec(&identity_only)?,
+            2_000,
+        )?;
+        assert!(
+            identity_ack.order.is_none(),
+            "identity-only ACK is not a full RESULT"
+        );
         let exact_request = request.exact_readback_request(facts.readback.scope())?;
         let exact_page =
             BinanceRawPrivatePage::new(&exact_request, 2_100, 2_200, Bytes::from_static(EXACT))?;

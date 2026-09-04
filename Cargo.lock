@@ -4758,6 +4758,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "venue-control-protocol",
  "venue-copy",
  "venue-domain",

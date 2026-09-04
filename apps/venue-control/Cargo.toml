@@ -21,6 +21,7 @@ sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber = "0.3"
 venue-control-protocol = { path = "../../crates/venue-control-protocol" }
 venue-copy = { path = "../../crates/venue-copy" }
 venue-domain = { path = "../../crates/venue-domain" }

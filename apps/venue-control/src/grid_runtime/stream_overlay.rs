@@ -118,7 +118,12 @@ pub(super) fn apply_stream_overlay(
             return Err(GridStreamOverlayError::Cumulative);
         }
 
-        apply_position_delta(&mut projection, &owners[owner_index], event.fill.quantity)?;
+        apply_position_delta(
+            &mut projection,
+            &owners[owner_index],
+            event.fill.quantity,
+            event.fill.price,
+        )?;
         owners[owner_index].filled_quantity = evidence.cumulative;
         owners[owner_index].last_seen_ms =
             owners[owner_index].last_seen_ms.max(event.received_at_ms);
@@ -483,6 +488,7 @@ fn apply_position_delta(
     projection: &mut TerminalAccountProjection,
     owner: &GridOrderOwnership,
     quantity: Decimal,
+    fill_price: venue_domain::domain::Price,
 ) -> Result<(), GridStreamOverlayError> {
     let mut matches = projection.positions.iter_mut().filter(|position| {
         position.symbol == owner.symbol && position.position_side == owner.key.position_side
@@ -491,12 +497,35 @@ fn apply_position_delta(
     if matches.next().is_some() || position.quantity < Decimal::ZERO {
         return Err(GridStreamOverlayError::Baseline);
     }
-    position.quantity = match owner.key.role {
+    let next_quantity = match owner.key.role {
         GridOrderRole::Open => position.quantity.checked_add(quantity),
         GridOrderRole::Close => position.quantity.checked_sub(quantity),
     }
     .filter(|value| *value >= Decimal::ZERO)
     .ok_or(GridStreamOverlayError::Baseline)?;
+    if owner.key.role == GridOrderRole::Open {
+        let prior_cost = if position.quantity.is_zero() {
+            Some(Decimal::ZERO)
+        } else {
+            position
+                .entry_price
+                .and_then(|price| price.checked_mul(position.quantity))
+        };
+        position.entry_price = Some(
+            prior_cost
+                .and_then(|cost| {
+                    fill_price
+                        .value()
+                        .checked_mul(quantity)
+                        .and_then(|fill| cost.checked_add(fill))
+                })
+                .and_then(|cost| cost.checked_div(next_quantity))
+                .ok_or(GridStreamOverlayError::Baseline)?,
+        );
+    } else if next_quantity.is_zero() {
+        position.entry_price = None;
+    }
+    position.quantity = next_quantity;
     Ok(())
 }
 
@@ -529,6 +558,78 @@ mod tests {
     const INSTANCE_ID: &str = "00000000-0000-4000-8000-000000000001";
     const CREDENTIAL_ID: &str = "00000000-0000-4000-8000-000000000002";
     const ACCOUNT_ID: &str = "00000000-0000-4000-8000-000000000003";
+
+    #[test]
+    fn enabled_inventory_and_profit_policies_do_not_disable_stream_rolling()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::{
+            ActualSurface, BinanceGridRuntime, fast_path::ordinary_stream_record_eligible,
+            private_facts,
+        };
+        let mut record = record()?;
+        record.instance.config.inventory_replenishment.enabled = true;
+        record.instance.config.profit_reduction.enabled = true;
+        assert!(ordinary_stream_record_eligible(&record, false));
+        let projection = projection(&[])?;
+        let actual = ActualSurface {
+            ownership: BTreeMap::new(),
+            orders: BTreeMap::new(),
+            intents: vec![],
+            other_close_reservations: Default::default(),
+        };
+        let private = private_facts(&record, &projection, &actual)?;
+        let mut conversion = venue_gateway_binance::portfolio::UsdConversionEvidence {
+            asset: "USDT".parse()?,
+            usd_per_asset: Decimal::new(99, 2),
+            private_generation: 3,
+            observed_at_ms: 100,
+            source_time_ms: 100,
+        };
+        let risk = BinanceGridRuntime::risk_from_conversion(
+            &record,
+            &projection,
+            &private,
+            conversion.clone(),
+        )?;
+        assert_eq!(risk.legs.len(), 2);
+        assert_eq!(risk.legs[0].notional, Decimal::from(990));
+        conversion.private_generation = 4;
+        assert!(
+            BinanceGridRuntime::risk_from_conversion(&record, &projection, &private, conversion)
+                .is_err()
+        );
+        record.instance.dirty = true;
+        assert!(!ordinary_stream_record_eligible(&record, false));
+        assert!(ordinary_stream_record_eligible(&record, true));
+        record.instance.state = GridInstanceState::Paused;
+        assert!(!ordinary_stream_record_eligible(&record, true));
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_open_preserves_weighted_entry_for_profit_risk()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut projection = projection(&[])?;
+        let owned = owner(
+            "client",
+            "native",
+            PositionSide::Long,
+            GridOrderRole::Open,
+            1,
+        )?;
+        apply_position_delta(
+            &mut projection,
+            &owned,
+            Decimal::from(10),
+            Price::new(Decimal::from(120))?,
+        )?;
+        assert_eq!(projection.positions[0].quantity, Decimal::from(20));
+        assert_eq!(
+            projection.positions[0].entry_price,
+            Some(Decimal::from(110))
+        );
+        Ok(())
+    }
 
     fn symbol() -> Result<Symbol, Box<dyn std::error::Error>> {
         Ok("BTC/USDT".parse()?)

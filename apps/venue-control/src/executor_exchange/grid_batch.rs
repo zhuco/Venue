@@ -177,8 +177,21 @@ impl BinanceHttpExecution {
         for (index, ack) in acknowledgements.into_iter().enumerate() {
             let Some(ack) = ack else { continue };
             outcomes[index] = Some(GridBatchCommandOutcome::Submitted(
-                self.grid_batch_signed_readback(&requests[index], credentials, scope, rules, &ack)
-                    .await,
+                if matches!(
+                    requests[index].order_kind,
+                    ExecutionOrderKind::Market { .. }
+                ) {
+                    self.grid_batch_signed_readback(
+                        &requests[index],
+                        credentials,
+                        scope,
+                        rules,
+                        &ack,
+                    )
+                    .await
+                } else {
+                    grid_result_outcome(&requests[index], rules, &ack)
+                },
             ));
         }
         let commands = outcomes
@@ -260,6 +273,59 @@ impl BinanceHttpExecution {
         outcome(state, Some(ack.order_id.clone()))
     }
 }
+
+/// A validated mutation RESULT is already an authenticated exchange fact. Missing or
+/// inconsistent results enter durable reconciliation; never add a synchronous query per child.
+fn grid_result_outcome(
+    request: &ExecutionRequest,
+    rules: &venue_gateway_binance::BinanceInstrumentRules,
+    ack: &BinanceMutationAck,
+) -> ExecutionOutcome {
+    use venue_domain::domain::{FieldState, OrderState};
+    let unknown = || outcome(ExecutionReadback::Unknown, Some(ack.order_id.clone()));
+    let Some(order) = &ack.order else {
+        return unknown();
+    };
+    if order.order_id != ack.order_id || order.symbol != request.symbol {
+        return unknown();
+    }
+    let state = match &request.order_kind {
+        ExecutionOrderKind::CancelExact {
+            target_client_order_id,
+            native_order_id,
+        } => {
+            if target_client_order_id
+                .as_ref()
+                .is_some_and(|id| order.client_order_id != FieldState::Known(id.clone()))
+                || native_order_id
+                    .as_ref()
+                    .is_some_and(|id| id != &order.order_id)
+            {
+                return unknown();
+            }
+            match order.state {
+                OrderState::Cancelled | OrderState::Expired => ExecutionReadback::Reconciled,
+                // A cancel racing a fill requires that fill to be incorporated before advancing.
+                _ => ExecutionReadback::Unknown,
+            }
+        }
+        ExecutionOrderKind::LimitPostOnly { .. }
+            if exact_place_matches(request, order, rules) == Ok(true) =>
+        {
+            match place_readback_decision(order.state, order.filled_quantity) {
+                PlaceReadbackDecision::Accepted => ExecutionReadback::Accepted,
+                PlaceReadbackDecision::Rejected => ExecutionReadback::Rejected,
+                _ => ExecutionReadback::Unknown,
+            }
+        }
+        _ => ExecutionReadback::Unknown,
+    };
+    outcome(state, Some(ack.order_id.clone()))
+}
+
+#[cfg(test)]
+#[path = "grid_result_tests.rs"]
+mod result_tests;
 
 struct GridDispatchBurst {
     results: Vec<(usize, Result<BinanceMutationAck, BinanceTransportError>)>,

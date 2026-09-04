@@ -82,6 +82,7 @@ pub(super) struct GridHotPathState {
     dispatch_cache: crate::GridHotDispatchCache,
     records: BTreeMap<String, GridRuntimeRecord>,
     markets: BTreeMap<String, BinanceGridBootstrapMarketFacts>,
+    conversions: BTreeMap<String, venue_gateway_binance::portfolio::UsdConversionEvidence>,
     streams: BTreeMap<String, GridStreamCache>,
 }
 
@@ -99,6 +100,7 @@ impl GridHotPathState {
             dispatch_cache,
             records: BTreeMap::new(),
             markets: BTreeMap::new(),
+            conversions: BTreeMap::new(),
             streams: BTreeMap::new(),
         }
     }
@@ -141,6 +143,14 @@ impl GridHotPathState {
 
     pub(super) fn wake_commands(&self) {
         self.command_wake.wake();
+    }
+
+    pub(super) fn cache_conversion(
+        &mut self,
+        instance: String,
+        conversion: venue_gateway_binance::portfolio::UsdConversionEvidence,
+    ) {
+        self.conversions.insert(instance, conversion);
     }
 
     fn invalidate_credential(&mut self, credential_id: &str) {
@@ -236,7 +246,9 @@ impl BinanceGridRuntime {
         source: &ActiveProjectionSource,
         events: Vec<BinancePrivateFillEvent>,
     ) -> bool {
-        if self.process_private_events(source, events).await.is_err() {
+        if let Err(error) = self.process_private_events(source, events).await {
+            tracing::warn!(target: "venue_control::grid_hot_path", error = %error,
+                "Grid stream planning requires signed recovery");
             self.hot_path.invalidate_credential(&source.credential_id);
             self.hot_path.request_recovery(&source.credential_id);
             false
@@ -371,11 +383,7 @@ impl BinanceGridRuntime {
                     && cache.tail_batch_id == record.tail_batch_id
             })
             .cloned();
-        if record.instance.state != GridInstanceState::Running
-            || (record.instance.dirty && cached.is_none())
-            || record.instance.config.inventory_replenishment.enabled
-            || record.instance.config.profit_reduction.enabled
-        {
+        if !ordinary_stream_record_eligible(&record, cached.is_some()) {
             return Err(BinanceGridRuntimeError::Facts);
         }
         let now = now_ms()?;
@@ -500,6 +508,27 @@ impl BinanceGridRuntime {
         self.add_command_reservations(&record, &overlaid.projection, &mut actual)
             .await?;
         let private = private_facts(&record, &overlaid.projection, &actual)?;
+        let risk = if record.instance.config.profit_reduction.enabled {
+            let conversion = self
+                .hot_path
+                .conversions
+                .get(&record.instance.instance_id)
+                .filter(|conversion| {
+                    conversion.private_generation == private_generation
+                        && conversion.observed_at_ms <= now
+                        && now.saturating_sub(conversion.observed_at_ms)
+                            <= record.instance.config.reset_policy.stale_market_ms
+                })
+                .ok_or(BinanceGridRuntimeError::Market)?;
+            Some(Self::risk_from_conversion(
+                &record,
+                &overlaid.projection,
+                &private,
+                conversion.clone(),
+            )?)
+        } else {
+            None
+        };
         let unallocated = self
             .store
             .load_unallocated_fills(&record.instance.instance_id, 0, MAX_FILL_BATCH)
@@ -556,7 +585,7 @@ impl BinanceGridRuntime {
                 pending_since_ms: None,
                 consecutive_failures: 0,
             },
-            risk: None,
+            risk,
             control: GridPlannerControl::Run,
             now_ms: now,
         })
@@ -779,6 +808,14 @@ impl BinanceGridRuntime {
         );
         Ok(())
     }
+}
+
+pub(super) fn ordinary_stream_record_eligible(
+    record: &GridRuntimeRecord,
+    has_continuation: bool,
+) -> bool {
+    record.instance.state == GridInstanceState::Running
+        && (!record.instance.dirty || has_continuation)
 }
 
 fn same_stream_batch(

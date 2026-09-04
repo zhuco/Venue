@@ -2,6 +2,8 @@
 
 更新：2026-09-03
 
+Grid 快速补撤确认位于 `apps/venue-control/src/executor_exchange/grid_batch.rs`，完整 RESULT 由 `crates/venue-gateway-binance/src/execution.rs` 复用规范订单解析器保留；缺证据走耐久对账，普通补撤不逐单回读。`grid_runtime/risk.rs` 复用签名投影与汇率热缓存计算风险，`grid_runtime/stream_overlay.rs` 按成交更新数量与加权开仓均价；相关回归在 `executor_exchange/grid_result_tests.rs` 和流投影测试中。
+
 当前目标是 Binance KOL 跟单 MVP 与事实驱动 Binance 对冲网格共用单例 `venue-executor-binance`；初期全站最多 5 个启用 KOL、200 个启用跟单账户。Scalping 和其余交易所迁移暂停。下面多数 Runtime/Node 入口是已提交代码或冻结兼容位置，不等于新链调用链。长期文档统一在本目录，仓库根 CODEMAP 仅作导航。
 
 当前可复用入口：`apps/venue-control/src/accounts/`（注册、登录、会话、凭证密文、邀请码归属、KOL、跟单、终端和 Grid 生命周期）、`crates/venue-gateway-binance/src/{credential_probe,account_gateway,execution,grid_market}.rs`（Portfolio Margin UM 验证、私流/签名 REST、Post Only、市价平仓与 Grid 公开事实）及同级 `apps/ui/{web,desktop}`。两套 UI 的入口判断先看 `apps/ui/README.md`。新链由 `0017`–`0024`、版本化终端/Grid/投影 DTO、用户作用域私有投影、旧 writer 门禁和唯一 `venue-executor-binance` 组装；启动仅在 explicit LIVE、PostgreSQL 和既有主密钥均有效时进行。

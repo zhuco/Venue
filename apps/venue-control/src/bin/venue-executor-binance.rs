@@ -37,6 +37,17 @@ const PROJECTION_PERSISTENCE_TIMEOUT: std::time::Duration = std::time::Duration:
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::filter::filter_fn(|metadata| {
+            *metadata.level() <= tracing::Level::WARN
+                || matches!(
+                    metadata.target(),
+                    "venue_control::grid_hot_path" | "venue_control::grid_dispatch"
+                )
+        }))
+        .with(tracing_subscriber::fmt::layer().with_ansi(false))
+        .init();
     let launch = ExecutorLaunchConfig::from_environment()?;
     let singleton = BinanceExecutorSingleton::acquire(&launch.database_url).await?;
     let pool = PgPoolOptions::new()
@@ -843,7 +854,7 @@ fn spawn_projection_worker(
                     refresh_at = std::time::Instant::now() + PROJECTION_POLL_INTERVAL;
                 }
                 if !private_changed {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
             Some(())
