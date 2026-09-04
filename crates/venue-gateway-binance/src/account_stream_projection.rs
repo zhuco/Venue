@@ -97,7 +97,6 @@ impl AccountStreamProjection {
         if event_ms <= self.baseline.observed_at_ms() {
             return Ok(());
         }
-        self.last_change_received_ms = frame.received_at_ms;
         if event == "ACCOUNT_UPDATE" {
             let update = value.get("a").ok_or_else(invalid)?;
             if !matches!(
@@ -119,8 +118,14 @@ impl AccountStreamProjection {
             if positions.is_empty() && text(update, "m")? == "ORDER" {
                 return Err(invalid());
             }
+            let mut changed = false;
             for row in positions {
-                let symbol = scoped_symbol(row, symbols)?;
+                // The authenticated account stream is shared by every enabled strategy on the
+                // account. An unrelated UM leg is not a gap in this projection; only the
+                // configured symbols contribute to its order/position continuity proof.
+                let Some(symbol) = scoped_symbol(row, symbols)? else {
+                    continue;
+                };
                 let side = position_side(row)?;
                 let quantity = decimal(row, "pa")?;
                 if (side == PositionSide::Long && quantity < Decimal::ZERO)
@@ -153,10 +158,16 @@ impl AccountStreamProjection {
                         mark_price: mark,
                     },
                 );
+                changed = true;
+            }
+            if changed {
+                self.last_change_received_ms = frame.received_at_ms;
             }
         } else {
             let order = value.get("o").ok_or_else(invalid)?;
-            let symbol = scoped_symbol(order, symbols)?;
+            let Some(symbol) = scoped_symbol(order, symbols)? else {
+                return Ok(());
+            };
             let side = position_side(order)?;
             let client = text(order, "c")?.to_owned();
             let native = number(order, "i")?.to_string();
@@ -283,6 +294,7 @@ impl AccountStreamProjection {
             } else {
                 self.orders.remove(&client);
             }
+            self.last_change_received_ms = frame.received_at_ms;
         }
         Ok(())
     }
@@ -425,13 +437,12 @@ fn position_side(value: &Value) -> Result<PositionSide, BinanceAccountGatewayErr
 fn scoped_symbol(
     value: &Value,
     symbols: &BTreeSet<Symbol>,
-) -> Result<Symbol, BinanceAccountGatewayError> {
+) -> Result<Option<Symbol>, BinanceAccountGatewayError> {
     let native = text(value, "s")?;
-    symbols
+    Ok(symbols
         .iter()
         .find(|symbol| crate::native_symbol(symbol) == native)
-        .cloned()
-        .ok_or_else(invalid)
+        .cloned())
 }
 
 #[cfg(test)]

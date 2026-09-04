@@ -127,17 +127,48 @@ fn position_may_precede_execution_and_idle_does_not_renew_baseline()
 }
 
 #[test]
-fn wrong_symbol_side_or_order_identity_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+fn malformed_in_scope_side_or_order_identity_fails_closed() -> Result<(), Box<dyn std::error::Error>>
+{
     for changed in [
-        NEW.replace("SOLUSDC", "ETHUSDC"),
         NEW.replace("LONG", "BOTH"),
         NEW.replace("\"q\":\"2\"", "\"q\":\"-2\""),
+        NEW.replace("\"s\":\"SOLUSDC\",", ""),
     ] {
         assert!(apply(&mut state()?, &changed).is_err());
     }
     let mut state = state()?;
     apply(&mut state, NEW)?;
     assert!(apply(&mut state, &FILL.replace("\"i\":44", "\"i\":45")).is_err());
+    Ok(())
+}
+
+#[test]
+fn unrelated_um_order_and_position_frames_do_not_invalidate_grid_projection()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut state = state()?;
+    apply(&mut state, NEW)?;
+    apply(
+        &mut state,
+        &FILL
+            .replace("SOLUSDC", "ETHUSDT")
+            .replace("\"E\":132", "\"E\":133"),
+    )?;
+    let mixed_positions = POSITION.replace(
+        "\"P\":[{\"s\":\"SOLUSDC\"",
+        "\"P\":[{\"s\":\"ETHUSDT\",\"ps\":\"LONG\",\"pa\":\"4\",\"ep\":\"100\",\"up\":\"0\"},{\"s\":\"SOLUSDC\"",
+    )
+    .replace("\"pa\":\"3\"", "\"pa\":\"1\"");
+    apply(&mut state, &mixed_positions)?;
+    let snapshot = state.snapshot(150, 2)?.ok_or("snapshot")?;
+    assert_eq!(snapshot.open_orders().len(), 1);
+    assert_eq!(snapshot.positions().len(), 2);
+    let sol: Symbol = "SOL/USDC".parse()?;
+    assert!(
+        snapshot
+            .positions()
+            .iter()
+            .all(|position| position.symbol == sol)
+    );
     Ok(())
 }
 

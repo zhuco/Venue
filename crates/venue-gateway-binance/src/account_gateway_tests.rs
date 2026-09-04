@@ -392,6 +392,32 @@ fn private_stream_terminal_order_and_expiry_request_signed_reconciliation()
 }
 
 #[test]
+fn private_stream_ignores_unrelated_um_frames_without_requesting_rest()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_, rules, binding) = limit_fixture()?;
+    for payload in [
+        br#"{"e":"ORDER_TRADE_UPDATE","fs":"UM","E":1000,"T":999,"o":{"s":"ETHUSDT","c":"manual-eth","x":"TRADE","X":"FILLED","S":"BUY","ps":"LONG","t":17,"i":11,"q":"0.1","z":"0.1","l":"0.1","L":"3000","m":false}}"#.as_slice(),
+        br#"{"e":"ACCOUNT_UPDATE","fs":"UM","E":1001,"T":1000,"a":{"m":"ORDER","P":[{"s":"ETHUSDT","ps":"LONG","pa":"0.1","ep":"3000","up":"0"}]}}"#.as_slice(),
+    ] {
+        assert!(normalize_private_stream_event(
+            BinanceRawPrivateFrame {
+                binding: binding.clone(),
+                instrument_generation: rules.instrument.generation,
+                private_generation: 9,
+                received_at_ms: 1_720_000_000_100,
+                payload: Bytes::copy_from_slice(payload),
+            },
+            &binding,
+            rules.instrument.generation,
+            9,
+            10,
+        )?
+        .is_none());
+    }
+    Ok(())
+}
+
+#[test]
 fn private_stream_reconnect_backoff_is_bounded_exponential_and_staggered() {
     let first = private_stream_reconnect_delay(10, 1, 1);
     let second = private_stream_reconnect_delay(10, 1, 2);

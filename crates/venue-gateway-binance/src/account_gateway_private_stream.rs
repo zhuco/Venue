@@ -207,8 +207,8 @@ pub(super) fn normalize_private_stream_event_for_symbols(
         && value
             .pointer("/a/P")
             .and_then(Value::as_array)
-            .is_none_or(|positions| {
-                positions.iter().all(|position| {
+            .is_some_and(|positions| {
+                positions.iter().any(|position| {
                     position
                         .get("s")
                         .and_then(Value::as_str)
@@ -232,6 +232,7 @@ pub(super) fn normalize_private_stream_event_for_symbols(
                 .iter()
                 .find(|symbol| crate::native_symbol(symbol) == native)
         });
+    let stream_in_scope = stream_symbol.is_some();
     if event == "ORDER_TRADE_UPDATE"
         && value
             .get("o")
@@ -263,7 +264,7 @@ pub(super) fn normalize_private_stream_event_for_symbols(
                     .and_then(Value::as_str)
                     .ok_or(BinanceAccountGatewayError::PrivateStream)?;
                 let status = order.get("X").and_then(Value::as_str);
-                if stream_symbol.is_some()
+                if stream_in_scope
                     && matches!(execution, "NEW" | "CANCELED" | "EXPIRED")
                     && status.is_some_and(|status| {
                         matches!(status, "NEW" | "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH")
@@ -271,10 +272,32 @@ pub(super) fn normalize_private_stream_event_for_symbols(
                 {
                     return Ok(Some(BinancePrivateAccountEvent::RefreshRecommended));
                 }
-                true
+                // An enabled account may have orders outside this Grid/KOL scope. Their
+                // authenticated frames neither alter this projection nor justify a signed
+                // account snapshot on the Grid rolling path.
+                stream_in_scope
             }
-            // Other authenticated account events can change inventory, order semantics,
-            // leverage, liquidation custody, or algo orders and therefore require signed facts.
+            "ACCOUNT_UPDATE"
+                if value.get("fs").and_then(Value::as_str) == Some("UM")
+                    && value
+                        .pointer("/a/m")
+                        .and_then(Value::as_str)
+                        .is_some_and(|reason| {
+                            matches!(
+                                reason,
+                                "ORDER"
+                                    | "FUNDING_FEE"
+                                    | "DEPOSIT"
+                                    | "WITHDRAW"
+                                    | "ASSET_TRANSFER"
+                                    | "MARGIN_TRANSFER"
+                            )
+                        }) =>
+            {
+                false
+            }
+            // A different account event can change in-scope trading semantics and still
+            // requires a signed correction.
             _ => true,
         };
         return Ok(
