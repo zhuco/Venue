@@ -260,7 +260,7 @@ impl BinancePrivateProjectionStore {
             }
             let payload =
                 serde_json::to_value(fill).map_err(|_| PrivateProjectionError::Invalid)?;
-            sqlx::query("INSERT INTO venue_binance_account_fills (trading_account_id,owner_user_id,native_trade_id,symbol,occurred_ms,observed_ms,fill_json) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (trading_account_id,symbol,native_trade_id) DO UPDATE SET observed_ms=EXCLUDED.observed_ms WHERE venue_binance_account_fills.observed_ms<venue_binance_account_fills.occurred_ms AND venue_binance_account_fills.owner_user_id=EXCLUDED.owner_user_id AND venue_binance_account_fills.fill_json=EXCLUDED.fill_json")
+            sqlx::query("INSERT INTO venue_binance_account_fills (trading_account_id,owner_user_id,native_trade_id,symbol,occurred_ms,observed_ms,fill_json) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (trading_account_id,symbol,native_trade_id) DO UPDATE SET observed_ms=EXCLUDED.observed_ms WHERE venue_binance_account_fills.observed_ms<venue_binance_account_fills.occurred_ms AND venue_binance_account_fills.owner_user_id=EXCLUDED.owner_user_id AND (venue_binance_account_fills.fill_json - 'price' - 'quantity')=(EXCLUDED.fill_json - 'price' - 'quantity') AND (venue_binance_account_fills.fill_json->>'price')::numeric=(EXCLUDED.fill_json->>'price')::numeric AND (venue_binance_account_fills.fill_json->>'quantity')::numeric=(EXCLUDED.fill_json->>'quantity')::numeric")
                 .bind(&source.trading_account_id).bind(&source.owner_user_id).bind(&fill.native_trade_id)
                 .bind(fill.symbol.to_string()).bind(fill.occurred_ms.map(ms).transpose()?).bind(ms(persisted_ms)?).bind(payload)
                 .execute(&mut *tx).await.map_err(|_| PrivateProjectionError::Unavailable)?;
@@ -359,6 +359,8 @@ impl BinancePrivateProjectionStore {
             return Err(PrivateProjectionError::Invalid);
         }
 
+        // REST and authenticated streams may spell the same Decimal with different trailing
+        // zeros. Compare only numeric fields numerically; identity, side and time remain exact.
         for fill in prepared {
             let changed = sqlx::query(
                 "INSERT INTO venue_binance_account_fills \
@@ -375,12 +377,14 @@ impl BinancePrivateProjectionStore {
                   order_state=COALESCE(venue_binance_account_fills.order_state,EXCLUDED.order_state),\
                   client_order_id=COALESCE(venue_binance_account_fills.client_order_id,EXCLUDED.client_order_id) \
                  WHERE venue_binance_account_fills.owner_user_id=EXCLUDED.owner_user_id \
-                   AND venue_binance_account_fills.fill_json=EXCLUDED.fill_json \
+                   AND (venue_binance_account_fills.fill_json - 'price' - 'quantity')=(EXCLUDED.fill_json - 'price' - 'quantity') \
+                   AND (venue_binance_account_fills.fill_json->>'price')::numeric=(EXCLUDED.fill_json->>'price')::numeric \
+                   AND (venue_binance_account_fills.fill_json->>'quantity')::numeric=(EXCLUDED.fill_json->>'quantity')::numeric \
                    AND (venue_binance_account_fills.stream_private_generation IS NULL OR (\
                      venue_binance_account_fills.stream_private_generation=EXCLUDED.stream_private_generation \
                      AND venue_binance_account_fills.baseline_private_generation=EXCLUDED.baseline_private_generation \
-                     AND venue_binance_account_fills.original_quantity=EXCLUDED.original_quantity \
-                     AND venue_binance_account_fills.cumulative_filled_quantity=EXCLUDED.cumulative_filled_quantity \
+                     AND venue_binance_account_fills.original_quantity::numeric=EXCLUDED.original_quantity::numeric \
+                     AND venue_binance_account_fills.cumulative_filled_quantity::numeric=EXCLUDED.cumulative_filled_quantity::numeric \
                      AND venue_binance_account_fills.order_state=EXCLUDED.order_state \
                      AND venue_binance_account_fills.client_order_id=EXCLUDED.client_order_id))",
             )
@@ -390,7 +394,7 @@ impl BinancePrivateProjectionStore {
             .bind(&fill.symbol)
             .bind(fill.occurred_ms)
             .bind(fill.observed_ms)
-            .bind(fill.payload)
+            .bind(&fill.payload)
             .bind(fill.stream_generation)
             .bind(fill.baseline_generation)
             .bind(fill.original)
@@ -401,7 +405,25 @@ impl BinancePrivateProjectionStore {
             .await
             .map_err(|_| PrivateProjectionError::Unavailable)?;
             if changed.rows_affected() != 1 {
-                tracing::warn!(target: "venue_control::grid_hot_path", "Authenticated fill conflicts with an existing durable fill");
+                let prior: Option<serde_json::Value> = sqlx::query_scalar(
+                    "SELECT fill_json FROM venue_binance_account_fills WHERE trading_account_id=$1 AND symbol=$2 AND native_trade_id=$3",
+                ).bind(&source.trading_account_id).bind(&fill.symbol).bind(&fill.native_trade_id)
+                    .fetch_optional(&mut *tx).await.map_err(|_| PrivateProjectionError::Unavailable)?;
+                let mismatched_fields: Vec<&str> = [
+                    "native_order_id",
+                    "order_side",
+                    "position_side",
+                    "occurred_ms",
+                    "maker",
+                    "price",
+                    "quantity",
+                ]
+                .into_iter()
+                .filter(|key| {
+                    prior.as_ref().and_then(|value| value.get(key)) != fill.payload.get(key)
+                })
+                .collect();
+                tracing::warn!(target: "venue_control::grid_hot_path", ?mismatched_fields, "Authenticated fill conflicts with an existing durable fill");
                 return Err(PrivateProjectionError::Invalid);
             }
         }
@@ -658,8 +680,8 @@ fn terminal_fill(fill: &Fill) -> Result<TerminalFill, PrivateProjectionError> {
         symbol: fill.symbol.clone(),
         order_side: fill.side,
         position_side,
-        quantity: fill.quantity,
-        price: fill.price.value(),
+        quantity: fill.quantity.normalize(),
+        price: fill.price.value().normalize(),
         maker,
         occurred_ms: fill.exchange_time_ms,
     })

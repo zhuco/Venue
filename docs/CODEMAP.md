@@ -2,6 +2,8 @@
 
 更新：2026-09-03
 
+认证成交与 REST 的去重边界位于 `apps/venue-control/src/private_projection.rs`：价格、数量及订单进度按精确 Decimal 数值相等比较，兼容历史 JSON 中的尾零，其他字段仍精确匹配；实库回归位于 `tests/support/projection_fill_observation.rs`。
+
 Grid 快速补撤确认位于 `apps/venue-control/src/executor_exchange/grid_batch.rs`，完整 RESULT 由 `crates/venue-gateway-binance/src/execution.rs` 复用规范订单解析器保留；缺证据走耐久对账，普通补撤不逐单回读。`grid_runtime/risk.rs` 复用签名投影与汇率热缓存计算风险，`grid_runtime/stream_overlay.rs` 按成交更新数量与加权开仓均价；相关回归在 `executor_exchange/grid_result_tests.rs` 和流投影测试中。
 
 当前目标是 Binance KOL 跟单 MVP 与事实驱动 Binance 对冲网格共用单例 `venue-executor-binance`；初期全站最多 5 个启用 KOL、200 个启用跟单账户。Scalping 和其余交易所迁移暂停。下面多数 Runtime/Node 入口是已提交代码或冻结兼容位置，不等于新链调用链。长期文档统一在本目录，仓库根 CODEMAP 仅作导航。

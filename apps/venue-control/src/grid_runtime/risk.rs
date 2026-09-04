@@ -21,7 +21,10 @@ impl BinanceGridRuntime {
                 record.instance.config.reset_policy.stale_market_ms,
             )
             .await
-            .map_err(|_| BinanceGridRuntimeError::Market)?;
+            .map_err(|error| {
+                tracing::warn!(target: "venue_control::grid_hot_path", %error, "Grid quote-to-USD evidence refresh failed");
+                BinanceGridRuntimeError::Market
+            })?;
         self.hot_path
             .cache_conversion(record.instance.instance_id.clone(), conversion.clone());
         Self::risk_from_conversion(record, projection, private, conversion).map(Some)

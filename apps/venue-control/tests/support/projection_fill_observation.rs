@@ -90,6 +90,9 @@ async fn exercise(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> {
         Some("binance-fills-v1|BTCUSDT,100,111,110")
     );
     // A later authenticated duplicate may add stream context but must not change allocation identity.
+    // Older REST rows retain the exchange's trailing zeros; JSON string equality is not fill identity.
+    sqlx::query("UPDATE venue_binance_account_fills SET fill_json=jsonb_set(jsonb_set(fill_json,'{price}','\"50000.0000\"'::jsonb),'{quantity}','\"0.001000\"'::jsonb) WHERE trading_account_id=$1")
+        .bind(&account).execute(pool).await?;
     let mut later_event = event;
     later_event.received_at_ms = 150;
     store.persist_stream_fill(&source, &later_event).await?;
@@ -104,6 +107,27 @@ async fn exercise(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> {
     .fetch_one(pool)
     .await?;
     assert_eq!(count, 1);
+    let context: Option<i64> = sqlx::query_scalar("SELECT stream_private_generation FROM venue_binance_account_fills WHERE trading_account_id=$1")
+        .bind(&account).fetch_one(pool).await?;
+    assert_eq!(context, Some(3));
+    for field in ["quantity", "price", "time", "order", "side", "leg", "maker"] {
+        let mut conflicting = later_event.clone();
+        match field {
+            "quantity" => conflicting.fill.quantity += Decimal::new(1, 3),
+            "price" => conflicting.fill.price = Price::new(Decimal::new(50_001, 0))?,
+            "time" => conflicting.fill.exchange_time_ms = Some(109),
+            "order" => conflicting.fill.order_id = "other-order".to_owned(),
+            "side" => conflicting.fill.side = OrderSide::Sell,
+            "leg" => conflicting.fill.position_side = FieldState::Known(PositionSide::Short),
+            "maker" => conflicting.fill.maker = FieldState::Known(false),
+            _ => return Err("unknown test case".into()),
+        }
+        assert_eq!(
+            store.persist_stream_fill(&source, &conflicting).await,
+            Err(PrivateProjectionError::Invalid),
+            "{field}"
+        );
+    }
     Ok(())
 }
 

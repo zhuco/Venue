@@ -511,7 +511,10 @@ impl BinanceGridRuntime {
         let facts = state
             .refresh(now)
             .await
-            .map_err(|_| BinanceGridRuntimeError::Market)?;
+            .map_err(|error| {
+                tracing::warn!(target: "venue_control::grid_hot_path", %error, "Grid BBO or instrument refresh failed");
+                BinanceGridRuntimeError::Market
+            })?;
         self.hot_path.cache_market(id, facts.clone());
         Ok(facts)
     }
