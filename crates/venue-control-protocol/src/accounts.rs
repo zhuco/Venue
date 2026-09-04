@@ -5,6 +5,9 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub const REGISTER_PATH: &str = "/v2/account/register";
+/// Free terminal registration never creates a KOL binding. Web follower registration keeps
+/// using REGISTER_PATH, where a valid invite remains mandatory.
+pub const TERMINAL_REGISTER_PATH: &str = "/v2/account/terminal/register";
 pub const LOGIN_PATH: &str = "/v2/account/login";
 pub const LOGOUT_PATH: &str = "/v2/account/logout";
 pub const SESSION_PATH: &str = "/v2/account/session";

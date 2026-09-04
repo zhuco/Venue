@@ -2,7 +2,6 @@ use eframe::egui;
 use rust_decimal::Decimal;
 use std::str::FromStr as _;
 use venue_control_protocol::{
-    GatewayMode, StrategyKind, StrategySummary, VenueId,
     accounts::CredentialSummary,
     grid::{
         GRID_SCHEMA_VERSION, GridConfig, GridConfigUpdateRequest, GridInstanceCreateRequest,
@@ -332,7 +331,6 @@ pub fn show(
 
     ui.add_space(4.0);
     new_grid_table(ui, model, &visible);
-    legacy_table(ui, model, credential, account_id, current_symbol.as_deref());
     lifecycle_controls(ui, model, &visible, credential_ready, &mut action);
     editor(ui, model, credential_ready, &mut action);
 
@@ -343,11 +341,7 @@ pub fn show(
 
 fn new_grid_table(ui: &mut egui::Ui, model: &mut AppModel, instances: &[GridInstanceSummary]) {
     let language = model.preferences.language;
-    ui.weak(tr(
-        language,
-        "Binance Grid（新执行链）",
-        "Binance Grid (new executor)",
-    ));
+    ui.weak(tr(language, "Binance 对冲网格", "Binance hedge Grid"));
     egui::ScrollArea::horizontal()
         .id_salt("binance-grid-instances")
         .show(ui, |ui| {
@@ -436,87 +430,6 @@ fn instance_credential_label(model: &AppModel, credential_id: &str) -> String {
             )
             .to_owned()
         })
-}
-
-fn legacy_table(
-    ui: &mut egui::Ui,
-    model: &mut AppModel,
-    credential: &CredentialSummary,
-    account_id: &str,
-    symbol: Option<&str>,
-) {
-    let legacy = model
-        .snapshot
-        .as_ref()
-        .map(|snapshot| {
-            snapshot
-                .strategies
-                .iter()
-                .filter(|strategy| {
-                    legacy_grid_matches(strategy, credential.venue, account_id, symbol)
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if legacy.is_empty() {
-        return;
-    }
-    ui.add_space(8.0);
-    ui.weak(tr(
-        model.preferences.language,
-        "旧运行时策略（兼容只读）",
-        "Legacy runtime strategies (read only)",
-    ));
-    egui::Grid::new("legacy-grid-table")
-        .striped(true)
-        .spacing([14.0, 7.0])
-        .show(ui, |ui| {
-            for heading in [
-                tr(model.preferences.language, "账户", "Account"),
-                tr(model.preferences.language, "交易对", "Symbol"),
-                tr(model.preferences.language, "实例", "Instance"),
-                tr(model.preferences.language, "类型", "Type"),
-                tr(model.preferences.language, "状态", "State"),
-                tr(model.preferences.language, "多仓", "Long"),
-                tr(model.preferences.language, "空仓", "Short"),
-            ] {
-                ui.weak(heading);
-            }
-            ui.end_row();
-            for strategy in legacy {
-                ui.label(&credential.label);
-                if ui.link(strategy.symbol.to_string()).clicked() {
-                    model.select_symbol(strategy.symbol.to_string());
-                    model.follow_latest_requested = true;
-                }
-                ui.label(short_id(&strategy.instance_id))
-                    .on_hover_text(&strategy.instance_id);
-                ui.label(format!("{:?}", strategy.kind));
-                ui.label(format!("{:?}", strategy.lifecycle));
-                ui.monospace(number(strategy.long_quantity));
-                ui.monospace(number(strategy.short_quantity));
-                ui.end_row();
-            }
-        });
-    ui.weak(tr(
-        model.preferences.language,
-        "旧运行时实例仅展示，生命周期仍由旧入口管理。",
-        "Legacy instances are read only and remain controlled by the legacy entrypoint.",
-    ));
-}
-
-fn legacy_grid_matches(
-    strategy: &StrategySummary,
-    venue: VenueId,
-    account_id: &str,
-    symbol: Option<&str>,
-) -> bool {
-    strategy.venue == venue
-        && strategy.mode == GatewayMode::Live
-        && strategy.kind == StrategyKind::Grid
-        && strategy.trading_account_id == account_id
-        && symbol.is_none_or(|value| strategy.symbol.to_string() == value)
 }
 
 fn lifecycle_controls(
@@ -1152,7 +1065,7 @@ mod tests {
             credentials: vec![CredentialSummary {
                 credential_id: "00000000-0000-4000-8000-000000000010".to_owned(),
                 label: "主策略账户".to_owned(),
-                venue: VenueId::Binance,
+                venue: venue_control_protocol::VenueId::Binance,
                 masked_key: "••••1234".to_owned(),
                 trading_account_id: Some("00000000-0000-4000-8000-000000000101".to_owned()),
                 verification: venue_control_protocol::accounts::ApiVerificationState::Verified,
@@ -1222,41 +1135,6 @@ mod tests {
         assert!(!config_editable(GridInstanceState::StartPending));
         assert!(!config_editable(GridInstanceState::StopPending));
         assert!(config_editable(GridInstanceState::Running));
-    }
-
-    #[test]
-    fn legacy_panel_accepts_only_read_only_grid_rows() -> Result<(), Box<dyn std::error::Error>> {
-        let mut strategy = StrategySummary {
-            instance_id: "legacy-grid".to_owned(),
-            kind: StrategyKind::Grid,
-            venue: VenueId::Binance,
-            mode: GatewayMode::Live,
-            trading_account_id: "00000000-0000-4000-8000-000000000101".to_owned(),
-            symbol: "BTC/USDT".parse()?,
-            lifecycle: venue_control_protocol::StrategyLifecycle::Running,
-            config_epoch: 1,
-            open_orders: 4,
-            long_quantity: Decimal::ONE,
-            short_quantity: Decimal::ONE,
-            realized_pnl: None,
-            unrealized_pnl: None,
-            last_receipt_ms: 100,
-            attention: None,
-        };
-        assert!(legacy_grid_matches(
-            &strategy,
-            VenueId::Binance,
-            "00000000-0000-4000-8000-000000000101",
-            Some("BTC/USDT"),
-        ));
-        strategy.kind = StrategyKind::Manual;
-        assert!(!legacy_grid_matches(
-            &strategy,
-            VenueId::Binance,
-            "00000000-0000-4000-8000-000000000101",
-            Some("BTC/USDT"),
-        ));
-        Ok(())
     }
 
     #[test]

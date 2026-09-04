@@ -9,8 +9,6 @@ use eframe::egui;
 use std::sync::Arc;
 use text::{Key, text};
 use venue_control_protocol::kol::{ExecutorCommandSummary, TerminalAccountProjection};
-use venue_control_protocol::{ExecutionFactBinding, ExecutionFactsSnapshot, GatewayMode, VenueId};
-use venue_domain::OrderState;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum Tab {
@@ -26,14 +24,11 @@ enum Tab {
 
 #[derive(Debug, Default)]
 pub struct ExecutionViewState {
-    pub facts: Option<Arc<ExecutionFactsSnapshot>>,
-    pub error: Option<String>,
     pub private_error: Option<String>,
     pub terminal_executions_error: Option<String>,
     pub private_projection: Option<Arc<TerminalAccountProjection>>,
     pub terminal_executions: Vec<ExecutorCommandSummary>,
     pub grid: crate::grid_view::GridViewState,
-    facts_received_ms: u64,
     private_received_ms: u64,
     tab: Tab,
     pub(crate) current_symbol: bool,
@@ -68,6 +63,8 @@ impl ExecutionViewState {
             self.private_error = None;
         } else {
             trade_dock.clear_order_selection();
+            self.private_projection = None;
+            self.private_received_ms = 0;
             self.private_error = None;
         }
     }
@@ -75,16 +72,21 @@ impl ExecutionViewState {
     pub fn apply_terminal_executions(&mut self, executions: Vec<ExecutorCommandSummary>) {
         if executions.iter().any(|summary| summary.validate().is_err()) {
             self.terminal_executions_error = Some("Invalid terminal execution history".into());
-        } else if executions.len() == 1 {
-            let summary = executions[0].clone();
-            self.terminal_executions
-                .retain(|old| old.command_id != summary.command_id);
-            self.terminal_executions.insert(0, summary);
-            self.terminal_executions_error = None;
         } else {
             self.terminal_executions = executions;
             self.terminal_executions_error = None;
         }
+    }
+
+    pub fn apply_terminal_execution(&mut self, summary: ExecutorCommandSummary) {
+        if summary.validate().is_err() {
+            self.terminal_executions_error = Some("Invalid terminal execution receipt".into());
+            return;
+        }
+        self.terminal_executions
+            .retain(|old| old.command_id != summary.command_id);
+        self.terminal_executions.insert(0, summary);
+        self.terminal_executions.truncate(500);
     }
 
     pub fn private_projection_for(
@@ -119,29 +121,6 @@ impl ExecutionViewState {
             })
             .map(|position| position.quantity)
     }
-    pub fn apply(&mut self, facts: ExecutionFactsSnapshot) {
-        if facts.validate().is_err()
-            || self
-                .facts
-                .as_ref()
-                .is_some_and(|old| old.generated_ms > facts.generated_ms)
-        {
-            self.error = Some("Invalid or regressing execution facts".into());
-            return;
-        }
-        self.facts_received_ms = crate::account_center::now_ms();
-        self.facts = Some(Arc::new(facts));
-        self.error = None;
-    }
-
-    pub fn fresh(&self, now: u64) -> bool {
-        self.error.is_none()
-            && fresh_time(self.facts_received_ms, now)
-            && self
-                .facts
-                .as_ref()
-                .is_some_and(|facts| fresh_time(facts.generated_ms, now))
-    }
 }
 
 fn fresh_time(time: u64, now: u64) -> bool {
@@ -158,18 +137,6 @@ fn selection_exists(
             order.symbol == selection.symbol
                 && order.native_order_id.as_deref() == Some(selection.native_order_id.as_str())
         })
-}
-
-fn matches_account(
-    binding: &ExecutionFactBinding,
-    venue: VenueId,
-    account: &str,
-    symbol: Option<&str>,
-) -> bool {
-    binding.venue == venue
-        && binding.mode == GatewayMode::Live
-        && binding.trading_account_id == account
-        && symbol.is_none_or(|symbol| binding.symbol.to_string() == symbol)
 }
 
 pub fn show(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
@@ -198,9 +165,7 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
             Some(&credential.credential_id) == overview.selected_credential_id.as_ref()
         })
     });
-    let Some((venue, account)) =
-        selected.and_then(|c| c.trading_account_id.clone().map(|id| (c.venue, id)))
-    else {
+    let Some(account) = selected.and_then(|c| c.trading_account_id.clone()) else {
         ui.weak(text(language, Key::NoAccount));
         return;
     };
@@ -214,263 +179,17 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
         }
         return;
     }
-    if model.execution.tab != Tab::Bots {
-        if let Some(projection) = model.execution.private_projection.clone()
-            && projection.trading_account_id == account
-        {
-            show_private_projection(ui, model, &projection);
-        } else {
-            ui.weak(text(language, Key::Waiting));
-            ui.small("等待唯一 Binance Executor 返回签名私有账户投影");
-            if let Some(error) = &model.execution.private_error {
-                ui.colored_label(theme::WARNING, error);
-            }
-        }
-        return;
-    }
-    let Some(facts) = model.execution.facts.clone() else {
+    if let Some(projection) = model.execution.private_projection.clone()
+        && projection.trading_account_id == account
+        && Some(projection.credential_id.as_str())
+            == selected.map(|credential| credential.credential_id.as_str())
+    {
+        show_private_projection(ui, model, &projection);
+    } else {
         ui.weak(text(language, Key::Waiting));
-        if let Some(error) = &model.execution.error {
+        if let Some(error) = &model.execution.private_error {
             ui.colored_label(theme::WARNING, error);
         }
-        return;
-    };
-    let now = crate::account_center::now_ms();
-    let fresh = model.execution.fresh(now) && model.snapshot_online && model.event_stream_online;
-    ui.horizontal(|ui| {
-        ui.small(format!(
-            "{} · {}",
-            text(language, Key::Signed),
-            timestamp(facts.generated_ms)
-        ));
-        if !fresh {
-            ui.colored_label(theme::WARNING, text(language, Key::Stale));
-        }
-    });
-    match model.execution.tab {
-        Tab::Positions | Tab::CurrentOrders | Tab::Assets => {
-            ui.weak(text(language, Key::CurrentSource));
-        }
-        Tab::Fills => {
-            ui.weak(text(language, Key::FillsScope));
-        }
-        Tab::Bots => {}
-        Tab::OrderHistory | Tab::PositionHistory => {}
-    }
-    let symbol = model
-        .execution
-        .current_symbol
-        .then(|| model.preferences.selected_symbol.clone());
-    let included =
-        |b: &ExecutionFactBinding| matches_account(b, venue, &account, symbol.as_deref());
-    let mut selected_row: Option<(ExecutionFactBinding, Option<String>)> = None;
-    let mut count = 0;
-    egui::ScrollArea::both()
-        .id_salt("execution-table-scroll")
-        .show(ui, |ui| {
-            egui::Grid::new(("execution-table", model.execution.tab as u8))
-                .striped(true)
-                .min_col_width(72.0)
-                .spacing([18.0, 8.0])
-                .show(ui, |ui| {
-                    let headings: &[Key] = match model.execution.tab {
-                        Tab::Positions => &[
-                            Key::Symbol,
-                            Key::Side,
-                            Key::Size,
-                            Key::Entry,
-                            Key::Mark,
-                            Key::Instance,
-                            Key::Time,
-                        ],
-                        Tab::CurrentOrders => &[
-                            Key::Symbol,
-                            Key::Side,
-                            Key::Price,
-                            Key::Size,
-                            Key::Filled,
-                            Key::State,
-                            Key::ReduceOnly,
-                            Key::Instance,
-                            Key::OrderId,
-                            Key::Time,
-                        ],
-                        Tab::Fills => &[
-                            Key::Symbol,
-                            Key::Side,
-                            Key::Price,
-                            Key::Size,
-                            Key::Instance,
-                            Key::OrderId,
-                            Key::FillId,
-                            Key::Time,
-                        ],
-                        Tab::OrderHistory | Tab::PositionHistory => &[],
-                        Tab::Bots => &[
-                            Key::Symbol,
-                            Key::Instance,
-                            Key::Kind,
-                            Key::State,
-                            Key::Long,
-                            Key::Short,
-                        ],
-                        Tab::Assets => &[Key::Asset, Key::Equity, Key::Available],
-                    };
-                    for key in headings {
-                        ui.weak(text(language, *key));
-                    }
-                    ui.end_row();
-                    match model.execution.tab {
-                        Tab::Positions => {
-                            for row in facts.positions.iter().filter(|row| included(&row.binding)) {
-                                count += 1;
-                                if symbol_link(
-                                    ui,
-                                    &row.binding.symbol,
-                                    &model.preferences.selected_symbol,
-                                ) {
-                                    selected_row = Some((row.binding.clone(), None));
-                                }
-                                ui.label(format!("{:?}", row.position_side));
-                                market_quantity(ui, model, &row.binding.symbol, Some(row.quantity));
-                                market_price(ui, model, &row.binding.symbol, row.entry_price);
-                                market_price(ui, model, &row.binding.symbol, row.mark_price);
-                                ui.label(&row.binding.instance_id);
-                                ui.weak(timestamp(row.observed_ms));
-                                ui.end_row();
-                            }
-                        }
-                        Tab::CurrentOrders => {
-                            for row in facts
-                                .orders
-                                .iter()
-                                .filter(|row| included(&row.binding) && is_current_order(row.state))
-                            {
-                                count += 1;
-                                let actionable = fresh
-                                    && fresh_time(row.observed_ms, now)
-                                    && model.snapshot.as_ref().is_some_and(|s| {
-                                        s.strategies.iter().any(|s| {
-                                            s.venue == row.binding.venue
-                                                && s.mode == row.binding.mode
-                                                && s.trading_account_id
-                                                    == row.binding.trading_account_id
-                                                && s.symbol == row.binding.symbol
-                                                && s.instance_id == row.binding.instance_id
-                                                && s.config_epoch == row.binding.config_epoch
-                                        })
-                                    });
-                                if symbol_link(
-                                    ui,
-                                    &row.binding.symbol,
-                                    &model.preferences.selected_symbol,
-                                ) {
-                                    selected_row = Some((
-                                        row.binding.clone(),
-                                        actionable.then(|| row.order_id.clone()),
-                                    ));
-                                }
-                                ui.label(format!("{:?} / {:?}", row.side, row.position_side));
-                                market_price(ui, model, &row.binding.symbol, row.limit_price);
-                                market_quantity(ui, model, &row.binding.symbol, Some(row.quantity));
-                                market_quantity(
-                                    ui,
-                                    model,
-                                    &row.binding.symbol,
-                                    row.filled_quantity,
-                                );
-                                ui.label(
-                                    row.state
-                                        .map_or_else(|| "—".into(), |state| format!("{state:?}")),
-                                );
-                                ui.label(if row.reduce_only { "✓" } else { "—" });
-                                ui.label(&row.binding.instance_id);
-                                ui.monospace(&row.order_id);
-                                ui.weak(timestamp(row.observed_ms));
-                                ui.end_row();
-                            }
-                        }
-                        Tab::Fills => {
-                            for row in facts
-                                .fills
-                                .iter()
-                                .rev()
-                                .filter(|row| included(&row.binding))
-                            {
-                                count += 1;
-                                ui.label(row.binding.symbol.to_string());
-                                ui.label(format!("{:?}", row.side));
-                                decimal(ui, Some(row.price));
-                                decimal(ui, Some(row.quantity));
-                                ui.label(&row.binding.instance_id);
-                                ui.monospace(&row.order_id);
-                                ui.monospace(&row.fill_id);
-                                ui.weak(timestamp(row.occurred_ms));
-                                ui.end_row();
-                            }
-                        }
-                        Tab::OrderHistory | Tab::PositionHistory => {}
-                        Tab::Bots => {
-                            if let Some(snapshot) = &model.snapshot {
-                                for strategy in snapshot.strategies.iter().filter(|strategy| {
-                                    strategy.venue == venue
-                                        && strategy.mode == GatewayMode::Live
-                                        && strategy.trading_account_id == account
-                                        && symbol.as_ref().is_none_or(|selected| {
-                                            strategy.symbol.to_string() == *selected
-                                        })
-                                }) {
-                                    count += 1;
-                                    ui.label(strategy.symbol.to_string());
-                                    ui.label(&strategy.instance_id);
-                                    ui.label(format!("{:?}", strategy.kind));
-                                    ui.label(format!("{:?}", strategy.lifecycle));
-                                    decimal(ui, Some(strategy.long_quantity));
-                                    decimal(ui, Some(strategy.short_quantity));
-                                    ui.end_row();
-                                }
-                            }
-                        }
-                        Tab::Assets => {
-                            if let Some(account_summary) =
-                                model.snapshot.as_ref().and_then(|snapshot| {
-                                    snapshot.accounts.iter().find(|summary| {
-                                        summary.venue == venue
-                                            && summary.mode == GatewayMode::Live
-                                            && summary.trading_account_id == account
-                                    })
-                                })
-                            {
-                                for balance in &account_summary.balances {
-                                    count += 1;
-                                    ui.label(balance.asset.to_string());
-                                    decimal(ui, Some(balance.equity));
-                                    decimal(ui, balance.available_margin);
-                                    ui.end_row();
-                                }
-                            }
-                        }
-                    }
-                });
-        });
-    match model.execution.tab {
-        Tab::OrderHistory => {
-            ui.weak(text(language, Key::OrderHistoryUnavailable));
-        }
-        Tab::PositionHistory => {
-            ui.weak(text(language, Key::PositionHistoryUnavailable));
-        }
-        _ if count == 0 => {
-            ui.weak(text(language, Key::Empty));
-        }
-        _ => {}
-    }
-    if let Some((binding, order)) = selected_row {
-        model.select_symbol(binding.symbol.to_string());
-        model.follow_latest_requested = true;
-        model.preferences.selected_instance = Some(binding.instance_id);
-        model.synchronize_trading_scope();
-        model.trade_dock.selected_order_id = order;
     }
 }
 
@@ -480,6 +199,35 @@ fn show_private_projection(
     projection: &TerminalAccountProjection,
 ) {
     let language = model.preferences.language;
+    ui.small(text(language, Key::CurrentSource));
+    ui.horizontal_wrapped(|ui| {
+        ui.small(format!(
+            "{} · {}",
+            text(language, Key::Signed),
+            timestamp(projection.observed_ms)
+        ));
+        if !model.execution.private_ready(
+            Some(&projection.trading_account_id),
+            crate::account_center::now_ms(),
+        ) {
+            ui.colored_label(theme::WARNING, text(language, Key::Stale));
+        }
+    });
+    if let Some(error) = &model.execution.private_error {
+        ui.colored_label(theme::WARNING, error);
+    }
+    if model.execution.tab == Tab::OrderHistory {
+        ui.small(text(language, Key::OrderHistoryScope));
+        if let Some(error) = &model.execution.terminal_executions_error {
+            ui.colored_label(theme::WARNING, error);
+        }
+    }
+    if model.execution.tab == Tab::PositionHistory {
+        ui.small(text(language, Key::PositionHistoryScope));
+    }
+    if model.execution.tab == Tab::Fills {
+        ui.small(text(language, Key::FillsScope));
+    }
     let selected_symbol = model
         .execution
         .current_symbol
@@ -559,7 +307,7 @@ fn show_private_projection(
                             for row in projection
                                 .positions
                                 .iter()
-                                .filter(|row| included(&row.symbol))
+                                .filter(|row| included(&row.symbol) && !row.quantity.is_zero())
                             {
                                 count += 1;
                                 if symbol_link(ui, &row.symbol, &model.preferences.selected_symbol)
@@ -793,14 +541,6 @@ fn market_quantity(
     ));
 }
 
-fn is_current_order(state: Option<OrderState>) -> bool {
-    state.is_none()
-        || matches!(
-            state,
-            Some(OrderState::New | OrderState::PartiallyFilled | OrderState::Unknown)
-        )
-}
-
 fn decimal(ui: &mut egui::Ui, value: Option<rust_decimal::Decimal>) {
     ui.monospace(value.map_or_else(|| "—".into(), |v| v.normalize().to_string()));
 }
@@ -856,6 +596,62 @@ mod tests {
     }
 
     #[test]
+    fn empty_private_response_removes_old_account_data_and_readiness() {
+        let mut state = ExecutionViewState {
+            private_projection: Some(Arc::new(private_projection(
+                "00000000-0000-4000-8000-000000000001",
+                19_000,
+            ))),
+            private_received_ms: 19_500,
+            ..ExecutionViewState::default()
+        };
+        state.apply_private(None, &mut TradeDockState::default());
+        assert!(state.private_projection.is_none());
+        assert_eq!(state.private_received_ms, 0);
+        assert!(!state.private_ready(Some("00000000-0000-4000-8000-000000000001"), 20_000));
+    }
+
+    #[test]
+    fn complete_history_snapshot_replaces_even_a_single_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use venue_control_protocol::kol::{
+            ExecutorCommandOrigin, ExecutorCommandPhase, ExecutorCommandState, ExecutorOrderKind,
+        };
+        let symbol: venue_domain::Symbol = "SOL/USDC".parse()?;
+        let summary = |suffix: &str| ExecutorCommandSummary {
+            command_id: format!("00000000-0000-4000-8000-0000000000{suffix}"),
+            request_id: Some(format!("00000000-0000-4000-8000-0000000001{suffix}")),
+            trading_account_id: "00000000-0000-4000-8000-000000000001".into(),
+            symbol: symbol.clone(),
+            position_side: Some(venue_domain::PositionSide::Long),
+            origin: ExecutorCommandOrigin::Terminal,
+            phase: ExecutorCommandPhase::Open,
+            order_kind: ExecutorOrderKind::LimitPostOnly,
+            order_side: Some(venue_domain::OrderSide::Buy),
+            requested_quantity: Some(rust_decimal::Decimal::ONE),
+            limit_price: Some(rust_decimal::Decimal::from(100)),
+            state: ExecutorCommandState::Reconciled,
+            native_order_id: Some(suffix.into()),
+            created_ms: 1,
+            updated_ms: 2,
+            sanitized_error_code: None,
+        };
+        let first = summary("01");
+        let second = summary("02");
+        first.validate()?;
+        second.validate()?;
+        let mut state = ExecutionViewState::default();
+        state.apply_terminal_executions(vec![first.clone(), second.clone()]);
+        state.apply_terminal_executions(vec![second]);
+        assert_eq!(state.terminal_executions.len(), 1);
+        state.apply_terminal_execution(first);
+        assert_eq!(state.terminal_executions.len(), 2);
+        state.apply_terminal_executions(vec![]);
+        assert!(state.terminal_executions.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn private_readiness_uses_the_exact_selected_account_and_private_receive_time() {
         let mut state = ExecutionViewState {
             private_projection: Some(Arc::new(private_projection("account-a", 19_000))),
@@ -896,17 +692,6 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn current_and_historical_orders_are_separated_without_hiding_unknown_rows() {
-        assert!(is_current_order(None));
-        assert!(is_current_order(Some(OrderState::New)));
-        assert!(is_current_order(Some(OrderState::PartiallyFilled)));
-        assert!(is_current_order(Some(OrderState::Unknown)));
-        assert!(!is_current_order(Some(OrderState::Filled)));
-        assert!(!is_current_order(Some(OrderState::Cancelled)));
-        assert!(!is_current_order(Some(OrderState::Expired)));
-        assert!(!is_current_order(Some(OrderState::Rejected)));
-    }
-    #[test]
     fn private_mark_price_uses_the_exchange_symbol_precision()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut model = AppModel::new(crate::model::Preferences::default());
@@ -940,43 +725,6 @@ mod tests {
             position_pnl_value(&position(venue_domain::PositionSide::Short)),
             Some(rust_decimal::Decimal::new(-6, 0))
         );
-        Ok(())
-    }
-    #[test]
-    fn account_filter_never_crosses_venue_account_or_symbol()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let binding = ExecutionFactBinding {
-            venue: VenueId::Binance,
-            mode: GatewayMode::Live,
-            trading_account_id: "account-a".into(),
-            symbol: "BTC/USDC".parse()?,
-            instance_id: "one".into(),
-            config_epoch: 1,
-        };
-        assert!(matches_account(
-            &binding,
-            VenueId::Binance,
-            "account-a",
-            None
-        ));
-        assert!(!matches_account(
-            &binding,
-            VenueId::Binance,
-            "account-b",
-            None
-        ));
-        assert!(!matches_account(
-            &binding,
-            VenueId::Binance,
-            "account-a",
-            Some("ETH/USDC")
-        ));
-        assert!(!matches_account(
-            &binding,
-            VenueId::Bybit,
-            "account-a",
-            None
-        ));
         Ok(())
     }
 }

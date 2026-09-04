@@ -193,7 +193,11 @@ async fn login(
     request: LoginRequest,
     register: bool,
 ) -> Result<AccountResult, AccountErrorCode> {
-    let route = if register { REGISTER_PATH } else { LOGIN_PATH };
+    let route = if register {
+        TERMINAL_REGISTER_PATH
+    } else {
+        LOGIN_PATH
+    };
     let session: SessionResponse = post(
         client,
         endpoint,

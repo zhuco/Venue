@@ -781,11 +781,20 @@ impl AppModel {
             .as_deref()
             .and_then(|id| overview.credentials.iter().find(|c| c.credential_id == id))
             .and_then(|c| c.trading_account_id.clone());
-        if self.preferences.execution_account_id != selected {
+        let previous_credential = self
+            .account_overview
+            .as_ref()
+            .and_then(|value| value.selected_credential_id.as_ref());
+        if self.preferences.execution_account_id != selected
+            || previous_credential != overview.selected_credential_id.as_ref()
+        {
             self.preferences.selected_instance = None;
             self.pending_confirmation = None;
             self.execution.private_projection = None;
             self.execution.terminal_executions.clear();
+            self.execution.private_error = None;
+            self.execution.terminal_executions_error = None;
+            self.trade_dock.clear_order_selection();
         }
         self.preferences.execution_account_id = selected;
         self.account_overview = Some(overview);

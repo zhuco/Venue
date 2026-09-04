@@ -19,12 +19,223 @@ use venue_control_protocol::{
 
 const INVITE_CODE: &str = "Safe_Kol_Invite_Code_00001";
 
+#[tokio::test]
+async fn terminal_registration_is_free_without_weakening_invite_registration() -> TestResult {
+    let Some(f) = Fixture::create().await? else {
+        return Ok(());
+    };
+    let s = Server::start(&f).await?;
+    code(
+        s.post(REGISTER_PATH, None, &login("ordinary"))
+            .send()
+            .await?,
+        400,
+        AccountErrorCode::InvalidInput,
+    )
+    .await?;
+    let ordinary = s
+        .post(TERMINAL_REGISTER_PATH, None, &login("ordinary"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionResponse>()
+        .await?;
+    let overview = s
+        .get(SESSION_PATH, Some(&ordinary))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<AccountOverview>()
+        .await?;
+    assert_eq!(overview.user.user_id, ordinary.user.user_id);
+    assert!(overview.credentials.is_empty());
+    let bindings: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM venue_user_kol_bindings WHERE user_id=$1")
+            .bind(&ordinary.user.user_id)
+            .fetch_one(&f.pool)
+            .await?;
+    assert_eq!(bindings, 0);
+    let kols: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM venue_kol_profiles WHERE kol_user_id=$1")
+            .bind(&ordinary.user.user_id)
+            .fetch_one(&f.pool)
+            .await?;
+    assert_eq!(kols, 0);
+    let instances = s
+        .get(GRID_INSTANCES_PATH, Some(&ordinary))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<GridInstanceSummary>>()
+        .await?;
+    assert!(instances.is_empty());
+    code(
+        s.post(TERMINAL_REGISTER_PATH, None, &registration("forged"))
+            .send()
+            .await?,
+        400,
+        AccountErrorCode::InvalidInput,
+    )
+    .await?;
+    code(
+        s.post(REGISTER_PATH, None, &registration("follower"))
+            .send()
+            .await?,
+        400,
+        AccountErrorCode::InvalidInput,
+    )
+    .await?;
+    s.post(LOGIN_PATH, None, &login("ordinary"))
+        .send()
+        .await?
+        .error_for_status()?;
+    s.post(LOGOUT_PATH, Some(&ordinary), &())
+        .send()
+        .await?
+        .error_for_status()?;
+    code(
+        s.get(SESSION_PATH, Some(&ordinary)).send().await?,
+        401,
+        AccountErrorCode::Unauthorized,
+    )
+    .await?;
+    s.stop().await?;
+    f.cleanup().await
+}
+
 fn registration(username: &str) -> RegisterRequest {
     RegisterRequest {
         username: username.into(),
         password: login(username).password,
         invite_code: INVITE_CODE.into(),
     }
+}
+
+#[tokio::test]
+async fn ordinary_terminal_reads_only_its_verified_account_projection() -> TestResult {
+    use venue_control_protocol::kol::{
+        KOL_TERMINAL_ACCOUNT_PATH, TERMINAL_PROJECTION_SCHEMA_VERSION, TerminalAccountProjection,
+        TerminalProjectionRequest,
+    };
+    let Some(f) = Fixture::create().await? else {
+        return Ok(());
+    };
+    let s = Server::start(&f).await?;
+    let alice = s
+        .post(TERMINAL_REGISTER_PATH, None, &login("alice"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<SessionResponse>()
+        .await?;
+    let bob = f.service.register(login("bob"), now()).await?;
+    let principal = f.service.authenticate(alice.token.expose(), now()).await?;
+    let mut credential = f
+        .service
+        .bind_credential(&principal, binding(), now())
+        .await?;
+    let account = "00000000-0000-4000-8000-000000000711";
+    let observed = now();
+    // Only this isolated fixture supplies signed-readback results; no exchange call is made.
+    sqlx::query("INSERT INTO venue_user_trading_accounts (trading_account_id,user_id,venue,exchange_identity_hash) VALUES ($1,$2,'binance',$3)")
+        .bind(account).bind(&alice.user.user_id).bind([11_u8;32].as_slice()).execute(&f.pool).await?;
+    credential.trading_account_id = Some(account.into());
+    credential.verification = ApiVerificationState::Verified;
+    credential.verified_ms = Some(observed);
+    credential.api_reachable = true;
+    credential.dual_position = true;
+    sqlx::query("UPDATE venue_api_credentials SET trading_account_id=$1,verification_json=$2 WHERE credential_id=$3")
+        .bind(account).bind(serde_json::to_value(&credential)?).bind(&credential.credential_id).execute(&f.pool).await?;
+    let request = TerminalProjectionRequest {
+        schema_version: TERMINAL_PROJECTION_SCHEMA_VERSION,
+        credential_id: credential.credential_id.clone(),
+        symbols: vec!["BTC/USDT".parse()?],
+    };
+    let empty = s
+        .post(KOL_TERMINAL_ACCOUNT_PATH, Some(&alice), &request)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Option<TerminalAccountProjection>>()
+        .await?;
+    assert!(empty.is_none());
+    let position = serde_json::json!({
+        "symbol":"BTC/USDT", "position_side":"long", "quantity":"0.01",
+        "entry_price":"50000", "mark_price":"50100"
+    });
+    let projection: TerminalAccountProjection = serde_json::from_value(serde_json::json!({
+        "schema_version":TERMINAL_PROJECTION_SCHEMA_VERSION,
+        "credential_id":credential.credential_id, "trading_account_id":account,
+        "observed_ms":observed, "persisted_ms":observed, "private_generation":1,
+        "position_mode":"hedge", "positions":[position.clone()], "position_history":[],
+        "open_orders":[{
+            "client_order_id":"fixture-order", "native_order_id":"123", "symbol":"BTC/USDT",
+            "order_side":"buy", "position_side":"long", "quantity":"0.001",
+            "filled_quantity":"0", "limit_price":"49900", "post_only":true,
+            "reduce_only":false, "state":"new", "created_ms":observed
+        }],
+        "fills":[], "assets":[{"asset":"USDT", "equity":"100", "available_margin":"90"}]
+    }))?;
+    projection.validate()?;
+    sqlx::query("INSERT INTO venue_binance_account_projections (credential_id,owner_user_id,trading_account_id,observed_ms,persisted_ms,private_generation,projection_json) VALUES ($1,$2,$3,$4,$4,1,$5)")
+        .bind(&credential.credential_id).bind(&alice.user.user_id).bind(account).bind(i64::try_from(observed)?)
+        .bind(serde_json::json!({"fills_cursor":"fixture-cursor","stream_healthy":true,"projection":projection}))
+        .execute(&f.pool).await?;
+    sqlx::query("INSERT INTO venue_binance_position_history (trading_account_id,owner_user_id,symbol,position_side,observed_ms,position_json) VALUES ($1,$2,'BTC/USDT','long',$3,$4)")
+        .bind(account).bind(&alice.user.user_id).bind(i64::try_from(observed)?).bind(position).execute(&f.pool).await?;
+    let response = s
+        .post(KOL_TERMINAL_ACCOUNT_PATH, Some(&alice), &request)
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(
+        response
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let owned = response
+        .json::<Option<TerminalAccountProjection>>()
+        .await?
+        .ok_or("projection missing")?;
+    assert_eq!(owned.credential_id, credential.credential_id);
+    assert_eq!(owned.positions.len(), 1);
+    assert_eq!(owned.open_orders.len(), 1);
+    assert_eq!(owned.assets.len(), 1);
+    assert_eq!(owned.position_history.len(), 1);
+    assert_eq!(owned.position_history[0].position, owned.positions[0]);
+    code(
+        s.post(KOL_TERMINAL_ACCOUNT_PATH, None, &request)
+            .send()
+            .await?,
+        401,
+        AccountErrorCode::Unauthorized,
+    )
+    .await?;
+    code(
+        s.post(KOL_TERMINAL_ACCOUNT_PATH, Some(&bob), &request)
+            .send()
+            .await?,
+        409,
+        AccountErrorCode::VerificationRequired,
+    )
+    .await?;
+    sqlx::query("UPDATE venue_api_credentials SET deleted_ms=$1 WHERE credential_id=$2")
+        .bind(i64::try_from(now())?)
+        .bind(&credential.credential_id)
+        .execute(&f.pool)
+        .await?;
+    code(
+        s.post(KOL_TERMINAL_ACCOUNT_PATH, Some(&alice), &request)
+            .send()
+            .await?,
+        409,
+        AccountErrorCode::VerificationRequired,
+    )
+    .await?;
+    s.stop().await?;
+    f.cleanup().await
 }
 
 async fn seed_enabled_invite(fixture: &Fixture) -> TestResult {

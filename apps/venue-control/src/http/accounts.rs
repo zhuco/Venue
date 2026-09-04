@@ -270,6 +270,13 @@ async fn account_request(
     now: u64,
 ) -> Result<zeroize::Zeroizing<Vec<u8>>, AccountError> {
     match (request.method, path) {
+        (Method::Post, TERMINAL_REGISTER_PATH) => {
+            return encode(
+                &accounts
+                    .register(decode::<LoginRequest>(&request.body)?, now)
+                    .await?,
+            );
+        }
         (Method::Post, REGISTER_PATH) => {
             return encode(
                 &accounts

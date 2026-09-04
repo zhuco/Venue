@@ -203,16 +203,30 @@ impl VenueFlowApp {
                 ClientEvent::SnapshotConnected => {
                     self.model.snapshot_connected();
                 }
-                ClientEvent::ExecutionFacts(facts) => self.model.execution.apply(facts),
-                ClientEvent::ExecutionFactsUnavailable(message) => {
-                    self.model.execution.error = Some(message)
+                ClientEvent::TerminalAccountProjection {
+                    credential_id,
+                    projection,
+                } => {
+                    if self
+                        .model
+                        .account_overview
+                        .as_ref()
+                        .and_then(|overview| overview.selected_credential_id.as_deref())
+                        == Some(credential_id.as_str())
+                    {
+                        self.model
+                            .execution
+                            .apply_private(projection, &mut self.model.trade_dock);
+                    }
                 }
-                ClientEvent::TerminalAccountProjection(projection) => self
-                    .model
-                    .execution
-                    .apply_private(projection, &mut self.model.trade_dock),
                 ClientEvent::TerminalExecutions(executions) => {
                     self.model.execution.apply_terminal_executions(executions)
+                }
+                ClientEvent::TerminalExecutionUpdated(summary) => {
+                    self.model.execution.apply_terminal_execution(summary)
+                }
+                ClientEvent::TerminalExecutionsUnavailable(message) => {
+                    self.model.execution.terminal_executions_error = Some(message)
                 }
                 ClientEvent::TerminalAccountUnavailable(message) => {
                     self.model.execution.private_error = Some(message)
@@ -310,12 +324,8 @@ impl VenueFlowApp {
         else {
             return;
         };
-        let symbols = self
-            .model
-            .preferences
-            .favorite_symbols
-            .iter()
-            .chain(std::iter::once(&self.model.preferences.selected_symbol))
+        let symbols = std::iter::once(&self.model.preferences.selected_symbol)
+            .chain(self.model.preferences.favorite_symbols.iter())
             .filter_map(|symbol| symbol.parse().ok())
             .fold(Vec::new(), |mut values, symbol| {
                 if !values.contains(&symbol)

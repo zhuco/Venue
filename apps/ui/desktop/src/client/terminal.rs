@@ -82,7 +82,7 @@ async fn submit<T: serde::Serialize>(
                     publish(
                         sender,
                         context,
-                        ClientEvent::TerminalExecutions(vec![summary]),
+                        ClientEvent::TerminalExecutionUpdated(summary),
                     );
                 }
                 _ => publish(

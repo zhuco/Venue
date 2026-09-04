@@ -24,21 +24,17 @@ pub enum Key {
     State,
     Filled,
     Time,
-    Instance,
     OrderId,
     FillId,
     ReduceOnly,
     Signed,
-    Kind,
-    Long,
-    Short,
     Asset,
     Equity,
     Available,
     CurrentSource,
-    OrderHistoryUnavailable,
+    OrderHistoryScope,
     FillsScope,
-    PositionHistoryUnavailable,
+    PositionHistoryScope,
 }
 
 pub fn text(language: Language, key: Key) -> &'static str {
@@ -52,10 +48,7 @@ pub fn text(language: Language, key: Key) -> &'static str {
         Key::Assets => ("资产", "Assets"),
         Key::CurrentSymbol => ("仅当前交易对", "Current symbol"),
         Key::NoAccount => ("未选择交易帐户", "No trading account"),
-        Key::Waiting => (
-            "等待账户节点返回签名数据",
-            "Waiting for signed account data",
-        ),
+        Key::Waiting => ("等待账户签名数据", "Waiting for signed account data"),
         Key::Empty => (
             "暂无已投影记录（不代表账户已确认空仓）",
             "No projected records; account emptiness is not confirmed",
@@ -74,32 +67,28 @@ pub fn text(language: Language, key: Key) -> &'static str {
         Key::State => ("状态", "State"),
         Key::Filled => ("已成交", "Filled"),
         Key::Time => ("更新时间", "Updated"),
-        Key::Instance => ("实例", "Instance"),
         Key::OrderId => ("委托号", "Order ID"),
         Key::FillId => ("成交号", "Fill ID"),
         Key::ReduceOnly => ("只减仓", "Reduce only"),
         Key::Signed => ("签名投影", "Signed projection"),
-        Key::Kind => ("类型", "Type"),
-        Key::Long => ("多仓", "Long"),
-        Key::Short => ("空仓", "Short"),
         Key::Asset => ("资产", "Asset"),
         Key::Equity => ("权益", "Equity"),
         Key::Available => ("可用保证金", "Available margin"),
         Key::CurrentSource => (
-            "来自网关签名账户快照；连接中断后旧值仅供查看。",
-            "From a gateway-signed account snapshot; stale values are read only.",
+            "由 Binance Executor 统一提供签名账户数据；连接中断后旧值仅供查看。",
+            "Signed account data from Binance Executor; stale values are read only.",
         ),
-        Key::OrderHistoryUnavailable => (
-            "当前签名接口只提供活动委托，尚未提供完整历史委托；不会用当前委托快照冒充历史。",
-            "The signed source only provides open orders; complete order history is not available.",
+        Key::OrderHistoryScope => (
+            "仅显示 Venue 命令记录；已提交或已接受不代表已成交。外部历史委托不在此列表。",
+            "Venue command records only; submitted or accepted does not mean filled. External order history is not included.",
         ),
         Key::FillsScope => (
             "仅显示网关账户流及签名补查已投影的最近成交，不代表完整账户历史。",
             "Shows only recent fills projected from the gateway stream and signed recovery.",
         ),
-        Key::PositionHistoryUnavailable => (
-            "当前协议尚未提供仓位历史投影；不会用成交记录反推或伪造仓位历史。",
-            "Position-history projection is not available; fills are not used to infer it.",
+        Key::PositionHistoryScope => (
+            "最近 500 条仓位变更，数量为 0 表示该腿已平；不包含绑定前完整历史或已实现盈亏。",
+            "Last 500 observed position changes; zero quantity means that leg closed. Not full pre-binding history or realized PnL.",
         ),
     };
     match language {

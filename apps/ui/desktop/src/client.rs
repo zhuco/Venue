@@ -28,10 +28,13 @@ const MAX_SSE_FRAME_BYTES: usize = 1_024 * 1_024;
 
 #[derive(Clone, Debug)]
 pub enum ClientEvent {
-    ExecutionFacts(venue_control_protocol::ExecutionFactsSnapshot),
-    ExecutionFactsUnavailable(String),
-    TerminalAccountProjection(Option<TerminalAccountProjection>),
+    TerminalAccountProjection {
+        credential_id: String,
+        projection: Option<TerminalAccountProjection>,
+    },
     TerminalExecutions(Vec<ExecutorCommandSummary>),
+    TerminalExecutionUpdated(ExecutorCommandSummary),
+    TerminalExecutionsUnavailable(String),
     TerminalAccountUnavailable(String),
     GridInstances(Vec<venue_control_protocol::grid::GridInstanceSummary>),
     GridMutationApplied(Box<venue_control_protocol::grid::GridInstanceSummary>),
@@ -40,7 +43,9 @@ pub enum ClientEvent {
     SessionExpired,
     SnapshotConnected,
     SnapshotUnavailable(String),
-    StreamConnected { resumed_after: Option<i64> },
+    StreamConnected {
+        resumed_after: Option<i64>,
+    },
     StreamUnavailable(String),
     CommandUnavailable(String),
     CopyRelationUnavailable(String),
@@ -1099,13 +1104,6 @@ impl WebClient {
             return Self { stop };
         }
         if let Some(auth_token) = token.clone() {
-            execution::start_web(
-                endpoint.clone(),
-                sender.clone(),
-                context.clone(),
-                stop.clone(),
-                auth_token.clone(),
-            );
             grid::start_web(
                 endpoint.clone(),
                 sender.clone(),
