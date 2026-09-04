@@ -5,6 +5,8 @@ import { allowedOrigin, controlOrigin, noStore } from "./server";
 const cookieName = "venue_customer";
 type CustomerSession = { token: string; csrf: string; expires_ms: number };
 const routes: Record<string, { path: string; methods: string[]; public?: boolean }> = {
+  "managed-followers": { path: "/v2/kol/managed-followers", methods: ["GET", "POST"] },
+  "managed-verify": { path: "/v2/kol/managed-followers/verify", methods: ["POST"] },
   login: { path: "/v2/account/login", methods: ["POST"], public: true },
   register: { path: "/v2/account/register", methods: ["POST"], public: true },
   session: { path: "/v2/account/session", methods: ["GET"] },
@@ -78,6 +80,15 @@ const riskFields = ["credential_id", "allocated_capital", "multiplier", "max_ord
 // secrets are never passed through to a browser response, including unexpected fields.
 export function customerPublicValue(action: string, method: string, raw: unknown): unknown {
   if (raw === null) return null;
+  if (action === "managed-followers" || action === "managed-verify") {
+    const fields = ["managed_id", "label", "masked_key", "verification", "verified_ms"];
+    if (action === "managed-followers" && method === "GET") {
+      const value = object(raw);
+      if (!Array.isArray(value.accounts) || typeof value.can_manage !== "boolean") throw new Error("invalid_managed_accounts");
+      return { can_manage: value.can_manage, accounts: value.accounts.map(v => pick(v, fields)) };
+    }
+    return pick(raw, fields);
+  }
   if (action === "session" || (action === "credentials" && method === "GET")) {
     const value = object(raw);
     if (!Array.isArray(value.credentials)) throw new Error("invalid_overview");
@@ -123,7 +134,10 @@ export async function customerResponse(request: NextRequest, action: string): Pr
   if (request.method === "POST") {
     try {
       const raw = object(await boundedJson(request.body, 16_384));
-      if (action === "credentials") {
+      if (action === "managed-followers") {
+        if (Object.keys(raw).some(k => !["request_id", "label", "key", "secret"].includes(k)) || [raw.request_id, raw.label, raw.key, raw.secret].some(v => typeof v !== "string")) throw new Error("invalid_managed_credentials");
+        body = JSON.stringify({ request_id: raw.request_id, credential: { label: raw.label, api_key: raw.key, api_secret: raw.secret } });
+      } else if (action === "credentials") {
         if (Object.keys(raw).some(k => !["label", "key", "secret"].includes(k)) || [raw.label, raw.key, raw.secret].some(v => typeof v !== "string")) throw new Error("invalid_credentials");
         body = JSON.stringify({ label: raw.label, api_key: raw.key, api_secret: raw.secret });
       } else { body = JSON.stringify(raw); }

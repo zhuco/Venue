@@ -73,3 +73,38 @@ test("public leader DTO preserves server denial and exposes only own aggregate s
   assert.deepEqual(customerPublicValue("leader", "GET", { schema_version: 1, can_use: false, permission_revision: 0, bot: null, followers: [{ secret: "foreign" }], admin: true }), { schema_version: 1, can_use: false, permission_revision: 0, bot: null });
   assert.deepEqual(customerPublicValue("mirror-orders", "GET", [{ mirror_id: "owned", state: "pending", owner: "foreign", api_secret: "secret" }]), [{ mirror_id: "owned", state: "pending" }]);
 });
+
+test("managed save forwards an owned request once and strips all secret and identity fields", async () => {
+  const keys = ["VENUE_WEB_SESSION_SIGNING_KEY", "VENUE_CONTROL_ORIGIN"] as const;
+  const old = keys.map(key => process.env[key]); const fetch = globalThis.fetch; let calls = 0;
+  try {
+    process.env.VENUE_WEB_SESSION_SIGNING_KEY = material;
+    process.env.VENUE_CONTROL_ORIGIN = "http://127.0.0.1:39180";
+    const cookie = sealCustomerSession(session()); assert.ok(cookie);
+    globalThis.fetch = async (url, init) => {
+      calls++;
+      assert.equal(String(url), "http://127.0.0.1:39180/v2/kol/managed-followers");
+      assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${session().token}`);
+      assert.deepEqual(JSON.parse(String(init?.body)), { request_id: session().csrf, credential: { label: "托管", api_key: "K".repeat(32), api_secret: "S".repeat(32) } });
+      return Response.json({ managed_id: "owned", label: "托管", masked_key: "••••KKKK", verification: "unverified", verified_ms: null, api_key: "K".repeat(32), api_secret: "S".repeat(32), follower_user_id: "hidden", credential_id: "hidden", trading_account_id: "hidden" });
+    };
+    const body = { request_id: session().csrf, label: "托管", key: "K".repeat(32), secret: "S".repeat(32) };
+    const denied = await customerResponse(request("managed-followers", { cookie, body: { ...body, kol_user_id: "forged" } }), "managed-followers");
+    assert.equal(denied.status,400); assert.equal(calls,0);
+    assert.equal((await customerResponse(request("managed-verify", { cookie, csrf:"invalid", body:{managed_id:"owned"} }),"managed-verify")).status,403);
+    const saved = await customerResponse(request("managed-followers", { cookie, body }), "managed-followers");
+    assert.equal(saved.status,200); assert.equal(calls,1);
+    const value = await saved.json(); assert.deepEqual(Object.keys(value).sort(),["label","managed_id","masked_key","verification","verified_ms"]);
+    assert.equal(JSON.stringify(value).includes("S".repeat(32)),false);
+    globalThis.fetch = async () => { calls++; throw new Error("timeout_with_secret"); };
+    const failed = await customerResponse(request("managed-followers", {cookie,body}),"managed-followers");
+    assert.equal(failed.status,503); assert.deepEqual(await failed.json(),{code:"unavailable"}); assert.equal(calls,2);
+  } finally { globalThis.fetch = fetch; keys.forEach((key,index) => { if(old[index] === undefined) delete process.env[key]; else process.env[key]=old[index]; }); }
+});
+
+test("managed list and verification disclose only the narrow summary", () => {
+  const raw = { managed_id:"one", label:"one", masked_key:"••••1234", verification:"verified", verified_ms:1, account_identity:"hidden", api_secret:"secret" };
+  const clean = customerPublicValue("managed-verify","POST",raw);
+  assert.deepEqual(customerPublicValue("managed-followers","GET",{can_manage:false,accounts:[raw],token:"secret"}),{can_manage:false,accounts:[clean]});
+  assert.equal(JSON.stringify(clean).includes("secret"),false);
+});

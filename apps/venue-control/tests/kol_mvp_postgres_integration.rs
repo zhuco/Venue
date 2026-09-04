@@ -1832,6 +1832,9 @@ impl Fixture {
         sqlx::raw_sql(venue_control::MIGRATION_0029)
             .execute(&self.pool)
             .await?;
+        sqlx::raw_sql(venue_control::MIGRATION_0030)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

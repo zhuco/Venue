@@ -1,20 +1,11 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { api, messages, RequestError } from "@/lib/customer-api";
+import { ManagedFollowersPanel } from "./managed-followers-panel";
 import type { Credential, CustomerOverview, FollowRelation, FollowSettings, Invite, LeaderAccess, MirrorOrder } from "@/lib/customer-types";
 
-const messages: Record<string, string> = { invalid_input: "请检查填写内容。", invalid_login: "用户名或密码不正确。", username_unavailable: "用户名已被使用。", unauthorized: "请重新登录。", forbidden: "当前账户没有此操作权限。", not_found: "未找到记录或邀请已失效。", conflict: "状态已变化，请刷新后重试。", verification_required: "账户验证或启动条件尚未满足。", account_in_use: "账户仍有任务或订单，暂时不能修改。", rate_limited: "请求过于频繁，请稍后再试。", unavailable: "服务暂时不可用。请先刷新状态，勿重复提交。" };
 const states: Record<string, string> = { stopped: "已停止", running: "运行中", draining: "正在撤销同步挂单", needs_attention: "需要处理", paused: "已暂停", active: "跟单中", disabled: "已禁用", pending: "待执行", live: "已挂单", cancelling: "撤单中", terminal: "已结束", blocked: "未下单", verified: "验证通过", unverified: "未验证" };
-class RequestError extends Error { constructor(readonly status: number, code: string) { super(messages[code] ?? messages.unavailable); } }
-async function api<T>(action: string, csrf?: string, body?: unknown): Promise<T> {
-  let result: Response;
-  try {
-    result = await fetch(`/api/customer/${action}`, { method: body === undefined ? "GET" : "POST", cache: "no-store", credentials: "same-origin", headers: body === undefined ? {} : { "Content-Type": "application/json", "x-venue-csrf": csrf ?? "" }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(35_000) });
-  } catch { throw new RequestError(503, "unavailable"); }
-  const value = await result.json().catch(() => { throw new RequestError(503, "unavailable"); });
-  if (!result.ok) throw new RequestError(result.status, value.code);
-  return value as T;
-}
 const field = (form: FormData, name: string) => String(form.get(name) ?? "");
 type Pending = { action: string; body: object };
 
@@ -95,6 +86,7 @@ export function CustomerConsole({ inviteCode }: { inviteCode?: string }) {
           {bot && bot.state !== "stopped" && <button disabled={locked || bot.state === "draining"} onClick={() => void mutate("leader-lifecycle", { schema_version: 1, request_id: crypto.randomUUID(), bot_id: bot.bot_id, expected_revision: bot.revision, action: "stop", risk_confirmed: false }, true)}>停止并撤销同步挂单</button>}
         </div><p className="muted">停止只撤销程序创建的同步挂单，已有仓位不会自动平仓。</p>
       </section>}
+      <ManagedFollowersPanel key={overview.user.user_id} csrf={overview.csrf} />
       <FollowPanel relation={relation} credentials={overview.credentials} selected={selected?.credential_id} disabled={locked} mutate={mutate} />
       <section className="panel"><h2>我的同步订单</h2><p className="muted">主账户和跟单账户独立成交；显示最近 500 条订单记录。</p>{orders.length === 0 ? <p>暂无同步订单。</p> : <div className="table"><table><thead><tr><th>交易对</th><th>来源订单</th><th>委托数量</th><th>已成交</th><th>状态</th></tr></thead><tbody>{orders.map(order => <tr key={order.mirror_id}><td>{order.symbol}</td><td>{order.source_order_id}</td><td>{order.requested_quantity}</td><td>{order.filled_quantity}</td><td>{states[order.state] ?? order.state}{order.attention_code && <small> · {order.attention_code}</small>}</td></tr>)}</tbody></table></div>}</section>
     </>}

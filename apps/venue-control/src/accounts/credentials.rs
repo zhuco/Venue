@@ -44,6 +44,21 @@ impl AccountService {
         }
         self.rate_limit(&format!("bind:{}", principal.user.user_id), 10, now_ms)
             .await?;
+        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let summary = self
+            .insert_credential(&mut tx, &principal.user.user_id, request, now_ms)
+            .await?;
+        tx.commit().await.map_err(database_error)?;
+        Ok(summary)
+    }
+
+    pub(super) async fn insert_credential(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        user_id: &str,
+        request: BindCredentialRequest,
+        now_ms: u64,
+    ) -> Result<CredentialSummary, AccountError> {
         let id = crypto::opaque_id()?;
         let summary = CredentialSummary {
             credential_id: id.clone(),
@@ -68,31 +83,31 @@ impl AccountService {
         };
         let payload =
             Zeroizing::new(serde_json::to_vec(&request).map_err(|_| error(Code::InvalidInput))?);
-        let encrypted = self.cipher.encrypt(&scope(principal, &id), &payload)?;
-        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let encrypted = self
+            .cipher
+            .encrypt(&credential_scope(user_id, &id), &payload)?;
         sqlx::query("SELECT user_id FROM venue_users WHERE user_id=$1 FOR UPDATE")
-            .bind(&principal.user.user_id)
-            .fetch_one(&mut *tx)
+            .bind(user_id)
+            .fetch_one(&mut **tx)
             .await
             .map_err(database_error)?;
         let count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM venue_api_credentials WHERE user_id=$1 AND deleted_ms IS NULL",
         )
-        .bind(&principal.user.user_id)
-        .fetch_one(&mut *tx)
+        .bind(user_id)
+        .fetch_one(&mut **tx)
         .await
         .map_err(database_error)?;
         if count >= 20 {
             return Err(error(Code::RateLimited));
         }
         let inserted = sqlx::query("INSERT INTO venue_api_credentials (credential_id,user_id,label,key_fingerprint,masked_key,encrypted_credentials,verification_json,created_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (key_fingerprint) DO NOTHING")
-            .bind(&id).bind(&principal.user.user_id).bind(&summary.label).bind(crypto::fingerprint(request.api_key.expose().as_bytes()))
+            .bind(&id).bind(user_id).bind(&summary.label).bind(crypto::fingerprint(request.api_key.expose().as_bytes()))
             .bind(&summary.masked_key).bind(encrypted).bind(encode_summary(&summary)?).bind(ms(now_ms)?)
-            .execute(&mut *tx).await.map_err(database_error)?;
+            .execute(&mut **tx).await.map_err(database_error)?;
         if inserted.rows_affected() != 1 {
             return Err(error(Code::Conflict));
         }
-        tx.commit().await.map_err(database_error)?;
         Ok(summary)
     }
 

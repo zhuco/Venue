@@ -1,5 +1,7 @@
 # VENUE 功能入口
 
+托管 API 保存入口：`accounts/managed_followers.rs`、`managed_followers` 协议和 migration `0030`；Web `components/managed-followers-panel.tsx` 经 customer BFF 调用 `/v2/kol/managed-followers` 与 `/verify`。只保存、列出掩码和手动验证，不创建交易任务。
+
 Binance 网格各层职责、目录和实际调用链见 [策略开发与运行结构](GRID_STRATEGY_ARCHITECTURE.md)。
 
 桌面诊断入口为 `apps/ui/desktop/src/diagnostics.rs`：警告写入用户本地 UI 日志，后台连接不依赖启动器 stdout 管道。

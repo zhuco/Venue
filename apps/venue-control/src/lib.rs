@@ -113,6 +113,7 @@ pub const MIGRATION_0027: &str = include_str!("../migrations/0027_terminal_posit
 pub const MIGRATION_0025: &str = include_str!("../migrations/0025_kol_market_convergence.sql");
 pub const MIGRATION_0026: &str = include_str!("../migrations/0026_kol_copy_risk.sql");
 pub const MIGRATION_0028: &str = include_str!("../migrations/0028_leader_order_mirror.sql");
+pub const MIGRATION_0030: &str = include_str!("../migrations/0030_managed_followers.sql");
 pub const MIGRATION_0029: &str = include_str!("../migrations/0029_mirror_gtc.sql");
 mod schema;
 pub use schema::{SchemaError, install_control_schema};

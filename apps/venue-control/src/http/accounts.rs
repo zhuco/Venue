@@ -20,6 +20,10 @@ use venue_control_protocol::{
         LEADER_BOT_LIFECYCLE_PATH, LEADER_BOT_PATH, LeaderBotCreateRequest,
         LeaderBotLifecycleRequest, MIRROR_ORDERS_PATH,
     },
+    managed_followers::{
+        MANAGED_FOLLOWERS_PATH, MANAGED_VERIFY_PATH, ManagedFollowerCreateRequest,
+        ManagedFollowerVerifyRequest,
+    },
     terminal_position::{TERMINAL_POSITION_ACTION_PATH, TerminalPositionActionRequest},
 };
 
@@ -74,6 +78,8 @@ where
                 | LEADER_BOT_PATH
                 | LEADER_BOT_LIFECYCLE_PATH
                 | MIRROR_ORDERS_PATH
+                | MANAGED_FOLLOWERS_PATH
+                | MANAGED_VERIFY_PATH
         )
     {
         let Some(accounts) = accounts else {
@@ -303,6 +309,27 @@ async fn account_request(
     })?;
     let principal = accounts.authenticate(token.expose(), now).await?;
     match (request.method, path) {
+        (Method::Get, MANAGED_FOLLOWERS_PATH) => {
+            encode(&accounts.managed_followers(&principal).await?)
+        }
+        (Method::Post, MANAGED_FOLLOWERS_PATH) => encode(
+            &accounts
+                .create_managed_follower(
+                    &principal,
+                    decode::<ManagedFollowerCreateRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
+        (Method::Post, MANAGED_VERIFY_PATH) => encode(
+            &accounts
+                .verify_managed_follower(
+                    &principal,
+                    decode::<ManagedFollowerVerifyRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
         (Method::Get, KOL_PROFILE_PATH) => encode(&accounts.own_kol_profile(&principal).await?),
         (Method::Get, LEADER_BOT_PATH) => encode(&accounts.leader_bot_access(&principal).await?),
         (Method::Get, MIRROR_ORDERS_PATH) => encode(&accounts.own_mirror_orders(&principal).await?),
