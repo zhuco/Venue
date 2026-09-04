@@ -7,13 +7,13 @@ const quantiles = (values: number[]) => { const sorted = [...values].sort((a, b)
 
 test("real BFF to isolated test Control records segmented browser and SSE samples", async ({ page }) => {
   test.setTimeout(90_000);
-  await page.goto("/");
+  await page.goto("/ops");
   await page.getByLabel("受控登录令牌").fill("e2e-bootstrap-token");
   await page.getByRole("button", { name: "建立受控会话" }).click();
   await expect(page.getByText("已同步 · 可受控写入")).toBeVisible();
   const navigation: number[] = [];
   for (let index = 0; index < 10; index += 1) {
-    await page.goto("/", { waitUntil: "domcontentloaded" });
+    await page.goto("/ops", { waitUntil: "domcontentloaded" });
     await expect(page.getByRole("heading", { name: "控制面总览" })).toBeVisible();
     navigation.push(await page.evaluate(() => performance.now()));
   }

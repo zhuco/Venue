@@ -14,6 +14,13 @@ export function boundaryViolations(source) {
   return rules.filter(([, pattern]) => pattern.test(source)).map(([label]) => label);
 }
 
+// The customer BFF must serialize the Control credential request. This exception is tied
+// to its server-only source file; the same fields remain forbidden in every browser chunk.
+export function fileBoundaryViolations(source, path) {
+  const serverBinding = path.replaceAll("\\", "/") === "lib/customer-server.ts";
+  return boundaryViolations(source).filter(reason => !(serverBinding && reason === "exchange credential field"));
+}
+
 function filesBelow(root) {
   return readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
     const path = join(root, entry.name);
@@ -33,7 +40,7 @@ export function verifyBoundary(root) {
   const bundleFiles = filesBelow(staticRoot).filter((path) => extname(path) === ".js");
   if (sourceFiles.length === 0 || bundleFiles.length === 0) throw new Error("Web boundary scan found no source or browser JavaScript");
   const violations = [...sourceFiles, ...bundleFiles].flatMap((path) =>
-    boundaryViolations(readFileSync(path, "utf8")).map((reason) => `${relative(root, path)}: ${reason}`),
+    fileBoundaryViolations(readFileSync(path, "utf8"), relative(root, path)).map((reason) => `${relative(root, path)}: ${reason}`),
   );
   // Only filenames and rule names are printed; offending text may itself contain a secret.
   if (violations.length) throw new Error(violations.join("\n"));
