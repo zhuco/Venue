@@ -54,3 +54,5 @@ G:\Venue\scripts\Start-VenueFlow.ps1 -SshTunnel
 ```
 
 隧道选项只复用已有 SSH 凭证；若已保存其他服务器地址，须在设置中切换到本机地址。脚本不读取或保存 API Key、密码和会话令牌。
+
+SSH 隧道诊断通过 OpenSSH `-E` 写入同目录的 `ssh-tunnel.log`，不占用启动器的输出管道。遇到持续 HTTP 超时应对比服务器本地接口和新隧道，确认故障连接后仅替换该隧道；服务器策略不依赖桌面隧道。

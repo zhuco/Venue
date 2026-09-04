@@ -19,8 +19,11 @@ if ($SshTunnel) {
     $forward = "127.0.0.1:${ControlPort}:127.0.0.1:${ControlPort}"
     $listener = Get-NetTCPConnection -State Listen -LocalPort $ControlPort -ErrorAction SilentlyContinue
     if (-not $listener) {
+        $tunnelLogDirectory = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'VenueFlow'
+        [IO.Directory]::CreateDirectory($tunnelLogDirectory) | Out-Null
         $ssh = Start-Process ssh.exe -ArgumentList @(
             '-N',
+            '-E', ('"{0}"' -f (Join-Path $tunnelLogDirectory 'ssh-tunnel.log')),
             '-o', 'BatchMode=yes',
             '-o', 'ExitOnForwardFailure=yes',
             '-o', 'ServerAliveInterval=15',
