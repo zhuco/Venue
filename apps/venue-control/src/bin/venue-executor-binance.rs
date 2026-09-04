@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let command_wake = CommandWake::new();
     let mut runtime = BinanceExecutorRuntime::with_command_wake(
         store.clone(),
-        exchange,
+        exchange.clone(),
         secrets.clone(),
         command_wake.clone(),
     );
@@ -84,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         secrets.clone(),
         command_wake.clone(),
         hot_dispatch.clone(),
+        exchange,
         grid_signal_tx,
         grid_recovery_rx,
         shutdown_rx.clone(),
@@ -174,6 +175,7 @@ async fn run_projection_supervisor(
     secrets: ExecutorSecretProvider,
     command_wake: CommandWake,
     hot_dispatch: GridHotDispatchCache,
+    exchange: BinanceExecutionRouter,
     grid_signal: tokio::sync::mpsc::Sender<GridPrivateStreamSignal>,
     mut grid_recovery: tokio::sync::mpsc::Receiver<String>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -300,6 +302,7 @@ async fn run_projection_supervisor(
                         let command_wake = command_wake.clone();
                         let hot_dispatch = hot_dispatch.clone();
                         let message_tx = message_tx.clone();
+                        let exchange = exchange.clone();
                         persistence_tasks.spawn(async move {
                             hot_dispatch.invalidate_credential(&source.credential_id);
                             let _ = grid_signal.try_send(GridPrivateStreamSignal::Invalidate {
@@ -308,6 +311,9 @@ async fn run_projection_supervisor(
                             let persisted = tokio::time::timeout(
                                 PROJECTION_PERSISTENCE_TIMEOUT,
                                 async {
+                                    if exchange.prepare_account_transports(&source.trading_account_id, &source.symbols).await.is_err() {
+                                        return false;
+                                    }
                                     match now_ms() {
                                         Ok(now) => persist_projection_turn(
                                             &executor_store,

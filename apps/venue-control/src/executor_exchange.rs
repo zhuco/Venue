@@ -239,7 +239,36 @@ impl BinanceExecutionRouter {
         &self,
         request: &ExecutionRequest,
     ) -> Result<Arc<tokio::sync::Mutex<BinanceHttpExecution>>, BinanceExecutionError> {
-        let key = (request.trading_account_id.clone(), request.symbol.clone());
+        self.account_exchange(&request.trading_account_id, &request.symbol)
+    }
+
+    /// Prime the actual mutation transports before installing a strategy's private baseline.
+    /// This reads public server time only; no credentials, account reads or orders are involved.
+    pub async fn prepare_account_transports(
+        &self,
+        trading_account_id: &str,
+        symbols: &BTreeSet<Symbol>,
+    ) -> Result<(), BinanceExecutionError> {
+        for symbol in symbols {
+            let exchange = self.account_exchange(trading_account_id, symbol)?;
+            let exchange = exchange.lock().await;
+            if exchange.transport.signing_timestamp_ms().is_err() {
+                exchange
+                    .transport
+                    .synchronize_clock()
+                    .await
+                    .map_err(|_| BinanceExecutionError::Unavailable)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn account_exchange(
+        &self,
+        trading_account_id: &str,
+        symbol: &Symbol,
+    ) -> Result<Arc<tokio::sync::Mutex<BinanceHttpExecution>>, BinanceExecutionError> {
+        let key = (trading_account_id.to_owned(), symbol.clone());
         let mut exchanges = self
             .exchanges
             .lock()
@@ -248,8 +277,8 @@ impl BinanceExecutionRouter {
             let binding = GatewayBinding::new(
                 VenueId::Binance,
                 GatewayMode::Live,
-                request.trading_account_id.clone(),
-                request.symbol.clone(),
+                trading_account_id.to_owned(),
+                symbol.clone(),
             )
             .map_err(|_| BinanceExecutionError::Invalid)?;
             let config = venue_gateway_binance::BinanceConfig::for_binding(
@@ -833,7 +862,12 @@ impl BinanceExecution for BinanceExecutionRouter {
                     .submit_grid_batch_hot_request(requests, &credentials, &token, executor_started)
                     .await
                 {
-                    Ok(outcome) => return Ok(outcome),
+                    Ok(outcome) => {
+                        tracing::info!(target: "venue_control::grid_hot_path",
+                            batch_id = %context.batch_id,
+                            "Grid batch dispatched using authenticated hot facts without REST preflight");
+                        return Ok(outcome);
+                    }
                     Err(error) => tracing::warn!(
                         target: "venue_control::grid_hot_path",
                         batch_id = %context.batch_id,

@@ -4,7 +4,7 @@
 
 认证成交与 REST 的去重边界位于 `apps/venue-control/src/private_projection.rs`：价格、数量及订单进度按精确 Decimal 数值相等比较，兼容历史 JSON 中的尾零，其他字段仍精确匹配；实库回归位于 `tests/support/projection_fill_observation.rs`。
 
-Grid 快速补撤确认位于 `apps/venue-control/src/executor_exchange/grid_batch.rs`，完整 RESULT 由 `crates/venue-gateway-binance/src/execution.rs` 保留；不确定结果按同 ID 对账。`account_stream_projection.rs` 在启动 REST 基线之上维护连续认证用户流的订单与双腿仓位，正常运行不定时拉全账户 REST；`account_gateway_projection.rs` 仅处理异常恢复读，`account_gateway_risk.rs` 保留完整账户风险读辅助。`grid_runtime/stream_overlay.rs` 按成交更新数量与加权开仓均价。`grid_runtime/risk.rs` 只在存在盈利减仓候选时单独签名读取 PM 权益；此查询不进入普通成交补撤路径。
+Grid 快速补撤确认位于 `apps/venue-control/src/executor_exchange/grid_batch.rs`，完整 RESULT 由 `crates/venue-gateway-binance/src/execution.rs` 保留；不确定结果按同 ID 对账。`BinanceExecutionRouter::prepare_account_transports` 在策略私流基线启用前预热实际共享下单连接的签名时钟，不占用成交热路径。`account_stream_projection.rs` 在启动 REST 基线之上维护连续认证用户流的订单与双腿仓位，正常运行不定时拉全账户 REST；`account_gateway_projection.rs` 仅处理异常恢复读，`account_gateway_risk.rs` 保留完整账户风险读辅助。`grid_runtime/stream_overlay.rs` 按成交更新数量与加权开仓均价。`grid_runtime/risk.rs` 只在存在盈利减仓候选时单独签名读取 PM 权益；此查询不进入普通成交补撤路径。
 
 当前目标是 Binance KOL 跟单 MVP 与事实驱动 Binance 对冲网格共用单例 `venue-executor-binance`；初期全站最多 5 个启用 KOL、200 个启用跟单账户。Scalping 和其余交易所迁移暂停。下面多数 Runtime/Node 入口是已提交代码或冻结兼容位置，不等于新链调用链。长期文档统一在本目录，仓库根 CODEMAP 仅作导航。
 

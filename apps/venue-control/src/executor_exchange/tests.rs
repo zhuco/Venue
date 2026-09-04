@@ -126,6 +126,31 @@ fn hot_token(now: u64) -> Result<crate::GridHotDispatchToken, Box<dyn std::error
 }
 
 #[test]
+fn prepared_account_transport_is_the_shared_dispatch_transport()
+-> Result<(), Box<dyn std::error::Error>> {
+    let router = BinanceExecutionRouter::new(venue_gateway_binance::BinanceTransportLimits::new(
+        std::time::Duration::from_secs(1),
+        1_024,
+    )?);
+    let mut request = grid_place_request(0)?;
+    request.trading_account_id = "00000000-0000-4000-8000-000000000001".into();
+    let prepared = router.account_exchange(&request.trading_account_id, &request.symbol)?;
+    let dispatch = router.clone().exchange(&request)?;
+    assert!(Arc::ptr_eq(&prepared, &dispatch));
+    let other = router.account_exchange("00000000-0000-4000-8000-000000000002", &request.symbol)?;
+    assert!(!Arc::ptr_eq(&prepared, &other));
+    assert!(
+        prepared
+            .try_lock()?
+            .transport
+            .signing_timestamp_ms()
+            .is_err(),
+        "a newly created production adapter must be explicitly warmed before hot dispatch"
+    );
+    Ok(())
+}
+
+#[test]
 fn router_consumes_only_an_exact_durable_hot_token() -> Result<(), Box<dyn std::error::Error>> {
     let now = now_ms()?;
     let cache = crate::GridHotDispatchCache::new();
