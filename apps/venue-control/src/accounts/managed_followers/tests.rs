@@ -182,3 +182,54 @@ async fn managed_save_is_atomic_scoped_idempotent_and_never_grants_trading() -> 
     );
     f.cleanup().await
 }
+
+#[tokio::test]
+async fn frozen_managed_table_is_preserved_and_nonempty_legacy_fails_closed() -> TestResult {
+    let Some(f) = Fixture::create().await? else {
+        return Ok(());
+    };
+    // DDL touches only Fixture's isolated random schema, never a production table.
+    sqlx::raw_sql("DROP TABLE venue_managed_credentials; DROP TABLE venue_kol_managed_followers; CREATE TABLE venue_kol_managed_followers(managed_follower_id TEXT PRIMARY KEY, kol_user_id TEXT NOT NULL, user_id TEXT NOT NULL, credential_id TEXT NOT NULL, label TEXT NOT NULL, managed_state TEXT NOT NULL, created_ms BIGINT NOT NULL, disabled_ms BIGINT);")
+        .execute(&f.pool).await?;
+    sqlx::query("INSERT INTO venue_kol_managed_followers VALUES('old','kol','subject','credential','label','active',1,NULL)").execute(&f.pool).await?;
+    assert!(crate::install_control_schema(&f.pool).await.is_err());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM venue_kol_managed_followers")
+            .fetch_one(&f.pool)
+            .await?,
+        1
+    );
+    assert!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT to_regclass('venue_managed_credentials')::text"
+        )
+        .fetch_one(&f.pool)
+        .await?
+        .is_none()
+    );
+    sqlx::query("DELETE FROM venue_kol_managed_followers WHERE managed_follower_id='old'")
+        .execute(&f.pool)
+        .await?;
+    crate::install_control_schema(&f.pool).await?;
+    crate::install_control_schema(&f.pool).await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("SELECT max(version) FROM venue_control_schema_migrations")
+            .fetch_one(&f.pool)
+            .await?,
+        31
+    );
+    assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='venue_kol_managed_followers' AND column_name='managed_follower_id'").fetch_one(&f.pool).await?,1);
+    let session = f.service.register(login("freshuser"), now()).await?;
+    let principal = f
+        .service
+        .authenticate(session.token.expose(), now())
+        .await?;
+    assert!(
+        f.service
+            .managed_followers(&principal)
+            .await?
+            .accounts
+            .is_empty()
+    );
+    f.cleanup().await
+}

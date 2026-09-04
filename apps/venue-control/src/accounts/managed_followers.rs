@@ -19,7 +19,7 @@ impl AccountService {
         .fetch_optional(&self.pool)
         .await
         .map_err(database_error)?;
-        let rows = sqlx::query("SELECT m.managed_id,c.verification_json FROM venue_kol_managed_followers m JOIN venue_api_credentials c ON c.credential_id=m.credential_id AND c.user_id=m.follower_user_id WHERE m.kol_user_id=$1 AND c.deleted_ms IS NULL ORDER BY m.created_ms,m.managed_id LIMIT 200")
+        let rows = sqlx::query("SELECT m.managed_id,c.verification_json FROM venue_managed_credentials m JOIN venue_api_credentials c ON c.credential_id=m.credential_id AND c.user_id=m.follower_user_id WHERE m.kol_user_id=$1 AND c.deleted_ms IS NULL ORDER BY m.created_ms,m.managed_id LIMIT 200")
             .bind(&principal.user.user_id).fetch_all(&self.pool).await.map_err(database_error)?;
         let accounts = rows
             .into_iter()
@@ -59,14 +59,14 @@ impl AccountService {
         if enabled != Some(true) {
             return Err(error(Code::Forbidden));
         }
-        if let Some(row) = sqlx::query("SELECT m.managed_id,m.request_hash,c.verification_json FROM venue_kol_managed_followers m JOIN venue_api_credentials c ON c.credential_id=m.credential_id WHERE m.kol_user_id=$1 AND m.request_id=$2")
+        if let Some(row) = sqlx::query("SELECT m.managed_id,m.request_hash,c.verification_json FROM venue_managed_credentials m JOIN venue_api_credentials c ON c.credential_id=m.credential_id WHERE m.kol_user_id=$1 AND m.request_id=$2")
             .bind(&principal.user.user_id).bind(&request.request_id).fetch_optional(&mut *tx).await.map_err(database_error)? {
             if row.try_get::<Vec<u8>,_>("request_hash").map_err(database_error)? != request_hash { return Err(error(Code::Conflict)); }
             let summary = serde_json::from_value(row.try_get("verification_json").map_err(database_error)?).map_err(|_| error(Code::Unavailable))?;
             return Ok(managed_summary(row.try_get("managed_id").map_err(database_error)?, summary));
         }
         let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM venue_kol_managed_followers WHERE kol_user_id=$1",
+            "SELECT count(*) FROM venue_managed_credentials WHERE kol_user_id=$1",
         )
         .bind(&principal.user.user_id)
         .fetch_one(&mut *tx)
@@ -83,7 +83,7 @@ impl AccountService {
         let credential = self
             .insert_credential(&mut tx, &user_id, request.credential, now_ms)
             .await?;
-        sqlx::query("INSERT INTO venue_kol_managed_followers(managed_id,kol_user_id,follower_user_id,credential_id,request_id,request_hash,created_ms) VALUES($1,$2,$3,$4,$5,$6,$7)")
+        sqlx::query("INSERT INTO venue_managed_credentials(managed_id,kol_user_id,follower_user_id,credential_id,request_id,request_hash,created_ms) VALUES($1,$2,$3,$4,$5,$6,$7)")
             .bind(&managed_id).bind(&principal.user.user_id).bind(&user_id).bind(&credential.credential_id)
             .bind(&request.request_id).bind(request_hash).bind(ms(now_ms)?).execute(&mut *tx).await.map_err(database_error)?;
         tx.commit().await.map_err(database_error)?;
@@ -114,7 +114,7 @@ impl AccountService {
         if !valid_id(id) {
             return Err(error(Code::InvalidInput));
         }
-        let row = sqlx::query("SELECT m.follower_user_id,m.credential_id,u.username FROM venue_kol_managed_followers m JOIN venue_kol_profiles p ON p.kol_user_id=m.kol_user_id JOIN venue_users u ON u.user_id=m.follower_user_id WHERE m.managed_id=$1 AND m.kol_user_id=$2 AND p.profile_state='enabled' AND NOT u.login_enabled")
+        let row = sqlx::query("SELECT m.follower_user_id,m.credential_id,u.username FROM venue_managed_credentials m JOIN venue_kol_profiles p ON p.kol_user_id=m.kol_user_id JOIN venue_users u ON u.user_id=m.follower_user_id WHERE m.managed_id=$1 AND m.kol_user_id=$2 AND p.profile_state='enabled' AND NOT u.login_enabled")
             .bind(id).bind(&principal.user.user_id).fetch_optional(&self.pool).await.map_err(database_error)?.ok_or(error(Code::NotFound))?;
         self.rate_limit(
             &format!("managed-verify:{}", principal.user.user_id),

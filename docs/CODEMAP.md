@@ -1,6 +1,6 @@
 # VENUE 功能入口
 
-托管 API 保存入口：`accounts/managed_followers.rs`、`managed_followers` 协议和 migration `0030`；Web `components/managed-followers-panel.tsx` 经 customer BFF 调用 `/v2/kol/managed-followers` 与 `/verify`。只保存、列出掩码和手动验证，不创建交易任务。
+托管 API 保存入口：`accounts/managed_followers.rs`、`managed_followers` 协议和 migration `0030`/`0031`；Web `components/managed-followers-panel.tsx` 经 customer BFF 调用 `/v2/kol/managed-followers` 与 `/verify`。只保存、列出掩码和手动验证，不创建交易任务。
 
 Binance 网格各层职责、目录和实际调用链见 [策略开发与运行结构](GRID_STRATEGY_ARCHITECTURE.md)。
 
