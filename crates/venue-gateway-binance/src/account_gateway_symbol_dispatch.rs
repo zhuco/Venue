@@ -177,6 +177,9 @@ pub(super) fn dispatch_catalog_permit(
         BinancePhysicalMutationOutcome::DispatchFailed {
             error: BinanceTransportError::HttpStatus(status),
         } if (400..500).contains(&status) => rejected("binance_venue_rejected"),
+        BinancePhysicalMutationOutcome::DispatchFailed {
+            error: BinanceTransportError::ApiRejected(_),
+        } => rejected("binance_venue_rejected"),
         BinancePhysicalMutationOutcome::DispatchFailed { .. }
         | BinancePhysicalMutationOutcome::AckedReadbackUnknown { .. }
         | BinancePhysicalMutationOutcome::DispatchUnknown { .. } => AccountGatewayResult::Unknown,

@@ -45,7 +45,7 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
         } else if private_ready {
             "LIVE"
         } else {
-            crate::i18n::text(language, crate::i18n::TextKey::TradingUnavailable)
+            label(language, "账户数据待刷新", "Account data awaiting refresh")
         };
         ui.label(
             RichText::new(format!("● {scope}  {symbol}"))
@@ -58,8 +58,8 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
         )
         .on_hover_text(label(
             language,
-            "下单须有精确账户、交易对和运行中的作用域；服务端再次验证。",
-            "An exact account, symbol and running scope are required; the server revalidates.",
+            "手动开仓不等待持仓刷新；账户权限由服务端验证，平仓仍需新鲜持仓。",
+            "Manual opens do not wait for positions; the server verifies ownership. Closes still require fresh positions.",
         ));
     });
     crate::terminal_feedback::show(ui, model);
@@ -323,15 +323,16 @@ fn action_button(
 
 fn action_disabled_reason(model: &AppModel, action: TradingAction, now: f64) -> Option<String> {
     let language = model.preferences.language;
-    if !model
-        .execution
-        .private_ready(model.preferences.execution_account_id.as_deref(), now_ms())
+    if !matches!(action, TradingAction::OpenLong | TradingAction::OpenShort)
+        && !model
+            .execution
+            .private_ready(model.preferences.execution_account_id.as_deref(), now_ms())
     {
         return Some(
             label(
                 language,
-                "私有账户数据已过期，等待 Executor 刷新后才可下单",
-                "Private account data is stale; orders resume after an Executor refresh",
+                "私有账户数据已过期，刷新后才可平仓或撤单；手动开仓不受此限制",
+                "Private data is stale; refresh before closing or cancelling. Manual opens remain available",
             )
             .to_owned(),
         );
@@ -723,5 +724,39 @@ pub(crate) const fn action_name(
         TradingAction::SelectSizePreset(_) => label(language, "数量预设", "Size Preset"),
         TradingAction::ClearSelection => label(language, "清除", "Clear"),
         TradingAction::CenterMarket => label(language, "回到市场", "Center Market"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn manual_open_is_available_without_private_projection_but_close_is_not()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut model = AppModel::new(crate::model::Preferences::default());
+        model.account_overview = Some(serde_json::from_value(serde_json::json!({
+            "user":{"user_id":"fixture-user","username":"fixture"},
+            "credentials":[], "selected_credential_id":"fixture-credential"
+        }))?);
+        model.preferences.execution_account_id = Some("fixture-account".into());
+        model.preferences.selected_symbol = "DOGE/USDC".into();
+        model
+            .trade_dock
+            .select_price(rust_decimal::Decimal::new(8663, 5), 1.0)?;
+        assert!(model.execution.private_projection.is_none());
+        for action in [TradingAction::OpenLong, TradingAction::OpenShort] {
+            assert!(action_disabled_reason(&model, action, 1.0).is_none());
+            assert!(terminal_request_parts(&model, action, 1.0)?.5.is_none());
+        }
+        for action in [
+            TradingAction::CloseLong,
+            TradingAction::CloseShort,
+            TradingAction::CancelSelectedOrder,
+        ] {
+            assert!(action_disabled_reason(&model, action, 1.0).is_some());
+        }
+        model.account_overview = None;
+        assert!(action_disabled_reason(&model, TradingAction::OpenLong, 1.0).is_some());
+        Ok(())
     }
 }

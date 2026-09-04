@@ -102,23 +102,33 @@ impl AccountService {
         now_ms: u64,
     ) -> Result<ExecutorCommandSummary, AccountError> {
         request.validate().map_err(|_| error(Code::InvalidInput))?;
-        let projection =
-            crate::private_projection::BinancePrivateProjectionStore::new(self.pool.clone())
-                .load_owned(&principal.user.user_id, &request.credential_id)
-                .await
-                .map_err(|_| error(Code::Unavailable))?
-                .ok_or(error(Code::VerificationRequired))?;
-        if projection.observed_ms > now_ms
-            || now_ms.saturating_sub(projection.observed_ms) > MAX_TERMINAL_PROJECTION_AGE_MS
-        {
-            return Err(error(Code::VerificationRequired));
-        }
-        let position_side = request.action.position_side();
         let reducing = request.action.is_close();
+        let trading_account_id: String = sqlx::query_scalar("SELECT trading_account_id FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND deleted_ms IS NULL AND trading_account_id IS NOT NULL AND verification_json->>'verification'='verified'")
+            .bind(&request.credential_id).bind(&principal.user.user_id).fetch_optional(&self.pool)
+            .await.map_err(database_error)?.ok_or(error(Code::VerificationRequired))?;
+        let projection = if reducing {
+            let projection =
+                crate::private_projection::BinancePrivateProjectionStore::new(self.pool.clone())
+                    .load_owned(&principal.user.user_id, &request.credential_id)
+                    .await
+                    .map_err(|_| error(Code::Unavailable))?
+                    .ok_or(error(Code::VerificationRequired))?;
+            if projection.trading_account_id != trading_account_id
+                || projection.observed_ms > now_ms
+                || now_ms.saturating_sub(projection.observed_ms) > MAX_TERMINAL_PROJECTION_AGE_MS
+            {
+                return Err(error(Code::VerificationRequired));
+            }
+            Some(projection)
+        } else {
+            None
+        };
+        let position_side = request.action.position_side();
         let side = order_side_for(request.action);
         let position_quantity = projection
-            .positions
-            .iter()
+            .as_ref()
+            .into_iter()
+            .flat_map(|projection| &projection.positions)
             .find(|position| {
                 position.symbol == request.symbol && position.position_side == position_side
             })
@@ -156,7 +166,7 @@ impl AccountService {
         // A legacy account-node scope is a fail-closed ownership fence. It is deliberately not
         // age-expired here: only an explicit, audited migration may release an old writer after
         // its WAL, Unknown outcomes and positions have converged.
-        reject_legacy_writer(&self.pool, &projection.trading_account_id).await?;
+        reject_legacy_writer(&self.pool, &trading_account_id).await?;
         let digest: [u8; 32] =
             Sha256::digest(serde_json::to_vec(&request).map_err(|_| error(Code::InvalidInput))?)
                 .into();
@@ -172,11 +182,18 @@ impl AccountService {
         let queue_depth = lock_account_command_queue(
             &mut *tx,
             &principal.user.user_id,
-            &projection.trading_account_id,
+            &trading_account_id,
             &request.credential_id,
         )
         .await
         .map_err(account_admission_error)?;
+        // Recheck under the existing credential lock, without a private exchange round trip.
+        let verified: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND trading_account_id=$3 AND deleted_ms IS NULL AND verification_json->>'verification'='verified')")
+            .bind(&request.credential_id).bind(&principal.user.user_id).bind(&trading_account_id)
+            .fetch_one(&mut *tx).await.map_err(database_error)?;
+        if !verified {
+            return Err(error(Code::VerificationRequired));
+        }
         if let Some(row) =
             load_terminal_command(&mut *tx, &principal.user.user_id, &request.request_id).await?
         {
@@ -190,10 +207,10 @@ impl AccountService {
         }
         let inserted = sqlx::query("INSERT INTO venue_binance_commands (command_id,command_origin,request_id,owner_user_id,trading_account_id,credential_id,symbol,position_side,command_phase,order_kind,order_side,requested_quantity,limit_price,rule_version,client_order_id,command_state,source_digest,created_ms,updated_ms) VALUES ($1,'terminal',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pending',$15,$16,$16) ON CONFLICT (owner_user_id,request_id) WHERE command_origin='terminal' DO NOTHING")
             .bind(&command_id).bind(&request.request_id).bind(&principal.user.user_id)
-            .bind(&projection.trading_account_id).bind(&request.credential_id).bind(request.symbol.to_string())
+            .bind(&trading_account_id).bind(&request.credential_id).bind(request.symbol.to_string())
             .bind(position_side_name(position_side)).bind(phase).bind(order_kind).bind(order_side_name(side))
             .bind(requested_quantity.normalize().to_string()).bind(request.limit_price.map(|price| price.normalize().to_string()))
-            .bind(format!("binance-pm-um-projection-{}", projection.private_generation)).bind(client_order_id)
+            .bind(projection.as_ref().map_or_else(|| "binance-pm-um-terminal-open".to_owned(), |projection| format!("binance-pm-um-projection-{}", projection.private_generation))).bind(client_order_id)
             .bind(digest.as_slice()).bind(ms(now_ms)?).execute(&mut *tx).await.map_err(database_error)?;
         let row = sqlx::query("SELECT command_id,request_id,command_origin,command_phase,order_kind,order_side,requested_quantity,limit_price,trading_account_id,symbol,position_side,command_state,native_order_id,created_ms,updated_ms,sanitized_error_code,source_digest FROM venue_binance_commands WHERE owner_user_id=$1 AND request_id=$2 AND command_origin='terminal' FOR SHARE")
             .bind(&principal.user.user_id).bind(&request.request_id).fetch_one(&mut *tx).await.map_err(database_error)?;

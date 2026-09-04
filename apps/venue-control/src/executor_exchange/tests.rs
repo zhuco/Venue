@@ -13,6 +13,7 @@ fn credentials() -> Result<BinanceCredentials, Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn mock_submit_is_stable_by_client_order_id() -> Result<(), Box<dyn std::error::Error>> {
     let request = ExecutionRequest {
+        origin: venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
         command_id: "command-a".into(),
         client_order_id: "client-a".into(),
         credential_id: "credential-a".into(),
@@ -46,6 +47,7 @@ async fn mock_submit_is_stable_by_client_order_id() -> Result<(), Box<dyn std::e
 
 fn grid_place_request(index: usize) -> Result<ExecutionRequest, Box<dyn std::error::Error>> {
     Ok(ExecutionRequest {
+        origin: venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
         command_id: format!("place-command-{index}"),
         client_order_id: format!("place-client-{index}"),
         credential_id: "credential-a".into(),
@@ -65,6 +67,7 @@ fn grid_place_request(index: usize) -> Result<ExecutionRequest, Box<dyn std::err
 
 fn grid_cancel_request(index: usize) -> Result<ExecutionRequest, Box<dyn std::error::Error>> {
     Ok(ExecutionRequest {
+        origin: venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
         command_id: format!("cancel-command-{index}"),
         client_order_id: format!("cancel-client-{index}"),
         credential_id: "credential-a".into(),
@@ -311,6 +314,22 @@ fn transport_preflight_failure_stays_not_dispatched() {
 }
 
 #[test]
+fn exchange_rejection_retains_numeric_reason_without_raw_message()
+-> Result<(), Box<dyn std::error::Error>> {
+    for code in [-4164, -5022, -2019, -1111, -4061] {
+        let result = dispatch_failed(BinanceTransportError::ApiRejected(code), None)?;
+        assert_eq!(result.state, ExecutionReadback::Rejected);
+        assert_eq!(result.exchange_error_code, Some(code));
+    }
+    let timestamp = dispatch_failed(BinanceTransportError::TimestampRejected, None)?;
+    assert_eq!(timestamp.exchange_error_code, Some(-1021));
+    let unknown = dispatch_failed(BinanceTransportError::AmbiguousStatus(503), None)?;
+    assert_eq!(unknown.state, ExecutionReadback::Unknown);
+    assert_eq!(unknown.exchange_error_code, None);
+    Ok(())
+}
+
+#[test]
 fn not_dispatched_failures_are_distinct_from_dispatch_uncertainty() {
     assert_eq!(
         BinanceExecutionError::Invalid.not_dispatched_code(),
@@ -395,6 +414,7 @@ fn restart_market_terminal_requires_a_persisted_pre_dispatch_position_baseline()
 fn projection_lag_reservation_requires_exact_persisted_context()
 -> Result<(), Box<dyn std::error::Error>> {
     let request = ExecutionRequest {
+        origin: venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
         command_id: "current".into(),
         client_order_id: "current-client".into(),
         credential_id: "credential-a".into(),
@@ -511,6 +531,7 @@ fn exact_limit_readback_requires_every_immutable_semantic() -> Result<(), Box<dy
         7,
     )?;
     let request = ExecutionRequest {
+        origin: venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
         command_id: "command-limit".into(),
         client_order_id: "client-limit".into(),
         credential_id: "credential-a".into(),
@@ -562,6 +583,7 @@ fn exact_reducing_readback_accepts_only_a_normalized_downward_clip()
         7,
     )?;
     let request = ExecutionRequest {
+        origin: venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
         command_id: "command-close".into(),
         client_order_id: "client-close".into(),
         credential_id: "credential-a".into(),

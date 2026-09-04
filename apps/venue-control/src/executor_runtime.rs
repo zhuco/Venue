@@ -737,6 +737,19 @@ where
     };
     let mut request = request(&command);
     request.reconciled_close_reservations = reservations;
+    if crate::executor_exchange::is_terminal_open(&request)
+        && !store.terminal_open_credential_verified(&command).await?
+    {
+        store
+            .transition_command(
+                &command.command_id,
+                ExecutorCommandState::Rejected,
+                now_ms()?,
+                Some("credential_unavailable"),
+            )
+            .await?;
+        return Ok(drain_after_persisted_state(ExecutorCommandState::Rejected));
+    }
     match exchange.submit(&request, credentials).await {
         Ok(result) => settle_submit_result(store, &command, result).await,
         Err(error) => {
@@ -781,12 +794,15 @@ async fn settle_submit_result(
     }
     match result.state {
         ExecutionReadback::Rejected => {
+            let reason = result
+                .exchange_error_code
+                .map(|code| format!("binance_{code}"));
             store
                 .transition_command_with_readback(
                     &command.command_id,
                     ExecutorCommandState::Rejected,
                     now_ms()?,
-                    Some("binance_rejected"),
+                    Some(reason.as_deref().unwrap_or("binance_rejected")),
                     result.native_order_id.as_deref(),
                 )
                 .await?;
@@ -928,6 +944,7 @@ where
         Ok(ExecutionOutcome {
             state: ExecutionReadback::Reconciled,
             native_order_id,
+            ..
         }) => {
             store
                 .transition_command_with_readback(
@@ -945,6 +962,7 @@ where
         Ok(ExecutionOutcome {
             state: ExecutionReadback::Accepted,
             native_order_id: Some(native_order_id),
+            ..
         }) if completes_on_signed_accept(command) => {
             store
                 .transition_command_with_readback(
@@ -962,6 +980,7 @@ where
         Ok(ExecutionOutcome {
             state: ExecutionReadback::Rejected,
             native_order_id,
+            ..
         }) => {
             if command.state == ExecutorCommandState::Accepted {
                 store
@@ -988,6 +1007,7 @@ where
         Ok(ExecutionOutcome {
             state: ExecutionReadback::Unknown,
             native_order_id,
+            ..
         }) => {
             store
                 .defer_reconciliation(
@@ -1005,6 +1025,7 @@ where
         Ok(ExecutionOutcome {
             state: ExecutionReadback::Accepted,
             native_order_id,
+            ..
         }) => {
             store
                 .defer_reconciliation(
@@ -1076,6 +1097,7 @@ fn request(command: &ClaimedBinanceCommand) -> ExecutionRequest {
         },
     };
     ExecutionRequest {
+        origin: command.origin,
         command_id: command.command_id.clone(),
         client_order_id: command.client_order_id.clone(),
         credential_id: command.credential_id.clone(),
@@ -1157,6 +1179,7 @@ mod tests {
     ) -> Result<RecoverableBinanceCommand, Box<dyn std::error::Error>> {
         Ok(RecoverableBinanceCommand {
             command: ClaimedBinanceCommand {
+                origin: venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
                 command_id: command_id.into(),
                 owner_user_id: "owner".into(),
                 trading_account_id: account.into(),
@@ -1393,6 +1416,7 @@ mod tests {
     #[test]
     fn request_keeps_the_durable_identities_verbatim() -> Result<(), Box<dyn std::error::Error>> {
         let command = ClaimedBinanceCommand {
+            origin: venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
             command_id: "command".into(),
             owner_user_id: "owner".into(),
             trading_account_id: "account".into(),
@@ -1411,6 +1435,7 @@ mod tests {
         assert_eq!(
             request(&command),
             ExecutionRequest {
+                origin: venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
                 command_id: "command".into(),
                 client_order_id: "client".into(),
                 credential_id: "credential".into(),
@@ -1434,6 +1459,7 @@ mod tests {
     fn signed_post_only_acceptance_releases_the_account_queue()
     -> Result<(), Box<dyn std::error::Error>> {
         let command = ClaimedBinanceCommand {
+            origin: venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
             command_id: "command".into(),
             owner_user_id: "owner".into(),
             trading_account_id: "account".into(),
@@ -1458,6 +1484,7 @@ mod tests {
     fn request_keeps_dual_exact_cancel_selectors_separate_from_command_identity()
     -> Result<(), Box<dyn std::error::Error>> {
         let command = ClaimedBinanceCommand {
+            origin: venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
             command_id: "cancel-command".into(),
             owner_user_id: "owner".into(),
             trading_account_id: "account".into(),
@@ -1474,6 +1501,7 @@ mod tests {
         assert_eq!(
             request(&command),
             ExecutionRequest {
+                origin: venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
                 command_id: "cancel-command".into(),
                 client_order_id: "cancel-request-id".into(),
                 credential_id: "credential".into(),

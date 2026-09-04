@@ -1,4 +1,5 @@
 use super::*;
+mod terminal_open;
 use crate::{
     PgControlRepository,
     accounts::{

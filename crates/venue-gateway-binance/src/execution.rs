@@ -1,5 +1,7 @@
 use rust_decimal::Decimal;
+mod terminal_open;
 use serde_json::Value;
+pub use terminal_open::prepare_terminal_open_limit;
 use venue_domain::domain::{
     ExecutionCommand, FieldState, LimitTimeInForce, Order, OrderSide, OrderState, PositionSide,
     Price,
