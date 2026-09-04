@@ -19,6 +19,9 @@ use venue_domain::{OrderSide, PositionSide};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+#[path = "support/grid_rejection_recovery.rs"]
+mod grid_rejection_recovery;
+
 #[tokio::test]
 async fn grid_store_is_idempotent_owned_and_restart_safe() -> TestResult {
     let Some(fixture) = Fixture::create().await? else {

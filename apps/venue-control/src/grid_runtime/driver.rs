@@ -1,10 +1,11 @@
 use std::{collections::VecDeque, future::Future};
 
 use tokio::sync::{mpsc, watch};
+use venue_control_protocol::grid::GridInstanceState;
 
 use super::{
     BinanceGridRuntime, BinanceGridRuntimeError, GRID_TICK_INTERVAL, GridPrivateStreamSignal,
-    fast_path::receive_private_signal,
+    fast_path::receive_private_signal, now_ms,
 };
 
 enum ColdTurn<T> {
@@ -24,10 +25,20 @@ impl BinanceGridRuntime {
         let mut private_stream = self.hot_path.take_receiver();
         let mut deferred = VecDeque::new();
         let mut cold_due = false;
+        let mut next_rejection_check = tokio::time::Instant::now();
 
         loop {
             if *shutdown.borrow() {
                 return Ok(());
+            }
+            // A continuously ready private mailbox can cancel every cold turn. The durable
+            // rejection deadline must still be checked before draining that mailbox.
+            if tokio::time::Instant::now() >= next_rejection_check {
+                if let Err(error) = self.enforce_rejection_deadlines().await {
+                    tracing::warn!(target: "venue_control::grid_runtime", %error,
+                        "Grid rejection deadline check failed and will retry");
+                }
+                next_rejection_check = tokio::time::Instant::now() + GRID_TICK_INTERVAL;
             }
             if let Some(signal) = deferred.pop_front() {
                 self.handle_private_signal(signal, &mut private_stream, &mut deferred)
@@ -81,6 +92,45 @@ impl BinanceGridRuntime {
                 _ = interval.tick() => cold_due = true,
             }
         }
+    }
+
+    pub(super) async fn enforce_rejection_deadlines(&self) -> Result<(), BinanceGridRuntimeError> {
+        for record in self.store.list_runtime_instances().await? {
+            if !matches!(
+                record.instance.state,
+                GridInstanceState::StartPending
+                    | GridInstanceState::Running
+                    | GridInstanceState::Blocked
+            ) {
+                continue;
+            }
+            let first = self
+                .store
+                .exchange_rejection_started_ms(
+                    &record.instance.instance_id,
+                    record.instance.config_revision,
+                )
+                .await?;
+            let now = now_ms()?;
+            if crate::grid_store::rejection::rejection_reset_due(first, now) {
+                match self
+                    .store
+                    .settle_runtime_state_checked(
+                        &record.instance.instance_id,
+                        Some(record.instance.revision),
+                        record.instance.state,
+                        GridInstanceState::ResetRequired,
+                        Some("exchange_rejection_delay_elapsed"),
+                        now,
+                    )
+                    .await
+                {
+                    Ok(_) | Err(crate::GridStoreError::Conflict) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(())
     }
 }
 

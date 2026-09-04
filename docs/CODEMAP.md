@@ -1,5 +1,9 @@
 # VENUE 功能入口
 
+Binance 网格各层职责、目录和实际调用链见 [策略开发与运行结构](GRID_STRATEGY_ARCHITECTURE.md)。
+
+Grid 拒单恢复位于 `apps/venue-control/src/grid_store/rejection.rs`：从当前配置代的命令账本读取首次明确 Binance 拒单时间，30 秒期限不随重试、滚动、短暂收敛或进程重启延后。`grid_store/convergence.rs` 管理倒计时与独立的重置阶段计时；`grid_runtime/driver.rs` 在持续私流下仍检查期限，`grid_runtime/reconcile.rs` 批量修复明确失败的目标、继续补撤，并在撤净确认后清除旧收敛计时。实库回归位于 `grid_runtime/reconcile_tests.rs` 与 `tests/support/grid_rejection_recovery.rs`。
+
 更新：2026-09-04
 
 认证成交与 REST 的去重边界位于 `apps/venue-control/src/private_projection.rs`：价格、数量及订单进度按精确 Decimal 数值相等比较，兼容历史 JSON 中的尾零，其他字段仍精确匹配；实库回归位于 `tests/support/projection_fill_observation.rs`。

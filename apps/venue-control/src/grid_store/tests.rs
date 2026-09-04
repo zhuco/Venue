@@ -47,7 +47,11 @@ fn runtime_transition_table_is_fail_closed() {
 
 #[test]
 fn lifecycle_and_config_changes_fence_only_unsent_risk_commands() {
-    let source = include_str!("../grid_store.rs");
+    let source = [
+        include_str!("../grid_store.rs"),
+        include_str!("convergence.rs"),
+    ]
+    .join("\n");
     assert_eq!(
         source
             .matches("cancel_pending_risk_commands(&mut tx")
@@ -191,7 +195,7 @@ fn convergence_cas_fences_every_lifecycle_change() {
         update.expected_state = state;
         assert!(!convergence_cas_matches(&update, 7, state));
     }
-    let source = include_str!("../grid_store.rs");
+    let source = include_str!("convergence.rs");
     assert!(source.contains("AND revision=$12 AND plan_revision=$13"));
     assert!(source.contains("AND instance_state=$14"));
     assert!(source.contains("update.expected_state == GridInstanceState::Paused && update.dirty"));
