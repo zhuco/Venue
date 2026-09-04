@@ -120,6 +120,42 @@ pub(crate) fn command_reason(summary: &ExecutorCommandSummary, language: Languag
         .into();
     }
     let (zh, en) = match code {
+        "not_dispatched_quantity_zero" => (
+            "按交易对数量步长向下取整后为零，未发单。",
+            "Quantity rounds down to zero at the symbol's step size; not sent.",
+        ),
+        "binance_-4164" => (
+            "币安拒单：订单名义金额低于该交易对最低要求。",
+            "Binance rejected the order: notional below the symbol minimum.",
+        ),
+        "binance_-1013" => (
+            "币安拒单：请求消息无效。",
+            "Binance rejected the order: invalid request message.",
+        ),
+        "binance_-2019" => (
+            "币安拒单：保证金不足。",
+            "Binance rejected the order: insufficient margin.",
+        ),
+        "binance_-5022" => (
+            "币安拒单：Post Only 价格会立即成交，请重新选择挂单价格。",
+            "Binance rejected Post Only because the price would take liquidity.",
+        ),
+        "binance_-1111" => (
+            "币安拒单：数量或价格精度超出交易对限制。",
+            "Binance rejected quantity or price precision.",
+        ),
+        "binance_-4061" => (
+            "币安拒单：订单持仓方向与账户持仓模式不匹配。",
+            "Binance rejected a position-side/account-mode mismatch.",
+        ),
+        "binance_-2015" => (
+            "币安拒单：API Key、IP 白名单或交易权限被拒绝。",
+            "Binance rejected the API key, IP whitelist or permissions.",
+        ),
+        "binance_-1021" => (
+            "币安拒单：签名时间超出有效窗口，执行器需完成校时。",
+            "Binance rejected the signed timestamp; executor clock synchronization is required.",
+        ),
         "not_dispatched_invalid" => (
             "发送前校验未通过；可能涉及请求、数量/价格规则或签名账户事实。当前服务端未记录更细分原因。",
             "Pre-send validation failed for the request, order rules or signed account facts. The server did not record a finer reason.",
@@ -183,6 +219,46 @@ fn choose(language: Language, zh: &'static str, en: &'static str) -> &'static st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exchange_reasons_keep_numeric_codes_and_hide_untrusted_content()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use venue_control_protocol::kol::{
+            ExecutorCommandOrigin, ExecutorCommandPhase, ExecutorOrderKind,
+        };
+        let mut summary = ExecutorCommandSummary {
+            command_id: "fixture".into(),
+            request_id: None,
+            origin: ExecutorCommandOrigin::Terminal,
+            phase: ExecutorCommandPhase::Open,
+            trading_account_id: "fixture".into(),
+            symbol: "DOGE/USDC".parse()?,
+            position_side: Some(venue_domain::domain::PositionSide::Long),
+            order_side: Some(venue_domain::domain::OrderSide::Buy),
+            order_kind: ExecutorOrderKind::LimitPostOnly,
+            requested_quantity: Some(1.into()),
+            limit_price: Some(1.into()),
+            state: ExecutorCommandState::Rejected,
+            native_order_id: None,
+            created_ms: 1,
+            updated_ms: 1,
+            sanitized_error_code: None,
+        };
+        for (code, reason) in [
+            ("binance_-4164", "最低要求"),
+            ("binance_-1013", "消息无效"),
+            ("binance_-5022", "Post Only"),
+            ("binance_-2019", "保证金不足"),
+        ] {
+            summary.sanitized_error_code = Some(code.into());
+            let message = command_reason(&summary, Language::SimplifiedChinese);
+            assert!(message.contains(code) && message.contains(reason));
+        }
+        summary.sanitized_error_code = Some("APIKEY=must-not-render".into());
+        let message = command_reason(&summary, Language::SimplifiedChinese);
+        assert!(message.contains("原文已隐藏") && !message.contains("must-not-render"));
+        Ok(())
+    }
 
     #[test]
     fn http_failure_exposes_only_the_typed_error_code() {

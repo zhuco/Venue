@@ -25,6 +25,7 @@ pub struct BinanceCommandLedger {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaimedBinanceCommand {
+    pub origin: venue_control_protocol::kol::ExecutorCommandOrigin,
     pub command_id: String,
     pub owner_user_id: String,
     pub trading_account_id: String,
@@ -338,7 +339,7 @@ impl BinanceCommandLedger {
              LIMIT 1 FOR UPDATE SKIP LOCKED) \
              UPDATE venue_binance_commands c SET command_state='sending',sending_ms=$2,updated_ms=$2 \
              FROM candidate WHERE c.command_id=candidate.command_id \
-             RETURNING c.command_id,c.owner_user_id,c.trading_account_id,c.credential_id,c.symbol,c.order_side,c.position_side,c.requested_quantity,c.command_phase,c.order_kind,c.limit_price,c.selected_native_order_id,c.target_client_order_id,c.client_order_id,c.native_order_id,c.command_state",
+             RETURNING c.command_id,c.command_origin,c.owner_user_id,c.trading_account_id,c.credential_id,c.symbol,c.order_side,c.position_side,c.requested_quantity,c.command_phase,c.order_kind,c.limit_price,c.selected_native_order_id,c.target_client_order_id,c.client_order_id,c.native_order_id,c.command_state",
         )
         .bind(trading_account_id)
         .bind(now)
@@ -449,7 +450,7 @@ impl BinanceCommandLedger {
              UPDATE venue_binance_commands c \
              SET command_state='sending',sending_ms=$5,updated_ms=$5 \
              FROM selected WHERE c.command_id=selected.command_id \
-             RETURNING c.command_id,c.owner_user_id,c.trading_account_id,c.credential_id,c.symbol,\
+             RETURNING c.command_id,c.command_origin,c.owner_user_id,c.trading_account_id,c.credential_id,c.symbol,\
                c.order_side,c.position_side,c.requested_quantity,c.command_phase,c.order_kind,\
                c.limit_price,c.selected_native_order_id,c.target_client_order_id,c.client_order_id,\
                c.native_order_id,c.command_state,c.grid_batch_id,c.dispatch_sequence",
@@ -762,6 +763,16 @@ pub(crate) fn claimed(
     let order = claimed_order(&row, &phase)?;
     let native_order_id = optional_native_id(&row, "native_order_id")?;
     Ok(ClaimedBinanceCommand {
+        origin: match row
+            .try_get::<String, _>("command_origin")
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+            .as_str()
+        {
+            "terminal" => venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
+            "grid" => venue_control_protocol::kol::ExecutorCommandOrigin::Grid,
+            "copy" => venue_control_protocol::kol::ExecutorCommandOrigin::Copy,
+            _ => return Err(BinanceCommandLedgerError::Conflict),
+        },
         command_id: row
             .try_get("command_id")
             .map_err(|_| BinanceCommandLedgerError::Unavailable)?,

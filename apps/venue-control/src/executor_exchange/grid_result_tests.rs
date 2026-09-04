@@ -61,6 +61,7 @@ fn fixture(
         2200,
     )?;
     let request = ExecutionRequest {
+        origin: venue_control_protocol::kol::ExecutorCommandOrigin::Grid,
         command_id: "command".into(),
         client_order_id: "venue_place_1".into(),
         credential_id: "credential".into(),

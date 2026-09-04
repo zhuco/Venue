@@ -276,7 +276,7 @@ impl BinanceHttpExecution {
 
 /// A validated mutation RESULT is already an authenticated exchange fact. Missing or
 /// inconsistent results enter durable reconciliation; never add a synchronous query per child.
-fn grid_result_outcome(
+pub(super) fn grid_result_outcome(
     request: &ExecutionRequest,
     rules: &venue_gateway_binance::BinanceInstrumentRules,
     ack: &BinanceMutationAck,
@@ -844,6 +844,7 @@ const fn prepare_dispatch_error(error: BinanceTransportError) -> BinanceExecutio
         | BinanceTransportError::Disconnected
         | BinanceTransportError::AmbiguousStatus(_)
         | BinanceTransportError::HttpStatus(_)
+        | BinanceTransportError::ApiRejected(_)
         | BinanceTransportError::BodyTooLarge
         | BinanceTransportError::Ack
         | BinanceTransportError::TimestampRejected

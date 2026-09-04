@@ -920,14 +920,16 @@ fn time_offset_ms(server_time_ms: u64, local_midpoint_ms: u64) -> i64 {
 }
 
 fn classify_http_error(status: u16, payload: &[u8], mutation: bool) -> BinanceTransportError {
-    if serde_json::from_slice::<serde_json::Value>(payload)
+    let code = serde_json::from_slice::<serde_json::Value>(payload)
         .ok()
         .and_then(|value| value.get("code").and_then(serde_json::Value::as_i64))
-        == Some(-1021)
-    {
-        BinanceTransportError::TimestampRejected
-    } else if mutation && (status >= 500 || status == 408) {
+        .filter(|code| (-999_999..=-1).contains(code));
+    if mutation && (status >= 500 || status == 408 || matches!(code, Some(-1006 | -1007))) {
         BinanceTransportError::AmbiguousStatus(status)
+    } else if code == Some(-1021) {
+        BinanceTransportError::TimestampRejected
+    } else if let Some(code) = code.filter(|_| mutation && (400..500).contains(&status)) {
+        BinanceTransportError::ApiRejected(code)
     } else {
         BinanceTransportError::HttpStatus(status)
     }
@@ -949,6 +951,8 @@ pub enum BinanceTransportError {
     Disconnected,
     #[error("Binance returned HTTP status {0}")]
     HttpStatus(u16),
+    #[error("Binance rejected the request with code {0}")]
+    ApiRejected(i64),
     #[error("Binance returned ambiguous HTTP status {0} after dispatch")]
     AmbiguousStatus(u16),
     #[error("Binance response exceeded the bounded body or frame limit")]
@@ -1002,6 +1006,25 @@ mod tests {
     const ACK: &[u8] = include_bytes!("../fixtures/place-order-ack.json");
     const EXACT: &[u8] = include_bytes!("../fixtures/exact-order-readback.json");
     const ACCOUNT: &[u8] = include_bytes!("../fixtures/portfolio-account.json");
+
+    #[test]
+    fn mutation_rejection_keeps_only_numeric_code_and_never_hides_unknown() {
+        let error = classify_http_error(
+            400,
+            br#"{"code":-4164,"msg":"secret-must-not-escape"}"#,
+            true,
+        );
+        assert_eq!(error, BinanceTransportError::ApiRejected(-4164));
+        assert!(!format!("{error:?} {error}").contains("secret-must-not-escape"));
+        for status in [400, 408, 503] {
+            assert!(classify_http_error(status, br#"{"code":-1007}"#, true).is_unknown_dispatch());
+        }
+        assert!(classify_http_error(503, br#"{"code":-4164}"#, true).is_unknown_dispatch());
+        assert_eq!(
+            classify_http_error(400, br#"{"code":"API_SECRET"}"#, true),
+            BinanceTransportError::HttpStatus(400)
+        );
+    }
 
     enum Behavior {
         Body(&'static [u8]),
@@ -1228,6 +1251,47 @@ mod tests {
         };
         assert!(error.is_unknown_dispatch());
         assert_eq!(count.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_open_reaches_exchange_once_without_private_reads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use venue_domain::domain::{OrderSide, PositionSide, Price};
+        let credentials = BinanceCredentials::from_values("key", "secret")?;
+        let (config, rules, scope) = facts("00000000-0000-4000-8000-000000000001")?;
+        let (endpoint, count, counts) = fake_http_tracked(vec![Behavior::Status(
+            400,
+            br#"{"code":-4164,"msg":"fixture-private-text"}"#,
+        )])
+        .await?;
+        let transport = BinanceHttpTransport::with_endpoint(
+            config,
+            7,
+            17,
+            endpoint,
+            BinanceTransportLimits::new(Duration::from_secs(1), 4096)?,
+        )?;
+        let prepared = crate::prepare_terminal_open_limit(
+            &rules,
+            &scope,
+            &crate::BinancePlaceIntent {
+                client_order_id: "manual-fixture".into(),
+                side: OrderSide::Buy,
+                position_side: PositionSide::Long,
+                quantity: rules.instrument.quantity_step,
+                limit_price: Price::new(rust_decimal::Decimal::ONE)?,
+                time_in_force: crate::BinanceTimeInForce::PostOnly,
+                reduce_only: false,
+            },
+        )?;
+        let result = transport
+            .dispatch_once(&credentials, &scope, &prepared, unix_ms()?)
+            .await;
+        assert_eq!(result, Err(BinanceTransportError::ApiRejected(-4164)));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.posts.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.signed_gets.load(Ordering::SeqCst), 0);
         Ok(())
     }
 

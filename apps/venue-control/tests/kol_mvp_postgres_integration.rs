@@ -451,7 +451,7 @@ async fn runtime_reconciles_mocked_restart_timeout_and_rejection_without_reposti
         api_secret: SecretValue::new("b".repeat(32)),
     })?;
     let encrypted = cipher.encrypt(&format!("venue-api-v1:{user}:{credential}"), &payload)?;
-    sqlx::query("UPDATE venue_api_credentials SET encrypted_credentials=$1 WHERE credential_id=$2")
+    sqlx::query("UPDATE venue_api_credentials SET encrypted_credentials=$1,verification_json='{\"verification\":\"verified\"}'::jsonb WHERE credential_id=$2")
         .bind(encrypted)
         .bind(&credential)
         .execute(&fixture.pool)
@@ -461,7 +461,7 @@ async fn runtime_reconciles_mocked_restart_timeout_and_rejection_without_reposti
     // private projection owns its later fill/cancel lifecycle, so the next account command can run.
     exchange.set_readback(reconciled.clone(), ExecutionReadback::Accepted);
     exchange.set_readback(unknown.clone(), ExecutionReadback::Unknown);
-    exchange.set_readback(rejected.clone(), ExecutionReadback::Rejected);
+    exchange.set_rejection(rejected.clone(), -4164);
     exchange.set_readback(
         rejected_after_unknown_dispatch.clone(),
         ExecutionReadback::Rejected,
@@ -520,6 +520,13 @@ async fn runtime_reconciles_mocked_restart_timeout_and_rejection_without_reposti
     assert_eq!(terminal_schedule, (0, None));
     assert_eq!(runtime.recover_once().await?, 1);
     assert_eq!(command_state(&fixture.pool, &rejected).await?, "rejected");
+    let reason: Option<String> = sqlx::query_scalar(
+        "SELECT sanitized_error_code FROM venue_binance_commands WHERE command_id=$1",
+    )
+    .bind(&rejected)
+    .fetch_one(&fixture.pool)
+    .await?;
+    assert_eq!(reason.as_deref(), Some("binance_-4164"));
     insert_terminal_command(
         &fixture.pool,
         &rejected_after_unknown_dispatch,

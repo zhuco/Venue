@@ -31,9 +31,14 @@ use venue_gateway_binance::{GatewayBinding, GatewayMode, VenueId};
 #[path = "executor_exchange/grid_batch.rs"]
 mod grid_batch;
 use grid_batch::{elapsed_us, record_outbound_timing, validate_grid_batch_shape};
+mod catalogue;
+mod terminal_open;
+use catalogue::SharedCatalogue;
+pub(crate) use terminal_open::is_terminal_open;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionRequest {
+    pub origin: venue_control_protocol::kol::ExecutorCommandOrigin,
     pub command_id: String,
     pub client_order_id: String,
     pub credential_id: String,
@@ -93,6 +98,7 @@ pub enum ExecutionReadback {
 /// identity is retained while the state remains Unknown; it never upgrades to Accepted by itself.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionOutcome {
+    pub exchange_error_code: Option<i64>,
     pub state: ExecutionReadback,
     pub native_order_id: Option<String>,
 }
@@ -154,6 +160,8 @@ pub enum BinanceExecutionError {
     Unavailable,
     #[error("Binance execution request is invalid")]
     Invalid,
+    #[error("Manual opening quantity rounds down to zero")]
+    OpenQuantityZero,
 }
 
 impl BinanceExecutionError {
@@ -163,6 +171,7 @@ impl BinanceExecutionError {
     pub const fn not_dispatched_code(self) -> &'static str {
         match self {
             Self::Invalid => "not_dispatched_invalid",
+            Self::OpenQuantityZero => "not_dispatched_quantity_zero",
             Self::Unavailable => "not_dispatched_unavailable",
         }
     }
@@ -174,6 +183,7 @@ impl BinanceExecutionError {
 /// can exercise the exact same request/signature surface without a second client.
 pub struct BinanceHttpExecution {
     transport: BinanceHttpTransport,
+    catalogue: SharedCatalogue,
     fills_cursor: Option<RecentFillsCursor>,
     next_attempt_id: u64,
 }
@@ -186,6 +196,7 @@ pub struct BinanceExecutionRouter {
         Arc<Mutex<BTreeMap<(String, Symbol), Arc<tokio::sync::Mutex<BinanceHttpExecution>>>>>,
     limits: venue_gateway_binance::BinanceTransportLimits,
     hot_dispatch: crate::GridHotDispatchCache,
+    catalogue: SharedCatalogue,
 }
 
 impl BinanceExecutionRouter {
@@ -203,6 +214,7 @@ impl BinanceExecutionRouter {
             exchanges: Arc::new(Mutex::new(BTreeMap::new())),
             limits,
             hot_dispatch,
+            catalogue: SharedCatalogue::default(),
         }
     }
 
@@ -288,12 +300,9 @@ impl BinanceExecutionRouter {
             .map_err(|_| BinanceExecutionError::Invalid)?;
             let transport = BinanceHttpTransport::new(config, 1, 1, self.limits)
                 .map_err(|_| BinanceExecutionError::Unavailable)?;
-            exchanges.insert(
-                key.clone(),
-                Arc::new(tokio::sync::Mutex::new(BinanceHttpExecution::new(
-                    transport,
-                ))),
-            );
+            let mut execution = BinanceHttpExecution::new(transport);
+            execution.catalogue = self.catalogue.clone();
+            exchanges.insert(key.clone(), Arc::new(tokio::sync::Mutex::new(execution)));
         }
         exchanges
             .get_mut(&key)
@@ -342,6 +351,7 @@ impl BinanceHttpExecution {
     pub fn new(transport: BinanceHttpTransport) -> Self {
         Self {
             transport,
+            catalogue: SharedCatalogue::default(),
             fills_cursor: None,
             next_attempt_id: 1,
         }
@@ -558,6 +568,9 @@ impl BinanceHttpExecution {
         request: &ExecutionRequest,
         credentials: BinanceCredentials,
     ) -> Result<ExecutionOutcome, BinanceExecutionError> {
+        if terminal_open::is_terminal_open(request) {
+            return self.submit_terminal_open(request, &credentials).await;
+        }
         let (before, rules) = self.snapshot_with_rules(request, &credentials).await?;
         if let ExecutionOrderKind::CancelExact {
             native_order_id,
@@ -1317,6 +1330,7 @@ fn terminal_order_state(state: OrderState) -> bool {
 
 fn outcome(state: ExecutionReadback, native_order_id: Option<String>) -> ExecutionOutcome {
     ExecutionOutcome {
+        exchange_error_code: None,
         state,
         native_order_id,
     }
@@ -1335,13 +1349,20 @@ fn dispatch_failed(
     native_order_id: Option<String>,
 ) -> Result<ExecutionOutcome, BinanceExecutionError> {
     let result = match error {
+        BinanceTransportError::ApiRejected(code) => {
+            let mut rejected = outcome(ExecutionReadback::Rejected, native_order_id);
+            rejected.exchange_error_code = Some(code);
+            rejected
+        }
         // `AmbiguousStatus` already owns timeout/5xx cases where Binance may have accepted the
         // mutation. Any `HttpStatus` here is a complete explicit rejection response.
         BinanceTransportError::HttpStatus(_) => {
             outcome(ExecutionReadback::Rejected, native_order_id)
         }
         BinanceTransportError::TimestampRejected => {
-            outcome(ExecutionReadback::Rejected, native_order_id)
+            let mut rejected = outcome(ExecutionReadback::Rejected, native_order_id);
+            rejected.exchange_error_code = Some(-1021);
+            rejected
         }
         // These checks occur while binding or constructing the signed request, before reqwest's
         // physical send future is entered.
@@ -1478,6 +1499,12 @@ pub struct MockBinanceExecution {
 }
 
 impl MockBinanceExecution {
+    pub fn set_rejection(&mut self, client_order_id: String, code: i64) {
+        let mut result = outcome(ExecutionReadback::Rejected, None);
+        result.exchange_error_code = Some(code);
+        self.orders.insert(client_order_id, result);
+    }
+
     pub fn set_readback(&mut self, client_order_id: String, state: ExecutionReadback) {
         let native_order_id = matches!(
             state,
