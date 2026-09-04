@@ -283,12 +283,13 @@ async fn run_projection_supervisor(
                         Err(_) => false,
                     };
                     if !persisted { let _ = completion.send(Err(())); continue; }
-                    let (ready, settled) = tokio::sync::oneshot::channel();
-                    let warmed = tokio::time::timeout(PROJECTION_PERSISTENCE_TIMEOUT, async {
-                        grid_signal.send(GridPrivateStreamSignal::ProjectionReady { credential_id: source.credential_id, completion: ready }).await.map_err(|_| ())?;
-                        settled.await.map_err(|_| ())
-                    }).await;
-                    let _ = completion.send(if matches!(warmed, Ok(Ok(true))) { Ok(Some(true)) } else { Err(()) });
+                    // The durable snapshot is already locally checked against the desired surface
+                    // with no account command in flight. Sending it back through the Grid runner
+                    // every 500 ms used to cancel an unrelated cold turn while SQLx owned a
+                    // transaction, leaving PostgreSQL transaction notices and starving that turn.
+                    // Fill and invalidation signals remain immediate; ordinary convergence runs on
+                    // its own two-second schedule against this persisted signed projection.
+                    let _ = completion.send(Ok(Some(true)));
                 }
                 Some(ProjectionMessage::Snapshot {
                     worker_id,

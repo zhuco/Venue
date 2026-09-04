@@ -40,10 +40,6 @@ const MAX_CACHED_STREAM_FILLS: usize = 64;
 
 #[derive(Debug)]
 pub enum GridPrivateStreamSignal {
-    ProjectionReady {
-        credential_id: String,
-        completion: oneshot::Sender<bool>,
-    },
     Fill {
         source: ActiveProjectionSource,
         event: BinancePrivateFillEvent,
@@ -178,49 +174,6 @@ pub(super) async fn receive_private_signal(
 }
 
 impl BinanceGridRuntime {
-    /// Fold only the already acknowledged live surface. No market/equity HTTP or new orders
-    /// may run while the private receiver waits for its new baseline to be installed.
-    async fn settle_stream_projection(
-        &mut self,
-        credential_id: &str,
-    ) -> Result<(), BinanceGridRuntimeError> {
-        let records = self.store.list_runtime_instances().await?;
-        for record in records.iter().filter(|record| {
-            record.instance.credential_id == credential_id
-                && record.instance.state == GridInstanceState::Running
-        }) {
-            let projection = self
-                .projections
-                .load_owned(&record.owner_user_id, credential_id)
-                .await?
-                .ok_or(BinanceGridRuntimeError::PrivateProjection)?;
-            let owners = self
-                .store
-                .load_owned_orders(&record.instance.instance_id)
-                .await?;
-            let actual = self
-                .synchronize_actual_surface(record, &projection, owners, now_ms()?)
-                .await?;
-            let Some(desired) = self
-                .store
-                .load_desired_orders(&record.instance.instance_id)
-                .await?
-            else {
-                continue;
-            };
-            if surface_is_exact(&desired, &actual)? && record.instance.dirty {
-                self.finish_reconcile(
-                    record,
-                    &projection,
-                    &desired,
-                    super::ReconcileResult::Converged,
-                    now_ms()?,
-                )
-                .await?;
-            }
-        }
-        Ok(())
-    }
     pub(super) async fn handle_private_signal(
         &mut self,
         signal: GridPrivateStreamSignal,
@@ -228,18 +181,6 @@ impl BinanceGridRuntime {
         deferred: &mut VecDeque<GridPrivateStreamSignal>,
     ) {
         let (source, mut events) = match signal {
-            GridPrivateStreamSignal::ProjectionReady {
-                credential_id,
-                completion,
-            } => {
-                self.hot_path.invalidate_credential(&credential_id);
-                let healthy = self.settle_stream_projection(&credential_id).await.is_ok();
-                if let Ok(records) = self.store.list_runtime_instances().await {
-                    self.hot_path.replace_records(&records);
-                }
-                let _ = completion.send(healthy);
-                return;
-            }
             GridPrivateStreamSignal::Fill { source, event } => (source, vec![event]),
             GridPrivateStreamSignal::FillBatch {
                 source,
