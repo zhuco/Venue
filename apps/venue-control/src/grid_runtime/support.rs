@@ -486,6 +486,7 @@ pub(super) fn blocked_code(reason: GridBlockedReason) -> &'static str {
         GridBlockedReason::MissingRiskFacts => "risk_missing",
         GridBlockedReason::InvalidRiskFacts => "risk_invalid",
         GridBlockedReason::ReductionBelowMinimum => "reduction_below_minimum",
+        GridBlockedReason::MakerPriceWouldCrossBook => "maker_price_wait",
     }
 }
 

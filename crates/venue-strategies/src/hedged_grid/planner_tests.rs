@@ -274,6 +274,135 @@ fn one_complete_maker_fill_places_two_and_cancels_one_without_waiting_for_a_pair
 }
 
 #[test]
+fn resting_crossed_orders_preserve_surface_until_signed_fills_arrive()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (bid, ask) in [(98, 99), (101, 102)] {
+        let mut value = initialized_input()?;
+        let original = value.owned_orders.clone();
+        let anchor = value.rolling_anchor.clone();
+        value.book.bid = Price::new(Decimal::from(bid))?;
+        value.book.ask = Price::new(Decimal::from(ask))?;
+        let (after_anchor, desired) = converge(GridPlanner::plan(&value)?)?;
+        assert_eq!(diff_counts(&original, &desired), (0, 0));
+        assert_eq!(Some(after_anchor), anchor);
+    }
+    Ok(())
+}
+
+#[test]
+fn first_fill_rolls_while_crossed_counterpart_is_still_in_signed_snapshot()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut value = initialized_input()?;
+    let source = take_order(
+        &value.owned_orders,
+        GridPosition::Long,
+        GridOrderRole::Open,
+        1,
+    )?;
+    value.book.bid = Price::new(source.price.value() - Decimal::new(1, 1))?;
+    value.book.ask = source.price;
+    value.owned_orders.retain(|order| order.key != source.key);
+    value.maker_fills.push(GridMakerFill {
+        fill_id: "first-of-pair".to_owned(),
+        source_order: source,
+        complete: true,
+        maker: true,
+    });
+    let (_, desired) = converge(GridPlanner::plan(&value)?)?;
+    assert_eq!(diff_counts(&value.owned_orders, &desired), (2, 1));
+    assert_unique_diff(&value.owned_orders, &desired)?;
+    Ok(())
+}
+
+#[test]
+fn crossing_new_maker_target_waits_without_consuming_fill_or_resetting_anchor()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut value = initialized_input()?;
+    let source = take_order(
+        &value.owned_orders,
+        GridPosition::Long,
+        GridOrderRole::Open,
+        1,
+    )?;
+    value.owned_orders.retain(|order| order.key != source.key);
+    value.maker_fills.push(GridMakerFill {
+        fill_id: "maker-wait".to_owned(),
+        source_order: source,
+        complete: true,
+        maker: true,
+    });
+    let normal_book = value.book.clone();
+    value.book.bid = Price::new(Decimal::from(104))?;
+    value.book.ask = Price::new(Decimal::from(105))?;
+    for _ in 0..5 {
+        assert_eq!(
+            GridPlanner::plan(&value)?.directive,
+            GridPlanDirective::Blocked {
+                reason: GridBlockedReason::MakerPriceWouldCrossBook,
+            }
+        );
+    }
+    value.book = normal_book;
+    let (_, desired) = converge(GridPlanner::plan(&value)?)?;
+    assert_eq!(diff_counts(&value.owned_orders, &desired), (2, 1));
+    Ok(())
+}
+
+#[test]
+fn crossed_pair_in_separate_batches_keeps_epoch_and_two_place_one_cancel_per_fill()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut value = initialized_input()?;
+    let first = take_order(
+        &value.owned_orders,
+        GridPosition::Long,
+        GridOrderRole::Open,
+        1,
+    )?;
+    let second = take_order(
+        &value.owned_orders,
+        GridPosition::Short,
+        GridOrderRole::Close,
+        1,
+    )?;
+    value.book.bid = Price::new(first.price.value() - Decimal::new(1, 1))?;
+    value.book.ask = first.price;
+    value.owned_orders.retain(|order| order.key != first.key);
+    value.maker_fills = vec![GridMakerFill {
+        fill_id: "pair-first".to_owned(),
+        source_order: first,
+        complete: true,
+        maker: true,
+    }];
+    let (anchor, desired) = converge(GridPlanner::plan(&value)?)?;
+    assert_eq!(diff_counts(&value.owned_orders, &desired), (2, 1));
+    value.pending_place_keys = desired
+        .iter()
+        .filter(|order| !value.owned_orders.iter().any(|old| old.key == order.key))
+        .map(|order| order.key.clone())
+        .collect();
+    value.owned_orders = desired
+        .into_iter()
+        .filter(|order| order.key != second.key)
+        .collect();
+    value.rolling_anchor = Some(anchor);
+    value.maker_fills = vec![GridMakerFill {
+        fill_id: "pair-second".to_owned(),
+        source_order: second,
+        complete: true,
+        maker: true,
+    }];
+    let (_, desired) = converge(GridPlanner::plan(&value)?)?;
+    assert_eq!(diff_counts(&value.owned_orders, &desired), (2, 1));
+    assert!(
+        desired
+            .iter()
+            .all(|order| order.key.epoch == value.config.revision)
+    );
+    assert_eq!(desired.len(), 12);
+    Ok(())
+}
+
+#[test]
 fn consecutive_complete_fills_keep_unconfirmed_places_non_cancellable()
 -> Result<(), Box<dyn std::error::Error>> {
     let initialized = initialized_input()?;

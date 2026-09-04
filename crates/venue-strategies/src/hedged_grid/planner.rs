@@ -260,6 +260,7 @@ pub enum GridBlockedReason {
     MissingRiskFacts,
     InvalidRiskFacts,
     ReductionBelowMinimum,
+    MakerPriceWouldCrossBook,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -344,6 +345,12 @@ impl GridPlanner {
         } else {
             match rolled_surface(input, surface) {
                 Ok(surface) => surface,
+                Err(GridResetTrigger::PriceWouldCrossBook) => {
+                    return Ok(blocked_plan(
+                        input,
+                        GridBlockedReason::MakerPriceWouldCrossBook,
+                    ));
+                }
                 Err(trigger) => return Ok(reset_plan(input, trigger)),
             }
         };
@@ -563,9 +570,8 @@ fn validated_surface(
                 GridResetTrigger::InvalidOwnedOrder
             });
         }
-        if crosses_book(order, &input.book) {
-            return Err(GridResetTrigger::PriceWouldCrossBook);
-        }
+        // A signed resting order and the newest BBO are not an atomic snapshot. Crossing
+        // may mean its fill is in flight; only authenticated order/fill facts retire it.
         if !lane_prices.insert((order.key.position, order.key.role, order.price))
             || surface.insert(order.key.clone(), order.clone()).is_some()
         {
@@ -751,24 +757,13 @@ fn rolled_surface(
                 price,
                 anchor.grid_quantity,
             )?;
-            if crosses_book(&order, &input.book)
-                || surface.values().any(|existing| {
-                    existing.key.position == position
-                        && existing.key.role == role
-                        && existing.price == order.price
-                })
-                || surface.insert(order.key.clone(), order.clone()).is_some()
+            if surface.values().any(|existing| {
+                existing.key.position == position
+                    && existing.key.role == role
+                    && existing.price == order.price
+            }) || surface.insert(order.key.clone(), order.clone()).is_some()
             {
-                return Err(
-                    if surface
-                        .values()
-                        .any(|existing| crosses_book(existing, &input.book))
-                    {
-                        GridResetTrigger::PriceWouldCrossBook
-                    } else {
-                        GridResetTrigger::RollingConflict
-                    },
-                );
+                return Err(GridResetTrigger::RollingConflict);
             }
             rolled_keys.insert(order.key);
         }
@@ -781,6 +776,17 @@ fn rolled_surface(
     }
     let desired = clip_close_orders(input, surface.into_values().collect())
         .map_err(|_| GridResetTrigger::RollingConflict)?;
+    // Check only the final new placements, not signed resting orders or intermediate orders
+    // removed by a later fill in this batch. A crossing Maker target waits, never resets.
+    if desired.iter().any(|order| {
+        !input
+            .owned_orders
+            .iter()
+            .any(|owned| owned.key == order.key)
+            && crosses_book(order, &input.book)
+    }) {
+        return Err(GridResetTrigger::PriceWouldCrossBook);
+    }
     if validate_generated_orders(input, &desired).is_err() {
         return Err(GridResetTrigger::InvalidOwnedOrder);
     }

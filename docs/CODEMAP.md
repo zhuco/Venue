@@ -127,6 +127,8 @@ Node 投影摘要辅助位于 `apps/venue-node/src/control_loop/projection_diges
 
 ## 测试定位
 
+Grid 穿价边界：`hedged_grid/planner.rs` 不用最新 BBO 推断已有签名挂单已失效；仅最终新增 Maker 目标穿价时返回 `MakerPriceWouldCrossBook`，运行时显示 `maker_price_wait` 并保留锚点与未分配成交，等待后续事实重试，不进入整网重置。`planner_tests.rs` 覆盖旧挂单与 BBO 错位、配对成交分批到达、穿价等待后继续补撤。
+
 账户成交观察时间回归：`apps/venue-control/tests/support/projection_fill_observation.rs` 由 `kol_mvp_postgres_integration` 组合；覆盖 REST 拉取期间成交、签名重读修复与重复私流的稳定身份。`private_projection.rs` 保留订单/持仓的快照起始时间，成交使用接收后的持久化时间；历史倒置时间通过 `account_gateway_projection.rs::replay_projection_fills_from` 定向签名补查。`grid_runtime/fills.rs` 在任何成交尚未被后续签名基线覆盖时推迟整轮冷规划，不允许过滤后形成假缺单；不完整订单面或成交单仍在快照中的情况只等待私有事实收敛，不触发撤单重置。对应边界测试位于 `grid_runtime/support.rs`。
 
 默认按影响面分层验证，不在每次局部修改后重复全工作区回归。UI 局部改动验证客户端及相应交互；单模块修改验证该模块及直接契约；KOL 新链交易安全修改覆盖命令幂等、账户串行、`ReconcileRequired`、数量/权限和 Binance adapter；冻结旧链维护才覆盖风险、WAL、Unknown 与恢复路径。
