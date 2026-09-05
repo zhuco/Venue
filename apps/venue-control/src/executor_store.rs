@@ -182,7 +182,7 @@ impl PgExecutorStore {
         &self,
         _now_ms: u64,
     ) -> Result<Vec<ActiveKolPrivateSource>, BinanceCommandLedgerError> {
-        let rows = sqlx::query("SELECT p.kol_user_id,p.leader_trading_account_id,ARRAY_AGG(DISTINCT symbols.value ORDER BY symbols.value) AS symbols,b.credential_id,(SELECT count(*) FROM venue_api_credentials c WHERE c.user_id=p.kol_user_id AND c.trading_account_id=p.leader_trading_account_id AND c.credential_id=b.credential_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified') AS credential_count FROM venue_kol_profiles p JOIN venue_leader_bots b ON b.owner_user_id=p.kol_user_id AND b.bot_state='running' JOIN venue_kol_follow_relations r ON r.kol_user_id=p.kol_user_id AND r.leader_trading_account_id=p.leader_trading_account_id AND r.relation_state='active' CROSS JOIN LATERAL jsonb_array_elements_text(r.allowed_symbols) AS symbols(value) WHERE p.profile_state='enabled' GROUP BY p.kol_user_id,p.leader_trading_account_id,b.credential_id ORDER BY p.kol_user_id")
+        let rows = sqlx::query("SELECT p.kol_user_id,p.leader_trading_account_id,CASE WHEN bool_or(jsonb_array_length(r.allowed_symbols)=0) THEN ARRAY[]::text[] ELSE COALESCE(ARRAY_AGG(DISTINCT symbols.value ORDER BY symbols.value) FILTER (WHERE symbols.value IS NOT NULL),ARRAY[]::text[]) END AS symbols,b.credential_id,(SELECT count(*) FROM venue_api_credentials c WHERE c.user_id=p.kol_user_id AND c.trading_account_id=p.leader_trading_account_id AND c.credential_id=b.credential_id AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified') AS credential_count FROM venue_kol_profiles p JOIN venue_leader_bots b ON b.owner_user_id=p.kol_user_id AND b.bot_state='running' JOIN venue_kol_follow_relations r ON r.kol_user_id=p.kol_user_id AND r.leader_trading_account_id=p.leader_trading_account_id AND r.relation_state='active' LEFT JOIN LATERAL jsonb_array_elements_text(r.allowed_symbols) AS symbols(value) ON true WHERE p.profile_state='enabled' GROUP BY p.kol_user_id,p.leader_trading_account_id,b.credential_id ORDER BY p.kol_user_id")
             .fetch_all(&self.pool)
             .await
             .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
@@ -205,9 +205,6 @@ impl PgExecutorStore {
                 .map(|value| value.parse())
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| BinanceCommandLedgerError::Conflict)?;
-            if symbols.is_empty() {
-                return Err(BinanceCommandLedgerError::Conflict);
-            }
             sources.push(ActiveKolPrivateSource {
                 kol_user_id: row
                     .try_get("kol_user_id")
@@ -487,9 +484,6 @@ impl PgExecutorStore {
                         .map_err(|_| BinanceCommandLedgerError::Conflict)
                 })
                 .collect::<Result<BTreeSet<_>, _>>()?;
-            if symbols.is_empty() {
-                return Err(BinanceCommandLedgerError::Conflict);
-            }
             pending.push(PendingActivation {
                 relation_id: row
                     .try_get("relation_id")

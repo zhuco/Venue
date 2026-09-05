@@ -60,7 +60,7 @@ export function ManagedFollowSettingsPanel({ managedId, label, csrf, canManage }
             <label>单笔名义上限（报价币）<input name="orderLimit" inputMode="decimal" defaultValue={current?.max_order_notional ?? ""} required /></label>
             <label>总名义上限（报价币）<input name="totalLimit" inputMode="decimal" defaultValue={current?.max_total_notional ?? ""} required /></label>
             <label>价格偏离限制（基点）<input name="deviation" type="number" min="0" max="5000" defaultValue={current?.max_deviation_bps ?? ""} required /></label>
-            <label>允许交易对<input name="symbols" defaultValue={current?.allowed_symbols.join(", ") ?? ""} placeholder="DASH/USDT" required /></label>
+            <label>允许交易对（留空允许全部）<input name="symbols" defaultValue={current?.allowed_symbols.join(", ") ?? ""} placeholder="留空允许全部" /></label>
           </div><button type="submit">保存设置</button>
         </fieldset>
       </form>}

@@ -193,6 +193,17 @@ fn one_catalogue_binds_two_canonical_symbols_without_cross_route()
 }
 
 #[test]
+fn empty_symbol_set_loads_all_supported_linear_perpetuals() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_, _, binding) = limit_fixture()?;
+    let catalogue = parse_rules_catalog(MIXED_EXCHANGE_INFO, &binding, &BTreeSet::new(), 18)?;
+    assert_eq!(catalogue.len(), 2);
+    assert!(catalogue.contains_key(&"BTC/USDT".parse()?));
+    assert!(catalogue.contains_key(&"SOL/USDC".parse()?));
+    Ok(())
+}
+
+#[test]
 fn limit_normalization_rejects_stale_future_wrong_symbol_empty_and_crossed_book()
 -> Result<(), Box<dyn std::error::Error>> {
     let (intent, rules, binding) = limit_fixture()?;

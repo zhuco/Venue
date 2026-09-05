@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{collections::BTreeMap, str::FromStr};
 
 use rust_decimal::Decimal;
 use serde_json::{Map, Value};
@@ -63,6 +63,45 @@ pub fn parse_native_instrument_rules(
     }
     let entry = select_entry(payload, expected_native)?;
     parse_entry(&entry, None, generation)
+}
+
+/// Parses every currently trading USDT/USDC linear perpetual from one exchange-info snapshot.
+/// An empty follow allowlist uses this finite signed-at-connect catalogue as its wildcard scope.
+pub fn parse_instrument_catalog(
+    payload: &str,
+    generation: u64,
+) -> Result<BTreeMap<Symbol, BinanceInstrumentRules>, BinanceInstrumentError> {
+    let root: Value = serde_json::from_str(payload).map_err(|_| BinanceInstrumentError::Payload)?;
+    let entries = root
+        .get("symbols")
+        .and_then(Value::as_array)
+        .ok_or(BinanceInstrumentError::Payload)?;
+    let mut catalog = BTreeMap::new();
+    for entry in entries {
+        let Some(entry) = entry.as_object() else {
+            return Err(BinanceInstrumentError::Payload);
+        };
+        if entry.get("status").and_then(Value::as_str) != Some("TRADING")
+            || entry.get("contractType").and_then(Value::as_str) != Some("PERPETUAL")
+            || !matches!(
+                entry.get("quoteAsset").and_then(Value::as_str),
+                Some("USDT" | "USDC")
+            )
+        {
+            continue;
+        }
+        let rules = parse_entry(entry, None, generation)?;
+        if catalog
+            .insert(rules.instrument.symbol.clone(), rules)
+            .is_some()
+        {
+            return Err(BinanceInstrumentError::Instrument);
+        }
+    }
+    if catalog.is_empty() {
+        return Err(BinanceInstrumentError::Instrument);
+    }
+    Ok(catalog)
 }
 
 fn select_entry(

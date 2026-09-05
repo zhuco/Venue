@@ -75,7 +75,7 @@ pub(super) async fn record_source_fill_and_plan(
          FROM venue_kol_follow_relations r JOIN venue_kol_profiles p ON p.kol_user_id=r.kol_user_id \
          LEFT JOIN venue_kol_copy_targets t ON t.relation_id=r.relation_id AND t.symbol=$3 AND t.position_side=$4 \
          WHERE r.kol_user_id=$1 AND r.leader_trading_account_id=$2 AND r.relation_state='active' \
-           AND p.profile_state='enabled' AND r.baseline_json->>'target_model'='1' AND r.allowed_symbols @> jsonb_build_array($3::text) \
+           AND p.profile_state='enabled' AND r.baseline_json->>'target_model'='1' AND (r.allowed_symbols='[]'::jsonb OR r.allowed_symbols @> jsonb_build_array($3::text)) \
          ORDER BY r.relation_id FOR UPDATE OF r",
     )
     .bind(kol_user_id).bind(&fill.leader_trading_account_id).bind(&fill.symbol)

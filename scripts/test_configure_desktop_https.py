@@ -42,6 +42,10 @@ class DesktopHttpsTests(unittest.TestCase):
         self.assertNotIn("/v2/ui/events", POST_PATHS)
         self.assertIn("/v2/kol/terminal/positions/action", POST_PATHS)
         self.assertNotIn("/v2/kol/terminal/positions/action", GET_PATHS)
+        self.assertIn("/v2/kol/leader-bots", GET_PATHS)
+        self.assertIn("/v2/kol/leader-bots", POST_PATHS)
+        self.assertIn("/v2/kol/leader-bots/update", POST_PATHS)
+        self.assertIn("/v2/kol/leader-bots/lifecycle", POST_PATHS)
 
     def test_market_relay_is_get_only_exact_and_strips_private_headers(self):
         routes = configured_route(self.original)["handle"][0]["routes"]

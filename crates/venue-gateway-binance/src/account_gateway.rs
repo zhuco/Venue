@@ -66,9 +66,9 @@ use crate::{
     build_algo_orders_request, build_exact_order_for_native_symbol_request,
     build_exact_order_request, build_fills_for_native_symbol_request, build_fills_request,
     build_position_mode_request, build_positions_request, build_regular_orders_request,
-    complete_private_readback, connect_private_ws, connect_public_ws, parse_instrument_rules,
-    parse_native_instrument_rules, parse_public_market_agg_trade, parse_public_market_bbo,
-    parse_public_market_depth_delta, parse_public_market_kline,
+    complete_private_readback, connect_private_ws, connect_public_ws, parse_instrument_catalog,
+    parse_instrument_rules, parse_native_instrument_rules, parse_public_market_agg_trade,
+    parse_public_market_bbo, parse_public_market_depth_delta, parse_public_market_kline,
     parse_public_market_rest_depth_snapshot, prepare_execution_command, settle_mutation_ack,
 };
 
@@ -81,6 +81,10 @@ pub struct BinanceAccountGateway {
     transport: BinanceHttpTransport,
     rules: BinanceInstrumentRules,
     rules_by_symbol: BTreeMap<Symbol, BinanceInstrumentRules>,
+    /// Symbols whose trade cursors must survive signed projection refreshes. An unrestricted
+    /// gateway knows the full rule catalogue, but expands this durable read scope only from
+    /// account-owned facts instead of polling userTrades for every listed contract.
+    projection_symbols: BTreeSet<Symbol>,
     private: BinancePrivateReadbackCandidate,
     /// Stable for this gateway process. A reconnect starts a new Account gateway instead of
     /// treating a REST collection or a websocket frame as a new connection.
@@ -172,6 +176,11 @@ impl BinanceAccountGateway {
         runtime
             .block_on(transport.synchronize_clock())
             .map_err(BinanceAccountGatewayError::Transport)?;
+        let projection_symbols = if symbols.is_empty() {
+            BTreeSet::from([binding.symbol.clone()])
+        } else {
+            symbols.clone()
+        };
         let rules_by_symbol = runtime.block_on(fetch_rules_catalog(
             &transport,
             &binding,
@@ -197,6 +206,7 @@ impl BinanceAccountGateway {
             transport,
             rules,
             rules_by_symbol,
+            projection_symbols,
             private,
             connection_generation,
             private_generation,
@@ -425,6 +435,9 @@ impl BinanceAccountGateway {
                     self.private_generation,
                 ) {
                     Ok(event) => {
+                        if let Some(BinancePrivateAccountEvent::Fill(fill)) = event.as_ref() {
+                            self.projection_symbols.insert(fill.fill.symbol.clone());
+                        }
                         self.private_stream_reconnect.record_valid_frame();
                         Ok(event.map(|event| (received_at, event)))
                     }
@@ -688,7 +701,7 @@ impl AccountPhysicalGateway for BinanceAccountGateway {
             return Err(BinanceAccountGatewayError::Binding);
         }
         if request.configured_symbols().iter().collect::<BTreeSet<_>>()
-            != self.rules_by_symbol.keys().collect()
+            != self.projection_symbols.iter().collect()
         {
             return Err(BinanceAccountGatewayError::Binding);
         }
@@ -774,7 +787,7 @@ impl AccountPhysicalGateway for BinanceAccountGateway {
             return Err(AccountHostValidationError::SignedSnapshot);
         }
         if request.configured_symbols().iter().collect::<BTreeSet<_>>()
-            != self.rules_by_symbol.keys().collect()
+            != self.projection_symbols.iter().collect()
         {
             return Err(AccountHostValidationError::SignedSnapshot);
         }
@@ -807,6 +820,15 @@ impl AccountPhysicalGateway for BinanceAccountGateway {
             },
             std::thread::sleep,
         )?;
+        for symbol in snapshot
+            .open_orders()
+            .iter()
+            .map(|order| &order.symbol)
+            .chain(snapshot.positions().iter().map(|position| &position.symbol))
+            .chain(snapshot.fills().iter().map(|fill| &fill.symbol))
+        {
+            self.projection_symbols.insert(symbol.clone());
+        }
         self.transport = transport;
         self.private_generation = next_private_generation;
         Ok(snapshot)
@@ -898,7 +920,7 @@ async fn fetch_rules_catalog(
     symbols: &BTreeSet<Symbol>,
     generation: u64,
 ) -> Result<BTreeMap<Symbol, BinanceInstrumentRules>, BinanceAccountGatewayError> {
-    if symbols.is_empty() || !symbols.contains(&binding.symbol) {
+    if !symbols.is_empty() && !symbols.contains(&binding.symbol) {
         return Err(BinanceAccountGatewayError::Binding);
     }
     let response = transport
@@ -916,8 +938,16 @@ fn parse_rules_catalog(
     symbols: &BTreeSet<Symbol>,
     generation: u64,
 ) -> Result<BTreeMap<Symbol, BinanceInstrumentRules>, BinanceAccountGatewayError> {
-    if symbols.is_empty() || !symbols.contains(&binding.symbol) {
+    if !symbols.is_empty() && !symbols.contains(&binding.symbol) {
         return Err(BinanceAccountGatewayError::Binding);
+    }
+    if symbols.is_empty() {
+        let catalog = parse_instrument_catalog(payload, generation)
+            .map_err(|_| BinanceAccountGatewayError::Instrument)?;
+        return catalog
+            .contains_key(&binding.symbol)
+            .then_some(catalog)
+            .ok_or(BinanceAccountGatewayError::Binding);
     }
     symbols
         .iter()

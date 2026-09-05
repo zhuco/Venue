@@ -802,7 +802,7 @@ async fn runtime_only_activates_after_two_clean_mocked_signed_baselines()
     kol_activation::authorize_leader(&fixture.pool, &kol, &leader, &kol_credential).await?;
     sqlx::query("INSERT INTO venue_user_kol_bindings (user_id,kol_user_id,invite_id,bound_ms) VALUES ($1,$2,$3,1)")
         .bind(&follower).bind(&kol).bind(&invite).execute(&fixture.pool).await?;
-    sqlx::query("INSERT INTO venue_kol_follow_relations (relation_id,follower_user_id,kol_user_id,leader_trading_account_id,follower_trading_account_id,credential_id,relation_state,allocated_capital,multiplier,max_order_notional,max_total_notional,max_deviation_bps,allowed_symbols,revision,created_ms,updated_ms) VALUES ($1,$2,$3,$4,$5,$6,'paused','100','1','20','100',100,'[\"BTC/USDT\"]'::jsonb,1,1,1)")
+    sqlx::query("INSERT INTO venue_kol_follow_relations (relation_id,follower_user_id,kol_user_id,leader_trading_account_id,follower_trading_account_id,credential_id,relation_state,allocated_capital,multiplier,max_order_notional,max_total_notional,max_deviation_bps,allowed_symbols,revision,created_ms,updated_ms) VALUES ($1,$2,$3,$4,$5,$6,'paused','100','1','20','100',100,'[]'::jsonb,1,1,1)")
         .bind(&relation).bind(&follower).bind(&kol).bind(&leader).bind(&follower_account).bind(&follower_credential).execute(&fixture.pool).await?;
     sqlx::query("INSERT INTO venue_kol_activation_requests (relation_id,request_id,relation_revision,request_state,requested_ms,updated_ms) VALUES ($1,$2,1,'pending',1,1)")
         .bind(&relation).bind(id(970)).execute(&fixture.pool).await?;
@@ -841,6 +841,7 @@ async fn runtime_only_activates_after_two_clean_mocked_signed_baselines()
     let sources = store.active_kol_private_sources(9_999_999).await?;
     assert_eq!(sources.len(), 1);
     assert_eq!(sources[0].credential_id, kol_credential);
+    assert!(sources[0].symbols.is_empty());
     let projection_sources = BinancePrivateProjectionStore::new(fixture.pool.clone())
         .active_sources(9_999_999)
         .await?;
@@ -850,6 +851,7 @@ async fn runtime_only_activates_after_two_clean_mocked_signed_baselines()
         .ok_or("enabled KOL source was not admitted to signed projection recovery")?;
     assert_eq!(leader_source.kol_user_id.as_deref(), Some(kol.as_str()));
     assert_eq!(leader_source.trading_account_id, leader);
+    assert!(leader_source.symbols.is_empty());
     fixture.cleanup().await?;
     Ok(())
 }

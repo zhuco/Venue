@@ -795,7 +795,11 @@ fn spawn_projection_worker(
     tokio::task::spawn_blocking(move || {
         let credential_id = source.credential_id.clone();
         let result = (|| {
-            let primary_symbol = source.symbols.first().cloned()?;
+            let primary_symbol = source
+                .symbols
+                .first()
+                .cloned()
+                .or_else(|| "BTC/USDT".parse().ok())?;
             let binding = GatewayBinding::new(
                 VenueId::Binance,
                 GatewayMode::Live,

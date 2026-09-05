@@ -182,7 +182,9 @@ pub(super) async fn plan_relation(pool: &PgPool, relation: &str, now: u64) -> Re
         .into_iter()
         .flat_map(|p| p.open_orders.iter())
         .filter(|order| {
-            active && allowed.contains(&order.symbol.to_string()) && eligible(order, cutoff)
+            active
+                && (allowed.is_empty() || allowed.contains(&order.symbol.to_string()))
+                && eligible(order, cutoff)
         })
         .filter_map(|order| {
             order

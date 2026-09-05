@@ -184,14 +184,17 @@ impl BinancePrivateProjectionStore {
         let kol_rows = sqlx::query(
             "WITH active_kol AS (\
                SELECT p.kol_user_id,p.leader_trading_account_id,b.credential_id,\
-                 jsonb_agg(DISTINCT symbols.value ORDER BY symbols.value) AS symbols \
+                 CASE WHEN bool_or(jsonb_array_length(r.allowed_symbols)=0) \
+                   THEN '[]'::jsonb \
+                   ELSE COALESCE(jsonb_agg(DISTINCT symbols.value ORDER BY symbols.value) \
+                     FILTER (WHERE symbols.value IS NOT NULL),'[]'::jsonb) END AS symbols \
                FROM venue_kol_profiles p \
                JOIN venue_leader_bots b ON b.owner_user_id=p.kol_user_id \
                  AND b.bot_state='running' \
                JOIN venue_kol_follow_relations r ON r.kol_user_id=p.kol_user_id \
                  AND r.leader_trading_account_id=p.leader_trading_account_id \
                  AND r.relation_state='active' \
-               CROSS JOIN LATERAL jsonb_array_elements_text(r.allowed_symbols) AS symbols(value) \
+               LEFT JOIN LATERAL jsonb_array_elements_text(r.allowed_symbols) AS symbols(value) ON true \
                WHERE p.profile_state='enabled' \
                GROUP BY p.kol_user_id,p.leader_trading_account_id,b.credential_id\
              ) \
@@ -276,7 +279,9 @@ impl BinancePrivateProjectionStore {
                 let time: i64 = row
                     .try_get("replay_from")
                     .map_err(|_| PrivateProjectionError::Unavailable)?;
-                source.symbols.insert(symbol.clone());
+                if !source.symbols.is_empty() {
+                    source.symbols.insert(symbol.clone());
+                }
                 from.insert(
                     symbol,
                     u64::try_from(time).map_err(|_| PrivateProjectionError::Invalid)?,
@@ -612,9 +617,6 @@ fn projection_source(
         .map_err(|_| PrivateProjectionError::Unavailable)?
         .into_iter()
         .collect::<BTreeSet<_>>();
-    if symbols.is_empty() {
-        return Err(PrivateProjectionError::Unavailable);
-    }
     let projection: Option<serde_json::Value> = row
         .try_get("projection_json")
         .map_err(|_| PrivateProjectionError::Unavailable)?;
@@ -655,7 +657,11 @@ fn merge_projection_source(
             {
                 return Err(PrivateProjectionError::Unavailable);
             }
-            current.symbols.extend(source.symbols);
+            if current.symbols.is_empty() || source.symbols.is_empty() {
+                current.symbols.clear();
+            } else {
+                current.symbols.extend(source.symbols);
+            }
             if current.kol_user_id.is_none() {
                 current.kol_user_id = source.kol_user_id;
             }
@@ -814,7 +820,7 @@ fn prepare_stream_fill_batch(
             || event.private_generation < event.stream_private_generation
             || (event.stream_private_generation, event.private_generation) != generation
             || event.received_at_ms == 0
-            || !source.symbols.contains(&event.fill.symbol)
+            || (!source.symbols.is_empty() && !source.symbols.contains(&event.fill.symbol))
             || event
                 .fill
                 .exchange_time_ms
@@ -1061,6 +1067,31 @@ mod tests {
     fn one_stream_fill_reuses_the_batch_contract() -> Result<(), Box<dyn std::error::Error>> {
         let event = stream_fill("trade-1", Decimal::new(1, 3), OrderState::PartiallyFilled)?;
         assert_eq!(prepare_stream_fill_batch(&source()?, &[event])?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_symbol_scope_accepts_any_catalogued_stream_symbol()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut unrestricted = source()?;
+        unrestricted.symbols.clear();
+        let mut event = stream_fill("trade-1", Decimal::new(1, 3), OrderState::PartiallyFilled)?;
+        event.fill.symbol = "DASH/USDT".parse()?;
+        assert_eq!(prepare_stream_fill_batch(&unrestricted, &[event])?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn unrestricted_projection_scope_dominates_merged_symbol_lists()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut by_credential = BTreeMap::new();
+        let mut priority = Vec::new();
+        merge_projection_source(&mut by_credential, &mut priority, source()?)?;
+        let mut unrestricted = source()?;
+        unrestricted.symbols.clear();
+        merge_projection_source(&mut by_credential, &mut priority, unrestricted)?;
+        assert!(by_credential["credential"].symbols.is_empty());
+        assert_eq!(priority, ["credential"]);
         Ok(())
     }
 

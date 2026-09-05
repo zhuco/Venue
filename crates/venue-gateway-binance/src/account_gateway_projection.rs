@@ -57,7 +57,7 @@ impl BinanceAccountGateway {
     ) -> Result<BinanceProjectionRead, BinanceAccountGatewayError> {
         let symbols = AccountSymbolSet::new(
             self.config.gateway_binding(),
-            self.rules_by_symbol.keys().cloned(),
+            self.projection_symbols.iter().cloned(),
         )
         .map_err(|_| BinanceAccountGatewayError::Binding)?;
         let request = AccountRecoveryRequest::read_only(
@@ -95,6 +95,22 @@ impl BinanceAccountGateway {
             || completed.read.config.gateway_binding() != self.config.gateway_binding()
         {
             return Err(BinanceAccountGatewayError::Binding);
+        }
+        for symbol in completed
+            .snapshot
+            .open_orders()
+            .iter()
+            .map(|order| &order.symbol)
+            .chain(
+                completed
+                    .snapshot
+                    .positions()
+                    .iter()
+                    .map(|position| &position.symbol),
+            )
+            .chain(completed.snapshot.fills().iter().map(|fill| &fill.symbol))
+        {
+            self.projection_symbols.insert(symbol.clone());
         }
         self.transport = completed.read.transport;
         self.private_generation = completed.read.generation;
@@ -137,7 +153,7 @@ impl BinanceAccountGateway {
     ) -> Result<SignedAccountSnapshot, BinanceAccountGatewayError> {
         let configured_symbols = AccountSymbolSet::new(
             self.config.gateway_binding(),
-            self.rules_by_symbol.keys().cloned(),
+            self.projection_symbols.iter().cloned(),
         )
         .map_err(|_| BinanceAccountGatewayError::Binding)?;
         let request = AccountRecoveryRequest::read_only(

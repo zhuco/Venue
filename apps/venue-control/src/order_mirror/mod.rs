@@ -6,4 +6,4 @@ mod store;
 pub(crate) use settlement::{mirror_send_allowed, settle_mirror_command};
 pub use store::run_order_mirror;
 
-pub const MAX_MIRROR_ORDERS_PER_RELATION: usize = 128;
+pub const MAX_MIRROR_ORDERS_PER_RELATION: usize = 1_000;

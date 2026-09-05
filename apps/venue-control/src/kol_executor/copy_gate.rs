@@ -97,7 +97,7 @@ pub(super) async fn lock_account_claim(
              AND ((r.baseline_json->>'target_model'='1' AND c.mirror_order_id IS NULL) OR (r.baseline_json->>'target_model'='2' AND c.mirror_order_id IS NOT NULL)) \
              AND r.follower_trading_account_id=c.trading_account_id \
              AND r.credential_id=c.credential_id \
-             AND r.allowed_symbols @> jsonb_build_array(c.symbol)) \
+             AND (r.allowed_symbols='[]'::jsonb OR r.allowed_symbols @> jsonb_build_array(c.symbol))) \
          AND NOT (c.command_phase='cancel' AND c.mirror_order_id IS NOT NULL AND EXISTS(SELECT 1 FROM venue_order_mirrors m JOIN venue_kol_follow_relations r ON r.relation_id=m.relation_id WHERE m.mirror_id=c.mirror_order_id AND m.child_native_order_id=c.selected_native_order_id AND r.follower_trading_account_id=c.trading_account_id AND r.credential_id=c.credential_id))",
     )
     .bind(trading_account_id)

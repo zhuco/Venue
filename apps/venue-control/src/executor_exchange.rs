@@ -1239,10 +1239,12 @@ impl BinanceActivationBaseline for BinanceExecutionRouter {
     ) -> Result<AccountBaseline, BinanceExecutionError> {
         self.prepare_account_transports(trading_account_id, symbols)
             .await?;
-        let primary_symbol = symbols
-            .first()
-            .cloned()
-            .ok_or(BinanceExecutionError::Invalid)?;
+        let primary_symbol = match symbols.first().cloned() {
+            Some(symbol) => symbol,
+            None => "BTC/USDT"
+                .parse()
+                .map_err(|_| BinanceExecutionError::Invalid)?,
+        };
         let binding = GatewayBinding::new(
             VenueId::Binance,
             GatewayMode::Live,
