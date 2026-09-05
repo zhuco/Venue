@@ -21,6 +21,8 @@ pub enum SupportMartingaleStoreError {
     Conflict,
     #[error("support martingale storage is unavailable")]
     Unavailable,
+    #[error("support martingale stored state is invalid at {0}")]
+    Corrupt(&'static str),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -196,53 +198,62 @@ impl SupportMartingaleStore {
         owner: &str,
         instance_id: &str,
     ) -> Result<SupportMartingaleInstance, SupportMartingaleStoreError> {
-        let r = sqlx::query("SELECT instance_id,owner_user_id,credential_id,trading_account_id,execution_venue,config::text AS config,lifecycle,health,revision::text AS revision,reserved_budget::text AS reserved_budget FROM venue_support_martingale_instances WHERE owner_user_id=$1 AND instance_id=$2").bind(owner).bind(instance_id).fetch_one(&self.pool).await.map_err(|_| SupportMartingaleStoreError::Conflict)?;
+        let r = sqlx::query("SELECT instance_id,owner_user_id,credential_id,trading_account_id,execution_venue,config::text AS config,lifecycle,health,revision::text AS revision,reserved_budget::text AS reserved_budget FROM venue_support_martingale_instances WHERE owner_user_id=$1 AND instance_id=$2").bind(owner).bind(instance_id).fetch_one(&self.pool).await.map_err(|_| SupportMartingaleStoreError::Corrupt("instance_query"))?;
         let config: SupportMartingaleConfig = serde_json::from_str(
             &r.try_get::<String, _>("config")
-                .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
+                .map_err(|_| SupportMartingaleStoreError::Corrupt("instance_config_column"))?,
         )
-        .map_err(|_| SupportMartingaleStoreError::Conflict)?;
-        let states = sqlx::query("SELECT symbol,cycle_id,layer::text AS layer,average_price::text AS average_price,quantity::text AS quantity,invested::text AS invested,take_profit_price::text AS take_profit_price,net_pnl::text AS net_pnl,status FROM venue_support_martingale_symbol_states WHERE instance_id=$1 ORDER BY symbol").bind(instance_id).fetch_all(&self.pool).await.map_err(|_| SupportMartingaleStoreError::Unavailable)?;
+        .map_err(|_| SupportMartingaleStoreError::Corrupt("instance_config_json"))?;
+        let states = sqlx::query("SELECT symbol,cycle_id,layer::text AS layer,average_price::text AS average_price,quantity::text AS quantity,invested::text AS invested,take_profit_price::text AS take_profit_price,net_pnl::text AS net_pnl,status FROM venue_support_martingale_symbol_states WHERE instance_id=$1 ORDER BY symbol").bind(instance_id).fetch_all(&self.pool).await.map_err(|_| SupportMartingaleStoreError::Corrupt("symbol_state_query"))?;
         let symbols = states
             .into_iter()
             .map(|s| {
                 Ok(SupportMartingaleSymbolState {
                     symbol: s
                         .try_get::<String, _>("symbol")
-                        .map_err(|_| SupportMartingaleStoreError::Unavailable)?
+                        .map_err(|_| SupportMartingaleStoreError::Corrupt("symbol_column"))?
                         .parse()
-                        .map_err(|_| SupportMartingaleStoreError::Conflict)?,
+                        .map_err(|_| SupportMartingaleStoreError::Corrupt("symbol_value"))?,
                     cycle_id: s
                         .try_get("cycle_id")
-                        .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
+                        .map_err(|_| SupportMartingaleStoreError::Corrupt("cycle_id_column"))?,
                     layer: s
                         .try_get::<String, _>("layer")
-                        .map_err(|_| SupportMartingaleStoreError::Unavailable)?
+                        .map_err(|_| SupportMartingaleStoreError::Corrupt("layer_column"))?
                         .parse()
-                        .map_err(|_| SupportMartingaleStoreError::Conflict)?,
+                        .map_err(|_| SupportMartingaleStoreError::Corrupt("layer_value"))?,
                     average_price: opt_decimal(
                         &s.try_get::<Option<String>, _>("average_price")
-                            .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
-                    )?,
+                            .map_err(|_| {
+                                SupportMartingaleStoreError::Corrupt("average_price_column")
+                            })?,
+                    )
+                    .map_err(|_| SupportMartingaleStoreError::Corrupt("average_price_value"))?,
                     quantity: decimal(
                         &s.try_get::<String, _>("quantity")
-                            .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
-                    )?,
+                            .map_err(|_| SupportMartingaleStoreError::Corrupt("quantity_column"))?,
+                    )
+                    .map_err(|_| SupportMartingaleStoreError::Corrupt("quantity_value"))?,
                     invested: decimal(
                         &s.try_get::<String, _>("invested")
-                            .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
-                    )?,
+                            .map_err(|_| SupportMartingaleStoreError::Corrupt("invested_column"))?,
+                    )
+                    .map_err(|_| SupportMartingaleStoreError::Corrupt("invested_value"))?,
                     take_profit_price: opt_decimal(
                         &s.try_get::<Option<String>, _>("take_profit_price")
-                            .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
-                    )?,
+                            .map_err(|_| {
+                                SupportMartingaleStoreError::Corrupt("take_profit_price_column")
+                            })?,
+                    )
+                    .map_err(|_| SupportMartingaleStoreError::Corrupt("take_profit_price_value"))?,
                     net_pnl: opt_decimal(
                         &s.try_get::<Option<String>, _>("net_pnl")
-                            .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
-                    )?,
+                            .map_err(|_| SupportMartingaleStoreError::Corrupt("net_pnl_column"))?,
+                    )
+                    .map_err(|_| SupportMartingaleStoreError::Corrupt("net_pnl_value"))?,
                     status: s
                         .try_get("status")
-                        .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
+                        .map_err(|_| SupportMartingaleStoreError::Corrupt("status_column"))?,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -261,27 +272,31 @@ impl SupportMartingaleStore {
                 .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
             execution_venue: parse_venue(
                 &r.try_get::<String, _>("execution_venue")
-                    .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
-            )?,
+                    .map_err(|_| SupportMartingaleStoreError::Corrupt("execution_venue_column"))?,
+            )
+            .map_err(|_| SupportMartingaleStoreError::Corrupt("execution_venue_value"))?,
             mode: GatewayMode::Live,
             config,
             lifecycle: parse_lifecycle(
                 &r.try_get::<String, _>("lifecycle")
-                    .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
-            )?,
+                    .map_err(|_| SupportMartingaleStoreError::Corrupt("lifecycle_column"))?,
+            )
+            .map_err(|_| SupportMartingaleStoreError::Corrupt("lifecycle_value"))?,
             health: parse_health(
                 &r.try_get::<String, _>("health")
-                    .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
-            )?,
+                    .map_err(|_| SupportMartingaleStoreError::Corrupt("health_column"))?,
+            )
+            .map_err(|_| SupportMartingaleStoreError::Corrupt("health_value"))?,
             revision: r
                 .try_get::<String, _>("revision")
-                .map_err(|_| SupportMartingaleStoreError::Unavailable)?
+                .map_err(|_| SupportMartingaleStoreError::Corrupt("revision_column"))?
                 .parse()
-                .map_err(|_| SupportMartingaleStoreError::Conflict)?,
+                .map_err(|_| SupportMartingaleStoreError::Corrupt("revision_value"))?,
             reserved_budget: decimal(
                 &r.try_get::<String, _>("reserved_budget")
-                    .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
-            )?,
+                    .map_err(|_| SupportMartingaleStoreError::Corrupt("reserved_budget_column"))?,
+            )
+            .map_err(|_| SupportMartingaleStoreError::Corrupt("reserved_budget_value"))?,
             symbols,
         })
     }

@@ -59,6 +59,8 @@ fn support_martingale_error(value: SupportMartingaleStoreError) -> AccountError 
     error(match value {
         SupportMartingaleStoreError::Invalid => Code::InvalidInput,
         SupportMartingaleStoreError::Conflict => Code::Conflict,
-        SupportMartingaleStoreError::Unavailable => Code::Unavailable,
+        SupportMartingaleStoreError::Unavailable | SupportMartingaleStoreError::Corrupt(_) => {
+            Code::Unavailable
+        }
     })
 }
