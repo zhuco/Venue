@@ -492,14 +492,27 @@ impl BybitClosedOrderReadback {
             .map(|raw| raw.received_at_ms)
             .min()
             .ok_or(BybitExecutionError::Readback)?;
+        let mut open_orders = open.orders;
+        let history_orders = history.orders;
+        if let ([open_order], [history_order]) = (open_orders.as_slice(), history_orders.as_slice())
+        {
+            if cross_surface_terminal_duplicate(open_order, history_order) {
+                // With an exact identity filter, Bybit's realtime endpoint can repeat the same
+                // recently terminal order returned by history even when openOnly=0. Accept only
+                // byte-for-byte normalized semantic agreement; every disagreement stays closed.
+                open_orders.clear();
+            } else {
+                return Err(BybitExecutionError::Readback);
+            }
+        }
         Ok(Self {
             binding: binding.gateway_binding().clone(),
             generation,
             lookup,
             requested_at_ms,
             received_at_ms,
-            open_orders: open.orders,
-            history: history.orders,
+            open_orders,
+            history: history_orders,
         })
     }
 
@@ -536,7 +549,11 @@ impl BybitClosedOrderReadback {
                 order_id: item.order.order_id.clone(),
                 client_order_id: item.order.client_order_id.clone(),
                 state: item.order.state,
-                finality: BybitSettlementFinality::Working,
+                finality: if terminal_order_state(item.order.state) {
+                    BybitSettlementFinality::Terminal
+                } else {
+                    BybitSettlementFinality::Working
+                },
                 updated_at_ms: item.updated_at_ms,
             }));
         }
@@ -544,13 +561,7 @@ impl BybitClosedOrderReadback {
             order_id: item.order.order_id.clone(),
             client_order_id: item.order.client_order_id.clone(),
             state: item.order.state,
-            finality: if matches!(
-                item.order.state,
-                OrderState::Filled
-                    | OrderState::Cancelled
-                    | OrderState::Expired
-                    | OrderState::Rejected
-            ) {
+            finality: if terminal_order_state(item.order.state) {
                 BybitSettlementFinality::Terminal
             } else {
                 BybitSettlementFinality::Working
@@ -573,6 +584,29 @@ impl BybitClosedOrderReadback {
             Some(_) | None => None,
         })
     }
+}
+
+fn cross_surface_terminal_duplicate(open: &BybitOpenOrder, history: &BybitOrderEvidence) -> bool {
+    terminal_order_state(open.order.state)
+        && open.order == history.order
+        && open.family == history.family
+        && open.native_order_type == history.native_order_type
+        && open.native_time_in_force == history.native_time_in_force
+        && open.position_idx == history.position_idx
+        && open.stop_order_type == history.stop_order_type
+        && open.trigger_price == history.trigger_price
+        && open.trigger_direction == history.trigger_direction
+        && open.trigger_by == history.trigger_by
+        && open.close_on_trigger == history.close_on_trigger
+        && open.created_at_ms == history.created_at_ms
+        && open.updated_at_ms == history.updated_at_ms
+}
+
+const fn terminal_order_state(state: OrderState) -> bool {
+    matches!(
+        state,
+        OrderState::Filled | OrderState::Cancelled | OrderState::Expired | OrderState::Rejected
+    )
 }
 
 fn conditional_order_matches(
@@ -1493,6 +1527,78 @@ mod tests {
         let settlement = settle_order_ack(&facts.binding, &ack, &readback)?;
         assert_eq!(settlement.state, OrderState::Cancelled);
         assert_eq!(settlement.finality, BybitSettlementFinality::Terminal);
+        Ok(())
+    }
+
+    #[test]
+    fn identical_terminal_realtime_and_history_rows_are_one_exact_readback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let facts = facts(GatewayMode::Live)?;
+        let lookup = BybitOrderLookup::by_client_order_id("cancel-client")?;
+        let open = parse_open_order_page(
+            &facts.binding,
+            &private_raw(
+                &facts.binding,
+                BybitPrivateSource::OpenOrders(NativeOrderFamily::UmOrder),
+                lookup.clone(),
+                CANCEL_HISTORY,
+            )?,
+        )?;
+        let history = parse_order_history_page(
+            &facts.binding,
+            &private_raw(
+                &facts.binding,
+                BybitPrivateSource::OrderHistory(NativeOrderFamily::UmOrder),
+                lookup.clone(),
+                CANCEL_HISTORY,
+            )?,
+        )?;
+        let readback = BybitClosedOrderReadback::from_pages(
+            &facts.binding,
+            7,
+            std::slice::from_ref(&open),
+            std::slice::from_ref(&history),
+        )?;
+        assert!(readback.open_orders.is_empty());
+        assert_eq!(readback.history.len(), 1);
+        let cancel = ExecutionCommand::Cancel(venue_domain::domain::CancelCommand {
+            command_id: CommandId::new("cancel-command")?,
+            owner: OrderOwner {
+                strategy_instance_id: "acceptance".to_owned(),
+                run_id: "run-1".to_owned(),
+                exchange: "bybit".to_owned(),
+                account: ACCOUNT_ID.to_owned(),
+                symbol: "BTC/USDT".parse()?,
+                purpose: OrderPurpose::Entry,
+            },
+            target_client_order_id: CommandId::new("cancel-client")?,
+        });
+        assert!(readback.command_matches(&cancel));
+        assert_eq!(
+            readback.exact_settlement()?.map(|value| value.state),
+            Some(OrderState::Cancelled)
+        );
+
+        let conflicting_payload = String::from_utf8(CANCEL_HISTORY.to_vec())?
+            .replace("\"updatedTime\":\"2002\"", "\"updatedTime\":\"2001\"");
+        let conflicting_open = parse_open_order_page(
+            &facts.binding,
+            &private_raw(
+                &facts.binding,
+                BybitPrivateSource::OpenOrders(NativeOrderFamily::UmOrder),
+                lookup,
+                conflicting_payload.as_bytes(),
+            )?,
+        )?;
+        assert_eq!(
+            BybitClosedOrderReadback::from_pages(
+                &facts.binding,
+                7,
+                &[conflicting_open],
+                &[history]
+            ),
+            Err(BybitExecutionError::Readback)
+        );
         Ok(())
     }
 

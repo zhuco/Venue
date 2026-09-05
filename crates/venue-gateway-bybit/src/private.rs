@@ -970,6 +970,7 @@ pub fn parse_open_order_page(
     accepted(&envelope)?;
     validate_page(&envelope.result, &raw.native_symbol, 50)?;
     envelope.result.validate_symbols(&raw.native_symbol)?;
+    let exact_lookup = raw.lookup.is_some();
     let mut ids = BTreeSet::new();
     let orders = envelope
         .result
@@ -979,7 +980,10 @@ pub fn parse_open_order_page(
             if !ids.insert(row.order_id.clone()) {
                 return Err(BybitError::Payload);
             }
-            normalize_order(raw, row, family, true)
+            // Bybit can return the exact recently terminal order when orderId/orderLinkId is
+            // supplied even with openOnly=0. Account-wide reads must remain strictly open-only;
+            // the exact readback path validates this row again against history and command shape.
+            normalize_order(raw, row, family, !exact_lookup)
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(BybitOpenOrderPage {
