@@ -196,13 +196,13 @@ impl SupportMartingaleStore {
         owner: &str,
         instance_id: &str,
     ) -> Result<SupportMartingaleInstance, SupportMartingaleStoreError> {
-        let r = sqlx::query("SELECT instance_id,owner_user_id,credential_id,trading_account_id,execution_venue,config::text AS config,lifecycle,health,revision::text AS revision,reserved_budget::text AS reserved_budget FROM venue_support_martingale_instances WHERE owner_user_id=$1 AND instance_id=$2").bind(owner).bind(instance_id).fetch_one(&self.pool).await.map_err(|_| SupportMartingaleStoreError::Conflict)?;
-        let config: SupportMartingaleConfig = serde_json::from_str(
-            &r.try_get::<String, _>("config")
+        let r = sqlx::query("SELECT instance_id,owner_user_id,credential_id,trading_account_id,execution_venue,config,lifecycle,health,revision,reserved_budget::text AS reserved_budget FROM venue_support_martingale_instances WHERE owner_user_id=$1 AND instance_id=$2").bind(owner).bind(instance_id).fetch_one(&self.pool).await.map_err(|_| SupportMartingaleStoreError::Conflict)?;
+        let config: SupportMartingaleConfig = serde_json::from_value(
+            r.try_get("config")
                 .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
         )
         .map_err(|_| SupportMartingaleStoreError::Conflict)?;
-        let states = sqlx::query("SELECT symbol,cycle_id,layer::text AS layer,average_price::text AS average_price,quantity::text AS quantity,invested::text AS invested,take_profit_price::text AS take_profit_price,net_pnl::text AS net_pnl,status FROM venue_support_martingale_symbol_states WHERE instance_id=$1 ORDER BY symbol").bind(instance_id).fetch_all(&self.pool).await.map_err(|_| SupportMartingaleStoreError::Unavailable)?;
+        let states = sqlx::query("SELECT symbol,cycle_id,layer,average_price::text AS average_price,quantity::text AS quantity,invested::text AS invested,take_profit_price::text AS take_profit_price,net_pnl::text AS net_pnl,status FROM venue_support_martingale_symbol_states WHERE instance_id=$1 ORDER BY symbol").bind(instance_id).fetch_all(&self.pool).await.map_err(|_| SupportMartingaleStoreError::Unavailable)?;
         let symbols = states
             .into_iter()
             .map(|s| {
@@ -215,11 +215,11 @@ impl SupportMartingaleStore {
                     cycle_id: s
                         .try_get("cycle_id")
                         .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
-                    layer: s
-                        .try_get::<String, _>("layer")
-                        .map_err(|_| SupportMartingaleStoreError::Unavailable)?
-                        .parse()
-                        .map_err(|_| SupportMartingaleStoreError::Conflict)?,
+                    layer: i64_to_u16(
+                        s.try_get::<i32, _>("layer")
+                            .map_err(|_| SupportMartingaleStoreError::Unavailable)?
+                            as i64,
+                    )?,
                     average_price: opt_decimal(
                         &s.try_get::<Option<String>, _>("average_price")
                             .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
@@ -273,11 +273,10 @@ impl SupportMartingaleStore {
                 &r.try_get::<String, _>("health")
                     .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
             )?,
-            revision: r
-                .try_get::<String, _>("revision")
-                .map_err(|_| SupportMartingaleStoreError::Unavailable)?
-                .parse()
-                .map_err(|_| SupportMartingaleStoreError::Conflict)?,
+            revision: i64_to_u64(
+                r.try_get("revision")
+                    .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
+            )?,
             reserved_budget: decimal(
                 &r.try_get::<String, _>("reserved_budget")
                     .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
