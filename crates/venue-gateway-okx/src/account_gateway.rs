@@ -1490,7 +1490,7 @@ pub enum OkxAccountGatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use venue_domain::domain::{CommandId, OrderOwner, OrderPurpose, Position};
+    use venue_domain::domain::{CommandId, MarketOrderCommand, OrderOwner, OrderPurpose, Position};
 
     #[test]
     fn failed_ack_parse_with_row_success_stays_unknown() {
@@ -1551,6 +1551,54 @@ mod tests {
             AccountGatewayResult::Accepted { .. }
         ));
         observed.order.side = OrderSide::Buy;
+        assert_eq!(
+            durable_execution::reconcile_okx_order(&command, &observed),
+            AccountGatewayResult::Unknown
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn committed_reconcile_accepts_signed_market_order() -> Result<(), Box<dyn std::error::Error>> {
+        let command = ExecutionCommand::PlaceMarket(MarketOrderCommand {
+            command_id: CommandId::new("okx_market")?,
+            client_order_id: CommandId::new("okx_market_client")?,
+            owner: OrderOwner {
+                strategy_instance_id: "acceptance".to_owned(),
+                run_id: "run1".to_owned(),
+                exchange: "okx".to_owned(),
+                account: "00000000-0000-4000-8000-000000000001".to_owned(),
+                symbol: "BTC/USDT".parse()?,
+                purpose: OrderPurpose::Entry,
+            },
+            position_side: PositionSide::Long,
+            side: OrderSide::Buy,
+            quantity: Decimal::new(1, 1),
+            reduce_only: false,
+        });
+        let mut observed = OkxTimedOrder {
+            order: venue_domain::domain::Order {
+                order_id: "7002".to_owned(),
+                client_order_id: FieldState::Known("okx_market_client".to_owned()),
+                symbol: "BTC/USDT".parse()?,
+                side: OrderSide::Buy,
+                position_side: FieldState::Known(PositionSide::Long),
+                purpose: FieldState::Missing,
+                state: OrderState::Filled,
+                quantity: Decimal::new(1, 1),
+                filled_quantity: Decimal::new(1, 1),
+                limit_price: None,
+                time_in_force: FieldState::Missing,
+                average_price: FieldState::Missing,
+                reduce_only: false,
+            },
+            update_time_ms: 1,
+        };
+        assert!(matches!(
+            durable_execution::reconcile_okx_order(&command, &observed),
+            AccountGatewayResult::Accepted { .. }
+        ));
+        observed.order.side = OrderSide::Sell;
         assert_eq!(
             durable_execution::reconcile_okx_order(&command, &observed),
             AccountGatewayResult::Unknown

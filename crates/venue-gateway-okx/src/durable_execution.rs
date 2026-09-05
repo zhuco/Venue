@@ -929,7 +929,7 @@ pub(super) fn reconcile_okx_order(
                 AccountGatewayResult::Unknown
             }
         },
-        ExecutionCommand::PlaceLimit(_) => match order.state {
+        ExecutionCommand::PlaceLimit(_) | ExecutionCommand::PlaceMarket(_) => match order.state {
             OrderState::Rejected => rejected("okx_order_rejected"),
             OrderState::New
             | OrderState::PartiallyFilled
