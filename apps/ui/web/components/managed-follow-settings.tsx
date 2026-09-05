@@ -47,7 +47,7 @@ export function ManagedFollowSettingsPanel({ managedId, label, csrf, canManage }
   const state = !loaded ? "尚未读取" : !relation ? "尚未设置" : relation.activation_requested ? "正在校验激活条件" : ({ paused: "已暂停", active: "跟单中", needs_attention: "需要处理", disabled: "已停用" }[relation.state] ?? "状态未知");
   return <>
     <button onClick={() => { dialog.current?.showModal(); void refresh(); }}>跟单设置</button>
-    <dialog ref={dialog} className="managed-dialog" aria-label={`${label} 跟单设置`} onCancel={event => { if (busy || pending) event.preventDefault(); }}>
+    <dialog ref={dialog} className="managed-dialog" style={{ whiteSpace: "normal", overflowWrap: "anywhere" }} aria-label={`${label} 跟单设置`} onCancel={event => { if (busy || pending) event.preventDefault(); }}>
       <h2>{label} · 跟单设置</h2><p role="status">{state}</p>
       {error && <p role="alert" className="notice error">{error}</p>}
       {pending && <button disabled={busy} onClick={() => void submit(pending.action, pending.body)}>重试原请求</button>}
