@@ -52,8 +52,22 @@ pub(super) async fn lock_scope(
                 return Err(error(Code::Conflict));
             }
             if credential.is_some() {
-                sqlx::query("INSERT INTO venue_user_kol_bindings(user_id,kol_user_id,managed_id,bound_ms) VALUES($1,$2,$3,$4) ON CONFLICT(user_id) DO NOTHING")
-                    .bind(&principal.user.user_id).bind(owner).bind(id).bind(ms(now)?).execute(&mut **tx).await.map_err(database_error)?;
+                // Some upgraded deployments retain the frozen managed-follower
+                // `binding_source` column. Preserve its stricter provenance check without
+                // making that historic compatibility column part of the canonical schema.
+                let has_binding_source: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='venue_user_kol_bindings'::regclass AND attname='binding_source' AND NOT attisdropped)",
+                )
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(database_error)?;
+                if has_binding_source {
+                    sqlx::query("INSERT INTO venue_user_kol_bindings(user_id,kol_user_id,managed_id,bound_ms,binding_source) VALUES($1,$2,$3,$4,'kol_managed') ON CONFLICT(user_id) DO NOTHING")
+                        .bind(&principal.user.user_id).bind(owner).bind(id).bind(ms(now)?).execute(&mut **tx).await.map_err(database_error)?;
+                } else {
+                    sqlx::query("INSERT INTO venue_user_kol_bindings(user_id,kol_user_id,managed_id,bound_ms) VALUES($1,$2,$3,$4) ON CONFLICT(user_id) DO NOTHING")
+                        .bind(&principal.user.user_id).bind(owner).bind(id).bind(ms(now)?).execute(&mut **tx).await.map_err(database_error)?;
+                }
             }
             let matches: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_user_kol_bindings WHERE user_id=$1 AND kol_user_id=$2 AND managed_id=$3 AND invite_id IS NULL)")
                 .bind(&principal.user.user_id).bind(owner).bind(id).fetch_one(&mut **tx).await.map_err(database_error)?;
