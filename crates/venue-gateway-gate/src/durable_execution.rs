@@ -38,6 +38,8 @@ impl GateAccountGateway {
             native_order_id: readback.order.order_id,
             state: readback.order.state,
             filled_quantity: readback.order.filled_quantity,
+            average_price: venue_domain::domain::FieldState::Missing,
+            cumulative_fee: venue_domain::domain::FieldState::Missing,
         }))
     }
 

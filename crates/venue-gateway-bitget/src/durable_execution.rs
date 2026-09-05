@@ -54,6 +54,8 @@ impl BitgetAccountGateway {
             native_order_id: observed.order_id,
             state: observed.state,
             filled_quantity: observed.filled_quantity,
+            average_price: venue_domain::domain::FieldState::Missing,
+            cumulative_fee: venue_domain::domain::FieldState::Missing,
         }))
     }
 

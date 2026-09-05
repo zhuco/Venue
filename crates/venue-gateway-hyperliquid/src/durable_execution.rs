@@ -76,6 +76,8 @@ impl HyperliquidAccountGateway {
             native_order_id: order_id.to_string(),
             state,
             filled_quantity,
+            average_price: FieldState::Missing,
+            cumulative_fee: FieldState::Missing,
         }))
     }
 

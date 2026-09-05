@@ -219,6 +219,7 @@ fn signed_queries_are_exact_bounded_and_identity_specific() -> Result<(), TestEr
         Some(lookup),
     )?;
     assert!(execution.query.contains("execType=Trade&limit=100"));
+    assert!(execution.query.contains("orderLinkId=client-1"));
     let positions = prepare_private_request(
         &binding,
         7,
