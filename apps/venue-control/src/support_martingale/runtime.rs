@@ -950,8 +950,7 @@ fn map_store(error: super::SupportMartingaleStoreError) -> MultiVenueStoreError 
         super::SupportMartingaleStoreError::Invalid => MultiVenueStoreError::Invalid,
         super::SupportMartingaleStoreError::Conflict => MultiVenueStoreError::Conflict,
         super::SupportMartingaleStoreError::Unavailable
-        | super::SupportMartingaleStoreError::Corrupt(_)
-        | super::SupportMartingaleStoreError::Query { .. } => MultiVenueStoreError::Unavailable,
+        | super::SupportMartingaleStoreError::Corrupt(_) => MultiVenueStoreError::Unavailable,
     }
 }
 
