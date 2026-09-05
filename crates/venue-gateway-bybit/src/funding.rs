@@ -115,7 +115,7 @@ pub(crate) fn parse_funding_page(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let next_cursor = match envelope.result.next_page_cursor {
+    let next_cursor = match envelope.result.next_page_cursor.unwrap_or_default() {
         value if value.is_empty() => None,
         value if valid_cursor(&value) => Some(value),
         _ => return Err(BybitError::Pagination),
@@ -197,7 +197,7 @@ struct FundingEnvelope {
 #[serde(rename_all = "camelCase")]
 struct FundingResult {
     #[serde(default)]
-    next_page_cursor: String,
+    next_page_cursor: Option<String>,
     list: Vec<FundingRow>,
 }
 
@@ -312,6 +312,17 @@ mod tests {
             )?,
         ];
         assert!(complete_funding_pages(&binding, &duplicate_pages, None).is_err());
+
+        let empty = br#"{"retCode":0,"retMsg":"OK","result":{"nextPageCursor":null,"list":[]},"time":2000}"#;
+        let empty_pages = [parse_funding_page(
+            &binding,
+            &raw(&binding, 0, None, empty)?,
+        )?];
+        assert!(
+            complete_funding_pages(&binding, &empty_pages, None)?
+                .settlements
+                .is_empty()
+        );
         Ok(())
     }
 

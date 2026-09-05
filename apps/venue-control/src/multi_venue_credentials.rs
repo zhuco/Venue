@@ -198,28 +198,37 @@ impl StrategyCredentialStore {
         credential: &str,
         symbol: Symbol,
         query: venue_gateway_bybit::BybitFundingQuery,
-    ) -> Result<venue_gateway_bybit::BybitFundingReadback, StrategyExchangeError> {
+    ) -> Result<venue_gateway_bybit::BybitFundingReadback, StrategyProbeError> {
         let account: String = sqlx::query_scalar("SELECT trading_account_id FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND deleted_ms IS NULL")
-            .bind(credential).bind(owner).fetch_one(&self.pool).await.map_err(|_| StrategyExchangeError)?;
-        let (credentials, expected) = self.load(owner, credential, &account, false).await?;
+            .bind(credential).bind(owner).fetch_one(&self.pool).await.map_err(|_| StrategyProbeError::Binding)?;
+        let (credentials, expected) = self
+            .load(owner, credential, &account, false)
+            .await
+            .map_err(|_| StrategyProbeError::Permissions)?;
         if credentials.venue() != VenueId::Bybit {
-            return Err(StrategyExchangeError);
+            return Err(StrategyProbeError::Binding);
         }
         let binding = GatewayBinding::new(VenueId::Bybit, GatewayMode::Live, account, symbol)
-            .map_err(|_| StrategyExchangeError)?;
+            .map_err(|_| StrategyProbeError::Binding)?;
         let _slot = crate::multi_venue_runtime::ACCOUNT_NETWORK_SLOTS
             .acquire()
             .await
-            .map_err(|_| StrategyExchangeError)?;
+            .map_err(|_| StrategyProbeError::NetworkSlot)?;
         tokio::task::spawn_blocking(move || {
-            let mut gateway = StrategyGateway::connect(binding.clone(), credentials, 1)?;
-            if identity_hash(binding.venue, &gateway.identity()?) != expected {
-                return Err(StrategyExchangeError);
+            let mut gateway = StrategyGateway::connect_detailed(binding.clone(), credentials, 1)
+                .map_err(StrategyProbeError::Connect)?;
+            let identity = gateway
+                .identity()
+                .map_err(|_| StrategyProbeError::Identity)?;
+            if identity_hash(binding.venue, &identity) != expected {
+                return Err(StrategyProbeError::Identity);
             }
-            gateway.bybit_funding(&query)
+            gateway
+                .bybit_funding_detailed(&query)
+                .map_err(StrategyProbeError::Observation)
         })
         .await
-        .map_err(|_| StrategyExchangeError)?
+        .map_err(|_| StrategyProbeError::Worker)?
     }
 
     pub async fn set_limits(
