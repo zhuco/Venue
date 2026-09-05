@@ -621,10 +621,14 @@ impl AccountPhysicalGateway for OkxAccountGateway {
         }
         let candidate = self
             .collect_account_wide(request.previous_fills_cursor())
-            .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-        let recovery = self
-            .reconcile(request)
-            .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+            .map_err(|error| {
+                eprintln!("OKX_PROBE_DIAGNOSTIC collect_account_wide: {error}");
+                AccountHostValidationError::SignedSnapshot
+            })?;
+        let recovery = self.reconcile(request).map_err(|error| {
+            eprintln!("OKX_PROBE_DIAGNOSTIC reconcile: {error}");
+            AccountHostValidationError::SignedSnapshot
+        })?;
         let unknown_results = recovery
             .outcomes()
             .iter()
@@ -647,7 +651,7 @@ impl AccountPhysicalGateway for OkxAccountGateway {
             OkxPositionMode::Net => SignedAccountPositionMode::Net,
             OkxPositionMode::LongShort => SignedAccountPositionMode::Hedge,
         };
-        SignedAccountSnapshot::complete_with_fills(
+        let snapshot = SignedAccountSnapshot::complete_with_fills(
             self.config.gateway_binding().clone(),
             candidate.observed_at_ms,
             self.instrument.instrument().generation,
@@ -659,8 +663,15 @@ impl AccountPhysicalGateway for OkxAccountGateway {
             candidate.fills,
             candidate.fills_cursor,
             unknown_results,
-        )?
-        .with_balances(candidate.balances)
+        )
+        .map_err(|error| {
+            eprintln!("OKX_PROBE_DIAGNOSTIC normalize_snapshot: {error}");
+            error
+        })?;
+        snapshot.with_balances(candidate.balances).map_err(|error| {
+            eprintln!("OKX_PROBE_DIAGNOSTIC normalize_balances: {error}");
+            error
+        })
     }
 
     fn normalize_limit_intent(
