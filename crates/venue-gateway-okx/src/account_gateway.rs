@@ -5,7 +5,6 @@ use std::{
 };
 
 use rust_decimal::Decimal;
-use serde::Deserialize;
 use tokio::runtime::{Builder, Runtime};
 use venue_domain::domain::{
     Amount, Asset, ExecutionCommand, FieldState, Fill, LimitTimeInForce, MarketReduceCommand,
@@ -39,12 +38,13 @@ use crate::{
 
 #[path = "durable_execution.rs"]
 mod durable_execution;
+#[path = "account_gateway/market_facts.rs"]
+mod market_facts;
+
+use market_facts::{OkxLimitBbo, parse_limit_bbo};
 
 /// Production OKX adapter for the lightweight account host. Base quantities remain canonical in
 /// the WAL; `build_place_request` converts them to contracts using ctVal × ctMult exactly once.
-const LIMIT_BBO_MAX_AGE_MS: u64 = 1_000;
-const LIMIT_BBO_MAX_CLOCK_SKEW_MS: u64 = 250;
-
 pub struct OkxAccountGateway {
     runtime: Runtime,
     config: OkxConfig,
@@ -328,83 +328,6 @@ fn validate_limit_reduce_position(
         return Err(());
     }
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct OkxLimitBbo {
-    bid: Price,
-    ask: Price,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OkxLimitBboEnvelope {
-    code: String,
-    data: Vec<OkxLimitBboRow>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OkxLimitBboRow {
-    inst_id: String,
-    bids: Vec<Vec<String>>,
-    asks: Vec<Vec<String>>,
-    ts: String,
-}
-
-fn parse_limit_bbo(
-    response: &crate::OkxHttpResponse,
-    config: &OkxConfig,
-    instrument: &OkxInstrument,
-    now_ms: u64,
-) -> Result<OkxLimitBbo, OkxAccountGatewayError> {
-    if response.binding != *config.gateway_binding()
-        || response.instrument_generation != instrument.instrument().generation
-        || response.received_at_ms == 0
-        || now_ms < response.received_at_ms
-        || now_ms.saturating_sub(response.received_at_ms) > LIMIT_BBO_MAX_AGE_MS
-    {
-        return Err(OkxAccountGatewayError::Instrument);
-    }
-    let envelope: OkxLimitBboEnvelope =
-        serde_json::from_slice(&response.body).map_err(|_| OkxAccountGatewayError::Instrument)?;
-    if envelope.code != "0" {
-        return Err(OkxAccountGatewayError::Instrument);
-    }
-    let [row] = envelope.data.as_slice() else {
-        return Err(OkxAccountGatewayError::Instrument);
-    };
-    if row.inst_id != instrument.native_id() {
-        return Err(OkxAccountGatewayError::Instrument);
-    }
-    let exchange_time_ms = row
-        .ts
-        .parse::<u64>()
-        .map_err(|_| OkxAccountGatewayError::Instrument)?;
-    if exchange_time_ms == 0
-        || exchange_time_ms > now_ms.saturating_add(LIMIT_BBO_MAX_CLOCK_SKEW_MS)
-        || now_ms.saturating_sub(exchange_time_ms) > LIMIT_BBO_MAX_AGE_MS
-    {
-        return Err(OkxAccountGatewayError::Instrument);
-    }
-    let bid = bbo_level_price(&row.bids)?;
-    let ask = bbo_level_price(&row.asks)?;
-    if bid >= ask {
-        return Err(OkxAccountGatewayError::Instrument);
-    }
-    Ok(OkxLimitBbo { bid, ask })
-}
-
-fn bbo_level_price(levels: &[Vec<String>]) -> Result<Price, OkxAccountGatewayError> {
-    let [price, ..] = levels
-        .first()
-        .ok_or(OkxAccountGatewayError::Instrument)?
-        .as_slice()
-    else {
-        return Err(OkxAccountGatewayError::Instrument);
-    };
-    Price::new(Decimal::from_str(price).map_err(|_| OkxAccountGatewayError::Instrument)?)
-        .map_err(|_| OkxAccountGatewayError::Instrument)
 }
 
 fn normalize_limit_from_bbo(
@@ -1878,6 +1801,10 @@ mod tests {
             ..limit_bbo(&config)
         };
         assert!(parse_limit_bbo(&excessive, &config, &instrument, 10_010).is_err());
+        assert_eq!(
+            market_facts::parse_limit_bbo_detailed(&excessive, &config, &instrument, 10_010),
+            Err(market_facts::LimitBboFailure::ExchangeTime)
+        );
         Ok(())
     }
 

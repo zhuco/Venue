@@ -765,7 +765,8 @@ mod error_code_tests {
     #[test]
     fn strategy_error_codes_are_bounded_log_safe_identifiers() {
         assert!(valid_strategy_error_code("strategy_market_limits"));
-        assert!(valid_strategy_error_code("strategy_okx_bbo_parse"));
+        assert!(valid_strategy_error_code("strategy_okx_bbo_book"));
+        assert!(valid_strategy_error_code("strategy_okx_bbo_exchange_time"));
         assert!(valid_strategy_error_code("strategy_okx_bbo_transport"));
         assert!(valid_strategy_error_code("strategy_okx_market_metadata"));
         assert!(valid_strategy_error_code("strategy_okx_market_rules"));

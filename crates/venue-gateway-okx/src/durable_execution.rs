@@ -24,8 +24,13 @@ impl OkxAccountGateway {
                 )
             })?;
         let now_ms = unix_ms().map_err(|error| ("strategy_okx_market_clock", error))?;
-        let bbo = parse_limit_bbo(&response, &self.config, &self.instrument, now_ms)
-            .map_err(|error| ("strategy_okx_bbo_parse", error))?;
+        let bbo = market_facts::parse_limit_bbo_detailed(
+            &response,
+            &self.config,
+            &self.instrument,
+            now_ms,
+        )
+        .map_err(|failure| (failure.code(), OkxAccountGatewayError::Instrument))?;
         let reference_price =
             Price::new((bbo.bid.value() + bbo.ask.value()) / rust_decimal::Decimal::from(2))
                 .map_err(|_| {
