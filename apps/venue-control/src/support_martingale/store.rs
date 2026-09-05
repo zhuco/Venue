@@ -23,6 +23,11 @@ pub enum SupportMartingaleStoreError {
     Unavailable,
     #[error("support martingale stored state is invalid at {0}")]
     Corrupt(&'static str),
+    #[error("support martingale query failed at {stage}: {detail}")]
+    Query {
+        stage: &'static str,
+        detail: &'static str,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -198,7 +203,16 @@ impl SupportMartingaleStore {
         owner: &str,
         instance_id: &str,
     ) -> Result<SupportMartingaleInstance, SupportMartingaleStoreError> {
-        let r = sqlx::query("SELECT instance_id,owner_user_id,credential_id,trading_account_id,execution_venue,config::text AS config,lifecycle,health,revision::text AS revision,reserved_budget::text AS reserved_budget FROM venue_support_martingale_instances WHERE owner_user_id=$1 AND instance_id=$2").bind(owner).bind(instance_id).fetch_one(&self.pool).await.map_err(|_| SupportMartingaleStoreError::Corrupt("instance_query"))?;
+        let r = sqlx::query("SELECT instance_id,owner_user_id,credential_id,trading_account_id,execution_venue,config::text AS config,lifecycle,health,revision::text AS revision,reserved_budget::text AS reserved_budget FROM venue_support_martingale_instances WHERE owner_user_id=$1 AND instance_id=$2").bind(owner).bind(instance_id).fetch_one(&self.pool).await.map_err(|error| SupportMartingaleStoreError::Query {
+            stage: "instance_query",
+            detail: match error {
+                sqlx::Error::RowNotFound => "row_not_found",
+                sqlx::Error::Database(_) => "database",
+                sqlx::Error::PoolTimedOut => "pool_timeout",
+                sqlx::Error::PoolClosed => "pool_closed",
+                _ => "transport_or_decode",
+            },
+        })?;
         let config: SupportMartingaleConfig = serde_json::from_str(
             &r.try_get::<String, _>("config")
                 .map_err(|_| SupportMartingaleStoreError::Corrupt("instance_config_column"))?,
