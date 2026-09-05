@@ -1,7 +1,9 @@
 use super::*;
 use crate::{GatePublicError, collect_regular_order_pages, parse_regular_order};
 use bytes::Bytes;
-use venue_domain::domain::{Amount, CommandId, OrderOwner, OrderPurpose};
+use venue_domain::domain::{
+    Amount, CommandId, OrderOwner, OrderPurpose, StopMarketFullPositionCommand,
+};
 use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
 
 const CATALOGUE: &str = r#"[{
@@ -151,6 +153,45 @@ fn unknown_limit_readback_requires_the_original_policy() -> Result<(), Box<dyn s
     assert!(readback_policy_matches_command(&command, &order));
     order.time_in_force = FieldState::Missing;
     assert!(!readback_policy_matches_command(&command, &order));
+    Ok(())
+}
+
+#[test]
+fn recovery_routes_conditional_orders_to_the_price_order_readback()
+-> Result<(), Box<dyn std::error::Error>> {
+    let rules = rules()?;
+    let account = "00000000-0000-4000-8000-000000000001";
+    let binding = GateGatewayBinding::new(GatewayBinding::new(
+        VenueId::Gate,
+        GatewayMode::Live,
+        account,
+        "DOGE/USDT".parse()?,
+    )?)?;
+    let stop = StopMarketFullPositionCommand {
+        command_id: CommandId::new("gate_stop_command_1")?,
+        client_algo_id: CommandId::new("gate_stop_client_1")?,
+        owner: OrderOwner {
+            strategy_instance_id: "grid_1".to_owned(),
+            run_id: "run_1".to_owned(),
+            exchange: "gate".to_owned(),
+            account: account.to_owned(),
+            symbol: "DOGE/USDT".parse()?,
+            purpose: OrderPurpose::Protection,
+        },
+        side: OrderSide::Sell,
+        position_side: PositionSide::Long,
+        quantity: Decimal::from(10),
+        trigger_price: Price::new(Decimal::new(9, 2))?,
+        position_generation: 1,
+    };
+    let command = ExecutionCommand::StopMarketFullPosition(stop.clone());
+    let request =
+        prepare_recovery_exact_readback(&binding, &rules, &command, stop.client_algo_id.as_str())?;
+    assert_eq!(
+        request.endpoint,
+        format!("{}/t-gate_stop_client_1", endpoints::FUTURES_PRICE_ORDERS)
+    );
+    assert_eq!(request.price_lookup_client(), Some("gate_stop_client_1"));
     Ok(())
 }
 

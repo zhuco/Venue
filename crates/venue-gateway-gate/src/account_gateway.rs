@@ -507,40 +507,38 @@ impl AccountPhysicalGateway for GateAccountGateway {
                     .as_str(),
             };
             let rules = self.registered_rules(&command.mutation_owner().symbol)?;
-            let outcome =
-                match prepare_exact_readback_by_client_id(&self.binding, &rules, client_id)
-                    .ok()
-                    .and_then(|exact| {
-                        now_ms().ok().and_then(|timestamp| {
-                            self.runtime
-                                .block_on(self.transport.execute_exact_readback(
-                                    &self.binding,
-                                    &self.credentials,
-                                    &rules,
-                                    &exact,
-                                    timestamp,
-                                ))
-                                .ok()
-                        })
-                    }) {
-                    Some(readback)
-                        if recovery_order_matches_command(command, &readback.order)
-                            && readback.order.state == OrderState::Rejected =>
-                    {
-                        AccountRecoveryOutcome::rejected(
-                            command.command_id().clone(),
-                            "gate_rejected".to_owned(),
-                        )
-                    }
-                    Some(readback) if recovery_order_matches_command(command, &readback.order) => {
-                        AccountRecoveryOutcome::accepted(
-                            command.command_id().clone(),
-                            readback.order.order_id,
-                        )
-                    }
-                    Some(_) => AccountRecoveryOutcome::still_unknown(command.command_id().clone()),
-                    None => AccountRecoveryOutcome::still_unknown(command.command_id().clone()),
-                };
+            let exact = prepare_recovery_exact_readback(&self.binding, &rules, command, client_id);
+            let outcome = match exact.ok().and_then(|exact| {
+                now_ms().ok().and_then(|timestamp| {
+                    self.runtime
+                        .block_on(self.transport.execute_exact_readback(
+                            &self.binding,
+                            &self.credentials,
+                            &rules,
+                            &exact,
+                            timestamp,
+                        ))
+                        .ok()
+                })
+            }) {
+                Some(readback)
+                    if recovery_order_matches_command(command, &readback.order)
+                        && readback.order.state == OrderState::Rejected =>
+                {
+                    AccountRecoveryOutcome::rejected(
+                        command.command_id().clone(),
+                        "gate_rejected".to_owned(),
+                    )
+                }
+                Some(readback) if recovery_order_matches_command(command, &readback.order) => {
+                    AccountRecoveryOutcome::accepted(
+                        command.command_id().clone(),
+                        readback.order.order_id,
+                    )
+                }
+                Some(_) => AccountRecoveryOutcome::still_unknown(command.command_id().clone()),
+                None => AccountRecoveryOutcome::still_unknown(command.command_id().clone()),
+            };
             outcomes.push(outcome);
         }
         AccountRecoveryReport::new(
@@ -641,6 +639,20 @@ impl AccountPhysicalGateway for GateAccountGateway {
 
     fn dispatch(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
         self.dispatch_permit(permit)
+    }
+}
+
+fn prepare_recovery_exact_readback(
+    binding: &GateGatewayBinding,
+    rules: &GateContractRules,
+    command: &ExecutionCommand,
+    client_id: &str,
+) -> Result<crate::GateExactReadbackRequest, crate::GateExecutionError> {
+    match command {
+        ExecutionCommand::StopMarketFullPosition(stop) => {
+            prepare_price_readback_by_client_id(binding, rules, stop)
+        }
+        _ => prepare_exact_readback_by_client_id(binding, rules, client_id),
     }
 }
 
