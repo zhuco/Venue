@@ -13,9 +13,19 @@ impl OkxAccountGateway {
     ) -> Result<venue_execution::DurableMarketFacts, (&'static str, OkxAccountGatewayError)> {
         self.refresh_instrument()
             .map_err(|error| ("strategy_okx_market_rules", error))?;
-        let bbo = self
-            .current_market_bbo()
-            .map_err(|error| ("strategy_okx_market_bbo", error))?;
+        let generation = self.instrument.instrument().generation;
+        let response = self
+            .runtime
+            .block_on(self.transport.fetch_bbo(generation))
+            .map_err(|error| {
+                (
+                    "strategy_okx_bbo_transport",
+                    OkxAccountGatewayError::Transport(error),
+                )
+            })?;
+        let now_ms = unix_ms().map_err(|error| ("strategy_okx_market_clock", error))?;
+        let bbo = parse_limit_bbo(&response, &self.config, &self.instrument, now_ms)
+            .map_err(|error| ("strategy_okx_bbo_parse", error))?;
         let reference_price =
             Price::new((bbo.bid.value() + bbo.ask.value()) / rust_decimal::Decimal::from(2))
                 .map_err(|_| {
