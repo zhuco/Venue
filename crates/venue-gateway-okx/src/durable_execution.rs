@@ -12,19 +12,28 @@ impl OkxAccountGateway {
         &mut self,
         command: &ExecutionCommand,
     ) -> Result<Option<venue_execution::DurableOrderObservation>, OkxAccountGatewayError> {
-        let ExecutionCommand::PlaceLimit(order) = command else {
-            return Ok(None);
+        let client_order_id = match command {
+            ExecutionCommand::PlaceLimit(order) => order.client_order_id.as_str(),
+            ExecutionCommand::PlaceMarket(order) => order.client_order_id.as_str(),
+            ExecutionCommand::MarketReduce(order) => order.client_order_id.as_str(),
+            _ => return Ok(None),
         };
         if !venue_execution::validate_durable_command(self.config.gateway_binding(), command) {
             return Ok(None);
         }
         self.refresh_instrument()?;
+        let intent = match command {
+            ExecutionCommand::PlaceLimit(order) => OkxPlaceIntent::Limit(order),
+            ExecutionCommand::PlaceMarket(order) => OkxPlaceIntent::Market(order),
+            ExecutionCommand::MarketReduce(order) => OkxPlaceIntent::MarketReduce(order),
+            _ => return Ok(None),
+        };
         let submitted = build_place_request(
             &self.config,
             &self.instrument,
             &self.profile,
             self.trade_mode,
-            OkxPlaceIntent::Limit(order),
+            intent,
         )
         .map_err(|_| OkxAccountGatewayError::Readback)?;
         let request = crate::execution::build_unknown_order_readback_request(
@@ -53,11 +62,11 @@ impl OkxAccountGateway {
             return Ok(None);
         }
         Ok(Some(venue_execution::DurableOrderObservation {
-            client_order_id: order.client_order_id.as_str().to_owned(),
+            client_order_id: client_order_id.to_owned(),
             native_order_id: observed.order.order_id,
             state: observed.order.state,
             filled_quantity: observed.order.filled_quantity,
-            average_price: venue_domain::domain::FieldState::Missing,
+            average_price: observed.order.average_price,
             cumulative_fee: venue_domain::domain::FieldState::Missing,
         }))
     }

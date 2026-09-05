@@ -7,28 +7,45 @@ impl BitgetAccountGateway {
         &mut self,
         command: &ExecutionCommand,
     ) -> Result<Option<venue_execution::DurableOrderObservation>, BitgetAccountGatewayError> {
-        let ExecutionCommand::PlaceLimit(order) = command else {
-            return Ok(None);
+        let (client_order_id, symbol, kind, expected_time_in_force) = match command {
+            ExecutionCommand::PlaceLimit(order) => (
+                order.client_order_id.as_str(),
+                order.owner.symbol.clone(),
+                BitgetMutationKind::Place,
+                Some(match order.time_in_force {
+                    LimitTimeInForce::PostOnly => crate::BitgetTimeInForce::PostOnly,
+                    LimitTimeInForce::Gtc => crate::BitgetTimeInForce::GoodTillCancelled,
+                }),
+            ),
+            ExecutionCommand::PlaceMarket(order) => (
+                order.client_order_id.as_str(),
+                order.owner.symbol.clone(),
+                BitgetMutationKind::PlaceMarket,
+                None,
+            ),
+            ExecutionCommand::MarketReduce(order) => (
+                order.client_order_id.as_str(),
+                order.owner.symbol.clone(),
+                BitgetMutationKind::ReduceOnce,
+                None,
+            ),
+            _ => return Ok(None),
         };
         if !venue_execution::validate_durable_command(self.transport_binding(), command) {
             return Ok(None);
         }
-        let symbol = order.owner.symbol.clone();
         self.refresh_rules_for_symbols(std::iter::once(symbol.clone()))?;
         let rules = self.registered_rules(&symbol)?;
         let unknown = crate::BitgetUnknownMutation {
             binding: self.binding_for(&symbol),
             attempt_id: self.next_attempt_id()?,
             generation: rules.snapshot.metadata.instrument.generation,
-            kind: BitgetMutationKind::Place,
+            kind,
             order_id: None,
-            client_order_id: Some(order.client_order_id.as_str().to_owned()),
+            client_order_id: Some(client_order_id.to_owned()),
             dispatched_at_ms: 1,
             reason: crate::BitgetUnknownReason::AmbiguousResponse,
-            expected_time_in_force: Some(match order.time_in_force {
-                LimitTimeInForce::PostOnly => crate::BitgetTimeInForce::PostOnly,
-                LimitTimeInForce::Gtc => crate::BitgetTimeInForce::GoodTillCancelled,
-            }),
+            expected_time_in_force,
             expected_strategy: None,
         };
         let request = build_unknown_recovery_readback_request(
@@ -50,11 +67,11 @@ impl BitgetAccountGateway {
             return Ok(None);
         }
         Ok(Some(venue_execution::DurableOrderObservation {
-            client_order_id: order.client_order_id.as_str().to_owned(),
+            client_order_id: client_order_id.to_owned(),
             native_order_id: observed.order_id,
             state: observed.state,
             filled_quantity: observed.filled_quantity,
-            average_price: venue_domain::domain::FieldState::Missing,
+            average_price: observed.average_price,
             cumulative_fee: venue_domain::domain::FieldState::Missing,
         }))
     }

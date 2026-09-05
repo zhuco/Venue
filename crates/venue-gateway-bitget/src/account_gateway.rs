@@ -45,9 +45,8 @@ mod durable_execution;
 #[path = "snapshot_helpers.rs"]
 mod snapshot_helpers;
 use snapshot_helpers::{
-    require_uta_usdt_futures_row, snapshot_data, snapshot_data_rows, snapshot_decimal,
-    snapshot_fill_time, snapshot_order_facts, snapshot_position_facts,
-    snapshot_strategy_order_facts, snapshot_symbol,
+    require_uta_usdt_futures_row, snapshot_data, snapshot_data_rows, snapshot_fill_time,
+    snapshot_order_facts, snapshot_position_facts, snapshot_strategy_order_facts, snapshot_symbol,
 };
 
 const MAX_LIMIT_TICKER_AGE_MS: u64 = 5_000;
@@ -1039,40 +1038,8 @@ fn snapshot_fill(row: &Value) -> Result<Fill, AccountHostValidationError> {
         .as_object()
         .ok_or(AccountHostValidationError::SignedSnapshot)?;
     require_uta_usdt_futures_row(item).map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-    let id = item
-        .get("execId")
-        .and_then(Value::as_str)
-        .filter(|v| !v.is_empty())
-        .ok_or(AccountHostValidationError::SignedSnapshot)?
-        .to_owned();
-    let side = match item.get("side").and_then(Value::as_str) {
-        Some("buy") => OrderSide::Buy,
-        Some("sell") => OrderSide::Sell,
-        _ => return Err(AccountHostValidationError::SignedSnapshot),
-    };
-    Ok(Fill {
-        execution_sequence: id
-            .parse()
-            .map(FieldState::Known)
-            .map_err(|_| AccountHostValidationError::SignedSnapshot)?,
-        fill_id: id,
-        order_id: item
-            .get("orderId")
-            .and_then(Value::as_str)
-            .filter(|v| !v.is_empty())
-            .ok_or(AccountHostValidationError::SignedSnapshot)?
-            .to_owned(),
-        symbol: snapshot_symbol(item.get("symbol"))?,
-        side,
-        position_side: FieldState::Missing,
-        quantity: snapshot_decimal(item.get("execQty"))?,
-        price: Price::new(snapshot_decimal(item.get("execPrice"))?)
-            .map_err(|_| AccountHostValidationError::SignedSnapshot)?,
-        fee: FieldState::Missing,
-        realized_pnl: FieldState::Missing,
-        maker: FieldState::Missing,
-        exchange_time_ms: None,
-    })
+    let symbol = snapshot_symbol(item.get("symbol"))?;
+    crate::private::parse_fill(row, &symbol).map_err(|_| AccountHostValidationError::SignedSnapshot)
 }
 async fn snapshot_unknowns(
     transport: &BitgetHttpTransport,
@@ -1850,6 +1817,28 @@ mod tests {
         assert!(snapshot_fill_rows(&json!({"list": null})).is_ok_and(<[_]>::is_empty));
         assert!(snapshot_fill_rows(&json!({})).is_err());
         assert!(snapshot_fill_rows(&json!({"list": {}})).is_err());
+    }
+
+    #[test]
+    fn signed_snapshot_preserves_fill_fee_role_side_and_exchange_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fill = snapshot_fill(&json!({
+            "execId":"1001", "orderId":"9001", "category":"USDT-FUTURES",
+            "symbol":"BTCUSDT", "side":"buy", "holdSide":"long",
+            "execQty":"0.001", "execPrice":"100000",
+            "feeDetail":[{"feeCoin":"USDT", "fee":"-0.01"}],
+            "execPnl":"0.02", "tradeScope":"maker", "execTime":"1700000000000"
+        }))?;
+        assert_eq!(fill.position_side, FieldState::Known(PositionSide::Long));
+        assert_eq!(fill.maker, FieldState::Known(true));
+        assert_eq!(fill.exchange_time_ms, Some(1_700_000_000_000));
+        assert!(
+            matches!(fill.fee, FieldState::Known(ref fee) if fee.asset.as_str() == "USDT" && fee.value == Decimal::new(1, 2))
+        );
+        assert!(
+            matches!(fill.realized_pnl, FieldState::Known(ref pnl) if pnl.value == Decimal::new(2, 2))
+        );
+        Ok(())
     }
 
     #[test]
