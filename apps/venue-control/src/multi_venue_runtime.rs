@@ -303,9 +303,16 @@ impl MultiVenueExecutor {
                 ));
             }
             if !matches!(claim.command, venue_domain::ExecutionCommand::Cancel(_)) {
-                let market = match gateway.market_facts() {
+                let market = match gateway.market_facts_for_dispatch() {
                     Ok(market) => market,
-                    Err(_) => return Ok((pre_send_failure(false), Some(snapshot))),
+                    Err(reason) => {
+                        return Ok((
+                            AccountGatewayResult::Rejected {
+                                reason: reason.into(),
+                            },
+                            Some(snapshot),
+                        ));
+                    }
                 };
                 if !crate::multi_venue_risk::market_guard(
                     &claim.command,
