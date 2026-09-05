@@ -977,10 +977,7 @@ async fn snapshot_fills(
             .await
             .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
         let data = snapshot_data(&raw.payload)?;
-        let list = data
-            .get("list")
-            .and_then(Value::as_array)
-            .ok_or(AccountHostValidationError::SignedSnapshot)?;
+        let list = snapshot_fill_rows(&data)?;
         for row in list {
             let time_ms = snapshot_fill_time(row)?;
             if time_ms < requested_start_ms || time_ms > now {
@@ -1007,6 +1004,16 @@ async fn snapshot_fills(
 }
 
 const BITGET_FILL_CURSOR_OVERLAP_MS: u64 = 60_000;
+
+fn snapshot_fill_rows(data: &Value) -> Result<&[Value], AccountHostValidationError> {
+    match data.get("list") {
+        Some(Value::Array(rows)) => Ok(rows),
+        // Bitget returns an explicit null rather than an empty array when the selected window
+        // contains no fills. Missing or differently typed fields remain fail-closed.
+        Some(Value::Null) => Ok(&[]),
+        _ => Err(AccountHostValidationError::SignedSnapshot),
+    }
+}
 
 fn parse_snapshot_fills_cursor(
     value: Option<&str>,
@@ -1835,6 +1842,13 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn signed_snapshot_accepts_explicit_null_as_an_empty_fill_page() {
+        assert!(snapshot_fill_rows(&json!({"list": null})).is_ok_and(<[_]>::is_empty));
+        assert!(snapshot_fill_rows(&json!({})).is_err());
+        assert!(snapshot_fill_rows(&json!({"list": {}})).is_err());
     }
 
     #[test]

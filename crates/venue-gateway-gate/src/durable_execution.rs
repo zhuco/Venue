@@ -101,22 +101,28 @@ impl GateAccountGateway {
                 now_ms()?,
             ))
             .map_err(GateAccountGatewayError::Transport)?;
-        verify_key_permissions(&payload, &self.private.user_id)
+        verify_key_permissions(&payload, &self.private.user_id, self.credentials.api_key())
     }
 }
 
 fn verify_key_permissions(
     payload: &str,
     expected_user_id: &str,
+    expected_api_key: &str,
 ) -> Result<(), GateAccountGatewayError> {
     let root: Value =
         serde_json::from_str(payload).map_err(|_| GateAccountGatewayError::Readback)?;
-    let key = root.as_object().ok_or(GateAccountGatewayError::Readback)?;
+    let keys = root.as_array().ok_or(GateAccountGatewayError::Readback)?;
+    let mut matching = keys
+        .iter()
+        .filter(|key| key.get("key").and_then(Value::as_str) == Some(expected_api_key));
+    let key = matching.next().ok_or(GateAccountGatewayError::Readback)?;
+    if matching.next().is_some() {
+        return Err(GateAccountGatewayError::Readback);
+    }
+    let key = key.as_object().ok_or(GateAccountGatewayError::Readback)?;
     if key.get("state").and_then(Value::as_i64) != Some(1)
-        || key
-            .get("user_id")
-            .and_then(Value::as_i64)
-            .is_none_or(|value| value.to_string() != expected_user_id)
+        || !matches_gate_user_id(key.get("user_id"), expected_user_id)
     {
         return Err(GateAccountGatewayError::Readback);
     }
@@ -138,6 +144,14 @@ fn verify_key_permissions(
         Ok(())
     } else {
         Err(GateAccountGatewayError::Readback)
+    }
+}
+
+fn matches_gate_user_id(value: Option<&Value>, expected: &str) -> bool {
+    match value {
+        Some(Value::Number(value)) => value.to_string() == expected,
+        Some(Value::String(value)) => value == expected,
+        _ => false,
     }
 }
 
@@ -384,15 +398,18 @@ mod tests {
     #[test]
     fn gate_main_key_permissions_require_futures_write_without_withdrawal() {
         let payload = include_str!("../tests/fixtures/gate_account_main_keys.json");
-        assert!(verify_key_permissions(payload, "123").is_ok());
+        assert!(verify_key_permissions(payload, "123", "current-key").is_ok());
     }
 
     #[test]
-    fn gate_permissions_fail_closed_for_withdrawal_or_ambiguous_masks() {
-        let withdrawal = r#"{"state":1,"user_id":123,"perms":[{"name":"futures","read_only":false},{"name":"withdrawal","read_only":false}]}"#;
-        assert!(verify_key_permissions(withdrawal, "123").is_err());
-        let wrong_shape =
-            r#"[{"state":1,"user_id":123,"perms":[{"name":"futures","read_only":false}]}]"#;
-        assert!(verify_key_permissions(wrong_shape, "123").is_err());
+    fn gate_permissions_fail_closed_for_withdrawal_or_ambiguous_key_identity() {
+        let withdrawal = r#"[{"key":"current-key","state":1,"user_id":123,"perms":[{"name":"futures","read_only":false},{"name":"withdrawal","read_only":false}]}]"#;
+        assert!(verify_key_permissions(withdrawal, "123", "current-key").is_err());
+        let no_match = r#"[{"key":"other-key","state":1,"user_id":123,"perms":[{"name":"futures","read_only":false}]}]"#;
+        assert!(verify_key_permissions(no_match, "123", "current-key").is_err());
+        let duplicate = r#"[{"key":"current-key","state":1,"user_id":123,"perms":[{"name":"futures","read_only":false}]},{"key":"current-key","state":1,"user_id":123,"perms":[{"name":"futures","read_only":false}]}]"#;
+        assert!(verify_key_permissions(duplicate, "123", "current-key").is_err());
+        let wrong_shape = r#"{"key":"current-key","state":1,"user_id":123,"perms":[{"name":"futures","read_only":false}]}"#;
+        assert!(verify_key_permissions(wrong_shape, "123", "current-key").is_err());
     }
 }

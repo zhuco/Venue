@@ -66,6 +66,10 @@ impl GateCredentials {
         }
         digest.finalize().into()
     }
+
+    pub(crate) fn api_key(&self) -> &str {
+        self.api_key.expose_secret()
+    }
 }
 
 #[cfg(test)]
