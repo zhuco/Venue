@@ -43,6 +43,7 @@ mod durable_execution;
 /// Production OKX adapter for the lightweight account host. Base quantities remain canonical in
 /// the WAL; `build_place_request` converts them to contracts using ctVal × ctMult exactly once.
 const LIMIT_BBO_MAX_AGE_MS: u64 = 1_000;
+const LIMIT_BBO_MAX_CLOCK_SKEW_MS: u64 = 250;
 
 pub struct OkxAccountGateway {
     runtime: Runtime,
@@ -381,7 +382,7 @@ fn parse_limit_bbo(
         .parse::<u64>()
         .map_err(|_| OkxAccountGatewayError::Instrument)?;
     if exchange_time_ms == 0
-        || exchange_time_ms > response.received_at_ms
+        || exchange_time_ms > now_ms.saturating_add(LIMIT_BBO_MAX_CLOCK_SKEW_MS)
         || now_ms.saturating_sub(exchange_time_ms) > LIMIT_BBO_MAX_AGE_MS
     {
         return Err(OkxAccountGatewayError::Instrument);
@@ -1855,6 +1856,28 @@ mod tests {
         let mut wrong_leg = limit_intent(Decimal::new(6001, 0))?;
         wrong_leg.position_side = PositionSide::Net;
         assert!(normalize_limit_from_bbo(&config, &instrument, &wrong_leg, bbo).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn limit_bbo_accepts_only_bounded_exchange_clock_skew() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (config, instrument) = limit_config_and_instrument()?;
+        let skewed = crate::OkxHttpResponse {
+            body: bytes::Bytes::from_static(
+                br#"{"code":"0","data":[{"instId":"BTC-USDT-SWAP","bids":[["60000.09","20","0","3"]],"asks":[["60000.19","15","0","2"]],"ts":"10020"}]}"#,
+            ),
+            ..limit_bbo(&config)
+        };
+        assert!(parse_limit_bbo(&skewed, &config, &instrument, 10_010).is_ok());
+
+        let excessive = crate::OkxHttpResponse {
+            body: bytes::Bytes::from_static(
+                br#"{"code":"0","data":[{"instId":"BTC-USDT-SWAP","bids":[["60000.09","20","0","3"]],"asks":[["60000.19","15","0","2"]],"ts":"10261"}]}"#,
+            ),
+            ..limit_bbo(&config)
+        };
+        assert!(parse_limit_bbo(&excessive, &config, &instrument, 10_010).is_err());
         Ok(())
     }
 
