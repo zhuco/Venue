@@ -196,7 +196,7 @@ impl SupportMartingaleStore {
         owner: &str,
         instance_id: &str,
     ) -> Result<SupportMartingaleInstance, SupportMartingaleStoreError> {
-        let r = sqlx::query("SELECT * FROM venue_support_martingale_instances WHERE owner_user_id=$1 AND instance_id=$2").bind(owner).bind(instance_id).fetch_one(&self.pool).await.map_err(|_| SupportMartingaleStoreError::Conflict)?;
+        let r = sqlx::query("SELECT instance_id,owner_user_id,credential_id,trading_account_id,execution_venue,config,lifecycle,health,revision,reserved_budget::text AS reserved_budget FROM venue_support_martingale_instances WHERE owner_user_id=$1 AND instance_id=$2").bind(owner).bind(instance_id).fetch_one(&self.pool).await.map_err(|_| SupportMartingaleStoreError::Conflict)?;
         let config: SupportMartingaleConfig = serde_json::from_value(
             r.try_get("config")
                 .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
