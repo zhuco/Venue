@@ -1172,7 +1172,7 @@ fn validate_page_ids(ids: &[String], previous_after: Option<u128>) -> Result<(),
     Ok(())
 }
 
-fn semantic_reduce(
+pub(crate) fn semantic_reduce(
     mode: OkxPositionMode,
     leg: PositionSide,
     side: OrderSide,

@@ -1070,29 +1070,19 @@ fn collect_wide_orders(
         };
         let position_side =
             position_side_for(profile.position_mode(), text(row, "posSide")?, Decimal::ONE)?;
-        let raw_reduce_only = match text(row, "reduceOnly")? {
-            "true" => true,
-            "false" => false,
-            _ => return Err(OkxAccountGatewayError::Account),
-        };
         let price = optional_decimal(row, if algo { "orderPx" } else { "px" })?;
         let family = if algo && matches!(text(row, "ordType")?, "conditional" | "oco") {
             NativeOrderFamily::UmConditional
         } else {
             default_family
         };
-        let reduce_only = match profile.position_mode() {
-            OkxPositionMode::LongShort => {
-                if raw_reduce_only {
-                    return Err(OkxAccountGatewayError::Account);
-                }
-                matches!(
-                    (position_side, side),
-                    (PositionSide::Long, OrderSide::Sell) | (PositionSide::Short, OrderSide::Buy)
-                )
-            }
-            OkxPositionMode::Net => raw_reduce_only,
-        };
+        let reduce_only = crate::readback::semantic_reduce(
+            profile.position_mode(),
+            position_side,
+            side,
+            text(row, "reduceOnly")?,
+        )
+        .map_err(|_| OkxAccountGatewayError::Account)?;
         if !reduce_only {
             // A trigger market order has no bounded USDT value in this signed surface.  Treating
             // it as zero would understate aggregate account risk, so the whole observation fails.
@@ -1974,6 +1964,28 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn account_wide_orders_accept_consistent_hedge_reduce_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rules = parse_account_wide_rules(INSTRUMENT)?;
+        let profile = parse_account_profile(ACCOUNT_CONFIG, OkxPositionMode::LongShort)?;
+        let row = br#"{"code":"0","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","algoId":"8003","algoClOrdId":"conditional3","side":"sell","posSide":"long","sz":"2","ordType":"conditional","reduceOnly":"true","state":"live","orderPx":"","cTime":"1787911201400"}]}"#;
+        let mut orders = Vec::new();
+        let mut entries = Vec::new();
+        collect_wide_orders(
+            row,
+            NativeOrderFamily::UmAlgo,
+            &profile,
+            &rules,
+            &mut orders,
+            &mut entries,
+        )?;
+        assert_eq!(orders.len(), 1);
+        assert!(orders[0].reduce_only);
+        assert!(entries.is_empty());
         Ok(())
     }
 }
