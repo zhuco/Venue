@@ -1105,8 +1105,7 @@ fn snapshot_fills(
                 "Sell" => OrderSide::Sell,
                 _ => return Err(AccountHostValidationError::SignedSnapshot),
             };
-            let time = text(&row, "execTime")?
-                .parse::<u64>()
+            let time = unsigned_field(row.get("execTime"))
                 .ok()
                 .filter(|value| *value > 0 && *value <= raw.received_at_ms)
                 .ok_or(AccountHostValidationError::SignedSnapshot)?;
@@ -1115,8 +1114,7 @@ fn snapshot_fills(
             let fill = Fill {
                 fill_id: fill_id.clone(),
                 execution_sequence: FieldState::Known(
-                    text(&row, "seq")?
-                        .parse::<u64>()
+                    unsigned_field(row.get("seq"))
                         .ok()
                         .filter(|value| *value > 0)
                         .ok_or(AccountHostValidationError::SignedSnapshot)?,
@@ -1567,6 +1565,17 @@ fn decimal(
             .to_string()
             .parse()
             .map_err(|_| AccountHostValidationError::SignedSnapshot),
+        _ => Err(AccountHostValidationError::SignedSnapshot),
+    }
+}
+fn unsigned_field(value: Option<&serde_json::Value>) -> Result<u64, AccountHostValidationError> {
+    match value {
+        Some(serde_json::Value::String(value)) => value
+            .parse()
+            .map_err(|_| AccountHostValidationError::SignedSnapshot),
+        Some(serde_json::Value::Number(value)) => value
+            .as_u64()
+            .ok_or(AccountHostValidationError::SignedSnapshot),
         _ => Err(AccountHostValidationError::SignedSnapshot),
     }
 }

@@ -357,7 +357,7 @@ async fn fetch_settled_funding(
 ) -> Result<crate::BybitFundingReadback, BybitAccountGatewayError> {
     let window = query
         .window()
-        .map_err(|_| BybitAccountGatewayError::Readback)?;
+        .map_err(|_| BybitAccountGatewayError::ReadbackStage("funding_request"))?;
     let requested_cursor = query.cursor.clone();
     let mut cursor = requested_cursor.clone();
     let mut pages = Vec::new();
@@ -372,20 +372,73 @@ async fn fetch_settled_funding(
             Some(window.clone()),
             None,
         )
-        .map_err(|_| BybitAccountGatewayError::Readback)?;
+        .map_err(|_| BybitAccountGatewayError::ReadbackStage("funding_request"))?;
         let raw = execute_private(binding, credentials, transport, &request)
             .await
             .map_err(BybitAccountGatewayError::OrderTransport)?;
-        let page = crate::parse_funding_page(binding, &raw)
-            .map_err(|_| BybitAccountGatewayError::Readback)?;
+        let page = crate::parse_funding_page(binding, &raw).map_err(|error| {
+            BybitAccountGatewayError::ReadbackMismatch(format!(
+                "funding_page: {error}; {}",
+                funding_payload_summary(&raw.payload)
+            ))
+        })?;
         cursor = page.next_cursor.clone();
         pages.push(page);
         if cursor.is_none() {
-            return crate::complete_funding_pages(binding, &pages, requested_cursor)
-                .map_err(|_| BybitAccountGatewayError::Readback);
+            return crate::complete_funding_pages(binding, &pages, requested_cursor).map_err(
+                |error| {
+                    BybitAccountGatewayError::ReadbackMismatch(format!(
+                        "funding_page_closure: {error}"
+                    ))
+                },
+            );
         }
     }
     Err(BybitAccountGatewayError::Readback)
+}
+
+fn funding_payload_summary(payload: &[u8]) -> String {
+    let value = match serde_json::from_slice::<serde_json::Value>(payload) {
+        Ok(value) => value,
+        Err(_) => return "funding payload is not JSON".to_owned(),
+    };
+    let mut selected = serde_json::Map::new();
+    for key in ["retCode", "retMsg", "time"] {
+        if let Some(value) = value.get(key) {
+            selected.insert(key.to_owned(), value.clone());
+        }
+    }
+    if let Some(result) = value.get("result") {
+        if let Some(cursor) = result.get("nextPageCursor") {
+            selected.insert("nextPageCursor".to_owned(), cursor.clone());
+        }
+        if let Some(row) = result
+            .get("list")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(serde_json::Value::as_object)
+        {
+            let fields = [
+                "id",
+                "symbol",
+                "category",
+                "transactionTime",
+                "type",
+                "currency",
+                "funding",
+                "change",
+                "cashFlow",
+            ]
+            .into_iter()
+            .filter_map(|key| row.get(key).cloned().map(|value| (key.to_owned(), value)))
+            .collect::<serde_json::Map<_, _>>();
+            selected.insert("firstRow".to_owned(), serde_json::Value::Object(fields));
+        }
+    }
+    match serde_json::to_string(&selected) {
+        Ok(summary) => summary,
+        Err(_) => "funding fields could not be summarized".to_owned(),
+    }
 }
 
 fn aggregate_market_fills(
