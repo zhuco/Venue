@@ -270,7 +270,9 @@ pub(crate) fn parse_algo_detail(
             .expected_algo_id
             .as_deref()
             .is_some_and(|id| id != row.algo_id)
-        || !matches!(row.reduce_only.as_str(), "" | "false")
+        // Hedge requests omit reduceOnly and bind reduction through side + posSide. OKX may
+        // project either boolean value on the resulting conditional order.
+        || !matches!(row.reduce_only.as_str(), "" | "false" | "true")
         || !row.close_fraction.is_empty()
     {
         return Err(OkxError::Binding);
@@ -609,6 +611,19 @@ mod tests {
         )?
         .ok_or(OkxError::Payload)?;
         assert_eq!(detail.state, OkxAlgoState::Working);
+        let fixture = include_bytes!("../fixtures/algo-detail-live-sl.json");
+        let projected = String::from_utf8(fixture.to_vec())?
+            .replace(r#""reduceOnly":"false""#, r#""reduceOnly":"true""#);
+        let projected = OkxHttpResponse {
+            body: Bytes::from(projected),
+            ..response(&config, fixture)
+        };
+        assert_eq!(
+            parse_algo_detail(projected, &lookup)?
+                .ok_or(OkxError::Payload)?
+                .state,
+            OkxAlgoState::Working
+        );
         let cancel = build_algo_cancel_request(&lookup, &id)?;
         let cancel_body: serde_json::Value = serde_json::from_slice(cancel.body())?;
         assert_eq!(
