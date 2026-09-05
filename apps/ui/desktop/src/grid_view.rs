@@ -240,6 +240,102 @@ impl GridViewState {
     }
 }
 
+pub(crate) fn visible_instances(model: &AppModel, account_id: &str) -> Vec<GridInstanceSummary> {
+    let current_symbol = model
+        .execution
+        .current_symbol
+        .then(|| model.preferences.selected_symbol.clone());
+    model
+        .execution
+        .grid
+        .instances
+        .iter()
+        .filter(|instance| {
+            instance.trading_account_id == account_id
+                && current_symbol
+                    .as_ref()
+                    .is_none_or(|symbol| instance.symbol.to_string() == *symbol)
+        })
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn open_create(model: &mut AppModel, credential: &CredentialSummary) {
+    model.execution.grid.mutation_error = None;
+    model.execution.grid.editor = Some(GridEditor::create(
+        &model.preferences.selected_symbol,
+        &credential.credential_id,
+    ));
+}
+
+pub(crate) fn open_update(model: &mut AppModel, instance: &GridInstanceSummary) {
+    if config_editable(instance.state) && !model.execution.grid.pending {
+        model.execution.grid.mutation_error = None;
+        model.execution.grid.selected_instance_id = Some(instance.instance_id.clone());
+        model.execution.grid.editor = Some(GridEditor::update(instance));
+    }
+}
+
+pub(crate) fn select(model: &mut AppModel, instance_id: &str) {
+    model.execution.grid.selected_instance_id = Some(instance_id.to_owned());
+}
+
+pub(crate) fn clear_selection(model: &mut AppModel) {
+    model.execution.grid.selected_instance_id = None;
+}
+
+pub(crate) fn close_editor(model: &mut AppModel) {
+    model.execution.grid.editor = None;
+}
+
+pub(crate) fn is_selected(model: &AppModel, instance_id: &str) -> bool {
+    model.execution.grid.selected_instance_id.as_deref() == Some(instance_id)
+}
+
+pub(crate) fn pending(model: &AppModel) -> bool {
+    model.execution.grid.pending
+}
+
+pub(crate) fn editable(state: GridInstanceState) -> bool {
+    config_editable(state)
+}
+
+pub(crate) fn state_presentation(state: GridInstanceState) -> (&'static str, egui::Color32) {
+    match state {
+        GridInstanceState::Draft => ("草稿", theme::TEXT_SECONDARY),
+        GridInstanceState::StartPending => ("正在启动", theme::WARNING),
+        GridInstanceState::Running => ("运行中", theme::BUY),
+        GridInstanceState::Paused => ("已暂停", theme::TEXT_SECONDARY),
+        GridInstanceState::StopPending => ("正在停止", theme::SELL),
+        GridInstanceState::Stopped => ("已停止", theme::TEXT_SECONDARY),
+        GridInstanceState::Blocked => ("已阻塞", theme::WARNING),
+        GridInstanceState::ResetRequired => ("需要重置", theme::WARNING),
+        GridInstanceState::NeedsAttention => ("需要处理", theme::WARNING),
+    }
+}
+
+pub(crate) fn show_management(
+    ui: &mut egui::Ui,
+    model: &mut AppModel,
+    client: &ControlClient,
+    credential: &CredentialSummary,
+    visible: &[GridInstanceSummary],
+) {
+    let credential_ready = credential.selectable(crate::account_center::now_ms());
+    let mut action = None;
+    if let Some(error) = &model.execution.grid.mutation_error {
+        ui.colored_label(theme::WARNING, error);
+    }
+    if let Some(error) = &model.execution.grid.refresh_error {
+        ui.colored_label(theme::WARNING, error);
+    }
+    lifecycle_controls(ui, model, visible, credential_ready, &mut action);
+    editor(ui, model, credential, credential_ready, &mut action);
+    if let Some(action) = action {
+        dispatch(model, client, credential, action);
+    }
+}
+
 enum UiAction {
     Create {
         symbol: String,
@@ -255,167 +351,6 @@ enum UiAction {
         revision: u64,
         action: GridLifecycleAction,
     },
-}
-
-pub fn show(
-    ui: &mut egui::Ui,
-    model: &mut AppModel,
-    client: &ControlClient,
-    credential: &CredentialSummary,
-    account_id: &str,
-) {
-    let language = model.preferences.language;
-    let credential_ready = credential.selectable(crate::account_center::now_ms());
-    let current_symbol = model
-        .execution
-        .current_symbol
-        .then(|| model.preferences.selected_symbol.clone());
-    let visible = model
-        .execution
-        .grid
-        .instances
-        .iter()
-        .filter(|instance| {
-            instance.trading_account_id == account_id
-                && current_symbol
-                    .as_ref()
-                    .is_none_or(|symbol| instance.symbol.to_string() == *symbol)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut action = None;
-    ui.horizontal(|ui| {
-        ui.strong(format!("{} · Binance", credential.label));
-        if ui
-            .add_enabled(
-                credential_ready && !model.execution.grid.pending,
-                egui::Button::new(tr(language, "新建 Grid", "New Grid")),
-            )
-            .on_disabled_hover_text(tr(
-                language,
-                "需要已验证且可用的 Binance 双向持仓账户",
-                "A verified and reachable Binance hedge account is required",
-            ))
-            .clicked()
-        {
-            model.execution.grid.mutation_error = None;
-            model.execution.grid.editor = Some(GridEditor::create(
-                &model.preferences.selected_symbol,
-                &credential.credential_id,
-            ));
-        }
-        let selected = selected_visible_instance(&model.execution.grid, &visible).cloned();
-        if ui
-            .add_enabled(
-                selected
-                    .as_ref()
-                    .is_some_and(|instance| config_editable(instance.state))
-                    && !model.execution.grid.pending,
-                egui::Button::new(tr(language, "编辑配置", "Edit config")),
-            )
-            .on_disabled_hover_text(tr(
-                language,
-                "只能编辑当前账户、当前筛选范围内且非过渡状态的实例",
-                "Only the visible instance for this account can be edited outside transition states",
-            ))
-            .clicked()
-            && let Some(instance) = selected
-        {
-            model.execution.grid.mutation_error = None;
-            model.execution.grid.editor = Some(GridEditor::update(&instance));
-        }
-        if model.execution.grid.pending {
-            ui.spinner();
-            ui.weak(tr(language, "等待 Control 确认", "Waiting for Control"));
-        }
-    });
-    if let Some(error) = &model.execution.grid.mutation_error {
-        ui.colored_label(theme::WARNING, error);
-    }
-    if let Some(error) = &model.execution.grid.refresh_error {
-        ui.colored_label(theme::WARNING, error);
-    }
-
-    ui.add_space(4.0);
-    new_grid_table(ui, model, &visible);
-    lifecycle_controls(ui, model, &visible, credential_ready, &mut action);
-    editor(ui, model, credential, credential_ready, &mut action);
-
-    if let Some(action) = action {
-        dispatch(model, client, credential, action);
-    }
-}
-
-fn new_grid_table(ui: &mut egui::Ui, model: &mut AppModel, instances: &[GridInstanceSummary]) {
-    let language = model.preferences.language;
-    ui.weak(tr(language, "Binance 对冲网格", "Binance hedge Grid"));
-    egui::ScrollArea::horizontal()
-        .id_salt("binance-grid-instances")
-        .show(ui, |ui| {
-            egui::Grid::new("binance-grid-table")
-                .striped(true)
-                .spacing([14.0, 7.0])
-                .show(ui, |ui| {
-                    for heading in [
-                        tr(language, "账户", "Account"),
-                        tr(language, "交易对", "Symbol"),
-                        tr(language, "实例", "Instance"),
-                        tr(language, "状态", "State"),
-                        tr(
-                            language,
-                            "账户交易对 PnL / 注意",
-                            "Account-symbol PnL / attention",
-                        ),
-                        tr(language, "版本", "Revision"),
-                        tr(language, "更新", "Updated"),
-                    ] {
-                        ui.weak(heading);
-                    }
-                    ui.end_row();
-                    for instance in instances {
-                        ui.label(instance_credential_label(model, &instance.credential_id));
-                        if ui.link(instance.symbol.to_string()).clicked() {
-                            model.select_symbol(instance.symbol.to_string());
-                            model.follow_latest_requested = true;
-                        }
-                        let selected = model.execution.grid.selected_instance_id.as_deref()
-                            == Some(instance.instance_id.as_str());
-                        if ui
-                            .selectable_label(selected, short_id(&instance.instance_id))
-                            .on_hover_text(&instance.instance_id)
-                            .clicked()
-                        {
-                            model.execution.grid.selected_instance_id =
-                                Some(instance.instance_id.clone());
-                        }
-                        state_label(ui, instance.state);
-                        if let Some(attention) = &instance.attention_code {
-                            attention_label(ui, language, attention);
-                        } else if let Some(pnl) = grid_pnl(model, instance) {
-                            pnl_label(ui, pnl).on_hover_text(tr(
-                                language,
-                                "来自签名账户投影的该交易对双腿未实现盈亏；不表示单个 Grid 的独立归因",
-                                "Signed account-symbol unrealized PnL across both legs; not per-grid attribution",
-                            ));
-                        } else {
-                            ui.weak("—");
-                        }
-                        ui.monospace(format!(
-                            "{} / {}",
-                            instance.config_revision, instance.plan_revision
-                        ));
-                        ui.weak(timestamp(instance.updated_ms));
-                        ui.end_row();
-                    }
-                });
-        });
-    if instances.is_empty() {
-        ui.weak(tr(
-            language,
-            "该账户暂无新 Grid 实例，可从当前交易对创建。",
-            "No new Grid instance for this account; create one for the current symbol.",
-        ));
-    }
 }
 
 fn instance_credential_label(model: &AppModel, credential_id: &str) -> String {
@@ -796,6 +731,7 @@ fn dispatch(
     }
 }
 
+#[cfg(test)]
 fn selected_visible_instance<'a>(
     state: &GridViewState,
     visible: &'a [GridInstanceSummary],
@@ -875,7 +811,7 @@ fn lifecycle_enabled(
     }
 }
 
-fn grid_pnl(model: &AppModel, instance: &GridInstanceSummary) -> Option<Decimal> {
+pub(crate) fn grid_pnl(model: &AppModel, instance: &GridInstanceSummary) -> Option<Decimal> {
     if !model.execution.private_ready(
         Some(&instance.trading_account_id),
         crate::account_center::now_ms(),
@@ -915,7 +851,7 @@ fn account_symbol_pnl(
     Some(result)
 }
 
-fn pnl_label(ui: &mut egui::Ui, value: Decimal) -> egui::Response {
+pub(crate) fn pnl_label(ui: &mut egui::Ui, value: Decimal) -> egui::Response {
     let color = if value.is_sign_negative() {
         theme::SELL
     } else {
@@ -924,7 +860,7 @@ fn pnl_label(ui: &mut egui::Ui, value: Decimal) -> egui::Response {
     ui.colored_label(color, crate::model::format_decimal(value, 4))
 }
 
-fn attention_label(ui: &mut egui::Ui, language: Language, code: &str) {
+pub(crate) fn attention_label(ui: &mut egui::Ui, language: Language, code: &str) {
     let label = match code {
         "market_unavailable" | "market_stale" | "market_invalid" => {
             tr(language, "行情事实不可用", "Market facts unavailable")
@@ -960,21 +896,6 @@ fn attention_label(ui: &mut egui::Ui, language: Language, code: &str) {
     ui.colored_label(theme::WARNING, label);
 }
 
-fn state_label(ui: &mut egui::Ui, state: GridInstanceState) {
-    let color = match state {
-        GridInstanceState::Running => theme::BUY,
-        GridInstanceState::Blocked
-        | GridInstanceState::ResetRequired
-        | GridInstanceState::NeedsAttention => theme::WARNING,
-        GridInstanceState::StopPending => theme::SELL,
-        GridInstanceState::Draft
-        | GridInstanceState::StartPending
-        | GridInstanceState::Paused
-        | GridInstanceState::Stopped => theme::TEXT_SECONDARY,
-    };
-    ui.colored_label(color, format!("{state:?}"));
-}
-
 fn input(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.label(label);
     ui.add_sized([120.0, 24.0], egui::TextEdit::singleline(value));
@@ -994,14 +915,6 @@ fn integer<T: std::str::FromStr>(value: &str, label: &str) -> Result<T, String> 
 
 fn number(value: Decimal) -> String {
     value.normalize().to_string()
-}
-
-fn short_id(value: &str) -> &str {
-    value.get(..8).unwrap_or(value)
-}
-
-fn timestamp(ms: u64) -> String {
-    crate::chart::format_timeline_label(ms, crate::chart::ChartInterval::OneHour)
 }
 
 fn tr<'a>(language: Language, chinese: &'a str, english: &'a str) -> &'a str {

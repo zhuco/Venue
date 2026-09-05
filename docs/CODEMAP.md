@@ -16,7 +16,7 @@ Control 部署由 `bin/venue-control-server.rs` 用迁移身份验证 schema，�
 
 更新：2026-09-04
 
-带单机器人与挂单同步入口：`apps/venue-control/src/accounts/leader_bot.rs` 管理本人实例与启停，`leader_bot_admin.rs` 和 `bin/venue-leader-bot-admin.rs` 管理默认拒绝的用户授权；`order_mirror/{planner,store,settlement}.rs` 保存源/子单映射、先撤后挂和精确对账。协议在 `crates/venue-control-protocol/src/leader_bot.rs`，迁移为 `0028`/`0029`，版本化安装在 `schema.rs`。桌面入口 `leader_bot_view.rs` 使用创建确认对话框；`grid_view.rs` 提供 Grid 新建与编辑配置对话框；`ui/status_bar.rs` 区分连接失败与事实过期。用户 Web `/`、`/join/[invite_code]` 与 `lib/customer-server.ts`；运营控制台位于 `/ops`。契约见 [LEADER_ORDER_MIRROR](LEADER_ORDER_MIRROR.md)，实库回归见 `tests/support/leader_order_mirror.rs`。
+带单机器人与挂单同步入口：`apps/venue-control/src/accounts/leader_bot.rs` 管理本人最多 20 条私有配置及单活动实例生命周期，`leader_bot_admin.rs` 和 `bin/venue-leader-bot-admin.rs` 管理默认拒绝的用户授权；`order_mirror/{planner,store,settlement}.rs` 保存源/子单映射、先撤后挂和精确对账。协议在 `crates/venue-control-protocol/src/leader_bot.rs`，迁移为 `0028`/`0029`/`0034`，版本化安装在 `schema.rs`。桌面 `leader_bot_view.rs` 与 `grid_view.rs` 组成统一内置机器人列表及类型专属编辑/生命周期面板；本阶段无策略广场。用户 Web `/`、`/join/[invite_code]` 与 `lib/customer-server.ts` 继续使用兼容单实例接口；运营控制台位于 `/ops`。契约见 [LEADER_ORDER_MIRROR](LEADER_ORDER_MIRROR.md)，实库回归见 `tests/support/leader_order_mirror.rs`。
 
 Grid 拒单恢复位于 `apps/venue-control/src/grid_store/rejection.rs`：从当前配置代的命令账本读取首次明确 Binance 拒单时间，30 秒期限不随重试、滚动、短暂收敛或进程重启延后。`grid_store/convergence.rs` 管理倒计时与独立的重置阶段计时；`grid_runtime/driver.rs` 在持续私流下仍检查期限，`grid_runtime/reconcile.rs` 批量修复明确失败的目标、继续补撤，并在撤净确认后清除旧收敛计时。实库回归位于 `grid_runtime/reconcile_tests.rs` 与 `tests/support/grid_rejection_recovery.rs`。
 

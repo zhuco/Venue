@@ -4,7 +4,7 @@ use venue_control_protocol::leader_bot::*;
 
 pub(super) async fn fetch(client: &reqwest::Client, endpoint: &str) -> ClientEvent {
     response(
-        client.get(path(endpoint, LEADER_BOT_PATH)).send().await,
+        client.get(path(endpoint, LEADER_BOTS_PATH)).send().await,
         false,
     )
     .await
@@ -17,14 +17,21 @@ pub(super) async fn submit(
     let result = match mutation {
         GridMutation::LeaderCreate(request) => {
             client
-                .post(path(endpoint, LEADER_BOT_PATH))
+                .post(path(endpoint, LEADER_BOTS_PATH))
+                .json(request)
+                .send()
+                .await
+        }
+        GridMutation::LeaderUpdate(request) => {
+            client
+                .post(path(endpoint, LEADER_BOTS_UPDATE_PATH))
                 .json(request)
                 .send()
                 .await
         }
         GridMutation::LeaderLifecycle(request) => {
             client
-                .post(path(endpoint, LEADER_BOT_LIFECYCLE_PATH))
+                .post(path(endpoint, LEADER_BOTS_LIFECYCLE_PATH))
                 .json(request)
                 .send()
                 .await
@@ -88,10 +95,10 @@ async fn response(
         }
         body.extend_from_slice(&chunk);
     }
-    let Ok(access) = serde_json::from_slice::<LeaderBotAccess>(&body) else {
+    let Ok(access) = serde_json::from_slice::<LeaderBotsAccess>(&body) else {
         return unavailable(mutation, "带单响应无效");
     };
-    if access.schema_version != LEADER_BOT_SCHEMA_VERSION {
+    if !access.valid() {
         return unavailable(mutation, "带单协议版本不匹配");
     }
     if mutation {

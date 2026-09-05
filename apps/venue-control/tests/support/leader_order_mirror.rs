@@ -224,6 +224,192 @@ async fn order_mirror_plans_once_and_revocation_cancels_only_definitely_unsent_c
 }
 
 #[tokio::test]
+async fn leader_bot_catalog_allows_same_account_presets_and_only_one_active_bot()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(url) = integration_database_url()? else {
+        return Ok(());
+    };
+    let fixture = Fixture::create(&url).await?;
+    fixture.migrate_twice().await?;
+    let service = AccountService::new_with_node_token(
+        fixture.pool.clone(),
+        CredentialCipher::from_key(&[13; 32])?,
+        None,
+    )?;
+    let now = test_now_ms()?;
+    let session = service
+        .register(
+            LoginRequest {
+                username: "leader-catalog".into(),
+                password: SecretValue::new("leader catalog fixture password".into()),
+            },
+            now,
+        )
+        .await?;
+    let principal = service
+        .authenticate(session.token.expose(), now + 1)
+        .await?;
+    let user = &principal.user.user_id;
+    let account = id(9051);
+    let credential = id(9052);
+    provision_account(&fixture.pool, user, &account, &credential, 64).await?;
+    insert_kol_profile(&fixture.pool, user, &account, 1).await?;
+    set_permission(&fixture.pool, user, true, 0, "fixture-admin", now + 2).await?;
+
+    let first_request = LeaderBotConfiguredCreateRequest {
+        schema_version: LEADER_BOTS_SCHEMA_VERSION,
+        request_id: id(9053),
+        credential_id: credential.clone(),
+        config: LeaderBotConfig {
+            name: "稳健带单".into(),
+            description: "第一套配置".into(),
+            strategy_capital: Decimal::from(100),
+        },
+    };
+    service
+        .create_configured_leader_bot(&principal, first_request, now + 3)
+        .await?;
+    let second_request = LeaderBotConfiguredCreateRequest {
+        schema_version: LEADER_BOTS_SCHEMA_VERSION,
+        request_id: id(9054),
+        credential_id: credential.clone(),
+        config: LeaderBotConfig {
+            name: "积极带单".into(),
+            description: "第二套配置".into(),
+            strategy_capital: Decimal::from(200),
+        },
+    };
+    let created = service
+        .create_configured_leader_bot(&principal, second_request.clone(), now + 4)
+        .await?;
+    assert_eq!(created.bots.len(), 2);
+    assert!(
+        created
+            .bots
+            .iter()
+            .all(|bot| bot.trading_account_id == account)
+    );
+    assert_eq!(
+        created,
+        service
+            .create_configured_leader_bot(&principal, second_request, now + 5)
+            .await?
+    );
+
+    let second = created
+        .bots
+        .iter()
+        .find(|bot| bot.config.name == "积极带单")
+        .ok_or("second configured bot missing")?;
+    let update = LeaderBotUpdateRequest {
+        schema_version: LEADER_BOTS_SCHEMA_VERSION,
+        request_id: id(9055),
+        bot_id: second.bot_id.clone(),
+        expected_revision: second.revision,
+        credential_id: credential.clone(),
+        config: LeaderBotConfig {
+            name: "积极带单 2".into(),
+            description: "已编辑".into(),
+            strategy_capital: Decimal::from(250),
+        },
+    };
+    let updated = service
+        .update_leader_bot(&principal, update.clone(), now + 6)
+        .await?;
+    assert!(updated.bots.iter().any(|bot| {
+        bot.bot_id == second.bot_id
+            && bot.config.name == "积极带单 2"
+            && bot.config_revision == second.config_revision + 1
+    }));
+    let mut stale = update;
+    stale.request_id = id(9056);
+    assert_eq!(
+        service
+            .update_leader_bot(&principal, stale, now + 7)
+            .await
+            .err()
+            .ok_or("stale update admitted")?
+            .code,
+        AccountErrorCode::Conflict
+    );
+
+    let first = updated
+        .bots
+        .iter()
+        .find(|bot| bot.config.name == "稳健带单")
+        .ok_or("first configured bot missing")?;
+    let running = service
+        .request_leader_bots_lifecycle(
+            &principal,
+            LeaderBotLifecycleRequest {
+                schema_version: LEADER_BOT_SCHEMA_VERSION,
+                request_id: id(9057),
+                bot_id: first.bot_id.clone(),
+                expected_revision: first.revision,
+                action: LeaderBotAction::Start,
+                risk_confirmed: true,
+            },
+            now + 8,
+        )
+        .await?;
+    let second = running
+        .bots
+        .iter()
+        .find(|bot| bot.config.name == "积极带单 2")
+        .ok_or("updated second bot missing")?;
+    assert_eq!(
+        service
+            .request_leader_bots_lifecycle(
+                &principal,
+                LeaderBotLifecycleRequest {
+                    schema_version: LEADER_BOT_SCHEMA_VERSION,
+                    request_id: id(9058),
+                    bot_id: second.bot_id.clone(),
+                    expected_revision: second.revision,
+                    action: LeaderBotAction::Start,
+                    risk_confirmed: true,
+                },
+                now + 9,
+            )
+            .await
+            .err()
+            .ok_or("second active bot admitted")?
+            .code,
+        AccountErrorCode::AccountInUse
+    );
+    let first = running
+        .bots
+        .iter()
+        .find(|bot| bot.config.name == "稳健带单")
+        .ok_or("running first bot missing")?;
+    let draining = service
+        .request_leader_bots_lifecycle(
+            &principal,
+            LeaderBotLifecycleRequest {
+                schema_version: LEADER_BOT_SCHEMA_VERSION,
+                request_id: id(9059),
+                bot_id: first.bot_id.clone(),
+                expected_revision: first.revision,
+                action: LeaderBotAction::Stop,
+                risk_confirmed: false,
+            },
+            now + 10,
+        )
+        .await?;
+    assert_eq!(
+        draining
+            .bots
+            .iter()
+            .find(|bot| bot.bot_id == first.bot_id)
+            .ok_or("draining bot missing")?
+            .state,
+        LeaderBotState::Draining
+    );
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn fixed_notional_mirror_uses_persisted_sizing_and_keeps_reconciliation_fences()
 -> Result<(), Box<dyn std::error::Error>> {
     mirror_sizing_and_revocation(true).await
@@ -275,7 +461,7 @@ async fn mirror_sizing_and_revocation(fixed: bool) -> Result<(), Box<dyn std::er
             .execute(&fixture.pool).await?;
     }
     set_permission(&fixture.pool, &kol, true, 0, "fixture", now).await?;
-    sqlx::query("INSERT INTO venue_leader_bots(bot_id,owner_user_id,trading_account_id,credential_id,create_request_id,bot_state,revision,permission_revision,started_ms,created_ms,updated_ms) VALUES ($1,$2,$3,$4,$1,'running',1,1,$5,$5,$5)").bind(&bot).bind(&kol).bind(&leader_account).bind(&leader_credential).bind(i64::try_from(now-10)?).execute(&fixture.pool).await?;
+    sqlx::query("INSERT INTO venue_leader_bots(bot_id,owner_user_id,trading_account_id,credential_id,create_request_id,bot_name,bot_description,strategy_capital,bot_state,revision,permission_revision,started_ms,created_ms,updated_ms) VALUES ($1,$2,$3,$4,$1,'Fixture KOL','','100','running',1,1,$5,$5,$5)").bind(&bot).bind(&kol).bind(&leader_account).bind(&leader_credential).bind(i64::try_from(now-10)?).execute(&fixture.pool).await?;
     let order = serde_json::json!({"client_order_id":"source-client","native_order_id":"123","symbol":"BTC/USDT","order_side":OrderSide::Buy,"position_side":PositionSide::Long,"quantity":"0.001","filled_quantity":"0","limit_price":"50000","post_only":true,"time_in_force":"post_only","reduce_only":false,"state":"new","created_ms":now-1});
     let mut gtc = order.clone();
     gtc["native_order_id"] = "124".into();

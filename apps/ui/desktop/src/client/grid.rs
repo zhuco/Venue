@@ -13,7 +13,8 @@ pub(crate) enum GridMutation {
     Create(GridInstanceCreateRequest),
     Update(GridConfigUpdateRequest),
     Lifecycle(GridLifecycleRequest),
-    LeaderCreate(venue_control_protocol::leader_bot::LeaderBotCreateRequest),
+    LeaderCreate(venue_control_protocol::leader_bot::LeaderBotConfiguredCreateRequest),
+    LeaderUpdate(venue_control_protocol::leader_bot::LeaderBotUpdateRequest),
     LeaderLifecycle(venue_control_protocol::leader_bot::LeaderBotLifecycleRequest),
 }
 
@@ -24,6 +25,7 @@ impl GridMutation {
             Self::Update(request) => request.validate().is_ok(),
             Self::Lifecycle(request) => request.validate().is_ok(),
             Self::LeaderCreate(request) => request.valid(),
+            Self::LeaderUpdate(request) => request.valid(),
             Self::LeaderLifecycle(request) => request.valid(),
         }
     }
@@ -32,9 +34,10 @@ impl GridMutation {
         match self {
             Self::Create(_) | Self::Update(_) => GRID_INSTANCES_PATH,
             Self::Lifecycle(_) => GRID_LIFECYCLE_PATH,
-            Self::LeaderCreate(_) => venue_control_protocol::leader_bot::LEADER_BOT_PATH,
+            Self::LeaderCreate(_) => venue_control_protocol::leader_bot::LEADER_BOTS_PATH,
+            Self::LeaderUpdate(_) => venue_control_protocol::leader_bot::LEADER_BOTS_UPDATE_PATH,
             Self::LeaderLifecycle(_) => {
-                venue_control_protocol::leader_bot::LEADER_BOT_LIFECYCLE_PATH
+                venue_control_protocol::leader_bot::LEADER_BOTS_LIFECYCLE_PATH
             }
         }
     }
@@ -46,7 +49,7 @@ impl GridMutation {
             }
             Self::Update(request) => summary.instance_id == request.instance_id,
             Self::Lifecycle(request) => summary.instance_id == request.instance_id,
-            Self::LeaderCreate(_) | Self::LeaderLifecycle(_) => false,
+            Self::LeaderCreate(_) | Self::LeaderUpdate(_) | Self::LeaderLifecycle(_) => false,
         }
     }
 }
@@ -90,7 +93,9 @@ async fn submit(
         GridMutation::Create(request) => builder.json(request),
         GridMutation::Update(request) => builder.json(request),
         GridMutation::Lifecycle(request) => builder.json(request),
-        GridMutation::LeaderCreate(_) | GridMutation::LeaderLifecycle(_) => {
+        GridMutation::LeaderCreate(_)
+        | GridMutation::LeaderUpdate(_)
+        | GridMutation::LeaderLifecycle(_) => {
             return Err(mutation_unavailable("wrong mutation route"));
         }
     }
@@ -236,7 +241,9 @@ pub(super) fn start_native(
             for mutation in mutations.try_iter().take(16) {
                 if matches!(
                     mutation,
-                    GridMutation::LeaderCreate(_) | GridMutation::LeaderLifecycle(_)
+                    GridMutation::LeaderCreate(_)
+                        | GridMutation::LeaderUpdate(_)
+                        | GridMutation::LeaderLifecycle(_)
                 ) {
                     let event = match tokio::time::timeout(
                         super::REQUEST_TIMEOUT,
@@ -311,7 +318,9 @@ pub(super) fn start_web(
             for mutation in mutations.try_iter().take(16) {
                 if matches!(
                     mutation,
-                    GridMutation::LeaderCreate(_) | GridMutation::LeaderLifecycle(_)
+                    GridMutation::LeaderCreate(_)
+                        | GridMutation::LeaderUpdate(_)
+                        | GridMutation::LeaderLifecycle(_)
                 ) {
                     let event = super::leader_bot::submit(&client, &endpoint, &mutation).await;
                     publish(&sender, &context, event);
