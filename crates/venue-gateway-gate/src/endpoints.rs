@@ -19,6 +19,7 @@ pub const FUTURES_ORDER: &str = "/futures/usdt/orders";
 pub const FUTURES_PRICE_ORDERS: &str = "/futures/usdt/price_orders";
 pub const FUTURES_OPEN_ORDERS: &str = "/futures/usdt/orders";
 pub const FUTURES_FILLS: &str = "/futures/usdt/my_trades";
+pub const FUTURES_FILLS_TIMERANGE: &str = "/futures/usdt/my_trades_timerange";
 
 pub(crate) fn canonical_rest_path(endpoint: &str) -> Result<String, GateProtocolError> {
     if !endpoint.starts_with('/')

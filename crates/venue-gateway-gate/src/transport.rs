@@ -960,6 +960,32 @@ pub async fn connect_private_ws(
     {
         return Err(GateTransportError::Binding);
     }
+    connect_private_ws_for_identity(
+        binding,
+        credentials,
+        rules,
+        &private.user_id,
+        private.generation,
+        limits,
+    )
+    .await
+}
+
+pub(crate) async fn connect_private_ws_for_identity(
+    binding: &GateGatewayBinding,
+    credentials: &GateCredentials,
+    rules: &GateContractRules,
+    user_id: &str,
+    generation: u64,
+    limits: GateTransportLimits,
+) -> Result<GatePrivateWsTransport, GateTransportError> {
+    if generation == 0
+        || generation != rules.instrument.generation
+        || user_id.is_empty()
+        || rules.instrument.symbol != binding.gateway_binding().symbol
+    {
+        return Err(GateTransportError::Binding);
+    }
     let endpoint = binding.config().usdt_futures_ws().to_owned();
     let mut request = endpoint
         .clone()
@@ -984,8 +1010,8 @@ pub async fn connect_private_ws(
         binding,
         credentials,
         rules,
-        &private.user_id,
-        private.generation,
+        user_id,
+        generation,
         limits,
         Some(binding.config().rest_origin().to_owned()),
     )

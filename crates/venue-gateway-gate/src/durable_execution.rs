@@ -184,7 +184,7 @@ impl GateAccountGateway {
                     .and_then(|value| value.target_native_order_id.clone())
                     .or_else(|| {
                         regular_venue_order_id_for_client_id(
-                            &self.private.order_families.regular().orders,
+                            &self.private.regular_orders,
                             command.target_client_order_id.as_str(),
                         )
                     });

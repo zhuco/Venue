@@ -355,7 +355,10 @@ fn private_request_parts(
             }
             (
                 endpoints::POSITIONS,
-                format!("category={LINEAR}&limit={POSITION_PAGE_LIMIT}"),
+                format!(
+                    "category={LINEAR}&settleCoin={}&limit={POSITION_PAGE_LIMIT}",
+                    binding.gateway_binding().symbol.quote()
+                ),
             )
         }
         BybitPrivateSource::OpenOrders(family) => {
@@ -378,7 +381,8 @@ fn private_request_parts(
             (
                 endpoints::OPEN_ORDERS,
                 format!(
-                    "category={LINEAR}&openOnly=0&orderFilter={filter}&limit={ORDER_PAGE_LIMIT}"
+                    "category={LINEAR}&settleCoin={}&openOnly=0&orderFilter={filter}&limit={ORDER_PAGE_LIMIT}",
+                    binding.gateway_binding().symbol.quote()
                 ),
             )
         }

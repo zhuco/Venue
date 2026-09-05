@@ -769,14 +769,20 @@ async fn fetch_private_for(
     rules: &BitgetInstrumentRules,
     attempt_id: u64,
 ) -> Result<BitgetNodeReadbackCandidate, BitgetAccountGatewayError> {
+    let observed_at_ms = now_ms()?;
+    let requested_fill_start_ms = Some(
+        observed_at_ms
+            .saturating_sub(BITGET_FILL_CURSOR_OVERLAP_MS)
+            .max(1),
+    );
     let candidate = transport
         .collect_private_turn_for(
             credentials,
             binding,
             attempt_id,
             rules.snapshot.metadata.instrument.generation,
-            None,
-            now_ms()?,
+            requested_fill_start_ms,
+            observed_at_ms,
         )
         .await
         .map_err(BitgetAccountGatewayError::Transport)?;

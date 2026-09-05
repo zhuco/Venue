@@ -2,15 +2,14 @@ use crate::execution::{
     mutation_unknown, prepare_price_cancel, prepare_price_readback_by_client_id,
 };
 use crate::{
-    GATE_PRIVATE_PAGE_LIMIT, GATE_STAGE7_ORDER_PROFILE_VERSION, GateContractRules, GateCredentials,
-    GateFillsCursor, GateGatewayBinding, GateHttpTransport, GateMutationDispatch,
-    GatePrivateReadSource, GatePrivateReadbackCandidate, GatePrivateWsFrame,
-    GatePrivateWsTransport, GatePublicBinding, GatePublicPayloadKind, GatePublicRawPayload,
-    GateRawPrivateResponse, GateTransportError, GateTransportLimits,
-    canonical_client_id_from_native, connect_private_ws, endpoints, parse_contract_rules,
-    parse_fill_record, parse_rest_snapshot, prepare_cancel, prepare_exact_readback_by_client_id,
-    prepare_limit, prepare_private_read, prepare_reduce_once, prepare_stop_market,
-    rest_order_book_path, settle_exact_readback, validate_private_readback,
+    GATE_PRIVATE_PAGE_LIMIT, GateContractRules, GateCredentials, GateFillsCursor,
+    GateGatewayBinding, GateHttpTransport, GateMutationDispatch, GatePrivateReadSource,
+    GatePrivateWsFrame, GatePrivateWsTransport, GatePublicBinding, GatePublicPayloadKind,
+    GatePublicRawPayload, GateRawPrivateResponse, GateTransportError, GateTransportLimits,
+    canonical_client_id_from_native, endpoints, parse_contract_rules, parse_fill_record,
+    parse_rest_snapshot, prepare_cancel, prepare_exact_readback_by_client_id, prepare_limit,
+    prepare_private_read, prepare_reduce_once, prepare_stop_market, rest_order_book_path,
+    settle_exact_readback,
 };
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -36,6 +35,12 @@ use venue_gateway_api::GatewayBinding;
 #[path = "durable_execution.rs"]
 mod durable_execution;
 
+#[path = "account_private_state.rs"]
+mod account_private_state;
+use account_private_state::{GateAccountPrivateState, fetch_private_state, fetch_snapshot_fills};
+#[cfg(test)]
+use account_private_state::{parse_snapshot_fills_cursor, snapshot_fills_cursor};
+
 #[path = "account_gateway_priced.rs"]
 mod account_gateway_priced;
 use account_gateway_priced::normalize_priced_limit;
@@ -53,7 +58,7 @@ pub struct GateAccountGateway {
     transport: GateHttpTransport,
     rules: GateContractRules,
     rules_catalog: BTreeMap<Symbol, GateContractRules>,
-    private: GatePrivateReadbackCandidate,
+    private: GateAccountPrivateState,
     /// Account-private generation installed by the last complete signed snapshot. This is
     /// deliberately separate from the immutable contract-rules generation on websocket frames.
     private_generation: u64,
@@ -106,8 +111,13 @@ impl GateAccountGateway {
         let transport = GateHttpTransport::new(&binding, generation, limits)
             .map_err(GateAccountGatewayError::Transport)?;
         let rules = runtime.block_on(fetch_selected_rules(&transport, &binding, generation))?;
-        let private =
-            runtime.block_on(fetch_private(&transport, &binding, &credentials, &rules, 1))?;
+        let private = runtime.block_on(fetch_private_state(
+            &transport,
+            &binding,
+            &credentials,
+            &rules,
+            1,
+        ))?;
         let rules_catalog = BTreeMap::from([(rules.instrument.symbol.clone(), rules.clone())]);
         Ok(Self {
             runtime,
@@ -158,19 +168,23 @@ impl GateAccountGateway {
             if self.private.attempt != self.private_generation {
                 return Err(GateAccountGatewayError::PrivateStream);
             }
-            let stream = match self.runtime.block_on(connect_private_ws(
-                &self.binding,
-                &self.credentials,
-                &self.rules,
-                &self.private,
-                self.transport.limits(),
-            )) {
-                Ok(stream) => stream,
-                Err(error) => {
-                    self.poison_private_stream();
-                    return Err(GateAccountGatewayError::Transport(error));
-                }
-            };
+            let stream =
+                match self
+                    .runtime
+                    .block_on(crate::transport::connect_private_ws_for_identity(
+                        &self.binding,
+                        &self.credentials,
+                        &self.rules,
+                        &self.private.user_id,
+                        self.private.generation,
+                        self.transport.limits(),
+                    )) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        self.poison_private_stream();
+                        return Err(GateAccountGatewayError::Transport(error));
+                    }
+                };
             self.private_stream = Some(stream);
             self.private_stream_attempt = Some(self.private_generation);
         }
@@ -291,7 +305,7 @@ impl GateAccountGateway {
         self.refresh_rules_for_symbols([symbol.clone()])?;
         let rules = self.registered_rules(symbol)?;
         let attempt = self.next_attempt()?;
-        self.private = self.runtime.block_on(fetch_private(
+        self.private = self.runtime.block_on(fetch_private_state(
             &self.transport,
             &self.binding,
             &self.credentials,
@@ -582,7 +596,7 @@ impl AccountPhysicalGateway for GateAccountGateway {
         // cannot authenticate with an older candidate and relabel its facts as this snapshot.
         let private = self
             .runtime
-            .block_on(fetch_private(
+            .block_on(fetch_private_state(
                 &self.transport,
                 &self.binding,
                 &self.credentials,
@@ -825,71 +839,6 @@ fn catalog_rule(
         .ok_or(GateAccountGatewayError::Rules)
 }
 
-async fn fetch_private(
-    transport: &GateHttpTransport,
-    binding: &GateGatewayBinding,
-    credentials: &GateCredentials,
-    rules: &GateContractRules,
-    attempt: u64,
-) -> Result<GatePrivateReadbackCandidate, GateAccountGatewayError> {
-    let started_at_ms = now_ms()?;
-    let deadline = started_at_ms
-        .checked_add(3_000)
-        .ok_or(GateAccountGatewayError::Clock)?;
-    let mut responses = Vec::new();
-    for source in [
-        GatePrivateReadSource::Account,
-        GatePrivateReadSource::DualPositions,
-    ] {
-        responses.push(
-            fetch_private_page(
-                transport,
-                binding,
-                credentials,
-                rules,
-                attempt,
-                source,
-                GateFillsCursor::default(),
-            )
-            .await?,
-        );
-    }
-    for source in [
-        GatePrivateReadSource::RegularOrders,
-        GatePrivateReadSource::Fills,
-    ] {
-        let mut cursor = GateFillsCursor::default();
-        for _ in 0..crate::GATE_PRIVATE_MAX_PAGES {
-            let response = fetch_private_page(
-                transport,
-                binding,
-                credentials,
-                rules,
-                attempt,
-                source,
-                cursor.clone(),
-            )
-            .await?;
-            let next = page_cursor(&response.payload)?;
-            let terminal = next.1;
-            responses.push(response);
-            if terminal {
-                break;
-            }
-            cursor = GateFillsCursor::new(next.0).map_err(|_| GateAccountGatewayError::Readback)?;
-        }
-    }
-    validate_private_readback(
-        binding,
-        rules,
-        GATE_STAGE7_ORDER_PROFILE_VERSION,
-        deadline,
-        now_ms()?,
-        responses,
-    )
-    .map_err(|_| GateAccountGatewayError::Readback)
-}
-
 async fn fetch_private_page(
     transport: &GateHttpTransport,
     binding: &GateGatewayBinding,
@@ -982,15 +931,13 @@ async fn fetch_account_wide_snapshot(
     if price_orders.len() >= 100 {
         return Err(AccountHostValidationError::SignedSnapshot);
     }
-    let previous_fills_cursor = parse_snapshot_fills_cursor(recovery.previous_fills_cursor())?;
-    let (fills, fill_payloads) = snapshot_paged_rows_from_cursor(
+    let (fills, fills_cursor) = fetch_snapshot_fills(
         transport,
         binding,
         credentials,
         selected_rules,
-        "",
-        endpoints::FUTURES_FILLS,
-        previous_fills_cursor.as_deref(),
+        observed_at_ms,
+        recovery.previous_fills_cursor(),
     )
     .await?;
     let position_facts =
@@ -1004,7 +951,6 @@ async fn fetch_account_wide_snapshot(
     )?);
     let unknown_results =
         snapshot_unknown_results(transport, binding, credentials, rules_catalog, recovery).await?;
-    let fills_cursor = snapshot_fills_cursor(&fills, &fill_payloads, previous_fills_cursor)?;
     let fill_facts = snapshot_fill_facts(&catalogue, &fills, selected_rules.instrument.generation)?;
     if regular_payloads.is_empty() {
         return Err(AccountHostValidationError::SignedSnapshot);
@@ -1105,17 +1051,13 @@ async fn snapshot_paged_rows_from_cursor(
         if rows.len() > GATE_PRIVATE_PAGE_LIMIT {
             return Err(AccountHostValidationError::SignedSnapshot);
         }
-        let page_last = rows
-            .last()
-            .and_then(|row| row.get("id"))
-            .and_then(value_id)
-            .map(str::to_owned);
+        let page_last = rows.last().and_then(|row| row.get("id")).and_then(value_id);
         for row in &rows {
             let id = row
                 .get("id")
                 .and_then(value_id)
                 .ok_or(AccountHostValidationError::SignedSnapshot)?;
-            if !seen_ids.insert(id.to_owned()) {
+            if !seen_ids.insert(id) {
                 return Err(AccountHostValidationError::SignedSnapshot);
             }
         }
@@ -1433,62 +1375,6 @@ fn recovery_order_matches_command(
         )
 }
 
-fn snapshot_fills_cursor(
-    fills: &[Value],
-    raw_pages: &[String],
-    previous: Option<String>,
-) -> Result<String, AccountHostValidationError> {
-    if raw_pages.is_empty() {
-        return Err(AccountHostValidationError::SignedSnapshot);
-    }
-    let mut ids = BTreeSet::new();
-    for row in fills {
-        let id = row
-            .get("id")
-            .and_then(value_id)
-            .ok_or(AccountHostValidationError::SignedSnapshot)?;
-        if !ids.insert(id.to_owned()) {
-            return Err(AccountHostValidationError::SignedSnapshot);
-        }
-    }
-    let current = fills
-        .last()
-        .and_then(|row| row.get("id"))
-        .and_then(value_id);
-    let watermark = current
-        .or(previous.as_deref())
-        .ok_or(AccountHostValidationError::SignedSnapshot)?;
-    if let Some(previous) = previous.as_deref() {
-        let old = previous
-            .parse::<u128>()
-            .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-        let new = watermark
-            .parse::<u128>()
-            .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-        if new < old {
-            return Err(AccountHostValidationError::SignedSnapshot);
-        }
-    }
-    // Gate's signed my_trades cursor is the native trade id.  A payload digest cannot resume a
-    // page after restart and is therefore deliberately not persisted as a cursor.
-    Ok(format!("gate-fills-v1|{watermark}"))
-}
-
-fn parse_snapshot_fills_cursor(
-    value: Option<&str>,
-) -> Result<Option<String>, AccountHostValidationError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let native = value
-        .strip_prefix("gate-fills-v1|")
-        // Legacy SHA cursors cannot identify the next Gate page; fail closed rather than start
-        // from a recent window that could omit a restart gap.
-        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
-        .ok_or(AccountHostValidationError::SignedSnapshot)?;
-    Ok(Some(native.to_owned()))
-}
-
 fn snapshot_contract_rules(
     catalogue: &str,
     symbol: Symbol,
@@ -1676,11 +1562,7 @@ async fn risk_order_pages(
             rows.extend(page);
             return Ok(rows);
         }
-        last_id = page
-            .last()
-            .and_then(|row| row.get("id"))
-            .and_then(value_id)
-            .map(str::to_owned);
+        last_id = page.last().and_then(|row| row.get("id")).and_then(value_id);
         if last_id.is_none() {
             return Err(AccountHostValidationError::RiskEvidence);
         }
@@ -1818,24 +1700,21 @@ fn page_cursor(payload: &str) -> Result<(Option<String>, bool), GateAccountGatew
     if rows.len() > GATE_PRIVATE_PAGE_LIMIT {
         return Err(GateAccountGatewayError::Readback);
     }
-    let last = rows
-        .last()
-        .and_then(|row| row.get("id"))
-        .and_then(value_id)
-        .map(str::to_owned);
+    let last = rows.last().and_then(|row| row.get("id")).and_then(value_id);
     if rows.len() == GATE_PRIVATE_PAGE_LIMIT && last.is_none() {
         return Err(GateAccountGatewayError::Readback);
     }
     Ok((last, rows.len() < GATE_PRIVATE_PAGE_LIMIT))
 }
 
-fn value_id(value: &Value) -> Option<&str> {
+fn value_id(value: &Value) -> Option<String> {
     match value {
         Value::String(value)
             if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) =>
         {
-            Some(value)
+            Some(value.clone())
         }
+        Value::Number(value) if value.as_u64().is_some() => Some(value.to_string()),
         _ => None,
     }
 }

@@ -422,10 +422,19 @@ fn signed_snapshot_normalizes_only_the_exact_gate_managed_text_encoding()
 fn signed_snapshot_rejects_duplicate_fills_and_bad_position_family()
 -> Result<(), Box<dyn std::error::Error>> {
     assert!(
-        snapshot_fills_cursor(
-            &[serde_json::json!({"id":"1"}), serde_json::json!({"id":"1"})],
-            &["[]".to_owned()],
-            None,
+        snapshot_fill_facts(
+            CATALOGUE,
+            &[
+                serde_json::json!({
+                    "id":"1", "order_id":"2", "contract":"DOGE_USDT", "size":"1",
+                    "price":"0.1", "fee":"0", "pnl":"0", "role":"maker"
+                }),
+                serde_json::json!({
+                    "id":"1", "order_id":"3", "contract":"DOGE_USDT", "size":"1",
+                    "price":"0.1", "fee":"0", "pnl":"0", "role":"maker"
+                })
+            ],
+            7,
         )
         .is_err()
     );
@@ -446,8 +455,8 @@ fn signed_snapshot_rejects_duplicate_fills_and_bad_position_family()
 #[test]
 fn signed_snapshot_fill_cursor_is_native_and_legacy_digest_fails_closed() {
     assert_eq!(
-        parse_snapshot_fills_cursor(Some("gate-fills-v1|123")),
-        Ok(Some("123".to_owned()))
+        parse_snapshot_fills_cursor(Some("gate-fills-v2|1700000000123")),
+        Ok(Some(1_700_000_000_123))
     );
     assert!(
         parse_snapshot_fills_cursor(Some(
@@ -456,13 +465,21 @@ fn signed_snapshot_fill_cursor_is_native_and_legacy_digest_fails_closed() {
         .is_err()
     );
     assert_eq!(
-        snapshot_fills_cursor(
-            &[serde_json::json!({"id":"124"})],
-            &["[]".to_owned()],
-            Some("123".to_owned())
-        ),
-        Ok("gate-fills-v1|124".to_owned())
+        snapshot_fills_cursor(1_700_000_000_124),
+        Ok("gate-fills-v2|1700000000124".to_owned())
     );
+    assert!(parse_snapshot_fills_cursor(Some("gate-fills-v1|123")).is_err());
+}
+
+#[test]
+fn paged_gate_surfaces_accept_documented_numeric_native_ids()
+-> Result<(), Box<dyn std::error::Error>> {
+    let rows = (1_u64..=GATE_PRIVATE_PAGE_LIMIT as u64)
+        .map(|id| serde_json::json!({"id": id}))
+        .collect::<Vec<_>>();
+    let payload = serde_json::to_string(&rows)?;
+    assert_eq!(page_cursor(&payload)?, (Some("100".to_owned()), false));
+    Ok(())
 }
 
 #[test]
