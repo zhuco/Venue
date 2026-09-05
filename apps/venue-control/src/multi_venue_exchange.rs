@@ -108,8 +108,16 @@ impl StrategyGateway {
         credentials: StrategyCredentials,
         nonce: u64,
     ) -> Result<Self, StrategyExchangeError> {
+        Self::connect_detailed(binding, credentials, nonce).map_err(|_| StrategyExchangeError)
+    }
+
+    pub(crate) fn connect_detailed(
+        binding: GatewayBinding,
+        credentials: StrategyCredentials,
+        nonce: u64,
+    ) -> Result<Self, String> {
         if binding.venue != credentials.venue() {
-            return Err(StrategyExchangeError);
+            return Err("strategy credential venue does not match binding".to_owned());
         }
         let secret = |value: SecretValue| SecretString::from(value.expose().to_owned());
         Ok(match credentials {
@@ -123,7 +131,7 @@ impl StrategyGateway {
                     secret(api_secret),
                     secret(passphrase),
                 )
-                .map_err(|_| StrategyExchangeError)?;
+                .map_err(|error| error.to_string())?;
                 Self::Bitget(
                     venue_gateway_bitget::BitgetAccountGateway::connect_with_credentials(
                         binding,
@@ -131,7 +139,7 @@ impl StrategyGateway {
                         TIMEOUT,
                         MAX_BODY,
                     )
-                    .map_err(|_| StrategyExchangeError)?,
+                    .map_err(|error| error.to_string())?,
                 )
             }
             StrategyCredentials::Bybit {
@@ -142,7 +150,7 @@ impl StrategyGateway {
                     secret(api_key),
                     secret(api_secret),
                 )
-                .map_err(|_| StrategyExchangeError)?;
+                .map_err(|error| error.to_string())?;
                 Self::Bybit(
                     venue_gateway_bybit::BybitAccountGateway::connect_with_credentials(
                         binding,
@@ -150,7 +158,7 @@ impl StrategyGateway {
                         TIMEOUT,
                         MAX_BODY,
                     )
-                    .map_err(|_| StrategyExchangeError)?,
+                    .map_err(|error| error.to_string())?,
                 )
             }
             StrategyCredentials::Gate {
@@ -161,7 +169,7 @@ impl StrategyGateway {
                     secret(api_key),
                     secret(api_secret),
                 )
-                .map_err(|_| StrategyExchangeError)?;
+                .map_err(|error| error.to_string())?;
                 Self::Gate(
                     venue_gateway_gate::GateAccountGateway::connect_with_credentials(
                         binding,
@@ -169,7 +177,7 @@ impl StrategyGateway {
                         TIMEOUT,
                         MAX_BODY,
                     )
-                    .map_err(|_| StrategyExchangeError)?,
+                    .map_err(|error| error.to_string())?,
                 )
             }
             StrategyCredentials::Okx {
@@ -182,7 +190,7 @@ impl StrategyGateway {
                     secret(api_secret),
                     secret(passphrase),
                 )
-                .map_err(|_| StrategyExchangeError)?;
+                .map_err(|error| error.to_string())?;
                 Self::Okx(
                     venue_gateway_okx::OkxAccountGateway::connect_with_credentials(
                         binding,
@@ -191,7 +199,7 @@ impl StrategyGateway {
                         TIMEOUT,
                         MAX_BODY,
                     )
-                    .map_err(|_| StrategyExchangeError)?,
+                    .map_err(|error| error.to_string())?,
                 )
             }
             StrategyCredentials::Hyperliquid {
@@ -205,7 +213,7 @@ impl StrategyGateway {
                     api_wallet_address,
                     secret(private_key),
                 )
-                .map_err(|_| StrategyExchangeError)?;
+                .map_err(|error| error.to_string())?;
                 Self::Hyperliquid(
                     venue_gateway_hyperliquid::HyperliquidAccountGateway::connect_with_credentials(
                         binding,
@@ -214,7 +222,7 @@ impl StrategyGateway {
                         TIMEOUT,
                         MAX_BODY,
                     )
-                    .map_err(|_| StrategyExchangeError)?,
+                    .map_err(|error| error.to_string())?,
                 )
             }
         })

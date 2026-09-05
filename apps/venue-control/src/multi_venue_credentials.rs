@@ -39,8 +39,8 @@ pub enum StrategyProbeError {
     Binding,
     #[error("strategy probe network slot unavailable")]
     NetworkSlot,
-    #[error("strategy probe gateway connection rejected")]
-    Connect,
+    #[error("strategy probe gateway connection rejected: {0}")]
+    Connect(String),
     #[error("strategy probe signed identity rejected")]
     Identity,
     #[error("strategy probe permissions rejected")]
@@ -87,8 +87,8 @@ async fn verified_snapshot(
         .await
         .map_err(|_| StrategyProbeError::NetworkSlot)?;
     tokio::task::spawn_blocking(move || {
-        let mut gateway = StrategyGateway::connect(binding.clone(), credentials, 1)
-            .map_err(|_| StrategyProbeError::Connect)?;
+        let mut gateway = StrategyGateway::connect_detailed(binding.clone(), credentials, 1)
+            .map_err(StrategyProbeError::Connect)?;
         let identity = gateway
             .identity()
             .map_err(|_| StrategyProbeError::Identity)?;
