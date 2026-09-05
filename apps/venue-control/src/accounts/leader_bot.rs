@@ -34,20 +34,30 @@ impl AccountService {
         &self,
         principal: &Principal,
     ) -> Result<LeaderBotAccess, AccountError> {
-        let permission = sqlx::query("SELECT g.enabled,g.revision,p.profile_state FROM venue_leader_bot_permissions g JOIN venue_kol_profiles p ON p.kol_user_id=g.kol_user_id WHERE g.kol_user_id=$1")
+        let profile = sqlx::query("SELECT p.profile_state,COALESCE(g.enabled,false) AS enabled,COALESCE(g.revision,0) AS revision FROM venue_kol_profiles p LEFT JOIN venue_leader_bot_permissions g ON g.kol_user_id=p.kol_user_id WHERE p.kol_user_id=$1")
             .bind(&principal.user.user_id).fetch_optional(&self.pool).await.map_err(database_error)?;
-        let (can_use, permission_revision) = if let Some(row) = permission {
-            (
-                row.try_get::<bool, _>("enabled").map_err(database_error)?
-                    && row
-                        .try_get::<String, _>("profile_state")
-                        .map_err(database_error)?
-                        == "enabled",
+        let (profile_state, can_use, permission_revision) = if let Some(row) = profile {
+            let state = match row
+                .try_get::<String, _>("profile_state")
+                .map_err(database_error)?
+                .as_str()
+            {
+                "draft" => venue_control_protocol::kol::KolProfileState::Draft,
+                "enabled" => venue_control_protocol::kol::KolProfileState::Enabled,
+                "disabled" => venue_control_protocol::kol::KolProfileState::Disabled,
+                _ => return Err(error(Code::Unavailable)),
+            };
+            let enabled = row.try_get::<bool, _>("enabled").map_err(database_error)?;
+            let revision =
                 u64::try_from(row.try_get::<i64, _>("revision").map_err(database_error)?)
-                    .map_err(|_| error(Code::Unavailable))?,
+                    .map_err(|_| error(Code::Unavailable))?;
+            (
+                Some(state),
+                enabled && state == venue_control_protocol::kol::KolProfileState::Enabled,
+                revision,
             )
         } else {
-            (false, 0)
+            (None, false, 0)
         };
         let row = sqlx::query("SELECT b.*,(SELECT count(*) FROM venue_kol_follow_relations r WHERE r.kol_user_id=b.owner_user_id AND r.relation_state='active') AS followers,(SELECT count(*) FROM venue_order_mirrors m WHERE m.bot_id=b.bot_id AND m.mirror_state NOT IN ('terminal','blocked')) AS orders FROM venue_leader_bots b WHERE b.owner_user_id=$1")
             .bind(&principal.user.user_id).fetch_optional(&self.pool).await.map_err(database_error)?;
@@ -89,6 +99,7 @@ impl AccountService {
             .transpose()?;
         Ok(LeaderBotAccess {
             schema_version: LEADER_BOT_SCHEMA_VERSION,
+            profile_state,
             can_use,
             permission_revision,
             bot,

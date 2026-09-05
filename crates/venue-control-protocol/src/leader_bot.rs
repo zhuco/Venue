@@ -1,5 +1,6 @@
 //! Account-owned order mirroring controls. UI permissions are display hints; the server and
 //! executor independently enforce the current database grant before creating risk.
+use crate::kol::KolProfileState;
 use serde::{Deserialize, Serialize};
 
 pub const LEADER_BOT_PATH: &str = "/v2/kol/leader-bot";
@@ -46,6 +47,7 @@ pub struct LeaderBotSummary {
 #[serde(deny_unknown_fields)]
 pub struct LeaderBotAccess {
     pub schema_version: u16,
+    pub profile_state: Option<KolProfileState>,
     pub can_use: bool,
     pub permission_revision: u64,
     // Existing exposure remains inspectable after revocation; only the creation entry hides.

@@ -70,7 +70,7 @@ test("login cookie keeps the Control token out of JSON; writes use only the owne
   } finally { globalThis.fetch = fetch; keys.forEach((key, index) => { if (old[index] === undefined) delete process.env[key]; else process.env[key] = old[index]; }); }
 });
 test("public leader DTO preserves server denial and exposes only own aggregate state", () => {
-  assert.deepEqual(customerPublicValue("leader", "GET", { schema_version: 1, can_use: false, permission_revision: 0, bot: null, followers: [{ secret: "foreign" }], admin: true }), { schema_version: 1, can_use: false, permission_revision: 0, bot: null });
+  assert.deepEqual(customerPublicValue("leader", "GET", { schema_version: 1, profile_state: "enabled", can_use: false, permission_revision: 0, bot: null, followers: [{ secret: "foreign" }], admin: true }), { schema_version: 1, profile_state: "enabled", can_use: false, permission_revision: 0, bot: null });
   assert.deepEqual(customerPublicValue("mirror-orders", "GET", [{ mirror_id: "owned", state: "pending", owner: "foreign", api_secret: "secret" }]), [{ mirror_id: "owned", state: "pending" }]);
 });
 

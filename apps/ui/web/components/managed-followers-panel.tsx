@@ -64,7 +64,7 @@ export function ManagedFollowersPanel({ csrf }: { csrf: string }) {
   if (overview && !overview.can_manage && overview.accounts.length === 0 && !error) return null;
   return <section className="panel" aria-label="托管跟单账户">
     <div className="heading"><h2>托管跟单账户</h2><span className="pill">{overview ? `${overview.accounts.length} / 200` : "正在读取"}</span></div>
-    <p>为交由你管理的 Binance 账户保存 API 密钥，并逐个验证。保存后跟单保持关闭。</p>
+    <p>为交由你管理的 Binance 账户保存 API 密钥并逐个验证；随后在每行“跟单”栏打开独立设置。保存设置后仍保持关闭，需再次确认启用。</p>
     {error && <p role="alert" className="notice error">{error}</p>}
     {notice && <p role="status" className="notice">{notice}</p>}
     <div className="buttons"><button className="primary" disabled={busy || !overview?.can_manage || overview.accounts.length >= 200} onClick={() => { setRows([draft()]); dialog.current?.showModal(); }}>添加托管 API Key</button><button disabled={busy} onClick={() => void refresh()}>刷新托管账户</button></div>

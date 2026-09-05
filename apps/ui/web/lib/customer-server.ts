@@ -123,7 +123,7 @@ export function customerPublicValue(action: string, method: string, raw: unknown
   }
   if (action === "leader" || action === "leader-lifecycle") {
     const value = object(raw);
-    return { ...pick(value, ["schema_version", "can_use", "permission_revision"]), bot: value.bot === null ? null : pick(value.bot, ["bot_id", "trading_account_id", "credential_id", "state", "revision", "active_followers", "pending_orders", "attention_code"]) };
+    return { ...pick(value, ["schema_version", "profile_state", "can_use", "permission_revision"]), bot: value.bot === null ? null : pick(value.bot, ["bot_id", "trading_account_id", "credential_id", "state", "revision", "active_followers", "pending_orders", "attention_code"]) };
   }
   if (action === "mirror-orders") {
     if (!Array.isArray(raw)) throw new Error("invalid_orders");

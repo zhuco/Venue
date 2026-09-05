@@ -8,7 +8,7 @@ test("managed account dialog saves, retries with the same identity, verifies and
     const action = new URL(route.request().url()).pathname.split("/").at(-1);
     let value: unknown = null;
     if(action === "session") value={user:{user_id:"kol-fixture",username:"kol"},credentials:[],selected_credential_id:null,csrf:"owned-csrf"};
-    else if(action === "leader") value={can_use:false,bot:null};
+    else if(action === "leader") value={profile_state:"enabled",can_use:false,permission_revision:0,bot:null};
     else if(action === "settings") value=null;
     else if(action === "mirror-orders") value=[];
     else if(action === "managed-followers") {

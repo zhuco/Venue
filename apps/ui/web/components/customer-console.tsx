@@ -7,6 +7,7 @@ import { FollowSizingFields, sizingFromForm } from "./follow-sizing-fields";
 import type { Credential, CustomerOverview, FollowRelation, FollowSettings, Invite, LeaderAccess, MirrorOrder } from "@/lib/customer-types";
 
 const states: Record<string, string> = { stopped: "已停止", running: "运行中", draining: "正在撤销同步挂单", needs_attention: "需要处理", paused: "已暂停", active: "跟单中", disabled: "已禁用", pending: "待执行", live: "已挂单", cancelling: "撤单中", terminal: "已结束", blocked: "未下单", verified: "验证通过", unverified: "未验证" };
+const profileStates: Record<string, string> = { draft: "资料待启用", enabled: "KOL 已启用", disabled: "KOL 已停用" };
 const field = (form: FormData, name: string) => String(form.get(name) ?? "");
 type Pending = { action: string; body: object };
 
@@ -78,9 +79,11 @@ export function CustomerConsole({ inviteCode }: { inviteCode?: string }) {
           <div className="buttons"><button disabled={locked}>绑定并保存</button></div>
         </form><p className="muted">密钥提交后清空输入，仅由服务器加密保存；KOL 无法查看。</p></details>
       </section>
-      {(leader?.can_use || bot) && <section className="panel" aria-label="带单机器人"><div className="heading"><h2>带单机器人</h2><span className="pill">{bot ? states[bot.state] ?? bot.state : "尚未创建"}</span></div>
-        {!leader?.can_use && <p>带单权限已撤销。已有实例仍可查看和停止。</p>}
-        {bot ? <><p>主账户：{bot.trading_account_id}</p><p>跟单账户 {bot.active_followers} · 待处理挂单 {bot.pending_orders}</p>{bot.attention_code && <p role="status">需处理：{bot.attention_code}</p>}</> : <p>将已验证的 KOL 主账户设为带单源。</p>}
+      {leader && (leader.profile_state !== null || bot) && <section className="panel" aria-label="带单机器人"><div className="heading"><h2>带单机器人</h2><span className="pill">{bot ? states[bot.state] ?? bot.state : leader.can_use ? "已授权，尚未创建" : leader.profile_state === "enabled" ? "待管理员授权" : profileStates[leader.profile_state ?? ""] ?? "不可用"}</span></div>
+        {!leader.can_use && bot && <p role="status">带单权限已撤销。已有实例仍可查看和停止。</p>}
+        {!leader.can_use && !bot && leader.profile_state === "enabled" && <p role="status">KOL 资料已启用，但管理员尚未授予带单权限；授权后才可创建和启动机器人。</p>}
+        {!leader.can_use && !bot && leader.profile_state !== "enabled" && <p role="status">当前状态：{profileStates[leader.profile_state ?? ""] ?? "非启用 KOL"}。资料启用且管理员授权后才可带单。</p>}
+        {bot ? <><p>主账户：{bot.trading_account_id}</p><p>跟单账户 {bot.active_followers} · 待处理挂单 {bot.pending_orders}</p>{bot.attention_code && <p role="status">需处理：{bot.attention_code}</p>}</> : leader.can_use && <p>将已验证的 KOL 主账户设为带单源。</p>}
         {leader?.can_use && bot?.state === "stopped" && <label className="customer-confirm"><input type="checkbox" checked={confirmed} onChange={e => setConfirmed(e.target.checked)} />我确认启动后，符合条件的新挂单将同步到启用跟单的账户。</label>}
         <div className="buttons">{!bot && leader?.can_use && <button disabled={locked || selected?.verification !== "verified"} onClick={() => void mutate("leader", { schema_version: 1, request_id: crypto.randomUUID(), credential_id: selected?.credential_id }, true)}>创建带单机器人</button>}
           {bot && leader?.can_use && bot.state === "stopped" && <button className="primary" disabled={locked || !confirmed} onClick={() => void mutate("leader-lifecycle", { schema_version: 1, request_id: crypto.randomUUID(), bot_id: bot.bot_id, expected_revision: bot.revision, action: "start", risk_confirmed: true }, true)}>启动带单</button>}
@@ -88,7 +91,7 @@ export function CustomerConsole({ inviteCode }: { inviteCode?: string }) {
         </div><p className="muted">停止只撤销程序创建的同步挂单，已有仓位不会自动平仓。</p>
       </section>}
       <ManagedFollowersPanel key={overview.user.user_id} csrf={overview.csrf} />
-      <FollowPanel relation={relation} credentials={overview.credentials} selected={selected?.credential_id} disabled={locked} mutate={mutate} />
+      {leader?.profile_state === null && <FollowPanel relation={relation} credentials={overview.credentials} selected={selected?.credential_id} disabled={locked} mutate={mutate} />}
       <section className="panel"><h2>我的同步订单</h2><p className="muted">主账户和跟单账户独立成交；显示最近 500 条订单记录。</p>{orders.length === 0 ? <p>暂无同步订单。</p> : <div className="table"><table><thead><tr><th>交易对</th><th>来源订单</th><th>委托数量</th><th>已成交</th><th>状态</th></tr></thead><tbody>{orders.map(order => <tr key={order.mirror_id}><td>{order.symbol}</td><td>{order.source_order_id}</td><td>{order.requested_quantity}</td><td>{order.filled_quantity}</td><td>{states[order.state] ?? order.state}{order.attention_code && <small> · {order.attention_code}</small>}</td></tr>)}</tbody></table></div>}</section>
     </>}
   </div></main>;
@@ -102,7 +105,7 @@ function FollowPanel({ relation, credentials, selected, disabled, mutate }: { re
   const [confirmed, setConfirmed] = useState(false);
   const current = relation?.settings;
   const editing = disabled || relation?.state === "active" || relation?.activation_requested;
-  return <section className="panel"><div className="heading"><h2>跟单设置</h2><span className="pill">{relation?.activation_requested ? "正在校验激活条件" : relation ? states[relation.state] ?? relation.state : "尚未设置"}</span></div><p>仅同步启用后的新挂单，不追补已有订单或仓位。</p>
+  return <section className="panel"><div className="heading"><h2>我的跟单设置</h2><span className="pill">{relation?.activation_requested ? "正在校验激活条件" : relation ? states[relation.state] ?? relation.state : "尚未设置"}</span></div><p>仅同步启用后的新挂单，不追补已有订单或仓位。</p>
     <form key={`${relation?.relation_id ?? "new"}:${relation?.revision ?? 0}`} onSubmit={event => { event.preventDefault(); const data = new FormData(event.currentTarget); const settings: FollowSettings = { credential_id: field(data, "credential"), sizing: sizingFromForm(data), allocated_capital: field(data, "capital"), multiplier: field(data, "multiplier"), max_order_notional: field(data, "orderLimit"), max_total_notional: field(data, "totalLimit"), max_deviation_bps: Number(field(data, "deviation")), allowed_symbols: field(data, "symbols").split(/[,，\s]+/).filter(Boolean) }; void mutate("settings", { schema_version: 1, request_id: crypto.randomUUID(), expected_revision: relation?.revision ?? null, settings }, true); }}>
       <fieldset disabled={Boolean(editing)}><div className="customer-grid"><label>跟单账户<select name="credential" defaultValue={current?.credential_id ?? selected ?? ""} required><option value="">选择已验证账户</option>{credentials.filter(c => c.verification === "verified").map(c => <option key={c.credential_id} value={c.credential_id}>{c.label}</option>)}</select></label>
         <FollowSizingFields value={current?.sizing} />

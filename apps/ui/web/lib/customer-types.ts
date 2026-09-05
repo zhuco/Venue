@@ -6,6 +6,6 @@ export type FollowSettings = { credential_id: string; sizing?: FollowSizing; all
 export type ManagedFollowSettings = Omit<FollowSettings, "credential_id">;
 export type ManagedFollowRelation = { managed_id: string; relation_id: string; state: string; revision: number; settings: ManagedFollowSettings; activation_requested: boolean };
 export type FollowRelation = { relation_id: string; state: string; revision: number; settings: FollowSettings; activation_requested: boolean };
-export type LeaderAccess = { can_use: boolean; permission_revision: number; bot: { bot_id: string; trading_account_id: string; credential_id: string; state: string; revision: number; active_followers: number; pending_orders: number; attention_code: string | null } | null };
+export type LeaderAccess = { profile_state: "draft" | "enabled" | "disabled" | null; can_use: boolean; permission_revision: number; bot: { bot_id: string; trading_account_id: string; credential_id: string; state: string; revision: number; active_followers: number; pending_orders: number; attention_code: string | null } | null };
 export type MirrorOrder = { mirror_id: string; symbol: string; source_order_id: string; child_client_order_id: string; state: string; requested_quantity: string; filled_quantity: string; attention_code: string | null };
 export type Invite = { profile: { name: string; title: string; description: string } };

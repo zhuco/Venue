@@ -34,6 +34,10 @@ async fn leader_bot_grant_is_owned_revisioned_and_revocation_drains_without_resu
     provision_account(&fixture.pool, user, &account, &credential, 61).await?;
     insert_kol_profile(&fixture.pool, user, &account, 1).await?;
     let denied = service.leader_bot_access(&principal).await?;
+    assert_eq!(
+        denied.profile_state,
+        Some(venue_control_protocol::kol::KolProfileState::Enabled)
+    );
     assert!(!denied.can_use);
     assert!(denied.bot.is_none());
     assert_eq!(denied.permission_revision, 0);
