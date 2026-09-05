@@ -1751,7 +1751,8 @@ async fn fetch_one(
             | BybitPrivateSource::AccountWideOpenOrders(_)
             | BybitPrivateSource::OrderHistory(_)
             | BybitPrivateSource::Executions
-            | BybitPrivateSource::AccountWideExecutions => {
+            | BybitPrivateSource::AccountWideExecutions
+            | BybitPrivateSource::FundingTransactions => {
                 BybitAccountGatewayError::OrderTransport(error)
             }
         })
@@ -1974,6 +1975,10 @@ pub enum BybitAccountGatewayError {
     PositionMode,
     #[error("Bybit exact signed order readback failed")]
     Readback,
+    #[error("Bybit exact signed order readback failed at {0}")]
+    ReadbackStage(&'static str),
+    #[error("Bybit exact signed order does not match the durable command: {0}")]
+    ReadbackMismatch(String),
     #[error("Bybit transport setup failed")]
     Transport(#[source] BybitTransportError),
     #[error("Bybit public instrument request failed")]

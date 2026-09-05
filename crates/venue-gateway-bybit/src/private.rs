@@ -41,6 +41,7 @@ pub enum BybitPrivateSource {
     OrderHistory(NativeOrderFamily),
     Executions,
     AccountWideExecutions,
+    FundingTransactions,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -128,7 +129,13 @@ impl BybitPreparedPrivateRequest {
         {
             return Err(BybitError::Binding);
         }
-        if (self.page_index == 0) != self.request_cursor.is_none() {
+        let cursor_page_invalid = match self.source {
+            BybitPrivateSource::FundingTransactions => {
+                self.page_index > 0 && self.request_cursor.is_none()
+            }
+            _ => (self.page_index == 0) != self.request_cursor.is_none(),
+        };
+        if cursor_page_invalid {
             return Err(BybitError::Pagination);
         }
         let (expected_path, expected_query) = private_request_parts(
@@ -252,7 +259,7 @@ impl BybitRawPrivatePayload {
         Ok(raw)
     }
 
-    fn validate(
+    pub(crate) fn validate(
         &self,
         binding: &BybitGatewayBinding,
         source: BybitPrivateSource,
@@ -417,6 +424,22 @@ fn private_request_parts(
                 format!(
                     "category={LINEAR}&startTime={}&endTime={}&execType=Trade&limit={EXECUTION_PAGE_LIMIT}",
                     window.start_ms, window.end_ms
+                ),
+            )
+        }
+        BybitPrivateSource::FundingTransactions => {
+            let window = history_window.ok_or(BybitError::Clock)?;
+            if lookup.is_some() {
+                return Err(BybitError::Binding);
+            }
+            (
+                endpoints::TRANSACTION_LOG,
+                format!(
+                    "accountType=UNIFIED&category={LINEAR}&currency={}&baseCoin={}&type=SETTLEMENT&startTime={}&endTime={}&limit=50",
+                    binding.gateway_binding().symbol.quote(),
+                    binding.gateway_binding().symbol.base(),
+                    window.start_ms,
+                    window.end_ms
                 ),
             )
         }
@@ -1584,6 +1607,7 @@ fn normalize_order(
     let native_time_in_force = validate_native_time_in_force(&row.time_in_force)?.to_owned();
     let time_in_force = canonical_limit_time_in_force(&native_order_type, &native_time_in_force);
     let reduce_only = row.reduce_only;
+    let reported_price = optional_price(&row.price)?;
     let order = Order {
         order_id: row.order_id,
         client_order_id: field_text(row.order_link_id),
@@ -1598,7 +1622,9 @@ fn normalize_order(
         state,
         quantity: positive_decimal(&row.qty)?,
         filled_quantity: non_negative_decimal(&row.cum_exec_qty)?,
-        limit_price: optional_price(&row.price)?,
+        limit_price: (native_order_type == "Limit")
+            .then_some(reported_price)
+            .flatten(),
         time_in_force,
         average_price: optional_field_price(&row.avg_price)?,
         reduce_only,
@@ -1958,6 +1984,7 @@ struct ExecutionRow {
     closed_size: String,
     exec_type: String,
     is_maker: bool,
+    #[serde(deserialize_with = "string_or_integer")]
     seq: String,
     #[serde(default)]
     exec_pnl: Option<String>,
