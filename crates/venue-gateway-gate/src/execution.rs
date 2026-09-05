@@ -2,8 +2,9 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::Value;
 use venue_domain::domain::{
-    CancelCommand, FieldState, LimitTimeInForce, MarketReduceCommand, Order, OrderCommand,
-    OrderSide, OrderState, PositionSide, Price,
+    CancelCommand, FieldState, LimitTimeInForce, MarketOrderCommand, MarketReduceCommand, Order,
+    OrderCommand, OrderPurpose, OrderSide, OrderState, PositionSide, Price,
+    StopMarketFullPositionCommand,
 };
 use venue_gateway_api::GatewayBinding;
 
@@ -17,7 +18,10 @@ const MAX_CLIENT_ORDER_SUFFIX_BYTES: usize = 28;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GateMutationKind {
     PlacePostOnly,
+    PlaceMarket,
+    StopMarketFullPosition,
     Cancel,
+    CancelPrice,
     ReduceOnce,
 }
 
@@ -33,6 +37,17 @@ struct ExpectedOrder {
     reduce_only: Option<bool>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExpectedPriceOrder {
+    order_id: Option<String>,
+    client_order_id: String,
+    side: OrderSide,
+    position_side: PositionSide,
+    quantity: Decimal,
+    trigger_price: Price,
+    purpose: OrderPurpose,
+}
+
 /// A prepared request is intentionally not `Clone`. The async transport consumes it and returns
 /// either an ACK-bound readback or an UNKNOWN-bound readback, so it cannot implement a retry loop.
 #[derive(Debug, Eq, PartialEq)]
@@ -45,6 +60,7 @@ pub struct GatePreparedMutation {
     body: Vec<u8>,
     kind: GateMutationKind,
     expected: ExpectedOrder,
+    expected_price: Option<ExpectedPriceOrder>,
     reduce_episode: Option<(String, u64)>,
 }
 
@@ -171,6 +187,136 @@ pub fn prepare_limit(
     )
 }
 
+/// Builds an exposure increasing futures market order with an explicit IOC execution policy.
+pub fn prepare_market(
+    binding: &GateGatewayBinding,
+    rules: &GateContractRules,
+    command: &MarketOrderCommand,
+) -> Result<GatePreparedMutation, GateExecutionError> {
+    command.validate().map_err(|_| GateExecutionError::Intent)?;
+    validate_owner(
+        binding,
+        rules,
+        &command.owner.exchange,
+        &command.owner.account,
+        &command.owner.symbol,
+    )?;
+    let contracts = rules
+        .native_order_contracts_checked(command.quantity)
+        .map_err(|_| GateExecutionError::Rules)?;
+    let client_order_id = command.client_order_id.as_str().to_owned();
+    let body = PlaceBody {
+        contract: &rules.native_symbol,
+        size: decimal_wire(signed_contracts(contracts, command.side)),
+        price: "0".to_owned(),
+        tif: "ioc",
+        reduce_only: false,
+        text: native_client_id(&client_order_id)?,
+    };
+    prepared_place(
+        binding,
+        rules,
+        GateMutationKind::PlaceMarket,
+        body,
+        ExpectedOrder {
+            order_id: None,
+            client_order_id,
+            side: Some(command.side),
+            position_side: Some(command.position_side),
+            quantity: Some(command.quantity),
+            limit_price: None,
+            time_in_force: None,
+            reduce_only: Some(false),
+        },
+        None,
+    )
+}
+
+/// Creates Gate's native futures price-triggered close order. Gate encodes the hedge leg in
+/// `order_type`; the trigger child is intrinsically reduce-only and quantity bounded.
+pub fn prepare_stop_market(
+    binding: &GateGatewayBinding,
+    rules: &GateContractRules,
+    command: &StopMarketFullPositionCommand,
+) -> Result<GatePreparedMutation, GateExecutionError> {
+    command.validate().map_err(|_| GateExecutionError::Intent)?;
+    validate_owner(
+        binding,
+        rules,
+        &command.owner.exchange,
+        &command.owner.account,
+        &command.owner.symbol,
+    )?;
+    validate_step(
+        command.trigger_price.value(),
+        rules.instrument.price_tick.value(),
+    )?;
+    let contracts = rules
+        .native_order_contracts_checked(command.quantity)
+        .map_err(|_| GateExecutionError::Rules)?;
+    let trigger_rule = match (command.position_side, command.owner.purpose) {
+        (PositionSide::Long, OrderPurpose::Protection)
+        | (PositionSide::Short, OrderPurpose::TakeProfit) => 2,
+        (PositionSide::Long, OrderPurpose::TakeProfit)
+        | (PositionSide::Short, OrderPurpose::Protection) => 1,
+        _ => return Err(GateExecutionError::Intent),
+    };
+    let body = TriggerBody {
+        initial: TriggerInitial {
+            contract: &rules.native_symbol,
+            amount: decimal_wire(signed_contracts(contracts, command.side)),
+            price: "0".to_owned(),
+            tif: "ioc",
+            text: native_client_id(command.client_algo_id.as_str())?,
+            reduce_only: true,
+        },
+        trigger: TriggerSpec {
+            strategy_type: 0,
+            price_type: 1,
+            price: decimal_wire(command.trigger_price.value()),
+            rule: trigger_rule,
+            expiration: 0,
+        },
+        order_type: if command.position_side == PositionSide::Long {
+            "plan-close-long-position"
+        } else {
+            "plan-close-short-position"
+        },
+    };
+    Ok(GatePreparedMutation {
+        binding: binding.gateway_binding().clone(),
+        generation: rules.instrument.generation,
+        origin: binding.config().rest_origin(),
+        method: "POST",
+        endpoint: endpoints::FUTURES_PRICE_ORDERS.to_owned(),
+        body: serde_json::to_vec(&body).map_err(|_| GateExecutionError::Payload)?,
+        kind: GateMutationKind::StopMarketFullPosition,
+        expected: ExpectedOrder {
+            order_id: None,
+            client_order_id: command.client_algo_id.as_str().to_owned(),
+            side: Some(command.side),
+            position_side: Some(command.position_side),
+            quantity: Some(command.quantity),
+            limit_price: Some(command.trigger_price),
+            time_in_force: None,
+            reduce_only: Some(true),
+        },
+        expected_price: Some(ExpectedPriceOrder {
+            order_id: None,
+            client_order_id: command.client_algo_id.as_str().to_owned(),
+            side: command.side,
+            position_side: command.position_side,
+            quantity: command.quantity,
+            trigger_price: command.trigger_price,
+            purpose: command.owner.purpose,
+        }),
+        reduce_episode: Some((
+            command.client_algo_id.as_str().to_owned(),
+            command.position_generation,
+        )),
+    })
+}
+
 pub fn prepare_reduce_once(
     binding: &GateGatewayBinding,
     rules: &GateContractRules,
@@ -263,6 +409,7 @@ pub fn prepare_cancel(
             time_in_force: None,
             reduce_only: None,
         },
+        expected_price: None,
         reduce_episode: None,
     })
 }
@@ -284,6 +431,7 @@ fn prepared_place(
         body: serde_json::to_vec(&body).map_err(|_| GateExecutionError::Payload)?,
         kind,
         expected,
+        expected_price: None,
         reduce_episode,
     })
 }
@@ -296,10 +444,50 @@ pub struct GateExactReadbackRequest {
     pub not_before_ms: u64,
     pub mutation_kind: GateMutationKind,
     expected: ExpectedOrder,
+    expected_price: Option<ExpectedPriceOrder>,
     ack_order: Option<Order>,
 }
 
 impl GateExactReadbackRequest {
+    pub(crate) fn price_lookup_client(&self) -> Option<&str> {
+        self.expected_price
+            .as_ref()
+            .filter(|value| value.order_id.is_none())
+            .map(|value| value.client_order_id.as_str())
+    }
+
+    pub(crate) fn select_price_lookup(
+        &self,
+        payloads: &[String],
+    ) -> Result<String, GateExecutionError> {
+        let expected = native_client_id(
+            self.price_lookup_client()
+                .ok_or(GateExecutionError::Readback)?,
+        )?;
+        let mut found = None;
+        for payload in payloads {
+            let rows: Vec<Value> =
+                serde_json::from_str(payload).map_err(|_| GateExecutionError::Readback)?;
+            for row in rows {
+                if row
+                    .get("initial")
+                    .and_then(Value::as_object)
+                    .and_then(|value| value.get("text"))
+                    .and_then(Value::as_str)
+                    == Some(expected.as_str())
+                {
+                    if found.is_some() {
+                        return Err(GateExecutionError::Readback);
+                    }
+                    found = Some(
+                        serde_json::to_string(&row).map_err(|_| GateExecutionError::Readback)?,
+                    );
+                }
+            }
+        }
+        found.ok_or(GateExecutionError::Readback)
+    }
+
     pub(crate) fn validate(
         &self,
         binding: &GateGatewayBinding,
@@ -309,7 +497,10 @@ impl GateExactReadbackRequest {
             .validate_request_binding(&self.binding)
             .map_err(|_| GateExecutionError::Binding)?;
         validate_scope(binding, rules, self.generation)?;
-        if self.not_before_ms == 0 || !self.endpoint.starts_with(endpoints::FUTURES_ORDER) {
+        if self.not_before_ms == 0
+            || (!self.endpoint.starts_with(endpoints::FUTURES_ORDER)
+                && !self.endpoint.starts_with(endpoints::FUTURES_PRICE_ORDERS))
+        {
             return Err(GateExecutionError::Binding);
         }
         Ok(())
@@ -356,8 +547,16 @@ pub(crate) fn parse_mutation_ack(
         return Err(GateExecutionError::Payload);
     }
     let value: Value = serde_json::from_slice(payload).map_err(|_| GateExecutionError::Payload)?;
-    let order = parse_regular_order(&value, &rules.instrument.symbol, rules)
-        .map_err(GateExecutionError::Order)?;
+    let order = if let Some(expected) = request.expected_price.as_ref() {
+        if request.kind == GateMutationKind::StopMarketFullPosition {
+            price_order_from_create_ack(&value, &rules.instrument.symbol, expected)?
+        } else {
+            parse_price_order(&value, &rules.instrument.symbol, rules, expected)?
+        }
+    } else {
+        parse_regular_order(&value, &rules.instrument.symbol, rules)
+            .map_err(GateExecutionError::Order)?
+    };
     if !matches_expected(&order, &request.expected) {
         return Err(GateExecutionError::Binding);
     }
@@ -369,11 +568,16 @@ pub(crate) fn parse_mutation_ack(
     expected.limit_price = order.limit_price;
     expected.time_in_force = known_time_in_force(&order);
     expected.reduce_only = Some(order.reduce_only);
+    let mut expected_price = request.expected_price;
+    if let Some(expected_price) = &mut expected_price {
+        expected_price.order_id = Some(order.order_id.clone());
+    }
     let readback = exact_readback(
         &request.binding,
         request.generation,
         request.kind,
         expected,
+        expected_price,
         Some(order.clone()),
         received_at_ms,
     )?;
@@ -396,6 +600,7 @@ pub(crate) fn mutation_unknown(
         request.generation,
         request.kind,
         request.expected,
+        request.expected_price,
         None,
         unknown_at_ms,
     )?;
@@ -413,6 +618,7 @@ fn exact_readback(
     generation: u64,
     mutation_kind: GateMutationKind,
     expected: ExpectedOrder,
+    expected_price: Option<ExpectedPriceOrder>,
     ack_order: Option<Order>,
     not_before_ms: u64,
 ) -> Result<GateExactReadbackRequest, GateExecutionError> {
@@ -423,13 +629,19 @@ fn exact_readback(
         .order_id
         .clone()
         .unwrap_or(native_client_id(&expected.client_order_id)?);
+    let family_endpoint = if expected_price.is_some() {
+        endpoints::FUTURES_PRICE_ORDERS
+    } else {
+        endpoints::FUTURES_ORDER
+    };
     Ok(GateExactReadbackRequest {
         binding: binding.clone(),
         generation,
-        endpoint: format!("{}/{}", endpoints::FUTURES_ORDER, identity),
+        endpoint: format!("{family_endpoint}/{identity}"),
         not_before_ms,
         mutation_kind,
         expected,
+        expected_price,
         ack_order,
     })
 }
@@ -470,12 +682,55 @@ pub fn prepare_exact_readback_by_client_id(
             reduce_only: None,
         },
         None,
+        None,
         1,
     )
     .map(|mut request| {
         request.endpoint = format!("{}/{}", endpoints::FUTURES_ORDER, native_client_id);
         request
     })
+}
+
+pub fn prepare_price_readback_by_client_id(
+    binding: &GateGatewayBinding,
+    rules: &GateContractRules,
+    command: &StopMarketFullPositionCommand,
+) -> Result<GateExactReadbackRequest, GateExecutionError> {
+    command.validate().map_err(|_| GateExecutionError::Intent)?;
+    validate_owner(
+        binding,
+        rules,
+        &command.owner.exchange,
+        &command.owner.account,
+        &command.owner.symbol,
+    )?;
+    let expected_price = ExpectedPriceOrder {
+        order_id: None,
+        client_order_id: command.client_algo_id.as_str().to_owned(),
+        side: command.side,
+        position_side: command.position_side,
+        quantity: command.quantity,
+        trigger_price: command.trigger_price,
+        purpose: command.owner.purpose,
+    };
+    exact_readback(
+        binding.gateway_binding(),
+        rules.instrument.generation,
+        GateMutationKind::StopMarketFullPosition,
+        ExpectedOrder {
+            order_id: None,
+            client_order_id: command.client_algo_id.as_str().to_owned(),
+            side: Some(command.side),
+            position_side: Some(command.position_side),
+            quantity: Some(command.quantity),
+            limit_price: Some(command.trigger_price),
+            time_in_force: None,
+            reduce_only: Some(true),
+        },
+        Some(expected_price),
+        None,
+        1,
+    )
 }
 
 impl GateExactOrderReadback {
@@ -496,8 +751,12 @@ impl GateExactOrderReadback {
         }
         let value: Value =
             serde_json::from_str(&payload).map_err(|_| GateExecutionError::Readback)?;
-        let order = parse_regular_order(&value, &rules.instrument.symbol, rules)
-            .map_err(|_| GateExecutionError::Readback)?;
+        let order = if let Some(expected) = request.expected_price.as_ref() {
+            parse_price_order(&value, &rules.instrument.symbol, rules, expected)?
+        } else {
+            parse_regular_order(&value, &rules.instrument.symbol, rules)
+                .map_err(|_| GateExecutionError::Readback)?
+        };
         if !matches_expected(&order, &request.expected)
             || request
                 .ack_order
@@ -514,6 +773,208 @@ impl GateExactOrderReadback {
             raw_payload: payload,
             order,
         })
+    }
+}
+
+fn price_order_from_create_ack(
+    value: &Value,
+    symbol: &venue_domain::domain::Symbol,
+    expected: &ExpectedPriceOrder,
+) -> Result<Order, GateExecutionError> {
+    let object = value.as_object().ok_or(GateExecutionError::Payload)?;
+    let order_id = object
+        .get("id_string")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            object
+                .get("id")
+                .and_then(Value::as_i64)
+                .map(|value| value.to_string())
+        })
+        .filter(|value| valid_native_order_id(value))
+        .ok_or(GateExecutionError::Payload)?;
+    Ok(expected_order(symbol, expected, order_id, OrderState::New))
+}
+
+fn parse_price_order(
+    value: &Value,
+    symbol: &venue_domain::domain::Symbol,
+    rules: &GateContractRules,
+    expected: &ExpectedPriceOrder,
+) -> Result<Order, GateExecutionError> {
+    let item = value.as_object().ok_or(GateExecutionError::Readback)?;
+    let initial = item
+        .get("initial")
+        .and_then(Value::as_object)
+        .ok_or(GateExecutionError::Readback)?;
+    let trigger = item
+        .get("trigger")
+        .and_then(Value::as_object)
+        .ok_or(GateExecutionError::Readback)?;
+    let order_id = item
+        .get("id_string")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            item.get("id")
+                .and_then(Value::as_i64)
+                .map(|value| value.to_string())
+        })
+        .filter(|value| valid_native_order_id(value))
+        .ok_or(GateExecutionError::Readback)?;
+    let native_text = initial
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or(GateExecutionError::Readback)?;
+    let client_id =
+        canonical_client_id_from_native(native_text).ok_or(GateExecutionError::Readback)?;
+    let contracts = value_decimal(initial.get("amount").or_else(|| initial.get("size")))?;
+    let quantity = contracts
+        .abs()
+        .checked_mul(rules.quanto_multiplier)
+        .ok_or(GateExecutionError::Readback)?;
+    let trigger_price = Price::new(value_decimal(trigger.get("price"))?)
+        .map_err(|_| GateExecutionError::Readback)?;
+    let reduce_only = initial
+        .get("is_reduce_only")
+        .or_else(|| initial.get("reduce_only"))
+        .and_then(Value::as_bool)
+        .ok_or(GateExecutionError::Readback)?;
+    let expected_order_type = if expected.position_side == PositionSide::Long {
+        "plan-close-long-position"
+    } else {
+        "plan-close-short-position"
+    };
+    let expected_rule = match (expected.position_side, expected.purpose) {
+        (PositionSide::Long, OrderPurpose::Protection)
+        | (PositionSide::Short, OrderPurpose::TakeProfit) => 2,
+        (PositionSide::Long, OrderPurpose::TakeProfit)
+        | (PositionSide::Short, OrderPurpose::Protection) => 1,
+        _ => return Err(GateExecutionError::Readback),
+    };
+    if expected
+        .order_id
+        .as_ref()
+        .is_some_and(|value| value != &order_id)
+        || initial.get("contract").and_then(Value::as_str) != Some(rules.native_symbol.as_str())
+        || client_id != expected.client_order_id
+        || initial.get("price").and_then(Value::as_str) != Some("0")
+        || initial.get("tif").and_then(Value::as_str) != Some("ioc")
+        || !reduce_only
+        || quantity != expected.quantity
+        || trigger_price != expected.trigger_price
+        || item.get("order_type").and_then(Value::as_str) != Some(expected_order_type)
+        || trigger.get("strategy_type").and_then(Value::as_u64) != Some(0)
+        || trigger.get("price_type").and_then(Value::as_u64) != Some(1)
+        || trigger.get("rule").and_then(Value::as_u64) != Some(expected_rule)
+        || (contracts.is_sign_positive() && expected.side != OrderSide::Buy)
+        || (contracts.is_sign_negative() && expected.side != OrderSide::Sell)
+    {
+        return Err(GateExecutionError::Readback);
+    }
+    let state = match item.get("status").and_then(Value::as_str) {
+        Some("open") => OrderState::New,
+        Some("finished") => match item.get("finish_as").and_then(Value::as_str) {
+            Some("succeeded") => OrderState::Filled,
+            Some("cancelled" | "canceled") => OrderState::Cancelled,
+            Some("expired") => OrderState::Expired,
+            Some("failed") => OrderState::Rejected,
+            _ => return Err(GateExecutionError::Readback),
+        },
+        _ => return Err(GateExecutionError::Readback),
+    };
+    let order = expected_order(symbol, expected, order_id, state);
+    order.validate().map_err(|_| GateExecutionError::Readback)?;
+    Ok(order)
+}
+
+fn expected_order(
+    symbol: &venue_domain::domain::Symbol,
+    expected: &ExpectedPriceOrder,
+    order_id: String,
+    state: OrderState,
+) -> Order {
+    Order {
+        order_id,
+        client_order_id: FieldState::Known(expected.client_order_id.clone()),
+        symbol: symbol.clone(),
+        side: expected.side,
+        position_side: FieldState::Known(expected.position_side),
+        purpose: FieldState::Known(expected.purpose),
+        state,
+        quantity: expected.quantity,
+        filled_quantity: if state == OrderState::Filled {
+            expected.quantity
+        } else {
+            Decimal::ZERO
+        },
+        limit_price: Some(expected.trigger_price),
+        time_in_force: FieldState::NotApplicable,
+        average_price: FieldState::Missing,
+        reduce_only: true,
+    }
+}
+
+impl GateExactReadbackRequest {
+    pub(crate) fn finished_trigger_trade_id(
+        &self,
+        payload: &str,
+    ) -> Result<Option<String>, GateExecutionError> {
+        if self.expected_price.is_none() {
+            return Ok(None);
+        }
+        let value: Value =
+            serde_json::from_str(payload).map_err(|_| GateExecutionError::Readback)?;
+        if value.get("status").and_then(Value::as_str) == Some("finished")
+            && value.get("finish_as").and_then(Value::as_str) == Some("succeeded")
+        {
+            return value
+                .get("trade_id")
+                .and_then(|value| match value {
+                    Value::String(value) => Some(value.clone()),
+                    Value::Number(value) => Some(value.to_string()),
+                    _ => None,
+                })
+                .filter(|value| valid_native_order_id(value))
+                .map(Some)
+                .ok_or(GateExecutionError::Readback);
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn validate_trigger_child(
+        &self,
+        rules: &GateContractRules,
+        payload: &str,
+    ) -> Result<(), GateExecutionError> {
+        let expected = self
+            .expected_price
+            .as_ref()
+            .ok_or(GateExecutionError::Readback)?;
+        let value: Value =
+            serde_json::from_str(payload).map_err(|_| GateExecutionError::Readback)?;
+        let order = parse_regular_order(&value, &rules.instrument.symbol, rules)
+            .map_err(|_| GateExecutionError::Readback)?;
+        if order.side != expected.side
+            || known_position_side(&order) != Some(expected.position_side)
+            || order.quantity != expected.quantity
+            || !order.reduce_only
+        {
+            return Err(GateExecutionError::Readback);
+        }
+        Ok(())
+    }
+}
+
+fn value_decimal(value: Option<&Value>) -> Result<Decimal, GateExecutionError> {
+    match value {
+        Some(Value::String(value)) => value.parse().map_err(|_| GateExecutionError::Readback),
+        Some(Value::Number(value)) => value
+            .to_string()
+            .parse()
+            .map_err(|_| GateExecutionError::Readback),
+        _ => Err(GateExecutionError::Readback),
     }
 }
 
@@ -550,8 +1011,10 @@ pub fn settle_exact_readback(
     } else {
         GateSettlementFinality::Working
     };
-    if request.mutation_kind == GateMutationKind::Cancel
-        && finality != GateSettlementFinality::Terminal
+    if matches!(
+        request.mutation_kind,
+        GateMutationKind::Cancel | GateMutationKind::CancelPrice
+    ) && finality != GateSettlementFinality::Terminal
     {
         return Err(GateExecutionError::Unsettled);
     }
@@ -714,6 +1177,90 @@ struct PlaceBody<'a> {
     text: String,
 }
 
+pub fn prepare_price_cancel(
+    binding: &GateGatewayBinding,
+    rules: &GateContractRules,
+    cancel: &CancelCommand,
+    target: &StopMarketFullPositionCommand,
+    venue_order_id: &str,
+) -> Result<GatePreparedMutation, GateExecutionError> {
+    cancel.validate().map_err(|_| GateExecutionError::Intent)?;
+    target.validate().map_err(|_| GateExecutionError::Intent)?;
+    validate_owner(
+        binding,
+        rules,
+        &cancel.owner.exchange,
+        &cancel.owner.account,
+        &cancel.owner.symbol,
+    )?;
+    validate_owner(
+        binding,
+        rules,
+        &target.owner.exchange,
+        &target.owner.account,
+        &target.owner.symbol,
+    )?;
+    if cancel.target_client_order_id.as_str() != target.client_algo_id.as_str()
+        || !valid_native_order_id(venue_order_id)
+    {
+        return Err(GateExecutionError::Intent);
+    }
+    let expected_price = ExpectedPriceOrder {
+        order_id: Some(venue_order_id.to_owned()),
+        client_order_id: target.client_algo_id.as_str().to_owned(),
+        side: target.side,
+        position_side: target.position_side,
+        quantity: target.quantity,
+        trigger_price: target.trigger_price,
+        purpose: target.owner.purpose,
+    };
+    Ok(GatePreparedMutation {
+        binding: binding.gateway_binding().clone(),
+        generation: rules.instrument.generation,
+        origin: binding.config().rest_origin(),
+        method: "DELETE",
+        endpoint: format!("{}/{}", endpoints::FUTURES_PRICE_ORDERS, venue_order_id),
+        body: Vec::new(),
+        kind: GateMutationKind::CancelPrice,
+        expected: ExpectedOrder {
+            order_id: Some(venue_order_id.to_owned()),
+            client_order_id: target.client_algo_id.as_str().to_owned(),
+            side: Some(target.side),
+            position_side: Some(target.position_side),
+            quantity: Some(target.quantity),
+            limit_price: Some(target.trigger_price),
+            time_in_force: None,
+            reduce_only: Some(true),
+        },
+        expected_price: Some(expected_price),
+        reduce_episode: None,
+    })
+}
+
+#[derive(Serialize)]
+struct TriggerBody<'a> {
+    initial: TriggerInitial<'a>,
+    trigger: TriggerSpec,
+    order_type: &'static str,
+}
+#[derive(Serialize)]
+struct TriggerInitial<'a> {
+    contract: &'a str,
+    amount: String,
+    price: String,
+    tif: &'static str,
+    text: String,
+    reduce_only: bool,
+}
+#[derive(Serialize)]
+struct TriggerSpec {
+    strategy_type: u8,
+    price_type: u8,
+    price: String,
+    rule: u8,
+    expiration: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum GateExecutionError {
     #[error("Gate mutation does not match the exact gateway binding, owner, or generation")]
@@ -804,6 +1351,19 @@ mod tests {
             quantity: Decimal::ONE,
             limit_price: Price::new(Decimal::new(1, 1))?,
             reduce_only: false,
+        })
+    }
+
+    fn stop() -> Result<StopMarketFullPositionCommand, Box<dyn std::error::Error>> {
+        Ok(StopMarketFullPositionCommand {
+            command_id: CommandId::new("stop-command")?,
+            client_algo_id: CommandId::new("protect1")?,
+            owner: owner(OrderPurpose::Protection)?,
+            side: OrderSide::Sell,
+            position_side: PositionSide::Long,
+            quantity: Decimal::ONE,
+            trigger_price: Price::new(Decimal::new(9, 2))?,
+            position_generation: 9,
         })
     }
 
@@ -1014,6 +1574,50 @@ mod tests {
         assert_eq!(
             settle_exact_readback(&accepted.readback, &readback)?.finality,
             GateSettlementFinality::Terminal
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_price_create_scans_history_and_requires_matching_trigger_child()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (binding, rules) = facts()?;
+        let command = stop()?;
+        let prepared = prepare_stop_market(&binding, &rules, &command)?;
+        assert_eq!(prepared.endpoint(), "/futures/usdt/price_orders");
+        let wire: Value = serde_json::from_slice(prepared.body())?;
+        assert_eq!(wire["initial"]["amount"], "-10");
+        assert_eq!(wire["initial"]["reduce_only"], true);
+        assert_eq!(wire["initial"]["text"], "t-protect1");
+        assert_eq!(wire["trigger"]["price_type"], 1);
+        assert_eq!(wire["trigger"]["rule"], 2);
+        assert_eq!(wire["order_type"], "plan-close-long-position");
+
+        let request = prepare_price_readback_by_client_id(&binding, &rules, &command)?;
+        let selected = request.select_price_lookup(&[
+            "[]".to_owned(),
+            include_str!("../tests/fixtures/gate_price_orders_finished.json").to_owned(),
+        ])?;
+        assert_eq!(
+            request.finished_trigger_trade_id(&selected)?.as_deref(),
+            Some("9002")
+        );
+        request.validate_trigger_child(
+            &rules,
+            include_str!("../tests/fixtures/gate_trigger_child_filled.json"),
+        )?;
+        let wrong_child = include_str!("../tests/fixtures/gate_trigger_child_filled.json")
+            .replace("\"is_reduce_only\": true", "\"is_reduce_only\": false");
+        assert_eq!(
+            request.validate_trigger_child(&rules, &wrong_child),
+            Err(GateExecutionError::Readback)
+        );
+
+        let mut missing_trade: Value = serde_json::from_str(&selected)?;
+        missing_trade["trade_id"] = Value::Null;
+        assert_eq!(
+            request.finished_trigger_trade_id(&serde_json::to_string(&missing_trade)?),
+            Err(GateExecutionError::Readback)
         );
         Ok(())
     }

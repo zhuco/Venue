@@ -554,6 +554,7 @@ impl BinanceGridRuntime {
             )
         };
         let plan = GridPlanner::plan(&GridPlannerInput {
+            net_direction: None,
             config,
             instrument: market
                 .rules

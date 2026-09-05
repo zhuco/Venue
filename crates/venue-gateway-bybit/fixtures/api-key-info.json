@@ -2,6 +2,7 @@
   "retCode": 0,
   "retMsg": "OK",
   "result": {
+    "userID": 123456789,
     "apiKey": "test",
     "readOnly": 0,
     "secret": "",

@@ -77,8 +77,8 @@ foreach ($required in @("-Slot 'slot-2'",'Enter-VenueBuildGuard','Exit-VenueBuil
     'Assert-VenueUbuntuRevision $source $ExpectedRevision')) {
     if (-not $entry.Contains($required,[StringComparison]::Ordinal)) { throw "Missing build contract: $required" }
 }
-if ($entry -notmatch '\$controlBinaries\s*=\s*@\(''venue-control-server'',''venue-executor-binance'',''venue-leader-bot-admin''\)') {
-    throw 'Control release must contain Control, Binance Executor and the leader permission administrator.'
+if ($entry -notmatch '\$controlBinaries\s*=\s*@\(''venue-control-server'',''venue-executor-binance'',''venue-leader-bot-admin'',''venue-strategy-admin''\)') {
+    throw 'Control release must contain Control, the singleton Executor, and both administrator tools.'
 }
 if ($entry.Contains("'venue-copy-worker'",[StringComparison]::Ordinal)) {
     throw 'Frozen venue-copy-worker must not remain in the KOL Control release.'

@@ -1,4 +1,5 @@
 mod account_gateway;
+mod algo_execution;
 mod binding;
 mod capability;
 mod config;

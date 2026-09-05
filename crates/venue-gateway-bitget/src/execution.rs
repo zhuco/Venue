@@ -52,6 +52,25 @@ pub struct BitgetPlaceIntent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BitgetMarketIntent {
+    pub client_order_id: String,
+    pub side: OrderSide,
+    pub position_side: PositionSide,
+    pub quantity: Decimal,
+    pub reduce_only: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BitgetStopIntent {
+    pub client_algo_id: String,
+    pub side: OrderSide,
+    pub position_side: PositionSide,
+    pub quantity: Decimal,
+    pub trigger_price: Price,
+    pub take_profit: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BitgetReduceOnceIntent {
     pub client_order_id: String,
     pub position_side: PositionSide,
@@ -67,8 +86,23 @@ pub struct BitgetCancelIntent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BitgetMutationKind {
     Place,
+    PlaceMarket,
     Cancel,
+    CancelStrategy,
     ReduceOnce,
+    StopMarketFullPosition,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BitgetExpectedStrategy {
+    pub client_order_id: String,
+    pub order_id: Option<String>,
+    pub symbol: venue_domain::domain::Symbol,
+    pub side: OrderSide,
+    pub position_side: PositionSide,
+    pub quantity: Decimal,
+    pub trigger_price: Price,
+    pub take_profit: bool,
 }
 
 /// A prepared request is intentionally non-Clone and is consumed by the one-shot transport.
@@ -83,14 +117,19 @@ pub struct BitgetPreparedMutation {
     pub(crate) expected_order_id: Option<String>,
     pub(crate) expected_client_order_id: Option<String>,
     pub(crate) expected_time_in_force: Option<BitgetTimeInForce>,
+    pub(crate) expected_strategy: Option<BitgetExpectedStrategy>,
 }
 
 impl BitgetPreparedMutation {
     pub(crate) fn validate(&self, config: &BitgetConfig) -> Result<(), BitgetExecutionError> {
         validate_binding(&self.binding, config)?;
         let expected_path = match self.kind {
-            BitgetMutationKind::Place | BitgetMutationKind::ReduceOnce => endpoints::PLACE_ORDER,
+            BitgetMutationKind::Place
+            | BitgetMutationKind::PlaceMarket
+            | BitgetMutationKind::ReduceOnce => endpoints::PLACE_ORDER,
+            BitgetMutationKind::StopMarketFullPosition => endpoints::PLACE_STRATEGY_ORDER,
             BitgetMutationKind::Cancel => endpoints::CANCEL_ORDER,
+            BitgetMutationKind::CancelStrategy => endpoints::CANCEL_STRATEGY_ORDER,
         };
         if self.attempt_id == 0
             || self.generation == 0
@@ -203,6 +242,160 @@ pub fn prepare_reduce_once_request(
     )
 }
 
+/// Builds an exposure-increasing market order.  The explicit entry purpose and non-reduce-only
+/// invariant are validated by the shared command before this adapter is called.
+pub fn prepare_market_request(
+    binding: &GatewayBinding,
+    config: &BitgetConfig,
+    rules: &BitgetInstrumentRules,
+    attempt_id: u64,
+    intent: &BitgetMarketIntent,
+    now_ms: u64,
+) -> Result<BitgetPreparedMutation, BitgetExecutionError> {
+    validate_scope(binding, config, rules, attempt_id, now_ms)?;
+    validate_client_order_id(&intent.client_order_id)?;
+    validate_hedge_direction(intent.position_side, intent.side, intent.reduce_only)?;
+    validate_quantity(rules, intent.quantity, false)?;
+    let body = PlaceWire {
+        category: crate::private::BITGET_UTA_FUTURES_CATEGORY,
+        symbol: rules.native_symbol(),
+        client_oid: &intent.client_order_id,
+        side: side_wire(intent.side),
+        pos_side: position_side_wire(intent.position_side)?,
+        order_type: "market",
+        qty: decimal_wire(intent.quantity),
+        price: None,
+        time_in_force: None,
+    };
+    prepared_place(
+        binding,
+        attempt_id,
+        rules.snapshot.metadata.instrument.generation,
+        BitgetMutationKind::PlaceMarket,
+        &intent.client_order_id,
+        None,
+        body,
+    )
+}
+
+/// UTA v3 TPSL strategy with an explicit partial quantity and market child. `partial` preserves
+/// the durable quantity instead of allowing the venue to resize the close against a later leg.
+pub fn prepare_stop_market_request(
+    binding: &GatewayBinding,
+    config: &BitgetConfig,
+    rules: &BitgetInstrumentRules,
+    attempt_id: u64,
+    intent: &BitgetStopIntent,
+    now_ms: u64,
+) -> Result<BitgetPreparedMutation, BitgetExecutionError> {
+    validate_scope(binding, config, rules, attempt_id, now_ms)?;
+    validate_client_order_id(&intent.client_algo_id)?;
+    validate_hedge_direction(intent.position_side, intent.side, true)?;
+    validate_quantity(rules, intent.quantity, true)?;
+    if !rules
+        .snapshot
+        .metadata
+        .price
+        .accepts(intent.trigger_price.value())
+        .map_err(|_| BitgetExecutionError::Rules)?
+    {
+        return Err(BitgetExecutionError::Rules);
+    }
+    let (take_profit, stop_loss) = if intent.take_profit {
+        (Some(decimal_wire(intent.trigger_price.value())), None)
+    } else {
+        (None, Some(decimal_wire(intent.trigger_price.value())))
+    };
+    let body = StrategyWire {
+        category: crate::private::BITGET_UTA_FUTURES_CATEGORY,
+        symbol: rules.native_symbol(),
+        strategy_type: "tpsl",
+        tpsl_mode: "partial",
+        side: side_wire(intent.side),
+        pos_side: position_side_wire(intent.position_side)?,
+        qty: decimal_wire(intent.quantity),
+        reduce_only: "yes",
+        client_oid: &intent.client_algo_id,
+        take_profit,
+        stop_loss,
+        tp_trigger_by: intent.take_profit.then_some("mark"),
+        sl_trigger_by: (!intent.take_profit).then_some("mark"),
+        tp_order_type: intent.take_profit.then_some("market"),
+        sl_order_type: (!intent.take_profit).then_some("market"),
+    };
+    Ok(BitgetPreparedMutation {
+        binding: binding.clone(),
+        attempt_id,
+        generation: rules.snapshot.metadata.instrument.generation,
+        kind: BitgetMutationKind::StopMarketFullPosition,
+        path: endpoints::PLACE_STRATEGY_ORDER,
+        body: serde_json::to_vec(&body).map_err(|_| BitgetExecutionError::Payload)?,
+        expected_order_id: None,
+        expected_client_order_id: Some(intent.client_algo_id.clone()),
+        expected_time_in_force: None,
+        expected_strategy: Some(BitgetExpectedStrategy {
+            client_order_id: intent.client_algo_id.clone(),
+            order_id: None,
+            symbol: binding.symbol.clone(),
+            side: intent.side,
+            position_side: intent.position_side,
+            quantity: intent.quantity,
+            trigger_price: intent.trigger_price,
+            take_profit: intent.take_profit,
+        }),
+    })
+}
+
+pub fn prepare_strategy_cancel_request(
+    binding: &GatewayBinding,
+    config: &BitgetConfig,
+    generation: u64,
+    attempt_id: u64,
+    target: &venue_domain::domain::StopMarketFullPositionCommand,
+    native_order_id: &str,
+) -> Result<BitgetPreparedMutation, BitgetExecutionError> {
+    validate_binding(binding, config)?;
+    target
+        .validate()
+        .map_err(|_| BitgetExecutionError::Position)?;
+    if generation == 0
+        || attempt_id == 0
+        || target.owner.exchange != binding.venue.as_str()
+        || target.owner.account != binding.trading_account_id
+        || target.owner.symbol != binding.symbol
+        || !valid_native_id(native_order_id)
+    {
+        return Err(BitgetExecutionError::Binding);
+    }
+    let body = serde_json::to_vec(&CancelWire {
+        category: crate::private::BITGET_UTA_FUTURES_CATEGORY,
+        order_id: Some(native_order_id),
+        client_oid: None,
+    })
+    .map_err(|_| BitgetExecutionError::Payload)?;
+    Ok(BitgetPreparedMutation {
+        binding: binding.clone(),
+        attempt_id,
+        generation,
+        kind: BitgetMutationKind::CancelStrategy,
+        path: endpoints::CANCEL_STRATEGY_ORDER,
+        body,
+        expected_order_id: Some(native_order_id.to_owned()),
+        expected_client_order_id: Some(target.client_algo_id.as_str().to_owned()),
+        expected_time_in_force: None,
+        expected_strategy: Some(BitgetExpectedStrategy {
+            client_order_id: target.client_algo_id.as_str().to_owned(),
+            order_id: Some(native_order_id.to_owned()),
+            symbol: target.owner.symbol.clone(),
+            side: target.side,
+            position_side: target.position_side,
+            quantity: target.quantity,
+            trigger_price: target.trigger_price,
+            take_profit: target.owner.purpose == venue_domain::domain::OrderPurpose::TakeProfit,
+        }),
+    })
+}
+
 pub fn prepare_cancel_request(
     binding: &GatewayBinding,
     config: &BitgetConfig,
@@ -238,6 +431,7 @@ pub fn prepare_cancel_request(
         expected_order_id: intent.order_id.clone(),
         expected_client_order_id: intent.client_order_id.clone(),
         expected_time_in_force: None,
+        expected_strategy: None,
     })
 }
 
@@ -260,6 +454,7 @@ fn prepared_place(
         expected_order_id: None,
         expected_client_order_id: Some(client_order_id.to_owned()),
         expected_time_in_force,
+        expected_strategy: None,
     })
 }
 
@@ -303,6 +498,7 @@ pub struct BitgetMutationAck {
     pub payload_sha256: String,
     pub raw_payload: Vec<u8>,
     pub expected_time_in_force: Option<BitgetTimeInForce>,
+    pub(crate) expected_strategy: Option<BitgetExpectedStrategy>,
 }
 
 pub fn parse_mutation_ack(
@@ -321,12 +517,27 @@ pub fn parse_mutation_ack(
     if accepted_at_ms == 0 || received_at_ms < accepted_at_ms {
         return Err(BitgetExecutionError::Clock);
     }
-    let data = object
-        .get("data")
-        .and_then(Value::as_object)
-        .ok_or(BitgetExecutionError::Payload)?;
-    let order_id = identifier(data.get("orderId"))?;
-    let client_order_id = identifier(data.get("clientOid"))?;
+    let (order_id, client_order_id) = if request.kind == BitgetMutationKind::CancelStrategy {
+        (
+            request
+                .expected_order_id
+                .clone()
+                .ok_or(BitgetExecutionError::Identity)?,
+            request
+                .expected_client_order_id
+                .clone()
+                .ok_or(BitgetExecutionError::Identity)?,
+        )
+    } else {
+        let data = object
+            .get("data")
+            .and_then(Value::as_object)
+            .ok_or(BitgetExecutionError::Payload)?;
+        (
+            identifier(data.get("orderId"))?,
+            identifier(data.get("clientOid"))?,
+        )
+    };
     if request
         .expected_order_id
         .as_ref()
@@ -351,6 +562,7 @@ pub fn parse_mutation_ack(
         payload_sha256: payload_digest(payload),
         raw_payload: payload.to_vec(),
         expected_time_in_force: request.expected_time_in_force,
+        expected_strategy: request.expected_strategy.clone(),
     })
 }
 
@@ -372,6 +584,7 @@ pub struct BitgetUnknownMutation {
     pub dispatched_at_ms: u64,
     pub reason: BitgetUnknownReason,
     pub expected_time_in_force: Option<BitgetTimeInForce>,
+    pub(crate) expected_strategy: Option<BitgetExpectedStrategy>,
 }
 
 pub(crate) fn into_unknown(
@@ -389,6 +602,7 @@ pub(crate) fn into_unknown(
         dispatched_at_ms,
         reason,
         expected_time_in_force: request.expected_time_in_force,
+        expected_strategy: request.expected_strategy,
     }
 }
 
@@ -415,6 +629,7 @@ pub struct BitgetExactReadbackRequest {
     pub expected_kind: BitgetMutationKind,
     pub expected_time_in_force: Option<BitgetTimeInForce>,
     pub(crate) query: String,
+    pub(crate) expected_strategy: Option<BitgetExpectedStrategy>,
 }
 
 pub fn build_ack_readback_request(
@@ -428,6 +643,7 @@ pub fn build_ack_readback_request(
         ack.received_at_ms,
         ack.kind,
         ack.expected_time_in_force,
+        ack.expected_strategy.clone(),
     )
 }
 
@@ -460,6 +676,7 @@ pub fn build_unknown_recovery_readback_request(
         unknown.dispatched_at_ms,
         unknown.kind,
         unknown.expected_time_in_force,
+        unknown.expected_strategy.clone(),
     )
 }
 
@@ -471,19 +688,29 @@ fn build_readback(
     not_before_ms: u64,
     expected_kind: BitgetMutationKind,
     expected_time_in_force: Option<BitgetTimeInForce>,
+    expected_strategy: Option<BitgetExpectedStrategy>,
 ) -> Result<BitgetExactReadbackRequest, BitgetExecutionError> {
     if attempt_id == 0 || generation == 0 || not_before_ms == 0 {
         return Err(BitgetExecutionError::Binding);
     }
-    let query = match &lookup {
-        BitgetOrderLookup::OrderId(value) if valid_native_id(value) => {
-            format!("orderId={}", encode_query(value))
+    let query = if expected_strategy.is_some() {
+        match &lookup {
+            BitgetOrderLookup::OrderId(value) if valid_native_id(value) => {}
+            BitgetOrderLookup::ClientOrderId(value) => validate_client_order_id(value)?,
+            _ => return Err(BitgetExecutionError::Identity),
         }
-        BitgetOrderLookup::ClientOrderId(value) => {
-            validate_client_order_id(value)?;
-            format!("clientOid={}", encode_query(value))
+        "category=USDT-FUTURES&type=tpsl".to_owned()
+    } else {
+        match &lookup {
+            BitgetOrderLookup::OrderId(value) if valid_native_id(value) => {
+                format!("orderId={}", encode_query(value))
+            }
+            BitgetOrderLookup::ClientOrderId(value) => {
+                validate_client_order_id(value)?;
+                format!("clientOid={}", encode_query(value))
+            }
+            _ => return Err(BitgetExecutionError::Identity),
         }
-        _ => return Err(BitgetExecutionError::Identity),
     };
     Ok(BitgetExactReadbackRequest {
         binding: binding.clone(),
@@ -494,6 +721,7 @@ fn build_readback(
         expected_kind,
         expected_time_in_force,
         query,
+        expected_strategy,
     })
 }
 
@@ -525,15 +753,22 @@ pub fn parse_exact_order_readback(
     if object.get("code").and_then(Value::as_str) != Some("00000") {
         return Err(BitgetExecutionError::VenueRejected);
     }
-    let (order, actual_time_in_force) = match object.get("data") {
-        None | Some(Value::Null) => (None, None),
-        Some(value) => (
-            Some(
-                parse_regular_order(value, &request.binding.symbol)
-                    .map_err(|_| BitgetExecutionError::Payload)?,
+    let (order, actual_time_in_force) = if let Some(expected) = &request.expected_strategy {
+        (
+            strategy_order_from_payload(object.get("data"), &request.lookup, expected)?,
+            None,
+        )
+    } else {
+        match object.get("data") {
+            None | Some(Value::Null) => (None, None),
+            Some(value) => (
+                Some(
+                    parse_regular_order(value, &request.binding.symbol)
+                        .map_err(|_| BitgetExecutionError::Payload)?,
+                ),
+                native_time_in_force(value)?,
             ),
-            native_time_in_force(value)?,
-        ),
+        }
     };
     if order
         .as_ref()
@@ -550,6 +785,149 @@ pub fn parse_exact_order_readback(
         payload_sha256: payload_digest(&payload),
         raw_payload: payload,
     })
+}
+
+fn strategy_order_from_payload(
+    data: Option<&Value>,
+    lookup: &BitgetOrderLookup,
+    expected: &BitgetExpectedStrategy,
+) -> Result<Option<Order>, BitgetExecutionError> {
+    let rows = match data {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Array(rows)) => rows.as_slice(),
+        Some(Value::Object(object)) => object
+            .get("list")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .ok_or(BitgetExecutionError::Payload)?,
+        Some(_) => return Err(BitgetExecutionError::Payload),
+    };
+    let mut matches = rows.iter().filter(|row| {
+        let order_id = row.get("orderId").and_then(Value::as_str);
+        let client_id = row.get("clientOid").and_then(Value::as_str);
+        match lookup {
+            BitgetOrderLookup::OrderId(expected) => order_id == Some(expected.as_str()),
+            BitgetOrderLookup::ClientOrderId(expected) => client_id == Some(expected.as_str()),
+        }
+    });
+    let Some(row) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(BitgetExecutionError::Identity);
+    }
+    parse_strategy_order(row, expected).map(Some)
+}
+
+fn parse_strategy_order(
+    row: &Value,
+    expected: &BitgetExpectedStrategy,
+) -> Result<Order, BitgetExecutionError> {
+    let item = row.as_object().ok_or(BitgetExecutionError::Payload)?;
+    let order_id = identifier(item.get("orderId"))?;
+    let client_order_id = identifier(item.get("clientOid"))?;
+    let symbol = identifier(item.get("symbol"))?;
+    let expected_symbol = format!("{}{}", expected.symbol.base(), expected.symbol.quote());
+    let quantity = strategy_decimal(item.get("qty"))?;
+    let position_side = match item.get("posSide").and_then(Value::as_str) {
+        Some("long") => PositionSide::Long,
+        Some("short") => PositionSide::Short,
+        _ => return Err(BitgetExecutionError::Payload),
+    };
+    let side = match item.get("side").and_then(Value::as_str) {
+        Some("buy") => OrderSide::Buy,
+        Some("sell") => OrderSide::Sell,
+        None => close_side(position_side)?,
+        _ => return Err(BitgetExecutionError::Payload),
+    };
+    let trigger_key = if expected.take_profit {
+        "takeProfit"
+    } else {
+        "stopLoss"
+    };
+    let other_key = if expected.take_profit {
+        "stopLoss"
+    } else {
+        "takeProfit"
+    };
+    let trigger = strategy_decimal(item.get(trigger_key))?;
+    let other_absent = item
+        .get(other_key)
+        .is_none_or(|value| value.is_null() || value.as_str() == Some(""));
+    let order_type_key = if expected.take_profit {
+        "tpOrderType"
+    } else {
+        "slOrderType"
+    };
+    let status = match item.get("status").and_then(Value::as_str) {
+        Some("pending" | "submitting") => OrderState::New,
+        Some("success") => OrderState::Filled,
+        Some("cancelled") => OrderState::Cancelled,
+        Some("failed") => OrderState::Rejected,
+        _ => return Err(BitgetExecutionError::Payload),
+    };
+    let reduce_only = match item.get("reduceOnly") {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::String(value)) if value.eq_ignore_ascii_case("yes") => true,
+        Some(Value::String(value)) if value.eq_ignore_ascii_case("no") => false,
+        _ => return Err(BitgetExecutionError::Payload),
+    };
+    if item.get("category").and_then(Value::as_str) != Some("USDT-FUTURES")
+        || item
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value != "tpsl")
+        || symbol != expected_symbol
+        || client_order_id != expected.client_order_id
+        || expected
+            .order_id
+            .as_ref()
+            .is_some_and(|value| value != &order_id)
+        || quantity != expected.quantity
+        || position_side != expected.position_side
+        || side != expected.side
+        || trigger != expected.trigger_price.value()
+        || !other_absent
+        || item.get(order_type_key).and_then(Value::as_str) != Some("market")
+        || !reduce_only
+    {
+        return Err(BitgetExecutionError::Readback);
+    }
+    let filled_quantity = if status == OrderState::Filled {
+        quantity
+    } else {
+        Decimal::ZERO
+    };
+    Ok(Order {
+        order_id,
+        client_order_id: FieldState::Known(client_order_id),
+        symbol: expected.symbol.clone(),
+        side,
+        position_side: FieldState::Known(position_side),
+        purpose: FieldState::Known(if expected.take_profit {
+            venue_domain::domain::OrderPurpose::TakeProfit
+        } else {
+            venue_domain::domain::OrderPurpose::Protection
+        }),
+        state: status,
+        quantity,
+        filled_quantity,
+        limit_price: Some(expected.trigger_price),
+        time_in_force: FieldState::NotApplicable,
+        average_price: FieldState::Missing,
+        reduce_only,
+    })
+}
+
+fn strategy_decimal(value: Option<&Value>) -> Result<Decimal, BitgetExecutionError> {
+    match value {
+        Some(Value::String(value)) => value.parse().map_err(|_| BitgetExecutionError::Payload),
+        Some(Value::Number(value)) => value
+            .to_string()
+            .parse()
+            .map_err(|_| BitgetExecutionError::Payload),
+        _ => Err(BitgetExecutionError::Payload),
+    }
 }
 
 fn native_time_in_force(value: &Value) -> Result<Option<BitgetTimeInForce>, BitgetExecutionError> {
@@ -589,6 +967,7 @@ pub fn settle_ack_readback(
         || ack.kind != readback.request.expected_kind
         || readback.request.not_before_ms != ack.received_at_ms
         || readback.request.expected_time_in_force != ack.expected_time_in_force
+        || readback.request.expected_strategy != ack.expected_strategy
         || readback
             .order
             .as_ref()
@@ -614,7 +993,11 @@ pub fn settle_ack_readback(
         order.state,
         OrderState::Filled | OrderState::Cancelled | OrderState::Expired | OrderState::Rejected
     );
-    if ack.kind == BitgetMutationKind::Cancel && !terminal {
+    if matches!(
+        ack.kind,
+        BitgetMutationKind::Cancel | BitgetMutationKind::CancelStrategy
+    ) && !terminal
+    {
         return Err(BitgetExecutionError::Unsettled);
     }
     Ok(BitgetMutationSettlement {
@@ -637,6 +1020,7 @@ pub fn settle_unknown_readback(
         || unknown.kind != readback.request.expected_kind
         || readback.request.not_before_ms != unknown.dispatched_at_ms
         || readback.request.expected_time_in_force != unknown.expected_time_in_force
+        || readback.request.expected_strategy != unknown.expected_strategy
     {
         return Err(BitgetExecutionError::Readback);
     }
@@ -665,7 +1049,11 @@ pub fn settle_unknown_readback(
     } else {
         BitgetReadbackFinality::Working
     };
-    if unknown.kind == BitgetMutationKind::Cancel && finality != BitgetReadbackFinality::Terminal {
+    if matches!(
+        unknown.kind,
+        BitgetMutationKind::Cancel | BitgetMutationKind::CancelStrategy
+    ) && finality != BitgetReadbackFinality::Terminal
+    {
         return Err(BitgetExecutionError::Unsettled);
     }
     Ok(BitgetMutationSettlement {
@@ -698,6 +1086,33 @@ struct CancelWire<'a> {
     order_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     client_oid: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StrategyWire<'a> {
+    category: &'static str,
+    symbol: &'a str,
+    #[serde(rename = "type")]
+    strategy_type: &'static str,
+    tpsl_mode: &'static str,
+    side: &'static str,
+    pos_side: &'static str,
+    qty: String,
+    reduce_only: &'static str,
+    client_oid: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    take_profit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_loss: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tp_trigger_by: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sl_trigger_by: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tp_order_type: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sl_order_type: Option<&'static str>,
 }
 
 fn validate_scope(
@@ -1229,6 +1644,7 @@ mod tests {
             dispatched_at_ms: 100,
             reason: BitgetUnknownReason::Timeout,
             expected_time_in_force: Some(BitgetTimeInForce::PostOnly),
+            expected_strategy: None,
         };
         let config = BitgetConfig::for_mode(GatewayMode::Live);
         let readback = parse_exact_order_readback(
@@ -1318,6 +1734,7 @@ mod tests {
             dispatched_at_ms: 100,
             reason: BitgetUnknownReason::Timeout,
             expected_time_in_force: None,
+            expected_strategy: None,
         };
         let readback = parse_exact_order_readback(
             &config,

@@ -20,6 +20,7 @@ use venue_control_protocol::accounts::{AccountErrorCode, SecretValue, UserSummar
 
 pub(crate) use credentials::credential_scope;
 pub use crypto::CredentialCipher;
+pub(crate) use crypto::opaque_id as strategy_credential_id;
 pub const MIGRATION_0015: &str = include_str!("../../migrations/0015_accounts.sql");
 
 #[derive(Clone, Copy, Debug, thiserror::Error)]

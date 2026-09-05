@@ -257,7 +257,7 @@ impl PgExecutorStore {
     pub async fn recover_nonterminal(
         &self,
     ) -> Result<Vec<RecoverableBinanceCommand>, BinanceCommandLedgerError> {
-        let rows = sqlx::query("SELECT command_id,command_origin,owner_user_id,trading_account_id,credential_id,symbol,order_side,position_side,requested_quantity,command_phase,order_kind,limit_price,selected_native_order_id,target_client_order_id,client_order_id,native_order_id,command_state,reconcile_attempts,next_reconcile_ms,grid_batch_id,dispatch_sequence,copy_risk FROM venue_binance_commands WHERE command_state IN ('pending','sending','accepted','reconcile_required') ORDER BY created_ms,COALESCE(grid_batch_id,command_id),COALESCE(dispatch_sequence,0),command_id")
+        let rows = sqlx::query("SELECT command_id,command_origin,owner_user_id,trading_account_id,credential_id,symbol,order_side,position_side,requested_quantity,command_phase,order_kind,limit_price,selected_native_order_id,target_client_order_id,client_order_id,native_order_id,command_state,reconcile_attempts,next_reconcile_ms,grid_batch_id,dispatch_sequence,copy_risk FROM venue_binance_commands WHERE command_origin <> 'strategy' AND command_state IN ('pending','sending','accepted','reconcile_required') ORDER BY created_ms,COALESCE(grid_batch_id,command_id),COALESCE(dispatch_sequence,0),command_id")
             .fetch_all(&self.pool).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
         rows.into_iter().map(recoverable_command).collect()
     }

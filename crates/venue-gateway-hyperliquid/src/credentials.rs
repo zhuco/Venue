@@ -27,7 +27,7 @@ impl HyperliquidCredentials {
             std::env::var("HYPERLIQUID_API_WALLET_PRIVATE_KEY")
                 .map_err(|_| HyperliquidError::Credentials)?,
         );
-        Self::from_secrets(
+        Self::from_secret_string(
             account_address,
             vault_address,
             api_wallet_address,
@@ -42,7 +42,7 @@ impl HyperliquidCredentials {
         api_wallet_address: impl Into<String>,
         api_wallet_private_key: impl Into<String>,
     ) -> Result<Self, HyperliquidError> {
-        Self::from_secrets(
+        Self::from_secret_string(
             account_address.into(),
             vault_address,
             api_wallet_address.into(),
@@ -50,7 +50,23 @@ impl HyperliquidCredentials {
         )
     }
 
-    fn from_secrets(
+    /// Builds request-scoped credentials from memory. The private key is wrapped before it is
+    /// retained and is never included in a debug value or serialized payload.
+    pub fn from_secrets(
+        account_address: impl Into<String>,
+        vault_address: Option<String>,
+        api_wallet_address: impl Into<String>,
+        api_wallet_private_key: SecretString,
+    ) -> Result<Self, HyperliquidError> {
+        Self::from_secret_string(
+            account_address.into(),
+            vault_address,
+            api_wallet_address.into(),
+            api_wallet_private_key,
+        )
+    }
+
+    fn from_secret_string(
         account_address: String,
         vault_address: Option<String>,
         api_wallet_address: String,

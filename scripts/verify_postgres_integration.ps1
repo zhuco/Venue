@@ -28,10 +28,13 @@ if ($databaseUri.Scheme -notin @('postgres', 'postgresql') -or [string]::IsNullO
 $env:VENUE_CONTROL_POSTGRES_REQUIRED = '1'
 Write-Output 'PostgreSQL integration gate: configured database connection (connection string redacted).'
 
-function Invoke-PostgresIntegrationTest {
-    param([Parameter(Mandatory)] [string]$TestTarget)
+function Invoke-PostgresCargoTest {
+    param(
+        [Parameter(Mandatory)] [string]$Name,
+        [Parameter(Mandatory)] [string[]]$CargoArguments
+    )
 
-    $output = @(& cargo test --locked -p venue-control --test $TestTarget 2>&1)
+    $output = @(& cargo @CargoArguments 2>&1)
     $exitCode = $LASTEXITCODE
     $output | ForEach-Object { Write-Output $_ }
     if ($exitCode -ne 0) {
@@ -42,11 +45,19 @@ function Invoke-PostgresIntegrationTest {
             $summary = $summary.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Output "::error title=PostgreSQL integration test failed::$summary"
         }
-        throw "PostgreSQL integration test $TestTarget failed with exit code $exitCode"
+        throw "PostgreSQL integration test $Name failed with exit code $exitCode"
     }
     if ($output | Select-String -SimpleMatch 'SKIP:') {
-        throw "PostgreSQL integration test $TestTarget reported a skipped test"
+        throw "PostgreSQL integration test $Name reported a skipped test"
     }
+}
+
+function Invoke-PostgresIntegrationTest {
+    param([Parameter(Mandatory)] [string]$TestTarget)
+
+    Invoke-PostgresCargoTest -Name $TestTarget -CargoArguments @(
+        'test', '--locked', '-p', 'venue-control', '--test', $TestTarget
+    )
 }
 
 Invoke-PostgresIntegrationTest -TestTarget 'account_delivery_postgres_integration'
@@ -54,7 +65,13 @@ Invoke-PostgresIntegrationTest -TestTarget 'copy_postgres_integration'
 Invoke-PostgresIntegrationTest -TestTarget 'kol_mvp_postgres_integration'
 Invoke-PostgresIntegrationTest -TestTarget 'grid_store_postgres_integration'
 Invoke-PostgresIntegrationTest -TestTarget 'grid_owner_settlement_postgres'
+Invoke-PostgresIntegrationTest -TestTarget 'multi_venue_executor_postgres'
+Invoke-PostgresCargoTest -Name 'multi_venue_grid_lifecycle' -CargoArguments @(
+    'test', '--locked', '-p', 'venue-control', '--lib',
+    'multi_venue_grid::tests::grid_commands_and_observations_commit_atomically_with_lifecycle_fence',
+    '--', '--exact'
+)
 
-Write-Output 'PostgreSQL integration gate passed: delivery, Copy, KOL MVP, and Grid tests connected to the test database.'
+Write-Output 'PostgreSQL integration gate passed: delivery, Copy, KOL MVP, Binance Grid, multi-venue ledger, and strategy Grid tests connected to the test database.'
 } finally { Pop-Location }
 } finally { Exit-VenueBuildGuard $venueBuildLease }

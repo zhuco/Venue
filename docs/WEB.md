@@ -2,7 +2,7 @@
 
 KOL 登录 `/` 或 `/login` 后可在“托管跟单账户”打开“添加托管 API Key”对话框；保存成功清空密钥输入并列出掩码，提供手动权限验证。批量最多 10 个，每行稳定请求编号用于结果不确定后的原内容重试，浏览器不将密钥保存至本地存储。BFF `managed-followers` / `managed-verify` 继续强制同源、加密 Cookie、CSRF 与响应字段白名单。该入口不启用跟单。
 
-Current product target: the Binance KOL copy-trading MVP defined in [KOL_COPY_MVP](KOL_COPY_MVP.md). Web must provide the KOL invite landing page, real user registration/login, Binance API binding and verification, copy settings/status, a basic KOL terminal, and KOL-owned page-copy editing. Grid and every non-Binance venue are deferred. The browser never contains an exchange gateway or decrypted API credential.
+Current Web scope: the Binance KOL invite landing page, user registration/login, API binding and verification, managed followers, follow settings/status and leader bot controls. The Binance trading terminal and unified Grid/leader robot list are implemented in the sibling VenueFlow desktop client; a full browser terminal is not yet equivalent. Binance Grid shares the current Executor, while non-Binance migration remains outside this release. Product acceptance follows [KOL_COPY_MVP](KOL_COPY_MVP.md). The browser never contains an exchange gateway or decrypted API credential.
 
 Responsive Control client using schema v2 only. Product version and known limits: [root README](../README.md), [release notes](CHANGELOG.md). Development workflow: [DEVELOPMENT](DEVELOPMENT.md).
 
@@ -12,7 +12,7 @@ The customer console at `/` provides login, owned API binding/verification, foll
 
 The earlier operator console is retained at `/ops` with its separate environment-injected session. Customer requests never inherit this identity. KOL page editing and the full browser trading terminal remain separate product acceptance items; this change provides the leader bot controls and preserves the desktop terminal.
 
-Target user routes are `/join/<invite_code>`, registration/login/logout, API management, copy settings/status, and the KOL public page. Target KOL routes add page preview/edit and a basic terminal scoped only to the KOL's own verified account. KOL pages may contain bounded plain text but no arbitrary HTML or script; fixed platform risk text is not editable.
+KOL page content is bounded plain text, never arbitrary HTML or script; fixed platform risk text is not editable. Product requirements for page editing are maintained in the KOL contract, separately from the routes currently exposed by the customer console.
 
 ## Build and run
 

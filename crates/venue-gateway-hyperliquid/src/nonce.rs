@@ -27,6 +27,22 @@ pub struct PersistedNonce {
 }
 
 impl PersistedNonce {
+    pub(crate) fn from_committed(
+        agent_address: &str,
+        nonce: u64,
+    ) -> Result<Self, HyperliquidError> {
+        if nonce == 0 || !valid_address(agent_address) {
+            return Err(HyperliquidError::Nonce);
+        }
+        Ok(Self {
+            checkpoint: NonceCheckpoint {
+                schema_version: 1,
+                agent_address: agent_address.to_ascii_lowercase(),
+                last_nonce_ms: nonce,
+            },
+        })
+    }
+
     #[must_use]
     pub const fn value(&self) -> u64 {
         self.checkpoint.last_nonce_ms
@@ -82,4 +98,20 @@ pub fn reserve_next_nonce<S: HyperliquidNonceStore>(
         return Err(HyperliquidError::Nonce);
     }
     Ok(PersistedNonce { checkpoint })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AGENT: &str = "0x2222222222222222222222222222222222222222";
+
+    #[test]
+    fn committed_nonce_is_in_memory_and_bound_to_agent() -> Result<(), HyperliquidError> {
+        let nonce = PersistedNonce::from_committed(AGENT, 1_700_000_000_001)?;
+        assert_eq!(nonce.value(), 1_700_000_000_001);
+        assert_eq!(nonce.agent_address(), AGENT);
+        assert!(PersistedNonce::from_committed(AGENT, 0).is_err());
+        Ok(())
+    }
 }

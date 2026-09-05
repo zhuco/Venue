@@ -16,6 +16,9 @@ use venue_execution::{
 };
 use venue_gateway_api::GatewayBinding;
 
+#[path = "durable_execution.rs"]
+mod durable_execution;
+
 use crate::private::diagnose_position_page;
 use crate::transport::unix_ms;
 use crate::{
@@ -26,7 +29,7 @@ use crate::{
     BybitTransportError, BybitTransportLimits, parse_account_identity, parse_api_key_evidence,
     parse_linear_instrument, parse_open_order_page, parse_order_history_page, parse_position_page,
     parse_rest_bbo, prepare_cancel_request, prepare_place_request, prepare_private_request,
-    settle_order_ack,
+    prepare_stop_market_request, settle_order_ack,
 };
 
 const EXACT_READBACK_MAX_PAGES: u32 = 32;
@@ -63,6 +66,19 @@ impl BybitAccountGateway {
     ) -> Result<Self, BybitAccountGatewayError> {
         let credentials = BybitCredentials::from_environment()
             .map_err(|_| BybitAccountGatewayError::Credentials)?;
+        Self::connect(binding, credentials, limits)
+    }
+
+    /// Connects using caller-supplied in-memory credentials. This path never reads environment
+    /// variables, allowing the executor to keep its PostgreSQL decryption boundary in Control.
+    pub fn connect_with_credentials(
+        binding: GatewayBinding,
+        credentials: BybitCredentials,
+        operation_timeout: std::time::Duration,
+        maximum_body_bytes: usize,
+    ) -> Result<Self, BybitAccountGatewayError> {
+        let limits = BybitTransportLimits::new(operation_timeout, maximum_body_bytes)
+            .map_err(BybitAccountGatewayError::Transport)?;
         Self::connect(binding, credentials, limits)
     }
 
@@ -242,13 +258,27 @@ impl BybitAccountGateway {
         parse_rest_bbo(&scope.binding, raw).map_err(|_| BybitAccountGatewayError::Instrument)
     }
 
-    fn dispatch_permit(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
-        if permit.binding() != self.binding.gateway_binding() {
+    fn execute_command(
+        &mut self,
+        command: &ExecutionCommand,
+        reject_existing_position: bool,
+    ) -> AccountGatewayResult {
+        if command.validate().is_err() {
             return AccountGatewayResult::Rejected {
                 reason: "bybit_permit_binding".to_owned(),
             };
         }
-        let symbol = permit.command().mutation_owner().symbol.clone();
+        let owner = command.mutation_owner();
+        let account_binding = self.binding.gateway_binding();
+        if owner.exchange != account_binding.venue.as_str()
+            || owner.account != account_binding.trading_account_id
+            || !self.symbol_catalog.contains_key(&owner.symbol)
+        {
+            return AccountGatewayResult::Rejected {
+                reason: "bybit_permit_binding".to_owned(),
+            };
+        }
+        let symbol = owner.symbol.clone();
         if !self.symbol_catalog.contains_key(&symbol)
             || self.refresh_rules_for(&symbol).is_err()
             || self.refresh_private_for(&symbol).is_err()
@@ -273,15 +303,16 @@ impl BybitAccountGateway {
                 };
             }
         };
-        let request = match permit.command() {
+        let request = match command {
             ExecutionCommand::PlaceLimit(command) => {
-                if !command.reduce_only
-                    && self
-                        .positions
+                if should_reject_existing_position(
+                    reject_existing_position,
+                    command.reduce_only,
+                    self.positions
                         .positions
                         .iter()
-                        .any(|position| !position.position.quantity.is_zero())
-                {
+                        .any(|position| !position.position.quantity.is_zero()),
+                ) {
                     return AccountGatewayResult::Rejected {
                         reason: "bybit_existing_position".to_owned(),
                     };
@@ -355,12 +386,52 @@ impl BybitAccountGateway {
                     Some(&bbo),
                 )
             }
-            ExecutionCommand::PlaceMarket(_)
-            | ExecutionCommand::StopMarketCloseAll(_)
-            | ExecutionCommand::StopMarketFullPosition(_) => {
+            ExecutionCommand::PlaceMarket(command) => {
+                let bbo = match self.current_market_bbo_for(&symbol) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return AccountGatewayResult::Rejected {
+                            reason: "bybit_market_rules".to_owned(),
+                        };
+                    }
+                };
+                prepare_place_request(
+                    &binding,
+                    &self.identity,
+                    &rules,
+                    &BybitPlaceIntent {
+                        client_order_id: command.client_order_id.as_str().to_owned(),
+                        side: command.side,
+                        position_side: command.position_side,
+                        kind: BybitOrderKind::Market,
+                        quantity: command.quantity,
+                        limit_price: None,
+                        time_in_force: BybitTimeInForce::ImmediateOrCancel,
+                        reduce_only: false,
+                    },
+                    now_ms,
+                    Some(&bbo),
+                )
+            }
+            ExecutionCommand::StopMarketCloseAll(_) => {
                 return AccountGatewayResult::Rejected {
                     reason: "bybit_initial_profile_unsupported_command".to_owned(),
                 };
+            }
+            ExecutionCommand::StopMarketFullPosition(command) => {
+                let mark_price = match durable_execution::validate_stop_position(
+                    command,
+                    &self.positions,
+                    &symbol,
+                ) {
+                    Ok(value) => value,
+                    Err(()) => {
+                        return AccountGatewayResult::Rejected {
+                            reason: "bybit_stop_position".to_owned(),
+                        };
+                    }
+                };
+                prepare_stop_market_request(&binding, &self.identity, &rules, command, mark_price)
             }
         };
         let request = match request {
@@ -391,7 +462,7 @@ impl BybitAccountGateway {
         };
         match outcome {
             Ok(ack) => {
-                if !matches!(permit.command(), ExecutionCommand::MarketReduce(_)) {
+                if !matches!(command, ExecutionCommand::MarketReduce(_)) {
                     return ack
                         .order_id
                         .or(ack.client_order_id)
@@ -425,6 +496,7 @@ impl BybitAccountGateway {
                     rules.instrument.generation,
                     attempt_id,
                     lookup,
+                    NativeOrderFamily::UmOrder,
                     readback_now,
                 ));
                 let Ok(readback) = readback else {
@@ -455,6 +527,15 @@ impl BybitAccountGateway {
             },
             Err(_) => AccountGatewayResult::Unknown,
         }
+    }
+
+    fn dispatch_permit(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
+        if permit.binding() != self.binding.gateway_binding() {
+            return AccountGatewayResult::Rejected {
+                reason: "bybit_permit_binding".to_owned(),
+            };
+        }
+        self.execute_command(permit.command(), true)
     }
 }
 
@@ -717,6 +798,7 @@ impl AccountPhysicalGateway for BybitAccountGateway {
                 scope.rules.instrument.generation,
                 attempt_id,
                 lookup,
+                bybit_command_family(command),
                 observed_at_ms,
             ))?;
             let outcome = recovery_outcome(command, &readback)?;
@@ -796,6 +878,14 @@ impl AccountPhysicalGateway for BybitAccountGateway {
     fn dispatch(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
         self.dispatch_permit(permit)
     }
+}
+
+fn should_reject_existing_position(
+    reject_existing_position: bool,
+    reduce_only: bool,
+    has_position: bool,
+) -> bool {
+    reject_existing_position && !reduce_only && has_position
 }
 
 async fn collect_account_wide_snapshot(
@@ -888,6 +978,7 @@ async fn collect_account_wide_snapshot(
             attempt_id,
             BybitOrderLookup::by_client_order_id(identity.to_owned())
                 .map_err(|_| AccountHostValidationError::SignedSnapshot)?,
+            bybit_command_family(command),
             now,
         )
         .await
@@ -1685,6 +1776,7 @@ async fn fetch_exact_readback(
     generation: u64,
     attempt_id: u64,
     lookup: BybitOrderLookup,
+    family: NativeOrderFamily,
     now_ms: u64,
 ) -> Result<BybitClosedOrderReadback, BybitAccountGatewayError> {
     let history_window =
@@ -1696,7 +1788,7 @@ async fn fetch_exact_readback(
         transport,
         generation,
         attempt_id,
-        BybitPrivateSource::OpenOrders(NativeOrderFamily::UmOrder),
+        BybitPrivateSource::OpenOrders(family),
         None,
         &lookup,
     )
@@ -1707,7 +1799,7 @@ async fn fetch_exact_readback(
         transport,
         generation,
         attempt_id,
-        BybitPrivateSource::OrderHistory(NativeOrderFamily::UmOrder),
+        BybitPrivateSource::OrderHistory(family),
         Some(history_window),
         &lookup,
     )
@@ -1777,6 +1869,13 @@ async fn fetch_order_pages(
     Err(BybitAccountGatewayError::Readback)
 }
 
+fn bybit_command_family(command: &ExecutionCommand) -> NativeOrderFamily {
+    match command {
+        ExecutionCommand::StopMarketFullPosition(_) => NativeOrderFamily::UmConditional,
+        _ => NativeOrderFamily::UmOrder,
+    }
+}
+
 fn recovery_outcome(
     command: &ExecutionCommand,
     readback: &BybitClosedOrderReadback,
@@ -1799,12 +1898,35 @@ fn recovery_outcome(
             command.command_id().clone(),
         ));
     };
+    if !readback.command_matches(command) {
+        return Ok(AccountRecoveryOutcome::still_unknown(
+            command.command_id().clone(),
+        ));
+    }
     if matches!(command, ExecutionCommand::Cancel(_)) {
-        return Ok(if settlement.state == OrderState::Cancelled {
-            AccountRecoveryOutcome::accepted(command.command_id().clone(), settlement.order_id)
-        } else {
-            AccountRecoveryOutcome::still_unknown(command.command_id().clone())
-        });
+        return Ok(
+            if matches!(
+                settlement.state,
+                OrderState::Filled
+                    | OrderState::Cancelled
+                    | OrderState::Expired
+                    | OrderState::Rejected
+            ) {
+                AccountRecoveryOutcome::accepted(command.command_id().clone(), settlement.order_id)
+            } else {
+                AccountRecoveryOutcome::still_unknown(command.command_id().clone())
+            },
+        );
+    }
+    if matches!(command, ExecutionCommand::MarketReduce(_))
+        && !matches!(
+            settlement.state,
+            OrderState::Filled | OrderState::Cancelled | OrderState::Expired | OrderState::Rejected
+        )
+    {
+        return Ok(AccountRecoveryOutcome::still_unknown(
+            command.command_id().clone(),
+        ));
     }
     Ok(if settlement.state == OrderState::Rejected {
         AccountRecoveryOutcome::rejected(

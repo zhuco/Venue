@@ -15,9 +15,10 @@ use venue_execution::{
     AccountDispatchPermit, AccountGatewayResult, AccountHostValidationError,
     AccountInstrumentIdentity, AccountLimitNormalizationIntent, AccountPhysicalGateway,
     AccountPricedLimitIntent, AccountRecoveryOutcome, AccountRecoveryReport,
-    AccountRecoveryRequest, AccountRecoveryState, AccountRiskEvidence, SignedAccountBalance,
-    SignedAccountOrderFact, SignedAccountPositionFact, SignedAccountPositionMode,
-    SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
+    AccountRecoveryRequest, AccountRecoveryState, AccountRiskEvidence, DurableAccountGateway,
+    SignedAccountBalance, SignedAccountOrderFact, SignedAccountPositionFact,
+    SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
+    validate_durable_command,
 };
 use venue_gateway_api::GatewayBinding;
 
@@ -29,12 +30,15 @@ use crate::execution::{
 use crate::recovery_collector::okx_timestamp;
 use crate::{
     OkxAccountProfile, OkxConfig, OkxCredentials, OkxError, OkxHttpTransport, OkxInstrument,
-    OkxPositionMode, OkxPrivateReadRequest, OkxPrivateReadScope, OkxRawPrivatePage,
+    OkxPositionMode, OkxPrivateReadRequest, OkxPrivateReadScope, OkxRawPrivatePage, OkxTimedOrder,
     OkxTimedPosition, OkxTradeMode, OkxTransportError, advance_private_page,
     build_account_config_request, build_algo_orders_request, build_balance_request,
     build_fills_request, build_fills_resume_request, build_positions_request,
     build_regular_orders_request, parse_account_profile, parse_instrument, parse_positions,
 };
+
+#[path = "durable_execution.rs"]
+mod durable_execution;
 
 /// Production OKX adapter for the lightweight account host. Base quantities remain canonical in
 /// the WAL; `build_place_request` converts them to contracts using ctVal × ctMult exactly once.
@@ -72,7 +76,32 @@ impl OkxAccountGateway {
         )
     }
 
-    fn connect(
+    /// Connects with credentials held by the caller. Construction performs only signed
+    /// permission/account reads; the first mutation still requires a durable command.
+    pub fn connect_with_credentials(
+        binding: GatewayBinding,
+        credentials: OkxCredentials,
+        trade_mode: OkxTradeMode,
+        operation_timeout: Duration,
+        max_body_bytes: usize,
+    ) -> Result<Self, OkxAccountGatewayError> {
+        Self::connect(
+            binding,
+            credentials,
+            trade_mode,
+            operation_timeout,
+            max_body_bytes,
+        )
+    }
+
+    /// Returns the UID obtained from the signed account-config response during connect.
+    pub fn verified_account_identity(&self) -> Result<String, OkxAccountGatewayError> {
+        (!self.profile.uid().is_empty())
+            .then(|| self.profile.uid().to_owned())
+            .ok_or(OkxAccountGatewayError::Account)
+    }
+
+    pub fn connect(
         binding: GatewayBinding,
         credentials: OkxCredentials,
         trade_mode: OkxTradeMode,
@@ -212,111 +241,6 @@ impl OkxAccountGateway {
         Ok(candidate)
     }
 
-    fn dispatch_permit(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
-        if permit.binding() != self.config.gateway_binding() {
-            return rejected("okx_permit_binding");
-        }
-        if self.refresh_instrument().is_err() || self.refresh_private().is_err() {
-            return rejected("okx_preflight_failed");
-        }
-        let timestamp = match okx_timestamp(SystemTime::now()) {
-            Ok(value) => value,
-            Err(_) => return rejected("okx_clock"),
-        };
-        match permit.command() {
-            ExecutionCommand::PlaceLimit(command) => {
-                if !command.reduce_only
-                    && self
-                        .positions
-                        .iter()
-                        .any(|position| !position.position.quantity.is_zero())
-                {
-                    return rejected("okx_existing_position");
-                }
-                let request = match build_place_request(
-                    &self.config,
-                    &self.instrument,
-                    &self.profile,
-                    self.trade_mode,
-                    OkxPlaceIntent::Limit(command),
-                ) {
-                    Ok(value) => value,
-                    Err(_) => return rejected("okx_intent_rejected"),
-                };
-                match self.runtime.block_on(self.transport.execute(
-                    &self.credentials,
-                    &request,
-                    &timestamp,
-                )) {
-                    Ok(response) => match parse_place_ack(response.clone(), &request) {
-                        Ok(accepted) => self.settle_accepted_place(&accepted, "okx_limit_rejected"),
-                        Err(OkxError::Rejected) => rejected_response(&response.body),
-                        Err(_) => AccountGatewayResult::Unknown,
-                    },
-                    Err(error) => map_transport_dispatch(error),
-                }
-            }
-            ExecutionCommand::Cancel(command) => {
-                let request = match build_host_cancel_request(
-                    &self.config,
-                    &self.instrument,
-                    &self.profile,
-                    self.trade_mode,
-                    command,
-                ) {
-                    Ok(value) => value,
-                    Err(_) => return rejected("okx_cancel_intent_rejected"),
-                };
-                match self.runtime.block_on(self.transport.execute(
-                    &self.credentials,
-                    &request,
-                    &timestamp,
-                )) {
-                    Ok(response) => match parse_host_cancel_ack(response.clone(), &request) {
-                        Ok(venue_order_id) => AccountGatewayResult::Accepted { venue_order_id },
-                        Err(OkxError::Rejected) => rejected_response(&response.body),
-                        Err(_) => AccountGatewayResult::Unknown,
-                    },
-                    Err(error) => map_transport_dispatch(error),
-                }
-            }
-            ExecutionCommand::MarketReduce(command) => {
-                if validate_market_reduce_position(command, &self.positions).is_err() {
-                    return rejected("okx_market_reduce_position");
-                }
-                let request = match build_place_request(
-                    &self.config,
-                    &self.instrument,
-                    &self.profile,
-                    self.trade_mode,
-                    OkxPlaceIntent::MarketReduce(command),
-                ) {
-                    Ok(value) => value,
-                    Err(_) => return rejected("okx_market_reduce_rules"),
-                };
-                match self.runtime.block_on(self.transport.execute(
-                    &self.credentials,
-                    &request,
-                    &timestamp,
-                )) {
-                    Ok(response) => match parse_place_ack(response.clone(), &request) {
-                        Ok(accepted) => {
-                            self.settle_accepted_place(&accepted, "okx_market_reduce_rejected")
-                        }
-                        Err(OkxError::Rejected) => rejected_response(&response.body),
-                        Err(_) => AccountGatewayResult::Unknown,
-                    },
-                    Err(error) => map_transport_dispatch(error),
-                }
-            }
-            ExecutionCommand::PlaceMarket(_)
-            | ExecutionCommand::StopMarketCloseAll(_)
-            | ExecutionCommand::StopMarketFullPosition(_) => {
-                rejected("okx_initial_profile_unsupported_command")
-            }
-        }
-    }
-
     fn settle_accepted_place(
         &self,
         accepted: &OkxAcceptedOrder,
@@ -353,6 +277,13 @@ impl OkxAccountGateway {
             Err(_) => AccountGatewayResult::Unknown,
         }
     }
+
+    fn dispatch_permit(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
+        if permit.binding() != self.config.gateway_binding() {
+            return rejected("okx_permit_binding");
+        }
+        self.execute_command(permit.command(), true)
+    }
 }
 
 fn validate_market_reduce_position(
@@ -371,6 +302,24 @@ fn validate_market_reduce_against_position(
     command: &MarketReduceCommand,
     position: &venue_domain::domain::Position,
 ) -> Result<(), ()> {
+    command
+        .validate_with_authoritative_position(position)
+        .map_err(|_| ())?;
+    if position.quantity.is_zero() || command.quantity > position.quantity {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn validate_limit_reduce_position(
+    command: &OrderCommand,
+    positions: &[OkxTimedPosition],
+) -> Result<(), ()> {
+    let position = positions
+        .iter()
+        .find(|value| value.position.side == command.position_side)
+        .map(|value| &value.position)
+        .ok_or(())?;
     command
         .validate_with_authoritative_position(position)
         .map_err(|_| ())?;
@@ -737,6 +686,60 @@ impl AccountPhysicalGateway for OkxAccountGateway {
 
     fn dispatch(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
         self.dispatch_permit(permit)
+    }
+}
+
+impl DurableAccountGateway for OkxAccountGateway {
+    fn execute_committed_with_context(
+        &mut self,
+        command: &ExecutionCommand,
+        context: &venue_execution::DurableExecutionContext,
+    ) -> AccountGatewayResult {
+        if !venue_execution::validate_durable_context(command, context)
+            || !validate_durable_command(self.config.gateway_binding(), command)
+        {
+            return rejected("okx_durable_context");
+        }
+        match command {
+            ExecutionCommand::Cancel(_) => self.execute_exact_cancel(context),
+            _ => self.execute_command(command, false),
+        }
+    }
+
+    fn execute_committed(&mut self, command: &ExecutionCommand) -> AccountGatewayResult {
+        if !validate_durable_command(self.config.gateway_binding(), command) {
+            return rejected("okx_durable_command_scope");
+        }
+        if matches!(command, ExecutionCommand::Cancel(_)) {
+            return rejected("okx_cancel_context_required");
+        }
+        self.execute_command(command, false)
+    }
+
+    fn reconcile_committed_with_context(
+        &mut self,
+        command: &ExecutionCommand,
+        context: &venue_execution::DurableExecutionContext,
+    ) -> AccountGatewayResult {
+        if !venue_execution::validate_durable_context(command, context)
+            || !validate_durable_command(self.config.gateway_binding(), command)
+        {
+            return AccountGatewayResult::Unknown;
+        }
+        match command {
+            ExecutionCommand::Cancel(_) => self.reconcile_exact_cancel(context),
+            _ => self.reconcile_order(command),
+        }
+    }
+
+    fn reconcile_committed(&mut self, command: &ExecutionCommand) -> AccountGatewayResult {
+        if !validate_durable_command(self.config.gateway_binding(), command) {
+            return rejected("okx_durable_command_scope");
+        }
+        if matches!(command, ExecutionCommand::Cancel(_)) {
+            return AccountGatewayResult::Unknown;
+        }
+        self.reconcile_order(command)
     }
 }
 
@@ -1143,7 +1146,7 @@ fn collect_wide_orders(
         };
         let position_side =
             position_side_for(profile.position_mode(), text(row, "posSide")?, Decimal::ONE)?;
-        let reduce_only = match text(row, "reduceOnly")? {
+        let raw_reduce_only = match text(row, "reduceOnly")? {
             "true" => true,
             "false" => false,
             _ => return Err(OkxAccountGatewayError::Account),
@@ -1153,6 +1156,18 @@ fn collect_wide_orders(
             NativeOrderFamily::UmConditional
         } else {
             default_family
+        };
+        let reduce_only = match profile.position_mode() {
+            OkxPositionMode::LongShort => {
+                if raw_reduce_only {
+                    return Err(OkxAccountGatewayError::Account);
+                }
+                matches!(
+                    (position_side, side),
+                    (PositionSide::Long, OrderSide::Sell) | (PositionSide::Short, OrderSide::Buy)
+                )
+            }
+            OkxPositionMode::Net => raw_reduce_only,
         };
         if !reduce_only {
             // A trigger market order has no bounded USDT value in this signed surface.  Treating
@@ -1179,9 +1194,13 @@ fn collect_wide_orders(
             external: true,
             state: Some(okx_order_state(text(row, "state")?)?),
             filled_quantity: Some(
-                positive_or_zero(row, "accFillSz")?
-                    .checked_mul(rule.base_per_contract)
-                    .ok_or(OkxAccountGatewayError::Account)?,
+                (if algo && row.get("accFillSz").is_none() {
+                    Decimal::ZERO
+                } else {
+                    positive_or_zero(row, "accFillSz")?
+                })
+                .checked_mul(rule.base_per_contract)
+                .ok_or(OkxAccountGatewayError::Account)?,
             ),
             created_at_ms: optional_order_created_at_ms(row)?,
         });
@@ -1579,6 +1598,40 @@ mod tests {
             rejected_response(br#"{"code":"0","msg":"","data":[]}"#),
             AccountGatewayResult::Unknown
         );
+    }
+
+    #[test]
+    fn committed_reconcile_keeps_signed_side_conflict_unknown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let command = ExecutionCommand::MarketReduce(reduce(Decimal::new(1, 1))?);
+        let mut observed = OkxTimedOrder {
+            order: venue_domain::domain::Order {
+                order_id: "7001".to_owned(),
+                client_order_id: FieldState::Known("okx_reduce_client".to_owned()),
+                symbol: "BTC/USDT".parse()?,
+                side: OrderSide::Sell,
+                position_side: FieldState::Known(PositionSide::Long),
+                purpose: FieldState::Missing,
+                state: OrderState::Filled,
+                quantity: Decimal::new(1, 1),
+                filled_quantity: Decimal::new(1, 1),
+                limit_price: None,
+                time_in_force: FieldState::Missing,
+                average_price: FieldState::Missing,
+                reduce_only: true,
+            },
+            update_time_ms: 1,
+        };
+        assert!(matches!(
+            durable_execution::reconcile_okx_order(&command, &observed),
+            AccountGatewayResult::Accepted { .. }
+        ));
+        observed.order.side = OrderSide::Buy;
+        assert_eq!(
+            durable_execution::reconcile_okx_order(&command, &observed),
+            AccountGatewayResult::Unknown
+        );
+        Ok(())
     }
 
     #[test]

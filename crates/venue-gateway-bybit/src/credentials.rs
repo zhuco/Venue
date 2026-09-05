@@ -11,18 +11,39 @@ pub struct BybitCredentials {
 
 impl BybitCredentials {
     pub fn from_environment() -> Result<Self, BybitError> {
-        Self::from_values(
-            std::env::var("BYBIT_API_KEY").map_err(|_| BybitError::Credentials)?,
-            std::env::var("BYBIT_API_SECRET").map_err(|_| BybitError::Credentials)?,
+        Self::from_secrets(
+            SecretString::from(
+                std::env::var("BYBIT_API_KEY").map_err(|_| BybitError::Credentials)?,
+            ),
+            SecretString::from(
+                std::env::var("BYBIT_API_SECRET").map_err(|_| BybitError::Credentials)?,
+            ),
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn from_values(
         api_key: impl Into<String>,
         api_secret: impl Into<String>,
     ) -> Result<Self, BybitError> {
         let api_key = SecretString::from(api_key.into());
         let api_secret = SecretString::from(api_secret.into());
+        if api_key.expose_secret().trim().is_empty() || api_secret.expose_secret().trim().is_empty()
+        {
+            return Err(BybitError::Credentials);
+        }
+        Ok(Self {
+            api_key,
+            api_secret,
+        })
+    }
+
+    /// Builds credentials from already decrypted in-memory values. This path never reads process
+    /// environment variables and is used by the durable executor.
+    pub fn from_secrets(
+        api_key: SecretString,
+        api_secret: SecretString,
+    ) -> Result<Self, BybitError> {
         if api_key.expose_secret().trim().is_empty() || api_secret.expose_secret().trim().is_empty()
         {
             return Err(BybitError::Credentials);

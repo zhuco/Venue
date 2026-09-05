@@ -3,6 +3,24 @@ use venue_gateway_api::GatewayBinding;
 use super::{AccountHostValidationError, AccountRecoveryRequest, AccountSymbolSet};
 
 impl AccountRecoveryRequest {
+    /// Exact signed queries for durable PostgreSQL commands. This grants no mutation authority
+    /// and does not import a WAL cursor or create recovery artifacts.
+    pub fn for_durable_commands(
+        binding: GatewayBinding,
+        commands: Vec<venue_domain::domain::ExecutionCommand>,
+    ) -> Result<Self, AccountHostValidationError> {
+        if commands.is_empty()
+            || commands
+                .iter()
+                .any(|command| !crate::validate_durable_command(&binding, command))
+        {
+            return Err(AccountHostValidationError::Scope);
+        }
+        let symbols = AccountSymbolSet::single(&binding);
+        let mut request = Self::read_only(binding, symbols, None)?;
+        request.unresolved = commands;
+        Ok(request)
+    }
     pub fn read_only(
         binding: GatewayBinding,
         configured_symbols: AccountSymbolSet,

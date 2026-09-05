@@ -1,0 +1,25 @@
+{
+  "status": "order",
+  "order": {
+    "order": {
+      "children": [],
+      "coin": "BTC",
+      "isPositionTpsl": true,
+      "isTrigger": true,
+      "side": "A",
+      "limitPx": "57600",
+      "sz": "0.4",
+      "oid": 77,
+      "timestamp": 1700000000001,
+      "reduceOnly": true,
+      "orderType": "Stop Market",
+      "origSz": "0.4",
+      "tif": null,
+      "triggerCondition": "Price below 64000",
+      "triggerPx": "64000",
+      "cloid": "0x00000000000000000000000000000001"
+    },
+    "status": "open",
+    "statusTimestamp": 1700000000002
+  }
+}

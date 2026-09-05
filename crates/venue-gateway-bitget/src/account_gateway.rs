@@ -40,6 +40,15 @@ use crate::{
     settle_ack_readback, settle_unknown_readback,
 };
 
+#[path = "durable_execution.rs"]
+mod durable_execution;
+#[path = "snapshot_helpers.rs"]
+mod snapshot_helpers;
+use snapshot_helpers::{
+    snapshot_data, snapshot_data_rows, snapshot_decimal, snapshot_fill_time, snapshot_order_facts,
+    snapshot_position_facts, snapshot_strategy_order_facts, snapshot_symbol,
+};
+
 const MAX_LIMIT_TICKER_AGE_MS: u64 = 5_000;
 
 /// The Bitget UTA account writer. Startup and every dispatched command collect fresh signed
@@ -73,15 +82,19 @@ pub struct BitgetPrivateFillEvent {
 }
 
 impl BitgetAccountGateway {
-    pub fn connect_from_environment(
+    /// Connects using caller-supplied in-memory credentials. This path never reads environment
+    /// variables, allowing the executor to keep its PostgreSQL decryption boundary in Control.
+    pub fn connect_with_credentials(
         binding: GatewayBinding,
-        limits: BitgetTransportLimits,
+        credentials: BitgetCredentials,
+        operation_timeout: std::time::Duration,
+        maximum_body_bytes: usize,
     ) -> Result<Self, BitgetAccountGatewayError> {
+        let limits = BitgetTransportLimits::new(operation_timeout, maximum_body_bytes)
+            .map_err(BitgetAccountGatewayError::Transport)?;
         BitgetAccountBinding::UtaUsdtFuturesHedge
             .validate_gateway_binding(&binding)
             .map_err(|_| BitgetAccountGatewayError::Binding)?;
-        let credentials = BitgetCredentials::from_environment()
-            .map_err(|_| BitgetAccountGatewayError::Credentials)?;
         let runtime = Builder::new_current_thread()
             .enable_io()
             .enable_time()
@@ -107,6 +120,20 @@ impl BitgetAccountGateway {
             private_stream_attempt: None,
             pending_private_fills: VecDeque::new(),
         })
+    }
+
+    pub fn connect_from_environment(
+        binding: GatewayBinding,
+        limits: BitgetTransportLimits,
+    ) -> Result<Self, BitgetAccountGatewayError> {
+        let credentials = BitgetCredentials::from_environment()
+            .map_err(|_| BitgetAccountGatewayError::Credentials)?;
+        Self::connect_with_credentials(
+            binding,
+            credentials,
+            limits.operation_timeout(),
+            limits.maximum_body_bytes(),
+        )
     }
 
     /// Opens one authenticated UTA stream only after a complete signed snapshot has installed an
@@ -279,76 +306,6 @@ impl BitgetAccountGateway {
         self.private_generation = 0;
     }
 
-    fn dispatch_permit(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
-        if permit.binding() != self.transport_binding() {
-            return rejected("bitget_preflight_failed");
-        }
-        let symbol = permit.command().mutation_owner().symbol.clone();
-        if self.refresh_private_for(&symbol).is_err() {
-            return rejected("bitget_preflight_failed");
-        }
-        let rules = match self.registered_rules(&symbol) {
-            Ok(value) => value,
-            Err(_) => return rejected("bitget_symbol_unconfigured"),
-        };
-        let attempt = match self.next_attempt_id() {
-            Ok(value) => value,
-            Err(_) => return rejected("bitget_attempt_exhausted"),
-        };
-        let now = match now_ms() {
-            Ok(value) => value,
-            Err(_) => return rejected("bitget_clock"),
-        };
-        let prepared = match prepare_node_mutation(
-            &self.private,
-            &rules,
-            &self.config,
-            permit.command(),
-            attempt,
-            now,
-        ) {
-            Ok(value) => value,
-            Err(_) => return rejected("bitget_intent_rejected"),
-        };
-        match self.runtime.block_on(self.transport.execute_mutation_once(
-            &self.credentials,
-            prepared.into_mutation(),
-            now,
-        )) {
-            Ok(BitgetMutationOutcome::Acknowledged(ack)) => {
-                let request = match build_ack_readback_request(&ack) {
-                    Ok(value) => value,
-                    Err(_) => return AccountGatewayResult::Unknown,
-                };
-                let readback = match now_ms().ok().and_then(|timestamp| {
-                    self.runtime
-                        .block_on(self.transport.execute_exact_readback(
-                            &self.credentials,
-                            request,
-                            timestamp,
-                        ))
-                        .ok()
-                }) {
-                    Some(value) => value,
-                    None => return AccountGatewayResult::Unknown,
-                };
-                match settle_ack_readback(&ack, &readback) {
-                    Ok(settlement) => match settlement.order {
-                        Some(order) => AccountGatewayResult::Accepted {
-                            venue_order_id: order.order_id,
-                        },
-                        None => AccountGatewayResult::Unknown,
-                    },
-                    Err(_) => AccountGatewayResult::Unknown,
-                }
-            }
-            Ok(BitgetMutationOutcome::Rejected) => rejected("bitget_venue_rejected"),
-            // `execute_mutation_once` consumes the request. WAL UNKNOWN recovery below performs
-            // an exact signed lookup only and never rebuilds this mutation.
-            Ok(BitgetMutationOutcome::Unknown(_)) | Err(_) => AccountGatewayResult::Unknown,
-        }
-    }
-
     fn transport_binding(&self) -> &GatewayBinding {
         self.transport.binding()
     }
@@ -426,6 +383,7 @@ impl AccountPhysicalGateway for BitgetAccountGateway {
                     ),
                     _ => None,
                 },
+                expected_strategy: expected_strategy(command, None),
             };
             let result = build_unknown_recovery_readback_request(
                 &unknown,
@@ -444,7 +402,10 @@ impl AccountPhysicalGateway for BitgetAccountGateway {
                 })
             });
             let outcome = match result {
-                Some(readback) if settle_unknown_readback(&unknown, &readback).is_ok() => {
+                Some(readback)
+                    if settle_unknown_readback(&unknown, &readback).is_ok()
+                        && recovery_order_is_settleable(command, &readback) =>
+                {
                     exact_outcome(command, readback)
                 }
                 _ => AccountRecoveryOutcome::still_unknown(command.command_id().clone()),
@@ -915,6 +876,13 @@ async fn fetch_account_wide_snapshot(
         .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
     let position_rows = snapshot_data_rows(&positions.payload)?;
     let orders = snapshot_orders(transport, credentials, attempt_id).await?;
+    let strategies = transport
+        .fetch_unfilled_strategy_orders(
+            credentials,
+            now_ms().map_err(|_| AccountHostValidationError::SignedSnapshot)?,
+        )
+        .await
+        .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
     let previous_fills_cursor = parse_snapshot_fills_cursor(recovery.previous_fills_cursor())?;
     let (fills, cursor) = snapshot_fills(
         transport,
@@ -935,6 +903,8 @@ async fn fetch_account_wide_snapshot(
     .await?;
     let balance = crate::account::parse_balance(&snapshot_data(&account.payload)?)
         .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+    let mut order_facts = snapshot_order_facts(&orders)?;
+    order_facts.extend(snapshot_strategy_order_facts(&strategies)?);
     SignedAccountSnapshot::complete_with_fills(
         transport_binding(transport).clone(),
         observed_at_ms,
@@ -942,7 +912,7 @@ async fn fetch_account_wide_snapshot(
         attempt_id,
         transport.generation(),
         SignedAccountPositionMode::Hedge,
-        snapshot_order_facts(&orders)?,
+        order_facts,
         snapshot_position_facts(&position_rows)?,
         fills,
         cursor,
@@ -1050,187 +1020,6 @@ fn parse_snapshot_fills_cursor(
     Ok(Some(watermark))
 }
 
-fn snapshot_fill_time(row: &Value) -> Result<u64, AccountHostValidationError> {
-    let text = row
-        .get("cTime")
-        .or_else(|| row.get("createdTime"))
-        .and_then(Value::as_str)
-        .ok_or(AccountHostValidationError::SignedSnapshot)?;
-    text.parse::<u64>()
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or(AccountHostValidationError::SignedSnapshot)
-}
-
-fn snapshot_data(payload: &str) -> Result<Value, AccountHostValidationError> {
-    let root: Value =
-        serde_json::from_str(payload).map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-    if root.get("code").and_then(Value::as_str) != Some("00000") {
-        return Err(AccountHostValidationError::SignedSnapshot);
-    }
-    root.get("data")
-        .cloned()
-        .ok_or(AccountHostValidationError::SignedSnapshot)
-}
-fn snapshot_data_rows(payload: &str) -> Result<Vec<Value>, AccountHostValidationError> {
-    snapshot_data(payload)?
-        .get("list")
-        .and_then(Value::as_array)
-        .cloned()
-        .ok_or(AccountHostValidationError::SignedSnapshot)
-}
-fn snapshot_symbol(value: Option<&Value>) -> Result<Symbol, AccountHostValidationError> {
-    let raw = value
-        .and_then(Value::as_str)
-        .ok_or(AccountHostValidationError::SignedSnapshot)?;
-    let base = raw
-        .strip_suffix("USDT")
-        .filter(|v| !v.is_empty())
-        .ok_or(AccountHostValidationError::SignedSnapshot)?;
-    Symbol::new(base, "USDT").map_err(|_| AccountHostValidationError::SignedSnapshot)
-}
-fn snapshot_decimal(value: Option<&Value>) -> Result<Decimal, AccountHostValidationError> {
-    decimal(value).map_err(|_| AccountHostValidationError::SignedSnapshot)
-}
-fn snapshot_position_facts(
-    rows: &[Value],
-) -> Result<Vec<SignedAccountPositionFact>, AccountHostValidationError> {
-    rows.iter()
-        .map(|row| {
-            let item = row
-                .as_object()
-                .ok_or(AccountHostValidationError::SignedSnapshot)?;
-            require_usdt_perpetual(item).map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-            require_text(item, "holdMode", "hedge_mode")
-                .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-            let side = match item.get("posSide").and_then(Value::as_str) {
-                Some("long") => PositionSide::Long,
-                Some("short") => PositionSide::Short,
-                _ => return Err(AccountHostValidationError::SignedSnapshot),
-            };
-            Ok(SignedAccountPositionFact {
-                symbol: snapshot_symbol(item.get("symbol"))?,
-                position_side: side,
-                quantity: snapshot_decimal(item.get("total"))?,
-                entry_price: None,
-                mark_price: match snapshot_decimal(item.get("markPrice"))? {
-                    v if v > Decimal::ZERO => Some(v),
-                    v if v.is_zero() => None,
-                    _ => return Err(AccountHostValidationError::SignedSnapshot),
-                },
-            })
-        })
-        .collect()
-}
-fn snapshot_order_facts(
-    rows: &[Value],
-) -> Result<Vec<SignedAccountOrderFact>, AccountHostValidationError> {
-    rows.iter()
-        .map(|row| {
-            let item = row
-                .as_object()
-                .ok_or(AccountHostValidationError::SignedSnapshot)?;
-            require_usdt_perpetual(item).map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-            require_text(item, "delegateType", "normal")
-                .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-            let side = match item.get("side").and_then(Value::as_str) {
-                Some("buy") => OrderSide::Buy,
-                Some("sell") => OrderSide::Sell,
-                _ => return Err(AccountHostValidationError::SignedSnapshot),
-            };
-            let position_side = match item.get("posSide").and_then(Value::as_str) {
-                Some("long") => PositionSide::Long,
-                Some("short") => PositionSide::Short,
-                _ => return Err(AccountHostValidationError::SignedSnapshot),
-            };
-            let quantity = snapshot_decimal(item.get("qty"))?;
-            let filled_quantity = snapshot_decimal(item.get("cumExecQty"))?;
-            let remaining_quantity = quantity
-                .checked_sub(filled_quantity)
-                .ok_or(AccountHostValidationError::SignedSnapshot)?;
-            if quantity <= Decimal::ZERO || remaining_quantity <= Decimal::ZERO {
-                return Err(AccountHostValidationError::SignedSnapshot);
-            }
-            Ok(SignedAccountOrderFact {
-                client_order_id: item
-                    .get("clientOid")
-                    .and_then(Value::as_str)
-                    .filter(|v| !v.is_empty())
-                    .ok_or(AccountHostValidationError::SignedSnapshot)?
-                    .to_owned(),
-                venue_order_id: Some(
-                    item.get("orderId")
-                        .and_then(Value::as_str)
-                        .filter(|v| !v.is_empty())
-                        .ok_or(AccountHostValidationError::SignedSnapshot)?
-                        .to_owned(),
-                ),
-                symbol: snapshot_symbol(item.get("symbol"))?,
-                family: NativeOrderFamily::UmOrder,
-                side,
-                position_side,
-                quantity,
-                limit_price: match snapshot_decimal(item.get("price"))? {
-                    v if v > Decimal::ZERO => Some(v),
-                    v if v.is_zero() => None,
-                    _ => return Err(AccountHostValidationError::SignedSnapshot),
-                },
-                time_in_force: match item.get("timeInForce") {
-                    Some(Value::String(value)) => match value.as_str() {
-                        "post_only" => Some(LimitTimeInForce::PostOnly),
-                        "gtc" => Some(LimitTimeInForce::Gtc),
-                        // IOC/FOK remain native capabilities but have no canonical limit-policy
-                        // variant. Preserve that absence rather than reclassifying either as maker.
-                        "ioc" | "fok" => None,
-                        _ => return Err(AccountHostValidationError::SignedSnapshot),
-                    },
-                    None | Some(Value::Null) => None,
-                    Some(_) => return Err(AccountHostValidationError::SignedSnapshot),
-                },
-                created_at_ms: snapshot_order_created_at_ms(
-                    item.get("cTime").or_else(|| item.get("createdTime")),
-                )?,
-                reduce_only: bitget_reduce_only(item)
-                    .map_err(|_| AccountHostValidationError::SignedSnapshot)?,
-                owner: None,
-                external: true,
-                state: Some(snapshot_order_state(
-                    item.get("orderStatus").or_else(|| item.get("status")),
-                )?),
-                filled_quantity: Some(filled_quantity),
-            })
-        })
-        .collect()
-}
-
-fn snapshot_order_state(value: Option<&Value>) -> Result<OrderState, AccountHostValidationError> {
-    match value.and_then(Value::as_str) {
-        Some("live" | "new") => Ok(OrderState::New),
-        Some("partially_filled" | "partially-filled") => Ok(OrderState::PartiallyFilled),
-        Some("filled") => Ok(OrderState::Filled),
-        Some("cancelled" | "canceled") => Ok(OrderState::Cancelled),
-        Some("rejected") => Ok(OrderState::Rejected),
-        Some("expired") => Ok(OrderState::Expired),
-        _ => Err(AccountHostValidationError::SignedSnapshot),
-    }
-}
-
-fn snapshot_order_created_at_ms(
-    value: Option<&Value>,
-) -> Result<Option<u64>, AccountHostValidationError> {
-    let Some(value) = value.filter(|value| !value.is_null()) else {
-        return Ok(None);
-    };
-    let value = match value {
-        Value::String(value) => value.parse::<u64>().ok(),
-        Value::Number(value) => value.as_u64(),
-        _ => return Err(AccountHostValidationError::SignedSnapshot),
-    };
-    value
-        .filter(|value| *value > 0)
-        .map(Some)
-        .ok_or(AccountHostValidationError::SignedSnapshot)
-}
 fn snapshot_fill(row: &Value) -> Result<Fill, AccountHostValidationError> {
     let item = row
         .as_object()
@@ -1307,6 +1096,7 @@ async fn snapshot_unknowns(
                 ),
                 _ => None,
             },
+            expected_strategy: expected_strategy(command, None),
         };
         let result = match build_unknown_recovery_readback_request(
             &unknown,
@@ -1564,8 +1354,29 @@ fn command_kind(command: &ExecutionCommand) -> BitgetMutationKind {
     match command {
         ExecutionCommand::Cancel(_) => BitgetMutationKind::Cancel,
         ExecutionCommand::MarketReduce(_) => BitgetMutationKind::ReduceOnce,
+        ExecutionCommand::PlaceMarket(_) => BitgetMutationKind::PlaceMarket,
+        ExecutionCommand::StopMarketFullPosition(_) => BitgetMutationKind::StopMarketFullPosition,
         _ => BitgetMutationKind::Place,
     }
+}
+
+fn expected_strategy(
+    command: &ExecutionCommand,
+    native_order_id: Option<String>,
+) -> Option<crate::execution::BitgetExpectedStrategy> {
+    let ExecutionCommand::StopMarketFullPosition(command) = command else {
+        return None;
+    };
+    Some(crate::execution::BitgetExpectedStrategy {
+        client_order_id: command.client_algo_id.as_str().to_owned(),
+        order_id: native_order_id,
+        symbol: command.owner.symbol.clone(),
+        side: command.side,
+        position_side: command.position_side,
+        quantity: command.quantity,
+        trigger_price: command.trigger_price,
+        take_profit: command.owner.purpose == venue_domain::domain::OrderPurpose::TakeProfit,
+    })
 }
 
 fn exact_outcome(
@@ -1573,6 +1384,9 @@ fn exact_outcome(
     readback: BitgetExactOrderReadback,
 ) -> AccountRecoveryOutcome {
     match readback.order {
+        Some(order) if !command_matches_readback_order(command, &order) => {
+            AccountRecoveryOutcome::still_unknown(command.command_id().clone())
+        }
         Some(order) if order.state == OrderState::Rejected => AccountRecoveryOutcome::rejected(
             command.command_id().clone(),
             "bitget_rejected".to_owned(),
@@ -1582,6 +1396,21 @@ fn exact_outcome(
         }
         None => AccountRecoveryOutcome::still_unknown(command.command_id().clone()),
     }
+}
+
+fn recovery_order_is_settleable(
+    command: &ExecutionCommand,
+    readback: &BitgetExactOrderReadback,
+) -> bool {
+    if !matches!(command, ExecutionCommand::MarketReduce(_)) {
+        return true;
+    }
+    matches!(
+        readback.order.as_ref().map(|order| order.state),
+        Some(
+            OrderState::Filled | OrderState::Cancelled | OrderState::Expired | OrderState::Rejected
+        )
+    )
 }
 
 fn rejected(reason: &str) -> AccountGatewayResult {

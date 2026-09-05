@@ -183,6 +183,7 @@ impl GateHttpTransport {
         if !matches!(
             endpoint,
             crate::endpoints::FUTURES_ACCOUNT
+                | crate::endpoints::ACCOUNT_MAIN_KEYS
                 | crate::endpoints::POSITIONS
                 | crate::endpoints::FUTURES_OPEN_ORDERS
                 | crate::endpoints::FUTURES_FILLS
@@ -315,8 +316,11 @@ impl GateHttpTransport {
             .map_err(|_| GateTransportError::Signing)?;
         let url = format!("{}{}", self.endpoint, request.endpoint());
         let method = match request.kind() {
-            GateMutationKind::PlacePostOnly | GateMutationKind::ReduceOnce => reqwest::Method::POST,
-            GateMutationKind::Cancel => reqwest::Method::DELETE,
+            GateMutationKind::PlacePostOnly
+            | GateMutationKind::PlaceMarket
+            | GateMutationKind::StopMarketFullPosition
+            | GateMutationKind::ReduceOnce => reqwest::Method::POST,
+            GateMutationKind::Cancel | GateMutationKind::CancelPrice => reqwest::Method::DELETE,
         };
         let mut builder = self.client.request(method, url);
         if !request.body().is_empty() {
@@ -366,6 +370,59 @@ impl GateHttpTransport {
         if timestamp_ms < request.not_before_ms {
             return Err(GateTransportError::Binding);
         }
+        if request.price_lookup_client().is_some() {
+            let mut pages = Vec::with_capacity(2);
+            for status in ["open", "finished"] {
+                let query = format!("status={status}&contract={}&limit=100", rules.native_symbol);
+                let signed = crate::sign_rest(
+                    credentials,
+                    timestamp_sec(timestamp_ms)?,
+                    "GET",
+                    crate::endpoints::FUTURES_PRICE_ORDERS,
+                    &query,
+                    &[],
+                )
+                .map_err(|_| GateTransportError::Signing)?;
+                let url = format!(
+                    "{}{}?{}",
+                    self.endpoint,
+                    crate::endpoints::FUTURES_PRICE_ORDERS,
+                    query
+                );
+                let body = timeout(self.limits.operation_timeout, async {
+                    let response = add_signed_headers(self.client.get(url), &signed)?
+                        .send()
+                        .await
+                        .map_err(map_reqwest)?;
+                    read_response(response, self.limits.maximum_body_bytes).await
+                })
+                .await
+                .map_err(|_| GateTransportError::Timeout)??;
+                pages.push(
+                    String::from_utf8(body.to_vec()).map_err(|_| GateTransportError::Protocol)?,
+                );
+            }
+            let payload = request
+                .select_price_lookup(&pages)
+                .map_err(|_| GateTransportError::Protocol)?;
+            self.validate_trigger_child_if_needed(
+                credentials,
+                rules,
+                request,
+                timestamp_ms,
+                &payload,
+            )
+            .await?;
+            return GateExactOrderReadback::from_response(
+                binding,
+                rules,
+                request,
+                timestamp_ms,
+                unix_ms()?,
+                payload,
+            )
+            .map_err(|_| GateTransportError::Protocol);
+        }
         let signed = request
             .sign(credentials, timestamp_sec(timestamp_ms)?)
             .map_err(|_| GateTransportError::Signing)?;
@@ -380,6 +437,8 @@ impl GateHttpTransport {
         .await
         .map_err(|_| GateTransportError::Timeout)??;
         let payload = String::from_utf8(body.to_vec()).map_err(|_| GateTransportError::Protocol)?;
+        self.validate_trigger_child_if_needed(credentials, rules, request, timestamp_ms, &payload)
+            .await?;
         GateExactOrderReadback::from_response(
             binding,
             rules,
@@ -389,6 +448,47 @@ impl GateHttpTransport {
             payload,
         )
         .map_err(|_| GateTransportError::Protocol)
+    }
+
+    async fn validate_trigger_child_if_needed(
+        &self,
+        credentials: &GateCredentials,
+        rules: &GateContractRules,
+        request: &GateExactReadbackRequest,
+        timestamp_ms: u64,
+        payload: &str,
+    ) -> Result<(), GateTransportError> {
+        if let Some(trade_id) = request
+            .finished_trigger_trade_id(payload)
+            .map_err(|_| GateTransportError::Protocol)?
+        {
+            let child_endpoint = format!("{}/{}", crate::endpoints::FUTURES_ORDER, trade_id);
+            let signed = crate::sign_rest(
+                credentials,
+                timestamp_sec(timestamp_ms)?,
+                "GET",
+                &child_endpoint,
+                "",
+                &[],
+            )
+            .map_err(|_| GateTransportError::Signing)?;
+            let child_url = format!("{}{}", self.endpoint, child_endpoint);
+            let child = timeout(self.limits.operation_timeout, async {
+                let response = add_signed_headers(self.client.get(child_url), &signed)?
+                    .send()
+                    .await
+                    .map_err(map_reqwest)?;
+                read_response(response, self.limits.maximum_body_bytes).await
+            })
+            .await
+            .map_err(|_| GateTransportError::Timeout)??;
+            let child_payload =
+                String::from_utf8(child.to_vec()).map_err(|_| GateTransportError::Protocol)?;
+            request
+                .validate_trigger_child(rules, &child_payload)
+                .map_err(|_| GateTransportError::Protocol)?;
+        }
+        Ok(())
     }
 
     fn validate_binding(

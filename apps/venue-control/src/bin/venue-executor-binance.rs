@@ -1,4 +1,4 @@
-//! Singleton process entrypoint for the Binance KOL executor.
+//! Singleton process entrypoint for Binance and independent multi-venue strategies.
 //!
 //! This binary assembles the singleton's restricted PostgreSQL and master-key boundaries. It
 //! never reads Binance API secrets from environment variables.
@@ -74,6 +74,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Account-scoped SQL fences remain effective while streams start; a slow or failed follower
     // must not prevent the shared Grid/terminal process from starting.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let strategy_executor = venue_control::multi_venue_runtime::MultiVenueExecutor::new(
+        pool.clone(),
+        venue_control::multi_venue_credentials::StrategyCredentialStore::new(
+            pool.clone(),
+            CredentialCipher::from_environment()?,
+        ),
+    );
+    let strategy_shutdown = shutdown_rx.clone();
+    let strategy_task = tokio::spawn(async move {
+        strategy_executor
+            .run_until_shutdown(strategy_shutdown)
+            .await;
+    });
     let mirror_task = tokio::spawn(venue_control::order_mirror::run_order_mirror(
         pool,
         command_wake.clone(),
@@ -129,9 +142,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let result = runtime.run_until_shutdown(shutdown_rx).await;
     let _ = shutdown_tx.send(true);
-    clock_task.await?;
-    grid_task.await??;
-    mirror_task.await??;
+    // Drain all mutation workers before propagating any sibling failure and dropping the lock.
+    let (clock_result, grid_result, mirror_result, strategy_result) =
+        tokio::join!(clock_task, grid_task, mirror_task, strategy_task);
+    strategy_result?;
+    clock_result?;
+    grid_result??;
+    mirror_result??;
     singleton.release().await?;
     result?;
     Ok(())

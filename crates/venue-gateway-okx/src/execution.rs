@@ -240,6 +240,84 @@ pub(crate) fn parse_host_order_lookup(
     Ok(Some((row.ord_id.clone(), state, time_in_force)))
 }
 
+/// Parses the signed order lookup into a complete canonical order. The cancel path has no
+/// original order command available, so it must still validate every immutable wire field before
+/// allowing a terminal status to settle a durable command.
+pub(crate) fn parse_host_order_lookup_detail(
+    response: OkxHttpResponse,
+    request: &OkxHostOrderLookupRequest,
+) -> Result<Option<OkxTimedOrder>, OkxError> {
+    validate_http_response(&response, &request.scope)?;
+    let envelope = decode_success::<DetailRow>(&response.body)?;
+    let Some(row) = envelope.data.as_slice().first() else {
+        return Ok(None);
+    };
+    if envelope.data.len() != 1
+        || row.inst_type != "SWAP"
+        || row.inst_id != request.scope.native_instrument_id
+        || row.td_mode != request.scope.trade_mode.wire_value()
+        || row.cl_ord_id != request.client_order_id
+    {
+        return Err(OkxError::Binding);
+    }
+    validate_order_id(&row.ord_id)?;
+    let side = match row.side.as_str() {
+        "buy" => OrderSide::Buy,
+        "sell" => OrderSide::Sell,
+        _ => return Err(OkxError::Payload),
+    };
+    let position_side = match row.pos_side.as_str() {
+        "long" => PositionSide::Long,
+        "short" => PositionSide::Short,
+        _ => return Err(OkxError::PositionMode),
+    };
+    let time_in_force = match row.ord_type.as_str() {
+        "post_only" => FieldState::Known(LimitTimeInForce::PostOnly),
+        "limit" => FieldState::Known(LimitTimeInForce::Gtc),
+        "market" => FieldState::Missing,
+        _ => return Err(OkxError::Payload),
+    };
+    let contracts = positive_decimal(&row.sz)?;
+    let filled_contracts = decimal(&row.acc_fill_sz)?;
+    if filled_contracts.is_sign_negative() || filled_contracts > contracts {
+        return Err(OkxError::Payload);
+    }
+    if parse_boolean(&row.reduce_only)? {
+        return Err(OkxError::PositionMode);
+    }
+    let state = parse_order_state(&row.state)?;
+    let order = Order {
+        order_id: row.ord_id.clone(),
+        client_order_id: FieldState::Known(row.cl_ord_id.clone()),
+        symbol: request.scope.gateway_binding.symbol.clone(),
+        side,
+        position_side: FieldState::Known(position_side),
+        purpose: FieldState::Missing,
+        state,
+        quantity: contracts
+            .checked_mul(request.scope.base_quantity_per_contract)
+            .ok_or(OkxError::Payload)?,
+        filled_quantity: filled_contracts
+            .checked_mul(request.scope.base_quantity_per_contract)
+            .ok_or(OkxError::Payload)?,
+        limit_price: parse_optional_price(&row.px)?,
+        time_in_force,
+        average_price: parse_optional_price(&row.avg_px)?
+            .map(FieldState::Known)
+            .unwrap_or(FieldState::Missing),
+        reduce_only: false,
+    };
+    order.validate().map_err(|_| OkxError::Payload)?;
+    let update_time_ms = positive_u64(&row.u_time)?;
+    if update_time_ms > response.received_at_ms {
+        return Err(OkxError::Sequence);
+    }
+    Ok(Some(OkxTimedOrder {
+        order,
+        update_time_ms,
+    }))
+}
+
 /// The existing canonical commands are the only admitted place intents. Adapter-specific order
 /// variants are deliberately not invented here.
 #[derive(Clone, Copy, Debug)]
@@ -1144,7 +1222,7 @@ fn parse_order_state(value: &str) -> Result<OrderState, OkxError> {
     })
 }
 
-fn validate_owner(
+pub(crate) fn validate_owner(
     owner: &venue_domain::domain::OrderOwner,
     config: &OkxConfig,
 ) -> Result<(), OkxError> {
@@ -1158,28 +1236,28 @@ fn validate_owner(
     Ok(())
 }
 
-fn validate_client_order_id(value: &str) -> Result<(), OkxError> {
+pub(crate) fn validate_client_order_id(value: &str) -> Result<(), OkxError> {
     if !(1..=32).contains(&value.len()) || !value.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
         return Err(OkxError::Identity);
     }
     Ok(())
 }
 
-fn validate_order_id(value: &str) -> Result<(), OkxError> {
+pub(crate) fn validate_order_id(value: &str) -> Result<(), OkxError> {
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(OkxError::Identity);
     }
     Ok(())
 }
 
-const fn side_text(side: OrderSide) -> &'static str {
+pub(crate) const fn side_text(side: OrderSide) -> &'static str {
     match side {
         OrderSide::Buy => "buy",
         OrderSide::Sell => "sell",
     }
 }
 
-fn position_side_text(side: PositionSide) -> Result<&'static str, OkxError> {
+pub(crate) fn position_side_text(side: PositionSide) -> Result<&'static str, OkxError> {
     match side {
         PositionSide::Long => Ok("long"),
         PositionSide::Short => Ok("short"),

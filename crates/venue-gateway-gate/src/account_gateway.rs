@@ -1,3 +1,6 @@
+use crate::execution::{
+    mutation_unknown, prepare_price_cancel, prepare_price_readback_by_client_id,
+};
 use crate::{
     GATE_PRIVATE_PAGE_LIMIT, GATE_STAGE7_ORDER_PROFILE_VERSION, GateContractRules, GateCredentials,
     GateFillsCursor, GateGatewayBinding, GateHttpTransport, GateMutationDispatch,
@@ -6,8 +9,8 @@ use crate::{
     GateRawPrivateResponse, GateTransportError, GateTransportLimits,
     canonical_client_id_from_native, connect_private_ws, endpoints, parse_contract_rules,
     parse_fill_record, parse_rest_snapshot, prepare_cancel, prepare_exact_readback_by_client_id,
-    prepare_limit, prepare_private_read, prepare_reduce_once, rest_order_book_path,
-    settle_exact_readback, validate_private_readback,
+    prepare_limit, prepare_private_read, prepare_reduce_once, prepare_stop_market,
+    rest_order_book_path, settle_exact_readback, validate_private_readback,
 };
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -29,6 +32,9 @@ use venue_execution::{
     SignedUnknownResult, command_matches_readback_order,
 };
 use venue_gateway_api::GatewayBinding;
+
+#[path = "durable_execution.rs"]
+mod durable_execution;
 
 #[path = "account_gateway_priced.rs"]
 mod account_gateway_priced;
@@ -79,14 +85,18 @@ pub struct GateGridBootstrapMarketFacts {
 }
 
 impl GateAccountGateway {
-    pub fn connect_from_environment(
+    /// Connects using caller-supplied in-memory credentials. This path never reads environment
+    /// variables, allowing the executor to keep its PostgreSQL decryption boundary in Control.
+    pub fn connect_with_credentials(
         binding: GatewayBinding,
-        limits: GateTransportLimits,
+        credentials: GateCredentials,
+        operation_timeout: std::time::Duration,
+        maximum_body_bytes: usize,
     ) -> Result<Self, GateAccountGatewayError> {
+        let limits = GateTransportLimits::new(operation_timeout, maximum_body_bytes)
+            .map_err(GateAccountGatewayError::Transport)?;
         let binding =
             GateGatewayBinding::new(binding).map_err(|_| GateAccountGatewayError::Binding)?;
-        let credentials = GateCredentials::from_environment()
-            .map_err(|_| GateAccountGatewayError::Credentials)?;
         let runtime = Builder::new_current_thread()
             .enable_io()
             .enable_time()
@@ -106,14 +116,27 @@ impl GateAccountGateway {
             transport,
             rules,
             rules_catalog,
-            // The constructor's private candidate is not a Host-admitted account snapshot.
-            private_generation: 0,
             private,
+            private_generation: 0,
             next_attempt: 2,
             private_stream: None,
             private_stream_attempt: None,
             pending_private_fills: VecDeque::new(),
         })
+    }
+
+    pub fn connect_from_environment(
+        binding: GatewayBinding,
+        limits: GateTransportLimits,
+    ) -> Result<Self, GateAccountGatewayError> {
+        let credentials = GateCredentials::from_environment()
+            .map_err(|_| GateAccountGatewayError::Credentials)?;
+        Self::connect_with_credentials(
+            binding,
+            credentials,
+            limits.operation_timeout(),
+            limits.maximum_body_bytes(),
+        )
     }
 
     /// Opens once and polls at most one normalized fill. A complete `futures.usertrades`
@@ -287,71 +310,6 @@ impl GateAccountGateway {
     fn poison_private_stream(&mut self) {
         self.clear_private_stream();
         self.private_generation = 0;
-    }
-
-    fn dispatch_permit(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
-        if permit.binding() != self.binding.gateway_binding() {
-            return rejected("gate_permit_binding");
-        }
-        let symbol = permit.command().mutation_owner().symbol.clone();
-        if self.refresh_private_for(&symbol).is_err() {
-            return rejected("gate_preflight_failed");
-        }
-        let rules = match self.registered_rules(&symbol) {
-            Ok(value) => value,
-            Err(_) => return rejected("gate_symbol_unconfigured"),
-        };
-        let prepared = match permit.command() {
-            ExecutionCommand::PlaceLimit(command) => prepare_limit(&self.binding, &rules, command),
-            ExecutionCommand::MarketReduce(command) => {
-                prepare_reduce_once(&self.binding, &rules, command)
-            }
-            ExecutionCommand::Cancel(command) => {
-                let target = regular_venue_order_id_for_client_id(
-                    &self.private.order_families.regular().orders,
-                    command.target_client_order_id.as_str(),
-                );
-                match target {
-                    Some(venue_order_id) => prepare_cancel(
-                        &self.binding,
-                        &rules,
-                        &crate::GateCancelIntent {
-                            command: command.clone(),
-                            venue_order_id,
-                        },
-                    ),
-                    None => return rejected("gate_cancel_target_unproven"),
-                }
-            }
-            ExecutionCommand::PlaceMarket(_)
-            | ExecutionCommand::StopMarketCloseAll(_)
-            | ExecutionCommand::StopMarketFullPosition(_) => {
-                return rejected("gate_command_unsupported");
-            }
-        };
-        let prepared = match prepared {
-            Ok(value) => value,
-            Err(_) => return rejected("gate_intent_rejected"),
-        };
-        match self.runtime.block_on(self.transport.execute_mutation(
-            &self.binding,
-            &self.credentials,
-            &rules,
-            prepared,
-            match now_ms() {
-                Ok(value) => value,
-                Err(_) => return rejected("gate_clock"),
-            },
-        )) {
-            Ok(GateMutationDispatch::Accepted(accepted)) => {
-                self.settle_exact(&rules, &accepted.readback)
-            }
-            Ok(GateMutationDispatch::Unknown(unknown)) => {
-                self.settle_exact(&rules, &unknown.readback)
-            }
-            Err(GateTransportError::VenueRejected) => rejected("gate_venue_rejected"),
-            Err(_) => AccountGatewayResult::Unknown,
-        }
     }
 
     fn settle_exact(
@@ -552,7 +510,7 @@ impl AccountPhysicalGateway for GateAccountGateway {
                         })
                     }) {
                     Some(readback)
-                        if readback_policy_matches_command(command, &readback.order)
+                        if recovery_order_matches_command(command, &readback.order)
                             && readback.order.state == OrderState::Rejected =>
                     {
                         AccountRecoveryOutcome::rejected(
@@ -560,7 +518,7 @@ impl AccountPhysicalGateway for GateAccountGateway {
                             "gate_rejected".to_owned(),
                         )
                     }
-                    Some(readback) if readback_policy_matches_command(command, &readback.order) => {
+                    Some(readback) if recovery_order_matches_command(command, &readback.order) => {
                         AccountRecoveryOutcome::accepted(
                             command.command_id().clone(),
                             readback.order.order_id,
@@ -1010,6 +968,20 @@ async fn fetch_account_wide_snapshot(
         endpoints::FUTURES_OPEN_ORDERS,
     )
     .await?;
+    let price_orders_payload = snapshot_read(
+        transport,
+        binding,
+        credentials,
+        selected_rules,
+        endpoints::FUTURES_PRICE_ORDERS,
+        "status=open&limit=100",
+    )
+    .await?;
+    let price_orders: Vec<Value> = serde_json::from_str(&price_orders_payload)
+        .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+    if price_orders.len() >= 100 {
+        return Err(AccountHostValidationError::SignedSnapshot);
+    }
     let previous_fills_cursor = parse_snapshot_fills_cursor(recovery.previous_fills_cursor())?;
     let (fills, fill_payloads) = snapshot_paged_rows_from_cursor(
         transport,
@@ -1023,8 +995,13 @@ async fn fetch_account_wide_snapshot(
     .await?;
     let position_facts =
         snapshot_position_facts(&catalogue, &positions, selected_rules.instrument.generation)?;
-    let order_facts =
+    let mut order_facts =
         snapshot_regular_order_facts(&catalogue, &regular, selected_rules.instrument.generation)?;
+    order_facts.extend(snapshot_price_order_facts(
+        &catalogue,
+        &price_orders,
+        selected_rules.instrument.generation,
+    )?);
     let unknown_results =
         snapshot_unknown_results(transport, binding, credentials, rules_catalog, recovery).await?;
     let fills_cursor = snapshot_fills_cursor(&fills, &fill_payloads, previous_fills_cursor)?;
@@ -1271,6 +1248,89 @@ fn snapshot_regular_order_facts(
         .collect()
 }
 
+fn snapshot_price_order_facts(
+    catalogue: &str,
+    rows: &[Value],
+    generation: u64,
+) -> Result<Vec<SignedAccountOrderFact>, AccountHostValidationError> {
+    let mut ids = BTreeSet::new();
+    rows.iter()
+        .map(|row| {
+            let item = row
+                .as_object()
+                .ok_or(AccountHostValidationError::SignedSnapshot)?;
+            if item.get("status").and_then(Value::as_str) != Some("open") {
+                return Err(AccountHostValidationError::SignedSnapshot);
+            }
+            let initial = item
+                .get("initial")
+                .and_then(Value::as_object)
+                .ok_or(AccountHostValidationError::SignedSnapshot)?;
+            let trigger = item
+                .get("trigger")
+                .and_then(Value::as_object)
+                .ok_or(AccountHostValidationError::SignedSnapshot)?;
+            let symbol = snapshot_symbol(initial.get("contract"))?;
+            let rules = snapshot_contract_rules(catalogue, symbol.clone(), generation)?;
+            let contracts =
+                snapshot_decimal(initial.get("amount").or_else(|| initial.get("size")))?;
+            let quantity = contracts
+                .abs()
+                .checked_mul(rules.quanto_multiplier)
+                .filter(|value| *value > Decimal::ZERO)
+                .ok_or(AccountHostValidationError::SignedSnapshot)?;
+            let native_client_id = snapshot_text(initial.get("text"))?;
+            let client_order_id = canonical_client_id_from_native(native_client_id)
+                .unwrap_or_else(|| native_client_id.to_owned());
+            if !ids.insert(client_order_id.clone())
+                || initial
+                    .get("is_reduce_only")
+                    .or_else(|| initial.get("reduce_only"))
+                    .and_then(Value::as_bool)
+                    != Some(true)
+                || initial.get("price").and_then(Value::as_str) != Some("0")
+                || initial.get("tif").and_then(Value::as_str) != Some("ioc")
+                || trigger.get("strategy_type").and_then(Value::as_u64) != Some(0)
+                || trigger.get("price_type").and_then(Value::as_u64) != Some(1)
+            {
+                return Err(AccountHostValidationError::SignedSnapshot);
+            }
+            let (side, position_side) = match item.get("order_type").and_then(Value::as_str) {
+                Some("plan-close-long-position") if contracts.is_sign_negative() => {
+                    (OrderSide::Sell, PositionSide::Long)
+                }
+                Some("plan-close-short-position") if contracts.is_sign_positive() => {
+                    (OrderSide::Buy, PositionSide::Short)
+                }
+                _ => return Err(AccountHostValidationError::SignedSnapshot),
+            };
+            let trigger_price = snapshot_decimal(trigger.get("price"))?;
+            if trigger_price <= Decimal::ZERO {
+                return Err(AccountHostValidationError::SignedSnapshot);
+            }
+            Ok(SignedAccountOrderFact {
+                client_order_id,
+                venue_order_id: Some(snapshot_id(
+                    item.get("id_string").or_else(|| item.get("id")),
+                )?),
+                symbol,
+                family: NativeOrderFamily::UmConditional,
+                side,
+                position_side,
+                quantity,
+                limit_price: Some(trigger_price),
+                time_in_force: None,
+                created_at_ms: snapshot_created_at_ms(item.get("create_time"))?,
+                reduce_only: true,
+                owner: None,
+                external: true,
+                state: Some(OrderState::New),
+                filled_quantity: Some(Decimal::ZERO),
+            })
+        })
+        .collect()
+}
+
 fn snapshot_fill_facts(
     catalogue: &str,
     rows: &[Value],
@@ -1312,21 +1372,27 @@ async fn snapshot_unknown_results(
         };
         let rules = catalog_rule(rules_catalog, &command.mutation_owner().symbol)
             .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-        let result = match prepare_exact_readback_by_client_id(binding, &rules, identity) {
+        let exact = match command {
+            ExecutionCommand::StopMarketFullPosition(stop) => {
+                prepare_price_readback_by_client_id(binding, &rules, stop)
+            }
+            _ => prepare_exact_readback_by_client_id(binding, &rules, identity),
+        };
+        let result = match exact {
             Ok(exact) => match now_ms().ok() {
                 Some(timestamp) => match transport
                     .execute_exact_readback(binding, credentials, &rules, &exact, timestamp)
                     .await
                 {
                     Ok(readback)
-                        if readback_policy_matches_command(command, &readback.order)
+                        if recovery_order_matches_command(command, &readback.order)
                             && readback.order.state == OrderState::Rejected =>
                     {
                         SignedUnknownResult::Rejected {
                             reason: "gate_rejected".to_owned(),
                         }
                     }
-                    Ok(readback) if readback_policy_matches_command(command, &readback.order) => {
+                    Ok(readback) if recovery_order_matches_command(command, &readback.order) => {
                         SignedUnknownResult::Accepted {
                             venue_order_id: readback.order.order_id,
                         }
@@ -1351,6 +1417,20 @@ fn readback_policy_matches_command(
     order: &venue_domain::domain::Order,
 ) -> bool {
     command_matches_readback_order(command, order)
+}
+
+fn recovery_order_matches_command(
+    command: &ExecutionCommand,
+    order: &venue_domain::domain::Order,
+) -> bool {
+    if !readback_policy_matches_command(command, order) {
+        return false;
+    }
+    !matches!(command, ExecutionCommand::MarketReduce(_))
+        || matches!(
+            order.state,
+            OrderState::Filled | OrderState::Cancelled | OrderState::Expired | OrderState::Rejected
+        )
 }
 
 fn snapshot_fills_cursor(
