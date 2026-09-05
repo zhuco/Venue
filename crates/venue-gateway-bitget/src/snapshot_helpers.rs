@@ -2,6 +2,26 @@
 
 use super::*;
 
+/// UTA v3 trade rows use `category` and omit the legacy position-side `marginCoin` field.
+pub(super) fn require_uta_usdt_futures_row(
+    item: &serde_json::Map<String, Value>,
+) -> Result<(), AccountHostValidationError> {
+    super::require_text(item, "category", "USDT-FUTURES")?;
+    match item.get("marginCoin") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(value)) if value == "USDT" => {}
+        _ => return Err(AccountHostValidationError::RiskEvidence),
+    }
+    let native = item
+        .get("symbol")
+        .and_then(Value::as_str)
+        .ok_or(AccountHostValidationError::RiskEvidence)?;
+    if !native.ends_with("USDT") || native.len() <= 4 {
+        return Err(AccountHostValidationError::RiskEvidence);
+    }
+    Ok(())
+}
+
 pub(super) fn snapshot_fill_time(row: &Value) -> Result<u64, AccountHostValidationError> {
     let text = row
         .get("cTime")
@@ -90,7 +110,7 @@ pub(super) fn snapshot_order_facts(
             let item = row
                 .as_object()
                 .ok_or(AccountHostValidationError::SignedSnapshot)?;
-            super::require_usdt_perpetual(item)
+            super::require_uta_usdt_futures_row(item)
                 .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
             super::require_text(item, "delegateType", "normal")
                 .map_err(|_| AccountHostValidationError::SignedSnapshot)?;

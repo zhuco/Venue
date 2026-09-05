@@ -45,8 +45,9 @@ mod durable_execution;
 #[path = "snapshot_helpers.rs"]
 mod snapshot_helpers;
 use snapshot_helpers::{
-    snapshot_data, snapshot_data_rows, snapshot_decimal, snapshot_fill_time, snapshot_order_facts,
-    snapshot_position_facts, snapshot_strategy_order_facts, snapshot_symbol,
+    require_uta_usdt_futures_row, snapshot_data, snapshot_data_rows, snapshot_decimal,
+    snapshot_fill_time, snapshot_order_facts, snapshot_position_facts,
+    snapshot_strategy_order_facts, snapshot_symbol,
 };
 
 const MAX_LIMIT_TICKER_AGE_MS: u64 = 5_000;
@@ -1037,7 +1038,7 @@ fn snapshot_fill(row: &Value) -> Result<Fill, AccountHostValidationError> {
     let item = row
         .as_object()
         .ok_or(AccountHostValidationError::SignedSnapshot)?;
-    require_usdt_perpetual(item).map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+    require_uta_usdt_futures_row(item).map_err(|_| AccountHostValidationError::SignedSnapshot)?;
     let id = item
         .get("execId")
         .and_then(Value::as_str)
@@ -1240,7 +1241,7 @@ fn entry_order_notionals(rows: &[Value]) -> Result<Vec<Decimal>, AccountHostVali
             let item = row
                 .as_object()
                 .ok_or(AccountHostValidationError::RiskEvidence)?;
-            require_usdt_perpetual(item)?;
+            require_uta_usdt_futures_row(item)?;
             // The UTA endpoint also returns active trigger/strategy delegates.  This runtime
             // cannot price their latent entry risk, so seeing one rejects admission instead of
             // pretending a normal-order page proves it absent.
@@ -1879,12 +1880,36 @@ mod tests {
     fn current_uta_normal_order_shape_without_legacy_trade_side_is_risk_counted()
     -> Result<(), Box<dyn std::error::Error>> {
         let rows = vec![json!({
-            "category":"USDT-FUTURES", "marginCoin":"USDT", "symbol":"BTCUSDT",
+            "category":"USDT-FUTURES", "symbol":"BTCUSDT",
             "delegateType":"normal", "posSide":"short", "side":"sell",
             "reduceOnly":"NO", "qty":"0.1", "cumExecQty":"0", "price":"100000"
         })];
         assert_eq!(entry_order_notionals(&rows)?, vec![Decimal::from(10_000)]);
+        let mut snapshot_row = rows[0].clone();
+        snapshot_row["clientOid"] = Value::String("uta-current-1".to_owned());
+        snapshot_row["orderId"] = Value::String("1".to_owned());
+        snapshot_row["orderStatus"] = Value::String("live".to_owned());
+        snapshot_row["timeInForce"] = Value::String("gtc".to_owned());
+        assert_eq!(snapshot_order_facts(&[snapshot_row])?.len(), 1);
         Ok(())
+    }
+
+    #[test]
+    fn uta_trade_rows_reject_wrong_category_or_conflicting_legacy_margin_coin() {
+        let row = |category: &str, margin_coin: Option<&str>, symbol: &str| {
+            let mut value = json!({
+                "category":category, "symbol":symbol, "delegateType":"normal",
+                "posSide":"long", "side":"buy", "reduceOnly":"NO",
+                "qty":"1", "cumExecQty":"0", "price":"1"
+            });
+            if let Some(margin_coin) = margin_coin {
+                value["marginCoin"] = Value::String(margin_coin.to_owned());
+            }
+            value
+        };
+        assert!(entry_order_notionals(&[row("USDC-FUTURES", None, "BTCUSDT")]).is_err());
+        assert!(entry_order_notionals(&[row("USDT-FUTURES", Some("USDC"), "BTCUSDT")]).is_err());
+        assert!(entry_order_notionals(&[row("USDT-FUTURES", None, "BTCUSDC")]).is_err());
     }
 
     #[test]
