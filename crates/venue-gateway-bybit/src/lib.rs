@@ -4,6 +4,7 @@ mod config;
 mod credentials;
 mod evidence;
 mod execution;
+mod funding;
 #[cfg(test)]
 mod physical;
 mod private;
@@ -20,6 +21,7 @@ pub use config::{BybitConfig, endpoints};
 pub use credentials::BybitCredentials;
 pub use evidence::*;
 pub use execution::*;
+pub use funding::*;
 #[cfg(test)]
 pub use physical::*;
 pub use private::*;

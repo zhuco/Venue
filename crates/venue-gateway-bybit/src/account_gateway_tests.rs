@@ -266,12 +266,17 @@ fn limit_normalization_rejects_minimum_symbol_direction_and_stale_bbo()
 fn snapshot_fills_deduplicates_closed_account_wide_pages_and_keeps_cursor()
 -> Result<(), Box<dyn std::error::Error>> {
     let (binding, _, _) = limit_facts()?;
-    let first = String::from_utf8(EXECUTIONS.to_vec())?
+    let numeric_sequences = String::from_utf8(EXECUTIONS.to_vec())?
+        .replace("\"seq\": \"103\"", "\"seq\": 103")
+        .replace("\"seq\": \"102\"", "\"seq\": 102")
+        .replace("\"seq\": \"101\"", "\"seq\": 101");
+    let first = numeric_sequences
+        .clone()
         .replace("\"nextPageCursor\": \"\"", "\"nextPageCursor\": \"next\"");
     let (fills, cursor) = snapshot_fills(
         &[
             account_wide_execution(&binding, 0, None, first.into_bytes()),
-            account_wide_execution(&binding, 1, Some("next"), EXECUTIONS.to_vec()),
+            account_wide_execution(&binding, 1, Some("next"), numeric_sequences.into_bytes()),
         ],
         None,
     )?;

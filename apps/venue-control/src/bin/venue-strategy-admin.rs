@@ -25,10 +25,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let valid = matches!(args.as_slice(), [op] if op == "migrate")
         || matches!(args.as_slice(), [op, _, _, _, _] if op == "bind" || op == "bind-released")
-        || matches!(args.as_slice(), [op, _, _] if matches!(op.as_str(), "submit"|"status"|"limits"|"grid-create"|"grid-status"|"probe"))
-        || matches!(args.as_slice(), [op, _, _, _] if op == "snapshot" || op == "grid-lifecycle");
+        || matches!(args.as_slice(), [op, _, _] if matches!(op.as_str(), "submit"|"status"|"limits"|"grid-create"|"grid-status"|"probe"|"observe"))
+        || matches!(args.as_slice(), [op, _, _, _] if matches!(op.as_str(), "snapshot"|"grid-lifecycle"|"funding"));
     if !valid {
-        return Err("usage: venue-strategy-admin migrate | probe ACCOUNT SYMBOL | bind|bind-released USER ACCOUNT SYMBOL LABEL | limits USER CREDENTIAL | submit USER CREDENTIAL | snapshot USER CREDENTIAL SYMBOL | status USER COMMAND | grid-create USER CREDENTIAL | grid-status USER INSTANCE | grid-lifecycle USER INSTANCE start|pause|resume|stop|reset; structured input uses stdin".into());
+        return Err("usage: venue-strategy-admin migrate | probe ACCOUNT SYMBOL | bind|bind-released USER ACCOUNT SYMBOL LABEL | limits USER CREDENTIAL | submit USER CREDENTIAL | observe USER CREDENTIAL | snapshot USER CREDENTIAL SYMBOL | funding USER CREDENTIAL SYMBOL | status USER COMMAND | grid-create USER CREDENTIAL | grid-status USER INSTANCE | grid-lifecycle USER INSTANCE start|pause|resume|stop|reset; structured input uses stdin".into());
     }
     if args[0] == "probe" {
         let credentials: StrategyCredentials = input()?;
@@ -52,6 +52,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .set_limits(&args[1], &args[2], input()?)
                 .await?;
             println!("limits saved");
+        }
+        "observe" => {
+            let command: ExecutionCommand = input()?;
+            let observed =
+                StrategyCredentialStore::new(pool, CredentialCipher::from_environment()?)
+                    .order_observation(&args[1], &args[2], command)
+                    .await?;
+            println!("{}", serde_json::to_string(&observed)?);
+        }
+        "funding" => {
+            let query: venue_gateway_bybit::BybitFundingQuery = input()?;
+            let observed =
+                StrategyCredentialStore::new(pool, CredentialCipher::from_environment()?)
+                    .bybit_funding(&args[1], &args[2], args[3].parse::<Symbol>()?, query)
+                    .await?;
+            println!("{}", serde_json::to_string(&observed)?);
         }
         "grid-create" => {
             let id = venue_control::multi_venue_grid::StrategyGridStore::new(pool)
