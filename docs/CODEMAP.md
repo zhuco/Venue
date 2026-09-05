@@ -90,6 +90,8 @@
 
 ## 当前开发中的多交易所策略入口
 
+支撑分批做多（马丁）的拟开发模块、桌面/API、多币预算和市价/限价执行契约见 [SUPPORT_MARTINGALE](SUPPORT_MARTINGALE.md)。该文档中的新路径均为待实现落点，不属于下面已存在的源码入口。
+
 以下工作区改动尚未纳入 alpha.27 标签，验证状态由对应开发任务记录；完整契约见 [MULTI_VENUE_EXECUTOR](MULTI_VENUE_EXECUTOR.md)。它不扩大 Binance KOL 的复制范围，也不重新启用旧 Node 执行链。
 
 | 功能 | 入口 |

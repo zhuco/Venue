@@ -7,8 +7,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
 use sqlx::{Executor, PgPool, Row, postgres::PgPoolOptions};
-use venue_control::{MultiVenueStore, StrategyEnqueueResult, install_control_schema};
-use venue_control_protocol::VenueId;
+use venue_control::{
+    MultiVenueStore, StrategyEnqueueResult, install_control_schema,
+    support_martingale::{SupportMartingaleCommandKind, SupportMartingaleStore},
+};
+use venue_control_protocol::{
+    VenueId,
+    support_martingale::{
+        SUPPORT_MARTINGALE_SCHEMA_VERSION, SupportMartingaleAction, SupportMartingaleConfig,
+        SupportMartingaleCreateRequest, SupportMartingaleLifecycleRequest,
+    },
+};
 use venue_domain::{
     CommandId, ExecutionCommand, LimitTimeInForce, OrderCommand, OrderOwner, OrderPurpose,
     OrderSide, PositionSide, Price, Symbol,
@@ -650,6 +659,145 @@ async fn five_venues_persist_market_entry_and_each_protection_purpose()
             assert_eq!(serde_json::from_value::<ExecutionCommand>(raw)?, protection);
         }
     }
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn support_martingale_create_lifecycle_budget_and_support_identity_are_durable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(fixture) = Fixture::create().await? else {
+        return Ok(());
+    };
+    let (user, account, credential) =
+        seed(&fixture.pool, VenueId::Bybit, "support_martingale").await?;
+    let store = SupportMartingaleStore::new(fixture.pool.clone());
+    let symbols = vec![
+        Symbol::from_str("SOL/USDT")?,
+        Symbol::from_str("DOGE/USDT")?,
+    ];
+    let create = SupportMartingaleCreateRequest {
+        schema_version: SUPPORT_MARTINGALE_SCHEMA_VERSION,
+        request_id: "qa_create".into(),
+        credential_id: credential,
+        config: SupportMartingaleConfig {
+            reference_venue: VenueId::Binance,
+            execution_venue: VenueId::Bybit,
+            symbols: symbols.clone(),
+            total_budget: Decimal::from(20),
+            first_order_notional: Decimal::from(5),
+            max_entries: 3,
+            size_multiplier: Decimal::ONE,
+            target_profit_rate: Decimal::new(5, 3),
+            minimum_profit_quote: Decimal::new(2, 2),
+            max_active_positions: 2,
+        },
+    };
+    let instance = store.create(&user, create.clone(), 1_000).await?;
+    assert_eq!(store.create(&user, create, 1_001).await?, instance);
+    let revision = store
+        .lifecycle(
+            &user,
+            SupportMartingaleLifecycleRequest {
+                schema_version: SUPPORT_MARTINGALE_SCHEMA_VERSION,
+                request_id: "qa_start".into(),
+                instance_id: instance.clone(),
+                expected_revision: 1,
+                action: SupportMartingaleAction::Start,
+            },
+            1_002,
+        )
+        .await?;
+    assert_eq!(revision, 2);
+    store
+        .sync_symbol_facts(
+            &user,
+            &instance,
+            &symbols[0],
+            Decimal::ZERO,
+            None,
+            Decimal::ZERO,
+            None,
+            Some(Decimal::ZERO),
+            1_003,
+        )
+        .await?;
+    let initial_runtime = store.load_runtime_state(&user, &instance).await?;
+    assert_eq!(initial_runtime.symbols[0].cooldown_until_ms, None);
+    assert_eq!(store.get(&user, &instance).await?.symbols[0].status, "idle");
+    let owner = OrderOwner {
+        strategy_instance_id: instance.clone(),
+        run_id: "cycle_1".into(),
+        exchange: VenueId::Bybit.as_str().into(),
+        account,
+        symbol: symbols[0].clone(),
+        purpose: OrderPurpose::Entry,
+    };
+    let entry = ExecutionCommand::PlaceMarket(venue_domain::MarketOrderCommand {
+        command_id: CommandId::new("support_entry_1")?,
+        client_order_id: CommandId::new("support_entry_1")?,
+        owner: owner.clone(),
+        position_side: PositionSide::Long,
+        side: OrderSide::Buy,
+        quantity: Decimal::ONE,
+        reduce_only: false,
+    });
+    assert!(matches!(
+        store
+            .enqueue_command(
+                &user,
+                &instance,
+                &symbols[0],
+                SupportMartingaleCommandKind::Entry,
+                Some("cycle_1"),
+                Some("support_1"),
+                Some((Decimal::from(90), Decimal::from(91))),
+                "support_entry_1",
+                Decimal::from(5),
+                entry,
+                1_004,
+            )
+            .await?,
+        StrategyEnqueueResult::Inserted { .. }
+    ));
+    assert_eq!(
+        store.get(&user, &instance).await?.reserved_budget,
+        Decimal::from(5)
+    );
+    store
+        .settle_command(&user, "support_entry_1", Decimal::ZERO, true, 1_005)
+        .await?;
+    assert_eq!(
+        store.get(&user, &instance).await?.reserved_budget,
+        Decimal::ZERO
+    );
+    let retry = ExecutionCommand::PlaceMarket(venue_domain::MarketOrderCommand {
+        command_id: CommandId::new("support_entry_2")?,
+        client_order_id: CommandId::new("support_entry_2")?,
+        owner,
+        position_side: PositionSide::Long,
+        side: OrderSide::Buy,
+        quantity: Decimal::ONE,
+        reduce_only: false,
+    });
+    assert!(
+        store
+            .enqueue_command(
+                &user,
+                &instance,
+                &symbols[0],
+                SupportMartingaleCommandKind::Entry,
+                Some("cycle_1"),
+                Some("support_1"),
+                Some((Decimal::from(90), Decimal::from(91))),
+                "support_entry_2",
+                Decimal::from(5),
+                retry,
+                1_006,
+            )
+            .await
+            .is_err()
+    );
     fixture.cleanup().await?;
     Ok(())
 }

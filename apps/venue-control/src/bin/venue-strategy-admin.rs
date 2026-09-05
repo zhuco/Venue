@@ -7,6 +7,10 @@ use venue_control::{
     multi_venue_exchange::StrategyCredentials,
     multi_venue_runtime::now_ms,
     multi_venue_store::MultiVenueStore,
+    support_martingale::SupportMartingaleStore,
+};
+use venue_control_protocol::support_martingale::{
+    SupportMartingaleCreateRequest, SupportMartingaleLifecycleRequest,
 };
 use venue_domain::domain::{ExecutionCommand, Symbol};
 use zeroize::Zeroizing;
@@ -25,10 +29,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let valid = matches!(args.as_slice(), [op] if op == "migrate")
         || matches!(args.as_slice(), [op, _, _, _, _] if op == "bind" || op == "bind-released")
-        || matches!(args.as_slice(), [op, _, _] if matches!(op.as_str(), "submit"|"status"|"limits"|"grid-create"|"grid-status"|"probe"))
+        || matches!(args.as_slice(), [op, _] if op == "martingale-create" || op == "martingale-lifecycle")
+        || matches!(args.as_slice(), [op, _, _] if matches!(op.as_str(), "submit"|"status"|"limits"|"grid-create"|"grid-status"|"probe"|"martingale-status"))
         || matches!(args.as_slice(), [op, _, _, _] if op == "snapshot" || op == "grid-lifecycle");
     if !valid {
-        return Err("usage: venue-strategy-admin migrate | probe ACCOUNT SYMBOL | bind|bind-released USER ACCOUNT SYMBOL LABEL | limits USER CREDENTIAL | submit USER CREDENTIAL | snapshot USER CREDENTIAL SYMBOL | status USER COMMAND | grid-create USER CREDENTIAL | grid-status USER INSTANCE | grid-lifecycle USER INSTANCE start|pause|resume|stop|reset; structured input uses stdin".into());
+        return Err("usage: venue-strategy-admin migrate | probe ACCOUNT SYMBOL | bind|bind-released USER ACCOUNT SYMBOL LABEL | limits USER CREDENTIAL | submit USER CREDENTIAL | snapshot USER CREDENTIAL SYMBOL | status USER COMMAND | grid-create USER CREDENTIAL | grid-status USER INSTANCE | grid-lifecycle USER INSTANCE start|pause|resume|stop|reset | martingale-create USER | martingale-status USER INSTANCE | martingale-lifecycle USER; structured input uses stdin".into());
     }
     if args[0] == "probe" {
         let credentials: StrategyCredentials = input()?;
@@ -70,6 +75,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .lifecycle(&args[1], &args[2], &args[3], now_ms()?)
                 .await?;
             println!("lifecycle intent saved");
+        }
+        "martingale-create" => {
+            let request: SupportMartingaleCreateRequest = input()?;
+            let id = SupportMartingaleStore::new(pool)
+                .create(&args[1], request, now_ms()?)
+                .await?;
+            println!("{id}");
+        }
+        "martingale-status" => {
+            let record = SupportMartingaleStore::new(pool)
+                .get(&args[1], &args[2])
+                .await?;
+            println!("{}", serde_json::to_string(&record)?);
+        }
+        "martingale-lifecycle" => {
+            let request: SupportMartingaleLifecycleRequest = input()?;
+            let revision = SupportMartingaleStore::new(pool)
+                .lifecycle(&args[1], request, now_ms()?)
+                .await?;
+            println!("{revision}");
         }
         "migrate" => venue_control::install_control_schema(&pool).await?,
         "bind" | "bind-released" => {

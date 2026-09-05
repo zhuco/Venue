@@ -9,6 +9,7 @@ pub mod grid;
 pub mod kol;
 pub mod leader_bot;
 pub mod managed_followers;
+pub mod support_martingale;
 pub mod terminal_position;
 mod trade;
 use rust_decimal::Decimal;

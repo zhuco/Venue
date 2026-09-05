@@ -28,19 +28,27 @@ pub struct MultiVenueExecutor {
     store: MultiVenueStore,
     credentials: StrategyCredentialStore,
     grids: crate::multi_venue_grid::StrategyGridRuntime,
+    support: crate::support_martingale::SupportMartingaleRuntime,
 }
 
 impl MultiVenueExecutor {
-    pub fn new(pool: PgPool, credentials: StrategyCredentialStore) -> Self {
-        Self {
+    pub fn new(
+        pool: PgPool,
+        credentials: StrategyCredentialStore,
+    ) -> Result<Self, MultiVenueStoreError> {
+        Ok(Self {
             grids: crate::multi_venue_grid::StrategyGridRuntime::new(
                 pool.clone(),
                 credentials.clone(),
             ),
+            support: crate::support_martingale::SupportMartingaleRuntime::new(
+                pool.clone(),
+                credentials.clone(),
+            )?,
             store: MultiVenueStore::new(pool.clone()),
             pool,
             credentials,
-        }
+        })
     }
 
     pub async fn run_until_shutdown(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
@@ -58,7 +66,7 @@ impl MultiVenueExecutor {
                 }
                 _ = tick.tick() => {
                     // Ordering by the oldest update rotates failed accounts behind useful work.
-                    let accounts = sqlx::query("SELECT trading_account_id,MIN(updated_ms) AS oldest FROM (SELECT trading_account_id,updated_ms FROM venue_binance_commands WHERE strategy_command IS NOT NULL AND command_state IN ('pending','sending','accepted','reconcile_required') UNION ALL SELECT trading_account_id,updated_ms FROM venue_strategy_grids WHERE lifecycle IN ('running','pausing','stopping','resetting')) work GROUP BY trading_account_id ORDER BY oldest,trading_account_id LIMIT 232")
+                    let accounts = sqlx::query("SELECT trading_account_id,MIN(updated_ms) AS oldest FROM (SELECT trading_account_id,updated_ms FROM venue_binance_commands WHERE strategy_command IS NOT NULL AND command_state IN ('pending','sending','accepted','reconcile_required') UNION ALL SELECT trading_account_id,updated_ms FROM venue_strategy_grids WHERE lifecycle IN ('running','pausing','stopping','resetting') UNION ALL SELECT trading_account_id,updated_ms FROM venue_support_martingale_instances WHERE lifecycle IN ('running','entry_paused','increase_paused','draining')) work GROUP BY trading_account_id ORDER BY oldest,trading_account_id LIMIT 232")
                         .fetch_all(&self.pool).await;
                     let Ok(accounts) = accounts else {
                         tracing::warn!("strategy discovery unavailable; durable commands retained");
@@ -91,6 +99,11 @@ impl MultiVenueExecutor {
     async fn account_turn(&self, account: &str) -> Result<(), MultiVenueStoreError> {
         // Planning and transport share the same in-process account worker. Planner failure must
         // not prevent an existing command from being reconciled below.
+        if self.support.account_turn(account).await.is_err() {
+            tracing::warn!(
+                "support martingale planning deferred; durable account commands retained"
+            );
+        }
         if self.grids.account_turn(account).await.is_err() {
             tracing::warn!("strategy grid planning deferred; durable account commands retained");
         }
@@ -180,6 +193,14 @@ impl MultiVenueExecutor {
                     .await
                     .map_err(|_| StrategyExchangeError)?
             };
+            let support_fence = if claim.reconcile_only {
+                None
+            } else {
+                self.support
+                    .send_fence(&claim.command, now_ms()?)
+                    .await
+                    .map_err(|_| StrategyExchangeError)?
+            };
             Ok::<_, StrategyExchangeError>((
                 credentials,
                 expected_identity,
@@ -187,14 +208,15 @@ impl MultiVenueExecutor {
                 context,
                 limits,
                 grid_fence,
+                support_fence,
             ))
         }
         .await;
-        let (credentials, expected_identity, binding, context, limits, grid_fence) = match prepared
-        {
-            Ok(prepared) => prepared,
-            Err(_) => return Ok(pre_send_failure(claim.reconcile_only)),
-        };
+        let (credentials, expected_identity, binding, context, limits, grid_fence, support_fence) =
+            match prepared {
+                Ok(prepared) => prepared,
+                Err(_) => return Ok(pre_send_failure(claim.reconcile_only)),
+            };
         let claim = claim.clone();
         let credential_id = claim.credential_id.clone();
         let (result, snapshot) = tokio::task::spawn_blocking(move || {
@@ -244,6 +266,14 @@ impl MultiVenueExecutor {
                 Ok(snapshot) => snapshot,
                 Err(_) => return Ok((pre_send_failure(false), None)),
             };
+            if support_fence.is_some_and(|fence| !fence.validates(&claim.command, &snapshot)) {
+                return Ok((
+                    AccountGatewayResult::Rejected {
+                        reason: "strategy_support_plan_changed".into(),
+                    },
+                    Some(snapshot),
+                ));
+            }
             for (observed, expected_cancel) in checked_grid_orders {
                 let fact = snapshot.open_orders().iter().find(|fact| {
                     fact.venue_order_id.as_deref() == Some(observed.native_order_id.as_str())

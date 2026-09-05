@@ -16,6 +16,8 @@ pub(crate) enum GridMutation {
     LeaderCreate(venue_control_protocol::leader_bot::LeaderBotConfiguredCreateRequest),
     LeaderUpdate(venue_control_protocol::leader_bot::LeaderBotUpdateRequest),
     LeaderLifecycle(venue_control_protocol::leader_bot::LeaderBotLifecycleRequest),
+    SupportMartingaleCreate(super::support_martingale::SupportMartingaleCreateRequest),
+    SupportMartingaleLifecycle(super::support_martingale::SupportMartingaleLifecycleRequest),
 }
 
 impl GridMutation {
@@ -27,6 +29,8 @@ impl GridMutation {
             Self::LeaderCreate(request) => request.valid(),
             Self::LeaderUpdate(request) => request.valid(),
             Self::LeaderLifecycle(request) => request.valid(),
+            Self::SupportMartingaleCreate(request) => request.validate().is_ok(),
+            Self::SupportMartingaleLifecycle(request) => request.validate().is_ok(),
         }
     }
 
@@ -39,6 +43,8 @@ impl GridMutation {
             Self::LeaderLifecycle(_) => {
                 venue_control_protocol::leader_bot::LEADER_BOTS_LIFECYCLE_PATH
             }
+            Self::SupportMartingaleCreate(_) => super::support_martingale::INSTANCES_PATH,
+            Self::SupportMartingaleLifecycle(_) => super::support_martingale::LIFECYCLE_PATH,
         }
     }
 
@@ -50,6 +56,7 @@ impl GridMutation {
             Self::Update(request) => summary.instance_id == request.instance_id,
             Self::Lifecycle(request) => summary.instance_id == request.instance_id,
             Self::LeaderCreate(_) | Self::LeaderUpdate(_) | Self::LeaderLifecycle(_) => false,
+            Self::SupportMartingaleCreate(_) | Self::SupportMartingaleLifecycle(_) => false,
         }
     }
 }
@@ -96,6 +103,9 @@ async fn submit(
         GridMutation::LeaderCreate(_)
         | GridMutation::LeaderUpdate(_)
         | GridMutation::LeaderLifecycle(_) => {
+            return Err(mutation_unavailable("wrong mutation route"));
+        }
+        GridMutation::SupportMartingaleCreate(_) | GridMutation::SupportMartingaleLifecycle(_) => {
             return Err(mutation_unavailable("wrong mutation route"));
         }
     }
@@ -232,6 +242,17 @@ pub(super) fn start_native(
                 },
             };
             publish(&poll_sender, &poll_context, event);
+            let event = match tokio::time::timeout(
+                super::REQUEST_TIMEOUT,
+                super::support_martingale::fetch(&poll_client, &poll_endpoint),
+            )
+            .await
+            {
+                Ok(Ok(instances)) => ClientEvent::SupportMartingaleInstances(instances),
+                Ok(Err(event)) => *event,
+                Err(_) => ClientEvent::SupportMartingaleUnavailable("支撑分批策略查询超时".into()),
+            };
+            publish(&poll_sender, &poll_context, event);
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
     });
@@ -257,6 +278,28 @@ pub(super) fn start_native(
                             definitive: false,
                             message: "带单操作未确认，可重试原请求".into(),
                         },
+                    };
+                    publish(&sender, &context, event);
+                    continue;
+                }
+                if matches!(
+                    mutation,
+                    GridMutation::SupportMartingaleCreate(_)
+                        | GridMutation::SupportMartingaleLifecycle(_)
+                ) {
+                    let event = match tokio::time::timeout(
+                        super::REQUEST_TIMEOUT,
+                        super::support_martingale::submit(&client, &endpoint, &mutation),
+                    )
+                    .await
+                    {
+                        Ok(Ok(summary)) => {
+                            ClientEvent::SupportMartingaleMutationApplied(Box::new(summary))
+                        }
+                        Ok(Err(event)) => *event,
+                        Err(_) => ClientEvent::SupportMartingaleMutationUnavailable(
+                            "请求超时，原请求待对账".into(),
+                        ),
                     };
                     publish(&sender, &context, event);
                     continue;
@@ -314,6 +357,11 @@ pub(super) fn start_web(
                 next_poll_ms = now_ms.saturating_add(3_000);
                 let event = super::leader_bot::fetch(&client, &endpoint).await;
                 publish(&sender, &context, event);
+                let event = match super::support_martingale::fetch(&client, &endpoint).await {
+                    Ok(instances) => ClientEvent::SupportMartingaleInstances(instances),
+                    Err(event) => *event,
+                };
+                publish(&sender, &context, event);
             }
             for mutation in mutations.try_iter().take(16) {
                 if matches!(
@@ -323,6 +371,24 @@ pub(super) fn start_web(
                         | GridMutation::LeaderLifecycle(_)
                 ) {
                     let event = super::leader_bot::submit(&client, &endpoint, &mutation).await;
+                    publish(&sender, &context, event);
+                    continue;
+                }
+                if matches!(
+                    mutation,
+                    GridMutation::SupportMartingaleCreate(_)
+                        | GridMutation::SupportMartingaleLifecycle(_)
+                ) {
+                    let event = match super::support_martingale::submit(
+                        &client, &endpoint, &mutation,
+                    )
+                    .await
+                    {
+                        Ok(summary) => {
+                            ClientEvent::SupportMartingaleMutationApplied(Box::new(summary))
+                        }
+                        Err(event) => *event,
+                    };
                     publish(&sender, &context, event);
                     continue;
                 }

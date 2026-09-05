@@ -285,6 +285,26 @@ impl VenueFlowApp {
                         self.model.execution.leader_bot.pending = None;
                     }
                 }
+                ClientEvent::SupportMartingaleInstances(instances) => self
+                    .model
+                    .execution
+                    .support_martingale
+                    .apply_instances(instances),
+                ClientEvent::SupportMartingaleMutationApplied(summary) => self
+                    .model
+                    .execution
+                    .support_martingale
+                    .apply_summary(*summary),
+                ClientEvent::SupportMartingaleUnavailable(message) => self
+                    .model
+                    .execution
+                    .support_martingale
+                    .unavailable(message, false),
+                ClientEvent::SupportMartingaleMutationUnavailable(message) => self
+                    .model
+                    .execution
+                    .support_martingale
+                    .unavailable(message, true),
                 ClientEvent::GridMutationApplied(summary) => {
                     self.model.execution.grid.apply_summary(*summary)
                 }

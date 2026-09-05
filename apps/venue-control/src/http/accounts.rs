@@ -27,6 +27,11 @@ use venue_control_protocol::{
         ManagedFollowSettingsUpsertRequest, ManagedFollowStatusRequest,
         ManagedFollowerCreateRequest, ManagedFollowerVerifyRequest,
     },
+    support_martingale::{
+        SUPPORT_MARTINGALE_DETAIL_PREFIX, SUPPORT_MARTINGALE_INSTANCES_PATH,
+        SUPPORT_MARTINGALE_LIFECYCLE_PATH, SupportMartingaleCreateRequest,
+        SupportMartingaleLifecycleRequest,
+    },
     terminal_position::{TERMINAL_POSITION_ACTION_PATH, TerminalPositionActionRequest},
 };
 
@@ -89,7 +94,10 @@ where
                 | MANAGED_FOLLOW_STATUS_PATH
                 | MANAGED_FOLLOW_LIFECYCLE_PATH
                 | MANAGED_VERIFY_PATH
+                | SUPPORT_MARTINGALE_INSTANCES_PATH
+                | SUPPORT_MARTINGALE_LIFECYCLE_PATH
         )
+        || path.starts_with(SUPPORT_MARTINGALE_DETAIL_PREFIX)
     {
         let Some(accounts) = accounts else {
             return account_error(stream, AccountErrorCode::Unavailable).await;
@@ -317,7 +325,37 @@ async fn account_request(
         code: AccountErrorCode::Unauthorized,
     })?;
     let principal = accounts.authenticate(token.expose(), now).await?;
+    if request.method == Method::Get {
+        if let Some(instance_id) = support_martingale_detail_id(path) {
+            return encode(
+                &accounts
+                    .support_martingale_instance(&principal, instance_id)
+                    .await?,
+            );
+        }
+    }
     match (request.method, path) {
+        (Method::Get, SUPPORT_MARTINGALE_INSTANCES_PATH) => {
+            encode(&accounts.support_martingale_instances(&principal).await?)
+        }
+        (Method::Post, SUPPORT_MARTINGALE_INSTANCES_PATH) => encode(
+            &accounts
+                .create_support_martingale(
+                    &principal,
+                    decode::<SupportMartingaleCreateRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
+        (Method::Post, SUPPORT_MARTINGALE_LIFECYCLE_PATH) => encode(
+            &accounts
+                .support_martingale_lifecycle(
+                    &principal,
+                    decode::<SupportMartingaleLifecycleRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
         (Method::Get, MANAGED_FOLLOWERS_PATH) => {
             encode(&accounts.managed_followers(&principal).await?)
         }
@@ -564,6 +602,32 @@ async fn account_request(
         _ => Err(AccountError {
             code: AccountErrorCode::InvalidInput,
         }),
+    }
+}
+
+fn support_martingale_detail_id(path: &str) -> Option<&str> {
+    path.strip_prefix(SUPPORT_MARTINGALE_DETAIL_PREFIX)
+        .filter(|value| !value.is_empty() && !value.contains('/'))
+}
+
+#[cfg(test)]
+mod support_martingale_route_tests {
+    use super::support_martingale_detail_id;
+
+    #[test]
+    fn detail_route_requires_one_non_empty_instance_segment() {
+        assert_eq!(
+            support_martingale_detail_id("/v2/strategies/support-martingale/instances/sm-1"),
+            Some("sm-1")
+        );
+        assert_eq!(
+            support_martingale_detail_id("/v2/strategies/support-martingale/instances/"),
+            None
+        );
+        assert_eq!(
+            support_martingale_detail_id("/v2/strategies/support-martingale/instances/a/b"),
+            None
+        );
     }
 }
 

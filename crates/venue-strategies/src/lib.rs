@@ -5,3 +5,4 @@
 
 pub mod hedged_grid;
 pub mod scalping;
+pub mod support_martingale;

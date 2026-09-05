@@ -279,6 +279,33 @@ impl MultiVenueStore {
         if old_writer {
             return Err(MultiVenueStoreError::Conflict);
         }
+        let support_owner = sqlx::query(
+            "SELECT instance_id,owner_user_id,credential_id FROM venue_support_martingale_instances WHERE trading_account_id=$1 AND lifecycle IN ('running','entry_paused','increase_paused','draining') LIMIT 2",
+        )
+        .bind(&account_id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|_| MultiVenueStoreError::Unavailable)?;
+        if support_owner.len() > 1 {
+            return Err(MultiVenueStoreError::Conflict);
+        }
+        if let Some(support) = support_owner.first() {
+            let support_instance: String = support
+                .try_get("instance_id")
+                .map_err(|_| MultiVenueStoreError::Unavailable)?;
+            let support_user: String = support
+                .try_get("owner_user_id")
+                .map_err(|_| MultiVenueStoreError::Unavailable)?;
+            let support_credential: String = support
+                .try_get("credential_id")
+                .map_err(|_| MultiVenueStoreError::Unavailable)?;
+            if support_instance != owner.strategy_instance_id
+                || support_user != owner_user_id
+                || support_credential != credential_id
+            {
+                return Err(MultiVenueStoreError::Conflict);
+            }
+        }
         let existing = sqlx::query(
             "SELECT command_id,owner_user_id,credential_id,trading_account_id,strategy_venue, \
                     strategy_command,client_order_id \

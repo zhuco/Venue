@@ -158,6 +158,18 @@ impl StrategyGridStore {
             ("reset", "running" | "paused") => "resetting",
             _ => return Err(Error::Conflict),
         };
+        if matches!(action, "start" | "resume" | "reset") {
+            let support_active: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM venue_support_martingale_instances WHERE trading_account_id=$1 AND lifecycle IN ('running','entry_paused','increase_paused','draining'))",
+            )
+            .bind(&record.trading_account_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| Error::Unavailable)?;
+            if support_active {
+                return Err(Error::Conflict);
+            }
+        }
         // An unsent entry may be cancelled locally. Sent or uncertain commands keep their original
         // identity and finish reconciliation before any cancellation or new strategy planning.
         if next != "running" {

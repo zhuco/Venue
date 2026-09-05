@@ -42,6 +42,7 @@ mod postgres;
 pub mod private_projection;
 mod repository;
 mod service;
+pub mod support_martingale;
 
 pub use account_delivery_postgres::{
     MAX_ACCOUNT_DELIVERY_CLAIM, MAX_ACCOUNT_DELIVERY_LEASE_MS, MIGRATION_0004,
@@ -130,5 +131,6 @@ pub const MIGRATION_0030: &str = include_str!("../migrations/0030_managed_follow
 pub const MIGRATION_0029: &str = include_str!("../migrations/0029_mirror_gtc.sql");
 pub const MIGRATION_0035: &str = include_str!("../migrations/0035_multi_venue_executor.sql");
 pub const MIGRATION_0036: &str = include_str!("../migrations/0036_strategy_grid.sql");
+pub const MIGRATION_0037: &str = include_str!("../migrations/0037_support_martingale.sql");
 mod schema;
 pub use schema::{SchemaError, install_control_schema};

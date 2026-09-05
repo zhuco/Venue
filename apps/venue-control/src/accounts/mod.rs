@@ -9,6 +9,7 @@ mod kol;
 mod leader_bot;
 mod managed_followers;
 mod session;
+mod support_martingale;
 mod terminal;
 #[cfg(test)]
 pub(crate) mod test_support;

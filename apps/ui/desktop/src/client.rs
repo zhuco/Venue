@@ -3,11 +3,13 @@ mod execution;
 mod grid;
 mod leader_bot;
 mod stream_gates;
+mod support_martingale;
 mod terminal;
 use eframe::egui;
 pub(crate) use grid::GridMutation;
 use std::collections::BTreeSet;
 use stream_gates::StreamGates;
+pub(crate) use support_martingale::*;
 use venue_control_protocol::accounts::SecretValue;
 use venue_control_protocol::kol::{
     ExecutorCommandSummary, TerminalAccountProjection, TerminalCancelRequest, TerminalOrderRequest,
@@ -56,6 +58,10 @@ pub enum ClientEvent {
         definitive: bool,
         message: String,
     },
+    SupportMartingaleInstances(Vec<support_martingale::SupportMartingaleListItem>),
+    SupportMartingaleMutationApplied(Box<support_martingale::SupportMartingaleListItem>),
+    SupportMartingaleUnavailable(String),
+    SupportMartingaleMutationUnavailable(String),
     SessionExpired,
     SnapshotConnected,
     SnapshotUnavailable(String),

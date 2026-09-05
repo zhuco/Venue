@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pool.clone(),
             CredentialCipher::from_environment()?,
         ),
-    );
+    )?;
     let strategy_shutdown = shutdown_rx.clone();
     let strategy_task = tokio::spawn(async move {
         strategy_executor

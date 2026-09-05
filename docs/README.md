@@ -12,6 +12,7 @@
 | 进程如何协作、功能代码在哪里 | [架构](ARCHITECTURE.md)、[CODEMAP](CODEMAP.md) |
 | Grid 如何规划和运行 | [Grid 开发结构](GRID_STRATEGY_ARCHITECTURE.md) |
 | 当前开发中的独立多交易所策略入口 | [多交易所执行](MULTI_VENUE_EXECUTOR.md)；与 alpha.27 发布基线分开验证 |
+| 支撑分批做多如何开发并接入桌面 | [马丁策略开发与评估](SUPPORT_MARTINGALE.md)；单账户多币、币安参考行情、市价买入与限价止盈，待实现契约 |
 | 如何处理旧 Grid/Node 账户和恢复事实 | [Grid 契约与旧运行时保护](GRID_RUNTIME_REFACTOR.md)、[冻结 Node CLI](NODE.md) |
 | 如何构建、验证、合并及管理版本 | [开发指南](DEVELOPMENT.md) |
 | 如何发布或回滚 Control/Executor | [发布及回滚清单](DEVELOPMENT.md#executor-release) |
