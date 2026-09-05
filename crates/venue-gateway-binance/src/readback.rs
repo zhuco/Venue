@@ -725,6 +725,15 @@ fn one(
     pages.pop().ok_or(BinanceReadbackError::Page)
 }
 
+/// Parses the complete, symbol-filtered signed UM position response. Absent legs in that
+/// complete response mean zero, not a missing page. Raw exchange fields stay in this adapter.
+pub fn parse_signed_hedge_positions(
+    payload: &str,
+    binding: &GatewayBinding,
+) -> Result<Vec<Position>, BinanceReadbackError> {
+    parse_complete_positions(payload, binding, BinancePositionMode::Hedge)
+}
+
 fn parse_complete_positions(
     payload: &str,
     binding: &GatewayBinding,

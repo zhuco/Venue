@@ -1,5 +1,7 @@
 //! Authenticated terminal command admission. It only writes the singleton Executor ledger.
 
+mod position_actions;
+
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, Row};
@@ -60,7 +62,7 @@ impl AccountService {
             terminal_client_order_id(&principal.user.user_id, &request.request_id);
         let mut tx = self.pool.begin().await.map_err(database_error)?;
         let queue_depth = lock_account_command_queue(
-            &mut *tx,
+            &mut tx,
             &principal.user.user_id,
             &projection.trading_account_id,
             &request.credential_id,
@@ -68,7 +70,7 @@ impl AccountService {
         .await
         .map_err(account_admission_error)?;
         if let Some(row) =
-            load_terminal_command(&mut *tx, &principal.user.user_id, &request.request_id).await?
+            load_terminal_command(&mut tx, &principal.user.user_id, &request.request_id).await?
         {
             validate_replay_digest(&row, &digest)?;
             let summary = command_summary(&row)?;
@@ -180,7 +182,7 @@ impl AccountService {
         };
         let mut tx = self.pool.begin().await.map_err(database_error)?;
         let queue_depth = lock_account_command_queue(
-            &mut *tx,
+            &mut tx,
             &principal.user.user_id,
             &trading_account_id,
             &request.credential_id,
@@ -195,7 +197,7 @@ impl AccountService {
             return Err(error(Code::VerificationRequired));
         }
         if let Some(row) =
-            load_terminal_command(&mut *tx, &principal.user.user_id, &request.request_id).await?
+            load_terminal_command(&mut tx, &principal.user.user_id, &request.request_id).await?
         {
             validate_replay_digest(&row, &digest)?;
             let summary = command_summary(&row)?;
@@ -226,7 +228,7 @@ impl AccountService {
         &self,
         principal: &Principal,
     ) -> Result<Vec<ExecutorCommandSummary>, AccountError> {
-        let rows = sqlx::query("SELECT command_id,request_id,command_origin,command_phase,order_kind,order_side,requested_quantity,limit_price,trading_account_id,symbol,position_side,command_state,native_order_id,created_ms,updated_ms,sanitized_error_code FROM venue_binance_commands WHERE owner_user_id=$1 ORDER BY created_ms DESC,command_id DESC LIMIT 200")
+        let rows = sqlx::query("SELECT c.command_id,c.request_id,c.command_origin,c.command_phase,c.order_kind,c.order_side,c.requested_quantity,c.limit_price,c.trading_account_id,c.symbol,c.position_side,c.command_state,c.native_order_id,c.created_ms,c.updated_ms,CASE WHEN c.command_state='pending' AND parent.command_state='reconcile_required' THEN parent.sanitized_error_code ELSE c.sanitized_error_code END AS sanitized_error_code FROM venue_binance_commands c LEFT JOIN venue_terminal_position_commands action ON action.command_id=c.command_id LEFT JOIN venue_binance_commands parent ON parent.command_id=action.reverse_parent_id AND parent.owner_user_id=c.owner_user_id WHERE c.owner_user_id=$1 ORDER BY c.created_ms DESC,c.command_id DESC LIMIT 200")
             .bind(&principal.user.user_id).fetch_all(&self.pool).await.map_err(database_error)?;
         rows.iter().map(command_summary).collect()
     }
@@ -299,6 +301,7 @@ fn command_summary(row: &sqlx::postgres::PgRow) -> Result<ExecutorCommandSummary
     let order_kind = match text(row, "order_kind")?.as_str() {
         "market" => ExecutorOrderKind::Market,
         "limit_post_only" => ExecutorOrderKind::LimitPostOnly,
+        "limit_gtc" => ExecutorOrderKind::LimitGtc,
         "cancel_exact" => ExecutorOrderKind::CancelExact,
         _ => return Err(error(Code::Unavailable)),
     };

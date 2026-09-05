@@ -1,3 +1,3 @@
-import { ControlConsole } from "@/components/control-console";
+import { CustomerConsole } from "@/components/customer-console";
 
-export default function Page() { return <ControlConsole />; }
+export default function Page() { return <CustomerConsole />; }

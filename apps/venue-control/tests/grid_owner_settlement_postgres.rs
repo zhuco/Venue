@@ -550,6 +550,10 @@ impl Fixture {
             MIGRATION_0022,
             MIGRATION_0023,
             MIGRATION_0024,
+            venue_control::MIGRATION_0025,
+            venue_control::MIGRATION_0026,
+            venue_control::MIGRATION_0027,
+            venue_control::MIGRATION_0028,
         ] {
             sqlx::raw_sql(migration).execute(&pool).await?;
         }

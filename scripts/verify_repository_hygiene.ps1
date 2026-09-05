@@ -2,9 +2,9 @@
 param()
 
 $ErrorActionPreference = "Stop"
-# The unified Node/Web workspace plus bounded startup-recovery tests is about 12 MiB.
-# This is a source-only budget; single-file and generated/secret exclusions stay unchanged.
-$maxTrackedBytes = 13MB
+# The unified Binance Control/Desktop/Web workspace and bounded recovery tests are about 14 MiB.
+# This is a source-only budget with feature headroom; single-file and generated/secret exclusions stay unchanged.
+$maxTrackedBytes = 20MB
 $maxSingleFileBytes = 2MB
 $forbiddenRoots = @(
     "bak/",
@@ -96,7 +96,7 @@ foreach ($change in $changedPaths) {
 }
 
 if ($totalBytes -gt $maxTrackedBytes) {
-    $violations.Add("tracked worktree exceeds 13 MiB: $totalBytes bytes")
+    $violations.Add("tracked worktree exceeds 20 MiB: $totalBytes bytes")
 }
 if ($violations.Count -ne 0) {
     $violations | ForEach-Object { Write-Error $_ }

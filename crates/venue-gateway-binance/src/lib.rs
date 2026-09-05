@@ -6,6 +6,7 @@ mod credentials;
 mod execution;
 mod grid_market;
 mod instrument;
+mod mark_price;
 pub mod portfolio;
 pub mod private;
 mod private_ws;
@@ -21,8 +22,9 @@ pub use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
 
 pub use account_gateway::{
     BinanceAccountGateway, BinanceAccountGatewayError, BinanceCompletedProjection,
-    BinanceGridBootstrapMarketFacts, BinancePrivateAccountEvent, BinancePrivateFillEvent,
-    BinanceProjectionRead, BinancePublicMarketEvent,
+    BinanceExecutionRiskInput, BinanceGridBootstrapMarketFacts, BinancePrivateAccountEvent,
+    BinancePrivateFillEvent, BinanceProjectionRead, BinancePublicMarketEvent,
+    prepare_execution_risk_readback,
 };
 pub use binding::{BinanceAccountBinding, BinanceBindingError, native_symbol};
 pub use config::{BinanceConfig, endpoints};
@@ -34,6 +36,7 @@ pub use instrument::{
     BinanceInstrumentError, BinanceInstrumentRules, parse_instrument_rules,
     parse_native_instrument_rules,
 };
+pub use mark_price::{BinanceMarkPrice, parse_mark_price};
 pub use private_ws::{
     BinanceListenKey, BinancePrivateWsTransport, BinanceRawPrivateFrame, connect_private_ws,
 };

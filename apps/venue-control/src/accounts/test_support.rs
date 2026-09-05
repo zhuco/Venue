@@ -67,6 +67,15 @@ impl Fixture {
                 crate::MIGRATION_0022,
                 crate::MIGRATION_0023,
                 crate::MIGRATION_0024,
+                crate::MIGRATION_0025,
+                crate::MIGRATION_0026,
+                crate::MIGRATION_0027,
+                crate::MIGRATION_0028,
+                crate::MIGRATION_0029,
+                crate::MIGRATION_0030,
+                crate::MIGRATION_0031,
+                crate::MIGRATION_0032,
+                crate::MIGRATION_0033,
             ] {
                 sqlx::raw_sql(migration).execute(&pool).await?;
             }

@@ -16,7 +16,7 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 const STORAGE_KEY: &str = "venueflow-state-v1";
-const PERSISTED_SCHEMA_VERSION: u16 = 6;
+const PERSISTED_SCHEMA_VERSION: u16 = 7;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -231,7 +231,11 @@ impl VenueFlowApp {
                 ClientEvent::TerminalSubmissionUnavailable {
                     request_id,
                     message,
+                    definitely_not_submitted,
                 } => {
+                    self.model
+                        .execution
+                        .position_submission_failed(&request_id, definitely_not_submitted);
                     if self.model.execution.terminal_request_id.as_deref()
                         == Some(request_id.as_str())
                     {
@@ -239,11 +243,48 @@ impl VenueFlowApp {
                         self.model.notice(message);
                     }
                 }
-                ClientEvent::TerminalAccountUnavailable(message) => {
-                    self.model.execution.private_error = Some(message)
+                ClientEvent::TerminalAccountUnavailable {
+                    credential_id,
+                    message,
+                } => {
+                    if self
+                        .model
+                        .account_overview
+                        .as_ref()
+                        .is_some_and(|overview| {
+                            overview.selected_credential_id.as_ref() == Some(&credential_id)
+                        })
+                    {
+                        self.model.execution.private_error = Some(message);
+                    }
                 }
                 ClientEvent::GridInstances(instances) => {
                     self.model.execution.grid.apply_instances(instances)
+                }
+                ClientEvent::LeaderBotAccess(access) => {
+                    self.model.execution.leader_bot.access = Some(access);
+                    self.model.execution.leader_bot.fresh = true;
+                    if self.model.execution.leader_bot.pending.is_none() {
+                        self.model.execution.leader_bot.error = None;
+                    }
+                }
+                ClientEvent::LeaderBotMutationApplied(access) => {
+                    self.model.execution.leader_bot.access = Some(access);
+                    self.model.execution.leader_bot.fresh = true;
+                    self.model.execution.leader_bot.pending = None;
+                    self.model.execution.leader_bot.create_credential_id = None;
+                    self.model.execution.leader_bot.error = None;
+                }
+                ClientEvent::LeaderBotUnavailable {
+                    mutation,
+                    definitive,
+                    message,
+                } => {
+                    self.model.execution.leader_bot.error = Some(message);
+                    self.model.execution.leader_bot.fresh = false;
+                    if mutation && definitive {
+                        self.model.execution.leader_bot.pending = None;
+                    }
                 }
                 ClientEvent::GridMutationApplied(summary) => {
                     self.model.execution.grid.apply_summary(*summary)
@@ -327,6 +368,21 @@ impl VenueFlowApp {
     }
 
     fn synchronize_private_projection(&self) {
+        self.client
+            .select_execution_scope(self.model.selected_execution_credential().and_then(
+                |credential| {
+                    credential
+                        .trading_account_id
+                        .clone()
+                        .map(
+                            |trading_account_id| venue_control_protocol::UiAccountScope {
+                                venue: credential.venue,
+                                mode: venue_control_protocol::GatewayMode::Live,
+                                trading_account_id,
+                            },
+                        )
+                },
+            ));
         let Some(credential_id) = self
             .model
             .account_overview
@@ -394,6 +450,8 @@ impl eframe::App for VenueFlowApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        crate::chart_trading::poll(&mut self.model);
+        crate::chart_trading::notification(ui.ctx(), &mut self.model);
         ui.painter()
             .rect_filled(ui.max_rect(), 0.0, theme::BG_PRIMARY);
         ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
@@ -401,6 +459,7 @@ impl eframe::App for VenueFlowApp {
         self.model.refresh_trading_price(ui.ctx());
         let accepts_trading_input = self.workspaces.active == crate::model::WorkspaceKind::Trading
             && !ui.ctx().egui_wants_keyboard_input()
+            && !egui::Popup::is_any_open(ui.ctx())
             && !self.show_modules
             && !self.show_settings
             && !self.show_trading_settings
@@ -448,6 +507,7 @@ impl eframe::App for VenueFlowApp {
             };
             tree.ui(&mut behavior, ui);
         });
+        crate::chart_trading::apply_interaction(&mut self.model, &self.client, ui.ctx());
         if std::mem::take(&mut self.model.indicator_settings_requested) {
             self.show_settings = true;
             self.settings_state
@@ -530,8 +590,20 @@ fn load(storage: Option<&dyn eframe::Storage>) -> PersistedState {
 }
 
 fn migrate_persisted_state(mut state: PersistedState) -> PersistedState {
+    // Old installs inherited the development tunnel. Resolve the new startup default
+    // before opening the endpoint-scoped vault; never move saved credentials across origins.
+    if cfg!(not(target_arch = "wasm32"))
+        && (2..=6).contains(&state.schema_version)
+        && state.preferences.endpoint.trim().trim_end_matches('/') == "http://127.0.0.1:39180"
+    {
+        state.preferences.endpoint.clear();
+    }
     match state.schema_version {
         PERSISTED_SCHEMA_VERSION => state,
+        6 => {
+            state.schema_version = PERSISTED_SCHEMA_VERSION;
+            state
+        }
         5 => {
             // Schema 6 changes the product default from crossing GTC to maker-only. Apply the
             // new default once; subsequent user changes are preserved under schema 6.
@@ -554,6 +626,37 @@ fn migrate_persisted_state(mut state: PersistedState) -> PersistedState {
 #[cfg(test)]
 mod tests {
     use super::{PERSISTED_SCHEMA_VERSION, PersistedState, migrate_persisted_state};
+
+    #[test]
+    fn legacy_tunnel_default_migrates_once_but_custom_servers_are_preserved() {
+        let mut old = PersistedState {
+            schema_version: 6,
+            ..Default::default()
+        };
+        old.preferences.endpoint = "http://127.0.0.1:39180/".into();
+        old.preferences.trading.post_only = false;
+        let migrated = migrate_persisted_state(old);
+        if cfg!(not(target_arch = "wasm32")) {
+            assert!(migrated.preferences.endpoint.is_empty());
+        }
+        assert!(!migrated.preferences.trading.post_only);
+
+        for (version, endpoint) in [
+            (6, "https://custom.example.com"),
+            (6, "http://127.0.0.1:39181"),
+            (PERSISTED_SCHEMA_VERSION, "http://127.0.0.1:39180"),
+        ] {
+            let mut state = PersistedState {
+                schema_version: version,
+                ..Default::default()
+            };
+            state.preferences.endpoint = endpoint.into();
+            assert_eq!(
+                migrate_persisted_state(state).preferences.endpoint,
+                endpoint
+            );
+        }
+    }
 
     #[test]
     fn persisted_state_contains_only_ui_preferences_and_layout() {
@@ -579,8 +682,10 @@ mod tests {
 
     #[test]
     fn schema_five_migrates_once_to_maker_only_without_overriding_future_choices() {
-        let mut old = PersistedState::default();
-        old.schema_version = 5;
+        let mut old = PersistedState {
+            schema_version: 5,
+            ..Default::default()
+        };
         old.preferences.trading.post_only = false;
         let migrated = migrate_persisted_state(old);
         assert_eq!(migrated.schema_version, PERSISTED_SCHEMA_VERSION);

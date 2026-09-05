@@ -1,6 +1,34 @@
 # VENUE 功能入口
 
+托管 API 入口：`accounts/managed_followers.rs`、`managed_followers` 协议和 migration `0030`/`0031`；Web `components/managed-followers-panel.tsx` 经 customer BFF 保存、列出掩码和手动验证。每账户跟单配置由 `components/managed-follow-settings.tsx`、`accounts/follow_requests.rs` 与 `/v2/kol/managed-followers/follow/{status,settings,lifecycle}` 管理；`0033` 保证托管绑定和请求幂等。凭证及参数保存均不自动启用交易。
+
+跟单数量方式入口：协议 `follow_sizing.rs`、迁移 `0032`、`order_mirror/planner.rs` 与 Web `components/follow-sizing-fields.tsx`；各账户定比/定额独立持久化，旧关系默认定比。
+
+Binance 网格各层职责、目录和实际调用链见 [策略开发与运行结构](GRID_STRATEGY_ARCHITECTURE.md)。
+
+桌面诊断入口为 `apps/ui/desktop/src/diagnostics.rs`：警告写入用户本地 UI 日志，后台连接不依赖启动器 stdout 管道。
+
+Control 部署由 `bin/venue-control-server.rs` 用迁移身份验证 schema，再以 `VENUE_CONTROL_RUNTIME_DATABASE_URL` 连接受限运行角色；`bin/venue-leader-bot-admin.rs` 的 `migrate` 子命令只安装迁移。`scripts/Build-VenueUbuntu.ps1 -Component Control` 同包输出 Control、Executor 与管理员工具。
+
+桌面当前执行账户的 Control 事件订阅与写入门由 `apps/ui/desktop/src/client/stream_gates.rs` 管理；切换账户直接更新订阅范围，迟到的全账户快照不得重新启用旧范围。账户私有投影仍由 `client/execution.rs` 按所选凭证轮询。
+
 更新：2026-09-04
+
+带单机器人与挂单同步入口：`apps/venue-control/src/accounts/leader_bot.rs` 管理本人实例与启停，`leader_bot_admin.rs` 和 `bin/venue-leader-bot-admin.rs` 管理默认拒绝的用户授权；`order_mirror/{planner,store,settlement}.rs` 保存源/子单映射、先撤后挂和精确对账。协议在 `crates/venue-control-protocol/src/leader_bot.rs`，迁移为 `0028`/`0029`，版本化安装在 `schema.rs`。桌面入口 `leader_bot_view.rs` 使用创建确认对话框；`grid_view.rs` 提供 Grid 新建与编辑配置对话框；`ui/status_bar.rs` 区分连接失败与事实过期。用户 Web `/`、`/join/[invite_code]` 与 `lib/customer-server.ts`；运营控制台位于 `/ops`。契约见 [LEADER_ORDER_MIRROR](LEADER_ORDER_MIRROR.md)，实库回归见 `tests/support/leader_order_mirror.rs`。
+
+Grid 拒单恢复位于 `apps/venue-control/src/grid_store/rejection.rs`：从当前配置代的命令账本读取首次明确 Binance 拒单时间，30 秒期限不随重试、滚动、短暂收敛或进程重启延后。`grid_store/convergence.rs` 管理倒计时与独立的重置阶段计时；`grid_runtime/driver.rs` 在持续私流下仍检查期限，`grid_runtime/reconcile.rs` 批量修复明确失败的目标、继续补撤，并在撤净确认后清除旧收敛计时。实库回归位于 `grid_runtime/reconcile_tests.rs` 与 `tests/support/grid_rejection_recovery.rs`。
+
+手动持仓动作入口为 `crates/venue-control-protocol/src/terminal_position.rs` 和 `apps/venue-control/src/accounts/terminal/position_actions.rs`；`executor_{runtime,store}/terminal_positions.rs` 与 migration `0027` 复用现有命令账本串行衔接平仓/反开。`executor_exchange/terminal_market.rs` 复用已有缓存发送 MARKET，再读取该交易对仓位；`private_projection/terminal_positions.rs` 只把更新的仓位合入同一账户投影。桌面逐行按钮、确认框和去重状态在 `apps/ui/desktop/src/execution_view/position_actions.rs`；专项实库回归在 `tests/support/terminal_positions.rs`。
+
+跟单启用边界位于 `apps/venue-control/src/executor_store/activation.rs`：重新验证权限/真实账户身份，检查完整签名账户快照，并以 request ID + relation revision 拦截过期启用结果。跟随账户须空仓、无订单、无未决命令且未由 Grid/旧链管理；KOL 存量仓位只记录基线。恢复只重置当前目标数量，保留历史命令及单调目标版本。实库回归位于 `tests/support/kol_activation.rs`。
+
+跟单市价收敛位于 `executor_exchange/market.rs`、`executor_store/{market,copy_targets,copy_drain}.rs` 与 migration `0025`：发送前保存单笔裁剪数量与签名持仓基线，成交确认与实际数量回写使用同一 PostgreSQL 事务；在途源成交合并为 dirty target，终态或重启后重新计算差额。实库连续开平、部分成交与外部漂移回归位于 `tests/support/kol_copy_convergence.rs`。
+
+`apps/venue-control/src/executor_exchange/catalogue.rs` 在所有账户间共享 60 秒交易规则目录及按 symbol/generation 归一后的规则，过期刷新失败不回退旧规则；同一并发扇出只进行一次目录读取，失败短暂退避。已校准的下单连接不在逐笔账户快照中重复校时，启用验证提前预热实际派发连接。
+
+跟单领取与暂停的事务边界位于 `apps/venue-control/src/kol_executor/copy_gate.rs`：关系、凭证、命令按统一顺序加锁；暂停或参数 revision 变化取消未发送命令，已进入 Sending 的命令保留同 ID 对账。实库竞态回归位于 `tests/support/kol_copy_lifecycle.rs`。
+
+`apps/venue-control/src/executor_runtime/dispatch.rs` 持续发现新命令，不等待其他账户的整轮网络操作结束；活动账户串行、全局最多 32 路，账户失败保留耐久状态并独立退避，启用验证独立于下单循环。实库慢账户/故障隔离回归位于 `tests/support/kol_continuous_dispatch.rs`。
 
 认证成交与 REST 的去重边界位于 `apps/venue-control/src/private_projection.rs`：价格、数量及订单进度按精确 Decimal 数值相等比较，兼容历史 JSON 中的尾零，其他字段仍精确匹配；实库回归位于 `tests/support/projection_fill_observation.rs`。
 
@@ -22,10 +50,10 @@ Grid 快速补撤确认位于 `apps/venue-control/src/executor_exchange/grid_bat
 
 ## 进程、配置与通用领域
 
-合并后 Git 源码总预算为 12 MiB，单文件仍为 2 MiB；`content-releases/`、`handoff-staging/` 与既有运行工件均排除跟踪。
+合并后 Git 源码当前约 14 MiB、20 MiB 为硬上限，单文件仍为 2 MiB；`content-releases/`、`handoff-staging/` 与既有运行工件均排除跟踪。
 依赖门禁按当前用途允许 Control 的 `argon2/ring` 密码与加密、VenueFlow 的 `time` 本地时区；`zeroize` 遵循凭证清理基线。
 Node 投影摘要辅助位于 `apps/venue-node/src/control_loop/projection_digest.rs`；手动交易协议位于 `crates/venue-control-protocol/src/trade.rs`。
-当前 Web 的 Control 用户会话只在 BFF 环境注入，这是待替换的运维入口；MVP 必须改为真实用户安全 Cookie 会话。HTTP/SSE 继续保留 Control 账户归属校验，不复用 Node token；部署配置见 `docs/WEB.md`。
+用户 Web 的 Control 会话通过登录获得并由 BFF 加密放入安全 Cookie；`/ops` 的环境注入会话单独保留。账户归属仍由 Control 校验，不复用 Node token；部署配置见 `docs/WEB.md`。
 
 下表中只有明确写为“KOL MVP 契约/目标复用”的条目可进入新链。名称含“冻结/旧/Node/Actor/WAL/Stage 7”或 Binance 以外交易所的条目都只描述仓库现状与恢复兼容；即使正文使用现在时，也不表示当前开发或部署目标。
 
@@ -90,7 +118,7 @@ Node 投影摘要辅助位于 `apps/venue-node/src/control_loop/projection_diges
 | 历史配置 | `venue.grid.toml`、`venue.gate.example.toml`、`venue.bitget.example.toml` | 不是 Node runtime JSON；远端运行状态必须实测，不由文档路径推断 |
 | 六所 Node 二进制验证 | `scripts/verify_venue_node_binaries.ps1` | 固定 feature 隔离；不等于实盘接管 |
 | 本地 Ubuntu Node/Control 编译 | `scripts/Build-VenueUbuntu.ps1` | `G:\Build\Venue\ubuntu`，Cargo 复用 slot-2；默认 Nodes 为六 ELF，`-Component Control` 为 `venue-control-server` 与 `venue-executor-binance`，均绑定固定 commit 与 manifest/SHA256，`-CheckOnly` 零写；详见 [构建政策](DEVELOPMENT.md#build-policy) |
-| 远程 Control 桌面启动 | `scripts/Start-VenueFlow.ps1` | 为默认访问 `127.0.0.1:39180` 的桌面端建立到服务器回环 Control 的 SSH 转发，再启动 `venueflow.exe`；不接触账户凭证 |
+| 远程 Control 与桌面行情 | `apps/ui/desktop/src/{server_connection,market_client}.rs`、`scripts/Start-VenueFlow.ps1`、`scripts/configure_desktop_https.py` | 桌面默认直连 `https://clawdbotweb.site`；设置页校验地址、暂存编辑并显式应用重连，schema 7 一次性迁移旧开发默认地址而不迁移凭据。Caddy 精确转发桌面接口/SSE 到本机 Control，并仅将三条 Binance USD-M 公共 REST 与两条组合 WebSocket 路径反代至 Binance，删除上游请求中的会话/授权头；既有路由恢复服务用 `venue-desktop-https.conf` 在启动后重建这些路由。启动脚本仅显式 `-SshTunnel` 时使用 SSH |
 
 ## 交易所 adapter
 
@@ -144,6 +172,9 @@ Grid 穿价边界：`hedged_grid/planner.rs` 不用最新 BBO 推断已有签名
 跨模块契约、依赖变化、架构合并或发布前集中建立全工作区通过基线。基线通过后的增量只重跑受影响专项；纯文档、注释或 lint 标注只做对应静态检查，不使既有业务测试结果失效。记录验证对应的提交/源码范围，构建缓存疑似串用时使用两个固定隔离槽并持锁核验，不新建目录、不清空共享缓存。
 
 - VenueFlow 图表实时锚点：`apps/ui/desktop/src/chart.rs` 与 `chart_view.rs`；左键拖动保持固定 K 线宽度、右侧留白占用视窗槽位，新 K 线在拖定位置继续更新。内联测试覆盖连续拖动/松手不回弹、图表与时间轴、缩放及新 K 线到达；“跟随”/“适配”显式恢复右端位置。
+- VenueFlow 主图显示菜单：`apps/ui/desktop/src/chart_trading/` 管理快捷下单、当前委托、持仓、真实成交历史、强平价空态、本机价格提醒、价格线/标签/刻度与订单预览。各图表开关随 `workspace::Pane` 保存；快捷下单复用 `trade_dock` 的校验和唯一 Executor，私有标记按所选账户及图表交易对过滤。`market.rs` 将新成交同步到未收盘 K 线与指标预览，延迟 K 线不覆盖更新成交，不把逐笔量重复加到 K 线成交量；已收盘 K 线仅由 K 线事实修订。主菜单交互、持久化及提醒回归在 `chart_trading/tests.rs`。
+- VenueFlow 图表分段委托标签：`chart_trading/order_tags.rs` 绘制拖动柄、类型/价格、数量及 X，并将精确撤单复用到 `trade_dock::apply_action`。拖动仅显示未提交的价格预览，不改委托或下单面板，不拼接无耐久保证的撤旧挂新；账户/凭证/订单身份及新鲜度在点击处理时再次校验。
+- 图表请求即时回显：`trade_dock.rs` 在发送队列成功接收时更新 `chart_trading::OrderTagState` 并立即重绘；临时新单/撤单隐藏不走行情采样节流，无状态文案。`execution_view.rs` 按回执/签名投影消除临时显示或在失败/不确定时回滚；只改变图形，不改账户事实或重发命令。
 - 新 Grid 规划/持久化/运行时测试：`crates/venue-strategies/src/hedged_grid/planner_tests.rs`、`apps/venue-control/src/grid_runtime.rs` 内联测试、`apps/venue-control/tests/{grid_store_postgres_integration,binance_grid_hot_batch_migration}.rs`；旧 reducer/风险状态回归仍位于 `crates/venue-strategies/src/hedged_grid/{reducer_tests,exposure_guard,recovery_tests}.rs`。
 - 交易所 adapter 测试：`src/exchange/{binance,bitget,gate,grid}/` 内的测试文件及各交易所直接测试模块。
 - 共享 resident/runtime 测试：`src/runtime/grid/stage7_grid_tests.rs` 统一组合 `stage7_grid_{core,recovery}_tests.rs`，其余专项位于 `stage7_grid_reconciliation_tests.rs`、`stage7_fill_sequence_tests.rs`、`stage7_install_recovery_tests.rs`、`stage7_inventory_recovery_evidence_tests.rs`、`stage7_exposure_composition_tests.rs`、`hedged_grid_runtime_equivalence_tests.rs`、`exposure_runtime_tests.rs` 及各 `stage7_*` 模块内测试。

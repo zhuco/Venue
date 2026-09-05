@@ -91,7 +91,18 @@ export function noStore(): HeadersInit { return { "Cache-Control": "no-store", "
 export function allowedOrigin(request: NextRequest): boolean {
   const origin = request.headers.get("origin"); const host = request.headers.get("host");
   if (!origin || !host) return false;
-  try { const parsed = new URL(origin); return parsed.origin === request.nextUrl.origin && parsed.host === host; } catch { return false; }
+  try {
+      const parsed = new URL(origin);
+      if (origin !== parsed.origin || parsed.host !== host) return false;
+      // Bind proxy deployments to a configured origin, never caller-supplied forwarded headers.
+      const configured = process.env.VENUE_WEB_PUBLIC_ORIGIN;
+      if (configured !== undefined) {
+        const expected = new URL(configured);
+        return expected.protocol === "https:" && configured === expected.origin
+          && parsed.origin === expected.origin;
+      }
+      return parsed.origin === request.nextUrl.origin;
+    } catch { return false; }
 }
 export function allowWrite(request: NextRequest, accountId: string): { session: Session } | Response {
   const session = getSession(request);

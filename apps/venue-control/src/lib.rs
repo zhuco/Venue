@@ -28,8 +28,10 @@ mod indicator_projection;
 pub mod kol_executor;
 pub mod kol_mvp;
 pub mod kol_private_source;
+pub mod leader_bot_admin;
 mod model;
 mod node_projection_postgres;
+pub mod order_mirror;
 mod postgres;
 pub mod private_projection;
 mod repository;
@@ -87,7 +89,7 @@ pub use indicator_projection::{
 };
 pub use kol_executor::{
     AccountSerialScheduler, BinanceCommandLedger, BinanceCommandLedgerError, ClaimedBinanceCommand,
-    KolSourceFill, MAX_ENABLED_FOLLOWERS, MAX_ENABLED_KOLS,
+    KolSourceFill, MAX_ACTIVE_EXECUTOR_ACCOUNTS, MAX_ENABLED_FOLLOWERS, MAX_ENABLED_KOLS,
 };
 pub use kol_mvp::{
     BINANCE_EXECUTOR_ADVISORY_LOCK, BinanceExecutorSingleton, ExecutorSingletonError,
@@ -107,3 +109,14 @@ pub use service::{ControlService, ServiceError};
 
 pub const MIGRATION_0023: &str = include_str!("../migrations/0023_binance_grid_hot_batch.sql");
 pub const MIGRATION_0024: &str = include_str!("../migrations/0024_binance_grid_batch_chain.sql");
+pub const MIGRATION_0027: &str = include_str!("../migrations/0027_terminal_position_actions.sql");
+pub const MIGRATION_0025: &str = include_str!("../migrations/0025_kol_market_convergence.sql");
+pub const MIGRATION_0026: &str = include_str!("../migrations/0026_kol_copy_risk.sql");
+pub const MIGRATION_0028: &str = include_str!("../migrations/0028_leader_order_mirror.sql");
+pub const MIGRATION_0031: &str = include_str!("../migrations/0031_managed_credential_store.sql");
+pub const MIGRATION_0032: &str = include_str!("../migrations/0032_follow_sizing.sql");
+pub const MIGRATION_0033: &str = include_str!("../migrations/0033_managed_follow_binding.sql");
+pub const MIGRATION_0030: &str = include_str!("../migrations/0030_managed_followers.sql");
+pub const MIGRATION_0029: &str = include_str!("../migrations/0029_mirror_gtc.sql");
+mod schema;
+pub use schema::{SchemaError, install_control_schema};

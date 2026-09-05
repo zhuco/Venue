@@ -1,10 +1,11 @@
 use std::{collections::VecDeque, future::Future};
 
 use tokio::sync::{mpsc, watch};
+use venue_control_protocol::grid::GridInstanceState;
 
 use super::{
     BinanceGridRuntime, BinanceGridRuntimeError, GRID_TICK_INTERVAL, GridPrivateStreamSignal,
-    fast_path::receive_private_signal,
+    fast_path::receive_private_signal, now_ms,
 };
 
 enum ColdTurn<T> {
@@ -24,10 +25,20 @@ impl BinanceGridRuntime {
         let mut private_stream = self.hot_path.take_receiver();
         let mut deferred = VecDeque::new();
         let mut cold_due = false;
+        let mut next_rejection_check = tokio::time::Instant::now();
 
         loop {
             if *shutdown.borrow() {
                 return Ok(());
+            }
+            // A continuously ready private mailbox can cancel every cold turn. The durable
+            // rejection deadline must still be checked before draining that mailbox.
+            if tokio::time::Instant::now() >= next_rejection_check {
+                if let Err(error) = self.enforce_rejection_deadlines().await {
+                    tracing::warn!(target: "venue_control::grid_runtime", %error,
+                        "Grid rejection deadline check failed and will retry");
+                }
+                next_rejection_check = tokio::time::Instant::now() + GRID_TICK_INTERVAL;
             }
             if let Some(signal) = deferred.pop_front() {
                 self.handle_private_signal(signal, &mut private_stream, &mut deferred)
@@ -82,6 +93,45 @@ impl BinanceGridRuntime {
             }
         }
     }
+
+    pub(super) async fn enforce_rejection_deadlines(&self) -> Result<(), BinanceGridRuntimeError> {
+        for record in self.store.list_runtime_instances().await? {
+            if !matches!(
+                record.instance.state,
+                GridInstanceState::StartPending
+                    | GridInstanceState::Running
+                    | GridInstanceState::Blocked
+            ) {
+                continue;
+            }
+            let first = self
+                .store
+                .exchange_rejection_started_ms(
+                    &record.instance.instance_id,
+                    record.instance.config_revision,
+                )
+                .await?;
+            let now = now_ms()?;
+            if crate::grid_store::rejection::rejection_reset_due(first, now) {
+                match self
+                    .store
+                    .settle_runtime_state_checked(
+                        &record.instance.instance_id,
+                        Some(record.instance.revision),
+                        record.instance.state,
+                        GridInstanceState::ResetRequired,
+                        Some("exchange_rejection_delay_elapsed"),
+                        now,
+                    )
+                    .await
+                {
+                    Ok(_) | Err(crate::GridStoreError::Conflict) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 async fn select_cold_turn<F>(
@@ -131,10 +181,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ready_private_signal_cancels_a_pending_cold_turn() {
+    async fn ready_private_signal_cancels_a_pending_cold_turn()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (_shutdown_tx, mut shutdown) = watch::channel(false);
         let (private_tx, private_rx) = mpsc::channel(1);
-        private_tx.send(invalidate()).await.expect("private signal");
+        private_tx.send(invalidate()).await?;
         let drops = Arc::new(AtomicUsize::new(0));
         let probe = DropProbe(Arc::clone(&drops));
         let cold = async move {
@@ -146,13 +197,15 @@ mod tests {
         let turn = select_cold_turn(&mut shutdown, &mut private_stream, cold).await;
         assert!(matches!(turn, ColdTurn::Private(Some(_))));
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn private_signal_wins_when_cold_completion_is_already_ready_then_cold_can_retry() {
+    async fn private_signal_wins_when_cold_completion_is_already_ready_then_cold_can_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (_shutdown_tx, mut shutdown) = watch::channel(false);
         let (private_tx, private_rx) = mpsc::channel(1);
-        private_tx.send(invalidate()).await.expect("private signal");
+        private_tx.send(invalidate()).await?;
         let mut private_stream = Some(private_rx);
 
         let first = select_cold_turn(
@@ -169,14 +222,16 @@ mod tests {
         )
         .await;
         assert!(matches!(retried, ColdTurn::Completed(2)));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn shutdown_wins_over_private_signal_and_ready_cold_completion() {
+    async fn shutdown_wins_over_private_signal_and_ready_cold_completion()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (shutdown_tx, mut shutdown) = watch::channel(false);
         let (private_tx, private_rx) = mpsc::channel(1);
-        private_tx.send(invalidate()).await.expect("private signal");
-        shutdown_tx.send(true).expect("shutdown");
+        private_tx.send(invalidate()).await?;
+        shutdown_tx.send(true)?;
         let mut private_stream = Some(private_rx);
 
         let turn = select_cold_turn(
@@ -186,5 +241,6 @@ mod tests {
         )
         .await;
         assert!(matches!(turn, ColdTurn::Stop));
+        Ok(())
     }
 }

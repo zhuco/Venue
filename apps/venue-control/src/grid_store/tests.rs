@@ -47,7 +47,11 @@ fn runtime_transition_table_is_fail_closed() {
 
 #[test]
 fn lifecycle_and_config_changes_fence_only_unsent_risk_commands() {
-    let source = include_str!("../grid_store.rs");
+    let source = [
+        include_str!("../grid_store.rs"),
+        include_str!("convergence.rs"),
+    ]
+    .join("\n");
     assert_eq!(
         source
             .matches("cancel_pending_risk_commands(&mut tx")
@@ -93,7 +97,8 @@ fn command_history_is_scoped_by_config_and_plan_revision() {
 }
 
 #[test]
-fn grid_ledger_ids_are_bounded_opaque_ids_not_account_ids() {
+fn grid_ledger_ids_are_bounded_opaque_ids_not_account_ids() -> Result<(), Box<dyn std::error::Error>>
+{
     let command = GridLedgerCommand {
         command_id: "gp-0123456789abcdef".into(),
         client_order_id: "vgp-0123456789".into(),
@@ -126,7 +131,7 @@ fn grid_ledger_ids_are_bounded_opaque_ids_not_account_ids() {
         },
         place_command_id: command.command_id,
         client_order_id: command.client_order_id,
-        symbol: "BTC/USDT".parse().expect("static symbol"),
+        symbol: "BTC/USDT".parse()?,
         quantity: Decimal::ONE,
         filled_quantity: Decimal::ZERO,
         limit_price: Decimal::from(100),
@@ -136,6 +141,7 @@ fn grid_ledger_ids_are_bounded_opaque_ids_not_account_ids() {
         last_seen_ms: 10,
     };
     assert_eq!(validate_ownership(&ownership), Ok(()));
+    Ok(())
 }
 
 #[test]
@@ -191,7 +197,7 @@ fn convergence_cas_fences_every_lifecycle_change() {
         update.expected_state = state;
         assert!(!convergence_cas_matches(&update, 7, state));
     }
-    let source = include_str!("../grid_store.rs");
+    let source = include_str!("convergence.rs");
     assert!(source.contains("AND revision=$12 AND plan_revision=$13"));
     assert!(source.contains("AND instance_state=$14"));
     assert!(source.contains("update.expected_state == GridInstanceState::Paused && update.dirty"));

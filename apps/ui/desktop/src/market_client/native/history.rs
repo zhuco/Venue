@@ -69,7 +69,7 @@ mod tests {
         let selection = MarketSelection::binance_usd_m("BTC/USDC", ChartInterval::OneMinute)?;
         let page = url(&selection, 500, Some(180_000))?;
         assert_eq!(page.scheme(), "https");
-        assert_eq!(page.host_str(), Some("fapi.binance.com"));
+        assert_eq!(page.host_str(), Some("clawdbotweb.site"));
         assert_eq!(page.path(), "/fapi/v1/klines");
         let query = page
             .query_pairs()

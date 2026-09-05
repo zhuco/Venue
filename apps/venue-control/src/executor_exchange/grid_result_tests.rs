@@ -69,13 +69,16 @@ fn fixture(
         symbol: binding.symbol,
         known_native_order_id: None,
         reconciled_close_reservations: vec![],
+        market_baseline: None,
+        copy_risk: None,
         order_kind: if cancel {
             ExecutionOrderKind::CancelExact {
                 native_order_id: Some("401".into()),
                 target_client_order_id: Some("venue_place_1".into()),
             }
         } else {
-            ExecutionOrderKind::LimitPostOnly {
+            ExecutionOrderKind::Limit {
+                time_in_force: venue_domain::LimitTimeInForce::PostOnly,
                 side: OrderSide::Buy,
                 position_side: PositionSide::Long,
                 quantity: Decimal::new(2, 3),

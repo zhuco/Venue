@@ -130,7 +130,8 @@ fn top_button_opens_trading_settings_without_a_trade_dock() {
 }
 
 #[test]
-fn terminal_chrome_shows_product_name_and_hides_symbol_close_until_hover() {
+fn terminal_chrome_shows_product_name_and_hides_symbol_close_until_hover()
+-> Result<(), &'static str> {
     let context = egui::Context::default();
     theme::apply(&context);
     let mut model = AppModel::new(crate::model::Preferences::default());
@@ -180,7 +181,7 @@ fn terminal_chrome_shows_product_name_and_hides_symbol_close_until_hover() {
         .iter()
         .find(|(label, _)| label == "BTC/USDC")
         .map(|(_, rect)| *rect)
-        .expect("symbol tab");
+        .ok_or("symbol tab")?;
     assert!(
         !labels
             .iter()
@@ -201,10 +202,11 @@ fn terminal_chrome_shows_product_name_and_hides_symbol_close_until_hover() {
             .iter()
             .any(|(label, rect)| label == "×" && rect.left() < 500.0)
     );
+    Ok(())
 }
 
 #[test]
-fn terminal_chrome_keeps_both_rows_at_the_top_of_the_window() {
+fn terminal_chrome_keeps_both_rows_at_the_top_of_the_window() -> Result<(), &'static str> {
     let context = egui::Context::default();
     theme::apply(&context);
     let mut model = AppModel::new(crate::model::Preferences::default());
@@ -244,22 +246,22 @@ fn terminal_chrome_keeps_both_rows_at_the_top_of_the_window() {
         .iter()
         .find(|(label, _)| label == "BTC/USDC")
         .map(|(_, rect)| *rect)
-        .expect("symbol tab");
+        .ok_or("symbol tab")?;
     let trading = labels
         .iter()
         .find(|(label, _)| label == text(model.preferences.language, TextKey::TradingSettings))
         .map(|(_, rect)| *rect)
-        .expect("trading settings");
+        .ok_or("trading settings")?;
     let add_tab = labels
         .iter()
         .find(|(label, _)| label == "+")
         .map(|(_, rect)| *rect)
-        .expect("add tab");
+        .ok_or("add tab")?;
     let layout = labels
         .iter()
         .find(|(label, _)| label.starts_with("布局管理") || label.starts_with("Layout"))
         .map(|(_, rect)| *rect)
-        .expect("layout manager");
+        .ok_or("layout manager")?;
     assert!(
         symbol.top() <= 60.0,
         "symbol tabs start at {}px",
@@ -277,6 +279,7 @@ fn terminal_chrome_keeps_both_rows_at_the_top_of_the_window() {
         layout.left() >= 1_700.0,
         "layout manager is not right aligned"
     );
+    Ok(())
 }
 
 #[test]
@@ -398,6 +401,7 @@ fn footer_execution_account_uses_the_selected_credential_label() {
 fn order_panel_primary_buttons_fit_and_short_panels_can_scroll_to_cancellations() {
     for (size, scroll) in [
         (egui::vec2(680.0, 260.0), false),
+        (egui::vec2(330.0, 300.0), false),
         (egui::vec2(330.0, 160.0), true),
     ] {
         let context = egui::Context::default();

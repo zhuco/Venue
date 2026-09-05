@@ -90,29 +90,12 @@ impl BinanceGridMarketReader {
                     .transport
                     .fetch_usd_m_mark_price(&rules.native_symbol)
                     .await?;
-                let value: serde_json::Value = serde_json::from_slice(&response.payload)
-                    .map_err(|_| BinanceAccountGatewayError::Readback)?;
-                if value.get("symbol").and_then(serde_json::Value::as_str)
-                    != Some(rules.native_symbol.as_str())
-                {
-                    return Err(BinanceAccountGatewayError::Readback);
-                }
-                let price = value
-                    .get("markPrice")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|value| value.parse().ok())
-                    .and_then(|value| Price::new(value).ok())
-                    .ok_or(BinanceAccountGatewayError::Readback)?;
-                let observed = value
-                    .get("time")
-                    .and_then(serde_json::Value::as_u64)
-                    .filter(|time| {
-                        *time > 0
-                            && *time <= response.received_at_ms
-                            && response.received_at_ms - *time <= 5_000
-                    })
-                    .ok_or(BinanceAccountGatewayError::Readback)?;
-                (price, observed)
+                let mark = crate::parse_mark_price(
+                    &response.payload,
+                    &rules.instrument.symbol,
+                    response.received_at_ms,
+                )?;
+                (mark.price, mark.observed_at_ms)
             }
         };
         Ok(BinanceGridReferenceFacts {

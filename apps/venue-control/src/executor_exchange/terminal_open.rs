@@ -5,7 +5,7 @@ pub(crate) fn is_terminal_open(request: &ExecutionRequest) -> bool {
     request.origin == ExecutorCommandOrigin::Terminal
         && matches!(
             request.order_kind,
-            ExecutionOrderKind::LimitPostOnly {
+            ExecutionOrderKind::Limit {
                 reducing: false,
                 ..
             }
@@ -33,7 +33,8 @@ impl BinanceHttpExecution {
             .catalogue
             .rules(&self.transport, &request.symbol)
             .await?;
-        let ExecutionOrderKind::LimitPostOnly {
+        let ExecutionOrderKind::Limit {
+            time_in_force: venue_domain::LimitTimeInForce::PostOnly,
             side,
             position_side,
             quantity,
@@ -107,7 +108,8 @@ mod tests {
             credential_id: "credential".into(),
             trading_account_id: "account".into(),
             symbol: "DOGE/USDC".parse()?,
-            order_kind: ExecutionOrderKind::LimitPostOnly {
+            order_kind: ExecutionOrderKind::Limit {
+                time_in_force: venue_domain::LimitTimeInForce::PostOnly,
                 side: OrderSide::Buy,
                 position_side: PositionSide::Long,
                 quantity: Decimal::from(288),
@@ -116,6 +118,8 @@ mod tests {
             },
             known_native_order_id: None,
             reconciled_close_reservations: Vec::new(),
+            market_baseline: None,
+            copy_risk: None,
         };
         assert!(is_terminal_open(&request));
         for origin in [ExecutorCommandOrigin::Grid, ExecutorCommandOrigin::Copy] {
@@ -123,7 +127,7 @@ mod tests {
             assert!(!is_terminal_open(&request));
         }
         request.origin = ExecutorCommandOrigin::Terminal;
-        if let ExecutionOrderKind::LimitPostOnly { reducing, .. } = &mut request.order_kind {
+        if let ExecutionOrderKind::Limit { reducing, .. } = &mut request.order_kind {
             *reducing = true;
         }
         assert!(!is_terminal_open(&request));

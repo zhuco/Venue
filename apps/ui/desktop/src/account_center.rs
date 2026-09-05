@@ -156,10 +156,12 @@ impl AccountCenter {
                         self.session = Some(session);
                         reconnect = true;
                     }
-                    let old = model.preferences.execution_account_id.clone();
+                    // Account switches reuse this user's streams; private polls carry the new
+                    // credential. Removing the selection must also stop the old private poll.
+                    reconnect |= model.preferences.execution_account_id.is_some()
+                        && overview.selected_credential_id.is_none();
                     model.apply_account_overview(overview);
                     self.error = None;
-                    reconnect |= old != model.preferences.execution_account_id;
                 }
                 Ok(AccountResult::LoggedOut) => {
                     self.clear(model);

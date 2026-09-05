@@ -38,6 +38,11 @@ mod account_gateway_projection;
 #[path = "account_gateway_risk.rs"]
 mod account_gateway_risk;
 use account_gateway_risk::*;
+#[path = "account_gateway_risk_readback.rs"]
+mod account_gateway_risk_readback;
+pub use account_gateway_risk_readback::{
+    BinanceExecutionRiskInput, prepare_execution_risk_readback,
+};
 #[path = "account_stream_projection.rs"]
 mod account_stream_projection;
 #[cfg(test)]
@@ -393,24 +398,23 @@ impl BinanceAccountGateway {
             .ok_or(BinanceAccountGatewayError::PrivateStream)?;
         match result {
             Ok(Some(frame)) => {
-                if let Some(state) = &mut self.stream_projection {
-                    if state
+                if let Some(state) = &mut self.stream_projection
+                    && state
                         .apply(&frame, &self.rules_by_symbol.keys().cloned().collect())
                         .is_err()
-                    {
-                        eprintln!(
-                            "Authenticated account event cannot extend the current order/position projection"
-                        );
-                        self.stream_projection = None;
-                        return Ok(Some((
-                            received_at,
-                            BinancePrivateAccountEvent::ReconcileRequired {
-                                stream_private_generation,
-                                private_generation: self.private_generation,
-                                received_at_ms: frame.received_at_ms,
-                            },
-                        )));
-                    }
+                {
+                    eprintln!(
+                        "Authenticated account event cannot extend the current order/position projection"
+                    );
+                    self.stream_projection = None;
+                    return Ok(Some((
+                        received_at,
+                        BinancePrivateAccountEvent::ReconcileRequired {
+                            stream_private_generation,
+                            private_generation: self.private_generation,
+                            received_at_ms: frame.received_at_ms,
+                        },
+                    )));
                 }
                 match normalize_private_stream_event_for_symbols(
                     frame,

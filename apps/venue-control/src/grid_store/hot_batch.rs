@@ -318,7 +318,7 @@ async fn admit_account_batch(
     require_empty: bool,
 ) -> Result<(), GridStoreError> {
     let queue_depth = lock_account_command_queue(
-        &mut **tx,
+        tx,
         &instance.owner_user_id,
         &instance.trading_account_id,
         &instance.credential_id,

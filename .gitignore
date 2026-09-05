@@ -11,7 +11,9 @@
 /artifacts/
 /venue.local.toml
 /logs/
-/\.playwright-cli/
+**/.playwright-cli/
+**/__pycache__/
+/.codex-deploy/
 /data/
 *.log
 *.jsonl

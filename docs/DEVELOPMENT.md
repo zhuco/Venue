@@ -46,7 +46,7 @@ Windows 所有 Cargo 命令都经过 guard。下面是需要全量基线时的�
 - [账户管理](ACCOUNT_MANAGEMENT.md) 说明 Control/桌面启动环境；运行前先受控 build，
   再从 guard 选择的固定缓存启动已构建 binary，不用长期 `cargo run` 占用构建槽。
 - [Web README](WEB.md) 说明 BFF 会话、同源 HTTPS、npm 验证与五视口测试。
-- 新 KOL 链只由 `venue-executor-binance` 执行：它要求精确 `VENUE_EXECUTOR_MODE=LIVE`、`VENUE_EXECUTOR_DATABASE_URL` 的 PostgreSQL URL 和现有 credential master key，取得 advisory singleton 后先 activation baseline/未终态 readback，再建立已激活 KOL 私流并进入有界循环。缺配置、权限、规则或基线失败一律 fail-closed；没有 mock/dry-run/testnet 运行模式。SIGINT/SIGTERM 停止循环、关闭私流并释放锁。冻结旧 Node 维护仍遵守原 writer/WAL 契约。文档更新不触发实盘测试。
+- 新 KOL 链只由 `venue-executor-binance` 执行：它要求精确 `VENUE_EXECUTOR_MODE=LIVE`、`VENUE_EXECUTOR_DATABASE_URL` 的 PostgreSQL URL 和现有 credential master key，取得 advisory singleton 后启动私有投影、Grid 与持续命令发现；未决命令按账户只查不重发，启用基线在独立低优先级任务中核验，单个失败账户不阻止进程启动。缺配置、权限、规则或基线失败一律 fail-closed；没有 mock/dry-run/testnet 运行模式。SIGINT/SIGTERM 停止循环、关闭私流并释放锁。冻结旧 Node 维护仍遵守原 writer/WAL 契约。文档更新不触发实盘测试。
 
 UI 完成标准包括移动/桌面布局截图、空/错误/离线状态、作用域与确认交互、网关联通和分段延迟。
 本地 fixture/BFF 性能报告不能代替 Executor→Binance 的实际延迟；冻结旧 Node 的历史结果也不能代替新链验收。
@@ -128,11 +128,11 @@ Rust/Cargo 1.98.0、cargo-zigbuild 0.23.0、Zig 0.16.0 和 `x86_64-unknown-linux
 # 预检后去掉 -CheckOnly 编译六所；脚本不自动上传或启动服务。
 ./scripts/test_venue_ubuntu_build.ps1
 
-# KOL MVP Control 发布入口：只打包 Control Server 与 Binance Executor。
+# KOL MVP Control 发布入口：打包 Control Server、Binance Executor 与带单授权管理工具。
 ./scripts/Build-VenueUbuntu.ps1 -SourceRoot G:\Build\Venue\ubuntu\source -ExpectedRevision <完整40位commit> -ReleaseId <版本号> -Component Control -CheckOnly
 ```
 
-- 专用根为 `G:\Build\Venue\ubuntu`：`source` 可存固定 revision 的独立 checkout；当前脚本的 Nodes release 仅含六个冻结 Node binary，Control release 仅含 `venue-control-server`、`venue-executor-binance`，两者均另含 SHA256SUMS 与 manifest。旧 `venue-copy-worker` 不进入 KOL 发布包；离线发布和回滚清单见 [`KOL_EXECUTOR_RELEASE.md`](KOL_EXECUTOR_RELEASE.md)。工具缓存为 `zig-cache/zig-local-cache/zigbuild-cache`。源码只用干净 Git clone/bundle，不复制 `.env`、账户工件或未提交文件；已有 checkout 不自动 reset。
+- 专用根为 `G:\Build\Venue\ubuntu`：`source` 可存固定 revision 的独立 checkout；当前脚本的 Nodes release 仅含六个冻结 Node binary，Control release 仅含 `venue-control-server`、`venue-executor-binance`、`venue-leader-bot-admin`，两者均另含 SHA256SUMS 与 manifest。旧 `venue-copy-worker` 不进入 KOL 发布包；离线发布和回滚清单见 [`KOL_EXECUTOR_RELEASE.md`](KOL_EXECUTOR_RELEASE.md)。工具缓存为 `zig-cache/zig-local-cache/zigbuild-cache`。源码只用干净 Git clone/bundle，不复制 `.env`、账户工件或未提交文件；已有 checkout 不自动 reset。
 - Cargo 仍使用既有 `slot-2` 锁和两个全局并发许可，其自动目标子目录 `slot-2/x86_64-unknown-linux-gnu/release` 不是另设 target root。六所按顺序、每次两个 Cargo jobs；全部目录计入 150 GiB 总预算。不清理 Windows 缓存，不安装工具、不改全局配置。
 - `-CheckOnly` 不新建输出、锁或缓存；正式构建前后均校验 HEAD 和干净状态，manifest 另记录构建入口/辅助/guard 脚本哈希，运行期间脚本变动则拒绝发布。源码 checkout 必须由构建独占，其他任务不得在构建期间同步或编辑；前后 Git 检查不是文件系统只读沙箱。输出要求 ELF64/x86-64，拒绝误复制 Windows exe；目录原子转为新 release，已有 release 不覆盖。失败保留缓存和本次 `.stage.*` 目录，不把不完整目录当发布包。
 - 入口持锁覆盖构建、ELF/哈希核验和复制，finally 还原 Cargo/Zig 环境并释放锁。版本化产物仅表示编译完成；KOL MVP 仍须完成 API/双向持仓验证、Executor/Binance、UI、容量和真实 Canary 验收。冻结旧链的签名 preflight 与 writer/WAL 接管另行处理。

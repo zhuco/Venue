@@ -80,6 +80,7 @@ pub struct SettingsPanelState {
     original: Option<ChartDisplaySettings>,
     error: Option<String>,
     target: Option<String>,
+    endpoint_draft: Option<String>,
 }
 
 impl SettingsPanelState {
@@ -94,6 +95,7 @@ impl SettingsPanelState {
         self.draft = None;
         self.original = None;
         self.error = None;
+        self.endpoint_draft = None;
     }
 }
 
@@ -150,7 +152,7 @@ pub fn show(
                     }
                 }
                 SettingsTab::Backtest => placeholder(ui, language),
-                SettingsTab::General => general_settings(ui, model, reconnect, language),
+                SettingsTab::General => general_settings(ui, state, model, reconnect, language),
             }
             ui.separator();
             bottom_actions(ui, state, language, &mut saved, &mut close_requested);
@@ -878,6 +880,7 @@ fn placeholder(ui: &mut egui::Ui, language: Language) {
 
 fn general_settings(
     ui: &mut egui::Ui,
+    state: &mut SettingsPanelState,
     model: &mut AppModel,
     reconnect: &mut bool,
     language: Language,
@@ -902,10 +905,49 @@ fn general_settings(
                 });
             ui.add_space(12.0);
             ui.label(text(language, TextKey::ControlUrl));
-            ui.text_edit_singleline(&mut model.preferences.endpoint);
-            if ui.button(text(language, TextKey::Reconnect)).clicked() {
-                *reconnect = true;
-            }
+            let draft = state
+                .endpoint_draft
+                .get_or_insert_with(|| model.preferences.endpoint.clone());
+            ui.add(
+                egui::TextEdit::singleline(draft)
+                    .desired_width(580.0)
+                    .hint_text(crate::server_connection::DEFAULT_CONTROL_ENDPOINT),
+            );
+            ui.horizontal(|ui| {
+                if ui.button(text(language, TextKey::DefaultServer)).clicked() {
+                    *draft = crate::server_connection::DEFAULT_CONTROL_ENDPOINT.to_owned();
+                }
+                let normalized = crate::server_connection::normalize_endpoint(draft);
+                if ui
+                    .add_enabled(
+                        normalized.is_some(),
+                        egui::Button::new(text(language, TextKey::ApplyServer)),
+                    )
+                    .clicked()
+                    && let Some(endpoint) = normalized
+                {
+                    model.preferences.endpoint = endpoint.clone();
+                    *draft = endpoint;
+                    *reconnect = true;
+                }
+            });
+            let valid = crate::server_connection::normalize_endpoint(draft).is_some();
+            ui.colored_label(
+                if valid {
+                    theme::TEXT_SECONDARY
+                } else {
+                    theme::SELL
+                },
+                text(
+                    language,
+                    if valid {
+                        TextKey::ServerAddressHint
+                    } else {
+                        TextKey::InvalidServerAddress
+                    },
+                ),
+            );
+            ui.add_space(12.0);
             ui.add(
                 egui::Slider::new(&mut model.preferences.ui_scale, 0.85..=1.35)
                     .text(text(language, TextKey::UiScale)),
@@ -1003,6 +1045,122 @@ const fn indicator_title(kind: IndicatorKind) -> IndicatorTextKey {
 #[cfg(test)]
 mod tests {
     use super::{MAIN_INDICATORS, SUB_INDICATORS, SettingsTab};
+
+    #[test]
+    fn server_settings_apply_only_valid_explicit_changes_in_both_languages() {
+        use eframe::egui;
+        fn labels(shape: &egui::Shape, output: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => output.push((
+                    text.galley.job.text.clone(),
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                )),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| labels(shape, output)),
+                _ => (),
+            }
+        }
+        for language in crate::i18n::Language::ALL {
+            let context = egui::Context::default();
+            crate::theme::apply(&context);
+            let original = crate::server_connection::DEFAULT_CONTROL_ENDPOINT;
+            let mut model = crate::model::AppModel::new(crate::model::Preferences {
+                endpoint: original.into(),
+                language,
+                ..Default::default()
+            });
+            let mut state = super::SettingsPanelState {
+                tab: SettingsTab::General,
+                endpoint_draft: Some("https://other.example.com/".into()),
+                ..Default::default()
+            };
+            let mut open = true;
+            let mut reconnect = false;
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 700.0));
+            let mut rendered = Vec::new();
+            for _ in 0..3 {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ui| super::show(ui.ctx(), &mut open, &mut state, &mut model, &mut reconnect),
+                );
+                output.textures_delta.clear();
+                rendered.clear();
+                for shape in output.shapes {
+                    labels(&shape.shape, &mut rendered);
+                }
+            }
+            assert_eq!(model.preferences.endpoint, original);
+            assert!(!reconnect);
+            for key in [
+                crate::i18n::TextKey::ControlUrl,
+                crate::i18n::TextKey::DefaultServer,
+                crate::i18n::TextKey::ApplyServer,
+            ] {
+                let label = crate::i18n::text(language, key);
+                assert!(
+                    rendered
+                        .iter()
+                        .any(|(text, rect)| text == label && screen.contains_rect(*rect)),
+                    "Missing or clipped: {label}"
+                );
+            }
+            let apply_label = crate::i18n::text(language, crate::i18n::TextKey::ApplyServer);
+            let point = rendered
+                .iter()
+                .find(|(text, _)| text == apply_label)
+                .map(|(_, rect)| rect.center());
+            assert!(point.is_some());
+            let Some(point) = point else {
+                return;
+            };
+            for pressed in [true, false] {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events: vec![
+                            egui::Event::PointerMoved(point),
+                            egui::Event::PointerButton {
+                                pos: point,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: Default::default(),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ui| super::show(ui.ctx(), &mut open, &mut state, &mut model, &mut reconnect),
+                );
+                output.textures_delta.clear();
+            }
+            assert_eq!(model.preferences.endpoint, "https://other.example.com");
+            assert!(reconnect);
+            state.endpoint_draft = Some("http://other.example.com".into());
+            reconnect = false;
+            for pressed in [true, false] {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        events: vec![
+                            egui::Event::PointerMoved(point),
+                            egui::Event::PointerButton {
+                                pos: point,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: Default::default(),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ui| super::show(ui.ctx(), &mut open, &mut state, &mut model, &mut reconnect),
+                );
+                output.textures_delta.clear();
+            }
+            assert!(!reconnect);
+            assert_eq!(model.preferences.endpoint, "https://other.example.com");
+        }
+    }
 
     #[test]
     fn custom_tab_exposes_enable_and_save_in_both_languages() {

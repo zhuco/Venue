@@ -62,6 +62,31 @@ const FILL: &str = r#"{"e":"ORDER_TRADE_UPDATE","fs":"UM","E":132,"T":130,"o":{"
 const POSITION: &str = r#"{"e":"ACCOUNT_UPDATE","fs":"UM","E":131,"T":130,"a":{"m":"ORDER","P":[{"s":"SOLUSDC","ps":"LONG","pa":"3","ep":"100","up":"0"}]}}"#;
 
 #[test]
+fn amendment_preserves_source_identity_and_creation_cutoff()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut projection = state()?;
+    apply(&mut projection, NEW)?;
+    let mut amended: Value = serde_json::from_str(NEW)?;
+    amended["E"] = 130.into();
+    amended["T"] = 129.into();
+    amended["o"]["x"] = "AMENDMENT".into();
+    amended["o"]["q"] = "3".into();
+    amended["o"]["p"] = "99".into();
+    apply(&mut projection, &serde_json::to_string(&amended)?)?;
+    let snapshot = projection.snapshot(135, 2)?.ok_or("snapshot")?;
+    assert_eq!(snapshot.open_orders()[0].quantity, Decimal::from(3));
+    assert_eq!(
+        snapshot.open_orders()[0].limit_price,
+        Some(Decimal::from(99))
+    );
+    assert_eq!(snapshot.open_orders()[0].created_at_ms, Some(119));
+    amended["E"] = 140.into();
+    amended["o"]["i"] = 45.into();
+    assert!(apply(&mut projection, &serde_json::to_string(&amended)?).is_err());
+    Ok(())
+}
+
+#[test]
 fn new_and_cancel_are_local_facts_not_rest_refreshes() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = state()?;
     apply(&mut state, NEW)?;

@@ -1891,7 +1891,8 @@ impl ProductionResident<venue_gateway_binance::BinanceAccountGateway> {
                         fill: event.fill,
                     },
                 ),
-            venue_gateway_binance::BinancePrivateAccountEvent::ReconcileRequired { .. } => {
+            venue_gateway_binance::BinancePrivateAccountEvent::ReconcileRequired { .. }
+            | venue_gateway_binance::BinancePrivateAccountEvent::RefreshRecommended => {
                 self.supervise_binance_grid_once(binding).map(|_| true)
             }
         }

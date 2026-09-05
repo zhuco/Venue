@@ -198,7 +198,7 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
             let quantity = model
                 .execution
                 .position_quantity(&symbol, side)
-                .map_or(rust_decimal::Decimal::ZERO, |value| value);
+                .unwrap_or(rust_decimal::Decimal::ZERO);
             let armed = model.trade_dock.armed_action == Some(action);
             if ui
                 .add_enabled(
@@ -239,29 +239,6 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
     if let Some(armed) = model.trade_dock.armed_action {
         ui.colored_label(theme::WARNING, action_name(language, armed));
     }
-    if model.execution.private_projection.is_some() {
-        ui.separator();
-        ui.horizontal_wrapped(|ui| {
-            let long = model
-                .execution
-                .position_quantity(&symbol, venue_domain::PositionSide::Long)
-                .map_or_else(|| "—".to_owned(), |value| value.normalize().to_string());
-            let short = model
-                .execution
-                .position_quantity(&symbol, venue_domain::PositionSide::Short)
-                .map_or_else(|| "—".to_owned(), |value| value.normalize().to_string());
-            ui.label(
-                RichText::new(format!("{} {long} {base}", label(language, "多", "Long")))
-                    .size(11.0)
-                    .color(theme::BUY),
-            );
-            ui.label(
-                RichText::new(format!("{} {short} {base}", label(language, "空", "Short")))
-                    .size(11.0)
-                    .color(theme::SELL),
-            );
-        });
-    }
     action
 }
 
@@ -285,7 +262,7 @@ fn action_palette(action: TradingAction) -> (Color32, Color32, Color32) {
         _ => (theme::TEXT_PRIMARY, theme::BG_SECONDARY, theme::DIVIDER),
     }
 }
-fn action_button(
+pub(crate) fn action_button(
     ui: &mut egui::Ui,
     model: &AppModel,
     action: TradingAction,
@@ -359,6 +336,7 @@ fn action_disabled_reason(model: &AppModel, action: TradingAction, now: f64) -> 
                     CancelSelectionError::Disappeared => {
                         "所选委托已不在最新活动委托投影中，请刷新后重新选择"
                     }
+                    CancelSelectionError::Pending => "该委托的撤单结果未确认，请勿重复提交",
                 },
                 match error {
                     CancelSelectionError::Missing => {
@@ -370,6 +348,7 @@ fn action_disabled_reason(model: &AppModel, action: TradingAction, now: f64) -> 
                     CancelSelectionError::Disappeared => {
                         "The selected order is absent from the latest open-order projection"
                     }
+                    CancelSelectionError::Pending => "Cancellation is unconfirmed; do not resubmit",
                 },
             )
             .to_owned()
@@ -468,13 +447,18 @@ pub fn apply_action(
         let request = TerminalCancelRequest {
             schema_version: TERMINAL_SCHEMA_VERSION,
             request_id: model.next_terminal_request_id(),
-            credential_id: selection.credential_id,
-            symbol: selection.symbol,
-            native_order_id: selection.native_order_id,
+            credential_id: selection.credential_id.clone(),
+            symbol: selection.symbol.clone(),
+            native_order_id: selection.native_order_id.clone(),
         };
         let request_id = request.request_id.clone();
         match client.send_terminal_cancel(request) {
             Ok(()) => {
+                model.execution.chart_orders.submitted_cancel(
+                    selection,
+                    request_id.clone(),
+                    context,
+                );
                 model.execution.begin_terminal_submission(request_id);
                 model.trade_dock.clear_order_selection();
                 model.notice("Submitted exact order cancellation to the Binance Executor ledger");
@@ -496,8 +480,15 @@ pub fn apply_action(
         }
     };
     let request_id = request.request_id.clone();
-    match client.send_terminal(request) {
+    match client.send_terminal(request.clone()) {
         Ok(()) => {
+            if let Some(account) = model.preferences.execution_account_id.clone() {
+                model
+                    .execution
+                    .chart_orders
+                    .submitted_order(account, request, context);
+            }
+            context.request_repaint();
             model.execution.begin_terminal_submission(request_id);
             model.trade_dock.armed_action = None;
             model.notice(format!(
@@ -514,6 +505,7 @@ enum CancelSelectionError {
     Missing,
     ScopeChanged,
     Disappeared,
+    Pending,
 }
 
 fn terminal_cancel_selection(
@@ -546,24 +538,26 @@ fn terminal_cancel_selection(
     }) {
         return Err(CancelSelectionError::Disappeared);
     }
+    if model.execution.chart_orders.is_pending(selection) {
+        return Err(CancelSelectionError::Pending);
+    }
     Ok(selection)
+}
+
+struct TerminalRequestParts {
+    credential_id: String,
+    symbol: venue_domain::Symbol,
+    action: TerminalAction,
+    price: rust_decimal::Decimal,
+    quote_notional: rust_decimal::Decimal,
+    close_quantity_cap: Option<rust_decimal::Decimal>,
 }
 
 fn terminal_request_parts(
     model: &AppModel,
     action: TradingAction,
     now: f64,
-) -> Result<
-    (
-        String,
-        venue_domain::Symbol,
-        TerminalAction,
-        rust_decimal::Decimal,
-        rust_decimal::Decimal,
-        Option<rust_decimal::Decimal>,
-    ),
-    crate::trading::TradePlanError,
-> {
+) -> Result<TerminalRequestParts, crate::trading::TradePlanError> {
     let credential_id = model
         .account_overview
         .as_ref()
@@ -608,14 +602,14 @@ fn terminal_request_parts(
     if terminal_action.is_close() && close_cap.is_none() {
         return Err(crate::trading::TradePlanError::NoPosition);
     }
-    Ok((
+    Ok(TerminalRequestParts {
         credential_id,
         symbol,
-        terminal_action,
+        action: terminal_action,
         price,
         quote_notional,
-        close_cap,
-    ))
+        close_quantity_cap: close_cap,
+    })
 }
 
 fn build_terminal_request(
@@ -623,8 +617,14 @@ fn build_terminal_request(
     action: TradingAction,
     now: f64,
 ) -> Result<TerminalOrderRequest, crate::trading::TradePlanError> {
-    let (credential_id, symbol, action, price, quote_notional, close_quantity_cap) =
-        terminal_request_parts(model, action, now)?;
+    let TerminalRequestParts {
+        credential_id,
+        symbol,
+        action,
+        price,
+        quote_notional,
+        close_quantity_cap,
+    } = terminal_request_parts(model, action, now)?;
     Ok(TerminalOrderRequest {
         schema_version: TERMINAL_SCHEMA_VERSION,
         request_id: model.next_terminal_request_id(),
@@ -644,49 +644,7 @@ fn submit_market_close(
     client: &ControlClient,
     side: venue_domain::PositionSide,
 ) {
-    let Some(credential_id) = model
-        .account_overview
-        .as_ref()
-        .and_then(|overview| overview.selected_credential_id.clone())
-    else {
-        return;
-    };
-    let Ok(symbol) = model.preferences.selected_symbol.parse() else {
-        return;
-    };
-    let Some(close_quantity_cap) = model
-        .execution
-        .position_quantity(&model.preferences.selected_symbol, side)
-        .filter(|quantity| *quantity > rust_decimal::Decimal::ZERO)
-    else {
-        return;
-    };
-    let action = if side == venue_domain::PositionSide::Long {
-        TerminalAction::CloseLong
-    } else {
-        TerminalAction::CloseShort
-    };
-    let request = TerminalOrderRequest {
-        schema_version: TERMINAL_SCHEMA_VERSION,
-        request_id: model.next_terminal_request_id(),
-        credential_id,
-        symbol,
-        action,
-        order_kind: TerminalOrderKind::Market,
-        quote_notional: rust_decimal::Decimal::ZERO,
-        limit_price: None,
-        close_quantity_cap: Some(close_quantity_cap),
-        market_risk_confirmed: true,
-    };
-    let request_id = request.request_id.clone();
-    match client.send_terminal(request) {
-        Ok(()) => {
-            model.execution.begin_terminal_submission(request_id);
-            model.trade_dock.armed_action = None;
-            model.notice("Submitted confirmed market close to the Binance Executor ledger");
-        }
-        Err(error) => local_failure(model, format!("市价平仓未提交 [local_rejected]：{error}")),
-    }
+    crate::execution_view::submit_confirmed_close(model, client, side);
 }
 
 fn local_failure(model: &mut AppModel, reason: String) {
@@ -746,7 +704,11 @@ mod tests {
         assert!(model.execution.private_projection.is_none());
         for action in [TradingAction::OpenLong, TradingAction::OpenShort] {
             assert!(action_disabled_reason(&model, action, 1.0).is_none());
-            assert!(terminal_request_parts(&model, action, 1.0)?.5.is_none());
+            assert!(
+                terminal_request_parts(&model, action, 1.0)?
+                    .close_quantity_cap
+                    .is_none()
+            );
         }
         for action in [
             TradingAction::CloseLong,

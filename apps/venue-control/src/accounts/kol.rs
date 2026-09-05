@@ -196,7 +196,7 @@ impl AccountService {
     ) -> Result<FollowRelationSummary, AccountError> {
         let row = sqlx::query(
             "SELECT r.relation_id,r.relation_state,r.revision,r.credential_id,r.allocated_capital, \
-             r.multiplier,r.max_order_notional,r.max_total_notional,r.max_deviation_bps,r.allowed_symbols, \
+             r.multiplier,r.max_order_notional,r.max_total_notional,r.max_deviation_bps,r.allowed_symbols,r.sizing_json, \
              EXISTS(SELECT 1 FROM venue_kol_activation_requests a WHERE a.relation_id=r.relation_id \
              AND a.request_state='pending') AS activation_requested \
              FROM venue_kol_follow_relations r WHERE r.follower_user_id=$1",
@@ -215,6 +215,17 @@ impl AccountService {
         request: FollowSettingsUpsertRequest,
         now_ms: u64,
     ) -> Result<FollowRelationSummary, AccountError> {
+        self.upsert_follow_settings_scoped(principal, request, now_ms, None)
+            .await
+    }
+
+    pub(super) async fn upsert_follow_settings_scoped(
+        &self,
+        principal: &Principal,
+        request: FollowSettingsUpsertRequest,
+        now_ms: u64,
+        managed: Option<(&str, &str)>,
+    ) -> Result<FollowRelationSummary, AccountError> {
         request.validate().map_err(|_| error(Code::InvalidInput))?;
         self.rate_limit(
             &format!("follow-settings:{}", principal.user.user_id),
@@ -223,12 +234,47 @@ impl AccountService {
         )
         .await?;
         let mut tx = self.pool.begin().await.map_err(database_error)?;
+        super::follow_requests::lock_scope(
+            &mut tx,
+            principal,
+            managed,
+            true,
+            Some(&request.settings.credential_id),
+            now_ms,
+        )
+        .await?;
+        let actor = managed
+            .map(|scope| scope.0)
+            .unwrap_or(&principal.user.user_id);
+        let hash = super::follow_requests::digest("settings", &request)?;
+        if let Some(prior) =
+            super::follow_requests::replay(&mut tx, principal, actor, &request.request_id, &hash)
+                .await?
+        {
+            return Ok(prior);
+        }
+        let existing = sqlx::query(
+            "SELECT relation_id,relation_state,revision FROM venue_kol_follow_relations \
+             WHERE follower_user_id=$1 FOR UPDATE",
+        )
+        .bind(&principal.user.user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        if let Some(ref row) = existing {
+            let relation_id: String = row.try_get("relation_id").map_err(database_error)?;
+            let unresolved: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_order_mirrors WHERE relation_id=$1 AND mirror_state NOT IN ('terminal','blocked')) OR EXISTS(SELECT 1 FROM venue_binance_commands WHERE relation_id=$1 AND command_state IN ('pending','sending','accepted','reconcile_required'))")
+                .bind(relation_id).fetch_one(&mut *tx).await.map_err(database_error)?;
+            if unresolved {
+                return Err(error(Code::AccountInUse));
+            }
+        }
         let credential =
             verified_empty_credential(&mut tx, principal, &request.settings, now_ms).await?;
         let binding = sqlx::query(
             "SELECT b.kol_user_id,p.leader_trading_account_id FROM venue_user_kol_bindings b \
              JOIN venue_kol_profiles p ON p.kol_user_id=b.kol_user_id \
-             WHERE b.user_id=$1 AND p.profile_state='enabled' FOR SHARE OF b,p",
+             WHERE b.user_id=$1 AND p.profile_state='enabled'",
         )
         .bind(&principal.user.user_id)
         .fetch_optional(&mut *tx)
@@ -253,14 +299,6 @@ impl AccountService {
                 .collect::<Vec<_>>(),
         )
         .map_err(|_| error(Code::InvalidInput))?;
-        let existing = sqlx::query(
-            "SELECT relation_id,relation_state,revision FROM venue_kol_follow_relations \
-             WHERE follower_user_id=$1 FOR UPDATE",
-        )
-        .bind(&principal.user.user_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(database_error)?;
         let row = match existing {
             None => {
                 if request.expected_revision.is_some() {
@@ -268,8 +306,8 @@ impl AccountService {
                 }
                 let relation_id = crypto::opaque_id()?;
                 sqlx::query(
-                    "INSERT INTO venue_kol_follow_relations (relation_id,follower_user_id,kol_user_id,leader_trading_account_id,follower_trading_account_id,credential_id,relation_state,allocated_capital,multiplier,max_order_notional,max_total_notional,max_deviation_bps,allowed_symbols,revision,created_ms,updated_ms) \
-                     VALUES ($1,$2,$3,$4,$5,$6,'paused',$7,$8,$9,$10,$11,$12,1,$13,$13)",
+                    "INSERT INTO venue_kol_follow_relations (relation_id,follower_user_id,kol_user_id,leader_trading_account_id,follower_trading_account_id,credential_id,relation_state,allocated_capital,multiplier,max_order_notional,max_total_notional,max_deviation_bps,allowed_symbols,revision,created_ms,updated_ms,sizing_json) \
+                     VALUES ($1,$2,$3,$4,$5,$6,'paused',$7,$8,$9,$10,$11,$12,1,$13,$13,$14)",
                 )
                 .bind(&relation_id)
                 .bind(&principal.user.user_id)
@@ -284,6 +322,7 @@ impl AccountService {
                 .bind(i32::try_from(request.settings.max_deviation_bps).map_err(|_| error(Code::InvalidInput))?)
                 .bind(allowed_symbols)
                 .bind(ms(now_ms)?)
+                .bind(serde_json::to_value(request.settings.sizing).map_err(|_| error(Code::InvalidInput))?)
                 .execute(&mut *tx)
                 .await
                 .map_err(database_error)?;
@@ -306,7 +345,7 @@ impl AccountService {
                     "UPDATE venue_kol_follow_relations SET kol_user_id=$1,leader_trading_account_id=$2, \
                      follower_trading_account_id=$3,credential_id=$4,allocated_capital=$5,multiplier=$6, \
                      max_order_notional=$7,max_total_notional=$8,max_deviation_bps=$9,allowed_symbols=$10, \
-                     revision=$11,updated_ms=$12 WHERE relation_id=$13",
+                     revision=$11,updated_ms=$12,sizing_json=$14 WHERE relation_id=$13",
                 )
                 .bind(binding.try_get::<String, _>("kol_user_id").map_err(database_error)?)
                 .bind(&leader_account)
@@ -321,7 +360,16 @@ impl AccountService {
                 .bind(next)
                 .bind(ms(now_ms)?)
                 .bind(&relation_id)
+                .bind(serde_json::to_value(request.settings.sizing).map_err(|_| error(Code::InvalidInput))?)
                 .execute(&mut *tx)
+                .await
+                .map_err(database_error)?;
+                crate::kol_executor::cancel_pending_copy_commands(
+                    &mut tx,
+                    &relation_id,
+                    ms(now_ms)?,
+                    "settings_changed",
+                )
                 .await
                 .map_err(database_error)?;
                 sqlx::query("UPDATE venue_kol_activation_requests SET request_state='cancelled',sanitized_reason='settings_changed',updated_ms=$1 WHERE relation_id=$2 AND request_state='pending'")
@@ -333,8 +381,19 @@ impl AccountService {
                 query_follow_relation(&mut tx, &relation_id).await?
             }
         };
+        let summary = follow_relation_summary(&row)?;
+        super::follow_requests::save(
+            &mut tx,
+            principal,
+            actor,
+            &request.request_id,
+            &hash,
+            &summary,
+            now_ms,
+        )
+        .await?;
         tx.commit().await.map_err(database_error)?;
-        follow_relation_summary(&row)
+        Ok(summary)
     }
 
     pub async fn request_follow_lifecycle(
@@ -342,6 +401,17 @@ impl AccountService {
         principal: &Principal,
         request: FollowLifecycleRequest,
         now_ms: u64,
+    ) -> Result<FollowRelationSummary, AccountError> {
+        self.request_follow_lifecycle_scoped(principal, request, now_ms, None)
+            .await
+    }
+
+    pub(super) async fn request_follow_lifecycle_scoped(
+        &self,
+        principal: &Principal,
+        request: FollowLifecycleRequest,
+        now_ms: u64,
+        managed: Option<(&str, &str)>,
     ) -> Result<FollowRelationSummary, AccountError> {
         request.validate().map_err(|_| error(Code::InvalidInput))?;
         self.rate_limit(
@@ -353,9 +423,28 @@ impl AccountService {
         let expected =
             i64::try_from(request.expected_revision).map_err(|_| error(Code::InvalidInput))?;
         let mut tx = self.pool.begin().await.map_err(database_error)?;
+        super::follow_requests::lock_scope(
+            &mut tx,
+            principal,
+            managed,
+            request.action == FollowLifecycleAction::Activate,
+            None,
+            now_ms,
+        )
+        .await?;
+        let actor = managed
+            .map(|scope| scope.0)
+            .unwrap_or(&principal.user.user_id);
+        let hash = super::follow_requests::digest("lifecycle", &request)?;
+        if let Some(prior) =
+            super::follow_requests::replay(&mut tx, principal, actor, &request.request_id, &hash)
+                .await?
+        {
+            return Ok(prior);
+        }
         let row = sqlx::query(
             "SELECT relation_id,relation_state,revision,credential_id,allocated_capital,multiplier, \
-             max_order_notional,max_total_notional,max_deviation_bps,allowed_symbols \
+             max_order_notional,max_total_notional,max_deviation_bps,allowed_symbols,sizing_json \
              FROM venue_kol_follow_relations WHERE relation_id=$1 AND follower_user_id=$2 FOR UPDATE",
         )
         .bind(&request.relation_id)
@@ -401,6 +490,14 @@ impl AccountService {
                     .execute(&mut *tx)
                     .await
                     .map_err(database_error)?;
+                crate::kol_executor::cancel_pending_copy_commands(
+                    &mut tx,
+                    &relation_id,
+                    ms(now_ms)?,
+                    "follow_paused",
+                )
+                .await
+                .map_err(database_error)?;
                 sqlx::query("UPDATE venue_kol_activation_requests SET request_state='cancelled',sanitized_reason='paused',updated_ms=$1 WHERE relation_id=$2 AND request_state='pending'")
                     .bind(ms(now_ms)?)
                     .bind(&relation_id)
@@ -409,9 +506,20 @@ impl AccountService {
                     .map_err(database_error)?;
             }
         }
-        let summary = query_follow_relation(&mut tx, &relation_id).await?;
+        let summary =
+            follow_relation_summary(&query_follow_relation(&mut tx, &relation_id).await?)?;
+        super::follow_requests::save(
+            &mut tx,
+            principal,
+            actor,
+            &request.request_id,
+            &hash,
+            &summary,
+            now_ms,
+        )
+        .await?;
         tx.commit().await.map_err(database_error)?;
-        follow_relation_summary(&summary)
+        Ok(summary)
     }
 
     pub async fn terminal_account_projection(
@@ -488,7 +596,7 @@ async fn query_follow_relation(
 ) -> Result<PgRow, AccountError> {
     sqlx::query(
         "SELECT r.relation_id,r.relation_state,r.revision,r.credential_id,r.allocated_capital, \
-         r.multiplier,r.max_order_notional,r.max_total_notional,r.max_deviation_bps,r.allowed_symbols, \
+         r.multiplier,r.max_order_notional,r.max_total_notional,r.max_deviation_bps,r.allowed_symbols,r.sizing_json, \
          EXISTS(SELECT 1 FROM venue_kol_activation_requests a WHERE a.relation_id=r.relation_id \
          AND a.request_state='pending') AS activation_requested \
          FROM venue_kol_follow_relations r WHERE r.relation_id=$1",
@@ -538,6 +646,8 @@ fn follow_relation_settings(row: &PgRow) -> Result<FollowRiskSettings, AccountEr
             .map_err(|_| error(Code::Unavailable))
     };
     Ok(FollowRiskSettings {
+        sizing: serde_json::from_value(row.try_get("sizing_json").map_err(database_error)?)
+            .map_err(|_| error(Code::Unavailable))?,
         credential_id: row.try_get("credential_id").map_err(database_error)?,
         allocated_capital: decimal("allocated_capital")?,
         multiplier: decimal("multiplier")?,
@@ -685,6 +795,7 @@ mod tests {
             )
             .await?;
         let settings = FollowRiskSettings {
+            sizing: Default::default(),
             credential_id: credential.credential_id.clone(),
             allocated_capital: Decimal::new(100, 0),
             multiplier: Decimal::ONE,
@@ -740,11 +851,13 @@ mod tests {
             .await?;
         assert!(!paused.activation_requested);
         assert_eq!(paused.revision, relation.revision + 1);
+        sqlx::query("UPDATE venue_kol_follow_relations SET relation_state='active',active_slot=1,baseline_json='{\"target_model\":1,\"baseline_ms\":1}'::jsonb WHERE relation_id=$1")
+            .bind(&relation.relation_id).execute(&fixture.pool).await?;
         for (command_id, target_revision) in [
             ("00000000-0000-4000-8000-000000000108", 1_i64),
             ("00000000-0000-4000-8000-000000000109", 2_i64),
         ] {
-            sqlx::query("INSERT INTO venue_binance_commands (command_id,command_origin,relation_id,relation_revision,target_revision,owner_user_id,trading_account_id,credential_id,symbol,position_side,command_phase,order_kind,order_side,requested_quantity,target_quantity,rule_version,client_order_id,command_state,created_ms,updated_ms) VALUES ($1,'copy',$2,1,$3,$4,$5,$6,'BTC/USDT','long','open','market','buy','0.001','0.001','fixture',$1,'pending',$7,$7)")
+            sqlx::query("INSERT INTO venue_binance_commands (command_id,command_origin,relation_id,relation_revision,target_revision,owner_user_id,trading_account_id,credential_id,symbol,position_side,command_phase,order_kind,order_side,requested_quantity,target_quantity,rule_version,client_order_id,command_state,created_ms,updated_ms,copy_risk) VALUES ($1,'copy',$2,$8,$3,$4,$5,$6,'BTC/USDT','long','open','market','buy','0.001','0.001','fixture',$1,'pending',$7,$7,$9)")
                 .bind(command_id)
                 .bind(&relation.relation_id)
                 .bind(target_revision)
@@ -752,6 +865,9 @@ mod tests {
                 .bind(verified.trading_account_id.as_ref().ok_or("account missing")?)
                 .bind(&credential.credential_id)
                 .bind(i64::try_from(timestamp)?)
+                .bind(i64::try_from(paused.revision)?)
+                .bind(serde_json::json!({"max_order_notional":"20","max_total_notional":"100",
+                    "max_deviation_bps":100,"source_price":"10000","source_occurred_ms":timestamp}))
                 .execute(&fixture.pool)
                 .await?;
         }
@@ -782,6 +898,19 @@ mod tests {
                 .await?
                 .is_none()
         );
+        sqlx::query("INSERT INTO venue_kol_copy_targets (relation_id,symbol,position_side,copyable_quantity,target_quantity,observed_quantity,target_revision,last_native_symbol,last_native_trade_id,dirty,updated_ms) VALUES ($1,'BTC/USDT','long','0.01','0.001','0',1,'BTCUSDT','fixture',false,$2)")
+            .bind(&relation.relation_id).bind(i64::try_from(timestamp)?).execute(&fixture.pool).await?;
+        crate::executor_store::PgExecutorStore::new(fixture.pool.clone())
+            .persist_market_baseline(
+                &first.command_id,
+                &crate::executor_exchange::MarketBaseline {
+                    before_quantity: Decimal::ZERO,
+                    order_quantity: Decimal::new(1, 3),
+                    observed_ms: timestamp - 1,
+                    valid_until_ms: timestamp + 1_000,
+                },
+            )
+            .await?;
         ledger
             .settle(
                 &first.command_id,
@@ -803,11 +932,17 @@ mod tests {
                 .is_none()
         );
         ledger
-            .settle(
+            .settle_with_execution(
                 &first.command_id,
                 venue_control_protocol::kol::ExecutorCommandState::Reconciled,
                 timestamp,
                 None,
+                Some("fixture-native-1"),
+                Some(&crate::executor_exchange::MarketSettlement {
+                    executed_quantity: Decimal::new(1, 3),
+                    position_quantity: Decimal::new(1, 3),
+                    observed_ms: timestamp,
+                }),
             )
             .await?;
         let second = ledger
@@ -824,6 +959,38 @@ mod tests {
             second.client_order_id,
             "00000000-0000-4000-8000-000000000109"
         );
+        let pending_id = "00000000-0000-4000-8000-000000000110";
+        sqlx::query("INSERT INTO venue_binance_commands (command_id,command_origin,relation_id,relation_revision,target_revision,owner_user_id,trading_account_id,credential_id,symbol,position_side,command_phase,order_kind,order_side,requested_quantity,target_quantity,rule_version,client_order_id,command_state,created_ms,updated_ms,copy_risk) SELECT $1,'copy',relation_id,relation_revision,3,owner_user_id,trading_account_id,credential_id,symbol,position_side,command_phase,order_kind,order_side,requested_quantity,target_quantity,rule_version,$1,'pending',created_ms,updated_ms,copy_risk FROM venue_binance_commands WHERE command_id=$2")
+            .bind(pending_id).bind(&second.command_id).execute(&fixture.pool).await?;
+        fixture
+            .service
+            .request_follow_lifecycle(
+                &follower_principal,
+                FollowLifecycleRequest {
+                    schema_version: KOL_SCHEMA_VERSION,
+                    request_id: "00000000-0000-4000-8000-000000000111".into(),
+                    relation_id: relation.relation_id.clone(),
+                    expected_revision: paused.revision,
+                    action: FollowLifecycleAction::Pause,
+                    risk_confirmed: false,
+                },
+                timestamp + 1,
+            )
+            .await?;
+        let pending_state: String = sqlx::query_scalar(
+            "SELECT command_state FROM venue_binance_commands WHERE command_id=$1",
+        )
+        .bind(pending_id)
+        .fetch_one(&fixture.pool)
+        .await?;
+        let sent_state: String = sqlx::query_scalar(
+            "SELECT command_state FROM venue_binance_commands WHERE command_id=$1",
+        )
+        .bind(&second.command_id)
+        .fetch_one(&fixture.pool)
+        .await?;
+        assert_eq!(pending_state, "cancelled");
+        assert_eq!(sent_state, "sending");
         assert_eq!(
             ledger
                 .settle(

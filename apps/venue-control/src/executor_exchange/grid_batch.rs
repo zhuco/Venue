@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, time::Instant};
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use rust_decimal::Decimal;
-use venue_domain::domain::PositionSide;
+use venue_domain::domain::{LimitTimeInForce, PositionSide};
 use venue_gateway_binance::{
     BinanceCancelIntent, BinanceCredentials, BinanceGridDispatchFence, BinanceHttpTransport,
     BinanceMarketIntent, BinanceMutationAck, BinancePlaceIntent, BinancePreparedDispatch,
@@ -139,7 +139,7 @@ impl BinanceHttpExecution {
                 )
                 .map_err(prepare_dispatch_error)?;
             match &requests[index].order_kind {
-                ExecutionOrderKind::Market { .. } | ExecutionOrderKind::LimitPostOnly { .. } => {
+                ExecutionOrderKind::Market { .. } | ExecutionOrderKind::Limit { .. } => {
                     place_dispatches.push((index, dispatch));
                 }
                 ExecutionOrderKind::CancelExact { .. } => {
@@ -233,7 +233,7 @@ impl BinanceHttpExecution {
             } => target_client_order_id
                 .as_deref()
                 .unwrap_or(request.client_order_id.as_str()),
-            ExecutionOrderKind::Market { .. } | ExecutionOrderKind::LimitPostOnly { .. } => {
+            ExecutionOrderKind::Market { .. } | ExecutionOrderKind::Limit { .. } => {
                 request.client_order_id.as_str()
             }
         };
@@ -255,7 +255,7 @@ impl BinanceHttpExecution {
                     ExecutionReadback::Accepted
                 }
             }
-            ExecutionOrderKind::LimitPostOnly { .. }
+            ExecutionOrderKind::Limit { .. }
                 if exact_place_matches(request, &order, rules) == Ok(true) =>
             {
                 match place_readback_decision(order.state, order.filled_quantity) {
@@ -266,7 +266,7 @@ impl BinanceHttpExecution {
                     }
                 }
             }
-            ExecutionOrderKind::Market { .. } | ExecutionOrderKind::LimitPostOnly { .. } => {
+            ExecutionOrderKind::Market { .. } | ExecutionOrderKind::Limit { .. } => {
                 ExecutionReadback::Unknown
             }
         };
@@ -309,7 +309,7 @@ pub(super) fn grid_result_outcome(
                 _ => ExecutionReadback::Unknown,
             }
         }
-        ExecutionOrderKind::LimitPostOnly { .. }
+        ExecutionOrderKind::Limit { .. }
             if exact_place_matches(request, order, rules) == Ok(true) =>
         {
             match place_readback_decision(order.state, order.filled_quantity) {
@@ -610,7 +610,7 @@ pub(super) fn validate_grid_batch_shape(
             return Err(BinanceExecutionError::Invalid);
         }
         match &request.order_kind {
-            ExecutionOrderKind::LimitPostOnly { .. } if !cancellation_seen => {}
+            ExecutionOrderKind::Limit { .. } if !cancellation_seen => {}
             ExecutionOrderKind::Market { .. } if requests.len() == 1 && !cancellation_seen => {}
             ExecutionOrderKind::CancelExact {
                 native_order_id,
@@ -628,7 +628,7 @@ pub(super) fn validate_grid_batch_shape(
             }
             // Multi-command market dispatch would make several position mutations one
             // acknowledgement group. Replenishment and profit reduction remain single commands.
-            ExecutionOrderKind::Market { .. } | ExecutionOrderKind::LimitPostOnly { .. } => {
+            ExecutionOrderKind::Market { .. } | ExecutionOrderKind::Limit { .. } => {
                 return Err(BinanceExecutionError::Invalid);
             }
         }
@@ -643,13 +643,17 @@ fn prepare_hot_grid_batch(
     let mut prepared = Vec::with_capacity(requests.len());
     for request in requests {
         match &request.order_kind {
-            ExecutionOrderKind::LimitPostOnly {
+            ExecutionOrderKind::Limit {
                 side,
                 position_side,
                 quantity,
                 price,
                 reducing,
+                time_in_force,
             } => {
+                if *time_in_force != LimitTimeInForce::PostOnly {
+                    return Err(BinanceExecutionError::Invalid);
+                }
                 let mutation = fence
                     .prepare_place_limit(&BinancePlaceIntent {
                         client_order_id: request.client_order_id.clone(),
@@ -742,7 +746,7 @@ pub(super) fn prepare_grid_batch(
                     native_id: Some(native_id),
                 });
             }
-            ExecutionOrderKind::Market { .. } | ExecutionOrderKind::LimitPostOnly { .. } => {
+            ExecutionOrderKind::Market { .. } | ExecutionOrderKind::Limit { .. } => {
                 let (side, position_side, requested, reducing) = place_shape(request)?;
                 let before_position = position_quantity(before, position_side)?;
                 let requested = if reducing {
@@ -779,7 +783,7 @@ pub(super) fn prepare_grid_batch(
                     check_minimum_notional(before, position_side, quantity, rules)?;
                 }
                 let mutation = match &request.order_kind {
-                    ExecutionOrderKind::LimitPostOnly { price, .. } => prepare_place_limit(
+                    ExecutionOrderKind::Limit { price, .. } => prepare_place_limit(
                         rules,
                         before,
                         &BinancePlaceIntent {

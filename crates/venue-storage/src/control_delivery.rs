@@ -218,6 +218,10 @@ impl OpaqueJournal {
             Err(source) => Err(io_error(&self.path, source).into()),
         }
     }
+
+    pub fn is_empty(&self) -> Result<bool, OpaqueJournalError> {
+        self.len().map(|length| length == 0)
+    }
 }
 
 fn encode_replacement(payloads: &[Vec<u8>]) -> Result<Vec<u8>, OpaqueJournalError> {
@@ -288,7 +292,7 @@ fn operation_guard(path: &Path) -> Result<File, OpaqueJournalError> {
         .open(&lock_path)
         .map_err(|source| io_error(&lock_path, source))?;
     file.try_lock_exclusive()
-        .map_err(|source| io_error(&lock_path, source.into()))?;
+        .map_err(|source| io_error(&lock_path, source))?;
     Ok(file)
 }
 

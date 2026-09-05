@@ -7,15 +7,22 @@ use venue_control_protocol::kol::{
 
 const BODY_LIMIT: usize = 4 * 1024 * 1024;
 
-fn terminal_unavailable(message: &str) -> Box<ClientEvent> {
-    Box::new(ClientEvent::TerminalAccountUnavailable(message.to_owned()))
+enum TerminalReadError {
+    SessionExpired,
+    Unavailable(String),
+}
+
+fn terminal_unavailable(message: &str) -> TerminalReadError {
+    #[cfg(not(target_arch = "wasm32"))]
+    tracing::warn!(reason = message, "terminal account read unavailable");
+    TerminalReadError::Unavailable(message.to_owned())
 }
 
 async fn fetch_terminal_projection(
     client: &reqwest::Client,
     endpoint: &str,
     request: &TerminalProjectionRequest,
-) -> Result<Option<TerminalAccountProjection>, Box<ClientEvent>> {
+) -> Result<Option<TerminalAccountProjection>, TerminalReadError> {
     let response = client
         .post(path(endpoint, KOL_TERMINAL_ACCOUNT_PATH))
         .json(request)
@@ -23,7 +30,7 @@ async fn fetch_terminal_projection(
         .await
         .map_err(|_| terminal_unavailable("Private account projection connection failed"))?;
     if response.status().as_u16() == 401 {
-        return Err(Box::new(ClientEvent::SessionExpired));
+        return Err(TerminalReadError::SessionExpired);
     }
     if !response.status().is_success() {
         return Err(terminal_unavailable(&format!(
@@ -47,14 +54,14 @@ async fn fetch_terminal_projection(
 async fn fetch_terminal_executions(
     client: &reqwest::Client,
     endpoint: &str,
-) -> Result<Vec<ExecutorCommandSummary>, Box<ClientEvent>> {
+) -> Result<Vec<ExecutorCommandSummary>, TerminalReadError> {
     let response = client
         .get(path(endpoint, KOL_EXECUTION_STATUS_PATH))
         .send()
         .await
         .map_err(|_| terminal_unavailable("Terminal execution history connection failed"))?;
     if response.status().as_u16() == 401 {
-        return Err(Box::new(ClientEvent::SessionExpired));
+        return Err(TerminalReadError::SessionExpired);
     }
     if !response.status().is_success() {
         return Err(terminal_unavailable(&format!(
@@ -73,7 +80,7 @@ async fn fetch_terminal_executions(
     Ok(values)
 }
 
-async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, Box<ClientEvent>> {
+async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, TerminalReadError> {
     if response
         .content_length()
         .is_some_and(|length| length > BODY_LIMIT as u64)
@@ -118,7 +125,7 @@ pub(super) fn start_native(
             .await
             {
                 Ok(Ok(executions)) => ClientEvent::TerminalExecutions(executions),
-                Ok(Err(event)) if matches!(event.as_ref(), ClientEvent::SessionExpired) => *event,
+                Ok(Err(TerminalReadError::SessionExpired)) => ClientEvent::SessionExpired,
                 Ok(Err(_)) => ClientEvent::TerminalExecutionsUnavailable(
                     "历史委托读取失败，请检查 Control 连接。".into(),
                 ),
@@ -155,8 +162,20 @@ pub(super) fn start_native(
                         credential_id: request.credential_id.clone(),
                         projection,
                     },
-                    Ok(Err(event)) => *event,
-                    Err(_) => *terminal_unavailable("Private account projection request timed out"),
+                    Ok(Err(TerminalReadError::SessionExpired)) => ClientEvent::SessionExpired,
+                    Ok(Err(TerminalReadError::Unavailable(message))) => {
+                        ClientEvent::TerminalAccountUnavailable {
+                            credential_id: request.credential_id.clone(),
+                            message,
+                        }
+                    }
+                    Err(_) => {
+                        tracing::warn!("private account projection request timed out");
+                        ClientEvent::TerminalAccountUnavailable {
+                            credential_id: request.credential_id.clone(),
+                            message: "Private account projection request timed out".into(),
+                        }
+                    }
                 };
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     break;

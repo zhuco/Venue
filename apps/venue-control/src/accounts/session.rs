@@ -47,11 +47,13 @@ impl AccountService {
         self.rate_limit("login-global", 60, now_ms).await?;
         self.rate_limit(&format!("login:{username}"), 10, now_ms)
             .await?;
-        let row = sqlx::query("SELECT user_id, password_hash FROM venue_users WHERE username=$1")
-            .bind(&username)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(database_error)?;
+        let row = sqlx::query(
+            "SELECT user_id, password_hash FROM venue_users WHERE username=$1 AND login_enabled",
+        )
+        .bind(&username)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
         let hash = row
             .as_ref()
             .map(|row| row.try_get::<String, _>("password_hash"))
@@ -121,7 +123,7 @@ impl AccountService {
             return Err(error(Code::Unauthorized));
         }
         let token_hash = crypto::fingerprint(token.as_bytes());
-        let row = sqlx::query("SELECT u.user_id,u.username,s.selected_credential_id FROM venue_user_sessions s JOIN venue_users u USING(user_id) WHERE s.token_hash=$1 AND s.expires_ms>$2")
+        let row = sqlx::query("SELECT u.user_id,u.username,s.selected_credential_id FROM venue_user_sessions s JOIN venue_users u USING(user_id) WHERE s.token_hash=$1 AND s.expires_ms>$2 AND u.login_enabled")
             .bind(&token_hash).bind(ms(now_ms)?).fetch_optional(&self.pool).await.map_err(database_error)?
             .ok_or(error(Code::Unauthorized))?;
         Ok(Principal {

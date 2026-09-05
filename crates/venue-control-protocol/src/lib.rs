@@ -4,8 +4,12 @@
 //! These types are query projections and semantic control requests. They never grant physical
 //! mutation authority; an account node must independently validate every accepted request.
 pub mod accounts;
+pub mod follow_sizing;
 pub mod grid;
 pub mod kol;
+pub mod leader_bot;
+pub mod managed_followers;
+pub mod terminal_position;
 mod trade;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -1842,7 +1846,6 @@ mod tests {
         let mut invalid = request;
         invalid.relation.follower = invalid.relation.leader.clone();
         assert_eq!(invalid.validate(), Err(ProtocolError::CopyRelationPolicy));
-        let mut invalid = invalid;
         invalid.relation.follower.instance_id = "copy-btc".to_owned();
         assert_eq!(invalid.validate(), Err(ProtocolError::CopyRelationPolicy));
         Ok(())

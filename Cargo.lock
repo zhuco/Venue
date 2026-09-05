@@ -5058,6 +5058,7 @@ dependencies = [
  "futures-util",
  "js-sys",
  "keyring",
+ "parking_lot",
  "reqwest",
  "rust_decimal",
  "serde",

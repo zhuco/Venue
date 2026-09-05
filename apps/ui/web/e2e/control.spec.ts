@@ -250,7 +250,7 @@ async function captureView(
 test("captures every operational view and the expanded relation editor without viewport overflow", async ({
   page,
 }) => {
-  await page.goto("/");
+  await page.goto("/ops");
   await expect(page.getByRole("heading", { name: "控制面总览" })).toBeVisible();
   await captureView(page, "overview");
   for (const [label, heading, name] of [
@@ -286,7 +286,7 @@ test("captures every operational view and the expanded relation editor without v
 });
 
 test("submits a Decimal-preserving TradeIntent only after explicit LIVE confirmation", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/ops");
   await openView(page, "交易", "基础手动交易");
   await page.getByLabel("限价").fill("100000.0100");
   await page.getByLabel("报价金额（USDT）").fill("5.00");
@@ -302,7 +302,7 @@ test("submits a Decimal-preserving TradeIntent only after explicit LIVE confirma
 test("SSE failure and cursor gaps close writes until a fresh reconnect", async ({
   page,
 }) => {
-  await page.goto("/");
+  await page.goto("/ops");
   await openControl(page);
   await expect(page.getByRole("button", { name: "平仓" })).toBeEnabled();
   await page.evaluate(() => {
@@ -342,7 +342,7 @@ test("renders signed facts and Unknown/Rejected/Reconciled without decimal loss 
     value.strategies[0].unrealized_pnl = null;
     return route.fulfill({ json: value });
   });
-  await page.goto("/");
+  await page.goto("/ops");
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await captureView(page, "large-decimal-overview");
   await openView(page, "账户", "交易账户");
@@ -374,7 +374,7 @@ test("a once-valid snapshot ages out without another network event", async ({
   page,
 }) => {
   await page.clock.install({ time: new Date() });
-  await page.goto("/");
+  await page.goto("/ops");
   await openControl(page);
   await expect(page.getByRole("button", { name: "平仓" })).toBeEnabled();
   await page.clock.fastForward(121_001);
@@ -394,7 +394,7 @@ test("a failed snapshot remains an explicit recoverable error", async ({
       body: JSON.stringify(unavailable ? { error: "unavailable" } : snapshot()),
     }),
   );
-  await page.goto("/");
+  await page.goto("/ops");
   await expect(page.getByRole("main").getByRole("alert")).toContainText(
     "请求失败 (503)",
   );
@@ -409,7 +409,7 @@ test("a failed snapshot remains an explicit recoverable error", async ({
 test("renders schema v2 snapshot and has a usable mobile navigation drawer", async ({
   page,
 }) => {
-  const document = await page.goto("/");
+  const document = await page.goto("/ops");
   expect(document?.headers()["content-security-policy"]).toContain(
     "connect-src 'self'",
   );
@@ -432,7 +432,7 @@ test("mobile drawer locks background scrolling, closes on Escape, and restores f
     test.info().project.name !== "mobile",
     "Drawer behavior is mobile-only.",
   );
-  await page.goto("/");
+  await page.goto("/ops");
   const menu = page.getByRole("button", { name: "切换导航" });
   await menu.click();
   await expect
@@ -465,7 +465,7 @@ test("does not grant an unauthenticated browser context mutation authority and c
     },
   });
   expect(rejected.status()).toBe(403);
-  await page.goto("/");
+  await page.goto("/ops");
   await openControl(page);
   await expect(page.getByRole("button", { name: "平仓" })).toBeEnabled();
   await page.context().setOffline(true);
@@ -490,7 +490,7 @@ test("does not grant an unauthenticated browser context mutation authority and c
 test("requires an explicit LIVE confirmation and prevents duplicate flatten submission while a receipt is pending", async ({
   page,
 }) => {
-  await page.goto("/");
+  await page.goto("/ops");
   await openControl(page);
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "平仓" }).click();
@@ -501,7 +501,7 @@ test("requires an explicit LIVE confirmation and prevents duplicate flatten subm
 test("orders and positions remain explicitly unavailable until projected", async ({
   page,
 }) => {
-  await page.goto("/");
+  await page.goto("/ops");
   if (
     test.info().project.name === "mobile" ||
     test.info().project.name === "tablet"
@@ -518,7 +518,7 @@ test("orders and positions remain explicitly unavailable until projected", async
 test("only accepts server-derived relation candidates and preserves decimal strings", async ({
   page,
 }) => {
-  await page.goto("/");
+  await page.goto("/ops");
   if (
     test.info().project.name === "mobile" ||
     test.info().project.name === "tablet"

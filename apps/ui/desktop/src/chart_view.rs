@@ -47,6 +47,9 @@ pub(crate) fn candle_plot(
     interval: crate::chart::ChartInterval,
     market_price: Option<rust_decimal::Decimal>,
     selected_price: Option<rust_decimal::Decimal>,
+    trading_display: &crate::chart_trading::ChartTradingSettings,
+    overlays: &[crate::chart_trading::ChartOverlay],
+    bid_ask: (Option<rust_decimal::Decimal>, Option<rust_decimal::Decimal>),
 ) -> Option<rust_decimal::Decimal> {
     let (price_scale, quantity_scale) = scales;
     let height = ui.available_height().max(120.0);
@@ -329,13 +332,80 @@ pub(crate) fn candle_plot(
             );
         }
     }
-    for (price, color) in [
+    let mut trading_overlays = overlays.to_vec();
+    let last_color = all_bars.last().map_or(theme::BUY, |bar| {
+        if market_price.unwrap_or(bar.close) >= bar.open {
+            theme::BUY
+        } else {
+            theme::SELL
+        }
+    });
+    for (enabled, price, color, name) in [
         (
+            trading_display.last_price,
             market_price.or_else(|| all_bars.last().map(|bar| bar.close)),
-            theme::BUY,
+            last_color,
+            if language == Language::SimplifiedChinese {
+                "最新价格"
+            } else {
+                "Last price"
+            },
         ),
-        (selected_price, theme::WARNING),
+        (
+            trading_display.bid_ask,
+            bid_ask.0,
+            theme::BUY,
+            if language == Language::SimplifiedChinese {
+                "买一"
+            } else {
+                "Bid"
+            },
+        ),
+        (
+            trading_display.bid_ask,
+            bid_ask.1,
+            theme::SELL,
+            if language == Language::SimplifiedChinese {
+                "卖一"
+            } else {
+                "Ask"
+            },
+        ),
     ] {
+        if trading_display.price_lines
+            && enabled
+            && let Some(price) = price.filter(|price| *price > rust_decimal::Decimal::ZERO)
+        {
+            trading_overlays.push(crate::chart_trading::ChartOverlay {
+                price,
+                label: if trading_display.price_labels {
+                    name.into()
+                } else {
+                    String::new()
+                },
+                color,
+                time_ms: None,
+                line: true,
+                tick: trading_display.price_labels
+                    && trading_display.ticks
+                    && trading_display.tick_prices,
+                badge: None,
+            });
+        }
+    }
+    crate::chart_trading::draw(
+        ui,
+        &painter,
+        price_rect,
+        bars,
+        display_slots,
+        interval,
+        price_range,
+        &trading_overlays,
+        price_scale,
+        trading_display,
+    );
+    for (price, color) in [(selected_price, theme::WARNING)] {
         let Some(price) = price.filter(|price| *price > rust_decimal::Decimal::ZERO) else {
             continue;
         };
@@ -1392,6 +1462,9 @@ mod tests {
                     crate::chart::ChartInterval::OneMinute,
                     None,
                     None,
+                    &crate::chart_trading::ChartTradingSettings::default(),
+                    &[],
+                    (None, None),
                 );
             },
         );

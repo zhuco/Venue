@@ -55,7 +55,7 @@ Control 使用现有 PostgreSQL，通过 `DATABASE_URL` 指定连接。以下命
 编译结束后，从 guard 实际选择的固定缓存 `debug` 目录分别启动 `venue-control-server.exe` 和 `venueflow.exe`；
 主工作区默认为 `G:\Build\Venue\main\debug`。不要以长期 `cargo run` 占用构建锁。本次文档核对不自动启动任何服务。
 
-默认监听和连接 `127.0.0.1:39180`。当前 Control 幂等安装 `0001`–`0017` migrations；0017 已固定 KOL、邀请、永久唯一用户归属、关系容量槽、源成交/目标和轻量命令账本，HTTP repository 与 Executor 消费仍按 `KOL_COPY_MVP.md` 的 P1–P3 实现。`VENUE_CONTROL_BIND` 继续只允许 loopback；公网浏览器经同源 HTTPS BFF 访问。
+Control 默认监听 `127.0.0.1:39180`，桌面默认连接 `https://clawdbotweb.site`，通过 Caddy 转发到服务器本机；地址设置与旧默认迁移见 [UI 说明](../apps/ui/README.md)。当前 Control 幂等安装 `0001`–`0017` migrations；0017 已固定 KOL、邀请、永久唯一用户归属、关系容量槽、源成交/目标和轻量命令账本，HTTP repository 与 Executor 消费仍按 `KOL_COPY_MVP.md` 的 P1–P3 实现。`VENUE_CONTROL_BIND` 继续只允许 loopback；公网浏览器经同源 HTTPS BFF 访问。
 
 不要把数据库 URL、主密钥或实际 API Key 粘贴到诊断输出。主密钥丢失无法恢复绑定密文；轮换必须另行设计迁移，不可直接换值后假定旧绑定仍可用。
 

@@ -19,6 +19,9 @@ use venue_domain::{OrderSide, PositionSide};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+#[path = "support/grid_rejection_recovery.rs"]
+mod grid_rejection_recovery;
+
 #[tokio::test]
 async fn grid_store_is_idempotent_owned_and_restart_safe() -> TestResult {
     let Some(fixture) = Fixture::create().await? else {
@@ -1234,6 +1237,18 @@ async fn exercise(pool: &PgPool) -> TestResult {
     sqlx::raw_sql(MIGRATION_0022).execute(pool).await?;
     sqlx::raw_sql(MIGRATION_0023).execute(pool).await?;
     sqlx::raw_sql(MIGRATION_0024).execute(pool).await?;
+    sqlx::raw_sql(venue_control::MIGRATION_0025)
+        .execute(pool)
+        .await?;
+    sqlx::raw_sql(venue_control::MIGRATION_0026)
+        .execute(pool)
+        .await?;
+    sqlx::raw_sql(venue_control::MIGRATION_0027)
+        .execute(pool)
+        .await?;
+    sqlx::raw_sql(venue_control::MIGRATION_0028)
+        .execute(pool)
+        .await?;
     assert_eq!(store.load_owned_orders(&first).await?.len(), 1);
 
     let current = store
@@ -1494,6 +1509,10 @@ impl Fixture {
                 MIGRATION_0022,
                 MIGRATION_0023,
                 MIGRATION_0024,
+                venue_control::MIGRATION_0025,
+                venue_control::MIGRATION_0026,
+                venue_control::MIGRATION_0027,
+                venue_control::MIGRATION_0028,
             ] {
                 sqlx::raw_sql(migration).execute(&pool).await?;
             }

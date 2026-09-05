@@ -1,3 +1,4 @@
+mod position_actions;
 mod text;
 use crate::{
     client::ControlClient,
@@ -6,6 +7,7 @@ use crate::{
     trading::{TerminalOrderSelection, TradeDockState},
 };
 use eframe::egui;
+pub(crate) use position_actions::submit_confirmed_close;
 use std::sync::Arc;
 use text::{Key, text};
 use venue_control_protocol::kol::{ExecutorCommandSummary, TerminalAccountProjection};
@@ -31,6 +33,9 @@ pub struct ExecutionViewState {
     pub terminal_request_id: Option<String>,
     pub terminal_submission_error: Option<String>,
     pub grid: crate::grid_view::GridViewState,
+    pub leader_bot: crate::leader_bot_view::LeaderBotView,
+    position_actions: position_actions::PositionActions,
+    pub(crate) chart_orders: crate::chart_trading::OrderTagState,
     private_received_ms: u64,
     tab: Tab,
     pub(crate) current_symbol: bool,
@@ -40,6 +45,11 @@ impl ExecutionViewState {
     pub fn begin_terminal_submission(&mut self, request_id: String) {
         self.terminal_request_id = Some(request_id);
         self.terminal_submission_error = None;
+    }
+
+    pub fn position_submission_failed(&mut self, id: &str, definitive: bool) {
+        self.position_actions.submission_failed(id, definitive);
+        self.chart_orders.submission_failed(id, definitive);
     }
 
     pub fn apply_private(
@@ -54,6 +64,8 @@ impl ExecutionViewState {
                         && old.observed_ms > projection.observed_ms
                 })
             {
+                #[cfg(not(target_arch = "wasm32"))]
+                tracing::warn!("invalid or regressing private account projection");
                 self.private_error =
                     Some("Invalid or regressing private account projection".into());
                 return;
@@ -65,6 +77,7 @@ impl ExecutionViewState {
             {
                 trade_dock.clear_order_selection();
             }
+            self.chart_orders.observe(&projection);
             self.private_received_ms = crate::account_center::now_ms();
             self.private_projection = Some(Arc::new(projection));
             self.private_error = None;
@@ -80,6 +93,11 @@ impl ExecutionViewState {
         if executions.iter().any(|summary| summary.validate().is_err()) {
             self.terminal_executions_error = Some("Invalid terminal execution history".into());
         } else {
+            self.position_actions.completed(&executions);
+            self.chart_orders.completed(&executions);
+            if let Some(projection) = &self.private_projection {
+                self.chart_orders.observe(projection);
+            }
             if self.terminal_request_id.as_deref().is_some_and(|id| {
                 executions
                     .iter()
@@ -103,6 +121,11 @@ impl ExecutionViewState {
         self.terminal_executions
             .retain(|old| old.command_id != summary.command_id);
         self.terminal_executions.insert(0, summary);
+        self.position_actions.completed(&self.terminal_executions);
+        self.chart_orders.completed(&self.terminal_executions);
+        if let Some(projection) = &self.private_projection {
+            self.chart_orders.observe(projection);
+        }
         self.terminal_executions.truncate(500);
     }
 
@@ -122,6 +145,24 @@ impl ExecutionViewState {
             && self
                 .private_projection_for(trading_account_id)
                 .is_some_and(|projection| fresh_time(projection.observed_ms, now))
+    }
+
+    pub(crate) fn private_received_ms(&self) -> u64 {
+        self.private_received_ms
+    }
+
+    fn refresh_warning(&self, observed_ms: u64, now: u64) -> Key {
+        if self.private_error.is_some() {
+            Key::ConnectionRetry
+        } else if observed_ms > now.saturating_add(2_000)
+            || self.private_received_ms > now.saturating_add(2_000)
+        {
+            Key::ClockMismatch
+        } else if !fresh_time(self.private_received_ms, now) {
+            Key::RefreshDelayed
+        } else {
+            Key::AccountDelayed
+        }
     }
 
     pub fn position_quantity(
@@ -168,7 +209,8 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
             (Tab::Bots, Key::Bots),
             (Tab::Assets, Key::Assets),
         ] {
-            ui.selectable_value(&mut model.execution.tab, tab, text(language, key));
+            let label = tab_label(model, tab, key, language);
+            ui.selectable_value(&mut model.execution.tab, tab, label);
         }
         ui.separator();
         ui.checkbox(
@@ -192,6 +234,7 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
     }
     if model.execution.tab == Tab::Bots {
         if let Some(credential) = selected.cloned() {
+            crate::leader_bot_view::show(ui, model, client, &credential);
             crate::grid_view::show(ui, model, client, &credential, &account);
         }
         return;
@@ -201,7 +244,7 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
         && Some(projection.credential_id.as_str())
             == selected.map(|credential| credential.credential_id.as_str())
     {
-        show_private_projection(ui, model, &projection);
+        show_private_projection(ui, model, client, &projection);
     } else {
         ui.weak(text(language, Key::Waiting));
         if let Some(error) = &model.execution.private_error {
@@ -213,25 +256,26 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
 fn show_private_projection(
     ui: &mut egui::Ui,
     model: &mut AppModel,
+    client: &ControlClient,
     projection: &TerminalAccountProjection,
 ) {
     let language = model.preferences.language;
-    ui.small(text(language, Key::CurrentSource));
-    ui.horizontal_wrapped(|ui| {
-        ui.small(format!(
-            "{} · {}",
-            text(language, Key::Signed),
-            timestamp(projection.observed_ms)
-        ));
-        if !model.execution.private_ready(
-            Some(&projection.trading_account_id),
-            crate::account_center::now_ms(),
-        ) {
-            ui.colored_label(theme::WARNING, text(language, Key::Stale));
+    let now = crate::account_center::now_ms();
+    if model.execution.tab != Tab::Positions
+        && !model
+            .execution
+            .private_ready(Some(&projection.trading_account_id), now)
+    {
+        let warning = ui.colored_label(
+            theme::WARNING,
+            text(
+                language,
+                model.execution.refresh_warning(projection.observed_ms, now),
+            ),
+        );
+        if let Some(error) = &model.execution.private_error {
+            warning.on_hover_text(error);
         }
-    });
-    if let Some(error) = &model.execution.private_error {
-        ui.colored_label(theme::WARNING, error);
     }
     if model.execution.tab == Tab::OrderHistory {
         ui.small(text(language, Key::OrderHistoryScope));
@@ -260,6 +304,7 @@ fn show_private_projection(
     let mut count = 0_usize;
     let mut requested_symbol = None;
     let mut requested_order = None;
+    let mut requested_position = None;
     egui::ScrollArea::both()
         .id_salt("private-execution-table-scroll")
         .show(ui, |ui| {
@@ -275,8 +320,9 @@ fn show_private_projection(
                             Key::Size,
                             Key::Entry,
                             Key::Mark,
+                            Key::ValueUsd,
                             Key::CurrentPnl,
-                            Key::Time,
+                            Key::Actions,
                         ],
                         Tab::CurrentOrders => &[
                             Key::Symbol,
@@ -339,8 +385,13 @@ fn show_private_projection(
                                 market_quantity(ui, model, &row.symbol, Some(row.quantity));
                                 market_price(ui, model, &row.symbol, row.entry_price);
                                 market_price(ui, model, &row.symbol, row.mark_price);
+                                position_usd_value(ui, row);
                                 position_pnl(ui, row);
-                                ui.weak(timestamp(projection.observed_ms));
+                                if let Some(action) =
+                                    position_actions::row_buttons(ui, model, projection, row)
+                                {
+                                    requested_position = Some(action);
+                                }
                                 ui.end_row();
                             }
                         }
@@ -491,6 +542,7 @@ fn show_private_projection(
     if count == 0 {
         ui.weak(text(language, Key::Empty));
     }
+    position_actions::show_confirmation(ui, model, client, requested_position);
     if let Some(selection) = requested_order {
         model.select_symbol(selection.symbol.to_string());
         model.trade_dock.select_terminal_order(selection);
@@ -509,13 +561,31 @@ fn position_pnl(ui: &mut egui::Ui, position: &venue_control_protocol::kol::Termi
         } else {
             theme::SELL
         };
-        ui.colored_label(color, pnl.normalize().to_string());
+        ui.colored_label(color, format!("{:.4}", pnl.round_dp(4)));
     } else {
         ui.label("—");
     }
 }
 
-fn position_pnl_value(
+fn position_usd_value(ui: &mut egui::Ui, position: &venue_control_protocol::kol::TerminalPosition) {
+    let value = position_usd_value_value(position);
+    ui.monospace(value.map_or_else(
+        || "—".to_owned(),
+        |value| format!("{} USD", value.round_dp(4).normalize()),
+    ));
+}
+
+fn position_usd_value_value(
+    position: &venue_control_protocol::kol::TerminalPosition,
+) -> Option<rust_decimal::Decimal> {
+    let quote = position.symbol.to_string().split_once('/')?.1.to_owned();
+    if !matches!(quote.as_str(), "USDC" | "USDT") {
+        return None;
+    }
+    position.mark_price?.checked_mul(position.quantity)
+}
+
+pub(crate) fn position_pnl_value(
     position: &venue_control_protocol::kol::TerminalPosition,
 ) -> Option<rust_decimal::Decimal> {
     position
@@ -578,6 +648,40 @@ fn decimal(ui: &mut egui::Ui, value: Option<rust_decimal::Decimal>) {
     ui.monospace(value.map_or_else(|| "—".into(), |v| v.normalize().to_string()));
 }
 
+fn tab_label(model: &AppModel, tab: Tab, key: Key, language: crate::i18n::Language) -> String {
+    let count = model
+        .execution
+        .private_projection
+        .as_ref()
+        .and_then(|projection| {
+            let selected_symbol = model
+                .execution
+                .current_symbol
+                .then_some(model.preferences.selected_symbol.as_str());
+            let included = |symbol: &venue_domain::Symbol| {
+                selected_symbol.is_none_or(|selected| symbol.to_string() == selected)
+            };
+            let count = match tab {
+                Tab::Positions => projection
+                    .positions
+                    .iter()
+                    .filter(|row| included(&row.symbol) && !row.quantity.is_zero())
+                    .count(),
+                Tab::CurrentOrders => projection
+                    .open_orders
+                    .iter()
+                    .filter(|row| included(&row.symbol))
+                    .count(),
+                _ => return None,
+            };
+            Some(count)
+        });
+    count.map_or_else(
+        || text(language, key).to_owned(),
+        |count| format!("{}({count})", text(language, key)),
+    )
+}
+
 fn timestamp(ms: u64) -> String {
     crate::chart::format_timeline_label(ms, crate::chart::ChartInterval::OneHour)
 }
@@ -614,10 +718,64 @@ mod tests {
             filled_quantity: Some(rust_decimal::Decimal::ZERO),
             limit_price: Some(rust_decimal::Decimal::new(100, 0)),
             post_only: true,
+            time_in_force: Some(venue_domain::LimitTimeInForce::PostOnly),
             reduce_only: false,
             state: venue_control_protocol::kol::TerminalOrderState::New,
             created_ms: Some(18_000),
         }
+    }
+
+    #[test]
+    fn positions_render_four_decimal_pnl_and_each_row_actions_without_update_time()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use rust_decimal::Decimal;
+        let mut model = AppModel::new(crate::model::Preferences::default());
+        model.preferences.language = crate::i18n::Language::SimplifiedChinese;
+        let mut projection = private_projection(
+            "00000000-0000-4000-8000-000000000003",
+            crate::account_center::now_ms(),
+        );
+        for side in [
+            venue_domain::PositionSide::Long,
+            venue_domain::PositionSide::Short,
+        ] {
+            projection
+                .positions
+                .push(venue_control_protocol::kol::TerminalPosition {
+                    symbol: "SOL/USDC".parse()?,
+                    position_side: side,
+                    quantity: Decimal::ONE,
+                    entry_price: Some(Decimal::from(100)),
+                    mark_price: Some(Decimal::new(100123456, 6)),
+                });
+        }
+        let context = egui::Context::default();
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            for row in &projection.positions {
+                position_pnl(ui, row);
+                assert!(position_actions::row_buttons(ui, &model, &projection, row).is_none());
+            }
+        });
+        output.textures_delta.clear();
+        fn collect(shape: &egui::Shape, text: &mut String) {
+            match shape {
+                egui::Shape::Text(value) => {
+                    text.push_str(&value.galley.job.text);
+                    text.push('\n');
+                }
+                egui::Shape::Vec(values) => values.iter().for_each(|value| collect(value, text)),
+                _ => (),
+            }
+        }
+        let mut rendered = String::new();
+        for shape in &output.shapes {
+            collect(&shape.shape, &mut rendered);
+        }
+        assert!(rendered.contains("0.1235") && rendered.contains("-0.1235"));
+        assert_eq!(rendered.matches("平仓").count(), 2);
+        assert_eq!(rendered.matches("反开").count(), 2);
+        assert!(!rendered.contains("更新时间"));
+        Ok(())
     }
 
     #[test]
@@ -626,6 +784,32 @@ mod tests {
         assert!(!fresh_time(1, 20_000));
         assert!(!fresh_time(25_000, 20_000));
         assert!(fresh_time(19_000, 20_000));
+    }
+
+    #[test]
+    fn refresh_warning_distinguishes_connection_clock_and_data_delays() {
+        let mut state = ExecutionViewState {
+            private_received_ms: 19_000,
+            ..Default::default()
+        };
+        assert!(matches!(
+            state.refresh_warning(1, 20_000),
+            Key::AccountDelayed
+        ));
+        state.private_received_ms = 1;
+        assert!(matches!(
+            state.refresh_warning(19_000, 20_000),
+            Key::RefreshDelayed
+        ));
+        assert!(matches!(
+            state.refresh_warning(25_000, 20_000),
+            Key::ClockMismatch
+        ));
+        state.private_error = Some("HTTP 503".into());
+        assert!(matches!(
+            state.refresh_warning(19_000, 20_000),
+            Key::ConnectionRetry
+        ));
     }
 
     #[test]
@@ -762,6 +946,81 @@ mod tests {
         assert_eq!(
             position_pnl_value(&position(venue_domain::PositionSide::Short)),
             Some(rust_decimal::Decimal::new(-6, 0))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stablecoin_quote_positions_have_usd_values_and_counted_tabs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use rust_decimal::Decimal;
+
+        let mut model = AppModel::new(crate::model::Preferences::default());
+        model.preferences.language = crate::i18n::Language::SimplifiedChinese;
+        let mut projection = private_projection(
+            "00000000-0000-4000-8000-000000000003",
+            crate::account_center::now_ms(),
+        );
+        projection.positions = vec![
+            venue_control_protocol::kol::TerminalPosition {
+                symbol: "SOL/USDC".parse()?,
+                position_side: venue_domain::PositionSide::Long,
+                quantity: Decimal::new(334, 2),
+                entry_price: None,
+                mark_price: Some(Decimal::new(125, 1)),
+            },
+            venue_control_protocol::kol::TerminalPosition {
+                symbol: "DOGE/USDT".parse()?,
+                position_side: venue_domain::PositionSide::Short,
+                quantity: Decimal::new(178, 2),
+                entry_price: None,
+                mark_price: Some(Decimal::new(21, 2)),
+            },
+            venue_control_protocol::kol::TerminalPosition {
+                symbol: "ETH/BTC".parse()?,
+                position_side: venue_domain::PositionSide::Long,
+                quantity: Decimal::ONE,
+                entry_price: None,
+                mark_price: Some(Decimal::ONE),
+            },
+        ];
+        projection.open_orders = vec![
+            open_order("SOL/USDC".parse()?),
+            open_order("DOGE/USDT".parse()?),
+        ];
+        model.execution.private_projection = Some(Arc::new(projection));
+        let stored = model
+            .execution
+            .private_projection
+            .as_deref()
+            .ok_or("private projection absent")?;
+
+        assert_eq!(
+            position_usd_value_value(&stored.positions[0]),
+            Some(Decimal::new(4175, 2)),
+        );
+        assert_eq!(
+            position_usd_value_value(&stored.positions[1]),
+            Some(Decimal::new(3738, 4)),
+        );
+        assert_eq!(position_usd_value_value(&stored.positions[2]), None,);
+        assert_eq!(
+            tab_label(
+                &model,
+                Tab::Positions,
+                Key::Positions,
+                model.preferences.language
+            ),
+            "持仓(3)"
+        );
+        assert_eq!(
+            tab_label(
+                &model,
+                Tab::CurrentOrders,
+                Key::CurrentOrders,
+                model.preferences.language
+            ),
+            "当前委托(2)"
         );
         Ok(())
     }

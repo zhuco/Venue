@@ -39,11 +39,12 @@ mod native {
         model::{MarketInstrument, MarketQuote},
     };
 
-    const REST_KLINES_ENDPOINT: &str = "https://fapi.binance.com/fapi/v1/klines";
-    const EXCHANGE_INFO_ENDPOINT: &str = "https://fapi.binance.com/fapi/v1/exchangeInfo";
-    const TICKER_24H_ENDPOINT: &str = "https://fapi.binance.com/fapi/v1/ticker/24hr";
-    const MARKET_STREAM_ENDPOINT: &str = "wss://fstream.binance.com/market/stream";
-    const PUBLIC_STREAM_ENDPOINT: &str = "wss://fstream.binance.com/public/stream";
+    const MARKET_RELAY_HOST: &str = "clawdbotweb.site";
+    const REST_KLINES_ENDPOINT: &str = "https://clawdbotweb.site/fapi/v1/klines";
+    const EXCHANGE_INFO_ENDPOINT: &str = "https://clawdbotweb.site/fapi/v1/exchangeInfo";
+    const TICKER_24H_ENDPOINT: &str = "https://clawdbotweb.site/fapi/v1/ticker/24hr";
+    const MARKET_STREAM_ENDPOINT: &str = "wss://clawdbotweb.site/market/stream";
+    const PUBLIC_STREAM_ENDPOINT: &str = "wss://clawdbotweb.site/public/stream";
     const CONNECT_BUDGET: Duration = Duration::from_secs(10);
     const HTTP_BODY_LIMIT: usize = 1024 * 1024;
     const CATALOG_BODY_LIMIT: usize = 4 * 1024 * 1024;
@@ -339,7 +340,7 @@ mod native {
             }
         };
         history::start(http.clone(), history_rx, event_tx.clone());
-        let proxy = ProxySetting::from_environment("fstream.binance.com");
+        let proxy = ProxySetting::from_environment(MARKET_RELAY_HOST);
         let _ = event_tx.try_send(LocalMarketClientEvent::ProxyDetected(proxy.configured()));
         let catalog = match fetch_catalog(&http).await {
             Ok(instruments) => {
@@ -922,6 +923,7 @@ mod native {
         commands: &mut mpsc::Receiver<LocalMarketCommand>,
         emitter: &mut EventEmitter,
     ) -> Option<LocalMarketCommand> {
+        tracing::warn!(generation, attempt, reason = %error, "public market subscription resync");
         if emitter
             .status_all(generation, selections, MarketStatus::Resyncing, Some(error))
             .is_err()
@@ -1301,7 +1303,7 @@ mod native {
             let selection = selection("BTC/USDT", ChartInterval::FiveMinutes)?;
             assert_eq!(
                 rest_klines_url(&selection, 1_000)?,
-                "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=5m&limit=1000"
+                "https://clawdbotweb.site/fapi/v1/klines?symbol=BTCUSDT&interval=5m&limit=1000"
             );
             assert!(rest_klines_url(&selection, 0).is_err());
             assert!(rest_klines_url(&selection, 1_001).is_err());
@@ -1314,11 +1316,11 @@ mod native {
             let (market, public) = combined_stream_urls(&[selection]);
             assert_eq!(
                 market,
-                "wss://fstream.binance.com/market/stream?streams=!ticker@arr/ethusdt@kline_1h/ethusdt@aggTrade"
+                "wss://clawdbotweb.site/market/stream?streams=!ticker@arr/ethusdt@kline_1h/ethusdt@aggTrade"
             );
             assert_eq!(
                 public,
-                "wss://fstream.binance.com/public/stream?streams=ethusdt@bookTicker/ethusdt@depth20@100ms"
+                "wss://clawdbotweb.site/public/stream?streams=ethusdt@bookTicker/ethusdt@depth20@100ms"
             );
             Ok(())
         }

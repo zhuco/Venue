@@ -4,13 +4,9 @@ use eframe::egui;
 use venueflow::VenueFlowApp;
 
 fn main() -> eframe::Result {
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .without_time()
-        .init();
+    venueflow::init_diagnostics();
 
-    let endpoint =
-        std::env::var("VENUE_CONTROL_URL").unwrap_or_else(|_| "http://127.0.0.1:39180".to_owned());
+    let endpoint = venueflow::default_control_endpoint();
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("VenueFlow — Venue Control Workstation")
