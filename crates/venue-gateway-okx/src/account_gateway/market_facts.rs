@@ -18,7 +18,9 @@ pub(super) struct OkxLimitBbo {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum LimitBboFailure {
     ResponseTime,
-    Envelope,
+    Decode,
+    VenueCode,
+    RowCount,
     Scope,
     ExchangeTime,
     Book,
@@ -28,7 +30,9 @@ impl LimitBboFailure {
     pub(super) const fn code(self) -> &'static str {
         match self {
             Self::ResponseTime => "strategy_okx_bbo_response_time",
-            Self::Envelope => "strategy_okx_bbo_envelope",
+            Self::Decode => "strategy_okx_bbo_decode",
+            Self::VenueCode => "strategy_okx_bbo_venue_code",
+            Self::RowCount => "strategy_okx_bbo_row_count",
             Self::Scope => "strategy_okx_bbo_scope",
             Self::ExchangeTime => "strategy_okx_bbo_exchange_time",
             Self::Book => "strategy_okx_bbo_book",
@@ -67,12 +71,12 @@ pub(super) fn parse_limit_bbo_detailed(
         return Err(LimitBboFailure::ResponseTime);
     }
     let envelope: OkxLimitBboEnvelope =
-        serde_json::from_slice(&response.body).map_err(|_| LimitBboFailure::Envelope)?;
+        serde_json::from_slice(&response.body).map_err(|_| LimitBboFailure::Decode)?;
     if envelope.code != "0" {
-        return Err(LimitBboFailure::Envelope);
+        return Err(LimitBboFailure::VenueCode);
     }
     let [row] = envelope.data.as_slice() else {
-        return Err(LimitBboFailure::Envelope);
+        return Err(LimitBboFailure::RowCount);
     };
     if row.inst_id != instrument.native_id() {
         return Err(LimitBboFailure::Scope);

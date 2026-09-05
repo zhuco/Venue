@@ -1760,6 +1760,10 @@ mod tests {
             ..limit_bbo(&config)
         };
         assert!(parse_limit_bbo(&empty, &config, &instrument, 10_010).is_err());
+        assert_eq!(
+            market_facts::parse_limit_bbo_detailed(&empty, &config, &instrument, 10_010),
+            Err(market_facts::LimitBboFailure::RowCount)
+        );
         let bbo = parse_limit_bbo(&limit_bbo(&config), &config, &instrument, 10_010)?;
         assert!(
             normalize_limit_from_bbo(
