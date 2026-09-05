@@ -570,6 +570,34 @@ impl BybitClosedOrderReadback {
         }))
     }
 
+    pub(crate) fn exact_order_evidence(
+        &self,
+    ) -> Result<Option<BybitOrderEvidence>, BybitExecutionError> {
+        if self.open_orders.len() > 1
+            || self.history.len() > 1
+            || (!self.open_orders.is_empty() && !self.history.is_empty())
+        {
+            return Err(BybitExecutionError::Readback);
+        }
+        if let Some(item) = self.open_orders.first() {
+            return Ok(Some(BybitOrderEvidence {
+                order: item.order.clone(),
+                family: item.family,
+                native_order_type: item.native_order_type.clone(),
+                native_time_in_force: item.native_time_in_force.clone(),
+                position_idx: item.position_idx,
+                stop_order_type: item.stop_order_type.clone(),
+                trigger_price: item.trigger_price,
+                trigger_direction: item.trigger_direction,
+                trigger_by: item.trigger_by.clone(),
+                close_on_trigger: item.close_on_trigger,
+                created_at_ms: item.created_at_ms,
+                updated_at_ms: item.updated_at_ms,
+            }));
+        }
+        Ok(self.history.first().cloned())
+    }
+
     pub(crate) fn exact_limit_time_in_force(
         &self,
     ) -> Result<Option<LimitTimeInForce>, BybitExecutionError> {

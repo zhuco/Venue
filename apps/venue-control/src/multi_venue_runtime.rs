@@ -374,6 +374,8 @@ mod tests {
             native_order_id: "native".into(),
             state: venue_domain::OrderState::Cancelled,
             filled_quantity: Decimal::ZERO,
+            average_price: venue_domain::domain::FieldState::Missing,
+            cumulative_fee: venue_domain::domain::FieldState::Missing,
         };
         assert!(grid_fill_fence(Some("native"), Decimal::ZERO, &observation));
         observation.filled_quantity = Decimal::ONE;

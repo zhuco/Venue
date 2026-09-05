@@ -57,6 +57,8 @@ impl OkxAccountGateway {
             native_order_id: observed.order.order_id,
             state: observed.order.state,
             filled_quantity: observed.order.filled_quantity,
+            average_price: venue_domain::domain::FieldState::Missing,
+            cumulative_fee: venue_domain::domain::FieldState::Missing,
         }))
     }
     /// Returns a fresh public reference and the exact parsed instrument generation.  Bounds are

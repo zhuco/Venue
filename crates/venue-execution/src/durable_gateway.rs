@@ -29,6 +29,10 @@ pub struct DurableOrderObservation {
     pub native_order_id: String,
     pub state: venue_domain::OrderState,
     pub filled_quantity: rust_decimal::Decimal,
+    #[serde(default)]
+    pub average_price: venue_domain::domain::FieldState<venue_domain::domain::Price>,
+    #[serde(default)]
+    pub cumulative_fee: venue_domain::domain::FieldState<venue_domain::domain::Amount>,
 }
 
 /// Transport boundary for a command already committed as Sending in PostgreSQL. This does not

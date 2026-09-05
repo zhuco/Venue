@@ -153,6 +153,8 @@ fn resting(
             native_order_id: native.clone(),
             state: OrderState::New,
             filled_quantity: Decimal::ZERO,
+            average_price: venue_domain::domain::FieldState::Missing,
+            cumulative_fee: venue_domain::domain::FieldState::Missing,
         });
         facts.push(SignedAccountOrderFact {
             client_order_id: order.client_order_id.as_str().into(),
