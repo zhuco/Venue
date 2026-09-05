@@ -29,6 +29,20 @@
         { "filterType": "LOT_SIZE", "minQty": "0.1", "maxQty": "1000000", "stepSize": "0.1" },
         { "filterType": "MIN_NOTIONAL", "notional": "5" }
       ]
+    },
+    {
+      "symbol": "币安人生USDT",
+      "pair": "币安人生USDT",
+      "contractType": "PERPETUAL",
+      "status": "TRADING",
+      "baseAsset": "币安人生",
+      "quoteAsset": "USDT",
+      "marginAsset": "USDT",
+      "filters": [
+        { "filterType": "PRICE_FILTER", "minPrice": "0.000001", "maxPrice": "1000", "tickSize": "0.000001" },
+        { "filterType": "LOT_SIZE", "minQty": "1", "maxQty": "100000000", "stepSize": "1" },
+        { "filterType": "MIN_NOTIONAL", "notional": "5" }
+      ]
     }
   ]
 }

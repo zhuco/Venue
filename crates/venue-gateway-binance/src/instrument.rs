@@ -90,6 +90,12 @@ pub fn parse_instrument_catalog(
         {
             continue;
         }
+        // Binance can list active contracts whose native base asset cannot cross Venue's
+        // canonical ASCII symbol boundary. They are outside an empty allowlist's representable
+        // scope; malformed rules for a canonical symbol still fail the entire catalogue closed.
+        if Symbol::new(text(entry, "baseAsset")?, text(entry, "quoteAsset")?).is_err() {
+            continue;
+        }
         let rules = parse_entry(entry, None, generation)?;
         if catalog
             .insert(rules.instrument.symbol.clone(), rules)
