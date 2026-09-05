@@ -1,6 +1,10 @@
 use super::*;
 use crate::accounts::test_support::{Fixture, TestResult, login, now};
+use rust_decimal::Decimal;
 use venue_control_protocol::accounts::{ApiVerificationState, BindCredentialRequest, SecretValue};
+use venue_control_protocol::managed_followers::{
+    ManagedFollowRiskSettings, ManagedFollowSettingsUpsertRequest,
+};
 
 fn request(id: &str, key: char) -> ManagedFollowerCreateRequest {
     ManagedFollowerCreateRequest {
@@ -162,9 +166,139 @@ async fn managed_save_is_atomic_scoped_idempotent_and_never_grants_trading() -> 
         f.service.managed_followers(&owner).await?.accounts[0].verification,
         ApiVerificationState::Verified
     );
+    let follow_request = ManagedFollowSettingsUpsertRequest {
+        request_id: "00000000-0000-4000-8000-000000000604".into(),
+        managed_id: saved.managed_id.clone(),
+        settings: ManagedFollowRiskSettings {
+            sizing: venue_control_protocol::follow_sizing::FollowSizing::FixedNotional {
+                notional: Decimal::new(55, 1),
+            },
+            allocated_capital: Decimal::new(100, 0),
+            multiplier: Decimal::ONE,
+            max_order_notional: Decimal::new(20, 0),
+            max_total_notional: Decimal::new(100, 0),
+            max_deviation_bps: 100,
+            allowed_symbols: vec!["BTC/USDT".parse()?],
+        },
+        expected_revision: None,
+    };
+    assert!(
+        f.service
+            .upsert_managed_follow_settings(&stranger, follow_request.clone(), now)
+            .await
+            .is_err()
+    );
+    let verification: serde_json::Value = sqlx::query_scalar(
+        "SELECT verification_json FROM venue_api_credentials WHERE credential_id=$1",
+    )
+    .bind(&credential_id)
+    .fetch_one(&f.pool)
+    .await?;
+    sqlx::query(
+        "UPDATE venue_api_credentials SET verification_json='{}'::jsonb WHERE credential_id=$1",
+    )
+    .bind(&credential_id)
+    .execute(&f.pool)
+    .await?;
+    assert!(
+        f.service
+            .upsert_managed_follow_settings(&owner, follow_request.clone(), now)
+            .await
+            .is_err()
+    );
+    let incomplete: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM venue_user_kol_bindings)+(SELECT count(*) FROM venue_kol_follow_relations)+(SELECT count(*) FROM venue_follow_requests)")
+        .fetch_one(&f.pool).await?;
+    assert_eq!(incomplete, 0);
+    sqlx::query("UPDATE venue_api_credentials SET verification_json=$1 WHERE credential_id=$2")
+        .bind(verification)
+        .bind(&credential_id)
+        .execute(&f.pool)
+        .await?;
+    let (left, right) = tokio::join!(
+        f.service
+            .upsert_managed_follow_settings(&owner, follow_request.clone(), now),
+        f.service
+            .upsert_managed_follow_settings(&owner, follow_request.clone(), now)
+    );
+    let relation = left?;
+    assert_eq!(relation, right?);
+    assert_eq!(relation.settings.sizing, follow_request.settings.sizing);
+    let mut conflict = follow_request.clone();
+    conflict.settings.multiplier = Decimal::from(2);
+    assert_eq!(
+        f.service
+            .upsert_managed_follow_settings(&owner, conflict, now)
+            .await
+            .err()
+            .map(|e| e.code),
+        Some(Code::Conflict)
+    );
+    assert!(
+        f.service
+            .upsert_follow_settings(
+                &subject,
+                FollowSettingsUpsertRequest {
+                    schema_version: KOL_SCHEMA_VERSION,
+                    request_id: "00000000-0000-4000-8000-000000000609".into(),
+                    settings: managed_settings(
+                        follow_request.settings.clone(),
+                        credential_id.clone()
+                    ),
+                    expected_revision: Some(relation.revision),
+                },
+                now
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(relation.managed_id, saved.managed_id);
+    assert_eq!(
+        relation.state,
+        venue_control_protocol::kol::FollowLifecycleState::Paused
+    );
+    let relation_json = serde_json::to_string(&relation)?;
+    assert!(!relation_json.contains("credential_id"));
+    assert!(!relation_json.contains("trading_account_id"));
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT follower_user_id FROM venue_kol_follow_relations WHERE relation_id=$1",
+        )
+        .bind(&relation.relation_id)
+        .fetch_one(&f.pool)
+        .await?,
+        subject.user.user_id
+    );
     let work: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM venue_kol_follow_relations)+(SELECT count(*) FROM venue_binance_commands)+(SELECT count(*) FROM venue_leader_bot_permissions)").fetch_one(&f.pool).await?;
-    assert_eq!(work, 0);
+    assert_eq!(work, 1);
     sqlx::query("UPDATE venue_kol_profiles SET profile_state='disabled',active_slot=NULL WHERE kol_user_id=$1").bind(&owner.user.user_id).execute(&f.pool).await?;
+    let pause = ManagedFollowLifecycleRequest {
+        request_id: "00000000-0000-4000-8000-000000000605".into(),
+        managed_id: saved.managed_id.clone(),
+        relation_id: relation.relation_id.clone(),
+        expected_revision: relation.revision,
+        action: venue_control_protocol::kol::FollowLifecycleAction::Pause,
+        risk_confirmed: false,
+    };
+    let paused = f
+        .service
+        .request_managed_follow_lifecycle(&owner, pause.clone(), now)
+        .await?;
+    assert_eq!(paused.revision, relation.revision + 1);
+    assert_eq!(
+        paused,
+        f.service
+            .request_managed_follow_lifecycle(&owner, pause, now)
+            .await?
+    );
+    let mut tx = f.pool.begin().await?;
+    assert!(
+        sqlx::query("UPDATE venue_user_kol_bindings SET managed_id=NULL WHERE user_id=$1")
+            .bind(&subject.user.user_id)
+            .execute(&mut *tx)
+            .await
+            .is_err()
+    );
+    tx.rollback().await?;
     assert!(!f.service.managed_followers(&owner).await?.can_manage);
     assert!(
         f.service
@@ -189,6 +323,8 @@ async fn frozen_managed_table_is_preserved_and_nonempty_legacy_fails_closed() ->
         return Ok(());
     };
     // DDL touches only Fixture's isolated random schema, never a production table.
+    sqlx::raw_sql("ALTER TABLE venue_user_kol_bindings DROP CONSTRAINT venue_binding_managed_owner, DROP CONSTRAINT venue_binding_source;")
+        .execute(&f.pool).await?;
     sqlx::raw_sql("DROP TABLE venue_managed_credentials; DROP TABLE venue_kol_managed_followers; CREATE TABLE venue_kol_managed_followers(managed_follower_id TEXT PRIMARY KEY, kol_user_id TEXT NOT NULL, user_id TEXT NOT NULL, credential_id TEXT NOT NULL, label TEXT NOT NULL, managed_state TEXT NOT NULL, created_ms BIGINT NOT NULL, disabled_ms BIGINT);")
         .execute(&f.pool).await?;
     sqlx::query("INSERT INTO venue_kol_managed_followers VALUES('old','kol','subject','credential','label','active',1,NULL)").execute(&f.pool).await?;
@@ -216,7 +352,7 @@ async fn frozen_managed_table_is_preserved_and_nonempty_legacy_fails_closed() ->
         sqlx::query_scalar::<_, i32>("SELECT max(version) FROM venue_control_schema_migrations")
             .fetch_one(&f.pool)
             .await?,
-        31
+        33
     );
     assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='venue_kol_managed_followers' AND column_name='managed_follower_id'").fetch_one(&f.pool).await?,1);
     let session = f.service.register(login("freshuser"), now()).await?;

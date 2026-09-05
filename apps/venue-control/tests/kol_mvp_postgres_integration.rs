@@ -642,7 +642,8 @@ async fn runtime_restart_reads_every_unresolved_grid_batch_sibling()
         api_secret: SecretValue::new("b".repeat(32)),
     })?;
     let encrypted = cipher.encrypt(&format!("venue-api-v1:{user}:{credential}"), &payload)?;
-    sqlx::query("UPDATE venue_api_credentials SET encrypted_credentials=$1 WHERE credential_id=$2")
+    // This fixture must pass the credential gate before exercising dispatch uncertainty.
+    sqlx::query("UPDATE venue_api_credentials SET encrypted_credentials=$1,verification_json='{\"verification\":\"verified\"}'::jsonb WHERE credential_id=$2")
         .bind(encrypted)
         .bind(&credential)
         .execute(&fixture.pool)
@@ -731,7 +732,7 @@ async fn runtime_never_rejects_a_batch_after_dispatch_may_have_started()
         api_secret: SecretValue::new("b".repeat(32)),
     })?;
     let encrypted = cipher.encrypt(&format!("venue-api-v1:{user}:{credential}"), &payload)?;
-    sqlx::query("UPDATE venue_api_credentials SET encrypted_credentials=$1 WHERE credential_id=$2")
+    sqlx::query("UPDATE venue_api_credentials SET encrypted_credentials=$1,verification_json='{\"verification\":\"verified\"}'::jsonb WHERE credential_id=$2")
         .bind(encrypted)
         .bind(&credential)
         .execute(&fixture.pool)
@@ -865,7 +866,7 @@ async fn command_state_value(pool: &PgPool, query: &str, id: &str) -> Result<Str
 }
 
 #[tokio::test]
-async fn executor_secret_provider_requires_the_durable_credential_owner()
+async fn executor_secret_provider_requires_the_durable_verified_credential_owner()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = integration_database_url()? else {
         return Ok(());
@@ -883,7 +884,7 @@ async fn executor_secret_provider_requires_the_durable_credential_owner()
         api_secret: SecretValue::new("b".repeat(32)),
     })?;
     let encrypted = cipher.encrypt(&format!("venue-api-v1:{user}:{credential}"), &payload)?;
-    sqlx::query("UPDATE venue_api_credentials SET encrypted_credentials=$1 WHERE credential_id=$2")
+    sqlx::query("UPDATE venue_api_credentials SET encrypted_credentials=$1,verification_json='{\"verification\":\"verified\"}'::jsonb WHERE credential_id=$2")
         .bind(encrypted)
         .bind(&credential)
         .execute(&fixture.pool)
@@ -893,6 +894,16 @@ async fn executor_secret_provider_requires_the_durable_credential_owner()
     drop(credentials);
     assert_eq!(
         provider.load(&credential, &id(121)).await.err(),
+        Some(ExecutorSecretError::Forbidden)
+    );
+    sqlx::query(
+        "UPDATE venue_api_credentials SET verification_json='{}'::jsonb WHERE credential_id=$1",
+    )
+    .bind(&credential)
+    .execute(&fixture.pool)
+    .await?;
+    assert_eq!(
+        provider.load(&credential, &user).await.err(),
         Some(ExecutorSecretError::Forbidden)
     );
     fixture.cleanup().await?;
@@ -1787,7 +1798,15 @@ impl Fixture {
             .connect(database_url)
             .await?;
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let schema = format!("venue_kol_mvp_{}_{}", std::process::id(), nonce);
+        // Windows clock resolution can give parallel fixtures the same timestamp.
+        static NEXT_SCHEMA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_SCHEMA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let schema = format!(
+            "venue_kol_mvp_{}_{}_{}",
+            std::process::id(),
+            nonce,
+            sequence
+        );
         admin
             .execute(format!("CREATE SCHEMA {schema}").as_str())
             .await?;
@@ -1836,6 +1855,12 @@ impl Fixture {
             .execute(&self.pool)
             .await?;
         sqlx::raw_sql(venue_control::MIGRATION_0031)
+            .execute(&self.pool)
+            .await?;
+        sqlx::raw_sql(venue_control::MIGRATION_0032)
+            .execute(&self.pool)
+            .await?;
+        sqlx::raw_sql(venue_control::MIGRATION_0033)
             .execute(&self.pool)
             .await?;
         Ok(())

@@ -43,6 +43,6 @@ test("managed account dialog saves, retries with the same identity, verifies and
   await expect(panel.getByRole("cell",{name:"托管一号",exact:true})).toBeVisible();
   await panel.getByRole("button",{name:"验证权限",exact:true}).click();
   await expect(panel.getByRole("cell",{name:"验证通过",exact:true})).toBeVisible(); expect(probes).toBe(1);
-  await expect(panel.getByRole("cell",{name:"未启用",exact:true})).toBeVisible();
+  await expect(panel.getByRole("button",{name:"跟单设置",exact:true})).toBeVisible();
   expect(await page.evaluate(()=>JSON.stringify({...localStorage,...sessionStorage}))).not.toContain("S".repeat(32));
 });

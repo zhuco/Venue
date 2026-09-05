@@ -30,14 +30,15 @@ impl ExecutorSecretProvider {
         }
     }
 
-    /// Decrypts one credential only after the durable owner relation matches. The returned
-    /// adapter container has no Debug or serde implementation and clears secret material on drop.
+    /// Decrypts one credential only after the durable owner relation and verification state
+    /// still match. The returned adapter container has no Debug or serde implementation and
+    /// clears secret material on drop.
     pub async fn load(
         &self,
         credential_id: &str,
         owner_user_id: &str,
     ) -> Result<BinanceCredentials, ExecutorSecretError> {
-        let row = sqlx::query("SELECT encrypted_credentials FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND deleted_ms IS NULL")
+        let row = sqlx::query("SELECT encrypted_credentials FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND deleted_ms IS NULL AND verification_json->>'verification'='verified'")
             .bind(credential_id).bind(owner_user_id).fetch_optional(&self.pool).await
             .map_err(|_| ExecutorSecretError::Unavailable)?
             .ok_or(ExecutorSecretError::Forbidden)?;

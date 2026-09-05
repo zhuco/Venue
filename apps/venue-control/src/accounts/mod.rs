@@ -3,6 +3,7 @@
 
 mod credentials;
 mod crypto;
+mod follow_requests;
 mod grid;
 mod kol;
 mod leader_bot;

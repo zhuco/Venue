@@ -7,6 +7,9 @@ type CustomerSession = { token: string; csrf: string; expires_ms: number };
 const routes: Record<string, { path: string; methods: string[]; public?: boolean }> = {
   "managed-followers": { path: "/v2/kol/managed-followers", methods: ["GET", "POST"] },
   "managed-verify": { path: "/v2/kol/managed-followers/verify", methods: ["POST"] },
+  "managed-settings": { path: "/v2/kol/managed-followers/follow/settings", methods: ["POST"] },
+  "managed-follow": { path: "/v2/kol/managed-followers/follow/lifecycle", methods: ["POST"] },
+  "managed-status": { path: "/v2/kol/managed-followers/follow/status", methods: ["POST"] },
   login: { path: "/v2/account/login", methods: ["POST"], public: true },
   register: { path: "/v2/account/register", methods: ["POST"], public: true },
   session: { path: "/v2/account/session", methods: ["GET"] },
@@ -76,10 +79,25 @@ function pick(value: unknown, fields: string[]): ObjectValue {
 const userFields = ["user_id", "username"];
 const credentialFields = ["credential_id", "label", "venue", "masked_key", "trading_account_id", "verification", "verified_ms", "expires_ms", "api_reachable", "dual_position", "account_mode", "has_exposure"];
 const riskFields = ["credential_id", "allocated_capital", "multiplier", "max_order_notional", "max_total_notional", "max_deviation_bps", "allowed_symbols"];
+function publicRisk(raw: unknown, managed = false): ObjectValue {
+  const value = object(raw);
+  const result = pick(value, managed ? riskFields.filter(field => field !== "credential_id") : riskFields);
+  if (value.sizing !== undefined) {
+    const sizing = object(value.sizing);
+    if (sizing.mode === "proportional") result.sizing = { mode: "proportional" };
+    else if (sizing.mode === "fixed_notional" && typeof sizing.notional === "string" && /^\d+(\.\d+)?$/.test(sizing.notional)) result.sizing = { mode: "fixed_notional", notional: sizing.notional };
+    else throw new Error("invalid_sizing");
+  }
+  return result;
+}
 // Every response crosses an explicit DTO boundary. Control session tokens and exchange
 // secrets are never passed through to a browser response, including unexpected fields.
 export function customerPublicValue(action: string, method: string, raw: unknown): unknown {
   if (raw === null) return null;
+  if (["managed-settings", "managed-follow", "managed-status"].includes(action)) {
+    const value = object(raw);
+    return { ...pick(value, ["managed_id", "relation_id", "state", "revision", "activation_requested"]), settings: publicRisk(value.settings, true) };
+  }
   if (action === "managed-followers" || action === "managed-verify") {
     const fields = ["managed_id", "label", "masked_key", "verification", "verified_ms"];
     if (action === "managed-followers" && method === "GET") {
@@ -101,7 +119,7 @@ export function customerPublicValue(action: string, method: string, raw: unknown
   }
   if (action === "settings" || action === "follow") {
     const value = object(raw);
-    return { ...pick(value, ["relation_id", "state", "revision", "activation_requested"]), settings: pick(value.settings, riskFields) };
+    return { ...pick(value, ["relation_id", "state", "revision", "activation_requested"]), settings: publicRisk(value.settings) };
   }
   if (action === "leader" || action === "leader-lifecycle") {
     const value = object(raw);

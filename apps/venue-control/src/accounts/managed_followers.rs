@@ -2,6 +2,10 @@ use super::{AccountError, AccountService, Principal, crypto, database_error, err
 use sqlx::Row;
 use venue_control_protocol::{
     accounts::{AccountErrorCode as Code, CredentialSummary, UserSummary},
+    kol::{
+        FollowLifecycleRequest, FollowRelationSummary, FollowRiskSettings,
+        FollowSettingsUpsertRequest, KOL_SCHEMA_VERSION,
+    },
     leader_bot::valid_id,
     managed_followers::*,
 };
@@ -105,25 +109,109 @@ impl AccountService {
         Ok(managed_summary(request.managed_id, summary))
     }
 
-    async fn managed_verification_subject(
+    pub async fn upsert_managed_follow_settings(
+        &self,
+        principal: &Principal,
+        request: ManagedFollowSettingsUpsertRequest,
+        now_ms: u64,
+    ) -> Result<ManagedFollowRelationSummary, AccountError> {
+        let (subject, credential_id) = self
+            .managed_verification_subject(principal, &request.managed_id, now_ms)
+            .await?;
+        let relation = self
+            .upsert_follow_settings_scoped(
+                &subject,
+                FollowSettingsUpsertRequest {
+                    schema_version: KOL_SCHEMA_VERSION,
+                    request_id: request.request_id,
+                    settings: managed_settings(request.settings, credential_id),
+                    expected_revision: request.expected_revision,
+                },
+                now_ms,
+                Some((&principal.user.user_id, &request.managed_id)),
+            )
+            .await?;
+        Ok(managed_relation_summary(request.managed_id, relation))
+    }
+
+    pub async fn managed_follow_status(
+        &self,
+        principal: &Principal,
+        request: ManagedFollowStatusRequest,
+        now_ms: u64,
+    ) -> Result<Option<ManagedFollowRelationSummary>, AccountError> {
+        let (subject, _) = self
+            .managed_follow_subject(principal, &request.managed_id, now_ms, false)
+            .await?;
+        match self.follow_relation(&subject).await {
+            Ok(relation) => Ok(Some(managed_relation_summary(request.managed_id, relation))),
+            Err(cause) if cause.code == Code::NotFound => Ok(None),
+            Err(cause) => Err(cause),
+        }
+    }
+
+    pub async fn request_managed_follow_lifecycle(
+        &self,
+        principal: &Principal,
+        request: ManagedFollowLifecycleRequest,
+        now_ms: u64,
+    ) -> Result<ManagedFollowRelationSummary, AccountError> {
+        let (subject, _) = self
+            .managed_follow_subject(
+                principal,
+                &request.managed_id,
+                now_ms,
+                request.action == venue_control_protocol::kol::FollowLifecycleAction::Activate,
+            )
+            .await?;
+        let relation = self
+            .request_follow_lifecycle_scoped(
+                &subject,
+                FollowLifecycleRequest {
+                    schema_version: KOL_SCHEMA_VERSION,
+                    request_id: request.request_id,
+                    relation_id: request.relation_id,
+                    expected_revision: request.expected_revision,
+                    action: request.action,
+                    risk_confirmed: request.risk_confirmed,
+                },
+                now_ms,
+                Some((&principal.user.user_id, &request.managed_id)),
+            )
+            .await?;
+        Ok(managed_relation_summary(request.managed_id, relation))
+    }
+
+    pub(super) async fn managed_verification_subject(
         &self,
         principal: &Principal,
         id: &str,
         now_ms: u64,
     ) -> Result<(Principal, String), AccountError> {
+        self.managed_follow_subject(principal, id, now_ms, true)
+            .await
+    }
+
+    async fn managed_follow_subject(
+        &self,
+        principal: &Principal,
+        id: &str,
+        now_ms: u64,
+        require_enabled: bool,
+    ) -> Result<(Principal, String), AccountError> {
         if !valid_id(id) {
             return Err(error(Code::InvalidInput));
         }
-        let row = sqlx::query("SELECT m.follower_user_id,m.credential_id,u.username FROM venue_managed_credentials m JOIN venue_kol_profiles p ON p.kol_user_id=m.kol_user_id JOIN venue_users u ON u.user_id=m.follower_user_id WHERE m.managed_id=$1 AND m.kol_user_id=$2 AND p.profile_state='enabled' AND NOT u.login_enabled")
-            .bind(id).bind(&principal.user.user_id).fetch_optional(&self.pool).await.map_err(database_error)?.ok_or(error(Code::NotFound))?;
+        let row = sqlx::query("SELECT m.follower_user_id,m.credential_id,u.username FROM venue_managed_credentials m JOIN venue_kol_profiles p ON p.kol_user_id=m.kol_user_id JOIN venue_users u ON u.user_id=m.follower_user_id WHERE m.managed_id=$1 AND m.kol_user_id=$2 AND (NOT $3 OR p.profile_state='enabled') AND NOT u.login_enabled")
+            .bind(id).bind(&principal.user.user_id).bind(require_enabled).fetch_optional(&self.pool).await.map_err(database_error)?.ok_or(error(Code::NotFound))?;
         self.rate_limit(
             &format!("managed-verify:{}", principal.user.user_id),
             20,
             now_ms,
         )
         .await?;
-        // Internal scope is used solely by the existing read-only credential probe, never
-        // returned to a caller or installed as a login/session/selected trading account.
+        // Internal subjects never become login sessions. Trading lifecycle calls recheck
+        // managed ownership inside the same transaction as the relation and request audit.
         Ok((
             Principal {
                 user: UserSummary {
@@ -135,6 +223,44 @@ impl AccountService {
             },
             row.try_get("credential_id").map_err(database_error)?,
         ))
+    }
+}
+
+fn managed_settings(
+    settings: ManagedFollowRiskSettings,
+    credential_id: String,
+) -> FollowRiskSettings {
+    FollowRiskSettings {
+        credential_id,
+        sizing: settings.sizing,
+        allocated_capital: settings.allocated_capital,
+        multiplier: settings.multiplier,
+        max_order_notional: settings.max_order_notional,
+        max_total_notional: settings.max_total_notional,
+        max_deviation_bps: settings.max_deviation_bps,
+        allowed_symbols: settings.allowed_symbols,
+    }
+}
+
+fn managed_relation_summary(
+    managed_id: String,
+    relation: FollowRelationSummary,
+) -> ManagedFollowRelationSummary {
+    ManagedFollowRelationSummary {
+        managed_id,
+        relation_id: relation.relation_id,
+        state: relation.state,
+        revision: relation.revision,
+        settings: ManagedFollowRiskSettings {
+            sizing: relation.settings.sizing,
+            allocated_capital: relation.settings.allocated_capital,
+            multiplier: relation.settings.multiplier,
+            max_order_notional: relation.settings.max_order_notional,
+            max_total_notional: relation.settings.max_total_notional,
+            max_deviation_bps: relation.settings.max_deviation_bps,
+            allowed_symbols: relation.settings.allowed_symbols,
+        },
+        activation_requested: relation.activation_requested,
     }
 }
 

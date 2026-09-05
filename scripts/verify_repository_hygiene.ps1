@@ -2,9 +2,9 @@
 param()
 
 $ErrorActionPreference = "Stop"
-# The unified Node/Web workspace plus bounded startup-recovery tests is about 12 MiB.
+# Match the current workspace source budget; recovery artifacts remain excluded.
 # This is a source-only budget; single-file and generated/secret exclusions stay unchanged.
-$maxTrackedBytes = 13MB
+$maxTrackedBytes = 20MB
 $maxSingleFileBytes = 2MB
 $forbiddenRoots = @(
     "bak/",

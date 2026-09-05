@@ -21,8 +21,10 @@ use venue_control_protocol::{
         LeaderBotLifecycleRequest, MIRROR_ORDERS_PATH,
     },
     managed_followers::{
-        MANAGED_FOLLOWERS_PATH, MANAGED_VERIFY_PATH, ManagedFollowerCreateRequest,
-        ManagedFollowerVerifyRequest,
+        MANAGED_FOLLOW_LIFECYCLE_PATH, MANAGED_FOLLOW_SETTINGS_PATH, MANAGED_FOLLOW_STATUS_PATH,
+        MANAGED_FOLLOWERS_PATH, MANAGED_VERIFY_PATH, ManagedFollowLifecycleRequest,
+        ManagedFollowSettingsUpsertRequest, ManagedFollowStatusRequest,
+        ManagedFollowerCreateRequest, ManagedFollowerVerifyRequest,
     },
     terminal_position::{TERMINAL_POSITION_ACTION_PATH, TerminalPositionActionRequest},
 };
@@ -79,6 +81,9 @@ where
                 | LEADER_BOT_LIFECYCLE_PATH
                 | MIRROR_ORDERS_PATH
                 | MANAGED_FOLLOWERS_PATH
+                | MANAGED_FOLLOW_SETTINGS_PATH
+                | MANAGED_FOLLOW_STATUS_PATH
+                | MANAGED_FOLLOW_LIFECYCLE_PATH
                 | MANAGED_VERIFY_PATH
         )
     {
@@ -326,6 +331,33 @@ async fn account_request(
                 .verify_managed_follower(
                     &principal,
                     decode::<ManagedFollowerVerifyRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
+        (Method::Post, MANAGED_FOLLOW_SETTINGS_PATH) => encode(
+            &accounts
+                .upsert_managed_follow_settings(
+                    &principal,
+                    decode::<ManagedFollowSettingsUpsertRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
+        (Method::Post, MANAGED_FOLLOW_STATUS_PATH) => encode(
+            &accounts
+                .managed_follow_status(
+                    &principal,
+                    decode::<ManagedFollowStatusRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
+        (Method::Post, MANAGED_FOLLOW_LIFECYCLE_PATH) => encode(
+            &accounts
+                .request_managed_follow_lifecycle(
+                    &principal,
+                    decode::<ManagedFollowLifecycleRequest>(&request.body)?,
                     now,
                 )
                 .await?,

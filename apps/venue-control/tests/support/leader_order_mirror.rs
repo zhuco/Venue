@@ -216,6 +216,16 @@ async fn creation_waiting_for_admin_lock_observes_committed_revocation()
 #[tokio::test]
 async fn order_mirror_plans_once_and_revocation_cancels_only_definitely_unsent_children()
 -> Result<(), Box<dyn std::error::Error>> {
+    mirror_sizing_and_revocation(false).await
+}
+
+#[tokio::test]
+async fn fixed_notional_mirror_uses_persisted_sizing_and_keeps_reconciliation_fences()
+-> Result<(), Box<dyn std::error::Error>> {
+    mirror_sizing_and_revocation(true).await
+}
+
+async fn mirror_sizing_and_revocation(fixed: bool) -> Result<(), Box<dyn std::error::Error>> {
     let Some(url) = integration_database_url()? else {
         return Ok(());
     };
@@ -256,6 +266,10 @@ async fn order_mirror_plans_once_and_revocation_cancels_only_definitely_unsent_c
     )
     .await?;
     sqlx::query("UPDATE venue_kol_follow_relations SET baseline_json=jsonb_build_object('target_model',2,'baseline_ms',$1::bigint)").bind(i64::try_from(now-20)?).execute(&fixture.pool).await?;
+    if fixed {
+        sqlx::query("UPDATE venue_kol_follow_relations SET sizing_json='{\"mode\":\"fixed_notional\",\"notional\":\"5.5\"}'::jsonb")
+            .execute(&fixture.pool).await?;
+    }
     set_permission(&fixture.pool, &kol, true, 0, "fixture", now).await?;
     sqlx::query("INSERT INTO venue_leader_bots(bot_id,owner_user_id,trading_account_id,credential_id,create_request_id,bot_state,revision,permission_revision,started_ms,created_ms,updated_ms) VALUES ($1,$2,$3,$4,$1,'running',1,1,$5,$5,$5)").bind(&bot).bind(&kol).bind(&leader_account).bind(&leader_credential).bind(i64::try_from(now-10)?).execute(&fixture.pool).await?;
     let order = serde_json::json!({"client_order_id":"source-client","native_order_id":"123","symbol":"BTC/USDT","order_side":OrderSide::Buy,"position_side":PositionSide::Long,"quantity":"0.001","filled_quantity":"0","limit_price":"50000","post_only":true,"time_in_force":"post_only","reduce_only":false,"state":"new","created_ms":now-1});
@@ -300,6 +314,16 @@ async fn order_mirror_plans_once_and_revocation_cancels_only_definitely_unsent_c
             .fetch_one(&fixture.pool)
             .await?;
     assert_eq!(kind, "limit_post_only");
+    if fixed {
+        let quantities: Vec<String> =
+            sqlx::query_scalar("SELECT child_quantity FROM venue_order_mirrors")
+                .fetch_all(&fixture.pool)
+                .await?;
+        assert_eq!(quantities.len(), 2);
+        for quantity in quantities {
+            assert_eq!(quantity.parse::<Decimal>()?, Decimal::new(11, 5));
+        }
+    }
     venue_control::install_control_schema(&fixture.pool).await?;
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -398,7 +422,8 @@ async fn order_mirror_plans_once_and_revocation_cancels_only_definitely_unsent_c
     let retry:String=sqlx::query_scalar("SELECT command_id FROM venue_binance_commands WHERE command_phase='cancel' AND command_state='pending'").fetch_one(&fixture.pool).await?;
     assert_ne!(cancel, retry);
     // Emulate the next exact signed terminal fact; only this releases the drain.
-    sqlx::query("UPDATE venue_order_mirrors SET mirror_state='terminal',filled_quantity='0.0002' WHERE source_order_id='124'").execute(&fixture.pool).await?;
+    sqlx::query("UPDATE venue_order_mirrors SET mirror_state='terminal',filled_quantity=$1 WHERE source_order_id='124'")
+        .bind(if fixed { "0.00005" } else { "0.0002" }).execute(&fixture.pool).await?;
     sqlx::query("UPDATE venue_binance_commands SET command_state='reconciled',native_order_id='child-124',terminal_ms=$1 WHERE command_id=$2").bind(i64::try_from(test_now_ms()?)?).bind(&retry).execute(&fixture.pool).await?;
     wait_count(
         &fixture.pool,

@@ -1,5 +1,9 @@
 # VENUE 功能入口
 
+托管跟单设置：`accounts/follow_requests.rs`、`accounts/managed_followers.rs`、`managed_followers` 协议和迁移 `0033` 维护不可变托管绑定、作用域和请求幂等。Web `components/managed-follow-settings.tsx` 经 customer BFF 调用 `/v2/kol/managed-followers/follow/{status,settings,lifecycle}`，保存不自动启用。
+
+每账户数量模式：协议 `follow_sizing.rs`、迁移 `0032`、`order_mirror/planner.rs` 与 `components/follow-sizing-fields.tsx`；支持定比和定额，旧关系默认定比。
+
 托管 API 保存入口：`accounts/managed_followers.rs`、`managed_followers` 协议和 migration `0030`/`0031`；Web `components/managed-followers-panel.tsx` 经 customer BFF 调用 `/v2/kol/managed-followers` 与 `/verify`。只保存、列出掩码和手动验证，不创建交易任务。
 
 Binance 网格各层职责、目录和实际调用链见 [策略开发与运行结构](GRID_STRATEGY_ARCHITECTURE.md)。

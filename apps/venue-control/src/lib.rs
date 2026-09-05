@@ -114,6 +114,8 @@ pub const MIGRATION_0025: &str = include_str!("../migrations/0025_kol_market_con
 pub const MIGRATION_0026: &str = include_str!("../migrations/0026_kol_copy_risk.sql");
 pub const MIGRATION_0028: &str = include_str!("../migrations/0028_leader_order_mirror.sql");
 pub const MIGRATION_0031: &str = include_str!("../migrations/0031_managed_credential_store.sql");
+pub const MIGRATION_0032: &str = include_str!("../migrations/0032_follow_sizing.sql");
+pub const MIGRATION_0033: &str = include_str!("../migrations/0033_managed_follow_binding.sql");
 pub const MIGRATION_0030: &str = include_str!("../migrations/0030_managed_followers.sql");
 pub const MIGRATION_0029: &str = include_str!("../migrations/0029_mirror_gtc.sql");
 mod schema;

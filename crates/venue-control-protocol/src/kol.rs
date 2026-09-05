@@ -271,6 +271,8 @@ pub enum FollowLifecycleState {
 #[serde(deny_unknown_fields)]
 pub struct FollowRiskSettings {
     pub credential_id: String,
+    #[serde(default)]
+    pub sizing: crate::follow_sizing::FollowSizing,
     #[serde(with = "rust_decimal::serde::str")]
     pub allocated_capital: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
@@ -291,6 +293,7 @@ impl FollowRiskSettings {
             .map(ToString::to_string)
             .collect::<BTreeSet<_>>();
         if !canonical_id(&self.credential_id)
+            || !self.sizing.valid_for(self.max_order_notional)
             || !positive(self.allocated_capital)
             || !positive(self.multiplier)
             || !positive(self.max_order_notional)
@@ -456,11 +459,7 @@ impl TerminalOrderRequest {
                 }
             }
         }
-        if self.action.is_close()
-            != self
-                .close_quantity_cap
-                .is_some_and(|quantity| positive(quantity))
-        {
+        if self.action.is_close() != self.close_quantity_cap.is_some_and(positive) {
             return Err(KolProtocolError::TerminalOrder);
         }
         Ok(())
@@ -675,6 +674,7 @@ mod tests {
     fn settings() -> Result<FollowRiskSettings, Box<dyn std::error::Error>> {
         Ok(FollowRiskSettings {
             credential_id: ID_1.into(),
+            sizing: Default::default(),
             allocated_capital: Decimal::new(1_000, 0),
             multiplier: Decimal::ONE,
             max_order_notional: Decimal::new(100, 0),

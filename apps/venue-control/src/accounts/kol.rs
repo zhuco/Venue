@@ -196,7 +196,7 @@ impl AccountService {
     ) -> Result<FollowRelationSummary, AccountError> {
         let row = sqlx::query(
             "SELECT r.relation_id,r.relation_state,r.revision,r.credential_id,r.allocated_capital, \
-             r.multiplier,r.max_order_notional,r.max_total_notional,r.max_deviation_bps,r.allowed_symbols, \
+             r.multiplier,r.max_order_notional,r.max_total_notional,r.max_deviation_bps,r.allowed_symbols,r.sizing_json, \
              EXISTS(SELECT 1 FROM venue_kol_activation_requests a WHERE a.relation_id=r.relation_id \
              AND a.request_state='pending') AS activation_requested \
              FROM venue_kol_follow_relations r WHERE r.follower_user_id=$1",
@@ -215,6 +215,17 @@ impl AccountService {
         request: FollowSettingsUpsertRequest,
         now_ms: u64,
     ) -> Result<FollowRelationSummary, AccountError> {
+        self.upsert_follow_settings_scoped(principal, request, now_ms, None)
+            .await
+    }
+
+    pub(super) async fn upsert_follow_settings_scoped(
+        &self,
+        principal: &Principal,
+        request: FollowSettingsUpsertRequest,
+        now_ms: u64,
+        managed: Option<(&str, &str)>,
+    ) -> Result<FollowRelationSummary, AccountError> {
         request.validate().map_err(|_| error(Code::InvalidInput))?;
         self.rate_limit(
             &format!("follow-settings:{}", principal.user.user_id),
@@ -223,6 +234,25 @@ impl AccountService {
         )
         .await?;
         let mut tx = self.pool.begin().await.map_err(database_error)?;
+        super::follow_requests::lock_scope(
+            &mut tx,
+            principal,
+            managed,
+            true,
+            Some(&request.settings.credential_id),
+            now_ms,
+        )
+        .await?;
+        let actor = managed
+            .map(|scope| scope.0)
+            .unwrap_or(&principal.user.user_id);
+        let hash = super::follow_requests::digest("settings", &request)?;
+        if let Some(prior) =
+            super::follow_requests::replay(&mut tx, principal, actor, &request.request_id, &hash)
+                .await?
+        {
+            return Ok(prior);
+        }
         let existing = sqlx::query(
             "SELECT relation_id,relation_state,revision FROM venue_kol_follow_relations \
              WHERE follower_user_id=$1 FOR UPDATE",
@@ -276,8 +306,8 @@ impl AccountService {
                 }
                 let relation_id = crypto::opaque_id()?;
                 sqlx::query(
-                    "INSERT INTO venue_kol_follow_relations (relation_id,follower_user_id,kol_user_id,leader_trading_account_id,follower_trading_account_id,credential_id,relation_state,allocated_capital,multiplier,max_order_notional,max_total_notional,max_deviation_bps,allowed_symbols,revision,created_ms,updated_ms) \
-                     VALUES ($1,$2,$3,$4,$5,$6,'paused',$7,$8,$9,$10,$11,$12,1,$13,$13)",
+                    "INSERT INTO venue_kol_follow_relations (relation_id,follower_user_id,kol_user_id,leader_trading_account_id,follower_trading_account_id,credential_id,relation_state,allocated_capital,multiplier,max_order_notional,max_total_notional,max_deviation_bps,allowed_symbols,revision,created_ms,updated_ms,sizing_json) \
+                     VALUES ($1,$2,$3,$4,$5,$6,'paused',$7,$8,$9,$10,$11,$12,1,$13,$13,$14)",
                 )
                 .bind(&relation_id)
                 .bind(&principal.user.user_id)
@@ -292,6 +322,7 @@ impl AccountService {
                 .bind(i32::try_from(request.settings.max_deviation_bps).map_err(|_| error(Code::InvalidInput))?)
                 .bind(allowed_symbols)
                 .bind(ms(now_ms)?)
+                .bind(serde_json::to_value(request.settings.sizing).map_err(|_| error(Code::InvalidInput))?)
                 .execute(&mut *tx)
                 .await
                 .map_err(database_error)?;
@@ -314,7 +345,7 @@ impl AccountService {
                     "UPDATE venue_kol_follow_relations SET kol_user_id=$1,leader_trading_account_id=$2, \
                      follower_trading_account_id=$3,credential_id=$4,allocated_capital=$5,multiplier=$6, \
                      max_order_notional=$7,max_total_notional=$8,max_deviation_bps=$9,allowed_symbols=$10, \
-                     revision=$11,updated_ms=$12 WHERE relation_id=$13",
+                     revision=$11,updated_ms=$12,sizing_json=$14 WHERE relation_id=$13",
                 )
                 .bind(binding.try_get::<String, _>("kol_user_id").map_err(database_error)?)
                 .bind(&leader_account)
@@ -329,6 +360,7 @@ impl AccountService {
                 .bind(next)
                 .bind(ms(now_ms)?)
                 .bind(&relation_id)
+                .bind(serde_json::to_value(request.settings.sizing).map_err(|_| error(Code::InvalidInput))?)
                 .execute(&mut *tx)
                 .await
                 .map_err(database_error)?;
@@ -349,8 +381,19 @@ impl AccountService {
                 query_follow_relation(&mut tx, &relation_id).await?
             }
         };
+        let summary = follow_relation_summary(&row)?;
+        super::follow_requests::save(
+            &mut tx,
+            principal,
+            actor,
+            &request.request_id,
+            &hash,
+            &summary,
+            now_ms,
+        )
+        .await?;
         tx.commit().await.map_err(database_error)?;
-        follow_relation_summary(&row)
+        Ok(summary)
     }
 
     pub async fn request_follow_lifecycle(
@@ -358,6 +401,17 @@ impl AccountService {
         principal: &Principal,
         request: FollowLifecycleRequest,
         now_ms: u64,
+    ) -> Result<FollowRelationSummary, AccountError> {
+        self.request_follow_lifecycle_scoped(principal, request, now_ms, None)
+            .await
+    }
+
+    pub(super) async fn request_follow_lifecycle_scoped(
+        &self,
+        principal: &Principal,
+        request: FollowLifecycleRequest,
+        now_ms: u64,
+        managed: Option<(&str, &str)>,
     ) -> Result<FollowRelationSummary, AccountError> {
         request.validate().map_err(|_| error(Code::InvalidInput))?;
         self.rate_limit(
@@ -369,9 +423,28 @@ impl AccountService {
         let expected =
             i64::try_from(request.expected_revision).map_err(|_| error(Code::InvalidInput))?;
         let mut tx = self.pool.begin().await.map_err(database_error)?;
+        super::follow_requests::lock_scope(
+            &mut tx,
+            principal,
+            managed,
+            request.action == FollowLifecycleAction::Activate,
+            None,
+            now_ms,
+        )
+        .await?;
+        let actor = managed
+            .map(|scope| scope.0)
+            .unwrap_or(&principal.user.user_id);
+        let hash = super::follow_requests::digest("lifecycle", &request)?;
+        if let Some(prior) =
+            super::follow_requests::replay(&mut tx, principal, actor, &request.request_id, &hash)
+                .await?
+        {
+            return Ok(prior);
+        }
         let row = sqlx::query(
             "SELECT relation_id,relation_state,revision,credential_id,allocated_capital,multiplier, \
-             max_order_notional,max_total_notional,max_deviation_bps,allowed_symbols \
+             max_order_notional,max_total_notional,max_deviation_bps,allowed_symbols,sizing_json \
              FROM venue_kol_follow_relations WHERE relation_id=$1 AND follower_user_id=$2 FOR UPDATE",
         )
         .bind(&request.relation_id)
@@ -433,9 +506,20 @@ impl AccountService {
                     .map_err(database_error)?;
             }
         }
-        let summary = query_follow_relation(&mut tx, &relation_id).await?;
+        let summary =
+            follow_relation_summary(&query_follow_relation(&mut tx, &relation_id).await?)?;
+        super::follow_requests::save(
+            &mut tx,
+            principal,
+            actor,
+            &request.request_id,
+            &hash,
+            &summary,
+            now_ms,
+        )
+        .await?;
         tx.commit().await.map_err(database_error)?;
-        follow_relation_summary(&summary)
+        Ok(summary)
     }
 
     pub async fn terminal_account_projection(
@@ -512,7 +596,7 @@ async fn query_follow_relation(
 ) -> Result<PgRow, AccountError> {
     sqlx::query(
         "SELECT r.relation_id,r.relation_state,r.revision,r.credential_id,r.allocated_capital, \
-         r.multiplier,r.max_order_notional,r.max_total_notional,r.max_deviation_bps,r.allowed_symbols, \
+         r.multiplier,r.max_order_notional,r.max_total_notional,r.max_deviation_bps,r.allowed_symbols,r.sizing_json, \
          EXISTS(SELECT 1 FROM venue_kol_activation_requests a WHERE a.relation_id=r.relation_id \
          AND a.request_state='pending') AS activation_requested \
          FROM venue_kol_follow_relations r WHERE r.relation_id=$1",
@@ -562,6 +646,8 @@ fn follow_relation_settings(row: &PgRow) -> Result<FollowRiskSettings, AccountEr
             .map_err(|_| error(Code::Unavailable))
     };
     Ok(FollowRiskSettings {
+        sizing: serde_json::from_value(row.try_get("sizing_json").map_err(database_error)?)
+            .map_err(|_| error(Code::Unavailable))?,
         credential_id: row.try_get("credential_id").map_err(database_error)?,
         allocated_capital: decimal("allocated_capital")?,
         multiplier: decimal("multiplier")?,
@@ -709,6 +795,7 @@ mod tests {
             )
             .await?;
         let settings = FollowRiskSettings {
+            sizing: Default::default(),
             credential_id: credential.credential_id.clone(),
             allocated_capital: Decimal::new(100, 0),
             multiplier: Decimal::ONE,

@@ -1,4 +1,5 @@
 use rust_decimal::Decimal;
+use venue_control_protocol::follow_sizing::FollowSizing;
 use venue_control_protocol::kol::TerminalOpenOrder;
 use venue_domain::{OrderSide, PositionSide};
 
@@ -53,12 +54,29 @@ pub(super) fn replacement_quantity(
     allocated: Decimal,
     capital: Decimal,
     multiplier: Decimal,
+    sizing: FollowSizing,
     prior_filled: Decimal,
 ) -> Result<Decimal, BinanceCommandLedgerError> {
     if prior_filled < Decimal::ZERO {
         return Err(BinanceCommandLedgerError::Conflict);
     }
-    let scaled = scaled_copy_quantity(order.quantity, allocated, capital, multiplier)?;
+    let scaled = match sizing {
+        FollowSizing::Proportional => {
+            scaled_copy_quantity(order.quantity, allocated, capital, multiplier)?
+        }
+        FollowSizing::FixedNotional { notional } => {
+            let price = order
+                .limit_price
+                .filter(|price| *price > Decimal::ZERO)
+                .ok_or(BinanceCommandLedgerError::Conflict)?;
+            if notional <= Decimal::ZERO {
+                return Err(BinanceCommandLedgerError::Conflict);
+            }
+            notional
+                .checked_div(price)
+                .ok_or(BinanceCommandLedgerError::Conflict)?
+        }
+    };
     Ok(scaled
         .checked_sub(prior_filled)
         .ok_or(BinanceCommandLedgerError::Conflict)?
@@ -117,6 +135,7 @@ mod tests {
                 Decimal::ONE,
                 Decimal::from(2),
                 Decimal::ONE,
+                FollowSizing::Proportional,
                 Decimal::ZERO
             )?,
             Decimal::from(5)
@@ -136,6 +155,7 @@ mod tests {
                 Decimal::ONE,
                 Decimal::ONE,
                 Decimal::ONE,
+                FollowSizing::Proportional,
                 Decimal::from(3)
             )?,
             Decimal::ONE
@@ -146,6 +166,7 @@ mod tests {
                 Decimal::ONE,
                 Decimal::ONE,
                 Decimal::ONE,
+                FollowSizing::Proportional,
                 Decimal::from(6)
             )?,
             Decimal::ZERO
@@ -162,6 +183,35 @@ mod tests {
         assert!(!reducing(&source));
         source.order_side = OrderSide::Buy;
         assert!(reducing(&source));
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_notional_ignores_source_size_and_multiplier_but_subtracts_own_fills()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut source = order()?;
+        let sizing = FollowSizing::FixedNotional {
+            notional: Decimal::new(55, 1),
+        };
+        let quantity = |order: &TerminalOpenOrder, filled| {
+            replacement_quantity(
+                order,
+                Decimal::from(999),
+                Decimal::ONE,
+                Decimal::from(7),
+                sizing,
+                filled,
+            )
+        };
+        assert_eq!(quantity(&source, Decimal::ZERO)?, Decimal::new(55, 3));
+        source.quantity = Decimal::from(20);
+        source.filled_quantity = Some(Decimal::from(4));
+        assert_eq!(quantity(&source, Decimal::ZERO)?, Decimal::new(55, 3));
+        source.limit_price = Some(Decimal::from(50));
+        assert_eq!(quantity(&source, Decimal::new(55, 3))?, Decimal::new(55, 3));
+        assert_eq!(quantity(&source, Decimal::ONE)?, Decimal::ZERO);
+        source.limit_price = Some(Decimal::ZERO);
+        assert!(quantity(&source, Decimal::ZERO).is_err());
         Ok(())
     }
 }

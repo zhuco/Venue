@@ -108,3 +108,17 @@ test("managed list and verification disclose only the narrow summary", () => {
   assert.deepEqual(customerPublicValue("managed-followers","GET",{can_manage:false,accounts:[raw],token:"secret"}),{can_manage:false,accounts:[clean]});
   assert.equal(JSON.stringify(clean).includes("secret"),false);
 });
+
+test("managed sizing responses preserve each mode without leaking internal credentials", () => {
+  const settings = { sizing: { mode:"fixed_notional", notional:"5.5", api_secret:"hidden" }, allocated_capital:"55", multiplier:"1", max_order_notional:"5.5", max_total_notional:"55", max_deviation_bps:100, allowed_symbols:["DASH/USDT"], credential_id:"hidden" };
+  for (const action of ["managed-settings", "managed-follow", "managed-status"]) {
+    const raw = { managed_id:"one", relation_id:"relation", state:"paused", revision:1, activation_requested:false, settings, follower_user_id:"hidden" };
+    const clean = customerPublicValue(action,"POST",raw) as {settings: {sizing: object}};
+    assert.deepEqual(clean.settings.sizing,{mode:"fixed_notional",notional:"5.5"});
+    assert.equal(JSON.stringify(clean).includes("hidden"),false);
+    const proportional = customerPublicValue(action,"POST",{...raw,settings:{...settings,sizing:{mode:"proportional"}}}) as typeof clean;
+    assert.deepEqual(proportional.settings.sizing,{mode:"proportional"});
+    assert.equal(customerPublicValue(action,"POST",null),null);
+    assert.throws(()=>customerPublicValue(action,"POST",{...raw,settings:{...settings,sizing:{mode:"unexpected"}}}));
+  }
+});

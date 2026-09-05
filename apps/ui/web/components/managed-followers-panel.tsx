@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { api, messages, RequestError } from "@/lib/customer-api";
+import { ManagedFollowSettingsPanel } from "./managed-follow-settings";
 
 type Account = { managed_id: string; label: string; masked_key: string; verification: string; verified_ms: number | null };
 type Overview = { can_manage: boolean; accounts: Account[] };
@@ -68,7 +69,7 @@ export function ManagedFollowersPanel({ csrf }: { csrf: string }) {
     {notice && <p role="status" className="notice">{notice}</p>}
     <div className="buttons"><button className="primary" disabled={busy || !overview?.can_manage || overview.accounts.length >= 200} onClick={() => { setRows([draft()]); dialog.current?.showModal(); }}>添加托管 API Key</button><button disabled={busy} onClick={() => void refresh()}>刷新托管账户</button></div>
     {overview?.accounts.length === 0 && <p className="muted">尚未添加托管账户。点击上方按钮开始保存。</p>}
-    {overview && overview.accounts.length > 0 && <div className="table"><table><thead><tr><th>账户标签</th><th>API Key</th><th>验证状态</th><th>跟单</th><th>操作</th></tr></thead><tbody>{overview.accounts.map(account => <tr key={account.managed_id}><td>{account.label}</td><td>{account.masked_key}</td><td>{verification[account.verification] ?? "状态未知"}</td><td>未启用</td><td><button disabled={busy || !overview.can_manage} onClick={() => void verify(account)}>验证权限</button></td></tr>)}</tbody></table></div>}
+    {overview && overview.accounts.length > 0 && <div className="table"><table><thead><tr><th>账户标签</th><th>API Key</th><th>验证状态</th><th>跟单</th><th>操作</th></tr></thead><tbody>{overview.accounts.map(account => <tr key={account.managed_id}><td>{account.label}</td><td>{account.masked_key}</td><td>{verification[account.verification] ?? "状态未知"}</td><td><ManagedFollowSettingsPanel managedId={account.managed_id} label={account.label} csrf={csrf} canManage={overview.can_manage} /></td><td><button disabled={busy || !overview.can_manage} onClick={() => void verify(account)}>验证权限</button></td></tr>)}</tbody></table></div>}
     <dialog ref={dialog} className="managed-dialog" aria-labelledby="managed-title" onCancel={event => { event.preventDefault(); close(); }}>
       <h2 id="managed-title">添加托管 API Key</h2><p>填写标签、API Key 和 API Secret。支持一次添加多个账户，最多 10 个。</p>
       <p className="muted">仅支持 Binance Portfolio Margin · UM · 双向持仓；开启读取及 UM 交易权限，关闭提现。密钥加密保存后只显示掩码。</p>
