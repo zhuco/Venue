@@ -1792,7 +1792,7 @@ mod tests {
         let (config, instrument) = limit_config_and_instrument()?;
         let skewed = crate::OkxHttpResponse {
             body: bytes::Bytes::from_static(
-                br#"{"code":"0","data":[{"instId":"BTC-USDT-SWAP","bids":[["60000.09","20","0","3"]],"asks":[["60000.19","15","0","2"]],"ts":"10020"}]}"#,
+                br#"{"code":"0","data":[{"bids":[["60000.09","20","0","3"]],"asks":[["60000.19","15","0","2"]],"ts":"10020"}]}"#,
             ),
             ..limit_bbo(&config)
         };
@@ -1800,7 +1800,7 @@ mod tests {
 
         let excessive = crate::OkxHttpResponse {
             body: bytes::Bytes::from_static(
-                br#"{"code":"0","data":[{"instId":"BTC-USDT-SWAP","bids":[["60000.09","20","0","3"]],"asks":[["60000.19","15","0","2"]],"ts":"10261"}]}"#,
+                br#"{"code":"0","data":[{"bids":[["60000.09","20","0","3"]],"asks":[["60000.19","15","0","2"]],"ts":"10261"}]}"#,
             ),
             ..limit_bbo(&config)
         };

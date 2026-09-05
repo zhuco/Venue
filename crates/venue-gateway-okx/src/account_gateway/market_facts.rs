@@ -21,7 +21,6 @@ pub(super) enum LimitBboFailure {
     Decode,
     VenueCode,
     RowCount,
-    Scope,
     ExchangeTime,
     Book,
 }
@@ -33,7 +32,6 @@ impl LimitBboFailure {
             Self::Decode => "strategy_okx_bbo_decode",
             Self::VenueCode => "strategy_okx_bbo_venue_code",
             Self::RowCount => "strategy_okx_bbo_row_count",
-            Self::Scope => "strategy_okx_bbo_scope",
             Self::ExchangeTime => "strategy_okx_bbo_exchange_time",
             Self::Book => "strategy_okx_bbo_book",
         }
@@ -50,7 +48,6 @@ struct OkxLimitBboEnvelope {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OkxLimitBboRow {
-    inst_id: String,
     bids: Vec<Vec<String>>,
     asks: Vec<Vec<String>>,
     ts: String,
@@ -78,9 +75,8 @@ pub(super) fn parse_limit_bbo_detailed(
     let [row] = envelope.data.as_slice() else {
         return Err(LimitBboFailure::RowCount);
     };
-    if row.inst_id != instrument.native_id() {
-        return Err(LimitBboFailure::Scope);
-    }
+    // This REST response does not echo instId. Scope is carried by the exact request-bound
+    // response binding and instrument generation checked above.
     let exchange_time_ms = row
         .ts
         .parse::<u64>()
