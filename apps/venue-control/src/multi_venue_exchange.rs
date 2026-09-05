@@ -123,15 +123,15 @@ impl StrategyGateway {
                 .map_err(|error| error.to_string()),
         }
     }
-    pub(crate) fn bybit_funding(
+    pub(crate) fn bybit_funding_detailed(
         &mut self,
         query: &venue_gateway_bybit::BybitFundingQuery,
-    ) -> Result<venue_gateway_bybit::BybitFundingReadback, StrategyExchangeError> {
+    ) -> Result<venue_gateway_bybit::BybitFundingReadback, String> {
         match self {
             Self::Bybit(gateway) => gateway
                 .settled_funding(query)
-                .map_err(|_| StrategyExchangeError),
-            _ => Err(StrategyExchangeError),
+                .map_err(|error| error.to_string()),
+            _ => Err("funding readback is available only for Bybit".to_owned()),
         }
     }
     /// Called only inside a bounded blocking worker: the existing adapters own their synchronous
