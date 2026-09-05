@@ -193,7 +193,8 @@ fn one_catalogue_binds_two_canonical_symbols_without_cross_route()
 }
 
 #[test]
-fn empty_symbol_set_loads_all_supported_linear_perpetuals() -> Result<(), Box<dyn std::error::Error>>
+fn empty_symbol_set_loads_supported_linear_perpetuals_and_skips_noncanonical_assets()
+-> Result<(), Box<dyn std::error::Error>>
 {
     let (_, _, binding) = limit_fixture()?;
     let catalogue = parse_rules_catalog(MIXED_EXCHANGE_INFO, &binding, &BTreeSet::new(), 18)?;
