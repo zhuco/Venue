@@ -1084,16 +1084,14 @@ async fn fetch_account_wide_snapshot(
         .fetch_usd_m_exchange_info()
         .await
         .map_err(|_| stage("exchange_info_read"))?;
-    let catalogue = str::from_utf8(&catalogue.payload)
-        .map_err(|_| stage("exchange_info_utf8"))?;
+    let catalogue = str::from_utf8(&catalogue.payload).map_err(|_| stage("exchange_info_utf8"))?;
     let account_config =
         signed_snapshot_page(transport, credentials, build_account_config_request(&scope))
             .await
             .map_err(|_| stage("account_config_read"))?;
-    let account =
-        signed_snapshot_page(transport, credentials, build_account_request(&scope))
-            .await
-            .map_err(|_| stage("account_read"))?;
+    let account = signed_snapshot_page(transport, credentials, build_account_request(&scope))
+        .await
+        .map_err(|_| stage("account_read"))?;
     let position_mode =
         signed_snapshot_page(transport, credentials, build_position_mode_request(&scope))
             .await
@@ -1119,11 +1117,11 @@ async fn fetch_account_wide_snapshot(
     )
     .await
     .map_err(|_| stage("algo_orders_read"))?;
-    let account_config = str::from_utf8(&account_config.payload)
-        .map_err(|_| stage("account_config_utf8"))?;
+    let account_config =
+        str::from_utf8(&account_config.payload).map_err(|_| stage("account_config_utf8"))?;
     let balances = snapshot_balances(&account.payload).map_err(|_| stage("balances_normalize"))?;
-    let position_mode = str::from_utf8(&position_mode.payload)
-        .map_err(|_| stage("position_mode_utf8"))?;
+    let position_mode =
+        str::from_utf8(&position_mode.payload).map_err(|_| stage("position_mode_utf8"))?;
     let capabilities = crate::portfolio::capabilities(account_config, position_mode)
         .map_err(|_| stage("capabilities_parse"))?;
     if !capabilities.can_trade || !capabilities.hedge_position || capabilities.one_way_position {
@@ -1134,15 +1132,15 @@ async fn fetch_account_wide_snapshot(
         json_rows_snapshot(&positions.payload).map_err(|_| stage("positions_rows"))?;
     let regular_rows =
         json_rows_snapshot(&regular.payload).map_err(|_| stage("regular_orders_rows"))?;
-    let algo_rows =
-        json_rows_snapshot(&algo.payload).map_err(|_| stage("algo_orders_rows"))?;
+    let algo_rows = json_rows_snapshot(&algo.payload).map_err(|_| stage("algo_orders_rows"))?;
     if !account_wide_order_rows_are_complete(&regular_rows, &algo_rows) {
         return Err(stage("orders_collection_complete"));
     }
     let position_facts = snapshot_position_facts(catalogue, &position_rows, private_generation)
         .map_err(|_| stage("positions_normalize"))?;
-    let order_facts = snapshot_order_facts(catalogue, &regular_rows, &algo_rows, private_generation)
-        .map_err(|_| stage("orders_normalize"))?;
+    let order_facts =
+        snapshot_order_facts(catalogue, &regular_rows, &algo_rows, private_generation)
+            .map_err(|_| stage("orders_normalize"))?;
     let previous_fills = parse_snapshot_fills_cursor(recovery.previous_fills_cursor())
         .map_err(|_| stage("fills_cursor_parse"))?;
     let fill_symbols = snapshot_fill_symbols(
@@ -1165,10 +1163,9 @@ async fn fetch_account_wide_snapshot(
     })
     .await
     .map_err(|_| stage("fills_collect"))?;
-    let unknown_results =
-        snapshot_unknown_results(transport, credentials, &scope, recovery)
-            .await
-            .map_err(|_| stage("unknown_results"))?;
+    let unknown_results = snapshot_unknown_results(transport, credentials, &scope, recovery)
+        .await
+        .map_err(|_| stage("unknown_results"))?;
     SignedAccountSnapshot::complete_with_fills(
         config.gateway_binding().clone(),
         observed_at_ms,
