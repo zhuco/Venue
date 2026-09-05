@@ -33,6 +33,24 @@ pub struct StrategyAccountProbe {
     pub unknown_results: Vec<SignedUnknownFact>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum StrategyProbeError {
+    #[error("strategy probe binding rejected")]
+    Binding,
+    #[error("strategy probe network slot unavailable")]
+    NetworkSlot,
+    #[error("strategy probe gateway connection rejected")]
+    Connect,
+    #[error("strategy probe signed identity rejected")]
+    Identity,
+    #[error("strategy probe permissions rejected")]
+    Permissions,
+    #[error("strategy probe complete snapshot rejected")]
+    Snapshot,
+    #[error("strategy probe worker unavailable")]
+    Worker,
+}
+
 pub(crate) fn identity_hash(venue: VenueId, identity: &str) -> Vec<u8> {
     let mut hash = Sha256::new();
     hash.update(venue.as_str().as_bytes());
@@ -60,23 +78,30 @@ async fn verified_snapshot(
     account: &str,
     symbol: Symbol,
     credentials: StrategyCredentials,
-) -> Result<(VenueId, String, SignedAccountSnapshot), StrategyExchangeError> {
+) -> Result<(VenueId, String, SignedAccountSnapshot), StrategyProbeError> {
     let venue = credentials.venue();
     let binding = GatewayBinding::new(venue, GatewayMode::Live, account, symbol)
-        .map_err(|_| StrategyExchangeError)?;
+        .map_err(|_| StrategyProbeError::Binding)?;
     let _slot = crate::multi_venue_runtime::ACCOUNT_NETWORK_SLOTS
         .acquire()
         .await
-        .map_err(|_| StrategyExchangeError)?;
+        .map_err(|_| StrategyProbeError::NetworkSlot)?;
     tokio::task::spawn_blocking(move || {
-        let mut gateway = StrategyGateway::connect(binding.clone(), credentials, 1)?;
-        let identity = gateway.identity()?;
-        gateway.verify_permissions()?;
-        let snapshot = gateway.snapshot(&binding)?;
-        Ok((venue, identity, snapshot))
+        let mut gateway = StrategyGateway::connect(binding.clone(), credentials, 1)
+            .map_err(|_| StrategyProbeError::Connect)?;
+        let identity = gateway
+            .identity()
+            .map_err(|_| StrategyProbeError::Identity)?;
+        gateway
+            .verify_permissions()
+            .map_err(|_| StrategyProbeError::Permissions)?;
+        let snapshot = gateway
+            .snapshot(&binding)
+            .map_err(|_| StrategyProbeError::Snapshot)?;
+        Ok::<_, StrategyProbeError>((venue, identity, snapshot))
     })
     .await
-    .map_err(|_| StrategyExchangeError)?
+    .map_err(|_| StrategyProbeError::Worker)?
 }
 
 /// Performs the exact signed read and permission checks used by `bind`, without writing the
@@ -85,7 +110,7 @@ pub async fn probe_strategy_account(
     account: &str,
     symbol: Symbol,
     credentials: StrategyCredentials,
-) -> Result<StrategyAccountProbe, StrategyExchangeError> {
+) -> Result<StrategyAccountProbe, StrategyProbeError> {
     let (venue, identity, snapshot) = verified_snapshot(account, symbol, credentials).await?;
     Ok(StrategyAccountProbe {
         venue,
@@ -287,8 +312,9 @@ impl StrategyCredentialStore {
             Zeroizing::new(serde_json::to_vec(&credentials).map_err(|_| StrategyExchangeError)?);
         let key_fingerprint = identity_hash(venue, credentials.key_identity());
         let masked_key = "••••".to_owned();
-        let (_, native_identity, snapshot) =
-            verified_snapshot(account, symbol, credentials).await?;
+        let (_, native_identity, snapshot) = verified_snapshot(account, symbol, credentials)
+            .await
+            .map_err(|_| StrategyExchangeError)?;
         // Both admission paths require the old order network to be gone. Released accounts may
         // retain signed inventory; the new grid derives its own orders from those positions.
         let has_exposure = snapshot.positions().iter().any(|p| !p.quantity.is_zero());
