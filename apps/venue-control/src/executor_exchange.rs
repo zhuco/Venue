@@ -1256,7 +1256,10 @@ impl BinanceActivationBaseline for BinanceExecutionRouter {
         let limits = self.limits;
         let probe = venue_gateway_binance::probe_credentials(&credentials)
             .await
-            .map_err(|_| BinanceExecutionError::Unavailable)?;
+            .map_err(|error| {
+                tracing::warn!(stage = "credential_probe", %error, "Binance KOL activation baseline failed");
+                BinanceExecutionError::Unavailable
+            })?;
         tokio::task::spawn_blocking(move || {
             let mut gateway = BinanceAccountGateway::connect_with_credentials_for_symbols(
                 binding,
@@ -1264,10 +1267,16 @@ impl BinanceActivationBaseline for BinanceExecutionRouter {
                 credentials,
                 limits,
             )
-            .map_err(|_| BinanceExecutionError::Unavailable)?;
+            .map_err(|error| {
+                tracing::warn!(stage = "gateway_connect", %error, "Binance KOL activation baseline failed");
+                BinanceExecutionError::Unavailable
+            })?;
             let snapshot = gateway
                 .signed_projection_snapshot(None)
-                .map_err(|_| BinanceExecutionError::Unavailable)?;
+                .map_err(|error| {
+                    tracing::warn!(stage = "signed_projection", %error, "Binance KOL activation baseline failed");
+                    BinanceExecutionError::Unavailable
+                })?;
             Ok(AccountBaseline {
                 account_identity_hash: probe.account_identity_hash,
                 snapshot,

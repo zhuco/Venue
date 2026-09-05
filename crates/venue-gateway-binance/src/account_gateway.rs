@@ -1059,6 +1059,7 @@ struct BinanceSnapshotCollection<'a> {
 async fn fetch_account_wide_snapshot(
     request: BinanceSnapshotCollection<'_>,
 ) -> Result<SignedAccountSnapshot, AccountHostValidationError> {
+    let stage = AccountHostValidationError::SignedSnapshotStage;
     let BinanceSnapshotCollection {
         transport,
         credentials,
@@ -1070,7 +1071,7 @@ async fn fetch_account_wide_snapshot(
         attempt_id,
         recovery,
     } = request;
-    let observed_at_ms = now_ms().map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+    let observed_at_ms = now_ms().map_err(|_| stage("clock_start"))?;
     let scope = BinancePrivateReadScope::new(
         config,
         selected_rules,
@@ -1078,65 +1079,80 @@ async fn fetch_account_wide_snapshot(
         attempt_id,
         observed_at_ms,
     )
-    .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+    .map_err(|_| stage("scope"))?;
     let catalogue = transport
         .fetch_usd_m_exchange_info()
         .await
-        .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+        .map_err(|_| stage("exchange_info_read"))?;
     let catalogue = str::from_utf8(&catalogue.payload)
-        .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+        .map_err(|_| stage("exchange_info_utf8"))?;
     let account_config =
-        signed_snapshot_page(transport, credentials, build_account_config_request(&scope)).await?;
+        signed_snapshot_page(transport, credentials, build_account_config_request(&scope))
+            .await
+            .map_err(|_| stage("account_config_read"))?;
     let account =
-        signed_snapshot_page(transport, credentials, build_account_request(&scope)).await?;
+        signed_snapshot_page(transport, credentials, build_account_request(&scope))
+            .await
+            .map_err(|_| stage("account_read"))?;
     let position_mode =
-        signed_snapshot_page(transport, credentials, build_position_mode_request(&scope)).await?;
+        signed_snapshot_page(transport, credentials, build_position_mode_request(&scope))
+            .await
+            .map_err(|_| stage("position_mode_read"))?;
     let positions = signed_snapshot_page(
         transport,
         credentials,
         build_account_wide_positions_request(&scope),
     )
-    .await?;
+    .await
+    .map_err(|_| stage("positions_read"))?;
     let regular = signed_snapshot_page(
         transport,
         credentials,
         build_account_wide_regular_orders_request(&scope),
     )
-    .await?;
+    .await
+    .map_err(|_| stage("regular_orders_read"))?;
     let algo = signed_snapshot_page(
         transport,
         credentials,
         build_account_wide_algo_orders_request(&scope),
     )
-    .await?;
+    .await
+    .map_err(|_| stage("algo_orders_read"))?;
     let account_config = str::from_utf8(&account_config.payload)
-        .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-    let balances = snapshot_balances(&account.payload)?;
+        .map_err(|_| stage("account_config_utf8"))?;
+    let balances = snapshot_balances(&account.payload).map_err(|_| stage("balances_normalize"))?;
     let position_mode = str::from_utf8(&position_mode.payload)
-        .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+        .map_err(|_| stage("position_mode_utf8"))?;
     let capabilities = crate::portfolio::capabilities(account_config, position_mode)
-        .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+        .map_err(|_| stage("capabilities_parse"))?;
     if !capabilities.can_trade || !capabilities.hedge_position || capabilities.one_way_position {
-        return Err(AccountHostValidationError::SignedSnapshot);
+        return Err(stage("capabilities_value"));
     }
 
-    let position_rows = json_rows_snapshot(&positions.payload)?;
-    let regular_rows = json_rows_snapshot(&regular.payload)?;
-    let algo_rows = json_rows_snapshot(&algo.payload)?;
+    let position_rows =
+        json_rows_snapshot(&positions.payload).map_err(|_| stage("positions_rows"))?;
+    let regular_rows =
+        json_rows_snapshot(&regular.payload).map_err(|_| stage("regular_orders_rows"))?;
+    let algo_rows =
+        json_rows_snapshot(&algo.payload).map_err(|_| stage("algo_orders_rows"))?;
     if !account_wide_order_rows_are_complete(&regular_rows, &algo_rows) {
-        return Err(AccountHostValidationError::SignedSnapshot);
+        return Err(stage("orders_collection_complete"));
     }
-    let position_facts = snapshot_position_facts(catalogue, &position_rows, private_generation)?;
-    let order_facts =
-        snapshot_order_facts(catalogue, &regular_rows, &algo_rows, private_generation)?;
-    let previous_fills = parse_snapshot_fills_cursor(recovery.previous_fills_cursor())?;
+    let position_facts = snapshot_position_facts(catalogue, &position_rows, private_generation)
+        .map_err(|_| stage("positions_normalize"))?;
+    let order_facts = snapshot_order_facts(catalogue, &regular_rows, &algo_rows, private_generation)
+        .map_err(|_| stage("orders_normalize"))?;
+    let previous_fills = parse_snapshot_fills_cursor(recovery.previous_fills_cursor())
+        .map_err(|_| stage("fills_cursor_parse"))?;
     let fill_symbols = snapshot_fill_symbols(
         &position_rows,
         &regular_rows,
         &algo_rows,
         recovery,
         &previous_fills,
-    )?;
+    )
+    .map_err(|_| stage("fills_symbols"))?;
     let (fills_cursor, fill_facts) = snapshot_fills_cursor(BinanceSnapshotFillsRequest {
         transport,
         credentials,
@@ -1147,9 +1163,12 @@ async fn fetch_account_wide_snapshot(
         catalogue,
         generation: private_generation,
     })
-    .await?;
+    .await
+    .map_err(|_| stage("fills_collect"))?;
     let unknown_results =
-        snapshot_unknown_results(transport, credentials, &scope, recovery).await?;
+        snapshot_unknown_results(transport, credentials, &scope, recovery)
+            .await
+            .map_err(|_| stage("unknown_results"))?;
     SignedAccountSnapshot::complete_with_fills(
         config.gateway_binding().clone(),
         observed_at_ms,
@@ -1163,8 +1182,9 @@ async fn fetch_account_wide_snapshot(
         fills_cursor,
         unknown_results,
     )
-    .and_then(|snapshot| snapshot.with_balances(balances))
-    .map_err(|_| AccountHostValidationError::SignedSnapshot)
+    .map_err(|_| stage("snapshot_complete"))?
+    .with_balances(balances)
+    .map_err(|_| stage("snapshot_balances"))
 }
 
 fn normalize_public_stream_event(
@@ -1958,6 +1978,8 @@ pub enum BinanceAccountGatewayError {
     RulesChanged,
     #[error("Binance signed private readback is incomplete")]
     Readback,
+    #[error("Binance signed account snapshot is incomplete: {0}")]
+    SignedSnapshot(#[source] AccountHostValidationError),
     #[error("Binance attempt identity exhausted")]
     Attempt,
     #[error("Binance private stream evidence is invalid or unavailable")]

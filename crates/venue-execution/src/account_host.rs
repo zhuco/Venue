@@ -3014,6 +3014,8 @@ pub enum AccountHostValidationError {
     JournalBudget,
     #[error("complete signed account snapshot is unavailable, stale, or incomplete")]
     SignedSnapshot,
+    #[error("complete signed account snapshot failed closed at {0}")]
+    SignedSnapshotStage(&'static str),
     #[error("current adapter-validated instrument is unavailable or inconsistent")]
     Instrument,
     #[error("legacy Stage-7 predecessor handoff is missing, inconsistent, or unavailable")]
