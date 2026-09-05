@@ -272,6 +272,42 @@ fn signed_queries_are_exact_bounded_and_identity_specific() -> Result<(), TestEr
 }
 
 #[test]
+fn market_history_reported_price_is_not_promoted_to_a_limit() -> Result<(), TestError> {
+    let binding = binding(GatewayMode::Live)?;
+    let payload = br#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","nextPageCursor":"","list":[{"symbol":"BTCUSDT","orderId":"native-market-1","orderLinkId":"market-client-1","side":"Sell","positionIdx":1,"orderStatus":"Filled","orderType":"Market","timeInForce":"IOC","qty":"0.1","cumExecQty":"0.1","price":"98.63","avgPrice":"98.63","reduceOnly":true,"createdTime":"1500","updatedTime":"1600"}]},"time":2000}"#;
+    let page = parse_order_history_page(
+        &binding,
+        &raw(
+            &binding,
+            BybitPrivateSource::OrderHistory(NativeOrderFamily::UmOrder),
+            payload,
+        )?,
+    )?;
+    let [order] = page.orders.as_slice() else {
+        return Err("expected one exact market order".into());
+    };
+    assert_eq!(order.native_order_type, "Market");
+    assert_eq!(order.native_time_in_force, "IOC");
+    assert!(order.order.limit_price.is_none());
+    assert!(matches!(order.order.average_price, FieldState::Known(_)));
+    assert!(order.order.reduce_only);
+    let executions = br#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","nextPageCursor":"","list":[{"symbol":"BTCUSDT","orderId":"native-market-1","orderLinkId":"market-client-1","side":"Sell","execId":"fill-market-1","execPrice":"98.63","execQty":"0.1","execFee":"0.005","execTime":"1700","feeCurrency":"USDT","closedSize":"0.1","execType":"Trade","isMaker":false,"seq":278511054529}]},"time":2000}"#;
+    let fills = parse_execution_page(
+        &binding,
+        &raw(&binding, BybitPrivateSource::Executions, executions)?,
+        &page.orders,
+    )?;
+    let [fill] = fills.fills.as_slice() else {
+        return Err("expected one exact market fill".into());
+    };
+    assert_eq!(
+        fill.fill.execution_sequence,
+        FieldState::Known(278_511_054_529)
+    );
+    Ok(())
+}
+
+#[test]
 fn account_positions_orders_and_fills_replay_exact_raw_evidence() -> Result<(), TestError> {
     let binding = binding(GatewayMode::Live)?;
     let account = complete_account_readback(

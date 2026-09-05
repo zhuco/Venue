@@ -97,11 +97,11 @@
 | 功能 | 入口 |
 |---|---|
 | 独立策略命令与账户调度 | `apps/venue-control/src/{multi_venue_store,multi_venue_runtime}.rs` |
-| 凭证及五所 adapter 组装 | `apps/venue-control/src/{multi_venue_credentials,multi_venue_exchange}.rs` |
+| 凭证、只读原命令观察及五所 adapter 组装 | `apps/venue-control/src/{multi_venue_credentials,multi_venue_exchange}.rs` |
 | 已持久化命令物理边界 | `crates/venue-execution/src/durable_gateway.rs` |
 | 行情精度、名义金额和条件触发风险检查 | `apps/venue-control/src/multi_venue_risk.rs` |
 | 网格生命周期、签名累计成交与原子目标面 | `apps/venue-control/src/multi_venue_grid/{store,runtime,planner,tests}.rs` |
-| 迁移、绑定、命令、网格操作工具 | `apps/venue-control/migrations/{0035_multi_venue_executor,0036_strategy_grid}.sql`、`apps/venue-control/src/bin/venue-strategy-admin.rs` |
+| 迁移、绑定、命令、原命令观察、Bybit 资金费及网格操作工具 | `apps/venue-control/migrations/{0035_multi_venue_executor,0036_strategy_grid}.sql`、`apps/venue-control/src/bin/venue-strategy-admin.rs`；Bybit 资金费协议在 `crates/venue-gateway-bybit/src/funding.rs` |
 
 ## 冻结兼容与共享类型
 

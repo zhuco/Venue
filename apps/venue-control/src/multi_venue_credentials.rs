@@ -47,6 +47,8 @@ pub enum StrategyProbeError {
     Permissions,
     #[error("strategy probe complete snapshot rejected")]
     Snapshot,
+    #[error("strategy probe exact order observation rejected: {0}")]
+    Observation(String),
     #[error("strategy probe worker unavailable")]
     Worker,
 }
@@ -143,6 +145,83 @@ mod tests {
 }
 
 impl StrategyCredentialStore {
+    /// Read-only exact client-ID observation for an already durable command. This never claims,
+    /// sends or retries the command and is suitable for operator reconciliation evidence.
+    pub async fn order_observation(
+        &self,
+        owner: &str,
+        credential: &str,
+        command: venue_domain::ExecutionCommand,
+    ) -> Result<Option<venue_execution::DurableOrderObservation>, StrategyProbeError> {
+        let account: String = sqlx::query_scalar("SELECT trading_account_id FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND deleted_ms IS NULL")
+            .bind(credential).bind(owner).fetch_one(&self.pool).await.map_err(|_| StrategyProbeError::Binding)?;
+        if command.mutation_owner().account != account {
+            return Err(StrategyProbeError::Binding);
+        }
+        let (credentials, expected) = self
+            .load(owner, credential, &account, false)
+            .await
+            .map_err(|_| StrategyProbeError::Permissions)?;
+        let binding = GatewayBinding::new(
+            credentials.venue(),
+            GatewayMode::Live,
+            account,
+            command.mutation_owner().symbol.clone(),
+        )
+        .map_err(|_| StrategyProbeError::Binding)?;
+        let _slot = crate::multi_venue_runtime::ACCOUNT_NETWORK_SLOTS
+            .acquire()
+            .await
+            .map_err(|_| StrategyProbeError::NetworkSlot)?;
+        tokio::task::spawn_blocking(move || {
+            let mut gateway = StrategyGateway::connect_detailed(binding.clone(), credentials, 1)
+                .map_err(StrategyProbeError::Connect)?;
+            let identity = gateway
+                .identity()
+                .map_err(|_| StrategyProbeError::Identity)?;
+            if identity_hash(binding.venue, &identity) != expected {
+                return Err(StrategyProbeError::Identity);
+            }
+            gateway
+                .order_observation_detailed(&command)
+                .map_err(StrategyProbeError::Observation)
+        })
+        .await
+        .map_err(|_| StrategyProbeError::Worker)?
+    }
+
+    /// Reads one bounded Bybit linear funding-settlement window. The adapter owns pagination,
+    /// signed scope checks and duplicate rejection; no cross-venue funding semantics are guessed.
+    pub async fn bybit_funding(
+        &self,
+        owner: &str,
+        credential: &str,
+        symbol: Symbol,
+        query: venue_gateway_bybit::BybitFundingQuery,
+    ) -> Result<venue_gateway_bybit::BybitFundingReadback, StrategyExchangeError> {
+        let account: String = sqlx::query_scalar("SELECT trading_account_id FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND deleted_ms IS NULL")
+            .bind(credential).bind(owner).fetch_one(&self.pool).await.map_err(|_| StrategyExchangeError)?;
+        let (credentials, expected) = self.load(owner, credential, &account, false).await?;
+        if credentials.venue() != VenueId::Bybit {
+            return Err(StrategyExchangeError);
+        }
+        let binding = GatewayBinding::new(VenueId::Bybit, GatewayMode::Live, account, symbol)
+            .map_err(|_| StrategyExchangeError)?;
+        let _slot = crate::multi_venue_runtime::ACCOUNT_NETWORK_SLOTS
+            .acquire()
+            .await
+            .map_err(|_| StrategyExchangeError)?;
+        tokio::task::spawn_blocking(move || {
+            let mut gateway = StrategyGateway::connect(binding.clone(), credentials, 1)?;
+            if identity_hash(binding.venue, &gateway.identity()?) != expected {
+                return Err(StrategyExchangeError);
+            }
+            gateway.bybit_funding(&query)
+        })
+        .await
+        .map_err(|_| StrategyExchangeError)?
+    }
+
     pub async fn set_limits(
         &self,
         owner: &str,

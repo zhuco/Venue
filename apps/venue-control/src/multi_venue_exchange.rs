@@ -101,6 +101,39 @@ impl StrategyGateway {
     ) -> Result<Option<venue_execution::DurableOrderObservation>, StrategyExchangeError> {
         gateway_call!(self, durable_order_observation, command)
     }
+    pub(crate) fn order_observation_detailed(
+        &mut self,
+        command: &ExecutionCommand,
+    ) -> Result<Option<venue_execution::DurableOrderObservation>, String> {
+        match self {
+            Self::Bitget(gateway) => gateway
+                .durable_order_observation(command)
+                .map_err(|error| error.to_string()),
+            Self::Bybit(gateway) => gateway
+                .durable_order_observation(command)
+                .map_err(|error| error.to_string()),
+            Self::Gate(gateway) => gateway
+                .durable_order_observation(command)
+                .map_err(|error| error.to_string()),
+            Self::Okx(gateway) => gateway
+                .durable_order_observation(command)
+                .map_err(|error| error.to_string()),
+            Self::Hyperliquid(gateway) => gateway
+                .durable_order_observation(command)
+                .map_err(|error| error.to_string()),
+        }
+    }
+    pub(crate) fn bybit_funding(
+        &mut self,
+        query: &venue_gateway_bybit::BybitFundingQuery,
+    ) -> Result<venue_gateway_bybit::BybitFundingReadback, StrategyExchangeError> {
+        match self {
+            Self::Bybit(gateway) => gateway
+                .settled_funding(query)
+                .map_err(|_| StrategyExchangeError),
+            _ => Err(StrategyExchangeError),
+        }
+    }
     /// Called only inside a bounded blocking worker: the existing adapters own their synchronous
     /// transport runtime. No runtime, credentials or nonce file is created per trading strategy.
     pub(crate) fn connect(

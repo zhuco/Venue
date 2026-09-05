@@ -44,6 +44,11 @@ impl BybitAccountGateway {
                 order.owner.symbol.clone(),
                 true,
             ),
+            ExecutionCommand::MarketReduce(order) => (
+                order.client_order_id.as_str(),
+                order.owner.symbol.clone(),
+                true,
+            ),
             _ => return Ok(None),
         };
         if !venue_execution::validate_durable_command(self.binding.gateway_binding(), command) {
@@ -65,23 +70,48 @@ impl BybitAccountGateway {
             .symbol_catalog
             .get(&symbol)
             .ok_or(BybitAccountGatewayError::Binding)?;
-        let readback = self.runtime.block_on(fetch_exact_readback(
-            &scope.binding,
-            &self.credentials,
-            &scope.transport,
-            generation,
-            attempt,
-            lookup.clone(),
-            NativeOrderFamily::UmOrder,
-            now,
-        ))?;
-        if !readback.command_matches(command) {
-            return Ok(None);
-        }
+        let readback = self
+            .runtime
+            .block_on(fetch_exact_readback(
+                &scope.binding,
+                &self.credentials,
+                &scope.transport,
+                generation,
+                attempt,
+                lookup.clone(),
+                NativeOrderFamily::UmOrder,
+                now,
+            ))
+            .map_err(|_| BybitAccountGatewayError::ReadbackStage("order_surfaces"))?;
         let observed = readback
             .exact_order_evidence()
-            .map_err(|_| BybitAccountGatewayError::Readback)?
-            .ok_or(BybitAccountGatewayError::Readback)?;
+            .map_err(|_| BybitAccountGatewayError::ReadbackStage("order_evidence"))?;
+        let Some(observed) = observed else {
+            if market {
+                let history_window =
+                    BybitHistoryWindow::new(now.saturating_sub(HISTORY_WINDOW_MS).max(1), now)
+                        .map_err(|_| BybitAccountGatewayError::Readback)?;
+                let fills = self.runtime.block_on(fetch_exact_executions(
+                    &scope.binding,
+                    &self.credentials,
+                    &scope.transport,
+                    generation,
+                    attempt,
+                    history_window,
+                    lookup,
+                    &[],
+                ))?;
+                if !fills.fills.is_empty() {
+                    return Err(BybitAccountGatewayError::Readback);
+                }
+            }
+            return Ok(None);
+        };
+        if !readback.command_matches(command) {
+            return Err(BybitAccountGatewayError::ReadbackMismatch(
+                describe_command_mismatch(command, &observed),
+            ));
+        }
         let (average_price, cumulative_fee) = if market {
             if !terminal_state(observed.order.state) {
                 return Ok(None);
@@ -99,7 +129,8 @@ impl BybitAccountGateway {
                 lookup,
                 std::slice::from_ref(&observed),
             ))?;
-            aggregate_market_fills(command, &observed, &fills)?
+            aggregate_market_fills(command, &observed, &fills)
+                .map_err(|_| BybitAccountGatewayError::ReadbackStage("fill_aggregation"))?
         } else {
             (FieldState::Missing, FieldState::Missing)
         };
@@ -169,6 +200,36 @@ impl BybitAccountGateway {
         })
     }
 
+    /// Reads the complete, bounded Bybit transaction-log cursor chain for one linear symbol.
+    /// Positive funding is received and negative funding is paid, exactly as signed by Bybit.
+    pub fn settled_funding(
+        &mut self,
+        query: &crate::BybitFundingQuery,
+    ) -> Result<crate::BybitFundingReadback, BybitAccountGatewayError> {
+        let symbol = self.binding.gateway_binding().symbol.clone();
+        self.refresh_rules_for(&symbol)?;
+        let generation = self
+            .symbol_catalog
+            .get(&symbol)
+            .ok_or(BybitAccountGatewayError::Binding)?
+            .rules
+            .instrument
+            .generation;
+        let attempt_id = self.take_attempt_id()?;
+        let scope = self
+            .symbol_catalog
+            .get(&symbol)
+            .ok_or(BybitAccountGatewayError::Binding)?;
+        self.runtime.block_on(fetch_settled_funding(
+            &scope.binding,
+            &self.credentials,
+            &scope.transport,
+            generation,
+            attempt_id,
+            query,
+        ))
+    }
+
     /// Reads `/v5/user/query-api` through the existing signed transport and returns its
     /// exchange-issued `userID`. A configured label or API-key hash is never substituted.
     pub fn verified_account_identity(&mut self) -> Result<String, BybitAccountGatewayError> {
@@ -227,12 +288,100 @@ async fn fetch_exact_executions(
         let raw = execute_private(binding, credentials, transport, &request)
             .await
             .map_err(BybitAccountGatewayError::OrderTransport)?;
-        let page = crate::parse_execution_page(binding, &raw, evidence)
-            .map_err(|_| BybitAccountGatewayError::Readback)?;
+        let page = crate::parse_execution_page(binding, &raw, evidence).map_err(|error| {
+            BybitAccountGatewayError::ReadbackMismatch(format!(
+                "execution_page: {error}; {}",
+                execution_payload_summary(&raw.payload)
+            ))
+        })?;
         cursor = page.meta.next_cursor.clone();
         pages.push(page);
         if cursor.is_none() {
-            return crate::complete_execution_pages(binding, &pages, evidence)
+            return crate::complete_execution_pages(binding, &pages, evidence).map_err(|error| {
+                BybitAccountGatewayError::ReadbackMismatch(format!(
+                    "execution_page_closure: {error}"
+                ))
+            });
+        }
+    }
+    Err(BybitAccountGatewayError::Readback)
+}
+
+fn execution_payload_summary(payload: &[u8]) -> String {
+    let value = match serde_json::from_slice::<serde_json::Value>(payload) {
+        Ok(value) => value,
+        Err(_) => return "execution payload is not JSON".to_owned(),
+    };
+    let Some(row) = value
+        .get("result")
+        .and_then(|result| result.get("list"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|list| list.first())
+        .and_then(serde_json::Value::as_object)
+    else {
+        return "execution list is empty or malformed".to_owned();
+    };
+    let selected = [
+        "symbol",
+        "orderId",
+        "orderLinkId",
+        "side",
+        "execId",
+        "execPrice",
+        "execQty",
+        "execFee",
+        "execTime",
+        "feeCurrency",
+        "closedSize",
+        "execType",
+        "isMaker",
+        "seq",
+        "execPnl",
+    ]
+    .into_iter()
+    .filter_map(|key| row.get(key).cloned().map(|value| (key.to_owned(), value)))
+    .collect::<serde_json::Map<_, _>>();
+    match serde_json::to_string(&selected) {
+        Ok(summary) => summary,
+        Err(_) => "execution fields could not be summarized".to_owned(),
+    }
+}
+
+async fn fetch_settled_funding(
+    binding: &BybitGatewayBinding,
+    credentials: &BybitCredentials,
+    transport: &BybitHttpTransport,
+    generation: u64,
+    attempt_id: u64,
+    query: &crate::BybitFundingQuery,
+) -> Result<crate::BybitFundingReadback, BybitAccountGatewayError> {
+    let window = query
+        .window()
+        .map_err(|_| BybitAccountGatewayError::Readback)?;
+    let requested_cursor = query.cursor.clone();
+    let mut cursor = requested_cursor.clone();
+    let mut pages = Vec::new();
+    for page_index in 0..EXACT_READBACK_MAX_PAGES {
+        let request = prepare_private_request(
+            binding,
+            generation,
+            attempt_id,
+            page_index,
+            BybitPrivateSource::FundingTransactions,
+            cursor.as_deref(),
+            Some(window.clone()),
+            None,
+        )
+        .map_err(|_| BybitAccountGatewayError::Readback)?;
+        let raw = execute_private(binding, credentials, transport, &request)
+            .await
+            .map_err(BybitAccountGatewayError::OrderTransport)?;
+        let page = crate::parse_funding_page(binding, &raw)
+            .map_err(|_| BybitAccountGatewayError::Readback)?;
+        cursor = page.next_cursor.clone();
+        pages.push(page);
+        if cursor.is_none() {
+            return crate::complete_funding_pages(binding, &pages, requested_cursor)
                 .map_err(|_| BybitAccountGatewayError::Readback);
         }
     }
@@ -244,10 +393,16 @@ fn aggregate_market_fills(
     observed: &crate::BybitOrderEvidence,
     fills: &crate::BybitFillReadback,
 ) -> Result<(FieldState<Price>, FieldState<Amount>), BybitAccountGatewayError> {
-    let ExecutionCommand::PlaceMarket(order) = command else {
-        return Err(BybitAccountGatewayError::Readback);
+    let (client_order_id, symbol) = match command {
+        ExecutionCommand::PlaceMarket(order) => {
+            (order.client_order_id.as_str(), &order.owner.symbol)
+        }
+        ExecutionCommand::MarketReduce(order) => {
+            (order.client_order_id.as_str(), &order.owner.symbol)
+        }
+        _ => return Err(BybitAccountGatewayError::Readback),
     };
-    if fills.binding.symbol != order.owner.symbol
+    if &fills.binding.symbol != symbol
         || fills.generation == 0
         || fills.attempt_id == 0
         || !terminal_state(observed.order.state)
@@ -261,7 +416,7 @@ fn aggregate_market_fills(
     for item in &fills.fills {
         if !fill_ids.insert(item.fill.fill_id.as_str())
             || item.fill.order_id != observed.order.order_id
-            || item.client_order_id != FieldState::Known(order.client_order_id.as_str().to_owned())
+            || item.client_order_id != FieldState::Known(client_order_id.to_owned())
         {
             return Err(BybitAccountGatewayError::Readback);
         }
@@ -307,6 +462,52 @@ fn aggregate_market_fills(
     Ok((FieldState::Known(average), FieldState::Known(fee)))
 }
 
+fn describe_command_mismatch(
+    command: &ExecutionCommand,
+    observed: &crate::BybitOrderEvidence,
+) -> String {
+    let (
+        expected_side,
+        expected_position_side,
+        expected_quantity,
+        expected_limit_price,
+        expected_reduce_only,
+    ) = match command {
+        ExecutionCommand::PlaceLimit(order) => (
+            order.side,
+            order.position_side,
+            order.quantity,
+            Some(order.limit_price),
+            order.reduce_only,
+        ),
+        ExecutionCommand::PlaceMarket(order) => (
+            order.side,
+            order.position_side,
+            order.quantity,
+            None,
+            order.reduce_only,
+        ),
+        ExecutionCommand::MarketReduce(order) => {
+            (order.side, order.position_side, order.quantity, None, true)
+        }
+        _ => return "unsupported command family".to_owned(),
+    };
+    format!(
+        "expected side={expected_side:?} position_side={expected_position_side:?} quantity={expected_quantity} limit_price={expected_limit_price:?} reduce_only={expected_reduce_only}; observed order_id={} client_order_id={:?} state={:?} side={:?} position_side={:?} quantity={} filled_quantity={} limit_price={:?} reduce_only={} native_order_type={} native_time_in_force={}",
+        observed.order.order_id,
+        observed.order.client_order_id,
+        observed.order.state,
+        observed.order.side,
+        observed.order.position_side,
+        observed.order.quantity,
+        observed.order.filled_quantity,
+        observed.order.limit_price,
+        observed.order.reduce_only,
+        observed.native_order_type,
+        observed.native_time_in_force,
+    )
+}
+
 const fn terminal_state(state: OrderState) -> bool {
     matches!(
         state,
@@ -317,7 +518,9 @@ const fn terminal_state(state: OrderState) -> bool {
 #[cfg(test)]
 mod market_observation_tests {
     use super::*;
-    use venue_domain::domain::{CommandId, MarketOrderCommand, Order, OrderOwner, OrderPurpose};
+    use venue_domain::domain::{
+        CommandId, MarketOrderCommand, MarketReduceCommand, Order, OrderOwner, OrderPurpose,
+    };
     use venue_gateway_api::{GatewayMode, VenueId};
 
     const ACCOUNT_ID: &str = "00000000-0000-4000-8000-000000000001";
@@ -370,6 +573,26 @@ mod market_observation_tests {
             created_at_ms: 1_000,
             updated_at_ms: 1_100,
         })
+    }
+
+    fn reduce_command() -> Result<ExecutionCommand, Box<dyn std::error::Error>> {
+        Ok(ExecutionCommand::MarketReduce(MarketReduceCommand {
+            command_id: CommandId::new("bybit-reduce-command")?,
+            client_order_id: CommandId::new("bybit-market-client")?,
+            owner: OrderOwner {
+                strategy_instance_id: "acceptance".into(),
+                run_id: "run-1".into(),
+                exchange: "bybit".into(),
+                account: ACCOUNT_ID.into(),
+                symbol: "DOGE/USDT".parse()?,
+                purpose: OrderPurpose::ExposureTakeProfit,
+            },
+            position_side: PositionSide::Long,
+            side: OrderSide::Sell,
+            quantity: Decimal::from(50),
+            risk_episode_id: CommandId::new("bybit-reduce-episode")?,
+            position_generation: 7,
+        }))
     }
 
     fn fill(
@@ -436,6 +659,29 @@ mod market_observation_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (average, fee) =
             aggregate_market_fills(&market_command()?, &observed_market()?, &fill_readback()?)?;
+        assert_eq!(
+            average,
+            FieldState::Known(Price::new(Decimal::new(106, 3))?)
+        );
+        assert_eq!(
+            fee,
+            FieldState::Known(Amount::new(Asset::new("USDT")?, Decimal::new(3, 3)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn market_reduce_uses_the_same_exact_fill_aggregation() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut observed = observed_market()?;
+        observed.order.position_side = FieldState::Known(PositionSide::Long);
+        observed.order.purpose = FieldState::Known(OrderPurpose::ExposureTakeProfit);
+        observed.order.reduce_only = true;
+        let mut fills = fill_readback()?;
+        for fill in &mut fills.fills {
+            fill.fill.position_side = FieldState::Known(PositionSide::Long);
+        }
+        let (average, fee) = aggregate_market_fills(&reduce_command()?, &observed, &fills)?;
         assert_eq!(
             average,
             FieldState::Known(Price::new(Decimal::new(106, 3))?)
