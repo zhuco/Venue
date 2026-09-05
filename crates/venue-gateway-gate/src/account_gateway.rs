@@ -575,27 +575,19 @@ impl AccountPhysicalGateway for GateAccountGateway {
             return Err(AccountHostValidationError::SignedSnapshot);
         }
         self.refresh_rules_for_symbols(request.configured_symbols().iter().cloned())
-            .map_err(|error| {
-                eprintln!("GATE_PROBE_DIAGNOSTIC refresh_rules: {error}");
-                AccountHostValidationError::SignedSnapshot
-            })?;
+            .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
         let attempt = self
             .next_attempt()
             .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-        let snapshot = self
-            .runtime
-            .block_on(fetch_account_wide_snapshot(
-                &self.transport,
-                &self.binding,
-                &self.credentials,
-                &self.rules,
-                &self.rules_catalog,
-                attempt,
-                request,
-            ))
-            .inspect_err(|error| {
-                eprintln!("GATE_PROBE_DIAGNOSTIC account_wide_snapshot: {error}");
-            })?;
+        let snapshot = self.runtime.block_on(fetch_account_wide_snapshot(
+            &self.transport,
+            &self.binding,
+            &self.credentials,
+            &self.rules,
+            &self.rules_catalog,
+            attempt,
+            request,
+        ))?;
         if snapshot.private_generation() != attempt {
             return Err(AccountHostValidationError::SignedSnapshot);
         }
@@ -611,10 +603,7 @@ impl AccountPhysicalGateway for GateAccountGateway {
                 &self.rules,
                 attempt,
             ))
-            .map_err(|error| {
-                eprintln!("GATE_PROBE_DIAGNOSTIC refresh_private: {error}");
-                AccountHostValidationError::SignedSnapshot
-            })?;
+            .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
         if private.attempt != snapshot.private_generation() {
             return Err(AccountHostValidationError::SignedSnapshot);
         }
@@ -890,10 +879,10 @@ async fn fetch_account_wide_snapshot(
         return Err(AccountHostValidationError::SignedSnapshot);
     }
     let observed_at_ms = now_ms().map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-    let catalogue = transport.fetch_public_contracts().await.map_err(|error| {
-        eprintln!("GATE_PROBE_DIAGNOSTIC catalogue: {error}");
-        AccountHostValidationError::SignedSnapshot
-    })?;
+    let catalogue = transport
+        .fetch_public_contracts()
+        .await
+        .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
     let account = snapshot_read(
         transport,
         binding,
@@ -902,16 +891,12 @@ async fn fetch_account_wide_snapshot(
         endpoints::FUTURES_ACCOUNT,
         "",
     )
-    .await
-    .inspect_err(|error| {
-        eprintln!("GATE_PROBE_DIAGNOSTIC account_read: {error}");
-    })?;
+    .await?;
     let account_value: Value =
         serde_json::from_str(&account).map_err(|_| AccountHostValidationError::SignedSnapshot)?;
-    crate::parse_dual_position_mode(&account_value).map_err(|error| {
-        eprintln!("GATE_PROBE_DIAGNOSTIC account_mode: {error}");
-        AccountHostValidationError::SignedSnapshot
-    })?;
+    if !crate::parse_dual_position_mode(&account_value).is_ok() {
+        return Err(AccountHostValidationError::SignedSnapshot);
+    }
     let positions = snapshot_read(
         transport,
         binding,
@@ -920,10 +905,7 @@ async fn fetch_account_wide_snapshot(
         endpoints::POSITIONS,
         "holding=false",
     )
-    .await
-    .inspect_err(|error| {
-        eprintln!("GATE_PROBE_DIAGNOSTIC positions_read: {error}");
-    })?;
+    .await?;
     let positions: Vec<Value> =
         serde_json::from_str(&positions).map_err(|_| AccountHostValidationError::SignedSnapshot)?;
     let (regular, regular_payloads) = snapshot_paged_rows(
@@ -934,10 +916,7 @@ async fn fetch_account_wide_snapshot(
         "status=open",
         endpoints::FUTURES_OPEN_ORDERS,
     )
-    .await
-    .inspect_err(|error| {
-        eprintln!("GATE_PROBE_DIAGNOSTIC regular_read: {error}");
-    })?;
+    .await?;
     let price_orders_payload = snapshot_read(
         transport,
         binding,
@@ -946,10 +925,7 @@ async fn fetch_account_wide_snapshot(
         endpoints::FUTURES_PRICE_ORDERS,
         "status=open&limit=100",
     )
-    .await
-    .inspect_err(|error| {
-        eprintln!("GATE_PROBE_DIAGNOSTIC price_orders_read: {error}");
-    })?;
+    .await?;
     let price_orders: Vec<Value> = serde_json::from_str(&price_orders_payload)
         .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
     if price_orders.len() >= 100 {
@@ -963,47 +939,24 @@ async fn fetch_account_wide_snapshot(
         observed_at_ms,
         recovery.previous_fills_cursor(),
     )
-    .await
-    .inspect_err(|error| {
-        eprintln!("GATE_PROBE_DIAGNOSTIC fills_read: {error}");
-    })?;
+    .await?;
     let position_facts =
-        snapshot_position_facts(&catalogue, &positions, selected_rules.instrument.generation)
-            .inspect_err(|error| {
-                eprintln!("GATE_PROBE_DIAGNOSTIC position_facts: {error}");
-            })?;
+        snapshot_position_facts(&catalogue, &positions, selected_rules.instrument.generation)?;
     let mut order_facts =
-        snapshot_regular_order_facts(&catalogue, &regular, selected_rules.instrument.generation)
-            .inspect_err(|error| {
-                eprintln!("GATE_PROBE_DIAGNOSTIC regular_facts: {error}");
-            })?;
-    order_facts.extend(
-        snapshot_price_order_facts(
-            &catalogue,
-            &price_orders,
-            selected_rules.instrument.generation,
-        )
-        .inspect_err(|error| {
-            eprintln!("GATE_PROBE_DIAGNOSTIC price_order_facts: {error}");
-        })?,
-    );
+        snapshot_regular_order_facts(&catalogue, &regular, selected_rules.instrument.generation)?;
+    order_facts.extend(snapshot_price_order_facts(
+        &catalogue,
+        &price_orders,
+        selected_rules.instrument.generation,
+    )?);
     let unknown_results =
-        snapshot_unknown_results(transport, binding, credentials, rules_catalog, recovery)
-            .await
-            .inspect_err(|error| {
-                eprintln!("GATE_PROBE_DIAGNOSTIC unknown_results: {error}");
-            })?;
-    let fill_facts = snapshot_fill_facts(&catalogue, &fills, selected_rules.instrument.generation)
-        .inspect_err(|error| {
-            eprintln!("GATE_PROBE_DIAGNOSTIC fill_facts: {error}");
-        })?;
+        snapshot_unknown_results(transport, binding, credentials, rules_catalog, recovery).await?;
+    let fill_facts = snapshot_fill_facts(&catalogue, &fills, selected_rules.instrument.generation)?;
     if regular_payloads.is_empty() {
         return Err(AccountHostValidationError::SignedSnapshot);
     }
-    let balance = crate::private::parse_account_balance(&account_value).map_err(|error| {
-        eprintln!("GATE_PROBE_DIAGNOSTIC balance: {error}");
-        AccountHostValidationError::SignedSnapshot
-    })?;
+    let balance = crate::private::parse_account_balance(&account_value)
+        .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
     SignedAccountSnapshot::complete_with_fills(
         binding.gateway_binding().clone(),
         observed_at_ms,
@@ -1024,10 +977,7 @@ async fn fetch_account_wide_snapshot(
             available_margin: Some(balance.available_balance),
         }])
     })
-    .map_err(|error| {
-        eprintln!("GATE_PROBE_DIAGNOSTIC normalized_snapshot: {error}");
-        AccountHostValidationError::SignedSnapshot
-    })
+    .map_err(|_| AccountHostValidationError::SignedSnapshot)
 }
 
 async fn snapshot_read(

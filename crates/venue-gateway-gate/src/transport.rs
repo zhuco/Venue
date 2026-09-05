@@ -186,7 +186,9 @@ impl GateHttpTransport {
                 | crate::endpoints::ACCOUNT_MAIN_KEYS
                 | crate::endpoints::POSITIONS
                 | crate::endpoints::FUTURES_OPEN_ORDERS
+                | crate::endpoints::FUTURES_PRICE_ORDERS
                 | crate::endpoints::FUTURES_FILLS
+                | crate::endpoints::FUTURES_FILLS_TIMERANGE
         ) || timestamp_ms == 0
         {
             return Err(GateTransportError::Binding);
@@ -1536,6 +1538,64 @@ mod tests {
         assert!(sent.contains("sign:"));
         assert!(sent.contains("x-gate-size-decimal: 1"));
         assert!(sent.ends_with(&expected_body));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn account_risk_read_admits_snapshot_endpoints_but_not_mutations() -> Result<(), TestError>
+    {
+        let (binding, credentials, rules, _) = facts()?;
+        let (endpoint, server) = http_mock(Some(response("[]")), Duration::ZERO).await?;
+        let limits = GateTransportLimits::new(Duration::from_secs(2), 16 * 1024)?;
+        let transport = GateHttpTransport::with_endpoint(&binding, 7, endpoint, limits)?;
+
+        let payload = transport
+            .execute_account_risk_read(
+                &binding,
+                &credentials,
+                &rules,
+                crate::endpoints::FUTURES_PRICE_ORDERS,
+                "status=open&limit=100",
+                1_700_000_000_000,
+            )
+            .await?;
+        assert_eq!(payload, "[]");
+        let sent = String::from_utf8(server.await??)?;
+        assert!(sent.starts_with("GET /futures/usdt/price_orders?status=open&limit=100 HTTP/1.1"));
+        assert!(sent.contains("sign:"));
+
+        let (endpoint, server) = http_mock(Some(response("[]")), Duration::ZERO).await?;
+        let transport = GateHttpTransport::with_endpoint(&binding, 7, endpoint, limits)?;
+        let payload = transport
+            .execute_account_risk_read(
+                &binding,
+                &credentials,
+                &rules,
+                crate::endpoints::FUTURES_FILLS_TIMERANGE,
+                "from=1699999940&to=1700000001&limit=100&offset=0",
+                1_700_000_000_000,
+            )
+            .await?;
+        assert_eq!(payload, "[]");
+        let sent = String::from_utf8(server.await??)?;
+        assert!(sent.starts_with(
+            "GET /futures/usdt/my_trades_timerange?from=1699999940&to=1700000001&limit=100&offset=0 HTTP/1.1"
+        ));
+        assert!(sent.contains("sign:"));
+
+        assert!(matches!(
+            transport
+                .execute_account_risk_read(
+                    &binding,
+                    &credentials,
+                    &rules,
+                    crate::endpoints::FUTURES_DUAL_MODE,
+                    "",
+                    1_700_000_000_000,
+                )
+                .await,
+            Err(GateTransportError::Binding)
+        ));
         Ok(())
     }
 
