@@ -207,13 +207,17 @@ impl OkxAccountGateway {
         previous_fills_cursor: Option<&str>,
     ) -> Result<AccountWideCandidate, OkxAccountGatewayError> {
         let started_at_ms = unix_ms()?;
-        self.refresh_instrument()?;
+        self.refresh_instrument().inspect_err(|error| {
+            eprintln!("OKX_PROBE_DIAGNOSTIC account_wide.instrument: {error}");
+        })?;
         let generation = self.take_attempt_id()?;
         let catalogue = self
             .runtime
             .block_on(self.transport.fetch_swap_instruments(generation))
             .map_err(OkxAccountGatewayError::Transport)?;
-        let rules = parse_account_wide_rules(&catalogue.body)?;
+        let rules = parse_account_wide_rules(&catalogue.body).inspect_err(|error| {
+            eprintln!("OKX_PROBE_DIAGNOSTIC account_wide.rules: {error}");
+        })?;
         let scope = OkxPrivateReadScope::account_wide(
             &self.config,
             &self.instrument,
@@ -222,12 +226,17 @@ impl OkxAccountGateway {
             generation,
         )
         .map_err(|_| OkxAccountGatewayError::Account)?;
-        let pages = self.runtime.block_on(collect_complete_pages(
-            &self.credentials,
-            &self.transport,
-            &scope,
-            previous_fills_cursor,
-        ))?;
+        let pages = self
+            .runtime
+            .block_on(collect_complete_pages(
+                &self.credentials,
+                &self.transport,
+                &scope,
+                previous_fills_cursor,
+            ))
+            .inspect_err(|error| {
+                eprintln!("OKX_PROBE_DIAGNOSTIC account_wide.pages: {error}");
+            })?;
         let mut candidate = account_wide_candidate(
             &pages,
             &rules,
@@ -235,7 +244,10 @@ impl OkxAccountGateway {
             self.profile.position_mode(),
             generation,
             previous_fills_cursor,
-        )?;
+        )
+        .inspect_err(|error| {
+            eprintln!("OKX_PROBE_DIAGNOSTIC account_wide.candidate: {error}");
+        })?;
         // Later rule/fill pages cannot refresh the age of positions collected earlier.
         candidate.observed_at_ms = candidate.observed_at_ms.min(started_at_ms);
         Ok(candidate)
@@ -922,7 +934,10 @@ fn account_wide_candidate(
         .find(|page| page.surface == crate::OkxPrivateSurface::AccountConfig)
         .ok_or(OkxAccountGatewayError::Account)?;
     let profile = parse_account_profile(&account.payload, expected_mode)
-        .map_err(|_| OkxAccountGatewayError::Account)?;
+        .map_err(|_| OkxAccountGatewayError::Account)
+        .inspect_err(|error| {
+            eprintln!("OKX_PROBE_DIAGNOSTIC candidate.profile: {error}");
+        })?;
     if !profile.can_read() || !profile.can_trade() || profile.can_withdraw() {
         return Err(OkxAccountGatewayError::Permissions);
     }
@@ -931,7 +946,10 @@ fn account_wide_candidate(
         .find(|page| page.surface == crate::OkxPrivateSurface::Balance)
         .ok_or(OkxAccountGatewayError::Account)?;
     let balance = crate::parse_balance(&balance_page.payload, config, &profile)
-        .map_err(|_| OkxAccountGatewayError::Account)?;
+        .map_err(|_| OkxAccountGatewayError::Account)
+        .inspect_err(|error| {
+            eprintln!("OKX_PROBE_DIAGNOSTIC candidate.balance: {error}");
+        })?;
     let balances = vec![SignedAccountBalance {
         asset: balance.balance.asset,
         equity: balance.balance.wallet_balance,
@@ -945,43 +963,49 @@ fn account_wide_candidate(
     for page in pages {
         match page.surface {
             crate::OkxPrivateSurface::Positions => {
-                for row in &response_rows(&page.payload)? {
-                    let rule = row_rule(row, rules)?;
-                    let contracts = decimal(row, "pos")?;
-                    let side = position_side_for(
-                        profile.position_mode(),
-                        text(row, "posSide")?,
-                        contracts,
-                    )?;
-                    let contracts = if side == PositionSide::Net {
-                        contracts
-                    } else {
-                        contracts.abs()
-                    };
-                    let quantity = contracts
-                        .checked_mul(rule.base_per_contract)
-                        .ok_or(OkxAccountGatewayError::Account)?;
-                    let entry_price = optional_decimal(row, "avgPx")?;
-                    let mark_price = optional_decimal(row, "markPx")?;
-                    if !quantity.is_zero() {
-                        let price = mark_price
-                            .or(entry_price)
+                (|| -> Result<(), OkxAccountGatewayError> {
+                    for row in &response_rows(&page.payload)? {
+                        let rule = row_rule(row, rules)?;
+                        let contracts = decimal(row, "pos")?;
+                        let side = position_side_for(
+                            profile.position_mode(),
+                            text(row, "posSide")?,
+                            contracts,
+                        )?;
+                        let contracts = if side == PositionSide::Net {
+                            contracts
+                        } else {
+                            contracts.abs()
+                        };
+                        let quantity = contracts
+                            .checked_mul(rule.base_per_contract)
                             .ok_or(OkxAccountGatewayError::Account)?;
-                        position_notionals.push(
-                            quantity
-                                .abs()
-                                .checked_mul(price)
-                                .ok_or(OkxAccountGatewayError::Account)?,
-                        );
+                        let entry_price = optional_decimal(row, "avgPx")?;
+                        let mark_price = optional_decimal(row, "markPx")?;
+                        if !quantity.is_zero() {
+                            let price = mark_price
+                                .or(entry_price)
+                                .ok_or(OkxAccountGatewayError::Account)?;
+                            position_notionals.push(
+                                quantity
+                                    .abs()
+                                    .checked_mul(price)
+                                    .ok_or(OkxAccountGatewayError::Account)?,
+                            );
+                        }
+                        positions.push(SignedAccountPositionFact {
+                            symbol: rule.symbol.clone(),
+                            position_side: side,
+                            quantity,
+                            entry_price,
+                            mark_price,
+                        });
                     }
-                    positions.push(SignedAccountPositionFact {
-                        symbol: rule.symbol.clone(),
-                        position_side: side,
-                        quantity,
-                        entry_price,
-                        mark_price,
-                    });
-                }
+                    Ok(())
+                })()
+                .inspect_err(|error| {
+                    eprintln!("OKX_PROBE_DIAGNOSTIC candidate.positions: {error}");
+                })?;
             }
             crate::OkxPrivateSurface::RegularOrders => collect_wide_orders(
                 &page.payload,
@@ -990,19 +1014,28 @@ fn account_wide_candidate(
                 rules,
                 &mut orders,
                 &mut entry_order_notionals,
-            )?,
-            crate::OkxPrivateSurface::AlgoOrders(_) => collect_wide_orders(
+            )
+            .inspect_err(|error| {
+                eprintln!("OKX_PROBE_DIAGNOSTIC candidate.regular_orders: {error}");
+            })?,
+            crate::OkxPrivateSurface::AlgoOrders(kind) => collect_wide_orders(
                 &page.payload,
                 NativeOrderFamily::UmAlgo,
                 &profile,
                 rules,
                 &mut orders,
                 &mut entry_order_notionals,
-            )?,
+            )
+            .inspect_err(|error| {
+                eprintln!("OKX_PROBE_DIAGNOSTIC candidate.algo_orders.{kind:?}: {error}");
+            })?,
             _ => {}
         }
     }
-    let (fills, fills_cursor) = snapshot_fills(pages, rules, &profile, previous_fills_cursor)?;
+    let (fills, fills_cursor) = snapshot_fills(pages, rules, &profile, previous_fills_cursor)
+        .inspect_err(|error| {
+            eprintln!("OKX_PROBE_DIAGNOSTIC candidate.fills: {error}");
+        })?;
     Ok(AccountWideCandidate {
         observed_at_ms,
         generation,
