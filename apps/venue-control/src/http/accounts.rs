@@ -17,8 +17,9 @@ use venue_control_protocol::{
         TerminalProjectionRequest,
     },
     leader_bot::{
-        LEADER_BOT_LIFECYCLE_PATH, LEADER_BOT_PATH, LeaderBotCreateRequest,
-        LeaderBotLifecycleRequest, MIRROR_ORDERS_PATH,
+        LEADER_BOT_LIFECYCLE_PATH, LEADER_BOT_PATH, LEADER_BOTS_LIFECYCLE_PATH, LEADER_BOTS_PATH,
+        LEADER_BOTS_UPDATE_PATH, LeaderBotConfiguredCreateRequest, LeaderBotCreateRequest,
+        LeaderBotLifecycleRequest, LeaderBotUpdateRequest, MIRROR_ORDERS_PATH,
     },
     managed_followers::{
         MANAGED_FOLLOW_LIFECYCLE_PATH, MANAGED_FOLLOW_SETTINGS_PATH, MANAGED_FOLLOW_STATUS_PATH,
@@ -79,6 +80,9 @@ where
                 | GRID_LIFECYCLE_PATH
                 | LEADER_BOT_PATH
                 | LEADER_BOT_LIFECYCLE_PATH
+                | LEADER_BOTS_PATH
+                | LEADER_BOTS_UPDATE_PATH
+                | LEADER_BOTS_LIFECYCLE_PATH
                 | MIRROR_ORDERS_PATH
                 | MANAGED_FOLLOWERS_PATH
                 | MANAGED_FOLLOW_SETTINGS_PATH
@@ -364,6 +368,7 @@ async fn account_request(
         ),
         (Method::Get, KOL_PROFILE_PATH) => encode(&accounts.own_kol_profile(&principal).await?),
         (Method::Get, LEADER_BOT_PATH) => encode(&accounts.leader_bot_access(&principal).await?),
+        (Method::Get, LEADER_BOTS_PATH) => encode(&accounts.leader_bots_access(&principal).await?),
         (Method::Get, MIRROR_ORDERS_PATH) => encode(&accounts.own_mirror_orders(&principal).await?),
         (Method::Post, LEADER_BOT_PATH) => encode(
             &accounts
@@ -374,9 +379,36 @@ async fn account_request(
                 )
                 .await?,
         ),
+        (Method::Post, LEADER_BOTS_PATH) => encode(
+            &accounts
+                .create_configured_leader_bot(
+                    &principal,
+                    decode::<LeaderBotConfiguredCreateRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
+        (Method::Post, LEADER_BOTS_UPDATE_PATH) => encode(
+            &accounts
+                .update_leader_bot(
+                    &principal,
+                    decode::<LeaderBotUpdateRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
         (Method::Post, LEADER_BOT_LIFECYCLE_PATH) => encode(
             &accounts
                 .request_leader_bot_lifecycle(
+                    &principal,
+                    decode::<LeaderBotLifecycleRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
+        (Method::Post, LEADER_BOTS_LIFECYCLE_PATH) => encode(
+            &accounts
+                .request_leader_bots_lifecycle(
                     &principal,
                     decode::<LeaderBotLifecycleRequest>(&request.body)?,
                     now,

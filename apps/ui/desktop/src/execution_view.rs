@@ -234,8 +234,7 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
     }
     if model.execution.tab == Tab::Bots {
         if let Some(credential) = selected.cloned() {
-            crate::leader_bot_view::show(ui, model, client, &credential);
-            crate::grid_view::show(ui, model, client, &credential, &account);
+            crate::leader_bot_view::show(ui, model, client, &credential, &account);
         }
         return;
     }

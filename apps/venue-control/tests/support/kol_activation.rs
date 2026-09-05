@@ -204,7 +204,7 @@ pub(super) async fn authorize_leader(
     credential: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     venue_control::leader_bot_admin::set_permission(pool, user, true, 0, "fixture", 1).await?;
-    sqlx::query("INSERT INTO venue_leader_bots(bot_id,owner_user_id,trading_account_id,credential_id,create_request_id,bot_state,revision,permission_revision,started_ms,created_ms,updated_ms) VALUES ($1,$1,$2,$3,$1,'running',1,1,1,1,1)")
+    sqlx::query("INSERT INTO venue_leader_bots(bot_id,owner_user_id,trading_account_id,credential_id,create_request_id,bot_name,bot_description,strategy_capital,bot_state,revision,permission_revision,started_ms,created_ms,updated_ms) VALUES ($1,$1,$2,$3,$1,'Fixture KOL','','100','running',1,1,1,1,1)")
         .bind(user).bind(account).bind(credential).execute(pool).await?;
     Ok(())
 }

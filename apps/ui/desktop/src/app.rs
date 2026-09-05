@@ -272,7 +272,6 @@ impl VenueFlowApp {
                     self.model.execution.leader_bot.access = Some(access);
                     self.model.execution.leader_bot.fresh = true;
                     self.model.execution.leader_bot.pending = None;
-                    self.model.execution.leader_bot.create_credential_id = None;
                     self.model.execution.leader_bot.error = None;
                 }
                 ClientEvent::LeaderBotUnavailable {

@@ -49,8 +49,8 @@ pub enum ClientEvent {
     GridMutationApplied(Box<venue_control_protocol::grid::GridInstanceSummary>),
     GridUnavailable(String),
     GridMutationUnavailable(String),
-    LeaderBotAccess(venue_control_protocol::leader_bot::LeaderBotAccess),
-    LeaderBotMutationApplied(venue_control_protocol::leader_bot::LeaderBotAccess),
+    LeaderBotAccess(venue_control_protocol::leader_bot::LeaderBotsAccess),
+    LeaderBotMutationApplied(venue_control_protocol::leader_bot::LeaderBotsAccess),
     LeaderBotUnavailable {
         mutation: bool,
         definitive: bool,

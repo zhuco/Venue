@@ -642,7 +642,8 @@ async fn runtime_restart_reads_every_unresolved_grid_batch_sibling()
         api_secret: SecretValue::new("b".repeat(32)),
     })?;
     let encrypted = cipher.encrypt(&format!("venue-api-v1:{user}:{credential}"), &payload)?;
-    sqlx::query("UPDATE venue_api_credentials SET encrypted_credentials=$1 WHERE credential_id=$2")
+    // This fixture must pass the credential gate before exercising dispatch uncertainty.
+    sqlx::query("UPDATE venue_api_credentials SET encrypted_credentials=$1,verification_json='{\"verification\":\"verified\"}'::jsonb WHERE credential_id=$2")
         .bind(encrypted)
         .bind(&credential)
         .execute(&fixture.pool)
@@ -731,7 +732,6 @@ async fn runtime_never_rejects_a_batch_after_dispatch_may_have_started()
         api_secret: SecretValue::new("b".repeat(32)),
     })?;
     let encrypted = cipher.encrypt(&format!("venue-api-v1:{user}:{credential}"), &payload)?;
-    // This fixture must pass the credential gate before exercising dispatch uncertainty.
     sqlx::query("UPDATE venue_api_credentials SET encrypted_credentials=$1,verification_json='{\"verification\":\"verified\"}'::jsonb WHERE credential_id=$2")
         .bind(encrypted)
         .bind(&credential)
@@ -1861,6 +1861,9 @@ impl Fixture {
             .execute(&self.pool)
             .await?;
         sqlx::raw_sql(venue_control::MIGRATION_0033)
+            .execute(&self.pool)
+            .await?;
+        sqlx::raw_sql(venue_control::MIGRATION_0034)
             .execute(&self.pool)
             .await?;
         Ok(())

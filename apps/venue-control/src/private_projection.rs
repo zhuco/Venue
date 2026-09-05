@@ -16,6 +16,7 @@ use venue_gateway_binance::BinancePrivateFillEvent;
 
 const PROJECTION_SUBSCRIPTION_MS: u64 = 45_000;
 const HISTORY_LIMIT: i64 = 500;
+const MAX_ACTIVE_PROJECTION_WORKERS: i64 = 232;
 pub const PRIVATE_STREAM_FILL_BATCH_LIMIT: usize = 5;
 pub const MIGRATION_0019: &str = include_str!("../migrations/0019_binance_account_projection.sql");
 pub const MIGRATION_0020: &str = include_str!("../migrations/0020_binance_post_only_terminal.sql");
@@ -180,19 +181,19 @@ impl BinancePrivateProjectionStore {
         &self,
         now_ms: u64,
     ) -> Result<Vec<ActiveProjectionSource>, PrivateProjectionError> {
-        let worker_limit = i64::try_from(crate::kol_executor::MAX_ACTIVE_EXECUTOR_ACCOUNTS)
-            .map_err(|_| PrivateProjectionError::Unavailable)?;
         let kol_rows = sqlx::query(
             "WITH active_kol AS (\
-               SELECT p.kol_user_id,p.leader_trading_account_id,\
+               SELECT p.kol_user_id,p.leader_trading_account_id,b.credential_id,\
                  jsonb_agg(DISTINCT symbols.value ORDER BY symbols.value) AS symbols \
                FROM venue_kol_profiles p \
+               JOIN venue_leader_bots b ON b.owner_user_id=p.kol_user_id \
+                 AND b.bot_state='running' \
                JOIN venue_kol_follow_relations r ON r.kol_user_id=p.kol_user_id \
                  AND r.leader_trading_account_id=p.leader_trading_account_id \
                  AND r.relation_state='active' \
                CROSS JOIN LATERAL jsonb_array_elements_text(r.allowed_symbols) AS symbols(value) \
                WHERE p.profile_state='enabled' \
-               GROUP BY p.kol_user_id,p.leader_trading_account_id\
+               GROUP BY p.kol_user_id,p.leader_trading_account_id,b.credential_id\
              ) \
              SELECT k.kol_user_id,k.kol_user_id AS owner_user_id,\
                credentials.credential_id,k.leader_trading_account_id AS trading_account_id,\
@@ -202,7 +203,8 @@ impl BinancePrivateProjectionStore {
                SELECT min(c.credential_id) AS credential_id,count(*) AS credential_count \
                FROM venue_api_credentials c \
                WHERE c.user_id=k.kol_user_id \
-                 AND c.trading_account_id=k.leader_trading_account_id AND c.credential_id=COALESCE((SELECT b.credential_id FROM venue_leader_bots b WHERE b.owner_user_id=k.kol_user_id),c.credential_id) \
+                 AND c.trading_account_id=k.leader_trading_account_id \
+                 AND c.credential_id=k.credential_id \
                  AND c.deleted_ms IS NULL \
                  AND c.verification_json->>'verification'='verified'\
              ) credentials \
@@ -228,13 +230,13 @@ impl BinancePrivateProjectionStore {
              GROUP BY i.owner_user_id,i.credential_id,i.trading_account_id,p.projection_json \
              ORDER BY i.credential_id LIMIT $1",
         )
-        .bind(worker_limit)
+        .bind(MAX_ACTIVE_PROJECTION_WORKERS)
         .fetch_all(&self.pool)
         .await
         .map_err(|_| PrivateProjectionError::Unavailable)?;
         let ui_rows = sqlx::query("SELECT s.owner_user_id,s.credential_id,s.trading_account_id,s.symbols,p.projection_json FROM venue_binance_projection_subscriptions s JOIN venue_api_credentials c ON c.credential_id=s.credential_id AND c.user_id=s.owner_user_id AND c.trading_account_id=s.trading_account_id LEFT JOIN venue_binance_account_projections p ON p.credential_id=s.credential_id WHERE s.expires_ms>$1 AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' ORDER BY s.requested_ms DESC,s.credential_id LIMIT $2")
             .bind(ms(now_ms)?)
-            .bind(worker_limit)
+            .bind(MAX_ACTIVE_PROJECTION_WORKERS)
             .fetch_all(&self.pool)
             .await
             .map_err(|_| PrivateProjectionError::Unavailable)?;
@@ -287,8 +289,8 @@ impl BinancePrivateProjectionStore {
                 )
                 .map_err(|_| PrivateProjectionError::Invalid)?;
         }
-        let max_workers =
-            usize::try_from(worker_limit).map_err(|_| PrivateProjectionError::Unavailable)?;
+        let max_workers = usize::try_from(MAX_ACTIVE_PROJECTION_WORKERS)
+            .map_err(|_| PrivateProjectionError::Unavailable)?;
         priority
             .into_iter()
             .take(max_workers)
