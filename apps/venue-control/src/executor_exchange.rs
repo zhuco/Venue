@@ -37,6 +37,8 @@ use grid_batch::{elapsed_us, record_outbound_timing, validate_grid_batch_shape};
 mod algo;
 mod catalogue;
 mod copy_risk;
+mod drain;
+pub use drain::LimitAbsenceFuture;
 mod market;
 mod mirror;
 use mirror::mirror_order_outcome;
@@ -682,6 +684,14 @@ pub type BinanceGridBatchFuture<'a> = Pin<
 >;
 
 pub trait BinanceExecution {
+    fn confirm_draining_limit_absence<'a>(
+        &'a mut self,
+        _request: &'a ExecutionRequest,
+        _created_ms: u64,
+        _credentials: BinanceCredentials,
+    ) -> LimitAbsenceFuture<'a> {
+        Box::pin(async { Ok(None) })
+    }
     fn terminal_market<'a>(
         &'a mut self,
         _request: &'a ExecutionRequest,
@@ -1196,6 +1206,14 @@ impl BinanceExecution for BinanceHttpExecution {
 }
 
 impl BinanceExecution for BinanceExecutionRouter {
+    fn confirm_draining_limit_absence<'a>(
+        &'a mut self,
+        request: &'a ExecutionRequest,
+        created_ms: u64,
+        credentials: BinanceCredentials,
+    ) -> LimitAbsenceFuture<'a> {
+        drain::confirm(request, created_ms, credentials, self.limits)
+    }
     fn terminal_market<'a>(
         &'a mut self,
         request: &'a ExecutionRequest,

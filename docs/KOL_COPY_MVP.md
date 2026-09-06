@@ -171,6 +171,8 @@ Executor 以部署副本数 1 运行，并在启动时取得一个 PostgreSQL �
 
 旧成交目标模型只用于既有历史与未决命令恢复。新激活关系使用 target_model=2，迁移暂停旧活动关系并取消其未发送命令，重新启用必须通过空仓/无挂单门。
 
+用户停止带单时，未确认接受的普通开仓限价请求只有在有限历史区间内取得重复精确查无、空订单历史、空成交和空账户的完整签名核对后，才可结束停止；原命令及不可改写的 `mirror_stop_readback` 保留，不重发旧单。时间、身份和停止版本约束见 [停止收尾契约](LEADER_ORDER_MIRROR.md#生命周期)。
+
 ## 7. 幂等与轻量命令账本
 
 跟单路径不使用每账户 JSONL WAL、Actor Applied、hash-chain receipt、manifest 或 Checkpoint。PostgreSQL 轻量命令账本是该路径唯一的发送前持久记录。

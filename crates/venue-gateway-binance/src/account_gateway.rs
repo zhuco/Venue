@@ -42,8 +42,11 @@ use account_gateway_snapshot_fields::{snapshot_limit_time_in_force, snapshot_ord
 #[path = "account_gateway_private_stream.rs"]
 mod account_gateway_private_stream;
 pub use account_gateway_private_stream::{BinancePrivateAccountEvent, BinancePrivateFillEvent};
+#[path = "account_gateway_absence.rs"]
+mod account_gateway_absence;
 #[path = "account_gateway_projection.rs"]
 mod account_gateway_projection;
+pub use account_gateway_absence::BinanceAbsentLimitOrder;
 #[path = "account_gateway_risk.rs"]
 mod account_gateway_risk;
 use account_gateway_risk::*;

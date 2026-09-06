@@ -1,6 +1,8 @@
 use super::*;
 use venue_control::leader_bot_admin::{LeaderBotAdminError, set_permission};
 use venue_control_protocol::leader_bot::*;
+#[path = "mirror_drain_fixture.rs"]
+mod mirror_drain_fixture;
 
 #[tokio::test]
 async fn leader_bot_grant_is_owned_revisioned_and_revocation_drains_without_resurrection()
@@ -220,7 +222,7 @@ async fn creation_waiting_for_admin_lock_observes_committed_revocation()
 #[tokio::test]
 async fn order_mirror_plans_once_and_revocation_cancels_only_definitely_unsent_children()
 -> Result<(), Box<dyn std::error::Error>> {
-    mirror_sizing_and_revocation(false, false).await
+    mirror_sizing_and_revocation(false, false, false).await
 }
 
 #[tokio::test]
@@ -412,18 +414,25 @@ async fn leader_bot_catalog_allows_same_account_presets_and_only_one_active_bot(
 #[tokio::test]
 async fn fixed_notional_mirror_uses_persisted_sizing_and_keeps_reconciliation_fences()
 -> Result<(), Box<dyn std::error::Error>> {
-    mirror_sizing_and_revocation(true, false).await
+    mirror_sizing_and_revocation(true, false, false).await
 }
 
 #[tokio::test]
 async fn mirror_admission_error_before_submit_does_not_leave_uncertain_commands()
 -> Result<(), Box<dyn std::error::Error>> {
-    mirror_sizing_and_revocation(false, true).await
+    mirror_sizing_and_revocation(false, true, false).await
+}
+
+#[tokio::test]
+async fn stopped_mirror_requires_complete_recent_absence_and_preserves_evidence()
+-> Result<(), Box<dyn std::error::Error>> {
+    mirror_sizing_and_revocation(false, false, true).await
 }
 
 async fn mirror_sizing_and_revocation(
     fixed: bool,
     admission_failure: bool,
+    drain_absence: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(url) = integration_database_url()? else {
         return Ok(());
@@ -507,6 +516,21 @@ async fn mirror_sizing_and_revocation(
     )
     .fetch_one(&fixture.pool)
     .await?;
+    if drain_absence {
+        shutdown.send(true)?;
+        task.await??;
+        mirror_drain_fixture::verify(
+            &fixture,
+            &follower,
+            &follower_credential,
+            &follower_account,
+            &bot,
+            &child,
+        )
+        .await?;
+        fixture.cleanup().await?;
+        return Ok(());
+    }
     if admission_failure {
         shutdown.send(true)?;
         task.await??;

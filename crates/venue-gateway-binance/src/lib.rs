@@ -21,10 +21,10 @@ use venue_gateway_api::CapabilityFlags;
 pub use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
 
 pub use account_gateway::{
-    BinanceAccountGateway, BinanceAccountGatewayError, BinanceCompletedProjection,
-    BinanceExecutionRiskInput, BinanceGridBootstrapMarketFacts, BinancePrivateAccountEvent,
-    BinancePrivateFillEvent, BinanceProjectionRead, BinancePublicMarketEvent,
-    prepare_execution_risk_readback,
+    BinanceAbsentLimitOrder, BinanceAccountGateway, BinanceAccountGatewayError,
+    BinanceCompletedProjection, BinanceExecutionRiskInput, BinanceGridBootstrapMarketFacts,
+    BinancePrivateAccountEvent, BinancePrivateFillEvent, BinanceProjectionRead,
+    BinancePublicMarketEvent, prepare_execution_risk_readback,
 };
 pub use binding::{BinanceAccountBinding, BinanceBindingError, native_symbol};
 pub use config::{BinanceConfig, endpoints};

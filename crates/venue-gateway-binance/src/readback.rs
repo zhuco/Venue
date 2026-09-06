@@ -33,6 +33,7 @@ pub enum BinancePrivateSurface {
     Fills,
     ExactOrder,
     ExactAlgoOrder,
+    OrderHistory,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,6 +177,7 @@ impl BinancePrivateReadRequest {
             BinancePrivateSurface::Fills => endpoints::USER_TRADES,
             BinancePrivateSurface::ExactOrder => endpoints::ORDER,
             BinancePrivateSurface::ExactAlgoOrder => endpoints::EXACT_ALGO_ORDER,
+            BinancePrivateSurface::OrderHistory => endpoints::ALL_ORDERS,
         }
     }
 
@@ -205,6 +207,23 @@ pub fn build_position_mode_request(
 
 fn symbol_parameters(scope: &BinancePrivateReadScope) -> Vec<(String, String)> {
     vec![("symbol".to_owned(), native_symbol(&scope.binding.symbol))]
+}
+
+pub(crate) fn build_recent_order_history_request(
+    scope: &BinancePrivateReadScope,
+    start_ms: u64,
+    end_ms: u64,
+) -> Result<BinancePrivateReadRequest, BinanceReadbackError> {
+    if start_ms == 0 || end_ms <= start_ms || end_ms - start_ms > 48 * 60 * 60 * 1000 {
+        return Err(BinanceReadbackError::Request);
+    }
+    let mut parameters = symbol_parameters(scope);
+    parameters.extend([
+        ("startTime".into(), start_ms.to_string()),
+        ("endTime".into(), end_ms.to_string()),
+        ("limit".into(), "1000".into()),
+    ]);
+    BinancePrivateReadRequest::new(scope, BinancePrivateSurface::OrderHistory, 1, parameters)
 }
 
 pub fn build_positions_request(
@@ -1029,6 +1048,52 @@ mod tests {
                 FILLS,
             )?,
         ])
+    }
+
+    #[test]
+    fn bounded_history_read_is_signed_symbol_scoped_and_cannot_replace_open_orders()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (config, rules, scope) = facts(
+            GatewayMode::Live,
+            "00000000-0000-4000-8000-000000000001",
+            7,
+            9,
+        )?;
+        let request = build_recent_order_history_request(&scope, 1_000, 2_000)?;
+        assert_eq!(request.method(), BinanceHttpMethod::Get);
+        assert_eq!(request.path(), "/papi/v1/um/allOrders");
+        assert_eq!(
+            request.parameters(),
+            &[
+                ("symbol".into(), "BTCUSDT".into()),
+                ("startTime".into(), "1000".into()),
+                ("endTime".into(), "2000".into()),
+                ("limit".into(), "1000".into())
+            ]
+        );
+        assert!(build_recent_order_history_request(&scope, 0, 2_000).is_err());
+        assert!(build_recent_order_history_request(&scope, 2_000, 1_000).is_err());
+        assert!(
+            build_recent_order_history_request(&scope, 1_000, 48 * 60 * 60 * 1000 + 1_001).is_err()
+        );
+        let mut input = pages(&scope)?;
+        input.push(page(request, b"[]")?);
+        assert!(
+            complete_private_readback(
+                &config,
+                &rules,
+                &scope,
+                RecentFillsCursor {
+                    observed_through_ms: 1_000,
+                    last_trade_id: None,
+                    last_event_time_ms: None
+                },
+                2_000,
+                input
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]

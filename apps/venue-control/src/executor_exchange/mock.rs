@@ -7,9 +7,14 @@ pub struct MockBinanceExecution {
     pub(super) grid_batch_failure: Option<GridBatchSubmitError>,
     pub(super) grid_batch_dispatch_started: Arc<AtomicBool>,
     pub(super) market_positions: Arc<Mutex<BTreeMap<String, Decimal>>>,
+    pub(super) absent_limits: BTreeMap<String, venue_gateway_binance::BinanceAbsentLimitOrder>,
 }
 
 impl MockBinanceExecution {
+    pub fn set_absent_limit(&mut self, fact: venue_gateway_binance::BinanceAbsentLimitOrder) {
+        self.absent_limits
+            .insert(fact.client_order_id.clone(), fact);
+    }
     pub fn set_rejection(&mut self, client_order_id: String, code: i64) {
         let mut result = outcome(ExecutionReadback::Rejected, None);
         result.exchange_error_code = Some(code);
@@ -41,6 +46,14 @@ impl MockBinanceExecution {
 }
 
 impl BinanceExecution for MockBinanceExecution {
+    fn confirm_draining_limit_absence<'a>(
+        &'a mut self,
+        request: &'a ExecutionRequest,
+        _: u64,
+        _: BinanceCredentials,
+    ) -> LimitAbsenceFuture<'a> {
+        Box::pin(async move { Ok(self.absent_limits.get(&request.client_order_id).cloned()) })
+    }
     fn prepare_market<'a>(
         &'a mut self,
         request: &'a ExecutionRequest,

@@ -24,6 +24,7 @@ mod activation;
 mod copy_drain;
 mod copy_targets;
 mod market;
+mod mirror_drain;
 
 pub const MIGRATION_0022: &str = include_str!("../migrations/0022_binance_reconcile_backoff.sql");
 

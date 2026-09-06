@@ -81,11 +81,27 @@ pub async fn inspect_account(
         let result = exchange
             .readback(&read, secrets.load(credential_id, &owner).await?)
             .await;
+        let stop_absence =
+            if let Some(candidate) = store.mirror_drain_candidate(&command, now_ms()?).await? {
+                Some(
+                    exchange
+                        .confirm_draining_limit_absence(
+                            &read,
+                            candidate.created_ms,
+                            secrets.load(credential_id, &owner).await?,
+                        )
+                        .await
+                        .map_err(|error| error.to_string()),
+                )
+            } else {
+                None
+            };
         commands.push(serde_json::json!({
             "command_id": command.command_id,
             "stored_state": format!("{:?}", command.state),
             "admission": format!("{admission:?}"),
             "readback": format!("{result:?}"),
+            "stop_absence": stop_absence,
         }));
     }
     pool.close().await;

@@ -1005,6 +1005,44 @@ where
             return Ok(drain_after_persisted_state(command.state));
         }
     };
+    if let Some(candidate) = store.mirror_drain_candidate(command, now_ms()?).await? {
+        let read = request(command);
+        match exchange
+            .confirm_draining_limit_absence(&read, candidate.created_ms, credentials)
+            .await
+        {
+            Ok(Some(fact))
+                if store
+                    .settle_absent_mirror_drain(command, &candidate, &fact, now_ms()?)
+                    .await? =>
+            {
+                tracing::info!(command_id = %command.command_id, "Stopped mirror confirmed absent by signed history and account readback");
+                return Ok(AccountDrainDecision::Continue);
+            }
+            _ => {
+                // A discovered order still needs the ordinary exact terminal/fill readback.
+                let credentials = match secrets
+                    .credentials(&command.credential_id, &command.owner_user_id)
+                    .await
+                {
+                    Ok(credentials) => credentials,
+                    Err(_) => {
+                        store
+                            .defer_reconciliation(
+                                command,
+                                command.state,
+                                now_ms()?,
+                                Some("readback_credentials_unavailable"),
+                                command.native_order_id.as_deref(),
+                            )
+                            .await?;
+                        return Ok(AccountDrainDecision::Stop);
+                    }
+                };
+                return readback_with_credentials(store, exchange, command, credentials).await;
+            }
+        }
+    }
     readback_with_credentials(store, exchange, command, credentials).await
 }
 
