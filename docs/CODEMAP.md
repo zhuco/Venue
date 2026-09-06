@@ -1,7 +1,5 @@
 # VENUE 功能代码地图
 
-五所独立策略新执行入口：`apps/venue-control/src/multi_venue_{store,runtime,exchange,credentials,risk}.rs`、`multi_venue_grid/`、`bin/venue-strategy-admin.rs` 与 migration `0035–0036`；由同一 `venue-executor-binance` 进程调度，复用既有命令表与密文。各所 `DurableAccountGateway` 不依赖旧 Host/WAL。命令、网格生命周期和迁入边界见 [多交易所策略与网格](MULTI_VENUE_EXECUTOR.md)，不扩展 Binance KOL。
-
 本页只定位当前入口与直接依赖。产品范围见 [README](../README.md)，职责见 [架构](ARCHITECTURE.md)，行为与验收见 [KOL MVP](KOL_COPY_MVP.md)、[挂单同步](LEADER_ORDER_MIRROR.md) 和 [Grid 契约](GRID_RUNTIME_REFACTOR.md)。路径均相对仓库根。
 
 当前发布链是 Control + PostgreSQL + 单例 `venue-executor-binance`，由桌面与 Web 消费。先按下面的功能进入代码；旧 Node/Actor/WAL 单列为冻结兼容，不能作为新链模板。
@@ -13,7 +11,7 @@
 | Rust workspace、依赖及固定工具链 | `Cargo.toml`、`Cargo.lock`、`rust-toolchain.toml` |
 | 产品版本与发布范围 | `VERSION`、`docs/CHANGELOG.md` |
 | Control HTTP 服务 | `apps/venue-control/src/bin/venue-control-server.rs` |
-| 单例 Binance Executor：私有投影、Grid、挂单同步、调度 | `apps/venue-control/src/bin/venue-executor-binance.rs` |
+| 共享 Executor：私有投影、挂单同步、Grid 与独立策略调度 | `apps/venue-control/src/bin/venue-executor-binance.rs` |
 | 带单授权、撤权及仅迁移命令 | `apps/venue-control/src/bin/venue-leader-bot-admin.rs`、`apps/venue-control/src/leader_bot_admin.rs` |
 | 版本化迁移及校验 | `apps/venue-control/src/schema.rs`、`apps/venue-control/migrations/`；alpha.28 安装至 0037 |
 | 本地受控构建与缓存准入 | `scripts/Invoke-VenueBuild.ps1`、`scripts/venue_build_guard.ps1` |
@@ -60,11 +58,12 @@
 | 配置与生命周期协议 | `crates/venue-control-protocol/src/grid.rs` |
 | 持久目标、版本 CAS、订单归属与批次尾 | `apps/venue-control/src/grid_store.rs`、`grid_store/{surface,reads,types}.rs`；迁移 0021–0024 |
 | 私流驱动、冷恢复、热路径及风险协调 | `apps/venue-control/src/grid_runtime.rs`、`grid_runtime/{driver,fast_path,reconcile,stream_overlay,risk}.rs` |
+| 批次组装与成交分配 | `apps/venue-control/src/grid_runtime/{batch,fills}.rs` |
 | 首次明确拒单后 30 秒重置 | `apps/venue-control/src/grid_store/{rejection,convergence}.rs`、`grid_runtime/driver.rs` |
 | 批内 Place-before-Cancel、RESULT 确认及计时 | `apps/venue-control/src/executor_exchange/grid_batch.rs` |
 | 公开规则、标记价及必要汇率事实 | `crates/venue-gateway-binance/src/grid_market.rs` |
 
-调用链和文件分工详见 [GRID_STRATEGY_ARCHITECTURE](GRID_STRATEGY_ARCHITECTURE.md)。旧恢复工件与迁入删除门见 [GRID_RUNTIME_REFACTOR](GRID_RUNTIME_REFACTOR.md#81-旧迁移代码删除门)。性能目标不以代码中的周期或历史测试结果代替实测。
+调用链见 [架构中的 Grid 流程](ARCHITECTURE.md#grid-flow)。旧恢复工件与迁入删除门见 [GRID_RUNTIME_REFACTOR](GRID_RUNTIME_REFACTOR.md#81-旧迁移代码删除门)。性能目标不以代码中的周期或历史测试结果代替实测。
 
 ## 桌面与 Web
 
@@ -88,7 +87,7 @@
 
 表中续写的短文件名相对同格首个文件的目录；终端执行相关缩写目录相对 `apps/venue-control/src/`。
 
-## 当前开发中的多交易所策略入口
+## 独立多交易所策略与支撑分批做多
 
 支撑分批做多（马丁）的当前模块、桌面/API、多币预算和市价/限价执行契约见 [SUPPORT_MARTINGALE](SUPPORT_MARTINGALE.md)。当前首个闭环只准入 Bybit LIVE；其他执行所仍按逐所真实验收放行。
 
@@ -114,7 +113,7 @@
 | 旧 JSONL、checkpoint 与 Actor Applied | `crates/venue-execution/src/journal.rs`、`crates/venue-storage/src/{journal,actor_applied}.rs` |
 | 旧 Copy delivery 与记账 | `apps/venue-control/src/{copy_planning_postgres,copy_execution_postgres,copy_ledger_postgres}.rs` |
 | 旧 Grid/Stage 7 与三所协议兼容 | `src/runtime/grid/`、`src/runtime/legacy/`、`src/exchange/` |
-| 非 Binance adapter 的旧调用与协议 | `crates/venue-gateway-{bitget,bybit,gate,okx,hyperliquid}/src/`；开发中新调用见上节，旧运行链不因此迁入 |
+| 非 Binance adapter 的旧调用与协议 | `crates/venue-gateway-{bitget,bybit,gate,okx,hyperliquid}/src/`；当前独立策略调用见上节，旧运行链不因此迁入 |
 | 冻结 Scalping | `crates/venue-strategies/src/scalping/`、`apps/venue-node/src/production_resident/scalping.rs` |
 | 根离线工件 verifier | `src/bin/verify-grid-inventory-recovery.rs`、`src/bin/verify-grid-exposure-shadow.rs` |
 | 共享规范事实及数量归一化 | `crates/venue-domain/src/domain/`、`crates/venue-execution/src/{account_snapshot,account_recovery_request,account_normalization}.rs` |

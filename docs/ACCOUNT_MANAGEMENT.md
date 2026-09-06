@@ -8,16 +8,18 @@
 - Venue 用户账号与真实交易所账户分开。注册/登录后才能加载、添加、验证、选择和删除自己的 API 绑定。
 - 新用户从 `/join/<invite_code>` 注册时由服务端在同一事务绑定唯一 KOL；邀请绑定不自动启用交易。初期全站最多 5 个启用 KOL、200 个启用跟单账户；KOL 由管理员授予，普通用户不能自行升级。
 - “添加 API”绑定用户已在币安创建的 Key，不代用户在交易所创建密钥。“删除绑定”只删除 Venue 中的加密凭证，不撤销交易所 Key。
-- API 验证只发签名 GET：读取权限、真实账户身份、Portfolio Margin 状态、UM 交易权限、双向持仓、持仓、普通挂单及 Algo 挂单；不下单、不撤单、不切换账户模式。当前仅接受 Binance Portfolio Margin UM，不声称支持普通合约账户。
+- API 验证只发签名 GET：读取权限、真实账户身份、Portfolio Margin 状态、UM 交易权限、双向持仓、持仓、普通挂单及 Algo 挂单；不下单、不撤单、不切换账户模式。本页用户 API 流程仅接受 Binance Portfolio Margin UM，不声称支持普通合约账户。
 - 同一真实账户的多把 Key 复用同一稳定 `trading_account_id`，不同用户不能认领同一真实账户。系统账号或 Key 数量不是 writer 数量。
 - 用户管理自己的 API 和跟单设置；KOL 还可通过专用托管接口添加经委托的 API、查看掩码、验证并逐账户配置跟单。托管边界见 [KOL MVP](KOL_COPY_MVP.md)，不授予读取已保存密钥的能力。
 - 启用跟单还要求明确选择定比/定额、资金及风险上限并再次确认；选择或验证账户本身不产生订单。
+
+非 Binance 独立策略凭证与账户准入使用 [多交易所管理员入口](MULTI_VENUE_EXECUTOR.md#操作入口)，不套用本页 Binance 用户绑定流程。
 
 ## 进程与状态
 
 Control 负责认证、邀请归属、KOL 页面、绑定管理、只读验证和查询投影。Binance Executor 是一个多账户进程，按活动账户需求维护有界私有投影与签名恢复，复用进程内顺序队列。新关系按普通限价挂单同步；不为每个账户启动 Node、Actor 或本地 WAL。
 
-UI 分开显示登录状态、邀请归属、API 验证、跟单启用和 Executor 最近报告。`api_reachable` 只说明验证期内签名读取成功，不表示 Executor 在线或跟单已启用。公共行情可由桌面直连 Binance；私有仓位、活动委托、成交和资产必须由服务端 Binance gateway 解析，再经唯一 Executor/Control 返回用户作用域投影，桌面不得持有 API Secret 或自行解析私流。无新鲜私有投影时必须显示未知/未连接，旧 Node 当前快照不得冒充完整委托或仓位历史。
+UI 分开显示登录状态、邀请归属、API 验证、跟单启用和 Executor 最近报告。`api_reachable` 只说明验证期内签名读取成功，不表示 Executor 在线或跟单已启用。公共行情默认经同一 HTTPS 主机的精确只读 Binance 反代获取；私有仓位、活动委托、成交和资产必须由服务端 Binance gateway 解析，再经唯一 Executor/Control 返回用户作用域投影，桌面不得持有 API Secret 或自行解析私流。无新鲜私有投影时必须显示未知/未连接，旧 Node 当前快照不得冒充完整委托或仓位历史。
 
 已通过的 API 验证结果保存在 PostgreSQL，不因桌面重启或 UI 计时器自动失效；Executor 的新鲜签名账户事实仍独立决定是否可交易。主动复验开始即撤销旧结果，并通过 revision 拒绝较旧并发探测覆盖较新结果。账户列表每 30 秒从 Control 刷新。
 
@@ -45,7 +47,7 @@ Windows 将有效登录会话保存至系统凭据库，启动后向服务端验
 
 ## 启动
 
-Control 使用现有 PostgreSQL，通过 `DATABASE_URL` 指定连接。以下命令只启动当前已提交组件，不代表 KOL MVP 已完成；设置 `VENUE_ACCOUNT_MASTER_KEY` 后运行：
+Control 使用现有 PostgreSQL，通过 `DATABASE_URL` 指定连接。本地启动前按 [发布指南](DEVELOPMENT.md#executor-release) 配置数据库角色与 `VENUE_ACCOUNT_MASTER_KEY`，先构建：
 
 ```powershell
 ./scripts/Invoke-VenueBuild.ps1 -CargoArguments @('build','--locked','-p','venue-control','--bin','venue-control-server')
@@ -53,9 +55,9 @@ Control 使用现有 PostgreSQL，通过 `DATABASE_URL` 指定连接。以下命
 ```
 
 编译结束后，从 guard 实际选择的固定缓存 `debug` 目录分别启动 `venue-control-server.exe` 和 `venueflow.exe`；
-主工作区默认为 `G:\Build\Venue\main\debug`。不要以长期 `cargo run` 占用构建锁。本次文档核对不自动启动任何服务。
+主工作区默认为 `G:\Build\Venue\main\debug`。不要以长期 `cargo run` 占用构建锁。启动与部署按当前任务的授权范围执行。
 
-Control 默认监听 `127.0.0.1:39180`，桌面默认连接 `https://clawdbotweb.site`，通过 Caddy 转发到服务器本机；地址设置与旧默认迁移见 [UI 说明](../apps/ui/README.md)。alpha.27 由 `schema.rs` 安装并校验截至 `0034` 的迁移，覆盖邀请、命令账本、Grid、挂单镜像、托管跟随者、定比/定额和多机器人目录。生产 Control 迁移后使用 `VENUE_CONTROL_RUNTIME_DATABASE_URL` 的受限角色；Executor 使用独立 `VENUE_EXECUTOR_DATABASE_URL`，完整配置及回滚见 [发布指南](DEVELOPMENT.md#executor-release)。`VENUE_CONTROL_BIND` 继续只允许 loopback；公网浏览器经同源 HTTPS BFF 访问。
+Control 默认监听 `127.0.0.1:39180`，桌面默认连接 `https://clawdbotweb.site`，通过 Caddy 转发到服务器本机；地址设置与旧默认迁移见 [UI 说明](../apps/ui/README.md)。alpha.28 的版本化迁移及运行角色要求统一见 [发布指南](DEVELOPMENT.md#executor-release)。生产 Control 迁移后使用 `VENUE_CONTROL_RUNTIME_DATABASE_URL` 的受限角色；Executor 使用独立 `VENUE_EXECUTOR_DATABASE_URL`，完整配置及回滚见 [发布指南](DEVELOPMENT.md#executor-release)。`VENUE_CONTROL_BIND` 继续只允许 loopback；公网浏览器经同源 HTTPS BFF 访问。
 
 不要把数据库 URL、主密钥或实际 API Key 粘贴到诊断输出。主密钥丢失无法恢复绑定密文；轮换必须另行设计迁移，不可直接换值后假定旧绑定仍可用。
 

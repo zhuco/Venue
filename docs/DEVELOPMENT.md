@@ -1,10 +1,6 @@
 # 开发、验证与合并
 
-独立多交易所策略的 Control 发布包新增 `venue-strategy-admin`，执行仍由现有 `venue-executor-binance` 单例承担；调用、凭证与逐所验收见 [MULTI_VENUE_EXECUTOR](MULTI_VENUE_EXECUTOR.md)。这不授权部署或启动实盘。
-
-本指南只说明当前工作方式，不自动启动 [Binance KOL 跟单 MVP](KOL_COPY_MVP.md) 中的任务。
-先读 [CODEMAP](CODEMAP.md) 定位；当前产品范围和阶段门统一读 [KOL MVP 契约](KOL_COPY_MVP.md)。只有维护冻结旧 Node、Grid 或其运行工件时，才完整读 [旧运行时契约](GRID_RUNTIME_REFACTOR.md)。
-业务边界见 [ARCHITECTURE](ARCHITECTURE.md)，旧方法状态见 [停用入口](ARCHITECTURE.md#deprecated)。
+本页统一维护构建缓存、验证、合并、版本化发布和回滚。先从 [CODEMAP](CODEMAP.md) 定位源码，再从 [文档目录](README.md) 进入对应业务契约；各策略的准入与验收范围分别维护。
 
 ## 1. 工作区与环境
 
@@ -38,9 +34,9 @@ Windows 所有 Cargo 命令都经过 guard。下面是需要全量基线时的�
 `verify_postgres_integration.ps1`、`verify_workspace_quality.ps1` 自带 guard，直接执行，不二次套锁。
 记录验证的 commit/源码范围、被测目标及跳过项；解析 fixture 通过不等于真实连接，数据库跳过不等于集成测试通过。
 
-## 3. 构建缓存与 Ubuntu
+## 3. 构建入口
 
-完整约束集中在本页[构建规则](#build-policy)，包括 main/slot-1/slot-2、双并发、磁盘预算和本机 Ubuntu 交叉编译。所有 Cargo 都走 guard；不在弱服务器日常编译，不新建 target。
+所有 Cargo 操作统一经过 [构建规则与固定缓存](#build-policy)；Ubuntu Control 包使用同节的 `Build-VenueUbuntu.ps1 -Component Control`。
 
 ## 4. 本地应用
 

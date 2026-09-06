@@ -1,18 +1,12 @@
 # Venue Web
 
-KOL 登录 `/` 或 `/login` 后可在“托管跟单账户”打开“添加托管 API Key”对话框；保存成功清空密钥输入并列出掩码，提供手动权限验证。批量最多 10 个，每行稳定请求编号用于结果不确定后的原内容重试，浏览器不将密钥保存至本地存储。BFF `managed-followers` / `managed-verify` 继续强制同源、加密 Cookie、CSRF 与响应字段白名单。该入口不启用跟单。
+Web 提供 Binance KOL 邀请页、注册登录、API 与托管账户、跟单设置和带单控制；`/ops` 保留独立运营会话。桌面交易、Grid 与支撑分批做多入口见 [UI 说明](../apps/ui/README.md)，五所独立策略范围见 [多交易所执行](MULTI_VENUE_EXECUTOR.md)。
 
-Current Web scope: the Binance KOL invite landing page, user registration/login, API binding and verification, managed followers, follow settings/status and leader bot controls. The Binance trading terminal and unified Grid/leader robot list are implemented in the sibling VenueFlow desktop client; a full browser terminal is not yet equivalent. Binance Grid shares the current Executor, while non-Binance migration remains outside this release. Product acceptance follows [KOL_COPY_MVP](KOL_COPY_MVP.md). The browser never contains an exchange gateway or decrypted API credential.
+本页维护 BFF 会话、运行配置、HTTPS 路由及浏览器验证。注册和凭证流程见 [账户管理](ACCOUNT_MANAGEMENT.md)，托管业务约束见 [KOL 契约](KOL_COPY_MVP.md)，机器人权限与生命周期见 [带单同步](LEADER_ORDER_MIRROR.md)。KOL 页面仅允许有界纯文本，固定平台风险说明不可编辑。
 
-Responsive Control client using schema v2 only. Product version and known limits: [root README](../README.md), [release notes](CHANGELOG.md). Development workflow: [DEVELOPMENT](DEVELOPMENT.md).
+`lib/customer-server.ts` 将 Control 用户会话加密存入 Secure/HttpOnly/SameSite=Strict Cookie，浏览器只获得用户摘要和 CSRF；客户请求不使用运营环境令牌。写入校验 Origin/Host、JSON 与 CSRF。密钥仅在用户输入与受控绑定请求中短时传递，提交成功清空，不进入浏览器持久化或响应回显。构建产物不包含交易所网关或部署密钥。
 
-Use Node.js 24, matching CI. The package minimum is >=22.18; that lower bound does not certify every newer major. Next.js 16.3.3, React/React DOM 19.2.8 and TypeScript 7.0.2 are pinned in the package/lockfile. This is the user-facing DOM application, not the internal VenueFlow WASM canvas client.
-
-The customer console at `/` provides login, owned API binding/verification, follow settings, mirrored orders and the permission-controlled leader bot. `/join/<invite_code>` provides invite registration and profile text. `lib/customer-server.ts` encrypts the actual Control user session in a Secure/HttpOnly/SameSite=Strict cookie; authenticated writes require same-origin JSON and CSRF. Only its server-side credential serializer is exempt from the source credential-field scan; browser chunks remain fully checked. See [leader bot contract](LEADER_ORDER_MIRROR.md).
-
-The earlier operator console is retained at `/ops` with its separate environment-injected session. Customer requests never inherit this identity. KOL page editing and the full browser trading terminal remain separate product acceptance items; this change provides the leader bot controls and preserves the desktop terminal.
-
-KOL page content is bounded plain text, never arbitrary HTML or script; fixed platform risk text is not editable. Product requirements for page editing are maintained in the KOL contract, separately from the routes currently exposed by the customer console.
+使用与 CI 一致的 Node.js 24；版本和命令以 `apps/ui/web/package.json`、lockfile 为准。当前 BFF 使用 schema v2，不能由页面可见推断真实账户已启用。
 
 ## Build and run
 
@@ -20,7 +14,7 @@ Behind the HTTPS reverse proxy, set `VENUE_WEB_PUBLIC_ORIGIN=https://clawdbotweb
 
 Run `npm ci`, `npm run typecheck`, `npm test`, and `npm run build` from `apps/ui/web`. The build produces `.next/standalone`, including `.next/static` and optional `public` assets. `npm run start` runs the standalone server; `PORT` and `HOSTNAME` control its listener. Deploy the generated standalone directory as one versioned release, without environment files or QA artifacts. Production browser access requires HTTPS.
 
-Next.js 16 does not run a linter during `next build`; this repository currently has no ESLint/Biome script. Typecheck and boundary scans must not be reported as a full lint pass. See the [official Next 16 changes](https://nextjs.org/blog/next-16); runtime support references are in [ARCHITECTURE](ARCHITECTURE.md).
+Next.js 16 does not run a linter during `next build`; this repository currently has no ESLint/Biome script. Typecheck and boundary scans must not be reported as a full lint pass. See the [official Next 16 changes](https://nextjs.org/blog/next-16); the supported project runtime is defined in [DEVELOPMENT](DEVELOPMENT.md).
 
 After building, run `npm run verify:boundary`. It scans application source and browser JavaScript for legacy Control endpoints, non-LIVE gateway modes, exchange credential fields, direct exchange API URLs and URL credentials. It reports only filenames/rule names, never matching secret text. CI runs this guard, typecheck, unit tests, production build and all five browser viewports; the isolated browser fixtures are not deployed.
 

@@ -14,13 +14,11 @@
 
 每账户独立选择定比或定额跟单，迁移 `0032` 的旧记录默认定比。定比保留原数量比例公式；定额使用正数报价币名义金额除以源限价，不再乘资金比例或倍数。两种模式的开仓数量均按交易所步长向上取整，并补足最低数量/最低名义额；单笔名义额及其上限允许最小合规取整差额，实际金额仍受账户总风险上限和交易所最大数量限制。已有子单成交先扣减；只减仓数量仍向下裁剪，不补足开仓最低额。命令持久化取整策略，旧命令回读保留原规则，详见 [挂单同步数量契约](LEADER_ORDER_MIRROR.md#同步规则)。改变参数前必须暂停并结清未决同步订单。迁移 `0034` 增加私有带单机器人目录、配置版本及单活动实例约束。保存设置不自动启用。
 
-更新：2026-09-05
-
 ## 1. 文档职责
 
 本文定义可供真实用户使用的 Binance KOL 跟单 MVP，拥有其产品流程、挂单同步语义、安全边界和验收标准。Binance Grid 的当前重建契约由 [`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md) 管理；两者共用单例 Executor，但都不得引入 Actor、Checkpoint、handoff 或每账户进程。
 
-本阶段只做 Binance。旧 Grid 接管路线停止，新的事实驱动 Binance Grid 与 KOL 共用执行链；Gate.io、Bitget、Bybit、OKX、Hyperliquid、Scalping 仍暂停。暂停不等于删除其运行工件或恢复事实。
+本契约的 KOL 范围只覆盖 Binance；五所独立策略按 [MULTI_VENUE_EXECUTOR](MULTI_VENUE_EXECUTOR.md) 准入，不提供跨所 KOL 跟单。旧 Grid/Node 接管路线继续冻结，Scalping 暂缓；冻结不等于删除运行工件或恢复事实。
 
 Grid 明确交易所拒单采用首次拒单后 30 秒开始重置的恢复语义，期间继续正常补撤；后续拒单不刷新期限，实际撤单重布使用独立收敛计时。超时或响应未知仍由统一命令账本按原 clientOrderId 对账，不能作为明确拒单重发；完整边界见 Grid 契约第 5.1 节。
 
@@ -100,9 +98,9 @@ KOL 可编辑字段限定为：公开名称（1–40 字）、页面标题（1�
 
 页面必须固定展示平台风险提示、KOL 内容为其自行提供的说明、历史表现不代表未来结果。KOL 最多看到聚合跟随人数和聚合运行状态；不得读取跟随者密码、API Key、API Secret、完整账户身份、持仓明细或订单明细。任何 UI（包括管理员 UI）均不提供 API 明文查看功能。
 
-## 5. 目标架构与进程边界
+## 5. 当前架构与进程边界
 
-目标拓扑固定为：
+当前拓扑为：
 
 ```text
 浏览器
@@ -255,22 +253,11 @@ Pending -> Sending -> Accepted -> Reconciled
 
 它们保持可编译、可读取既有恢复事实，除非阻挡本 MVP 的共享类型编译或构建；不得借本任务删除旧恢复工件、改写旧 WAL、宣称旧三所接管完成或恢复旧生产入口。
 
-新 Executor 上线后，所有新 Binance 跟单订单只允许从该入口产生。已有旧 Copy 关系先暂停并完成签名核对，再以干净账户和新 revision 重新启用；不迁移旧 Actor/manifest 的中间状态。
+所有新 Binance 跟单订单只允许从共享 Executor 入口产生。已有旧 Copy 关系先暂停并完成签名核对，再以干净账户和新 revision 重新启用；不迁移旧 Actor/manifest 的中间状态。
 
-### 9.3 目标代码落点
+### 9.3 代码入口
 
-本轮不新建通用 runtime crate，也不搬迁整个 workspace。改动限定为：
-
-- 在现有 `apps/venue-control` package 内新增薄 binary `src/bin/venue-executor-binance.rs` 和按职责拆分的 `executor_runtime/`、`executor_store/`、`executor_exchange/`、`order_mirror/` 模块，管理员授权入口为 `src/bin/venue-leader-bot-admin.rs`；旧 `venue-copy-worker` 在开发期只作冻结参考，MVP 发布清单中不得与新 binary 并存。
-- 在 `apps/venue-control/migrations/` 增量增加 KOL、邀请、唯一归属、跟单设置、源成交/目标版本、命令账本和执行投影表；不改写旧 migration 或旧恢复记录。
-- 在 `apps/venue-control/src/accounts/`、HTTP/service/repository 现有边界内扩展用户会话、KOL 权限和凭证授权；不建立第二个认证服务。
-- 在 `crates/venue-control-protocol` 增量加入邀请、KOL 页面、终端和跟单状态 DTO；不复用旧 Node delivery DTO 作为新 Executor 协议。
-- 在 `crates/venue-gateway-binance` 补齐 Portfolio Margin UM 认证账户流、Post Only 限价、市价平仓、精确撤单和同代签名回读；不复制签名 HTTP client。
-- 在现有 `apps/ui/web` 增加 `/join/<invite_code>`、注册/登录、API 管理、跟单状态和 KOL 页面编辑；桌面终端只位于同级的 `apps/ui/desktop`。
-
-挂单同步复用唯一 Executor，管理员工具只修改授权与审计。冻结旧 Node 的恢复数据格式不变，不作为新链依赖。
-
-当前代码包含 `0017`–`0034` 数据契约与 `schema.rs` 版本化安装、邀请/KOL/跟单/Grid/机器人目录 HTTP、唯一 `venue-executor-binance`、私流与签名 REST 投影、Post Only/市价平仓/精确撤单命令账本、耐久签名回读退避及桌面消费链。真实凭证联调、旧账户迁移和 2 核 4 GiB/真实 Canary 仍须按验收门执行；存在旧 `venue_control_strategy_scopes` 的账户在 Control 入账与 Executor 抢占两处均保持拒绝。
+具体模块、协议、数据库迁移和测试只在 [CODEMAP](CODEMAP.md) 维护；组件职责见 [ARCHITECTURE](ARCHITECTURE.md)。本页保留产品与验收约束。
 
 ## 10. 改造与发布边界
 

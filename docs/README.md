@@ -1,6 +1,6 @@
 # VENUE 文档目录
 
-当前发布范围是 Binance KOL 挂单同步、VenueFlow 终端和事实驱动对冲网格，共用单例多账户 Executor 与 PostgreSQL 命令账本。版本与功能摘要见 [项目 README](../README.md)。
+当前 alpha.28 包含 Binance KOL/终端/Grid、五所独立策略与网格，以及 Bybit 支撑分批做多桌面闭环；共用单例多账户 Executor 与 PostgreSQL 命令账本。版本与功能摘要见 [项目 README](../README.md)。
 
 | 要解决的问题 | 说明入口 |
 |---|---|
@@ -10,9 +10,9 @@
 | KOL 产品流程和验收要求 | [KOL MVP](KOL_COPY_MVP.md) |
 | 如何授权、配置和启停带单机器人 | [带单机器人与挂单同步](LEADER_ORDER_MIRROR.md) |
 | 进程如何协作、功能代码在哪里 | [架构](ARCHITECTURE.md)、[CODEMAP](CODEMAP.md) |
-| Grid 如何规划和运行 | [Grid 开发结构](GRID_STRATEGY_ARCHITECTURE.md) |
-| 当前开发中的独立多交易所策略入口 | [多交易所执行](MULTI_VENUE_EXECUTOR.md)；与 alpha.27 发布基线分开验证 |
-| 支撑分批做多如何开发并接入桌面 | [马丁策略开发与评估](SUPPORT_MARTINGALE.md)；单账户多币、币安参考行情、市价买入与限价止盈，待实现契约 |
+| Grid 如何规划和运行 | [Grid 调用链](ARCHITECTURE.md#grid-flow) / [Grid 行为契约](GRID_RUNTIME_REFACTOR.md) |
+| 独立多交易所命令、网格与账户准入 | [多交易所执行](MULTI_VENUE_EXECUTOR.md) |
+| 支撑分批做多的当前能力与增强门 | [策略与桌面契约](SUPPORT_MARTINGALE.md)；Binance 参考行情、Bybit LIVE 执行 |
 | 如何处理旧 Grid/Node 账户和恢复事实 | [Grid 契约与旧运行时保护](GRID_RUNTIME_REFACTOR.md)、[冻结 Node CLI](NODE.md) |
 | 如何构建、验证、合并及管理版本 | [开发指南](DEVELOPMENT.md) |
 | 如何发布或回滚 Control/Executor | [发布及回滚清单](DEVELOPMENT.md#executor-release) |

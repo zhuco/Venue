@@ -1,7 +1,7 @@
 # Venue Node：冻结的六所账户节点
 
 本页只描述仓库中已经提交的旧 `venue-node-*` CLI 和恢复边界，供维护既有账户与工件使用。当前产品目标见
-[Binance KOL 跟单 MVP](KOL_COPY_MVP.md)：新用户、KOL 终端和跟单统一进入计划中的单个多账户 Binance Executor，
+[Binance KOL 跟单 MVP](KOL_COPY_MVP.md)：新用户、KOL 终端和跟单统一进入现有单例多账户 Executor，
 不得继续扩展这里的每账户 Node、Actor、Checkpoint、handoff 或本地 WAL。
 
 所有旧 Node、Grid、Scalping 及六所接管均冻结；本页保留的构建、启动和配置字段不是新部署或启用指令。任何旧账户未完成签名收敛前不得加入新 Executor，新旧实现也不得同时写同一账户。

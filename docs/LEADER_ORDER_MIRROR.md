@@ -66,9 +66,7 @@ venue-leader-bot-admin migrate
 
 ## Web 会话
 
-`lib/customer-server.ts` 为固定的用户路由转发 BFF。Control 登录令牌加密放入 Secure/HttpOnly/SameSite=Strict Cookie，浏览器只获得用户摘要和 CSRF 值；客户请求不使用运营会话环境令牌。写请求校验 Origin/Host、JSON 和 CSRF。
-
-密钥字段只允许在该服务端文件中构造 Control 绑定请求，所有浏览器产物仍禁止这些字段及直连交易所。输入提交后清空；没有密钥回显或浏览器持久化。运营控制台保留在 `/ops`，与用户登录 Cookie 分离。
+客户与运营会话隔离、Cookie 加密、CSRF、凭证表单和构建边界统一维护在 [Web 指南](WEB.md)。机器人接口仍在 Control 按用户归属和带单授权校验。
 
 ## 验收
 

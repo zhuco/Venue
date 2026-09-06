@@ -1,16 +1,16 @@
-# 支撑分批做多策略：开发与桌面接入契约
+# 支撑分批做多：当前实现与增强契约
 
 本文定义 `support_martingale` 的开发范围、策略规则、执行边界、VenueFlow 桌面交互和验收标准。产品名称为“支撑分批做多（马丁）”。当前源码已完成 Bybit 首个可运行 MVP；盈利能力仍须用持续实盘和样本外回测验证，部署与真实交易结果按每次验收记录判断。
 
 依赖现有[架构](ARCHITECTURE.md)、[多交易所执行](MULTI_VENUE_EXECUTOR.md)和[UI 入口](../apps/ui/README.md)。本策略是独立自营策略；Binance KOL 仍只按原契约同步普通限价挂单，本策略的市价首仓/补仓不会因此自动获得 KOL 复制支持。
 
-## 0. 当前实现状态（2026-09-06）
+## 0. alpha.28 实现边界
 
-已实现范围是：`venue-strategies` 的纯规则；Binance USD-M 15m/1h/4h 与 BTC 4h 公共 REST 连续性和新鲜度检查；Bybit 签名账户事实、市价累计成交回读、GTC 只减仓限价止盈；migration 0037 的实例、逐币、支撑身份、预算预留和命令关联；共享 Executor 单账户串行调度与发送前复核；Control 的创建/列表/详情/只读预检/生命周期接口；VenueFlow 的绑定账户保存、预检、风险确认、启动/暂停/等待止盈及失败展示。一个实例可同时运行多个交易对，首个实盘配置固定使用 `SOL/USDT,DOGE/USDT`。
+已实现范围是：`venue-strategies` 的纯规则；Binance USD-M 15m/1h/4h 与 BTC 4h 公共 REST 连续性和新鲜度检查；Bybit 签名账户事实、市价累计成交回读、GTC 只减仓限价止盈；migration 0037 的实例、逐币、支撑身份、预算预留和命令关联；共享 Executor 单账户串行调度与发送前复核；Control 的创建/列表/详情/只读预检/生命周期接口；VenueFlow 的绑定账户保存、预检、风险确认、启动/暂停/等待止盈及失败展示。一个实例可同时配置多个规范交易对；具体币种和预算由实例配置决定，不将历史实盘参数写成产品默认值。
 
 当前止盈使用保守的入场与退出费率上界，界面和状态必须视为估算；Bybit 已结算资金费的逐轮归集是精确净收益展示的增强项。未取得该事实时不把估算收益写成实际净收益，实盘候选使用较低总名义预算保留保证金缓冲。其他四个非 Binance 执行所虽然共享 Durable Gateway，仍须逐所完成本策略的市价、止盈、费用和恢复验收后才能启用；Binance 在本策略中先只作为无凭证参考行情源。
 
-本文后续较当前 MVP 更宽的 capabilities/preflight、人工批量平仓、历史决策明细、资金费精确归集和逐所验收条目属于增强门，不应从文档描述推断已经上线。当前可调用接口以第 9 节明确标注的三类实例接口为准。
+本文后续的 capabilities、人工批量平仓、历史决策明细、资金费精确归集和逐所验收条目属于增强门，不应从文档描述推断已经上线。实例签名 preflight 已实现；可调用的 method/path 以第 9 节明确标注的接口及源码协议常量为准。
 
 ## 1. 产品范围与评估结论
 
@@ -34,25 +34,15 @@
 
 币安集中提供参考行情便于统一信号和回测，但“用户多”不足以证明每个合约都不受操控，也不能保证执行所价格跟随。低流动性标的、交易所价差、插针、下架、数据中断与稳定币偏离仍需独立处理。BTC 的长期判断也不能外推为所有候选币都会回本。
 
-## 2. 当前可复用能力与缺口
+## 2. 当前组件与剩余缺口
 
-以下为当前源码边界，不能从“有源码”推断已经部署。
+纯规划位于 `venue-strategies`，共享 EMA/RSI/ATR 由 `venue-indicators` 提供；Control 的 `support_martingale` 负责持久化、参考行情与运行编排，通过 `multi_venue_*` 入账执行。协议、用户 API 和桌面 view/client 已接线，具体文件统一见 [CODEMAP](CODEMAP.md#独立多交易所策略与支撑分批做多)。
 
-| 当前入口 | 可复用内容 | 本策略必须新增或补齐 |
-|---|---|---|
-| `crates/venue-strategies/src/` | 纯策略包，已依赖 domain 与 indicators | 新的纯规则、支撑识别和持仓轮次规划；不套用对冲 Grid 数学 |
-| `crates/venue-indicators/src/chart/` | `Ema`、`Rsi`、`Atr` 与已收盘 `PublicBar` 指标 | 相对成交额、支撑识别属于当前实际需求；复用指标算法，不复制一套 |
-| `crates/venue-gateway-binance/src/public.rs` | 1m/5m/15m/1h/4h/1d K 线解析，区分形成中与已收盘 | Executor 的共享参考行情订阅、补缺与策略消费；不依赖桌面市场线程 |
-| `apps/venue-control/src/executor_{store,runtime,exchange}/` | Binance 既有命令账本、账户队列、签名恢复及物理执行 | 为该独立策略明确命令 origin、入账、领取、结算和生命周期接线 |
-| `apps/venue-control/src/multi_venue_{store,runtime,exchange,credentials,risk}.rs` | 另外五所独立命令、密文和物理网关 | 多币组合预算、在途资金预留、多币一致账户事实及策略 API |
-| `crates/venue-execution/src/durable_gateway.rs` | 已入账命令发送、精确撤单和签名减仓边界 | 市价累计成交、实际均价/成交额/费用与资金费的完整结算契约 |
-| `apps/ui/desktop/src/{leader_bot_view,grid_view}.rs` | 统一机器人入口、模态配置、凭证及 revision 保护 | 独立策略类型、配置、逐币状态和生命周期 |
+`multi_venue_*` 的 venue 范围是另外五所，不能直接填入 Binance；当前首个桌面闭环是 Bybit。若扩展 Binance，必须接既有 Binance 分支并完成本策略准入，不能绕到手动终端或旧 Node。各所通用网关存在不代表本策略已逐所验收。
 
-特别注意：当前 `multi_venue_*` 的 `StrategyGateway`、凭证枚举和 migration 0035 的 `strategy_venue` 范围是另外五所，不能直接把 Binance 填进去。Binance 应接既有 Binance 执行分支，并为本策略补齐受控入口；不得绕到桌面手动下单或旧 Node。共享 Executor 进程不等于已有完全统一的六所策略 API。
+策略在实例及逐币状态中持久化预算和在途预留，通用 `StrategyRiskLimits` 仍只负责单笔/单交易对限额。当前市价累计成交已用于持仓和止盈；精确资金费归集与整轮净收益仍是增强门，不能把估算成本写成已结算盈亏。
 
-当前 `StrategyRiskLimits` 只有单笔和单交易对上限，不是多交易对组合风控。部分策略快照按单 symbol 读取并覆盖 credential 投影；必须补齐多币账户范围和时效，不能把最近一次快照当作全账户完整事实。现有 `DurableOrderObservation` 的 ID、state、filled_quantity 及限价 Grid 用途，也不足以直接核算市价买入均价和整轮净利润。
-
-当前桌面 `market_client.rs` 的最多 8 个订阅是显示能力；新策略最多 30 个候选、10 个持仓不能受当前图表选择或窗口存活限制。当前 `indicator_projection.rs` 还绑定 Scalping 特征来源，不把它直接当作本策略行情 runtime，Scalping 保持冻结。
+参考行情由服务端 `reference_market.rs` 获取，不依赖桌面最多 8 个图表订阅或窗口存活。Scalping 的旧指标投影不作为本策略运行入口。
 
 ## 3. 配置与账户准入
 
@@ -218,7 +208,7 @@ P_tp  = ceil_to_execution_tick(P_min)
 
 ## 8. 生命周期、持久化与重启
 
-实例的用户目标生命周期 `desired_lifecycle` 使用 `Stopped / Running / EntryPaused / IncreasePaused / Draining`，健康状态独立记录 `Ready / NeedsAttention` 及原因；显示的有效状态由两者共同决定。故障恢复不能把原来的暂停或 Draining 自动改回 Running。逐币另有 `Waiting / EntryPending / Holding / AddPending / ExitOnly / Cooldown`，以及对账、费用不完整和止盈阻塞原因。各状态是业务记录，不新增 Actor 或通用运行引擎。
+实例的用户目标生命周期 `desired_lifecycle` 使用 `Stopped / Running / EntryPaused / IncreasePaused / Draining`，健康状态按当前协议独立记录 `Healthy / NeedsAttention / Unavailable` 及原因；显示的有效状态由两者共同决定。故障恢复不能把原来的暂停或 Draining 自动改回 Running。逐币另有 `Waiting / EntryPending / Holding / AddPending / ExitOnly / Cooldown`，以及对账、费用不完整和止盈阻塞原因。各状态是业务记录，不新增 Actor 或通用运行引擎。
 
 | 桌面动作 | 服务端语义 |
 |---|---|
@@ -227,22 +217,23 @@ P_tp  = ceil_to_execution_tick(P_min)
 | 暂停增险 | 禁止首仓和补仓；撤销未发送增险意图，已发送按原身份对账；继续维护止盈 |
 | 停止并等待止盈 | 进入 Draining，禁止增险，后台继续维护限价止盈；全部归零并核清订单后才变 Stopped |
 | 恢复 | 检查 revision、账户事实、阻塞原因及预算；保留原 cycle/支撑使用记录 |
-| 全部市价平仓 | 独立人工动作，二次确认明确账户、币种、数量及可能亏损；封增险、对账并撤旧TP、按新鲜可减仓量发送；失败逐币显示 |
-| 删除/更换账户 | 仅完全 Stopped、无持仓/自有订单/未决命令时允许；不重置历史成本或支撑事实 |
+| 全部市价平仓（增强项） | 独立人工动作，二次确认明确账户、币种、数量及可能亏损；封增险、对账并撤旧TP、按新鲜可减仓量发送；失败逐币显示 |
+| 删除/更换账户（增强项） | 仅完全 Stopped、无持仓/自有订单/未决命令时允许；不重置历史成本或支撑事实 |
 
 停止不代表即时清仓，等待可能无限期；关闭窗口或网络断开不停止服务器策略。人工市价平仓属于用户明确操作，不构成自动止损规则，不得平仓后自动重开。组级与逐币暂停分别记录，恢复组级状态不能解除某币的人工暂停或风控阻塞。
 
 首次版本只有 Stopped 且无仓位、自有订单和未决命令时才允许编辑金额、币池和信号配置，暂停不等于可编辑。持仓中不允许通过换实例、换 credential、改 revision 或删除币种重新获得预算。人工减仓/外部订单导致事实偏离时暂停增险，核对并调整止盈；不自动买回人工减掉的数量。归零前不释放账户占用。
 
-建议新增最小业务表，具体 migration 号在实施时取下一个未占用编号，不能复写0035/0036：
+当前持久化由 migration `0037_support_martingale.sql` 定义：
 
-| 建议业务记录 | 内容与唯一性 |
+| 已有表 | 职责 |
 |---|---|
-| `venue_support_martingale_instances` | 本人/账户/执行所、配置、revision、生命周期；真实账户活动实例排他 |
-| `venue_support_martingale_cycles` | 每币当前及历史轮次，首次成交时间、层数、累计投入、费用游标与决策版本；同实例同币最多一个未结束轮次 |
-| `venue_support_martingale_supports` | 冻结支撑、别名合并、使用状态、关联命令；`cycle_id + support_id` 唯一 |
-| `venue_support_martingale_decisions` | 信号收盘时间、关键指标摘要、拒绝原因及原命令引用；只保存本策略决策，不复制订单/成交 journal |
-| 账户预算行与 reservation | 复用/最小扩展现有Store事务，按 command ID 唯一；跨币预留、实际消耗与终态释放 |
+| `venue_support_martingale_instances` | 本人、账户、执行所、配置、revision、生命周期、健康与共享预算预留 |
+| `venue_support_martingale_symbol_states` | 逐币轮次、持仓成本、支撑状态及未决命令 |
+| `venue_support_martingale_commands` | 策略命令与实例、币种、轮次、支撑及用途的关联和消费状态 |
+| `venue_support_martingale_requests` | 用户请求摘要、结果及生命周期幂等 |
+
+独立历史轮次/决策明细及精确资金费消费属于增强需求，不能将设计中的表名当成已安装表。后续迁移使用新的未占用编号，已应用的 0037 不回写。
 
 委托身份和执行状态仍在现有 `venue_binance_commands` 账本；签名订单、成交、持仓和费用复用规范事实与可靠消费游标，确有缺口才扩展，禁止新建平行订单账本。支撑是否用过无法从当前仓位推断，必须保存 PostgreSQL；这不构成旧 WAL/checkpoint 恢复模式。
 
@@ -250,7 +241,7 @@ P_tp  = ceil_to_execution_tick(P_min)
 
 ## 9. VenueFlow 桌面与 Control 协议
 
-机器人页在 `execution_view.rs::show → Tab::Bots → leader_bot_view.rs` 增加独立类型，复用现有列表样式，不把本策略伪装成 Grid 或 KOL。建议新增 `support_martingale_view.rs` 和 `client/support_martingale.rs`，文件按职责拆分且遵守2000行上限。
+机器人页在 `execution_view.rs::show → Tab::Bots → leader_bot_view.rs` 增加独立类型，复用现有列表样式，不把本策略伪装成 Grid 或 KOL。当前实现为 `support_martingale_view.rs` 和 `client/support_martingale.rs`，文件按职责拆分。
 
 创建入口：“新建机器人 → 支撑分批做多”。首先选执行交易所/账户，再选择交易对；固定显示“参考行情：Binance USD-M”。账户掩码、真实身份摘要、支持的订单/持仓模式与缺失能力由服务端返回，不把当前 `CredentialSummary::selectable()` 的 Binance 双向条件硬套 Hyperliquid Net。
 
@@ -283,19 +274,9 @@ P_tp  = ceil_to_execution_tick(P_min)
 
 ## 10. 实施落点与交易所能力
 
-以下目录/文件为本策略拟新增，只有实际实现时才加入模块声明，不预装空壳：
+源码入口统一维护在 [CODEMAP](CODEMAP.md)，不在本页重复文件表。下面列出本策略各执行所的能力边界；Bybit 为当前首个闭环，其余行是扩展时必须核验的条件。
 
-| 落点 | 当前任务需要的职责 |
-|---|---|
-| `crates/venue-strategies/src/support_martingale/` | 配置校验、支撑/事件识别、预算输入后的纯规划、成本目标；无网络、数据库、凭证 |
-| `apps/venue-control/src/support_martingale/` | `store`、`runtime`、`market`、`risk`、`settlement` 按职责组合；PG事务和既有Executor调度 |
-| control-protocol 与 accounts 新模块 | DTO、归属、配置CAS、生命周期和用户投影 |
-| desktop 新 view/client | 列表、配置、详情及幂等请求 |
-| 现 gateway/execution 模块 | 仅补当前欠缺的规范成交/费用、深度、时效和减仓能力，不另建物理订单客户端 |
-
-现有依赖已覆盖核心需要：tokio、reqwest、tokio-tungstenite、serde、rust_decimal、sqlx、secrecy/zeroize、共享指标。当前没有引入新直接依赖的理由；若实施发现缺口，按项目依赖治理说明实际调用和专项验证。
-
-| 执行所 | 当前分支与本策略准入重点 |
+| 执行所 | 本策略准入重点 |
 |---|---|
 | Binance | 既有 PM UM Hedge 分支；需本策略Store/dispatch/settlement接线。原生禁止的 `reduceOnly` 不发送，按多头腿、可减数量与签名事实实现减仓 |
 | Bybit | `multi_venue_*`；正确 `positionIdx`、原生减仓和市场单结果；市价按原生IOC/价格保护，可能未足额成交 |
@@ -306,9 +287,9 @@ P_tp  = ceil_to_execution_tick(P_min)
 
 “支持某交易所”必须同时具备账户验证、符号/数量/报价转换、新鲜行情、订单精确恢复、只减仓限价TP和桌面投影；缺一项则能力未就绪。当前设计覆盖六所，不表示六所已全部可运行。首个执行所选择已完成该策略能力和验收的账户，后续按同一契约逐所放行。
 
-## 11. 验收、研究与开发顺序
+## 11. 验收与研究
 
-先完成研究规则和纯函数，再补持久化/执行契约，然后接桌面；实现过程保留一个闭环，不为了提前显示启动按钮而跳过结算和账户预算。
+已有源码、部署、逐所实盘和收益研究分别核验；下面的完整增强验收表不是当前版本的通过清单。
 
 | 门 | 必须覆盖的场景及通过条件 |
 |---|---|
@@ -331,7 +312,7 @@ P_tp  = ceil_to_execution_tick(P_min)
 
 缺少执行所深度、费用或资金费历史时，允许完成规则研究，但该所执行回测标记未完成。真实带单另验证跟单者漏掉低位补仓、资金不足和成交偏差；本策略开发不改变当前 KOL 市价单不复制的契约，也不自动开通平台带单。
 
-文档阶段仅静态验证。实现后的局部Rust检查/测试统一用 `scripts/Invoke-VenueBuild.ps1` 验证 `venue-strategies`、`venue-control-protocol`、`venue-control`、`venueflow` 和改动adapter；专项脚本已有guard时不二次套锁。跨模块公共契约及发布前按 [DEVELOPMENT](DEVELOPMENT.md) 集中建立全量基线。所有离线、数据库、桌面、逐所真实门分别记录，不以一种通过替代另一种。
+文档变更仅静态验证；代码变更的局部 Rust 检查/测试统一用 `scripts/Invoke-VenueBuild.ps1` 验证 `venue-strategies`、`venue-control-protocol`、`venue-control`、`venueflow` 和改动adapter；专项脚本已有guard时不二次套锁。跨模块公共契约及发布前按 [DEVELOPMENT](DEVELOPMENT.md) 集中建立全量基线。所有离线、数据库、桌面、逐所真实门分别记录，不以一种通过替代另一种。
 
 ## 12. 外部协议依据
 
