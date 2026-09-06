@@ -29,7 +29,9 @@ use crate::{
 };
 
 const EXECUTOR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+mod inspection;
 mod terminal_positions;
+pub use inspection::inspect_account;
 const ACTIVATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const ACCOUNT_DRAIN_QUANTUM: usize = MAX_ACCOUNT_QUEUE_DEPTH;
 
@@ -788,8 +790,28 @@ where
             }
         }
     }
-    store.prepare_mirror_request(&command, &mut request).await?;
-    if !crate::order_mirror::mirror_send_allowed(store, &command, now_ms()?).await? {
+    let admission = async {
+        store.prepare_mirror_request(&command, &mut request).await?;
+        crate::order_mirror::mirror_send_allowed(store, &command, now_ms()?).await
+    }
+    .await;
+    let allowed = match admission {
+        Ok(allowed) => allowed,
+        Err(error) => {
+            // This path has not entered exchange.submit. Leaving Sending here would create
+            // permanent uncertainty for a request that was never dispatched.
+            store
+                .transition_command(
+                    &command.command_id,
+                    ExecutorCommandState::Rejected,
+                    now_ms()?,
+                    Some(ledger_not_dispatched_code(error)),
+                )
+                .await?;
+            return Ok(AccountDrainDecision::Continue);
+        }
+    };
+    if !allowed {
         store
             .transition_command(
                 &command.command_id,

@@ -78,6 +78,13 @@ impl BinancePrivateProjectionStore {
         source: &ActiveProjectionSource,
         snapshot: &SignedAccountSnapshot,
     ) -> Result<Option<bool>, PrivateProjectionError> {
+        // The Grid continuation cache must wait for its batch surface. Other accounts still
+        // publish authenticated observations while an uncertain command fences new dispatch.
+        let running_grid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_binance_grid_instances WHERE trading_account_id=$1 AND instance_state='running')")
+            .bind(&source.trading_account_id).fetch_one(&self.pool).await.map_err(|_| PrivateProjectionError::Unavailable)?;
+        if !running_grid {
+            return Ok(Some(true));
+        }
         let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_binance_commands WHERE trading_account_id=$1 AND command_state IN ('pending','sending','accepted','reconcile_required'))")
             .bind(&source.trading_account_id).fetch_one(&self.pool).await.map_err(|_| PrivateProjectionError::Unavailable)?;
         if pending {

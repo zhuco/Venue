@@ -1,6 +1,83 @@
 use super::*;
 
 #[tokio::test]
+async fn uncertain_account_keeps_publishing_signed_facts_without_releasing_command()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(url) = integration_database_url()? else {
+        return Ok(());
+    };
+    let fixture = Fixture::create(&url).await?;
+    fixture.migrate_twice().await?;
+    let user = id(981);
+    let account = id(982);
+    let credential = id(983);
+    let command = id(984);
+    seed_verified_account(&fixture.pool, &user, &account, &credential, 74).await?;
+    insert_terminal_command(
+        &fixture.pool,
+        &command,
+        &id(985),
+        &user,
+        &account,
+        &credential,
+        "reconcile_required",
+    )
+    .await?;
+    let source = ActiveProjectionSource {
+        kol_user_id: None,
+        owner_user_id: user,
+        credential_id: credential,
+        trading_account_id: account.clone(),
+        symbols: ["BTC/USDT".parse()?].into_iter().collect(),
+        previous_fills_cursor: None,
+    };
+    let snapshot = SignedAccountSnapshot::complete_with_fills(
+        GatewayBinding::new(
+            VenueId::Binance,
+            GatewayMode::Live,
+            account,
+            "BTC/USDT".parse()?,
+        )?,
+        100,
+        1,
+        3,
+        1,
+        SignedAccountPositionMode::Hedge,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        "binance-fills-v1|BTCUSDT,100,,".to_owned(),
+        Vec::new(),
+    )?;
+    let store = BinancePrivateProjectionStore::new(fixture.pool.clone());
+    assert_eq!(
+        store.stream_surface_settled(&source, &snapshot).await?,
+        Some(true)
+    );
+    store.persist(&source, &snapshot, 120).await?;
+    assert_eq!(
+        store
+            .load_owned(&source.owner_user_id, &source.credential_id)
+            .await?
+            .ok_or("projection absent")?
+            .observed_ms,
+        100
+    );
+    assert_eq!(
+        command_state(&fixture.pool, &command).await?,
+        "reconcile_required"
+    );
+    assert!(
+        PgExecutorStore::new(fixture.pool.clone())
+            .claim_next_command(&source.trading_account_id, 121)
+            .await?
+            .is_none()
+    );
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn rest_fill_received_during_snapshot_repairs_only_invalid_observation()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(url) = integration_database_url()? else {

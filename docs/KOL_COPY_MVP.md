@@ -274,6 +274,7 @@ Pending -> Sending -> Accepted -> Reconciled
 - KOL 只能修改自己的页面，固定风险提示不可编辑，任何 KOL 页面与接口都看不到跟随者 API 明文。
 - 一次 KOL 新限价单、市价单或止损单可正确产生对应多/空腿委托；同一市价原生订单的多笔成交仍只有一个对应子单，限价改单及止损创建/修改/撤销均保留精确身份。
 - 跟随账户之间故障隔离；一个账户 `Rejected/ReconcileRequired` 不停止其他账户。暂停停止新挂单并撤销程序创建的子单剩余量，不自动清仓。
+- 非 Grid 跟随账户的 `ReconcileRequired` 只阻止新发送，不阻止认证账户快照更新；发送前镜像检查失败应明确拒绝，不能制造未实际发送的永久待对账命令。
 - Executor 重启后 `Pending` 可继续调度，`Sending/ReconcileRequired` 只查不重发；`Accepted` 必须经签名事实后才显示完成。
 - 新旧实现不得同时操作同一账户，旧 Grid/Gate/Bitget 没有因本次发布被启动、迁移或宣称完成。
 

@@ -49,6 +49,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer().with_ansi(false))
         .init();
     let launch = ExecutorLaunchConfig::from_environment()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        if let [operation, credential, symbol] = args.as_slice()
+            && operation == "inspect-account"
+        {
+            let report = venue_control::executor_runtime::inspect_account(
+                &launch.database_url,
+                credential,
+                symbol.parse()?,
+            )
+            .await?;
+            println!("{}", serde_json::to_string(&report)?);
+            return Ok(());
+        }
+        return Err("usage: venue-executor-binance [inspect-account CREDENTIAL SYMBOL]".into());
+    }
     let singleton = BinanceExecutorSingleton::acquire(&launch.database_url).await?;
     let pool = PgPoolOptions::new()
         .max_connections(8)

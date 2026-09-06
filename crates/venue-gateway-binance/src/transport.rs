@@ -924,6 +924,8 @@ fn classify_http_error(status: u16, payload: &[u8], mutation: bool) -> BinanceTr
         .ok()
         .and_then(|value| value.get("code").and_then(serde_json::Value::as_i64))
         .filter(|code| (-999_999..=-1).contains(code));
+    // Only numeric protocol facts are safe to retain; Binance messages can echo private input.
+    eprintln!("Binance HTTP request rejected: status={status} code={code:?} mutation={mutation}");
     if mutation && (status >= 500 || status == 408 || matches!(code, Some(-1006 | -1007))) {
         BinanceTransportError::AmbiguousStatus(status)
     } else if code == Some(-1021) {

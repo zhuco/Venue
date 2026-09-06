@@ -220,7 +220,7 @@ async fn creation_waiting_for_admin_lock_observes_committed_revocation()
 #[tokio::test]
 async fn order_mirror_plans_once_and_revocation_cancels_only_definitely_unsent_children()
 -> Result<(), Box<dyn std::error::Error>> {
-    mirror_sizing_and_revocation(false).await
+    mirror_sizing_and_revocation(false, false).await
 }
 
 #[tokio::test]
@@ -412,10 +412,19 @@ async fn leader_bot_catalog_allows_same_account_presets_and_only_one_active_bot(
 #[tokio::test]
 async fn fixed_notional_mirror_uses_persisted_sizing_and_keeps_reconciliation_fences()
 -> Result<(), Box<dyn std::error::Error>> {
-    mirror_sizing_and_revocation(true).await
+    mirror_sizing_and_revocation(true, false).await
 }
 
-async fn mirror_sizing_and_revocation(fixed: bool) -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn mirror_admission_error_before_submit_does_not_leave_uncertain_commands()
+-> Result<(), Box<dyn std::error::Error>> {
+    mirror_sizing_and_revocation(false, true).await
+}
+
+async fn mirror_sizing_and_revocation(
+    fixed: bool,
+    admission_failure: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let Some(url) = integration_database_url()? else {
         return Ok(());
     };
@@ -498,6 +507,50 @@ async fn mirror_sizing_and_revocation(fixed: bool) -> Result<(), Box<dyn std::er
     )
     .fetch_one(&fixture.pool)
     .await?;
+    if admission_failure {
+        shutdown.send(true)?;
+        task.await??;
+        // A malformed source projection fails admission after the command has been claimed,
+        // before any exchange request is allowed. The mock would return Accepted if reached.
+        sqlx::query("UPDATE venue_binance_account_projections SET projection_json=jsonb_build_object('stream_healthy',true,'projection','{}'::jsonb) WHERE credential_id=$1")
+            .bind(&leader_credential).execute(&fixture.pool).await?;
+        let cipher = CredentialCipher::from_key(&[42; 32])?;
+        let payload = serde_json::to_vec(&BindCredentialRequest {
+            label: "fixture".into(),
+            api_key: SecretValue::new("a".repeat(32)),
+            api_secret: SecretValue::new("b".repeat(32)),
+        })?;
+        let encrypted = cipher.encrypt(
+            &format!("venue-api-v1:{follower}:{follower_credential}"),
+            &payload,
+        )?;
+        sqlx::query(
+            "UPDATE venue_api_credentials SET encrypted_credentials=$1 WHERE credential_id=$2",
+        )
+        .bind(encrypted)
+        .bind(&follower_credential)
+        .execute(&fixture.pool)
+        .await?;
+        let mut runtime = BinanceExecutorRuntime::new(
+            PgExecutorStore::new(fixture.pool.clone()),
+            MockBinanceExecution::default(),
+            ExecutorSecretProvider::new(fixture.pool.clone(), cipher),
+        );
+        assert_eq!(runtime.recover_once().await?, 2);
+        let outcomes: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT command_state,sanitized_error_code,native_order_id FROM venue_binance_commands",
+        )
+        .fetch_all(&fixture.pool)
+        .await?;
+        assert_eq!(outcomes.len(), 2);
+        for (state, code, native) in outcomes {
+            assert_eq!(state, "rejected");
+            assert_eq!(code.as_deref(), Some("not_dispatched_invalid"));
+            assert!(native.is_none());
+        }
+        fixture.cleanup().await?;
+        return Ok(());
+    }
     let kind: String =
         sqlx::query_scalar("SELECT order_kind FROM venue_binance_commands WHERE command_id=$1")
             .bind(&child)

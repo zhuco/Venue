@@ -14,6 +14,7 @@
 | 产品版本与发布范围 | `VERSION`、`docs/CHANGELOG.md` |
 | Control HTTP 服务 | `apps/venue-control/src/bin/venue-control-server.rs` |
 | 共享 Executor：私有投影、人工带单、Grid 与独立策略调度 | `apps/venue-control/src/bin/venue-executor-binance.rs` |
+| Executor 只读账户及未决命令检查 | `apps/venue-control/src/executor_runtime/inspection.rs`；`venue-executor-binance inspect-account CREDENTIAL SYMBOL`，只读数据库与签名查询，不启动调度 |
 | 带单授权、撤权及仅迁移命令 | `apps/venue-control/src/bin/venue-leader-bot-admin.rs`、`apps/venue-control/src/leader_bot_admin.rs` |
 | 版本化迁移及校验 | `apps/venue-control/src/schema.rs`、`apps/venue-control/migrations/`；当前安装至 0041 |
 | 本地受控构建与缓存准入 | `scripts/Invoke-VenueBuild.ps1`、`scripts/venue_build_guard.ps1` |

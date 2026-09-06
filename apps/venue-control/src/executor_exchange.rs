@@ -524,7 +524,10 @@ impl BinanceHttpExecution {
                 self.transport
                     .execute_read(credentials, &request, now)
                     .await
-                    .map_err(|_| BinanceExecutionError::Unavailable)?,
+                    .map_err(|error| {
+                        tracing::warn!(path = request.path(), %error, "Binance execution snapshot surface failed");
+                        BinanceExecutionError::Unavailable
+                    })?,
             );
         }
         pages.push(
@@ -573,7 +576,10 @@ impl BinanceHttpExecution {
             now,
             pages,
         )
-        .map_err(|_| BinanceExecutionError::Unavailable)?;
+        .map_err(|error| {
+            tracing::warn!(%error, "Binance execution snapshot validation failed");
+            BinanceExecutionError::Unavailable
+        })?;
         self.fills_cursor = Some(candidate.fills_cursor());
         Ok((candidate, rules, risk))
     }
@@ -612,7 +618,12 @@ impl BinanceHttpExecution {
             .known_native_order_id
             .as_ref()
             .is_none_or(|value| value == &order.order_id);
-        (native_matches && exact_place_matches(request, &order, &rules)?)
+        let shape_matches = exact_place_matches(request, &order, &rules)?;
+        if !native_matches || !shape_matches {
+            tracing::warn!(command_id = %request.command_id, native_matches, shape_matches,
+                "Binance exact order differs from durable command");
+        }
+        (native_matches && shape_matches)
             .then_some((snapshot, order))
             .ok_or(BinanceExecutionError::Unavailable)
     }
