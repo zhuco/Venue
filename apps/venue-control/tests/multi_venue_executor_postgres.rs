@@ -276,6 +276,7 @@ async fn unresolved_sending_and_backoff_fence_pending_and_deleted_credentials()
             venue_control_protocol::kol::ExecutorCommandState::ReconcileRequired,
             2_002,
             None,
+            None,
         )
         .await?;
     store.backoff(&crash_recovery, 8_000, 2_002).await?;
@@ -362,6 +363,7 @@ async fn concurrent_claims_send_one_command_once_and_nonce_is_monotonic()
             &first_claim,
             venue_control_protocol::kol::ExecutorCommandState::Reconciled,
             4_001,
+            None,
             None,
         )
         .await?;
@@ -546,6 +548,7 @@ async fn same_timestamp_commands_keep_insertion_order_and_cancel_recovers_origin
             ExecutorCommandState::Reconciled,
             2_001,
             Some("native-first"),
+            None,
         )
         .await?;
     let second = store
@@ -554,7 +557,7 @@ async fn same_timestamp_commands_keep_insertion_order_and_cancel_recovers_origin
         .ok_or("second claim missing")?;
     assert_eq!(second.command.command_id().as_str(), "a_second");
     store
-        .finish(&second, ExecutorCommandState::Rejected, 2_003, None)
+        .finish(&second, ExecutorCommandState::Rejected, 2_003, None, None)
         .await?;
     let cancel = cancel(
         "c_cancel",

@@ -531,7 +531,19 @@ pub fn fill_history_query(
 }
 
 pub fn parse_regular_order(value: &Value, symbol: &Symbol) -> Result<Order, BitgetPrivateError> {
-    if object(value)?.get("delegateType").and_then(Value::as_str) != Some("normal") {
+    parse_regular_order_detail(value, symbol, false)
+}
+
+pub(crate) fn parse_regular_order_detail(
+    value: &Value,
+    symbol: &Symbol,
+    market: bool,
+) -> Result<Order, BitgetPrivateError> {
+    let object = object(value)?;
+    let expected_delegate = if market { "market" } else { "normal" };
+    if object.get("delegateType").and_then(Value::as_str) != Some(expected_delegate)
+        || (market && object.get("orderType").and_then(Value::as_str) != Some("market"))
+    {
         return Err(BitgetPrivateError::OrderFamily);
     }
     parse_order(value, symbol)

@@ -194,7 +194,7 @@ impl BybitAccountGateway {
             binding: self.binding.gateway_binding().clone(),
             metadata,
             reference_price,
-            observed_at_ms: bbo.response_time_ms,
+            observed_at_ms: bbo.observed_at_ms(),
             maximum_quantity: Some(rules.maximum_market_quantity),
             maximum_price: Some(rules.maximum_price),
         })

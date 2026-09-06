@@ -5,7 +5,6 @@ use std::{
 };
 
 use rust_decimal::Decimal;
-use serde::Deserialize;
 use tokio::runtime::{Builder, Runtime};
 use venue_domain::domain::{
     Amount, Asset, ExecutionCommand, FieldState, Fill, LimitTimeInForce, MarketReduceCommand,
@@ -39,11 +38,13 @@ use crate::{
 
 #[path = "durable_execution.rs"]
 mod durable_execution;
+#[path = "account_gateway/market_facts.rs"]
+mod market_facts;
+
+use market_facts::{OkxLimitBbo, parse_limit_bbo};
 
 /// Production OKX adapter for the lightweight account host. Base quantities remain canonical in
 /// the WAL; `build_place_request` converts them to contracts using ctVal × ctMult exactly once.
-const LIMIT_BBO_MAX_AGE_MS: u64 = 1_000;
-
 pub struct OkxAccountGateway {
     runtime: Runtime,
     config: OkxConfig,
@@ -327,83 +328,6 @@ fn validate_limit_reduce_position(
         return Err(());
     }
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct OkxLimitBbo {
-    bid: Price,
-    ask: Price,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OkxLimitBboEnvelope {
-    code: String,
-    data: Vec<OkxLimitBboRow>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OkxLimitBboRow {
-    inst_id: String,
-    bids: Vec<Vec<String>>,
-    asks: Vec<Vec<String>>,
-    ts: String,
-}
-
-fn parse_limit_bbo(
-    response: &crate::OkxHttpResponse,
-    config: &OkxConfig,
-    instrument: &OkxInstrument,
-    now_ms: u64,
-) -> Result<OkxLimitBbo, OkxAccountGatewayError> {
-    if response.binding != *config.gateway_binding()
-        || response.instrument_generation != instrument.instrument().generation
-        || response.received_at_ms == 0
-        || now_ms < response.received_at_ms
-        || now_ms.saturating_sub(response.received_at_ms) > LIMIT_BBO_MAX_AGE_MS
-    {
-        return Err(OkxAccountGatewayError::Instrument);
-    }
-    let envelope: OkxLimitBboEnvelope =
-        serde_json::from_slice(&response.body).map_err(|_| OkxAccountGatewayError::Instrument)?;
-    if envelope.code != "0" {
-        return Err(OkxAccountGatewayError::Instrument);
-    }
-    let [row] = envelope.data.as_slice() else {
-        return Err(OkxAccountGatewayError::Instrument);
-    };
-    if row.inst_id != instrument.native_id() {
-        return Err(OkxAccountGatewayError::Instrument);
-    }
-    let exchange_time_ms = row
-        .ts
-        .parse::<u64>()
-        .map_err(|_| OkxAccountGatewayError::Instrument)?;
-    if exchange_time_ms == 0
-        || exchange_time_ms > response.received_at_ms
-        || now_ms.saturating_sub(exchange_time_ms) > LIMIT_BBO_MAX_AGE_MS
-    {
-        return Err(OkxAccountGatewayError::Instrument);
-    }
-    let bid = bbo_level_price(&row.bids)?;
-    let ask = bbo_level_price(&row.asks)?;
-    if bid >= ask {
-        return Err(OkxAccountGatewayError::Instrument);
-    }
-    Ok(OkxLimitBbo { bid, ask })
-}
-
-fn bbo_level_price(levels: &[Vec<String>]) -> Result<Price, OkxAccountGatewayError> {
-    let [price, ..] = levels
-        .first()
-        .ok_or(OkxAccountGatewayError::Instrument)?
-        .as_slice()
-    else {
-        return Err(OkxAccountGatewayError::Instrument);
-    };
-    Price::new(Decimal::from_str(price).map_err(|_| OkxAccountGatewayError::Instrument)?)
-        .map_err(|_| OkxAccountGatewayError::Instrument)
 }
 
 fn normalize_limit_from_bbo(
@@ -1146,29 +1070,19 @@ fn collect_wide_orders(
         };
         let position_side =
             position_side_for(profile.position_mode(), text(row, "posSide")?, Decimal::ONE)?;
-        let raw_reduce_only = match text(row, "reduceOnly")? {
-            "true" => true,
-            "false" => false,
-            _ => return Err(OkxAccountGatewayError::Account),
-        };
         let price = optional_decimal(row, if algo { "orderPx" } else { "px" })?;
         let family = if algo && matches!(text(row, "ordType")?, "conditional" | "oco") {
             NativeOrderFamily::UmConditional
         } else {
             default_family
         };
-        let reduce_only = match profile.position_mode() {
-            OkxPositionMode::LongShort => {
-                if raw_reduce_only {
-                    return Err(OkxAccountGatewayError::Account);
-                }
-                matches!(
-                    (position_side, side),
-                    (PositionSide::Long, OrderSide::Sell) | (PositionSide::Short, OrderSide::Buy)
-                )
-            }
-            OkxPositionMode::Net => raw_reduce_only,
-        };
+        let reduce_only = crate::readback::semantic_reduce(
+            profile.position_mode(),
+            position_side,
+            side,
+            text(row, "reduceOnly")?,
+        )
+        .map_err(|_| OkxAccountGatewayError::Account)?;
         if !reduce_only {
             // A trigger market order has no bounded USDT value in this signed surface.  Treating
             // it as zero would understate aggregate account risk, so the whole observation fails.
@@ -1566,7 +1480,7 @@ pub enum OkxAccountGatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use venue_domain::domain::{CommandId, OrderOwner, OrderPurpose, Position};
+    use venue_domain::domain::{CommandId, MarketOrderCommand, OrderOwner, OrderPurpose, Position};
 
     #[test]
     fn failed_ack_parse_with_row_success_stays_unknown() {
@@ -1627,6 +1541,54 @@ mod tests {
             AccountGatewayResult::Accepted { .. }
         ));
         observed.order.side = OrderSide::Buy;
+        assert_eq!(
+            durable_execution::reconcile_okx_order(&command, &observed),
+            AccountGatewayResult::Unknown
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn committed_reconcile_accepts_signed_market_order() -> Result<(), Box<dyn std::error::Error>> {
+        let command = ExecutionCommand::PlaceMarket(MarketOrderCommand {
+            command_id: CommandId::new("okx_market")?,
+            client_order_id: CommandId::new("okx_market_client")?,
+            owner: OrderOwner {
+                strategy_instance_id: "acceptance".to_owned(),
+                run_id: "run1".to_owned(),
+                exchange: "okx".to_owned(),
+                account: "00000000-0000-4000-8000-000000000001".to_owned(),
+                symbol: "BTC/USDT".parse()?,
+                purpose: OrderPurpose::Entry,
+            },
+            position_side: PositionSide::Long,
+            side: OrderSide::Buy,
+            quantity: Decimal::new(1, 1),
+            reduce_only: false,
+        });
+        let mut observed = OkxTimedOrder {
+            order: venue_domain::domain::Order {
+                order_id: "7002".to_owned(),
+                client_order_id: FieldState::Known("okx_market_client".to_owned()),
+                symbol: "BTC/USDT".parse()?,
+                side: OrderSide::Buy,
+                position_side: FieldState::Known(PositionSide::Long),
+                purpose: FieldState::Missing,
+                state: OrderState::Filled,
+                quantity: Decimal::new(1, 1),
+                filled_quantity: Decimal::new(1, 1),
+                limit_price: None,
+                time_in_force: FieldState::Missing,
+                average_price: FieldState::Missing,
+                reduce_only: false,
+            },
+            update_time_ms: 1,
+        };
+        assert!(matches!(
+            durable_execution::reconcile_okx_order(&command, &observed),
+            AccountGatewayResult::Accepted { .. }
+        ));
+        observed.order.side = OrderSide::Sell;
         assert_eq!(
             durable_execution::reconcile_okx_order(&command, &observed),
             AccountGatewayResult::Unknown
@@ -1836,6 +1798,10 @@ mod tests {
             ..limit_bbo(&config)
         };
         assert!(parse_limit_bbo(&empty, &config, &instrument, 10_010).is_err());
+        assert_eq!(
+            market_facts::parse_limit_bbo_detailed(&empty, &config, &instrument, 10_010),
+            Err(market_facts::LimitBboFailure::RowCount)
+        );
         let bbo = parse_limit_bbo(&limit_bbo(&config), &config, &instrument, 10_010)?;
         assert!(
             normalize_limit_from_bbo(
@@ -1855,6 +1821,32 @@ mod tests {
         let mut wrong_leg = limit_intent(Decimal::new(6001, 0))?;
         wrong_leg.position_side = PositionSide::Net;
         assert!(normalize_limit_from_bbo(&config, &instrument, &wrong_leg, bbo).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn limit_bbo_accepts_only_bounded_exchange_clock_skew() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (config, instrument) = limit_config_and_instrument()?;
+        let skewed = crate::OkxHttpResponse {
+            body: bytes::Bytes::from_static(
+                br#"{"code":"0","data":[{"bids":[["60000.09","20","0","3"]],"asks":[["60000.19","15","0","2"]],"ts":"10020"}]}"#,
+            ),
+            ..limit_bbo(&config)
+        };
+        assert!(parse_limit_bbo(&skewed, &config, &instrument, 10_010).is_ok());
+
+        let excessive = crate::OkxHttpResponse {
+            body: bytes::Bytes::from_static(
+                br#"{"code":"0","data":[{"bids":[["60000.09","20","0","3"]],"asks":[["60000.19","15","0","2"]],"ts":"10261"}]}"#,
+            ),
+            ..limit_bbo(&config)
+        };
+        assert!(parse_limit_bbo(&excessive, &config, &instrument, 10_010).is_err());
+        assert_eq!(
+            market_facts::parse_limit_bbo_detailed(&excessive, &config, &instrument, 10_010),
+            Err(market_facts::LimitBboFailure::ExchangeTime)
+        );
         Ok(())
     }
 
@@ -1972,6 +1964,28 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn account_wide_orders_accept_consistent_hedge_reduce_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rules = parse_account_wide_rules(INSTRUMENT)?;
+        let profile = parse_account_profile(ACCOUNT_CONFIG, OkxPositionMode::LongShort)?;
+        let row = br#"{"code":"0","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","algoId":"8003","algoClOrdId":"conditional3","side":"sell","posSide":"long","sz":"2","ordType":"conditional","reduceOnly":"true","state":"live","orderPx":"","cTime":"1787911201400"}]}"#;
+        let mut orders = Vec::new();
+        let mut entries = Vec::new();
+        collect_wide_orders(
+            row,
+            NativeOrderFamily::UmAlgo,
+            &profile,
+            &rules,
+            &mut orders,
+            &mut entries,
+        )?;
+        assert_eq!(orders.len(), 1);
+        assert!(orders[0].reduce_only);
+        assert!(entries.is_empty());
         Ok(())
     }
 }

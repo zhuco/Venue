@@ -8,6 +8,90 @@ use crate::algo_execution::{
 use crate::execution::{OkxExecutionScope, OkxPrivateRequest};
 
 impl OkxAccountGateway {
+    fn durable_market_facts_inner(
+        &mut self,
+    ) -> Result<venue_execution::DurableMarketFacts, (&'static str, OkxAccountGatewayError)> {
+        self.refresh_instrument()
+            .map_err(|error| ("strategy_okx_market_rules", error))?;
+        let generation = self.instrument.instrument().generation;
+        let response = self
+            .runtime
+            .block_on(self.transport.fetch_bbo(generation))
+            .map_err(|error| {
+                (
+                    "strategy_okx_bbo_transport",
+                    OkxAccountGatewayError::Transport(error),
+                )
+            })?;
+        let now_ms = unix_ms().map_err(|error| ("strategy_okx_market_clock", error))?;
+        let bbo = market_facts::parse_limit_bbo_detailed(
+            &response,
+            &self.config,
+            &self.instrument,
+            now_ms,
+        )
+        .map_err(|failure| (failure.code(), OkxAccountGatewayError::Instrument))?;
+        let reference_price =
+            Price::new((bbo.bid.value() + bbo.ask.value()) / rust_decimal::Decimal::from(2))
+                .map_err(|_| {
+                    (
+                        "strategy_okx_market_reference",
+                        OkxAccountGatewayError::Instrument,
+                    )
+                })?;
+        let metadata = venue_domain::domain::InstrumentMetadata::new(
+            self.instrument.instrument().clone(),
+            venue_domain::domain::Precision::new(
+                self.instrument.instrument().price_tick.value(),
+                self.instrument.instrument().price_tick.value(),
+            )
+            .map_err(|_| {
+                (
+                    "strategy_okx_market_metadata",
+                    OkxAccountGatewayError::Instrument,
+                )
+            })?,
+            venue_domain::domain::Precision::new(
+                self.instrument.instrument().quantity_step,
+                self.instrument.minimum_base_quantity(),
+            )
+            .map_err(|_| {
+                (
+                    "strategy_okx_market_metadata",
+                    OkxAccountGatewayError::Instrument,
+                )
+            })?,
+            None,
+            true,
+        )
+        .map_err(|_| {
+            (
+                "strategy_okx_market_metadata",
+                OkxAccountGatewayError::Instrument,
+            )
+        })?;
+        Ok(venue_execution::DurableMarketFacts {
+            binding: self.config.gateway_binding().clone(),
+            metadata,
+            reference_price,
+            observed_at_ms: unix_ms().map_err(|error| ("strategy_okx_market_clock", error))?,
+            maximum_quantity: self
+                .instrument
+                .maximum_limit_contracts()
+                .and_then(|lots| lots.checked_mul(self.instrument.base_quantity_per_contract())),
+            maximum_price: None,
+        })
+    }
+
+    /// Dispatch diagnostics expose only a fixed stage code; protocol bodies and credentials are
+    /// never retained in the command ledger.
+    pub fn durable_market_facts_for_dispatch(
+        &mut self,
+    ) -> Result<venue_execution::DurableMarketFacts, &'static str> {
+        self.durable_market_facts_inner()
+            .map_err(|(code, _error)| code)
+    }
+
     pub fn durable_order_observation(
         &mut self,
         command: &ExecutionCommand,
@@ -75,38 +159,8 @@ impl OkxAccountGateway {
     pub fn durable_market_facts(
         &mut self,
     ) -> Result<venue_execution::DurableMarketFacts, OkxAccountGatewayError> {
-        self.refresh_instrument()?;
-        let bbo = self.current_market_bbo()?;
-        let reference_price =
-            Price::new((bbo.bid.value() + bbo.ask.value()) / rust_decimal::Decimal::from(2))
-                .map_err(|_| OkxAccountGatewayError::Instrument)?;
-        let metadata = venue_domain::domain::InstrumentMetadata::new(
-            self.instrument.instrument().clone(),
-            venue_domain::domain::Precision::new(
-                self.instrument.instrument().price_tick.value(),
-                self.instrument.instrument().price_tick.value(),
-            )
-            .map_err(|_| OkxAccountGatewayError::Instrument)?,
-            venue_domain::domain::Precision::new(
-                self.instrument.instrument().quantity_step,
-                self.instrument.minimum_base_quantity(),
-            )
-            .map_err(|_| OkxAccountGatewayError::Instrument)?,
-            None,
-            true,
-        )
-        .map_err(|_| OkxAccountGatewayError::Instrument)?;
-        Ok(venue_execution::DurableMarketFacts {
-            binding: self.config.gateway_binding().clone(),
-            metadata,
-            reference_price,
-            observed_at_ms: unix_ms()?,
-            maximum_quantity: self
-                .instrument
-                .maximum_limit_contracts()
-                .and_then(|lots| lots.checked_mul(self.instrument.base_quantity_per_contract())),
-            maximum_price: None,
-        })
+        self.durable_market_facts_inner()
+            .map_err(|(_code, error)| error)
     }
 }
 
@@ -875,7 +929,7 @@ pub(super) fn reconcile_okx_order(
                 AccountGatewayResult::Unknown
             }
         },
-        ExecutionCommand::PlaceLimit(_) => match order.state {
+        ExecutionCommand::PlaceLimit(_) | ExecutionCommand::PlaceMarket(_) => match order.state {
             OrderState::Rejected => rejected("okx_order_rejected"),
             OrderState::New
             | OrderState::PartiallyFilled

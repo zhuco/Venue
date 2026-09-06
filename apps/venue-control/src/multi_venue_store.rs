@@ -641,6 +641,7 @@ impl MultiVenueStore {
         next: venue_control_protocol::kol::ExecutorCommandState,
         now_ms: u64,
         native_order_id: Option<&str>,
+        sanitized_error_code: Option<&str>,
     ) -> Result<(), MultiVenueStoreError> {
         if now_ms == 0
             || matches!(
@@ -656,6 +657,18 @@ impl MultiVenueStore {
         }) {
             return Err(MultiVenueStoreError::Invalid);
         }
+        let sanitized_error_code = match (next, sanitized_error_code) {
+            (venue_control_protocol::kol::ExecutorCommandState::Rejected, Some(value))
+                if valid_strategy_error_code(value) =>
+            {
+                Some(value)
+            }
+            (venue_control_protocol::kol::ExecutorCommandState::Rejected, _) => {
+                return Err(MultiVenueStoreError::Invalid);
+            }
+            (_, None) => None,
+            (_, Some(_)) => return Err(MultiVenueStoreError::Invalid),
+        };
         let payload =
             serde_json::to_value(&claim.command).map_err(|_| MultiVenueStoreError::Invalid)?;
         let expected = if claim.reconcile_only {
@@ -668,10 +681,11 @@ impl MultiVenueStore {
         let changed = sqlx::query(
             "UPDATE venue_binance_commands SET command_state=$1,sending_ms=CASE WHEN $1='cancelled' THEN NULL ELSE sending_ms END, \
              accepted_ms=CASE WHEN $2 THEN $3 ELSE accepted_ms END, \
-             terminal_ms=CASE WHEN $4 THEN $3 ELSE terminal_ms END, native_order_id=COALESCE(native_order_id,$5),updated_ms=$3 \
-             WHERE command_id=$6 AND command_origin='strategy' AND owner_user_id=$7 AND credential_id=$8 \
-               AND strategy_venue=$9 AND strategy_nonce=$10 AND strategy_command=$11 \
-               AND command_state=ANY($12) \
+             terminal_ms=CASE WHEN $4 THEN $3 ELSE terminal_ms END, native_order_id=COALESCE(native_order_id,$5), \
+             sanitized_error_code=CASE WHEN $1='rejected' THEN $6 ELSE NULL END,updated_ms=$3 \
+             WHERE command_id=$7 AND command_origin='strategy' AND owner_user_id=$8 AND credential_id=$9 \
+               AND strategy_venue=$10 AND strategy_nonce=$11 AND strategy_command=$12 \
+               AND command_state=ANY($13) \
                AND ($5::text IS NULL OR native_order_id IS NULL OR native_order_id=$5)",
         )
         .bind(state)
@@ -679,6 +693,7 @@ impl MultiVenueStore {
         .bind(now)
         .bind(terminal)
         .bind(native_order_id)
+        .bind(sanitized_error_code)
         .bind(claim.command.command_id().as_str())
         .bind(&claim.owner_user_id)
         .bind(&claim.credential_id)
@@ -732,6 +747,35 @@ impl MultiVenueStore {
         } else {
             Err(MultiVenueStoreError::Conflict)
         }
+    }
+}
+
+fn valid_strategy_error_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::valid_strategy_error_code;
+
+    #[test]
+    fn strategy_error_codes_are_bounded_log_safe_identifiers() {
+        assert!(valid_strategy_error_code("strategy_market_limits"));
+        assert!(valid_strategy_error_code("strategy_okx_bbo_book"));
+        assert!(valid_strategy_error_code("strategy_okx_bbo_venue_code"));
+        assert!(valid_strategy_error_code("strategy_okx_bbo_exchange_time"));
+        assert!(valid_strategy_error_code("strategy_okx_bbo_transport"));
+        assert!(valid_strategy_error_code("strategy_okx_market_metadata"));
+        assert!(valid_strategy_error_code("strategy_okx_market_rules"));
+        assert!(valid_strategy_error_code("okx_51008"));
+        assert!(!valid_strategy_error_code(""));
+        assert!(!valid_strategy_error_code("raw response"));
+        assert!(!valid_strategy_error_code("exchange:secret"));
+        assert!(!valid_strategy_error_code(&"x".repeat(129)));
     }
 }
 

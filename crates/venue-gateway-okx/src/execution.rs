@@ -1176,7 +1176,11 @@ fn parse_bound_order_detail(
     }
     validate_order_id(&row.ord_id)?;
     let raw_reduce_only = parse_boolean(&row.reduce_only)?;
-    if scope.position_mode != OkxPositionMode::LongShort || raw_reduce_only {
+    // Hedge requests omit reduceOnly and bind reduction through side + posSide. OKX may still
+    // project true on a reducing order, while older details project false; an entry may not.
+    if scope.position_mode != OkxPositionMode::LongShort
+        || (raw_reduce_only && !expected_reduce_only)
+    {
         return Err(OkxError::PositionMode);
     }
     let filled_contracts = decimal(&row.acc_fill_sz)?;
@@ -1455,6 +1459,34 @@ mod tests {
             ),
             Err(OkxError::Precision)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn market_reduce_readback_accepts_exchange_projected_reduce_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (config, instrument, profile) = scope(GatewayMode::Live)?;
+        let command = market_reduce()?;
+        let submitted = build_place_request(
+            &config,
+            &instrument,
+            &profile,
+            OkxTradeMode::Cross,
+            OkxPlaceIntent::MarketReduce(&command),
+        )?;
+        let lookup =
+            build_unknown_order_readback_request(&config, &instrument, &profile, &submitted)?;
+        let observed = parse_unknown_order_readback(
+            response(
+                &config,
+                &instrument,
+                1_787_911_200_600,
+                br#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","tdMode":"cross","ordType":"market","ordId":"7004","clOrdId":"00000000000000000000000000000004","side":"sell","posSide":"long","sz":"2","accFillSz":"2","px":"","avgPx":"60000","reduceOnly":"true","state":"filled","uTime":"1787911200500"}]}"#,
+            ),
+            &lookup,
+        )?;
+        assert!(observed.order.order.reduce_only);
+        assert_eq!(observed.order.order.state, OrderState::Filled);
         Ok(())
     }
 

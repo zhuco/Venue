@@ -11,7 +11,7 @@ use venue_gateway_api::GatewayBinding;
 
 use crate::{
     BitgetAccountBinding, BitgetConfig, BitgetCredentials, SignInput, SignedHeaders, endpoints,
-    instrument::BitgetInstrumentRules, private::parse_regular_order, sign,
+    instrument::BitgetInstrumentRules, private::parse_regular_order_detail, sign,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -763,8 +763,15 @@ pub fn parse_exact_order_readback(
             None | Some(Value::Null) => (None, None),
             Some(value) => (
                 Some(
-                    parse_regular_order(value, &request.binding.symbol)
-                        .map_err(|_| BitgetExecutionError::Payload)?,
+                    parse_regular_order_detail(
+                        value,
+                        &request.binding.symbol,
+                        matches!(
+                            request.expected_kind,
+                            BitgetMutationKind::PlaceMarket | BitgetMutationKind::ReduceOnce
+                        ),
+                    )
+                    .map_err(|_| BitgetExecutionError::Payload)?,
                 ),
                 native_time_in_force(value)?,
             ),
@@ -866,12 +873,7 @@ fn parse_strategy_order(
         Some("failed") => OrderState::Rejected,
         _ => return Err(BitgetExecutionError::Payload),
     };
-    let reduce_only = match item.get("reduceOnly") {
-        Some(Value::Bool(value)) => *value,
-        Some(Value::String(value)) if value.eq_ignore_ascii_case("yes") => true,
-        Some(Value::String(value)) if value.eq_ignore_ascii_case("no") => false,
-        _ => return Err(BitgetExecutionError::Payload),
-    };
+    let reduce_only = strategy_reduce_only(item.get("reduceOnly"), position_side, side)?;
     if item.get("category").and_then(Value::as_str) != Some("USDT-FUTURES")
         || item
             .get("type")
@@ -1200,6 +1202,25 @@ const fn close_side(position_side: PositionSide) -> Result<OrderSide, BitgetExec
     }
 }
 
+pub(crate) fn strategy_reduce_only(
+    value: Option<&Value>,
+    position_side: PositionSide,
+    side: OrderSide,
+) -> Result<bool, BitgetExecutionError> {
+    validate_hedge_direction(position_side, side, true)?;
+    match value {
+        None | Some(Value::Null) => Ok(true),
+        Some(Value::String(value)) if value.is_empty() => Ok(true),
+        Some(Value::Bool(true)) => Ok(true),
+        Some(Value::String(value)) if value.eq_ignore_ascii_case("yes") => Ok(true),
+        Some(Value::Bool(false)) => Err(BitgetExecutionError::Readback),
+        Some(Value::String(value)) if value.eq_ignore_ascii_case("no") => {
+            Err(BitgetExecutionError::Readback)
+        }
+        _ => Err(BitgetExecutionError::Payload),
+    }
+}
+
 const fn side_wire(side: OrderSide) -> &'static str {
     match side {
         OrderSide::Buy => "buy",
@@ -1408,6 +1429,27 @@ mod tests {
     }
 
     #[test]
+    fn strategy_reduce_projection_may_be_omitted_but_never_contradict_direction() {
+        assert_eq!(
+            strategy_reduce_only(None, PositionSide::Short, OrderSide::Buy),
+            Ok(true)
+        );
+        assert_eq!(
+            strategy_reduce_only(Some(&Value::Null), PositionSide::Long, OrderSide::Sell),
+            Ok(true)
+        );
+        assert!(
+            strategy_reduce_only(
+                Some(&Value::Bool(false)),
+                PositionSide::Short,
+                OrderSide::Buy
+            )
+            .is_err()
+        );
+        assert!(strategy_reduce_only(None, PositionSide::Short, OrderSide::Sell).is_err());
+    }
+
+    #[test]
     fn gtc_wire_and_readback_policy_must_match() -> Result<(), Box<dyn std::error::Error>> {
         let live = binding(GatewayMode::Live)?;
         let config = BitgetConfig::for_mode(GatewayMode::Live);
@@ -1485,6 +1527,56 @@ mod tests {
             settle_ack_readback(&ack_without_policy, &readback),
             Err(BitgetExecutionError::Readback)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn market_exact_readback_accepts_only_the_market_delegate_family()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = BitgetConfig::for_mode(GatewayMode::Live);
+        let request = BitgetExactReadbackRequest {
+            binding: binding(GatewayMode::Live)?,
+            attempt_id: 1,
+            generation: 1,
+            lookup: BitgetOrderLookup::ClientOrderId("venue_market".to_owned()),
+            not_before_ms: 100,
+            expected_kind: BitgetMutationKind::PlaceMarket,
+            expected_time_in_force: None,
+            query: "clientOid=venue_market".to_owned(),
+            expected_strategy: None,
+        };
+        let detail = |delegate: &str, order_type: &str| {
+            json!({
+                "code":"00000",
+                "data":{
+                    "orderId":"123", "clientOid":"venue_market",
+                    "category":"USDT-FUTURES", "symbol":"BTCUSDT",
+                    "orderType":order_type, "orderStatus":"filled", "side":"buy",
+                    "posSide":"long", "holdMode":"hedge_mode", "tradeSide":"open_long",
+                    "qty":"0.001", "cumExecQty":"0.001", "price":"",
+                    "avgPrice":"50000", "delegateType":delegate, "timeInForce":"ioc"
+                }
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let readback = parse_exact_order_readback(
+            &config,
+            request.clone(),
+            101,
+            102,
+            detail("market", "market"),
+        )?;
+        assert_eq!(
+            readback.order.as_ref().map(|order| order.filled_quantity),
+            Some(Decimal::new(1, 3))
+        );
+        for payload in [detail("normal", "market"), detail("market", "limit")] {
+            assert_eq!(
+                parse_exact_order_readback(&config, request.clone(), 101, 102, payload),
+                Err(BitgetExecutionError::Payload)
+            );
+        }
         Ok(())
     }
 

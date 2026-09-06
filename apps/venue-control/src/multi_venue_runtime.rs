@@ -118,17 +118,19 @@ impl MultiVenueExecutor {
         let result = self.perform(&claim).await;
         let stale_grid_plan = matches!(&result, Ok(AccountGatewayResult::Rejected {reason}) if reason=="strategy_grid_plan_changed");
         let now = now_ms().map_err(|_| MultiVenueStoreError::Unavailable)?;
-        let (state, native) = match result {
+        let (state, native, rejection) = match result {
             Ok(AccountGatewayResult::Accepted { venue_order_id }) => {
-                (ExecutorCommandState::Reconciled, Some(venue_order_id))
+                (ExecutorCommandState::Reconciled, Some(venue_order_id), None)
             }
-            Ok(AccountGatewayResult::Rejected { .. }) => (ExecutorCommandState::Rejected, None),
+            Ok(AccountGatewayResult::Rejected { reason }) => {
+                (ExecutorCommandState::Rejected, None, Some(reason))
+            }
             Ok(AccountGatewayResult::Unknown) | Err(_) => {
-                (ExecutorCommandState::ReconcileRequired, None)
+                (ExecutorCommandState::ReconcileRequired, None, None)
             }
         };
         self.store
-            .finish(&claim, state, now, native.as_deref())
+            .finish(&claim, state, now, native.as_deref(), rejection.as_deref())
             .await?;
         if stale_grid_plan {
             self.grids.invalidate_pending(&claim.command, now).await?;
@@ -301,9 +303,16 @@ impl MultiVenueExecutor {
                 ));
             }
             if !matches!(claim.command, venue_domain::ExecutionCommand::Cancel(_)) {
-                let market = match gateway.market_facts() {
+                let market = match gateway.market_facts_for_dispatch() {
                     Ok(market) => market,
-                    Err(_) => return Ok((pre_send_failure(false), Some(snapshot))),
+                    Err(reason) => {
+                        return Ok((
+                            AccountGatewayResult::Rejected {
+                                reason: reason.into(),
+                            },
+                            Some(snapshot),
+                        ));
+                    }
                 };
                 if !crate::multi_venue_risk::market_guard(
                     &claim.command,

@@ -1172,7 +1172,7 @@ fn validate_page_ids(ids: &[String], previous_after: Option<u128>) -> Result<(),
     Ok(())
 }
 
-fn semantic_reduce(
+pub(crate) fn semantic_reduce(
     mode: OkxPositionMode,
     leg: PositionSide,
     side: OrderSide,
@@ -1183,12 +1183,20 @@ fn semantic_reduce(
         "false" => false,
         _ => return Err(OkxError::Payload),
     };
+    // In hedge mode side + posSide are authoritative; OKX inconsistently projects reduceOnly
+    // false or true for that same reducing pair. A true entry projection is still contradictory.
     match mode {
         OkxPositionMode::Net if leg == PositionSide::Net => Ok(raw_reduce),
-        OkxPositionMode::LongShort if leg != PositionSide::Net && !raw_reduce => Ok(matches!(
-            (leg, side),
-            (PositionSide::Long, OrderSide::Sell) | (PositionSide::Short, OrderSide::Buy)
-        )),
+        OkxPositionMode::LongShort if leg != PositionSide::Net => {
+            let derived_reduce = matches!(
+                (leg, side),
+                (PositionSide::Long, OrderSide::Sell) | (PositionSide::Short, OrderSide::Buy)
+            );
+            if raw_reduce && !derived_reduce {
+                return Err(OkxError::PositionMode);
+            }
+            Ok(derived_reduce)
+        }
         _ => Err(OkxError::PositionMode),
     }
 }
@@ -1417,7 +1425,7 @@ mod tests {
         let (_, instrument, scope) = setup()?;
         let mut pages = all_empty_pages(&scope)?;
         let regular = r#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","tdMode":"cross","category":"normal","ordType":"post_only","ordId":"9003","clOrdId":"regular3","side":"sell","posSide":"long","sz":"2","accFillSz":"0","px":"60000","avgPx":"","reduceOnly":"false","state":"live","uTime":"1899999999000"}]}"#;
-        let conditional = r#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","tdMode":"cross","algoId":"8003","algoClOrdId":"conditional3","side":"sell","posSide":"long","sz":"2","ordType":"conditional","reduceOnly":"false","state":"live","uTime":"1899999999000","cTime":"1899999998000","slTriggerPx":"59000","slOrdPx":"-1"}]}"#;
+        let conditional = r#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","tdMode":"cross","algoId":"8003","algoClOrdId":"conditional3","side":"sell","posSide":"long","sz":"2","ordType":"conditional","reduceOnly":"true","state":"live","uTime":"1899999999000","cTime":"1899999998000","slTriggerPx":"59000","slOrdPx":"-1"}]}"#;
         let trigger = r#"{"code":"0","msg":"","data":[{"instType":"SWAP","instId":"BTC-USDT-SWAP","tdMode":"cross","algoId":"7003","algoClOrdId":"trigger3","side":"buy","posSide":"short","sz":"2","ordType":"trigger","reduceOnly":"false","state":"live","uTime":"1899999999000","cTime":"1899999998000","triggerPx":"61000","orderPx":"-1"}]}"#;
         for raw in &mut pages {
             raw.payload = match raw.surface {

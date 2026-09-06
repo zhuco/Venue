@@ -395,6 +395,14 @@ impl BybitAccountGateway {
                         };
                     }
                 };
+                now_ms = match unix_ms() {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return AccountGatewayResult::Rejected {
+                            reason: "bybit_clock".to_owned(),
+                        };
+                    }
+                };
                 prepare_place_request(
                     &binding,
                     &self.identity,

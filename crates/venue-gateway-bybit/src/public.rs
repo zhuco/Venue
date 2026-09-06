@@ -207,6 +207,14 @@ pub struct BybitRestBbo {
     pub snapshot: MarketSnapshot,
 }
 
+impl BybitRestBbo {
+    /// Local receipt time is the freshness clock. Venue response time remains protocol evidence
+    /// and may be slightly ahead of the host clock without making a fresh BBO unusable.
+    pub(crate) const fn observed_at_ms(&self) -> u64 {
+        self.raw.received_at_ms
+    }
+}
+
 pub fn parse_rest_bbo(
     binding: &BybitGatewayBinding,
     raw: BybitRawPublicPayload,
@@ -713,6 +721,8 @@ mod tests {
         assert_eq!(bbo.snapshot.exchange_time_ms, Some(1_716_863_718_905));
         assert_eq!(bbo.snapshot.sequence, 230_704);
         assert_eq!(bbo.cross_sequence, 1_432_604_333);
+        assert_eq!(bbo.observed_at_ms(), 1_716_863_719_400);
+        assert_ne!(bbo.observed_at_ms(), bbo.response_time_ms);
         Ok(())
     }
 

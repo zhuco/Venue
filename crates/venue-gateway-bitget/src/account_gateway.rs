@@ -1967,4 +1967,15 @@ mod tests {
         assert_eq!(snapshot_order_facts(&[no_creation])?[0].created_at_ms, None);
         Ok(())
     }
+
+    #[test]
+    fn signed_snapshot_accepts_uta_tpsl_without_reduce_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = br#"{"code":"00000","data":[{"category":"USDT-FUTURES","symbol":"BTCUSDT","type":"tpsl","orderId":"501","clientOid":"tp-1","posSide":"short","side":null,"qty":"0.1","reduceOnly":null,"status":"pending","takeProfit":"90000","stopLoss":"","tpOrderType":"market","slOrderType":"market","createdTime":"1700000000123"}]}"#;
+        let facts = snapshot_strategy_order_facts(payload)?;
+        assert_eq!(facts.len(), 1);
+        assert!(facts[0].reduce_only);
+        assert_eq!(facts[0].side, OrderSide::Buy);
+        Ok(())
+    }
 }

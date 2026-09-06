@@ -165,11 +165,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string(&snapshot)?);
         }
         "status" => {
-            let row = sqlx::query("SELECT command_state,native_order_id,next_reconcile_ms FROM venue_binance_commands WHERE command_id=$1 AND owner_user_id=$2 AND strategy_command IS NOT NULL")
+            let row = sqlx::query("SELECT command_state,native_order_id,next_reconcile_ms,sanitized_error_code FROM venue_binance_commands WHERE command_id=$1 AND owner_user_id=$2 AND strategy_command IS NOT NULL")
                 .bind(&args[2]).bind(&args[1]).fetch_one(&pool).await.map_err(|_| "strategy command unavailable")?;
             println!(
                 "{}",
-                serde_json::json!({"state": row.try_get::<String,_>("command_state")?, "native_order_id": row.try_get::<Option<String>,_>("native_order_id")?, "next_reconcile_ms": row.try_get::<Option<i64>,_>("next_reconcile_ms")?})
+                serde_json::json!({"state": row.try_get::<String,_>("command_state")?, "native_order_id": row.try_get::<Option<String>,_>("native_order_id")?, "next_reconcile_ms": row.try_get::<Option<i64>,_>("next_reconcile_ms")?, "error_code": row.try_get::<Option<String>,_>("sanitized_error_code")?})
             );
         }
         _ => return Err("unsupported operation".into()),

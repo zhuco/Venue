@@ -91,6 +91,26 @@ macro_rules! gateway_call {
 }
 
 impl StrategyGateway {
+    pub(crate) fn market_facts_for_dispatch(
+        &mut self,
+    ) -> Result<venue_execution::DurableMarketFacts, &'static str> {
+        match self {
+            Self::Okx(gateway) => gateway.durable_market_facts_for_dispatch(),
+            Self::Bitget(gateway) => gateway
+                .durable_market_facts()
+                .map_err(|_| "strategy_market_unavailable"),
+            Self::Bybit(gateway) => gateway
+                .durable_market_facts()
+                .map_err(|_| "strategy_market_unavailable"),
+            Self::Gate(gateway) => gateway
+                .durable_market_facts()
+                .map_err(|_| "strategy_market_unavailable"),
+            Self::Hyperliquid(gateway) => gateway
+                .durable_market_facts()
+                .map_err(|_| "strategy_market_unavailable"),
+        }
+    }
+
     pub(crate) fn market_facts(
         &mut self,
     ) -> Result<venue_execution::DurableMarketFacts, StrategyExchangeError> {

@@ -239,9 +239,8 @@ pub(super) fn snapshot_strategy_order_facts(
             if quantity <= Decimal::ZERO {
                 return Err(AccountHostValidationError::SignedSnapshot);
             }
-            if !native_reduce_only(item.get("reduceOnly"))? {
-                return Err(AccountHostValidationError::SignedSnapshot);
-            }
+            crate::execution::strategy_reduce_only(item.get("reduceOnly"), position_side, side)
+                .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
             Ok(SignedAccountOrderFact {
                 client_order_id: required_text(item.get("clientOid"))?.to_owned(),
                 venue_order_id: Some(required_text(item.get("orderId"))?.to_owned()),
@@ -279,15 +278,6 @@ fn optional_positive_decimal(
             }
             Ok(Some(value))
         }
-    }
-}
-
-fn native_reduce_only(value: Option<&Value>) -> Result<bool, AccountHostValidationError> {
-    match value {
-        Some(Value::Bool(value)) => Ok(*value),
-        Some(Value::String(value)) if value.eq_ignore_ascii_case("yes") => Ok(true),
-        Some(Value::String(value)) if value.eq_ignore_ascii_case("no") => Ok(false),
-        _ => Err(AccountHostValidationError::SignedSnapshot),
     }
 }
 
