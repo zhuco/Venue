@@ -483,8 +483,8 @@ pub(super) fn draw(
     if badge.pnl.is_some() {
         detail.push_str(label(
             language,
-            " · 浮盈按新鲜最新价估算，行情过期回退签名标记价；不含手续费/资金费",
-            " · Estimated from fresh last price, or signed mark if stale; excludes fees/funding",
+            " · 本地浮盈：价差 × 持仓数量（按多空方向）；新鲜最新价，过期回退签名标记价；不含手续费/资金费",
+            " · Local PnL: directional price movement × quantity; fresh last price or signed mark if stale; excludes fees/funding",
         ));
     }
     if badge.selection.is_none() {

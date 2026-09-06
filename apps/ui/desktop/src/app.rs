@@ -44,6 +44,8 @@ pub struct VenueFlowApp {
     connected_endpoint: String,
     #[cfg(not(target_arch = "wasm32"))]
     market_client: Option<LocalMarketClient>,
+    #[cfg(not(target_arch = "wasm32"))]
+    market_server: crate::model::MarketServer,
     show_modules: bool,
     show_settings: bool,
     show_trading_settings: bool,
@@ -67,17 +69,20 @@ impl VenueFlowApp {
             creation_context.egui_ctx.clone(),
         );
         #[cfg(not(target_arch = "wasm32"))]
-        let (model, market_client) = match LocalMarketClient::start() {
-            Ok(client) => (model, Some(client)),
-            Err(error) => {
-                let mut model = model;
-                model.notice(format!("Local Binance market worker unavailable: {error}"));
-                (model, None)
-            }
-        };
+        let (model, market_client) =
+            match LocalMarketClient::start_for(model.preferences.market_server) {
+                Ok(client) => (model, Some(client)),
+                Err(error) => {
+                    let mut model = model;
+                    model.notice(format!("Local Binance market worker unavailable: {error}"));
+                    (model, None)
+                }
+            };
         Self {
             connected_endpoint: model.preferences.endpoint.clone(),
             account_center: crate::account_center::AccountCenter::new(&model.preferences.endpoint),
+            #[cfg(not(target_arch = "wasm32"))]
+            market_server: model.preferences.market_server,
             model,
             workspaces: persisted.workspaces,
             client,
@@ -95,12 +100,23 @@ impl VenueFlowApp {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn synchronize_local_markets(&mut self) {
+        if self.market_server != self.model.preferences.market_server {
+            self.market_client.take();
+            self.market_server = self.model.preferences.market_server;
+            self.model.local_symbols.clear();
+            self.model.local_precisions.clear();
+            self.model.local_quotes.clear();
+            self.model.history_requests.clear();
+            self.model.local_catalog_error = None;
+            self.model.trade_dock = crate::trading::TradeDockState::default();
+            self.market_client = LocalMarketClient::start_for(self.market_server).ok();
+        }
         let selections = self
             .workspaces
             .active_chart_requests(&self.model.preferences.selected_symbol)
             .into_iter()
             .filter_map(|(symbol, interval)| {
-                match MarketSelection::binance_usd_m(&symbol, interval) {
+                match MarketSelection::for_server(self.market_server, &symbol, interval) {
                     Ok(selection) => Some(selection),
                     Err(error) => {
                         self.model.notice(format!(
@@ -160,6 +176,23 @@ impl VenueFlowApp {
                 }
                 LocalMarketClientEvent::Catalog(symbols) => {
                     self.model.apply_local_catalog(symbols);
+                    if self.market_server != crate::model::MarketServer::Binance
+                        && !self
+                            .model
+                            .local_symbols
+                            .contains(&self.model.preferences.selected_symbol)
+                    {
+                        let fallback = self
+                            .model
+                            .local_symbols
+                            .iter()
+                            .find(|s| s.starts_with("BTC/"))
+                            .or(self.model.local_symbols.first())
+                            .cloned();
+                        if let Some(symbol) = fallback {
+                            self.model.preferences.selected_symbol = symbol;
+                        }
+                    }
                 }
                 LocalMarketClientEvent::Quotes(quotes) => {
                     self.model.apply_local_quotes(quotes);
@@ -513,6 +546,10 @@ impl eframe::App for VenueFlowApp {
             &mut self.show_execution_account,
             &mut self.show_symbol_picker,
         );
+        if std::mem::take(&mut self.model.general_settings_requested) {
+            self.settings_state.focus_general();
+            self.show_settings = true;
+        }
 
         let status_height = if self.model.preferences.show_status_bar {
             26.0

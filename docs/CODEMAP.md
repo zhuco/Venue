@@ -1,5 +1,7 @@
 # VENUE 功能代码地图
 
+桌面多交易所公共行情：`apps/ui/desktop/src/market_client/native/multi.rs` 负责显示订阅及代次；`crates/venue-gateway-{bybit,bitget,gate,okx,hyperliquid}/src/display.rs` 解析各所公开协议；`crates/venue-gateway-api/src/display.rs` 提供有界显示数据与已有领域类型转换；`scripts/configure_desktop_https.py` 管理固定只读代理。语言入口为顶部 `ui.rs` → `settings_panel.rs` 通用页。
+
 本页只定位当前入口与直接依赖。产品范围见 [README](../README.md)，职责见 [架构](ARCHITECTURE.md)，行为与验收见 [KOL MVP](KOL_COPY_MVP.md)、[人工带单](LEADER_ORDER_MIRROR.md) 和 [Grid 契约](GRID_RUNTIME_REFACTOR.md)。路径均相对仓库根。
 
 当前发布链是 Control + PostgreSQL + 单例 `venue-executor-binance`，由桌面与 Web 消费。先按下面的功能进入代码；旧 Node/Actor/WAL 单列为冻结兼容，不能作为新链模板。

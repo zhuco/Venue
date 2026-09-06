@@ -95,7 +95,15 @@ pub(crate) fn show(
                 );
                 ui.add_sized(
                     [130.0, 24.0],
-                    egui::Label::new(text(language, TextKey::Last)),
+                    egui::Label::new(
+                        if model.preferences.market_server
+                            == crate::model::MarketServer::Hyperliquid
+                        {
+                            "标记价 / Mark"
+                        } else {
+                            text(language, TextKey::Last)
+                        },
+                    ),
                 );
                 ui.add_sized([100.0, 24.0], egui::Label::new("24h %"));
                 ui.add_sized([170.0, 24.0], egui::Label::new("24h Quote Volume"));
@@ -222,10 +230,12 @@ pub(crate) fn show(
                                             ui.add_sized(
                                                 [170.0, 28.0],
                                                 egui::Label::new(
-                                                    RichText::new(format_decimal(
-                                                        quote.quote_volume_24h,
-                                                        0,
-                                                    ))
+                                                    RichText::new(
+                                                        quote
+                                                            .quote_volume_24h
+                                                            .map(|v| format_decimal(v, 0))
+                                                            .unwrap_or_else(|| "—".into()),
+                                                    )
                                                     .monospace(),
                                                 ),
                                             );

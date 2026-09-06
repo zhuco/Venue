@@ -5,7 +5,7 @@ use venue_control_protocol::{
 
 use crate::i18n::Language;
 
-pub(crate) fn show(ui: &mut egui::Ui, model: &crate::model::AppModel) {
+pub(crate) fn message(model: &crate::model::AppModel) -> Option<String> {
     let language = model.preferences.language;
     let row = model
         .execution
@@ -25,8 +25,7 @@ pub(crate) fn show(ui: &mut egui::Ui, model: &crate::model::AppModel) {
         })
         .max_by_key(|row| row.created_ms);
     if let Some(error) = &model.execution.terminal_submission_error {
-        ui.separator();
-        ui.colored_label(crate::theme::SELL, error);
+        Some(error.clone())
     } else if let Some(row) = row.filter(|row| {
         row.sanitized_error_code.is_some()
             || matches!(
@@ -36,20 +35,20 @@ pub(crate) fn show(ui: &mut egui::Ui, model: &crate::model::AppModel) {
                     | ExecutorCommandState::Cancelled
             )
     }) {
-        ui.separator();
-        let color = crate::theme::WARNING;
-        ui.colored_label(
-            color,
+        Some(
             format!(
                 "{} · {} · {}",
                 row.symbol,
                 choose(language, "委托", "Order"),
                 command_state(row.state, language)
-            ),
-        );
-        if row.sanitized_error_code.is_some() {
-            ui.colored_label(color, command_reason(row, language));
-        }
+            ) + &if row.sanitized_error_code.is_some() {
+                format!(" · {}", command_reason(row, language))
+            } else {
+                String::new()
+            },
+        )
+    } else {
+        None
     }
 }
 
@@ -354,20 +353,6 @@ mod tests {
     }
 
     fn render_feedback(model: &crate::model::AppModel) -> String {
-        fn collect(shape: &egui::Shape, text: &mut String) {
-            match shape {
-                egui::Shape::Text(value) => text.push_str(&value.galley.job.text),
-                egui::Shape::Vec(values) => values.iter().for_each(|value| collect(value, text)),
-                _ => (),
-            }
-        }
-        let context = egui::Context::default();
-        let mut output = context.run_ui(egui::RawInput::default(), |ui| show(ui, model));
-        output.textures_delta.clear();
-        let mut text = String::new();
-        for shape in output.shapes {
-            collect(&shape.shape, &mut text);
-        }
-        text
+        message(model).unwrap_or_default()
     }
 }

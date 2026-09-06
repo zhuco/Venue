@@ -30,6 +30,16 @@ pub struct HistoryRequest {
 }
 
 impl MarketSelection {
+    pub fn for_server(
+        server: crate::model::MarketServer,
+        symbol: &str,
+        interval: ChartInterval,
+    ) -> Result<Self, LocalMarketError> {
+        let mut selection = Self::binance_usd_m(symbol, interval)?;
+        selection.binding.venue = server.venue();
+        selection.validate()?;
+        Ok(selection)
+    }
     pub fn binance_usd_m(symbol: &str, interval: ChartInterval) -> Result<Self, LocalMarketError> {
         let symbol = symbol
             .parse()
@@ -40,7 +50,11 @@ impl MarketSelection {
     }
 
     pub fn validate(&self) -> Result<(), LocalMarketError> {
-        self.binding
+        // The Binance parser retains its narrower binding contract. Display subscriptions may
+        // use another adapter, while keeping the same LIVE linear stablecoin product boundary.
+        let mut binding = self.binding.clone();
+        binding.venue = venue_gateway_api::VenueId::Binance;
+        binding
             .validate()
             .map_err(|_| LocalMarketError::InvalidBinding)
     }
@@ -108,6 +122,8 @@ pub struct LocalMarketView {
     pub asks: Vec<UiBookLevel>,
     pub trades: Vec<UiTrade>,
     pub last: Option<Decimal>,
+    pub last_price_event_ms: Option<u64>,
+    pub last_price_received_ms: Option<u64>,
     pub bid: Option<Decimal>,
     pub ask: Option<Decimal>,
     pub last_event_ms: Option<u64>,
@@ -132,6 +148,8 @@ impl LocalMarketView {
             asks: Vec::new(),
             trades: Vec::new(),
             last: None,
+            last_price_event_ms: None,
+            last_price_received_ms: None,
             bid: None,
             ask: None,
             last_event_ms: None,
@@ -229,6 +247,7 @@ impl LocalMarketReducer {
             &envelope.payload,
             MarketPayload::RestHistory { .. } | MarketPayload::Status { .. }
         );
+        let previous_price_event_ms = self.last_price_event_ms;
         match envelope.payload {
             MarketPayload::RestHistory { bars } => self.apply_history(bars)?,
             MarketPayload::WsBar {
@@ -245,6 +264,11 @@ impl LocalMarketReducer {
             }
         }
 
+        // Book updates and status heartbeats cannot make an old traded price fresh.
+        if exchange_event && self.last_price_event_ms > previous_price_event_ms {
+            self.view.last_price_event_ms = Some(self.last_price_event_ms);
+            self.view.last_price_received_ms = Some(envelope.received_ms);
+        }
         self.view.last_event_ms = Some(envelope.event_time_ms);
         self.view.last_received_ms = Some(envelope.received_ms);
         if exchange_event {
@@ -301,6 +325,8 @@ impl LocalMarketReducer {
             self.closed_facts.pop_first();
         }
         self.view.last = self.view.bars.last().map(|bar| bar.close);
+        self.view.last_price_event_ms = None;
+        self.view.last_price_received_ms = None;
         self.last_price_event_ms = self
             .closed_facts
             .last_key_value()
@@ -749,6 +775,21 @@ impl LocalMarketStore {
             .find(|view| view.selection.binding.symbol.to_string() == symbol)
     }
 
+    pub fn latest_price_for_symbol(&self, symbol: &str) -> Option<(Decimal, u64, u64)> {
+        self.reducers
+            .values()
+            .map(LocalMarketReducer::view)
+            .filter(|view| view.selection.binding.symbol.to_string() == symbol)
+            .filter_map(|view| {
+                Some((
+                    view.last?,
+                    view.last_price_event_ms?,
+                    view.last_price_received_ms?,
+                ))
+            })
+            .max_by_key(|(_, event_ms, received_ms)| (*event_ms, *received_ms))
+    }
+
     pub fn refresh_staleness(&mut self, now_ms: u64, stale_after_ms: u64) {
         for reducer in self.reducers.values_mut() {
             reducer.refresh_staleness(now_ms, stale_after_ms);
@@ -780,7 +821,7 @@ impl LocalMarketStore {
 pub enum LocalMarketError {
     #[error("symbol must be canonical BASE/USDT or BASE/USDC")]
     InvalidSymbol,
-    #[error("public market binding is outside the approved Binance LIVE USD-M scope")]
+    #[error("public market binding must use LIVE linear stablecoin perpetuals")]
     InvalidBinding,
     #[error("market generation must be positive")]
     InvalidGeneration,
@@ -993,6 +1034,48 @@ mod tests {
 
     fn selection(symbol: &str) -> Result<MarketSelection, LocalMarketError> {
         MarketSelection::binance_usd_m(symbol, ChartInterval::OneMinute)
+    }
+
+    #[test]
+    fn pnl_price_freshness_only_advances_with_new_prices() -> Result<(), LocalMarketError> {
+        let mut reducer = LocalMarketReducer::new(selection("BTC/USDT")?)?;
+        reducer.apply(envelope(
+            &reducer,
+            100,
+            MarketPayload::Trade(UiTrade {
+                trade_id: "first".into(),
+                occurred_ms: 100,
+                price: Decimal::from(100),
+                quantity: Decimal::ONE,
+                aggressor: AggressorSide::Buy,
+            }),
+        ))?;
+        for payload in [
+            MarketPayload::Bbo {
+                bid: Decimal::from(99),
+                ask: Decimal::from(101),
+            },
+            MarketPayload::Status {
+                status: MarketStatus::Live,
+                detail: None,
+            },
+            MarketPayload::Trade(UiTrade {
+                trade_id: "late".into(),
+                occurred_ms: 90,
+                price: Decimal::from(90),
+                quantity: Decimal::ONE,
+                aggressor: AggressorSide::Buy,
+            }),
+        ] {
+            reducer.apply(envelope(&reducer, 20_000, payload))?;
+            assert_eq!(reducer.view().last, Some(Decimal::from(100)));
+            assert_eq!(reducer.view().last_price_event_ms, Some(100));
+            assert_eq!(reducer.view().last_price_received_ms, Some(107));
+        }
+        reducer.select(selection("ETH/USDT")?)?;
+        assert_eq!(reducer.view().last_price_event_ms, None);
+        assert_eq!(reducer.view().last_price_received_ms, None);
+        Ok(())
     }
 
     fn bar(open_time_ms: u64, close: i64) -> UiBar {

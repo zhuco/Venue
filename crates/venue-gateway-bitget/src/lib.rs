@@ -54,3 +54,4 @@ pub enum BitgetError {
     #[error("Bitget signing input is invalid")]
     SigningInput,
 }
+pub mod display;

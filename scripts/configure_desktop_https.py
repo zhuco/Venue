@@ -76,7 +76,8 @@ def desktop_route():
             {
                 "handler": "reverse_proxy",
                 "upstreams": [{"dial": "127.0.0.1:39180"}],
-                "flush_interval": -1,
+                # SSE is automatically flushed by Content-Type. A negative interval
+                # uses Caddy 2.6.2's inconsistent ignoreClientGoneContext on reload.
                 "transport": {"protocol": "http", "versions": ["1.1"]},
             },
         ],
@@ -100,8 +101,7 @@ def market_route(route_id, paths, upstream, websocket=False):
             "versions": ["1.1"] if websocket else ["1.1", "2"],
         },
     }
-    if websocket:
-        proxy["flush_interval"] = -1
+    # WebSocket upgrades are bidirectional streams, not buffered HTTP bodies.
     return {
         "@id": route_id,
         "match": [{"method": ["GET"], "path": paths}],
@@ -123,8 +123,33 @@ def desired_routes():
             "fstream.binance.com",
             websocket=True,
         ),
+        *multi_market_routes(),
         {"handle": WEB_HANDLERS},
     ]
+
+
+def multi_market_routes():
+    sources = {
+        "bybit": ("api.bybit.com", ["/v5/market/" + path for path in
+            ["instruments-info", "tickers", "kline", "orderbook", "recent-trade"]]),
+        "bitget": ("api.bitget.com", ["/api/v3/market/" + path for path in
+            ["instruments", "tickers", "candles", "orderbook", "fills"]]),
+        "okx": ("www.okx.com", ["/api/v5/public/instruments"] +
+            ["/api/v5/market/" + path for path in ["tickers", "candles", "history-candles", "books", "trades"]]),
+        "gate": ("api.gateio.ws", ["/api/v4/futures/usdt/" + path for path in
+            ["contracts", "tickers", "candlesticks", "order_book", "trades"]]),
+        "hyperliquid": ("api.hyperliquid.xyz", ["/info"]),
+    }
+    result = []
+    for venue, (host, paths) in sources.items():
+        prefix = f"/quotes/{venue}"
+        route = market_route(f"venue-desktop-market-{venue}", [prefix + p for p in paths], host)
+        if venue == "hyperliquid":
+            # /info is read-only; the exchange's order-writing /exchange is never exposed.
+            route["match"][0]["method"] = ["POST"]
+        route["handle"].insert(1, {"handler": "rewrite", "strip_path_prefix": prefix})
+        result.append(route)
+    return result
 
 
 def configured_route(current):
@@ -157,7 +182,13 @@ def configured_route(current):
             == [DESKTOP_ID, MARKET_REST_ID, MARKET_STREAM_ID]
             and routes[3] == {"handle": WEB_HANDLERS}
         )
-        if not old_layout and not current_layout:
+        multi_layout = (
+            len(routes) == 9
+            and [route.get("@id") for route in routes[:-1]] ==
+                [route.get("@id") for route in desired_routes()[:-1]]
+            and routes[-1] == {"handle": WEB_HANDLERS}
+        )
+        if not old_layout and not current_layout and not multi_layout:
             raise ValueError("Unexpected host handlers; refusing to overwrite another deployment")
         handles[0]["routes"] = desired_routes()
     else:
@@ -182,6 +213,8 @@ def read_route():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="Verify without changing configuration")
+    parser.add_argument("--drained-legacy-streams", action="store_true",
+                        help="Confirm clients using the old negative-flush routes are disconnected")
     args = parser.parse_args()
     for _ in range(3):
         current, etag = read_route()
@@ -191,6 +224,8 @@ def main():
             return
         if args.check:
             raise SystemExit("Venue desktop HTTPS and market routes are not installed")
+        if has_negative_flush(current) and not args.drained_legacy_streams:
+            raise SystemExit("Disconnect old desktop SSE/WebSocket clients before reload; then use --drained-legacy-streams")
         request = urllib.request.Request(
             ADMIN_ROUTE, data=json.dumps(desired).encode("utf-8"), method="PATCH",
             headers={"Content-Type": "application/json", "If-Match": etag},
@@ -208,6 +243,12 @@ def main():
         print("Venue desktop HTTPS and market routes installed and verified")
         return
     raise SystemExit("Caddy configuration changed concurrently; retry after the other deployment")
+
+
+def has_negative_flush(value):
+    if isinstance(value, dict):
+        return value.get("flush_interval", 0) < 0 or any(has_negative_flush(v) for v in value.values())
+    return isinstance(value, list) and any(has_negative_flush(v) for v in value)
 
 
 if __name__ == "__main__":

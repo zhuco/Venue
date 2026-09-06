@@ -10,10 +10,15 @@ from configure_desktop_https import (
     POST_PATHS,
     WEB_HANDLERS,
     configured_route,
+    has_negative_flush,
 )
 
 
 class DesktopHttpsTests(unittest.TestCase):
+    def test_negative_flush_is_detected_and_removed(self):
+        self.assertTrue(has_negative_flush({"handle": [{"flush_interval": -1}]}))
+        self.assertFalse(has_negative_flush(configured_route(self.original)))
+
     def setUp(self):
         self.original = {
             "@id": "venue-kol-web",
@@ -29,8 +34,8 @@ class DesktopHttpsTests(unittest.TestCase):
         self.assertEqual(result, configured_route(result))
         self.assertEqual(result["match"], before["match"])
         routes = result["handle"][0]["routes"]
-        self.assertEqual(routes[3], {"handle": before["handle"]})
-        self.assertEqual(routes[0]["handle"][1]["flush_interval"], -1)
+        self.assertEqual(routes[-1], {"handle": before["handle"]})
+        self.assertNotIn("flush_interval", routes[0]["handle"][1])
         self.assertTrue(routes[0]["terminal"])
 
     def test_only_exact_desktop_methods_and_paths_are_exposed(self):
@@ -65,7 +70,7 @@ class DesktopHttpsTests(unittest.TestCase):
             self.assertTrue(route["terminal"])
         self.assertEqual(rest["handle"][1]["upstreams"], [{"dial": "fapi.binance.com:443"}])
         self.assertEqual(stream["handle"][1]["upstreams"], [{"dial": "fstream.binance.com:443"}])
-        self.assertEqual(stream["handle"][1]["flush_interval"], -1)
+        self.assertNotIn("flush_interval", stream["handle"][1])
 
     def test_upgrades_previous_desktop_only_layout(self):
         desktop_only = configured_route(self.original)
@@ -75,6 +80,20 @@ class DesktopHttpsTests(unittest.TestCase):
         self.assertEqual([route.get("@id") for route in upgraded[:3]], [
             "venue-desktop-api", MARKET_REST_ID, MARKET_STREAM_ID
         ])
+
+    def test_multi_venue_routes_are_exact_read_only_and_remove_credentials(self):
+        routes = configured_route(self.original)["handle"][0]["routes"]
+        self.assertEqual(len(routes), 9)
+        for route in routes[3:-1]:
+            paths = route["match"][0]["path"]
+            self.assertTrue(all("*" not in p and "/exchange" not in p for p in paths))
+            self.assertEqual(route["handle"][-1]["headers"]["request"]["delete"], ["Authorization", "Cookie"])
+            self.assertEqual(route["handle"][1]["handler"], "rewrite")
+            self.assertEqual(route["match"][0]["method"],
+                ["POST"] if route["@id"].endswith("hyperliquid") else ["GET"])
+        previous = copy.deepcopy(configured_route(self.original))
+        previous["handle"][0]["routes"] = routes[:3] + routes[-1:]
+        self.assertEqual(configured_route(previous), configured_route(self.original))
 
     def test_rejects_other_sites_and_unrecognized_handlers(self):
         for change in (

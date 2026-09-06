@@ -73,6 +73,10 @@ impl AlertBook {
 }
 
 pub(crate) fn poll(model: &mut AppModel) {
+    // Saved alerts predate venue binding and belong to the original Binance source.
+    if model.preferences.market_server != crate::model::MarketServer::Binance {
+        return;
+    }
     let now = crate::account_center::now_ms();
     for quote in model.local_quotes.values() {
         if quote.exchange_time_ms > now.saturating_add(2_000)

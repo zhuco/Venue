@@ -1,6 +1,7 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     mod history;
+    mod multi;
     use std::{
         collections::BTreeSet,
         thread,
@@ -93,13 +94,15 @@ mod native {
     }
 
     impl LocalMarketClient {
-        pub fn start() -> Result<Self, LocalMarketClientError> {
+        pub fn start_for(
+            server: crate::model::MarketServer,
+        ) -> Result<Self, LocalMarketClientError> {
             let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
             let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
             let (history_tx, history_rx) = bounded(MAX_SUBSCRIPTIONS);
             let worker = thread::Builder::new()
                 .name("venueflow-local-market".to_owned())
-                .spawn(move || worker_main(command_rx, event_tx, history_rx))
+                .spawn(move || worker_main(command_rx, event_tx, history_rx, server))
                 .map_err(|_| LocalMarketClientError::ThreadStart)?;
             Ok(Self {
                 history_commands: history_tx,
@@ -154,7 +157,9 @@ mod native {
                 .is_ok()
                 && let Some(worker) = self.worker.take()
             {
-                let _ = worker.join();
+                // Source changes must not block the UI on a slow public HTTP request. The Stop
+                // command closes its runtime; dropping the handle detaches only that cleanup.
+                drop(worker);
             }
         }
     }
@@ -292,6 +297,7 @@ mod native {
         command_rx: Receiver<LocalMarketCommand>,
         event_tx: Sender<LocalMarketClientEvent>,
         history_rx: Receiver<crate::market::HistoryRequest>,
+        server: crate::model::MarketServer,
     ) {
         let runtime = match Builder::new_multi_thread()
             .worker_threads(2)
@@ -306,7 +312,11 @@ mod native {
                 return;
             }
         };
-        runtime.block_on(supervisor(command_rx, event_tx, history_rx));
+        if server == crate::model::MarketServer::Binance {
+            runtime.block_on(supervisor(command_rx, event_tx, history_rx));
+        } else {
+            runtime.block_on(multi::run(server, command_rx, event_tx, history_rx));
+        }
         runtime.shutdown_background();
     }
 
@@ -816,7 +826,7 @@ mod native {
                         symbol: ticker.symbol.to_string(),
                         last: ticker.last_price.value(),
                         change_percent_24h: ticker.price_change_percent,
-                        quote_volume_24h: ticker.quote_volume,
+                        quote_volume_24h: Some(ticker.quote_volume),
                         exchange_time_ms: ticker.exchange_time_ms,
                         received_ms: ticker.received_at_ms,
                     })
@@ -945,15 +955,22 @@ mod native {
         emitter: &mut EventEmitter,
     ) -> Result<(), String> {
         if payload.contains("\"stream\":\"!ticker@arr\"") {
-            let tickers = parse_public_market_ticker_array(payload, catalog, received_ms)
-                .map_err(|error| format!("all-market ticker parse failed: {error}"))?;
+            let tickers = match parse_public_market_ticker_array(payload, catalog, received_ms) {
+                Ok(tickers) => tickers,
+                Err(error) => {
+                    // A rejected ticker batch must not tear down unrelated candle,
+                    // trade and book subscriptions. Existing quotes still expire normally.
+                    tracing::warn!(%error, "discarded invalid all-market ticker batch");
+                    return Ok(());
+                }
+            };
             let quotes = tickers
                 .into_iter()
                 .map(|ticker| MarketQuote {
                     symbol: ticker.symbol.to_string(),
                     last: ticker.last_price.value(),
                     change_percent_24h: ticker.price_change_percent,
-                    quote_volume_24h: ticker.quote_volume,
+                    quote_volume_24h: Some(ticker.quote_volume),
                     exchange_time_ms: ticker.exchange_time_ms,
                     received_ms: ticker.received_at_ms,
                 })
@@ -1293,6 +1310,22 @@ mod native {
         use venue_domain::domain::{Price, Symbol};
 
         use super::*;
+
+        #[test]
+        fn rejected_ticker_batch_does_not_reconnect_or_refresh_quotes() -> Result<(), String> {
+            let catalog = vec!["BTC/USDT".parse::<Symbol>().map_err(|e| e.to_string())?];
+            let (sender, receiver) = crossbeam_channel::bounded(8);
+            let mut emitter = EventEmitter::new(sender);
+            let invalid = r#"{"stream":"!ticker@arr","data":[{"e":"24hrTicker","s":"BTCUSDT","E":1000,"c":"0","P":"0","q":"10"}]}"#;
+            dispatch_payload(invalid, 1, &[], &catalog, 1001, &mut emitter)?;
+            assert!(receiver.is_empty());
+            let valid = invalid.replace("\"c\":\"0\"", "\"c\":\"100\"");
+            dispatch_payload(&valid, 1, &[], &catalog, 1001, &mut emitter)?;
+            assert!(receiver.try_iter().any(|event| matches!(event,
+                LocalMarketClientEvent::Quotes(quotes) if quotes.len() == 1 && quotes[0].last == rust_decimal::Decimal::from(100)
+            )));
+            Ok(())
+        }
 
         fn selection(symbol: &str, interval: ChartInterval) -> Result<MarketSelection, String> {
             MarketSelection::binance_usd_m(symbol, interval).map_err(|error| error.to_string())

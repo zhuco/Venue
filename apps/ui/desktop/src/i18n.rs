@@ -169,7 +169,7 @@ resources! {
     Change => "Change", "涨跌幅";
     Amplitude => "Amplitude", "振幅";
     Volume => "Volume", "成交量";
-    NoBook => "No order-book data. Waiting for the public WebSocket.", "暂无订单簿，正在等待公共 WebSocket。";
+    NoBook => "No order-book data. Waiting for public market data.", "暂无订单簿，正在等待公共行情。";
     Side => "Side", "方向";
     Price => "Price", "价格";
     Quantity => "Quantity", "数量";
@@ -177,7 +177,7 @@ resources! {
     PricePrecision => "Price precision", "价格精度";
     Ask => "ASK", "卖";
     Bid => "BID", "买";
-    NoTrades => "No trades. Waiting for the public WebSocket.", "暂无逐笔成交，正在等待公共 WebSocket。";
+    NoTrades => "No trades. Waiting for public market data.", "暂无逐笔成交，正在等待公共行情。";
     Time => "Time", "时间";
     AccountsSource => "secret-free server projections", "无敏感信息的服务端投影";
     WaitingControl => "Waiting for the Control API.", "正在等待 Control API。";

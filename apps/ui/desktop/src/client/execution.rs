@@ -109,7 +109,7 @@ pub(super) fn start_native(
     sender: crossbeam_channel::Sender<ClientEvent>,
     context: eframe::egui::Context,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    projection_requests: crossbeam_channel::Receiver<TerminalProjectionRequest>,
+    projection_requests: tokio::sync::watch::Receiver<Option<TerminalProjectionRequest>>,
 ) {
     let history_client = client.clone();
     let history_endpoint = endpoint.clone();
@@ -145,56 +145,163 @@ pub(super) fn start_native(
         }
     });
 
-    tokio::spawn(async move {
-        let mut projection_request = None;
-        while !stop.load(std::sync::atomic::Ordering::Acquire) {
-            for request in projection_requests.try_iter() {
-                projection_request = Some(request);
-            }
-            if let Some(request) = projection_request.as_ref() {
-                let event = match tokio::time::timeout(
+    tokio::spawn(projection_loop(
+        client,
+        endpoint,
+        sender,
+        context,
+        stop,
+        projection_requests,
+    ));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn projection_loop(
+    client: reqwest::Client,
+    endpoint: String,
+    sender: crossbeam_channel::Sender<ClientEvent>,
+    context: eframe::egui::Context,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mut requests: tokio::sync::watch::Receiver<Option<TerminalProjectionRequest>>,
+) {
+    while !stop.load(std::sync::atomic::Ordering::Acquire) {
+        let request = requests.borrow_and_update().clone();
+        if let Some(request) = request {
+            // Only read-only projection requests are cancelled. Order delivery stays on
+            // its independent durable command path. Watch retains the latest selection.
+            let result = tokio::select! {
+                biased;
+                changed = requests.changed() => {
+                    if changed.is_err() { break; }
+                    continue;
+                }
+                result = tokio::time::timeout(
                     super::REQUEST_TIMEOUT,
-                    fetch_terminal_projection(&client, &endpoint, request),
-                )
-                .await
-                {
-                    Ok(Ok(projection)) => ClientEvent::TerminalAccountProjection {
-                        credential_id: request.credential_id.clone(),
-                        projection,
-                    },
-                    Ok(Err(TerminalReadError::SessionExpired)) => ClientEvent::SessionExpired,
-                    Ok(Err(TerminalReadError::Unavailable(message))) => {
-                        ClientEvent::TerminalAccountUnavailable {
-                            credential_id: request.credential_id.clone(),
-                            message,
-                        }
-                    }
-                    Err(_) => {
-                        tracing::warn!("private account projection request timed out");
-                        ClientEvent::TerminalAccountUnavailable {
-                            credential_id: request.credential_id.clone(),
-                            message: "Private account projection request timed out".into(),
-                        }
-                    }
-                };
-                if stop.load(std::sync::atomic::Ordering::Acquire) {
-                    break;
-                }
-                let expired = matches!(event, ClientEvent::SessionExpired);
-                let latest = projection_requests.try_iter().last();
-                if let Some(latest) = latest {
-                    let changed = latest != *request;
-                    projection_request = Some(latest);
-                    if changed && !expired {
-                        continue;
+                    fetch_terminal_projection(&client, &endpoint, &request),
+                ) => result,
+            };
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            let event = match result {
+                Ok(Ok(projection)) => ClientEvent::TerminalAccountProjection {
+                    credential_id: request.credential_id,
+                    projection,
+                },
+                Ok(Err(TerminalReadError::SessionExpired)) => ClientEvent::SessionExpired,
+                Ok(Err(TerminalReadError::Unavailable(message))) => {
+                    ClientEvent::TerminalAccountUnavailable {
+                        credential_id: request.credential_id,
+                        message,
                     }
                 }
-                publish(&sender, &context, event);
-                if expired {
-                    break;
+                Err(_) => ClientEvent::TerminalAccountUnavailable {
+                    credential_id: request.credential_id,
+                    message: "Private account projection request timed out".into(),
+                },
+            };
+            let expired = matches!(event, ClientEvent::SessionExpired);
+            if !expired && requests.has_changed().unwrap_or(true) {
+                continue;
+            }
+            publish(&sender, &context, event);
+            if expired {
+                break;
+            }
+        }
+        tokio::select! {
+            changed = requests.changed() => {
+                if changed.is_err() { break; }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+        }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use std::{
+        sync::{Arc, atomic::AtomicBool},
+        time::Duration,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn account_switch_interrupts_slow_read_and_poll_delay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let mut old_connection = None;
+            for index in 0..3 {
+                let (mut socket, _) = listener.accept().await?;
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 2048];
+                    let read = socket.read(&mut chunk).await?;
+                    if read == 0 {
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                    }
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if bytes.ends_with(b"}") {
+                        break;
+                    }
+                }
+                let _ = seen_tx.send(String::from_utf8_lossy(&bytes).to_string());
+                if index == 0 {
+                    old_connection = Some(socket);
+                } else {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnull").await?;
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            drop(old_connection);
+            Ok::<_, std::io::Error>(())
+        });
+        let symbol: venue_domain::Symbol = "DOGE/USDC".parse()?;
+        let request = |index| TerminalProjectionRequest {
+            schema_version: venue_control_protocol::kol::TERMINAL_PROJECTION_SCHEMA_VERSION,
+            credential_id: format!("00000000-0000-4000-8000-{index:012}"),
+            symbols: vec![symbol.clone()],
+        };
+        let (requests_tx, requests_rx) = tokio::sync::watch::channel(Some(request(1)));
+        let (events_tx, events_rx) = crossbeam_channel::unbounded();
+        let worker = tokio::spawn(projection_loop(
+            reqwest::Client::builder().no_proxy().build()?,
+            endpoint,
+            events_tx,
+            egui::Context::default(),
+            Arc::new(AtomicBool::new(false)),
+            requests_rx,
+        ));
+        let first = tokio::time::timeout(Duration::from_secs(2), seen_rx.recv())
+            .await?
+            .ok_or("first request")?;
+        assert!(first.contains(&request(1).credential_id));
+        for index in [2, 3] {
+            requests_tx.send(Some(request(index)))?;
+            let received = tokio::time::timeout(Duration::from_millis(750), seen_rx.recv())
+                .await?
+                .ok_or("switched request")?;
+            assert!(received.contains(&request(index).credential_id));
+            let event = tokio::time::timeout(Duration::from_millis(750), async {
+                loop {
+                    if let Ok(event) = events_rx.try_recv() {
+                        break event;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await?;
+            assert!(
+                matches!(event, ClientEvent::TerminalAccountProjection { credential_id, projection: None } if credential_id == request(index).credential_id)
+            );
         }
-    });
+        drop(requests_tx);
+        tokio::time::timeout(Duration::from_secs(1), worker).await??;
+        server.await??;
+        assert!(events_rx.is_empty());
+        Ok(())
+    }
 }

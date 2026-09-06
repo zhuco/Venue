@@ -5,6 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use venue_domain::domain::{MarketKind, Symbol, is_canonical_trading_account_id};
 
 mod capability_promotion;
+pub mod display;
 
 pub use capability_promotion::{
     CanaryAdmissionReceipt, CapabilityProbeCandidate, CapabilityPromotionError,

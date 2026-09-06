@@ -87,7 +87,8 @@ pub struct ControlClient {
     terminal_order_tx: Sender<TerminalOrderRequest>,
     terminal_cancel_tx: Sender<TerminalCancelRequest>,
     terminal_position_tx: Sender<TerminalPositionActionRequest>,
-    terminal_projection_tx: Sender<TerminalProjectionRequest>,
+    #[cfg(not(target_arch = "wasm32"))]
+    terminal_projection_tx: tokio::sync::watch::Sender<Option<TerminalProjectionRequest>>,
     copy_relation_tx: Sender<CopyRelationUpsertRequest>,
     grid_mutation_tx: Sender<GridMutation>,
     stream_gates: StreamGates,
@@ -112,7 +113,8 @@ impl ControlClient {
         let (terminal_order_tx, terminal_order_rx) = unbounded();
         let (terminal_cancel_tx, terminal_cancel_rx) = unbounded();
         let (terminal_position_tx, terminal_position_rx) = bounded(1);
-        let (terminal_projection_tx, terminal_projection_rx) = bounded(1);
+        #[cfg(not(target_arch = "wasm32"))]
+        let (terminal_projection_tx, terminal_projection_rx) = tokio::sync::watch::channel(None);
         let (copy_relation_tx, copy_relation_rx) = unbounded();
         let (grid_mutation_tx, grid_mutation_rx) = unbounded();
         let stream_gates = StreamGates::default();
@@ -159,6 +161,7 @@ impl ControlClient {
             terminal_order_tx,
             terminal_cancel_tx,
             terminal_position_tx,
+            #[cfg(not(target_arch = "wasm32"))]
             terminal_projection_tx,
             copy_relation_tx,
             grid_mutation_tx,
@@ -204,7 +207,14 @@ impl ControlClient {
 
     pub fn subscribe_terminal(&self, request: TerminalProjectionRequest) {
         if request.validate().is_ok() {
-            let _ = self.terminal_projection_tx.try_send(request);
+            #[cfg(not(target_arch = "wasm32"))]
+            self.terminal_projection_tx.send_if_modified(|current| {
+                if current.as_ref() == Some(&request) {
+                    return false;
+                }
+                *current = Some(request);
+                true
+            });
         }
     }
 
@@ -334,7 +344,7 @@ fn start_native(
     terminal_orders: Receiver<TerminalOrderRequest>,
     terminal_cancellations: Receiver<TerminalCancelRequest>,
     terminal_positions: Receiver<TerminalPositionActionRequest>,
-    terminal_projection: Receiver<TerminalProjectionRequest>,
+    terminal_projection: tokio::sync::watch::Receiver<Option<TerminalProjectionRequest>>,
     copy_relations: Receiver<CopyRelationUpsertRequest>,
     grid_mutations: Receiver<GridMutation>,
     context: egui::Context,
@@ -395,7 +405,7 @@ async fn native_loop(
     terminal_orders: Receiver<TerminalOrderRequest>,
     terminal_cancellations: Receiver<TerminalCancelRequest>,
     terminal_positions: Receiver<TerminalPositionActionRequest>,
-    terminal_projection: Receiver<TerminalProjectionRequest>,
+    terminal_projection: tokio::sync::watch::Receiver<Option<TerminalProjectionRequest>>,
     copy_relations: Receiver<CopyRelationUpsertRequest>,
     grid_mutations: Receiver<GridMutation>,
     context: egui::Context,

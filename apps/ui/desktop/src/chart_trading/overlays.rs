@@ -32,6 +32,11 @@ pub(crate) fn collect(
     if let Some(projection) = model
         .execution
         .private_projection_for(model.preferences.execution_account_id.as_deref())
+        .filter(|_| {
+            model
+                .selected_execution_credential()
+                .is_none_or(|c| c.venue == model.preferences.market_server.venue())
+        })
     {
         let fresh = model.execution.private_ready(
             model.preferences.execution_account_id.as_deref(),
@@ -251,6 +256,7 @@ pub(crate) fn draw(
     let painter = painter.with_clip_rect(rect);
     let mut occupied = Vec::<Rect>::new();
     let mut price_lines = Vec::new();
+    let mut fill_stacks = std::collections::HashMap::<(usize, bool), usize>::new();
     let mut sorted = overlays.iter().enumerate().collect::<Vec<_>>();
     sorted.sort_by(|(_, a), (_, b)| b.price.cmp(&a.price));
     for (index, overlay) in sorted {
@@ -274,23 +280,27 @@ pub(crate) fn draw(
             let Some(x) = bar_center_x(rect.left(), rect.width(), slots, bar_index) else {
                 continue;
             };
-            let direction = if overlay.color == theme::BUY {
-                1.0
-            } else {
-                -1.0
-            };
-            let center = Pos2::new(x, y);
-            painter.add(egui::Shape::convex_polygon(
-                vec![
-                    center,
-                    center + egui::vec2(-4.0, direction * 8.0),
-                    center + egui::vec2(4.0, direction * 8.0),
-                ],
-                overlay.color,
-                Stroke::NONE,
-            ));
+            let buy = overlay.color == theme::BUY;
+            let direction = if buy { 1.0 } else { -1.0 };
+            let candle = &bars[bar_index];
+            let anchor_price = if buy { candle.low } else { candle.high };
+            let anchor_y = range
+                .price_to_y(rect.top(), rect.height(), decimal_to_f64(anchor_price))
+                .unwrap_or(y);
+            let stack = fill_stacks.entry((bar_index, buy)).or_default();
+            let center = Pos2::new(x, anchor_y + direction * (13.0 + *stack as f32 * 20.0));
+            *stack += 1;
+            let marker = Rect::from_center_size(center, egui::vec2(18.0, 18.0));
+            painter.rect_filled(marker, 5, overlay.color);
+            painter.text(
+                center,
+                Align2::CENTER_CENTER,
+                if buy { "B" } else { "S" },
+                FontId::monospace(13.0),
+                Color32::WHITE,
+            );
             ui.interact(
-                Rect::from_center_size(center, egui::vec2(12.0, 18.0)),
+                marker.intersect(rect),
                 ui.id().with(("chart-fill", index, time)),
                 egui::Sense::hover(),
             )

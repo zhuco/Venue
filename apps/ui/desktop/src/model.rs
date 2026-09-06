@@ -23,20 +23,47 @@ pub const DEFAULT_SELECTED_SYMBOL: &str = "BTC/USDC";
 #[cfg(not(target_arch = "wasm32"))]
 pub const PREFERRED_SYMBOL_ORDER: [&str; 4] = ["BTC/USDC", "ETH/USDC", "SOL/USDC", "BNB/USDC"];
 
-/// Public market providers are selected at the UI boundary. Binance is the only provider
-/// currently wired to the native market worker; adding another value requires a real adapter.
+/// Public display source is independent of the selected execution account.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum MarketServer {
     #[default]
     Binance,
+    Bybit,
+    Bitget,
+    Gate,
+    Okx,
+    Hyperliquid,
 }
 
 impl MarketServer {
-    pub const ALL: [Self; 1] = [Self::Binance];
+    pub const ALL: [Self; 6] = [
+        Self::Binance,
+        Self::Bybit,
+        Self::Bitget,
+        Self::Gate,
+        Self::Okx,
+        Self::Hyperliquid,
+    ];
+
+    pub const fn venue(self) -> VenueId {
+        match self {
+            Self::Binance => VenueId::Binance,
+            Self::Bybit => VenueId::Bybit,
+            Self::Bitget => VenueId::Bitget,
+            Self::Gate => VenueId::Gate,
+            Self::Okx => VenueId::Okx,
+            Self::Hyperliquid => VenueId::Hyperliquid,
+        }
+    }
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Binance => "Binance",
+            Self::Bybit => "Bybit",
+            Self::Bitget => "Bitget",
+            Self::Gate => "Gate",
+            Self::Okx => "OKX",
+            Self::Hyperliquid => "Hyperliquid",
         }
     }
 }
@@ -46,7 +73,7 @@ pub struct MarketQuote {
     pub symbol: String,
     pub last: Decimal,
     pub change_percent_24h: Decimal,
-    pub quote_volume_24h: Decimal,
+    pub quote_volume_24h: Option<Decimal>,
     pub exchange_time_ms: u64,
     pub received_ms: u64,
 }
@@ -358,6 +385,7 @@ pub struct AppModel {
     pub symbol_group: SymbolGroup,
     pub follow_latest_requested: bool,
     pub indicator_settings_requested: bool,
+    pub general_settings_requested: bool,
     pub indicator_target: Option<String>,
     pub trading_settings_requested: bool,
     pub trade_dock: crate::trading::TradeDockState,
@@ -430,6 +458,7 @@ impl AppModel {
             symbol_group: SymbolGroup::All,
             follow_latest_requested: false,
             indicator_settings_requested: false,
+            general_settings_requested: false,
             indicator_target: None,
             trading_settings_requested: false,
             trade_dock: crate::trading::TradeDockState::default(),
@@ -740,6 +769,10 @@ impl AppModel {
     }
 
     pub fn select_trading_price(&mut self, symbol: &str, price: Decimal, context: &egui::Context) {
+        if self.preferences.market_server != MarketServer::Binance {
+            self.notice("当前行情为参考行情，手动选价仅支持 Binance / Reference market; manual pricing requires Binance");
+            return;
+        }
         if symbol != self.preferences.selected_symbol {
             return;
         }
@@ -830,6 +863,25 @@ impl AppModel {
     pub fn notice(&mut self, message: impl Into<String>) {
         self.notices.push_front(message.into());
         self.notices.truncate(MAX_NOTICES);
+    }
+
+    pub fn select_market_server(&mut self, server: MarketServer) {
+        if self.preferences.market_server == server {
+            return;
+        }
+        self.preferences.market_server = server;
+        self.local_quotes.clear();
+        self.trade_dock = crate::trading::TradeDockState::default();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.local_symbols.clear();
+            self.local_precisions.clear();
+            self.history_requests.clear();
+            self.local_catalog_error = None;
+            if let Err(e) = self.local_markets.replace([]) {
+                self.notice(e.to_string());
+            }
+        }
     }
 }
 

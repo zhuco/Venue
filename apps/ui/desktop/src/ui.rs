@@ -119,6 +119,9 @@ pub fn show_top_bar(
                         ui.horizontal_centered(|ui| {
                             #[cfg(not(target_arch = "wasm32"))]
                             window_controls(ui);
+                            if ui.button("设置 / Settings").clicked() {
+                                model.general_settings_requested = true;
+                            }
                             let user_label = account_overview
                                 .as_ref()
                                 .map(|a| a.user.username.as_str())
@@ -165,7 +168,14 @@ pub fn show_top_bar(
                             }
                             egui::ComboBox::from_id_salt("market-server")
                                 .width(94.0)
-                                .selected_text(format!("行情 · {}", market_server.label()))
+                                .selected_text(format!(
+                                    "{} · {}",
+                                    match language {
+                                        Language::SimplifiedChinese => "行情",
+                                        Language::English => "Market",
+                                    },
+                                    market_server.label()
+                                ))
                                 .show_ui(ui, |ui| {
                                     for server in crate::model::MarketServer::ALL {
                                         ui.selectable_value(
@@ -257,7 +267,7 @@ pub fn show_top_bar(
                 );
             workspaces.active = workspace_selection;
             if model.preferences.market_server != market_server {
-                model.preferences.market_server = market_server;
+                model.select_market_server(market_server);
             }
             if account_selection_requested.is_some() {
                 model.account_selection_requested = account_selection_requested;
@@ -288,7 +298,10 @@ fn show_symbol_tabs(
     workspaces: &mut Workspaces,
     picker_requested: &std::cell::Cell<bool>,
 ) {
-    let tabs = model.preferences.favorite_symbols.clone();
+    let mut tabs = model.preferences.favorite_symbols.clone();
+    if !tabs.contains(&model.preferences.selected_symbol) {
+        tabs.push(model.preferences.selected_symbol.clone());
+    }
     let mut close_requested = None;
     for symbol in tabs {
         let quote = local_quote(model, &symbol);
@@ -296,7 +309,12 @@ fn show_symbol_tabs(
             || "—  —".to_owned(),
             |quote| {
                 format!(
-                    "{} {:+.2}%",
+                    "{}{} {:+.2}%",
+                    if model.preferences.market_server == crate::model::MarketServer::Hyperliquid {
+                        "Mark "
+                    } else {
+                        ""
+                    },
                     model.format_market_price(&symbol, quote.last),
                     quote.change_percent_24h
                 )
@@ -553,7 +571,8 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
     let language = model.preferences.language;
     let settings_key = pane.settings_key();
     #[cfg(not(target_arch = "wasm32"))]
-    let history_status = MarketSelection::binance_usd_m(
+    let history_status = MarketSelection::for_server(
+        model.preferences.market_server,
         pane.symbol
             .as_deref()
             .unwrap_or(&model.preferences.selected_symbol),
@@ -606,7 +625,8 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
     }
     let overlays = crate::chart_trading::collect(model, &symbol, &pane.trading_display);
     #[cfg(not(target_arch = "wasm32"))]
-    if let Ok(selection) = MarketSelection::binance_usd_m(&symbol, pane.interval)
+    if let Ok(selection) =
+        MarketSelection::for_server(model.preferences.market_server, &symbol, pane.interval)
         && let Err(error) =
             model
                 .local_markets
@@ -1488,6 +1508,9 @@ fn format_freshness(age_ms: Option<u64>) -> String {
     })
 }
 fn market<'a>(model: &'a AppModel, symbol: &str) -> Option<&'a MarketSummary> {
+    if model.preferences.market_server != crate::model::MarketServer::Binance {
+        return None;
+    }
     model
         .snapshot
         .as_ref()?
@@ -1496,6 +1519,10 @@ fn market<'a>(model: &'a AppModel, symbol: &str) -> Option<&'a MarketSummary> {
         .find(|market| market.symbol.to_string() == symbol)
 }
 pub(crate) fn available_symbols(model: &AppModel) -> Vec<String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if model.preferences.market_server != crate::model::MarketServer::Binance {
+        return model.local_symbols.clone();
+    }
     #[cfg(not(target_arch = "wasm32"))]
     if !model.local_symbols.is_empty() {
         return model.local_symbols.clone();

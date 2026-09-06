@@ -7,6 +7,9 @@ publish = false
 
 [dependencies]
 bitflags.workspace = true
+reqwest.workspace = true
+rust_decimal.workspace = true
+serde_json.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 venue-domain = { path = "../venue-domain" }

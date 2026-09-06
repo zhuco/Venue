@@ -62,7 +62,6 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
             "Manual opens do not wait for positions; the server verifies ownership. Closes still require fresh positions.",
         ));
     });
-    crate::terminal_feedback::show(ui, model);
     ui.separator();
     ui.horizontal(|ui| {
         ui.strong("Limit · Post Only");
@@ -552,6 +551,9 @@ fn terminal_request_parts(
     action: TradingAction,
     now: f64,
 ) -> Result<TerminalRequestParts, crate::trading::TradePlanError> {
+    if model.preferences.market_server != crate::model::MarketServer::Binance {
+        return Err(crate::trading::TradePlanError::UiOnlyAction);
+    }
     if model
         .selected_execution_credential()
         .is_none_or(|c| c.venue != venue_control_protocol::VenueId::Binance)

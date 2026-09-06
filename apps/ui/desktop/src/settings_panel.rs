@@ -84,6 +84,11 @@ pub struct SettingsPanelState {
 }
 
 impl SettingsPanelState {
+    pub fn focus_general(&mut self) {
+        self.clear();
+        self.target = None;
+        self.tab = SettingsTab::General;
+    }
     pub fn focus_indicators(&mut self, target: Option<String>) {
         self.clear();
         self.target = target;

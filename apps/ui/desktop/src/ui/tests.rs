@@ -285,7 +285,7 @@ fn terminal_chrome_keeps_both_rows_at_the_top_of_the_window() -> Result<(), &'st
 #[test]
 fn status_bar_is_one_line_with_funds_visible_at_supported_widths() {
     for language in Language::ALL {
-        for width in [850.0, 1100.0, 1680.0] {
+        for width in [750.0, 850.0, 1100.0, 1680.0] {
             let context = egui::Context::default();
             theme::apply(&context);
             let model = AppModel::new(crate::model::Preferences {
@@ -319,6 +319,10 @@ fn status_bar_is_one_line_with_funds_visible_at_supported_widths() {
                 }
             }
             for prefix in [
+                "● Binance",
+                "Control",
+                text(language, TextKey::TradeConnection),
+                text(language, TextKey::ExecutionAccount),
                 text(language, TextKey::Equity),
                 text(language, TextKey::MarginShort),
             ] {

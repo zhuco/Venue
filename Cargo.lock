@@ -4832,6 +4832,8 @@ name = "venue-gateway-api"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.1",
+ "reqwest",
+ "rust_decimal",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -5079,6 +5081,11 @@ dependencies = [
  "venue-domain",
  "venue-gateway-api",
  "venue-gateway-binance",
+ "venue-gateway-bitget",
+ "venue-gateway-bybit",
+ "venue-gateway-gate",
+ "venue-gateway-hyperliquid",
+ "venue-gateway-okx",
  "venue-indicators",
  "wasm-bindgen",
  "wasm-bindgen-futures",

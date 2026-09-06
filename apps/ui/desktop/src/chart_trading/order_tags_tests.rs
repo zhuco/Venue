@@ -308,10 +308,47 @@ fn order_tags_fixture_preview() -> Result<(), Box<dyn std::error::Error>> {
             selection: None,
         }),
     });
+    for (bar, color, count) in [(116_u64, theme::BUY, 3), (123, theme::SELL, 3)] {
+        for fill in 0..count {
+            harness.overlays.push(ChartOverlay {
+                price: Decimal::new(8400 + ((bar * 17) % 370) as i64, 5),
+                label: format!("成交 {fill}"),
+                color,
+                time_ms: Some(bar * 60_000 + fill * 1000),
+                line: false,
+                tick: false,
+                badge: None,
+            });
+        }
+    }
     harness.frame(vec![]);
     let output = harness.frame(vec![]);
     assert!(harness.texts.iter().any(|text| text.contains("盈亏")));
     assert!(harness.texts.iter().any(|text| text.contains("限价委托")));
+    assert_eq!(harness.texts.iter().filter(|text| *text == "B").count(), 3);
+    assert_eq!(harness.texts.iter().filter(|text| *text == "S").count(), 3);
+    fn marker_positions(shape: &egui::Shape, letter: &str, positions: &mut Vec<Pos2>) {
+        match shape {
+            egui::Shape::Text(text) if text.galley.job.text == letter => positions.push(text.pos),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    marker_positions(shape, letter, positions);
+                }
+            }
+            _ => (),
+        }
+    }
+    for letter in ["B", "S"] {
+        let mut positions = Vec::new();
+        for shape in &output.shapes {
+            marker_positions(&shape.shape, letter, &mut positions);
+        }
+        positions.sort_by(|a, b| a.y.total_cmp(&b.y));
+        for pair in positions.windows(2) {
+            assert!((pair[0].x - pair[1].x).abs() < 0.1);
+            assert!(pair[1].y - pair[0].y >= 19.0, "fills must remain readable");
+        }
+    }
     if let Some(path) = std::env::var_os("VENUE_CHART_TAG_PREVIEW") {
         let primitives = harness
             .context
@@ -594,7 +631,7 @@ fn realtime_pnl_tracks_quote_and_hedge_side_without_changing_signed_facts()
                 symbol: "DOGE/USDC".into(),
                 last: price,
                 change_percent_24h: Decimal::ZERO,
-                quote_volume_24h: Decimal::ZERO,
+                quote_volume_24h: Some(Decimal::ZERO),
                 exchange_time_ms: now,
                 received_ms: now,
             },
@@ -620,6 +657,53 @@ fn realtime_pnl_tracks_quote_and_hedge_side_without_changing_signed_facts()
     missing.mark_price = None;
     assert_eq!(
         crate::execution_view::live_position_pnl_value(&model, &missing),
+        None
+    );
+    // No further private-account refresh is needed for either chart or table PnL.
+    let selection = crate::market::MarketSelection::binance_usd_m(
+        "DOGE/USDC",
+        crate::chart::ChartInterval::OneMinute,
+    )?;
+    let generation = model
+        .local_markets
+        .replace([selection.clone()])?
+        .ok_or("generation")?;
+    for (event_ms, price, expected) in [
+        (now - 300, Decimal::new(12, 1), Decimal::from(20)),
+        (now - 100, Decimal::new(8, 1), Decimal::from(-20)),
+        (now - 200, Decimal::new(15, 1), Decimal::from(-20)),
+    ] {
+        model.local_markets.apply(crate::market::MarketEnvelope {
+            generation,
+            selection: selection.clone(),
+            event_time_ms: event_ms,
+            received_ms: now,
+            payload: crate::market::MarketPayload::Trade(venue_control_protocol::UiTrade {
+                trade_id: event_ms.to_string(),
+                occurred_ms: event_ms,
+                price,
+                quantity: Decimal::ONE,
+                aggressor: venue_control_protocol::AggressorSide::Buy,
+            }),
+        })?;
+        assert_eq!(
+            crate::execution_view::live_position_pnl_value(&model, &missing),
+            Some(expected)
+        );
+        let tags = super::super::collect(&model, "DOGE/USDC", &ChartTradingSettings::default());
+        assert_eq!(tags[0].badge.as_ref().and_then(|b| b.pnl), Some(expected));
+        assert_eq!(tags[1].badge.as_ref().and_then(|b| b.pnl), Some(-expected));
+    }
+    let mut net_short = missing.clone();
+    net_short.position_side = venue_domain::PositionSide::Net;
+    net_short.quantity = -net_short.quantity;
+    assert_eq!(
+        crate::execution_view::live_position_pnl_value(&model, &net_short),
+        Some(Decimal::from(20))
+    );
+    net_short.entry_price = None;
+    assert_eq!(
+        crate::execution_view::live_position_pnl_value(&model, &net_short),
         None
     );
     Ok(())

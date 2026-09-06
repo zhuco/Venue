@@ -564,8 +564,8 @@ fn position_pnl(
     if let Some(pnl) = pnl {
         ui.colored_label(pnl_color(pnl), format!("{:.4}", pnl.round_dp(4)))
             .on_hover_text(
-                "新鲜最新价估算浮动盈亏；行情过期回退签名标记价，不含手续费与资金费。
-Estimated from fresh last price; falls back to signed mark. Excludes fees and funding.",
+                "本地计算：价差 × 持仓数量（按多空方向）。采用最新成交价；行情过期回退签名标记价。不含手续费与资金费。
+Locally calculated from price movement and position quantity. Uses fresh last price, or signed mark when stale. Excludes fees and funding.",
             );
     } else {
         ui.label("—");
@@ -611,18 +611,29 @@ pub(crate) fn live_position_pnl_value(
     position: &venue_control_protocol::kol::TerminalPosition,
 ) -> Option<rust_decimal::Decimal> {
     let now = crate::account_center::now_ms();
-    let quote = model
-        .local_quotes
-        .get(&position.symbol.to_string())
-        .filter(|quote| {
-            fresh_time(quote.received_ms, now)
-                && fresh_time(quote.exchange_time_ms, now)
-                && quote.last > rust_decimal::Decimal::ZERO
-        });
-    match quote {
-        Some(quote) => position_pnl_at(position, Some(quote.last)),
-        None => position_pnl_value(position),
+    // Only prices from the execution venue may value that account's position.
+    if model
+        .selected_execution_credential()
+        .is_some_and(|credential| credential.venue != model.preferences.market_server.venue())
+    {
+        return position_pnl_value(position);
     }
+    let symbol = position.symbol.to_string();
+    let ticker = model
+        .local_quotes
+        .get(&symbol)
+        .map(|quote| (quote.last, quote.exchange_time_ms, quote.received_ms));
+    let price = ticker
+        .into_iter()
+        .chain(model.local_markets.latest_price_for_symbol(&symbol))
+        .filter(|(price, event_ms, received_ms)| {
+            fresh_time(*received_ms, now)
+                && fresh_time(*event_ms, now)
+                && *price > rust_decimal::Decimal::ZERO
+        })
+        .max_by_key(|(_, event_ms, received_ms)| (*event_ms, *received_ms))
+        .map(|(price, _, _)| price);
+    position_pnl_at(position, price.or(position.mark_price))
 }
 
 fn position_pnl_at(
@@ -630,6 +641,9 @@ fn position_pnl_at(
     price: Option<rust_decimal::Decimal>,
 ) -> Option<rust_decimal::Decimal> {
     position.entry_price.zip(price).and_then(|(entry, mark)| {
+        if entry <= rust_decimal::Decimal::ZERO || mark <= rust_decimal::Decimal::ZERO {
+            return None;
+        }
         let movement = match position.position_side {
             venue_domain::PositionSide::Long => mark.checked_sub(entry),
             venue_domain::PositionSide::Short => entry.checked_sub(mark),
