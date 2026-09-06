@@ -930,6 +930,10 @@ fn classify_http_error(status: u16, payload: &[u8], mutation: bool) -> BinanceTr
         BinanceTransportError::AmbiguousStatus(status)
     } else if code == Some(-1021) {
         BinanceTransportError::TimestampRejected
+    } else if !mutation && status == 400 && code == Some(-2013) {
+        // Preserve the numeric exact-lookup absence code for corroborated stop reconciliation.
+        // Callers still treat this error alone as UNKNOWN; it grants no retry or cancel fact.
+        BinanceTransportError::ApiRejected(-2013)
     } else if let Some(code) = code.filter(|_| mutation && (400..500).contains(&status)) {
         BinanceTransportError::ApiRejected(code)
     } else {
@@ -1026,6 +1030,44 @@ mod tests {
             classify_http_error(400, br#"{"code":"API_SECRET"}"#, true),
             BinanceTransportError::HttpStatus(400)
         );
+    }
+
+    #[tokio::test]
+    async fn read_absence_preserves_numeric_code_without_mutation_or_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let credentials = BinanceCredentials::from_values("key", "secret")?;
+        let (config, _, scope) = facts("00000000-0000-4000-8000-000000000001")?;
+        let (endpoint, count, counts) =
+            fake_http_tracked(vec![Behavior::Status(400, br#"{"code":-2013}"#)]).await?;
+        let transport = BinanceHttpTransport::with_endpoint(
+            config,
+            7,
+            17,
+            endpoint,
+            BinanceTransportLimits::new(Duration::from_secs(1), 4096)?,
+        )?;
+        let request = crate::build_exact_order_request(&scope, "missing-client")?;
+        assert_eq!(
+            transport
+                .execute_read(&credentials, &request, unix_ms()?)
+                .await,
+            Err(BinanceTransportError::ApiRejected(-2013))
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.signed_gets.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.posts.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.deletes.load(Ordering::SeqCst), 0);
+        for (status, payload) in [
+            (500, br#"{"code":-2013}"#.as_slice()),
+            (400, br#"{"code":-2011}"#.as_slice()),
+            (400, br#"{"code":"-2013"}"#.as_slice()),
+        ] {
+            assert_eq!(
+                classify_http_error(status, payload, false),
+                BinanceTransportError::HttpStatus(status)
+            );
+        }
+        Ok(())
     }
 
     enum Behavior {
