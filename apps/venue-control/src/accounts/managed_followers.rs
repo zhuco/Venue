@@ -425,6 +425,9 @@ impl AccountService {
         now_ms: u64,
         managed: Option<(&str, &str)>,
     ) -> Result<(), AccountError> {
+        // The signed probe completes after the HTTP request timestamp was captured. Use its
+        // observation time so the freshly verified credential is not rejected as future-dated.
+        let activation_now_ms = now_ms.max(summary.verified_ms.unwrap_or(now_ms));
         let value: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT follow_authorization_json FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND deleted_ms IS NULL",
         )
@@ -496,7 +499,7 @@ impl AccountService {
                     },
                     expected_revision: existing.map(|value| value.revision),
                 },
-                now_ms,
+                activation_now_ms,
                 managed,
             )
             .await?;
@@ -510,7 +513,7 @@ impl AccountService {
                 action: venue_control_protocol::kol::FollowLifecycleAction::Activate,
                 risk_confirmed: true,
             },
-            now_ms,
+            activation_now_ms,
             managed,
         )
         .await?;
