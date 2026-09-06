@@ -364,6 +364,9 @@ pub enum HyperliquidOrderStatus {
         reduce_only: bool,
         native_order_type: String,
         time_in_force: Option<String>,
+        trigger_price: Option<Price>,
+        trigger_condition: String,
+        is_position_tpsl: bool,
         state: OrderState,
         exchange_time_ms: u64,
     },
@@ -522,6 +525,14 @@ pub fn parse_order_status(
             {
                 return Err(HyperliquidError::Payload);
             }
+            let trigger_price = if body.order.is_trigger {
+                Some(
+                    Price::new(decimal(&body.order.trigger_px)?)
+                        .map_err(|_| HyperliquidError::Payload)?,
+                )
+            } else {
+                None
+            };
             Ok(HyperliquidOrderStatus::Known {
                 scope: meta.scope.clone(),
                 order_id: body.order.oid,
@@ -540,6 +551,9 @@ pub fn parse_order_status(
                 reduce_only: body.order.reduce_only,
                 native_order_type: body.order.order_type,
                 time_in_force: body.order.tif,
+                trigger_price,
+                trigger_condition: body.order.trigger_condition,
+                is_position_tpsl: body.order.is_position_tpsl,
                 state,
                 exchange_time_ms: body.status_timestamp,
             })

@@ -1,4 +1,9 @@
 mod account_host;
+mod durable_gateway;
+pub use durable_gateway::{
+    DurableAccountGateway, DurableExecutionContext, DurableMarketFacts, DurableOrderObservation,
+    validate_durable_command, validate_durable_context, validate_signed_durable_command,
+};
 mod canonical_root;
 mod journal;
 mod owner_routes;

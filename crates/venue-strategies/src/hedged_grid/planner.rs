@@ -31,6 +31,12 @@ pub struct GridPlannerConfig {
     pub reset_policy: GridResetPolicy,
 }
 
+impl GridPlannerConfig {
+    pub fn validate(&self) -> Result<(), GridPlannerError> {
+        validate_config(self)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GridReplenishmentPolicy {
     pub minimum_leg_notional: Amount,
@@ -164,6 +170,9 @@ pub enum GridPlannerControl {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GridPlannerInput {
+    /// Explicit one-direction Net grid; None preserves the two Hedge lanes.
+    #[serde(default)]
+    pub net_direction: Option<GridPosition>,
     pub config: GridPlannerConfig,
     pub instrument: InstrumentMetadata,
     pub instrument_limits: GridInstrumentLimits,
@@ -583,7 +592,10 @@ fn validated_surface(
     let mut surface = BTreeMap::new();
     let mut lane_prices = BTreeSet::new();
     for order in &input.owned_orders {
-        if order.validate().is_err()
+        if input
+            .net_direction
+            .is_some_and(|side| side != order.key.position)
+            || order.validate().is_err()
             || order.key.epoch != input.config.revision
             || !input.price_within_limits(order.price)
             || !input.quantity_within_limits(order.quantity)
@@ -649,7 +661,7 @@ fn initial_surface(
         grid_quantity,
     };
     let mut desired = Vec::with_capacity(usize::from(input.config.grid_count) * 4);
-    for position in [GridPosition::Long, GridPosition::Short] {
+    for position in input.active_positions() {
         for level in 1..=input.config.grid_count {
             desired.push(order_from_anchor(
                 &anchor,
@@ -876,7 +888,7 @@ fn infer_anchor(
         return Err(GridResetTrigger::InvalidOwnedOrder);
     }
     let mut differences = Vec::new();
-    for position in [GridPosition::Long, GridPosition::Short] {
+    for position in input.active_positions() {
         for role in [GridOrderRole::Open, GridOrderRole::Close] {
             let mut prices = surface
                 .values()
@@ -923,24 +935,20 @@ fn complete_surface_shape(
     input: &GridPlannerInput,
     surface: &BTreeMap<GridOrderKey, GridOrderIntent>,
 ) -> bool {
-    [GridPosition::Long, GridPosition::Short]
-        .into_iter()
-        .all(|position| {
-            let opens = surface
-                .values()
-                .filter(|order| {
-                    order.key.position == position && order.key.role == GridOrderRole::Open
-                })
-                .count();
-            let closes = surface
-                .values()
-                .filter(|order| {
-                    order.key.position == position && order.key.role == GridOrderRole::Close
-                })
-                .count();
-            opens == usize::from(input.config.grid_count)
-                && closes <= usize::from(input.config.grid_count)
-        })
+    input.active_positions().into_iter().all(|position| {
+        let opens = surface
+            .values()
+            .filter(|order| order.key.position == position && order.key.role == GridOrderRole::Open)
+            .count();
+        let closes = surface
+            .values()
+            .filter(|order| {
+                order.key.position == position && order.key.role == GridOrderRole::Close
+            })
+            .count();
+        opens == usize::from(input.config.grid_count)
+            && closes <= usize::from(input.config.grid_count)
+    })
 }
 
 fn cancellation_candidate(
@@ -1075,7 +1083,7 @@ fn exposure_directive(
             }));
         }
     }
-    for position in [GridPosition::Long, GridPosition::Short] {
+    for position in input.active_positions() {
         let inventory_quantity = inventory_quantity(&input.inventory, position);
         match by_position.get(&position) {
             Some(leg) if leg.quantity != inventory_quantity => {
@@ -1098,7 +1106,7 @@ fn exposure_directive(
         .checked_mul(policy.inventory_equity_multiple)
         .ok_or(GridPlannerError::Arithmetic)?;
     let mut reductions = Vec::new();
-    for position in [GridPosition::Long, GridPosition::Short] {
+    for position in input.active_positions() {
         let Some(leg) = by_position.get(&position) else {
             continue;
         };
@@ -1166,7 +1174,7 @@ fn replenishment_directive(
         return Ok(None);
     };
     let mut adjustments = Vec::new();
-    for position in [GridPosition::Long, GridPosition::Short] {
+    for position in input.active_positions() {
         let current_notional = raw_quote_notional(
             &input.instrument,
             inventory_quantity(&input.inventory, position),
@@ -1215,7 +1223,7 @@ fn clip_close_orders(
         .cloned()
         .collect::<Vec<_>>();
     let mut close_orders = Vec::new();
-    for position in [GridPosition::Long, GridPosition::Short] {
+    for position in input.active_positions() {
         let mut lane = orders
             .iter()
             .filter(|order| {
@@ -1426,7 +1434,10 @@ fn validate_generated_orders(
     orders: &[GridOrderIntent],
 ) -> Result<(), GridPlannerError> {
     for order in orders {
-        if order.validate().is_err()
+        if input
+            .net_direction
+            .is_some_and(|side| side != order.key.position)
+            || order.validate().is_err()
             || !input.price_within_limits(order.price)
             || !input.quantity_within_limits(order.quantity)
         {
@@ -1437,6 +1448,13 @@ fn validate_generated_orders(
 }
 
 impl GridPlannerInput {
+    fn active_positions(&self) -> Vec<GridPosition> {
+        self.net_direction.map_or_else(
+            || vec![GridPosition::Long, GridPosition::Short],
+            |side| vec![side],
+        )
+    }
+
     fn reference_value(&self) -> Option<Decimal> {
         if let Some(reference) = &self.reference_price {
             return Some(reference.price.value());

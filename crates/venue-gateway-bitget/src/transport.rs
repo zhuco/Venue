@@ -6,6 +6,7 @@ use std::{
 };
 
 use bytes::BytesMut;
+use serde_json::Value;
 use venue_gateway_api::GatewayBinding;
 
 use crate::{
@@ -474,6 +475,70 @@ impl BitgetHttpTransport {
         .map_err(|_| BitgetTransportError::Protocol)
     }
 
+    /// Reads the signed UTA account identity endpoint.  This response is kept separate from
+    /// the five-face snapshot because `/api/v3/account/info` has a different payload contract
+    /// and must never be accepted as a balance face.
+    pub async fn fetch_account_info(
+        &self,
+        credentials: &BitgetCredentials,
+        timestamp_ms: u64,
+    ) -> Result<Vec<u8>, BitgetTransportError> {
+        self.validate_scope(&self.binding, self.generation)?;
+        let headers = sign(
+            credentials,
+            &self.config,
+            &SignInput {
+                timestamp_ms,
+                method: "GET",
+                request_path: endpoints::ACCOUNT_INFO,
+                query: "",
+                body: &[],
+            },
+        )
+        .map_err(|_| BitgetTransportError::Signing)?;
+        tokio::time::timeout(
+            self.limits.operation_timeout,
+            self.send("GET", endpoints::ACCOUNT_INFO, "", &[], &headers),
+        )
+        .await
+        .map_err(|_| BitgetTransportError::Timeout)?
+    }
+
+    pub(crate) async fn fetch_unfilled_strategy_orders(
+        &self,
+        credentials: &BitgetCredentials,
+        timestamp_ms: u64,
+    ) -> Result<Vec<u8>, BitgetTransportError> {
+        self.validate_scope(&self.binding, self.generation)?;
+        // `type` is intentionally omitted: Bitget documents it as optional, and this account-wide
+        // admission surface must see unsupported trigger/TWAP/iceberg/trailing orders too.
+        let query = "category=USDT-FUTURES";
+        let headers = sign(
+            credentials,
+            &self.config,
+            &SignInput {
+                timestamp_ms,
+                method: "GET",
+                request_path: endpoints::UNFILLED_STRATEGY_ORDERS,
+                query,
+                body: &[],
+            },
+        )
+        .map_err(|_| BitgetTransportError::Signing)?;
+        tokio::time::timeout(
+            self.limits.operation_timeout,
+            self.send(
+                "GET",
+                endpoints::UNFILLED_STRATEGY_ORDERS,
+                query,
+                &[],
+                &headers,
+            ),
+        )
+        .await
+        .map_err(|_| BitgetTransportError::Timeout)?
+    }
+
     /// Collects all five signed surfaces. Any failed face discards the local turn candidate.
     pub async fn collect_private_turn(
         &self,
@@ -670,6 +735,11 @@ impl BitgetHttpTransport {
         timestamp_ms: u64,
     ) -> Result<BitgetExactOrderReadback, BitgetTransportError> {
         self.validate_scope(&request.binding, request.generation)?;
+        if request.expected_strategy.is_some() {
+            return self
+                .execute_strategy_exact_readback(credentials, request, timestamp_ms)
+                .await;
+        }
         let headers = sign(
             credentials,
             &self.config,
@@ -701,6 +771,76 @@ impl BitgetHttpTransport {
         let received_at_ms = unix_ms()?.max(requested_at_ms);
         parse_exact_order_readback(&self.config, request, requested_at_ms, received_at_ms, body)
             .map_err(|_| BitgetTransportError::Protocol)
+    }
+
+    async fn execute_strategy_exact_readback(
+        &self,
+        credentials: &BitgetCredentials,
+        request: BitgetExactReadbackRequest,
+        timestamp_ms: u64,
+    ) -> Result<BitgetExactOrderReadback, BitgetTransportError> {
+        let requested_at_ms = unix_ms()?;
+        if requested_at_ms < request.not_before_ms {
+            return Err(BitgetTransportError::Clock);
+        }
+        let mut path = endpoints::UNFILLED_STRATEGY_ORDERS;
+        let mut query = request.query.clone();
+        for _ in 0..=crate::private::BITGET_MAX_PRIVATE_PAGES {
+            let headers = sign(
+                credentials,
+                &self.config,
+                &SignInput {
+                    timestamp_ms,
+                    method: "GET",
+                    request_path: path,
+                    query: &query,
+                    body: &[],
+                },
+            )
+            .map_err(|_| BitgetTransportError::Signing)?;
+            let body = tokio::time::timeout(
+                self.limits.operation_timeout,
+                self.send("GET", path, &query, &[], &headers),
+            )
+            .await
+            .map_err(|_| BitgetTransportError::Timeout)??;
+            let received_at_ms = unix_ms()?.max(requested_at_ms);
+            let readback = parse_exact_order_readback(
+                &self.config,
+                request.clone(),
+                requested_at_ms,
+                received_at_ms,
+                body.clone(),
+            )
+            .map_err(|_| BitgetTransportError::Protocol)?;
+            if readback.order.is_some() {
+                return Ok(readback);
+            }
+            if path == endpoints::UNFILLED_STRATEGY_ORDERS {
+                path = endpoints::HISTORY_STRATEGY_ORDERS;
+                query = request.query.clone();
+                continue;
+            }
+            let root: Value =
+                serde_json::from_slice(&body).map_err(|_| BitgetTransportError::Protocol)?;
+            let Some(cursor) = root
+                .get("data")
+                .and_then(Value::as_object)
+                .and_then(|value| value.get("cursor"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            else {
+                return Err(BitgetTransportError::Protocol);
+            };
+            if !cursor
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return Err(BitgetTransportError::Protocol);
+            }
+            query = format!("{}&cursor={cursor}", request.query);
+        }
+        Err(BitgetTransportError::Protocol)
     }
 
     /// Executes one recovery GET only under an adapter-issued authenticated private session. The

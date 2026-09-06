@@ -194,6 +194,11 @@ async fn managed_save_is_atomic_scoped_idempotent_and_never_grants_trading() -> 
     .bind(&credential_id)
     .fetch_one(&f.pool)
     .await?;
+    // Production upgraded from the frozen managed-follower table and retains this stricter
+    // provenance column. The canonical fresh schema deliberately does not require it.
+    sqlx::raw_sql("ALTER TABLE venue_user_kol_bindings ADD COLUMN binding_source TEXT NOT NULL DEFAULT 'invite' CHECK(binding_source IN ('invite','kol_managed')); ALTER TABLE venue_user_kol_bindings ADD CONSTRAINT venue_user_kol_bindings_invite_source_check CHECK((binding_source='invite' AND invite_id IS NOT NULL) OR (binding_source='kol_managed' AND invite_id IS NULL));")
+        .execute(&f.pool)
+        .await?;
     sqlx::query(
         "UPDATE venue_api_credentials SET verification_json='{}'::jsonb WHERE credential_id=$1",
     )
@@ -255,6 +260,15 @@ async fn managed_save_is_atomic_scoped_idempotent_and_never_grants_trading() -> 
     assert_eq!(
         relation.state,
         venue_control_protocol::kol::FollowLifecycleState::Paused
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT binding_source FROM venue_user_kol_bindings WHERE user_id=$1",
+        )
+        .bind(&subject.user.user_id)
+        .fetch_one(&f.pool)
+        .await?,
+        "kol_managed"
     );
     let relation_json = serde_json::to_string(&relation)?;
     assert!(!relation_json.contains("credential_id"));
@@ -352,7 +366,7 @@ async fn frozen_managed_table_is_preserved_and_nonempty_legacy_fails_closed() ->
         sqlx::query_scalar::<_, i32>("SELECT max(version) FROM venue_control_schema_migrations")
             .fetch_one(&f.pool)
             .await?,
-        34
+        36
     );
     assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='venue_kol_managed_followers' AND column_name='managed_follower_id'").fetch_one(&f.pool).await?,1);
     let session = f.service.register(login("freshuser"), now()).await?;

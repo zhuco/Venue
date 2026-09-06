@@ -1,0 +1,10 @@
+{
+  "code": "00000",
+  "msg": "success",
+  "requestTime": 1710000000000,
+  "data": {
+    "userId": "123456789",
+    "permType": "read-and-write",
+    "permissions": ["uta_trade"]
+  }
+}

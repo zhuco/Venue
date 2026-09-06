@@ -1,0 +1,24 @@
+[
+  {
+    "id": 777,
+    "initial": {
+      "contract": "DOGE_USDT",
+      "amount": "-10",
+      "price": "0",
+      "tif": "ioc",
+      "text": "t-protect1",
+      "is_reduce_only": true
+    },
+    "trigger": {
+      "strategy_type": 0,
+      "price_type": 1,
+      "price": "0.09",
+      "rule": 2
+    },
+    "order_type": "plan-close-long-position",
+    "status": "finished",
+    "finish_as": "succeeded",
+    "trade_id": 9002,
+    "create_time": 1777777000
+  }
+]

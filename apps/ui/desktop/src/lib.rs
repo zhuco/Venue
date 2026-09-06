@@ -21,6 +21,7 @@ mod model;
 mod order_book_view;
 mod server_connection;
 mod settings_panel;
+mod support_martingale_view;
 mod symbol_picker;
 mod terminal_feedback;
 mod theme;

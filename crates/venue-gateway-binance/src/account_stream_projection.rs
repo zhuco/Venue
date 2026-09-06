@@ -385,7 +385,7 @@ impl BinanceAccountGateway {
     /// Balances retain the bootstrap value; callers must independently verify PM equity before
     /// using it for a new risk action. The snapshot is a read model, not a dispatch permission.
     pub fn stream_projection_snapshot(
-        &self,
+        &mut self,
     ) -> Result<Option<SignedAccountSnapshot>, BinanceAccountGatewayError> {
         let Some(state) = &self.stream_projection else {
             return Ok(None);
@@ -393,7 +393,18 @@ impl BinanceAccountGateway {
         let Some(stream) = &self.private_stream else {
             return Ok(None);
         };
-        state.snapshot(stream.last_received_at_ms(), self.private_generation)
+        let snapshot = state.snapshot(stream.last_received_at_ms(), self.private_generation)?;
+        if let Some(snapshot) = &snapshot {
+            for symbol in snapshot
+                .open_orders()
+                .iter()
+                .map(|order| &order.symbol)
+                .chain(snapshot.positions().iter().map(|position| &position.symbol))
+            {
+                self.projection_symbols.insert(symbol.clone());
+            }
+        }
+        Ok(snapshot)
     }
 
     pub fn accept_stream_projection(&mut self, observed_ms: u64) {

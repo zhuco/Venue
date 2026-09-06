@@ -30,12 +30,19 @@ pub mod kol_mvp;
 pub mod kol_private_source;
 pub mod leader_bot_admin;
 mod model;
+pub mod multi_venue_credentials;
+pub mod multi_venue_exchange;
+pub mod multi_venue_grid;
+pub mod multi_venue_risk;
+pub mod multi_venue_runtime;
+pub mod multi_venue_store;
 mod node_projection_postgres;
 pub mod order_mirror;
 mod postgres;
 pub mod private_projection;
 mod repository;
 mod service;
+pub mod support_martingale;
 
 pub use account_delivery_postgres::{
     MAX_ACCOUNT_DELIVERY_CLAIM, MAX_ACCOUNT_DELIVERY_LEASE_MS, MIGRATION_0004,
@@ -96,6 +103,9 @@ pub use kol_mvp::{
     MIGRATION_0017, MIGRATION_0018,
 };
 pub use model::{AccountNodeBinding, ClaimedCommand, ScopedCommandReceipt, StoredEvent};
+pub use multi_venue_store::{
+    MultiVenueStore, MultiVenueStoreError, StrategyClaim, StrategyEnqueueResult,
+};
 pub use postgres::{
     MIGRATION_0001, MIGRATION_0005, MIGRATION_0009, MIGRATION_0011, MIGRATION_0012, MIGRATION_0014,
     PgControlRepository,
@@ -119,5 +129,8 @@ pub const MIGRATION_0033: &str = include_str!("../migrations/0033_managed_follow
 pub const MIGRATION_0034: &str = include_str!("../migrations/0034_leader_bot_catalog.sql");
 pub const MIGRATION_0030: &str = include_str!("../migrations/0030_managed_followers.sql");
 pub const MIGRATION_0029: &str = include_str!("../migrations/0029_mirror_gtc.sql");
+pub const MIGRATION_0035: &str = include_str!("../migrations/0035_multi_venue_executor.sql");
+pub const MIGRATION_0036: &str = include_str!("../migrations/0036_strategy_grid.sql");
+pub const MIGRATION_0037: &str = include_str!("../migrations/0037_support_martingale.sql");
 mod schema;
 pub use schema::{SchemaError, install_control_schema};

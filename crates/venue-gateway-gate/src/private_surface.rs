@@ -372,7 +372,7 @@ where
     })
 }
 
-fn parse_two_legs(
+pub(crate) fn parse_two_legs(
     payload: &str,
     rules: &GateContractRules,
 ) -> Result<(String, [Position; 2]), GatePrivateReadError> {

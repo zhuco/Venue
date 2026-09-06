@@ -2,8 +2,10 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use venue_domain::domain::{
-    FieldState, LimitTimeInForce, NativeOrderFamily, OrderSide, OrderState, PositionSide, Price,
+    FieldState, LimitTimeInForce, NativeOrderFamily, OrderPurpose, OrderSide, OrderState,
+    PositionSide, Price, StopMarketFullPositionCommand,
 };
+use venue_execution::command_matches_readback_order;
 use venue_gateway_api::GatewayBinding;
 
 use crate::{
@@ -68,6 +70,7 @@ pub struct BybitCancelIntent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BybitRequestKind {
     Place,
+    Conditional,
     Cancel,
 }
 
@@ -93,7 +96,7 @@ impl BybitPreparedRequest {
             .validate_request_binding(&self.binding)
             .map_err(|_| BybitExecutionError::Binding)?;
         let expected_path = match self.kind {
-            BybitRequestKind::Place => endpoints::PLACE_ORDER,
+            BybitRequestKind::Place | BybitRequestKind::Conditional => endpoints::PLACE_ORDER,
             BybitRequestKind::Cancel => endpoints::CANCEL_ORDER,
         };
         if self.origin != binding.config().rest_origin()
@@ -126,6 +129,64 @@ impl BybitPreparedRequest {
             .map(|byte| format!("{byte:02x}"))
             .collect()
     }
+}
+
+/// Builds a native conditional market order with a frozen quantity and two independent native
+/// closing guards. Neither flag permits the late trigger to open the opposite hedge leg.
+pub fn prepare_stop_market_request(
+    binding: &BybitGatewayBinding,
+    identity: &BybitAccountIdentity,
+    rules: &BybitLinearInstrumentRules,
+    command: &StopMarketFullPositionCommand,
+    mark_price: Price,
+) -> Result<BybitPreparedRequest, BybitExecutionError> {
+    validate_scope(binding, identity, rules)?;
+    command
+        .validate()
+        .map_err(|_| BybitExecutionError::Intent)?;
+    validate_client_order_id(command.client_algo_id.as_str())?;
+    validate_step(command.quantity, rules.instrument.quantity_step)?;
+    if command.quantity < rules.minimum_quantity || command.quantity > rules.maximum_market_quantity
+    {
+        return Err(BybitExecutionError::Rules);
+    }
+    if command.trigger_price.value() < rules.minimum_price.value()
+        || command.trigger_price.value() > rules.maximum_price.value()
+    {
+        return Err(BybitExecutionError::Rules);
+    }
+    validate_step(
+        command.trigger_price.value(),
+        rules.instrument.price_tick.value(),
+    )?;
+    let position_idx = position_idx(command.position_side);
+    let direction = conditional_trigger_direction(command, mark_price)?;
+    let body = ConditionalPlaceBody {
+        category: "linear",
+        symbol: &rules.native_symbol,
+        side: side_wire(command.side),
+        order_type: "Market",
+        qty: decimal_wire(command.quantity),
+        time_in_force: "IOC",
+        position_idx,
+        order_link_id: command.client_algo_id.as_str(),
+        reduce_only: true,
+        close_on_trigger: true,
+        trigger_direction: direction,
+        trigger_price: decimal_wire(command.trigger_price.value()),
+        trigger_by: "MarkPrice",
+    };
+    Ok(BybitPreparedRequest {
+        binding: binding.gateway_binding().clone(),
+        generation: rules.instrument.generation,
+        origin: binding.config().rest_origin(),
+        path: endpoints::PLACE_ORDER,
+        kind: BybitRequestKind::Conditional,
+        body: serde_json::to_vec(&body).map_err(|_| BybitExecutionError::Payload)?,
+        expected_order_id: None,
+        expected_client_order_id: Some(command.client_algo_id.as_str().to_owned()),
+        expected_time_in_force: Some(BybitTimeInForce::ImmediateOrCancel),
+    })
 }
 
 pub fn prepare_place_request(
@@ -332,11 +393,39 @@ pub struct BybitClosedOrderReadback {
     lookup: BybitOrderLookup,
     requested_at_ms: u64,
     received_at_ms: u64,
-    open_orders: Vec<BybitOpenOrder>,
-    history: Vec<BybitOrderEvidence>,
+    pub(crate) open_orders: Vec<BybitOpenOrder>,
+    pub(crate) history: Vec<BybitOrderEvidence>,
 }
 
 impl BybitClosedOrderReadback {
+    /// Verifies all immutable command semantics against the one order selected by the exact
+    /// client identity. Identity-only matches are deliberately insufficient for durable recovery.
+    pub(crate) fn command_matches(&self, command: &venue_domain::domain::ExecutionCommand) -> bool {
+        if let venue_domain::domain::ExecutionCommand::StopMarketFullPosition(stop) = command {
+            let open_matches = self
+                .open_orders
+                .iter()
+                .filter(|item| conditional_order_matches(stop, item))
+                .count();
+            let history_matches = self
+                .history
+                .iter()
+                .filter(|item| conditional_evidence_matches(stop, item))
+                .count();
+            return self.open_orders.len() + self.history.len() == 1
+                && open_matches + history_matches == 1;
+        }
+        let mut matches = self
+            .open_orders
+            .iter()
+            .map(|item| &item.order)
+            .chain(self.history.iter().map(|item| &item.order));
+        matches
+            .next()
+            .is_some_and(|order| command_matches_readback_order(command, order))
+            && matches.next().is_none()
+    }
+
     pub fn from_pages(
         binding: &BybitGatewayBinding,
         generation: u64,
@@ -346,11 +435,20 @@ impl BybitClosedOrderReadback {
         if generation == 0 || open_pages.is_empty() || history_pages.is_empty() {
             return Err(BybitExecutionError::Readback);
         }
-        let open = complete_open_order_pages(binding, NativeOrderFamily::UmOrder, open_pages)
+        let family = match (
+            open_pages.first().map(|page| page.raw.source),
+            history_pages.first().map(|page| page.raw.source),
+        ) {
+            (
+                Some(crate::BybitPrivateSource::OpenOrders(open)),
+                Some(crate::BybitPrivateSource::OrderHistory(history)),
+            ) if open == history => open,
+            _ => return Err(BybitExecutionError::Readback),
+        };
+        let open = complete_open_order_pages(binding, family, open_pages)
             .map_err(|_| BybitExecutionError::Readback)?;
-        let history =
-            complete_order_history_pages(binding, NativeOrderFamily::UmOrder, history_pages)
-                .map_err(|_| BybitExecutionError::Readback)?;
+        let history = complete_order_history_pages(binding, family, history_pages)
+            .map_err(|_| BybitExecutionError::Readback)?;
         if open.generation != generation
             || history.generation != generation
             || open.attempt_id != history.attempt_id
@@ -394,14 +492,27 @@ impl BybitClosedOrderReadback {
             .map(|raw| raw.received_at_ms)
             .min()
             .ok_or(BybitExecutionError::Readback)?;
+        let mut open_orders = open.orders;
+        let history_orders = history.orders;
+        if let ([open_order], [history_order]) = (open_orders.as_slice(), history_orders.as_slice())
+        {
+            if cross_surface_terminal_duplicate(open_order, history_order) {
+                // With an exact identity filter, Bybit's realtime endpoint can repeat the same
+                // recently terminal order returned by history even when openOnly=0. Accept only
+                // byte-for-byte normalized semantic agreement; every disagreement stays closed.
+                open_orders.clear();
+            } else {
+                return Err(BybitExecutionError::Readback);
+            }
+        }
         Ok(Self {
             binding: binding.gateway_binding().clone(),
             generation,
             lookup,
             requested_at_ms,
             received_at_ms,
-            open_orders: open.orders,
-            history: history.orders,
+            open_orders,
+            history: history_orders,
         })
     }
 
@@ -438,7 +549,11 @@ impl BybitClosedOrderReadback {
                 order_id: item.order.order_id.clone(),
                 client_order_id: item.order.client_order_id.clone(),
                 state: item.order.state,
-                finality: BybitSettlementFinality::Working,
+                finality: if terminal_order_state(item.order.state) {
+                    BybitSettlementFinality::Terminal
+                } else {
+                    BybitSettlementFinality::Working
+                },
                 updated_at_ms: item.updated_at_ms,
             }));
         }
@@ -446,19 +561,41 @@ impl BybitClosedOrderReadback {
             order_id: item.order.order_id.clone(),
             client_order_id: item.order.client_order_id.clone(),
             state: item.order.state,
-            finality: if matches!(
-                item.order.state,
-                OrderState::Filled
-                    | OrderState::Cancelled
-                    | OrderState::Expired
-                    | OrderState::Rejected
-            ) {
+            finality: if terminal_order_state(item.order.state) {
                 BybitSettlementFinality::Terminal
             } else {
                 BybitSettlementFinality::Working
             },
             updated_at_ms: item.updated_at_ms,
         }))
+    }
+
+    pub(crate) fn exact_order_evidence(
+        &self,
+    ) -> Result<Option<BybitOrderEvidence>, BybitExecutionError> {
+        if self.open_orders.len() > 1
+            || self.history.len() > 1
+            || (!self.open_orders.is_empty() && !self.history.is_empty())
+        {
+            return Err(BybitExecutionError::Readback);
+        }
+        if let Some(item) = self.open_orders.first() {
+            return Ok(Some(BybitOrderEvidence {
+                order: item.order.clone(),
+                family: item.family,
+                native_order_type: item.native_order_type.clone(),
+                native_time_in_force: item.native_time_in_force.clone(),
+                position_idx: item.position_idx,
+                stop_order_type: item.stop_order_type.clone(),
+                trigger_price: item.trigger_price,
+                trigger_direction: item.trigger_direction,
+                trigger_by: item.trigger_by.clone(),
+                close_on_trigger: item.close_on_trigger,
+                created_at_ms: item.created_at_ms,
+                updated_at_ms: item.updated_at_ms,
+            }));
+        }
+        Ok(self.history.first().cloned())
     }
 
     pub(crate) fn exact_limit_time_in_force(
@@ -475,6 +612,102 @@ impl BybitClosedOrderReadback {
             Some(_) | None => None,
         })
     }
+}
+
+fn cross_surface_terminal_duplicate(open: &BybitOpenOrder, history: &BybitOrderEvidence) -> bool {
+    terminal_order_state(open.order.state)
+        && open.order == history.order
+        && open.family == history.family
+        && open.native_order_type == history.native_order_type
+        && open.native_time_in_force == history.native_time_in_force
+        && open.position_idx == history.position_idx
+        && open.stop_order_type == history.stop_order_type
+        && open.trigger_price == history.trigger_price
+        && open.trigger_direction == history.trigger_direction
+        && open.trigger_by == history.trigger_by
+        && open.close_on_trigger == history.close_on_trigger
+        && open.created_at_ms == history.created_at_ms
+        && open.updated_at_ms == history.updated_at_ms
+}
+
+const fn terminal_order_state(state: OrderState) -> bool {
+    matches!(
+        state,
+        OrderState::Filled | OrderState::Cancelled | OrderState::Expired | OrderState::Rejected
+    )
+}
+
+fn conditional_order_matches(
+    command: &StopMarketFullPositionCommand,
+    item: &BybitOpenOrder,
+) -> bool {
+    conditional_fields_match(
+        command,
+        &item.order,
+        item.family,
+        &item.native_order_type,
+        &item.native_time_in_force,
+        item.stop_order_type.as_deref(),
+        item.trigger_price,
+        item.trigger_direction,
+        item.trigger_by.as_deref(),
+        item.close_on_trigger,
+    )
+}
+
+fn conditional_evidence_matches(
+    command: &StopMarketFullPositionCommand,
+    item: &BybitOrderEvidence,
+) -> bool {
+    conditional_fields_match(
+        command,
+        &item.order,
+        item.family,
+        &item.native_order_type,
+        &item.native_time_in_force,
+        item.stop_order_type.as_deref(),
+        item.trigger_price,
+        item.trigger_direction,
+        item.trigger_by.as_deref(),
+        item.close_on_trigger,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conditional_fields_match(
+    command: &StopMarketFullPositionCommand,
+    order: &venue_domain::domain::Order,
+    family: NativeOrderFamily,
+    native_order_type: &str,
+    native_time_in_force: &str,
+    stop_order_type: Option<&str>,
+    trigger_price: Option<Price>,
+    trigger_direction: Option<u8>,
+    trigger_by: Option<&str>,
+    close_on_trigger: bool,
+) -> bool {
+    let expected_direction = match (command.owner.purpose, command.position_side) {
+        (OrderPurpose::Protection, PositionSide::Long)
+        | (OrderPurpose::TakeProfit, PositionSide::Short) => 2,
+        (OrderPurpose::Protection, PositionSide::Short)
+        | (OrderPurpose::TakeProfit, PositionSide::Long) => 1,
+        _ => return false,
+    };
+    family == NativeOrderFamily::UmConditional
+        && native_order_type == "Market"
+        && native_time_in_force == "IOC"
+        && stop_order_type == Some("Stop")
+        && trigger_price == Some(command.trigger_price)
+        && trigger_direction == Some(expected_direction)
+        && trigger_by == Some("MarkPrice")
+        && close_on_trigger
+        && order.client_order_id == FieldState::Known(command.client_algo_id.as_str().to_owned())
+        && order.symbol == command.owner.symbol
+        && order.side == command.side
+        && order.position_side == FieldState::Known(command.position_side)
+        && order.quantity == command.quantity
+        && order.limit_price.is_none()
+        && order.reduce_only
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -613,6 +846,25 @@ fn validate_direction(intent: &BybitPlaceIntent) -> Result<(), BybitExecutionErr
     }
 }
 
+fn conditional_trigger_direction(
+    command: &StopMarketFullPositionCommand,
+    mark_price: Price,
+) -> Result<u8, BybitExecutionError> {
+    let rises = command.trigger_price > mark_price;
+    let falls = command.trigger_price < mark_price;
+    let semantic_match = match (command.owner.purpose, command.position_side) {
+        (OrderPurpose::Protection, PositionSide::Long) => falls,
+        (OrderPurpose::Protection, PositionSide::Short) => rises,
+        (OrderPurpose::TakeProfit, PositionSide::Long) => rises,
+        (OrderPurpose::TakeProfit, PositionSide::Short) => falls,
+        _ => false,
+    };
+    if !semantic_match {
+        return Err(BybitExecutionError::Intent);
+    }
+    Ok(if rises { 1 } else { 2 })
+}
+
 fn validate_step(value: Decimal, step: Decimal) -> Result<(), BybitExecutionError> {
     if value > Decimal::ZERO && step > Decimal::ZERO && value % step == Decimal::ZERO {
         Ok(())
@@ -738,6 +990,24 @@ struct PlaceBody<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ConditionalPlaceBody<'a> {
+    category: &'static str,
+    symbol: &'a str,
+    side: &'static str,
+    order_type: &'static str,
+    qty: String,
+    time_in_force: &'static str,
+    position_idx: u8,
+    order_link_id: &'a str,
+    reduce_only: bool,
+    close_on_trigger: bool,
+    trigger_direction: u8,
+    trigger_price: String,
+    trigger_by: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CancelBody<'a> {
     category: &'static str,
     symbol: &'a str,
@@ -796,6 +1066,7 @@ mod tests {
         BybitRawPublicPayload, parse_account_identity, parse_linear_instrument,
         parse_open_order_page, parse_order_history_page, parse_rest_bbo, prepare_private_request,
     };
+    use venue_domain::domain::{CommandId, ExecutionCommand, OrderOwner};
     use venue_gateway_api::{GatewayMode, VenueId};
 
     const ACCOUNT_ID: &str = "00000000-0000-4000-8000-000000000001";
@@ -807,6 +1078,7 @@ mod tests {
     const CANCEL_HISTORY: &[u8] = include_bytes!("../fixtures/cancel-order-history-linear.json");
     const PLACE_ACK: &[u8] = include_bytes!("../fixtures/place-order-ack.json");
     const CANCEL_ACK: &[u8] = include_bytes!("../fixtures/cancel-order-ack.json");
+    const CONDITIONAL_OPEN: &[u8] = include_bytes!("../fixtures/open-stop-orders-linear.json");
     const EMPTY_ORDERS: &[u8] = br#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","nextPageCursor":"","list":[]},"time":2002}"#;
 
     struct Facts {
@@ -875,6 +1147,30 @@ mod tests {
             limit_price: Some(Price::new(Decimal::new(60_000, 0))?),
             time_in_force: BybitTimeInForce::GoodTillCancelled,
             reduce_only: false,
+        })
+    }
+
+    fn conditional(
+        purpose: OrderPurpose,
+        client_id: &str,
+        trigger: i64,
+    ) -> Result<StopMarketFullPositionCommand, Box<dyn std::error::Error>> {
+        Ok(StopMarketFullPositionCommand {
+            command_id: CommandId::new(format!("command-{client_id}"))?,
+            client_algo_id: CommandId::new(client_id)?,
+            owner: OrderOwner {
+                strategy_instance_id: "grid1".to_owned(),
+                run_id: "run1".to_owned(),
+                exchange: "bybit".to_owned(),
+                account: ACCOUNT_ID.to_owned(),
+                symbol: "BTC/USDT".parse()?,
+                purpose,
+            },
+            side: OrderSide::Sell,
+            position_side: PositionSide::Long,
+            quantity: Decimal::ONE,
+            trigger_price: Price::new(Decimal::from(trigger))?,
+            position_generation: 9,
         })
     }
 
@@ -1025,6 +1321,83 @@ mod tests {
             MARKET_REDUCE_REQUEST.trim()
         );
         assert_eq!(request.kind, BybitRequestKind::Place);
+        Ok(())
+    }
+
+    #[test]
+    fn conditional_wire_uses_mark_relative_sl_tp_direction_and_two_close_guards()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let facts = facts(GatewayMode::Live)?;
+        let mark = Price::new(Decimal::from(60_000))?;
+        for (purpose, trigger, expected_direction) in [
+            (OrderPurpose::Protection, 55_000, 2),
+            (OrderPurpose::TakeProfit, 65_000, 1),
+        ] {
+            let command = conditional(purpose, "risk-stop", trigger)?;
+            let request = prepare_stop_market_request(
+                &facts.binding,
+                &facts.identity,
+                &facts.rules,
+                &command,
+                mark,
+            )?;
+            let body: serde_json::Value = serde_json::from_slice(&request.body)?;
+            assert_eq!(body["triggerDirection"], expected_direction);
+            assert_eq!(body["triggerBy"], "MarkPrice");
+            assert_eq!(body["reduceOnly"], true);
+            assert_eq!(body["closeOnTrigger"], true);
+            assert!(body.get("stopOrderType").is_none());
+        }
+        assert_eq!(
+            prepare_stop_market_request(
+                &facts.binding,
+                &facts.identity,
+                &facts.rules,
+                &conditional(OrderPurpose::Protection, "bad-stop", 65_000)?,
+                mark,
+            ),
+            Err(BybitExecutionError::Intent)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn conditional_fixture_matches_all_immutable_fields_and_conflict_is_unknown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let facts = facts(GatewayMode::Live)?;
+        let command = ExecutionCommand::StopMarketFullPosition(conditional(
+            OrderPurpose::Protection,
+            "risk-stop",
+            55_000,
+        )?);
+        let lookup = BybitOrderLookup::by_client_order_id("risk-stop")?;
+        let open = parse_open_order_page(
+            &facts.binding,
+            &private_raw(
+                &facts.binding,
+                BybitPrivateSource::OpenOrders(NativeOrderFamily::UmConditional),
+                lookup.clone(),
+                CONDITIONAL_OPEN,
+            )?,
+        )?;
+        let history = parse_order_history_page(
+            &facts.binding,
+            &private_raw(
+                &facts.binding,
+                BybitPrivateSource::OrderHistory(NativeOrderFamily::UmConditional),
+                lookup,
+                EMPTY_ORDERS,
+            )?,
+        )?;
+        let readback =
+            BybitClosedOrderReadback::from_pages(&facts.binding, 7, &[open], &[history])?;
+        assert!(readback.command_matches(&command));
+        let conflict = ExecutionCommand::StopMarketFullPosition(conditional(
+            OrderPurpose::Protection,
+            "risk-stop",
+            55_000 + 1,
+        )?);
+        assert!(!readback.command_matches(&conflict));
         Ok(())
     }
 
@@ -1182,6 +1555,78 @@ mod tests {
         let settlement = settle_order_ack(&facts.binding, &ack, &readback)?;
         assert_eq!(settlement.state, OrderState::Cancelled);
         assert_eq!(settlement.finality, BybitSettlementFinality::Terminal);
+        Ok(())
+    }
+
+    #[test]
+    fn identical_terminal_realtime_and_history_rows_are_one_exact_readback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let facts = facts(GatewayMode::Live)?;
+        let lookup = BybitOrderLookup::by_client_order_id("cancel-client")?;
+        let open = parse_open_order_page(
+            &facts.binding,
+            &private_raw(
+                &facts.binding,
+                BybitPrivateSource::OpenOrders(NativeOrderFamily::UmOrder),
+                lookup.clone(),
+                CANCEL_HISTORY,
+            )?,
+        )?;
+        let history = parse_order_history_page(
+            &facts.binding,
+            &private_raw(
+                &facts.binding,
+                BybitPrivateSource::OrderHistory(NativeOrderFamily::UmOrder),
+                lookup.clone(),
+                CANCEL_HISTORY,
+            )?,
+        )?;
+        let readback = BybitClosedOrderReadback::from_pages(
+            &facts.binding,
+            7,
+            std::slice::from_ref(&open),
+            std::slice::from_ref(&history),
+        )?;
+        assert!(readback.open_orders.is_empty());
+        assert_eq!(readback.history.len(), 1);
+        let cancel = ExecutionCommand::Cancel(venue_domain::domain::CancelCommand {
+            command_id: CommandId::new("cancel-command")?,
+            owner: OrderOwner {
+                strategy_instance_id: "acceptance".to_owned(),
+                run_id: "run-1".to_owned(),
+                exchange: "bybit".to_owned(),
+                account: ACCOUNT_ID.to_owned(),
+                symbol: "BTC/USDT".parse()?,
+                purpose: OrderPurpose::Entry,
+            },
+            target_client_order_id: CommandId::new("cancel-client")?,
+        });
+        assert!(readback.command_matches(&cancel));
+        assert_eq!(
+            readback.exact_settlement()?.map(|value| value.state),
+            Some(OrderState::Cancelled)
+        );
+
+        let conflicting_payload = String::from_utf8(CANCEL_HISTORY.to_vec())?
+            .replace("\"updatedTime\":\"2002\"", "\"updatedTime\":\"2001\"");
+        let conflicting_open = parse_open_order_page(
+            &facts.binding,
+            &private_raw(
+                &facts.binding,
+                BybitPrivateSource::OpenOrders(NativeOrderFamily::UmOrder),
+                lookup,
+                conflicting_payload.as_bytes(),
+            )?,
+        )?;
+        assert_eq!(
+            BybitClosedOrderReadback::from_pages(
+                &facts.binding,
+                7,
+                &[conflicting_open],
+                &[history]
+            ),
+            Err(BybitExecutionError::Readback)
+        );
         Ok(())
     }
 

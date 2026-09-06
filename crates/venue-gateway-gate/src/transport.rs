@@ -183,9 +183,12 @@ impl GateHttpTransport {
         if !matches!(
             endpoint,
             crate::endpoints::FUTURES_ACCOUNT
+                | crate::endpoints::ACCOUNT_MAIN_KEYS
                 | crate::endpoints::POSITIONS
                 | crate::endpoints::FUTURES_OPEN_ORDERS
+                | crate::endpoints::FUTURES_PRICE_ORDERS
                 | crate::endpoints::FUTURES_FILLS
+                | crate::endpoints::FUTURES_FILLS_TIMERANGE
         ) || timestamp_ms == 0
         {
             return Err(GateTransportError::Binding);
@@ -315,8 +318,11 @@ impl GateHttpTransport {
             .map_err(|_| GateTransportError::Signing)?;
         let url = format!("{}{}", self.endpoint, request.endpoint());
         let method = match request.kind() {
-            GateMutationKind::PlacePostOnly | GateMutationKind::ReduceOnce => reqwest::Method::POST,
-            GateMutationKind::Cancel => reqwest::Method::DELETE,
+            GateMutationKind::PlacePostOnly
+            | GateMutationKind::PlaceMarket
+            | GateMutationKind::StopMarketFullPosition
+            | GateMutationKind::ReduceOnce => reqwest::Method::POST,
+            GateMutationKind::Cancel | GateMutationKind::CancelPrice => reqwest::Method::DELETE,
         };
         let mut builder = self.client.request(method, url);
         if !request.body().is_empty() {
@@ -366,6 +372,59 @@ impl GateHttpTransport {
         if timestamp_ms < request.not_before_ms {
             return Err(GateTransportError::Binding);
         }
+        if request.price_lookup_client().is_some() {
+            let mut pages = Vec::with_capacity(2);
+            for status in ["open", "finished"] {
+                let query = format!("status={status}&contract={}&limit=100", rules.native_symbol);
+                let signed = crate::sign_rest(
+                    credentials,
+                    timestamp_sec(timestamp_ms)?,
+                    "GET",
+                    crate::endpoints::FUTURES_PRICE_ORDERS,
+                    &query,
+                    &[],
+                )
+                .map_err(|_| GateTransportError::Signing)?;
+                let url = format!(
+                    "{}{}?{}",
+                    self.endpoint,
+                    crate::endpoints::FUTURES_PRICE_ORDERS,
+                    query
+                );
+                let body = timeout(self.limits.operation_timeout, async {
+                    let response = add_signed_headers(self.client.get(url), &signed)?
+                        .send()
+                        .await
+                        .map_err(map_reqwest)?;
+                    read_response(response, self.limits.maximum_body_bytes).await
+                })
+                .await
+                .map_err(|_| GateTransportError::Timeout)??;
+                pages.push(
+                    String::from_utf8(body.to_vec()).map_err(|_| GateTransportError::Protocol)?,
+                );
+            }
+            let payload = request
+                .select_price_lookup(&pages)
+                .map_err(|_| GateTransportError::Protocol)?;
+            self.validate_trigger_child_if_needed(
+                credentials,
+                rules,
+                request,
+                timestamp_ms,
+                &payload,
+            )
+            .await?;
+            return GateExactOrderReadback::from_response(
+                binding,
+                rules,
+                request,
+                timestamp_ms,
+                unix_ms()?,
+                payload,
+            )
+            .map_err(|_| GateTransportError::Protocol);
+        }
         let signed = request
             .sign(credentials, timestamp_sec(timestamp_ms)?)
             .map_err(|_| GateTransportError::Signing)?;
@@ -380,6 +439,8 @@ impl GateHttpTransport {
         .await
         .map_err(|_| GateTransportError::Timeout)??;
         let payload = String::from_utf8(body.to_vec()).map_err(|_| GateTransportError::Protocol)?;
+        self.validate_trigger_child_if_needed(credentials, rules, request, timestamp_ms, &payload)
+            .await?;
         GateExactOrderReadback::from_response(
             binding,
             rules,
@@ -389,6 +450,47 @@ impl GateHttpTransport {
             payload,
         )
         .map_err(|_| GateTransportError::Protocol)
+    }
+
+    async fn validate_trigger_child_if_needed(
+        &self,
+        credentials: &GateCredentials,
+        rules: &GateContractRules,
+        request: &GateExactReadbackRequest,
+        timestamp_ms: u64,
+        payload: &str,
+    ) -> Result<(), GateTransportError> {
+        if let Some(trade_id) = request
+            .finished_trigger_trade_id(payload)
+            .map_err(|_| GateTransportError::Protocol)?
+        {
+            let child_endpoint = format!("{}/{}", crate::endpoints::FUTURES_ORDER, trade_id);
+            let signed = crate::sign_rest(
+                credentials,
+                timestamp_sec(timestamp_ms)?,
+                "GET",
+                &child_endpoint,
+                "",
+                &[],
+            )
+            .map_err(|_| GateTransportError::Signing)?;
+            let child_url = format!("{}{}", self.endpoint, child_endpoint);
+            let child = timeout(self.limits.operation_timeout, async {
+                let response = add_signed_headers(self.client.get(child_url), &signed)?
+                    .send()
+                    .await
+                    .map_err(map_reqwest)?;
+                read_response(response, self.limits.maximum_body_bytes).await
+            })
+            .await
+            .map_err(|_| GateTransportError::Timeout)??;
+            let child_payload =
+                String::from_utf8(child.to_vec()).map_err(|_| GateTransportError::Protocol)?;
+            request
+                .validate_trigger_child(rules, &child_payload)
+                .map_err(|_| GateTransportError::Protocol)?;
+        }
+        Ok(())
     }
 
     fn validate_binding(
@@ -860,6 +962,32 @@ pub async fn connect_private_ws(
     {
         return Err(GateTransportError::Binding);
     }
+    connect_private_ws_for_identity(
+        binding,
+        credentials,
+        rules,
+        &private.user_id,
+        private.generation,
+        limits,
+    )
+    .await
+}
+
+pub(crate) async fn connect_private_ws_for_identity(
+    binding: &GateGatewayBinding,
+    credentials: &GateCredentials,
+    rules: &GateContractRules,
+    user_id: &str,
+    generation: u64,
+    limits: GateTransportLimits,
+) -> Result<GatePrivateWsTransport, GateTransportError> {
+    if generation == 0
+        || generation != rules.instrument.generation
+        || user_id.is_empty()
+        || rules.instrument.symbol != binding.gateway_binding().symbol
+    {
+        return Err(GateTransportError::Binding);
+    }
     let endpoint = binding.config().usdt_futures_ws().to_owned();
     let mut request = endpoint
         .clone()
@@ -884,8 +1012,8 @@ pub async fn connect_private_ws(
         binding,
         credentials,
         rules,
-        &private.user_id,
-        private.generation,
+        user_id,
+        generation,
         limits,
         Some(binding.config().rest_origin().to_owned()),
     )
@@ -1410,6 +1538,64 @@ mod tests {
         assert!(sent.contains("sign:"));
         assert!(sent.contains("x-gate-size-decimal: 1"));
         assert!(sent.ends_with(&expected_body));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn account_risk_read_admits_snapshot_endpoints_but_not_mutations() -> Result<(), TestError>
+    {
+        let (binding, credentials, rules, _) = facts()?;
+        let (endpoint, server) = http_mock(Some(response("[]")), Duration::ZERO).await?;
+        let limits = GateTransportLimits::new(Duration::from_secs(2), 16 * 1024)?;
+        let transport = GateHttpTransport::with_endpoint(&binding, 7, endpoint, limits)?;
+
+        let payload = transport
+            .execute_account_risk_read(
+                &binding,
+                &credentials,
+                &rules,
+                crate::endpoints::FUTURES_PRICE_ORDERS,
+                "status=open&limit=100",
+                1_700_000_000_000,
+            )
+            .await?;
+        assert_eq!(payload, "[]");
+        let sent = String::from_utf8(server.await??)?;
+        assert!(sent.starts_with("GET /futures/usdt/price_orders?status=open&limit=100 HTTP/1.1"));
+        assert!(sent.contains("sign:"));
+
+        let (endpoint, server) = http_mock(Some(response("[]")), Duration::ZERO).await?;
+        let transport = GateHttpTransport::with_endpoint(&binding, 7, endpoint, limits)?;
+        let payload = transport
+            .execute_account_risk_read(
+                &binding,
+                &credentials,
+                &rules,
+                crate::endpoints::FUTURES_FILLS_TIMERANGE,
+                "from=1699999940&to=1700000001&limit=100&offset=0",
+                1_700_000_000_000,
+            )
+            .await?;
+        assert_eq!(payload, "[]");
+        let sent = String::from_utf8(server.await??)?;
+        assert!(sent.starts_with(
+            "GET /futures/usdt/my_trades_timerange?from=1699999940&to=1700000001&limit=100&offset=0 HTTP/1.1"
+        ));
+        assert!(sent.contains("sign:"));
+
+        assert!(matches!(
+            transport
+                .execute_account_risk_read(
+                    &binding,
+                    &credentials,
+                    &rules,
+                    crate::endpoints::FUTURES_DUAL_MODE,
+                    "",
+                    1_700_000_000_000,
+                )
+                .await,
+            Err(GateTransportError::Binding)
+        ));
         Ok(())
     }
 

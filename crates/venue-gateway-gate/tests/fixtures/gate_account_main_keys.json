@@ -1,0 +1,25 @@
+[
+  {
+    "state": 1,
+    "mode": 1,
+    "name": ["strategy"],
+    "currency_pairs": ["BTC_USDT"],
+    "user_id": 123,
+    "ip_whitelist": [],
+    "perms": [
+      {"name": "account", "read_only": true},
+      {"name": "futures", "read_only": false},
+      {"name": "spot", "read_only": false}
+    ],
+    "key": "current-key",
+    "created_at": "1704067200",
+    "updated_at": "1704067200",
+    "last_access": "1704067200"
+  },
+  {
+    "state": 1,
+    "user_id": 123,
+    "perms": [{"name": "futures", "read_only": true}],
+    "key": "other-key"
+  }
+]

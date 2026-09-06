@@ -219,6 +219,32 @@ fn signed_queries_are_exact_bounded_and_identity_specific() -> Result<(), TestEr
         Some(lookup),
     )?;
     assert!(execution.query.contains("execType=Trade&limit=100"));
+    assert!(execution.query.contains("orderLinkId=client-1"));
+    let positions = prepare_private_request(
+        &binding,
+        7,
+        11,
+        0,
+        BybitPrivateSource::AccountWidePositions,
+        None,
+        None,
+        None,
+    )?;
+    assert_eq!(positions.query, "category=linear&settleCoin=USDT&limit=200");
+    let orders = prepare_private_request(
+        &binding,
+        7,
+        11,
+        0,
+        BybitPrivateSource::AccountWideOpenOrders(NativeOrderFamily::UmOrder),
+        None,
+        None,
+        None,
+    )?;
+    assert_eq!(
+        orders.query,
+        "category=linear&settleCoin=USDT&openOnly=0&orderFilter=Order&limit=50"
+    );
     let credentials = BybitCredentials::from_values("test", "secret")?;
     assert!(
         sign_private_request(&credentials, &binding, &request, 1_670_000_000_000)?

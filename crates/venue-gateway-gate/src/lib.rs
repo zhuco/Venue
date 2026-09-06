@@ -32,7 +32,8 @@ pub use execution::{
     GateAcceptedMutation, GateCancelIntent, GateDispatchUnknown, GateExactOrderReadback,
     GateExactReadbackRequest, GateExecutionError, GateMutationKind, GateMutationSettlement,
     GatePreparedMutation, GateSettlementFinality, prepare_cancel,
-    prepare_exact_readback_by_client_id, prepare_limit, prepare_reduce_once, settle_exact_readback,
+    prepare_exact_readback_by_client_id, prepare_limit, prepare_market, prepare_reduce_once,
+    prepare_stop_market, settle_exact_readback,
 };
 pub use order_families::{
     GATE_STAGE7_ORDER_PROFILE_VERSION, GateStage7OrderFamilyCandidate, GateStage7OrderFamilyError,

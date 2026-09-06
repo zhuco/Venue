@@ -1,0 +1,13 @@
+{
+  "id": "9002",
+  "contract": "DOGE_USDT",
+  "size": "-10",
+  "left": "0",
+  "is_reduce_only": true,
+  "tif": "ioc",
+  "status": "finished",
+  "finish_as": "filled",
+  "price": "0",
+  "fill_price": "0.089",
+  "text": "t-protect1"
+}

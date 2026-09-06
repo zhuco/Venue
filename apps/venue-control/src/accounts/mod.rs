@@ -9,6 +9,7 @@ mod kol;
 mod leader_bot;
 mod managed_followers;
 mod session;
+mod support_martingale;
 mod terminal;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -20,6 +21,7 @@ use venue_control_protocol::accounts::{AccountErrorCode, SecretValue, UserSummar
 
 pub(crate) use credentials::credential_scope;
 pub use crypto::CredentialCipher;
+pub(crate) use crypto::opaque_id as strategy_credential_id;
 pub const MIGRATION_0015: &str = include_str!("../../migrations/0015_accounts.sql");
 
 #[derive(Clone, Copy, Debug, thiserror::Error)]
@@ -40,7 +42,7 @@ fn ms(value: u64) -> Result<i64, AccountError> {
 
 pub struct AccountService {
     pool: PgPool,
-    cipher: CredentialCipher,
+    cipher: Arc<CredentialCipher>,
     password_slots: Arc<Semaphore>,
     dummy_hash: String,
     node_token_hash: Option<Vec<u8>>,
@@ -71,7 +73,7 @@ impl AccountService {
     ) -> Result<Self, AccountError> {
         Ok(Self {
             pool,
-            cipher,
+            cipher: Arc::new(cipher),
             password_slots: Arc::new(Semaphore::new(2)),
             node_token_hash: node_token
                 .filter(|t| t.expose().len() >= 32)

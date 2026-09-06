@@ -12,12 +12,17 @@ pub struct GateCredentials {
 
 impl GateCredentials {
     pub fn from_environment() -> Result<Self, GateProtocolError> {
-        Self::from_values(
-            std::env::var("GATEIO_API_KEY").map_err(|_| GateProtocolError::Credentials)?,
-            std::env::var("GATEIO_API_SECRET").map_err(|_| GateProtocolError::Credentials)?,
+        Self::from_secrets(
+            SecretString::from(
+                std::env::var("GATEIO_API_KEY").map_err(|_| GateProtocolError::Credentials)?,
+            ),
+            SecretString::from(
+                std::env::var("GATEIO_API_SECRET").map_err(|_| GateProtocolError::Credentials)?,
+            ),
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn from_values(
         api_key: impl Into<String>,
         api_secret: impl Into<String>,
@@ -33,6 +38,22 @@ impl GateCredentials {
         })
     }
 
+    /// Builds credentials from already decrypted in-memory values. This path never reads process
+    /// environment variables and is used by the durable executor.
+    pub fn from_secrets(
+        api_key: SecretString,
+        api_secret: SecretString,
+    ) -> Result<Self, GateProtocolError> {
+        if api_key.expose_secret().trim().is_empty() || api_secret.expose_secret().trim().is_empty()
+        {
+            return Err(GateProtocolError::Credentials);
+        }
+        Ok(Self {
+            api_key,
+            api_secret,
+        })
+    }
+
     pub(crate) fn identity_commitment(&self) -> [u8; 32] {
         let mut digest = Sha256::new();
         digest.update(b"venue-gate-credential-identity-v2");
@@ -44,6 +65,10 @@ impl GateCredentials {
             digest.update(value);
         }
         digest.finalize().into()
+    }
+
+    pub(crate) fn api_key(&self) -> &str {
+        self.api_key.expose_secret()
     }
 }
 

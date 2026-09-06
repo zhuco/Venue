@@ -373,6 +373,10 @@ where
     E: BinanceExecution + Send,
     S: ExecutorCredentials + Send + Sync,
 {
+    let _network_slot = crate::multi_venue_runtime::ACCOUNT_NETWORK_SLOTS
+        .acquire()
+        .await
+        .map_err(|_| BinanceCommandLedgerError::Unavailable)?;
     let mut next = Some(scheduled);
     let mut processed = 0_usize;
     let mut last_decision = AccountDrainDecision::Stop;

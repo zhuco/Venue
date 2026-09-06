@@ -37,7 +37,7 @@ impl BitgetCredentials {
         Self::from_secrets(api_key, api_secret, passphrase)
     }
 
-    fn from_secrets(
+    pub fn from_secrets(
         api_key: SecretString,
         api_secret: SecretString,
         passphrase: SecretString,

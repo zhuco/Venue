@@ -23,8 +23,9 @@ use venue_execution::{
     AccountInstrumentIdentity, AccountLimitNormalizationIntent, AccountPhysicalGateway,
     AccountPricedLimitIntent, AccountRecoveryOutcome, AccountRecoveryReport,
     AccountRecoveryRequest, AccountRecoveryState, AccountRiskAmount, AccountRiskEvidence,
-    SignedAccountBalance, SignedAccountOrderFact, SignedAccountPositionFact,
+    DurableAccountGateway, SignedAccountBalance, SignedAccountOrderFact, SignedAccountPositionFact,
     SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
+    validate_durable_command,
 };
 use venue_gateway_api::GatewayBinding;
 
@@ -46,8 +47,13 @@ use crate::{
     parse_order_status, parse_perp_meta, reserve_next_nonce,
 };
 
+#[path = "durable_execution.rs"]
+mod durable_execution;
+
 const NONCE_CHECKPOINT_MAX_BYTES: u64 = 4 * 1024;
 const ACTION_EXPIRY_MS: u64 = 30_000;
+const NONCE_PAST_WINDOW_MS: u64 = 2 * 24 * 60 * 60 * 1_000;
+const NONCE_FUTURE_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
 const IOC_REDUCE_SLIPPAGE_BPS: u64 = 50;
 const BPS_DENOMINATOR: u64 = 10_000;
 /// A synchronous `/info` BBO is only usable as a maker price while its exchange timestamp is
@@ -67,7 +73,8 @@ pub struct HyperliquidAccountGateway {
     transport: HyperliquidHttpTransport,
     meta: HyperliquidPerpMeta,
     account_safety: AccountSafety,
-    nonce_store: FileNonceStore,
+    nonce_store: Option<FileNonceStore>,
+    committed_nonce: Option<u64>,
     connection_generation: u64,
     snapshot_generation: u64,
 }
@@ -91,6 +98,50 @@ impl HyperliquidAccountGateway {
             nonce_checkpoint_path.into(),
             read_binding.gateway().gateway_binding(),
         )?;
+        Self::connect_with_parts(
+            read_binding,
+            credentials,
+            Some(nonce_store),
+            None,
+            operation_timeout,
+            max_body_bytes,
+        )
+    }
+
+    /// Connects with credentials and a nonce already claimed durably by PostgreSQL. This
+    /// constructor never opens, reads, creates, or updates a local nonce file.
+    pub fn connect_with_credentials(
+        binding: GatewayBinding,
+        credentials: HyperliquidCredentials,
+        committed_nonce: u64,
+        operation_timeout: Duration,
+        max_body_bytes: usize,
+    ) -> Result<Self, HyperliquidAccountGatewayError> {
+        if committed_nonce == 0 {
+            return Err(HyperliquidAccountGatewayError::Nonce);
+        }
+        let gateway = HyperliquidGatewayBinding::new(binding)
+            .map_err(|_| HyperliquidAccountGatewayError::Binding)?;
+        let read_binding = HyperliquidReadBinding::new(gateway, credentials.user_address())
+            .map_err(|_| HyperliquidAccountGatewayError::Binding)?;
+        Self::connect_with_parts(
+            read_binding,
+            credentials,
+            None,
+            Some(committed_nonce),
+            operation_timeout,
+            max_body_bytes,
+        )
+    }
+
+    fn connect_with_parts(
+        read_binding: HyperliquidReadBinding,
+        credentials: HyperliquidCredentials,
+        nonce_store: Option<FileNonceStore>,
+        committed_nonce: Option<u64>,
+        operation_timeout: Duration,
+        max_body_bytes: usize,
+    ) -> Result<Self, HyperliquidAccountGatewayError> {
         let transport = HyperliquidHttpTransport::new(operation_timeout, max_body_bytes)
             .map_err(HyperliquidAccountGatewayError::Transport)?;
         let runtime = Builder::new_current_thread()
@@ -108,9 +159,16 @@ impl HyperliquidAccountGateway {
             meta,
             account_safety,
             nonce_store,
+            committed_nonce,
             connection_generation: unix_ms()?,
             snapshot_generation: 0,
         })
+    }
+
+    /// Returns the normalized account address checked against the signed account reads.
+    pub fn verified_account_identity(&self) -> Result<String, HyperliquidAccountGatewayError> {
+        self.verify_account_scope()?;
+        Ok(self.binding.user_address().to_owned())
     }
 
     fn refresh(&mut self) -> Result<(), HyperliquidAccountGatewayError> {
@@ -139,7 +197,9 @@ impl HyperliquidAccountGateway {
             .map_err(HyperliquidAccountGatewayError::Transport)?;
         let bbo = parse_l2_book_bbo(&response.body, &self.meta)
             .map_err(|_| HyperliquidAccountGatewayError::Instrument)?;
-        if bbo.exchange_time_ms > response.received_at_ms {
+        if bbo.exchange_time_ms > response.received_at_ms
+            || response.received_at_ms.saturating_sub(bbo.exchange_time_ms) > MAX_LIMIT_BBO_AGE_MS
+        {
             return Err(HyperliquidAccountGatewayError::Instrument);
         }
         Ok(bbo)
@@ -235,154 +295,33 @@ impl HyperliquidAccountGateway {
 
     fn reserve_nonce(&mut self) -> Result<crate::PersistedNonce, HyperliquidAccountGatewayError> {
         let now_ms = unix_ms()?;
-        reserve_next_nonce(
-            &mut self.nonce_store,
-            self.credentials.api_wallet_address(),
-            now_ms,
-        )
-        .map_err(|_| HyperliquidAccountGatewayError::Nonce)
+        if let Some(committed_nonce) = self.committed_nonce.take() {
+            let lower_bound = now_ms.saturating_sub(NONCE_PAST_WINDOW_MS);
+            let upper_bound = now_ms
+                .checked_add(NONCE_FUTURE_WINDOW_MS)
+                .ok_or(HyperliquidAccountGatewayError::Nonce)?;
+            if committed_nonce <= lower_bound || committed_nonce >= upper_bound {
+                return Err(HyperliquidAccountGatewayError::Nonce);
+            }
+            return crate::PersistedNonce::from_committed(
+                self.credentials.api_wallet_address(),
+                committed_nonce,
+            )
+            .map_err(|_| HyperliquidAccountGatewayError::Nonce);
+        }
+        let store = self
+            .nonce_store
+            .as_mut()
+            .ok_or(HyperliquidAccountGatewayError::Nonce)?;
+        reserve_next_nonce(store, self.credentials.api_wallet_address(), now_ms)
+            .map_err(|_| HyperliquidAccountGatewayError::Nonce)
     }
 
     fn dispatch_permit(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
         if permit.binding() != self.binding.gateway().gateway_binding() {
             return rejected("hyperliquid_permit_binding");
         }
-        if self.refresh_meta().is_err() || self.refresh().is_err() {
-            return rejected("hyperliquid_preflight_failed");
-        }
-        let now_ms = match unix_ms() {
-            Ok(value) => value,
-            Err(_) => return rejected("hyperliquid_clock"),
-        };
-        let expires_after_ms = match now_ms.checked_add(ACTION_EXPIRY_MS) {
-            Some(value) => Some(value),
-            None => return rejected("hyperliquid_clock"),
-        };
-        let request = match permit.command() {
-            ExecutionCommand::PlaceLimit(command) => {
-                if !command.reduce_only
-                    && (self.account_safety.has_position || self.account_safety.has_open_orders)
-                {
-                    return rejected("hyperliquid_existing_account_risk");
-                }
-                let nonce = match self.reserve_nonce() {
-                    Ok(value) => value,
-                    Err(_) => return rejected("hyperliquid_nonce"),
-                };
-                let cloid = command_cloid(command.client_order_id.as_str());
-                match command.time_in_force {
-                    LimitTimeInForce::PostOnly => {
-                        let order = match HyperliquidAloOrder::new(
-                            &self.meta,
-                            command.side,
-                            command.limit_price.value(),
-                            command.quantity,
-                            command.reduce_only,
-                            cloid,
-                        ) {
-                            Ok(value) => value,
-                            Err(_) => return rejected("hyperliquid_intent_rejected"),
-                        };
-                        build_alo_place_request(&self.credentials, nonce, order, expires_after_ms)
-                    }
-                    LimitTimeInForce::Gtc => {
-                        let order = match HyperliquidGtcOrder::new(
-                            &self.meta,
-                            command.side,
-                            command.limit_price.value(),
-                            command.quantity,
-                            command.reduce_only,
-                            cloid,
-                        ) {
-                            Ok(value) => value,
-                            Err(_) => return rejected("hyperliquid_intent_rejected"),
-                        };
-                        build_gtc_place_request(&self.credentials, nonce, order, expires_after_ms)
-                    }
-                }
-            }
-            ExecutionCommand::Cancel(command) => {
-                let lookup = match HyperliquidOrderLookup::client_order_id(command_cloid(
-                    command.target_client_order_id.as_str(),
-                )) {
-                    Ok(value) => value,
-                    Err(_) => return rejected("hyperliquid_cancel_identity"),
-                };
-                let order_id = match self.order_status(&lookup) {
-                    Ok(HyperliquidOrderStatus::Known { order_id, .. }) => order_id,
-                    Ok(HyperliquidOrderStatus::Unknown { .. }) | Err(_) => {
-                        return rejected("hyperliquid_cancel_target_unresolved");
-                    }
-                };
-                let nonce = match self.reserve_nonce() {
-                    Ok(value) => value,
-                    Err(_) => return rejected("hyperliquid_nonce"),
-                };
-                let cancel = match HyperliquidCancel::new(&self.meta, order_id) {
-                    Ok(value) => value,
-                    Err(_) => return rejected("hyperliquid_cancel_identity"),
-                };
-                build_cancel_request(&self.credentials, nonce, cancel, expires_after_ms)
-            }
-            ExecutionCommand::MarketReduce(command) => {
-                let position = match self.account_safety.position.as_ref() {
-                    Some(value) => value,
-                    None => return rejected("hyperliquid_market_reduce_position"),
-                };
-                if validate_market_reduce_position(command, position).is_err() {
-                    return rejected("hyperliquid_market_reduce_position");
-                }
-                let bbo = match self.current_bbo() {
-                    Ok(value) => value,
-                    Err(_) => return rejected("hyperliquid_market_reduce_rules"),
-                };
-                let price = match ioc_reduce_price(command.side, &bbo, &self.meta) {
-                    Ok(value) => value,
-                    Err(_) => return rejected("hyperliquid_market_reduce_rules"),
-                };
-                let nonce = match self.reserve_nonce() {
-                    Ok(value) => value,
-                    Err(_) => return rejected("hyperliquid_nonce"),
-                };
-                let order = match HyperliquidIocReduceOnlyOrder::new(
-                    &self.meta,
-                    command.side,
-                    price,
-                    command.quantity,
-                    command_cloid(command.client_order_id.as_str()),
-                ) {
-                    Ok(value) => value,
-                    Err(_) => return rejected("hyperliquid_market_reduce_rules"),
-                };
-                build_ioc_reduce_only_request(&self.credentials, nonce, order, expires_after_ms)
-            }
-            ExecutionCommand::PlaceMarket(_)
-            | ExecutionCommand::StopMarketCloseAll(_)
-            | ExecutionCommand::StopMarketFullPosition(_) => {
-                return rejected("hyperliquid_initial_profile_unsupported_command");
-            }
-        };
-        let request = match request {
-            Ok(value) => value,
-            Err(_) => return rejected("hyperliquid_signing_rejected"),
-        };
-        match self
-            .runtime
-            .block_on(self.transport.post_exchange(request.binding(), &request))
-        {
-            Ok(response) => match parse_exchange_ack(&response.body, &request) {
-                Ok(outcome @ HyperliquidExchangeOutcome::Resting { .. })
-                | Ok(outcome @ HyperliquidExchangeOutcome::Filled { .. })
-                | Ok(outcome @ HyperliquidExchangeOutcome::Cancelled { .. }) => {
-                    self.confirm_exchange_readback(&request, &outcome)
-                }
-                Ok(HyperliquidExchangeOutcome::Rejected { reason }) => {
-                    AccountGatewayResult::Rejected { reason }
-                }
-                Err(_) => AccountGatewayResult::Unknown,
-            },
-            Err(error) => map_transport_dispatch(error),
-        }
+        self.execute_command(permit.command(), true, None)
     }
 
     fn confirm_exchange_readback(
@@ -724,6 +663,44 @@ impl AccountPhysicalGateway for HyperliquidAccountGateway {
 
     fn dispatch(&mut self, permit: AccountDispatchPermit) -> AccountGatewayResult {
         self.dispatch_permit(permit)
+    }
+}
+
+impl DurableAccountGateway for HyperliquidAccountGateway {
+    fn execute_committed(&mut self, command: &ExecutionCommand) -> AccountGatewayResult {
+        if !validate_durable_command(self.binding.gateway().gateway_binding(), command) {
+            return rejected("hyperliquid_durable_command_scope");
+        }
+        self.execute_command(command, false, None)
+    }
+
+    fn reconcile_committed(&mut self, command: &ExecutionCommand) -> AccountGatewayResult {
+        if !validate_durable_command(self.binding.gateway().gateway_binding(), command) {
+            return rejected("hyperliquid_durable_command_scope");
+        }
+        self.reconcile_command(command, None)
+    }
+
+    fn execute_committed_with_context(
+        &mut self,
+        command: &ExecutionCommand,
+        context: &venue_execution::DurableExecutionContext,
+    ) -> AccountGatewayResult {
+        if !validate_durable_command(self.binding.gateway().gateway_binding(), command) {
+            return rejected("hyperliquid_durable_command_scope");
+        }
+        self.execute_command(command, false, Some(context))
+    }
+
+    fn reconcile_committed_with_context(
+        &mut self,
+        command: &ExecutionCommand,
+        context: &venue_execution::DurableExecutionContext,
+    ) -> AccountGatewayResult {
+        if !validate_durable_command(self.binding.gateway().gateway_binding(), command) {
+            return rejected("hyperliquid_durable_command_scope");
+        }
+        self.reconcile_command(command, Some(context))
     }
 }
 
@@ -1220,7 +1197,7 @@ fn validate_market_reduce_position(
     command
         .validate_with_authoritative_position(position)
         .map_err(|_| ())?;
-    if position.quantity.is_zero() || command.quantity > position.quantity {
+    if position.quantity.is_zero() || command.quantity > position.quantity.abs() {
         return Err(());
     }
     Ok(())

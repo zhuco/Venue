@@ -355,7 +355,10 @@ fn private_request_parts(
             }
             (
                 endpoints::POSITIONS,
-                format!("category={LINEAR}&limit={POSITION_PAGE_LIMIT}"),
+                format!(
+                    "category={LINEAR}&settleCoin={}&limit={POSITION_PAGE_LIMIT}",
+                    binding.gateway_binding().symbol.quote()
+                ),
             )
         }
         BybitPrivateSource::OpenOrders(family) => {
@@ -378,7 +381,8 @@ fn private_request_parts(
             (
                 endpoints::OPEN_ORDERS,
                 format!(
-                    "category={LINEAR}&openOnly=0&orderFilter={filter}&limit={ORDER_PAGE_LIMIT}"
+                    "category={LINEAR}&settleCoin={}&openOnly=0&orderFilter={filter}&limit={ORDER_PAGE_LIMIT}",
+                    binding.gateway_binding().symbol.quote()
                 ),
             )
         }
@@ -935,6 +939,8 @@ pub struct BybitOpenOrder {
     pub position_idx: u8,
     pub stop_order_type: Option<String>,
     pub trigger_price: Option<Price>,
+    pub trigger_direction: Option<u8>,
+    pub trigger_by: Option<String>,
     pub close_on_trigger: bool,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -964,6 +970,7 @@ pub fn parse_open_order_page(
     accepted(&envelope)?;
     validate_page(&envelope.result, &raw.native_symbol, 50)?;
     envelope.result.validate_symbols(&raw.native_symbol)?;
+    let exact_lookup = raw.lookup.is_some();
     let mut ids = BTreeSet::new();
     let orders = envelope
         .result
@@ -973,7 +980,10 @@ pub fn parse_open_order_page(
             if !ids.insert(row.order_id.clone()) {
                 return Err(BybitError::Payload);
             }
-            normalize_order(raw, row, family, true)
+            // Bybit can return the exact recently terminal order when orderId/orderLinkId is
+            // supplied even with openOnly=0. Account-wide reads must remain strictly open-only;
+            // the exact readback path validates this row again against history and command shape.
+            normalize_order(raw, row, family, !exact_lookup)
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(BybitOpenOrderPage {
@@ -999,6 +1009,8 @@ pub struct BybitOrderEvidence {
     pub position_idx: u8,
     pub stop_order_type: Option<String>,
     pub trigger_price: Option<Price>,
+    pub trigger_direction: Option<u8>,
+    pub trigger_by: Option<String>,
     pub close_on_trigger: bool,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -1046,6 +1058,8 @@ pub fn parse_order_history_page(
                 position_idx: normalized.position_idx,
                 stop_order_type: normalized.stop_order_type,
                 trigger_price: normalized.trigger_price,
+                trigger_direction: normalized.trigger_direction,
+                trigger_by: normalized.trigger_by,
                 close_on_trigger: normalized.close_on_trigger,
                 created_at_ms: normalized.created_at_ms,
                 updated_at_ms: normalized.updated_at_ms,
@@ -1492,6 +1506,8 @@ fn validate_same_attempt(
 struct OrderFamilyFields {
     stop_order_type: Option<String>,
     trigger_price: Option<Price>,
+    trigger_direction: Option<u8>,
+    trigger_by: Option<String>,
 }
 
 fn validate_order_family(
@@ -1506,16 +1522,35 @@ fn validate_order_family(
         _ => return Err(BybitError::Payload),
     };
     let trigger_price = optional_zero_price(&row.trigger_price)?;
+    let trigger_direction = match row.trigger_direction {
+        0 => None,
+        1 | 2 => Some(row.trigger_direction),
+        _ => return Err(BybitError::Payload),
+    };
+    let trigger_by = match row.trigger_by.as_str() {
+        "" | "UNKNOWN" => None,
+        "LastPrice" | "IndexPrice" | "MarkPrice" => Some(row.trigger_by.clone()),
+        _ => return Err(BybitError::Payload),
+    };
     match family {
         NativeOrderFamily::UmOrder
-            if stop_order_type.is_none() && trigger_price.is_none() && !row.close_on_trigger => {}
+            if stop_order_type.is_none()
+                && trigger_price.is_none()
+                && trigger_direction.is_none()
+                && trigger_by.is_none()
+                && !row.close_on_trigger => {}
         NativeOrderFamily::UmConditional
-            if stop_order_type.is_some() && trigger_price.is_some() => {}
+            if stop_order_type.is_some()
+                && trigger_price.is_some()
+                && trigger_direction.is_some()
+                && trigger_by.is_some() => {}
         _ => return Err(BybitError::OrderFamily),
     }
     Ok(OrderFamilyFields {
         stop_order_type,
         trigger_price,
+        trigger_direction,
+        trigger_by,
     })
 }
 
@@ -1577,6 +1612,8 @@ fn normalize_order(
         position_idx: row.position_idx,
         stop_order_type: family_fields.stop_order_type,
         trigger_price: family_fields.trigger_price,
+        trigger_direction: family_fields.trigger_direction,
+        trigger_by: family_fields.trigger_by,
         close_on_trigger: row.close_on_trigger,
         created_at_ms: positive_u64(&row.created_time)?,
         updated_at_ms: positive_u64(&row.updated_time)?,
@@ -1713,38 +1750,8 @@ fn position_unrealized_pnl(value: &str, empty_position: bool) -> Result<Decimal,
 }
 
 #[cfg(test)]
-mod empty_position_sentinel_tests {
-    use super::*;
-
-    #[test]
-    fn never_traded_sentinels_are_only_valid_for_empty_positions() {
-        assert_eq!(position_sequence("-1", true), Ok(0));
-        assert_eq!(position_updated_at("0", true), Ok(0));
-        assert_eq!(position_unrealized_pnl("", true), Ok(Decimal::ZERO));
-        assert_eq!(position_sequence("7", false), Ok(7));
-        assert!(position_sequence("-1", false).is_err());
-        assert!(position_updated_at("0", false).is_err());
-        assert!(position_unrealized_pnl("", false).is_err());
-    }
-
-    #[test]
-    fn native_limit_policy_is_projected_without_inventing_unsupported_values() {
-        assert_eq!(
-            canonical_limit_time_in_force("Limit", "PostOnly"),
-            FieldState::Known(LimitTimeInForce::PostOnly)
-        );
-        assert_eq!(
-            canonical_limit_time_in_force("Limit", "GTC"),
-            FieldState::Known(LimitTimeInForce::Gtc)
-        );
-        assert!(matches!(
-            canonical_limit_time_in_force("Limit", "IOC"),
-            FieldState::Unavailable {
-                reason: UnknownReason::Ambiguous
-            }
-        ));
-    }
-}
+#[path = "private_sentinel_tests.rs"]
+mod empty_position_sentinel_tests;
 fn optional_price(value: &str) -> Result<Option<Price>, BybitError> {
     if value.is_empty() {
         Ok(None)
@@ -1925,6 +1932,10 @@ struct OrderRow {
     stop_order_type: String,
     #[serde(default)]
     trigger_price: String,
+    #[serde(default)]
+    trigger_direction: u8,
+    #[serde(default)]
+    trigger_by: String,
     #[serde(default)]
     close_on_trigger: bool,
     created_time: String,

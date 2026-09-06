@@ -33,7 +33,9 @@ impl OkxCredentials {
         )
     }
 
-    fn from_secrets(
+    /// Builds request-scoped credentials from memory. Secrets are immediately wrapped in
+    /// `SecretString` and are never exposed by this crate's public API.
+    pub fn from_secrets(
         api_key: SecretString,
         api_secret: SecretString,
         passphrase: SecretString,

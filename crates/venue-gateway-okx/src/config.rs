@@ -67,5 +67,7 @@ pub mod endpoints {
     pub const CANCEL_ORDER: &str = "/api/v5/trade/cancel-order";
     pub const OPEN_ORDERS: &str = "/api/v5/trade/orders-pending";
     pub const OPEN_ALGO_ORDERS: &str = "/api/v5/trade/orders-algo-pending";
+    pub const ALGO_ORDER: &str = "/api/v5/trade/order-algo";
+    pub const CANCEL_ALGO_ORDERS: &str = "/api/v5/trade/cancel-algos";
     pub const FILLS_HISTORY: &str = "/api/v5/trade/fills-history";
 }

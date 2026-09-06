@@ -28,6 +28,7 @@ fn metadata() -> Result<InstrumentMetadata, Box<dyn std::error::Error>> {
 fn input() -> Result<GridPlannerInput, Box<dyn std::error::Error>> {
     let quote = Asset::new("USDT")?;
     Ok(GridPlannerInput {
+        net_direction: None,
         config: GridPlannerConfig {
             instance_id: "binance_grid_sol".to_owned(),
             revision: 11,
@@ -79,6 +80,37 @@ fn input() -> Result<GridPlannerInput, Box<dyn std::error::Error>> {
         control: GridPlannerControl::Run,
         now_ms: 10_100,
     })
+}
+
+#[test]
+fn explicit_net_direction_never_creates_the_opposite_lane_and_rolls_once()
+-> Result<(), Box<dyn std::error::Error>> {
+    for direction in [GridPosition::Long, GridPosition::Short] {
+        let mut value = input()?;
+        value.net_direction = Some(direction);
+        value.config.replenishment = None;
+        let (anchor, orders) = converge(GridPlanner::plan(&value)?)?;
+        assert!(orders.iter().all(|o| o.key.position == direction));
+        assert_eq!(orders.len(), 6);
+        value.rolling_anchor = Some(anchor);
+        value.owned_orders = orders.clone();
+        assert_eq!(converge(GridPlanner::plan(&value)?)?.1, orders);
+        let filled = orders
+            .iter()
+            .find(|o| o.key.role == GridOrderRole::Open)
+            .ok_or("no open")?
+            .clone();
+        value.owned_orders.retain(|o| o.key != filled.key);
+        value.maker_fills.push(GridMakerFill {
+            fill_id: "netfill".into(),
+            source_order: filled,
+            complete: true,
+            maker: true,
+        });
+        let rolled = converge(GridPlanner::plan(&value)?)?.1;
+        assert!(rolled.iter().all(|o| o.key.position == direction));
+    }
+    Ok(())
 }
 
 fn converge(plan: GridPlan) -> Result<(GridRollingAnchor, Vec<GridOrderIntent>), &'static str> {

@@ -180,6 +180,7 @@ pub fn show(
         dispatch(model, client, credential, action);
     }
     crate::grid_view::show_management(ui, model, client, credential, &grids);
+    crate::support_martingale_view::show(ui, model, client, credential, account_id);
 }
 
 fn toolbar(

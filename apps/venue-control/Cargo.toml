@@ -22,12 +22,19 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = "0.3"
+reqwest.workspace = true
 venue-control-protocol = { path = "../../crates/venue-control-protocol" }
 venue-copy = { path = "../../crates/venue-copy" }
 venue-domain = { path = "../../crates/venue-domain" }
 venue-execution = { path = "../../crates/venue-execution" }
 venue-indicators = { path = "../../crates/venue-indicators" }
 venue-gateway-binance = { path = "../../crates/venue-gateway-binance" }
+venue-gateway-api = { path = "../../crates/venue-gateway-api" }
+venue-gateway-bitget = { path = "../../crates/venue-gateway-bitget" }
+venue-gateway-bybit = { path = "../../crates/venue-gateway-bybit" }
+venue-gateway-gate = { path = "../../crates/venue-gateway-gate" }
+venue-gateway-okx = { path = "../../crates/venue-gateway-okx" }
+venue-gateway-hyperliquid = { path = "../../crates/venue-gateway-hyperliquid" }
 venue-strategies = { path = "../../crates/venue-strategies" }
 
 [dev-dependencies]

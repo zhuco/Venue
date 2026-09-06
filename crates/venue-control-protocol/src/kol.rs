@@ -300,7 +300,6 @@ impl FollowRiskSettings {
             || !positive(self.max_total_notional)
             || self.max_order_notional > self.max_total_notional
             || self.max_deviation_bps > MAX_DEVIATION_BPS
-            || self.allowed_symbols.is_empty()
             || self.allowed_symbols.len() > MAX_ALLOWED_SYMBOLS
             || unique_symbols.len() != self.allowed_symbols.len()
         {
@@ -706,6 +705,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut valid = settings()?;
         assert_eq!(valid.validate(), Ok(()));
+        valid.allowed_symbols.clear();
+        assert_eq!(valid.validate(), Ok(()));
+        valid = settings()?;
         valid.allowed_symbols.push("BTC/USDT".parse()?);
         assert_eq!(valid.validate(), Err(KolProtocolError::RiskSettings));
         valid = settings()?;

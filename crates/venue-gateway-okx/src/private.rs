@@ -211,14 +211,22 @@ pub(crate) fn normalize_balance_row(
         asset: Asset::new(&detail.ccy).map_err(|_| OkxError::Payload)?,
         wallet_balance: decimal(&detail.eq)?,
         available_balance: decimal(&detail.avail_bal)?,
-        initial_margin: decimal(&detail.imr)?,
-        maintenance_margin: decimal(&detail.mmr)?,
+        initial_margin: decimal_or_zero(&detail.imr)?,
+        maintenance_margin: decimal_or_zero(&detail.mmr)?,
     };
     balance.validate().map_err(|_| OkxError::Payload)?;
     Ok(OkxTimedBalance {
         balance,
         update_time_ms: account_time,
     })
+}
+
+fn decimal_or_zero(value: &str) -> Result<Decimal, OkxError> {
+    if value.is_empty() {
+        Ok(Decimal::ZERO)
+    } else {
+        decimal(value)
+    }
 }
 
 pub fn parse_positions(
@@ -575,6 +583,13 @@ mod tests {
         let balance = parse_balance(BALANCE, &config, &profile)?;
         assert_eq!(balance.balance.wallet_balance, Decimal::new(20_000, 0));
         assert_eq!(balance.update_time_ms, 1_787_911_200_300);
+        let mut empty_margin: serde_json::Value = serde_json::from_slice(BALANCE)?;
+        empty_margin["data"][0]["details"][0]["imr"] = serde_json::json!("");
+        empty_margin["data"][0]["details"][0]["mmr"] = serde_json::json!("");
+        let empty_margin = serde_json::to_vec(&empty_margin)?;
+        let balance = parse_balance(&empty_margin, &config, &profile)?;
+        assert_eq!(balance.balance.initial_margin, Decimal::ZERO);
+        assert_eq!(balance.balance.maintenance_margin, Decimal::ZERO);
 
         let positions = parse_positions(POSITIONS, &config, &instrument, &profile)?;
         assert_eq!(positions.len(), 1);

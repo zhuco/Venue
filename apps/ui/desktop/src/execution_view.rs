@@ -34,6 +34,7 @@ pub struct ExecutionViewState {
     pub terminal_submission_error: Option<String>,
     pub grid: crate::grid_view::GridViewState,
     pub leader_bot: crate::leader_bot_view::LeaderBotView,
+    pub support_martingale: crate::support_martingale_view::SupportMartingaleViewState,
     position_actions: position_actions::PositionActions,
     pub(crate) chart_orders: crate::chart_trading::OrderTagState,
     private_received_ms: u64,

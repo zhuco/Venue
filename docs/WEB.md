@@ -2,7 +2,7 @@
 
 KOL 登录 `/` 或 `/login` 后可在“托管跟单账户”打开“添加托管 API Key”对话框；保存成功清空密钥输入并列出掩码，提供手动权限验证。批量最多 10 个，每行稳定请求编号用于结果不确定后的原内容重试，浏览器不将密钥保存至本地存储。BFF `managed-followers` / `managed-verify` 继续强制同源、加密 Cookie、CSRF 与响应字段白名单。该入口不启用跟单。
 
-Current product target: the Binance KOL copy-trading MVP defined in [KOL_COPY_MVP](KOL_COPY_MVP.md). Web must provide the KOL invite landing page, real user registration/login, Binance API binding and verification, copy settings/status, a basic KOL terminal, and KOL-owned page-copy editing. Grid and every non-Binance venue are deferred. The browser never contains an exchange gateway or decrypted API credential.
+Current Web scope: the Binance KOL invite landing page, user registration/login, API binding and verification, managed followers, follow settings/status and leader bot controls. The Binance trading terminal and unified Grid/leader robot list are implemented in the sibling VenueFlow desktop client; a full browser terminal is not yet equivalent. Binance Grid shares the current Executor, while non-Binance migration remains outside this release. Product acceptance follows [KOL_COPY_MVP](KOL_COPY_MVP.md). The browser never contains an exchange gateway or decrypted API credential.
 
 Responsive Control client using schema v2 only. Product version and known limits: [root README](../README.md), [release notes](CHANGELOG.md). Development workflow: [DEVELOPMENT](DEVELOPMENT.md).
 
@@ -12,7 +12,7 @@ The customer console at `/` provides login, owned API binding/verification, foll
 
 The earlier operator console is retained at `/ops` with its separate environment-injected session. Customer requests never inherit this identity. KOL page editing and the full browser trading terminal remain separate product acceptance items; this change provides the leader bot controls and preserves the desktop terminal.
 
-Target user routes are `/join/<invite_code>`, registration/login/logout, API management, copy settings/status, and the KOL public page. Target KOL routes add page preview/edit and a basic terminal scoped only to the KOL's own verified account. KOL pages may contain bounded plain text but no arbitrary HTML or script; fixed platform risk text is not editable.
+KOL page content is bounded plain text, never arbitrary HTML or script; fixed platform risk text is not editable. Product requirements for page editing are maintained in the KOL contract, separately from the routes currently exposed by the customer console.
 
 ## Build and run
 
@@ -35,7 +35,7 @@ The browser holds only a short-lived Secure/HttpOnly/SameSite session. BFF reads
 
 ## Desktop HTTPS access
 
-Desktop access shares `https://clawdbotweb.site` but uses its own Control Bearer session, not BFF cookies. `scripts/configure_desktop_https.py` adds only the desktop client's exact HTTP methods/paths beneath the existing `venue-kol-web` Caddy route; all other traffic retains the Web fallback. It also exposes exactly three read-only Binance USD-M REST paths and two combined public WebSocket paths so installed clients do not require direct Binance reachability; authorization and cookie headers are removed before those requests reach Binance. The proxy disables response buffering for SSE/streams and sets `Cache-Control: no-store`. Node/internal routes are excluded; Control still binds only to loopback and performs authentication/ownership checks.
+Desktop access shares `https://clawdbotweb.site` but uses its own Control Bearer session, not BFF cookies. `scripts/configure_desktop_https.py` adds only the desktop client's exact HTTP methods/paths beneath the existing `venue-kol-web` Caddy route, including the support-martingale instance, preflight and lifecycle endpoints; all other traffic retains the Web fallback. It also exposes exactly three read-only Binance USD-M REST paths and two combined public WebSocket paths so installed clients do not require direct Binance reachability; authorization and cookie headers are removed before those requests reach Binance. The proxy disables response buffering for SSE/streams and sets `Cache-Control: no-store`. Node/internal routes are excluded; Control still binds only to loopback and performs authentication/ownership checks.
 
 On the current server, install the script at `/home/cta/venue/desktop-https/configure_desktop_https.py` and `scripts/venue-desktop-https.conf` as `/home/cta/.config/systemd/user/venue-kol-caddy-route.service.d/desktop-https.conf`. This extends the existing enabled boot-time route restoration service. Reload that user unit's definitions and apply the script once; `--check` verifies without mutation. After a manual Caddy reload/restart, run the existing route restoration service again. The script uses Caddy's [ETag/If-Match contract](https://caddyserver.com/docs/api#concurrent-config-changes) and modifies only the verified Venue host route, leaving other sites intact.
 

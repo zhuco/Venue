@@ -1,5 +1,7 @@
 # 开发、验证与合并
 
+独立多交易所策略的 Control 发布包新增 `venue-strategy-admin`，执行仍由现有 `venue-executor-binance` 单例承担；调用、凭证与逐所验收见 [MULTI_VENUE_EXECUTOR](MULTI_VENUE_EXECUTOR.md)。这不授权部署或启动实盘。
+
 本指南只说明当前工作方式，不自动启动 [Binance KOL 跟单 MVP](KOL_COPY_MVP.md) 中的任务。
 先读 [CODEMAP](CODEMAP.md) 定位；当前产品范围和阶段门统一读 [KOL MVP 契约](KOL_COPY_MVP.md)。只有维护冻结旧 Node、Grid 或其运行工件时，才完整读 [旧运行时契约](GRID_RUNTIME_REFACTOR.md)。
 业务边界见 [ARCHITECTURE](ARCHITECTURE.md)，旧方法状态见 [停用入口](ARCHITECTURE.md#deprecated)。
@@ -63,6 +65,8 @@ UI 完成标准包括移动/桌面布局截图、空/错误/离线状态、作�
 
 ## 6. 合并与版本
 
+`master` 是集成主线，独立任务使用 `codex/*` 分支和隔离工作树。一个工作树只处理一个明确任务，避免多个任务同时改写相同文件；合并前检查未提交改动和其他工作树占用。分支是提交指针，工作树是实际文件目录，版本标签固定发布提交；Git 推送不会编译或更新运行中的 UI/服务。
+
 1. 核对主线分支/HEAD、工作树 diff、暂存区和未跟踪文件，明确本批路径。
 2. 文档可安全整合，但 UI/源码/lockfile 的其他未提交工作原样保留；重叠不明时停止合并。
 3. 在隔离树验证并提交本批改动；建立主线回退分支，优先 `merge --ff-only`，不做 hard reset。
@@ -115,7 +119,7 @@ UI 完成标准包括移动/桌面布局截图、空/错误/离线状态、作�
 - 全局和项目 AGENTS.md 提供会话规则；旧会话开始下一次构建前需重新读取，必要时重启会话。这不是强制安全沙箱。
 - GitHub托管CI继续使用既有 RUNNER_TEMP 内的 job-owned target，不使用本机F/G盘阈值；保留同目录锁、两项并发和环境恢复，CI空闲下限2 GiB。
 
-### 现有 Ubuntu Node 与 Control 编译（冻结入口）
+### Ubuntu Control 发布与冻结 Node 编译
 
 `45.77.253.180` 只接收本机编译好的产物并执行运行核验，不承担日常 Cargo 编译。Windows 本机使用既有
 Rust/Cargo 1.98.0、cargo-zigbuild 0.23.0、Zig 0.16.0 和 `x86_64-unknown-linux-gnu` 标准库，不依赖 WSL/Docker。
@@ -132,7 +136,7 @@ Rust/Cargo 1.98.0、cargo-zigbuild 0.23.0、Zig 0.16.0 和 `x86_64-unknown-linux
 ./scripts/Build-VenueUbuntu.ps1 -SourceRoot G:\Build\Venue\ubuntu\source -ExpectedRevision <完整40位commit> -ReleaseId <版本号> -Component Control -CheckOnly
 ```
 
-- 专用根为 `G:\Build\Venue\ubuntu`：`source` 可存固定 revision 的独立 checkout；当前脚本的 Nodes release 仅含六个冻结 Node binary，Control release 仅含 `venue-control-server`、`venue-executor-binance`、`venue-leader-bot-admin`，两者均另含 SHA256SUMS 与 manifest。旧 `venue-copy-worker` 不进入 KOL 发布包；离线发布和回滚清单见 [`KOL_EXECUTOR_RELEASE.md`](KOL_EXECUTOR_RELEASE.md)。工具缓存为 `zig-cache/zig-local-cache/zigbuild-cache`。源码只用干净 Git clone/bundle，不复制 `.env`、账户工件或未提交文件；已有 checkout 不自动 reset。
+- 专用根为 `G:\Build\Venue\ubuntu`：`source` 可存固定 revision 的独立 checkout；Nodes release 包含六个冻结 Node binary。alpha.27 的 Control release 包含 `venue-control-server`、`venue-executor-binance`、`venue-leader-bot-admin`；当前多交易所开发脚本另加入 `venue-strategy-admin`，实际清单以所选干净 revision 的脚本与 manifest 为准。两类包均另含 SHA256SUMS 与 manifest。旧 `venue-copy-worker` 不进入 KOL 发布包；离线发布和回滚清单见[第 8 节](#executor-release)。工具缓存为 `zig-cache/zig-local-cache/zigbuild-cache`。源码只用干净 Git clone/bundle，不复制 `.env`、账户工件或未提交文件；已有 checkout 不自动 reset。
 - Cargo 仍使用既有 `slot-2` 锁和两个全局并发许可，其自动目标子目录 `slot-2/x86_64-unknown-linux-gnu/release` 不是另设 target root。六所按顺序、每次两个 Cargo jobs；全部目录计入 150 GiB 总预算。不清理 Windows 缓存，不安装工具、不改全局配置。
 - `-CheckOnly` 不新建输出、锁或缓存；正式构建前后均校验 HEAD 和干净状态，manifest 另记录构建入口/辅助/guard 脚本哈希，运行期间脚本变动则拒绝发布。源码 checkout 必须由构建独占，其他任务不得在构建期间同步或编辑；前后 Git 检查不是文件系统只读沙箱。输出要求 ELF64/x86-64，拒绝误复制 Windows exe；目录原子转为新 release，已有 release 不覆盖。失败保留缓存和本次 `.stage.*` 目录，不把不完整目录当发布包。
 - 入口持锁覆盖构建、ELF/哈希核验和复制，finally 还原 Cargo/Zig 环境并释放锁。版本化产物仅表示编译完成；KOL MVP 仍须完成 API/双向持仓验证、Executor/Binance、UI、容量和真实 Canary 验收。冻结旧链的签名 preflight 与 writer/WAL 接管另行处理。
@@ -149,3 +153,26 @@ Rust/Cargo 1.98.0、cargo-zigbuild 0.23.0、Zig 0.16.0 和 `x86_64-unknown-linux
 - 不自动删除构建缓存。失败仅可删除本次创建且规范路径校验通过的发布暂存目录；版本化 release 不覆盖，只包含六个固定 Node binary、`SHA256SUMS` 和 `manifest.json`。
 - 20 GiB 是准入阈值，不是持续磁盘配额。正式发布仍需对应源码的验证基线；构建成功不等于 writer、旧 WAL、真实网关或 UI 验收完成。
 - Windows 的 `test_venue_node_linux_release.ps1` 用 Git Bash 和假 Cargo/Rust/flock 检查脚本编排、缓存复用、零写预检、revision 变化及发布竞争；不执行真实 Cargo。真实 Linux 锁和符号链接边界必须在目标主机另外验证，不能用该 fixture 代替。
+
+<a id="executor-release"></a>
+
+## 8. Control / Executor 发布与回滚
+
+本清单只覆盖离线构建、fixture 和可恢复的部署准备；它不授权连接 Binance、读取用户密钥或下单。真实 Canary 仍须遵守 [KOL MVP 契约](KOL_COPY_MVP.md) 的单独授权与隔离账户条件。
+
+### 发布前离线门
+
+1. 在干净、指定 revision 的 checkout 中运行 `scripts/Invoke-KolCanaryDrill.ps1 -OfflineFixture`。脚本拒绝进程内 `BINANCE_API_KEY`、`BINANCE_API_SECRET`，只通过受控 Cargo 入口运行 5 KOL / 200 follower fixture。
+2. 若配置了独立测试 PostgreSQL，运行 `scripts/verify_postgres_integration.ps1`；它必须不出现 `SKIP:`。该门覆盖源成交去重、稳定命令 ID、owner-scoped 密文、重启 readback、超时栅栏与拒单 fixture。
+3. 按第 2 节建立与发布源码一致的全量验证基线后，使用 `scripts/Build-VenueUbuntu.ps1 -Component Control` 打包；核对所选 revision 的二进制清单（见第 7 节），不得含 `venue-copy-worker`。Executor 只接受 `VENUE_EXECUTOR_MODE=LIVE`、PostgreSQL `VENUE_EXECUTOR_DATABASE_URL` 和既有 credential master key；不提供 mock、dry-run 或 testnet 配置。
+4. Grid 发布必须确认 `0021`–`0024` 已按序落库；`0024` 的输入 desired 摘要、唯一前驱和实例批次尾列缺一不可。记录 release hash、控制服务和 Executor 二进制哈希、迁移版本、脱敏账户数量及待对账计数。不要记录连接串、API key、secret、listen key 或原始私流帧。
+
+### 真实部署与回滚边界
+
+alpha.27 升级须由 `schema.rs` 安装并验证截至 `0034` 的迁移（包括 `0028`/`0029` 授权与挂单映射、`0030`–`0033` 托管和数量设置、`0034` 多机器人目录），同步核验 [授权及数据库角色](LEADER_ORDER_MIRROR.md)。旧 Canary 脚本的成交模型 fixture 不能代替新挂单模型的 5/200 容量与延迟验收。数据库含真实 GTC 镜像后，不得直接回退到每次启动重跑旧迁移的 Control binary：旧 `0020` 会重解释 GTC，须先单独核验回滚版本的迁移兼容性。
+
+管理员可先运行包内 `venue-leader-bot-admin migrate`，然后以迁移所有者向运行角色授予实际需要的表与序列权限；授权表和授权审计表只授予运行角色 SELECT。生产 Control 设置 `VENUE_CONTROL_RUNTIME_DATABASE_URL`，Executor 使用其独立 `VENUE_EXECUTOR_DATABASE_URL`，二者不得拥有授权表或持有能改回管理员身份的角色成员关系。迁移 URL 不进入启动参数或日志。
+
+上线前由获授权操作者确认目标账户未被旧 Node/Copy writer 管理，且旧 `Prepared/Submitted/Unknown`、仓位和订单均已按签名事实收敛。先启动并确认 PostgreSQL advisory lock 仅由一个 `venue-executor-binance` 持有；它并行组装私有投影、Grid、挂单同步与持续命令调度；账户栅栏保证各账户完成自身启用基线及未终态 readback 前不能继续增险。锁、数据库、凭证、规则或基线失败均不得发送新订单；私流断线/过期只经有界退避与签名 REST 补读恢复，原始帧和 listenKey 不记录。
+
+回滚只暂停关系并以 SIGINT/SIGTERM 停止新 Executor；它关闭私流并释放锁。不得删除 PostgreSQL 命令、源成交、目标、凭证或旧恢复工件。`Sending`、`Accepted`、`ReconcileRequired` 先由同一 `clientOrderId` 查单和签名仓位收敛；精确回读遵守数据库中 500 ms 起、8 s 封顶的耐久退避，未到期仍保留账户栅栏。未终态时不得恢复旧 writer 或盲目重新发送。确认所有账户无未决命令且旧链仍未接管后，才允许按单独变更恢复此前部署。

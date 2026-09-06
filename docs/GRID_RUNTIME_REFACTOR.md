@@ -5,7 +5,7 @@
 ## 1. 文档职责
 
 本文定义 Binance 对冲网格迁入单例 `venue-executor-binance` 的目标契约，并继续说明冻结旧 Grid/Node 的兼容边界。
-本轮只恢复 Binance Grid；Gate.io、Bitget、其余交易所和 Scalping 仍不进入新执行链。
+本文件只定义 Binance Grid；另外五所的独立策略与网格通过 [多交易所策略与网格](MULTI_VENUE_EXECUTOR.md) 接入同一新 Executor，复用纯网格规划器。迁入须先通过旧生命周期核清订单并释放账户；新入口可保留签名持仓，不导入旧恢复工件。Scalping 仍冻结；Hyperliquid Net 网格须显式选择单一方向。
 
 仓库现有 Account Runtime、Strategy Actor、Actor Applied、checkpoint、JSONL WAL、writer lease、canonical root、receipt、manifest、handoff
 和 Stage 7 恢复代码属于已提交旧实现，不因文档调整自动获得新架构地位，也不得在没有替代和现存账户核验时删除。

@@ -33,8 +33,8 @@ pub use credentials::BinanceCredentials;
 pub use execution::*;
 pub use grid_market::{BinanceGridMarketReader, BinanceGridReferenceFacts};
 pub use instrument::{
-    BinanceInstrumentError, BinanceInstrumentRules, parse_instrument_rules,
-    parse_native_instrument_rules,
+    BinanceInstrumentError, BinanceInstrumentRules, parse_instrument_catalog,
+    parse_instrument_rules, parse_native_instrument_rules,
 };
 pub use mark_price::{BinanceMarkPrice, parse_mark_price};
 pub use private_ws::{
@@ -45,7 +45,7 @@ pub use public::{
     BinancePublicError, BinancePublicInstrument, BinancePublicKline, parse_bbo, parse_closed_bar,
     parse_depth_delta, parse_public_exchange_catalog, parse_public_exchange_info,
     parse_public_market_agg_trade, parse_public_market_bbo, parse_public_market_depth_delta,
-    parse_public_market_depth20_snapshot, parse_public_market_kline,
+    parse_public_market_depth20_snapshot, parse_public_market_kline, parse_public_market_rest_bbo,
     parse_public_market_rest_depth_snapshot, parse_public_market_rest_klines,
     parse_public_market_ticker_array, parse_public_market_ticker_snapshot, parse_public_trade,
 };

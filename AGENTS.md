@@ -1,12 +1,13 @@
 # VENUE Workspace Rules
 
-活动代码由根 `Cargo.toml` 声明的 Rust workspace（根 package、`apps/`、`crates/`）及独立 `apps/ui/web` npm 应用组成；两套 UI 统一位于 `apps/ui/`：`desktop` 是 VenueFlow/egui 桌面终端，`web` 是 Next.js/BFF 用户 Web，先读 `apps/ui/README.md` 判定入口。长期说明统一在 `docs/`。当前产品目标是 Binance KOL 跟单 MVP 与 Binance 对冲网格迁入同一个 `venue-executor-binance`；新网格由签名事实驱动，不依赖 Actor/checkpoint/WAL。初期全站不超过 5 个启用 KOL、200 个启用跟单账户；Gate.io、Bitget 及其余交易所迁移与 Scalping 暂缓。
+活动代码由根 `Cargo.toml` 声明的 Rust workspace（根 package、`apps/`、`crates/`）及独立 `apps/ui/web` npm 应用组成；两套 UI 统一位于 `apps/ui/`：`desktop` 是 VenueFlow/egui 桌面终端，`web` 是 Next.js/BFF 用户 Web，先读 `apps/ui/README.md` 判定入口。长期说明统一在 `docs/`。Binance KOL、Binance Grid 与另外五所独立策略/网格共用 `venue-executor-binance` 单例；新网格由签名事实驱动，不依赖 Actor/checkpoint/WAL。KOL 初期全站不超过 5 个启用 KOL、200 个启用跟单账户；其他五所独立策略范围见 `docs/MULTI_VENUE_EXECUTOR.md`，不扩展跨所 KOL 跟单。Scalping 仍暂缓。
 
 ## 最短读取路径
 
 1. 先读 `CODEMAP.md`，按任务只打开对应入口和直接依赖。
 2. KOL 开发范围与验收查 `docs/KOL_COPY_MVP.md`。
 3. Binance Grid 迁移、冻结旧 Grid/Node 或已有仓位/工件处理必须完整阅读 `docs/GRID_RUNTIME_REFACTOR.md`；旧运行时不得成为新网格或 KOL MVP 的依赖模板。
+4. 非 Binance 的独立命令、网格和已释放账户迁入先读 `docs/MULTI_VENUE_EXECUTOR.md`；代码接入不能替代逐所真实验收或旧 writer 释放。
 
 ## 目录与旧实现
 
@@ -26,12 +27,13 @@
 
 ## 代码与配置
 
+- KOL 开仓/增仓的定额与定比数量按交易所数量步长向上取整，并补足最低数量、最低名义额；单笔设置允许必要的最小合规取整差额，实际金额必须计入且不得突破账户总额度和交易所最大数量。价格保持源单价格与交易所精度，不机械向上改价；平仓仍按可减持仓向下裁剪。命令须持久化取整策略，发送、回读和实际数量记账一致，旧未决命令保留原规则；详见 `docs/LEADER_ORDER_MIRROR.md`。
 - 手写源文件最多 2000 个物理行；入口文件只声明、组合和重导出，新增行为超限前按职责拆分。
 - `domain` 不依赖业务模块；交易所原始协议只存在于 `exchange`；策略不得依赖具体交易所、凭证、原生字段或物理订单客户端。
 - 不建立通用策略 runtime；交易所原始差异仍只进入 adapter。Binance Grid 由配置与签名订单/双向持仓事实计算目标订单并收敛，不恢复 Actor/checkpoint 作为新架构前置。
 - 规范交易对使用大写 `BASE/QUOTE` 的 `domain::Symbol`；native symbol 不越过 adapter。
-- KOL MVP 只准入 Binance Portfolio Margin UM 的精确 `LIVE`；其余 adapter 代码冻结且不扩大验收范围。不得新增测试网、demo、Shadow 或隐式布尔模式。离线 fixture、mock 和集成测试是验证手段，不是运行模式。
-- 用户 API Key 由 Control 使用现有 AES-256-GCM 边界加密后存 PostgreSQL；只有验证流程和 Binance Executor 可短时解密。明文不得进入浏览器响应、KOL 页面、TOML、日志、错误或工件，也不得由 KOL 查看。API 必须具备读取与 UM 交易权限、关闭提现，并验证 Portfolio Margin 统一账户与双向持仓。
+- KOL MVP 只准入 Binance Portfolio Margin UM 的精确 `LIVE`；另外五所仅通过 `multi_venue_*` 和 `DurableAccountGateway` 执行独立策略，旧 Node 路线继续冻结。不得新增测试网、demo、Shadow 或隐式布尔模式。离线 fixture、mock 和集成测试是验证手段，不是运行模式。
+- 用户 API Key 由 Control 使用现有 AES-256-GCM 边界加密后存 PostgreSQL；只有验证流程和共享 Executor 可短时解密。明文不得进入浏览器响应、KOL 页面、TOML、日志、错误或工件，也不得由 KOL 查看。Binance KOL API 必须具备读取与 UM 交易权限、关闭提现，并验证 Portfolio Margin 统一账户与双向持仓；其他五所执行其 adapter 的权限、真实身份与持仓模式契约，Hyperliquid Net 必须明确策略方向。
 - 禁止复制规范类型、指标算法、归一化、订单事实或 journal；禁止用 `unsafe`、`unwrap`、`expect`、`panic!` 处理运行时外部输入。
 - 注释只解释边界、不变量、失败语义和非显然原因，不复述代码。
 - Git 只跟踪源码、配置、长期文档、脚本与小型协议 fixture；禁止跟踪 `bak/`、构建/发布目录、工具链、凭证、运行日志、数据库和 `artifacts/`。清理 `artifacts` 必须按上述活跃恢复集与历史归档边界执行，禁止删除未决 WAL、Unknown 关联事实或当前 checkpoint。

@@ -244,6 +244,9 @@ impl ExecutionCommand {
                 command.validate_shape()?;
                 command.validate_generation()
             }
+            Self::StopMarketFullPosition(command) if command.position_side == PositionSide::Net => {
+                command.validate_shape()
+            }
             _ => self.validate(),
         }
     }
@@ -300,6 +303,44 @@ impl StopMarketCloseAllCommand {
 
 impl StopMarketFullPositionCommand {
     pub fn validate(&self) -> Result<(), CommandError> {
+        self.validate_shape()?;
+        if self.position_side == PositionSide::Net {
+            return Err(CommandError::ProtectionPositionSide);
+        }
+        validate_protection_direction(self.side, self.position_side)
+    }
+
+    /// Net protection is checked against the signed position captured immediately before send.
+    /// The quantity is bounded by that position; no synthetic LONG/SHORT hedge leg is created.
+    pub fn validate_with_authoritative_position(
+        &self,
+        position: &Position,
+    ) -> Result<(), CommandError> {
+        self.validate_shape()?;
+        if self.position_side != PositionSide::Net {
+            validate_position_binding(&self.owner, self.position_side, position)?;
+            return validate_protection_direction(self.side, self.position_side);
+        }
+        validate_position_binding(&self.owner, PositionSide::Net, position)?;
+        let available = position.quantity.abs();
+        if available.is_zero() {
+            return Err(CommandError::NetReduceDirection);
+        }
+        let expected = if position.quantity.is_sign_positive() {
+            OrderSide::Sell
+        } else {
+            OrderSide::Buy
+        };
+        if self.side != expected {
+            return Err(CommandError::NetReduceDirection);
+        }
+        if self.quantity > available {
+            return Err(CommandError::NetReduceQuantity);
+        }
+        Ok(())
+    }
+
+    fn validate_shape(&self) -> Result<(), CommandError> {
         self.owner.validate()?;
         if !matches!(
             self.owner.purpose,
@@ -310,21 +351,26 @@ impl StopMarketFullPositionCommand {
         if !self.quantity.is_sign_positive() || self.quantity.is_zero() {
             return Err(CommandError::Quantity);
         }
-        if !matches!(self.position_side, PositionSide::Long | PositionSide::Short) {
-            return Err(CommandError::ProtectionPositionSide);
-        }
-        let expected_side = match self.position_side {
-            PositionSide::Long => OrderSide::Sell,
-            PositionSide::Short => OrderSide::Buy,
-            PositionSide::Net => return Err(CommandError::ProtectionPositionSide),
-        };
-        if self.side != expected_side {
-            return Err(CommandError::ProtectionSide);
-        }
         if self.position_generation == 0 {
             return Err(CommandError::PositionGeneration);
         }
         Ok(())
+    }
+}
+
+fn validate_protection_direction(
+    side: OrderSide,
+    position_side: PositionSide,
+) -> Result<(), CommandError> {
+    let expected = match position_side {
+        PositionSide::Long => OrderSide::Sell,
+        PositionSide::Short => OrderSide::Buy,
+        PositionSide::Net => return Err(CommandError::ProtectionPositionSide),
+    };
+    if side == expected {
+        Ok(())
+    } else {
+        Err(CommandError::ProtectionSide)
     }
 }
 
@@ -962,6 +1008,45 @@ mod tests {
             reduce.validate_with_authoritative_position(&net_position(Decimal::ZERO)?),
             Err(CommandError::NetReduceDirection)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn net_position_tpsl_requires_signed_direction_but_keeps_historical_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let command = StopMarketFullPositionCommand {
+            command_id: CommandId::new("net_stop_1")?,
+            client_algo_id: CommandId::new("net_stop_client_1")?,
+            owner: test_owner(OrderPurpose::Protection)?,
+            side: OrderSide::Sell,
+            position_side: PositionSide::Net,
+            quantity: Decimal::new(2, 0),
+            trigger_price: Price::new(Decimal::from(49_000))?,
+            position_generation: 7,
+        };
+        assert_eq!(
+            command.validate(),
+            Err(CommandError::ProtectionPositionSide)
+        );
+        command.validate_with_authoritative_position(&net_position(Decimal::new(2, 0))?)?;
+        assert_eq!(
+            command.validate_with_authoritative_position(&net_position(Decimal::ZERO)?),
+            Err(CommandError::NetReduceDirection)
+        );
+        assert_eq!(
+            command.validate_with_authoritative_position(&net_position(Decimal::new(-2, 0))?),
+            Err(CommandError::NetReduceDirection)
+        );
+        let mut oversized = command.clone();
+        oversized.quantity = Decimal::new(3, 0);
+        assert_eq!(
+            oversized.validate_with_authoritative_position(&net_position(Decimal::new(2, 0))?),
+            Err(CommandError::NetReduceQuantity)
+        );
+
+        // Recovery validates immutable shape after the trigger has flattened the live position;
+        // it never reauthorizes a send without a fresh signed non-zero position.
+        ExecutionCommand::StopMarketFullPosition(command).validate_persisted_shape()?;
         Ok(())
     }
 

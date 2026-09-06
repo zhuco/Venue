@@ -182,7 +182,9 @@ pub(super) async fn plan_relation(pool: &PgPool, relation: &str, now: u64) -> Re
         .into_iter()
         .flat_map(|p| p.open_orders.iter())
         .filter(|order| {
-            active && allowed.contains(&order.symbol.to_string()) && eligible(order, cutoff)
+            active
+                && (allowed.is_empty() || allowed.contains(&order.symbol.to_string()))
+                && eligible(order, cutoff)
         })
         .filter_map(|order| {
             order
@@ -399,7 +401,7 @@ async fn enqueue_place(
     let command_revision:i64=sqlx::query_scalar("INSERT INTO venue_order_mirrors (mirror_id,bot_id,bot_revision,permission_revision,relation_id,relation_revision,source_order_id,source_client_order_id,symbol,source_order_json,child_sequence,child_client_order_id,child_quantity,mirror_state,created_ms,updated_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending',$14,$14) RETURNING command_revision")
         .bind(&mirror).bind(bot).bind(number(row,"bot_revision")?).bind(number(row,"permission_revision")?).bind(&relation).bind(revision).bind(native).bind(&order.client_order_id).bind(order.symbol.to_string()).bind(source).bind(sequence).bind(&client).bind(quantity.to_string()).bind(stamp(now)?)
         .fetch_one(&mut *connection).await.map_err(unavailable)?;
-    let risk = serde_json::json!({"max_order_notional":text(row,"max_order_notional")?,"max_total_notional":text(row,"max_total_notional")?,"max_deviation_bps":row.try_get::<i32,_>("max_deviation_bps").map_err(unavailable)?,"source_price":order.limit_price.ok_or(Error::Conflict)?.to_string(),"source_occurred_ms":order.created_ms.ok_or(Error::Conflict)?});
+    let risk = serde_json::json!({"round_open_quantity_up":!reducing(order),"max_order_notional":text(row,"max_order_notional")?,"max_total_notional":text(row,"max_total_notional")?,"max_deviation_bps":row.try_get::<i32,_>("max_deviation_bps").map_err(unavailable)?,"source_price":order.limit_price.ok_or(Error::Conflict)?.to_string(),"source_occurred_ms":order.created_ms.ok_or(Error::Conflict)?});
     sqlx::query("INSERT INTO venue_binance_commands (command_id,command_origin,relation_id,relation_revision,target_revision,owner_user_id,trading_account_id,credential_id,symbol,position_side,command_phase,order_kind,order_side,requested_quantity,target_quantity,limit_price,rule_version,client_order_id,command_state,created_ms,updated_ms,copy_risk,mirror_order_id) VALUES ($1,'copy',$2,$3,$4,$5,$6,$7,$8,$9,$10,$17,$11,$12,$12,$13,'binance-pm-um-v1',$1,'pending',$14,$14,$15,$16)")
         .bind(client).bind(relation).bind(revision).bind(command_revision).bind(text(row,"follower_user_id")?).bind(text(row,"follower_trading_account_id")?).bind(text(row,"credential_id")?).bind(order.symbol.to_string())
         .bind(if order.position_side==venue_domain::PositionSide::Long{"long"}else{"short"}).bind(if reducing(order){"close"}else{"open"}).bind(if order.order_side==venue_domain::OrderSide::Buy{"buy"}else{"sell"})

@@ -1,6 +1,6 @@
 # Binance KOL MVP 账户、邀请与 API 管理
 
-入口：[MVP 契约](KOL_COPY_MVP.md) / [README](../README.md) / [开发指南](DEVELOPMENT.md)。本页描述已提交的 Control 账户能力及下一步公开用户接入边界；尚未实现的邀请、Web会话和Executor凭证读取不得描述为已上线。
+入口：[MVP 契约](KOL_COPY_MVP.md) / [README](../README.md) / [开发指南](DEVELOPMENT.md)。本页说明当前 Control 账户、邀请、会话和凭证能力；实际部署与实盘验收须核验对应环境，不能由页面或保存的验证状态推断。
 
 ## 产品边界
 
@@ -10,12 +10,12 @@
 - “添加 API”绑定用户已在币安创建的 Key，不代用户在交易所创建密钥。“删除绑定”只删除 Venue 中的加密凭证，不撤销交易所 Key。
 - API 验证只发签名 GET：读取权限、真实账户身份、Portfolio Margin 状态、UM 交易权限、双向持仓、持仓、普通挂单及 Algo 挂单；不下单、不撤单、不切换账户模式。当前仅接受 Binance Portfolio Margin UM，不声称支持普通合约账户。
 - 同一真实账户的多把 Key 复用同一稳定 `trading_account_id`，不同用户不能认领同一真实账户。系统账号或 Key 数量不是 writer 数量。
-- 用户只能管理自己的 API 和跟单设置；KOL 只能管理自己的公开页面和主账户终端，不能查看跟随者 API 明文或账户明细。
-- 启用跟单还要求明确配置资金、倍率与风险上限并再次确认；选择或验证账户本身不产生订单。
+- 用户管理自己的 API 和跟单设置；KOL 还可通过专用托管接口添加经委托的 API、查看掩码、验证并逐账户配置跟单。托管边界见 [KOL MVP](KOL_COPY_MVP.md)，不授予读取已保存密钥的能力。
+- 启用跟单还要求明确选择定比/定额、资金及风险上限并再次确认；选择或验证账户本身不产生订单。
 
 ## 进程与状态
 
-Control 负责认证、邀请归属、KOL 页面、绑定管理、只读验证和查询投影。目标 Binance Executor 是一个多账户进程：最多 5 个 KOL 保持成交私流，跟随账户只使用进程内顺序队列、按需查单和周期签名对账，不为每个账户启动 Node、Actor 或本地 WAL。
+Control 负责认证、邀请归属、KOL 页面、绑定管理、只读验证和查询投影。Binance Executor 是一个多账户进程，按活动账户需求维护有界私有投影与签名恢复，复用进程内顺序队列。新关系按普通限价挂单同步；不为每个账户启动 Node、Actor 或本地 WAL。
 
 UI 分开显示登录状态、邀请归属、API 验证、跟单启用和 Executor 最近报告。`api_reachable` 只说明验证期内签名读取成功，不表示 Executor 在线或跟单已启用。公共行情可由桌面直连 Binance；私有仓位、活动委托、成交和资产必须由服务端 Binance gateway 解析，再经唯一 Executor/Control 返回用户作用域投影，桌面不得持有 API Secret 或自行解析私流。无新鲜私有投影时必须显示未知/未连接，旧 Node 当前快照不得冒充完整委托或仓位历史。
 
@@ -27,7 +27,7 @@ Windows 将有效登录会话保存至系统凭据库，启动后向服务端验
 
 ## 凭证边界
 
-本次获准的 UI 绑定对原“凭证仅来自环境”的限制增加一个窄例外：
+用户绑定与部署凭证分别遵守以下边界：
 
 - 交易所 API Key 仅在 UI 表单和请求期间持有，使用掩码、清理编辑历史，不写入界面配置、系统登录凭证库、日志、URL、错误信息或 artifacts。
 - Windows 桌面可通过 `account_center/vault.rs` 保存 Venue 登录资料及会话至系统凭证库，按 Control endpoint 隔离，过期会话丢弃；记住密码开关控制登录资料保存。非 Windows 无本地凭证库回退。记录不经过 eframe 普通配置，不包含交易所 API Key 或账户投影。
@@ -55,7 +55,7 @@ Control 使用现有 PostgreSQL，通过 `DATABASE_URL` 指定连接。以下命
 编译结束后，从 guard 实际选择的固定缓存 `debug` 目录分别启动 `venue-control-server.exe` 和 `venueflow.exe`；
 主工作区默认为 `G:\Build\Venue\main\debug`。不要以长期 `cargo run` 占用构建锁。本次文档核对不自动启动任何服务。
 
-Control 默认监听 `127.0.0.1:39180`，桌面默认连接 `https://clawdbotweb.site`，通过 Caddy 转发到服务器本机；地址设置与旧默认迁移见 [UI 说明](../apps/ui/README.md)。当前 Control 幂等安装 `0001`–`0017` migrations；0017 已固定 KOL、邀请、永久唯一用户归属、关系容量槽、源成交/目标和轻量命令账本，HTTP repository 与 Executor 消费仍按 `KOL_COPY_MVP.md` 的 P1–P3 实现。`VENUE_CONTROL_BIND` 继续只允许 loopback；公网浏览器经同源 HTTPS BFF 访问。
+Control 默认监听 `127.0.0.1:39180`，桌面默认连接 `https://clawdbotweb.site`，通过 Caddy 转发到服务器本机；地址设置与旧默认迁移见 [UI 说明](../apps/ui/README.md)。alpha.27 由 `schema.rs` 安装并校验截至 `0034` 的迁移，覆盖邀请、命令账本、Grid、挂单镜像、托管跟随者、定比/定额和多机器人目录。生产 Control 迁移后使用 `VENUE_CONTROL_RUNTIME_DATABASE_URL` 的受限角色；Executor 使用独立 `VENUE_EXECUTOR_DATABASE_URL`，完整配置及回滚见 [发布指南](DEVELOPMENT.md#executor-release)。`VENUE_CONTROL_BIND` 继续只允许 loopback；公网浏览器经同源 HTTPS BFF 访问。
 
 不要把数据库 URL、主密钥或实际 API Key 粘贴到诊断输出。主密钥丢失无法恢复绑定密文；轮换必须另行设计迁移，不可直接换值后假定旧绑定仍可用。
 

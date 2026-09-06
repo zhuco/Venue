@@ -581,6 +581,52 @@ pub fn parse_public_market_bbo(
     ))
 }
 
+/// Parses the single-symbol USD-M REST `bookTicker` response. REST field names differ from the
+/// websocket frame, so callers must not pass this payload through the stream parser.
+pub fn parse_public_market_rest_bbo(
+    payload: &str,
+    binding: &PublicMarketBinding,
+    generation: u64,
+    received_at_ms: u64,
+) -> Result<PublicTicker, BinancePublicError> {
+    binding
+        .validate()
+        .map_err(|_| BinancePublicError::Binding)?;
+    if generation == 0 {
+        return Err(BinancePublicError::Generation);
+    }
+    if received_at_ms == 0 {
+        return Err(BinancePublicError::Value);
+    }
+    let object = serde_json::from_str::<Value>(payload)
+        .map_err(|_| BinancePublicError::Payload)?
+        .as_object()
+        .cloned()
+        .ok_or(BinancePublicError::Payload)?;
+    let expected_native = native_symbol(&binding.symbol);
+    if object.get("symbol").and_then(Value::as_str) != Some(expected_native.as_str()) {
+        return Err(BinancePublicError::Symbol);
+    }
+    let exchange_time_ms = positive_u64(object.get("time"))?;
+    let bid_price = positive_price(object.get("bidPrice"))?;
+    let ask_price = positive_price(object.get("askPrice"))?;
+    if bid_price >= ask_price {
+        return Err(BinancePublicError::Value);
+    }
+    Ok(PublicTicker {
+        symbol: binding.symbol.clone(),
+        generation,
+        received_at_ms,
+        exchange_time_ms,
+        transaction_time_ms: exchange_time_ms,
+        update_id: positive_u64(object.get("lastUpdateId"))?,
+        bid_price,
+        bid_quantity: positive_decimal(object.get("bidQty"))?,
+        ask_price,
+        ask_quantity: positive_decimal(object.get("askQty"))?,
+    })
+}
+
 /// Parses a direct Binance `aggTrade` frame or a combined-stream wrapper. Binance's public
 /// aggregate trade frame has no quote quantity, so it is derived with checked decimal arithmetic.
 pub fn parse_public_market_agg_trade(
@@ -1355,6 +1401,21 @@ mod public_market_tests {
         assert_eq!(depth.fact().sequence, 10);
         assert_eq!(depth.fact().bids.len(), 2);
         assert_eq!(depth.fact().asks.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn rest_book_ticker_uses_the_documented_rest_shape() -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding()?;
+        let ticker = parse_public_market_rest_bbo(
+            r#"{"lastUpdateId":1027024,"symbol":"BTCUSDT","bidPrice":"9650.1","bidQty":"16","askPrice":"9650.3","askQty":"7","time":1591257300345}"#,
+            &binding,
+            7,
+            1_591_257_300_400,
+        )?;
+        assert_eq!(ticker.bid_price.value(), Decimal::new(96_501, 1));
+        assert_eq!(ticker.ask_quantity, Decimal::from(7));
+        assert_eq!(ticker.exchange_time_ms, 1_591_257_300_345);
         Ok(())
     }
 

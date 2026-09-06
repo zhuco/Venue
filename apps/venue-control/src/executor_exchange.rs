@@ -756,7 +756,11 @@ impl BinanceHttpExecution {
         } else {
             requested_quantity
         };
-        let quantity = normalize_quantity(market_quantity.unwrap_or(requested_quantity), &rules)?;
+        let quantity = copy_risk::normalize_request_quantity(
+            request,
+            market_quantity.unwrap_or(requested_quantity),
+            &rules,
+        )?;
         if opening_minimum_notional_required(reducing) {
             let price = match &request.order_kind {
                 ExecutionOrderKind::Market { .. } => reference
@@ -1239,10 +1243,12 @@ impl BinanceActivationBaseline for BinanceExecutionRouter {
     ) -> Result<AccountBaseline, BinanceExecutionError> {
         self.prepare_account_transports(trading_account_id, symbols)
             .await?;
-        let primary_symbol = symbols
-            .first()
-            .cloned()
-            .ok_or(BinanceExecutionError::Invalid)?;
+        let primary_symbol = match symbols.first().cloned() {
+            Some(symbol) => symbol,
+            None => "BTC/USDT"
+                .parse()
+                .map_err(|_| BinanceExecutionError::Invalid)?,
+        };
         let binding = GatewayBinding::new(
             VenueId::Binance,
             GatewayMode::Live,
@@ -1460,7 +1466,7 @@ fn exact_place_matches(
             && order.quantity <= quantity
             && normalize_quantity(order.quantity, rules)? == order.quantity
     } else {
-        order.quantity == normalize_quantity(requested_quantity, rules)?
+        order.quantity == copy_risk::normalize_request_quantity(request, requested_quantity, rules)?
     };
     let common = order.client_order_id == FieldState::Known(request.client_order_id.clone())
         && order.symbol == request.symbol

@@ -10,11 +10,12 @@ use sha2::{Digest, Sha256};
 use venue_domain::domain::{CommandId, ExecutionCommand, NativeOrderFamily, PositionSide};
 
 use crate::{
-    BitgetCancelIntent, BitgetConfig, BitgetExecutionError, BitgetMutationKind,
+    BitgetCancelIntent, BitgetConfig, BitgetExecutionError, BitgetMarketIntent, BitgetMutationKind,
     BitgetOrderFamilyCandidate, BitgetOrderFamilyError, BitgetOrderFamilyEvidence,
     BitgetOrderFamilyScope, BitgetPlaceIntent, BitgetPreparedMutation, BitgetReduceOnceIntent,
     BitgetTimeInForce, instrument::BitgetInstrumentRules, prepare_cancel_request,
-    prepare_place_request, prepare_reduce_once_request, private::BitgetPrivateGenerationCandidate,
+    prepare_market_request, prepare_place_request, prepare_reduce_once_request,
+    prepare_stop_market_request, private::BitgetPrivateGenerationCandidate,
     validate_order_families,
 };
 
@@ -166,9 +167,37 @@ pub fn prepare_node_mutation(
                 now_ms,
             )?
         }
-        ExecutionCommand::PlaceMarket(_)
-        | ExecutionCommand::StopMarketCloseAll(_)
-        | ExecutionCommand::StopMarketFullPosition(_) => {
+        ExecutionCommand::PlaceMarket(command) => prepare_market_request(
+            &candidate.private().binding,
+            config,
+            rules,
+            mutation_attempt_id,
+            &BitgetMarketIntent {
+                client_order_id: command.client_order_id.as_str().to_owned(),
+                side: command.side,
+                position_side: command.position_side,
+                quantity: command.quantity,
+                reduce_only: command.reduce_only,
+            },
+            now_ms,
+        )?,
+        ExecutionCommand::StopMarketFullPosition(command) => prepare_stop_market_request(
+            &candidate.private().binding,
+            config,
+            rules,
+            mutation_attempt_id,
+            &crate::BitgetStopIntent {
+                client_algo_id: command.client_algo_id.as_str().to_owned(),
+                side: command.side,
+                position_side: command.position_side,
+                quantity: command.quantity,
+                trigger_price: command.trigger_price,
+                take_profit: command.owner.purpose
+                    == venue_domain::domain::OrderPurpose::TakeProfit,
+            },
+            now_ms,
+        )?,
+        ExecutionCommand::StopMarketCloseAll(_) => {
             return Err(BitgetNodeBridgeError::UnsupportedCommand);
         }
     };

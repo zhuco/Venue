@@ -1,0 +1,20 @@
+{
+  "planner": {
+    "instance_id": "grid_example",
+    "revision": 1,
+    "symbol": "BTC/USDT",
+    "order_notional": { "asset": "USDT", "value": "5" },
+    "maximum_grid_notional": { "asset": "USDT", "value": "100" },
+    "spacing_rate": "0.01",
+    "grid_count": 2,
+    "replenishment": null,
+    "profit_reduction": null,
+    "reset_policy": {
+      "max_market_age_ms": 5000,
+      "max_private_age_ms": 5000,
+      "convergence_timeout_ms": 30000,
+      "failure_threshold": 3
+    }
+  },
+  "net_direction": null
+}

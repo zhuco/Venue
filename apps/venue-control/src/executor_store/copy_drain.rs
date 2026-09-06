@@ -27,7 +27,7 @@ impl PgExecutorStore {
         if lock_account_command_queue(&mut tx, &owner, account, &credential).await? != 0 {
             return Ok(false);
         }
-        let targets = sqlx::query("SELECT t.symbol,t.position_side,t.target_quantity,t.observed_quantity,t.target_revision,f.payload_digest,f.price,f.occurred_ms FROM venue_kol_copy_targets t JOIN venue_kol_follow_relations r ON r.relation_id=t.relation_id JOIN venue_kol_source_fills f ON f.kol_trading_account_id=r.leader_trading_account_id AND f.native_symbol=t.last_native_symbol AND f.native_trade_id=t.last_native_trade_id WHERE t.relation_id=$1 AND t.dirty AND r.allowed_symbols @> jsonb_build_array(t.symbol) ORDER BY (t.target_quantity::numeric<t.observed_quantity::numeric) DESC,t.symbol,t.position_side FOR UPDATE OF t")
+        let targets = sqlx::query("SELECT t.symbol,t.position_side,t.target_quantity,t.observed_quantity,t.target_revision,f.payload_digest,f.price,f.occurred_ms FROM venue_kol_copy_targets t JOIN venue_kol_follow_relations r ON r.relation_id=t.relation_id JOIN venue_kol_source_fills f ON f.kol_trading_account_id=r.leader_trading_account_id AND f.native_symbol=t.last_native_symbol AND f.native_trade_id=t.last_native_trade_id WHERE t.relation_id=$1 AND t.dirty AND (r.allowed_symbols='[]'::jsonb OR r.allowed_symbols @> jsonb_build_array(t.symbol)) ORDER BY (t.target_quantity::numeric<t.observed_quantity::numeric) DESC,t.symbol,t.position_side FOR UPDATE OF t")
             .bind(&relation_id).fetch_all(&mut *tx).await.map_err(unavailable)?;
         for target in targets {
             let desired = decimal(&target, "target_quantity")?;
@@ -50,6 +50,7 @@ impl PgExecutorStore {
                 let id = deterministic_id(&relation_id, &symbol, side, target_revision, phase);
                 let digest: Vec<u8> = target.try_get("payload_digest").map_err(unavailable)?;
                 let copy_risk = crate::executor_exchange::CopyRiskContext {
+                    round_open_quantity_up: false,
                     max_order_notional: decimal(&relation, "max_order_notional")?,
                     max_total_notional: decimal(&relation, "max_total_notional")?,
                     max_deviation_bps: u32::try_from(
