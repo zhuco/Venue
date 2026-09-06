@@ -21,6 +21,48 @@ struct TargetWrite {
     copy_risk: crate::executor_exchange::CopyRiskContext,
 }
 
+pub(super) async fn record_source_market_order(
+    store: &PgExecutorStore,
+    kol_user_id: &str,
+    leader_trading_account_id: &str,
+    order: &venue_execution::SignedMarketOrderFact,
+    observed_ms: u64,
+) -> Result<(), BinanceCommandLedgerError> {
+    if kol_user_id.trim().is_empty()
+        || leader_trading_account_id.trim().is_empty()
+        || observed_ms < order.created_at_ms
+    {
+        return Err(BinanceCommandLedgerError::Conflict);
+    }
+    let mut tx = store.pool.begin().await.map_err(unavailable)?;
+    sqlx::query("SELECT kol_user_id FROM venue_kol_profiles WHERE kol_user_id=$1 AND leader_trading_account_id=$2 FOR SHARE")
+        .bind(kol_user_id)
+        .bind(leader_trading_account_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(unavailable)?;
+    let changed = sqlx::query("INSERT INTO venue_kol_source_market_orders (leader_trading_account_id,kol_user_id,native_symbol,native_order_id,client_order_id,symbol,order_side,position_side,original_quantity,reference_price,occurred_ms,observed_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (leader_trading_account_id,native_symbol,native_order_id) DO UPDATE SET observed_ms=GREATEST(venue_kol_source_market_orders.observed_ms,EXCLUDED.observed_ms) WHERE venue_kol_source_market_orders.kol_user_id=EXCLUDED.kol_user_id AND venue_kol_source_market_orders.client_order_id=EXCLUDED.client_order_id AND venue_kol_source_market_orders.symbol=EXCLUDED.symbol AND venue_kol_source_market_orders.order_side=EXCLUDED.order_side AND venue_kol_source_market_orders.position_side=EXCLUDED.position_side AND venue_kol_source_market_orders.original_quantity::numeric=EXCLUDED.original_quantity::numeric")
+        .bind(leader_trading_account_id)
+        .bind(kol_user_id)
+        .bind(venue_gateway_binance::native_symbol(&order.symbol))
+        .bind(&order.venue_order_id)
+        .bind(&order.client_order_id)
+        .bind(order.symbol.to_string())
+        .bind(order_side(order.side))
+        .bind(position_side(order.position_side))
+        .bind(order.quantity.to_string())
+        .bind(order.reference_price.to_string())
+        .bind(ms(order.created_at_ms)?)
+        .bind(ms(observed_ms)?)
+        .execute(&mut *tx)
+        .await
+        .map_err(unavailable)?;
+    if changed.rows_affected() != 1 {
+        return Err(BinanceCommandLedgerError::Conflict);
+    }
+    tx.commit().await.map_err(unavailable)
+}
+
 pub(super) async fn record_source_fill_and_plan(
     store: &PgExecutorStore,
     kol_user_id: &str,
@@ -46,6 +88,18 @@ pub(super) async fn record_source_fill_and_plan(
         .bind(fill.quantity.to_string()).bind(fill.price.to_string()).bind(ms(fill.occurred_ms)?)
         .bind(ms(fill.observed_ms)?).bind(fill.payload_digest.as_slice())
         .execute(&mut *tx).await.map_err(unavailable)?;
+    if let Some(market) = &fill.market_order {
+        let changed = sqlx::query("INSERT INTO venue_kol_source_market_orders (leader_trading_account_id,kol_user_id,native_symbol,native_order_id,client_order_id,symbol,order_side,position_side,original_quantity,reference_price,occurred_ms,observed_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (leader_trading_account_id,native_symbol,native_order_id) DO UPDATE SET observed_ms=GREATEST(venue_kol_source_market_orders.observed_ms,EXCLUDED.observed_ms) WHERE venue_kol_source_market_orders.kol_user_id=EXCLUDED.kol_user_id AND venue_kol_source_market_orders.client_order_id=EXCLUDED.client_order_id AND venue_kol_source_market_orders.symbol=EXCLUDED.symbol AND venue_kol_source_market_orders.order_side=EXCLUDED.order_side AND venue_kol_source_market_orders.position_side=EXCLUDED.position_side AND venue_kol_source_market_orders.original_quantity::numeric=EXCLUDED.original_quantity::numeric")
+            .bind(&fill.leader_trading_account_id).bind(kol_user_id).bind(&fill.native_symbol)
+            .bind(&market.native_order_id).bind(&market.client_order_id).bind(&fill.symbol)
+            .bind(order_side(fill.order_side)).bind(position_side(fill.position_side))
+            .bind(market.original_quantity.to_string()).bind(fill.price.to_string())
+            .bind(ms(fill.occurred_ms)?).bind(ms(fill.observed_ms)?)
+            .execute(&mut *tx).await.map_err(unavailable)?;
+        if changed.rows_affected() != 1 {
+            return Err(BinanceCommandLedgerError::Conflict);
+        }
+    }
     if inserted.rows_affected() == 0 {
         let original = sqlx::query("SELECT kol_user_id,symbol,order_side,position_side,quantity,price,occurred_ms FROM venue_kol_source_fills WHERE kol_trading_account_id=$1 AND native_symbol=$2 AND native_trade_id=$3")
             .bind(&fill.leader_trading_account_id).bind(&fill.native_symbol).bind(&fill.native_trade_id)

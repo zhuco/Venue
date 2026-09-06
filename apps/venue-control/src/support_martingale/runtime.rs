@@ -47,14 +47,22 @@ pub(crate) enum SupportSendKind {
     Add,
     TakeProfit,
     CancelTakeProfit,
+    StopLoss,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SupportSendFence {
     kind: SupportSendKind,
+    price_ceiling: Option<Decimal>,
+    stop_floor: Option<Decimal>,
 }
 
 impl SupportSendFence {
+    pub(crate) fn market_allows(&self, price: Decimal) -> bool {
+        self.price_ceiling.is_none_or(|ceiling| price <= ceiling)
+            && self.stop_floor.is_none_or(|floor| price > floor)
+    }
+
     pub(crate) fn validates(
         &self,
         command: &ExecutionCommand,
@@ -88,7 +96,9 @@ impl SupportSendFence {
         match self.kind {
             SupportSendKind::Entry => long_quantity.is_zero() && !has_reduce,
             SupportSendKind::Add => long_quantity > Decimal::ZERO && !has_reduce,
-            SupportSendKind::TakeProfit => long_quantity > Decimal::ZERO && !has_reduce,
+            SupportSendKind::TakeProfit | SupportSendKind::StopLoss => {
+                long_quantity > Decimal::ZERO && !has_reduce
+            }
             SupportSendKind::CancelTakeProfit => true,
         }
     }
@@ -225,7 +235,6 @@ impl SupportMartingaleRuntime {
         _runtime: &super::SupportMartingaleRuntimeState,
         symbol: &Symbol,
     ) -> Result<(), MultiVenueStoreError> {
-        let now = now_ms()?;
         let state = instance
             .symbols
             .iter()
@@ -243,6 +252,7 @@ impl SupportMartingaleRuntime {
             .grid_facts(owner, &instance.credential_id, symbol.clone(), queries)
             .await
             .map_err(|_| MultiVenueStoreError::Unavailable)?;
+        let now = now_ms()?;
         let observed_take_profit_terminal = observations
             .first()
             .is_some_and(|observation| terminal(observation.state));
@@ -373,6 +383,24 @@ impl SupportMartingaleRuntime {
             .iter()
             .find(|state| state.symbol == *symbol)
             .ok_or(MultiVenueStoreError::Conflict)?;
+        if let Some(stop) =
+            super::stop_loss::stop_loss_plan(&instance, symbol, &snapshot, current_tp.as_ref(), now)
+        {
+            return self
+                .apply_plan(
+                    owner,
+                    &instance,
+                    runtime_state,
+                    resting.as_ref().filter(|_| !observed_take_profit_terminal),
+                    stop,
+                    current_tp.as_ref(),
+                    now,
+                )
+                .await;
+        }
+        if state.status == "sl_failed" {
+            return Ok(());
+        }
         if quantity > Decimal::ZERO
             && current_tp.is_none()
             && runtime_state.health_reason.as_deref() != Some("external_position")
@@ -415,7 +443,18 @@ impl SupportMartingaleRuntime {
         {
             return Ok(());
         }
-        let reference = match self.reference_snapshot(&instance, now).await {
+        let reference_result = if instance.config.entry_mode
+            == venue_control_protocol::support_martingale::MartingaleEntryMode::FixedPrice
+        {
+            Ok(ReferenceSnapshot {
+                fetched_at_ms: now,
+                btc_environment: Vec::new(),
+                symbols: BTreeMap::new(),
+            })
+        } else {
+            self.reference_snapshot(&instance, now).await
+        };
+        let reference = match reference_result {
             Ok(value) => value,
             Err(error) => {
                 if quantity > Decimal::ZERO && current_tp.is_none() {
@@ -549,6 +588,7 @@ impl SupportMartingaleRuntime {
             Plan::CancelTakeProfit {
                 symbol,
                 client_order_id,
+                for_stop_loss,
             } => {
                 let resting = resting
                     .filter(|value| {
@@ -569,8 +609,56 @@ impl SupportMartingaleRuntime {
                         owner,
                         &instance.instance_id,
                         &symbol,
-                        SupportMartingaleCommandKind::CancelTakeProfit,
+                        if for_stop_loss {
+                            SupportMartingaleCommandKind::CancelForStopLoss
+                        } else {
+                            SupportMartingaleCommandKind::CancelTakeProfit
+                        },
                         state.cycle_id.as_deref(),
+                        None,
+                        None,
+                        &request,
+                        Decimal::ZERO,
+                        command,
+                        now,
+                    )
+                    .await
+                    .map_err(map_store)?;
+                Ok(())
+            }
+            Plan::MarketStopLoss {
+                symbol,
+                quantity,
+                position_generation,
+            } => {
+                let cycle = state
+                    .cycle_id
+                    .as_deref()
+                    .ok_or(MultiVenueStoreError::Conflict)?;
+                let id = identity(
+                    instance,
+                    &symbol,
+                    "stop",
+                    state.decision_sequence.saturating_add(1),
+                )?;
+                let request = id.as_str().to_owned();
+                let command = ExecutionCommand::MarketReduce(venue_domain::MarketReduceCommand {
+                    command_id: id.clone(),
+                    client_order_id: id.clone(),
+                    risk_episode_id: id,
+                    owner: self::owner(instance, &symbol, cycle, OrderPurpose::Protection),
+                    position_side: PositionSide::Long,
+                    side: OrderSide::Sell,
+                    quantity,
+                    position_generation,
+                });
+                self.store
+                    .enqueue_command(
+                        owner,
+                        &instance.instance_id,
+                        &symbol,
+                        SupportMartingaleCommandKind::StopLoss,
+                        Some(cycle),
                         None,
                         None,
                         &request,
@@ -639,7 +727,7 @@ impl SupportMartingaleRuntime {
                     .await
                     .map_err(map_store)?;
             }
-            "reconciled" if pending.kind == "cancel_tp" => {
+            "reconciled" if matches!(pending.kind.as_str(), "cancel_tp" | "cancel_sl_tp") => {
                 self.store
                     .settle_command(owner, &pending.command_id, Decimal::ZERO, true, now_ms()?)
                     .await
@@ -663,7 +751,7 @@ impl SupportMartingaleRuntime {
                     .map_err(|_| MultiVenueStoreError::Unavailable)?;
                 let observation = observations.first().ok_or(MultiVenueStoreError::Conflict)?;
                 let order_terminal = terminal(observation.state);
-                if matches!(pending.kind.as_str(), "entry" | "add") && !order_terminal {
+                if matches!(pending.kind.as_str(), "entry" | "add" | "sl") && !order_terminal {
                     return Ok(());
                 }
                 self.store
@@ -793,7 +881,7 @@ impl SupportMartingaleRuntime {
         command: &ExecutionCommand,
         now: u64,
     ) -> Result<Option<SupportSendFence>, MultiVenueStoreError> {
-        let row = sqlx::query("SELECT c.kind,c.created_ms,i.lifecycle,i.health FROM venue_support_martingale_commands c JOIN venue_support_martingale_instances i USING(instance_id) WHERE c.command_id=$1 AND c.instance_id=$2 AND c.symbol=$3")
+        let row = sqlx::query("SELECT c.kind,c.created_ms,i.lifecycle,i.health,i.config,s.last_support_upper::text AS last_support_upper,s.average_price::text AS average_price FROM venue_support_martingale_commands c JOIN venue_support_martingale_instances i USING(instance_id) JOIN venue_support_martingale_symbol_states s ON s.instance_id=c.instance_id AND s.symbol=c.symbol WHERE c.command_id=$1 AND c.instance_id=$2 AND c.symbol=$3")
             .bind(command.command_id().as_str()).bind(&command.mutation_owner().strategy_instance_id)
             .bind(command.mutation_owner().symbol.to_string()).fetch_optional(&self.store.pool).await
             .map_err(|_| MultiVenueStoreError::Unavailable)?;
@@ -822,7 +910,10 @@ impl SupportMartingaleRuntime {
                 SupportSendKind::Add
             }
             "tp" if lifecycle != "stopped" => SupportSendKind::TakeProfit,
-            "cancel_tp" if lifecycle != "stopped" => SupportSendKind::CancelTakeProfit,
+            "cancel_tp" | "cancel_sl_tp" if lifecycle != "stopped" => {
+                SupportSendKind::CancelTakeProfit
+            }
+            "sl" if lifecycle != "stopped" => SupportSendKind::StopLoss,
             _ => return Err(MultiVenueStoreError::Conflict),
         };
         if matches!(kind, SupportSendKind::Entry | SupportSendKind::Add)
@@ -830,7 +921,45 @@ impl SupportMartingaleRuntime {
         {
             return Err(MultiVenueStoreError::Conflict);
         }
-        Ok(Some(SupportSendFence { kind }))
+        let mut price_ceiling = None;
+        let mut stop_floor = None;
+        if matches!(kind, SupportSendKind::Entry | SupportSendKind::Add) {
+            let config: venue_control_protocol::support_martingale::SupportMartingaleConfig =
+                serde_json::from_value(
+                    row.try_get("config")
+                        .map_err(|_| MultiVenueStoreError::Conflict)?,
+                )
+                .map_err(|_| MultiVenueStoreError::Conflict)?;
+            if config.entry_mode
+                == venue_control_protocol::support_martingale::MartingaleEntryMode::FixedPrice
+            {
+                let value: String = row
+                    .try_get("last_support_upper")
+                    .map_err(|_| MultiVenueStoreError::Conflict)?;
+                price_ceiling = Some(value.parse().map_err(|_| MultiVenueStoreError::Conflict)?);
+            }
+            if let Some(parameters) = config
+                .symbol_parameters
+                .iter()
+                .find(|p| p.symbol == command.mutation_owner().symbol)
+            {
+                let average: Option<String> = row
+                    .try_get("average_price")
+                    .map_err(|_| MultiVenueStoreError::Conflict)?;
+                let average = average
+                    .map(|s| s.parse::<Decimal>())
+                    .transpose()
+                    .map_err(|_| MultiVenueStoreError::Conflict)?;
+                stop_floor = parameters.stop_loss.and_then(|sl| {
+                    sl.trigger_price(average.or(parameters.entry_price).unwrap_or_default())
+                });
+            }
+        }
+        Ok(Some(SupportSendFence {
+            kind,
+            price_ceiling,
+            stop_floor,
+        }))
     }
 }
 
@@ -960,6 +1089,19 @@ mod tests {
     use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
 
     #[test]
+    fn fixed_entry_rechecks_ceiling_and_stop_floor_before_sending() {
+        let fence = SupportSendFence {
+            kind: SupportSendKind::Entry,
+            price_ceiling: Some(Decimal::from(100)),
+            stop_floor: Some(Decimal::from(90)),
+        };
+        assert!(fence.market_allows(Decimal::from(100)));
+        assert!(fence.market_allows(Decimal::from(95)));
+        assert!(!fence.market_allows(Decimal::from(101)));
+        assert!(!fence.market_allows(Decimal::from(90)));
+    }
+
+    #[test]
     fn add_send_fence_rejects_a_filled_take_profit_race() -> Result<(), Box<dyn std::error::Error>>
     {
         let symbol = Symbol::new("SOL", "USDT")?;
@@ -999,7 +1141,9 @@ mod tests {
         });
         assert!(
             !SupportSendFence {
-                kind: SupportSendKind::Add
+                kind: SupportSendKind::Add,
+                price_ceiling: None,
+                stop_floor: None
             }
             .validates(&command, &snapshot)
         );

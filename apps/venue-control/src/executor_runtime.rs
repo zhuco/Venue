@@ -831,7 +831,10 @@ async fn settle_submit_result(
         result.state,
         ExecutionReadback::Accepted | ExecutionReadback::Reconciled
     ) && result.native_order_id.is_none()
-        && !matches!(&command.order, ClaimedBinanceOrder::CancelExact { .. })
+        && !matches!(
+            &command.order,
+            ClaimedBinanceOrder::CancelExact { .. } | ClaimedBinanceOrder::CancelAlgoExact { .. }
+        )
     {
         store
             .transition_command_with_readback(
@@ -1193,6 +1196,28 @@ fn request(command: &ClaimedBinanceCommand) -> ExecutionRequest {
             native_order_id,
             target_client_order_id,
         } => ExecutionOrderKind::CancelExact {
+            native_order_id: native_order_id.clone(),
+            target_client_order_id: target_client_order_id.clone(),
+        },
+        ClaimedBinanceOrder::StopMarket {
+            side,
+            position_side,
+            quantity,
+            trigger_price,
+            working_type,
+            reducing,
+        } => ExecutionOrderKind::StopMarket {
+            side: *side,
+            position_side: *position_side,
+            quantity: *quantity,
+            trigger_price: *trigger_price,
+            working_type: working_type.clone(),
+            reducing: *reducing,
+        },
+        ClaimedBinanceOrder::CancelAlgoExact {
+            native_order_id,
+            target_client_order_id,
+        } => ExecutionOrderKind::CancelAlgoExact {
             native_order_id: native_order_id.clone(),
             target_client_order_id: target_client_order_id.clone(),
         },

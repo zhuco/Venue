@@ -643,6 +643,227 @@ async fn mirror_sizing_and_revocation(fixed: bool) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+#[tokio::test]
+async fn market_is_planned_once_and_stop_create_modify_cancel_keep_exact_algo_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(url) = integration_database_url()? else {
+        return Ok(());
+    };
+    let fixture = Fixture::create(&url).await?;
+    venue_control::install_control_schema(&fixture.pool).await?;
+    let now = test_now_ms()?;
+    let kol = id(9201);
+    let leader_account = id(9202);
+    let leader_credential = id(9203);
+    let bot = id(9204);
+    let follower = id(9211);
+    let follower_account = id(9212);
+    let follower_credential = id(9213);
+    let relation = id(9214);
+    let invite = id(9215);
+    seed_verified_account(&fixture.pool, &kol, &leader_account, &leader_credential, 81).await?;
+    seed_verified_account(
+        &fixture.pool,
+        &follower,
+        &follower_account,
+        &follower_credential,
+        82,
+    )
+    .await?;
+    sqlx::query("UPDATE venue_api_credentials SET verification_json='{\"verification\":\"verified\"}'::jsonb")
+        .execute(&fixture.pool)
+        .await?;
+    insert_kol_profile(&fixture.pool, &kol, &leader_account, 1).await?;
+    insert_invite(&fixture.pool, &invite, &kol, 83).await?;
+    sqlx::query("INSERT INTO venue_user_kol_bindings (user_id,kol_user_id,invite_id,bound_ms) VALUES ($1,$2,$3,1)")
+        .bind(&follower).bind(&kol).bind(&invite).execute(&fixture.pool).await?;
+    insert_follow_relation(
+        &fixture.pool,
+        &relation,
+        &follower,
+        &kol,
+        &leader_account,
+        &follower_account,
+        &follower_credential,
+        1,
+    )
+    .await?;
+    sqlx::query("UPDATE venue_kol_follow_relations SET baseline_json=jsonb_build_object('target_model',2,'baseline_ms',$1::bigint)")
+        .bind(i64::try_from(now - 20)?).execute(&fixture.pool).await?;
+    set_permission(&fixture.pool, &kol, true, 0, "fixture", now).await?;
+    sqlx::query("INSERT INTO venue_leader_bots(bot_id,owner_user_id,trading_account_id,credential_id,create_request_id,bot_name,bot_description,strategy_capital,bot_state,revision,permission_revision,started_ms,created_ms,updated_ms) VALUES ($1,$2,$3,$4,$1,'Fixture KOL','','100','running',1,1,$5,$5,$5)")
+        .bind(&bot).bind(&kol).bind(&leader_account).bind(&leader_credential)
+        .bind(i64::try_from(now - 10)?).execute(&fixture.pool).await?;
+
+    let store = PgExecutorStore::new(fixture.pool.clone());
+    store
+        .record_source_market_order(
+            &kol,
+            &leader_account,
+            &venue_execution::SignedMarketOrderFact {
+                client_order_id: "source-market".into(),
+                venue_order_id: "market-1".into(),
+                symbol: "BTC/USDT".parse()?,
+                side: OrderSide::Buy,
+                position_side: PositionSide::Long,
+                quantity: Decimal::new(1, 3),
+                reference_price: Decimal::from(50_000),
+                created_at_ms: now - 1,
+            },
+            now,
+        )
+        .await?;
+    let source_stop = conditional("source-stop", "stop-1", "49000", now - 1);
+    persist_projection_with_conditionals(
+        &fixture.pool,
+        &kol,
+        &leader_account,
+        &leader_credential,
+        vec![source_stop.clone()],
+        now,
+    )
+    .await?;
+    persist_projection_with_conditionals(
+        &fixture.pool,
+        &follower,
+        &follower_account,
+        &follower_credential,
+        vec![],
+        now,
+    )
+    .await?;
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(venue_control::order_mirror::run_order_mirror(
+        fixture.pool.clone(),
+        venue_control::executor_runtime::CommandWake::new(),
+        receiver,
+    ));
+    wait_count(
+        &fixture.pool,
+        "SELECT count(*) FROM venue_order_mirrors WHERE source_kind IN ('market','stop')",
+        2,
+    )
+    .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM venue_order_mirrors WHERE source_kind='market'"
+        )
+        .fetch_one(&fixture.pool)
+        .await?,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM venue_binance_commands WHERE order_kind='market'"
+        )
+        .fetch_one(&fixture.pool)
+        .await?,
+        1
+    );
+
+    let stop_place: String = sqlx::query_scalar(
+        "SELECT child_client_order_id FROM venue_order_mirrors WHERE source_kind='stop'",
+    )
+    .fetch_one(&fixture.pool)
+    .await?;
+    sqlx::query("UPDATE venue_binance_commands SET command_state='reconciled',native_order_id='child-stop-1',terminal_ms=$1 WHERE command_id=$2")
+        .bind(i64::try_from(test_now_ms()?)?).bind(&stop_place).execute(&fixture.pool).await?;
+    sqlx::query("UPDATE venue_order_mirrors SET mirror_state='live',child_native_order_id='child-stop-1' WHERE source_kind='stop'")
+        .execute(&fixture.pool).await?;
+    let child_stop = conditional(&stop_place, "child-stop-1", "49000", now - 1);
+    let changed_stop = conditional("source-stop", "stop-1", "48000", now - 1);
+    let refreshed = test_now_ms()?;
+    persist_projection_with_conditionals(
+        &fixture.pool,
+        &kol,
+        &leader_account,
+        &leader_credential,
+        vec![changed_stop.clone()],
+        refreshed,
+    )
+    .await?;
+    persist_projection_with_conditionals(
+        &fixture.pool,
+        &follower,
+        &follower_account,
+        &follower_credential,
+        vec![child_stop],
+        refreshed,
+    )
+    .await?;
+    wait_count(
+        &fixture.pool,
+        "SELECT count(*) FROM venue_binance_commands WHERE order_kind='cancel_algo_exact'",
+        1,
+    )
+    .await?;
+    let (cancel, selected): (String, String) = sqlx::query_as("SELECT command_id,selected_native_order_id FROM venue_binance_commands WHERE order_kind='cancel_algo_exact'")
+        .fetch_one(&fixture.pool).await?;
+    assert_eq!(selected, "child-stop-1");
+
+    sqlx::query("UPDATE venue_binance_commands SET command_state='reconciled',native_order_id='child-stop-1',terminal_ms=$1 WHERE command_id=$2")
+        .bind(i64::try_from(test_now_ms()?)?).bind(&cancel).execute(&fixture.pool).await?;
+    sqlx::query("UPDATE venue_order_mirrors SET mirror_state='terminal' WHERE source_kind='stop'")
+        .execute(&fixture.pool)
+        .await?;
+    persist_projection_with_conditionals(
+        &fixture.pool,
+        &follower,
+        &follower_account,
+        &follower_credential,
+        vec![],
+        test_now_ms()?,
+    )
+    .await?;
+    wait_count(
+        &fixture.pool,
+        "SELECT count(*) FROM venue_binance_commands WHERE order_kind='stop_market'",
+        2,
+    )
+    .await?;
+
+    let replacement: String = sqlx::query_scalar("SELECT child_client_order_id FROM venue_order_mirrors WHERE source_kind='stop' ORDER BY child_sequence DESC LIMIT 1")
+        .fetch_one(&fixture.pool).await?;
+    sqlx::query("UPDATE venue_binance_commands SET command_state='reconciled',native_order_id='child-stop-2',terminal_ms=$1 WHERE command_id=$2")
+        .bind(i64::try_from(test_now_ms()?)?).bind(&replacement).execute(&fixture.pool).await?;
+    sqlx::query("UPDATE venue_order_mirrors SET mirror_state='live',child_native_order_id='child-stop-2' WHERE child_client_order_id=$1")
+        .bind(&replacement).execute(&fixture.pool).await?;
+    let refreshed = test_now_ms()?;
+    persist_projection_with_conditionals(
+        &fixture.pool,
+        &kol,
+        &leader_account,
+        &leader_credential,
+        vec![],
+        refreshed,
+    )
+    .await?;
+    persist_projection_with_conditionals(
+        &fixture.pool,
+        &follower,
+        &follower_account,
+        &follower_credential,
+        vec![conditional(&replacement, "child-stop-2", "48000", now - 1)],
+        refreshed,
+    )
+    .await?;
+    wait_count(
+        &fixture.pool,
+        "SELECT count(*) FROM venue_binance_commands WHERE order_kind='cancel_algo_exact'",
+        2,
+    )
+    .await?;
+
+    shutdown.send(true)?;
+    task.await??;
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+fn conditional(client: &str, native: &str, trigger: &str, created: u64) -> serde_json::Value {
+    serde_json::json!({"client_order_id":client,"native_order_id":native,"symbol":"BTC/USDT","order_side":"buy","position_side":"long","quantity":"0.001","trigger_price":trigger,"working_type":"MARK_PRICE","reduce_only":false,"created_ms":created})
+}
+
 async fn provision_account(
     pool: &PgPool,
     user: &str,
@@ -662,7 +883,39 @@ async fn persist_projection(
     orders: Vec<serde_json::Value>,
     now: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let projection = serde_json::json!({"stream_healthy":true,"projection":{"schema_version":1,"credential_id":credential,"trading_account_id":account,"observed_ms":now,"persisted_ms":now,"private_generation":1,"position_mode":"hedge","positions":[],"open_orders":orders,"fills":[],"assets":[]}});
+    persist_projection_full(pool, user, account, credential, orders, vec![], now).await
+}
+
+async fn persist_projection_with_conditionals(
+    pool: &PgPool,
+    user: &str,
+    account: &str,
+    credential: &str,
+    conditional_orders: Vec<serde_json::Value>,
+    now: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    persist_projection_full(
+        pool,
+        user,
+        account,
+        credential,
+        vec![],
+        conditional_orders,
+        now,
+    )
+    .await
+}
+
+async fn persist_projection_full(
+    pool: &PgPool,
+    user: &str,
+    account: &str,
+    credential: &str,
+    orders: Vec<serde_json::Value>,
+    conditional_orders: Vec<serde_json::Value>,
+    now: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let projection = serde_json::json!({"stream_healthy":true,"projection":{"schema_version":1,"credential_id":credential,"trading_account_id":account,"observed_ms":now,"persisted_ms":now,"private_generation":1,"position_mode":"hedge","positions":[],"open_orders":orders,"conditional_orders":conditional_orders,"fills":[],"assets":[]}});
     sqlx::query("INSERT INTO venue_binance_account_projections(credential_id,owner_user_id,trading_account_id,observed_ms,persisted_ms,private_generation,projection_json) VALUES($1,$2,$3,$4,$4,1,$5) ON CONFLICT(credential_id) DO UPDATE SET projection_json=EXCLUDED.projection_json,observed_ms=EXCLUDED.observed_ms,persisted_ms=EXCLUDED.persisted_ms").bind(credential).bind(user).bind(account).bind(i64::try_from(now)?).bind(projection).execute(pool).await?;
     Ok(())
 }

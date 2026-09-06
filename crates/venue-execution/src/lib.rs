@@ -22,8 +22,8 @@ pub use account_host::{
     COMMAND_JOURNAL_ROTATE_BYTES, HostPreparedCommand, LegacyV1CustodyRoute,
     ManagedGridRollingDispatchPermit, ManagedGridSurfaceReceipt, RuntimeBootstrapReceipt,
     SignedAccountBalance, SignedAccountOrderFact, SignedAccountPositionFact,
-    SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
-    command_matches_readback_order,
+    SignedAccountPositionMode, SignedAccountSnapshot, SignedConditionalOrderFact,
+    SignedMarketOrderFact, SignedUnknownFact, SignedUnknownResult, command_matches_readback_order,
 };
 pub use canonical_root::{
     AccountCanonicalRootError, AccountCanonicalRootGuard, LegacyV1WriterGuard,

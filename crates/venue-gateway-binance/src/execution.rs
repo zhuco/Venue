@@ -13,7 +13,7 @@ use venue_gateway_api::GatewayBinding;
 use crate::readback::{
     BinancePositionMode, BinancePrivateReadRequest, BinancePrivateReadScope,
     BinancePrivateReadbackCandidate, BinanceRawPrivatePage, BinanceReadbackError,
-    build_exact_order_request, validate_client_order_id,
+    build_exact_algo_order_request, build_exact_order_request, validate_client_order_id,
 };
 use crate::{
     BinanceHttpMethod, BinanceInstrumentRules, BinancePrivateSurface, endpoints, native_symbol,
@@ -53,6 +53,17 @@ pub struct BinanceMarketIntent {
     pub side: OrderSide,
     pub position_side: PositionSide,
     pub quantity: Decimal,
+    pub reduce_only: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinanceStopMarketIntent {
+    pub client_order_id: String,
+    pub side: OrderSide,
+    pub position_side: PositionSide,
+    pub quantity: Decimal,
+    pub trigger_price: Price,
+    pub working_type: String,
     pub reduce_only: bool,
 }
 
@@ -164,6 +175,8 @@ pub enum BinanceMutationKind {
     PlaceMarket,
     Cancel,
     ReduceOnce,
+    PlaceStopMarket,
+    CancelAlgo,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -174,6 +187,7 @@ pub struct BinancePreparedMutation {
     kind: BinanceMutationKind,
     parameters: Vec<(String, String)>,
     client_order_id: String,
+    native_order_id: Option<String>,
 }
 
 impl BinancePreparedMutation {
@@ -216,14 +230,22 @@ impl BinancePreparedMutation {
         match self.kind {
             BinanceMutationKind::PlaceLimit
             | BinanceMutationKind::PlaceMarket
-            | BinanceMutationKind::ReduceOnce => BinanceHttpMethod::Post,
-            BinanceMutationKind::Cancel => BinanceHttpMethod::Delete,
+            | BinanceMutationKind::ReduceOnce
+            | BinanceMutationKind::PlaceStopMarket => BinanceHttpMethod::Post,
+            BinanceMutationKind::Cancel | BinanceMutationKind::CancelAlgo => {
+                BinanceHttpMethod::Delete
+            }
         }
     }
 
     #[must_use]
     pub const fn path(&self) -> &'static str {
-        endpoints::ORDER
+        match self.kind {
+            BinanceMutationKind::PlaceStopMarket | BinanceMutationKind::CancelAlgo => {
+                endpoints::ALGO_ORDER
+            }
+            _ => endpoints::ORDER,
+        }
     }
 
     #[must_use]
@@ -241,9 +263,86 @@ impl BinancePreparedMutation {
         scope: &BinancePrivateReadScope,
     ) -> Result<BinancePrivateReadRequest, BinanceExecutionError> {
         self.validate(scope)?;
-        build_exact_order_request(scope, &self.client_order_id)
-            .map_err(|_| BinanceExecutionError::Readback)
+        match self.kind {
+            BinanceMutationKind::PlaceStopMarket | BinanceMutationKind::CancelAlgo => {
+                build_exact_algo_order_request(scope, &self.client_order_id)
+            }
+            _ => build_exact_order_request(scope, &self.client_order_id),
+        }
+        .map_err(|_| BinanceExecutionError::Readback)
     }
+}
+
+pub fn prepare_place_stop_market(
+    rules: &BinanceInstrumentRules,
+    readback: &BinancePrivateReadbackCandidate,
+    intent: &BinanceStopMarketIntent,
+) -> Result<BinancePreparedMutation, BinanceExecutionError> {
+    validate_common(rules, readback, &intent.client_order_id, intent.quantity)?;
+    validate_price_and_notional(rules, intent.quantity, intent.trigger_price)?;
+    validate_direction(
+        readback.position_mode,
+        intent.position_side,
+        intent.side,
+        intent.reduce_only,
+    )?;
+    if !matches!(
+        intent.working_type.as_str(),
+        "MARK_PRICE" | "CONTRACT_PRICE"
+    ) {
+        return Err(BinanceExecutionError::Intent);
+    }
+    let mut parameters = vec![
+        ("algoType".to_owned(), "CONDITIONAL".to_owned()),
+        ("symbol".to_owned(), rules.native_symbol.clone()),
+        ("side".to_owned(), side_wire(intent.side).to_owned()),
+        ("type".to_owned(), "STOP_MARKET".to_owned()),
+        ("quantity".to_owned(), decimal_wire(intent.quantity)),
+        (
+            "positionSide".to_owned(),
+            position_side_wire(intent.position_side).to_owned(),
+        ),
+        (
+            "triggerPrice".to_owned(),
+            decimal_wire(intent.trigger_price.value()),
+        ),
+        ("workingType".to_owned(), intent.working_type.clone()),
+        ("clientAlgoId".to_owned(), intent.client_order_id.clone()),
+    ];
+    if readback.position_mode == BinancePositionMode::Net {
+        parameters.push(("reduceOnly".to_owned(), intent.reduce_only.to_string()));
+    }
+    prepared(
+        rules,
+        readback,
+        BinanceMutationKind::PlaceStopMarket,
+        parameters,
+        intent.client_order_id.clone(),
+    )
+}
+
+pub fn prepare_cancel_algo(
+    rules: &BinanceInstrumentRules,
+    readback: &BinancePrivateReadbackCandidate,
+    native_algo_id: &str,
+    client_algo_id: &str,
+) -> Result<BinancePreparedMutation, BinanceExecutionError> {
+    validate_common(rules, readback, client_algo_id, rules.minimum_quantity)?;
+    let mut request = prepared(
+        rules,
+        readback,
+        BinanceMutationKind::CancelAlgo,
+        vec![
+            ("algoType".to_owned(), "CONDITIONAL".to_owned()),
+            ("clientAlgoId".to_owned(), client_algo_id.to_owned()),
+        ],
+        client_algo_id.to_owned(),
+    )?;
+    if native_algo_id.trim().is_empty() {
+        return Err(BinanceExecutionError::Intent);
+    }
+    request.native_order_id = Some(native_algo_id.to_owned());
+    Ok(request)
 }
 
 pub fn prepare_place_limit(
@@ -488,6 +587,7 @@ fn prepared_for_scope(
         kind,
         parameters,
         client_order_id,
+        native_order_id: None,
     };
     request.validate(scope)?;
     Ok(request)
@@ -659,21 +759,49 @@ pub fn parse_mutation_ack(
     {
         return Err(BinanceExecutionError::VenueRejected);
     }
-    let order_id = identifier(value.get("orderId"))?;
-    let client_order_id = value
-        .get("clientOrderId")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or(BinanceExecutionError::Payload)?;
+    let algo = matches!(
+        request.kind,
+        BinanceMutationKind::PlaceStopMarket | BinanceMutationKind::CancelAlgo
+    );
+    let cancel_algo = request.kind == BinanceMutationKind::CancelAlgo;
+    if cancel_algo && value.get("complete").and_then(Value::as_bool) != Some(true) {
+        return Err(BinanceExecutionError::Payload);
+    }
+    let order_id = if cancel_algo {
+        request
+            .native_order_id
+            .clone()
+            .ok_or(BinanceExecutionError::Binding)?
+    } else {
+        identifier(value.get(if algo { "algoId" } else { "orderId" }))?
+    };
+    let client_order_id = if cancel_algo {
+        request.client_order_id.as_str()
+    } else {
+        value
+            .get(if algo {
+                "clientAlgoId"
+            } else {
+                "clientOrderId"
+            })
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(BinanceExecutionError::Payload)?
+    };
     if client_order_id != request.client_order_id {
         return Err(BinanceExecutionError::Binding);
     }
-    let accepted_at_ms = value
-        .get("updateTime")
-        .or_else(|| value.get("transactTime"))
-        .and_then(Value::as_u64)
-        .filter(|value| *value > 0 && *value <= received_at_ms)
-        .ok_or(BinanceExecutionError::Payload)?;
+    let accepted_at_ms = if cancel_algo {
+        received_at_ms
+    } else {
+        value
+            .get("updateTime")
+            .or_else(|| value.get("transactTime"))
+            .or_else(|| value.get("createTime"))
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0 && *value <= received_at_ms)
+            .ok_or(BinanceExecutionError::Payload)?
+    };
     Ok(BinanceMutationAck {
         binding: request.binding.clone(),
         instrument_generation: request.instrument_generation,
@@ -684,13 +812,17 @@ pub fn parse_mutation_ack(
         time_in_force: request.limit_time_in_force()?,
         accepted_at_ms,
         received_at_ms,
-        order: std::str::from_utf8(payload)
-            .ok()
-            .and_then(|payload| crate::private::parse_order(payload, &request.binding.symbol).ok())
-            .filter(|order| {
-                order.order_id == order_id
-                    && order.client_order_id == FieldState::Known(client_order_id.to_owned())
-            }),
+        order: (!algo).then(|| ()).and_then(|_| {
+            std::str::from_utf8(payload)
+                .ok()
+                .and_then(|payload| {
+                    crate::private::parse_order(payload, &request.binding.symbol).ok()
+                })
+                .filter(|order| {
+                    order.order_id == order_id
+                        && order.client_order_id == FieldState::Known(client_order_id.to_owned())
+                })
+        }),
     })
 }
 
@@ -702,6 +834,7 @@ pub struct BinanceExactOrderReadback {
     pub requested_at_ms: u64,
     pub received_at_ms: u64,
     pub order: Order,
+    pub algo: Option<crate::private::AlgoOrderReadback>,
     pub raw_payload: Vec<u8>,
 }
 
@@ -710,8 +843,11 @@ pub fn parse_exact_order_readback(
     request: &BinancePrivateReadRequest,
     page: &BinanceRawPrivatePage,
 ) -> Result<BinanceExactOrderReadback, BinanceExecutionError> {
-    if request.surface() != BinancePrivateSurface::ExactOrder
-        || page.surface != BinancePrivateSurface::ExactOrder
+    let algo_surface = request.surface() == BinancePrivateSurface::ExactAlgoOrder;
+    if !matches!(
+        request.surface(),
+        BinancePrivateSurface::ExactOrder | BinancePrivateSurface::ExactAlgoOrder
+    ) || page.surface != request.surface()
         || page.scope != *request.scope()
         || ack.binding != *request.scope().binding()
         || ack.instrument_generation != request.scope().instrument_generation()
@@ -722,8 +858,52 @@ pub fn parse_exact_order_readback(
         return Err(BinanceExecutionError::Binding);
     }
     let payload = std::str::from_utf8(&page.payload).map_err(|_| BinanceExecutionError::Payload)?;
-    let order = crate::private::parse_order(payload, &ack.binding.symbol)
-        .map_err(|_| BinanceExecutionError::Readback)?;
+    let (order, algo) = if algo_surface {
+        let algo =
+            crate::private::parse_algo_order(payload, &ack.binding.symbol, &ack.client_order_id)
+                .map_err(|_| BinanceExecutionError::Readback)?;
+        let quantity = match algo.quantity {
+            FieldState::Known(value) if value > Decimal::ZERO => value,
+            _ => return Err(BinanceExecutionError::Readback),
+        };
+        let side = match algo.side {
+            FieldState::Known(value) => value,
+            _ => return Err(BinanceExecutionError::Readback),
+        };
+        let position_side = match algo.position_side {
+            FieldState::Known(value) => value,
+            _ => return Err(BinanceExecutionError::Readback),
+        };
+        let state = match algo.status {
+            crate::private::ConditionalStrategyStatus::Current => OrderState::New,
+            crate::private::ConditionalStrategyStatus::Cancelled => OrderState::Cancelled,
+            crate::private::ConditionalStrategyStatus::NonCancelledTerminal => OrderState::Filled,
+            crate::private::ConditionalStrategyStatus::Rejected => OrderState::Rejected,
+            crate::private::ConditionalStrategyStatus::Unknown => OrderState::Unknown,
+        };
+        let order = Order {
+            order_id: algo.algo_id.clone(),
+            client_order_id: FieldState::Known(algo.client_algo_id.clone()),
+            symbol: ack.binding.symbol.clone(),
+            side,
+            position_side: FieldState::Known(position_side),
+            purpose: FieldState::Missing,
+            state,
+            quantity,
+            filled_quantity: Decimal::ZERO,
+            limit_price: None,
+            time_in_force: FieldState::Missing,
+            average_price: FieldState::Missing,
+            reduce_only: matches!(algo.reduce_only, FieldState::Known(true)),
+        };
+        (order, Some(algo))
+    } else {
+        (
+            crate::private::parse_order(payload, &ack.binding.symbol)
+                .map_err(|_| BinanceExecutionError::Readback)?,
+            None,
+        )
+    };
     let client_matches = matches!(
         &order.client_order_id,
         FieldState::Known(value) if value == &ack.client_order_id
@@ -743,6 +923,7 @@ pub fn parse_exact_order_readback(
         requested_at_ms: page.requested_at_ms,
         received_at_ms: page.received_at_ms,
         order,
+        algo,
         raw_payload: page.payload.to_vec(),
     })
 }
@@ -895,6 +1076,10 @@ pub(crate) fn prepared_for_transport_test(
             ("newOrderRespType".to_owned(), "RESULT".to_owned()),
             ("newClientOrderId".to_owned(), client_order_id.to_owned()),
         ],
+        BinanceMutationKind::PlaceStopMarket | BinanceMutationKind::CancelAlgo => vec![
+            ("algoType".to_owned(), "CONDITIONAL".to_owned()),
+            ("clientAlgoId".to_owned(), client_order_id.to_owned()),
+        ],
     };
     BinancePreparedMutation {
         binding: scope.binding().clone(),
@@ -903,6 +1088,7 @@ pub(crate) fn prepared_for_transport_test(
         kind,
         parameters,
         client_order_id: client_order_id.to_owned(),
+        native_order_id: None,
     }
 }
 
@@ -1101,6 +1287,50 @@ mod tests {
             ),
             Err(BinanceExecutionError::Position)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_market_and_algo_cancel_use_current_algo_surfaces_and_exact_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let facts = facts("00000000-0000-4000-8000-000000000001")?;
+        let stop = prepare_place_stop_market(
+            &facts.rules,
+            &facts.readback,
+            &BinanceStopMarketIntent {
+                client_order_id: "venue_stop_1".to_owned(),
+                side: OrderSide::Sell,
+                position_side: PositionSide::Long,
+                quantity: Decimal::new(2, 3),
+                trigger_price: Price::new(Decimal::new(49_000, 0))?,
+                working_type: "MARK_PRICE".to_owned(),
+                reduce_only: true,
+            },
+        )?;
+        assert_eq!(stop.kind(), BinanceMutationKind::PlaceStopMarket);
+        assert_eq!(stop.method(), BinanceHttpMethod::Post);
+        assert_eq!(stop.path(), endpoints::ALGO_ORDER);
+        assert!(
+            stop.parameters()
+                .contains(&("type".into(), "STOP_MARKET".into()))
+        );
+        assert!(stop.parameters().iter().all(|(key, _)| key != "reduceOnly"));
+        let exact = stop.exact_readback_request(facts.readback.scope())?;
+        assert_eq!(exact.path(), endpoints::EXACT_ALGO_ORDER);
+
+        let cancel = prepare_cancel_algo(&facts.rules, &facts.readback, "902", "venue_stop_1")?;
+        assert_eq!(cancel.kind(), BinanceMutationKind::CancelAlgo);
+        assert_eq!(cancel.method(), BinanceHttpMethod::Delete);
+        assert_eq!(cancel.path(), endpoints::ALGO_ORDER);
+        let ack = parse_mutation_ack(
+            &cancel,
+            facts.readback.scope(),
+            br#"{"complete":true}"#,
+            2_000,
+        )?;
+        assert_eq!(ack.order_id, "902");
+        assert_eq!(ack.client_order_id, "venue_stop_1");
+        assert!(ack.order.is_none());
         Ok(())
     }
 

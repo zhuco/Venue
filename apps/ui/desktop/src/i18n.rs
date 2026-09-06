@@ -85,7 +85,7 @@ resources! {
     AvailableMargin => "Available margin", "可用保证金";
     ValuationCurrencyMissing => "Valuation currency unspecified", "估值币种待提供";
     FundsHint => "Selected account, server valuation. Currency is not supplied by the current protocol: do not interpret this as the chart's quote asset. Stale values are historical, not spendable balance.", "所选账户的服务器估值；当前协议未提供估值币种，不能当作图表交易对的报价币。过期值仅供参考，不代表可下单余额。";
-    AwaitingNode => "Awaiting node", "等待节点";
+    AwaitingNode => "Loading account", "正在读取账户";
     NoExecutionAccount => "No trading account selected", "未选择交易帐户";
     TradingUnavailable => "Trading unavailable", "交易未就绪";
     Modules => "Modules", "模块";

@@ -26,9 +26,9 @@ pub use venue_execution::{
     CommandJournalError, CommandState, DispatchGuard, DurableOwnerRoutes,
     LegacyV1WriterPredecessor, OwnerRouteFence, OwnerRoutesError, RuntimeBootstrapReceipt,
     SignedAccountBalance, SignedAccountOrderFact, SignedAccountPositionFact,
-    SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
-    WriterLeaseAuthority, WriterLeaseError, WriterScope, WriterSession,
-    acquire_account_canonical_root,
+    SignedAccountPositionMode, SignedAccountSnapshot, SignedConditionalOrderFact,
+    SignedMarketOrderFact, SignedUnknownFact, SignedUnknownResult, WriterLeaseAuthority,
+    WriterLeaseError, WriterScope, WriterSession, acquire_account_canonical_root,
 };
 pub use venue_gateway_api::VenueId as ExchangeId;
 

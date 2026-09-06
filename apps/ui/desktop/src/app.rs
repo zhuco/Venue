@@ -532,6 +532,7 @@ impl eframe::App for VenueFlowApp {
             tree.ui(&mut behavior, ui);
         });
         crate::chart_trading::apply_interaction(&mut self.model, &self.client, ui.ctx());
+        crate::execution_view::show_position_confirmation(ui, &mut self.model, &self.client, None);
         if std::mem::take(&mut self.model.indicator_settings_requested) {
             self.show_settings = true;
             self.settings_state

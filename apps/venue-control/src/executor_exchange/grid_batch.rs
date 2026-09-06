@@ -145,6 +145,10 @@ impl BinanceHttpExecution {
                 ExecutionOrderKind::CancelExact { .. } => {
                     cancel_dispatches.push((index, dispatch));
                 }
+                ExecutionOrderKind::StopMarket { .. }
+                | ExecutionOrderKind::CancelAlgoExact { .. } => {
+                    return Err(BinanceExecutionError::Invalid);
+                }
             }
         }
         let mut first_submit_us = None;
@@ -236,6 +240,9 @@ impl BinanceHttpExecution {
             ExecutionOrderKind::Market { .. } | ExecutionOrderKind::Limit { .. } => {
                 request.client_order_id.as_str()
             }
+            ExecutionOrderKind::StopMarket { .. } | ExecutionOrderKind::CancelAlgoExact { .. } => {
+                return outcome(ExecutionReadback::Unknown, Some(ack.order_id.clone()));
+            }
         };
         let order = match self
             .exact_order_for_client_in_scope(request, credentials, client_order_id, scope)
@@ -267,6 +274,9 @@ impl BinanceHttpExecution {
                 }
             }
             ExecutionOrderKind::Market { .. } | ExecutionOrderKind::Limit { .. } => {
+                ExecutionReadback::Unknown
+            }
+            ExecutionOrderKind::StopMarket { .. } | ExecutionOrderKind::CancelAlgoExact { .. } => {
                 ExecutionReadback::Unknown
             }
         };
@@ -631,6 +641,9 @@ pub(super) fn validate_grid_batch_shape(
             ExecutionOrderKind::Market { .. } | ExecutionOrderKind::Limit { .. } => {
                 return Err(BinanceExecutionError::Invalid);
             }
+            ExecutionOrderKind::StopMarket { .. } | ExecutionOrderKind::CancelAlgoExact { .. } => {
+                return Err(BinanceExecutionError::Invalid);
+            }
         }
     }
     Ok(())
@@ -697,6 +710,9 @@ fn prepare_hot_grid_batch(
                 });
             }
             ExecutionOrderKind::Market { .. } => return Err(BinanceExecutionError::Invalid),
+            ExecutionOrderKind::StopMarket { .. } | ExecutionOrderKind::CancelAlgoExact { .. } => {
+                return Err(BinanceExecutionError::Invalid);
+            }
         }
     }
     Ok(prepared)
@@ -811,6 +827,10 @@ pub(super) fn prepare_grid_batch(
                     ExecutionOrderKind::CancelExact { .. } => {
                         return Err(BinanceExecutionError::Invalid);
                     }
+                    ExecutionOrderKind::StopMarket { .. }
+                    | ExecutionOrderKind::CancelAlgoExact { .. } => {
+                        return Err(BinanceExecutionError::Invalid);
+                    }
                 }
                 .map_err(|_| BinanceExecutionError::Invalid)?;
                 prepared.push(PreparedGridCommand {
@@ -818,6 +838,9 @@ pub(super) fn prepare_grid_batch(
                     immediate: None,
                     native_id: None,
                 });
+            }
+            ExecutionOrderKind::StopMarket { .. } | ExecutionOrderKind::CancelAlgoExact { .. } => {
+                return Err(BinanceExecutionError::Invalid);
             }
         }
     }

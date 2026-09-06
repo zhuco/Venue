@@ -14,8 +14,8 @@ pub(crate) struct TradingBadge {
     pub quantity: Option<String>,
     pub stale: bool,
     pub pending: bool,
-    pub provisional: bool,
     pub pnl: Option<Decimal>,
+    pub position: Option<crate::execution_view::PositionActionDraft>,
     pub selection: Option<TerminalOrderSelection>,
 }
 
@@ -24,14 +24,6 @@ pub(crate) struct TradingBadge {
 pub(crate) struct OrderTagState {
     pending: Vec<(TerminalOrderSelection, String)>,
     uncertain_cancels: std::collections::HashSet<String>,
-    submitted_orders: Vec<SubmittedOrder>,
-}
-
-#[derive(Debug)]
-struct SubmittedOrder {
-    account: String,
-    request: venue_control_protocol::kol::TerminalOrderRequest,
-    receipt: Option<venue_control_protocol::kol::ExecutorCommandSummary>,
 }
 
 impl OrderTagState {
@@ -43,27 +35,6 @@ impl OrderTagState {
     ) {
         if !self.is_pending(&target) {
             self.pending.push((target, request_id));
-        }
-        context.request_repaint();
-    }
-
-    pub(crate) fn submitted_order(
-        &mut self,
-        account: String,
-        request: venue_control_protocol::kol::TerminalOrderRequest,
-        context: &egui::Context,
-    ) {
-        if request.limit_price.is_some()
-            && !self
-                .submitted_orders
-                .iter()
-                .any(|pending| pending.request.request_id == request.request_id)
-        {
-            self.submitted_orders.push(SubmittedOrder {
-                account,
-                request,
-                receipt: None,
-            });
         }
         context.request_repaint();
     }
@@ -82,8 +53,6 @@ impl OrderTagState {
         if definitive {
             self.pending.retain(|(_, id)| id != request_id);
             self.uncertain_cancels.remove(request_id);
-            self.submitted_orders
-                .retain(|pending| pending.request.request_id != request_id);
         } else if self.pending.iter().any(|(_, id)| id == request_id) {
             self.uncertain_cancels.insert(request_id.into());
         }
@@ -93,29 +62,6 @@ impl OrderTagState {
         &mut self,
         rows: &[venue_control_protocol::kol::ExecutorCommandSummary],
     ) {
-        for pending in &mut self.submitted_orders {
-            if let Some(row) = rows.iter().find(|row| {
-                row.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Terminal
-                    && row.request_id.as_ref() == Some(&pending.request.request_id)
-                    && row.trading_account_id == pending.account
-                    && row.symbol == pending.request.symbol
-            }) && pending
-                .receipt
-                .as_ref()
-                .is_none_or(|old| old.updated_ms <= row.updated_ms)
-            {
-                pending.receipt = Some(row.clone());
-            }
-        }
-        self.submitted_orders.retain(|pending| {
-            pending.receipt.as_ref().is_none_or(|row| {
-                !matches!(
-                    row.state,
-                    venue_control_protocol::kol::ExecutorCommandState::Rejected
-                        | venue_control_protocol::kol::ExecutorCommandState::Cancelled
-                )
-            })
-        });
         for (target, id) in &self.pending {
             if let Some(row) = rows.iter().find(|row| {
                 row.request_id.as_ref() == Some(id)
@@ -149,26 +95,6 @@ impl OrderTagState {
         &mut self,
         projection: &venue_control_protocol::kol::TerminalAccountProjection,
     ) {
-        self.submitted_orders.retain(|pending| {
-            if pending.account != projection.trading_account_id
-                || pending.request.credential_id != projection.credential_id
-            {
-                return true;
-            }
-            let Some(receipt) = &pending.receipt else {
-                return true;
-            };
-            let matched = receipt.native_order_id.as_ref().is_some_and(|id| {
-                projection.open_orders.iter().any(|order| {
-                    order.symbol == pending.request.symbol
-                        && order.native_order_id.as_ref() == Some(id)
-                })
-            });
-            let refreshed_after_resolution = receipt.state
-                == venue_control_protocol::kol::ExecutorCommandState::Reconciled
-                && projection.observed_ms >= receipt.updated_ms;
-            !matched && !refreshed_after_resolution
-        });
         self.pending.retain(|(target, _)| {
             target.trading_account_id != projection.trading_account_id
                 || target.credential_id != projection.credential_id
@@ -179,56 +105,6 @@ impl OrderTagState {
         });
         self.uncertain_cancels
             .retain(|id| self.pending.iter().any(|(_, pending)| pending == id));
-    }
-
-    pub(crate) fn append_submitted(
-        &self,
-        model: &crate::model::AppModel,
-        symbol: &str,
-        settings: &super::ChartTradingSettings,
-        overlays: &mut Vec<ChartOverlay>,
-    ) {
-        let language = model.preferences.language;
-        let selected_credential = model
-            .account_overview
-            .as_ref()
-            .and_then(|overview| overview.selected_credential_id.as_deref());
-        for pending in &self.submitted_orders {
-            if model.preferences.execution_account_id.as_deref() != Some(pending.account.as_str())
-                || selected_credential != Some(pending.request.credential_id.as_str())
-                || pending.request.symbol.to_string() != symbol
-            {
-                continue;
-            }
-            let Some(price) = pending.request.limit_price else {
-                continue;
-            };
-            let buy = matches!(
-                pending.request.action,
-                venue_control_protocol::kol::TerminalAction::OpenLong
-                    | venue_control_protocol::kol::TerminalAction::CloseShort
-            );
-            let quote = symbol.split_once('/').map_or("", |(_, quote)| quote);
-            overlays.push(ChartOverlay {
-                price,
-                label: label(language, "只做Maker", "Maker only").into(),
-                color: if buy { theme::BUY } else { theme::SELL },
-                time_ms: None,
-                line: settings.order_lines,
-                tick: false,
-                badge: Some(TradingBadge {
-                    language,
-                    quantity: settings
-                        .order_quantity
-                        .then(|| format!("{} {quote}", pending.request.quote_notional.normalize())),
-                    stale: false,
-                    pending: false,
-                    provisional: true,
-                    pnl: None,
-                    selection: None,
-                }),
-            });
-        }
     }
 }
 
@@ -263,51 +139,67 @@ pub(super) fn draw(
     overlay: &ChartOverlay,
     badge: &TradingBadge,
     price_y: f32,
-    label_y: f32,
     scale: usize,
-) {
+) -> Rect {
     if plot.width() < 120.0 || plot.height() < 24.0 {
-        return;
+        return Rect::NOTHING;
     }
+    let label_y = price_y;
     let language = badge.language;
-    let color = overlay.color;
+    let color = badge
+        .pnl
+        .map_or(overlay.color, crate::execution_view::pnl_color);
     let font = FontId::proportional(11.0);
-    let title = badge.pnl.map_or_else(
-        || format!("{} {}", overlay.label, format_decimal(overlay.price, scale)),
-        |pnl| {
-            format!(
-                "{} {} {:+.2}",
-                overlay.label,
-                label(language, "盈亏", "PnL"),
-                pnl
-            )
-        },
-    );
+    let position = overlay.color == theme::POSITION_LINE;
+    let title = if position {
+        format!(
+            "{}{}",
+            label(language, "盈亏", "PnL "),
+            badge
+                .pnl
+                .map_or_else(|| "—".into(), |pnl| format!("{pnl:+.2}"))
+        )
+    } else {
+        format!("{} {}", overlay.label, format_decimal(overlay.price, scale))
+    };
     let title_galley = painter.layout_no_wrap(title, font.clone(), theme::TEXT_PRIMARY);
     let qty_galley = badge
         .quantity
         .as_ref()
         .map(|quantity| painter.layout_no_wrap(quantity.clone(), FontId::monospace(11.0), color));
-    let grip_width = if badge.selection.is_some() { 16.0 } else { 0.0 };
-    let cancel_width = if badge.selection.is_some() { 24.0 } else { 0.0 };
+    let grip_width = if !position { 14.0 } else { 0.0 };
+    let cancel_width = if position || badge.selection.is_some() {
+        20.0
+    } else {
+        0.0
+    };
+    let reverse_width = if position { 22.0 } else { 0.0 };
+    let left_inset = if position { 0.0 } else { 24.0 };
     let qty_width = qty_galley
         .as_ref()
         .map_or(0.0, |galley| galley.size().x + 16.0)
         .min((plot.width() * 0.3).min(104.0));
-    let title_width = (title_galley.size().x + 14.0)
-        .min((plot.width() - grip_width - qty_width - cancel_width - 12.0).max(24.0));
-    let total = grip_width + title_width + qty_width + cancel_width;
-    let rect = Rect::from_min_size(
-        Pos2::new(plot.left() + 5.0, label_y - 11.0),
-        egui::vec2(total, 22.0),
+    let title_width = (title_galley.size().x + 14.0).min(
+        (plot.width() - left_inset - grip_width - qty_width - cancel_width - reverse_width - 4.0)
+            .max(24.0),
     );
+    let total = grip_width + title_width + qty_width + reverse_width + cancel_width;
+    let rect = Rect::from_min_size(
+        Pos2::new(plot.left() + left_inset, label_y - 10.0),
+        egui::vec2(total, 20.0),
+    );
+    // Price is the label anchor, even when nearby labels overlap.
     let title_rect = Rect::from_min_max(
         rect.min + egui::vec2(grip_width, 0.0),
         Pos2::new(rect.left() + grip_width + title_width, rect.bottom()),
     );
     let cancel_rect =
         Rect::from_min_max(Pos2::new(rect.right() - cancel_width, rect.top()), rect.max);
-    let body = Rect::from_min_max(rect.min, Pos2::new(cancel_rect.left(), rect.bottom()));
+    let reverse_rect = Rect::from_min_max(
+        Pos2::new(cancel_rect.left() - reverse_width, rect.top()),
+        cancel_rect.left_bottom(),
+    );
+    let body = Rect::from_min_max(rect.min, Pos2::new(reverse_rect.left(), rect.bottom()));
     let mut hovered_cancel = false;
     if let Some(selection) = &badge.selection {
         let id = order_id(selection);
@@ -424,28 +316,11 @@ pub(super) fn draw(
             });
         }
     }
-    if (price_y - label_y).abs() > 1.0 {
-        painter.line_segment(
-            [Pos2::new(rect.left() - 3.0, price_y), rect.left_center()],
-            Stroke::new(1.0, color.gamma_multiply(0.6)),
-        );
-    }
-    painter.rect_filled(rect, 4, theme::BG_SECONDARY);
-    let head_color = badge.pnl.map_or(color, |pnl| {
-        if pnl < Decimal::ZERO {
-            theme::SELL
-        } else {
-            theme::BUY
-        }
-    });
+    painter.rect_filled(rect, 3, theme::BG_SECONDARY);
     painter.rect_filled(
         title_rect,
         0,
-        head_color.gamma_multiply(if badge.stale || badge.provisional {
-            0.35
-        } else {
-            0.8
-        }),
+        color.gamma_multiply(if badge.stale { 0.45 } else { 1.0 }),
     );
     painter.with_clip_rect(title_rect.intersect(plot)).galley(
         title_rect.left_center() + egui::vec2(7.0, -title_galley.size().y * 0.5),
@@ -455,7 +330,7 @@ pub(super) fn draw(
     if let Some(galley) = qty_galley {
         painter
             .with_clip_rect(
-                Rect::from_min_max(title_rect.right_top(), cancel_rect.left_bottom())
+                Rect::from_min_max(title_rect.right_top(), reverse_rect.left_bottom())
                     .intersect(plot),
             )
             .galley(
@@ -505,25 +380,113 @@ pub(super) fn draw(
             }
         }
     }
+    if position {
+        use venue_control_protocol::terminal_position::PositionAction;
+        for (button_rect, action, hint) in [
+            (
+                reverse_rect,
+                PositionAction::Reverse,
+                label(
+                    language,
+                    "反开此仓位（需确认）",
+                    "Reverse this position (confirmation required)",
+                ),
+            ),
+            (
+                cancel_rect,
+                PositionAction::Close,
+                label(
+                    language,
+                    "平掉此仓位（需确认）",
+                    "Close this position (confirmation required)",
+                ),
+            ),
+        ] {
+            let enabled = badge.position.is_some() && !badge.stale;
+            let response = ui.interact(
+                button_rect.intersect(plot),
+                ui.id().with((
+                    "chart-position-action",
+                    &overlay.label,
+                    overlay.price.to_string(),
+                    format!("{action:?}"),
+                )),
+                Sense::click(),
+            );
+            response.clone().on_hover_text(if enabled {
+                hint
+            } else {
+                label(
+                    language,
+                    "账户数据待刷新或不支持此操作",
+                    "Awaiting account data or action unavailable",
+                )
+            });
+            if enabled && response.hovered() {
+                painter.rect_filled(button_rect.shrink(1.0), 0, color.gamma_multiply(0.2));
+            }
+            painter.line_segment(
+                [button_rect.left_top(), button_rect.left_bottom()],
+                Stroke::new(1.0, color),
+            );
+            let center = button_rect.center();
+            if action == PositionAction::Close {
+                for direction in [-1.0, 1.0] {
+                    painter.line_segment(
+                        [
+                            center + egui::vec2(-3.0, -3.0 * direction),
+                            center + egui::vec2(3.0, 3.0 * direction),
+                        ],
+                        Stroke::new(1.0, color),
+                    );
+                }
+            } else {
+                for direction in [-1.0, 1.0] {
+                    let x = center.x + direction * 3.0;
+                    let y = center.y + direction * 4.0;
+                    painter.line_segment(
+                        [Pos2::new(x, center.y - direction * 4.0), Pos2::new(x, y)],
+                        Stroke::new(1.0, color),
+                    );
+                    painter.line_segment(
+                        [Pos2::new(x - 2.0, y - direction * 2.0), Pos2::new(x, y)],
+                        Stroke::new(1.0, color),
+                    );
+                    painter.line_segment(
+                        [Pos2::new(x + 2.0, y - direction * 2.0), Pos2::new(x, y)],
+                        Stroke::new(1.0, color),
+                    );
+                }
+            }
+            if enabled && response.clicked() {
+                if let Some(target) = &badge.position {
+                    ui.ctx().data_mut(|data| {
+                        data.insert_temp(action_id().with("position"), (target.clone(), action))
+                    });
+                }
+            }
+        }
+    }
     if badge.stale {
         painter.circle_filled(rect.left_top() + egui::vec2(3.0, 3.0), 2.5, theme::WARNING);
     }
-    let detail = format!(
+    let mut detail = format!(
         "{} · {} · {}",
         overlay.label,
         format_decimal(overlay.price, scale),
-        if badge.provisional {
-            label(
-                language,
-                "价格与金额来自本次请求，以实际委托回报为准",
-                "Price and amount come from this request; exchange confirmation is authoritative",
-            )
-        } else if badge.stale {
+        if badge.stale {
             label(language, "账户数据待刷新", "Account data is stale")
         } else {
             label(language, "已观察委托/持仓", "Observed order/position")
         }
     );
+    if badge.pnl.is_some() {
+        detail.push_str(label(
+            language,
+            " · 浮盈按新鲜最新价估算，行情过期回退签名标记价；不含手续费/资金费",
+            " · Estimated from fresh last price, or signed mark if stale; excludes fees/funding",
+        ));
+    }
     if badge.selection.is_none() {
         ui.interact(
             rect,
@@ -552,30 +515,22 @@ pub(super) fn draw(
             Stroke::new(2.0, color),
         );
     }
-    if !badge.provisional {
-        painter.rect_stroke(
-            rect,
-            4,
-            Stroke::new(
-                1.0,
-                color.gamma_multiply(if badge.stale { 0.55 } else { 1.0 }),
-            ),
-            egui::StrokeKind::Inside,
-        );
-    } else {
-        painter.extend(egui::Shape::dashed_line(
-            &[
-                rect.left_top(),
-                rect.right_top(),
-                rect.right_bottom(),
-                rect.left_bottom(),
-                rect.left_top(),
-            ],
+    painter.rect_stroke(
+        rect,
+        3,
+        Stroke::new(
+            1.0,
+            color.gamma_multiply(if badge.stale { 0.55 } else { 1.0 }),
+        ),
+        egui::StrokeKind::Inside,
+    );
+    if badge.quantity.is_some() {
+        painter.line_segment(
+            [title_rect.right_top(), title_rect.right_bottom()],
             Stroke::new(1.0, color),
-            3.0,
-            3.0,
-        ));
+        );
     }
+    rect
 }
 
 fn preview_price(range: PriceRange, plot: Rect, y: f32, scale: usize) -> Option<Decimal> {
@@ -590,9 +545,19 @@ pub(crate) fn apply_interaction(
     client: &crate::client::ControlClient,
     context: &egui::Context,
 ) {
-    if !model.execution.chart_orders.pending.is_empty()
-        || !model.execution.chart_orders.submitted_orders.is_empty()
-    {
+    type PositionClick = (
+        crate::execution_view::PositionActionDraft,
+        venue_control_protocol::terminal_position::PositionAction,
+    );
+    if let Some((draft, action)) = context.data_mut(|data| {
+        let id = action_id().with("position");
+        let click = data.get_temp::<PositionClick>(id);
+        data.remove::<PositionClick>(id);
+        click
+    }) {
+        crate::execution_view::request_chart_position_action(model, draft, action);
+    }
+    if !model.execution.chart_orders.pending.is_empty() {
         context.request_repaint_after(std::time::Duration::from_millis(100));
     }
     let action = context.data_mut(|data| {

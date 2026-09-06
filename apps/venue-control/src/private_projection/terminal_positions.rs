@@ -51,6 +51,7 @@ mod tests {
             position_mode: TerminalPositionMode::Hedge,
             positions: Vec::new(),
             open_orders: Vec::new(),
+            conditional_orders: Vec::new(),
             fills: Vec::new(),
             position_history: Vec::new(),
             assets: Vec::new(),

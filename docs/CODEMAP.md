@@ -1,6 +1,6 @@
 # VENUE 功能代码地图
 
-本页只定位当前入口与直接依赖。产品范围见 [README](../README.md)，职责见 [架构](ARCHITECTURE.md)，行为与验收见 [KOL MVP](KOL_COPY_MVP.md)、[挂单同步](LEADER_ORDER_MIRROR.md) 和 [Grid 契约](GRID_RUNTIME_REFACTOR.md)。路径均相对仓库根。
+本页只定位当前入口与直接依赖。产品范围见 [README](../README.md)，职责见 [架构](ARCHITECTURE.md)，行为与验收见 [KOL MVP](KOL_COPY_MVP.md)、[人工带单](LEADER_ORDER_MIRROR.md) 和 [Grid 契约](GRID_RUNTIME_REFACTOR.md)。路径均相对仓库根。
 
 当前发布链是 Control + PostgreSQL + 单例 `venue-executor-binance`，由桌面与 Web 消费。先按下面的功能进入代码；旧 Node/Actor/WAL 单列为冻结兼容，不能作为新链模板。
 
@@ -11,7 +11,7 @@
 | Rust workspace、依赖及固定工具链 | `Cargo.toml`、`Cargo.lock`、`rust-toolchain.toml` |
 | 产品版本与发布范围 | `VERSION`、`docs/CHANGELOG.md` |
 | Control HTTP 服务 | `apps/venue-control/src/bin/venue-control-server.rs` |
-| 共享 Executor：私有投影、挂单同步、Grid 与独立策略调度 | `apps/venue-control/src/bin/venue-executor-binance.rs` |
+| 共享 Executor：私有投影、人工带单、Grid 与独立策略调度 | `apps/venue-control/src/bin/venue-executor-binance.rs` |
 | 带单授权、撤权及仅迁移命令 | `apps/venue-control/src/bin/venue-leader-bot-admin.rs`、`apps/venue-control/src/leader_bot_admin.rs` |
 | 版本化迁移及校验 | `apps/venue-control/src/schema.rs`、`apps/venue-control/migrations/`；alpha.28 安装至 0037 |
 | 本地受控构建与缓存准入 | `scripts/Invoke-VenueBuild.ps1`、`scripts/venue_build_guard.ps1` |
@@ -20,17 +20,17 @@
 
 所有 Cargo 操作和固定缓存规则见 [DEVELOPMENT](DEVELOPMENT.md#build-policy)，发布及回滚见 [发布清单](DEVELOPMENT.md#executor-release)。
 
-## 账户、KOL 与挂单同步
+## 账户、KOL 与人工带单
 
 | 功能 | 首要入口与直接契约 |
 |---|---|
 | 用户、会话、密码、凭证密文及归属 | `apps/venue-control/src/accounts/`、`crates/venue-control-protocol/src/accounts.rs` |
 | KOL、邀请、跟随关系和终端投影协议 | `crates/venue-control-protocol/src/kol.rs`；Control 的 accounts、HTTP、repository 边界 |
 | 带单多配置目录与创建/编辑/启停 | `apps/venue-control/src/accounts/leader_bot.rs`、`crates/venue-control-protocol/src/leader_bot.rs`；迁移 0028/0029/0034 |
-| 托管 API 保存、掩码与验证 | `apps/venue-control/src/accounts/managed_followers.rs`；迁移 0030/0031 的 `venue_managed_credentials`，不改写冻结同名旧表 |
-| 托管账户逐账户参数及生命周期 | `apps/venue-control/src/accounts/follow_requests.rs`；迁移 0033；`/v2/kol/managed-followers/follow/{status,settings,lifecycle}` |
+| 跟单 API 授权与托管账户 | `apps/venue-control/src/accounts/{credentials,managed_followers}.rs`、`crates/venue-gateway-binance/src/credential_probe.rs`；迁移 0030/0031/0038，保存定比/定额后验证并自动申请激活，支持余额验证与安全删除 |
+| 托管账户逐账户参数及生命周期 | `apps/venue-control/src/accounts/follow_requests.rs`；迁移 0033；`/v2/kol/managed-followers/follow/{status,settings,lifecycle}`，暂停态仅作为执行安全闸门 |
 | 定比/定额数量 | `crates/venue-control-protocol/src/follow_sizing.rs`、`apps/venue-control/src/order_mirror/planner.rs`；开仓向上取整/最小合规额与回读共用 `apps/venue-control/src/executor_exchange/copy_risk.rs`，回归 `apps/venue-control/src/executor_exchange/copy_rounding_tests.rs`；迁移 0032 |
-| 源/子单映射、替代单、撤单及对账 | `apps/venue-control/src/order_mirror/{mod,planner,store,settlement}.rs` |
+| 限价/市价/止损源单、子单映射、替代单及对账 | `apps/venue-control/src/order_mirror/{mod,planner,extended,store,settlement}.rs`、`executor_exchange/algo.rs`；迁移 0040 |
 | 启用签名基线、空仓与过期请求保护 | `apps/venue-control/src/executor_store/activation.rs` |
 | 关系领取、暂停与 revision 事务顺序 | `apps/venue-control/src/kol_executor/copy_gate.rs` |
 | 旧成交目标模型的历史及未决市价命令恢复 | `apps/venue-control/src/executor_store/{market,copy_targets,copy_drain}.rs`、`executor_exchange/market.rs`；迁移 0025，不是新关系的挂单规划入口 |
@@ -42,8 +42,9 @@
 | 有界持续发现、账户串行和失败隔离 | `apps/venue-control/src/executor_runtime/dispatch.rs` |
 | 命令账本、领取、签名结算和耐久退避 | `apps/venue-control/src/executor_store/`、`executor_runtime/`、`executor_exchange/` |
 | 认证投影、私流成交与 REST 去重 | `apps/venue-control/src/private_projection.rs`、`private_projection/` |
+| 非 Binance 桌面签名账户投影 | `apps/venue-control/src/accounts/strategy_projection.rs`，复用 `StrategyCredentialStore` 与独立策略 Gateway |
 | Binance 权限、统一账户及双向模式 probe | `crates/venue-gateway-binance/src/credential_probe.rs` |
-| 认证私流、签名基线与异常恢复 | `crates/venue-gateway-binance/src/{account_gateway,account_stream_projection,account_gateway_projection,private_ws,readback}.rs` |
+| 认证私流、签名基线与异常恢复 | `crates/venue-gateway-binance/src/{account_gateway,account_gateway_market_recovery,account_gateway_conditional,account_stream_projection,account_gateway_projection,private_ws,readback}.rs` |
 | 原生下单、签名时钟和安全错误码 | `crates/venue-gateway-binance/src/{execution,transport}.rs` |
 | 共享规则目录与后台校时 | `apps/venue-control/src/executor_exchange/catalogue.rs`、`executor_exchange/` |
 | 手动 Post Only 开仓快速路径 | `apps/venue-control/src/executor_exchange/terminal_open.rs`、`crates/venue-gateway-binance/src/execution/terminal_open.rs` |
@@ -78,10 +79,10 @@
 | 私有持仓、委托、成交、资产与历史 | `apps/ui/desktop/src/execution_view.rs`、`client/execution.rs` |
 | 逐行平仓/反开、下单及反馈 | `apps/ui/desktop/src/execution_view/position_actions.rs`、`trade_dock.rs`、`terminal_feedback.rs` |
 | 当前账户 SSE 与写入状态门 | `apps/ui/desktop/src/client/stream_gates.rs`、`ui/status_bar.rs` |
-| 图表与共享指标 | `apps/ui/desktop/src/{chart_view,chart_settings,settings_panel}.rs`、`crates/venue-indicators/src/chart/` |
+| 图表与共享指标 | `apps/ui/desktop/src/{chart_view,chart_settings,settings_panel}.rs`、`chart_trading/{overlays,order_tags}.rs`（委托/持仓标签与价格线）、`crates/venue-indicators/src/chart/` |
 | 服务器配置、公共行情代理、启动和 UI 日志 | `apps/ui/desktop/src/{server_connection,market_client,diagnostics}.rs`、`scripts/Start-VenueFlow.ps1`、`scripts/configure_desktop_https.py` |
 | 用户首页和邀请注册 | `apps/ui/web/app/`、`components/customer-console.tsx`、`lib/customer-server.ts` |
-| 托管账户与定比/定额表单 | `apps/ui/web/components/{managed-followers-panel,managed-follow-settings,follow-sizing-fields}.tsx` |
+| 普通与托管跟单账户的定比/定额授权表单 | `apps/ui/web/components/{customer-console,managed-followers-panel,managed-follow-settings,follow-sizing-fields}.tsx` |
 | 独立运营控制台 `/ops` | `apps/ui/web/components/control-console.tsx`、`lib/projection-scope.ts` |
 | Web 命令、边界扫描与浏览器验证 | `apps/ui/web/package.json`、`apps/ui/web/scripts/verify-boundary.mjs`、`apps/ui/web/e2e/`；见 [WEB](WEB.md) |
 
@@ -103,6 +104,7 @@
 | 迁移、绑定、命令、原命令观察、Bybit 资金费及网格操作工具 | `apps/venue-control/migrations/{0035_multi_venue_executor,0036_strategy_grid}.sql`、`apps/venue-control/src/bin/venue-strategy-admin.rs`；Bybit 资金费协议在 `crates/venue-gateway-bybit/src/funding.rs` |
 | 支撑分批做多规则、持久化、执行与参考行情 | `crates/venue-strategies/src/support_martingale/`、`apps/venue-control/src/support_martingale/`、migration `0037_support_martingale.sql` |
 | 支撑分批协议、用户 API 与桌面闭环 | `crates/venue-control-protocol/src/support_martingale.rs`、`apps/venue-control/src/accounts/support_martingale.rs`、`apps/ui/desktop/src/{support_martingale_view.rs,client/support_martingale.rs}` |
+| 马丁固定价格入场与可选止损扩展 | `support_martingale/planner.rs`、`support_martingale/stop_loss.rs`、`support_martingale/runtime.rs`、migration `0039_martingale_stop_loss.sql`；当前源码扩展，未代表 alpha.28 已部署范围 |
 
 ## 冻结兼容与共享类型
 

@@ -763,6 +763,7 @@ mod tests {
             ],
             position_history: Vec::new(),
             open_orders,
+            conditional_orders: Vec::new(),
             fills: Vec::new(),
             assets: vec![TerminalAsset {
                 asset: "USD".into(),
@@ -834,6 +835,7 @@ mod tests {
                 exchange_time_ms: Some(108 + sequence),
             },
             client_order_id: FieldState::Known(client.into()),
+            order_type: FieldState::Missing,
             original_quantity: FieldState::Known(Decimal::from(2)),
             cumulative_filled_quantity: FieldState::Known(cumulative),
             order_state: FieldState::Known(state),

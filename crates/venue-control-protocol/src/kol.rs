@@ -30,6 +30,7 @@ pub const TERMINAL_PROJECTION_SCHEMA_VERSION: u16 = 1;
 #[serde(rename_all = "snake_case")]
 pub enum TerminalPositionMode {
     Hedge,
+    Net,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -106,6 +107,23 @@ pub struct TerminalOpenOrder {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct TerminalConditionalOrder {
+    pub client_order_id: String,
+    pub native_order_id: String,
+    pub symbol: Symbol,
+    pub order_side: OrderSide,
+    pub position_side: PositionSide,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub quantity: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub trigger_price: Decimal,
+    pub working_type: String,
+    pub reduce_only: bool,
+    pub created_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TerminalFill {
     pub native_trade_id: String,
     pub native_order_id: String,
@@ -144,6 +162,8 @@ pub struct TerminalAccountProjection {
     #[serde(default)]
     pub position_history: Vec<TerminalPositionHistoryEntry>,
     pub open_orders: Vec<TerminalOpenOrder>,
+    #[serde(default)]
+    pub conditional_orders: Vec<TerminalConditionalOrder>,
     pub fills: Vec<TerminalFill>,
     pub assets: Vec<TerminalAsset>,
 }
@@ -157,7 +177,8 @@ impl TerminalAccountProjection {
             || self.persisted_ms < self.observed_ms
             || self.private_generation == 0
             || self.positions.iter().any(|position| {
-                position.position_side == PositionSide::Net
+                (self.position_mode == TerminalPositionMode::Hedge
+                    && position.position_side == PositionSide::Net)
                     || position.quantity == Decimal::MAX
                     || position.quantity == Decimal::MIN
             })
@@ -167,13 +188,25 @@ impl TerminalAccountProjection {
                 .any(|entry| entry.observed_ms == 0)
             || self.open_orders.iter().any(|order| {
                 order.client_order_id.trim().is_empty()
-                    || order.position_side == PositionSide::Net
+                    || (self.position_mode == TerminalPositionMode::Hedge
+                        && order.position_side == PositionSide::Net)
                     || !positive(order.quantity)
+            })
+            || self.conditional_orders.iter().any(|order| {
+                order.client_order_id.trim().is_empty()
+                    || order.native_order_id.trim().is_empty()
+                    || (self.position_mode == TerminalPositionMode::Hedge
+                        && order.position_side == PositionSide::Net)
+                    || !positive(order.quantity)
+                    || !positive(order.trigger_price)
+                    || !matches!(order.working_type.as_str(), "MARK_PRICE" | "CONTRACT_PRICE")
+                    || order.created_ms == Some(0)
             })
             || self.fills.iter().any(|fill| {
                 fill.native_trade_id.trim().is_empty()
                     || fill.native_order_id.trim().is_empty()
-                    || fill.position_side == PositionSide::Net
+                    || (self.position_mode == TerminalPositionMode::Hedge
+                        && fill.position_side == PositionSide::Net)
                     || !positive(fill.quantity)
                     || !positive(fill.price)
             })

@@ -28,12 +28,6 @@ pub(crate) fn collect(
 ) -> Vec<ChartOverlay> {
     let language = model.preferences.language;
     let mut result = Vec::new();
-    if settings.current_orders {
-        model
-            .execution
-            .chart_orders
-            .append_submitted(model, symbol, settings, &mut result);
-    }
     let tick_enabled = settings.price_lines && settings.price_labels && settings.ticks;
     if let Some(projection) = model
         .execution
@@ -49,11 +43,12 @@ pub(crate) fn collect(
             label(language, " · 待刷新", " · stale")
         };
         if settings.current_orders {
-            for order in projection
-                .open_orders
-                .iter()
-                .filter(|order| order.symbol.to_string() == symbol)
-            {
+            for order in projection.open_orders.iter().filter(|order| {
+                order.symbol.to_string() == symbol
+                    && order
+                        .filled_quantity
+                        .is_none_or(|filled| filled < order.quantity)
+            }) {
                 let Some(price) = order.limit_price.filter(|price| *price > Decimal::ZERO) else {
                     continue;
                 };
@@ -101,8 +96,8 @@ pub(crate) fn collect(
                         pending: selection.as_ref().is_some_and(|selection| {
                             model.execution.chart_orders.is_pending(selection)
                         }),
-                        provisional: false,
                         pnl: None,
+                        position: None,
                         selection,
                     }),
                 });
@@ -125,7 +120,7 @@ pub(crate) fn collect(
                         label(language, "空仓", "Short")
                     }
                     .into(),
-                    color: if long { theme::BUY } else { theme::SELL },
+                    color: theme::POSITION_LINE,
                     time_ms: None,
                     line: true,
                     tick: tick_enabled && settings.tick_positions,
@@ -134,9 +129,11 @@ pub(crate) fn collect(
                         quantity: Some(position.quantity.normalize().to_string()),
                         stale: !fresh,
                         pending: false,
-                        provisional: false,
                         selection: None,
-                        pnl: crate::execution_view::position_pnl_value(position),
+                        pnl: crate::execution_view::live_position_pnl_value(model, position),
+                        position: crate::execution_view::chart_position_draft(
+                            model, projection, position,
+                        ),
                     }),
                 });
             }
@@ -252,15 +249,10 @@ pub(crate) fn draw(
     settings: &ChartTradingSettings,
 ) {
     let painter = painter.with_clip_rect(rect);
-    let mut label_rows = Vec::<f32>::new();
+    let mut occupied = Vec::<Rect>::new();
+    let mut price_lines = Vec::new();
     let mut sorted = overlays.iter().enumerate().collect::<Vec<_>>();
-    sorted.sort_by(|(_, a), (_, b)| {
-        b.badge
-            .as_ref()
-            .is_some_and(|badge| badge.provisional)
-            .cmp(&a.badge.as_ref().is_some_and(|badge| badge.provisional))
-            .then_with(|| b.price.cmp(&a.price))
-    });
+    sorted.sort_by(|(_, a), (_, b)| b.price.cmp(&a.price));
     for (index, overlay) in sorted {
         let Some(raw_y) =
             range.price_to_y(rect.top(), rect.height(), decimal_to_f64(overlay.price))
@@ -268,12 +260,7 @@ pub(crate) fn draw(
             continue;
         };
         let off_scale = raw_y < rect.top() || raw_y > rect.bottom();
-        if off_scale
-            && !overlay
-                .badge
-                .as_ref()
-                .is_some_and(|badge| badge.provisional)
-        {
+        if off_scale {
             continue;
         }
         let y = raw_y.clamp(rect.top(), rect.bottom());
@@ -310,43 +297,22 @@ pub(crate) fn draw(
             .on_hover_text(&overlay.label);
             continue;
         }
-        if overlay.line && !off_scale {
-            painter.extend(egui::Shape::dashed_line(
-                &[Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
-                Stroke::new(1.0, overlay.color),
-                4.0,
-                3.0,
-            ));
-        }
         if overlay.label.is_empty() {
-            continue;
-        }
-        let mut label_y = y.clamp(rect.top() + 12.0, rect.bottom() - 12.0);
-        for _ in 0..label_rows.len() {
-            if label_rows
-                .iter()
-                .all(|other| (label_y - other).abs() >= 24.0)
-            {
-                break;
+            if overlay.line {
+                price_lines.push((y, overlay.color, rect.left() - 2.0));
             }
-            label_y += 24.0;
-        }
-        if label_y > rect.bottom() - 12.0 {
             continue;
         }
-        label_rows.push(label_y);
+        let label_y = y;
         if let Some(badge) = &overlay.badge {
-            super::order_tags::draw(
-                ui,
-                &painter,
-                rect,
-                range,
-                overlay,
-                badge,
-                y,
-                label_y,
-                price_scale,
-            );
+            let badge_rect =
+                super::order_tags::draw(ui, &painter, rect, range, overlay, badge, y, price_scale);
+            if badge_rect.is_positive() {
+                occupied.push(badge_rect);
+            }
+            if overlay.line && badge_rect.is_positive() {
+                price_lines.push((y, overlay.color, badge_rect.right()));
+            }
             continue;
         }
         let text = format!(
@@ -359,6 +325,10 @@ pub(crate) fn draw(
             Pos2::new(rect.left() + 5.0, label_y - 8.0),
             galley.size() + egui::vec2(8.0, 4.0),
         );
+        occupied.push(label_rect);
+        if overlay.line {
+            price_lines.push((y, overlay.color, label_rect.right()));
+        }
         painter.rect_filled(label_rect, 2, theme::BG_SECONDARY);
         painter.galley(label_rect.min + egui::vec2(4.0, 2.0), galley, overlay.color);
         if settings.price_labels && overlay.tick {
@@ -373,6 +343,112 @@ pub(crate) fn draw(
                 FontId::monospace(11.0),
                 overlay.color,
             );
+        }
+    }
+    for (y, color, start) in price_lines {
+        let mut gaps = occupied
+            .iter()
+            .filter(|rect| rect.top() <= y && rect.bottom() >= y)
+            .map(|rect| (rect.left() - 2.0, rect.right() + 2.0))
+            .collect::<Vec<_>>();
+        gaps.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut left = start + 2.0;
+        for (gap_left, gap_right) in gaps {
+            draw_dash(&painter, left, gap_left.min(rect.right()), y, color);
+            left = left.max(gap_right);
+        }
+        draw_dash(&painter, left, rect.right(), y, color);
+    }
+}
+
+fn draw_dash(painter: &egui::Painter, left: f32, right: f32, y: f32, color: Color32) {
+    if right > left {
+        // egui rounds both ends to pixel centers. A one-point dash can collapse to
+        // zero length, so retain at least two physical pixels at every UI scale.
+        let minimum_dash = 2.0 / painter.ctx().pixels_per_point();
+        let dash = if color == theme::TEXT_SECONDARY {
+            4.0_f32
+        } else {
+            3.0_f32
+        };
+        painter.extend(egui::Shape::dashed_line(
+            &[Pos2::new(left, y), Pos2::new(right, y)],
+            Stroke::new(1.25, color),
+            dash.max(minimum_dash),
+            3.0,
+        ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn price_line_mesh_survives_pixel_rounding_at_multiple_scales() {
+        for scale in [0.75, 1.0, 1.25, 1.5, 2.0] {
+            for offset in [0.0, 0.25, 0.5, 0.75] {
+                for color in [
+                    theme::BUY,
+                    theme::SELL,
+                    theme::POSITION_LINE,
+                    theme::TEXT_SECONDARY,
+                ] {
+                    let context = egui::Context::default();
+                    context.set_pixels_per_point(scale);
+                    let mut output = context.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                egui::vec2(400.0, 200.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            draw_dash(ui.painter(), 100.0 + offset, 300.0, 80.0, color);
+                        },
+                    );
+                    output.textures_delta.clear();
+                    let shapes = output.shapes.into_iter().filter(|shape| matches!(
+                        &shape.shape, egui::Shape::LineSegment { stroke, .. } if stroke.color == color
+                    )).collect();
+                    let meshes = context.tessellate(shapes, scale);
+                    let mut visible_area = 0.0;
+                    let mut rightmost = 0.0_f32;
+                    for primitive in meshes {
+                        if let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive {
+                            for triangle in mesh.indices.chunks_exact(3) {
+                                let a = mesh.vertices[triangle[0] as usize];
+                                let b = mesh.vertices[triangle[1] as usize];
+                                let c = mesh.vertices[triangle[2] as usize];
+                                if ![a, b, c].iter().any(|v| {
+                                    v.color.a() > 0
+                                        && v.color.r() == color.r()
+                                        && v.color.g() == color.g()
+                                        && v.color.b() == color.b()
+                                }) {
+                                    continue;
+                                }
+                                let ab = b.pos - a.pos;
+                                let ac = c.pos - a.pos;
+                                let area = (ab.x * ac.y - ab.y * ac.x).abs() * 0.5;
+                                visible_area += area;
+                                if area > 0.0 {
+                                    rightmost = rightmost.max(a.pos.x.max(b.pos.x).max(c.pos.x));
+                                }
+                            }
+                        }
+                    }
+                    assert!(
+                        visible_area > 20.0,
+                        "invisible dashes: scale={scale}, offset={offset}, color={color:?}, area={visible_area}"
+                    );
+                    assert!(
+                        rightmost > 290.0,
+                        "line did not reach the right edge: {rightmost}"
+                    );
+                }
+            }
         }
     }
 }

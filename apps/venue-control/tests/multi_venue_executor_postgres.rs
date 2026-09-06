@@ -33,6 +33,9 @@ const VENUES: [VenueId; 5] = [
 
 static NEXT_ACCOUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+#[path = "support/martingale_stop_loss.rs"]
+mod martingale_stop_loss;
+
 struct Fixture {
     pool: PgPool,
     admin: PgPool,
@@ -702,6 +705,8 @@ async fn support_martingale_create_lifecycle_budget_and_support_identity_are_dur
         request_id: "qa_create".into(),
         credential_id: credential,
         config: SupportMartingaleConfig {
+            entry_mode: Default::default(),
+            symbol_parameters: Vec::new(),
             reference_venue: VenueId::Binance,
             execution_venue: VenueId::Bybit,
             symbols: symbols.clone(),

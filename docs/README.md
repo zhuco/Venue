@@ -8,7 +8,7 @@
 | 桌面与 Web 应该改哪一端 | [UI 入口](../apps/ui/README.md) |
 | 如何注册、绑定和验证账户 | [账户与 API 管理](ACCOUNT_MANAGEMENT.md) |
 | KOL 产品流程和验收要求 | [KOL MVP](KOL_COPY_MVP.md) |
-| 如何授权、配置和启停带单机器人 | [带单机器人与挂单同步](LEADER_ORDER_MIRROR.md) |
+| 如何授权、配置和启停带单机器人 | [人工带单与订单同步](LEADER_ORDER_MIRROR.md) |
 | 进程如何协作、功能代码在哪里 | [架构](ARCHITECTURE.md)、[CODEMAP](CODEMAP.md) |
 | Grid 如何规划和运行 | [Grid 调用链](ARCHITECTURE.md#grid-flow) / [Grid 行为契约](GRID_RUNTIME_REFACTOR.md) |
 | 独立多交易所命令、网格与账户准入 | [多交易所执行](MULTI_VENUE_EXECUTOR.md) |

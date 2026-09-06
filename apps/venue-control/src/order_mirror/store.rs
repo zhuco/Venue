@@ -102,7 +102,11 @@ pub async fn run_order_mirror(
             };
         let mut turns = stream::iter(relations.into_iter().map(|relation| {
             let pool = pool.clone();
-            async move { plan_relation(&pool, &relation, now).await }
+            async move {
+                let ordinary = plan_relation(&pool, &relation, now).await?;
+                let extended = super::extended::plan_relation(&pool, &relation, now).await?;
+                Ok::<bool, Error>(ordinary || extended)
+            }
         }))
         .buffer_unordered(8);
         while let Some(result) = turns.next().await {
@@ -193,7 +197,7 @@ pub(super) async fn plan_relation(pool: &PgPool, relation: &str, now: u64) -> Re
                 .map(|id| ((order.symbol.to_string(), id.clone()), order.clone()))
         })
         .collect();
-    let mirrors=sqlx::query("SELECT m.*,c.command_state AS place_state FROM venue_order_mirrors m LEFT JOIN venue_binance_commands c ON c.command_id=m.child_client_order_id WHERE m.relation_id=$1 ORDER BY m.symbol,m.source_order_id,m.child_sequence FOR UPDATE OF m")
+    let mirrors=sqlx::query("SELECT m.*,c.command_state AS place_state FROM venue_order_mirrors m LEFT JOIN venue_binance_commands c ON c.command_id=m.child_client_order_id WHERE m.relation_id=$1 AND m.source_kind='limit' ORDER BY m.symbol,m.source_order_id,m.child_sequence FOR UPDATE OF m")
         .bind(relation).fetch_all(&mut *tx).await.map_err(unavailable)?;
     let mut latest = BTreeMap::new();
     let mut filled = BTreeMap::<(String, String), Decimal>::new();

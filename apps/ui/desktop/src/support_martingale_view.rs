@@ -13,6 +13,7 @@ use eframe::egui;
 use venue_control_protocol::{
     accounts::CredentialSummary,
     support_martingale::{
+        MartingaleEntryMode, MartingaleStopLoss, MartingaleSymbolParameters,
         SupportMartingaleAction, SupportMartingaleHealth, SupportMartingaleLifecycle,
         SupportMartingalePreflightCheckCode as CheckCode,
         SupportMartingalePreflightCheckStatus as CheckStatus, SupportMartingalePreflightResponse,
@@ -34,6 +35,28 @@ struct Editor {
     target_profit_rate: String,
     minimum_profit_quote: String,
     max_active_positions: String,
+    entry_mode: MartingaleEntryMode,
+    symbol_parameters: BTreeMap<String, SymbolEditor>,
+}
+
+#[derive(Clone, Debug)]
+struct SymbolEditor {
+    entry_price: String,
+    add_drop_percent: String,
+    stop_enabled: bool,
+    stop_fixed: bool,
+    stop_value: String,
+}
+impl Default for SymbolEditor {
+    fn default() -> Self {
+        Self {
+            entry_price: String::new(),
+            add_drop_percent: "2".into(),
+            stop_enabled: false,
+            stop_fixed: false,
+            stop_value: "10".into(),
+        }
+    }
 }
 
 impl Editor {
@@ -49,6 +72,8 @@ impl Editor {
             target_profit_rate: "0.005".into(),
             minimum_profit_quote: "0.02".into(),
             max_active_positions: "2".into(),
+            entry_mode: MartingaleEntryMode::Support,
+            symbol_parameters: BTreeMap::new(),
         }
     }
 
@@ -72,6 +97,40 @@ impl Editor {
                 .map_err(|_| "金额和比率必须是十进制数".to_owned())
         };
         let config = SupportMartingaleConfig {
+            entry_mode: self.entry_mode,
+            symbol_parameters: symbols
+                .iter()
+                .map(|symbol: &venue_domain::Symbol| {
+                    let value = self
+                        .symbol_parameters
+                        .get(&symbol.to_string())
+                        .cloned()
+                        .unwrap_or_default();
+                    let entry_price = if self.entry_mode == MartingaleEntryMode::FixedPrice {
+                        Some(decimal(&value.entry_price)?)
+                    } else {
+                        None
+                    };
+                    let stop_loss = if !value.stop_enabled {
+                        None
+                    } else if value.stop_fixed {
+                        Some(MartingaleStopLoss::FixedPrice {
+                            price: decimal(&value.stop_value)?,
+                        })
+                    } else {
+                        Some(MartingaleStopLoss::AveragePricePercent {
+                            rate: decimal(&value.stop_value)? / rust_decimal::Decimal::from(100),
+                        })
+                    };
+                    Ok(MartingaleSymbolParameters {
+                        symbol: symbol.clone(),
+                        entry_price,
+                        add_drop_rate: decimal(&value.add_drop_percent)?
+                            / rust_decimal::Decimal::from(100),
+                        stop_loss,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
             reference_venue: VenueId::Binance,
             execution_venue: VenueId::Bybit,
             symbols,
@@ -117,6 +176,7 @@ pub(crate) struct SupportMartingaleViewState {
     editor: Option<Editor>,
     preflights: BTreeMap<String, SupportMartingalePreflightResponse>,
     start_confirmation: Option<String>,
+    selected_instance_id: Option<String>,
 }
 
 impl SupportMartingaleViewState {
@@ -184,6 +244,76 @@ impl SupportMartingaleViewState {
     }
 }
 
+pub(crate) fn can_create(model: &AppModel, credential: &CredentialSummary) -> bool {
+    credential.venue == VenueId::Bybit
+        && credential.trading_account_id.is_some()
+        && credential.selectable(crate::account_center::now_ms())
+        && !model.execution.support_martingale.is_pending()
+}
+
+pub(crate) fn open_create(model: &mut AppModel, credential: &CredentialSummary) {
+    if let Some(account) = &credential.trading_account_id {
+        model.execution.support_martingale.editor = Some(Editor::create(credential, account));
+        model.execution.support_martingale.selected_instance_id = None;
+    }
+}
+
+pub(crate) fn clear_selection(model: &mut AppModel) {
+    model.execution.support_martingale.selected_instance_id = None;
+}
+
+pub(crate) fn list_row(
+    ui: &mut egui::Ui,
+    model: &mut AppModel,
+    credential: &CredentialSummary,
+    item: &SupportMartingaleListItem,
+) {
+    let selected = model
+        .execution
+        .support_martingale
+        .selected_instance_id
+        .as_deref()
+        == Some(&item.instance_id);
+    if ui
+        .selectable_label(
+            selected,
+            format!(
+                "马丁 · {}",
+                item.instance_id.chars().take(8).collect::<String>()
+            ),
+        )
+        .clicked()
+    {
+        crate::grid_view::clear_selection(model);
+        crate::leader_bot_view::clear_selection(model);
+        model.execution.support_martingale.selected_instance_id = Some(item.instance_id.clone());
+    }
+    ui.label("马丁做多");
+    ui.label(&credential.label);
+    ui.label(
+        item.config
+            .symbols
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    ui.label(lifecycle_label(item.lifecycle));
+    ui.label(format!("预留 {}", item.reserved_budget));
+    ui.label(item.revision.to_string());
+    ui.label(health_label(item.health)).on_hover_text(
+        item.health_reason
+            .as_deref()
+            .map(health_reason_label)
+            .unwrap_or(""),
+    );
+    if ui.button("管理").clicked() {
+        crate::grid_view::clear_selection(model);
+        crate::leader_bot_view::clear_selection(model);
+        model.execution.support_martingale.selected_instance_id = Some(item.instance_id.clone());
+    }
+}
+
 pub(crate) fn show(
     ui: &mut egui::Ui,
     model: &mut AppModel,
@@ -191,73 +321,104 @@ pub(crate) fn show(
     credential: &CredentialSummary,
     account_id: &str,
 ) {
-    let credential_ready = credential.venue == VenueId::Bybit
-        && credential.trading_account_id.as_deref() == Some(account_id)
-        && credential.selectable(crate::account_center::now_ms());
-    ui.horizontal_wrapped(|ui| {
-        ui.strong("支撑分批做多");
-        ui.weak("Binance USD-M 参考行情 · Bybit LIVE 执行");
-        if ui
-            .add_enabled(
-                credential_ready && !model.execution.support_martingale.is_pending(),
-                egui::Button::new("新建策略"),
-            )
-            .on_disabled_hover_text("请选择已验证的 Bybit 双向持仓 LIVE 账户")
-            .clicked()
-        {
-            model.execution.support_martingale.editor =
-                Some(Editor::create(credential, account_id));
-        }
-    });
-    for message in [
-        model
-            .execution
-            .support_martingale
-            .operation_error
-            .as_deref(),
-        model.execution.support_martingale.load_error.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        ui.colored_label(theme::WARNING, message);
-    }
-    if let Some(notice) = model.execution.support_martingale.notice.as_deref() {
-        ui.weak(notice);
-    }
-    if !model.execution.support_martingale.fresh {
-        ui.weak("实例列表尚未取得新鲜响应；旧状态仅供查看，操作结果不会冒充成交。")
-            .on_hover_text("Control 或网络恢复后会重新读取；不会自动重发控制请求或交易命令。");
-    }
-
-    let instances = model
+    let selected = model
+        .execution
+        .support_martingale
+        .selected_instance_id
+        .clone();
+    if let Some(item) = model
         .execution
         .support_martingale
         .instances
         .iter()
-        .filter(|item| item.trading_account_id == account_id)
+        .find(|item| {
+            Some(&item.instance_id) == selected.as_ref() && item.trading_account_id == account_id
+        })
         .cloned()
-        .collect::<Vec<_>>();
-    if instances.is_empty() {
-        ui.weak("当前账户暂无支撑分批实例");
-    } else {
-        egui::Grid::new("support-martingale-list")
-            .striped(true)
-            .show(ui, |ui| {
-                ui.strong("执行所");
-                ui.strong("状态");
-                ui.strong("交易对");
-                ui.strong("预留");
-                ui.strong("操作与预检");
-                ui.end_row();
-                for item in &instances {
-                    row(ui, model, client, item);
-                    ui.end_row();
+    {
+        let mut open = true;
+        egui::Window::new("马丁做多管理")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .vscroll(true)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "账户：{} · {}",
+                    credential.label,
+                    item.execution_venue.as_str()
+                ));
+                ui.label(format!(
+                    "交易对：{}",
+                    item.config
+                        .symbols
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                ui.label(format!(
+                    "总预算 {} · 首仓 {} · 层数 {} · 倍率 {}",
+                    item.config.total_budget,
+                    item.config.first_order_notional,
+                    item.config.max_entries,
+                    item.config.size_multiplier
+                ));
+                ui.label(format!(
+                    "止盈率 {} · 最低止盈 {}",
+                    item.config.target_profit_rate, item.config.minimum_profit_quote
+                ));
+                configuration_summary(ui, &item.config);
+                ui.separator();
+                ui.vertical(|ui| row(ui, model, client, &item));
+                for message in [
+                    model
+                        .execution
+                        .support_martingale
+                        .operation_error
+                        .as_deref(),
+                    model.execution.support_martingale.load_error.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    ui.colored_label(theme::WARNING, message);
+                }
+                if let Some(notice) = &model.execution.support_martingale.notice {
+                    ui.weak(notice);
                 }
             });
+        if !open {
+            model.execution.support_martingale.selected_instance_id = None;
+        }
     }
     start_confirmation(ui, model, client);
     editor(ui, model, client, credential, account_id);
+}
+
+fn configuration_summary(ui: &mut egui::Ui, config: &SupportMartingaleConfig) {
+    ui.label(match config.entry_mode {
+        MartingaleEntryMode::Support => "入场：支撑位做多",
+        MartingaleEntryMode::FixedPrice => "入场：固定价格做多",
+    });
+    for parameters in &config.symbol_parameters {
+        if let Some(price) = parameters.entry_price {
+            ui.label(format!(
+                "{} 首仓价 {} · 补仓跌幅 {}%",
+                parameters.symbol,
+                price,
+                parameters.add_drop_rate * rust_decimal::Decimal::from(100)
+            ));
+        }
+        let stop = match parameters.stop_loss {
+            None => "止损未启用".to_owned(),
+            Some(MartingaleStopLoss::FixedPrice { price }) => format!("固定止损价 {price}"),
+            Some(MartingaleStopLoss::AveragePricePercent { rate }) => {
+                format!("均价下跌 {}% 止损", rate * rust_decimal::Decimal::from(100))
+            }
+        };
+        ui.label(format!("{} · {stop}", parameters.symbol));
+    }
 }
 
 fn row(
@@ -392,7 +553,7 @@ fn start_confirmation(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlC
     let mut close = item.is_none();
     let mut confirm = false;
     if let Some(item) = item.as_ref() {
-        egui::Window::new("确认启动支撑分批做多")
+        egui::Window::new("确认启动马丁做多")
             .collapsible(false)
             .resizable(false)
             .show(ui.ctx(), |ui| {
@@ -405,9 +566,10 @@ fn start_confirmation(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlC
                     item.config.max_entries,
                     item.config.size_multiplier
                 ));
+                configuration_summary(ui, &item.config);
                 ui.colored_label(
                     theme::WARNING,
-                    "下跌中已有仓位仍可能补仓；无自动止损，不限制持仓时间。",
+                    "下跌中已有仓位仍可能补仓；止损仅对已启用的币种生效，由服务器监控，不限制持仓时间。",
                 );
                 ui.weak("启动只允许未来新信号。服务端会再次核对 LIVE、账户排他和签名事实。");
                 ui.horizontal(|ui| {
@@ -468,12 +630,13 @@ fn editor(
     let current = draft.is_current(credential, account_id);
     let mut close = false;
     let mut submit = false;
-    egui::Window::new("支撑分批做多配置")
+    egui::Window::new("新建机器人 · 马丁做多")
+        .default_width((ui.ctx().content_rect().width() - 64.0).clamp(240.0, 460.0))
         .collapsible(false)
         .resizable(true)
         .show(ui.ctx(), |ui| {
             egui::ScrollArea::vertical()
-                .max_height(420.0)
+                .max_height((ui.ctx().content_rect().height() - 160.0).clamp(120.0, 420.0))
                 .show(ui, |ui| {
                     ui.label("参考行情固定为 Binance USD-M；当前执行所为 Bybit LIVE。");
                     for (label, value) in [
@@ -489,10 +652,36 @@ fn editor(
                         ui.label(label);
                         ui.text_edit_singleline(value);
                     }
+                    ui.horizontal(|ui| {
+                        ui.label("入场方式");
+                        ui.selectable_value(&mut draft.entry_mode, MartingaleEntryMode::Support, "支撑位做多");
+                        ui.selectable_value(&mut draft.entry_mode, MartingaleEntryMode::FixedPrice, "固定价格做多");
+                    });
+                    for symbol in draft.symbols.split(',').map(|s| s.trim().to_ascii_uppercase()).filter(|s| !s.is_empty()) {
+                        let parameters = draft.symbol_parameters.entry(symbol.clone()).or_default();
+                        ui.push_id(&symbol, |ui| ui.group(|ui| {
+                            ui.strong(&symbol);
+                            if draft.entry_mode == MartingaleEntryMode::FixedPrice {
+                                ui.label("首仓触发价（现价不高于此价时市价入场）");
+                                ui.text_edit_singleline(&mut parameters.entry_price);
+                                ui.label("每层相对上一层触发价下跌（%）");
+                                ui.text_edit_singleline(&mut parameters.add_drop_percent);
+                            }
+                            ui.checkbox(&mut parameters.stop_enabled, "启用止损");
+                            if parameters.stop_enabled {
+                                ui.horizontal(|ui| {
+                                    ui.selectable_value(&mut parameters.stop_fixed, false, "均价下跌百分比");
+                                    ui.selectable_value(&mut parameters.stop_fixed, true, "固定止损价格");
+                                });
+                                ui.label(if parameters.stop_fixed { "止损价格" } else { "均价下跌（%）" });
+                                ui.text_edit_singleline(&mut parameters.stop_value);
+                            }
+                        }));
+                    }
                     ui.weak("保存只建立停止态实例，不执行预检、不启动、不下单。");
                     ui.colored_label(
                         theme::WARNING,
-                        "无自动止损、无持仓超时；大周期下跌时已有仓位仍可能在新支撑补仓。",
+                        "止损由服务器按签名标记价监控，触发后先撤止盈再市价减仓；可能滑点，离线期间无法触发。未启用止损的币种仍可能持续持仓。",
                     );
                     if !current {
                         ui.colored_label(
@@ -639,6 +828,7 @@ fn health_reason_label(value: &str) -> &str {
     match value {
         "external_open_order" => "检测到实例外开放订单，已停止增险",
         "unexpected_position" => "持仓方向或腿位与策略不符",
+        "stop_loss_rejected" => "止损请求被拒绝；已暂停增险，需人工处理",
         "external_position" => "检测到未归属本实例的持仓",
         "symbol_state_missing" => "逐币持久状态缺失",
         other => other,
@@ -664,12 +854,48 @@ mod tests {
             dual_position: true,
             account_mode: Some("hedge".into()),
             has_exposure: Some(false),
+            equity: None,
+            available_margin: None,
+            balance_observed_ms: None,
         }
     }
 
     #[test]
     fn default_config_accepts_bound_two_symbol_account() {
         assert!(Editor::create(&credential(), "account").config().is_ok());
+    }
+
+    #[test]
+    fn fixed_editor_serializes_each_symbols_entry_and_stop()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut editor = Editor::create(&credential(), "account");
+        editor.symbols = "SOL/USDT".into();
+        editor.entry_mode = MartingaleEntryMode::FixedPrice;
+        editor.max_active_positions = "1".into();
+        editor.symbol_parameters.insert(
+            "SOL/USDT".into(),
+            SymbolEditor {
+                entry_price: "100".into(),
+                add_drop_percent: "2.5".into(),
+                stop_enabled: true,
+                stop_fixed: false,
+                stop_value: "10".into(),
+            },
+        );
+        let config = editor.config()?;
+        let parameters = &config.symbol_parameters[0];
+        assert_eq!(
+            parameters.entry_price,
+            Some(rust_decimal::Decimal::from(100))
+        );
+        assert_eq!(parameters.add_drop_rate, rust_decimal::Decimal::new(25, 3));
+        assert_eq!(
+            parameters
+                .stop_loss
+                .and_then(|sl| sl.trigger_price(rust_decimal::Decimal::from(80))),
+            Some(rust_decimal::Decimal::from(72))
+        );
+        Ok(())
     }
 
     #[test]

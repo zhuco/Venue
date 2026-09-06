@@ -20,7 +20,7 @@ impl AccountService {
             tx.commit().await.map_err(database_error)?;
             return Ok(summary);
         }
-        let account: String = sqlx::query_scalar("SELECT trading_account_id FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND deleted_ms IS NULL AND trading_account_id IS NOT NULL AND verification_json->>'verification'='verified'")
+        let account: String = sqlx::query_scalar("SELECT trading_account_id FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND EXISTS (SELECT 1 FROM venue_user_trading_accounts a WHERE a.trading_account_id=venue_api_credentials.trading_account_id AND a.user_id=venue_api_credentials.user_id AND a.venue='binance') AND deleted_ms IS NULL AND trading_account_id IS NOT NULL AND verification_json->>'verification'='verified'")
             .bind(&request.credential_id).bind(owner).fetch_optional(&mut *tx)
             .await.map_err(database_error)?.ok_or(error(Code::VerificationRequired))?;
         let depth = lock_account_command_queue(&mut tx, owner, &account, &request.credential_id)

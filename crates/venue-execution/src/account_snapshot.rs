@@ -42,6 +42,38 @@ pub struct SignedAccountOrderFact {
     pub filled_quantity: Option<Decimal>,
 }
 
+/// Current exchange-native stop order. Conditional orders use a distinct native identity and
+/// lifecycle from ordinary orders, so a caller cannot accidentally cancel one through the
+/// regular-order surface.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SignedConditionalOrderFact {
+    pub client_order_id: String,
+    pub venue_order_id: String,
+    pub symbol: Symbol,
+    pub side: OrderSide,
+    pub position_side: PositionSide,
+    pub quantity: Decimal,
+    pub trigger_price: Decimal,
+    pub working_type: String,
+    pub reduce_only: bool,
+    pub created_at_ms: Option<u64>,
+}
+
+/// Authenticated identity of a source market order recovered from its signed order readback.
+/// The first execution price is retained only as the proportional-copy reference; fills remain
+/// the durable inventory facts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SignedMarketOrderFact {
+    pub client_order_id: String,
+    pub venue_order_id: String,
+    pub symbol: Symbol,
+    pub side: OrderSide,
+    pub position_side: PositionSide,
+    pub quantity: Decimal,
+    pub reference_price: Decimal,
+    pub created_at_ms: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SignedAccountBalance {
     pub asset: Asset,
@@ -109,6 +141,10 @@ pub struct SignedAccountSnapshot {
     rules_generation: u64,
     position_mode: SignedAccountPositionMode,
     open_orders: Vec<SignedAccountOrderFact>,
+    #[serde(default)]
+    conditional_orders: Vec<SignedConditionalOrderFact>,
+    #[serde(default)]
+    market_orders: Vec<SignedMarketOrderFact>,
     positions: Vec<SignedAccountPositionFact>,
     fills: Vec<Fill>,
     fills_cursor: String,
@@ -226,6 +262,8 @@ impl SignedAccountSnapshot {
             rules_generation,
             position_mode,
             open_orders,
+            conditional_orders: Vec::new(),
+            market_orders: Vec::new(),
             positions,
             fills,
             fills_cursor,
@@ -288,6 +326,59 @@ impl SignedAccountSnapshot {
     #[must_use]
     pub fn open_orders(&self) -> &[SignedAccountOrderFact] {
         &self.open_orders
+    }
+
+    #[must_use]
+    pub fn conditional_orders(&self) -> &[SignedConditionalOrderFact] {
+        &self.conditional_orders
+    }
+
+    #[must_use]
+    pub fn market_orders(&self) -> &[SignedMarketOrderFact] {
+        &self.market_orders
+    }
+
+    pub fn with_conditional_orders(
+        mut self,
+        orders: Vec<SignedConditionalOrderFact>,
+    ) -> Result<Self, AccountHostValidationError> {
+        let mut identities = BTreeMap::new();
+        if orders.iter().any(|order| {
+            order.client_order_id.trim().is_empty()
+                || order.venue_order_id.trim().is_empty()
+                || !order.quantity.is_sign_positive()
+                || !order.trigger_price.is_sign_positive()
+                || !matches!(order.working_type.as_str(), "MARK_PRICE" | "CONTRACT_PRICE")
+                || order.created_at_ms == Some(0)
+                || identities
+                    .insert((order.symbol.clone(), order.venue_order_id.clone()), ())
+                    .is_some()
+        }) {
+            return Err(AccountHostValidationError::SignedSnapshot);
+        }
+        self.conditional_orders = orders;
+        Ok(self)
+    }
+
+    pub fn with_market_orders(
+        mut self,
+        orders: Vec<SignedMarketOrderFact>,
+    ) -> Result<Self, AccountHostValidationError> {
+        let mut identities = BTreeMap::new();
+        if orders.iter().any(|order| {
+            order.client_order_id.trim().is_empty()
+                || order.venue_order_id.trim().is_empty()
+                || !order.quantity.is_sign_positive()
+                || !order.reference_price.is_sign_positive()
+                || order.created_at_ms == 0
+                || identities
+                    .insert((order.symbol.clone(), order.venue_order_id.clone()), ())
+                    .is_some()
+        }) {
+            return Err(AccountHostValidationError::SignedSnapshot);
+        }
+        self.market_orders = orders;
+        Ok(self)
     }
 
     /// Host-only normalization of signed adapter facts. Gateway-provided ownership is never

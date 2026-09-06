@@ -19,13 +19,14 @@ use venue_domain::domain::{
 use venue_gateway_binance::{BinanceAccountGateway, BinanceCredentials};
 use venue_gateway_binance::{
     BinanceCancelIntent, BinanceHttpTransport, BinanceMarketIntent, BinancePhysicalMutationOutcome,
-    BinancePlaceIntent, BinancePrivateReadScope, BinanceTimeInForce, BinanceTransportError,
-    build_account_config_request, build_account_request, build_account_wide_algo_orders_request,
-    build_account_wide_positions_request, build_account_wide_regular_orders_request,
-    build_algo_orders_request, build_exact_order_request, build_fills_request,
-    build_position_mode_request, build_positions_request, build_regular_orders_request,
-    complete_private_readback, parse_instrument_rules, prepare_cancel,
-    prepare_execution_risk_readback, prepare_place_limit, prepare_place_market,
+    BinancePlaceIntent, BinancePrivateReadScope, BinanceStopMarketIntent, BinanceTimeInForce,
+    BinanceTransportError, build_account_config_request, build_account_request,
+    build_account_wide_algo_orders_request, build_account_wide_positions_request,
+    build_account_wide_regular_orders_request, build_algo_orders_request,
+    build_exact_order_request, build_fills_request, build_position_mode_request,
+    build_positions_request, build_regular_orders_request, complete_private_readback,
+    parse_instrument_rules, prepare_cancel, prepare_cancel_algo, prepare_execution_risk_readback,
+    prepare_place_limit, prepare_place_market, prepare_place_stop_market,
     private::{RecentFillsCursor, parse_order},
 };
 use venue_gateway_binance::{GatewayBinding, GatewayMode, VenueId};
@@ -33,11 +34,14 @@ use venue_gateway_binance::{GatewayBinding, GatewayMode, VenueId};
 #[path = "executor_exchange/grid_batch.rs"]
 mod grid_batch;
 use grid_batch::{elapsed_us, record_outbound_timing, validate_grid_batch_shape};
+mod algo;
 mod catalogue;
 mod copy_risk;
 mod market;
 mod mirror;
 use mirror::mirror_order_outcome;
+mod mock;
+pub use mock::MockBinanceExecution;
 mod prices;
 mod terminal_market;
 mod terminal_open;
@@ -100,6 +104,18 @@ pub enum ExecutionOrderKind {
         time_in_force: LimitTimeInForce,
     },
     CancelExact {
+        native_order_id: Option<String>,
+        target_client_order_id: Option<String>,
+    },
+    StopMarket {
+        side: OrderSide,
+        position_side: PositionSide,
+        quantity: Decimal,
+        trigger_price: Decimal,
+        working_type: String,
+        reducing: bool,
+    },
+    CancelAlgoExact {
         native_order_id: Option<String>,
         target_client_order_id: Option<String>,
     },
@@ -623,6 +639,29 @@ impl BinanceHttpExecution {
             .then_some(order)
             .ok_or(BinanceExecutionError::Unavailable)
     }
+
+    async fn exact_algo_for_client_in_scope(
+        &mut self,
+        credentials: &BinanceCredentials,
+        client_order_id: &str,
+        scope: &BinancePrivateReadScope,
+    ) -> Result<venue_gateway_binance::private::AlgoOrderReadback, BinanceExecutionError> {
+        let exact = venue_gateway_binance::build_exact_algo_order_request(scope, client_order_id)
+            .map_err(|_| BinanceExecutionError::Invalid)?;
+        let page = self
+            .transport
+            .execute_read(credentials, &exact, now_ms()?)
+            .await
+            .map_err(|_| BinanceExecutionError::Unavailable)?;
+        let payload =
+            std::str::from_utf8(&page.payload).map_err(|_| BinanceExecutionError::Unavailable)?;
+        venue_gateway_binance::private::parse_algo_order(
+            payload,
+            &scope.binding().symbol,
+            client_order_id,
+        )
+        .map_err(|_| BinanceExecutionError::Unavailable)
+    }
 }
 
 pub type BinanceExecutionFuture<'a> =
@@ -685,6 +724,12 @@ impl BinanceHttpExecution {
         request: &ExecutionRequest,
         credentials: BinanceCredentials,
     ) -> Result<ExecutionOutcome, BinanceExecutionError> {
+        if matches!(
+            request.order_kind,
+            ExecutionOrderKind::StopMarket { .. } | ExecutionOrderKind::CancelAlgoExact { .. }
+        ) {
+            return self.submit_algo_request(request, credentials).await;
+        }
         if terminal_open::is_terminal_open(request) {
             return self.submit_terminal_open(request, &credentials).await;
         }
@@ -772,6 +817,10 @@ impl BinanceHttpExecution {
                 ExecutionOrderKind::CancelExact { .. } => {
                     return Err(BinanceExecutionError::Invalid);
                 }
+                ExecutionOrderKind::StopMarket { .. }
+                | ExecutionOrderKind::CancelAlgoExact { .. } => {
+                    return Err(BinanceExecutionError::Invalid);
+                }
             };
             check_minimum_notional_at_price(price, quantity, &rules)?;
         }
@@ -809,6 +858,9 @@ impl BinanceHttpExecution {
                 },
             ),
             ExecutionOrderKind::CancelExact { .. } => {
+                return Err(BinanceExecutionError::Invalid);
+            }
+            ExecutionOrderKind::StopMarket { .. } | ExecutionOrderKind::CancelAlgoExact { .. } => {
                 return Err(BinanceExecutionError::Invalid);
             }
         }
@@ -884,6 +936,16 @@ impl BinanceHttpExecution {
                             } else {
                                 ExecutionReadback::Unknown
                             };
+                            if request.origin
+                                == venue_control_protocol::kol::ExecutorCommandOrigin::Copy
+                                && result.state == ExecutionReadback::Reconciled
+                            {
+                                result.order_fact = Some(ExactOrderFact {
+                                    quantity: readback.order.quantity,
+                                    filled_quantity: readback.order.filled_quantity,
+                                    terminal: true,
+                                });
+                            }
                         }
                         Ok(result)
                     }
@@ -1005,6 +1067,12 @@ impl BinanceHttpExecution {
         request: &ExecutionRequest,
         credentials: BinanceCredentials,
     ) -> Result<ExecutionOutcome, BinanceExecutionError> {
+        if matches!(
+            request.order_kind,
+            ExecutionOrderKind::StopMarket { .. } | ExecutionOrderKind::CancelAlgoExact { .. }
+        ) {
+            return self.readback_algo_request(request, credentials).await;
+        }
         if let Some(baseline) = request.market_baseline.as_ref() {
             self.fills_cursor = Some(RecentFillsCursor {
                 observed_through_ms: baseline.observed_ms.saturating_sub(1),
@@ -1054,6 +1122,13 @@ impl BinanceHttpExecution {
             result.market_settlement = signed_market_settlement(request, &after, &order);
             if result.market_settlement.is_some() {
                 result.state = ExecutionReadback::Reconciled;
+                if request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Copy {
+                    result.order_fact = Some(ExactOrderFact {
+                        quantity: order.quantity,
+                        filled_quantity: order.filled_quantity,
+                        terminal: true,
+                    });
+                }
             }
         }
         Ok(result)
@@ -1349,6 +1424,28 @@ fn validate_request_binding(
                 return Err(BinanceExecutionError::Invalid);
             }
         }
+        ExecutionOrderKind::StopMarket {
+            side,
+            position_side,
+            quantity,
+            trigger_price,
+            working_type,
+            reducing,
+        } => {
+            if *position_side == PositionSide::Net
+                || *quantity <= Decimal::ZERO
+                || *trigger_price <= Decimal::ZERO
+                || !matches!(working_type.as_str(), "MARK_PRICE" | "CONTRACT_PRICE")
+                || *reducing
+                    != matches!(
+                        (*position_side, *side),
+                        (PositionSide::Long, OrderSide::Sell)
+                            | (PositionSide::Short, OrderSide::Buy)
+                    )
+            {
+                return Err(BinanceExecutionError::Invalid);
+            }
+        }
         ExecutionOrderKind::CancelExact {
             native_order_id,
             target_client_order_id,
@@ -1367,6 +1464,21 @@ fn validate_request_binding(
                         .as_ref()
                         .is_some_and(|known| known != selected)
                 })
+            {
+                return Err(BinanceExecutionError::Invalid);
+            }
+        }
+        ExecutionOrderKind::CancelAlgoExact {
+            native_order_id,
+            target_client_order_id,
+        } => {
+            if native_order_id.is_none() && target_client_order_id.is_none()
+                || native_order_id
+                    .as_deref()
+                    .is_some_and(invalid_native_order_id)
+                || target_client_order_id
+                    .as_deref()
+                    .is_some_and(invalid_native_order_id)
             {
                 return Err(BinanceExecutionError::Invalid);
             }
@@ -1449,8 +1561,17 @@ fn place_shape(
             quantity,
             reducing,
             ..
+        }
+        | ExecutionOrderKind::StopMarket {
+            side,
+            position_side,
+            quantity,
+            reducing,
+            ..
         } => Ok((*side, *position_side, *quantity, *reducing)),
-        ExecutionOrderKind::CancelExact { .. } => Err(BinanceExecutionError::Invalid),
+        ExecutionOrderKind::CancelExact { .. } | ExecutionOrderKind::CancelAlgoExact { .. } => {
+            Err(BinanceExecutionError::Invalid)
+        }
     }
 }
 
@@ -1501,7 +1622,9 @@ fn exact_place_matches(
                 .is_some_and(|value| value.value() == *price)
                 && order.time_in_force == FieldState::Known(*time_in_force)
         }
-        ExecutionOrderKind::CancelExact { .. } => false,
+        ExecutionOrderKind::CancelExact { .. }
+        | ExecutionOrderKind::StopMarket { .. }
+        | ExecutionOrderKind::CancelAlgoExact { .. } => false,
     })
 }
 
@@ -1818,186 +1941,6 @@ fn now_ms() -> Result<u64, BinanceExecutionError> {
         .map_err(|_| BinanceExecutionError::Unavailable)?
         .as_millis();
     u64::try_from(value).map_err(|_| BinanceExecutionError::Unavailable)
-}
-
-#[derive(Clone, Default)]
-pub struct MockBinanceExecution {
-    orders: BTreeMap<String, ExecutionOutcome>,
-    baselines: BTreeMap<String, AccountBaseline>,
-    grid_batch_failure: Option<GridBatchSubmitError>,
-    grid_batch_dispatch_started: Arc<AtomicBool>,
-    market_positions: Arc<Mutex<BTreeMap<String, Decimal>>>,
-}
-
-impl MockBinanceExecution {
-    pub fn set_rejection(&mut self, client_order_id: String, code: i64) {
-        let mut result = outcome(ExecutionReadback::Rejected, None);
-        result.exchange_error_code = Some(code);
-        self.orders.insert(client_order_id, result);
-    }
-
-    pub fn set_readback(&mut self, client_order_id: String, state: ExecutionReadback) {
-        let native_order_id = matches!(
-            state,
-            ExecutionReadback::Accepted | ExecutionReadback::Reconciled
-        )
-        .then(|| format!("mock-{client_order_id}"));
-        self.orders
-            .insert(client_order_id, outcome(state, native_order_id));
-    }
-
-    pub fn set_baseline(&mut self, trading_account_id: String, baseline: AccountBaseline) {
-        self.baselines.insert(trading_account_id, baseline);
-    }
-
-    pub fn set_grid_batch_failure(&mut self, failure: GridBatchSubmitError) {
-        self.grid_batch_failure = Some(failure);
-    }
-
-    #[must_use]
-    pub fn grid_batch_dispatch_started(&self) -> bool {
-        self.grid_batch_dispatch_started.load(Ordering::Acquire)
-    }
-}
-
-impl BinanceExecution for MockBinanceExecution {
-    fn prepare_market<'a>(
-        &'a mut self,
-        request: &'a ExecutionRequest,
-        _: &'a BinanceCredentials,
-    ) -> MarketPreparationFuture<'a> {
-        Box::pin(async move { self.mock_market_baseline(request) })
-    }
-    fn submit<'a>(
-        &'a mut self,
-        request: &'a ExecutionRequest,
-        _credentials: BinanceCredentials,
-    ) -> BinanceExecutionFuture<'a> {
-        Box::pin(async move {
-            if request.client_order_id.is_empty()
-                || request.command_id.is_empty()
-                || request.trading_account_id.is_empty()
-            {
-                return Err(BinanceExecutionError::Invalid);
-            }
-            let default_native = match &request.order_kind {
-                ExecutionOrderKind::CancelExact {
-                    native_order_id, ..
-                } => native_order_id
-                    .clone()
-                    .or_else(|| request.known_native_order_id.clone())
-                    .unwrap_or_else(|| format!("mock-target-{}", request.client_order_id)),
-                ExecutionOrderKind::Market { .. } | ExecutionOrderKind::Limit { .. } => {
-                    format!("mock-{}", request.client_order_id)
-                }
-            };
-            let result = self
-                .orders
-                .entry(request.client_order_id.clone())
-                .or_insert_with(|| outcome(ExecutionReadback::Accepted, Some(default_native)))
-                .clone();
-            self.mock_market_settlement(request, result)
-        })
-    }
-
-    fn readback<'a>(
-        &'a mut self,
-        request: &'a ExecutionRequest,
-        _credentials: BinanceCredentials,
-    ) -> BinanceExecutionFuture<'a> {
-        Box::pin(async move {
-            let result = self
-                .orders
-                .get(&request.client_order_id)
-                .cloned()
-                .ok_or(BinanceExecutionError::Unavailable)?;
-            self.mock_market_settlement(request, result)
-        })
-    }
-
-    fn submit_grid_batch<'a>(
-        &'a mut self,
-        _context: &'a GridBatchExecutionContext,
-        requests: &'a [ExecutionRequest],
-        _credentials: BinanceCredentials,
-    ) -> BinanceGridBatchFuture<'a> {
-        Box::pin(async move {
-            validate_grid_batch_shape(requests)
-                .map_err(GridBatchSubmitError::DefinitelyNotDispatched)?;
-            if let Some(failure) = self.grid_batch_failure.take() {
-                if failure == GridBatchSubmitError::DispatchUncertain {
-                    self.grid_batch_dispatch_started
-                        .store(true, Ordering::Release);
-                }
-                return Err(failure);
-            }
-            if requests.iter().any(|request| {
-                request.command_id.is_empty()
-                    || request.client_order_id.is_empty()
-                    || request.trading_account_id.is_empty()
-            }) {
-                return Err(GridBatchSubmitError::DefinitelyNotDispatched(
-                    BinanceExecutionError::Invalid,
-                ));
-            }
-            self.grid_batch_dispatch_started
-                .store(true, Ordering::Release);
-            let started = Instant::now();
-            let mut commands = Vec::with_capacity(requests.len());
-            let mut first = None;
-            let mut last = None;
-            let mut attempts = 0_u16;
-            for request in requests {
-                let submit_us = elapsed_us(started);
-                let native = match &request.order_kind {
-                    ExecutionOrderKind::CancelExact {
-                        native_order_id, ..
-                    } => native_order_id
-                        .clone()
-                        .or_else(|| request.known_native_order_id.clone())
-                        .unwrap_or_else(|| format!("mock-target-{}", request.client_order_id)),
-                    ExecutionOrderKind::Market { .. } | ExecutionOrderKind::Limit { .. } => {
-                        format!("mock-{}", request.client_order_id)
-                    }
-                };
-                let result = self
-                    .orders
-                    .entry(request.client_order_id.clone())
-                    .or_insert_with(|| outcome(ExecutionReadback::Accepted, Some(native)))
-                    .clone();
-                record_outbound_timing(submit_us, &mut first, &mut last, &mut attempts);
-                commands.push(GridBatchCommandOutcome::Submitted(result));
-            }
-            Ok(GridBatchExecutionOutcome {
-                commands,
-                timing: GridBatchSubmitTiming {
-                    executor_start_to_first_submit_us: first,
-                    executor_start_to_last_submit_us: last,
-                    first_to_last_submit_us: first
-                        .zip(last)
-                        .map(|(first, last)| last.saturating_sub(first)),
-                    outbound_attempts: attempts,
-                },
-            })
-        })
-    }
-}
-
-impl BinanceActivationBaseline for MockBinanceExecution {
-    async fn activation_baseline(
-        &mut self,
-        trading_account_id: &str,
-        _symbols: &std::collections::BTreeSet<Symbol>,
-        _credentials: BinanceCredentials,
-    ) -> Result<AccountBaseline, BinanceExecutionError> {
-        if trading_account_id.is_empty() {
-            return Err(BinanceExecutionError::Invalid);
-        }
-        self.baselines
-            .get(trading_account_id)
-            .cloned()
-            .ok_or(BinanceExecutionError::Unavailable)
-    }
 }
 
 #[cfg(test)]

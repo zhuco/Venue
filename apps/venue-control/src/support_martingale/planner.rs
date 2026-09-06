@@ -68,6 +68,12 @@ pub enum Plan {
     CancelTakeProfit {
         symbol: Symbol,
         client_order_id: String,
+        for_stop_loss: bool,
+    },
+    MarketStopLoss {
+        symbol: Symbol,
+        quantity: Decimal,
+        position_generation: u64,
     },
     LimitTakeProfit {
         symbol: Symbol,
@@ -139,6 +145,11 @@ pub fn plan(input: &PlannerInput<'_>) -> Plan {
                 );
             }
         }
+    }
+    if input.instance.config.entry_mode
+        == venue_control_protocol::support_martingale::MartingaleEntryMode::FixedPrice
+    {
+        return fixed_entry(input, state);
     }
     let Some(reference) = input.reference.symbols.get(input.symbol) else {
         return Plan::Noop(NoopReason::MissingReference);
@@ -245,11 +256,94 @@ pub fn plan(input: &PlannerInput<'_>) -> Plan {
     .flatten() else {
         return Plan::Noop(NoopReason::NoSupport);
     };
-    if has_position {
+    let _ = signal;
+    entry_at_support(input, state, support)
+}
+
+fn fixed_entry(input: &PlannerInput<'_>, state: &SupportMartingaleSymbolState) -> Plan {
+    let Some(parameters) = input
+        .instance
+        .config
+        .symbol_parameters
+        .iter()
+        .find(|p| p.symbol == *input.symbol)
+    else {
+        return Plan::Noop(NoopReason::InvalidInput);
+    };
+    let Some(first) = parameters.entry_price else {
+        return Plan::Noop(NoopReason::InvalidInput);
+    };
+    let mut target = first;
+    for _ in 0..state.layer {
+        let Some(next) = target.checked_mul(Decimal::ONE - parameters.add_drop_rate) else {
+            return Plan::Noop(NoopReason::InvalidInput);
+        };
+        target = next;
+    }
+    let price = input.execution_market.reference_price.value();
+    if price > target
+        || input
+            .current_take_profit
+            .is_some_and(|order| order.filled_quantity > Decimal::ZERO)
+    {
+        return Plan::Noop(NoopReason::NoSupport);
+    }
+    if parameters
+        .stop_loss
+        .and_then(|sl| sl.trigger_price(state.average_price.unwrap_or(first)))
+        .is_some_and(|stop| price <= stop)
+    {
+        return Plan::Noop(NoopReason::ExitOnly);
+    }
+    let Ok(target) = Price::new(target) else {
+        return Plan::Noop(NoopReason::InvalidInput);
+    };
+    let support = SupportZone {
+        id: format!(
+            "fixed:{}:{}:{}",
+            input.symbol,
+            state
+                .cycle_id
+                .as_deref()
+                .map(str::to_owned)
+                .unwrap_or_else(|| input.instance.revision.to_string()),
+            state.layer
+        ),
+        lower: target,
+        upper: target,
+        source_price: target,
+        confirmed_at_ms: input.now_ms,
+        version: 1,
+    };
+    entry_at_support(input, state, &support)
+}
+
+fn entry_at_support(
+    input: &PlannerInput<'_>,
+    state: &SupportMartingaleSymbolState,
+    support: &SupportZone,
+) -> Plan {
+    let execution_mid = input.execution_market.reference_price.value();
+    if state.layer >= input.instance.config.max_entries {
+        return Plan::Noop(NoopReason::BudgetExhausted);
+    }
+    if state.quantity.is_zero()
+        && input
+            .instance
+            .symbols
+            .iter()
+            .filter(|s| s.quantity > Decimal::ZERO)
+            .count()
+            >= usize::from(input.instance.config.max_active_positions)
+    {
+        return Plan::Noop(NoopReason::PositionLimit);
+    }
+    if state.quantity > Decimal::ZERO {
         if let Some(order) = input.current_take_profit {
             return Plan::CancelTakeProfit {
                 symbol: input.symbol.clone(),
                 client_order_id: order.client_order_id.clone(),
+                for_stop_loss: false,
             };
         }
     }
@@ -295,7 +389,6 @@ pub fn plan(input: &PlannerInput<'_>) -> Plan {
     if quantity <= Decimal::ZERO || quantity < input.execution_market.metadata.quantity.minimum {
         return Plan::Noop(NoopReason::QuantityTooSmall);
     }
-    let _ = signal;
     Plan::MarketEntry {
         symbol: input.symbol.clone(),
         support_id: support.id.clone(),

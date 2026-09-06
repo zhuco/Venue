@@ -329,7 +329,21 @@ pub(crate) fn show_management(
     if let Some(error) = &model.execution.grid.refresh_error {
         ui.colored_label(theme::WARNING, error);
     }
-    lifecycle_controls(ui, model, visible, credential_ready, &mut action);
+    if model.execution.grid.selected_instance_id.is_some() && model.execution.grid.editor.is_none()
+    {
+        let mut open = true;
+        egui::Window::new("网格机器人管理")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .vscroll(true)
+            .show(ui.ctx(), |ui| {
+                lifecycle_controls(ui, model, visible, credential_ready, &mut action);
+            });
+        if !open {
+            clear_selection(model);
+        }
+    }
     editor(ui, model, credential, credential_ready, &mut action);
     if let Some(action) = action {
         dispatch(model, client, credential, action);
@@ -995,6 +1009,9 @@ mod tests {
             dual_position: true,
             account_mode: Some("portfolio_margin_um".into()),
             has_exposure: Some(false),
+            equity: None,
+            available_margin: None,
+            balance_observed_ms: None,
         };
         for case in [
             "create", "update", "pending", "switched", "stale", "invalid",
@@ -1169,6 +1186,9 @@ mod tests {
                 dual_position: true,
                 account_mode: Some("portfolio_margin_um".to_owned()),
                 has_exposure: Some(false),
+                equity: None,
+                available_margin: None,
+                balance_observed_ms: None,
             }],
             selected_credential_id: None,
         });
@@ -1298,6 +1318,7 @@ mod tests {
             ],
             position_history: Vec::new(),
             open_orders: Vec::new(),
+            conditional_orders: Vec::new(),
             fills: Vec::new(),
             assets: Vec::new(),
         };

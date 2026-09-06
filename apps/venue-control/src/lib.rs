@@ -132,5 +132,8 @@ pub const MIGRATION_0029: &str = include_str!("../migrations/0029_mirror_gtc.sql
 pub const MIGRATION_0035: &str = include_str!("../migrations/0035_multi_venue_executor.sql");
 pub const MIGRATION_0036: &str = include_str!("../migrations/0036_strategy_grid.sql");
 pub const MIGRATION_0037: &str = include_str!("../migrations/0037_support_martingale.sql");
+pub const MIGRATION_0038: &str = include_str!("../migrations/0038_follow_authorization.sql");
+pub const MIGRATION_0039: &str = include_str!("../migrations/0039_martingale_stop_loss.sql");
+pub const MIGRATION_0040: &str = include_str!("../migrations/0040_market_and_stop_mirror.sql");
 mod schema;
 pub use schema::{SchemaError, install_control_schema};

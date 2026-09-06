@@ -149,6 +149,7 @@ mod tests {
                 exchange_time_ms: Some(100),
             },
             client_order_id: FieldState::Known("client-9".into()),
+            order_type: FieldState::Missing,
             original_quantity: FieldState::Missing,
             cumulative_filled_quantity: FieldState::Missing,
             order_state: FieldState::Missing,

@@ -12,7 +12,6 @@ export function ManagedFollowSettingsPanel({ managedId, label, csrf, canManage }
   const [error, setError] = useState("");
   const [relation, setRelation] = useState<ManagedFollowRelation | null>(null);
   const [pending, setPending] = useState<{ action: string; body: object } | null>(null);
-  const [confirmed, setConfirmed] = useState(false);
   async function refresh() {
     if (gate.current) return;
     gate.current = true; setBusy(true); setError("");
@@ -23,7 +22,7 @@ export function ManagedFollowSettingsPanel({ managedId, label, csrf, canManage }
   async function submit(action: string, body: object) {
     if (gate.current) return;
     gate.current = true; setBusy(true); setError("");
-    try { setRelation(await api<ManagedFollowRelation>(action, csrf, body)); setLoaded(true); setPending(null); setConfirmed(false); }
+    try { setRelation(await api<ManagedFollowRelation>(action, csrf, body)); setLoaded(true); setPending(null); }
     catch (cause) {
       const uncertain = !(cause instanceof RequestError) || cause.status >= 500 || cause.status === 408;
       if (uncertain) setPending({ action, body });
@@ -65,12 +64,11 @@ export function ManagedFollowSettingsPanel({ managedId, label, csrf, canManage }
         </fieldset>
       </form>}
       {loaded && relation && <>
-        <label className="customer-confirm"><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} disabled={busy || Boolean(pending)} />已核对账户、金额和风险参数，确认启用跟单。</label>
-        <div className="buttons"><button disabled={busy || Boolean(pending) || !canManage || !confirmed || relation.state !== "paused" || relation.activation_requested} onClick={() => void submit("managed-follow", { managed_id: managedId, request_id: crypto.randomUUID(), relation_id: relation.relation_id, expected_revision: relation.revision, action: "activate", risk_confirmed: true })}>启用跟单</button>
+        <div className="buttons"><button disabled={busy || Boolean(pending) || !canManage || relation.state !== "paused" || relation.activation_requested} onClick={() => void submit("managed-follow", { managed_id: managedId, request_id: crypto.randomUUID(), relation_id: relation.relation_id, expected_revision: relation.revision, action: "activate", risk_confirmed: true })}>重新申请跟单</button>
           <button disabled={busy || Boolean(pending)} onClick={() => void submit("managed-follow", { managed_id: managedId, request_id: crypto.randomUUID(), relation_id: relation.relation_id, expected_revision: relation.revision, action: "pause", risk_confirmed: false })}>暂停并撤销同步挂单</button></div>
       </>}
-      <p className="muted">保存不自动启用。激活需完成空仓、无挂单和权限验证；暂停保留已有仓位。</p>
-      <button disabled={busy || Boolean(pending)} onClick={() => { dialog.current?.close(); setConfirmed(false); }}>关闭</button>
+      <p className="muted">保存 API 即授权跟单；验证成功后自动申请激活。系统仍校验空仓、无挂单、权限和单一执行器；暂停保留已有仓位。</p>
+      <button disabled={busy || Boolean(pending)} onClick={() => dialog.current?.close()}>关闭</button>
     </dialog>
   </>;
 }

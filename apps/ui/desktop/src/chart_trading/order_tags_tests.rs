@@ -13,6 +13,8 @@ fn selection() -> Result<TerminalOrderSelection, Box<dyn std::error::Error>> {
 struct Harness {
     context: egui::Context,
     viewport: crate::chart::ChartViewport,
+    display: ChartTradingSettings,
+    market_price: Option<Decimal>,
     overlays: Vec<ChartOverlay>,
     body: Rect,
     cancel: Rect,
@@ -28,6 +30,8 @@ impl Harness {
         Ok(Self {
             context,
             viewport: Default::default(),
+            display: Default::default(),
+            market_price: None,
             body: Rect::NOTHING,
             cancel: Rect::NOTHING,
             textures: vec![],
@@ -45,8 +49,8 @@ impl Harness {
                     quantity: Some("289".into()),
                     stale: false,
                     pending: false,
-                    provisional: false,
                     pnl: None,
+                    position: None,
                     selection: Some(selection()?),
                 }),
             }],
@@ -88,9 +92,9 @@ impl Harness {
                     &settings,
                     (5, 0),
                     crate::chart::ChartInterval::OneMinute,
+                    self.market_price,
                     None,
-                    None,
-                    &ChartTradingSettings::default(),
+                    &self.display,
                     &self.overlays,
                     (None, None),
                 );
@@ -157,7 +161,7 @@ fn tag_x_targets_exact_order_and_does_not_select_chart_price()
     let mut harness = Harness::new()?;
     harness.frame(vec![]);
     harness.frame(vec![]);
-    assert_eq!(harness.cancel.width(), 24.0);
+    assert_eq!(harness.cancel.width(), 20.0);
     assert!(harness.cancel.left() >= harness.body.right());
     let point = harness.cancel.center();
     harness.press(point, true);
@@ -267,23 +271,30 @@ fn order_identity_includes_account_credential_and_symbol() -> Result<(), Box<dyn
 #[test]
 fn order_tags_fixture_preview() -> Result<(), Box<dyn std::error::Error>> {
     let mut harness = Harness::new()?;
-    for (index, price) in [8679, 8616, 8586].into_iter().enumerate() {
-        let mut overlay = harness.overlays[0].clone();
-        overlay.price = Decimal::new(price, 5);
-        if index == 0 {
-            overlay.label = "限价委托".into();
+    harness.market_price = Some(Decimal::new(8660, 5));
+    harness.overlays[0].label = "限价委托".into();
+    let mut buy = harness.overlays[0].clone();
+    buy.price = Decimal::new(8586, 5);
+    buy.label = "只做Maker".into();
+    buy.color = theme::BUY;
+    if let Some(badge) = &mut buy.badge {
+        if let Some(selection) = &mut badge.selection {
+            selection.native_order_id = "buy-order".into();
         }
-        if let Some(badge) = &mut overlay.badge {
-            if let Some(selection) = &mut badge.selection {
-                selection.native_order_id = format!("order-{index}");
-            }
-        }
-        harness.overlays.push(overlay);
     }
+    let mut nearby = buy.clone();
+    nearby.price += Decimal::new(3, 5);
+    if let Some(badge) = &mut nearby.badge {
+        if let Some(selection) = &mut badge.selection {
+            selection.native_order_id = "nearby-buy".into();
+        }
+    }
+    harness.overlays.push(nearby);
+    harness.overlays.push(buy);
     harness.overlays.push(ChartOverlay {
         price: Decimal::new(8524, 5),
         label: "多仓".into(),
-        color: theme::BUY,
+        color: theme::POSITION_LINE,
         time_ms: None,
         line: true,
         tick: false,
@@ -292,8 +303,8 @@ fn order_tags_fixture_preview() -> Result<(), Box<dyn std::error::Error>> {
             quantity: Some("1175".into()),
             stale: false,
             pending: false,
-            provisional: false,
-            pnl: Some(Decimal::new(-148, 2)),
+            pnl: Some(Decimal::new(540, 2)),
+            position: None,
             selection: None,
         }),
     });
@@ -351,6 +362,7 @@ fn projection()
             state: TerminalOrderState::PartiallyFilled,
             created_ms: Some(now),
         }],
+        conditional_orders: vec![],
     })
 }
 
@@ -435,23 +447,6 @@ fn action_revalidates_account_and_order_and_unknown_quantity_is_not_zero()
     Ok(())
 }
 
-fn request_fixture()
--> Result<venue_control_protocol::kol::TerminalOrderRequest, Box<dyn std::error::Error>> {
-    use venue_control_protocol::kol::*;
-    Ok(TerminalOrderRequest {
-        schema_version: TERMINAL_SCHEMA_VERSION,
-        request_id: "00000000-0000-4000-8000-000000000003".into(),
-        credential_id: selection()?.credential_id,
-        symbol: "DOGE/USDC".parse()?,
-        action: TerminalAction::OpenShort,
-        order_kind: TerminalOrderKind::LimitPostOnly,
-        quote_notional: Decimal::from(25),
-        limit_price: Some(Decimal::new(8727, 5)),
-        close_quantity_cap: None,
-        market_risk_confirmed: false,
-    })
-}
-
 fn model_fixture() -> Result<crate::model::AppModel, Box<dyn std::error::Error>> {
     use venue_control_protocol::accounts::{AccountOverview, UserSummary};
     let target = selection()?;
@@ -466,69 +461,6 @@ fn model_fixture() -> Result<crate::model::AppModel, Box<dyn std::error::Error>>
         selected_credential_id: Some(target.credential_id),
     });
     Ok(model)
-}
-
-#[test]
-fn sent_order_is_visible_in_same_frame_with_immediate_repaint_and_no_status_copy()
--> Result<(), Box<dyn std::error::Error>> {
-    let mut model = model_fixture()?;
-    let request = request_fixture()?;
-    request.validate()?;
-    let account = selection()?.trading_account_id;
-    let context = egui::Context::default();
-    for _ in 0..3 {
-        let mut output = context.run_ui(Default::default(), |_| {});
-        output.textures_delta.clear();
-    }
-    let mut output = context.run_ui(
-        egui::RawInput {
-            time: Some(1.0),
-            ..Default::default()
-        },
-        |ui| {
-            model.execution.chart_orders.submitted_order(
-                account.clone(),
-                request.clone(),
-                ui.ctx(),
-            );
-            let overlays =
-                super::super::collect(&model, "DOGE/USDC", &ChartTradingSettings::default());
-            assert_eq!(overlays.len(), 1);
-            assert_eq!(overlays[0].label, "只做Maker");
-            assert_eq!(overlays[0].price, Decimal::new(8727, 5));
-            assert!(
-                overlays[0]
-                    .badge
-                    .as_ref()
-                    .is_some_and(|badge| badge.provisional)
-            );
-            assert!(model.execution.private_projection.is_none());
-        },
-    );
-    assert!(
-        output
-            .viewport_output
-            .get(&egui::ViewportId::ROOT)
-            .is_some_and(|viewport| viewport.repaint_delay < std::time::Duration::from_millis(100))
-    );
-    output.textures_delta.clear();
-    model
-        .execution
-        .chart_orders
-        .submission_failed(&request.request_id, false);
-    assert_eq!(
-        super::super::collect(&model, "DOGE/USDC", &ChartTradingSettings::default()).len(),
-        1
-    );
-    assert!(super::super::collect(&model, "BTC/USDC", &ChartTradingSettings::default()).is_empty());
-    model
-        .execution
-        .chart_orders
-        .submission_failed(&request.request_id, true);
-    assert!(
-        super::super::collect(&model, "DOGE/USDC", &ChartTradingSettings::default()).is_empty()
-    );
-    Ok(())
 }
 
 #[test]
@@ -585,57 +517,304 @@ fn sent_cancel_hides_immediately_and_uncertainty_restores_without_mutating_facts
 }
 
 #[test]
-fn request_tag_merges_by_exact_receipt_identity_not_price_or_quantity()
+fn signed_orders_have_one_tag_each_and_fills_remove_only_the_finished_order()
 -> Result<(), Box<dyn std::error::Error>> {
-    use venue_control_protocol::kol::*;
     let mut model = model_fixture()?;
-    let old = projection()?;
+    let mut facts = projection()?;
+    let mut second = facts.open_orders[0].clone();
+    second.native_order_id = Some("same-price-second-order".into());
+    second.client_order_id = "second-client".into();
+    facts.open_orders.push(second);
     model
         .execution
-        .apply_private(Some(old.clone()), &mut model.trade_dock);
-    let request = request_fixture()?;
-    model.execution.chart_orders.submitted_order(
-        selection()?.trading_account_id,
-        request.clone(),
-        &egui::Context::default(),
-    );
-    let receipt = ExecutorCommandSummary {
-        command_id: "00000000-0000-4000-8000-000000000004".into(),
-        request_id: Some(request.request_id),
-        origin: ExecutorCommandOrigin::Terminal,
-        phase: ExecutorCommandPhase::Open,
-        trading_account_id: selection()?.trading_account_id,
-        symbol: request.symbol,
-        position_side: Some(venue_domain::PositionSide::Short),
-        order_side: Some(venue_domain::OrderSide::Sell),
-        order_kind: ExecutorOrderKind::LimitPostOnly,
-        requested_quantity: Some(Decimal::from(289)),
-        limit_price: request.limit_price,
-        state: ExecutorCommandState::Reconciled,
-        native_order_id: Some("new-order".into()),
-        created_ms: old.observed_ms,
-        updated_ms: old.observed_ms + 1,
-        sanitized_error_code: None,
-    };
-    model.execution.apply_terminal_execution(receipt.clone());
+        .apply_private(Some(facts.clone()), &mut model.trade_dock);
+    let settings = ChartTradingSettings::default();
+    let tags = super::super::collect(&model, "DOGE/USDC", &settings);
+    assert_eq!(tags.len(), 2);
+    assert_eq!(tags[0].price, tags[1].price);
+    // Partial fills retain the remaining amount, even for two orders at the same price.
     assert_eq!(
-        super::super::collect(&model, "DOGE/USDC", &ChartTradingSettings::default()).len(),
-        2
+        tags[0].badge.as_ref().and_then(|b| b.quantity.as_deref()),
+        Some("289")
     );
-    let mut latest = old;
-    latest.observed_ms += 2;
-    latest.persisted_ms += 2;
-    latest.open_orders[0].native_order_id = receipt.native_order_id;
+    facts.observed_ms += 1;
+    facts.persisted_ms += 1;
+    facts.open_orders.remove(0);
     model
         .execution
-        .apply_private(Some(latest), &mut model.trade_dock);
-    let overlays = super::super::collect(&model, "DOGE/USDC", &ChartTradingSettings::default());
-    assert_eq!(overlays.len(), 1);
-    assert!(
-        overlays[0]
+        .apply_private(Some(facts.clone()), &mut model.trade_dock);
+    let tags = super::super::collect(&model, "DOGE/USDC", &settings);
+    assert_eq!(tags.len(), 1);
+    assert_eq!(
+        tags[0]
             .badge
             .as_ref()
-            .is_some_and(|badge| !badge.provisional)
+            .and_then(|b| b.selection.as_ref())
+            .map(|s| s.native_order_id.as_str()),
+        Some("same-price-second-order")
     );
+    facts.observed_ms += 1;
+    facts.persisted_ms += 1;
+    facts.open_orders.clear();
+    model
+        .execution
+        .apply_private(Some(facts), &mut model.trade_dock);
+    assert!(super::super::collect(&model, "DOGE/USDC", &settings).is_empty());
+    Ok(())
+}
+
+#[test]
+fn realtime_pnl_tracks_quote_and_hedge_side_without_changing_signed_facts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut model = model_fixture()?;
+    let mut facts = projection()?;
+    facts.open_orders.clear();
+    let position = venue_control_protocol::kol::TerminalPosition {
+        symbol: "DOGE/USDC".parse()?,
+        position_side: venue_domain::PositionSide::Long,
+        quantity: Decimal::from(100),
+        entry_price: Some(Decimal::ONE),
+        mark_price: Some(Decimal::ONE),
+    };
+    facts.positions.push(position.clone());
+    let mut short = position.clone();
+    short.position_side = venue_domain::PositionSide::Short;
+    facts.positions.push(short);
+    model
+        .execution
+        .apply_private(Some(facts), &mut model.trade_dock);
+    let now = crate::account_center::now_ms();
+    for (price, expected) in [
+        (Decimal::new(11, 1), Decimal::from(10)),
+        (Decimal::new(9, 1), Decimal::from(-10)),
+    ] {
+        model.local_quotes.insert(
+            "DOGE/USDC".into(),
+            crate::model::MarketQuote {
+                symbol: "DOGE/USDC".into(),
+                last: price,
+                change_percent_24h: Decimal::ZERO,
+                quote_volume_24h: Decimal::ZERO,
+                exchange_time_ms: now,
+                received_ms: now,
+            },
+        );
+        let tags = super::super::collect(&model, "DOGE/USDC", &ChartTradingSettings::default());
+        assert_eq!(tags[0].badge.as_ref().and_then(|b| b.pnl), Some(expected));
+        assert_eq!(tags[1].badge.as_ref().and_then(|b| b.pnl), Some(-expected));
+        assert_eq!(tags[0].color, theme::POSITION_LINE);
+        assert_ne!(tags[0].color, theme::BUY);
+        assert_ne!(tags[0].color, theme::SELL);
+        assert_ne!(tags[0].color, theme::WARNING);
+    }
+    assert_eq!(crate::execution_view::pnl_color(Decimal::ONE), theme::BUY);
+    assert_eq!(crate::execution_view::pnl_color(-Decimal::ONE), theme::SELL);
+    if let Some(quote) = model.local_quotes.get_mut("DOGE/USDC") {
+        quote.exchange_time_ms = now - 16_000;
+    }
+    assert_eq!(
+        crate::execution_view::live_position_pnl_value(&model, &position),
+        Some(Decimal::ZERO)
+    );
+    let mut missing = position;
+    missing.mark_price = None;
+    assert_eq!(
+        crate::execution_view::live_position_pnl_value(&model, &missing),
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn nearby_badges_overlap_at_exact_prices_and_lines_never_cross_badges()
+-> Result<(), Box<dyn std::error::Error>> {
+    let context = egui::Context::default();
+    crate::theme::apply(&context);
+    let mut orders = Harness::new()?.overlays;
+    let mut nearby = orders[0].clone();
+    nearby.price += Decimal::new(1, 5);
+    if let Some(badge) = &mut nearby.badge {
+        if let Some(selection) = &mut badge.selection {
+            selection.native_order_id = "nearby".into();
+        }
+    }
+    orders.push(nearby);
+    let mut badges = Vec::new();
+    let plot = Rect::from_min_size(Pos2::new(10.0, 10.0), egui::vec2(650.0, 300.0));
+    let range = PriceRange::from_extrema(0.08, 0.09).ok_or("range")?;
+    let mut output = context.run_ui(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(700.0, 400.0))),
+            ..Default::default()
+        },
+        |ui| {
+            super::super::draw(
+                ui,
+                ui.painter(),
+                plot,
+                &[],
+                1,
+                crate::chart::ChartInterval::OneMinute,
+                range,
+                &orders,
+                5,
+                &ChartTradingSettings::default(),
+            );
+            for overlay in &orders {
+                if let Some(selection) = overlay.badge.as_ref().and_then(|b| b.selection.as_ref()) {
+                    let id = ui.id().with(order_id(selection));
+                    if let (Some(body), Some(cancel)) = (
+                        ui.ctx().read_response(id.with("drag")),
+                        ui.ctx().read_response(id.with("cancel")),
+                    ) {
+                        let rect = body.rect.union(cancel.rect);
+                        let expected = range.price_to_y(
+                            plot.top(),
+                            plot.height(),
+                            crate::model::decimal_to_f64(overlay.price),
+                        );
+                        assert!(expected.is_some_and(|y| (rect.center().y - y).abs() < 0.01));
+                        badges.push(rect);
+                    }
+                }
+            }
+        },
+    );
+    output.textures_delta.clear();
+    assert_eq!(badges.len(), 2);
+    assert!(badges[0].intersects(badges[1]));
+    assert_eq!(badges[0].left(), badges[1].left());
+    let lines = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::LineSegment { points, stroke }
+                if stroke.color == theme::SELL && (stroke.width - 1.25).abs() < 0.001 =>
+            {
+                Some(points)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!lines.is_empty());
+    for points in lines {
+        assert!((points[0].y - points[1].y).abs() < 0.01);
+        assert!(
+            badges
+                .iter()
+                .any(|b| (points[0].y - b.center().y).abs() < 0.01)
+        );
+        for badge in &badges {
+            if points[0].y >= badge.top() && points[0].y <= badge.bottom() {
+                assert!(points[1].x < badge.left() || points[0].x > badge.right());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn latest_price_has_no_label_even_when_price_labels_are_enabled()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut harness = Harness::new()?;
+    harness.overlays.clear();
+    harness.market_price = Some(Decimal::new(8660, 5));
+    harness.display.price_labels = true;
+    harness.display.ticks = true;
+    harness.frame(vec![]);
+    harness.frame(vec![]);
+    assert!(
+        !harness
+            .texts
+            .iter()
+            .any(|text| text.contains("最新价格") || text.contains("Last price"))
+    );
+    assert!(!harness.texts.iter().any(|text| text == "0.08660"));
+    Ok(())
+}
+
+#[test]
+fn position_icons_queue_only_the_clicked_action_and_do_not_select_chart_price()
+-> Result<(), Box<dyn std::error::Error>> {
+    use venue_control_protocol::{accounts::*, terminal_position::PositionAction};
+    let mut model = model_fixture()?;
+    let target = selection()?;
+    if let Some(overview) = &mut model.account_overview {
+        overview.credentials.push(CredentialSummary {
+            credential_id: target.credential_id.clone(),
+            label: "fixture".into(),
+            venue: venue_control_protocol::VenueId::Binance,
+            masked_key: "***".into(),
+            trading_account_id: Some(target.trading_account_id.clone()),
+            verification: ApiVerificationState::Verified,
+            verified_ms: Some(1),
+            expires_ms: None,
+            api_reachable: true,
+            dual_position: true,
+            account_mode: None,
+            has_exposure: Some(true),
+            equity: None,
+            available_margin: None,
+            balance_observed_ms: None,
+        });
+    }
+    let mut facts = projection()?;
+    facts.open_orders.clear();
+    facts
+        .positions
+        .push(venue_control_protocol::kol::TerminalPosition {
+            symbol: target.symbol,
+            position_side: venue_domain::PositionSide::Long,
+            quantity: Decimal::from(10),
+            entry_price: Some(Decimal::new(8524, 5)),
+            mark_price: Some(Decimal::new(8600, 5)),
+        });
+    model
+        .execution
+        .apply_private(Some(facts), &mut model.trade_dock);
+    for action in [PositionAction::Close, PositionAction::Reverse] {
+        let mut harness = Harness::new()?;
+        harness.overlays =
+            super::super::collect(&model, "DOGE/USDC", &ChartTradingSettings::default());
+        assert!(
+            harness.overlays[0]
+                .badge
+                .as_ref()
+                .is_some_and(|b| b.position.is_some())
+        );
+        harness.frame(vec![]);
+        harness.frame(vec![]);
+        // Find the actual painted label bounds; icons occupy its two rightmost segments.
+        let mut rect = Rect::NOTHING;
+        let mut output = harness.frame(vec![]);
+        for shape in &output.shapes {
+            if let egui::Shape::Rect(shape) = &shape.shape {
+                if shape.stroke.color == theme::BUY && shape.rect.height() == 20.0 {
+                    rect = shape.rect;
+                }
+            }
+        }
+        output.textures_delta.clear();
+        assert!(rect.is_positive());
+        let point = Pos2::new(
+            rect.right()
+                - if action == PositionAction::Close {
+                    10.0
+                } else {
+                    31.0
+                },
+            rect.center().y,
+        );
+        harness.press(point, true);
+        harness.press(point, false);
+        let queued = harness.context.data(|data| {
+            data.get_temp::<(crate::execution_view::PositionActionDraft, PositionAction)>(
+                action_id().with("position"),
+            )
+        });
+        assert!(queued.is_some_and(|(_, queued)| queued == action));
+        assert!(harness.action().is_none());
+        assert!(harness.selected.is_none());
+    }
     Ok(())
 }

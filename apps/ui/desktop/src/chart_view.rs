@@ -333,23 +333,12 @@ pub(crate) fn candle_plot(
         }
     }
     let mut trading_overlays = overlays.to_vec();
-    let last_color = all_bars.last().map_or(theme::BUY, |bar| {
-        if market_price.unwrap_or(bar.close) >= bar.open {
-            theme::BUY
-        } else {
-            theme::SELL
-        }
-    });
     for (enabled, price, color, name) in [
         (
             trading_display.last_price,
             market_price.or_else(|| all_bars.last().map(|bar| bar.close)),
-            last_color,
-            if language == Language::SimplifiedChinese {
-                "最新价格"
-            } else {
-                "Last price"
-            },
+            theme::TEXT_SECONDARY,
+            "",
         ),
         (
             trading_display.bid_ask,
@@ -386,7 +375,8 @@ pub(crate) fn candle_plot(
                 color,
                 time_ms: None,
                 line: true,
-                tick: trading_display.price_labels
+                tick: !name.is_empty()
+                    && trading_display.price_labels
                     && trading_display.ticks
                     && trading_display.tick_prices,
                 badge: None,

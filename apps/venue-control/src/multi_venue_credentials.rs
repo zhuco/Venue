@@ -467,6 +467,9 @@ impl StrategyCredentialStore {
                 .to_owned(),
             ),
             has_exposure: Some(has_exposure),
+            equity: None,
+            available_margin: None,
+            balance_observed_ms: None,
         };
         let mut verification = serde_json::to_value(&summary).map_err(|_| StrategyExchangeError)?;
         verification["strategy_execution"] = serde_json::json!(true);

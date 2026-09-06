@@ -40,6 +40,7 @@ pub(super) async fn seeded_copy(
         occurred_ms: 10,
         observed_ms: 11,
         payload_digest: [51; 32],
+        market_order: None,
     };
     let planned = PgExecutorStore::new(pool.clone())
         .record_source_fill_and_plan(&kol, &fill, 12)

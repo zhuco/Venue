@@ -29,6 +29,8 @@ pub enum SupportMartingaleCommandKind {
     Add,
     TakeProfit,
     CancelTakeProfit,
+    StopLoss,
+    CancelForStopLoss,
 }
 impl SupportMartingaleCommandKind {
     fn as_str(self) -> &'static str {
@@ -37,6 +39,8 @@ impl SupportMartingaleCommandKind {
             Self::Add => "add",
             Self::TakeProfit => "tp",
             Self::CancelTakeProfit => "cancel_tp",
+            Self::StopLoss => "sl",
+            Self::CancelForStopLoss => "cancel_sl_tp",
         }
     }
 }
@@ -591,8 +595,12 @@ impl SupportMartingaleStore {
                 command_owner.purpose == OrderPurpose::Entry
             }
             SupportMartingaleCommandKind::TakeProfit
-            | SupportMartingaleCommandKind::CancelTakeProfit => {
+            | SupportMartingaleCommandKind::CancelTakeProfit
+            | SupportMartingaleCommandKind::CancelForStopLoss => {
                 command_owner.purpose == OrderPurpose::TakeProfit
+            }
+            SupportMartingaleCommandKind::StopLoss => {
+                command_owner.purpose == OrderPurpose::Protection
             }
         };
         if command_owner.strategy_instance_id != instance_id
@@ -644,7 +652,9 @@ impl SupportMartingaleStore {
                 SupportMartingaleLifecycle::Running | SupportMartingaleLifecycle::EntryPaused
             ),
             SupportMartingaleCommandKind::TakeProfit
-            | SupportMartingaleCommandKind::CancelTakeProfit => {
+            | SupportMartingaleCommandKind::CancelTakeProfit
+            | SupportMartingaleCommandKind::CancelForStopLoss
+            | SupportMartingaleCommandKind::StopLoss => {
                 lifecycle != SupportMartingaleLifecycle::Stopped
             }
         };
@@ -685,10 +695,13 @@ impl SupportMartingaleStore {
             {
                 return Err(SupportMartingaleStoreError::Conflict);
             }
-            SupportMartingaleCommandKind::TakeProfit if quantity <= Decimal::ZERO => {
+            SupportMartingaleCommandKind::TakeProfit | SupportMartingaleCommandKind::StopLoss
+                if quantity <= Decimal::ZERO =>
+            {
                 return Err(SupportMartingaleStoreError::Conflict);
             }
             SupportMartingaleCommandKind::CancelTakeProfit
+            | SupportMartingaleCommandKind::CancelForStopLoss
                 if state
                     .try_get::<Option<String>, _>("take_profit_client_id")
                     .map_err(|_| SupportMartingaleStoreError::Unavailable)?
@@ -753,6 +766,14 @@ impl SupportMartingaleStore {
             .map_err(|_| SupportMartingaleStoreError::Unavailable)?
             .checked_add(1)
             .ok_or(SupportMartingaleStoreError::Invalid)?;
+        if matches!(
+            kind,
+            SupportMartingaleCommandKind::StopLoss
+                | SupportMartingaleCommandKind::CancelForStopLoss
+        ) {
+            sqlx::query("UPDATE venue_support_martingale_instances SET lifecycle=CASE WHEN lifecycle='draining' THEN lifecycle ELSE 'increase_paused' END,revision=revision+1,updated_ms=$1 WHERE instance_id=$2")
+                .bind(ms(now_ms)?).bind(instance_id).execute(&mut *tx).await.map_err(|_| SupportMartingaleStoreError::Unavailable)?;
+        }
         sqlx::query("INSERT INTO venue_support_martingale_commands(command_id,instance_id,symbol,kind,cycle_id,support_id,request_id,requested_notional,created_ms,updated_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8::numeric,$9,$9)")
             .bind(&command_id).bind(instance_id).bind(symbol.to_string()).bind(kind.as_str()).bind(cycle_id).bind(support_id)
             .bind(request_id).bind(requested_notional.to_string()).bind(ms(now_ms)?).execute(&mut *tx).await
@@ -760,7 +781,7 @@ impl SupportMartingaleStore {
         let tp_client_id = command.native_client_id().map(|id| id.as_str().to_owned());
         let (support_lower, support_upper) = support_bounds.unzip();
         sqlx::query("UPDATE venue_support_martingale_symbol_states SET pending_command_id=$1,decision_sequence=$2,status=$3,cycle_id=COALESCE(cycle_id,$10),take_profit_client_id=CASE WHEN $3='tp_pending' THEN $7 ELSE take_profit_client_id END,last_support_lower=COALESCE($8::text::numeric,last_support_lower),last_support_upper=COALESCE($9::text::numeric,last_support_upper),updated_ms=$4 WHERE instance_id=$5 AND symbol=$6")
-            .bind(&command_id).bind(next_sequence).bind(match kind { SupportMartingaleCommandKind::Entry=>"entry_pending",SupportMartingaleCommandKind::Add=>"add_pending",SupportMartingaleCommandKind::TakeProfit=>"tp_pending",SupportMartingaleCommandKind::CancelTakeProfit=>"cancel_tp_pending" })
+            .bind(&command_id).bind(next_sequence).bind(match kind { SupportMartingaleCommandKind::Entry=>"entry_pending",SupportMartingaleCommandKind::Add=>"add_pending",SupportMartingaleCommandKind::TakeProfit=>"tp_pending",SupportMartingaleCommandKind::CancelTakeProfit=>"cancel_tp_pending",SupportMartingaleCommandKind::CancelForStopLoss=>"sl_cancel_pending",SupportMartingaleCommandKind::StopLoss=>"sl_pending" })
             .bind(ms(now_ms)?).bind(instance_id).bind(symbol.to_string()).bind(tp_client_id)
             .bind(support_lower.map(|value| value.to_string())).bind(support_upper.map(|value| value.to_string()))
             .bind(cycle_id)
@@ -796,7 +817,7 @@ impl SupportMartingaleStore {
             .begin()
             .await
             .map_err(|_| SupportMartingaleStoreError::Unavailable)?;
-        let row = sqlx::query("SELECT c.instance_id,c.symbol,c.kind,c.requested_notional::text AS requested_notional,c.observed_fill::text AS prior_fill,c.ledger_settled,c.terminal,i.trading_account_id FROM venue_support_martingale_commands c JOIN venue_support_martingale_instances i USING(instance_id) WHERE c.command_id=$1 AND i.owner_user_id=$2 FOR UPDATE").bind(command_id).bind(owner).fetch_optional(&mut *tx).await.map_err(|_| SupportMartingaleStoreError::Unavailable)?.ok_or(SupportMartingaleStoreError::Conflict)?;
+        let row = sqlx::query("SELECT c.instance_id,c.symbol,c.kind,c.requested_notional::text AS requested_notional,c.observed_fill::text AS prior_fill,c.ledger_settled,c.terminal,i.trading_account_id,b.command_state FROM venue_support_martingale_commands c JOIN venue_support_martingale_instances i USING(instance_id) JOIN venue_binance_commands b USING(command_id) WHERE c.command_id=$1 AND i.owner_user_id=$2 FOR UPDATE").bind(command_id).bind(owner).fetch_optional(&mut *tx).await.map_err(|_| SupportMartingaleStoreError::Unavailable)?.ok_or(SupportMartingaleStoreError::Conflict)?;
         let instance_id: String = row
             .try_get("instance_id")
             .map_err(|_| SupportMartingaleStoreError::Unavailable)?;
@@ -833,18 +854,38 @@ impl SupportMartingaleStore {
         sqlx::query("UPDATE venue_support_martingale_commands SET observed_fill=$1::text::numeric,ledger_settled=TRUE,terminal=$2,updated_ms=$3 WHERE command_id=$4")
             .bind(observed_fill.to_string()).bind(order_terminal).bind(ms(now_ms)?).bind(command_id)
             .execute(&mut *tx).await.map_err(|_| SupportMartingaleStoreError::Unavailable)?;
+        let ledger_state: String = row
+            .try_get("command_state")
+            .map_err(|_| SupportMartingaleStoreError::Unavailable)?;
+        if matches!(kind.as_str(), "sl" | "cancel_sl_tp")
+            && !matches!(
+                ledger_state.as_str(),
+                "reconciled" | "rejected" | "cancelled"
+            )
+        {
+            return Err(SupportMartingaleStoreError::Conflict);
+        }
+        let stop_failed = matches!(kind.as_str(), "sl" | "cancel_sl_tp")
+            && (matches!(ledger_state.as_str(), "rejected" | "cancelled")
+                || (kind == "sl" && observed_fill.is_zero()));
+        if stop_failed {
+            sqlx::query("UPDATE venue_support_martingale_instances SET health='needs_attention',updated_ms=$1 WHERE instance_id=$2")
+                .bind(ms(now_ms)?).bind(&instance_id).execute(&mut *tx).await.map_err(|_| SupportMartingaleStoreError::Unavailable)?;
+        }
         let next_status = match kind.as_str() {
+            "sl" | "cancel_sl_tp" if stop_failed => "sl_failed",
             "entry" | "add" if observed_fill > rust_decimal::Decimal::ZERO => "holding",
             "entry" => "idle",
             "add" => "holding",
             "tp" if observed_fill > rust_decimal::Decimal::ZERO => "exit_only",
             "tp" => "holding",
             "cancel_tp" => "add_ready",
+            "sl" | "cancel_sl_tp" => "sl_ready",
             _ => return Err(SupportMartingaleStoreError::Conflict),
         };
-        sqlx::query("UPDATE venue_support_martingale_symbol_states SET pending_command_id=NULL,status=$1,layer=CASE WHEN $2 AND $3::text::numeric>0 THEN layer+1 ELSE layer END,take_profit_client_id=CASE WHEN $4 OR ($5='tp' AND $6) THEN NULL ELSE take_profit_client_id END,updated_ms=$7 WHERE instance_id=$8 AND symbol=$9 AND pending_command_id=$10")
+        sqlx::query("UPDATE venue_support_martingale_symbol_states SET pending_command_id=NULL,status=$1,health_reason=CASE WHEN $1='sl_failed' THEN 'stop_loss_rejected' ELSE health_reason END,layer=CASE WHEN $2 AND $3::text::numeric>0 THEN layer+1 ELSE layer END,take_profit_client_id=CASE WHEN $4 OR ($5='tp' AND $6) THEN NULL ELSE take_profit_client_id END,updated_ms=$7 WHERE instance_id=$8 AND symbol=$9 AND pending_command_id=$10")
             .bind(next_status).bind(matches!(kind.as_str(), "entry"|"add")).bind(observed_fill.to_string())
-            .bind(kind=="cancel_tp").bind(&kind).bind(order_terminal).bind(ms(now_ms)?).bind(&instance_id).bind(&symbol).bind(command_id)
+            .bind(matches!(kind.as_str(), "cancel_tp" | "cancel_sl_tp")).bind(&kind).bind(order_terminal).bind(ms(now_ms)?).bind(&instance_id).bind(&symbol).bind(command_id)
             .execute(&mut *tx).await.map_err(|_| SupportMartingaleStoreError::Unavailable)?;
         if matches!(kind.as_str(), "entry" | "add") {
             let requested: String = row
@@ -935,7 +976,7 @@ impl SupportMartingaleStore {
             let symbol: String = row
                 .try_get("symbol")
                 .map_err(|_| SupportMartingaleStoreError::Unavailable)?;
-            sqlx::query("UPDATE venue_support_martingale_symbol_states SET take_profit_client_id=NULL,take_profit_price=NULL,status=CASE WHEN $1::text::numeric>0 THEN 'exit_only' WHEN status='add_ready' THEN 'add_ready' ELSE 'take_profit_blocked' END,updated_ms=$2 WHERE instance_id=$3 AND symbol=$4")
+            sqlx::query("UPDATE venue_support_martingale_symbol_states SET take_profit_client_id=NULL,take_profit_price=NULL,status=CASE WHEN status IN ('sl_ready','sl_failed') THEN status WHEN $1::text::numeric>0 THEN 'exit_only' WHEN status='add_ready' THEN 'add_ready' ELSE 'take_profit_blocked' END,updated_ms=$2 WHERE instance_id=$3 AND symbol=$4")
                 .bind(observed_fill.to_string()).bind(ms(now_ms)?).bind(instance_id).bind(symbol)
                 .execute(&mut *tx).await.map_err(|_| SupportMartingaleStoreError::Unavailable)?;
         }
@@ -1016,6 +1057,8 @@ impl SupportMartingaleStore {
             "cooldown"
         } else if quantity.is_zero() {
             "idle"
+        } else if matches!(status.as_str(), "sl_ready" | "sl_failed") {
+            status.as_str()
         } else if status == "exit_only" {
             "exit_only"
         } else if status == "add_ready" && take_profit_price.is_none() {
@@ -1060,15 +1103,15 @@ impl SupportMartingaleStore {
             SupportMartingaleHealth::NeedsAttention => "needs_attention",
             SupportMartingaleHealth::Unavailable => "unavailable",
         };
-        sqlx::query("UPDATE venue_support_martingale_instances SET health=$1,updated_ms=$2 WHERE instance_id=$3")
+        sqlx::query("UPDATE venue_support_martingale_instances SET health=CASE WHEN EXISTS (SELECT 1 FROM venue_support_martingale_symbol_states s WHERE s.instance_id=venue_support_martingale_instances.instance_id AND s.status='sl_failed' AND s.quantity>0) THEN 'needs_attention' ELSE $1 END,updated_ms=$2 WHERE instance_id=$3")
             .bind(value).bind(ms(now_ms)?).bind(instance_id).execute(&self.pool).await
             .map_err(|_| SupportMartingaleStoreError::Unavailable)?;
         if health == SupportMartingaleHealth::Healthy {
-            sqlx::query("UPDATE venue_support_martingale_symbol_states SET health_reason=NULL,updated_ms=$1 WHERE instance_id=$2")
+            sqlx::query("UPDATE venue_support_martingale_symbol_states SET health_reason=NULL,updated_ms=$1 WHERE instance_id=$2 AND status<>'sl_failed'")
                 .bind(ms(now_ms)?).bind(instance_id).execute(&self.pool).await
                 .map_err(|_| SupportMartingaleStoreError::Unavailable)?;
         } else if let Some(reason) = reason {
-            sqlx::query("UPDATE venue_support_martingale_symbol_states SET health_reason=$1,updated_ms=$2 WHERE instance_id=$3")
+            sqlx::query("UPDATE venue_support_martingale_symbol_states SET health_reason=$1,updated_ms=$2 WHERE instance_id=$3 AND status<>'sl_failed'")
                 .bind(reason).bind(ms(now_ms)?).bind(instance_id).execute(&self.pool).await
                 .map_err(|_| SupportMartingaleStoreError::Unavailable)?;
         }

@@ -3,6 +3,7 @@ mod planner;
 pub use planner::{NoopReason, Plan, PlannerInput, TakeProfitOrder, plan, plan_take_profit_only};
 mod reference_market;
 mod runtime;
+mod stop_loss;
 mod store;
 pub use reference_market::{
     BinanceReferenceClient, ReferenceMarketError, ReferenceSnapshot, SymbolReference,

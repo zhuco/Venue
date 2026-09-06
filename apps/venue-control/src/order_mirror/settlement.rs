@@ -35,7 +35,7 @@ pub(crate) async fn mirror_send_allowed(
     if command.origin != ExecutorCommandOrigin::Copy {
         return Ok(true);
     }
-    let row=sqlx::query("SELECT c.mirror_order_id,c.command_phase,c.selected_native_order_id,c.credential_id,c.trading_account_id,m.child_native_order_id,m.source_order_json,m.bot_revision,m.permission_revision,m.relation_revision,m.mirror_state,b.bot_state,b.revision AS current_bot_revision,b.permission_revision AS bot_grant,r.revision AS current_relation_revision,r.relation_state,p.profile_state,g.enabled,g.revision AS current_permission_revision,b.trading_account_id AS leader_account,EXISTS(SELECT 1 FROM venue_api_credentials lc WHERE lc.credential_id=b.credential_id AND lc.user_id=b.owner_user_id AND lc.deleted_ms IS NULL AND lc.verification_json->>'verification'='verified') AS leader_verified,EXISTS(SELECT 1 FROM venue_api_credentials fc WHERE fc.credential_id=c.credential_id AND fc.user_id=c.owner_user_id AND fc.trading_account_id=c.trading_account_id AND fc.deleted_ms IS NULL AND fc.verification_json->>'verification'='verified') AS follower_verified,lp.projection_json FROM venue_binance_commands c LEFT JOIN venue_order_mirrors m ON m.mirror_id=c.mirror_order_id LEFT JOIN venue_leader_bots b ON b.bot_id=m.bot_id LEFT JOIN venue_kol_follow_relations r ON r.relation_id=m.relation_id LEFT JOIN venue_kol_profiles p ON p.kol_user_id=b.owner_user_id LEFT JOIN venue_leader_bot_permissions g ON g.kol_user_id=b.owner_user_id LEFT JOIN venue_binance_account_projections lp ON lp.credential_id=b.credential_id WHERE c.command_id=$1")
+    let row=sqlx::query("SELECT c.mirror_order_id,c.command_phase,c.selected_native_order_id,c.credential_id,c.trading_account_id,m.child_native_order_id,m.source_order_json,m.source_kind,m.source_order_id,m.symbol,m.bot_revision,m.permission_revision,m.relation_revision,m.mirror_state,b.bot_state,b.revision AS current_bot_revision,b.permission_revision AS bot_grant,r.revision AS current_relation_revision,r.relation_state,p.profile_state,g.enabled,g.revision AS current_permission_revision,b.trading_account_id AS leader_account,EXISTS(SELECT 1 FROM venue_api_credentials lc WHERE lc.credential_id=b.credential_id AND lc.user_id=b.owner_user_id AND lc.deleted_ms IS NULL AND lc.verification_json->>'verification'='verified') AS leader_verified,EXISTS(SELECT 1 FROM venue_api_credentials fc WHERE fc.credential_id=c.credential_id AND fc.user_id=c.owner_user_id AND fc.trading_account_id=c.trading_account_id AND fc.deleted_ms IS NULL AND fc.verification_json->>'verification'='verified') AS follower_verified,EXISTS(SELECT 1 FROM venue_kol_source_market_orders ms WHERE ms.leader_trading_account_id=b.trading_account_id AND ms.kol_user_id=b.owner_user_id AND ms.native_order_id=m.source_order_id AND ms.symbol=m.symbol) AS market_source_exists,lp.projection_json FROM venue_binance_commands c LEFT JOIN venue_order_mirrors m ON m.mirror_id=c.mirror_order_id LEFT JOIN venue_leader_bots b ON b.bot_id=m.bot_id LEFT JOIN venue_kol_follow_relations r ON r.relation_id=m.relation_id LEFT JOIN venue_kol_profiles p ON p.kol_user_id=b.owner_user_id LEFT JOIN venue_leader_bot_permissions g ON g.kol_user_id=b.owner_user_id LEFT JOIN venue_binance_account_projections lp ON lp.credential_id=b.credential_id WHERE c.command_id=$1")
         .bind(&command.command_id).fetch_one(store.mirror_pool()).await.map_err(unavailable)?;
     if row
         .try_get::<Option<String>, _>("mirror_order_id")
@@ -75,14 +75,23 @@ pub(crate) async fn mirror_send_allowed(
     {
         return Ok(false);
     }
-    let original: TerminalOpenOrder =
-        serde_json::from_value(row.try_get("source_order_json").map_err(unavailable)?)
-            .map_err(|_| Error::Conflict)?;
     let current = projection(
         row.try_get("projection_json").map_err(unavailable)?,
         &text(&row, "leader_account")?,
         now,
     )?;
+    let kind = text(&row, "source_kind")?;
+    if kind != "limit" {
+        return super::extended::source_send_allowed(
+            &kind,
+            row.try_get("source_order_json").map_err(unavailable)?,
+            current.as_ref(),
+            row.try_get("market_source_exists").map_err(unavailable)?,
+        );
+    }
+    let original: TerminalOpenOrder =
+        serde_json::from_value(row.try_get("source_order_json").map_err(unavailable)?)
+            .map_err(|_| Error::Conflict)?;
     Ok(current.is_some_and(|p| {
         p.open_orders
             .iter()
@@ -138,6 +147,10 @@ impl PgExecutorStore {
         if let (
             Some(target),
             ExecutionOrderKind::CancelExact {
+                target_client_order_id,
+                ..
+            }
+            | ExecutionOrderKind::CancelAlgoExact {
                 target_client_order_id,
                 ..
             },

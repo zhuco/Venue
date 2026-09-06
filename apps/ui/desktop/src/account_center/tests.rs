@@ -15,6 +15,9 @@ fn credential() -> CredentialSummary {
         dual_position: true,
         account_mode: Some("Portfolio Margin · UM".into()),
         has_exposure: Some(false),
+        equity: None,
+        available_margin: None,
+        balance_observed_ms: None,
     }
 }
 fn overview() -> AccountOverview {
@@ -151,6 +154,7 @@ fn account_connection_uses_the_same_private_projection_as_positions()
             positions: vec![],
             position_history: vec![],
             open_orders: vec![],
+            conditional_orders: vec![],
             fills: vec![],
             assets: vec![],
         }),

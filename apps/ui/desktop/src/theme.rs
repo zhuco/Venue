@@ -10,6 +10,7 @@ pub const BRAND: Color32 = Color32::from_rgb(0xf0, 0xb9, 0x0b);
 pub const BRAND_HOVER: Color32 = Color32::from_rgb(0xfc, 0xd5, 0x35);
 pub const BUY: Color32 = Color32::from_rgb(0x0e, 0xcb, 0x81);
 pub const SELL: Color32 = Color32::from_rgb(0xf6, 0x46, 0x5d);
+pub const POSITION_LINE: Color32 = Color32::from_rgb(0x58, 0xa6, 0xff);
 pub const WARNING: Color32 = Color32::from_rgb(0xf0, 0xb9, 0x0b);
 pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xea, 0xec, 0xef);
 pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0x84, 0x8e, 0x9c);

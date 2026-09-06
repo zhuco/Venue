@@ -18,8 +18,8 @@ use venue_execution::{
     AccountPricedLimitIntent, AccountQuoteToUsdtRate, AccountRecoveryOutcome,
     AccountRecoveryReport, AccountRecoveryRequest, AccountRiskAmount, AccountRiskEvidence,
     SignedAccountBalance, SignedAccountOrderFact, SignedAccountPositionFact,
-    SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
-    command_matches_readback_order,
+    SignedAccountPositionMode, SignedAccountSnapshot, SignedMarketOrderFact, SignedUnknownFact,
+    SignedUnknownResult, command_matches_readback_order,
 };
 use venue_gateway_api::{GatewayBinding, PublicMarketBinding};
 
@@ -30,6 +30,15 @@ use account_gateway_limit::{
     normalize_fresh_limit, readback_policy_matches_command, snapshot_created_at_ms,
     snapshot_regular_order_quantities,
 };
+#[path = "account_gateway_market_recovery.rs"]
+mod account_gateway_market_recovery;
+use account_gateway_market_recovery::snapshot_market_order_facts;
+#[path = "account_gateway_conditional.rs"]
+mod account_gateway_conditional;
+use account_gateway_conditional::snapshot_conditional_order_facts;
+#[path = "account_gateway_snapshot_fields.rs"]
+mod account_gateway_snapshot_fields;
+use account_gateway_snapshot_fields::{snapshot_limit_time_in_force, snapshot_order_state};
 #[path = "account_gateway_private_stream.rs"]
 mod account_gateway_private_stream;
 pub use account_gateway_private_stream::{BinancePrivateAccountEvent, BinancePrivateFillEvent};
@@ -63,10 +72,11 @@ use crate::{
     BinancePublicWsTransport, BinanceRawPublicFrame, BinanceTransportError, BinanceTransportLimits,
     build_account_config_request, build_account_request, build_account_wide_algo_orders_request,
     build_account_wide_positions_request, build_account_wide_regular_orders_request,
-    build_algo_orders_request, build_exact_order_for_native_symbol_request,
-    build_exact_order_request, build_fills_for_native_symbol_request, build_fills_request,
-    build_position_mode_request, build_positions_request, build_regular_orders_request,
-    complete_private_readback, connect_private_ws, connect_public_ws, parse_instrument_catalog,
+    build_algo_orders_request, build_exact_order_by_native_id_request,
+    build_exact_order_for_native_symbol_request, build_exact_order_request,
+    build_fills_for_native_symbol_request, build_fills_request, build_position_mode_request,
+    build_positions_request, build_regular_orders_request, complete_private_readback,
+    connect_private_ws, connect_public_ws, native_symbol, parse_instrument_catalog,
     parse_instrument_rules, parse_native_instrument_rules, parse_public_market_agg_trade,
     parse_public_market_bbo, parse_public_market_depth_delta, parse_public_market_kline,
     parse_public_market_rest_depth_snapshot, prepare_execution_command, settle_mutation_ack,
@@ -483,6 +493,7 @@ impl BinanceAccountGateway {
                     original_quantity: FieldState::Missing,
                     cumulative_filled_quantity: FieldState::Missing,
                     order_state: FieldState::Missing,
+                    order_type: FieldState::Missing,
                     fill,
                 })
             })
@@ -1141,6 +1152,9 @@ async fn fetch_account_wide_snapshot(
     let order_facts =
         snapshot_order_facts(catalogue, &regular_rows, &algo_rows, private_generation)
             .map_err(|_| stage("orders_normalize"))?;
+    let conditional_facts =
+        snapshot_conditional_order_facts(catalogue, &algo_rows, private_generation)
+            .map_err(|_| stage("conditional_orders_normalize"))?;
     let previous_fills = parse_snapshot_fills_cursor(recovery.previous_fills_cursor())
         .map_err(|_| stage("fills_cursor_parse"))?;
     let fill_symbols = snapshot_fill_symbols(
@@ -1163,6 +1177,16 @@ async fn fetch_account_wide_snapshot(
     })
     .await
     .map_err(|_| stage("fills_collect"))?;
+    let market_facts = snapshot_market_order_facts(
+        transport,
+        credentials,
+        &scope,
+        catalogue,
+        private_generation,
+        &fill_facts,
+    )
+    .await
+    .map_err(|_| stage("market_orders_collect"))?;
     let unknown_results = snapshot_unknown_results(transport, credentials, &scope, recovery)
         .await
         .map_err(|_| stage("unknown_results"))?;
@@ -1180,6 +1204,10 @@ async fn fetch_account_wide_snapshot(
         unknown_results,
     )
     .map_err(|_| stage("snapshot_complete"))?
+    .with_conditional_orders(conditional_facts)
+    .map_err(|_| stage("snapshot_conditional_orders"))?
+    .with_market_orders(market_facts)
+    .map_err(|_| stage("snapshot_market_orders"))?
     .with_balances(balances)
     .map_err(|_| stage("snapshot_balances"))
 }
@@ -1454,18 +1482,6 @@ fn snapshot_order_facts(
         });
     }
     Ok(facts)
-}
-
-fn snapshot_order_state(value: &str) -> Result<OrderState, AccountHostValidationError> {
-    match value {
-        "NEW" => Ok(OrderState::New),
-        "PARTIALLY_FILLED" => Ok(OrderState::PartiallyFilled),
-        "FILLED" => Ok(OrderState::Filled),
-        "CANCELED" => Ok(OrderState::Cancelled),
-        "EXPIRED" | "EXPIRED_IN_MATCH" => Ok(OrderState::Expired),
-        "REJECTED" => Ok(OrderState::Rejected),
-        _ => Err(AccountHostValidationError::SignedSnapshot),
-    }
 }
 
 fn snapshot_fill_symbols(
@@ -1834,21 +1850,6 @@ fn snapshot_bool(
     row.get(field)
         .and_then(Value::as_bool)
         .ok_or(AccountHostValidationError::SignedSnapshot)
-}
-
-fn snapshot_limit_time_in_force(
-    row: &serde_json::Map<String, Value>,
-    field: &str,
-) -> Result<Option<LimitTimeInForce>, AccountHostValidationError> {
-    match row.get(field) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) if !value.trim().is_empty() => match value.as_str() {
-            "GTX" => Ok(Some(LimitTimeInForce::PostOnly)),
-            "GTC" => Ok(Some(LimitTimeInForce::Gtc)),
-            _ => Ok(None),
-        },
-        Some(_) => Err(AccountHostValidationError::SignedSnapshot),
-    }
 }
 
 fn snapshot_side(

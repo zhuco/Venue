@@ -1,12 +1,12 @@
 # VENUE 架构
 
-本文描述 alpha.28 的代码结构与当前发布范围；功能入口见 [CODEMAP](CODEMAP.md)，产品行为和验收以 [KOL MVP](KOL_COPY_MVP.md)、[带单同步](LEADER_ORDER_MIRROR.md) 和 [Grid 契约](GRID_RUNTIME_REFACTOR.md) 为准。部署状态须读取实际运行版本，不能由源码或标签推断。
+本文描述 alpha.28 的代码结构与当前发布范围；功能入口见 [CODEMAP](CODEMAP.md)，产品行为和验收以 [KOL MVP](KOL_COPY_MVP.md)、[人工带单](LEADER_ORDER_MIRROR.md) 和 [Grid 契约](GRID_RUNTIME_REFACTOR.md) 为准。部署状态须读取实际运行版本，不能由源码或标签推断。
 
 ## 1. 产品范围
 
 独立多交易所策略入口见 [MULTI_VENUE_EXECUTOR](MULTI_VENUE_EXECUTOR.md)：另外五所复用相同单例进程、PostgreSQL 账本与密文边界，协议留在 adapter。此扩展的本地验证与逐所实盘验收独立于下述 Binance KOL 发布范围。
 
-Binance KOL、桌面终端和 Binance Grid 面向 Portfolio Margin UM 双向持仓账户，提供 KOL 普通限价挂单同步、桌面终端与事实驱动对冲网格。初期最多 5 个启用 KOL、200 个启用跟随账户；收费结算、策略广场、跨交易所跟单和多 Executor 分片不在本版范围。
+Binance KOL、桌面终端和 Binance Grid 面向 Portfolio Margin UM 双向持仓账户，提供 KOL 人工带单、桌面终端与事实驱动对冲网格。人工带单同步普通限价单、经认证身份确认的市价单和 `STOP_MARKET` 止损单。初期最多 5 个启用 KOL、200 个启用跟随账户；收费结算、策略广场、跨交易所跟单和多 Executor 分片不在本版范围。
 
 五所独立策略与网格走 `multi_venue_*` 和 `DurableAccountGateway`；支撑分批做多当前以 Binance 为参考行情、Bybit LIVE 为执行所。它们已纳入 alpha.28，具体准入和增强门分别见 [多交易所执行](MULTI_VENUE_EXECUTOR.md) 与 [支撑分批做多](SUPPORT_MARTINGALE.md)。旧 Node/Actor/WAL 继续保留冻结兼容边界。
 
@@ -18,14 +18,14 @@ Binance KOL、桌面终端和 Binance Grid 面向 Portfolio Margin UM 双向持�
 | Venue Web / BFF | Next.js + React；邀请注册、登录、API 表单和跟单管理；用户 Cookie 与运营会话分离 |
 | `venue-control-server` | 认证、归属、凭证加密与只读验证、版本化配置、命令入账、用户作用域查询 |
 | PostgreSQL | 用户与关系、密文、配置、源/子单映射、投影、迁移版本和唯一耐久命令账本 |
-| `venue-executor-binance` | 单例锁、认证私流与签名恢复、挂单规划、Grid、独立策略、账户调度、物理下单及对账 |
+| `venue-executor-binance` | 单例锁、认证私流与签名恢复、人工带单规划、Grid、独立策略、账户调度、物理下单及对账 |
 | `venue-leader-bot-admin` | 管理员迁移、带单授权及撤权；不提供公开授权 HTTP 接口，不执行交易 |
 | `venue-strategy-admin` | 独立策略凭证、命令、网格及只读诊断；命令入账仍由共享 Executor 执行 |
 | 六所 adapter | 签名、校时、规则、原生字段转换与规范订单/仓位事实 |
 
 浏览器经同源 BFF 访问 Control；桌面用自身 Control 会话访问 HTTP/SSE。Control 将命令提交 PostgreSQL 后由 Executor 领取，执行结果和私有投影经 Control 返回对应用户。UI 不自行确认成交。
 
-Executor 在同一进程组装挂单同步、Grid 和私有投影任务，复用账户顺序队列与共享连接。当前全局执行并发上限 32；私有投影按活动需求有界发现，不仅包含 KOL，也服务跟随账户、Grid 和桌面账户。它不为每个账户创建进程或本地恢复日志。
+Executor 在同一进程组装人工带单、Grid 和私有投影任务，复用账户顺序队列与共享连接。当前全局执行并发上限 32；私有投影按活动需求有界发现，不仅包含 KOL，也服务跟随账户、Grid 和桌面账户。它不为每个账户创建进程或本地恢复日志。
 
 ## 3. 模块边界
 
@@ -46,15 +46,13 @@ KOL 角色和带单授权是独立状态。用户经邀请注册固定归属一�
 
 当前 profile/robot 仍保存带单账户绑定。用户切换桌面执行账户不能冒充已切换带单源；源切换的目标语义、清理和签名基线边界见 [带单契约](LEADER_ORDER_MIRROR.md)，配套实现需独立验证。
 
-## 5. 挂单同步与 Grid
+## 5. 人工带单与 Grid
 
-挂单同步调用链：
+人工带单调用链：
 
 `认证账户流 / 签名 REST → 私有订单投影 → order_mirror 规划 → 源/子单映射与命令事务 → 账户队列 → Binance → 精确对账`
 
-只同步机器人与关系启用后符合条件的新普通限价单，保留源价、方向、持仓腿及 GTC/PostOnly。定比和定额在每个跟随关系独立计算；开仓按步长向上取整并满足最低数量/名义额，实际金额不得突破总风险额度。平仓按新鲜可减仓量向下裁剪，旧命令保留已持久化的取整规则。主单部分成交不反复重挂子单；改单先确认旧子单终态并扣除自身累计成交，再建立替代单；主单结束撤销子单剩余量。
-
-市价、Algo/条件单及主从仓位差异不触发追补。旧成交目标模型仅为历史和未决命令恢复保留，不能描述为新关系的复制方式。完整数量、限制与恢复规则统一维护在 [LEADER_ORDER_MIRROR](LEADER_ORDER_MIRROR.md)。
+机器人与关系启用后同步符合条件的新普通限价单、经认证身份确认的市价单及 `STOP_MARKET` 止损单。限价保留源价、方向、持仓腿及 GTC/PostOnly；市价按原生订单号去重；止损修改先撤旧 Algo 子单并确认终态，再建立替代单。定比和定额在每个跟随关系独立计算；开仓按步长向上取整并满足最低数量/名义额，实际金额不得突破总风险额度。平仓按新鲜可减仓量向下裁剪，旧命令保留已持久化的取整规则。主从仓位差异及其他 Algo 类型不触发追补。旧成交目标模型仅为历史和未决命令恢复保留，不能描述为新关系的复制方式。完整数量、限制与恢复规则统一维护在 [LEADER_ORDER_MIRROR](LEADER_ORDER_MIRROR.md)。
 
 Grid 从配置、签名基线及连续认证私流生成目标订单；Planner 计算，Store 原子提交批次，Runtime 唤醒共享 Executor 补撤。正常热路径复用有效规则与时钟，异常转签名恢复；重启依赖 PostgreSQL 和交易所事实。批内顺序、首次拒单后 30 秒重置及旧账户边界统一见 [Grid 契约](GRID_RUNTIME_REFACTOR.md)。
 

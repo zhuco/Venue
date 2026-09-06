@@ -1,7 +1,9 @@
 use super::{AccountError, AccountService, Principal, crypto, database_error, error, ms};
-use sqlx::Row;
+use rust_decimal::Decimal;
+use sqlx::{Postgres, Row, Transaction};
 use venue_control_protocol::{
     accounts::{AccountErrorCode as Code, CredentialSummary, UserSummary},
+    follow_sizing::{FollowAuthorization, FollowSizing},
     kol::{
         FollowLifecycleRequest, FollowRelationSummary, FollowRiskSettings,
         FollowSettingsUpsertRequest, KOL_SCHEMA_VERSION,
@@ -9,6 +11,7 @@ use venue_control_protocol::{
     leader_bot::valid_id,
     managed_followers::*,
 };
+use venue_gateway_binance::{BinanceCredentials, BinanceProbeError, probe_credentials};
 use zeroize::Zeroizing;
 
 impl AccountService {
@@ -50,7 +53,10 @@ impl AccountService {
         request: ManagedFollowerCreateRequest,
         now_ms: u64,
     ) -> Result<ManagedFollowerSummary, AccountError> {
-        if !valid_id(&request.request_id) || !request.credential.valid() {
+        if !valid_id(&request.request_id)
+            || !request.credential.valid()
+            || !request.authorization.valid()
+        {
             return Err(error(Code::InvalidInput));
         }
         let payload =
@@ -70,7 +76,7 @@ impl AccountService {
             return Ok(managed_summary(row.try_get("managed_id").map_err(database_error)?, summary));
         }
         let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM venue_managed_credentials WHERE kol_user_id=$1",
+            "SELECT count(*) FROM venue_managed_credentials m JOIN venue_api_credentials c USING(credential_id) WHERE m.kol_user_id=$1 AND c.deleted_ms IS NULL",
         )
         .bind(&principal.user.user_id)
         .fetch_one(&mut *tx)
@@ -87,9 +93,23 @@ impl AccountService {
         let credential = self
             .insert_credential(&mut tx, &user_id, request.credential, now_ms)
             .await?;
+        super::credentials::save_follow_authorization(
+            &mut tx,
+            &credential.credential_id,
+            request.authorization,
+        )
+        .await?;
         sqlx::query("INSERT INTO venue_managed_credentials(managed_id,kol_user_id,follower_user_id,credential_id,request_id,request_hash,created_ms) VALUES($1,$2,$3,$4,$5,$6,$7)")
             .bind(&managed_id).bind(&principal.user.user_id).bind(&user_id).bind(&credential.credential_id)
             .bind(&request.request_id).bind(request_hash).bind(ms(now_ms)?).execute(&mut *tx).await.map_err(database_error)?;
+        bind_managed_owner(
+            &mut tx,
+            &managed_id,
+            &principal.user.user_id,
+            &user_id,
+            now_ms,
+        )
+        .await?;
         tx.commit().await.map_err(database_error)?;
         Ok(managed_summary(managed_id, credential))
     }
@@ -100,13 +120,185 @@ impl AccountService {
         request: ManagedFollowerVerifyRequest,
         now_ms: u64,
     ) -> Result<ManagedFollowerSummary, AccountError> {
+        self.verify_managed_follower_with(principal, request, now_ms, |credentials| async move {
+            probe_credentials(&credentials).await
+        })
+        .await
+    }
+
+    async fn verify_managed_follower_with<F, Fut>(
+        &self,
+        principal: &Principal,
+        request: ManagedFollowerVerifyRequest,
+        now_ms: u64,
+        probe: F,
+    ) -> Result<ManagedFollowerSummary, AccountError>
+    where
+        F: FnOnce(BinanceCredentials) -> Fut,
+        Fut: std::future::Future<
+                Output = Result<venue_gateway_binance::BinanceCredentialProbe, BinanceProbeError>,
+            >,
+    {
         let (subject, credential_id) = self
             .managed_verification_subject(principal, &request.managed_id, now_ms)
             .await?;
         let summary = self
-            .verify_credential(&subject, &credential_id, now_ms)
+            .verify_with(&subject, &credential_id, now_ms, probe)
             .await?;
+        if summary.verification == venue_control_protocol::accounts::ApiVerificationState::Verified
+        {
+            let mut tx = self.pool.begin().await.map_err(database_error)?;
+            bind_managed_owner(
+                &mut tx,
+                &request.managed_id,
+                &principal.user.user_id,
+                &subject.user.user_id,
+                now_ms,
+            )
+            .await?;
+            tx.commit().await.map_err(database_error)?;
+            self.activate_saved_follow_authorization(
+                &subject,
+                &credential_id,
+                &summary,
+                now_ms,
+                Some((&principal.user.user_id, &request.managed_id)),
+            )
+            .await?;
+        }
         Ok(managed_summary(request.managed_id, summary))
+    }
+
+    pub async fn delete_managed_follower(
+        &self,
+        principal: &Principal,
+        request: ManagedFollowerDeleteRequest,
+        now_ms: u64,
+    ) -> Result<ManagedFollowers, AccountError> {
+        self.delete_managed_follower_with(principal, request, now_ms, |credentials| async move {
+            probe_credentials(&credentials).await
+        })
+        .await?;
+        self.managed_followers(principal).await
+    }
+
+    async fn delete_managed_follower_with<F, Fut>(
+        &self,
+        principal: &Principal,
+        request: ManagedFollowerDeleteRequest,
+        now_ms: u64,
+        probe: F,
+    ) -> Result<(), AccountError>
+    where
+        F: FnOnce(BinanceCredentials) -> Fut,
+        Fut: std::future::Future<
+                Output = Result<venue_gateway_binance::BinanceCredentialProbe, BinanceProbeError>,
+            >,
+    {
+        self.confirm_password(principal, request.password, now_ms)
+            .await?;
+        let (subject, credential_id) = self
+            .managed_follow_subject(principal, &request.managed_id, now_ms, false)
+            .await?;
+        match self.follow_relation(&subject).await {
+            Ok(relation)
+                if relation.state
+                    != venue_control_protocol::kol::FollowLifecycleState::Disabled
+                    && (relation.state
+                        != venue_control_protocol::kol::FollowLifecycleState::Paused
+                        || relation.activation_requested) =>
+            {
+                self.request_managed_follow_lifecycle(
+                    principal,
+                    ManagedFollowLifecycleRequest {
+                        request_id: crypto::opaque_id()?,
+                        managed_id: request.managed_id.clone(),
+                        relation_id: relation.relation_id,
+                        expected_revision: relation.revision,
+                        action: venue_control_protocol::kol::FollowLifecycleAction::Pause,
+                        risk_confirmed: false,
+                    },
+                    now_ms,
+                )
+                .await?;
+            }
+            Ok(_) => {}
+            Err(cause) if cause.code == Code::NotFound => {}
+            Err(cause) => return Err(cause),
+        }
+        let summary = self
+            .verify_with(&subject, &credential_id, now_ms, probe)
+            .await?;
+        if summary.verification != venue_control_protocol::accounts::ApiVerificationState::Verified
+            || summary.has_exposure != Some(false)
+        {
+            return Err(error(Code::AccountInUse));
+        }
+
+        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let row = sqlx::query(
+            "SELECT c.verification_json FROM venue_managed_credentials m JOIN venue_api_credentials c ON c.credential_id=m.credential_id AND c.user_id=m.follower_user_id WHERE m.managed_id=$1 AND m.kol_user_id=$2 AND c.deleted_ms IS NULL FOR UPDATE OF m,c",
+        )
+        .bind(&request.managed_id)
+        .bind(&principal.user.user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(database_error)?
+        .ok_or(error(Code::NotFound))?;
+        let relation = sqlx::query(
+            "SELECT relation_id,relation_state FROM venue_kol_follow_relations WHERE follower_user_id=$1 FOR UPDATE",
+        )
+        .bind(&subject.user.user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        let relation_id: Option<String> = relation
+            .as_ref()
+            .map(|row| row.try_get("relation_id"))
+            .transpose()
+            .map_err(database_error)?;
+        let relation_state: Option<String> = relation
+            .as_ref()
+            .map(|row| row.try_get("relation_state"))
+            .transpose()
+            .map_err(database_error)?;
+        if relation_state
+            .as_deref()
+            .is_some_and(|state| !matches!(state, "paused" | "disabled"))
+        {
+            return Err(error(Code::AccountInUse));
+        }
+        if let Some(relation_id) = &relation_id {
+            let busy: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM venue_kol_activation_requests WHERE relation_id=$1 AND request_state='pending') OR EXISTS(SELECT 1 FROM venue_order_mirrors WHERE relation_id=$1 AND mirror_state NOT IN ('terminal','blocked')) OR EXISTS(SELECT 1 FROM venue_binance_commands WHERE relation_id=$1 AND command_state IN ('pending','sending','accepted','reconcile_required'))",
+            )
+            .bind(relation_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(database_error)?;
+            if busy {
+                return Err(error(Code::AccountInUse));
+            }
+            sqlx::query("UPDATE venue_kol_follow_relations SET relation_state='disabled',active_slot=NULL,attention_code=NULL,revision=revision+1,updated_ms=$1 WHERE relation_id=$2")
+                .bind(ms(now_ms)?).bind(relation_id).execute(&mut *tx).await.map_err(database_error)?;
+        }
+        let mut tombstone: CredentialSummary =
+            serde_json::from_value(row.try_get("verification_json").map_err(database_error)?)
+                .map_err(|_| error(Code::Unavailable))?;
+        super::credentials::invalidate(
+            &mut tombstone,
+            venue_control_protocol::accounts::ApiVerificationState::Unverified,
+        );
+        tombstone.masked_key = "已删除".into();
+        let tombstone_key = crypto::fingerprint(
+            format!("managed-deleted:{}:{now_ms}", request.managed_id).as_bytes(),
+        );
+        sqlx::query("UPDATE venue_api_credentials SET key_fingerprint=$1,masked_key=$2,encrypted_credentials=$3,verification_json=$4,deleted_ms=$5,revision=revision+1 WHERE credential_id=$6")
+            .bind(tombstone_key).bind(&tombstone.masked_key).bind(Vec::<u8>::new())
+            .bind(serde_json::to_value(&tombstone).map_err(|_| error(Code::Unavailable))?)
+            .bind(ms(now_ms)?).bind(&credential_id).execute(&mut *tx).await.map_err(database_error)?;
+        tx.commit().await.map_err(database_error)?;
+        Ok(())
     }
 
     pub async fn upsert_managed_follow_settings(
@@ -224,6 +416,137 @@ impl AccountService {
             row.try_get("credential_id").map_err(database_error)?,
         ))
     }
+
+    pub(super) async fn activate_saved_follow_authorization(
+        &self,
+        principal: &Principal,
+        credential_id: &str,
+        summary: &CredentialSummary,
+        now_ms: u64,
+        managed: Option<(&str, &str)>,
+    ) -> Result<(), AccountError> {
+        let value: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT follow_authorization_json FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND deleted_ms IS NULL",
+        )
+        .bind(credential_id)
+        .bind(&principal.user.user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .flatten();
+        let Some(value) = value else {
+            return Ok(());
+        };
+        let authorization: FollowAuthorization =
+            serde_json::from_value(value).map_err(|_| error(Code::Unavailable))?;
+        if !authorization.valid() {
+            return Err(error(Code::Unavailable));
+        }
+        let has_follow_owner: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM venue_user_kol_bindings WHERE user_id=$1)",
+        )
+        .bind(&principal.user.user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if !has_follow_owner {
+            return Ok(());
+        }
+        if summary.has_exposure != Some(false) {
+            return Err(error(Code::AccountInUse));
+        }
+        let equity = summary.equity.ok_or(error(Code::Unavailable))?;
+        if equity <= Decimal::ZERO {
+            return Err(error(Code::AccountInUse));
+        }
+        let total = equity
+            .checked_mul(Decimal::from(5))
+            .ok_or(error(Code::InvalidInput))?;
+        let order = match authorization.sizing {
+            FollowSizing::Proportional => total,
+            FollowSizing::FixedNotional { notional } if notional <= total => notional,
+            FollowSizing::FixedNotional { .. } => return Err(error(Code::InvalidInput)),
+        };
+        let existing = match self.follow_relation(principal).await {
+            Ok(value) => Some(value),
+            Err(cause) if cause.code == Code::NotFound => None,
+            Err(cause) => return Err(cause),
+        };
+        if existing.as_ref().is_some_and(|relation| {
+            relation.state == venue_control_protocol::kol::FollowLifecycleState::Active
+                || relation.activation_requested
+        }) {
+            return Ok(());
+        }
+        let relation = self
+            .upsert_follow_settings_scoped(
+                principal,
+                FollowSettingsUpsertRequest {
+                    schema_version: KOL_SCHEMA_VERSION,
+                    request_id: crypto::opaque_id()?,
+                    settings: FollowRiskSettings {
+                        credential_id: credential_id.to_owned(),
+                        sizing: authorization.sizing,
+                        allocated_capital: equity,
+                        multiplier: authorization.multiplier,
+                        max_order_notional: order,
+                        max_total_notional: total,
+                        max_deviation_bps: 5_000,
+                        allowed_symbols: Vec::new(),
+                    },
+                    expected_revision: existing.map(|value| value.revision),
+                },
+                now_ms,
+                managed,
+            )
+            .await?;
+        self.request_follow_lifecycle_scoped(
+            principal,
+            FollowLifecycleRequest {
+                schema_version: KOL_SCHEMA_VERSION,
+                request_id: crypto::opaque_id()?,
+                relation_id: relation.relation_id,
+                expected_revision: relation.revision,
+                action: venue_control_protocol::kol::FollowLifecycleAction::Activate,
+                risk_confirmed: true,
+            },
+            now_ms,
+            managed,
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+async fn bind_managed_owner(
+    tx: &mut Transaction<'_, Postgres>,
+    managed_id: &str,
+    kol_user_id: &str,
+    follower_user_id: &str,
+    now_ms: u64,
+) -> Result<(), AccountError> {
+    let has_binding_source: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='venue_user_kol_bindings'::regclass AND attname='binding_source' AND NOT attisdropped)",
+    )
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(database_error)?;
+    if has_binding_source {
+        sqlx::query("INSERT INTO venue_user_kol_bindings(user_id,kol_user_id,managed_id,bound_ms,binding_source) VALUES($1,$2,$3,$4,'kol_managed') ON CONFLICT(user_id) DO NOTHING")
+            .bind(follower_user_id).bind(kol_user_id).bind(managed_id).bind(ms(now_ms)?)
+            .execute(&mut **tx).await.map_err(database_error)?;
+    } else {
+        sqlx::query("INSERT INTO venue_user_kol_bindings(user_id,kol_user_id,managed_id,bound_ms) VALUES($1,$2,$3,$4) ON CONFLICT(user_id) DO NOTHING")
+            .bind(follower_user_id).bind(kol_user_id).bind(managed_id).bind(ms(now_ms)?)
+            .execute(&mut **tx).await.map_err(database_error)?;
+    }
+    let matches: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_user_kol_bindings WHERE user_id=$1 AND kol_user_id=$2 AND managed_id=$3 AND invite_id IS NULL)")
+        .bind(follower_user_id).bind(kol_user_id).bind(managed_id)
+        .fetch_one(&mut **tx).await.map_err(database_error)?;
+    if !matches {
+        return Err(error(Code::Conflict));
+    }
+    Ok(())
 }
 
 fn managed_settings(
@@ -271,6 +594,9 @@ fn managed_summary(managed_id: String, summary: CredentialSummary) -> ManagedFol
         masked_key: summary.masked_key,
         verification: summary.verification,
         verified_ms: summary.verified_ms,
+        equity: summary.equity,
+        available_margin: summary.available_margin,
+        balance_observed_ms: summary.balance_observed_ms,
     }
 }
 

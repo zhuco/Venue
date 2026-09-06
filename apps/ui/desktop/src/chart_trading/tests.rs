@@ -68,6 +68,7 @@ fn private_overlays_obey_account_symbol_and_visibility() -> Result<(), Box<dyn s
         }],
         position_history: vec![],
         open_orders: vec![],
+        conditional_orders: vec![],
         fills: vec![],
         assets: vec![],
     };

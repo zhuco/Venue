@@ -64,7 +64,8 @@ use account_scope::{
 pub use account_snapshot::{
     AccountQuoteToUsdtRate, AccountRiskAmount, AccountRiskEvidence, RuntimeBootstrapReceipt,
     SignedAccountBalance, SignedAccountOrderFact, SignedAccountPositionFact,
-    SignedAccountPositionMode, SignedAccountSnapshot, SignedUnknownFact, SignedUnknownResult,
+    SignedAccountPositionMode, SignedAccountSnapshot, SignedConditionalOrderFact,
+    SignedMarketOrderFact, SignedUnknownFact, SignedUnknownResult,
 };
 pub use account_symbols::AccountSymbolSet;
 

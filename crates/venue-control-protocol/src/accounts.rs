@@ -169,6 +169,26 @@ pub struct CredentialSummary {
     pub dual_position: bool,
     pub account_mode: Option<String>,
     pub has_exposure: Option<bool>,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub equity: Option<rust_decimal::Decimal>,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub available_margin: Option<rust_decimal::Decimal>,
+    #[serde(default)]
+    pub balance_observed_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FollowCredentialCreateRequest {
+    pub credential: BindCredentialRequest,
+    #[serde(default)]
+    pub authorization: crate::follow_sizing::FollowAuthorization,
+}
+
+impl FollowCredentialCreateRequest {
+    pub fn valid(&self) -> bool {
+        self.credential.valid() && self.authorization.valid()
+    }
 }
 
 impl CredentialSummary {
@@ -291,6 +311,9 @@ mod tests {
             dual_position: true,
             account_mode: Some("Portfolio Margin · UM".into()),
             has_exposure: Some(false),
+            equity: Some(rust_decimal::Decimal::from(10)),
+            available_margin: Some(rust_decimal::Decimal::from(8)),
+            balance_observed_ms: Some(100),
         };
         assert!(summary.selectable(10_000));
     }

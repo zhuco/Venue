@@ -44,6 +44,10 @@ pub enum SupportMartingaleAction {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupportMartingaleConfig {
+    #[serde(default)]
+    pub entry_mode: MartingaleEntryMode,
+    #[serde(default)]
+    pub symbol_parameters: Vec<MartingaleSymbolParameters>,
     pub reference_venue: VenueId,
     pub execution_venue: VenueId,
     pub symbols: Vec<Symbol>,
@@ -63,7 +67,8 @@ pub struct SupportMartingaleConfig {
 
 impl SupportMartingaleConfig {
     pub fn validate(&self) -> Result<(), SupportMartingaleProtocolError> {
-        if self.reference_venue != VenueId::Binance
+        if !self.valid_symbol_parameters()
+            || self.reference_venue != VenueId::Binance
             || self.execution_venue == VenueId::Binance
             || self.symbols.is_empty()
             || self.symbols.len() > 30
@@ -92,6 +97,83 @@ impl SupportMartingaleConfig {
             return Err(SupportMartingaleProtocolError::Config);
         }
         Ok(())
+    }
+
+    fn valid_symbol_parameters(&self) -> bool {
+        self.symbol_parameters
+            .iter()
+            .enumerate()
+            .all(|(index, value)| {
+                self.symbols.contains(&value.symbol)
+                    && !self.symbol_parameters[..index]
+                        .iter()
+                        .any(|other| other.symbol == value.symbol)
+                    && value.entry_price.is_none_or(|price| price > Decimal::ZERO)
+                    && value.add_drop_rate > Decimal::ZERO
+                    && value.add_drop_rate < Decimal::ONE
+                    && match value.stop_loss {
+                        None => true,
+                        Some(MartingaleStopLoss::FixedPrice { price }) => {
+                            price > Decimal::ZERO
+                                && value.entry_price.is_none_or(|entry| price < entry)
+                        }
+                        Some(MartingaleStopLoss::AveragePricePercent { rate }) => {
+                            rate > Decimal::ZERO && rate < Decimal::ONE
+                        }
+                    }
+            })
+            && (self.entry_mode != MartingaleEntryMode::FixedPrice
+                || self.symbols.iter().all(|symbol| {
+                    self.symbol_parameters
+                        .iter()
+                        .any(|value| value.symbol == *symbol && value.entry_price.is_some())
+                }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MartingaleEntryMode {
+    #[default]
+    Support,
+    FixedPrice,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MartingaleSymbolParameters {
+    pub symbol: Symbol,
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub entry_price: Option<Decimal>,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub add_drop_rate: Decimal,
+    pub stop_loss: Option<MartingaleStopLoss>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MartingaleStopLoss {
+    FixedPrice {
+        #[serde(with = "rust_decimal::serde::str")]
+        price: Decimal,
+    },
+    AveragePricePercent {
+        #[serde(with = "rust_decimal::serde::str")]
+        rate: Decimal,
+    },
+}
+
+impl MartingaleStopLoss {
+    pub fn trigger_price(self, average: Decimal) -> Option<Decimal> {
+        match self {
+            Self::FixedPrice { price } if price > Decimal::ZERO => Some(price),
+            Self::AveragePricePercent { rate }
+                if average > Decimal::ZERO && rate > Decimal::ZERO && rate < Decimal::ONE =>
+            {
+                average.checked_mul(Decimal::ONE.checked_sub(rate)?)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -291,9 +373,80 @@ pub enum SupportMartingaleProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fixed_config() -> Result<SupportMartingaleConfig, Box<dyn std::error::Error>> {
+        Ok(serde_json::from_value(serde_json::json!({
+            "entry_mode":"fixed_price", "reference_venue":"binance", "execution_venue":"bybit",
+            "symbols":["SOL/USDT"], "symbol_parameters":[{
+                "symbol":"SOL/USDT", "entry_price":"100", "add_drop_rate":"0.02",
+                "stop_loss":{"method":"average_price_percent","rate":"0.1"}
+            }], "total_budget":"100", "first_order_notional":"5", "max_entries":3,
+            "size_multiplier":"1.25", "target_profit_rate":"0.005", "minimum_profit_quote":"0",
+            "max_active_positions":1
+        }))?)
+    }
+
+    #[test]
+    fn fixed_entry_requires_each_symbol_and_valid_stop_terms()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let original = fixed_config()?;
+        assert!(original.validate().is_ok());
+        for rate in [Decimal::ZERO, Decimal::ONE, -Decimal::ONE] {
+            let mut config = original.clone();
+            config.symbol_parameters[0].add_drop_rate = rate;
+            assert!(config.validate().is_err());
+            config = original.clone();
+            config.symbol_parameters[0].stop_loss =
+                Some(MartingaleStopLoss::AveragePricePercent { rate });
+            assert!(config.validate().is_err());
+        }
+        let mut config = original.clone();
+        config.symbol_parameters[0].entry_price = None;
+        assert!(config.validate().is_err());
+        config = original.clone();
+        config.symbols.push("ETH/USDT".parse()?);
+        assert!(config.validate().is_err());
+        config = original.clone();
+        config
+            .symbol_parameters
+            .push(config.symbol_parameters[0].clone());
+        assert!(config.validate().is_err());
+        config = original;
+        config.symbol_parameters[0].stop_loss = Some(MartingaleStopLoss::FixedPrice {
+            price: Decimal::from(100),
+        });
+        assert!(config.validate().is_err());
+        config.symbol_parameters[0].stop_loss = Some(MartingaleStopLoss::FixedPrice {
+            price: Decimal::from(90),
+        });
+        assert!(config.validate().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn old_configs_keep_support_mode_and_stops_are_explicit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = fixed_config()?;
+        assert_eq!(
+            config.symbol_parameters[0]
+                .stop_loss
+                .and_then(|stop| stop.trigger_price(Decimal::from(80))),
+            Some(Decimal::from(72))
+        );
+        let mut value = serde_json::to_value(config)?;
+        let map = value.as_object_mut().ok_or("configuration object")?;
+        map.remove("entry_mode");
+        map.remove("symbol_parameters");
+        let old: SupportMartingaleConfig = serde_json::from_value(value)?;
+        assert!(old.validate().is_ok());
+        assert_eq!(old.entry_mode, MartingaleEntryMode::Support);
+        assert!(old.symbol_parameters.is_empty());
+        Ok(())
+    }
     #[test]
     fn accepts_binance_reference_and_non_binance_execution() {
         let config = SupportMartingaleConfig {
+            entry_mode: Default::default(),
+            symbol_parameters: Vec::new(),
             reference_venue: VenueId::Binance,
             execution_venue: VenueId::Bybit,
             symbols: vec!["SOL/USDT".parse().unwrap(), "DOGE/USDT".parse().unwrap()],
@@ -311,6 +464,8 @@ mod tests {
     #[test]
     fn rejects_mixed_quote_assets_and_out_of_scope_counts() {
         let mut config = SupportMartingaleConfig {
+            entry_mode: Default::default(),
+            symbol_parameters: Vec::new(),
             reference_venue: VenueId::Binance,
             execution_venue: VenueId::Bybit,
             symbols: vec!["SOL/USDT".parse().unwrap(), "ETH/USDC".parse().unwrap()],

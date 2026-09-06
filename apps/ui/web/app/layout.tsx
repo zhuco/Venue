@@ -5,7 +5,7 @@ import "./customer.css";
 
 export const metadata: Metadata = {
   title: "Venue · 跟单与带单机器人",
-  description: "Binance KOL 挂单同步与账户管理",
+  description: "Binance KOL 人工带单与账户管理",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

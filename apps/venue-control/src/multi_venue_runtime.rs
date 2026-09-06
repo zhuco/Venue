@@ -314,6 +314,16 @@ impl MultiVenueExecutor {
                         ));
                     }
                 };
+                if support_fence
+                    .is_some_and(|fence| !fence.market_allows(market.reference_price.value()))
+                {
+                    return Ok((
+                        AccountGatewayResult::Rejected {
+                            reason: "strategy_support_price_changed".into(),
+                        },
+                        Some(snapshot),
+                    ));
+                }
                 if !crate::multi_venue_risk::market_guard(
                     &claim.command,
                     &snapshot,

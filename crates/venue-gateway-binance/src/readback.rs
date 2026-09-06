@@ -32,6 +32,7 @@ pub enum BinancePrivateSurface {
     AlgoOrders,
     Fills,
     ExactOrder,
+    ExactAlgoOrder,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -174,6 +175,7 @@ impl BinancePrivateReadRequest {
             BinancePrivateSurface::AlgoOrders => endpoints::OPEN_ALGO_ORDERS,
             BinancePrivateSurface::Fills => endpoints::USER_TRADES,
             BinancePrivateSurface::ExactOrder => endpoints::ORDER,
+            BinancePrivateSurface::ExactAlgoOrder => endpoints::EXACT_ALGO_ORDER,
         }
     }
 
@@ -350,6 +352,43 @@ pub fn build_exact_order_for_native_symbol_request(
         vec![
             ("symbol".to_owned(), native.to_owned()),
             ("origClientOrderId".to_owned(), client_order_id.to_owned()),
+        ],
+    )
+}
+
+/// Exact signed lookup by the venue order identity carried by an authenticated fill. This proves
+/// the source order type after a process restarts and only REST fills remain available.
+pub fn build_exact_order_by_native_id_request(
+    scope: &BinancePrivateReadScope,
+    native: &str,
+    native_order_id: &str,
+) -> Result<BinancePrivateReadRequest, BinanceReadbackError> {
+    if native.trim().is_empty() || native_order_id.trim().is_empty() {
+        return Err(BinanceReadbackError::Request);
+    }
+    BinancePrivateReadRequest::new(
+        scope,
+        BinancePrivateSurface::ExactOrder,
+        1,
+        vec![
+            ("symbol".to_owned(), native.to_owned()),
+            ("orderId".to_owned(), native_order_id.to_owned()),
+        ],
+    )
+}
+
+pub fn build_exact_algo_order_request(
+    scope: &BinancePrivateReadScope,
+    client_algo_id: &str,
+) -> Result<BinancePrivateReadRequest, BinanceReadbackError> {
+    validate_client_order_id(client_algo_id)?;
+    BinancePrivateReadRequest::new(
+        scope,
+        BinancePrivateSurface::ExactAlgoOrder,
+        1,
+        vec![
+            ("algoType".to_owned(), "CONDITIONAL".to_owned()),
+            ("clientAlgoId".to_owned(), client_algo_id.to_owned()),
         ],
     )
 }

@@ -105,7 +105,7 @@ impl AccountService {
     ) -> Result<ExecutorCommandSummary, AccountError> {
         request.validate().map_err(|_| error(Code::InvalidInput))?;
         let reducing = request.action.is_close();
-        let trading_account_id: String = sqlx::query_scalar("SELECT trading_account_id FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND deleted_ms IS NULL AND trading_account_id IS NOT NULL AND verification_json->>'verification'='verified'")
+        let trading_account_id: String = sqlx::query_scalar("SELECT trading_account_id FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND EXISTS (SELECT 1 FROM venue_user_trading_accounts a WHERE a.trading_account_id=venue_api_credentials.trading_account_id AND a.user_id=venue_api_credentials.user_id AND a.venue='binance') AND deleted_ms IS NULL AND trading_account_id IS NOT NULL AND verification_json->>'verification'='verified'")
             .bind(&request.credential_id).bind(&principal.user.user_id).fetch_optional(&self.pool)
             .await.map_err(database_error)?.ok_or(error(Code::VerificationRequired))?;
         let projection = if reducing {
@@ -190,7 +190,7 @@ impl AccountService {
         .await
         .map_err(account_admission_error)?;
         // Recheck under the existing credential lock, without a private exchange round trip.
-        let verified: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND trading_account_id=$3 AND deleted_ms IS NULL AND verification_json->>'verification'='verified')")
+        let verified: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND trading_account_id=$3 AND EXISTS (SELECT 1 FROM venue_user_trading_accounts a WHERE a.trading_account_id=venue_api_credentials.trading_account_id AND a.user_id=venue_api_credentials.user_id AND a.venue='binance') AND deleted_ms IS NULL AND verification_json->>'verification'='verified')")
             .bind(&request.credential_id).bind(&principal.user.user_id).bind(&trading_account_id)
             .fetch_one(&mut *tx).await.map_err(database_error)?;
         if !verified {

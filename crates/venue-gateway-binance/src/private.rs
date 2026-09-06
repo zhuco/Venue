@@ -36,6 +36,9 @@ pub struct PrivateReadback {
 pub struct StreamFill {
     pub fill: Fill,
     pub client_order_id: FieldState<String>,
+    /// Native source order type from the authenticated order event. Only an exact MARKET value
+    /// may authorize market-order mirroring.
+    pub order_type: FieldState<String>,
     /// Original order quantity reported by the authenticated order update. Older signed-fill
     /// fixtures do not carry this value, so absence remains explicit and is never inferred from
     /// the last-fill quantity.
@@ -455,6 +458,7 @@ pub fn parse_stream_fill(
     Ok(Some(StreamFill {
         fill,
         client_order_id: optional_text(order.get("c")),
+        order_type: optional_text(order.get("o")),
         original_quantity,
         cumulative_filled_quantity,
         order_state,

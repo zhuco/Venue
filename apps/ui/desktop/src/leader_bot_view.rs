@@ -30,7 +30,7 @@ impl LeaderEditor {
             mode: EditorMode::Create,
             credential_id: credential_id.to_owned(),
             name: "KOL 带单".to_owned(),
-            description: "同步主账户符合条件的新限价挂单".to_owned(),
+            description: "同步主账户符合条件的限价单、市价单和止损单".to_owned(),
             strategy_capital: capital.normalize().to_string(),
         }
     }
@@ -76,10 +76,15 @@ pub struct LeaderBotView {
     confirmed: Option<(String, u64)>,
 }
 
+pub(crate) fn clear_selection(model: &mut AppModel) {
+    model.execution.leader_bot.selected_bot_id = None;
+}
+
 #[derive(Clone)]
 enum BotRow {
     Grid(GridInstanceSummary),
     Leader(LeaderBotListItem),
+    Martingale(crate::client::SupportMartingaleListItem),
 }
 
 impl BotRow {
@@ -87,6 +92,7 @@ impl BotRow {
         match self {
             Self::Grid(instance) => instance.updated_ms,
             Self::Leader(bot) => bot.updated_ms,
+            Self::Martingale(_) => 0,
         }
     }
 
@@ -94,6 +100,7 @@ impl BotRow {
         match self {
             Self::Grid(instance) => &instance.instance_id,
             Self::Leader(bot) => &bot.bot_id,
+            Self::Martingale(instance) => &instance.instance_id,
         }
     }
 }
@@ -137,6 +144,16 @@ pub fn show(
         .cloned()
         .map(BotRow::Grid)
         .chain(leaders.iter().cloned().map(BotRow::Leader))
+        .chain(
+            model
+                .execution
+                .support_martingale
+                .instances
+                .iter()
+                .filter(|item| item.trading_account_id == account_id)
+                .cloned()
+                .map(BotRow::Martingale),
+        )
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| {
         right
@@ -199,7 +216,9 @@ fn toolbar(
         ui.menu_button("新建机器人", |ui| {
             if ui
                 .add_enabled(
-                    credential_ready && !grid_pending,
+                    credential_ready
+                        && credential.venue == venue_gateway_api::VenueId::Binance
+                        && !grid_pending,
                     egui::Button::new("Binance 对冲网格"),
                 )
                 .on_disabled_hover_text("需要已验证且可用的 Binance 双向持仓账户")
@@ -209,6 +228,19 @@ fn toolbar(
                 crate::grid_view::open_create(model, credential);
                 ui.close();
             }
+            if ui
+                .add_enabled(
+                    crate::support_martingale_view::can_create(model, credential),
+                    egui::Button::new("马丁做多"),
+                )
+                .on_disabled_hover_text("请选择已验证的 Bybit LIVE 执行账户")
+                .clicked()
+            {
+                model.execution.leader_bot.editor = None;
+                crate::grid_view::close_editor(model);
+                crate::support_martingale_view::open_create(model, credential);
+                ui.close();
+            }
             let can_create_leader = access.is_some_and(|access| {
                 access.can_use
                     && access.bots.len() < MAX_LEADER_BOTS_PER_KOL as usize
@@ -216,7 +248,7 @@ fn toolbar(
             }) && credential_ready
                 && !leader_pending;
             if ui
-                .add_enabled(can_create_leader, egui::Button::new("KOL 挂单同步"))
+                .add_enabled(can_create_leader, egui::Button::new("人工带单"))
                 .on_disabled_hover_text("需要已启用的 KOL 资料、带单授权和已验证主账户")
                 .clicked()
             {
@@ -252,7 +284,7 @@ fn robot_table(
     credential: &CredentialSummary,
     rows: &[BotRow],
 ) {
-    egui::ScrollArea::horizontal()
+    egui::ScrollArea::both()
         .id_salt("built-in-robot-list")
         .show(ui, |ui| {
             egui::Grid::new("built-in-robot-table")
@@ -277,6 +309,11 @@ fn robot_table(
                         match row {
                             BotRow::Grid(instance) => grid_row(ui, model, instance),
                             BotRow::Leader(bot) => leader_row(ui, model, access, credential, bot),
+                            BotRow::Martingale(instance) => {
+                                crate::support_martingale_view::list_row(
+                                    ui, model, credential, instance,
+                                )
+                            }
                         }
                         ui.end_row();
                     }
@@ -327,6 +364,7 @@ fn grid_row(ui: &mut egui::Ui, model: &mut AppModel, instance: &GridInstanceSumm
     ui.horizontal(|ui| {
         if ui.small_button("管理").clicked() {
             model.execution.leader_bot.selected_bot_id = None;
+            crate::support_martingale_view::clear_selection(model);
             crate::grid_view::select(model, &instance.instance_id);
         }
         if ui
@@ -353,16 +391,17 @@ fn leader_row(
     let selected = model.execution.leader_bot.selected_bot_id.as_deref() == Some(&bot.bot_id);
     if ui.selectable_label(selected, &bot.config.name).clicked() {
         crate::grid_view::clear_selection(model);
+        crate::support_martingale_view::clear_selection(model);
         model.execution.leader_bot.selected_bot_id = Some(bot.bot_id.clone());
     }
-    ui.label("KOL 挂单同步");
+    ui.label("人工带单");
     ui.label(credential_label_or_current(
         model,
         credential,
         &bot.credential_id,
     ))
     .on_hover_text(&bot.trading_account_id);
-    ui.weak("符合条件的新限价挂单");
+    ui.weak("符合条件的限价单、市价单和止损单");
     let (state, color) = leader_state(bot.state, model.execution.leader_bot.fresh);
     ui.colored_label(color, state);
     ui.monospace(format!(
@@ -385,20 +424,18 @@ fn leader_row(
     ui.horizontal(|ui| {
         if ui.small_button("管理").clicked() {
             crate::grid_view::clear_selection(model);
+            crate::support_martingale_view::clear_selection(model);
             model.execution.leader_bot.selected_bot_id = Some(bot.bot_id.clone());
         }
-        let editable = bot.state == LeaderBotState::Stopped
-            && bot.credential_id == credential.credential_id
-            && model.execution.leader_bot.fresh
-            && model.execution.leader_bot.pending.is_none();
         if ui
-            .add_enabled(editable, egui::Button::new("编辑"))
-            .on_disabled_hover_text("仅可编辑当前凭证绑定且已停用的机器人")
+            .button("编辑")
+            .on_hover_text("打开配置；运行中可查看，停用并完成对账后可保存")
             .clicked()
         {
             crate::grid_view::close_editor(model);
             crate::grid_view::clear_selection(model);
-            model.execution.leader_bot.selected_bot_id = Some(bot.bot_id.clone());
+            crate::support_martingale_view::clear_selection(model);
+            model.execution.leader_bot.selected_bot_id = None;
             model.execution.leader_bot.editor = Some(LeaderEditor::update(bot));
         }
     });
@@ -413,9 +450,9 @@ fn empty_leader_row(
         return;
     };
     ui.weak("尚未创建");
-    ui.label("KOL 挂单同步");
+    ui.label("人工带单");
     ui.label(&credential.label);
-    ui.weak("符合条件的新限价挂单");
+    ui.weak("符合条件的限价单、市价单和止损单");
     let (label, color) = availability_state(access);
     ui.colored_label(color, label);
     ui.weak("—");
@@ -452,117 +489,129 @@ fn leader_management(
         .bots
         .iter()
         .any(|other| other.bot_id != bot.bot_id && other.state != LeaderBotState::Stopped);
-    ui.add_space(8.0);
-    ui.group(|ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.strong(&bot.config.name);
-            ui.weak(format!(
-                "策略资金 {} · 实例 {}",
-                bot.config.strategy_capital.normalize(),
-                short_id(&bot.bot_id)
-            ));
+    if model.execution.leader_bot.editor.is_some() {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new("机器人管理")
+        .id(egui::Id::new("leader-bot-management"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .vscroll(true)
+        .show(ui.ctx(), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(&bot.config.name);
+                ui.weak(format!(
+                    "策略资金 {} · 实例 {}",
+                    bot.config.strategy_capital.normalize(),
+                    short_id(&bot.bot_id)
+                ));
+            });
+            if !bot.config.description.is_empty() {
+                ui.label(&bot.config.description);
+            }
+            if bot.state == LeaderBotState::Stopped && access.can_use {
+                let mut confirmed = confirmed(model, &bot);
+                if ui
+                    .add_enabled(
+                        scope_current && credential_ready && fresh && !pending && !active_sibling,
+                        egui::Checkbox::new(
+                            &mut confirmed,
+                            "确认启用后同步符合条件的限价单、市价单和止损单；跟随账户仍须各自启用",
+                        ),
+                    )
+                    .changed()
+                {
+                    model.execution.leader_bot.confirmed =
+                        confirmed.then(|| (bot.bot_id.clone(), bot.revision));
+                }
+            }
+            ui.horizontal_wrapped(|ui| match bot.state {
+                LeaderBotState::Stopped => {
+                    if ui
+                        .add_enabled(
+                            access.can_use
+                                && scope_current
+                                && credential_ready
+                                && fresh
+                                && !pending
+                                && !active_sibling
+                                && confirmed(model, &bot),
+                            egui::Button::new("启用"),
+                        )
+                        .on_disabled_hover_text(
+                            "需有效授权、当前已验证凭证、无其他活动带单机器人并完成风险确认",
+                        )
+                        .clicked()
+                    {
+                        *action = Some(UiAction::Lifecycle {
+                            bot_id: bot.bot_id.clone(),
+                            revision: bot.revision,
+                            action: LeaderBotAction::Start,
+                        });
+                    }
+                    if ui
+                        .add_enabled(
+                            scope_current && fresh && !pending,
+                            egui::Button::new("编辑配置"),
+                        )
+                        .clicked()
+                    {
+                        model.execution.leader_bot.editor = Some(LeaderEditor::update(&bot));
+                    }
+                }
+                LeaderBotState::Running | LeaderBotState::NeedsAttention => {
+                    if ui
+                        .add_enabled(
+                            scope_current && fresh && !pending,
+                            egui::Button::new("停用"),
+                        )
+                        .on_disabled_hover_text("停用会撤销程序子单，但不会自动平仓")
+                        .clicked()
+                    {
+                        *action = Some(UiAction::Lifecycle {
+                            bot_id: bot.bot_id.clone(),
+                            revision: bot.revision,
+                            action: LeaderBotAction::Stop,
+                        });
+                    }
+                }
+                LeaderBotState::Draining => {
+                    ui.spinner();
+                    ui.weak("正在撤销程序子单并等待对账，不会自动平仓");
+                    if ui
+                        .add_enabled(
+                            scope_current && fresh && !pending,
+                            egui::Button::new("重试停用"),
+                        )
+                        .clicked()
+                    {
+                        *action = Some(UiAction::Lifecycle {
+                            bot_id: bot.bot_id.clone(),
+                            revision: bot.revision,
+                            action: LeaderBotAction::Stop,
+                        });
+                    }
+                }
+            });
+            if active_sibling && bot.state == LeaderBotState::Stopped {
+                ui.colored_label(
+                    theme::WARNING,
+                    "同一 KOL 当前已有活动带单机器人；停用完成后才能切换。",
+                );
+            } else if !scope_current {
+                ui.colored_label(theme::WARNING, "请切换到该机器人绑定的凭证后管理。");
+            } else if !credential_ready {
+                ui.colored_label(theme::WARNING, "主账户凭证验证已失效，请先重新验证。");
+            } else if !access.can_use && bot.state == LeaderBotState::Stopped {
+                ui.colored_label(theme::WARNING, "带单授权未启用，当前不能启用机器人。");
+            }
+            ui.weak("停用只撤销程序创建的同步挂单；已有仓位不会自动平仓。");
         });
-        if !bot.config.description.is_empty() {
-            ui.label(&bot.config.description);
-        }
-        if bot.state == LeaderBotState::Stopped && access.can_use {
-            let mut confirmed = confirmed(model, &bot);
-            if ui
-                .add_enabled(
-                    scope_current && credential_ready && fresh && !pending && !active_sibling,
-                    egui::Checkbox::new(
-                        &mut confirmed,
-                        "确认启用后同步符合条件的新限价挂单；跟随账户仍须各自启用",
-                    ),
-                )
-                .changed()
-            {
-                model.execution.leader_bot.confirmed =
-                    confirmed.then(|| (bot.bot_id.clone(), bot.revision));
-            }
-        }
-        ui.horizontal_wrapped(|ui| match bot.state {
-            LeaderBotState::Stopped => {
-                if ui
-                    .add_enabled(
-                        access.can_use
-                            && scope_current
-                            && credential_ready
-                            && fresh
-                            && !pending
-                            && !active_sibling
-                            && confirmed(model, &bot),
-                        egui::Button::new("启用"),
-                    )
-                    .on_disabled_hover_text(
-                        "需有效授权、当前已验证凭证、无其他活动带单机器人并完成风险确认",
-                    )
-                    .clicked()
-                {
-                    *action = Some(UiAction::Lifecycle {
-                        bot_id: bot.bot_id.clone(),
-                        revision: bot.revision,
-                        action: LeaderBotAction::Start,
-                    });
-                }
-                if ui
-                    .add_enabled(
-                        scope_current && fresh && !pending,
-                        egui::Button::new("编辑配置"),
-                    )
-                    .clicked()
-                {
-                    model.execution.leader_bot.editor = Some(LeaderEditor::update(&bot));
-                }
-            }
-            LeaderBotState::Running | LeaderBotState::NeedsAttention => {
-                if ui
-                    .add_enabled(
-                        scope_current && fresh && !pending,
-                        egui::Button::new("停用"),
-                    )
-                    .on_disabled_hover_text("停用会撤销程序子单，但不会自动平仓")
-                    .clicked()
-                {
-                    *action = Some(UiAction::Lifecycle {
-                        bot_id: bot.bot_id.clone(),
-                        revision: bot.revision,
-                        action: LeaderBotAction::Stop,
-                    });
-                }
-            }
-            LeaderBotState::Draining => {
-                ui.spinner();
-                ui.weak("正在撤销程序子单并等待对账，不会自动平仓");
-                if ui
-                    .add_enabled(
-                        scope_current && fresh && !pending,
-                        egui::Button::new("重试停用"),
-                    )
-                    .clicked()
-                {
-                    *action = Some(UiAction::Lifecycle {
-                        bot_id: bot.bot_id.clone(),
-                        revision: bot.revision,
-                        action: LeaderBotAction::Stop,
-                    });
-                }
-            }
-        });
-        if active_sibling && bot.state == LeaderBotState::Stopped {
-            ui.colored_label(
-                theme::WARNING,
-                "同一 KOL 当前已有活动带单机器人；停用完成后才能切换。",
-            );
-        } else if !scope_current {
-            ui.colored_label(theme::WARNING, "请切换到该机器人绑定的凭证后管理。");
-        } else if !credential_ready {
-            ui.colored_label(theme::WARNING, "主账户凭证验证已失效，请先重新验证。");
-        } else if !access.can_use && bot.state == LeaderBotState::Stopped {
-            ui.colored_label(theme::WARNING, "带单授权未启用，当前不能启用机器人。");
-        }
-        ui.weak("停用只撤销程序创建的同步挂单；已有仓位不会自动平仓。");
-    });
+    if !open {
+        model.execution.leader_bot.selected_bot_id = None;
+    }
 }
 
 fn leader_editor(
@@ -592,8 +641,8 @@ fn leader_editor(
             ui.set_width(500.0_f32.min((viewport.x - 64.0).max(280.0)));
             ui.horizontal(|ui| {
                 ui.heading(match &draft.mode {
-                    EditorMode::Create => "新建 KOL 挂单同步机器人",
-                    EditorMode::Update { .. } => "编辑 KOL 挂单同步机器人",
+                    EditorMode::Create => "新建人工带单机器人",
+                    EditorMode::Update { .. } => "编辑人工带单机器人",
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add_enabled(!pending, egui::Button::new("×")).clicked() {
@@ -604,7 +653,7 @@ fn leader_editor(
             ui.label(format!("主账户：{} · Binance", credential.label));
             ui.weak("同一主账户可保存多条配置；当前只允许一条带单机器人处于活动状态。");
             ui.separator();
-            ui.add_enabled_ui(!pending && scope_current, |ui| {
+            ui.add_enabled_ui(!pending && scope_current && current, |ui| {
                 egui::Grid::new("leader-bot-config-editor")
                     .num_columns(2)
                     .spacing([10.0, 8.0])
@@ -635,7 +684,10 @@ fn leader_editor(
             if !scope_current {
                 ui.colored_label(theme::WARNING, "账户已切换，请关闭后从绑定凭证重新打开。");
             } else if !current {
-                ui.colored_label(theme::WARNING, "机器人状态或版本已刷新，请取消后重新编辑。");
+                ui.colored_label(
+                    theme::WARNING,
+                    "当前配置只读：运行中须先停用并完成对账；版本变化后请重新打开。",
+                );
             }
             ui.separator();
             ui.horizontal(|ui| {
@@ -979,6 +1031,9 @@ mod tests {
             dual_position: true,
             account_mode: Some("portfolio_margin_um".to_owned()),
             has_exposure: Some(false),
+            equity: None,
+            available_margin: None,
+            balance_observed_ms: None,
         };
         let access = access(vec![
             bot(
@@ -1013,12 +1068,61 @@ mod tests {
                 collect_text(&shape.shape, &mut texts);
             }
         }
-        for expected in ["名称", "策略", "KOL 挂单同步", "zhu"] {
+        for expected in ["名称", "策略", "人工带单", "zhu"] {
             assert!(
                 texts.iter().any(|text| text == expected),
                 "missing {expected}"
             );
         }
         assert!(context.globally_used_rect().max.x <= screen.max.x);
+        let wide = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 360.0));
+        for label in ["管理", "编辑"] {
+            let mut point = None;
+            for _ in 0..3 {
+                let output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(wide),
+                        ..Default::default()
+                    },
+                    |ui| robot_table(ui, &mut model, Some(&access), &credential, &rows),
+                );
+                point = output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == label => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                });
+            }
+            let Some(point) = point else {
+                panic!("missing button {label}")
+            };
+            for pressed in [true, false] {
+                let _ = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(wide),
+                        events: vec![
+                            egui::Event::PointerMoved(point),
+                            egui::Event::PointerButton {
+                                pos: point,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: Default::default(),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ui| robot_table(ui, &mut model, Some(&access), &credential, &rows),
+                );
+            }
+            if label == "管理" {
+                assert_eq!(
+                    model.execution.leader_bot.selected_bot_id.as_deref(),
+                    Some(access.bots[0].bot_id.as_str())
+                );
+            } else {
+                assert!(model.execution.leader_bot.editor.is_some());
+                assert!(model.execution.leader_bot.selected_bot_id.is_none());
+            }
+        }
     }
 }

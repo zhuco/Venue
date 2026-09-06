@@ -1517,6 +1517,22 @@ impl Fixture {
                 sqlx::raw_sql(migration).execute(&pool).await?;
             }
         }
+        for migration in [
+            venue_control::MIGRATION_0029,
+            venue_control::MIGRATION_0030,
+            venue_control::MIGRATION_0031,
+            venue_control::MIGRATION_0032,
+            venue_control::MIGRATION_0033,
+            venue_control::MIGRATION_0034,
+            venue_control::MIGRATION_0035,
+            venue_control::MIGRATION_0036,
+            venue_control::MIGRATION_0037,
+            venue_control::MIGRATION_0038,
+            venue_control::MIGRATION_0039,
+            venue_control::MIGRATION_0040,
+        ] {
+            sqlx::raw_sql(migration).execute(&pool).await?;
+        }
         Ok(Some(Self {
             pool,
             admin,

@@ -7,6 +7,7 @@ type CustomerSession = { token: string; csrf: string; expires_ms: number };
 const routes: Record<string, { path: string; methods: string[]; public?: boolean }> = {
   "managed-followers": { path: "/v2/kol/managed-followers", methods: ["GET", "POST"] },
   "managed-verify": { path: "/v2/kol/managed-followers/verify", methods: ["POST"] },
+  "managed-delete": { path: "/v2/kol/managed-followers/delete", methods: ["POST"] },
   "managed-settings": { path: "/v2/kol/managed-followers/follow/settings", methods: ["POST"] },
   "managed-follow": { path: "/v2/kol/managed-followers/follow/lifecycle", methods: ["POST"] },
   "managed-status": { path: "/v2/kol/managed-followers/follow/status", methods: ["POST"] },
@@ -90,6 +91,18 @@ function publicRisk(raw: unknown, managed = false): ObjectValue {
   }
   return result;
 }
+function followAuthorization(raw: unknown): ObjectValue {
+  const value = object(raw);
+  if (Object.keys(value).some(field => !["sizing", "multiplier"].includes(field))
+    || typeof value.multiplier !== "string" || !/^\d+(\.\d+)?$/.test(value.multiplier)) throw new Error("invalid_follow_authorization");
+  const sizing = object(value.sizing);
+  if (sizing.mode === "proportional" && Object.keys(sizing).length === 1) return { sizing: { mode: "proportional" }, multiplier: value.multiplier };
+  if (sizing.mode === "fixed_notional" && Object.keys(sizing).every(field => ["mode", "notional"].includes(field))
+    && Object.keys(sizing).length === 2 && typeof sizing.notional === "string" && /^\d+(\.\d+)?$/.test(sizing.notional)) {
+    return { sizing: { mode: "fixed_notional", notional: sizing.notional }, multiplier: value.multiplier };
+  }
+  throw new Error("invalid_follow_authorization");
+}
 // Every response crosses an explicit DTO boundary. Control session tokens and exchange
 // secrets are never passed through to a browser response, including unexpected fields.
 export function customerPublicValue(action: string, method: string, raw: unknown): unknown {
@@ -98,9 +111,9 @@ export function customerPublicValue(action: string, method: string, raw: unknown
     const value = object(raw);
     return { ...pick(value, ["managed_id", "relation_id", "state", "revision", "activation_requested"]), settings: publicRisk(value.settings, true) };
   }
-  if (action === "managed-followers" || action === "managed-verify") {
-    const fields = ["managed_id", "label", "masked_key", "verification", "verified_ms"];
-    if (action === "managed-followers" && method === "GET") {
+  if (action === "managed-followers" || action === "managed-verify" || action === "managed-delete") {
+    const fields = ["managed_id", "label", "masked_key", "verification", "verified_ms", "equity", "available_margin", "balance_observed_ms"];
+    if ((action === "managed-followers" && method === "GET") || action === "managed-delete") {
       const value = object(raw);
       if (!Array.isArray(value.accounts) || typeof value.can_manage !== "boolean") throw new Error("invalid_managed_accounts");
       return { can_manage: value.can_manage, accounts: value.accounts.map(v => pick(v, fields)) };
@@ -153,11 +166,14 @@ export async function customerResponse(request: NextRequest, action: string): Pr
     try {
       const raw = object(await boundedJson(request.body, 16_384));
       if (action === "managed-followers") {
-        if (Object.keys(raw).some(k => !["request_id", "label", "key", "secret"].includes(k)) || [raw.request_id, raw.label, raw.key, raw.secret].some(v => typeof v !== "string")) throw new Error("invalid_managed_credentials");
-        body = JSON.stringify({ request_id: raw.request_id, credential: { label: raw.label, api_key: raw.key, api_secret: raw.secret } });
+        if (Object.keys(raw).some(k => !["request_id", "label", "key", "secret", "authorization"].includes(k)) || [raw.request_id, raw.label, raw.key, raw.secret].some(v => typeof v !== "string")) throw new Error("invalid_managed_credentials");
+        body = JSON.stringify({ request_id: raw.request_id, credential: { label: raw.label, api_key: raw.key, api_secret: raw.secret }, authorization: followAuthorization(raw.authorization) });
       } else if (action === "credentials") {
-        if (Object.keys(raw).some(k => !["label", "key", "secret"].includes(k)) || [raw.label, raw.key, raw.secret].some(v => typeof v !== "string")) throw new Error("invalid_credentials");
-        body = JSON.stringify({ label: raw.label, api_key: raw.key, api_secret: raw.secret });
+        if (Object.keys(raw).some(k => !["label", "key", "secret", "authorization"].includes(k)) || [raw.label, raw.key, raw.secret].some(v => typeof v !== "string")) throw new Error("invalid_credentials");
+        body = JSON.stringify({ credential: { label: raw.label, api_key: raw.key, api_secret: raw.secret }, authorization: followAuthorization(raw.authorization) });
+      } else if (action === "managed-delete") {
+        if (Object.keys(raw).some(k => !["managed_id", "password"].includes(k)) || [raw.managed_id, raw.password].some(v => typeof v !== "string")) throw new Error("invalid_managed_delete");
+        body = JSON.stringify(raw);
       } else { body = JSON.stringify(raw); }
     } catch { return response({ code: "invalid_input" }, 400); }
   }

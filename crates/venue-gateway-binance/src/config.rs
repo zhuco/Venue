@@ -103,6 +103,8 @@ pub mod endpoints {
     pub const POSITIONS: &str = "/papi/v1/um/positionRisk";
     pub const OPEN_ORDERS: &str = "/papi/v1/um/openOrders";
     pub const OPEN_ALGO_ORDERS: &str = "/papi/v1/um/algo/openAlgoOrders";
+    pub const ALGO_ORDER: &str = "/papi/v1/um/algo/order";
+    pub const EXACT_ALGO_ORDER: &str = "/papi/v1/um/algo/algoOrder";
     pub const USER_TRADES: &str = "/papi/v1/um/userTrades";
     pub const ORDER: &str = "/papi/v1/um/order";
 }

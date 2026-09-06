@@ -9,6 +9,7 @@ mod kol;
 mod leader_bot;
 mod managed_followers;
 mod session;
+mod strategy_projection;
 mod support_martingale;
 mod terminal;
 #[cfg(test)]

@@ -8,16 +8,16 @@
 - Venue 用户账号与真实交易所账户分开。注册/登录后才能加载、添加、验证、选择和删除自己的 API 绑定。
 - 新用户从 `/join/<invite_code>` 注册时由服务端在同一事务绑定唯一 KOL；邀请绑定不自动启用交易。初期全站最多 5 个启用 KOL、200 个启用跟单账户；KOL 由管理员授予，普通用户不能自行升级。
 - “添加 API”绑定用户已在币安创建的 Key，不代用户在交易所创建密钥。“删除绑定”只删除 Venue 中的加密凭证，不撤销交易所 Key。
-- API 验证只发签名 GET：读取权限、真实账户身份、Portfolio Margin 状态、UM 交易权限、双向持仓、持仓、普通挂单及 Algo 挂单；不下单、不撤单、不切换账户模式。本页用户 API 流程仅接受 Binance Portfolio Margin UM，不声称支持普通合约账户。
+- API 验证只发签名 GET：读取权限、真实账户身份、Portfolio Margin 状态与 USD 权益/可用保证金、UM 交易权限、双向持仓、持仓、普通挂单及 Algo 挂单；不下单、不撤单、不切换账户模式。本页用户 API 流程仅接受 Binance Portfolio Margin UM，不声称支持普通合约账户。
 - 同一真实账户的多把 Key 复用同一稳定 `trading_account_id`，不同用户不能认领同一真实账户。系统账号或 Key 数量不是 writer 数量。
-- 用户管理自己的 API 和跟单设置；KOL 还可通过专用托管接口添加经委托的 API、查看掩码、验证并逐账户配置跟单。托管边界见 [KOL MVP](KOL_COPY_MVP.md)，不授予读取已保存密钥的能力。
-- 启用跟单还要求明确选择定比/定额、资金及风险上限并再次确认；选择或验证账户本身不产生订单。
+- 用户保存自己的 API 时选择定比或定额；KOL 通过专用托管接口添加经委托的 API 时使用同一选择，并自动建立不可变 KOL 归属。KOL 可查看掩码与余额验证结果，并在密码复验和零风险门通过后删除 Venue 托管绑定。托管边界见 [KOL MVP](KOL_COPY_MVP.md)，不授予读取已保存密钥的能力，也不删除交易所子账户。
+- 保存 API 即完成跟单授权。默认定比 1 倍；验证成功后以账户权益作为分配资金、5 倍权益作为总名义上限自动申请激活。激活闸门通过前不产生订单。
 
 非 Binance 独立策略凭证与账户准入使用 [多交易所管理员入口](MULTI_VENUE_EXECUTOR.md#操作入口)，不套用本页 Binance 用户绑定流程。
 
 ## 进程与状态
 
-Control 负责认证、邀请归属、KOL 页面、绑定管理、只读验证和查询投影。Binance Executor 是一个多账户进程，按活动账户需求维护有界私有投影与签名恢复，复用进程内顺序队列。新关系按普通限价挂单同步；不为每个账户启动 Node、Actor 或本地 WAL。
+Control 负责认证、邀请归属、KOL 页面、绑定管理、只读验证和查询投影。Binance Executor 是一个多账户进程，按活动账户需求维护有界私有投影与签名恢复，复用进程内顺序队列。新关系同步普通限价单、已确认原生身份的市价单和 `STOP_MARKET` 止损单；不为每个账户启动 Node、Actor 或本地 WAL。
 
 UI 分开显示登录状态、邀请归属、API 验证、跟单启用和 Executor 最近报告。`api_reachable` 只说明验证期内签名读取成功，不表示 Executor 在线或跟单已启用。公共行情默认经同一 HTTPS 主机的精确只读 Binance 反代获取；私有仓位、活动委托、成交和资产必须由服务端 Binance gateway 解析，再经唯一 Executor/Control 返回用户作用域投影，桌面不得持有 API Secret 或自行解析私流。无新鲜私有投影时必须显示未知/未连接，旧 Node 当前快照不得冒充完整委托或仓位历史。
 
@@ -68,6 +68,6 @@ Control 默认监听 `127.0.0.1:39180`，桌面默认连接 `https://clawdbotweb
 - `http/account_tests`：真实 HTTP + PostgreSQL 会话、JSON 约束、匿名/跨用户投影与命令拒绝、SSE 数据过滤及退出后关闭。
 - Binance `credential_probe`：完整签名请求面、权限/双向模式不匹配、任一面失败/不完整不通过、普通/Algo/持仓任一非零不允许安全删除。
 - 邀请/KOL：服务端邀请码解析、注册事务绑定唯一 KOL、任何后续换绑拒绝、页面 revision、XSS 与跨 KOL 修改拒绝。
-- Web UI：真实注册/登录 Cookie、API 掩码、验证与 Executor 状态分离、跟单显式启用/暂停；浏览器响应和构建产物无 API 明文。
+- Web UI：真实注册/登录 Cookie、API 掩码、保存 API 时选择定比或定额授权；默认定比 1 倍，验证成功自动申请激活，浏览器响应和构建产物无 API 明文。
 
 数据库测试使用 `VENUE_CONTROL_TEST_DATABASE_URL`，并设置 `VENUE_CONTROL_POSTGRES_REQUIRED=1`，避免未配置数据库时的跳过被误认为验收。每个测试创建独立随机 schema；不接真实交易所或使用实盘凭证。

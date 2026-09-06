@@ -248,13 +248,31 @@ impl PgExecutorStore {
         copy_targets::record_source_fill_and_plan(self, kol_user_id, fill, now_ms).await
     }
 
+    /// Persists REST-recovered MARKET identity before the signed projection cursor advances.
+    pub async fn record_source_market_order(
+        &self,
+        kol_user_id: &str,
+        leader_trading_account_id: &str,
+        order: &venue_execution::SignedMarketOrderFact,
+        observed_ms: u64,
+    ) -> Result<(), BinanceCommandLedgerError> {
+        copy_targets::record_source_market_order(
+            self,
+            kol_user_id,
+            leader_trading_account_id,
+            order,
+            observed_ms,
+        )
+        .await
+    }
+
     /// Restart recovery returns the immutable identity and durable readback schedule. It
     /// deliberately does not make a Sending or ReconcileRequired command eligible for another
     /// POST.
     pub async fn recover_nonterminal(
         &self,
     ) -> Result<Vec<RecoverableBinanceCommand>, BinanceCommandLedgerError> {
-        let rows = sqlx::query("SELECT command_id,command_origin,owner_user_id,trading_account_id,credential_id,symbol,order_side,position_side,requested_quantity,command_phase,order_kind,limit_price,selected_native_order_id,target_client_order_id,client_order_id,native_order_id,command_state,reconcile_attempts,next_reconcile_ms,grid_batch_id,dispatch_sequence,copy_risk FROM venue_binance_commands WHERE command_origin <> 'strategy' AND command_state IN ('pending','sending','accepted','reconcile_required') ORDER BY created_ms,COALESCE(grid_batch_id,command_id),COALESCE(dispatch_sequence,0),command_id")
+        let rows = sqlx::query("SELECT command_id,command_origin,owner_user_id,trading_account_id,credential_id,symbol,order_side,position_side,requested_quantity,command_phase,order_kind,limit_price,trigger_price,working_type,selected_native_order_id,target_client_order_id,client_order_id,native_order_id,command_state,reconcile_attempts,next_reconcile_ms,grid_batch_id,dispatch_sequence,copy_risk FROM venue_binance_commands WHERE command_origin <> 'strategy' AND command_state IN ('pending','sending','accepted','reconcile_required') ORDER BY created_ms,COALESCE(grid_batch_id,command_id),COALESCE(dispatch_sequence,0),command_id")
             .fetch_all(&self.pool).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
         rows.into_iter().map(recoverable_command).collect()
     }
@@ -305,8 +323,15 @@ impl PgExecutorStore {
                 position_side,
                 reducing,
                 ..
+            }
+            | ClaimedBinanceOrder::StopMarket {
+                side,
+                position_side,
+                reducing,
+                ..
             } => (*side, *position_side, *reducing),
-            ClaimedBinanceOrder::CancelExact { .. } => return Ok(Vec::new()),
+            ClaimedBinanceOrder::CancelExact { .. }
+            | ClaimedBinanceOrder::CancelAlgoExact { .. } => return Ok(Vec::new()),
         };
         if !reducing {
             return Ok(Vec::new());

@@ -365,6 +365,9 @@ fn footer_execution_account_uses_the_selected_credential_label() {
             dual_position: true,
             account_mode: Some("Portfolio Margin · UM".into()),
             has_exposure: None,
+            equity: None,
+            available_margin: None,
+            balance_observed_ms: None,
         }],
     });
     let mut labels = Vec::new();

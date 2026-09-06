@@ -165,10 +165,10 @@ Rust/Cargo 1.98.0、cargo-zigbuild 0.23.0、Zig 0.16.0 和 `x86_64-unknown-linux
 
 ### 真实部署与回滚边界
 
-alpha.28 升级须由 `schema.rs` 安装并验证截至 `0037` 的迁移（包括 `0028`/`0029` 授权与挂单映射、`0030`–`0033` 托管和数量设置、`0034` 多机器人目录、`0035` 独立执行、`0036` 策略网格、`0037` 支撑分批策略），同步核验 [授权及数据库角色](LEADER_ORDER_MIRROR.md)。旧 Canary 脚本的成交模型 fixture 不能代替新挂单模型的 5/200 容量与延迟验收。数据库含真实 GTC 镜像后，不得直接回退到每次启动重跑旧迁移的 Control binary：旧 `0020` 会重解释 GTC，须先单独核验回滚版本的迁移兼容性。
+当前 Control 升级须由 `schema.rs` 安装并验证截至 `0040` 的迁移（包括 `0028`/`0029` 授权与挂单映射、`0030`–`0033` 托管和数量设置、`0034` 多机器人目录、`0035` 独立执行、`0036` 策略网格、`0037` 支撑分批策略、`0038` 跟单授权、`0039` 马丁止损和 `0040` 市价/止损同步），同步核验 [授权及数据库角色](LEADER_ORDER_MIRROR.md)。旧 Canary 脚本的成交模型 fixture 不能代替新挂单模型的 5/200 容量与延迟验收。数据库含真实 GTC 镜像后，不得直接回退到每次启动重跑旧迁移的 Control binary：旧 `0020` 会重解释 GTC，须先单独核验回滚版本的迁移兼容性。
 
 管理员可先运行包内 `venue-leader-bot-admin migrate`，然后以迁移所有者向运行角色授予实际需要的表与序列权限；授权表和授权审计表只授予运行角色 SELECT。生产 Control 设置 `VENUE_CONTROL_RUNTIME_DATABASE_URL`，Executor 使用其独立 `VENUE_EXECUTOR_DATABASE_URL`，二者不得拥有授权表或持有能改回管理员身份的角色成员关系。迁移 URL 不进入启动参数或日志。
 
-上线前由获授权操作者确认目标账户未被旧 Node/Copy writer 管理，且旧 `Prepared/Submitted/Unknown`、仓位和订单均已按签名事实收敛。先启动并确认 PostgreSQL advisory lock 仅由一个 `venue-executor-binance` 持有；它并行组装私有投影、Grid、挂单同步与持续命令调度；账户栅栏保证各账户完成自身启用基线及未终态 readback 前不能继续增险。锁、数据库、凭证、规则或基线失败均不得发送新订单；私流断线/过期只经有界退避与签名 REST 补读恢复，原始帧和 listenKey 不记录。
+上线前由获授权操作者确认目标账户未被旧 Node/Copy writer 管理，且旧 `Prepared/Submitted/Unknown`、仓位和订单均已按签名事实收敛。先启动并确认 PostgreSQL advisory lock 仅由一个 `venue-executor-binance` 持有；它并行组装私有投影、Grid、人工带单与持续命令调度；账户栅栏保证各账户完成自身启用基线及未终态 readback 前不能继续增险。锁、数据库、凭证、规则或基线失败均不得发送新订单；私流断线/过期只经有界退避与签名 REST 补读恢复，原始帧和 listenKey 不记录。
 
 回滚只暂停关系并以 SIGINT/SIGTERM 停止新 Executor；它关闭私流并释放锁。不得删除 PostgreSQL 命令、源成交、目标、凭证或旧恢复工件。`Sending`、`Accepted`、`ReconcileRequired` 先由同一 `clientOrderId` 查单和签名仓位收敛；精确回读遵守数据库中 500 ms 起、8 s 封顶的耐久退避，未到期仍保留账户栅栏。未终态时不得恢复旧 writer 或盲目重新发送。确认所有账户无未决命令且旧链仍未接管后，才允许按单独变更恢复此前部署。

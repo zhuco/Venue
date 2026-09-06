@@ -6,9 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::{PgPool, Row};
 use venue_control_protocol::kol::{
-    TERMINAL_PROJECTION_SCHEMA_VERSION, TerminalAccountProjection, TerminalAsset, TerminalFill,
-    TerminalOpenOrder, TerminalOrderState, TerminalPosition, TerminalPositionHistoryEntry,
-    TerminalPositionMode,
+    TERMINAL_PROJECTION_SCHEMA_VERSION, TerminalAccountProjection, TerminalAsset,
+    TerminalConditionalOrder, TerminalFill, TerminalOpenOrder, TerminalOrderState,
+    TerminalPosition, TerminalPositionHistoryEntry, TerminalPositionMode,
 };
 use venue_domain::domain::{FieldState, Fill, LimitTimeInForce, OrderState, PositionSide, Symbol};
 use venue_execution::SignedAccountSnapshot;
@@ -686,7 +686,7 @@ struct StoredProjection {
     projection: TerminalAccountProjection,
 }
 
-fn project(
+pub(crate) fn project(
     source: &ActiveProjectionSource,
     snapshot: &SignedAccountSnapshot,
     persisted_ms: u64,
@@ -732,6 +732,22 @@ fn project(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let conditional_orders = snapshot
+        .conditional_orders()
+        .iter()
+        .map(|order| TerminalConditionalOrder {
+            client_order_id: order.client_order_id.clone(),
+            native_order_id: order.venue_order_id.clone(),
+            symbol: order.symbol.clone(),
+            order_side: order.side,
+            position_side: order.position_side,
+            quantity: order.quantity,
+            trigger_price: order.trigger_price,
+            working_type: order.working_type.clone(),
+            reduce_only: order.reduce_only,
+            created_ms: order.created_at_ms,
+        })
+        .collect();
     let fills = snapshot
         .fills()
         .iter()
@@ -753,10 +769,14 @@ fn project(
         observed_ms: snapshot.observed_at_ms(),
         persisted_ms,
         private_generation: snapshot.private_generation(),
-        position_mode: TerminalPositionMode::Hedge,
+        position_mode: match snapshot.position_mode() {
+            venue_execution::SignedAccountPositionMode::Hedge => TerminalPositionMode::Hedge,
+            venue_execution::SignedAccountPositionMode::Net => TerminalPositionMode::Net,
+        },
         positions,
         position_history: Vec::new(),
         open_orders,
+        conditional_orders,
         fills,
         assets,
     };
@@ -768,7 +788,7 @@ fn project(
 
 fn terminal_fill(fill: &Fill) -> Result<TerminalFill, PrivateProjectionError> {
     let position_side = match fill.position_side {
-        FieldState::Known(side) if side != PositionSide::Net => side,
+        FieldState::Known(side) => side,
         _ => return Err(PrivateProjectionError::Invalid),
     };
     let maker = match fill.maker {
@@ -1022,6 +1042,48 @@ mod tests {
     use rust_decimal::Decimal;
     use venue_domain::domain::{OrderSide, Price};
 
+    #[test]
+    fn non_binance_net_projection_preserves_signed_short_quantity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut source = source()?;
+        source.credential_id = "00000000-0000-4000-8000-000000000001".into();
+        source.trading_account_id = "00000000-0000-4000-8000-000000000002".into();
+        let symbol: Symbol = "BTC/USDC".parse()?;
+        let snapshot = SignedAccountSnapshot::complete(
+            venue_gateway_api::GatewayBinding::new(
+                venue_gateway_api::VenueId::Hyperliquid,
+                venue_gateway_api::GatewayMode::Live,
+                source.trading_account_id.clone(),
+                symbol.clone(),
+            )?,
+            1000,
+            1,
+            1,
+            1,
+            venue_execution::SignedAccountPositionMode::Net,
+            vec![],
+            vec![venue_execution::SignedAccountPositionFact {
+                symbol,
+                position_side: PositionSide::Net,
+                quantity: -Decimal::ONE,
+                entry_price: Some(Decimal::from(100)),
+                mark_price: Some(Decimal::from(90)),
+            }],
+            "cursor".into(),
+            vec![],
+        )?;
+        let projection = project(&source, &snapshot, 1001)?;
+        assert_eq!(projection.position_mode, TerminalPositionMode::Net);
+        assert_eq!(projection.positions[0].quantity, -Decimal::ONE);
+        assert!(projection.validate().is_ok());
+        let hedge = TerminalAccountProjection {
+            position_mode: TerminalPositionMode::Hedge,
+            ..projection
+        };
+        assert!(hedge.validate().is_err());
+        Ok(())
+    }
+
     fn source() -> Result<ActiveProjectionSource, Box<dyn std::error::Error>> {
         Ok(ActiveProjectionSource {
             kol_user_id: None,
@@ -1057,6 +1119,7 @@ mod tests {
                 exchange_time_ms: Some(199),
             },
             client_order_id: FieldState::Known("client-1".to_owned()),
+            order_type: FieldState::Missing,
             original_quantity: FieldState::Known(Decimal::new(2, 3)),
             cumulative_filled_quantity: FieldState::Known(cumulative),
             order_state: FieldState::Known(state),

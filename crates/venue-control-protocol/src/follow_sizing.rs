@@ -41,6 +41,41 @@ impl FollowSizing {
     }
 }
 
+/// The sizing choice granted when a follower saves an execution credential.
+/// Runtime limits are derived from the freshly signed account balance at verification time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FollowAuthorization {
+    pub sizing: FollowSizing,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub multiplier: Decimal,
+}
+
+impl Default for FollowAuthorization {
+    fn default() -> Self {
+        Self {
+            sizing: FollowSizing::Proportional,
+            multiplier: Decimal::ONE,
+        }
+    }
+}
+
+impl FollowAuthorization {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn valid(self) -> bool {
+        self.multiplier > Decimal::ZERO
+            && match self.sizing {
+                FollowSizing::Proportional => true,
+                FollowSizing::FixedNotional { notional } => {
+                    notional > Decimal::ZERO && self.multiplier == Decimal::ONE
+                }
+            }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +98,32 @@ mod tests {
             assert!(!FollowSizing::FixedNotional { notional }.valid_for(Decimal::from(10)));
         }
         Ok(())
+    }
+
+    #[test]
+    fn saved_authorization_defaults_to_one_times_proportional() {
+        assert_eq!(
+            FollowAuthorization::default().sizing,
+            FollowSizing::Proportional
+        );
+        assert!(FollowAuthorization::default().valid());
+        assert!(
+            FollowAuthorization {
+                sizing: FollowSizing::FixedNotional {
+                    notional: Decimal::ONE,
+                },
+                multiplier: Decimal::ONE,
+            }
+            .valid()
+        );
+        assert!(
+            !FollowAuthorization {
+                sizing: FollowSizing::FixedNotional {
+                    notional: Decimal::ONE,
+                },
+                multiplier: Decimal::from(2),
+            }
+            .valid()
+        );
     }
 }

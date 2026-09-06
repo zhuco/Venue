@@ -480,14 +480,8 @@ pub fn apply_action(
         }
     };
     let request_id = request.request_id.clone();
-    match client.send_terminal(request.clone()) {
+    match client.send_terminal(request) {
         Ok(()) => {
-            if let Some(account) = model.preferences.execution_account_id.clone() {
-                model
-                    .execution
-                    .chart_orders
-                    .submitted_order(account, request, context);
-            }
             context.request_repaint();
             model.execution.begin_terminal_submission(request_id);
             model.trade_dock.armed_action = None;
@@ -558,6 +552,12 @@ fn terminal_request_parts(
     action: TradingAction,
     now: f64,
 ) -> Result<TerminalRequestParts, crate::trading::TradePlanError> {
+    if model
+        .selected_execution_credential()
+        .is_none_or(|c| c.venue != venue_control_protocol::VenueId::Binance)
+    {
+        return Err(crate::trading::TradePlanError::UiOnlyAction);
+    }
     let credential_id = model
         .account_overview
         .as_ref()
@@ -694,7 +694,12 @@ mod tests {
         let mut model = AppModel::new(crate::model::Preferences::default());
         model.account_overview = Some(serde_json::from_value(serde_json::json!({
             "user":{"user_id":"fixture-user","username":"fixture"},
-            "credentials":[], "selected_credential_id":"fixture-credential"
+            "credentials":[{
+                "credential_id":"fixture-credential", "label":"fixture", "venue":"binance",
+                "masked_key":"***", "trading_account_id":"fixture-account", "verification":"verified",
+                "verified_ms":1, "expires_ms":null, "api_reachable":true, "dual_position":true,
+                "account_mode":null, "has_exposure":false
+            }], "selected_credential_id":"fixture-credential"
         }))?);
         model.preferences.execution_account_id = Some("fixture-account".into());
         model.preferences.selected_symbol = "DOGE/USDC".into();

@@ -1203,6 +1203,7 @@ mod tests {
                 exchange_time_ms: Some(received_at_ms - 1),
             },
             client_order_id: FieldState::Known("client".into()),
+            order_type: FieldState::Missing,
             original_quantity: FieldState::Known(Decimal::ONE),
             cumulative_filled_quantity: FieldState::Known(Decimal::ONE),
             order_state: FieldState::Known(venue_domain::domain::OrderState::Filled),

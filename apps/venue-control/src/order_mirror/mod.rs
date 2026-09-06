@@ -1,5 +1,6 @@
 //! Order mirroring owns only mappings and ordinary PostgreSQL commands. Account scheduling,
 //! exchange transport and ambiguous-request recovery remain in the existing executor.
+mod extended;
 mod planner;
 mod settlement;
 mod store;

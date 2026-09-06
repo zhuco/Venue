@@ -50,11 +50,11 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
     };
     let mut node_hint = match language {
         crate::i18n::Language::SimplifiedChinese => {
-            "交易连接与账户资金统一依据选中账户的 Binance Executor 签名私有投影。"
+            "账户状态与资金依据选中交易所的签名私有投影；账户切换后重新读取。"
                 .to_owned()
         }
         crate::i18n::Language::English => {
-            "Trading connectivity and account funds share the selected account's signed Binance Executor projection."
+            "Account status and funds use signed private facts from the selected exchange. Switching accounts refreshes those facts."
                 .to_owned()
         }
     };

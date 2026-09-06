@@ -531,6 +531,17 @@ impl AccountService {
         request.validate().map_err(|_| error(Code::InvalidInput))?;
         let store =
             crate::private_projection::BinancePrivateProjectionStore::new(self.pool.clone());
+        let payload: serde_json::Value = sqlx::query_scalar("SELECT verification_json FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND deleted_ms IS NULL")
+            .bind(&request.credential_id).bind(&principal.user.user_id)
+            .fetch_optional(&self.pool).await.map_err(database_error)?
+            .ok_or(error(Code::VerificationRequired))?;
+        let credential = super::credentials::decode_summary(payload)?;
+        if credential.venue != venue_gateway_api::VenueId::Binance {
+            return self
+                .strategy_terminal_projection(principal, &credential, &request)
+                .await
+                .map(Some);
+        }
         store
             .subscribe(
                 &principal.user.user_id,
@@ -790,6 +801,8 @@ mod tests {
                         account_identity_hash: [29; 32],
                         observed_ms: timestamp,
                         has_exposure: false,
+                        equity: Decimal::from(100),
+                        available_margin: Decimal::from(80),
                     })
                 },
             )

@@ -10,6 +10,9 @@ mod kol_copy_convergence;
 mod kol_copy_lifecycle;
 #[path = "support/leader_order_mirror.rs"]
 mod leader_order_mirror;
+#[path = "support/private_stream_fixture.rs"]
+mod private_stream_fixture;
+use private_stream_fixture::private_stream_fill;
 
 use rust_decimal::Decimal;
 use sqlx::{Executor, PgPool, postgres::PgPoolOptions};
@@ -44,7 +47,7 @@ use venue_execution::{
     SignedAccountBalance, SignedAccountPositionFact, SignedAccountPositionMode,
     SignedAccountSnapshot,
 };
-use venue_gateway_binance::{BinancePrivateFillEvent, GatewayBinding, GatewayMode, VenueId};
+use venue_gateway_binance::{GatewayBinding, GatewayMode, VenueId};
 
 #[tokio::test]
 async fn kol_mvp_migration_is_idempotent_and_enforces_capacity_and_ownership()
@@ -324,6 +327,7 @@ async fn executor_store_deduplicates_source_fills_and_recovers_only_nonterminal_
         occurred_ms: 10,
         observed_ms: 11,
         payload_digest: [7; 32],
+        market_order: None,
     };
     let store = PgExecutorStore::new(fixture.pool.clone());
     assert!(store.record_source_fill(&kol, &fill).await?);
@@ -397,6 +401,7 @@ async fn source_fill_planning_is_deduplicated_and_uses_a_stable_command_identity
         occurred_ms: 10,
         observed_ms: 11,
         payload_digest: [8; 32],
+        market_order: None,
     };
     let store = PgExecutorStore::new(fixture.pool.clone());
     let planned = store.record_source_fill_and_plan(&kol, &fill, 12).await?;
@@ -1290,37 +1295,6 @@ async fn private_stream_fill_batch_is_atomic_idempotent_and_generation_fenced()
     Ok(())
 }
 
-fn private_stream_fill(
-    fill_id: &str,
-    received_at_ms: u64,
-    cumulative: Decimal,
-    state: OrderState,
-) -> Result<BinancePrivateFillEvent, Box<dyn std::error::Error>> {
-    Ok(BinancePrivateFillEvent {
-        stream_private_generation: 3,
-        private_generation: 3,
-        received_at_ms,
-        fill: Fill {
-            fill_id: fill_id.to_owned(),
-            execution_sequence: FieldState::Known(received_at_ms),
-            order_id: "native-order-batch".to_owned(),
-            symbol: "BTC/USDT".parse()?,
-            side: OrderSide::Buy,
-            position_side: FieldState::Known(PositionSide::Long),
-            quantity: Decimal::new(1, 3),
-            price: Price::new(Decimal::new(50_000, 0))?,
-            fee: FieldState::Missing,
-            realized_pnl: FieldState::Missing,
-            maker: FieldState::Known(true),
-            exchange_time_ms: Some(received_at_ms - 1),
-        },
-        client_order_id: FieldState::Known("client-batch".to_owned()),
-        original_quantity: FieldState::Known(Decimal::new(2, 3)),
-        cumulative_filled_quantity: FieldState::Known(cumulative),
-        order_state: FieldState::Known(state),
-    })
-}
-
 fn projection_snapshot(
     account: String,
     symbol: venue_domain::domain::Symbol,
@@ -1639,6 +1613,7 @@ async fn terminal_and_copy_share_one_atomic_account_queue_limit()
         occurred_ms: now + 3,
         observed_ms: now + 4,
         payload_digest: [17_u8; 32],
+        market_order: None,
     };
     let store = PgExecutorStore::new(fixture.pool.clone());
     let (terminal_result, copy_result) = tokio::join!(
@@ -1866,6 +1841,24 @@ impl Fixture {
             .execute(&self.pool)
             .await?;
         sqlx::raw_sql(venue_control::MIGRATION_0034)
+            .execute(&self.pool)
+            .await?;
+        sqlx::raw_sql(venue_control::MIGRATION_0035)
+            .execute(&self.pool)
+            .await?;
+        sqlx::raw_sql(venue_control::MIGRATION_0036)
+            .execute(&self.pool)
+            .await?;
+        sqlx::raw_sql(venue_control::MIGRATION_0037)
+            .execute(&self.pool)
+            .await?;
+        sqlx::raw_sql(venue_control::MIGRATION_0038)
+            .execute(&self.pool)
+            .await?;
+        sqlx::raw_sql(venue_control::MIGRATION_0039)
+            .execute(&self.pool)
+            .await?;
+        sqlx::raw_sql(venue_control::MIGRATION_0040)
             .execute(&self.pool)
             .await?;
         Ok(())

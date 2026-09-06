@@ -17,6 +17,7 @@ fn fill(trade: &str, quantity: Decimal, side: OrderSide, time: u64) -> KolSource
         occurred_ms: time,
         observed_ms: time + 1,
         payload_digest: [53; 32],
+        market_order: None,
     }
 }
 

@@ -90,6 +90,18 @@ pub enum ClaimedBinanceOrder {
         native_order_id: Option<String>,
         target_client_order_id: Option<String>,
     },
+    StopMarket {
+        side: OrderSide,
+        position_side: PositionSide,
+        quantity: Decimal,
+        trigger_price: Decimal,
+        working_type: String,
+        reducing: bool,
+    },
+    CancelAlgoExact {
+        native_order_id: Option<String>,
+        target_client_order_id: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -113,6 +125,14 @@ pub struct KolSourceFill {
     pub occurred_ms: u64,
     pub observed_ms: u64,
     pub payload_digest: [u8; 32],
+    pub market_order: Option<KolSourceMarketOrder>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KolSourceMarketOrder {
+    pub native_order_id: String,
+    pub client_order_id: String,
+    pub original_quantity: Decimal,
 }
 
 /// Converts only an adapter-admitted authenticated fill. A missing Hedge Mode leg or invalid
@@ -121,7 +141,24 @@ pub fn source_fill_from_private(
     leader_trading_account_id: &str,
     event: &BinancePrivateFillEvent,
 ) -> Result<KolSourceFill, BinanceCommandLedgerError> {
-    source_fill_from_signed(leader_trading_account_id, &event.fill, event.received_at_ms)
+    let mut source =
+        source_fill_from_signed(leader_trading_account_id, &event.fill, event.received_at_ms)?;
+    if matches!(&event.order_type, FieldState::Known(value) if value == "MARKET") {
+        let client_order_id = match &event.client_order_id {
+            FieldState::Known(value) if !value.trim().is_empty() => value.clone(),
+            _ => return Err(BinanceCommandLedgerError::Conflict),
+        };
+        let original_quantity = match event.original_quantity {
+            FieldState::Known(value) if value > Decimal::ZERO => value,
+            _ => return Err(BinanceCommandLedgerError::Conflict),
+        };
+        source.market_order = Some(KolSourceMarketOrder {
+            native_order_id: event.fill.order_id.clone(),
+            client_order_id,
+            original_quantity,
+        });
+    }
+    Ok(source)
 }
 
 /// Converts a fill from the signed REST suffix used after startup, reconnect, or a failed source
@@ -172,6 +209,7 @@ pub fn source_fill_from_signed(
         occurred_ms,
         observed_ms,
         payload_digest,
+        market_order: None,
     })
 }
 
@@ -356,7 +394,7 @@ impl BinanceCommandLedger {
              LIMIT 1 FOR UPDATE SKIP LOCKED) \
              UPDATE venue_binance_commands c SET command_state='sending',sending_ms=$2,updated_ms=$2 \
              FROM candidate WHERE c.command_id=candidate.command_id \
-             RETURNING c.command_id,c.command_origin,c.owner_user_id,c.trading_account_id,c.credential_id,c.symbol,c.order_side,c.position_side,c.requested_quantity,c.command_phase,c.order_kind,c.limit_price,c.selected_native_order_id,c.target_client_order_id,c.client_order_id,c.native_order_id,c.command_state,c.copy_risk",
+             RETURNING c.command_id,c.command_origin,c.owner_user_id,c.trading_account_id,c.credential_id,c.symbol,c.order_side,c.position_side,c.requested_quantity,c.command_phase,c.order_kind,c.limit_price,c.trigger_price,c.working_type,c.selected_native_order_id,c.target_client_order_id,c.client_order_id,c.native_order_id,c.command_state,c.copy_risk",
         )
         .bind(trading_account_id)
         .bind(now)
@@ -920,6 +958,10 @@ fn claimed_batch(
                         return Err(BinanceCommandLedgerError::Conflict);
                     }
                     ClaimedBinanceOrder::Market { .. } | ClaimedBinanceOrder::Limit { .. } => {}
+                    ClaimedBinanceOrder::StopMarket { .. }
+                    | ClaimedBinanceOrder::CancelAlgoExact { .. } => {
+                        return Err(BinanceCommandLedgerError::Conflict);
+                    }
                 }
             }
         }
@@ -1106,6 +1148,30 @@ fn claimed_order(
                 return Err(BinanceCommandLedgerError::Unavailable);
             }
             Ok(ClaimedBinanceOrder::CancelExact {
+                native_order_id,
+                target_client_order_id,
+            })
+        }
+        "stop_market" => Ok(ClaimedBinanceOrder::StopMarket {
+            side: required_order_side(row)?,
+            position_side: required_position_side(row)?,
+            quantity: required_quantity(row)?,
+            trigger_price: optional_decimal(row, "trigger_price")?
+                .ok_or(BinanceCommandLedgerError::Unavailable)?,
+            working_type: row
+                .try_get::<Option<String>, _>("working_type")
+                .map_err(|_| BinanceCommandLedgerError::Unavailable)?
+                .filter(|value| matches!(value.as_str(), "MARK_PRICE" | "CONTRACT_PRICE"))
+                .ok_or(BinanceCommandLedgerError::Unavailable)?,
+            reducing: phase == "close",
+        }),
+        "cancel_algo_exact" if phase == "cancel" => {
+            let native_order_id = optional_native_id(row, "selected_native_order_id")?;
+            let target_client_order_id = optional_native_id(row, "target_client_order_id")?;
+            if native_order_id.is_none() && target_client_order_id.is_none() {
+                return Err(BinanceCommandLedgerError::Unavailable);
+            }
+            Ok(ClaimedBinanceOrder::CancelAlgoExact {
                 native_order_id,
                 target_client_order_id,
             })
@@ -1300,6 +1366,7 @@ mod tests {
                 exchange_time_ms: Some(199),
             },
             client_order_id: FieldState::Missing,
+            order_type: FieldState::Missing,
             original_quantity: FieldState::Missing,
             cumulative_filled_quantity: FieldState::Missing,
             order_state: FieldState::Missing,

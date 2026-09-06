@@ -352,6 +352,7 @@ fn projection(
             state: TerminalOrderState::New,
             created_ms: Some(now - 5),
         }],
+        conditional_orders: vec![],
         position_history: Vec::new(),
         fills: Vec::new(),
         assets: Vec::new(),

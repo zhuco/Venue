@@ -7,7 +7,10 @@ use crate::{
     trading::{TerminalOrderSelection, TradeDockState},
 };
 use eframe::egui;
-pub(crate) use position_actions::submit_confirmed_close;
+pub(crate) use position_actions::{
+    PositionActionDraft, chart_position_draft, request_chart_position_action,
+    show_confirmation as show_position_confirmation, submit_confirmed_close,
+};
 use std::sync::Arc;
 use text::{Key, text};
 use venue_control_protocol::kol::{ExecutorCommandSummary, TerminalAccountProjection};
@@ -244,7 +247,7 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
         && Some(projection.credential_id.as_str())
             == selected.map(|credential| credential.credential_id.as_str())
     {
-        show_private_projection(ui, model, client, &projection);
+        show_private_projection(ui, model, &projection);
     } else {
         ui.weak(text(language, Key::Waiting));
         if let Some(error) = &model.execution.private_error {
@@ -256,7 +259,6 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
 fn show_private_projection(
     ui: &mut egui::Ui,
     model: &mut AppModel,
-    client: &ControlClient,
     projection: &TerminalAccountProjection,
 ) {
     let language = model.preferences.language;
@@ -386,7 +388,7 @@ fn show_private_projection(
                                 market_price(ui, model, &row.symbol, row.entry_price);
                                 market_price(ui, model, &row.symbol, row.mark_price);
                                 position_usd_value(ui, row);
-                                position_pnl(ui, row);
+                                position_pnl(ui, model, row);
                                 if let Some(action) =
                                     position_actions::row_buttons(ui, model, projection, row)
                                 {
@@ -542,7 +544,7 @@ fn show_private_projection(
     if count == 0 {
         ui.weak(text(language, Key::Empty));
     }
-    position_actions::show_confirmation(ui, model, client, requested_position);
+    position_actions::queue_confirmation(model, requested_position);
     if let Some(selection) = requested_order {
         model.select_symbol(selection.symbol.to_string());
         model.trade_dock.select_terminal_order(selection);
@@ -553,15 +555,18 @@ fn show_private_projection(
     }
 }
 
-fn position_pnl(ui: &mut egui::Ui, position: &venue_control_protocol::kol::TerminalPosition) {
-    let pnl = position_pnl_value(position);
+fn position_pnl(
+    ui: &mut egui::Ui,
+    model: &AppModel,
+    position: &venue_control_protocol::kol::TerminalPosition,
+) {
+    let pnl = live_position_pnl_value(model, position);
     if let Some(pnl) = pnl {
-        let color = if pnl >= rust_decimal::Decimal::ZERO {
-            theme::BUY
-        } else {
-            theme::SELL
-        };
-        ui.colored_label(color, format!("{:.4}", pnl.round_dp(4)));
+        ui.colored_label(pnl_color(pnl), format!("{:.4}", pnl.round_dp(4)))
+            .on_hover_text(
+                "新鲜最新价估算浮动盈亏；行情过期回退签名标记价，不含手续费与资金费。
+Estimated from fresh last price; falls back to signed mark. Excludes fees and funding.",
+            );
     } else {
         ui.label("—");
     }
@@ -588,17 +593,50 @@ fn position_usd_value_value(
 pub(crate) fn position_pnl_value(
     position: &venue_control_protocol::kol::TerminalPosition,
 ) -> Option<rust_decimal::Decimal> {
-    position
-        .entry_price
-        .zip(position.mark_price)
-        .and_then(|(entry, mark)| {
-            let movement = match position.position_side {
-                venue_domain::PositionSide::Long => mark.checked_sub(entry),
-                venue_domain::PositionSide::Short => entry.checked_sub(mark),
-                venue_domain::PositionSide::Net => mark.checked_sub(entry),
-            }?;
-            movement.checked_mul(position.quantity)
-        })
+    position_pnl_at(position, position.mark_price)
+}
+
+pub(crate) fn pnl_color(pnl: rust_decimal::Decimal) -> egui::Color32 {
+    if pnl > rust_decimal::Decimal::ZERO {
+        theme::BUY
+    } else if pnl < rust_decimal::Decimal::ZERO {
+        theme::SELL
+    } else {
+        theme::TEXT_SECONDARY
+    }
+}
+
+pub(crate) fn live_position_pnl_value(
+    model: &AppModel,
+    position: &venue_control_protocol::kol::TerminalPosition,
+) -> Option<rust_decimal::Decimal> {
+    let now = crate::account_center::now_ms();
+    let quote = model
+        .local_quotes
+        .get(&position.symbol.to_string())
+        .filter(|quote| {
+            fresh_time(quote.received_ms, now)
+                && fresh_time(quote.exchange_time_ms, now)
+                && quote.last > rust_decimal::Decimal::ZERO
+        });
+    match quote {
+        Some(quote) => position_pnl_at(position, Some(quote.last)),
+        None => position_pnl_value(position),
+    }
+}
+
+fn position_pnl_at(
+    position: &venue_control_protocol::kol::TerminalPosition,
+    price: Option<rust_decimal::Decimal>,
+) -> Option<rust_decimal::Decimal> {
+    position.entry_price.zip(price).and_then(|(entry, mark)| {
+        let movement = match position.position_side {
+            venue_domain::PositionSide::Long => mark.checked_sub(entry),
+            venue_domain::PositionSide::Short => entry.checked_sub(mark),
+            venue_domain::PositionSide::Net => mark.checked_sub(entry),
+        }?;
+        movement.checked_mul(position.quantity)
+    })
 }
 
 fn symbol_link(ui: &mut egui::Ui, symbol: &venue_domain::Symbol, selected_symbol: &str) -> bool {
@@ -702,6 +740,7 @@ mod tests {
             positions: vec![],
             position_history: vec![],
             open_orders: vec![],
+            conditional_orders: vec![],
             fills: vec![],
             assets: vec![],
         }
@@ -752,7 +791,7 @@ mod tests {
         let context = egui::Context::default();
         let mut output = context.run_ui(egui::RawInput::default(), |ui| {
             for row in &projection.positions {
-                position_pnl(ui, row);
+                position_pnl(ui, &model, row);
                 assert!(position_actions::row_buttons(ui, &model, &projection, row).is_none());
             }
         });

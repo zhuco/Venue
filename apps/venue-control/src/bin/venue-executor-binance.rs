@@ -618,6 +618,15 @@ async fn persist_projection_turn(
     now_ms: u64,
 ) -> bool {
     if let Some(kol_user_id) = source.kol_user_id.as_deref() {
+        for order in snapshot.market_orders() {
+            if executor_store
+                .record_source_market_order(kol_user_id, &source.trading_account_id, order, now_ms)
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
         for fill in snapshot.fills() {
             let normalized = match source_fill_from_signed(
                 &source.trading_account_id,
@@ -1132,6 +1141,7 @@ mod tests {
                 exchange_time_ms: Some(199),
             },
             client_order_id: FieldState::Known(format!("client-{fill_id}")),
+            order_type: FieldState::Missing,
             original_quantity: FieldState::Known(rust_decimal::Decimal::new(2, 3)),
             cumulative_filled_quantity: FieldState::Known(rust_decimal::Decimal::new(1, 3)),
             order_state: FieldState::Known(venue_domain::domain::OrderState::PartiallyFilled),

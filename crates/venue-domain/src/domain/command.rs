@@ -555,7 +555,10 @@ impl MarketReduceCommand {
         {
             return Err(CommandError::Identifier);
         }
-        if self.owner.purpose != OrderPurpose::ExposureTakeProfit {
+        if !matches!(
+            self.owner.purpose,
+            OrderPurpose::ExposureTakeProfit | OrderPurpose::Protection
+        ) {
             return Err(CommandError::MarketReducePurpose);
         }
         if !self.quantity.is_sign_positive() || self.quantity.is_zero() {
