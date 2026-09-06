@@ -15,7 +15,7 @@
 | Control HTTP 服务 | `apps/venue-control/src/bin/venue-control-server.rs` |
 | 单例 Binance Executor：私有投影、Grid、挂单同步、调度 | `apps/venue-control/src/bin/venue-executor-binance.rs` |
 | 带单授权、撤权及仅迁移命令 | `apps/venue-control/src/bin/venue-leader-bot-admin.rs`、`apps/venue-control/src/leader_bot_admin.rs` |
-| 版本化迁移及校验 | `apps/venue-control/src/schema.rs`、`apps/venue-control/migrations/`；alpha.27 安装至 0034 |
+| 版本化迁移及校验 | `apps/venue-control/src/schema.rs`、`apps/venue-control/migrations/`；alpha.28 安装至 0037 |
 | 本地受控构建与缓存准入 | `scripts/Invoke-VenueBuild.ps1`、`scripts/venue_build_guard.ps1` |
 | Ubuntu Control/Executor/管理员工具打包 | `scripts/Build-VenueUbuntu.ps1`；`-Component Control` |
 | CI、源码卫生及依赖边界 | `.github/workflows/workspace-gates.yml`、`scripts/verify_repository_hygiene.ps1`、`scripts/verify_workspace_policy.ps1` |
@@ -92,7 +92,7 @@
 
 支撑分批做多（马丁）的当前模块、桌面/API、多币预算和市价/限价执行契约见 [SUPPORT_MARTINGALE](SUPPORT_MARTINGALE.md)。当前首个闭环只准入 Bybit LIVE；其他执行所仍按逐所真实验收放行。
 
-以下工作区改动尚未纳入 alpha.27 标签，验证状态由对应开发任务记录；完整契约见 [MULTI_VENUE_EXECUTOR](MULTI_VENUE_EXECUTOR.md)。它不扩大 Binance KOL 的复制范围，也不重新启用旧 Node 执行链。
+以下功能纳入 alpha.28 源码，真实部署与逐所验收另行核验；完整契约见 [MULTI_VENUE_EXECUTOR](MULTI_VENUE_EXECUTOR.md)。它不扩大 Binance KOL 的复制范围，也不重新启用旧 Node 执行链。
 
 | 功能 | 入口 |
 |---|---|

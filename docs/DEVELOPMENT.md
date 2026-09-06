@@ -136,7 +136,7 @@ Rust/Cargo 1.98.0、cargo-zigbuild 0.23.0、Zig 0.16.0 和 `x86_64-unknown-linux
 ./scripts/Build-VenueUbuntu.ps1 -SourceRoot G:\Build\Venue\ubuntu\source -ExpectedRevision <完整40位commit> -ReleaseId <版本号> -Component Control -CheckOnly
 ```
 
-- 专用根为 `G:\Build\Venue\ubuntu`：`source` 可存固定 revision 的独立 checkout；Nodes release 包含六个冻结 Node binary。alpha.27 的 Control release 包含 `venue-control-server`、`venue-executor-binance`、`venue-leader-bot-admin`；当前多交易所开发脚本另加入 `venue-strategy-admin`，实际清单以所选干净 revision 的脚本与 manifest 为准。两类包均另含 SHA256SUMS 与 manifest。旧 `venue-copy-worker` 不进入 KOL 发布包；离线发布和回滚清单见[第 8 节](#executor-release)。工具缓存为 `zig-cache/zig-local-cache/zigbuild-cache`。源码只用干净 Git clone/bundle，不复制 `.env`、账户工件或未提交文件；已有 checkout 不自动 reset。
+- 专用根为 `G:\Build\Venue\ubuntu`：`source` 可存固定 revision 的独立 checkout；Nodes release 包含六个冻结 Node binary。alpha.28 的 Control release 包含 `venue-control-server`、`venue-executor-binance`、`venue-leader-bot-admin`、`venue-strategy-admin`，实际清单以所选干净 revision 的脚本与 manifest 为准。两类包均另含 SHA256SUMS 与 manifest。旧 `venue-copy-worker` 不进入 KOL 发布包；离线发布和回滚清单见[第 8 节](#executor-release)。工具缓存为 `zig-cache/zig-local-cache/zigbuild-cache`。源码只用干净 Git clone/bundle，不复制 `.env`、账户工件或未提交文件；已有 checkout 不自动 reset。
 - Cargo 仍使用既有 `slot-2` 锁和两个全局并发许可，其自动目标子目录 `slot-2/x86_64-unknown-linux-gnu/release` 不是另设 target root。六所按顺序、每次两个 Cargo jobs；全部目录计入 150 GiB 总预算。不清理 Windows 缓存，不安装工具、不改全局配置。
 - `-CheckOnly` 不新建输出、锁或缓存；正式构建前后均校验 HEAD 和干净状态，manifest 另记录构建入口/辅助/guard 脚本哈希，运行期间脚本变动则拒绝发布。源码 checkout 必须由构建独占，其他任务不得在构建期间同步或编辑；前后 Git 检查不是文件系统只读沙箱。输出要求 ELF64/x86-64，拒绝误复制 Windows exe；目录原子转为新 release，已有 release 不覆盖。失败保留缓存和本次 `.stage.*` 目录，不把不完整目录当发布包。
 - 入口持锁覆盖构建、ELF/哈希核验和复制，finally 还原 Cargo/Zig 环境并释放锁。版本化产物仅表示编译完成；KOL MVP 仍须完成 API/双向持仓验证、Executor/Binance、UI、容量和真实 Canary 验收。冻结旧链的签名 preflight 与 writer/WAL 接管另行处理。
@@ -169,7 +169,7 @@ Rust/Cargo 1.98.0、cargo-zigbuild 0.23.0、Zig 0.16.0 和 `x86_64-unknown-linux
 
 ### 真实部署与回滚边界
 
-alpha.27 升级须由 `schema.rs` 安装并验证截至 `0034` 的迁移（包括 `0028`/`0029` 授权与挂单映射、`0030`–`0033` 托管和数量设置、`0034` 多机器人目录），同步核验 [授权及数据库角色](LEADER_ORDER_MIRROR.md)。旧 Canary 脚本的成交模型 fixture 不能代替新挂单模型的 5/200 容量与延迟验收。数据库含真实 GTC 镜像后，不得直接回退到每次启动重跑旧迁移的 Control binary：旧 `0020` 会重解释 GTC，须先单独核验回滚版本的迁移兼容性。
+alpha.28 升级须由 `schema.rs` 安装并验证截至 `0037` 的迁移（包括 `0028`/`0029` 授权与挂单映射、`0030`–`0033` 托管和数量设置、`0034` 多机器人目录、`0035` 独立执行、`0036` 策略网格、`0037` 支撑分批策略），同步核验 [授权及数据库角色](LEADER_ORDER_MIRROR.md)。旧 Canary 脚本的成交模型 fixture 不能代替新挂单模型的 5/200 容量与延迟验收。数据库含真实 GTC 镜像后，不得直接回退到每次启动重跑旧迁移的 Control binary：旧 `0020` 会重解释 GTC，须先单独核验回滚版本的迁移兼容性。
 
 管理员可先运行包内 `venue-leader-bot-admin migrate`，然后以迁移所有者向运行角色授予实际需要的表与序列权限；授权表和授权审计表只授予运行角色 SELECT。生产 Control 设置 `VENUE_CONTROL_RUNTIME_DATABASE_URL`，Executor 使用其独立 `VENUE_EXECUTOR_DATABASE_URL`，二者不得拥有授权表或持有能改回管理员身份的角色成员关系。迁移 URL 不进入启动参数或日志。
 

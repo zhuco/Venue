@@ -1,6 +1,6 @@
 # VENUE
 
-当前产品版本：**v0.1.0-alpha.27 · 开发预览**（[VERSION](VERSION) / [更新说明](docs/CHANGELOG.md)）。
+当前产品版本：**v0.1.0-alpha.28 · 开发预览**（[VERSION](VERSION) / [更新说明](docs/CHANGELOG.md)）。
 
 VENUE 提供 Binance 交易终端、KOL 限价挂单同步和对冲网格。VenueFlow 是原生桌面客户端，Web 提供邀请注册、账户管理和跟单设置；交易统一由服务端单个多账户 `venue-executor-binance` 执行。当前发布范围为 Binance Portfolio Margin UM 双向持仓账户。
 
@@ -16,7 +16,7 @@ VENUE 提供 Binance 交易终端、KOL 限价挂单同步和对冲网格。Venu
 | 桌面终端 | 图表、盘口、持仓、委托、成交、仓位变更及资产；Post Only 开平仓、精确撤单、市价平仓和反开 | 私有数据来自用户作用域投影；反开先确认平仓，失败或未知结果不继续增仓 |
 | Binance 对冲网格 | 配置和签名事实驱动 Planner、目标订单与补撤收敛，共用命令账本 | 不依赖旧 Actor/WAL；旧账户迁入、恢复及性能须独立验收 |
 | Web | 用户登录、邀请页、API、托管跟随账户、跟单状态和挂单同步；独立 `/ops` 运营入口 | 使用兼容单实例带单接口；完整浏览器交易终端尚非桌面功能的等价实现 |
-| 其他交易所与旧 Node | alpha.27 保留六所 adapter、旧运行时和恢复读取代码 | 不属于本版 KOL 发布范围；独立策略扩展见下方开发状态，Scalping 仍暂缓 |
+| 其他交易所与旧 Node | alpha.28 包含六所 adapter 与独立策略执行入口 | 不属于本版 KOL 发布范围；独立策略扩展见下方开发状态，Scalping 仍暂缓 |
 
 主账户可从币安原生客户端或 VENUE 下单；同步依据是认证账户订单事实，与下单界面无关。停用带单会撤销程序子单剩余量，不自动平仓；不确定请求按原 `clientOrderId` 查单。桌面切换执行账户不代表带单源已完成切换，须遵守[带单源交接契约](docs/LEADER_ORDER_MIRROR.md)。
 
@@ -24,7 +24,7 @@ VENUE 提供 Binance 交易终端、KOL 限价挂单同步和对冲网格。Venu
 
 ## 开发中的扩展
 
-当前代码包含独立多交易所策略执行扩展：`multi_venue_*` 模块、迁移 `0035–0036` 和 `venue-strategy-admin`。它复用现有 Executor 进程，为另外五所提供独立策略命令、条件单及网格生命周期入口，不改变 Binance KOL 的复制范围。接口、账户模式和逐所验收见 [多交易所执行说明](docs/MULTI_VENUE_EXECUTOR.md)；这部分不属于 alpha.27 标签，可发布性与实盘状态须以具体 revision 的门禁和逐所真实验收为准。
+当前代码包含独立多交易所策略执行扩展：`multi_venue_*` 模块、迁移 `0035–0036` 和 `venue-strategy-admin`。它复用现有 Executor 进程，为另外五所提供独立策略命令、条件单及网格生命周期入口，不改变 Binance KOL 的复制范围。接口、账户模式和逐所验收见 [多交易所执行说明](docs/MULTI_VENUE_EXECUTOR.md)；这部分纳入 alpha.28 源码；实盘状态仍以部署核验和逐所真实验收为准。
 
 ## 代码与进程
 
