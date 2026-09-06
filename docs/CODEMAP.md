@@ -101,13 +101,9 @@
 | 已持久化命令物理边界 | `crates/venue-execution/src/durable_gateway.rs` |
 | 行情精度、名义金额和条件触发风险检查 | `apps/venue-control/src/multi_venue_risk.rs` |
 | 网格生命周期、签名累计成交与原子目标面 | `apps/venue-control/src/multi_venue_grid/{store,runtime,planner,tests}.rs` |
-<<<<<<< workspace
-| 迁移、绑定、命令、网格操作工具 | `apps/venue-control/migrations/{0035_multi_venue_executor,0036_strategy_grid}.sql`、`apps/venue-control/src/bin/venue-strategy-admin.rs` |
+| 迁移、绑定、命令、原命令观察、Bybit 资金费及网格操作工具 | `apps/venue-control/migrations/{0035_multi_venue_executor,0036_strategy_grid}.sql`、`apps/venue-control/src/bin/venue-strategy-admin.rs`；Bybit 资金费协议在 `crates/venue-gateway-bybit/src/funding.rs` |
 | 支撑分批做多规则、持久化、执行与参考行情 | `crates/venue-strategies/src/support_martingale/`、`apps/venue-control/src/support_martingale/`、migration `0037_support_martingale.sql` |
 | 支撑分批协议、用户 API 与桌面闭环 | `crates/venue-control-protocol/src/support_martingale.rs`、`apps/venue-control/src/accounts/support_martingale.rs`、`apps/ui/desktop/src/{support_martingale_view.rs,client/support_martingale.rs}` |
-=======
-| 迁移、绑定、命令、原命令观察、Bybit 资金费及网格操作工具 | `apps/venue-control/migrations/{0035_multi_venue_executor,0036_strategy_grid}.sql`、`apps/venue-control/src/bin/venue-strategy-admin.rs`；Bybit 资金费协议在 `crates/venue-gateway-bybit/src/funding.rs` |
->>>>>>> branch
 
 ## 冻结兼容与共享类型
 
