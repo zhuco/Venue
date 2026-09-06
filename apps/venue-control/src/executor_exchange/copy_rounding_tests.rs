@@ -21,11 +21,19 @@ fn rules() -> Result<BinanceInstrumentRules, Box<dyn std::error::Error>> {
 fn context() -> CopyRiskContext {
     CopyRiskContext {
         round_open_quantity_up: true,
+        open_quantity_rounding: None,
         max_order_notional: Decimal::from(5),
         max_total_notional: Decimal::from(100),
         max_deviation_bps: 5000,
         source_price: Decimal::new(9111, 5),
         source_occurred_ms: 1000,
+    }
+}
+
+fn bounded_context() -> CopyRiskContext {
+    CopyRiskContext {
+        open_quantity_rounding: Some(CopyOpenQuantityRounding::MinimumUpOtherwiseDown),
+        ..context()
     }
 }
 
@@ -49,6 +57,57 @@ fn five_quote_units_produce_the_smallest_valid_doge_lot() -> Result<(), Box<dyn 
     assert_eq!(
         normalize_mirror_open_quantity(Decimal::from(50), Decimal::new(1, 1), &rules)?,
         Decimal::from(50)
+    );
+    Ok(())
+}
+
+#[test]
+fn planned_amounts_above_the_minimum_round_down_without_exceeding_budget()
+-> Result<(), Box<dyn std::error::Error>> {
+    let rules = rules()?;
+    let price = Decimal::new(907, 4);
+    let requested = Decimal::from(25) / price;
+    assert_eq!(
+        normalize_copy_open_quantity(&bounded_context(), requested, price, &rules)?,
+        Decimal::from(275)
+    );
+    assert_eq!(Decimal::from(275) * price, Decimal::new(249425, 4));
+    assert_eq!(
+        normalize_copy_open_quantity(
+            &bounded_context(),
+            Decimal::new(49, 1) / price,
+            price,
+            &rules,
+        )?,
+        Decimal::from(56)
+    );
+    Ok(())
+}
+
+#[test]
+fn market_open_uses_the_same_bounded_rounding_policy() -> Result<(), Box<dyn std::error::Error>> {
+    let rules = rules()?;
+    let price = Decimal::new(907, 4);
+    let mut context = bounded_context();
+    context.source_price = price;
+    context.max_order_notional = Decimal::from(25);
+    let (binding, evidence) = risk(Decimal::ZERO, Decimal::ONE)?;
+    let mark = BinanceMarkPrice {
+        symbol: binding.symbol.clone(),
+        price: Price::new(price)?,
+        observed_at_ms: 1_000,
+    };
+    assert_eq!(
+        clip_open_quantity(
+            &context,
+            &binding,
+            &evidence,
+            &mark,
+            &rules,
+            Decimal::from(25) / price,
+            1_000,
+        )?,
+        Decimal::from(275)
     );
     Ok(())
 }

@@ -48,7 +48,12 @@ impl BinanceHttpExecution {
                         *trigger_price,
                         now_ms()?,
                     )?;
-                    copy_risk::normalize_mirror_open_quantity(*quantity, *trigger_price, &rules)?
+                    copy_risk::normalize_copy_open_quantity(
+                        context,
+                        *quantity,
+                        *trigger_price,
+                        &rules,
+                    )?
                 };
                 prepare_place_stop_market(
                     &rules,
@@ -183,14 +188,16 @@ fn algo_outcome(
             working_type,
             reducing: _,
         } => {
-            let normalized = request
+            let normalized = match request
                 .copy_risk
                 .as_ref()
-                .is_some_and(|risk| risk.round_open_quantity_up)
-                .then(|| {
-                    copy_risk::normalize_mirror_open_quantity(*quantity, *trigger_price, rules)
-                })
-                .unwrap_or_else(|| normalize_quantity(*quantity, rules));
+                .filter(|risk| risk.round_open_quantity_up || risk.open_quantity_rounding.is_some())
+            {
+                Some(risk) => {
+                    copy_risk::normalize_copy_open_quantity(risk, *quantity, *trigger_price, rules)
+                }
+                None => normalize_quantity(*quantity, rules),
+            };
             normalized.is_ok_and(|quantity| algo.quantity == FieldState::Known(quantity))
                 && algo.order_type == FieldState::Known("STOP_MARKET".to_owned())
                 && algo.side == FieldState::Known(*side)

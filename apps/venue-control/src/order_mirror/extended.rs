@@ -442,7 +442,11 @@ async fn enqueue_place(
     let source = serde_json::to_value(order).map_err(|_| Error::Conflict)?;
     let command_revision:i64=sqlx::query_scalar("INSERT INTO venue_order_mirrors (mirror_id,bot_id,bot_revision,permission_revision,relation_id,relation_revision,source_order_id,source_client_order_id,symbol,source_order_json,source_kind,child_sequence,child_client_order_id,child_quantity,mirror_state,created_ms,updated_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pending',$15,$15) RETURNING command_revision")
         .bind(&mirror).bind(bot).bind(number(row,"bot_revision")?).bind(number(row,"permission_revision")?).bind(&relation).bind(revision).bind(order.native_id()).bind(order.client_id()).bind(order.symbol().to_string()).bind(source).bind(order.kind()).bind(sequence).bind(&client).bind(quantity.to_string()).bind(stamp(now)?).fetch_one(&mut *connection).await.map_err(unavailable)?;
-    let risk = serde_json::json!({"round_open_quantity_up":!order.reducing(),"max_order_notional":text(row,"max_order_notional")?,"max_total_notional":text(row,"max_total_notional")?,"max_deviation_bps":row.try_get::<i32,_>("max_deviation_bps").map_err(unavailable)?,"source_price":order.price().to_string(),"source_occurred_ms":order.occurred_ms()});
+    let mut risk = serde_json::json!({"round_open_quantity_up":!order.reducing(),"max_order_notional":text(row,"max_order_notional")?,"max_total_notional":text(row,"max_total_notional")?,"max_deviation_bps":row.try_get::<i32,_>("max_deviation_bps").map_err(unavailable)?,"source_price":order.price().to_string(),"source_occurred_ms":order.occurred_ms()});
+    if !order.reducing() {
+        risk["open_quantity_rounding"] =
+            serde_json::Value::String("minimum_up_otherwise_down".into());
+    }
     let (kind, trigger, working) = match order {
         ExtendedSource::Market { .. } => ("market", None, None),
         ExtendedSource::Stop { order } => (

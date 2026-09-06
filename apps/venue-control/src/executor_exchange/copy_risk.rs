@@ -13,6 +13,8 @@ pub struct CopyRiskContext {
     /// Persisted per command so recovery never changes an older order's rounding policy.
     #[serde(default)]
     pub round_open_quantity_up: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_quantity_rounding: Option<CopyOpenQuantityRounding>,
     pub max_order_notional: Decimal,
     pub max_total_notional: Decimal,
     pub max_deviation_bps: u32,
@@ -116,11 +118,18 @@ pub(super) fn clip_open_quantity(
     }
     let notional_limit = remaining.min(context.max_order_notional);
     let ceiling = notional_limit.checked_div(unit).ok_or_else(invalid)?;
-    let quantity = normalize_quantity(requested.min(ceiling).min(rules.maximum_quantity), rules)?;
-    if quantity
-        .checked_mul(unit)
-        .is_none_or(|value| value > notional_limit)
-    {
+    let bounded = requested.min(ceiling).min(rules.maximum_quantity);
+    let quantity = normalize_copy_open_quantity(context, bounded, mark.price.value(), rules)?;
+    let notional = quantity.checked_mul(unit).ok_or_else(invalid)?;
+    let order_limit = minimum_rounding_order_limit(
+        context,
+        context.max_order_notional,
+        notional,
+        unit,
+        mark.price.value(),
+        rules,
+    )?;
+    if notional > remaining || notional > order_limit {
         return Err(invalid());
     }
     check_minimum_notional_at_price(mark.price, quantity, rules)?;
@@ -163,26 +172,16 @@ pub(super) fn check_mirror_limit_risk(
         .ok_or_else(invalid)?;
     let asset = Asset::new(binding.symbol.quote()).map_err(|_| invalid())?;
     let unit = risk.value_in_usdt(&asset, price).map_err(|_| invalid())?;
-    let quantity = if context.round_open_quantity_up {
-        normalize_mirror_open_quantity(requested, price, rules)?
-    } else {
-        normalize_quantity(requested, rules)?
-    };
+    let quantity = normalize_copy_open_quantity(context, requested, price, rules)?;
     let notional = quantity.checked_mul(unit).ok_or_else(invalid)?;
-    let order_limit = if context.round_open_quantity_up && notional > context.max_order_notional {
-        normalize_mirror_open_quantity(
-            context
-                .max_order_notional
-                .checked_div(unit)
-                .ok_or_else(invalid)?,
-            price,
-            rules,
-        )?
-        .checked_mul(unit)
-        .ok_or_else(invalid)?
-    } else {
-        context.max_order_notional
-    };
+    let order_limit = minimum_rounding_order_limit(
+        context,
+        context.max_order_notional,
+        notional,
+        unit,
+        price,
+        rules,
+    )?;
     if notional > order_limit
         || total.checked_add(notional).ok_or_else(invalid)? > context.max_total_notional
     {
@@ -191,25 +190,87 @@ pub(super) fn check_mirror_limit_risk(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyOpenQuantityRounding {
+    MinimumUpOtherwiseDown,
+}
+
 pub(super) fn normalize_request_quantity(
     request: &ExecutionRequest,
     quantity: Decimal,
     rules: &BinanceInstrumentRules,
 ) -> Result<Decimal, BinanceExecutionError> {
     if request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Copy
-        && request
-            .copy_risk
-            .as_ref()
-            .is_some_and(|risk| risk.round_open_quantity_up)
+        && let Some(risk) = request.copy_risk.as_ref()
         && let ExecutionOrderKind::Limit {
             reducing: false,
             price,
             ..
         } = request.order_kind
     {
-        return normalize_mirror_open_quantity(quantity, price, rules);
+        return normalize_copy_open_quantity(risk, quantity, price, rules);
     }
     normalize_quantity(quantity, rules)
+}
+
+pub(super) fn normalize_copy_open_quantity(
+    context: &CopyRiskContext,
+    requested: Decimal,
+    price: Decimal,
+    rules: &BinanceInstrumentRules,
+) -> Result<Decimal, BinanceExecutionError> {
+    match context.open_quantity_rounding {
+        Some(CopyOpenQuantityRounding::MinimumUpOtherwiseDown) => {
+            normalize_mirror_open_quantity_bounded(requested, price, rules)
+        }
+        None if context.round_open_quantity_up => {
+            normalize_mirror_open_quantity(requested, price, rules)
+        }
+        None => normalize_quantity(requested, rules),
+    }
+}
+
+fn minimum_rounding_order_limit(
+    context: &CopyRiskContext,
+    configured_limit: Decimal,
+    actual_notional: Decimal,
+    unit: Decimal,
+    price: Decimal,
+    rules: &BinanceInstrumentRules,
+) -> Result<Decimal, BinanceExecutionError> {
+    if actual_notional <= configured_limit
+        || (context.open_quantity_rounding.is_none() && !context.round_open_quantity_up)
+    {
+        return Ok(configured_limit);
+    }
+    normalize_copy_open_quantity(
+        context,
+        configured_limit
+            .checked_div(unit)
+            .ok_or(BinanceExecutionError::Invalid)?,
+        price,
+        rules,
+    )?
+    .checked_mul(unit)
+    .ok_or(BinanceExecutionError::Invalid)
+}
+
+/// Floors an opening quantity when that lot remains exchange-compliant. A smaller request is
+/// enlarged only to the first lot satisfying the exchange quantity and notional minimums.
+pub(super) fn normalize_mirror_open_quantity_bounded(
+    requested: Decimal,
+    price: Decimal,
+    rules: &BinanceInstrumentRules,
+) -> Result<Decimal, BinanceExecutionError> {
+    if let Ok(quantity) = normalize_quantity(requested, rules)
+        && quantity
+            .checked_mul(price)
+            .is_some_and(|notional| notional >= rules.instrument.minimum_notional.value)
+    {
+        return Ok(quantity);
+    }
+    normalize_mirror_open_quantity(requested, price, rules)
 }
 
 /// Smallest valid opening size at the source limit price. Closing intents keep their
