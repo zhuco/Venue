@@ -866,12 +866,7 @@ fn parse_strategy_order(
         Some("failed") => OrderState::Rejected,
         _ => return Err(BitgetExecutionError::Payload),
     };
-    let reduce_only = match item.get("reduceOnly") {
-        Some(Value::Bool(value)) => *value,
-        Some(Value::String(value)) if value.eq_ignore_ascii_case("yes") => true,
-        Some(Value::String(value)) if value.eq_ignore_ascii_case("no") => false,
-        _ => return Err(BitgetExecutionError::Payload),
-    };
+    let reduce_only = strategy_reduce_only(item.get("reduceOnly"), position_side, side)?;
     if item.get("category").and_then(Value::as_str) != Some("USDT-FUTURES")
         || item
             .get("type")
@@ -1200,6 +1195,25 @@ const fn close_side(position_side: PositionSide) -> Result<OrderSide, BitgetExec
     }
 }
 
+pub(crate) fn strategy_reduce_only(
+    value: Option<&Value>,
+    position_side: PositionSide,
+    side: OrderSide,
+) -> Result<bool, BitgetExecutionError> {
+    validate_hedge_direction(position_side, side, true)?;
+    match value {
+        None | Some(Value::Null) => Ok(true),
+        Some(Value::String(value)) if value.is_empty() => Ok(true),
+        Some(Value::Bool(true)) => Ok(true),
+        Some(Value::String(value)) if value.eq_ignore_ascii_case("yes") => Ok(true),
+        Some(Value::Bool(false)) => Err(BitgetExecutionError::Readback),
+        Some(Value::String(value)) if value.eq_ignore_ascii_case("no") => {
+            Err(BitgetExecutionError::Readback)
+        }
+        _ => Err(BitgetExecutionError::Payload),
+    }
+}
+
 const fn side_wire(side: OrderSide) -> &'static str {
     match side {
         OrderSide::Buy => "buy",
@@ -1405,6 +1419,27 @@ mod tests {
             .is_err()
         );
         Ok(())
+    }
+
+    #[test]
+    fn strategy_reduce_projection_may_be_omitted_but_never_contradict_direction() {
+        assert_eq!(
+            strategy_reduce_only(None, PositionSide::Short, OrderSide::Buy),
+            Ok(true)
+        );
+        assert_eq!(
+            strategy_reduce_only(Some(&Value::Null), PositionSide::Long, OrderSide::Sell),
+            Ok(true)
+        );
+        assert!(
+            strategy_reduce_only(
+                Some(&Value::Bool(false)),
+                PositionSide::Short,
+                OrderSide::Buy
+            )
+            .is_err()
+        );
+        assert!(strategy_reduce_only(None, PositionSide::Short, OrderSide::Sell).is_err());
     }
 
     #[test]
