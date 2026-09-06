@@ -395,7 +395,7 @@ async fn managed_verification_uses_saved_authorization_and_requests_activation()
                 managed_id: saved.managed_id.clone(),
             },
             timestamp,
-            |_| async { proof(96, false, timestamp) },
+            |_| async { proof(96, false, timestamp + 1) },
         )
         .await?;
     assert_eq!(verified.equity, Some(Decimal::from(100)));
