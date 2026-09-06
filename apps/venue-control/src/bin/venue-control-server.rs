@@ -3,7 +3,7 @@
 use std::{env, net::SocketAddr, sync::Arc};
 
 use sqlx::postgres::PgPoolOptions;
-use venue_control::accounts::{AccountService, CredentialCipher};
+use venue_control::accounts::{AccountService, CredentialCipher, run_managed_deletion_cleanup};
 use venue_control::{
     ControlHttpConfig, ControlService, PgControlRepository, control_shutdown_channel,
     install_control_schema, serve_local_with_accounts,
@@ -38,8 +38,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let accounts = Arc::new(AccountService::new(pool.clone(), cipher)?);
-    let service = Arc::new(ControlService::new(PgControlRepository::new(pool)));
+    let service = Arc::new(ControlService::new(PgControlRepository::new(pool.clone())));
     let (shutdown_tx, shutdown_rx) = control_shutdown_channel();
+    let cleanup_task = tokio::spawn(run_managed_deletion_cleanup(pool, shutdown_rx.clone()));
     let server = serve_local_with_accounts(
         listener,
         service,
@@ -49,12 +50,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     tokio::pin!(server);
 
-    tokio::select! {
+    let result = tokio::select! {
         result = &mut server => result.map_err(Into::into),
         signal = tokio::signal::ctrl_c() => {
             signal?;
             let _ = shutdown_tx.send(true);
             server.await.map_err(Into::into)
         }
-    }
+    };
+    let _ = shutdown_tx.send(true);
+    cleanup_task.await?;
+    result
 }

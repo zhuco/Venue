@@ -65,14 +65,14 @@ export function ManagedFollowersPanel({ csrf }: { csrf: string }) {
     } catch (cause) { if (alive.current) setError(cause instanceof Error ? cause.message : messages.unavailable); }
     finally { gate.current = false; if (alive.current) setBusy(false); }
   }
-  async function remove(account: Account, password: string) {
+  async function remove(account: Account) {
     if (gate.current) return;
     gate.current = true; setBusy(true); setError(""); setNotice("");
     try {
-      const result = await api<Overview>("managed-delete", csrf, { managed_id: account.managed_id, password });
-      if (alive.current) { setOverview(result); setNotice(`${account.label} 已从 Venue 托管列表删除。`); }
+      const result = await api<Overview>("managed-delete", csrf, { managed_id: account.managed_id });
+      if (alive.current) { setOverview(result); setNotice(`${account.label} 已停止跟单并从托管列表移除；程序挂单正在撤销。`); }
     } catch (cause) {
-      if (alive.current) setError(cause instanceof RequestError && cause.status === 409 ? "系统已请求停跟；账户仍有挂单、持仓或未完成命令，请完成对账后重试删除。" : cause instanceof Error ? cause.message : messages.unavailable);
+      if (alive.current) setError(cause instanceof Error ? cause.message : messages.unavailable);
     } finally { gate.current = false; if (alive.current) setBusy(false); }
   }
   if (overview && !overview.can_manage && overview.accounts.length === 0 && !error) return null;
@@ -83,7 +83,7 @@ export function ManagedFollowersPanel({ csrf }: { csrf: string }) {
     {notice && <p role="status" className="notice">{notice}</p>}
     <div className="buttons"><button className="primary" disabled={busy || !overview?.can_manage || overview.accounts.length >= 200} onClick={() => { setRows([draft()]); dialog.current?.showModal(); }}>添加托管 API Key</button><button disabled={busy} onClick={() => void refresh()}>刷新托管账户</button></div>
     {overview?.accounts.length === 0 && <p className="muted">尚未添加托管账户。点击上方按钮开始保存。</p>}
-    {overview && overview.accounts.length > 0 && <div className="table"><table><thead><tr><th>账户标签</th><th>API Key</th><th>验证状态</th><th>账户权益</th><th>可用保证金</th><th>跟单</th><th>操作</th></tr></thead><tbody>{overview.accounts.map(account => <tr key={account.managed_id}><td>{account.label}</td><td>{account.masked_key}</td><td>{verification[account.verification] ?? "状态未知"}</td><td>{balance(account.equity)}</td><td>{balance(account.available_margin)}</td><td><ManagedFollowSettingsPanel managedId={account.managed_id} label={account.label} csrf={csrf} canManage={overview.can_manage} /></td><td><button disabled={busy || !overview.can_manage} onClick={() => void verify(account)}>验证权限并申请跟单</button><details><summary>删除托管账户</summary><form onSubmit={event => { event.preventDefault(); const form = event.currentTarget; const password = String(new FormData(form).get("password") ?? ""); form.reset(); void remove(account, password); }}><p className="muted">系统先停跟并撤销程序子单；确认无持仓、挂单和未完成命令后清除 Venue 凭证，不删除 Binance 子账户。</p><label>输入登录密码确认<input name="password" type="password" required autoComplete="current-password" /></label><button disabled={busy || !overview.can_manage}>确认删除</button></form></details></td></tr>)}</tbody></table></div>}
+    {overview && overview.accounts.length > 0 && <div className="table"><table><thead><tr><th>账户标签</th><th>API Key</th><th>验证状态</th><th>账户权益</th><th>可用保证金</th><th>跟单</th><th>操作</th></tr></thead><tbody>{overview.accounts.map(account => <tr key={account.managed_id}><td>{account.label}</td><td>{account.masked_key}</td><td>{verification[account.verification] ?? "状态未知"}</td><td>{balance(account.equity)}</td><td>{balance(account.available_margin)}</td><td><ManagedFollowSettingsPanel managedId={account.managed_id} label={account.label} csrf={csrf} canManage={overview.can_manage} /></td><td><button disabled={busy || !overview.can_manage} onClick={() => void verify(account)}>验证权限并申请跟单</button><button disabled={busy || !overview.can_manage} onClick={() => void remove(account)}>删除托管账户</button><p className="muted">立即停跟并移出列表；程序挂单撤销及未决命令对账完成后擦除凭证。</p></td></tr>)}</tbody></table></div>}
     <dialog ref={dialog} className="managed-dialog" aria-labelledby="managed-title" onCancel={event => { event.preventDefault(); close(); }}>
       <h2 id="managed-title">添加托管 API Key</h2><p>填写标签、API Key 和 API Secret。支持一次添加多个账户，最多 10 个。</p>
       <p className="muted">仅支持 Binance Portfolio Margin · UM · 双向持仓；开启读取及 UM 交易权限，关闭提现。密钥加密保存后只显示掩码。</p>

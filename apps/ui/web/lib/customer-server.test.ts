@@ -109,6 +109,27 @@ test("managed list and verification disclose only the narrow summary", () => {
   assert.equal(JSON.stringify(clean).includes("secret"),false);
 });
 
+test("managed deletion needs only the owned managed id", async () => {
+  const keys = ["VENUE_WEB_SESSION_SIGNING_KEY", "VENUE_CONTROL_ORIGIN"] as const;
+  const old = keys.map(key => process.env[key]); const fetch = globalThis.fetch; let calls = 0;
+  try {
+    process.env.VENUE_WEB_SESSION_SIGNING_KEY = material;
+    process.env.VENUE_CONTROL_ORIGIN = "http://127.0.0.1:39180";
+    const cookie = sealCustomerSession(session()); assert.ok(cookie);
+    globalThis.fetch = async (url, init) => {
+      calls++;
+      assert.equal(String(url), "http://127.0.0.1:39180/v2/kol/managed-followers/delete");
+      assert.deepEqual(JSON.parse(String(init?.body)), { managed_id: "owned" });
+      return Response.json({ can_manage: true, accounts: [] });
+    };
+    const denied = await customerResponse(request("managed-delete", { cookie, body: { managed_id: "owned", password: "legacy" } }), "managed-delete");
+    assert.equal(denied.status, 400); assert.equal(calls, 0);
+    const deleted = await customerResponse(request("managed-delete", { cookie, body: { managed_id: "owned" } }), "managed-delete");
+    assert.equal(deleted.status, 200); assert.equal(calls, 1);
+    assert.deepEqual(await deleted.json(), { can_manage: true, accounts: [] });
+  } finally { globalThis.fetch = fetch; keys.forEach((key,index) => { if(old[index] === undefined) delete process.env[key]; else process.env[key]=old[index]; }); }
+});
+
 test("managed sizing responses preserve each mode without leaking internal credentials", () => {
   const settings = { sizing: { mode:"fixed_notional", notional:"5.5", api_secret:"hidden" }, allocated_capital:"55", multiplier:"1", max_order_notional:"5.5", max_total_notional:"55", max_deviation_bps:100, allowed_symbols:["DASH/USDT"], credential_id:"hidden" };
   for (const action of ["managed-settings", "managed-follow", "managed-status"]) {

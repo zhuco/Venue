@@ -419,7 +419,7 @@ async fn managed_verification_uses_saved_authorization_and_requests_activation()
 }
 
 #[tokio::test]
-async fn managed_delete_requires_owner_password_and_fresh_empty_exchange_state() -> TestResult {
+async fn managed_delete_is_one_click_and_erases_credentials_after_drain() -> TestResult {
     let Some(f) = Fixture::create().await? else {
         return Ok(());
     };
@@ -451,69 +451,37 @@ async fn managed_delete_requires_owner_password_and_fresh_empty_exchange_state()
             |_| async { proof(94, false, timestamp) },
         )
         .await?;
-    let removal = || ManagedFollowerDeleteRequest {
+    let removal = ManagedFollowerDeleteRequest {
         managed_id: saved.managed_id.clone(),
-        password: SecretValue::new("password-wrong".into()),
     };
-    assert_eq!(
-        f.service
-            .delete_managed_follower_with(&owner, removal(), timestamp, |_| async {
-                proof(94, false, timestamp)
-            })
-            .await
-            .err()
-            .map(|error| error.code),
-        Some(Code::InvalidLogin)
-    );
-    let valid_removal = || ManagedFollowerDeleteRequest {
-        managed_id: saved.managed_id.clone(),
-        password: login("kol-delete").password,
-    };
-    assert_eq!(
-        f.service
-            .delete_managed_follower_with(&owner, valid_removal(), timestamp, |_| async {
-                proof(94, true, timestamp)
-            })
-            .await
-            .err()
-            .map(|error| error.code),
-        Some(Code::AccountInUse)
-    );
-    let paused = f
+    let overview = f
         .service
-        .managed_follow_status(
-            &owner,
-            ManagedFollowStatusRequest {
-                managed_id: saved.managed_id.clone(),
-            },
-            timestamp,
-        )
-        .await?
-        .ok_or("missing paused relation")?;
-    assert_eq!(
-        paused.state,
-        venue_control_protocol::kol::FollowLifecycleState::Paused
-    );
-    assert!(!paused.activation_requested);
-    f.service
-        .delete_managed_follower_with(&owner, valid_removal(), timestamp, |_| async {
-            proof(94, false, timestamp)
-        })
+        .delete_managed_follower(&owner, removal, timestamp)
         .await?;
-    assert!(
-        f.service
-            .managed_followers(&owner)
-            .await?
-            .accounts
-            .is_empty()
-    );
+    assert!(overview.accounts.is_empty());
+    let requested: (Option<i64>, Option<i64>, i32) = sqlx::query_as(
+        "SELECT m.delete_requested_ms,c.deleted_ms,octet_length(c.encrypted_credentials) FROM venue_api_credentials c JOIN venue_managed_credentials m USING(credential_id) WHERE m.managed_id=$1",
+    )
+    .bind(&saved.managed_id)
+    .fetch_one(&f.pool)
+    .await?;
+    assert_eq!(requested.0, Some(ms(timestamp)?));
+    assert_eq!(requested.1, None);
+    assert!(requested.2 > 0);
+    let unresolved = "00000000-0000-4000-8000-000000000623";
+    sqlx::query("INSERT INTO venue_binance_commands (command_id,command_origin,relation_id,relation_revision,target_revision,owner_user_id,trading_account_id,credential_id,symbol,position_side,command_phase,order_kind,order_side,requested_quantity,target_quantity,rule_version,client_order_id,command_state,created_ms,updated_ms,copy_risk) SELECT $1,'copy',r.relation_id,r.revision,1,r.follower_user_id,r.follower_trading_account_id,r.credential_id,'BTC/USDT','long','open','market','buy','0.001','0.001','fixture',$1,'pending',$2,$2,'{\"max_order_notional\":\"20\",\"max_total_notional\":\"100\",\"max_deviation_bps\":100,\"source_price\":\"10000\",\"source_occurred_ms\":1}'::jsonb FROM venue_kol_follow_relations r WHERE r.follower_user_id=(SELECT follower_user_id FROM venue_managed_credentials WHERE managed_id=$3)")
+        .bind(unresolved).bind(ms(timestamp)?).bind(&saved.managed_id).execute(&f.pool).await?;
+    assert_eq!(finalize_managed_deletions(&f.pool, timestamp + 1).await?, 0);
+    sqlx::query("UPDATE venue_binance_commands SET command_state='cancelled',terminal_ms=$1,updated_ms=$1,sanitized_error_code='test_terminal' WHERE command_id=$2")
+        .bind(ms(timestamp + 1)?).bind(unresolved).execute(&f.pool).await?;
+    assert_eq!(finalize_managed_deletions(&f.pool, timestamp + 2).await?, 1);
     let tombstone: (Option<i64>, i32, String) = sqlx::query_as(
         "SELECT deleted_ms,octet_length(encrypted_credentials),masked_key FROM venue_api_credentials c JOIN venue_managed_credentials m USING(credential_id) WHERE m.managed_id=$1",
     )
     .bind(&saved.managed_id)
     .fetch_one(&f.pool)
     .await?;
-    assert_eq!(tombstone.0, Some(ms(timestamp)?));
+    assert_eq!(tombstone.0, Some(ms(timestamp + 2)?));
     assert_eq!(tombstone.1, 0);
     assert_eq!(tombstone.2, "已删除");
     f.cleanup().await
@@ -554,7 +522,7 @@ async fn frozen_managed_table_is_preserved_and_nonempty_legacy_fails_closed() ->
         sqlx::query_scalar::<_, i32>("SELECT max(version) FROM venue_control_schema_migrations")
             .fetch_one(&f.pool)
             .await?,
-        40
+        41
     );
     assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='venue_kol_managed_followers' AND column_name='managed_follower_id'").fetch_one(&f.pool).await?,1);
     let session = f.service.register(login("freshuser"), now()).await?;

@@ -172,7 +172,7 @@ export async function customerResponse(request: NextRequest, action: string): Pr
         if (Object.keys(raw).some(k => !["label", "key", "secret", "authorization"].includes(k)) || [raw.label, raw.key, raw.secret].some(v => typeof v !== "string")) throw new Error("invalid_credentials");
         body = JSON.stringify({ credential: { label: raw.label, api_key: raw.key, api_secret: raw.secret }, authorization: followAuthorization(raw.authorization) });
       } else if (action === "managed-delete") {
-        if (Object.keys(raw).some(k => !["managed_id", "password"].includes(k)) || [raw.managed_id, raw.password].some(v => typeof v !== "string")) throw new Error("invalid_managed_delete");
+        if (Object.keys(raw).some(k => k !== "managed_id") || typeof raw.managed_id !== "string") throw new Error("invalid_managed_delete");
         body = JSON.stringify(raw);
       } else { body = JSON.stringify(raw); }
     } catch { return response({ code: "invalid_input" }, 400); }

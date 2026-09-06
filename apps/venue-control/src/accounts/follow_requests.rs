@@ -45,7 +45,7 @@ pub(super) async fn lock_scope(
             if login_enabled {
                 return Err(error(Code::Forbidden));
             }
-            let row = sqlx::query("SELECT credential_id FROM venue_managed_credentials WHERE managed_id=$1 AND kol_user_id=$2 AND follower_user_id=$3 FOR SHARE")
+            let row = sqlx::query("SELECT credential_id FROM venue_managed_credentials WHERE managed_id=$1 AND kol_user_id=$2 AND follower_user_id=$3 AND delete_requested_ms IS NULL FOR SHARE")
                 .bind(id).bind(owner).bind(&principal.user.user_id).fetch_optional(&mut **tx).await.map_err(database_error)?.ok_or(error(Code::NotFound))?;
             let owned: String = row.try_get("credential_id").map_err(database_error)?;
             if credential.is_some_and(|id| id != owned) {

@@ -13,7 +13,7 @@
 | Control HTTP 服务 | `apps/venue-control/src/bin/venue-control-server.rs` |
 | 共享 Executor：私有投影、人工带单、Grid 与独立策略调度 | `apps/venue-control/src/bin/venue-executor-binance.rs` |
 | 带单授权、撤权及仅迁移命令 | `apps/venue-control/src/bin/venue-leader-bot-admin.rs`、`apps/venue-control/src/leader_bot_admin.rs` |
-| 版本化迁移及校验 | `apps/venue-control/src/schema.rs`、`apps/venue-control/migrations/`；alpha.28 安装至 0037 |
+| 版本化迁移及校验 | `apps/venue-control/src/schema.rs`、`apps/venue-control/migrations/`；当前安装至 0041 |
 | 本地受控构建与缓存准入 | `scripts/Invoke-VenueBuild.ps1`、`scripts/venue_build_guard.ps1` |
 | Ubuntu Control/Executor/管理员工具打包 | `scripts/Build-VenueUbuntu.ps1`；`-Component Control` |
 | CI、源码卫生及依赖边界 | `.github/workflows/workspace-gates.yml`、`scripts/verify_repository_hygiene.ps1`、`scripts/verify_workspace_policy.ps1` |
@@ -27,7 +27,7 @@
 | 用户、会话、密码、凭证密文及归属 | `apps/venue-control/src/accounts/`、`crates/venue-control-protocol/src/accounts.rs` |
 | KOL、邀请、跟随关系和终端投影协议 | `crates/venue-control-protocol/src/kol.rs`；Control 的 accounts、HTTP、repository 边界 |
 | 带单多配置目录与创建/编辑/启停 | `apps/venue-control/src/accounts/leader_bot.rs`、`crates/venue-control-protocol/src/leader_bot.rs`；迁移 0028/0029/0034 |
-| 跟单 API 授权与托管账户 | `apps/venue-control/src/accounts/{credentials,managed_followers}.rs`、`crates/venue-gateway-binance/src/credential_probe.rs`；迁移 0030/0031/0038，保存定比/定额后验证并自动申请激活，支持余额验证与安全删除 |
+| 跟单 API 授权与托管账户 | `apps/venue-control/src/accounts/{credentials,managed_followers}.rs`、`crates/venue-gateway-binance/src/credential_probe.rs`；迁移 0030/0031/0038/0041，保存定比/定额后验证并自动申请激活，删除免密码并在撤单对账后擦除凭证 |
 | 托管账户逐账户参数及生命周期 | `apps/venue-control/src/accounts/follow_requests.rs`；迁移 0033；`/v2/kol/managed-followers/follow/{status,settings,lifecycle}`，暂停态仅作为执行安全闸门 |
 | 定比/定额数量 | `crates/venue-control-protocol/src/follow_sizing.rs`、`apps/venue-control/src/order_mirror/planner.rs`；开仓向上取整/最小合规额与回读共用 `apps/venue-control/src/executor_exchange/copy_risk.rs`，回归 `apps/venue-control/src/executor_exchange/copy_rounding_tests.rs`；迁移 0032 |
 | 限价/市价/止损源单、子单映射、替代单及对账 | `apps/venue-control/src/order_mirror/{mod,planner,extended,store,settlement}.rs`、`executor_exchange/algo.rs`；迁移 0040 |

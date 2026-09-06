@@ -1,6 +1,6 @@
 //! Saved managed credentials are distinct from enabled follow relationships.
 use crate::{
-    accounts::{ApiVerificationState, BindCredentialRequest, SecretValue},
+    accounts::{ApiVerificationState, BindCredentialRequest},
     kol::{FollowLifecycleAction, FollowLifecycleState},
 };
 use rust_decimal::Decimal;
@@ -42,7 +42,6 @@ pub struct ManagedFollowerVerifyRequest {
 #[serde(deny_unknown_fields)]
 pub struct ManagedFollowerDeleteRequest {
     pub managed_id: String,
-    pub password: SecretValue,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

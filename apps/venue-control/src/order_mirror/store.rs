@@ -103,9 +103,13 @@ pub async fn run_order_mirror(
         let mut turns = stream::iter(relations.into_iter().map(|relation| {
             let pool = pool.clone();
             async move {
-                let ordinary = plan_relation(&pool, &relation, now).await?;
-                let extended = super::extended::plan_relation(&pool, &relation, now).await?;
-                Ok::<bool, Error>(ordinary || extended)
+                let ordinary = plan_relation(&pool, &relation, now)
+                    .await
+                    .map_err(|cause| (relation.clone(), "limit", cause))?;
+                let extended = super::extended::plan_relation(&pool, &relation, now)
+                    .await
+                    .map_err(|cause| (relation.clone(), "market_or_stop", cause))?;
+                Ok::<bool, (String, &'static str, Error)>(ordinary || extended)
             }
         }))
         .buffer_unordered(8);
@@ -113,7 +117,10 @@ pub async fn run_order_mirror(
             match result {
                 Ok(true) => wake.wake(),
                 Ok(false) => {}
-                Err(_) => tracing::warn!(
+                Err((relation_id, source_kind, cause)) => tracing::warn!(
+                    %relation_id,
+                    source_kind,
+                    ?cause,
                     "Order mirror turn failed; retained mappings and commands for reconciliation"
                 ),
             }
