@@ -479,6 +479,12 @@ fn binding() -> BindCredentialRequest {
         api_secret: SecretValue::new("S".repeat(32)),
     }
 }
+fn follow_binding() -> FollowCredentialCreateRequest {
+    FollowCredentialCreateRequest {
+        credential: binding(),
+        authorization: Default::default(),
+    }
+}
 
 fn grid_config(order_notional: i64) -> GridConfig {
     GridConfig {
@@ -568,7 +574,7 @@ async fn postgres_http_account_lifecycle_requires_session_json_and_ownership() -
     )
     .await?;
     let response = s
-        .post(CREDENTIALS_PATH, Some(&alice), &binding())
+        .post(CREDENTIALS_PATH, Some(&alice), &follow_binding())
         .send()
         .await?
         .error_for_status()?;

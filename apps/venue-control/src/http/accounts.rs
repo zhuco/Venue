@@ -22,10 +22,11 @@ use venue_control_protocol::{
         LeaderBotLifecycleRequest, LeaderBotUpdateRequest, MIRROR_ORDERS_PATH,
     },
     managed_followers::{
-        MANAGED_FOLLOW_LIFECYCLE_PATH, MANAGED_FOLLOW_SETTINGS_PATH, MANAGED_FOLLOW_STATUS_PATH,
-        MANAGED_FOLLOWERS_PATH, MANAGED_VERIFY_PATH, ManagedFollowLifecycleRequest,
-        ManagedFollowSettingsUpsertRequest, ManagedFollowStatusRequest,
-        ManagedFollowerCreateRequest, ManagedFollowerVerifyRequest,
+        MANAGED_DELETE_PATH, MANAGED_FOLLOW_LIFECYCLE_PATH, MANAGED_FOLLOW_SETTINGS_PATH,
+        MANAGED_FOLLOW_STATUS_PATH, MANAGED_FOLLOWERS_PATH, MANAGED_VERIFY_PATH,
+        ManagedFollowLifecycleRequest, ManagedFollowSettingsUpsertRequest,
+        ManagedFollowStatusRequest, ManagedFollowerCreateRequest, ManagedFollowerDeleteRequest,
+        ManagedFollowerVerifyRequest,
     },
     support_martingale::{
         SUPPORT_MARTINGALE_DETAIL_PREFIX, SUPPORT_MARTINGALE_INSTANCES_PATH,
@@ -95,6 +96,7 @@ where
                 | MANAGED_FOLLOW_STATUS_PATH
                 | MANAGED_FOLLOW_LIFECYCLE_PATH
                 | MANAGED_VERIFY_PATH
+                | MANAGED_DELETE_PATH
                 | SUPPORT_MARTINGALE_INSTANCES_PATH
                 | SUPPORT_MARTINGALE_LIFECYCLE_PATH
         )
@@ -387,6 +389,15 @@ async fn account_request(
                 )
                 .await?,
         ),
+        (Method::Post, MANAGED_DELETE_PATH) => encode(
+            &accounts
+                .delete_managed_follower(
+                    &principal,
+                    decode::<ManagedFollowerDeleteRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
         (Method::Post, MANAGED_FOLLOW_SETTINGS_PATH) => encode(
             &accounts
                 .upsert_managed_follow_settings(
@@ -583,7 +594,7 @@ async fn account_request(
         }
         (Method::Post, CREDENTIALS_PATH) => encode(
             &accounts
-                .bind_credential(&principal, decode(&request.body)?, now)
+                .bind_follow_credential(&principal, decode(&request.body)?, now)
                 .await?,
         ),
         (Method::Post, VERIFY_PATH) => {

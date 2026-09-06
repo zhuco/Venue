@@ -7,12 +7,33 @@ use venue_control_protocol::{
     accounts::{
         AccountErrorCode as Code, AccountOverview, ApiVerificationState as State,
         BindCredentialRequest, CredentialSummary, DeleteCredentialRequest,
+        FollowCredentialCreateRequest,
     },
 };
 use venue_gateway_binance::{BinanceCredentials, BinanceProbeError, probe_credentials};
 use zeroize::Zeroizing;
 
 impl AccountService {
+    pub async fn bind_follow_credential(
+        &self,
+        principal: &Principal,
+        request: FollowCredentialCreateRequest,
+        now_ms: u64,
+    ) -> Result<CredentialSummary, AccountError> {
+        if !request.valid() {
+            return Err(error(Code::InvalidInput));
+        }
+        self.rate_limit(&format!("bind:{}", principal.user.user_id), 10, now_ms)
+            .await?;
+        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let summary = self
+            .insert_credential(&mut tx, &principal.user.user_id, request.credential, now_ms)
+            .await?;
+        save_follow_authorization(&mut tx, &summary.credential_id, request.authorization).await?;
+        tx.commit().await.map_err(database_error)?;
+        Ok(summary)
+    }
+
     pub async fn overview(
         &self,
         principal: &Principal,
@@ -80,6 +101,9 @@ impl AccountService {
             dual_position: false,
             account_mode: None,
             has_exposure: None,
+            equity: None,
+            available_margin: None,
+            balance_observed_ms: None,
         };
         let payload =
             Zeroizing::new(serde_json::to_vec(&request).map_err(|_| error(Code::InvalidInput))?);
@@ -117,10 +141,16 @@ impl AccountService {
         id: &str,
         now_ms: u64,
     ) -> Result<CredentialSummary, AccountError> {
-        self.verify_with(principal, id, now_ms, |credentials| async move {
-            probe_credentials(&credentials).await
-        })
-        .await
+        let summary = self
+            .verify_with(principal, id, now_ms, |credentials| async move {
+                probe_credentials(&credentials).await
+            })
+            .await?;
+        if summary.verification == State::Verified {
+            self.activate_saved_follow_authorization(principal, id, &summary, now_ms, None)
+                .await?;
+        }
+        Ok(summary)
     }
 
     pub(super) async fn verify_with<F, Fut>(
@@ -198,6 +228,9 @@ impl AccountService {
                     summary.dual_position = true;
                     summary.account_mode = Some("Portfolio Margin · UM".into());
                     summary.has_exposure = Some(probe.has_exposure);
+                    summary.equity = Some(probe.equity);
+                    summary.available_margin = Some(probe.available_margin);
+                    summary.balance_observed_ms = Some(probe.observed_ms);
                 }
             }
             Err(failure) => invalidate(
@@ -408,7 +441,7 @@ pub(super) fn decode_summary(value: serde_json::Value) -> Result<CredentialSumma
 fn encode_summary(value: &CredentialSummary) -> Result<serde_json::Value, AccountError> {
     serde_json::to_value(value).map_err(|_| error(Code::Unavailable))
 }
-fn invalidate(summary: &mut CredentialSummary, state: State) {
+pub(super) fn invalidate(summary: &mut CredentialSummary, state: State) {
     summary.verification = state;
     summary.verified_ms = None;
     summary.expires_ms = None;
@@ -416,4 +449,26 @@ fn invalidate(summary: &mut CredentialSummary, state: State) {
     summary.dual_position = false;
     summary.account_mode = None;
     summary.has_exposure = None;
+    summary.equity = None;
+    summary.available_margin = None;
+    summary.balance_observed_ms = None;
+}
+
+pub(super) async fn save_follow_authorization(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    credential_id: &str,
+    authorization: venue_control_protocol::follow_sizing::FollowAuthorization,
+) -> Result<(), AccountError> {
+    if !authorization.valid() {
+        return Err(error(Code::InvalidInput));
+    }
+    sqlx::query(
+        "UPDATE venue_api_credentials SET follow_authorization_json=$1 WHERE credential_id=$2",
+    )
+    .bind(serde_json::to_value(authorization).map_err(|_| error(Code::InvalidInput))?)
+    .bind(credential_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(database_error)?;
+    Ok(())
 }

@@ -14,6 +14,7 @@ fn request(id: &str, key: char) -> ManagedFollowerCreateRequest {
             api_key: SecretValue::new(key.to_string().repeat(32)),
             api_secret: SecretValue::new("S".repeat(32)),
         },
+        authorization: Default::default(),
     }
 }
 
@@ -79,6 +80,15 @@ async fn managed_save_is_atomic_scoped_idempotent_and_never_grants_trading() -> 
     let own = f.service.managed_followers(&owner).await?;
     assert!(own.can_manage);
     assert_eq!(own.accounts, vec![saved.clone()]);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT kol_user_id FROM venue_user_kol_bindings WHERE managed_id=$1"
+        )
+        .bind(&saved.managed_id)
+        .fetch_one(&f.pool)
+        .await?,
+        owner.user.user_id
+    );
     assert!(
         f.service
             .managed_followers(&stranger)
@@ -158,10 +168,15 @@ async fn managed_save_is_atomic_scoped_idempotent_and_never_grants_trading() -> 
                 account_identity_hash: [92; 32],
                 observed_ms: now,
                 has_exposure: false,
+                equity: Decimal::from(100),
+                available_margin: Decimal::from(80),
             })
         })
         .await?;
     assert_eq!(verified.verification, ApiVerificationState::Verified);
+    assert_eq!(verified.equity, Some(Decimal::from(100)));
+    assert_eq!(verified.available_margin, Some(Decimal::from(80)));
+    assert_eq!(verified.balance_observed_ms, Some(now));
     assert_eq!(
         f.service.managed_followers(&owner).await?.accounts[0].verification,
         ApiVerificationState::Verified
@@ -196,7 +211,7 @@ async fn managed_save_is_atomic_scoped_idempotent_and_never_grants_trading() -> 
     .await?;
     // Production upgraded from the frozen managed-follower table and retains this stricter
     // provenance column. The canonical fresh schema deliberately does not require it.
-    sqlx::raw_sql("ALTER TABLE venue_user_kol_bindings ADD COLUMN binding_source TEXT NOT NULL DEFAULT 'invite' CHECK(binding_source IN ('invite','kol_managed')); ALTER TABLE venue_user_kol_bindings ADD CONSTRAINT venue_user_kol_bindings_invite_source_check CHECK((binding_source='invite' AND invite_id IS NOT NULL) OR (binding_source='kol_managed' AND invite_id IS NULL));")
+    sqlx::raw_sql("ALTER TABLE venue_user_kol_bindings ADD COLUMN binding_source TEXT NOT NULL DEFAULT 'invite' CHECK(binding_source IN ('invite','kol_managed')); UPDATE venue_user_kol_bindings SET binding_source='kol_managed' WHERE managed_id IS NOT NULL; ALTER TABLE venue_user_kol_bindings ADD CONSTRAINT venue_user_kol_bindings_invite_source_check CHECK((binding_source='invite' AND invite_id IS NOT NULL) OR (binding_source='kol_managed' AND invite_id IS NULL));")
         .execute(&f.pool)
         .await?;
     sqlx::query(
@@ -213,7 +228,7 @@ async fn managed_save_is_atomic_scoped_idempotent_and_never_grants_trading() -> 
     );
     let incomplete: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM venue_user_kol_bindings)+(SELECT count(*) FROM venue_kol_follow_relations)+(SELECT count(*) FROM venue_follow_requests)")
         .fetch_one(&f.pool).await?;
-    assert_eq!(incomplete, 0);
+    assert_eq!(incomplete, 1);
     sqlx::query("UPDATE venue_api_credentials SET verification_json=$1 WHERE credential_id=$2")
         .bind(verification)
         .bind(&credential_id)
@@ -331,6 +346,179 @@ async fn managed_save_is_atomic_scoped_idempotent_and_never_grants_trading() -> 
     f.cleanup().await
 }
 
+fn proof(
+    identity: u8,
+    exposed: bool,
+    observed_ms: u64,
+) -> Result<venue_gateway_binance::BinanceCredentialProbe, venue_gateway_binance::BinanceProbeError>
+{
+    Ok(venue_gateway_binance::BinanceCredentialProbe {
+        account_identity_hash: [identity; 32],
+        observed_ms,
+        has_exposure: exposed,
+        equity: Decimal::from(100),
+        available_margin: Decimal::from(80),
+    })
+}
+
+#[tokio::test]
+async fn managed_verification_uses_saved_authorization_and_requests_activation() -> TestResult {
+    let Some(f) = Fixture::create().await? else {
+        return Ok(());
+    };
+    let timestamp = now();
+    let session = f
+        .service
+        .register(login("kol-auto-follow"), timestamp)
+        .await?;
+    let owner = f
+        .service
+        .authenticate(session.token.expose(), timestamp)
+        .await?;
+    sqlx::query("INSERT INTO venue_user_trading_accounts(trading_account_id,user_id,venue,exchange_identity_hash) VALUES('00000000-0000-4000-8000-000000000631',$1,'binance',$2)")
+        .bind(&owner.user.user_id).bind(vec![95_u8;32]).execute(&f.pool).await?;
+    sqlx::query("INSERT INTO venue_kol_profiles(kol_user_id,leader_trading_account_id,public_name,public_title,public_description,strategy_capital,profile_state,active_slot,created_ms,updated_ms) VALUES($1,'00000000-0000-4000-8000-000000000631','KOL','Title','','100','enabled',1,$2,$2)")
+        .bind(&owner.user.user_id).bind(ms(timestamp)?).execute(&f.pool).await?;
+    let saved = f
+        .service
+        .create_managed_follower(
+            &owner,
+            request("00000000-0000-4000-8000-000000000632", 'A'),
+            timestamp,
+        )
+        .await?;
+    let verified = f
+        .service
+        .verify_managed_follower_with(
+            &owner,
+            ManagedFollowerVerifyRequest {
+                managed_id: saved.managed_id.clone(),
+            },
+            timestamp,
+            |_| async { proof(96, false, timestamp) },
+        )
+        .await?;
+    assert_eq!(verified.equity, Some(Decimal::from(100)));
+    let relation = f
+        .service
+        .managed_follow_status(
+            &owner,
+            ManagedFollowStatusRequest {
+                managed_id: saved.managed_id,
+            },
+            timestamp,
+        )
+        .await?
+        .ok_or("missing auto relation")?;
+    assert!(relation.activation_requested);
+    assert_eq!(relation.settings.sizing, Default::default());
+    assert_eq!(relation.settings.multiplier, Decimal::ONE);
+    assert_eq!(relation.settings.allocated_capital, Decimal::from(100));
+    assert_eq!(relation.settings.max_total_notional, Decimal::from(500));
+    f.cleanup().await
+}
+
+#[tokio::test]
+async fn managed_delete_requires_owner_password_and_fresh_empty_exchange_state() -> TestResult {
+    let Some(f) = Fixture::create().await? else {
+        return Ok(());
+    };
+    let timestamp = now();
+    let session = f.service.register(login("kol-delete"), timestamp).await?;
+    let owner = f
+        .service
+        .authenticate(session.token.expose(), timestamp)
+        .await?;
+    sqlx::query("INSERT INTO venue_user_trading_accounts(trading_account_id,user_id,venue,exchange_identity_hash) VALUES('00000000-0000-4000-8000-000000000621',$1,'binance',$2)")
+        .bind(&owner.user.user_id).bind(vec![93_u8;32]).execute(&f.pool).await?;
+    sqlx::query("INSERT INTO venue_kol_profiles(kol_user_id,leader_trading_account_id,public_name,public_title,public_description,strategy_capital,profile_state,active_slot,created_ms,updated_ms) VALUES($1,'00000000-0000-4000-8000-000000000621','KOL','Title','','100','enabled',1,$2,$2)")
+        .bind(&owner.user.user_id).bind(ms(timestamp)?).execute(&f.pool).await?;
+    let saved = f
+        .service
+        .create_managed_follower(
+            &owner,
+            request("00000000-0000-4000-8000-000000000622", 'D'),
+            timestamp,
+        )
+        .await?;
+    f.service
+        .verify_managed_follower_with(
+            &owner,
+            ManagedFollowerVerifyRequest {
+                managed_id: saved.managed_id.clone(),
+            },
+            timestamp,
+            |_| async { proof(94, false, timestamp) },
+        )
+        .await?;
+    let removal = || ManagedFollowerDeleteRequest {
+        managed_id: saved.managed_id.clone(),
+        password: SecretValue::new("password-wrong".into()),
+    };
+    assert_eq!(
+        f.service
+            .delete_managed_follower_with(&owner, removal(), timestamp, |_| async {
+                proof(94, false, timestamp)
+            })
+            .await
+            .err()
+            .map(|error| error.code),
+        Some(Code::InvalidLogin)
+    );
+    let valid_removal = || ManagedFollowerDeleteRequest {
+        managed_id: saved.managed_id.clone(),
+        password: login("kol-delete").password,
+    };
+    assert_eq!(
+        f.service
+            .delete_managed_follower_with(&owner, valid_removal(), timestamp, |_| async {
+                proof(94, true, timestamp)
+            })
+            .await
+            .err()
+            .map(|error| error.code),
+        Some(Code::AccountInUse)
+    );
+    let paused = f
+        .service
+        .managed_follow_status(
+            &owner,
+            ManagedFollowStatusRequest {
+                managed_id: saved.managed_id.clone(),
+            },
+            timestamp,
+        )
+        .await?
+        .ok_or("missing paused relation")?;
+    assert_eq!(
+        paused.state,
+        venue_control_protocol::kol::FollowLifecycleState::Paused
+    );
+    assert!(!paused.activation_requested);
+    f.service
+        .delete_managed_follower_with(&owner, valid_removal(), timestamp, |_| async {
+            proof(94, false, timestamp)
+        })
+        .await?;
+    assert!(
+        f.service
+            .managed_followers(&owner)
+            .await?
+            .accounts
+            .is_empty()
+    );
+    let tombstone: (Option<i64>, i32, String) = sqlx::query_as(
+        "SELECT deleted_ms,octet_length(encrypted_credentials),masked_key FROM venue_api_credentials c JOIN venue_managed_credentials m USING(credential_id) WHERE m.managed_id=$1",
+    )
+    .bind(&saved.managed_id)
+    .fetch_one(&f.pool)
+    .await?;
+    assert_eq!(tombstone.0, Some(ms(timestamp)?));
+    assert_eq!(tombstone.1, 0);
+    assert_eq!(tombstone.2, "已删除");
+    f.cleanup().await
+}
+
 #[tokio::test]
 async fn frozen_managed_table_is_preserved_and_nonempty_legacy_fails_closed() -> TestResult {
     let Some(f) = Fixture::create().await? else {
@@ -366,7 +554,7 @@ async fn frozen_managed_table_is_preserved_and_nonempty_legacy_fails_closed() ->
         sqlx::query_scalar::<_, i32>("SELECT max(version) FROM venue_control_schema_migrations")
             .fetch_one(&f.pool)
             .await?,
-        36
+        38
     );
     assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='venue_kol_managed_followers' AND column_name='managed_follower_id'").fetch_one(&f.pool).await?,1);
     let session = f.service.register(login("freshuser"), now()).await?;

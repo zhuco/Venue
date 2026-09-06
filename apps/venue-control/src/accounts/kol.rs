@@ -790,6 +790,8 @@ mod tests {
                         account_identity_hash: [29; 32],
                         observed_ms: timestamp,
                         has_exposure: false,
+                        equity: Decimal::new(100, 0),
+                        available_margin: Decimal::new(80, 0),
                     })
                 },
             )

@@ -62,10 +62,10 @@ test("login cookie keeps the Control token out of JSON; writes use only the owne
     globalThis.fetch = async (url, init) => {
       assert.equal(String(url), "http://127.0.0.1:39180/v2/account/credentials");
       assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${session().token}`);
-      assert.deepEqual(JSON.parse(String(init?.body)), { label: "owned", api_key: "read-trade-key-fixture", api_secret: "secret-fixture" });
+      assert.deepEqual(JSON.parse(String(init?.body)), { credential: { label: "owned", api_key: "read-trade-key-fixture", api_secret: "secret-fixture" }, authorization: { sizing: { mode: "proportional" }, multiplier: "1" } });
       return Response.json({ credential_id: "owned", label: "owned", masked_key: "••••ture", api_key: "read-trade-key-fixture", api_secret: "secret-fixture", token: "other-secret" });
     };
-    const bound = await customerResponse(request("credentials", { cookie, csrf: loginBody.csrf, body: { label: "owned", key: "read-trade-key-fixture", secret: "secret-fixture" } }), "credentials");
+    const bound = await customerResponse(request("credentials", { cookie, csrf: loginBody.csrf, body: { label: "owned", key: "read-trade-key-fixture", secret: "secret-fixture", authorization: { sizing: { mode: "proportional" }, multiplier: "1" } } }), "credentials");
     assert.equal(bound.status, 200); const text = await bound.text(); assert.equal(text.includes("secret"), false); assert.equal(text.includes("read-trade-key-fixture"), false);
   } finally { globalThis.fetch = fetch; keys.forEach((key, index) => { if (old[index] === undefined) delete process.env[key]; else process.env[key] = old[index]; }); }
 });
@@ -85,10 +85,10 @@ test("managed save forwards an owned request once and strips all secret and iden
       calls++;
       assert.equal(String(url), "http://127.0.0.1:39180/v2/kol/managed-followers");
       assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${session().token}`);
-      assert.deepEqual(JSON.parse(String(init?.body)), { request_id: session().csrf, credential: { label: "托管", api_key: "K".repeat(32), api_secret: "S".repeat(32) } });
+      assert.deepEqual(JSON.parse(String(init?.body)), { request_id: session().csrf, credential: { label: "托管", api_key: "K".repeat(32), api_secret: "S".repeat(32) }, authorization: { sizing: { mode: "proportional" }, multiplier: "1" } });
       return Response.json({ managed_id: "owned", label: "托管", masked_key: "••••KKKK", verification: "unverified", verified_ms: null, api_key: "K".repeat(32), api_secret: "S".repeat(32), follower_user_id: "hidden", credential_id: "hidden", trading_account_id: "hidden" });
     };
-    const body = { request_id: session().csrf, label: "托管", key: "K".repeat(32), secret: "S".repeat(32) };
+    const body = { request_id: session().csrf, label: "托管", key: "K".repeat(32), secret: "S".repeat(32), authorization: { sizing: { mode: "proportional" }, multiplier: "1" } };
     const denied = await customerResponse(request("managed-followers", { cookie, body: { ...body, kol_user_id: "forged" } }), "managed-followers");
     assert.equal(denied.status,400); assert.equal(calls,0);
     assert.equal((await customerResponse(request("managed-verify", { cookie, csrf:"invalid", body:{managed_id:"owned"} }),"managed-verify")).status,403);

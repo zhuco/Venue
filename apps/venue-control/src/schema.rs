@@ -51,6 +51,7 @@ pub async fn install_control_schema(pool: &PgPool) -> Result<(), SchemaError> {
         MIGRATION_0035,
         MIGRATION_0036,
         MIGRATION_0037,
+        MIGRATION_0038,
     ];
     let mut tx = pool.begin().await.map_err(|_| SchemaError::Unavailable)?;
     // Serializes schema installation only; never participates in trading-account ownership.

@@ -972,6 +972,9 @@ mod tests {
                 dual_position: true,
                 account_mode: Some("fixture".to_owned()),
                 has_exposure: Some(false),
+                equity: None,
+                available_margin: None,
+                balance_observed_ms: None,
             }],
             selected_credential_id: Some("fixture-credential".to_owned()),
         });

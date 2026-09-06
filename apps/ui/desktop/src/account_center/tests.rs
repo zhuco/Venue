@@ -15,6 +15,9 @@ fn credential() -> CredentialSummary {
         dual_position: true,
         account_mode: Some("Portfolio Margin · UM".into()),
         has_exposure: Some(false),
+        equity: None,
+        available_margin: None,
+        balance_observed_ms: None,
     }
 }
 fn overview() -> AccountOverview {

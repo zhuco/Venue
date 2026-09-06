@@ -1,6 +1,6 @@
 //! Saved managed credentials are distinct from enabled follow relationships.
 use crate::{
-    accounts::{ApiVerificationState, BindCredentialRequest},
+    accounts::{ApiVerificationState, BindCredentialRequest, SecretValue},
     kol::{FollowLifecycleAction, FollowLifecycleState},
 };
 use rust_decimal::Decimal;
@@ -9,6 +9,7 @@ use venue_domain::Symbol;
 
 pub const MANAGED_FOLLOWERS_PATH: &str = "/v2/kol/managed-followers";
 pub const MANAGED_VERIFY_PATH: &str = "/v2/kol/managed-followers/verify";
+pub const MANAGED_DELETE_PATH: &str = "/v2/kol/managed-followers/delete";
 pub const MANAGED_FOLLOW_SETTINGS_PATH: &str = "/v2/kol/managed-followers/follow/settings";
 pub const MANAGED_FOLLOW_LIFECYCLE_PATH: &str = "/v2/kol/managed-followers/follow/lifecycle";
 pub const MANAGED_FOLLOW_STATUS_PATH: &str = "/v2/kol/managed-followers/follow/status";
@@ -24,12 +25,24 @@ pub struct ManagedFollowStatusRequest {
 pub struct ManagedFollowerCreateRequest {
     pub request_id: String,
     pub credential: BindCredentialRequest,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::follow_sizing::FollowAuthorization::is_default"
+    )]
+    pub authorization: crate::follow_sizing::FollowAuthorization,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedFollowerVerifyRequest {
     pub managed_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedFollowerDeleteRequest {
+    pub managed_id: String,
+    pub password: SecretValue,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +53,12 @@ pub struct ManagedFollowerSummary {
     pub masked_key: String,
     pub verification: ApiVerificationState,
     pub verified_ms: Option<u64>,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub equity: Option<Decimal>,
+    #[serde(default, with = "rust_decimal::serde::str_option")]
+    pub available_margin: Option<Decimal>,
+    #[serde(default)]
+    pub balance_observed_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

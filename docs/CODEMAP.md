@@ -13,7 +13,7 @@
 | Control HTTP 服务 | `apps/venue-control/src/bin/venue-control-server.rs` |
 | 共享 Executor：私有投影、挂单同步、Grid 与独立策略调度 | `apps/venue-control/src/bin/venue-executor-binance.rs` |
 | 带单授权、撤权及仅迁移命令 | `apps/venue-control/src/bin/venue-leader-bot-admin.rs`、`apps/venue-control/src/leader_bot_admin.rs` |
-| 版本化迁移及校验 | `apps/venue-control/src/schema.rs`、`apps/venue-control/migrations/`；alpha.28 安装至 0037 |
+| 版本化迁移及校验 | `apps/venue-control/src/schema.rs`、`apps/venue-control/migrations/`；当前安装至 0038 |
 | 本地受控构建与缓存准入 | `scripts/Invoke-VenueBuild.ps1`、`scripts/venue_build_guard.ps1` |
 | Ubuntu Control/Executor/管理员工具打包 | `scripts/Build-VenueUbuntu.ps1`；`-Component Control` |
 | CI、源码卫生及依赖边界 | `.github/workflows/workspace-gates.yml`、`scripts/verify_repository_hygiene.ps1`、`scripts/verify_workspace_policy.ps1` |
@@ -27,8 +27,8 @@
 | 用户、会话、密码、凭证密文及归属 | `apps/venue-control/src/accounts/`、`crates/venue-control-protocol/src/accounts.rs` |
 | KOL、邀请、跟随关系和终端投影协议 | `crates/venue-control-protocol/src/kol.rs`；Control 的 accounts、HTTP、repository 边界 |
 | 带单多配置目录与创建/编辑/启停 | `apps/venue-control/src/accounts/leader_bot.rs`、`crates/venue-control-protocol/src/leader_bot.rs`；迁移 0028/0029/0034 |
-| 托管 API 保存、掩码与验证 | `apps/venue-control/src/accounts/managed_followers.rs`；迁移 0030/0031 的 `venue_managed_credentials`，不改写冻结同名旧表 |
-| 托管账户逐账户参数及生命周期 | `apps/venue-control/src/accounts/follow_requests.rs`；迁移 0033；`/v2/kol/managed-followers/follow/{status,settings,lifecycle}` |
+| 跟单 API 授权与托管账户 | `apps/venue-control/src/accounts/{credentials,managed_followers}.rs`、`crates/venue-gateway-binance/src/credential_probe.rs`；迁移 0030/0031/0038，保存定比/定额后验证并自动申请激活，支持余额验证与安全删除 |
+| 托管账户逐账户参数及生命周期 | `apps/venue-control/src/accounts/follow_requests.rs`；迁移 0033；`/v2/kol/managed-followers/follow/{status,settings,lifecycle}`，暂停态仅作为执行安全闸门 |
 | 定比/定额数量 | `crates/venue-control-protocol/src/follow_sizing.rs`、`apps/venue-control/src/order_mirror/planner.rs`；开仓向上取整/最小合规额与回读共用 `apps/venue-control/src/executor_exchange/copy_risk.rs`，回归 `apps/venue-control/src/executor_exchange/copy_rounding_tests.rs`；迁移 0032 |
 | 源/子单映射、替代单、撤单及对账 | `apps/venue-control/src/order_mirror/{mod,planner,store,settlement}.rs` |
 | 启用签名基线、空仓与过期请求保护 | `apps/venue-control/src/executor_store/activation.rs` |
@@ -81,7 +81,7 @@
 | 图表与共享指标 | `apps/ui/desktop/src/{chart_view,chart_settings,settings_panel}.rs`、`crates/venue-indicators/src/chart/` |
 | 服务器配置、公共行情代理、启动和 UI 日志 | `apps/ui/desktop/src/{server_connection,market_client,diagnostics}.rs`、`scripts/Start-VenueFlow.ps1`、`scripts/configure_desktop_https.py` |
 | 用户首页和邀请注册 | `apps/ui/web/app/`、`components/customer-console.tsx`、`lib/customer-server.ts` |
-| 托管账户与定比/定额表单 | `apps/ui/web/components/{managed-followers-panel,managed-follow-settings,follow-sizing-fields}.tsx` |
+| 普通与托管跟单账户的定比/定额授权表单 | `apps/ui/web/components/{customer-console,managed-followers-panel,managed-follow-settings,follow-sizing-fields}.tsx` |
 | 独立运营控制台 `/ops` | `apps/ui/web/components/control-console.tsx`、`lib/projection-scope.ts` |
 | Web 命令、边界扫描与浏览器验证 | `apps/ui/web/package.json`、`apps/ui/web/scripts/verify-boundary.mjs`、`apps/ui/web/e2e/`；见 [WEB](WEB.md) |
 

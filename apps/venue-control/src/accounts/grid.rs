@@ -170,6 +170,9 @@ mod tests {
             dual_position: true,
             account_mode: Some("portfolio_margin_um".to_owned()),
             has_exposure: Some(false),
+            equity: None,
+            available_margin: None,
+            balance_observed_ms: None,
         }
     }
 

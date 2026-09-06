@@ -34,6 +34,8 @@ pub struct BinanceCredentialProbe {
     pub account_identity_hash: [u8; 32],
     pub observed_ms: u64,
     pub has_exposure: bool,
+    pub equity: Decimal,
+    pub available_margin: Decimal,
 }
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -66,11 +68,13 @@ where
     let identity = read_surface(Surface::Identity).await?;
     let identity_hash = identity_hash(&identity)?;
     let account = read_surface(Surface::Account).await?;
-    let account: Value =
+    let account_value: Value =
         serde_json::from_str(&account).map_err(|_| BinanceProbeError::Incomplete)?;
-    if account.get("accountStatus").and_then(Value::as_str) != Some("NORMAL") {
+    if account_value.get("accountStatus").and_then(Value::as_str) != Some("NORMAL") {
         return Err(BinanceProbeError::AccountMode);
     }
+    let balance = crate::portfolio::parse_account_balance(&account)
+        .map_err(|_| BinanceProbeError::Incomplete)?;
     let config = read_surface(Surface::Config).await?;
     let mode = read_surface(Surface::PositionMode).await?;
     let capabilities =
@@ -91,6 +95,8 @@ where
         account_identity_hash: identity_hash,
         observed_ms: now_ms()?,
         has_exposure,
+        equity: balance.wallet_balance,
+        available_margin: balance.available_balance,
     })
 }
 
@@ -249,7 +255,9 @@ mod tests {
                 r#"{"enableReading":true,"enablePortfolioMarginTrading":true,"enableWithdrawals":false}"#
             }
             Surface::Identity => r#"{"uid":123456}"#,
-            Surface::Account => r#"{"accountStatus":"NORMAL"}"#,
+            Surface::Account => {
+                r#"{"accountStatus":"NORMAL","accountEquity":"10.5","totalAvailableBalance":"8.25","accountInitialMargin":"2","accountMaintMargin":"0.5"}"#
+            }
             Surface::Config => r#"{"canTrade":true}"#,
             Surface::PositionMode => r#"{"dualSidePosition":true}"#,
             Surface::Positions | Surface::Orders | Surface::Algos => "[]",
@@ -278,6 +286,8 @@ mod tests {
             ]
         );
         assert!(!result.has_exposure);
+        assert_eq!(result.equity, Decimal::new(105, 1));
+        assert_eq!(result.available_margin, Decimal::new(825, 2));
         for failed in called {
             let result = probe(|surface| {
                 std::future::ready(if surface == failed {
