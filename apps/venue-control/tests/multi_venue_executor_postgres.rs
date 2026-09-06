@@ -556,9 +556,27 @@ async fn same_timestamp_commands_keep_insertion_order_and_cancel_recovers_origin
         .await?
         .ok_or("second claim missing")?;
     assert_eq!(second.command.command_id().as_str(), "a_second");
+    assert!(
+        store
+            .finish(&second, ExecutorCommandState::Rejected, 2_003, None, None)
+            .await
+            .is_err()
+    );
     store
-        .finish(&second, ExecutorCommandState::Rejected, 2_003, None, None)
+        .finish(
+            &second,
+            ExecutorCommandState::Rejected,
+            2_003,
+            None,
+            Some("strategy_market_limits"),
+        )
         .await?;
+    let rejection: Option<String> = sqlx::query_scalar(
+        "SELECT sanitized_error_code FROM venue_binance_commands WHERE command_id='a_second'",
+    )
+    .fetch_one(&fixture.pool)
+    .await?;
+    assert_eq!(rejection.as_deref(), Some("strategy_market_limits"));
     let cancel = cancel(
         "c_cancel",
         VenueId::Bybit,
