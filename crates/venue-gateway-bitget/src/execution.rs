@@ -11,7 +11,7 @@ use venue_gateway_api::GatewayBinding;
 
 use crate::{
     BitgetAccountBinding, BitgetConfig, BitgetCredentials, SignInput, SignedHeaders, endpoints,
-    instrument::BitgetInstrumentRules, private::parse_regular_order, sign,
+    instrument::BitgetInstrumentRules, private::parse_regular_order_detail, sign,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -763,8 +763,15 @@ pub fn parse_exact_order_readback(
             None | Some(Value::Null) => (None, None),
             Some(value) => (
                 Some(
-                    parse_regular_order(value, &request.binding.symbol)
-                        .map_err(|_| BitgetExecutionError::Payload)?,
+                    parse_regular_order_detail(
+                        value,
+                        &request.binding.symbol,
+                        matches!(
+                            request.expected_kind,
+                            BitgetMutationKind::PlaceMarket | BitgetMutationKind::ReduceOnce
+                        ),
+                    )
+                    .map_err(|_| BitgetExecutionError::Payload)?,
                 ),
                 native_time_in_force(value)?,
             ),
@@ -1520,6 +1527,56 @@ mod tests {
             settle_ack_readback(&ack_without_policy, &readback),
             Err(BitgetExecutionError::Readback)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn market_exact_readback_accepts_only_the_market_delegate_family()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = BitgetConfig::for_mode(GatewayMode::Live);
+        let request = BitgetExactReadbackRequest {
+            binding: binding(GatewayMode::Live)?,
+            attempt_id: 1,
+            generation: 1,
+            lookup: BitgetOrderLookup::ClientOrderId("venue_market".to_owned()),
+            not_before_ms: 100,
+            expected_kind: BitgetMutationKind::PlaceMarket,
+            expected_time_in_force: None,
+            query: "clientOid=venue_market".to_owned(),
+            expected_strategy: None,
+        };
+        let detail = |delegate: &str, order_type: &str| {
+            json!({
+                "code":"00000",
+                "data":{
+                    "orderId":"123", "clientOid":"venue_market",
+                    "category":"USDT-FUTURES", "symbol":"BTCUSDT",
+                    "orderType":order_type, "orderStatus":"filled", "side":"buy",
+                    "posSide":"long", "holdMode":"hedge_mode", "tradeSide":"open_long",
+                    "qty":"0.001", "cumExecQty":"0.001", "price":"",
+                    "avgPrice":"50000", "delegateType":delegate, "timeInForce":"ioc"
+                }
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let readback = parse_exact_order_readback(
+            &config,
+            request.clone(),
+            101,
+            102,
+            detail("market", "market"),
+        )?;
+        assert_eq!(
+            readback.order.as_ref().map(|order| order.filled_quantity),
+            Some(Decimal::new(1, 3))
+        );
+        for payload in [detail("normal", "market"), detail("market", "limit")] {
+            assert_eq!(
+                parse_exact_order_readback(&config, request.clone(), 101, 102, payload),
+                Err(BitgetExecutionError::Payload)
+            );
+        }
         Ok(())
     }
 
