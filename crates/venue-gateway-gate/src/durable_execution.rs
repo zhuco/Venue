@@ -7,19 +7,24 @@ impl GateAccountGateway {
         &mut self,
         command: &ExecutionCommand,
     ) -> Result<Option<venue_execution::DurableOrderObservation>, GateAccountGatewayError> {
-        let ExecutionCommand::PlaceLimit(order) = command else {
-            return Ok(None);
+        let (client_order_id, symbol) = match command {
+            ExecutionCommand::PlaceLimit(order) => {
+                (order.client_order_id.as_str(), order.owner.symbol.clone())
+            }
+            ExecutionCommand::PlaceMarket(order) => {
+                (order.client_order_id.as_str(), order.owner.symbol.clone())
+            }
+            ExecutionCommand::MarketReduce(order) => {
+                (order.client_order_id.as_str(), order.owner.symbol.clone())
+            }
+            _ => return Ok(None),
         };
         if !venue_execution::validate_durable_command(self.binding.gateway_binding(), command) {
             return Ok(None);
         }
-        let rules = self.registered_rules(&order.owner.symbol)?.clone();
-        let request = prepare_exact_readback_by_client_id(
-            &self.binding,
-            &rules,
-            order.client_order_id.as_str(),
-        )
-        .map_err(|_| GateAccountGatewayError::Readback)?;
+        let rules = self.registered_rules(&symbol)?.clone();
+        let request = prepare_exact_readback_by_client_id(&self.binding, &rules, client_order_id)
+            .map_err(|_| GateAccountGatewayError::Readback)?;
         let readback = self
             .runtime
             .block_on(self.transport.execute_exact_readback(
@@ -34,11 +39,11 @@ impl GateAccountGateway {
             return Ok(None);
         }
         Ok(Some(venue_execution::DurableOrderObservation {
-            client_order_id: order.client_order_id.as_str().to_owned(),
+            client_order_id: client_order_id.to_owned(),
             native_order_id: readback.order.order_id,
             state: readback.order.state,
             filled_quantity: readback.order.filled_quantity,
-            average_price: venue_domain::domain::FieldState::Missing,
+            average_price: readback.order.average_price,
             cumulative_fee: venue_domain::domain::FieldState::Missing,
         }))
     }

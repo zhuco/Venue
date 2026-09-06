@@ -163,7 +163,7 @@ impl BinanceAccountGateway {
         )
         .map_err(|_| BinanceAccountGatewayError::Binding)?;
         <Self as AccountPhysicalGateway>::signed_account_snapshot(self, &request)
-            .map_err(|_| BinanceAccountGatewayError::Readback)
+            .map_err(BinanceAccountGatewayError::SignedSnapshot)
     }
 }
 

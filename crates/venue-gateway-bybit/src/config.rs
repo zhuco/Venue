@@ -62,4 +62,5 @@ pub mod endpoints {
     pub const OPEN_ORDERS: &str = "/v5/order/realtime";
     pub const ORDER_HISTORY: &str = "/v5/order/history";
     pub const EXECUTIONS: &str = "/v5/execution/list";
+    pub const TRANSACTION_LOG: &str = "/v5/account/transaction-log";
 }

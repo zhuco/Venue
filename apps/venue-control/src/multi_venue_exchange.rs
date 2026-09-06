@@ -37,6 +37,7 @@ pub enum StrategyCredentials {
     },
     Hyperliquid {
         account_address: String,
+        vault_address: Option<String>,
         api_wallet_address: String,
         private_key: SecretValue,
     },
@@ -100,6 +101,39 @@ impl StrategyGateway {
         command: &ExecutionCommand,
     ) -> Result<Option<venue_execution::DurableOrderObservation>, StrategyExchangeError> {
         gateway_call!(self, durable_order_observation, command)
+    }
+    pub(crate) fn order_observation_detailed(
+        &mut self,
+        command: &ExecutionCommand,
+    ) -> Result<Option<venue_execution::DurableOrderObservation>, String> {
+        match self {
+            Self::Bitget(gateway) => gateway
+                .durable_order_observation(command)
+                .map_err(|error| error.to_string()),
+            Self::Bybit(gateway) => gateway
+                .durable_order_observation(command)
+                .map_err(|error| error.to_string()),
+            Self::Gate(gateway) => gateway
+                .durable_order_observation(command)
+                .map_err(|error| error.to_string()),
+            Self::Okx(gateway) => gateway
+                .durable_order_observation(command)
+                .map_err(|error| error.to_string()),
+            Self::Hyperliquid(gateway) => gateway
+                .durable_order_observation(command)
+                .map_err(|error| error.to_string()),
+        }
+    }
+    pub(crate) fn bybit_funding_detailed(
+        &mut self,
+        query: &venue_gateway_bybit::BybitFundingQuery,
+    ) -> Result<venue_gateway_bybit::BybitFundingReadback, String> {
+        match self {
+            Self::Bybit(gateway) => gateway
+                .settled_funding(query)
+                .map_err(|error| error.to_string()),
+            _ => Err("funding readback is available only for Bybit".to_owned()),
+        }
     }
     /// Called only inside a bounded blocking worker: the existing adapters own their synchronous
     /// transport runtime. No runtime, credentials or nonce file is created per trading strategy.
@@ -204,12 +238,13 @@ impl StrategyGateway {
             }
             StrategyCredentials::Hyperliquid {
                 account_address,
+                vault_address,
                 api_wallet_address,
                 private_key,
             } => {
                 let credentials = venue_gateway_hyperliquid::HyperliquidCredentials::from_secrets(
                     account_address,
-                    None,
+                    vault_address,
                     api_wallet_address,
                     secret(private_key),
                 )
@@ -279,5 +314,32 @@ impl StrategyGateway {
             Self::Okx(g) => g.reconcile_committed_with_context(command, context),
             Self::Hyperliquid(g) => g.reconcile_committed_with_context(command, context),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StrategyCredentials;
+
+    #[test]
+    fn hyperliquid_strategy_credentials_preserve_optional_vault_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (encoded, expected) in [
+            (
+                r#"{"venue":"hyperliquid","account_address":"0x0000000000000000000000000000000000000001","vault_address":"0x0000000000000000000000000000000000000002","api_wallet_address":"0x0000000000000000000000000000000000000003","private_key":"secret"}"#,
+                Some("0x0000000000000000000000000000000000000002"),
+            ),
+            (
+                r#"{"venue":"hyperliquid","account_address":"0x0000000000000000000000000000000000000001","api_wallet_address":"0x0000000000000000000000000000000000000003","private_key":"secret"}"#,
+                None,
+            ),
+        ] {
+            let parsed: StrategyCredentials = serde_json::from_str(encoded)?;
+            let StrategyCredentials::Hyperliquid { vault_address, .. } = parsed else {
+                return Err("wrong credential venue".into());
+            };
+            assert_eq!(vault_address.as_deref(), expected);
+        }
+        Ok(())
     }
 }

@@ -28,19 +28,22 @@ impl HyperliquidAccountGateway {
         &mut self,
         command: &ExecutionCommand,
     ) -> Result<Option<DurableOrderObservation>, HyperliquidAccountGatewayError> {
-        let ExecutionCommand::PlaceLimit(order) = command else {
-            return Ok(None);
+        let expected_client_order_id = match command {
+            ExecutionCommand::PlaceLimit(order) => order.client_order_id.as_str(),
+            ExecutionCommand::PlaceMarket(order) => order.client_order_id.as_str(),
+            ExecutionCommand::MarketReduce(order) => order.client_order_id.as_str(),
+            _ => return Ok(None),
         };
         if !validate_durable_command(self.binding.gateway().gateway_binding(), command) {
             return Err(HyperliquidAccountGatewayError::Binding);
         }
         let lookup =
-            HyperliquidOrderLookup::client_order_id(command_cloid(order.client_order_id.as_str()))
+            HyperliquidOrderLookup::client_order_id(command_cloid(expected_client_order_id))
                 .map_err(|_| HyperliquidAccountGatewayError::Readback)?;
         let status = self.order_status(&lookup)?;
         let HyperliquidOrderStatus::Known {
             order_id,
-            client_order_id,
+            client_order_id: observed_client_order_id,
             side,
             limit_price,
             original_quantity,
@@ -49,30 +52,51 @@ impl HyperliquidAccountGateway {
             native_order_type,
             time_in_force,
             state,
+            trigger_price,
+            is_position_tpsl,
             ..
         } = status
         else {
             return Ok(None);
         };
-        let expected_policy = match order.time_in_force {
-            LimitTimeInForce::PostOnly => "Alo",
-            LimitTimeInForce::Gtc => "Gtc",
+        let common_matches = matches!(observed_client_order_id, FieldState::Known(ref value) if value.eq_ignore_ascii_case(&command_cloid(expected_client_order_id)))
+            && native_order_type == "Limit"
+            && trigger_price.is_none()
+            && !is_position_tpsl;
+        let command_matches = match command {
+            ExecutionCommand::PlaceLimit(order) => {
+                let expected_policy = match order.time_in_force {
+                    LimitTimeInForce::PostOnly => "Alo",
+                    LimitTimeInForce::Gtc => "Gtc",
+                };
+                side == order.side
+                    && limit_price == order.limit_price
+                    && original_quantity == order.quantity
+                    && reduce_only == order.reduce_only
+                    && time_in_force.as_deref() == Some(expected_policy)
+            }
+            ExecutionCommand::PlaceMarket(order) => {
+                side == order.side
+                    && original_quantity == order.quantity
+                    && !reduce_only
+                    && time_in_force.as_deref() == Some("Ioc")
+            }
+            ExecutionCommand::MarketReduce(order) => {
+                side == order.side
+                    && original_quantity == order.quantity
+                    && reduce_only
+                    && time_in_force.as_deref() == Some("Ioc")
+            }
+            _ => false,
         };
-        if !matches!(client_order_id, FieldState::Known(ref value) if value.eq_ignore_ascii_case(&command_cloid(order.client_order_id.as_str())))
-            || side != order.side
-            || limit_price != order.limit_price
-            || original_quantity != order.quantity
-            || reduce_only != order.reduce_only
-            || native_order_type != "Limit"
-            || time_in_force.as_deref() != Some(expected_policy)
-        {
+        if !common_matches || !command_matches {
             return Ok(None);
         }
         let filled_quantity = original_quantity
             .checked_sub(remaining_quantity)
             .ok_or(HyperliquidAccountGatewayError::Readback)?;
         Ok(Some(DurableOrderObservation {
-            client_order_id: order.client_order_id.as_str().to_owned(),
+            client_order_id: expected_client_order_id.to_owned(),
             native_order_id: order_id.to_string(),
             state,
             filled_quantity,

@@ -48,17 +48,19 @@ venue-strategy-admin bind-released USER_ID EXISTING_ACCOUNT_UUID BTC/USDT LABEL
 venue-strategy-admin limits USER_ID CREDENTIAL_ID
 venue-strategy-admin snapshot USER_ID CREDENTIAL_ID BTC/USDT
 venue-strategy-admin submit USER_ID CREDENTIAL_ID
+venue-strategy-admin observe USER_ID CREDENTIAL_ID
+venue-strategy-admin funding USER_ID CREDENTIAL_ID BTC/USDT
 venue-strategy-admin status USER_ID COMMAND_ID
 venue-strategy-admin grid-create USER_ID CREDENTIAL_ID
 venue-strategy-admin grid-status USER_ID INSTANCE_ID
 venue-strategy-admin grid-lifecycle USER_ID INSTANCE_ID start|pause|resume|stop|reset
 ```
 
-`probe` 使用同一 stdin 凭证结构和正式 adapter，只返回脱敏身份摘要、权限核验后的持仓/挂单/余额及成交条数，不连接数据库、不入账也不授予发送权。`bind` 的 stdin 是带 `venue` 标签的凭证结构：Bitget/OKX 为 `api_key/api_secret/passphrase`；Bybit/Gate 为 `api_key/api_secret`；Hyperliquid 为 `account_address/api_wallet_address/private_key`。绑定只执行签名读取与权限、模式、身份核验，保存密文；默认要求账户无持仓、无普通或条件挂单。
+`probe` 使用同一 stdin 凭证结构和正式 adapter，只返回脱敏身份摘要、权限核验后的持仓/挂单/余额及成交条数，不连接数据库、不入账也不授予发送权。`bind` 的 stdin 是带 `venue` 标签的凭证结构：Bitget/OKX 为 `api_key/api_secret/passphrase`；Bybit/Gate 为 `api_key/api_secret`；Hyperliquid 为 `account_address`、可选 `vault_address`、`api_wallet_address/private_key`，存在 vault 时所有读取、签名和唯一身份均绑定该 vault。绑定只执行签名读取与权限、模式、身份核验，保存密文；默认要求账户无持仓、无普通或条件挂单。
 
 `bind-released` 仅用于运营清单中的既有账户 UUID 已通过旧运行时生命周期释放后的迁入，可保留经签名确认的持仓，仍要求无开放订单、无旧 scope、无未决命令。首次迁入在真实身份、权限和上述排他条件同时通过后才原子建立账户库存行；真实身份唯一约束仍禁止换 UUID 重复接管。它不停止旧 writer、不释放旧 scope、不导入或修改旧 WAL。
 
-`limits` 的 stdin 是 `StrategyRiskLimits` JSON，必填字符串字段 `max_order_notional` 与 `max_symbol_notional`，均为正数，后者不得低于前者。上限使用交易对报价资产单位。`submit` 的 stdin 是 `domain::ExecutionCommand` JSON：相同 ID 与内容幂等，改变内容须使用新 ID。`snapshot` 带观察时间；过期或读取失败不等于空仓。
+`limits` 的 stdin 是 `StrategyRiskLimits` JSON，必填字符串字段 `max_order_notional` 与 `max_symbol_notional`，均为正数，后者不得低于前者。上限使用交易对报价资产单位。`submit` 的 stdin 是 `domain::ExecutionCommand` JSON：相同 ID 与内容幂等，改变内容须使用新 ID。`snapshot` 带观察时间；过期或读取失败不等于空仓，并保留交易所已提供的成交费用、maker/taker 角色和成交时间。`observe` 读取 stdin 中既有的限价、市价增仓或市价减仓命令，只按其原 `clientOrderId` 查询订单与成交，不认领、不发送也不重试；动态价格保护的 IOC 不冒充规范限价，订单与成交均精确为空才返回未发现，身份冲突或孤立成交失败关闭。`funding` 的 stdin 是不超过七日的 Bybit `start_ms/end_ms/cursor` 窗口，只接受该账户、交易对及报价资产的 `SETTLEMENT` 游标闭包，保留交易所签名正负号且不产生风险命令。
 
 `grid-create` 的 stdin 是 `StrategyGridConfig`：`planner` 采用既有 `GridPlannerConfig`，`net_direction` 对四所 Hedge 账户为 `null`，对 Hyperliquid 为明确方向。新建 `revision=1`，金额资产必须与 symbol 的 quote 一致；须先设置账户金额上限。实例创建后为 `paused`，创建本身不发送命令。当前 Hedge 每侧最多 4 层、Net 最多 8 层，完整首轮最多 16 单；独立策略队列上限 32 条，以容纳一次完整撤挂；配置超限明确拒绝。配置结构示例见 [离线 fixture](../apps/venue-control/tests/fixtures/multi_venue_grid.json)，其中金额仅用于测试，不代表实际账户的交易参数。
 
