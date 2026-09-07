@@ -221,6 +221,39 @@ fn grid_restart_keeps_surface_and_pause_only_cancels_owned_orders()
 }
 
 #[test]
+fn grid_reconnect_preserves_rules_identity_but_rule_changes_reset()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut record, snapshot, mut market) = fixture()?;
+    let initial = planner::plan(&record, &[], &snapshot, &market, &[], 1001)?;
+    let ids: std::collections::BTreeSet<_> = initial
+        .commands
+        .iter()
+        .filter_map(|(command, _)| command.native_client_id())
+        .map(|id| id.as_str())
+        .collect();
+    assert_eq!(ids.len(), initial.commands.len());
+    assert!(ids.iter().all(|id| id.len() <= 28));
+    record.rolling_anchor = initial.anchor;
+    record.plan_sequence = 1;
+    let (rows, observed, snapshot) = resting(&record, &snapshot, &market)?;
+    market.metadata.instrument.generation = 1_788_769_968_345;
+    market.reference_price = Price::new(Decimal::from(101))?;
+    let same = planner::plan(&record, &rows, &snapshot, &market, &observed, 1001)?;
+    assert!(same.commands.is_empty());
+    assert_eq!(same.anchor, record.rolling_anchor);
+    market.maximum_quantity = Some(Decimal::from(99));
+    let changed = planner::plan(&record, &rows, &snapshot, &market, &observed, 1001)?;
+    assert_eq!(changed.lifecycle.as_deref(), Some("resetting"));
+    assert!(
+        changed
+            .commands
+            .iter()
+            .all(|(c, _)| matches!(c, ExecutionCommand::Cancel(_)))
+    );
+    Ok(())
+}
+
+#[test]
 fn grid_complete_fill_rolls_and_unknown_order_never_becomes_a_fill()
 -> Result<(), Box<dyn std::error::Error>> {
     let (mut record, base, market) = fixture()?;

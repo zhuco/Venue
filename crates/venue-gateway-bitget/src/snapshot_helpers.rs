@@ -2,6 +2,40 @@
 
 use super::*;
 
+#[cfg(test)]
+mod hedge_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn signed_hedge_closes_use_direction_even_when_reduce_only_is_no()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (position, side, close) in [
+            ("long", "sell", true),
+            ("short", "buy", true),
+            ("long", "buy", false),
+            ("short", "sell", false),
+        ] {
+            let mut row = json!({
+                "category":"USDT-FUTURES", "symbol":"DOGEUSDT", "delegateType":"normal",
+                "holdMode":"hedge_mode", "posSide":position, "side":side,
+                "reduceOnly":"NO", "qty":"57", "cumExecQty":"0", "price":"0.09",
+                "clientOid":"existing-grid-client", "orderId":"123", "orderStatus":"live",
+                "timeInForce":"post_only"
+            });
+            let facts = snapshot_order_facts(&[row.clone()])?;
+            assert_eq!(facts[0].reduce_only, close);
+            assert_eq!(
+                super::super::entry_order_notionals(&[row.clone()])?.is_empty(),
+                close
+            );
+            row["tradeSide"] = json!(if close { "open" } else { "close" });
+            assert!(snapshot_order_facts(&[row]).is_err());
+        }
+        Ok(())
+    }
+}
+
 /// UTA v3 trade rows use `category` and omit the legacy position-side `marginCoin` field.
 pub(super) fn require_uta_usdt_futures_row(
     item: &serde_json::Map<String, Value>,

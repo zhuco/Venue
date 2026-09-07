@@ -207,10 +207,21 @@ pub(crate) fn plan(
         )?)
         .map_err(|_| Error::Invalid)?,
     );
+    let mut instrument = market.metadata.clone();
+    // Adapter sessions rotate generations without changing rules. The persisted anchor follows
+    // rule content, while a changed precision, bound, or trading status still requires a reset.
+    instrument.instrument.generation = 1;
+    let rule_bytes =
+        serde_json::to_vec(&(&instrument, market.maximum_quantity, market.maximum_price))
+            .map_err(|_| Error::Invalid)?;
+    let digest = Sha256::digest(rule_bytes);
+    let mut generation = [0_u8; 8];
+    generation.copy_from_slice(&digest[..8]);
+    instrument.instrument.generation = u64::from_be_bytes(generation).max(1);
     let input = GridPlannerInput {
         net_direction: record.config.net_direction,
         config: record.config.planner.clone(),
-        instrument: market.metadata.clone(),
+        instrument,
         instrument_limits: GridInstrumentLimits {
             minimum_quantity: market.metadata.quantity.minimum,
             maximum_quantity: max_qty,
@@ -344,7 +355,8 @@ fn identity(record: &StrategyGridRecord, purpose: &str, index: usize) -> Result<
         record.instance_id, record.revision, record.plan_sequence
     );
     let digest = Sha256::digest(raw.as_bytes());
-    let hex: String = digest[..14].iter().map(|b| format!("{b:02x}")).collect();
+    // Keep new client IDs within the shared 28-byte admission boundary. Persisted IDs stay intact.
+    let hex: String = digest[..13].iter().map(|b| format!("{b:02x}")).collect();
     CommandId::new(format!("sg{hex}")).map_err(|_| Error::Invalid)
 }
 fn owner(record: &StrategyGridRecord, purpose: OrderPurpose) -> OrderOwner {

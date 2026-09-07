@@ -756,7 +756,7 @@ fn validate_symbol_category(
     Ok(())
 }
 
-fn parse_reduce_only(
+pub(crate) fn parse_reduce_only(
     object: &Map<String, Value>,
     position_side: PositionSide,
     side: OrderSide,

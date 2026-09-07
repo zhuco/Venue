@@ -70,6 +70,8 @@ venue-strategy-admin grid-lifecycle USER_ID INSTANCE_ID start|pause|resume|stop|
 
 ## 协议依据与验收
 
+新网格命令 ID 控制在共同支持的 28 字节内；旧账本中的 ID 不改写。滚动锚点按规则内容识别精度和上下界变化，不把每次重连产生的会话代次当作规则变更。Bitget Hedge 普通订单沿用 adapter 的持仓腿位与买卖方向语义核验平仓，不能使用只适用于单向模式的原生 `reduceOnly` 值覆盖它。
+
 适配器必须保持与官方协议一致：[Bybit 下单](https://bybit-exchange.github.io/docs/v5/order/create-order)、[Bitget UTA](https://www.bitget.com/api-doc/uta/intro)、[Gate Futures](https://www.gate.com/docs/developers/apiv4/en/#futures)、[OKX Algo](https://www.okx.com/docs-v5/en/#order-book-trading-algo-trading)、[Hyperliquid Exchange](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint)。Bitget 准入校验 UID、可写、`uta_trade` 且无提现权限；Gate 使用签名 `/account/main_keys` 校验 UID、有效状态、期货写权限和无提现权限，不能读取该权限接口的 Key 不准入。
 
 本地验证使用统一构建入口、五所协议 fixture、命令幂等与恢复契约、隔离 PostgreSQL 迁移/顺序/生命周期测试；不得把生产数据库当作 QA。真实验收另逐所记录普通挂单、精确撤单、市价增减仓、SL/TP 创建与触发、PostOnly 参数及 maker 成交角色，并核对手续费与持仓差额。离线通过不代表这些真实交易验收已执行。

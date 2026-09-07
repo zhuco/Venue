@@ -1269,6 +1269,20 @@ fn entry_order_notionals(rows: &[Value]) -> Result<Vec<Decimal>, AccountHostVali
 fn bitget_reduce_only(
     item: &serde_json::Map<String, Value>,
 ) -> Result<bool, AccountHostValidationError> {
+    if item.get("holdMode").and_then(Value::as_str) == Some("hedge_mode") {
+        let position = match item.get("posSide").and_then(Value::as_str) {
+            Some("long") => PositionSide::Long,
+            Some("short") => PositionSide::Short,
+            _ => return Err(AccountHostValidationError::RiskEvidence),
+        };
+        let side = match item.get("side").and_then(Value::as_str) {
+            Some("buy") => OrderSide::Buy,
+            Some("sell") => OrderSide::Sell,
+            _ => return Err(AccountHostValidationError::RiskEvidence),
+        };
+        return crate::private::parse_reduce_only(item, position, side)
+            .map_err(|_| AccountHostValidationError::RiskEvidence);
+    }
     match item.get("reduceOnly") {
         Some(Value::Bool(value)) => Ok(*value),
         Some(Value::String(value)) if value == "YES" => Ok(true),
