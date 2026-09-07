@@ -1,0 +1,55 @@
+# Venue Control Server Dockerfile
+# 多阶段构建：编译阶段 + 运行阶段
+
+# ============================================================================
+# 阶段 1：编译
+# ============================================================================
+FROM rust:1.98.0-bookworm AS builder
+
+WORKDIR /build
+
+# 安装编译依赖
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 复制 workspace 配置
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY apps ./apps
+
+# 编译后端服务（release 模式）
+RUN cargo build --release -p venue-control --bin venue-control-server
+
+# ============================================================================
+# 阶段 2：运行
+# ============================================================================
+FROM debian:bookworm-slim
+
+WORKDIR /app
+
+# 安装运行时依赖
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libpq5 \
+    curl \
+    socat \
+    && rm -rf /var/lib/apt/lists/*
+
+# 复制编译产物
+COPY --from=builder /build/target/release/venue-control-server /app/venue-control-server
+
+# 复制启动脚本
+COPY scripts/docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+
+# 暴露端口
+EXPOSE 39180
+
+# 健康检查
+HEALTHCHECK --interval=10s --timeout=5s --retries=3 --start-period=10s \
+    CMD curl -f http://localhost:39180/v2/ui/snapshot || exit 1
+
+# 启动命令
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
