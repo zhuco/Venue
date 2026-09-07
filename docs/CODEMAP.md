@@ -1,6 +1,8 @@
 # VENUE 功能代码地图
 
-五所公共行情的自动校时：`crates/venue-gateway-api/src/display/clock.rs` 维护仅供显示的单调时钟；Bybit `display::synchronize_display_clock` 读取精确只读 `/quotes/bybit/v5/market/time`，桌面 `market_client/native/multi.rs` 自动刷新。它不参与签名、账户事实或系统校时。
+行情状态中文提示：`apps/ui/desktop/src/i18n/market.rs` 区分更新延迟、自动校时、限流、访问受限、合约不可用与校验失败；`market.rs` 在新的有效行情到达后恢复延迟状态，连接状态消息不刷新行情接收时间。
+
+六所公共行情的自动校时：`crates/venue-gateway-api/src/display/clock.rs` 维护仅供显示的单调时钟；Bybit `display::synchronize_display_clock` 读取精确只读 `/quotes/bybit/v5/market/time`，桌面 `market_client/native/multi.rs` 自动刷新。它不参与签名、账户事实或系统校时。
 
 桌面多交易所公共行情：`apps/ui/desktop/src/market_client/native/multi.rs` 负责显示订阅及代次；`crates/venue-gateway-{bybit,bitget,gate,okx,hyperliquid}/src/display.rs` 解析各所公开协议；`crates/venue-gateway-api/src/display.rs` 提供有界显示数据与已有领域类型转换；`scripts/configure_desktop_https.py` 管理固定只读代理。语言入口为顶部 `ui.rs` → `settings_panel.rs` 通用页。
 

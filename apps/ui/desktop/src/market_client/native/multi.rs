@@ -1,7 +1,7 @@
 use super::*;
 use crate::model::MarketServer;
 use venue_gateway_api::display::{Book, Instrument, Quote};
-async fn ensure_clock(http: &reqwest::Client) -> Result<(), String> {
+pub(super) async fn ensure_clock(http: &reqwest::Client) -> Result<(), String> {
     if venue_gateway_api::display::clock::needs_refresh() {
         if let Err(error) = venue_gateway_bybit::display::synchronize_display_clock(http).await {
             // A brief time-source outage can use the bounded monotonic holdover.

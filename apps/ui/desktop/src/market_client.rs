@@ -5,7 +5,7 @@ mod native {
     use std::{
         collections::BTreeSet,
         thread,
-        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant},
     };
 
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -373,7 +373,7 @@ mod native {
                 Vec::new()
             }
         };
-        if !catalog.is_empty() {
+        if !catalog.is_empty() && multi::ensure_clock(&http).await.is_ok() {
             match fetch_quote_snapshot(&http, &catalog).await {
                 Ok(quotes) => {
                     let _ = event_tx.try_send(LocalMarketClientEvent::Quotes(quotes));
@@ -432,6 +432,22 @@ mod native {
         let mut attempt = 0_u32;
         let mut emitter = EventEmitter::new(event_tx.clone());
         loop {
+            if let Err(error) = multi::ensure_clock(http).await {
+                if let Some(command) = retry_after_error(
+                    generation,
+                    &selections,
+                    attempt,
+                    error,
+                    commands,
+                    &mut emitter,
+                )
+                .await
+                {
+                    return Some(command);
+                }
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
             if let Err(error) =
                 emitter.status_all(generation, &selections, MarketStatus::LoadingHistory, None)
             {
@@ -556,12 +572,18 @@ mod native {
             }
             attempt = 0;
             let mut heartbeat = tokio::time::interval(PING_INTERVAL);
+            let mut clock_refresh = tokio::time::interval(Duration::from_secs(60));
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut last_public_pong = Instant::now();
             let mut last_market_pong = Instant::now();
             let session_error = loop {
                 tokio::select! {
                     command = commands.recv() => return command,
+                    _ = clock_refresh.tick() => {
+                        if let Err(error) = multi::ensure_clock(http).await {
+                            break error;
+                        }
+                    }
                     _ = heartbeat.tick() => {
                         if last_public_pong.elapsed() > PONG_DEADLINE {
                             break "public websocket pong deadline exceeded".to_owned();
@@ -1297,15 +1319,79 @@ mod native {
     }
 
     fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(1, |duration| {
-                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-            })
+        venue_gateway_api::display::received_ms().unwrap_or(0)
     }
 
     #[cfg(test)]
     mod tests {
+        #[test]
+        #[ignore = "reads deployed public Binance streams for 75 seconds; no credentials or orders"]
+        fn live_binance_display_health() -> Result<(), String> {
+            use super::*;
+            let selection = MarketSelection::binance_usd_m("DOGE/USDC", ChartInterval::OneMinute)
+                .map_err(|e| e.to_string())?;
+            let mut reducer = crate::market::LocalMarketReducer::new(selection.clone())
+                .map_err(|e| e.to_string())?;
+            let client = LocalMarketClient::start_for(crate::model::MarketServer::Binance)
+                .map_err(|e| e.to_string())?;
+            client
+                .replace_subscriptions(reducer.view().generation, vec![selection])
+                .map_err(|e| e.to_string())?;
+            let started = Instant::now();
+            let (mut quotes, mut books, mut trades, mut bars) = (0, 0, 0, 0);
+            let (mut forced_stale, mut recovered) = (false, false);
+            while started.elapsed() < Duration::from_secs(75) {
+                for event in client.drain(10_000) {
+                    match event {
+                        LocalMarketClientEvent::Quotes(rows)
+                            if rows.iter().any(|q| {
+                                q.symbol == "DOGE/USDC" && q.last > rust_decimal::Decimal::ZERO
+                            }) =>
+                        {
+                            quotes += 1
+                        }
+                        LocalMarketClientEvent::Market(event) => {
+                            match &event.payload {
+                                crate::market::MarketPayload::BookSnapshot { .. }
+                                | crate::market::MarketPayload::Bbo { .. } => books += 1,
+                                crate::market::MarketPayload::Trade(_) => trades += 1,
+                                crate::market::MarketPayload::WsBar { .. } => bars += 1,
+                                _ => {}
+                            }
+                            reducer.apply(*event).map_err(|e| e.to_string())?;
+                            if forced_stale && reducer.view().status == MarketStatus::Live {
+                                recovered = true;
+                            }
+                            if !forced_stale
+                                && books > 0
+                                && reducer.view().status == MarketStatus::Live
+                            {
+                                reducer.refresh_staleness(now_ms().saturating_add(5_001), 5_000);
+                                forced_stale = reducer.view().status == MarketStatus::Stale;
+                            }
+                        }
+                        LocalMarketClientEvent::WorkerFailed(e) => return Err(e),
+                        _ => {}
+                    }
+                }
+                thread::sleep(Duration::from_millis(30));
+            }
+            reducer.refresh_staleness(now_ms(), 5_000);
+            println!(
+                "Binance DOGE/USDC: quotes={quotes}, books={books}, trades={trades}, candles={bars}, recovered={recovered}, status={:?}",
+                reducer.view().status
+            );
+            if quotes < 2
+                || books == 0
+                || trades == 0
+                || bars == 0
+                || !recovered
+                || reducer.view().status != MarketStatus::Live
+            {
+                return Err("public Binance display did not recover or stay current".into());
+            }
+            Ok(())
+        }
         use rust_decimal::Decimal;
         use venue_domain::domain::{Price, Symbol};
 

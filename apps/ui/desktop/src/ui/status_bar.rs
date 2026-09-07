@@ -131,14 +131,26 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
                         .local_markets
                         .view_for_symbol(&model.preferences.selected_symbol);
                     let live = market.is_some_and(|m| m.status == MarketStatus::Live);
-                    let status = match market.map(|m| m.status) {
-                        Some(MarketStatus::Live) => TextKey::Online,
-                        Some(MarketStatus::LoadingHistory) => TextKey::LoadingHistory,
-                        Some(MarketStatus::Connecting) => TextKey::Connecting,
-                        Some(MarketStatus::Resyncing) => TextKey::Resyncing,
-                        Some(MarketStatus::Stale) => TextKey::Stale,
-                        _ => TextKey::Offline,
-                    };
+                    let (status, mut hint) = crate::i18n::market::message(
+                        language,
+                        market.map(|m| m.status),
+                        market
+                            .and_then(|m| m.status_detail.as_deref())
+                            .or(model.local_catalog_error.as_deref()),
+                    );
+                    if let Some(received) = market.and_then(|m| m.last_received_ms)
+                        && let Ok(market_now) = venue_gateway_api::display::received_ms()
+                    {
+                        let age = market_now.saturating_sub(received) as f64 / 1000.0;
+                        hint.push_str(&match language {
+                            crate::i18n::Language::SimplifiedChinese => {
+                                format!("\n距离上次有效更新 {age:.1} 秒。")
+                            }
+                            crate::i18n::Language::English => {
+                                format!("\nLast valid update: {age:.1}s ago.")
+                            }
+                        });
+                    }
                     let delay = market
                         .filter(|_| live)
                         .and_then(|m| m.latency_ms)
@@ -149,20 +161,10 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
                         format!(
                             "● {} {} · {delay}",
                             model.preferences.market_server.label(),
-                            text(language, status)
+                            status
                         ),
                         if live { theme::BUY } else { theme::WARNING },
-                        &market
-                            .and_then(|view| view.status_detail.as_deref())
-                            .map_or_else(
-                                || text(language, TextKey::MarketDelayHint).to_owned(),
-                                |detail| {
-                                    format!(
-                                        "{}\n{detail}",
-                                        text(language, TextKey::MarketDelayHint)
-                                    )
-                                },
-                            ),
+                        &hint,
                     );
                 }
                 #[cfg(target_arch = "wasm32")]

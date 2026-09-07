@@ -264,13 +264,23 @@ impl LocalMarketReducer {
             }
         }
 
+        if exchange_event
+            && self.view.status == MarketStatus::Stale
+            && envelope.received_ms.saturating_sub(envelope.event_time_ms) <= 5_000
+        {
+            self.view.status = MarketStatus::Live;
+            self.view.status_detail = None;
+        }
+
         // Book updates and status heartbeats cannot make an old traded price fresh.
         if exchange_event && self.last_price_event_ms > previous_price_event_ms {
             self.view.last_price_event_ms = Some(self.last_price_event_ms);
             self.view.last_price_received_ms = Some(envelope.received_ms);
         }
         self.view.last_event_ms = Some(envelope.event_time_ms);
-        self.view.last_received_ms = Some(envelope.received_ms);
+        if exchange_event || self.view.last_received_ms.is_none() {
+            self.view.last_received_ms = Some(envelope.received_ms);
+        }
         if exchange_event {
             self.view.latency_ms = Some(envelope.received_ms - envelope.event_time_ms);
         }
@@ -1587,6 +1597,29 @@ mod tests {
             reducer.view().status_detail.as_deref(),
             Some("market event timeout")
         );
+        reducer.apply(envelope(
+            &reducer,
+            6_011,
+            MarketPayload::Bbo {
+                bid: Decimal::ONE,
+                ask: Decimal::new(2, 0),
+            },
+        ))?;
+        assert_eq!(reducer.view().status, MarketStatus::Live);
+        assert!(reducer.view().status_detail.is_none());
+        assert!(reducer.view().last_price_received_ms.is_none());
+        let received = reducer.view().last_received_ms;
+        reducer.apply(envelope(
+            &reducer,
+            10_000,
+            MarketPayload::Status {
+                status: MarketStatus::Live,
+                detail: None,
+            },
+        ))?;
+        assert_eq!(reducer.view().last_received_ms, received);
+        reducer.refresh_staleness(11_019, 5_000);
+        assert_eq!(reducer.view().status, MarketStatus::Stale);
         Ok(())
     }
 

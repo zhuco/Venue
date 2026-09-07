@@ -186,13 +186,8 @@ impl VenueFlowApp {
                     .finish_history(&request, Err(error.to_string()));
             }
         }
-        let market_now =
-            if self.model.preferences.market_server == crate::model::MarketServer::Binance {
-                unix_now_ms()
-            } else {
-                // Expired synchronization must mark every old public view stale.
-                venue_gateway_api::display::received_ms().unwrap_or(u64::MAX)
-            };
+        // Expired synchronization must mark every old public view stale.
+        let market_now = venue_gateway_api::display::received_ms().unwrap_or(u64::MAX);
         self.model
             .local_markets
             .refresh_staleness(market_now, 5_000);
@@ -563,15 +558,6 @@ impl eframe::App for VenueFlowApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         theme::BG_PRIMARY.to_normalized_gamma_f32()
     }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn unix_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(1, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        })
 }
 
 fn load(storage: Option<&dyn eframe::Storage>) -> PersistedState {
