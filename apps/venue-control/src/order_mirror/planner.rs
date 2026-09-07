@@ -5,6 +5,16 @@ use venue_domain::{OrderSide, PositionSide};
 
 use crate::kol_executor::{BinanceCommandLedgerError, scaled_copy_quantity};
 
+/// A minimum-notional opening can be larger than its proportional source size.
+/// If the leader subsequently closes substantially all of that exact source lot,
+/// the follower must unwind the established child lot rather than leave the
+/// minimum-up remainder open forever.
+#[derive(Clone, Debug)]
+pub(super) struct MinimumUpliftedOpen {
+    pub source: TerminalOpenOrder,
+    pub child_quantity: Decimal,
+}
+
 pub(super) fn reducing(order: &TerminalOpenOrder) -> bool {
     matches!(
         (order.position_side, order.order_side),
@@ -81,6 +91,46 @@ pub(super) fn replacement_quantity(
         .checked_sub(prior_filled)
         .ok_or(BinanceCommandLedgerError::Conflict)?
         .max(Decimal::ZERO))
+}
+
+pub(super) fn close_quantity_with_minimum_uplift(
+    close: &TerminalOpenOrder,
+    proportional_quantity: Decimal,
+    openings: &[MinimumUpliftedOpen],
+) -> Decimal {
+    if !reducing(close) {
+        return proportional_quantity;
+    }
+    let Some(opening) = openings
+        .iter()
+        .filter(|opening| {
+            !reducing(&opening.source)
+                && opening.source.symbol == close.symbol
+                && opening.source.position_side == close.position_side
+                && opening.source.order_side != close.order_side
+                && opening
+                    .source
+                    .created_ms
+                    .zip(close.created_ms)
+                    .is_some_and(|(opened, closed)| opened < closed)
+                // A source close within one percent of the source opening is
+                // its practical full exit after source-lot rounding.
+                && opening
+                    .source
+                    .quantity
+                    .checked_mul(Decimal::from(99))
+                    .is_some_and(|needed| {
+                        close
+                            .quantity
+                            .checked_mul(Decimal::from(100))
+                            .is_some_and(|covered| covered >= needed)
+                    })
+        })
+        .max_by_key(|opening| opening.source.created_ms)
+    else {
+        return proportional_quantity;
+    };
+    proportional_quantity.max(opening.child_quantity)
 }
 
 #[cfg(test)]
@@ -183,6 +233,38 @@ mod tests {
         assert!(!reducing(&source));
         source.order_side = OrderSide::Buy;
         assert!(reducing(&source));
+        Ok(())
+    }
+
+    #[test]
+    fn near_full_close_unwinds_a_minimum_uplifted_child_lot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut open = order()?;
+        open.quantity = Decimal::from(281);
+        open.created_ms = Some(1001);
+        let mut close = open.clone();
+        close.native_order_id = Some("close-1".into());
+        close.client_order_id = "close-client".into();
+        close.order_side = OrderSide::Sell;
+        close.quantity = Decimal::from(280);
+        close.created_ms = Some(1002);
+        let opening = MinimumUpliftedOpen {
+            source: open,
+            child_quantity: Decimal::from(57),
+        };
+        assert_eq!(
+            close_quantity_with_minimum_uplift(
+                &close,
+                Decimal::new(279_926_854_480, 10),
+                std::slice::from_ref(&opening),
+            ),
+            Decimal::from(57)
+        );
+        close.quantity = Decimal::from(200);
+        assert_eq!(
+            close_quantity_with_minimum_uplift(&close, Decimal::from(20), &[opening]),
+            Decimal::from(20)
+        );
         Ok(())
     }
 

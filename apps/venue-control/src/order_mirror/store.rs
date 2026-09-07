@@ -206,6 +206,37 @@ pub(super) async fn plan_relation(pool: &PgPool, relation: &str, now: u64) -> Re
         .collect();
     let mirrors=sqlx::query("SELECT m.*,c.command_state AS place_state FROM venue_order_mirrors m LEFT JOIN venue_binance_commands c ON c.command_id=m.child_client_order_id WHERE m.relation_id=$1 AND m.source_kind='limit' ORDER BY m.symbol,m.source_order_id,m.child_sequence FOR UPDATE OF m")
         .bind(relation).fetch_all(&mut *tx).await.map_err(unavailable)?;
+    let mut minimum_uplifted_opens = Vec::new();
+    for mirror in &mirrors {
+        let source: TerminalOpenOrder =
+            serde_json::from_value(mirror.try_get("source_order_json").map_err(unavailable)?)
+                .map_err(|_| Error::Conflict)?;
+        if reducing(&source)
+            || mirror
+                .try_get::<Option<String>, _>("child_native_order_id")
+                .map_err(unavailable)?
+                .is_none()
+            || decimal(mirror, "filled_quantity")? <= Decimal::ZERO
+        {
+            continue;
+        }
+        let planned = replacement_quantity(
+            &source,
+            decimal(&row, "allocated_capital")?,
+            decimal(&row, "strategy_capital")?,
+            decimal(&row, "multiplier")?,
+            serde_json::from_value(row.try_get("sizing_json").map_err(unavailable)?)
+                .map_err(|_| Error::Conflict)?,
+            Decimal::ZERO,
+        )?;
+        let child_quantity = decimal(mirror, "child_quantity")?;
+        if child_quantity > planned {
+            minimum_uplifted_opens.push(MinimumUpliftedOpen {
+                source,
+                child_quantity,
+            });
+        }
+    }
     let mut latest = BTreeMap::new();
     let mut filled = BTreeMap::<(String, String), Decimal>::new();
     let mut has_work = false;
@@ -347,6 +378,8 @@ pub(super) async fn plan_relation(pool: &PgPool, relation: &str, now: u64) -> Re
                 filled.get(&key).copied().unwrap_or_default(),
             )?;
             if reducing(&order) {
+                quantity =
+                    close_quantity_with_minimum_uplift(&order, quantity, &minimum_uplifted_opens);
                 let p = follower.as_ref().ok_or(Error::Conflict)?;
                 let position = p
                     .positions
