@@ -100,7 +100,49 @@ async fn manual_opens_need_verified_ownership_not_private_projection() -> TestRe
     }});
     sqlx::query("INSERT INTO venue_binance_account_projections (credential_id,owner_user_id,trading_account_id,observed_ms,persisted_ms,private_generation,projection_json) VALUES ($1,$2,$3,$4,$4,1,$5)")
         .bind(&credential.credential_id).bind(&alice.user.user_id).bind(account).bind(i64::try_from(old)?)
-        .bind(projection).execute(&f.pool).await?;
+        .bind(&projection).execute(&f.pool).await?;
+    let projections = crate::private_projection::BinancePrivateProjectionStore::new(f.pool.clone());
+    // Missing display-history tables must not prevent an execution-only position read.
+    sqlx::raw_sql("ALTER TABLE venue_binance_account_fills RENAME TO fixture_hidden_fills; ALTER TABLE venue_binance_position_history RENAME TO fixture_hidden_history")
+        .execute(&f.pool).await?;
+    let execution_view = projections
+        .load_terminal_positions(&alice.user.user_id, &credential.credential_id, account)
+        .await?
+        .ok_or("execution projection missing")?;
+    assert_eq!(execution_view.observed_ms, old);
+    assert!(
+        projections
+            .load_terminal_positions(
+                &alice.user.user_id,
+                &credential.credential_id,
+                "other-account"
+            )
+            .await?
+            .is_none()
+    );
+    assert!(
+        projections
+            .load_terminal_positions(&bob.user.user_id, &credential.credential_id, account)
+            .await?
+            .is_none()
+    );
+    sqlx::raw_sql("ALTER TABLE fixture_hidden_fills RENAME TO venue_binance_account_fills; ALTER TABLE fixture_hidden_history RENAME TO venue_binance_position_history")
+        .execute(&f.pool).await?;
+    sqlx::query("UPDATE venue_binance_account_projections SET projection_json=jsonb_set(projection_json,'{projection,trading_account_id}','\"00000000-0000-4000-8000-000000000999\"'::jsonb) WHERE credential_id=$1")
+        .bind(&credential.credential_id).execute(&f.pool).await?;
+    assert!(
+        projections
+            .load_terminal_positions(&alice.user.user_id, &credential.credential_id, account)
+            .await
+            .is_err()
+    );
+    sqlx::query(
+        "UPDATE venue_binance_account_projections SET projection_json=$2 WHERE credential_id=$1",
+    )
+    .bind(&credential.credential_id)
+    .bind(projection)
+    .execute(&f.pool)
+    .await?;
     code(
         server
             .post(KOL_TERMINAL_ORDER_PATH, Some(&alice), &request)
@@ -126,9 +168,41 @@ async fn manual_opens_need_verified_ownership_not_private_projection() -> TestRe
     assert_eq!(command.origin, ExecutorCommandOrigin::Terminal);
     let store = crate::executor_store::PgExecutorStore::new(f.pool.clone());
     assert!(store.terminal_open_credential_verified(&command).await?);
+    let secrets = crate::executor_secret::ExecutorSecretProvider::new(
+        f.pool.clone(),
+        CredentialCipher::from_key(&[17; 32])?,
+    );
+    assert!(
+        secrets
+            .load_bound(&credential.credential_id, &alice.user.user_id, account)
+            .await
+            .is_ok()
+    );
+    assert!(matches!(
+        secrets
+            .load_bound(
+                &credential.credential_id,
+                &alice.user.user_id,
+                "other-account"
+            )
+            .await,
+        Err(crate::executor_secret::ExecutorSecretError::Forbidden)
+    ));
+    assert!(matches!(
+        secrets
+            .load_bound(&credential.credential_id, &bob.user.user_id, account)
+            .await,
+        Err(crate::executor_secret::ExecutorSecretError::Forbidden)
+    ));
     sqlx::query("UPDATE venue_api_credentials SET verification_json=jsonb_set(verification_json,'{verification}','\"unverified\"'::jsonb) WHERE credential_id=$1")
         .bind(&credential.credential_id).execute(&f.pool).await?;
     assert!(!store.terminal_open_credential_verified(&command).await?);
+    assert!(matches!(
+        secrets
+            .load_bound(&credential.credential_id, &alice.user.user_id, account)
+            .await,
+        Err(crate::executor_secret::ExecutorSecretError::Forbidden)
+    ));
     code(
         server
             .post(KOL_TERMINAL_ORDER_PATH, Some(&alice), &request)

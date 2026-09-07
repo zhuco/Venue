@@ -38,8 +38,28 @@ impl ExecutorSecretProvider {
         credential_id: &str,
         owner_user_id: &str,
     ) -> Result<BinanceCredentials, ExecutorSecretError> {
-        let row = sqlx::query("SELECT encrypted_credentials FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND deleted_ms IS NULL AND verification_json->>'verification'='verified'")
-            .bind(credential_id).bind(owner_user_id).fetch_optional(&self.pool).await
+        self.load_matching(credential_id, owner_user_id, None).await
+    }
+
+    /// Manual opens combine account binding and credential verification in the decryption read.
+    pub(crate) async fn load_bound(
+        &self,
+        credential_id: &str,
+        owner_user_id: &str,
+        trading_account_id: &str,
+    ) -> Result<BinanceCredentials, ExecutorSecretError> {
+        self.load_matching(credential_id, owner_user_id, Some(trading_account_id))
+            .await
+    }
+
+    async fn load_matching(
+        &self,
+        credential_id: &str,
+        owner_user_id: &str,
+        trading_account_id: Option<&str>,
+    ) -> Result<BinanceCredentials, ExecutorSecretError> {
+        let row = sqlx::query("SELECT encrypted_credentials FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND deleted_ms IS NULL AND verification_json->>'verification'='verified' AND ($3::text IS NULL OR trading_account_id=$3)")
+            .bind(credential_id).bind(owner_user_id).bind(trading_account_id).fetch_optional(&self.pool).await
             .map_err(|_| ExecutorSecretError::Unavailable)?
             .ok_or(ExecutorSecretError::Forbidden)?;
         let envelope: Vec<u8> = row

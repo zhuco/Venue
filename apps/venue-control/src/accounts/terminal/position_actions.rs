@@ -44,7 +44,7 @@ impl AccountService {
         reject_legacy_writer(&self.pool, &account).await?;
         let projection =
             crate::private_projection::BinancePrivateProjectionStore::new(self.pool.clone())
-                .load_healthy_owned(owner, &request.credential_id)
+                .load_terminal_positions(owner, &request.credential_id, &account)
                 .await
                 .map_err(|_| error(Code::Unavailable))?
                 .ok_or(error(Code::VerificationRequired))?;

@@ -71,15 +71,47 @@ impl CommandWake {
     }
 }
 
-pub trait ExecutorCredentials {
+pub trait ExecutorCredentials: Sync {
     fn credentials<'a>(
         &'a self,
         credential_id: &'a str,
         owner_user_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<BinanceCredentials, ExecutorSecretError>> + Send + 'a>>;
+
+    fn terminal_open_credentials<'a>(
+        &'a self,
+        store: &'a PgExecutorStore,
+        command: &'a ClaimedBinanceCommand,
+    ) -> Pin<Box<dyn Future<Output = Result<BinanceCredentials, ExecutorSecretError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if !store
+                .terminal_open_credential_verified(command)
+                .await
+                .map_err(|_| ExecutorSecretError::Unavailable)?
+            {
+                return Err(ExecutorSecretError::Forbidden);
+            }
+            self.credentials(&command.credential_id, &command.owner_user_id)
+                .await
+        })
+    }
 }
 
 impl ExecutorCredentials for ExecutorSecretProvider {
+    fn terminal_open_credentials<'a>(
+        &'a self,
+        _store: &'a PgExecutorStore,
+        command: &'a ClaimedBinanceCommand,
+    ) -> Pin<Box<dyn Future<Output = Result<BinanceCredentials, ExecutorSecretError>> + Send + 'a>>
+    {
+        Box::pin(self.load_bound(
+            &command.credential_id,
+            &command.owner_user_id,
+            &command.trading_account_id,
+        ))
+    }
+
     fn credentials<'a>(
         &'a self,
         credential_id: &'a str,
@@ -702,10 +734,14 @@ where
     E: BinanceExecution + Send,
     S: ExecutorCredentials + Sync,
 {
-    let credentials = match secrets
-        .credentials(&command.credential_id, &command.owner_user_id)
-        .await
-    {
+    let mut request = request(&command);
+    let credentials = match if crate::executor_exchange::is_terminal_open(&request) {
+        secrets.terminal_open_credentials(store, &command).await
+    } else {
+        secrets
+            .credentials(&command.credential_id, &command.owner_user_id)
+            .await
+    } {
         Ok(credentials) => credentials,
         // Credential retrieval happens before the physical mutation boundary.
         Err(_) => {
@@ -740,21 +776,7 @@ where
             return Ok(drain_after_persisted_state(ExecutorCommandState::Rejected));
         }
     };
-    let mut request = request(&command);
     request.reconciled_close_reservations = reservations;
-    if crate::executor_exchange::is_terminal_open(&request)
-        && !store.terminal_open_credential_verified(&command).await?
-    {
-        store
-            .transition_command(
-                &command.command_id,
-                ExecutorCommandState::Rejected,
-                now_ms()?,
-                Some("credential_unavailable"),
-            )
-            .await?;
-        return Ok(drain_after_persisted_state(ExecutorCommandState::Rejected));
-    }
     if matches!(request.order_kind, ExecutionOrderKind::Market { .. }) {
         match exchange.prepare_market(&request, &credentials).await {
             Ok(Some(baseline)) => {
@@ -1299,7 +1321,7 @@ fn request(command: &ClaimedBinanceCommand) -> ExecutionRequest {
 
 const fn ledger_not_dispatched_code(error: BinanceCommandLedgerError) -> &'static str {
     match error {
-        BinanceCommandLedgerError::Conflict => "not_dispatched_invalid",
+        BinanceCommandLedgerError::Conflict => "not_dispatched_ledger_conflict",
         BinanceCommandLedgerError::Unavailable => "not_dispatched_unavailable",
     }
 }
@@ -1624,6 +1646,18 @@ mod tests {
     #[test]
     fn adapter_errors_before_post_are_terminal_and_never_dispatch_unknown() {
         for (error, expected) in [
+            (
+                crate::executor_exchange::BinanceExecutionError::PreDispatch(
+                    crate::executor_exchange::PreDispatchRejection::Direction,
+                ),
+                "not_dispatched_direction",
+            ),
+            (
+                crate::executor_exchange::BinanceExecutionError::PreDispatch(
+                    crate::executor_exchange::PreDispatchRejection::InstrumentRules,
+                ),
+                "not_dispatched_instrument_rules",
+            ),
             (
                 crate::executor_exchange::BinanceExecutionError::Invalid,
                 "not_dispatched_invalid",

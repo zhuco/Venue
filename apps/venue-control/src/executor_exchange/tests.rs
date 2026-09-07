@@ -314,11 +314,15 @@ fn post_dispatch_ambiguity_never_becomes_explicit_rejection() {
 fn transport_preflight_failure_stays_not_dispatched() {
     assert_eq!(
         dispatch_failed(BinanceTransportError::Binding, None),
-        Err(BinanceExecutionError::Invalid)
+        Err(BinanceExecutionError::PreDispatch(
+            PreDispatchRejection::Binding
+        ))
     );
     assert_eq!(
         dispatch_failed(BinanceTransportError::Signing, None),
-        Err(BinanceExecutionError::Unavailable)
+        Err(BinanceExecutionError::PreDispatch(
+            PreDispatchRejection::Signing
+        ))
     );
 }
 

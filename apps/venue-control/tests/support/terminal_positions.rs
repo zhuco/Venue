@@ -16,6 +16,8 @@ enum ResultMode {
     Stale,
     UnpreparedRestart,
     OpenRejected,
+    PreDispatch,
+    Unhealthy,
 }
 
 #[derive(Clone)]
@@ -84,6 +86,11 @@ impl BinanceExecution for PositionExchange {
                     context.quantity,
                     request.client_order_id.clone(),
                 ));
+            if matches!(self.mode, ResultMode::PreDispatch) {
+                return Err(BinanceExecutionError::PreDispatch(
+                    PreDispatchRejection::Direction,
+                ));
+            }
             let state = match (self.mode, read_only) {
                 (ResultMode::OpenRejected, _) if !reducing => ExecutionReadback::Rejected,
                 (ResultMode::Unknown, false) if reducing => ExecutionReadback::Unknown,
@@ -191,6 +198,8 @@ async fn terminal_position_reverse_is_durable_and_never_opens_before_confirmed_c
         ResultMode::Stale,
         ResultMode::UnpreparedRestart,
         ResultMode::OpenRejected,
+        ResultMode::PreDispatch,
+        ResultMode::Unhealthy,
     ] {
         let fixture = Fixture::create(&url).await?;
         fixture.migrate_twice().await?;
@@ -290,6 +299,9 @@ async fn terminal_position_reverse_is_durable_and_never_opens_before_confirmed_c
             .await?;
         assert_eq!(count, 2);
         match mode {
+            ResultMode::Unhealthy => {
+                projections.invalidate_stream(&credential).await?;
+            }
             ResultMode::Revoked => {
                 sqlx::query("UPDATE venue_api_credentials SET verification_json='{}'::jsonb WHERE credential_id=$1")
                     .bind(&credential).execute(&fixture.pool).await?;
@@ -319,7 +331,10 @@ async fn terminal_position_reverse_is_durable_and_never_opens_before_confirmed_c
         runtime.recover_once().await?;
         if matches!(
             mode,
-            ResultMode::Revoked | ResultMode::Stale | ResultMode::UnpreparedRestart
+            ResultMode::Revoked
+                | ResultMode::Stale
+                | ResultMode::UnpreparedRestart
+                | ResultMode::Unhealthy
         ) {
             if matches!(mode, ResultMode::UnpreparedRestart) {
                 sqlx::query("UPDATE venue_binance_commands SET next_reconcile_ms=1 WHERE command_state='reconcile_required'").execute(&fixture.pool).await?;
@@ -332,6 +347,20 @@ async fn terminal_position_reverse_is_durable_and_never_opens_before_confirmed_c
             );
             fixture.cleanup().await?;
             continue;
+        }
+        if matches!(mode, ResultMode::PreDispatch) {
+            let reason: String = sqlx::query_scalar("SELECT sanitized_error_code FROM venue_binance_commands WHERE command_phase='close'")
+                .fetch_one(&fixture.pool).await?;
+            assert_eq!(reason, "not_dispatched_direction");
+            let summaries = service.terminal_executions(&principal).await?;
+            assert!(
+                summaries
+                    .iter()
+                    .any(|row| row.sanitized_error_code.as_deref()
+                        == Some("not_dispatched_direction"))
+            );
+            runtime.recover_once().await?;
+            assert_eq!(calls.lock().map_err(|_| "poison")?.len(), 1);
         }
         if matches!(mode, ResultMode::OpenRejected) {
             assert_eq!(

@@ -20,14 +20,15 @@ impl BinanceHttpExecution {
     ) -> Result<ExecutionOutcome, BinanceExecutionError> {
         validate_request_binding(&self.transport, request)?;
         if !is_terminal_open(request) {
-            return Err(BinanceExecutionError::Invalid);
+            return Err(BinanceExecutionError::PreDispatch(
+                PreDispatchRejection::OrderType,
+            ));
         }
         // Initial public-only warmup is required; subsequent opens use the same pool and clock.
         if self.transport.signing_timestamp_ms().is_err() {
-            self.transport
-                .synchronize_clock()
-                .await
-                .map_err(|_| BinanceExecutionError::Unavailable)?;
+            self.transport.synchronize_clock().await.map_err(|_| {
+                BinanceExecutionError::PreDispatch(PreDispatchRejection::ClockUnavailable)
+            })?;
         }
         let rules = self
             .catalogue
@@ -42,7 +43,9 @@ impl BinanceHttpExecution {
             reducing: false,
         } = request.order_kind
         else {
-            return Err(BinanceExecutionError::Invalid);
+            return Err(BinanceExecutionError::PreDispatch(
+                PreDispatchRejection::OrderType,
+            ));
         };
         let quantity = quantity - quantity % rules.instrument.quantity_step;
         if quantity <= Decimal::ZERO {
@@ -55,7 +58,7 @@ impl BinanceHttpExecution {
             self.next_attempt_id,
             now_ms()?,
         )
-        .map_err(|_| BinanceExecutionError::Invalid)?;
+        .map_err(|_| BinanceExecutionError::PreDispatch(PreDispatchRejection::Scope))?;
         self.next_attempt_id = self
             .next_attempt_id
             .checked_add(1)
@@ -69,12 +72,12 @@ impl BinanceHttpExecution {
                 position_side,
                 quantity,
                 limit_price: venue_domain::domain::Price::new(price)
-                    .map_err(|_| BinanceExecutionError::Invalid)?,
+                    .map_err(|_| BinanceExecutionError::PreDispatch(PreDispatchRejection::Price))?,
                 time_in_force: BinanceTimeInForce::PostOnly,
                 reduce_only: false,
             },
         )
-        .map_err(|_| BinanceExecutionError::Invalid)?;
+        .map_err(BinanceExecutionError::from)?;
         let started = Instant::now();
         let response = self
             .transport
@@ -82,9 +85,9 @@ impl BinanceHttpExecution {
                 credentials,
                 &scope,
                 &prepared,
-                self.transport
-                    .signing_timestamp_ms()
-                    .map_err(|_| BinanceExecutionError::Unavailable)?,
+                self.transport.signing_timestamp_ms().map_err(|_| {
+                    BinanceExecutionError::PreDispatch(PreDispatchRejection::ClockUnavailable)
+                })?,
             )
             .await;
         tracing::info!(target: "venue_control::terminal", command_id = %request.command_id,

@@ -2,6 +2,47 @@ use super::*;
 use crate::executor_exchange::TerminalPositionSettlement;
 
 impl BinancePrivateProjectionStore {
+    /// Execution needs current positions, not the display's fills and position-history queries.
+    /// Read credential admission and stream health with the same projection row snapshot.
+    pub(crate) async fn load_terminal_positions(
+        &self,
+        owner: &str,
+        credential: &str,
+        trading_account: &str,
+    ) -> Result<Option<TerminalAccountProjection>, PrivateProjectionError> {
+        let payload: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT p.projection_json FROM venue_binance_account_projections p \
+             JOIN venue_api_credentials c ON c.credential_id=p.credential_id \
+             AND c.user_id=p.owner_user_id AND c.trading_account_id=p.trading_account_id \
+             WHERE p.credential_id=$1 AND p.owner_user_id=$2 AND p.trading_account_id=$3 AND c.deleted_ms IS NULL \
+             AND c.verification_json->>'verification'='verified' \
+             AND COALESCE((p.projection_json->>'stream_healthy')::boolean,false)",
+        )
+        .bind(credential)
+        .bind(owner)
+        .bind(trading_account)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PrivateProjectionError::Unavailable)?;
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let mut stored: StoredProjection =
+            serde_json::from_value(payload).map_err(|_| PrivateProjectionError::Unavailable)?;
+        if stored.projection.credential_id != credential
+            || stored.projection.trading_account_id != trading_account
+        {
+            return Err(PrivateProjectionError::Invalid);
+        }
+        self.apply_terminal_position_refresh(owner, &mut stored.projection)
+            .await?;
+        stored
+            .projection
+            .validate()
+            .map_err(|_| PrivateProjectionError::Unavailable)?;
+        Ok(Some(stored.projection))
+    }
+
     pub(super) async fn apply_terminal_position_refresh(
         &self,
         owner: &str,

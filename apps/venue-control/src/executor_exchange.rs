@@ -45,18 +45,22 @@ use mirror::mirror_order_outcome;
 mod mock;
 pub use mock::MockBinanceExecution;
 mod prices;
+mod rejection;
 mod terminal_market;
 mod terminal_open;
+mod validation;
 use catalogue::SharedCatalogue;
 pub use copy_risk::{CopyRiskContext, CopyRiskRejection};
 use copy_risk::{check_minimum_notional_at_price, clip_open_quantity};
 pub use market::{MarketBaseline, MarketPreparationFuture, MarketSettlement};
 use market::{PreparedMarket, signed_market_settlement};
 use prices::SharedMarketPrices;
+pub use rejection::{BinanceExecutionError, PreDispatchRejection};
 pub use terminal_market::{
     TerminalMarketContext, TerminalMarketFuture, TerminalMarketResult, TerminalPositionSettlement,
 };
 pub(crate) use terminal_open::is_terminal_open;
+use validation::validate_request_binding;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionRequest {
@@ -199,32 +203,6 @@ pub struct AccountBaseline {
     pub snapshot: venue_execution::SignedAccountSnapshot,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum BinanceExecutionError {
-    #[error("Binance execution is unavailable")]
-    Unavailable,
-    #[error("Binance execution request is invalid")]
-    Invalid,
-    #[error("Manual opening quantity rounds down to zero")]
-    OpenQuantityZero,
-    #[error("Binance copy risk check rejected the order")]
-    Risk(CopyRiskRejection),
-}
-
-impl BinanceExecutionError {
-    /// `submit` only returns these errors before calling the physical mutation transport. Once a
-    /// POST is attempted, uncertainty is represented by `ExecutionReadback::Unknown` instead.
-    #[must_use]
-    pub const fn not_dispatched_code(self) -> &'static str {
-        match self {
-            Self::Invalid => "not_dispatched_invalid",
-            Self::OpenQuantityZero => "not_dispatched_quantity_zero",
-            Self::Unavailable => "not_dispatched_unavailable",
-            Self::Risk(reason) => reason.code(),
-        }
-    }
-}
-
 /// The production Portfolio Margin UM adapter. It owns no credentials and never retries a
 /// mutation: a durable command ID can pass through `submit` once, while later calls only use
 /// `readback`. The supplied transport is the existing signed HTTP implementation, so fixtures
@@ -347,12 +325,12 @@ impl BinanceExecutionRouter {
                 trading_account_id.to_owned(),
                 symbol.clone(),
             )
-            .map_err(|_| BinanceExecutionError::Invalid)?;
+            .map_err(|_| BinanceExecutionError::PreDispatch(PreDispatchRejection::Binding))?;
             let config = venue_gateway_binance::BinanceConfig::for_binding(
                 venue_gateway_binance::BinanceAccountBinding::PortfolioMarginUm,
                 &binding,
             )
-            .map_err(|_| BinanceExecutionError::Invalid)?;
+            .map_err(|_| BinanceExecutionError::PreDispatch(PreDispatchRejection::Binding))?;
             let transport = BinanceHttpTransport::new(config, 1, 1, self.limits)
                 .map_err(|_| BinanceExecutionError::Unavailable)?;
             exchanges.insert(
@@ -885,7 +863,7 @@ impl BinanceHttpExecution {
                 return Err(BinanceExecutionError::Invalid);
             }
         }
-        .map_err(|_| BinanceExecutionError::Invalid)?;
+        .map_err(BinanceExecutionError::from)?;
         match self
             .transport
             .dispatch_then_exact_readback(&credentials, before.scope(), &prepared, now_ms()?)
@@ -1012,7 +990,7 @@ impl BinanceHttpExecution {
                 client_order_id: target_client_order_id,
             },
         )
-        .map_err(|_| BinanceExecutionError::Invalid)?;
+        .map_err(BinanceExecutionError::from)?;
         match self
             .transport
             .dispatch_then_exact_readback(&credentials, before.scope(), &prepared, now_ms()?)
@@ -1395,127 +1373,6 @@ impl BinanceActivationBaseline for BinanceExecutionRouter {
     }
 }
 
-fn validate_request_binding(
-    transport: &BinanceHttpTransport,
-    request: &ExecutionRequest,
-) -> Result<(), BinanceExecutionError> {
-    let binding = transport.config().gateway_binding();
-    if request.command_id.is_empty()
-        || request.client_order_id.is_empty()
-        || request.credential_id.is_empty()
-        || request.trading_account_id != binding.trading_account_id
-        || request.symbol != binding.symbol
-        || request
-            .known_native_order_id
-            .as_deref()
-            .is_some_and(invalid_native_order_id)
-    {
-        return Err(BinanceExecutionError::Invalid);
-    }
-    match &request.order_kind {
-        ExecutionOrderKind::Market {
-            side,
-            position_side,
-            quantity,
-            reducing,
-        }
-        | ExecutionOrderKind::Limit {
-            side,
-            position_side,
-            quantity,
-            reducing,
-            ..
-        } => {
-            let price_invalid = matches!(
-                &request.order_kind,
-                ExecutionOrderKind::Limit { price, .. } if *price <= Decimal::ZERO
-            );
-            let unsupported_gtc = matches!(
-                &request.order_kind,
-                ExecutionOrderKind::Limit {
-                    time_in_force: LimitTimeInForce::Gtc,
-                    ..
-                }
-            ) && request.origin
-                != venue_control_protocol::kol::ExecutorCommandOrigin::Copy;
-            if *position_side == PositionSide::Net
-                || *quantity <= Decimal::ZERO
-                || price_invalid
-                || unsupported_gtc
-                || (!*reducing && !request.reconciled_close_reservations.is_empty())
-                || *reducing
-                    != matches!(
-                        (*position_side, *side),
-                        (PositionSide::Long, OrderSide::Sell)
-                            | (PositionSide::Short, OrderSide::Buy)
-                    )
-            {
-                return Err(BinanceExecutionError::Invalid);
-            }
-        }
-        ExecutionOrderKind::StopMarket {
-            side,
-            position_side,
-            quantity,
-            trigger_price,
-            working_type,
-            reducing,
-        } => {
-            if *position_side == PositionSide::Net
-                || *quantity <= Decimal::ZERO
-                || *trigger_price <= Decimal::ZERO
-                || !matches!(working_type.as_str(), "MARK_PRICE" | "CONTRACT_PRICE")
-                || *reducing
-                    != matches!(
-                        (*position_side, *side),
-                        (PositionSide::Long, OrderSide::Sell)
-                            | (PositionSide::Short, OrderSide::Buy)
-                    )
-            {
-                return Err(BinanceExecutionError::Invalid);
-            }
-        }
-        ExecutionOrderKind::CancelExact {
-            native_order_id,
-            target_client_order_id,
-        } => {
-            if native_order_id.is_none() && target_client_order_id.is_none()
-                || !request.reconciled_close_reservations.is_empty()
-                || native_order_id
-                    .as_deref()
-                    .is_some_and(invalid_native_order_id)
-                || target_client_order_id
-                    .as_deref()
-                    .is_some_and(invalid_native_order_id)
-                || native_order_id.as_ref().is_some_and(|selected| {
-                    request
-                        .known_native_order_id
-                        .as_ref()
-                        .is_some_and(|known| known != selected)
-                })
-            {
-                return Err(BinanceExecutionError::Invalid);
-            }
-        }
-        ExecutionOrderKind::CancelAlgoExact {
-            native_order_id,
-            target_client_order_id,
-        } => {
-            if native_order_id.is_none() && target_client_order_id.is_none()
-                || native_order_id
-                    .as_deref()
-                    .is_some_and(invalid_native_order_id)
-                || target_client_order_id
-                    .as_deref()
-                    .is_some_and(invalid_native_order_id)
-            {
-                return Err(BinanceExecutionError::Invalid);
-            }
-        }
-    }
-    Ok(())
-}
-
 fn invalid_native_order_id(value: &str) -> bool {
     value.trim().is_empty() || value.len() > 128 || value.chars().any(char::is_whitespace)
 }
@@ -1848,9 +1705,17 @@ fn dispatch_failed(
         }
         // These checks occur while binding or constructing the signed request, before reqwest's
         // physical send future is entered.
-        BinanceTransportError::Binding => return Err(BinanceExecutionError::Invalid),
+        BinanceTransportError::Binding => {
+            return Err(BinanceExecutionError::PreDispatch(
+                PreDispatchRejection::Binding,
+            ));
+        }
+        BinanceTransportError::Signing => {
+            return Err(BinanceExecutionError::PreDispatch(
+                PreDispatchRejection::Signing,
+            ));
+        }
         BinanceTransportError::Limits
-        | BinanceTransportError::Signing
         | BinanceTransportError::Http
         | BinanceTransportError::Payload
         | BinanceTransportError::Protocol

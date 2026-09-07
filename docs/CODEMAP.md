@@ -56,8 +56,9 @@
 | 原生下单、签名时钟和安全错误码 | `crates/venue-gateway-binance/src/{execution,transport}.rs` |
 | 共享规则目录与后台校时 | `apps/venue-control/src/executor_exchange/catalogue.rs`、`executor_exchange/` |
 | 手动 Post Only 开仓快速路径 | `apps/venue-control/src/executor_exchange/terminal_open.rs`、`crates/venue-gateway-binance/src/execution/terminal_open.rs` |
+| 发送前拒绝分类与参数绑定 | `apps/venue-control/src/executor_exchange/{rejection,validation}.rs`；沿命令账本安全错误码到 `apps/ui/desktop/src/terminal_feedback.rs`，未知旧码不推测原因 |
 | 逐行市价平仓与反开 | `crates/venue-control-protocol/src/terminal_position.rs`、`apps/venue-control/src/accounts/terminal/position_actions.rs`、`executor_runtime/terminal_positions.rs`、`executor_store/terminal_positions.rs`；迁移 0027 |
-| 市价操作后的单交易对仓位刷新 | `apps/venue-control/src/executor_exchange/terminal_market.rs`、`private_projection/terminal_positions.rs` |
+| 市价操作的精简持仓读取及发送后单交易对刷新 | `apps/venue-control/src/executor_exchange/terminal_market.rs`、`private_projection/terminal_positions.rs`；执行读取合并凭证/流状态，跳过成交与仓位历史查询 |
 
 ## Binance Grid
 

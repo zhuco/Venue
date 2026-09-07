@@ -36,12 +36,12 @@ impl SharedCatalogue {
         symbol: &Symbol,
     ) -> Result<(BinanceInstrumentRules, Arc<str>), BinanceExecutionError> {
         self.rules_with(symbol, transport.instrument_generation(), || async {
-            let response = transport
-                .fetch_usd_m_exchange_info()
-                .await
-                .map_err(|_| BinanceExecutionError::Unavailable)?;
-            String::from_utf8(response.payload.to_vec())
-                .map_err(|_| BinanceExecutionError::Unavailable)
+            let response = transport.fetch_usd_m_exchange_info().await.map_err(|_| {
+                BinanceExecutionError::PreDispatch(PreDispatchRejection::CatalogueUnavailable)
+            })?;
+            String::from_utf8(response.payload.to_vec()).map_err(|_| {
+                BinanceExecutionError::PreDispatch(PreDispatchRejection::CatalogueUnavailable)
+            })
         })
         .await
     }
@@ -66,7 +66,9 @@ impl SharedCatalogue {
             .is_none_or(|cache| now.duration_since(cache.received) >= RULES_TTL)
         {
             if state.retry_after.is_some_and(|retry| now < retry) {
-                return Err(BinanceExecutionError::Unavailable);
+                return Err(BinanceExecutionError::PreDispatch(
+                    PreDispatchRejection::CatalogueUnavailable,
+                ));
             }
             match load().await {
                 Ok(payload) => {
@@ -86,13 +88,16 @@ impl SharedCatalogue {
         let cache = state
             .current
             .as_mut()
-            .ok_or(BinanceExecutionError::Unavailable)?;
+            .ok_or(BinanceExecutionError::PreDispatch(
+                PreDispatchRejection::CatalogueUnavailable,
+            ))?;
         let rules = cache
             .rules
             .entry((symbol.clone(), generation))
             .or_insert_with(|| {
-                parse_instrument_rules(&cache.payload, symbol.clone(), generation)
-                    .map_err(|_| BinanceExecutionError::Invalid)
+                parse_instrument_rules(&cache.payload, symbol.clone(), generation).map_err(|_| {
+                    BinanceExecutionError::PreDispatch(PreDispatchRejection::InstrumentRules)
+                })
             })
             .clone()?;
         Ok((rules, cache.payload.clone()))
@@ -107,6 +112,20 @@ mod tests {
     const CATALOGUE: &str = include_str!(
         "../../../../crates/venue-gateway-binance/tests/fixtures/exchange_info_btcusdt.json"
     );
+
+    #[tokio::test]
+    async fn missing_contract_reports_catalogue_rules_not_account_or_order_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cache = SharedCatalogue::default();
+        let result = cache
+            .rules_with(&"DOGE/USDC".parse()?, 1, || async { Ok(CATALOGUE.into()) })
+            .await;
+        assert_eq!(
+            result.err().map(BinanceExecutionError::not_dispatched_code),
+            Some("not_dispatched_instrument_rules")
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn two_hundred_followers_share_one_catalogue_and_one_normalized_rule()

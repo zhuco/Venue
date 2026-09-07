@@ -92,6 +92,10 @@ pub(crate) fn command_reason(summary: &ExecutorCommandSummary, language: Languag
     let Some(code) = summary.sanitized_error_code.as_deref() else {
         return "—".into();
     };
+    describe_command_code(code, language)
+}
+
+fn describe_command_code(code: &str, language: Language) -> String {
     if code.is_empty()
         || code.len() > 64
         || !code.bytes().all(|byte| {
@@ -163,12 +167,88 @@ pub(crate) fn command_reason(summary: &ExecutorCommandSummary, language: Languag
             "Binance rejected the signed timestamp; executor clock synchronization is required.",
         ),
         "not_dispatched_invalid" => (
-            "发送前校验未通过；可能涉及请求、数量/价格规则或签名账户事实。当前服务端未记录更细分原因。",
-            "Pre-send validation failed for the request, order rules or signed account facts. The server did not record a finer reason.",
+            "执行器未发送此委托；服务端未记录具体原因。此记录无法判断失败条件。",
+            "The executor did not send this order. The server recorded no specific reason; the failed condition cannot be determined.",
+        ),
+        "not_dispatched_binding" => (
+            "命令账户或交易对与执行连接不一致，未发送；需核对服务端命令路由。",
+            "Command account or symbol does not match the execution connection; not sent. Check server routing.",
+        ),
+        "not_dispatched_identity" => (
+            "命令标识缺失或订单标识格式无效，未发送；需核对服务端命令记录。",
+            "Missing command identity or invalid order identity; not sent. Check the server command record.",
+        ),
+        "not_dispatched_quantity" => (
+            "委托数量必须大于零，未发送。",
+            "Order quantity must be greater than zero; not sent.",
+        ),
+        "not_dispatched_price" => (
+            "委托价格或触发价格必须大于零，未发送。",
+            "Order or trigger price must be greater than zero; not sent.",
+        ),
+        "not_dispatched_direction" => (
+            "买卖方向、持仓方向与开平仓意图不一致，未发送；需核对命令参数。",
+            "Order side, position side and open/close intent are inconsistent; not sent. Check command parameters.",
+        ),
+        "not_dispatched_order_type" => (
+            "当前执行路径不支持该订单类型、有效方式或触发方式，未发送。",
+            "This execution path does not support the order type, time in force or trigger type; not sent.",
+        ),
+        "not_dispatched_close_reservation" => (
+            "开仓命令错误地携带了平仓预留数据，未发送；需修正服务端命令。",
+            "An opening command unexpectedly contains close reservations; not sent. Server command needs correction.",
+        ),
+        "not_dispatched_cancel_target" => (
+            "撤单目标缺失、标识冲突或撤单参数不一致，未发送撤单。",
+            "Missing or conflicting cancel target, or inconsistent cancel parameters; cancel was not sent.",
+        ),
+        "not_dispatched_scope" => (
+            "请求范围与执行连接或规则版本不一致，无法准备委托，未发送。",
+            "Request scope does not match the execution connection or rule generation; order preparation failed, not sent.",
+        ),
+        "not_dispatched_instrument_rules" => (
+            "交易对规则目录无法解析该合约的有效规则，未发送；需核对规则目录。",
+            "The instrument catalogue could not resolve valid rules for this contract; not sent. Check the catalogue.",
+        ),
+        "not_dispatched_catalogue_unavailable" => (
+            "公共交易对规则目录暂不可用，未发送。",
+            "Public instrument catalogue is temporarily unavailable; not sent.",
+        ),
+        "not_dispatched_clock_unavailable" => (
+            "执行器签名时钟尚未就绪，未发送。",
+            "Executor signing clock is not ready; not sent.",
+        ),
+        "not_dispatched_signing" => (
+            "执行器构造签名请求失败，未发送。",
+            "Executor could not construct the signed request; not sent.",
+        ),
+        "not_dispatched_intent" => (
+            "交易所适配器无法构造有效且明确的委托参数，未发送；需核对命令参数。",
+            "The exchange adapter could not prepare a valid, unambiguous order intent; not sent. Check command parameters.",
+        ),
+        "not_dispatched_order_rules" => (
+            "委托未通过该执行路径的交易对规则检查，未发送；并非交易所拒单。",
+            "The order failed instrument-rule checks in this execution path; not sent, not an exchange rejection.",
+        ),
+        "not_dispatched_position" => (
+            "平仓数量超出签名持仓可减范围，未发送。",
+            "Close quantity exceeds the reducible signed position; not sent.",
+        ),
+        "not_dispatched_payload" => (
+            "适配器构造的委托请求不完整或格式无效，未发送。",
+            "The prepared order payload is incomplete or invalid; not sent.",
+        ),
+        "not_dispatched_account_facts" => (
+            "该执行路径所需的签名账户事实未通过核验，未发送。",
+            "Signed account facts required by this execution path did not validate; not sent.",
+        ),
+        "not_dispatched_ledger_conflict" => (
+            "命令账本状态冲突，未发送；需核对对应命令记录。",
+            "Command ledger state conflict; not sent. Check the command record.",
         ),
         "not_dispatched_unavailable" => (
-            "发送前所需的账户数据、规则或服务不可用，未向交易所发单。",
-            "Required account facts, rules or service unavailable before dispatch; not sent to the exchange.",
+            "执行服务在发送前不可用，未发送；服务端未记录具体不可用环节。",
+            "Execution was unavailable before dispatch; not sent. The server did not record the specific unavailable stage.",
         ),
         "credential_unavailable" => (
             "执行器无法取得有效凭证，未向交易所发单。",
@@ -273,6 +353,51 @@ mod tests {
         assert!(!message.contains("must-not-render"));
         let malformed = http_error(502, b"APIKEY=must-not-render");
         assert!(malformed.contains("HTTP 502") && !malformed.contains("APIKEY"));
+    }
+
+    #[test]
+    fn pre_dispatch_feedback_does_not_guess_unrecorded_causes() {
+        for language in [Language::SimplifiedChinese, Language::English] {
+            let unknown = describe_command_code("not_dispatched_invalid", language);
+            assert!(!unknown.contains("签名账户") && !unknown.contains("signed account"));
+            assert!(!unknown.contains("数量/价格") && !unknown.contains("order rules"));
+            assert!(!unknown.contains("币安拒单") && !unknown.contains("Binance rejected"));
+            for code in [
+                "not_dispatched_binding",
+                "not_dispatched_quantity",
+                "not_dispatched_price",
+                "not_dispatched_direction",
+                "not_dispatched_order_type",
+                "not_dispatched_identity",
+                "not_dispatched_close_reservation",
+                "not_dispatched_cancel_target",
+                "not_dispatched_scope",
+                "not_dispatched_instrument_rules",
+                "not_dispatched_catalogue_unavailable",
+                "not_dispatched_clock_unavailable",
+                "not_dispatched_signing",
+                "not_dispatched_intent",
+                "not_dispatched_order_rules",
+                "not_dispatched_position",
+                "not_dispatched_payload",
+                "not_dispatched_account_facts",
+                "not_dispatched_ledger_conflict",
+            ] {
+                let reason = describe_command_code(code, language);
+                assert!(reason.contains(code));
+                assert!(
+                    !reason.contains("服务端返回此安全错误码")
+                        && !reason.contains("Safe server error code")
+                );
+                assert!(!reason.contains("币安拒单") && !reason.contains("Binance rejected"));
+            }
+        }
+        let rules = describe_command_code(
+            "not_dispatched_instrument_rules",
+            Language::SimplifiedChinese,
+        );
+        assert!(rules.contains("规则目录"));
+        assert!(!rules.contains("账户") && !rules.contains("名义"));
     }
 
     #[test]

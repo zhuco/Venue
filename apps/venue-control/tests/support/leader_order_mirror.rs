@@ -569,7 +569,7 @@ async fn mirror_sizing_and_revocation(
         assert_eq!(outcomes.len(), 2);
         for (state, code, native) in outcomes {
             assert_eq!(state, "rejected");
-            assert_eq!(code.as_deref(), Some("not_dispatched_invalid"));
+            assert_eq!(code.as_deref(), Some("not_dispatched_ledger_conflict"));
             assert!(native.is_none());
         }
         fixture.cleanup().await?;

@@ -38,12 +38,16 @@ impl PgExecutorStore {
             return serde_json::from_value(prepared.ok_or(BinanceCommandLedgerError::Conflict)?)
                 .map_err(|_| BinanceCommandLedgerError::Conflict);
         }
-        if prepared.is_some() || !self.terminal_open_credential_verified(command).await? {
+        if prepared.is_some() {
             return Err(BinanceCommandLedgerError::Conflict);
         }
         let projection =
             crate::private_projection::BinancePrivateProjectionStore::new(self.pool.clone())
-                .load_healthy_owned(&command.owner_user_id, &command.credential_id)
+                .load_terminal_positions(
+                    &command.owner_user_id,
+                    &command.credential_id,
+                    &command.trading_account_id,
+                )
                 .await
                 .map_err(|_| BinanceCommandLedgerError::Unavailable)?
                 .ok_or(BinanceCommandLedgerError::Conflict)?;

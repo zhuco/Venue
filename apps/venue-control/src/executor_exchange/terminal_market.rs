@@ -53,7 +53,9 @@ impl BinanceHttpExecution {
             ..
         } = request.order_kind
         else {
-            return Err(BinanceExecutionError::Invalid);
+            return Err(BinanceExecutionError::PreDispatch(
+                PreDispatchRejection::OrderType,
+            ));
         };
         if request.origin != venue_control_protocol::kol::ExecutorCommandOrigin::Terminal
             || context.quantity <= Decimal::ZERO
@@ -78,7 +80,7 @@ impl BinanceHttpExecution {
             self.next_attempt_id,
             now_ms()?,
         )
-        .map_err(|_| BinanceExecutionError::Invalid)?;
+        .map_err(|_| BinanceExecutionError::PreDispatch(PreDispatchRejection::Scope))?;
         self.next_attempt_id = self
             .next_attempt_id
             .checked_add(1)
@@ -115,7 +117,7 @@ impl BinanceHttpExecution {
                     reduce_only: reducing,
                 },
             )
-            .map_err(|_| BinanceExecutionError::Invalid)?;
+            .map_err(BinanceExecutionError::from)?;
             let timestamp = self
                 .transport
                 .signing_timestamp_ms()
