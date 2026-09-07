@@ -15,6 +15,9 @@ use crate::{
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
+#[cfg(not(target_arch = "wasm32"))]
+mod market_events;
+
 const STORAGE_KEY: &str = "venueflow-state-v1";
 const PERSISTED_SCHEMA_VERSION: u16 = 7;
 
@@ -46,6 +49,8 @@ pub struct VenueFlowApp {
     market_client: Option<LocalMarketClient>,
     #[cfg(not(target_arch = "wasm32"))]
     market_server: crate::model::MarketServer,
+    #[cfg(not(target_arch = "wasm32"))]
+    market_generation: u64,
     show_modules: bool,
     show_settings: bool,
     show_trading_settings: bool,
@@ -74,7 +79,8 @@ impl VenueFlowApp {
                 Ok(client) => (model, Some(client)),
                 Err(error) => {
                     let mut model = model;
-                    model.notice(format!("Local Binance market worker unavailable: {error}"));
+                    model.market_worker_failed = true;
+                    model.local_catalog_error = Some(format!("Market worker unavailable: {error}"));
                     (model, None)
                 }
             };
@@ -83,6 +89,8 @@ impl VenueFlowApp {
             account_center: crate::account_center::AccountCenter::new(&model.preferences.endpoint),
             #[cfg(not(target_arch = "wasm32"))]
             market_server: model.preferences.market_server,
+            #[cfg(not(target_arch = "wasm32"))]
+            market_generation: model.market_generation,
             model,
             workspaces: persisted.workspaces,
             client,
@@ -103,13 +111,22 @@ impl VenueFlowApp {
         if self.market_server != self.model.preferences.market_server {
             self.market_client.take();
             self.market_server = self.model.preferences.market_server;
-            self.model.local_symbols.clear();
-            self.model.local_precisions.clear();
-            self.model.local_quotes.clear();
-            self.model.history_requests.clear();
-            self.model.local_catalog_error = None;
-            self.model.trade_dock = crate::trading::TradeDockState::default();
-            self.market_client = LocalMarketClient::start_for(self.market_server).ok();
+            self.market_generation = self.model.market_generation;
+            self.workspaces.reset_chart_viewports();
+            self.market_client = match LocalMarketClient::start_for(self.market_server) {
+                Ok(client) => Some(client),
+                Err(error) => {
+                    self.model.market_worker_failed = true;
+                    self.model.local_catalog_error =
+                        Some(format!("Market worker unavailable: {error}"));
+                    None
+                }
+            };
+        }
+        if self.model.market_worker_failed || self.market_client.is_none() {
+            self.market_client.take();
+            let _ = self.model.local_markets.replace([]);
+            return;
         }
         let selections = self
             .workspaces
@@ -151,71 +168,16 @@ impl VenueFlowApp {
             return;
         };
         for event in client.drain(10_000) {
-            match event {
-                LocalMarketClientEvent::History { request, result } => {
-                    match self.model.local_markets.finish_history(&request, result) {
-                        Ok(added) => self.workspaces.history_prepended(
-                            &request.selection,
-                            added,
-                            &self.model.preferences.selected_symbol,
-                        ),
-                        Err(error) => {
-                            let _ = self
-                                .model
-                                .local_markets
-                                .finish_history(&request, Err(error.to_string()));
-                            self.model.notice(format!("History page rejected: {error}"));
-                        }
-                    }
-                }
-                LocalMarketClientEvent::Market(envelope) => {
-                    if let Err(error) = self.model.local_markets.apply(*envelope) {
-                        self.model
-                            .notice(format!("Ignored invalid local market event: {error}"));
-                    }
-                }
-                LocalMarketClientEvent::Catalog(symbols) => {
-                    self.model.apply_local_catalog(symbols);
-                    if self.market_server != crate::model::MarketServer::Binance
-                        && !self
-                            .model
-                            .local_symbols
-                            .contains(&self.model.preferences.selected_symbol)
-                    {
-                        let fallback = self
-                            .model
-                            .local_symbols
-                            .iter()
-                            .find(|s| s.starts_with("BTC/"))
-                            .or(self.model.local_symbols.first())
-                            .cloned();
-                        if let Some(symbol) = fallback {
-                            self.model.preferences.selected_symbol = symbol;
-                        }
-                    }
-                }
-                LocalMarketClientEvent::Quotes(quotes) => {
-                    self.model.apply_local_quotes(quotes);
-                }
-                LocalMarketClientEvent::QuotesUnavailable(error) => {
-                    self.model
-                        .notice(format!("Local Binance 24h quotes unavailable: {error}"));
-                }
-                LocalMarketClientEvent::CatalogUnavailable(error) => {
-                    self.model.local_catalog_error = Some(error.clone());
-                    self.model
-                        .notice(format!("Local Binance symbol catalog unavailable: {error}"));
-                }
-                LocalMarketClientEvent::ProxyDetected(detected) => {
-                    self.model.local_proxy_detected = detected;
-                }
-                LocalMarketClientEvent::RepaintRequested => context.request_repaint(),
-                LocalMarketClientEvent::WorkerFailed(error) => {
-                    self.model
-                        .notice(format!("Local Binance market worker stopped: {error}"));
-                }
-            }
+            market_events::apply(
+                &mut self.model,
+                &mut self.workspaces,
+                self.market_server,
+                self.market_generation,
+                event,
+                context,
+            );
         }
+
         for request in self.model.history_requests.drain(..) {
             if let Err(error) = client.load_older(request.clone()) {
                 let _ = self
@@ -232,65 +194,25 @@ impl VenueFlowApp {
     fn drain_client(&mut self) {
         let events = self.client.drain().take(5_000).collect::<Vec<_>>();
         for event in events {
+            let event = match event {
+                ClientEvent::AccountScoped { scope, event } => {
+                    if self.model.apply_account_event(&scope, *event) {
+                        ClientEvent::SessionExpired
+                    } else {
+                        continue;
+                    }
+                }
+                event => event,
+            };
             match event {
-                ClientEvent::SnapshotConnected => {
-                    self.model.snapshot_connected();
-                }
-                ClientEvent::TerminalAccountProjection {
-                    credential_id,
-                    projection,
-                } => {
-                    if self
-                        .model
-                        .account_overview
-                        .as_ref()
-                        .and_then(|overview| overview.selected_credential_id.as_deref())
-                        == Some(credential_id.as_str())
-                    {
-                        self.model
-                            .execution
-                            .apply_private(projection, &mut self.model.trade_dock);
-                    }
-                }
-                ClientEvent::TerminalExecutions(executions) => {
-                    self.model.execution.apply_terminal_executions(executions)
-                }
-                ClientEvent::TerminalExecutionUpdated(summary) => {
-                    self.model.execution.apply_terminal_execution(summary)
-                }
-                ClientEvent::TerminalExecutionsUnavailable(message) => {
-                    self.model.execution.terminal_executions_error = Some(message)
-                }
-                ClientEvent::TerminalSubmissionUnavailable {
-                    request_id,
-                    message,
-                    definitely_not_submitted,
-                } => {
-                    self.model
-                        .execution
-                        .position_submission_failed(&request_id, definitely_not_submitted);
-                    if self.model.execution.terminal_request_id.as_deref()
-                        == Some(request_id.as_str())
-                    {
-                        self.model.execution.terminal_submission_error = Some(message.clone());
-                        self.model.notice(message);
-                    }
-                }
-                ClientEvent::TerminalAccountUnavailable {
-                    credential_id,
-                    message,
-                } => {
-                    if self
-                        .model
-                        .account_overview
-                        .as_ref()
-                        .is_some_and(|overview| {
-                            overview.selected_credential_id.as_ref() == Some(&credential_id)
-                        })
-                    {
-                        self.model.execution.private_error = Some(message);
-                    }
-                }
+                ClientEvent::AccountScoped { .. }
+                | ClientEvent::TerminalAccountProjection { .. }
+                | ClientEvent::TerminalAccountUnavailable { .. }
+                | ClientEvent::TerminalExecutions(_)
+                | ClientEvent::TerminalExecutionUpdated(_)
+                | ClientEvent::TerminalExecutionsUnavailable(_)
+                | ClientEvent::TerminalSubmissionUnavailable { .. } => continue,
+                ClientEvent::SnapshotConnected => self.model.snapshot_connected(),
                 ClientEvent::GridInstances(instances) => {
                     self.model.execution.grid.apply_instances(instances)
                 }
@@ -440,14 +362,11 @@ impl VenueFlowApp {
                         )
                 },
             ));
-        let Some(credential_id) = self
-            .model
-            .account_overview
-            .as_ref()
-            .and_then(|overview| overview.selected_credential_id.clone())
-        else {
+        let Some(scope) = self.model.confirmed_account_scope() else {
+            self.client.clear_terminal_subscription();
             return;
         };
+        let credential_id = scope.credential_id.clone();
         let symbols = std::iter::once(&self.model.preferences.selected_symbol)
             .chain(self.model.preferences.favorite_symbols.iter())
             .filter_map(|symbol| symbol.parse().ok())
@@ -463,10 +382,13 @@ impl VenueFlowApp {
             return;
         }
         self.client
-            .subscribe_terminal(venue_control_protocol::kol::TerminalProjectionRequest {
-                schema_version: venue_control_protocol::kol::TERMINAL_PROJECTION_SCHEMA_VERSION,
-                credential_id,
-                symbols,
+            .subscribe_terminal(crate::account_scope::Scoped {
+                scope,
+                value: venue_control_protocol::kol::TerminalProjectionRequest {
+                    schema_version: venue_control_protocol::kol::TERMINAL_PROJECTION_SCHEMA_VERSION,
+                    credential_id,
+                    symbols,
+                },
             });
     }
 }
@@ -514,6 +436,18 @@ impl eframe::App for VenueFlowApp {
         ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
         self.model.synchronize_trading_scope();
         self.model.refresh_trading_price(ui.ctx());
+        ui::show_top_bar(
+            ui,
+            &mut self.model,
+            &mut self.workspaces,
+            &mut self.show_modules,
+            &mut self.show_trading_settings,
+            &mut self.show_execution_account,
+            &mut self.show_symbol_picker,
+        );
+        self.synchronize_private_projection();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.synchronize_local_markets();
         let accepts_trading_input = self.workspaces.active == crate::model::WorkspaceKind::Trading
             && !ui.ctx().egui_wants_keyboard_input()
             && !egui::Popup::is_any_open(ui.ctx())
@@ -537,15 +471,6 @@ impl eframe::App for VenueFlowApp {
                 crate::trade_dock::apply_action(&mut self.model, &self.client, action, ui.ctx());
             }
         }
-        ui::show_top_bar(
-            ui,
-            &mut self.model,
-            &mut self.workspaces,
-            &mut self.show_modules,
-            &mut self.show_trading_settings,
-            &mut self.show_execution_account,
-            &mut self.show_symbol_picker,
-        );
         if std::mem::take(&mut self.model.general_settings_requested) {
             self.settings_state.focus_general();
             self.show_settings = true;

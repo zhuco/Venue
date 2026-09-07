@@ -40,8 +40,12 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
     ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
 
     ui.horizontal(|ui| {
-        let scope = if model.preferences.execution_account_id.is_none() {
+        let scope = if model.account_switch_pending.is_some() {
+            "账户切换中 / Account switch pending"
+        } else if model.preferences.execution_account_id.is_none() {
             crate::i18n::text(language, crate::i18n::TextKey::NoExecutionAccount)
+        } else if model.market_worker_failed {
+            "行情不可用 / Market unavailable"
         } else if private_ready {
             "LIVE"
         } else {
@@ -451,7 +455,7 @@ pub fn apply_action(
             native_order_id: selection.native_order_id.clone(),
         };
         let request_id = request.request_id.clone();
-        match client.send_terminal_cancel(request) {
+        match client.send_terminal_cancel(request, model.confirmed_account_scope()) {
             Ok(()) => {
                 model.execution.chart_orders.submitted_cancel(
                     selection,
@@ -479,7 +483,7 @@ pub fn apply_action(
         }
     };
     let request_id = request.request_id.clone();
-    match client.send_terminal(request) {
+    match client.send_terminal(request, model.confirmed_account_scope()) {
         Ok(()) => {
             context.request_repaint();
             model.execution.begin_terminal_submission(request_id);
@@ -504,6 +508,12 @@ enum CancelSelectionError {
 fn terminal_cancel_selection(
     model: &AppModel,
 ) -> Result<&crate::trading::TerminalOrderSelection, CancelSelectionError> {
+    if model
+        .confirmed_account_scope()
+        .is_none_or(|s| s.venue != venue_control_protocol::VenueId::Binance)
+    {
+        return Err(CancelSelectionError::ScopeChanged);
+    }
     let selection = model
         .trade_dock
         .terminal_order_selection
@@ -551,7 +561,9 @@ fn terminal_request_parts(
     action: TradingAction,
     now: f64,
 ) -> Result<TerminalRequestParts, crate::trading::TradePlanError> {
-    if model.preferences.market_server != crate::model::MarketServer::Binance {
+    if model.market_worker_failed
+        || model.preferences.market_server != crate::model::MarketServer::Binance
+    {
         return Err(crate::trading::TradePlanError::UiOnlyAction);
     }
     if model
@@ -591,6 +603,13 @@ fn terminal_request_parts(
         TradingAction::CloseShort => TerminalAction::CloseShort,
         _ => return Err(crate::trading::TradePlanError::UiOnlyAction),
     };
+    if terminal_action.is_close()
+        && !model
+            .execution
+            .private_ready(model.preferences.execution_account_id.as_deref(), now_ms())
+    {
+        return Err(crate::trading::TradePlanError::NoPosition);
+    }
     let close_cap = terminal_action
         .is_close()
         .then(|| {
@@ -727,5 +746,158 @@ mod tests {
         model.account_overview = None;
         assert!(action_disabled_reason(&model, TradingAction::OpenLong, 1.0).is_some());
         Ok(())
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod switch_regressions {
+    use super::*;
+    use crate::account_scope::{
+        Scoped,
+        tests::{id, model, overview},
+    };
+    fn subscribe(client: &ControlClient, model: &AppModel) {
+        let scope = model.confirmed_account_scope().unwrap();
+        client.subscribe_terminal(Scoped {
+            value: venue_control_protocol::kol::TerminalProjectionRequest {
+                schema_version: 1,
+                credential_id: scope.credential_id.clone(),
+                symbols: vec!["BTC/USDC".parse().unwrap()],
+            },
+            scope,
+        });
+    }
+    #[test]
+    fn selection_pending_same_frame_mouse_hotkey_and_builders_send_zero() {
+        let mut model = model();
+        let (client, probe) = ControlClient::fixture();
+        subscribe(&client, &model);
+        model.trade_dock.select_price(100.into(), 0.0).unwrap();
+        let old_request = build_terminal_request(&mut model, TradingAction::OpenLong, 0.0).unwrap();
+        let context = egui::Context::default();
+        model.preferences.trading.hotkeys_enabled = true;
+        let mut output = context.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: Some(egui::Key::A),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                model.begin_account_selection(id(2));
+                // Exercise the mouse action sink and the real keyboard decoder in one frame.
+                apply_action(&mut model, &client, TradingAction::OpenLong, ui.ctx());
+                let actions: Vec<_> = ui.input(|i| {
+                    i.events
+                        .iter()
+                        .filter_map(|e| {
+                            crate::trading::hotkey_action(e, &model.preferences.trading)
+                        })
+                        .collect()
+                });
+                assert_eq!(actions, vec![TradingAction::OpenLong]);
+                for action in actions {
+                    apply_action(&mut model, &client, action, ui.ctx());
+                }
+                assert_eq!(probe.count(), 0);
+            },
+        );
+        output.textures_delta.clear();
+        for action in [
+            TradingAction::OpenLong,
+            TradingAction::OpenShort,
+            TradingAction::CloseLong,
+            TradingAction::CloseShort,
+            TradingAction::CancelSelectedOrder,
+            TradingAction::CancelAllOrders,
+        ] {
+            apply_action(&mut model, &client, action, &context);
+            if action.is_order_action() {
+                assert!(build_terminal_request(&mut model, action, 0.0).is_err());
+            }
+        }
+        assert!(
+            client
+                .send_terminal(old_request, model.confirmed_account_scope())
+                .is_err()
+        );
+        assert!(
+            client
+                .send_terminal_cancel(
+                    TerminalCancelRequest {
+                        schema_version: TERMINAL_SCHEMA_VERSION,
+                        request_id: id(81),
+                        credential_id: id(1),
+                        symbol: "BTC/USDC".parse().unwrap(),
+                        native_order_id: "1".into()
+                    },
+                    model.confirmed_account_scope()
+                )
+                .is_err()
+        );
+        assert!(
+            client
+                .send_position_action(
+                    venue_control_protocol::terminal_position::TerminalPositionActionRequest {
+                        schema_version: 1,
+                        request_id: id(82),
+                        credential_id: id(1),
+                        symbol: "BTC/USDC".parse().unwrap(),
+                        position_side: venue_domain::PositionSide::Long,
+                        quantity: 1.into(),
+                        action: venue_control_protocol::terminal_position::PositionAction::Close,
+                        market_risk_confirmed: true,
+                    },
+                    model.confirmed_account_scope()
+                )
+                .is_err()
+        );
+        assert_eq!(probe.count(), 0);
+    }
+    #[test]
+    fn selection_request_scope_comes_from_confirmed_account_and_stale_generation_is_rejected() {
+        let mut model = model();
+        let (client, probe) = ControlClient::fixture();
+        subscribe(&client, &model);
+        model.trade_dock.select_price(100.into(), 0.0).unwrap();
+        let request = build_terminal_request(&mut model, TradingAction::OpenLong, 0.0).unwrap();
+        let old = model.confirmed_account_scope().unwrap();
+        client
+            .send_terminal(request.clone(), Some(old.clone()))
+            .unwrap();
+        let submitted = probe.take_order();
+        assert_eq!(submitted.scope, old);
+        assert_eq!(submitted.value.credential_id, old.credential_id);
+        for server in crate::model::MarketServer::ALL.into_iter().skip(1) {
+            model.select_market_server(server);
+            model.select_trading_price("BTC/USDC", 100.into(), &egui::Context::default());
+            assert!(model.trade_dock.selected_price.is_none());
+            assert!(build_terminal_request(&mut model, TradingAction::OpenLong, 0.0).is_err());
+            assert_eq!(model.confirmed_account_scope(), Some(old.clone()));
+            client
+                .send_terminal_cancel(
+                    TerminalCancelRequest {
+                        schema_version: TERMINAL_SCHEMA_VERSION,
+                        request_id: id(81),
+                        credential_id: id(1),
+                        symbol: "BTC/USDC".parse().unwrap(),
+                        native_order_id: "1".into(),
+                    },
+                    model.confirmed_account_scope(),
+                )
+                .unwrap();
+            assert_eq!(probe.take_cancel().scope, old);
+        }
+        model.begin_account_selection(id(2));
+        model.apply_account_overview(overview(2));
+        model.begin_account_selection(id(1));
+        model.apply_account_overview(overview(1));
+        subscribe(&client, &model);
+        assert!(client.send_terminal(request, Some(old)).is_err());
+        assert_eq!(probe.count(), 0);
     }
 }

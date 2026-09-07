@@ -350,6 +350,8 @@ pub struct AppModel {
     pub execution: crate::execution_view::ExecutionViewState,
     pub account_overview: Option<venue_control_protocol::accounts::AccountOverview>,
     pub account_selection_requested: Option<String>,
+    pub(crate) account_generation: u64,
+    pub(crate) account_switch_pending: Option<String>,
     pub preferences: Preferences,
     /// Connectivity of this secret-free Control API client, not the account runtime projection.
     pub connection: ConnectionState,
@@ -380,6 +382,8 @@ pub struct AppModel {
     pub local_catalog_error: Option<String>,
     #[cfg(not(target_arch = "wasm32"))]
     pub local_proxy_detected: bool,
+    pub(crate) market_generation: u64,
+    pub(crate) market_worker_failed: bool,
     pub local_quotes: BTreeMap<String, MarketQuote>,
     pub symbol_filter: String,
     pub symbol_group: SymbolGroup,
@@ -427,6 +431,8 @@ impl AppModel {
             execution: crate::execution_view::ExecutionViewState::default(),
             account_overview: None,
             account_selection_requested: None,
+            account_generation: 0,
+            account_switch_pending: None,
             connection: ConnectionState::Connecting,
             control_connection: None,
             snapshot_online: false,
@@ -453,6 +459,8 @@ impl AppModel {
             local_catalog_error: None,
             #[cfg(not(target_arch = "wasm32"))]
             local_proxy_detected: false,
+            market_generation: 0,
+            market_worker_failed: false,
             local_quotes: BTreeMap::new(),
             symbol_filter: String::new(),
             symbol_group: SymbolGroup::All,
@@ -681,6 +689,9 @@ impl AppModel {
             return None;
         }
         let account_id = self.preferences.execution_account_id.as_deref()?;
+        if self.account_switch_pending.is_some() {
+            return None;
+        }
         let overview = self.account_overview.as_ref()?;
         let selected = overview.selected_credential_id.as_deref()?;
         if !overview.credentials.iter().any(|c| {
@@ -757,6 +768,10 @@ impl AppModel {
     }
 
     pub fn refresh_trading_price(&mut self, context: &egui::Context) {
+        if self.account_switch_pending.is_some() {
+            self.clear_trading_intent();
+            return;
+        }
         let now = context.input(|input| input.time);
         let validity_seconds = self.preferences.trading.price_validity_seconds;
         self.trade_dock.expire_price(now, validity_seconds);
@@ -769,6 +784,9 @@ impl AppModel {
     }
 
     pub fn select_trading_price(&mut self, symbol: &str, price: Decimal, context: &egui::Context) {
+        if self.account_switch_pending.is_some() || self.market_worker_failed {
+            return;
+        }
         if self.preferences.market_server != MarketServer::Binance {
             self.notice("当前行情为参考行情，手动选价仅支持 Binance / Reference market; manual pricing requires Binance");
             return;
@@ -788,6 +806,9 @@ impl AppModel {
     }
 
     pub fn clear_account_session(&mut self) {
+        self.account_generation = self.account_generation.saturating_add(1);
+        self.account_switch_pending = None;
+        self.clear_trading_intent();
         self.execution = crate::execution_view::ExecutionViewState::default();
         self.account_selection_requested = None;
         self.account_overview = None;
@@ -810,6 +831,9 @@ impl AppModel {
     pub fn selected_execution_credential(
         &self,
     ) -> Option<&venue_control_protocol::accounts::CredentialSummary> {
+        if self.account_switch_pending.is_some() {
+            return None;
+        }
         let overview = self.account_overview.as_ref()?;
         let selected = overview.selected_credential_id.as_deref()?;
         overview
@@ -822,6 +846,25 @@ impl AppModel {
         &mut self,
         overview: venue_control_protocol::accounts::AccountOverview,
     ) {
+        if let Some(wanted) = &self.account_switch_pending {
+            if self.account_generation == u64::MAX
+                || overview.selected_credential_id.as_ref() != Some(wanted)
+                || !overview.credentials.iter().any(|c| {
+                    &c.credential_id == wanted
+                        && c.trading_account_id.is_some()
+                        && self.account_overview.as_ref().is_some_and(|old| {
+                            old.credentials.iter().any(|prior| {
+                                prior.credential_id == c.credential_id
+                                    && prior.trading_account_id == c.trading_account_id
+                                    && prior.venue == c.venue
+                            })
+                        })
+                })
+            {
+                return;
+            }
+        }
+        let was_pending = self.account_switch_pending.take().is_some();
         let selected = overview
             .selected_credential_id
             .as_deref()
@@ -835,14 +878,11 @@ impl AppModel {
             || previous_credential != overview.selected_credential_id.as_ref()
         {
             self.preferences.selected_instance = None;
-            self.pending_confirmation = None;
-            self.execution.private_projection = None;
-            self.execution.terminal_executions.clear();
-            self.execution.private_error = None;
-            self.execution.terminal_executions_error = None;
-            self.execution.terminal_request_id = None;
-            self.execution.terminal_submission_error = None;
-            self.trade_dock.clear_order_selection();
+            if !was_pending {
+                self.account_generation = self.account_generation.saturating_add(1);
+            }
+            self.clear_trading_intent();
+            self.execution.clear_account_view();
         }
         self.preferences.execution_account_id = selected;
         self.account_overview = Some(overview);
@@ -869,9 +909,11 @@ impl AppModel {
         if self.preferences.market_server == server {
             return;
         }
+        self.market_generation = self.market_generation.saturating_add(1);
+        self.market_worker_failed = false;
+        self.clear_trading_intent();
         self.preferences.market_server = server;
         self.local_quotes.clear();
-        self.trade_dock = crate::trading::TradeDockState::default();
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.local_symbols.clear();

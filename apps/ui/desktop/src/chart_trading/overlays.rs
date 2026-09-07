@@ -32,10 +32,12 @@ pub(crate) fn collect(
     if let Some(projection) = model
         .execution
         .private_projection_for(model.preferences.execution_account_id.as_deref())
-        .filter(|_| {
-            model
-                .selected_execution_credential()
-                .is_none_or(|c| c.venue == model.preferences.market_server.venue())
+        .filter(|projection| {
+            model.selected_execution_credential().is_some_and(|c| {
+                c.venue == model.preferences.market_server.venue()
+                    && c.credential_id == projection.credential_id
+                    && c.trading_account_id.as_ref() == Some(&projection.trading_account_id)
+            })
         })
     {
         let fresh = model.execution.private_ready(

@@ -20,7 +20,7 @@ pub(crate) struct PositionActionDraft {
 
 #[derive(Debug, Default)]
 pub(super) struct PositionActions {
-    draft: Option<PositionActionDraft>,
+    pub(super) draft: Option<PositionActionDraft>,
     pending: Option<(String, PositionActionDraft)>,
 }
 
@@ -239,7 +239,8 @@ fn request(draft: &PositionActionDraft, request_id: String) -> TerminalPositionA
 
 fn submit(model: &mut AppModel, client: &ControlClient, draft: PositionActionDraft) {
     let id = model.next_terminal_request_id();
-    match client.send_position_action(request(&draft, id.clone())) {
+    match client.send_position_action(request(&draft, id.clone()), model.confirmed_account_scope())
+    {
         Ok(()) => {
             model.execution.position_actions.pending = Some((id.clone(), draft));
             model.execution.begin_terminal_submission(id);

@@ -46,6 +46,22 @@ pub struct ExecutionViewState {
 }
 
 impl ExecutionViewState {
+    pub(crate) fn clear_account_view(&mut self) {
+        self.private_projection = None;
+        self.private_received_ms = 0;
+        self.private_error = None;
+        self.terminal_executions.clear();
+        self.terminal_executions_error = None;
+        self.terminal_request_id = None;
+        self.terminal_submission_error = None;
+        self.position_actions = Default::default();
+        self.chart_orders = Default::default();
+    }
+
+    pub(crate) fn clear_position_confirmation(&mut self) {
+        self.position_actions.draft = None;
+    }
+
     pub fn begin_terminal_submission(&mut self, request_id: String) {
         self.terminal_request_id = Some(request_id);
         self.terminal_submission_error = None;

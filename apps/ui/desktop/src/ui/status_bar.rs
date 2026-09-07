@@ -33,7 +33,9 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
     } else {
         TextKey::Stale
     };
-    let node_status = if account_id.is_some() && model.execution.private_error.is_some() {
+    let node_status = if model.account_switch_pending.is_some() {
+        "账户切换中 / Account switch pending"
+    } else if account_id.is_some() && model.execution.private_error.is_some() {
         match language {
             crate::i18n::Language::SimplifiedChinese => "账户刷新失败",
             crate::i18n::Language::English => "Account refresh failed",
@@ -87,9 +89,16 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
         ));
     }
     let account_id = account_id.unwrap_or("—");
-    let account_label = model
-        .selected_execution_credential()
-        .map_or("—", |credential| credential.label.as_str());
+    let account_label = model.selected_execution_credential().map_or_else(
+        || {
+            if model.account_switch_pending.is_some() {
+                "切换中 / pending".to_owned()
+            } else {
+                "—".to_owned()
+            }
+        },
+        |c| format!("{} · {}", c.venue, c.label),
+    );
     let asset = private_projection.and_then(|projection| {
         selected_account_asset(&projection.assets, &model.preferences.selected_symbol)
     });
@@ -392,5 +401,64 @@ mod tests {
                 assets[0].available_margin
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod switch_tests {
+    use super::*;
+    fn texts(shape: &egui::Shape, output: &mut String) {
+        match shape {
+            egui::Shape::Text(t) => output.push_str(&t.galley.job.text),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, output)),
+            _ => (),
+        }
+    }
+    fn render(model: &mut AppModel) -> String {
+        let mut text = String::new();
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1800.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                show(ui, model);
+                crate::trade_dock::controls(ui, model);
+            },
+        );
+        output.textures_delta.clear();
+        for shape in output.shapes {
+            texts(&shape.shape, &mut text);
+        }
+        text
+    }
+    #[test]
+    fn selection_footer_separates_market_execution_and_pending_has_no_live() {
+        let mut model = crate::account_scope::tests::model();
+        model.select_market_server(crate::model::MarketServer::Bybit);
+        let text = render(&mut model);
+        assert!(
+            text.contains("Bybit") && text.contains("binance") && text.contains("account 1"),
+            "{text}"
+        );
+        model.select_market_server(crate::model::MarketServer::Binance);
+        model.execution.apply_private(
+            Some(crate::account_scope::tests::projection(1)),
+            &mut model.trade_dock,
+        );
+        model.market_worker_failed = true;
+        assert!(
+            !render(&mut model).contains("LIVE"),
+            "failed public worker cannot advertise actionable LIVE"
+        );
+        model.begin_account_selection(crate::account_scope::tests::id(2));
+        let text = render(&mut model);
+        assert!(text.contains("pending") && !text.contains("LIVE"), "{text}");
+        model.clear_account_session();
+        assert!(!render(&mut model).contains("LIVE"));
     }
 }

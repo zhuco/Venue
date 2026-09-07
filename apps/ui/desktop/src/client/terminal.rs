@@ -1,5 +1,6 @@
 #[cfg(not(target_arch = "wasm32"))]
 use super::{ClientEvent, REQUEST_TIMEOUT, path, publish};
+use crate::account_scope::{AccountScope, Scoped};
 #[cfg(not(target_arch = "wasm32"))]
 use venue_control_protocol::kol::{
     ExecutorCommandSummary, KOL_TERMINAL_CANCEL_PATH, KOL_TERMINAL_ORDER_PATH,
@@ -12,17 +13,17 @@ use venue_control_protocol::terminal_position::{
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) struct NativeTerminalQueues {
-    orders: crossbeam_channel::Receiver<TerminalOrderRequest>,
-    cancellations: crossbeam_channel::Receiver<TerminalCancelRequest>,
-    positions: crossbeam_channel::Receiver<TerminalPositionActionRequest>,
+    orders: crossbeam_channel::Receiver<Scoped<TerminalOrderRequest>>,
+    cancellations: crossbeam_channel::Receiver<Scoped<TerminalCancelRequest>>,
+    positions: crossbeam_channel::Receiver<Scoped<TerminalPositionActionRequest>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl NativeTerminalQueues {
     pub(super) fn new(
-        orders: crossbeam_channel::Receiver<TerminalOrderRequest>,
-        cancellations: crossbeam_channel::Receiver<TerminalCancelRequest>,
-        positions: crossbeam_channel::Receiver<TerminalPositionActionRequest>,
+        orders: crossbeam_channel::Receiver<Scoped<TerminalOrderRequest>>,
+        cancellations: crossbeam_channel::Receiver<Scoped<TerminalCancelRequest>>,
+        positions: crossbeam_channel::Receiver<Scoped<TerminalPositionActionRequest>>,
     ) -> Self {
         Self {
             orders,
@@ -57,10 +58,15 @@ pub(super) fn start_native(
     };
     tokio::spawn(async move {
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
-            for request in queues.positions.try_iter().take(1) {
+            for Scoped {
+                scope,
+                value: request,
+            } in queues.positions.try_iter().take(1)
+            {
                 if submitter
                     .submit(
                         TERMINAL_POSITION_ACTION_PATH,
+                        &scope,
                         &request.request_id,
                         &request,
                         "持仓操作",
@@ -70,10 +76,15 @@ pub(super) fn start_native(
                     return;
                 }
             }
-            for request in queues.orders.try_iter().take(32) {
+            for Scoped {
+                scope,
+                value: request,
+            } in queues.orders.try_iter().take(32)
+            {
                 if submitter
                     .submit(
                         KOL_TERMINAL_ORDER_PATH,
+                        &scope,
                         &request.request_id,
                         &request,
                         "terminal order",
@@ -83,10 +94,15 @@ pub(super) fn start_native(
                     return;
                 }
             }
-            for request in queues.cancellations.try_iter().take(32) {
+            for Scoped {
+                scope,
+                value: request,
+            } in queues.cancellations.try_iter().take(32)
+            {
                 if submitter
                     .submit(
                         KOL_TERMINAL_CANCEL_PATH,
+                        &scope,
                         &request.request_id,
                         &request,
                         "terminal exact cancel",
@@ -106,6 +122,7 @@ impl NativeTerminalSubmitter {
     async fn submit<T: serde::Serialize>(
         &self,
         route: &str,
+        scope: &AccountScope,
         request_id: &str,
         request: &T,
         label: &str,
@@ -124,13 +141,15 @@ impl NativeTerminalSubmitter {
                         if summary.validate().is_ok()
                             && summary.request_id.as_deref() == Some(request_id) =>
                     {
-                        publish(
+                        publish_scoped(
+                            scope,
                             &self.sender,
                             &self.context,
                             ClientEvent::TerminalExecutionUpdated(summary),
                         );
                     }
-                    _ => publish(
+                    _ => publish_scoped(
+                        scope,
                         &self.sender,
                         &self.context,
                         ClientEvent::TerminalSubmissionUnavailable {
@@ -145,7 +164,8 @@ impl NativeTerminalSubmitter {
                 false
             }
             Ok(response) if response.status().as_u16() == 401 => {
-                publish(
+                publish_scoped(
+                    scope,
                     &self.sender,
                     &self.context,
                     ClientEvent::TerminalSubmissionUnavailable {
@@ -157,13 +177,19 @@ impl NativeTerminalSubmitter {
                         ),
                     },
                 );
-                publish(&self.sender, &self.context, ClientEvent::SessionExpired);
-                true
+                publish_scoped(
+                    scope,
+                    &self.sender,
+                    &self.context,
+                    ClientEvent::SessionExpired,
+                );
+                false
             }
             Ok(response) => {
                 let status = response.status().as_u16();
                 let body = safe_error_body(response).await;
-                publish(
+                publish_scoped(
+                    scope,
                     &self.sender,
                     &self.context,
                     ClientEvent::TerminalSubmissionUnavailable {
@@ -175,7 +201,8 @@ impl NativeTerminalSubmitter {
                 false
             }
             Err(error) => {
-                publish(
+                publish_scoped(
+                    scope,
                     &self.sender,
                     &self.context,
                     ClientEvent::TerminalSubmissionUnavailable {
@@ -214,4 +241,75 @@ async fn safe_error_body(response: reqwest::Response) -> Vec<u8> {
         body.extend_from_slice(&chunk);
     }
     body
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn publish_scoped(
+    scope: &AccountScope,
+    sender: &crossbeam_channel::Sender<ClientEvent>,
+    context: &eframe::egui::Context,
+    event: ClientEvent,
+) {
+    publish(sender, context, scope.event(event));
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod race_tests {
+    use super::*;
+    use crate::account_scope::tests::{id, model, overview, receipt};
+    #[tokio::test]
+    async fn selection_http_barrier_submit_cancel_position_receipts_are_ui_scoped() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for route in [
+                KOL_TERMINAL_ORDER_PATH,
+                KOL_TERMINAL_CANCEL_PATH,
+                TERMINAL_POSITION_ACTION_PATH,
+            ] {
+                let mut model = model();
+                let scope = model.confirmed_account_scope().unwrap();
+                let (endpoint, seen, release, server) =
+                    crate::client::execution::race_tests::barrier_server(
+                        200,
+                        serde_json::to_string(&receipt(1)).unwrap(),
+                    )
+                    .await;
+                let (sender, events) = crossbeam_channel::unbounded();
+                let submitter = NativeTerminalSubmitter {
+                    client: reqwest::Client::builder().no_proxy().build().unwrap(),
+                    endpoint,
+                    sender,
+                    context: egui::Context::default(),
+                };
+                let worker = tokio::spawn(async move {
+                    submitter
+                        .submit(
+                            route,
+                            &scope,
+                            &id(81),
+                            &serde_json::json!({"request_id": id(81)}),
+                            "fixture",
+                        )
+                        .await
+                });
+                seen.await.unwrap();
+                model.begin_account_selection(id(2));
+                model.apply_account_overview(overview(2));
+                release.send(()).unwrap();
+                assert!(!worker.await.unwrap());
+                let ClientEvent::AccountScoped { scope, event } = events.try_recv().unwrap() else {
+                    panic!("untagged receipt");
+                };
+                assert!(matches!(*event, ClientEvent::TerminalExecutionUpdated(_)));
+                assert!(!model.accept_account_event(&scope, &event));
+                model.apply_account_event(&scope, *event);
+                assert!(model.execution.terminal_executions.is_empty());
+                assert!(
+                    model.execution.terminal_submission_error.is_none() && model.notices.is_empty()
+                );
+                server.await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
 }

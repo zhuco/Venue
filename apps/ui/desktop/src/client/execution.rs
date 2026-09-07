@@ -1,4 +1,5 @@
 use super::{ClientEvent, path, publish};
+use crate::account_scope::Scoped;
 use futures_util::StreamExt;
 use venue_control_protocol::kol::{
     ExecutorCommandSummary, KOL_EXECUTION_STATUS_PATH, KOL_TERMINAL_ACCOUNT_PATH,
@@ -109,8 +110,9 @@ pub(super) fn start_native(
     sender: crossbeam_channel::Sender<ClientEvent>,
     context: eframe::egui::Context,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    projection_requests: tokio::sync::watch::Receiver<Option<TerminalProjectionRequest>>,
+    projection_requests: tokio::sync::watch::Receiver<Option<Scoped<TerminalProjectionRequest>>>,
 ) {
+    let history_requests = projection_requests.clone();
     let history_client = client.clone();
     let history_endpoint = endpoint.clone();
     let history_sender = sender.clone();
@@ -118,27 +120,14 @@ pub(super) fn start_native(
     let history_stop = stop.clone();
     tokio::spawn(async move {
         while !history_stop.load(std::sync::atomic::Ordering::Acquire) {
-            let event = match tokio::time::timeout(
-                super::REQUEST_TIMEOUT,
-                fetch_terminal_executions(&history_client, &history_endpoint),
-            )
-            .await
-            {
-                Ok(Ok(executions)) => ClientEvent::TerminalExecutions(executions),
-                Ok(Err(TerminalReadError::SessionExpired)) => ClientEvent::SessionExpired,
-                Ok(Err(_)) => ClientEvent::TerminalExecutionsUnavailable(
-                    "历史委托读取失败，请检查 Control 连接。".into(),
-                ),
-                Err(_) => ClientEvent::TerminalExecutionsUnavailable(
-                    "历史委托读取超时，显示的记录可能已过期。".into(),
-                ),
-            };
-            if history_stop.load(std::sync::atomic::Ordering::Acquire) {
-                break;
+            let scope = history_requests.borrow().as_ref().map(|r| r.scope.clone());
+            if let Some(scope) = scope {
+                let event = history_read(&history_client, &history_endpoint, &scope).await;
+                if !history_stop.load(std::sync::atomic::Ordering::Acquire) {
+                    publish(&history_sender, &history_context, event);
+                }
             }
-            let expired = matches!(event, ClientEvent::SessionExpired);
-            publish(&history_sender, &history_context, event);
-            if expired {
+            if history_stop.load(std::sync::atomic::Ordering::Acquire) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -162,7 +151,7 @@ async fn projection_loop(
     sender: crossbeam_channel::Sender<ClientEvent>,
     context: eframe::egui::Context,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    mut requests: tokio::sync::watch::Receiver<Option<TerminalProjectionRequest>>,
+    mut requests: tokio::sync::watch::Receiver<Option<Scoped<TerminalProjectionRequest>>>,
 ) {
     while !stop.load(std::sync::atomic::Ordering::Acquire) {
         let request = requests.borrow_and_update().clone();
@@ -175,39 +164,15 @@ async fn projection_loop(
                     if changed.is_err() { break; }
                     continue;
                 }
-                result = tokio::time::timeout(
-                    super::REQUEST_TIMEOUT,
-                    fetch_terminal_projection(&client, &endpoint, &request),
-                ) => result,
+                result = projection_read(&client, &endpoint, &request) => result,
             };
             if stop.load(std::sync::atomic::Ordering::Acquire) {
                 break;
             }
-            let event = match result {
-                Ok(Ok(projection)) => ClientEvent::TerminalAccountProjection {
-                    credential_id: request.credential_id,
-                    projection,
-                },
-                Ok(Err(TerminalReadError::SessionExpired)) => ClientEvent::SessionExpired,
-                Ok(Err(TerminalReadError::Unavailable(message))) => {
-                    ClientEvent::TerminalAccountUnavailable {
-                        credential_id: request.credential_id,
-                        message,
-                    }
-                }
-                Err(_) => ClientEvent::TerminalAccountUnavailable {
-                    credential_id: request.credential_id,
-                    message: "Private account projection request timed out".into(),
-                },
-            };
-            let expired = matches!(event, ClientEvent::SessionExpired);
-            if !expired && requests.has_changed().unwrap_or(true) {
+            if requests.has_changed().unwrap_or(true) {
                 continue;
             }
-            publish(&sender, &context, event);
-            if expired {
-                break;
-            }
+            publish(&sender, &context, result);
         }
         tokio::select! {
             changed = requests.changed() => {
@@ -260,10 +225,18 @@ mod tests {
             Ok::<_, std::io::Error>(())
         });
         let symbol: venue_domain::Symbol = "DOGE/USDC".parse()?;
-        let request = |index| TerminalProjectionRequest {
-            schema_version: venue_control_protocol::kol::TERMINAL_PROJECTION_SCHEMA_VERSION,
-            credential_id: format!("00000000-0000-4000-8000-{index:012}"),
-            symbols: vec![symbol.clone()],
+        let request = |index| Scoped {
+            scope: crate::account_scope::AccountScope {
+                generation: index,
+                credential_id: format!("00000000-0000-4000-8000-{index:012}"),
+                trading_account_id: format!("account-{index}"),
+                venue: venue_control_protocol::VenueId::Binance,
+            },
+            value: TerminalProjectionRequest {
+                schema_version: venue_control_protocol::kol::TERMINAL_PROJECTION_SCHEMA_VERSION,
+                credential_id: format!("00000000-0000-4000-8000-{index:012}"),
+                symbols: vec![symbol.clone()],
+            },
         };
         let (requests_tx, requests_rx) = tokio::sync::watch::channel(Some(request(1)));
         let (events_tx, events_rx) = crossbeam_channel::unbounded();
@@ -278,25 +251,19 @@ mod tests {
         let first = tokio::time::timeout(Duration::from_secs(2), seen_rx.recv())
             .await?
             .ok_or("first request")?;
-        assert!(first.contains(&request(1).credential_id));
+        assert!(first.contains(&request(1).value.credential_id));
         for index in [2, 3] {
             requests_tx.send(Some(request(index)))?;
             let received = tokio::time::timeout(Duration::from_millis(750), seen_rx.recv())
                 .await?
                 .ok_or("switched request")?;
-            assert!(received.contains(&request(index).credential_id));
-            let event = tokio::time::timeout(Duration::from_millis(750), async {
-                loop {
-                    if let Ok(event) = events_rx.try_recv() {
-                        break event;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await?;
-            assert!(
-                matches!(event, ClientEvent::TerminalAccountProjection { credential_id, projection: None } if credential_id == request(index).credential_id)
-            );
+            assert!(received.contains(&request(index).value.credential_id));
+            let receiver = events_rx.clone();
+            let event =
+                tokio::task::spawn_blocking(move || receiver.recv_timeout(Duration::from_secs(2)))
+                    .await??;
+            assert!(matches!(event, ClientEvent::AccountScoped { scope, event }
+                if scope == request(index).scope && matches!(*event, ClientEvent::TerminalAccountProjection { projection: None, .. })));
         }
         drop(requests_tx);
         tokio::time::timeout(Duration::from_secs(1), worker).await??;
@@ -305,3 +272,59 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn history_read(
+    client: &reqwest::Client,
+    endpoint: &str,
+    scope: &crate::account_scope::AccountScope,
+) -> ClientEvent {
+    let event = match tokio::time::timeout(
+        super::REQUEST_TIMEOUT,
+        fetch_terminal_executions(client, endpoint),
+    )
+    .await
+    {
+        Ok(Ok(executions)) => ClientEvent::TerminalExecutions(executions),
+        Ok(Err(TerminalReadError::SessionExpired)) => ClientEvent::SessionExpired,
+        Ok(Err(_)) => ClientEvent::TerminalExecutionsUnavailable(
+            "历史委托读取失败，请检查 Control 连接。".into(),
+        ),
+        Err(_) => ClientEvent::TerminalExecutionsUnavailable(
+            "历史委托读取超时，显示的记录可能已过期。".into(),
+        ),
+    };
+    scope.event(event)
+}
+#[cfg(not(target_arch = "wasm32"))]
+async fn projection_read(
+    client: &reqwest::Client,
+    endpoint: &str,
+    request: &Scoped<TerminalProjectionRequest>,
+) -> ClientEvent {
+    let result = tokio::time::timeout(
+        super::REQUEST_TIMEOUT,
+        fetch_terminal_projection(client, endpoint, &request.value),
+    )
+    .await;
+    let event = match result {
+        Ok(Ok(projection)) => ClientEvent::TerminalAccountProjection {
+            credential_id: request.value.credential_id.clone(),
+            projection,
+        },
+        Ok(Err(TerminalReadError::SessionExpired)) => ClientEvent::SessionExpired,
+        Ok(Err(TerminalReadError::Unavailable(message))) => {
+            ClientEvent::TerminalAccountUnavailable {
+                credential_id: request.value.credential_id.clone(),
+                message,
+            }
+        }
+        Err(_) => ClientEvent::TerminalAccountUnavailable {
+            credential_id: request.value.credential_id.clone(),
+            message: "Private account projection request timed out".into(),
+        },
+    };
+    request.scope.event(event)
+}
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(super) mod race_tests;

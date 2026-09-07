@@ -1,5 +1,6 @@
 mod account_center;
 mod account_client;
+mod account_scope;
 mod app;
 mod chart;
 mod chart_settings;

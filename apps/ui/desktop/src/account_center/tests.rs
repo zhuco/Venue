@@ -101,6 +101,7 @@ fn switching_execution_account_keeps_authenticated_connection_and_clears_old_pri
     selected.trading_account_id = Some("00000000-0000-4000-8000-000000000002".into());
     next.selected_credential_id = Some(selected.credential_id.clone());
     next.credentials.push(selected.clone());
+    state.request_generation = model.account_generation;
     assert!(
         state
             .client
@@ -118,6 +119,7 @@ fn switching_execution_account_keeps_authenticated_connection_and_clears_old_pri
 
     let mut removed = overview();
     removed.selected_credential_id = None;
+    state.request_generation = model.account_generation;
     assert!(
         state
             .client
@@ -651,4 +653,65 @@ fn expiry_and_logout_keep_remembered_password_but_never_auto_login() {
     assert!(!state.password.is_empty());
     assert!(!state.poll(&mut model, &egui::Context::default()));
     assert!(!state.busy);
+}
+
+#[test]
+fn selection_failed_response_and_superseded_overview_or_401_cannot_restore_account() {
+    use crate::account_scope::tests::{id, model as fixture_model, overview as fixture_overview};
+    let mut model = fixture_model();
+    let mut state = AccountCenter {
+        session: Some(SessionResponse {
+            user: fixture_overview(1).user,
+            token: SecretValue::new("fixture".into()),
+            expires_ms: now_ms() + 60_000,
+        }),
+        request_generation: model.account_generation,
+        busy: true,
+        next_refresh_ms: u64::MAX,
+        ..Default::default()
+    };
+    model.begin_account_selection(id(2));
+    model.account_selection_requested = None;
+    // A request issued before B was selected cannot expire the shared session.
+    state
+        .client
+        .test_sender()
+        .send(Err(AccountErrorCode::Unauthorized))
+        .unwrap();
+    state.poll(&mut model, &egui::Context::default());
+    assert!(state.session.is_some() && state.error.is_none());
+    assert!(model.confirmed_account_scope().is_none());
+    state.request_generation = model.account_generation;
+    state.busy = true;
+    state
+        .client
+        .test_sender()
+        .send(Err(AccountErrorCode::Unavailable))
+        .unwrap();
+    state.poll(&mut model, &egui::Context::default());
+    assert_eq!(state.error, Some(AccountErrorCode::Unavailable));
+    assert!(model.confirmed_account_scope().is_none());
+    let b_generation = model.account_generation;
+    model.begin_account_selection(id(3));
+    model.account_selection_requested = None;
+    state.request_generation = b_generation;
+    state
+        .client
+        .test_sender()
+        .send(Ok(AccountResult::Overview(fixture_overview(2))))
+        .unwrap();
+    state.poll(&mut model, &egui::Context::default());
+    assert!(model.confirmed_account_scope().is_none());
+    state.request_generation = model.account_generation;
+    state
+        .client
+        .test_sender()
+        .send(Ok(AccountResult::Overview(fixture_overview(3))))
+        .unwrap();
+    state.poll(&mut model, &egui::Context::default());
+    assert_eq!(
+        model.confirmed_account_scope().unwrap().credential_id,
+        id(3)
+    );
+    assert!(model.trade_dock.selected_price.is_none());
 }

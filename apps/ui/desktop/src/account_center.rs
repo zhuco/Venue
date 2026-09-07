@@ -22,6 +22,7 @@ pub(crate) struct AccountCenter {
     pub session: Option<SessionResponse>,
     client: AccountClient,
     busy: bool,
+    request_generation: u64,
     registering: bool,
     adding: bool,
     username: String,
@@ -127,6 +128,9 @@ impl AccountCenter {
         let mut reconnect = std::mem::take(&mut self.reconnect_requested);
         for result in events {
             self.busy = false;
+            if self.request_generation != model.account_generation {
+                continue;
+            }
             match result {
                 Ok(AccountResult::Session(session, overview)) => {
                     if session.user != overview.user || session.expires_ms <= now_ms() {
@@ -206,6 +210,7 @@ impl AccountCenter {
         if self.busy {
             return;
         }
+        self.request_generation = model.account_generation;
         self.busy = true;
         self.error = None;
         self.next_refresh_ms = now_ms().saturating_add(30_000);
@@ -645,11 +650,7 @@ fn show_credentials_table(
                                 )
                                 .clicked()
                             {
-                                state.submit(
-                                    AccountAction::Select(credential.credential_id.clone()),
-                                    model,
-                                    ui.ctx(),
-                                );
+                                model.begin_account_selection(credential.credential_id.clone());
                             }
                         });
                         account_cell(ui, widths[6], |ui| {

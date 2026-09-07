@@ -269,8 +269,8 @@ pub fn show_top_bar(
             if model.preferences.market_server != market_server {
                 model.select_market_server(market_server);
             }
-            if account_selection_requested.is_some() {
-                model.account_selection_requested = account_selection_requested;
+            if let Some(id) = account_selection_requested {
+                model.begin_account_selection(id);
             }
             model.symbol_filter = symbol_filter;
             *show_symbol_picker = picker_requested.get();
@@ -1508,6 +1508,10 @@ fn format_freshness(age_ms: Option<u64>) -> String {
     })
 }
 fn market<'a>(model: &'a AppModel, symbol: &str) -> Option<&'a MarketSummary> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if model.market_generation > 0 || model.market_worker_failed {
+        return None;
+    }
     if model.preferences.market_server != crate::model::MarketServer::Binance {
         return None;
     }
@@ -1524,7 +1528,8 @@ pub(crate) fn available_symbols(model: &AppModel) -> Vec<String> {
         return model.local_symbols.clone();
     }
     #[cfg(not(target_arch = "wasm32"))]
-    if !model.local_symbols.is_empty() {
+    if model.market_generation > 0 || model.market_worker_failed || !model.local_symbols.is_empty()
+    {
         return model.local_symbols.clone();
     }
     model

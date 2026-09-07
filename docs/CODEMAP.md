@@ -80,6 +80,8 @@
 | 统一机器人列表、带单编辑及启停 | `apps/ui/desktop/src/leader_bot_view.rs` |
 | Grid 模态配置和生命周期 | `apps/ui/desktop/src/grid_view.rs`、`client/grid.rs` |
 | 账户/API/系统登录凭据库 | `apps/ui/desktop/src/account_client.rs`、`account_center/` |
+| 桌面账户切换代次与迟到结果过滤 | `apps/ui/desktop/src/account_scope.rs`、`account_scope/tests.rs`、`client/execution/race_tests.rs` |
+| 桌面行情切换应用边界 | `apps/ui/desktop/src/app/market_events.rs`、`app/market_events/tests.rs` |
 | 私有持仓、委托、成交、资产与历史 | `apps/ui/desktop/src/execution_view.rs`、`client/execution.rs` |
 | 逐行平仓/反开、下单及反馈 | `apps/ui/desktop/src/execution_view/position_actions.rs`、`trade_dock.rs`、`terminal_feedback.rs` |
 | 当前账户 SSE 与写入状态门 | `apps/ui/desktop/src/client/stream_gates.rs`、`ui/status_bar.rs` |

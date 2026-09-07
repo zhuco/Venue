@@ -432,18 +432,8 @@ fn cancel_pending_keeps_unknown_and_waits_for_matching_account_absence()
 #[test]
 fn action_revalidates_account_and_order_and_unknown_quantity_is_not_zero()
 -> Result<(), Box<dyn std::error::Error>> {
-    use venue_control_protocol::accounts::{AccountOverview, UserSummary};
     let target = selection()?;
-    let mut model = crate::model::AppModel::new(Default::default());
-    model.preferences.execution_account_id = Some(target.trading_account_id.clone());
-    model.account_overview = Some(AccountOverview {
-        user: UserSummary {
-            user_id: "fixture-user".into(),
-            username: "fixture".into(),
-        },
-        credentials: vec![],
-        selected_credential_id: Some(target.credential_id.clone()),
-    });
+    let mut model = model_fixture()?;
     model
         .execution
         .apply_private(Some(projection()?), &mut model.trade_dock);
@@ -485,18 +475,14 @@ fn action_revalidates_account_and_order_and_unknown_quantity_is_not_zero()
 }
 
 fn model_fixture() -> Result<crate::model::AppModel, Box<dyn std::error::Error>> {
-    use venue_control_protocol::accounts::{AccountOverview, UserSummary};
     let target = selection()?;
     let mut model = crate::model::AppModel::new(Default::default());
-    model.preferences.execution_account_id = Some(target.trading_account_id);
-    model.account_overview = Some(AccountOverview {
-        user: UserSummary {
-            user_id: "fixture-user".into(),
-            username: "fixture".into(),
-        },
-        credentials: vec![],
-        selected_credential_id: Some(target.credential_id),
-    });
+    let mut overview = crate::account_scope::tests::overview(1);
+    overview.credentials.truncate(1);
+    overview.credentials[0].credential_id = target.credential_id.clone();
+    overview.credentials[0].trading_account_id = Some(target.trading_account_id);
+    overview.selected_credential_id = Some(target.credential_id);
+    model.apply_account_overview(overview);
     Ok(model)
 }
 

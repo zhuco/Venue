@@ -128,6 +128,20 @@ impl Default for Workspaces {
 }
 
 impl Workspaces {
+    pub(crate) fn reset_chart_viewports(&mut self) {
+        for tree in [
+            &mut self.trading,
+            &mut self.operations,
+            &mut self.multi_chart,
+        ] {
+            for (_, tile) in tree.tiles.iter_mut() {
+                if let Tile::Pane(pane) = tile {
+                    pane.viewport = Default::default();
+                }
+            }
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub fn history_prepended(
         &mut self,

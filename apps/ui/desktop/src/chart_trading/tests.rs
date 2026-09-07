@@ -50,7 +50,11 @@ fn no_account_does_not_create_private_price_lines() {
 fn private_overlays_obey_account_symbol_and_visibility() -> Result<(), Box<dyn std::error::Error>> {
     use venue_control_protocol::kol::*;
     let mut model = crate::model::AppModel::new(crate::model::Preferences::default());
-    model.preferences.execution_account_id = Some("selected-account".into());
+    let mut overview = crate::account_scope::tests::overview(1);
+    overview.credentials[0].credential_id = "credential".into();
+    overview.credentials[0].trading_account_id = Some("selected-account".into());
+    overview.selected_credential_id = Some("credential".into());
+    model.apply_account_overview(overview);
     let projection = TerminalAccountProjection {
         schema_version: TERMINAL_PROJECTION_SCHEMA_VERSION,
         credential_id: "credential".into(),
@@ -244,4 +248,31 @@ fn menu_layout_checkbox_submenu_and_outside_click() -> Result<(), Box<dyn std::e
     harness.click(egui::pos2(390.0, 430.0));
     assert!(!egui::Popup::is_any_open(&harness.context));
     Ok(())
+}
+
+#[test]
+fn selection_overlays_require_confirmed_matching_venue_and_account() {
+    let mut model = crate::account_scope::tests::model();
+    let mut projection = crate::account_scope::tests::projection(1);
+    projection
+        .positions
+        .push(venue_control_protocol::kol::TerminalPosition {
+            symbol: "BTC/USDC".parse().unwrap(),
+            position_side: venue_domain::PositionSide::Long,
+            quantity: Decimal::ONE,
+            entry_price: Some(100.into()),
+            mark_price: Some(101.into()),
+        });
+    model
+        .execution
+        .apply_private(Some(projection), &mut model.trade_dock);
+    let settings = ChartTradingSettings::default();
+    assert!(!collect(&model, "BTC/USDC", &settings).is_empty());
+    for server in crate::model::MarketServer::ALL.into_iter().skip(1) {
+        model.select_market_server(server);
+        assert!(collect(&model, "BTC/USDC", &settings).is_empty());
+    }
+    model.select_market_server(crate::model::MarketServer::Binance);
+    model.account_overview = None;
+    assert!(collect(&model, "BTC/USDC", &settings).is_empty());
 }
