@@ -6,7 +6,7 @@ use venue_domain::{OrderSide, PositionSide};
 use crate::kol_executor::{BinanceCommandLedgerError, scaled_copy_quantity};
 
 /// A minimum-notional opening can be larger than its proportional source size.
-/// If the leader subsequently closes substantially all of that exact source lot,
+/// If the leader subsequently closes substantially the same source notional,
 /// the follower must unwind the established child lot rather than leave the
 /// minimum-up remainder open forever.
 #[derive(Clone, Debug)]
@@ -113,24 +113,38 @@ pub(super) fn close_quantity_with_minimum_uplift(
                     .created_ms
                     .zip(close.created_ms)
                     .is_some_and(|(opened, closed)| opened < closed)
-                // A source close within one percent of the source opening is
-                // its practical full exit after source-lot rounding.
-                && opening
-                    .source
-                    .quantity
-                    .checked_mul(Decimal::from(99))
-                    .is_some_and(|needed| {
-                        close
-                            .quantity
-                            .checked_mul(Decimal::from(100))
-                            .is_some_and(|covered| covered >= needed)
-                    })
+                && substantially_same_source_notional(close, &opening.source)
         })
         .max_by_key(|opening| opening.source.created_ms)
     else {
         return proportional_quantity;
     };
     proportional_quantity.max(opening.child_quantity)
+}
+
+fn substantially_same_source_notional(
+    close: &TerminalOpenOrder,
+    opening: &TerminalOpenOrder,
+) -> bool {
+    let Some(opening_notional) = opening
+        .limit_price
+        .and_then(|price| opening.quantity.checked_mul(price))
+    else {
+        return false;
+    };
+    let Some(close_notional) = close
+        .limit_price
+        .and_then(|price| close.quantity.checked_mul(price))
+    else {
+        return false;
+    };
+    let Some(lower) = opening_notional.checked_mul(Decimal::new(99, 2)) else {
+        return false;
+    };
+    let Some(upper) = opening_notional.checked_mul(Decimal::new(101, 2)) else {
+        return false;
+    };
+    close_notional >= lower && close_notional <= upper
 }
 
 #[cfg(test)]
@@ -241,12 +255,14 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut open = order()?;
         open.quantity = Decimal::from(281);
+        open.limit_price = Some(Decimal::new(8876, 5));
         open.created_ms = Some(1001);
         let mut close = open.clone();
         close.native_order_id = Some("close-1".into());
         close.client_order_id = "close-client".into();
         close.order_side = OrderSide::Sell;
-        close.quantity = Decimal::from(280);
+        close.quantity = Decimal::from(278);
+        close.limit_price = Some(Decimal::new(8983, 5));
         close.created_ms = Some(1002);
         let opening = MinimumUpliftedOpen {
             source: open,
