@@ -283,14 +283,15 @@ pub(super) async fn plan_relation(pool: &PgPool, relation: &str, now: u64) -> Re
         let original: TerminalOpenOrder =
             serde_json::from_value(mirror.try_get("source_order_json").map_err(unavailable)?)
                 .map_err(|_| Error::Conflict)?;
+        // A signed live child can precede its follower stream event. Absence from that
+        // projection is not a retirement intent; only source/lifecycle changes cancel it.
         let obsolete = !active
             || number(&mirror, "relation_revision")? != number(&row, "revision")?
             || number(&mirror, "bot_revision")? != number(&row, "bot_revision")?
             || (source.is_some()
                 && desired
                     .get(&key)
-                    .is_none_or(|order| !same_terms(order, &original)))
-            || (state == "live" && follower.is_some() && child.is_none());
+                    .is_none_or(|order| !same_terms(order, &original)));
         if obsolete
             && state == "pending"
             && mirror

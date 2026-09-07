@@ -637,6 +637,35 @@ async fn mirror_sizing_and_revocation(
     sqlx::query("UPDATE venue_binance_commands SET command_state='reconciled',native_order_id='child-124',terminal_ms=$1 WHERE command_id=$2")
         .bind(i64::try_from(test_now_ms()?)?).bind(&gtc_child).execute(&fixture.pool).await?;
     sqlx::query("UPDATE venue_order_mirrors SET mirror_state='live',child_native_order_id='child-124' WHERE source_order_id='124'").execute(&fixture.pool).await?;
+    // RESULT/exact readback can precede the follower stream's NEW event. Even a healthy
+    // projection with a newer observation clock is not a request to retire that child.
+    persist_projection(
+        &fixture.pool,
+        &follower,
+        &follower_account,
+        &follower_credential,
+        vec![],
+        test_now_ms()?,
+    )
+    .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM venue_binance_commands WHERE command_phase='cancel'"
+        )
+        .fetch_one(&fixture.pool)
+        .await?,
+        0,
+        "a lagging follower projection must not cancel a signed live child"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT mirror_state FROM venue_order_mirrors WHERE source_order_id='124'"
+        )
+        .fetch_one(&fixture.pool)
+        .await?,
+        "live"
+    );
     // A pause may cancel the queued command independently of the planner; the mapping must drain.
     sqlx::query("UPDATE venue_binance_commands SET command_state='cancelled',terminal_ms=$1 WHERE command_id=$2 AND command_state='pending'").bind(i64::try_from(test_now_ms()?)?).bind(&child).execute(&fixture.pool).await?;
     set_permission(&fixture.pool, &kol, false, 1, "fixture", test_now_ms()?).await?;
@@ -847,6 +876,25 @@ async fn market_is_planned_once_and_stop_create_modify_cancel_keep_exact_algo_id
         .bind(i64::try_from(test_now_ms()?)?).bind(&stop_place).execute(&fixture.pool).await?;
     sqlx::query("UPDATE venue_order_mirrors SET mirror_state='live',child_native_order_id='child-stop-1' WHERE source_kind='stop'")
         .execute(&fixture.pool).await?;
+    persist_projection_with_conditionals(
+        &fixture.pool,
+        &follower,
+        &follower_account,
+        &follower_credential,
+        vec![],
+        test_now_ms()?,
+    )
+    .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM venue_binance_commands WHERE order_kind='cancel_algo_exact'"
+        )
+        .fetch_one(&fixture.pool)
+        .await?,
+        0,
+        "a missing follower stream event must not cancel a confirmed stop"
+    );
     let child_stop = conditional(&stop_place, "child-stop-1", "49000", now - 1);
     let changed_stop = conditional("source-stop", "stop-1", "48000", now - 1);
     let refreshed = test_now_ms()?;

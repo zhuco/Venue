@@ -270,25 +270,12 @@ pub(super) async fn plan_relation(pool: &PgPool, relation: &str, now: u64) -> Re
             latest.insert(key, mirror);
             continue;
         }
-        let child_client_order_id = text(&mirror, "child_client_order_id")?;
-        let child_native_order_id = mirror
-            .try_get::<Option<String>, _>("child_native_order_id")
-            .map_err(unavailable)?;
-        let stop_child = matches!(original, ExtendedSource::Stop { .. })
-            && follower.as_ref().is_some_and(|p| {
-                p.conditional_orders.iter().any(|o| {
-                    o.client_order_id == child_client_order_id
-                        && child_native_order_id.as_deref() == Some(o.native_order_id.as_str())
-                })
-            });
+        // Exact Algo readback can confirm a stop before the follower projection contains it.
+        // Keep that identity until a source/lifecycle change requires cancellation.
         let obsolete = !active
             || number(&mirror, "relation_revision")? != number(&row, "revision")?
             || number(&mirror, "bot_revision")? != number(&row, "bot_revision")?
-            || (source.is_some() && desired.get(&key).is_none_or(|current| current != &original))
-            || (state == "live"
-                && matches!(original, ExtendedSource::Stop { .. })
-                && follower.is_some()
-                && !stop_child);
+            || (source.is_some() && desired.get(&key).is_none_or(|current| current != &original));
         if obsolete
             && state == "pending"
             && mirror
