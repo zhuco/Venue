@@ -914,11 +914,11 @@ pub fn decimal_to_f64(value: Decimal) -> f64 {
     value.to_string().parse::<f64>().unwrap_or_default()
 }
 
-pub fn format_decimal(value: Decimal, precision: usize) -> String {
-    value
-        .round_dp(precision.min(28) as u32)
-        .normalize()
-        .to_string()
+pub fn format_decimal(mut value: Decimal, precision: usize) -> String {
+    let precision = precision.min(28) as u32;
+    value = value.round_dp(precision);
+    value.rescale(precision);
+    value.to_string()
 }
 
 #[cfg(test)]
@@ -1185,21 +1185,25 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn exchange_precision_is_used_without_padding_trailing_zeroes() {
+    fn exchange_precision_is_used_with_trailing_zeroes() {
         let mut model = AppModel::new(Preferences::default());
         model.apply_local_catalog(vec![super::MarketInstrument {
             symbol: "SOL/USDC".to_owned(),
-            price_scale: 4,
+            price_scale: 5,
             quantity_scale: 3,
         }]);
 
         assert_eq!(
             model.format_market_price("SOL/USDC", Decimal::new(104_900, 3)),
-            "104.9"
+            "104.90000"
         );
         assert_eq!(
             model.format_market_quantity("SOL/USDC", Decimal::new(12_340, 3)),
-            "12.34"
+            "12.340"
+        );
+        assert_eq!(
+            model.format_market_price("SOL/USDC", Decimal::new(889, 4)),
+            "0.08890"
         );
     }
 

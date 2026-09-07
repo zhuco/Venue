@@ -156,7 +156,7 @@ pub(crate) fn candle_plot(
     };
     let sub_rects = (0..sub_count).map(|_| next_sub_rect()).collect::<Vec<_>>();
     let price_range = overlay_price_range(bars, all_studies, settings)?;
-    let selected_index = response
+    let hovered_index = response
         .hover_pos()
         .filter(|point| plot_rect.contains(*point))
         .and_then(|point| {
@@ -167,8 +167,8 @@ pub(crate) fn candle_plot(
                 point.x,
             )
         })
-        .filter(|index| *index < bars.len())
-        .or_else(|| bars.len().checked_sub(1));
+        .filter(|index| *index < bars.len());
+    let selected_index = hovered_index.or_else(|| bars.len().checked_sub(1));
     let width = price_rect.width() / display_slots as f32;
     let price_y = |price: f64| {
         price_range
@@ -187,7 +187,7 @@ pub(crate) fn candle_plot(
         painter.text(
             Pos2::new(price_rect.right() - 3.0, y - 2.0),
             Align2::RIGHT_BOTTOM,
-            format_f64_trimmed(price, price_scale),
+            format_f64_fixed(price, price_scale),
             FontId::monospace(f32::from(settings.chart_text_size)),
             theme::TEXT_SECONDARY,
         );
@@ -332,11 +332,12 @@ pub(crate) fn candle_plot(
             );
         }
     }
+    let latest_price = market_price.or_else(|| all_bars.last().map(|bar| bar.close));
     let mut trading_overlays = overlays.to_vec();
     for (enabled, price, color, name) in [
         (
             trading_display.last_price,
-            market_price.or_else(|| all_bars.last().map(|bar| bar.close)),
+            latest_price,
             theme::TEXT_SECONDARY,
             "",
         ),
@@ -416,10 +417,15 @@ pub(crate) fn candle_plot(
         .hover_pos()
         .filter(|point| content_rect.contains(*point))
     {
+        let snapped_x = hovered_index
+            .and_then(|index| {
+                bar_center_x(price_rect.left(), price_rect.width(), display_slots, index)
+            })
+            .unwrap_or(pointer.x);
         painter.extend(egui::Shape::dashed_line(
             &[
-                Pos2::new(pointer.x, content_rect.top()),
-                Pos2::new(pointer.x, content_rect.bottom()),
+                Pos2::new(snapped_x, content_rect.top()),
+                Pos2::new(snapped_x, content_rect.bottom()),
             ],
             Stroke::new(1.0, theme::TEXT_SECONDARY),
             5.0,
@@ -438,12 +444,14 @@ pub(crate) fn candle_plot(
             if let Some(price) =
                 price_range.y_to_price(price_rect.top(), price_rect.height(), pointer.y)
             {
-                painter.text(
-                    Pos2::new(price_rect.right() - 4.0, pointer.y - 4.0),
-                    Align2::RIGHT_BOTTOM,
-                    format_f64_trimmed(price, price_scale),
-                    FontId::monospace(f32::from(settings.chart_text_size)),
-                    theme::TEXT_PRIMARY,
+                draw_hover_price_readout(
+                    &painter,
+                    price_rect,
+                    pointer.y,
+                    price,
+                    latest_price,
+                    price_scale,
+                    settings.chart_text_size,
                 );
             }
         }
@@ -469,7 +477,7 @@ pub(crate) fn candle_plot(
         .and_then(|pointer| {
             price_range.y_to_price(price_rect.top(), price_rect.height(), pointer.y)
         })
-        .and_then(|price| format_f64_trimmed(price, price_scale).parse().ok())
+        .and_then(|price| format_f64_fixed(price, price_scale).parse().ok())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1335,7 +1343,7 @@ fn draw_sub_pane(
                 readout.append(&format!("  {series_label} "), 0.0, label_format.clone());
             }
             readout.append(
-                &format_f64_trimmed(decimal_to_f64(value), 6),
+                &format_f64_fixed(decimal_to_f64(value), 6),
                 0.0,
                 egui::TextFormat {
                     color: if spec.histogram && index == 2 {
@@ -1370,17 +1378,61 @@ fn study_at(studies: &[ChartStudyPoint], open_time_ms: u64) -> Option<&ChartStud
         .and_then(|index| studies.get(index))
 }
 
-fn format_f64_trimmed(value: f64, precision: usize) -> String {
-    let rendered = format!("{value:.precision$}");
-    if precision == 0 {
-        return rendered;
-    }
-    let trimmed = rendered.trim_end_matches('0').trim_end_matches('.');
-    if trimmed.is_empty() || trimmed == "-0" {
-        "0".to_owned()
-    } else {
-        trimmed.to_owned()
-    }
+fn draw_hover_price_readout(
+    painter: &egui::Painter,
+    price_rect: Rect,
+    pointer_y: f32,
+    price: f64,
+    latest_price: Option<rust_decimal::Decimal>,
+    price_scale: usize,
+    text_size: u8,
+) {
+    let price_text = format_f64_fixed(price, price_scale);
+    let change_text = hover_price_change_percent(price, latest_price)
+        .map_or_else(|| "—".to_owned(), |change| format!("{change:+.4}%"));
+    let font = FontId::monospace(f32::from(text_size));
+    let price_galley = painter.layout_no_wrap(price_text, font.clone(), theme::TEXT_PRIMARY);
+    let change_galley = painter.layout_no_wrap(change_text, font, theme::TEXT_PRIMARY);
+    let width = price_galley.size().x.max(change_galley.size().x).max(72.0) + 12.0;
+    let height = price_galley.size().y + change_galley.size().y + 8.0;
+    let center_y = pointer_y.clamp(
+        price_rect.top() + height * 0.5,
+        price_rect.bottom() - height * 0.5,
+    );
+    let rect = Rect::from_center_size(
+        Pos2::new(price_rect.right() - width * 0.5, center_y),
+        egui::vec2(width, height),
+    );
+    painter.rect_filled(rect, 4.0, theme::DIVIDER);
+    painter.galley(
+        Pos2::new(
+            rect.center().x - price_galley.size().x * 0.5,
+            rect.top() + 3.0,
+        ),
+        price_galley,
+        theme::TEXT_PRIMARY,
+    );
+    painter.galley(
+        Pos2::new(
+            rect.center().x - change_galley.size().x * 0.5,
+            rect.bottom() - change_galley.size().y - 3.0,
+        ),
+        change_galley,
+        theme::TEXT_PRIMARY,
+    );
+}
+
+fn hover_price_change_percent(
+    price: f64,
+    latest_price: Option<rust_decimal::Decimal>,
+) -> Option<f64> {
+    let latest = latest_price.map(decimal_to_f64)?;
+    (latest.is_finite() && latest > 0.0 && price.is_finite())
+        .then(|| (price / latest - 1.0) * 100.0)
+}
+
+fn format_f64_fixed(value: f64, precision: usize) -> String {
+    format!("{value:.precision$}")
 }
 
 #[cfg(test)]
@@ -1617,5 +1669,13 @@ mod tests {
             3
         );
         assert!(shapes.iter().all(|s| s.clip_rect.max.y <= 100.0));
+    }
+
+    #[test]
+    fn hover_readout_measures_price_against_latest_trade() {
+        let change = hover_price_change_percent(0.089_350, Some(Decimal::new(8_893, 5)));
+        assert!(change.is_some_and(|change| (change - 0.472_281_57).abs() < 0.000_001));
+        assert_eq!(format_f64_fixed(0.0889, 5), "0.08890");
+        assert_eq!(hover_price_change_percent(1.0, Some(Decimal::ZERO)), None);
     }
 }
