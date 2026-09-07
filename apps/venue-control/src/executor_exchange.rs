@@ -965,7 +965,10 @@ impl BinanceHttpExecution {
         let Some((native_order_id, target_client_order_id)) =
             cancel_target(before, selected_native_order_id, selected_client_order_id)?
         else {
-            if request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Copy {
+            if request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Copy
+                || (request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Terminal
+                    && selected_client_order_id.is_some())
+            {
                 return self
                     .read_mirror_cancel_fact(
                         request,
@@ -1017,7 +1020,11 @@ impl BinanceHttpExecution {
                 } else {
                     ExecutionReadback::Accepted
                 };
-                if request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Copy {
+                if request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Copy
+                    || (request.origin
+                        == venue_control_protocol::kol::ExecutorCommandOrigin::Terminal
+                        && selected_client_order_id.is_some())
+                {
                     return Ok(mirror_order_outcome(&readback.order, true));
                 }
                 Ok(outcome(state, Some(native_order_id)))
@@ -1033,7 +1040,10 @@ impl BinanceHttpExecution {
         credentials: BinanceCredentials,
     ) -> Result<ExecutionOutcome, BinanceExecutionError> {
         let snapshot = self.snapshot(request, &credentials).await?;
-        if request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Copy {
+        if request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Copy
+            || (request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Terminal
+                && selected_client_order_id.is_some())
+        {
             return self
                 .read_mirror_cancel_fact(
                     request,

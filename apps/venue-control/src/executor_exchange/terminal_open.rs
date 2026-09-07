@@ -7,6 +7,7 @@ pub(crate) fn is_terminal_open(request: &ExecutionRequest) -> bool {
             request.order_kind,
             ExecutionOrderKind::Limit {
                 reducing: false,
+                time_in_force: venue_domain::LimitTimeInForce::PostOnly,
                 ..
             }
         )

@@ -28,3 +28,14 @@ pub(super) fn snapshot_limit_time_in_force(
         Some(_) => Err(AccountHostValidationError::SignedSnapshot),
     }
 }
+
+pub(super) fn snapshot_limit_policy(
+    row: &serde_json::Map<String, Value>,
+) -> Result<Option<LimitTimeInForce>, AccountHostValidationError> {
+    // Price and GTC alone do not prove an ordinary limit order (e.g. STOP limits).
+    if row.get("type").and_then(Value::as_str) == Some("LIMIT") {
+        snapshot_limit_time_in_force(row, "timeInForce")
+    } else {
+        Ok(None)
+    }
+}

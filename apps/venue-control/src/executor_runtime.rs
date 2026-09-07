@@ -868,6 +868,7 @@ async fn settle_submit_result(
     result: ExecutionOutcome,
 ) -> Result<AccountDrainDecision, BinanceCommandLedgerError> {
     let result = require_signed_mirror_fact(command, result);
+    store.record_replace_fact(command, &result).await?;
     store
         .record_mirror_order_fact(command, &result, now_ms()?)
         .await?;
@@ -1105,6 +1106,7 @@ where
     };
     let result = result.map(|outcome| require_signed_mirror_fact(command, outcome));
     if let Ok(outcome) = &result {
+        store.record_replace_fact(command, outcome).await?;
         store
             .record_mirror_order_fact(command, outcome, now_ms()?)
             .await?;
@@ -1229,8 +1231,18 @@ fn require_signed_mirror_fact(
     command: &ClaimedBinanceCommand,
     mut result: ExecutionOutcome,
 ) -> ExecutionOutcome {
-    if command.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Copy
-        && !matches!(command.order, ClaimedBinanceOrder::Market { .. })
+    let requires_exact_fact = (command.origin
+        == venue_control_protocol::kol::ExecutorCommandOrigin::Copy
+        && !matches!(command.order, ClaimedBinanceOrder::Market { .. }))
+        || (command.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Terminal
+            && matches!(
+                command.order,
+                ClaimedBinanceOrder::CancelExact {
+                    target_client_order_id: Some(_),
+                    ..
+                }
+            ));
+    if requires_exact_fact
         && matches!(
             result.state,
             ExecutionReadback::Accepted | ExecutionReadback::Reconciled

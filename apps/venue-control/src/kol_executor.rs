@@ -366,6 +366,7 @@ impl BinanceCommandLedger {
             "WITH candidate AS ( \
              SELECT c.command_id FROM venue_binance_commands c \
              WHERE c.trading_account_id=$1 AND c.command_state='pending' \
+             AND NOT EXISTS (SELECT 1 FROM venue_terminal_replacements r JOIN venue_binance_commands parent ON parent.command_id=r.cancel_command_id WHERE r.command_id=c.command_id AND (NOT r.released OR parent.command_state<>'reconciled')) \
              AND NOT EXISTS (SELECT 1 FROM venue_terminal_position_commands action LEFT JOIN venue_binance_commands parent ON parent.command_id=action.reverse_parent_id WHERE action.command_id=c.command_id AND (NOT action.released OR (action.reverse_parent_id IS NOT NULL AND parent.command_state<>'reconciled'))) \
              AND (c.command_origin<>'grid' OR EXISTS (SELECT 1 \
                   FROM venue_binance_grid_mutation_batches current_batch \
@@ -430,6 +431,7 @@ impl BinanceCommandLedger {
             "SELECT c.command_id,c.command_origin,c.grid_batch_id,c.dispatch_sequence \
              FROM venue_binance_commands c \
              WHERE c.trading_account_id=$1 AND c.command_state='pending' \
+             AND NOT EXISTS (SELECT 1 FROM venue_terminal_replacements r JOIN venue_binance_commands parent ON parent.command_id=r.cancel_command_id WHERE r.command_id=c.command_id AND (NOT r.released OR parent.command_state<>'reconciled')) \
              AND NOT EXISTS (SELECT 1 FROM venue_terminal_position_commands action LEFT JOIN venue_binance_commands parent ON parent.command_id=action.reverse_parent_id WHERE action.command_id=c.command_id AND (NOT action.released OR (action.reverse_parent_id IS NOT NULL AND parent.command_state<>'reconciled'))) \
              AND (c.command_origin<>'grid' OR EXISTS (SELECT 1 \
                  FROM venue_binance_grid_mutation_batches current_batch \
@@ -631,6 +633,7 @@ impl BinanceCommandLedger {
         ) {
             terminalize_unsubmitted_grid_owner(&mut tx, &changed, now).await?;
         }
+        crate::executor_store::settle_replace_child(&mut tx, command_id, next, now).await?;
         crate::executor_store::settle_reverse_child(
             &mut tx,
             command_id,

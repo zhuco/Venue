@@ -888,3 +888,22 @@ fn position_icons_queue_only_the_clicked_action_and_do_not_select_chart_price()
     }
     Ok(())
 }
+
+#[test]
+fn replacement_confirmation_requires_original_account_generation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut model = model_fixture()?;
+    let target = selection()?;
+    model
+        .execution
+        .apply_private(Some(projection()?), &mut model.trade_dock);
+    let scope = model.confirmed_account_scope().ok_or("scope missing")?;
+    assert!(preview_is_current(&model, &target, Some(&scope)));
+    assert!(!preview_is_current(&model, &target, None));
+    let mut changed = scope.clone();
+    changed.generation += 1;
+    assert!(!preview_is_current(&model, &target, Some(&changed)));
+    model.begin_account_selection(target.credential_id.clone());
+    assert!(!preview_is_current(&model, &target, Some(&scope)));
+    Ok(())
+}

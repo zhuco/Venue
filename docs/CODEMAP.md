@@ -91,6 +91,7 @@
 | 私有持仓、委托、成交、资产与历史 | `apps/ui/desktop/src/execution_view.rs`、`client/execution.rs` |
 | 逐行平仓/反开、下单及反馈 | `apps/ui/desktop/src/execution_view/position_actions.rs`、`trade_dock.rs`、`terminal_feedback.rs` |
 | 当前账户 SSE 与写入状态门 | `apps/ui/desktop/src/client/stream_gates.rs`、`ui/status_bar.rs` |
+| 图表拖动撤单并新挂 | `apps/ui/desktop/src/chart_trading/order_tags.rs`、`apps/venue-control/src/accounts/terminal/replace.rs`、`apps/venue-control/src/executor_store/terminal_replace.rs`（终态剩余量与新单释放）、`apps/venue-control/migrations/0043_terminal_replace.sql`；数据库夹具 `apps/venue-control/tests/support/kol_fixture.rs` |
 | 图表与共享指标 | `apps/ui/desktop/src/{chart_view,chart_settings,settings_panel}.rs`、`chart_trading/{overlays,order_tags}.rs`（委托/持仓标签与价格线）、`crates/venue-indicators/src/chart/` |
 | 服务器配置、公共行情代理、启动和 UI 日志 | `apps/ui/desktop/src/{server_connection,market_client,diagnostics}.rs`、`scripts/Start-VenueFlow.ps1`、`scripts/configure_desktop_https.py` |
 | 用户首页和邀请注册 | `apps/ui/web/app/`、`components/customer-console.tsx`、`lib/customer-server.ts` |

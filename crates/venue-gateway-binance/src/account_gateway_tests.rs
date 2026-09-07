@@ -1,3 +1,4 @@
+use super::account_gateway_snapshot_fields::snapshot_limit_time_in_force;
 use bytes::Bytes;
 
 use super::account_gateway_limit::normalize_priced_limit;
@@ -656,9 +657,9 @@ fn signed_snapshot_policy_preserves_missing_and_unrepresented_values() {
 #[test]
 fn signed_snapshot_partial_regular_order_keeps_original_quantity_and_filled_amount()
 -> Result<(), Box<dyn std::error::Error>> {
-    let regular = json_rows_snapshot(
+    let mut regular = json_rows_snapshot(
         br#"[
-            {"symbol":"BTCUSDT","orderId":"501","clientOrderId":"partial-regular-1","status":"PARTIALLY_FILLED","side":"BUY","positionSide":"LONG","timeInForce":"GTX","origQty":"0.002","executedQty":"0.0005","price":"50000","reduceOnly":false}
+            {"type":"LIMIT","symbol":"BTCUSDT","orderId":"501","clientOrderId":"partial-regular-1","status":"PARTIALLY_FILLED","side":"BUY","positionSide":"LONG","timeInForce":"GTX","origQty":"0.002","executedQty":"0.0005","price":"50000","reduceOnly":false}
         ]"#,
     )?;
     let facts = snapshot_order_facts(EXCHANGE_INFO, &regular, &[], 7)?;
@@ -666,6 +667,19 @@ fn signed_snapshot_partial_regular_order_keeps_original_quantity_and_filled_amou
     assert_eq!(facts[0].quantity, Decimal::new(2, 3));
     assert_eq!(facts[0].filled_quantity, Some(Decimal::new(5, 4)));
     assert_eq!(facts[0].state, Some(OrderState::PartiallyFilled));
+    assert_eq!(
+        facts[0].time_in_force,
+        Some(venue_domain::LimitTimeInForce::PostOnly)
+    );
+    for kind in [Some("STOP"), Some("TAKE_PROFIT"), Some("MARKET"), None] {
+        if let Some(kind) = kind {
+            regular[0].insert("type".into(), Value::String(kind.into()));
+        } else {
+            regular[0].remove("type");
+        }
+        let facts = snapshot_order_facts(EXCHANGE_INFO, &regular, &[], 7)?;
+        assert_eq!(facts[0].time_in_force, None);
+    }
     Ok(())
 }
 

@@ -1,7 +1,9 @@
 //! PostgreSQL facts owned by the singleton executor; no local journal is created.
 
 mod terminal_positions;
+mod terminal_replace;
 pub(crate) use terminal_positions::settle_reverse_child;
+pub(crate) use terminal_replace::settle_replace_child;
 
 use std::{collections::BTreeSet, ops::Deref, str::FromStr};
 

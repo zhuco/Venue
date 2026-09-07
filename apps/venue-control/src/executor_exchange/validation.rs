@@ -48,7 +48,8 @@ pub(super) fn validate_request_binding(
                     ..
                 }
             ) && request.origin
-                != venue_control_protocol::kol::ExecutorCommandOrigin::Copy;
+                != venue_control_protocol::kol::ExecutorCommandOrigin::Copy
+                && request.origin != venue_control_protocol::kol::ExecutorCommandOrigin::Terminal;
             if *quantity <= Decimal::ZERO {
                 return Err(BinanceExecutionError::PreDispatch(
                     PreDispatchRejection::Quantity,
@@ -223,14 +224,6 @@ mod tests {
                 LimitTimeInForce::PostOnly,
                 "not_dispatched_direction",
             ),
-            (
-                Decimal::ONE,
-                Decimal::ONE,
-                OrderSide::Buy,
-                PositionSide::Long,
-                LimitTimeInForce::Gtc,
-                "not_dispatched_order_type",
-            ),
         ] {
             request = valid.clone();
             request.order_kind = ExecutionOrderKind::Limit {
@@ -243,6 +236,14 @@ mod tests {
             };
             assert_eq!(check(&request), Err(expected));
         }
+        request = valid.clone();
+        if let ExecutionOrderKind::Limit { time_in_force, .. } = &mut request.order_kind {
+            *time_in_force = LimitTimeInForce::Gtc;
+        }
+        assert_eq!(check(&request), Ok(()));
+        assert!(!super::super::terminal_open::is_terminal_open(&request));
+        request.origin = venue_control_protocol::kol::ExecutorCommandOrigin::Grid;
+        assert_eq!(check(&request), Err("not_dispatched_order_type"));
         request = valid.clone();
         request.order_kind = ExecutionOrderKind::CancelExact {
             native_order_id: None,

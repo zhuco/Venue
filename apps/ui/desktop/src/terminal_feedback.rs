@@ -40,13 +40,22 @@ pub(crate) fn message(model: &crate::model::AppModel) -> Option<String> {
                 "{} · {} · {}",
                 row.symbol,
                 choose(language, "委托", "Order"),
-                command_state(row.state, language)
+                displayed_command_state(
+                    row.state,
+                    model.execution.terminal_executions_error.is_some(),
+                    language
+                )
             ) + &if row.sanitized_error_code.is_some() {
                 format!(" · {}", command_reason(row, language))
             } else {
                 String::new()
             },
         )
+    } else if model.execution.terminal_executions_error.is_some() {
+        Some(choose(language,
+            "委托状态刷新失败，当前显示上次记录；请勿因等待提示重复下单。",
+            "Order status refresh failed; showing the last record. Do not resubmit based on a queued status.",
+        ).into())
     } else {
         None
     }
@@ -292,6 +301,30 @@ pub(crate) fn command_state(state: ExecutorCommandState, language: Language) -> 
     choose(language, zh, en)
 }
 
+pub(crate) fn displayed_command_state(
+    state: ExecutorCommandState,
+    history_unavailable: bool,
+    language: Language,
+) -> String {
+    let recorded = command_state(state, language);
+    if history_unavailable
+        && matches!(
+            state,
+            ExecutorCommandState::Pending
+                | ExecutorCommandState::Sending
+                | ExecutorCommandState::Accepted
+                | ExecutorCommandState::ReconcileRequired
+        )
+    {
+        format!(
+            "{} ({recorded})",
+            choose(language, "状态待刷新，上次", "Refresh unavailable; last")
+        )
+    } else {
+        recorded.into()
+    }
+}
+
 fn choose(language: Language, zh: &'static str, en: &'static str) -> &'static str {
     match language {
         Language::SimplifiedChinese => zh,
@@ -302,6 +335,37 @@ fn choose(language: Language, zh: &'static str, en: &'static str) -> &'static st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_history_marks_nonterminal_receipts_as_stale() {
+        for language in [Language::SimplifiedChinese, Language::English] {
+            for state in [
+                ExecutorCommandState::Pending,
+                ExecutorCommandState::Sending,
+                ExecutorCommandState::Accepted,
+                ExecutorCommandState::ReconcileRequired,
+            ] {
+                assert_ne!(
+                    displayed_command_state(state, true, language),
+                    command_state(state, language)
+                );
+                assert_eq!(
+                    displayed_command_state(state, false, language),
+                    command_state(state, language)
+                );
+            }
+            for state in [
+                ExecutorCommandState::Rejected,
+                ExecutorCommandState::Reconciled,
+                ExecutorCommandState::Cancelled,
+            ] {
+                assert_eq!(
+                    displayed_command_state(state, true, language),
+                    command_state(state, language)
+                );
+            }
+        }
+    }
 
     #[test]
     fn exchange_reasons_keep_numeric_codes_and_hide_untrusted_content()

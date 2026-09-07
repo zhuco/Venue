@@ -501,6 +501,12 @@ impl TerminalOrderRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TerminalCancelRequest {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "rust_decimal::serde::str_option"
+    )]
+    pub replacement_price: Option<Decimal>,
     pub schema_version: u16,
     pub request_id: String,
     pub credential_id: String,
@@ -510,6 +516,9 @@ pub struct TerminalCancelRequest {
 
 impl TerminalCancelRequest {
     pub fn validate(&self) -> Result<(), KolProtocolError> {
+        if self.replacement_price.is_some_and(|price| !positive(price)) {
+            return Err(KolProtocolError::TerminalOrder);
+        }
         if self.schema_version != TERMINAL_SCHEMA_VERSION
             || !canonical_id(&self.request_id)
             || !canonical_id(&self.credential_id)
@@ -624,7 +633,7 @@ impl ExecutorCommandSummary {
                 ExecutorOrderKind::LimitPostOnly | ExecutorOrderKind::LimitGtc
             ) != self.limit_price.is_some()
             || (self.order_kind == ExecutorOrderKind::LimitGtc
-                && self.origin != ExecutorCommandOrigin::Copy)
+                && self.origin == ExecutorCommandOrigin::Grid)
             || self.limit_price.is_some_and(|price| !positive(price))
             || (self.phase != ExecutorCommandPhase::Cancel)
                 != self.requested_quantity.is_some_and(positive)
@@ -714,6 +723,25 @@ mod tests {
             max_deviation_bps: 100,
             allowed_symbols: vec!["BTC/USDT".parse()?, "ETH/USDT".parse()?],
         })
+    }
+
+    #[test]
+    fn cancel_replace_wire_is_optional_and_rejects_invalid_prices()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let wire = serde_json::json!({"schema_version": TERMINAL_SCHEMA_VERSION, "request_id": ID_1, "credential_id": ID_2, "symbol": "BTC/USDT", "native_order_id": "123"});
+        let mut request: TerminalCancelRequest = serde_json::from_value(wire.clone())?;
+        assert_eq!(request.replacement_price, None);
+        assert_eq!(serde_json::to_value(&request)?, wire);
+        for price in [Decimal::ZERO, Decimal::NEGATIVE_ONE] {
+            request.replacement_price = Some(price);
+            assert!(request.validate().is_err());
+        }
+        request.replacement_price = Some(Decimal::from(50000));
+        assert_eq!(request.validate(), Ok(()));
+        let decoded: TerminalCancelRequest =
+            serde_json::from_str(&serde_json::to_string(&request)?)?;
+        assert_eq!(decoded, request);
+        Ok(())
     }
 
     #[test]
@@ -872,8 +900,8 @@ mod tests {
     }
 
     #[test]
-    fn copy_gtc_history_preserves_limit_price_without_admitting_gtc_for_other_origins()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn copy_and_terminal_gtc_history_preserve_limit_price() -> Result<(), Box<dyn std::error::Error>>
+    {
         let mut summary = ExecutorCommandSummary {
             command_id: ID_1.into(),
             request_id: None,
@@ -899,10 +927,10 @@ mod tests {
             assert_eq!(summary.validate(), Err(KolProtocolError::CommandSummary));
         }
         summary.limit_price = Some(Decimal::from(80));
-        for origin in [ExecutorCommandOrigin::Terminal, ExecutorCommandOrigin::Grid] {
-            summary.origin = origin;
-            assert_eq!(summary.validate(), Err(KolProtocolError::CommandSummary));
-        }
+        summary.origin = ExecutorCommandOrigin::Terminal;
+        assert_eq!(summary.validate(), Ok(()));
+        summary.origin = ExecutorCommandOrigin::Grid;
+        assert_eq!(summary.validate(), Err(KolProtocolError::CommandSummary));
         Ok(())
     }
 }

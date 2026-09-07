@@ -448,6 +448,7 @@ pub fn apply_action(
             }
         };
         let request = TerminalCancelRequest {
+            replacement_price: None,
             schema_version: TERMINAL_SCHEMA_VERSION,
             request_id: model.next_terminal_request_id(),
             credential_id: selection.credential_id.clone(),
@@ -829,6 +830,7 @@ mod switch_regressions {
             client
                 .send_terminal_cancel(
                     TerminalCancelRequest {
+                        replacement_price: None,
                         schema_version: TERMINAL_SCHEMA_VERSION,
                         request_id: id(81),
                         credential_id: id(1),
@@ -881,6 +883,7 @@ mod switch_regressions {
             client
                 .send_terminal_cancel(
                     TerminalCancelRequest {
+                        replacement_price: None,
                         schema_version: TERMINAL_SCHEMA_VERSION,
                         request_id: id(81),
                         credential_id: id(1),

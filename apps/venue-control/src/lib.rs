@@ -136,6 +136,7 @@ pub const MIGRATION_0038: &str = include_str!("../migrations/0038_follow_authori
 pub const MIGRATION_0039: &str = include_str!("../migrations/0039_martingale_stop_loss.sql");
 pub const MIGRATION_0040: &str = include_str!("../migrations/0040_market_and_stop_mirror.sql");
 pub const MIGRATION_0041: &str = include_str!("../migrations/0041_managed_deletion.sql");
+pub const MIGRATION_0043: &str = include_str!("../migrations/0043_terminal_replace.sql");
 pub const MIGRATION_0042: &str = include_str!("../migrations/0042_mirror_stop_readback.sql");
 mod schema;
 pub use schema::{SchemaError, install_control_schema};

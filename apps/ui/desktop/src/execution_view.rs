@@ -492,8 +492,10 @@ fn show_private_projection(
                                 ui.label(format!("{:?} / {:?}", row.order_side, row.position_side));
                                 market_price(ui, model, &row.symbol, row.limit_price);
                                 market_quantity(ui, model, &row.symbol, row.requested_quantity);
-                                ui.label(crate::terminal_feedback::command_state(
-                                    row.state, language,
+                                ui.label(crate::terminal_feedback::displayed_command_state(
+                                    row.state,
+                                    model.execution.terminal_executions_error.is_some(),
+                                    language,
                                 ));
                                 ui.add_sized(
                                     [260.0, 32.0],

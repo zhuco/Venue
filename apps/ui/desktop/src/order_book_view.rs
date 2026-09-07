@@ -74,6 +74,7 @@ pub fn show(
     };
     let ask_rows = cumulative_rows(asks, limit);
     let bid_rows = cumulative_rows(bids, limit);
+    let (ask_marks, bid_marks) = own_order_marks(model, symbol, asks, bids, limit);
     let max_total = ask_rows
         .last()
         .map(|(_, total)| *total)
@@ -85,7 +86,7 @@ pub fn show(
                 .unwrap_or(Decimal::ZERO),
         );
     if mode.shows_asks() {
-        for (level, cumulative) in ask_rows.iter().rev() {
+        for (index, (level, cumulative)) in ask_rows.iter().enumerate().rev() {
             if book_row(
                 ui,
                 level,
@@ -94,6 +95,7 @@ pub fn show(
                 theme::SELL,
                 model,
                 symbol,
+                ask_marks[index],
             ) {
                 selected = Some(level.price);
             }
@@ -101,8 +103,17 @@ pub fn show(
     }
     price_mid_row(ui, trades, last, bid, ask, model, symbol);
     if mode.shows_bids() {
-        for (level, cumulative) in &bid_rows {
-            if book_row(ui, level, *cumulative, max_total, theme::BUY, model, symbol) {
+        for (index, (level, cumulative)) in bid_rows.iter().enumerate() {
+            if book_row(
+                ui,
+                level,
+                *cumulative,
+                max_total,
+                theme::BUY,
+                model,
+                symbol,
+                bid_marks[index],
+            ) {
                 selected = Some(level.price);
             }
         }
@@ -183,6 +194,61 @@ fn cumulative_rows(levels: &[UiBookLevel], limit: usize) -> Vec<(&UiBookLevel, D
         .collect()
 }
 
+fn own_order_marks(
+    model: &AppModel,
+    symbol: &str,
+    asks: &[UiBookLevel],
+    bids: &[UiBookLevel],
+    limit: usize,
+) -> ([bool; SINGLE_SIDE_ROWS], [bool; SINGLE_SIDE_ROWS]) {
+    let mut marks = ([false; SINGLE_SIDE_ROWS], [false; SINGLE_SIDE_ROWS]);
+    let Some(credential) = model.selected_execution_credential() else {
+        return marks;
+    };
+    let Some(projection) = model
+        .execution
+        .private_projection_for(model.preferences.execution_account_id.as_deref())
+        .filter(|projection| {
+            credential.venue == model.preferences.market_server.venue()
+                && credential.credential_id == projection.credential_id
+                && credential.trading_account_id.as_ref() == Some(&projection.trading_account_id)
+        })
+    else {
+        return marks;
+    };
+    let Some((base, quote)) = symbol.split_once('/') else {
+        return marks;
+    };
+    // Scan the existing projection once; only visible price levels need storage.
+    for order in &projection.open_orders {
+        if order.symbol.base() != base
+            || order.symbol.quote() != quote
+            || order.quantity <= Decimal::ZERO
+            || order
+                .filled_quantity
+                .is_some_and(|filled| filled >= order.quantity)
+        {
+            continue;
+        }
+        let Some(price) = order.limit_price.filter(|price| *price > Decimal::ZERO) else {
+            continue;
+        };
+        let (levels, side_marks) = match order.order_side {
+            venue_domain::OrderSide::Buy => (bids, &mut marks.1),
+            venue_domain::OrderSide::Sell => (asks, &mut marks.0),
+        };
+        if let Some(index) = levels
+            .iter()
+            .take(limit.min(SINGLE_SIDE_ROWS))
+            .position(|level| level.price == price)
+        {
+            side_marks[index] = true;
+        }
+    }
+    marks
+}
+
+#[allow(clippy::too_many_arguments)]
 fn book_row(
     ui: &mut egui::Ui,
     level: &UiBookLevel,
@@ -191,6 +257,7 @@ fn book_row(
     color: Color32,
     model: &AppModel,
     symbol: &str,
+    own_order: bool,
 ) -> bool {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), BOOK_ROW_HEIGHT),
@@ -222,8 +289,15 @@ fn book_row(
         );
     }
     let font = FontId::monospace(11.5);
+    if own_order {
+        painter.circle_filled(
+            Pos2::new(rect.left() + 3.0, rect.center().y),
+            1.5,
+            theme::WARNING,
+        );
+    }
     painter.text(
-        rect.left_center(),
+        Pos2::new(rect.left() + 9.0, rect.center().y),
         Align2::LEFT_CENTER,
         model.format_market_price(symbol, level.price),
         font.clone(),

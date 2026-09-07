@@ -229,8 +229,8 @@ pub(super) fn draw(
         } else {
             label(
                 language,
-                "上下拖动预览新价格；尚未接通安全改单，不会自动提交",
-                "Drag to preview a price; safe amendment is not connected and no order is sent",
+                "上下拖动修改价格，松手后确认撤单并重新挂单",
+                "Drag to change price, then confirm cancel and replace",
             )
         });
         if enabled && response.hovered() {
@@ -587,7 +587,13 @@ pub(crate) fn apply_interaction(
                 );
             }
             preview @ Interaction::Preview(..) => {
-                context.data_mut(|data| data.insert_temp(action_id().with("preview"), preview));
+                context.data_mut(|data| {
+                    data.insert_temp(action_id().with("preview"), preview);
+                    data.insert_temp(
+                        action_id().with("preview_scope"),
+                        model.confirmed_account_scope(),
+                    );
+                });
             }
         }
     }
@@ -595,16 +601,24 @@ pub(crate) fn apply_interaction(
     if let Some(Interaction::Preview(selection, old, new)) =
         context.data(|data| data.get_temp::<Interaction>(preview_id))
     {
-        if !target_is_current(model, &selection) {
+        let preview_scope = context
+            .data(|data| {
+                data.get_temp::<Option<crate::account_scope::AccountScope>>(
+                    action_id().with("preview_scope"),
+                )
+            })
+            .flatten();
+        if !preview_is_current(model, &selection, preview_scope.as_ref()) {
             context.data_mut(|data| data.remove::<Interaction>(preview_id));
             return;
         }
         let language = model.preferences.language;
         let mut open = true;
+        let mut submit = false;
         egui::Window::new(label(
             language,
-            "改单预览 · 未提交",
-            "Amendment preview · not submitted",
+            "撤单并重新挂单",
+            "Cancel and replace",
         ))
         .id(preview_id)
         .open(&mut open)
@@ -621,16 +635,43 @@ pub(crate) fn apply_interaction(
                 theme::WARNING,
                 label(
                     language,
-                    "原委托未改变；当前后端尚不支持安全改单。",
-                    "Original order unchanged; safe amendment is not supported by the backend yet.",
+                    "确认后先撤原单，再按最终未成交数量挂新单。",
+                    "Cancel the original order, then place its final unfilled quantity at the new price.",
                 ),
             );
             ui.label(label(
                 language,
-                "本次拖动没有撤单、下单或修改下单面板。",
-                "This drag did not cancel, place, or change the order form.",
+                "保留原方向及 GTC/Post Only；撤单期间仍可能成交。新挂失败时原单不会恢复。",
+                "Direction and GTC/Post Only are preserved. Fills can occur during cancellation; a failed replacement does not restore the original.",
             ));
+            submit = ui.add_enabled(!model.execution.chart_orders.is_pending(&selection) && model.confirmed_account_scope().is_some() && old != new,
+                egui::Button::new(label(language, "确认撤单并新挂", "Confirm cancel and replace"))).clicked();
         });
+        if submit {
+            let request = venue_control_protocol::kol::TerminalCancelRequest {
+                replacement_price: Some(new),
+                schema_version: venue_control_protocol::kol::TERMINAL_SCHEMA_VERSION,
+                request_id: model.next_terminal_request_id(),
+                credential_id: selection.credential_id.clone(),
+                symbol: selection.symbol.clone(),
+                native_order_id: selection.native_order_id.clone(),
+            };
+            let id = request.request_id.clone();
+            match client.send_terminal_cancel(request, model.confirmed_account_scope()) {
+                Ok(()) => {
+                    model
+                        .execution
+                        .chart_orders
+                        .submitted_cancel(selection, id.clone(), context);
+                    // Keep the signed original visible while both durable commands settle.
+                    model.execution.chart_orders.submission_failed(&id, false);
+                    model.execution.begin_terminal_submission(id);
+                    model.notice("改单已提交：等待撤单确认后新挂；请勿重复提交");
+                }
+                Err(error) => model.notice(format!("改单未提交：{error}")),
+            }
+            open = false;
+        }
         if !open {
             context.data_mut(|data| data.remove::<Interaction>(preview_id));
         }
@@ -656,4 +697,14 @@ fn target_is_current(model: &crate::model::AppModel, selection: &TerminalOrderSe
                             && order.native_order_id.as_ref() == Some(&selection.native_order_id)
                     })
             })
+}
+
+fn preview_is_current(
+    model: &crate::model::AppModel,
+    selection: &TerminalOrderSelection,
+    scope: Option<&crate::account_scope::AccountScope>,
+) -> bool {
+    scope.is_some()
+        && scope == model.confirmed_account_scope().as_ref()
+        && target_is_current(model, selection)
 }

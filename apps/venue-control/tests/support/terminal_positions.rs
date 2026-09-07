@@ -159,7 +159,7 @@ impl BinanceActivationBaseline for PositionExchange {
         Err(BinanceExecutionError::Invalid)
     }
 }
-struct FixtureSecrets;
+pub(super) struct FixtureSecrets;
 impl ExecutorCredentials for FixtureSecrets {
     fn credentials<'a>(
         &'a self,

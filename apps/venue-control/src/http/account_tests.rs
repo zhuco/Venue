@@ -340,6 +340,18 @@ async fn verify_grid_history(
         )
         .await?;
     store.enqueue_command(&command, now()).await?;
+    // The legacy account fixture omits multi-venue migrations; enable the shared ledger here.
+    for migration in [crate::MIGRATION_0035, crate::MIGRATION_0036] {
+        sqlx::raw_sql(migration).execute(&f.pool).await?;
+    }
+    // Other venues share the ledger, but must not consume this Binance endpoint's 200-row window.
+    sqlx::query("INSERT INTO venue_user_trading_accounts(trading_account_id,user_id,venue,exchange_identity_hash) SELECT '00000000-0000-4000-8000-000000000713',user_id,'bybit',decode(repeat('ab',32),'hex') FROM venue_user_trading_accounts WHERE trading_account_id=$1")
+        .bind(account).execute(&f.pool).await?;
+    sqlx::query("INSERT INTO venue_api_credentials(credential_id,user_id,label,key_fingerprint,masked_key,encrypted_credentials,trading_account_id,venue,verification_json,created_ms) SELECT 'history-bybit-credential',user_id,'fixture',decode(repeat('bc',32),'hex'),'***',decode('00','hex'),'00000000-0000-4000-8000-000000000713','bybit',verification_json || '{\"strategy_execution\":true}'::jsonb,created_ms FROM venue_api_credentials WHERE credential_id=$1")
+        .bind(&credential.credential_id).execute(&f.pool).await?;
+    sqlx::query("INSERT INTO venue_binance_commands(command_id,command_origin,owner_user_id,trading_account_id,credential_id,symbol,position_side,command_phase,order_kind,order_side,requested_quantity,limit_price,rule_version,client_order_id,command_state,source_digest,strategy_command,strategy_venue,strategy_sequence,created_ms,updated_ms) SELECT 'history-strategy-'||i,'strategy',owner_user_id,'00000000-0000-4000-8000-000000000713','history-bybit-credential',symbol,position_side,'open','strategy',order_side,requested_quantity,limit_price,rule_version,'history-strategy-'||i,'reconciled',source_digest,'{}'::jsonb,'bybit',i,created_ms+1000+i,updated_ms+1000+i FROM venue_binance_commands CROSS JOIN generate_series(1,205) i WHERE command_id=$1")
+        .bind(&command.command_id).execute(&f.pool).await?;
+
     let response = server
         .get(KOL_EXECUTION_STATUS_PATH, Some(owner))
         .send()

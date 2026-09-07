@@ -38,7 +38,7 @@ mod account_gateway_conditional;
 use account_gateway_conditional::snapshot_conditional_order_facts;
 #[path = "account_gateway_snapshot_fields.rs"]
 mod account_gateway_snapshot_fields;
-use account_gateway_snapshot_fields::{snapshot_limit_time_in_force, snapshot_order_state};
+use account_gateway_snapshot_fields::{snapshot_limit_policy, snapshot_order_state};
 #[path = "account_gateway_private_stream.rs"]
 mod account_gateway_private_stream;
 pub use account_gateway_private_stream::{BinancePrivateAccountEvent, BinancePrivateFillEvent};
@@ -1444,7 +1444,7 @@ fn snapshot_order_facts(
             position_side: snapshot_position_side(row)?,
             quantity,
             limit_price: snapshot_optional_positive_decimal(row, "price")?,
-            time_in_force: snapshot_limit_time_in_force(row, "timeInForce")?,
+            time_in_force: snapshot_limit_policy(row)?,
             created_at_ms: snapshot_created_at_ms(row, "time")?,
             reduce_only: snapshot_bool(row, "reduceOnly")?,
             owner: None,
