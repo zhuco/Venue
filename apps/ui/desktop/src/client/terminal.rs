@@ -2,6 +2,8 @@
 use super::{ClientEvent, REQUEST_TIMEOUT, path, publish};
 use crate::account_scope::{AccountScope, Scoped};
 #[cfg(not(target_arch = "wasm32"))]
+const MAX_OPEN_ADMISSIONS: usize = 4;
+#[cfg(not(target_arch = "wasm32"))]
 use venue_control_protocol::kol::{
     ExecutorCommandSummary, KOL_TERMINAL_CANCEL_PATH, KOL_TERMINAL_ORDER_PATH,
     TerminalCancelRequest, TerminalOrderRequest,
@@ -60,12 +62,15 @@ pub(super) fn start_native(
         context,
     };
     tokio::spawn(async move {
+        use futures_util::{StreamExt, stream::FuturesUnordered};
+        let mut openings = FuturesUnordered::new();
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
             for Scoped {
                 scope,
                 value: request,
             } in queues.positions.try_iter().take(1)
             {
+                while openings.next().await.is_some() {}
                 if submitter
                     .submit(
                         TERMINAL_POSITION_ACTION_PATH,
@@ -82,8 +87,32 @@ pub(super) fn start_native(
             for Scoped {
                 scope,
                 value: request,
-            } in queues.orders.try_iter().take(32)
+            } in queues
+                .orders
+                .try_iter()
+                .take(MAX_OPEN_ADMISSIONS - openings.len())
             {
+                if !request.action.is_close()
+                    && request.order_kind
+                        == venue_control_protocol::kol::TerminalOrderKind::LimitPostOnly
+                {
+                    let submitter = &submitter;
+                    openings.push(async move {
+                        submitter
+                            .submit(
+                                KOL_TERMINAL_ORDER_PATH,
+                                &scope,
+                                &request.request_id,
+                                &request,
+                                "terminal order",
+                            )
+                            .await
+                    });
+                    continue;
+                }
+                // Dependent actions wait for admission receipts. Physical account ordering
+                // and uncertain-result fencing remain owned by the server ledger.
+                while openings.next().await.is_some() {}
                 if submitter
                     .submit(
                         KOL_TERMINAL_ORDER_PATH,
@@ -102,6 +131,7 @@ pub(super) fn start_native(
                 value: request,
             } in queues.cancellations.try_iter().take(32)
             {
+                while openings.next().await.is_some() {}
                 if submitter
                     .submit(
                         KOL_TERMINAL_CANCEL_PATH,
@@ -116,10 +146,13 @@ pub(super) fn start_native(
                 }
             }
             tokio::select! {
+                _ = openings.next(), if !openings.is_empty() => {},
                 _ = queues.wake.notified() => {},
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
             }
         }
+        // A connection/account switch must not cancel already dispatched HTTP requests.
+        while openings.next().await.is_some() {}
     });
 }
 
@@ -133,6 +166,9 @@ impl NativeTerminalSubmitter {
         request: &T,
         label: &str,
     ) -> bool {
+        let started = std::time::Instant::now();
+        tracing::info!(target: "venueflow::terminal_latency", %request_id,
+            "Terminal admission HTTP started");
         let response = self
             .client
             .post(path(&self.endpoint, route))
@@ -140,6 +176,10 @@ impl NativeTerminalSubmitter {
             .timeout(REQUEST_TIMEOUT)
             .send()
             .await;
+        tracing::info!(target: "venueflow::terminal_latency", %request_id,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            status = response.as_ref().ok().map(|r| r.status().as_u16()),
+            "Terminal admission HTTP completed");
         match response {
             Ok(response) if response.status().is_success() => {
                 match response.json::<ExecutorCommandSummary>().await {
@@ -234,6 +274,10 @@ impl NativeTerminalSubmitter {
         }
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "terminal_burst_tests.rs"]
+mod burst_tests;
 
 #[cfg(not(target_arch = "wasm32"))]
 async fn safe_error_body(response: reqwest::Response) -> Vec<u8> {

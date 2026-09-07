@@ -397,6 +397,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn order_updates_bypass_one_second_market_cadence() {
+        let mut model = crate::account_scope::tests::model();
+        model.preferences.trading.chart_cadence = crate::trading::DisplayCadence::Ms1000;
+        let mut projection = crate::account_scope::tests::projection(1);
+        let settings = ChartTradingSettings::default();
+        model
+            .execution
+            .apply_private(Some(projection.clone()), &mut model.trade_dock);
+        assert!(collect(&model, "BTC/USDC", &settings).is_empty());
+        projection
+            .open_orders
+            .push(venue_control_protocol::kol::TerminalOpenOrder {
+                client_order_id: "order-fixture".into(),
+                native_order_id: Some("123456".into()),
+                symbol: "BTC/USDC".parse().unwrap(),
+                order_side: venue_domain::OrderSide::Buy,
+                position_side: venue_domain::PositionSide::Long,
+                quantity: Decimal::ONE,
+                filled_quantity: Some(Decimal::ZERO),
+                limit_price: Some(100.into()),
+                post_only: true,
+                time_in_force: Some(venue_domain::LimitTimeInForce::PostOnly),
+                reduce_only: false,
+                state: venue_control_protocol::kol::TerminalOrderState::New,
+                created_ms: Some(projection.observed_ms),
+            });
+        model
+            .execution
+            .apply_private(Some(projection.clone()), &mut model.trade_dock);
+        assert!(
+            collect(&model, "BTC/USDC", &settings)
+                .iter()
+                .any(|o| o.price == Decimal::from(100))
+        );
+        projection.open_orders.clear();
+        model
+            .execution
+            .apply_private(Some(projection), &mut model.trade_dock);
+        assert!(collect(&model, "BTC/USDC", &settings).is_empty());
+    }
+
+    #[test]
     fn price_line_mesh_survives_pixel_rounding_at_multiple_scales() {
         for scale in [0.75, 1.0, 1.25, 1.5, 2.0] {
             for offset in [0.0, 0.25, 0.5, 0.75] {

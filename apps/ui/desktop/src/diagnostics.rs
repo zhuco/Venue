@@ -1,6 +1,7 @@
 //! Detached desktop processes cannot rely on the launcher's stdout pipe being drained.
 use std::{fs::OpenOptions, path::PathBuf, sync::Mutex};
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
+use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 pub fn init_diagnostics() {
     let path = std::env::var_os("LOCALAPPDATA")
@@ -21,10 +22,14 @@ pub fn init_diagnostics() {
         Some(file) => BoxMakeWriter::new(Mutex::new(file)),
         None => BoxMakeWriter::new(std::io::sink),
     };
-    let _ = tracing_subscriber::fmt()
+    let layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_ansi(false)
-        .with_max_level(tracing::Level::WARN)
         .with_writer(writer)
-        .try_init();
+        .with_filter(
+            tracing_subscriber::filter::Targets::new()
+                .with_default(tracing::Level::WARN)
+                .with_target("venueflow::terminal_latency", tracing::Level::INFO),
+        );
+    let _ = tracing_subscriber::registry().with(layer).try_init();
 }

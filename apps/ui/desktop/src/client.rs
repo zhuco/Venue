@@ -208,6 +208,9 @@ impl ControlClient {
             .validate()
             .map_err(|_| ClientError::TerminalProtocol)?;
         let scope = self.terminal_scope(scope, &request.credential_id)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        tracing::info!(target: "venueflow::terminal_latency", request_id = %request.request_id,
+            "Terminal order queued locally");
         self.terminal_order_tx
             .send(Scoped {
                 scope,
