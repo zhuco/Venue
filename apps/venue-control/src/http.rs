@@ -192,6 +192,9 @@ where
     .await
 }
 
+/// 第二步：带账户认证的 HTTP 服务入口
+///
+/// 调用链：main → serve_local_with_accounts → serve_inner
 pub async fn serve_local_with_accounts<R>(
     listener: TcpListener,
     service: Arc<ControlService<R>>,

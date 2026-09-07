@@ -26,7 +26,8 @@ const routes: Record<string, { path: string; methods: string[]; public?: boolean
   "mirror-orders": { path: "/v2/kol/follow/orders", methods: ["GET"] },
 };
 const response = (body: unknown, status = 200) => NextResponse.json(body, { status, headers: noStore() });
-const cookieOptions = { httpOnly: true, secure: true, sameSite: "strict" as const, path: "/" };
+const isDev = process.env.NODE_ENV === "development";
+const cookieOptions = { httpOnly: true, secure: !isDev, sameSite: "strict" as const, path: "/" };
 function key(): Buffer | undefined {
   const material = process.env.VENUE_WEB_SESSION_SIGNING_KEY;
   return material && material.length >= 32 ? createHash("sha256").update("venue-customer-v1\0").update(material).digest() : undefined;
