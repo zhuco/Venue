@@ -186,9 +186,16 @@ impl VenueFlowApp {
                     .finish_history(&request, Err(error.to_string()));
             }
         }
+        let market_now =
+            if self.model.preferences.market_server == crate::model::MarketServer::Binance {
+                unix_now_ms()
+            } else {
+                // Expired synchronization must mark every old public view stale.
+                venue_gateway_api::display::received_ms().unwrap_or(u64::MAX)
+            };
         self.model
             .local_markets
-            .refresh_staleness(unix_now_ms(), 5_000);
+            .refresh_staleness(market_now, 5_000);
     }
 
     fn drain_client(&mut self) {

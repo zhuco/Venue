@@ -3,15 +3,12 @@ use rust_decimal::Decimal;
 use serde_json::Value;
 use venue_domain::{FieldState, Price, PublicBar, Symbol, UnknownReason};
 
+pub mod clock;
+
 pub type Result<T> = std::result::Result<T, String>;
 
 pub fn received_ms() -> Result<u64> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| "invalid receive clock")?
-        .as_millis()
-        .try_into()
-        .map_err(|_| "receive clock overflow".into())
+    clock::received_ms()
 }
 
 #[derive(Clone, Debug)]

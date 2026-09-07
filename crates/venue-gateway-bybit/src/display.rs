@@ -4,6 +4,16 @@ use serde_json::Value;
 use venue_domain::PublicBar;
 use venue_gateway_api::display::*;
 const ORIGIN: &str = "https://clawdbotweb.site/quotes/bybit/v5/market";
+pub async fn synchronize_display_clock(http: &reqwest::Client) -> Result<()> {
+    let started = std::time::Instant::now();
+    let value = get(http, "time").await?;
+    let nanos = stamp(&value["result"]["timeNano"])?;
+    let millis = nanos / 1_000_000;
+    if millis.abs_diff(stamp(&value["time"])?) > 1_000 {
+        return Err("inconsistent public server time".into());
+    }
+    clock::synchronize(millis, started)
+}
 async fn get(http: &reqwest::Client, path: &str) -> Result<Value> {
     let value = json(http, http.get(format!("{ORIGIN}/{path}"))).await?;
     if value["retCode"] != 0 {

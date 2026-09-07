@@ -1,7 +1,20 @@
 use super::*;
 use crate::model::MarketServer;
 use venue_gateway_api::display::{Book, Instrument, Quote};
+async fn ensure_clock(http: &reqwest::Client) -> Result<(), String> {
+    if venue_gateway_api::display::clock::needs_refresh() {
+        if let Err(error) = venue_gateway_bybit::display::synchronize_display_clock(http).await {
+            // A brief time-source outage can use the bounded monotonic holdover.
+            venue_gateway_api::display::received_ms().map_err(|_| error)?;
+        }
+    }
+    Ok(())
+}
+fn now_ms() -> u64 {
+    venue_gateway_api::display::received_ms().unwrap_or(0)
+}
 async fn catalog(server: MarketServer, http: &reqwest::Client) -> Result<Vec<Instrument>, String> {
+    ensure_clock(http).await?;
     match server {
         MarketServer::Bybit => venue_gateway_bybit::display::catalog(http).await,
         MarketServer::Bitget => venue_gateway_bitget::display::catalog(http).await,
@@ -19,6 +32,7 @@ async fn candles(
     generation: u64,
     before: Option<u64>,
 ) -> Result<Vec<PublicBar>, String> {
+    ensure_clock(http).await?;
     let ms = selection.interval.duration_ms();
     let now = now_ms();
     match server {
@@ -51,6 +65,7 @@ async fn book(
     http: &reqwest::Client,
     instrument: &Instrument,
 ) -> Result<Book, String> {
+    ensure_clock(http).await?;
     match server {
         MarketServer::Bybit => venue_gateway_bybit::display::book(http, instrument).await,
         MarketServer::Bitget => venue_gateway_bitget::display::book(http, instrument).await,
@@ -68,6 +83,7 @@ async fn trades(
     instrument: &Instrument,
     generation: u64,
 ) -> Result<Vec<PublicTrade>, String> {
+    ensure_clock(http).await?;
     let now = now_ms();
     match server {
         MarketServer::Bybit => {
@@ -93,6 +109,7 @@ async fn quotes(
     http: &reqwest::Client,
     instruments: &[Instrument],
 ) -> Result<Vec<Quote>, String> {
+    ensure_clock(http).await?;
     match server {
         MarketServer::Bybit => venue_gateway_bybit::display::quotes(http, instruments).await,
         MarketServer::Bitget => venue_gateway_bitget::display::quotes(http, instruments).await,
