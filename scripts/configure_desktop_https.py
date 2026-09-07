@@ -131,7 +131,7 @@ def desired_routes():
 def multi_market_routes():
     sources = {
         "bybit": ("api.bybit.com", ["/v5/market/" + path for path in
-            ["instruments-info", "tickers", "kline", "orderbook", "recent-trade"]]),
+            ["time", "instruments-info", "tickers", "kline", "orderbook", "recent-trade"]]),
         "bitget": ("api.bitget.com", ["/api/v3/market/" + path for path in
             ["instruments", "tickers", "candles", "orderbook", "fills"]]),
         "okx": ("www.okx.com", ["/api/v5/public/instruments"] +

@@ -4832,6 +4832,7 @@ name = "venue-gateway-api"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.1",
+ "parking_lot",
  "reqwest",
  "rust_decimal",
  "serde",

@@ -84,6 +84,7 @@ class DesktopHttpsTests(unittest.TestCase):
     def test_multi_venue_routes_are_exact_read_only_and_remove_credentials(self):
         routes = configured_route(self.original)["handle"][0]["routes"]
         self.assertEqual(len(routes), 9)
+        self.assertIn("/quotes/bybit/v5/market/time", routes[3]["match"][0]["path"])
         for route in routes[3:-1]:
             paths = route["match"][0]["path"]
             self.assertTrue(all("*" not in p and "/exchange" not in p for p in paths))
