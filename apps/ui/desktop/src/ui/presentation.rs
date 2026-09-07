@@ -106,9 +106,9 @@ mod tests {
     fn old_preferences_get_readable_defaults_and_persist_choices() -> Result<(), serde_json::Error>
     {
         let mut settings: crate::trading::TradingSettings = serde_json::from_str("{}")?;
-        assert_eq!(settings.book_cadence.millis(), 250);
-        assert_eq!(settings.tape_cadence.millis(), 500);
-        assert_eq!(settings.chart_cadence.millis(), 250);
+        assert_eq!(settings.book_cadence.millis(), 33);
+        assert_eq!(settings.tape_cadence.millis(), 33);
+        assert_eq!(settings.chart_cadence.millis(), 33);
         assert_eq!(settings.price_validity_seconds, 10);
         settings.price_validity_seconds = 3;
         settings.tape_cadence = DisplayCadence::Ms1000;

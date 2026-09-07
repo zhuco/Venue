@@ -17,6 +17,7 @@ pub const KOL_FOLLOW_LIFECYCLE_PATH: &str = "/v2/kol/follow/lifecycle";
 pub const KOL_TERMINAL_ORDER_PATH: &str = "/v2/kol/terminal/orders";
 pub const KOL_TERMINAL_CANCEL_PATH: &str = "/v2/kol/terminal/orders/cancel";
 pub const KOL_EXECUTION_STATUS_PATH: &str = "/v2/kol/executions";
+pub const KOL_TERMINAL_ACCOUNT_STREAM_PATH: &str = "/v2/kol/terminal/account/events";
 pub const KOL_TERMINAL_ACCOUNT_PATH: &str = "/v2/kol/terminal/account";
 
 pub const MAX_KOL_NAME_CHARS: usize = 40;

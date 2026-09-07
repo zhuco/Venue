@@ -74,16 +74,18 @@ impl VenueFlowApp {
             creation_context.egui_ctx.clone(),
         );
         #[cfg(not(target_arch = "wasm32"))]
-        let (model, market_client) =
-            match LocalMarketClient::start_for(model.preferences.market_server) {
-                Ok(client) => (model, Some(client)),
-                Err(error) => {
-                    let mut model = model;
-                    model.market_worker_failed = true;
-                    model.local_catalog_error = Some(format!("Market worker unavailable: {error}"));
-                    (model, None)
-                }
-            };
+        let (model, market_client) = match LocalMarketClient::start_with_context(
+            model.preferences.market_server,
+            Some(creation_context.egui_ctx.clone()),
+        ) {
+            Ok(client) => (model, Some(client)),
+            Err(error) => {
+                let mut model = model;
+                model.market_worker_failed = true;
+                model.local_catalog_error = Some(format!("Market worker unavailable: {error}"));
+                (model, None)
+            }
+        };
         Self {
             connected_endpoint: model.preferences.endpoint.clone(),
             account_center: crate::account_center::AccountCenter::new(&model.preferences.endpoint),
@@ -107,13 +109,16 @@ impl VenueFlowApp {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn synchronize_local_markets(&mut self) {
+    fn synchronize_local_markets(&mut self, context: &egui::Context) {
         if self.market_server != self.model.preferences.market_server {
             self.market_client.take();
             self.market_server = self.model.preferences.market_server;
             self.market_generation = self.model.market_generation;
             self.workspaces.reset_chart_viewports();
-            self.market_client = match LocalMarketClient::start_for(self.market_server) {
+            self.market_client = match LocalMarketClient::start_with_context(
+                self.market_server,
+                Some(context.clone()),
+            ) {
                 Ok(client) => Some(client),
                 Err(error) => {
                     self.model.market_worker_failed = true;
@@ -416,7 +421,7 @@ impl eframe::App for VenueFlowApp {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.synchronize_local_markets();
+            self.synchronize_local_markets(context);
             self.drain_local_markets(context);
         }
         let display = &self.model.preferences.trading;
@@ -449,7 +454,7 @@ impl eframe::App for VenueFlowApp {
         );
         self.synchronize_private_projection();
         #[cfg(not(target_arch = "wasm32"))]
-        self.synchronize_local_markets();
+        self.synchronize_local_markets(ui.ctx());
         let accepts_trading_input = self.workspaces.active == crate::model::WorkspaceKind::Trading
             && !ui.ctx().egui_wants_keyboard_input()
             && !egui::Popup::is_any_open(ui.ctx())

@@ -20,7 +20,7 @@ pub(super) fn url(
 pub(super) fn start(
     http: reqwest::Client,
     requests: Receiver<crate::market::HistoryRequest>,
-    events: Sender<LocalMarketClientEvent>,
+    events: MarketSender,
 ) {
     tokio::spawn(async move {
         loop {

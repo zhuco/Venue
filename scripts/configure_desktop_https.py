@@ -34,6 +34,7 @@ POST_PATHS = [
     "/v2/account/credentials/delete",
     "/v2/account/select",
     "/v2/kol/terminal/account",
+    "/v2/kol/terminal/account/events",
     "/v2/kol/terminal/orders",
     "/v2/kol/terminal/orders/cancel",
     "/v2/kol/terminal/positions/action",

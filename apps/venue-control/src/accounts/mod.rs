@@ -44,6 +44,7 @@ fn ms(value: u64) -> Result<i64, AccountError> {
 
 pub struct AccountService {
     pool: PgPool,
+    projection_wake: std::sync::OnceLock<tokio::sync::watch::Receiver<()>>,
     cipher: Arc<CredentialCipher>,
     password_slots: Arc<Semaphore>,
     dummy_hash: String,
@@ -75,6 +76,7 @@ impl AccountService {
     ) -> Result<Self, AccountError> {
         Ok(Self {
             pool,
+            projection_wake: std::sync::OnceLock::new(),
             cipher: Arc::new(cipher),
             password_slots: Arc::new(Semaphore::new(2)),
             node_token_hash: node_token
@@ -84,6 +86,14 @@ impl AccountService {
                 "unavailable account dummy password".into(),
             ))?,
         })
+    }
+
+    pub(crate) fn projection_changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.projection_wake
+            .get_or_init(|| {
+                crate::database_wake::listen(self.pool.clone(), "venue_terminal_projection")
+            })
+            .clone()
     }
 
     pub fn node_authorized(&self, token: &str) -> bool {

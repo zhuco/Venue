@@ -1,4 +1,5 @@
 use super::*;
+mod terminal_stream;
 use crate::accounts::{AccountError, AccountService, Principal};
 use serde::{Serialize, de::DeserializeOwned};
 use std::collections::BTreeSet;
@@ -71,6 +72,22 @@ where
             },
             Err(error) => account_error(stream, error.code).await,
         };
+    }
+    if path == venue_control_protocol::kol::KOL_TERMINAL_ACCOUNT_STREAM_PATH {
+        if request.method != Method::Post || query.is_some() || !request.json_content {
+            return account_error(stream, AccountErrorCode::InvalidInput).await;
+        }
+        let Some(accounts) = accounts else {
+            return account_error(stream, AccountErrorCode::Unavailable).await;
+        };
+        let Some(token) = request.bearer else {
+            return account_error(stream, AccountErrorCode::Unauthorized).await;
+        };
+        let subscription = match decode(&request.body) {
+            Ok(value) => value,
+            Err(error) => return account_error(stream, error.code).await,
+        };
+        return terminal_stream::serve(stream, state, accounts, token, subscription).await;
     }
     if path.starts_with("/v2/account/")
         || matches!(

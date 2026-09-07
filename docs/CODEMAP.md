@@ -1,5 +1,7 @@
 # VENUE 功能代码地图
 
+终端低延迟链：`apps/ui/desktop/src/market_client/native/delivery.rs` 从行情线程唤醒绘制，Binance WS 在 `market_client.rs` 优先直连、失败回退 HTTPS 中继；`client/execution/stream.rs` 消费认证账户快照 SSE。Control `http/accounts/terminal_stream.rs` 逐次校验会话及账户归属；`database_wake.rs` 与迁移 `0044` 提供提交后通知，原轮询负责断线恢复。
+
 行情状态中文提示：`apps/ui/desktop/src/i18n/market.rs` 区分更新延迟、自动校时、限流、访问受限、合约不可用与校验失败；`market.rs` 在新的有效行情到达后恢复延迟状态，连接状态消息不刷新行情接收时间。
 
 六所公共行情的自动校时：`crates/venue-gateway-api/src/display/clock.rs` 维护仅供显示的单调时钟；Bybit `display::synchronize_display_clock` 读取精确只读 `/quotes/bybit/v5/market/time`，桌面 `market_client/native/multi.rs` 自动刷新。它不参与签名、账户事实或系统校时。

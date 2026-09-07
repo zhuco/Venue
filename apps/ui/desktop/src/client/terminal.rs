@@ -16,6 +16,7 @@ pub(super) struct NativeTerminalQueues {
     orders: crossbeam_channel::Receiver<Scoped<TerminalOrderRequest>>,
     cancellations: crossbeam_channel::Receiver<Scoped<TerminalCancelRequest>>,
     positions: crossbeam_channel::Receiver<Scoped<TerminalPositionActionRequest>>,
+    wake: std::sync::Arc<tokio::sync::Notify>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -24,11 +25,13 @@ impl NativeTerminalQueues {
         orders: crossbeam_channel::Receiver<Scoped<TerminalOrderRequest>>,
         cancellations: crossbeam_channel::Receiver<Scoped<TerminalCancelRequest>>,
         positions: crossbeam_channel::Receiver<Scoped<TerminalPositionActionRequest>>,
+        wake: std::sync::Arc<tokio::sync::Notify>,
     ) -> Self {
         Self {
             orders,
             cancellations,
             positions,
+            wake,
         }
     }
 }
@@ -112,7 +115,10 @@ pub(super) fn start_native(
                     return;
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::select! {
+                _ = queues.wake.notified() => {},
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+            }
         }
     });
 }

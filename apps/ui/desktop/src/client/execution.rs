@@ -1,3 +1,5 @@
+#[cfg(not(target_arch = "wasm32"))]
+mod stream;
 use super::{ClientEvent, path, publish};
 use crate::account_scope::Scoped;
 use futures_util::StreamExt;
@@ -156,6 +158,31 @@ async fn projection_loop(
     while !stop.load(std::sync::atomic::Ordering::Acquire) {
         let request = requests.borrow_and_update().clone();
         if let Some(request) = request {
+            if request.scope.venue == venue_control_protocol::VenueId::Binance {
+                let result = tokio::select! {
+                    biased;
+                    changed = requests.changed() => {
+                        if changed.is_err() { break; }
+                        continue;
+                    }
+                    result = stream::receive(&client, &endpoint, &request, &sender, &context) => result,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => continue,
+                };
+                if matches!(result, Err(TerminalReadError::SessionExpired)) {
+                    publish(
+                        &sender,
+                        &context,
+                        request.scope.event(ClientEvent::SessionExpired),
+                    );
+                }
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                if requests.has_changed().unwrap_or(true) {
+                    continue;
+                }
+                // Read the same owned snapshot after disconnect; never retry an order.
+            }
             // Only read-only projection requests are cancelled. Order delivery stays on
             // its independent durable command path. Watch retains the latest selection.
             let result = tokio::select! {
@@ -195,11 +222,20 @@ mod tests {
     #[tokio::test]
     async fn account_switch_interrupts_slow_read_and_poll_delay()
     -> Result<(), Box<dyn std::error::Error>> {
+        account_switches(venue_control_protocol::VenueId::Bybit).await?;
+        account_switches(venue_control_protocol::VenueId::Binance).await
+    }
+
+    async fn account_switches(
+        venue: venue_control_protocol::VenueId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}", listener.local_addr()?);
         let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let mut old_connection = None;
+            let mut streams = Vec::new();
             for index in 0..3 {
                 let (mut socket, _) = listener.accept().await?;
                 let mut bytes = Vec::new();
@@ -217,10 +253,15 @@ mod tests {
                 let _ = seen_tx.send(String::from_utf8_lossy(&bytes).to_string());
                 if index == 0 {
                     old_connection = Some(socket);
+                } else if venue == venue_control_protocol::VenueId::Binance {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nevent: terminal-account\ndata: null\n\n").await?;
+                    streams.push(socket);
                 } else {
                     socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnull").await?;
                 }
             }
+            let _ = done_rx.await;
+            drop(streams);
             drop(old_connection);
             Ok::<_, std::io::Error>(())
         });
@@ -230,7 +271,7 @@ mod tests {
                 generation: index,
                 credential_id: format!("00000000-0000-4000-8000-{index:012}"),
                 trading_account_id: format!("account-{index}"),
-                venue: venue_control_protocol::VenueId::Binance,
+                venue,
             },
             value: TerminalProjectionRequest {
                 schema_version: venue_control_protocol::kol::TERMINAL_PROJECTION_SCHEMA_VERSION,
@@ -267,6 +308,7 @@ mod tests {
         }
         drop(requests_tx);
         tokio::time::timeout(Duration::from_secs(1), worker).await??;
+        let _ = done_tx.send(());
         server.await??;
         assert!(events_rx.is_empty());
         Ok(())

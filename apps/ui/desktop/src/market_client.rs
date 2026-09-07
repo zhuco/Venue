@@ -1,6 +1,8 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
+    mod delivery;
     mod history;
+    use delivery::MarketSender;
     mod multi;
     use std::{
         collections::BTreeSet,
@@ -94,15 +96,23 @@ mod native {
     }
 
     impl LocalMarketClient {
-        pub fn start_for(
+        pub fn start_with_context(
             server: crate::model::MarketServer,
+            context: Option<egui::Context>,
         ) -> Result<Self, LocalMarketClientError> {
             let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
             let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
             let (history_tx, history_rx) = bounded(MAX_SUBSCRIPTIONS);
             let worker = thread::Builder::new()
                 .name("venueflow-local-market".to_owned())
-                .spawn(move || worker_main(command_rx, event_tx, history_rx, server))
+                .spawn(move || {
+                    worker_main(
+                        command_rx,
+                        MarketSender::new(event_tx, context),
+                        history_rx,
+                        server,
+                    )
+                })
                 .map_err(|_| LocalMarketClientError::ThreadStart)?;
             Ok(Self {
                 history_commands: history_tx,
@@ -295,7 +305,7 @@ mod native {
 
     fn worker_main(
         command_rx: Receiver<LocalMarketCommand>,
-        event_tx: Sender<LocalMarketClientEvent>,
+        event_tx: MarketSender,
         history_rx: Receiver<crate::market::HistoryRequest>,
         server: crate::model::MarketServer,
     ) {
@@ -322,7 +332,7 @@ mod native {
 
     async fn supervisor(
         command_rx: Receiver<LocalMarketCommand>,
-        event_tx: Sender<LocalMarketClientEvent>,
+        event_tx: MarketSender,
         history_rx: Receiver<crate::market::HistoryRequest>,
     ) {
         let (async_tx, mut async_rx) = mpsc::channel(COMMAND_CAPACITY);
@@ -427,7 +437,7 @@ mod native {
         proxy: &ProxySetting,
         catalog: &[Symbol],
         commands: &mut mpsc::Receiver<LocalMarketCommand>,
-        event_tx: &Sender<LocalMarketClientEvent>,
+        event_tx: &MarketSender,
     ) -> Option<LocalMarketCommand> {
         let mut attempt = 0_u32;
         let mut emitter = EventEmitter::new(event_tx.clone());
@@ -481,7 +491,7 @@ mod native {
             let (market_url, public_url) = combined_stream_urls(&selections);
             let public_connection = tokio::select! {
                 command = commands.recv() => return command,
-                result = timeout(CONNECT_BUDGET, connect_public_websocket(
+                result = timeout(CONNECT_BUDGET, connect_binance_websocket(
                     &public_url,
                     websocket_config(),
                     proxy,
@@ -524,7 +534,7 @@ mod native {
             };
             let market_connection = tokio::select! {
                 command = commands.recv() => return command,
-                result = timeout(CONNECT_BUDGET, connect_public_websocket(
+                result = timeout(CONNECT_BUDGET, connect_binance_websocket(
                     &market_url,
                     websocket_config(),
                     proxy,
@@ -690,13 +700,33 @@ mod native {
             .max_frame_size(Some(WS_FRAME_LIMIT))
     }
 
+    async fn connect_binance_websocket(
+        url: &str,
+        config: WebSocketConfig,
+        relay_proxy: &ProxySetting,
+    ) -> Result<PublicWebSocket, String> {
+        let direct_url = url.replacen("clawdbotweb.site", "fstream.binance.com", 1);
+        let direct_proxy = ProxySetting::from_environment("fstream.binance.com");
+        if let Ok(Ok(socket)) = timeout(
+            Duration::from_millis(1500),
+            connect_public_websocket(&direct_url, websocket_config(), &direct_proxy),
+        )
+        .await
+        {
+            tracing::info!("Public Binance stream connected directly");
+            return Ok(socket);
+        }
+        tracing::info!("Public Binance stream using relay fallback");
+        connect_public_websocket(url, config, relay_proxy).await
+    }
+
     async fn connect_public_websocket(
         url: &str,
         config: WebSocketConfig,
         proxy: &ProxySetting,
     ) -> Result<PublicWebSocket, String> {
         match proxy {
-            ProxySetting::Direct => connect_async_with_config(url, Some(config), false)
+            ProxySetting::Direct => connect_async_with_config(url, Some(config), true)
                 .await
                 .map(|(websocket, _)| websocket)
                 .map_err(|error| format!("direct websocket connect failed: {error}")),
@@ -712,6 +742,9 @@ mod native {
                 let stream = TcpStream::connect((route.host.as_str(), route.port))
                     .await
                     .map_err(|_| "websocket proxy TCP connect failed".to_owned())?;
+                stream
+                    .set_nodelay(true)
+                    .map_err(|_| "public TCP configuration failed".to_owned())?;
                 let stream = establish_http_connect(
                     stream,
                     target_host,
@@ -1084,14 +1117,14 @@ mod native {
     }
 
     struct EventEmitter {
-        events: Sender<LocalMarketClientEvent>,
+        events: MarketSender,
         last_repaint: Option<Instant>,
     }
 
     impl EventEmitter {
-        fn new(events: Sender<LocalMarketClientEvent>) -> Self {
+        fn new(events: impl Into<MarketSender>) -> Self {
             Self {
-                events,
+                events: events.into(),
                 last_repaint: None,
             }
         }
@@ -1154,10 +1187,7 @@ mod native {
         Failed(String),
     }
 
-    fn worker_failure(
-        events: &Sender<LocalMarketClientEvent>,
-        error: String,
-    ) -> Option<LocalMarketCommand> {
+    fn worker_failure(events: &MarketSender, error: String) -> Option<LocalMarketCommand> {
         let _ = events.try_send(LocalMarketClientEvent::WorkerFailed(error));
         Some(LocalMarketCommand::Stop)
     }
@@ -1332,8 +1362,9 @@ mod native {
                 .map_err(|e| e.to_string())?;
             let mut reducer = crate::market::LocalMarketReducer::new(selection.clone())
                 .map_err(|e| e.to_string())?;
-            let client = LocalMarketClient::start_for(crate::model::MarketServer::Binance)
-                .map_err(|e| e.to_string())?;
+            let client =
+                LocalMarketClient::start_with_context(crate::model::MarketServer::Binance, None)
+                    .map_err(|e| e.to_string())?;
             client
                 .replace_subscriptions(reducer.view().generation, vec![selection])
                 .map_err(|e| e.to_string())?;

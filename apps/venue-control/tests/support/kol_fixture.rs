@@ -96,6 +96,9 @@ impl Fixture {
         sqlx::raw_sql(venue_control::MIGRATION_0043)
             .execute(&self.pool)
             .await?;
+        sqlx::raw_sql(venue_control::MIGRATION_0044)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

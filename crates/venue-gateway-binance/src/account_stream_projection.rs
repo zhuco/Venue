@@ -384,6 +384,13 @@ impl BinanceAccountGateway {
     /// No HTTP. The observation time is the latest real frame/Pong, never the local poll time.
     /// Balances retain the bootstrap value; callers must independently verify PM equity before
     /// using it for a new risk action. The snapshot is a read model, not a dispatch permission.
+    /// A scheduling hint only; callers still validate the complete signed projection.
+    pub fn stream_projection_change_ms(&self) -> Option<u64> {
+        self.stream_projection
+            .as_ref()
+            .map(|state| state.last_change_received_ms)
+    }
+
     pub fn stream_projection_snapshot(
         &mut self,
     ) -> Result<Option<SignedAccountSnapshot>, BinanceAccountGatewayError> {

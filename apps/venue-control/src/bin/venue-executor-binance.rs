@@ -90,6 +90,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Account-scoped SQL fences remain effective while streams start; a slow or failed follower
     // must not prevent the shared Grid/terminal process from starting.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut command_notifications =
+        venue_control::database_wake::listen(pool.clone(), "venue_executor_commands");
+    let notify_wake = command_wake.clone();
+    let mut notify_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = notify_shutdown.changed() => break,
+                result = command_notifications.changed() => {
+                    if result.is_err() { break; }
+                    notify_wake.wake();
+                }
+            }
+        }
+    });
     let strategy_executor = venue_control::multi_venue_runtime::MultiVenueExecutor::new(
         pool.clone(),
         venue_control::multi_venue_credentials::StrategyCredentialStore::new(
@@ -879,6 +894,7 @@ fn spawn_projection_worker(
             }
             let mut refresh_at = std::time::Instant::now();
             let mut publish_at = std::time::Instant::now() + STREAM_PROJECTION_INTERVAL;
+            let mut last_noticed_change = gateway.stream_projection_change_ms();
             let mut consecutive_snapshot_failures = 0_u32;
             let mut deferred_private_event = None;
             let mut pending_snapshot: Option<(
@@ -1044,7 +1060,13 @@ fn spawn_projection_worker(
                     });
                     pending_snapshot = Some((receiver, fill_epoch));
                 }
-                if !recovering && !private_changed && std::time::Instant::now() >= publish_at {
+                let change = gateway.stream_projection_change_ms();
+                if change != last_noticed_change {
+                    last_noticed_change = change;
+                    publish_at = publish_at
+                        .min(std::time::Instant::now() + std::time::Duration::from_millis(33));
+                }
+                if !recovering && std::time::Instant::now() >= publish_at {
                     if let Some(snapshot) = gateway.stream_projection_snapshot().map_err(|error| {
                         tracing::warn!(target: "venue_control::grid_hot_path", %error, "Authenticated account projection lost continuity; rebuilding baseline");
                     }).ok()? {

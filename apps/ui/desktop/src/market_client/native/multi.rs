@@ -124,7 +124,7 @@ async fn quotes(
 pub(super) async fn run(
     server: MarketServer,
     commands: Receiver<LocalMarketCommand>,
-    events: Sender<LocalMarketClientEvent>,
+    events: MarketSender,
     history: Receiver<crate::market::HistoryRequest>,
 ) {
     let http = match reqwest::Client::builder()
@@ -190,7 +190,7 @@ async fn run_with_pending(
     mut rx: mpsc::Receiver<LocalMarketCommand>,
     history: Receiver<crate::market::HistoryRequest>,
     mut emitter: EventEmitter,
-    events: Sender<LocalMarketClientEvent>,
+    events: MarketSender,
     mut pending: LocalMarketCommand,
 ) {
     let instruments = loop {
@@ -218,7 +218,7 @@ async fn run_with_pending(
     )
     .await;
 }
-fn publish_catalog(instruments: &[Instrument], events: &Sender<LocalMarketClientEvent>) {
+fn publish_catalog(instruments: &[Instrument], events: &MarketSender) {
     let _ = events.try_send(LocalMarketClientEvent::Catalog(
         instruments
             .iter()

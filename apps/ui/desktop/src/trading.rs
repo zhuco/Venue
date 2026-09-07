@@ -12,18 +12,26 @@ const MAX_PRICE_VALIDITY_SECONDS: u16 = 300;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DisplayCadence {
-    Ms100,
     #[default]
+    Ms33,
+    Ms100,
     Ms250,
     Ms500,
     Ms1000,
 }
 
 impl DisplayCadence {
-    pub const ALL: [Self; 4] = [Self::Ms100, Self::Ms250, Self::Ms500, Self::Ms1000];
+    pub const ALL: [Self; 5] = [
+        Self::Ms33,
+        Self::Ms100,
+        Self::Ms250,
+        Self::Ms500,
+        Self::Ms1000,
+    ];
 
     pub const fn millis(self) -> u64 {
         match self {
+            Self::Ms33 => 33,
             Self::Ms100 => 100,
             Self::Ms250 => 250,
             Self::Ms500 => 500,
@@ -303,9 +311,9 @@ impl Default for TradingSettings {
             ],
             hotkeys: HotkeyMapping::default(),
             hotkeys_enabled: true,
-            book_cadence: DisplayCadence::Ms250,
-            tape_cadence: DisplayCadence::Ms500,
-            chart_cadence: DisplayCadence::Ms250,
+            book_cadence: DisplayCadence::Ms33,
+            tape_cadence: DisplayCadence::Ms33,
+            chart_cadence: DisplayCadence::Ms33,
         }
     }
 }

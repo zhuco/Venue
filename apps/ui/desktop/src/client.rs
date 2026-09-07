@@ -93,6 +93,8 @@ pub struct ControlClient {
     terminal_cancel_tx: Sender<Scoped<TerminalCancelRequest>>,
     terminal_position_tx: Sender<Scoped<TerminalPositionActionRequest>>,
     #[cfg(not(target_arch = "wasm32"))]
+    terminal_wake: std::sync::Arc<tokio::sync::Notify>,
+    #[cfg(not(target_arch = "wasm32"))]
     terminal_projection_tx: tokio::sync::watch::Sender<Option<Scoped<TerminalProjectionRequest>>>,
     copy_relation_tx: Sender<CopyRelationUpsertRequest>,
     grid_mutation_tx: Sender<GridMutation>,
@@ -119,6 +121,8 @@ impl ControlClient {
         let (terminal_cancel_tx, terminal_cancel_rx) = unbounded();
         let (terminal_position_tx, terminal_position_rx) = bounded(1);
         #[cfg(not(target_arch = "wasm32"))]
+        let terminal_wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        #[cfg(not(target_arch = "wasm32"))]
         let (terminal_projection_tx, terminal_projection_rx) = tokio::sync::watch::channel(None);
         let (copy_relation_tx, copy_relation_rx) = unbounded();
         let (grid_mutation_tx, grid_mutation_rx) = unbounded();
@@ -137,6 +141,7 @@ impl ControlClient {
                 terminal_order_rx,
                 terminal_cancel_rx,
                 terminal_position_rx,
+                terminal_wake.clone(),
                 terminal_projection_rx,
                 copy_relation_rx,
                 grid_mutation_rx,
@@ -166,6 +171,8 @@ impl ControlClient {
             terminal_order_tx,
             terminal_cancel_tx,
             terminal_position_tx,
+            #[cfg(not(target_arch = "wasm32"))]
+            terminal_wake,
             #[cfg(not(target_arch = "wasm32"))]
             terminal_projection_tx,
             copy_relation_tx,
@@ -206,7 +213,10 @@ impl ControlClient {
                 scope,
                 value: request,
             })
-            .map_err(|_| ClientError::Closed)
+            .map_err(|_| ClientError::Closed)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        self.terminal_wake.notify_one();
+        Ok(())
     }
 
     pub fn send_terminal_cancel(
@@ -223,7 +233,10 @@ impl ControlClient {
                 scope,
                 value: request,
             })
-            .map_err(|_| ClientError::Closed)
+            .map_err(|_| ClientError::Closed)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        self.terminal_wake.notify_one();
+        Ok(())
     }
 
     fn terminal_scope(
@@ -287,7 +300,10 @@ impl ControlClient {
                 scope,
                 value: request,
             })
-            .map_err(|_| ClientError::Closed)
+            .map_err(|_| ClientError::Closed)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        self.terminal_wake.notify_one();
+        Ok(())
     }
 
     pub fn send_copy_relation(
@@ -400,6 +416,7 @@ fn start_native(
     terminal_orders: Receiver<Scoped<TerminalOrderRequest>>,
     terminal_cancellations: Receiver<Scoped<TerminalCancelRequest>>,
     terminal_positions: Receiver<Scoped<TerminalPositionActionRequest>>,
+    terminal_wake: std::sync::Arc<tokio::sync::Notify>,
     terminal_projection: tokio::sync::watch::Receiver<Option<Scoped<TerminalProjectionRequest>>>,
     copy_relations: Receiver<CopyRelationUpsertRequest>,
     grid_mutations: Receiver<GridMutation>,
@@ -435,6 +452,7 @@ fn start_native(
                 terminal_orders,
                 terminal_cancellations,
                 terminal_positions,
+                terminal_wake,
                 terminal_projection,
                 copy_relations,
                 grid_mutations,
@@ -461,6 +479,7 @@ async fn native_loop(
     terminal_orders: Receiver<Scoped<TerminalOrderRequest>>,
     terminal_cancellations: Receiver<Scoped<TerminalCancelRequest>>,
     terminal_positions: Receiver<Scoped<TerminalPositionActionRequest>>,
+    terminal_wake: std::sync::Arc<tokio::sync::Notify>,
     terminal_projection: tokio::sync::watch::Receiver<Option<Scoped<TerminalProjectionRequest>>>,
     copy_relations: Receiver<CopyRelationUpsertRequest>,
     grid_mutations: Receiver<GridMutation>,
@@ -513,6 +532,7 @@ async fn native_loop(
                 terminal_orders,
                 terminal_cancellations,
                 terminal_positions,
+                terminal_wake,
             ),
         );
         grid::start_native(
@@ -1899,6 +1919,8 @@ impl ControlClient {
         let (terminal_cancel_tx, terminal_cancel_rx) = unbounded();
         let (terminal_position_tx, terminal_position_rx) = bounded(1);
         #[cfg(not(target_arch = "wasm32"))]
+        let terminal_wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        #[cfg(not(target_arch = "wasm32"))]
         let (terminal_projection_tx, _terminal_projection_rx) = tokio::sync::watch::channel(None);
         let (copy_relation_tx, _copy_relation_rx) = unbounded();
         let (grid_mutation_tx, _grid_mutation_rx) = unbounded();
@@ -1910,6 +1932,8 @@ impl ControlClient {
             terminal_order_tx,
             terminal_cancel_tx,
             terminal_position_tx,
+            #[cfg(not(target_arch = "wasm32"))]
+            terminal_wake,
             #[cfg(not(target_arch = "wasm32"))]
             terminal_projection_tx,
             copy_relation_tx,
