@@ -348,10 +348,23 @@ pub fn parse_public_trades(
     if binding.venue != venue_gateway_api::VenueId::Bybit {
         return Err(BybitPublicError::Binding);
     }
+    linear_native_symbol(&binding.symbol)?;
+    parse_display_trades(payload, &binding.symbol, generation, received_at_ms)
+}
+
+pub(crate) fn parse_display_trades(
+    payload: &str,
+    symbol: &Symbol,
+    generation: u64,
+    received_at_ms: u64,
+) -> Result<Vec<PublicTrade>, BybitPublicError> {
+    if !matches!(symbol.quote(), "USDT" | "USDC") {
+        return Err(BybitPublicError::Product);
+    }
     if generation == 0 || received_at_ms == 0 {
         return Err(BybitPublicError::Sequence);
     }
-    let native_symbol = linear_native_symbol(&binding.symbol)?;
+    let native_symbol = format!("{}{}", symbol.base(), symbol.quote());
     let root_value = parse_json(payload)?;
     let root = object(&root_value)?;
     require_text(root, "topic", &format!("publicTrade.{native_symbol}"))?;
@@ -390,7 +403,7 @@ pub fn parse_public_trades(
                 return Err(BybitPublicError::Payload);
             }
             Ok(PublicTrade {
-                symbol: binding.symbol.clone(),
+                symbol: symbol.clone(),
                 generation,
                 received_at_ms,
                 exchange_time_ms,

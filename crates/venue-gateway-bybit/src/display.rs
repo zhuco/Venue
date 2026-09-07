@@ -1,3 +1,4 @@
+pub mod stream;
 // Public perpetual market display via the fixed Venue HTTPS relay.
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -65,15 +66,7 @@ pub async fn candles(
     before: Option<u64>,
 ) -> Result<Vec<PublicBar>> {
     let native = format!("{}{}", instrument.symbol.base(), instrument.symbol.quote());
-    let interval = match ms {
-        60_000 => "1",
-        300_000 => "5",
-        900_000 => "15",
-        3_600_000 => "60",
-        14_400_000 => "240",
-        86_400_000 => "D",
-        _ => return Err("unsupported interval".into()),
-    };
+    let interval = interval(ms)?;
     let cursor = before
         .map(|before| format!("&end={}", before.saturating_sub(1)))
         .unwrap_or_default();
@@ -187,4 +180,16 @@ pub async fn trades(
     }
     result.sort_by_key(|t| t.transaction_time_ms);
     Ok(result)
+}
+
+fn interval(ms: u64) -> Result<&'static str> {
+    match ms {
+        60_000 => Ok("1"),
+        300_000 => Ok("5"),
+        900_000 => Ok("15"),
+        3_600_000 => Ok("60"),
+        14_400_000 => Ok("240"),
+        86_400_000 => Ok("D"),
+        _ => return Err("unsupported interval".into()),
+    }
 }

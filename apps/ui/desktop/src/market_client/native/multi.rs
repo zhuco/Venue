@@ -1,4 +1,5 @@
 use super::*;
+mod bybit_stream;
 use crate::model::MarketServer;
 use venue_gateway_api::display::{Book, Instrument, Quote};
 pub(super) async fn ensure_clock(http: &reqwest::Client) -> Result<(), String> {
@@ -254,6 +255,22 @@ async fn subscription_loop(
         else {
             return;
         };
+        if server == MarketServer::Bybit {
+            pending = bybit_stream::run(
+                http,
+                instruments,
+                generation,
+                selections,
+                commands,
+                history,
+                emitter.events.clone(),
+            )
+            .await;
+            if pending.is_none() {
+                return;
+            }
+            continue;
+        }
         let mut initialized = BTreeSet::new();
         let mut seen = std::collections::VecDeque::new();
         loop {

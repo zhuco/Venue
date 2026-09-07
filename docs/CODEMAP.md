@@ -6,6 +6,8 @@
 
 六所公共行情的自动校时：`crates/venue-gateway-api/src/display/clock.rs` 维护仅供显示的单调时钟；Bybit `display::synchronize_display_clock` 读取精确只读 `/quotes/bybit/v5/market/time`，桌面 `market_client/native/multi.rs` 自动刷新。它不参与签名、账户事实或系统校时。
 
+Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit_stream.rs` 独立维护当前图表的 WS、历史与统计任务；`crates/venue-gateway-bybit/src/display/stream.rs` 复用原盘口序列与逐笔解析，公开范围不携带账户身份。
+
 桌面多交易所公共行情：`apps/ui/desktop/src/market_client/native/multi.rs` 负责显示订阅及代次；`crates/venue-gateway-{bybit,bitget,gate,okx,hyperliquid}/src/display.rs` 解析各所公开协议；`crates/venue-gateway-api/src/display.rs` 提供有界显示数据与已有领域类型转换；`scripts/configure_desktop_https.py` 管理固定只读代理。语言入口为顶部 `ui.rs` → `settings_panel.rs` 通用页。
 
 本页只定位当前入口与直接依赖。产品范围见 [README](../README.md)，职责见 [架构](ARCHITECTURE.md)，行为与验收见 [KOL MVP](KOL_COPY_MVP.md)、[人工带单](LEADER_ORDER_MIRROR.md) 和 [Grid 契约](GRID_RUNTIME_REFACTOR.md)。路径均相对仓库根。

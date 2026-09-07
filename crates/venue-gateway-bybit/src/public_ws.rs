@@ -46,6 +46,7 @@ type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 /// A bounded public receiver for exactly one Bybit LIVE USDT-linear symbol. It owns no
 /// credentials and has no path to a private or mutation transport.
 pub struct BybitScalpingPublicReceiver {
+    binding: GatewayBinding,
     socket: Socket,
     bridge: BybitBookBridge,
     connect_timeout: Duration,
@@ -103,6 +104,7 @@ impl BybitScalpingPublicReceiver {
         .map_err(|_| BybitPublicWsError::Timeout)?
         .map_err(|_| BybitPublicWsError::Disconnected)?;
         Ok(Self {
+            binding: binding.gateway_binding().clone(),
             bridge: BybitBookBridge::new(binding.gateway_binding(), native_symbol, generation)?,
             socket,
             connect_timeout,
@@ -217,7 +219,7 @@ impl BybitScalpingPublicReceiver {
         if topic == kline_topic(&self.bridge.native_symbol) {
             return match parse_closed_1m_kline(
                 &payload,
-                &self.bridge.binding,
+                &self.binding,
                 self.bridge.generation,
                 received_at_ms,
             ) {
@@ -233,7 +235,7 @@ impl BybitScalpingPublicReceiver {
         if topic == public_trade_topic(&self.bridge.native_symbol) {
             return parse_public_trades(
                 &payload,
-                &self.bridge.binding,
+                &self.binding,
                 self.bridge.generation,
                 received_at_ms,
             )
@@ -400,8 +402,8 @@ fn same_trade(
         && left.aggressor == right.aggressor
 }
 
-struct BybitBookBridge {
-    binding: GatewayBinding,
+pub(crate) struct BybitBookBridge {
+    symbol: venue_domain::Symbol,
     native_symbol: String,
     generation: u64,
     last_update_id: Option<u64>,
@@ -416,11 +418,19 @@ impl BybitBookBridge {
         native_symbol: String,
         generation: u64,
     ) -> Result<Self, BybitPublicWsError> {
+        Self::for_display(binding.symbol.clone(), native_symbol, generation)
+    }
+
+    pub(crate) fn for_display(
+        symbol: venue_domain::Symbol,
+        native_symbol: String,
+        generation: u64,
+    ) -> Result<Self, BybitPublicWsError> {
         if generation == 0 || native_symbol.is_empty() {
             return Err(BybitPublicWsError::Clock);
         }
         Ok(Self {
-            binding: binding.clone(),
+            symbol,
             native_symbol,
             generation,
             last_update_id: None,
@@ -430,7 +440,7 @@ impl BybitBookBridge {
         })
     }
 
-    fn accept(
+    pub(crate) fn accept(
         &mut self,
         root: &Map<String, Value>,
         received_at_ms: u64,
@@ -517,7 +527,7 @@ impl BybitBookBridge {
 
     fn current_snapshot(&self, update_id: u64, exchange_time_ms: u64) -> MarketEvent {
         MarketEvent::Snapshot(MarketSnapshot {
-            symbol: self.binding.symbol.clone(),
+            symbol: self.symbol.clone(),
             generation: self.generation,
             sequence: update_id,
             exchange_time_ms: Some(exchange_time_ms),
