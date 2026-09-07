@@ -68,6 +68,7 @@
 | 配置与生命周期协议 | `crates/venue-control-protocol/src/grid.rs` |
 | 持久目标、版本 CAS、订单归属与批次尾 | `apps/venue-control/src/grid_store.rs`、`grid_store/{surface,reads,types}.rs`；迁移 0021–0024 |
 | 私流驱动、冷恢复、热路径及风险协调 | `apps/venue-control/src/grid_runtime.rs`、`grid_runtime/{driver,fast_path,reconcile,stream_overlay,risk}.rs` |
+| 自有订单改价后的安全撤净与运维重置 | `grid_runtime.rs` 的运行参数检查与生命周期撤单身份检查分离；`venue-strategy-admin binance-grid-reset USER` 从 stdin 接收完整 `GridLifecycleRequest`，复用 owner/revision/幂等边界，只保存 Reset 意图 |
 | 批次组装与成交分配 | `apps/venue-control/src/grid_runtime/{batch,fills}.rs` |
 | 首次明确拒单后 30 秒重置 | `apps/venue-control/src/grid_store/{rejection,convergence}.rs`、`grid_runtime/driver.rs` |
 | 批内 Place-before-Cancel、RESULT 确认及计时 | `apps/venue-control/src/executor_exchange/grid_batch.rs` |

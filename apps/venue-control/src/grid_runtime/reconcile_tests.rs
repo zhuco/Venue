@@ -20,12 +20,22 @@ async fn multiple_rejections_keep_repair_and_exact_cancel_active_until_deadline(
     let Some(fixture) = Fixture::create().await? else {
         return Ok(());
     };
-    let result = exercise(&fixture.pool).await;
+    let result = exercise(&fixture.pool, false).await;
     fixture.cleanup().await?;
     result
 }
 
-async fn exercise(pool: &sqlx::PgPool) -> TestResult {
+#[tokio::test]
+async fn amended_owned_order_resets_by_identity_without_rewriting_placement() -> TestResult {
+    let Some(fixture) = Fixture::create().await? else {
+        return Ok(());
+    };
+    let result = exercise(&fixture.pool, true).await;
+    fixture.cleanup().await?;
+    result
+}
+
+async fn exercise(pool: &sqlx::PgPool, amended: bool) -> TestResult {
     sqlx::query("INSERT INTO venue_users (user_id,username,password_hash,created_ms) VALUES ($1,'grid-repair','fixture',1)")
         .bind(OWNER).execute(pool).await?;
     sqlx::query("INSERT INTO venue_user_trading_accounts (trading_account_id,user_id,venue,exchange_identity_hash) VALUES ($1,$2,'binance',$3)")
@@ -214,6 +224,10 @@ async fn exercise(pool: &sqlx::PgPool) -> TestResult {
     let actual = runtime
         .synchronize_actual_surface(&record, &projection, owners, now + 10)
         .await?;
+    if amended {
+        return exercise_amended_cancel(pool, &runtime, &store, &ledger, record, projection, now)
+            .await;
+    }
     let desired = store
         .load_desired_orders(INSTANCE)
         .await?
@@ -311,6 +325,162 @@ async fn exercise(pool: &sqlx::PgPool) -> TestResult {
     let sending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM venue_binance_commands WHERE grid_instance_id=$1 AND command_state='sending'")
         .bind(INSTANCE).fetch_one(pool).await?;
     assert_eq!(sending, 3);
+    Ok(())
+}
+
+async fn exercise_amended_cancel(
+    pool: &sqlx::PgPool,
+    runtime: &BinanceGridRuntime,
+    store: &BinanceGridStore,
+    ledger: &BinanceCommandLedger,
+    mut record: GridRuntimeRecord,
+    mut projection: TerminalAccountProjection,
+    now: u64,
+) -> TestResult {
+    let original = store.load_owned_orders(INSTANCE).await?;
+    let client = projection.open_orders[0].client_order_id.clone();
+    let owner = original
+        .iter()
+        .find(|o| o.client_order_id == client)
+        .ok_or("owner")?;
+    projection.open_orders[0].limit_price = Some(Decimal::new(966, 1));
+    assert_eq!(
+        validate_owned_order(&record, owner, &projection.open_orders[0]),
+        Err(BinanceGridRuntimeError::SurfaceConflict)
+    );
+    // An amendment may also increase quantity beyond the original placement. Cancellation
+    // must not rewrite the placement identity or pretend the extra fill belonged to it.
+    projection.open_orders[0].quantity = Decimal::from(2);
+    projection.open_orders[0].filled_quantity = Some(Decimal::new(12, 1));
+    projection.open_orders[0].state = TerminalOrderState::PartiallyFilled;
+    projection.open_orders[0].post_only = false;
+    projection.open_orders[0].time_in_force = Some(venue_domain::LimitTimeInForce::Gtc);
+    let amended = projection.open_orders[0].clone();
+    assert!(validate_owned_cancel(&record, owner, &amended).is_ok());
+    for (index, mut invalid) in [
+        amended.clone(),
+        amended.clone(),
+        amended.clone(),
+        amended.clone(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        match index {
+            0 => invalid.native_order_id = Some("different-native".into()),
+            1 => invalid.client_order_id = "external-order".into(),
+            2 => invalid.position_side = PositionSide::Short,
+            _ => invalid.symbol = "ETH/USDT".parse()?,
+        }
+        assert!(validate_owned_cancel(&record, owner, &invalid).is_err());
+    }
+    let mut terminal = owner.clone();
+    terminal.state = GridOwnedOrderState::Terminal;
+    assert!(validate_owned_cancel(&record, &terminal, &amended).is_err());
+    for state in [
+        GridInstanceState::Paused,
+        GridInstanceState::StopPending,
+        GridInstanceState::ResetRequired,
+    ] {
+        let mut drain = record.clone();
+        drain.instance.state = state;
+        let actual = runtime
+            .synchronize_actual_surface(&drain, &projection, original.clone(), now + 11)
+            .await?;
+        assert_eq!(actual.orders.len(), 1);
+        assert!(actual.intents.is_empty());
+    }
+    assert_eq!(store.load_owned_orders(INSTANCE).await?, original);
+    record.instance = store
+        .settle_runtime_state(
+            INSTANCE,
+            record.instance.state,
+            GridInstanceState::ResetRequired,
+            Some("surface_conflict"),
+            now + 12,
+        )
+        .await?;
+    projection.observed_ms = now + 13;
+    projection.persisted_ms = now + 13;
+    let mut external = amended;
+    external.client_order_id = "external-order".into();
+    external.native_order_id = Some("external-native".into());
+    projection.open_orders.push(external);
+    let actual = runtime
+        .synchronize_actual_surface(&record, &projection, original, now + 13)
+        .await?;
+    let desired = empty_surface(&record, empty_digest(), record.instance.plan_revision);
+    assert_eq!(
+        runtime
+            .reconcile_desired(&record, &projection, &actual, &desired, now + 13)
+            .await?,
+        ReconcileResult::Pending
+    );
+    let batch = ledger
+        .claim_next_batch(ACCOUNT, now + 14)
+        .await?
+        .ok_or("cancel batch")?;
+    assert_eq!(batch.commands.len(), 1);
+    let command = &batch.commands[0];
+    let ClaimedBinanceOrder::CancelExact {
+        target_client_order_id,
+        ..
+    } = &command.order
+    else {
+        return Err("drain must only cancel".into());
+    };
+    assert_eq!(target_client_order_id.as_deref(), Some(client.as_str()));
+    let selected: String = sqlx::query_scalar(
+        "SELECT selected_native_order_id FROM venue_binance_commands WHERE command_id=$1",
+    )
+    .bind(&command.command_id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(selected, "native-survivor");
+    assert_eq!(
+        runtime
+            .reconcile_desired(&record, &projection, &actual, &desired, now + 15)
+            .await?,
+        ReconcileResult::Pending
+    );
+    assert!(ledger.claim_next_batch(ACCOUNT, now + 16).await?.is_none());
+    ledger
+        .settle_with_readback(
+            &command.command_id,
+            ExecutorCommandState::Accepted,
+            now + 16,
+            None,
+            Some("native-survivor"),
+        )
+        .await?;
+    ledger
+        .settle_with_readback(
+            &command.command_id,
+            ExecutorCommandState::Reconciled,
+            now + 17,
+            None,
+            Some("native-survivor"),
+        )
+        .await?;
+    projection
+        .open_orders
+        .retain(|o| o.client_order_id != client);
+    projection.observed_ms = now + 18;
+    projection.persisted_ms = now + 18;
+    let actual = runtime
+        .synchronize_actual_surface(
+            &record,
+            &projection,
+            store.load_owned_orders(INSTANCE).await?,
+            now + 18,
+        )
+        .await?;
+    assert_eq!(
+        runtime
+            .reconcile_desired(&record, &projection, &actual, &desired, now + 18)
+            .await?,
+        ReconcileResult::Converged
+    );
     Ok(())
 }
 

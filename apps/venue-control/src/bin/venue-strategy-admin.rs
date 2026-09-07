@@ -1,4 +1,4 @@
-//! Trusted operator API for independent strategies. Credentials enter through stdin only.
+//! Trusted operator API for strategies. Credentials enter through stdin only.
 use sqlx::{Row, postgres::PgPoolOptions};
 use std::io::Read;
 use venue_control::{
@@ -29,11 +29,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let valid = matches!(args.as_slice(), [op] if op == "migrate")
         || matches!(args.as_slice(), [op, _, _, _, _] if op == "bind" || op == "bind-released")
-        || matches!(args.as_slice(), [op, _] if op == "martingale-create" || op == "martingale-lifecycle")
+        || matches!(args.as_slice(), [op, _] if matches!(op.as_str(), "martingale-create" | "martingale-lifecycle" | "binance-grid-reset"))
         || matches!(args.as_slice(), [op, _, _] if matches!(op.as_str(), "submit"|"status"|"limits"|"grid-create"|"grid-status"|"probe"|"observe"|"martingale-status"))
         || matches!(args.as_slice(), [op, _, _, _] if matches!(op.as_str(), "snapshot"|"grid-lifecycle"|"funding"));
     if !valid {
-        return Err("usage: venue-strategy-admin migrate | probe ACCOUNT SYMBOL | bind|bind-released USER ACCOUNT SYMBOL LABEL | limits USER CREDENTIAL | submit USER CREDENTIAL | observe USER CREDENTIAL | snapshot USER CREDENTIAL SYMBOL | funding USER CREDENTIAL SYMBOL | status USER COMMAND | grid-create USER CREDENTIAL | grid-status USER INSTANCE | grid-lifecycle USER INSTANCE start|pause|resume|stop|reset | martingale-create USER | martingale-status USER INSTANCE | martingale-lifecycle USER; structured input uses stdin".into());
+        return Err("usage: venue-strategy-admin migrate | probe ACCOUNT SYMBOL | bind|bind-released USER ACCOUNT SYMBOL LABEL | limits USER CREDENTIAL | submit USER CREDENTIAL | observe USER CREDENTIAL | snapshot USER CREDENTIAL SYMBOL | funding USER CREDENTIAL SYMBOL | status USER COMMAND | grid-create USER CREDENTIAL | grid-status USER INSTANCE | grid-lifecycle USER INSTANCE start|pause|resume|stop|reset | binance-grid-reset USER | martingale-create USER | martingale-status USER INSTANCE | martingale-lifecycle USER; structured input uses stdin".into());
     }
     if args[0] == "probe" {
         let credentials: StrategyCredentials = input()?;
@@ -52,6 +52,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(|_| "strategy admin database unavailable")?;
     match args[0].as_str() {
+        "binance-grid-reset" => {
+            let request: venue_control_protocol::grid::GridLifecycleRequest = input()?;
+            if request.action != venue_control_protocol::grid::GridLifecycleAction::Reset {
+                return Err("binance-grid-reset requires the reset action".into());
+            }
+            let instance = venue_control::BinanceGridStore::new(pool)
+                .request_lifecycle(&args[1], &request, now_ms()?)
+                .await?;
+            println!("{}", serde_json::to_string(&instance)?);
+        }
         "limits" => {
             StrategyCredentialStore::new(pool, CredentialCipher::from_environment()?)
                 .set_limits(&args[1], &args[2], input()?)

@@ -981,6 +981,24 @@ impl BinanceGridRuntime {
             }
             let remaining = remaining_quantity(order)?;
             if let Some(owner) = ownership.get_mut(&order.client_order_id) {
+                if matches!(
+                    record.instance.state,
+                    GridInstanceState::Paused
+                        | GridInstanceState::StopPending
+                        | GridInstanceState::ResetRequired
+                ) {
+                    if owner.state == GridOwnedOrderState::Terminal
+                        && projection.observed_ms <= owner.last_seen_ms
+                    {
+                        validate_owned_identity(record, owner, order)?;
+                        continue;
+                    }
+                    validate_owned_cancel(record, owner, order)?;
+                    // Drain by immutable identity even if the exchange order was amended.
+                    // Keep the original placement terms and fill accounting unchanged.
+                    orders.insert(order.client_order_id.clone(), order.clone());
+                    continue;
+                }
                 validate_owned_order(record, owner, order)?;
                 if owner.state == GridOwnedOrderState::Terminal {
                     if projection.observed_ms <= owner.last_seen_ms {
@@ -1496,16 +1514,11 @@ fn validate_owned_order(
     owner: &GridOrderOwnership,
     order: &TerminalOpenOrder,
 ) -> Result<(), BinanceGridRuntimeError> {
+    validate_owned_identity(record, owner, order)?;
     let filled = order
         .filled_quantity
         .ok_or(BinanceGridRuntimeError::Facts)?;
-    if owner.instance_id != record.instance.instance_id
-        || owner.trading_account_id != record.instance.trading_account_id
-        || owner.symbol != record.instance.symbol
-        || order.native_order_id.is_none()
-        || order.position_side != owner.key.position_side
-        || order.order_side != owner.key.order_side()
-        || order.quantity != owner.quantity
+    if order.quantity != owner.quantity
         || filled < Decimal::ZERO
         || filled > order.quantity
         || order.limit_price != Some(owner.limit_price)
@@ -1513,6 +1526,42 @@ fn validate_owned_order(
     {
         return Err(BinanceGridRuntimeError::SurfaceConflict);
     }
+    Ok(())
+}
+
+fn validate_owned_identity(
+    record: &GridRuntimeRecord,
+    owner: &GridOrderOwnership,
+    order: &TerminalOpenOrder,
+) -> Result<(), BinanceGridRuntimeError> {
+    if owner.instance_id != record.instance.instance_id
+        || owner.trading_account_id != record.instance.trading_account_id
+        || owner.symbol != record.instance.symbol
+        || order.symbol != owner.symbol
+        || order.client_order_id != owner.client_order_id
+        || order.native_order_id.is_none()
+        || owner
+            .native_order_id
+            .as_ref()
+            .is_some_and(|native| order.native_order_id.as_ref() != Some(native))
+        || order.position_side != owner.key.position_side
+        || order.order_side != owner.key.order_side()
+    {
+        return Err(BinanceGridRuntimeError::SurfaceConflict);
+    }
+    Ok(())
+}
+
+fn validate_owned_cancel(
+    record: &GridRuntimeRecord,
+    owner: &GridOrderOwnership,
+    order: &TerminalOpenOrder,
+) -> Result<(), BinanceGridRuntimeError> {
+    validate_owned_identity(record, owner, order)?;
+    if owner.native_order_id.is_none() || owner.state != GridOwnedOrderState::Working {
+        return Err(BinanceGridRuntimeError::SurfaceConflict);
+    }
+    remaining_quantity(order)?;
     Ok(())
 }
 
