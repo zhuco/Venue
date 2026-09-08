@@ -69,7 +69,7 @@ export function CustomerConsole({ inviteCode, registration = false }: { inviteCo
   const locked = busy || !fresh || pending !== null;
   const bot = leader?.bot;
   return <main className="customer-page"><div className="customer-stack">
-    <header className="customer-header"><div><p className="eyebrow">VENUE · BINANCE LIVE</p><h1>{kolProfile ? "KOL 管理后台" : "跟单账户"}</h1><p>同步 KOL 的限价单、市价单和止损单，使用自己的交易账户执行。</p></div>{overview && <div className="buttons"><span>{overview.user.username}</span><button disabled={busy || pending !== null} onClick={() => void mutate("logout", {})}>退出登录</button></div>}</header>
+    <header className="customer-header"><div><p className="eyebrow">VENUE · BINANCE LIVE</p><h1>{kolProfile ? "KOL 管理后台" : "跟单账户"}</h1><p>同步 KOL 的限价单、市价单和止损单，使用自己的交易账户执行。</p></div>{overview && <div className="buttons">{kolProfile && <a className="guide-help-link" href="/help/kol">KOL 使用指南</a>}<span>{overview.user.username}</span><button disabled={busy || pending !== null} onClick={() => void mutate("logout", {})}>退出登录</button></div>}</header>
     {error && <div role="alert" className="notice error">{error}</div>}
     {message && <div role="status" className="notice">{message}</div>}
     {pending && <div className="notice"><span>上次请求结果待确认。重试会使用同一个请求编号。</span><div className="buttons"><button disabled={busy} onClick={() => void mutate(pending.action, pending.body, true)}>查询并重试原请求</button></div></div>}

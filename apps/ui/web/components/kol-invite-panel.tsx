@@ -45,7 +45,7 @@ export function KolInvitePanel({ csrf, enabled }: { csrf: string; enabled: boole
     try { await navigator.clipboard.writeText(value); setCopied("已复制"); }
     catch { setError("复制失败，请选中下方文本手动复制。"); }
   }
-  return <section className="panel" aria-label="邀请跟单用户"><h2>邀请跟单用户</h2>
+  return <section className="panel" aria-label="邀请跟单用户"><h2>邀请跟单用户</h2><a href="/help/kol#invite" target="_blank" rel="noreferrer">如何邀请用户并开始跟单？</a>
     <p>用户通过邀请链接注册，或在注册页填写邀请码，注册后固定归属于你。</p>
     {!enabled && <p className="notice">KOL 尚未启用，暂不能生成或使用邀请码。</p>}
     {error && <p role="alert" className="notice error">{error}</p>}

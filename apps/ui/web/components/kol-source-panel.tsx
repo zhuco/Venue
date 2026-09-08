@@ -17,7 +17,7 @@ export function KolSourcePanel({ csrf, credentials, onSource }: { csrf: string; 
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => { onSource(source?.trading_account_id ?? null); }, [source, onSource]);
   const current = source?.trading_account_id ? credentials.find(c => c.trading_account_id === source.trading_account_id) : undefined;
-  return <section className="panel" aria-label="带单账户"><h2>带单账户（只能选择一个）</h2>
+  return <section className="panel" aria-label="带单账户"><h2>带单账户（只能选择一个）</h2><a href="/help/kol#source" target="_blank" rel="noreferrer">查看设置步骤</a>
     <p>必须使用币安统一账户（Portfolio Margin），并开启 U 本位合约双向持仓。</p>
     <p>当前带单账户：<strong>{current?.label ?? source?.trading_account_id ?? "尚未指定"}</strong></p>
     {error && <p role="alert">{error}</p>}
