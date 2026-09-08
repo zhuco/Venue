@@ -50,6 +50,7 @@ impl PgExecutorStore {
                 let id = deterministic_id(&relation_id, &symbol, side, target_revision, phase);
                 let digest: Vec<u8> = target.try_get("payload_digest").map_err(unavailable)?;
                 let copy_risk = crate::executor_exchange::CopyRiskContext {
+                    round_open_quantity_up: false,
                     max_order_notional: decimal(&relation, "max_order_notional")?,
                     max_total_notional: decimal(&relation, "max_total_notional")?,
                     max_deviation_bps: u32::try_from(

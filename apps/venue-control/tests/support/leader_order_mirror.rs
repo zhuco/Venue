@@ -504,6 +504,14 @@ async fn mirror_sizing_and_revocation(fixed: bool) -> Result<(), Box<dyn std::er
             .fetch_one(&fixture.pool)
             .await?;
     assert_eq!(kind, "limit_post_only");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM venue_binance_commands WHERE command_phase='open' AND copy_risk->>'round_open_quantity_up'='true'"
+        )
+        .fetch_one(&fixture.pool)
+        .await?,
+        2
+    );
     if fixed {
         let quantities: Vec<String> =
             sqlx::query_scalar("SELECT child_quantity FROM venue_order_mirrors")

@@ -47,7 +47,9 @@ async fn mock_submit_is_stable_by_client_order_id() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-fn grid_place_request(index: usize) -> Result<ExecutionRequest, Box<dyn std::error::Error>> {
+pub(super) fn grid_place_request(
+    index: usize,
+) -> Result<ExecutionRequest, Box<dyn std::error::Error>> {
     Ok(ExecutionRequest {
         origin: venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
         command_id: format!("place-command-{index}"),

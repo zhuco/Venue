@@ -31,7 +31,7 @@
 | 带单多配置目录与创建/编辑/启停 | `apps/venue-control/src/accounts/leader_bot.rs`、`crates/venue-control-protocol/src/leader_bot.rs`；迁移 0028/0029/0034 |
 | 托管 API 保存、掩码与验证 | `apps/venue-control/src/accounts/managed_followers.rs`；迁移 0030/0031 的 `venue_managed_credentials`，不改写冻结同名旧表 |
 | 托管账户逐账户参数及生命周期 | `apps/venue-control/src/accounts/follow_requests.rs`；迁移 0033；`/v2/kol/managed-followers/follow/{status,settings,lifecycle}` |
-| 定比/定额数量 | `crates/venue-control-protocol/src/follow_sizing.rs`、`apps/venue-control/src/order_mirror/planner.rs`；迁移 0032 |
+| 定比/定额数量 | `crates/venue-control-protocol/src/follow_sizing.rs`、`apps/venue-control/src/order_mirror/planner.rs`；开仓向上取整/最小合规额与回读共用 `apps/venue-control/src/executor_exchange/copy_risk.rs`，回归 `apps/venue-control/src/executor_exchange/copy_rounding_tests.rs`；迁移 0032 |
 | 源/子单映射、替代单、撤单及对账 | `apps/venue-control/src/order_mirror/{mod,planner,store,settlement}.rs` |
 | 启用签名基线、空仓与过期请求保护 | `apps/venue-control/src/executor_store/activation.rs` |
 | 关系领取、暂停与 revision 事务顺序 | `apps/venue-control/src/kol_executor/copy_gate.rs` |

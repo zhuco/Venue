@@ -11,6 +11,12 @@ use rust_decimal::Decimal;
 use sqlx::{PgConnection, Row};
 use venue_control_protocol::kol::{ExecutorCommandOrigin, TerminalOpenOrder};
 
+#[cfg(test)]
+#[path = "settlement_tests.rs"]
+mod tests;
+
+const RECORD_MIRROR_FACT: &str = "UPDATE venue_order_mirrors m SET child_native_order_id=$1,child_quantity=$6,filled_quantity=$2,mirror_state=CASE WHEN $3 THEN 'terminal' ELSE m.mirror_state END,updated_ms=$4 FROM venue_binance_commands c WHERE c.command_id=$5 AND c.mirror_order_id=m.mirror_id AND (m.child_native_order_id IS NULL OR m.child_native_order_id=$1) AND m.filled_quantity::numeric<=$2::numeric AND ((m.child_native_order_id IS NOT NULL AND $6::numeric=m.child_quantity::numeric) OR (m.child_native_order_id IS NULL AND ($6::numeric<=m.child_quantity::numeric OR (c.command_phase='open' AND c.copy_risk->>'round_open_quantity_up'='true'))) OR (COALESCE(c.copy_risk->>'round_open_quantity_up','false')<>'true' AND $6::numeric<=m.child_quantity::numeric))";
+
 pub(super) fn now_ms() -> Result<u64, Error> {
     u64::try_from(
         std::time::SystemTime::now()
@@ -161,8 +167,19 @@ impl PgExecutorStore {
         {
             return Err(Error::Conflict);
         }
-        let updated=sqlx::query("UPDATE venue_order_mirrors m SET child_native_order_id=$1,filled_quantity=$2,mirror_state=CASE WHEN $3 THEN 'terminal' ELSE m.mirror_state END,updated_ms=$4 FROM venue_binance_commands c WHERE c.command_id=$5 AND c.mirror_order_id=m.mirror_id AND (m.child_native_order_id IS NULL OR m.child_native_order_id=$1) AND m.filled_quantity::numeric<=$2::numeric AND $6::numeric<=m.child_quantity::numeric")
-            .bind(native).bind(fact.filled_quantity.to_string()).bind(fact.terminal).bind(stamp(now)?).bind(&command.command_id).bind(fact.quantity.to_string()).execute(self.mirror_pool()).await.map_err(unavailable)?.rows_affected();
+        // The executor has matched the signed fact against the command's persisted rounding
+        // policy. Record its actual lot size once; later facts cannot resize that native order.
+        let updated = sqlx::query(RECORD_MIRROR_FACT)
+            .bind(native)
+            .bind(fact.filled_quantity.to_string())
+            .bind(fact.terminal)
+            .bind(stamp(now)?)
+            .bind(&command.command_id)
+            .bind(fact.quantity.to_string())
+            .execute(self.mirror_pool())
+            .await
+            .map_err(unavailable)?
+            .rows_affected();
         if updated != 1 {
             return Err(Error::Conflict);
         }

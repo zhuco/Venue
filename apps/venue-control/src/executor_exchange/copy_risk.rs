@@ -3,9 +3,16 @@ use venue_domain::domain::Asset;
 use venue_execution::AccountRiskEvidence;
 use venue_gateway_binance::{BinanceInstrumentRules, BinanceMarkPrice};
 
+#[cfg(test)]
+#[path = "copy_rounding_tests.rs"]
+mod rounding_tests;
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CopyRiskContext {
+    /// Persisted per command so recovery never changes an older order's rounding policy.
+    #[serde(default)]
+    pub round_open_quantity_up: bool,
     pub max_order_notional: Decimal,
     pub max_total_notional: Decimal,
     pub max_deviation_bps: u32,
@@ -156,13 +163,88 @@ pub(super) fn check_mirror_limit_risk(
         .ok_or_else(invalid)?;
     let asset = Asset::new(binding.symbol.quote()).map_err(|_| invalid())?;
     let unit = risk.value_in_usdt(&asset, price).map_err(|_| invalid())?;
-    let notional = normalize_quantity(requested, rules)?
+    let quantity = if context.round_open_quantity_up {
+        normalize_mirror_open_quantity(requested, price, rules)?
+    } else {
+        normalize_quantity(requested, rules)?
+    };
+    let notional = quantity.checked_mul(unit).ok_or_else(invalid)?;
+    let order_limit = if context.round_open_quantity_up && notional > context.max_order_notional {
+        normalize_mirror_open_quantity(
+            context
+                .max_order_notional
+                .checked_div(unit)
+                .ok_or_else(invalid)?,
+            price,
+            rules,
+        )?
         .checked_mul(unit)
-        .ok_or_else(invalid)?;
-    if notional > context.max_order_notional
+        .ok_or_else(invalid)?
+    } else {
+        context.max_order_notional
+    };
+    if notional > order_limit
         || total.checked_add(notional).ok_or_else(invalid)? > context.max_total_notional
     {
         return Err(BinanceExecutionError::Risk(CopyRiskRejection::TotalLimit));
     }
     Ok(())
+}
+
+pub(super) fn normalize_request_quantity(
+    request: &ExecutionRequest,
+    quantity: Decimal,
+    rules: &BinanceInstrumentRules,
+) -> Result<Decimal, BinanceExecutionError> {
+    if request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Copy
+        && request
+            .copy_risk
+            .as_ref()
+            .is_some_and(|risk| risk.round_open_quantity_up)
+        && let ExecutionOrderKind::Limit {
+            reducing: false,
+            price,
+            ..
+        } = request.order_kind
+    {
+        return normalize_mirror_open_quantity(quantity, price, rules);
+    }
+    normalize_quantity(quantity, rules)
+}
+
+/// Smallest valid opening size at the source limit price. Closing intents keep their
+/// inventory-bounded floor policy and must never be enlarged to satisfy an opening minimum.
+pub(super) fn normalize_mirror_open_quantity(
+    requested: Decimal,
+    price: Decimal,
+    rules: &BinanceInstrumentRules,
+) -> Result<Decimal, BinanceExecutionError> {
+    let invalid = || BinanceExecutionError::Invalid;
+    let step = rules.instrument.quantity_step;
+    let minimum = rules.instrument.minimum_notional.value;
+    if requested <= Decimal::ZERO
+        || price <= Decimal::ZERO
+        || step <= Decimal::ZERO
+        || rules.minimum_quantity <= Decimal::ZERO
+        || minimum < Decimal::ZERO
+    {
+        return Err(invalid());
+    }
+    let target = requested
+        .max(rules.minimum_quantity)
+        .max(minimum.checked_div(price).ok_or_else(invalid)?);
+    // Remainder arithmetic avoids a rounded Decimal division losing the final lot.
+    let remainder = target.checked_rem(step).ok_or_else(invalid)?;
+    let mut quantity = if remainder > Decimal::ZERO {
+        target
+            .checked_sub(remainder)
+            .and_then(|n| n.checked_add(step))
+            .ok_or_else(invalid)?
+    } else {
+        target
+    };
+    if quantity.checked_mul(price).ok_or_else(invalid)? < minimum {
+        quantity = quantity.checked_add(step).ok_or_else(invalid)?;
+    }
+    normalize_quantity(quantity, rules)
 }
