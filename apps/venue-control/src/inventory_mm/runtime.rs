@@ -159,7 +159,10 @@ impl InventoryMmRuntime {
             .iter()
             .any(|c| c.state == ExecutorCommandState::ReconcileRequired)
         {
-            self.latch_and_cancel(record, "command_reconcile_required")
+            // The dispatcher continues same-identity readback. A stale discovery snapshot
+            // must not latch a command that recovered while this turn was loading facts.
+            self.store
+                .latch_stalled_reconciliation(record, now()?)
                 .await?;
             return Ok(());
         }
