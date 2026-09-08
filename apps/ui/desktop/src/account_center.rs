@@ -954,8 +954,8 @@ fn error_text(l: Language, code: AccountErrorCode) -> &'static str {
         ),
         AccountErrorCode::AccountInUse => tr(
             l,
-            "账户仍有风险、正在运行或无法确认安全状态，不能删除。",
-            "Account has exposure, is running, or cannot be confirmed safe to remove.",
+            "账户仍有风险、正在运行或无法确认安全状态，暂不能执行此操作。",
+            "Account has exposure, is running, or cannot be confirmed safe for this operation.",
         ),
         AccountErrorCode::RateLimited => tr(
             l,

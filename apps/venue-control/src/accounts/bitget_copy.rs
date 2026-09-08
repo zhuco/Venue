@@ -1,6 +1,7 @@
 use super::{AccountError, AccountService, Principal, error};
 use crate::{
-    multi_venue_credentials::StrategyCredentialStore, multi_venue_exchange::StrategyCredentials,
+    multi_venue_credentials::{StrategyCredentialBindError, StrategyCredentialStore},
+    multi_venue_exchange::StrategyCredentials,
 };
 use venue_control_protocol::accounts::{
     AccountErrorCode as Code, BindBitgetCopyCredentialRequest, CredentialSummary,
@@ -22,7 +23,7 @@ impl AccountService {
         let account = super::strategy_credential_id()?;
         let symbol = Symbol::new("BTC", "USDT").map_err(|_| error(Code::InvalidInput))?;
         StrategyCredentialStore::new_shared(self.pool.clone(), self.cipher.clone())
-            .bind(
+            .bind_bitget_copy(
                 &principal.user.user_id,
                 &account,
                 &request.label,
@@ -35,6 +36,10 @@ impl AccountService {
                 now_ms,
             )
             .await
-            .map_err(|_| error(Code::VerificationRequired))
+            .map_err(|bind_error| match bind_error {
+                StrategyCredentialBindError::AccountInUse => error(Code::AccountInUse),
+                StrategyCredentialBindError::IdentityConflict => error(Code::Conflict),
+                StrategyCredentialBindError::Exchange => error(Code::VerificationRequired),
+            })
     }
 }
