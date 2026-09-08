@@ -80,11 +80,13 @@ pub(super) fn snapshot_data(payload: &str) -> Result<Value, AccountHostValidatio
 }
 
 pub(super) fn snapshot_data_rows(payload: &str) -> Result<Vec<Value>, AccountHostValidationError> {
-    snapshot_data(payload)?
-        .get("list")
-        .and_then(Value::as_array)
-        .cloned()
-        .ok_or(AccountHostValidationError::SignedSnapshot)
+    match snapshot_data(payload)?.get("list") {
+        Some(Value::Array(rows)) => Ok(rows.clone()),
+        // Bitget returns an explicit null for an empty account-wide position list.
+        // Missing or differently typed fields remain fail-closed.
+        Some(Value::Null) => Ok(Vec::new()),
+        _ => Err(AccountHostValidationError::SignedSnapshot),
+    }
 }
 
 pub(super) fn snapshot_symbol(value: Option<&Value>) -> Result<Symbol, AccountHostValidationError> {
@@ -351,4 +353,25 @@ pub(super) fn snapshot_order_created_at_ms(
         .filter(|value| *value > 0)
         .map(Some)
         .ok_or(AccountHostValidationError::SignedSnapshot)
+}
+
+#[cfg(test)]
+mod position_list_tests {
+    use super::snapshot_data_rows;
+
+    #[test]
+    fn account_wide_positions_accept_explicit_null_only_as_empty() {
+        assert!(
+            snapshot_data_rows(r#"{"code":"00000","data":{"list":null}}"#)
+                .expect("explicit empty position list")
+                .is_empty()
+        );
+        for payload in [
+            r#"{"code":"00000","data":{}}"#,
+            r#"{"code":"00000","data":{"list":{}}}"#,
+            r#"{"code":"00000","data":null}"#,
+        ] {
+            assert!(snapshot_data_rows(payload).is_err());
+        }
+    }
 }
