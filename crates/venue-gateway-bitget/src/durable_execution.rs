@@ -120,8 +120,8 @@ impl BitgetAccountGateway {
         })
     }
 
-    /// The UID comes only from Bitget's signed account-info response.  A configured account
-    /// label or credential hash is never treated as the exchange identity.
+    /// Ordinary and elite UTA keys share a UID but address different trading portfolios.
+    /// Keep the ordinary identity stable; elite credentials use one durable scope per UID.
     pub fn verified_account_identity(&mut self) -> Result<String, BitgetAccountGatewayError> {
         let timestamp_ms = now_ms()?;
         let payload = self.runtime.block_on(
@@ -129,7 +129,7 @@ impl BitgetAccountGateway {
                 .fetch_account_info(&self.credentials, timestamp_ms),
         )?;
         let info = parse_account_info(&payload).ok_or(BitgetAccountGatewayError::Readback)?;
-        Ok(info.user_id)
+        scoped_account_identity(&info, self.credentials.account_scope)
     }
 
     /// Rechecks the key permissions immediately before a committed mutation. Recovery only
@@ -402,6 +402,21 @@ impl venue_execution::DurableAccountGateway for BitgetAccountGateway {
     }
 }
 
+fn scoped_account_identity(
+    info: &BitgetAccountInfo,
+    scope: crate::credentials::BitgetAccountScope,
+) -> Result<String, BitgetAccountGatewayError> {
+    match scope {
+        crate::credentials::BitgetAccountScope::Unified => Ok(info.user_id.clone()),
+        crate::credentials::BitgetAccountScope::EliteTrading => {
+            validate_scope_permissions(info, scope)?;
+            // This identifies the supported elite trading scope, not a fabricated exchange UID
+            // or a key identity. Rotating either of a portfolio's keys must not create a writer.
+            Ok(format!("elite-trading\0{}", info.user_id))
+        }
+    }
+}
+
 fn validate_scope_permissions(
     info: &BitgetAccountInfo,
     scope: crate::credentials::BitgetAccountScope,
@@ -535,6 +550,32 @@ impl BitgetAccountGateway {
 #[cfg(test)]
 mod tests {
     use super::{parse_account_info, validate_strategy_permissions};
+
+    #[test]
+    fn ordinary_and_elite_share_uid_but_not_durable_trading_scope() {
+        use crate::credentials::BitgetAccountScope;
+        let mut info = super::BitgetAccountInfo {
+            user_id: "12345".into(),
+            perm_type: "read-and-write".into(),
+            permissions: vec![
+                "uta_trade".into(),
+                "copy_futures_order".into(),
+                "copy_futures_position".into(),
+            ],
+        };
+        let ordinary = super::scoped_account_identity(&info, BitgetAccountScope::Unified).unwrap();
+        let elite =
+            super::scoped_account_identity(&info, BitgetAccountScope::EliteTrading).unwrap();
+        assert_eq!(ordinary, "12345");
+        assert_ne!(ordinary, elite);
+        assert_eq!(
+            elite,
+            super::scoped_account_identity(&info, BitgetAccountScope::EliteTrading).unwrap()
+        );
+        info.permissions
+            .retain(|value| value != "copy_futures_position");
+        assert!(super::scoped_account_identity(&info, BitgetAccountScope::EliteTrading).is_err());
+    }
 
     #[test]
     fn elite_scope_requires_both_copy_permissions_without_withdrawal() {
