@@ -18,7 +18,7 @@ use venue_control_protocol::{
     },
 };
 
-const INVITE_CODE: &str = "Safe_Kol_Invite_Code_00001";
+const INVITE_CODE: &str = "SafeKolInviteCode00001";
 
 #[tokio::test]
 async fn terminal_registration_is_free_without_weakening_invite_registration() -> TestResult {

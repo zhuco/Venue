@@ -28,7 +28,7 @@ export function KolInvitePanel({ csrf, enabled }: { csrf: string; enabled: boole
     finally { gate.current = false; setBusy(false); }
   }
   async function generate(manual = false) {
-    if (manual && !/^[A-Za-z0-9_-]{6,64}$/.test(custom.trim())) { setError("请输入 6–64 位字母、数字、- 或 _，邀请码区分大小写。"); return; }
+    if (manual && !/^[A-Za-z0-9]{4,64}$/.test(custom.trim())) { setError("请输入 4–64 位英文字母和数字，邀请码区分大小写。"); return; }
     if (gate.current || !loaded || !enabled || (!pending && invite && !confirmed)) return;
     const request = pending ?? { request_id: crypto.randomUUID(), expected_invite_id: invite?.invite_id ?? null, invite_code: manual ? custom.trim() : null };
     gate.current = true; setBusy(true); setError(""); setCopied("");
@@ -53,7 +53,7 @@ export function KolInvitePanel({ csrf, enabled }: { csrf: string; enabled: boole
     {loaded && invite && !code && <p>当前邀请码已过期，或旧记录仅保存哈希，无法显示原文。可生成新邀请码。</p>}
     {code && <div className="customer-grid"><label>邀请码<input readOnly value={code} /></label><label>邀请链接<input readOnly value={link} /></label></div>}
     {invite && <label className="customer-confirm"><input type="checkbox" checked={confirmed} disabled={busy || Boolean(pending)} onChange={event => setConfirmed(event.target.checked)} />我确认更换后旧邀请链接不能再注册，已有跟单归属不变。</label>}
-    <label>自定义邀请码（可选）<input value={custom} onChange={event => setCustom(event.target.value)} disabled={busy || Boolean(pending)} minLength={6} maxLength={64} placeholder="例如 KOL2026" /><small>6–64 位字母、数字、- 或 _，区分大小写；所有 KOL 的邀请码不能重复。</small></label>
+    <label>自定义邀请码（可选）<input value={custom} onChange={event => setCustom(event.target.value)} disabled={busy || Boolean(pending)} minLength={4} maxLength={64} placeholder="例如 KOL2026" /><small>4–64 位英文字母和数字，区分大小写；所有 KOL 的邀请码不能重复。</small></label>
     <div className="buttons"><button disabled={busy} onClick={() => void refresh()}>刷新邀请码</button>
       <button className="primary" disabled={busy || !loaded || !enabled || (!pending && Boolean(invite) && !confirmed)} onClick={() => void generate()}>{pending ? "重试原请求" : invite ? "生成新邀请码" : "生成邀请码"}</button>
       <button disabled={busy || !loaded || !enabled || Boolean(pending) || !custom.trim() || (Boolean(invite) && !confirmed)} onClick={() => void generate(true)}>使用自定义邀请码</button>

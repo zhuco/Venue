@@ -56,7 +56,7 @@ export function CustomerConsole({ inviteCode, registration = false }: { inviteCo
       if (action === "logout") { hasSession.current = false; setOverview(null); setLeader(null); setKolProfile(null); setRelation(null); setOrders([]); }
       else {
         if (action === "verify") { const feedback = verificationFeedback(result.verification); if (feedback.success) setMessage(feedback.message); else setError(feedback.message); }
-        else setMessage("请求已处理。");
+        else setMessage(action === "leader-create" ? "带单机器人已创建，当前为停止状态。确认后可启动带单。" : "请求已处理。");
         await refresh();
       }
     } catch (cause) {
@@ -75,7 +75,7 @@ export function CustomerConsole({ inviteCode, registration = false }: { inviteCo
     {pending && <div className="notice"><span>上次请求结果待确认。重试会使用同一个请求编号。</span><div className="buttons"><button disabled={busy} onClick={() => void mutate(pending.action, pending.body, true)}>查询并重试原请求</button></div></div>}
     {loading ? <p role="status">正在读取账户…</p> : !overview ? <section className="panel customer-auth"><h2>{registering ? "注册跟单账户" : "登录账户"}</h2>{invite && <div className="customer-invite"><strong>{invite.profile.name} · {invite.profile.title}</strong><p>{invite.profile.description}</p></div>}
       <form onSubmit={(event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = new FormData(event.currentTarget); const body = { username: field(data, "username"), password: field(data, "password"), ...(registering ? { invite_code: inviteCode ?? field(data, "inviteCode").trim() } : {}) }; event.currentTarget.reset(); void mutate(registering ? "register" : "login", body); }}>
-        {registering && !inviteCode && <label>KOL 邀请码<input name="inviteCode" required minLength={6} maxLength={64} pattern="[A-Za-z0-9_-]+" autoComplete="off" /><small>向你要跟随的 KOL 获取邀请码。注册后归属固定，不会自动换绑。</small></label>}
+        {registering && !inviteCode && <label>KOL 邀请码<input name="inviteCode" required minLength={4} maxLength={64} pattern="[A-Za-z0-9]+" autoComplete="off" /><small>向你要跟随的 KOL 获取邀请码。注册后归属固定，不会自动换绑。</small></label>}
         <label>用户名<input name="username" autoComplete="username" required minLength={3} maxLength={64} /></label>
         <label>密码<input name="password" type="password" autoComplete={registering ? "new-password" : "current-password"} required minLength={8} maxLength={128} /></label>
         <div className="buttons"><button className="primary" disabled={busy || Boolean(inviteCode && !invite)}>{registering ? "注册跟单账户" : "登录"}</button>{registering ? <a href="/login">已有账户，前往登录</a> : <a href="/register">注册跟单账户</a>}</div>
@@ -94,7 +94,20 @@ export function CustomerConsole({ inviteCode, registration = false }: { inviteCo
         {!leader?.can_use && <p>带单权限已撤销。已有实例仍可查看和停止。</p>}
         {bot ? <><p>主账户：{bot.trading_account_id}</p><p>跟单账户 {bot.active_followers} · 待处理挂单 {bot.pending_orders}</p>{bot.attention_code && <p role="status">需处理：{bot.attention_code}</p>}</> : <p>将已验证的 KOL 主账户设为带单源。</p>}
         {leader?.can_use && bot?.state === "stopped" && <label className="customer-confirm"><input type="checkbox" checked={confirmed} onChange={e => setConfirmed(e.target.checked)} />我确认启动后，符合条件的新挂单将同步到启用跟单的账户。</label>}
-        <div className="buttons">{!bot && leader?.can_use && <button disabled={locked || selected?.verification !== "verified"} onClick={() => void mutate("leader", { schema_version: 1, request_id: crypto.randomUUID(), credential_id: selected?.credential_id }, true)}>创建带单机器人</button>}
+        {!bot && leader?.can_use && <form key={selected?.credential_id ?? "no-source"} onSubmit={event => {
+          event.preventDefault();
+          if (locked || selected?.verification !== "verified") return;
+          const data = new FormData(event.currentTarget);
+          const capital = field(data, "capital").trim();
+          if (!/^\d+(\.\d+)?$/.test(capital) || !/[1-9]/.test(capital)) { setError("策略资金必须为大于零的金额。"); return; }
+          void mutate("leader-create", { schema_version: 2, request_id: crypto.randomUUID(), credential_id: selected.credential_id, config: { name: field(data, "botName").trim(), description: "", strategy_capital: capital } }, true);
+        }}><fieldset disabled={locked || selected?.verification !== "verified"}>
+          <label>机器人名称<input name="botName" required maxLength={64} defaultValue="KOL 带单" /></label>
+          <label>策略资金（USD）<input name="capital" required inputMode="decimal" pattern="[0-9]+(\.[0-9]+)?" defaultValue={hasFollowEquity(selected?.equity) ? selected?.equity ?? "" : ""} placeholder="请输入大于零的策略资金" /></label>
+          <p className="muted">用于定比跟单计算。请核对实际策略资金；创建后仍需确认启动。</p>
+          <button type="submit">创建带单机器人</button>
+        </fieldset>{selected?.verification !== "verified" && <p role="status">请先验证账户并保存唯一带单账户。</p>}</form>}
+        <div className="buttons">
           {bot && leader?.can_use && bot.state === "stopped" && <button className="primary" disabled={locked || !confirmed} onClick={() => void mutate("leader-lifecycle", { schema_version: 1, request_id: crypto.randomUUID(), bot_id: bot.bot_id, expected_revision: bot.revision, action: "start", risk_confirmed: true }, true)}>启动带单</button>}
           {bot && bot.state !== "stopped" && <button disabled={locked || bot.state === "draining"} onClick={() => void mutate("leader-lifecycle", { schema_version: 1, request_id: crypto.randomUUID(), bot_id: bot.bot_id, expected_revision: bot.revision, action: "stop", risk_confirmed: false }, true)}>停止并撤销同步挂单</button>}
         </div><p className="muted">停止只撤销程序创建的同步挂单，已有仓位不会自动平仓。</p>

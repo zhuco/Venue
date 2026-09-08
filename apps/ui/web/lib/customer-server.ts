@@ -25,6 +25,7 @@ const routes: Record<string, { path: string; methods: string[]; public?: boolean
   settings: { path: "/v2/kol/follow/settings", methods: ["GET", "POST"] },
   follow: { path: "/v2/kol/follow/lifecycle", methods: ["POST"] },
   leader: { path: "/v2/kol/leader-bot", methods: ["GET", "POST"] },
+  "leader-create": { path: "/v2/kol/leader-bots", methods: ["POST"] },
   "leader-lifecycle": { path: "/v2/kol/leader-bot/lifecycle", methods: ["POST"] },
   "mirror-orders": { path: "/v2/kol/follow/orders", methods: ["GET"] },
 };
@@ -111,6 +112,11 @@ function followAuthorization(raw: unknown): ObjectValue {
 // secrets are never passed through to a browser response, including unexpected fields.
 export function customerPublicValue(action: string, method: string, raw: unknown): unknown {
   if (raw === null) return null;
+  if (action === "leader-create") {
+    const value = object(raw);
+    if (!Array.isArray(value.bots)) throw new Error("invalid_bots");
+    return { ...pick(value, ["schema_version", "can_use", "permission_revision"]), bots: value.bots.map(bot => pick(bot, ["bot_id", "state", "revision"])) };
+  }
   if (["managed-settings", "managed-follow", "managed-status"].includes(action)) {
     const value = object(raw);
     return { ...pick(value, ["managed_id", "relation_id", "state", "revision", "activation_requested"]), settings: publicRisk(value.settings, true) };
@@ -160,7 +166,7 @@ export async function customerResponse(request: NextRequest, action: string): Pr
   let path = route?.path ?? "";
   if (invite) {
     const code = request.nextUrl.searchParams.get("code") ?? "";
-    if (!/^[A-Za-z0-9_-]{6,64}$/.test(code)) return response({ code: "invalid_input" }, 400);
+    if (!/^[A-Za-z0-9]{4,64}$/.test(code)) return response({ code: "invalid_input" }, 400);
     path = `/v2/public/kol/invites/${code}`;
   } else if (request.nextUrl.search) return response({ code: "invalid_input" }, 400);
   const session = customerSession(request);
@@ -175,7 +181,7 @@ export async function customerResponse(request: NextRequest, action: string): Pr
       if (action === "register") {
         if (Object.keys(raw).some(k => !["username", "password", "invite_code"].includes(k))
           || typeof raw.username !== "string" || typeof raw.password !== "string"
-          || typeof raw.invite_code !== "string" || !/^[A-Za-z0-9_-]{6,64}$/.test(raw.invite_code)) throw new Error("invalid_registration");
+          || typeof raw.invite_code !== "string" || !/^[A-Za-z0-9]{4,64}$/.test(raw.invite_code)) throw new Error("invalid_registration");
         body = JSON.stringify({ username: raw.username, password: raw.password, invite_code: raw.invite_code });
       } else if (action === "managed-followers") {
         if (Object.keys(raw).some(k => !["request_id", "label", "key", "secret", "authorization"].includes(k)) || [raw.request_id, raw.label, raw.key, raw.secret].some(v => typeof v !== "string")) throw new Error("invalid_managed_credentials");

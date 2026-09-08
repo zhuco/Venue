@@ -16,7 +16,7 @@ pub const VERIFY_PATH: &str = "/v2/account/credentials/verify";
 pub const DELETE_PATH: &str = "/v2/account/credentials/delete";
 pub const SELECT_PATH: &str = "/v2/account/select";
 pub const MIN_PASSWORD_CHARS: usize = 8;
-pub const MIN_INVITE_CODE_CHARS: usize = 6;
+pub const MIN_INVITE_CODE_CHARS: usize = 4;
 pub const MAX_INVITE_CODE_CHARS: usize = 64;
 
 #[derive(Clone, Debug)]
@@ -95,9 +95,7 @@ impl RegisterRequest {
     pub fn normalized_invite_code(&self) -> Option<String> {
         let code = self.invite_code.trim();
         ((MIN_INVITE_CODE_CHARS..=MAX_INVITE_CODE_CHARS).contains(&code.len())
-            && code
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+            && code.bytes().all(|byte| byte.is_ascii_alphanumeric()))
         .then(|| code.to_owned())
     }
 
@@ -280,17 +278,27 @@ mod tests {
         let request = RegisterRequest {
             username: "Alice".into(),
             password: SecretValue::new("a safe long passphrase".into()),
-            invite_code: "Abcdefghijklmnop_1234567".into(),
+            invite_code: "Abcd1234".into(),
         };
         assert!(request.valid());
         assert_eq!(
             request.normalized_invite_code().as_deref(),
-            Some("Abcdefghijklmnop_1234567")
+            Some("Abcd1234")
         );
         let unknown = serde_json::from_str::<RegisterRequest>(
-            r#"{"username":"alice","password":"a safe passphrase","invite_code":"Abcdefghijklmnop_1234567","kol_id":"forged"}"#,
+            r#"{"username":"alice","password":"a safe passphrase","invite_code":"Abcd1234","kol_id":"forged"}"#,
         );
         assert!(unknown.is_err());
+        for code in ["Ab12", "1234", "a".repeat(64).as_str()] {
+            let mut valid = request.clone();
+            valid.invite_code = code.into();
+            assert!(valid.valid());
+        }
+        for code in ["Ab1", "AB_1", "AB-1", "中文12", "a".repeat(65).as_str()] {
+            let mut invalid = request.clone();
+            invalid.invite_code = code.into();
+            assert!(!invalid.valid());
+        }
         let mut invalid = request;
         invalid.invite_code = "contains/slash-and-is-not-valid".into();
         assert!(!invalid.valid());

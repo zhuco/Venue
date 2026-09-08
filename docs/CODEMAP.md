@@ -183,3 +183,5 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 - Web 公开注册：`apps/ui/web/app/register/page.tsx`；KOL 邀请与唯一带单账户：`components/kol-invite-panel.tsx`、`components/kol-source-panel.tsx`，Control `accounts/kol_invites.rs`、`accounts/kol_source.rs`，迁移 0046/0047。
 
 Web KOL 使用指南：`apps/ui/web/app/help/kol/page.tsx`，路由 `/help/kol`；后台顶部、API、带单源与邀请表单提供定位入口。
+
+Web 带单机器人创建：`apps/ui/web/components/customer-console.tsx` → BFF `leader-create` → `/v2/kol/leader-bots`，显式提交正策略资金，保存停止态；读取和启停继续使用单机器人兼容接口。

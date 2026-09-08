@@ -157,7 +157,7 @@ test("public follower registration requires an invite and cannot request elevate
   try {
     process.env.VENUE_WEB_SESSION_SIGNING_KEY = material;
     process.env.VENUE_CONTROL_ORIGIN = "http://127.0.0.1:39180";
-    const body = { username: "follower", password: "password-fixture", invite_code: "KOL2026" };
+    const body = { username: "follower", password: "password-fixture", invite_code: "Ab12" };
     globalThis.fetch = async (url, init) => {
       calls++;
       assert.equal(String(url), "http://127.0.0.1:39180/v2/account/register");
@@ -165,7 +165,7 @@ test("public follower registration requires an invite and cannot request elevate
       assert.equal(new Headers(init?.headers).get("authorization"), null);
       return Response.json({ ...session(), user: { user_id: "follower", username: "follower" } });
     };
-    for (const raw of [{ username: body.username, password: body.password }, { ...body, invite_code: "" }, { ...body, role: "kol" }, { ...body, kol_user_id: "forged" }]) {
+    for (const raw of [{ username: body.username, password: body.password }, { ...body, invite_code: "" }, { ...body, invite_code: "Ab1" }, { ...body, invite_code: "AB_1" }, { ...body, invite_code: "AB-1" }, { ...body, role: "kol" }, { ...body, kol_user_id: "forged" }]) {
       assert.equal((await customerResponse(request("register", { body: raw }), "register")).status, 400);
     }
     assert.equal(calls, 0);
@@ -182,4 +182,34 @@ test("public follower registration requires an invite and cannot request elevate
 test("KOL invite responses expose only the owned share code, never database envelopes", () => {
   assert.deepEqual(customerPublicValue("kol-invite", "GET", { invite_id: "id", invite_code: "KOL2026", active: true, created_ms: 100, code_envelope: "secret", code_hash: "hash", request_hash: "hash", kol_user_id: "hidden" }), { invite_id: "id", invite_code: "KOL2026", active: true, created_ms: 100 });
   assert.deepEqual(customerPublicValue("kol-profile", "GET", { kol_id: "own", state: "enabled", api_secret: "hidden" }), { kol_id: "own", state: "enabled" });
+});
+
+
+test("configured leader creation forwards capital and the same request identity without leaking internals", async () => {
+  const keys = ["VENUE_WEB_SESSION_SIGNING_KEY", "VENUE_CONTROL_ORIGIN"] as const;
+  const old = keys.map(key => process.env[key]); const originalFetch = globalThis.fetch;
+  try {
+    process.env.VENUE_WEB_SESSION_SIGNING_KEY = material;
+    process.env.VENUE_CONTROL_ORIGIN = "http://127.0.0.1:39180";
+    const cookie = sealCustomerSession(session()); assert.ok(cookie);
+    const body = { schema_version: 2, request_id: session().csrf, credential_id: "owned", config: { name: "KOL", description: "", strategy_capital: "100.25" } };
+    let calls = 0;
+    globalThis.fetch = async (url, init) => {
+      calls++;
+      assert.equal(String(url), "http://127.0.0.1:39180/v2/kol/leader-bots");
+      assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${session().token}`);
+      assert.deepEqual(JSON.parse(String(init?.body)), body);
+      if (calls === 1) return Response.json({ code: "unavailable" }, { status: 503 });
+      return Response.json({ schema_version: 2, can_use: true, permission_revision: 1, bots: [{ bot_id: "created", state: "stopped", revision: 1, owner: "hidden", api_secret: "hidden" }] });
+    };
+    assert.equal((await customerResponse(request("leader-create", { cookie, body }), "leader-create")).status, 503);
+    assert.equal(calls, 1);
+    const result = await customerResponse(request("leader-create", { cookie, body }), "leader-create");
+    assert.equal(result.status, 200);
+    assert.deepEqual(await result.json(), { schema_version: 2, can_use: true, permission_revision: 1, bots: [{ bot_id: "created", state: "stopped", revision: 1 }] });
+    assert.equal(calls, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    keys.forEach((key, index) => { if (old[index] === undefined) delete process.env[key]; else process.env[key] = old[index]; });
+  }
 });

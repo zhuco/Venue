@@ -100,9 +100,7 @@ impl AccountService {
         if !(venue_control_protocol::accounts::MIN_INVITE_CODE_CHARS
             ..=venue_control_protocol::accounts::MAX_INVITE_CODE_CHARS)
             .contains(&code.len())
-            || !code
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            || !code.bytes().all(|byte| byte.is_ascii_alphanumeric())
         {
             return Err(error(Code::NotFound));
         }
@@ -707,7 +705,7 @@ mod tests {
     use venue_gateway_binance::BinanceCredentialProbe;
 
     const KOL_ACCOUNT: &str = "00000000-0000-4000-8000-000000000102";
-    const INVITE: &str = "Safe_Kol_Invite_Code_00001";
+    const INVITE: &str = "SafeKolInviteCode00001";
 
     #[tokio::test]
     async fn registration_binds_the_resolved_invite_once_and_profiles_are_owner_scoped()

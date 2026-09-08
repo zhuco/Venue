@@ -72,7 +72,7 @@ impl AccountService {
             Some(code) => {
                 venue_control_protocol::accounts::SecretValue::new(code.trim().to_owned())
             }
-            None => crypto::new_token()?,
+            None => new_invite_code()?,
         };
         let scope = format!(
             "kol-invite:{}:{}",
@@ -132,11 +132,42 @@ impl AccountService {
     }
 }
 
+fn new_invite_code() -> Result<venue_control_protocol::accounts::SecretValue, AccountError> {
+    const ALPHABET: &[u8; 62] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut code = String::with_capacity(6);
+    while code.len() < 6 {
+        // Reject the incomplete range so every character has equal probability.
+        for byte in crypto::random::<16>()? {
+            if byte < 248 {
+                code.push(char::from(ALPHABET[usize::from(byte % 62)]));
+                if code.len() == 6 {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(venue_control_protocol::accounts::SecretValue::new(code))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::accounts::test_support::{Fixture, login, now};
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn generated_invites_are_six_alphanumeric_characters() -> TestResult {
+        for _ in 0..128 {
+            let code = new_invite_code()?;
+            assert_eq!(code.expose().len(), 6);
+            assert!(
+                code.expose()
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric())
+            );
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn invites_are_owned_encrypted_idempotent_and_rotate_without_rebinding() -> TestResult {
@@ -232,7 +263,7 @@ mod tests {
                 KolInviteCreateRequest {
                     request_id: crypto::opaque_id()?,
                     expected_invite_id: Some(first.invite_id.clone()),
-                    invite_code: Some("CUSTOM_2026".into()),
+                    invite_code: Some("Ab12".into()),
                 },
                 time + 1,
             )
