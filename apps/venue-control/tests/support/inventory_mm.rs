@@ -200,6 +200,98 @@ async fn inventory_mm_postgres_lifecycle_commands_and_fences()
     assert_eq!(commands.len(), 2);
     let first = &commands[0];
     let first_id = first.client_order_id.clone();
+    // A temporary unknown result holds the account without permanently stopping MM.
+    let current = store.get(&user, &running.instance_id).await?;
+    let sent = now + 2;
+    sqlx::query("UPDATE venue_binance_commands SET command_state='reconcile_required',sending_ms=$2 WHERE client_order_id=$1")
+        .bind(&first_id).bind(i64::try_from(sent)?).execute(&fixture.pool).await?;
+    // Keep this runtime probe offline; coexistence admission above is already verified.
+    sqlx::query(
+        "UPDATE venue_inventory_mm_instances SET instance_state='stopped' WHERE instance_id=$1",
+    )
+    .bind(&peer.instance_id)
+    .execute(&fixture.pool)
+    .await?;
+    runtime.run_once().await?;
+    assert_eq!(store.get(&user, &current.instance_id).await?, current);
+    assert!(
+        !store
+            .latch_stalled_reconciliation(&current, sent + 119_999)
+            .await?
+    );
+    assert_eq!(store.get(&user, &current.instance_id).await?, current);
+    assert!(!store.enqueue(&current, &intents, 7, now, now + 3).await?);
+    assert_eq!(store.commands(&current.instance_id).await?.len(), 2);
+
+    // Signed recovery wins even if the timeout turn began with an old unknown snapshot.
+    let mut recovery = fixture.pool.begin().await?;
+    sqlx::query(
+        "UPDATE venue_binance_commands SET command_state='reconciled' WHERE client_order_id=$1",
+    )
+    .bind(&first_id)
+    .execute(&mut *recovery)
+    .await?;
+    let waiter_store = store.clone();
+    let waiter_instance = current.clone();
+    let mut waiter = tokio::spawn(async move {
+        waiter_store
+            .latch_stalled_reconciliation(&waiter_instance, sent + 120_000)
+            .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut waiter)
+            .await
+            .is_err()
+    );
+    recovery.commit().await?;
+    assert!(!waiter.await??);
+    assert_eq!(store.get(&user, &current.instance_id).await?, current);
+
+    // Retry timestamps and a newly constructed store cannot postpone a genuinely stuck command.
+    sqlx::query("UPDATE venue_binance_commands SET command_state='reconcile_required',updated_ms=$2 WHERE client_order_id=$1")
+        .bind(&first_id).bind(i64::try_from(sent + 119_999)?).execute(&fixture.pool).await?;
+    let restarted = InventoryMmStore::new(fixture.pool.clone());
+    assert!(
+        restarted
+            .latch_stalled_reconciliation(&current, sent + 120_000)
+            .await?
+    );
+    let latched = restarted.get(&user, &current.instance_id).await?;
+    assert_eq!(
+        latched.attention.as_deref(),
+        Some("command_reconcile_timeout")
+    );
+    assert_eq!(
+        latched.state,
+        venue_control_protocol::inventory_mm::InventoryMmState::NeedsAttention
+    );
+    assert!(
+        !restarted
+            .latch_stalled_reconciliation(&latched, sent + 120_001)
+            .await?
+    );
+    assert!(matches!(
+        restarted.enqueue(&latched, &intents, 7, now, now + 3).await,
+        Err(InventoryMmStoreError::Conflict)
+    ));
+    let original = restarted.commands(&current.instance_id).await?;
+    assert_eq!(original.len(), 2);
+    assert!(original.iter().any(|c| c.client_order_id == first_id
+        && c.state == venue_control_protocol::kol::ExecutorCommandState::ReconcileRequired));
+
+    // Explicit Stop remains Stop even while an original request exceeds the recovery deadline.
+    sqlx::query("UPDATE venue_inventory_mm_instances SET instance_state='stop_pending',attention=NULL WHERE instance_id=$1")
+        .bind(&current.instance_id).execute(&fixture.pool).await?;
+    let stopping = store.get(&user, &current.instance_id).await?;
+    assert!(
+        !store
+            .latch_stalled_reconciliation(&stopping, sent + 120_002)
+            .await?
+    );
+    assert_eq!(store.get(&user, &current.instance_id).await?, stopping);
+    // Restore this isolated fixture for the remaining lifecycle and dispatch cases.
+    sqlx::query("UPDATE venue_inventory_mm_instances SET instance_state='running',attention=NULL WHERE instance_id=$1")
+        .bind(&current.instance_id).execute(&fixture.pool).await?;
     sqlx::query("UPDATE venue_binance_commands SET command_state='reconciled',native_order_id='native-1',updated_ms=created_ms WHERE client_order_id=$1").bind(&first_id).execute(&fixture.pool).await?;
     let second_id = commands[1].client_order_id.clone();
     sqlx::query("UPDATE venue_binance_commands SET command_state='cancelled',updated_ms=created_ms WHERE client_order_id=$1").bind(&second_id).execute(&fixture.pool).await?;

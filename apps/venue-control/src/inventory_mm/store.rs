@@ -380,6 +380,39 @@ impl InventoryMmStore {
         tx.commit().await.map_err(db)?;
         Ok(true)
     }
+    /// Recheck under row locks before escalating. Readback retries and process restarts
+    /// must not extend the original dispatch's bounded recovery window.
+    pub async fn latch_stalled_reconciliation(
+        &self,
+        instance: &InventoryMmInstance,
+        now: u64,
+    ) -> Result<bool> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        lock_queue(&mut tx, instance).await?;
+        let stalled: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT command_id,COALESCE(sending_ms,created_ms) FROM venue_binance_commands WHERE inventory_mm_instance_id=$1 AND owner_user_id=$2 AND trading_account_id=$3 AND credential_id=$4 AND command_state='reconcile_required' ORDER BY command_id FOR UPDATE",
+        )
+        .bind(&instance.instance_id)
+        .bind(&instance.owner_user_id)
+        .bind(&instance.trading_account_id)
+        .bind(&instance.credential_id)
+        .fetch_all(&mut *tx).await.map_err(db)?;
+        let deadline = ms(now.saturating_sub(120_000))?;
+        let Some((command_id, _)) = stalled.iter().find(|(_, sent)| *sent <= deadline) else {
+            tx.commit().await.map_err(db)?;
+            return Ok(false);
+        };
+        let changed = sqlx::query("UPDATE venue_inventory_mm_instances SET attention='command_reconcile_timeout',instance_state='needs_attention',revision=revision+1,updated_ms=$3 WHERE instance_id=$1 AND revision=$2 AND instance_state IN ('running','start_pending') AND attention IS NULL")
+            .bind(&instance.instance_id).bind(ms(instance.revision)?).bind(ms(now)?)
+            .execute(&mut *tx).await.map_err(db)?.rows_affected() == 1;
+        tx.commit().await.map_err(db)?;
+        if changed {
+            tracing::warn!(instance_id=%instance.instance_id, %command_id,
+                "inventory MM original command readback exceeded 120 seconds; quotes remain fenced");
+        }
+        Ok(changed)
+    }
+
     pub async fn observe(
         &self,
         instance: &InventoryMmInstance,
