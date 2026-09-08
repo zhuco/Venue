@@ -35,9 +35,10 @@ export function ManagedFollowSettingsPanel({ managedId, label, csrf, canManage, 
     if (pending || !relation || !hasFollowEquity(equity)) return;
     const data = new FormData(event.currentTarget);
     const text = (name: string) => String(data.get(name) ?? "").trim();
+    const sizing = sizingFromForm(data);
     const settings: ManagedFollowSettings = {
-      sizing: sizingFromForm(data), allocated_capital: equity, multiplier: text("multiplier"),
-      max_order_notional: text("orderLimit"), max_total_notional: text("totalLimit"),
+      sizing, allocated_capital: equity, multiplier: text("multiplier"),
+      max_order_notional: sizing.mode === "fixed_notional" ? sizing.notional : equity, max_total_notional: sizing.mode === "fixed_notional" ? sizing.notional : equity,
       max_deviation_bps: Number(text("deviation")), allowed_symbols: text("symbols").split(/[,，\s]+/).filter(Boolean),
     };
     void submit("managed-settings", { managed_id: managedId, request_id: crypto.randomUUID(), expected_revision: relation?.revision ?? null, settings });
@@ -57,8 +58,6 @@ export function ManagedFollowSettingsPanel({ managedId, label, csrf, canManage, 
         <fieldset disabled={busy || Boolean(pending) || !canManage || !relation || !hasFollowEquity(equity) || relation?.state === "active" || relation?.activation_requested}>
           <FollowSizingFields value={current?.sizing} multiplier={current?.multiplier} equity={equity} />
           <details><summary>高级设置（可选）</summary><div className="customer-grid">
-            <label>单笔名义上限（报价币）<input name="orderLimit" inputMode="decimal" defaultValue={current?.max_order_notional ?? ""} required /></label>
-            <label>总名义上限（报价币）<input name="totalLimit" inputMode="decimal" defaultValue={current?.max_total_notional ?? ""} required /></label>
             <label>价格偏离限制（基点）<input name="deviation" type="number" min="0" max="5000" defaultValue={current?.max_deviation_bps ?? ""} required /></label>
             <label>允许交易对（留空允许全部）<input name="symbols" defaultValue={current?.allowed_symbols.join(", ") ?? ""} placeholder="留空允许全部" /></label>
           </div></details><div className="buttons"><button className="primary" type="submit">保存设置</button></div>

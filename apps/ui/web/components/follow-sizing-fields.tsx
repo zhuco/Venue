@@ -12,7 +12,7 @@ export function FollowSizingFields({ value, multiplier = "1", multiplierName = "
     <input type="hidden" name="sizingMode" value={mode} />
     <p className="muted">{mode === "proportional" ? "按账户全部权益与带单策略资金的比例跟单，默认 1 倍。" : "每笔开仓使用相同的名义金额，不乘跟单倍数。名义金额是订单价值，不是保证金。"}</p>
     {mode === "fixed_notional" ? <><label>每笔跟单名义金额（报价币）<input key="fixed" name="fixedNotional" inputMode="decimal" defaultValue={value?.mode === "fixed_notional" ? value.notional : ""} required /><small>USDT 合约按 USDT 填写，USDC 合约按 USDC 填写；低于交易所最低名义额时会补足。</small></label><input type="hidden" name={multiplierName} value="1" /></> : <label>跟单倍数<input key="proportional" name={multiplierName} inputMode="decimal" defaultValue={multiplier} required /><small>1 倍表示使用相同的资金比例，2 倍表示该比例的两倍。</small></label>}
-    <p className="muted">跟单资金默认使用验证时的账户全部权益{hasFollowEquity(equity) ? `（${equity} USD）` : ""}，无需填写总跟单金额。此为验证快照；已有持仓与可用保证金仍会限制下单。</p>
+    <p className="muted">跟单资金默认使用验证时的账户全部权益{hasFollowEquity(equity) ? `（${equity} USD）` : ""}，无需填写总跟单金额。此为验证快照；定比数量仍按此快照计算。软件不设置单笔或总名义金额上限，能否开仓由币安账户保证金及交易规则决定。</p>
   </div>;
 }
 

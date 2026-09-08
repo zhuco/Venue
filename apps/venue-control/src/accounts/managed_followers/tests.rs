@@ -414,7 +414,45 @@ async fn managed_verification_uses_saved_authorization_and_requests_activation()
     assert_eq!(relation.settings.sizing, Default::default());
     assert_eq!(relation.settings.multiplier, Decimal::ONE);
     assert_eq!(relation.settings.allocated_capital, Decimal::from(100));
-    assert_eq!(relation.settings.max_total_notional, Decimal::from(500));
+    assert_eq!(relation.settings.max_total_notional, Decimal::from(100));
+    let mut fixed = request("00000000-0000-4000-8000-000000000633", 'B');
+    fixed.authorization.sizing =
+        venue_control_protocol::follow_sizing::FollowSizing::FixedNotional {
+            notional: Decimal::from(600),
+        };
+    let fixed = f
+        .service
+        .create_managed_follower(&owner, fixed, timestamp)
+        .await?;
+    f.service
+        .verify_managed_follower_with(
+            &owner,
+            ManagedFollowerVerifyRequest {
+                managed_id: fixed.managed_id.clone(),
+            },
+            timestamp,
+            |_| async { proof(97, false, timestamp + 1) },
+        )
+        .await?;
+    let fixed = f
+        .service
+        .managed_follow_status(
+            &owner,
+            ManagedFollowStatusRequest {
+                managed_id: fixed.managed_id,
+            },
+            timestamp,
+        )
+        .await?
+        .ok_or("missing fixed relation")?;
+    assert!(fixed.activation_requested);
+    assert_eq!(fixed.settings.allocated_capital, Decimal::from(100));
+    assert_eq!(
+        fixed.settings.sizing,
+        venue_control_protocol::follow_sizing::FollowSizing::FixedNotional {
+            notional: Decimal::from(600)
+        }
+    );
     f.cleanup().await
 }
 

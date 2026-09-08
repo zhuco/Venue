@@ -10,6 +10,9 @@ mod rounding_tests;
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CopyRiskContext {
+    /// Missing policy belongs to an already persisted command and retains its original limits.
+    #[serde(default)]
+    pub notional_limit_policy: CopyNotionalLimitPolicy,
     /// Persisted per command so recovery never changes an older order's rounding policy.
     #[serde(default)]
     pub round_open_quantity_up: bool,
@@ -20,6 +23,14 @@ pub struct CopyRiskContext {
     pub max_deviation_bps: u32,
     pub source_price: Decimal,
     pub source_occurred_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyNotionalLimitPolicy {
+    #[default]
+    StoredLimits,
+    ExchangeAccount,
 }
 
 impl CopyRiskContext {
@@ -97,6 +108,16 @@ pub(super) fn clip_open_quantity(
             CopyRiskRejection::PriceDeviation,
         ));
     }
+    if context.notional_limit_policy == CopyNotionalLimitPolicy::ExchangeAccount {
+        let quantity = normalize_copy_open_quantity(
+            context,
+            requested.min(rules.maximum_quantity),
+            mark.price.value(),
+            rules,
+        )?;
+        check_minimum_notional_at_price(mark.price, quantity, rules)?;
+        return Ok(quantity);
+    }
     let total = risk
         .signed_position_total()
         .map_err(|_| invalid())?
@@ -164,6 +185,10 @@ pub(super) fn check_mirror_limit_risk(
         return Err(BinanceExecutionError::Risk(
             CopyRiskRejection::PriceDeviation,
         ));
+    }
+    if context.notional_limit_policy == CopyNotionalLimitPolicy::ExchangeAccount {
+        normalize_copy_open_quantity(context, requested, price, rules)?;
+        return Ok(());
     }
     let total = risk
         .signed_position_total()

@@ -583,7 +583,7 @@ async fn mirror_sizing_and_revocation(
     assert_eq!(kind, "limit_post_only");
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM venue_binance_commands WHERE command_phase='open' AND copy_risk->>'round_open_quantity_up'='true'"
+            "SELECT count(*) FROM venue_binance_commands WHERE command_phase='open' AND copy_risk->>'round_open_quantity_up'='true' AND copy_risk->>'notional_limit_policy'='exchange_account'"
         )
         .fetch_one(&fixture.pool)
         .await?,
