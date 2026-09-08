@@ -375,14 +375,12 @@ impl AccountService {
         if equity <= Decimal::ZERO {
             return Err(error(Code::AccountInUse));
         }
-        let total = equity
-            .checked_mul(Decimal::from(5))
-            .ok_or(error(Code::InvalidInput))?;
+        // Keep legacy wire fields valid; new mirrors persist ExchangeAccount admission.
         let order = match authorization.sizing {
-            FollowSizing::Proportional => total,
-            FollowSizing::FixedNotional { notional } if notional <= total => notional,
-            FollowSizing::FixedNotional { .. } => return Err(error(Code::InvalidInput)),
+            FollowSizing::Proportional => equity,
+            FollowSizing::FixedNotional { notional } => notional,
         };
+        let total = order;
         let existing = match self.follow_relation(principal).await {
             Ok(value) => Some(value),
             Err(cause) if cause.code == Code::NotFound => None,

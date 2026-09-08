@@ -42,3 +42,11 @@ Install the browser once with `npx playwright install chromium`. Alternatively s
 Use `VENUE_WEB_QA_DIR=G:\Build\Venue\venue-web-qa\<run-id>`, then run `npm run test:e2e` after a production build. Screenshots default to `<qa-dir>/screenshots`; `VENUE_WEB_SCREENSHOT_DIR` can override this with another absolute build-artifact path. Without overrides, Windows uses `G:/Build/Venue/venue-web-qa/local-<pid>` and other hosts use their temporary directory. QA never defaults to the source or trading-recovery directory. The suite starts isolated listeners on 3216 and 38080; both must be free. It covers all five migration viewports, scoped session recovery, drawer focus, exact control confirmation, relation idempotency, empty/error/offline/stale states, signed-fact layout and decimal preservation.
 
 `control.spec.ts` uses browser request interception with synthetic account IDs for deterministic UI failure/layout cases. `performance.spec.ts` exercises the real BFF against a separate isolated test Control HTTP service, without interception. Its timing report is local BFF evidence only, not proof of PostgreSQL, Executor, exchange latency or live trading. Product and capacity acceptance follow [KOL_COPY_MVP](KOL_COPY_MVP.md); QA fixture services are never part of the standalone production release.
+
+公开注册入口 `/register` 保留邀请码固定归属，普通注册用户只能添加本人跟单账户。每个账户在添加时选择定比或定额（每笔名义金额）；跟单资金默认账户验证时的全部权益，不设置总跟单金额或项目止损。跟单中参数只读，暂停并排空后修改。
+
+KOL 与跟单页面明确要求币安统一账户（Portfolio Margin）、U 本位合约双向持仓及读取/交易权限、关闭提现。KOL 后台 `/v2/kol/source` 指定唯一带单账户，独立于登录会话的当前账户；需为本人验证通过的账户。管理员可预建无账户的 draft KOL，首次指定时以已验证权益初始化策略资金并占用全站最多 5 个名额之一；不自动创建或启动机器人，带单权限仍需独立授权。已有机器人或跟单关系时禁止更换源，保留历史身份。
+
+KOL 后台可随机生成或输入 6–64 位 ASCII 字母数字及 `_`、`-` 邀请码，区分大小写，全平台（包括历史）唯一；`/v2/kol/invite` 使用数据库唯一约束、事务和请求摘要保障并发及重试。邀请码按现有密钥边界加密存储，注册归属保持不可变。KOL 隐藏误用跟随者范围的“我的同步订单”，普通跟单用户保留该模块。需要同步部署 Control 迁移 0046、0047 与 Web。
+
+KOL 原生跟单的新指令不再使用软件单笔或总名义金额上限，也不再以初始权益乘 5 限制开仓。限价、市价与 STOP_MARKET 开仓均持久化 `copy_risk.notional_limit_policy=exchange_account`；币安账户保证金、持仓/订单规则、交易所步长/最小名义额/最大数量决定准入，原权限、同一身份对账、价格保护和只减仓约束保留。定比/定额决定计划数量，定比权益仍是验证快照，取消额度不代表动态重算跟单比例。历史无此字段的指令按 `stored_limits` 原规则恢复，已拒绝指令不自动补发。旧 wire 和数据库额度列仅为历史兼容，新模式不用于开仓额度；页面移除额度输入，API 字段显示统一为“API密钥”和“密钥”。

@@ -486,13 +486,19 @@ async fn mirror_sizing_and_revocation(
     gtc["client_order_id"] = "source-gtc".into();
     gtc["post_only"] = false.into();
     gtc["time_in_force"] = "gtc".into();
+    // Open the worker/poller connections before publishing short-lived signed facts.
+    let mut connections = Vec::new();
+    for _ in 0..4 {
+        connections.push(fixture.pool.acquire().await?);
+    }
+    drop(connections);
     persist_projection(
         &fixture.pool,
         &kol,
         &leader_account,
         &leader_credential,
         vec![order.clone(), gtc.clone()],
-        now,
+        test_now_ms()?,
     )
     .await?;
     persist_projection(
@@ -501,7 +507,7 @@ async fn mirror_sizing_and_revocation(
         &follower_account,
         &follower_credential,
         vec![],
-        now,
+        test_now_ms()?,
     )
     .await?;
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
@@ -583,7 +589,7 @@ async fn mirror_sizing_and_revocation(
     assert_eq!(kind, "limit_post_only");
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM venue_binance_commands WHERE command_phase='open' AND copy_risk->>'round_open_quantity_up'='true'"
+            "SELECT count(*) FROM venue_binance_commands WHERE command_phase='open' AND copy_risk->>'round_open_quantity_up'='true' AND copy_risk->>'notional_limit_policy'='exchange_account'"
         )
         .fetch_one(&fixture.pool)
         .await?,
@@ -1056,9 +1062,10 @@ async fn wait_count(
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(
-                format!("mirror fixture timed out: expected {wanted}, got {actual}").into(),
-            );
+            return Err(format!(
+                "mirror fixture timed out: {query}; expected {wanted}, got {actual}"
+            )
+            .into());
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }

@@ -20,6 +20,7 @@ fn rules() -> Result<BinanceInstrumentRules, Box<dyn std::error::Error>> {
 
 fn context() -> CopyRiskContext {
     CopyRiskContext {
+        notional_limit_policy: Default::default(),
         round_open_quantity_up: true,
         open_quantity_rounding: None,
         max_order_notional: Decimal::from(5),
@@ -164,6 +165,116 @@ fn risk(
         }],
     )?;
     Ok((binding, evidence))
+}
+
+#[test]
+fn exchange_account_policy_ignores_software_caps_but_keeps_exchange_and_freshness_checks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut context = bounded_context();
+    context.source_price = Decimal::new(8945, 5);
+    context.max_order_notional = Decimal::new(499869383, 7);
+    context.max_total_notional = context.max_order_notional;
+    let (binding, evidence) = risk(Decimal::new(4507306585, 8), Decimal::ONE)?;
+    let rules = rules()?;
+    let requested = Decimal::new(278927115714, 10);
+    assert_eq!(
+        check_mirror_limit_risk(
+            &context,
+            &binding,
+            &evidence,
+            &rules,
+            requested,
+            context.source_price,
+            1000
+        ),
+        Err(BinanceExecutionError::Risk(CopyRiskRejection::TotalLimit))
+    );
+    context.notional_limit_policy = CopyNotionalLimitPolicy::ExchangeAccount;
+    let context: CopyRiskContext = serde_json::from_value(serde_json::to_value(&context)?)?;
+    check_mirror_limit_risk(
+        &context,
+        &binding,
+        &evidence,
+        &rules,
+        requested,
+        context.source_price,
+        1000,
+    )?;
+    let mark = BinanceMarkPrice {
+        symbol: binding.symbol.clone(),
+        price: Price::new(context.source_price)?,
+        observed_at_ms: 1000,
+    };
+    assert_eq!(
+        clip_open_quantity(
+            &context, &binding, &evidence, &mark, &rules, requested, 1000
+        )?,
+        Decimal::from(56)
+    );
+    assert_eq!(
+        clip_open_quantity(
+            &context,
+            &binding,
+            &evidence,
+            &mark,
+            &rules,
+            Decimal::from(1000),
+            1000
+        )?,
+        Decimal::from(1000)
+    );
+    assert!(
+        check_mirror_limit_risk(
+            &context,
+            &binding,
+            &evidence,
+            &rules,
+            rules.maximum_quantity + Decimal::ONE,
+            context.source_price,
+            1000
+        )
+        .is_err()
+    );
+    assert!(
+        clip_open_quantity(
+            &context, &binding, &evidence, &mark, &rules, requested, 60_000
+        )
+        .is_err()
+    );
+    assert!(
+        check_mirror_limit_risk(
+            &context,
+            &binding,
+            &evidence,
+            &rules,
+            requested,
+            context.source_price + Decimal::ONE,
+            1000
+        )
+        .is_err()
+    );
+    let mut old = serde_json::to_value(&context)?;
+    old.as_object_mut()
+        .ok_or("missing policy object")?
+        .remove("notional_limit_policy");
+    let old: CopyRiskContext = serde_json::from_value(old)?;
+    assert_eq!(
+        old.notional_limit_policy,
+        CopyNotionalLimitPolicy::StoredLimits
+    );
+    assert!(
+        check_mirror_limit_risk(
+            &old,
+            &binding,
+            &evidence,
+            &rules,
+            requested,
+            old.source_price,
+            1000
+        )
+        .is_err()
+    );
+    Ok(())
 }
 
 #[test]

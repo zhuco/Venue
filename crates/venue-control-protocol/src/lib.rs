@@ -8,6 +8,8 @@ pub mod follow_sizing;
 pub mod grid;
 pub mod inventory_mm;
 pub mod kol;
+pub mod kol_invites;
+pub mod kol_source;
 pub mod leader_bot;
 pub mod managed_followers;
 pub mod support_martingale;
