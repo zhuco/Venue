@@ -231,9 +231,8 @@ impl InventoryMmRuntime {
             return Ok(());
         }
         if self.private_recovery.remove(&record.instance_id).is_some() {
-            self.markets.remove(&record.instance_id);
             tracing::info!(instance_id=%record.instance_id,
-                "inventory MM private facts recovered; rewarming quotes");
+                "inventory MM private facts recovered; validating fresh quotes");
         }
         if projection.position_mode != TerminalPositionMode::Hedge {
             self.latch_and_cancel(record, "position_mode_changed")
@@ -284,19 +283,13 @@ impl InventoryMmRuntime {
             .and_then(|v| v.checked_div(Decimal::from(2)))
             .and_then(|v| Price::new(v).ok())
             .ok_or(InventoryMmRuntimeError::Facts)?;
-        if bbo.observed_at_ms > market.last_sample_ms {
-            if market.last_sample_ms != 0
-                && bbo.observed_at_ms - market.last_sample_ms > facts::MARKET_MAX_AGE_MS
-            {
-                market.volatility =
-                    MmVolatility::new(20).map_err(|_| InventoryMmRuntimeError::Planner)?;
-            }
-            market.estimate = market
-                .volatility
-                .update(bbo.observed_at_ms, midpoint)
-                .map_err(|_| InventoryMmRuntimeError::Facts)?;
-            market.last_sample_ms = bbo.observed_at_ms;
-        }
+        update_volatility(
+            &mut market.volatility,
+            &mut market.last_sample_ms,
+            &mut market.estimate,
+            bbo.observed_at_ms,
+            midpoint,
+        )?;
         let reference = market
             .reader
             .refresh_reference(None, now()?)
@@ -627,6 +620,28 @@ fn projection_covers_ledger(commands: &[MmCommandRecord], observed_ms: u64) -> b
                 || (c.state == ExecutorCommandState::Reconciled && c.updated_ms >= observed_ms)
         })
 }
+fn update_volatility(
+    volatility: &mut MmVolatility,
+    last_sample_ms: &mut u64,
+    estimate: &mut Option<Decimal>,
+    observed_ms: u64,
+    midpoint: Price,
+) -> Result<()> {
+    if observed_ms <= *last_sample_ms {
+        return Ok(());
+    }
+    // A short read/private-stream interruption does not erase public price history.
+    // Include the entire observed price move on recovery; stale prices never pass the
+    // separate market gate. Longer gaps and process restarts require full warmup.
+    if *last_sample_ms != 0 && observed_ms - *last_sample_ms > 30_000 {
+        *volatility = MmVolatility::new(20).map_err(|_| InventoryMmRuntimeError::Planner)?;
+    }
+    *estimate = volatility
+        .update(observed_ms, midpoint)
+        .map_err(|_| InventoryMmRuntimeError::Facts)?;
+    *last_sample_ms = observed_ms;
+    Ok(())
+}
 fn same_generation_refresh(
     previous: &TerminalAccountProjection,
     latest: &TerminalAccountProjection,
@@ -749,6 +764,42 @@ mod tests {
             fills: vec![],
             assets: vec![],
         }
+    }
+
+    #[test]
+    fn short_read_gap_preserves_signal_but_long_gap_rewarms()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mut signal = MmVolatility::new(20)?;
+        let mut at = 0;
+        let mut estimate = None;
+        for index in 1..=21 {
+            update_volatility(
+                &mut signal,
+                &mut at,
+                &mut estimate,
+                index * 2_000,
+                Price::new(Decimal::ONE)?,
+            )?;
+        }
+        assert_eq!(estimate, Some(Decimal::ZERO));
+        update_volatility(
+            &mut signal,
+            &mut at,
+            &mut estimate,
+            50_000,
+            Price::new(Decimal::new(101, 2))?,
+        )?;
+        assert!(estimate.is_some_and(|value| value > Decimal::ZERO));
+        assert!(!facts::fresh(42_000, 50_000, facts::MARKET_MAX_AGE_MS));
+        update_volatility(
+            &mut signal,
+            &mut at,
+            &mut estimate,
+            80_001,
+            Price::new(Decimal::ONE)?,
+        )?;
+        assert_eq!(estimate, None);
+        Ok(())
     }
 
     #[test]

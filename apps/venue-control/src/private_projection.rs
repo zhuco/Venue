@@ -85,7 +85,10 @@ impl BinancePrivateProjectionStore {
         if pending {
             return Ok(None);
         }
-        let rows = sqlx::query("SELECT d.client_order_id,d.quantity,d.limit_price FROM venue_binance_grid_desired_orders d JOIN venue_binance_grid_instances i ON i.instance_id=d.instance_id WHERE i.trading_account_id=$1 AND i.owner_user_id=$2 AND i.instance_state='running'")
+        // A dirty surface is still being installed in bounded batches. Its not-yet-sent
+        // targets cannot prove a stream gap; publish real facts so cold convergence can proceed.
+        // The account in-flight fence above and settled-instance checks below remain intact.
+        let rows = sqlx::query("SELECT d.client_order_id,d.quantity,d.limit_price FROM venue_binance_grid_desired_orders d JOIN venue_binance_grid_instances i ON i.instance_id=d.instance_id WHERE i.trading_account_id=$1 AND i.owner_user_id=$2 AND i.instance_state='running' AND NOT i.dirty")
             .bind(&source.trading_account_id).bind(&source.owner_user_id).fetch_all(&self.pool).await.map_err(|_| PrivateProjectionError::Unavailable)?;
         for row in rows {
             let client: String = row
@@ -115,7 +118,7 @@ impl BinancePrivateProjectionStore {
                 return Ok(Some(false));
             }
         }
-        let retired: Vec<String> = sqlx::query_scalar("SELECT o.client_order_id FROM venue_binance_grid_order_owners o JOIN venue_binance_grid_instances i ON i.instance_id=o.instance_id LEFT JOIN venue_binance_grid_desired_orders d ON d.client_order_id=o.client_order_id WHERE i.trading_account_id=$1 AND i.owner_user_id=$2 AND i.instance_state='running' AND d.client_order_id IS NULL")
+        let retired: Vec<String> = sqlx::query_scalar("SELECT o.client_order_id FROM venue_binance_grid_order_owners o JOIN venue_binance_grid_instances i ON i.instance_id=o.instance_id LEFT JOIN venue_binance_grid_desired_orders d ON d.client_order_id=o.client_order_id WHERE i.trading_account_id=$1 AND i.owner_user_id=$2 AND i.instance_state='running' AND NOT i.dirty AND d.client_order_id IS NULL")
             .bind(&source.trading_account_id).bind(&source.owner_user_id).fetch_all(&self.pool).await.map_err(|_| PrivateProjectionError::Unavailable)?;
         if snapshot
             .open_orders()
