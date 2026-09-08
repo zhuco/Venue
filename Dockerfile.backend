@@ -18,9 +18,11 @@ RUN apt-get update && apt-get install -y \
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY apps ./apps
+COPY src ./src
+COPY VERSION ./VERSION
 
 # 编译后端服务（release 模式）
-RUN cargo build --release -p venue-control --bin venue-control-server
+RUN cargo build --locked --release -p venue-control --bin venue-control-server
 
 # ============================================================================
 # 阶段 2：运行

@@ -1,5 +1,7 @@
 # VENUE 功能代码地图
 
+Mac/Linux 打包入口：`scripts/build-all.sh`、`apps/ui/web/scripts/build.sh`；Web standalone 部署说明见 [WEB_STANDALONE.md](WEB_STANDALONE.md)。Windows 交叉构建使用 `scripts/Build-VenueUbuntu.ps1`。
+
 桌面体验维护：`apps/ui/desktop/src/app.rs` 按预算消费事件；`app/persistence.rs` 保存/恢复上次可解析布局；`diagnostics.rs` 负责有界异步日志轮转；`execution_view.rs` 虚拟化只读历史行。
 
 币安状态栏 RTT：`apps/ui/desktop/src/market_client/native/latency.rs` 计量两条行情 WS 的匹配 Ping/Pong，`market.rs` 独立保存连接 RTT，心跳不更新行情新鲜度。

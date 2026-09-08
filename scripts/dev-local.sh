@@ -108,6 +108,7 @@ start_frontend() {
     
     # 设置环境变量
     export VENUE_CONTROL_ORIGIN="http://127.0.0.1:39180"
+    : "${VENUE_WEB_SESSION_SIGNING_KEY:?Set a session signing key before starting the frontend}"
     
     info "启动 Next.js 开发服务器..."
     info "访问地址: http://localhost:3000"
@@ -121,11 +122,7 @@ stop_all() {
     info "停止所有服务..."
     
     # 停止前端（如果在运行）
-    if pgrep -f "next dev" > /dev/null; then
-        info "停止前端开发服务器..."
-        pkill -f "next dev"
-        success "前端已停止"
-    fi
+    info "前端在启动它的终端使用 Ctrl+C 停止。"
     
     # 停止后端
     cd "$PROJECT_ROOT"

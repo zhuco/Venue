@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ============================================================================
 # Venue 全栈打包脚本
-# 支持 macOS/Windows 交叉编译到 Linux，或直接在 Linux 上编译
+# 支持 macOS 交叉编译到 Linux，或直接在 Linux 上编译
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,9 +46,8 @@ detect_environment() {
             log_info "检测到 macOS 环境，使用交叉编译"
             ;;
         MINGW*|MSYS*|CYGWIN*)
-            TARGET="x86_64-unknown-linux-gnu"
-            BUILD_MODE="cross"
-            log_info "检测到 Windows 环境，使用交叉编译"
+            log_error "Windows 请使用 scripts/Build-VenueUbuntu.ps1，遵守统一构建缓存与资源检查"
+            exit 1
             ;;
         *)
             log_error "不支持的操作系统：$OS"
@@ -245,12 +244,12 @@ build_frontend() {
     mkdir -p "$frontend_dist"
     
     log_info "复制 standalone 产物..."
-    cp -r .next/standalone/* "$frontend_dist/"
+    cp -R .next/standalone/. "$frontend_dist/"
     
     # 确保静态资源已复制
     if [[ ! -d "$frontend_dist/.next/static" ]]; then
         mkdir -p "$frontend_dist/.next/static"
-        cp -r .next/static/* "$frontend_dist/.next/static/"
+        cp -R .next/static/. "$frontend_dist/.next/static/"
     fi
     
     if [[ ! -d "$frontend_dist/public" ]] && [[ -d "public" ]]; then
@@ -329,7 +328,8 @@ VENUE_CONTROL_BIND=127.0.0.1:39180
 VENUE_CONTROL_CREDENTIAL_KEY=your-32-byte-hex-key
 
 # 前端 BFF 连接的后端地址
-VENUE_CONTROL_ENDPOINT=http://127.0.0.1:39180
+VENUE_CONTROL_ORIGIN=http://127.0.0.1:39180
+VENUE_WEB_SESSION_SIGNING_KEY=replace-with-a-unique-random-secret
 
 # 前端监听端口
 PORT=3000

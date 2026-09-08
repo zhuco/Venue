@@ -31,7 +31,8 @@ ssh user@server "cd /opt/venue && tar -xzf venue-web.tar.gz && mv dist web"
 
 ```bash
 # 必需：Control 服务地址
-VENUE_CONTROL_ENDPOINT=http://127.0.0.1:39180
+VENUE_CONTROL_ORIGIN=http://127.0.0.1:39180
+VENUE_WEB_SESSION_SIGNING_KEY=replace-with-a-unique-random-secret
 
 # 可选：监听端口（默认 3000）
 PORT=3000
@@ -60,7 +61,8 @@ After=network.target
 Type=simple
 User=venue
 WorkingDirectory=/opt/venue/web
-Environment=VENUE_CONTROL_ENDPOINT=http://127.0.0.1:39180
+Environment=VENUE_CONTROL_ORIGIN=http://127.0.0.1:39180
+EnvironmentFile=/opt/venue/web/.env
 ExecStart=/usr/bin/node server.js
 Restart=always
 RestartSec=10

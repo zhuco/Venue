@@ -26,7 +26,6 @@ mod order_book_view;
 mod web_preview;
 #[cfg(all(not(target_arch = "wasm32"), feature = "preview"))]
 pub use web_preview::server::serve as serve_web_preview;
-mod inventory_mm_view;
 mod server_connection;
 mod settings_panel;
 mod support_martingale_view;

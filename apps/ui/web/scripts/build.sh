@@ -99,13 +99,13 @@ if [[ ! -d "$STANDALONE_DIR" ]]; then
 fi
 
 log_info "复制 standalone 产物..."
-cp -r "$STANDALONE_DIR"/* "$DIST_DIR"/
+cp -R "$STANDALONE_DIR"/. "$DIST_DIR"/
 
 # 确保 .next/static 和 public 已复制（prepare-standalone.mjs 应该已经做了）
 if [[ ! -d "$DIST_DIR/.next/static" ]]; then
     log_warn "static 资源未找到，手动复制..."
     mkdir -p "$DIST_DIR/.next/static"
-    cp -r "$WEB_ROOT/.next/static"/* "$DIST_DIR/.next/static"/
+    cp -R "$WEB_ROOT/.next/static"/. "$DIST_DIR/.next/static"/
 fi
 
 if [[ ! -d "$DIST_DIR/public" ]] && [[ -d "$WEB_ROOT/public" ]]; then
@@ -150,7 +150,8 @@ ssh user@server "cd /opt/venue && tar -xzf venue-web.tar.gz && mv dist web"
 
 ```bash
 # 必需：Control 服务地址
-VENUE_CONTROL_ENDPOINT=http://127.0.0.1:39180
+VENUE_CONTROL_ORIGIN=http://127.0.0.1:39180
+VENUE_WEB_SESSION_SIGNING_KEY=replace-with-a-unique-random-secret
 
 # 可选：监听端口（默认 3000）
 PORT=3000
@@ -179,7 +180,8 @@ After=network.target
 Type=simple
 User=venue
 WorkingDirectory=/opt/venue/web
-Environment=VENUE_CONTROL_ENDPOINT=http://127.0.0.1:39180
+Environment=VENUE_CONTROL_ORIGIN=http://127.0.0.1:39180
+EnvironmentFile=/opt/venue/web/.env
 ExecStart=/usr/bin/node server.js
 Restart=always
 RestartSec=10
