@@ -123,7 +123,7 @@ KOL Binance TRADE 成交
 
 ## 10. 当前完成度
 
-仓库已有邀请注册、KOL 页面、真实用户 Cookie BFF、浏览器自助 API 绑定与跟单设置；P3-A 已有单例锁、PostgreSQL 源成交去重/非终态恢复/激活提升、owner-scoped 密文读取及离线 clientOrderId mock。它们尚未组成真实私流、目标/命令生成、签名发送与精确回读循环，因此不存在可用的快速跟单闭环或实盘准入。
+仓库已有邀请注册、KOL 页面、真实用户 Cookie BFF、浏览器自助 API 绑定与跟单设置；P3-A 已有单例锁、PostgreSQL 源成交去重/目标推进/确定性命令生成、非终态恢复、owner-scoped 密文读取及离线 clientOrderId mock。离线运行时已证明 Pending 只提交一次，重启后的 Sending/Accepted/ReconcileRequired 只读回查并向前收敛。它尚未接入真实私流、实时规则和签名 adapter 的仓位裁剪/精确回读，因此不存在可用的快速跟单闭环或实盘准入。
 
 完成标准只以 [`KOL_COPY_MVP.md`](KOL_COPY_MVP.md) 为准。文档更新本身不启动服务、不迁移账户，也不表示实盘已可用。
 

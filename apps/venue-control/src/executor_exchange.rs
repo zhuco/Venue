@@ -15,6 +15,7 @@ pub struct ExecutionRequest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionReadback {
     Accepted,
+    PartiallyFilled,
     Reconciled,
     Rejected,
     Unknown,
@@ -48,11 +49,17 @@ pub trait BinanceExecution {
 #[derive(Default)]
 pub struct MockBinanceExecution {
     orders: BTreeMap<String, ExecutionReadback>,
+    submissions: BTreeMap<String, usize>,
 }
 
 impl MockBinanceExecution {
     pub fn set_readback(&mut self, client_order_id: String, state: ExecutionReadback) {
         self.orders.insert(client_order_id, state);
+    }
+
+    #[must_use]
+    pub fn submissions(&self, client_order_id: &str) -> usize {
+        self.submissions.get(client_order_id).copied().unwrap_or(0)
     }
 }
 
@@ -68,6 +75,10 @@ impl BinanceExecution for MockBinanceExecution {
         {
             return Err(BinanceExecutionError::Invalid);
         }
+        *self
+            .submissions
+            .entry(request.client_order_id.clone())
+            .or_default() += 1;
         Ok(*self
             .orders
             .entry(request.client_order_id.clone())
@@ -120,6 +131,7 @@ mod tests {
             exchange.readback(&request, credentials()?).await?,
             ExecutionReadback::Reconciled
         );
+        assert_eq!(exchange.submissions("client-a"), 2);
         Ok(())
     }
 }

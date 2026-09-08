@@ -250,6 +250,83 @@ async fn executor_store_deduplicates_source_fills_and_recovers_only_nonterminal_
 }
 
 #[tokio::test]
+async fn source_fill_planning_is_idempotent_and_never_crosses_a_zero_target()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(database_url) = integration_database_url()? else {
+        return Ok(());
+    };
+    let fixture = Fixture::create(&database_url).await?;
+    fixture.migrate_twice().await?;
+    let kol = id(150);
+    let leader = id(250);
+    let kol_credential = id(350);
+    let follower = id(151);
+    let follower_account = id(251);
+    let follower_credential = id(351);
+    let invite = id(450);
+    let relation = id(850);
+    seed_verified_account(&fixture.pool, &kol, &leader, &kol_credential, 150).await?;
+    seed_verified_account(
+        &fixture.pool,
+        &follower,
+        &follower_account,
+        &follower_credential,
+        151,
+    )
+    .await?;
+    insert_kol_profile(&fixture.pool, &kol, &leader, 1).await?;
+    insert_invite(&fixture.pool, &invite, &kol, 150).await?;
+    sqlx::query("INSERT INTO venue_user_kol_bindings (user_id,kol_user_id,invite_id,bound_ms) VALUES ($1,$2,$3,1)")
+        .bind(&follower)
+        .bind(&kol)
+        .bind(&invite)
+        .execute(&fixture.pool)
+        .await?;
+    sqlx::query("INSERT INTO venue_kol_follow_relations (relation_id,follower_user_id,kol_user_id,leader_trading_account_id,follower_trading_account_id,credential_id,relation_state,active_slot,allocated_capital,multiplier,max_order_notional,max_total_notional,max_deviation_bps,allowed_symbols,revision,created_ms,updated_ms) VALUES ($1,$2,$3,$4,$5,$6,'active',1,'100','1','20','100',100,'[\"BTC/USDT\"]'::jsonb,1,1,1)")
+        .bind(&relation).bind(&follower).bind(&kol).bind(&leader).bind(&follower_account).bind(&follower_credential).execute(&fixture.pool).await?;
+    let open = KolSourceFill {
+        leader_trading_account_id: leader.clone(),
+        native_symbol: "BTCUSDT".into(),
+        native_trade_id: "open-1".into(),
+        symbol: "BTC/USDT".into(),
+        order_side: OrderSide::Buy,
+        position_side: PositionSide::Long,
+        quantity: Decimal::new(1, 3),
+        price: Decimal::new(100_000, 0),
+        occurred_ms: 10,
+        observed_ms: 11,
+        payload_digest: [8; 32],
+    };
+    let store = PgExecutorStore::new(fixture.pool.clone());
+    let commands = store.record_source_fill_and_plan(&kol, &open).await?;
+    assert_eq!(commands.len(), 1);
+    assert!(commands[0].client_order_id.starts_with("vkol"));
+    assert!(
+        store
+            .record_source_fill_and_plan(&kol, &open)
+            .await?
+            .is_empty()
+    );
+    let close = KolSourceFill {
+        native_trade_id: "close-1".into(),
+        order_side: OrderSide::Sell,
+        occurred_ms: 12,
+        observed_ms: 13,
+        payload_digest: [9; 32],
+        ..open
+    };
+    assert_eq!(
+        store.record_source_fill_and_plan(&kol, &close).await?.len(),
+        1
+    );
+    let target: String = sqlx::query_scalar("SELECT target_quantity FROM venue_kol_copy_targets WHERE relation_id=$1 AND symbol='BTC/USDT' AND position_side='long'")
+        .bind(&relation).fetch_one(&fixture.pool).await?;
+    assert_eq!(target, "0.000");
+    fixture.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn executor_secret_provider_requires_the_durable_credential_owner()
 -> Result<(), Box<dyn std::error::Error>> {
     let Some(database_url) = integration_database_url()? else {

@@ -26,6 +26,7 @@ pub struct BinanceCommandLedger {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaimedBinanceCommand {
     pub command_id: String,
+    pub owner_user_id: String,
     pub trading_account_id: String,
     pub credential_id: String,
     pub client_order_id: String,
@@ -256,7 +257,7 @@ impl BinanceCommandLedger {
              ORDER BY c.created_ms,c.command_id LIMIT 1 FOR UPDATE SKIP LOCKED) \
              UPDATE venue_binance_commands c SET command_state='sending',sending_ms=$2,updated_ms=$2 \
              FROM candidate WHERE c.command_id=candidate.command_id \
-             RETURNING c.command_id,c.trading_account_id,c.credential_id,c.client_order_id,c.command_state",
+             RETURNING c.command_id,c.owner_user_id,c.trading_account_id,c.credential_id,c.client_order_id,c.command_state",
         )
         .bind(trading_account_id)
         .bind(now)
@@ -278,7 +279,11 @@ impl BinanceCommandLedger {
         let now = i64::try_from(now_ms).map_err(|_| BinanceCommandLedgerError::Conflict)?;
         let (from, terminal_ms, accepted_ms) = match next {
             ExecutorCommandState::Accepted => ("sending", None, Some(now)),
-            ExecutorCommandState::Rejected => ("sending", Some(now), None),
+            // A Binance ACK may later be disproved by the independently signed exact lookup;
+            // that lookup is allowed to settle any non-terminal command as rejected.
+            ExecutorCommandState::Rejected => {
+                ("sending,accepted,reconcile_required", Some(now), None)
+            }
             ExecutorCommandState::ReconcileRequired => ("sending,accepted", None, None),
             ExecutorCommandState::Reconciled => ("accepted,reconcile_required", Some(now), None),
             ExecutorCommandState::Cancelled => ("pending", Some(now), None),
@@ -316,6 +321,9 @@ fn claimed(row: sqlx::postgres::PgRow) -> Result<ClaimedBinanceCommand, BinanceC
     Ok(ClaimedBinanceCommand {
         command_id: row
             .try_get("command_id")
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
+        owner_user_id: row
+            .try_get("owner_user_id")
             .map_err(|_| BinanceCommandLedgerError::Unavailable)?,
         trading_account_id: row
             .try_get("trading_account_id")

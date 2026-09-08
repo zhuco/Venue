@@ -1,11 +1,14 @@
 //! Singleton process entrypoint for the Binance KOL executor.
 //!
 //! This binary assembles the singleton's restricted PostgreSQL and master-key boundaries. It
-//! never reads Binance API secrets from environment variables.
+//! never reads Binance API secrets from environment variables. Network transport is deliberately
+//! not enabled by configuration here: production deployment must inject the reviewed signed
+//! adapter, while the built-in offline mode provides a no-network convergence smoke path.
 
 use sqlx::postgres::PgPoolOptions;
 use venue_control::{
-    BinanceExecutorSingleton, accounts::CredentialCipher, executor_secret::ExecutorSecretProvider,
+    BinanceExecutorRuntime, BinanceExecutorSingleton, accounts::CredentialCipher,
+    executor_exchange::MockBinanceExecution, executor_secret::ExecutorSecretProvider,
     executor_store::PgExecutorStore,
 };
 
@@ -20,9 +23,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let store = PgExecutorStore::new(pool.clone());
     let secrets = ExecutorSecretProvider::new(pool, CredentialCipher::from_environment()?);
-    // Keep construction type-checked without converting any encrypted record until a command is
-    // claimed by the later runtime loop. No API key has an environment fallback.
-    std::mem::drop((store, secrets));
+    if std::env::var_os("VENUE_EXECUTOR_OFFLINE_FIXTURE").is_none() {
+        singleton.release().await?;
+        return Err("a reviewed Binance signed adapter is required; set VENUE_EXECUTOR_OFFLINE_FIXTURE only for an isolated fixture database".into());
+    }
+    let mut runtime = BinanceExecutorRuntime::new(store, secrets, MockBinanceExecution::default());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system clock is before Unix epoch")?
+        .as_millis();
+    let now_ms = u64::try_from(now_ms).map_err(|_| "system clock is outside executor range")?;
+    let report = runtime.sweep(now_ms).await?;
+    eprintln!(
+        "offline executor sweep submitted={} read_back={} reconciled={} rejected={} reconcile_required={}",
+        report.submitted,
+        report.read_back,
+        report.reconciled,
+        report.rejected,
+        report.reconcile_required
+    );
     singleton.release().await?;
-    Err("Binance executor event loop is not configured".into())
+    Ok(())
 }

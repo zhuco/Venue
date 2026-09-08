@@ -302,9 +302,9 @@ Pending -> Sending -> Accepted -> Reconciled
 - 在统一 Binance adapter 内补齐 `PlaceMarket`，复用现有市场减仓、签名回读和错误解析；不创建旁路 HTTP client。
 - 把 KOL 基础终端接到同一命令账本和账户队列，支持显式 `positionSide` 的市价/限价开平仓、精确撤单及签名订单/成交/仓位回显。
 
-当前预备边界：Binance adapter 的 Hedge Mode 市价开仓预备路径显式携带 `positionSide` 且从不序列化 Binance 禁止的 `reduceOnly`；`kol_executor.rs` 已持久化领取 Pending、同账户 Sending/ReconcileRequired 栅栏和 `Accepted/Rejected/ReconcileRequired/Reconciled/Cancelled` 的单向状态迁移。它不含私流、目标计算、解密、传输或 binary，尚不构成 P3 完成。
+当前预备边界：Binance adapter 的 Hedge Mode 市价开仓预备路径显式携带 `positionSide` 且从不序列化 Binance 禁止的 `reduceOnly`；`kol_executor.rs` 已持久化领取 Pending、同账户 Sending/ReconcileRequired 栅栏和 `Accepted/Rejected/ReconcileRequired/Reconciled/Cancelled` 的单向状态迁移。`executor_store.rs::record_source_fill_and_plan` 在源成交身份去重事务中按关系资本倍率推进目标并生成稳定命令 ID；`executor_runtime.rs` 使 Pending 只提交一次，重启后的 Sending/Accepted/ReconcileRequired 只按同一 ID 回读，超时或密文读取失败均保留待对账。它不含真实私流、实时规则/仓位裁剪、签名传输或生产 adapter，尚不构成 P3 完成。
 
-离线调度层进一步固定为中心化有界 round-robin：每个账户最多一个 in-flight，单账户积压最多 16，全局最多 32 个 in-flight；该层不创建每账户 task、Actor 或恢复 journal。`source_fill_from_private` 只接收 Binance adapter 已认证且带明确 Long/Short 腿的成交，`scaled_copy_quantity` 只做已持久化源成交后的比例计算。私流连接、密文解密、签名发送、精确回读、重启对账与 `venue-executor-binance` binary 尚未接通，不能将这些纯离线边界视为 P3 完成。
+离线调度层进一步固定为中心化有界 round-robin：每个账户最多一个 in-flight，单账户积压最多 16，全局最多 32 个 in-flight；该层不创建每账户 task、Actor 或恢复 journal。`source_fill_from_private` 只接收 Binance adapter 已认证且带明确 Long/Short 腿的成交，`scaled_copy_quantity` 只做已持久化源成交后的比例计算。`venue-executor-binance` 仅在 `VENUE_EXECUTOR_OFFLINE_FIXTURE` 显式设置时运行一轮无网络 mock sweep；否则在获得 advisory lock 后退出。它从不回退环境变量 API Key/Secret。私流连接、实时规则、发送前同代仓位裁剪、签名发送和精确回读尚未接通，不能将离线运行时当作 P3 完成或实盘准入。
 
 P3-A 已接通受限依赖边界：`PgExecutorStore` 在 PostgreSQL 中按 native trade identity 去重源成交、读取未终态命令，并只在 Pending activation 的 relation revision 匹配时提升为 Active；`ExecutorSecretProvider` 只用 `(credential_id, owner_user_id)` 查询密文并复用 AES-256-GCM AAD 解密为不可序列化的 adapter 密钥容器。`BinanceExecution` mock 以稳定 `clientOrderId` 模拟 submit/readback。binary 只创建单例锁、Store 和 SecretProvider，不读取 Binance 环境密钥或发网络请求。下一阶段仍需把这些边界组合为事件循环，接入真实 adapter 的签名 transport/精确回读，并把结果收敛到命令状态。
 - 实现 Pending/Sending/Accepted/Rejected/ReconcileRequired/Reconciled、重启恢复、账户隔离和 UI 投影。
@@ -329,7 +329,7 @@ P3-A 已接通受限依赖边界：`PgExecutorStore` 在 PostgreSQL 中按 nativ
 
 完成门：真实 KOL 成交可触发至少两个不同账户的正确复制和签名收敛；注册、邀请、API、KOL 页面、暂停及执行状态均可由真实 Web 完成。ACK、fixture 或同账户双 Key 均不能代替真实验收。
 
-离线发布演练只能运行 `scripts/Invoke-KolCanaryDrill.ps1 -OfflineFixture`：该脚本拒绝进程内 Binance 凭证，并只经受控 Rust 构建入口执行 5 KOL / 200 follower 调度 fixture。真实 Canary 仍须按本节获得明确授权、确认旧 writer 已停及提供隔离账户；离线脚本不得替代该条件。
+离线发布演练只能运行 `scripts/Invoke-KolCanaryDrill.ps1 -OfflineFixture`：该脚本拒绝进程内 Binance 凭证，并只经受控 Rust 构建入口执行 5 KOL / 200 follower 调度 fixture。演练前须确认 `VENUE_EXECUTOR_OFFLINE_FIXTURE` 未被部署服务继承；此变量只允许临时 fixture 数据库进程使用。真实 Canary 仍须按本节获得明确授权、确认旧 writer 已停及提供隔离账户；离线脚本不得替代该条件。
 
 ## 11. 验收与性能容量门
 
