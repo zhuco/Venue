@@ -31,6 +31,7 @@ POST_PATHS = [
     "/v2/account/login",
     "/v2/account/logout",
     "/v2/account/credentials",
+    "/v2/account/bitget-copy-credentials",
     "/v2/account/credentials/verify",
     "/v2/account/credentials/delete",
     "/v2/account/select",

@@ -116,14 +116,12 @@ impl AccountService {
             checks.extend(skipped_signed_checks());
             return preflight_response(instance, now_ms, checks);
         }
-        let symbol = instance
-            .config
-            .symbols
-            .first()
-            .cloned()
-            .ok_or_else(|| error(Code::InvalidInput))?;
         let snapshot = StrategyCredentialStore::new_shared(self.pool.clone(), self.cipher.clone())
-            .preflight_snapshot(&principal.user.user_id, &instance.credential_id, symbol)
+            .preflight_snapshot(
+                &principal.user.user_id,
+                &instance.credential_id,
+                instance.config.symbols.clone(),
+            )
             .await
             .map_err(|_| error(Code::Unavailable))?;
         let checked_at_ms =

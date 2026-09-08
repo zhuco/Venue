@@ -12,6 +12,7 @@ pub const LOGIN_PATH: &str = "/v2/account/login";
 pub const LOGOUT_PATH: &str = "/v2/account/logout";
 pub const SESSION_PATH: &str = "/v2/account/session";
 pub const CREDENTIALS_PATH: &str = "/v2/account/credentials";
+pub const BITGET_COPY_CREDENTIALS_PATH: &str = "/v2/account/bitget-copy-credentials";
 pub const VERIFY_PATH: &str = "/v2/account/credentials/verify";
 pub const DELETE_PATH: &str = "/v2/account/credentials/delete";
 pub const SELECT_PATH: &str = "/v2/account/select";
@@ -125,6 +126,37 @@ pub struct BindCredentialRequest {
     pub label: String,
     pub api_key: SecretValue,
     pub api_secret: SecretValue,
+}
+
+/// Bitget elite credentials are distinct from Binance follower authorization. The passphrase
+/// is request-only and must never be included in a credential summary or UI preferences.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BindBitgetCopyCredentialRequest {
+    pub label: String,
+    pub api_key: SecretValue,
+    pub api_secret: SecretValue,
+    pub passphrase: SecretValue,
+}
+
+impl BindBitgetCopyCredentialRequest {
+    pub fn valid(&self) -> bool {
+        let label = self.label.trim();
+        !label.is_empty()
+            && label.chars().count() <= 64
+            && !label.chars().any(char::is_control)
+            && [self.api_key.expose(), self.api_secret.expose()]
+                .into_iter()
+                .all(|value| {
+                    (16..=256).contains(&value.len())
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                })
+            && (1..=256).contains(&self.passphrase.expose().len())
+            && !self.passphrase.expose().chars().any(char::is_control)
+            && !self.passphrase.expose().trim().is_empty()
+    }
 }
 
 impl BindCredentialRequest {
@@ -324,5 +356,23 @@ mod tests {
             balance_observed_ms: Some(100),
         };
         assert!(summary.selectable(10_000));
+    }
+
+    #[test]
+    fn bitget_copy_credentials_accept_native_key_and_require_passphrase() {
+        let mut request = BindBitgetCopyCredentialRequest {
+            label: "Bitget lead".into(),
+            api_key: SecretValue::new("bg_0123456789abcdef0123456789abcdef".into()),
+            api_secret: SecretValue::new("a".repeat(64)),
+            passphrase: SecretValue::new("fixture-passphrase".into()),
+        };
+        assert!(request.valid());
+        request.passphrase = SecretValue::new(" ".into());
+        assert!(!request.valid());
+        request.passphrase = SecretValue::new("fixture\npassphrase".into());
+        assert!(!request.valid());
+        request.passphrase = SecretValue::new("fixture-passphrase".into());
+        request.api_key = SecretValue::new("bg_123456789\r\nheader".into());
+        assert!(!request.valid());
     }
 }

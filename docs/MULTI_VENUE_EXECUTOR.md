@@ -30,6 +30,10 @@
 
 四家中心化交易所要求各 adapter 支持的永续合约双向持仓账户；Bitget 使用 UTA v3。Hyperliquid 使用主账户/API Wallet 的 Net 持仓：网格必须显式指定 `net_direction` 为 `long` 或 `short`，只生成选定方向；已有反向净仓会阻止增仓，不用另一方向下单冒充双向持仓。
 
+Bitget 原生带单凭证在耐久密文中使用显式 `bitget_copy` 类型，普通 `bitget` 保留原 UTA 契约；两者均复用 UTA v3 物理执行。带单绑定和增仓发送读取该 Key 的签名 `copy/futures/trading-pairs`，不以全球合约目录代替带单范围。带单凭证要求 `uta_trade`、`copy_futures_order`、`copy_futures_position` 读写且无提现权限，仍读取真实账户设置与完整签名快照；缺少设置读取能力时拒绝准入，不默认假设 Hedge。普通账户与带单账户沿用签名 UID 唯一身份约束，不能用 Key 哈希或人工 scope 后缀伪造独立账户。
+
+桌面通过本人认证的 `POST /v2/account/bitget-copy-credentials` 提交备注、Key、Secret 和 Passphrase，保存即完成签名准入；不创建 Binance KOL 关系。绑定使用 BTC/USDT 作为只读快照锚点并验证带单范围非空，不要求实际交易 BTC。马丁启动前验证全部配置交易对的带单资格，增仓发送前再次验证当前交易对。此接入须取得目标专用 Key 的签名验证及策略真实订单事实后才可视为实盘可用。
+
 市价语义遵循原生市场规则；Hyperliquid 以带价格保护的 IOC 执行，可能部分成交或未成交。精确查单的累计成交量与终态才是结果，入账、HTTP ACK、订单存在都不等于足额成交。数量统一为基础币数量，合约张数转换仅在 adapter 内；不隐式扩大最小数量或把拒绝的 maker 单改成市价。
 
 条件单同时保留 SL/TP 意图、触发方向、mark 触发类型和原条件单身份。恢复和撤单使用原条件订单端点；已触发时查其子单，不能因条件挂单列表里消失而重发。未证明终态的请求保持 `ReconcileRequired`，暂停该账户后续新命令。

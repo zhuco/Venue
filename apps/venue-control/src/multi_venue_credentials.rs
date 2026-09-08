@@ -97,6 +97,9 @@ async fn verified_snapshot(
         gateway
             .verify_permissions()
             .map_err(|_| StrategyProbeError::Permissions)?;
+        gateway
+            .verify_admission_symbol()
+            .map_err(|_| StrategyProbeError::Permissions)?;
         let snapshot = gateway
             .snapshot(&binding)
             .map_err(|_| StrategyProbeError::Snapshot)?;
@@ -324,8 +327,9 @@ impl StrategyCredentialStore {
         &self,
         owner: &str,
         credential: &str,
-        symbol: Symbol,
+        symbols: Vec<Symbol>,
     ) -> Result<venue_execution::SignedAccountSnapshot, StrategyExchangeError> {
+        let symbol = symbols.first().cloned().ok_or(StrategyExchangeError)?;
         let account: String = sqlx::query_scalar("SELECT trading_account_id FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND deleted_ms IS NULL")
             .bind(credential).bind(owner).fetch_one(&self.pool).await.map_err(|_| StrategyExchangeError)?;
         let (credentials, expected) = self.load(owner, credential, &account, false).await?;
@@ -341,6 +345,7 @@ impl StrategyCredentialStore {
                 return Err(StrategyExchangeError);
             }
             gateway.verify_permissions()?;
+            gateway.verify_strategy_symbols(&symbols)?;
             gateway.snapshot(&binding)
         })
         .await

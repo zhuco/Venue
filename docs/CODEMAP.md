@@ -132,6 +132,8 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 
 ## 独立多交易所策略与支撑分批做多
 
+Bitget 原生带单账户入口：`accounts/bitget_copy.rs` 与协议 `accounts::BindBitgetCopyCredentialRequest`；桌面 `account_center.rs` 提供 Bitget/Passphrase 表单。密文 `StrategyCredentials::BitgetCopy` 与 gateway `copy_trading.rs` 限定签名带单交易对；马丁表单按已选 Bybit/Bitget 凭证保存执行所。该入口不扩大 Binance KOL 复制范围。
+
 支撑分批做多（马丁）的当前模块、桌面/API、多币预算和市价/限价执行契约见 [SUPPORT_MARTINGALE](SUPPORT_MARTINGALE.md)。当前首个闭环只准入 Bybit LIVE；其他执行所仍按逐所真实验收放行。
 
 以下功能纳入当前源码，真实部署与逐所验收另行核验；完整契约见 [MULTI_VENUE_EXECUTOR](MULTI_VENUE_EXECUTOR.md)。它不扩大 Binance KOL 的复制范围，也不重新启用旧 Node 执行链。

@@ -305,7 +305,7 @@ fn validate_binding(binding: &GatewayBinding) -> Result<(), BitgetInstrumentErro
         .map_err(|_| BitgetInstrumentError::Binding)
 }
 
-fn native_symbol(symbol: &Symbol) -> Result<String, BitgetInstrumentError> {
+pub(crate) fn native_symbol(symbol: &Symbol) -> Result<String, BitgetInstrumentError> {
     public::native_symbol(symbol).map_err(|_| BitgetInstrumentError::Symbol)
 }
 

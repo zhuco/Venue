@@ -2,6 +2,7 @@ pub mod account;
 mod account_gateway;
 mod binding;
 mod config;
+mod copy_trading;
 mod credentials;
 pub mod endpoints;
 mod execution;

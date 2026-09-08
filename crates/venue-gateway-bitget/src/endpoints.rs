@@ -1,6 +1,7 @@
 pub const INSTRUMENTS: &str = "/api/v3/market/instruments";
 pub const ACCOUNT_SETTINGS: &str = "/api/v3/account/settings";
 pub const ACCOUNT_INFO: &str = "/api/v3/account/info";
+pub const COPY_TRADING_PAIRS: &str = "/api/v3/copy/futures/trading-pairs";
 pub const BALANCES: &str = "/api/v3/account/assets";
 pub const POSITIONS: &str = "/api/v3/position/current-position";
 pub const PLACE_ORDER: &str = "/api/v3/trade/place-order";

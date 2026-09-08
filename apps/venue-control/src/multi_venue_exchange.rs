@@ -22,6 +22,12 @@ pub enum StrategyCredentials {
         api_secret: SecretValue,
         passphrase: SecretValue,
     },
+    #[serde(rename = "bitget_copy")]
+    BitgetCopy {
+        api_key: SecretValue,
+        api_secret: SecretValue,
+        passphrase: SecretValue,
+    },
     Bybit {
         api_key: SecretValue,
         api_secret: SecretValue,
@@ -46,7 +52,7 @@ pub enum StrategyCredentials {
 impl StrategyCredentials {
     pub const fn venue(&self) -> VenueId {
         match self {
-            Self::Bitget { .. } => VenueId::Bitget,
+            Self::Bitget { .. } | Self::BitgetCopy { .. } => VenueId::Bitget,
             Self::Bybit { .. } => VenueId::Bybit,
             Self::Gate { .. } => VenueId::Gate,
             Self::Okx { .. } => VenueId::Okx,
@@ -56,6 +62,7 @@ impl StrategyCredentials {
     pub(crate) fn key_identity(&self) -> &str {
         match self {
             Self::Bitget { api_key, .. }
+            | Self::BitgetCopy { api_key, .. }
             | Self::Bybit { api_key, .. }
             | Self::Gate { api_key, .. }
             | Self::Okx { api_key, .. } => api_key.expose(),
@@ -175,6 +182,27 @@ impl StrategyGateway {
         }
         let secret = |value: SecretValue| SecretString::from(value.expose().to_owned());
         Ok(match credentials {
+            StrategyCredentials::BitgetCopy {
+                api_key,
+                api_secret,
+                passphrase,
+            } => {
+                let credentials = venue_gateway_bitget::BitgetCredentials::from_copy_secrets(
+                    secret(api_key),
+                    secret(api_secret),
+                    secret(passphrase),
+                )
+                .map_err(|error| error.to_string())?;
+                Self::Bitget(
+                    venue_gateway_bitget::BitgetAccountGateway::connect_with_credentials(
+                        binding,
+                        credentials,
+                        TIMEOUT,
+                        MAX_BODY,
+                    )
+                    .map_err(|error| error.to_string())?,
+                )
+            }
             StrategyCredentials::Bitget {
                 api_key,
                 api_secret,
@@ -284,6 +312,20 @@ impl StrategyGateway {
     }
     pub(crate) fn identity(&mut self) -> Result<String, StrategyExchangeError> {
         gateway_call!(self, verified_account_identity)
+    }
+    pub(crate) fn verify_admission_symbol(&mut self) -> Result<(), StrategyExchangeError> {
+        self.verify_strategy_symbols(&[])
+    }
+    pub(crate) fn verify_strategy_symbols(
+        &mut self,
+        symbols: &[venue_domain::Symbol],
+    ) -> Result<(), StrategyExchangeError> {
+        match self {
+            Self::Bitget(gateway) => gateway
+                .verify_copy_trading_symbols(symbols)
+                .map_err(|_| StrategyExchangeError),
+            _ => Ok(()),
+        }
     }
     pub(crate) fn verify_permissions(&mut self) -> Result<(), StrategyExchangeError> {
         match self {

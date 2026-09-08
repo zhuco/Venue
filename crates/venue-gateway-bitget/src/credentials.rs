@@ -7,9 +7,25 @@ pub struct BitgetCredentials {
     pub(crate) api_key: SecretString,
     pub(crate) api_secret: SecretString,
     pub(crate) passphrase: SecretString,
+    pub(crate) account_scope: BitgetAccountScope,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BitgetAccountScope {
+    Unified,
+    EliteTrading,
 }
 
 impl BitgetCredentials {
+    pub fn from_copy_secrets(
+        api_key: SecretString,
+        api_secret: SecretString,
+        passphrase: SecretString,
+    ) -> Result<Self, BitgetError> {
+        let mut credentials = Self::from_secrets(api_key, api_secret, passphrase)?;
+        credentials.account_scope = BitgetAccountScope::EliteTrading;
+        Ok(credentials)
+    }
     pub fn from_environment() -> Result<Self, BitgetError> {
         let api_key = SecretString::from(
             std::env::var("BITGET_API_KEY").map_err(|_| BitgetError::Credentials)?,
@@ -52,6 +68,7 @@ impl BitgetCredentials {
             api_key,
             api_secret,
             passphrase,
+            account_scope: BitgetAccountScope::Unified,
         })
     }
 
