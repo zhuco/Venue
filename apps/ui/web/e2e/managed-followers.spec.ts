@@ -8,6 +8,9 @@ test("managed account dialog saves, retries with the same identity, verifies and
     const action = new URL(route.request().url()).pathname.split("/").at(-1);
     let value: unknown = null;
     if(action === "session") value={user:{user_id:"kol-fixture",username:"kol"},credentials:[],selected_credential_id:null,csrf:"owned-csrf"};
+    else if(action === "kol-profile") value={state:"enabled"};
+    else if(action === "kol-invite") value=null;
+    else if(action === "kol-source") value={trading_account_id:null,revision:1,can_change:true};
     else if(action === "leader") value={can_use:false,bot:null};
     else if(action === "settings") value=null;
     else if(action === "mirror-orders") value=[];
@@ -33,7 +36,7 @@ test("managed account dialog saves, retries with the same identity, verifies and
   await dialog.getByLabel("账户 1 API Key",{exact:true}).fill("K".repeat(32));
   await dialog.getByLabel("账户 1 API Secret",{exact:true}).fill("S".repeat(32));
   await expect(dialog.getByLabel("账户 1 跟单方式",{exact:true})).toHaveValue("proportional");
-  await expect(dialog.getByLabel("账户 1 比例倍数",{exact:true})).toHaveValue("1");
+  await expect(dialog.getByLabel("账户 1 跟单倍数",{exact:true})).toHaveValue("1");
   await dialog.getByRole("button",{name:"加密保存账户",exact:true}).click();
   await expect(dialog.getByText("结果待确认，请重试原内容；不会重复创建。",{exact:true})).toBeVisible();
   await expect(dialog.getByLabel("账户 1 API Key",{exact:true})).toBeDisabled();
@@ -48,9 +51,7 @@ test("managed account dialog saves, retries with the same identity, verifies and
   await expect(panel.getByRole("cell",{name:"10 USD",exact:true})).toBeVisible();
   await expect(panel.getByRole("cell",{name:"8 USD",exact:true})).toBeVisible();
   await expect(panel.getByRole("button",{name:"跟单设置",exact:true})).toBeVisible();
-  const deleteSummary = panel.getByText("删除托管账户",{exact:true}); await deleteSummary.focus(); await deleteSummary.press("Enter");
-  await panel.getByLabel("输入登录密码确认",{exact:true}).fill("correct horse battery staple");
-  const remove = panel.getByRole("button",{name:"确认删除",exact:true}); await remove.focus(); await remove.press("Enter");
+  const remove = panel.getByRole("button",{name:"删除托管账户",exact:true}); await remove.focus(); await remove.press("Enter");
   await expect(panel.getByText("尚未添加托管账户。",{exact:false})).toBeVisible();
   expect(await page.evaluate(()=>JSON.stringify({...localStorage,...sessionStorage}))).not.toContain("S".repeat(32));
 });

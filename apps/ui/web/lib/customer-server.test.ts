@@ -143,3 +143,43 @@ test("managed sizing responses preserve each mode without leaking internal crede
     assert.throws(()=>customerPublicValue(action,"POST",{...raw,settings:{...settings,sizing:{mode:"unexpected"}}}));
   }
 });
+
+test("owned account equity remains exact while credential internals are stripped", () => {
+  const credential = { credential_id: "owned", equity: "9007199254740993.010000000000000001", balance_observed_ms: 123, api_secret: "hidden", ciphertext: "hidden" };
+  const clean = { credential_id: credential.credential_id, equity: credential.equity, balance_observed_ms: 123 };
+  assert.deepEqual(customerPublicValue("verify", "POST", credential), clean);
+  assert.deepEqual(customerPublicValue("session", "GET", { user: { user_id: "u", username: "user" }, credentials: [credential], selected_credential_id: "owned" }), { user: { user_id: "u", username: "user" }, credentials: [clean], selected_credential_id: "owned" });
+});
+
+test("public follower registration requires an invite and cannot request elevated roles", async () => {
+  const keys = ["VENUE_WEB_SESSION_SIGNING_KEY", "VENUE_CONTROL_ORIGIN"] as const;
+  const old = keys.map(key => process.env[key]); const originalFetch = globalThis.fetch; let calls = 0;
+  try {
+    process.env.VENUE_WEB_SESSION_SIGNING_KEY = material;
+    process.env.VENUE_CONTROL_ORIGIN = "http://127.0.0.1:39180";
+    const body = { username: "follower", password: "password-fixture", invite_code: "KOL2026" };
+    globalThis.fetch = async (url, init) => {
+      calls++;
+      assert.equal(String(url), "http://127.0.0.1:39180/v2/account/register");
+      assert.deepEqual(JSON.parse(String(init?.body)), body);
+      assert.equal(new Headers(init?.headers).get("authorization"), null);
+      return Response.json({ ...session(), user: { user_id: "follower", username: "follower" } });
+    };
+    for (const raw of [{ username: body.username, password: body.password }, { ...body, invite_code: "" }, { ...body, role: "kol" }, { ...body, kol_user_id: "forged" }]) {
+      assert.equal((await customerResponse(request("register", { body: raw }), "register")).status, 400);
+    }
+    assert.equal(calls, 0);
+    const result = await customerResponse(request("register", { body }), "register");
+    assert.equal(result.status, 200); assert.equal(calls, 1);
+    assert.equal((await result.json()).token, undefined);
+    assert.match(result.headers.get("set-cookie") ?? "", /HttpOnly/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    keys.forEach((key, index) => { if (old[index] === undefined) delete process.env[key]; else process.env[key] = old[index]; });
+  }
+});
+
+test("KOL invite responses expose only the owned share code, never database envelopes", () => {
+  assert.deepEqual(customerPublicValue("kol-invite", "GET", { invite_id: "id", invite_code: "KOL2026", active: true, created_ms: 100, code_envelope: "secret", code_hash: "hash", request_hash: "hash", kol_user_id: "hidden" }), { invite_id: "id", invite_code: "KOL2026", active: true, created_ms: 100 });
+  assert.deepEqual(customerPublicValue("kol-profile", "GET", { kol_id: "own", state: "enabled", api_secret: "hidden" }), { kol_id: "own", state: "enabled" });
+});

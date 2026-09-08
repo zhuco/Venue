@@ -5,6 +5,9 @@ import { allowedOrigin, controlOrigin, noStore } from "./server";
 const cookieName = "venue_customer";
 type CustomerSession = { token: string; csrf: string; expires_ms: number };
 const routes: Record<string, { path: string; methods: string[]; public?: boolean }> = {
+  "kol-source": { path: "/v2/kol/source", methods: ["GET", "POST"] },
+  "kol-profile": { path: "/v2/kol/profile", methods: ["GET"] },
+  "kol-invite": { path: "/v2/kol/invite", methods: ["GET", "POST"] },
   "managed-followers": { path: "/v2/kol/managed-followers", methods: ["GET", "POST"] },
   "managed-verify": { path: "/v2/kol/managed-followers/verify", methods: ["POST"] },
   "managed-delete": { path: "/v2/kol/managed-followers/delete", methods: ["POST"] },
@@ -78,7 +81,7 @@ function pick(value: unknown, fields: string[]): ObjectValue {
   return result;
 }
 const userFields = ["user_id", "username"];
-const credentialFields = ["credential_id", "label", "venue", "masked_key", "trading_account_id", "verification", "verified_ms", "expires_ms", "api_reachable", "dual_position", "account_mode", "has_exposure"];
+const credentialFields = ["credential_id", "label", "venue", "masked_key", "trading_account_id", "verification", "verified_ms", "expires_ms", "api_reachable", "dual_position", "account_mode", "has_exposure", "equity", "balance_observed_ms"];
 const riskFields = ["credential_id", "allocated_capital", "multiplier", "max_order_notional", "max_total_notional", "max_deviation_bps", "allowed_symbols"];
 function publicRisk(raw: unknown, managed = false): ObjectValue {
   const value = object(raw);
@@ -142,6 +145,9 @@ export function customerPublicValue(action: string, method: string, raw: unknown
     if (!Array.isArray(raw)) throw new Error("invalid_orders");
     return raw.map(value => pick(value, ["mirror_id", "symbol", "source_order_id", "child_client_order_id", "state", "requested_quantity", "filled_quantity", "attention_code"]));
   }
+  if (action === "kol-source") return pick(raw, ["trading_account_id", "revision", "can_change"]);
+  if (action === "kol-profile") return pick(raw, ["kol_id", "name", "title", "description", "state", "revision"]);
+  if (action === "kol-invite") return pick(raw, ["invite_id", "invite_code", "active", "created_ms"]);
   if (action === "invite") return { schema_version: object(raw).schema_version, profile: pick(object(raw).profile, ["kol_id", "name", "title", "description", "state", "revision"]) };
   if (action === "logout") return null;
   throw new Error("invalid_action");
@@ -153,7 +159,7 @@ export async function customerResponse(request: NextRequest, action: string): Pr
   let path = route?.path ?? "";
   if (invite) {
     const code = request.nextUrl.searchParams.get("code") ?? "";
-    if (!/^[A-Za-z0-9_-]{24,64}$/.test(code)) return response({ code: "invalid_input" }, 400);
+    if (!/^[A-Za-z0-9_-]{6,64}$/.test(code)) return response({ code: "invalid_input" }, 400);
     path = `/v2/public/kol/invites/${code}`;
   } else if (request.nextUrl.search) return response({ code: "invalid_input" }, 400);
   const session = customerSession(request);
@@ -165,7 +171,12 @@ export async function customerResponse(request: NextRequest, action: string): Pr
   if (request.method === "POST") {
     try {
       const raw = object(await boundedJson(request.body, 16_384));
-      if (action === "managed-followers") {
+      if (action === "register") {
+        if (Object.keys(raw).some(k => !["username", "password", "invite_code"].includes(k))
+          || typeof raw.username !== "string" || typeof raw.password !== "string"
+          || typeof raw.invite_code !== "string" || !/^[A-Za-z0-9_-]{6,64}$/.test(raw.invite_code)) throw new Error("invalid_registration");
+        body = JSON.stringify({ username: raw.username, password: raw.password, invite_code: raw.invite_code });
+      } else if (action === "managed-followers") {
         if (Object.keys(raw).some(k => !["request_id", "label", "key", "secret", "authorization"].includes(k)) || [raw.request_id, raw.label, raw.key, raw.secret].some(v => typeof v !== "string")) throw new Error("invalid_managed_credentials");
         body = JSON.stringify({ request_id: raw.request_id, credential: { label: raw.label, api_key: raw.key, api_secret: raw.secret }, authorization: followAuthorization(raw.authorization) });
       } else if (action === "credentials") {

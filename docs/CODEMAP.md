@@ -165,3 +165,5 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 | Web 与桌面 | Web `lib/*.test.ts`、`e2e/`；VenueFlow 包内测试及布局验证 |
 
 只验证改动影响面；文档修改不启动 Cargo 编译。全量发布门、命令和报告要求统一见 [DEVELOPMENT](DEVELOPMENT.md)。
+
+- Web 公开注册：`apps/ui/web/app/register/page.tsx`；KOL 邀请与唯一带单账户：`components/kol-invite-panel.tsx`、`components/kol-source-panel.tsx`，Control `accounts/kol_invites.rs`、`accounts/kol_source.rs`，迁移 0046/0047。
