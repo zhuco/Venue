@@ -178,6 +178,6 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 
 只验证改动影响面；文档修改不启动 Cargo 编译。全量发布门、命令和报告要求统一见 [DEVELOPMENT](DEVELOPMENT.md)。
 
-- KOL 唯一带单账户：Web `components/kol-source-panel.tsx`，Control `accounts/kol_source.rs`，协议 `kol_source.rs`，迁移 0047。
+- Web 公开注册：`apps/ui/web/app/register/page.tsx`；KOL 邀请与唯一带单账户：`components/kol-invite-panel.tsx`、`components/kol-source-panel.tsx`，Control `accounts/kol_invites.rs`、`accounts/kol_source.rs`，迁移 0046/0047。
 
-Web KOL 使用指南：`apps/ui/web/app/help/kol/page.tsx`，路由 `/help/kol`，后台提供分步帮助入口。
+Web KOL 使用指南：`apps/ui/web/app/help/kol/page.tsx`，路由 `/help/kol`；后台顶部、API、带单源与邀请表单提供定位入口。
