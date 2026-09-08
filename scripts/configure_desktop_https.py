@@ -76,6 +76,12 @@ def desktop_route():
         "match": [
             {"method": ["GET"], "path": GET_PATHS},
             {"method": ["POST"], "path": POST_PATHS},
+            {
+                "method": ["GET"],
+                "path_regexp": {
+                    "pattern": "^/v2/strategies/support-martingale/instances/[^/]+$"
+                },
+            },
         ],
         "handle": [
             {"handler": "headers", "response": {"set": {"Cache-Control": ["no-store"]}}},
