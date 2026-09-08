@@ -1062,9 +1062,10 @@ async fn wait_count(
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(
-                format!("mirror fixture timed out: {query}; expected {wanted}, got {actual}").into(),
-            );
+            return Err(format!(
+                "mirror fixture timed out: {query}; expected {wanted}, got {actual}"
+            )
+            .into());
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
