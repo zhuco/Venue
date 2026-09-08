@@ -22,7 +22,9 @@ use crate::{BinanceConfig, BinanceTransportError, BinanceTransportLimits};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READINESS_TIMEOUT: Duration = Duration::from_millis(1);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+// Idle signed projections feed a five-second trading gate. Leave room for pong RTT,
+// the 500 ms publication cadence and persistence instead of racing that exact deadline.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct BinanceListenKey {
@@ -374,7 +376,13 @@ mod tests {
     #[tokio::test]
     async fn idle_poll_does_not_renew_coverage_and_missing_heartbeats_fail_closed()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (local, _peer) = tokio::io::duplex(1024);
+        let (local, peer) = tokio::io::duplex(1024);
+        let mut peer = WebSocketStream::from_raw_socket(
+            peer,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
         let stream = WebSocketStream::from_raw_socket(
             local,
             tokio_tungstenite::tungstenite::protocol::Role::Client,
@@ -402,12 +410,29 @@ mod tests {
         };
         assert!(transport.poll_raw_frame().await?.is_none());
         assert_eq!(transport.last_received_at_ms(), 123);
+        // At two seconds an idle account must already be probing, before the MM gate expires.
+        transport.next_heartbeat_at -= Duration::from_secs(2);
+        assert!(transport.poll_raw_frame().await?.is_none());
+        assert_eq!(
+            transport.last_received_at_ms(),
+            123,
+            "sending a ping is not received evidence"
+        );
+        let message = timeout(Duration::from_millis(100), peer.next())
+            .await?
+            .ok_or("peer closed before heartbeat")??;
+        assert!(matches!(message, Message::Ping(_)));
+        peer.flush().await?;
+        assert!(transport.poll_raw_frame().await?.is_none());
+        let received = transport.last_received_at_ms();
+        assert!(received > 123, "only the received pong renews continuity");
+        assert_eq!(transport.private_generation(), 9);
         transport.last_received_at = Instant::now() - HEARTBEAT_TIMEOUT;
         assert!(matches!(
             transport.poll_raw_frame().await,
             Err(BinanceTransportError::Timeout)
         ));
-        assert_eq!(transport.last_received_at_ms(), 123);
+        assert_eq!(transport.last_received_at_ms(), received);
         Ok(())
     }
 

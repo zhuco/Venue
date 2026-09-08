@@ -28,6 +28,8 @@ pub enum InventoryMmRuntimeError {
     Facts,
     #[error("inventory MM public market unavailable")]
     Market,
+    #[error("inventory MM signed risk read unavailable")]
+    PrivateRead,
     #[error("inventory MM planner rejected facts")]
     Planner,
 }
@@ -55,6 +57,8 @@ pub struct InventoryMmRuntime {
     limits: BinanceTransportLimits,
     wake: CommandWake,
     markets: BTreeMap<String, MarketState>,
+    private_recovery: BTreeMap<String, std::time::Instant>,
+    read_recovery: BTreeMap<String, std::time::Instant>,
 }
 impl InventoryMmRuntime {
     pub fn new(
@@ -71,6 +75,8 @@ impl InventoryMmRuntime {
             limits,
             wake,
             markets: BTreeMap::new(),
+            private_recovery: BTreeMap::new(),
+            read_recovery: BTreeMap::new(),
         }
     }
     pub async fn run_until_shutdown(
@@ -95,11 +101,34 @@ impl InventoryMmRuntime {
         let records = self.store.active().await?;
         let active: BTreeSet<_> = records.iter().map(|r| r.instance_id.clone()).collect();
         self.markets.retain(|id, _| active.contains(id));
+        self.private_recovery.retain(|id, _| active.contains(id));
+        self.read_recovery.retain(|id, _| active.contains(id));
         let mut processed = 0;
         for record in records {
             match self.process(&record).await {
-                Ok(()) => processed += 1,
+                Ok(()) => {
+                    self.read_recovery.remove(&record.instance_id);
+                    processed += 1;
+                }
                 Err(InventoryMmRuntimeError::Superseded) => {}
+                Err(error) if retryable_read(error) => {
+                    let first = *self
+                        .read_recovery
+                        .entry(record.instance_id.clone())
+                        .or_insert_with(std::time::Instant::now);
+                    tracing::warn!(instance_id=%record.instance_id, %error,
+                        "inventory MM read failed; quotes paused while cancelling owned orders");
+                    let recovery = if private_recovery_expired(first.elapsed()) {
+                        self.latch_and_cancel(&record, "read_recovery_timeout")
+                            .await
+                    } else {
+                        self.cancel_observed(&record).await
+                    };
+                    if let Err(error) = recovery {
+                        tracing::warn!(instance_id=%record.instance_id, %error,
+                            "inventory MM recovery cancellation awaits original order readback");
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(instance_id=%record.instance_id, %error, "inventory MM turn failed closed");
                     if let Err(error) = self
@@ -179,14 +208,44 @@ impl InventoryMmRuntime {
             return Ok(());
         }
         if healthy.is_none()
-            || projection.position_mode != TerminalPositionMode::Hedge
             || !facts::fresh(projection.observed_ms, now_ms, facts::PRIVATE_MAX_AGE_MS)
-            || projection
-                .conditional_orders
-                .iter()
-                .any(|o| o.symbol == record.config.symbol)
         {
-            self.latch_and_cancel(record, "private_facts_unavailable")
+            let first = *self
+                .private_recovery
+                .entry(record.instance_id.clone())
+                .or_insert_with(|| {
+                    tracing::warn!(instance_id=%record.instance_id,
+                    observed_ms=projection.observed_ms, now_ms,
+                    stream_healthy=healthy.is_some(),
+                    "inventory MM paused for private recovery; cancelling owned quotes");
+                    std::time::Instant::now()
+                });
+            if private_recovery_expired(first.elapsed()) {
+                self.latch_and_cancel(record, "private_facts_unavailable")
+                    .await?;
+            } else {
+                // Retry observation only. No quote can pass the existing five-second admission
+                // gate during recovery; cancellation keeps its original ledger identity.
+                self.cancel(record, &projection, &owned).await?;
+            }
+            return Ok(());
+        }
+        if self.private_recovery.remove(&record.instance_id).is_some() {
+            self.markets.remove(&record.instance_id);
+            tracing::info!(instance_id=%record.instance_id,
+                "inventory MM private facts recovered; rewarming quotes");
+        }
+        if projection.position_mode != TerminalPositionMode::Hedge {
+            self.latch_and_cancel(record, "position_mode_changed")
+                .await?;
+            return Ok(());
+        }
+        if projection
+            .conditional_orders
+            .iter()
+            .any(|o| o.symbol == record.config.symbol)
+        {
+            self.latch_and_cancel(record, "unexpected_conditional_orders")
                 .await?;
             return Ok(());
         }
@@ -214,11 +273,10 @@ impl InventoryMmRuntime {
             .markets
             .get_mut(&record.instance_id)
             .ok_or(InventoryMmRuntimeError::Market)?;
-        let bbo = market
-            .reader
-            .refresh(now_ms)
-            .await
-            .map_err(|_| InventoryMmRuntimeError::Market)?;
+        let bbo = market.reader.refresh(now_ms).await.map_err(|error| {
+            tracing::warn!(%error, stage="bbo", "inventory MM public read failed");
+            InventoryMmRuntimeError::Market
+        })?;
         let midpoint = bbo
             .bid
             .value()
@@ -244,7 +302,10 @@ impl InventoryMmRuntime {
             .reader
             .refresh_reference(None, now()?)
             .await
-            .map_err(|_| InventoryMmRuntimeError::Market)?;
+            .map_err(|error| {
+                tracing::warn!(%error, stage="reference", "inventory MM public read failed");
+                InventoryMmRuntimeError::Market
+            })?;
         let credentials = self
             .secrets
             .load(&record.credential_id, &record.owner_user_id)
@@ -261,7 +322,10 @@ impl InventoryMmRuntime {
                 .reader
                 .quote_usd_evidence(projection.private_generation, facts::MARKET_MAX_AGE_MS),
         )
-        .map_err(|_| InventoryMmRuntimeError::Facts)?;
+        .map_err(|error| {
+            tracing::warn!(%error, "inventory MM signed margin, leverage or conversion read failed");
+            InventoryMmRuntimeError::PrivateRead
+        })?;
         let now_ms = now()?;
         if leverage.0 != record.config.required_leverage
             || !facts::fresh(leverage.1, now_ms, facts::MARKET_MAX_AGE_MS)
@@ -425,10 +489,16 @@ impl InventoryMmRuntime {
                 .observe(&current, None, None, Some(reason), now()?)
                 .await?;
         }
+        self.cancel_observed(expected).await
+    }
+    async fn cancel_observed(&self, expected: &InventoryMmInstance) -> Result<()> {
         let current = self
             .store
             .get(&expected.owner_user_id, &expected.instance_id)
             .await?;
+        if current.state == InventoryMmState::Stopped {
+            return Ok(());
+        }
         let commands = self.store.commands(&expected.instance_id).await?;
         if commands.iter().any(|c| nonterminal(c.state)) {
             return Ok(());
@@ -481,6 +551,15 @@ impl InventoryMmRuntime {
         self.wake.wake();
         Ok(())
     }
+}
+fn private_recovery_expired(elapsed: std::time::Duration) -> bool {
+    elapsed >= std::time::Duration::from_secs(30)
+}
+fn retryable_read(error: InventoryMmRuntimeError) -> bool {
+    matches!(
+        error,
+        InventoryMmRuntimeError::Market | InventoryMmRuntimeError::PrivateRead
+    )
 }
 fn owned_orders<'a>(
     record: &InventoryMmInstance,
@@ -548,6 +627,29 @@ mod tests {
         kol::{TERMINAL_PROJECTION_SCHEMA_VERSION, TerminalOpenOrder, TerminalOrderState},
     };
     use venue_domain::{OrderSide, PositionSide};
+
+    #[test]
+    fn private_recovery_is_bounded_without_extending_fact_freshness() {
+        assert!(!private_recovery_expired(std::time::Duration::from_millis(
+            29_999
+        )));
+        assert!(private_recovery_expired(std::time::Duration::from_secs(30)));
+        assert!(!facts::fresh(1_000, 6_001, facts::PRIVATE_MAX_AGE_MS));
+    }
+
+    #[test]
+    fn read_retries_do_not_include_identity_planner_store_or_revision_errors() {
+        assert!(retryable_read(InventoryMmRuntimeError::Market));
+        assert!(retryable_read(InventoryMmRuntimeError::PrivateRead));
+        for error in [
+            InventoryMmRuntimeError::Facts,
+            InventoryMmRuntimeError::Planner,
+            InventoryMmRuntimeError::Store,
+            InventoryMmRuntimeError::Superseded,
+        ] {
+            assert!(!retryable_read(error));
+        }
+    }
 
     fn record() -> std::result::Result<InventoryMmInstance, Box<dyn std::error::Error>> {
         Ok(InventoryMmInstance {
