@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import { api, messages, RequestError } from "@/lib/customer-api";
+import { api, messages, RequestError, verificationFeedback, verificationMessages } from "@/lib/customer-api";
 import { KolSourcePanel } from "./kol-source-panel";
 import { KolInvitePanel } from "./kol-invite-panel";
 import { ManagedFollowersPanel } from "./managed-followers-panel";
@@ -52,16 +52,20 @@ export function CustomerConsole({ inviteCode, registration = false }: { inviteCo
     mutating.current = true; setBusy(true); setError(""); setMessage(""); setFresh(false); version.current++;
     if (retryable) setPending({ action, body });
     try {
-      await api(action, overview?.csrf, body); setPending(null); setConfirmed(false);
+      const result = await api<Partial<Credential>>(action, overview?.csrf, body); setPending(null); setConfirmed(false);
       if (action === "logout") { hasSession.current = false; setOverview(null); setLeader(null); setKolProfile(null); setRelation(null); setOrders([]); }
-      else { setMessage("请求已处理。"); await refresh(); }
+      else {
+        if (action === "verify") { const feedback = verificationFeedback(result.verification); if (feedback.success) setMessage(feedback.message); else setError(feedback.message); }
+        else setMessage("请求已处理。");
+        await refresh();
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : messages.unavailable);
       if (cause instanceof RequestError && cause.status >= 400 && cause.status < 500 && cause.status !== 408 && cause.status !== 429) setPending(null);
       await refresh();
     } finally { mutating.current = false; setBusy(false); }
   }
-  const selected = overview?.credentials.find(c => c.trading_account_id === sourceAccount);
+  const selected = sourceAccount ? overview?.credentials.find(c => c.trading_account_id === sourceAccount) : undefined;
   const locked = busy || !fresh || pending !== null;
   const bot = leader?.bot;
   return <main className="customer-page"><div className="customer-stack">
@@ -104,7 +108,7 @@ export function CustomerConsole({ inviteCode, registration = false }: { inviteCo
 
 type Mutate = (action: string, body: object, retryable?: boolean) => Promise<void>;
 function CredentialRow({ credential, selected, disabled, mutate, relation, canLead }: { credential: Credential; selected: boolean; disabled: boolean; mutate: Mutate; relation: FollowRelation | null; canLead: boolean }) {
-  return <div className="customer-credential"><div><strong>{credential.label}</strong> <span>{credential.masked_key}</span><p>{states[credential.verification] ?? credential.verification}{selected && canLead ? " · 带单账户" : ""}</p></div><div className="buttons"><button disabled={disabled} onClick={() => void mutate("verify", { credential_id: credential.credential_id })}>验证权限</button>{relation && <FollowPanel relation={relation} credential={credential} disabled={disabled} mutate={mutate} />}</div><details><summary>删除绑定</summary><form onSubmit={event => { event.preventDefault(); const data = new FormData(event.currentTarget); const body = { credential_id: credential.credential_id, password: field(data, "password") }; event.currentTarget.reset(); void mutate("delete", body); }}><label>输入登录密码确认<input name="password" type="password" required autoComplete="current-password" /></label><div className="buttons"><button disabled={disabled}>确认删除绑定</button></div></form></details></div>;
+  return <div className="customer-credential"><div><strong>{credential.label}</strong> <span>{credential.masked_key}</span><p>{verificationMessages[credential.verification] ?? credential.verification}{selected && canLead ? " · 带单账户" : ""}</p></div><div className="buttons"><button disabled={disabled} onClick={() => void mutate("verify", { credential_id: credential.credential_id })}>验证权限</button>{relation && <FollowPanel relation={relation} credential={credential} disabled={disabled} mutate={mutate} />}</div><details><summary>删除绑定</summary><form onSubmit={event => { event.preventDefault(); const data = new FormData(event.currentTarget); const body = { credential_id: credential.credential_id, password: field(data, "password") }; event.currentTarget.reset(); void mutate("delete", body); }}><label>输入登录密码确认<input name="password" type="password" required autoComplete="current-password" /></label><div className="buttons"><button disabled={disabled}>确认删除绑定</button></div></form></details></div>;
 }
 function FollowPanel({ relation, credential, disabled, mutate }: { relation: FollowRelation; credential: Credential; disabled: boolean; mutate: Mutate }) {
   const dialog = useRef<HTMLDialogElement>(null);

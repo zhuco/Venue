@@ -99,6 +99,13 @@ impl AccountService {
             sqlx::query("UPDATE venue_kol_profiles SET leader_trading_account_id=$1,revision=revision+1,updated_ms=$2 WHERE kol_user_id=$3")
                 .bind(account).bind(ms(now)?).bind(&principal.user.user_id).execute(&mut *tx).await.map_err(database_error)?;
         }
+        // Selecting a verified source completes initial KOL onboarding; an explicit revocation remains final.
+        sqlx::query("SELECT venue_initialize_kol_permission($1,$2)")
+            .bind(&principal.user.user_id)
+            .bind(ms(now)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(database_error)?;
         tx.commit().await.map_err(database_error)?;
         self.own_kol_source(principal).await
     }
@@ -179,6 +186,32 @@ mod tests {
         .fetch_one(&f.pool)
         .await?;
         assert_eq!((state.as_str(), capital.as_str()), ("enabled", "123.45"));
+        let access = f.service.leader_bots_access(&owner).await?;
+        assert!(access.can_use);
+        assert_eq!(access.permission_revision, 1);
+        crate::leader_bot_admin::set_permission(
+            &f.pool,
+            &owner.user.user_id,
+            false,
+            1,
+            "fixture",
+            time,
+        )
+        .await?;
+        f.service
+            .select_kol_source(
+                &owner,
+                KolSourceRequest {
+                    credential_id: ids[0].0.clone(),
+                    expected_revision: 2,
+                },
+                time,
+            )
+            .await?;
+        let access = f.service.leader_bots_access(&owner).await?;
+        assert!(!access.can_use);
+        assert_eq!(access.permission_revision, 2);
+
         sqlx::query("INSERT INTO venue_leader_bots(bot_id,owner_user_id,trading_account_id,credential_id,bot_state,permission_revision,created_ms,updated_ms,create_request_id,bot_name,bot_description,strategy_capital) VALUES($1,$2,$3,$4,'stopped',1,$5,$5,$1,'fixture','','123.45')")
             .bind(crypto::opaque_id()?).bind(&owner.user.user_id).bind(&ids[0].1).bind(&ids[0].0).bind(ms(time)?).execute(&f.pool).await?;
         assert!(!f.service.own_kol_source(&owner).await?.can_change);
