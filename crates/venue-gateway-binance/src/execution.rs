@@ -351,8 +351,14 @@ pub fn prepare_place_limit(
     intent: &BinancePlaceIntent,
 ) -> Result<BinancePreparedMutation, BinanceExecutionError> {
     validate_common(rules, readback, &intent.client_order_id, intent.quantity)?;
-    validate_price_and_notional(rules, intent.quantity, intent.limit_price)?;
     validate_place_direction(readback.position_mode, intent)?;
+    if intent.reduce_only {
+        // This is the domain close intent, even when Hedge Mode omits native reduceOnly.
+        // Position clipping remains the caller's responsibility; price/lot filters still apply.
+        validate_limit_price(rules, intent.limit_price)?;
+    } else {
+        validate_price_and_notional(rules, intent.quantity, intent.limit_price)?;
+    }
     let parameters = place_limit_parameters(rules, intent, readback.position_mode);
     prepared(
         rules,
@@ -684,13 +690,24 @@ fn validate_price_and_notional(
     quantity: Decimal,
     price: Price,
 ) -> Result<(), BinanceExecutionError> {
+    validate_limit_price(rules, price)?;
+    if quantity
+        .checked_mul(price.value())
+        .ok_or(BinanceExecutionError::Rules)?
+        < rules.instrument.minimum_notional.value
+    {
+        return Err(BinanceExecutionError::Rules);
+    }
+    Ok(())
+}
+
+fn validate_limit_price(
+    rules: &BinanceInstrumentRules,
+    price: Price,
+) -> Result<(), BinanceExecutionError> {
     if price.value() % rules.instrument.price_tick.value() != Decimal::ZERO
         || price.value() < rules.minimum_price
         || price.value() > rules.maximum_price
-        || quantity
-            .checked_mul(price.value())
-            .ok_or(BinanceExecutionError::Rules)?
-            < rules.instrument.minimum_notional.value
     {
         return Err(BinanceExecutionError::Rules);
     }
@@ -1186,6 +1203,58 @@ mod tests {
             time_in_force: BinanceTimeInForce::PostOnly,
             reduce_only: false,
         })
+    }
+
+    #[test]
+    fn small_limit_close_skips_only_notional_and_omits_hedge_reduce_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let facts = facts("00000000-0000-4000-8000-000000000001")?;
+        let mut intent = place_intent()?;
+        intent.quantity = facts.rules.minimum_quantity;
+        intent.limit_price = Price::new(Decimal::from(100))?;
+        assert!(
+            intent.quantity * intent.limit_price.value()
+                < facts.rules.instrument.minimum_notional.value
+        );
+        assert_eq!(
+            prepare_place_limit(&facts.rules, &facts.readback, &intent),
+            Err(BinanceExecutionError::Rules)
+        );
+        intent.reduce_only = true;
+        for (position_side, side) in [
+            (PositionSide::Long, OrderSide::Sell),
+            (PositionSide::Short, OrderSide::Buy),
+        ] {
+            intent.position_side = position_side;
+            intent.side = side;
+            let prepared = prepare_place_limit(&facts.rules, &facts.readback, &intent)?;
+            assert!(
+                !prepared
+                    .parameters()
+                    .iter()
+                    .any(|(key, _)| key == "reduceOnly")
+            );
+        }
+        intent.side = OrderSide::Sell;
+        assert_eq!(
+            prepare_place_limit(&facts.rules, &facts.readback, &intent),
+            Err(BinanceExecutionError::Intent)
+        );
+        intent.side = OrderSide::Buy;
+        intent.quantity = facts.rules.minimum_quantity / Decimal::from(2);
+        assert_eq!(
+            prepare_place_limit(&facts.rules, &facts.readback, &intent),
+            Err(BinanceExecutionError::Rules)
+        );
+        intent.quantity = facts.rules.minimum_quantity;
+        intent.limit_price = Price::new(
+            Decimal::from(100) + facts.rules.instrument.price_tick.value() / Decimal::from(2),
+        )?;
+        assert_eq!(
+            prepare_place_limit(&facts.rules, &facts.readback, &intent),
+            Err(BinanceExecutionError::Rules)
+        );
+        Ok(())
     }
 
     fn grid_fence() -> Result<BinanceGridDispatchFence, Box<dyn std::error::Error>> {
