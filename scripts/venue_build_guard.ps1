@@ -56,7 +56,7 @@ function Get-VenueBuildPlan {
     Assert-VenuePlainPath $target
     Assert-VenuePlainPath (Join-Path $root '.guard')
     Assert-VenuePlainPath (Join-Path (Join-Path $root '.tmp') $Slot)
-    return [PSCustomObject]@{RepoRoot=$repo;Root=$root;Slot=$Slot;TargetDirectory=$target;TempDirectory=(Join-Path (Join-Path $root '.tmp') $Slot);GuardDirectory=(Join-Path $root '.guard');HostedCI=$false;BudgetBytes=150GB;MinimumHostFree=100GB;MinimumGuestFree=20GB;HostRoot='F:\';GuestRoot='G:\'}
+    return [PSCustomObject]@{RepoRoot=$repo;Root=$root;Slot=$Slot;TargetDirectory=$target;TempDirectory=(Join-Path (Join-Path $root '.tmp') $Slot);GuardDirectory=(Join-Path $root '.guard');HostedCI=$false;BudgetBytes=200GB;MinimumHostFree=100GB;MinimumGuestFree=20GB;HostRoot='F:\';GuestRoot='G:\'}
 }
 
 function Get-VenueCacheBytes {
@@ -86,7 +86,7 @@ function Test-VenueBuildAdmission {
     if ($hostFree -lt $Plan.MinimumHostFree) { throw "Build refused: backing volume free space is below $($Plan.MinimumHostFree / 1GB) GiB." }
     if ($guestFree -lt $Plan.MinimumGuestFree) { throw "Build refused: target volume free space is below $($Plan.MinimumGuestFree / 1GB) GiB." }
     $bytes = if ($Plan.HostedCI) { Get-VenueCacheBytes $Plan.TargetDirectory $Plan.BudgetBytes } else { Get-VenueCacheBytes $Plan.Root $Plan.BudgetBytes }
-    if ($bytes -gt $Plan.BudgetBytes) { throw 'Build refused: the 150 GiB cache admission budget is exceeded. Review idle registered caches; do not clean source or recovery data.' }
+    if ($bytes -gt $Plan.BudgetBytes) { throw "Build refused: the $($Plan.BudgetBytes / 1GB) GiB cache admission budget is exceeded. Review idle registered caches; do not clean source or recovery data." }
     [PSCustomObject]@{Slot=$Plan.Slot;TargetDirectory=$Plan.TargetDirectory;CacheBytes=$bytes;HostFreeBytes=$hostFree;GuestFreeBytes=$guestFree;BudgetBytes=$Plan.BudgetBytes;HostedCI=$Plan.HostedCI}
 }
 
