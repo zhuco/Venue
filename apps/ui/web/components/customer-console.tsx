@@ -23,7 +23,7 @@ export function CustomerConsole({ inviteCode, registration = false }: { inviteCo
   const [invite, setInvite] = useState<Invite | null>(null);
   const [error, setError] = useState(""); const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(true); const [busy, setBusy] = useState(false);
-  const [fresh, setFresh] = useState(false); const [confirmed, setConfirmed] = useState(false);
+  const [fresh, setFresh] = useState(false);
   const [pending, setPending] = useState<Pending | null>(null);
   const mutating = useRef(false); const version = useRef(0); const hasSession = useRef(true);
   const refresh = useCallback(async () => {
@@ -36,7 +36,7 @@ export function CustomerConsole({ inviteCode, registration = false }: { inviteCo
     } catch (cause) {
       if (version.current !== current) return;
       setFresh(false);
-      if (cause instanceof RequestError && cause.status === 401) { hasSession.current = false; setOverview(null); setLeader(null); setKolProfile(null); setRelation(null); setOrders([]); setPending(null); setConfirmed(false); }
+      if (cause instanceof RequestError && cause.status === 401) { hasSession.current = false; setOverview(null); setLeader(null); setKolProfile(null); setRelation(null); setOrders([]); setPending(null); }
       else setError(cause instanceof Error ? cause.message : messages.unavailable);
     } finally { if (version.current === current) setLoading(false); }
   }, []);
@@ -52,11 +52,22 @@ export function CustomerConsole({ inviteCode, registration = false }: { inviteCo
     mutating.current = true; setBusy(true); setError(""); setMessage(""); setFresh(false); version.current++;
     if (retryable) setPending({ action, body });
     try {
-      const result = await api<Partial<Credential>>(action, overview?.csrf, body); setPending(null); setConfirmed(false);
+      const result = await api<Partial<Credential> & { can_use?: boolean; bots?: NonNullable<LeaderAccess["bot"]>[] }>(action, overview?.csrf, body);
+      if (action === "leader-create") {
+        const created = result.bots?.length === 1 ? result.bots[0] : null;
+        if (!result.can_use || !created || created.state !== "stopped" || created.credential_id !== (body as { credential_id: string }).credential_id) {
+          throw new RequestError(409, "conflict");
+        }
+        const start = { schema_version: 1, request_id: crypto.randomUUID(), bot_id: created.bot_id, expected_revision: created.revision, action: "start", risk_confirmed: true };
+        // Once creation is confirmed, retry only this lifecycle identity, never create again.
+        setPending({ action: "leader-lifecycle", body: start });
+        await api<LeaderAccess>("leader-lifecycle", overview?.csrf, start);
+      }
+      setPending(null);
       if (action === "logout") { hasSession.current = false; setOverview(null); setLeader(null); setKolProfile(null); setRelation(null); setOrders([]); }
       else {
         if (action === "verify") { const feedback = verificationFeedback(result.verification); if (feedback.success) setMessage(feedback.message); else setError(feedback.message); }
-        else setMessage(action === "leader-create" ? "带单机器人已创建，当前为停止状态。确认后可启动带单。" : "请求已处理。");
+        else setMessage(action === "leader-create" || action === "leader-lifecycle" ? "带单操作已处理，请核对当前状态。" : "请求已处理。");
         await refresh();
       }
     } catch (cause) {
@@ -89,29 +100,19 @@ export function CustomerConsole({ inviteCode, registration = false }: { inviteCo
           <div className="buttons"><button disabled={locked}>{kolProfile ? "绑定交易账户" : "绑定并授权跟单"}</button></div>
         </form><p className="muted">{kolProfile ? "绑定并验证成功后，请在下方指定唯一带单账户。" : "默认定比跟单 1 倍，定额跟单需填写每笔名义金额。验证成功后自动申请跟单。"}密钥仅由服务器加密保存。</p></details>
       </section>
-      {kolProfile && <KolSourcePanel csrf={overview.csrf} credentials={overview.credentials} onSource={setSourceAccount} />}
-      {(leader?.can_use || bot) && <section className="panel" aria-label="带单机器人"><div className="heading"><h2>带单机器人</h2><span className="pill">{bot ? states[bot.state] ?? bot.state : "尚未创建"}</span></div>
-        {!leader?.can_use && <p>带单权限已撤销。已有实例仍可查看和停止。</p>}
-        {bot ? <><p>主账户：{bot.trading_account_id}</p><p>跟单账户 {bot.active_followers} · 待处理挂单 {bot.pending_orders}</p>{bot.attention_code && <p role="status">需处理：{bot.attention_code}</p>}</> : <p>将已验证的 KOL 主账户设为带单源。</p>}
-        {leader?.can_use && bot?.state === "stopped" && <label className="customer-confirm"><input type="checkbox" checked={confirmed} onChange={e => setConfirmed(e.target.checked)} />我确认启动后，符合条件的新挂单将同步到启用跟单的账户。</label>}
-        {!bot && leader?.can_use && <form key={selected?.credential_id ?? "no-source"} onSubmit={event => {
-          event.preventDefault();
-          if (locked || selected?.verification !== "verified") return;
-          const data = new FormData(event.currentTarget);
-          const capital = field(data, "capital").trim();
-          if (!/^\d+(\.\d+)?$/.test(capital) || !/[1-9]/.test(capital)) { setError("策略资金必须为大于零的金额。"); return; }
-          void mutate("leader-create", { schema_version: 2, request_id: crypto.randomUUID(), credential_id: selected.credential_id, config: { name: field(data, "botName").trim(), description: "", strategy_capital: capital } }, true);
-        }}><fieldset disabled={locked || selected?.verification !== "verified"}>
-          <label>机器人名称<input name="botName" required maxLength={64} defaultValue="KOL 带单" /></label>
-          <label>策略资金（USD）<input name="capital" required inputMode="decimal" pattern="[0-9]+(\.[0-9]+)?" defaultValue={hasFollowEquity(selected?.equity) ? selected?.equity ?? "" : ""} placeholder="请输入大于零的策略资金" /></label>
-          <p className="muted">用于定比跟单计算。请核对实际策略资金；创建后仍需确认启动。</p>
-          <button type="submit">创建带单机器人</button>
-        </fieldset>{selected?.verification !== "verified" && <p role="status">请先验证账户并保存唯一带单账户。</p>}</form>}
-        <div className="buttons">
-          {bot && leader?.can_use && bot.state === "stopped" && <button className="primary" disabled={locked || !confirmed} onClick={() => void mutate("leader-lifecycle", { schema_version: 1, request_id: crypto.randomUUID(), bot_id: bot.bot_id, expected_revision: bot.revision, action: "start", risk_confirmed: true }, true)}>启动带单</button>}
-          {bot && bot.state !== "stopped" && <button disabled={locked || bot.state === "draining"} onClick={() => void mutate("leader-lifecycle", { schema_version: 1, request_id: crypto.randomUUID(), bot_id: bot.bot_id, expected_revision: bot.revision, action: "stop", risk_confirmed: false }, true)}>停止并撤销同步挂单</button>}
-        </div><p className="muted">停止只撤销程序创建的同步挂单，已有仓位不会自动平仓。</p>
-      </section>}
+      {kolProfile && <KolSourcePanel csrf={overview.csrf} credentials={overview.credentials} onSource={setSourceAccount} disabled={locked}>
+        <div><div className="buttons"><span className="pill">{bot ? states[bot.state] ?? bot.state : "未启用"}</span>
+          <button type="button" role="switch" aria-checked={bot?.state === "running"} aria-label="带单开关" className="primary" disabled={locked || bot?.state === "draining" || (!(bot && bot.state !== "stopped") && (!leader?.can_use || selected?.verification !== "verified" || (!bot && !hasFollowEquity(selected?.equity))))} onClick={() => {
+            if (bot) void mutate("leader-lifecycle", { schema_version: 1, request_id: crypto.randomUUID(), bot_id: bot.bot_id, expected_revision: bot.revision, action: bot.state === "stopped" ? "start" : "stop", risk_confirmed: bot.state === "stopped" }, true);
+            else if (selected && hasFollowEquity(selected.equity)) void mutate("leader-create", { schema_version: 2, request_id: crypto.randomUUID(), credential_id: selected.credential_id, config: { name: "KOL 带单", description: "", strategy_capital: selected.equity } }, true);
+          }}>{busy ? "正在处理…" : bot?.state === "draining" ? "正在停止…" : bot && bot.state !== "stopped" ? "停止带单" : "启用带单"}</button>
+        </div>
+        {!leader?.can_use && <p className="muted">当前尚未获得带单权限，请先保存已验证的带单账户；已撤权时需联系管理员。</p>}
+        {leader?.can_use && selected?.verification !== "verified" && <p className="muted">请先验证账户并保存带单账户。</p>}
+        {leader?.can_use && selected?.verification === "verified" && !bot && !hasFollowEquity(selected.equity) && <p role="status">尚未取得正账户权益。请入金后点击“验证权限”更新权益，再启用带单。</p>}
+        {bot?.attention_code && <p role="status">需处理：{bot.attention_code}</p>}
+        </div>
+      </KolSourcePanel>}
       {kolProfile && <KolInvitePanel key={`invite:${overview.user.user_id}`} csrf={overview.csrf} enabled={kolProfile.state === "enabled"} />}
       <ManagedFollowersPanel key={`managed:${overview.user.user_id}`} csrf={overview.csrf} />
       {!kolProfile && <section className="panel"><h2>我的同步订单</h2><p className="muted">主账户和跟单账户独立成交；显示最近 500 条订单记录。</p>{orders.length === 0 ? <p>暂无同步订单。</p> : <div className="table"><table><thead><tr><th>交易对</th><th>来源订单</th><th>委托数量</th><th>已成交</th><th>状态</th></tr></thead><tbody>{orders.map(order => <tr key={order.mirror_id}><td>{order.symbol}</td><td>{order.source_order_id}</td><td>{order.requested_quantity}</td><td>{order.filled_quantity}</td><td>{states[order.state] ?? order.state}{order.attention_code && <small> · {order.attention_code}</small>}</td></tr>)}</tbody></table></div>}</section>}

@@ -115,7 +115,7 @@ export function customerPublicValue(action: string, method: string, raw: unknown
   if (action === "leader-create") {
     const value = object(raw);
     if (!Array.isArray(value.bots)) throw new Error("invalid_bots");
-    return { ...pick(value, ["schema_version", "can_use", "permission_revision"]), bots: value.bots.map(bot => pick(bot, ["bot_id", "state", "revision"])) };
+    return { ...pick(value, ["schema_version", "can_use", "permission_revision"]), bots: value.bots.map(bot => pick(bot, ["bot_id", "credential_id", "trading_account_id", "state", "revision"])) };
   }
   if (["managed-settings", "managed-follow", "managed-status"].includes(action)) {
     const value = object(raw);

@@ -184,4 +184,4 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 
 Web KOL 使用指南：`apps/ui/web/app/help/kol/page.tsx`，路由 `/help/kol`；后台顶部、API、带单源与邀请表单提供定位入口。
 
-Web 带单机器人创建：`apps/ui/web/components/customer-console.tsx` → BFF `leader-create` → `/v2/kol/leader-bots`，显式提交正策略资金，保存停止态；读取和启停继续使用单机器人兼容接口。
+Web 在唯一带单账户旁提供启用/停止开关，不单独展示机器人创建表单。首次启用以当前验证取得的正权益调用 `/v2/kol/leader-bots` 保存配置，确认成功后再调用生命周期接口；创建与启用各自保留请求编号，结果不确定只重试对应阶段。零/缺失权益提示重新验证；停止撤销程序同步挂单但不平仓。入口为 `apps/ui/web/components/customer-console.tsx` 与 `kol-source-panel.tsx`。

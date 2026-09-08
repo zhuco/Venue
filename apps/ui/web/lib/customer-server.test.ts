@@ -200,13 +200,13 @@ test("configured leader creation forwards capital and the same request identity 
       assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${session().token}`);
       assert.deepEqual(JSON.parse(String(init?.body)), body);
       if (calls === 1) return Response.json({ code: "unavailable" }, { status: 503 });
-      return Response.json({ schema_version: 2, can_use: true, permission_revision: 1, bots: [{ bot_id: "created", state: "stopped", revision: 1, owner: "hidden", api_secret: "hidden" }] });
+      return Response.json({ schema_version: 2, can_use: true, permission_revision: 1, bots: [{ bot_id: "created", credential_id: "owned", trading_account_id: "account", state: "stopped", revision: 1, owner: "hidden", api_secret: "hidden" }] });
     };
     assert.equal((await customerResponse(request("leader-create", { cookie, body }), "leader-create")).status, 503);
     assert.equal(calls, 1);
     const result = await customerResponse(request("leader-create", { cookie, body }), "leader-create");
     assert.equal(result.status, 200);
-    assert.deepEqual(await result.json(), { schema_version: 2, can_use: true, permission_revision: 1, bots: [{ bot_id: "created", state: "stopped", revision: 1 }] });
+    assert.deepEqual(await result.json(), { schema_version: 2, can_use: true, permission_revision: 1, bots: [{ bot_id: "created", credential_id: "owned", trading_account_id: "account", state: "stopped", revision: 1 }] });
     assert.equal(calls, 2);
   } finally {
     globalThis.fetch = originalFetch;
