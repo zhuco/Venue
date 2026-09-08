@@ -252,6 +252,7 @@ impl VenueFlowApp {
                     .execution
                     .support_martingale
                     .apply_instances(instances),
+                ClientEvent::InventoryMm(event) => self.model.execution.inventory_mm.apply(event),
                 ClientEvent::SupportMartingaleMutationApplied(summary) => self
                     .model
                     .execution

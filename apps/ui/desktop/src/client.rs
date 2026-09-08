@@ -2,6 +2,7 @@ use crate::account_scope::{AccountScope, Scoped};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 mod execution;
 mod grid;
+pub(crate) mod inventory_mm;
 mod leader_bot;
 mod stream_gates;
 mod support_martingale;
@@ -53,6 +54,7 @@ pub enum ClientEvent {
         message: String,
     },
     GridInstances(Vec<venue_control_protocol::grid::GridInstanceSummary>),
+    InventoryMm(inventory_mm::Event),
     GridMutationApplied(Box<venue_control_protocol::grid::GridInstanceSummary>),
     GridUnavailable(String),
     GridMutationUnavailable(String),

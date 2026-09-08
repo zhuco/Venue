@@ -55,6 +55,10 @@ class DesktopHttpsTests(unittest.TestCase):
         self.assertIn("/v2/strategies/support-martingale/instances", POST_PATHS)
         self.assertIn("/v2/strategies/support-martingale/preflight", POST_PATHS)
         self.assertIn("/v2/strategies/support-martingale/lifecycle", POST_PATHS)
+        self.assertIn("/v2/strategies/inventory-mm", GET_PATHS)
+        self.assertIn("/v2/strategies/inventory-mm", POST_PATHS)
+        self.assertIn("/v2/strategies/inventory-mm/preflight", POST_PATHS)
+        self.assertIn("/v2/strategies/inventory-mm/lifecycle", POST_PATHS)
 
     def test_market_relay_is_get_only_exact_and_strips_private_headers(self):
         routes = configured_route(self.original)["handle"][0]["routes"]

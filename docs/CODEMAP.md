@@ -90,6 +90,7 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 | 独立配置及启动/停止协议 | `crates/venue-control-protocol/src/inventory_mm.rs` |
 | 实例、命令归属、取消确认及单例协调 | `apps/venue-control/src/inventory_mm/`；迁移 `0045_inventory_mm.sql` |
 | 本人 API 与签名预检 | `apps/venue-control/src/accounts/inventory_mm.rs` |
+| 桌面独立创建与管理窗口 | `apps/ui/desktop/src/inventory_mm_view.rs`、`client/inventory_mm.rs` |
 
 ## 桌面与 Web
 
