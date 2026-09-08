@@ -297,7 +297,6 @@ impl InventoryMmRuntime {
                 .map_err(|_| InventoryMmRuntimeError::Facts)?;
             market.last_sample_ms = bbo.observed_at_ms;
         }
-        let (long_quantity, short_quantity) = facts::positions(&projection, &record.config.symbol)?;
         let reference = market
             .reader
             .refresh_reference(None, now()?)
@@ -326,6 +325,28 @@ impl InventoryMmRuntime {
             tracing::warn!(%error, "inventory MM signed margin, leverage or conversion read failed");
             InventoryMmRuntimeError::PrivateRead
         })?;
+        // Signed risk reads cross network awaits. Plan against a fresh authenticated surface
+        // afterwards instead of repeatedly enqueueing a snapshot overtaken by heartbeats.
+        let latest = self
+            .projections
+            .load_healthy_owned(&record.owner_user_id, &record.credential_id)
+            .await
+            .map_err(|_| InventoryMmRuntimeError::PrivateRead)?
+            .ok_or(InventoryMmRuntimeError::PrivateRead)?;
+        if !same_generation_refresh(&projection, &latest, now()?) {
+            return Err(InventoryMmRuntimeError::PrivateRead);
+        }
+        let projection = latest;
+        if projection.position_mode != TerminalPositionMode::Hedge
+            || projection
+                .conditional_orders
+                .iter()
+                .any(|o| o.symbol == record.config.symbol)
+        {
+            return Err(InventoryMmRuntimeError::Facts);
+        }
+        let owned = owned_orders(record, &projection, &commands)?;
+        let (long_quantity, short_quantity) = facts::positions(&projection, &record.config.symbol)?;
         let now_ms = now()?;
         if leverage.0 != record.config.required_leverage
             || !facts::fresh(leverage.1, now_ms, facts::MARKET_MAX_AGE_MS)
@@ -606,6 +627,17 @@ fn projection_covers_ledger(commands: &[MmCommandRecord], observed_ms: u64) -> b
                 || (c.state == ExecutorCommandState::Reconciled && c.updated_ms >= observed_ms)
         })
 }
+fn same_generation_refresh(
+    previous: &TerminalAccountProjection,
+    latest: &TerminalAccountProjection,
+    now_ms: u64,
+) -> bool {
+    latest.credential_id == previous.credential_id
+        && latest.trading_account_id == previous.trading_account_id
+        && latest.private_generation == previous.private_generation
+        && latest.observed_ms >= previous.observed_ms
+        && facts::fresh(latest.observed_ms, now_ms, facts::PRIVATE_MAX_AGE_MS)
+}
 fn nonterminal(state: ExecutorCommandState) -> bool {
     matches!(
         state,
@@ -717,6 +749,30 @@ mod tests {
             fills: vec![],
             assets: vec![],
         }
+    }
+
+    #[test]
+    fn late_projection_refresh_keeps_identity_generation_and_real_freshness()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let record = record()?;
+        let old = projection(&record);
+        let mut latest = old.clone();
+        latest.observed_ms = 200;
+        assert!(same_generation_refresh(&old, &latest, 201));
+        assert!(!same_generation_refresh(&old, &latest, 199));
+        assert!(!same_generation_refresh(&old, &latest, 5_201));
+        latest.observed_ms = 99;
+        assert!(!same_generation_refresh(&old, &latest, 201));
+        latest.observed_ms = 200;
+        latest.private_generation += 1;
+        assert!(!same_generation_refresh(&old, &latest, 201));
+        latest = old.clone();
+        latest.credential_id = "different".into();
+        assert!(!same_generation_refresh(&old, &latest, 201));
+        latest = old.clone();
+        latest.trading_account_id = "different".into();
+        assert!(!same_generation_refresh(&old, &latest, 201));
+        Ok(())
     }
 
     #[test]
