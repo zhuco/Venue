@@ -1,0 +1,73 @@
+# Venue 本地开发环境 Docker Compose
+# 包含 PostgreSQL 数据库和 venue-control-server 后端服务
+#
+# 使用方式：
+#   docker-compose up -d          # 启动所有服务
+#   docker-compose down           # 停止所有服务
+#   docker-compose logs -f        # 查看日志
+#   docker-compose ps             # 查看服务状态
+
+version: '3.8'
+
+services:
+  # ============================================================================
+  # PostgreSQL 数据库
+  # ============================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: venue-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: venue
+      POSTGRES_PASSWORD: venue_dev_password
+      POSTGRES_DB: venue
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U venue -d venue"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - venue-network
+
+  # ============================================================================
+  # Venue Control Server (后端)
+  # ============================================================================
+  control-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: venue-control-server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # 数据库连接
+      DATABASE_URL: postgresql://venue:venue_dev_password@postgres:5432/venue
+      # 服务绑定地址（必须使用 loopback）
+      VENUE_CONTROL_BIND: 127.0.0.1:39180
+      # 凭证加密密钥（base64 编码的 32 字节）
+      # 本地开发用固定值，生产环境请更换
+      VENUE_ACCOUNT_MASTER_KEY: odfcqJxp6rg8VTItuezr1s7JzdUBCO4Z6SVEovfRGOI=
+    ports:
+      - "39180:39181"
+    networks:
+      - venue-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:39180/v2/ui/snapshot"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  venue-network:
+    driver: bridge
