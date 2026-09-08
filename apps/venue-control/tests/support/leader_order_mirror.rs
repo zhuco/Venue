@@ -486,6 +486,12 @@ async fn mirror_sizing_and_revocation(
     gtc["client_order_id"] = "source-gtc".into();
     gtc["post_only"] = false.into();
     gtc["time_in_force"] = "gtc".into();
+    // Open the worker/poller connections before publishing short-lived signed facts.
+    let mut connections = Vec::new();
+    for _ in 0..4 {
+        connections.push(fixture.pool.acquire().await?);
+    }
+    drop(connections);
     persist_projection(
         &fixture.pool,
         &kol,
