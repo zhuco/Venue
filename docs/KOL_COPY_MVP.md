@@ -1,5 +1,9 @@
 # Binance KOL 跟单 MVP 长期契约
 
+共享Executor的认证账户投影以用户流更新订单/库存，正常每30分钟建立一次签名REST校验基线；
+启动、断线、语义变化、事件缺口及原身份待对账仍立即恢复。心跳仅证明连接连续性，不更新旧PM余额。
+独立库存做市的可恢复读取和显式带库存Resume见 [库存做市契约](INVENTORY_MM.md)，不修改KOL命令对账规则。
+
 独立策略通过 [多交易所执行入口](MULTI_VENUE_EXECUTOR.md) 接入另外五所，并与 Binance 共用 Executor 进程及账户网络并发上限。该扩展不改变本文件的 Binance KOL 账户、复制语义或实盘验收范围；其他交易所不得进入 KOL/终端/Grid 的 Binance 命令路由。
 
 ## KOL 托管凭证保存

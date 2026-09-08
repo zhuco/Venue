@@ -2,7 +2,7 @@ use sqlx::PgPool;
 use venue_control::{
     accounts::CredentialCipher,
     executor_secret::ExecutorSecretProvider,
-    inventory_mm::{InventoryMmStore, signed_gate},
+    inventory_mm::{InventoryMmStore, signed_gate, signed_resume_gate},
     multi_venue_runtime::now_ms,
     private_projection::BinancePrivateProjectionStore,
 };
@@ -67,12 +67,19 @@ pub(super) async fn run(args: &[String], pool: PgPool) -> Result<(), Box<dyn std
         "mm-lifecycle" => {
             let request: InventoryMmLifecycleRequest = super::input()?;
             let instance = store.get(owner, &request.instance_id).await?;
-            let evidence = if request.action == InventoryMmAction::Start {
+            let evidence = if matches!(
+                request.action,
+                InventoryMmAction::Start | InventoryMmAction::Resume
+            ) {
                 let secrets = ExecutorSecretProvider::new(
                     pool.clone(),
                     CredentialCipher::from_environment()?,
                 );
-                Some(signed_gate(pool, secrets, &instance).await?)
+                Some(if request.action == InventoryMmAction::Resume {
+                    signed_resume_gate(pool, secrets, &instance).await?
+                } else {
+                    signed_gate(pool, secrets, &instance).await?
+                })
             } else {
                 None
             };

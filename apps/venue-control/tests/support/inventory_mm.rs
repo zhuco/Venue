@@ -73,6 +73,18 @@ async fn inventory_mm_postgres_lifecycle_commands_and_fences()
         expected_revision: 1,
         action: InventoryMmAction::Start,
     };
+    let fresh_resume = InventoryMmLifecycleRequest {
+        request_id: id(9640),
+        action: InventoryMmAction::Resume,
+        ..start.clone()
+    };
+    assert!(
+        store
+            .lifecycle(&user, &fresh_resume, Some((3, now)), now)
+            .await
+            .is_err(),
+        "Resume cannot adopt inventory into an instance which has never run"
+    );
     assert!(
         store
             .lifecycle(
@@ -139,6 +151,68 @@ async fn inventory_mm_postgres_lifecycle_commands_and_fences()
     );
     store
         .mark_running(&pending, Decimal::new(1000, 0), now + 1)
+        .await?;
+    let running = store.get(&user, &instance.instance_id).await?;
+    assert!(
+        store
+            .preflight_resume(&user, &instance.instance_id, running.revision, now + 1)
+            .await
+            .is_err()
+    );
+    sqlx::query("UPDATE venue_inventory_mm_instances SET instance_state='needs_attention',attention='facts_or_planner_unavailable',last_quote_ms=$2 WHERE instance_id=$1")
+        .bind(&instance.instance_id).bind(i64::try_from(now)?).execute(&fixture.pool).await?;
+    let inventory = serde_json::json!([{"symbol":"BTC/USDT","position_side":"short","quantity":"0.001","entry_price":"20000","mark_price":"20000"}]);
+    sqlx::query("UPDATE venue_binance_account_projections SET projection_json=jsonb_set(projection_json,'{projection,positions}',$2) WHERE credential_id=$1")
+        .bind(&credential).bind(inventory).execute(&fixture.pool).await?;
+    assert!(
+        !store
+            .preflight(&user, &instance.instance_id, running.revision, now + 1)
+            .await?
+            .ready,
+        "ordinary Start must still require flat inventory"
+    );
+    assert!(
+        store
+            .preflight_resume(&user, &instance.instance_id, running.revision, now + 1)
+            .await?
+            .ready
+    );
+    let resume = InventoryMmLifecycleRequest {
+        request_id: id(9641),
+        action: InventoryMmAction::Resume,
+        expected_revision: running.revision,
+        ..start.clone()
+    };
+    assert!(
+        store
+            .lifecycle(&user, &resume, None, now + 1)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .lifecycle(&id(9991), &resume, Some((3, now)), now + 1)
+            .await
+            .is_err()
+    );
+    let resumed = store
+        .lifecycle(&user, &resume, Some((3, now)), now + 1)
+        .await?;
+    assert_eq!(resumed.baseline_equity, running.baseline_equity);
+    assert_eq!(resumed.peak_equity, running.peak_equity);
+    assert_eq!(resumed.config, running.config);
+    assert!(resumed.attention.is_none());
+    assert_eq!(
+        store
+            .lifecycle(&user, &resume, Some((3, now)), now + 1)
+            .await?,
+        resumed,
+        "the same resume identity is idempotent"
+    );
+    sqlx::query("UPDATE venue_binance_account_projections SET projection_json=jsonb_set(projection_json,'{projection,positions}','[]') WHERE credential_id=$1")
+        .bind(&credential).execute(&fixture.pool).await?;
+    store
+        .mark_running(&resumed, Decimal::new(1000, 0), now + 1)
         .await?;
     let running = store.get(&user, &instance.instance_id).await?;
 

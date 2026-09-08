@@ -15,6 +15,24 @@ pub async fn signed_gate(
     secrets: ExecutorSecretProvider,
     instance: &InventoryMmInstance,
 ) -> Result<(u8, u64), InventoryMmStoreError> {
+    signed_admission(pool, secrets, instance, false).await
+}
+
+/// Explicit recovery adopts the bound symbol's existing inventory; first Start remains flat-only.
+pub async fn signed_resume_gate(
+    pool: PgPool,
+    secrets: ExecutorSecretProvider,
+    instance: &InventoryMmInstance,
+) -> Result<(u8, u64), InventoryMmStoreError> {
+    signed_admission(pool, secrets, instance, true).await
+}
+
+async fn signed_admission(
+    pool: PgPool,
+    secrets: ExecutorSecretProvider,
+    instance: &InventoryMmInstance,
+    resume: bool,
+) -> Result<(u8, u64), InventoryMmStoreError> {
     let unavailable = |_| InventoryMmStoreError::Unavailable;
     let projections = BinancePrivateProjectionStore::new(pool.clone());
     let projection = projections
@@ -84,14 +102,26 @@ pub async fn signed_gate(
     }
     // Signed HTTP calls can cross a lifecycle/config change. Re-read revision and account
     // fences after the I/O; Start will repeat this under its credential lock before committing.
-    let ready = InventoryMmStore::new(pool)
-        .preflight(
-            &instance.owner_user_id,
-            &instance.instance_id,
-            instance.revision,
-            checked,
-        )
-        .await?;
+    let store = InventoryMmStore::new(pool);
+    let ready = if resume {
+        store
+            .preflight_resume(
+                &instance.owner_user_id,
+                &instance.instance_id,
+                instance.revision,
+                checked,
+            )
+            .await?
+    } else {
+        store
+            .preflight(
+                &instance.owner_user_id,
+                &instance.instance_id,
+                instance.revision,
+                checked,
+            )
+            .await?
+    };
     if !ready.ready {
         return Err(InventoryMmStoreError::Conflict);
     }

@@ -84,6 +84,7 @@ pub enum InventoryMmState {
 #[serde(rename_all = "snake_case")]
 pub enum InventoryMmAction {
     Start,
+    Resume,
     Stop,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

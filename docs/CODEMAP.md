@@ -95,6 +95,8 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 | 双报价、库存偏移、波动与风险退出 | `crates/venue-strategies/src/inventory_mm/` |
 | 独立配置及启动/停止协议 | `crates/venue-control-protocol/src/inventory_mm.rs` |
 | 实例、命令归属、取消确认及单例协调 | `apps/venue-control/src/inventory_mm/`；迁移 `0045_inventory_mm.sql` |
+| 做市读取退避与带库存恢复 | `apps/venue-control/src/inventory_mm/recovery.rs`、`admission.rs`、`store.rs`；`mm-lifecycle` 的 `resume` |
+| 做市委托的用户流发送与完整RESULT确认 | `apps/venue-control/src/executor_exchange/inventory_mm.rs`；网关 `BinanceHedgeDispatchFence` |
 | 本人 API 与签名预检 | `apps/venue-control/src/accounts/inventory_mm.rs` |
 | 桌面独立创建与管理窗口 | `apps/ui/desktop/src/inventory_mm_view.rs`、`client/inventory_mm.rs` |
 
