@@ -10,6 +10,67 @@ fn credentials() -> Result<BinanceCredentials, Box<dyn std::error::Error>> {
     )?)
 }
 
+#[test]
+fn inventory_mm_exact_limit_and_cancel_keep_cumulative_order_facts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut request = grid_place_request(0)?;
+    request.origin = venue_control_protocol::kol::ExecutorCommandOrigin::InventoryMm;
+    assert!(tracks_exact_order_fact(request.origin));
+    let mut order = Order {
+        order_id: "mm-native".into(),
+        client_order_id: FieldState::Known(request.client_order_id.clone()),
+        symbol: request.symbol.clone(),
+        side: OrderSide::Buy,
+        position_side: FieldState::Known(PositionSide::Long),
+        purpose: FieldState::Missing,
+        state: OrderState::New,
+        quantity: Decimal::new(1, 3),
+        filled_quantity: Decimal::ZERO,
+        limit_price: Some(Price::new(Decimal::from(50_000))?),
+        time_in_force: FieldState::Known(LimitTimeInForce::PostOnly),
+        average_price: FieldState::Missing,
+        reduce_only: false,
+    };
+    for state in [
+        OrderState::New,
+        OrderState::PartiallyFilled,
+        OrderState::Cancelled,
+    ] {
+        order.state = state;
+        order.filled_quantity = if state == OrderState::New {
+            Decimal::ZERO
+        } else {
+            Decimal::new(5, 4)
+        };
+        let result = signed_limit_outcome(&request, &order).ok_or("MM exact fact missing")?;
+        assert_eq!(result.state, ExecutionReadback::Reconciled);
+        assert_eq!(result.native_order_id.as_deref(), Some("mm-native"));
+        assert_eq!(
+            result.order_fact,
+            Some(ExactOrderFact {
+                quantity: order.quantity,
+                filled_quantity: order.filled_quantity,
+                terminal: state == OrderState::Cancelled,
+            })
+        );
+        let cancel = mirror_order_outcome(&order, true);
+        assert_eq!(cancel.order_fact, result.order_fact);
+        assert_eq!(
+            cancel.state,
+            if state == OrderState::Cancelled {
+                ExecutionReadback::Reconciled
+            } else {
+                ExecutionReadback::Accepted
+            }
+        );
+    }
+    order.state = OrderState::Unknown;
+    let unknown = signed_limit_outcome(&request, &order).ok_or("MM routing missing")?;
+    assert_eq!(unknown.state, ExecutionReadback::Unknown);
+    assert!(unknown.order_fact.is_none());
+    Ok(())
+}
+
 #[tokio::test]
 async fn mock_submit_is_stable_by_client_order_id() -> Result<(), Box<dyn std::error::Error>> {
     let request = ExecutionRequest {

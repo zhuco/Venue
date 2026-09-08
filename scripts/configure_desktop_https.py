@@ -24,6 +24,7 @@ GET_PATHS = [
     "/v2/kol/leader-bot",
     "/v2/kol/leader-bots",
     "/v2/strategies/support-martingale/instances",
+    "/v2/strategies/inventory-mm",
 ]
 POST_PATHS = [
     "/v2/account/terminal/register",
@@ -47,6 +48,9 @@ POST_PATHS = [
     "/v2/kol/leader-bots/lifecycle",
     "/v2/strategies/support-martingale/instances",
     "/v2/strategies/support-martingale/preflight",
+    "/v2/strategies/inventory-mm",
+    "/v2/strategies/inventory-mm/preflight",
+    "/v2/strategies/inventory-mm/lifecycle",
     "/v2/strategies/support-martingale/lifecycle",
     "/v2/control/commands",
     "/v2/copy/relations",

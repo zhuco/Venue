@@ -3,12 +3,23 @@ mod bybit_stream;
 use crate::model::MarketServer;
 use venue_gateway_api::display::{Book, Instrument, Quote};
 pub(super) async fn ensure_clock(http: &reqwest::Client) -> Result<(), String> {
-    if venue_gateway_api::display::clock::needs_refresh() {
+    // Refresh before the five-minute expiry, without a per-minute request or
+    // simultaneous history/chart workers issuing duplicate time requests.
+    static LAST_ATTEMPT: tokio::sync::Mutex<Option<(Instant, bool)>> =
+        tokio::sync::Mutex::const_new(None);
+    let mut last = LAST_ATTEMPT.lock().await;
+    if last
+        .as_ref()
+        .is_none_or(|(at, ok)| at.elapsed() >= Duration::from_secs(if *ok { 270 } else { 15 }))
+    {
         if let Err(error) = venue_gateway_bybit::display::synchronize_display_clock(http).await {
-            // A brief time-source outage can use the bounded monotonic holdover.
+            *last = Some((Instant::now(), false));
             venue_gateway_api::display::received_ms().map_err(|_| error)?;
+        } else {
+            *last = Some((Instant::now(), true));
         }
     }
+    venue_gateway_api::display::received_ms()?;
     Ok(())
 }
 fn now_ms() -> u64 {

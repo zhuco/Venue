@@ -16,7 +16,7 @@ pub const VERIFY_PATH: &str = "/v2/account/credentials/verify";
 pub const DELETE_PATH: &str = "/v2/account/credentials/delete";
 pub const SELECT_PATH: &str = "/v2/account/select";
 pub const MIN_PASSWORD_CHARS: usize = 8;
-pub const MIN_INVITE_CODE_CHARS: usize = 24;
+pub const MIN_INVITE_CODE_CHARS: usize = 6;
 pub const MAX_INVITE_CODE_CHARS: usize = 64;
 
 #[derive(Clone, Debug)]

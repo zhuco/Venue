@@ -10,6 +10,7 @@ const BODY_LIMIT: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) enum GridMutation {
+    InventoryMm(super::inventory_mm::Mutation),
     Create(GridInstanceCreateRequest),
     Update(GridConfigUpdateRequest),
     Lifecycle(GridLifecycleRequest),
@@ -24,6 +25,7 @@ pub(crate) enum GridMutation {
 impl GridMutation {
     pub(crate) fn validate(&self) -> bool {
         match self {
+            Self::InventoryMm(request) => request.valid(),
             Self::Create(request) => request.validate().is_ok(),
             Self::Update(request) => request.validate().is_ok(),
             Self::Lifecycle(request) => request.validate().is_ok(),
@@ -38,6 +40,7 @@ impl GridMutation {
 
     fn endpoint(&self) -> &'static str {
         match self {
+            Self::InventoryMm(request) => request.route(),
             Self::Create(_) | Self::Update(_) => GRID_INSTANCES_PATH,
             Self::Lifecycle(_) => GRID_LIFECYCLE_PATH,
             Self::LeaderCreate(_) => venue_control_protocol::leader_bot::LEADER_BOTS_PATH,
@@ -55,6 +58,7 @@ impl GridMutation {
 
     fn matches(&self, summary: &GridInstanceSummary) -> bool {
         match self {
+            Self::InventoryMm(_) => false,
             Self::Create(request) => {
                 summary.credential_id == request.credential_id && summary.symbol == request.symbol
             }
@@ -104,6 +108,7 @@ async fn submit(
 ) -> Result<GridInstanceSummary, Box<ClientEvent>> {
     let builder = client.post(path(endpoint, mutation.endpoint()));
     let response = match mutation {
+        GridMutation::InventoryMm(_) => return Err(mutation_unavailable("wrong mutation route")),
         GridMutation::Create(request) => builder.json(request),
         GridMutation::Update(request) => builder.json(request),
         GridMutation::Lifecycle(request) => builder.json(request),
@@ -262,6 +267,13 @@ pub(super) fn start_native(
                 Err(_) => ClientEvent::SupportMartingaleUnavailable("支撑分批策略查询超时".into()),
             };
             publish(&poll_sender, &poll_context, event);
+            let event = tokio::time::timeout(
+                super::REQUEST_TIMEOUT,
+                super::inventory_mm::fetch(&poll_client, &poll_endpoint),
+            )
+            .await
+            .unwrap_or_else(|_| super::inventory_mm::timeout(None));
+            publish(&poll_sender, &poll_context, event);
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
     });
@@ -269,6 +281,20 @@ pub(super) fn start_native(
     tokio::spawn(async move {
         while !stop.load(std::sync::atomic::Ordering::Acquire) {
             for mutation in mutations.try_iter().take(16) {
+                if let GridMutation::InventoryMm(request) = &mutation {
+                    let event = tokio::time::timeout(
+                        super::REQUEST_TIMEOUT,
+                        super::inventory_mm::submit(&client, &endpoint, request),
+                    )
+                    .await
+                    .unwrap_or_else(|_| super::inventory_mm::timeout(Some(request)));
+                    let expired = matches!(event, ClientEvent::SessionExpired);
+                    publish(&sender, &context, event);
+                    if expired {
+                        return;
+                    }
+                    continue;
+                }
                 if matches!(
                     mutation,
                     GridMutation::LeaderCreate(_)
@@ -377,8 +403,19 @@ pub(super) fn start_web(
                     Err(event) => *event,
                 };
                 publish(&sender, &context, event);
+                let event = super::inventory_mm::fetch(&client, &endpoint).await;
+                publish(&sender, &context, event);
             }
             for mutation in mutations.try_iter().take(16) {
+                if let GridMutation::InventoryMm(request) = &mutation {
+                    let event = super::inventory_mm::submit(&client, &endpoint, request).await;
+                    let expired = matches!(event, ClientEvent::SessionExpired);
+                    publish(&sender, &context, event);
+                    if expired {
+                        return;
+                    }
+                    continue;
+                }
                 if matches!(
                     mutation,
                     GridMutation::LeaderCreate(_)

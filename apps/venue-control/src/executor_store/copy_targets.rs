@@ -220,6 +220,7 @@ pub(super) async fn record_source_fill_and_plan(
             )
         });
         let copy_risk = crate::executor_exchange::CopyRiskContext {
+            notional_limit_policy: Default::default(),
             round_open_quantity_up: false,
             open_quantity_rounding: None,
             max_order_notional: decimal(&row, "max_order_notional")?,

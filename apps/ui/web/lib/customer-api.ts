@@ -9,3 +9,16 @@ export async function api<T>(action: string, csrf?: string, body?: unknown): Pro
   if (!result.ok) throw new RequestError(result.status, value.code);
   return value as T;
 }
+
+export const verificationMessages: Record<string, string> = {
+  verified: "验证通过：币安统一账户和双向持仓已确认。",
+  unverified: "账户尚未验证。",
+  invalid_credentials: "验证失败：API密钥或密钥无效，请核对币安配置。",
+  permission_denied: "验证失败：币安 API 访问被拒绝，请检查 API 是否开启统一账户交易、IP 白名单及统一账户配置。",
+  mode_mismatch: "验证失败：请使用币安统一帐户，开通 U 本位合约，并在交易设置中修改为双向持仓。",
+  network_unavailable: "验证未完成：暂时无法连接币安，请稍后重试。",
+  account_conflict: "验证失败：该币安账户已被其他账户绑定。",
+};
+export function verificationFeedback(state: unknown): { success: boolean; message: string } {
+  return { success: state === "verified", message: typeof state === "string" ? verificationMessages[state] ?? "未取得明确验证结果，请刷新后重试。" : "未取得明确验证结果，请刷新后重试。" };
+}

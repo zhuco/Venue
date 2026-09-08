@@ -1,5 +1,6 @@
 #[cfg(not(target_arch = "wasm32"))]
 use super::{ClientEvent, REQUEST_TIMEOUT, path, publish};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::account_scope::{AccountScope, Scoped};
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_OPEN_ADMISSIONS: usize = 4;

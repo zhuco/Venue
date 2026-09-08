@@ -82,6 +82,7 @@ pub(crate) fn clear_selection(model: &mut AppModel) {
 
 #[derive(Clone)]
 enum BotRow {
+    InventoryMm(venue_control_protocol::inventory_mm::InventoryMmInstance),
     Grid(GridInstanceSummary),
     Leader(LeaderBotListItem),
     Martingale(crate::client::SupportMartingaleListItem),
@@ -90,6 +91,7 @@ enum BotRow {
 impl BotRow {
     fn updated_ms(&self) -> u64 {
         match self {
+            Self::InventoryMm(instance) => instance.updated_ms,
             Self::Grid(instance) => instance.updated_ms,
             Self::Leader(bot) => bot.updated_ms,
             Self::Martingale(_) => 0,
@@ -98,6 +100,7 @@ impl BotRow {
 
     fn id(&self) -> &str {
         match self {
+            Self::InventoryMm(instance) => &instance.instance_id,
             Self::Grid(instance) => &instance.instance_id,
             Self::Leader(bot) => &bot.bot_id,
             Self::Martingale(instance) => &instance.instance_id,
@@ -154,6 +157,19 @@ pub fn show(
                 .cloned()
                 .map(BotRow::Martingale),
         )
+        .chain(
+            model
+                .execution
+                .inventory_mm
+                .instances
+                .iter()
+                .filter(|item| {
+                    item.trading_account_id == account_id
+                        && item.credential_id == credential.credential_id
+                })
+                .cloned()
+                .map(BotRow::InventoryMm),
+        )
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| {
         right
@@ -198,6 +214,7 @@ pub fn show(
     }
     crate::grid_view::show_management(ui, model, client, credential, &grids);
     crate::support_martingale_view::show(ui, model, client, credential, account_id);
+    crate::inventory_mm_view::show(ui, model, client, credential, account_id);
 }
 
 fn toolbar(
@@ -212,12 +229,23 @@ fn toolbar(
     let grid_pending = crate::grid_view::pending(model);
     ui.horizontal_wrapped(|ui| {
         ui.strong("交易机器人");
-        ui.weak("当前账户的私有内置策略；不包含策略广场。");
         ui.menu_button("新建机器人", |ui| {
             if ui
                 .add_enabled(
+                    crate::inventory_mm_view::can_create(model, credential),
+                    egui::Button::new("Binance 库存做市（独立策略）"),
+                )
+                .clicked()
+            {
+                model.execution.leader_bot.editor = None;
+                crate::grid_view::close_editor(model);
+                crate::inventory_mm_view::open_create(model, credential);
+                ui.close();
+            }
+            if ui
+                .add_enabled(
                     credential_ready
-                        && credential.venue == venue_gateway_api::VenueId::Binance
+                        && credential.venue == venue_control_protocol::VenueId::Binance
                         && !grid_pending,
                     egui::Button::new("Binance 对冲网格"),
                 )
@@ -289,6 +317,7 @@ fn robot_table(
         .show(ui, |ui| {
             egui::Grid::new("built-in-robot-table")
                 .striped(true)
+                .min_row_height(28.0)
                 .spacing([14.0, 7.0])
                 .show(ui, |ui| {
                     for heading in [
@@ -307,6 +336,9 @@ fn robot_table(
                     ui.end_row();
                     for row in rows {
                         match row {
+                            BotRow::InventoryMm(instance) => {
+                                crate::inventory_mm_view::list_row(ui, model, credential, instance)
+                            }
                             BotRow::Grid(instance) => grid_row(ui, model, instance),
                             BotRow::Leader(bot) => leader_row(ui, model, access, credential, bot),
                             BotRow::Martingale(instance) => {

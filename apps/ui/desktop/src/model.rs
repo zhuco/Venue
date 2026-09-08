@@ -1,8 +1,9 @@
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     collections::{BTreeMap, VecDeque},
     str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use rust_decimal::Decimal;
@@ -158,7 +159,7 @@ impl Default for Preferences {
 }
 
 const fn default_language() -> Language {
-    if cfg!(target_arch = "wasm32") {
+    if cfg!(all(target_arch = "wasm32", not(feature = "preview"))) {
         Language::English
     } else {
         Language::SimplifiedChinese
@@ -281,9 +282,12 @@ impl CopyRelationDraft {
 static COPY_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn next_copy_request_id() -> String {
+    #[cfg(not(target_arch = "wasm32"))]
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
+    #[cfg(target_arch = "wasm32")]
+    let elapsed = u128::from(crate::account_center::now_ms()) * 1_000_000;
     let sequence = u128::from(COPY_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed));
     let seed = elapsed ^ sequence;
     format!(
@@ -347,6 +351,8 @@ pub struct CommandProgress {
 
 #[derive(Debug)]
 pub struct AppModel {
+    #[cfg(all(target_arch = "wasm32", feature = "preview"))]
+    pub browser_market: crate::web_preview::browser::BrowserMarket,
     pub execution: crate::execution_view::ExecutionViewState,
     pub account_overview: Option<venue_control_protocol::accounts::AccountOverview>,
     pub account_selection_requested: Option<String>,
@@ -428,6 +434,8 @@ impl AppModel {
         };
         Self {
             preferences,
+            #[cfg(all(target_arch = "wasm32", feature = "preview"))]
+            browser_market: Default::default(),
             execution: crate::execution_view::ExecutionViewState::default(),
             account_overview: None,
             account_selection_requested: None,
@@ -513,6 +521,10 @@ impl AppModel {
     }
 
     pub fn format_market_price(&self, _symbol: &str, value: Decimal) -> String {
+        #[cfg(all(target_arch = "wasm32", feature = "preview"))]
+        if let Some(series) = self.browser_market.series(_symbol, None) {
+            return format_decimal(value, series.price_scale);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some((scale, _)) = self.local_precisions.get(_symbol) {
             return format_decimal(value, *scale as usize);
@@ -521,6 +533,10 @@ impl AppModel {
     }
 
     pub fn format_market_quantity(&self, _symbol: &str, value: Decimal) -> String {
+        #[cfg(all(target_arch = "wasm32", feature = "preview"))]
+        if let Some(series) = self.browser_market.series(_symbol, None) {
+            return format_decimal(value, series.quantity_scale);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some((_, scale)) = self.local_precisions.get(_symbol) {
             return format_decimal(value, *scale as usize);

@@ -10,6 +10,7 @@ use crate::{
     theme,
 };
 use eframe::egui;
+use venue_control_protocol::VenueId;
 use venue_control_protocol::{
     accounts::CredentialSummary,
     support_martingale::{
@@ -19,7 +20,6 @@ use venue_control_protocol::{
         SupportMartingalePreflightCheckStatus as CheckStatus, SupportMartingalePreflightResponse,
     },
 };
-use venue_gateway_api::VenueId;
 
 const PREFLIGHT_DISPLAY_TTL_MS: u64 = 60_000;
 

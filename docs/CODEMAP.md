@@ -1,5 +1,9 @@
 # VENUE 功能代码地图
 
+桌面体验维护：`apps/ui/desktop/src/app.rs` 按预算消费事件；`app/persistence.rs` 保存/恢复上次可解析布局；`diagnostics.rs` 负责有界异步日志轮转；`execution_view.rs` 虚拟化只读历史行。
+
+币安状态栏 RTT：`apps/ui/desktop/src/market_client/native/latency.rs` 计量两条行情 WS 的匹配 Ping/Pong，`market.rs` 独立保存连接 RTT，心跳不更新行情新鲜度。
+
 终端低延迟链：`apps/ui/desktop/src/market_client/native/delivery.rs` 从行情线程唤醒绘制，Binance WS 在 `market_client.rs` 优先直连、失败回退 HTTPS 中继；`client/execution/stream.rs` 消费认证账户快照 SSE。Control `http/accounts/terminal_stream.rs` 逐次校验会话及账户归属；`database_wake.rs` 与迁移 `0044` 提供提交后通知，原轮询负责断线恢复。
 
 行情状态中文提示：`apps/ui/desktop/src/i18n/market.rs` 区分更新延迟、自动校时、限流、访问受限、合约不可用与校验失败；`market.rs` 在新的有效行情到达后恢复延迟状态，连接状态消息不刷新行情接收时间。
@@ -41,7 +45,7 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 | 跟单 API 授权与托管账户 | `apps/venue-control/src/accounts/{credentials,managed_followers}.rs`、`crates/venue-gateway-binance/src/credential_probe.rs`；迁移 0030/0031/0038/0041，保存定比/定额后验证并自动申请激活，删除免密码并在撤单对账后擦除凭证 |
 | 托管账户逐账户参数及生命周期 | `apps/venue-control/src/accounts/follow_requests.rs`；迁移 0033；`/v2/kol/managed-followers/follow/{status,settings,lifecycle}`，暂停态仅作为执行安全闸门 |
 | 定比/定额数量 | `crates/venue-control-protocol/src/follow_sizing.rs`、`apps/venue-control/src/order_mirror/planner.rs`；开仓向上取整/最小合规额与回读共用 `apps/venue-control/src/executor_exchange/copy_risk.rs`，回归 `apps/venue-control/src/executor_exchange/copy_rounding_tests.rs`；迁移 0032 |
-| 限价/市价/止损源单、子单映射、替代单及对账 | `apps/venue-control/src/order_mirror/{mod,planner,extended,store,settlement}.rs`、`executor_exchange/algo.rs`；迁移 0040 |
+| 限价/市价/止损源单、子单映射、替代单及对账 | `apps/venue-control/src/order_mirror/{mod,planner,extended,store,settlement}.rs`；`completed_source.rs` 核对主单全成并保留已有子单；`executor_exchange/algo.rs`；迁移 0040 |
 | 启用签名基线、空仓与过期请求保护 | `apps/venue-control/src/executor_store/activation.rs` |
 | 关系领取、暂停与 revision 事务顺序 | `apps/venue-control/src/kol_executor/copy_gate.rs` |
 | 旧成交目标模型的历史及未决市价命令恢复 | `apps/venue-control/src/executor_store/{market,copy_targets,copy_drain}.rs`、`executor_exchange/market.rs`；迁移 0025，不是新关系的挂单规划入口 |
@@ -90,6 +94,7 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 | 独立配置及启动/停止协议 | `crates/venue-control-protocol/src/inventory_mm.rs` |
 | 实例、命令归属、取消确认及单例协调 | `apps/venue-control/src/inventory_mm/`；迁移 `0045_inventory_mm.sql` |
 | 本人 API 与签名预检 | `apps/venue-control/src/accounts/inventory_mm.rs` |
+| 桌面独立创建与管理窗口 | `apps/ui/desktop/src/inventory_mm_view.rs`、`client/inventory_mm.rs` |
 
 ## 桌面与 Web
 
@@ -98,18 +103,25 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 | 功能 | 首要入口 |
 |---|---|
 | VenueFlow 启动与布局 | `apps/ui/desktop/src/main.rs`、`workspace.rs` |
+| VenueFlow 本机 WASM 只读预览 | `scripts/Build-VenueWebPreview.ps1`、`apps/ui/desktop/src/web_preview/`、`src/bin/web_preview.rs`、`web/preview.html`；归一化公开行情通过本机 8877 端口提供，不包含账户/交易接入 |
 | 统一机器人列表、带单编辑及启停 | `apps/ui/desktop/src/leader_bot_view.rs` |
 | Grid 模态配置和生命周期 | `apps/ui/desktop/src/grid_view.rs`、`client/grid.rs` |
 | 账户/API/系统登录凭据库 | `apps/ui/desktop/src/account_client.rs`、`account_center/` |
 | 桌面账户切换代次与迟到结果过滤 | `apps/ui/desktop/src/account_scope.rs`、`account_scope/tests.rs`、`client/execution/race_tests.rs` |
 | 桌面行情切换应用边界 | `apps/ui/desktop/src/app/market_events.rs`、`app/market_events/tests.rs` |
 | 私有持仓、委托、成交、资产与历史 | `apps/ui/desktop/src/execution_view.rs`、`client/execution.rs` |
+| 复用成交的仓位历史估算与仓位变更 | `apps/ui/desktop/src/execution_view/position_history.rs`；零仓快照界定片段，费用与历史缺失不补造，不新增 REST |
 | 逐行平仓/反开、下单及反馈 | `apps/ui/desktop/src/execution_view/position_actions.rs`、`trade_dock.rs`、`terminal_feedback.rs` |
 | 当前账户 SSE 与写入状态门 | `apps/ui/desktop/src/client/stream_gates.rs`、`ui/status_bar.rs` |
 | 图表拖动撤单并新挂 | `apps/ui/desktop/src/chart_trading/order_tags.rs`、`apps/venue-control/src/accounts/terminal/replace.rs`、`apps/venue-control/src/executor_store/terminal_replace.rs`（终态剩余量与新单释放）、`apps/venue-control/migrations/0043_terminal_replace.sql`；数据库夹具 `apps/venue-control/tests/support/kol_fixture.rs` |
 | 图表与共享指标 | `apps/ui/desktop/src/{chart_view,chart_settings,settings_panel}.rs`、`chart_trading/{overlays,order_tags}.rs`（委托/持仓标签与价格线）、`crates/venue-indicators/src/chart/` |
+| 独立价格轴与刻度适配 | `apps/ui/desktop/src/chart_view/price_axis.rs` 绘制轴刻度与价格标签；`chart.rs::ChartViewport` 管理自动/手动范围，`ui.rs` 通过适配恢复可见范围 |
+| 主图指标实时读数 | `apps/ui/desktop/src/chart_view/study_readout.rs` 按所选K线读取已有指标结果，`custom_indicator/render.rs` 按实际读数高度紧凑排列 |
+| 可见K线极值价格与纵向缩放 | `apps/ui/desktop/src/chart_view/price_annotations.rs`、`chart.rs::ChartViewport`；可见蜡烛自动范围、按可见K线适配、价格轴拖动 |
 | 服务器配置、公共行情代理、启动和 UI 日志 | `apps/ui/desktop/src/{server_connection,market_client,diagnostics}.rs`、`scripts/Start-VenueFlow.ps1`、`scripts/configure_desktop_https.py` |
 | 用户首页和邀请注册 | `apps/ui/web/app/`、`components/customer-console.tsx`、`lib/customer-server.ts` |
+| KOL 邀请码管理 | `apps/venue-control/src/accounts/kol_invites.rs`、`crates/venue-control-protocol/src/kol_invites.rs`、`apps/ui/web/components/kol-invite-panel.tsx`；迁移 0046，所属 KOL 随机生成或输入全局唯一邀请码 |
+| 跟单注册入口 | `apps/ui/web/app/register/page.tsx`、`components/customer-console.tsx`；登录页跳转，邀请码固定归属，普通用户仅添加本人跟单账户 |
 | 普通与托管跟单账户的定比/定额授权表单 | `apps/ui/web/components/{customer-console,managed-followers-panel,managed-follow-settings,follow-sizing-fields}.tsx` |
 | 独立运营控制台 `/ops` | `apps/ui/web/components/control-console.tsx`、`lib/projection-scope.ts` |
 | Web 命令、边界扫描与浏览器验证 | `apps/ui/web/package.json`、`apps/ui/web/scripts/verify-boundary.mjs`、`apps/ui/web/e2e/`；见 [WEB](WEB.md) |
@@ -120,7 +132,7 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 
 支撑分批做多（马丁）的当前模块、桌面/API、多币预算和市价/限价执行契约见 [SUPPORT_MARTINGALE](SUPPORT_MARTINGALE.md)。当前首个闭环只准入 Bybit LIVE；其他执行所仍按逐所真实验收放行。
 
-以下功能纳入 alpha.28 源码，真实部署与逐所验收另行核验；完整契约见 [MULTI_VENUE_EXECUTOR](MULTI_VENUE_EXECUTOR.md)。它不扩大 Binance KOL 的复制范围，也不重新启用旧 Node 执行链。
+以下功能纳入当前源码，真实部署与逐所验收另行核验；完整契约见 [MULTI_VENUE_EXECUTOR](MULTI_VENUE_EXECUTOR.md)。它不扩大 Binance KOL 的复制范围，也不重新启用旧 Node 执行链。
 
 | 功能 | 入口 |
 |---|---|
@@ -132,7 +144,7 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 | 迁移、绑定、命令、原命令观察、Bybit 资金费及网格操作工具 | `apps/venue-control/migrations/{0035_multi_venue_executor,0036_strategy_grid}.sql`、`apps/venue-control/src/bin/venue-strategy-admin.rs`；Bybit 资金费协议在 `crates/venue-gateway-bybit/src/funding.rs` |
 | 支撑分批做多规则、持久化、执行与参考行情 | `crates/venue-strategies/src/support_martingale/`、`apps/venue-control/src/support_martingale/`、migration `0037_support_martingale.sql` |
 | 支撑分批协议、用户 API 与桌面闭环 | `crates/venue-control-protocol/src/support_martingale.rs`、`apps/venue-control/src/accounts/support_martingale.rs`、`apps/ui/desktop/src/{support_martingale_view.rs,client/support_martingale.rs}` |
-| 马丁固定价格入场与可选止损扩展 | `support_martingale/planner.rs`、`support_martingale/stop_loss.rs`、`support_martingale/runtime.rs`、migration `0039_martingale_stop_loss.sql`；当前源码扩展，未代表 alpha.28 已部署范围 |
+| 马丁固定价格入场与可选止损扩展 | `support_martingale/planner.rs`、`support_martingale/stop_loss.rs`、`support_martingale/runtime.rs`、migration `0039_martingale_stop_loss.sql`；当前源码扩展，不代表已经部署或完成真实验收 |
 
 ## 冻结兼容与共享类型
 
@@ -165,3 +177,7 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 | Web 与桌面 | Web `lib/*.test.ts`、`e2e/`；VenueFlow 包内测试及布局验证 |
 
 只验证改动影响面；文档修改不启动 Cargo 编译。全量发布门、命令和报告要求统一见 [DEVELOPMENT](DEVELOPMENT.md)。
+
+- KOL 唯一带单账户：Web `components/kol-source-panel.tsx`，Control `accounts/kol_source.rs`，协议 `kol_source.rs`，迁移 0047。
+
+Web KOL 使用指南：`apps/ui/web/app/help/kol/page.tsx`，路由 `/help/kol`，后台提供分步帮助入口。

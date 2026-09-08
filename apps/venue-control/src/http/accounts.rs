@@ -21,6 +21,8 @@ use venue_control_protocol::{
         KolProfileUpdateRequest, TerminalCancelRequest, TerminalOrderRequest,
         TerminalProjectionRequest,
     },
+    kol_invites::{KOL_INVITE_PATH, KolInviteCreateRequest},
+    kol_source::{KOL_SOURCE_PATH, KolSourceRequest},
     leader_bot::{
         LEADER_BOT_LIFECYCLE_PATH, LEADER_BOT_PATH, LEADER_BOTS_LIFECYCLE_PATH, LEADER_BOTS_PATH,
         LEADER_BOTS_UPDATE_PATH, LeaderBotConfiguredCreateRequest, LeaderBotCreateRequest,
@@ -97,6 +99,8 @@ where
         || matches!(
             path,
             KOL_PROFILE_PATH
+                | KOL_SOURCE_PATH
+                | KOL_INVITE_PATH
                 | KOL_FOLLOW_SETTINGS_PATH
                 | KOL_FOLLOW_LIFECYCLE_PATH
                 | KOL_TERMINAL_ACCOUNT_PATH
@@ -475,6 +479,22 @@ async fn account_request(
                 .request_managed_follow_lifecycle(
                     &principal,
                     decode::<ManagedFollowLifecycleRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
+        (Method::Get, KOL_SOURCE_PATH) => encode(&accounts.own_kol_source(&principal).await?),
+        (Method::Post, KOL_SOURCE_PATH) => encode(
+            &accounts
+                .select_kol_source(&principal, decode::<KolSourceRequest>(&request.body)?, now)
+                .await?,
+        ),
+        (Method::Get, KOL_INVITE_PATH) => encode(&accounts.own_kol_invite(&principal, now).await?),
+        (Method::Post, KOL_INVITE_PATH) => encode(
+            &accounts
+                .create_kol_invite(
+                    &principal,
+                    decode::<KolInviteCreateRequest>(&request.body)?,
                     now,
                 )
                 .await?,

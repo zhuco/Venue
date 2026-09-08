@@ -62,14 +62,11 @@ impl BinanceGridMarketReader {
             self.transport.recovery_limits(),
         )?;
         transport.synchronize_clock().await?;
-        let observed = transport.signing_timestamp_ms()?;
-        let scope =
-            crate::BinancePrivateReadScope::new(&config, rules, private_generation, 1, observed)
-                .map_err(|_| BinanceAccountGatewayError::Readback)?;
+        let scope = local_read_scope(&config, rules, private_generation)?;
         let request = crate::build_account_request(&scope)
             .map_err(|_| BinanceAccountGatewayError::Readback)?;
         let response = transport
-            .execute_read(credentials, &request, observed)
+            .execute_read(credentials, &request, transport.signing_timestamp_ms()?)
             .await?;
         let payload = std::str::from_utf8(&response.payload)
             .map_err(|_| BinanceAccountGatewayError::Readback)?;
@@ -99,14 +96,11 @@ impl BinanceGridMarketReader {
             self.transport.recovery_limits(),
         )?;
         transport.synchronize_clock().await?;
-        let observed = transport.signing_timestamp_ms()?;
-        let scope =
-            crate::BinancePrivateReadScope::new(&config, rules, private_generation, 1, observed)
-                .map_err(|_| BinanceAccountGatewayError::Readback)?;
+        let scope = local_read_scope(&config, rules, private_generation)?;
         let request = crate::readback::build_symbol_config_request(&scope)
             .map_err(|_| BinanceAccountGatewayError::Readback)?;
         let response = transport
-            .execute_read(credentials, &request, observed)
+            .execute_read(credentials, &request, transport.signing_timestamp_ms()?)
             .await?;
         let payload = std::str::from_utf8(&response.payload)
             .map_err(|_| BinanceAccountGatewayError::Readback)?;
@@ -256,6 +250,23 @@ impl BinanceGridMarketReader {
         self.last_rules_check_ms = now_ms;
         Ok(())
     }
+}
+
+// Request evidence uses the host clock, like HTTP send/receipt evidence. The exchange-adjusted
+// timestamp belongs only in the signature; a positive offset must not invalidate a valid page.
+pub(crate) fn local_read_scope(
+    config: &BinanceConfig,
+    rules: &BinanceInstrumentRules,
+    private_generation: u64,
+) -> Result<crate::BinancePrivateReadScope, BinanceAccountGatewayError> {
+    let observed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| BinanceAccountGatewayError::Clock)?
+        .as_millis()
+        .try_into()
+        .map_err(|_| BinanceAccountGatewayError::Clock)?;
+    crate::BinancePrivateReadScope::new(config, rules, private_generation, 1, observed)
+        .map_err(|_| BinanceAccountGatewayError::Readback)
 }
 
 /// A content-derived generation survives an Executor restart. A process-local counter would miss

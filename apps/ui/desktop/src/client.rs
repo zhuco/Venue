@@ -2,6 +2,7 @@ use crate::account_scope::{AccountScope, Scoped};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 mod execution;
 mod grid;
+pub(crate) mod inventory_mm;
 mod leader_bot;
 mod stream_gates;
 mod support_martingale;
@@ -53,6 +54,7 @@ pub enum ClientEvent {
         message: String,
     },
     GridInstances(Vec<venue_control_protocol::grid::GridInstanceSummary>),
+    InventoryMm(inventory_mm::Event),
     GridMutationApplied(Box<venue_control_protocol::grid::GridInstanceSummary>),
     GridUnavailable(String),
     GridMutationUnavailable(String),
@@ -187,6 +189,10 @@ impl ControlClient {
 
     pub fn drain(&self) -> impl Iterator<Item = ClientEvent> + '_ {
         self.events.try_iter()
+    }
+
+    pub(crate) fn has_events(&self) -> bool {
+        !self.events.is_empty()
     }
 
     pub fn send(&self, command: ControlCommandRequest) -> Result<(), ClientError> {
@@ -1206,6 +1212,9 @@ impl WebClient {
         token: Option<SecretValue>,
     ) -> Self {
         let stop = std::rc::Rc::new(std::cell::Cell::new(false));
+        if cfg!(feature = "preview") {
+            return Self { stop };
+        }
         if token.is_some() && !crate::account_client::safe_endpoint(&endpoint) {
             publish(&sender, &context, ClientEvent::SessionExpired);
             return Self { stop };

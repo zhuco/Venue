@@ -49,6 +49,11 @@ impl AccountClient {
         context: egui::Context,
     ) {
         let sender = self.sender.clone();
+        if cfg!(all(target_arch = "wasm32", feature = "preview")) {
+            let _ = sender.try_send(Err(AccountErrorCode::Unavailable));
+            context.request_repaint();
+            return;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
             let failure_sender = sender.clone();

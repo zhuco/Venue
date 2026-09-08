@@ -170,6 +170,10 @@ fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChartViewport {
+    pub price_zoom_milli: u32,
+    pub auto_price_scale: bool,
+    #[serde(skip)]
+    price_scale_base: Option<(u64, u64)>,
     visible_bars: usize,
     right_offset: usize,
     right_padding: usize,
@@ -185,6 +189,9 @@ pub struct ChartViewport {
 impl Default for ChartViewport {
     fn default() -> Self {
         Self {
+            price_zoom_milli: 1000,
+            auto_price_scale: true,
+            price_scale_base: None,
             visible_bars: DEFAULT_VISIBLE_BARS,
             right_offset: 0,
             right_padding: 0,
@@ -196,6 +203,29 @@ impl Default for ChartViewport {
 }
 
 impl ChartViewport {
+    pub fn reset_price_scale(&mut self) {
+        self.auto_price_scale = true;
+        self.price_zoom_milli = 1000;
+        self.price_scale_base = None;
+    }
+
+    pub fn resolve_price_scale(&mut self, automatic: PriceRange) -> PriceRange {
+        // Freeze the unzoomed range on manual entry so new candles cannot undo a drag.
+        if self.auto_price_scale || self.price_scale_base.is_none() {
+            self.price_scale_base = Some((automatic.low.to_bits(), automatic.high.to_bits()));
+        }
+        let (low, high) = self
+            .price_scale_base
+            .unwrap_or((automatic.low.to_bits(), automatic.high.to_bits()));
+        let low = f64::from_bits(low);
+        let high = f64::from_bits(high);
+        let center = low + (high - low) * 0.5;
+        let half = (high - low) * 0.5 * f64::from(self.price_zoom_milli.clamp(250, 4000)) / 1000.0;
+        PriceRange {
+            low: (center - half).max(0.0),
+            high: center + half,
+        }
+    }
     #[cfg(any(test, not(target_arch = "wasm32")))]
     pub fn history_prepended(&mut self, added: usize) {
         self.last_total_bars = self.last_total_bars.saturating_add(added);
@@ -219,6 +249,7 @@ impl ChartViewport {
     }
 
     pub fn reset(&mut self) {
+        self.reset_price_scale();
         self.visible_bars = DEFAULT_VISIBLE_BARS;
         self.right_offset = 0;
         self.right_padding = 0;
@@ -416,13 +447,17 @@ impl PriceRange {
             return None;
         }
         let span = high - low;
-        let padding = if span > f64::EPSILON {
-            span * 0.05
-        } else {
-            high.abs().max(1.0) * 0.005
-        };
+        // A relative floor stays meaningful for low-price instruments and remains continuous
+        // when a flat window receives its first non-zero price change.
+        let padding = (span * 0.05)
+            .max(high.abs().max(low.abs()) * 0.00005)
+            .max(f64::MIN_POSITIVE);
         Some(Self {
-            low: low - padding,
+            low: if low >= 0.0 {
+                (low - padding).max(0.0)
+            } else {
+                low - padding
+            },
             high: high + padding,
         })
     }
@@ -714,6 +749,43 @@ mod tests {
             .ok_or("chart coordinate maps to price")?;
         assert!((price - 105.0).abs() < 0.0001);
         Ok(())
+    }
+
+    #[test]
+    fn flat_low_price_range_stays_positive_and_continuous() -> Result<(), String> {
+        let flat = PriceRange::from_extrema(0.001, 0.001).ok_or("flat range")?;
+        let moving = PriceRange::from_extrema(0.001, 0.001000001).ok_or("moving range")?;
+        assert!(flat.low > 0.0009 && flat.high < 0.0011);
+        assert!((moving.high - moving.low) / (flat.high - flat.low) < 1.1);
+        let old: ChartViewport = serde_json::from_str("{}").map_err(|e| e.to_string())?;
+        assert_eq!(old.price_zoom_milli, 1000);
+        assert!(old.auto_price_scale);
+        Ok(())
+    }
+
+    #[test]
+    fn manual_price_scale_is_stable_until_auto_is_restored() {
+        let mut viewport = ChartViewport::default();
+        let original = PriceRange {
+            low: 90.0,
+            high: 110.0,
+        };
+        let moved = PriceRange {
+            low: 190.0,
+            high: 210.0,
+        };
+        assert_eq!(viewport.resolve_price_scale(original), original);
+        viewport.auto_price_scale = false;
+        viewport.price_zoom_milli = 2000;
+        assert_eq!(
+            viewport.resolve_price_scale(moved),
+            PriceRange {
+                low: 80.0,
+                high: 120.0
+            }
+        );
+        viewport.reset_price_scale();
+        assert_eq!(viewport.resolve_price_scale(moved), moved);
     }
 
     #[test]

@@ -200,7 +200,14 @@ pub(crate) fn show_confirmation(
             confirm = ui
                 .add_enabled(
                     matches_account && model.execution.position_actions.pending.is_none(),
-                    egui::Button::new(text(language, Key::Confirm)),
+                    egui::Button::new(text(
+                        language,
+                        if draft.action == PositionAction::Close {
+                            Key::CloseConfirm
+                        } else {
+                            Key::ReverseConfirm
+                        },
+                    )),
                 )
                 .clicked();
             cancel = ui.button(text(language, Key::Cancel)).clicked();

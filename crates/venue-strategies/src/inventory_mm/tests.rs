@@ -126,6 +126,39 @@ fn inventory_mm_admission_two_quotes_and_stable_signed_surface() -> TestResult {
 }
 
 #[test]
+fn fresh_single_side_completes_only_the_missing_risk_checked_target() -> TestResult {
+    for index in 0..2 {
+        let mut i = input()?;
+        let desired = quotes(plan(&i)?)?;
+        own(&mut i, desired[index].clone(), "survivor");
+        i.previous_quotes_at_ms = Some(i.now_ms);
+        assert_eq!(quotes(plan(&i)?)?, vec![desired[1 - index].clone()]);
+        own(&mut i, desired[1 - index].clone(), "completion");
+        assert!(matches!(plan(&i)?.action, MmAction::Keep { .. }));
+    }
+    let mut i = input()?;
+    let desired = quotes(plan(&i)?)?;
+    own(&mut i, desired[0].clone(), "survivor");
+    i.unknown_results = true;
+    assert!(matches!(plan(&i)?.action, MmAction::Halt { .. }));
+    i.unknown_results = false;
+    i.account.observed_at_ms = 1;
+    assert!(matches!(plan(&i)?.action, MmAction::Halt { .. }));
+    i.account.observed_at_ms = i.now_ms;
+    i.live_orders[0].filled_quantity = Decimal::new(1, 1);
+    i.live_orders[0].state = OrderState::PartiallyFilled;
+    assert!(matches!(
+        plan(&i)?.action,
+        MmAction::CancelThenReplan { .. }
+    ));
+    i.live_orders[0].filled_quantity = Decimal::ZERO;
+    i.live_orders[0].state = OrderState::New;
+    i.available_open_notional.value = Decimal::ZERO;
+    assert!(!matches!(plan(&i)?.action, MmAction::Quote { .. }));
+    Ok(())
+}
+
+#[test]
 fn inventory_mm_admission_excess_net_cancels_then_reduces_and_keeps_exit() -> TestResult {
     let mut i = input()?;
     let increasing = quotes(plan(&i)?)?

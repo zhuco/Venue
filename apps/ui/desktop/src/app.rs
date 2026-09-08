@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod market_events;
+mod persistence;
 
 const STORAGE_KEY: &str = "venueflow-state-v1";
 const PERSISTED_SCHEMA_VERSION: u16 = 7;
@@ -63,12 +64,27 @@ pub struct VenueFlowApp {
 impl VenueFlowApp {
     pub fn new(creation_context: &eframe::CreationContext<'_>, default_endpoint: String) -> Self {
         theme::apply(&creation_context.egui_ctx);
-        let mut persisted = load(creation_context.storage);
+        let (mut persisted, recovered) = persistence::load(creation_context.storage);
+        #[cfg(all(target_arch = "wasm32", feature = "preview"))]
+        {
+            persisted.preferences.market_server = crate::model::MarketServer::Binance;
+            persisted.preferences.endpoint.clear();
+        }
         persisted.workspaces.upgrade_trading_tables();
         if persisted.preferences.endpoint.trim().is_empty() {
             persisted.preferences.endpoint = default_endpoint;
         }
-        let model = AppModel::new(persisted.preferences);
+        let mut model = AppModel::new(persisted.preferences);
+        if recovered {
+            let message = match model.preferences.language {
+                crate::i18n::Language::SimplifiedChinese => "布局配置无法读取，已恢复可用布局。",
+                crate::i18n::Language::English => {
+                    "Layout could not be read; a usable layout was restored."
+                }
+            };
+            model.last_error = Some(message.into());
+            model.notice(message);
+        }
         let client = ControlClient::connect(
             model.preferences.endpoint.clone(),
             creation_context.egui_ctx.clone(),
@@ -172,7 +188,14 @@ impl VenueFlowApp {
         let Some(client) = self.market_client.as_ref() else {
             return;
         };
-        for event in client.drain(10_000) {
+        let started = std::time::Instant::now();
+        for _ in 0..512 {
+            if started.elapsed() >= Duration::from_millis(3) {
+                break;
+            }
+            let Some(event) = client.next_event() else {
+                break;
+            };
             market_events::apply(
                 &mut self.model,
                 &mut self.workspaces,
@@ -181,6 +204,9 @@ impl VenueFlowApp {
                 event,
                 context,
             );
+        }
+        if client.has_events() {
+            context.request_repaint();
         }
 
         for request in self.model.history_requests.drain(..) {
@@ -198,9 +224,17 @@ impl VenueFlowApp {
             .refresh_staleness(market_now, 5_000);
     }
 
-    fn drain_client(&mut self) {
-        let events = self.client.drain().take(5_000).collect::<Vec<_>>();
-        for event in events {
+    fn drain_client(&mut self, context: &egui::Context) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let started = std::time::Instant::now();
+        for _ in 0..256 {
+            #[cfg(not(target_arch = "wasm32"))]
+            if started.elapsed() >= Duration::from_millis(2) {
+                break;
+            }
+            let Some(event) = self.client.drain().next() else {
+                break;
+            };
             let event = match event {
                 ClientEvent::AccountScoped { scope, event } => {
                     if self.model.apply_account_event(&scope, *event) {
@@ -252,6 +286,7 @@ impl VenueFlowApp {
                     .execution
                     .support_martingale
                     .apply_instances(instances),
+                ClientEvent::InventoryMm(event) => self.model.execution.inventory_mm.apply(event),
                 ClientEvent::SupportMartingaleMutationApplied(summary) => self
                     .model
                     .execution
@@ -327,6 +362,9 @@ impl VenueFlowApp {
                     ));
                 }
             }
+        }
+        if self.client.has_events() {
+            context.request_repaint();
         }
     }
 
@@ -410,7 +448,13 @@ impl eframe::App for VenueFlowApp {
         if (context.zoom_factor() - zoom).abs() > 0.001 {
             context.set_zoom_factor(zoom);
         }
-        self.drain_client();
+        self.drain_client(context);
+        #[cfg(all(target_arch = "wasm32", feature = "preview"))]
+        self.model.browser_market.poll(
+            self.workspaces
+                .active_chart_requests(&self.model.preferences.selected_symbol),
+            context,
+        );
         if self.account_center.poll(&mut self.model, context) {
             self.reconnect = true;
         }
@@ -443,6 +487,13 @@ impl eframe::App for VenueFlowApp {
         ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
         self.model.synchronize_trading_scope();
         self.model.refresh_trading_price(ui.ctx());
+        #[cfg(all(target_arch = "wasm32", feature = "preview"))]
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            ui.colored_label(theme::BRAND, "浏览器终端预览 · 只读");
+            ui.label("Binance 实时公开行情 · 账户及交易未接通");
+            ui.weak(&self.model.browser_market.status);
+        });
         ui::show_top_bar(
             ui,
             &mut self.model,
@@ -511,7 +562,14 @@ impl eframe::App for VenueFlowApp {
             self.show_trading_settings = true;
         }
         if self.model.preferences.show_status_bar {
+            #[cfg(not(all(target_arch = "wasm32", feature = "preview")))]
             ui::show_status_bar(ui, &self.model);
+            #[cfg(all(target_arch = "wasm32", feature = "preview"))]
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                ui.colored_label(theme::BRAND, "只读行情");
+                ui.weak("本机行情桥接 · 每 500ms 读取 · 未连接交易账户");
+            });
         }
 
         let context = ui.ctx().clone();
@@ -547,8 +605,16 @@ impl eframe::App for VenueFlowApp {
             preferences: self.model.preferences.clone(),
             workspaces: self.workspaces.clone(),
         };
-        if let Ok(encoded) = serde_json::to_string(&persisted) {
-            storage.set_string(STORAGE_KEY, encoded);
+        if persistence::save(storage, &persisted).is_err() {
+            self.model.last_error = Some(
+                match self.model.preferences.language {
+                    crate::i18n::Language::SimplifiedChinese => "布局保存失败，上次配置已保留。",
+                    crate::i18n::Language::English => {
+                        "Layout save failed; the previous configuration was retained."
+                    }
+                }
+                .into(),
+            );
         }
     }
 
@@ -563,15 +629,6 @@ impl eframe::App for VenueFlowApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         theme::BG_PRIMARY.to_normalized_gamma_f32()
     }
-}
-
-fn load(storage: Option<&dyn eframe::Storage>) -> PersistedState {
-    let Some(encoded) = storage.and_then(|storage| storage.get_string(STORAGE_KEY)) else {
-        return PersistedState::default();
-    };
-    serde_json::from_str::<PersistedState>(&encoded)
-        .map(migrate_persisted_state)
-        .unwrap_or_default()
 }
 
 fn migrate_persisted_state(mut state: PersistedState) -> PersistedState {

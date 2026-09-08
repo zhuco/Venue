@@ -1732,7 +1732,7 @@ mod tests {
     async fn signed_wire_offset_never_relabels_local_request_evidence()
     -> Result<(), Box<dyn std::error::Error>> {
         let credentials = BinanceCredentials::from_values("key", "secret")?;
-        let (config, _, scope) = facts("00000000-0000-4000-8000-000000000001")?;
+        let (config, rules, _) = facts("00000000-0000-4000-8000-000000000001")?;
         for offset in [-5_000_i64, 5_000_i64] {
             let (endpoint, _) = fake_http(vec![Behavior::Body(ACCOUNT)]).await?;
             let transport = BinanceHttpTransport::with_endpoint(
@@ -1745,6 +1745,7 @@ mod tests {
             transport.clock_offset_ms.store(offset, Ordering::Relaxed);
             transport.clock_synchronized.store(true, Ordering::Release);
             let before = unix_ms()?;
+            let scope = crate::grid_market::local_read_scope(&config, &rules, 17)?;
             let page = transport
                 .execute_read(
                     &credentials,
@@ -1753,6 +1754,7 @@ mod tests {
                 )
                 .await?;
             assert!(page.requested_at_ms >= before);
+            assert!(page.scope.requested_at_ms() >= before);
             assert!(page.received_at_ms >= page.requested_at_ms);
             assert!(page.received_at_ms.saturating_sub(page.requested_at_ms) < 1_000);
         }

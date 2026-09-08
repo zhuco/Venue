@@ -7,6 +7,27 @@ use crate::i18n::Language;
 
 pub(crate) fn message(model: &crate::model::AppModel) -> Option<String> {
     let language = model.preferences.language;
+    let unknown = model
+        .execution
+        .terminal_executions
+        .iter()
+        .filter(|row| {
+            row.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Terminal
+                && Some(row.trading_account_id.as_str())
+                    == model.preferences.execution_account_id.as_deref()
+                && row.state == ExecutorCommandState::ReconcileRequired
+        })
+        .count();
+    if unknown > 0 {
+        return Some(match language {
+            Language::SimplifiedChinese => {
+                format!("有 {unknown} 笔委托记录待对账；请查看历史委托，不要重复下单。")
+            }
+            Language::English => format!(
+                "{unknown} orders recorded as awaiting reconciliation. Check order history; do not resubmit."
+            ),
+        });
+    }
     let row = model
         .execution
         .terminal_executions
@@ -335,6 +356,43 @@ fn choose(language: Language, zh: &'static str, en: &'static str) -> &'static st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconciliation_notice_covers_older_requests_but_only_the_selected_account()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use venue_control_protocol::kol::{
+            ExecutorCommandOrigin, ExecutorCommandPhase, ExecutorOrderKind,
+        };
+        let mut model = crate::model::AppModel::new(Default::default());
+        model.preferences.language = Language::English;
+        model.preferences.execution_account_id = Some("account-a".into());
+        model.execution.terminal_request_id = Some("new-request".into());
+        model
+            .execution
+            .terminal_executions
+            .push(ExecutorCommandSummary {
+                command_id: "old-command".into(),
+                request_id: Some("old-request".into()),
+                origin: ExecutorCommandOrigin::Terminal,
+                phase: ExecutorCommandPhase::Open,
+                trading_account_id: "account-a".into(),
+                symbol: "BTC/USDT".parse()?,
+                position_side: Some(venue_domain::domain::PositionSide::Long),
+                order_side: Some(venue_domain::domain::OrderSide::Buy),
+                order_kind: ExecutorOrderKind::LimitPostOnly,
+                requested_quantity: Some(1.into()),
+                limit_price: Some(1.into()),
+                state: ExecutorCommandState::ReconcileRequired,
+                native_order_id: None,
+                created_ms: 1,
+                updated_ms: 1,
+                sanitized_error_code: None,
+            });
+        assert!(message(&model).is_some_and(|text| text.contains("1 orders recorded")));
+        model.preferences.execution_account_id = Some("account-b".into());
+        assert!(message(&model).is_none());
+        Ok(())
+    }
 
     #[test]
     fn unavailable_history_marks_nonterminal_receipts_as_stale() {

@@ -73,6 +73,52 @@ async fn uncertain_account_keeps_publishing_signed_facts_without_releasing_comma
             .await?
             .is_none()
     );
+    // A partially installed target is not a missing authenticated event. Keep the
+    // in-flight fence, but let a quiescent dirty Grid publish facts for its next batch.
+    sqlx::query("UPDATE venue_binance_commands SET command_state='rejected',terminal_ms=122 WHERE command_id=$1")
+        .bind(&command).execute(&fixture.pool).await?;
+    sqlx::query("UPDATE venue_api_credentials SET verification_json='{\"verification\":\"verified\"}'::jsonb WHERE credential_id=$1")
+        .bind(&source.credential_id).execute(&fixture.pool).await?;
+    let grid_id = id(986);
+    inventory_mm::start_peer_grid(
+        &fixture.pool,
+        &source.owner_user_id,
+        &source.trading_account_id,
+        &source.credential_id,
+        &grid_id,
+        123,
+    )
+    .await?;
+    sqlx::query("UPDATE venue_binance_grid_instances SET instance_state='running',dirty=true WHERE instance_id=$1")
+        .bind(&grid_id).execute(&fixture.pool).await?;
+    sqlx::query("INSERT INTO venue_binance_grid_desired_orders(instance_id,config_revision,plan_revision,desired_digest,semantic_key,client_order_id,symbol,position_side,order_role,grid_level,order_sequence,order_side,quantity,limit_price,updated_ms) SELECT instance_id,current_config_revision,1,decode(repeat('00',32),'hex'),'uninstalled','not-sent','BTC/USDT','long','open',1,1,'buy','0.001','50000',123 FROM venue_binance_grid_instances WHERE instance_id=$1")
+        .bind(&grid_id).execute(&fixture.pool).await?;
+    assert_eq!(
+        store.stream_surface_settled(&source, &snapshot).await?,
+        Some(true)
+    );
+    sqlx::query("UPDATE venue_binance_grid_instances SET dirty=false,convergence_started_ms=NULL WHERE instance_id=$1")
+        .bind(&grid_id)
+        .execute(&fixture.pool)
+        .await?;
+    assert_eq!(
+        store.stream_surface_settled(&source, &snapshot).await?,
+        Some(false)
+    );
+    sqlx::query("UPDATE venue_binance_grid_instances SET dirty=true WHERE instance_id=$1")
+        .bind(&grid_id)
+        .execute(&fixture.pool)
+        .await?;
+    sqlx::query("UPDATE venue_binance_commands SET command_state='reconcile_required',terminal_ms=NULL WHERE command_id=$1")
+        .bind(&command).execute(&fixture.pool).await?;
+    assert_eq!(
+        store.stream_surface_settled(&source, &snapshot).await?,
+        None
+    );
+    assert_eq!(
+        command_state(&fixture.pool, &command).await?,
+        "reconcile_required"
+    );
     fixture.cleanup().await?;
     Ok(())
 }

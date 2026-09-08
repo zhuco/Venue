@@ -73,6 +73,10 @@ pub enum MarketStatus {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MarketPayload {
+    ConnectionRtt {
+        millis: u64,
+        measured_at: std::time::Instant,
+    },
     RestHistory {
         bars: Vec<PublicBar>,
     },
@@ -129,9 +133,17 @@ pub struct LocalMarketView {
     pub last_event_ms: Option<u64>,
     pub last_received_ms: Option<u64>,
     pub latency_ms: Option<u64>,
+    pub connection_rtt_ms: Option<u64>,
+    connection_rtt_at: Option<std::time::Instant>,
 }
 
 impl LocalMarketView {
+    pub fn recent_rtt_ms(&self) -> Option<u64> {
+        self.connection_rtt_at
+            .filter(|at| at.elapsed() <= std::time::Duration::from_secs(45))
+            .and(self.connection_rtt_ms)
+    }
+
     fn empty(generation: u64, selection: MarketSelection) -> Self {
         Self {
             history_started_ms: 0,
@@ -155,6 +167,8 @@ impl LocalMarketView {
             last_event_ms: None,
             last_received_ms: None,
             latency_ms: None,
+            connection_rtt_ms: None,
+            connection_rtt_at: None,
         }
     }
 }
@@ -239,6 +253,15 @@ impl LocalMarketReducer {
         if envelope.selection != self.view.selection {
             return Err(LocalMarketError::ScopeMismatch);
         }
+        if let MarketPayload::ConnectionRtt {
+            millis,
+            measured_at,
+        } = &envelope.payload
+        {
+            self.view.connection_rtt_ms = Some(*millis);
+            self.view.connection_rtt_at = Some(*measured_at);
+            return Ok(ReduceOutcome::Applied);
+        }
         if envelope.event_time_ms > envelope.received_ms {
             return Err(LocalMarketError::EventFromFuture);
         }
@@ -249,6 +272,7 @@ impl LocalMarketReducer {
         );
         let previous_price_event_ms = self.last_price_event_ms;
         match envelope.payload {
+            MarketPayload::ConnectionRtt { .. } => {}
             MarketPayload::RestHistory { bars } => self.apply_history(bars)?,
             MarketPayload::WsBar {
                 bar,
@@ -259,6 +283,10 @@ impl LocalMarketReducer {
             MarketPayload::Bbo { bid, ask } => self.apply_bbo(bid, ask)?,
             MarketPayload::Trade(trade) => self.apply_trade(trade)?,
             MarketPayload::Status { status, detail } => {
+                if status != MarketStatus::Live {
+                    self.view.connection_rtt_ms = None;
+                    self.view.connection_rtt_at = None;
+                }
                 self.view.status = status;
                 self.view.status_detail = detail;
             }
@@ -1038,6 +1066,33 @@ fn normalize_book_side(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rtt_expires_without_making_market_data_fresh() -> Result<(), super::LocalMarketError> {
+        let mut reducer = super::LocalMarketReducer::new(selection("BTC/USDT")?)?;
+        let old = std::time::Instant::now() - std::time::Duration::from_secs(46);
+        reducer.apply(envelope(
+            &reducer,
+            0,
+            super::MarketPayload::ConnectionRtt {
+                millis: 120,
+                measured_at: old,
+            },
+        ))?;
+        assert_eq!(reducer.view().recent_rtt_ms(), None);
+        assert_eq!(reducer.view().last_received_ms, None);
+        let sample = envelope(
+            &reducer,
+            0,
+            super::MarketPayload::ConnectionRtt {
+                millis: 1500,
+                measured_at: std::time::Instant::now(),
+            },
+        );
+        reducer.apply(sample)?;
+        assert_eq!(reducer.view().recent_rtt_ms(), Some(1500));
+        assert_eq!(reducer.view().last_received_ms, None);
+        Ok(())
+    }
     use super::*;
     use venue_control_protocol::AggressorSide;
     use venue_domain::Price;
@@ -1581,6 +1636,18 @@ mod tests {
                 ask: Decimal::new(2, 0),
             },
         ))?;
+        assert_eq!(reducer.view().latency_ms, Some(7));
+        let received = reducer.view().last_received_ms;
+        reducer.apply(envelope(
+            &reducer,
+            5_999,
+            MarketPayload::ConnectionRtt {
+                millis: 1501,
+                measured_at: std::time::Instant::now(),
+            },
+        ))?;
+        assert_eq!(reducer.view().connection_rtt_ms, Some(1501));
+        assert_eq!(reducer.view().last_received_ms, received);
         assert_eq!(reducer.view().latency_ms, Some(7));
         reducer.apply(envelope(
             &reducer,

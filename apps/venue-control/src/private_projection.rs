@@ -63,12 +63,7 @@ impl BinancePrivateProjectionStore {
         owner: &str,
         credential: &str,
     ) -> Result<Option<TerminalAccountProjection>, PrivateProjectionError> {
-        let healthy: Option<bool> = sqlx::query_scalar("SELECT COALESCE((projection_json->>'stream_healthy')::boolean,false) FROM venue_binance_account_projections WHERE credential_id=$1 AND owner_user_id=$2")
-            .bind(credential).bind(owner).fetch_optional(&self.pool).await.map_err(|_| PrivateProjectionError::Unavailable)?;
-        if healthy != Some(true) {
-            return Ok(None);
-        }
-        self.load_owned(owner, credential).await
+        self.load_owned_with_health(owner, credential, true).await
     }
     /// A live projection must not replace the continuation cache while REST RESULT and user
     /// stream order acknowledgements are still crossing. This is local ledger validation only.
@@ -90,7 +85,10 @@ impl BinancePrivateProjectionStore {
         if pending {
             return Ok(None);
         }
-        let rows = sqlx::query("SELECT d.client_order_id,d.quantity,d.limit_price FROM venue_binance_grid_desired_orders d JOIN venue_binance_grid_instances i ON i.instance_id=d.instance_id WHERE i.trading_account_id=$1 AND i.owner_user_id=$2 AND i.instance_state='running'")
+        // A dirty surface is still being installed in bounded batches. Its not-yet-sent
+        // targets cannot prove a stream gap; publish real facts so cold convergence can proceed.
+        // The account in-flight fence above and settled-instance checks below remain intact.
+        let rows = sqlx::query("SELECT d.client_order_id,d.quantity,d.limit_price FROM venue_binance_grid_desired_orders d JOIN venue_binance_grid_instances i ON i.instance_id=d.instance_id WHERE i.trading_account_id=$1 AND i.owner_user_id=$2 AND i.instance_state='running' AND NOT i.dirty")
             .bind(&source.trading_account_id).bind(&source.owner_user_id).fetch_all(&self.pool).await.map_err(|_| PrivateProjectionError::Unavailable)?;
         for row in rows {
             let client: String = row
@@ -120,7 +118,7 @@ impl BinancePrivateProjectionStore {
                 return Ok(Some(false));
             }
         }
-        let retired: Vec<String> = sqlx::query_scalar("SELECT o.client_order_id FROM venue_binance_grid_order_owners o JOIN venue_binance_grid_instances i ON i.instance_id=o.instance_id LEFT JOIN venue_binance_grid_desired_orders d ON d.client_order_id=o.client_order_id WHERE i.trading_account_id=$1 AND i.owner_user_id=$2 AND i.instance_state='running' AND d.client_order_id IS NULL")
+        let retired: Vec<String> = sqlx::query_scalar("SELECT o.client_order_id FROM venue_binance_grid_order_owners o JOIN venue_binance_grid_instances i ON i.instance_id=o.instance_id LEFT JOIN venue_binance_grid_desired_orders d ON d.client_order_id=o.client_order_id WHERE i.trading_account_id=$1 AND i.owner_user_id=$2 AND i.instance_state='running' AND NOT i.dirty AND d.client_order_id IS NULL")
             .bind(&source.trading_account_id).bind(&source.owner_user_id).fetch_all(&self.pool).await.map_err(|_| PrivateProjectionError::Unavailable)?;
         if snapshot
             .open_orders()
@@ -540,8 +538,19 @@ impl BinancePrivateProjectionStore {
         owner_user_id: &str,
         credential_id: &str,
     ) -> Result<Option<TerminalAccountProjection>, PrivateProjectionError> {
-        let row: Option<(String, serde_json::Value)> = sqlx::query_as("SELECT p.trading_account_id,p.projection_json FROM venue_binance_account_projections p JOIN venue_api_credentials c ON c.credential_id=p.credential_id AND c.user_id=p.owner_user_id AND c.trading_account_id=p.trading_account_id WHERE p.credential_id=$1 AND p.owner_user_id=$2 AND c.deleted_ms IS NULL")
-            .bind(credential_id).bind(owner_user_id).fetch_optional(&self.pool).await
+        self.load_owned_with_health(owner_user_id, credential_id, false)
+            .await
+    }
+
+    async fn load_owned_with_health(
+        &self,
+        owner_user_id: &str,
+        credential_id: &str,
+        require_healthy: bool,
+    ) -> Result<Option<TerminalAccountProjection>, PrivateProjectionError> {
+        // Health and payload must come from one row version; invalidation can race two reads.
+        let row: Option<(String, serde_json::Value)> = sqlx::query_as("SELECT p.trading_account_id,p.projection_json FROM venue_binance_account_projections p JOIN venue_api_credentials c ON c.credential_id=p.credential_id AND c.user_id=p.owner_user_id AND c.trading_account_id=p.trading_account_id WHERE p.credential_id=$1 AND p.owner_user_id=$2 AND c.deleted_ms IS NULL AND (NOT $3 OR COALESCE((p.projection_json->>'stream_healthy')::boolean,false))")
+            .bind(credential_id).bind(owner_user_id).bind(require_healthy).fetch_optional(&self.pool).await
             .map_err(|_| PrivateProjectionError::Unavailable)?;
         let Some((trading_account_id, payload)) = row else {
             return Ok(None);

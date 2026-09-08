@@ -1,4 +1,5 @@
 mod position_actions;
+mod position_history;
 mod text;
 use crate::{
     client::ControlClient,
@@ -38,7 +39,9 @@ pub struct ExecutionViewState {
     pub grid: crate::grid_view::GridViewState,
     pub leader_bot: crate::leader_bot_view::LeaderBotView,
     pub support_martingale: crate::support_martingale_view::SupportMartingaleViewState,
+    pub inventory_mm: crate::inventory_mm_view::InventoryMmViewState,
     position_actions: position_actions::PositionActions,
+    position_cycles: Vec<position_history::Cycle>,
     pub(crate) chart_orders: crate::chart_trading::OrderTagState,
     private_received_ms: u64,
     tab: Tab,
@@ -47,6 +50,7 @@ pub struct ExecutionViewState {
 
 impl ExecutionViewState {
     pub(crate) fn clear_account_view(&mut self) {
+        self.position_cycles.clear();
         self.private_projection = None;
         self.private_received_ms = 0;
         self.private_error = None;
@@ -98,11 +102,13 @@ impl ExecutionViewState {
                 trade_dock.clear_order_selection();
             }
             self.chart_orders.observe(&projection);
+            self.position_cycles = position_history::rebuild(&projection);
             self.private_received_ms = crate::account_center::now_ms();
             self.private_projection = Some(Arc::new(projection));
             self.private_error = None;
         } else {
             trade_dock.clear_order_selection();
+            self.position_cycles.clear();
             self.private_projection = None;
             self.private_received_ms = 0;
             self.private_error = None;
@@ -296,16 +302,13 @@ fn show_private_projection(
         }
     }
     if model.execution.tab == Tab::OrderHistory {
-        ui.small(text(language, Key::OrderHistoryScope));
         if let Some(error) = &model.execution.terminal_executions_error {
             ui.colored_label(theme::WARNING, error);
         }
     }
     if model.execution.tab == Tab::PositionHistory {
-        ui.small(text(language, Key::PositionHistoryScope));
-    }
-    if model.execution.tab == Tab::Fills {
-        ui.small(text(language, Key::FillsScope));
+        position_history::show(ui, model);
+        return;
     }
     if model.execution.tab == Tab::Assets {
         ui.small(text(language, Key::AssetsScope));
@@ -319,15 +322,55 @@ fn show_private_projection(
             .as_ref()
             .is_none_or(|selected| symbol.to_string() == *selected)
     };
-    let mut count = 0_usize;
+    let virtualized = matches!(model.execution.tab, Tab::OrderHistory | Tab::Fills);
+    let count = match model.execution.tab {
+        Tab::Positions => projection
+            .positions
+            .iter()
+            .filter(|row| included(&row.symbol) && !row.quantity.is_zero())
+            .count(),
+        Tab::CurrentOrders => projection
+            .open_orders
+            .iter()
+            .filter(|row| included(&row.symbol))
+            .count(),
+        Tab::OrderHistory => model
+            .execution
+            .terminal_executions
+            .iter()
+            .filter(|row| {
+                row.trading_account_id == projection.trading_account_id && included(&row.symbol)
+            })
+            .count(),
+        Tab::Fills => projection
+            .fills
+            .iter()
+            .filter(|row| included(&row.symbol))
+            .count(),
+        Tab::Assets => projection.assets.len(),
+        Tab::Bots | Tab::PositionHistory => 0,
+    };
+    let row_height = if model.execution.tab == Tab::OrderHistory {
+        32.0_f32
+    } else {
+        ui.spacing().interact_size.y
+    };
     let mut requested_symbol = None;
     let mut requested_order = None;
     let mut requested_position = None;
-    egui::ScrollArea::both()
-        .id_salt("private-execution-table-scroll")
-        .show(ui, |ui| {
+    history_table_scroll(
+        ui,
+        model.execution.tab,
+        count,
+        row_height,
+        virtualized,
+        |ui, visible| {
+            let skip = visible.start.saturating_sub(1);
+            let take = visible.end.saturating_sub(1).saturating_sub(skip);
             egui::Grid::new(("private-execution-table", model.execution.tab as u8))
                 .striped(true)
+                .start_row(visible.start)
+                .min_row_height(row_height)
                 .min_col_width(72.0)
                 .spacing([18.0, 8.0])
                 .show(ui, |ui| {
@@ -372,21 +415,15 @@ fn show_private_projection(
                             Key::FillId,
                             Key::Time,
                         ],
-                        Tab::PositionHistory => &[
-                            Key::Symbol,
-                            Key::Side,
-                            Key::Size,
-                            Key::Entry,
-                            Key::Mark,
-                            Key::Time,
-                        ],
                         Tab::Assets => &[Key::Asset, Key::Equity, Key::Available],
-                        Tab::Bots => &[],
+                        Tab::Bots | Tab::PositionHistory => &[],
                     };
-                    for key in headings {
-                        ui.weak(text(language, *key));
+                    if visible.start == 0 {
+                        for key in headings {
+                            ui.weak(text(language, *key));
+                        }
+                        ui.end_row();
                     }
-                    ui.end_row();
                     match model.execution.tab {
                         Tab::Positions => {
                             for row in projection
@@ -394,7 +431,6 @@ fn show_private_projection(
                                 .iter()
                                 .filter(|row| included(&row.symbol) && !row.quantity.is_zero())
                             {
-                                count += 1;
                                 if symbol_link(ui, &row.symbol, &model.preferences.selected_symbol)
                                 {
                                     requested_symbol = Some(row.symbol.to_string());
@@ -419,7 +455,6 @@ fn show_private_projection(
                                 .iter()
                                 .filter(|row| included(&row.symbol))
                             {
-                                count += 1;
                                 let selection =
                                     row.native_order_id.as_deref().map(|native_order_id| {
                                         TerminalOrderSelection {
@@ -483,11 +518,17 @@ fn show_private_projection(
                             }
                         }
                         Tab::OrderHistory => {
-                            for row in model.execution.terminal_executions.iter().filter(|row| {
-                                row.trading_account_id == projection.trading_account_id
-                                    && included(&row.symbol)
-                            }) {
-                                count += 1;
+                            for row in model
+                                .execution
+                                .terminal_executions
+                                .iter()
+                                .filter(|row| {
+                                    row.trading_account_id == projection.trading_account_id
+                                        && included(&row.symbol)
+                                })
+                                .skip(skip)
+                                .take(take)
+                            {
                                 ui.label(row.symbol.to_string());
                                 ui.label(format!("{:?} / {:?}", row.order_side, row.position_side));
                                 market_price(ui, model, &row.symbol, row.limit_price);
@@ -517,8 +558,13 @@ fn show_private_projection(
                             }
                         }
                         Tab::Fills => {
-                            for row in projection.fills.iter().filter(|row| included(&row.symbol)) {
-                                count += 1;
+                            for row in projection
+                                .fills
+                                .iter()
+                                .filter(|row| included(&row.symbol))
+                                .skip(skip)
+                                .take(take)
+                            {
                                 ui.label(row.symbol.to_string());
                                 ui.label(format!("{:?} / {:?}", row.order_side, row.position_side));
                                 market_price(ui, model, &row.symbol, Some(row.price));
@@ -529,36 +575,19 @@ fn show_private_projection(
                                 ui.end_row();
                             }
                         }
-                        Tab::PositionHistory => {
-                            for entry in projection
-                                .position_history
-                                .iter()
-                                .filter(|entry| included(&entry.position.symbol))
-                            {
-                                let row = &entry.position;
-                                count += 1;
-                                ui.label(row.symbol.to_string());
-                                ui.label(format!("{:?}", row.position_side));
-                                market_quantity(ui, model, &row.symbol, Some(row.quantity));
-                                market_price(ui, model, &row.symbol, row.entry_price);
-                                market_price(ui, model, &row.symbol, row.mark_price);
-                                ui.weak(timestamp(entry.observed_ms));
-                                ui.end_row();
-                            }
-                        }
                         Tab::Assets => {
                             for row in &projection.assets {
-                                count += 1;
                                 ui.label(&row.asset);
                                 decimal(ui, Some(row.equity));
                                 decimal(ui, row.available_margin);
                                 ui.end_row();
                             }
                         }
-                        Tab::Bots => {}
+                        Tab::Bots | Tab::PositionHistory => {}
                     }
                 });
-        });
+        },
+    );
     if count == 0 {
         ui.weak(text(language, Key::Empty));
     }
@@ -570,6 +599,27 @@ fn show_private_projection(
     } else if let Some(symbol) = requested_symbol {
         model.select_symbol(symbol);
         model.follow_latest_requested = true;
+    }
+}
+
+fn history_table_scroll(
+    ui: &mut egui::Ui,
+    tab: Tab,
+    count: usize,
+    row_height: f32,
+    virtualized: bool,
+    contents: impl FnOnce(&mut egui::Ui, std::ops::Range<usize>),
+) {
+    let scroll = egui::ScrollArea::both().id_salt(("private-execution-table-scroll", tab as u8));
+    if virtualized {
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            scroll.show_rows(ui, row_height, count + 1, contents);
+        });
+    } else {
+        // Action rows keep their existing widget identity and interaction path.
+        scroll.show(ui, |ui| contents(ui, 0..count + 1));
     }
 }
 
@@ -592,7 +642,7 @@ Locally calculated from price movement and position quantity. Uses fresh last pr
 
 fn position_usd_value(ui: &mut egui::Ui, position: &venue_control_protocol::kol::TerminalPosition) {
     let value = position_usd_value_value(position);
-    ui.monospace(value.map_or_else(
+    ui.label(value.map_or_else(
         || "—".to_owned(),
         |value| format!("{} USD", value.round_dp(4).normalize()),
     ));
@@ -641,9 +691,13 @@ pub(crate) fn live_position_pnl_value(
         .local_quotes
         .get(&symbol)
         .map(|quote| (quote.last, quote.exchange_time_ms, quote.received_ms));
+    #[cfg(not(target_arch = "wasm32"))]
+    let latest_trade = model.local_markets.latest_price_for_symbol(&symbol);
+    #[cfg(target_arch = "wasm32")]
+    let latest_trade = None;
     let price = ticker
         .into_iter()
-        .chain(model.local_markets.latest_price_for_symbol(&symbol))
+        .chain(latest_trade)
         .filter(|(price, event_ms, received_ms)| {
             fresh_time(*received_ms, now)
                 && fresh_time(*event_ms, now)
@@ -688,7 +742,7 @@ fn market_price(
     symbol: &venue_domain::Symbol,
     value: Option<rust_decimal::Decimal>,
 ) {
-    ui.monospace(market_price_text(model, symbol, value));
+    ui.label(market_price_text(model, symbol, value));
 }
 
 fn market_price_text(
@@ -708,14 +762,14 @@ fn market_quantity(
     symbol: &venue_domain::Symbol,
     value: Option<rust_decimal::Decimal>,
 ) {
-    ui.monospace(value.map_or_else(
+    ui.label(value.map_or_else(
         || "—".into(),
         |value| model.format_market_quantity(&symbol.to_string(), value),
     ));
 }
 
 fn decimal(ui: &mut egui::Ui, value: Option<rust_decimal::Decimal>) {
-    ui.monospace(value.map_or_else(|| "—".into(), |v| v.normalize().to_string()));
+    ui.label(value.map_or_else(|| "—".into(), |v| v.normalize().to_string()));
 }
 
 fn tab_label(model: &AppModel, tab: Tab, key: Key, language: crate::i18n::Language) -> String {
@@ -758,6 +812,32 @@ fn timestamp(ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn history_scroll_only_builds_visible_rows() {
+        let context = egui::Context::default();
+        for _ in 0..2 {
+            let mut rows = 0;
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1100.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    history_table_scroll(ui, Tab::OrderHistory, 500, 32.0, true, |ui, visible| {
+                        rows = visible.len();
+                        for row in visible {
+                            ui.label(format!("Order {row}"));
+                        }
+                    });
+                },
+            );
+            assert!(rows > 0 && rows < 30, "rendered {rows} rows");
+            output.textures_delta.clear();
+        }
+    }
     use super::*;
 
     fn private_projection(account: &str, observed_ms: u64) -> TerminalAccountProjection {

@@ -42,3 +42,15 @@ Install the browser once with `npx playwright install chromium`. Alternatively s
 Use `VENUE_WEB_QA_DIR=G:\Build\Venue\venue-web-qa\<run-id>`, then run `npm run test:e2e` after a production build. Screenshots default to `<qa-dir>/screenshots`; `VENUE_WEB_SCREENSHOT_DIR` can override this with another absolute build-artifact path. Without overrides, Windows uses `G:/Build/Venue/venue-web-qa/local-<pid>` and other hosts use their temporary directory. QA never defaults to the source or trading-recovery directory. The suite starts isolated listeners on 3216 and 38080; both must be free. It covers all five migration viewports, scoped session recovery, drawer focus, exact control confirmation, relation idempotency, empty/error/offline/stale states, signed-fact layout and decimal preservation.
 
 `control.spec.ts` uses browser request interception with synthetic account IDs for deterministic UI failure/layout cases. `performance.spec.ts` exercises the real BFF against a separate isolated test Control HTTP service, without interception. Its timing report is local BFF evidence only, not proof of PostgreSQL, Executor, exchange latency or live trading. Product and capacity acceptance follow [KOL_COPY_MVP](KOL_COPY_MVP.md); QA fixture services are never part of the standalone production release.
+
+公开注册入口为 `/register`，登录页可直接进入；邀请码必填，`/join/<invite_code>` 保留预填邀请的注册流程。普通注册用户添加的是本人跟单账户，复用定比/定额授权表单；BFF 只允许用户名、密码和邀请码注册字段，拒绝角色或 KOL 身份注入。KOL 仍由管理员开通，不从注册页面授予。
+
+KOL 后台“邀请跟单用户”提供随机生成、自定义、查看和复制邀请链接；自定义邀请码为 6–64 位 ASCII 字母数字或 `-`、`_`，区分大小写，全平台不可重复。更换要求显式确认并使用原请求重试。`kol-profile` 和 `kol-invite` BFF 仅返回本人 DTO；跟随者的订单模块不在 KOL 后台显示。新邀请接口需要 Control 与迁移 `0046` 同步上线。
+
+KOL 与跟单页面必须使用币安统一账户（Portfolio Margin）及 U 本位双向持仓。`/v2/kol/source` 保存 KOL 唯一带单账户，不使用会话当前账户代替。管理员可预建无账户的 draft KOL；首次选择本人已验证账户时以权益初始化策略资金并占用全站 5 个 KOL 名额之一，不自动启动带单。已有机器人或跟单关系时禁止换源，保留历史归属。需迁移 0047。
+
+KOL 原生跟单的新指令不再使用软件单笔或总名义金额上限，也不再以初始权益乘 5 限制开仓。限价、市价与 STOP_MARKET 开仓均持久化 `copy_risk.notional_limit_policy=exchange_account`；币安账户保证金、持仓/订单规则、交易所步长/最小名义额/最大数量决定准入，原权限、同一身份对账、价格保护和只减仓约束保留。定比/定额决定计划数量，定比权益仍是验证快照，取消额度不代表动态重算跟单比例。历史无此字段的指令按 `stored_limits` 原规则恢复，已拒绝指令不自动补发。旧 wire 和数据库额度列仅为历史兼容，新模式不用于开仓额度；页面移除额度输入，API 字段显示统一为“API密钥”和“密钥”。
+
+手工创建的 KOL 无需额外带单审批：验证币安 API 并指定唯一带单账户时自动授予初始带单权限；已有明确撤权不自动恢复。普通跟单注册不授予 KOL 身份。验证按钮必须展示验证结果，HTTP 200 不代表验证通过；空账户编号不得显示为已指定带单账户。
+
+`/help/kol` 图文指南改编 PR #2，保留署名；校正验证结果、自动授权、邀请码、跟单与退出步骤。

@@ -189,6 +189,18 @@ pub fn plan(input: &MmInput) -> Result<MmPlan> {
         }
     }
     if !owned.is_empty() {
+        // A serial sender can retire one unsent side after the first side changes private facts.
+        // Complete only an exact surviving subset of today's fully risk-checked target. Changed
+        // prices, partial fills or inventory still take the cancel-and-replan path below.
+        if own_quotes.len() == 1 && desired.len() == 2 && desired.contains(&own_quotes[0]) {
+            return Ok(output(MmAction::Quote {
+                quotes: desired
+                    .into_iter()
+                    .filter(|q| !own_quotes.contains(q))
+                    .collect(),
+                reason: MmReason::Normal,
+            }));
+        }
         let same =
             own_quotes.len() == desired.len() && own_quotes.iter().all(|q| desired.contains(q));
         let before_refresh = input.previous_quotes_at_ms.is_some_and(|at| {

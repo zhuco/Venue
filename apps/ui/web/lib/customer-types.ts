@@ -1,5 +1,5 @@
 /** Browser views of the owned DTOs in venue-control-protocol::{accounts,kol,leader_bot}. */
-export type Credential = { credential_id: string; label: string; masked_key: string; verification: string; trading_account_id: string | null; dual_position: boolean; account_mode: string | null };
+export type Credential = { credential_id: string; label: string; masked_key: string; verification: string; trading_account_id: string | null; dual_position: boolean; account_mode: string | null; equity?: string | null; balance_observed_ms?: number | null };
 export type CustomerOverview = { user: { user_id: string; username: string }; credentials: Credential[]; selected_credential_id: string | null; csrf: string };
 export type FollowSizing = { mode: "proportional" } | { mode: "fixed_notional"; notional: string };
 export type FollowSettings = { credential_id: string; sizing?: FollowSizing; allocated_capital: string; multiplier: string; max_order_notional: string; max_total_notional: string; max_deviation_bps: number; allowed_symbols: string[] };

@@ -229,7 +229,6 @@ impl Workspaces {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn active_chart_requests(&self, fallback_symbol: &str) -> Vec<(String, ChartInterval)> {
         let tree = self.active_tree();
         tree.tiles
