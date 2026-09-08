@@ -4,5 +4,6 @@
 //! dependency. Hosts supply normalized facts and own all persistence and execution authority.
 
 pub mod hedged_grid;
+pub mod inventory_mm;
 pub mod scalping;
 pub mod support_martingale;

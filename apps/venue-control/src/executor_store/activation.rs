@@ -75,9 +75,9 @@ impl PgExecutorStore {
                 return Err(BinanceCommandLedgerError::Conflict);
             }
         }
-        let blocked: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM venue_control_strategy_scopes WHERE venue='binance' AND mode='LIVE' AND trading_account_id=ANY($1)) OR EXISTS (SELECT 1 FROM venue_binance_grid_instances WHERE trading_account_id=$2 AND instance_state<>'stopped')")
+        let blocked: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM venue_control_strategy_scopes WHERE venue='binance' AND mode='LIVE' AND trading_account_id=ANY($1))")
             .bind(vec![&activation.leader_trading_account_id, &activation.follower_trading_account_id])
-            .bind(&activation.follower_trading_account_id).fetch_one(&mut *tx).await.map_err(unavailable)?;
+            .fetch_one(&mut *tx).await.map_err(unavailable)?;
         if blocked {
             return Err(BinanceCommandLedgerError::Conflict);
         }

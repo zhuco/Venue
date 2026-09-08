@@ -5,8 +5,8 @@ use venue_control_protocol::{
     accounts::CredentialSummary,
     grid::{
         GRID_SCHEMA_VERSION, GridConfig, GridConfigUpdateRequest, GridInstanceCreateRequest,
-        GridInstanceState, GridInstanceSummary, GridInventoryReplenishment, GridInventoryRisk,
-        GridLifecycleAction, GridLifecycleRequest, GridProfitReduction, GridResetPolicy,
+        GridInstanceState, GridInstanceSummary, GridInventoryReplenishment, GridLifecycleAction,
+        GridLifecycleRequest, GridProfitReduction, GridResetPolicy,
     },
 };
 use venue_domain::PositionSide;
@@ -33,12 +33,6 @@ struct GridEditor {
     spacing_rate: String,
     grid_levels: String,
     max_total_notional: String,
-    inventory_risk_enabled: bool,
-    max_leg_notional: String,
-    max_gross_notional: String,
-    max_net_notional: String,
-    required_leverage_enabled: bool,
-    required_leverage: String,
     replenish_enabled: bool,
     minimum_inventory_notional: String,
     target_inventory_notional: String,
@@ -64,12 +58,6 @@ impl GridEditor {
             spacing_rate: "0.002".to_owned(),
             grid_levels: "10".to_owned(),
             max_total_notional: "1000".to_owned(),
-            inventory_risk_enabled: false,
-            max_leg_notional: "400".to_owned(),
-            max_gross_notional: "800".to_owned(),
-            max_net_notional: "20".to_owned(),
-            required_leverage_enabled: false,
-            required_leverage: "20".to_owned(),
             replenish_enabled: false,
             minimum_inventory_notional: "10".to_owned(),
             target_inventory_notional: "20".to_owned(),
@@ -99,26 +87,6 @@ impl GridEditor {
             spacing_rate: number(config.spacing_rate),
             grid_levels: config.grid_levels.to_string(),
             max_total_notional: number(config.max_total_notional),
-            inventory_risk_enabled: config.inventory_risk.is_some(),
-            max_leg_notional: config
-                .inventory_risk
-                .as_ref()
-                .map(|risk| number(risk.max_leg_notional))
-                .unwrap_or_else(|| "400".to_owned()),
-            max_gross_notional: config
-                .inventory_risk
-                .as_ref()
-                .map(|risk| number(risk.max_gross_notional))
-                .unwrap_or_else(|| "800".to_owned()),
-            max_net_notional: config
-                .inventory_risk
-                .as_ref()
-                .map(|risk| number(risk.max_net_notional))
-                .unwrap_or_else(|| "20".to_owned()),
-            required_leverage_enabled: config.required_leverage.is_some(),
-            required_leverage: config
-                .required_leverage
-                .map_or_else(|| "20".to_owned(), |value| value.to_string()),
             replenish_enabled: config.inventory_replenishment.enabled,
             minimum_inventory_notional: number(
                 config.inventory_replenishment.minimum_inventory_notional,
@@ -151,23 +119,8 @@ impl GridEditor {
             spacing_rate: decimal(&self.spacing_rate, "网格间距")?,
             grid_levels: integer(&self.grid_levels, "网格层数")?,
             max_total_notional: decimal(&self.max_total_notional, "最大总名义价值")?,
-            inventory_risk: if self.inventory_risk_enabled {
-                Some(GridInventoryRisk {
-                    max_leg_notional: decimal(&self.max_leg_notional, "单腿库存上限")?,
-                    max_gross_notional: decimal(&self.max_gross_notional, "双腿总库存上限")?,
-                    max_net_notional: decimal(&self.max_net_notional, "最大净敞口")?,
-                })
-            } else {
-                None
-            },
-            required_leverage: self
-                .required_leverage_enabled
-                .then(|| integer::<u16>(&self.required_leverage, "要求杠杆"))
-                .transpose()?
-                .map(|value| {
-                    u8::try_from(value).map_err(|_| "要求杠杆必须在 1 到 125 之间".to_owned())
-                })
-                .transpose()?,
+            inventory_risk: None,
+            required_leverage: None,
             inventory_replenishment: GridInventoryReplenishment {
                 enabled: self.replenish_enabled,
                 minimum_inventory_notional: decimal(&self.minimum_inventory_notional, "最低库存")?,
@@ -581,40 +534,6 @@ fn editor(
                                     ui,
                                     tr(language, "总名义上限", "Total notional cap"),
                                     &mut draft.max_total_notional,
-                                );
-                                ui.checkbox(
-                                    &mut draft.inventory_risk_enabled,
-                                    tr(
-                                        language,
-                                        "启用库存风险边界",
-                                        "Enable inventory risk envelope",
-                                    ),
-                                );
-                                ui.end_row();
-                                input(
-                                    ui,
-                                    tr(language, "单腿库存上限", "Per-leg inventory cap"),
-                                    &mut draft.max_leg_notional,
-                                );
-                                input(
-                                    ui,
-                                    tr(language, "双腿总库存上限", "Gross inventory cap"),
-                                    &mut draft.max_gross_notional,
-                                );
-                                input(
-                                    ui,
-                                    tr(language, "最大净敞口", "Maximum net exposure"),
-                                    &mut draft.max_net_notional,
-                                );
-                                ui.checkbox(
-                                    &mut draft.required_leverage_enabled,
-                                    tr(language, "要求交易所杠杆", "Require exchange leverage"),
-                                );
-                                ui.end_row();
-                                input(
-                                    ui,
-                                    tr(language, "要求杠杆", "Required leverage"),
-                                    &mut draft.required_leverage,
                                 );
                                 ui.checkbox(
                                     &mut draft.replenish_enabled,

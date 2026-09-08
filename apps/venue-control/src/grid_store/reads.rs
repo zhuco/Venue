@@ -256,6 +256,7 @@ fn decode_origin(value: String) -> Result<ExecutorCommandOrigin, GridStoreError>
         "copy" => Ok(ExecutorCommandOrigin::Copy),
         "terminal" => Ok(ExecutorCommandOrigin::Terminal),
         "grid" => Ok(ExecutorCommandOrigin::Grid),
+        "inventory_mm" => Ok(ExecutorCommandOrigin::InventoryMm),
         _ => Err(GridStoreError::Corrupt),
     }
 }

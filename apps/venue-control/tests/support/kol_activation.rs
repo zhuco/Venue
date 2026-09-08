@@ -172,6 +172,17 @@ async fn activation_checks_actual_exposure_identity_and_retires_previous_targets
         .execute(&fixture.pool)
         .await?;
     // A nonzero KOL baseline is allowed and is not copied. Only the flat follower starts anew.
+    // A peer strategy instance is not account ownership; the flat baseline and pending-command
+    // fences above remain authoritative even though Grid allocation itself does not block KOL.
+    inventory_mm::start_peer_grid(
+        &fixture.pool,
+        &activation.follower_user_id,
+        &activation.follower_trading_account_id,
+        &activation.follower_credential_id,
+        &id(596),
+        31,
+    )
+    .await?;
     store
         .complete_activation(&activation, &leader, &flat, 32)
         .await?;

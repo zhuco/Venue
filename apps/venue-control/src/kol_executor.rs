@@ -867,6 +867,7 @@ pub(crate) fn claimed(
         {
             "terminal" => venue_control_protocol::kol::ExecutorCommandOrigin::Terminal,
             "grid" => venue_control_protocol::kol::ExecutorCommandOrigin::Grid,
+            "inventory_mm" => venue_control_protocol::kol::ExecutorCommandOrigin::InventoryMm,
             "copy" => venue_control_protocol::kol::ExecutorCommandOrigin::Copy,
             _ => return Err(BinanceCommandLedgerError::Conflict),
         },

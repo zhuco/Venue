@@ -357,7 +357,7 @@ impl BinanceGridStore {
                 .ok_or(GridStoreError::Corrupt);
         }
         let row = sqlx::query(
-            "SELECT revision,current_config_revision,instance_state,trading_account_id \
+            "SELECT revision,current_config_revision,instance_state,trading_account_id,credential_id \
              FROM venue_binance_grid_instances \
              WHERE instance_id=$1 AND owner_user_id=$2 FOR UPDATE",
         )
@@ -382,6 +382,12 @@ impl BinanceGridStore {
             request.action,
             GridLifecycleAction::Start | GridLifecycleAction::Resume
         ) {
+            // Strategy allocation is user-managed; keep the shared account queue ordering,
+            // not a strategy-count or symbol-occupancy admission lock.
+            let credential_id: String = row.try_get("credential_id").map_err(corrupt_row)?;
+            lock_account_command_queue(&mut tx, owner_user_id, &trading_account_id, &credential_id)
+                .await
+                .map_err(grid_command_admission_error)?;
             let legacy_owned: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM venue_control_strategy_scopes \
                  WHERE venue='binance' AND mode='LIVE' AND trading_account_id=$1)",

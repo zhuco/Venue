@@ -234,7 +234,7 @@ impl AccountService {
         &self,
         principal: &Principal,
     ) -> Result<Vec<ExecutorCommandSummary>, AccountError> {
-        let rows = sqlx::query("SELECT c.command_id,c.request_id,c.command_origin,c.command_phase,c.order_kind,c.order_side,c.requested_quantity,c.limit_price,c.trading_account_id,c.symbol,c.position_side,c.command_state,c.native_order_id,c.created_ms,c.updated_ms,CASE WHEN c.command_state='pending' AND cancel_parent.command_state='reconcile_required' THEN cancel_parent.sanitized_error_code WHEN c.command_state='pending' AND parent.command_state='reconcile_required' THEN parent.sanitized_error_code ELSE c.sanitized_error_code END AS sanitized_error_code FROM venue_binance_commands c LEFT JOIN venue_terminal_position_commands action ON action.command_id=c.command_id LEFT JOIN venue_binance_commands parent ON parent.command_id=action.reverse_parent_id AND parent.owner_user_id=c.owner_user_id LEFT JOIN venue_terminal_replacements replacement ON replacement.command_id=c.command_id LEFT JOIN venue_binance_commands cancel_parent ON cancel_parent.command_id=replacement.cancel_command_id AND cancel_parent.owner_user_id=c.owner_user_id WHERE c.owner_user_id=$1 AND c.command_origin IN ('terminal','copy','grid') ORDER BY c.created_ms DESC,c.command_id DESC LIMIT 200")
+        let rows = sqlx::query("SELECT c.command_id,c.request_id,c.command_origin,c.command_phase,c.order_kind,c.order_side,c.requested_quantity,c.limit_price,c.trading_account_id,c.symbol,c.position_side,c.command_state,c.native_order_id,c.created_ms,c.updated_ms,CASE WHEN c.command_state='pending' AND cancel_parent.command_state='reconcile_required' THEN cancel_parent.sanitized_error_code WHEN c.command_state='pending' AND parent.command_state='reconcile_required' THEN parent.sanitized_error_code ELSE c.sanitized_error_code END AS sanitized_error_code FROM venue_binance_commands c LEFT JOIN venue_terminal_position_commands action ON action.command_id=c.command_id LEFT JOIN venue_binance_commands parent ON parent.command_id=action.reverse_parent_id AND parent.owner_user_id=c.owner_user_id LEFT JOIN venue_terminal_replacements replacement ON replacement.command_id=c.command_id LEFT JOIN venue_binance_commands cancel_parent ON cancel_parent.command_id=replacement.cancel_command_id AND cancel_parent.owner_user_id=c.owner_user_id WHERE c.owner_user_id=$1 AND c.command_origin IN ('terminal','copy','grid','inventory_mm') ORDER BY c.created_ms DESC,c.command_id DESC LIMIT 200")
             .bind(&principal.user.user_id).fetch_all(&self.pool).await.map_err(database_error)?;
         rows.iter().map(command_summary).collect()
     }
@@ -296,6 +296,7 @@ fn command_summary(row: &sqlx::postgres::PgRow) -> Result<ExecutorCommandSummary
         "copy" => ExecutorCommandOrigin::Copy,
         "terminal" => ExecutorCommandOrigin::Terminal,
         "grid" => ExecutorCommandOrigin::Grid,
+        "inventory_mm" => ExecutorCommandOrigin::InventoryMm,
         _ => return Err(error(Code::Unavailable)),
     };
     let phase = match text(row, "command_phase")?.as_str() {

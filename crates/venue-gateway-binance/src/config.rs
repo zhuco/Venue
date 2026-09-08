@@ -99,6 +99,7 @@ pub mod endpoints {
     pub const LISTEN_KEY: &str = "/papi/v1/listenKey";
     pub const ACCOUNT: &str = "/papi/v1/account";
     pub const ACCOUNT_CONFIG: &str = "/papi/v1/um/accountConfig";
+    pub const SYMBOL_CONFIG: &str = "/papi/v1/um/symbolConfig";
     pub const POSITION_MODE: &str = "/papi/v1/um/positionSide/dual";
     pub const POSITIONS: &str = "/papi/v1/um/positionRisk";
     pub const OPEN_ORDERS: &str = "/papi/v1/um/openOrders";

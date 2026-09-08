@@ -26,6 +26,7 @@ pub const BINANCE_PRIVATE_MAX_PAGES: usize = 10_000;
 pub enum BinancePrivateSurface {
     Account,
     AccountConfig,
+    SymbolConfig,
     PositionMode,
     Positions,
     RegularOrders,
@@ -170,6 +171,7 @@ impl BinancePrivateReadRequest {
         match self.surface {
             BinancePrivateSurface::Account => endpoints::ACCOUNT,
             BinancePrivateSurface::AccountConfig => endpoints::ACCOUNT_CONFIG,
+            BinancePrivateSurface::SymbolConfig => endpoints::SYMBOL_CONFIG,
             BinancePrivateSurface::PositionMode => endpoints::POSITION_MODE,
             BinancePrivateSurface::Positions => endpoints::POSITIONS,
             BinancePrivateSurface::RegularOrders => endpoints::OPEN_ORDERS,
@@ -235,6 +237,41 @@ pub fn build_positions_request(
         1,
         symbol_parameters(scope),
     )
+}
+
+pub(crate) fn build_symbol_config_request(
+    scope: &BinancePrivateReadScope,
+) -> Result<BinancePrivateReadRequest, BinanceReadbackError> {
+    BinancePrivateReadRequest::new(
+        scope,
+        BinancePrivateSurface::SymbolConfig,
+        1,
+        symbol_parameters(scope),
+    )
+}
+
+/// Symbol configuration is authoritative even while the account has no open position.
+pub(crate) fn parse_symbol_leverage(
+    payload: &str,
+    binding: &GatewayBinding,
+) -> Result<u8, BinanceReadbackError> {
+    let value: Value = serde_json::from_str(payload).map_err(|_| BinanceReadbackError::Payload)?;
+    let rows = value
+        .as_array()
+        .filter(|rows| rows.len() == 1)
+        .ok_or(BinanceReadbackError::Payload)?;
+    let row = rows
+        .first()
+        .and_then(Value::as_object)
+        .ok_or(BinanceReadbackError::Payload)?;
+    if row.get("symbol").and_then(Value::as_str) != Some(native_symbol(&binding.symbol).as_str()) {
+        return Err(BinanceReadbackError::Binding);
+    }
+    row.get("leverage")
+        .and_then(Value::as_u64)
+        .filter(|v| (1..=125).contains(v))
+        .and_then(|v| u8::try_from(v).ok())
+        .ok_or(BinanceReadbackError::Position)
 }
 
 /// The account-risk gate needs the whole account, never merely the command symbol. The same
@@ -1226,6 +1263,37 @@ mod tests {
         assert_eq!(candidate.positions().len(), 1);
         assert_eq!(candidate.positions()[0].side, PositionSide::Net);
         assert_eq!(candidate.positions()[0].quantity, Decimal::new(-10, 3));
+        Ok(())
+    }
+
+    #[test]
+    fn symbol_leverage_readback_is_signed_scoped_and_available_when_flat()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, _, scope) = facts(
+            GatewayMode::Live,
+            "00000000-0000-4000-8000-000000000001",
+            7,
+            17,
+        )?;
+        let request = build_symbol_config_request(&scope)?;
+        assert_eq!(request.method(), BinanceHttpMethod::Get);
+        assert_eq!(request.path(), "/papi/v1/um/symbolConfig");
+        assert_eq!(request.parameters(), &[("symbol".into(), "BTCUSDT".into())]);
+        assert_eq!(
+            parse_symbol_leverage(r#"[{"symbol":"BTCUSDT","leverage":20}]"#, scope.binding())?,
+            20
+        );
+        for invalid in [
+            "[]",
+            r#"[{"symbol":"XRPUSDC","leverage":20}]"#,
+            r#"[{"symbol":"BTCUSDT","leverage":0}]"#,
+            r#"[{"symbol":"BTCUSDT","leverage":126}]"#,
+            r#"[{"symbol":"BTCUSDT","leverage":20.5}]"#,
+            r#"[{"symbol":"BTCUSDT","leverage":"20"}]"#,
+            r#"[{"symbol":"BTCUSDT","leverage":20},{"symbol":"BTCUSDT","leverage":20}]"#,
+        ] {
+            assert!(parse_symbol_leverage(invalid, scope.binding()).is_err());
+        }
         Ok(())
     }
 

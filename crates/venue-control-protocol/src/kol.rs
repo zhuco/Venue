@@ -537,6 +537,7 @@ pub enum ExecutorCommandOrigin {
     Copy,
     Terminal,
     Grid,
+    InventoryMm,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -612,7 +613,9 @@ impl ExecutorCommandSummary {
         // Grid stores bounded opaque ledger IDs, not account UUIDs. Keep the stricter
         // identity contract for terminal/copy commands and every account/request ID.
         let valid_command_id = match self.origin {
-            ExecutorCommandOrigin::Grid => bounded_plain(&self.command_id, 1, 128),
+            ExecutorCommandOrigin::Grid | ExecutorCommandOrigin::InventoryMm => {
+                bounded_plain(&self.command_id, 1, 128)
+            }
             ExecutorCommandOrigin::Copy | ExecutorCommandOrigin::Terminal => {
                 canonical_id(&self.command_id)
             }
@@ -634,7 +637,10 @@ impl ExecutorCommandSummary {
                 ExecutorOrderKind::LimitPostOnly | ExecutorOrderKind::LimitGtc
             ) != self.limit_price.is_some()
             || (self.order_kind == ExecutorOrderKind::LimitGtc
-                && self.origin == ExecutorCommandOrigin::Grid)
+                && matches!(
+                    self.origin,
+                    ExecutorCommandOrigin::Grid | ExecutorCommandOrigin::InventoryMm
+                ))
             || self.limit_price.is_some_and(|price| !positive(price))
             || (self.phase != ExecutorCommandPhase::Cancel)
                 != self.requested_quantity.is_some_and(positive)

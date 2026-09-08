@@ -22,6 +22,9 @@ pub enum ExecutorSecretError {
 }
 
 impl ExecutorSecretProvider {
+    pub(crate) fn new_shared(pool: PgPool, cipher: std::sync::Arc<CredentialCipher>) -> Self {
+        Self { pool, cipher }
+    }
     #[must_use]
     pub fn new(pool: PgPool, cipher: CredentialCipher) -> Self {
         Self {

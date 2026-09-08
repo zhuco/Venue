@@ -23,23 +23,12 @@ pub struct GridPlannerConfig {
     pub symbol: Symbol,
     pub order_notional: Amount,
     pub maximum_grid_notional: Amount,
-    pub inventory_risk: Option<GridInventoryRiskPolicy>,
     #[serde(with = "rust_decimal::serde::str")]
     pub spacing_rate: Decimal,
     pub grid_count: u8,
     pub replenishment: Option<GridReplenishmentPolicy>,
     pub profit_reduction: Option<GridProfitReductionPolicy>,
     pub reset_policy: GridResetPolicy,
-}
-
-/// Limits that remain meaningful when the two Hedge legs offset each other.  They are expressed
-/// in the configured quote asset, while planning always values positions and pending orders at
-/// the same fresh mark price.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct GridInventoryRiskPolicy {
-    pub max_leg_notional: Amount,
-    pub max_gross_notional: Amount,
-    pub max_net_notional: Amount,
 }
 
 impl GridPlannerConfig {
@@ -290,7 +279,6 @@ pub enum GridBlockedReason {
     InvalidRiskFacts,
     ReductionBelowMinimum,
     MakerPriceWouldCrossBook,
-    InventoryRiskLimit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -346,9 +334,6 @@ impl GridPlanner {
             Ok(surface) => surface,
             Err(trigger) => return Ok(reset_plan(input, trigger)),
         };
-        if !inventory_risk_permits(input, surface.values())? {
-            return Ok(blocked_plan(input, GridBlockedReason::InventoryRiskLimit));
-        }
         enforce_maximum_grid_notional(input, surface.values())?;
 
         if input.convergence.consecutive_failures >= input.config.reset_policy.failure_threshold {
@@ -369,32 +354,25 @@ impl GridPlanner {
             return Ok(plan_with(input, directive));
         }
         if let Some(directive) = replenishment_directive(input)? {
-            if !inventory_risk_permits_replenishment(input, &directive)? {
-                return Ok(blocked_plan(input, GridBlockedReason::InventoryRiskLimit));
-            }
             return Ok(plan_with(input, directive));
         }
 
-        let (rolling_anchor, mut desired_orders) =
-            if surface.is_empty() && input.maker_fills.is_empty() {
-                initial_surface(input)?
-            } else {
-                match rolled_surface(input, surface) {
-                    Ok(surface) => surface,
-                    Err(GridResetTrigger::PriceWouldCrossBook) => {
-                        return Ok(blocked_plan(
-                            input,
-                            GridBlockedReason::MakerPriceWouldCrossBook,
-                        ));
-                    }
-                    Err(trigger) => return Ok(reset_plan(input, trigger)),
+        let (rolling_anchor, desired_orders) = if surface.is_empty() && input.maker_fills.is_empty()
+        {
+            initial_surface(input)?
+        } else {
+            match rolled_surface(input, surface) {
+                Ok(surface) => surface,
+                Err(GridResetTrigger::PriceWouldCrossBook) => {
+                    return Ok(blocked_plan(
+                        input,
+                        GridBlockedReason::MakerPriceWouldCrossBook,
+                    ));
                 }
-            };
-        retain_inventory_safe_orders(input, &mut desired_orders)?;
+                Err(trigger) => return Ok(reset_plan(input, trigger)),
+            }
+        };
         enforce_maximum_grid_notional(input, desired_orders.iter())?;
-        if !inventory_risk_permits(input, desired_orders.iter())? {
-            return Ok(blocked_plan(input, GridBlockedReason::InventoryRiskLimit));
-        }
         Ok(plan_with(
             input,
             GridPlanDirective::Converge {
@@ -489,19 +467,6 @@ fn validate_config(config: &GridPlannerConfig) -> Result<(), GridPlannerError> {
             || policy.reduction_fraction <= Decimal::ZERO
             || policy.reduction_fraction > Decimal::ONE
             || policy.max_single_notional.value <= Decimal::ZERO
-        {
-            return Err(GridPlannerError::Config);
-        }
-    }
-    if let Some(policy) = &config.inventory_risk {
-        let same_asset = policy.max_leg_notional.asset == config.order_notional.asset
-            && policy.max_gross_notional.asset == config.order_notional.asset
-            && policy.max_net_notional.asset == config.order_notional.asset;
-        if !same_asset
-            || policy.max_leg_notional.value < config.order_notional.value
-            || policy.max_gross_notional.value < policy.max_leg_notional.value
-            || policy.max_net_notional.value < config.order_notional.value
-            || policy.max_net_notional.value > policy.max_leg_notional.value
         {
             return Err(GridPlannerError::Config);
         }
@@ -1461,143 +1426,6 @@ fn enforce_maximum_grid_notional<'a>(
             return Err(GridPlannerError::OpenNotionalLimit);
         }
     }
-    Ok(())
-}
-
-/// Every executable direction is included independently.  A close of SHORT is a BUY and can
-/// increase net-long exposure just as an opening LONG can; symmetric resting quotes therefore
-/// cannot be assumed to cancel one another.
-fn inventory_risk_permits<'a>(
-    input: &GridPlannerInput,
-    orders: impl IntoIterator<Item = &'a GridOrderIntent>,
-) -> Result<bool, GridPlannerError> {
-    inventory_risk_permits_with_opening(input, orders, Decimal::ZERO, Decimal::ZERO)
-}
-
-fn inventory_risk_permits_replenishment(
-    input: &GridPlannerInput,
-    directive: &GridPlanDirective,
-) -> Result<bool, GridPlannerError> {
-    let GridPlanDirective::Replenish { adjustments, .. } = directive else {
-        return Ok(true);
-    };
-    let mut long_open = Decimal::ZERO;
-    let mut short_open = Decimal::ZERO;
-    for adjustment in adjustments {
-        let notional = raw_quote_notional(
-            &input.instrument,
-            adjustment.quantity,
-            input.inventory.mark_price,
-        )?;
-        match adjustment.position {
-            GridPosition::Long => {
-                long_open = long_open
-                    .checked_add(notional)
-                    .ok_or(GridPlannerError::Arithmetic)?;
-            }
-            GridPosition::Short => {
-                short_open = short_open
-                    .checked_add(notional)
-                    .ok_or(GridPlannerError::Arithmetic)?;
-            }
-        }
-    }
-    inventory_risk_permits_with_opening(input, std::iter::empty(), long_open, short_open)
-}
-
-fn inventory_risk_permits_with_opening<'a>(
-    input: &GridPlannerInput,
-    orders: impl IntoIterator<Item = &'a GridOrderIntent>,
-    additional_long_open: Decimal,
-    additional_short_open: Decimal,
-) -> Result<bool, GridPlannerError> {
-    let Some(policy) = &input.config.inventory_risk else {
-        return Ok(true);
-    };
-    let mut long_open = additional_long_open;
-    let mut short_open = additional_short_open;
-    let mut long_close = Decimal::ZERO;
-    let mut short_close = Decimal::ZERO;
-    for order in orders {
-        let notional = raw_quote_notional(
-            &input.instrument,
-            order.quantity,
-            input.inventory.mark_price,
-        )?;
-        let target = match (order.key.position, order.key.role) {
-            (GridPosition::Long, GridOrderRole::Open) => &mut long_open,
-            (GridPosition::Short, GridOrderRole::Open) => &mut short_open,
-            (GridPosition::Long, GridOrderRole::Close) => &mut long_close,
-            (GridPosition::Short, GridOrderRole::Close) => &mut short_close,
-        };
-        *target = target
-            .checked_add(notional)
-            .ok_or(GridPlannerError::Arithmetic)?;
-    }
-    let long_inventory = raw_quote_notional(
-        &input.instrument,
-        input.inventory.long_quantity,
-        input.inventory.mark_price,
-    )?;
-    let short_inventory = raw_quote_notional(
-        &input.instrument,
-        input.inventory.short_quantity,
-        input.inventory.mark_price,
-    )?;
-    if long_close > long_inventory || short_close > short_inventory {
-        return Ok(false);
-    }
-    let maximum_long = long_inventory
-        .checked_add(long_open)
-        .ok_or(GridPlannerError::Arithmetic)?;
-    let maximum_short = short_inventory
-        .checked_add(short_open)
-        .ok_or(GridPlannerError::Arithmetic)?;
-    let maximum_gross = maximum_long
-        .checked_add(maximum_short)
-        .ok_or(GridPlannerError::Arithmetic)?;
-    let maximum_net = maximum_long
-        .checked_add(short_close)
-        .and_then(|value| value.checked_sub(short_inventory))
-        .ok_or(GridPlannerError::Arithmetic)?;
-    let minimum_net = long_inventory
-        .checked_sub(long_close)
-        .and_then(|value| value.checked_sub(maximum_short))
-        .ok_or(GridPlannerError::Arithmetic)?;
-    Ok(maximum_long <= policy.max_leg_notional.value
-        && maximum_short <= policy.max_leg_notional.value
-        && maximum_gross <= policy.max_gross_notional.value
-        && maximum_net.abs() <= policy.max_net_notional.value
-        && minimum_net.abs() <= policy.max_net_notional.value)
-}
-
-/// A Grid may retain a deep price geometry while exposing only the portion safe against a
-/// one-sided execution burst. Candidates alternate positive and negative net impact at each
-/// level, so neither Hedge side gains priority merely from enum ordering.
-fn retain_inventory_safe_orders(
-    input: &GridPlannerInput,
-    orders: &mut Vec<GridOrderIntent>,
-) -> Result<(), GridPlannerError> {
-    if input.config.inventory_risk.is_none() {
-        return Ok(());
-    }
-    orders.sort_by_key(|order| {
-        let lane = match (order.key.position, order.key.role) {
-            (GridPosition::Long, GridOrderRole::Open) => 0,
-            (GridPosition::Short, GridOrderRole::Open) => 1,
-            (GridPosition::Short, GridOrderRole::Close) => 2,
-            (GridPosition::Long, GridOrderRole::Close) => 3,
-        };
-        (order.key.level, lane)
-    });
-    let candidates = std::mem::take(orders);
-    let mut retained = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        if inventory_risk_permits(input, retained.iter().chain(std::iter::once(&candidate)))? {
-            retained.push(candidate);
-        }
-    }
-    *orders = retained;
     Ok(())
 }
 

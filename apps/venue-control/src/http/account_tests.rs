@@ -340,10 +340,6 @@ async fn verify_grid_history(
         )
         .await?;
     store.enqueue_command(&command, now()).await?;
-    // The legacy account fixture omits multi-venue migrations; enable the shared ledger here.
-    for migration in [crate::MIGRATION_0035, crate::MIGRATION_0036] {
-        sqlx::raw_sql(migration).execute(&f.pool).await?;
-    }
     // Other venues share the ledger, but must not consume this Binance endpoint's 200-row window.
     sqlx::query("INSERT INTO venue_user_trading_accounts(trading_account_id,user_id,venue,exchange_identity_hash) SELECT '00000000-0000-4000-8000-000000000713',user_id,'bybit',decode(repeat('ab',32),'hex') FROM venue_user_trading_accounts WHERE trading_account_id=$1")
         .bind(account).execute(&f.pool).await?;

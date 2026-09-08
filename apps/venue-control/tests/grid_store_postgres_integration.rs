@@ -1532,7 +1532,11 @@ impl Fixture {
             venue_control::MIGRATION_0038,
             venue_control::MIGRATION_0039,
             venue_control::MIGRATION_0040,
+            venue_control::MIGRATION_0041,
+            venue_control::MIGRATION_0042,
             venue_control::MIGRATION_0043,
+            venue_control::MIGRATION_0044,
+            venue_control::MIGRATION_0045,
         ] {
             sqlx::raw_sql(migration).execute(&pool).await?;
         }

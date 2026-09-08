@@ -105,11 +105,15 @@ impl Ema {
 
     pub fn update(&mut self, bar: &PublicBar) -> Result<Option<Decimal>, ChartIndicatorError> {
         validate_bar(bar)?;
+        self.update_value(bar.close.value())
+    }
+
+    /// Scalar observations share the same initialization and warmup as chart bar closes.
+    pub fn update_value(&mut self, value: Decimal) -> Result<Option<Decimal>, ChartIndicatorError> {
         self.samples = self.samples.saturating_add(1);
-        let close = bar.close.value();
         let value = match self.value {
             Some(previous) => {
-                let change = close
+                let change = value
                     .checked_sub(previous)
                     .ok_or(ChartIndicatorError::Arithmetic)?;
                 let adjustment = self
@@ -120,7 +124,7 @@ impl Ema {
                     .checked_add(adjustment)
                     .ok_or(ChartIndicatorError::Arithmetic)?
             }
-            None => close,
+            None => value,
         };
         self.value = Some(value);
         Ok(self.is_ready().then_some(value))
@@ -200,6 +204,22 @@ mod tests {
         assert_eq!(ema.update(&bar(10, 1)?)?, None);
         assert_eq!(ema.update(&bar(14, 2)?)?, None);
         assert_eq!(ema.update(&bar(14, 3)?)?, Some(Decimal::from(13)));
+        Ok(())
+    }
+
+    #[test]
+    fn ema_scalar_updates_match_validated_bar_updates() -> Result<(), Box<dyn std::error::Error>> {
+        let mut scalar = Ema::new(3)?;
+        let mut bars = Ema::new(3)?;
+        for (index, close) in [10, 14, 14, 9, 20].into_iter().enumerate() {
+            assert_eq!(
+                scalar.update_value(Decimal::from(close))?,
+                bars.update(&bar(close, index as u64 + 1)?)?
+            );
+        }
+        scalar.reset();
+        assert_eq!(scalar.samples(), 0);
+        assert_eq!(scalar.update_value(Decimal::ZERO)?, None);
         Ok(())
     }
 }

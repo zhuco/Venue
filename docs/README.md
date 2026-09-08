@@ -11,6 +11,7 @@
 | 如何授权、配置和启停带单机器人 | [人工带单与订单同步](LEADER_ORDER_MIRROR.md) |
 | 进程如何协作、功能代码在哪里 | [架构](ARCHITECTURE.md)、[CODEMAP](CODEMAP.md) |
 | Grid 如何规划和运行 | [Grid 调用链](ARCHITECTURE.md#grid-flow) / [Grid 行为契约](GRID_RUNTIME_REFACTOR.md) |
+| 独立库存做市、净头寸与取消确认 | [Binance 库存做市](INVENTORY_MM.md)，不是对冲网格参数组合 |
 | 独立多交易所命令、网格与账户准入 | [多交易所执行](MULTI_VENUE_EXECUTOR.md) |
 | 支撑分批做多的当前能力与增强门 | [策略与桌面契约](SUPPORT_MARTINGALE.md)；Binance 参考行情、Bybit LIVE 执行 |
 | 如何处理旧 Grid/Node 账户和恢复事实 | [Grid 契约与旧运行时保护](GRID_RUNTIME_REFACTOR.md)、[冻结 Node CLI](NODE.md) |

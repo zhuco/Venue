@@ -116,7 +116,7 @@ KOL 可编辑字段限定为：公开名称（1–40 字）、页面标题（1�
 - `apps/ui/desktop`：Binance 风格 VenueFlow 桌面终端；只消费 Control 的用户作用域私有投影和命令状态，不持有 API Secret，也不直连 Binance 私流。
 - `venue-control`：认证、邀请归属、KOL 页面、API 密文管理、只读验证、关系配置、终端命令授权、查询投影和任务持久化；不直接执行物理订单。
 - PostgreSQL：保存用户、归属、页面、加密凭证、关系、KOL 成交游标、目标版本、终端/跟单轻量命令账本和执行投影。
-- `venue-executor-binance`：初期新链唯一物理交易进程，承载终端、跟单与 Binance Grid；旧 Copy worker、旧 Grid writer 及旧 Node 不得继续作为第二个生产入口。
+- `venue-executor-binance`：初期新链唯一物理交易进程，承载终端、跟单、Binance Grid 与独立库存做市；旧 Copy worker、旧 Grid writer 及旧 Node 不得继续作为第二个生产入口。
 
 Executor 使用 Tokio 异步任务管理所有账户：
 
@@ -157,6 +157,12 @@ Executor 以部署副本数 1 运行，并在启动时取得一个 PostgreSQL �
 4. 从旧部署配置移除该账户，再在新 Executor 中启用。
 
 本 MVP 不迁移旧 Grid Actor、Checkpoint 或本地 WAL。存在旧未决事实的账户保持拒绝，不能通过清文件或换 API Key 绕过。KOL 与跟随账户都遵守新旧互斥。
+
+独立库存做市使用 `inventory_mm` 命令来源，复用该单例与账户队列；不扩大 KOL 复制范围。
+策略与交易对由用户自行排布，不因同账户存在 Grid 或库存做市实例而拒绝 KOL 激活，
+也不在 Grid/做市/手动操作之间设置交易对占用拦截。同账户同交易对只安排一个策略是用户约定，
+不是程序唯一约束。KOL 的签名空仓基线、唯一 KOL 归属、容量限制，以及全部命令的账户串行、
+订单归属、未决对账和新旧 writer 隔离仍保留，详见 [库存做市](INVENTORY_MM.md)。
 
 ## 6. 人工带单与订单同步
 

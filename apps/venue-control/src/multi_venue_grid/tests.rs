@@ -63,7 +63,6 @@ fn fixture() -> Result<
                 symbol: symbol.clone(),
                 order_notional: Amount::new(quote.clone(), Decimal::from(5)),
                 maximum_grid_notional: Amount::new(quote.clone(), Decimal::from(100)),
-                inventory_risk: None,
                 spacing_rate: Decimal::new(1, 2),
                 grid_count: 2,
                 replenishment: None,

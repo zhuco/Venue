@@ -10,8 +10,7 @@ use venue_domain::domain::{OrderSide, PositionSide, Symbol, is_canonical_trading
 pub const GRID_SCHEMA_VERSION: u16 = 1;
 pub const GRID_INSTANCES_PATH: &str = "/v2/grid/instances";
 pub const GRID_LIFECYCLE_PATH: &str = "/v2/grid/lifecycle";
-/// XRP's five-USDC inventory design needs up to eighty bounded price levels per Hedge leg.
-pub const MAX_GRID_LEVELS: u16 = 80;
+pub const MAX_GRID_LEVELS: u16 = 50;
 pub const MIN_GRID_STALENESS_MS: u64 = 500;
 pub const MAX_GRID_STALENESS_MS: u64 = 300_000;
 pub const MIN_GRID_CONVERGENCE_MS: u64 = 1_000;
@@ -28,16 +27,13 @@ pub struct GridConfig {
     pub grid_levels: u16,
     #[serde(with = "rust_decimal::serde::str")]
     pub max_total_notional: Decimal,
-    /// Optional inventory envelope for a new Grid.  Omission retains the behaviour of an
-    /// already-running legacy instance; a configured envelope is enforced against positions
-    /// and every currently executable order direction.
-    #[serde(default)]
-    pub inventory_risk: Option<GridInventoryRisk>,
-    /// A Grid with a configured value remains blocked until Binance returns this exact leverage
-    /// from a fresh signed position-risk read. Legacy instances omit the field and retain their
-    /// existing exchange setting.
-    #[serde(default)]
-    pub required_leverage: Option<u8>,
+    /// Retired extension: accept only the null persisted by earlier Grid saves. Non-null values
+    /// must fail deserialization rather than silently losing a previously requested risk gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_risk: Option<()>,
+    /// Null-only compatibility for the retired Grid leverage gate; inventory MM is independent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_leverage: Option<()>,
     pub inventory_replenishment: GridInventoryReplenishment,
     pub profit_reduction: GridProfitReduction,
     pub reset_policy: GridResetPolicy,
@@ -53,48 +49,12 @@ impl GridConfig {
         {
             return Err(GridProtocolError::Config);
         }
-        if let Some(risk) = &self.inventory_risk {
-            risk.validate(self.order_notional)?;
-        }
-        if self
-            .required_leverage
-            .is_some_and(|value| !(1..=125).contains(&value))
-        {
+        if self.inventory_risk.is_some() || self.required_leverage.is_some() {
             return Err(GridProtocolError::Config);
         }
         self.inventory_replenishment.validate()?;
         self.profit_reduction.validate()?;
         self.reset_policy.validate()?;
-        Ok(())
-    }
-}
-
-/// Quote-asset limits for a two-sided inventory Grid.  `max_total_notional` remains the
-/// historical cap on opening orders; these limits constrain realized legs and the worst case in
-/// which all same-direction resting orders execute before their counterparts do.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GridInventoryRisk {
-    #[serde(with = "rust_decimal::serde::str")]
-    pub max_leg_notional: Decimal,
-    #[serde(with = "rust_decimal::serde::str")]
-    pub max_gross_notional: Decimal,
-    #[serde(with = "rust_decimal::serde::str")]
-    pub max_net_notional: Decimal,
-}
-
-impl GridInventoryRisk {
-    fn validate(&self, order_notional: Decimal) -> Result<(), GridProtocolError> {
-        if !positive(self.max_leg_notional)
-            || !positive(self.max_gross_notional)
-            || !positive(self.max_net_notional)
-            || self.max_leg_notional < order_notional
-            || self.max_gross_notional < self.max_leg_notional
-            || self.max_net_notional < order_notional
-            || self.max_net_notional > self.max_leg_notional
-        {
-            return Err(GridProtocolError::Config);
-        }
         Ok(())
     }
 }
@@ -536,8 +496,41 @@ mod tests {
         assert_eq!(value.validate(), Err(GridProtocolError::Config));
 
         value = config();
-        value.required_leverage = Some(0);
+        value.required_leverage = Some(());
         assert_eq!(value.validate(), Err(GridProtocolError::Config));
+    }
+
+    #[test]
+    fn retired_grid_extensions_accept_only_legacy_nulls() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let expected = config();
+        let encoded = serde_json::to_value(&expected)?;
+        assert!(encoded.get("inventory_risk").is_none());
+        assert!(encoded.get("required_leverage").is_none());
+        assert_eq!(
+            serde_json::from_value::<GridConfig>(encoded.clone())?,
+            expected
+        );
+
+        let mut legacy = encoded.clone();
+        legacy["inventory_risk"] = serde_json::Value::Null;
+        legacy["required_leverage"] = serde_json::Value::Null;
+        assert_eq!(serde_json::from_value::<GridConfig>(legacy)?, expected);
+
+        for (field, value) in [
+            ("required_leverage", serde_json::json!(20)),
+            (
+                "inventory_risk",
+                serde_json::json!({
+                    "max_leg_notional": "400", "max_gross_notional": "800", "max_net_notional": "20"
+                }),
+            ),
+        ] {
+            let mut retired = encoded.clone();
+            retired[field] = value;
+            assert!(serde_json::from_value::<GridConfig>(retired).is_err());
+        }
+        Ok(())
     }
 
     #[test]

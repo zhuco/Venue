@@ -5,6 +5,7 @@ mod credentials;
 mod crypto;
 mod follow_requests;
 mod grid;
+mod inventory_mm;
 mod kol;
 mod leader_bot;
 mod managed_followers;

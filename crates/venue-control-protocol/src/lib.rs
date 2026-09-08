@@ -6,6 +6,7 @@
 pub mod accounts;
 pub mod follow_sizing;
 pub mod grid;
+pub mod inventory_mm;
 pub mod kol;
 pub mod leader_bot;
 pub mod managed_followers;

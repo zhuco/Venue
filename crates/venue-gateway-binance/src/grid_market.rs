@@ -37,6 +37,17 @@ impl BinanceGridMarketReader {
         credentials: &crate::BinanceCredentials,
         private_generation: u64,
     ) -> Result<(rust_decimal::Decimal, u64), BinanceAccountGatewayError> {
+        let (account, observed) = self.account_margin(credentials, private_generation).await?;
+        Ok((account.wallet_balance, observed))
+    }
+
+    /// Fresh signed PM account values. The caller must treat these values as USD, irrespective
+    /// of the historical AccountBalance asset label, and convert contract quote units explicitly.
+    pub async fn account_margin(
+        &self,
+        credentials: &crate::BinanceCredentials,
+        private_generation: u64,
+    ) -> Result<(venue_domain::domain::AccountBalance, u64), BinanceAccountGatewayError> {
         let rules = self
             .rules
             .as_ref()
@@ -64,11 +75,11 @@ impl BinanceGridMarketReader {
             .map_err(|_| BinanceAccountGatewayError::Readback)?;
         let account = crate::portfolio::parse_account_balance(payload)
             .map_err(|_| BinanceAccountGatewayError::Readback)?;
-        Ok((account.wallet_balance, response.received_at_ms))
+        Ok((account, response.received_at_ms))
     }
 
-    /// Reads the selected symbol's exact Hedge leverage with the same authenticated position-risk
-    /// endpoint that supplies the Grid's signed inventory. The reader never changes leverage.
+    /// Reads exact symbol configuration even when flat position-risk rows are omitted. Hedge
+    /// mode is verified independently by the private account gate. Never changes leverage.
     pub async fn symbol_leverage(
         &self,
         credentials: &crate::BinanceCredentials,
@@ -92,14 +103,14 @@ impl BinanceGridMarketReader {
         let scope =
             crate::BinancePrivateReadScope::new(&config, rules, private_generation, 1, observed)
                 .map_err(|_| BinanceAccountGatewayError::Readback)?;
-        let request = crate::build_positions_request(&scope)
+        let request = crate::readback::build_symbol_config_request(&scope)
             .map_err(|_| BinanceAccountGatewayError::Readback)?;
         let response = transport
             .execute_read(credentials, &request, observed)
             .await?;
         let payload = std::str::from_utf8(&response.payload)
             .map_err(|_| BinanceAccountGatewayError::Readback)?;
-        let leverage = crate::parse_signed_hedge_leverage(payload, scope.binding())
+        let leverage = crate::readback::parse_symbol_leverage(payload, scope.binding())
             .map_err(|_| BinanceAccountGatewayError::Readback)?;
         Ok((leverage, response.received_at_ms))
     }

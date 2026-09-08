@@ -73,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = PgExecutorStore::new(pool.clone());
     let projection_store = BinancePrivateProjectionStore::new(pool.clone());
     let grid_store = BinanceGridStore::new(pool.clone());
+    let mm_store = venue_control::inventory_mm::InventoryMmStore::new(pool.clone());
     let secrets = ExecutorSecretProvider::new(pool.clone(), CredentialCipher::from_environment()?);
     let hot_dispatch = GridHotDispatchCache::new();
     let exchange = BinanceExecutionRouter::with_hot_dispatch(
@@ -144,15 +145,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let grid_runtime = BinanceGridRuntime::with_private_stream(
         grid_store,
-        projection_store,
+        projection_store.clone(),
         BinanceTransportLimits::new(EXECUTOR_HTTP_TIMEOUT, EXECUTOR_MAX_RESPONSE_BYTES)?,
         grid_signal_rx,
         grid_recovery_tx,
-        command_wake,
+        command_wake.clone(),
         hot_dispatch,
     )
     .with_risk_credentials(secrets.clone());
     let grid_task = tokio::spawn(grid_runtime.run_until_shutdown(shutdown_rx.clone()));
+    let mm_runtime = venue_control::inventory_mm::InventoryMmRuntime::new(
+        mm_store,
+        projection_store,
+        secrets.clone(),
+        BinanceTransportLimits::new(EXECUTOR_HTTP_TIMEOUT, EXECUTOR_MAX_RESPONSE_BYTES)?,
+        command_wake,
+    );
+    let mm_task = tokio::spawn(mm_runtime.run_until_shutdown(shutdown_rx.clone()));
     let signal_shutdown = shutdown_tx.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -174,8 +183,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = runtime.run_until_shutdown(shutdown_rx).await;
     let _ = shutdown_tx.send(true);
     // Drain all mutation workers before propagating any sibling failure and dropping the lock.
-    let (clock_result, grid_result, mirror_result, strategy_result) =
-        tokio::join!(clock_task, grid_task, mirror_task, strategy_task);
+    let (clock_result, grid_result, mirror_result, strategy_result, mm_result) =
+        tokio::join!(clock_task, grid_task, mirror_task, strategy_task, mm_task);
+    mm_result??;
     strategy_result?;
     clock_result?;
     grid_result??;

@@ -244,6 +244,8 @@ impl BinancePrivateProjectionStore {
         .fetch_all(&self.pool)
         .await
         .map_err(|_| PrivateProjectionError::Unavailable)?;
+        let mm_rows=sqlx::query("SELECT i.owner_user_id,i.credential_id,i.trading_account_id,jsonb_agg(DISTINCT i.symbol ORDER BY i.symbol) AS symbols,p.projection_json FROM venue_inventory_mm_instances i JOIN venue_api_credentials c ON c.credential_id=i.credential_id AND c.user_id=i.owner_user_id AND c.trading_account_id=i.trading_account_id LEFT JOIN venue_binance_account_projections p ON p.credential_id=i.credential_id WHERE i.instance_state<>'stopped' AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' GROUP BY i.owner_user_id,i.credential_id,i.trading_account_id,p.projection_json ORDER BY i.credential_id LIMIT $1")
+            .bind(MAX_ACTIVE_PROJECTION_WORKERS).fetch_all(&self.pool).await.map_err(|_|PrivateProjectionError::Unavailable)?;
         let ui_rows = sqlx::query("SELECT s.owner_user_id,s.credential_id,s.trading_account_id,s.symbols,p.projection_json FROM venue_binance_projection_subscriptions s JOIN venue_api_credentials c ON c.credential_id=s.credential_id AND c.user_id=s.owner_user_id AND c.trading_account_id=s.trading_account_id LEFT JOIN venue_binance_account_projections p ON p.credential_id=s.credential_id WHERE s.expires_ms>$1 AND c.deleted_ms IS NULL AND c.verification_json->>'verification'='verified' ORDER BY s.requested_ms DESC,s.credential_id LIMIT $2")
             .bind(ms(now_ms)?)
             .bind(MAX_ACTIVE_PROJECTION_WORKERS)
@@ -267,7 +269,12 @@ impl BinancePrivateProjectionStore {
             let source = projection_source(&row, Some(kol_user_id))?;
             merge_projection_source(&mut by_credential, &mut priority, source)?;
         }
-        for row in follower_rows.into_iter().chain(grid_rows).chain(ui_rows) {
+        for row in follower_rows
+            .into_iter()
+            .chain(grid_rows)
+            .chain(mm_rows)
+            .chain(ui_rows)
+        {
             let source = projection_source(&row, None)?;
             merge_projection_source(&mut by_credential, &mut priority, source)?;
         }

@@ -10,6 +10,10 @@ use venue_control_protocol::{
         GRID_INSTANCES_PATH, GRID_LIFECYCLE_PATH, GridConfigUpdateRequest,
         GridInstanceCreateRequest, GridLifecycleRequest,
     },
+    inventory_mm::{
+        INVENTORY_MM_LIFECYCLE_PATH, INVENTORY_MM_PATH, INVENTORY_MM_PREFLIGHT_PATH,
+        InventoryMmCreateRequest, InventoryMmLifecycleRequest, InventoryMmPreflightRequest,
+    },
     kol::{
         FollowLifecycleRequest, FollowSettingsUpsertRequest, KOL_EXECUTION_STATUS_PATH,
         KOL_FOLLOW_LIFECYCLE_PATH, KOL_FOLLOW_SETTINGS_PATH, KOL_PROFILE_PATH,
@@ -102,6 +106,9 @@ where
                 | KOL_EXECUTION_STATUS_PATH
                 | GRID_INSTANCES_PATH
                 | GRID_LIFECYCLE_PATH
+                | INVENTORY_MM_PATH
+                | INVENTORY_MM_PREFLIGHT_PATH
+                | INVENTORY_MM_LIFECYCLE_PATH
                 | LEADER_BOT_PATH
                 | LEADER_BOT_LIFECYCLE_PATH
                 | LEADER_BOTS_PATH
@@ -355,6 +362,36 @@ async fn account_request(
         }
     }
     match (request.method, path) {
+        (Method::Get, INVENTORY_MM_PATH) => {
+            encode(&accounts.inventory_mm_instances(&principal).await?)
+        }
+        (Method::Post, INVENTORY_MM_PATH) => encode(
+            &accounts
+                .create_inventory_mm(
+                    &principal,
+                    decode::<InventoryMmCreateRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
+        (Method::Post, INVENTORY_MM_PREFLIGHT_PATH) => encode(
+            &accounts
+                .inventory_mm_preflight(
+                    &principal,
+                    decode::<InventoryMmPreflightRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
+        (Method::Post, INVENTORY_MM_LIFECYCLE_PATH) => encode(
+            &accounts
+                .inventory_mm_lifecycle(
+                    &principal,
+                    decode::<InventoryMmLifecycleRequest>(&request.body)?,
+                    now,
+                )
+                .await?,
+        ),
         (Method::Get, SUPPORT_MARTINGALE_INSTANCES_PATH) => {
             encode(&accounts.support_martingale_instances(&principal).await?)
         }

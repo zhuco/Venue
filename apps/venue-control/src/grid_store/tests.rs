@@ -1,6 +1,54 @@
 use super::*;
 
 #[test]
+fn inventory_mm_grid_start_preserves_queue_order_without_symbol_exclusion()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source = include_str!("../grid_store.rs");
+    let lifecycle = source
+        .split("pub async fn request_lifecycle(")
+        .nth(1)
+        .ok_or("missing lifecycle")?;
+    let instance_lock = lifecycle
+        .find("FOR UPDATE")
+        .ok_or("missing Grid row lock")?;
+    let queue_lock = lifecycle
+        .find("lock_account_command_queue(")
+        .ok_or("missing shared account lock")?;
+    assert!(instance_lock < queue_lock);
+    assert!(!lifecycle.contains("venue_inventory_mm_instances"));
+    assert!(lifecycle.contains("venue_control_strategy_scopes"));
+    Ok(())
+}
+
+#[test]
+fn inventory_mm_terminal_keeps_account_safety_without_strategy_exclusion() {
+    let terminal = include_str!("../accounts/terminal.rs").replace("\r\n", "\n");
+    let position = include_str!("../accounts/terminal/position_actions.rs").replace("\r\n", "\n");
+    assert!(!terminal.contains("reject_inventory_mm_symbol"));
+    assert!(!position.contains("reject_inventory_mm_symbol"));
+    assert!(terminal.contains("lock_account_command_queue("));
+    assert!(position.contains("lock_account_command_queue("));
+    assert!(terminal.contains("reject_legacy_writer("));
+    assert!(position.contains("reject_legacy_writer("));
+    assert!(terminal.contains("c.command_origin IN ('terminal','copy','grid','inventory_mm')"));
+}
+
+#[test]
+fn inventory_mm_allocation_does_not_replace_execution_identity_or_legacy_fences() {
+    let migration = crate::MIGRATION_0045;
+    assert!(!migration.contains("venue_inventory_mm_active_symbol"));
+    assert!(migration.contains("inventory_mm_command_identity FOREIGN KEY"));
+    assert!(migration.contains("venue_reject_legacy_scope_with_inventory_mm_trigger"));
+    assert!(migration.contains("TO venue_control_api"));
+    assert!(migration.contains("TO venue_binance_executor"));
+    let activation = include_str!("../executor_store/activation.rs");
+    assert!(!activation.contains("venue_inventory_mm_instances"));
+    assert!(!activation.contains("venue_binance_grid_instances"));
+    assert!(activation.contains("lock_account_command_queue("));
+    assert!(activation.contains("venue_control_strategy_scopes"));
+}
+
+#[test]
 fn migration_has_only_the_minimal_postgres_grid_boundary() {
     for required in [
         "venue_binance_grid_instances",

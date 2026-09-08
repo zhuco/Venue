@@ -41,51 +41,7 @@ impl Fixture {
             })
             .connect(&url)
             .await?;
-        for _ in 0..2 {
-            for migration in [
-                crate::MIGRATION_0001,
-                crate::MIGRATION_0002,
-                crate::MIGRATION_0003,
-                crate::MIGRATION_0004,
-                crate::MIGRATION_0005,
-                crate::MIGRATION_0006,
-                crate::MIGRATION_0007,
-                crate::MIGRATION_0008,
-                crate::MIGRATION_0009,
-                crate::MIGRATION_0010,
-                crate::MIGRATION_0011,
-                crate::MIGRATION_0012,
-                crate::MIGRATION_0013,
-                crate::MIGRATION_0014,
-                super::MIGRATION_0015,
-                crate::MIGRATION_0016,
-                crate::MIGRATION_0017,
-                crate::MIGRATION_0018,
-                crate::MIGRATION_0019,
-                crate::MIGRATION_0020,
-                crate::MIGRATION_0021,
-                crate::MIGRATION_0022,
-                crate::MIGRATION_0023,
-                crate::MIGRATION_0024,
-                crate::MIGRATION_0025,
-                crate::MIGRATION_0026,
-                crate::MIGRATION_0027,
-                crate::MIGRATION_0028,
-                crate::MIGRATION_0029,
-                crate::MIGRATION_0030,
-                crate::MIGRATION_0031,
-                crate::MIGRATION_0032,
-                crate::MIGRATION_0033,
-                crate::MIGRATION_0034,
-                crate::MIGRATION_0038,
-                crate::MIGRATION_0040,
-                crate::MIGRATION_0041,
-                crate::MIGRATION_0042,
-                crate::MIGRATION_0043,
-            ] {
-                sqlx::raw_sql(migration).execute(&pool).await?;
-            }
-        }
+        crate::install_control_schema(&pool).await?;
         let service = AccountService::new(pool.clone(), CredentialCipher::from_key(&[17; 32])?)?;
         Ok(Some(Self {
             pool,
@@ -101,6 +57,82 @@ impl Fixture {
             .await?;
         self.admin.close().await;
         Ok(())
+    }
+
+    pub async fn create_before_managed_credential_migration()
+    -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        let Some(url) = std::env::var("VENUE_CONTROL_TEST_DATABASE_URL").ok() else {
+            if std::env::var("VENUE_CONTROL_POSTGRES_REQUIRED")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                return Err("account PostgreSQL test database is required".into());
+            }
+            eprintln!("SKIP: account PostgreSQL test database is not configured");
+            return Ok(None);
+        };
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await?;
+        let schema = format!("venue_accounts_{}", crypto::opaque_id()?.replace('-', "_"));
+        admin
+            .execute(format!("CREATE SCHEMA {schema}").as_str())
+            .await?;
+        let search_path = schema.clone();
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .after_connect(move |connection, _| {
+                let sql = format!("SET search_path TO {search_path}");
+                Box::pin(async move {
+                    connection.execute(sql.as_str()).await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await?;
+        for migration in [
+            crate::MIGRATION_0001,
+            crate::MIGRATION_0002,
+            crate::MIGRATION_0003,
+            crate::MIGRATION_0004,
+            crate::MIGRATION_0005,
+            crate::MIGRATION_0006,
+            crate::MIGRATION_0007,
+            crate::MIGRATION_0008,
+            crate::MIGRATION_0009,
+            crate::MIGRATION_0010,
+            crate::MIGRATION_0011,
+            crate::MIGRATION_0012,
+            crate::MIGRATION_0013,
+            crate::MIGRATION_0014,
+            super::MIGRATION_0015,
+            crate::MIGRATION_0016,
+            crate::MIGRATION_0017,
+            crate::MIGRATION_0018,
+            crate::MIGRATION_0019,
+            crate::MIGRATION_0020,
+            crate::MIGRATION_0021,
+            crate::MIGRATION_0022,
+            crate::MIGRATION_0023,
+            crate::MIGRATION_0024,
+            crate::MIGRATION_0025,
+            crate::MIGRATION_0026,
+            crate::MIGRATION_0027,
+            crate::MIGRATION_0028,
+            crate::MIGRATION_0029,
+            crate::MIGRATION_0030,
+        ] {
+            sqlx::raw_sql(migration).execute(&pool).await?;
+        }
+        let service = AccountService::new(pool.clone(), CredentialCipher::from_key(&[17; 32])?)?;
+        Ok(Some(Self {
+            pool,
+            service,
+            admin,
+            schema,
+        }))
     }
 }
 pub fn now() -> u64 {

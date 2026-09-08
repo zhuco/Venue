@@ -1770,6 +1770,8 @@ struct Fixture {
     schema: String,
 }
 
+#[path = "support/inventory_mm.rs"]
+mod inventory_mm;
 #[path = "support/kol_fixture.rs"]
 mod kol_fixture;
 

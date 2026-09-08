@@ -91,6 +91,14 @@ pub struct PgExecutorStore {
 }
 
 impl PgExecutorStore {
+    /// Read-only admission snapshot; callers still need the account queue lock through dispatch.
+    pub async fn inventory_mm_dispatch_permitted(
+        &self,
+        command_id: &str,
+        now: u64,
+    ) -> Result<bool, BinanceCommandLedgerError> {
+        crate::inventory_mm::dispatch::permits(&self.pool, command_id, now).await
+    }
     pub(crate) async fn terminal_open_credential_verified(
         &self,
         command: &ClaimedBinanceCommand,

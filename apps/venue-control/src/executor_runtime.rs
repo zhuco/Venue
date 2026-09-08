@@ -735,6 +735,21 @@ where
     S: ExecutorCredentials + Sync,
 {
     let mut request = request(&command);
+    if command.origin == venue_control_protocol::kol::ExecutorCommandOrigin::InventoryMm
+        && !store
+            .inventory_mm_dispatch_permitted(&command.command_id, now_ms()?)
+            .await?
+    {
+        store
+            .transition_command(
+                &command.command_id,
+                ExecutorCommandState::Rejected,
+                now_ms()?,
+                Some("inventory_mm_dispatch_gate"),
+            )
+            .await?;
+        return Ok(drain_after_persisted_state(ExecutorCommandState::Rejected));
+    }
     let credentials = match if crate::executor_exchange::is_terminal_open(&request) {
         secrets.terminal_open_credentials(store, &command).await
     } else {
@@ -840,6 +855,23 @@ where
                 ExecutorCommandState::Rejected,
                 now_ms()?,
                 Some("mirror_authorization_changed"),
+            )
+            .await?;
+        return Ok(AccountDrainDecision::Continue);
+    }
+    // Credential loading and other read-only admission may take time. An MM quote must still
+    // match its durable lifecycle and private generation at the final dispatch boundary.
+    if command.origin == venue_control_protocol::kol::ExecutorCommandOrigin::InventoryMm
+        && !store
+            .inventory_mm_dispatch_permitted(&command.command_id, now_ms()?)
+            .await?
+    {
+        store
+            .transition_command(
+                &command.command_id,
+                ExecutorCommandState::Rejected,
+                now_ms()?,
+                Some("inventory_mm_dispatch_gate"),
             )
             .await?;
         return Ok(AccountDrainDecision::Continue);
@@ -1231,9 +1263,10 @@ fn require_signed_mirror_fact(
     command: &ClaimedBinanceCommand,
     mut result: ExecutionOutcome,
 ) -> ExecutionOutcome {
-    let requires_exact_fact = (command.origin
-        == venue_control_protocol::kol::ExecutorCommandOrigin::Copy
-        && !matches!(command.order, ClaimedBinanceOrder::Market { .. }))
+    let requires_exact_fact = command.origin
+        == venue_control_protocol::kol::ExecutorCommandOrigin::InventoryMm
+        || (command.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Copy
+            && !matches!(command.order, ClaimedBinanceOrder::Market { .. }))
         || (command.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Terminal
             && matches!(
                 command.order,

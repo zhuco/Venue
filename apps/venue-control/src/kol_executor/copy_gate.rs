@@ -86,6 +86,7 @@ pub(super) async fn lock_account_claim(
     if credentials.is_empty() {
         return Err(BinanceCommandLedgerError::Conflict);
     }
+    crate::inventory_mm::dispatch::retire_pending(connection, trading_account_id, now).await?;
     sqlx::query(
         "UPDATE venue_binance_commands c SET command_state='cancelled',terminal_ms=$2,updated_ms=$2,\
          sanitized_error_code='copy_revision_retired' \

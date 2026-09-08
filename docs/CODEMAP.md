@@ -24,7 +24,7 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 | 共享 Executor：私有投影、人工带单、Grid 与独立策略调度 | `apps/venue-control/src/bin/venue-executor-binance.rs` |
 | Executor 只读账户及未决命令检查 | `apps/venue-control/src/executor_runtime/inspection.rs`；`venue-executor-binance inspect-account CREDENTIAL SYMBOL`，只读数据库与签名查询，不启动调度 |
 | 带单授权、撤权及仅迁移命令 | `apps/venue-control/src/bin/venue-leader-bot-admin.rs`、`apps/venue-control/src/leader_bot_admin.rs` |
-| 版本化迁移及校验 | `apps/venue-control/src/schema.rs`、`apps/venue-control/migrations/`；当前安装至 0041 |
+| 版本化迁移及校验 | `apps/venue-control/src/schema.rs`、`apps/venue-control/migrations/`；源码迁移至 0045，部署版本须读取目标数据库确认 |
 | 本地受控构建与缓存准入 | `scripts/Invoke-VenueBuild.ps1`、`scripts/venue_build_guard.ps1` |
 | Ubuntu Control/Executor/管理员工具打包 | `scripts/Build-VenueUbuntu.ps1`；`-Component Control` |
 | CI、源码卫生及依赖边界 | `.github/workflows/workspace-gates.yml`、`scripts/verify_repository_hygiene.ps1`、`scripts/verify_workspace_policy.ps1` |
@@ -79,6 +79,17 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 | 公开规则、标记价及必要汇率事实 | `crates/venue-gateway-binance/src/grid_market.rs` |
 
 调用链见 [架构中的 Grid 流程](ARCHITECTURE.md#grid-flow)。旧恢复工件与迁入删除门见 [GRID_RUNTIME_REFACTOR](GRID_RUNTIME_REFACTOR.md#81-旧迁移代码删除门)。性能目标不以代码中的周期或历史测试结果代替实测。
+
+## Binance 库存做市
+
+独立于 Grid，行为与实盘准入见 [库存做市契约](INVENTORY_MM.md)。
+
+| 功能 | 首要入口 |
+|---|---|
+| 双报价、库存偏移、波动与风险退出 | `crates/venue-strategies/src/inventory_mm/` |
+| 独立配置及启动/停止协议 | `crates/venue-control-protocol/src/inventory_mm.rs` |
+| 实例、命令归属、取消确认及单例协调 | `apps/venue-control/src/inventory_mm/`；迁移 `0045_inventory_mm.sql` |
+| 本人 API 与签名预检 | `apps/venue-control/src/accounts/inventory_mm.rs` |
 
 ## 桌面与 Web
 

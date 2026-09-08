@@ -23,10 +23,10 @@ use venue_gateway_binance::{
 };
 use venue_strategies::hedged_grid::{
     GridCloseReservations, GridConvergenceFacts, GridExposureReduction, GridInstrumentLimits,
-    GridInventoryAdjustment, GridInventoryRiskPolicy, GridMakerFill, GridOrderIntent, GridOrderKey,
-    GridPlanDirective, GridPlanner, GridPlannerConfig, GridPlannerControl, GridPlannerInput,
-    GridPosition, GridProfitReductionPolicy, GridReferencePrice, GridReplenishmentPolicy,
-    GridResetPolicy, GridRiskConversion, GridRiskFacts, GridRollingAnchor,
+    GridInventoryAdjustment, GridMakerFill, GridOrderIntent, GridOrderKey, GridPlanDirective,
+    GridPlanner, GridPlannerConfig, GridPlannerControl, GridPlannerInput, GridPosition,
+    GridProfitReductionPolicy, GridReferencePrice, GridReplenishmentPolicy, GridResetPolicy,
+    GridRiskConversion, GridRiskFacts, GridRollingAnchor,
 };
 
 use crate::{
@@ -386,20 +386,6 @@ impl BinanceGridRuntime {
         {
             position.mark_price = Some(reference.price.value());
         }
-        match self.required_leverage_matches(&record, &projection).await {
-            Ok(true) => {}
-            Ok(false) => {
-                self.block_if_running(&record, "leverage_mismatch", now)
-                    .await?;
-                return Ok(false);
-            }
-            Err(error) => {
-                tracing::warn!(target: "venue_control::grid_hot_path", %error, "Grid leverage verification unavailable");
-                self.block_if_running(&record, "leverage_unavailable", now)
-                    .await?;
-                return Ok(false);
-            }
-        }
         self.add_command_reservations(&record, &projection, &mut actual)
             .await?;
         let private = private_facts(&record, &projection, &actual)?;
@@ -661,32 +647,6 @@ impl BinanceGridRuntime {
             })?;
         self.hot_path.cache_market(id, facts.clone());
         Ok(facts)
-    }
-
-    async fn required_leverage_matches(
-        &self,
-        record: &GridRuntimeRecord,
-        projection: &TerminalAccountProjection,
-    ) -> Result<bool, BinanceGridRuntimeError> {
-        let Some(required) = record.instance.config.required_leverage else {
-            return Ok(true);
-        };
-        let credentials = self
-            .risk_credentials
-            .as_ref()
-            .ok_or(BinanceGridRuntimeError::Facts)?
-            .load(&record.instance.credential_id, &record.owner_user_id)
-            .await
-            .map_err(|_| BinanceGridRuntimeError::Facts)?;
-        let reader = self
-            .markets
-            .get(&record.instance.instance_id)
-            .ok_or(BinanceGridRuntimeError::Market)?;
-        let (actual, observed_ms) = reader
-            .symbol_leverage(&credentials, projection.private_generation)
-            .await
-            .map_err(|_| BinanceGridRuntimeError::Facts)?;
-        Ok(observed_ms >= projection.observed_ms && actual == required)
     }
 
     async fn apply_converge(
@@ -1433,14 +1393,6 @@ fn planner_config(
         symbol: record.instance.symbol.clone(),
         order_notional: Amount::new(quote.clone(), config.order_notional),
         maximum_grid_notional: Amount::new(quote.clone(), config.max_total_notional),
-        inventory_risk: config
-            .inventory_risk
-            .as_ref()
-            .map(|risk| GridInventoryRiskPolicy {
-                max_leg_notional: Amount::new(quote.clone(), risk.max_leg_notional),
-                max_gross_notional: Amount::new(quote.clone(), risk.max_gross_notional),
-                max_net_notional: Amount::new(quote.clone(), risk.max_net_notional),
-            }),
         spacing_rate: config.spacing_rate,
         grid_count: u8::try_from(config.grid_levels).map_err(|_| BinanceGridRuntimeError::Facts)?,
         replenishment: config
