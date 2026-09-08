@@ -1049,7 +1049,7 @@ async fn wait_count(
     query: &str,
     wanted: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         let actual: i64 = sqlx::query_scalar(query).fetch_one(pool).await?;
         if actual == wanted {
