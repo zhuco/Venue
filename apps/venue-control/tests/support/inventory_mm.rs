@@ -42,7 +42,7 @@ async fn inventory_mm_postgres_lifecycle_commands_and_fences()
         .bind(&credential)
         .bind(serde_json::json!({"credential_id":credential,"label":"fixture","venue":"binance","masked_key":"***","trading_account_id":account,"verification":"verified","verified_ms":now-1,"expires_ms":now+60000,"api_reachable":true,"dual_position":true,"account_mode":"portfolio_margin","has_exposure":false,"equity":"1000","available_margin":"1000","balance_observed_ms":now-1}))
         .execute(&fixture.pool).await?;
-    let projection = serde_json::json!({"stream_healthy":true,"projection":{"schema_version":1,"credential_id":credential,"trading_account_id":account,"observed_ms":now,"persisted_ms":now,"private_generation":7,"position_mode":"hedge","positions":[],"open_orders":[],"conditional_orders":[],"fills":[],"assets":[]}});
+    let projection = serde_json::json!({"fills_cursor":"fixture","stream_healthy":true,"projection":{"schema_version":1,"credential_id":credential,"trading_account_id":account,"observed_ms":now,"persisted_ms":now,"private_generation":7,"position_mode":"hedge","positions":[],"open_orders":[],"conditional_orders":[],"fills":[],"assets":[]}});
     sqlx::query("INSERT INTO venue_binance_account_projections(credential_id,owner_user_id,trading_account_id,observed_ms,persisted_ms,private_generation,projection_json) VALUES($1,$2,$3,$4,$4,7,$5)")
         .bind(&credential).bind(&user).bind(&account).bind(i64::try_from(now)?).bind(projection).execute(&fixture.pool).await?;
 
@@ -92,6 +92,50 @@ async fn inventory_mm_postgres_lifecycle_commands_and_fences()
     assert_eq!(
         pending.state,
         venue_control_protocol::inventory_mm::InventoryMmState::StartPending
+    );
+    let projections =
+        venue_control::private_projection::BinancePrivateProjectionStore::new(fixture.pool.clone());
+    projections.invalidate_stream(&credential).await?;
+    let mut runtime = venue_control::inventory_mm::InventoryMmRuntime::new(
+        store.clone(),
+        projections.clone(),
+        venue_control::executor_secret::ExecutorSecretProvider::new(
+            fixture.pool.clone(),
+            CredentialCipher::from_key(&[42; 32])?,
+        ),
+        venue_gateway_binance::BinanceTransportLimits::new(
+            std::time::Duration::from_secs(1),
+            4096,
+        )?,
+        venue_control::executor_runtime::CommandWake::default(),
+    );
+    for _ in 0..2 {
+        runtime.run_once().await?;
+        let waiting = store.get(&user, &instance.instance_id).await?;
+        assert_eq!(
+            waiting.state, pending.state,
+            "a transient stream gap must not latch startup"
+        );
+        assert_eq!(waiting.revision, pending.revision);
+        assert!(waiting.attention.is_none());
+        assert!(
+            store.commands(&instance.instance_id).await?.is_empty(),
+            "recovery must never enqueue quotes"
+        );
+        assert!(
+            projections
+                .load_healthy_owned(&user, &credential)
+                .await?
+                .is_none()
+        );
+    }
+    sqlx::query("UPDATE venue_binance_account_projections SET projection_json=jsonb_set(projection_json,'{stream_healthy}','true'::jsonb) WHERE credential_id=$1")
+        .bind(&credential).execute(&fixture.pool).await?;
+    assert!(
+        projections
+            .load_healthy_owned(&user, &credential)
+            .await?
+            .is_some()
     );
     store
         .mark_running(&pending, Decimal::new(1000, 0), now + 1)
