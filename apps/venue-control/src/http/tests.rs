@@ -895,6 +895,30 @@ async fn account_node_projection_requires_a_valid_contiguous_idempotent_envelope
 }
 
 #[tokio::test]
+async fn martingale_preflight_enters_account_dispatch_without_a_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (stop, shutdown) = control_shutdown_channel();
+    let task = tokio::spawn(serve_local(
+        listener,
+        Arc::new(ControlService::new(TestRepository::default())),
+        ControlHttpConfig::default(),
+        shutdown,
+    ));
+    let response = request(
+        address,
+        &post_path(
+            venue_control_protocol::support_martingale::SUPPORT_MARTINGALE_PREFLIGHT_PATH,
+            br#"{"schema_version":1,"instance_id":"sm-1","expected_revision":1}"#,
+        ),
+    )
+    .await?;
+    assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+    stop_server(stop, task).await
+}
+
+#[tokio::test]
 async fn non_loopback_listener_is_rejected_before_accepting_clients()
 -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("0.0.0.0:0").await?;

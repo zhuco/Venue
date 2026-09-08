@@ -126,6 +126,7 @@ where
                 | MANAGED_VERIFY_PATH
                 | MANAGED_DELETE_PATH
                 | SUPPORT_MARTINGALE_INSTANCES_PATH
+                | SUPPORT_MARTINGALE_PREFLIGHT_PATH
                 | SUPPORT_MARTINGALE_LIFECYCLE_PATH
         )
         || path.starts_with(SUPPORT_MARTINGALE_DETAIL_PREFIX)
