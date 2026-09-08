@@ -1,5 +1,26 @@
 use super::*;
 
+pub(super) fn tracks_exact_order_fact(
+    origin: venue_control_protocol::kol::ExecutorCommandOrigin,
+) -> bool {
+    matches!(
+        origin,
+        venue_control_protocol::kol::ExecutorCommandOrigin::Copy
+            | venue_control_protocol::kol::ExecutorCommandOrigin::InventoryMm
+    )
+}
+
+// Both immediate and resumed exact reads have already verified native identity and order shape.
+// MM's dispatcher requires the same cumulative fact as copying; an ACK alone remains unknown.
+pub(super) fn signed_limit_outcome(
+    request: &ExecutionRequest,
+    order: &venue_domain::domain::Order,
+) -> Option<ExecutionOutcome> {
+    (tracks_exact_order_fact(request.origin)
+        && matches!(request.order_kind, ExecutionOrderKind::Limit { .. }))
+    .then(|| mirror_order_outcome(order, false))
+}
+
 impl BinanceHttpExecution {
     pub(super) async fn read_mirror_cancel_fact(
         &mut self,

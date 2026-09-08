@@ -41,7 +41,7 @@ mod drain;
 pub use drain::LimitAbsenceFuture;
 mod market;
 mod mirror;
-use mirror::mirror_order_outcome;
+use mirror::{mirror_order_outcome, signed_limit_outcome, tracks_exact_order_fact};
 mod mock;
 pub use mock::MockBinanceExecution;
 mod prices;
@@ -886,10 +886,8 @@ impl BinanceHttpExecution {
                 if exact_place_matches(request, &readback.order, &rules) != Ok(true) {
                     return Ok(outcome(ExecutionReadback::Unknown, Some(ack.order_id)));
                 }
-                if request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Copy
-                    && matches!(request.order_kind, ExecutionOrderKind::Limit { .. })
-                {
-                    return Ok(mirror_order_outcome(&readback.order, false));
+                if let Some(result) = signed_limit_outcome(request, &readback.order) {
+                    return Ok(result);
                 }
                 match place_readback_decision(readback.order.state, readback.order.filled_quantity)
                 {
@@ -965,7 +963,7 @@ impl BinanceHttpExecution {
         let Some((native_order_id, target_client_order_id)) =
             cancel_target(before, selected_native_order_id, selected_client_order_id)?
         else {
-            if request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Copy
+            if tracks_exact_order_fact(request.origin)
                 || (request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Terminal
                     && selected_client_order_id.is_some())
             {
@@ -1020,7 +1018,7 @@ impl BinanceHttpExecution {
                 } else {
                     ExecutionReadback::Accepted
                 };
-                if request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Copy
+                if tracks_exact_order_fact(request.origin)
                     || (request.origin
                         == venue_control_protocol::kol::ExecutorCommandOrigin::Terminal
                         && selected_client_order_id.is_some())
@@ -1040,7 +1038,7 @@ impl BinanceHttpExecution {
         credentials: BinanceCredentials,
     ) -> Result<ExecutionOutcome, BinanceExecutionError> {
         let snapshot = self.snapshot(request, &credentials).await?;
-        if request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Copy
+        if tracks_exact_order_fact(request.origin)
             || (request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Terminal
                 && selected_client_order_id.is_some())
         {
@@ -1115,10 +1113,8 @@ impl BinanceHttpExecution {
             Err(error) => return Err(error),
         };
         let native_order_id = order.order_id.clone();
-        if request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Copy
-            && matches!(request.order_kind, ExecutionOrderKind::Limit { .. })
-        {
-            return Ok(mirror_order_outcome(&order, false));
+        if let Some(result) = signed_limit_outcome(request, &order) {
+            return Ok(result);
         }
         let state = match place_readback_decision(order.state, order.filled_quantity) {
             PlaceReadbackDecision::Unknown => ExecutionReadback::Unknown,
