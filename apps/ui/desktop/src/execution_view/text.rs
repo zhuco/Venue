@@ -35,7 +35,6 @@ pub enum Key {
     MarketWarning,
     StrategyWarning,
     AccountChanged,
-    Confirm,
     Cancel,
     State,
     Reason,
@@ -47,9 +46,6 @@ pub enum Key {
     Asset,
     Equity,
     Available,
-    OrderHistoryScope,
-    FillsScope,
-    PositionHistoryScope,
     AssetsScope,
 }
 
@@ -99,26 +95,22 @@ pub fn text(language: Language, key: Key) -> &'static str {
         Key::CloseConfirm => ("市价平仓", "Market close"),
         Key::ReverseConfirm => ("市价反开", "Market reverse"),
         Key::CloseExplain => (
-            "按该行数量市价平仓；仓位已减少时只平剩余数量。",
-            "Close this row at market, capped to the remaining position.",
+            "市价平仓，最多平掉当前剩余数量。",
+            "Close at market, up to the remaining quantity.",
         ),
         Key::ReverseExplain => (
-            "先平掉该行仓位，确认平仓后按实际平掉的数量反向开仓。已有反向仓位会被追加。",
-            "Close this leg first, then open the opposite leg for the confirmed closed quantity. Existing opposite exposure will increase.",
+            "先平仓，再按实平数量反向开仓。已有反向仓位会追加，开仓可能失败。",
+            "Close first, then reverse the filled quantity. Adds to an existing opposite position; reopening may fail.",
         ),
-        Key::MarketWarning => (
-            "市价成交可能滑点；反开是两笔交易，不能保证同时成功。",
-            "Market orders may slip. Reversal uses two orders; both are not guaranteed to succeed.",
-        ),
+        Key::MarketWarning => ("成交价可能滑点。", "Execution price may slip."),
         Key::StrategyWarning => (
-            "不会撤销挂单或停止网格；运行中的策略可能再次建仓。",
-            "Open orders and running strategies are unchanged; a strategy may reopen exposure.",
+            "挂单和策略继续运行，可能再次建仓。",
+            "Orders and strategies remain active and may reopen positions.",
         ),
         Key::AccountChanged => (
-            "执行账户已切换，请取消并重新选择持仓。",
-            "Execution account changed. Cancel and select the position again.",
+            "账户已切换，请重新选择持仓。",
+            "Account changed. Select the position again.",
         ),
-        Key::Confirm => ("确认提交", "Confirm"),
         Key::Cancel => ("取消", "Cancel"),
         Key::State => ("状态", "State"),
         Key::Reason => ("异常原因", "Failure reason"),
@@ -130,18 +122,6 @@ pub fn text(language: Language, key: Key) -> &'static str {
         Key::Asset => ("资产", "Asset"),
         Key::Equity => ("权益", "Equity"),
         Key::Available => ("可用保证金", "Available margin"),
-        Key::OrderHistoryScope => (
-            "仅显示 Venue 命令记录；已提交或已接受不代表已成交。外部历史委托不在此列表。",
-            "Venue command records only; submitted or accepted does not mean filled. External order history is not included.",
-        ),
-        Key::FillsScope => (
-            "仅显示网关账户流及签名补查已投影的最近成交，不代表完整账户历史。",
-            "Shows only recent fills projected from the gateway stream and signed recovery.",
-        ),
-        Key::PositionHistoryScope => (
-            "最近 500 条仓位变更，数量为 0 表示该腿已平；不包含绑定前完整历史或已实现盈亏。",
-            "Last 500 observed position changes; zero quantity means that leg closed. Not full pre-binding history or realized PnL.",
-        ),
         Key::AssetsScope => (
             "最近一次签名资产快照；USD 是统一账户计价，不等于 USDC 余额。资产不随仓位事件实时刷新。",
             "Latest signed asset snapshot. USD is portfolio valuation, not a USDC balance. Position events do not refresh balances.",

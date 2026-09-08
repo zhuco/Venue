@@ -1,5 +1,7 @@
 /bak/
 /target/
+/dist/
+/apps/ui/web/dist/
 /target-*/
 /.codex-target-*/
 /.codex-local-toolchain/

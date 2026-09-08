@@ -1,6 +1,6 @@
 # VENUE 架构
 
-本文描述 alpha.28 的代码结构与当前发布范围；功能入口见 [CODEMAP](CODEMAP.md)，产品行为和验收以 [KOL MVP](KOL_COPY_MVP.md)、[人工带单](LEADER_ORDER_MIRROR.md) 和 [Grid 契约](GRID_RUNTIME_REFACTOR.md) 为准。部署状态须读取实际运行版本，不能由源码或标签推断。
+本文描述当前 v0.1.0 源码的代码结构与发布范围；功能入口见 [CODEMAP](CODEMAP.md)，产品行为和验收以 [KOL MVP](KOL_COPY_MVP.md)、[人工带单](LEADER_ORDER_MIRROR.md) 和 [Grid 契约](GRID_RUNTIME_REFACTOR.md) 为准。部署状态须读取实际运行版本，不能由源码或标签推断。
 
 ## 1. 产品范围
 
@@ -8,7 +8,7 @@
 
 Binance KOL、桌面终端和 Binance Grid 面向 Portfolio Margin UM 双向持仓账户，提供 KOL 人工带单、桌面终端与事实驱动对冲网格。人工带单同步普通限价单、经认证身份确认的市价单和 `STOP_MARKET` 止损单。初期最多 5 个启用 KOL、200 个启用跟随账户；收费结算、策略广场、跨交易所跟单和多 Executor 分片不在本版范围。
 
-五所独立策略与网格走 `multi_venue_*` 和 `DurableAccountGateway`；支撑分批做多当前以 Binance 为参考行情、Bybit LIVE 为执行所。它们已纳入 alpha.28，具体准入和增强门分别见 [多交易所执行](MULTI_VENUE_EXECUTOR.md) 与 [支撑分批做多](SUPPORT_MARTINGALE.md)。旧 Node/Actor/WAL 继续保留冻结兼容边界。
+五所独立策略与网格走 `multi_venue_*` 和 `DurableAccountGateway`；支撑分批做多当前以 Binance 为参考行情、Bybit LIVE 为执行所。它们属于当前源码，具体准入和增强门分别见 [多交易所执行](MULTI_VENUE_EXECUTOR.md) 与 [支撑分批做多](SUPPORT_MARTINGALE.md)。旧 Node/Actor/WAL 继续保留冻结兼容边界。
 
 ## 2. 进程与职责
 

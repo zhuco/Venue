@@ -25,6 +25,7 @@ pub(crate) fn draw(
     scale: usize,
     font_size: u8,
     language: Language,
+    readout_y: f32,
 ) {
     if !settings.enabled {
         return;
@@ -142,7 +143,7 @@ pub(crate) fn draw(
     }
     let mut job = egui::text::LayoutJob::default();
     let format = egui::TextFormat {
-        font_id: FontId::monospace(f32::from(font_size)),
+        font_id: FontId::proportional(f32::from(font_size)),
         color: theme::TEXT_SECONDARY,
         ..Default::default()
     };
@@ -194,7 +195,7 @@ pub(crate) fn draw(
         );
     }
     painter.galley(
-        rect.left_top() + egui::vec2(6.0, 44.0),
+        rect.left_top() + egui::vec2(6.0, readout_y),
         painter.layout_job(job),
         theme::TEXT_PRIMARY,
     );

@@ -19,6 +19,7 @@ function Assert-GuardThrows([scriptblock]$Action,[string]$Pattern) {
 $repo = Split-Path -Parent $PSScriptRoot
 $first = Get-VenueBuildPlan -RepoRoot $repo
 $second = Get-VenueBuildPlan -RepoRoot $repo
+Assert-GuardTest ($first.BudgetBytes -eq 200GB) 'Local budget matches the authorized 200 GiB policy'
 Assert-GuardTest ($first.TargetDirectory -eq $second.TargetDirectory) 'Stable cache selection'
 Assert-GuardTest ($first.TargetDirectory -in @('G:\Build\Venue\main','G:\Build\Venue\slot-1','G:\Build\Venue\slot-2')) 'Only three targets'
 Assert-GuardThrows { Get-VenueBuildPlan -RepoRoot $repo -RequestedTarget 'G:\Build\Venue\new-target-12345' } 'Arbitrary target'
@@ -61,7 +62,7 @@ try {
     $script:fixturePlan.MinimumGuestFree = 0
     [IO.File]::WriteAllText((Join-Path $fixture 'budget-fixture.txt'),'budget-fixture')
     $script:fixturePlan.BudgetBytes = 1
-    Assert-GuardThrows { Enter-VenueBuildGuard -RepoRoot $repo -WaitSeconds 0 } '1 GiB'
+    Assert-GuardThrows { Enter-VenueBuildGuard -RepoRoot $repo -WaitSeconds 0 } 'cache admission budget'
     Assert-GuardTest (-not (Test-Path -LiteralPath $script:fixturePlan.GuardDirectory)) 'Budget failure occurs before creating locks or starting work'
     $script:fixturePlan.BudgetBytes = 150GB
 

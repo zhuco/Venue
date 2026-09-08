@@ -50,16 +50,16 @@ pub fn show(
     let mode_id = ui.make_persistent_id(("venueflow-book-mode", instance));
     let mut mode = ui.data(|data| data.get_temp::<BookMode>(mode_id).unwrap_or_default());
     ui.horizontal(|ui| {
-        mode_button(ui, &mut mode, BookMode::Both, "▥", theme::BRAND);
-        mode_button(ui, &mut mode, BookMode::Bids, "▤", theme::BUY);
-        mode_button(ui, &mut mode, BookMode::Asks, "▤", theme::SELL);
+        mode_button(ui, &mut mode, BookMode::Both, theme::BRAND);
+        mode_button(ui, &mut mode, BookMode::Bids, theme::BUY);
+        mode_button(ui, &mut mode, BookMode::Asks, theme::SELL);
         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
             let precision = inferred_price_step(asks, bids)
                 .map(|step| model.format_market_price(symbol, step))
                 .unwrap_or_else(|| "—".to_owned());
             ui.label(
                 RichText::new(format!("{precision} ▾"))
-                    .monospace()
+                    .family(egui::FontFamily::Proportional)
                     .size(11.0),
             )
             .on_hover_text(text(language, TextKey::PricePrecision));
@@ -137,20 +137,43 @@ fn section_title(ui: &mut egui::Ui, title: &str) {
     ui.separator();
 }
 
-fn mode_button(
-    ui: &mut egui::Ui,
-    mode: &mut BookMode,
-    candidate: BookMode,
-    icon: &str,
-    color: Color32,
-) {
-    if ui
-        .selectable_label(
+fn mode_button(ui: &mut egui::Ui, mode: &mut BookMode, candidate: BookMode, color: Color32) {
+    let response = ui.add(
+        egui::Button::new("")
+            .min_size(egui::vec2(28.0, 24.0))
+            .selected(*mode == candidate),
+    );
+    let label = match candidate {
+        BookMode::Both => "买卖盘口 / Both sides",
+        BookMode::Bids => "买盘 / Bids",
+        BookMode::Asks => "卖盘 / Asks",
+    };
+    let response = response.on_hover_text(label);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
             *mode == candidate,
-            RichText::new(icon).color(color).size(15.0),
+            label,
         )
-        .clicked()
-    {
+    });
+    let origin = response.rect.center() - egui::vec2(7.0, 6.0);
+    for row in 0..3 {
+        let tint = if candidate == BookMode::Both {
+            if row == 0 { theme::SELL } else { theme::BUY }
+        } else {
+            color
+        };
+        let y = origin.y + row as f32 * 5.0;
+        for (offset, width) in [(0.0, 3.0), (5.0, 9.0)] {
+            ui.painter().rect_filled(
+                Rect::from_min_size(Pos2::new(origin.x + offset, y), egui::vec2(width, 3.0)),
+                0.75,
+                tint,
+            );
+        }
+    }
+    if response.clicked() {
         *mode = candidate;
     }
 }
@@ -288,7 +311,7 @@ fn book_row(
             egui::StrokeKind::Inside,
         );
     }
-    let font = FontId::monospace(11.5);
+    let font = FontId::proportional(12.0);
     if own_order {
         painter.circle_filled(
             Pos2::new(rect.left() + 3.0, rect.center().y),
@@ -343,7 +366,7 @@ fn price_mid_row(
             rect.left_center(),
             Align2::LEFT_CENTER,
             format!("{} {arrow}", model.format_market_price(symbol, price)),
-            FontId::monospace(20.0),
+            FontId::proportional(20.0),
             color,
         );
     }
@@ -352,7 +375,7 @@ fn price_mid_row(
             Pos2::new(rect.left() + rect.width() * 0.46, rect.center().y),
             Align2::LEFT_CENTER,
             model.format_market_price(symbol, midpoint),
-            FontId::monospace(11.0),
+            FontId::proportional(11.0),
             theme::TEXT_SECONDARY,
         );
     }
@@ -436,7 +459,7 @@ fn trade_row(ui: &mut egui::Ui, trade: &UiTrade, model: &AppModel, symbol: &str)
         ui.painter()
             .rect_filled(rect, 0.0, Color32::from_white_alpha(10));
     }
-    let font = FontId::monospace(11.0);
+    let font = FontId::proportional(11.0);
     ui.painter().text(
         rect.left_center(),
         Align2::LEFT_CENTER,

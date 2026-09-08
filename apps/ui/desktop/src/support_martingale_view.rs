@@ -10,6 +10,7 @@ use crate::{
     theme,
 };
 use eframe::egui;
+use venue_control_protocol::VenueId;
 use venue_control_protocol::{
     accounts::CredentialSummary,
     support_martingale::{
@@ -19,7 +20,6 @@ use venue_control_protocol::{
         SupportMartingalePreflightCheckStatus as CheckStatus, SupportMartingalePreflightResponse,
     },
 };
-use venue_gateway_api::VenueId;
 
 const PREFLIGHT_DISPLAY_TTL_MS: u64 = 60_000;
 
@@ -27,6 +27,7 @@ const PREFLIGHT_DISPLAY_TTL_MS: u64 = 60_000;
 struct Editor {
     credential_id: String,
     trading_account_id: String,
+    execution_venue: VenueId,
     symbols: String,
     total_budget: String,
     first_order_notional: String,
@@ -64,6 +65,7 @@ impl Editor {
         Self {
             credential_id: credential.credential_id.clone(),
             trading_account_id: account_id.to_owned(),
+            execution_venue: credential.venue,
             symbols: "SOL/USDT,DOGE/USDT".into(),
             total_budget: "30".into(),
             first_order_notional: "5".into(),
@@ -132,7 +134,7 @@ impl Editor {
                 })
                 .collect::<Result<Vec<_>, String>>()?,
             reference_venue: VenueId::Binance,
-            execution_venue: VenueId::Bybit,
+            execution_venue: self.execution_venue,
             symbols,
             total_budget: decimal(&self.total_budget)?,
             first_order_notional: decimal(&self.first_order_notional)?,
@@ -245,7 +247,7 @@ impl SupportMartingaleViewState {
 }
 
 pub(crate) fn can_create(model: &AppModel, credential: &CredentialSummary) -> bool {
-    credential.venue == VenueId::Bybit
+    matches!(credential.venue, VenueId::Bybit | VenueId::Bitget)
         && credential.trading_account_id.is_some()
         && credential.selectable(crate::account_center::now_ms())
         && !model.execution.support_martingale.is_pending()
@@ -638,7 +640,10 @@ fn editor(
             egui::ScrollArea::vertical()
                 .max_height((ui.ctx().content_rect().height() - 160.0).clamp(120.0, 420.0))
                 .show(ui, |ui| {
-                    ui.label("参考行情固定为 Binance USD-M；当前执行所为 Bybit LIVE。");
+                    ui.label(format!(
+                        "参考行情固定为 Binance USD-M；当前执行所为 {} LIVE。",
+                        draft.execution_venue.as_str()
+                    ));
                     for (label, value) in [
                         ("交易对（逗号分隔）", &mut draft.symbols),
                         ("总名义预算", &mut draft.total_budget),
@@ -863,6 +868,14 @@ mod tests {
     #[test]
     fn default_config_accepts_bound_two_symbol_account() {
         assert!(Editor::create(&credential(), "account").config().is_ok());
+    }
+
+    #[test]
+    fn editor_uses_selected_bitget_execution_venue() {
+        let mut credential = credential();
+        credential.venue = VenueId::Bitget;
+        let config = Editor::create(&credential, "account").config().unwrap();
+        assert_eq!(config.execution_venue, VenueId::Bitget);
     }
 
     #[test]

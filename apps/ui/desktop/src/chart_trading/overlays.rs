@@ -86,12 +86,20 @@ pub(crate) fn collect(
                 }
                 result.push(ChartOverlay {
                     price,
-                    label: if order.post_only {
-                        label(language, "只做Maker", "Maker only")
-                    } else {
-                        label(language, "限价委托", "Limit order")
-                    }
-                    .into(),
+                    label: format!(
+                        "{} · {}",
+                        order_intent(
+                            language,
+                            order.order_side,
+                            order.position_side,
+                            order.reduce_only
+                        ),
+                        if order.post_only {
+                            label(language, "只做Maker", "Maker only")
+                        } else {
+                            label(language, "限价委托", "Limit order")
+                        }
+                    ),
                     color: side_color(order.order_side),
                     time_ms: None,
                     line: settings.order_lines,
@@ -234,6 +242,65 @@ pub(crate) fn collect(
     result
 }
 
+pub(crate) fn order_intent(
+    language: crate::i18n::Language,
+    side: OrderSide,
+    position: PositionSide,
+    reduce_only: bool,
+) -> &'static str {
+    match (side, position, reduce_only) {
+        (OrderSide::Buy, PositionSide::Long, _) => label(language, "开多", "Open long"),
+        (OrderSide::Sell, PositionSide::Long, _) => label(language, "平多", "Close long"),
+        (OrderSide::Sell, PositionSide::Short, _) => label(language, "开空", "Open short"),
+        (OrderSide::Buy, PositionSide::Short, _) => label(language, "平空", "Close short"),
+        (OrderSide::Buy, PositionSide::Net, true) => label(language, "平空", "Close short"),
+        (OrderSide::Sell, PositionSide::Net, true) => label(language, "平多", "Close long"),
+        // A non-reduce-only Net order may both close and open. Do not infer intent from price.
+        (OrderSide::Buy, PositionSide::Net, false) => label(language, "买入", "Buy"),
+        (OrderSide::Sell, PositionSide::Net, false) => label(language, "卖出", "Sell"),
+    }
+}
+
+#[cfg(test)]
+mod intent_tests {
+    use super::*;
+    use crate::i18n::Language;
+
+    #[test]
+    fn hedge_intent_uses_both_sides_even_without_reduce_only() {
+        for (side, position, zh, en) in [
+            (OrderSide::Buy, PositionSide::Long, "开多", "Open long"),
+            (OrderSide::Sell, PositionSide::Long, "平多", "Close long"),
+            (OrderSide::Buy, PositionSide::Short, "平空", "Close short"),
+            (OrderSide::Sell, PositionSide::Short, "开空", "Open short"),
+        ] {
+            for reduce in [false, true] {
+                assert_eq!(
+                    order_intent(Language::SimplifiedChinese, side, position, reduce),
+                    zh
+                );
+                assert_eq!(order_intent(Language::English, side, position, reduce), en);
+            }
+        }
+        assert_eq!(
+            order_intent(Language::English, OrderSide::Buy, PositionSide::Net, false),
+            "Buy"
+        );
+        assert_eq!(
+            order_intent(Language::English, OrderSide::Sell, PositionSide::Net, false),
+            "Sell"
+        );
+        assert_eq!(
+            order_intent(Language::English, OrderSide::Buy, PositionSide::Net, true),
+            "Close short"
+        );
+        assert_eq!(
+            order_intent(Language::English, OrderSide::Sell, PositionSide::Net, true),
+            "Close long"
+        );
+    }
+}
+
 fn side_color(side: OrderSide) -> Color32 {
     if side == OrderSide::Buy {
         theme::BUY
@@ -298,7 +365,7 @@ pub(crate) fn draw(
                 center,
                 Align2::CENTER_CENTER,
                 if buy { "B" } else { "S" },
-                FontId::monospace(13.0),
+                FontId::proportional(13.0),
                 Color32::WHITE,
             );
             ui.interact(
@@ -352,7 +419,7 @@ pub(crate) fn draw(
                 Pos2::new(rect.right() - 10.0, y),
                 Align2::RIGHT_CENTER,
                 format_decimal(overlay.price, price_scale),
-                FontId::monospace(11.0),
+                FontId::proportional(11.0),
                 overlay.color,
             );
         }

@@ -13,6 +13,9 @@ use crate::{
 };
 
 type StudySelector = fn(&ChartStudyPoint) -> Option<rust_decimal::Decimal>;
+mod price_annotations;
+mod price_axis;
+mod study_readout;
 
 #[derive(Clone, Copy)]
 enum PaneScale {
@@ -52,11 +55,15 @@ pub(crate) fn candle_plot(
     bid_ask: (Option<rust_decimal::Decimal>, Option<rust_decimal::Decimal>),
 ) -> Option<rust_decimal::Decimal> {
     let (price_scale, quantity_scale) = scales;
-    let height = ui.available_height().max(120.0);
+    let height = ui.available_height().max(1.0);
+    if height < 80.0 || ui.available_width() < 120.0 {
+        return None;
+    }
     let (response, painter) = ui.allocate_painter(
         egui::vec2(ui.available_width(), height),
         Sense::click_and_drag(),
     );
+    painter.rect_filled(response.rect, 0, theme::BG_PRIMARY);
     if all_bars.is_empty() {
         painter.text(
             response.rect.center(),
@@ -68,7 +75,17 @@ pub(crate) fn candle_plot(
         return None;
     }
 
-    let plot_rect = response.rect.shrink2(egui::vec2(8.0, 8.0));
+    let full_rect = response.rect.shrink2(egui::vec2(8.0, 8.0));
+    let axis_width =
+        price_axis::width(&painter, all_bars, overlays, price_scale).min(full_rect.width() * 0.4);
+    let plot_rect = Rect::from_min_max(full_rect.min, full_rect.max - egui::vec2(axis_width, 0.0));
+    let axis_painter = painter.clone();
+    axis_painter.rect_filled(
+        Rect::from_min_max(Pos2::new(plot_rect.right(), full_rect.top()), full_rect.max),
+        0,
+        theme::BG_PRIMARY,
+    );
+    let painter = painter.with_clip_rect(plot_rect.intersect(painter.clip_rect()));
     let timeline_height = 16.0_f32.min(plot_rect.height() * 0.14);
     let content_rect = Rect::from_min_max(
         plot_rect.min,
@@ -89,7 +106,28 @@ pub(crate) fn candle_plot(
     let pointer_ratio = response.hover_pos().map_or(1.0, |point| {
         ((point.x - plot_rect.left()) / plot_rect.width()).clamp(0.0, 1.0)
     });
-    if response.hovered() {
+    let price_axis = ui.interact(
+        Rect::from_min_max(
+            Pos2::new(plot_rect.right(), plot_rect.top()),
+            Pos2::new(full_rect.right(), content_rect.bottom()),
+        ),
+        response.id.with("price-axis"),
+        Sense::click_and_drag(),
+    );
+    if price_axis.hovered() || price_axis.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+    }
+    if price_axis.double_clicked() {
+        viewport.reset_price_scale();
+    }
+    if price_axis.dragged_by(egui::PointerButton::Primary) {
+        viewport.auto_price_scale = false;
+        let delta = ui.input(|input| input.pointer.delta().y);
+        viewport.price_zoom_milli = ((viewport.price_zoom_milli.clamp(250, 4000) as f32)
+            * (delta * 0.006).exp())
+        .clamp(250.0, 4000.0) as u32;
+    }
+    if response.hovered() && !price_axis.hovered() {
         let wheel = ui.input(|input| input.smooth_scroll_delta.y);
         if wheel.abs() > f32::EPSILON {
             viewport.zoom_by_steps(
@@ -100,6 +138,7 @@ pub(crate) fn candle_plot(
         }
     }
     if response.dragged_by(egui::PointerButton::Primary)
+        && !price_axis.dragged()
         && let Some(delta) = response.total_drag_delta()
     {
         viewport.pan_by_drag_total(all_bars.len(), plot_rect.width(), delta.x);
@@ -118,9 +157,9 @@ pub(crate) fn candle_plot(
         Vec::new()
     };
     let sub_count = pane_specs.len();
-    let volume_ratio = if settings.volume.enabled { 0.14 } else { 0.0 };
-    let sub_ratio = (0.145 * sub_count as f32).min(0.48);
-    let price_ratio = (1.0 - volume_ratio - sub_ratio).clamp(0.38, 0.86);
+    let volume_ratio = if settings.volume.enabled { 0.12 } else { 0.0 };
+    let sub_ratio = (0.12 * sub_count as f32).min(0.38);
+    let price_ratio = 1.0 - volume_ratio - sub_ratio;
     let price_rect = Rect::from_min_max(
         content_rect.min,
         Pos2::new(
@@ -155,7 +194,6 @@ pub(crate) fn candle_plot(
         rect
     };
     let sub_rects = (0..sub_count).map(|_| next_sub_rect()).collect::<Vec<_>>();
-    let price_range = overlay_price_range(bars, all_studies, settings)?;
     let hovered_index = response
         .hover_pos()
         .filter(|point| plot_rect.contains(*point))
@@ -169,6 +207,41 @@ pub(crate) fn candle_plot(
         })
         .filter(|index| *index < bars.len());
     let selected_index = hovered_index.or_else(|| bars.len().checked_sub(1));
+    let readout_time = selected_index
+        .and_then(|index| bars.get(index))
+        .map_or(0, |bar| bar.open_time_ms);
+    let line_height = painter
+        .layout_no_wrap(
+            "0".into(),
+            FontId::proportional(f32::from(settings.chart_text_size)),
+            theme::TEXT_PRIMARY,
+        )
+        .size()
+        .y;
+    let readout_top = 6.0 + line_height + 2.0;
+    let job = study_readout::job(
+        settings,
+        study_at(all_studies, readout_time),
+        price_scale,
+        price_rect.width() - 12.0,
+    );
+    let study_galley = (has_local_studies && !job.text.is_empty()).then(|| painter.layout_job(job));
+    let custom_readout_y = readout_top
+        + study_galley
+            .as_ref()
+            .map_or(0.0, |galley| galley.size().y + 2.0);
+    let mut price_range = PriceRange::from_bars(bars)?;
+    // Keep the OHLC / study readouts and the high-price leader out of candle space.
+    let headroom = (custom_readout_y
+        + if has_local_studies && settings.custom_ema_adx.enabled {
+            line_height + 8.0
+        } else {
+            8.0
+        })
+    .min(price_rect.height() * 0.4);
+    price_range.high += (price_range.high - price_range.low)
+        * f64::from(headroom / (price_rect.height() - headroom));
+    price_range = viewport.resolve_price_scale(price_range);
     let width = price_rect.width() / display_slots as f32;
     let price_y = |price: f64| {
         price_range
@@ -183,13 +256,6 @@ pub(crate) fn candle_plot(
                 Pos2::new(price_rect.right(), y),
             ],
             Stroke::new(1.0, theme::CHART_GRID),
-        );
-        painter.text(
-            Pos2::new(price_rect.right() - 3.0, y - 2.0),
-            Align2::RIGHT_BOTTOM,
-            format_f64_fixed(price, price_scale),
-            FontId::monospace(f32::from(settings.chart_text_size)),
-            theme::TEXT_SECONDARY,
         );
     }
     painter.line_segment(
@@ -215,7 +281,7 @@ pub(crate) fn candle_plot(
             Pos2::new(x, timeline_rect.top() + 2.0),
             Align2::CENTER_TOP,
             format_timeline_label(open_time_ms, interval),
-            FontId::monospace(f32::from(settings.chart_text_size)),
+            FontId::proportional(f32::from(settings.chart_text_size)),
             theme::TEXT_SECONDARY,
         );
     }
@@ -235,6 +301,7 @@ pub(crate) fn candle_plot(
             settings,
         );
     }
+    let candle_painter = painter.with_clip_rect(price_rect.intersect(painter.clip_rect()));
     for (index, bar) in bars.iter().enumerate() {
         let open = decimal_to_f64(bar.open);
         let close = decimal_to_f64(bar.close);
@@ -245,7 +312,7 @@ pub(crate) fn candle_plot(
         } else {
             theme::SELL
         };
-        painter.line_segment(
+        candle_painter.line_segment(
             [
                 Pos2::new(x, price_y(decimal_to_f64(bar.low))),
                 Pos2::new(x, price_y(decimal_to_f64(bar.high))),
@@ -258,7 +325,7 @@ pub(crate) fn candle_plot(
             Pos2::new(x - width * 0.31, top),
             Pos2::new(x + width * 0.31, bottom.max(top + 1.0)),
         );
-        painter.rect_filled(body, 0.5, color);
+        candle_painter.rect_filled(body, 0.5, color);
         if let Some(volume_rect) = volume_rect {
             let color = if close >= open {
                 settings.volume.color()
@@ -286,7 +353,7 @@ pub(crate) fn candle_plot(
             rect.left_top() + egui::vec2(4.0, 2.0),
             Align2::LEFT_TOP,
             volume_readout(bars, selected_index, quantity_scale),
-            FontId::monospace(f32::from(settings.chart_text_size)),
+            FontId::proportional(f32::from(settings.chart_text_size)),
             theme::TEXT_SECONDARY,
         );
     }
@@ -300,12 +367,13 @@ pub(crate) fn candle_plot(
             price_y,
             settings,
         );
-        let readout_time = response
-            .hover_pos()
-            .filter(|p| plot_rect.contains(*p))
-            .and_then(|_| selected_index.and_then(|index| bars.get(index)))
-            .or_else(|| all_bars.last())
-            .map_or(0, |bar| bar.open_time_ms);
+        if let Some(galley) = study_galley {
+            painter.galley(
+                price_rect.left_top() + egui::vec2(6.0, readout_top),
+                galley,
+                theme::TEXT_PRIMARY,
+            );
+        }
         crate::custom_indicator::draw(
             &painter,
             price_rect,
@@ -318,6 +386,7 @@ pub(crate) fn candle_plot(
             price_scale,
             settings.chart_text_size,
             language,
+            custom_readout_y,
         );
         for (spec, rect) in pane_specs.iter().zip(sub_rects) {
             draw_sub_pane(
@@ -338,7 +407,14 @@ pub(crate) fn candle_plot(
         (
             trading_display.last_price,
             latest_price,
-            theme::TEXT_SECONDARY,
+            if latest_price
+                .zip(all_bars.last())
+                .is_some_and(|(price, bar)| price >= bar.open)
+            {
+                theme::BUY
+            } else {
+                theme::SELL
+            },
             "",
         ),
         (
@@ -384,6 +460,14 @@ pub(crate) fn candle_plot(
             });
         }
     }
+    price_annotations::draw(
+        &painter,
+        price_rect,
+        bars,
+        display_slots,
+        price_range,
+        price_scale,
+    );
     crate::chart_trading::draw(
         ui,
         &painter,
@@ -469,11 +553,22 @@ pub(crate) fn candle_plot(
             settings.chart_text_size,
         );
     }
+    price_axis::draw(
+        &axis_painter,
+        Rect::from_min_max(
+            Pos2::new(price_rect.right(), price_rect.top()),
+            Pos2::new(full_rect.right(), price_rect.bottom()),
+        ),
+        price_range,
+        &trading_overlays,
+        price_scale,
+        settings.chart_text_size,
+    );
     response
         .clicked()
         .then(|| response.interact_pointer_pos())
         .flatten()
-        .filter(|pointer| price_rect.contains(*pointer))
+        .filter(|pointer| price_rect.contains(*pointer) && !price_axis.rect.contains(*pointer))
         .and_then(|pointer| {
             price_range.y_to_price(price_rect.top(), price_rect.height(), pointer.y)
         })
@@ -505,7 +600,7 @@ fn draw_candle_readout(
     let change_percent = percent(bar.close - bar.open);
     let amplitude_percent = percent(bar.high - bar.low);
     let label_format = egui::TextFormat {
-        font_id: FontId::monospace(f32::from(text_size)),
+        font_id: FontId::proportional(f32::from(text_size)),
         color: theme::TEXT_SECONDARY,
         ..Default::default()
     };
@@ -700,126 +795,8 @@ fn draw_price_studies(
             true,
         );
     }
-
-    let mut labels = Vec::new();
-    if settings.ma.enabled {
-        labels.push(format!(
-            "MA({},{},{})",
-            settings.ma_periods[0], settings.ma_periods[1], settings.ma_periods[2]
-        ));
-    }
-    if settings.ema.enabled {
-        labels.push(format!(
-            "EMA({},{},{})",
-            settings.ema_periods[0], settings.ema_periods[1], settings.ema_periods[2]
-        ));
-    }
-    if settings.wma.enabled {
-        labels.push(format!(
-            "WMA({},{},{})",
-            settings.wma_periods[0], settings.wma_periods[1], settings.wma_periods[2]
-        ));
-    }
-    if settings.bollinger.enabled {
-        labels.push(format!(
-            "BOLL({},{:.2})",
-            settings.bollinger_period,
-            settings.bollinger_multiplier_hundredths as f32 / 100.0
-        ));
-    }
-    if settings.vwap.enabled {
-        labels.push("VWAP".to_owned());
-    }
-    if settings.avl.enabled {
-        labels.push("AVL".to_owned());
-    }
-    if settings.trix.enabled {
-        labels.push(format!("TRIX({})", settings.trix_period));
-    }
-    if settings.sar.enabled {
-        labels.push("SAR".to_owned());
-    }
-    if settings.supertrend.enabled {
-        labels.push(format!(
-            "SUPER({},{:.2})",
-            settings.supertrend_period,
-            settings.supertrend_multiplier_hundredths as f32 / 100.0
-        ));
-    }
-    if !labels.is_empty() {
-        painter.text(
-            rect.left_top() + egui::vec2(6.0, 22.0),
-            Align2::LEFT_TOP,
-            labels.join("  "),
-            FontId::monospace(f32::from(settings.chart_text_size)),
-            theme::TEXT_SECONDARY,
-        );
-    }
 }
 
-fn overlay_price_range(
-    bars: &[UiBar],
-    studies: &[ChartStudyPoint],
-    settings: &ChartDisplaySettings,
-) -> Option<PriceRange> {
-    let range = PriceRange::from_bars(bars)?;
-    let (mut low, mut high) = (range.low, range.high);
-    for point in bars
-        .iter()
-        .filter_map(|bar| study_at(studies, bar.open_time_ms))
-    {
-        if settings.custom_ema_adx.enabled
-            && let Some(custom) = &point.custom_ema_adx
-        {
-            for value in custom.ema.into_iter().flatten() {
-                let value = decimal_to_f64(value);
-                low = low.min(value);
-                high = high.max(value);
-            }
-        }
-        for (style, values) in [
-            (settings.ma, [point.sma, point.sma_second, point.sma_third]),
-            (settings.ema, [point.ema, point.ema_second, point.ema_third]),
-            (settings.wma, [point.wma, point.wma_second, point.wma_third]),
-            (
-                settings.bollinger,
-                [
-                    point.bollinger_upper,
-                    point.bollinger_middle,
-                    point.bollinger_lower,
-                ],
-            ),
-            (settings.vwap, [point.vwap, None, None]),
-            (settings.avl, [point.avl, None, None]),
-            (settings.sar, [point.sar, None, None]),
-            (settings.supertrend, [point.supertrend, None, None]),
-        ] {
-            if !style.enabled {
-                continue;
-            }
-            for (index, value) in values.into_iter().enumerate() {
-                if !style.line_enabled[index]
-                    && !style.background_enabled
-                    && !style.secondary_background_enabled
-                {
-                    continue;
-                }
-                if let Some(value) = value {
-                    let value = decimal_to_f64(value);
-                    low = low.min(value);
-                    high = high.max(value);
-                }
-            }
-        }
-    }
-    if low < range.low || high > range.high {
-        PriceRange::from_extrema(low, high)
-    } else {
-        Some(range)
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn draw_triple_price(
     painter: &egui::Painter,
     rect: Rect,
@@ -1325,7 +1302,7 @@ fn draw_sub_pane(
     }
     let mut readout = egui::text::LayoutJob::default();
     let label_format = egui::TextFormat {
-        font_id: FontId::monospace(f32::from(text_size)),
+        font_id: FontId::proportional(f32::from(text_size)),
         color: theme::TEXT_SECONDARY,
         ..Default::default()
     };
@@ -1390,7 +1367,7 @@ fn draw_hover_price_readout(
     let price_text = format_f64_fixed(price, price_scale);
     let change_text = hover_price_change_percent(price, latest_price)
         .map_or_else(|| "—".to_owned(), |change| format!("{change:+.4}%"));
-    let font = FontId::monospace(f32::from(text_size));
+    let font = FontId::proportional(f32::from(text_size));
     let price_galley = painter.layout_no_wrap(price_text, font.clone(), theme::TEXT_PRIMARY);
     let change_galley = painter.layout_no_wrap(change_text, font, theme::TEXT_PRIMARY);
     let width = price_galley.size().x.max(change_galley.size().x).max(72.0) + 12.0;
@@ -1582,6 +1559,106 @@ mod tests {
     }
 
     #[test]
+    fn price_axis_drag_changes_height_without_panning_or_selecting_price() {
+        let context = egui::Context::default();
+        let mut viewport = crate::chart::ChartViewport::default();
+        let (bars, _) = fixture();
+        pointer_frame(&context, &mut viewport, &bars, vec![]);
+        pointer_frame(
+            &context,
+            &mut viewport,
+            &bars,
+            vec![
+                egui::Event::PointerMoved(egui::pos2(1160.0, 150.0)),
+                egui::Event::PointerButton {
+                    pos: egui::pos2(1160.0, 150.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        pointer_frame(
+            &context,
+            &mut viewport,
+            &bars,
+            vec![egui::Event::PointerMoved(egui::pos2(1160.0, 210.0))],
+        );
+        assert!(viewport.price_zoom_milli > 1000);
+        assert!(!viewport.auto_price_scale);
+        assert_eq!(viewport.right_padding(), 0);
+        assert!(!pointer_frame(
+            &context,
+            &mut viewport,
+            &bars,
+            vec![egui::Event::PointerButton {
+                pos: egui::pos2(1160.0, 210.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE
+            }]
+        ));
+        viewport.reset();
+        assert_eq!(viewport.price_zoom_milli, 1000);
+        assert!(viewport.auto_price_scale);
+    }
+
+    #[test]
+    fn candles_are_clipped_before_the_separate_price_axis() {
+        let context = egui::Context::default();
+        let mut viewport = crate::chart::ChartViewport::default();
+        let (bars, _) = fixture();
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1200.0, 500.0))),
+                ..Default::default()
+            },
+            |ui| {
+                candle_plot(
+                    ui,
+                    &bars,
+                    &[],
+                    &mut viewport,
+                    Language::English,
+                    &ChartDisplaySettings::default(),
+                    (2, 2),
+                    crate::chart::ChartInterval::OneMinute,
+                    None,
+                    None,
+                    &crate::chart_trading::ChartTradingSettings::default(),
+                    &[],
+                    (None, None),
+                );
+            },
+        );
+        output.textures_delta.clear();
+        let axis_left = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::Shape::Rect(rect) = &shape.shape
+                    && rect.fill == theme::BG_PRIMARY
+                    && rect.rect.left() > 900.0
+                {
+                    Some(rect.rect.left())
+                } else {
+                    None
+                }
+            })
+            .reduce(f32::min)
+            .unwrap_or(0.0);
+        assert!(axis_left > 900.0);
+        let candles = output.shapes.iter().filter(|shape| matches!(&shape.shape,
+            egui::Shape::Rect(rect) if (rect.fill == theme::BUY || rect.fill == theme::SELL) && rect.rect.center().x < axis_left)).collect::<Vec<_>>();
+        assert!(!candles.is_empty());
+        assert!(
+            candles
+                .iter()
+                .all(|shape| shape.clip_rect.right() <= axis_left)
+        );
+    }
+
+    #[test]
     fn supertrend_breaks_lines_at_reversals_and_missing_studies() {
         let (bars, mut studies) = fixture();
         studies.remove(1);
@@ -1651,13 +1728,11 @@ mod tests {
     }
 
     #[test]
-    fn enabled_bands_fit_price_scale_and_fill_does_not_bridge_missing_values() {
+    fn enabled_band_fill_does_not_bridge_missing_values() {
         let (bars, mut studies) = fixture();
         studies[2].bollinger_upper = None;
         let mut settings = ChartDisplaySettings::default();
         settings.bollinger.enabled = true;
-        let range = overlay_price_range(&bars, &studies, &settings);
-        assert!(range.is_some_and(|r| r.low < 30.0 && r.high > 70.0));
         let shapes = render(|painter, rect| {
             draw_price_fills(painter, rect, &bars, 6, &studies, |v| v as f32, &settings)
         });

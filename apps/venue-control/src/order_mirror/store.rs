@@ -311,9 +311,44 @@ pub(super) async fn plan_relation(pool: &PgPool, relation: &str, now: u64) -> Re
         if !matches!(state.as_str(), "terminal" | "blocked") {
             live_count += 1;
         }
-        let original: TerminalOpenOrder =
+        let mut original: TerminalOpenOrder =
             serde_json::from_value(mirror.try_get("source_order_json").map_err(unavailable)?)
                 .map_err(|_| Error::Conflict)?;
+        let retained_fill = active
+            && source.is_some()
+            && !desired.contains_key(&key)
+            && matches!(state.as_str(), "pending" | "live")
+            && super::completed_source::source_complete(
+                &mut tx,
+                &text(&row, "leader_trading_account_id")?,
+                &original,
+            )
+            .await?;
+        if retained_fill && !super::completed_source::recorded_complete(&original) {
+            original.filled_quantity = Some(original.quantity);
+            // Keep the completed source with its existing mirror even after display history trims.
+            sqlx::query("UPDATE venue_order_mirrors SET source_order_json=$1 WHERE mirror_id=$2")
+                .bind(serde_json::to_value(&original).map_err(|_| Error::Conflict)?)
+                .bind(text(&mirror, "mirror_id")?)
+                .execute(&mut *tx)
+                .await
+                .map_err(unavailable)?;
+        }
+        if retained_fill && state == "live" && child.is_none() && follower.is_some() {
+            let mut child_order = original.clone();
+            child_order.native_order_id = native.clone();
+            child_order.client_order_id = client.clone();
+            child_order.quantity = decimal(&mirror, "child_quantity")?;
+            let actual =
+                super::completed_source::filled_quantity(&mut tx, &account, &child_order).await?;
+            if actual == child_order.quantity {
+                sqlx::query("UPDATE venue_order_mirrors SET filled_quantity=$1,mirror_state='terminal',updated_ms=$2 WHERE mirror_id=$3")
+                    .bind(actual.to_string()).bind(stamp(now)?).bind(text(&mirror, "mirror_id")?)
+                    .execute(&mut *tx).await.map_err(unavailable)?;
+                latest.insert(key, mirror);
+                continue;
+            }
+        }
         // A signed live child can precede its follower stream event. Absence from that
         // projection is not a retirement intent; only source/lifecycle changes cancel it.
         let obsolete = !active
@@ -322,7 +357,7 @@ pub(super) async fn plan_relation(pool: &PgPool, relation: &str, now: u64) -> Re
             || (source.is_some()
                 && desired
                     .get(&key)
-                    .is_none_or(|order| !same_terms(order, &original)));
+                    .map_or(!retained_fill, |order| !same_terms(order, &original)));
         if obsolete
             && state == "pending"
             && mirror

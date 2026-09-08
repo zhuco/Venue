@@ -93,10 +93,10 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
             ui.small(text(language, TextKey::TradeSizeAmount));
             let previous = model.trade_dock.amount_in_base;
             egui::ComboBox::from_id_salt("trade-amount-unit")
-                .selected_text(if previous { &base } else { &quote })
+                .selected_text(if previous { &base } else { "USD" })
                 .width(60.0)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut model.trade_dock.amount_in_base, false, &quote);
+                    ui.selectable_value(&mut model.trade_dock.amount_in_base, false, "USD");
                     ui.selectable_value(&mut model.trade_dock.amount_in_base, true, &base);
                 });
             if previous != model.trade_dock.amount_in_base {
@@ -143,7 +143,7 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
                     )
                     .wrap_mode(egui::TextWrapMode::Truncate),
                 )
-                .on_hover_text(format!("{} {quote} · {key}", value.normalize()))
+                .on_hover_text(format!("{} USD · {key}", value.normalize()))
                 .clicked()
             {
                 action = Some(TradingAction::SelectSizePreset(index));
@@ -215,8 +215,8 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
                 )
                 .on_hover_text(label(
                     language,
-                    "第二次点击确认；Executor 下单前按最新签名仓位再次裁剪。",
-                    "Click twice to confirm; Executor re-clips against the latest signed position.",
+                    "再次点击平仓，最多平掉当前剩余数量。",
+                    "Click again to close, up to the remaining quantity.",
                 ))
                 .clicked()
             {
@@ -676,11 +676,7 @@ fn local_failure(model: &mut AppModel, reason: String) {
 }
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(1, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        })
+    crate::account_center::now_ms().max(1)
 }
 
 const fn label<'a>(language: crate::i18n::Language, chinese: &'a str, english: &'a str) -> &'a str {

@@ -483,6 +483,25 @@ impl BitgetHttpTransport {
         credentials: &BitgetCredentials,
         timestamp_ms: u64,
     ) -> Result<Vec<u8>, BitgetTransportError> {
+        self.fetch_signed_account_path(credentials, timestamp_ms, endpoints::ACCOUNT_INFO)
+            .await
+    }
+
+    pub(crate) async fn fetch_copy_trading_pairs(
+        &self,
+        credentials: &BitgetCredentials,
+        timestamp_ms: u64,
+    ) -> Result<Vec<u8>, BitgetTransportError> {
+        self.fetch_signed_account_path(credentials, timestamp_ms, endpoints::COPY_TRADING_PAIRS)
+            .await
+    }
+
+    async fn fetch_signed_account_path(
+        &self,
+        credentials: &BitgetCredentials,
+        timestamp_ms: u64,
+        path: &str,
+    ) -> Result<Vec<u8>, BitgetTransportError> {
         self.validate_scope(&self.binding, self.generation)?;
         let headers = sign(
             credentials,
@@ -490,7 +509,7 @@ impl BitgetHttpTransport {
             &SignInput {
                 timestamp_ms,
                 method: "GET",
-                request_path: endpoints::ACCOUNT_INFO,
+                request_path: path,
                 query: "",
                 body: &[],
             },
@@ -498,7 +517,7 @@ impl BitgetHttpTransport {
         .map_err(|_| BitgetTransportError::Signing)?;
         tokio::time::timeout(
             self.limits.operation_timeout,
-            self.send("GET", endpoints::ACCOUNT_INFO, "", &[], &headers),
+            self.send("GET", path, "", &[], &headers),
         )
         .await
         .map_err(|_| BitgetTransportError::Timeout)?

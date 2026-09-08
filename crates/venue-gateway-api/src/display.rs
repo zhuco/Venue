@@ -128,6 +128,7 @@ pub fn levels(rows: &Value, multiplier: Decimal) -> Result<Vec<(Decimal, Decimal
         })
         .collect()
 }
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn json(http: &reqwest::Client, request: reqwest::RequestBuilder) -> Result<Value> {
     let _ = http;
     let mut response = request

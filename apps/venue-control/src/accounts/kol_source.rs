@@ -85,13 +85,10 @@ impl AccountService {
                 let slot = slot.ok_or(error(Code::Conflict))?;
                 let equity: String = sqlx::query_scalar("SELECT verification_json->>'equity' FROM venue_api_credentials WHERE credential_id=$1")
                     .bind(&request.credential_id).fetch_one(&mut *tx).await.map_err(database_error)?;
-                if equity
+                // Source ownership does not depend on funding; bot configuration validates its own capital.
+                equity
                     .parse::<rust_decimal::Decimal>()
-                    .ok()
-                    .is_none_or(|v| v <= rust_decimal::Decimal::ZERO)
-                {
-                    return Err(error(Code::VerificationRequired));
-                }
+                    .map_err(|_| error(Code::VerificationRequired))?;
                 sqlx::query("UPDATE venue_kol_profiles SET leader_trading_account_id=$1,profile_state='enabled',active_slot=$2,strategy_capital=$3 WHERE kol_user_id=$4")
                     .bind(&account).bind(slot as i16).bind(equity).bind(&principal.user.user_id).execute(&mut *tx).await.map_err(database_error)?;
             }
@@ -121,6 +118,15 @@ mod tests {
 
     #[tokio::test]
     async fn source_is_owned_single_and_revision_guarded() -> TestResult {
+        source_selection("123.45").await
+    }
+
+    #[tokio::test]
+    async fn verified_unfunded_source_can_be_saved_without_starting_a_bot() -> TestResult {
+        source_selection("0.0").await
+    }
+
+    async fn source_selection(equity: &str) -> TestResult {
         let Some(f) = Fixture::create().await? else {
             return Ok(());
         };
@@ -142,7 +148,7 @@ mod tests {
                 .bind(&account).bind(&owner.user.user_id).bind(vec![n;32]).execute(&f.pool).await?;
             sqlx::query("INSERT INTO venue_api_credentials(credential_id,user_id,label,key_fingerprint,masked_key,encrypted_credentials,trading_account_id,verification_json,created_ms) VALUES($1,$2,'fixture',$3,'***',$3,$4,$5,$6)")
                 .bind(&credential).bind(&owner.user.user_id).bind(vec![n;32]).bind(&account)
-                .bind(serde_json::json!({"verification":"verified","dual_position":true,"account_mode":"Portfolio Margin · UM","equity":"123.45"})).bind(ms(time)?).execute(&f.pool).await?;
+                .bind(serde_json::json!({"verification":"verified","dual_position":true,"account_mode":"Portfolio Margin · UM","equity":equity})).bind(ms(time)?).execute(&f.pool).await?;
             ids.push((credential, account));
         }
         assert!(f.service.own_kol_source(&stranger).await.is_err());
@@ -185,7 +191,13 @@ mod tests {
         .bind(&owner.user.user_id)
         .fetch_one(&f.pool)
         .await?;
-        assert_eq!((state.as_str(), capital.as_str()), ("enabled", "123.45"));
+        assert_eq!((state.as_str(), capital.as_str()), ("enabled", equity));
+        let bot_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM venue_leader_bots WHERE owner_user_id=$1")
+                .bind(&owner.user.user_id)
+                .fetch_one(&f.pool)
+                .await?;
+        assert_eq!(bot_count, 0);
         let access = f.service.leader_bots_access(&owner).await?;
         assert!(access.can_use);
         assert_eq!(access.permission_revision, 1);

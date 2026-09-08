@@ -126,7 +126,13 @@ pub fn show_top_bar(
                                 .as_ref()
                                 .map(|a| a.user.username.as_str())
                                 .unwrap_or_else(|| text(language, TextKey::LoginAccount));
-                            if ui.button(user_label).clicked() {
+                            if ui
+                                .add_enabled(
+                                    !cfg!(all(target_arch = "wasm32", feature = "preview")),
+                                    egui::Button::new(user_label),
+                                )
+                                .clicked()
+                            {
                                 *show_execution_account = true;
                             }
                             if let Some(overview) = &account_overview {
@@ -178,6 +184,11 @@ pub fn show_top_bar(
                                 ))
                                 .show_ui(ui, |ui| {
                                     for server in crate::model::MarketServer::ALL {
+                                        if cfg!(all(target_arch = "wasm32", feature = "preview"))
+                                            && server != crate::model::MarketServer::Binance
+                                        {
+                                            continue;
+                                        }
                                         ui.selectable_value(
                                             &mut market_server,
                                             server,
@@ -207,15 +218,15 @@ pub fn show_top_bar(
             ui.separator();
             egui::containers::Sides::new()
                 .shrink_left()
-                .height(40.0)
+                .height(48.0)
                 .show(
                     ui,
                     |ui| {
                         egui::ScrollArea::horizontal()
                             .id_salt("favorite-symbol-tabs")
                             .auto_shrink([false, true])
-                            .max_height(40.0)
-                            .min_scrolled_height(40.0)
+                            .max_height(48.0)
+                            .min_scrolled_height(48.0)
                             .scroll_bar_visibility(
                                 egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
                             )
@@ -325,16 +336,16 @@ fn show_symbol_tabs(
             theme::value_color(decimal_to_f64(quote.change_percent_24h))
         });
         let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(152.0, 40.0), egui::Sense::click());
+            ui.allocate_exact_size(egui::vec2(152.0, 48.0), egui::Sense::click());
         ui.painter().rect_filled(
             rect,
             0.0,
             if selected {
-                theme::PANEL
+                theme::DIVIDER
             } else if response.hovered() {
-                theme::BG_PRIMARY
-            } else {
                 theme::BG_SECONDARY
+            } else {
+                theme::BG_PRIMARY
             },
         );
         if selected {
@@ -343,22 +354,26 @@ fn show_symbol_tabs(
                 Stroke::new(2.0, theme::BRAND),
             );
         }
-        ui.painter().text(
+        let name_rect = ui.painter().text(
             rect.left_top() + egui::vec2(10.0, 6.0),
             Align2::LEFT_TOP,
             &symbol,
-            FontId::proportional(12.0),
             if selected {
-                theme::BRAND_HOVER
+                theme::emphasis_font(14.0)
             } else {
+                FontId::proportional(14.0)
+            },
+            if selected {
                 theme::TEXT_PRIMARY
+            } else {
+                theme::TEXT_SECONDARY
             },
         );
         ui.painter().text(
-            rect.left_bottom() + egui::vec2(10.0, -6.0),
-            Align2::LEFT_BOTTOM,
+            egui::pos2(rect.left() + 10.0, name_rect.bottom() + 2.8),
+            Align2::LEFT_TOP,
             details,
-            FontId::monospace(10.0),
+            FontId::proportional(11.0),
             detail_color,
         );
         let close_rect = egui::Rect::from_min_max(
@@ -398,7 +413,7 @@ fn show_symbol_tabs(
             picker_requested.set(true);
         }
     }
-    if ui.add_sized([40.0, 40.0], egui::Button::new("+")).clicked() {
+    if ui.add_sized([40.0, 48.0], egui::Button::new("+")).clicked() {
         picker_requested.set(true);
     }
 }
@@ -570,30 +585,7 @@ fn show_market_watch(ui: &mut egui::Ui, model: &mut AppModel) {
 fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: &ControlClient) {
     let language = model.preferences.language;
     let settings_key = pane.settings_key();
-    #[cfg(not(target_arch = "wasm32"))]
-    let history_status = MarketSelection::for_server(
-        model.preferences.market_server,
-        pane.symbol
-            .as_deref()
-            .unwrap_or(&model.preferences.selected_symbol),
-        pane.interval,
-    )
-    .ok()
-    .and_then(|selection| model.local_markets.view(&selection))
-    .and_then(|view| {
-        if let Some(error) = &view.history_error {
-            Some(error.clone())
-        } else if view.history_loading {
-            Some(text(language, TextKey::LoadingHistory).into())
-        } else if view.history_exhausted || view.bars.len() >= crate::market::MAX_BARS {
-            Some(text(language, TextKey::HistoryBoundary).into())
-        } else {
-            None
-        }
-    });
-    #[cfg(target_arch = "wasm32")]
-    let history_status: Option<String> = None;
-    let settings_requested = show_chart_toolbar(ui, pane, language, history_status.as_deref());
+    let settings_requested = show_chart_toolbar(ui, pane, language);
     if settings_requested {
         model.indicator_settings_requested = true;
         model.indicator_target = Some(settings_key.clone());
@@ -693,6 +685,35 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
         }
         return;
     }
+    #[cfg(all(target_arch = "wasm32", feature = "preview"))]
+    {
+        if let Some(series) = model.browser_market.series(&symbol, Some(pane.interval)) {
+            pane_heading(
+                ui,
+                &symbol,
+                &format!("Binance · {} · read only", series.status),
+            );
+            let market = series.market.as_ref();
+            let _ = crate::chart_view::candle_plot(
+                ui,
+                &series.bars,
+                &[],
+                &mut pane.viewport,
+                language,
+                &settings,
+                (series.price_scale, series.quantity_scale),
+                pane.interval,
+                market.map(|value| value.last),
+                None,
+                &pane.trading_display,
+                &overlays,
+                (market.map(|value| value.bid), market.map(|value| value.ask)),
+            );
+        } else {
+            empty(ui, &model.browser_market.status);
+        }
+        return;
+    }
     pane_heading(ui, &symbol, text(language, TextKey::ControlFallback));
     let Some(market) = market(model, &symbol) else {
         empty(ui, text(language, TextKey::NoMarket));
@@ -758,12 +779,7 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
         model.indicator_target = Some(settings_key);
     }
 }
-fn show_chart_toolbar(
-    ui: &mut egui::Ui,
-    pane: &mut Pane,
-    language: Language,
-    history_status: Option<&str>,
-) -> bool {
+fn show_chart_toolbar(ui: &mut egui::Ui, pane: &mut Pane, language: Language) -> bool {
     let mut settings_requested = false;
     ui.horizontal_wrapped(|ui| {
         if ui
@@ -787,32 +803,6 @@ fn show_chart_toolbar(
         if ui.small_button(text(language, TextKey::Fit)).clicked() {
             pane.viewport.reset();
         }
-        if ui.small_button(text(language, TextKey::Follow)).clicked() {
-            pane.viewport.follow_latest();
-        }
-        if let Some(status) = history_status {
-            ui.weak(status);
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        if ui
-            .small_button(text(language, TextKey::OlderBars))
-            .clicked()
-        {
-            pane.history_requested = true;
-        }
-        ui.colored_label(
-            theme::TEXT_SECONDARY,
-            format!(
-                "{} {} · {}",
-                pane.viewport.visible_bars(),
-                text(language, TextKey::Bars),
-                if pane.viewport.right_offset() == 0 {
-                    text(language, TextKey::Live)
-                } else {
-                    text(language, TextKey::History)
-                }
-            ),
-        );
     });
     settings_requested
 }
@@ -1508,6 +1498,10 @@ fn format_freshness(age_ms: Option<u64>) -> String {
     })
 }
 fn market<'a>(model: &'a AppModel, symbol: &str) -> Option<&'a MarketSummary> {
+    #[cfg(all(target_arch = "wasm32", feature = "preview"))]
+    if let Some(series) = model.browser_market.series(symbol, None) {
+        return series.market.as_ref();
+    }
     #[cfg(not(target_arch = "wasm32"))]
     if model.market_generation > 0 || model.market_worker_failed {
         return None;
@@ -1523,6 +1517,10 @@ fn market<'a>(model: &'a AppModel, symbol: &str) -> Option<&'a MarketSummary> {
         .find(|market| market.symbol.to_string() == symbol)
 }
 pub(crate) fn available_symbols(model: &AppModel) -> Vec<String> {
+    #[cfg(all(target_arch = "wasm32", feature = "preview"))]
+    if let Some(snapshot) = &model.browser_market.snapshot {
+        return snapshot.symbols.clone();
+    }
     #[cfg(not(target_arch = "wasm32"))]
     if model.preferences.market_server != crate::model::MarketServer::Binance {
         return model.local_symbols.clone();

@@ -2,9 +2,9 @@
 param()
 
 $ErrorActionPreference = "Stop"
-# The unified Binance Control/Desktop/Web workspace and bounded recovery tests are about 14 MiB.
-# This is a source-only budget with feature headroom; single-file and generated/secret exclusions stay unchanged.
-$maxTrackedBytes = 20MB
+# Bound source and documentation growth, including the contributed illustrated guide.
+# Generated artifacts and secrets remain excluded.
+$maxTrackedBytes = 26MB
 $maxSingleFileBytes = 2MB
 $forbiddenRoots = @(
     "bak/",
@@ -40,7 +40,7 @@ $forbiddenExtensions = @(
 )
 $protectedArtifactRoots = @("artifacts/")
 
-$tracked = @(git ls-files)
+$tracked = @(git -c core.quotepath=false ls-files)
 if ($LASTEXITCODE -ne 0) {
     throw "git ls-files failed"
 }
@@ -73,7 +73,9 @@ foreach ($relativePath in $tracked) {
     }
     $bytes = (Get-Item -LiteralPath $relativePath).Length
     $totalBytes += $bytes
-    if ($bytes -gt $maxSingleFileBytes) {
+    # Allow only this contributed illustrated guide above the usual file limit.
+    $fileBudget = if ($normalized -eq 'docs/bn带单教程V1.docx') { 6MB } else { $maxSingleFileBytes }
+    if ($bytes -gt $fileBudget) {
         $violations.Add("tracked file exceeds 2 MiB: $normalized ($bytes bytes)")
     }
 }
@@ -96,7 +98,7 @@ foreach ($change in $changedPaths) {
 }
 
 if ($totalBytes -gt $maxTrackedBytes) {
-    $violations.Add("tracked worktree exceeds 20 MiB: $totalBytes bytes")
+    $violations.Add("tracked worktree exceeds 26 MiB: $totalBytes bytes")
 }
 if ($violations.Count -ne 0) {
     $violations | ForEach-Object { Write-Error $_ }

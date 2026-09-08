@@ -151,17 +151,28 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
                             }
                         });
                     }
+                    let binance = model.preferences.market_server == crate::model::MarketServer::Binance;
+                    let rtt = market.filter(|_| live).and_then(|m| m.recent_rtt_ms());
                     let delay = market
                         .filter(|_| live)
-                        .and_then(|m| m.latency_ms)
+                        .and_then(|m| if binance { rtt } else { m.latency_ms })
                         .map_or_else(|| "—".to_owned(), |ms| format!("{ms} ms"));
+                    if binance {
+                        hint.push_str(&match language {
+                            crate::i18n::Language::SimplifiedChinese =>
+                                "\n行情连接延迟，每秒测量两次；数值越低，连接响应越快。".to_owned(),
+                            crate::i18n::Language::English =>
+                                "\nMarket connection delay, measured twice per second. Lower means a faster connection response.".to_owned(),
+                        });
+                    }
                     status_text(
                         ui,
                         widths[0],
                         format!(
-                            "● {} {} · {delay}",
+                            "● {}{} · {}{delay}",
                             model.preferences.market_server.label(),
-                            status
+                            if live { String::new() } else { format!(" {status}") },
+                            if binance { if language == crate::i18n::Language::SimplifiedChinese { "延迟 " } else { "Delay " } } else if language == crate::i18n::Language::SimplifiedChinese { "数据年龄 " } else { "Age " }
                         ),
                         if live { theme::BUY } else { theme::WARNING },
                         &hint,

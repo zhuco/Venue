@@ -622,7 +622,7 @@ async fn mirror_sizing_and_revocation(
         &kol,
         &leader_account,
         &leader_credential,
-        vec![partial, gtc],
+        vec![partial.clone(), gtc],
         test_now_ms()?,
     )
     .await?;
@@ -671,6 +671,42 @@ async fn mirror_sizing_and_revocation(
         .fetch_one(&fixture.pool)
         .await?,
         "live"
+    );
+    // A fully filled source retires from the exchange list, but its unfilled child stays live.
+    let fill = serde_json::json!({"native_trade_id":"source-fill","native_order_id":"124","symbol":"BTC/USDT","order_side":"buy","position_side":"long","quantity":"0.001","price":"50000","occurred_ms":now,"maker":true});
+    sqlx::query("INSERT INTO venue_binance_account_fills (trading_account_id,owner_user_id,native_trade_id,symbol,occurred_ms,observed_ms,fill_json) VALUES ($1,$2,'source-fill','BTC/USDT',$3,$3,$4)")
+        .bind(&leader_account).bind(&kol).bind(i64::try_from(now)?).bind(fill)
+        .execute(&fixture.pool).await?;
+    persist_projection(
+        &fixture.pool,
+        &kol,
+        &leader_account,
+        &leader_credential,
+        vec![partial],
+        test_now_ms()?,
+    )
+    .await?;
+    wait_count(&fixture.pool, "SELECT count(*) FROM venue_order_mirrors WHERE source_order_id='124' AND (source_order_json->>'filled_quantity')::numeric=(source_order_json->>'quantity')::numeric AND mirror_state='live'", 1).await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM venue_binance_commands WHERE command_phase='cancel'"
+        )
+        .fetch_one(&fixture.pool)
+        .await?,
+        0
+    );
+    // Persisted completion must survive history trimming and subsequent planner turns.
+    sqlx::query("DELETE FROM venue_binance_account_fills WHERE native_trade_id='source-fill'")
+        .execute(&fixture.pool)
+        .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM venue_binance_commands WHERE command_phase='cancel'"
+        )
+        .fetch_one(&fixture.pool)
+        .await?,
+        0
     );
     // A pause may cancel the queued command independently of the planner; the mapping must drain.
     sqlx::query("UPDATE venue_binance_commands SET command_state='cancelled',terminal_ms=$1 WHERE command_id=$2 AND command_state='pending'").bind(i64::try_from(test_now_ms()?)?).bind(&child).execute(&fixture.pool).await?;

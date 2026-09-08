@@ -1,6 +1,7 @@
 //! User authentication and credential administration, isolated from semantic command storage.
 //! Verification only reads exchange state; no method grants a writer or sends an order.
 
+mod bitget_copy;
 mod credentials;
 mod crypto;
 mod follow_requests;

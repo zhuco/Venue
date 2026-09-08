@@ -4,7 +4,7 @@ import type { FollowSizing } from "@/lib/customer-types";
 
 export function FollowSizingFields({ value, multiplier = "1", multiplierName = "multiplier", equity }: { value?: FollowSizing; multiplier?: string; multiplierName?: string; equity?: string | null }) {
   const [mode, setMode] = useState(value?.mode ?? "proportional");
-  return <div className="follow-sizing customer-wide">
+  return <div className="follow-sizing customer-wide"><a href="/help/kol#sizing" target="_blank" rel="noreferrer">定比和定额有什么区别？</a>
     <div className="follow-mode" role="group" aria-label="跟单方式">
       <button type="button" aria-pressed={mode === "proportional"} onClick={() => setMode("proportional")}>定比跟单</button>
       <button type="button" aria-pressed={mode === "fixed_notional"} onClick={() => setMode("fixed_notional")}>定额跟单</button>

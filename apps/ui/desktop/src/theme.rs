@@ -1,6 +1,5 @@
 use eframe::egui::{self, Color32, FontId, Frame, Margin, Stroke, TextStyle};
 
-#[cfg(not(target_arch = "wasm32"))]
 use eframe::egui::{FontData, FontDefinitions, FontFamily};
 
 pub const BG_PRIMARY: Color32 = Color32::from_rgb(0x0b, 0x0e, 0x11);
@@ -19,7 +18,13 @@ pub const CHART_GRID: Color32 = Color32::from_rgb(0x1e, 0x23, 0x29);
 
 pub fn apply(context: &egui::Context) {
     #[cfg(not(target_arch = "wasm32"))]
-    install_system_cjk_fallback(context);
+    install_system_fonts(context);
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut fonts = FontDefinitions::default();
+        install_emphasis_family(&mut fonts);
+        context.set_fonts(fonts);
+    }
     context.set_theme(egui::Theme::Dark);
     let mut style = (*context.style_of(egui::Theme::Dark)).clone();
     let mut visuals = egui::Visuals::dark();
@@ -42,6 +47,17 @@ pub fn apply(context: &egui::Context) {
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, BRAND_HOVER);
     visuals.widgets.active.bg_fill = Color32::from_rgb(0x3a, 0x3f, 0x47);
     visuals.widgets.active.bg_stroke = Stroke::new(1.0, BRAND_HOVER);
+    visuals.window_corner_radius = egui::CornerRadius::same(8);
+    visuals.menu_corner_radius = egui::CornerRadius::same(6);
+    for widget in [
+        &mut visuals.widgets.noninteractive,
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        widget.corner_radius = egui::CornerRadius::same(5);
+    }
     style.visuals = visuals;
     style.spacing.item_spacing = egui::vec2(6.0, 4.0);
     style.spacing.button_padding = egui::vec2(9.0, 5.0);
@@ -65,19 +81,86 @@ pub fn apply(context: &egui::Context) {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn install_system_cjk_fallback(context: &egui::Context) {
-    const MAX_FONT_BYTES: u64 = 32 * 1024 * 1024;
-    let Some(path) = cjk_font_candidates().into_iter().find(|path| {
-        std::fs::metadata(path).is_ok_and(|metadata| {
-            metadata.is_file() && metadata.len() > 0 && metadata.len() <= MAX_FONT_BYTES
-        })
-    }) else {
-        return;
-    };
-    let Ok(bytes) = std::fs::read(path) else {
-        return;
-    };
+fn install_system_fonts(context: &egui::Context) {
     let mut fonts = FontDefinitions::default();
+    if let Some(bytes) = read_first_font(cjk_font_candidates()) {
+        add_cjk_font(&mut fonts, bytes);
+    }
+    let mut candidates = Vec::new();
+    if let Some(windows) = std::env::var_os("WINDIR") {
+        candidates.push(std::path::PathBuf::from(windows).join("Fonts/segoeui.ttf"));
+    }
+    for path in [
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ] {
+        candidates.push(path.into());
+    }
+    if let Some(bytes) = read_first_font(candidates) {
+        let name = "venueflow-system-ui".to_owned();
+        fonts
+            .font_data
+            .insert(name.clone(), FontData::from_owned(bytes).into());
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, name);
+    }
+    install_emphasis_family(&mut fonts);
+    if let Some(windows) = std::env::var_os("WINDIR")
+        && let Some(bytes) = read_first_font(vec![
+            std::path::PathBuf::from(windows).join("Fonts/seguisb.ttf"),
+        ])
+    {
+        let name = "venueflow-system-semibold".to_owned();
+        fonts
+            .font_data
+            .insert(name.clone(), FontData::from_owned(bytes).into());
+        fonts
+            .families
+            .entry(emphasis_font(14.0).family)
+            .or_default()
+            .insert(0, name);
+    }
+    context.set_fonts(fonts);
+}
+
+pub fn emphasis_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("venueflow-emphasis".into()))
+}
+
+fn install_emphasis_family(fonts: &mut FontDefinitions) {
+    let fallback = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    fonts.families.insert(emphasis_font(14.0).family, fallback);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_first_font(paths: Vec<std::path::PathBuf>) -> Option<Vec<u8>> {
+    const MAX_FONT_BYTES: u64 = 32 * 1024 * 1024;
+    paths.into_iter().find_map(|path| {
+        if !std::fs::metadata(&path).is_ok_and(|metadata| {
+            metadata.is_file() && metadata.len() > 0 && metadata.len() <= MAX_FONT_BYTES
+        }) {
+            return None;
+        }
+        std::fs::read(path).ok()
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn install_cjk_bytes(context: &egui::Context, bytes: Vec<u8>) {
+    let mut fonts = FontDefinitions::default();
+    add_cjk_font(&mut fonts, bytes);
+    install_emphasis_family(&mut fonts);
+    context.set_fonts(fonts);
+}
+
+fn add_cjk_font(fonts: &mut FontDefinitions, bytes: Vec<u8>) {
     let name = "venueflow-system-cjk".to_owned();
     fonts
         .font_data
@@ -85,7 +168,6 @@ fn install_system_cjk_fallback(context: &egui::Context) {
     for family in [FontFamily::Proportional, FontFamily::Monospace] {
         fonts.families.entry(family).or_default().push(name.clone());
     }
-    context.set_fonts(fonts);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -111,7 +193,7 @@ pub fn panel_frame() -> Frame {
     Frame::new()
         .fill(PANEL)
         .stroke(Stroke::new(1.0, DIVIDER))
-        .corner_radius(egui::CornerRadius::same(3))
+        .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(Margin::same(7))
 }
 

@@ -23,7 +23,7 @@ export function CustomerConsole({ inviteCode, registration = false }: { inviteCo
   const [invite, setInvite] = useState<Invite | null>(null);
   const [error, setError] = useState(""); const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(true); const [busy, setBusy] = useState(false);
-  const [fresh, setFresh] = useState(false); const [confirmed, setConfirmed] = useState(false);
+  const [fresh, setFresh] = useState(false);
   const [pending, setPending] = useState<Pending | null>(null);
   const mutating = useRef(false); const version = useRef(0); const hasSession = useRef(true);
   const refresh = useCallback(async () => {
@@ -36,7 +36,7 @@ export function CustomerConsole({ inviteCode, registration = false }: { inviteCo
     } catch (cause) {
       if (version.current !== current) return;
       setFresh(false);
-      if (cause instanceof RequestError && cause.status === 401) { hasSession.current = false; setOverview(null); setLeader(null); setKolProfile(null); setRelation(null); setOrders([]); setPending(null); setConfirmed(false); }
+      if (cause instanceof RequestError && cause.status === 401) { hasSession.current = false; setOverview(null); setLeader(null); setKolProfile(null); setRelation(null); setOrders([]); setPending(null); }
       else setError(cause instanceof Error ? cause.message : messages.unavailable);
     } finally { if (version.current === current) setLoading(false); }
   }, []);
@@ -52,11 +52,22 @@ export function CustomerConsole({ inviteCode, registration = false }: { inviteCo
     mutating.current = true; setBusy(true); setError(""); setMessage(""); setFresh(false); version.current++;
     if (retryable) setPending({ action, body });
     try {
-      const result = await api<Partial<Credential>>(action, overview?.csrf, body); setPending(null); setConfirmed(false);
+      const result = await api<Partial<Credential> & { can_use?: boolean; bots?: NonNullable<LeaderAccess["bot"]>[] }>(action, overview?.csrf, body);
+      if (action === "leader-create") {
+        const created = result.bots?.length === 1 ? result.bots[0] : null;
+        if (!result.can_use || !created || created.state !== "stopped" || created.credential_id !== (body as { credential_id: string }).credential_id) {
+          throw new RequestError(409, "conflict");
+        }
+        const start = { schema_version: 1, request_id: crypto.randomUUID(), bot_id: created.bot_id, expected_revision: created.revision, action: "start", risk_confirmed: true };
+        // Once creation is confirmed, retry only this lifecycle identity, never create again.
+        setPending({ action: "leader-lifecycle", body: start });
+        await api<LeaderAccess>("leader-lifecycle", overview?.csrf, start);
+      }
+      setPending(null);
       if (action === "logout") { hasSession.current = false; setOverview(null); setLeader(null); setKolProfile(null); setRelation(null); setOrders([]); }
       else {
         if (action === "verify") { const feedback = verificationFeedback(result.verification); if (feedback.success) setMessage(feedback.message); else setError(feedback.message); }
-        else setMessage("请求已处理。");
+        else setMessage(action === "leader-create" || action === "leader-lifecycle" ? "带单操作已处理，请核对当前状态。" : "请求已处理。");
         await refresh();
       }
     } catch (cause) {
@@ -69,36 +80,39 @@ export function CustomerConsole({ inviteCode, registration = false }: { inviteCo
   const locked = busy || !fresh || pending !== null;
   const bot = leader?.bot;
   return <main className="customer-page"><div className="customer-stack">
-    <header className="customer-header"><div><p className="eyebrow">VENUE · BINANCE LIVE</p><h1>{kolProfile ? "KOL 管理后台" : "跟单账户"}</h1><p>同步 KOL 的限价单、市价单和止损单，使用自己的交易账户执行。</p></div>{overview && <div className="buttons"><span>{overview.user.username}</span><button disabled={busy || pending !== null} onClick={() => void mutate("logout", {})}>退出登录</button></div>}</header>
+    <header className="customer-header"><div><p className="eyebrow">VENUE · BINANCE LIVE</p><h1>{kolProfile ? "KOL 管理后台" : "跟单账户"}</h1><p>同步 KOL 的限价单、市价单和止损单，使用自己的交易账户执行。</p></div>{overview && <div className="buttons">{kolProfile && <a className="guide-help-link" href="/help/kol">KOL 使用指南</a>}<span>{overview.user.username}</span><button disabled={busy || pending !== null} onClick={() => void mutate("logout", {})}>退出登录</button></div>}</header>
     {error && <div role="alert" className="notice error">{error}</div>}
     {message && <div role="status" className="notice">{message}</div>}
     {pending && <div className="notice"><span>上次请求结果待确认。重试会使用同一个请求编号。</span><div className="buttons"><button disabled={busy} onClick={() => void mutate(pending.action, pending.body, true)}>查询并重试原请求</button></div></div>}
     {loading ? <p role="status">正在读取账户…</p> : !overview ? <section className="panel customer-auth"><h2>{registering ? "注册跟单账户" : "登录账户"}</h2>{invite && <div className="customer-invite"><strong>{invite.profile.name} · {invite.profile.title}</strong><p>{invite.profile.description}</p></div>}
       <form onSubmit={(event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = new FormData(event.currentTarget); const body = { username: field(data, "username"), password: field(data, "password"), ...(registering ? { invite_code: inviteCode ?? field(data, "inviteCode").trim() } : {}) }; event.currentTarget.reset(); void mutate(registering ? "register" : "login", body); }}>
-        {registering && !inviteCode && <label>KOL 邀请码<input name="inviteCode" required minLength={6} maxLength={64} pattern="[A-Za-z0-9_-]+" autoComplete="off" /><small>向你要跟随的 KOL 获取邀请码。注册后归属固定，不会自动换绑。</small></label>}
+        {registering && !inviteCode && <label>KOL 邀请码<input name="inviteCode" required minLength={4} maxLength={64} pattern="[A-Za-z0-9]+" autoComplete="off" /><small>向你要跟随的 KOL 获取邀请码。注册后归属固定，不会自动换绑。</small></label>}
         <label>用户名<input name="username" autoComplete="username" required minLength={3} maxLength={64} /></label>
         <label>密码<input name="password" type="password" autoComplete={registering ? "new-password" : "current-password"} required minLength={8} maxLength={128} /></label>
         <div className="buttons"><button className="primary" disabled={busy || Boolean(inviteCode && !invite)}>{registering ? "注册跟单账户" : "登录"}</button>{registering ? <a href="/login">已有账户，前往登录</a> : <a href="/register">注册跟单账户</a>}</div>
       </form><p className="muted">注册后仅管理自己的跟单账户，添加账户时选择定比或定额，不开通带单权限。跟单注册需要有效的 KOL 邀请。已有跟单绑定保持不变。历史表现不保证未来收益；主从账户独立成交，可能产生亏损。</p></section> : <>
       {!fresh && <div className="notice">账户状态尚未刷新，启动操作暂不可用。<button disabled={busy} onClick={() => void refresh()}>刷新状态</button></div>}
-      <section className="panel"><h2>{kolProfile ? "交易账户" : "我的跟单账户"}</h2><p>必须使用币安统一账户（Portfolio Margin），并开启 U 本位合约双向持仓。密钥须具备读取和 UM 交易权限，关闭提现。</p>
+      <section className="panel"><h2>{kolProfile ? "交易账户" : "我的跟单账户"}</h2><p>KOL 和跟单帐户都必须是币安统一帐户，且开通 U 本位合约，在交易设置中修改为双向持仓。API 设置需要开启统一账户交易。</p>
         {overview.credentials.length === 0 ? <p className="muted">尚未绑定交易账户。</p> : overview.credentials.map(credential => <CredentialRow key={credential.credential_id} credential={credential} selected={selected?.credential_id === credential.credential_id} disabled={locked} mutate={mutate} canLead={Boolean(kolProfile)} relation={relation?.settings.credential_id === credential.credential_id ? relation : null} />)}
-        <details><summary>{kolProfile ? "添加交易账户" : "添加跟单账户"}</summary><form onSubmit={(event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = new FormData(event.currentTarget); const body = { label: field(data, "label"), key: field(data, "key"), secret: field(data, "secret"), authorization: kolProfile ? { sizing: { mode: "proportional" }, multiplier: "1" } : authorizationFromForm(data) }; event.currentTarget.reset(); void mutate("credentials", body); }}>
+        <details><summary>{kolProfile ? "添加交易账户" : "添加跟单账户"}</summary><a href="/help/kol#api" target="_blank" rel="noreferrer">如何创建 API 并通过验证？</a><form onSubmit={(event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = new FormData(event.currentTarget); const body = { label: field(data, "label"), key: field(data, "key"), secret: field(data, "secret"), authorization: kolProfile ? { sizing: { mode: "proportional" }, multiplier: "1" } : authorizationFromForm(data) }; event.currentTarget.reset(); void mutate("credentials", body); }}>
           <label>账户名称<input name="label" required maxLength={64} autoComplete="off" /></label><label>API密钥<input name="key" type="password" required minLength={16} maxLength={256} autoComplete="off" spellCheck={false} /></label><label>密钥<input name="secret" type="password" required minLength={16} maxLength={256} autoComplete="off" spellCheck={false} /></label>
           {!kolProfile && <FollowAuthorizationFields />}
           <div className="buttons"><button disabled={locked}>{kolProfile ? "绑定交易账户" : "绑定并授权跟单"}</button></div>
         </form><p className="muted">{kolProfile ? "绑定并验证成功后，请在下方指定唯一带单账户。" : "默认定比跟单 1 倍，定额跟单需填写每笔名义金额。验证成功后自动申请跟单。"}密钥仅由服务器加密保存。</p></details>
       </section>
-      {kolProfile && <KolSourcePanel csrf={overview.csrf} credentials={overview.credentials} onSource={setSourceAccount} />}
-      {(leader?.can_use || bot) && <section className="panel" aria-label="带单机器人"><div className="heading"><h2>带单机器人</h2><span className="pill">{bot ? states[bot.state] ?? bot.state : "尚未创建"}</span></div>
-        {!leader?.can_use && <p>带单权限已撤销。已有实例仍可查看和停止。</p>}
-        {bot ? <><p>主账户：{bot.trading_account_id}</p><p>跟单账户 {bot.active_followers} · 待处理挂单 {bot.pending_orders}</p>{bot.attention_code && <p role="status">需处理：{bot.attention_code}</p>}</> : <p>将已验证的 KOL 主账户设为带单源。</p>}
-        {leader?.can_use && bot?.state === "stopped" && <label className="customer-confirm"><input type="checkbox" checked={confirmed} onChange={e => setConfirmed(e.target.checked)} />我确认启动后，符合条件的新挂单将同步到启用跟单的账户。</label>}
-        <div className="buttons">{!bot && leader?.can_use && <button disabled={locked || selected?.verification !== "verified"} onClick={() => void mutate("leader", { schema_version: 1, request_id: crypto.randomUUID(), credential_id: selected?.credential_id }, true)}>创建带单机器人</button>}
-          {bot && leader?.can_use && bot.state === "stopped" && <button className="primary" disabled={locked || !confirmed} onClick={() => void mutate("leader-lifecycle", { schema_version: 1, request_id: crypto.randomUUID(), bot_id: bot.bot_id, expected_revision: bot.revision, action: "start", risk_confirmed: true }, true)}>启动带单</button>}
-          {bot && bot.state !== "stopped" && <button disabled={locked || bot.state === "draining"} onClick={() => void mutate("leader-lifecycle", { schema_version: 1, request_id: crypto.randomUUID(), bot_id: bot.bot_id, expected_revision: bot.revision, action: "stop", risk_confirmed: false }, true)}>停止并撤销同步挂单</button>}
-        </div><p className="muted">停止只撤销程序创建的同步挂单，已有仓位不会自动平仓。</p>
-      </section>}
+      {kolProfile && <KolSourcePanel csrf={overview.csrf} credentials={overview.credentials} onSource={setSourceAccount} disabled={locked}>
+        <div><div className="buttons"><span className="pill">{bot ? states[bot.state] ?? bot.state : "未启用"}</span>
+          <button type="button" role="switch" aria-checked={bot?.state === "running"} aria-label="带单开关" className="primary" disabled={locked || bot?.state === "draining" || (!(bot && bot.state !== "stopped") && (!leader?.can_use || selected?.verification !== "verified" || (!bot && !hasFollowEquity(selected?.equity))))} onClick={() => {
+            if (bot) void mutate("leader-lifecycle", { schema_version: 1, request_id: crypto.randomUUID(), bot_id: bot.bot_id, expected_revision: bot.revision, action: bot.state === "stopped" ? "start" : "stop", risk_confirmed: bot.state === "stopped" }, true);
+            else if (selected && hasFollowEquity(selected.equity)) void mutate("leader-create", { schema_version: 2, request_id: crypto.randomUUID(), credential_id: selected.credential_id, config: { name: "KOL 带单", description: "", strategy_capital: selected.equity } }, true);
+          }}>{busy ? "正在处理…" : bot?.state === "draining" ? "正在停止…" : bot && bot.state !== "stopped" ? "停止带单" : "启用带单"}</button>
+        </div>
+        {!leader?.can_use && <p className="muted">当前尚未获得带单权限，请先保存已验证的带单账户；已撤权时需联系管理员。</p>}
+        {leader?.can_use && selected?.verification !== "verified" && <p className="muted">请先验证账户并保存带单账户。</p>}
+        {leader?.can_use && selected?.verification === "verified" && !bot && !hasFollowEquity(selected.equity) && <p role="status">尚未取得正账户权益。请入金后点击“验证权限”更新权益，再启用带单。</p>}
+        {bot?.attention_code && <p role="status">需处理：{bot.attention_code}</p>}
+        </div>
+      </KolSourcePanel>}
       {kolProfile && <KolInvitePanel key={`invite:${overview.user.user_id}`} csrf={overview.csrf} enabled={kolProfile.state === "enabled"} />}
       <ManagedFollowersPanel key={`managed:${overview.user.user_id}`} csrf={overview.csrf} />
       {!kolProfile && <section className="panel"><h2>我的同步订单</h2><p className="muted">主账户和跟单账户独立成交；显示最近 500 条订单记录。</p>{orders.length === 0 ? <p>暂无同步订单。</p> : <div className="table"><table><thead><tr><th>交易对</th><th>来源订单</th><th>委托数量</th><th>已成交</th><th>状态</th></tr></thead><tbody>{orders.map(order => <tr key={order.mirror_id}><td>{order.symbol}</td><td>{order.source_order_id}</td><td>{order.requested_quantity}</td><td>{order.filled_quantity}</td><td>{states[order.state] ?? order.state}{order.attention_code && <small> · {order.attention_code}</small>}</td></tr>)}</tbody></table></div>}</section>}

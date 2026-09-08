@@ -1,6 +1,9 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod stream;
-use super::{ClientEvent, path, publish};
+use super::path;
+#[cfg(not(target_arch = "wasm32"))]
+use super::{ClientEvent, publish};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::account_scope::Scoped;
 use futures_util::StreamExt;
 use venue_control_protocol::kol::{

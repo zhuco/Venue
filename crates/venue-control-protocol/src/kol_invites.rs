@@ -16,9 +16,7 @@ impl KolInviteCreateRequest {
             let code = code.trim();
             (crate::accounts::MIN_INVITE_CODE_CHARS..=crate::accounts::MAX_INVITE_CODE_CHARS)
                 .contains(&code.len())
-                && code
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+                && code.bytes().all(|c| c.is_ascii_alphanumeric())
         }) && crate::leader_bot::valid_id(&self.request_id)
             && self
                 .expected_invite_id
@@ -33,4 +31,27 @@ pub struct KolInviteSummary {
     pub invite_code: Option<String>,
     pub active: bool,
     pub created_ms: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_invites_require_four_to_sixty_four_ascii_alphanumerics() {
+        let mut request = KolInviteCreateRequest {
+            request_id: "00000000-0000-4000-8000-000000000001".into(),
+            expected_invite_id: None,
+            invite_code: None,
+        };
+        assert!(request.valid());
+        for code in ["Ab12", "1234", "a".repeat(64).as_str()] {
+            request.invite_code = Some(code.into());
+            assert!(request.valid());
+        }
+        for code in ["Ab1", "AB_1", "AB-1", "中文12", "a".repeat(65).as_str()] {
+            request.invite_code = Some(code.into());
+            assert!(!request.valid());
+        }
+    }
 }

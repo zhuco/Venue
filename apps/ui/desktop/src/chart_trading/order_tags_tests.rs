@@ -525,7 +525,7 @@ fn sent_cancel_hides_immediately_and_uncertainty_restores_without_mutating_facts
         .position_submission_failed("cancel-request", false);
     let overlays = super::super::collect(&model, "DOGE/USDC", &ChartTradingSettings::default());
     assert_eq!(overlays.len(), 1);
-    assert_eq!(overlays[0].label, "只做Maker");
+    assert_eq!(overlays[0].label, "开空 · 只做Maker");
     assert!(
         overlays[0]
             .badge
@@ -784,8 +784,8 @@ fn nearby_badges_overlap_at_exact_prices_and_lines_never_cross_badges()
 }
 
 #[test]
-fn latest_price_has_no_label_even_when_price_labels_are_enabled()
--> Result<(), Box<dyn std::error::Error>> {
+fn latest_price_has_one_axis_price_without_a_canvas_title() -> Result<(), Box<dyn std::error::Error>>
+{
     let mut harness = Harness::new()?;
     harness.overlays.clear();
     harness.market_price = Some(Decimal::new(8660, 5));
@@ -799,7 +799,14 @@ fn latest_price_has_no_label_even_when_price_labels_are_enabled()
             .iter()
             .any(|text| text.contains("最新价格") || text.contains("Last price"))
     );
-    assert!(!harness.texts.iter().any(|text| text == "0.08660"));
+    assert_eq!(
+        harness
+            .texts
+            .iter()
+            .filter(|text| *text == "0.08660")
+            .count(),
+        1
+    );
     Ok(())
 }
 
@@ -859,7 +866,7 @@ fn position_icons_queue_only_the_clicked_action_and_do_not_select_chart_price()
         let mut output = harness.frame(vec![]);
         for shape in &output.shapes {
             if let egui::Shape::Rect(shape) = &shape.shape {
-                if shape.stroke.color == theme::BUY && shape.rect.height() == 20.0 {
+                if shape.stroke.color == theme::BUY && (shape.rect.height() - 20.0).abs() < 0.01 {
                     rect = shape.rect;
                 }
             }

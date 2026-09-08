@@ -671,6 +671,11 @@ async fn account_request(
                 .bind_follow_credential(&principal, decode(&request.body)?, now)
                 .await?,
         ),
+        (Method::Post, BITGET_COPY_CREDENTIALS_PATH) => encode(
+            &accounts
+                .bind_bitget_copy_credential(&principal, decode(&request.body)?, now)
+                .await?,
+        ),
         (Method::Post, VERIFY_PATH) => {
             let target: CredentialRequest = decode(&request.body)?;
             encode(

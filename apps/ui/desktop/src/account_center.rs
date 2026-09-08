@@ -5,6 +5,7 @@ use crate::{
     theme,
 };
 use eframe::egui::{self, RichText};
+use venue_control_protocol::VenueId;
 use venue_control_protocol::accounts::*;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -31,6 +32,8 @@ pub(crate) struct AccountCenter {
     label: String,
     api_key: Zeroizing<String>,
     api_secret: Zeroizing<String>,
+    passphrase: Zeroizing<String>,
+    adding_venue: Option<VenueId>,
     deleting: Option<String>,
     error: Option<AccountErrorCode>,
     next_refresh_ms: u64,
@@ -230,6 +233,7 @@ impl AccountCenter {
         self.confirmation.zeroize();
         self.api_key.zeroize();
         self.api_secret.zeroize();
+        self.passphrase.zeroize();
     }
 }
 
@@ -300,6 +304,7 @@ pub(crate) fn show(
         state.form_visible = false;
         state.clear_form_secrets();
         state.adding = false;
+        state.adding_venue = None;
         state.deleting = None;
     }
     *open = visible;
@@ -521,6 +526,7 @@ fn show_accounts(ui: &mut egui::Ui, state: &mut AccountCenter, model: &mut AppMo
         ui.heading(tr(l, "交易所 API 管理", "Exchange API management"));
         if ui.button(tr(l, "＋ 添加 API", "+ Add API")).clicked() {
             state.adding = true;
+            state.adding_venue = Some(VenueId::Binance);
             state.deleting = None;
             state.clear_form_secrets();
         }
@@ -537,8 +543,8 @@ fn show_accounts(ui: &mut egui::Ui, state: &mut AccountCenter, model: &mut AppMo
     if credentials.is_empty() {
         ui.label(tr(
             l,
-            "尚未绑定 API。添加币安 API 后，验证并选择执行账户。",
-            "No API is bound. Add a Binance API, verify it, then select the execution account.",
+            "尚未绑定 API。添加 Binance 或 Bitget 带单 API，验证并选择执行账户。",
+            "No API is bound. Add a Binance or Bitget copy-trading API, verify it, then select the execution account.",
         ));
     }
     show_credentials_table(ui, state, model, &credentials);
@@ -624,7 +630,18 @@ fn show_credentials_table(
                                 },
                                 verification_text(l, &credential.verification),
                             );
-                            if ui.button(tr(l, "验证 API", "Verify API")).clicked() {
+                            if credential.venue == VenueId::Bitget {
+                                ui.add_enabled(false, egui::Button::new(tr(
+                                    l,
+                                    "保存时已验证",
+                                    "Verified on save",
+                                )))
+                                .on_hover_text(tr(
+                                    l,
+                                    "Bitget 带单 API 保存时验证；策略启动和发送前仍会重新核验权限。",
+                                    "Verified when saved; permissions are checked again before strategy start and order dispatch.",
+                                ));
+                            } else if ui.button(tr(l, "验证 API", "Verify API")).clicked() {
                                 state.submit(
                                     AccountAction::Verify(credential.credential_id.clone()),
                                     model,
@@ -690,8 +707,8 @@ fn show_remove_confirmation(
                 theme::WARNING,
                 tr(
                     l,
-                    "仅删除 Venue 绑定，不撤销币安 Key。存在持仓、挂单或运行账户时会拒绝删除。",
-                    "Removes only the Venue binding, not the Binance key. Exposure, orders or a running account block removal.",
+                    "仅删除 Venue 绑定，不撤销交易所 Key。存在持仓、挂单或运行账户时会拒绝删除。",
+                    "Removes only the Venue binding, not the exchange key. Exposure, orders or a running account block removal.",
                 ),
             );
             field(
@@ -726,19 +743,45 @@ fn show_remove_confirmation(
 
 fn show_add(ui: &mut egui::Ui, state: &mut AccountCenter, model: &AppModel) {
     let l = model.preferences.language;
-    ui.strong(tr(
-        l,
-        "添加已有 Binance API · Portfolio Margin UM",
-        "Add existing Binance API · Portfolio Margin UM",
-    ));
-    ui.small(tr(
-        l,
-        "需要读取和统一账户交易权限、双向持仓；请关闭提现权限。",
-        "Requires reading, Portfolio Margin trading and Hedge mode; disable withdrawals.",
-    ));
+    let venue = state.adding_venue.unwrap_or(VenueId::Binance);
+    ui.strong(tr(l, "添加带单 API", "Add copy-trading API"));
+    ui.horizontal(|ui| {
+        ui.label(tr(l, "交易所", "Exchange"));
+        let binance = ui.selectable_value(
+            &mut state.adding_venue,
+            Some(VenueId::Binance),
+            "Binance 带单",
+        );
+        let bitget = ui.selectable_value(
+            &mut state.adding_venue,
+            Some(VenueId::Bitget),
+            "Bitget 带单",
+        );
+        if (binance.clicked() && venue == VenueId::Bitget)
+            || (bitget.clicked() && venue != VenueId::Bitget)
+        {
+            state.passphrase.zeroize();
+        }
+    });
+    if venue == VenueId::Binance {
+        ui.small(tr(
+            l,
+            "需要读取和统一账户交易权限、双向持仓；请关闭提现权限。",
+            "Requires reading, Portfolio Margin trading and Hedge mode; disable withdrawals.",
+        ));
+    } else {
+        ui.small(tr(
+            l,
+            "Bitget UTA 合约带单需要读取、交易权限和双向持仓；请关闭提现权限。保存时验证账户身份和权限。",
+            "Bitget UTA copy trading requires read/trade permission and Hedge mode; identity and permissions are verified on save.",
+        ));
+    }
     field(ui, tr(l, "备注名称", "Label"), &mut state.label, false, 64);
     field(ui, "API Key", &mut state.api_key, true, 256);
     field(ui, "API Secret", &mut state.api_secret, true, 256);
+    if venue == VenueId::Bitget {
+        field(ui, "Passphrase", &mut state.passphrase, true, 256);
+    }
     ui.small(tr(
         l,
         "密钥仅用于加密绑定，不保存在本机界面配置。",
@@ -747,21 +790,34 @@ fn show_add(ui: &mut egui::Ui, state: &mut AccountCenter, model: &AppModel) {
     ui.horizontal(|ui| {
         let valid = !state.label.trim().is_empty()
             && state.api_key.len() >= 16
-            && state.api_secret.len() >= 16;
+            && state.api_secret.len() >= 16
+            && (venue == VenueId::Binance || !state.passphrase.trim().is_empty());
         if ui
             .add_enabled(valid, egui::Button::new(tr(l, "保存绑定", "Save binding")))
             .clicked()
         {
-            let request = BindCredentialRequest {
-                label: std::mem::take(&mut state.label),
-                api_key: SecretValue::new(std::mem::take(&mut *state.api_key)),
-                api_secret: SecretValue::new(std::mem::take(&mut *state.api_secret)),
+            let action = if venue == VenueId::Bitget {
+                AccountAction::BindBitgetCopy(BindBitgetCopyCredentialRequest {
+                    label: std::mem::take(&mut state.label),
+                    api_key: SecretValue::new(std::mem::take(&mut *state.api_key)),
+                    api_secret: SecretValue::new(std::mem::take(&mut *state.api_secret)),
+                    passphrase: SecretValue::new(std::mem::take(&mut *state.passphrase)),
+                })
+            } else {
+                state.passphrase.zeroize();
+                AccountAction::Bind(BindCredentialRequest {
+                    label: std::mem::take(&mut state.label),
+                    api_key: SecretValue::new(std::mem::take(&mut *state.api_key)),
+                    api_secret: SecretValue::new(std::mem::take(&mut *state.api_secret)),
+                })
             };
             state.adding = false;
-            state.submit(AccountAction::Bind(request), model, ui.ctx());
+            state.adding_venue = None;
+            state.submit(action, model, ui.ctx());
         }
         if ui.button(tr(l, "取消", "Cancel")).clicked() {
             state.adding = false;
+            state.adding_venue = None;
             state.clear_form_secrets();
         }
     });
@@ -898,8 +954,8 @@ fn error_text(l: Language, code: AccountErrorCode) -> &'static str {
         ),
         AccountErrorCode::AccountInUse => tr(
             l,
-            "账户仍有风险、正在运行或无法确认安全状态，不能删除。",
-            "Account has exposure, is running, or cannot be confirmed safe to remove.",
+            "账户仍有风险、正在运行或无法确认安全状态，暂不能执行此操作。",
+            "Account has exposure, is running, or cannot be confirmed safe for this operation.",
         ),
         AccountErrorCode::RateLimited => tr(
             l,

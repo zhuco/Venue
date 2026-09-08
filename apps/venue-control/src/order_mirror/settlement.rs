@@ -92,11 +92,23 @@ pub(crate) async fn mirror_send_allowed(
     let original: TerminalOpenOrder =
         serde_json::from_value(row.try_get("source_order_json").map_err(unavailable)?)
             .map_err(|_| Error::Conflict)?;
-    Ok(current.is_some_and(|p| {
-        p.open_orders
-            .iter()
-            .any(|o| super::planner::eligible(o, 0) && same_terms(o, &original))
-    }))
+    let Some(current) = current else {
+        return Ok(false);
+    };
+    if let Some(order) = current
+        .open_orders
+        .iter()
+        .find(|o| o.symbol == original.symbol && o.native_order_id == original.native_order_id)
+    {
+        return Ok(super::planner::eligible(order, 0) && same_terms(order, &original));
+    }
+    let mut connection = store.mirror_pool().acquire().await.map_err(unavailable)?;
+    super::completed_source::source_complete(
+        &mut connection,
+        &text(&row, "leader_account")?,
+        &original,
+    )
+    .await
 }
 
 // Return true for mirror commands so the old market-target settlement cannot consume them.

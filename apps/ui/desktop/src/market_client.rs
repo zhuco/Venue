@@ -2,6 +2,7 @@
 mod native {
     mod delivery;
     mod history;
+    mod latency;
     use delivery::MarketSender;
     mod multi;
     use std::{
@@ -58,7 +59,7 @@ mod native {
     const MAX_SUBSCRIPTIONS: usize = 8;
     const DEFAULT_HISTORY_LIMIT: usize = 1_000;
     const REPAINT_INTERVAL: Duration = Duration::from_millis(50);
-    const PING_INTERVAL: Duration = Duration::from_secs(15);
+    const PING_INTERVAL: Duration = Duration::from_millis(500);
     const PONG_DEADLINE: Duration = Duration::from_secs(45);
     const COMMAND_SEND_TIMEOUT: Duration = Duration::from_millis(250);
 
@@ -154,8 +155,17 @@ mod native {
                 .map_err(|_| LocalMarketClientError::CommandUnavailable)
         }
 
+        #[cfg(any(test, feature = "preview"))]
         pub fn drain(&self, limit: usize) -> Vec<LocalMarketClientEvent> {
             self.events.try_iter().take(limit).collect()
+        }
+
+        pub(crate) fn next_event(&self) -> Option<LocalMarketClientEvent> {
+            self.events.try_recv().ok()
+        }
+
+        pub(crate) fn has_events(&self) -> bool {
+            !self.events.is_empty()
         }
     }
 
@@ -582,15 +592,25 @@ mod native {
             }
             attempt = 0;
             let mut heartbeat = tokio::time::interval(PING_INTERVAL);
-            let mut clock_refresh = tokio::time::interval(Duration::from_secs(60));
-            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let clock_recovery = async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if let Err(error) = multi::ensure_clock(http).await {
+                        break Err::<(), String>(error);
+                    }
+                }
+            };
+            tokio::pin!(clock_recovery);
+            let mut public_rtt = latency::Probe::default();
+            let mut market_rtt = latency::Probe::default();
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut last_public_pong = Instant::now();
             let mut last_market_pong = Instant::now();
             let session_error = loop {
                 tokio::select! {
                     command = commands.recv() => return command,
-                    _ = clock_refresh.tick() => {
-                        if let Err(error) = multi::ensure_clock(http).await {
+                    result = &mut clock_recovery => {
+                        if let Err(error) = result {
                             break error;
                         }
                     }
@@ -601,10 +621,10 @@ mod native {
                         if last_market_pong.elapsed() > PONG_DEADLINE {
                             break "market websocket pong deadline exceeded".to_owned();
                         }
-                        if let Err(error) = public_websocket.send(Message::Ping(Vec::new().into())).await {
+                        if let Err(error) = public_websocket.send(Message::Ping(public_rtt.start().into())).await {
                             break format!("public websocket ping failed: {error}");
                         }
-                        if let Err(error) = market_websocket.send(Message::Ping(Vec::new().into())).await {
+                        if let Err(error) = market_websocket.send(Message::Ping(market_rtt.start().into())).await {
                             break format!("market websocket ping failed: {error}");
                         }
                     }
@@ -612,6 +632,9 @@ mod native {
                         match frame {
                             Some(Ok(Message::Text(payload))) => {
                                 let received_ms = now_ms();
+                                if received_ms == 0 {
+                                    continue;
+                                }
                                 if payload.len() > WS_FRAME_LIMIT {
                                     break "public websocket text frame exceeded 1 MiB".to_owned();
                                 }
@@ -631,7 +654,14 @@ mod native {
                                     break format!("public websocket pong failed: {error}");
                                 }
                             }
-                            Some(Ok(Message::Pong(_))) => last_public_pong = Instant::now(),
+                            Some(Ok(Message::Pong(payload))) => {
+                                last_public_pong = Instant::now();
+                                if public_rtt.finish(&payload).is_some()
+                                    && let Err(error) = latency::publish(&public_rtt, &market_rtt, generation, &selections, &mut emitter)
+                                {
+                                    break error;
+                                }
+                            }
                             Some(Ok(Message::Close(_))) => break "public websocket closed".to_owned(),
                             Some(Ok(Message::Binary(_))) => {
                                 break "unexpected public websocket binary frame".to_owned();
@@ -645,6 +675,9 @@ mod native {
                         match frame {
                             Some(Ok(Message::Text(payload))) => {
                                 let received_ms = now_ms();
+                                if received_ms == 0 {
+                                    continue;
+                                }
                                 if payload.len() > WS_FRAME_LIMIT {
                                     break "market websocket text frame exceeded 1 MiB".to_owned();
                                 }
@@ -664,7 +697,14 @@ mod native {
                                     break format!("market websocket pong failed: {error}");
                                 }
                             }
-                            Some(Ok(Message::Pong(_))) => last_market_pong = Instant::now(),
+                            Some(Ok(Message::Pong(payload))) => {
+                                last_market_pong = Instant::now();
+                                if market_rtt.finish(&payload).is_some()
+                                    && let Err(error) = latency::publish(&public_rtt, &market_rtt, generation, &selections, &mut emitter)
+                                {
+                                    break error;
+                                }
+                            }
                             Some(Ok(Message::Close(_))) => break "market websocket closed".to_owned(),
                             Some(Ok(Message::Binary(_))) => {
                                 break "unexpected market websocket binary frame".to_owned();

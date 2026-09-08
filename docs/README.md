@@ -1,6 +1,6 @@
 # VENUE 文档目录
 
-当前 alpha.28 包含 Binance KOL/终端/Grid、五所独立策略与网格，以及 Bybit 支撑分批做多桌面闭环；共用单例多账户 Executor 与 PostgreSQL 命令账本。版本与功能摘要见 [项目 README](../README.md)。
+当前 v0.1.0 源码包含 Binance KOL/终端/Grid、五所独立策略与网格，以及 Bybit 支撑分批做多桌面闭环；共用单例多账户 Executor 与 PostgreSQL 命令账本。版本与功能摘要以 [项目 README](../README.md)、[VERSION](../VERSION) 和 [CHANGELOG](CHANGELOG.md) 为准；部署或实盘验收状态须单独核验。
 
 | 要解决的问题 | 说明入口 |
 |---|---|

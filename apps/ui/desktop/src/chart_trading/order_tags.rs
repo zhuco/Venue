@@ -163,10 +163,9 @@ pub(super) fn draw(
         format!("{} {}", overlay.label, format_decimal(overlay.price, scale))
     };
     let title_galley = painter.layout_no_wrap(title, font.clone(), theme::TEXT_PRIMARY);
-    let qty_galley = badge
-        .quantity
-        .as_ref()
-        .map(|quantity| painter.layout_no_wrap(quantity.clone(), FontId::monospace(11.0), color));
+    let qty_galley = badge.quantity.as_ref().map(|quantity| {
+        painter.layout_no_wrap(quantity.clone(), FontId::proportional(11.0), color)
+    });
     let grip_width = if !position { 14.0 } else { 0.0 };
     let cancel_width = if position || badge.selection.is_some() {
         20.0
@@ -504,7 +503,7 @@ pub(super) fn draw(
             Pos2::new(plot.right() - 10.0, price_y),
             Align2::RIGHT_CENTER,
             format_decimal(overlay.price, scale),
-            FontId::monospace(11.0),
+            FontId::proportional(11.0),
             color,
         );
         painter.line_segment(
@@ -617,8 +616,8 @@ pub(crate) fn apply_interaction(
         let mut submit = false;
         egui::Window::new(label(
             language,
-            "撤单并重新挂单",
-            "Cancel and replace",
+            "调整挂单价",
+            "Change order price",
         ))
         .id(preview_id)
         .open(&mut open)
@@ -635,17 +634,17 @@ pub(crate) fn apply_interaction(
                 theme::WARNING,
                 label(
                     language,
-                    "确认后先撤原单，再按最终未成交数量挂新单。",
-                    "Cancel the original order, then place its final unfilled quantity at the new price.",
+                    "先撤原单，再按剩余数量挂新价。",
+                    "Cancel, then replace the remainder at the new price.",
                 ),
             );
             ui.label(label(
                 language,
-                "保留原方向及 GTC/Post Only；撤单期间仍可能成交。新挂失败时原单不会恢复。",
-                "Direction and GTC/Post Only are preserved. Fills can occur during cancellation; a failed replacement does not restore the original.",
+                "撤单前仍可能成交；新挂失败不恢复原单。",
+                "Fills may occur before cancellation. A failed replacement leaves the original cancelled.",
             ));
             submit = ui.add_enabled(!model.execution.chart_orders.is_pending(&selection) && model.confirmed_account_scope().is_some() && old != new,
-                egui::Button::new(label(language, "确认撤单并新挂", "Confirm cancel and replace"))).clicked();
+                egui::Button::new(label(language, "确认改价", "Confirm change"))).clicked();
         });
         if submit {
             let request = venue_control_protocol::kol::TerminalCancelRequest {

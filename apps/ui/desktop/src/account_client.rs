@@ -10,6 +10,7 @@ pub enum AccountAction {
     Refresh,
     Logout,
     Bind(BindCredentialRequest),
+    BindBitgetCopy(BindBitgetCopyCredentialRequest),
     Verify(String),
     Select(String),
     Delete(DeleteCredentialRequest),
@@ -49,6 +50,11 @@ impl AccountClient {
         context: egui::Context,
     ) {
         let sender = self.sender.clone();
+        if cfg!(all(target_arch = "wasm32", feature = "preview")) {
+            let _ = sender.try_send(Err(AccountErrorCode::Unavailable));
+            context.request_repaint();
+            return;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
             let failure_sender = sender.clone();
@@ -154,6 +160,19 @@ async fn execute(
         AccountAction::Bind(request) => {
             let _: CredentialSummary =
                 post(&client, endpoint, CREDENTIALS_PATH, &auth, &request).await?;
+            Ok(AccountResult::Overview(
+                get(&client, endpoint, SESSION_PATH, &auth).await?,
+            ))
+        }
+        AccountAction::BindBitgetCopy(request) => {
+            let _: CredentialSummary = post(
+                &client,
+                endpoint,
+                BITGET_COPY_CREDENTIALS_PATH,
+                &auth,
+                &request,
+            )
+            .await?;
             Ok(AccountResult::Overview(
                 get(&client, endpoint, SESSION_PATH, &auth).await?,
             ))

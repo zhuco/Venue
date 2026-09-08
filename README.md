@@ -1,6 +1,6 @@
 # VENUE
 
-当前产品版本：**v0.1.0-alpha.28 · 开发预览**（[VERSION](VERSION) / [更新说明](docs/CHANGELOG.md)）。
+当前产品版本：**v0.1.1**（[VERSION](VERSION) / [更新说明](docs/CHANGELOG.md)）。
 
 VENUE 提供 Binance 交易终端、KOL 人工带单和对冲网格。VenueFlow 是原生桌面客户端，Web 提供邀请注册、账户管理和跟单设置；交易统一由服务端单个多账户 `venue-executor-binance` 执行。Binance KOL、终端和 Binance Grid 使用 Portfolio Margin UM 双向持仓账户；另外五所通过独立策略入口执行，支撑分批做多首个闭环使用 Bybit LIVE。
 
