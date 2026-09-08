@@ -18,9 +18,9 @@ pub use model::{
 pub use planner::{
     GRID_PLANNER_SCHEMA_VERSION, GridBestBook, GridBlockedReason, GridCloseReservations,
     GridConvergenceFacts, GridExposureReduction, GridInstrumentLimits, GridInventoryAdjustment,
-    GridMakerFill, GridPlan, GridPlanDirective, GridPlanner, GridPlannerConfig, GridPlannerControl,
-    GridPlannerError, GridPlannerInput, GridProfitReductionPolicy, GridReferencePrice,
-    GridReplenishmentPolicy, GridResetPolicy, GridResetTrigger, GridRiskConversion, GridRiskFacts,
-    GridRollingAnchor, GridSemanticOrderKey,
+    GridInventoryRiskPolicy, GridMakerFill, GridPlan, GridPlanDirective, GridPlanner,
+    GridPlannerConfig, GridPlannerControl, GridPlannerError, GridPlannerInput,
+    GridProfitReductionPolicy, GridReferencePrice, GridReplenishmentPolicy, GridResetPolicy,
+    GridResetTrigger, GridRiskConversion, GridRiskFacts, GridRollingAnchor, GridSemanticOrderKey,
 };
 pub use reducer::{HedgedGridState, desired_orders};

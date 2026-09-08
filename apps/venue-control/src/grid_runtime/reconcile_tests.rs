@@ -535,6 +535,8 @@ fn config() -> GridConfig {
         spacing_rate: Decimal::new(1, 2),
         grid_levels: 3,
         max_total_notional: Decimal::from(500),
+        inventory_risk: None,
+        required_leverage: None,
         inventory_replenishment: GridInventoryReplenishment {
             enabled: false,
             minimum_inventory_notional: Decimal::from(5),

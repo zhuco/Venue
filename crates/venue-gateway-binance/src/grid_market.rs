@@ -66,6 +66,43 @@ impl BinanceGridMarketReader {
             .map_err(|_| BinanceAccountGatewayError::Readback)?;
         Ok((account.wallet_balance, response.received_at_ms))
     }
+
+    /// Reads the selected symbol's exact Hedge leverage with the same authenticated position-risk
+    /// endpoint that supplies the Grid's signed inventory. The reader never changes leverage.
+    pub async fn symbol_leverage(
+        &self,
+        credentials: &crate::BinanceCredentials,
+        private_generation: u64,
+    ) -> Result<(u8, u64), BinanceAccountGatewayError> {
+        let rules = self
+            .rules
+            .as_ref()
+            .ok_or(BinanceAccountGatewayError::Instrument)?;
+        let config =
+            BinanceConfig::for_binding(BinanceAccountBinding::PortfolioMarginUm, &self.binding)
+                .map_err(|_| BinanceAccountGatewayError::Binding)?;
+        let transport = BinanceHttpTransport::new(
+            config.clone(),
+            rules.instrument.generation,
+            private_generation,
+            self.transport.recovery_limits(),
+        )?;
+        transport.synchronize_clock().await?;
+        let observed = transport.signing_timestamp_ms()?;
+        let scope =
+            crate::BinancePrivateReadScope::new(&config, rules, private_generation, 1, observed)
+                .map_err(|_| BinanceAccountGatewayError::Readback)?;
+        let request = crate::build_positions_request(&scope)
+            .map_err(|_| BinanceAccountGatewayError::Readback)?;
+        let response = transport
+            .execute_read(credentials, &request, observed)
+            .await?;
+        let payload = std::str::from_utf8(&response.payload)
+            .map_err(|_| BinanceAccountGatewayError::Readback)?;
+        let leverage = crate::parse_signed_hedge_leverage(payload, scope.binding())
+            .map_err(|_| BinanceAccountGatewayError::Readback)?;
+        Ok((leverage, response.received_at_ms))
+    }
     /// Grid rolling needs filters and a real reference price, not bid/ask availability.
     /// A flat first start uses the public mark; existing inventory uses its signed mark.
     pub async fn refresh_reference(

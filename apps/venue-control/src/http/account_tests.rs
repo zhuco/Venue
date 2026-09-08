@@ -504,6 +504,8 @@ fn grid_config(order_notional: i64) -> GridConfig {
         spacing_rate: rust_decimal::Decimal::new(2, 3),
         grid_levels: 10,
         max_total_notional: rust_decimal::Decimal::new(1_000, 0),
+        inventory_risk: None,
+        required_leverage: None,
         inventory_replenishment: GridInventoryReplenishment {
             enabled: false,
             minimum_inventory_notional: rust_decimal::Decimal::new(10, 0),

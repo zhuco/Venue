@@ -10,7 +10,8 @@ use venue_domain::domain::{OrderSide, PositionSide, Symbol, is_canonical_trading
 pub const GRID_SCHEMA_VERSION: u16 = 1;
 pub const GRID_INSTANCES_PATH: &str = "/v2/grid/instances";
 pub const GRID_LIFECYCLE_PATH: &str = "/v2/grid/lifecycle";
-pub const MAX_GRID_LEVELS: u16 = 50;
+/// XRP's five-USDC inventory design needs up to eighty bounded price levels per Hedge leg.
+pub const MAX_GRID_LEVELS: u16 = 80;
 pub const MIN_GRID_STALENESS_MS: u64 = 500;
 pub const MAX_GRID_STALENESS_MS: u64 = 300_000;
 pub const MIN_GRID_CONVERGENCE_MS: u64 = 1_000;
@@ -27,6 +28,16 @@ pub struct GridConfig {
     pub grid_levels: u16,
     #[serde(with = "rust_decimal::serde::str")]
     pub max_total_notional: Decimal,
+    /// Optional inventory envelope for a new Grid.  Omission retains the behaviour of an
+    /// already-running legacy instance; a configured envelope is enforced against positions
+    /// and every currently executable order direction.
+    #[serde(default)]
+    pub inventory_risk: Option<GridInventoryRisk>,
+    /// A Grid with a configured value remains blocked until Binance returns this exact leverage
+    /// from a fresh signed position-risk read. Legacy instances omit the field and retain their
+    /// existing exchange setting.
+    #[serde(default)]
+    pub required_leverage: Option<u8>,
     pub inventory_replenishment: GridInventoryReplenishment,
     pub profit_reduction: GridProfitReduction,
     pub reset_policy: GridResetPolicy,
@@ -42,9 +53,48 @@ impl GridConfig {
         {
             return Err(GridProtocolError::Config);
         }
+        if let Some(risk) = &self.inventory_risk {
+            risk.validate(self.order_notional)?;
+        }
+        if self
+            .required_leverage
+            .is_some_and(|value| !(1..=125).contains(&value))
+        {
+            return Err(GridProtocolError::Config);
+        }
         self.inventory_replenishment.validate()?;
         self.profit_reduction.validate()?;
         self.reset_policy.validate()?;
+        Ok(())
+    }
+}
+
+/// Quote-asset limits for a two-sided inventory Grid.  `max_total_notional` remains the
+/// historical cap on opening orders; these limits constrain realized legs and the worst case in
+/// which all same-direction resting orders execute before their counterparts do.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GridInventoryRisk {
+    #[serde(with = "rust_decimal::serde::str")]
+    pub max_leg_notional: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub max_gross_notional: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub max_net_notional: Decimal,
+}
+
+impl GridInventoryRisk {
+    fn validate(&self, order_notional: Decimal) -> Result<(), GridProtocolError> {
+        if !positive(self.max_leg_notional)
+            || !positive(self.max_gross_notional)
+            || !positive(self.max_net_notional)
+            || self.max_leg_notional < order_notional
+            || self.max_gross_notional < self.max_leg_notional
+            || self.max_net_notional < order_notional
+            || self.max_net_notional > self.max_leg_notional
+        {
+            return Err(GridProtocolError::Config);
+        }
         Ok(())
     }
 }
@@ -446,6 +496,8 @@ mod tests {
             spacing_rate: Decimal::new(2, 3),
             grid_levels: 20,
             max_total_notional: Decimal::new(500, 0),
+            inventory_risk: None,
+            required_leverage: None,
             inventory_replenishment: GridInventoryReplenishment {
                 enabled: true,
                 minimum_inventory_notional: Decimal::new(5, 0),
@@ -481,6 +533,10 @@ mod tests {
 
         value = config();
         value.reset_policy.stale_private_ms = MAX_GRID_STALENESS_MS + 1;
+        assert_eq!(value.validate(), Err(GridProtocolError::Config));
+
+        value = config();
+        value.required_leverage = Some(0);
         assert_eq!(value.validate(), Err(GridProtocolError::Config));
     }
 

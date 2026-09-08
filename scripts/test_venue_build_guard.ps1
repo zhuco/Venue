@@ -61,7 +61,7 @@ try {
     $script:fixturePlan.MinimumGuestFree = 0
     [IO.File]::WriteAllText((Join-Path $fixture 'budget-fixture.txt'),'budget-fixture')
     $script:fixturePlan.BudgetBytes = 1
-    Assert-GuardThrows { Enter-VenueBuildGuard -RepoRoot $repo -WaitSeconds 0 } '150 GiB'
+    Assert-GuardThrows { Enter-VenueBuildGuard -RepoRoot $repo -WaitSeconds 0 } '1 GiB'
     Assert-GuardTest (-not (Test-Path -LiteralPath $script:fixturePlan.GuardDirectory)) 'Budget failure occurs before creating locks or starting work'
     $script:fixturePlan.BudgetBytes = 150GB
 

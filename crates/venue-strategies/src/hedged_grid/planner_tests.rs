@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use rust_decimal::Decimal;
-use venue_domain::domain::{Asset, Instrument, MarketKind, Precision, RiskSourceStatus};
+use venue_domain::domain::{Asset, Instrument, MarketKind, OrderSide, Precision, RiskSourceStatus};
 
 use super::*;
 
@@ -35,6 +35,7 @@ fn input() -> Result<GridPlannerInput, Box<dyn std::error::Error>> {
             symbol: "SOL/USDT".parse()?,
             order_notional: Amount::new(quote.clone(), Decimal::from(5)),
             maximum_grid_notional: Amount::new(quote.clone(), Decimal::from(50)),
+            inventory_risk: None,
             spacing_rate: Decimal::new(1, 2),
             grid_count: 3,
             replenishment: Some(GridReplenishmentPolicy {
@@ -202,6 +203,88 @@ fn reference_only_grid_rejects_stale_future_and_ambiguous_price_sources()
         GridPlanner::plan(&ambiguous)?.directive,
         GridPlanDirective::Blocked { .. }
     ));
+    Ok(())
+}
+
+#[test]
+fn inventory_envelope_blocks_a_short_close_that_would_increase_net_long()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut value = input()?;
+    let quote = value.config.order_notional.asset.clone();
+    value.config.inventory_risk = Some(GridInventoryRiskPolicy {
+        max_leg_notional: Amount::new(quote.clone(), Decimal::from(200)),
+        max_gross_notional: Amount::new(quote.clone(), Decimal::from(400)),
+        max_net_notional: Amount::new(quote, Decimal::from(5)),
+    });
+    value.owned_orders.push(GridOrderIntent {
+        key: GridOrderKey {
+            epoch: value.config.revision,
+            position: GridPosition::Short,
+            role: GridOrderRole::Close,
+            level: 1,
+        },
+        side: OrderSide::Buy,
+        price: Price::new(Decimal::from(100))?,
+        quantity: Decimal::new(1, 1),
+        reduce_only: true,
+    });
+
+    assert_eq!(
+        GridPlanner::plan(&value)?.directive,
+        GridPlanDirective::Blocked {
+            reason: GridBlockedReason::InventoryRiskLimit,
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn inventory_envelope_blocks_realized_leg_over_cap() -> Result<(), Box<dyn std::error::Error>> {
+    let mut value = input()?;
+    let quote = value.config.order_notional.asset.clone();
+    value.config.inventory_risk = Some(GridInventoryRiskPolicy {
+        max_leg_notional: Amount::new(quote.clone(), Decimal::from(199)),
+        max_gross_notional: Amount::new(quote.clone(), Decimal::from(400)),
+        max_net_notional: Amount::new(quote, Decimal::from(199)),
+    });
+    value.inventory.long_quantity = Decimal::from(2);
+
+    assert_eq!(
+        GridPlanner::plan(&value)?.directive,
+        GridPlanDirective::Blocked {
+            reason: GridBlockedReason::InventoryRiskLimit,
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn inventory_envelope_keeps_a_deep_grid_within_worst_case_net_capacity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut value = input()?;
+    let quote = value.config.order_notional.asset.clone();
+    value.config.grid_count = 10;
+    value.config.maximum_grid_notional = Amount::new(quote.clone(), Decimal::from(100));
+    value.config.inventory_risk = Some(GridInventoryRiskPolicy {
+        max_leg_notional: Amount::new(quote.clone(), Decimal::from(200)),
+        max_gross_notional: Amount::new(quote.clone(), Decimal::from(400)),
+        max_net_notional: Amount::new(quote, Decimal::from(20)),
+    });
+    let (_, orders) = converge(GridPlanner::plan(&value)?)?;
+    let mut positive_net = Decimal::ZERO;
+    let mut negative_net = Decimal::ZERO;
+    for order in &orders {
+        let notional = order.quantity * Decimal::from(100);
+        match (order.key.position, order.key.role) {
+            (GridPosition::Long, GridOrderRole::Open)
+            | (GridPosition::Short, GridOrderRole::Close) => positive_net += notional,
+            (GridPosition::Short, GridOrderRole::Open)
+            | (GridPosition::Long, GridOrderRole::Close) => negative_net += notional,
+        }
+    }
+    assert!(!orders.is_empty());
+    assert!(positive_net <= Decimal::from(20));
+    assert!(negative_net <= Decimal::from(20));
     Ok(())
 }
 

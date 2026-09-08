@@ -679,6 +679,8 @@ mod tests {
                     spacing_rate: Decimal::new(2, 3),
                     grid_levels: 2,
                     max_total_notional: Decimal::from(100),
+                    inventory_risk: None,
+                    required_leverage: None,
                     inventory_replenishment: GridInventoryReplenishment {
                         enabled: false,
                         minimum_inventory_notional: Decimal::from(10),

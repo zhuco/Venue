@@ -792,6 +792,47 @@ pub fn parse_signed_hedge_positions(
     parse_complete_positions(payload, binding, BinancePositionMode::Hedge)
 }
 
+/// Extracts Binance's exact configured leverage from the same signed, symbol-scoped
+/// position-risk response used for Hedge positions. Both legs must be present and agree: a
+/// missing, malformed, or asymmetric response never authorizes a Grid start.
+pub fn parse_signed_hedge_leverage(
+    payload: &str,
+    binding: &GatewayBinding,
+) -> Result<u8, BinanceReadbackError> {
+    let value: Value = serde_json::from_str(payload).map_err(|_| BinanceReadbackError::Payload)?;
+    let rows = value.as_array().ok_or(BinanceReadbackError::Payload)?;
+    let expected_symbol = native_symbol(&binding.symbol);
+    let mut leverage = None;
+    let mut seen = BTreeSet::new();
+    for row in rows {
+        let row = row.as_object().ok_or(BinanceReadbackError::Payload)?;
+        if row.get("symbol").and_then(Value::as_str) != Some(expected_symbol.as_str()) {
+            return Err(BinanceReadbackError::Binding);
+        }
+        let side = match row.get("positionSide").and_then(Value::as_str) {
+            Some("LONG") => PositionSide::Long,
+            Some("SHORT") => PositionSide::Short,
+            _ => return Err(BinanceReadbackError::Position),
+        };
+        if !seen.insert(side) {
+            return Err(BinanceReadbackError::Position);
+        }
+        let value = row
+            .get("leverage")
+            .and_then(Value::as_str)
+            .and_then(|raw| raw.parse::<u8>().ok())
+            .filter(|value| (1..=125).contains(value))
+            .ok_or(BinanceReadbackError::Position)?;
+        if leverage.replace(value).is_some_and(|prior| prior != value) {
+            return Err(BinanceReadbackError::Position);
+        }
+    }
+    if seen != BTreeSet::from([PositionSide::Long, PositionSide::Short]) {
+        return Err(BinanceReadbackError::Position);
+    }
+    leverage.ok_or(BinanceReadbackError::Position)
+}
+
 fn parse_complete_positions(
     payload: &str,
     binding: &GatewayBinding,
@@ -1185,6 +1226,27 @@ mod tests {
         assert_eq!(candidate.positions().len(), 1);
         assert_eq!(candidate.positions()[0].side, PositionSide::Net);
         assert_eq!(candidate.positions()[0].quantity, Decimal::new(-10, 3));
+        Ok(())
+    }
+
+    #[test]
+    fn leverage_readback_requires_matching_complete_hedge_legs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, _, scope) = facts(
+            GatewayMode::Live,
+            "00000000-0000-4000-8000-000000000001",
+            7,
+            17,
+        )?;
+        let valid = br#"[{"symbol":"BTCUSDT","positionSide":"LONG","leverage":"20"},{"symbol":"BTCUSDT","positionSide":"SHORT","leverage":"20"}]"#;
+        assert_eq!(
+            parse_signed_hedge_leverage(std::str::from_utf8(valid)?, scope.binding())?,
+            20
+        );
+        let mismatched = br#"[{"symbol":"BTCUSDT","positionSide":"LONG","leverage":"20"},{"symbol":"BTCUSDT","positionSide":"SHORT","leverage":"21"}]"#;
+        assert!(
+            parse_signed_hedge_leverage(std::str::from_utf8(mismatched)?, scope.binding()).is_err()
+        );
         Ok(())
     }
 

@@ -5,7 +5,7 @@ use venue_domain::domain::{Amount, Asset, FieldState, OrderSide, Price, Symbol};
 
 pub const HEDGED_GRID_SCHEMA_VERSION: u16 = 3;
 pub const MIN_GRID_COUNT: u8 = 1;
-pub const MAX_GRID_COUNT: u8 = 50;
+pub const MAX_GRID_COUNT: u8 = 80;
 /// Low inventory replenishment remains three 5-quote-asset grids; it is independent from grid
 /// depth.
 pub const INVENTORY_REPLENISH_GRID_COUNT: u8 = 3;
