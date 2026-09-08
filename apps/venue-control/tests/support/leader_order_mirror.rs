@@ -492,7 +492,7 @@ async fn mirror_sizing_and_revocation(
         &leader_account,
         &leader_credential,
         vec![order.clone(), gtc.clone()],
-        now,
+        test_now_ms()?,
     )
     .await?;
     persist_projection(
@@ -501,7 +501,7 @@ async fn mirror_sizing_and_revocation(
         &follower_account,
         &follower_credential,
         vec![],
-        now,
+        test_now_ms()?,
     )
     .await?;
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
