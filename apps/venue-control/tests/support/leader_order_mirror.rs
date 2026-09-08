@@ -1055,7 +1055,7 @@ async fn wait_count(
     query: &str,
     wanted: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {
         let actual: i64 = sqlx::query_scalar(query).fetch_one(pool).await?;
         if actual == wanted {
@@ -1063,7 +1063,7 @@ async fn wait_count(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(
-                format!("mirror fixture timed out: expected {wanted}, got {actual}").into(),
+                format!("mirror fixture timed out: {query}; expected {wanted}, got {actual}").into(),
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
