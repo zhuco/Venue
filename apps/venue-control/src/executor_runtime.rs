@@ -1474,26 +1474,31 @@ mod tests {
             ExecutorCommandState::Sending,
         )?
         .command;
-        command.origin = venue_control_protocol::kol::ExecutorCommandOrigin::Copy;
-        for state in [ExecutionReadback::Accepted, ExecutionReadback::Reconciled] {
-            let ack = ExecutionOutcome {
-                state,
-                native_order_id: Some("123".into()),
-                exchange_error_code: None,
-                market_settlement: None,
-                order_fact: None,
-            };
-            assert_eq!(
-                require_signed_mirror_fact(&command, ack.clone()).state,
-                ExecutionReadback::Unknown
-            );
-            let mut exact = ack;
-            exact.order_fact = Some(crate::executor_exchange::ExactOrderFact {
-                quantity: rust_decimal::Decimal::ONE,
-                filled_quantity: rust_decimal::Decimal::ZERO,
-                terminal: false,
-            });
-            assert_eq!(require_signed_mirror_fact(&command, exact).state, state);
+        for origin in [
+            venue_control_protocol::kol::ExecutorCommandOrigin::Copy,
+            venue_control_protocol::kol::ExecutorCommandOrigin::InventoryMm,
+        ] {
+            command.origin = origin;
+            for state in [ExecutionReadback::Accepted, ExecutionReadback::Reconciled] {
+                let ack = ExecutionOutcome {
+                    state,
+                    native_order_id: Some("123".into()),
+                    exchange_error_code: None,
+                    market_settlement: None,
+                    order_fact: None,
+                };
+                assert_eq!(
+                    require_signed_mirror_fact(&command, ack.clone()).state,
+                    ExecutionReadback::Unknown
+                );
+                let mut exact = ack;
+                exact.order_fact = Some(crate::executor_exchange::ExactOrderFact {
+                    quantity: rust_decimal::Decimal::ONE,
+                    filled_quantity: rust_decimal::Decimal::ZERO,
+                    terminal: false,
+                });
+                assert_eq!(require_signed_mirror_fact(&command, exact).state, state);
+            }
         }
         Ok(())
     }
