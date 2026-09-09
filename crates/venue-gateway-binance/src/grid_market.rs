@@ -27,9 +27,34 @@ pub struct BinanceGridMarketReader {
     transport: BinanceHttpTransport,
     rules: Option<BinanceInstrumentRules>,
     last_rules_check_ms: u64,
+    private_reads: tokio::sync::Mutex<PrivateMarketReads>,
+}
+
+struct PrivateMarketReads {
+    transport: BinanceHttpTransport,
+    synchronized_at: std::time::Instant,
 }
 
 impl BinanceGridMarketReader {
+    async fn private_transport(
+        &self,
+        rules: &BinanceInstrumentRules,
+        generation: u64,
+    ) -> Result<tokio::sync::MutexGuard<'_, PrivateMarketReads>, BinanceAccountGatewayError> {
+        let mut reader = self.private_reads.lock().await;
+        reader
+            .transport
+            .rebind_generations(rules.instrument.generation, generation)?;
+        // Keep the HTTP pool and clock for this binding; account data itself is always reread.
+        // Reconstructing a reader used to issue six time requests before every margin read.
+        if reader.transport.signing_timestamp_ms().is_err()
+            || reader.synchronized_at.elapsed() >= std::time::Duration::from_secs(3_600)
+        {
+            reader.transport.synchronize_clock().await?;
+            reader.synchronized_at = std::time::Instant::now();
+        }
+        Ok(reader)
+    }
     /// A candidate profit reduction needs PM's actual USD equity. This reads only /account;
     /// neither orders nor positions are polled, and no credential is retained by this reader.
     pub async fn account_equity(
@@ -55,18 +80,17 @@ impl BinanceGridMarketReader {
         let config =
             BinanceConfig::for_binding(BinanceAccountBinding::PortfolioMarginUm, &self.binding)
                 .map_err(|_| BinanceAccountGatewayError::Binding)?;
-        let transport = BinanceHttpTransport::new(
-            config.clone(),
-            rules.instrument.generation,
-            private_generation,
-            self.transport.recovery_limits(),
-        )?;
-        transport.synchronize_clock().await?;
+        let transport = self.private_transport(rules, private_generation).await?;
         let scope = local_read_scope(&config, rules, private_generation)?;
         let request = crate::build_account_request(&scope)
             .map_err(|_| BinanceAccountGatewayError::Readback)?;
         let response = transport
-            .execute_read(credentials, &request, transport.signing_timestamp_ms()?)
+            .transport
+            .execute_read(
+                credentials,
+                &request,
+                transport.transport.signing_timestamp_ms()?,
+            )
             .await?;
         let payload = std::str::from_utf8(&response.payload)
             .map_err(|_| BinanceAccountGatewayError::Readback)?;
@@ -89,18 +113,17 @@ impl BinanceGridMarketReader {
         let config =
             BinanceConfig::for_binding(BinanceAccountBinding::PortfolioMarginUm, &self.binding)
                 .map_err(|_| BinanceAccountGatewayError::Binding)?;
-        let transport = BinanceHttpTransport::new(
-            config.clone(),
-            rules.instrument.generation,
-            private_generation,
-            self.transport.recovery_limits(),
-        )?;
-        transport.synchronize_clock().await?;
+        let transport = self.private_transport(rules, private_generation).await?;
         let scope = local_read_scope(&config, rules, private_generation)?;
         let request = crate::readback::build_symbol_config_request(&scope)
             .map_err(|_| BinanceAccountGatewayError::Readback)?;
         let response = transport
-            .execute_read(credentials, &request, transport.signing_timestamp_ms()?)
+            .transport
+            .execute_read(
+                credentials,
+                &request,
+                transport.transport.signing_timestamp_ms()?,
+            )
             .await?;
         let payload = std::str::from_utf8(&response.payload)
             .map_err(|_| BinanceAccountGatewayError::Readback)?;
@@ -152,12 +175,17 @@ impl BinanceGridMarketReader {
     ) -> Result<Self, BinanceAccountGatewayError> {
         let config = BinanceConfig::for_binding(BinanceAccountBinding::PortfolioMarginUm, &binding)
             .map_err(|_| BinanceAccountGatewayError::Binding)?;
-        let transport = BinanceHttpTransport::new(config, 1, 1, limits)?;
+        let transport = BinanceHttpTransport::new(config.clone(), 1, 1, limits)?;
+        let private_reads = tokio::sync::Mutex::new(PrivateMarketReads {
+            transport: BinanceHttpTransport::new(config, 1, 1, limits)?,
+            synchronized_at: std::time::Instant::now(),
+        });
         Ok(Self {
             binding,
             transport,
             rules: None,
             last_rules_check_ms: 0,
+            private_reads,
         })
     }
 
@@ -329,6 +357,36 @@ fn same_rules_ignoring_generation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn risk_reads_reuse_transport_and_rebind_without_clock_io()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let binding = GatewayBinding::new(
+            venue_gateway_api::VenueId::Binance,
+            venue_gateway_api::GatewayMode::Live,
+            "00000000-0000-4000-8000-000000000001".to_owned(),
+            "BTC/USDT".parse()?,
+        )?;
+        let limits = BinanceTransportLimits::new(std::time::Duration::from_secs(1), 1024)?;
+        let reader = BinanceGridMarketReader::new(binding, limits)?;
+        let rules = parse_instrument_rules(
+            include_str!("../tests/fixtures/exchange_info_btcusdt.json"),
+            "BTC/USDT".parse()?,
+            9,
+        )?;
+        let first = reader.private_transport(&rules, 7).await?;
+        let serial = first.transport.recovery_instance_serial();
+        let clock_at = first.synchronized_at;
+        drop(first);
+        let second = reader.private_transport(&rules, 8).await?;
+        assert_eq!(second.transport.recovery_instance_serial(), serial);
+        assert_eq!(second.synchronized_at, clock_at);
+        assert_eq!(second.transport.private_generation(), 8);
+        assert_eq!(second.transport.instrument_generation(), 9);
+        drop(second);
+        assert!(reader.private_transport(&rules, 0).await.is_err());
+        Ok(())
+    }
 
     #[test]
     fn bbo_during_fetch_requires_receipt_clock_and_keeps_staleness_guard()

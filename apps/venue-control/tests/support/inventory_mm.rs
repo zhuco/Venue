@@ -33,6 +33,11 @@ async fn inventory_mm_postgres_lifecycle_commands_and_fences()
     };
     let fixture = Fixture::create(&database_url).await?;
     fixture.migrate_twice().await?;
+    for _ in 0..2 {
+        sqlx::raw_sql(venue_control::MIGRATION_0049)
+            .execute(&fixture.pool)
+            .await?;
+    }
     let user = id(9101);
     let account = id(9201);
     let credential = id(9301);
@@ -471,6 +476,66 @@ async fn inventory_mm_postgres_lifecycle_commands_and_fences()
             .inventory_mm_dispatch_permitted(&quote.command_id, future + 2)
             .await?
     );
+    let original_projection: serde_json::Value = sqlx::query_scalar(
+        "SELECT projection_json FROM venue_binance_account_projections WHERE credential_id=$1",
+    )
+    .bind(&credential)
+    .fetch_one(&fixture.pool)
+    .await?;
+    sqlx::query("UPDATE venue_binance_account_projections SET observed_ms=$2,persisted_ms=$2,projection_json=jsonb_set(jsonb_set(projection_json,'{projection,observed_ms}',to_jsonb($2::bigint)),'{projection,persisted_ms}',to_jsonb($2::bigint)) WHERE credential_id=$1")
+        .bind(&credential).bind(i64::try_from(future + 1)?).execute(&fixture.pool).await?;
+    assert!(
+        executor
+            .inventory_mm_dispatch_permitted(&quote.command_id, future + 2)
+            .await?,
+        "unchanged heartbeat must preserve a fresh decision"
+    );
+    let decision_digest: Vec<u8> = sqlx::query_scalar(
+        "SELECT inventory_mm_projection_digest FROM venue_binance_commands WHERE command_id=$1",
+    )
+    .bind(&quote.command_id)
+    .fetch_one(&fixture.pool)
+    .await?;
+    sqlx::query(
+        "UPDATE venue_binance_commands SET inventory_mm_projection_digest=NULL WHERE command_id=$1",
+    )
+    .bind(&quote.command_id)
+    .execute(&fixture.pool)
+    .await?;
+    assert!(
+        !executor
+            .inventory_mm_dispatch_permitted(&quote.command_id, future + 2)
+            .await?,
+        "legacy commands retain exact-observation fencing"
+    );
+    sqlx::query(
+        "UPDATE venue_binance_commands SET inventory_mm_projection_digest=$2 WHERE command_id=$1",
+    )
+    .bind(&quote.command_id)
+    .bind(decision_digest)
+    .execute(&fixture.pool)
+    .await?;
+    for field in [
+        "positions",
+        "open_orders",
+        "conditional_orders",
+        "fills",
+        "assets",
+        "position_mode",
+    ] {
+        let mut changed = original_projection.clone();
+        changed["projection"][field] = serde_json::json!([{"changed": true}]);
+        sqlx::query("UPDATE venue_binance_account_projections SET projection_json=$2 WHERE credential_id=$1")
+            .bind(&credential).bind(changed).execute(&fixture.pool).await?;
+        assert!(
+            !executor
+                .inventory_mm_dispatch_permitted(&quote.command_id, future + 2)
+                .await?,
+            "changed {field} must invalidate the decision"
+        );
+    }
+    sqlx::query("UPDATE venue_binance_account_projections SET observed_ms=$2,persisted_ms=$2,projection_json=$3 WHERE credential_id=$1")
+        .bind(&credential).bind(i64::try_from(future)?).bind(original_projection).execute(&fixture.pool).await?;
     sqlx::query("UPDATE venue_binance_commands SET command_state='pending' WHERE command_id=$1")
         .bind(&quote.command_id)
         .execute(&fixture.pool)

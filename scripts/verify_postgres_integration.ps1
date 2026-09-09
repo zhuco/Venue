@@ -72,6 +72,12 @@ Invoke-PostgresCargoTest -Name 'multi_venue_grid_lifecycle' -CargoArguments @(
     '--', '--exact'
 )
 
-Write-Output 'PostgreSQL integration gate passed: delivery, Copy, KOL MVP, Binance Grid, multi-venue ledger, and strategy Grid tests connected to the test database.'
+Invoke-PostgresCargoTest -Name 'grid_begin_cancellation' -CargoArguments @(
+    'test', '--locked', '-p', 'venue-control', '--lib',
+    'grid_store::transaction::tests::interrupted_begin_rolls_back_before_connection_reuse',
+    '--', '--exact', '--nocapture'
+)
+
+Write-Output 'PostgreSQL integration gate passed: delivery, Copy, KOL MVP, Binance Grid, multi-venue ledger, strategy Grid and cancelled BEGIN tests connected to the test database.'
 } finally { Pop-Location }
 } finally { Exit-VenueBuildGuard $venueBuildLease }

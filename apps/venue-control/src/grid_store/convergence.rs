@@ -19,7 +19,7 @@ impl BinanceGridStore {
         {
             return Err(GridStoreError::Invalid);
         }
-        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let mut tx = self.begin_transaction().await?;
         let row = sqlx::query(
             "SELECT i.owner_user_id,i.revision,i.current_config_revision,i.plan_revision,\
              i.instance_state,i.attention_code,i.convergence_started_ms,i.desired_digest,\
@@ -229,7 +229,7 @@ impl BinanceGridStore {
         {
             return Err(GridStoreError::Invalid);
         }
-        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let mut tx = self.begin_transaction().await?;
         let locked = sqlx::query(
             "SELECT owner_user_id,revision,current_config_revision,instance_state \
              FROM venue_binance_grid_instances WHERE instance_id=$1 FOR UPDATE",

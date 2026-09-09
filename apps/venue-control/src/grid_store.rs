@@ -81,7 +81,7 @@ impl BinanceGridStore {
         let request_digest = digest(request)?;
         let config_json = serde_json::to_value(&request.config).map_err(invalid_json)?;
         let config_digest = digest(&request.config)?;
-        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let mut tx = self.begin_transaction().await?;
         let inserted = sqlx::query(
             "INSERT INTO venue_binance_grid_instances \
              (instance_id,owner_user_id,trading_account_id,credential_id,create_request_id,\
@@ -214,7 +214,7 @@ impl BinanceGridStore {
         }
         let config_json = serde_json::to_value(&request.config).map_err(invalid_json)?;
         let config_digest = digest(&request.config)?;
-        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let mut tx = self.begin_transaction().await?;
         let replay: Option<Vec<u8>> = sqlx::query_scalar(
             "SELECT r.config_digest FROM venue_binance_grid_config_revisions r \
              JOIN venue_binance_grid_instances i ON i.instance_id=r.instance_id \
@@ -336,7 +336,7 @@ impl BinanceGridStore {
             return Err(GridStoreError::Invalid);
         }
         let request_digest = digest(request)?;
-        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let mut tx = self.begin_transaction().await?;
         let replay: Option<Vec<u8>> = sqlx::query_scalar(
             "SELECT request_digest FROM venue_binance_grid_lifecycle_requests \
              WHERE owner_user_id=$1 AND request_id=$2 FOR SHARE",
@@ -539,7 +539,7 @@ impl BinanceGridStore {
                    AND legacy.trading_account_id=i.trading_account_id) \
              ON CONFLICT DO NOTHING"
         );
-        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let mut tx = self.begin_transaction().await?;
         let instance_row = sqlx::query(
             "SELECT owner_user_id,trading_account_id,credential_id,revision \
              FROM venue_binance_grid_instances WHERE instance_id=$1 \
@@ -704,7 +704,7 @@ impl BinanceGridStore {
     ) -> Result<(), GridStoreError> {
         validate_ownership(ownership)?;
         let ownership_digest = ownership_identity_digest(ownership)?;
-        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let mut tx = self.begin_transaction().await?;
         let existing = sqlx::query(
             "SELECT ownership_digest,filled_quantity,native_order_id,first_seen_ms,last_seen_ms \
              FROM venue_binance_grid_order_owners WHERE trading_account_id=$1 \
@@ -1688,3 +1688,5 @@ fn database_error(error: sqlx::Error) -> GridStoreError {
         GridStoreError::Unavailable
     }
 }
+
+mod transaction;

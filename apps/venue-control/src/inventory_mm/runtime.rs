@@ -45,6 +45,8 @@ impl From<InventoryMmStoreError> for InventoryMmRuntimeError {
     }
 }
 type Result<T> = std::result::Result<T, InventoryMmRuntimeError>;
+const LEVERAGE_MAX_AGE_MS: u64 = 1_800_000;
+const LEVERAGE_REFRESH_HEADROOM_MS: u64 = 60_000;
 
 struct MarketState {
     reader: BinanceGridMarketReader,
@@ -326,8 +328,14 @@ impl InventoryMmRuntime {
             })?;
         // Account configuration events invalidate the stream generation. Between those events,
         // symbol leverage is configuration, not a five-second market observation.
+        let leverage_checked = now()?;
         let leverage = match market.leverage.filter(|(_, at, generation)| {
-            *generation == projection.private_generation && facts::fresh(*at, now_ms, 1_800_000)
+            reusable_leverage(
+                *at,
+                *generation,
+                projection.private_generation,
+                leverage_checked,
+            )
         }) {
             Some((value, at, _)) => (value, at),
             None => {
@@ -410,7 +418,7 @@ impl InventoryMmRuntime {
             &record.instance_id,
             now_ms,
             &[
-                ("leverage", leverage.1, 1_800_000),
+                ("leverage", leverage.1, LEVERAGE_MAX_AGE_MS),
                 ("margin", margin_at, facts::MARKET_MAX_AGE_MS),
                 (
                     "reference",
@@ -645,6 +653,10 @@ impl InventoryMmRuntime {
 fn private_recovery_expired(elapsed: std::time::Duration) -> bool {
     elapsed >= std::time::Duration::from_secs(120)
 }
+fn reusable_leverage(at: u64, generation: u64, current_generation: u64, now: u64) -> bool {
+    generation == current_generation
+        && facts::fresh(at, now, LEVERAGE_MAX_AGE_MS - LEVERAGE_REFRESH_HEADROOM_MS)
+}
 fn validate_freshness(instance_id: &str, now_ms: u64, fields: &[(&str, u64, u64)]) -> Result<()> {
     for &(field, at, age) in fields {
         if !facts::fresh(at, now_ms, age) {
@@ -768,6 +780,30 @@ mod tests {
         kol::{TERMINAL_PROJECTION_SCHEMA_VERSION, TerminalOpenOrder, TerminalOrderState},
     };
     use venue_domain::{OrderSide, PositionSide};
+
+    #[test]
+    fn leverage_refresh_precedes_expiry_and_keeps_the_original_limit() {
+        assert!(reusable_leverage(1_000, 7, 7, 1_740_000));
+        assert!(!reusable_leverage(1_000, 7, 7, 1_741_001));
+        assert!(!reusable_leverage(1_000, 6, 7, 2_000));
+        assert!(!reusable_leverage(2_001, 7, 7, 2_000));
+        assert!(
+            validate_freshness(
+                "test",
+                1_800_999,
+                &[("leverage", 1_000, LEVERAGE_MAX_AGE_MS)]
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_freshness(
+                "test",
+                1_801_001,
+                &[("leverage", 1_000, LEVERAGE_MAX_AGE_MS)]
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn private_recovery_is_bounded_without_extending_fact_freshness() {

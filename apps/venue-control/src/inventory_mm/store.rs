@@ -315,9 +315,9 @@ impl InventoryMmStore {
         {
             return Err(InventoryMmStoreError::Conflict);
         }
-        let current:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_binance_account_projections WHERE credential_id=$1 AND owner_user_id=$2 AND private_generation=$3 AND observed_ms=$4 AND COALESCE((projection_json->>'stream_healthy')::boolean,false))")
-            .bind(&instance.credential_id).bind(&instance.owner_user_id).bind(ms(generation)?).bind(ms(observed)?).fetch_one(&mut *tx).await.map_err(db)?;
-        if !cancelling && !current {
+        let projection_digest:Option<Vec<u8>>=sqlx::query_scalar("SELECT venue_mm_projection_digest(projection_json) FROM venue_binance_account_projections WHERE credential_id=$1 AND owner_user_id=$2 AND private_generation=$3 AND observed_ms=$4 AND COALESCE((projection_json->>'stream_healthy')::boolean,false)")
+            .bind(&instance.credential_id).bind(&instance.owner_user_id).bind(ms(generation)?).bind(ms(observed)?).fetch_optional(&mut *tx).await.map_err(db)?;
+        if !cancelling && projection_digest.is_none() {
             return Ok(false);
         }
         let own_pending:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_binance_commands WHERE inventory_mm_instance_id=$1 AND command_state IN ('pending','sending','accepted','reconcile_required'))")
@@ -400,11 +400,11 @@ impl InventoryMmStore {
                     )
                 }
             };
-            sqlx::query("INSERT INTO venue_binance_commands(command_id,command_origin,owner_user_id,trading_account_id,credential_id,symbol,command_phase,order_kind,order_side,position_side,requested_quantity,limit_price,target_client_order_id,selected_native_order_id,client_order_id,command_state,created_ms,updated_ms,inventory_mm_instance_id,rule_version,source_digest,inventory_mm_private_generation,inventory_mm_observed_ms) VALUES($1,'inventory_mm',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pending',$15,$15,$16,$17,$18,$19,$20)")
+            sqlx::query("INSERT INTO venue_binance_commands(command_id,command_origin,owner_user_id,trading_account_id,credential_id,symbol,command_phase,order_kind,order_side,position_side,requested_quantity,limit_price,target_client_order_id,selected_native_order_id,client_order_id,command_state,created_ms,updated_ms,inventory_mm_instance_id,rule_version,source_digest,inventory_mm_private_generation,inventory_mm_observed_ms,inventory_mm_projection_digest) VALUES($1,'inventory_mm',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pending',$15,$15,$16,$17,$18,$19,$20,$21)")
                 .bind(command_id).bind(&instance.owner_user_id).bind(&instance.trading_account_id).bind(&instance.credential_id).bind(instance.config.symbol.to_string())
                 .bind(phase).bind(kind).bind(side).bind(leg).bind(qty).bind(price).bind(target).bind(native).bind(client).bind(ms(now)?).bind(&instance.instance_id)
                 .bind(format!("inventory-mm-v1-private-{generation}")).bind(commitment)
-                .bind(ms(generation)?).bind(ms(observed)?)
+                .bind(ms(generation)?).bind(ms(observed)?).bind(&projection_digest)
                 .execute(&mut *tx).await.map_err(db)?;
         }
         sqlx::query("UPDATE venue_inventory_mm_instances SET revision=revision+1,updated_ms=$2,last_quote_ms=CASE WHEN $3 THEN last_quote_ms ELSE $2 END WHERE instance_id=$1")

@@ -34,6 +34,7 @@ pub mod leader_bot_admin;
 mod model;
 pub const MIGRATION_0044: &str = include_str!("../migrations/0044_realtime_wake.sql");
 pub const MIGRATION_0048: &str = include_str!("../migrations/0048_kol_default_access.sql");
+pub const MIGRATION_0049: &str = include_str!("../migrations/0049_mm_projection_digest.sql");
 pub const MIGRATION_0047: &str = include_str!("../migrations/0047_kol_source_selection.sql");
 pub const MIGRATION_0046: &str = include_str!("../migrations/0046_kol_invite_management.sql");
 pub const MIGRATION_0045: &str = include_str!("../migrations/0045_inventory_mm.sql");

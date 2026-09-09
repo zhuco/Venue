@@ -203,3 +203,7 @@ VenueFlow 延迟采集：`apps/ui/desktop/src/latency_evidence.rs` 与 `latency_
 马丁参考行情读取与闭合 K 线缓存：`apps/venue-control/src/support_martingale/reference_market.rs`；空仓等待原因：同目录 `diagnostics.rs`。可信操作员 `venue-strategy-admin martingale-config USER` 仅在停止且空仓时修改 BTC Neutral 准入；`grid-depth USER INSTANCE` 通过 `multi_venue_grid/configuration.rs` 在停止且挂单收敛后修改网格层数。
 
 桌面单实例入口：`apps/ui/desktop/src/main.rs` 在日志和 UI 初始化前调用 `single_instance.rs`，使用固定用户目录的操作系统文件锁；重复启动直接退出，锁失败则拒绝启动，进程退出自动释放。
+
+做市观测摘要：`migrations/0049_mm_projection_digest.sql`、`inventory_mm/{store,dispatch}.rs`（相对 `apps/venue-control/`）；网格未分配成交查询 `grid_store/reads.rs` 先筛本账户/交易对的未分配成交，再关联历史归属。签名风险连接复用位于 `crates/venue-gateway-binance/src/grid_market.rs`。
+
+网格可中断冷路径的 BEGIN 握手：`apps/venue-control/src/grid_store/transaction.rs` 只让事务建立完成；若调用方已取消，返回的事务自动回滚，不在后台执行规划或命令提交。数据库专项门验证取消握手后连接复用不会继承未结束事务。

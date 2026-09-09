@@ -43,7 +43,7 @@ impl BinanceGridStore {
         if expected_instance_revision == 0 || expected_config_revision == 0 {
             return Err(GridStoreError::Invalid);
         }
-        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let mut tx = self.begin_transaction().await?;
         let row = sqlx::query(
             "SELECT owner_user_id,symbol,revision,current_config_revision,plan_revision,\
              instance_state,convergence_started_ms FROM venue_binance_grid_instances \

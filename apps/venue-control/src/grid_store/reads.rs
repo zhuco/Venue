@@ -154,20 +154,24 @@ impl BinanceGridStore {
         }
         ensure_resolvable_owners(self, instance_id).await?;
         let rows = sqlx::query(
-            "SELECT f.fill_json,f.observed_ms,o.trading_account_id,o.client_order_id,\
+            "WITH unallocated AS MATERIALIZED (\
+             SELECT f.* FROM venue_binance_account_fills f \
+             JOIN venue_binance_grid_instances i ON i.trading_account_id=f.trading_account_id \
+              AND i.symbol=f.symbol WHERE i.instance_id=$1 AND f.observed_ms>$2 \
+             AND NOT EXISTS(SELECT 1 FROM venue_binance_grid_fill_allocations a \
+              WHERE a.trading_account_id=f.trading_account_id AND a.symbol=f.symbol \
+              AND a.native_trade_id=f.native_trade_id)) \
+             SELECT f.fill_json,f.observed_ms,o.trading_account_id,o.client_order_id,\
              o.config_revision,o.position_side,o.order_role \
              FROM venue_binance_grid_order_owners o \
              JOIN venue_binance_commands c ON c.command_id=o.place_command_id \
               AND c.command_origin='grid' AND c.grid_instance_id=o.instance_id \
               AND c.trading_account_id=o.trading_account_id \
               AND c.client_order_id=o.client_order_id AND c.symbol=o.symbol \
-             JOIN venue_binance_account_fills f ON f.trading_account_id=o.trading_account_id \
+             JOIN unallocated f ON f.trading_account_id=o.trading_account_id \
               AND f.symbol=o.symbol AND f.fill_json->>'native_order_id'=COALESCE(\
                   o.native_order_id,c.native_order_id,c.selected_native_order_id) \
-             LEFT JOIN venue_binance_grid_fill_allocations a \
-              ON a.trading_account_id=f.trading_account_id AND a.symbol=f.symbol \
-              AND a.native_trade_id=f.native_trade_id \
-             WHERE o.instance_id=$1 AND f.observed_ms>$2 AND a.native_trade_id IS NULL \
+             WHERE o.instance_id=$1 \
              ORDER BY f.observed_ms,f.native_trade_id LIMIT $3",
         )
         .bind(instance_id)
@@ -265,7 +269,7 @@ async fn ensure_resolvable_owners(
     store: &BinanceGridStore,
     instance_id: &str,
 ) -> Result<(), GridStoreError> {
-    let mut tx = store.pool.begin().await.map_err(database_error)?;
+    let mut tx = store.begin_transaction().await?;
     sqlx::query(
         "UPDATE venue_binance_grid_order_owners o SET native_order_id=COALESCE(\
              c.native_order_id,c.selected_native_order_id) FROM venue_binance_commands c \

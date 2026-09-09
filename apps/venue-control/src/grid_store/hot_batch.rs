@@ -131,7 +131,7 @@ impl BinanceGridStore {
     ) -> Result<GridMutationBatchReceipt, GridStoreError> {
         let batch_digest = validate_batch(batch, now_ms, false)?;
         let command_count = command_count(batch)?;
-        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let mut tx = self.begin_transaction().await?;
         if let Some(row) = load_receipt(&mut tx, &batch.batch_id).await? {
             verify_replay(&mut tx, batch, batch_digest, command_count, None, &row).await?;
             tx.commit().await.map_err(database_error)?;
@@ -167,7 +167,7 @@ impl BinanceGridStore {
         validate_plan_batch(plan, now_ms)?;
         let batch_digest = plan_batch_digest(plan, mutation_digest)?;
         let command_count = command_count(&plan.mutation)?;
-        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        let mut tx = self.begin_transaction().await?;
         if let Some(row) = load_receipt(&mut tx, &plan.mutation.batch_id).await? {
             verify_replay(
                 &mut tx,
