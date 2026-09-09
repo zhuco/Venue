@@ -120,8 +120,8 @@ impl BitgetAccountGateway {
         })
     }
 
-    /// The UID comes only from Bitget's signed account-info response.  A configured account
-    /// label or credential hash is never treated as the exchange identity.
+    /// Ordinary and elite UTA keys share a UID but address different trading portfolios.
+    /// Keep the ordinary identity stable; elite credentials use one durable scope per UID.
     pub fn verified_account_identity(&mut self) -> Result<String, BitgetAccountGatewayError> {
         let timestamp_ms = now_ms()?;
         let payload = self.runtime.block_on(
@@ -129,7 +129,7 @@ impl BitgetAccountGateway {
                 .fetch_account_info(&self.credentials, timestamp_ms),
         )?;
         let info = parse_account_info(&payload).ok_or(BitgetAccountGatewayError::Readback)?;
-        Ok(info.user_id)
+        scoped_account_identity(&info, self.credentials.account_scope)
     }
 
     /// Rechecks the key permissions immediately before a committed mutation. Recovery only
@@ -141,7 +141,36 @@ impl BitgetAccountGateway {
                 .fetch_account_info(&self.credentials, timestamp_ms),
         )?;
         let info = parse_account_info(&payload).ok_or(BitgetAccountGatewayError::Readback)?;
-        validate_strategy_permissions(&info)
+        validate_scope_permissions(&info, self.credentials.account_scope)
+    }
+
+    /// Membership is checked from this key's signed elite scope, never the global market list.
+    /// This gate is for admission/increasing orders; removing a symbol must not block readback.
+    pub fn verify_copy_trading_symbol(&mut self) -> Result<(), BitgetAccountGatewayError> {
+        self.verify_copy_trading_symbols(&[self.transport_binding().symbol.clone()])
+    }
+
+    pub fn verify_copy_trading_symbols(
+        &mut self,
+        symbols: &[Symbol],
+    ) -> Result<(), BitgetAccountGatewayError> {
+        if self.credentials.account_scope != crate::credentials::BitgetAccountScope::EliteTrading {
+            return Ok(());
+        }
+        let payload = self.runtime.block_on(
+            self.transport
+                .fetch_copy_trading_pairs(&self.credentials, now_ms()?),
+        )?;
+        let allowed = crate::copy_trading::allowed_symbols(&payload)
+            .ok_or(BitgetAccountGatewayError::Readback)?;
+        for symbol in symbols {
+            let native = crate::instrument::native_symbol(symbol)
+                .map_err(|_| BitgetAccountGatewayError::Readback)?;
+            if !allowed.contains(&native) {
+                return Err(BitgetAccountGatewayError::Readback);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -329,6 +358,9 @@ impl venue_execution::DurableAccountGateway for BitgetAccountGateway {
         if self.verify_strategy_permissions().is_err() {
             return AccountGatewayResult::Unknown;
         }
+        if increases_exposure(command) && self.verify_copy_trading_symbol().is_err() {
+            return rejected("bitget_copy_symbol_unavailable");
+        }
         self.execute_command(command, true, Some(context))
     }
 
@@ -338,6 +370,9 @@ impl venue_execution::DurableAccountGateway for BitgetAccountGateway {
         }
         if self.verify_strategy_permissions().is_err() {
             return AccountGatewayResult::Unknown;
+        }
+        if increases_exposure(command) && self.verify_copy_trading_symbol().is_err() {
+            return rejected("bitget_copy_symbol_unavailable");
         }
         if matches!(command, ExecutionCommand::Cancel(_)) {
             return rejected("bitget_durable_context");
@@ -365,6 +400,41 @@ impl venue_execution::DurableAccountGateway for BitgetAccountGateway {
         };
         self.reconcile_cancel_with_context(command, context)
     }
+}
+
+fn scoped_account_identity(
+    info: &BitgetAccountInfo,
+    scope: crate::credentials::BitgetAccountScope,
+) -> Result<String, BitgetAccountGatewayError> {
+    match scope {
+        crate::credentials::BitgetAccountScope::Unified => Ok(info.user_id.clone()),
+        crate::credentials::BitgetAccountScope::EliteTrading => {
+            validate_scope_permissions(info, scope)?;
+            // This identifies the supported elite trading scope, not a fabricated exchange UID
+            // or a key identity. Rotating either of a portfolio's keys must not create a writer.
+            Ok(format!("elite-trading\0{}", info.user_id))
+        }
+    }
+}
+
+fn validate_scope_permissions(
+    info: &BitgetAccountInfo,
+    scope: crate::credentials::BitgetAccountScope,
+) -> Result<(), BitgetAccountGatewayError> {
+    validate_strategy_permissions(info)?;
+    if scope == crate::credentials::BitgetAccountScope::EliteTrading
+        && !["copy_futures_order", "copy_futures_position"]
+            .iter()
+            .all(|required| info.permissions.iter().any(|value| value == required))
+    {
+        return Err(BitgetAccountGatewayError::Readback);
+    }
+    Ok(())
+}
+
+fn increases_exposure(command: &ExecutionCommand) -> bool {
+    matches!(command, ExecutionCommand::PlaceMarket(_))
+        || matches!(command, ExecutionCommand::PlaceLimit(order) if !order.reduce_only)
 }
 
 impl BitgetAccountGateway {
@@ -480,6 +550,64 @@ impl BitgetAccountGateway {
 #[cfg(test)]
 mod tests {
     use super::{parse_account_info, validate_strategy_permissions};
+
+    #[test]
+    fn ordinary_and_elite_share_uid_but_not_durable_trading_scope() {
+        use crate::credentials::BitgetAccountScope;
+        let mut info = super::BitgetAccountInfo {
+            user_id: "12345".into(),
+            perm_type: "read-and-write".into(),
+            permissions: vec![
+                "uta_trade".into(),
+                "copy_futures_order".into(),
+                "copy_futures_position".into(),
+            ],
+        };
+        let ordinary = super::scoped_account_identity(&info, BitgetAccountScope::Unified).unwrap();
+        let elite =
+            super::scoped_account_identity(&info, BitgetAccountScope::EliteTrading).unwrap();
+        assert_eq!(ordinary, "12345");
+        assert_ne!(ordinary, elite);
+        assert_eq!(
+            elite,
+            super::scoped_account_identity(&info, BitgetAccountScope::EliteTrading).unwrap()
+        );
+        info.permissions
+            .retain(|value| value != "copy_futures_position");
+        assert!(super::scoped_account_identity(&info, BitgetAccountScope::EliteTrading).is_err());
+    }
+
+    #[test]
+    fn elite_scope_requires_both_copy_permissions_without_withdrawal() {
+        use crate::credentials::BitgetAccountScope;
+        for (permissions, accepted) in [
+            (vec!["uta_trade"], false),
+            (vec!["uta_trade", "copy_futures_order"], false),
+            (
+                vec!["uta_trade", "copy_futures_order", "copy_futures_position"],
+                true,
+            ),
+            (
+                vec![
+                    "uta_trade",
+                    "copy_futures_order",
+                    "copy_futures_position",
+                    "withdraw",
+                ],
+                false,
+            ),
+        ] {
+            let info = super::BitgetAccountInfo {
+                user_id: "fixture-uid".into(),
+                perm_type: "read-and-write".into(),
+                permissions: permissions.into_iter().map(str::to_owned).collect(),
+            };
+            assert_eq!(
+                super::validate_scope_permissions(&info, BitgetAccountScope::EliteTrading).is_ok(),
+                accepted,
+            );
+        }
+    }
 
     #[test]
     fn account_uid_is_read_from_signed_response_shape() {

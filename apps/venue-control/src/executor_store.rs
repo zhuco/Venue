@@ -91,6 +91,20 @@ pub struct PgExecutorStore {
 }
 
 impl PgExecutorStore {
+    pub(crate) async fn inventory_mm_projection(
+        &self,
+        command_id: &str,
+    ) -> Result<
+        Option<venue_control_protocol::kol::TerminalAccountProjection>,
+        BinanceCommandLedgerError,
+    > {
+        let value: Option<serde_json::Value> = sqlx::query_scalar("SELECT p.projection_json->'projection' FROM venue_binance_account_projections p JOIN venue_binance_commands c ON c.credential_id=p.credential_id AND c.owner_user_id=p.owner_user_id AND c.trading_account_id=p.trading_account_id WHERE c.command_id=$1 AND c.command_origin='inventory_mm' AND p.private_generation=c.inventory_mm_private_generation AND p.observed_ms=c.inventory_mm_observed_ms AND COALESCE((p.projection_json->>'stream_healthy')::boolean,false)")
+            .bind(command_id).fetch_optional(&self.pool).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
+        value
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| BinanceCommandLedgerError::Unavailable)
+    }
     /// Read-only admission snapshot; callers still need the account queue lock through dispatch.
     pub async fn inventory_mm_dispatch_permitted(
         &self,

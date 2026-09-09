@@ -21,6 +21,7 @@ async fn stop_loss_pauses_increases_and_unknown_cannot_be_settled_or_reposted()
                 credential_id: credential,
                 config: SupportMartingaleConfig {
                     entry_mode: MartingaleEntryMode::Support,
+                    allow_btc_neutral: false,
                     symbol_parameters: vec![],
                     reference_venue: VenueId::Binance,
                     execution_venue: VenueId::Bybit,

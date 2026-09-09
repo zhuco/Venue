@@ -10,6 +10,7 @@ pub enum AccountAction {
     Refresh,
     Logout,
     Bind(BindCredentialRequest),
+    BindBitgetCopy(BindBitgetCopyCredentialRequest),
     Verify(String),
     Select(String),
     Delete(DeleteCredentialRequest),
@@ -159,6 +160,19 @@ async fn execute(
         AccountAction::Bind(request) => {
             let _: CredentialSummary =
                 post(&client, endpoint, CREDENTIALS_PATH, &auth, &request).await?;
+            Ok(AccountResult::Overview(
+                get(&client, endpoint, SESSION_PATH, &auth).await?,
+            ))
+        }
+        AccountAction::BindBitgetCopy(request) => {
+            let _: CredentialSummary = post(
+                &client,
+                endpoint,
+                BITGET_COPY_CREDENTIALS_PATH,
+                &auth,
+                &request,
+            )
+            .await?;
             Ok(AccountResult::Overview(
                 get(&client, endpoint, SESSION_PATH, &auth).await?,
             ))

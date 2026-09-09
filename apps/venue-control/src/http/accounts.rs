@@ -126,6 +126,7 @@ where
                 | MANAGED_VERIFY_PATH
                 | MANAGED_DELETE_PATH
                 | SUPPORT_MARTINGALE_INSTANCES_PATH
+                | SUPPORT_MARTINGALE_PREFLIGHT_PATH
                 | SUPPORT_MARTINGALE_LIFECYCLE_PATH
         )
         || path.starts_with(SUPPORT_MARTINGALE_DETAIL_PREFIX)
@@ -669,6 +670,11 @@ async fn account_request(
         (Method::Post, CREDENTIALS_PATH) => encode(
             &accounts
                 .bind_follow_credential(&principal, decode(&request.body)?, now)
+                .await?,
+        ),
+        (Method::Post, BITGET_COPY_CREDENTIALS_PATH) => encode(
+            &accounts
+                .bind_bitget_copy_credential(&principal, decode(&request.body)?, now)
                 .await?,
         ),
         (Method::Post, VERIFY_PATH) => {

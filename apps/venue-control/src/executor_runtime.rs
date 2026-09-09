@@ -876,7 +876,16 @@ where
             .await?;
         return Ok(AccountDrainDecision::Continue);
     }
-    match exchange.submit(&request, credentials).await {
+    let result =
+        if command.origin == venue_control_protocol::kol::ExecutorCommandOrigin::InventoryMm {
+            let projection = store.inventory_mm_projection(&command.command_id).await?;
+            exchange
+                .submit_inventory_mm(&request, projection.as_ref(), credentials)
+                .await
+        } else {
+            exchange.submit(&request, credentials).await
+        };
+    match result {
         Ok(result) => settle_submit_result(store, &command, result).await,
         Err(error) => {
             let (state, code) = not_dispatched_transition(error);

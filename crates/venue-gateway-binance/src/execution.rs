@@ -80,16 +80,19 @@ pub struct BinanceReduceOnceIntent {
     pub private_generation: u64,
 }
 
-/// Same-generation, Hedge-Mode-only preparation boundary for a Grid batch which has already
-/// passed the host's signed-projection CAS. It carries no dispatch capability or credentials:
+/// Same-generation Hedge preparation after the host's authenticated projection admission.
+/// Shared by Grid batches and single MM commands; carries no dispatch capability or credentials:
 /// the singleton executor must still claim durable commands and sign each mutation exactly once.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BinanceGridDispatchFence {
+pub struct BinanceHedgeDispatchFence {
     scope: BinancePrivateReadScope,
     rules: BinanceInstrumentRules,
 }
 
-impl BinanceGridDispatchFence {
+/// Compatibility name for existing Grid callers of the shared Hedge preparation boundary.
+pub type BinanceGridDispatchFence = BinanceHedgeDispatchFence;
+
+impl BinanceHedgeDispatchFence {
     pub fn new(
         config: &crate::BinanceConfig,
         rules: BinanceInstrumentRules,
@@ -122,7 +125,7 @@ impl BinanceGridDispatchFence {
     }
 
     /// Prepares only Binance GTX orders with an explicit LONG/SHORT direction. The committed
-    /// Grid plan is responsible for balance, inventory and reservation authority.
+    /// Host admission is responsible for balance, inventory and reservation authority.
     pub fn prepare_place_limit(
         &self,
         intent: &BinancePlaceIntent,
@@ -133,7 +136,11 @@ impl BinanceGridDispatchFence {
             &intent.client_order_id,
             intent.quantity,
         )?;
-        validate_price_and_notional(&self.rules, intent.quantity, intent.limit_price)?;
+        if intent.reduce_only {
+            validate_limit_price(&self.rules, intent.limit_price)?;
+        } else {
+            validate_price_and_notional(&self.rules, intent.quantity, intent.limit_price)?;
+        }
         if intent.time_in_force != BinanceTimeInForce::PostOnly {
             return Err(BinanceExecutionError::Intent);
         }
@@ -147,7 +154,7 @@ impl BinanceGridDispatchFence {
         )
     }
 
-    /// Prepares one exact client-order-id cancellation under the same Grid plan fence.
+    /// Prepares one exact client-order-id cancellation under the same authenticated fence.
     pub fn prepare_cancel(
         &self,
         intent: &BinanceCancelIntent,
@@ -1268,6 +1275,29 @@ mod tests {
             BinanceConfig::for_binding(BinanceAccountBinding::PortfolioMarginUm, &binding)?;
         let rules = parse_instrument_rules(EXCHANGE_INFO, binding.symbol.clone(), 7)?;
         Ok(BinanceGridDispatchFence::new(&config, rules, 17, 12, 901)?)
+    }
+
+    #[test]
+    fn authenticated_hedge_close_preserves_lot_price_and_direction_without_opening_minimum()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fence = grid_fence()?;
+        let mut intent = place_intent()?;
+        intent.side = OrderSide::Sell;
+        intent.position_side = PositionSide::Long;
+        intent.quantity = Decimal::new(1, 3);
+        intent.limit_price = Price::new(Decimal::from(1_000))?;
+        intent.time_in_force = BinanceTimeInForce::PostOnly;
+        intent.reduce_only = true;
+        assert!(fence.prepare_place_limit(&intent).is_ok());
+        intent.reduce_only = false;
+        assert!(fence.prepare_place_limit(&intent).is_err());
+        intent.reduce_only = true;
+        intent.side = OrderSide::Buy;
+        assert!(fence.prepare_place_limit(&intent).is_err());
+        intent.side = OrderSide::Sell;
+        intent.quantity = Decimal::new(1, 4);
+        assert!(fence.prepare_place_limit(&intent).is_err());
+        Ok(())
     }
 
     fn gtc_command() -> Result<ExecutionCommand, Box<dyn std::error::Error>> {

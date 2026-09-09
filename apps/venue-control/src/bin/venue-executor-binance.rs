@@ -29,6 +29,7 @@ const EXECUTOR_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const EXECUTOR_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const PROJECTION_DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 const STREAM_PROJECTION_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+const ACCOUNT_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 const GRID_PRIVATE_RECOVERY_CHANNEL_CAPACITY: usize = 32;
 const MAX_PROJECTION_RETRY_SHIFT: u32 = 5;
 const PRIVATE_STREAM_FILL_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(1);
@@ -918,6 +919,8 @@ fn spawn_projection_worker(
             )> = None;
             let mut fill_epoch = 0_u64;
             let mut recovering = false;
+            let mut recheck_at = std::time::Instant::now() + ACCOUNT_RECHECK_INTERVAL;
+            let mut periodic_recheck = false;
             let mut publish_deferred = 0_u32;
             while !*stop.borrow() {
                 let forced_reconcile = match reconcile.try_recv() {
@@ -925,7 +928,15 @@ fn spawn_projection_worker(
                     Err(std::sync::mpsc::TryRecvError::Empty) => false,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
                 };
-                let (action, action_received_at) = if forced_reconcile {
+                // Routine REST correction is separate from stream publication. A real gap or
+                // an uncertain command still requests immediate recovery through the same gate.
+                let scheduled_recheck = !recovering && std::time::Instant::now() >= recheck_at;
+                if scheduled_recheck {
+                    periodic_recheck = true;
+                    tracing::info!(target: "venue_control::grid_hot_path", %credential_id,
+                        "Authenticated account scheduled 30-minute signed recheck");
+                }
+                let (action, action_received_at) = if forced_reconcile || scheduled_recheck {
                     (
                         PrivatePollAction::SignedCorrection,
                         std::time::Instant::now(),
@@ -1042,6 +1053,12 @@ fn spawn_projection_worker(
                                 .install_stream_projection(snapshot_for_install)
                                 .ok()?;
                             recovering = false;
+                            recheck_at = std::time::Instant::now() + ACCOUNT_RECHECK_INTERVAL;
+                            if periodic_recheck {
+                                tracing::info!(target: "venue_control::grid_hot_path", %credential_id,
+                                    "Authenticated account periodic signed recheck completed; user stream resumed");
+                                periodic_recheck = false;
+                            }
                             consecutive_snapshot_failures = 0;
                             publish_at = std::time::Instant::now() + STREAM_PROJECTION_INTERVAL;
                         }

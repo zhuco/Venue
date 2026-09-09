@@ -48,11 +48,17 @@ fn clear_discards_old_replies_selection_secrets_and_keeps_public_preferences() {
         session: Some(session()),
         password: Zeroizing::new("private password".into()),
         api_secret: Zeroizing::new("private API secret".into()),
+        passphrase: Zeroizing::new("private Bitget passphrase".into()),
         ..Default::default()
     };
     let old_sender = state.client.test_sender();
     state.clear(&mut model);
-    assert!(state.session.is_none() && state.password.is_empty() && state.api_secret.is_empty());
+    assert!(
+        state.session.is_none()
+            && state.password.is_empty()
+            && state.api_secret.is_empty()
+            && state.passphrase.is_empty()
+    );
     assert!(
         old_sender
             .send(Ok(AccountResult::Session(session(), overview())))
@@ -301,6 +307,7 @@ fn login_registration_binding_and_management_render_without_exposing_secrets() {
                 password: Zeroizing::new("do-not-render-password".into()),
                 api_key: Zeroizing::new("do-not-render-api-key".into()),
                 api_secret: Zeroizing::new("do-not-render-api-secret".into()),
+                passphrase: Zeroizing::new("do-not-render-passphrase".into()),
                 ..Default::default()
             };
             if page >= 2 {
@@ -332,6 +339,7 @@ fn login_registration_binding_and_management_render_without_exposing_secrets() {
                 "do-not-render-password",
                 "do-not-render-api-key",
                 "do-not-render-api-secret",
+                "do-not-render-passphrase",
                 "fixture-session-must-not-render",
             ] {
                 assert!(!rendered.contains(secret));

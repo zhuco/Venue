@@ -17,6 +17,8 @@ use venue_gateway_binance::{
 use venue_strategies::inventory_mm::{MmAction, MmControl, MmInput, MmReason, MmVolatility, plan};
 #[path = "facts.rs"]
 mod facts;
+#[path = "recovery.rs"]
+mod recovery;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum InventoryMmRuntimeError {
@@ -49,6 +51,7 @@ struct MarketState {
     volatility: MmVolatility,
     last_sample_ms: u64,
     estimate: Option<Decimal>,
+    leverage: Option<(u8, u64, u64)>,
 }
 pub struct InventoryMmRuntime {
     store: InventoryMmStore,
@@ -58,7 +61,7 @@ pub struct InventoryMmRuntime {
     wake: CommandWake,
     markets: BTreeMap<String, MarketState>,
     private_recovery: BTreeMap<String, std::time::Instant>,
-    read_recovery: BTreeMap<String, std::time::Instant>,
+    read_recovery: BTreeMap<String, recovery::ReadRecovery>,
 }
 impl InventoryMmRuntime {
     pub fn new(
@@ -105,6 +108,16 @@ impl InventoryMmRuntime {
         self.read_recovery.retain(|id, _| active.contains(id));
         let mut processed = 0;
         for record in records {
+            if matches!(
+                record.state,
+                InventoryMmState::Running | InventoryMmState::StartPending
+            ) && self
+                .read_recovery
+                .get(&record.instance_id)
+                .is_some_and(|state| !state.ready(std::time::Instant::now()))
+            {
+                continue;
+            }
             match self.process(&record).await {
                 Ok(()) => {
                     self.read_recovery.remove(&record.instance_id);
@@ -112,18 +125,16 @@ impl InventoryMmRuntime {
                 }
                 Err(InventoryMmRuntimeError::Superseded) => {}
                 Err(error) if retryable_read(error) => {
-                    let first = *self
+                    let recovery_now = std::time::Instant::now();
+                    let state = self
                         .read_recovery
                         .entry(record.instance_id.clone())
-                        .or_insert_with(std::time::Instant::now);
-                    tracing::warn!(instance_id=%record.instance_id, %error,
-                        "inventory MM read failed; quotes paused while cancelling owned orders");
-                    let recovery = if private_recovery_expired(first.elapsed()) {
-                        self.latch_and_cancel(&record, "read_recovery_timeout")
-                            .await
-                    } else {
-                        self.cancel_observed(&record).await
-                    };
+                        .or_insert_with(|| recovery::ReadRecovery::new(recovery_now));
+                    if state.failed(recovery_now) {
+                        tracing::warn!(instance_id=%record.instance_id, %error, elapsed_ms=state.elapsed(recovery_now).as_millis(),
+                            "inventory MM read unavailable; quotes paused with automatic recovery");
+                    }
+                    let recovery = self.cancel_observed(&record).await;
                     if let Err(error) = recovery {
                         tracing::warn!(instance_id=%record.instance_id, %error,
                             "inventory MM recovery cancellation awaits original order readback");
@@ -148,8 +159,8 @@ impl InventoryMmRuntime {
             .projections
             .load_owned(&record.owner_user_id, &record.credential_id)
             .await
-            .map_err(|_| InventoryMmRuntimeError::Facts)?
-            .ok_or(InventoryMmRuntimeError::Facts)?;
+            .map_err(|_| InventoryMmRuntimeError::PrivateRead)?
+            .ok_or(InventoryMmRuntimeError::PrivateRead)?;
         if projection.trading_account_id != record.trading_account_id
             || projection.credential_id != record.credential_id
         {
@@ -201,7 +212,7 @@ impl InventoryMmRuntime {
             .projections
             .load_healthy_owned(&record.owner_user_id, &record.credential_id)
             .await
-            .map_err(|_| InventoryMmRuntimeError::Facts)?;
+            .map_err(|_| InventoryMmRuntimeError::PrivateRead)?;
         let now_ms = now()?;
         // A concurrently newer authenticated stream observation is a retry, not a broken-stream halt.
         if healthy.as_ref().is_some_and(|p| {
@@ -224,13 +235,12 @@ impl InventoryMmRuntime {
                     std::time::Instant::now()
                 });
             if private_recovery_expired(first.elapsed()) {
-                self.latch_and_cancel(record, "private_facts_unavailable")
-                    .await?;
-            } else {
-                // Retry observation only. No quote can pass the existing five-second admission
-                // gate during recovery; cancellation keeps its original ledger identity.
-                self.cancel(record, &projection, &owned).await?;
+                tracing::warn!(instance_id=%record.instance_id, elapsed_ms=first.elapsed().as_millis(),
+                    "inventory MM private stream outage persists; quotes remain paused");
+                self.private_recovery
+                    .insert(record.instance_id.clone(), std::time::Instant::now());
             }
+            self.cancel(record, &projection, &owned).await?;
             return Ok(());
         }
         if self.private_recovery.remove(&record.instance_id).is_some() {
@@ -268,6 +278,7 @@ impl InventoryMmRuntime {
                         .map_err(|_| InventoryMmRuntimeError::Planner)?,
                     last_sample_ms: 0,
                     estimate: None,
+                    leverage: None,
                 },
             );
         }
@@ -305,11 +316,31 @@ impl InventoryMmRuntime {
             .secrets
             .load(&record.credential_id, &record.owner_user_id)
             .await
-            .map_err(|_| InventoryMmRuntimeError::Facts)?;
-        let (leverage, (margin, margin_at), conversion) = tokio::try_join!(
-            market
-                .reader
-                .symbol_leverage(&credentials, projection.private_generation),
+            .map_err(|error| match error {
+                crate::executor_secret::ExecutorSecretError::Unavailable => {
+                    InventoryMmRuntimeError::PrivateRead
+                }
+                crate::executor_secret::ExecutorSecretError::Forbidden => {
+                    InventoryMmRuntimeError::Facts
+                }
+            })?;
+        // Account configuration events invalidate the stream generation. Between those events,
+        // symbol leverage is configuration, not a five-second market observation.
+        let leverage = match market.leverage.filter(|(_, at, generation)| {
+            *generation == projection.private_generation && facts::fresh(*at, now_ms, 1_800_000)
+        }) {
+            Some((value, at, _)) => (value, at),
+            None => {
+                let value = market
+                    .reader
+                    .symbol_leverage(&credentials, projection.private_generation)
+                    .await
+                    .map_err(|_| InventoryMmRuntimeError::PrivateRead)?;
+                market.leverage = Some((value.0, value.1, projection.private_generation));
+                value
+            }
+        };
+        let ((margin, margin_at), conversion) = tokio::try_join!(
             market
                 .reader
                 .account_margin(&credentials, projection.private_generation),
@@ -321,6 +352,28 @@ impl InventoryMmRuntime {
             tracing::warn!(%error, "inventory MM signed margin, leverage or conversion read failed");
             InventoryMmRuntimeError::PrivateRead
         })?;
+        // Network risk reads must not turn an initially valid quote into a permanent halt.
+        // Refresh public prices after slow I/O; all facts are still checked before planning.
+        let checked = now()?;
+        let bbo = if !facts::fresh(bbo.observed_at_ms, checked, 3_000) {
+            market
+                .reader
+                .refresh(checked)
+                .await
+                .map_err(|_| InventoryMmRuntimeError::Market)?
+        } else {
+            bbo
+        };
+        let reference =
+            if !facts::fresh(reference.observed_at_ms, checked, facts::MARKET_MAX_AGE_MS) {
+                market
+                    .reader
+                    .refresh_reference(None, checked)
+                    .await
+                    .map_err(|_| InventoryMmRuntimeError::Market)?
+            } else {
+                reference
+            };
         // Signed risk reads cross network awaits. Plan against a fresh authenticated surface
         // afterwards instead of repeatedly enqueueing a snapshot overtaken by heartbeats.
         let latest = self
@@ -345,18 +398,38 @@ impl InventoryMmRuntime {
         let (long_quantity, short_quantity) = facts::positions(&projection, &record.config.symbol)?;
         let now_ms = now()?;
         if leverage.0 != record.config.required_leverage
-            || !facts::fresh(leverage.1, now_ms, facts::MARKET_MAX_AGE_MS)
-            || !facts::fresh(margin_at, now_ms, facts::MARKET_MAX_AGE_MS)
-            || !facts::fresh(reference.observed_at_ms, now_ms, facts::MARKET_MAX_AGE_MS)
-            || !facts::fresh(bbo.observed_at_ms, now_ms, facts::MARKET_MAX_AGE_MS)
-            || !facts::fresh(conversion.observed_at_ms, now_ms, facts::MARKET_MAX_AGE_MS)
-            || !facts::fresh(conversion.source_time_ms, now_ms, facts::MARKET_MAX_AGE_MS)
             || conversion.private_generation != projection.private_generation
             || conversion.usd_per_asset <= Decimal::ZERO
             || conversion.asset.as_str() != record.config.symbol.quote()
         {
+            tracing::warn!(instance_id=%record.instance_id, leverage=leverage.0,
+                "inventory MM configuration or currency identity changed");
             return Err(InventoryMmRuntimeError::Facts);
         }
+        validate_freshness(
+            &record.instance_id,
+            now_ms,
+            &[
+                ("leverage", leverage.1, 1_800_000),
+                ("margin", margin_at, facts::MARKET_MAX_AGE_MS),
+                (
+                    "reference",
+                    reference.observed_at_ms,
+                    facts::MARKET_MAX_AGE_MS,
+                ),
+                ("bbo", bbo.observed_at_ms, facts::MARKET_MAX_AGE_MS),
+                (
+                    "conversion_receipt",
+                    conversion.observed_at_ms,
+                    facts::MARKET_MAX_AGE_MS,
+                ),
+                (
+                    "conversion_source",
+                    conversion.source_time_ms,
+                    facts::MARKET_MAX_AGE_MS,
+                ),
+            ],
+        )?;
         let available = margin
             .available_balance
             .checked_sub(record.config.min_available_margin)
@@ -570,12 +643,30 @@ impl InventoryMmRuntime {
     }
 }
 fn private_recovery_expired(elapsed: std::time::Duration) -> bool {
-    elapsed >= std::time::Duration::from_secs(30)
+    elapsed >= std::time::Duration::from_secs(120)
+}
+fn validate_freshness(instance_id: &str, now_ms: u64, fields: &[(&str, u64, u64)]) -> Result<()> {
+    for &(field, at, age) in fields {
+        if !facts::fresh(at, now_ms, age) {
+            tracing::warn!(
+                instance_id,
+                field,
+                observed_ms = at,
+                now_ms,
+                age_ms = now_ms.saturating_sub(at),
+                "inventory MM evidence expired while reading; retrying"
+            );
+            return Err(InventoryMmRuntimeError::PrivateRead);
+        }
+    }
+    Ok(())
 }
 fn retryable_read(error: InventoryMmRuntimeError) -> bool {
     matches!(
         error,
-        InventoryMmRuntimeError::Market | InventoryMmRuntimeError::PrivateRead
+        InventoryMmRuntimeError::Market
+            | InventoryMmRuntimeError::PrivateRead
+            | InventoryMmRuntimeError::Store
     )
 }
 fn owned_orders<'a>(
@@ -681,24 +772,48 @@ mod tests {
     #[test]
     fn private_recovery_is_bounded_without_extending_fact_freshness() {
         assert!(!private_recovery_expired(std::time::Duration::from_millis(
-            29_999
+            119_999
         )));
-        assert!(private_recovery_expired(std::time::Duration::from_secs(30)));
+        assert!(private_recovery_expired(std::time::Duration::from_secs(
+            120
+        )));
         assert!(!facts::fresh(1_000, 6_001, facts::PRIVATE_MAX_AGE_MS));
     }
 
     #[test]
-    fn read_retries_do_not_include_identity_planner_store_or_revision_errors() {
+    fn read_retries_do_not_include_identity_planner_or_revision_errors() {
         assert!(retryable_read(InventoryMmRuntimeError::Market));
         assert!(retryable_read(InventoryMmRuntimeError::PrivateRead));
+        assert!(retryable_read(InventoryMmRuntimeError::Store));
         for error in [
             InventoryMmRuntimeError::Facts,
             InventoryMmRuntimeError::Planner,
-            InventoryMmRuntimeError::Store,
             InventoryMmRuntimeError::Superseded,
         ] {
             assert!(!retryable_read(error));
         }
+    }
+
+    #[test]
+    fn evidence_expiry_is_retryable_and_recovery_never_extends_old_data() {
+        assert!(validate_freshness("fixture", 5_900, &[("bbo", 1_000, 5_000)]).is_ok());
+        assert_eq!(
+            validate_freshness("fixture", 6_100, &[("bbo", 1_000, 5_000)]),
+            Err(InventoryMmRuntimeError::PrivateRead)
+        );
+        assert_eq!(
+            validate_freshness("fixture", 6_100, &[("margin", 6_200, 5_000)]),
+            Err(InventoryMmRuntimeError::PrivateRead)
+        );
+        assert!(
+            validate_freshness(
+                "fixture",
+                6_100,
+                &[("bbo", 6_000, 5_000), ("margin", 6_010, 5_000)]
+            )
+            .is_ok()
+        );
+        assert!(!retryable_read(InventoryMmRuntimeError::Facts));
     }
 
     fn record() -> std::result::Result<InventoryMmInstance, Box<dyn std::error::Error>> {

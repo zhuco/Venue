@@ -1,5 +1,9 @@
 # Binance KOL 跟单 MVP 长期契约
 
+共享Executor的认证账户投影以用户流更新订单/库存，正常每30分钟建立一次签名REST校验基线；
+启动、断线、语义变化、事件缺口及原身份待对账仍立即恢复。心跳仅证明连接连续性，不更新旧PM余额。
+独立库存做市的可恢复读取和显式带库存Resume见 [库存做市契约](INVENTORY_MM.md)，不修改KOL命令对账规则。
+
 独立策略通过 [多交易所执行入口](MULTI_VENUE_EXECUTOR.md) 接入另外五所，并与 Binance 共用 Executor 进程及账户网络并发上限。该扩展不改变本文件的 Binance KOL 账户、复制语义或实盘验收范围；其他交易所不得进入 KOL/终端/Grid 的 Binance 命令路由。
 
 ## KOL 托管凭证保存
@@ -21,6 +25,8 @@ Web 不再显示页面下方独立的全局跟单表单。托管账户及已有�
 本文定义可供真实用户使用的 Binance KOL 跟单 MVP，拥有其产品流程、订单同步语义、安全边界和验收标准。Binance Grid 的当前重建契约由 [`GRID_RUNTIME_REFACTOR.md`](GRID_RUNTIME_REFACTOR.md) 管理；两者共用单例 Executor，但都不得引入 Actor、Checkpoint、handoff 或每账户进程。
 
 本契约的 KOL 范围只覆盖 Binance；五所独立策略按 [MULTI_VENUE_EXECUTOR](MULTI_VENUE_EXECUTOR.md) 准入，不提供跨所 KOL 跟单。旧 Grid/Node 接管路线继续冻结，Scalping 暂缓；冻结不等于删除运行工件或恢复事实。
+
+Bitget 马丁原生带单属于独立策略账户接入：Venue 执行带单资金范围内的策略，Bitget 承担平台跟随复制；专用凭证通过 Bitget 带单绑定入口验证，不进入本节 Binance 跟随授权或源单镜像链。源码接入、Bitget 签名准入和真实带单结果分别验收。
 
 Grid 明确交易所拒单采用首次拒单后 30 秒开始重置的恢复语义，期间继续正常补撤；后续拒单不刷新期限，实际撤单重布使用独立收敛计时。超时或响应未知仍由统一命令账本按原 clientOrderId 对账，不能作为明确拒单重发；完整边界见 Grid 契约第 5.1 节。
 

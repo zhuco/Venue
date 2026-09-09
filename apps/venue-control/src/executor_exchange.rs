@@ -44,6 +44,7 @@ mod mirror;
 use mirror::{mirror_order_outcome, signed_limit_outcome, tracks_exact_order_fact};
 mod mock;
 pub use mock::MockBinanceExecution;
+mod inventory_mm;
 mod prices;
 mod rejection;
 mod terminal_market;
@@ -662,6 +663,14 @@ pub type BinanceGridBatchFuture<'a> = Pin<
 >;
 
 pub trait BinanceExecution {
+    fn submit_inventory_mm<'a>(
+        &'a mut self,
+        request: &'a ExecutionRequest,
+        _projection: Option<&'a venue_control_protocol::kol::TerminalAccountProjection>,
+        credentials: BinanceCredentials,
+    ) -> BinanceExecutionFuture<'a> {
+        self.submit(request, credentials)
+    }
     fn confirm_draining_limit_absence<'a>(
         &'a mut self,
         _request: &'a ExecutionRequest,
@@ -1146,6 +1155,14 @@ impl BinanceHttpExecution {
 }
 
 impl BinanceExecution for BinanceHttpExecution {
+    fn submit_inventory_mm<'a>(
+        &'a mut self,
+        request: &'a ExecutionRequest,
+        projection: Option<&'a venue_control_protocol::kol::TerminalAccountProjection>,
+        credentials: BinanceCredentials,
+    ) -> BinanceExecutionFuture<'a> {
+        Box::pin(self.submit_mm_stream(request, projection, credentials))
+    }
     fn terminal_market<'a>(
         &'a mut self,
         request: &'a ExecutionRequest,
@@ -1195,6 +1212,21 @@ impl BinanceExecution for BinanceHttpExecution {
 }
 
 impl BinanceExecution for BinanceExecutionRouter {
+    fn submit_inventory_mm<'a>(
+        &'a mut self,
+        request: &'a ExecutionRequest,
+        projection: Option<&'a venue_control_protocol::kol::TerminalAccountProjection>,
+        credentials: BinanceCredentials,
+    ) -> BinanceExecutionFuture<'a> {
+        let exchange = self.exchange(request);
+        Box::pin(async move {
+            exchange?
+                .lock()
+                .await
+                .submit_inventory_mm(request, projection, credentials)
+                .await
+        })
+    }
     fn confirm_draining_limit_absence<'a>(
         &'a mut self,
         request: &'a ExecutionRequest,

@@ -10,7 +10,8 @@ use venue_control::{
     support_martingale::SupportMartingaleStore,
 };
 use venue_control_protocol::support_martingale::{
-    SupportMartingaleAction, SupportMartingaleCreateRequest, SupportMartingaleLifecycleRequest,
+    SupportMartingaleAction, SupportMartingaleConfigUpdateRequest, SupportMartingaleCreateRequest,
+    SupportMartingaleLifecycleRequest,
 };
 use venue_domain::domain::{ExecutionCommand, Symbol};
 use zeroize::Zeroizing;
@@ -31,11 +32,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let valid = matches!(args.as_slice(), [op] if op == "migrate")
         || matches!(args.as_slice(), [op, _, _, _, _] if op == "bind" || op == "bind-released")
-        || matches!(args.as_slice(), [op, _] if matches!(op.as_str(), "martingale-create" | "martingale-lifecycle" | "binance-grid-reset" | "mm-create" | "mm-preflight" | "mm-lifecycle"))
-        || matches!(args.as_slice(), [op, _, _] if matches!(op.as_str(), "submit"|"status"|"limits"|"grid-create"|"grid-status"|"probe"|"observe"|"martingale-status"|"mm-status"))
+        || matches!(args.as_slice(), [op, _] if matches!(op.as_str(), "martingale-create" | "martingale-config" | "martingale-lifecycle" | "binance-grid-reset" | "mm-create" | "mm-preflight" | "mm-lifecycle"))
+        || matches!(args.as_slice(), [op, _, _] if matches!(op.as_str(), "submit"|"status"|"limits"|"grid-create"|"grid-depth"|"grid-status"|"probe"|"observe"|"martingale-status"|"mm-status"))
         || matches!(args.as_slice(), [op, _, _, _] if matches!(op.as_str(), "snapshot"|"grid-lifecycle"|"funding"));
     if !valid {
-        return Err("usage: venue-strategy-admin migrate | probe ACCOUNT SYMBOL | bind|bind-released USER ACCOUNT SYMBOL LABEL | limits USER CREDENTIAL | submit USER CREDENTIAL | observe USER CREDENTIAL | snapshot USER CREDENTIAL SYMBOL | funding USER CREDENTIAL SYMBOL | status USER COMMAND | grid-create USER CREDENTIAL | grid-status USER INSTANCE | grid-lifecycle USER INSTANCE start|pause|resume|stop|reset | binance-grid-reset USER | martingale-create USER | martingale-status USER INSTANCE | martingale-lifecycle USER | mm-create USER | mm-status USER INSTANCE | mm-preflight USER | mm-lifecycle USER; structured input uses stdin".into());
+        return Err("usage: venue-strategy-admin migrate | probe ACCOUNT SYMBOL | bind|bind-released USER ACCOUNT SYMBOL LABEL | limits USER CREDENTIAL | submit USER CREDENTIAL | observe USER CREDENTIAL | snapshot USER CREDENTIAL SYMBOL | funding USER CREDENTIAL SYMBOL | status USER COMMAND | grid-create USER CREDENTIAL | grid-depth USER INSTANCE | grid-status USER INSTANCE | grid-lifecycle USER INSTANCE start|pause|resume|stop|reset | binance-grid-reset USER | martingale-create USER | martingale-config USER | martingale-status USER INSTANCE | martingale-lifecycle USER | mm-create USER | mm-status USER INSTANCE | mm-preflight USER | mm-lifecycle USER; structured input uses stdin".into());
     }
     if args[0] == "probe" {
         let credentials: StrategyCredentials = input()?;
@@ -101,6 +102,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             println!("{}", serde_json::to_string(&record)?);
         }
+        "grid-depth" => {
+            let revision = venue_control::multi_venue_grid::StrategyGridStore::new(pool)
+                .update_depth(&args[1], &args[2], input()?, now_ms()?)
+                .await?;
+            println!("{revision}");
+        }
         "grid-lifecycle" => {
             venue_control::multi_venue_grid::StrategyGridStore::new(pool)
                 .lifecycle(&args[1], &args[2], &args[3], now_ms()?)
@@ -113,6 +120,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .create(&args[1], request, now_ms()?)
                 .await?;
             println!("{id}");
+        }
+        "martingale-config" => {
+            let request: SupportMartingaleConfigUpdateRequest = input()?;
+            let revision = SupportMartingaleStore::new(pool)
+                .update_config(&args[1], request, now_ms()?)
+                .await?;
+            println!("{revision}");
         }
         "martingale-status" => {
             let record = SupportMartingaleStore::new(pool)

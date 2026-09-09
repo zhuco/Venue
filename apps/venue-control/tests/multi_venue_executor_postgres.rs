@@ -35,6 +35,8 @@ static NEXT_ACCOUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 #[path = "support/martingale_stop_loss.rs"]
 mod martingale_stop_loss;
+#[path = "support/strategy_configuration.rs"]
+mod strategy_configuration;
 
 struct Fixture {
     pool: PgPool,
@@ -706,6 +708,7 @@ async fn support_martingale_create_lifecycle_budget_and_support_identity_are_dur
         credential_id: credential,
         config: SupportMartingaleConfig {
             entry_mode: Default::default(),
+            allow_btc_neutral: false,
             symbol_parameters: Vec::new(),
             reference_venue: VenueId::Binance,
             execution_venue: VenueId::Bybit,

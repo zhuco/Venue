@@ -1,5 +1,5 @@
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use venue_control_protocol::accounts::{ApiVerificationState, CredentialSummary};
 use venue_domain::domain::Symbol;
 use venue_execution::{
@@ -66,6 +66,83 @@ pub(crate) fn identity_hash(venue: VenueId, identity: &str) -> Vec<u8> {
     hash.finalize().to_vec()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum StrategyCredentialBindError {
+    #[error("strategy exchange is unavailable or rejected its signed account contract")]
+    Exchange,
+    #[error("strategy account is already in use")]
+    AccountInUse,
+    #[error("strategy exchange identity belongs to another owner")]
+    IdentityConflict,
+}
+
+enum BindFailure {
+    Exchange(StrategyExchangeError),
+    AccountInUse,
+    IdentityConflict,
+}
+
+impl From<StrategyExchangeError> for BindFailure {
+    fn from(error: StrategyExchangeError) -> Self {
+        Self::Exchange(error)
+    }
+}
+
+impl From<BindFailure> for StrategyCredentialBindError {
+    fn from(error: BindFailure) -> Self {
+        match error {
+            BindFailure::Exchange(_) => Self::Exchange,
+            BindFailure::AccountInUse => Self::AccountInUse,
+            BindFailure::IdentityConflict => Self::IdentityConflict,
+        }
+    }
+}
+
+async fn resolve_identity_account(
+    tx: &mut Transaction<'_, Postgres>,
+    owner: &str,
+    requested_account: &str,
+    venue: VenueId,
+    identity: &[u8],
+) -> Result<String, BindFailure> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('venue-strategy-identity:' || $1 || ':' || encode($2,'hex'),0))")
+        .bind(venue.as_str())
+        .bind(identity)
+        .execute(&mut **tx)
+        .await
+        .map_err(|_| StrategyExchangeError)?;
+    let existing = sqlx::query(
+        "SELECT trading_account_id,user_id FROM venue_user_trading_accounts WHERE venue=$1 AND exchange_identity_hash=$2 FOR UPDATE",
+    )
+    .bind(venue.as_str())
+    .bind(identity)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|_| StrategyExchangeError)?;
+    let canonical = if let Some(existing) = existing {
+        let existing_owner: String = existing
+            .try_get("user_id")
+            .map_err(|_| StrategyExchangeError)?;
+        if existing_owner != owner {
+            return Err(BindFailure::IdentityConflict);
+        }
+        existing
+            .try_get("trading_account_id")
+            .map_err(|_| StrategyExchangeError)?
+    } else {
+        sqlx::query("INSERT INTO venue_user_trading_accounts(trading_account_id,user_id,venue,exchange_identity_hash) VALUES($1,$2,$3,$4)")
+            .bind(requested_account)
+            .bind(owner)
+            .bind(venue.as_str())
+            .bind(identity)
+            .execute(&mut **tx)
+            .await
+            .map_err(|_| StrategyExchangeError)?;
+        requested_account.to_owned()
+    };
+    Ok(canonical)
+}
+
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut value = String::with_capacity(bytes.len() * 2);
@@ -96,6 +173,9 @@ async fn verified_snapshot(
             .map_err(|_| StrategyProbeError::Identity)?;
         gateway
             .verify_permissions()
+            .map_err(|_| StrategyProbeError::Permissions)?;
+        gateway
+            .verify_admission_symbol()
             .map_err(|_| StrategyProbeError::Permissions)?;
         let snapshot = gateway
             .snapshot(&binding)
@@ -130,6 +210,62 @@ pub async fn probe_strategy_account(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bitget_identity_resolution_reuses_owner_and_serializes_concurrent_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Some(fixture) = crate::accounts::test_support::Fixture::create().await? else {
+            return Ok(());
+        };
+        sqlx::query("INSERT INTO venue_users(user_id,username,password_hash,created_ms) VALUES('owner1','bitget_owner1','fixture',1),('owner2','bitget_owner2','fixture',1)")
+            .execute(&fixture.pool).await?;
+        let hash = identity_hash(VenueId::Bitget, "signed-fixture-uid");
+        let mut first = fixture.pool.begin().await?;
+        let canonical =
+            resolve_identity_account(&mut first, "owner1", "account1", VenueId::Bitget, &hash)
+                .await
+                .map_err(|_| "first resolution failed")?;
+        assert_eq!(canonical, "account1");
+        let concurrent_pool = fixture.pool.clone();
+        let concurrent_hash = hash.clone();
+        let second = tokio::spawn(async move {
+            let mut tx = concurrent_pool.begin().await.map_err(|_| "begin failed")?;
+            let account = resolve_identity_account(
+                &mut tx,
+                "owner1",
+                "account2",
+                VenueId::Bitget,
+                &concurrent_hash,
+            )
+            .await
+            .map_err(|_| "second resolution failed")?;
+            tx.commit().await.map_err(|_| "commit failed")?;
+            Ok::<_, &'static str>(account)
+        });
+        first.commit().await?;
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), second).await???,
+            "account1"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM venue_user_trading_accounts WHERE venue='bitget' AND exchange_identity_hash=$1")
+            .bind(&hash).fetch_one(&fixture.pool).await?;
+        assert_eq!(count, 1);
+        let mut other_owner = fixture.pool.begin().await?;
+        assert!(matches!(
+            resolve_identity_account(
+                &mut other_owner,
+                "owner2",
+                "account3",
+                VenueId::Bitget,
+                &hash
+            )
+            .await,
+            Err(BindFailure::IdentityConflict)
+        ));
+        other_owner.rollback().await?;
+        fixture.cleanup().await?;
+        Ok(())
+    }
 
     #[test]
     fn wallet_identity_is_case_insensitive_but_exchange_keys_are_not() {
@@ -324,8 +460,9 @@ impl StrategyCredentialStore {
         &self,
         owner: &str,
         credential: &str,
-        symbol: Symbol,
+        symbols: Vec<Symbol>,
     ) -> Result<venue_execution::SignedAccountSnapshot, StrategyExchangeError> {
+        let symbol = symbols.first().cloned().ok_or(StrategyExchangeError)?;
         let account: String = sqlx::query_scalar("SELECT trading_account_id FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND deleted_ms IS NULL")
             .bind(credential).bind(owner).fetch_one(&self.pool).await.map_err(|_| StrategyExchangeError)?;
         let (credentials, expected) = self.load(owner, credential, &account, false).await?;
@@ -341,6 +478,7 @@ impl StrategyCredentialStore {
                 return Err(StrategyExchangeError);
             }
             gateway.verify_permissions()?;
+            gateway.verify_strategy_symbols(&symbols)?;
             gateway.snapshot(&binding)
         })
         .await
@@ -391,8 +529,48 @@ impl StrategyCredentialStore {
         credentials: StrategyCredentials,
         now_ms: u64,
     ) -> Result<CredentialSummary, StrategyExchangeError> {
-        self.bind_inner(owner, account, label, symbol, credentials, now_ms, false)
-            .await
+        self.bind_inner(
+            owner,
+            account,
+            label,
+            symbol,
+            credentials,
+            now_ms,
+            false,
+            false,
+        )
+        .await
+        .map_err(|_| StrategyExchangeError)
+    }
+
+    /// Bitget's copy-trading key can prove the same signed UID as an existing UTA key.
+    /// Resolve that UID to its canonical account row before admission; a second UUID would
+    /// bypass the account queue and could put two strategy writers on one exchange account.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn bind_bitget_copy(
+        &self,
+        owner: &str,
+        account: &str,
+        label: &str,
+        symbol: Symbol,
+        credentials: StrategyCredentials,
+        now_ms: u64,
+    ) -> Result<CredentialSummary, StrategyCredentialBindError> {
+        if !matches!(&credentials, StrategyCredentials::BitgetCopy { .. }) {
+            return Err(StrategyCredentialBindError::Exchange);
+        }
+        self.bind_inner(
+            owner,
+            account,
+            label,
+            symbol,
+            credentials,
+            now_ms,
+            false,
+            true,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     /// Operator entry after the old writer has been stopped and released through its own
@@ -407,8 +585,18 @@ impl StrategyCredentialStore {
         credentials: StrategyCredentials,
         now_ms: u64,
     ) -> Result<CredentialSummary, StrategyExchangeError> {
-        self.bind_inner(owner, account, label, symbol, credentials, now_ms, true)
-            .await
+        self.bind_inner(
+            owner,
+            account,
+            label,
+            symbol,
+            credentials,
+            now_ms,
+            true,
+            false,
+        )
+        .await
+        .map_err(|_| StrategyExchangeError)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -421,28 +609,142 @@ impl StrategyCredentialStore {
         credentials: StrategyCredentials,
         now_ms: u64,
         retain_positions: bool,
-    ) -> Result<CredentialSummary, StrategyExchangeError> {
+        reuse_identity: bool,
+    ) -> Result<CredentialSummary, BindFailure> {
         if label.trim().is_empty()
             || label.chars().count() > 64
             || label.chars().any(char::is_control)
         {
-            return Err(StrategyExchangeError);
+            return Err(BindFailure::Exchange(StrategyExchangeError));
         }
         let venue = credentials.venue();
         let payload =
             Zeroizing::new(serde_json::to_vec(&credentials).map_err(|_| StrategyExchangeError)?);
         let key_fingerprint = identity_hash(venue, credentials.key_identity());
         let masked_key = "••••".to_owned();
-        let (_, native_identity, snapshot) = verified_snapshot(account, symbol, credentials)
-            .await
-            .map_err(|_| StrategyExchangeError)?;
+        let (_, native_identity, initial_snapshot) =
+            verified_snapshot(account, symbol.clone(), credentials)
+                .await
+                .map_err(|_| StrategyExchangeError)?;
+        let hash = identity_hash(venue, &native_identity);
         // Both admission paths require the old order network to be gone. Released accounts may
         // retain signed inventory; the new grid derives its own orders from those positions.
+        let canonical_account = if reuse_identity {
+            let mut resolution_tx = self.pool.begin().await.map_err(|_| StrategyExchangeError)?;
+            let canonical =
+                resolve_identity_account(&mut resolution_tx, owner, account, venue, &hash).await?;
+            resolution_tx
+                .rollback()
+                .await
+                .map_err(|_| StrategyExchangeError)?;
+            canonical
+        } else {
+            account.to_owned()
+        };
+        let snapshot = if canonical_account == account {
+            initial_snapshot
+        } else {
+            let canonical_credentials: StrategyCredentials =
+                serde_json::from_slice(&payload).map_err(|_| StrategyExchangeError)?;
+            let (canonical_venue, canonical_identity, snapshot) =
+                verified_snapshot(&canonical_account, symbol, canonical_credentials)
+                    .await
+                    .map_err(|_| StrategyExchangeError)?;
+            if canonical_venue != venue
+                || identity_hash(canonical_venue, &canonical_identity) != hash
+            {
+                return Err(BindFailure::IdentityConflict);
+            }
+            snapshot
+        };
         let has_exposure = snapshot.positions().iter().any(|p| !p.quantity.is_zero());
         if !snapshot.open_orders().is_empty() || (!retain_positions && has_exposure) {
-            return Err(StrategyExchangeError);
+            return Err(BindFailure::Exchange(StrategyExchangeError));
         }
         let id = crate::accounts::strategy_credential_id().map_err(|_| StrategyExchangeError)?;
+        let mut tx = self.pool.begin().await.map_err(|_| StrategyExchangeError)?;
+        let canonical_account = if reuse_identity {
+            let resolved = resolve_identity_account(&mut tx, owner, account, venue, &hash).await?;
+            if resolved != canonical_account {
+                return Err(BindFailure::IdentityConflict);
+            }
+            resolved
+        } else {
+            account.to_owned()
+        };
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended('venue-strategy-admission:' || $1,0))",
+        )
+        .bind(&canonical_account)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| StrategyExchangeError)?;
+        sqlx::query("SELECT user_id FROM venue_users WHERE user_id=$1 FOR UPDATE")
+            .bind(owner)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| StrategyExchangeError)?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM venue_api_credentials WHERE user_id=$1 AND deleted_ms IS NULL",
+        )
+        .bind(owner)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| StrategyExchangeError)?;
+        if count >= 20 {
+            return Err(BindFailure::Exchange(StrategyExchangeError));
+        }
+        let occupied: bool = if reuse_identity {
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM venue_control_strategy_scopes WHERE trading_account_id=$1)
+                 OR EXISTS(SELECT 1 FROM venue_strategy_grids WHERE trading_account_id=$1 AND lifecycle IN ('running','pausing','paused','stopping','resetting'))
+                 OR EXISTS(SELECT 1 FROM venue_support_martingale_instances WHERE trading_account_id=$1 AND lifecycle IN ('running','entry_paused','increase_paused','draining'))
+                 OR EXISTS(SELECT 1 FROM venue_inventory_mm_instances WHERE trading_account_id=$1 AND instance_state <> 'stopped')",
+            )
+            .bind(&canonical_account)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| StrategyExchangeError)?
+        } else {
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM venue_control_strategy_scopes WHERE trading_account_id=$1)",
+            )
+            .bind(&canonical_account)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| StrategyExchangeError)?
+        };
+        if occupied {
+            return Err(if reuse_identity {
+                BindFailure::AccountInUse
+            } else {
+                BindFailure::Exchange(StrategyExchangeError)
+            });
+        }
+        let unfinished: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_binance_commands WHERE trading_account_id=$1 AND command_state IN ('pending','sending','accepted','reconcile_required'))")
+            .bind(&canonical_account).fetch_one(&mut *tx).await.map_err(|_| StrategyExchangeError)?;
+        if unfinished {
+            return Err(if reuse_identity {
+                BindFailure::AccountInUse
+            } else {
+                BindFailure::Exchange(StrategyExchangeError)
+            });
+        }
+        if !reuse_identity {
+            sqlx::query("INSERT INTO venue_user_trading_accounts(trading_account_id,user_id,venue,exchange_identity_hash) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
+                .bind(&canonical_account).bind(owner).bind(venue.as_str()).bind(&hash).execute(&mut *tx).await.map_err(|_| StrategyExchangeError)?;
+            let account_row = sqlx::query("SELECT trading_account_id,user_id FROM venue_user_trading_accounts WHERE venue=$1 AND exchange_identity_hash=$2 FOR UPDATE")
+                .bind(venue.as_str()).bind(&hash).fetch_one(&mut *tx).await.map_err(|_| StrategyExchangeError)?;
+            let stored_account: String = account_row
+                .try_get("trading_account_id")
+                .map_err(|_| StrategyExchangeError)?;
+            let stored_owner: String = account_row
+                .try_get("user_id")
+                .map_err(|_| StrategyExchangeError)?;
+            if stored_account != canonical_account || stored_owner != owner {
+                return Err(BindFailure::Exchange(StrategyExchangeError));
+            }
+        }
         let encrypted = self
             .cipher
             .encrypt(&credential_scope(owner, &id), &payload)
@@ -452,7 +754,7 @@ impl StrategyCredentialStore {
             label: label.trim().to_owned(),
             venue,
             masked_key,
-            trading_account_id: Some(account.to_owned()),
+            trading_account_id: Some(canonical_account.clone()),
             verification: ApiVerificationState::Verified,
             verified_ms: Some(snapshot.observed_at_ms()),
             expires_ms: None,
@@ -473,51 +775,11 @@ impl StrategyCredentialStore {
         };
         let mut verification = serde_json::to_value(&summary).map_err(|_| StrategyExchangeError)?;
         verification["strategy_execution"] = serde_json::json!(true);
-        let mut tx = self.pool.begin().await.map_err(|_| StrategyExchangeError)?;
-        sqlx::query(
-            "SELECT pg_advisory_xact_lock(hashtextextended('venue-strategy-admission:' || $1,0))",
-        )
-        .bind(account)
-        .execute(&mut *tx)
-        .await
-        .map_err(|_| StrategyExchangeError)?;
-        sqlx::query("SELECT user_id FROM venue_users WHERE user_id=$1 FOR UPDATE")
-            .bind(owner)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|_| StrategyExchangeError)?;
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM venue_api_credentials WHERE user_id=$1 AND deleted_ms IS NULL",
-        )
-        .bind(owner)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|_| StrategyExchangeError)?;
-        if count >= 20 {
-            return Err(StrategyExchangeError);
-        }
-        let old: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_control_strategy_scopes WHERE trading_account_id=$1)")
-            .bind(account).fetch_one(&mut *tx).await.map_err(|_| StrategyExchangeError)?;
-        if old {
-            return Err(StrategyExchangeError);
-        }
-        let unfinished:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_binance_commands WHERE trading_account_id=$1 AND command_state IN ('pending','sending','accepted','reconcile_required'))")
-            .bind(account).fetch_one(&mut *tx).await.map_err(|_| StrategyExchangeError)?;
-        if unfinished {
-            return Err(StrategyExchangeError);
-        }
-        let hash = identity_hash(venue, &native_identity);
-        sqlx::query("INSERT INTO venue_user_trading_accounts(trading_account_id,user_id,venue,exchange_identity_hash) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
-            .bind(account).bind(owner).bind(venue.as_str()).bind(&hash).execute(&mut *tx).await.map_err(|_| StrategyExchangeError)?;
-        let matches: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_user_trading_accounts WHERE trading_account_id=$1 AND user_id=$2 AND venue=$3 AND exchange_identity_hash=$4)")
-            .bind(account).bind(owner).bind(venue.as_str()).bind(hash).fetch_one(&mut *tx).await.map_err(|_| StrategyExchangeError)?;
-        if !matches {
-            return Err(StrategyExchangeError);
-        }
+        let snapshot_json = serde_json::to_value(&snapshot).map_err(|_| StrategyExchangeError)?;
         sqlx::query("INSERT INTO venue_api_credentials(credential_id,user_id,label,key_fingerprint,masked_key,encrypted_credentials,trading_account_id,verification_json,created_ms,venue,strategy_snapshot) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)")
             .bind(&id).bind(owner).bind(&summary.label).bind(key_fingerprint).bind(&summary.masked_key)
-            .bind(encrypted).bind(account).bind(verification).bind(i64::try_from(now_ms).map_err(|_| StrategyExchangeError)?)
-            .bind(venue.as_str()).bind(serde_json::to_value(&snapshot).map_err(|_| StrategyExchangeError)?)
+            .bind(encrypted).bind(&canonical_account).bind(verification).bind(i64::try_from(now_ms).map_err(|_| StrategyExchangeError)?)
+            .bind(venue.as_str()).bind(snapshot_json)
             .execute(&mut *tx).await.map_err(|_| StrategyExchangeError)?;
         tx.commit().await.map_err(|_| StrategyExchangeError)?;
         Ok(summary)

@@ -1,4 +1,5 @@
 import copy
+import re
 import unittest
 
 from configure_desktop_https import (
@@ -15,6 +16,16 @@ from configure_desktop_https import (
 
 
 class DesktopHttpsTests(unittest.TestCase):
+    def test_martingale_detail_exposes_only_one_instance_segment(self):
+        route = configured_route(self.original)["handle"][0]["routes"][0]
+        matcher = route["match"][2]
+        self.assertEqual(matcher["method"], ["GET"])
+        pattern = matcher["path_regexp"]["pattern"]
+        prefix = "/v2/strategies/support-martingale/instances/"
+        self.assertIsNotNone(re.fullmatch(pattern, prefix + "sm-123"))
+        for path in (prefix, prefix + "sm-123/admin", "/v2/account/admin"):
+            self.assertIsNone(re.fullmatch(pattern, path))
+
     def test_negative_flush_is_detected_and_removed(self):
         self.assertTrue(has_negative_flush({"handle": [{"flush_interval": -1}]}))
         self.assertFalse(has_negative_flush(configured_route(self.original)))

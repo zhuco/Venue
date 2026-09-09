@@ -131,6 +131,7 @@ pub enum MarketEnvironment {
     Up,
     Down,
     Range,
+    Neutral,
     Warmup,
 }
 
@@ -270,14 +271,16 @@ pub fn classify_environment(
         .is_some_and(|(_, low)| close.value() >= *low);
     let down_structure_holds =
         descending_last_two(&swing_highs) && descending_last_two(&swing_lows);
-    let environment = if close.value() > ef && ef > es && ef > ago && up_structure_holds {
+    let environment = if atr_value.is_none() {
+        MarketEnvironment::Warmup
+    } else if close.value() > ef && ef > es && ef > ago && up_structure_holds {
         MarketEnvironment::Up
     } else if close.value() < ef && ef < es && ef < ago && down_structure_holds {
         MarketEnvironment::Down
     } else if atr_value.is_some_and(|value| confirmed_range(bars, ef, ago, value)) {
         MarketEnvironment::Range
     } else {
-        MarketEnvironment::Warmup
+        MarketEnvironment::Neutral
     };
     Ok(EnvironmentSignal {
         environment,
@@ -433,9 +436,26 @@ pub fn evaluate_callback(
     let end = bars.len();
     let start = end.saturating_sub(config.callback_max_bars);
     let mut touched_at = None;
+    let mut invalidated = false;
     for i in start..end {
-        if bars[i].close.value() < support.lower.value() {
+        if bars[i].open_time_ms <= support.confirmed_at_ms {
+            continue;
+        }
+        // The last closed callback candle of the support interval has the same close
+        // as that interval. Intrahour dips alone do not invalidate a reclaim.
+        let support_close = bars[i]
+            .close_time_ms
+            .checked_add(1)
+            .is_some_and(|end| config.support_period > 0 && end % config.support_period == 0);
+        if support_close && bars[i].close.value() < support.lower.value() {
             touched_at = None;
+            invalidated = true;
+            continue;
+        }
+        if invalidated {
+            if bars[i].close.value() > support.upper.value() {
+                invalidated = false;
+            }
             continue;
         }
         if touched_at.is_none()
@@ -635,6 +655,36 @@ fn relative_volume(bars: &[PublicBar], index: usize) -> Result<Decimal, Strategy
 mod tests {
     use super::*;
 
+    #[test]
+    fn ready_unclassified_environment_is_neutral_and_short_history_is_warmup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut bars = callback_bars()?;
+        let mut config = SupportMartingaleConfig::research_default()?;
+        config.environment_period = 900_000;
+        config.environment_ema_fast = 2;
+        config.environment_ema_slow = 3;
+        for bar in &mut bars {
+            bar.open = Price::new(Decimal::from(100))?;
+            bar.close = bar.open;
+            bar.high = Price::new(Decimal::from(101))?;
+            bar.low = Price::new(Decimal::from(99))?;
+            bar.base_volume = FieldState::Known(Decimal::ONE);
+            bar.quote_volume = FieldState::Known(Decimal::from(100));
+            bar.taker_buy_base_volume = bar.base_volume.clone();
+            bar.taker_buy_quote_volume = bar.quote_volume.clone();
+        }
+        let now = bars.last().ok_or("no bar")?.close_time_ms + 1;
+        let ready = classify_environment(&bars, &config, now)?;
+        assert_eq!(ready.environment, MarketEnvironment::Neutral);
+        assert!(ready.ema_fast.is_some() && ready.ema_slow.is_some() && ready.atr.is_some());
+        config.environment_ema_slow = 60;
+        assert_eq!(
+            classify_environment(&bars, &config, now)?.environment,
+            MarketEnvironment::Warmup
+        );
+        Ok(())
+    }
+
     fn callback_bars() -> Result<Vec<PublicBar>, Box<dyn std::error::Error>> {
         let symbol = Symbol::new("BTC", "USDT")?;
         let interval = 900_000_u64;
@@ -771,6 +821,43 @@ mod tests {
             )?
             .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn callback_allows_intrahour_reclaim_but_rejects_hourly_break()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut bars, mut support, config) = callback_fixture()?;
+        support.lower = Price::new(Decimal::from(82))?;
+        support.upper = Price::new(Decimal::from(84))?;
+        let now = bars.last().ok_or("missing bar")?.close_time_ms + 1_000;
+        assert!(evaluate_callback(&bars, &support, &config, EntryKind::First, now)?.is_some());
+        for bar in &mut bars {
+            bar.open_time_ms -= config.callback_period;
+            bar.close_time_ms -= config.callback_period;
+            bar.received_at_ms -= config.callback_period;
+        }
+        support.confirmed_at_ms -= config.callback_period;
+        assert!(
+            evaluate_callback(
+                &bars,
+                &support,
+                &config,
+                EntryKind::First,
+                now - config.callback_period
+            )?
+            .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn callback_cannot_use_a_touch_before_support_confirmation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (bars, mut support, config) = callback_fixture()?;
+        support.confirmed_at_ms = bars[23].close_time_ms;
+        let now = bars.last().ok_or("missing bar")?.close_time_ms + 1_000;
+        assert!(evaluate_callback(&bars, &support, &config, EntryKind::First, now)?.is_none());
         Ok(())
     }
 

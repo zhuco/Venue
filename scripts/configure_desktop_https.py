@@ -31,6 +31,7 @@ POST_PATHS = [
     "/v2/account/login",
     "/v2/account/logout",
     "/v2/account/credentials",
+    "/v2/account/bitget-copy-credentials",
     "/v2/account/credentials/verify",
     "/v2/account/credentials/delete",
     "/v2/account/select",
@@ -75,6 +76,12 @@ def desktop_route():
         "match": [
             {"method": ["GET"], "path": GET_PATHS},
             {"method": ["POST"], "path": POST_PATHS},
+            {
+                "method": ["GET"],
+                "path_regexp": {
+                    "pattern": "^/v2/strategies/support-martingale/instances/[^/]+$"
+                },
+            },
         ],
         "handle": [
             {"handler": "headers", "response": {"set": {"Cache-Control": ["no-store"]}}},

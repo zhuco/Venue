@@ -90,6 +90,10 @@ pub enum NoopReason {
     MissingReference,
     BasisTooWide,
     EnvironmentBlocked,
+    BtcDown,
+    BtcWarmup,
+    BtcNeutral,
+    CallbackNotConfirmed,
     NoSupport,
     SupportConsumed,
     BudgetExhausted,
@@ -154,6 +158,14 @@ pub fn plan(input: &PlannerInput<'_>) -> Plan {
     let Some(reference) = input.reference.symbols.get(input.symbol) else {
         return Plan::Noop(NoopReason::MissingReference);
     };
+    if reference.ticker.exchange_time_ms > input.now_ms.saturating_add(2_000)
+        || input
+            .now_ms
+            .saturating_sub(reference.ticker.exchange_time_ms)
+            > 5_000
+    {
+        return Plan::Noop(NoopReason::MissingReference);
+    }
     let reference_mid = match reference
         .ticker
         .bid_price
@@ -195,18 +207,19 @@ pub fn plan(input: &PlannerInput<'_>) -> Plan {
             Ok(value) => value,
             Err(_) => return Plan::Noop(NoopReason::MissingReference),
         };
-    if !has_position
-        && !matches!(
+    if !has_position {
+        if let Some(reason) = btc_entry_block(
+            btc_environment.environment,
+            input.instance.config.allow_btc_neutral,
+        ) {
+            return Plan::Noop(reason);
+        }
+        if !matches!(
             target_environment.environment,
             MarketEnvironment::Up | MarketEnvironment::Range
-        )
-        || !has_position
-            && !matches!(
-                btc_environment.environment,
-                MarketEnvironment::Up | MarketEnvironment::Range
-            )
-    {
-        return Plan::Noop(NoopReason::EnvironmentBlocked);
+        ) {
+            return Plan::Noop(NoopReason::EnvironmentBlocked);
+        }
     }
     if state.layer >= input.instance.config.max_entries {
         return Plan::Noop(NoopReason::BudgetExhausted);
@@ -236,28 +249,65 @@ pub fn plan(input: &PlannerInput<'_>) -> Plan {
     {
         return Plan::Noop(NoopReason::NoSupport);
     }
+    let mut has_candidate = false;
     let support = select_support(
         &supports,
         input.consumed_supports,
         reference_mid,
         input.last_support_lower,
+        |support| {
+            has_candidate = true;
+            evaluate_callback(
+                &reference.fifteen_minutes,
+                support,
+                &core,
+                kind,
+                input.now_ms,
+            )
+            .ok()
+            .flatten()
+            .is_some()
+        },
     );
     let Some(support) = support else {
-        return Plan::Noop(NoopReason::NoSupport);
+        return Plan::Noop(if has_candidate {
+            NoopReason::CallbackNotConfirmed
+        } else {
+            NoopReason::NoSupport
+        });
     };
-    let Some(signal) = evaluate_callback(
-        &reference.fifteen_minutes,
-        support,
-        &core,
-        kind,
-        input.now_ms,
-    )
-    .ok()
-    .flatten() else {
-        return Plan::Noop(NoopReason::NoSupport);
-    };
-    let _ = signal;
     entry_at_support(input, state, support)
+}
+
+fn btc_entry_block(environment: MarketEnvironment, allow_neutral: bool) -> Option<NoopReason> {
+    match environment {
+        MarketEnvironment::Up | MarketEnvironment::Range => None,
+        MarketEnvironment::Neutral if allow_neutral => None,
+        MarketEnvironment::Neutral => Some(NoopReason::BtcNeutral),
+        MarketEnvironment::Down => Some(NoopReason::BtcDown),
+        MarketEnvironment::Warmup => Some(NoopReason::BtcWarmup),
+    }
+}
+
+#[test]
+fn btc_neutral_opt_in_never_allows_down_or_warmup() {
+    for allow in [false, true] {
+        assert_eq!(
+            btc_entry_block(MarketEnvironment::Down, allow),
+            Some(NoopReason::BtcDown)
+        );
+        assert_eq!(
+            btc_entry_block(MarketEnvironment::Warmup, allow),
+            Some(NoopReason::BtcWarmup)
+        );
+        assert_eq!(btc_entry_block(MarketEnvironment::Up, allow), None);
+        assert_eq!(btc_entry_block(MarketEnvironment::Range, allow), None);
+    }
+    assert_eq!(
+        btc_entry_block(MarketEnvironment::Neutral, false),
+        Some(NoopReason::BtcNeutral)
+    );
+    assert_eq!(btc_entry_block(MarketEnvironment::Neutral, true), None);
 }
 
 fn fixed_entry(input: &PlannerInput<'_>, state: &SupportMartingaleSymbolState) -> Plan {
@@ -323,7 +373,6 @@ fn entry_at_support(
     state: &SupportMartingaleSymbolState,
     support: &SupportZone,
 ) -> Plan {
-    let execution_mid = input.execution_market.reference_price.value();
     if state.layer >= input.instance.config.max_entries {
         return Plan::Noop(NoopReason::BudgetExhausted);
     }
@@ -363,31 +412,20 @@ fn entry_at_support(
         Some(value) => value,
         None => return Plan::Noop(NoopReason::BudgetExhausted),
     };
+    let Some((quantity, actual_notional)) = entry_quantity(
+        &input.execution_market.metadata,
+        input.execution_market.maximum_quantity,
+        notional,
+        input.execution_market.reference_price,
+    ) else {
+        return Plan::Noop(NoopReason::QuantityTooSmall);
+    };
     if state
         .invested
-        .checked_add(notional)
+        .checked_add(actual_notional)
         .is_none_or(|value| value > input.instance.config.total_budget)
     {
         return Plan::Noop(NoopReason::BudgetExhausted);
-    }
-    let Some(quantity) = input
-        .execution_market
-        .metadata
-        .contract
-        .as_ref()
-        .and_then(|contract| {
-            contract
-                .lots_for_quote_notional(notional, Some(input.execution_market.reference_price))
-                .ok()
-        })
-        .or_else(|| notional.checked_div(execution_mid))
-    else {
-        return Plan::Noop(NoopReason::QuantityTooSmall);
-    };
-    let step = input.execution_market.metadata.instrument.quantity_step;
-    let quantity = quantity - quantity % step;
-    if quantity <= Decimal::ZERO || quantity < input.execution_market.metadata.quantity.minimum {
-        return Plan::Noop(NoopReason::QuantityTooSmall);
     }
     Plan::MarketEntry {
         symbol: input.symbol.clone(),
@@ -395,9 +433,79 @@ fn entry_at_support(
         support_lower: support.lower.value(),
         support_upper: support.upper.value(),
         layer: state.layer,
-        notional,
+        notional: actual_notional,
         quantity,
         estimated: true,
+    }
+}
+
+/// Rounds an opening quantity upward so the persisted notional reflects the actual contract
+/// amount.  The final dispatch guard repeats these precision, quantity, and minimum-notional
+/// checks against fresh market facts.
+fn entry_quantity(
+    metadata: &venue_domain::InstrumentMetadata,
+    maximum_quantity: Option<Decimal>,
+    requested_notional: Decimal,
+    price: Price,
+) -> Option<(Decimal, Decimal)> {
+    if requested_notional <= Decimal::ZERO
+        || price.value() <= Decimal::ZERO
+        || metadata.validate().is_err()
+        || !metadata.trading_enabled
+    {
+        return None;
+    }
+    let target_notional = requested_notional.max(metadata.instrument.minimum_notional.value);
+    let probe_quantity = ceil_to_step(
+        metadata.quantity.minimum.max(metadata.quantity.step),
+        metadata.quantity.step,
+    )?;
+    let probe_notional = entry_raw_notional(metadata, probe_quantity, price)?;
+    let unit_notional = probe_notional.checked_div(probe_quantity)?;
+    let raw_quantity = target_notional.checked_div(unit_notional)?;
+    let mut quantity = ceil_to_step(
+        raw_quantity.max(metadata.quantity.minimum),
+        metadata.quantity.step,
+    )?;
+    let raw_actual = entry_raw_notional(metadata, quantity, price)?;
+    if raw_actual < target_notional {
+        // Decimal division can round a boundary down; final notional is checked again below.
+        quantity = quantity.checked_add(metadata.quantity.step)?;
+    }
+    if !metadata.quantity.accepts(quantity).ok()?
+        || maximum_quantity.is_some_and(|maximum| quantity > maximum)
+    {
+        return None;
+    }
+    let actual_notional = metadata.quote_notional(quantity, Some(price)).ok()?.value;
+    if actual_notional < target_notional
+        || actual_notional < metadata.instrument.minimum_notional.value
+    {
+        return None;
+    }
+    Some((quantity, actual_notional))
+}
+
+fn entry_raw_notional(
+    metadata: &venue_domain::InstrumentMetadata,
+    quantity: Decimal,
+    price: Price,
+) -> Option<Decimal> {
+    match &metadata.contract {
+        Some(contract) => contract.quote_notional(quantity, Some(price)).ok(),
+        None => quantity.checked_mul(price.value()),
+    }
+}
+
+fn ceil_to_step(value: Decimal, step: Decimal) -> Option<Decimal> {
+    if value < Decimal::ZERO || step <= Decimal::ZERO {
+        return None;
+    }
+    let remainder = value % step;
+    if remainder.is_zero() {
+        Some(value)
+    } else {
+        value.checked_add(step - remainder)
     }
 }
 
@@ -500,6 +608,7 @@ fn select_support<'a>(
     consumed: &BTreeSet<String>,
     reference_price: Decimal,
     last_support_lower: Option<Decimal>,
+    mut callback_confirmed: impl FnMut(&SupportZone) -> bool,
 ) -> Option<&'a SupportZone> {
     supports
         .iter()
@@ -508,6 +617,8 @@ fn select_support<'a>(
                 && support.upper.value() < reference_price
                 && last_support_lower.is_none_or(|lower| support.upper.value() < lower)
         })
+        // A newer untouched region must not hide an older region's fresh callback.
+        .filter(|support| callback_confirmed(support))
         .max_by_key(|support| support.confirmed_at_ms)
 }
 
@@ -524,7 +635,15 @@ fn core_config(instance: &SupportMartingaleInstance, symbol: &Symbol) -> Result<
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use venue_control_protocol::support_martingale::{
+        SupportMartingaleHealth, SupportMartingaleLifecycle,
+    };
+    use venue_domain::{Amount, Asset, Instrument, InstrumentMetadata, MarketKind, Precision};
+    use venue_execution::{SignedAccountPositionMode, SignedAccountSnapshot};
+    use venue_gateway_api::{GatewayBinding, GatewayMode, VenueId};
 
     fn zone(id: &str, lower: i64, upper: i64, confirmed_at_ms: u64) -> SupportZone {
         let lower = match Price::new(Decimal::from(lower)) {
@@ -572,8 +691,258 @@ mod tests {
             &consumed,
             Decimal::from(90),
             Some(Decimal::from(70)),
+            |_| true,
         );
         assert_eq!(selected.map(|value| value.id.as_str()), Some("lower"));
+        Ok(())
+    }
+
+    #[test]
+    fn newer_support_without_callback_does_not_hide_confirmed_support() {
+        let supports = vec![zone("rebound", 60, 62, 1), zone("untouched", 70, 72, 2)];
+        let consumed = BTreeSet::new();
+        let selected = select_support(&supports, &consumed, Decimal::from(90), None, |support| {
+            support.id == "rebound"
+        });
+        assert_eq!(selected.map(|support| support.id.as_str()), Some("rebound"));
+        let consumed = BTreeSet::from(["rebound".to_owned()]);
+        assert!(
+            select_support(
+                &supports,
+                &consumed,
+                Decimal::from(90),
+                None,
+                |support| support.id == "rebound"
+            )
+            .is_none()
+        );
+        assert!(
+            select_support(
+                &supports,
+                &BTreeSet::new(),
+                Decimal::from(90),
+                Some(Decimal::from(60)),
+                |support| support.id == "rebound"
+            )
+            .is_none()
+        );
+    }
+
+    fn spot_metadata(
+        minimum_notional: Decimal,
+    ) -> Result<InstrumentMetadata, Box<dyn std::error::Error>> {
+        let symbol = Symbol::new("BTC", "USDT")?;
+        let quote = Asset::new("USDT")?;
+        Ok(InstrumentMetadata::new(
+            Instrument {
+                symbol,
+                market: MarketKind::Spot,
+                settlement_asset: None,
+                generation: 1,
+                price_tick: Price::new(Decimal::ONE)?,
+                quantity_step: Decimal::new(1, 2),
+                minimum_notional: Amount::new(quote, minimum_notional),
+            },
+            Precision::new(Decimal::ONE, Decimal::ONE)?,
+            Precision::new(Decimal::new(1, 2), Decimal::new(1, 2))?,
+            None,
+            true,
+        )?)
+    }
+
+    fn plan_entry(
+        minimum_notional: Decimal,
+        total_budget: Decimal,
+        maximum_quantity: Option<Decimal>,
+    ) -> Result<Plan, Box<dyn std::error::Error>> {
+        let symbol = Symbol::new("BTC", "USDT")?;
+        let metadata = spot_metadata(minimum_notional)?;
+        let binding = GatewayBinding::new(
+            VenueId::Bybit,
+            GatewayMode::Live,
+            "00000000-0000-0000-0000-000000000001",
+            symbol.clone(),
+        )?;
+        let market = DurableMarketFacts {
+            binding: binding.clone(),
+            metadata,
+            reference_price: Price::new(Decimal::from(100))?,
+            observed_at_ms: 1,
+            maximum_quantity,
+            maximum_price: None,
+        };
+        let account = SignedAccountSnapshot::complete(
+            binding,
+            1,
+            1,
+            1,
+            1,
+            SignedAccountPositionMode::Hedge,
+            Vec::new(),
+            Vec::new(),
+            "cursor".to_owned(),
+            Vec::new(),
+        )?;
+        let instance = SupportMartingaleInstance {
+            instance_id: "instance".to_owned(),
+            owner_user_id: "user".to_owned(),
+            credential_id: "credential".to_owned(),
+            trading_account_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            execution_venue: VenueId::Bybit,
+            mode: GatewayMode::Live,
+            config: venue_control_protocol::support_martingale::SupportMartingaleConfig {
+                allow_btc_neutral: false,
+                entry_mode: Default::default(),
+                symbol_parameters: Vec::new(),
+                reference_venue: VenueId::Binance,
+                execution_venue: VenueId::Bybit,
+                symbols: vec![symbol.clone()],
+                total_budget,
+                first_order_notional: Decimal::from(5),
+                max_entries: 10,
+                size_multiplier: Decimal::ONE,
+                target_profit_rate: Decimal::new(5, 3),
+                minimum_profit_quote: Decimal::ZERO,
+                max_active_positions: 1,
+            },
+            lifecycle: SupportMartingaleLifecycle::Running,
+            health: SupportMartingaleHealth::Healthy,
+            revision: 1,
+            reserved_budget: Decimal::ZERO,
+            symbols: vec![SupportMartingaleSymbolState {
+                symbol: symbol.clone(),
+                cycle_id: None,
+                layer: 0,
+                average_price: None,
+                quantity: Decimal::ZERO,
+                invested: Decimal::ZERO,
+                take_profit_price: None,
+                net_pnl: None,
+                status: "idle".to_owned(),
+                health_reason: None,
+            }],
+        };
+        let reference = ReferenceSnapshot {
+            fetched_at_ms: 1,
+            btc_environment: Vec::new(),
+            symbols: BTreeMap::new(),
+        };
+        let support = zone("support", 90, 100, 1);
+        let state = &instance.symbols[0];
+        Ok(entry_at_support(
+            &PlannerInput {
+                instance: &instance,
+                symbol: &symbol,
+                reference: &reference,
+                account: &account,
+                execution_market: &market,
+                consumed_supports: &BTreeSet::new(),
+                last_support_lower: None,
+                current_take_profit: None,
+                prefer_add_after_cancel: false,
+                now_ms: 1,
+            },
+            state,
+            &support,
+        ))
+    }
+
+    #[test]
+    fn entry_quantity_rounds_up_and_returns_actual_notional()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let metadata = spot_metadata(Decimal::new(54, 1))?;
+        let (quantity, actual) = entry_quantity(
+            &metadata,
+            Some(Decimal::new(6, 2)),
+            Decimal::from(5),
+            Price::new(Decimal::from(100))?,
+        )
+        .ok_or("entry quantity")?;
+        assert_eq!(quantity, Decimal::new(6, 2));
+        assert_eq!(actual, Decimal::from(6));
+        Ok(())
+    }
+
+    #[test]
+    fn entry_quantity_uses_contract_value_for_upward_rounding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut metadata = spot_metadata(Decimal::from(5))?;
+        metadata.instrument.market = MarketKind::LinearPerpetual;
+        metadata.instrument.settlement_asset = Some(Asset::new("USDT")?);
+        metadata.instrument.quantity_step = Decimal::ONE;
+        metadata.quantity = Precision::new(Decimal::ONE, Decimal::ONE)?;
+        metadata.contract = Some(venue_domain::ContractSpec::new(
+            Decimal::new(3, 2),
+            venue_domain::ValueUnit::Base,
+            metadata.quantity.clone(),
+        )?);
+        assert_eq!(
+            entry_quantity(
+                &metadata,
+                Some(Decimal::from(2)),
+                Decimal::from(5),
+                Price::new(Decimal::from(100))?
+            ),
+            Some((Decimal::from(2), Decimal::from(6)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn entry_quantity_rejects_unrepresentable_maximum() -> Result<(), Box<dyn std::error::Error>> {
+        let metadata = spot_metadata(Decimal::new(54, 1))?;
+        assert!(
+            entry_quantity(
+                &metadata,
+                Some(Decimal::new(5, 2)),
+                Decimal::from(5),
+                Price::new(Decimal::from(100))?,
+            )
+            .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_entry_uses_exact_notional_when_step_is_exact() -> Result<(), Box<dyn std::error::Error>>
+    {
+        assert!(matches!(
+            plan_entry(Decimal::from(5), Decimal::from(10), Some(Decimal::ONE))?,
+            Plan::MarketEntry { notional, quantity, .. }
+                if notional == Decimal::from(5) && quantity == Decimal::new(5, 2)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_entry_persists_upward_minimum_notional() -> Result<(), Box<dyn std::error::Error>> {
+        assert!(matches!(
+            plan_entry(Decimal::new(54, 1), Decimal::from(10), Some(Decimal::new(6, 2)))?,
+            Plan::MarketEntry { notional, quantity, .. }
+                if notional == Decimal::from(6) && quantity == Decimal::new(6, 2)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_entry_rejects_maximum_quantity_and_budget_overrun()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert!(matches!(
+            plan_entry(
+                Decimal::new(54, 1),
+                Decimal::from(10),
+                Some(Decimal::new(5, 2))
+            )?,
+            Plan::Noop(NoopReason::QuantityTooSmall)
+        ));
+        assert!(matches!(
+            plan_entry(
+                Decimal::new(54, 1),
+                Decimal::new(55, 1),
+                Some(Decimal::new(6, 2))
+            )?,
+            Plan::Noop(NoopReason::BudgetExhausted)
+        ));
         Ok(())
     }
 }

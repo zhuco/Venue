@@ -1165,10 +1165,13 @@ async fn fetch_account_wide_open_orders(
 
 fn position_notionals(payload: &str) -> Result<Vec<Decimal>, AccountHostValidationError> {
     let data = success_data(payload)?;
-    let rows = data
-        .get("list")
-        .and_then(Value::as_array)
-        .ok_or(AccountHostValidationError::RiskEvidence)?;
+    let rows = match data.get("list") {
+        Some(Value::Array(rows)) => rows.as_slice(),
+        // Bitget returns an explicit null when no account-wide positions exist.
+        // Missing or differently typed fields remain fail-closed.
+        Some(Value::Null) => &[],
+        _ => return Err(AccountHostValidationError::RiskEvidence),
+    };
     rows.iter()
         .map(|row| {
             let item = row
@@ -1758,6 +1761,22 @@ mod tests {
             vec![Decimal::from(10_000), Decimal::from(4_000)]
         );
         Ok(())
+    }
+
+    #[test]
+    fn signed_account_risk_accepts_explicit_null_positions_but_not_missing_or_wrong_type() {
+        assert_eq!(
+            position_notionals(r#"{"code":"00000","data":{"list":null}}"#)
+                .expect("explicit empty position list"),
+            Vec::<Decimal>::new()
+        );
+        for payload in [
+            r#"{"code":"00000","data":{}}"#,
+            r#"{"code":"00000","data":{"list":{}}}"#,
+            r#"{"code":"00000","data":null}"#,
+        ] {
+            assert!(position_notionals(payload).is_err());
+        }
     }
 
     #[test]

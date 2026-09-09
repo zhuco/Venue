@@ -46,6 +46,10 @@ pub enum SupportMartingaleAction {
 pub struct SupportMartingaleConfig {
     #[serde(default)]
     pub entry_mode: MartingaleEntryMode,
+    /// Allows the strategy layer to treat a neutral BTC environment as admissible when its
+    /// symbol-level support signal is ready. The runtime must still enforce the BTC guard.
+    #[serde(default)]
+    pub allow_btc_neutral: bool,
     #[serde(default)]
     pub symbol_parameters: Vec<MartingaleSymbolParameters>,
     pub reference_venue: VenueId,
@@ -301,6 +305,29 @@ pub struct SupportMartingaleLifecycleRequest {
     pub expected_revision: u64,
     pub action: SupportMartingaleAction,
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupportMartingaleConfigUpdateRequest {
+    pub schema_version: u16,
+    pub request_id: String,
+    pub instance_id: String,
+    pub expected_revision: u64,
+    pub config: SupportMartingaleConfig,
+}
+
+impl SupportMartingaleConfigUpdateRequest {
+    pub fn validate(&self) -> Result<(), SupportMartingaleProtocolError> {
+        if self.schema_version != SUPPORT_MARTINGALE_SCHEMA_VERSION
+            || self.request_id.trim().is_empty()
+            || self.instance_id.trim().is_empty()
+            || self.expected_revision == 0
+        {
+            return Err(SupportMartingaleProtocolError::Identity);
+        }
+        self.config.validate()
+    }
+}
 impl SupportMartingaleLifecycleRequest {
     pub fn validate(&self) -> Result<(), SupportMartingaleProtocolError> {
         if self.schema_version != SUPPORT_MARTINGALE_SCHEMA_VERSION
@@ -442,10 +469,24 @@ mod tests {
         assert!(old.symbol_parameters.is_empty());
         Ok(())
     }
+
+    #[test]
+    fn old_configs_default_btc_neutral_gate_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let mut value = serde_json::to_value(fixed_config()?)?;
+        value
+            .as_object_mut()
+            .ok_or("configuration object")?
+            .remove("allow_btc_neutral");
+        let old: SupportMartingaleConfig = serde_json::from_value(value)?;
+        assert!(!old.allow_btc_neutral);
+        Ok(())
+    }
+
     #[test]
     fn accepts_binance_reference_and_non_binance_execution() {
         let config = SupportMartingaleConfig {
             entry_mode: Default::default(),
+            allow_btc_neutral: false,
             symbol_parameters: Vec::new(),
             reference_venue: VenueId::Binance,
             execution_venue: VenueId::Bybit,
@@ -465,6 +506,7 @@ mod tests {
     fn rejects_mixed_quote_assets_and_out_of_scope_counts() {
         let mut config = SupportMartingaleConfig {
             entry_mode: Default::default(),
+            allow_btc_neutral: false,
             symbol_parameters: Vec::new(),
             reference_venue: VenueId::Binance,
             execution_venue: VenueId::Bybit,

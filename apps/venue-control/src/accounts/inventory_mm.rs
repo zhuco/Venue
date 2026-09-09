@@ -100,6 +100,14 @@ impl AccountService {
                 return Err(error(Code::VerificationRequired));
             }
             Some(self.inventory_mm_signed_gate(&instance).await?)
+        } else if request.action == InventoryMmAction::Resume {
+            let secrets =
+                ExecutorSecretProvider::new_shared(self.pool.clone(), self.cipher.clone());
+            Some(
+                crate::inventory_mm::signed_resume_gate(self.pool.clone(), secrets, &instance)
+                    .await
+                    .map_err(mm_error)?,
+            )
         } else {
             None
         };

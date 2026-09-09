@@ -99,6 +99,8 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 | 双报价、库存偏移、波动与风险退出 | `crates/venue-strategies/src/inventory_mm/` |
 | 独立配置及启动/停止协议 | `crates/venue-control-protocol/src/inventory_mm.rs` |
 | 实例、命令归属、取消确认及单例协调 | `apps/venue-control/src/inventory_mm/`；迁移 `0045_inventory_mm.sql` |
+| 做市读取退避与带库存恢复 | `apps/venue-control/src/inventory_mm/recovery.rs`、`admission.rs`、`store.rs`；`mm-lifecycle` 的 `resume` |
+| 做市委托的用户流发送与完整RESULT确认 | `apps/venue-control/src/executor_exchange/inventory_mm.rs`；网关 `BinanceHedgeDispatchFence` |
 | 本人 API 与签名预检 | `apps/venue-control/src/accounts/inventory_mm.rs` |
 | 桌面独立创建与管理窗口 | `apps/ui/desktop/src/inventory_mm_view.rs`、`client/inventory_mm.rs` |
 
@@ -137,6 +139,8 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 表中续写的短文件名相对同格首个文件的目录；终端执行相关缩写目录相对 `apps/venue-control/src/`。
 
 ## 独立多交易所策略与支撑分批做多
+
+Bitget 原生带单账户入口：`accounts/bitget_copy.rs` 与协议 `accounts::BindBitgetCopyCredentialRequest`；桌面 `account_center.rs` 提供 Bitget/Passphrase 表单。密文 `StrategyCredentials::BitgetCopy` 与 gateway `copy_trading.rs` 限定签名带单交易对；马丁表单按已选 Bybit/Bitget 凭证保存执行所。该入口不扩大 Binance KOL 复制范围。
 
 支撑分批做多（马丁）的当前模块、桌面/API、多币预算和市价/限价执行契约见 [SUPPORT_MARTINGALE](SUPPORT_MARTINGALE.md)。当前首个闭环只准入 Bybit LIVE；其他执行所仍按逐所真实验收放行。
 
@@ -196,3 +200,4 @@ Web 在唯一带单账户旁提供启用/停止开关，不单独展示机器人
 VenueFlow 延迟采集：`apps/ui/desktop/src/latency_evidence.rs` 与 `latency_evidence/panel.rs` 提供 Ctrl+Shift+L 有界采集、帧缓冲回执和 JSON 分位数导出；契约及现场验收见 [延迟证据](VENUEFLOW_LATENCY_EVIDENCE.md)。
 
 桌面 K 线加载：`apps/ui/desktop/src/market_client.rs` 将 Binance 目录/报价初始化与历史加载解耦，`market_client/native/history.rs` 限制两个历史请求并行；`chart_view/loading.rs` 绘制加载动画，`market.rs` 维护仅供显示的有界周期预览。
+马丁参考行情读取与闭合 K 线缓存：`apps/venue-control/src/support_martingale/reference_market.rs`；空仓等待原因：同目录 `diagnostics.rs`。可信操作员 `venue-strategy-admin martingale-config USER` 仅在停止且空仓时修改 BTC Neutral 准入；`grid-depth USER INSTANCE` 通过 `multi_venue_grid/configuration.rs` 在停止且挂单收敛后修改网格层数。

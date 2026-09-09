@@ -138,6 +138,27 @@ impl InventoryMmStore {
             blockers,
         })
     }
+    pub async fn preflight_resume(
+        &self,
+        owner: &str,
+        id: &str,
+        revision: u64,
+        now: u64,
+    ) -> Result<InventoryMmPreflight> {
+        let instance = self.get(owner, id).await?;
+        if instance.revision != revision || !resumable(&instance) {
+            return Err(InventoryMmStoreError::Conflict);
+        }
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let blockers = admission(&mut tx, &instance, now, false).await?;
+        Ok(InventoryMmPreflight {
+            instance_id: id.to_owned(),
+            revision,
+            checked_ms: now,
+            ready: blockers.is_empty(),
+            blockers,
+        })
+    }
     /// Save and read-only preflight do not start a writer. Start rechecks the database facts
     /// under the same credential lock used by every shared account command producer.
     pub async fn lifecycle(
@@ -172,6 +193,17 @@ impl InventoryMmStore {
             InventoryMmAction::Start => {
                 if instance.state != InventoryMmState::Stopped
                     || !admission(&mut tx, &instance, now, true).await?.is_empty()
+                    || !leverage.is_some_and(|(v, t)| {
+                        v == instance.config.required_leverage && t <= now && now - t <= 5_000
+                    })
+                {
+                    return Err(InventoryMmStoreError::Conflict);
+                }
+                "start_pending"
+            }
+            InventoryMmAction::Resume => {
+                if !resumable(&instance)
+                    || !admission(&mut tx, &instance, now, false).await?.is_empty()
                     || !leverage.is_some_and(|(v, t)| {
                         v == instance.config.required_leverage && t <= now && now - t <= 5_000
                     })
@@ -516,17 +548,16 @@ async fn admission(
                 && now - p.observed_ms <= 5_000
                 && p.position_mode == TerminalPositionMode::Hedge =>
         {
-            if flat
-                && (p
-                    .positions
+            if (flat
+                && p.positions
                     .iter()
-                    .any(|v| v.symbol == instance.config.symbol && !v.quantity.is_zero())
-                    || p.open_orders
-                        .iter()
-                        .any(|v| v.symbol == instance.config.symbol)
-                    || p.conditional_orders
-                        .iter()
-                        .any(|v| v.symbol == instance.config.symbol))
+                    .any(|v| v.symbol == instance.config.symbol && !v.quantity.is_zero()))
+                || p.open_orders
+                    .iter()
+                    .any(|v| v.symbol == instance.config.symbol)
+                || p.conditional_orders
+                    .iter()
+                    .any(|v| v.symbol == instance.config.symbol)
             {
                 blockers.push("symbol_not_flat".into());
             }
@@ -534,6 +565,13 @@ async fn admission(
         _ => blockers.push("fresh_signed_hedge_projection_required".into()),
     }
     Ok(blockers)
+}
+fn resumable(instance: &InventoryMmInstance) -> bool {
+    matches!(
+        instance.state,
+        InventoryMmState::Stopped | InventoryMmState::NeedsAttention
+    ) && instance.baseline_equity.is_some()
+        && instance.last_quote_ms.is_some()
 }
 fn decode(row: &sqlx::postgres::PgRow) -> Result<InventoryMmInstance> {
     let config: InventoryMmConfig = serde_json::from_value(row.try_get("config_json").map_err(db)?)
