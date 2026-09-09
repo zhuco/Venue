@@ -25,6 +25,8 @@ use venue_control_protocol::kol::ExecutorCommandState;
 mod activation;
 mod copy_drain;
 mod copy_targets;
+#[cfg(test)]
+mod inventory_mm_tests;
 mod market;
 mod mirror_drain;
 
@@ -98,7 +100,10 @@ impl PgExecutorStore {
         Option<venue_control_protocol::kol::TerminalAccountProjection>,
         BinanceCommandLedgerError,
     > {
-        let value: Option<serde_json::Value> = sqlx::query_scalar("SELECT p.projection_json->'projection' FROM venue_binance_account_projections p JOIN venue_binance_commands c ON c.credential_id=p.credential_id AND c.owner_user_id=p.owner_user_id AND c.trading_account_id=p.trading_account_id WHERE c.command_id=$1 AND c.command_origin='inventory_mm' AND p.private_generation=c.inventory_mm_private_generation AND p.observed_ms=c.inventory_mm_observed_ms AND COALESCE((p.projection_json->>'stream_healthy')::boolean,false)")
+        // Match the admission digest, then retain the decision's older observation clock.
+        // The physical adapter must still reject it after five seconds, even if heartbeats
+        // advanced while credentials, clock or instrument rules were being loaded.
+        let value: Option<serde_json::Value> = sqlx::query_scalar("SELECT jsonb_set(p.projection_json->'projection','{observed_ms}',to_jsonb(c.inventory_mm_observed_ms)) FROM venue_binance_account_projections p JOIN venue_binance_commands c ON c.credential_id=p.credential_id AND c.owner_user_id=p.owner_user_id AND c.trading_account_id=p.trading_account_id WHERE c.command_id=$1 AND c.command_origin='inventory_mm' AND p.private_generation=c.inventory_mm_private_generation AND p.observed_ms>=c.inventory_mm_observed_ms AND (c.inventory_mm_projection_digest IS NULL AND p.observed_ms=c.inventory_mm_observed_ms OR c.inventory_mm_projection_digest IS NOT NULL AND venue_mm_projection_digest(p.projection_json)=c.inventory_mm_projection_digest) AND COALESCE((p.projection_json->>'stream_healthy')::boolean,false)")
             .bind(command_id).fetch_optional(&self.pool).await.map_err(|_| BinanceCommandLedgerError::Unavailable)?;
         value
             .map(serde_json::from_value)

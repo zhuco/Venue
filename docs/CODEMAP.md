@@ -206,4 +206,6 @@ VenueFlow 延迟采集：`apps/ui/desktop/src/latency_evidence.rs` 与 `latency_
 
 做市观测摘要：`migrations/0049_mm_projection_digest.sql`、`inventory_mm/{store,dispatch}.rs`（相对 `apps/venue-control/`）；网格未分配成交查询 `grid_store/reads.rs` 先筛本账户/交易对的未分配成交，再关联历史归属。签名风险连接复用位于 `crates/venue-gateway-binance/src/grid_market.rs`。
 
+执行器做市投影提取：`apps/venue-control/src/executor_store.rs` 使用同一事实摘要并保留原决策时钟；`executor_store/inventory_mm_tests.rs` 对真实 PostgreSQL 验证心跳推进和事实变化的发送边界。
+
 网格可中断冷路径的 BEGIN 握手：`apps/venue-control/src/grid_store/transaction.rs` 只让事务建立完成；若调用方已取消，返回的事务自动回滚，不在后台执行规划或命令提交。数据库专项门验证取消握手后连接复用不会继承未结束事务。
