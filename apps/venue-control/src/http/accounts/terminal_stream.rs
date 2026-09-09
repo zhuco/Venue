@@ -1,5 +1,6 @@
 use super::*;
 use venue_control_protocol::kol::TerminalProjectionRequest;
+use venue_control_protocol::terminal_account_stream::TerminalAccountStreamEvent;
 
 pub(super) async fn serve<R>(
     stream: &mut TcpStream,
@@ -7,6 +8,7 @@ pub(super) async fn serve<R>(
     accounts: &AccountService,
     token: SecretValue,
     request: TerminalProjectionRequest,
+    compact: bool,
 ) -> Result<(), ()>
 where
     R: ControlRepository + 'static,
@@ -19,6 +21,7 @@ where
     let mut fallback = time::interval(Duration::from_secs(1));
     fallback.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut opened = false;
+    let mut previous = None;
     loop {
         if *shutdown.borrow() {
             return Ok(());
@@ -37,7 +40,15 @@ where
             Err(_) if !opened => return account_error(stream, AccountErrorCode::Unavailable).await,
             _ => return Err(()),
         };
-        let body = serde_json::to_string(&projection).map_err(|_| ())?;
+        let body = if compact {
+            serde_json::to_string(&TerminalAccountStreamEvent::between(
+                previous.as_ref(),
+                projection.as_ref(),
+            ))
+        } else {
+            serde_json::to_string(&projection)
+        }
+        .map_err(|_| ())?;
         if body.len() > 4 * 1024 * 1024 {
             return Err(());
         }
@@ -45,20 +56,24 @@ where
             write_sse_headers(stream).await.map_err(|_| ())?;
             opened = true;
         }
-        // Full, owner-checked snapshots make reconnect lossless without treating hints as facts.
+        // Each connection starts with a full owner-checked snapshot. Unchanged history
+        // must not queue hundreds of kilobytes ahead of current orders and positions.
         let frame = format!("event: terminal-account\ndata: {body}\n\n");
         write_sse(stream, frame.as_bytes(), state.config.request_timeout)
             .await
             .map_err(|_| ())?;
+        previous = projection;
+        let next_read = time::Instant::now() + Duration::from_millis(500);
         tokio::select! {
             _ = shutdown.changed() => return Ok(()),
             _ = fallback.tick() => {},
             result = changes.changed() => if result.is_err() { return Err(()); },
         }
-        // Coalesce a burst without starving a client while other accounts keep updating.
+        // Read the latest row after coalescing; global account notifications must not
+        // turn a slow connection into an ever-growing queue of obsolete snapshots.
         tokio::select! {
             _ = shutdown.changed() => return Ok(()),
-            _ = time::sleep(Duration::from_millis(16)) => {},
+            _ = time::sleep_until(next_read) => {},
         }
     }
 }

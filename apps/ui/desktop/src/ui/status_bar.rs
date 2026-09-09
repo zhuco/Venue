@@ -47,16 +47,21 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
             crate::i18n::Language::SimplifiedChinese => "本机与服务器时钟不一致",
             crate::i18n::Language::English => "Client/server clock mismatch",
         }
+    } else if private_projection.is_some() && !private_current {
+        match language {
+            crate::i18n::Language::SimplifiedChinese => "账户更新延迟",
+            crate::i18n::Language::English => "Account update delayed",
+        }
     } else {
         text(language, node_key)
     };
     let mut node_hint = match language {
         crate::i18n::Language::SimplifiedChinese => {
-            "账户状态与资金依据选中交易所的签名私有投影；账户切换后重新读取。"
+            "这里是仓位、挂单、成交和资金等私有账户数据，不是盘口。更新延迟仅作提示，不禁止手动提交；服务端核对账户、订单与可平数量。"
                 .to_owned()
         }
         crate::i18n::Language::English => {
-            "Account status and funds use signed private facts from the selected exchange. Switching accounts refreshes those facts."
+            "Positions, orders, fills and funds from private account facts, separate from the public order book. Delays are advisory; manual submissions remain available and the server verifies the account, order and reducible quantity."
                 .to_owned()
         }
     };
@@ -69,12 +74,12 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
     if let Some(projection) = private_projection {
         node_hint.push_str(&match language {
             crate::i18n::Language::SimplifiedChinese => format!(
-                "\n服务器账户事实距今 {:.1} 秒；桌面上次接收距今 {:.1} 秒。超过 15 秒视为过期。",
+                "\n服务器账户事实距今 {:.1} 秒；桌面上次接收距今 {:.1} 秒。超过 15 秒提示更新延迟。",
                 now.saturating_sub(projection.observed_ms) as f64 / 1000.0,
                 now.saturating_sub(model.execution.private_received_ms()) as f64 / 1000.0,
             ),
             crate::i18n::Language::English => format!(
-                "\nServer facts age: {:.1}s; last desktop receipt: {:.1}s ago. Stale after 15s.",
+                "\nServer facts age: {:.1}s; last desktop receipt: {:.1}s ago. Update delay warning after 15s.",
                 now.saturating_sub(projection.observed_ms) as f64 / 1000.0,
                 now.saturating_sub(model.execution.private_received_ms()) as f64 / 1000.0,
             ),

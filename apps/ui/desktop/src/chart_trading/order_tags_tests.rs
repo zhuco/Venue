@@ -220,7 +220,8 @@ fn drag_previews_price_without_panning_or_cancelling() -> Result<(), Box<dyn std
 }
 
 #[test]
-fn stale_and_pending_tags_disable_order_actions() -> Result<(), Box<dyn std::error::Error>> {
+fn stale_tags_allow_order_actions_but_pending_tags_prevent_duplicates()
+-> Result<(), Box<dyn std::error::Error>> {
     for pending in [false, true] {
         let mut harness = Harness::new()?;
         if pending && let Some(badge) = harness.overlays[0].badge.as_mut() {
@@ -233,7 +234,13 @@ fn stale_and_pending_tags_disable_order_actions() -> Result<(), Box<dyn std::err
         let point = harness.cancel.center();
         harness.press(point, true);
         harness.press(point, false);
-        assert!(harness.action().is_none());
+        if pending {
+            assert!(harness.action().is_none());
+        } else {
+            assert!(
+                matches!(harness.action(), Some(Interaction::Cancel(target)) if target == selection()?)
+            );
+        }
         assert!(harness.selected.is_none());
     }
     Ok(())
@@ -493,7 +500,7 @@ fn action_revalidates_account_and_order_and_unknown_quantity_is_not_zero()
         Some("—")
     );
     model.execution.private_error = Some("fixture disconnect".into());
-    assert!(!target_is_current(&model, &target));
+    assert!(target_is_current(&model, &target));
     Ok(())
 }
 

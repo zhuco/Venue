@@ -9,12 +9,6 @@ pub(super) fn targets(model: &AppModel, all: bool) -> Result<Vec<TerminalOrderSe
                 && scope.venue == model.preferences.market_server.venue()
         })
         .ok_or("请先选择有效交易账户")?;
-    if !model
-        .execution
-        .private_ready(Some(&scope.trading_account_id), now_ms())
-    {
-        return Err("账户数据待更新".into());
-    }
     let projection = model
         .execution
         .private_projection_for(Some(&scope.trading_account_id))
@@ -100,6 +94,7 @@ mod tests {
         let mut model = model();
         model.select_symbol("BTC/USDC".into());
         let mut facts = projection(1);
+        facts.observed_ms = now_ms().saturating_sub(60_000);
         for (id, symbol) in [("a", "BTC/USDC"), ("b", "BTC/USDC"), ("c", "ETH/USDC")] {
             facts.open_orders.push(TerminalOpenOrder {
                 client_order_id: id.into(),
@@ -120,6 +115,11 @@ mod tests {
         model
             .execution
             .apply_private(Some(facts.clone()), &mut model.trade_dock);
+        assert!(
+            !model
+                .execution
+                .private_ready(model.preferences.execution_account_id.as_deref(), now_ms())
+        );
         assert_eq!(targets(&model, false)?.len(), 2);
         assert_eq!(targets(&model, true)?.len(), 3);
         let target = targets(&model, false)?.remove(0);

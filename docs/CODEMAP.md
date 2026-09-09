@@ -10,7 +10,7 @@ Mac/Linux 打包入口：`scripts/build-all.sh`、`apps/ui/web/scripts/build.sh`
 
 币安状态栏 RTT：`apps/ui/desktop/src/market_client/native/latency.rs` 计量两条行情 WS 的匹配 Ping/Pong，`market.rs` 独立保存连接 RTT，心跳不更新行情新鲜度。
 
-终端低延迟链：`apps/ui/desktop/src/market_client/native/delivery.rs` 从行情线程唤醒绘制，Binance WS 在 `market_client.rs` 优先直连、失败回退 HTTPS 中继；`client/execution/stream.rs` 消费认证账户快照 SSE。Control `http/accounts/terminal_stream.rs` 逐次校验会话及账户归属；`database_wake.rs` 与迁移 `0044` 提供提交后通知，原轮询负责断线恢复。
+终端低延迟链：`apps/ui/desktop/src/market_client/native/delivery.rs` 从行情线程唤醒绘制，Binance WS 在 `market_client.rs` 优先直连、失败回退 HTTPS 中继；`client/execution/stream.rs` 消费认证账户 SSE，`crates/venue-control-protocol/src/terminal_account_stream.rs` 定义连接内历史复用与完整快照恢复。Control `http/accounts/terminal_stream.rs` 逐次校验会话及账户归属，合并通知后读取最新事实；`database_wake.rs` 与迁移 `0044` 提供提交后通知，原轮询负责断线恢复。
 
 行情状态中文提示：`apps/ui/desktop/src/i18n/market.rs` 区分更新延迟、自动校时、限流、访问受限、合约不可用与校验失败；`market.rs` 在新的有效行情到达后恢复延迟状态，连接状态消息不刷新行情接收时间。
 

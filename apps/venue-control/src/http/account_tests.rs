@@ -1,5 +1,6 @@
 use super::*;
 mod terminal_open;
+mod terminal_stream;
 use crate::{
     PgControlRepository,
     accounts::{
@@ -206,6 +207,7 @@ async fn ordinary_terminal_reads_only_its_verified_account_projection() -> TestR
     assert_eq!(owned.assets.len(), 1);
     assert_eq!(owned.position_history.len(), 1);
     assert_eq!(owned.position_history[0].position, owned.positions[0]);
+    terminal_stream::verify(&f, &s, &alice, &bob, &request, &owned).await?;
     s.post(
         SELECT_PATH,
         Some(&alice),

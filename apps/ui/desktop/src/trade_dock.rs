@@ -46,7 +46,7 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
         } else if private_ready {
             "LIVE"
         } else {
-            label(language, "账户数据待刷新", "Account data awaiting refresh")
+            label(language, "账户更新延迟 · 可提交", "Account update delayed · submission available")
         };
         ui.label(
             RichText::new(format!("● {scope}  {symbol}"))
@@ -184,6 +184,16 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
             "Hotkeys are disabled in Settings.",
         ));
     }
+    if !private_ready
+        && model.preferences.trading.size_preset_mode
+            == crate::trading::SizePresetMode::EquityPercent
+    {
+        ui.small(label(
+            language,
+            "百分比金额按最近接收的账户权益估算。",
+            "Percentage sizing uses the last received account equity.",
+        ));
+    }
     ui.horizontal(|ui| {
         let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
         for candidate in [
@@ -210,12 +220,6 @@ fn symbol_assets(symbol: &str) -> (String, String) {
 
 fn preset_equity(model: &AppModel) -> Option<rust_decimal::Decimal> {
     let scope = model.confirmed_account_scope()?;
-    if !model
-        .execution
-        .private_ready(Some(&scope.trading_account_id), now_ms())
-    {
-        return None;
-    }
     let projection = model
         .execution
         .private_projection_for(Some(&scope.trading_account_id))?;
@@ -300,20 +304,6 @@ pub(crate) fn action_button(
 
 fn action_disabled_reason(model: &AppModel, action: TradingAction, now: f64) -> Option<String> {
     let language = model.preferences.language;
-    if !matches!(action, TradingAction::OpenLong | TradingAction::OpenShort)
-        && !model
-            .execution
-            .private_ready(model.preferences.execution_account_id.as_deref(), now_ms())
-    {
-        return Some(
-            label(
-                language,
-                "私有账户数据已过期，刷新后才可平仓或撤单；手动开仓不受此限制",
-                "Private data is stale; refresh before closing or cancelling. Manual opens remain available",
-            )
-            .to_owned(),
-        );
-    }
     if action == TradingAction::CancelAllOrders {
         return Some(
             label(
@@ -637,13 +627,6 @@ fn terminal_request_parts(
         TradingAction::CloseShort => TerminalAction::CloseShort,
         _ => return Err(crate::trading::TradePlanError::UiOnlyAction),
     };
-    if terminal_action.is_close()
-        && !model
-            .execution
-            .private_ready(model.preferences.execution_account_id.as_deref(), now_ms())
-    {
-        return Err(crate::trading::TradePlanError::NoPosition);
-    }
     let close_cap = terminal_action
         .is_close()
         .then(|| {
@@ -734,10 +717,10 @@ pub(crate) const fn action_name(
 mod tests {
     use super::*;
     #[test]
-    fn percent_order_uses_latest_local_equity_and_rejects_stale_or_switched_account()
+    fn percent_order_uses_last_received_equity_but_rejects_switched_account()
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::account_scope::tests::{id, model, projection};
-        use crate::trading::{SizePresetMode, TradePlanError};
+        use crate::trading::SizePresetMode;
         let mut model = model();
         model.preferences.trading.size_preset_mode = SizePresetMode::EquityPercent;
         model.trade_dock.selected_size_preset = 1;
@@ -768,12 +751,14 @@ mod tests {
                 equity: 9999.into(),
                 available_margin: None,
             });
+        model.execution.apply_private(None, &mut model.trade_dock);
         model
             .execution
             .apply_private(Some(stale), &mut model.trade_dock);
+        assert!(!model.execution.private_ready(Some(&id(11)), now_ms()));
         assert_eq!(
-            terminal_request_parts(&model, TradingAction::OpenLong, 1.0).err(),
-            Some(TradePlanError::EquityUnavailable)
+            build_terminal_request(&mut model, TradingAction::OpenLong, 1.0)?.quote_notional,
+            rust_decimal::Decimal::new(9999, 1)
         );
         model.trade_dock.amount_input = "25".into();
         assert_eq!(
@@ -782,6 +767,38 @@ mod tests {
         );
         model.begin_account_selection(id(2));
         assert!(preset_equity(&model).is_none());
+        Ok(())
+    }
+    #[test]
+    fn delayed_position_display_allows_close_with_existing_quantity_cap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::account_scope::tests::{model, projection};
+        let mut model = model();
+        model.select_symbol("BTC/USDC".into());
+        model.trade_dock.select_price(100.into(), 1.0)?;
+        let mut facts = projection(1);
+        facts.observed_ms = now_ms().saturating_sub(60_000);
+        facts
+            .positions
+            .push(venue_control_protocol::kol::TerminalPosition {
+                symbol: "BTC/USDC".parse()?,
+                position_side: venue_domain::PositionSide::Long,
+                quantity: 3.into(),
+                entry_price: Some(100.into()),
+                mark_price: Some(100.into()),
+            });
+        model
+            .execution
+            .apply_private(Some(facts), &mut model.trade_dock);
+        model.execution.private_error = Some("read timed out".into());
+        assert!(action_disabled_reason(&model, TradingAction::CloseLong, 1.0).is_none());
+        assert_eq!(
+            build_terminal_request(&mut model, TradingAction::CloseLong, 1.0)?.close_quantity_cap,
+            Some(3.into())
+        );
+        assert!(build_terminal_request(&mut model, TradingAction::CloseShort, 1.0).is_err());
+        model.begin_account_selection(crate::account_scope::tests::id(2));
+        assert!(build_terminal_request(&mut model, TradingAction::CloseLong, 1.0).is_err());
         Ok(())
     }
     #[test]

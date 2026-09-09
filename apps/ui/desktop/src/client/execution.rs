@@ -178,6 +178,9 @@ async fn projection_loop(
                         request.scope.event(ClientEvent::SessionExpired),
                     );
                 }
+                if let Err(TerminalReadError::Unavailable(reason)) = &result {
+                    tracing::warn!(%reason, "Account projection stream reconnecting");
+                }
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     break;
                 }
@@ -257,7 +260,7 @@ mod tests {
                 if index == 0 {
                     old_connection = Some(socket);
                 } else if venue == venue_control_protocol::VenueId::Binance {
-                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nevent: terminal-account\ndata: null\n\n").await?;
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nevent: terminal-account\ndata: {\"kind\":\"snapshot\",\"payload\":null}\n\n").await?;
                     streams.push(socket);
                 } else {
                     socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnull").await?;

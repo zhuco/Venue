@@ -13,6 +13,7 @@ pub mod kol_source;
 pub mod leader_bot;
 pub mod managed_followers;
 pub mod support_martingale;
+pub mod terminal_account_stream;
 pub mod terminal_position;
 mod trade;
 use rust_decimal::Decimal;

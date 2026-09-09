@@ -78,10 +78,6 @@ pub(crate) fn request_chart_position_action(
 ) {
     if !selected_account_matches(model, &draft)
         || model.execution.position_actions.pending.is_some()
-        || !model.execution.private_ready(
-            Some(&draft.trading_account_id),
-            crate::account_center::now_ms(),
-        )
     {
         return;
     }
@@ -377,7 +373,16 @@ mod tests {
         model.preferences.execution_account_id = Some(draft.trading_account_id.clone());
         model.execution.private_error = Some("stale".into());
         request_chart_position_action(&mut model, draft.clone(), PositionAction::Close);
-        assert!(model.execution.position_actions.draft.is_none());
+        assert_eq!(
+            model
+                .execution
+                .position_actions
+                .draft
+                .take()
+                .ok_or("delayed confirmation")?
+                .quantity,
+            Decimal::from(3)
+        );
         model.execution.private_error = None;
         model.execution.position_actions.pending = Some(("pending".into(), draft.clone()));
         request_chart_position_action(&mut model, draft, PositionAction::Reverse);

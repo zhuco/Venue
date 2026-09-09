@@ -222,7 +222,7 @@ pub(super) fn draw(
     if let Some(selection) = &badge.selection {
         let id = order_id(selection);
         let pending = badge.pending;
-        let enabled = !badge.stale && !pending;
+        let enabled = !pending;
         let response = ui.interact(
             body.intersect(plot),
             ui.id().with(id).with("drag"),
@@ -241,8 +241,8 @@ pub(super) fn draw(
         } else if badge.stale {
             label(
                 language,
-                "账户数据待刷新，暂不可操作",
-                "Account data is stale; actions disabled",
+                "账户显示待更新；提交后由服务端核对订单",
+                "Account display awaiting update; the server verifies submitted orders",
             )
         } else {
             label(
@@ -420,7 +420,7 @@ pub(super) fn draw(
                 ),
             ),
         ] {
-            let enabled = badge.position.is_some() && !badge.stale;
+            let enabled = badge.position.is_some();
             let response = ui.interact(
                 button_rect.intersect(plot),
                 ui.id().with((
@@ -701,10 +701,6 @@ fn target_is_current(model: &crate::model::AppModel, selection: &TerminalOrderSe
         && model.account_overview.as_ref().is_some_and(|overview| {
             overview.selected_credential_id.as_ref() == Some(&selection.credential_id)
         })
-        && model.execution.private_ready(
-            Some(&selection.trading_account_id),
-            crate::account_center::now_ms(),
-        )
         && model
             .execution
             .private_projection_for(Some(&selection.trading_account_id))
