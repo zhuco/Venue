@@ -24,6 +24,7 @@ pub(crate) struct TradingBadge {
 pub(crate) struct OrderTagState {
     pending: Vec<(TerminalOrderSelection, String)>,
     uncertain_cancels: std::collections::HashSet<String>,
+    crossed: Vec<(TerminalOrderSelection, u64)>,
 }
 
 impl OrderTagState {
@@ -40,9 +41,17 @@ impl OrderTagState {
     }
 
     pub(crate) fn hidden(&self, selection: &TerminalOrderSelection) -> bool {
-        self.pending
-            .iter()
-            .any(|(target, id)| target == selection && !self.uncertain_cancels.contains(id))
+        self.crossed.iter().any(|(target, _)| target == selection)
+            || self
+                .pending
+                .iter()
+                .any(|(target, id)| target == selection && !self.uncertain_cancels.contains(id))
+    }
+
+    pub(crate) fn crossed_price(&mut self, target: TerminalOrderSelection, trade_ms: u64) {
+        if !self.crossed.iter().any(|(existing, _)| existing == &target) {
+            self.crossed.push((target, trade_ms));
+        }
     }
 
     pub(crate) fn is_pending(&self, selection: &TerminalOrderSelection) -> bool {
@@ -95,6 +104,16 @@ impl OrderTagState {
         &mut self,
         projection: &venue_control_protocol::kol::TerminalAccountProjection,
     ) {
+        // A newer private snapshot overrides the speculative drawing, including partial fills.
+        self.crossed.retain(|(target, trade_ms)| {
+            target.credential_id == projection.credential_id
+                && target.trading_account_id == projection.trading_account_id
+                && projection.observed_ms < *trade_ms
+                && projection.open_orders.iter().any(|order| {
+                    order.symbol == target.symbol
+                        && order.native_order_id.as_ref() == Some(&target.native_order_id)
+                })
+        });
         self.pending.retain(|(target, _)| {
             target.trading_account_id != projection.trading_account_id
                 || target.credential_id != projection.credential_id
@@ -578,7 +597,7 @@ pub(crate) fn apply_interaction(
                 }
                 model.select_symbol(selection.symbol.to_string());
                 model.trade_dock.select_terminal_order(selection.clone());
-                crate::trade_dock::apply_action(
+                crate::trade_dock::apply_single_action(
                     model,
                     client,
                     venue_control_protocol::TradingAction::CancelSelectedOrder,

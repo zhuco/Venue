@@ -37,6 +37,8 @@ pub(crate) struct AccountCenter {
     vault: Option<Vault>,
     storage_error: bool,
     remember_password: bool,
+    resume_login: bool,
+    automatic_login: bool,
     saved_login: Option<LoginRequest>,
     pending_login: Option<LoginRequest>,
     restoring: Option<SessionResponse>,
@@ -62,6 +64,7 @@ impl AccountCenter {
                     if saved.login.is_some() || saved.session.is_some() {
                         state.remember_password = saved.login.is_some();
                     }
+                    state.resume_login = saved.resume_login.unwrap_or(false);
                     state.saved_login = saved.login;
                     state.restoring = saved.session;
                     state.fill_saved_login();
@@ -102,6 +105,7 @@ impl AccountCenter {
                 .save(
                     self.saved_login.as_ref(),
                     self.session.as_ref().or(self.restoring.as_ref()),
+                    self.resume_login || self.session.is_some() || self.restoring.is_some(),
                 )
                 .is_err();
         }
@@ -113,6 +117,15 @@ impl AccountCenter {
             self.pending_login = None;
             self.persist();
         }
+    }
+
+    pub(crate) fn session_expired(&mut self, model: &mut AppModel) {
+        let resume = self.remember_password
+            && self.saved_login.is_some()
+            && (self.session.is_some() || self.restoring.is_some() || self.resume_login);
+        self.clear(model);
+        self.resume_login = resume;
+        self.persist();
     }
 
     fn logout(&mut self, model: &mut AppModel, context: &egui::Context) {
@@ -141,6 +154,8 @@ impl AccountCenter {
                     }
                     self.restoring = None;
                     self.session = Some(session);
+                    self.resume_login = true;
+                    self.automatic_login = false;
                     self.saved_login = self.pending_login.take();
                     self.persist();
                     model.apply_account_overview(overview);
@@ -149,10 +164,14 @@ impl AccountCenter {
                 }
                 Ok(AccountResult::Overview(overview)) => {
                     let identity = self.session.as_ref().or(self.restoring.as_ref());
-                    if identity.is_none_or(|s| s.user != overview.user || s.expires_ms <= now_ms())
-                    {
+                    if identity.is_none_or(|s| s.user != overview.user) {
                         self.clear(model);
                         self.error = Some(AccountErrorCode::Unauthorized);
+                        reconnect = true;
+                        continue;
+                    }
+                    if identity.is_some_and(|s| s.expires_ms <= now_ms()) {
+                        self.session_expired(model);
                         reconnect = true;
                         continue;
                     }
@@ -172,10 +191,19 @@ impl AccountCenter {
                     reconnect = true;
                 }
                 Err(code) => {
+                    let automatic = self.automatic_login;
+                    self.automatic_login = false;
                     self.pending_login = None;
                     if code == AccountErrorCode::Unauthorized {
-                        self.clear(model);
+                        if automatic {
+                            self.clear(model);
+                        } else {
+                            self.session_expired(model);
+                        }
                         reconnect = true;
+                    } else if automatic && code != AccountErrorCode::Unavailable {
+                        self.resume_login = false;
+                        self.persist();
                     }
                     self.error = Some(code);
                 }
@@ -194,8 +222,19 @@ impl AccountCenter {
             .or(self.restoring.as_ref())
             .is_some_and(|s| s.expires_ms <= now)
         {
-            self.clear(model);
+            self.session_expired(model);
             reconnect = true;
+        }
+        if self.session.is_none()
+            && self.restoring.is_none()
+            && self.resume_login
+            && !self.busy
+            && now >= self.next_refresh_ms
+            && let Some(login) = self.saved_login.clone()
+        {
+            self.pending_login = Some(login.clone());
+            self.automatic_login = true;
+            self.submit(AccountAction::Login(login), model, context);
         }
         if (self.session.is_some() || self.restoring.is_some())
             && !self.busy
@@ -406,8 +445,8 @@ fn show_login(ui: &mut egui::Ui, state: &mut AccountCenter, model: &AppModel) {
     remember.clone().on_hover_text(if Vault::supported() {
         tr(
             l,
-            "仅保存在当前 Windows 用户的系统凭据库。取消勾选会删除已保存的密码。",
-            "Stored only in this Windows user's credential store. Uncheck to forget the password.",
+            "保存在 Windows 凭据库，用于重启或会话到期后自动登录。主动退出后停止自动登录；取消勾选会删除保存的密码。",
+            "Stored in Windows Credential Manager for automatic login after restart or session expiry. Signing out stops automatic login; uncheck to forget the password.",
         )
     } else {
         tr(
@@ -549,7 +588,7 @@ fn show_accounts(ui: &mut egui::Ui, state: &mut AccountCenter, model: &mut AppMo
         show_remove_confirmation(ui, state, model, credential);
     }
     ui.small(tr(l,"验证只读取交易所，不下单、不修改账户模式。选择账户不会启动策略。","Verification only reads exchange state; it never trades or changes account mode. Selecting an account does not start a strategy."));
-    ui.small(tr(l, "登录会话由 Windows 凭据库保存；API 验证和本次会话的执行账户选择由服务器保存，重启后恢复。", "Windows stores the login session; the server stores API verification and this session's execution account selection, restored on restart."));
+    ui.small(tr(l, "登录由 Windows 凭据库保护；执行账户按登录用户记住，重新登录后自动恢复。", "Windows protects saved login details; the execution account is remembered per user and restored after login."));
 }
 
 fn show_credentials_table(

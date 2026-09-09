@@ -65,6 +65,13 @@ pub(super) async fn receive(
                 {
                     return Err(terminal_unavailable("Account stream scope mismatch"));
                 }
+                if let ClientEvent::TerminalAccountProjection {
+                    projection: Some(p),
+                    ..
+                } = &event
+                {
+                    crate::latency_evidence::projection_received(&request.scope, p);
+                }
                 publish(sender, context, request.scope.event(event));
             }
             buffer.drain(..boundary + delimiter);

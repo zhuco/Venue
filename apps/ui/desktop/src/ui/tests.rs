@@ -449,9 +449,9 @@ fn order_panel_primary_buttons_fit_and_short_panels_can_scroll_to_cancellations(
             }
         }
         let expected: &[&str] = if scroll {
-            &["撤选中", "撤全部"]
+            &["撤交易对挂单", "撤全部挂单"]
         } else {
-            &["开多", "平多", "平空", "开空", "撤选中", "撤全部"]
+            &["开多", "平多", "平空", "开空", "撤交易对挂单", "撤全部挂单"]
         };
         for prefix in expected {
             assert!(
@@ -464,8 +464,76 @@ fn order_panel_primary_buttons_fit_and_short_panels_can_scroll_to_cancellations(
         assert!(!labels.iter().any(|(label, _)| label.contains("交易设置")
             || label.contains("快捷键 已启用")
             || label.contains("选择一个运行中的交易作用域")
+            || label.contains("请先点击图表或订单簿选择限价")
+            || label.starts_with("市价平")
             || label.starts_with("PnL")
             || label == "清除"
             || label == "回到市场"));
+    }
+}
+
+#[test]
+fn preset_schemes_fit_the_same_settings_window() {
+    use crate::trading::SizePresetMode;
+    for language in Language::ALL {
+        let mut window_bounds = Vec::new();
+        for mode in [SizePresetMode::Amount, SizePresetMode::EquityPercent] {
+            let context = egui::Context::default();
+            theme::apply(&context);
+            let mut model = AppModel::new(crate::model::Preferences {
+                language,
+                ..Default::default()
+            });
+            model.preferences.trading.size_preset_mode = mode;
+            let mut open = true;
+            let mut labels = Vec::new();
+            for _ in 0..3 {
+                let mut frame = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1100.0, 700.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| crate::trading::show_settings(ui.ctx(), &mut open, &mut model),
+                );
+                frame.textures_delta.clear();
+                labels.clear();
+                for clipped in frame.shapes {
+                    let mut contents = Vec::new();
+                    collect_text(&clipped.shape, &mut contents);
+                    labels.extend(
+                        contents
+                            .into_iter()
+                            .filter(|(_, rect)| clipped.clip_rect.contains_rect(*rect)),
+                    );
+                }
+            }
+            let title = labels
+                .iter()
+                .find(|(value, _)| value == text(language, TextKey::TradingSettings))
+                .unwrap()
+                .1;
+            let done = labels
+                .iter()
+                .find(|(value, _)| value == text(language, TextKey::Done))
+                .unwrap()
+                .1;
+            window_bounds.push((title, done));
+            assert!(labels.iter().any(|(value, _)| value == "USD"));
+            assert!(!labels.iter().any(|(value, _)| value.contains("USDC")));
+            if mode == SizePresetMode::EquityPercent {
+                for percent in ["5%", "10%", "20%", "30%", "50%"] {
+                    assert!(
+                        labels
+                            .iter()
+                            .any(|(value, rect)| value == percent && rect.bottom() < done.top()),
+                        "missing {percent}: {labels:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(window_bounds[0], window_bounds[1]);
     }
 }

@@ -124,6 +124,8 @@ pub struct Preferences {
     pub selected_symbol: String,
     #[serde(default)]
     pub execution_account_id: Option<String>,
+    #[serde(default)]
+    pub execution_selections: BTreeMap<String, String>,
     pub selected_instance: Option<String>,
     /// Selection is a view preference only. Relation configuration always remains in Control.
     pub selected_copy_relation: Option<String>,
@@ -144,6 +146,7 @@ impl Default for Preferences {
             market_server: MarketServer::Binance,
             selected_symbol: DEFAULT_SELECTED_SYMBOL.to_owned(),
             execution_account_id: None,
+            execution_selections: BTreeMap::new(),
             selected_instance: None,
             selected_copy_relation: None,
             ui_scale: 1.0,
@@ -881,6 +884,28 @@ impl AppModel {
             }
         }
         let was_pending = self.account_switch_pending.take().is_some();
+        let preference_key = format!(
+            "{}|{}",
+            self.preferences.endpoint.trim_end_matches('/'),
+            overview.user.user_id
+        );
+        let restore = (!was_pending)
+            .then(|| self.preferences.execution_selections.get(&preference_key))
+            .flatten()
+            .filter(|wanted| overview.selected_credential_id.as_ref() != Some(*wanted))
+            .filter(|wanted| {
+                overview.credentials.iter().any(|c| {
+                    &c.credential_id == *wanted && c.selectable(crate::account_center::now_ms())
+                })
+            })
+            .cloned();
+        if restore.is_none()
+            && let Some(id) = &overview.selected_credential_id
+        {
+            self.preferences
+                .execution_selections
+                .insert(preference_key, id.clone());
+        }
         let selected = overview
             .selected_credential_id
             .as_deref()
@@ -903,6 +928,9 @@ impl AppModel {
         self.preferences.execution_account_id = selected;
         self.account_overview = Some(overview);
         self.synchronize_trading_scope();
+        if let Some(id) = restore {
+            self.begin_account_selection(id);
+        }
     }
 
     pub fn select_copy_relation(

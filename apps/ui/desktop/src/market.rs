@@ -468,6 +468,15 @@ impl LocalMarketReducer {
         }
         trim_bars(&mut self.view.bars, &mut self.closed_bars);
         trim_studies(&mut self.view.studies);
+        // A late close changes the base of the next candle's preview, including its signals.
+        if closed && let Some(forming) = self.forming_bar.clone() {
+            self.apply_bar(
+                ui_bar_from_public(&forming)?,
+                forming,
+                false,
+                self.last_bar_event_ms,
+            )?;
+        }
         Ok(())
     }
 
@@ -610,9 +619,16 @@ pub struct LocalMarketStore {
     reducers: BTreeMap<MarketSelection, LocalMarketReducer>,
     study_config: ChartStudyConfig,
     chart_reducers: BTreeMap<String, LocalMarketReducer>,
+    chart_previews: std::collections::VecDeque<(MarketSelection, Vec<UiBar>)>,
 }
 
 impl LocalMarketStore {
+    pub fn chart_preview(&self, selection: &MarketSelection) -> Option<&[UiBar]> {
+        self.chart_previews
+            .iter()
+            .find(|(key, _)| key == selection)
+            .map(|(_, bars)| bars.as_slice())
+    }
     pub fn begin_history(
         &mut self,
         selection: &MarketSelection,
@@ -741,6 +757,24 @@ impl LocalMarketStore {
                 self.study_config.clone(),
             )?;
             reducers.insert(selection, reducer);
+        }
+        if reducers.is_empty() {
+            self.chart_previews.clear();
+        } else {
+            for (selection, reducer) in &self.reducers {
+                if reducer.view.bars.is_empty() {
+                    continue;
+                }
+                self.chart_previews.retain(|(key, _)| key != selection);
+                let bars = &reducer.view.bars;
+                self.chart_previews.push_back((
+                    selection.clone(),
+                    bars[bars.len().saturating_sub(1000)..].to_vec(),
+                ));
+            }
+            while self.chart_previews.len() > 8 {
+                self.chart_previews.pop_front();
+            }
         }
         self.generation = generation;
         self.reducers = reducers;
@@ -1066,6 +1100,7 @@ fn normalize_book_side(
 
 #[cfg(test)]
 mod tests {
+    mod live_studies;
     #[test]
     fn rtt_expires_without_making_market_data_fresh() -> Result<(), super::LocalMarketError> {
         let mut reducer = super::LocalMarketReducer::new(selection("BTC/USDT")?)?;
@@ -1301,6 +1336,48 @@ mod tests {
             reducer.view().selection.binding.symbol.to_string(),
             "ETH/USDT"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn cached_chart_is_bounded_preview_only_and_never_live_state() -> Result<(), LocalMarketError> {
+        let mut store = LocalMarketStore::default();
+        let first = selection("BTC/USDT")?;
+        store.replace([first.clone()])?;
+        let old = MarketEnvelope {
+            generation: store.generation(),
+            selection: first.clone(),
+            event_time_ms: 120_000,
+            received_ms: 120_000,
+            payload: MarketPayload::RestHistory {
+                bars: vec![study_bar(60_000, 10)?],
+            },
+        };
+        store.apply(old.clone())?;
+        let other = MarketSelection::binance_usd_m("BTC/USDT", ChartInterval::FiveMinutes)?;
+        store.replace([other.clone()])?;
+        assert!(store.chart_preview(&other).is_none());
+        assert_eq!(store.chart_preview(&first).map(<[UiBar]>::len), Some(1));
+        store.replace([first.clone()])?;
+        assert!(store.view(&first).unwrap().bars.is_empty());
+        assert!(store.view(&first).unwrap().last.is_none());
+        assert_eq!(store.apply(old)?, ReduceOutcome::IgnoredOldGeneration);
+        for index in 0..12 {
+            let next = selection(&format!("COIN{index}/USDT"))?;
+            store.replace([next.clone()])?;
+            // Public adapter output is already validated by the reducer in production.
+            store.reducers.get_mut(&next).unwrap().view.bars = vec![UiBar {
+                open_time_ms: 60_000,
+                open: 1.into(),
+                high: 1.into(),
+                low: 1.into(),
+                close: 1.into(),
+                volume: 1.into(),
+            }];
+        }
+        assert_eq!(store.chart_previews.len(), 8);
+        store.replace([])?;
+        assert!(store.chart_previews.is_empty());
         Ok(())
     }
 

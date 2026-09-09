@@ -15,6 +15,8 @@ mod execution_view;
 mod grid_view;
 mod i18n;
 mod inventory_mm_view;
+#[cfg(not(target_arch = "wasm32"))]
+mod latency_evidence;
 mod leader_bot_view;
 #[cfg(not(target_arch = "wasm32"))]
 mod market;

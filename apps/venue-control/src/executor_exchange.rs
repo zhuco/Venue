@@ -787,16 +787,21 @@ impl BinanceHttpExecution {
         let before_position = position_quantity(&before, position_side)?;
         let requested_quantity = if reducing {
             let reserved = reserved_close_quantity(&before, request, position_side, side)?;
-            let available = before_position
-                .checked_sub(reserved)
-                .ok_or(BinanceExecutionError::Invalid)?;
-            if request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Copy
-                && matches!(request.order_kind, ExecutionOrderKind::Limit { .. })
-                && requested_quantity > available
-            {
-                return Err(BinanceExecutionError::Invalid);
+            if market_quantity.is_some() {
+                requested_quantity.min(
+                    before_position
+                        .checked_sub(reserved)
+                        .ok_or(BinanceExecutionError::Invalid)?
+                        .max(Decimal::ZERO),
+                )
+            } else {
+                rejection::available_close_quantity(
+                    before_position,
+                    reserved,
+                    requested_quantity,
+                    request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Copy,
+                )?
             }
-            requested_quantity.min(available.max(Decimal::ZERO))
         } else {
             requested_quantity
         };

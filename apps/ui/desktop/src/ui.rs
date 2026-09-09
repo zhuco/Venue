@@ -629,6 +629,47 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
     }
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(local) = model.local_markets.chart_view(&settings_key) {
+        if local.bars.is_empty() {
+            if let Some(bars) = model.local_markets.chart_preview(&local.selection) {
+                let rect = ui.available_rect_before_wrap();
+                ui.add_enabled_ui(false, |ui| {
+                    let _ = crate::chart_view::candle_plot(
+                        ui,
+                        bars,
+                        &[],
+                        &mut pane.viewport,
+                        language,
+                        &settings,
+                        model.market_scales(&symbol),
+                        pane.interval,
+                        None,
+                        None,
+                        &pane.trading_display,
+                        &[],
+                        (None, None),
+                    );
+                });
+                crate::chart_view::loading::preview_badge(ui, rect, language);
+                return;
+            }
+            crate::chart_view::loading::show(
+                ui,
+                language,
+                &symbol,
+                pane.interval.label(),
+                matches!(
+                    local.status,
+                    crate::market::MarketStatus::Offline
+                        | crate::market::MarketStatus::Resyncing
+                        | crate::market::MarketStatus::Stale
+                ),
+            );
+            if settings_requested {
+                model.indicator_settings_requested = true;
+                model.indicator_target = Some(settings_key);
+            }
+            return;
+        }
         let (price_scale, quantity_scale) = model.market_scales(&symbol);
         let chart = presentation::sample(
             ui,
@@ -649,7 +690,23 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
                     local.last,
                     local.bid,
                     local.ask,
+                    (local.status == crate::market::MarketStatus::Live)
+                        .then_some(local.last_price_event_ms)
+                        .flatten(),
+                    local.last_price_received_ms,
                 )
+            },
+        );
+        crate::latency_evidence::prepare_market(
+            &format!("{:?}", model.preferences.market_server),
+            local.generation,
+            &symbol,
+            chart.5,
+            chart.6,
+            if pane.trading_display.last_price && pane.trading_display.price_lines {
+                chart.2
+            } else {
+                None
             },
         );
         let selected_price = crate::chart_view::candle_plot(
@@ -667,6 +724,19 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
             &overlays,
             (chart.3, chart.4),
         );
+        crate::latency_evidence::clear_market();
+        let render_key = egui::Id::new(("chart-history-rendered", pane.instance));
+        let rendered = (local.selection.clone(), local.generation);
+        if ui
+            .ctx()
+            .data(|data| data.get_temp::<(crate::market::MarketSelection, u64)>(render_key))
+            != Some(rendered.clone())
+        {
+            tracing::info!(target: "venueflow::chart_loading", generation = local.generation, symbol = %local.selection.binding.symbol,
+                interval = local.selection.interval.label(), bars = chart.0.len(), "Chart initial history rendered");
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(render_key, rendered));
+        }
         let selection = local.selection.clone();
         let near_start = pane.viewport.right_offset() > 0
             && pane.viewport.right_offset() + pane.viewport.visible_bars() + 32 >= chart.0.len();
@@ -683,6 +753,17 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
             model.indicator_settings_requested = true;
             model.indicator_target = Some(settings_key);
         }
+        return;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if model.preferences.market_server == crate::model::MarketServer::Binance {
+        crate::chart_view::loading::show(
+            ui,
+            language,
+            &symbol,
+            pane.interval.label(),
+            model.market_worker_failed,
+        );
         return;
     }
     #[cfg(all(target_arch = "wasm32", feature = "preview"))]

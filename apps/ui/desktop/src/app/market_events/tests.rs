@@ -5,8 +5,160 @@ use crate::{
     model::{MarketInstrument, MarketQuote, MarketServer},
 };
 use rust_decimal::Decimal;
-use venue_control_protocol::{AggressorSide, UiBookLevel, UiTrade};
+use venue_control_protocol::{AggressorSide, UiBar, UiBookLevel, UiTrade};
 use venue_domain::{FieldState, Price, PublicBar};
+
+#[test]
+fn startup_history_before_catalog_is_retained_and_matches_catalog_first()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = MarketServer::Binance;
+    let selected = selection(server);
+    let mut results = Vec::new();
+    for catalog_first in [false, true] {
+        let mut model = AppModel::new(Default::default());
+        let mut workspaces = Workspaces::default();
+        let generation = model
+            .local_markets
+            .replace([selected.clone()])?
+            .ok_or("generation")?;
+        if catalog_first {
+            apply_all(
+                &mut model,
+                &mut workspaces,
+                server,
+                0,
+                vec![catalog("BTC/USDT", 2)],
+            );
+        }
+        let bars = (0..300)
+            .map(|index| {
+                let mut candle = bar(generation);
+                candle.open_time_ms += index * 60_000;
+                candle.close_time_ms += index * 60_000;
+                candle.sequence += index;
+                candle.received_at_ms = 18_060_000;
+                candle
+            })
+            .collect();
+        apply_all(
+            &mut model,
+            &mut workspaces,
+            server,
+            0,
+            vec![LocalMarketClientEvent::Market(Box::new(MarketEnvelope {
+                generation,
+                selection: selected.clone(),
+                event_time_ms: 18_060_000,
+                received_ms: 18_060_000,
+                payload: MarketPayload::RestHistory { bars },
+            }))],
+        );
+        assert_eq!(
+            model
+                .local_markets
+                .view(&selected)
+                .ok_or("view")?
+                .bars
+                .len(),
+            300
+        );
+        if !catalog_first {
+            apply_all(
+                &mut model,
+                &mut workspaces,
+                server,
+                0,
+                vec![catalog("BTC/USDT", 2)],
+            );
+        }
+        let view = model.local_markets.view(&selected).ok_or("view")?;
+        assert_eq!(model.local_markets.generation(), generation);
+        results.push((view.bars.clone(), view.studies.clone()));
+    }
+    assert_eq!(results[0], results[1]);
+    Ok(())
+}
+
+#[test]
+fn missing_close_requests_history_resync_and_rejects_old_events()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut model = AppModel::new(Default::default());
+    let mut workspaces = Workspaces::default();
+    let server = MarketServer::Binance;
+    let selected = selection(server);
+    let generation = model
+        .local_markets
+        .replace([selected.clone()])?
+        .ok_or("generation")?;
+    apply_all(
+        &mut model,
+        &mut workspaces,
+        server,
+        0,
+        vec![catalog("BTC/USDT", 2)],
+    );
+    apply_all(
+        &mut model,
+        &mut workspaces,
+        server,
+        0,
+        data(server, generation),
+    );
+    let mut missing_predecessor = bar(generation);
+    missing_predecessor.open_time_ms += 120_000;
+    missing_predecessor.close_time_ms += 120_000;
+    missing_predecessor.received_at_ms += 120_000;
+    missing_predecessor.sequence += 2;
+    apply_all(
+        &mut model,
+        &mut workspaces,
+        server,
+        0,
+        vec![LocalMarketClientEvent::Market(Box::new(MarketEnvelope {
+            generation,
+            selection: selected.clone(),
+            event_time_ms: 240_000,
+            received_ms: 240_000,
+            payload: MarketPayload::WsBar {
+                bar: UiBar {
+                    open_time_ms: 180_000,
+                    open: 100.into(),
+                    high: 100.into(),
+                    low: 100.into(),
+                    close: 100.into(),
+                    volume: 1.into(),
+                },
+                study_bar: Box::new(missing_predecessor),
+                closed: true,
+            },
+        }))],
+    );
+    assert!(model.local_markets.generation() > generation);
+    assert!(model.local_markets.selections().next().is_none());
+    apply_all(
+        &mut model,
+        &mut workspaces,
+        server,
+        0,
+        data(server, generation),
+    );
+    assert!(model.local_markets.selections().next().is_none());
+    let fresh = model
+        .local_markets
+        .replace([selected.clone()])?
+        .ok_or("fresh generation")?;
+    apply_all(&mut model, &mut workspaces, server, 0, data(server, fresh));
+    assert_eq!(
+        model
+            .local_markets
+            .view(&selected)
+            .ok_or("view")?
+            .bars
+            .len(),
+        1
+    );
+    Ok(())
+}
 
 fn selection(server: MarketServer) -> MarketSelection {
     MarketSelection::for_server(server, "BTC/USDT", ChartInterval::OneMinute).unwrap()

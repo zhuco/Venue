@@ -176,7 +176,10 @@ impl VenueFlowApp {
         let (Some(generation), Some(client)) = (generation, self.market_client.as_ref()) else {
             return;
         };
-        let selections = self.model.local_markets.selections().cloned().collect();
+        let mut selections: Vec<_> = self.model.local_markets.selections().cloned().collect();
+        selections.sort_by_key(|selection| {
+            selection.binding.symbol.to_string() != self.model.preferences.selected_symbol
+        });
         if let Err(error) = client.replace_subscriptions(generation, selections) {
             self.model
                 .notice(format!("Local Binance subscription unavailable: {error}"));
@@ -320,7 +323,7 @@ impl VenueFlowApp {
                     // An unauthenticated bootstrap response must not invalidate
                     // a vaulted session that the account endpoint is validating.
                     if self.account_center.session.is_some() {
-                        self.account_center.clear(&mut self.model);
+                        self.account_center.session_expired(&mut self.model);
                         self.reconnect = true;
                     }
                     break;
@@ -480,6 +483,8 @@ impl eframe::App for VenueFlowApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::latency_evidence::begin_pass(ui.ctx(), self.model.confirmed_account_scope());
         crate::chart_trading::poll(&mut self.model);
         crate::chart_trading::notification(ui.ctx(), &mut self.model);
         ui.painter()
@@ -597,6 +602,11 @@ impl eframe::App for VenueFlowApp {
             &mut self.workspaces,
             self.model.preferences.language,
         );
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            crate::latency_evidence::show(&context);
+            crate::latency_evidence::end_pass(&context);
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

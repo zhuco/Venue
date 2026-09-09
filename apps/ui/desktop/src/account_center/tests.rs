@@ -101,6 +101,14 @@ fn switching_execution_account_keeps_authenticated_connection_and_clears_old_pri
     selected.trading_account_id = Some("00000000-0000-4000-8000-000000000002".into());
     next.selected_credential_id = Some(selected.credential_id.clone());
     next.credentials.push(selected.clone());
+    model
+        .account_overview
+        .as_mut()
+        .unwrap()
+        .credentials
+        .push(selected.clone());
+    model.begin_account_selection(selected.credential_id.clone());
+    model.account_selection_requested = None;
     state.request_generation = model.account_generation;
     assert!(
         state
@@ -634,7 +642,7 @@ fn system_vault_mock_roundtrip_forget_password_and_invalidate_session() {
 
 #[cfg(target_os = "windows")]
 #[test]
-fn expiry_and_logout_keep_remembered_password_but_never_auto_login() {
+fn logout_keeps_remembered_password_but_disables_automatic_login() {
     let mut state = AccountCenter {
         vault: Some(Vault::fixture("https://control.example.com")),
         saved_login: Some(saved_login()),
@@ -644,7 +652,11 @@ fn expiry_and_logout_keep_remembered_password_but_never_auto_login() {
     };
     state.persist();
     let expired = state.vault.as_ref().and_then(|v| v.load(u64::MAX).ok());
-    assert!(expired.is_some_and(|v| v.login.is_some() && v.session.is_none()));
+    assert!(
+        expired.is_some_and(|v| v.login.is_some()
+            && v.session.is_none()
+            && v.resume_login == Some(true))
+    );
     let mut model = AppModel::new(Preferences::default());
     state.clear(&mut model);
     let stored = state.vault.as_ref().and_then(|v| v.load(now_ms()).ok());
@@ -653,6 +665,80 @@ fn expiry_and_logout_keep_remembered_password_but_never_auto_login() {
     assert!(!state.password.is_empty());
     assert!(!state.poll(&mut model, &egui::Context::default()));
     assert!(!state.busy);
+}
+
+#[test]
+fn expired_remembered_session_can_resume_but_explicit_clear_and_bad_credentials_stop_it() {
+    let mut state = AccountCenter {
+        session: Some(session()),
+        saved_login: Some(saved_login()),
+        remember_password: true,
+        ..Default::default()
+    };
+    let mut model = AppModel::new(Preferences::default());
+    state.session_expired(&mut model);
+    assert!(state.resume_login);
+    assert!(state.session.is_none());
+    state.automatic_login = true;
+    state.request_generation = model.account_generation;
+    state
+        .client
+        .test_sender()
+        .send(Err(AccountErrorCode::Unauthorized))
+        .unwrap();
+    state.poll(&mut model, &egui::Context::default());
+    assert!(!state.resume_login && !state.busy);
+    state.session = Some(session());
+    state.session_expired(&mut model);
+    assert!(state.resume_login);
+    state.clear(&mut model);
+    assert!(!state.resume_login);
+}
+
+#[test]
+fn remembered_execution_selection_survives_restart_and_requires_server_confirmation()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::account_scope::tests::{id, overview};
+    let mut model = AppModel::new(Preferences::default());
+    model.apply_account_overview(overview(2));
+    let preferences: Preferences =
+        serde_json::from_str(&serde_json::to_string(&model.preferences)?)?;
+    let mut restarted = AppModel::new(preferences);
+    assert!(restarted.confirmed_account_scope().is_none());
+    let mut no_selection = overview(1);
+    no_selection.selected_credential_id = None;
+    restarted.apply_account_overview(no_selection);
+    assert_eq!(restarted.account_selection_requested, Some(id(2)));
+    assert!(restarted.confirmed_account_scope().is_none());
+    restarted.apply_account_overview(overview(2));
+    assert_eq!(
+        restarted
+            .confirmed_account_scope()
+            .ok_or("scope")?
+            .credential_id,
+        id(2)
+    );
+    restarted.begin_account_selection(id(1));
+    restarted.apply_account_overview(overview(1));
+    assert_eq!(
+        restarted
+            .confirmed_account_scope()
+            .ok_or("scope")?
+            .credential_id,
+        id(1)
+    );
+    restarted.clear_account_session();
+    let mut other = overview(3);
+    other.user.user_id = id(99);
+    restarted.apply_account_overview(other);
+    assert_eq!(
+        restarted
+            .confirmed_account_scope()
+            .ok_or("scope")?
+            .credential_id,
+        id(3)
+    );
+    Ok(())
 }
 
 #[test]

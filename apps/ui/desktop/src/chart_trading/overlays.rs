@@ -2,6 +2,7 @@ use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Stroke};
 use rust_decimal::Decimal;
 use venue_control_protocol::UiBar;
 use venue_domain::{OrderSide, PositionSide};
+mod fills;
 
 use super::{ChartTradingSettings, label};
 use crate::{
@@ -44,6 +45,10 @@ pub(crate) fn collect(
             model.preferences.execution_account_id.as_deref(),
             crate::account_center::now_ms(),
         );
+        #[cfg(not(target_arch = "wasm32"))]
+        if fresh {
+            crate::latency_evidence::bind_orders(model, projection);
+        }
         let suffix = if fresh {
             ""
         } else {
@@ -154,23 +159,20 @@ pub(crate) fn collect(
             }
         }
         if settings.history {
-            for fill in projection
-                .fills
-                .iter()
-                .filter(|fill| fill.symbol.to_string() == symbol)
-            {
+            for fill in fills::by_order(&projection.fills, symbol) {
                 if let Some(time_ms) = fill.occurred_ms {
                     result.push(ChartOverlay {
                         price: fill.price,
                         label: format!(
-                            "{} {} @ {}",
+                            "{} {} @ {}\nID: {}",
                             if fill.order_side == OrderSide::Buy {
                                 label(language, "买入成交", "Buy fill")
                             } else {
                                 label(language, "卖出成交", "Sell fill")
                             },
                             fill.quantity.normalize(),
-                            fill.price.normalize()
+                            format_decimal(fill.price, model.market_scales(symbol).0),
+                            fill.native_order_id
                         ),
                         color: side_color(fill.order_side),
                         time_ms: Some(time_ms),
@@ -368,17 +370,27 @@ pub(crate) fn draw(
                 FontId::proportional(13.0),
                 Color32::WHITE,
             );
-            ui.interact(
+            let response = ui.interact(
                 marker.intersect(rect),
                 ui.id().with(("chart-fill", index, time)),
                 egui::Sense::hover(),
-            )
-            .on_hover_text(&overlay.label);
+            );
+            if response.hovered() {
+                egui::Tooltip::for_widget(&response).show(|ui| {
+                    ui.label(&overlay.label);
+                });
+            }
             continue;
         }
         if overlay.label.is_empty() {
             if overlay.line {
-                price_lines.push((y, overlay.color, rect.left() - 2.0));
+                price_lines.push((
+                    y,
+                    overlay.color,
+                    rect.left() - 2.0,
+                    None,
+                    Some(overlay.price),
+                ));
             }
             continue;
         }
@@ -390,7 +402,15 @@ pub(crate) fn draw(
                 occupied.push(badge_rect);
             }
             if overlay.line && badge_rect.is_positive() {
-                price_lines.push((y, overlay.color, badge_rect.right()));
+                price_lines.push((
+                    y,
+                    overlay.color,
+                    badge_rect.right(),
+                    (!badge.stale && !badge.pending)
+                        .then_some(badge.selection.as_ref())
+                        .flatten(),
+                    None,
+                ));
             }
             continue;
         }
@@ -406,7 +426,7 @@ pub(crate) fn draw(
         );
         occupied.push(label_rect);
         if overlay.line {
-            price_lines.push((y, overlay.color, label_rect.right()));
+            price_lines.push((y, overlay.color, label_rect.right(), None, None));
         }
         painter.rect_filled(label_rect, 2, theme::BG_SECONDARY);
         painter.galley(label_rect.min + egui::vec2(4.0, 2.0), galley, overlay.color);
@@ -424,7 +444,7 @@ pub(crate) fn draw(
             );
         }
     }
-    for (y, color, start) in price_lines {
+    for (y, color, start, order_evidence, market_evidence) in price_lines {
         let mut gaps = occupied
             .iter()
             .filter(|rect| rect.top() <= y && rect.bottom() >= y)
@@ -433,10 +453,50 @@ pub(crate) fn draw(
         gaps.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut left = start + 2.0;
         for (gap_left, gap_right) in gaps {
-            draw_dash(&painter, left, gap_left.min(rect.right()), y, color);
+            let end = gap_left.min(rect.right());
+            draw_dash(&painter, left, end, y, color);
+            #[cfg(not(target_arch = "wasm32"))]
+            evidence_segment(ui, &painter, left, end, y, order_evidence, market_evidence);
             left = left.max(gap_right);
         }
         draw_dash(&painter, left, rect.right(), y, color);
+        #[cfg(not(target_arch = "wasm32"))]
+        evidence_segment(
+            ui,
+            &painter,
+            left,
+            rect.right(),
+            y,
+            order_evidence,
+            market_evidence,
+        );
+        #[cfg(target_arch = "wasm32")]
+        let _ = (order_evidence, market_evidence);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn evidence_segment(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    left: f32,
+    right: f32,
+    y: f32,
+    order: Option<&crate::trading::TerminalOrderSelection>,
+    market: Option<Decimal>,
+) {
+    // Probe inside the first painted dash, after subtracting every overlapping label.
+    let point = Pos2::new(left + 1.0 / painter.ctx().pixels_per_point(), y);
+    if right - left >= 2.0 / painter.ctx().pixels_per_point()
+        && painter.clip_rect().contains(point)
+        && ui.ctx().layer_id_at(point) == Some(ui.layer_id())
+    {
+        if let Some(order) = order {
+            crate::latency_evidence::order_painted(order);
+        }
+        if let Some(price) = market {
+            crate::latency_evidence::market_painted(price);
+        }
     }
 }
 

@@ -395,6 +395,26 @@ impl ChartViewport {
         self.right_offset = total_bars.saturating_sub(new_start.saturating_add(new_count));
     }
 
+    pub fn zoom_by_grid_steps(
+        &mut self,
+        total_bars: usize,
+        anchor_ratio: f32,
+        interval: ChartInterval,
+        steps: isize,
+    ) {
+        if steps == 0 || total_bars == 0 {
+            return;
+        }
+        let grid_bars = (interval.timeline_step_ms() / interval.duration_ms()) as usize;
+        let amount = grid_bars.saturating_mul(steps.unsigned_abs());
+        let requested = if steps > 0 {
+            self.visible_bars.saturating_sub(amount)
+        } else {
+            self.visible_bars.saturating_add(amount)
+        };
+        self.set_visible_bars_anchored(total_bars, requested, anchor_ratio);
+    }
+
     /// Positive steps zoom in and negative steps zoom out. Each step is about ten percent of the
     /// current visible window and remains within the chart-wide display limits.
     pub fn zoom_by_steps(&mut self, total_bars: usize, anchor_ratio: f32, steps: isize) {
@@ -544,6 +564,29 @@ fn decimal_to_f64(value: rust_decimal::Decimal) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wheel_notch_changes_one_grid_and_idle_frames_do_not_zoom() {
+        for interval in [
+            ChartInterval::OneMinute,
+            ChartInterval::FiveMinutes,
+            ChartInterval::FifteenMinutes,
+            ChartInterval::OneHour,
+            ChartInterval::FourHours,
+            ChartInterval::OneDay,
+        ] {
+            let mut viewport = ChartViewport::default();
+            let initial = viewport.visible_bars();
+            let grid = (interval.timeline_step_ms() / interval.duration_ms()) as usize;
+            viewport.zoom_by_grid_steps(500, 0.4, interval, 1);
+            assert_eq!(viewport.visible_bars(), initial - grid);
+            for _ in 0..40 {
+                viewport.zoom_by_grid_steps(500, 0.4, interval, 0);
+            }
+            assert_eq!(viewport.visible_bars(), initial - grid);
+            viewport.zoom_by_grid_steps(500, 0.4, interval, -1);
+            assert_eq!(viewport.visible_bars(), initial);
+        }
+    }
     use rust_decimal::Decimal;
 
     use super::{

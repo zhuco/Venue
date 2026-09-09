@@ -9,6 +9,8 @@ pub(super) struct SavedAccount {
     endpoint: String,
     pub login: Option<LoginRequest>,
     pub session: Option<SessionResponse>,
+    #[serde(default)]
+    pub resume_login: Option<bool>,
 }
 
 // This record never goes through eframe storage. API keys and account projections
@@ -59,6 +61,7 @@ impl Vault {
         &self,
         login: Option<&LoginRequest>,
         session: Option<&SessionResponse>,
+        resume_login: bool,
     ) -> Result<(), ()> {
         #[cfg(target_os = "windows")]
         if login.is_none() && session.is_none() {
@@ -72,6 +75,7 @@ impl Vault {
             endpoint: self.endpoint.clone(),
             login: login.cloned(),
             session: session.cloned(),
+            resume_login: Some(resume_login),
         };
         let bytes = Zeroizing::new(serde_json::to_vec(&record).map_err(|_| ())?);
         if bytes.len() > 2560 {
@@ -120,6 +124,8 @@ fn decode(bytes: &[u8], endpoint: &str, now: u64) -> Result<SavedAccount, ()> {
     {
         return Err(());
     }
+    // Legacy saved sessions opted into restart restoration; an explicit logout did not.
+    record.resume_login.get_or_insert(record.session.is_some());
     if record.session.as_ref().is_some_and(|session| {
         session.expires_ms <= now
             || session.user.user_id.is_empty()

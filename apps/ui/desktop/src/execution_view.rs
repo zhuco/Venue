@@ -10,7 +10,7 @@ use crate::{
 use eframe::egui;
 pub(crate) use position_actions::{
     PositionActionDraft, chart_position_draft, request_chart_position_action,
-    show_confirmation as show_position_confirmation, submit_confirmed_close,
+    show_confirmation as show_position_confirmation,
 };
 use std::sync::Arc;
 use text::{Key, text};
@@ -543,11 +543,26 @@ fn show_private_projection(
                                     egui::Label::new(crate::terminal_feedback::command_reason(
                                         row, language,
                                     ))
+                                    .sense(egui::Sense::click())
                                     .truncate(),
                                 )
-                                .on_hover_text(
-                                    crate::terminal_feedback::command_reason(row, language),
-                                );
+                                .on_hover_text(crate::terminal_feedback::command_details(
+                                    row, language,
+                                ))
+                                .context_menu(|ui| {
+                                    let label = match language {
+                                        crate::i18n::Language::SimplifiedChinese => "复制诊断详情",
+                                        crate::i18n::Language::English => "Copy diagnostic details",
+                                    };
+                                    if ui.button(label).clicked() {
+                                        ui.ctx().copy_text(
+                                            crate::terminal_feedback::command_details(
+                                                row, language,
+                                            ),
+                                        );
+                                        ui.close();
+                                    }
+                                });
                                 ui.monospace(
                                     row.native_order_id
                                         .as_deref()

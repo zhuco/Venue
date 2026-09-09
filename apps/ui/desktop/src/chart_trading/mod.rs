@@ -38,18 +38,16 @@ pub(crate) fn quick_order(
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
             ui.add_enabled_ui(symbol == model.preferences.selected_symbol, |ui| {
                 if settings.quick_amount {
-                    let quote = symbol.split_once('/').map_or("", |(_, quote)| quote);
                     ui.label(if model.trade_dock.amount_in_base {
                         symbol.split_once('/').map_or("", |(base, _)| base)
                     } else {
-                        quote
+                        "USD"
                     });
-                    let preset = model.preferences.trading.size_presets
-                        [model.trade_dock.selected_size_preset.min(4)];
+                    let preset = crate::trade_dock::preset_amount_hint(model);
                     let hint = if model.trade_dock.amount_in_base {
                         label(model.preferences.language, "数量", "Quantity").to_owned()
                     } else {
-                        preset.normalize().to_string()
+                        preset
                     };
                     if ui
                         .add(

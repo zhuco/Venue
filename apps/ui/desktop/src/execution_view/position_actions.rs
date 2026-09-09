@@ -258,37 +258,6 @@ fn submit(model: &mut AppModel, client: &ControlClient, draft: PositionActionDra
     }
 }
 
-pub(crate) fn submit_confirmed_close(
-    model: &mut AppModel,
-    client: &ControlClient,
-    side: PositionSide,
-) {
-    if model.execution.position_actions.pending.is_some() {
-        return;
-    }
-    let Some(projection) = model.execution.private_projection.clone() else {
-        return;
-    };
-    let Some(row) = projection.positions.iter().find(|row| {
-        row.symbol.to_string() == model.preferences.selected_symbol
-            && row.position_side == side
-            && row.quantity > Decimal::ZERO
-    }) else {
-        return;
-    };
-    let draft = PositionActionDraft {
-        credential_id: projection.credential_id.clone(),
-        trading_account_id: projection.trading_account_id.clone(),
-        symbol: row.symbol.clone(),
-        side,
-        quantity: row.quantity,
-        action: PositionAction::Close,
-    };
-    if selected_account_matches(model, &draft) {
-        submit(model, client, draft);
-    }
-}
-
 fn side_label(side: PositionSide, language: crate::i18n::Language) -> &'static str {
     match (side, language) {
         (PositionSide::Long, crate::i18n::Language::SimplifiedChinese) => "多仓",

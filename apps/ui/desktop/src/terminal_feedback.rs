@@ -66,7 +66,9 @@ pub(crate) fn message(model: &crate::model::AppModel) -> Option<String> {
                     model.execution.terminal_executions_error.is_some(),
                     language
                 )
-            ) + &if row.sanitized_error_code.is_some() {
+            ) + &if row.sanitized_error_code.is_some()
+                || row.state == ExecutorCommandState::Rejected
+            {
                 format!(" · {}", command_reason(row, language))
             } else {
                 String::new()
@@ -120,9 +122,32 @@ pub(crate) fn http_error(status: u16, body: &[u8]) -> String {
 
 pub(crate) fn command_reason(summary: &ExecutorCommandSummary, language: Language) -> String {
     let Some(code) = summary.sanitized_error_code.as_deref() else {
+        if summary.state == ExecutorCommandState::Rejected {
+            return choose(language,
+                "委托被拒绝，服务端未记录原因；请复制诊断详情核查。",
+                "Order rejected without a recorded reason. Copy diagnostic details for investigation.",
+            ).into();
+        }
         return "—".into();
     };
     describe_command_code(code, language)
+}
+
+pub(crate) fn command_details(summary: &ExecutorCommandSummary, language: Language) -> String {
+    format!(
+        "{}\n{}: {}\n{}: {}\n{}: {}\n{}: {}\n{}: {}",
+        command_reason(summary, language),
+        choose(language, "交易对", "Symbol"),
+        summary.symbol,
+        choose(language, "状态", "State"),
+        command_state(summary.state, language),
+        choose(language, "命令号", "Command ID"),
+        summary.command_id,
+        choose(language, "请求号", "Request ID"),
+        summary.request_id.as_deref().unwrap_or("—"),
+        choose(language, "交易所委托号", "Exchange order ID"),
+        summary.native_order_id.as_deref().unwrap_or("—"),
+    )
 }
 
 fn describe_command_code(code: &str, language: Language) -> String {
@@ -173,8 +198,8 @@ fn describe_command_code(code: &str, language: Language) -> String {
             "Binance rejected the order: invalid request message.",
         ),
         "binance_-2019" => (
-            "币安拒单：保证金不足。",
-            "Binance rejected the order: insufficient margin.",
+            "币安拒单：保证金不足；请检查可用保证金，减少开仓金额或调整已有委托。",
+            "Binance rejected the order: insufficient margin. Check available margin, reduce opening size or adjust existing orders.",
         ),
         "binance_-5022" => (
             "币安拒单：Post Only 价格会立即成交，请重新选择挂单价格。",
@@ -197,8 +222,8 @@ fn describe_command_code(code: &str, language: Language) -> String {
             "Binance rejected the signed timestamp; executor clock synchronization is required.",
         ),
         "not_dispatched_invalid" => (
-            "执行器未发送此委托；服务端未记录具体原因。此记录无法判断失败条件。",
-            "The executor did not send this order. The server recorded no specific reason; the failed condition cannot be determined.",
+            "委托未发送，具体原因未记录；请在历史委托中右键复制诊断详情核查。",
+            "Order not sent; no specific reason was recorded. Right-click order history to copy diagnostic details for investigation.",
         ),
         "not_dispatched_binding" => (
             "命令账户或交易对与执行连接不一致，未发送；需核对服务端命令路由。",
@@ -227,6 +252,18 @@ fn describe_command_code(code: &str, language: Language) -> String {
         "not_dispatched_close_reservation" => (
             "开仓命令错误地携带了平仓预留数据，未发送；需修正服务端命令。",
             "An opening command unexpectedly contains close reservations; not sent. Server command needs correction.",
+        ),
+        "not_dispatched_close_reserved" => (
+            "可平仓数量已被已有平仓委托占用，本次未发送；请检查当前委托，撤单确认并刷新可平量后再提交。调整价格不会释放占用。",
+            "Existing closing orders reserve all closable quantity; not sent. Check open orders, wait for confirmed cancellation and refreshed availability before submitting. Changing price does not release reservations.",
+        ),
+        "not_dispatched_close_position_empty" => (
+            "该方向已无可平持仓，本次未发送；请刷新持仓并核对平仓方向。",
+            "No position remains to close on this side; not sent. Refresh positions and check the closing side.",
+        ),
+        "not_dispatched_close_quantity_insufficient" => (
+            "剩余可平仓数量不足以覆盖本次委托，未发送；请核对持仓和已有平仓委托，减少数量或等待撤单确认。",
+            "Remaining closable quantity cannot cover this order; not sent. Check positions and closing orders, reduce quantity or wait for confirmed cancellation.",
         ),
         "not_dispatched_cancel_target" => (
             "撤单目标缺失、标识冲突或撤单参数不一致，未发送撤单。",
@@ -261,8 +298,8 @@ fn describe_command_code(code: &str, language: Language) -> String {
             "The order failed instrument-rule checks in this execution path; not sent, not an exchange rejection.",
         ),
         "not_dispatched_position" => (
-            "平仓数量超出签名持仓可减范围，未发送。",
-            "Close quantity exceeds the reducible signed position; not sent.",
+            "平仓数量超出签名持仓可减范围，未发送；请刷新持仓并核对平仓数量与方向。",
+            "Close quantity exceeds the reducible signed position; not sent. Refresh positions and check closing quantity and side.",
         ),
         "not_dispatched_payload" => (
             "适配器构造的委托请求不完整或格式无效，未发送。",
@@ -306,7 +343,7 @@ fn describe_command_code(code: &str, language: Language) -> String {
             "Safe server error code; inspect the associated command for details.",
         ),
     };
-    format!("[{code}] {}", choose(language, zh, en))
+    format!("{} [{code}]", choose(language, zh, en))
 }
 
 pub(crate) fn command_state(state: ExecutorCommandState, language: Language) -> &'static str {
@@ -454,11 +491,23 @@ mod tests {
             ("binance_-1013", "消息无效"),
             ("binance_-5022", "Post Only"),
             ("binance_-2019", "保证金不足"),
+            ("not_dispatched_close_reserved", "已有平仓委托占用"),
+            ("not_dispatched_close_position_empty", "已无可平持仓"),
+            (
+                "not_dispatched_close_quantity_insufficient",
+                "剩余可平仓数量不足",
+            ),
         ] {
             summary.sanitized_error_code = Some(code.into());
             let message = command_reason(&summary, Language::SimplifiedChinese);
             assert!(message.contains(code) && message.contains(reason));
+            assert!(!message.starts_with('['));
         }
+        let details = command_details(&summary, Language::SimplifiedChinese);
+        assert!(details.contains("命令号: fixture") && details.contains("DOGE/USDC"));
+        assert!(details.contains("交易所委托号: —"));
+        summary.sanitized_error_code = None;
+        assert!(command_reason(&summary, Language::SimplifiedChinese).contains("未记录原因"));
         summary.sanitized_error_code = Some("APIKEY=must-not-render".into());
         let message = command_reason(&summary, Language::SimplifiedChinese);
         assert!(message.contains("原文已隐藏") && !message.contains("must-not-render"));
@@ -492,6 +541,9 @@ mod tests {
                 "not_dispatched_order_type",
                 "not_dispatched_identity",
                 "not_dispatched_close_reservation",
+                "not_dispatched_close_reserved",
+                "not_dispatched_close_position_empty",
+                "not_dispatched_close_quantity_insufficient",
                 "not_dispatched_cancel_target",
                 "not_dispatched_scope",
                 "not_dispatched_instrument_rules",

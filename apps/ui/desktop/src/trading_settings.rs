@@ -272,10 +272,10 @@ fn order_hotkey_rows() -> [(TradingAction, &'static str, &'static str); 4] {
     [
         (
             TradingAction::CancelSelectedOrder,
-            "撤当前",
-            "Cancel Current",
+            "撤交易对挂单",
+            "Cancel Symbol Orders",
         ),
-        (TradingAction::CancelAllOrders, "撤全部", "Cancel All"),
+        (TradingAction::CancelAllOrders, "撤全部挂单", "Cancel All Orders"),
         (TradingAction::ClearSelection, "清除选中", "Clear Selection"),
         (TradingAction::CenterMarket, "回到市场", "Center Market"),
     ]

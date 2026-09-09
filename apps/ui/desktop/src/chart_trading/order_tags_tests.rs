@@ -1,6 +1,29 @@
 use super::*;
 use crate::chart_trading::ChartTradingSettings;
 
+#[test]
+fn crossed_line_waits_for_newer_private_facts_without_changing_orders()
+-> Result<(), Box<dyn std::error::Error>> {
+    let target = selection()?;
+    let mut facts = projection()?;
+    let original = facts.clone();
+    let mut state = OrderTagState::default();
+    state.crossed_price(target.clone(), facts.observed_ms + 1);
+    assert!(state.hidden(&target));
+    assert!(!state.is_pending(&target));
+    state.observe(&facts);
+    assert!(state.hidden(&target));
+    assert_eq!(facts, original);
+    facts.observed_ms += 2;
+    state.observe(&facts);
+    assert!(!state.hidden(&target));
+    state.crossed_price(target.clone(), facts.observed_ms + 1);
+    facts.open_orders.clear();
+    state.observe(&facts);
+    assert!(!state.hidden(&target));
+    Ok(())
+}
+
 fn selection() -> Result<TerminalOrderSelection, Box<dyn std::error::Error>> {
     Ok(TerminalOrderSelection {
         credential_id: "00000000-0000-4000-8000-000000000001".into(),

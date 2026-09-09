@@ -6,6 +6,14 @@ use venue_control_protocol::{
 };
 
 pub const SIZE_PRESET_COUNT: usize = 5;
+pub const EQUITY_PERCENT_PRESETS: [u8; SIZE_PRESET_COUNT] = [5, 10, 20, 30, 50];
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SizePresetMode {
+    #[default]
+    Amount,
+    EquityPercent,
+}
 const PRICE_HIGHLIGHT_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
 pub const DEFAULT_PRICE_VALIDITY_SECONDS: u16 = 10;
 const MAX_PRICE_VALIDITY_SECONDS: u16 = 300;
@@ -287,6 +295,7 @@ impl HotkeyMapping {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TradingSettings {
+    pub size_preset_mode: SizePresetMode,
     pub post_only: bool,
     pub price_validity_seconds: u16,
     pub size_presets: [Decimal; SIZE_PRESET_COUNT],
@@ -300,6 +309,7 @@ pub struct TradingSettings {
 impl Default for TradingSettings {
     fn default() -> Self {
         Self {
+            size_preset_mode: SizePresetMode::Amount,
             post_only: true,
             price_validity_seconds: DEFAULT_PRICE_VALIDITY_SECONDS,
             size_presets: [
@@ -319,6 +329,33 @@ impl Default for TradingSettings {
 }
 
 impl TradingSettings {
+    pub fn preset_label(&self, index: usize) -> String {
+        match self.size_preset_mode {
+            SizePresetMode::Amount => self.size_presets[index.min(4)].normalize().to_string(),
+            SizePresetMode::EquityPercent => format!("{}%", EQUITY_PERCENT_PRESETS[index.min(4)]),
+        }
+    }
+
+    pub fn preset_notional(
+        &self,
+        index: usize,
+        equity: Option<Decimal>,
+    ) -> Result<Decimal, TradePlanError> {
+        match self.size_preset_mode {
+            SizePresetMode::Amount => self.size_presets.get(index).copied(),
+            SizePresetMode::EquityPercent => {
+                let equity = equity
+                    .filter(|value| *value > Decimal::ZERO)
+                    .ok_or(TradePlanError::EquityUnavailable)?;
+                EQUITY_PERCENT_PRESETS
+                    .get(index)
+                    .and_then(|percent| equity.checked_mul(Decimal::new(i64::from(*percent), 2)))
+            }
+        }
+        .filter(|value| *value > Decimal::ZERO)
+        .ok_or(TradePlanError::InvalidSize)
+    }
+
     #[must_use]
     pub fn validate(&self) -> bool {
         self.size_presets.iter().all(|value| *value > Decimal::ZERO)
@@ -354,7 +391,6 @@ pub struct TradeDockState {
     pub terminal_order_selection: Option<TerminalOrderSelection>,
     pub armed_action: Option<TradingAction>,
     pub selected_size_preset: usize,
-    pub market_close_requested: Option<venue_domain::PositionSide>,
     price_selected_at: Option<f64>,
     display_symbol: String,
     scope: Option<TradingScope>,
@@ -451,17 +487,13 @@ impl TradeDockState {
         &self,
         settings: &TradingSettings,
         price: Decimal,
+        equity: Option<Decimal>,
     ) -> Result<Decimal, TradePlanError> {
         if self.amount_input.trim().is_empty() {
             if self.amount_in_base {
                 return Err(TradePlanError::InvalidSize);
             }
-            return settings
-                .size_presets
-                .get(self.selected_size_preset)
-                .copied()
-                .filter(|value| *value > Decimal::ZERO)
-                .ok_or(TradePlanError::InvalidSize);
+            return settings.preset_notional(self.selected_size_preset, equity);
         }
         let amount = self
             .amount_input
@@ -491,6 +523,8 @@ pub struct TerminalOrderSelection {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum TradePlanError {
+    #[error("fresh account equity in USD is unavailable")]
+    EquityUnavailable,
     #[error("select a chart or order-book price before placing an order")]
     MissingPrice,
     #[error("selected price has expired; select a new chart or order-book price")]
@@ -548,7 +582,7 @@ pub fn build_trade_intent(
     {
         return Err(TradePlanError::ExpiredPrice);
     }
-    let notional = state.quote_notional(settings, price)?;
+    let notional = state.quote_notional(settings, price, None)?;
     let close_quantity_cap = match action {
         TradingAction::CloseLong => Some(strategy.long_quantity),
         TradingAction::CloseShort => Some(strategy.short_quantity),
@@ -771,12 +805,6 @@ fn order_settings(ui: &mut egui::Ui, model: &mut crate::model::AppModel) {
     if !model.preferences.trading.validate() {
         ui.colored_label(theme::SELL, text(language, TextKey::InvalidSizePreset));
     }
-    let quote = model
-        .preferences
-        .selected_symbol
-        .split_once('/')
-        .map_or("—", |(_, quote)| quote)
-        .to_owned();
     ui.columns(2, |columns| {
         section_label(&mut columns[0], text(language, TextKey::OrderParameters));
         form_row(&mut columns[0], text(language, TextKey::OrderType), |ui| {
@@ -794,7 +822,7 @@ fn order_settings(ui: &mut egui::Ui, model: &mut crate::model::AppModel) {
             );
         });
         form_row(&mut columns[0], text(language, TextKey::SizeUnit), |ui| {
-            ui.monospace(&quote);
+            ui.label("USD");
         });
         form_row(
             &mut columns[0],
@@ -821,9 +849,36 @@ fn order_settings(ui: &mut egui::Ui, model: &mut crate::model::AppModel) {
                 .color(theme::TEXT_SECONDARY),
         );
         section_label(&mut columns[1], text(language, TextKey::SizePresets));
+        columns[1].spacing_mut().item_spacing.y = 6.0;
+        let previous = model.preferences.trading.size_preset_mode;
+        columns[1].horizontal(|ui| {
+            for (mode, zh, en) in [
+                (SizePresetMode::Amount, "金额", "Amount"),
+                (SizePresetMode::EquityPercent, "权益百分比", "Equity %"),
+            ] {
+                let caption = match language {
+                    crate::i18n::Language::SimplifiedChinese => zh,
+                    crate::i18n::Language::English => en,
+                };
+                ui.selectable_value(
+                    &mut model.preferences.trading.size_preset_mode,
+                    mode,
+                    caption,
+                );
+            }
+        });
+        if previous != model.preferences.trading.size_preset_mode {
+            model.trade_dock.amount_input.clear();
+            model.trade_dock.amount_in_base = false;
+            model.trade_dock.armed_action = None;
+        }
         for index in 0..SIZE_PRESET_COUNT {
             let title = format!("{} {}", text(language, TextKey::Preset), index + 1);
             form_row(&mut columns[1], &title, |ui| {
+                if model.preferences.trading.size_preset_mode == SizePresetMode::EquityPercent {
+                    ui.label(format!("{}%", EQUITY_PERCENT_PRESETS[index]));
+                    return;
+                }
                 let value = &mut model.preferences.trading.size_presets[index];
                 let mut numeric = value.to_string().parse::<f64>().unwrap_or(25.0);
                 if ui
@@ -832,7 +887,7 @@ fn order_settings(ui: &mut egui::Ui, model: &mut crate::model::AppModel) {
                             .range(0.01..=1_000_000_000.0)
                             .speed(1.0)
                             .max_decimals(2)
-                            .suffix(format!(" {quote}")),
+                            .suffix(" USD"),
                     )
                     .changed()
                     && let Some(decimal) = Decimal::from_f64_retain(numeric)

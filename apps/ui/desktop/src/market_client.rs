@@ -205,13 +205,16 @@ mod native {
             return Err(LocalMarketClientError::TooManySelections);
         }
         let mut unique = BTreeSet::new();
+        let mut ordered = Vec::new();
         for selection in selections {
             selection
                 .validate()
                 .map_err(|_| LocalMarketClientError::Selection)?;
-            unique.insert(selection);
+            if unique.insert(selection.clone()) {
+                ordered.push(selection);
+            }
         }
-        Ok(unique.into_iter().collect())
+        Ok(ordered)
     }
 
     enum ProxySetting {
@@ -372,46 +375,60 @@ mod native {
         history::start(http.clone(), history_rx, event_tx.clone());
         let proxy = ProxySetting::from_environment(MARKET_RELAY_HOST);
         let _ = event_tx.try_send(LocalMarketClientEvent::ProxyDetected(proxy.configured()));
-        let catalog = match fetch_catalog(&http).await {
-            Ok(instruments) => {
-                let labels = instruments
-                    .iter()
-                    .map(|instrument| MarketInstrument {
-                        symbol: instrument.symbol.to_string(),
-                        price_scale: instrument.price_tick.scale(),
-                        quantity_scale: instrument.quantity_step.scale(),
-                    })
-                    .collect();
-                let _ = event_tx.try_send(LocalMarketClientEvent::Catalog(labels));
-                instruments
-                    .into_iter()
-                    .map(|instrument| instrument.symbol)
-                    .collect()
-            }
-            Err(error) => {
-                let _ = event_tx.try_send(LocalMarketClientEvent::CatalogUnavailable(error));
-                Vec::new()
-            }
-        };
-        if !catalog.is_empty() && multi::ensure_clock(&http).await.is_ok() {
-            match fetch_quote_snapshot(&http, &catalog).await {
-                Ok(quotes) => {
-                    let _ = event_tx.try_send(LocalMarketClientEvent::Quotes(quotes));
+        let (catalog_tx, catalog) = tokio::sync::watch::channel(Vec::<Symbol>::new());
+        let bootstrap_http = http.clone();
+        let bootstrap_events = event_tx.clone();
+        let bootstrap = tokio::spawn(async move {
+            let http = bootstrap_http;
+            let event_tx = bootstrap_events;
+            let catalog: Vec<Symbol> = match fetch_catalog(&http).await {
+                Ok(instruments) => {
+                    let labels = instruments
+                        .iter()
+                        .map(|instrument| MarketInstrument {
+                            symbol: instrument.symbol.to_string(),
+                            price_scale: instrument.price_tick.scale(),
+                            quantity_scale: instrument.quantity_step.scale(),
+                        })
+                        .collect();
+                    let _ = event_tx.try_send(LocalMarketClientEvent::Catalog(labels));
+                    instruments
+                        .into_iter()
+                        .map(|instrument| instrument.symbol)
+                        .collect()
                 }
                 Err(error) => {
-                    let _ = event_tx.try_send(LocalMarketClientEvent::QuotesUnavailable(error));
+                    let _ = event_tx.try_send(LocalMarketClientEvent::CatalogUnavailable(error));
+                    Vec::new()
+                }
+            };
+            let _ = catalog_tx.send(catalog.clone());
+            if !catalog.is_empty() && multi::ensure_clock(&http).await.is_ok() {
+                match fetch_quote_snapshot(&http, &catalog).await {
+                    Ok(quotes) => {
+                        let _ = event_tx.try_send(LocalMarketClientEvent::Quotes(quotes));
+                    }
+                    Err(error) => {
+                        let _ = event_tx.try_send(LocalMarketClientEvent::QuotesUnavailable(error));
+                    }
                 }
             }
-        }
+        });
         let mut pending = None;
         loop {
-            let command = match pending.take() {
+            let mut command = match pending.take() {
                 Some(command) => command,
                 None => match async_rx.recv().await {
                     Some(command) => command,
                     None => break,
                 },
             };
+            while !matches!(command, LocalMarketCommand::Stop) {
+                match async_rx.try_recv() {
+                    Ok(latest) => command = latest,
+                    Err(_) => break,
+                }
+            }
             match command {
                 LocalMarketCommand::Stop => break,
                 LocalMarketCommand::Replace {
@@ -437,6 +454,7 @@ mod native {
                 }
             }
         }
+        bootstrap.abort();
         bridge.abort();
     }
 
@@ -445,7 +463,7 @@ mod native {
         selections: Vec<MarketSelection>,
         http: &reqwest::Client,
         proxy: &ProxySetting,
-        catalog: &[Symbol],
+        catalog: &tokio::sync::watch::Receiver<Vec<Symbol>>,
         commands: &mut mpsc::Receiver<LocalMarketCommand>,
         event_tx: &MarketSender,
     ) -> Option<LocalMarketCommand> {
@@ -642,7 +660,7 @@ mod native {
                                     payload.as_ref(),
                                     generation,
                                     &selections,
-                                    catalog,
+                                    &catalog.borrow(),
                                     received_ms,
                                     &mut emitter,
                                 ) {
@@ -685,7 +703,7 @@ mod native {
                                     payload.as_ref(),
                                     generation,
                                     &selections,
-                                    catalog,
+                                    &catalog.borrow(),
                                     received_ms,
                                     &mut emitter,
                                 ) {
@@ -936,16 +954,26 @@ mod native {
         commands: &mut mpsc::Receiver<LocalMarketCommand>,
         emitter: &mut EventEmitter,
     ) -> AttemptResult<()> {
-        for selection in selections {
-            let history = tokio::select! {
-                command = commands.recv() => {
-                    return match command {
-                        Some(command) => AttemptResult::Interrupted(command),
-                        None => AttemptResult::Failed("local market command bridge ended".to_owned()),
-                    };
-                }
-                result = fetch_history(http, selection, generation, DEFAULT_HISTORY_LIMIT, None) => result,
-            };
+        // Same requests and bar limits, at most two in flight; deliver each chart as it finishes.
+        let mut requests = history::batch(futures_util::stream::iter(selections.iter().map(
+            |selection| async move {
+                (
+                    selection,
+                    fetch_history(http, selection, generation, DEFAULT_HISTORY_LIMIT, None).await,
+                )
+            },
+        )));
+
+        while let Some((selection, history)) = tokio::select! {
+            biased;
+            command = commands.recv() => {
+                return match command {
+                    Some(command) => AttemptResult::Interrupted(command),
+                    None => AttemptResult::Failed("local market command bridge ended".to_owned()),
+                };
+            }
+            result = requests.next() => result,
+        } {
             let (bars, received_ms, event_time_ms) = match history {
                 Ok(history) => history,
                 Err(error) => return AttemptResult::Failed(error),

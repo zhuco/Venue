@@ -167,6 +167,7 @@ impl NativeTerminalSubmitter {
         request: &T,
         label: &str,
     ) -> bool {
+        crate::latency_evidence::submission(request_id, "http_started");
         let started = std::time::Instant::now();
         tracing::info!(target: "venueflow::terminal_latency", %request_id,
             "Terminal admission HTTP started");
@@ -181,6 +182,7 @@ impl NativeTerminalSubmitter {
             elapsed_ms = started.elapsed().as_millis() as u64,
             status = response.as_ref().ok().map(|r| r.status().as_u16()),
             "Terminal admission HTTP completed");
+        crate::latency_evidence::submission(request_id, "http_completed");
         match response {
             Ok(response) if response.status().is_success() => {
                 match response.json::<ExecutorCommandSummary>().await {

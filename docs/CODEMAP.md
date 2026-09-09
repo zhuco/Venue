@@ -1,5 +1,9 @@
 # VENUE 功能代码地图
 
+订单成交标记聚合：`apps/ui/desktop/src/chart_trading/overlays/fills.rs` 按订单 ID 汇总唯一成交，使用累计数量、加权均价和首次成交时间；`chart.rs::ChartViewport::zoom_by_grid_steps` 按每个原始滚轮刻度一个时间网格跨度缩放。
+
+挂单线穿价即时隐藏：`apps/ui/desktop/src/app/market_events/crossed_orders.rs` 消费既有逐笔行情，`chart_trading/order_tags.rs` 保存可由私有事实纠正的临时显示状态；按交易对/账户撤普通挂单入口为 `trade_dock/cancel_orders.rs`。
+
 Mac/Linux 打包入口：`scripts/build-all.sh`、`apps/ui/web/scripts/build.sh`；Web standalone 部署说明见 [WEB_STANDALONE.md](WEB_STANDALONE.md)。Windows 交叉构建使用 `scripts/Build-VenueUbuntu.ps1`。
 
 桌面体验维护：`apps/ui/desktop/src/app.rs` 按预算消费事件；`app/persistence.rs` 保存/恢复上次可解析布局；`diagnostics.rs` 负责有界异步日志轮转；`execution_view.rs` 虚拟化只读历史行。
@@ -66,7 +70,7 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 | 原生下单、签名时钟和安全错误码 | `crates/venue-gateway-binance/src/{execution,transport}.rs` |
 | 共享规则目录与后台校时 | `apps/venue-control/src/executor_exchange/catalogue.rs`、`executor_exchange/` |
 | 手动 Post Only 开仓快速路径 | `apps/venue-control/src/executor_exchange/terminal_open.rs`、`crates/venue-gateway-binance/src/execution/terminal_open.rs` |
-| 发送前拒绝分类与参数绑定 | `apps/venue-control/src/executor_exchange/{rejection,validation}.rs`；沿命令账本安全错误码到 `apps/ui/desktop/src/terminal_feedback.rs`，未知旧码不推测原因 |
+| 发送前拒绝分类与参数绑定 | `apps/venue-control/src/executor_exchange/{rejection,validation}.rs`；限价平仓区分预留占满、无持仓与可平量不足，沿命令账本安全错误码到 `apps/ui/desktop/src/terminal_feedback.rs`；历史委托原因列可复制诊断详情，未知旧码不推测原因 |
 | 逐行市价平仓与反开 | `crates/venue-control-protocol/src/terminal_position.rs`、`apps/venue-control/src/accounts/terminal/position_actions.rs`、`executor_runtime/terminal_positions.rs`、`executor_store/terminal_positions.rs`；迁移 0027 |
 | 市价操作的精简持仓读取及发送后单交易对刷新 | `apps/venue-control/src/executor_exchange/terminal_market.rs`、`private_projection/terminal_positions.rs`；执行读取合并凭证/流状态，跳过成交与仓位历史查询 |
 
@@ -108,10 +112,11 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 | VenueFlow 本机 WASM 只读预览 | `scripts/Build-VenueWebPreview.ps1`、`apps/ui/desktop/src/web_preview/`、`src/bin/web_preview.rs`、`web/preview.html`；归一化公开行情通过本机 8877 端口提供，不包含账户/交易接入 |
 | 统一机器人列表、带单编辑及启停 | `apps/ui/desktop/src/leader_bot_view.rs` |
 | Grid 模态配置和生命周期 | `apps/ui/desktop/src/grid_view.rs`、`client/grid.rs` |
-| 账户/API/系统登录凭据库 | `apps/ui/desktop/src/account_client.rs`、`account_center/` |
+| 账户/API/系统登录凭据库与到期恢复 | `apps/ui/desktop/src/account_client.rs`、`account_center/`；`model.rs` 按服务器和登录用户保存执行凭证选择，服务端确认后生效 |
 | 桌面账户切换代次与迟到结果过滤 | `apps/ui/desktop/src/account_scope.rs`、`account_scope/tests.rs`、`client/execution/race_tests.rs` |
 | 桌面行情切换应用边界 | `apps/ui/desktop/src/app/market_events.rs`、`app/market_events/tests.rs` |
 | 私有持仓、委托、成交、资产与历史 | `apps/ui/desktop/src/execution_view.rs`、`client/execution.rs` |
+| 桌面交易设置与金额/权益百分比预设 | `apps/ui/desktop/src/trading.rs`、`trade_dock.rs`；只读取已接收的账户 USD 权益，鼠标与快捷键共用计算 |
 | 复用成交的仓位历史估算与仓位变更 | `apps/ui/desktop/src/execution_view/position_history.rs`；零仓快照界定片段，费用与历史缺失不补造，不新增 REST |
 | 逐行平仓/反开、下单及反馈 | `apps/ui/desktop/src/execution_view/position_actions.rs`、`trade_dock.rs`、`terminal_feedback.rs` |
 | 当前账户 SSE 与写入状态门 | `apps/ui/desktop/src/client/stream_gates.rs`、`ui/status_bar.rs` |
@@ -119,6 +124,7 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 | 图表与共享指标 | `apps/ui/desktop/src/{chart_view,chart_settings,settings_panel}.rs`、`chart_trading/{overlays,order_tags}.rs`（委托/持仓标签与价格线）、`crates/venue-indicators/src/chart/` |
 | 独立价格轴与刻度适配 | `apps/ui/desktop/src/chart_view/price_axis.rs` 绘制轴刻度与价格标签；`chart.rs::ChartViewport` 管理自动/手动范围，`ui.rs` 通过适配恢复可见范围 |
 | 主图指标实时读数 | `apps/ui/desktop/src/chart_view/study_readout.rs` 按所选K线读取已有指标结果，`custom_indicator/render.rs` 按实际读数高度紧凑排列 |
+| 指标实时状态与缺口恢复 | `apps/ui/desktop/src/market.rs` 在迟到收盘后重算当前预览；`app/market_events.rs` 遇到不连续收盘时切换行情代次并自动补历史，拒绝旧代次结果 |
 | 可见K线极值价格与纵向缩放 | `apps/ui/desktop/src/chart_view/price_annotations.rs`、`chart.rs::ChartViewport`；可见蜡烛自动范围、按可见K线适配、价格轴拖动 |
 | 服务器配置、公共行情代理、启动和 UI 日志 | `apps/ui/desktop/src/{server_connection,market_client,diagnostics}.rs`、`scripts/Start-VenueFlow.ps1`、`scripts/configure_desktop_https.py` |
 | 用户首页和邀请注册 | `apps/ui/web/app/`、`components/customer-console.tsx`、`lib/customer-server.ts` |
@@ -184,4 +190,9 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 
 Web KOL 使用指南：`apps/ui/web/app/help/kol/page.tsx`，路由 `/help/kol`；后台顶部、API、带单源与邀请表单提供定位入口。
 
+
 Web 在唯一带单账户旁提供启用/停止开关，不单独展示机器人创建表单。首次启用以当前验证取得的正权益调用 `/v2/kol/leader-bots` 保存配置，确认成功后再调用生命周期接口；创建与启用各自保留请求编号，结果不确定只重试对应阶段。零/缺失权益提示重新验证；停止撤销程序同步挂单但不平仓。入口为 `apps/ui/web/components/customer-console.tsx` 与 `kol-source-panel.tsx`。
+
+VenueFlow 延迟采集：`apps/ui/desktop/src/latency_evidence.rs` 与 `latency_evidence/panel.rs` 提供 Ctrl+Shift+L 有界采集、帧缓冲回执和 JSON 分位数导出；契约及现场验收见 [延迟证据](VENUEFLOW_LATENCY_EVIDENCE.md)。
+
+桌面 K 线加载：`apps/ui/desktop/src/market_client.rs` 将 Binance 目录/报价初始化与历史加载解耦，`market_client/native/history.rs` 限制两个历史请求并行；`chart_view/loading.rs` 绘制加载动画，`market.rs` 维护仅供显示的有界周期预览。

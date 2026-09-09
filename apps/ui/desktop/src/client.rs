@@ -217,6 +217,8 @@ impl ControlClient {
         #[cfg(not(target_arch = "wasm32"))]
         tracing::info!(target: "venueflow::terminal_latency", request_id = %request.request_id,
             "Terminal order queued locally");
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::latency_evidence::submission(&request.request_id, "queued");
         self.terminal_order_tx
             .send(Scoped {
                 scope,

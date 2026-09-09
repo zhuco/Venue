@@ -10,6 +10,9 @@ pub enum PreDispatchRejection {
     Direction,
     OrderType,
     CloseReservation,
+    CloseReserved,
+    ClosePositionEmpty,
+    CloseQuantityInsufficient,
     CancelTarget,
     Scope,
     InstrumentRules,
@@ -33,6 +36,9 @@ impl PreDispatchRejection {
             Self::Direction => "not_dispatched_direction",
             Self::OrderType => "not_dispatched_order_type",
             Self::CloseReservation => "not_dispatched_close_reservation",
+            Self::CloseReserved => "not_dispatched_close_reserved",
+            Self::ClosePositionEmpty => "not_dispatched_close_position_empty",
+            Self::CloseQuantityInsufficient => "not_dispatched_close_quantity_insufficient",
             Self::CancelTarget => "not_dispatched_cancel_target",
             Self::Scope => "not_dispatched_scope",
             Self::InstrumentRules => "not_dispatched_instrument_rules",
@@ -45,6 +51,76 @@ impl PreDispatchRejection {
             Self::Payload => "not_dispatched_payload",
             Self::AccountFacts => "not_dispatched_account_facts",
         }
+    }
+}
+
+pub(super) fn available_close_quantity(
+    position: rust_decimal::Decimal,
+    reserved: rust_decimal::Decimal,
+    requested: rust_decimal::Decimal,
+    require_full: bool,
+) -> Result<rust_decimal::Decimal, BinanceExecutionError> {
+    use rust_decimal::Decimal;
+    let available = position
+        .checked_sub(reserved)
+        .ok_or(BinanceExecutionError::Invalid)?;
+    // Classify only fresh executor facts; desktop snapshots cannot prove reservation ownership.
+    let reason = if position <= Decimal::ZERO {
+        Some(PreDispatchRejection::ClosePositionEmpty)
+    } else if available <= Decimal::ZERO {
+        Some(PreDispatchRejection::CloseReserved)
+    } else if require_full && requested > available {
+        Some(PreDispatchRejection::CloseQuantityInsufficient)
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        return Err(BinanceExecutionError::PreDispatch(reason));
+    }
+    Ok(requested.min(available.max(Decimal::ZERO)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal::Decimal;
+
+    #[test]
+    fn close_reservations_classify_rejections_and_preserve_clipping() {
+        for (position, reserved, requested, full, expected) in [
+            (100, 100, 20, false, "not_dispatched_close_reserved"),
+            (100, 110, 20, false, "not_dispatched_close_reserved"),
+            (0, 0, 20, false, "not_dispatched_close_position_empty"),
+            (0, 20, 20, false, "not_dispatched_close_position_empty"),
+            (
+                100,
+                80,
+                30,
+                true,
+                "not_dispatched_close_quantity_insufficient",
+            ),
+        ] {
+            let result =
+                available_close_quantity(position.into(), reserved.into(), requested.into(), full);
+            assert_eq!(
+                result.map_err(|error| error.not_dispatched_code()),
+                Err(expected)
+            );
+        }
+        for full in [false, true] {
+            assert_eq!(
+                available_close_quantity(100.into(), 80.into(), 20.into(), full),
+                Ok(20.into())
+            );
+            assert_eq!(
+                available_close_quantity(100.into(), Decimal::ZERO, 10.into(), full),
+                Ok(10.into())
+            );
+        }
+        assert_eq!(
+            available_close_quantity(100.into(), 80.into(), 30.into(), false),
+            Ok(20.into())
+        );
     }
 }
 

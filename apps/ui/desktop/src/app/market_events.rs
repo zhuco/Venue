@@ -1,4 +1,5 @@
 use super::*;
+mod crossed_orders;
 
 pub(super) fn apply(
     model: &mut AppModel,
@@ -41,13 +42,56 @@ pub(super) fn apply(
             if envelope.generation != model.local_markets.generation()
                 || envelope.selection.binding.venue != server.venue()
                 || !model
-                    .local_symbols
-                    .contains(&envelope.selection.binding.symbol.to_string())
+                    .local_markets
+                    .selections()
+                    .any(|selection| selection == &envelope.selection)
+                || (server != crate::model::MarketServer::Binance
+                    && !model
+                        .local_symbols
+                        .contains(&envelope.selection.binding.symbol.to_string()))
             {
                 return;
             }
+            // The active subscription is the scope boundary. Binance catalog and history load in
+            // parallel; a delayed catalog must not discard the only initial history response.
+            let trade = match &envelope.payload {
+                crate::market::MarketPayload::Trade(trade) => {
+                    Some((envelope.selection.binding.symbol.clone(), trade.clone()))
+                }
+                _ => None,
+            };
+            let history = matches!(
+                &envelope.payload,
+                crate::market::MarketPayload::RestHistory { .. }
+            )
+            .then(|| (envelope.selection.clone(), envelope.generation));
             if let Err(error) = model.local_markets.apply(*envelope) {
+                if matches!(
+                    error,
+                    crate::market::LocalMarketError::Indicator(
+                        venue_indicators::chart::ChartIndicatorError::DiscontinuousBar
+                    )
+                ) {
+                    // The next frame resubscribes with a fresh generation and reloads history.
+                    // Never promote a partial forming candle to a confirmed close to bridge a gap.
+                    model.history_requests.clear();
+                    if let Err(reset_error) = model.local_markets.replace([]) {
+                        model.notice(format!("Market resync failed: {reset_error}"));
+                    }
+                    model.notice("K 线数据不连续，正在重新同步");
+                    context.request_repaint();
+                    return;
+                }
                 model.notice(format!("Ignored invalid local market event: {error}"));
+            } else if let Some((selection, generation)) = history {
+                let bars = model
+                    .local_markets
+                    .view(&selection)
+                    .map_or(0, |view| view.bars.len());
+                tracing::info!(target: "venueflow::chart_loading", generation, symbol = %selection.binding.symbol, interval = selection.interval.label(), bars, "Chart initial history accepted");
+                context.request_repaint();
+            } else if let Some((symbol, trade)) = trade {
+                crossed_orders::observe(model, &symbol, &trade, context);
             }
         }
         LocalMarketClientEvent::Catalog(symbols) => {

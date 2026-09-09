@@ -12,9 +12,6 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
     if let Some(action) = controls(ui, model) {
         apply_action(model, client, action, ui.ctx());
     }
-    if let Some(side) = model.trade_dock.market_close_requested.take() {
-        submit_market_close(model, client, side);
-    }
 }
 
 // Rendering produces the same semantic action as keyboard input, with no network side effect.
@@ -104,12 +101,11 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
                 model.trade_dock.armed_action = None;
             }
         });
-        let preset =
-            model.preferences.trading.size_presets[model.trade_dock.selected_size_preset.min(4)];
+        let preset = preset_amount_hint(model);
         let hint = if model.trade_dock.amount_in_base {
             text(language, TextKey::EnterBaseSize).to_owned()
         } else {
-            preset.normalize().to_string()
+            preset
         };
         if columns[1]
             .add(
@@ -125,8 +121,7 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
     ui.horizontal(|ui| {
         let width = ((ui.available_width() - ui.spacing().item_spacing.x * 4.0) / 5.0).max(24.0);
         for index in 0..crate::trading::SIZE_PRESET_COUNT {
-            let value = model.preferences.trading.size_presets[index];
-            let title = value.normalize().to_string();
+            let title = model.preferences.trading.preset_label(index);
             let key = model
                 .preferences
                 .trading
@@ -139,11 +134,11 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
                     egui::Button::selectable(
                         model.trade_dock.selected_size_preset == index
                             && model.trade_dock.amount_input.is_empty(),
-                        RichText::new(title).size(11.0),
+                        RichText::new(&title).size(11.0),
                     )
                     .wrap_mode(egui::TextWrapMode::Truncate),
                 )
-                .on_hover_text(format!("{} USD · {key}", value.normalize()))
+                .on_hover_text(format!("{title} · {key}"))
                 .clicked()
             {
                 action = Some(TradingAction::SelectSizePreset(index));
@@ -170,7 +165,12 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
     }
     let now = ui.ctx().input(|input| input.time);
     if let Some(reason) = action_disabled_reason(model, TradingAction::OpenLong, now) {
-        ui.colored_label(theme::WARNING, reason);
+        if !matches!(
+            terminal_request_parts(model, TradingAction::OpenLong, now),
+            Err(crate::trading::TradePlanError::MissingPrice)
+        ) {
+            ui.colored_label(theme::WARNING, reason);
+        }
     } else if model.preferences.trading.hotkeys_enabled {
         ui.small(label(
             language,
@@ -184,50 +184,6 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
             "Hotkeys are disabled in Settings.",
         ));
     }
-    ui.horizontal(|ui| {
-        let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-        for (side, action, title) in [
-            (
-                venue_domain::PositionSide::Long,
-                TradingAction::CloseLong,
-                label(language, "市价平多", "Market Close Long"),
-            ),
-            (
-                venue_domain::PositionSide::Short,
-                TradingAction::CloseShort,
-                label(language, "市价平空", "Market Close Short"),
-            ),
-        ] {
-            let quantity = model
-                .execution
-                .position_quantity(&symbol, side)
-                .unwrap_or(rust_decimal::Decimal::ZERO);
-            let armed = model.trade_dock.armed_action == Some(action);
-            if ui
-                .add_enabled(
-                    private_ready && quantity > rust_decimal::Decimal::ZERO,
-                    egui::Button::new(if armed {
-                        format!("确认 {title}")
-                    } else {
-                        title.to_owned()
-                    })
-                    .min_size(egui::vec2(width, 28.0)),
-                )
-                .on_hover_text(label(
-                    language,
-                    "再次点击平仓，最多平掉当前剩余数量。",
-                    "Click again to close, up to the remaining quantity.",
-                ))
-                .clicked()
-            {
-                if armed {
-                    model.trade_dock.market_close_requested = Some(side);
-                } else {
-                    model.trade_dock.armed_action = Some(action);
-                }
-            }
-        }
-    });
     ui.horizontal(|ui| {
         let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
         for candidate in [
@@ -250,6 +206,40 @@ fn symbol_assets(symbol: &str) -> (String, String) {
         || ("BASE".to_owned(), "QUOTE".to_owned()),
         |(base, quote)| (base.to_owned(), quote.to_owned()),
     )
+}
+
+fn preset_equity(model: &AppModel) -> Option<rust_decimal::Decimal> {
+    let scope = model.confirmed_account_scope()?;
+    if !model
+        .execution
+        .private_ready(Some(&scope.trading_account_id), now_ms())
+    {
+        return None;
+    }
+    let projection = model
+        .execution
+        .private_projection_for(Some(&scope.trading_account_id))?;
+    if projection.credential_id != scope.credential_id {
+        return None;
+    }
+    // Use portfolio USD valuation, never add asset balances with different units.
+    projection
+        .assets
+        .iter()
+        .find(|asset| asset.asset == "USD")
+        .map(|asset| asset.equity)
+        .filter(|equity| *equity > rust_decimal::Decimal::ZERO)
+}
+
+pub(crate) fn preset_amount_hint(model: &AppModel) -> String {
+    model
+        .preferences
+        .trading
+        .preset_notional(model.trade_dock.selected_size_preset, preset_equity(model))
+        .map_or_else(
+            |_| "—".to_owned(),
+            |amount| amount.round_dp(2).normalize().to_string(),
+        )
 }
 
 fn action_palette(action: TradingAction) -> (Color32, Color32, Color32) {
@@ -278,7 +268,14 @@ pub(crate) fn action_button(
         .hotkeys
         .key_for(action)
         .map_or("—", |key| key.label());
-    let disabled_reason = action_disabled_reason(model, action, ui.ctx().input(|input| input.time));
+    let disabled_reason = if matches!(
+        action,
+        TradingAction::CancelSelectedOrder | TradingAction::CancelAllOrders
+    ) {
+        cancel_orders::targets(model, action == TradingAction::CancelAllOrders).err()
+    } else {
+        action_disabled_reason(model, action, ui.ctx().input(|input| input.time))
+    };
     let enabled = disabled_reason.is_none();
     let (text_color, fill, stroke) = action_palette(action);
     let response = ui.add_enabled(
@@ -381,6 +378,9 @@ fn action_disabled_reason(model: &AppModel, action: TradingAction, now: f64) -> 
         .err()
         .map(|error| {
             let chinese = match error {
+                crate::trading::TradePlanError::EquityUnavailable => {
+                    "权益数据不可用，请等待账户刷新或使用金额方案"
+                }
                 crate::trading::TradePlanError::MissingPrice => "请先点击图表或订单簿选择限价",
                 crate::trading::TradePlanError::ExpiredPrice => "所选价格已过期，请重新选择",
                 crate::trading::TradePlanError::InvalidPrice => "所选价格无效",
@@ -403,6 +403,31 @@ pub fn apply_action(
     action: TradingAction,
     context: &egui::Context,
 ) {
+    if matches!(
+        action,
+        TradingAction::CancelSelectedOrder | TradingAction::CancelAllOrders
+    ) {
+        cancel_orders::submit(
+            model,
+            client,
+            action == TradingAction::CancelAllOrders,
+            context,
+        );
+    } else {
+        apply_single_action(model, client, action, context);
+    }
+}
+
+mod cancel_orders;
+
+pub(crate) fn apply_single_action(
+    model: &mut AppModel,
+    client: &ControlClient,
+    action: TradingAction,
+    context: &egui::Context,
+) {
+    #[cfg(not(target_arch = "wasm32"))]
+    let evidence_click = crate::latency_evidence::now();
     model.synchronize_trading_scope();
     model.refresh_trading_price(context);
     match action {
@@ -484,6 +509,13 @@ pub fn apply_action(
         }
     };
     let request_id = request.request_id.clone();
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::latency_evidence::click(
+        model.confirmed_account_scope(),
+        &request_id,
+        &request.symbol.to_string(),
+        evidence_click,
+    );
     match client.send_terminal(request, model.confirmed_account_scope()) {
         Ok(()) => {
             context.request_repaint();
@@ -594,9 +626,10 @@ fn terminal_request_parts(
     {
         return Err(crate::trading::TradePlanError::ExpiredPrice);
     }
-    let quote_notional = model
-        .trade_dock
-        .quote_notional(&model.preferences.trading, price)?;
+    let quote_notional =
+        model
+            .trade_dock
+            .quote_notional(&model.preferences.trading, price, preset_equity(model))?;
     let terminal_action = match action {
         TradingAction::OpenLong => TerminalAction::OpenLong,
         TradingAction::CloseLong => TerminalAction::CloseLong,
@@ -661,14 +694,6 @@ fn build_terminal_request(
     })
 }
 
-fn submit_market_close(
-    model: &mut AppModel,
-    client: &ControlClient,
-    side: venue_domain::PositionSide,
-) {
-    crate::execution_view::submit_confirmed_close(model, client, side);
-}
-
 fn local_failure(model: &mut AppModel, reason: String) {
     model.execution.terminal_request_id = None;
     model.execution.terminal_submission_error = Some(reason.clone());
@@ -695,8 +720,10 @@ pub(crate) const fn action_name(
         TradingAction::CloseLong => label(language, "平多", "Close Long"),
         TradingAction::CloseShort => label(language, "平空", "Close Short"),
         TradingAction::OpenShort => label(language, "开空", "Open Short"),
-        TradingAction::CancelSelectedOrder => label(language, "撤选中", "Cancel Selected"),
-        TradingAction::CancelAllOrders => label(language, "撤全部", "Cancel All"),
+        TradingAction::CancelSelectedOrder => {
+            label(language, "撤交易对挂单", "Cancel Symbol Orders")
+        }
+        TradingAction::CancelAllOrders => label(language, "撤全部挂单", "Cancel All Orders"),
         TradingAction::SelectSizePreset(_) => label(language, "数量预设", "Size Preset"),
         TradingAction::ClearSelection => label(language, "清除", "Clear"),
         TradingAction::CenterMarket => label(language, "回到市场", "Center Market"),
@@ -706,6 +733,57 @@ pub(crate) const fn action_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn percent_order_uses_latest_local_equity_and_rejects_stale_or_switched_account()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::account_scope::tests::{id, model, projection};
+        use crate::trading::{SizePresetMode, TradePlanError};
+        let mut model = model();
+        model.preferences.trading.size_preset_mode = SizePresetMode::EquityPercent;
+        model.trade_dock.selected_size_preset = 1;
+        model.trade_dock.select_price(100.into(), 1.0)?;
+        for (equity, expected) in [(1000, 100), (1500, 150)] {
+            let mut facts = projection(1);
+            facts
+                .assets
+                .push(venue_control_protocol::kol::TerminalAsset {
+                    asset: "USD".into(),
+                    equity: equity.into(),
+                    available_margin: Some(25.into()),
+                });
+            model
+                .execution
+                .apply_private(Some(facts), &mut model.trade_dock);
+            assert_eq!(
+                build_terminal_request(&mut model, TradingAction::OpenLong, 1.0)?.quote_notional,
+                rust_decimal::Decimal::from(expected)
+            );
+        }
+        let mut stale = projection(1);
+        stale.observed_ms = now_ms().saturating_sub(60_000);
+        stale
+            .assets
+            .push(venue_control_protocol::kol::TerminalAsset {
+                asset: "USD".into(),
+                equity: 9999.into(),
+                available_margin: None,
+            });
+        model
+            .execution
+            .apply_private(Some(stale), &mut model.trade_dock);
+        assert_eq!(
+            terminal_request_parts(&model, TradingAction::OpenLong, 1.0).err(),
+            Some(TradePlanError::EquityUnavailable)
+        );
+        model.trade_dock.amount_input = "25".into();
+        assert_eq!(
+            build_terminal_request(&mut model, TradingAction::OpenLong, 1.0)?.quote_notional,
+            rust_decimal::Decimal::from(25)
+        );
+        model.begin_account_selection(id(2));
+        assert!(preset_equity(&model).is_none());
+        Ok(())
+    }
     #[test]
     fn manual_open_is_available_without_private_projection_but_close_is_not()
     -> Result<(), Box<dyn std::error::Error>> {

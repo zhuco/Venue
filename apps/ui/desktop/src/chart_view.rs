@@ -13,6 +13,7 @@ use crate::{
 };
 
 type StudySelector = fn(&ChartStudyPoint) -> Option<rust_decimal::Decimal>;
+pub(crate) mod loading;
 mod price_annotations;
 mod price_axis;
 mod study_readout;
@@ -128,14 +129,28 @@ pub(crate) fn candle_plot(
         .clamp(250.0, 4000.0) as u32;
     }
     if response.hovered() && !price_axis.hovered() {
-        let wheel = ui.input(|input| input.smooth_scroll_delta.y);
-        if wheel.abs() > f32::EPSILON {
-            viewport.zoom_by_steps(
-                all_bars.len(),
-                pointer_ratio,
-                if wheel > 0.0 { 1 } else { -1 },
-            );
-        }
+        let steps = ui.input(|input| {
+            input
+                .events
+                .iter()
+                .filter_map(|event| {
+                    if let egui::Event::MouseWheel { unit, delta, .. } = event {
+                        if !delta.y.is_finite() || delta.y == 0.0 {
+                            return None;
+                        }
+                        let count = if *unit == egui::MouseWheelUnit::Line {
+                            delta.y.abs().ceil() as isize
+                        } else {
+                            1
+                        };
+                        Some(if delta.y > 0.0 { count } else { -count })
+                    } else {
+                        None
+                    }
+                })
+                .sum()
+        });
+        viewport.zoom_by_grid_steps(all_bars.len(), pointer_ratio, interval, steps);
     }
     if response.dragged_by(egui::PointerButton::Primary)
         && !price_axis.dragged()

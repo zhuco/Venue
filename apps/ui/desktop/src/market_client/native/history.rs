@@ -1,5 +1,11 @@
 use super::*;
 
+pub(super) fn batch<F: std::future::Future>(
+    requests: impl futures_util::Stream<Item = F>,
+) -> impl futures_util::Stream<Item = F::Output> {
+    requests.buffer_unordered(2)
+}
+
 pub(super) fn url(
     selection: &MarketSelection,
     limit: usize,
@@ -63,6 +69,34 @@ pub(super) fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn batch_delivers_ready_chart_before_slow_chart_with_exactly_two_in_flight() {
+        use futures_util::FutureExt;
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel::<usize>();
+        let (second_tx, second_rx) = tokio::sync::oneshot::channel::<usize>();
+        let (third_tx, third_rx) = tokio::sync::oneshot::channel::<usize>();
+        let mut results = batch(futures_util::stream::iter(
+            [first_rx, second_rx, third_rx].into_iter().map(|rx| {
+                let started = started.clone();
+                async move {
+                    started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    rx.await.unwrap()
+                }
+            }),
+        ));
+        assert!(results.next().now_or_never().is_none());
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 2);
+        second_tx.send(2).unwrap();
+        assert_eq!(results.next().await, Some(2));
+        assert!(results.next().now_or_never().is_none());
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 3);
+        third_tx.send(3).unwrap();
+        assert_eq!(results.next().await, Some(3));
+        first_tx.send(1).unwrap();
+        assert_eq!(results.next().await, Some(1));
+        assert_eq!(results.next().await, None);
+    }
     #[test]
     fn backward_page_is_public_scoped_and_excludes_boundary()
     -> Result<(), Box<dyn std::error::Error>> {

@@ -1695,6 +1695,17 @@ mod tests {
 
     #[test]
     fn adapter_errors_before_post_are_terminal_and_never_dispatch_unknown() {
+        for reason in [
+            crate::executor_exchange::PreDispatchRejection::CloseReserved,
+            crate::executor_exchange::PreDispatchRejection::ClosePositionEmpty,
+            crate::executor_exchange::PreDispatchRejection::CloseQuantityInsufficient,
+        ] {
+            let (state, code) = not_dispatched_transition(
+                crate::executor_exchange::BinanceExecutionError::PreDispatch(reason),
+            );
+            assert_eq!(state, ExecutorCommandState::Rejected);
+            assert_eq!(code, reason.code());
+        }
         for (error, expected) in [
             (
                 crate::executor_exchange::BinanceExecutionError::PreDispatch(
