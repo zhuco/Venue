@@ -436,9 +436,26 @@ pub fn evaluate_callback(
     let end = bars.len();
     let start = end.saturating_sub(config.callback_max_bars);
     let mut touched_at = None;
+    let mut invalidated = false;
     for i in start..end {
-        if bars[i].close.value() < support.lower.value() {
+        if bars[i].open_time_ms <= support.confirmed_at_ms {
+            continue;
+        }
+        // The last closed callback candle of the support interval has the same close
+        // as that interval. Intrahour dips alone do not invalidate a reclaim.
+        let support_close = bars[i]
+            .close_time_ms
+            .checked_add(1)
+            .is_some_and(|end| config.support_period > 0 && end % config.support_period == 0);
+        if support_close && bars[i].close.value() < support.lower.value() {
             touched_at = None;
+            invalidated = true;
+            continue;
+        }
+        if invalidated {
+            if bars[i].close.value() > support.upper.value() {
+                invalidated = false;
+            }
             continue;
         }
         if touched_at.is_none()
@@ -804,6 +821,43 @@ mod tests {
             )?
             .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn callback_allows_intrahour_reclaim_but_rejects_hourly_break()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut bars, mut support, config) = callback_fixture()?;
+        support.lower = Price::new(Decimal::from(82))?;
+        support.upper = Price::new(Decimal::from(84))?;
+        let now = bars.last().ok_or("missing bar")?.close_time_ms + 1_000;
+        assert!(evaluate_callback(&bars, &support, &config, EntryKind::First, now)?.is_some());
+        for bar in &mut bars {
+            bar.open_time_ms -= config.callback_period;
+            bar.close_time_ms -= config.callback_period;
+            bar.received_at_ms -= config.callback_period;
+        }
+        support.confirmed_at_ms -= config.callback_period;
+        assert!(
+            evaluate_callback(
+                &bars,
+                &support,
+                &config,
+                EntryKind::First,
+                now - config.callback_period
+            )?
+            .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn callback_cannot_use_a_touch_before_support_confirmation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (bars, mut support, config) = callback_fixture()?;
+        support.confirmed_at_ms = bars[23].close_time_ms;
+        let now = bars.last().ok_or("missing bar")?.close_time_ms + 1_000;
+        assert!(evaluate_callback(&bars, &support, &config, EntryKind::First, now)?.is_none());
         Ok(())
     }
 

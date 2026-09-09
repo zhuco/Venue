@@ -249,27 +249,33 @@ pub fn plan(input: &PlannerInput<'_>) -> Plan {
     {
         return Plan::Noop(NoopReason::NoSupport);
     }
+    let mut has_candidate = false;
     let support = select_support(
         &supports,
         input.consumed_supports,
         reference_mid,
         input.last_support_lower,
+        |support| {
+            has_candidate = true;
+            evaluate_callback(
+                &reference.fifteen_minutes,
+                support,
+                &core,
+                kind,
+                input.now_ms,
+            )
+            .ok()
+            .flatten()
+            .is_some()
+        },
     );
     let Some(support) = support else {
-        return Plan::Noop(NoopReason::NoSupport);
+        return Plan::Noop(if has_candidate {
+            NoopReason::CallbackNotConfirmed
+        } else {
+            NoopReason::NoSupport
+        });
     };
-    let Some(signal) = evaluate_callback(
-        &reference.fifteen_minutes,
-        support,
-        &core,
-        kind,
-        input.now_ms,
-    )
-    .ok()
-    .flatten() else {
-        return Plan::Noop(NoopReason::CallbackNotConfirmed);
-    };
-    let _ = signal;
     entry_at_support(input, state, support)
 }
 
@@ -602,6 +608,7 @@ fn select_support<'a>(
     consumed: &BTreeSet<String>,
     reference_price: Decimal,
     last_support_lower: Option<Decimal>,
+    mut callback_confirmed: impl FnMut(&SupportZone) -> bool,
 ) -> Option<&'a SupportZone> {
     supports
         .iter()
@@ -610,6 +617,8 @@ fn select_support<'a>(
                 && support.upper.value() < reference_price
                 && last_support_lower.is_none_or(|lower| support.upper.value() < lower)
         })
+        // A newer untouched region must not hide an older region's fresh callback.
+        .filter(|support| callback_confirmed(support))
         .max_by_key(|support| support.confirmed_at_ms)
 }
 
@@ -682,9 +691,41 @@ mod tests {
             &consumed,
             Decimal::from(90),
             Some(Decimal::from(70)),
+            |_| true,
         );
         assert_eq!(selected.map(|value| value.id.as_str()), Some("lower"));
         Ok(())
+    }
+
+    #[test]
+    fn newer_support_without_callback_does_not_hide_confirmed_support() {
+        let supports = vec![zone("rebound", 60, 62, 1), zone("untouched", 70, 72, 2)];
+        let consumed = BTreeSet::new();
+        let selected = select_support(&supports, &consumed, Decimal::from(90), None, |support| {
+            support.id == "rebound"
+        });
+        assert_eq!(selected.map(|support| support.id.as_str()), Some("rebound"));
+        let consumed = BTreeSet::from(["rebound".to_owned()]);
+        assert!(
+            select_support(
+                &supports,
+                &consumed,
+                Decimal::from(90),
+                None,
+                |support| support.id == "rebound"
+            )
+            .is_none()
+        );
+        assert!(
+            select_support(
+                &supports,
+                &BTreeSet::new(),
+                Decimal::from(90),
+                Some(Decimal::from(60)),
+                |support| support.id == "rebound"
+            )
+            .is_none()
+        );
     }
 
     fn spot_metadata(
