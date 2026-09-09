@@ -107,6 +107,7 @@ pub fn init_diagnostics() {
             tracing_subscriber::filter::Targets::new()
                 .with_default(tracing::Level::WARN)
                 .with_target("venueflow::terminal_latency", tracing::Level::INFO)
+                .with_target("venueflow::account_projection", tracing::Level::INFO)
                 .with_target("venueflow::chart_loading", tracing::Level::INFO),
         );
     let _ = tracing_subscriber::registry().with(layer).try_init();

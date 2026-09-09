@@ -89,6 +89,7 @@ pub(super) async fn receive(
                     crate::latency_evidence::projection_received(&request.scope, p);
                     if tokio::time::Instant::now() >= next_log {
                         tracing::info!(
+                            target: "venueflow::account_projection",
                             frame_bytes = payload.len(),
                             source_observed_ms = p.observed_ms,
                             received_ms = crate::account_center::now_ms(),
