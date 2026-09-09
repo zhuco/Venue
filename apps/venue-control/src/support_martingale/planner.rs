@@ -90,6 +90,10 @@ pub enum NoopReason {
     MissingReference,
     BasisTooWide,
     EnvironmentBlocked,
+    BtcDown,
+    BtcWarmup,
+    BtcNeutral,
+    CallbackNotConfirmed,
     NoSupport,
     SupportConsumed,
     BudgetExhausted,
@@ -154,6 +158,14 @@ pub fn plan(input: &PlannerInput<'_>) -> Plan {
     let Some(reference) = input.reference.symbols.get(input.symbol) else {
         return Plan::Noop(NoopReason::MissingReference);
     };
+    if reference.ticker.exchange_time_ms > input.now_ms.saturating_add(2_000)
+        || input
+            .now_ms
+            .saturating_sub(reference.ticker.exchange_time_ms)
+            > 5_000
+    {
+        return Plan::Noop(NoopReason::MissingReference);
+    }
     let reference_mid = match reference
         .ticker
         .bid_price
@@ -195,18 +207,19 @@ pub fn plan(input: &PlannerInput<'_>) -> Plan {
             Ok(value) => value,
             Err(_) => return Plan::Noop(NoopReason::MissingReference),
         };
-    if !has_position
-        && !matches!(
+    if !has_position {
+        if let Some(reason) = btc_entry_block(
+            btc_environment.environment,
+            input.instance.config.allow_btc_neutral,
+        ) {
+            return Plan::Noop(reason);
+        }
+        if !matches!(
             target_environment.environment,
             MarketEnvironment::Up | MarketEnvironment::Range
-        )
-        || !has_position
-            && !matches!(
-                btc_environment.environment,
-                MarketEnvironment::Up | MarketEnvironment::Range
-            )
-    {
-        return Plan::Noop(NoopReason::EnvironmentBlocked);
+        ) {
+            return Plan::Noop(NoopReason::EnvironmentBlocked);
+        }
     }
     if state.layer >= input.instance.config.max_entries {
         return Plan::Noop(NoopReason::BudgetExhausted);
@@ -254,10 +267,41 @@ pub fn plan(input: &PlannerInput<'_>) -> Plan {
     )
     .ok()
     .flatten() else {
-        return Plan::Noop(NoopReason::NoSupport);
+        return Plan::Noop(NoopReason::CallbackNotConfirmed);
     };
     let _ = signal;
     entry_at_support(input, state, support)
+}
+
+fn btc_entry_block(environment: MarketEnvironment, allow_neutral: bool) -> Option<NoopReason> {
+    match environment {
+        MarketEnvironment::Up | MarketEnvironment::Range => None,
+        MarketEnvironment::Neutral if allow_neutral => None,
+        MarketEnvironment::Neutral => Some(NoopReason::BtcNeutral),
+        MarketEnvironment::Down => Some(NoopReason::BtcDown),
+        MarketEnvironment::Warmup => Some(NoopReason::BtcWarmup),
+    }
+}
+
+#[test]
+fn btc_neutral_opt_in_never_allows_down_or_warmup() {
+    for allow in [false, true] {
+        assert_eq!(
+            btc_entry_block(MarketEnvironment::Down, allow),
+            Some(NoopReason::BtcDown)
+        );
+        assert_eq!(
+            btc_entry_block(MarketEnvironment::Warmup, allow),
+            Some(NoopReason::BtcWarmup)
+        );
+        assert_eq!(btc_entry_block(MarketEnvironment::Up, allow), None);
+        assert_eq!(btc_entry_block(MarketEnvironment::Range, allow), None);
+    }
+    assert_eq!(
+        btc_entry_block(MarketEnvironment::Neutral, false),
+        Some(NoopReason::BtcNeutral)
+    );
+    assert_eq!(btc_entry_block(MarketEnvironment::Neutral, true), None);
 }
 
 fn fixed_entry(input: &PlannerInput<'_>, state: &SupportMartingaleSymbolState) -> Plan {
@@ -706,6 +750,7 @@ mod tests {
             execution_venue: VenueId::Bybit,
             mode: GatewayMode::Live,
             config: venue_control_protocol::support_martingale::SupportMartingaleConfig {
+                allow_btc_neutral: false,
                 entry_mode: Default::default(),
                 symbol_parameters: Vec::new(),
                 reference_venue: VenueId::Binance,

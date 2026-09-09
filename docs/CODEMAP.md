@@ -189,3 +189,5 @@ Bitget 原生带单账户入口：`accounts/bitget_copy.rs` 与协议 `accounts:
 Web KOL 使用指南：`apps/ui/web/app/help/kol/page.tsx`，路由 `/help/kol`；后台顶部、API、带单源与邀请表单提供定位入口。
 
 Web 在唯一带单账户旁提供启用/停止开关，不单独展示机器人创建表单。首次启用以当前验证取得的正权益调用 `/v2/kol/leader-bots` 保存配置，确认成功后再调用生命周期接口；创建与启用各自保留请求编号，结果不确定只重试对应阶段。零/缺失权益提示重新验证；停止撤销程序同步挂单但不平仓。入口为 `apps/ui/web/components/customer-console.tsx` 与 `kol-source-panel.tsx`。
+
+马丁参考行情读取与闭合 K 线缓存：`apps/venue-control/src/support_martingale/reference_market.rs`；空仓等待原因：同目录 `diagnostics.rs`。可信操作员 `venue-strategy-admin martingale-config USER` 仅在停止且空仓时修改 BTC Neutral 准入；`grid-depth USER INSTANCE` 通过 `multi_venue_grid/configuration.rs` 在停止且挂单收敛后修改网格层数。

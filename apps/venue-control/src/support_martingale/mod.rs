@@ -1,4 +1,5 @@
 //! Durable control-plane state for support martingale instances.
+mod diagnostics;
 mod planner;
 pub use planner::{NoopReason, Plan, PlannerInput, TakeProfitOrder, plan, plan_take_profit_only};
 mod reference_market;

@@ -806,6 +806,7 @@ fn rolled_surface(
             .ok_or(GridResetTrigger::RollingConflict)?;
         order.quantity = anchor.grid_quantity;
     }
+    restore_close_lanes(input, &anchor, &mut surface)?;
     let desired = clip_close_orders(input, surface.into_values().collect())
         .map_err(|_| GridResetTrigger::RollingConflict)?;
     // Check only the final new placements, not signed resting orders or intermediate orders
@@ -929,6 +930,66 @@ fn infer_anchor(
         step: Price::new(step_value).map_err(|_| GridResetTrigger::RollingConflict)?,
         grid_quantity,
     })
+}
+
+// Inventory clipping removes the outer closes from the executable surface. Reconstruct those
+// targets before clipping the next snapshot, so a recovered leg can quote its configured depth.
+// Existing signed orders keep their keys, prices and remaining quantities.
+fn restore_close_lanes(
+    input: &GridPlannerInput,
+    anchor: &GridRollingAnchor,
+    surface: &mut BTreeMap<GridOrderKey, GridOrderIntent>,
+) -> Result<(), GridResetTrigger> {
+    let mut levels = next_levels(surface)?;
+    for position in input.active_positions() {
+        let closes = surface
+            .values()
+            .filter(|o| o.key.position == position && o.key.role == GridOrderRole::Close)
+            .collect::<Vec<_>>();
+        let count = closes.len();
+        let mut edge = match position {
+            GridPosition::Long => closes.iter().map(|o| o.price.value()).max(),
+            GridPosition::Short => closes.iter().map(|o| o.price.value()).min(),
+        };
+        if edge.is_none() {
+            let opens = surface
+                .values()
+                .filter(|o| o.key.position == position && o.key.role == GridOrderRole::Open);
+            // The initial surface leaves one empty step on either side of its centre.
+            edge = match position {
+                GridPosition::Long => opens
+                    .map(|o| o.price.value())
+                    .max()
+                    .and_then(|p| p.checked_add(anchor.step.value())),
+                GridPosition::Short => opens
+                    .map(|o| o.price.value())
+                    .min()
+                    .and_then(|p| p.checked_sub(anchor.step.value())),
+            };
+        }
+        let mut edge = edge.ok_or(GridResetTrigger::IncompleteOwnedSurface)?;
+        for _ in count..usize::from(input.config.grid_count) {
+            edge = match position {
+                GridPosition::Long => edge.checked_add(anchor.step.value()),
+                GridPosition::Short => edge.checked_sub(anchor.step.value()),
+            }
+            .ok_or(GridResetTrigger::RollingConflict)?;
+            let price = Price::new(edge).map_err(|_| GridResetTrigger::RollingConflict)?;
+            let level = next_level(&mut levels, position, GridOrderRole::Close)?;
+            let order = order_at_price(
+                input.config.revision,
+                position,
+                GridOrderRole::Close,
+                level,
+                price,
+                anchor.grid_quantity,
+            )?;
+            if surface.insert(order.key.clone(), order).is_some() {
+                return Err(GridResetTrigger::RollingConflict);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn complete_surface_shape(

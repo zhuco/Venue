@@ -241,6 +241,9 @@ P_tp  = ceil_to_execution_tick(P_min)
 | `venue_support_martingale_commands` | 策略命令与实例、币种、轮次、支撑及用途的关联和消费状态 |
 | `venue_support_martingale_requests` | 用户请求摘要、结果及生命周期幂等 |
 
+配置包含 `allow_btc_neutral`（默认 `false`）。通过 `venue-strategy-admin martingale-config USER` 可按
+`request_id + expected_revision` 更新已存在实例；Store 持有账户锁，并只接受 `stopped`、本地空仓且无未决命令的实例，更新不切换凭证或生命周期。
+
 独立历史轮次/决策明细及精确资金费消费属于增强需求，不能将设计中的表名当成已安装表。后续迁移使用新的未占用编号，已应用的 0037 不回写。
 
 委托身份和执行状态仍在现有 `venue_binance_commands` 账本；签名订单、成交、持仓和费用复用规范事实与可靠消费游标，确有缺口才扩展，禁止新建平行订单账本。支撑是否用过无法从当前仓位推断，必须保存 PostgreSQL；这不构成旧 WAL/checkpoint 恢复模式。
@@ -332,3 +335,5 @@ P_tp  = ceil_to_execution_tick(P_min)
 - [资金费](https://www.bybit.com/en/help-center/article/Funding-fee-calculation)与[强平说明](https://www.bybit.com/en/help-center/article/FAQ-Order-Execution-and-Liquidation)：永续长期持仓成本和保证金风险；各所用自己的规则核算。
 
 Binance已收盘参考K线的当前项目契约以 `crates/venue-gateway-binance/src/public.rs` 的 `BinancePublicKline`、`parse_public_market_rest_klines` 和规范 `PublicBar` 为准；不得在策略侧解析原生字段。其他五所原生协议链接及准入约束统一维护在 [MULTI_VENUE_EXECUTOR](MULTI_VENUE_EXECUTOR.md)。
+
+指标就绪但不满足上涨、下跌或区间确认的环境为 Neutral；Warmup 专指指标数据不足。运行时逐交易对刷新 BBO，闭合 K 线按周期缓存，不复用整实例旧报价；5 秒账户/报价与 30 秒信号窗口保持。空仓状态通过 `waiting_btc_down`、`waiting_btc_warmup`、`waiting_btc_neutral`、`waiting_symbol_environment`、`waiting_support`、`waiting_callback` 等记录等待原因，健康并不表示满足入场条件。

@@ -79,6 +79,7 @@ mod tests {
             reserved_budget: Decimal::ZERO,
             config: SupportMartingaleConfig {
                 entry_mode: MartingaleEntryMode::Support,
+                allow_btc_neutral: false,
                 symbol_parameters: vec![MartingaleSymbolParameters {
                     symbol: symbol.clone(),
                     entry_price: None,

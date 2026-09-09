@@ -100,6 +100,7 @@ impl Editor {
         };
         let config = SupportMartingaleConfig {
             entry_mode: self.entry_mode,
+            allow_btc_neutral: false,
             symbol_parameters: symbols
                 .iter()
                 .map(|symbol: &venue_domain::Symbol| {

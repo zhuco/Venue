@@ -1,9 +1,10 @@
 use crate::multi_venue_store::{MultiVenueStore, MultiVenueStoreError, StrategyEnqueueResult};
 use sqlx::{PgPool, Row};
 use venue_control_protocol::support_martingale::{
-    SupportMartingaleAction, SupportMartingaleConfig, SupportMartingaleCreateRequest,
-    SupportMartingaleHealth, SupportMartingaleInstance, SupportMartingaleLifecycle,
-    SupportMartingaleLifecycleRequest, SupportMartingaleListItem, SupportMartingaleSymbolState,
+    SupportMartingaleAction, SupportMartingaleConfig, SupportMartingaleConfigUpdateRequest,
+    SupportMartingaleCreateRequest, SupportMartingaleHealth, SupportMartingaleInstance,
+    SupportMartingaleLifecycle, SupportMartingaleLifecycleRequest, SupportMartingaleListItem,
+    SupportMartingaleSymbolState,
 };
 use venue_domain::{ExecutionCommand, OrderPurpose, Symbol};
 use venue_gateway_api::{GatewayMode, VenueId};
@@ -366,6 +367,138 @@ impl SupportMartingaleStore {
         let resulting_revision = request.expected_revision + 1;
         sqlx::query("INSERT INTO venue_support_martingale_requests(owner_user_id,request_id,instance_id,action,resulting_revision,created_ms) VALUES($1,$2,$3,$4,$5,$6)")
             .bind(owner).bind(&request.request_id).bind(&request.instance_id).bind(lifecycle_str(next)).bind(i64::try_from(resulting_revision).map_err(|_| SupportMartingaleStoreError::Invalid)?).bind(ms(now_ms)?).execute(&mut *tx).await.map_err(|_| SupportMartingaleStoreError::Conflict)?;
+        tx.commit()
+            .await
+            .map_err(|_| SupportMartingaleStoreError::Unavailable)?;
+        Ok(resulting_revision)
+    }
+
+    /// Updates only a stopped, flat instance. The account lock and request ledger make this
+    /// safe for operator retries without allowing a live runtime to observe a partial config.
+    pub async fn update_config(
+        &self,
+        owner: &str,
+        request: SupportMartingaleConfigUpdateRequest,
+        now_ms: u64,
+    ) -> Result<u64, SupportMartingaleStoreError> {
+        request
+            .validate()
+            .map_err(|_| SupportMartingaleStoreError::Invalid)?;
+        if owner.trim().is_empty() || now_ms == 0 {
+            return Err(SupportMartingaleStoreError::Invalid);
+        }
+        let record = self.get(owner, &request.instance_id).await?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| SupportMartingaleStoreError::Unavailable)?;
+        lock_account(&mut tx, &record.trading_account_id).await?;
+        if let Some(existing) = sqlx::query(
+            "SELECT resulting_revision,action FROM venue_support_martingale_requests WHERE owner_user_id=$1 AND request_id=$2 AND instance_id=$3 FOR UPDATE",
+        )
+        .bind(owner)
+        .bind(&request.request_id)
+        .bind(&request.instance_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| SupportMartingaleStoreError::Unavailable)?
+        {
+            let revision: i64 = existing
+                .try_get("resulting_revision")
+                .map_err(|_| SupportMartingaleStoreError::Unavailable)?;
+            let current: serde_json::Value = sqlx::query_scalar(
+                "SELECT config FROM venue_support_martingale_instances WHERE instance_id=$1 AND owner_user_id=$2",
+            )
+            .bind(&request.instance_id)
+            .bind(owner)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| SupportMartingaleStoreError::Unavailable)?;
+            if existing.try_get::<String, _>("action").map_err(|_| SupportMartingaleStoreError::Unavailable)? != "config_update"
+                || i64_to_u64(revision)? != request.expected_revision.checked_add(1).ok_or(SupportMartingaleStoreError::Invalid)?
+                || current != serde_json::to_value(&request.config).map_err(|_| SupportMartingaleStoreError::Invalid)? {
+                return Err(SupportMartingaleStoreError::Conflict);
+            }
+            tx.rollback()
+                .await
+                .map_err(|_| SupportMartingaleStoreError::Unavailable)?;
+            return i64_to_u64(revision);
+        }
+        let row = sqlx::query(
+            "SELECT lifecycle,revision,config FROM venue_support_martingale_instances WHERE instance_id=$1 AND owner_user_id=$2 FOR UPDATE",
+        )
+        .bind(&request.instance_id)
+        .bind(owner)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| SupportMartingaleStoreError::Conflict)?;
+        let lifecycle: String = row
+            .try_get("lifecycle")
+            .map_err(|_| SupportMartingaleStoreError::Unavailable)?;
+        let revision: i64 = row
+            .try_get("revision")
+            .map_err(|_| SupportMartingaleStoreError::Unavailable)?;
+        if lifecycle != "stopped" || i64_to_u64(revision)? != request.expected_revision {
+            return Err(SupportMartingaleStoreError::Conflict);
+        }
+        let current_config: SupportMartingaleConfig = serde_json::from_value(
+            row.try_get("config")
+                .map_err(|_| SupportMartingaleStoreError::Unavailable)?,
+        )
+        .map_err(|_| SupportMartingaleStoreError::Conflict)?;
+        let mut requested_shape = request.config.clone();
+        requested_shape.allow_btc_neutral = false;
+        let mut current_shape = current_config.clone();
+        current_shape.allow_btc_neutral = false;
+        if requested_shape != current_shape {
+            return Err(SupportMartingaleStoreError::Conflict);
+        }
+        let flat: bool = sqlx::query_scalar(
+            "SELECT NOT EXISTS(SELECT 1 FROM venue_support_martingale_symbol_states WHERE instance_id=$1 AND (quantity<>0 OR pending_command_id IS NOT NULL OR take_profit_client_id IS NOT NULL))
+             AND NOT EXISTS(SELECT 1 FROM venue_support_martingale_commands WHERE instance_id=$1 AND NOT terminal)
+             AND NOT EXISTS(SELECT 1 FROM venue_binance_commands WHERE trading_account_id=$2 AND command_state IN ('pending','sending','accepted','reconcile_required'))
+             AND NOT EXISTS(SELECT 1 FROM venue_strategy_grids WHERE trading_account_id=$2 AND lifecycle IN ('running','pausing','paused','stopping','resetting'))
+             AND NOT EXISTS(SELECT 1 FROM venue_control_strategy_scopes WHERE trading_account_id=$2)",
+        )
+        .bind(&request.instance_id)
+        .bind(&record.trading_account_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| SupportMartingaleStoreError::Unavailable)?;
+        if !flat {
+            return Err(SupportMartingaleStoreError::Conflict);
+        }
+        let config = serde_json::to_value(&request.config)
+            .map_err(|_| SupportMartingaleStoreError::Invalid)?;
+        let updated = sqlx::query(
+            "UPDATE venue_support_martingale_instances SET config=$1,revision=revision+1,updated_ms=$2 WHERE instance_id=$3 AND owner_user_id=$4 AND revision=$5 AND lifecycle='stopped'",
+        )
+        .bind(config)
+        .bind(ms(now_ms)?)
+        .bind(&request.instance_id)
+        .bind(owner)
+        .bind(revision)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| SupportMartingaleStoreError::Unavailable)?;
+        if updated.rows_affected() != 1 {
+            return Err(SupportMartingaleStoreError::Conflict);
+        }
+        let resulting_revision = request
+            .expected_revision
+            .checked_add(1)
+            .ok_or(SupportMartingaleStoreError::Invalid)?;
+        sqlx::query("INSERT INTO venue_support_martingale_requests(owner_user_id,request_id,instance_id,action,resulting_revision,created_ms) VALUES($1,$2,$3,$4,$5,$6)")
+            .bind(owner)
+            .bind(&request.request_id)
+            .bind(&request.instance_id)
+            .bind("config_update")
+            .bind(i64::try_from(resulting_revision).map_err(|_| SupportMartingaleStoreError::Invalid)?)
+            .bind(ms(now_ms)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| SupportMartingaleStoreError::Conflict)?;
         tx.commit()
             .await
             .map_err(|_| SupportMartingaleStoreError::Unavailable)?;
@@ -1055,6 +1188,8 @@ impl SupportMartingaleStore {
         };
         let next_status = if quantity.is_zero() && cooldown.is_some() {
             "cooldown"
+        } else if quantity.is_zero() && status.starts_with("waiting_") {
+            status.as_str()
         } else if quantity.is_zero() {
             "idle"
         } else if matches!(status.as_str(), "sl_ready" | "sl_failed") {

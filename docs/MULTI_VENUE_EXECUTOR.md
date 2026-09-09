@@ -83,3 +83,5 @@ venue-strategy-admin grid-lifecycle USER_ID INSTANCE_ID start|pause|resume|stop|
 本地验证使用统一构建入口、五所协议 fixture、命令幂等与恢复契约、隔离 PostgreSQL 迁移/顺序/生命周期测试；不得把生产数据库当作 QA。真实验收另逐所记录普通挂单、精确撤单、市价增减仓、SL/TP 创建与触发、PostOnly 参数及 maker 成交角色，并核对手续费与持仓差额。离线通过不代表这些真实交易验收已执行。
 
 旧网格替换与代码删除遵守 [迁移删除门](GRID_RUNTIME_REFACTOR.md#81-旧迁移代码删除门)：逐账户确认旧 writer 无在途不确定请求、旧自有订单已核清、新路径重启恢复已验证并保留回滚包后才能移除对应运行入口。未决 WAL、Unknown、checkpoint 和恢复工件始终保留；未完成真实切换前，旧 Node 只标注兼容入口，不宣称已经替换或重启。
+
+`venue-strategy-admin grid-depth USER INSTANCE` 的 stdin 为 `expected_revision` 与 `grid_count`。仅在 stopped、自有订单全部终态、账户无未决命令时增加配置 revision 并重建目标锚点，保留持仓与历史订单身份。层数仍受每侧上限及原最大网格金额约束；修改后需显式 start。重复提交相同预期 revision 和目标层数返回已应用 revision。库存裁剪过的平仓层在后续规划中重新计算，恢复量仍扣除外部平仓预留，不修改存量挂单身份、价格或剩余量。

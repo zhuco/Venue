@@ -955,6 +955,56 @@ fn adapter_price_and_quantity_boundaries_are_enforced_before_orders_escape()
 }
 
 #[test]
+fn clipped_close_lanes_recover_without_changing_signed_orders()
+-> Result<(), Box<dyn std::error::Error>> {
+    for retained in [0, 1] {
+        let mut value = initialized_input()?;
+        value.config.replenishment = None;
+        value.owned_orders.retain(|order| {
+            order.key.position != GridPosition::Long
+                || order.key.role != GridOrderRole::Close
+                || order.key.level <= retained
+        });
+        let preserved = value.owned_orders.clone();
+        let (anchor, restored) = converge(GridPlanner::plan(&value)?)?;
+        assert_eq!(restored.len(), 12);
+        for order in &preserved {
+            assert!(restored.contains(order));
+        }
+        value.rolling_anchor = Some(anchor);
+        value.owned_orders = restored.clone();
+        assert_eq!(converge(GridPlanner::plan(&value)?)?.1, restored);
+    }
+    Ok(())
+}
+
+#[test]
+fn restored_closes_still_respect_inventory_and_external_reservations()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut value = initialized_input()?;
+    value.config.replenishment = None;
+    value.inventory.long_quantity = Decimal::new(52, 3);
+    let (anchor, clipped) = converge(GridPlanner::plan(&value)?)?;
+    assert_eq!(
+        clipped
+            .iter()
+            .filter(|o| o.key.position == GridPosition::Long && o.key.role == GridOrderRole::Close)
+            .count(),
+        1
+    );
+    value.rolling_anchor = Some(anchor);
+    value.owned_orders = clipped;
+    let (_, still_clipped) = converge(GridPlanner::plan(&value)?)?;
+    assert_eq!(still_clipped.len(), 10);
+    value.inventory.long_quantity = Decimal::ONE;
+    value.other_close_reservations.long_quantity = Decimal::new(948, 3);
+    assert_eq!(converge(GridPlanner::plan(&value)?)?.1.len(), 10);
+    value.other_close_reservations.long_quantity = Decimal::ZERO;
+    assert_eq!(converge(GridPlanner::plan(&value)?)?.1.len(), 12);
+    Ok(())
+}
+
+#[test]
 fn partial_fill_keeps_signed_remaining_quantity_without_rolling()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut value = initialized_input()?;

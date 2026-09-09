@@ -1,11 +1,10 @@
 //! Support-martingale orchestration inside the shared multi-venue executor.
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
-use tokio::sync::Mutex;
 use venue_control_protocol::support_martingale::{
     SupportMartingaleHealth, SupportMartingaleInstance, SupportMartingaleLifecycle,
 };
@@ -24,7 +23,6 @@ use super::{
     plan_take_profit_only,
 };
 
-const REFERENCE_CACHE_MS: u64 = 10_000;
 const SIGNAL_SEND_AGE_MS: u64 = 30_000;
 
 #[derive(Clone)]
@@ -32,13 +30,6 @@ pub struct SupportMartingaleRuntime {
     store: SupportMartingaleStore,
     credentials: StrategyCredentialStore,
     reference: BinanceReferenceClient,
-    cache: Arc<Mutex<BTreeMap<String, CachedReference>>>,
-}
-
-#[derive(Clone)]
-struct CachedReference {
-    symbols: Vec<Symbol>,
-    snapshot: ReferenceSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,7 +119,6 @@ impl SupportMartingaleRuntime {
             store: SupportMartingaleStore::new(pool),
             credentials,
             reference,
-            cache: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -452,7 +442,7 @@ impl SupportMartingaleRuntime {
                 symbols: BTreeMap::new(),
             })
         } else {
-            self.reference_snapshot(&instance, now).await
+            self.reference_snapshot(symbol, now).await
         };
         let reference = match reference_result {
             Ok(value) => value,
@@ -497,6 +487,7 @@ impl SupportMartingaleRuntime {
             )
             .await
             .map_err(map_store)?;
+        let decision_now = now_ms()?;
         let input = PlannerInput {
             instance: &instance,
             symbol,
@@ -507,7 +498,7 @@ impl SupportMartingaleRuntime {
             last_support_lower: runtime_state.last_support_lower,
             current_take_profit: current_tp.as_ref(),
             prefer_add_after_cancel: state.status == "add_ready",
-            now_ms: now,
+            now_ms: decision_now,
         };
         let mut planned = plan(&input);
         if state.status == "add_ready" && !matches!(planned, Plan::MarketEntry { .. }) {
@@ -520,7 +511,7 @@ impl SupportMartingaleRuntime {
             resting.as_ref().filter(|_| !observed_take_profit_terminal),
             planned,
             current_tp.as_ref(),
-            now,
+            decision_now,
         )
         .await
     }
@@ -536,7 +527,11 @@ impl SupportMartingaleRuntime {
         now: u64,
     ) -> Result<(), MultiVenueStoreError> {
         match plan {
-            Plan::Noop(_) => Ok(()),
+            Plan::Noop(reason) => self
+                .store
+                .record_waiting(owner, &instance.instance_id, &state.symbol, reason, now)
+                .await
+                .map_err(map_store),
             Plan::MarketEntry {
                 symbol,
                 support_id,
@@ -838,37 +833,13 @@ impl SupportMartingaleRuntime {
 
     async fn reference_snapshot(
         &self,
-        instance: &SupportMartingaleInstance,
+        symbol: &Symbol,
         now: u64,
     ) -> Result<ReferenceSnapshot, &'static str> {
-        {
-            let cache = self.cache.lock().await;
-            if let Some(cached) = cache.get(&instance.instance_id) {
-                if cached.symbols == instance.config.symbols
-                    && now.saturating_sub(cached.snapshot.fetched_at_ms) <= REFERENCE_CACHE_MS
-                {
-                    return Ok(cached.snapshot.clone());
-                }
-            }
-        }
-        let generation = now
-            .checked_div(REFERENCE_CACHE_MS)
-            .and_then(|value| value.checked_add(1))
-            .ok_or("reference_generation")?;
-        let snapshot = self
-            .reference
-            .fetch_snapshot(&instance.config.symbols, now, generation)
+        self.reference
+            .fetch_snapshot(std::slice::from_ref(symbol), now, now)
             .await
-            .map_err(|_| "binance_reference_unavailable")?;
-        let mut cache = self.cache.lock().await;
-        cache.insert(
-            instance.instance_id.clone(),
-            CachedReference {
-                symbols: instance.config.symbols.clone(),
-                snapshot: snapshot.clone(),
-            },
-        );
-        Ok(snapshot)
+            .map_err(|_| "binance_reference_unavailable")
     }
 
     async fn account_has_unresolved(&self, account: &str) -> Result<bool, MultiVenueStoreError> {

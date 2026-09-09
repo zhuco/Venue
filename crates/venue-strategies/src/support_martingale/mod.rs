@@ -131,6 +131,7 @@ pub enum MarketEnvironment {
     Up,
     Down,
     Range,
+    Neutral,
     Warmup,
 }
 
@@ -270,14 +271,16 @@ pub fn classify_environment(
         .is_some_and(|(_, low)| close.value() >= *low);
     let down_structure_holds =
         descending_last_two(&swing_highs) && descending_last_two(&swing_lows);
-    let environment = if close.value() > ef && ef > es && ef > ago && up_structure_holds {
+    let environment = if atr_value.is_none() {
+        MarketEnvironment::Warmup
+    } else if close.value() > ef && ef > es && ef > ago && up_structure_holds {
         MarketEnvironment::Up
     } else if close.value() < ef && ef < es && ef < ago && down_structure_holds {
         MarketEnvironment::Down
     } else if atr_value.is_some_and(|value| confirmed_range(bars, ef, ago, value)) {
         MarketEnvironment::Range
     } else {
-        MarketEnvironment::Warmup
+        MarketEnvironment::Neutral
     };
     Ok(EnvironmentSignal {
         environment,
@@ -634,6 +637,36 @@ fn relative_volume(bars: &[PublicBar], index: usize) -> Result<Decimal, Strategy
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ready_unclassified_environment_is_neutral_and_short_history_is_warmup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut bars = callback_bars()?;
+        let mut config = SupportMartingaleConfig::research_default()?;
+        config.environment_period = 900_000;
+        config.environment_ema_fast = 2;
+        config.environment_ema_slow = 3;
+        for bar in &mut bars {
+            bar.open = Price::new(Decimal::from(100))?;
+            bar.close = bar.open;
+            bar.high = Price::new(Decimal::from(101))?;
+            bar.low = Price::new(Decimal::from(99))?;
+            bar.base_volume = FieldState::Known(Decimal::ONE);
+            bar.quote_volume = FieldState::Known(Decimal::from(100));
+            bar.taker_buy_base_volume = bar.base_volume.clone();
+            bar.taker_buy_quote_volume = bar.quote_volume.clone();
+        }
+        let now = bars.last().ok_or("no bar")?.close_time_ms + 1;
+        let ready = classify_environment(&bars, &config, now)?;
+        assert_eq!(ready.environment, MarketEnvironment::Neutral);
+        assert!(ready.ema_fast.is_some() && ready.ema_slow.is_some() && ready.atr.is_some());
+        config.environment_ema_slow = 60;
+        assert_eq!(
+            classify_environment(&bars, &config, now)?.environment,
+            MarketEnvironment::Warmup
+        );
+        Ok(())
+    }
 
     fn callback_bars() -> Result<Vec<PublicBar>, Box<dyn std::error::Error>> {
         let symbol = Symbol::new("BTC", "USDT")?;
