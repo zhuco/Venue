@@ -201,3 +201,5 @@ VenueFlow 延迟采集：`apps/ui/desktop/src/latency_evidence.rs` 与 `latency_
 
 桌面 K 线加载：`apps/ui/desktop/src/market_client.rs` 将 Binance 目录/报价初始化与历史加载解耦，`market_client/native/history.rs` 限制两个历史请求并行；`chart_view/loading.rs` 绘制加载动画，`market.rs` 维护仅供显示的有界周期预览。
 马丁参考行情读取与闭合 K 线缓存：`apps/venue-control/src/support_martingale/reference_market.rs`；空仓等待原因：同目录 `diagnostics.rs`。可信操作员 `venue-strategy-admin martingale-config USER` 仅在停止且空仓时修改 BTC Neutral 准入；`grid-depth USER INSTANCE` 通过 `multi_venue_grid/configuration.rs` 在停止且挂单收敛后修改网格层数。
+
+桌面单实例入口：`apps/ui/desktop/src/main.rs` 在日志和 UI 初始化前调用 `single_instance.rs`，使用固定用户目录的操作系统文件锁；重复启动直接退出，锁失败则拒绝启动，进程退出自动释放。

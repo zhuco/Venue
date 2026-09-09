@@ -3,7 +3,10 @@
 use eframe::egui;
 use venueflow::VenueFlowApp;
 
-fn main() -> eframe::Result {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(_instance) = single_instance::acquire()? else {
+        return Ok(());
+    };
     venueflow::init_diagnostics();
 
     let endpoint = venueflow::default_control_endpoint();
@@ -29,4 +32,7 @@ fn main() -> eframe::Result {
             )))
         }),
     )
+    .map_err(Into::into)
 }
+
+mod single_instance;
