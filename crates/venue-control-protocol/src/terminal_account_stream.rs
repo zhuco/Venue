@@ -1,5 +1,9 @@
-//! Connection-local account updates; retained history is bound to the preceding snapshot.
-use crate::kol::{KolProtocolError, TerminalAccountProjection};
+//! Connection-local changes bound to the preceding owner-checked account snapshot.
+use crate::kol::{
+    KolProtocolError, TerminalAccountProjection, TerminalAsset, TerminalConditionalOrder,
+    TerminalFill, TerminalOpenOrder, TerminalPosition, TerminalPositionHistoryEntry,
+    TerminalPositionMode,
+};
 use serde::{Deserialize, Serialize};
 
 pub const COMPACT_QUERY: &str = "compact=1";
@@ -15,9 +19,25 @@ pub enum TerminalAccountStreamEvent {
     Snapshot(Option<TerminalAccountProjection>),
     Update {
         base_observed_ms: u64,
-        projection: TerminalAccountProjection,
-        retain_fills: bool,
-        retain_position_history: bool,
+        credential_id: String,
+        trading_account_id: String,
+        private_generation: u64,
+        observed_ms: u64,
+        persisted_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        position_mode: Option<TerminalPositionMode>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        positions: Option<Vec<TerminalPosition>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        open_orders: Option<Vec<TerminalOpenOrder>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conditional_orders: Option<Vec<TerminalConditionalOrder>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fills: Option<Vec<TerminalFill>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        position_history: Option<Vec<TerminalPositionHistoryEntry>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assets: Option<Vec<TerminalAsset>>,
     },
 }
 
@@ -32,20 +52,20 @@ impl TerminalAccountStreamEvent {
         if !same_scope(previous, current) || current.observed_ms < previous.observed_ms {
             return Self::Snapshot(Some(current.clone()));
         }
-        let retain_fills = previous.fills == current.fills;
-        let retain_position_history = previous.position_history == current.position_history;
-        let mut projection = current.clone();
-        if retain_fills {
-            projection.fills.clear();
-        }
-        if retain_position_history {
-            projection.position_history.clear();
-        }
         Self::Update {
             base_observed_ms: previous.observed_ms,
-            projection,
-            retain_fills,
-            retain_position_history,
+            credential_id: current.credential_id.clone(),
+            trading_account_id: current.trading_account_id.clone(),
+            private_generation: current.private_generation,
+            observed_ms: current.observed_ms,
+            persisted_ms: current.persisted_ms,
+            position_mode: changed(&previous.position_mode, &current.position_mode),
+            positions: changed(&previous.positions, &current.positions),
+            open_orders: changed(&previous.open_orders, &current.open_orders),
+            conditional_orders: changed(&previous.conditional_orders, &current.conditional_orders),
+            fills: changed(&previous.fills, &current.fills),
+            position_history: changed(&previous.position_history, &current.position_history),
+            assets: changed(&previous.assets, &current.assets),
         }
     }
 
@@ -59,28 +79,53 @@ impl TerminalAccountStreamEvent {
             Self::Snapshot(projection) => projection,
             Self::Update {
                 base_observed_ms,
-                mut projection,
-                retain_fills,
-                retain_position_history,
+                credential_id,
+                trading_account_id,
+                private_generation,
+                observed_ms,
+                persisted_ms,
+                position_mode,
+                positions,
+                open_orders,
+                conditional_orders,
+                fills,
+                position_history,
+                assets,
             } => {
                 let base = previous
                     .as_ref()
                     .ok_or(KolProtocolError::TerminalProjection)?;
-                if !same_scope(base, &projection)
+                if base.credential_id != credential_id
+                    || base.trading_account_id != trading_account_id
+                    || base.private_generation != private_generation
                     || base.observed_ms != base_observed_ms
-                    || projection.observed_ms < base.observed_ms
-                    || (retain_fills && !projection.fills.is_empty())
-                    || (retain_position_history && !projection.position_history.is_empty())
+                    || observed_ms < base.observed_ms
                 {
                     return Err(KolProtocolError::TerminalProjection);
                 }
-                if retain_fills {
-                    projection.fills.clone_from(&base.fills);
+                let mut projection = base.clone();
+                projection.observed_ms = observed_ms;
+                projection.persisted_ms = persisted_ms;
+                if let Some(value) = position_mode {
+                    projection.position_mode = value;
                 }
-                if retain_position_history {
-                    projection
-                        .position_history
-                        .clone_from(&base.position_history);
+                if let Some(value) = positions {
+                    projection.positions = value;
+                }
+                if let Some(value) = open_orders {
+                    projection.open_orders = value;
+                }
+                if let Some(value) = conditional_orders {
+                    projection.conditional_orders = value;
+                }
+                if let Some(value) = fills {
+                    projection.fills = value;
+                }
+                if let Some(value) = position_history {
+                    projection.position_history = value;
+                }
+                if let Some(value) = assets {
+                    projection.assets = value;
                 }
                 Some(projection)
             }
@@ -91,6 +136,10 @@ impl TerminalAccountStreamEvent {
         *previous = next;
         Ok(())
     }
+}
+
+fn changed<T: PartialEq + Clone>(previous: &T, current: &T) -> Option<T> {
+    (previous != current).then(|| current.clone())
 }
 
 fn same_scope(a: &TerminalAccountProjection, b: &TerminalAccountProjection) -> bool {

@@ -39,7 +39,7 @@ impl AccountService {
         }
         let projection =
             crate::private_projection::BinancePrivateProjectionStore::new(self.pool.clone())
-                .load_owned(&principal.user.user_id, &request.credential_id)
+                .load_owned_current(&principal.user.user_id, &request.credential_id)
                 .await
                 .map_err(|_| error(Code::Unavailable))?
                 .ok_or(error(Code::VerificationRequired))?;
@@ -117,7 +117,7 @@ impl AccountService {
         let projection = if reducing {
             let projection =
                 crate::private_projection::BinancePrivateProjectionStore::new(self.pool.clone())
-                    .load_owned(&principal.user.user_id, &request.credential_id)
+                    .load_owned_current(&principal.user.user_id, &request.credential_id)
                     .await
                     .map_err(|_| error(Code::Unavailable))?
                     .ok_or(error(Code::VerificationRequired))?;

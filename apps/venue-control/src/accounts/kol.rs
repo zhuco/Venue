@@ -526,6 +526,17 @@ impl AccountService {
         request: TerminalProjectionRequest,
         now_ms: u64,
     ) -> Result<Option<TerminalAccountProjection>, AccountError> {
+        self.terminal_account_projection_cached(principal, request, now_ms, None)
+            .await
+    }
+
+    pub(crate) async fn terminal_account_projection_cached(
+        &self,
+        principal: &Principal,
+        request: TerminalProjectionRequest,
+        now_ms: u64,
+        cached: Option<&TerminalAccountProjection>,
+    ) -> Result<Option<TerminalAccountProjection>, AccountError> {
         request.validate().map_err(|_| error(Code::InvalidInput))?;
         let store =
             crate::private_projection::BinancePrivateProjectionStore::new(self.pool.clone());
@@ -550,7 +561,7 @@ impl AccountService {
             .await
             .map_err(projection_error)?;
         store
-            .load_owned(&principal.user.user_id, &request.credential_id)
+            .load_owned_for_display(&principal.user.user_id, &request.credential_id, cached)
             .await
             .map_err(projection_error)
     }

@@ -16,6 +16,8 @@ use venue_gateway_binance::BinancePrivateFillEvent;
 
 const PROJECTION_SUBSCRIPTION_MS: u64 = 45_000;
 const HISTORY_LIMIT: i64 = 500;
+const DISPLAY_HISTORY_LIMIT: i64 =
+    venue_control_protocol::kol::TERMINAL_DISPLAY_HISTORY_LIMIT as i64;
 const MAX_ACTIVE_PROJECTION_WORKERS: i64 = 232;
 pub const PRIVATE_STREAM_FILL_BATCH_LIMIT: usize = 5;
 pub const MIGRATION_0019: &str = include_str!("../migrations/0019_binance_account_projection.sql");
@@ -386,8 +388,8 @@ impl BinancePrivateProjectionStore {
         tx.commit()
             .await
             .map_err(|_| PrivateProjectionError::Unavailable)?;
-        projection.fills = self.load_fills(source).await?;
-        projection.position_history = self.load_position_history(source).await?;
+        projection.fills = self.load_fills(source, HISTORY_LIMIT).await?;
+        projection.position_history = self.load_position_history(source, HISTORY_LIMIT).await?;
         Ok(projection)
     }
 
@@ -548,6 +550,52 @@ impl BinancePrivateProjectionStore {
         credential_id: &str,
         require_healthy: bool,
     ) -> Result<Option<TerminalAccountProjection>, PrivateProjectionError> {
+        self.load_owned_with_history(
+            owner_user_id,
+            credential_id,
+            require_healthy,
+            HISTORY_LIMIT,
+            None,
+        )
+        .await
+    }
+
+    /// Terminal admission needs current order identities and quantities, never display history.
+    pub(crate) async fn load_owned_current(
+        &self,
+        owner: &str,
+        credential: &str,
+    ) -> Result<Option<TerminalAccountProjection>, PrivateProjectionError> {
+        self.load_owned_with_history(owner, credential, false, 0, None)
+            .await
+    }
+
+    /// Display history is bounded separately from execution/reconciliation reads.
+    /// The caller may retain history for five seconds within the same authenticated connection.
+    pub(crate) async fn load_owned_for_display(
+        &self,
+        owner_user_id: &str,
+        credential_id: &str,
+        cached: Option<&TerminalAccountProjection>,
+    ) -> Result<Option<TerminalAccountProjection>, PrivateProjectionError> {
+        self.load_owned_with_history(
+            owner_user_id,
+            credential_id,
+            false,
+            DISPLAY_HISTORY_LIMIT,
+            cached,
+        )
+        .await
+    }
+
+    async fn load_owned_with_history(
+        &self,
+        owner_user_id: &str,
+        credential_id: &str,
+        require_healthy: bool,
+        history_limit: i64,
+        cached: Option<&TerminalAccountProjection>,
+    ) -> Result<Option<TerminalAccountProjection>, PrivateProjectionError> {
         // Health and payload must come from one row version; invalidation can race two reads.
         let row: Option<(String, serde_json::Value)> = sqlx::query_as("SELECT p.trading_account_id,p.projection_json FROM venue_binance_account_projections p JOIN venue_api_credentials c ON c.credential_id=p.credential_id AND c.user_id=p.owner_user_id AND c.trading_account_id=p.trading_account_id WHERE p.credential_id=$1 AND p.owner_user_id=$2 AND c.deleted_ms IS NULL AND (NOT $3 OR COALESCE((p.projection_json->>'stream_healthy')::boolean,false))")
             .bind(credential_id).bind(owner_user_id).bind(require_healthy).fetch_optional(&self.pool).await
@@ -565,8 +613,25 @@ impl BinancePrivateProjectionStore {
             symbols: BTreeSet::new(),
             previous_fills_cursor: None,
         };
-        stored.projection.fills = self.load_fills(&source).await?;
-        stored.projection.position_history = self.load_position_history(&source).await?;
+        if history_limit == 0 {
+            stored.projection.fills.clear();
+            stored.projection.position_history.clear();
+        } else if let Some(cached) = cached.filter(|previous| {
+            previous.credential_id == stored.projection.credential_id
+                && previous.trading_account_id == stored.projection.trading_account_id
+                && previous.private_generation == stored.projection.private_generation
+                && previous.position_mode == stored.projection.position_mode
+        }) {
+            stored.projection.fills.clone_from(&cached.fills);
+            stored
+                .projection
+                .position_history
+                .clone_from(&cached.position_history);
+        } else {
+            stored.projection.fills = self.load_fills(&source, history_limit).await?;
+            stored.projection.position_history =
+                self.load_position_history(&source, history_limit).await?;
+        }
         self.apply_terminal_position_refresh(owner_user_id, &mut stored.projection)
             .await?;
         stored
@@ -579,9 +644,10 @@ impl BinancePrivateProjectionStore {
     async fn load_fills(
         &self,
         source: &ActiveProjectionSource,
+        limit: i64,
     ) -> Result<Vec<TerminalFill>, PrivateProjectionError> {
-        let values: Vec<serde_json::Value> = sqlx::query_scalar("SELECT fill_json FROM venue_binance_account_fills WHERE trading_account_id=$1 AND owner_user_id=$2 ORDER BY observed_ms DESC,native_trade_id DESC LIMIT 500")
-            .bind(&source.trading_account_id).bind(&source.owner_user_id).fetch_all(&self.pool).await
+        let values: Vec<serde_json::Value> = sqlx::query_scalar("SELECT fill_json FROM venue_binance_account_fills WHERE trading_account_id=$1 AND owner_user_id=$2 ORDER BY observed_ms DESC,native_trade_id DESC LIMIT $3")
+            .bind(&source.trading_account_id).bind(&source.owner_user_id).bind(limit).fetch_all(&self.pool).await
             .map_err(|_| PrivateProjectionError::Unavailable)?;
         values
             .into_iter()
@@ -594,9 +660,10 @@ impl BinancePrivateProjectionStore {
     async fn load_position_history(
         &self,
         source: &ActiveProjectionSource,
+        limit: i64,
     ) -> Result<Vec<TerminalPositionHistoryEntry>, PrivateProjectionError> {
-        let rows = sqlx::query("SELECT observed_ms,position_json FROM venue_binance_position_history WHERE trading_account_id=$1 AND owner_user_id=$2 ORDER BY observed_ms DESC,symbol,position_side LIMIT 500")
-            .bind(&source.trading_account_id).bind(&source.owner_user_id).fetch_all(&self.pool).await
+        let rows = sqlx::query("SELECT observed_ms,position_json FROM venue_binance_position_history WHERE trading_account_id=$1 AND owner_user_id=$2 ORDER BY observed_ms DESC,symbol,position_side LIMIT $3")
+            .bind(&source.trading_account_id).bind(&source.owner_user_id).bind(limit).fetch_all(&self.pool).await
             .map_err(|_| PrivateProjectionError::Unavailable)?;
         let mut latest_inventory = BTreeMap::new();
         let mut history = Vec::new();

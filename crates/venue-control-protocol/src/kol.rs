@@ -26,6 +26,7 @@ pub const MAX_KOL_DESCRIPTION_CHARS: usize = 2_000;
 pub const MAX_ALLOWED_SYMBOLS: usize = 32;
 pub const MAX_DEVIATION_BPS: u32 = 5_000;
 pub const TERMINAL_PROJECTION_SCHEMA_VERSION: u16 = 1;
+pub const TERMINAL_DISPLAY_HISTORY_LIMIT: usize = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

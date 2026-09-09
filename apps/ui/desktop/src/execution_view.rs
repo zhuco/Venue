@@ -81,7 +81,7 @@ impl ExecutionViewState {
         projection: Option<TerminalAccountProjection>,
         trade_dock: &mut TradeDockState,
     ) {
-        if let Some(projection) = projection {
+        if let Some(mut projection) = projection {
             if projection.validate().is_err()
                 || self.private_projection.as_ref().is_some_and(|old| {
                     old.credential_id == projection.credential_id
@@ -94,6 +94,17 @@ impl ExecutionViewState {
                     Some("Invalid or regressing private account projection".into());
                 return;
             }
+            // The history table and chart markers share the same bounded recent facts,
+            // including when an older server returns a larger snapshot.
+            projection
+                .fills
+                .sort_by_key(|fill| std::cmp::Reverse(fill.occurred_ms));
+            projection
+                .fills
+                .truncate(venue_control_protocol::kol::TERMINAL_DISPLAY_HISTORY_LIMIT);
+            projection
+                .position_history
+                .truncate(venue_control_protocol::kol::TERMINAL_DISPLAY_HISTORY_LIMIT);
             if trade_dock
                 .terminal_order_selection
                 .as_ref()
@@ -827,6 +838,52 @@ fn timestamp(ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recent_history_and_chart_markers_share_one_hundred_fills()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut model = crate::account_scope::tests::model();
+        model.select_symbol("BTC/USDC".into());
+        let mut projection = crate::account_scope::tests::projection(1);
+        for index in 1..=150 {
+            projection
+                .fills
+                .push(venue_control_protocol::kol::TerminalFill {
+                    native_trade_id: index.to_string(),
+                    native_order_id: index.to_string(),
+                    symbol: "BTC/USDC".parse()?,
+                    order_side: venue_domain::OrderSide::Buy,
+                    position_side: venue_domain::PositionSide::Long,
+                    quantity: 1.into(),
+                    price: 100.into(),
+                    maker: Some(true),
+                    occurred_ms: Some(index),
+                });
+        }
+        model
+            .execution
+            .apply_private(Some(projection), &mut model.trade_dock);
+        let facts = model
+            .execution
+            .private_projection
+            .as_ref()
+            .ok_or("projection")?;
+        assert_eq!(facts.fills.len(), 100);
+        assert_eq!(facts.fills[0].occurred_ms, Some(150));
+        assert_eq!(facts.fills[99].occurred_ms, Some(51));
+        let overlays = crate::chart_trading::collect(
+            &model,
+            "BTC/USDC",
+            &crate::chart_trading::ChartTradingSettings::default(),
+        );
+        assert_eq!(
+            overlays
+                .iter()
+                .filter(|overlay| overlay.time_ms.is_some())
+                .count(),
+            100
+        );
+        Ok(())
+    }
     #[test]
     fn history_scroll_only_builds_visible_rows() {
         let context = egui::Context::default();

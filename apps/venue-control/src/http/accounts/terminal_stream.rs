@@ -22,15 +22,26 @@ where
     fallback.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut opened = false;
     let mut previous = None;
+    let mut next_history_read = time::Instant::now();
     loop {
         if *shutdown.borrow() {
             return Ok(());
         }
         let now = now_ms().map_err(|_| ())?;
+        let refresh_history = time::Instant::now() >= next_history_read;
         let result = time::timeout(Duration::from_secs(5), async {
             let principal = accounts.authenticate(token.expose(), now).await?;
             accounts
-                .terminal_account_projection(&principal, request.clone(), now)
+                .terminal_account_projection_cached(
+                    &principal,
+                    request.clone(),
+                    now,
+                    if refresh_history {
+                        None
+                    } else {
+                        previous.as_ref()
+                    },
+                )
                 .await
         })
         .await;
@@ -63,6 +74,9 @@ where
             .await
             .map_err(|_| ())?;
         previous = projection;
+        if refresh_history {
+            next_history_read = time::Instant::now() + Duration::from_secs(5);
+        }
         let next_read = time::Instant::now() + Duration::from_millis(500);
         tokio::select! {
             _ = shutdown.changed() => return Ok(()),

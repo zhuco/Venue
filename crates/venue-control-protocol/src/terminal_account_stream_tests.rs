@@ -2,6 +2,41 @@ use super::*;
 use crate::kol::*;
 use venue_domain::{OrderSide, PositionSide};
 
+#[test]
+fn unchanged_fields_are_absent_and_changed_fields_replace_only_their_surface()
+-> Result<(), Box<dyn std::error::Error>> {
+    let original = projection()?;
+    let mut current = original.clone();
+    current.observed_ms += 10;
+    current.persisted_ms += 10;
+    let heartbeat = serde_json::to_value(TerminalAccountStreamEvent::between(
+        Some(&original),
+        Some(&current),
+    ))?;
+    for field in [
+        "positions",
+        "open_orders",
+        "conditional_orders",
+        "fills",
+        "position_history",
+        "assets",
+        "position_mode",
+    ] {
+        assert!(
+            heartbeat["payload"].get(field).is_none(),
+            "unchanged {field} was retransmitted"
+        );
+    }
+    current.positions.clear();
+    let update = TerminalAccountStreamEvent::between(Some(&original), Some(&current));
+    let encoded = serde_json::to_value(&update)?;
+    assert_eq!(encoded["payload"]["positions"], serde_json::json!([]));
+    let mut received = Some(original);
+    update.apply(&mut received)?;
+    assert_eq!(received, Some(current));
+    Ok(())
+}
+
 fn projection() -> Result<TerminalAccountProjection, Box<dyn std::error::Error>> {
     let position = TerminalPosition {
         symbol: "BTC/USDC".parse()?,
@@ -113,8 +148,8 @@ fn missing_or_wrong_baseline_never_borrows_another_accounts_history()
     }
     let mut base = Some(original.clone());
     let mut invalid = event;
-    if let TerminalAccountStreamEvent::Update { projection, .. } = &mut invalid {
-        projection.observed_ms = 1;
+    if let TerminalAccountStreamEvent::Update { observed_ms, .. } = &mut invalid {
+        *observed_ms = 1;
     }
     assert!(invalid.apply(&mut base).is_err());
     assert_eq!(base, Some(original));
