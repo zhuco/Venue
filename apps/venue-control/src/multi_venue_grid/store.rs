@@ -394,7 +394,12 @@ impl StrategyGridStore {
             .unwrap_or(record.lifecycle.as_str())
             .to_owned();
         let stable = !has_commands && record.lifecycle == "running" && next_lifecycle == "running";
+        // Only signed terminal observations let the planner finish resetting. Rebuilding
+        // the new surface must not inherit the elapsed cancellation deadline.
+        let reset_drained =
+            !has_commands && record.lifecycle == "resetting" && next_lifecycle == "running";
         let progress = if stable
+            || reset_drained
             || (has_commands && matches!(next_lifecycle.as_str(), "running" | "resetting"))
         {
             Some(
@@ -403,7 +408,9 @@ impl StrategyGridStore {
                         pending_since_ms: record.convergence_pending_since_ms,
                         consecutive_failures: record.consecutive_failures,
                     },
-                    if stable {
+                    if reset_drained {
+                        super::progress::ProgressEvent::ResetDrained
+                    } else if stable {
                         super::progress::ProgressEvent::Converged
                     } else {
                         super::progress::ProgressEvent::Pending
@@ -462,7 +469,10 @@ impl StrategyGridStore {
         let failures = progress
             .map(|value| value.progress.consecutive_failures)
             .unwrap_or(record.consecutive_failures);
-        let blocked_reason = if matches!(next_lifecycle.as_str(), "paused" | "stopped") {
+        let blocked_reason = if matches!(
+            next_lifecycle.as_str(),
+            "pausing" | "paused" | "stopping" | "stopped"
+        ) {
             record.blocked_reason.clone()
         } else {
             None

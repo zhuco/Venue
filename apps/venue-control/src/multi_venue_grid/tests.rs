@@ -471,11 +471,47 @@ async fn grid_commands_and_observations_commit_atomically_with_lifecycle_fence()
     assert_eq!(pending, 0);
     assert_eq!(store.get("user1", "grid1").await?.lifecycle, "pausing");
 
+    sqlx::query("UPDATE venue_strategy_grids SET blocked_reason='convergence_timeout' WHERE instance_id='grid1'")
+        .execute(&pool).await?;
     let pausing = store.get("user1", "grid1").await?;
+    let draining = planner::GridWork {
+        commands: vec![],
+        observations: vec![],
+        desired: vec![],
+        anchor: pausing.rolling_anchor.clone(),
+        lifecycle: None,
+        new_revision: false,
+    };
+    store.apply(&pausing, draining, 1004).await?;
+    let pausing = store.get("user1", "grid1").await?;
+    assert_eq!(
+        pausing.blocked_reason.as_deref(),
+        Some("convergence_timeout")
+    );
     let cancelled_orders = store.orders("grid1").await?;
     let paused_work = planner::plan(&pausing, &cancelled_orders, &snapshot, &market, &[], 1004)?;
     store.apply(&pausing, paused_work, 1004).await?;
     assert_eq!(store.get("user1", "grid1").await?.lifecycle, "paused");
+    assert_eq!(
+        store.get("user1", "grid1").await?.blocked_reason.as_deref(),
+        Some("convergence_timeout")
+    );
+    store.lifecycle("user1", "grid1", "reset", 1004).await?;
+    sqlx::query("UPDATE venue_strategy_grids SET convergence_pending_since_ms=1,consecutive_failures=1 WHERE instance_id='grid1'")
+        .execute(&pool).await?;
+    let resetting = store.get("user1", "grid1").await?;
+    let drained = planner::plan(&resetting, &[], &snapshot, &market, &[], 1004)?;
+    assert_eq!(drained.lifecycle.as_deref(), Some("running"));
+    assert!(drained.commands.is_empty());
+    store.apply(&resetting, drained, 1004).await?;
+    let rebuilt = store.get("user1", "grid1").await?;
+    assert_eq!(rebuilt.lifecycle, "running");
+    assert_eq!(rebuilt.convergence_pending_since_ms, None);
+    assert_eq!(rebuilt.consecutive_failures, 1);
+    store.lifecycle("user1", "grid1", "pause", 1004).await?;
+    let pausing = store.get("user1", "grid1").await?;
+    let paused_work = planner::plan(&pausing, &[], &snapshot, &market, &[], 1004)?;
+    store.apply(&pausing, paused_work, 1004).await?;
     store.lifecycle("user1", "grid1", "resume", 1005).await?;
     let resumed = store.get("user1", "grid1").await?;
     assert_eq!(resumed.convergence_pending_since_ms, None);
@@ -484,7 +520,7 @@ async fn grid_commands_and_observations_commit_atomically_with_lifecycle_fence()
     store.apply(&resumed, resumed_work, 1006).await?;
     let converging = store.get("user1", "grid1").await?;
     assert_eq!(converging.convergence_pending_since_ms, Some(1006));
-    sqlx::query("WITH failures AS (SELECT command_id FROM venue_binance_commands WHERE command_state='pending' ORDER BY command_id LIMIT 2) UPDATE venue_binance_commands c SET command_state='rejected' FROM failures f WHERE c.command_id=f.command_id")
+    sqlx::query("WITH failures AS (SELECT command_id FROM venue_binance_commands WHERE command_state='pending' ORDER BY strategy_sequence LIMIT 2) UPDATE venue_binance_commands c SET command_state='rejected' FROM failures f WHERE c.command_id=f.command_id")
         .execute(&pool).await?;
     assert_eq!(
         store.note_new_rejections(&converging, 1007).await?,
@@ -496,7 +532,7 @@ async fn grid_commands_and_observations_commit_atomically_with_lifecycle_fence()
         store.note_new_rejections(&converging, 1008).await?,
         (false, false)
     );
-    sqlx::query("UPDATE venue_binance_commands SET command_state='rejected' WHERE command_id=(SELECT command_id FROM venue_binance_commands WHERE command_state='pending' ORDER BY command_id LIMIT 1)")
+    sqlx::query("UPDATE venue_binance_commands SET command_state='rejected' WHERE command_id=(SELECT command_id FROM venue_binance_commands WHERE command_state='pending' ORDER BY strategy_sequence LIMIT 1)")
         .execute(&pool).await?;
     sqlx::query("UPDATE venue_binance_commands SET command_state='sending' WHERE command_id=(SELECT command_id FROM venue_binance_commands WHERE command_state='pending' ORDER BY command_id LIMIT 1)")
         .execute(&pool).await?;

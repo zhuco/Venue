@@ -11,6 +11,7 @@ pub(crate) enum ProgressEvent {
     Pending,
     Failures(u32),
     Converged,
+    ResetDrained,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,6 +34,16 @@ pub(crate) fn advance(
         return Some(ProgressTransition {
             progress: ConvergenceProgress::default(),
             pause: false,
+            timed_out: false,
+        });
+    }
+    if event == ProgressEvent::ResetDrained {
+        return Some(ProgressTransition {
+            progress: ConvergenceProgress {
+                pending_since_ms: None,
+                consecutive_failures: current.consecutive_failures,
+            },
+            pause: current.consecutive_failures >= policy.failure_threshold,
             timed_out: false,
         });
     }
@@ -121,6 +132,40 @@ mod tests {
                 1
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn confirmed_reset_drain_starts_a_new_deadline_without_erasing_failures() {
+        let old = ConvergenceProgress {
+            pending_since_ms: Some(1_000),
+            consecutive_failures: 1,
+        };
+        let drained = advance(old, ProgressEvent::ResetDrained, &policy(), 31_500).expect("valid");
+        assert_eq!(drained.progress.pending_since_ms, None);
+        assert_eq!(drained.progress.consecutive_failures, 1);
+        assert!(!drained.pause);
+        let next =
+            advance(drained.progress, ProgressEvent::Pending, &policy(), 31_501).expect("valid");
+        assert_eq!(next.progress.pending_since_ms, Some(31_501));
+        assert!(!next.pause);
+        assert!(
+            advance(next.progress, ProgressEvent::Pending, &policy(), 61_501)
+                .expect("valid")
+                .pause
+        );
+        assert!(
+            advance(
+                ConvergenceProgress {
+                    consecutive_failures: 3,
+                    ..old
+                },
+                ProgressEvent::ResetDrained,
+                &policy(),
+                31_500
+            )
+            .expect("valid")
+            .pause
         );
     }
 }
