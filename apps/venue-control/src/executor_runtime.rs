@@ -396,10 +396,29 @@ fn account_recovery_groups(
 async fn recover_account_groups(
     store: &PgExecutorStore,
 ) -> Result<BTreeMap<String, Option<Vec<RecoverableBinanceCommand>>>, BinanceCommandLedgerError> {
-    let mut groups = account_recovery_groups(store.recover_nonterminal().await?);
+    let commands = store.recover_nonterminal().await?;
+    let cancel_accounts: std::collections::BTreeSet<_> = commands
+        .iter()
+        .filter(|command| {
+            command.state == ExecutorCommandState::Pending && terminal_cancel(command)
+        })
+        .map(|command| command.trading_account_id.clone())
+        .collect();
+    let mut groups = account_recovery_groups(commands);
     for account in store.dirty_copy_accounts().await? {
         groups.entry(account).or_insert(None);
     }
+    let now = now_ms()?;
+    // Reuse discovery's pending rows rather than polling each fenced account's claim SQL
+    // throughout its backoff. A newly queued cancellation still wakes it immediately.
+    groups.retain(|account, unresolved| {
+        unresolved.as_ref().is_none_or(|commands| {
+            cancel_accounts.contains(account)
+                || commands
+                    .iter()
+                    .any(|command| command.reconciliation_due(now).unwrap_or(true))
+        })
+    });
     Ok(groups)
 }
 
