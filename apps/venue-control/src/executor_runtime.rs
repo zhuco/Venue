@@ -218,6 +218,8 @@ where
                     }
                     if any_due {
                         scheduler.enqueue(account, ScheduledCommand::Reconcile(commands))?;
+                    } else {
+                        scheduler.enqueue(account, ScheduledCommand::Claim)?;
                     }
                     // The durable row still fences this account. Its signed readback is simply
                     // not due during this discovery tick.
@@ -340,6 +342,11 @@ where
     }
 }
 
+fn terminal_cancel(command: &RecoverableBinanceCommand) -> bool {
+    command.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Terminal
+        && matches!(command.order, ClaimedBinanceOrder::CancelExact { .. })
+}
+
 /// Selects one account turn while retaining every unresolved sibling of the oldest Grid batch.
 /// A batch claim commits all selected rows as `Sending` before the first transport call, so a
 /// crash even before zero sends is intentionally fail-closed: absence is not proof of non-dispatch
@@ -371,13 +378,13 @@ fn account_recovery_groups(
                     .into_iter()
                     .filter(|command| {
                         command.state != ExecutorCommandState::Pending
-                            && command.grid_batch_id.as_deref() == Some(batch_id)
+                            && (command.grid_batch_id.as_deref() == Some(batch_id)
+                                || terminal_cancel(command))
                     })
                     .collect::<Vec<_>>(),
                 None => commands
                     .into_iter()
-                    .find(|command| command.state != ExecutorCommandState::Pending)
-                    .into_iter()
+                    .filter(|command| command.state != ExecutorCommandState::Pending)
                     .collect(),
             };
             selected.sort_by_key(|command| command.dispatch_sequence.unwrap_or(0));
@@ -441,7 +448,10 @@ where
                 submit_claimed(&store, &mut exchange, secrets.as_ref(), command).await?
             }
             ScheduledCommand::Reconcile(commands) => {
-                reconcile_group(&store, &mut exchange, secrets.as_ref(), &commands).await?
+                reconcile_group(&store, &mut exchange, secrets.as_ref(), &commands).await?;
+                // SQL still fences placements. This turn may only claim an eligible exact
+                // cancellation if any original command remains uncertain.
+                AccountDrainDecision::Continue
             }
             ScheduledCommand::Claim => return Err(BinanceCommandLedgerError::Conflict),
         };

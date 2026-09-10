@@ -62,6 +62,7 @@ Bybit 桌面实时行情：`apps/ui/desktop/src/market_client/native/multi/bybit
 |---|---|
 | 有界持续发现、账户串行和失败隔离 | `apps/venue-control/src/executor_runtime/dispatch.rs` |
 | 命令账本、领取、签名结算和耐久退避 | `apps/venue-control/src/executor_store/`、`executor_runtime/`、`executor_exchange/` |
+| 限价单与撤单精确签名对账，不依赖成交历史 | `apps/venue-control/src/executor_exchange/exact_readback.rs`、`mirror.rs`；账户撤单串行例外位于 `kol_executor.rs`、`executor_runtime.rs` |
 | 停止带单时的有限历史查无核对 | `apps/venue-control/src/executor_store/mirror_drain.rs`、`apps/venue-control/src/executor_exchange/drain.rs`、`crates/venue-gateway-binance/src/account_gateway_absence.rs`；迁移 0042；只结束已确认无订单和敞口的停止目标 |
 | 认证投影、私流成交与 REST 去重 | `apps/venue-control/src/private_projection.rs`、`private_projection/` |
 | 非 Binance 桌面签名账户投影 | `apps/venue-control/src/accounts/strategy_projection.rs`，复用 `StrategyCredentialStore` 与独立策略 Gateway |

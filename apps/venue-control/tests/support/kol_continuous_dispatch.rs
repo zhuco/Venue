@@ -28,6 +28,124 @@ impl ExecutorCredentials for FixtureCredentials {
     }
 }
 
+#[tokio::test]
+async fn unknown_placement_allows_only_serial_exact_cancel_and_cancel_recovery()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(url) = integration_database_url()? else {
+        return Ok(());
+    };
+    let fixture = Fixture::create(&url).await?;
+    fixture.migrate_twice().await?;
+    let (user, account, credential) = (id(681), id(682), id(683));
+    let (unknown, placement, cancel) = (id(684), id(685), id(686));
+    seed_verified_account(&fixture.pool, &user, &account, &credential, 68).await?;
+    for command in [&unknown, &placement, &cancel] {
+        insert_terminal_command(
+            &fixture.pool,
+            command,
+            command,
+            &user,
+            &account,
+            &credential,
+            "pending",
+        )
+        .await?;
+    }
+    sqlx::query("UPDATE venue_api_credentials SET verification_json='{\"verification\":\"verified\"}'::jsonb").execute(&fixture.pool).await?;
+    sqlx::query("UPDATE venue_binance_commands SET command_state='reconcile_required',sending_ms=2,next_reconcile_ms=9223372036854775807 WHERE command_id=$1")
+        .bind(&unknown).execute(&fixture.pool).await?;
+    sqlx::query("UPDATE venue_binance_commands SET command_phase='cancel',order_kind='cancel_exact',position_side=NULL,order_side=NULL,requested_quantity=NULL,limit_price=NULL,selected_native_order_id='123' WHERE command_id=$1")
+        .bind(&cancel).execute(&fixture.pool).await?;
+    sqlx::query("UPDATE venue_binance_commands SET command_state='sending' WHERE command_id=$1")
+        .bind(&unknown)
+        .execute(&fixture.pool)
+        .await?;
+    let store = PgExecutorStore::new(fixture.pool.clone());
+    assert!(store.claim_next_command(&account, 10).await?.is_none());
+    assert!(
+        store
+            .claim_next_command_batch(&account, 10)
+            .await?
+            .is_none()
+    );
+    sqlx::query("UPDATE venue_binance_commands SET command_state='reconcile_required',next_reconcile_ms=9223372036854775807 WHERE command_id=$1")
+        .bind(&unknown).execute(&fixture.pool).await?;
+    sqlx::query("INSERT INTO venue_terminal_replacements(command_id,cancel_command_id,original_quantity) VALUES($1,$2,'0.001')")
+        .bind(&placement).bind(&cancel).execute(&fixture.pool).await?;
+    assert!(
+        store
+            .claim_next_command_batch(&account, 10)
+            .await?
+            .is_none()
+    );
+    sqlx::query("DELETE FROM venue_terminal_replacements WHERE command_id=$1")
+        .bind(&placement)
+        .execute(&fixture.pool)
+        .await?;
+    sqlx::query("UPDATE venue_binance_commands SET next_reconcile_ms=9223372036854775807 WHERE command_id=$1")
+        .bind(&unknown).execute(&fixture.pool).await?;
+    let mut exchange = MockBinanceExecution::default();
+    exchange.set_readback(cancel.clone(), ExecutionReadback::Unknown);
+    let mut runtime = BinanceExecutorRuntime::new(
+        PgExecutorStore::new(fixture.pool.clone()),
+        exchange,
+        FixtureCredentials,
+    );
+    assert_eq!(runtime.recover_once().await?, 1);
+    assert_eq!(command_state(&fixture.pool, &placement).await?, "pending");
+    assert_eq!(
+        command_state(&fixture.pool, &unknown).await?,
+        "reconcile_required"
+    );
+    assert_eq!(
+        command_state(&fixture.pool, &cancel).await?,
+        "reconcile_required"
+    );
+    let duplicate = id(687);
+    insert_terminal_command(
+        &fixture.pool,
+        &duplicate,
+        &duplicate,
+        &user,
+        &account,
+        &credential,
+        "pending",
+    )
+    .await?;
+    sqlx::query("UPDATE venue_binance_commands SET command_phase='cancel',order_kind='cancel_exact',position_side=NULL,order_side=NULL,requested_quantity=NULL,selected_native_order_id='123' WHERE command_id=$1")
+        .bind(&duplicate).execute(&fixture.pool).await?;
+    assert!(
+        store
+            .claim_next_command_batch(&account, 10)
+            .await?
+            .is_none()
+    );
+    store
+        .transition_command(&duplicate, ExecutorCommandState::Cancelled, 10, None)
+        .await?;
+    // The original unknown is not due. A later cancel still gets its own exact recovery turn.
+    sqlx::query("UPDATE venue_binance_commands SET next_reconcile_ms=1 WHERE command_id=$1")
+        .bind(&cancel)
+        .execute(&fixture.pool)
+        .await?;
+    let mut exchange = MockBinanceExecution::default();
+    exchange.set_readback(cancel.clone(), ExecutionReadback::Reconciled);
+    let mut restarted = BinanceExecutorRuntime::new(
+        PgExecutorStore::new(fixture.pool.clone()),
+        exchange,
+        FixtureCredentials,
+    );
+    assert_eq!(restarted.recover_once().await?, 1);
+    assert_eq!(command_state(&fixture.pool, &cancel).await?, "reconciled");
+    assert_eq!(command_state(&fixture.pool, &placement).await?, "pending");
+    assert_eq!(
+        command_state(&fixture.pool, &unknown).await?,
+        "reconcile_required"
+    );
+    fixture.cleanup().await?;
+    Ok(())
+}
+
 #[derive(Clone)]
 struct IsolatedExchange {
     slow_account: String,

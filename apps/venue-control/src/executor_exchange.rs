@@ -39,6 +39,7 @@ mod catalogue;
 mod copy_risk;
 mod drain;
 pub use drain::LimitAbsenceFuture;
+mod exact_readback;
 mod market;
 mod mirror;
 use mirror::{mirror_order_outcome, signed_limit_outcome, tracks_exact_order_fact};
@@ -212,7 +213,6 @@ pub struct BinanceHttpExecution {
     transport: BinanceHttpTransport,
     catalogue: SharedCatalogue,
     prices: SharedMarketPrices,
-    fills_cursor: Option<RecentFillsCursor>,
     next_attempt_id: u64,
     prepared_market: Option<PreparedMarket>,
 }
@@ -406,7 +406,6 @@ impl BinanceHttpExecution {
             transport,
             catalogue,
             prices,
-            fills_cursor: None,
             next_attempt_id: 1,
             prepared_market: None,
         }
@@ -466,15 +465,7 @@ impl BinanceHttpExecution {
             now,
         )
         .map_err(|_| BinanceExecutionError::Invalid)?;
-        let initial_cursor = self.fills_cursor.unwrap_or(RecentFillsCursor {
-            // Execution preflight needs a complete current account/order surface, not historical
-            // fill recovery. Starting immediately before this signed snapshot keeps the one-page
-            // read complete even for active accounts; durable fill recovery belongs to the
-            // central authenticated projection.
-            observed_through_ms: now.saturating_sub(1),
-            last_trade_id: None,
-            last_event_time_ms: None,
-        });
+        let initial_cursor = exact_readback::execution_fills_cursor(request, now);
         let fills = build_fills_request(
             &scope,
             1,
@@ -561,7 +552,6 @@ impl BinanceHttpExecution {
             tracing::warn!(%error, "Binance execution snapshot validation failed");
             BinanceExecutionError::Unavailable
         })?;
-        self.fills_cursor = Some(candidate.fills_cursor());
         Ok((candidate, rules, risk))
     }
 
@@ -1051,21 +1041,22 @@ impl BinanceHttpExecution {
         selected_client_order_id: Option<&str>,
         credentials: BinanceCredentials,
     ) -> Result<ExecutionOutcome, BinanceExecutionError> {
-        let snapshot = self.snapshot(request, &credentials).await?;
         if tracks_exact_order_fact(request.origin)
             || (request.origin == venue_control_protocol::kol::ExecutorCommandOrigin::Terminal
                 && selected_client_order_id.is_some())
         {
+            let (scope, _) = self.exact_read_scope(request).await?;
             return self
                 .read_mirror_cancel_fact(
                     request,
                     selected_native_order_id,
                     selected_client_order_id,
                     &credentials,
-                    snapshot.scope(),
+                    &scope,
                 )
                 .await;
         }
+        let snapshot = self.snapshot(request, &credentials).await?;
         if let Some((native_order_id, _)) = cancel_target(
             &snapshot,
             selected_native_order_id,
@@ -1094,12 +1085,8 @@ impl BinanceHttpExecution {
         ) {
             return self.readback_algo_request(request, credentials).await;
         }
-        if let Some(baseline) = request.market_baseline.as_ref() {
-            self.fills_cursor = Some(RecentFillsCursor {
-                observed_through_ms: baseline.observed_ms.saturating_sub(1),
-                last_trade_id: None,
-                last_event_time_ms: None,
-            });
+        if matches!(request.order_kind, ExecutionOrderKind::Limit { .. }) {
+            return self.readback_limit_exact(request, &credentials).await;
         }
         if let ExecutionOrderKind::CancelExact {
             native_order_id,

@@ -51,7 +51,7 @@ where
                             });
                             match due {
                                 Ok(true) => ScheduledCommand::Reconcile(commands),
-                                Ok(false) => continue,
+                                Ok(false) => ScheduledCommand::Claim,
                                 Err(_) => {
                                     failed_until.insert(account, now.saturating_add(8_000));
                                     tracing::warn!(

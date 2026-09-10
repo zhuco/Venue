@@ -349,7 +349,7 @@ impl BinanceCommandLedger {
     }
 
     /// Claims the oldest eligible command for exactly one account. A Sending or
-    /// ReconcileRequired command fences all later commands for that account.
+    /// ReconcileRequired command fences placements; standalone exact cancels retain serial admission.
     pub async fn claim_next(
         &self,
         trading_account_id: &str,
@@ -380,7 +380,12 @@ impl BinanceCommandLedger {
                  AND legacy.trading_account_id=c.trading_account_id) \
              AND NOT EXISTS (SELECT 1 FROM venue_binance_commands blocked \
                   WHERE blocked.trading_account_id=c.trading_account_id \
-                  AND blocked.command_state IN ('sending','accepted','reconcile_required')) \
+                  AND blocked.command_state IN ('sending','accepted','reconcile_required') \
+                 AND (blocked.command_state='sending' OR c.command_origin<>'terminal' \
+                      OR c.order_kind<>'cancel_exact' OR c.command_phase<>'cancel' \
+                      OR c.selected_native_order_id IS NULL \
+                      OR EXISTS(SELECT 1 FROM venue_terminal_replacements replacement WHERE replacement.cancel_command_id=c.command_id) \
+                      OR (blocked.command_phase='cancel' AND blocked.symbol=c.symbol AND blocked.selected_native_order_id=c.selected_native_order_id))) \
              AND (c.command_origin<>'grid' OR (c.command_phase='cancel' AND EXISTS (\
                    SELECT 1 FROM venue_binance_grid_instances lifecycle \
                    WHERE lifecycle.instance_id=c.grid_instance_id AND lifecycle.instance_state IN (\
@@ -445,7 +450,12 @@ impl BinanceCommandLedger {
                  AND legacy.trading_account_id=c.trading_account_id) \
              AND NOT EXISTS (SELECT 1 FROM venue_binance_commands blocked \
                  WHERE blocked.trading_account_id=c.trading_account_id \
-                 AND blocked.command_state IN ('sending','accepted','reconcile_required')) \
+                 AND blocked.command_state IN ('sending','accepted','reconcile_required') \
+                 AND (blocked.command_state='sending' OR c.command_origin<>'terminal' \
+                      OR c.order_kind<>'cancel_exact' OR c.command_phase<>'cancel' \
+                      OR c.selected_native_order_id IS NULL \
+                      OR EXISTS(SELECT 1 FROM venue_terminal_replacements replacement WHERE replacement.cancel_command_id=c.command_id) \
+                      OR (blocked.command_phase='cancel' AND blocked.symbol=c.symbol AND blocked.selected_native_order_id=c.selected_native_order_id))) \
              AND (c.command_origin<>'grid' OR (c.command_phase='cancel' AND EXISTS (\
                  SELECT 1 FROM venue_binance_grid_instances lifecycle \
                  WHERE lifecycle.instance_id=c.grid_instance_id AND lifecycle.instance_state IN (\
