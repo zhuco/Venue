@@ -291,7 +291,8 @@ async fn ensure_resolvable_owners(
           AND c.trading_account_id=o.trading_account_id \
           AND c.client_order_id=o.client_order_id AND c.symbol=o.symbol \
          WHERE o.instance_id=$1 AND c.command_state='reconciled' \
-          AND COALESCE(o.native_order_id,c.native_order_id,c.selected_native_order_id) IS NULL)",
+          AND o.native_order_id IS NULL AND c.native_order_id IS NULL \
+          AND c.selected_native_order_id IS NULL)",
     )
     .bind(instance_id)
     .fetch_one(&mut *tx)

@@ -273,6 +273,15 @@ impl StrategyGridStore {
             .await?;
         }
         tx.commit().await.map_err(|_| Error::Unavailable)?;
+        tracing::warn!(
+            instance_id = %record.instance_id,
+            reason,
+            consecutive_failures = transition.progress.consecutive_failures,
+            pending_since_ms = transition.progress.pending_since_ms,
+            timed_out = transition.timed_out,
+            paused = transition.pause,
+            "Strategy grid convergence failure recorded"
+        );
         Ok(transition.pause)
     }
 
