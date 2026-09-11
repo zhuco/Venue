@@ -93,7 +93,56 @@ pub(super) async fn verify(
             break;
         }
     }
-    assert_eq!(received, Some(current));
+    assert_eq!(received, Some(current.clone()));
+    // A committed partial/final fill must update the order and history together,
+    // without waiting for the five-second display-history TTL.
+    for (trade, filled) in [("partial", 1), ("final", 2)] {
+        current.observed_ms += 1;
+        current.persisted_ms += 1;
+        let order = &expected.open_orders[0];
+        let fill = serde_json::json!({
+            "native_order_id": order.native_order_id, "native_trade_id": trade,
+            "symbol": order.symbol, "order_side": order.order_side,
+            "position_side": order.position_side, "quantity":"0.0005", "price":"50000"
+        });
+        current
+            .fills
+            .insert(0, serde_json::from_value(fill.clone())?);
+        if filled == 1 {
+            current.open_orders[0].filled_quantity = Some(rust_decimal::Decimal::new(5, 4));
+        } else {
+            current.open_orders.clear();
+        }
+        let mut tx = fixture.pool.begin().await?;
+        sqlx::query("INSERT INTO venue_binance_account_fills (trading_account_id,owner_user_id,native_trade_id,symbol,observed_ms,fill_json) VALUES ($1,$2,$3,$4,$5,$6)")
+            .bind(&current.trading_account_id).bind(&alice.user.user_id).bind(trade)
+            .bind(order.symbol.to_string()).bind(i64::try_from(current.observed_ms)?).bind(fill)
+            .execute(&mut *tx).await?;
+        sqlx::query("UPDATE venue_binance_account_projections SET projection_json=$1 WHERE credential_id=$2")
+            .bind(serde_json::json!({"fills_cursor":"fixture-cursor","stream_healthy":true,"projection":current}))
+            .bind(&request.credential_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        time::timeout(Duration::from_millis(450), async {
+            loop {
+                let next: TerminalAccountStreamEvent =
+                    serde_json::from_str(&frame(&mut response, &mut buffer).await?)?;
+                next.apply(&mut received)?;
+                if received
+                    .as_ref()
+                    .is_some_and(|p| p.observed_ms == current.observed_ms)
+                {
+                    assert_eq!(received.as_ref(), Some(&current));
+                    return Ok::<_, Box<dyn std::error::Error>>(());
+                }
+            }
+        })
+        .await??;
+    }
+    sqlx::query("DELETE FROM venue_binance_account_fills WHERE trading_account_id=$1 AND native_trade_id IN ('partial','final')")
+        .bind(&current.trading_account_id).execute(&fixture.pool).await?;
+    sqlx::query("UPDATE venue_binance_account_projections SET projection_json=$1 WHERE credential_id=$2")
+        .bind(serde_json::json!({"fills_cursor":"fixture-cursor","stream_healthy":true,"projection":expected}))
+        .bind(&request.credential_id).execute(&fixture.pool).await?;
     drop(response);
     verify_history_budget(fixture, server, alice, bob, request, expected).await?;
     Ok(())

@@ -571,7 +571,7 @@ impl BinancePrivateProjectionStore {
     }
 
     /// Display history is bounded separately from execution/reconciliation reads.
-    /// The caller may retain history for five seconds within the same authenticated connection.
+    /// Retain history only while account facts are unchanged, bounded by the connection TTL.
     pub(crate) async fn load_owned_for_display(
         &self,
         owner_user_id: &str,
@@ -621,6 +621,9 @@ impl BinancePrivateProjectionStore {
                 && previous.trading_account_id == stored.projection.trading_account_id
                 && previous.private_generation == stored.projection.private_generation
                 && previous.position_mode == stored.projection.position_mode
+                && previous.positions == stored.projection.positions
+                && previous.open_orders == stored.projection.open_orders
+                && previous.conditional_orders == stored.projection.conditional_orders
         }) {
             stored.projection.fills.clone_from(&cached.fills);
             stored

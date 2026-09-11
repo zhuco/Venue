@@ -211,3 +211,5 @@ VenueFlow 延迟采集：`apps/ui/desktop/src/latency_evidence.rs` 与 `latency_
 
 网格可中断冷路径的 BEGIN 握手：`apps/venue-control/src/grid_store/transaction.rs` 只让事务建立完成；若调用方已取消，返回的事务自动回滚，不在后台执行规划或命令提交。数据库专项门验证取消握手后连接复用不会继承未结束事务。
 `apps/venue-control/src/grid_runtime/surface_recovery.rs` 管理订单面缺口的新签名基线确认与限速重试，确认后复用原 Reset。
+
+终端成交重绘：`accounts/kol.rs::terminal_account_projection_update` 区分数据库投影与签名网络读取；`http/accounts/terminal_stream.rs` 对前者以 33ms 合并通知，后者保留 500ms 节奏。`private_projection.rs` 在订单或持仓变化时使历史缓存失效，当前订单与成交历史同帧增量交付；`http/account_tests/terminal_stream.rs` 验证部分成交和全部成交的推送。

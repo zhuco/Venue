@@ -32,7 +32,7 @@ where
         let result = time::timeout(Duration::from_secs(5), async {
             let principal = accounts.authenticate(token.expose(), now).await?;
             accounts
-                .terminal_account_projection_cached(
+                .terminal_account_projection_update(
                     &principal,
                     request.clone(),
                     now,
@@ -45,7 +45,7 @@ where
                 .await
         })
         .await;
-        let projection = match result {
+        let (projection, persisted_projection) = match result {
             Ok(Ok(value)) => value,
             Ok(Err(error)) if !opened => return account_error(stream, error.code).await,
             Err(_) if !opened => return account_error(stream, AccountErrorCode::Unavailable).await,
@@ -77,7 +77,7 @@ where
         if refresh_history {
             next_history_read = time::Instant::now() + Duration::from_secs(5);
         }
-        let next_read = time::Instant::now() + Duration::from_millis(500);
+        let next_read = time::Instant::now() + coalesce_interval(persisted_projection);
         tokio::select! {
             _ = shutdown.changed() => return Ok(()),
             _ = fallback.tick() => {},
@@ -89,5 +89,21 @@ where
             _ = shutdown.changed() => return Ok(()),
             _ = time::sleep_until(next_read) => {},
         }
+    }
+}
+
+fn coalesce_interval(persisted_projection: bool) -> Duration {
+    // Other venues may perform signed network reads; their cadence must not accelerate.
+    Duration::from_millis(if persisted_projection { 33 } else { 500 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fast_wake_is_limited_to_persisted_account_facts() {
+        assert_eq!(coalesce_interval(true), Duration::from_millis(33));
+        assert_eq!(coalesce_interval(false), Duration::from_millis(500));
     }
 }

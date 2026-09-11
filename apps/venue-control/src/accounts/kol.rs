@@ -537,6 +537,19 @@ impl AccountService {
         now_ms: u64,
         cached: Option<&TerminalAccountProjection>,
     ) -> Result<Option<TerminalAccountProjection>, AccountError> {
+        self.terminal_account_projection_update(principal, request, now_ms, cached)
+            .await
+            .map(|(projection, _)| projection)
+    }
+
+    /// Only persisted projections can be read faster without increasing exchange traffic.
+    pub(crate) async fn terminal_account_projection_update(
+        &self,
+        principal: &Principal,
+        request: TerminalProjectionRequest,
+        now_ms: u64,
+        cached: Option<&TerminalAccountProjection>,
+    ) -> Result<(Option<TerminalAccountProjection>, bool), AccountError> {
         request.validate().map_err(|_| error(Code::InvalidInput))?;
         let store =
             crate::private_projection::BinancePrivateProjectionStore::new(self.pool.clone());
@@ -549,7 +562,7 @@ impl AccountService {
             return self
                 .strategy_terminal_projection(principal, &credential, &request)
                 .await
-                .map(Some);
+                .map(|projection| (Some(projection), false));
         }
         store
             .subscribe(
@@ -563,6 +576,7 @@ impl AccountService {
         store
             .load_owned_for_display(&principal.user.user_id, &request.credential_id, cached)
             .await
+            .map(|projection| (projection, true))
             .map_err(projection_error)
     }
 }
