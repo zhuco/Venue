@@ -520,6 +520,18 @@ async fn grid_commands_and_observations_commit_atomically_with_lifecycle_fence()
     store.apply(&resumed, resumed_work, 1006).await?;
     let converging = store.get("user1", "grid1").await?;
     assert_eq!(converging.convergence_pending_since_ms, Some(1006));
+    sqlx::query("UPDATE venue_binance_commands SET command_state='rejected',sanitized_error_code='strategy_grid_plan_changed' WHERE command_id=(SELECT command_id FROM venue_binance_commands WHERE command_state='pending' ORDER BY strategy_sequence LIMIT 1)")
+        .execute(&pool).await?;
+    for now in [1006, 1007, 1008] {
+        assert_eq!(
+            store.note_new_rejections(&converging, now).await?,
+            (false, false)
+        );
+    }
+    let unchanged = store.get("user1", "grid1").await?;
+    assert_eq!(unchanged.consecutive_failures, 0);
+    assert_eq!(unchanged.convergence_pending_since_ms, Some(1006));
+    assert_eq!(unchanged.lifecycle, "running");
     sqlx::query("WITH failures AS (SELECT command_id FROM venue_binance_commands WHERE command_state='pending' ORDER BY strategy_sequence LIMIT 2) UPDATE venue_binance_commands c SET command_state='rejected' FROM failures f WHERE c.command_id=f.command_id")
         .execute(&pool).await?;
     assert_eq!(

@@ -210,3 +210,4 @@ VenueFlow 延迟采集：`apps/ui/desktop/src/latency_evidence.rs` 与 `latency_
 执行器做市投影提取：`apps/venue-control/src/executor_store.rs` 使用同一事实摘要并保留原决策时钟；`executor_store/inventory_mm_tests.rs` 对真实 PostgreSQL 验证心跳推进和事实变化的发送边界。
 
 网格可中断冷路径的 BEGIN 握手：`apps/venue-control/src/grid_store/transaction.rs` 只让事务建立完成；若调用方已取消，返回的事务自动回滚，不在后台执行规划或命令提交。数据库专项门验证取消握手后连接复用不会继承未结束事务。
+`apps/venue-control/src/grid_runtime/surface_recovery.rs` 管理订单面缺口的新签名基线确认与限速重试，确认后复用原 Reset。
