@@ -119,19 +119,8 @@ impl StrategyGridRuntime {
             match super::planner::plan(&record, &orders, &snapshot, &market, &observations, now) {
                 Ok(work) => {
                     let enqueues_commands = !work.commands.is_empty();
-                    if !counted_failure && work.lifecycle.as_deref() == Some("resetting") {
-                        let paused = self
-                            .store
-                            .note_failure(&record, "planner_reset_required", now)
-                            .await?;
-                        if paused {
-                            continue;
-                        }
-                        record = self
-                            .store
-                            .get(&record.owner_user_id, &record.instance_id)
-                            .await?;
-                    }
+                    // A reset is normal convergence: pply persists its pending work and
+                    // only the actual outstanding commands may consume the timeout budget.
                     self.store.apply(&record, work, now).await?;
                     if enqueues_commands {
                         return Ok(());
