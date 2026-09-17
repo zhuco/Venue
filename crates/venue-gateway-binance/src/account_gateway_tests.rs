@@ -768,3 +768,26 @@ fn signed_snapshot_fills_cursor_keeps_symbol_watermarks_and_rejects_sha_legacy()
         .is_err()
     );
 }
+
+#[test]
+fn from_id_replay_keeps_unseen_fills_before_the_previous_observation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut cursor = RecentFillsCursor {
+        observed_through_ms: 20,
+        last_trade_id: Some(7),
+        last_event_time_ms: Some(11),
+    };
+    let late = json_rows_snapshot(br#"[{"id":"8","time":"12"},{"id":"9","time":"13"}]"#)?;
+    advance_snapshot_fill_cursor(&mut cursor, &late, 20)?;
+    assert_eq!(cursor.last_trade_id, Some(9));
+    assert_eq!(cursor.last_event_time_ms, Some(13));
+    let backwards = json_rows_snapshot(br#"[{"id":"10","time":"12"}]"#)?;
+    assert!(advance_snapshot_fill_cursor(&mut cursor, &backwards, 20).is_err());
+    let mut first = RecentFillsCursor {
+        observed_through_ms: 20,
+        last_trade_id: None,
+        last_event_time_ms: None,
+    };
+    assert!(advance_snapshot_fill_cursor(&mut first, &late, 20).is_err());
+    Ok(())
+}

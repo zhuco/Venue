@@ -1,5 +1,7 @@
 # VENUE 功能代码地图
 
+账户历史恢复：`crates/venue-gateway-binance/src/account_gateway_projection.rs` 处理签名成交分页与游标校验；fromId 续读以原生成交身份和成交时序为准，保留晚到的较早时间成交。
+
 订单成交标记聚合：`apps/ui/desktop/src/chart_trading/overlays/fills.rs` 按订单 ID 汇总唯一成交，使用累计数量、加权均价和首次成交时间；`chart.rs::ChartViewport::zoom_by_grid_steps` 按每个原始滚轮刻度一个时间网格跨度缩放。
 
 挂单线穿价即时隐藏：`apps/ui/desktop/src/app/market_events/crossed_orders.rs` 消费既有逐笔行情，`chart_trading/order_tags.rs` 保存可由私有事实纠正的临时显示状态；按交易对/账户撤普通挂单入口为 `trade_dock/cancel_orders.rs`。

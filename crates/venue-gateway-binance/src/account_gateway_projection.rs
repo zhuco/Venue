@@ -2,7 +2,134 @@ use venue_execution::{
     AccountPhysicalGateway, AccountRecoveryRequest, AccountSymbolSet, SignedAccountSnapshot,
 };
 
+use super::{
+    AccountHostValidationError, BTreeSet, BinanceSnapshotFillsRequest, Fill, RecentFillsCursor,
+    USER_TRADES_PAGE_LIMIT, Value, build_fills_for_native_symbol_request, json_rows_snapshot,
+    snapshot_rules, snapshot_u64, str,
+};
 use super::{BinanceAccountGateway, BinanceAccountGatewayError};
+
+pub(super) async fn snapshot_fills_cursor(
+    request: BinanceSnapshotFillsRequest<'_>,
+) -> Result<(String, Vec<Fill>), AccountHostValidationError> {
+    let BinanceSnapshotFillsRequest {
+        transport,
+        credentials,
+        scope,
+        symbols,
+        previous,
+        observed_at_ms,
+        catalogue,
+        generation,
+    } = request;
+    let default_start = observed_at_ms
+        .checked_sub(1)
+        .filter(|value| *value > 0)
+        .ok_or(AccountHostValidationError::SignedSnapshot)?;
+    let mut fills = Vec::new();
+    let mut fill_ids = BTreeSet::new();
+    let mut next = previous;
+    for native in symbols {
+        let mut cursor = next
+            .by_native_symbol
+            .get(native)
+            .copied()
+            .unwrap_or(RecentFillsCursor {
+                observed_through_ms: default_start,
+                last_trade_id: None,
+                last_event_time_ms: None,
+            });
+        let start = cursor.observed_through_ms;
+        let mut terminal = false;
+        for page_index in 1..=crate::BINANCE_PRIVATE_MAX_PAGES {
+            let page_index = u32::try_from(page_index)
+                .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+            let request = build_fills_for_native_symbol_request(
+                scope,
+                native,
+                page_index,
+                cursor,
+                start,
+                observed_at_ms,
+            )
+            .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+            let page = transport
+                .execute_read(
+                    credentials,
+                    &request,
+                    transport
+                        .signing_timestamp_ms()
+                        .map_err(|_| AccountHostValidationError::SignedSnapshot)?,
+                )
+                .await
+                .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+            let rows = json_rows_snapshot(&page.payload)
+                .map_err(|_| AccountHostValidationError::SignedSnapshotStage("fills_rows"))?;
+            advance_snapshot_fill_cursor(&mut cursor, &rows, start).map_err(|error| {
+                eprintln!(
+                    "Signed fills cursor rejected: symbol={native} page={page_index} rows={}",
+                    rows.len()
+                );
+                error
+            })?;
+            let rules = snapshot_rules(catalogue, native, generation)
+                .map_err(|_| AccountHostValidationError::SignedSnapshotStage("fills_rules"))?;
+            let payload = str::from_utf8(&page.payload)
+                .map_err(|_| AccountHostValidationError::SignedSnapshot)?;
+            for fill in crate::private::parse_fills(payload, &rules.instrument.symbol)
+                .map_err(|_| AccountHostValidationError::SignedSnapshotStage("fills_normalize"))?
+            {
+                if !fill_ids.insert((fill.symbol.clone(), fill.fill_id.clone())) {
+                    return Err(AccountHostValidationError::SignedSnapshot);
+                }
+                fills.push(fill);
+            }
+            if rows.len() < usize::from(USER_TRADES_PAGE_LIMIT) {
+                terminal = true;
+                break;
+            }
+        }
+        if !terminal {
+            return Err(AccountHostValidationError::SignedSnapshot);
+        }
+        cursor.observed_through_ms = cursor.observed_through_ms.max(observed_at_ms);
+        next.by_native_symbol.insert(native.clone(), cursor);
+    }
+    Ok((next.encode(), fills))
+}
+
+pub(super) fn advance_snapshot_fill_cursor(
+    cursor: &mut RecentFillsCursor,
+    rows: &[serde_json::Map<String, Value>],
+    start: u64,
+) -> Result<(), AccountHostValidationError> {
+    if rows.len() > usize::from(USER_TRADES_PAGE_LIMIT) {
+        return Err(AccountHostValidationError::SignedSnapshot);
+    }
+    for row in rows {
+        let id = snapshot_u64(row, "id")?;
+        let event_time = snapshot_u64(row, "time")?;
+        if cursor.last_trade_id.is_some_and(|previous| id <= previous)
+            || cursor
+                .last_event_time_ms
+                .is_some_and(|previous| event_time < previous)
+            // fromId resumes by native identity, without a startTime parameter. An unseen
+            // fill may precede the prior REST observation while remaining after the last fill.
+            || (cursor.last_trade_id.is_none() && event_time < start)
+        {
+            eprintln!(
+                "Signed fills chronology mismatch: id={id} time={event_time} prior_id={:?} prior_time={:?} start={start}",
+                cursor.last_trade_id, cursor.last_event_time_ms
+            );
+            return Err(AccountHostValidationError::SignedSnapshotStage(
+                "fills_cursor_order",
+            ));
+        }
+        cursor.last_trade_id = Some(id);
+        cursor.last_event_time_ms = Some(event_time);
+    }
+    Ok(())
+}
 
 /// One bounded, read-only snapshot job. Its HTTP awaits do not borrow the live user stream.
 pub struct BinanceProjectionRead {
