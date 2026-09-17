@@ -2,6 +2,7 @@
 //! socket. It is deliberately not a recovery journal: restart and gaps require a new bootstrap.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -25,6 +26,7 @@ pub(super) struct AccountStreamProjection {
     event_times: BTreeMap<String, u64>,
     last_published_ms: u64,
     last_change_received_ms: u64,
+    incomplete_since: Option<Instant>,
 }
 
 impl AccountStreamProjection {
@@ -59,6 +61,7 @@ impl AccountStreamProjection {
             event_times: BTreeMap::new(),
             last_published_ms: baseline.observed_at_ms(),
             last_change_received_ms: baseline.observed_at_ms(),
+            incomplete_since: None,
             baseline,
         }
     }
@@ -300,15 +303,22 @@ impl AccountStreamProjection {
     }
 
     fn snapshot(
-        &self,
+        &mut self,
         observed_ms: u64,
         private_generation: u64,
     ) -> Result<Option<SignedAccountSnapshot>, BinanceAccountGatewayError> {
-        let incomplete = self.trade_times.iter().any(|(key, time)| {
-            self.position_times
-                .get(key)
-                .is_none_or(|position| position < time)
-        }) || self.expected_quantities.iter().any(|(key, expected)| {
+        self.snapshot_at(observed_ms, private_generation, Instant::now())
+    }
+
+    fn snapshot_at(
+        &mut self,
+        observed_ms: u64,
+        private_generation: u64,
+        now: Instant,
+    ) -> Result<Option<SignedAccountSnapshot>, BinanceAccountGatewayError> {
+        // Inventory is the continuity proof. A later fill clock must not freeze publication
+        // when ACCOUNT_UPDATE already reports the same quantity with an earlier T.
+        let incomplete = self.expected_quantities.iter().any(|(key, expected)| {
             self.positions.get(key).map(|position| position.quantity) != Some(*expected)
         }) || self.positions.iter().any(|(key, position)| {
             self.expected_quantities
@@ -317,14 +327,20 @@ impl AccountStreamProjection {
                 .unwrap_or(Decimal::ZERO)
                 != position.quantity
         });
-        if incomplete && observed_ms.saturating_sub(self.last_change_received_ms) > 5_000 {
-            eprintln!(
-                "Authenticated position quantities or trade coverage did not converge: trade_times={:?} position_times={:?}",
-                self.trade_times, self.position_times
-            );
-            return Err(invalid());
+        if incomplete {
+            // The recovery deadline must progress even when the socket receives no new facts.
+            let started = *self.incomplete_since.get_or_insert(now);
+            if now.saturating_duration_since(started) >= Duration::from_secs(5) {
+                eprintln!(
+                    "Authenticated position quantities or trade coverage did not converge: trade_times={:?} position_times={:?}",
+                    self.trade_times, self.position_times
+                );
+                return Err(invalid());
+            }
+            return Ok(None);
         }
-        if observed_ms <= self.last_published_ms || incomplete {
+        self.incomplete_since = None;
+        if observed_ms <= self.last_published_ms {
             return Ok(None);
         }
         let mut cursor = super::parse_snapshot_fills_cursor(Some(self.baseline.fills_cursor()))
@@ -394,13 +410,14 @@ impl BinanceAccountGateway {
     pub fn stream_projection_snapshot(
         &mut self,
     ) -> Result<Option<SignedAccountSnapshot>, BinanceAccountGatewayError> {
-        let Some(state) = &self.stream_projection else {
+        let (observed, generation) = match &self.private_stream {
+            Some(stream) => (stream.last_received_at_ms(), self.private_generation),
+            None => return Ok(None),
+        };
+        let Some(state) = &mut self.stream_projection else {
             return Ok(None);
         };
-        let Some(stream) = &self.private_stream else {
-            return Ok(None);
-        };
-        let snapshot = state.snapshot(stream.last_received_at_ms(), self.private_generation)?;
+        let snapshot = state.snapshot(observed, generation)?;
         if let Some(snapshot) = &snapshot {
             for symbol in snapshot
                 .open_orders()

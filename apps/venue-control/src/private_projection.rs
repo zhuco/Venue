@@ -332,6 +332,9 @@ impl BinancePrivateProjectionStore {
         }
         let persisted_ms = now_ms.max(snapshot.observed_at_ms());
         let mut projection = project(source, snapshot, persisted_ms)?;
+        // Bound both history inserts and the JSON read model; the signed recovery cursor
+        // and the execution consumer retain the complete snapshot independently.
+        projection.fills = bounded_history_fills(&projection.fills)?;
         let mut tx = self
             .pool
             .begin()
@@ -1129,6 +1132,25 @@ fn unsigned(value: i64) -> Result<u64, PrivateProjectionError> {
     u64::try_from(value).map_err(|_| PrivateProjectionError::Unavailable)
 }
 
+fn bounded_history_fills(
+    fills: &[TerminalFill],
+) -> Result<Vec<TerminalFill>, PrivateProjectionError> {
+    let limit = usize::try_from(HISTORY_LIMIT).map_err(|_| PrivateProjectionError::Invalid)?;
+    if fills.len() <= limit {
+        return Ok(fills.to_vec());
+    }
+    let mut ranked = fills.to_vec();
+    ranked.sort_by(|left, right| {
+        right
+            .occurred_ms
+            .unwrap_or(0)
+            .cmp(&left.occurred_ms.unwrap_or(0))
+            .then_with(|| right.native_trade_id.cmp(&left.native_trade_id))
+    });
+    ranked.truncate(limit);
+    Ok(ranked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1223,6 +1245,36 @@ mod tests {
     fn one_stream_fill_reuses_the_batch_contract() -> Result<(), Box<dyn std::error::Error>> {
         let event = stream_fill("trade-1", Decimal::new(1, 3), OrderState::PartiallyFilled)?;
         assert_eq!(prepare_stream_fill_batch(&source()?, &[event])?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn signed_fill_replay_keeps_only_the_recent_history_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let symbol: Symbol = "BTC/USDT".parse()?;
+        let fills = (0..HISTORY_LIMIT + 3)
+            .map(|index| TerminalFill {
+                native_trade_id: format!("{index:04}"),
+                native_order_id: "order".into(),
+                symbol: symbol.clone(),
+                order_side: OrderSide::Buy,
+                position_side: PositionSide::Long,
+                quantity: Decimal::ONE,
+                price: Decimal::from(10),
+                maker: None,
+                occurred_ms: Some(index as u64),
+            })
+            .collect::<Vec<_>>();
+        let bounded = bounded_history_fills(&fills)?;
+        assert_eq!(bounded.len(), usize::try_from(HISTORY_LIMIT)?);
+        assert_eq!(
+            bounded.first().map(|fill| fill.native_trade_id.as_str()),
+            Some("0502")
+        );
+        assert_eq!(
+            bounded.last().map(|fill| fill.native_trade_id.as_str()),
+            Some("0003")
+        );
         Ok(())
     }
 

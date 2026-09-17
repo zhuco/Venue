@@ -202,8 +202,13 @@ fn missing_execution_after_position_update_becomes_a_gap_not_fresh_inventory()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut state = state()?;
     apply(&mut state, POSITION)?;
-    assert!(state.snapshot(200, 2)?.is_none());
-    assert!(state.snapshot(5_201, 2).is_err());
+    let now = Instant::now();
+    assert!(state.snapshot_at(200, 2, now)?.is_none());
+    assert!(
+        state
+            .snapshot_at(200, 2, now + Duration::from_secs(5))
+            .is_err()
+    );
     Ok(())
 }
 
@@ -278,6 +283,46 @@ fn later_account_update_time_does_not_require_another_trade()
 }
 
 #[test]
+fn matching_inventory_publishes_when_fill_clock_is_ahead_of_position_clock()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut state = state()?;
+    apply(&mut state, NEW)?;
+    apply(
+        &mut state,
+        &FILL
+            .replace("\"E\":132", "\"E\":141")
+            .replace("\"T\":130", "\"T\":140"),
+    )?;
+    apply(&mut state, POSITION)?;
+    assert!(
+        state.snapshot(150, 2)?.is_some(),
+        "matching inventory must publish even when ORDER_TRADE_UPDATE T is later than ACCOUNT_UPDATE T"
+    );
+    Ok(())
+}
+
+#[test]
+fn unresolved_inventory_gap_starts_from_first_incomplete_observation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut state = state()?;
+    apply(&mut state, FILL)?;
+    let now = Instant::now();
+    assert!(state.snapshot_at(200, 2, now)?.is_none());
+    state.last_change_received_ms = 4_000;
+    assert!(
+        state
+            .snapshot_at(200, 2, now + Duration::from_millis(4_999))?
+            .is_none()
+    );
+    assert!(
+        state
+            .snapshot_at(200, 2, now + Duration::from_secs(5))
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
 fn matching_timestamps_cannot_hide_conflicting_position_quantity()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut state = state()?;
@@ -287,7 +332,54 @@ fn matching_timestamps_cannot_hide_conflicting_position_quantity()
         &mut state,
         &POSITION.replace("\"pa\":\"3\"", "\"pa\":\"4\""),
     )?;
-    assert!(state.snapshot(200, 2)?.is_none());
-    assert!(state.snapshot(5_201, 2).is_err());
+    let now = Instant::now();
+    assert!(state.snapshot_at(200, 2, now)?.is_none());
+    assert!(
+        state
+            .snapshot_at(200, 2, now + Duration::from_secs(5))
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn converged_inventory_resets_deadline_without_freshening_facts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut state = state()?;
+    let now = Instant::now();
+    apply(&mut state, FILL)?;
+    assert!(state.snapshot_at(200, 2, now)?.is_none());
+    apply(&mut state, POSITION)?;
+    let snapshot = state
+        .snapshot_at(200, 2, now + Duration::from_secs(4))?
+        .ok_or("snapshot")?;
+    assert_eq!(snapshot.observed_at_ms(), 200);
+    state.last_published_ms = 200;
+    assert!(
+        state
+            .snapshot_at(200, 2, now + Duration::from_secs(10))?
+            .is_none()
+    );
+    apply(
+        &mut state,
+        &POSITION
+            .replace("\"E\":131", "\"E\":231")
+            .replace("\"pa\":\"3\"", "\"pa\":\"4\""),
+    )?;
+    assert!(
+        state
+            .snapshot_at(240, 2, now + Duration::from_secs(11))?
+            .is_none()
+    );
+    assert!(
+        state
+            .snapshot_at(240, 2, now + Duration::from_secs(15))?
+            .is_none()
+    );
+    assert!(
+        state
+            .snapshot_at(240, 2, now + Duration::from_secs(16))
+            .is_err()
+    );
     Ok(())
 }
