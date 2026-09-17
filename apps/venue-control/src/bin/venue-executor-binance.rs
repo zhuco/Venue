@@ -239,6 +239,26 @@ struct ProjectionWorker {
     persistence_in_flight: bool,
 }
 
+#[derive(Default)]
+struct ProjectionRestartBackoff {
+    failures: u32,
+    retry_at: Option<std::time::Instant>,
+}
+
+impl ProjectionRestartBackoff {
+    fn ready(&self, now: std::time::Instant) -> bool {
+        self.retry_at.is_none_or(|deadline| now >= deadline)
+    }
+
+    fn failed(&mut self, now: std::time::Instant) {
+        self.failures = self.failures.saturating_add(1);
+        let shift = self.failures.saturating_sub(1).min(5);
+        let delay =
+            std::time::Duration::from_secs(3_u64 << shift).min(std::time::Duration::from_secs(60));
+        self.retry_at = Some(now + delay);
+    }
+}
+
 async fn run_projection_supervisor(
     executor_store: PgExecutorStore,
     projection_store: BinancePrivateProjectionStore,
@@ -252,6 +272,8 @@ async fn run_projection_supervisor(
 ) {
     let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(32);
     let mut workers = BTreeMap::<String, ProjectionWorker>::new();
+    // Restarting a failed bootstrap must not reset its account's REST retry budget.
+    let mut restart_backoff = BTreeMap::<String, ProjectionRestartBackoff>::new();
     let mut next_worker_id = 0_u64;
     let mut discovery = tokio::time::interval(PROJECTION_DISCOVERY_INTERVAL);
     let mut recovery_open = true;
@@ -399,7 +421,10 @@ async fn run_projection_supervisor(
                                 },
                             )
                             .await
-                            .unwrap_or(false);
+                            .unwrap_or_else(|_| {
+                                tracing::warn!(credential_id = %source.credential_id, fills = snapshot.fills().len(), phase = "persist_timeout", "Account projection bootstrap failed");
+                                false
+                            });
                             if persisted {
                                 command_wake.wake();
                             }
@@ -429,12 +454,17 @@ async fn run_projection_supervisor(
                         healthy,
                     );
                     if current && !healthy {
+                        restart_backoff.entry(credential_id.clone()).or_default().failed(std::time::Instant::now());
                         let _ = projection_store.invalidate_stream(&credential_id).await;
+                    }
+                    if current && healthy {
+                        restart_backoff.remove(&credential_id);
                     }
                     let _ = completion.send(current && healthy);
                 }
                 Some(ProjectionMessage::Stopped { credential_id, worker_id }) => {
                     if is_current_worker(&workers, &credential_id, worker_id) {
+                        restart_backoff.entry(credential_id.clone()).or_default().failed(std::time::Instant::now());
                         hot_dispatch.invalidate_credential(&credential_id);
                         let _ = projection_store.invalidate_stream(&credential_id).await;
                         let _ = grid_signal
@@ -462,6 +492,7 @@ async fn run_projection_supervisor(
                 let Ok(now) = now_ms() else { continue; };
                 let Ok(active) = projection_store.active_sources(now).await else { continue; };
                 let active_by_id = active.into_iter().map(|source| (source.credential_id.clone(), source)).collect::<BTreeMap<_, _>>();
+                restart_backoff.retain(|id, _| active_by_id.contains_key(id));
                 let stale = workers.keys().filter(|id| !active_by_id.contains_key(*id)).cloned().collect::<Vec<_>>();
                 for id in stale {
                     let in_flight = workers.get(&id).is_some_and(|worker| worker.persistence_in_flight);
@@ -474,6 +505,7 @@ async fn run_projection_supervisor(
                     }
                 }
                 for (credential_id, source) in active_by_id {
+                    if restart_backoff.get(&credential_id).is_some_and(|retry| !retry.ready(std::time::Instant::now())) { continue; }
                     if workers.get(&credential_id).is_some_and(|worker| same_subscription(&worker.source, &source)) { continue; }
                     if workers.get(&credential_id).is_some_and(|worker| worker.persistence_in_flight) {
                         hot_dispatch.invalidate_credential(&credential_id);
@@ -690,6 +722,7 @@ async fn persist_projection_turn(
     projection_store
         .persist(source, snapshot, now_ms)
         .await
+        .map_err(|error| tracing::warn!(credential_id = %source.credential_id, %error, phase = "projection_store", "Account projection persistence failed"))
         .is_ok()
 }
 
@@ -868,8 +901,11 @@ fn spawn_projection_worker(
                     credentials,
                     limits,
                 )
+                .map_err(|error| tracing::warn!(%credential_id, %error, phase = "connect", "Account projection bootstrap failed"))
                 .ok()?;
-            gateway.prime_private_stream().ok()?;
+            gateway.prime_private_stream()
+                .map_err(|error| tracing::warn!(%credential_id, %error, phase = "private_stream", "Account projection bootstrap failed"))
+                .ok()?;
             hot_dispatch.invalidate_credential(&credential_id);
             sender
                 .blocking_send(ProjectionMessage::Invalidate {
@@ -883,6 +919,7 @@ fn spawn_projection_worker(
             // suffix against a projection row that it has not seen yet.
             let initial = gateway
                 .signed_projection_snapshot(fills_cursor.clone())
+                .map_err(|error| tracing::warn!(%credential_id, %error, phase = "signed_baseline", "Account projection bootstrap failed"))
                 .ok()?;
             gateway.install_stream_projection(initial.clone()).ok()?;
             let mut baseline_fill_ids = initial
@@ -901,6 +938,7 @@ fn spawn_projection_worker(
                 })
                 .ok()?;
             if !initial_settled.recv().ok()? {
+                tracing::warn!(%credential_id, phase = "persist_baseline", "Account projection bootstrap failed");
                 return None;
             }
             let mut refresh_at = std::time::Instant::now();
@@ -1166,6 +1204,21 @@ fn now_ms() -> Result<u64, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_restart_backoff_survives_worker_recreation_and_is_bounded() {
+        let now = std::time::Instant::now();
+        let mut retry = ProjectionRestartBackoff::default();
+        assert!(retry.ready(now));
+        for seconds in [3, 6, 12, 24, 48, 60, 60] {
+            retry.failed(now);
+            let deadline = now + std::time::Duration::from_secs(seconds);
+            assert!(!retry.ready(deadline - std::time::Duration::from_millis(1)));
+            assert!(retry.ready(deadline));
+        }
+        let unrelated = ProjectionRestartBackoff::default();
+        assert!(unrelated.ready(now));
+    }
     use std::{
         collections::{BTreeSet, VecDeque},
         sync::{
