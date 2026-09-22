@@ -37,6 +37,7 @@ pub struct PlannerInput<'a> {
     pub reference: &'a ReferenceSnapshot,
     pub account: &'a SignedAccountSnapshot,
     pub execution_market: &'a DurableMarketFacts,
+    pub execution_limits: Option<&'a crate::multi_venue_risk::StrategyRiskLimits>,
     pub consumed_supports: &'a BTreeSet<String>,
     pub last_support_lower: Option<Decimal>,
     pub current_take_profit: Option<&'a TakeProfitOrder>,
@@ -99,6 +100,7 @@ pub enum NoopReason {
     BudgetExhausted,
     PositionLimit,
     QuantityTooSmall,
+    ExecutionLimits,
     ExitOnly,
     TakeProfitBlocked,
     WaitingForCancel,
@@ -387,15 +389,6 @@ fn entry_at_support(
     {
         return Plan::Noop(NoopReason::PositionLimit);
     }
-    if state.quantity > Decimal::ZERO {
-        if let Some(order) = input.current_take_profit {
-            return Plan::CancelTakeProfit {
-                symbol: input.symbol.clone(),
-                client_order_id: order.client_order_id.clone(),
-                for_stop_loss: false,
-            };
-        }
-    }
     let mut scale = Decimal::ONE;
     for _ in 0..state.layer {
         scale = match scale.checked_mul(input.instance.config.size_multiplier) {
@@ -427,6 +420,23 @@ fn entry_at_support(
     {
         return Plan::Noop(NoopReason::BudgetExhausted);
     }
+    if !crate::multi_venue_risk::entry_notional_allowed(
+        input.account,
+        input.execution_market,
+        input.execution_limits,
+        actual_notional,
+    ) {
+        return Plan::Noop(NoopReason::ExecutionLimits);
+    }
+    if state.quantity > Decimal::ZERO {
+        if let Some(order) = input.current_take_profit {
+            return Plan::CancelTakeProfit {
+                symbol: input.symbol.clone(),
+                client_order_id: order.client_order_id.clone(),
+                for_stop_loss: false,
+            };
+        }
+    }
     Plan::MarketEntry {
         symbol: input.symbol.clone(),
         support_id: support.id.clone(),
@@ -442,7 +452,7 @@ fn entry_at_support(
 /// Rounds an opening quantity upward so the persisted notional reflects the actual contract
 /// amount.  The final dispatch guard repeats these precision, quantity, and minimum-notional
 /// checks against fresh market facts.
-fn entry_quantity(
+pub(crate) fn entry_quantity(
     metadata: &venue_domain::InstrumentMetadata,
     maximum_quantity: Option<Decimal>,
     requested_notional: Decimal,
@@ -591,6 +601,7 @@ pub fn plan_take_profit_only(
             reference: &placeholder,
             account,
             execution_market,
+            execution_limits: None,
             consumed_supports: &consumed,
             last_support_lower: None,
             current_take_profit: None,
@@ -755,6 +766,23 @@ mod tests {
         total_budget: Decimal,
         maximum_quantity: Option<Decimal>,
     ) -> Result<Plan, Box<dyn std::error::Error>> {
+        plan_entry_with_limits(
+            minimum_notional,
+            total_budget,
+            maximum_quantity,
+            Some(crate::multi_venue_risk::StrategyRiskLimits {
+                max_order_notional: total_budget,
+                max_symbol_notional: total_budget,
+            }),
+        )
+    }
+
+    fn plan_entry_with_limits(
+        minimum_notional: Decimal,
+        total_budget: Decimal,
+        maximum_quantity: Option<Decimal>,
+        limits: Option<crate::multi_venue_risk::StrategyRiskLimits>,
+    ) -> Result<Plan, Box<dyn std::error::Error>> {
         let symbol = Symbol::new("BTC", "USDT")?;
         let metadata = spot_metadata(minimum_notional)?;
         let binding = GatewayBinding::new(
@@ -836,6 +864,7 @@ mod tests {
                 reference: &reference,
                 account: &account,
                 execution_market: &market,
+                execution_limits: limits.as_ref(),
                 consumed_supports: &BTreeSet::new(),
                 last_support_lower: None,
                 current_take_profit: None,
@@ -845,6 +874,31 @@ mod tests {
             state,
             &support,
         ))
+    }
+
+    #[test]
+    fn rounded_entry_waits_without_consuming_support_when_account_limit_is_too_small()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for cap in [None, Some(Decimal::new(55, 1))] {
+            let limits = cap.map(|cap| crate::multi_venue_risk::StrategyRiskLimits {
+                max_order_notional: cap,
+                max_symbol_notional: Decimal::from(20),
+            });
+            assert_eq!(
+                plan_entry_with_limits(Decimal::new(54, 1), Decimal::from(20), None, limits)?,
+                Plan::Noop(NoopReason::ExecutionLimits),
+            );
+        }
+        // The same unconsumed signal can become eligible under compatible account limits.
+        assert!(matches!(
+            plan_entry_with_limits(Decimal::new(54, 1), Decimal::from(20), None,
+                Some(crate::multi_venue_risk::StrategyRiskLimits {
+                    max_order_notional: Decimal::from(6),
+                    max_symbol_notional: Decimal::from(20),
+                }))?,
+            Plan::MarketEntry { notional, .. } if notional == Decimal::from(6)
+        ));
+        Ok(())
     }
 
     #[test]

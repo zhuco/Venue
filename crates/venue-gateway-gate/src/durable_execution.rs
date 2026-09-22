@@ -7,6 +7,14 @@ impl GateAccountGateway {
         &mut self,
         command: &ExecutionCommand,
     ) -> Result<Option<venue_execution::DurableOrderObservation>, GateAccountGatewayError> {
+        self.durable_order_observation_with_native_id(command, None)
+    }
+
+    pub fn durable_order_observation_with_native_id(
+        &mut self,
+        command: &ExecutionCommand,
+        native_order_id: Option<&str>,
+    ) -> Result<Option<venue_execution::DurableOrderObservation>, GateAccountGatewayError> {
         let (client_order_id, symbol) = match command {
             ExecutionCommand::PlaceLimit(order) => {
                 (order.client_order_id.as_str(), order.owner.symbol.clone())
@@ -23,8 +31,13 @@ impl GateAccountGateway {
             return Ok(None);
         }
         let rules = self.registered_rules(&symbol)?.clone();
-        let request = prepare_exact_readback_by_client_id(&self.binding, &rules, client_order_id)
-            .map_err(|_| GateAccountGatewayError::Readback)?;
+        let request = crate::execution::prepare_exact_readback_with_native_id(
+            &self.binding,
+            &rules,
+            client_order_id,
+            native_order_id,
+        )
+        .map_err(|_| GateAccountGatewayError::Readback)?;
         let readback = self
             .runtime
             .block_on(self.transport.execute_exact_readback(
@@ -287,7 +300,7 @@ impl venue_execution::DurableAccountGateway for GateAccountGateway {
             return rejected("gate_durable_scope");
         }
         if self.verify_strategy_permissions().is_err() {
-            return AccountGatewayResult::Unknown;
+            return rejected("gate_preflight_failed");
         }
         self.execute_command(command, true, Some(context))
     }
@@ -297,7 +310,7 @@ impl venue_execution::DurableAccountGateway for GateAccountGateway {
             return rejected("gate_durable_scope");
         }
         if self.verify_strategy_permissions().is_err() {
-            return AccountGatewayResult::Unknown;
+            return rejected("gate_preflight_failed");
         }
         if matches!(command, ExecutionCommand::Cancel(_)) {
             return rejected("gate_durable_context");

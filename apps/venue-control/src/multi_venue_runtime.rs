@@ -182,11 +182,6 @@ impl MultiVenueExecutor {
                 .execution_context(claim)
                 .await
                 .map_err(|_| StrategyExchangeError)?;
-            let limits = if claim.reconcile_only {
-                None
-            } else {
-                self.credentials.limits(&claim.credential_id).await?
-            };
             let grid_fence = if claim.reconcile_only {
                 vec![]
             } else {
@@ -202,6 +197,13 @@ impl MultiVenueExecutor {
                     .send_fence(&claim.command, now_ms()?)
                     .await
                     .map_err(|_| StrategyExchangeError)?
+            };
+            let limits = if claim.reconcile_only {
+                None
+            } else if let Some(limits) = support_fence.and_then(|fence| fence.entry_limits()) {
+                Some(limits)
+            } else {
+                self.credentials.limits(&claim.credential_id).await?
             };
             Ok::<_, StrategyExchangeError>((
                 credentials,
@@ -241,17 +243,18 @@ impl MultiVenueExecutor {
             // snapshot; the consumed cursor is changed only by a later atomic planning cycle.
             let mut checked_grid_orders = Vec::new();
             for (row, expected_cancel) in grid_fence {
-                let observed = match gateway.order_observation(&row.command) {
-                    Ok(Some(observed)) => observed,
-                    _ => {
-                        return Ok((
-                            AccountGatewayResult::Rejected {
-                                reason: "strategy_grid_plan_changed".into(),
-                            },
-                            None,
-                        ));
-                    }
-                };
+                let observed =
+                    match gateway.order_observation(&row.command, row.native_id.as_deref()) {
+                        Ok(Some(observed)) => observed,
+                        _ => {
+                            return Ok((
+                                AccountGatewayResult::Rejected {
+                                    reason: "strategy_grid_plan_changed".into(),
+                                },
+                                None,
+                            ));
+                        }
+                    };
                 if !grid_fill_fence(row.native_id.as_deref(), row.observed_filled, &observed)
                     || !grid_expected_state(expected_cancel, observed.state)
                 {

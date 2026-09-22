@@ -98,6 +98,20 @@ pub fn market_guard(
     if !increasing {
         return true;
     }
+    entry_notional_allowed(snapshot, market, limits, notional)
+}
+
+/// Shared planning and dispatch check. Planning cannot consume a support identity for an
+/// amount that is already known to exceed the saved account limits.
+pub(crate) fn entry_notional_allowed(
+    snapshot: &SignedAccountSnapshot,
+    market: &DurableMarketFacts,
+    limits: Option<&StrategyRiskLimits>,
+    notional: Decimal,
+) -> bool {
+    if notional <= Decimal::ZERO || market.binding != *snapshot.binding() {
+        return false;
+    }
     let Some(limits) = limits.filter(|l| l.validate()) else {
         return false;
     };
@@ -106,7 +120,7 @@ pub fn market_guard(
     if notional > limits.max_order_notional {
         return false;
     }
-    let symbol = &command.mutation_owner().symbol;
+    let symbol = &market.binding.symbol;
     let mut total = notional;
     for position in snapshot.positions().iter().filter(|p| &p.symbol == symbol) {
         let Some(value) = position

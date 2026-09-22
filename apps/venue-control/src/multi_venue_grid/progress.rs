@@ -9,6 +9,7 @@ pub(crate) struct ConvergenceProgress {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProgressEvent {
     Pending,
+    ReconciledAt(u64),
     Failures(u32),
     Converged,
     ResetDrained,
@@ -47,7 +48,15 @@ pub(crate) fn advance(
             timed_out: false,
         });
     }
-    let pending_since_ms = current.pending_since_ms.or(Some(now_ms));
+    let mut pending_since_ms = current.pending_since_ms.or(Some(now_ms));
+    if let ProgressEvent::ReconciledAt(observed) = event {
+        if observed == 0 || observed > now_ms {
+            return None;
+        }
+        // Only a newer durable signed reconciliation advances the deadline. Polling the
+        // same completed command or retrying an unknown result cannot renew this budget.
+        pending_since_ms = pending_since_ms.map(|started| started.max(observed));
+    }
     let consecutive_failures = match event {
         ProgressEvent::Failures(count) if count > 0 => {
             current.consecutive_failures.saturating_add(count)
@@ -77,6 +86,55 @@ mod tests {
             convergence_timeout_ms: 30_000,
             failure_threshold: 3,
         }
+    }
+
+    #[test]
+    fn signed_queue_progress_renews_once_but_stalled_work_still_times_out() {
+        let progress = ConvergenceProgress {
+            pending_since_ms: Some(1_000),
+            consecutive_failures: 1,
+        };
+        let advanced = advance(
+            progress,
+            ProgressEvent::ReconciledAt(29_000),
+            &policy(),
+            31_000,
+        )
+        .expect("valid signed observation");
+        assert!(!advanced.pause);
+        assert_eq!(advanced.progress.pending_since_ms, Some(29_000));
+        assert_eq!(advanced.progress.consecutive_failures, 1);
+        let stalled = advance(
+            advanced.progress,
+            ProgressEvent::ReconciledAt(29_000),
+            &policy(),
+            59_000,
+        )
+        .expect("same observation");
+        assert!(stalled.pause);
+        assert!(stalled.timed_out);
+        assert!(
+            advance(
+                progress,
+                ProgressEvent::ReconciledAt(31_001),
+                &policy(),
+                31_000
+            )
+            .is_none()
+        );
+        assert!(
+            advance(
+                ConvergenceProgress {
+                    consecutive_failures: 3,
+                    ..progress
+                },
+                ProgressEvent::ReconciledAt(29_000),
+                &policy(),
+                31_000
+            )
+            .expect("valid")
+            .pause
+        );
     }
 
     #[test]
