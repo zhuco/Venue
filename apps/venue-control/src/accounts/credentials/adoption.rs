@@ -27,7 +27,7 @@ pub(super) async fn adopt_deleted_personal(
     let Some(managed) = managed else {
         return Ok(None);
     };
-    if probe.has_exposure {
+    if probe.has_open_orders {
         return Err(error(Code::AccountInUse));
     }
     let rows = sqlx::query("SELECT deleted_ms,octet_length(encrypted_credentials) AS secret_bytes FROM venue_api_credentials WHERE trading_account_id=$1 ORDER BY credential_id FOR UPDATE")
@@ -43,7 +43,7 @@ pub(super) async fn adopt_deleted_personal(
     {
         return Ok(None);
     }
-    // Deletion already required current signed flatness and command drain. Recheck local
+    // Positions can remain as the next activation baseline. Recheck outstanding local
     // custody under the original account row lock, using this new signed observation.
     deletion::check_current_custody(connection, prior_account, Some(probe.observed_ms)).await?;
     let source: bool = sqlx::query_scalar(

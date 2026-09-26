@@ -268,7 +268,7 @@ impl AccountService {
             }
         }
         let credential =
-            verified_empty_credential(&mut tx, principal, &request.settings, now_ms).await?;
+            verified_follow_credential(&mut tx, principal, &request.settings, now_ms).await?;
         let binding = sqlx::query(
             "SELECT b.kol_user_id,p.leader_trading_account_id FROM venue_user_kol_bindings b \
              JOIN venue_kol_profiles p ON p.kol_user_id=b.kol_user_id \
@@ -459,7 +459,7 @@ impl AccountService {
         match request.action {
             FollowLifecycleAction::Activate => {
                 let settings = follow_relation_settings(&row)?;
-                let _ = verified_empty_credential(&mut tx, principal, &settings, now_ms).await?;
+                let _ = verified_follow_credential(&mut tx, principal, &settings, now_ms).await?;
                 let state: String = row.try_get("relation_state").map_err(database_error)?;
                 if state != "paused" {
                     return Err(error(Code::Conflict));
@@ -598,7 +598,7 @@ fn projection_error(
     }
 }
 
-async fn verified_empty_credential(
+async fn verified_follow_credential(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     principal: &Principal,
     settings: &FollowRiskSettings,
@@ -616,9 +616,6 @@ async fn verified_empty_credential(
     )?;
     if !summary.selectable(now_ms) {
         return Err(error(Code::VerificationRequired));
-    }
-    if summary.has_exposure != Some(false) {
-        return Err(error(Code::AccountInUse));
     }
     if row
         .try_get::<Option<String>, _>("trading_account_id")
@@ -830,6 +827,7 @@ mod tests {
                         account_identity_hash: [29; 32],
                         observed_ms: timestamp,
                         has_exposure: false,
+                        has_open_orders: false,
                         equity: Decimal::from(100),
                         available_margin: Decimal::from(80),
                     })

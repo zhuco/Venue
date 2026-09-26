@@ -15,6 +15,7 @@ fn proof(identity: u8, exposed: bool) -> Result<BinanceCredentialProbe, BinanceP
         account_identity_hash: [identity; 32],
         observed_ms: now(),
         has_exposure: exposed,
+        has_open_orders: exposed,
         equity: rust_decimal::Decimal::from(100),
         available_margin: rust_decimal::Decimal::from(80),
     })

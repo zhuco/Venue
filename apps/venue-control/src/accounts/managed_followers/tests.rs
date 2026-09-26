@@ -168,6 +168,7 @@ async fn managed_save_is_atomic_scoped_idempotent_and_never_grants_trading() -> 
                 account_identity_hash: [92; 32],
                 observed_ms: now,
                 has_exposure: false,
+                has_open_orders: false,
                 equity: Decimal::from(100),
                 available_margin: Decimal::from(80),
             })
@@ -356,6 +357,7 @@ fn proof(
         account_identity_hash: [identity; 32],
         observed_ms,
         has_exposure: exposed,
+        has_open_orders: exposed,
         equity: Decimal::from(100),
         available_margin: Decimal::from(80),
     })
@@ -580,7 +582,7 @@ async fn frozen_managed_table_is_preserved_and_nonempty_legacy_fails_closed() ->
 }
 
 #[tokio::test]
-async fn managed_adoption_requires_same_owner_deleted_flat_drained_and_preserves_history()
+async fn managed_adoption_allows_positions_but_requires_same_owner_deleted_drained_and_no_orders()
 -> TestResult {
     let Some(f) = Fixture::create().await? else {
         return Ok(());
@@ -696,7 +698,9 @@ async fn managed_adoption_requires_same_owner_deleted_flat_drained_and_preserves
     let adopted = f
         .service
         .verify_managed_follower_with(&owner, chosen.clone(), timestamp, |_| async {
-            proof(103, false, timestamp)
+            let mut positions_only = proof(103, true, timestamp)?;
+            positions_only.has_open_orders = false;
+            Ok(positions_only)
         })
         .await?;
     assert_eq!(adopted.verification, ApiVerificationState::Verified);

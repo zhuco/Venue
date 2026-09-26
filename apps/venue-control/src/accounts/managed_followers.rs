@@ -390,9 +390,6 @@ impl AccountService {
         if !has_follow_owner {
             return Ok(());
         }
-        if summary.has_exposure != Some(false) {
-            return Err(error(Code::AccountInUse));
-        }
         let equity = summary.equity.ok_or(error(Code::Unavailable))?;
         if equity <= Decimal::ZERO {
             return Err(error(Code::AccountInUse));
