@@ -219,3 +219,5 @@ VenueFlow 延迟采集：`apps/ui/desktop/src/latency_evidence.rs` 与 `latency_
 网格订单身份检查：`grid_store/reads.rs::ensure_resolvable_owners` 按各身份字段判空，`migrations/0050_grid_identity_candidates.sql` 仅索引待补全身份的记录，避免每轮扫描全部历史订单；原身份与未知结果栅栏不变。
 
 账户展示新增 `apps/venue-control/src/private_projection/display_orders.rs`、`apps/venue-control/src/accounts/strategy_projection_cache.rs`；五所账户连接复用见 `crates/venue-gateway-api/src/transport_pool.rs`，复用 workspace Tokio，无新版本依赖。
+
+- 本人个人 Binance 账户转托管：`apps/venue-control/src/accounts/credentials/adoption.rs`；活动身份与历史对应关系迁移：`apps/venue-control/migrations/0051_personal_to_managed_custody.sql`。

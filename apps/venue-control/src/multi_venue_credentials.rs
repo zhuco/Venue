@@ -112,7 +112,7 @@ async fn resolve_identity_account(
         .await
         .map_err(|_| StrategyExchangeError)?;
     let existing = sqlx::query(
-        "SELECT trading_account_id,user_id FROM venue_user_trading_accounts WHERE venue=$1 AND exchange_identity_hash=$2 FOR UPDATE",
+        "SELECT trading_account_id,user_id FROM venue_user_trading_accounts WHERE venue=$1 AND exchange_identity_hash=$2 AND retired_ms IS NULL FOR UPDATE",
     )
     .bind(venue.as_str())
     .bind(identity)
@@ -762,7 +762,7 @@ impl StrategyCredentialStore {
         if !reuse_identity {
             sqlx::query("INSERT INTO venue_user_trading_accounts(trading_account_id,user_id,venue,exchange_identity_hash) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
                 .bind(&canonical_account).bind(owner).bind(venue.as_str()).bind(&hash).execute(&mut *tx).await.map_err(|_| StrategyExchangeError)?;
-            let account_row = sqlx::query("SELECT trading_account_id,user_id FROM venue_user_trading_accounts WHERE venue=$1 AND exchange_identity_hash=$2 FOR UPDATE")
+            let account_row = sqlx::query("SELECT trading_account_id,user_id FROM venue_user_trading_accounts WHERE venue=$1 AND exchange_identity_hash=$2 AND retired_ms IS NULL FOR UPDATE")
                 .bind(venue.as_str()).bind(&hash).fetch_one(&mut *tx).await.map_err(|_| StrategyExchangeError)?;
             let stored_account: String = account_row
                 .try_get("trading_account_id")

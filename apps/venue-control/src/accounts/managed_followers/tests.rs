@@ -558,7 +558,7 @@ async fn frozen_managed_table_is_preserved_and_nonempty_legacy_fails_closed() ->
         sqlx::query_scalar::<_, i32>("SELECT max(version) FROM venue_control_schema_migrations")
             .fetch_one(&f.pool)
             .await?,
-        50
+        51
     );
     assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='venue_kol_managed_followers' AND column_name='managed_follower_id'").fetch_one(&f.pool).await?,1);
     let session = f.service.register(login("freshuser"), now()).await?;
@@ -573,5 +573,145 @@ async fn frozen_managed_table_is_preserved_and_nonempty_legacy_fails_closed() ->
             .accounts
             .is_empty()
     );
+    f.cleanup().await
+}
+
+#[tokio::test]
+async fn managed_adoption_requires_same_owner_deleted_flat_drained_and_preserves_history()
+-> TestResult {
+    let Some(f) = Fixture::create().await? else {
+        return Ok(());
+    };
+    let timestamp = now();
+    let session = f.service.register(login("adopt-owner"), timestamp).await?;
+    let owner = f
+        .service
+        .authenticate(session.token.expose(), timestamp)
+        .await?;
+    let stranger_session = f
+        .service
+        .register(login("adopt-stranger"), timestamp)
+        .await?;
+    let stranger = f
+        .service
+        .authenticate(stranger_session.token.expose(), timestamp)
+        .await?;
+    for (user, identity, slot) in [(&owner, 101_u8, 1_i32), (&stranger, 102_u8, 2_i32)] {
+        let account = crypto::opaque_id()?;
+        sqlx::query("INSERT INTO venue_user_trading_accounts(trading_account_id,user_id,venue,exchange_identity_hash) VALUES($1,$2,'binance',$3)").bind(&account).bind(&user.user.user_id).bind(vec![identity;32]).execute(&f.pool).await?;
+        sqlx::query("INSERT INTO venue_kol_profiles(kol_user_id,leader_trading_account_id,public_name,public_title,public_description,strategy_capital,profile_state,active_slot,created_ms,updated_ms) VALUES($1,$2,'KOL','Title','','500','enabled',$3,$4,$4)").bind(&user.user.user_id).bind(&account).bind(slot).bind(ms(timestamp)?).execute(&f.pool).await?;
+    }
+    let old = f
+        .service
+        .bind_credential(
+            &owner,
+            request("00000000-0000-4000-8000-000000000701", 'A').credential,
+            timestamp,
+        )
+        .await?;
+    let old = f
+        .service
+        .verify_with(&owner, &old.credential_id, timestamp, |_| async {
+            proof(103, false, timestamp)
+        })
+        .await?;
+    let old_account = old
+        .trading_account_id
+        .as_deref()
+        .ok_or("old account missing")?;
+    let managed = f
+        .service
+        .create_managed_follower(
+            &owner,
+            request("00000000-0000-4000-8000-000000000702", 'B'),
+            timestamp,
+        )
+        .await?;
+    let verify = || ManagedFollowerVerifyRequest {
+        managed_id: managed.managed_id.clone(),
+    };
+    let blocked = f
+        .service
+        .verify_managed_follower_with(&owner, verify(), timestamp, |_| async {
+            proof(103, false, timestamp)
+        })
+        .await?;
+    assert_eq!(blocked.verification, ApiVerificationState::AccountConflict);
+    sqlx::query("INSERT INTO venue_binance_commands(command_id,command_origin,request_id,owner_user_id,trading_account_id,credential_id,symbol,position_side,command_phase,order_kind,order_side,requested_quantity,rule_version,client_order_id,command_state,created_ms,updated_ms) VALUES('adopt-history','terminal','adopt-history',$1,$2,$3,'SOL/USDC','long','open','market','buy','1','fixture','adopt-history','pending',1,1)").bind(&owner.user.user_id).bind(old_account).bind(&old.credential_id).execute(&f.pool).await?;
+    // The deletion path has separate signed-readback tests. Retain its credential tombstone.
+    sqlx::query("UPDATE venue_api_credentials SET deleted_ms=$1,encrypted_credentials=$2 WHERE credential_id=$3").bind(ms(timestamp)?).bind(Vec::<u8>::new()).bind(&old.credential_id).execute(&f.pool).await?;
+    let other = f
+        .service
+        .create_managed_follower(
+            &stranger,
+            request("00000000-0000-4000-8000-000000000703", 'C'),
+            timestamp,
+        )
+        .await?;
+    let rejected = f
+        .service
+        .verify_managed_follower_with(
+            &stranger,
+            ManagedFollowerVerifyRequest {
+                managed_id: other.managed_id,
+            },
+            timestamp,
+            |_| async { proof(103, false, timestamp) },
+        )
+        .await?;
+    assert_eq!(rejected.verification, ApiVerificationState::AccountConflict);
+    assert_eq!(
+        f.service
+            .verify_managed_follower_with(&owner, verify(), timestamp, |_| async {
+                proof(103, true, timestamp)
+            })
+            .await
+            .err()
+            .map(|e| e.code),
+        Some(Code::AccountInUse)
+    );
+    assert_eq!(
+        f.service
+            .verify_managed_follower_with(&owner, verify(), timestamp, |_| async {
+                proof(103, false, timestamp)
+            })
+            .await
+            .err()
+            .map(|e| e.code),
+        Some(Code::AccountInUse)
+    );
+    sqlx::query("UPDATE venue_binance_commands SET command_state='cancelled',terminal_ms=2,updated_ms=2 WHERE command_id='adopt-history'").execute(&f.pool).await?;
+    let adopted = f
+        .service
+        .verify_managed_follower_with(&owner, verify(), timestamp, |_| async {
+            proof(103, false, timestamp)
+        })
+        .await?;
+    assert_eq!(adopted.verification, ApiVerificationState::Verified);
+    assert_eq!(adopted.equity, Some(Decimal::from(100)));
+    let (subject, credential) = f
+        .service
+        .managed_verification_subject(&owner, &managed.managed_id, timestamp)
+        .await?;
+    let account: String = sqlx::query_scalar(
+        "SELECT trading_account_id FROM venue_api_credentials WHERE credential_id=$1",
+    )
+    .bind(&credential)
+    .fetch_one(&f.pool)
+    .await?;
+    assert_ne!(account, old_account);
+    let history: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_user_trading_accounts a JOIN venue_binance_commands c USING(trading_account_id) WHERE a.trading_account_id=$1 AND a.user_id=$2 AND a.successor_account_id=$3 AND a.retired_by_managed_id=$4 AND a.retired_ms IS NOT NULL AND c.command_state='cancelled')").bind(old_account).bind(&owner.user.user_id).bind(&account).bind(&managed.managed_id).fetch_one(&f.pool).await?;
+    assert!(history);
+    let active: i64=sqlx::query_scalar("SELECT count(*) FROM venue_user_trading_accounts WHERE exchange_identity_hash=$1 AND retired_ms IS NULL").bind(vec![103_u8;32]).fetch_one(&f.pool).await?;
+    assert_eq!(active, 1);
+    let repeat = f
+        .service
+        .verify_managed_follower_with(&owner, verify(), timestamp, |_| async {
+            proof(103, false, timestamp)
+        })
+        .await?;
+    assert_eq!(repeat.verification, ApiVerificationState::Verified);
+    let retained: String=sqlx::query_scalar("SELECT trading_account_id FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2").bind(&credential).bind(&subject.user.user_id).fetch_one(&f.pool).await?;
+    assert_eq!(retained, account);
     f.cleanup().await
 }

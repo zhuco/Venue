@@ -1,3 +1,4 @@
+mod adoption;
 mod deletion;
 use super::{AccountError, AccountService, Principal, crypto, database_error, error, ms};
 use secrecy::SecretString;
@@ -201,15 +202,30 @@ impl AccountService {
         match result {
             Ok(probe) => {
                 let new_account_id = crypto::opaque_id()?;
-                sqlx::query("INSERT INTO venue_user_trading_accounts (trading_account_id,user_id,venue,exchange_identity_hash) VALUES ($1,$2,'binance',$3) ON CONFLICT (venue,exchange_identity_hash) DO NOTHING")
+                sqlx::query("INSERT INTO venue_user_trading_accounts (trading_account_id,user_id,venue,exchange_identity_hash) VALUES ($1,$2,'binance',$3) ON CONFLICT (venue,exchange_identity_hash) WHERE retired_ms IS NULL DO NOTHING")
                     .bind(&new_account_id).bind(&principal.user.user_id).bind(probe.account_identity_hash.as_slice())
                     .execute(&mut *tx).await.map_err(database_error)?;
-                let account = sqlx::query("SELECT trading_account_id,user_id FROM venue_user_trading_accounts WHERE venue='binance' AND exchange_identity_hash=$1")
+                let account = sqlx::query("SELECT trading_account_id,user_id FROM venue_user_trading_accounts WHERE venue='binance' AND exchange_identity_hash=$1 AND retired_ms IS NULL FOR UPDATE")
                     .bind(probe.account_identity_hash.as_slice()).fetch_one(&mut *tx).await.map_err(database_error)?;
-                let owner: String = account.try_get("user_id").map_err(database_error)?;
-                let account_id: String = account
+                let mut owner: String = account.try_get("user_id").map_err(database_error)?;
+                let mut account_id: String = account
                     .try_get("trading_account_id")
                     .map_err(database_error)?;
+                if owner != principal.user.user_id && summary.trading_account_id.is_none() {
+                    if let Some(adopted) = adoption::adopt_deleted_personal(
+                        &mut tx,
+                        principal,
+                        id,
+                        &account_id,
+                        &owner,
+                        &probe,
+                    )
+                    .await?
+                    {
+                        account_id = adopted;
+                        owner = principal.user.user_id.clone();
+                    }
+                }
                 if owner != principal.user.user_id
                     || summary
                         .trading_account_id
