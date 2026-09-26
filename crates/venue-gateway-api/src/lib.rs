@@ -529,3 +529,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod transport_pool;

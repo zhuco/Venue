@@ -914,6 +914,7 @@ mod tests {
 
     fn private_projection(account: &str, observed_ms: u64) -> TerminalAccountProjection {
         TerminalAccountProjection {
+            balance_observed_ms: None,
             schema_version: venue_control_protocol::kol::TERMINAL_PROJECTION_SCHEMA_VERSION,
             credential_id: "00000000-0000-4000-8000-000000000002".into(),
             trading_account_id: account.into(),

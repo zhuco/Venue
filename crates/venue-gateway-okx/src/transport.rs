@@ -5,7 +5,7 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
-use reqwest::{Client, Method, header::HeaderValue, redirect::Policy};
+use reqwest::{Client, Method, header::HeaderValue};
 use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde_json::Value;
@@ -145,16 +145,13 @@ impl OkxHttpTransport {
         {
             return Err(OkxTransportError::Configuration);
         }
-        let mut builder = Client::builder()
-            .connect_timeout(operation_timeout)
-            .timeout(operation_timeout)
-            .redirect(Policy::none());
-        if disable_proxy {
-            builder = builder.no_proxy();
-        }
-        let client = builder
-            .build()
-            .map_err(|_| OkxTransportError::Configuration)?;
+        let client = venue_gateway_api::transport_pool::account_http_client(
+            operation_timeout,
+            Some(operation_timeout),
+            disable_proxy,
+            false,
+        )
+        .map_err(|_| OkxTransportError::Configuration)?;
         Ok(Self {
             client,
             config,

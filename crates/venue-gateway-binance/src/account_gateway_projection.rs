@@ -178,6 +178,49 @@ impl BinanceCompletedProjection {
 }
 
 impl BinanceAccountGateway {
+    /// Refresh only PM account assets while the authenticated socket continues to drain.
+    pub fn prepare_balance_read(
+        &mut self,
+    ) -> Result<
+        impl std::future::Future<
+            Output = Result<
+                (Vec<venue_execution::SignedAccountBalance>, u64, u64),
+                BinanceAccountGatewayError,
+            >,
+        > + Send
+        + 'static,
+        BinanceAccountGatewayError,
+    > {
+        let generation = self.private_generation;
+        let transport = self.transport_for_private_generation(generation)?;
+        let credentials = crate::BinanceCredentials::from_secrets(
+            self.credentials.api_key.clone(),
+            self.credentials.api_secret.clone(),
+        )
+        .map_err(|_| BinanceAccountGatewayError::Credentials)?;
+        let attempt = self.take_attempt_id()?;
+        let scope = crate::BinancePrivateReadScope::new(
+            &self.config,
+            &self.rules,
+            generation,
+            attempt,
+            super::now_ms()?,
+        )
+        .map_err(|_| BinanceAccountGatewayError::Readback)?;
+        Ok(async move {
+            let response = super::signed_snapshot_page(
+                &transport,
+                &credentials,
+                crate::build_account_request(&scope),
+            )
+            .await
+            .map_err(|_| BinanceAccountGatewayError::Readback)?;
+            let balances = super::snapshot_balances(&response.payload)
+                .map_err(|_| BinanceAccountGatewayError::Readback)?;
+            Ok((balances, response.received_at_ms, generation))
+        })
+    }
+
     pub fn prepare_projection_read(
         &mut self,
         cursor: Option<String>,

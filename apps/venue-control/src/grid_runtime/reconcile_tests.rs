@@ -490,6 +490,7 @@ fn projection(
 ) -> Result<TerminalAccountProjection, Box<dyn std::error::Error>> {
     let symbol: venue_domain::Symbol = "BTC/USDT".parse()?;
     Ok(TerminalAccountProjection {
+        balance_observed_ms: None,
         schema_version: TERMINAL_PROJECTION_SCHEMA_VERSION,
         credential_id: CREDENTIAL.into(),
         trading_account_id: ACCOUNT.into(),

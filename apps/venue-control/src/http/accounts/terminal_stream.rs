@@ -9,6 +9,7 @@ pub(super) async fn serve<R>(
     token: SecretValue,
     request: TerminalProjectionRequest,
     compact: bool,
+    asset_clock: bool,
 ) -> Result<(), ()>
 where
     R: ControlRepository + 'static,
@@ -45,12 +46,15 @@ where
                 .await
         })
         .await;
-        let (projection, persisted_projection) = match result {
+        let (mut projection, persisted_projection) = match result {
             Ok(Ok(value)) => value,
             Ok(Err(error)) if !opened => return account_error(stream, error.code).await,
             Err(_) if !opened => return account_error(stream, AccountErrorCode::Unavailable).await,
             _ => return Err(()),
         };
+        if !asset_clock && let Some(value) = &mut projection {
+            value.balance_observed_ms = None;
+        }
         let body = if compact {
             serde_json::to_string(&TerminalAccountStreamEvent::between(
                 previous.as_ref(),

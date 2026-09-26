@@ -217,3 +217,5 @@ VenueFlow 延迟采集：`apps/ui/desktop/src/latency_evidence.rs` 与 `latency_
 终端成交重绘：`accounts/kol.rs::terminal_account_projection_update` 区分数据库投影与签名网络读取；`http/accounts/terminal_stream.rs` 对前者以 33ms 合并通知，后者保留 500ms 节奏。`private_projection.rs` 在订单或持仓变化时使历史缓存失效，当前订单与成交历史同帧增量交付；`http/account_tests/terminal_stream.rs` 验证部分成交和全部成交的推送。
 
 网格订单身份检查：`grid_store/reads.rs::ensure_resolvable_owners` 按各身份字段判空，`migrations/0050_grid_identity_candidates.sql` 仅索引待补全身份的记录，避免每轮扫描全部历史订单；原身份与未知结果栅栏不变。
+
+账户展示新增 `apps/venue-control/src/private_projection/display_orders.rs`、`apps/venue-control/src/accounts/strategy_projection_cache.rs`；五所账户连接复用见 `crates/venue-gateway-api/src/transport_pool.rs`，复用 workspace Tokio，无新版本依赖。

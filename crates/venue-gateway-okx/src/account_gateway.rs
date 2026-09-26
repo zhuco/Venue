@@ -5,7 +5,7 @@ use std::{
 };
 
 use rust_decimal::Decimal;
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Runtime;
 use venue_domain::domain::{
     Amount, Asset, ExecutionCommand, FieldState, Fill, LimitTimeInForce, MarketReduceCommand,
     NativeOrderFamily, OrderCommand, OrderSide, OrderState, PositionSide, Price, Symbol,
@@ -46,7 +46,7 @@ use market_facts::{OkxLimitBbo, parse_limit_bbo};
 /// Production OKX adapter for the lightweight account host. Base quantities remain canonical in
 /// the WAL; `build_place_request` converts them to contracts using ctVal × ctMult exactly once.
 pub struct OkxAccountGateway {
-    runtime: Runtime,
+    runtime: &'static Runtime,
     config: OkxConfig,
     credentials: OkxCredentials,
     transport: OkxHttpTransport,
@@ -122,10 +122,7 @@ impl OkxAccountGateway {
         transport: OkxHttpTransport,
         trade_mode: OkxTradeMode,
     ) -> Result<Self, OkxAccountGatewayError> {
-        let runtime = Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
+        let runtime = venue_gateway_api::transport_pool::account_runtime()
             .map_err(|_| OkxAccountGatewayError::Runtime)?;
         let generation = unix_ms()?;
         let response = runtime

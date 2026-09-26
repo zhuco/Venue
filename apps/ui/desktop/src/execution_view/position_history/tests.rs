@@ -19,6 +19,7 @@ fn fill(id: &str, side: OrderSide, quantity: i64, price: i64, time: u64) -> Term
 
 fn projection(fills: Vec<TerminalFill>) -> TerminalAccountProjection {
     TerminalAccountProjection {
+        balance_observed_ms: None,
         schema_version: 1,
         credential_id: "fixture".into(),
         trading_account_id: "fixture".into(),

@@ -157,6 +157,7 @@ fn account_connection_uses_the_same_private_projection_as_positions()
     let observed = now_ms();
     model.execution.apply_private(
         Some(TerminalAccountProjection {
+            balance_observed_ms: None,
             schema_version: TERMINAL_PROJECTION_SCHEMA_VERSION,
             credential_id: selected.credential_id.clone(),
             trading_account_id: selected

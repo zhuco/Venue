@@ -314,6 +314,21 @@ fn private_stream_fill_keeps_socket_generation_and_admits_against_current_snapsh
 }
 
 #[test]
+fn funding_balance_only_event_requests_asset_refresh() -> Result<(), Box<dyn std::error::Error>> {
+    let (_, rules, binding) = limit_fixture()?;
+    let event = normalize_private_stream_event(BinanceRawPrivateFrame {
+        binding: binding.clone(), instrument_generation: rules.instrument.generation,
+        private_generation: 9, received_at_ms: 1_720_000_000_100,
+        payload: Bytes::from_static(br#"{"e":"ACCOUNT_UPDATE","fs":"UM","E":1000,"T":999,"a":{"m":"FUNDING_FEE","B":[{"a":"USDT","wb":"100","cw":"100","bc":"-1"}]}}"#),
+    }, &binding, rules.instrument.generation, 9, 10)?;
+    assert!(matches!(
+        event,
+        Some(BinancePrivateAccountEvent::RefreshRecommended)
+    ));
+    Ok(())
+}
+
+#[test]
 fn private_stream_admits_each_enabled_kol_symbol_without_retaining_the_frame()
 -> Result<(), Box<dyn std::error::Error>> {
     let (_, rules, binding) = limit_fixture()?;

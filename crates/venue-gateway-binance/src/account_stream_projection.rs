@@ -27,6 +27,7 @@ pub(super) struct AccountStreamProjection {
     last_published_ms: u64,
     last_change_received_ms: u64,
     incomplete_since: Option<Instant>,
+    balances: Option<(Vec<venue_execution::SignedAccountBalance>, u64)>,
 }
 
 impl AccountStreamProjection {
@@ -63,6 +64,7 @@ impl AccountStreamProjection {
             last_change_received_ms: baseline.observed_at_ms(),
             incomplete_since: None,
             baseline,
+            balances: None,
         }
     }
 
@@ -74,8 +76,7 @@ impl AccountStreamProjection {
         let value: Value = serde_json::from_slice(&frame.payload).map_err(|_| invalid())?;
         let event = text(&value, "e")?;
         if matches!(event, "balanceUpdate" | "outboundAccountPosition") {
-            // These change the cached PM equity, not UM orders or positions. Equity remains
-            // explicitly timestamped at bootstrap and is verified before profit reduction.
+            // The consumer refreshes PM equity independently; this frame carries no total USD equity.
             number(&value, "E")?;
             return Ok(());
         }
@@ -375,7 +376,20 @@ impl AccountStreamProjection {
             cursor.encode(),
             Vec::new(),
         )
-        .and_then(|snapshot| snapshot.with_balances(self.baseline.balances().to_vec()))
+        .and_then(|snapshot| {
+            let (balances, time) = self
+                .balances
+                .as_ref()
+                .filter(|(_, time)| *time <= observed_ms)
+                .map(|(balances, time)| (balances.clone(), *time))
+                .unwrap_or_else(|| {
+                    (
+                        self.baseline.balances().to_vec(),
+                        self.baseline.balance_observed_at_ms(),
+                    )
+                });
+            snapshot.with_balances_at(balances, time)
+        })
         .and_then(|snapshot| snapshot.with_stream_origin(self.baseline.observed_at_ms()))
         .map_err(|_| invalid())?;
         Ok(Some(snapshot))
@@ -383,6 +397,27 @@ impl AccountStreamProjection {
 }
 
 impl BinanceAccountGateway {
+    pub fn accept_balance_read(
+        &mut self,
+        balances: Vec<venue_execution::SignedAccountBalance>,
+        observed: u64,
+        generation: u64,
+    ) {
+        if generation != self.private_generation {
+            return;
+        }
+        if let Some(state) = &mut self.stream_projection {
+            if observed > state.baseline.balance_observed_at_ms()
+                && state
+                    .balances
+                    .as_ref()
+                    .is_none_or(|(_, time)| observed > *time)
+            {
+                state.balances = Some((balances, observed));
+                state.last_change_received_ms = state.last_change_received_ms.max(observed);
+            }
+        }
+    }
     pub fn install_stream_projection(
         &mut self,
         snapshot: SignedAccountSnapshot,
@@ -398,7 +433,7 @@ impl BinanceAccountGateway {
     }
 
     /// No HTTP. The observation time is the latest real frame/Pong, never the local poll time.
-    /// Balances retain the bootstrap value; callers must independently verify PM equity before
+    /// Balances retain their independent signed observation time; verify PM equity before
     /// using it for a new risk action. The snapshot is a read model, not a dispatch permission.
     /// A scheduling hint only; callers still validate the complete signed projection.
     pub fn stream_projection_change_ms(&self) -> Option<u64> {

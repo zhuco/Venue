@@ -56,6 +56,7 @@ fn private_overlays_obey_account_symbol_and_visibility() -> Result<(), Box<dyn s
     overview.selected_credential_id = Some("credential".into());
     model.apply_account_overview(overview);
     let projection = TerminalAccountProjection {
+        balance_observed_ms: None,
         schema_version: TERMINAL_PROJECTION_SCHEMA_VERSION,
         credential_id: "credential".into(),
         trading_account_id: "selected-account".into(),

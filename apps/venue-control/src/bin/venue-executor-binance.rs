@@ -362,6 +362,13 @@ async fn run_projection_supervisor(
                     }
                     let ready = projection_store.stream_surface_settled(&source, &snapshot).await;
                     if !matches!(ready, Ok(Some(true))) {
+                        if matches!(ready, Ok(None | Some(false))) {
+                            if let Ok(now) = now_ms() {
+                                if projection_store.persist_display(&source, &snapshot, now).await.is_err() {
+                                    tracing::warn!(credential_id = %source.credential_id, "Authenticated display projection unavailable");
+                                }
+                            }
+                        }
                         let _ = completion.send(ready.map_err(|_| ()));
                         continue;
                     }
@@ -956,6 +963,16 @@ fn spawn_projection_worker(
                 u64,
             )> = None;
             let mut fill_epoch = 0_u64;
+            let mut balance_dirty = false;
+            let mut balance_read_at = std::time::Instant::now();
+            let mut pending_balance: Option<
+                std::sync::mpsc::Receiver<
+                    Result<
+                        (Vec<venue_execution::SignedAccountBalance>, u64, u64),
+                        venue_gateway_binance::BinanceAccountGatewayError,
+                    >,
+                >,
+            > = None;
             let mut recovering = false;
             let mut recheck_at = std::time::Instant::now() + ACCOUNT_RECHECK_INTERVAL;
             let mut periodic_recheck = false;
@@ -1041,6 +1058,46 @@ fn spawn_projection_worker(
                     PrivatePollAction::RefreshRecommended => (true, false),
                     PrivatePollAction::Idle => (false, false),
                 };
+                balance_dirty |= private_changed;
+                if let Some(result) =
+                    pending_balance
+                        .as_ref()
+                        .and_then(|receiver| match receiver.try_recv() {
+                            Ok(result) => Some(result),
+                            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(
+                                venue_gateway_binance::BinanceAccountGatewayError::Readback,
+                            )),
+                        })
+                {
+                    pending_balance = None;
+                    match result {
+                        Ok((balances, observed, generation)) => {
+                            gateway.accept_balance_read(balances, observed, generation)
+                        }
+                        Err(_) => {
+                            balance_dirty = true;
+                            balance_read_at =
+                                std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        }
+                    }
+                }
+                if balance_dirty
+                    && !recovering
+                    && !signed_correction
+                    && pending_balance.is_none()
+                    && std::time::Instant::now() >= balance_read_at
+                {
+                    if let Ok(read) = gateway.prepare_balance_read() {
+                        let (completed, receiver) = std::sync::mpsc::sync_channel(1);
+                        async_runtime.spawn(async move {
+                            let _ = completed.send(read.await);
+                        });
+                        pending_balance = Some(receiver);
+                        balance_dirty = false;
+                    }
+                    balance_read_at = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                }
                 if signed_correction {
                     recovering = true;
                     refresh_at = std::time::Instant::now();

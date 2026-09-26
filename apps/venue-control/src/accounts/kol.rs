@@ -539,7 +539,13 @@ impl AccountService {
     ) -> Result<Option<TerminalAccountProjection>, AccountError> {
         self.terminal_account_projection_update(principal, request, now_ms, cached)
             .await
-            .map(|(projection, _)| projection)
+            .map(|(mut projection, _)| {
+                // The legacy HTTP response keeps its exact schema; clocks are opt-in on SSE.
+                if let Some(value) = &mut projection {
+                    value.balance_observed_ms = None;
+                }
+                projection
+            })
     }
 
     /// Only persisted projections can be read faster without increasing exchange traffic.

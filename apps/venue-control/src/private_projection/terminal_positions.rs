@@ -83,6 +83,7 @@ mod tests {
     fn refresh_replaces_only_its_symbol_and_does_not_freshen_other_surfaces()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut projection = TerminalAccountProjection {
+            balance_observed_ms: None,
             schema_version: TERMINAL_PROJECTION_SCHEMA_VERSION,
             credential_id: "00000000-0000-4000-8000-000000000001".into(),
             trading_account_id: "00000000-0000-4000-8000-000000000002".into(),

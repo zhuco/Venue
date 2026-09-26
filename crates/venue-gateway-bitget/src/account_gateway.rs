@@ -6,7 +6,7 @@ use std::{
 
 use rust_decimal::Decimal;
 use serde_json::Value;
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Runtime;
 use venue_domain::domain::{
     Amount, ExecutionCommand, FieldState, Fill, LimitTimeInForce, NativeOrderFamily, OrderCommand,
     OrderSide, OrderState, PositionSide, Price, Symbol,
@@ -54,7 +54,7 @@ const MAX_LIMIT_TICKER_AGE_MS: u64 = 5_000;
 /// The Bitget UTA account writer. Startup and every dispatched command collect fresh signed
 /// facts; the only physical mutation consumes the runtime host's linear permit.
 pub struct BitgetAccountGateway {
-    runtime: Runtime,
+    runtime: &'static Runtime,
     config: BitgetConfig,
     credentials: BitgetCredentials,
     transport: BitgetHttpTransport,
@@ -95,10 +95,7 @@ impl BitgetAccountGateway {
         BitgetAccountBinding::UtaUsdtFuturesHedge
             .validate_gateway_binding(&binding)
             .map_err(|_| BitgetAccountGatewayError::Binding)?;
-        let runtime = Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
+        let runtime = venue_gateway_api::transport_pool::account_runtime()
             .map_err(|_| BitgetAccountGatewayError::Runtime)?;
         let generation = now_ms()?;
         let transport = BitgetHttpTransport::new(binding, generation, limits)

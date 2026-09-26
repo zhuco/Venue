@@ -14,6 +14,7 @@ mod leader_bot;
 mod managed_followers;
 mod session;
 mod strategy_projection;
+mod strategy_projection_cache;
 mod support_martingale;
 mod terminal;
 #[cfg(test)]
@@ -47,6 +48,7 @@ fn ms(value: u64) -> Result<i64, AccountError> {
 }
 
 pub struct AccountService {
+    projection_reads: strategy_projection_cache::ProjectionReadCache,
     pool: PgPool,
     projection_wake: std::sync::OnceLock<tokio::sync::watch::Receiver<()>>,
     cipher: Arc<CredentialCipher>,
@@ -79,6 +81,7 @@ impl AccountService {
         node_token: Option<SecretValue>,
     ) -> Result<Self, AccountError> {
         Ok(Self {
+            projection_reads: Default::default(),
             pool,
             projection_wake: std::sync::OnceLock::new(),
             cipher: Arc::new(cipher),

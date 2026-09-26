@@ -153,6 +153,9 @@ pub struct TerminalAsset {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TerminalAccountProjection {
+    /// Independent asset observation; absent on older servers. Never substitute a stream heartbeat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_observed_ms: Option<u64>,
     pub schema_version: u16,
     pub credential_id: String,
     pub trading_account_id: String,

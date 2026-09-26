@@ -1,5 +1,6 @@
 //! Secret-free Binance private-account projection shared by the singleton Executor and Control.
 
+mod display_orders;
 mod terminal_positions;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -381,6 +382,7 @@ impl BinancePrivateProjectionStore {
             balance_observed_ms: Some(snapshot.balance_observed_at_ms()),
             fills_cursor: snapshot.fills_cursor().to_owned(),
             projection: projection.clone(),
+            display_projection: None,
         };
         let payload = serde_json::to_value(stored).map_err(|_| PrivateProjectionError::Invalid)?;
         sqlx::query("INSERT INTO venue_binance_account_projections (credential_id,owner_user_id,trading_account_id,observed_ms,persisted_ms,private_generation,projection_json) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (credential_id) DO UPDATE SET observed_ms=EXCLUDED.observed_ms,persisted_ms=EXCLUDED.persisted_ms,private_generation=EXCLUDED.private_generation,projection_json=EXCLUDED.projection_json WHERE venue_binance_account_projections.observed_ms<=EXCLUDED.observed_ms")
@@ -394,6 +396,38 @@ impl BinancePrivateProjectionStore {
         projection.fills = self.load_fills(source, HISTORY_LIMIT).await?;
         projection.position_history = self.load_position_history(source, HISTORY_LIMIT).await?;
         Ok(projection)
+    }
+
+    /// Grid continuation may still be fenced by in-flight commands. Publish the
+    /// authenticated read model in a separate JSON field without advancing the
+    /// projection used by admission, reconciliation or strategy dispatch.
+    pub async fn persist_display(
+        &self,
+        source: &ActiveProjectionSource,
+        snapshot: &SignedAccountSnapshot,
+        now_ms: u64,
+    ) -> Result<bool, PrivateProjectionError> {
+        if snapshot.binding().trading_account_id != source.trading_account_id {
+            return Err(PrivateProjectionError::Invalid);
+        }
+        let mut projection = project(source, snapshot, now_ms.max(snapshot.observed_at_ms()))?;
+        projection.balance_observed_ms = Some(snapshot.balance_observed_at_ms());
+        // Display history comes from the already persisted bounded fill table.
+        projection.fills.clear();
+        projection.position_history.clear();
+        let payload =
+            serde_json::to_value(&projection).map_err(|_| PrivateProjectionError::Invalid)?;
+        let result = sqlx::query("UPDATE venue_binance_account_projections SET projection_json=jsonb_set(projection_json,'{display_projection}',$5,true) WHERE credential_id=$1 AND owner_user_id=$2 AND trading_account_id=$3 AND private_generation=$4 AND observed_ms<=$6 AND COALESCE((projection_json->>'stream_healthy')::boolean,false) AND COALESCE((projection_json#>>'{display_projection,observed_ms}')::bigint,0)<=$6")
+            .bind(&source.credential_id)
+            .bind(&source.owner_user_id)
+            .bind(&source.trading_account_id)
+            .bind(i64::try_from(projection.private_generation).map_err(|_| PrivateProjectionError::Invalid)?)
+            .bind(payload)
+            .bind(ms(snapshot.observed_at_ms())?)
+            .execute(&self.pool)
+            .await
+            .map_err(|_| PrivateProjectionError::Unavailable)?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Persists one authenticated stream fill without advancing the signed projection cursor.
@@ -557,6 +591,7 @@ impl BinancePrivateProjectionStore {
             owner_user_id,
             credential_id,
             require_healthy,
+            false,
             HISTORY_LIMIT,
             None,
         )
@@ -569,7 +604,7 @@ impl BinancePrivateProjectionStore {
         owner: &str,
         credential: &str,
     ) -> Result<Option<TerminalAccountProjection>, PrivateProjectionError> {
-        self.load_owned_with_history(owner, credential, false, 0, None)
+        self.load_owned_with_history(owner, credential, false, false, 0, None)
             .await
     }
 
@@ -585,6 +620,7 @@ impl BinancePrivateProjectionStore {
             owner_user_id,
             credential_id,
             false,
+            true,
             DISPLAY_HISTORY_LIMIT,
             cached,
         )
@@ -596,6 +632,7 @@ impl BinancePrivateProjectionStore {
         owner_user_id: &str,
         credential_id: &str,
         require_healthy: bool,
+        display_only: bool,
         history_limit: i64,
         cached: Option<&TerminalAccountProjection>,
     ) -> Result<Option<TerminalAccountProjection>, PrivateProjectionError> {
@@ -608,6 +645,23 @@ impl BinancePrivateProjectionStore {
         };
         let mut stored: StoredProjection =
             serde_json::from_value(payload).map_err(|_| PrivateProjectionError::Unavailable)?;
+        let mut display_updated = false;
+        if display_only {
+            stored.projection.balance_observed_ms = stored.balance_observed_ms;
+            if let Some(display) = stored.display_projection.take().filter(|display| {
+                display.credential_id == stored.projection.credential_id
+                    && display.trading_account_id == stored.projection.trading_account_id
+                    && display.private_generation == stored.projection.private_generation
+                    && display.observed_ms >= stored.projection.observed_ms
+            }) {
+                stored.projection = display;
+                stored.projection.balance_observed_ms = stored
+                    .projection
+                    .balance_observed_ms
+                    .or(stored.balance_observed_ms);
+                display_updated = true;
+            }
+        }
         let source = ActiveProjectionSource {
             kol_user_id: None,
             owner_user_id: owner_user_id.to_owned(),
@@ -620,7 +674,9 @@ impl BinancePrivateProjectionStore {
             stored.projection.fills.clear();
             stored.projection.position_history.clear();
         } else if let Some(cached) = cached.filter(|previous| {
-            previous.credential_id == stored.projection.credential_id
+            !display_only
+                && !display_updated
+                && previous.credential_id == stored.projection.credential_id
                 && previous.trading_account_id == stored.projection.trading_account_id
                 && previous.private_generation == stored.projection.private_generation
                 && previous.position_mode == stored.projection.position_mode
@@ -637,6 +693,10 @@ impl BinancePrivateProjectionStore {
             stored.projection.fills = self.load_fills(&source, history_limit).await?;
             stored.projection.position_history =
                 self.load_position_history(&source, history_limit).await?;
+        }
+        if display_only {
+            self.apply_display_fills(owner_user_id, &mut stored.projection)
+                .await?;
         }
         self.apply_terminal_position_refresh(owner_user_id, &mut stored.projection)
             .await?;
@@ -780,6 +840,8 @@ struct StoredProjection {
     stream_healthy: bool,
     fills_cursor: String,
     projection: TerminalAccountProjection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display_projection: Option<TerminalAccountProjection>,
 }
 
 pub(crate) fn project(
@@ -859,6 +921,7 @@ pub(crate) fn project(
         })
         .collect();
     let projection = TerminalAccountProjection {
+        balance_observed_ms: None,
         schema_version: TERMINAL_PROJECTION_SCHEMA_VERSION,
         credential_id: source.credential_id.clone(),
         trading_account_id: source.trading_account_id.clone(),

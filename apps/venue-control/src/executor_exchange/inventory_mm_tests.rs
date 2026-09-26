@@ -8,6 +8,7 @@ fn fixture() -> Result<(ExecutionRequest, TerminalAccountProjection), Box<dyn st
     request.credential_id = "00000000-0000-4000-8000-000000000001".into();
     request.trading_account_id = "00000000-0000-4000-8000-000000000002".into();
     let projection = TerminalAccountProjection {
+        balance_observed_ms: None,
         schema_version: 1,
         credential_id: request.credential_id.clone(),
         trading_account_id: request.trading_account_id.clone(),

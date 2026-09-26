@@ -43,6 +43,7 @@ pub(crate) fn model() -> AppModel {
 pub(crate) fn projection(i: u64) -> TerminalAccountProjection {
     let now = crate::account_center::now_ms();
     TerminalAccountProjection {
+        balance_observed_ms: None,
         schema_version: TERMINAL_PROJECTION_SCHEMA_VERSION,
         credential_id: id(i),
         trading_account_id: id(i + 10),

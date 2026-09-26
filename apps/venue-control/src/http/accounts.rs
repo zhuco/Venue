@@ -80,7 +80,10 @@ where
         };
     }
     if path == venue_control_protocol::kol::KOL_TERMINAL_ACCOUNT_STREAM_PATH {
-        let compact = query == Some(venue_control_protocol::terminal_account_stream::COMPACT_QUERY);
+        let asset_clock =
+            query == Some(venue_control_protocol::terminal_account_stream::ASSET_CLOCK_QUERY);
+        let compact = asset_clock
+            || query == Some(venue_control_protocol::terminal_account_stream::COMPACT_QUERY);
         if request.method != Method::Post || (query.is_some() && !compact) || !request.json_content
         {
             return account_error(stream, AccountErrorCode::InvalidInput).await;
@@ -95,7 +98,16 @@ where
             Ok(value) => value,
             Err(error) => return account_error(stream, error.code).await,
         };
-        return terminal_stream::serve(stream, state, accounts, token, subscription, compact).await;
+        return terminal_stream::serve(
+            stream,
+            state,
+            accounts,
+            token,
+            subscription,
+            compact,
+            asset_clock,
+        )
+        .await;
     }
     if path.starts_with("/v2/account/")
         || matches!(

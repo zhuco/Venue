@@ -904,6 +904,7 @@ mod tests {
 
     fn projection(record: &InventoryMmInstance) -> TerminalAccountProjection {
         TerminalAccountProjection {
+            balance_observed_ms: None,
             schema_version: TERMINAL_PROJECTION_SCHEMA_VERSION,
             credential_id: record.credential_id.clone(),
             trading_account_id: record.trading_account_id.clone(),

@@ -403,6 +403,7 @@ fn projection()
     let selection = selection()?;
     let now = crate::account_center::now_ms();
     Ok(TerminalAccountProjection {
+        balance_observed_ms: None,
         schema_version: TERMINAL_PROJECTION_SCHEMA_VERSION,
         credential_id: selection.credential_id,
         trading_account_id: selection.trading_account_id,

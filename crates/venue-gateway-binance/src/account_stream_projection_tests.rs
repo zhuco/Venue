@@ -62,6 +62,35 @@ const FILL: &str = r#"{"e":"ORDER_TRADE_UPDATE","fs":"UM","E":132,"T":130,"o":{"
 const POSITION: &str = r#"{"e":"ACCOUNT_UPDATE","fs":"UM","E":131,"T":130,"a":{"m":"ORDER","P":[{"s":"SOLUSDC","ps":"LONG","pa":"3","ep":"100","up":"0"}]}}"#;
 
 #[test]
+fn asset_refresh_has_its_own_clock_and_does_not_advance_position_facts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut state = state()?;
+    state.balances = Some((
+        vec![SignedAccountBalance {
+            asset: "USD".parse()?,
+            equity: 75.into(),
+            available_margin: Some(60.into()),
+        }],
+        180,
+    ));
+    let before = state.snapshot(150, 2)?.ok_or("snapshot")?;
+    assert_eq!(before.balances()[0].equity, Decimal::from(50));
+    assert_eq!(before.balance_observed_at_ms(), 100);
+    let after = state.snapshot(200, 2)?.ok_or("snapshot")?;
+    assert_eq!(after.balances()[0].equity, Decimal::from(75));
+    assert_eq!(after.balance_observed_at_ms(), 180);
+    assert_eq!(after.observed_at_ms(), 200);
+    assert_eq!(after.positions(), before.positions());
+    assert!(
+        after
+            .clone()
+            .with_balances_at(after.balances().to_vec(), 201)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
 fn amendment_preserves_source_identity_and_creation_cutoff()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut projection = state()?;
