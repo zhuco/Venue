@@ -392,6 +392,7 @@ async fn managed_verification_uses_saved_authorization_and_requests_activation()
         .verify_managed_follower_with(
             &owner,
             ManagedFollowerVerifyRequest {
+                authorization: None,
                 managed_id: saved.managed_id.clone(),
             },
             timestamp,
@@ -428,6 +429,7 @@ async fn managed_verification_uses_saved_authorization_and_requests_activation()
         .verify_managed_follower_with(
             &owner,
             ManagedFollowerVerifyRequest {
+                authorization: None,
                 managed_id: fixed.managed_id.clone(),
             },
             timestamp,
@@ -483,6 +485,7 @@ async fn managed_delete_is_one_click_and_erases_credentials_after_drain() -> Tes
         .verify_managed_follower_with(
             &owner,
             ManagedFollowerVerifyRequest {
+                authorization: None,
                 managed_id: saved.managed_id.clone(),
             },
             timestamp,
@@ -558,7 +561,7 @@ async fn frozen_managed_table_is_preserved_and_nonempty_legacy_fails_closed() ->
         sqlx::query_scalar::<_, i32>("SELECT max(version) FROM venue_control_schema_migrations")
             .fetch_one(&f.pool)
             .await?,
-        51
+        52
     );
     assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='venue_kol_managed_followers' AND column_name='managed_follower_id'").fetch_one(&f.pool).await?,1);
     let session = f.service.register(login("freshuser"), now()).await?;
@@ -628,6 +631,7 @@ async fn managed_adoption_requires_same_owner_deleted_flat_drained_and_preserves
         )
         .await?;
     let verify = || ManagedFollowerVerifyRequest {
+        authorization: None,
         managed_id: managed.managed_id.clone(),
     };
     let blocked = f
@@ -653,6 +657,7 @@ async fn managed_adoption_requires_same_owner_deleted_flat_drained_and_preserves
         .verify_managed_follower_with(
             &stranger,
             ManagedFollowerVerifyRequest {
+                authorization: None,
                 managed_id: other.managed_id,
             },
             timestamp,
@@ -681,9 +686,16 @@ async fn managed_adoption_requires_same_owner_deleted_flat_drained_and_preserves
         Some(Code::AccountInUse)
     );
     sqlx::query("UPDATE venue_binance_commands SET command_state='cancelled',terminal_ms=2,updated_ms=2 WHERE command_id='adopt-history'").execute(&f.pool).await?;
+    let mut chosen = verify();
+    chosen.authorization = Some(FollowAuthorization {
+        sizing: venue_control_protocol::follow_sizing::FollowSizing::SourceRatio {
+            ratio: Decimal::new(5, 1),
+        },
+        multiplier: Decimal::ONE,
+    });
     let adopted = f
         .service
-        .verify_managed_follower_with(&owner, verify(), timestamp, |_| async {
+        .verify_managed_follower_with(&owner, chosen.clone(), timestamp, |_| async {
             proof(103, false, timestamp)
         })
         .await?;
@@ -700,6 +712,26 @@ async fn managed_adoption_requires_same_owner_deleted_flat_drained_and_preserves
     .fetch_one(&f.pool)
     .await?;
     assert_ne!(account, old_account);
+    let sizing: serde_json::Value = sqlx::query_scalar(
+        "SELECT sizing_json FROM venue_kol_follow_relations WHERE follower_user_id=$1",
+    )
+    .bind(&subject.user.user_id)
+    .fetch_one(&f.pool)
+    .await?;
+    assert_eq!(
+        sizing,
+        serde_json::json!({"mode":"source_ratio","ratio":"0.5"})
+    );
+    assert_eq!(
+        f.service
+            .verify_managed_follower_with(&owner, chosen, timestamp, |_| async {
+                proof(103, false, timestamp)
+            })
+            .await
+            .err()
+            .map(|e| e.code),
+        Some(Code::Conflict)
+    );
     let history: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_user_trading_accounts a JOIN venue_binance_commands c USING(trading_account_id) WHERE a.trading_account_id=$1 AND a.user_id=$2 AND a.successor_account_id=$3 AND a.retired_by_managed_id=$4 AND a.retired_ms IS NOT NULL AND c.command_state='cancelled')").bind(old_account).bind(&owner.user.user_id).bind(&account).bind(&managed.managed_id).fetch_one(&f.pool).await?;
     assert!(history);
     let active: i64=sqlx::query_scalar("SELECT count(*) FROM venue_user_trading_accounts WHERE exchange_identity_hash=$1 AND retired_ms IS NULL").bind(vec![103_u8;32]).fetch_one(&f.pool).await?;

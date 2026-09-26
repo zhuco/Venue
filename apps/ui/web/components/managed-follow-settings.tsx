@@ -35,7 +35,8 @@ export function ManagedFollowSettingsPanel({ managedId, label, csrf, canManage, 
     if (pending || !relation || !hasFollowEquity(equity)) return;
     const data = new FormData(event.currentTarget);
     const text = (name: string) => String(data.get(name) ?? "").trim();
-    const sizing = sizingFromForm(data);
+    let sizing;
+    try { sizing = sizingFromForm(data); } catch (cause) { setError(cause instanceof Error ? cause.message : messages.unavailable); return; }
     const settings: ManagedFollowSettings = {
       sizing, allocated_capital: equity, multiplier: text("multiplier"),
       max_order_notional: sizing.mode === "fixed_notional" ? sizing.notional : equity, max_total_notional: sizing.mode === "fixed_notional" ? sizing.notional : equity,

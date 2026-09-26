@@ -411,3 +411,20 @@ fn persisted_policy_keeps_legacy_recovery_and_close_quantities_unchanged()
     assert!(normalize_request_quantity(&request, Decimal::new(5, 1), &rules).is_err());
     Ok(())
 }
+
+#[test]
+fn source_ratio_floor_never_enlarges_a_small_order() -> Result<(), Box<dyn std::error::Error>> {
+    let rules = rules()?;
+    let ctx = CopyRiskContext {
+        round_open_quantity_up: false,
+        open_quantity_rounding: None,
+        ..context()
+    };
+    let quantity =
+        normalize_copy_open_quantity(&ctx, Decimal::new(555, 1), ctx.source_price, &rules)?;
+    assert_eq!(quantity, Decimal::from(55));
+    let small = normalize_copy_open_quantity(&ctx, Decimal::ONE, ctx.source_price, &rules)?;
+    assert_eq!(small, Decimal::ONE);
+    assert!(check_minimum_notional_at_price(Price::new(ctx.source_price)?, small, &rules).is_err());
+    Ok(())
+}

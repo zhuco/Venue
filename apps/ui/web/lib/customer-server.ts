@@ -91,6 +91,7 @@ function publicRisk(raw: unknown, managed = false): ObjectValue {
   if (value.sizing !== undefined) {
     const sizing = object(value.sizing);
     if (sizing.mode === "proportional") result.sizing = { mode: "proportional" };
+    else if (sizing.mode === "source_ratio" && typeof sizing.ratio === "string" && /^\d+(\.\d+)?$/.test(sizing.ratio)) result.sizing = { mode: "source_ratio", ratio: sizing.ratio };
     else if (sizing.mode === "fixed_notional" && typeof sizing.notional === "string" && /^\d+(\.\d+)?$/.test(sizing.notional)) result.sizing = { mode: "fixed_notional", notional: sizing.notional };
     else throw new Error("invalid_sizing");
   }
@@ -102,6 +103,7 @@ function followAuthorization(raw: unknown): ObjectValue {
     || typeof value.multiplier !== "string" || !/^\d+(\.\d+)?$/.test(value.multiplier)) throw new Error("invalid_follow_authorization");
   const sizing = object(value.sizing);
   if (sizing.mode === "proportional" && Object.keys(sizing).length === 1) return { sizing: { mode: "proportional" }, multiplier: value.multiplier };
+  if (sizing.mode === "source_ratio" && Object.keys(sizing).length === 2 && Object.keys(sizing).every(field => ["mode", "ratio"].includes(field)) && typeof sizing.ratio === "string" && /^\d+(\.\d+)?$/.test(sizing.ratio) && Number(sizing.ratio) > 0 && Number(sizing.ratio) <= 1 && Number(value.multiplier) === 1) return { sizing: { mode: "source_ratio", ratio: sizing.ratio }, multiplier: "1" };
   if (sizing.mode === "fixed_notional" && Object.keys(sizing).every(field => ["mode", "notional"].includes(field))
     && Object.keys(sizing).length === 2 && typeof sizing.notional === "string" && /^\d+(\.\d+)?$/.test(sizing.notional)) {
     return { sizing: { mode: "fixed_notional", notional: sizing.notional }, multiplier: value.multiplier };
@@ -189,6 +191,9 @@ export async function customerResponse(request: NextRequest, action: string): Pr
       } else if (action === "credentials") {
         if (Object.keys(raw).some(k => !["label", "key", "secret", "authorization"].includes(k)) || [raw.label, raw.key, raw.secret].some(v => typeof v !== "string")) throw new Error("invalid_credentials");
         body = JSON.stringify({ credential: { label: raw.label, api_key: raw.key, api_secret: raw.secret }, authorization: followAuthorization(raw.authorization) });
+      } else if (action === "managed-verify") {
+        if (Object.keys(raw).some(k => !["managed_id", "authorization"].includes(k)) || typeof raw.managed_id !== "string") throw new Error("invalid_managed_verify");
+        body = JSON.stringify({ managed_id: raw.managed_id, ...(raw.authorization === undefined ? {} : { authorization: followAuthorization(raw.authorization) }) });
       } else if (action === "managed-delete") {
         if (Object.keys(raw).some(k => k !== "managed_id") || typeof raw.managed_id !== "string") throw new Error("invalid_managed_delete");
         body = JSON.stringify(raw);

@@ -59,6 +59,16 @@ pub(super) fn eligible(order: &TerminalOpenOrder, cutoff: u64) -> bool {
 
 // Source fills do not reduce an already established child order's quantity. The child has its
 // own fills; replacing after an amendment subtracts the fills of all prior child attempts.
+pub(super) fn source_ratio_quantity(
+    quantity: Decimal,
+    ratio: Decimal,
+) -> Result<Decimal, BinanceCommandLedgerError> {
+    if ratio <= Decimal::ZERO || ratio > Decimal::ONE {
+        return Err(BinanceCommandLedgerError::Conflict);
+    }
+    scaled_copy_quantity(quantity, ratio, Decimal::ONE, Decimal::ONE)
+}
+
 pub(super) fn replacement_quantity(
     order: &TerminalOpenOrder,
     allocated: Decimal,
@@ -74,6 +84,7 @@ pub(super) fn replacement_quantity(
         FollowSizing::Proportional => {
             scaled_copy_quantity(order.quantity, allocated, capital, multiplier)?
         }
+        FollowSizing::SourceRatio { ratio } => source_ratio_quantity(order.quantity, ratio)?,
         FollowSizing::FixedNotional { notional } => {
             let price = order
                 .limit_price
@@ -310,6 +321,42 @@ mod tests {
         assert_eq!(quantity(&source, Decimal::ONE)?, Decimal::ZERO);
         source.limit_price = Some(Decimal::ZERO);
         assert!(quantity(&source, Decimal::ZERO).is_err());
+        Ok(())
+    }
+    #[test]
+    fn half_source_notional_ignores_equity_capital_and_source_fills()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut source = order()?;
+        source.quantity = Decimal::from(10);
+        source.limit_price = Some(Decimal::from(100));
+        source.filled_quantity = Some(Decimal::from(4));
+        for capital in [Decimal::from(100), Decimal::from(550)] {
+            let quantity = replacement_quantity(
+                &source,
+                Decimal::from(240),
+                capital,
+                Decimal::ONE,
+                FollowSizing::SourceRatio {
+                    ratio: Decimal::new(5, 1),
+                },
+                Decimal::ZERO,
+            )?;
+            assert_eq!(quantity * Decimal::from(100), Decimal::from(500));
+            assert_eq!(
+                replacement_quantity(
+                    &source,
+                    Decimal::from(999),
+                    capital,
+                    Decimal::ONE,
+                    FollowSizing::SourceRatio {
+                        ratio: Decimal::new(5, 1)
+                    },
+                    Decimal::from(2)
+                )?,
+                Decimal::from(3)
+            );
+        }
+        assert!(source_ratio_quantity(source.quantity, Decimal::from(2)).is_err());
         Ok(())
     }
 }

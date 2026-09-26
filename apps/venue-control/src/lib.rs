@@ -36,6 +36,7 @@ pub const MIGRATION_0044: &str = include_str!("../migrations/0044_realtime_wake.
 pub const MIGRATION_0048: &str = include_str!("../migrations/0048_kol_default_access.sql");
 pub const MIGRATION_0049: &str = include_str!("../migrations/0049_mm_projection_digest.sql");
 pub const MIGRATION_0050: &str = include_str!("../migrations/0050_grid_identity_candidates.sql");
+pub const MIGRATION_0052: &str = include_str!("../migrations/0052_source_ratio_sizing.sql");
 pub const MIGRATION_0051: &str = include_str!("../migrations/0051_personal_to_managed_custody.sql");
 pub const MIGRATION_0047: &str = include_str!("../migrations/0047_kol_source_selection.sql");
 pub const MIGRATION_0046: &str = include_str!("../migrations/0046_kol_invite_management.sql");

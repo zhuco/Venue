@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 pub enum FollowSizing {
     #[default]
     Proportional,
+    SourceRatio {
+        #[serde(with = "rust_decimal::serde::str")]
+        ratio: Decimal,
+    },
     FixedNotional {
         #[serde(with = "rust_decimal::serde::str")]
         notional: Decimal,
@@ -20,6 +24,10 @@ impl<'de> Deserialize<'de> for FollowSizing {
         #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
         enum Wire {
             Proportional {},
+            SourceRatio {
+                #[serde(with = "rust_decimal::serde::str")]
+                ratio: Decimal,
+            },
             FixedNotional {
                 #[serde(with = "rust_decimal::serde::str")]
                 notional: Decimal,
@@ -27,6 +35,7 @@ impl<'de> Deserialize<'de> for FollowSizing {
         }
         Ok(match Wire::deserialize(deserializer)? {
             Wire::Proportional {} => Self::Proportional,
+            Wire::SourceRatio { ratio } => Self::SourceRatio { ratio },
             Wire::FixedNotional { notional } => Self::FixedNotional { notional },
         })
     }
@@ -36,6 +45,7 @@ impl FollowSizing {
     pub fn valid_for(self, order_cap: Decimal) -> bool {
         match self {
             Self::Proportional => true,
+            Self::SourceRatio { ratio } => ratio > Decimal::ZERO && ratio <= Decimal::ONE,
             Self::FixedNotional { notional } => notional > Decimal::ZERO && notional <= order_cap,
         }
     }
@@ -69,6 +79,11 @@ impl FollowAuthorization {
         self.multiplier > Decimal::ZERO
             && match self.sizing {
                 FollowSizing::Proportional => true,
+                FollowSizing::SourceRatio { ratio } => {
+                    ratio > Decimal::ZERO
+                        && ratio <= Decimal::ONE
+                        && self.multiplier == Decimal::ONE
+                }
                 FollowSizing::FixedNotional { notional } => {
                     notional > Decimal::ZERO && self.multiplier == Decimal::ONE
                 }
@@ -125,5 +140,39 @@ mod tests {
             }
             .valid()
         );
+    }
+    #[test]
+    fn source_ratio_is_explicit_bounded_and_not_multiplied()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sizing: FollowSizing =
+            serde_json::from_str(r#"{"mode":"source_ratio","ratio":"0.5"}"#)?;
+        assert!(
+            FollowAuthorization {
+                sizing,
+                multiplier: Decimal::ONE
+            }
+            .valid()
+        );
+        assert!(
+            !FollowAuthorization {
+                sizing,
+                multiplier: Decimal::from(2)
+            }
+            .valid()
+        );
+        for ratio in [Decimal::ZERO, Decimal::NEGATIVE_ONE, Decimal::new(101, 2)] {
+            assert!(!FollowSizing::SourceRatio { ratio }.valid_for(Decimal::from(1000)));
+        }
+        assert!(
+            serde_json::from_str::<FollowSizing>(
+                r#"{"mode":"source_ratio","ratio":"0.5","notional":"1"}"#
+            )
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(sizing)?,
+            serde_json::json!({"mode":"source_ratio","ratio":"0.5"})
+        );
+        Ok(())
     }
 }
