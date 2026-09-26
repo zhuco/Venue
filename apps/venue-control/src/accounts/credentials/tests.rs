@@ -408,9 +408,11 @@ async fn postgres_removal_requires_password_fresh_flat_readback_and_no_runtime_c
         .delete_with(&a, removal(), now(), |_| async { proof(1, false) })
         .await?;
     assert!(f.service.overview(&a, now()).await?.credentials.is_empty());
-    let encrypted_count: i64 = sqlx::query_scalar("SELECT count(*) FROM venue_api_credentials")
-        .fetch_one(&f.pool)
-        .await?;
+    let encrypted_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM venue_api_credentials WHERE octet_length(encrypted_credentials)>0",
+    )
+    .fetch_one(&f.pool)
+    .await?;
     assert_eq!(encrypted_count, 0);
     let rebound = f.service.bind_credential(&a, binding('A'), now()).await?;
     let rebound = f
@@ -420,5 +422,93 @@ async fn postgres_removal_requires_password_fresh_flat_readback_and_no_runtime_c
         })
         .await?;
     assert_eq!(rebound.trading_account_id, credential.trading_account_id);
+    f.cleanup().await
+}
+
+#[tokio::test]
+async fn postgres_executor_deletion_preserves_history_and_blocks_pending_commands() -> TestResult {
+    let Some(f) = Fixture::create().await? else {
+        return Ok(());
+    };
+    let session = f.service.register(login("delete-executor"), now()).await?;
+    let principal = f
+        .service
+        .authenticate(session.token.expose(), now())
+        .await?;
+    let credential = f
+        .service
+        .bind_credential(&principal, binding('D'), now())
+        .await?;
+    let credential = f
+        .service
+        .verify_with(&principal, &credential.credential_id, now(), |_| async {
+            proof(7, false)
+        })
+        .await?;
+    let account = credential
+        .trading_account_id
+        .as_deref()
+        .ok_or("missing account")?;
+    sqlx::query("INSERT INTO venue_binance_commands(command_id,command_origin,request_id,owner_user_id,trading_account_id,credential_id,symbol,position_side,command_phase,order_kind,order_side,requested_quantity,rule_version,client_order_id,command_state,created_ms,updated_ms) VALUES('delete-history','terminal','delete-history',$1,$2,$3,'SOL/USDC','long','open','market','buy','1','fixture','delete-history','pending',1,1)")
+        .bind(&principal.user.user_id).bind(account).bind(&credential.credential_id).execute(&f.pool).await?;
+    let removal = || DeleteCredentialRequest {
+        credential_id: credential.credential_id.clone(),
+        password: login("delete-executor").password,
+    };
+    assert_eq!(
+        f.service
+            .delete_with(&principal, removal(), now(), |_| async { proof(7, false) })
+            .await
+            .err()
+            .map(|e| e.code),
+        Some(Code::AccountInUse)
+    );
+    sqlx::query("UPDATE venue_binance_commands SET command_state='reconcile_required',sending_ms=2,updated_ms=2 WHERE command_id='delete-history'").execute(&f.pool).await?;
+    assert_eq!(
+        f.service
+            .delete_with(&principal, removal(), now(), |_| async { proof(7, false) })
+            .await
+            .err()
+            .map(|e| e.code),
+        Some(Code::AccountInUse)
+    );
+    sqlx::query("UPDATE venue_binance_commands SET command_state='reconciled',terminal_ms=3,updated_ms=3 WHERE command_id='delete-history'").execute(&f.pool).await?;
+    let mut tx = f.pool.begin().await?;
+    sqlx::query("INSERT INTO venue_binance_grid_instances(instance_id,owner_user_id,trading_account_id,credential_id,create_request_id,create_request_digest,symbol,instance_state,revision,current_config_revision,plan_revision,dirty,consecutive_failures,created_ms,updated_ms) VALUES('deletion-grid',$1,$2,$3,'deletion-grid',$4,'SOL/USDC','running',1,1,1,false,0,1,1)")
+        .bind(&principal.user.user_id).bind(account).bind(&credential.credential_id).bind(vec![0_u8;32]).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO venue_binance_grid_config_revisions(instance_id,config_revision,request_id,config_json,config_digest,created_ms) VALUES('deletion-grid',1,'deletion-grid','{}',$1,1)").bind(vec![0_u8;32]).execute(&mut *tx).await?;
+    tx.commit().await?;
+    for state in ["running", "paused", "stop_pending"] {
+        sqlx::query("UPDATE venue_binance_grid_instances SET instance_state=$1 WHERE instance_id='deletion-grid'").bind(state).execute(&f.pool).await?;
+        assert_eq!(
+            f.service
+                .delete_with(&principal, removal(), now(), |_| async { proof(7, false) })
+                .await
+                .err()
+                .map(|e| e.code),
+            Some(Code::AccountInUse)
+        );
+    }
+    sqlx::query("UPDATE venue_binance_grid_instances SET instance_state='stopped' WHERE instance_id='deletion-grid'").execute(&f.pool).await?;
+    sqlx::query(r#"INSERT INTO venue_control_command_inbox(request_id,venue,mode,trading_account_id,symbol,instance_id,config_epoch,action,command_state,command_json,receipt_json,created_ms,updated_ms) VALUES('legacy-resume','binance','LIVE',$1,'SOL/USDC','old-grid',1,'RESUME','accepted',jsonb_build_object('trading_account_id',$1::text),'{"state":"accepted"}',1,1)"#).bind(account).execute(&f.pool).await?;
+    let snapshot = serde_json::json!({"schema_version":venue_control_protocol::CONTROL_SCHEMA_VERSION,"generated_ms":1,"connection":"live","accounts":[{"venue":"binance","mode":"LIVE","trading_account_id":account,"health":"healthy","balances":[],"private_generation":1,"writer_generation":0,"last_reconciled_ms":1}],"strategies":[],"copy_relations":[],"markets":[],"ledger":[]});
+    sqlx::query("INSERT INTO venue_control_snapshots(singleton,generated_ms,snapshot_json) VALUES(TRUE,1,$1)").bind(snapshot).execute(&f.pool).await?;
+    f.service
+        .delete_with(&principal, removal(), now(), |_| async { proof(7, false) })
+        .await?;
+    assert!(
+        f.service
+            .overview(&principal, now())
+            .await?
+            .credentials
+            .is_empty()
+    );
+    let retained: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_binance_commands c JOIN venue_api_credentials k USING(credential_id) WHERE c.command_id='delete-history' AND c.command_state='reconciled' AND k.deleted_ms IS NOT NULL AND octet_length(k.encrypted_credentials)=0)").fetch_one(&f.pool).await?;
+    assert!(retained);
+    let rebound = f
+        .service
+        .bind_credential(&principal, binding('D'), now())
+        .await?;
+    assert_ne!(rebound.credential_id, credential.credential_id);
     f.cleanup().await
 }
