@@ -26,7 +26,11 @@ enum SettingsTab {
 type IndicatorKind = ChartIndicatorId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SpecialPanel { Structure, OrderFlow, ProfileOi }
+enum SpecialPanel {
+    Structure,
+    OrderFlow,
+    ProfileOi,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct SettingsPanelState {
@@ -107,10 +111,10 @@ pub fn show(
             top_tabs(ui, state, language, &mut close_requested);
             ui.separator();
             match state.tab {
-                SettingsTab::PriceStructure | SettingsTab::FlowLiquidity
-                | SettingsTab::Volatility | SettingsTab::Traditional => {
-                    indicator_body(ui, state, language)
-                }
+                SettingsTab::PriceStructure
+                | SettingsTab::FlowLiquidity
+                | SettingsTab::Volatility
+                | SettingsTab::Traditional => indicator_body(ui, state, language),
                 SettingsTab::Custom => {
                     if let Some(draft) = &mut state.draft {
                         egui::ScrollArea::vertical()
@@ -168,25 +172,64 @@ fn top_tabs(
 ) {
     ui.horizontal(|ui| {
         let width = (ui.available_width() - 42.0).max(180.0);
-        egui::ScrollArea::horizontal().max_width(width).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let zh = language == Language::SimplifiedChinese;
-                for (tab, title) in [
-                    (SettingsTab::PriceStructure, if zh { "价格结构" } else { "Price structure" }),
-                    (SettingsTab::FlowLiquidity, if zh { "成交与流动性" } else { "Flow & liquidity" }),
-                    (SettingsTab::Volatility, if zh { "波动" } else { "Volatility" }),
-                    (SettingsTab::Traditional, if zh { "传统指标" } else { "Traditional" }),
-                    (SettingsTab::Custom, indicator_text(language, IndicatorTextKey::CustomTab)),
-                    (SettingsTab::Backtest, indicator_text(language, IndicatorTextKey::BacktestTab)),
-                    (SettingsTab::General, indicator_text(language, IndicatorTextKey::GeneralTab)),
-                ] {
-                    ui.add_enabled_ui(tab != SettingsTab::Backtest, |ui| {
-                        tab_button(ui, &mut state.tab, tab, title);
-                    }).response.on_disabled_hover_text(indicator_text(language, IndicatorTextKey::FeatureUnavailable));
-                }
+        egui::ScrollArea::horizontal()
+            .max_width(width)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let zh = language == Language::SimplifiedChinese;
+                    for (tab, title) in [
+                        (
+                            SettingsTab::PriceStructure,
+                            if zh {
+                                "价格结构"
+                            } else {
+                                "Price structure"
+                            },
+                        ),
+                        (
+                            SettingsTab::FlowLiquidity,
+                            if zh {
+                                "成交与流动性"
+                            } else {
+                                "Flow & liquidity"
+                            },
+                        ),
+                        (
+                            SettingsTab::Volatility,
+                            if zh { "波动" } else { "Volatility" },
+                        ),
+                        (
+                            SettingsTab::Traditional,
+                            if zh { "传统指标" } else { "Traditional" },
+                        ),
+                        (
+                            SettingsTab::Custom,
+                            indicator_text(language, IndicatorTextKey::CustomTab),
+                        ),
+                        (
+                            SettingsTab::Backtest,
+                            indicator_text(language, IndicatorTextKey::BacktestTab),
+                        ),
+                        (
+                            SettingsTab::General,
+                            indicator_text(language, IndicatorTextKey::GeneralTab),
+                        ),
+                    ] {
+                        ui.add_enabled_ui(tab != SettingsTab::Backtest, |ui| {
+                            tab_button(ui, &mut state.tab, tab, title);
+                        })
+                        .response
+                        .on_disabled_hover_text(indicator_text(
+                            language,
+                            IndicatorTextKey::FeatureUnavailable,
+                        ));
+                    }
+                });
             });
-        });
-        if ui.add(egui::Button::new(RichText::new("×").size(28.0)).frame(false)).clicked() {
+        if ui
+            .add(egui::Button::new(RichText::new("×").size(28.0)).frame(false))
+            .clicked()
+        {
             *close = true;
         }
     });
@@ -221,13 +264,23 @@ fn indicator_body(ui: &mut egui::Ui, state: &mut SettingsPanelState, language: L
         SettingsTab::Traditional => ChartIndicatorCategory::Traditional,
         _ => return,
     };
-    let list = ChartIndicatorRegistry::all().iter().filter(|item| item.category == category).collect::<Vec<_>>();
+    let list = ChartIndicatorRegistry::all()
+        .iter()
+        .filter(|item| item.category == category)
+        .collect::<Vec<_>>();
     if !list.iter().any(|item| item.id == state.indicator) {
         state.indicator = list[0].id;
     }
-    if !matches!((category, state.special),
-        (ChartIndicatorCategory::PriceStructure, Some(SpecialPanel::Structure))
-        | (ChartIndicatorCategory::FlowLiquidity, Some(SpecialPanel::OrderFlow | SpecialPanel::ProfileOi))) {
+    if !matches!(
+        (category, state.special),
+        (
+            ChartIndicatorCategory::PriceStructure,
+            Some(SpecialPanel::Structure)
+        ) | (
+            ChartIndicatorCategory::FlowLiquidity,
+            Some(SpecialPanel::OrderFlow | SpecialPanel::ProfileOi)
+        )
+    ) {
         state.special = None;
     }
     ui.horizontal(|ui| {
@@ -237,7 +290,11 @@ fn indicator_body(ui: &mut egui::Ui, state: &mut SettingsPanelState, language: L
             |ui| {
                 ui.add_space(10.0);
                 ui.label(
-                    RichText::new(if language == Language::SimplifiedChinese { "指标" } else { "Studies" })
+                    RichText::new(if language == Language::SimplifiedChinese {
+                        "指标"
+                    } else {
+                        "Studies"
+                    })
                     .size(13.0)
                     .strong()
                     .color(theme::TEXT_PRIMARY),
@@ -251,14 +308,34 @@ fn indicator_body(ui: &mut egui::Ui, state: &mut SettingsPanelState, language: L
                         };
                         let zh = language == Language::SimplifiedChinese;
                         if category == ChartIndicatorCategory::PriceStructure {
-                            special_list_row(ui, &mut state.special, SpecialPanel::Structure,
-                                if zh { "S/R · 日周位" } else { "S/R · levels" });
+                            special_list_row(
+                                ui,
+                                &mut state.special,
+                                SpecialPanel::Structure,
+                                if zh {
+                                    "S/R · 日周位"
+                                } else {
+                                    "S/R · levels"
+                                },
+                            );
                         }
                         if category == ChartIndicatorCategory::FlowLiquidity {
-                            special_list_row(ui, &mut state.special, SpecialPanel::OrderFlow,
-                                if zh { "热图 · Delta" } else { "Heatmap · Delta" });
-                            special_list_row(ui, &mut state.special, SpecialPanel::ProfileOi,
-                                if zh { "Profile · OI" } else { "Profile · OI" });
+                            special_list_row(
+                                ui,
+                                &mut state.special,
+                                SpecialPanel::OrderFlow,
+                                if zh {
+                                    "热图 · Delta"
+                                } else {
+                                    "Heatmap · Delta"
+                                },
+                            );
+                            special_list_row(
+                                ui,
+                                &mut state.special,
+                                SpecialPanel::ProfileOi,
+                                if zh { "Profile · OI" } else { "Profile · OI" },
+                            );
                         }
                         for item in list {
                             indicator_list_row(
@@ -284,15 +361,25 @@ fn indicator_body(ui: &mut egui::Ui, state: &mut SettingsPanelState, language: L
                     return;
                 };
                 if let Some(panel) = state.special
-                    && ui.small_button(if language == Language::SimplifiedChinese {
-                        "恢复本组默认"
-                    } else { "Reset this group" }).clicked()
+                    && ui
+                        .small_button(if language == Language::SimplifiedChinese {
+                            "恢复本组默认"
+                        } else {
+                            "Reset this group"
+                        })
+                        .clicked()
                 {
                     reset_special_panel(draft, panel);
                 }
                 match state.special {
                     Some(SpecialPanel::Structure) => structure_settings(ui, draft, language),
-                    Some(SpecialPanel::OrderFlow) => crate::chart_view::microstructure::settings_ui(ui, &mut draft.microstructure, language),
+                    Some(SpecialPanel::OrderFlow) => {
+                        crate::chart_view::microstructure::settings_ui(
+                            ui,
+                            &mut draft.microstructure,
+                            language,
+                        )
+                    }
                     Some(SpecialPanel::ProfileOi) => profile_oi_settings(ui, draft, language),
                     None => indicator_editor(ui, draft, state.indicator, language),
                 }
@@ -335,67 +422,134 @@ fn indicator_list_row(
     });
 }
 
-fn special_list_row(ui: &mut egui::Ui, selected: &mut Option<SpecialPanel>, panel: SpecialPanel, name: &str) {
-    if ui.selectable_label(*selected == Some(panel), name).clicked() {
+fn special_list_row(
+    ui: &mut egui::Ui,
+    selected: &mut Option<SpecialPanel>,
+    panel: SpecialPanel,
+    name: &str,
+) {
+    if ui
+        .selectable_label(*selected == Some(panel), name)
+        .clicked()
+    {
         *selected = Some(panel);
     }
 }
 
 fn structure_settings(ui: &mut egui::Ui, draft: &mut ChartDisplaySettings, language: Language) {
-    let tr = |zh, en| if language == Language::SimplifiedChinese { zh } else { en };
-    egui::ScrollArea::vertical().max_height(370.0).show(ui, |ui| {
-        let session = &mut draft.session;
-        ui.heading(tr("自动支撑／阻力 · 本地结构", "Support / Resistance · local structure"));
-        ui.checkbox(&mut session.sr_current, tr("当前周期 S/R", "Current timeframe S/R"));
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut session.sr_15m, "15m");
-            ui.checkbox(&mut session.sr_1h, "1h");
-            ui.checkbox(&mut session.sr_1d, "1d");
+    let tr = |zh, en| {
+        if language == Language::SimplifiedChinese {
+            zh
+        } else {
+            en
+        }
+    };
+    egui::ScrollArea::vertical()
+        .max_height(370.0)
+        .show(ui, |ui| {
+            let session = &mut draft.session;
+            ui.heading(tr(
+                "自动支撑／阻力 · 本地结构",
+                "Support / Resistance · local structure",
+            ));
+            ui.checkbox(
+                &mut session.sr_current,
+                tr("当前周期 S/R", "Current timeframe S/R"),
+            );
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut session.sr_15m, "15m");
+                ui.checkbox(&mut session.sr_1h, "1h");
+                ui.checkbox(&mut session.sr_1d, "1d");
+            });
+            ui.small(tr(
+                "评分用于已确认拐点排序，不是交易成功概率。",
+                "Score ranks confirmed swings; it is not a trading probability.",
+            ));
+            ui.separator();
+            ui.heading(tr("UTC 日周位置", "UTC day and week levels"));
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut session.pdh, "PDH");
+                ui.checkbox(&mut session.pdl, "PDL");
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut session.pwh, "PWH");
+                ui.checkbox(&mut session.pwl, "PWL");
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut session.daily_open, tr("当日开盘", "Daily Open"));
+                ui.checkbox(&mut session.weekly_open, tr("当周开盘", "Weekly Open"));
+            });
+            ui.separator();
+            ui.checkbox(
+                &mut session.daily_pivot,
+                tr(
+                    "日 Pivot · P / R1 / R2 / S1 / S2",
+                    "Daily Pivot · P / R1 / R2 / S1 / S2",
+                ),
+            );
+            ui.checkbox(
+                &mut session.weekly_pivot,
+                tr(
+                    "周 Pivot · P / R1 / R2 / S1 / S2",
+                    "Weekly Pivot · P / R1 / R2 / S1 / S2",
+                ),
+            );
+            ui.checkbox(&mut session.pivot_r3_s3, "R3 / S3");
+            ui.small(tr(
+                "只使用完整收盘的前一 UTC 日／周；来源缺失时不画线。",
+                "Uses only the preceding complete UTC day/week. Missing source leaves a gap.",
+            ));
         });
-        ui.small(tr("评分用于已确认拐点排序，不是交易成功概率。", "Score ranks confirmed swings; it is not a trading probability."));
-        ui.separator();
-        ui.heading(tr("UTC 日周位置", "UTC day and week levels"));
-        ui.horizontal(|ui| { ui.checkbox(&mut session.pdh, "PDH"); ui.checkbox(&mut session.pdl, "PDL"); });
-        ui.horizontal(|ui| { ui.checkbox(&mut session.pwh, "PWH"); ui.checkbox(&mut session.pwl, "PWL"); });
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut session.daily_open, tr("当日开盘", "Daily Open"));
-            ui.checkbox(&mut session.weekly_open, tr("当周开盘", "Weekly Open"));
-        });
-        ui.separator();
-        ui.checkbox(&mut session.daily_pivot, tr("日 Pivot · P / R1 / R2 / S1 / S2", "Daily Pivot · P / R1 / R2 / S1 / S2"));
-        ui.checkbox(&mut session.weekly_pivot, tr("周 Pivot · P / R1 / R2 / S1 / S2", "Weekly Pivot · P / R1 / R2 / S1 / S2"));
-        ui.checkbox(&mut session.pivot_r3_s3, "R3 / S3");
-        ui.small(tr("只使用完整收盘的前一 UTC 日／周；来源缺失时不画线。",
-            "Uses only the preceding complete UTC day/week. Missing source leaves a gap."));
-    });
 }
 
 fn profile_oi_settings(ui: &mut egui::Ui, draft: &mut ChartDisplaySettings, language: Language) {
-    let tr = |zh, en| if language == Language::SimplifiedChinese { zh } else { en };
-    egui::ScrollArea::vertical().max_height(370.0).show(ui, |ui| {
-        let profile = &mut draft.profile;
-        ui.heading(tr("成交量分布 · 1m OHLCV 估算", "Volume Profile · 1m OHLCV estimate"));
-        ui.checkbox(&mut profile.visible_range, tr("可见区间", "Visible Range"));
-        ui.checkbox(&mut profile.fixed_range, tr("固定区间", "Fixed Range"));
-        ui.horizontal(|ui| {
-            ui.label(tr("价格桶 tick ×", "Bucket tick ×"));
-            ui.add(egui::DragValue::new(&mut profile.tick_multiple).range(1..=1_000));
-            ui.label(tr("宽度 %", "Width %"));
-            ui.add(egui::DragValue::new(&mut profile.width_percent).range(10..=35));
-            ui.label(tr("不透明度 %", "Opacity %"));
-            ui.add(egui::DragValue::new(&mut profile.opacity_percent).range(10..=80));
-        });
-        ui.horizontal(|ui| { ui.checkbox(&mut profile.poc, "POC"); ui.checkbox(&mut profile.vah, "VAH"); ui.checkbox(&mut profile.val, "VAL"); });
-        if profile.fixed_range {
-            ui.small(tr("在图表上使用“框选 Profile”依次点击起点与终点。",
-                "Use Select Profile on the chart, then click start and end."));
+    let tr = |zh, en| {
+        if language == Language::SimplifiedChinese {
+            zh
+        } else {
+            en
         }
-        ui.separator();
-        ui.heading(tr("持仓量 OI", "Open Interest"));
-        ui.checkbox(&mut draft.oi_pane, tr("OI 副图 · 基础币数量", "OI pane · base asset quantity"));
-        ui.small(tr("按所选场所和合约显示真实样本；没有历史来源时留空。",
-            "Shows samples for the selected venue and contract; missing history stays blank."));
-    });
+    };
+    egui::ScrollArea::vertical()
+        .max_height(370.0)
+        .show(ui, |ui| {
+            let profile = &mut draft.profile;
+            ui.heading(tr(
+                "成交量分布 · 1m OHLCV 估算",
+                "Volume Profile · 1m OHLCV estimate",
+            ));
+            ui.checkbox(&mut profile.visible_range, tr("可见区间", "Visible Range"));
+            ui.checkbox(&mut profile.fixed_range, tr("固定区间", "Fixed Range"));
+            ui.horizontal(|ui| {
+                ui.label(tr("价格桶 tick ×", "Bucket tick ×"));
+                ui.add(egui::DragValue::new(&mut profile.tick_multiple).range(1..=1_000));
+                ui.label(tr("宽度 %", "Width %"));
+                ui.add(egui::DragValue::new(&mut profile.width_percent).range(10..=35));
+                ui.label(tr("不透明度 %", "Opacity %"));
+                ui.add(egui::DragValue::new(&mut profile.opacity_percent).range(10..=80));
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut profile.poc, "POC");
+                ui.checkbox(&mut profile.vah, "VAH");
+                ui.checkbox(&mut profile.val, "VAL");
+            });
+            if profile.fixed_range {
+                ui.small(tr(
+                    "在图表上使用“框选 Profile”依次点击起点与终点。",
+                    "Use Select Profile on the chart, then click start and end.",
+                ));
+            }
+            ui.separator();
+            ui.heading(tr("持仓量 OI", "Open Interest"));
+            ui.checkbox(
+                &mut draft.oi_pane,
+                tr("OI 副图 · 基础币数量", "OI pane · base asset quantity"),
+            );
+            ui.small(tr(
+                "按所选场所和合约显示真实样本；没有历史来源时留空。",
+                "Shows samples for the selected venue and contract; missing history stays blank.",
+            ));
+        });
 }
 
 fn indicator_editor(
@@ -405,14 +559,31 @@ fn indicator_editor(
     language: Language,
 ) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(ChartIndicatorRegistry::all().iter().find(|item| item.id == kind)
-            .map(|item| if language == Language::SimplifiedChinese { item.name_zh_cn } else { item.name_en })
-            .unwrap_or(kind.short_label()))
+        ui.label(
+            RichText::new(
+                ChartIndicatorRegistry::all()
+                    .iter()
+                    .find(|item| item.id == kind)
+                    .map(|item| {
+                        if language == Language::SimplifiedChinese {
+                            item.name_zh_cn
+                        } else {
+                            item.name_en
+                        }
+                    })
+                    .unwrap_or(kind.short_label()),
+            )
             .size(14.0)
-            .strong());
-        if ui.small_button(if language == Language::SimplifiedChinese {
-            "恢复本项默认"
-        } else { "Reset this study" }).clicked() {
+            .strong(),
+        );
+        if ui
+            .small_button(if language == Language::SimplifiedChinese {
+                "恢复本项默认"
+            } else {
+                "Reset this study"
+            })
+            .clicked()
+        {
             reset_selected_indicator(settings, kind);
         }
     });
@@ -641,10 +812,28 @@ fn indicator_editor(
         ),
         IndicatorKind::Atr => {
             simple_period_style(
-                ui, language, "ATR", &mut settings.atr_period, &mut settings.atr,
+                ui,
+                language,
+                "ATR",
+                &mut settings.atr_period,
+                &mut settings.atr,
             );
-            ui.checkbox(&mut settings.atr_value_readout, if language == Language::SimplifiedChinese { "顶部显示 ATR 数值" } else { "Show ATR value in readout" });
-            ui.checkbox(&mut settings.atr_percent_readout, if language == Language::SimplifiedChinese { "顶部显示 ATR%" } else { "Show ATR% in readout" });
+            ui.checkbox(
+                &mut settings.atr_value_readout,
+                if language == Language::SimplifiedChinese {
+                    "顶部显示 ATR 数值"
+                } else {
+                    "Show ATR value in readout"
+                },
+            );
+            ui.checkbox(
+                &mut settings.atr_percent_readout,
+                if language == Language::SimplifiedChinese {
+                    "顶部显示 ATR%"
+                } else {
+                    "Show ATR% in readout"
+                },
+            );
         }
     }
 }
@@ -1416,9 +1605,12 @@ mod tests {
         assert_eq!(SettingsTab::default(), SettingsTab::PriceStructure);
         let descriptors = ChartIndicatorRegistry::all();
         assert_eq!(descriptors.len(), 22);
-        for category in [ChartIndicatorCategory::PriceStructure,
-            ChartIndicatorCategory::FlowLiquidity, ChartIndicatorCategory::Volatility,
-            ChartIndicatorCategory::Traditional] {
+        for category in [
+            ChartIndicatorCategory::PriceStructure,
+            ChartIndicatorCategory::FlowLiquidity,
+            ChartIndicatorCategory::Volatility,
+            ChartIndicatorCategory::Traditional,
+        ] {
             assert!(descriptors.iter().any(|item| item.category == category));
         }
         assert!(descriptors.iter().all(|item| !item.short_label.is_empty()));
@@ -1435,27 +1627,54 @@ mod tests {
             }
         }
         for (tab, special, expected) in [
-            (SettingsTab::PriceStructure, super::SpecialPanel::Structure, "当前周期 S/R"),
-            (SettingsTab::FlowLiquidity, super::SpecialPanel::OrderFlow, "Delta · base"),
-            (SettingsTab::FlowLiquidity, super::SpecialPanel::ProfileOi, "OI 副图 · 基础币数量"),
+            (
+                SettingsTab::PriceStructure,
+                super::SpecialPanel::Structure,
+                "当前周期 S/R",
+            ),
+            (
+                SettingsTab::FlowLiquidity,
+                super::SpecialPanel::OrderFlow,
+                "Delta · base",
+            ),
+            (
+                SettingsTab::FlowLiquidity,
+                super::SpecialPanel::ProfileOi,
+                "OI 副图 · 基础币数量",
+            ),
         ] {
             let context = egui::Context::default();
             crate::theme::apply(&context);
             let mut model = crate::model::AppModel::new(Default::default());
-            let mut state = super::SettingsPanelState { tab, special: Some(special), ..Default::default() };
+            let mut state = super::SettingsPanelState {
+                tab,
+                special: Some(special),
+                ..Default::default()
+            };
             let mut open = true;
             let mut reconnect = false;
             let mut rendered = Vec::new();
             for _ in 0..3 {
-                let mut output = context.run_ui(egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 700.0))),
-                    ..Default::default()
-                }, |ui| super::show(ui.ctx(), &mut open, &mut state, &mut model, &mut reconnect));
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1100.0, 700.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| super::show(ui.ctx(), &mut open, &mut state, &mut model, &mut reconnect),
+                );
                 output.textures_delta.clear();
                 rendered.clear();
-                for shape in output.shapes { labels(&shape.shape, &mut rendered); }
+                for shape in output.shapes {
+                    labels(&shape.shape, &mut rendered);
+                }
             }
-            assert!(rendered.iter().any(|label| label == expected), "missing {expected} in {tab:?}");
+            assert!(
+                rendered.iter().any(|label| label == expected),
+                "missing {expected} in {tab:?}"
+            );
         }
     }
 }

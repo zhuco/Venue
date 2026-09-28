@@ -46,9 +46,15 @@ pub struct SharedHistoryRequest {
     pub gap_after: Option<u64>,
 }
 
-pub(crate) fn history_page_covers_gap(bars: &[PublicBar], before: u64, gap_after: Option<u64>) -> bool {
-    gap_after.is_none_or(|left| bars.iter()
-        .any(|bar| bar.open_time_ms > left && bar.open_time_ms < before))
+pub(crate) fn history_page_covers_gap(
+    bars: &[PublicBar],
+    before: u64,
+    gap_after: Option<u64>,
+) -> bool {
+    gap_after.is_none_or(|left| {
+        bars.iter()
+            .any(|bar| bar.open_time_ms > left && bar.open_time_ms < before)
+    })
 }
 
 impl MarketSelection {
@@ -320,9 +326,12 @@ impl LocalMarketReducer {
 
         let exchange_event = !matches!(
             &envelope.payload,
-            MarketPayload::RestHistory { .. } | MarketPayload::Status { .. }
-                | MarketPayload::Funding(_) | MarketPayload::OpenInterestCurrent(_)
-                | MarketPayload::OpenInterestHistory(_) | MarketPayload::OpenInterestUnavailable(_)
+            MarketPayload::RestHistory { .. }
+                | MarketPayload::Status { .. }
+                | MarketPayload::Funding(_)
+                | MarketPayload::OpenInterestCurrent(_)
+                | MarketPayload::OpenInterestHistory(_)
+                | MarketPayload::OpenInterestUnavailable(_)
                 | MarketPayload::OpenInterestHistoryUnavailable(_)
         );
         let previous_price_event_ms = self.last_price_event_ms;
@@ -369,9 +378,12 @@ impl LocalMarketReducer {
                 {
                     return Err(LocalMarketError::ScopeMismatch);
                 }
-                if self.view.funding.as_ref().is_none_or(|previous| {
-                    previous.exchange_time_ms <= funding.exchange_time_ms
-                }) {
+                if self
+                    .view
+                    .funding
+                    .as_ref()
+                    .is_none_or(|previous| previous.exchange_time_ms <= funding.exchange_time_ms)
+                {
                     self.view.funding = Some(funding);
                 }
             }
@@ -383,25 +395,40 @@ impl LocalMarketReducer {
                 {
                     return Err(LocalMarketError::ScopeMismatch);
                 }
-                if self.view.open_interest_current.as_ref().is_none_or(|previous| {
-                    previous.exchange_time_ms <= sample.exchange_time_ms
-                }) {
+                if self
+                    .view
+                    .open_interest_current
+                    .as_ref()
+                    .is_none_or(|previous| previous.exchange_time_ms <= sample.exchange_time_ms)
+                {
                     self.view.open_interest_current = Some(sample);
                     self.view.open_interest_error = None;
                 }
             }
             MarketPayload::OpenInterestHistory(samples) => {
-                if samples.len() > 500 || samples.iter().any(|sample| {
-                    !sample.is_valid()
-                        || sample.symbol != self.view.selection.binding.symbol
-                        || sample.generation != envelope.generation
-                        || sample.sampling_interval_ms != Some(300_000)
-                }) || samples.windows(2).any(|pair| pair[0].exchange_time_ms >= pair[1].exchange_time_ms) {
+                if samples.len() > 500
+                    || samples.iter().any(|sample| {
+                        !sample.is_valid()
+                            || sample.symbol != self.view.selection.binding.symbol
+                            || sample.generation != envelope.generation
+                            || sample.sampling_interval_ms != Some(300_000)
+                    })
+                    || samples
+                        .windows(2)
+                        .any(|pair| pair[0].exchange_time_ms >= pair[1].exchange_time_ms)
+                {
                     return Err(LocalMarketError::ScopeMismatch);
                 }
-                if self.view.open_interest_history.last().is_none_or(|previous| {
-                    samples.last().is_some_and(|latest| latest.exchange_time_ms >= previous.exchange_time_ms)
-                }) {
+                if self
+                    .view
+                    .open_interest_history
+                    .last()
+                    .is_none_or(|previous| {
+                        samples.last().is_some_and(|latest| {
+                            latest.exchange_time_ms >= previous.exchange_time_ms
+                        })
+                    })
+                {
                     self.view.open_interest_history = samples;
                     self.view.open_interest_history_error = None;
                 }
@@ -465,31 +492,61 @@ impl LocalMarketReducer {
 
     fn apply_history(&mut self, mut bars: Vec<PublicBar>) -> Result<(), LocalMarketError> {
         bars.sort_by_key(|bar| bar.open_time_ms);
-        if bars.windows(2).any(|pair| pair[0].open_time_ms == pair[1].open_time_ms) {
+        if bars
+            .windows(2)
+            .any(|pair| pair[0].open_time_ms == pair[1].open_time_ms)
+        {
             return Err(LocalMarketError::InvalidBar);
         }
-        for bar in &bars { validate_study_bar(bar, &self.view.selection, self.view.generation)?; }
+        for bar in &bars {
+            validate_study_bar(bar, &self.view.selection, self.view.generation)?;
+        }
         let same_values = |old: &PublicBar, next: &PublicBar| {
-            old.symbol == next.symbol && old.open_time_ms == next.open_time_ms
-                && old.close_time_ms == next.close_time_ms && old.interval_ms == next.interval_ms
-                && old.open == next.open && old.high == next.high && old.low == next.low
-                && old.close == next.close && old.base_volume == next.base_volume
-                && old.quote_volume == next.quote_volume && old.trade_count == next.trade_count
+            old.symbol == next.symbol
+                && old.open_time_ms == next.open_time_ms
+                && old.close_time_ms == next.close_time_ms
+                && old.interval_ms == next.interval_ms
+                && old.open == next.open
+                && old.high == next.high
+                && old.low == next.low
+                && old.close == next.close
+                && old.base_volume == next.base_volume
+                && old.quote_volume == next.quote_volume
+                && old.trade_count == next.trade_count
                 && old.taker_buy_base_volume == next.taker_buy_base_volume
                 && old.taker_buy_quote_volume == next.taker_buy_quote_volume
         };
-        if !bars.is_empty() && bars.iter().all(|bar| self.closed_facts.get(&bar.open_time_ms)
-            .is_some_and(|old| same_values(old, bar))) { return Ok(()); }
-        if let (Some((old_first, _)), Some((old_last, _)), Some(new_first), Some(new_last)) =
-            (self.closed_facts.first_key_value(), self.closed_facts.last_key_value(),
-                bars.first(), bars.last()) {
+        if !bars.is_empty()
+            && bars.iter().all(|bar| {
+                self.closed_facts
+                    .get(&bar.open_time_ms)
+                    .is_some_and(|old| same_values(old, bar))
+            })
+        {
+            return Ok(());
+        }
+        if let (Some((old_first, _)), Some((old_last, _)), Some(new_first), Some(new_last)) = (
+            self.closed_facts.first_key_value(),
+            self.closed_facts.last_key_value(),
+            bars.first(),
+            bars.last(),
+        ) {
             let step = self.view.selection.interval.duration_ms();
             if new_first.open_time_ms <= old_last.saturating_add(step)
-                && *old_first <= new_last.open_time_ms.saturating_add(step) {
+                && *old_first <= new_last.open_time_ms.saturating_add(step)
+            {
                 let mut merged = self.closed_facts.clone();
-                for bar in bars { merged.insert(bar.open_time_ms, bar); }
-                bars = merged.into_values().rev().take(MAX_BARS).collect::<Vec<_>>()
-                    .into_iter().rev().collect();
+                for bar in bars {
+                    merged.insert(bar.open_time_ms, bar);
+                }
+                bars = merged
+                    .into_values()
+                    .rev()
+                    .take(MAX_BARS)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
             }
         }
         self.forming_bar = None;
@@ -614,7 +671,9 @@ impl LocalMarketReducer {
             );
         }
         upsert_bar(&mut self.view.bars, bar);
-        if closed { self.view.bar_revision = self.view.bar_revision.wrapping_add(1); }
+        if closed {
+            self.view.bar_revision = self.view.bar_revision.wrapping_add(1);
+        }
         while self.closed_facts.len() > MAX_BARS {
             self.closed_facts.pop_first();
         }
@@ -666,13 +725,18 @@ impl LocalMarketReducer {
         Ok(())
     }
 
-    fn study_closed_or_empty(&mut self, bar: &PublicBar) -> Result<ChartStudyPoint, LocalMarketError> {
+    fn study_closed_or_empty(
+        &mut self,
+        bar: &PublicBar,
+    ) -> Result<ChartStudyPoint, LocalMarketError> {
         match self.studies.ingest_closed(bar) {
             Ok(values) => {
                 self.view.study_error = None;
                 Ok(study_point(values))
             }
-            Err(ChartIndicatorError::DiscontinuousBar) => Err(LocalMarketError::Indicator(ChartIndicatorError::DiscontinuousBar)),
+            Err(ChartIndicatorError::DiscontinuousBar) => Err(LocalMarketError::Indicator(
+                ChartIndicatorError::DiscontinuousBar,
+            )),
             Err(error) => {
                 self.view.study_error = Some(error.to_string());
                 self.studies = ChartStudyEngine::with_config(&self.study_config)
@@ -682,13 +746,18 @@ impl LocalMarketReducer {
         }
     }
 
-    fn study_preview_or_empty(&mut self, bar: &PublicBar) -> Result<ChartStudyPoint, LocalMarketError> {
+    fn study_preview_or_empty(
+        &mut self,
+        bar: &PublicBar,
+    ) -> Result<ChartStudyPoint, LocalMarketError> {
         match self.studies.preview(bar) {
             Ok(values) => {
                 self.view.study_error = None;
                 Ok(study_point(values))
             }
-            Err(ChartIndicatorError::DiscontinuousBar) => Err(LocalMarketError::Indicator(ChartIndicatorError::DiscontinuousBar)),
+            Err(ChartIndicatorError::DiscontinuousBar) => Err(LocalMarketError::Indicator(
+                ChartIndicatorError::DiscontinuousBar,
+            )),
             Err(error) => {
                 self.view.study_error = Some(error.to_string());
                 Ok(ChartStudyPoint::default())
@@ -851,8 +920,10 @@ impl BaseMinuteSeries {
             + self.gap_right_edges.len() * 48
     }
 
-    fn prepare(bar: PublicBar, confirmed: bool)
-    -> Result<(PublicBar, UiBar, BaseMinuteStudy), LocalMarketError> {
+    fn prepare(
+        bar: PublicBar,
+        confirmed: bool,
+    ) -> Result<(PublicBar, UiBar, BaseMinuteStudy), LocalMarketError> {
         let ui_bar = ui_bar_from_public(&bar)?;
         let point = BaseMinuteStudy {
             confirmed,
@@ -871,30 +942,39 @@ impl BaseMinuteSeries {
         let open_time_ms = bar.open_time_ms;
         let confirmed = point.confirmed;
         let mut closed_changed = confirmed;
-        match self.bars.binary_search_by_key(&open_time_ms, |item| item.open_time_ms) {
+        match self
+            .bars
+            .binary_search_by_key(&open_time_ms, |item| item.open_time_ms)
+        {
             Ok(index) if self.studies[index].confirmed && !confirmed => return,
             Ok(index) => {
-                closed_changed = confirmed && (self.bars[index] != ui_bar
-                    || self.studies[index].bar_vwap != point.bar_vwap
-                    || !self.studies[index].confirmed
-                    || self.facts[index].base_volume != bar.base_volume
-                    || self.facts[index].quote_volume != bar.quote_volume
-                    || self.facts[index].taker_buy_base_volume != bar.taker_buy_base_volume
-                    || self.facts[index].taker_buy_quote_volume != bar.taker_buy_quote_volume);
+                closed_changed = confirmed
+                    && (self.bars[index] != ui_bar
+                        || self.studies[index].bar_vwap != point.bar_vwap
+                        || !self.studies[index].confirmed
+                        || self.facts[index].base_volume != bar.base_volume
+                        || self.facts[index].quote_volume != bar.quote_volume
+                        || self.facts[index].taker_buy_base_volume != bar.taker_buy_base_volume
+                        || self.facts[index].taker_buy_quote_volume != bar.taker_buy_quote_volume);
                 self.bars[index] = ui_bar;
                 self.studies[index] = point;
                 self.facts[index] = bar;
             }
             Err(index) => {
-                let previous = index.checked_sub(1).and_then(|previous| self.facts.get(previous))
+                let previous = index
+                    .checked_sub(1)
+                    .and_then(|previous| self.facts.get(previous))
                     .map(|previous| previous.open_time_ms);
                 let next = self.facts.get(index).map(|next| next.open_time_ms);
-                if let Some(next) = next { self.gap_right_edges.remove(&next); }
+                if let Some(next) = next {
+                    self.gap_right_edges.remove(&next);
+                }
                 if previous.is_some_and(|previous| previous.saturating_add(60_000) < open_time_ms) {
                     self.gap_right_edges.insert(open_time_ms);
                 }
                 if let Some(next) = next
-                    && open_time_ms.saturating_add(60_000) < next {
+                    && open_time_ms.saturating_add(60_000) < next
+                {
                     self.gap_right_edges.insert(next);
                 }
                 self.bars.insert(index, ui_bar);
@@ -902,14 +982,17 @@ impl BaseMinuteSeries {
                 self.facts.insert(index, bar);
             }
         }
-        if closed_changed { self.closed_revision = self.closed_revision.saturating_add(1); }
+        if closed_changed {
+            self.closed_revision = self.closed_revision.saturating_add(1);
+        }
         if self.bars.len() > MAX_BASE_MINUTE_BARS {
             let extra = self.bars.len() - MAX_BASE_MINUTE_BARS;
             self.bars.drain(..extra);
             self.studies.drain(..extra);
             self.facts.drain(..extra);
             if let Some(first) = self.facts.first() {
-                self.gap_right_edges.retain(|right| *right > first.open_time_ms);
+                self.gap_right_edges
+                    .retain(|right| *right > first.open_time_ms);
             }
         }
     }
@@ -917,10 +1000,12 @@ impl BaseMinuteSeries {
 
 impl LocalMarketStore {
     pub(crate) fn retained_study_source_bytes(&self) -> usize {
-        let minute = self.base_minutes.values().fold(0_usize, |total, series|
-            total.saturating_add(series.memory_bytes()));
+        let minute = self.base_minutes.values().fold(0_usize, |total, series| {
+            total.saturating_add(series.memory_bytes())
+        });
         self.session_days.values().fold(minute, |total, series| {
-            total.saturating_add(series.bars.capacity() * std::mem::size_of::<PublicBar>())
+            total
+                .saturating_add(series.bars.capacity() * std::mem::size_of::<PublicBar>())
                 .saturating_add(series.bars.len() * 64)
                 .saturating_add(series.confirmed.len() * 48)
         })
@@ -1094,7 +1179,10 @@ impl LocalMarketStore {
     }
 
     fn reattach_shared_sources(&mut self) {
-        let active = self.reducers.keys().map(|selection| selection.binding.clone())
+        let active = self
+            .reducers
+            .keys()
+            .map(|selection| selection.binding.clone())
             .collect::<BTreeSet<_>>();
         if active.is_empty() {
             self.base_minutes.clear();
@@ -1102,7 +1190,9 @@ impl LocalMarketStore {
             return;
         }
         for (binding, series) in &mut self.base_minutes {
-            if !active.contains(binding) { continue; }
+            if !active.contains(binding) {
+                continue;
+            }
             if series.studies.last().is_some_and(|point| !point.confirmed) {
                 if let Some(forming) = series.facts.pop() {
                     series.gap_right_edges.remove(&forming.open_time_ms);
@@ -1110,25 +1200,40 @@ impl LocalMarketStore {
                 series.bars.pop();
                 series.studies.pop();
             }
-            for bar in &mut series.facts { bar.generation = self.generation; }
+            for bar in &mut series.facts {
+                bar.generation = self.generation;
+            }
             self.base_minute_tick = self.base_minute_tick.saturating_add(1);
             series.incarnation = self.base_minute_tick;
             series.last_used_tick = self.base_minute_tick;
         }
-        self.base_minutes.retain(|_, series| !series.facts.is_empty());
+        self.base_minutes
+            .retain(|_, series| !series.facts.is_empty());
         for (binding, series) in &mut self.session_days {
-            if !active.contains(binding) { continue; }
-            series.bars.retain(|bar| series.confirmed.contains(&bar.open_time_ms));
-            for bar in &mut series.bars { bar.generation = self.generation; }
+            if !active.contains(binding) {
+                continue;
+            }
+            series
+                .bars
+                .retain(|bar| series.confirmed.contains(&bar.open_time_ms));
+            for bar in &mut series.bars {
+                bar.generation = self.generation;
+            }
             self.session_day_tick = self.session_day_tick.saturating_add(1);
             series.last_used_tick = self.session_day_tick;
         }
-        self.session_days.retain(|_, series| !series.bars.is_empty());
+        self.session_days
+            .retain(|_, series| !series.bars.is_empty());
         while self.session_days.len() > active.len() + MAX_SESSION_DAY_CACHE_BINDINGS {
-            let victim = self.session_days.iter().filter(|(binding, _)| !active.contains(*binding))
+            let victim = self
+                .session_days
+                .iter()
+                .filter(|(binding, _)| !active.contains(*binding))
                 .min_by_key(|(_, series)| series.last_used_tick)
                 .map(|(binding, _)| binding.clone());
-            let Some(victim) = victim else { break; };
+            let Some(victim) = victim else {
+                break;
+            };
             self.session_days.remove(&victim);
         }
     }
@@ -1216,21 +1321,50 @@ impl LocalMarketStore {
         self.reducers.get(selection).map(LocalMarketReducer::view)
     }
 
-    pub(crate) fn base_minutes(&self, binding: &PublicMarketBinding) -> Option<(&[UiBar], &[BaseMinuteStudy], (u64, u64))> {
-        if !self.reducers.keys().any(|selection| &selection.binding == binding) { return None; }
-        self.base_minutes.get(binding).map(|series| (series.bars.as_slice(), series.studies.as_slice(), (series.incarnation, series.closed_revision)))
+    pub(crate) fn base_minutes(
+        &self,
+        binding: &PublicMarketBinding,
+    ) -> Option<(&[UiBar], &[BaseMinuteStudy], (u64, u64))> {
+        if !self
+            .reducers
+            .keys()
+            .any(|selection| &selection.binding == binding)
+        {
+            return None;
+        }
+        self.base_minutes.get(binding).map(|series| {
+            (
+                series.bars.as_slice(),
+                series.studies.as_slice(),
+                (series.incarnation, series.closed_revision),
+            )
+        })
     }
 
     pub fn base_minute_facts(&self, binding: &PublicMarketBinding) -> Option<&[PublicBar]> {
-        if !self.reducers.keys().any(|selection| &selection.binding == binding) { return None; }
+        if !self
+            .reducers
+            .keys()
+            .any(|selection| &selection.binding == binding)
+        {
+            return None;
+        }
         self.base_minutes.get(binding).map(|series| {
-            let end = series.facts.len().saturating_sub(usize::from(series.studies.last().is_some_and(|point| !point.confirmed)));
+            let end = series.facts.len().saturating_sub(usize::from(
+                series.studies.last().is_some_and(|point| !point.confirmed),
+            ));
             &series.facts[..end]
         })
     }
 
     pub fn base_minute_forming_fact(&self, binding: &PublicMarketBinding) -> Option<&PublicBar> {
-        if !self.reducers.keys().any(|selection| &selection.binding == binding) { return None; }
+        if !self
+            .reducers
+            .keys()
+            .any(|selection| &selection.binding == binding)
+        {
+            return None;
+        }
         self.base_minutes.get(binding).and_then(|series| {
             series.studies.last().filter(|point| !point.confirmed)?;
             series.facts.last()
@@ -1238,14 +1372,33 @@ impl LocalMarketStore {
     }
 
     pub fn session_days(&self, binding: &PublicMarketBinding) -> Option<&[PublicBar]> {
-        if !self.reducers.keys().any(|selection| &selection.binding == binding) { return None; }
-        self.session_days.get(binding).map(|series| series.bars.as_slice())
+        if !self
+            .reducers
+            .keys()
+            .any(|selection| &selection.binding == binding)
+        {
+            return None;
+        }
+        self.session_days
+            .get(binding)
+            .map(|series| series.bars.as_slice())
     }
 
-    pub fn begin_shared_history(&mut self, binding: &PublicMarketBinding,
-        interval: ChartInterval, desired_start_ms: u64, desired_end_ms: u64) -> Option<SharedHistoryRequest> {
+    pub fn begin_shared_history(
+        &mut self,
+        binding: &PublicMarketBinding,
+        interval: ChartInterval,
+        desired_start_ms: u64,
+        desired_end_ms: u64,
+    ) -> Option<SharedHistoryRequest> {
         if !matches!(interval, ChartInterval::OneMinute | ChartInterval::OneDay)
-            || !self.reducers.keys().any(|selection| &selection.binding == binding) { return None; }
+            || !self
+                .reducers
+                .keys()
+                .any(|selection| &selection.binding == binding)
+        {
+            return None;
+        }
         let first = match interval {
             ChartInterval::OneMinute => {
                 let series = self.base_minutes.get(binding)?;
@@ -1253,148 +1406,279 @@ impl LocalMarketStore {
             }
             ChartInterval::OneDay => {
                 let series = self.session_days.get(binding)?;
-                if series.bars.len() >= 500 { return None; }
+                if series.bars.len() >= 500 {
+                    return None;
+                }
                 series.bars.first()?.open_time_ms
             }
             _ => return None,
         };
         let key = (binding.clone(), interval);
         if self.shared_history_pending.contains_key(&key)
-            || self.shared_history_retry_after.get(&key).is_some_and(|until| *until > crate::account_center::now_ms())
-        { return None; }
+            || self
+                .shared_history_retry_after
+                .get(&key)
+                .is_some_and(|until| *until > crate::account_center::now_ms())
+        {
+            return None;
+        }
         let gap = if interval == ChartInterval::OneMinute && desired_start_ms < desired_end_ms {
             self.base_minutes.get(binding).and_then(|series| {
-                series.gap_right_edges.range(desired_start_ms.saturating_add(1)..=desired_end_ms)
+                series
+                    .gap_right_edges
+                    .range(desired_start_ms.saturating_add(1)..=desired_end_ms)
                     .find_map(|right| {
-                        if self.shared_history_exhausted_at.contains(&(binding.clone(), interval, *right)) { return None; }
-                        let index = series.facts.binary_search_by_key(right, |bar| bar.open_time_ms).ok()?;
+                        if self.shared_history_exhausted_at.contains(&(
+                            binding.clone(),
+                            interval,
+                            *right,
+                        )) {
+                            return None;
+                        }
+                        let index = series
+                            .facts
+                            .binary_search_by_key(right, |bar| bar.open_time_ms)
+                            .ok()?;
                         let left = series.facts.get(index.checked_sub(1)?)?.open_time_ms;
                         Some((*right, left))
                     })
             })
-        } else { None };
-        let (before, gap_after) = if let Some((right, left)) = gap { (right, Some(left)) }
-            else if desired_start_ms < first && first > 0
-                && (interval != ChartInterval::OneMinute
-                    || self.base_minutes.get(binding).is_some_and(|series| series.facts.len() < MAX_BASE_MINUTE_BARS))
-                && !self.shared_history_exhausted_at.contains(&(binding.clone(), interval, first))
-            { (first, None) } else { return None; };
-        self.next_shared_history_request_id = self.next_shared_history_request_id
-            .wrapping_add(1).max(1);
+        } else {
+            None
+        };
+        let (before, gap_after) = if let Some((right, left)) = gap {
+            (right, Some(left))
+        } else if desired_start_ms < first
+            && first > 0
+            && (interval != ChartInterval::OneMinute
+                || self
+                    .base_minutes
+                    .get(binding)
+                    .is_some_and(|series| series.facts.len() < MAX_BASE_MINUTE_BARS))
+            && !self
+                .shared_history_exhausted_at
+                .contains(&(binding.clone(), interval, first))
+        {
+            (first, None)
+        } else {
+            return None;
+        };
+        self.next_shared_history_request_id =
+            self.next_shared_history_request_id.wrapping_add(1).max(1);
         let request_id = self.next_shared_history_request_id;
         self.shared_history_pending.insert(key, request_id);
-        Some(SharedHistoryRequest { request_id, generation: self.generation,
-            binding: binding.clone(), interval, before, gap_after })
+        Some(SharedHistoryRequest {
+            request_id,
+            generation: self.generation,
+            binding: binding.clone(),
+            interval,
+            before,
+            gap_after,
+        })
     }
 
     pub fn cancel_shared_history(&mut self, request: &SharedHistoryRequest) {
         let key = (request.binding.clone(), request.interval);
         if request.generation == self.generation
-            && self.shared_history_pending.get(&key) == Some(&request.request_id) {
+            && self.shared_history_pending.get(&key) == Some(&request.request_id)
+        {
             self.shared_history_pending.remove(&key);
         }
     }
 
     pub fn retain_shared_history_demands(
-        &mut self, demanded: &BTreeSet<(PublicMarketBinding, ChartInterval)>) {
-        self.shared_history_pending.retain(|key, _| demanded.contains(key));
-        self.shared_history_retry_after.retain(|key, _| demanded.contains(key));
+        &mut self,
+        demanded: &BTreeSet<(PublicMarketBinding, ChartInterval)>,
+    ) {
+        self.shared_history_pending
+            .retain(|key, _| demanded.contains(key));
+        self.shared_history_retry_after
+            .retain(|key, _| demanded.contains(key));
     }
 
-    pub fn finish_shared_history(&mut self, request: &SharedHistoryRequest,
-        result: Result<Vec<PublicBar>, String>) -> Result<usize, LocalMarketError> {
-        if request.generation != self.generation { return Ok(0); }
+    pub fn finish_shared_history(
+        &mut self,
+        request: &SharedHistoryRequest,
+        result: Result<Vec<PublicBar>, String>,
+    ) -> Result<usize, LocalMarketError> {
+        if request.generation != self.generation {
+            return Ok(0);
+        }
         let key = (request.binding.clone(), request.interval);
-        if self.shared_history_pending.get(&key) != Some(&request.request_id) { return Ok(0); }
+        if self.shared_history_pending.get(&key) != Some(&request.request_id) {
+            return Ok(0);
+        }
         self.shared_history_pending.remove(&key);
         let bars = match result {
-            Ok(bars) => { self.shared_history_retry_after.remove(&key); bars }
+            Ok(bars) => {
+                self.shared_history_retry_after.remove(&key);
+                bars
+            }
             Err(_) => {
-                self.shared_history_retry_after.insert(key, crate::account_center::now_ms().saturating_add(30_000));
+                self.shared_history_retry_after
+                    .insert(key, crate::account_center::now_ms().saturating_add(30_000));
                 return Ok(0);
             }
         };
         if bars.len() > 500 || bars.iter().any(|bar| bar.open_time_ms >= request.before) {
-            self.shared_history_retry_after.insert(key,
-                crate::account_center::now_ms().saturating_add(30_000));
+            self.shared_history_retry_after
+                .insert(key, crate::account_center::now_ms().saturating_add(30_000));
             return Err(LocalMarketError::ScopeMismatch);
         }
         if bars.is_empty() {
-            self.shared_history_exhausted_at.insert((request.binding.clone(), request.interval, request.before));
+            self.shared_history_exhausted_at.insert((
+                request.binding.clone(),
+                request.interval,
+                request.before,
+            ));
             return Ok(0);
         }
         if !history_page_covers_gap(&bars, request.before, request.gap_after) {
-            self.shared_history_exhausted_at.insert((request.binding.clone(), request.interval, request.before));
+            self.shared_history_exhausted_at.insert((
+                request.binding.clone(),
+                request.interval,
+                request.before,
+            ));
             return Ok(0);
         }
-        self.shared_history_exhausted_at.remove(&(request.binding.clone(), request.interval, request.before));
+        self.shared_history_exhausted_at.remove(&(
+            request.binding.clone(),
+            request.interval,
+            request.before,
+        ));
         let added = bars.len();
         let applied = match request.interval {
-            ChartInterval::OneMinute => self.apply_base_history(request.generation, request.binding.clone(), bars, None).map(|_| ()),
-            ChartInterval::OneDay => self.apply_session_history(request.generation, request.binding.clone(), bars, None).map(|_| ()),
+            ChartInterval::OneMinute => self
+                .apply_base_history(request.generation, request.binding.clone(), bars, None)
+                .map(|_| ()),
+            ChartInterval::OneDay => self
+                .apply_session_history(request.generation, request.binding.clone(), bars, None)
+                .map(|_| ()),
             _ => Err(LocalMarketError::ScopeMismatch),
         };
         if applied.is_err() {
-            self.shared_history_retry_after.insert(key,
-                crate::account_center::now_ms().saturating_add(30_000));
+            self.shared_history_retry_after
+                .insert(key, crate::account_center::now_ms().saturating_add(30_000));
         }
         applied.map(|()| added)
     }
 
-    pub fn apply_session_day(&mut self, generation: u64, binding: PublicMarketBinding,
-        bar: PublicBar, confirmed: bool) -> Result<ReduceOutcome, LocalMarketError> {
-        if generation < self.generation { return Ok(ReduceOutcome::IgnoredOldGeneration) }
-        if generation > self.generation { return Err(LocalMarketError::FutureGeneration) }
-        if !self.valid_session_scope(&binding, &bar) { return Err(LocalMarketError::ScopeMismatch) }
+    pub fn apply_session_day(
+        &mut self,
+        generation: u64,
+        binding: PublicMarketBinding,
+        bar: PublicBar,
+        confirmed: bool,
+    ) -> Result<ReduceOutcome, LocalMarketError> {
+        if generation < self.generation {
+            return Ok(ReduceOutcome::IgnoredOldGeneration);
+        }
+        if generation > self.generation {
+            return Err(LocalMarketError::FutureGeneration);
+        }
+        if !self.valid_session_scope(&binding, &bar) {
+            return Err(LocalMarketError::ScopeMismatch);
+        }
         self.session_day_tick = self.session_day_tick.saturating_add(1);
         let series = self.session_days.entry(binding).or_default();
         series.last_used_tick = self.session_day_tick;
-        match series.bars.binary_search_by_key(&bar.open_time_ms, |day| day.open_time_ms) {
+        match series
+            .bars
+            .binary_search_by_key(&bar.open_time_ms, |day| day.open_time_ms)
+        {
             Ok(_index) if series.confirmed.contains(&bar.open_time_ms) && !confirmed => {}
             Ok(index) if !confirmed && series.bars[index].received_at_ms > bar.received_at_ms => {}
             Ok(index) => series.bars[index] = bar.clone(),
             Err(index) => series.bars.insert(index, bar.clone()),
         }
-        if confirmed { series.confirmed.insert(bar.open_time_ms); }
+        if confirmed {
+            series.confirmed.insert(bar.open_time_ms);
+        }
         if series.bars.len() > 500 {
-            let expired = series.bars.drain(..series.bars.len()-500).map(|bar| bar.open_time_ms).collect::<Vec<_>>();
-            for time in expired { series.confirmed.remove(&time); }
+            let expired = series
+                .bars
+                .drain(..series.bars.len() - 500)
+                .map(|bar| bar.open_time_ms)
+                .collect::<Vec<_>>();
+            for time in expired {
+                series.confirmed.remove(&time);
+            }
         }
         Ok(ReduceOutcome::Applied)
     }
 
-    pub fn apply_session_history(&mut self, generation: u64, binding: PublicMarketBinding,
-        bars: Vec<PublicBar>, forming: Option<PublicBar>) -> Result<ReduceOutcome, LocalMarketError> {
-        if generation < self.generation { return Ok(ReduceOutcome::IgnoredOldGeneration) }
-        if generation > self.generation { return Err(LocalMarketError::FutureGeneration) }
-        if bars.len() > 500 || bars.windows(2).any(|pair| pair[0].open_time_ms >= pair[1].open_time_ms)
-            || bars.iter().any(|bar| !self.valid_session_scope(&binding, bar))
-            || forming.as_ref().is_some_and(|bar| !self.valid_session_scope(&binding, bar))
-        { return Err(LocalMarketError::ScopeMismatch) }
-        for bar in bars { self.apply_session_day(generation, binding.clone(), bar, true)?; }
-        if let Some(bar) = forming { self.apply_session_day(generation, binding, bar, false)?; }
+    pub fn apply_session_history(
+        &mut self,
+        generation: u64,
+        binding: PublicMarketBinding,
+        bars: Vec<PublicBar>,
+        forming: Option<PublicBar>,
+    ) -> Result<ReduceOutcome, LocalMarketError> {
+        if generation < self.generation {
+            return Ok(ReduceOutcome::IgnoredOldGeneration);
+        }
+        if generation > self.generation {
+            return Err(LocalMarketError::FutureGeneration);
+        }
+        if bars.len() > 500
+            || bars
+                .windows(2)
+                .any(|pair| pair[0].open_time_ms >= pair[1].open_time_ms)
+            || bars
+                .iter()
+                .any(|bar| !self.valid_session_scope(&binding, bar))
+            || forming
+                .as_ref()
+                .is_some_and(|bar| !self.valid_session_scope(&binding, bar))
+        {
+            return Err(LocalMarketError::ScopeMismatch);
+        }
+        for bar in bars {
+            self.apply_session_day(generation, binding.clone(), bar, true)?;
+        }
+        if let Some(bar) = forming {
+            self.apply_session_day(generation, binding, bar, false)?;
+        }
         Ok(ReduceOutcome::Applied)
     }
 
     fn valid_session_scope(&self, binding: &PublicMarketBinding, bar: &PublicBar) -> bool {
-        self.reducers.keys().any(|selection| &selection.binding == binding)
-            && bar.symbol == binding.symbol && bar.generation == self.generation
-            && bar.interval_ms == 86_400_000 && bar.is_valid()
+        self.reducers
+            .keys()
+            .any(|selection| &selection.binding == binding)
+            && bar.symbol == binding.symbol
+            && bar.generation == self.generation
+            && bar.interval_ms == 86_400_000
+            && bar.is_valid()
     }
 
-    pub fn apply_base_minute(&mut self, generation: u64, binding: PublicMarketBinding,
-        bar: PublicBar, confirmed: bool) -> Result<ReduceOutcome, LocalMarketError> {
-        if generation < self.generation { return Ok(ReduceOutcome::IgnoredOldGeneration) }
-        if generation > self.generation { return Err(LocalMarketError::FutureGeneration) }
+    pub fn apply_base_minute(
+        &mut self,
+        generation: u64,
+        binding: PublicMarketBinding,
+        bar: PublicBar,
+        confirmed: bool,
+    ) -> Result<ReduceOutcome, LocalMarketError> {
+        if generation < self.generation {
+            return Ok(ReduceOutcome::IgnoredOldGeneration);
+        }
+        if generation > self.generation {
+            return Err(LocalMarketError::FutureGeneration);
+        }
         if !self.valid_base_scope(generation, &binding, &bar) {
             return Err(LocalMarketError::ScopeMismatch);
         }
         self.base_minute_tick = self.base_minute_tick.saturating_add(1);
         let tick = self.base_minute_tick;
         let series = self.base_minutes.entry(binding.clone()).or_default();
-        if series.incarnation == 0 { series.incarnation = tick; }
-        let newly_narrowed_gap = series.facts.binary_search_by_key(&bar.open_time_ms,
-            |known| known.open_time_ms).err().and_then(|index| {
+        if series.incarnation == 0 {
+            series.incarnation = tick;
+        }
+        let newly_narrowed_gap = series
+            .facts
+            .binary_search_by_key(&bar.open_time_ms, |known| known.open_time_ms)
+            .err()
+            .and_then(|index| {
                 let left = series.facts.get(index.checked_sub(1)?)?.open_time_ms;
                 let right = series.facts.get(index)?.open_time_ms;
                 (left.saturating_add(60_000) < right).then_some(right)
@@ -1402,33 +1686,67 @@ impl LocalMarketStore {
         series.insert(bar, confirmed)?;
         series.last_used_tick = tick;
         if let Some(right) = newly_narrowed_gap {
-            self.shared_history_exhausted_at.remove(&(binding.clone(), ChartInterval::OneMinute, right));
+            self.shared_history_exhausted_at.remove(&(
+                binding.clone(),
+                ChartInterval::OneMinute,
+                right,
+            ));
         }
         self.trim_base_minute_cache(&binding, MAX_BASE_MINUTE_CACHE_BYTES);
         Ok(ReduceOutcome::Applied)
     }
 
-    pub fn apply_base_history(&mut self, generation: u64, binding: PublicMarketBinding,
-        bars: Vec<PublicBar>, forming: Option<PublicBar>) -> Result<ReduceOutcome, LocalMarketError> {
-        if generation < self.generation { return Ok(ReduceOutcome::IgnoredOldGeneration) }
-        if generation > self.generation { return Err(LocalMarketError::FutureGeneration) }
-        if bars.len() > 1_500 || bars.windows(2).any(|pair| pair[0].open_time_ms >= pair[1].open_time_ms)
-            || bars.iter().any(|bar| !self.valid_base_scope(generation, &binding, bar))
-            || forming.as_ref().is_some_and(|bar| !self.valid_base_scope(generation, &binding, bar))
+    pub fn apply_base_history(
+        &mut self,
+        generation: u64,
+        binding: PublicMarketBinding,
+        bars: Vec<PublicBar>,
+        forming: Option<PublicBar>,
+    ) -> Result<ReduceOutcome, LocalMarketError> {
+        if generation < self.generation {
+            return Ok(ReduceOutcome::IgnoredOldGeneration);
+        }
+        if generation > self.generation {
+            return Err(LocalMarketError::FutureGeneration);
+        }
+        if bars.len() > 1_500
+            || bars
+                .windows(2)
+                .any(|pair| pair[0].open_time_ms >= pair[1].open_time_ms)
+            || bars
+                .iter()
+                .any(|bar| !self.valid_base_scope(generation, &binding, bar))
+            || forming
+                .as_ref()
+                .is_some_and(|bar| !self.valid_base_scope(generation, &binding, bar))
         {
             return Err(LocalMarketError::ScopeMismatch);
         }
-        let prepared = bars.into_iter().map(|bar| BaseMinuteSeries::prepare(bar, true))
+        let prepared = bars
+            .into_iter()
+            .map(|bar| BaseMinuteSeries::prepare(bar, true))
             .collect::<Result<Vec<_>, _>>()?;
-        let prepared_forming = forming.map(|bar| BaseMinuteSeries::prepare(bar, false)).transpose()?;
+        let prepared_forming = forming
+            .map(|bar| BaseMinuteSeries::prepare(bar, false))
+            .transpose()?;
         self.base_minute_tick = self.base_minute_tick.saturating_add(1);
         let tick = self.base_minute_tick;
-        let prefix_page = prepared_forming.is_none() && !prepared.is_empty() && self.base_minutes.get(&binding)
-            .and_then(|series| series.facts.first())
-            .is_some_and(|first| prepared.last().is_some_and(|(last, _, _)| last.open_time_ms < first.open_time_ms));
+        let prefix_page = prepared_forming.is_none()
+            && !prepared.is_empty()
+            && self
+                .base_minutes
+                .get(&binding)
+                .and_then(|series| series.facts.first())
+                .is_some_and(|first| {
+                    prepared
+                        .last()
+                        .is_some_and(|(last, _, _)| last.open_time_ms < first.open_time_ms)
+                });
         if prefix_page {
             let mut prefix = BaseMinuteSeries::default();
-            for (bar, ui_bar, point) in prepared { prefix.insert_prepared(bar, ui_bar, point); }
+            for (bar, ui_bar, point) in prepared {
+                prefix.insert_prepared(bar, ui_bar, point);
+            }
             // Validate the new page before taking ownership of the cached tail.
             // Repeated 1m paging must not clone the entire growing series.
             let mut candidate = self.base_minutes.remove(&binding).unwrap_or_default();
@@ -1439,10 +1757,16 @@ impl LocalMarketStore {
                     prefix.gap_right_edges.insert(right.open_time_ms);
                 }
             }
-            prefix.gap_right_edges.append(&mut candidate.gap_right_edges);
+            prefix
+                .gap_right_edges
+                .append(&mut candidate.gap_right_edges);
             prefix.facts.append(&mut candidate.facts);
             prefix.closed_revision = candidate.closed_revision.saturating_add(1);
-            prefix.incarnation = if candidate.incarnation == 0 { tick } else { candidate.incarnation };
+            prefix.incarnation = if candidate.incarnation == 0 {
+                tick
+            } else {
+                candidate.incarnation
+            };
             prefix.last_used_tick = tick;
             if prefix.facts.len() > MAX_BASE_MINUTE_BARS {
                 let extra = prefix.facts.len() - MAX_BASE_MINUTE_BARS;
@@ -1450,14 +1774,20 @@ impl LocalMarketStore {
                 prefix.studies.drain(..extra);
                 prefix.facts.drain(..extra);
                 if let Some(first) = prefix.facts.first() {
-                    prefix.gap_right_edges.retain(|right| *right > first.open_time_ms);
+                    prefix
+                        .gap_right_edges
+                        .retain(|right| *right > first.open_time_ms);
                 }
             }
             self.base_minutes.insert(binding.clone(), prefix);
         } else {
             let candidate = self.base_minutes.entry(binding.clone()).or_default();
-            if candidate.incarnation == 0 { candidate.incarnation = tick; }
-            for (bar, ui_bar, point) in prepared { candidate.insert_prepared(bar, ui_bar, point); }
+            if candidate.incarnation == 0 {
+                candidate.incarnation = tick;
+            }
+            for (bar, ui_bar, point) in prepared {
+                candidate.insert_prepared(bar, ui_bar, point);
+            }
             if let Some((bar, ui_bar, point)) = prepared_forming {
                 candidate.insert_prepared(bar, ui_bar, point);
             }
@@ -1468,7 +1798,11 @@ impl LocalMarketStore {
     }
 
     fn trim_base_minute_cache(&mut self, protected: &PublicMarketBinding, budget: usize) {
-        let mut used = self.base_minutes.values().map(BaseMinuteSeries::memory_bytes).sum::<usize>();
+        let mut used = self
+            .base_minutes
+            .values()
+            .map(BaseMinuteSeries::memory_bytes)
+            .sum::<usize>();
         if used > budget {
             if let Some(series) = self.base_minutes.get_mut(protected) {
                 let reclaimable = (series.bars.capacity() - series.bars.len())
@@ -1482,12 +1816,16 @@ impl LocalMarketStore {
                     series.bars.shrink_to_fit();
                     series.studies.shrink_to_fit();
                     series.facts.shrink_to_fit();
-                    used = used.saturating_sub(before).saturating_add(series.memory_bytes());
+                    used = used
+                        .saturating_sub(before)
+                        .saturating_add(series.memory_bytes());
                 }
             }
         }
         while used > budget {
-            let victim = self.base_minutes.iter()
+            let victim = self
+                .base_minutes
+                .iter()
                 .filter(|(binding, _)| *binding != protected)
                 .min_by_key(|(_, series)| series.last_used_tick)
                 .map(|(binding, _)| binding.clone());
@@ -1502,18 +1840,31 @@ impl LocalMarketStore {
             };
             if let Some(removed) = self.base_minutes.remove(&victim) {
                 used = used.saturating_sub(removed.memory_bytes());
-                self.shared_history_pending.remove(&(victim.clone(), ChartInterval::OneMinute));
-                self.shared_history_retry_after.remove(&(victim.clone(), ChartInterval::OneMinute));
-                self.shared_history_exhausted_at.retain(|(binding, interval, _)|
-                    binding != &victim || *interval != ChartInterval::OneMinute);
+                self.shared_history_pending
+                    .remove(&(victim.clone(), ChartInterval::OneMinute));
+                self.shared_history_retry_after
+                    .remove(&(victim.clone(), ChartInterval::OneMinute));
+                self.shared_history_exhausted_at
+                    .retain(|(binding, interval, _)| {
+                        binding != &victim || *interval != ChartInterval::OneMinute
+                    });
             }
         }
     }
 
-    fn valid_base_scope(&self, generation: u64, binding: &PublicMarketBinding, bar: &PublicBar) -> bool {
-        self.reducers.keys().any(|selection| &selection.binding == binding)
-            && bar.symbol == binding.symbol && bar.generation == generation
-            && bar.interval_ms == 60_000 && bar.is_valid()
+    fn valid_base_scope(
+        &self,
+        generation: u64,
+        binding: &PublicMarketBinding,
+        bar: &PublicBar,
+    ) -> bool {
+        self.reducers
+            .keys()
+            .any(|selection| &selection.binding == binding)
+            && bar.symbol == binding.symbol
+            && bar.generation == generation
+            && bar.interval_ms == 60_000
+            && bar.is_valid()
     }
 
     pub fn view_for_symbol(&self, symbol: &str) -> Option<&LocalMarketView> {

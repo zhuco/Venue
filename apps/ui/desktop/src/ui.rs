@@ -410,8 +410,9 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
     }
     let overlays = crate::chart_trading::collect(model, &symbol, &pane.trading_display);
     #[cfg(not(target_arch = "wasm32"))]
-    pane.analysis.select(MarketSelection::for_server(
-        model.preferences.market_server, &symbol, pane.interval).ok());
+    pane.analysis.select(
+        MarketSelection::for_server(model.preferences.market_server, &symbol, pane.interval).ok(),
+    );
     #[cfg(not(target_arch = "wasm32"))]
     if let Ok(selection) =
         MarketSelection::for_server(model.preferences.market_server, &symbol, pane.interval)
@@ -545,13 +546,23 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
             }
             return;
         }
-        use crate::chart_view::analysis::{AnalysisAction, AnalysisMode, AvwapAnchor, FixedProfileRange};
+        use crate::chart_view::analysis::{
+            AnalysisAction, AnalysisMode, AvwapAnchor, FixedProfileRange,
+        };
         let binding = local.selection.binding.clone();
-        let anchors = model.preferences.analysis_anchors.iter()
+        let anchors = model
+            .preferences
+            .analysis_anchors
+            .iter()
             .filter(|anchor| anchor.pane_instance == pane.instance && anchor.binding == binding)
-            .cloned().collect::<Vec<_>>();
-        let fixed = model.preferences.fixed_profile_ranges.iter()
-            .find(|range| range.pane_instance == pane.instance && range.binding == binding).cloned();
+            .cloned()
+            .collect::<Vec<_>>();
+        let fixed = model
+            .preferences
+            .fixed_profile_ranges
+            .iter()
+            .find(|range| range.pane_instance == pane.instance && range.binding == binding)
+            .cloned();
         settings.profile.fixed_start_ms = fixed.as_ref().map_or(0, |range| range.start_ms);
         settings.profile.fixed_end_ms = fixed.as_ref().map_or(0, |range| range.end_ms);
         ui.horizontal_wrapped(|ui| {
@@ -653,8 +664,12 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
             Some(&local.selection.binding),
             model.local_markets.base_minutes(&local.selection.binding),
             model.local_markets.session_days(&local.selection.binding),
-            model.local_markets.base_minute_facts(&local.selection.binding),
-            model.local_markets.base_minute_forming_fact(&local.selection.binding),
+            model
+                .local_markets
+                .base_minute_facts(&local.selection.binding),
+            model
+                .local_markets
+                .base_minute_forming_fact(&local.selection.binding),
             Some((&anchors, &mut pane.analysis)),
             Some(local.bar_revision),
             Some(&local.open_interest_history),
@@ -663,28 +678,67 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
             match action {
                 AnalysisAction::AddAnchor { time_ms, price } => {
                     if anchors.len() < 8 {
-                        let id = model.preferences.analysis_anchors.iter().map(|item| item.id).max()
-                            .unwrap_or(0).saturating_add(1);
-                        let palette = [[240, 185, 11], [90, 200, 250], [159, 122, 234],
-                            [14, 203, 129], [246, 70, 93], [253, 138, 0], [183, 138, 247], [91, 159, 255]];
-                        model.preferences.analysis_anchors.push(AvwapAnchor { id, pane_instance: pane.instance,
-                            binding: binding.clone(), open_time_ms: time_ms, reference_price: price,
-                            color: palette[anchors.len()] });
+                        let id = model
+                            .preferences
+                            .analysis_anchors
+                            .iter()
+                            .map(|item| item.id)
+                            .max()
+                            .unwrap_or(0)
+                            .saturating_add(1);
+                        let palette = [
+                            [240, 185, 11],
+                            [90, 200, 250],
+                            [159, 122, 234],
+                            [14, 203, 129],
+                            [246, 70, 93],
+                            [253, 138, 0],
+                            [183, 138, 247],
+                            [91, 159, 255],
+                        ];
+                        model.preferences.analysis_anchors.push(AvwapAnchor {
+                            id,
+                            pane_instance: pane.instance,
+                            binding: binding.clone(),
+                            open_time_ms: time_ms,
+                            reference_price: price,
+                            color: palette[anchors.len()],
+                        });
                     }
                 }
                 AnalysisAction::MoveAnchor { id, time_ms, price } => {
-                    if let Some(anchor) = model.preferences.analysis_anchors.iter_mut()
-                        .find(|anchor| anchor.id == id && anchor.pane_instance == pane.instance && anchor.binding == binding) {
+                    if let Some(anchor) =
+                        model
+                            .preferences
+                            .analysis_anchors
+                            .iter_mut()
+                            .find(|anchor| {
+                                anchor.id == id
+                                    && anchor.pane_instance == pane.instance
+                                    && anchor.binding == binding
+                            })
+                    {
                         anchor.open_time_ms = time_ms;
                         anchor.reference_price = price;
                     }
                 }
                 AnalysisAction::SetFixedRange { start_ms, end_ms } => {
-                    model.preferences.fixed_profile_ranges.retain(|item| item.pane_instance != pane.instance || item.binding != binding);
-                    model.preferences.fixed_profile_ranges.push(FixedProfileRange {
-                        pane_instance: pane.instance, binding: binding.clone(), start_ms, end_ms,
+                    model.preferences.fixed_profile_ranges.retain(|item| {
+                        item.pane_instance != pane.instance || item.binding != binding
                     });
-                    let saved = model.preferences.chart_overrides.entry(settings_key.clone())
+                    model
+                        .preferences
+                        .fixed_profile_ranges
+                        .push(FixedProfileRange {
+                            pane_instance: pane.instance,
+                            binding: binding.clone(),
+                            start_ms,
+                            end_ms,
+                        });
+                    let saved = model
+                        .preferences
+                        .chart_overrides
+                        .entry(settings_key.clone())
                         .or_insert_with(|| settings.clone());
                     saved.profile.fixed_range = true;
                     saved.profile.fixed_start_ms = 0;
@@ -712,7 +766,9 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
             if let Some(first) = chart.0.get(visible.start) {
                 let mut minute_start = first.open_time_ms;
                 if settings.microstructure.heatmap {
-                    minute_start = minute_start.saturating_sub(u64::from(settings.microstructure.lookback_hours) * 3_600_000);
+                    minute_start = minute_start.saturating_sub(
+                        u64::from(settings.microstructure.lookback_hours) * 3_600_000,
+                    );
                 }
                 if settings.session.sr_1h {
                     minute_start = minute_start.saturating_sub(72 * 3_600_000);
@@ -720,35 +776,65 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
                     minute_start = minute_start.saturating_sub(24 * 3_600_000);
                 }
                 if settings.microstructure.show_cvd
-                    && settings.microstructure.cvd_reset_mode == venue_indicators::chart::CvdResetMode::UtcDaily {
+                    && settings.microstructure.cvd_reset_mode
+                        == venue_indicators::chart::CvdResetMode::UtcDaily
+                {
                     minute_start = minute_start.min(first.open_time_ms / 86_400_000 * 86_400_000);
                 }
-                if settings.profile.fixed_range && let Some(range) = &fixed {
+                if settings.profile.fixed_range
+                    && let Some(range) = &fixed
+                {
                     minute_start = minute_start.min(range.start_ms);
                 }
-                if !anchors.is_empty() { minute_start = minute_start.min(anchors.iter().map(|anchor| anchor.open_time_ms).min().unwrap_or(minute_start)); }
+                if !anchors.is_empty() {
+                    minute_start = minute_start.min(
+                        anchors
+                            .iter()
+                            .map(|anchor| anchor.open_time_ms)
+                            .min()
+                            .unwrap_or(minute_start),
+                    );
+                }
                 if pane.viewport.right_offset() == 0
                     && !(settings.microstructure.heatmap
-                        && pane.heatmap_history_scope.as_ref() == Some(&selection)) {
+                        && pane.heatmap_history_scope.as_ref() == Some(&selection))
+                {
                     // The default view warms only a small 1m window. Older model coverage
                     // is requested when the user navigates history; absent coverage stays visible.
-                    minute_start = minute_start.max(crate::account_center::now_ms().saturating_sub(6 * 3_600_000));
+                    minute_start = minute_start
+                        .max(crate::account_center::now_ms().saturating_sub(6 * 3_600_000));
                 }
-                let visible_end_ms = chart.0.get(visible.end.saturating_sub(1))
-                    .map_or(first.open_time_ms, |bar| bar.open_time_ms
-                        .saturating_add(selection.interval.duration_ms().saturating_sub(1)));
+                let visible_end_ms =
+                    chart
+                        .0
+                        .get(visible.end.saturating_sub(1))
+                        .map_or(first.open_time_ms, |bar| {
+                            bar.open_time_ms
+                                .saturating_add(selection.interval.duration_ms().saturating_sub(1))
+                        });
                 if settings.needs_minute_source(!anchors.is_empty()) {
-                    if let Some(request) = model.local_markets.begin_shared_history(&binding,
-                        crate::chart::ChartInterval::OneMinute, minute_start, visible_end_ms) {
+                    if let Some(request) = model.local_markets.begin_shared_history(
+                        &binding,
+                        crate::chart::ChartInterval::OneMinute,
+                        minute_start,
+                        visible_end_ms,
+                    ) {
                         model.shared_history_requests.push(request);
                     }
                 }
                 if settings.needs_day_source() {
-                    let week = venue_indicators::chart::session_levels::session_start(first.open_time_ms,
-                        venue_indicators::chart::session_levels::SessionPeriod::Weekly).unwrap_or(first.open_time_ms);
+                    let week = venue_indicators::chart::session_levels::session_start(
+                        first.open_time_ms,
+                        venue_indicators::chart::session_levels::SessionPeriod::Weekly,
+                    )
+                    .unwrap_or(first.open_time_ms);
                     let day_start = week.saturating_sub(7 * 86_400_000);
-                    if let Some(request) = model.local_markets.begin_shared_history(&binding,
-                        crate::chart::ChartInterval::OneDay, day_start, visible_end_ms) {
+                    if let Some(request) = model.local_markets.begin_shared_history(
+                        &binding,
+                        crate::chart::ChartInterval::OneDay,
+                        day_start,
+                        visible_end_ms,
+                    ) {
                         model.shared_history_requests.push(request);
                     }
                 }
@@ -756,7 +842,8 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
         }
         let near_start = pane.viewport.visible_bars() > chart.0.len()
             || (pane.viewport.right_offset() > 0
-                && pane.viewport.right_offset() + pane.viewport.visible_bars() + 32 >= chart.0.len());
+                && pane.viewport.right_offset() + pane.viewport.visible_bars() + 32
+                    >= chart.0.len());
         let manual = std::mem::take(&mut pane.history_requested);
         if (manual || near_start)
             && let Some(request) = model.local_markets.begin_history(&selection, manual)
@@ -929,11 +1016,14 @@ fn show_chart_toolbar(ui: &mut egui::Ui, pane: &mut Pane, language: Language) ->
         if ui.small_button(text(language, TextKey::Fit)).clicked() {
             pane.viewport.reset();
         }
-        if ui.small_button(if language == Language::SimplifiedChinese {
-            "更早K线"
-        } else {
-            "Older candles"
-        }).clicked() {
+        if ui
+            .small_button(if language == Language::SimplifiedChinese {
+                "更早K线"
+            } else {
+                "Older candles"
+            })
+            .clicked()
+        {
             pane.history_requested = true;
         }
     });

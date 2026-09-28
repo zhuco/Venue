@@ -1,6 +1,6 @@
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke};
-use venue_control_protocol::UiBar;
 use std::sync::Arc;
+use venue_control_protocol::UiBar;
 
 use crate::{
     chart::{
@@ -14,19 +14,24 @@ use crate::{
 };
 
 type StudySelector = fn(&ChartStudyPoint) -> Option<rust_decimal::Decimal>;
-mod candles;
 pub(crate) mod analysis;
+mod candles;
 pub(crate) mod loading;
 pub(crate) mod microstructure;
 mod price_annotations;
 mod price_axis;
-mod volume_profile;
 mod session_levels;
-mod support_resistance;
 mod study_readout;
+mod support_resistance;
+mod volume_profile;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum IndicatorCacheKind { Heatmap, Profile, Flow, Anchor }
+enum IndicatorCacheKind {
+    Heatmap,
+    Profile,
+    Flow,
+    Anchor,
+}
 
 #[derive(Clone, Copy)]
 struct IndicatorCacheEntry {
@@ -45,11 +50,20 @@ fn mark_indicator_cache(context: &egui::Context, kind: IndicatorCacheKind, id: e
     let frame = context.cumulative_frame_nr();
     context.data_mut(|data| {
         let key = indicator_cache_registry_id();
-        let mut entries = data.get_temp::<Vec<IndicatorCacheEntry>>(key).unwrap_or_default();
-        if let Some(entry) = entries.iter_mut().find(|entry| entry.kind == kind && entry.id == id) {
+        let mut entries = data
+            .get_temp::<Vec<IndicatorCacheEntry>>(key)
+            .unwrap_or_default();
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| entry.kind == kind && entry.id == id)
+        {
             entry.seen_frame = frame;
         } else {
-            entries.push(IndicatorCacheEntry { kind, id, seen_frame: frame });
+            entries.push(IndicatorCacheEntry {
+                kind,
+                id,
+                seen_frame: frame,
+            });
         }
         data.insert_temp(key, entries);
     });
@@ -59,26 +73,41 @@ pub(crate) fn evict_inactive_indicator_caches(context: &egui::Context) {
     let frame = context.cumulative_frame_nr();
     let stale = context.data_mut(|data| {
         let key = indicator_cache_registry_id();
-        let mut entries = data.get_temp::<Vec<IndicatorCacheEntry>>(key).unwrap_or_default();
+        let mut entries = data
+            .get_temp::<Vec<IndicatorCacheEntry>>(key)
+            .unwrap_or_default();
         let mut stale = Vec::new();
         entries.retain(|entry| {
-            if entry.seen_frame == frame { true } else { stale.push(*entry); false }
+            if entry.seen_frame == frame {
+                true
+            } else {
+                stale.push(*entry);
+                false
+            }
         });
-        if entries.is_empty() { data.remove::<Vec<IndicatorCacheEntry>>(key); }
-        else { data.insert_temp(key, entries); }
+        if entries.is_empty() {
+            data.remove::<Vec<IndicatorCacheEntry>>(key);
+        } else {
+            data.insert_temp(key, entries);
+        }
         stale
     });
-    for entry in stale { evict_indicator_cache(context, entry, true); }
+    for entry in stale {
+        evict_indicator_cache(context, entry, true);
+    }
     evict_indicator_caches_to_budget(context, MAX_RETAINED_INDICATOR_CACHE_BYTES);
 }
 
-fn evict_indicator_cache(context: &egui::Context, entry: IndicatorCacheEntry,
-    cancel_pending: bool) {
+fn evict_indicator_cache(
+    context: &egui::Context,
+    entry: IndicatorCacheEntry,
+    cancel_pending: bool,
+) {
     match entry.kind {
-        IndicatorCacheKind::Heatmap if cancel_pending =>
-            microstructure::evict_heatmap(context, entry.id),
-        IndicatorCacheKind::Heatmap =>
-            microstructure::evict_heatmap_result(context, entry.id),
+        IndicatorCacheKind::Heatmap if cancel_pending => {
+            microstructure::evict_heatmap(context, entry.id)
+        }
+        IndicatorCacheKind::Heatmap => microstructure::evict_heatmap_result(context, entry.id),
         IndicatorCacheKind::Profile => volume_profile::evict(context, entry.id),
         IndicatorCacheKind::Flow => context.data_mut(|data| {
             data.remove::<Arc<MinuteFlowCache>>(entry.id.with("minute-flow-cache"));
@@ -89,49 +118,67 @@ fn evict_indicator_cache(context: &egui::Context, entry: IndicatorCacheEntry,
 
 fn indicator_cache_entry_bytes(context: &egui::Context, entry: &IndicatorCacheEntry) -> usize {
     match entry.kind {
-        IndicatorCacheKind::Heatmap =>
-            microstructure::heatmap_retained_bytes(context, entry.id),
+        IndicatorCacheKind::Heatmap => microstructure::heatmap_retained_bytes(context, entry.id),
         IndicatorCacheKind::Profile => volume_profile::retained_bytes(context, entry.id),
         IndicatorCacheKind::Anchor => analysis::retained_bytes(context, entry.id),
-        IndicatorCacheKind::Flow => context.data(|data|
-            data.get_temp::<Arc<MinuteFlowCache>>(entry.id.with("minute-flow-cache")))
-            .map_or(0, |cache| std::mem::size_of::<MinuteFlowCache>()
-                .saturating_add(cache.buckets.capacity()
-                    * std::mem::size_of::<(u64, bool)>())
-                .saturating_add(cache.values.capacity()
-                    * std::mem::size_of::<venue_indicators::chart::OrderFlowValue>())),
+        IndicatorCacheKind::Flow => context
+            .data(|data| data.get_temp::<Arc<MinuteFlowCache>>(entry.id.with("minute-flow-cache")))
+            .map_or(0, |cache| {
+                std::mem::size_of::<MinuteFlowCache>()
+                    .saturating_add(cache.buckets.capacity() * std::mem::size_of::<(u64, bool)>())
+                    .saturating_add(
+                        cache.values.capacity()
+                            * std::mem::size_of::<venue_indicators::chart::OrderFlowValue>(),
+                    )
+            }),
     }
 }
 
 fn indicator_cache_total_bytes(context: &egui::Context, entries: &[IndicatorCacheEntry]) -> usize {
-    entries.iter().fold(entries.len() * std::mem::size_of::<IndicatorCacheEntry>(),
-        |total, entry| total.saturating_add(indicator_cache_entry_bytes(context, entry)))
+    entries.iter().fold(
+        entries.len() * std::mem::size_of::<IndicatorCacheEntry>(),
+        |total, entry| total.saturating_add(indicator_cache_entry_bytes(context, entry)),
+    )
 }
 
 fn evict_indicator_caches_to_budget(context: &egui::Context, budget: usize) {
     let key = indicator_cache_registry_id();
-    let mut entries = context.data(|data|
-        data.get_temp::<Vec<IndicatorCacheEntry>>(key).unwrap_or_default());
+    let mut entries = context.data(|data| {
+        data.get_temp::<Vec<IndicatorCacheEntry>>(key)
+            .unwrap_or_default()
+    });
     while indicator_cache_total_bytes(context, &entries) > budget {
-        let Some(index) = entries.iter().enumerate()
+        let Some(index) = entries
+            .iter()
+            .enumerate()
             .filter(|(_, entry)| indicator_cache_entry_bytes(context, entry) > 0)
-            .min_by_key(|(_, entry)| entry.seen_frame).map(|(index, _)| index) else { break; };
+            .min_by_key(|(_, entry)| entry.seen_frame)
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
         let entry = entries[index];
         evict_indicator_cache(context, entry, false);
         // A heatmap worker may finish after this frame; keep its registry entry so a
         // subsequently closed chart can still cancel and release that late result.
-        if entry.kind != IndicatorCacheKind::Heatmap { entries.remove(index); }
+        if entry.kind != IndicatorCacheKind::Heatmap {
+            entries.remove(index);
+        }
     }
     context.data_mut(|data| {
-        if entries.is_empty() { data.remove::<Vec<IndicatorCacheEntry>>(key); }
-        else { data.insert_temp(key, entries); }
+        if entries.is_empty() {
+            data.remove::<Vec<IndicatorCacheEntry>>(key);
+        } else {
+            data.insert_temp(key, entries);
+        }
     });
 }
 
 pub(crate) fn retained_indicator_cache_bytes(context: &egui::Context) -> usize {
-    let entries = context.data(|data|
+    let entries = context.data(|data| {
         data.get_temp::<Vec<IndicatorCacheEntry>>(indicator_cache_registry_id())
-            .unwrap_or_default());
+            .unwrap_or_default()
+    });
     indicator_cache_total_bytes(context, &entries)
 }
 
@@ -209,7 +256,9 @@ pub(crate) fn candle_plot(
         Sense::click_and_drag(),
     );
     painter.rect_filled(response.rect, 0, theme::BG_PRIMARY);
-    let analysis_active = analysis.as_ref().is_some_and(|(_, state)| state.mode != analysis::AnalysisMode::None);
+    let analysis_active = analysis
+        .as_ref()
+        .is_some_and(|(_, state)| state.mode != analysis::AnalysisMode::None);
     if let Some((_, state)) = analysis.as_mut() {
         state.action = None;
         if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
@@ -230,14 +279,22 @@ pub(crate) fn candle_plot(
     let full_rect = response.rect.shrink2(egui::vec2(8.0, 8.0));
     let axis_width =
         price_axis::width(&painter, all_bars, overlays, price_scale).min(full_rect.width() * 0.4);
-    let full_plot_rect = Rect::from_min_max(full_rect.min, full_rect.max - egui::vec2(axis_width, 0.0));
+    let full_plot_rect =
+        Rect::from_min_max(full_rect.min, full_rect.max - egui::vec2(axis_width, 0.0));
     let profile_enabled = settings.profile.visible_range || settings.profile.fixed_range;
     let profile_width = if profile_enabled {
         (full_plot_rect.width() * f32::from(settings.profile.width_percent) / 100.0)
             .min(full_plot_rect.width() * 0.35)
-    } else { 0.0 };
-    let plot_rect = Rect::from_min_max(full_plot_rect.min,
-        Pos2::new(full_plot_rect.right() - profile_width, full_plot_rect.bottom()));
+    } else {
+        0.0
+    };
+    let plot_rect = Rect::from_min_max(
+        full_plot_rect.min,
+        Pos2::new(
+            full_plot_rect.right() - profile_width,
+            full_plot_rect.bottom(),
+        ),
+    );
     let axis_painter = painter.clone();
     axis_painter.rect_filled(
         Rect::from_min_max(Pos2::new(plot_rect.right(), full_rect.top()), full_rect.max),
@@ -311,7 +368,8 @@ pub(crate) fn candle_plot(
         });
         viewport.zoom_by_grid_steps(all_bars.len(), pointer_ratio, interval, steps);
     }
-    if !analysis_active && response.dragged_by(egui::PointerButton::Primary)
+    if !analysis_active
+        && response.dragged_by(egui::PointerButton::Primary)
         && !price_axis.dragged()
         && let Some(delta) = response.total_drag_delta()
     {
@@ -324,58 +382,106 @@ pub(crate) fn candle_plot(
     let range = viewport.visible_range(all_bars.len());
     let bars = &all_bars[range.clone()];
     let flow_points = if settings.microstructure.show_delta || settings.microstructure.show_cvd {
-        let buckets = bars.iter().map(|bar| {
-            let confirmed = study_at(all_studies, bar.open_time_ms).is_some_and(|point| point.confirmed);
-            (bar.open_time_ms, confirmed)
-        }).collect::<Vec<_>>();
+        let buckets = bars
+            .iter()
+            .map(|bar| {
+                let confirmed =
+                    study_at(all_studies, bar.open_time_ms).is_some_and(|point| point.confirmed);
+                (bar.open_time_ms, confirmed)
+            })
+            .collect::<Vec<_>>();
         let revision = minute_source.map(|(_, _, revision)| revision);
         let key = response.id.with("minute-flow-cache");
         if market_scope.is_some() && revision.is_some() && minute_facts.is_some() {
             mark_indicator_cache(ui.ctx(), IndicatorCacheKind::Flow, response.id);
         } else {
-            ui.ctx().data_mut(|data| { data.remove::<Arc<MinuteFlowCache>>(key); });
+            ui.ctx().data_mut(|data| {
+                data.remove::<Arc<MinuteFlowCache>>(key);
+            });
         }
-        let cached = market_scope.zip(revision).filter(|_| minute_facts.is_some())
+        let cached = market_scope
+            .zip(revision)
+            .filter(|_| minute_facts.is_some())
             .and_then(|(binding, revision)| {
-            ui.ctx().data(|data| data.get_temp::<Arc<MinuteFlowCache>>(key))
-                .filter(|cache| cache.binding == *binding && cache.revision == revision
-                    && cache.interval_ms == interval.duration_ms()
-                    && cache.reset_mode == settings.microstructure.cvd_reset_mode
-                    && cache.buckets == buckets)
-        });
+                ui.ctx()
+                    .data(|data| data.get_temp::<Arc<MinuteFlowCache>>(key))
+                    .filter(|cache| {
+                        cache.binding == *binding
+                            && cache.revision == revision
+                            && cache.interval_ms == interval.duration_ms()
+                            && cache.reset_mode == settings.microstructure.cvd_reset_mode
+                            && cache.buckets == buckets
+                    })
+            });
         let values = cached.map(|cache| cache.values.clone()).unwrap_or_else(|| {
-            let values = minute_facts.map(|facts| venue_indicators::chart::aggregate_minute_flow(
-                facts, &buckets, interval.duration_ms(), settings.microstructure.cvd_reset_mode))
-                .unwrap_or_else(|| vec![venue_indicators::chart::OrderFlowValue::default(); buckets.len()]);
+            let values = minute_facts
+                .map(|facts| {
+                    venue_indicators::chart::aggregate_minute_flow(
+                        facts,
+                        &buckets,
+                        interval.duration_ms(),
+                        settings.microstructure.cvd_reset_mode,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    vec![venue_indicators::chart::OrderFlowValue::default(); buckets.len()]
+                });
             if let Some((binding, revision)) = market_scope.zip(revision)
-                && minute_facts.is_some() {
-                ui.ctx().data_mut(|data| data.insert_temp(key, Arc::new(MinuteFlowCache {
-                    binding: binding.clone(), revision, interval_ms: interval.duration_ms(),
-                    reset_mode: settings.microstructure.cvd_reset_mode, buckets: buckets.clone(),
-                    values: values.clone(),
-                })));
+                && minute_facts.is_some()
+            {
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(
+                        key,
+                        Arc::new(MinuteFlowCache {
+                            binding: binding.clone(),
+                            revision,
+                            interval_ms: interval.duration_ms(),
+                            reset_mode: settings.microstructure.cvd_reset_mode,
+                            buckets: buckets.clone(),
+                            values: values.clone(),
+                        }),
+                    )
+                });
             }
             values
         });
-        buckets.into_iter().zip(values).map(|((open_time_ms, confirmed), order_flow)| ChartStudyPoint {
-            open_time_ms, confirmed, order_flow, ..Default::default()
-        }).collect::<Vec<_>>()
-    } else { Vec::new() };
+        buckets
+            .into_iter()
+            .zip(values)
+            .map(|((open_time_ms, confirmed), order_flow)| ChartStudyPoint {
+                open_time_ms,
+                confirmed,
+                order_flow,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let oi_points = if settings.oi_pane {
-        bars.iter().map(|bar| {
-            let end = bar.open_time_ms.saturating_add(interval.duration_ms());
-            let quantity = oi_samples.and_then(|samples| {
-                let last = samples.partition_point(|sample| sample.exchange_time_ms <= end);
-                last.checked_sub(1).and_then(|index| samples.get(index))
-                    .filter(|sample| sample.exchange_time_ms > bar.open_time_ms)
-                    .and_then(|sample| match &sample.base_quantity {
-                        venue_domain::FieldState::Known(quantity) => Some(*quantity), _ => None,
-                    })
-            });
-            ChartStudyPoint { open_time_ms: bar.open_time_ms, open_interest: quantity,
-                ..Default::default() }
-        }).collect::<Vec<_>>()
-    } else { Vec::new() };
+        bars.iter()
+            .map(|bar| {
+                let end = bar.open_time_ms.saturating_add(interval.duration_ms());
+                let quantity = oi_samples.and_then(|samples| {
+                    let last = samples.partition_point(|sample| sample.exchange_time_ms <= end);
+                    last.checked_sub(1)
+                        .and_then(|index| samples.get(index))
+                        .filter(|sample| sample.exchange_time_ms > bar.open_time_ms)
+                        .and_then(|sample| match &sample.base_quantity {
+                            venue_domain::FieldState::Known(quantity) => Some(*quantity),
+                            _ => None,
+                        })
+                });
+                ChartStudyPoint {
+                    open_time_ms: bar.open_time_ms,
+                    open_interest: quantity,
+                    ..Default::default()
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let display_slots = viewport.display_slots(bars.len());
     let has_local_studies = !all_studies.is_empty();
     let pane_specs = if has_local_studies {
@@ -446,14 +552,20 @@ pub(crate) fn candle_plot(
         .size()
         .y;
     let readout_top = 6.0 + line_height + 2.0;
-    let mut readout_point = study_at(all_studies, readout_time).cloned().unwrap_or_default();
-    if let Some(index) = selected_index && let Some(flow) = flow_points.get(index) {
+    let mut readout_point = study_at(all_studies, readout_time)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(index) = selected_index
+        && let Some(flow) = flow_points.get(index)
+    {
         readout_point.order_flow = flow.order_flow;
     }
     let job = study_readout::job(
         settings,
         Some(&readout_point),
-        selected_index.and_then(|index| bars.get(index)).map(|bar| bar.close),
+        selected_index
+            .and_then(|index| bars.get(index))
+            .map(|bar| bar.close),
         price_scale,
         price_rect.width() - 12.0,
     );
@@ -480,7 +592,9 @@ pub(crate) fn candle_plot(
     let mut analysis_used = false;
     if (response.clicked_by(egui::PointerButton::Primary)
         || (analysis_active && response.drag_stopped_by(egui::PointerButton::Primary)))
-        && response.interact_pointer_pos().is_some_and(|point| price_rect.contains(point))
+        && response
+            .interact_pointer_pos()
+            .is_some_and(|point| price_rect.contains(point))
         && let Some(index) = hovered_index
         && let Some((_, state)) = analysis.as_mut()
     {
@@ -493,9 +607,20 @@ pub(crate) fn candle_plot(
             Pos2::new(plot_rect.right(), price_rect.top()),
             Pos2::new(full_plot_rect.right(), price_rect.bottom()),
         );
-        volume_profile::draw(ui, &profile_painter, response.id, profile_rect, bars,
-            interval.duration_ms(), price_range, price_tick, minute_facts,
-            minute_source.map(|(_, _, revision)| revision), market_scope, &settings.profile);
+        volume_profile::draw(
+            ui,
+            &profile_painter,
+            response.id,
+            profile_rect,
+            bars,
+            interval.duration_ms(),
+            price_range,
+            price_tick,
+            minute_facts,
+            minute_source.map(|(_, _, revision)| revision),
+            market_scope,
+            &settings.profile,
+        );
     }
     let width = price_rect.width() / display_slots as f32;
     let price_y = |price: f64| {
@@ -522,24 +647,71 @@ pub(crate) fn candle_plot(
         price_tick,
     );
     if let Some(days) = day_source {
-        session_levels::draw(&painter, price_rect, bars, display_slots,
-            price_range, price_scale, days, &settings.session);
+        session_levels::draw(
+            &painter,
+            price_rect,
+            bars,
+            display_slots,
+            price_range,
+            price_scale,
+            days,
+            &settings.session,
+        );
     }
     if settings.session.sr_current {
-        support_resistance::draw(ui, &painter, response.id, price_rect,
-            all_bars, all_studies, range.clone(), display_slots, interval.duration_ms(),
-            price_range, price_tick, market_scope, bar_revision);
+        support_resistance::draw(
+            ui,
+            &painter,
+            response.id,
+            price_rect,
+            all_bars,
+            all_studies,
+            range.clone(),
+            display_slots,
+            interval.duration_ms(),
+            price_range,
+            price_tick,
+            market_scope,
+            bar_revision,
+        );
     }
     if settings.session.sr_15m || settings.session.sr_1h || settings.session.sr_1d {
-        support_resistance::draw_higher(ui, &painter, response.id, price_rect,
-            bars, display_slots, interval.duration_ms(), price_range, price_tick,
-            market_scope, minute_facts, day_source,
-            [settings.session.sr_15m, settings.session.sr_1h, settings.session.sr_1d]);
+        support_resistance::draw_higher(
+            ui,
+            &painter,
+            response.id,
+            price_rect,
+            bars,
+            display_slots,
+            interval.duration_ms(),
+            price_range,
+            price_tick,
+            market_scope,
+            minute_facts,
+            day_source,
+            [
+                settings.session.sr_15m,
+                settings.session.sr_1h,
+                settings.session.sr_1d,
+            ],
+        );
     }
     if let Some((anchors, _)) = analysis.as_ref() {
-        analysis::draw_anchors(ui, response.id, &painter, price_rect, bars, display_slots,
-            interval.duration_ms(), price_range, minute_facts, forming_minute,
-            minute_source.map(|(_, _, revision)| revision), market_scope, anchors);
+        analysis::draw_anchors(
+            ui,
+            response.id,
+            &painter,
+            price_rect,
+            bars,
+            display_slots,
+            interval.duration_ms(),
+            price_range,
+            minute_facts,
+            forming_minute,
+            minute_source.map(|(_, _, revision)| revision),
+            market_scope,
+            anchors,
+        );
     }
     for price in price_range.grid_prices(price_scale, 5) {
         let y = price_y(price);
@@ -717,7 +889,9 @@ pub(crate) fn candle_plot(
                 flow_points.as_slice()
             } else if spec.label.starts_with("OI") {
                 oi_points.as_slice()
-            } else { all_studies };
+            } else {
+                all_studies
+            };
             draw_sub_pane(
                 &painter,
                 rect,
@@ -893,7 +1067,9 @@ pub(crate) fn candle_plot(
         price_scale,
         settings.chart_text_size,
     );
-    if analysis_active || analysis_used { return None; }
+    if analysis_active || analysis_used {
+        return None;
+    }
     response
         .clicked()
         .then(|| response.interact_pointer_pos())
@@ -975,7 +1151,10 @@ fn draw_candle_readout(
         ),
         (
             text(language, TextKey::Volume),
-            bar.volume.map_or_else(|| "—".to_owned(), |volume| format_decimal(volume, quantity_scale)),
+            bar.volume.map_or_else(
+                || "—".to_owned(),
+                |volume| format_decimal(volume, quantity_scale),
+            ),
         ),
     ] {
         stats.append(&format!("{label} "), 0.0, label_format.clone());
@@ -1703,8 +1882,15 @@ fn volume_readout(bars: &[UiBar], selected_index: Option<usize>, quantity_scale:
         .and_then(|index| bars.get(index))
         .map_or_else(
             || "VOL".to_owned(),
-            |bar| format!("VOL  {}", bar.volume.map_or_else(|| "—".to_owned(),
-                |volume| format_decimal(volume, quantity_scale))),
+            |bar| {
+                format!(
+                    "VOL  {}",
+                    bar.volume.map_or_else(
+                        || "—".to_owned(),
+                        |volume| format_decimal(volume, quantity_scale)
+                    )
+                )
+            },
         )
 }
 fn study_at(studies: &[ChartStudyPoint], open_time_ms: u64) -> Option<&ChartStudyPoint> {

@@ -28,45 +28,81 @@ pub fn aggregate_minute_flow(
     bucket_interval_ms: u64,
     mode: CvdResetMode,
 ) -> Vec<OrderFlowValue> {
-    if bucket_interval_ms == 0 { return vec![OrderFlowValue::default(); buckets.len()]; }
+    if bucket_interval_ms == 0 {
+        return vec![OrderFlowValue::default(); buckets.len()];
+    }
     let mut flow = OrderFlow::new(mode);
     let mut values = Vec::with_capacity(minutes.len());
     let mut previous = None;
     let mut scope = None;
     for bar in minutes {
-        if !bar.is_valid() || bar.interval_ms != 60_000
+        if !bar.is_valid()
+            || bar.interval_ms != 60_000
             || previous.is_some_and(|time| bar.open_time_ms <= time)
-            || scope.is_some_and(|(symbol, generation)| symbol != &bar.symbol || generation != bar.generation) {
+            || scope.is_some_and(|(symbol, generation)| {
+                symbol != &bar.symbol || generation != bar.generation
+            })
+        {
             return vec![OrderFlowValue::default(); buckets.len()];
         }
         scope = Some((&bar.symbol, bar.generation));
         values.push(flow.update(bar));
         previous = Some(bar.open_time_ms);
     }
-    buckets.iter().map(|&(start, confirmed)| {
-        let Some(end) = start.checked_add(bucket_interval_ms) else { return OrderFlowValue::default() };
-        let first = minutes.partition_point(|bar| bar.open_time_ms < start);
-        let last = minutes.partition_point(|bar| bar.open_time_ms < end);
-        let selected = &minutes[first..last];
-        if selected.is_empty() || selected[0].open_time_ms != start
-            || selected.windows(2).any(|pair| pair[0].open_time_ms.saturating_add(60_000) != pair[1].open_time_ms)
-            || (confirmed && selected.last().is_none_or(|bar| bar.open_time_ms.saturating_add(60_000) != end))
-        { return OrderFlowValue::default() }
-        let mut buy = Decimal::ZERO;
-        let mut sell = Decimal::ZERO;
-        let mut delta = Decimal::ZERO;
-        for item in &values[first..last] {
-            let Some((b, s, d)) = item.buy.zip(item.sell).zip(item.delta)
-                .map(|((b, s), d)| (b, s, d)) else { return OrderFlowValue::default() };
-            let Some(sum) = buy.checked_add(b).zip(sell.checked_add(s)).zip(delta.checked_add(d))
-                .map(|((b, s), d)| (b, s, d)) else { return OrderFlowValue::default() };
-            (buy, sell, delta) = sum;
-        }
-        let final_value = values[last - 1];
-        OrderFlowValue { buy: Some(buy), sell: Some(sell), delta: Some(delta),
-            cumulative: final_value.cumulative, cumulative_start_ms: final_value.cumulative_start_ms,
-            complete_day: final_value.complete_day }
-    }).collect()
+    buckets
+        .iter()
+        .map(|&(start, confirmed)| {
+            let Some(end) = start.checked_add(bucket_interval_ms) else {
+                return OrderFlowValue::default();
+            };
+            let first = minutes.partition_point(|bar| bar.open_time_ms < start);
+            let last = minutes.partition_point(|bar| bar.open_time_ms < end);
+            let selected = &minutes[first..last];
+            if selected.is_empty()
+                || selected[0].open_time_ms != start
+                || selected
+                    .windows(2)
+                    .any(|pair| pair[0].open_time_ms.saturating_add(60_000) != pair[1].open_time_ms)
+                || (confirmed
+                    && selected
+                        .last()
+                        .is_none_or(|bar| bar.open_time_ms.saturating_add(60_000) != end))
+            {
+                return OrderFlowValue::default();
+            }
+            let mut buy = Decimal::ZERO;
+            let mut sell = Decimal::ZERO;
+            let mut delta = Decimal::ZERO;
+            for item in &values[first..last] {
+                let Some((b, s, d)) = item
+                    .buy
+                    .zip(item.sell)
+                    .zip(item.delta)
+                    .map(|((b, s), d)| (b, s, d))
+                else {
+                    return OrderFlowValue::default();
+                };
+                let Some(sum) = buy
+                    .checked_add(b)
+                    .zip(sell.checked_add(s))
+                    .zip(delta.checked_add(d))
+                    .map(|((b, s), d)| (b, s, d))
+                else {
+                    return OrderFlowValue::default();
+                };
+                (buy, sell, delta) = sum;
+            }
+            let final_value = values[last - 1];
+            OrderFlowValue {
+                buy: Some(buy),
+                sell: Some(sell),
+                delta: Some(delta),
+                cumulative: final_value.cumulative,
+                cumulative_start_ms: final_value.cumulative_start_ms,
+                complete_day: final_value.complete_day,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -137,7 +173,8 @@ mod tests {
     }
 
     #[test]
-    fn utc_daily_resets_at_midnight_and_reports_partial_coverage() -> Result<(), Box<dyn std::error::Error>> {
+    fn utc_daily_resets_at_midnight_and_reports_partial_coverage()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut flow = OrderFlow::new(CvdResetMode::UtcDaily);
         let mut first = bar(1_439, Some(7))?;
         assert_eq!(flow.update(&first).cumulative, Some(Decimal::from(4)));
@@ -156,15 +193,25 @@ mod tests {
     }
 
     #[test]
-    fn five_minute_delta_uses_five_complete_minute_facts() -> Result<(), Box<dyn std::error::Error>> {
-        let minutes = (0..5).map(|minute| bar(minute, Some(7)))
+    fn five_minute_delta_uses_five_complete_minute_facts() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let minutes = (0..5)
+            .map(|minute| bar(minute, Some(7)))
             .collect::<Result<Vec<_>, _>>()?;
         let result = aggregate_minute_flow(&minutes, &[(0, true)], 300_000, CvdResetMode::UtcDaily);
         assert_eq!(result[0].delta, Some(Decimal::from(20)));
         assert_eq!(result[0].cumulative, Some(Decimal::from(20)));
         assert!(result[0].complete_day);
-        let missing = [minutes[0].clone(), minutes[2].clone(), minutes[3].clone(), minutes[4].clone()];
-        assert_eq!(aggregate_minute_flow(&missing, &[(0, true)], 300_000, CvdResetMode::UtcDaily)[0], OrderFlowValue::default());
+        let missing = [
+            minutes[0].clone(),
+            minutes[2].clone(),
+            minutes[3].clone(),
+            minutes[4].clone(),
+        ];
+        assert_eq!(
+            aggregate_minute_flow(&missing, &[(0, true)], 300_000, CvdResetMode::UtcDaily)[0],
+            OrderFlowValue::default()
+        );
         Ok(())
     }
 }
@@ -179,20 +226,29 @@ pub(super) struct OrderFlow {
 }
 
 impl OrderFlow {
-    pub fn mode(&self) -> CvdResetMode { self.mode }
+    pub fn mode(&self) -> CvdResetMode {
+        self.mode
+    }
     pub fn new(mode: CvdResetMode) -> Self {
-        Self { mode, ..Self::default() }
+        Self {
+            mode,
+            ..Self::default()
+        }
     }
 
     pub fn update(&mut self, bar: &PublicBar) -> OrderFlowValue {
         let day_ms = 86_400_000;
         if self.mode == CvdResetMode::UtcDaily
-            && self.start_ms.is_some_and(|start| start / day_ms != bar.open_time_ms / day_ms)
+            && self
+                .start_ms
+                .is_some_and(|start| start / day_ms != bar.open_time_ms / day_ms)
         {
             self.cumulative = Decimal::ZERO;
             self.start_ms = None;
         }
-        if self.previous_open_ms.zip(self.previous_interval_ms)
+        if self
+            .previous_open_ms
+            .zip(self.previous_interval_ms)
             .is_some_and(|(open, interval)| open.checked_add(interval) != Some(bar.open_time_ms))
         {
             self.cumulative = Decimal::ZERO;

@@ -1,7 +1,9 @@
 //! Gate USDT perpetual display. Contract quantities are converted using the public multiplier.
 use rust_decimal::Decimal;
 use serde_json::Value;
-use venue_domain::{FieldState, MarketTimeSource, OpenInterestSample, OpenInterestUnit, PublicBar, UnknownReason};
+use venue_domain::{
+    FieldState, MarketTimeSource, OpenInterestSample, OpenInterestUnit, PublicBar, UnknownReason,
+};
 use venue_gateway_api::display::*;
 const ORIGIN: &str = "https://clawdbotweb.site/quotes/gate/api/v4/futures/usdt";
 pub async fn quotes(http: &reqwest::Client, instruments: &[Instrument]) -> Result<Vec<Quote>> {
@@ -32,7 +34,8 @@ pub async fn quotes(http: &reqwest::Client, instruments: &[Instrument]) -> Resul
 }
 
 fn derivatives(row: &Value, instrument: &Instrument) -> DerivativeQuote {
-    let interest = number(&row["total_size"]).ok()
+    let interest = number(&row["total_size"])
+        .ok()
         .filter(|contracts| *contracts >= Decimal::ZERO);
     let base = interest.and_then(|contracts| product(contracts, instrument.contract_size).ok());
     DerivativeQuote {
@@ -40,8 +43,12 @@ fn derivatives(row: &Value, instrument: &Instrument) -> DerivativeQuote {
         funding_rate: number(&row["funding_rate"]).ok(),
         funding_time_ms: None,
         next_funding_time_ms: None,
-        mark_price: number(&row["mark_price"]).ok().filter(|value| *value > Decimal::ZERO),
-        index_price: number(&row["index_price"]).ok().filter(|value| *value > Decimal::ZERO),
+        mark_price: number(&row["mark_price"])
+            .ok()
+            .filter(|value| *value > Decimal::ZERO),
+        index_price: number(&row["index_price"])
+            .ok()
+            .filter(|value| *value > Decimal::ZERO),
         open_interest_base: base,
         open_interest_native_quantity: interest,
         open_interest_native_unit: Some(venue_domain::OpenInterestUnit::Contracts {
@@ -52,34 +59,67 @@ fn derivatives(row: &Value, instrument: &Instrument) -> DerivativeQuote {
 }
 
 pub async fn open_interest_history(
-    http: &reqwest::Client, instrument: &Instrument, generation: u64, now: u64,
+    http: &reqwest::Client,
+    instrument: &Instrument,
+    generation: u64,
+    now: u64,
 ) -> Result<Vec<OpenInterestSample>> {
-    let payload = get(http, &format!("contract_stats?contract={}&interval=5m&limit=300", instrument.native_symbol)).await?;
+    let payload = get(
+        http,
+        &format!(
+            "contract_stats?contract={}&interval=5m&limit=300",
+            instrument.native_symbol
+        ),
+    )
+    .await?;
     parse_interest_history(&payload, instrument, generation, now)
 }
 
 fn parse_interest_history(
-    payload: &Value, instrument: &Instrument, generation: u64, now: u64,
+    payload: &Value,
+    instrument: &Instrument,
+    generation: u64,
+    now: u64,
 ) -> Result<Vec<OpenInterestSample>> {
     let mut result = Vec::new();
     for row in array(payload)? {
-        let time = stamp(&row["time"])?.checked_mul(1000).ok_or("Gate OI time overflow")?;
-        if time == 0 || time.saturating_add(300_000) > now { continue; }
+        let time = stamp(&row["time"])?
+            .checked_mul(1000)
+            .ok_or("Gate OI time overflow")?;
+        if time == 0 || time.saturating_add(300_000) > now {
+            continue;
+        }
         let contracts = number(&row["open_interest"])?;
         let base = product(contracts, instrument.contract_size)?;
-        if contracts < Decimal::ZERO { return Err("negative Gate OI".into()); }
-        let notional = number(&row["open_interest_usd"]).ok()
+        if contracts < Decimal::ZERO {
+            return Err("negative Gate OI".into());
+        }
+        let notional = number(&row["open_interest_usd"])
+            .ok()
             .filter(|value| *value >= Decimal::ZERO);
         let sample = OpenInterestSample {
-            symbol: instrument.symbol.clone(), generation, received_at_ms: now,
-            exchange_time_ms: time, time_source: MarketTimeSource::Exchange,
-            sampling_interval_ms: Some(300_000), native_quantity: contracts,
-            native_unit: OpenInterestUnit::Contracts { base_per_contract: instrument.contract_size },
+            symbol: instrument.symbol.clone(),
+            generation,
+            received_at_ms: now,
+            exchange_time_ms: time,
+            time_source: MarketTimeSource::Exchange,
+            sampling_interval_ms: Some(300_000),
+            native_quantity: contracts,
+            native_unit: OpenInterestUnit::Contracts {
+                base_per_contract: instrument.contract_size,
+            },
             base_quantity: FieldState::Known(base),
-            quote_notional: notional.map_or(FieldState::Unavailable { reason: UnknownReason::SourceOmitted }, FieldState::Known),
+            quote_notional: notional.map_or(
+                FieldState::Unavailable {
+                    reason: UnknownReason::SourceOmitted,
+                },
+                FieldState::Known,
+            ),
             quote_asset: notional.map(|_| "USD".to_owned()),
         };
-        if !sample.is_valid() { return Err("invalid Gate OI sample".into()); }
+        if !sample.is_valid() {
+            return Err("invalid Gate OI sample".into());
+        }
         result.push(sample);
     }
     result.sort_by_key(|sample| sample.exchange_time_ms);
@@ -92,27 +132,45 @@ mod derivative_tests {
     use super::*;
     #[test]
     fn ticker_contracts_convert_with_catalog_multiplier() -> Result<()> {
-        let instrument = Instrument { symbol: symbol("DOGE", "USDT")?, native_symbol: "DOGE_USDT".into(),
-            price_tick: None, price_scale: 5, quantity_scale: 0, contract_size: Decimal::from(10) };
+        let instrument = Instrument {
+            symbol: symbol("DOGE", "USDT")?,
+            native_symbol: "DOGE_USDT".into(),
+            price_tick: None,
+            price_scale: 5,
+            quantity_scale: 0,
+            contract_size: Decimal::from(10),
+        };
         let row = serde_json::json!({"contract":"DOGE_USDT", "funding_rate":"-0.0001",
             "total_size":"237702564", "mark_price":"0.0974", "index_price":"0.097427"});
         let value = derivatives(&row, &instrument);
         assert_eq!(value.funding_rate, Some(Decimal::new(-1, 4)));
-        assert_eq!(value.open_interest_base, Some(Decimal::from(2_377_025_640_u64)));
+        assert_eq!(
+            value.open_interest_base,
+            Some(Decimal::from(2_377_025_640_u64))
+        );
         assert!(value.use_local_observation_time);
         Ok(())
     }
     #[test]
     fn contract_stats_keep_five_minute_samples_and_multiplier() -> Result<()> {
-        let instrument = Instrument { symbol: symbol("DOGE", "USDT")?, native_symbol: "DOGE_USDT".into(),
-            price_tick: None, price_scale: 5, quantity_scale: 0, contract_size: Decimal::from(10) };
+        let instrument = Instrument {
+            symbol: symbol("DOGE", "USDT")?,
+            native_symbol: "DOGE_USDT".into(),
+            price_tick: None,
+            price_scale: 5,
+            quantity_scale: 0,
+            contract_size: Decimal::from(10),
+        };
         let payload = serde_json::json!([
             {"time":600,"open_interest":"123","open_interest_usd":"120"},
             {"time":900,"open_interest":"124","open_interest_usd":"121"}
         ]);
         let result = parse_interest_history(&payload, &instrument, 1, 1_000_000)?;
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].base_quantity, FieldState::Known(Decimal::from(1230)));
+        assert_eq!(
+            result[0].base_quantity,
+            FieldState::Known(Decimal::from(1230))
+        );
         assert_eq!(result[0].native_quantity, Decimal::from(123));
         Ok(())
     }

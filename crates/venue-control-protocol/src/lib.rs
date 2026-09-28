@@ -1317,12 +1317,18 @@ mod tests {
         let mut snapshot = snapshot()?;
         let existing = serde_json::to_value(&snapshot)?;
         assert!(existing["markets"][0]["bars"][0]["volume"].is_string());
-        assert_eq!(serde_json::from_value::<ControlSnapshot>(existing)?.validate(), Ok(()));
+        assert_eq!(
+            serde_json::from_value::<ControlSnapshot>(existing)?.validate(),
+            Ok(())
+        );
         snapshot.markets[0].bars[0].volume = None;
         assert_eq!(snapshot.validate(), Ok(()));
         let missing = serde_json::to_value(&snapshot)?;
         assert!(missing["markets"][0]["bars"][0]["volume"].is_null());
-        assert_eq!(serde_json::from_value::<ControlSnapshot>(missing)?.validate(), Ok(()));
+        assert_eq!(
+            serde_json::from_value::<ControlSnapshot>(missing)?.validate(),
+            Ok(())
+        );
         Ok(())
     }
     fn request(action: ControlAction) -> Result<ControlCommandRequest, Box<dyn std::error::Error>> {

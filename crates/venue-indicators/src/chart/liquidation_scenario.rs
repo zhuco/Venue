@@ -26,11 +26,19 @@ impl LiquidationScenario {
     }
 
     pub fn estimated_retained_bytes(&self) -> usize {
-        let active = [&self.active_long, &self.active_short].into_iter().fold(0_usize,
-            |total, prices| total.saturating_add(prices.len().saturating_mul(96))
-                .saturating_add(prices.values().fold(0_usize, |size, indices|
-                    size.saturating_add(indices.capacity() * std::mem::size_of::<usize>()))));
-        self.bands.capacity().saturating_mul(std::mem::size_of::<LiquidationBand>())
+        let active =
+            [&self.active_long, &self.active_short]
+                .into_iter()
+                .fold(0_usize, |total, prices| {
+                    total
+                        .saturating_add(prices.len().saturating_mul(96))
+                        .saturating_add(prices.values().fold(0_usize, |size, indices| {
+                            size.saturating_add(indices.capacity() * std::mem::size_of::<usize>())
+                        }))
+                });
+        self.bands
+            .capacity()
+            .saturating_mul(std::mem::size_of::<LiquidationBand>())
             .saturating_add(active)
     }
 
@@ -39,18 +47,31 @@ impl LiquidationScenario {
         if high < low || low <= Decimal::ZERO {
             return;
         }
-        let long_prices = self.active_long.range(low..).map(|(price, _)| *price).collect::<Vec<_>>();
-        let short_prices = self.active_short.range(..=high).map(|(price, _)| *price).collect::<Vec<_>>();
+        let long_prices = self
+            .active_long
+            .range(low..)
+            .map(|(price, _)| *price)
+            .collect::<Vec<_>>();
+        let short_prices = self
+            .active_short
+            .range(..=high)
+            .map(|(price, _)| *price)
+            .collect::<Vec<_>>();
         for price in long_prices {
             if let Some(indices) = self.active_long.remove(&price) {
                 let mut future = Vec::new();
                 for index in indices {
                     if let Some(band) = self.bands.get_mut(index) {
-                        if band.valid_from_ms <= observed_at_ms { band.retired_at_ms = Some(observed_at_ms); }
-                        else { future.push(index); }
+                        if band.valid_from_ms <= observed_at_ms {
+                            band.retired_at_ms = Some(observed_at_ms);
+                        } else {
+                            future.push(index);
+                        }
                     }
                 }
-                if !future.is_empty() { self.active_long.insert(price, future); }
+                if !future.is_empty() {
+                    self.active_long.insert(price, future);
+                }
             }
         }
         for price in short_prices {
@@ -58,11 +79,16 @@ impl LiquidationScenario {
                 let mut future = Vec::new();
                 for index in indices {
                     if let Some(band) = self.bands.get_mut(index) {
-                        if band.valid_from_ms <= observed_at_ms { band.retired_at_ms = Some(observed_at_ms); }
-                        else { future.push(index); }
+                        if band.valid_from_ms <= observed_at_ms {
+                            band.retired_at_ms = Some(observed_at_ms);
+                        } else {
+                            future.push(index);
+                        }
                     }
                 }
-                if !future.is_empty() { self.active_short.insert(price, future); }
+                if !future.is_empty() {
+                    self.active_short.insert(price, future);
+                }
             }
         }
     }
@@ -82,19 +108,39 @@ impl LiquidationScenario {
         maintenance_bps: u16,
         margin_cost_bps: u16,
     ) {
-        self.observe_with_tick(bar_open_time_ms, bar_end_ms, high, low, close, volume,
-            leverage, maintenance_bps, margin_cost_bps, None);
+        self.observe_with_tick(
+            bar_open_time_ms,
+            bar_end_ms,
+            high,
+            low,
+            close,
+            volume,
+            leverage,
+            maintenance_bps,
+            margin_cost_bps,
+            None,
+        );
     }
 
     /// Quantize scenario centers to the selected instrument's exchange tick before indexing.
     #[allow(clippy::too_many_arguments)]
     pub fn observe_with_tick(
-        &mut self, bar_open_time_ms: u64, bar_end_ms: u64, high: Decimal, low: Decimal,
-        close: Decimal, volume: Decimal, leverage: &[u16], maintenance_bps: u16,
-        margin_cost_bps: u16, tick: Option<Decimal>,
+        &mut self,
+        bar_open_time_ms: u64,
+        bar_end_ms: u64,
+        high: Decimal,
+        low: Decimal,
+        close: Decimal,
+        volume: Decimal,
+        leverage: &[u16],
+        maintenance_bps: u16,
+        margin_cost_bps: u16,
+        tick: Option<Decimal>,
     ) {
         if bar_end_ms <= bar_open_time_ms
-            || self.last_observed_end_ms.is_some_and(|last| bar_end_ms <= last)
+            || self
+                .last_observed_end_ms
+                .is_some_and(|last| bar_end_ms <= last)
             || high < low
             || low <= Decimal::ZERO
             || close < low
@@ -120,9 +166,16 @@ impl LiquidationScenario {
                     scenario_price_after_cost(close, tier, maintenance_bps, margin_cost_bps, long)
                 {
                     if let Some(tick) = tick.filter(|tick| *tick > Decimal::ZERO) {
-                        let Some(quantized) = price.checked_div(tick)
-                            .map(|units| units.round()).and_then(|units| units.checked_mul(tick)) else { continue; };
-                        if quantized <= Decimal::ZERO { continue; }
+                        let Some(quantized) = price
+                            .checked_div(tick)
+                            .map(|units| units.round())
+                            .and_then(|units| units.checked_mul(tick))
+                        else {
+                            continue;
+                        };
+                        if quantized <= Decimal::ZERO {
+                            continue;
+                        }
                         price = quantized;
                     }
                     let index = self.bands.len();
@@ -134,8 +187,11 @@ impl LiquidationScenario {
                         weight,
                         long,
                     });
-                    if long { self.active_long.entry(price).or_default().push(index); }
-                    else { self.active_short.entry(price).or_default().push(index); }
+                    if long {
+                        self.active_long.entry(price).or_default().push(index);
+                    } else {
+                        self.active_short.entry(price).or_default().push(index);
+                    }
                 }
             }
         }
@@ -224,8 +280,23 @@ mod tests {
                 .iter()
                 .all(|b| b.valid_from_ms == 60_000 && b.retired_at_ms.is_none())
         );
-        model.observe(60_000, 120_000, 120.into(), 80.into(), 100.into(), 0.into(), &[10], 50, 0);
-        assert!(model.bands().iter().all(|b| b.retired_at_ms == Some(120_000)));
+        model.observe(
+            60_000,
+            120_000,
+            120.into(),
+            80.into(),
+            100.into(),
+            0.into(),
+            &[10],
+            50,
+            0,
+        );
+        assert!(
+            model
+                .bands()
+                .iter()
+                .all(|b| b.retired_at_ms == Some(120_000))
+        );
         model.observe(
             120_000,
             180_000,
@@ -244,9 +315,24 @@ mod tests {
     fn scenario_centers_use_exchange_tick_before_touch_indexing() {
         let mut model = LiquidationScenario::default();
         let tick = Decimal::new(5, 2);
-        model.observe_with_tick(0, 60_000, 100.into(), 100.into(), 100.into(),
-            10.into(), &[10], 50, 0, Some(tick));
+        model.observe_with_tick(
+            0,
+            60_000,
+            100.into(),
+            100.into(),
+            100.into(),
+            10.into(),
+            &[10],
+            50,
+            0,
+            Some(tick),
+        );
         assert_eq!(model.bands().len(), 2);
-        assert!(model.bands().iter().all(|band| band.price % tick == Decimal::ZERO));
+        assert!(
+            model
+                .bands()
+                .iter()
+                .all(|band| band.price % tick == Decimal::ZERO)
+        );
     }
 }

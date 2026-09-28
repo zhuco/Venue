@@ -3,13 +3,19 @@
 use rust_decimal::Decimal;
 use venue_domain::{FieldState, PublicBar, UnknownReason};
 
-use crate::catalog::{BarIndicator, price::{PivotOutput, PivotPoints}};
+use crate::catalog::{
+    BarIndicator,
+    price::{PivotOutput, PivotPoints},
+};
 
 const DAY_MS: u64 = 86_400_000;
 const WEEK_MS: u64 = 7 * DAY_MS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SessionPeriod { Daily, Weekly }
+pub enum SessionPeriod {
+    Daily,
+    Weekly,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PreviousSession {
@@ -42,12 +48,17 @@ pub fn previous_levels(
     period: SessionPeriod,
 ) -> Result<Option<SessionLevels>, SessionError> {
     let start = session_start(at_ms, period).ok_or(SessionError::Timestamp)?;
-    let duration = match period { SessionPeriod::Daily => DAY_MS, SessionPeriod::Weekly => WEEK_MS };
+    let duration = match period {
+        SessionPeriod::Daily => DAY_MS,
+        SessionPeriod::Weekly => WEEK_MS,
+    };
     let previous_start = start.checked_sub(duration).ok_or(SessionError::Timestamp)?;
     let mut previous_open = None;
     let mut scope = None;
     for bar in daily_bars {
-        if !bar.is_valid() || bar.interval_ms != DAY_MS || bar.open_time_ms % DAY_MS != 0
+        if !bar.is_valid()
+            || bar.interval_ms != DAY_MS
+            || bar.open_time_ms % DAY_MS != 0
             || previous_open.is_some_and(|time| bar.open_time_ms <= time)
         {
             return Err(SessionError::InvalidBars);
@@ -59,19 +70,34 @@ pub fn previous_levels(
         scope = Some(this_scope);
         previous_open = Some(bar.open_time_ms);
     }
-    let Some(first) = daily_bars.binary_search_by_key(&previous_start, |bar| bar.open_time_ms).ok() else {
+    let Some(first) = daily_bars
+        .binary_search_by_key(&previous_start, |bar| bar.open_time_ms)
+        .ok()
+    else {
         return Ok(None);
     };
     let count = (duration / DAY_MS) as usize;
-    let Some(slice) = daily_bars.get(first..first + count) else { return Ok(None) };
+    let Some(slice) = daily_bars.get(first..first + count) else {
+        return Ok(None);
+    };
     for (index, bar) in slice.iter().enumerate() {
         if bar.open_time_ms != previous_start + index as u64 * DAY_MS {
             return Ok(None);
         }
     }
-    let Some(last) = slice.last() else { return Ok(None) };
-    let high = slice.iter().map(|bar| bar.high.value()).max().ok_or(SessionError::InvalidBars)?;
-    let low = slice.iter().map(|bar| bar.low.value()).min().ok_or(SessionError::InvalidBars)?;
+    let Some(last) = slice.last() else {
+        return Ok(None);
+    };
+    let high = slice
+        .iter()
+        .map(|bar| bar.high.value())
+        .max()
+        .ok_or(SessionError::InvalidBars)?;
+    let low = slice
+        .iter()
+        .map(|bar| bar.low.value())
+        .min()
+        .ok_or(SessionError::InvalidBars)?;
     let previous = PreviousSession {
         start_ms: previous_start,
         end_ms: start,
@@ -86,12 +112,24 @@ pub fn previous_levels(
     synthetic.open = slice[0].open;
     synthetic.high = venue_domain::Price::new(high).map_err(|_| SessionError::InvalidBars)?;
     synthetic.low = venue_domain::Price::new(low).map_err(|_| SessionError::InvalidBars)?;
-    synthetic.base_volume = FieldState::Unavailable { reason: UnknownReason::SourceOmitted };
-    synthetic.quote_volume = FieldState::Unavailable { reason: UnknownReason::SourceOmitted };
-    synthetic.trade_count = FieldState::Unavailable { reason: UnknownReason::SourceOmitted };
-    synthetic.taker_buy_base_volume = FieldState::Unavailable { reason: UnknownReason::SourceOmitted };
-    synthetic.taker_buy_quote_volume = FieldState::Unavailable { reason: UnknownReason::SourceOmitted };
-    let pivot = PivotPoints::new().update(&synthetic).map_err(|_| SessionError::InvalidBars)?
+    synthetic.base_volume = FieldState::Unavailable {
+        reason: UnknownReason::SourceOmitted,
+    };
+    synthetic.quote_volume = FieldState::Unavailable {
+        reason: UnknownReason::SourceOmitted,
+    };
+    synthetic.trade_count = FieldState::Unavailable {
+        reason: UnknownReason::SourceOmitted,
+    };
+    synthetic.taker_buy_base_volume = FieldState::Unavailable {
+        reason: UnknownReason::SourceOmitted,
+    };
+    synthetic.taker_buy_quote_volume = FieldState::Unavailable {
+        reason: UnknownReason::SourceOmitted,
+    };
+    let pivot = PivotPoints::new()
+        .update(&synthetic)
+        .map_err(|_| SessionError::InvalidBars)?
         .ok_or(SessionError::InvalidBars)?;
     Ok(Some(SessionLevels { previous, pivot }))
 }
@@ -106,9 +144,15 @@ pub fn session_start(at_ms: u64, period: SessionPeriod) -> Option<u64> {
 }
 
 /// The first completed 1m bar supplies today's or this week's open. No later bar substitutes it.
-pub fn current_open(minute_bars: &[PublicBar], at_ms: u64, period: SessionPeriod) -> Option<Decimal> {
+pub fn current_open(
+    minute_bars: &[PublicBar],
+    at_ms: u64,
+    period: SessionPeriod,
+) -> Option<Decimal> {
     let start = session_start(at_ms, period)?;
-    minute_bars.binary_search_by_key(&start, |bar| bar.open_time_ms).ok()
+    minute_bars
+        .binary_search_by_key(&start, |bar| bar.open_time_ms)
+        .ok()
         .and_then(|index| minute_bars.get(index))
         .filter(|bar| bar.is_valid() && bar.interval_ms == 60_000)
         .map(|bar| bar.open.value())
@@ -121,7 +165,9 @@ mod tests {
 
     fn day_bar(day: u64, low: i64, high: i64) -> Result<PublicBar, Box<dyn std::error::Error>> {
         let start = day * DAY_MS;
-        let missing = || FieldState::Unavailable { reason: UnknownReason::SourceOmitted };
+        let missing = || FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        };
         Ok(PublicBar {
             symbol: "DOGE/USDC".parse()?,
             generation: 1,
@@ -134,15 +180,21 @@ mod tests {
             high: Price::new(Decimal::from(high))?,
             low: Price::new(Decimal::from(low))?,
             close: Price::new(Decimal::from(high))?,
-            base_volume: missing(), quote_volume: missing(),
-            trade_count: FieldState::Unavailable { reason: UnknownReason::SourceOmitted },
-            taker_buy_base_volume: missing(), taker_buy_quote_volume: missing(),
+            base_volume: missing(),
+            quote_volume: missing(),
+            trade_count: FieldState::Unavailable {
+                reason: UnknownReason::SourceOmitted,
+            },
+            taker_buy_base_volume: missing(),
+            taker_buy_quote_volume: missing(),
         })
     }
 
     #[test]
-    fn weekly_levels_require_all_seven_complete_days_and_never_use_current_day() -> Result<(), Box<dyn std::error::Error>> {
-        let mut days = (4..=10).map(|day| day_bar(day, day as i64, day as i64 + 10))
+    fn weekly_levels_require_all_seven_complete_days_and_never_use_current_day()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut days = (4..=10)
+            .map(|day| day_bar(day, day as i64, day as i64 + 10))
             .collect::<Result<Vec<_>, _>>()?;
         days.push(day_bar(11, 1, 999)?);
         let at = 11 * DAY_MS + 3_600_000;
@@ -160,7 +212,11 @@ mod tests {
 
     #[test]
     fn daily_levels_follow_the_queried_date() -> Result<(), Box<dyn std::error::Error>> {
-        let days = [day_bar(9, 10, 20)?, day_bar(10, 30, 40)?, day_bar(11, 1, 999)?];
+        let days = [
+            day_bar(9, 10, 20)?,
+            day_bar(10, 30, 40)?,
+            day_bar(11, 1, 999)?,
+        ];
         let result = previous_levels(&days, 11 * DAY_MS, SessionPeriod::Daily)?.ok_or("day")?;
         assert_eq!(result.previous.high, Decimal::from(40));
         assert_eq!(result.previous.low, Decimal::from(30));

@@ -3,17 +3,17 @@
 //! Canonical state accepts a closed bar once. A forming bar is evaluated by cloning the
 //! state through [`ChartStudyEngine::preview`], so UI previews cannot mutate strategy facts.
 
+pub mod anchored_vwap;
 mod common;
 mod custom_ema_adx;
 pub mod liquidation_scenario;
-pub mod anchored_vwap;
-pub mod open_interest;
-pub mod session_levels;
-pub mod support_resistance;
 mod momentum;
+pub mod open_interest;
 mod order_flow;
 mod registry;
 pub mod script;
+pub mod session_levels;
+pub mod support_resistance;
 mod trend;
 mod volatility;
 mod volume;
@@ -28,8 +28,8 @@ pub use custom_ema_adx::{EmaAdxConfig, EmaAdxSignal, EmaAdxValues};
 pub use momentum::{Macd, MacdValue, Rsi};
 pub use order_flow::{CvdResetMode, OrderFlowValue, aggregate_minute_flow};
 pub use registry::{
-    ChartIndicatorCategory, ChartIndicatorDescriptor, ChartIndicatorId, ChartIndicatorPlacement, ChartIndicatorRegistry,
-    ChartParameterDescriptor,
+    ChartIndicatorCategory, ChartIndicatorDescriptor, ChartIndicatorId, ChartIndicatorPlacement,
+    ChartIndicatorRegistry, ChartParameterDescriptor,
 };
 pub use trend::{Ema, Sma};
 pub use volatility::{Atr, BollingerBands, BollingerValue};

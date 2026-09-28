@@ -15,9 +15,15 @@ pub(super) async fn run(
     let mut demand_changes = source_demands.clone();
     demand_changes.borrow_and_update();
     let mut workers = tokio::task::JoinSet::new();
-    let mut derivative_scopes = std::collections::BTreeMap::<venue_gateway_api::PublicMarketBinding, Vec<MarketSelection>>::new();
+    let mut derivative_scopes = std::collections::BTreeMap::<
+        venue_gateway_api::PublicMarketBinding,
+        Vec<MarketSelection>,
+    >::new();
     for selection in &selections {
-        derivative_scopes.entry(selection.binding.clone()).or_default().push(selection.clone());
+        derivative_scopes
+            .entry(selection.binding.clone())
+            .or_default()
+            .push(selection.clone());
     }
     let mut owned_derivatives = BTreeSet::new();
     for selection in selections.iter().cloned() {
@@ -31,10 +37,21 @@ pub(super) async fn run(
         let http = http.clone();
         let events = events.clone();
         let derivative_destinations = if owned_derivatives.insert(selection.binding.clone()) {
-            derivative_scopes.get(&selection.binding).cloned().unwrap_or_default()
-        } else { Vec::new() };
-        let source_demand = source_demands.borrow().get(&selection.binding).copied()
-            .unwrap_or(SharedSourceDemand { minute: true, day: true });
+            derivative_scopes
+                .get(&selection.binding)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let source_demand = source_demands
+            .borrow()
+            .get(&selection.binding)
+            .copied()
+            .unwrap_or(SharedSourceDemand {
+                minute: true,
+                day: true,
+            });
         workers.spawn(async move {
             let mut emitter = EventEmitter::new(events);
             loop {
@@ -49,8 +66,16 @@ pub(super) async fn run(
                 {
                     return;
                 }
-                let result = stream(&http, &instrument, &selection, generation,
-                    &derivative_destinations, source_demand, &mut emitter).await;
+                let result = stream(
+                    &http,
+                    &instrument,
+                    &selection,
+                    generation,
+                    &derivative_destinations,
+                    source_demand,
+                    &mut emitter,
+                )
+                .await;
                 if let Err(error) = result {
                     if emitter
                         .status_all(
@@ -140,44 +165,90 @@ pub(super) async fn run(
         }
     });
     for (binding, destinations) in derivative_scopes {
-        let Some(instrument) = instruments.iter().find(|instrument| instrument.symbol == binding.symbol).cloned() else { continue; };
+        let Some(instrument) = instruments
+            .iter()
+            .find(|instrument| instrument.symbol == binding.symbol)
+            .cloned()
+        else {
+            continue;
+        };
         let http = http.clone();
         let events = events.clone();
         workers.spawn(async move {
             loop {
                 let now = now_ms();
                 let cache = public_cache::PublicHistoryCache::local();
-                let cached = cache.as_ref().and_then(|cache| cache.interest(&binding, generation));
-                let result = if let Some(samples) = cached.as_ref().filter(|samples|
-                    public_cache::PublicHistoryCache::interest_fresh(samples, now)) {
+                let cached = cache
+                    .as_ref()
+                    .and_then(|cache| cache.interest(&binding, generation));
+                let result = if let Some(samples) = cached.as_ref().filter(|samples| {
+                    public_cache::PublicHistoryCache::interest_fresh(samples, now)
+                }) {
                     Ok(samples.clone())
                 } else {
-                    let since = cached.as_ref().and_then(|samples| samples.last())
+                    let since = cached
+                        .as_ref()
+                        .and_then(|samples| samples.last())
                         .map(|sample| sample.exchange_time_ms);
-                    venue_gateway_bybit::display::open_interest_history(&http,
-                        &instrument, generation, now, since).await.and_then(|fresh| {
-                            if fresh.is_empty() { return Err("Bybit OI history has no completed samples".into()); }
-                            Ok(fresh)
-                        }).map(|fresh| {
-                            cache.as_ref().and_then(|cache|
-                                cache.remember_interest(&binding, generation, fresh.clone()))
-                                .unwrap_or(fresh)
-                        })
+                    venue_gateway_bybit::display::open_interest_history(
+                        &http,
+                        &instrument,
+                        generation,
+                        now,
+                        since,
+                    )
+                    .await
+                    .and_then(|fresh| {
+                        if fresh.is_empty() {
+                            return Err("Bybit OI history has no completed samples".into());
+                        }
+                        Ok(fresh)
+                    })
+                    .map(|fresh| {
+                        cache
+                            .as_ref()
+                            .and_then(|cache| {
+                                cache.remember_interest(&binding, generation, fresh.clone())
+                            })
+                            .unwrap_or(fresh)
+                    })
                 };
                 let (payload, event_time_ms, received_ms, pause) = match result {
                     Ok(samples) => {
                         let time = samples.last().map_or(now, |sample| sample.exchange_time_ms);
                         let received = samples.last().map_or(now, |sample| sample.received_at_ms);
-                        (MarketPayload::OpenInterestHistory(samples), time, received, 300_000)
+                        (
+                            MarketPayload::OpenInterestHistory(samples),
+                            time,
+                            received,
+                            300_000,
+                        )
                     }
-                    Err(error) => (MarketPayload::OpenInterestHistoryUnavailable(format!("Bybit OI history: {error}")),
-                        now, now, 60_000),
+                    Err(error) => (
+                        MarketPayload::OpenInterestHistoryUnavailable(format!(
+                            "Bybit OI history: {error}"
+                        )),
+                        now,
+                        now,
+                        60_000,
+                    ),
                 };
                 for selection in &destinations {
-                    if events.send_timeout(LocalMarketClientEvent::Market(Box::new(MarketEnvelope {
-                        generation, selection: selection.clone(), event_time_ms, received_ms,
-                        payload: payload.clone(),
-                    })), COMMAND_SEND_TIMEOUT).is_err() { return; }
+                    if events
+                        .send_timeout(
+                            LocalMarketClientEvent::Market(Box::new(MarketEnvelope {
+                                generation,
+                                selection: selection.clone(),
+                                event_time_ms,
+                                received_ms,
+                                payload: payload.clone(),
+                            })),
+                            COMMAND_SEND_TIMEOUT,
+                        )
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(pause)).await;
             }
@@ -285,20 +356,36 @@ async fn stream(
     )
     .await?;
     let received = now_ms();
-    let initial = initial_visible_history(MarketServer::Bybit, http, instrument, selection,
-        generation, bars.iter().filter(|bar| bar.close_time_ms < received)
-            .cloned().collect()).await;
+    let initial = initial_visible_history(
+        MarketServer::Bybit,
+        http,
+        instrument,
+        selection,
+        generation,
+        bars.iter()
+            .filter(|bar| bar.close_time_ms < received)
+            .cloned()
+            .collect(),
+    )
+    .await;
     emit(
         emitter,
         selection,
         generation,
-        MarketPayload::RestHistory {
-            bars: initial,
-        },
+        MarketPayload::RestHistory { bars: initial },
         received,
     )?;
     if !derivative_destinations.is_empty() {
-        seed_shared(http, instrument, selection, generation, &bars, source_demand, emitter).await;
+        seed_shared(
+            http,
+            instrument,
+            selection,
+            generation,
+            &bars,
+            source_demand,
+            emitter,
+        )
+        .await;
     }
     for bar in bars.into_iter().filter(|b| b.close_time_ms >= received) {
         emit(
@@ -401,27 +488,46 @@ async fn stream(
                     if let Some(funding) = funding {
                         let time = funding.exchange_time_ms;
                         for destination in derivative_destinations {
-                            emit(emitter, destination, generation, MarketPayload::Funding(funding.clone()), time)?;
+                            emit(
+                                emitter,
+                                destination,
+                                generation,
+                                MarketPayload::Funding(funding.clone()),
+                                time,
+                            )?;
                         }
                     }
                     if let Some(interest) = interest {
                         let time = interest.exchange_time_ms;
                         for destination in derivative_destinations {
-                            emit(emitter, destination, generation,
-                                MarketPayload::OpenInterestCurrent(interest.clone()), time)?;
+                            emit(
+                                emitter,
+                                destination,
+                                generation,
+                                MarketPayload::OpenInterestCurrent(interest.clone()),
+                                time,
+                            )?;
                         }
                     }
                 }
                 Frame::BaseMinuteBar { bar, closed } => {
                     if source_demand.minute {
-                        emitter.emit(LocalMarketClientEvent::BaseMinuteBar { generation,
-                            binding: selection.binding.clone(), bar, confirmed: closed })?;
+                        emitter.emit(LocalMarketClientEvent::BaseMinuteBar {
+                            generation,
+                            binding: selection.binding.clone(),
+                            bar,
+                            confirmed: closed,
+                        })?;
                     }
                 }
                 Frame::SessionDayBar { bar, closed } => {
                     if source_demand.day {
-                        emitter.emit(LocalMarketClientEvent::SessionDayBar { generation,
-                            binding: selection.binding.clone(), bar, confirmed: closed })?;
+                        emitter.emit(LocalMarketClientEvent::SessionDayBar {
+                            generation,
+                            binding: selection.binding.clone(),
+                            bar,
+                            confirmed: closed,
+                        })?;
                     }
                 }
             }
@@ -429,33 +535,86 @@ async fn stream(
     }
 }
 
-async fn seed_shared(http: &reqwest::Client, instrument: &Instrument,
-    selection: &MarketSelection, generation: u64, display: &[PublicBar],
-    source_demand: SharedSourceDemand, emitter: &mut EventEmitter) {
+async fn seed_shared(
+    http: &reqwest::Client,
+    instrument: &Instrument,
+    selection: &MarketSelection,
+    generation: u64,
+    display: &[PublicBar],
+    source_demand: SharedSourceDemand,
+    emitter: &mut EventEmitter,
+) {
     for interval in [ChartInterval::OneMinute, ChartInterval::OneDay] {
-        if !(if interval == ChartInterval::OneMinute { source_demand.minute } else { source_demand.day }) {
+        if !(if interval == ChartInterval::OneMinute {
+            source_demand.minute
+        } else {
+            source_demand.day
+        }) {
             continue;
         }
-        let source_selection = MarketSelection { binding: selection.binding.clone(), interval };
-        let source = if selection.interval == interval { display.to_vec() }
-            else { match candles(MarketServer::Bybit, http, instrument, &source_selection,
-                generation, None).await { Ok(bars) => bars, Err(_) => continue } };
+        let source_selection = MarketSelection {
+            binding: selection.binding.clone(),
+            interval,
+        };
+        let source = if selection.interval == interval {
+            display.to_vec()
+        } else {
+            match candles(
+                MarketServer::Bybit,
+                http,
+                instrument,
+                &source_selection,
+                generation,
+                None,
+            )
+            .await
+            {
+                Ok(bars) => bars,
+                Err(_) => continue,
+            }
+        };
         let cached = public_cache::PublicHistoryCache::local()
             .and_then(|cache| cache.recent(&source_selection, generation));
         let source = history::merge_latest(cached, source, generation);
-        let source = if interval == ChartInterval::OneMinute { source.into_iter().rev().take(360)
-            .collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>() } else { source };
-        let now = now_ms();
-        let forming = source.last().filter(|bar| bar.close_time_ms >= now).cloned();
-        let closed = source.into_iter().filter(|bar| bar.close_time_ms < now).collect();
-        let event = if interval == ChartInterval::OneMinute {
-            LocalMarketClientEvent::BaseMinuteHistory { generation,
-                binding: selection.binding.clone(), bars: closed, forming }
+        let source = if interval == ChartInterval::OneMinute {
+            source
+                .into_iter()
+                .rev()
+                .take(360)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
         } else {
-            LocalMarketClientEvent::SessionDayHistory { generation,
-                binding: selection.binding.clone(), bars: closed, forming }
+            source
         };
-        if emitter.emit(event).is_err() { return; }
+        let now = now_ms();
+        let forming = source
+            .last()
+            .filter(|bar| bar.close_time_ms >= now)
+            .cloned();
+        let closed = source
+            .into_iter()
+            .filter(|bar| bar.close_time_ms < now)
+            .collect();
+        let event = if interval == ChartInterval::OneMinute {
+            LocalMarketClientEvent::BaseMinuteHistory {
+                generation,
+                binding: selection.binding.clone(),
+                bars: closed,
+                forming,
+            }
+        } else {
+            LocalMarketClientEvent::SessionDayHistory {
+                generation,
+                binding: selection.binding.clone(),
+                bars: closed,
+                forming,
+            }
+        };
+        if emitter.emit(event).is_err() {
+            return;
+        }
     }
 }
 

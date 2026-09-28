@@ -281,6 +281,21 @@ mod tests {
 }
 
 impl StrategyCredentialStore {
+    async fn stored_native_order_id(
+        &self,
+        owner: &str,
+        credential: &str,
+        command: &venue_domain::ExecutionCommand,
+    ) -> Result<Option<String>, StrategyExchangeError> {
+        let result: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT native_order_id FROM venue_binance_commands WHERE command_id=$1 AND owner_user_id=$2 AND credential_id=$3 AND strategy_command=$4",
+        )
+        .bind(command.command_id().as_str()).bind(owner).bind(credential)
+        .bind(serde_json::to_value(command).map_err(|_| StrategyExchangeError)?)
+        .fetch_optional(&self.pool).await.map_err(|_| StrategyExchangeError)?;
+        Ok(result.flatten())
+    }
+
     /// Read-only exact client-ID observation for an already durable command. This never claims,
     /// sends or retries the command and is suitable for operator reconciliation evidence.
     pub async fn order_observation(
@@ -294,6 +309,10 @@ impl StrategyCredentialStore {
         if command.mutation_owner().account != account {
             return Err(StrategyProbeError::Binding);
         }
+        let native = self
+            .stored_native_order_id(owner, credential, &command)
+            .await
+            .map_err(|_| StrategyProbeError::Binding)?;
         let (credentials, expected) = self
             .load(owner, credential, &account, false)
             .await
@@ -319,7 +338,7 @@ impl StrategyCredentialStore {
                 return Err(StrategyProbeError::Identity);
             }
             gateway
-                .order_observation_detailed(&command)
+                .order_observation_detailed(&command, native.as_deref())
                 .map_err(StrategyProbeError::Observation)
         })
         .await
@@ -421,6 +440,13 @@ impl StrategyCredentialStore {
         let (credentials, expected) = self.load(owner, credential, &account, false).await?;
         let binding = GatewayBinding::new(credentials.venue(), GatewayMode::Live, account, symbol)
             .map_err(|_| StrategyExchangeError)?;
+        let mut queries = Vec::with_capacity(commands.len());
+        for command in commands {
+            let native = self
+                .stored_native_order_id(owner, credential, &command)
+                .await?;
+            queries.push((command, native));
+        }
         let _slot = crate::multi_venue_runtime::ACCOUNT_NETWORK_SLOTS
             .acquire()
             .await
@@ -431,14 +457,17 @@ impl StrategyCredentialStore {
                 return Err(StrategyExchangeError);
             }
             let mut observations = Vec::new();
-            for command in &commands {
+            for (command, native) in &queries {
                 let observation = gateway
-                    .order_observation(command)?
+                    .order_observation(command, native.as_deref())?
                     .ok_or(StrategyExchangeError)?;
                 observations.push(observation);
             }
+            // A complete private read performs several requests. Sample the decision price
+            // afterward so that this work cannot age the market fact before planning starts.
+            let snapshot = gateway.snapshot(&binding)?;
             let market = gateway.market_facts()?;
-            Ok((gateway.snapshot(&binding)?, market, observations))
+            Ok((snapshot, market, observations))
         })
         .await
         .map_err(|_| StrategyExchangeError)?

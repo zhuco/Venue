@@ -14,10 +14,12 @@ async fn get(http: &reqwest::Client, path: &str) -> Result<Value> {
 pub async fn catalog(http: &reqwest::Client) -> Result<Vec<Instrument>> {
     let mut result = Vec::new();
     for category in ["USDT-FUTURES", "USDC-FUTURES"] {
-    let value = get(http, &format!("instruments?category={category}")).await?;
-    for row in array(&value["data"])? {
-        if let Some(instrument) = parse_instrument(row, category)? { result.push(instrument); }
-    }
+        let value = get(http, &format!("instruments?category={category}")).await?;
+        for row in array(&value["data"])? {
+            if let Some(instrument) = parse_instrument(row, category)? {
+                result.push(instrument);
+            }
+        }
     }
 
     if result.is_empty() {
@@ -102,34 +104,38 @@ pub async fn book(http: &reqwest::Client, instrument: &Instrument) -> Result<Boo
 pub async fn quotes(http: &reqwest::Client, instruments: &[Instrument]) -> Result<Vec<Quote>> {
     let mut result = Vec::new();
     for category in ["USDT-FUTURES", "USDC-FUTURES"] {
-    if !instruments.iter().any(|i| format!("{}-FUTURES", i.symbol.quote()) == category) { continue; }
-    let value = get(http, &format!("tickers?category={category}")).await?;
-    for row in array(&value["data"])? {
-        let Some(i) = instruments
+        if !instruments
             .iter()
-            .find(|i| row["symbol"] == i.native_symbol
-                && format!("{}-FUTURES", i.symbol.quote()) == category)
-        else {
+            .any(|i| format!("{}-FUTURES", i.symbol.quote()) == category)
+        {
             continue;
-        };
-        let parsed = (|| -> Result<Quote> {
-            let last = number(&row["lastPrice"])?;
-            if last <= Decimal::ZERO {
-                return Err("inactive ticker".into());
-            }
-            Ok(Quote {
-                symbol: i.symbol.clone(),
-                last,
-                change_percent: number(&row["price24hPcnt"])? * Decimal::from(100),
-                quote_volume: Some(number(&row["turnover24h"])?),
-                time_ms: stamp(&row["ts"])?,
-                derivatives: Some(derivatives(row)),
-            })
-        })();
-        if let Ok(quote) = parsed {
-            result.push(quote);
         }
-    }
+        let value = get(http, &format!("tickers?category={category}")).await?;
+        for row in array(&value["data"])? {
+            let Some(i) = instruments.iter().find(|i| {
+                row["symbol"] == i.native_symbol
+                    && format!("{}-FUTURES", i.symbol.quote()) == category
+            }) else {
+                continue;
+            };
+            let parsed = (|| -> Result<Quote> {
+                let last = number(&row["lastPrice"])?;
+                if last <= Decimal::ZERO {
+                    return Err("inactive ticker".into());
+                }
+                Ok(Quote {
+                    symbol: i.symbol.clone(),
+                    last,
+                    change_percent: number(&row["price24hPcnt"])? * Decimal::from(100),
+                    quote_volume: Some(number(&row["turnover24h"])?),
+                    time_ms: stamp(&row["ts"])?,
+                    derivatives: Some(derivatives(row)),
+                })
+            })();
+            if let Ok(quote) = parsed {
+                result.push(quote);
+            }
+        }
     }
     Ok(result)
 }
@@ -143,9 +149,13 @@ fn parse_instrument(row: &Value, category: &str) -> Result<Option<Instrument>> {
     if !matches!(quote, "USDT" | "USDC") || format!("{quote}-FUTURES") != category {
         return Ok(None);
     }
-    let Ok(symbol) = symbol(base, quote) else { return Ok(None); };
+    let Ok(symbol) = symbol(base, quote) else {
+        return Ok(None);
+    };
     let native_symbol = string(&row["symbol"])?;
-    if native_symbol.is_empty() || !native_symbol.starts_with(base) { return Ok(None); }
+    if native_symbol.is_empty() || !native_symbol.starts_with(base) {
+        return Ok(None);
+    }
     Ok(Some(Instrument {
         symbol,
         native_symbol: native_symbol.to_owned(),
@@ -161,13 +171,21 @@ fn derivatives(row: &Value) -> DerivativeQuote {
         use_local_observation_time: false,
         funding_rate: number(&row["fundingRate"]).ok(),
         funding_time_ms: None,
-        next_funding_time_ms: row["nextFundingTime"].as_str()
-            .and_then(|value| value.parse::<u64>().ok()).filter(|time| *time > 0),
-        mark_price: number(&row["markPrice"]).ok().filter(|price| *price > Decimal::ZERO),
-        index_price: number(&row["indexPrice"]).ok().filter(|price| *price > Decimal::ZERO),
+        next_funding_time_ms: row["nextFundingTime"]
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|time| *time > 0),
+        mark_price: number(&row["markPrice"])
+            .ok()
+            .filter(|price| *price > Decimal::ZERO),
+        index_price: number(&row["indexPrice"])
+            .ok()
+            .filter(|price| *price > Decimal::ZERO),
         // UTA linear perpetual quantities are base coin; the v2 public OI readback
         // matches this exact v3 ticker field for the same native symbol.
-        open_interest_base: number(&row["openInterest"]).ok().filter(|quantity| *quantity >= Decimal::ZERO),
+        open_interest_base: number(&row["openInterest"])
+            .ok()
+            .filter(|quantity| *quantity >= Decimal::ZERO),
         open_interest_native_quantity: None,
         open_interest_native_unit: None,
         open_interest_time_ms: None,
@@ -222,9 +240,15 @@ mod derivative_tests {
             "openInterest":"1238599464", "nextFundingTime":"1790524800000"});
         let value = derivatives(&row);
         assert_eq!(value.funding_rate, Some(Decimal::new(-1, 4)));
-        assert_eq!(value.open_interest_base, Some(Decimal::from(1_238_599_464_u64)));
+        assert_eq!(
+            value.open_interest_base,
+            Some(Decimal::from(1_238_599_464_u64))
+        );
         assert_eq!(value.next_funding_time_ms, Some(1_790_524_800_000));
-        assert_eq!(derivatives(&serde_json::json!({"openInterest":"-1"})).open_interest_base, None);
+        assert_eq!(
+            derivatives(&serde_json::json!({"openInterest":"-1"})).open_interest_base,
+            None
+        );
     }
 
     #[test]

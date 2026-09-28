@@ -16,10 +16,17 @@ pub struct ZoneBar {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ZoneRole { Support, Resistance }
+pub enum ZoneRole {
+    Support,
+    Resistance,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ZoneState { Active, Broken, Retired }
+pub enum ZoneState {
+    Active,
+    Broken,
+    Retired,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Zone {
@@ -52,16 +59,34 @@ pub enum ZoneError {
     InvalidTick,
 }
 
-pub fn calculate(bars: &[ZoneBar], interval_ms: u64, tick: Decimal) -> Result<Vec<Zone>, ZoneError> {
-    if tick <= Decimal::ZERO { return Err(ZoneError::InvalidTick); }
-    if interval_ms == 0 || bars.windows(2).any(|pair| pair[0].open_time_ms.checked_add(interval_ms) != Some(pair[1].open_time_ms))
-        || bars.iter().any(|bar| bar.open_time_ms % interval_ms != 0 || bar.high < bar.low
-            || bar.close < bar.low || bar.close > bar.high || bar.low <= Decimal::ZERO)
-    { return Err(ZoneError::InvalidBars); }
+pub fn calculate(
+    bars: &[ZoneBar],
+    interval_ms: u64,
+    tick: Decimal,
+) -> Result<Vec<Zone>, ZoneError> {
+    if tick <= Decimal::ZERO {
+        return Err(ZoneError::InvalidTick);
+    }
+    if interval_ms == 0
+        || bars
+            .windows(2)
+            .any(|pair| pair[0].open_time_ms.checked_add(interval_ms) != Some(pair[1].open_time_ms))
+        || bars.iter().any(|bar| {
+            bar.open_time_ms % interval_ms != 0
+                || bar.high < bar.low
+                || bar.close < bar.low
+                || bar.close > bar.high
+                || bar.low <= Decimal::ZERO
+        })
+    {
+        return Err(ZoneError::InvalidBars);
+    }
     let mut zones: Vec<Zone> = Vec::new();
     for (index, bar) in bars.iter().enumerate() {
         for zone in &mut zones {
-            if zone.state == ZoneState::Retired { continue; }
+            if zone.state == ZoneState::Retired {
+                continue;
+            }
             if index.saturating_sub(zone.last_validation_index) > 500 {
                 zone.state = ZoneState::Retired;
                 zone.retired_at_ms = Some(bar.open_time_ms);
@@ -87,16 +112,25 @@ pub fn calculate(bars: &[ZoneBar], interval_ms: u64, tick: Decimal) -> Result<Ve
                 ZoneRole::Support => bar.close < zone.low - threshold,
             };
             if zone.state == ZoneState::Active {
-                zone.break_count = if beyond { zone.break_count.saturating_add(1) } else { 0 };
-                if zone.break_count >= 2 { zone.state = ZoneState::Broken; zone.last_validation_index = index; }
+                zone.break_count = if beyond {
+                    zone.break_count.saturating_add(1)
+                } else {
+                    0
+                };
+                if zone.break_count >= 2 {
+                    zone.state = ZoneState::Broken;
+                    zone.last_validation_index = index;
+                }
             } else if touched && !beyond {
                 let confirmed_flip = match zone.role {
                     ZoneRole::Resistance => bar.close >= zone.center,
                     ZoneRole::Support => bar.close <= zone.center,
                 };
                 if confirmed_flip {
-                    zone.role = match zone.role { ZoneRole::Resistance => ZoneRole::Support,
-                        ZoneRole::Support => ZoneRole::Resistance };
+                    zone.role = match zone.role {
+                        ZoneRole::Resistance => ZoneRole::Support,
+                        ZoneRole::Support => ZoneRole::Resistance,
+                    };
                     zone.state = ZoneState::Active;
                     zone.break_count = 0;
                     zone.last_validation_index = index;
@@ -104,10 +138,14 @@ pub fn calculate(bars: &[ZoneBar], interval_ms: u64, tick: Decimal) -> Result<Ve
             }
             zone.score = score(zone, index);
         }
-        if index < WINDOW * 2 { continue; }
+        if index < WINDOW * 2 {
+            continue;
+        }
         let center_index = index - WINDOW;
         let center = bars[center_index];
-        let Some(atr) = bar.atr.filter(|atr| *atr > Decimal::ZERO) else { continue; };
+        let Some(atr) = bar.atr.filter(|atr| *atr > Decimal::ZERO) else {
+            continue;
+        };
         let left = &bars[center_index - WINDOW..center_index];
         let right = &bars[center_index + 1..=index];
         let high_swing = left.iter().all(|item| item.high < center.high)
@@ -115,7 +153,11 @@ pub fn calculate(bars: &[ZoneBar], interval_ms: u64, tick: Decimal) -> Result<Ve
         let low_swing = left.iter().all(|item| item.low > center.low)
             && right.iter().all(|item| item.low >= center.low);
         for role in [ZoneRole::Resistance, ZoneRole::Support] {
-            if (role == ZoneRole::Resistance && !high_swing) || (role == ZoneRole::Support && !low_swing) { continue; }
+            if (role == ZoneRole::Resistance && !high_swing)
+                || (role == ZoneRole::Support && !low_swing)
+            {
+                continue;
+            }
             let prominence = match role {
                 ZoneRole::Resistance => {
                     let left_low = left.iter().map(|bar| bar.low).min().unwrap_or(center.low);
@@ -124,17 +166,30 @@ pub fn calculate(bars: &[ZoneBar], interval_ms: u64, tick: Decimal) -> Result<Ve
                 }
                 ZoneRole::Support => {
                     let left_high = left.iter().map(|bar| bar.high).max().unwrap_or(center.high);
-                    let right_high = right.iter().map(|bar| bar.high).max().unwrap_or(center.high);
+                    let right_high = right
+                        .iter()
+                        .map(|bar| bar.high)
+                        .max()
+                        .unwrap_or(center.high);
                     left_high.min(right_high) - center.low
                 }
             };
             let prominence = decimal_ratio(prominence, atr * Decimal::from(2)).clamp(0.0, 1.0);
-            let price = if role == ZoneRole::Resistance { center.high } else { center.low };
+            let price = if role == ZoneRole::Resistance {
+                center.high
+            } else {
+                center.low
+            };
             let half = (tick * Decimal::from(2)).max(atr / Decimal::from(4));
             let (low, high) = (price - half, price + half);
-            if let Some(zone) = zones.iter_mut().find(|zone| zone.state == ZoneState::Active && zone.role == role
-                && (zone.low <= high && low <= zone.high || (zone.center-price).abs() <= half + (zone.high-zone.low)/Decimal::from(2))
-                && zone.high.max(high)-zone.low.min(low) <= atr) {
+            if let Some(zone) = zones.iter_mut().find(|zone| {
+                zone.state == ZoneState::Active
+                    && zone.role == role
+                    && (zone.low <= high && low <= zone.high
+                        || (zone.center - price).abs()
+                            <= half + (zone.high - zone.low) / Decimal::from(2))
+                    && zone.high.max(high) - zone.low.min(low) <= atr
+            }) {
                 zone.low = zone.low.min(low);
                 zone.high = zone.high.max(high);
                 zone.center = (zone.low + zone.high) / Decimal::from(2);
@@ -143,21 +198,42 @@ pub fn calculate(bars: &[ZoneBar], interval_ms: u64, tick: Decimal) -> Result<Ve
                 zone.score = score(zone, index);
                 continue;
             }
-            let id = center.open_time_ms.saturating_mul(2)
+            let id = center
+                .open_time_ms
+                .saturating_mul(2)
                 .saturating_add(u64::from(role == ZoneRole::Resistance));
-            let mut zone = Zone { id, role, state: ZoneState::Active, low, high, center: price,
-                source_time_ms: center.open_time_ms, confirmed_at_ms: bar.open_time_ms.saturating_add(interval_ms),
-                retired_at_ms: None, touch_count: 0, first_touch_ms: None, last_touch_ms: None,
-                score: 0.0, prominence, atr, last_validation_index: index,
-                inside: false, outside_bars: 1, break_count: 0 };
+            let mut zone = Zone {
+                id,
+                role,
+                state: ZoneState::Active,
+                low,
+                high,
+                center: price,
+                source_time_ms: center.open_time_ms,
+                confirmed_at_ms: bar.open_time_ms.saturating_add(interval_ms),
+                retired_at_ms: None,
+                touch_count: 0,
+                first_touch_ms: None,
+                last_touch_ms: None,
+                score: 0.0,
+                prominence,
+                atr,
+                last_validation_index: index,
+                inside: false,
+                outside_bars: 1,
+                break_count: 0,
+            };
             zone.score = score(&zone, index);
             zones.push(zone);
         }
         if zones.len() > MAX_ZONES {
             zones.retain(|zone| zone.state != ZoneState::Retired);
             if zones.len() > MAX_ZONES {
-                zones.sort_by(|a, b| b.score.total_cmp(&a.score)
-                    .then_with(|| b.confirmed_at_ms.cmp(&a.confirmed_at_ms)));
+                zones.sort_by(|a, b| {
+                    b.score
+                        .total_cmp(&a.score)
+                        .then_with(|| b.confirmed_at_ms.cmp(&a.confirmed_at_ms))
+                });
                 zones.truncate(MAX_ZONES);
             }
         }
@@ -166,8 +242,12 @@ pub fn calculate(bars: &[ZoneBar], interval_ms: u64, tick: Decimal) -> Result<Ve
 }
 
 fn decimal_ratio(value: Decimal, denominator: Decimal) -> f64 {
-    if denominator <= Decimal::ZERO { return 0.0; }
-    value.checked_div(denominator).and_then(|ratio| ratio.to_f64())
+    if denominator <= Decimal::ZERO {
+        return 0.0;
+    }
+    value
+        .checked_div(denominator)
+        .and_then(|ratio| ratio.to_f64())
         .unwrap_or(0.0)
 }
 
@@ -182,18 +262,32 @@ mod tests {
     use super::*;
 
     fn bar(index: u64, low: i64, high: i64, close: i64) -> ZoneBar {
-        ZoneBar { open_time_ms: index * 60_000, low: Decimal::from(low),
-            high: Decimal::from(high), close: Decimal::from(close), atr: Some(Decimal::from(2)) }
+        ZoneBar {
+            open_time_ms: index * 60_000,
+            low: Decimal::from(low),
+            high: Decimal::from(high),
+            close: Decimal::from(close),
+            atr: Some(Decimal::from(2)),
+        }
     }
 
     #[test]
     fn swing_is_visible_only_after_three_right_bars_close() -> Result<(), ZoneError> {
-        let bars = [bar(0, 5, 7, 6), bar(1, 6, 8, 7), bar(2, 6, 9, 8),
-            bar(3, 7, 12, 10), bar(4, 6, 9, 8), bar(5, 5, 8, 7), bar(6, 5, 7, 6)];
+        let bars = [
+            bar(0, 5, 7, 6),
+            bar(1, 6, 8, 7),
+            bar(2, 6, 9, 8),
+            bar(3, 7, 12, 10),
+            bar(4, 6, 9, 8),
+            bar(5, 5, 8, 7),
+            bar(6, 5, 7, 6),
+        ];
         let tick = Decimal::new(1, 2);
         assert!(calculate(&bars[..6], 60_000, tick)?.is_empty());
         let zones = calculate(&bars, 60_000, tick)?;
-        let resistance = zones.iter().find(|zone| zone.role == ZoneRole::Resistance && zone.source_time_ms == 180_000)
+        let resistance = zones
+            .iter()
+            .find(|zone| zone.role == ZoneRole::Resistance && zone.source_time_ms == 180_000)
             .ok_or(ZoneError::InvalidBars)?;
         assert_eq!(resistance.confirmed_at_ms, 420_000);
         assert_eq!(resistance.state, ZoneState::Active);

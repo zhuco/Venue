@@ -130,7 +130,11 @@ pub(super) fn draw(
     language: Language,
     depth: Option<(&[UiBookLevel], &[UiBookLevel])>,
     market_scope: Option<&venue_gateway_api::PublicMarketBinding>,
-    minute_source: Option<(&[venue_control_protocol::UiBar], &[crate::chart::BaseMinuteStudy], (u64, u64))>,
+    minute_source: Option<(
+        &[venue_control_protocol::UiBar],
+        &[crate::chart::BaseMinuteStudy],
+        (u64, u64),
+    )>,
     price_tick: Option<rust_decimal::Decimal>,
 ) {
     let painter = painter.with_clip_rect(rect.intersect(painter.clip_rect()));

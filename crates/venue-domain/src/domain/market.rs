@@ -375,16 +375,22 @@ impl OpenInterestSample {
             && self.native_quantity >= Decimal::ZERO
             && self.sampling_interval_ms.is_none_or(|period| period > 0)
             && match (&self.native_unit, &self.base_quantity) {
-                (OpenInterestUnit::BaseAsset, FieldState::Known(base)) => *base == self.native_quantity,
+                (OpenInterestUnit::BaseAsset, FieldState::Known(base)) => {
+                    *base == self.native_quantity
+                }
                 (OpenInterestUnit::Contracts { base_per_contract }, FieldState::Known(base)) => {
                     *base_per_contract > Decimal::ZERO
                         && self.native_quantity.checked_mul(*base_per_contract) == Some(*base)
                 }
-                (OpenInterestUnit::Contracts { base_per_contract }, _) => *base_per_contract > Decimal::ZERO,
+                (OpenInterestUnit::Contracts { base_per_contract }, _) => {
+                    *base_per_contract > Decimal::ZERO
+                }
                 _ => false,
             }
             && match (&self.quote_notional, &self.quote_asset) {
-                (FieldState::Known(value), Some(asset)) => *value >= Decimal::ZERO && !asset.is_empty(),
+                (FieldState::Known(value), Some(asset)) => {
+                    *value >= Decimal::ZERO && !asset.is_empty()
+                }
                 (FieldState::Known(_), None) => false,
                 _ => true,
             }

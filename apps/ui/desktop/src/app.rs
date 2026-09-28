@@ -43,19 +43,27 @@ struct FrameTelemetry {
 impl FrameTelemetry {
     fn memory_sample_due(&self) -> bool {
         !self.reported_full_window
-            && self.last_memory_sample.is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+            && self
+                .last_memory_sample
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
     }
 
-    fn record_memory(&mut self, source_bytes: usize, chart_cache_bytes: usize,
-        async_reserved_bytes: usize) {
+    fn record_memory(
+        &mut self,
+        source_bytes: usize,
+        chart_cache_bytes: usize,
+        async_reserved_bytes: usize,
+    ) {
         self.last_memory_sample = Some(Instant::now());
         self.source_peak_bytes = self.source_peak_bytes.max(source_bytes);
         self.chart_cache_peak_bytes = self.chart_cache_peak_bytes.max(chart_cache_bytes);
         self.async_reserved_peak_bytes = self.async_reserved_peak_bytes.max(async_reserved_bytes);
         self.async_reserved_last_bytes = async_reserved_bytes;
-        self.estimated_indicator_last_bytes = source_bytes.saturating_add(chart_cache_bytes)
+        self.estimated_indicator_last_bytes = source_bytes
+            .saturating_add(chart_cache_bytes)
             .saturating_add(async_reserved_bytes);
-        self.estimated_indicator_peak_bytes = self.estimated_indicator_peak_bytes
+        self.estimated_indicator_peak_bytes = self
+            .estimated_indicator_peak_bytes
             .max(self.estimated_indicator_last_bytes);
     }
 
@@ -81,7 +89,9 @@ impl FrameTelemetry {
         }
         let mut sorted = self.cpu_ms.clone();
         sorted.sort_by(f32::total_cmp);
-        let elapsed_s = self.started.map_or(0.0, |started| started.elapsed().as_secs_f64());
+        let elapsed_s = self
+            .started
+            .map_or(0.0, |started| started.elapsed().as_secs_f64());
         tracing::info!(target: "venueflow::frame_performance", window,
             elapsed_s, samples = sorted.len(),
             p50_ms = percentile(&sorted, 50), p95_ms = percentile(&sorted, 95),
@@ -222,14 +232,22 @@ impl VenueFlowApp {
                         if pane.kind == crate::workspace::PaneKind::Chart
                             && tree.tiles.is_visible(*id) =>
                     {
-                        Some((pane.symbol.clone().unwrap_or_else(|| fallback_symbol.clone()), pane.interval,
-                            pane.settings_key(), pane.instance))
+                        Some((
+                            pane.symbol
+                                .clone()
+                                .unwrap_or_else(|| fallback_symbol.clone()),
+                            pane.interval,
+                            pane.settings_key(),
+                            pane.instance,
+                        ))
                     }
                     _ => None,
                 })
                 .collect()
         };
-        let chart_keys = active_charts.iter().map(|(_, _, key, _)| key.clone())
+        let chart_keys = active_charts
+            .iter()
+            .map(|(_, _, key, _)| key.clone())
             .collect::<std::collections::BTreeSet<_>>();
         self.model.local_markets.retain_chart_keys(&chart_keys);
         if self.market_server != self.model.preferences.market_server {
@@ -256,30 +274,45 @@ impl VenueFlowApp {
             return;
         }
         let mut source_demands = std::collections::BTreeMap::new();
-        let selections = active_charts
-            .into_iter()
-            .filter_map(|(symbol, interval, key, pane_instance)| {
-                match MarketSelection::for_server(self.market_server, &symbol, interval) {
-                    Ok(selection) => {
-                        let settings = self.model.preferences.chart_overrides.get(&key)
-                            .unwrap_or(&self.model.preferences.chart);
-                        let has_anchor = self.model.preferences.analysis_anchors.iter().any(|anchor|
-                            anchor.pane_instance == pane_instance && anchor.binding == selection.binding);
-                        let demand = crate::market_client::SharedSourceDemand::for_chart(settings, has_anchor);
-                        source_demands.entry(selection.binding.clone())
-                            .or_insert_with(crate::market_client::SharedSourceDemand::default)
-                            .merge(demand);
-                        Some(selection)
-                    },
-                    Err(error) => {
-                        self.model.notice(format!(
-                            "Local Binance selection rejected for {symbol}: {error}"
-                        ));
-                        None
+        let selections =
+            active_charts
+                .into_iter()
+                .filter_map(|(symbol, interval, key, pane_instance)| {
+                    match MarketSelection::for_server(self.market_server, &symbol, interval) {
+                        Ok(selection) => {
+                            let settings = self
+                                .model
+                                .preferences
+                                .chart_overrides
+                                .get(&key)
+                                .unwrap_or(&self.model.preferences.chart);
+                            let has_anchor =
+                                self.model
+                                    .preferences
+                                    .analysis_anchors
+                                    .iter()
+                                    .any(|anchor| {
+                                        anchor.pane_instance == pane_instance
+                                            && anchor.binding == selection.binding
+                                    });
+                            let demand = crate::market_client::SharedSourceDemand::for_chart(
+                                settings, has_anchor,
+                            );
+                            source_demands
+                                .entry(selection.binding.clone())
+                                .or_insert_with(crate::market_client::SharedSourceDemand::default)
+                                .merge(demand);
+                            Some(selection)
+                        }
+                        Err(error) => {
+                            self.model.notice(format!(
+                                "Local Binance selection rejected for {symbol}: {error}"
+                            ));
+                            None
+                        }
                     }
-                }
-            })
-            .collect::<Vec<_>>();
+                })
+                .collect::<Vec<_>>();
         let generation = match self.model.local_markets.replace(selections) {
             Ok(generation) => generation,
             Err(error) => {
@@ -288,12 +321,21 @@ impl VenueFlowApp {
                 return;
             }
         };
-        let demanded = source_demands.iter().flat_map(|(binding, demand)|
-            [crate::chart::ChartInterval::OneMinute, crate::chart::ChartInterval::OneDay]
-                .into_iter().filter(move |interval| demand.allows(*interval))
-                .map(move |interval| (binding.clone(), interval)))
+        let demanded = source_demands
+            .iter()
+            .flat_map(|(binding, demand)| {
+                [
+                    crate::chart::ChartInterval::OneMinute,
+                    crate::chart::ChartInterval::OneDay,
+                ]
+                .into_iter()
+                .filter(move |interval| demand.allows(*interval))
+                .map(move |interval| (binding.clone(), interval))
+            })
             .collect::<std::collections::BTreeSet<_>>();
-        self.model.local_markets.retain_shared_history_demands(&demanded);
+        self.model
+            .local_markets
+            .retain_shared_history_demands(&demanded);
         if let Some(client) = self.market_client.as_ref() {
             client.update_source_demands(source_demands);
         }
@@ -350,7 +392,10 @@ impl VenueFlowApp {
                 continue;
             }
             if let Err(error) = client.load_shared(request.clone()) {
-                let _ = self.model.local_markets.finish_shared_history(&request, Err(error.to_string()));
+                let _ = self
+                    .model
+                    .local_markets
+                    .finish_shared_history(&request, Err(error.to_string()));
             }
         }
         // Expired synchronization must mark every old public view stale.
@@ -704,8 +749,11 @@ impl eframe::App for VenueFlowApp {
             let source_bytes = self.model.local_markets.retained_study_source_bytes();
             let chart_cache_bytes = crate::chart_view::retained_indicator_cache_bytes(ui.ctx());
             let async_reserved_bytes = crate::chart_view::pending_indicator_input_bytes();
-            self.frame_telemetry.record_memory(source_bytes, chart_cache_bytes,
-                async_reserved_bytes);
+            self.frame_telemetry.record_memory(
+                source_bytes,
+                chart_cache_bytes,
+                async_reserved_bytes,
+            );
         }
         crate::chart_trading::apply_interaction(&mut self.model, &self.client, ui.ctx());
         crate::execution_view::show_position_confirmation(ui, &mut self.model, &self.client, None);
@@ -805,10 +853,10 @@ fn migrate_persisted_state(mut state: PersistedState) -> PersistedState {
             chart.session.pdh = false;
             chart.session.pdl = false;
             chart.session.sr_current = false;
-            chart.microstructure.show_delta = chart.microstructure.order_flow
-                && !chart.microstructure.cumulative;
-            chart.microstructure.show_cvd = chart.microstructure.order_flow
-                && chart.microstructure.cumulative;
+            chart.microstructure.show_delta =
+                chart.microstructure.order_flow && !chart.microstructure.cumulative;
+            chart.microstructure.show_cvd =
+                chart.microstructure.order_flow && chart.microstructure.cumulative;
             chart.microstructure.cvd_reset_mode =
                 venue_indicators::chart::CvdResetMode::LoadedContinuous;
         };
@@ -889,17 +937,30 @@ mod tests {
 
     #[test]
     fn old_charts_keep_sparse_readouts_but_new_installs_show_atr_percent() {
-        let mut old = PersistedState { schema_version: 7, ..Default::default() };
-        old.preferences.chart_overrides.insert("chart-1".into(), old.preferences.chart.clone());
+        let mut old = PersistedState {
+            schema_version: 7,
+            ..Default::default()
+        };
+        old.preferences
+            .chart_overrides
+            .insert("chart-1".into(), old.preferences.chart.clone());
         let migrated = migrate_persisted_state(old);
         assert!(!migrated.preferences.chart.atr_percent_readout);
         assert!(!migrated.preferences.chart_overrides["chart-1"].atr_percent_readout);
-        assert!(PersistedState::default().preferences.chart.atr_percent_readout);
+        assert!(
+            PersistedState::default()
+                .preferences
+                .chart
+                .atr_percent_readout
+        );
     }
 
     #[test]
     fn old_order_flow_choice_migrates_without_enabling_both_panes() {
-        let mut old = PersistedState { schema_version: 8, ..Default::default() };
+        let mut old = PersistedState {
+            schema_version: 8,
+            ..Default::default()
+        };
         old.preferences.chart.microstructure.order_flow = true;
         old.preferences.chart.microstructure.cumulative = true;
         old.preferences.chart.atr_percent_readout = true;
@@ -907,7 +968,13 @@ mod tests {
         assert!(!migrated.preferences.chart.microstructure.show_delta);
         assert!(migrated.preferences.chart.microstructure.show_cvd);
         assert!(migrated.preferences.chart.atr_percent_readout);
-        assert!(PersistedState::default().preferences.chart.microstructure.heatmap);
+        assert!(
+            PersistedState::default()
+                .preferences
+                .chart
+                .microstructure
+                .heatmap
+        );
         assert!(!PersistedState::default().preferences.chart.macd.enabled);
     }
 

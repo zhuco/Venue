@@ -46,10 +46,14 @@ fn derivatives(context: &Value) -> DerivativeQuote {
         funding_rate: number(&context["funding"]).ok(),
         funding_time_ms: None,
         next_funding_time_ms: None,
-        mark_price: number(&context["markPx"]).ok().filter(|value| *value > Decimal::ZERO),
+        mark_price: number(&context["markPx"])
+            .ok()
+            .filter(|value| *value > Decimal::ZERO),
         // Hyperliquid's oraclePx is not silently relabeled as an exchange index price.
         index_price: None,
-        open_interest_base: number(&context["openInterest"]).ok().filter(|value| *value >= Decimal::ZERO),
+        open_interest_base: number(&context["openInterest"])
+            .ok()
+            .filter(|value| *value >= Decimal::ZERO),
         open_interest_native_quantity: None,
         open_interest_native_unit: None,
         open_interest_time_ms: None,
@@ -65,7 +69,10 @@ mod derivative_tests {
             "markPx":"0.097504", "oraclePx":"0.097425"});
         let value = derivatives(&row);
         assert_eq!(value.funding_rate, Some(Decimal::new(-25, 6)));
-        assert_eq!(value.open_interest_base, Some(Decimal::from(1_285_463_316_u64)));
+        assert_eq!(
+            value.open_interest_base,
+            Some(Decimal::from(1_285_463_316_u64))
+        );
         assert!(value.index_price.is_none());
         assert!(value.use_local_observation_time);
     }

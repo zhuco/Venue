@@ -30,9 +30,9 @@ pub use instrument::{
 };
 pub use market::{
     AggressorSide, BARS_SOURCE, BOOK_SOURCE, MAX_OPAQUE_PUBLIC_TRADE_ID_BYTES, MarkFunding,
-    MarketDelta, MarketEvent, MarketLevel, MarketSnapshot, MarketTimeSource, OpenInterestSample, OpenInterestUnit,
-    PublicBar, PublicTicker, PublicTrade,
-    PublicTradeId, PublicTradeOrdering, TRADES_SOURCE,
+    MarketDelta, MarketEvent, MarketLevel, MarketSnapshot, MarketTimeSource, OpenInterestSample,
+    OpenInterestUnit, PublicBar, PublicTicker, PublicTrade, PublicTradeId, PublicTradeOrdering,
+    TRADES_SOURCE,
 };
 pub use money::{Amount, AmountError, Asset, Price};
 pub use order::{Fill, Order, OrderError, OrderPurpose, OrderSide, OrderState};

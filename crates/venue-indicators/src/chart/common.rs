@@ -229,8 +229,10 @@ impl CommonStudyEngine {
                 })
             })
             .transpose()?;
-        let avl = if matches!((&bar.base_volume, &bar.quote_volume),
-            (FieldState::Known(_), FieldState::Known(_))) {
+        let avl = if matches!(
+            (&bar.base_volume, &bar.quote_volume),
+            (FieldState::Known(_), FieldState::Known(_))
+        ) {
             scalar(self.avl.update(bar).map_err(map_catalog_error)?)?
         } else {
             // AVL is defined by exchange-reported quote amount. A missing

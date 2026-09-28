@@ -36,32 +36,62 @@ impl InitialHistoryCache {
         }
     }
 
-    pub(super) fn shared_minutes(&self, binding: &venue_gateway_api::PublicMarketBinding) -> Option<&[PublicBar]> {
-        self.shared_minutes.iter().find(|(key, _)| key == binding).map(|(_, bars)| bars.as_slice())
+    pub(super) fn shared_minutes(
+        &self,
+        binding: &venue_gateway_api::PublicMarketBinding,
+    ) -> Option<&[PublicBar]> {
+        self.shared_minutes
+            .iter()
+            .find(|(key, _)| key == binding)
+            .map(|(_, bars)| bars.as_slice())
     }
 
-    pub(super) fn remember_shared_minutes(&mut self, binding: &venue_gateway_api::PublicMarketBinding, bars: &[PublicBar]) {
-        if bars.is_empty() { return; }
+    pub(super) fn remember_shared_minutes(
+        &mut self,
+        binding: &venue_gateway_api::PublicMarketBinding,
+        bars: &[PublicBar],
+    ) {
+        if bars.is_empty() {
+            return;
+        }
         self.shared_minutes.retain(|(key, _)| key != binding);
-        self.shared_minutes.push_back((binding.clone(), bars.to_vec()));
-        while self.shared_minutes.len() > MAX_SUBSCRIPTIONS { self.shared_minutes.pop_front(); }
+        self.shared_minutes
+            .push_back((binding.clone(), bars.to_vec()));
+        while self.shared_minutes.len() > MAX_SUBSCRIPTIONS {
+            self.shared_minutes.pop_front();
+        }
     }
 }
 
-pub(super) fn merge_shared_minutes(cached: Option<Vec<PublicBar>>, fresh: Vec<PublicBar>, generation: u64) -> Vec<PublicBar> {
+pub(super) fn merge_shared_minutes(
+    cached: Option<Vec<PublicBar>>,
+    fresh: Vec<PublicBar>,
+    generation: u64,
+) -> Vec<PublicBar> {
     let cached = if let (Some(previous), Some(next)) =
-        (cached.as_ref().and_then(|bars| bars.last()), fresh.first()) {
+        (cached.as_ref().and_then(|bars| bars.last()), fresh.first())
+    {
         if previous.open_time_ms.saturating_add(previous.interval_ms) < next.open_time_ms {
             None
-        } else { cached }
-    } else { cached };
+        } else {
+            cached
+        }
+    } else {
+        cached
+    };
     let mut by_open = BTreeMap::new();
     for mut bar in cached.into_iter().flatten().chain(fresh) {
         bar.generation = generation;
         by_open.insert(bar.open_time_ms, bar);
     }
-    by_open.into_values().rev().take(1_500).collect::<Vec<_>>()
-        .into_iter().rev().collect()
+    by_open
+        .into_values()
+        .rev()
+        .take(1_500)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
 }
 
 pub(super) fn missing_limit(
@@ -91,11 +121,16 @@ pub(super) fn merge_latest(
 ) -> Vec<PublicBar> {
     // A long offline gap cannot be drawn as if old and new candles were adjacent.
     let cached = if let (Some(previous), Some(next)) =
-        (cached.as_ref().and_then(|bars| bars.last()), fresh.first()) {
+        (cached.as_ref().and_then(|bars| bars.last()), fresh.first())
+    {
         if previous.open_time_ms.saturating_add(previous.interval_ms) < next.open_time_ms {
             None
-        } else { cached }
-    } else { cached };
+        } else {
+            cached
+        }
+    } else {
+        cached
+    };
     let mut by_open = BTreeMap::new();
     for mut bar in cached.into_iter().flatten().chain(fresh) {
         bar.generation = generation;
@@ -193,21 +228,41 @@ pub(super) fn start_shared(
                     continue;
                 }
             };
-            let selection = MarketSelection { binding: request.binding.clone(), interval: request.interval };
-            let valid = request.generation != 0 && selection.validate().is_ok()
-                && matches!(request.interval, ChartInterval::OneMinute | ChartInterval::OneDay);
-            let demanded = source_is_requested(&source_demands.borrow(),
-                &request.binding, request.interval);
-            let cached = (valid && demanded).then(|| public_cache::PublicHistoryCache::local()
-                .and_then(|cache| cache.page(&selection, request.before, request.generation))
-                .filter(|bars| crate::market::history_page_covers_gap(
-                    bars, request.before, request.gap_after)))
+            let selection = MarketSelection {
+                binding: request.binding.clone(),
+                interval: request.interval,
+            };
+            let valid = request.generation != 0
+                && selection.validate().is_ok()
+                && matches!(
+                    request.interval,
+                    ChartInterval::OneMinute | ChartInterval::OneDay
+                );
+            let demanded =
+                source_is_requested(&source_demands.borrow(), &request.binding, request.interval);
+            let cached = (valid && demanded)
+                .then(|| {
+                    public_cache::PublicHistoryCache::local()
+                        .and_then(|cache| {
+                            cache.page(&selection, request.before, request.generation)
+                        })
+                        .filter(|bars| {
+                            crate::market::history_page_covers_gap(
+                                bars,
+                                request.before,
+                                request.gap_after,
+                            )
+                        })
+                })
                 .flatten();
             let cache_hit = cached.is_some();
-            let result = if !valid { Err("invalid shared history scope".to_owned()) }
-            else if !demanded { Err("shared source has no consumer".to_owned()) }
-            else if let Some(bars) = cached { Ok(bars) }
-            else {
+            let result = if !valid {
+                Err("invalid shared history scope".to_owned())
+            } else if !demanded {
+                Err("shared source has no consumer".to_owned())
+            } else if let Some(bars) = cached {
+                Ok(bars)
+            } else {
                 tokio::select! {
                     result = fetch_history_inner(&http, &selection, request.generation, 500,
                         Some(request.before), request.gap_after) =>
@@ -216,8 +271,15 @@ pub(super) fn start_shared(
                         request.interval) => Err("shared source has no consumer".to_owned()),
                 }
             };
-            if events.send_timeout(LocalMarketClientEvent::SharedHistory { request, result },
-                COMMAND_SEND_TIMEOUT).is_err() { return; }
+            if events
+                .send_timeout(
+                    LocalMarketClientEvent::SharedHistory { request, result },
+                    COMMAND_SEND_TIMEOUT,
+                )
+                .is_err()
+            {
+                return;
+            }
             tokio::time::sleep(Duration::from_millis(if cache_hit { 10 } else { 200 })).await;
         }
     });
@@ -263,7 +325,10 @@ mod tests {
             missing_limit(Some(&cached), ChartInterval::OneMinute, 300_500),
             4
         );
-        assert_eq!(missing_limit(None, ChartInterval::OneMinute, 300_500), INITIAL_VISIBLE_HISTORY_LIMIT);
+        assert_eq!(
+            missing_limit(None, ChartInterval::OneMinute, 300_500),
+            INITIAL_VISIBLE_HISTORY_LIMIT
+        );
         assert_eq!(
             missing_limit(Some(&cached), ChartInterval::OneMinute, 90_000_000),
             INITIAL_VISIBLE_HISTORY_LIMIT

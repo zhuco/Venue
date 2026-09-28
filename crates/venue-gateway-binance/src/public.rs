@@ -858,7 +858,11 @@ pub fn parse_public_mark_funding(
 ) -> Result<BinancePublicEnvelope<MarkFunding>, BinancePublicError> {
     let (object, expected_native) =
         public_market_stream_object(payload, binding, generation, "markPriceUpdate")?;
-    if object.get("st").and_then(Value::as_u64).is_some_and(|kind| kind != 1) {
+    if object
+        .get("st")
+        .and_then(Value::as_u64)
+        .is_some_and(|kind| kind != 1)
+    {
         return Err(BinancePublicError::Binding);
     }
     let exchange_event_time_ms = positive_u64(object.get("E"))?;
@@ -905,24 +909,34 @@ pub fn parse_public_open_interest_current(
     generation: u64,
     received_at_ms: u64,
 ) -> Result<OpenInterestSample, BinancePublicError> {
-    binding.validate().map_err(|_| BinancePublicError::Binding)?;
-    if generation == 0 || received_at_ms == 0 { return Err(BinancePublicError::Generation) }
+    binding
+        .validate()
+        .map_err(|_| BinancePublicError::Binding)?;
+    if generation == 0 || received_at_ms == 0 {
+        return Err(BinancePublicError::Generation);
+    }
     let value: Value = serde_json::from_str(payload).map_err(|_| BinancePublicError::Payload)?;
     let object = value.as_object().ok_or(BinancePublicError::Payload)?;
     check_symbol(object.get("symbol"), &native_symbol(&binding.symbol))?;
     let quantity = non_negative_decimal(object.get("openInterest"))?;
     let sample = OpenInterestSample {
-        symbol: binding.symbol.clone(), generation, received_at_ms,
+        symbol: binding.symbol.clone(),
+        generation,
+        received_at_ms,
         exchange_time_ms: positive_u64(object.get("time"))?,
         time_source: venue_domain::MarketTimeSource::Exchange,
         sampling_interval_ms: None,
         native_quantity: quantity,
         native_unit: OpenInterestUnit::BaseAsset,
         base_quantity: FieldState::Known(quantity),
-        quote_notional: FieldState::Unavailable { reason: UnknownReason::SourceOmitted },
+        quote_notional: FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        },
         quote_asset: None,
     };
-    if !sample.is_valid() { return Err(BinancePublicError::Value) }
+    if !sample.is_valid() {
+        return Err(BinancePublicError::Value);
+    }
     Ok(sample)
 }
 
@@ -933,22 +947,34 @@ pub fn parse_public_open_interest_history(
     generation: u64,
     received_at_ms: u64,
 ) -> Result<Vec<OpenInterestSample>, BinancePublicError> {
-    binding.validate().map_err(|_| BinancePublicError::Binding)?;
-    if generation == 0 || received_at_ms == 0 { return Err(BinancePublicError::Generation) }
+    binding
+        .validate()
+        .map_err(|_| BinancePublicError::Binding)?;
+    if generation == 0 || received_at_ms == 0 {
+        return Err(BinancePublicError::Generation);
+    }
     let value: Value = serde_json::from_str(payload).map_err(|_| BinancePublicError::Payload)?;
-    let rows = value.as_array().filter(|rows| rows.len() <= 500).ok_or(BinancePublicError::Payload)?;
+    let rows = value
+        .as_array()
+        .filter(|rows| rows.len() <= 500)
+        .ok_or(BinancePublicError::Payload)?;
     let mut samples = Vec::with_capacity(rows.len());
     for row in rows {
         let object = row.as_object().ok_or(BinancePublicError::Payload)?;
         check_symbol(object.get("symbol"), &native_symbol(&binding.symbol))?;
         let time = positive_u64(object.get("timestamp"))?;
-        if samples.last().is_some_and(|previous: &OpenInterestSample| previous.exchange_time_ms >= time) {
+        if samples
+            .last()
+            .is_some_and(|previous: &OpenInterestSample| previous.exchange_time_ms >= time)
+        {
             return Err(BinancePublicError::Sequence);
         }
         let quantity = non_negative_decimal(object.get("sumOpenInterest"))?;
         let notional = non_negative_decimal(object.get("sumOpenInterestValue"))?;
         let sample = OpenInterestSample {
-            symbol: binding.symbol.clone(), generation, received_at_ms,
+            symbol: binding.symbol.clone(),
+            generation,
+            received_at_ms,
             exchange_time_ms: time,
             time_source: venue_domain::MarketTimeSource::Exchange,
             sampling_interval_ms: Some(300_000),
@@ -958,7 +984,9 @@ pub fn parse_public_open_interest_history(
             quote_notional: FieldState::Known(notional),
             quote_asset: Some(binding.symbol.quote().to_owned()),
         };
-        if !sample.is_valid() { return Err(BinancePublicError::Value) }
+        if !sample.is_valid() {
+            return Err(BinancePublicError::Value);
+        }
         samples.push(sample);
     }
     Ok(samples)
@@ -1508,39 +1536,72 @@ mod public_market_tests {
     }
 
     #[test]
-    fn mark_funding_is_bound_to_exact_usdm_symbol_and_preserves_rate() -> Result<(), Box<dyn std::error::Error>> {
+    fn mark_funding_is_bound_to_exact_usdm_symbol_and_preserves_rate()
+    -> Result<(), Box<dyn std::error::Error>> {
         let binding = binding()?;
         let frame = r#"{"stream":"btcusdt@markPrice@1s","data":{"e":"markPriceUpdate","E":1000,"s":"BTCUSDT","p":"100","i":"99","P":"0","r":"-0.0001","T":10000,"st":1}}"#;
         let parsed = parse_public_mark_funding(frame, &binding, 7, 1001)?;
         assert_eq!(parsed.fact().funding_rate, Decimal::new(-1, 4));
         assert_eq!(parsed.fact().next_funding_time_ms, Some(10_000));
-        assert_eq!(parsed.fact().estimated_settle_price, FieldState::NotApplicable);
-        assert!(parse_public_mark_funding(frame.replace("BTCUSDT", "BTCUSDC").as_str(), &binding, 7, 1001).is_err());
-        assert!(parse_public_mark_funding(frame.replace("\"st\":1", "\"st\":2").as_str(), &binding, 7, 1001).is_err());
+        assert_eq!(
+            parsed.fact().estimated_settle_price,
+            FieldState::NotApplicable
+        );
+        assert!(
+            parse_public_mark_funding(
+                frame.replace("BTCUSDT", "BTCUSDC").as_str(),
+                &binding,
+                7,
+                1001
+            )
+            .is_err()
+        );
+        assert!(
+            parse_public_mark_funding(
+                frame.replace("\"st\":1", "\"st\":2").as_str(),
+                &binding,
+                7,
+                1001
+            )
+            .is_err()
+        );
         Ok(())
     }
 
     #[test]
-    fn dogeusdc_open_interest_keeps_native_symbol_and_five_minute_cadence() -> Result<(), Box<dyn std::error::Error>> {
+    fn dogeusdc_open_interest_keeps_native_symbol_and_five_minute_cadence()
+    -> Result<(), Box<dyn std::error::Error>> {
         let binding = PublicMarketBinding::binance_usds_m("DOGE/USDC".parse()?)?;
         let current = parse_public_open_interest_current(
             r#"{"symbol":"DOGEUSDC","openInterest":"123.5","time":600000}"#,
-            &binding, 7, 600001,
+            &binding,
+            7,
+            600001,
         )?;
-        assert_eq!(current.base_quantity, FieldState::Known(Decimal::new(1235, 1)));
+        assert_eq!(
+            current.base_quantity,
+            FieldState::Known(Decimal::new(1235, 1))
+        );
         assert_eq!(current.sampling_interval_ms, None);
         assert_eq!(current.quote_asset, None);
         let history = parse_public_open_interest_history(
             r#"[{"symbol":"DOGEUSDC","sumOpenInterest":"100","sumOpenInterestValue":"20","timestamp":300000},{"symbol":"DOGEUSDC","sumOpenInterest":"123.5","sumOpenInterestValue":"24.7","timestamp":600000}]"#,
-            &binding, 7, 600001,
+            &binding,
+            7,
+            600001,
         )?;
         assert_eq!(history.len(), 2);
         assert_eq!(history[1].sampling_interval_ms, Some(300_000));
         assert_eq!(history[1].quote_asset.as_deref(), Some("USDC"));
-        assert!(parse_public_open_interest_current(
-            r#"{"symbol":"DOGEUSDT","openInterest":"123.5","time":600000}"#,
-            &binding, 7, 600001,
-        ).is_err());
+        assert!(
+            parse_public_open_interest_current(
+                r#"{"symbol":"DOGEUSDT","openInterest":"123.5","time":600000}"#,
+                &binding,
+                7,
+                600001,
+            )
+            .is_err()
+        );
         Ok(())
     }
 

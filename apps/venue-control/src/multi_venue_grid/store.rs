@@ -294,14 +294,22 @@ impl StrategyGridStore {
             let config: StrategyGridConfig =
                 serde_json::from_value(row.try_get("config").map_err(|_| Error::Conflict)?)
                     .map_err(|_| Error::Conflict)?;
-            let transition = super::progress::advance(
-                decode_progress(&row)?,
-                super::progress::ProgressEvent::Pending,
-                &config.planner.reset_policy,
-                now,
-            )
-            .ok_or(Error::Invalid)?;
             let id: String = row.try_get("instance_id").map_err(|_| Error::Conflict)?;
+            let progress = decode_progress(&row)?;
+            let last_reconciled: Option<i64> = sqlx::query_scalar(
+                "SELECT MAX(terminal_ms) FROM venue_binance_commands WHERE trading_account_id=$1 AND strategy_command->'payload'->'owner'->>'strategy_instance_id'=$2 AND command_state='reconciled' AND native_order_id IS NOT NULL AND terminal_ms>$3 AND terminal_ms<=$4",
+            ).bind(account).bind(&id)
+                .bind(progress.pending_since_ms.map(ms).transpose()?.unwrap_or(ms(now)?))
+                .bind(ms(now)?).fetch_one(&mut *tx).await.map_err(|_| Error::Unavailable)?;
+            let event = match last_reconciled {
+                Some(observed) => super::progress::ProgressEvent::ReconciledAt(
+                    u64::try_from(observed).map_err(|_| Error::Conflict)?,
+                ),
+                None => super::progress::ProgressEvent::Pending,
+            };
+            let transition =
+                super::progress::advance(progress, event, &config.planner.reset_policy, now)
+                    .ok_or(Error::Invalid)?;
             sqlx::query("UPDATE venue_strategy_grids SET lifecycle=CASE WHEN $1 THEN 'pausing' ELSE lifecycle END,convergence_pending_since_ms=$2,consecutive_failures=$3,blocked_reason=CASE WHEN $1 THEN 'convergence_timeout' ELSE blocked_reason END,updated_ms=$4 WHERE instance_id=$5")
                 .bind(transition.pause).bind(transition.progress.pending_since_ms.map(ms).transpose()?)
                 .bind(i32::try_from(transition.progress.consecutive_failures).map_err(|_| Error::Invalid)?)

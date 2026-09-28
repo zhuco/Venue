@@ -101,10 +101,19 @@ pub struct SessionDisplay {
 impl Default for SessionDisplay {
     fn default() -> Self {
         Self {
-            sr_current: true, sr_15m: false, sr_1h: false, sr_1d: false,
-            pdh: true, pdl: true, pwh: false, pwl: false,
-            daily_open: false, weekly_open: false,
-            daily_pivot: false, weekly_pivot: false, pivot_r3_s3: false,
+            sr_current: true,
+            sr_15m: false,
+            sr_1h: false,
+            sr_1d: false,
+            pdh: true,
+            pdl: true,
+            pwh: false,
+            pwl: false,
+            daily_open: false,
+            weekly_open: false,
+            daily_pivot: false,
+            weekly_pivot: false,
+            pivot_r3_s3: false,
         }
     }
 }
@@ -126,10 +135,18 @@ pub struct ProfileDisplay {
 
 impl Default for ProfileDisplay {
     fn default() -> Self {
-        Self { visible_range: false, fixed_range: false,
-            fixed_start_ms: 0, fixed_end_ms: 0, tick_multiple: 1,
-            width_percent: 20, opacity_percent: 50,
-            poc: true, vah: true, val: true }
+        Self {
+            visible_range: false,
+            fixed_range: false,
+            fixed_start_ms: 0,
+            fixed_end_ms: 0,
+            tick_multiple: 1,
+            width_percent: 20,
+            opacity_percent: 50,
+            poc: true,
+            vah: true,
+            val: true,
+        }
     }
 }
 
@@ -268,16 +285,26 @@ impl Default for ChartDisplaySettings {
 
 impl ChartDisplaySettings {
     pub fn needs_minute_source(&self, has_anchor: bool) -> bool {
-        self.microstructure.heatmap || self.microstructure.show_delta
-            || self.microstructure.show_cvd || self.profile.visible_range
-            || self.profile.fixed_range || self.session.sr_15m || self.session.sr_1h
+        self.microstructure.heatmap
+            || self.microstructure.show_delta
+            || self.microstructure.show_cvd
+            || self.profile.visible_range
+            || self.profile.fixed_range
+            || self.session.sr_15m
+            || self.session.sr_1h
             || has_anchor
     }
 
     pub fn needs_day_source(&self) -> bool {
         let session = &self.session;
-        session.sr_1d || session.pdh || session.pdl || session.pwh || session.pwl
-            || session.daily_open || session.weekly_open || session.daily_pivot
+        session.sr_1d
+            || session.pdh
+            || session.pdl
+            || session.pwh
+            || session.pwl
+            || session.daily_open
+            || session.weekly_open
+            || session.daily_pivot
             || session.weekly_pivot
     }
 
@@ -288,10 +315,12 @@ impl ChartDisplaySettings {
     }
     pub fn validate(&self) -> Result<(), &'static str> {
         self.microstructure.validate()?;
-        if self.profile.tick_multiple == 0 || self.profile.tick_multiple > 1_000
+        if self.profile.tick_multiple == 0
+            || self.profile.tick_multiple > 1_000
             || !(10..=35).contains(&self.profile.width_percent)
             || !(10..=80).contains(&self.profile.opacity_percent)
-            || (self.profile.fixed_range && self.profile.fixed_end_ms != 0
+            || (self.profile.fixed_range
+                && self.profile.fixed_end_ms != 0
                 && self.profile.fixed_start_ms >= self.profile.fixed_end_ms)
         {
             return Err("Profile 桶宽、透明度或固定时间范围无效");

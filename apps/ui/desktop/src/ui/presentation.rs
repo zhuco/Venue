@@ -4,12 +4,17 @@ use eframe::egui;
 
 use crate::trading::DisplayCadence;
 
-pub(super) fn funding_display(funding: &venue_domain::MarkFunding, now_ms: u64,
-    language: crate::i18n::Language) -> (String, String) {
+pub(super) fn funding_display(
+    funding: &venue_domain::MarkFunding,
+    now_ms: u64,
+    language: crate::i18n::Language,
+) -> (String, String) {
     let zh = language == crate::i18n::Language::SimplifiedChinese;
-    let percent = |rate: rust_decimal::Decimal| rate.checked_mul(rust_decimal::Decimal::from(100))
-        .map(|value| format!("{}%", crate::model::format_decimal(value, 4)))
-        .unwrap_or_else(|| "—".to_owned());
+    let percent = |rate: rust_decimal::Decimal| {
+        rate.checked_mul(rust_decimal::Decimal::from(100))
+            .map(|value| format!("{}%", crate::model::format_decimal(value, 4)))
+            .unwrap_or_else(|| "—".to_owned())
+    };
     let rate = percent(funding.funding_rate);
     let predicted = match &funding.predicted_funding_rate {
         venue_domain::FieldState::Known(value) => percent(*value),
@@ -24,76 +29,172 @@ pub(super) fn funding_display(funding: &venue_domain::MarkFunding, now_ms: u64,
         Some(_) => "awaiting update".to_owned(),
         None => "—".to_owned(),
     };
-    let stale = now_ms < funding.received_at_ms
-        || now_ms.saturating_sub(funding.received_at_ms) > 45_000;
-    let label = format!("Funding {rate} · {settlement}{}", if stale { " · stale" } else { "" });
+    let stale =
+        now_ms < funding.received_at_ms || now_ms.saturating_sub(funding.received_at_ms) > 45_000;
+    let label = format!(
+        "Funding {rate} · {settlement}{}",
+        if stale { " · stale" } else { "" }
+    );
     let source = if funding.time_source == venue_domain::MarketTimeSource::Exchange {
         if zh { "交易所" } else { "exchange" }
-    } else if zh { "本机观察" } else { "local observation" };
-    let tooltip = if zh {
-        format!("当前费率：{rate}\n预测费率：{predicted}\n数据时间：{} ms UTC（{source}）\n下一结算：{}\n结算周期：当前公共来源未提供；按下一结算时间显示倒计时",
-            funding.exchange_time_ms,
-            funding.next_funding_time_ms.map_or_else(|| "—".to_owned(), |value| format!("{value} ms UTC")))
+    } else if zh {
+        "本机观察"
     } else {
-        format!("Current rate: {rate}\nPredicted rate: {predicted}\nData time: {} ms UTC ({source})\nNext settlement: {}\nSettlement interval: unavailable from this public source; countdown uses the next settlement timestamp",
+        "local observation"
+    };
+    let tooltip = if zh {
+        format!(
+            "当前费率：{rate}\n预测费率：{predicted}\n数据时间：{} ms UTC（{source}）\n下一结算：{}\n结算周期：当前公共来源未提供；按下一结算时间显示倒计时",
             funding.exchange_time_ms,
-            funding.next_funding_time_ms.map_or_else(|| "—".to_owned(), |value| format!("{value} ms UTC")))
+            funding
+                .next_funding_time_ms
+                .map_or_else(|| "—".to_owned(), |value| format!("{value} ms UTC"))
+        )
+    } else {
+        format!(
+            "Current rate: {rate}\nPredicted rate: {predicted}\nData time: {} ms UTC ({source})\nNext settlement: {}\nSettlement interval: unavailable from this public source; countdown uses the next settlement timestamp",
+            funding.exchange_time_ms,
+            funding
+                .next_funding_time_ms
+                .map_or_else(|| "—".to_owned(), |value| format!("{value} ms UTC"))
+        )
     };
     (label, tooltip)
 }
 
-pub(super) fn open_interest_display(interest: &venue_domain::OpenInterestSample, now_ms: u64,
-    language: crate::i18n::Language) -> (String, String) {
+pub(super) fn open_interest_display(
+    interest: &venue_domain::OpenInterestSample,
+    now_ms: u64,
+    language: crate::i18n::Language,
+) -> (String, String) {
     let zh = language == crate::i18n::Language::SimplifiedChinese;
-    let stale = now_ms < interest.received_at_ms
-        || now_ms.saturating_sub(interest.received_at_ms) > 45_000;
+    let stale =
+        now_ms < interest.received_at_ms || now_ms.saturating_sub(interest.received_at_ms) > 45_000;
     let (value, reason) = match &interest.base_quantity {
         venue_domain::FieldState::Known(quantity) => {
-            let decimals = if *quantity >= rust_decimal::Decimal::from(1_000) { 2 }
-                else if *quantity >= rust_decimal::Decimal::ONE { 4 } else { 8 };
-            (format!("{} {}", quantity.round_dp(decimals).normalize(), interest.symbol.base()), None)
+            let decimals = if *quantity >= rust_decimal::Decimal::from(1_000) {
+                2
+            } else if *quantity >= rust_decimal::Decimal::ONE {
+                4
+            } else {
+                8
+            };
+            (
+                format!(
+                    "{} {}",
+                    quantity.round_dp(decimals).normalize(),
+                    interest.symbol.base()
+                ),
+                None,
+            )
         }
-        venue_domain::FieldState::Missing =>
-            ("—".to_owned(), Some(if zh { "来源未提供" } else { "source omitted" })),
-        venue_domain::FieldState::Null =>
-            ("—".to_owned(), Some(if zh { "来源返回空值" } else { "source returned null" })),
-        venue_domain::FieldState::Unavailable { reason } =>
-            ("—".to_owned(), Some(match reason {
-                venue_domain::UnknownReason::SourceOmitted => if zh { "来源未提供" } else { "source omitted" },
-                venue_domain::UnknownReason::PermissionDenied => if zh { "无读取权限" } else { "permission denied" },
-                venue_domain::UnknownReason::VenueUnavailable => if zh { "交易所暂不可用" } else { "venue unavailable" },
-                venue_domain::UnknownReason::ParseFailure => if zh { "来源数值无法解析" } else { "source value could not be parsed" },
-                venue_domain::UnknownReason::Ambiguous => if zh { "合约单位不明确" } else { "contract unit ambiguous" },
-                venue_domain::UnknownReason::NotYetObserved => if zh { "尚未观察到" } else { "not yet observed" },
-            })),
-        venue_domain::FieldState::NotApplicable =>
-            ("—".to_owned(), Some(if zh { "不适用" } else { "not applicable" })),
+        venue_domain::FieldState::Missing => (
+            "—".to_owned(),
+            Some(if zh {
+                "来源未提供"
+            } else {
+                "source omitted"
+            }),
+        ),
+        venue_domain::FieldState::Null => (
+            "—".to_owned(),
+            Some(if zh {
+                "来源返回空值"
+            } else {
+                "source returned null"
+            }),
+        ),
+        venue_domain::FieldState::Unavailable { reason } => (
+            "—".to_owned(),
+            Some(match reason {
+                venue_domain::UnknownReason::SourceOmitted => {
+                    if zh {
+                        "来源未提供"
+                    } else {
+                        "source omitted"
+                    }
+                }
+                venue_domain::UnknownReason::PermissionDenied => {
+                    if zh {
+                        "无读取权限"
+                    } else {
+                        "permission denied"
+                    }
+                }
+                venue_domain::UnknownReason::VenueUnavailable => {
+                    if zh {
+                        "交易所暂不可用"
+                    } else {
+                        "venue unavailable"
+                    }
+                }
+                venue_domain::UnknownReason::ParseFailure => {
+                    if zh {
+                        "来源数值无法解析"
+                    } else {
+                        "source value could not be parsed"
+                    }
+                }
+                venue_domain::UnknownReason::Ambiguous => {
+                    if zh {
+                        "合约单位不明确"
+                    } else {
+                        "contract unit ambiguous"
+                    }
+                }
+                venue_domain::UnknownReason::NotYetObserved => {
+                    if zh {
+                        "尚未观察到"
+                    } else {
+                        "not yet observed"
+                    }
+                }
+            }),
+        ),
+        venue_domain::FieldState::NotApplicable => (
+            "—".to_owned(),
+            Some(if zh { "不适用" } else { "not applicable" }),
+        ),
     };
     let source = if interest.time_source == venue_domain::MarketTimeSource::Exchange {
         if zh { "交易所" } else { "exchange" }
-    } else if zh { "本机观察" } else { "local observation" };
+    } else if zh {
+        "本机观察"
+    } else {
+        "local observation"
+    };
     let unit = match &interest.native_unit {
         venue_domain::OpenInterestUnit::BaseAsset => "base asset",
         venue_domain::OpenInterestUnit::Contracts { .. } => "contracts",
     };
     let label = format!("OI {value}{}", if stale { " · stale" } else { "" });
     let tooltip = if zh {
-        format!("当前 OI 时间：{} ms UTC（{source}）\n原生数量：{} {unit}{}",
-            interest.exchange_time_ms, interest.native_quantity,
-            reason.map_or_else(String::new, |value| format!("\n基础币数量不可用：{value}")))
+        format!(
+            "当前 OI 时间：{} ms UTC（{source}）\n原生数量：{} {unit}{}",
+            interest.exchange_time_ms,
+            interest.native_quantity,
+            reason.map_or_else(String::new, |value| format!("\n基础币数量不可用：{value}"))
+        )
     } else {
-        format!("Current OI time: {} ms UTC ({source})\nNative: {} {unit}{}",
-            interest.exchange_time_ms, interest.native_quantity,
-            reason.map_or_else(String::new, |value| format!("\nBase quantity unavailable: {value}")))
+        format!(
+            "Current OI time: {} ms UTC ({source})\nNative: {} {unit}{}",
+            interest.exchange_time_ms,
+            interest.native_quantity,
+            reason.map_or_else(String::new, |value| format!(
+                "\nBase quantity unavailable: {value}"
+            ))
+        )
     };
     (label, tooltip)
 }
 
 pub(super) fn open_interest_history_stale(
-    last: Option<&venue_domain::OpenInterestSample>, now_ms: u64,
+    last: Option<&venue_domain::OpenInterestSample>,
+    now_ms: u64,
 ) -> bool {
-    last.is_some_and(|sample| now_ms < sample.exchange_time_ms
-        || now_ms.saturating_sub(sample.exchange_time_ms) > 900_000)
+    last.is_some_and(|sample| {
+        now_ms < sample.exchange_time_ms || now_ms.saturating_sub(sample.exchange_time_ms) > 900_000
+    })
 }
 
 #[derive(Clone)]

@@ -19,38 +19,83 @@ pub(super) fn apply(
     match event {
         LocalMarketClientEvent::SharedHistory { request, result } => {
             if request.generation != model.local_markets.generation()
-                || request.binding.venue != server.venue() { return; }
+                || request.binding.venue != server.venue()
+            {
+                return;
+            }
             if let Err(error) = model.local_markets.finish_shared_history(&request, result) {
                 model.notice(format!("Shared market history rejected: {error}"));
-            } else { context.request_repaint(); }
+            } else {
+                context.request_repaint();
+            }
         }
-        LocalMarketClientEvent::SessionDayHistory { generation, binding, bars, forming } => {
-            if generation != model.local_markets.generation() || binding.venue != server.venue() { return; }
-            if let Err(error) = model.local_markets.apply_session_history(generation, binding, bars, forming) {
+        LocalMarketClientEvent::SessionDayHistory {
+            generation,
+            binding,
+            bars,
+            forming,
+        } => {
+            if generation != model.local_markets.generation() || binding.venue != server.venue() {
+                return;
+            }
+            if let Err(error) = model
+                .local_markets
+                .apply_session_history(generation, binding, bars, forming)
+            {
                 model.notice(format!("Session day history rejected: {error}"));
             } else {
                 context.request_repaint();
             }
         }
-        LocalMarketClientEvent::SessionDayBar { generation, binding, bar, confirmed } => {
-            if generation != model.local_markets.generation() || binding.venue != server.venue() { return; }
-            if let Err(error) = model.local_markets.apply_session_day(generation, binding, bar, confirmed) {
+        LocalMarketClientEvent::SessionDayBar {
+            generation,
+            binding,
+            bar,
+            confirmed,
+        } => {
+            if generation != model.local_markets.generation() || binding.venue != server.venue() {
+                return;
+            }
+            if let Err(error) = model
+                .local_markets
+                .apply_session_day(generation, binding, bar, confirmed)
+            {
                 model.notice(format!("Session day bar rejected: {error}"));
             } else {
                 context.request_repaint();
             }
         }
-        LocalMarketClientEvent::BaseMinuteHistory { generation, binding, bars, forming } => {
-            if generation != model.local_markets.generation() || binding.venue != server.venue() { return; }
-            if let Err(error) = model.local_markets.apply_base_history(generation, binding, bars, forming) {
+        LocalMarketClientEvent::BaseMinuteHistory {
+            generation,
+            binding,
+            bars,
+            forming,
+        } => {
+            if generation != model.local_markets.generation() || binding.venue != server.venue() {
+                return;
+            }
+            if let Err(error) = model
+                .local_markets
+                .apply_base_history(generation, binding, bars, forming)
+            {
                 model.notice(format!("Base 1m history rejected: {error}"));
             } else {
                 context.request_repaint();
             }
         }
-        LocalMarketClientEvent::BaseMinuteBar { generation, binding, bar, confirmed } => {
-            if generation != model.local_markets.generation() || binding.venue != server.venue() { return; }
-            if let Err(error) = model.local_markets.apply_base_minute(generation, binding, bar, confirmed) {
+        LocalMarketClientEvent::BaseMinuteBar {
+            generation,
+            binding,
+            bar,
+            confirmed,
+        } => {
+            if generation != model.local_markets.generation() || binding.venue != server.venue() {
+                return;
+            }
+            if let Err(error) = model
+                .local_markets
+                .apply_base_minute(generation, binding, bar, confirmed)
+            {
                 model.notice(format!("Base 1m bar rejected: {error}"));
             } else {
                 context.request_repaint();

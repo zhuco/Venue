@@ -691,6 +691,25 @@ pub fn prepare_exact_readback_by_client_id(
     })
 }
 
+/// A stored native ID remains queryable after Gate expires the client-text lookup. Both
+/// identities must match; the native route alone never proves ownership.
+pub(crate) fn prepare_exact_readback_with_native_id(
+    binding: &GateGatewayBinding,
+    rules: &GateContractRules,
+    client_order_id: &str,
+    native_order_id: Option<&str>,
+) -> Result<GateExactReadbackRequest, GateExecutionError> {
+    let mut request = prepare_exact_readback_by_client_id(binding, rules, client_order_id)?;
+    if let Some(native) = native_order_id {
+        if !valid_native_order_id(native) {
+            return Err(GateExecutionError::Readback);
+        }
+        request.expected.order_id = Some(native.to_owned());
+        request.endpoint = format!("{}/{}", endpoints::FUTURES_ORDER, native);
+    }
+    Ok(request)
+}
+
 pub fn prepare_price_readback_by_client_id(
     binding: &GateGatewayBinding,
     rules: &GateContractRules,
@@ -1409,6 +1428,42 @@ mod tests {
             Some("grid_long_1".to_owned())
         );
         assert_eq!(canonical_client_id_from_native("t-bad space"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn native_recovery_route_still_requires_both_order_identities()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (binding, rules) = facts()?;
+        let request =
+            prepare_exact_readback_with_native_id(&binding, &rules, "grid_long_1", Some("9001"))?;
+        assert_eq!(request.endpoint, "/futures/usdt/orders/9001");
+        let payload = ack_payload("finished", "cancelled");
+        assert!(
+            GateExactOrderReadback::from_response(
+                &binding,
+                &rules,
+                &request,
+                1_000,
+                1_001,
+                payload.clone(),
+            )
+            .is_ok()
+        );
+        for wrong in [
+            payload.replace("9001", "9002"),
+            payload.replace("grid_long_1", "other"),
+        ] {
+            assert!(
+                GateExactOrderReadback::from_response(
+                    &binding, &rules, &request, 1_000, 1_001, wrong,
+                )
+                .is_err()
+            );
+        }
+        assert!(prepare_exact_readback_with_native_id(
+            &binding, &rules, "grid_long_1", Some("../9001"),
+        ).is_err());
         Ok(())
     }
 

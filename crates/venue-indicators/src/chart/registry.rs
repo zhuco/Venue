@@ -35,8 +35,17 @@ impl ChartIndicatorId {
                 ChartIndicatorCategory::FlowLiquidity
             }
             Self::Bollinger | Self::Atr => ChartIndicatorCategory::Volatility,
-            Self::Ma | Self::Ema | Self::Wma | Self::Trix | Self::Macd | Self::Rsi
-            | Self::Kdj | Self::Cci | Self::StochRsi | Self::WilliamsR | Self::Dmi
+            Self::Ma
+            | Self::Ema
+            | Self::Wma
+            | Self::Trix
+            | Self::Macd
+            | Self::Rsi
+            | Self::Kdj
+            | Self::Cci
+            | Self::StochRsi
+            | Self::WilliamsR
+            | Self::Dmi
             | Self::Momentum => ChartIndicatorCategory::Traditional,
         }
     }
@@ -44,14 +53,28 @@ impl ChartIndicatorId {
     #[must_use]
     pub const fn short_label(self) -> &'static str {
         match self {
-            Self::Ma => "MA", Self::Ema => "EMA", Self::Wma => "WMA",
-            Self::Bollinger => "BOLL", Self::Vwap => "VWAP", Self::Avl => "AVL",
-            Self::Trix => "TRIX", Self::Sar => "SAR", Self::Supertrend => "SUPER",
-            Self::Volume => "VOL", Self::Macd => "MACD", Self::Rsi => "RSI",
-            Self::Mfi => "MFI", Self::Kdj => "KDJ", Self::Obv => "OBV",
-            Self::Cci => "CCI", Self::StochRsi => "StochRSI",
-            Self::WilliamsR => "WR", Self::Dmi => "DMI", Self::Momentum => "MTM",
-            Self::Emv => "EMV", Self::Atr => "ATR",
+            Self::Ma => "MA",
+            Self::Ema => "EMA",
+            Self::Wma => "WMA",
+            Self::Bollinger => "BOLL",
+            Self::Vwap => "VWAP",
+            Self::Avl => "AVL",
+            Self::Trix => "TRIX",
+            Self::Sar => "SAR",
+            Self::Supertrend => "SUPER",
+            Self::Volume => "VOL",
+            Self::Macd => "MACD",
+            Self::Rsi => "RSI",
+            Self::Mfi => "MFI",
+            Self::Kdj => "KDJ",
+            Self::Obv => "OBV",
+            Self::Cci => "CCI",
+            Self::StochRsi => "StochRSI",
+            Self::WilliamsR => "WR",
+            Self::Dmi => "DMI",
+            Self::Momentum => "MTM",
+            Self::Emv => "EMV",
+            Self::Atr => "ATR",
         }
     }
 

@@ -1,8 +1,8 @@
 use super::*;
 mod bybit_stream;
 use crate::model::MarketServer;
-use venue_gateway_api::display::{Book, Instrument, Quote};
 use venue_gateway_api::PublicMarketBinding;
+use venue_gateway_api::display::{Book, Instrument, Quote};
 pub(super) async fn ensure_clock(http: &reqwest::Client) -> Result<(), String> {
     // Refresh before the five-minute expiry, without a per-minute request or
     // simultaneous history/chart workers issuing duplicate time requests.
@@ -45,7 +45,10 @@ async fn candles(
     generation: u64,
     before: Option<u64>,
 ) -> Result<Vec<PublicBar>, String> {
-    candles_inner(server, http, instrument, selection, generation, before, None).await
+    candles_inner(
+        server, http, instrument, selection, generation, before, None,
+    )
+    .await
 }
 
 async fn candles_inner(
@@ -61,38 +64,57 @@ async fn candles_inner(
         && let Some(bars) = public_cache::PublicHistoryCache::local()
             .and_then(|cache| cache.page(selection, before, generation))
         && crate::market::history_page_covers_gap(&bars, before, gap_after)
-    { return Ok(bars); }
+    {
+        return Ok(bars);
+    }
     ensure_clock(http).await?;
     let ms = selection.interval.duration_ms();
     let now = now_ms();
     let cache = public_cache::PublicHistoryCache::local();
     let recent_last = if before.is_none() {
-        cache.as_ref().and_then(|cache| cache.recent_last_open(selection, generation))
-    } else { None };
-    let limit = if before.is_some() { 200 } else {
+        cache
+            .as_ref()
+            .and_then(|cache| cache.recent_last_open(selection, generation))
+    } else {
+        None
+    };
+    let limit = if before.is_some() {
+        200
+    } else {
         recent_last
             .map(|last| {
                 let current_open = now - now % ms;
-                usize::try_from(current_open.saturating_sub(last) / ms).unwrap_or(200)
-                    .saturating_add(1).clamp(2, 200)
+                usize::try_from(current_open.saturating_sub(last) / ms)
+                    .unwrap_or(200)
+                    .saturating_add(1)
+                    .clamp(2, 200)
             })
             .unwrap_or(INITIAL_VISIBLE_HISTORY_LIMIT)
     };
     let bars = match server {
         MarketServer::Bybit => {
-            venue_gateway_bybit::display::candles(http, instrument, ms, generation, now, before, limit)
-                .await
+            venue_gateway_bybit::display::candles(
+                http, instrument, ms, generation, now, before, limit,
+            )
+            .await
         }
         MarketServer::Bitget => {
-            venue_gateway_bitget::display::candles(http, instrument, ms, generation, now, before, limit)
-                .await
+            venue_gateway_bitget::display::candles(
+                http, instrument, ms, generation, now, before, limit,
+            )
+            .await
         }
         MarketServer::Gate => {
-            venue_gateway_gate::display::candles(http, instrument, ms, generation, now, before, limit)
-                .await
+            venue_gateway_gate::display::candles(
+                http, instrument, ms, generation, now, before, limit,
+            )
+            .await
         }
         MarketServer::Okx => {
-            venue_gateway_okx::display::candles(http, instrument, ms, generation, now, before, limit).await
+            venue_gateway_okx::display::candles(
+                http, instrument, ms, generation, now, before, limit,
+            )
+            .await
         }
         MarketServer::Hyperliquid => {
             venue_gateway_hyperliquid::display::candles(
@@ -103,17 +125,28 @@ async fn candles_inner(
         _ => Err("unsupported display source".into()),
     }?;
     if let Some(cache) = cache {
-        let closed = bars.iter().filter(|bar| bar.close_time_ms < now)
-            .cloned().collect::<Vec<_>>();
-        if let Some(before) = before { cache.remember_page(selection, before, &closed); }
-        else { cache.remember_recent(selection, &closed); }
+        let closed = bars
+            .iter()
+            .filter(|bar| bar.close_time_ms < now)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(before) = before {
+            cache.remember_page(selection, before, &closed);
+        } else {
+            cache.remember_recent(selection, &closed);
+        }
     }
     Ok(bars)
 }
 
-async fn initial_visible_history(server: MarketServer, http: &reqwest::Client,
-    instrument: &Instrument, selection: &MarketSelection, generation: u64,
-    fresh: Vec<PublicBar>) -> Vec<PublicBar> {
+async fn initial_visible_history(
+    server: MarketServer,
+    http: &reqwest::Client,
+    instrument: &Instrument,
+    selection: &MarketSelection,
+    generation: u64,
+    fresh: Vec<PublicBar>,
+) -> Vec<PublicBar> {
     let cached = public_cache::PublicHistoryCache::local()
         .and_then(|cache| cache.recent(selection, generation));
     let mut bars = history::merge_latest(cached, fresh, generation);
@@ -121,12 +154,19 @@ async fn initial_visible_history(server: MarketServer, http: &reqwest::Client,
         && let Some(first) = bars.first().map(|bar| bar.open_time_ms)
         && first > 0
     {
-        if let Ok(older) = candles(server, http, instrument, selection, generation, Some(first)).await {
+        if let Ok(older) =
+            candles(server, http, instrument, selection, generation, Some(first)).await
+        {
             bars = history::merge_latest(Some(older), bars, generation);
         }
     }
-    bars.into_iter().rev().take(INITIAL_VISIBLE_HISTORY_LIMIT)
-        .collect::<Vec<_>>().into_iter().rev().collect()
+    bars.into_iter()
+        .rev()
+        .take(INITIAL_VISIBLE_HISTORY_LIMIT)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
 }
 async fn book(
     server: MarketServer,
@@ -405,113 +445,232 @@ async fn subscription_loop(
                     Ok(mut quotes) => {
                         if server == MarketServer::Okx {
                             for quote in &mut quotes {
-                                let Some(selection) = selections.iter().find(|item| item.binding.symbol == quote.symbol) else { continue; };
-                                if derivative_due.get(&selection.binding).is_some_and(|until| *until > now_ms()) { continue; }
-                                let Some(instrument) = instruments.iter().find(|item| item.symbol == quote.symbol) else { continue; };
-                                match venue_gateway_okx::display::current_derivatives(http, instrument).await {
+                                let Some(selection) = selections
+                                    .iter()
+                                    .find(|item| item.binding.symbol == quote.symbol)
+                                else {
+                                    continue;
+                                };
+                                if derivative_due
+                                    .get(&selection.binding)
+                                    .is_some_and(|until| *until > now_ms())
+                                {
+                                    continue;
+                                }
+                                let Some(instrument) =
+                                    instruments.iter().find(|item| item.symbol == quote.symbol)
+                                else {
+                                    continue;
+                                };
+                                match venue_gateway_okx::display::current_derivatives(
+                                    http, instrument,
+                                )
+                                .await
+                                {
                                     Ok(value) => quote.derivatives = Some(value),
                                     Err(error) => {
-                                        derivative_due.insert(selection.binding.clone(), now_ms().saturating_add(15_000));
-                                        for target in selections.iter().filter(|item| item.binding == selection.binding) {
-                                            emitter.emit(LocalMarketClientEvent::Market(Box::new(MarketEnvelope {
-                                                generation, selection: target.clone(), event_time_ms: now_ms(),
-                                                received_ms: now_ms(), payload: MarketPayload::OpenInterestUnavailable(error.clone()),
-                                            })))?;
+                                        derivative_due.insert(
+                                            selection.binding.clone(),
+                                            now_ms().saturating_add(15_000),
+                                        );
+                                        for target in selections
+                                            .iter()
+                                            .filter(|item| item.binding == selection.binding)
+                                        {
+                                            emitter.emit(LocalMarketClientEvent::Market(
+                                                Box::new(MarketEnvelope {
+                                                    generation,
+                                                    selection: target.clone(),
+                                                    event_time_ms: now_ms(),
+                                                    received_ms: now_ms(),
+                                                    payload: MarketPayload::OpenInterestUnavailable(
+                                                        error.clone(),
+                                                    ),
+                                                }),
+                                            ))?;
                                         }
                                     }
                                 }
                             }
                         }
                         for quote in &quotes {
-                            let Some(derivative) = quote.derivatives.as_ref() else { continue; };
-                            let Some(binding) = selections.iter().find(|selection| selection.binding.symbol == quote.symbol)
-                                .map(|selection| selection.binding.clone()) else { continue; };
-                            if derivative_due.get(&binding).is_some_and(|until| *until > now_ms()) { continue; }
+                            let Some(derivative) = quote.derivatives.as_ref() else {
+                                continue;
+                            };
+                            let Some(binding) = selections
+                                .iter()
+                                .find(|selection| selection.binding.symbol == quote.symbol)
+                                .map(|selection| selection.binding.clone())
+                            else {
+                                continue;
+                            };
+                            if derivative_due
+                                .get(&binding)
+                                .is_some_and(|until| *until > now_ms())
+                            {
+                                continue;
+                            }
                             let mut local_current = None;
                             for selection in &selections {
-                                if selection.binding.symbol != quote.symbol { continue; }
+                                if selection.binding.symbol != quote.symbol {
+                                    continue;
+                                }
                                 let received = now_ms();
                                 let source_time = |native: u64| {
                                     if native > 0 && native <= received {
                                         Some((native, venue_domain::MarketTimeSource::Exchange))
                                     } else if native == 0 && derivative.use_local_observation_time {
-                                        Some((received, venue_domain::MarketTimeSource::LocalObservation))
-                                    } else { None }
+                                        Some((
+                                            received,
+                                            venue_domain::MarketTimeSource::LocalObservation,
+                                        ))
+                                    } else {
+                                        None
+                                    }
                                 };
-                                if let Some((rate, (event_time, time_source))) = derivative.funding_rate
-                                    .zip(source_time(derivative.funding_time_ms.unwrap_or(quote.time_ms))) {
-                                    let price = |value: Option<rust_decimal::Decimal>| value
-                                        .and_then(|value| venue_domain::Price::new(value).ok())
-                                        .map_or(venue_domain::FieldState::Unavailable {
-                                            reason: venue_domain::UnknownReason::SourceOmitted }, venue_domain::FieldState::Known);
-                                    let funding = venue_domain::MarkFunding { symbol: quote.symbol.clone(),
-                                        generation, received_at_ms: received, exchange_time_ms: event_time, time_source,
+                                if let Some((rate, (event_time, time_source))) =
+                                    derivative.funding_rate.zip(source_time(
+                                        derivative.funding_time_ms.unwrap_or(quote.time_ms),
+                                    ))
+                                {
+                                    let price = |value: Option<rust_decimal::Decimal>| {
+                                        value
+                                            .and_then(|value| venue_domain::Price::new(value).ok())
+                                            .map_or(
+                                                venue_domain::FieldState::Unavailable {
+                                                    reason:
+                                                        venue_domain::UnknownReason::SourceOmitted,
+                                                },
+                                                venue_domain::FieldState::Known,
+                                            )
+                                    };
+                                    let funding = venue_domain::MarkFunding {
+                                        symbol: quote.symbol.clone(),
+                                        generation,
+                                        received_at_ms: received,
+                                        exchange_time_ms: event_time,
+                                        time_source,
                                         next_funding_time_ms: derivative.next_funding_time_ms,
-                                        mark_price: price(derivative.mark_price), index_price: price(derivative.index_price),
+                                        mark_price: price(derivative.mark_price),
+                                        index_price: price(derivative.index_price),
                                         funding_rate: rate,
-                                        estimated_settle_price: venue_domain::FieldState::Unavailable {
-                                            reason: venue_domain::UnknownReason::SourceOmitted },
-                                        predicted_funding_rate: venue_domain::FieldState::Unavailable {
-                                            reason: venue_domain::UnknownReason::SourceOmitted },
-                                        unknown_reason: None };
-                                    emitter.emit(LocalMarketClientEvent::Market(Box::new(MarketEnvelope {
-                                        generation, selection: selection.clone(), event_time_ms: event_time,
-                                        received_ms: received, payload: MarketPayload::Funding(funding) })))?;
+                                        estimated_settle_price:
+                                            venue_domain::FieldState::Unavailable {
+                                                reason: venue_domain::UnknownReason::SourceOmitted,
+                                            },
+                                        predicted_funding_rate:
+                                            venue_domain::FieldState::Unavailable {
+                                                reason: venue_domain::UnknownReason::SourceOmitted,
+                                            },
+                                        unknown_reason: None,
+                                    };
+                                    emitter.emit(LocalMarketClientEvent::Market(Box::new(
+                                        MarketEnvelope {
+                                            generation,
+                                            selection: selection.clone(),
+                                            event_time_ms: event_time,
+                                            received_ms: received,
+                                            payload: MarketPayload::Funding(funding),
+                                        },
+                                    )))?;
                                 }
-                                if let Some((quantity, (event_time, time_source))) = derivative.open_interest_base
-                                    .zip(source_time(derivative.open_interest_time_ms.unwrap_or(quote.time_ms))) {
-                                    let sample = venue_domain::OpenInterestSample { symbol: quote.symbol.clone(),
-                                        generation, received_at_ms: received, exchange_time_ms: event_time, time_source,
+                                if let Some((quantity, (event_time, time_source))) =
+                                    derivative.open_interest_base.zip(source_time(
+                                        derivative.open_interest_time_ms.unwrap_or(quote.time_ms),
+                                    ))
+                                {
+                                    let sample = venue_domain::OpenInterestSample {
+                                        symbol: quote.symbol.clone(),
+                                        generation,
+                                        received_at_ms: received,
+                                        exchange_time_ms: event_time,
+                                        time_source,
                                         sampling_interval_ms: None,
-                                        native_quantity: derivative.open_interest_native_quantity.unwrap_or(quantity),
-                                        native_unit: derivative.open_interest_native_unit.clone().unwrap_or(venue_domain::OpenInterestUnit::BaseAsset),
+                                        native_quantity: derivative
+                                            .open_interest_native_quantity
+                                            .unwrap_or(quantity),
+                                        native_unit: derivative
+                                            .open_interest_native_unit
+                                            .clone()
+                                            .unwrap_or(venue_domain::OpenInterestUnit::BaseAsset),
                                         base_quantity: venue_domain::FieldState::Known(quantity),
                                         quote_notional: venue_domain::FieldState::Unavailable {
-                                            reason: venue_domain::UnknownReason::SourceOmitted }, quote_asset: None };
-                                    if matches!(server, MarketServer::Bitget | MarketServer::Hyperliquid)
-                                        && local_current.is_none() { local_current = Some(sample.clone()); }
-                                    emitter.emit(LocalMarketClientEvent::Market(Box::new(MarketEnvelope {
-                                        generation, selection: selection.clone(), event_time_ms: event_time,
-                                        received_ms: received, payload: MarketPayload::OpenInterestCurrent(sample) })))?;
+                                            reason: venue_domain::UnknownReason::SourceOmitted,
+                                        },
+                                        quote_asset: None,
+                                    };
+                                    if matches!(
+                                        server,
+                                        MarketServer::Bitget | MarketServer::Hyperliquid
+                                    ) && local_current.is_none()
+                                    {
+                                        local_current = Some(sample.clone());
+                                    }
+                                    emitter.emit(LocalMarketClientEvent::Market(Box::new(
+                                        MarketEnvelope {
+                                            generation,
+                                            selection: selection.clone(),
+                                            event_time_ms: event_time,
+                                            received_ms: received,
+                                            payload: MarketPayload::OpenInterestCurrent(sample),
+                                        },
+                                    )))?;
                                 }
                             }
                             if let Some(current) = local_current
                                 && let Some(samples) = public_cache::PublicHistoryCache::local()
-                                    .and_then(|cache| cache.observe_interest(&binding, generation, &current))
+                                    .and_then(|cache| {
+                                        cache.observe_interest(&binding, generation, &current)
+                                    })
                                 && let Some(last) = samples.last()
-                                && sampled_interest_seen.get(&binding) != Some(&last.exchange_time_ms)
+                                && sampled_interest_seen.get(&binding)
+                                    != Some(&last.exchange_time_ms)
                             {
-                                sampled_interest_seen.insert(binding.clone(), last.exchange_time_ms);
-                                for selection in selections.iter().filter(|selection| selection.binding == binding) {
-                                    emitter.emit(LocalMarketClientEvent::Market(Box::new(MarketEnvelope {
-                                        generation, selection: selection.clone(),
-                                        event_time_ms: last.exchange_time_ms,
-                                        received_ms: current.received_at_ms,
-                                        payload: MarketPayload::OpenInterestHistory(samples.clone()),
-                                    })))?;
+                                sampled_interest_seen
+                                    .insert(binding.clone(), last.exchange_time_ms);
+                                for selection in selections
+                                    .iter()
+                                    .filter(|selection| selection.binding == binding)
+                                {
+                                    emitter.emit(LocalMarketClientEvent::Market(Box::new(
+                                        MarketEnvelope {
+                                            generation,
+                                            selection: selection.clone(),
+                                            event_time_ms: last.exchange_time_ms,
+                                            received_ms: current.received_at_ms,
+                                            payload: MarketPayload::OpenInterestHistory(
+                                                samples.clone(),
+                                            ),
+                                        },
+                                    )))?;
                                 }
                             }
                             derivative_due.insert(binding, now_ms().saturating_add(15_000));
                         }
-                        emitter.emit(LocalMarketClientEvent::Quotes(quotes
-                            .into_iter()
-                            .map(|q| MarketQuote {
-                                symbol: q.symbol.to_string(),
-                                last: q.last,
-                                change_percent_24h: q.change_percent,
-                                quote_volume_24h: q.quote_volume,
-                                exchange_time_ms: q.time_ms,
-                                received_ms: now_ms(),
-                            })
-                            .collect()))?
-                    },
+                        emitter.emit(LocalMarketClientEvent::Quotes(
+                            quotes
+                                .into_iter()
+                                .map(|q| MarketQuote {
+                                    symbol: q.symbol.to_string(),
+                                    last: q.last,
+                                    change_percent_24h: q.change_percent,
+                                    quote_volume_24h: q.quote_volume,
+                                    exchange_time_ms: q.time_ms,
+                                    received_ms: now_ms(),
+                                })
+                                .collect(),
+                        ))?
+                    }
                     Err(e) => {
                         emitter.emit(LocalMarketClientEvent::QuotesUnavailable(e))?;
                     }
                 }
                 let mut public_snapshots = std::collections::BTreeMap::<
-                    PublicMarketBinding, (Book, Vec<PublicTrade>)>::new();
-                let mut visible_source_bars = std::collections::BTreeMap::<MarketSelection, Vec<PublicBar>>::new();
+                    PublicMarketBinding,
+                    (Book, Vec<PublicTrade>),
+                >::new();
+                let mut visible_source_bars =
+                    std::collections::BTreeMap::<MarketSelection, Vec<PublicBar>>::new();
                 for selection in &selections {
                     let Some(instrument) = instruments
                         .iter()
@@ -525,18 +684,29 @@ async fn subscription_loop(
                         )?;
                         continue;
                     };
-                    if !initialized.contains(selection) && !previewed.contains(selection)
+                    if !initialized.contains(selection)
+                        && !previewed.contains(selection)
                         && let Some(bars) = public_cache::PublicHistoryCache::local()
                             .and_then(|cache| cache.recent(selection, generation))
                         && !bars.is_empty()
                     {
-                        let bars = bars.into_iter().rev().take(INITIAL_VISIBLE_HISTORY_LIMIT)
-                            .collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>();
+                        let bars = bars
+                            .into_iter()
+                            .rev()
+                            .take(INITIAL_VISIBLE_HISTORY_LIMIT)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<Vec<_>>();
                         let received_ms = now_ms();
-                        let event_time_ms = bars.last()
+                        let event_time_ms = bars
+                            .last()
                             .map_or(received_ms, |bar| bar.close_time_ms.min(received_ms));
                         emitter.emit(LocalMarketClientEvent::Market(Box::new(MarketEnvelope {
-                            generation, selection: selection.clone(), event_time_ms, received_ms,
+                            generation,
+                            selection: selection.clone(),
+                            event_time_ms,
+                            received_ms,
                             payload: MarketPayload::RestHistory { bars },
                         })))?;
                         previewed.insert(selection.clone());
@@ -575,26 +745,64 @@ async fn subscription_loop(
                 }
                 let mut bindings = BTreeSet::new();
                 for selection in &selections {
-                    if !bindings.insert(selection.binding.clone()) { continue; }
-                    let Some(instrument) = instruments.iter().find(|item| item.symbol == selection.binding.symbol) else { continue; };
+                    if !bindings.insert(selection.binding.clone()) {
+                        continue;
+                    }
+                    let Some(instrument) = instruments
+                        .iter()
+                        .find(|item| item.symbol == selection.binding.symbol)
+                    else {
+                        continue;
+                    };
                     for interval in [ChartInterval::OneMinute, ChartInterval::OneDay] {
                         let shared_key = (selection.binding.clone(), interval);
                         let fresh = shared_initialized.contains(&shared_key);
-                        let due = if interval == ChartInterval::OneMinute { &mut shared_minute_due }
-                            else { &mut shared_day_due };
-                        let demand = source_demands.borrow().get(&selection.binding).copied()
-                            .unwrap_or(SharedSourceDemand { minute: true, day: true });
-                        if !(if interval == ChartInterval::OneMinute { demand.minute } else { demand.day }) {
+                        let due = if interval == ChartInterval::OneMinute {
+                            &mut shared_minute_due
+                        } else {
+                            &mut shared_day_due
+                        };
+                        let demand = source_demands
+                            .borrow()
+                            .get(&selection.binding)
+                            .copied()
+                            .unwrap_or(SharedSourceDemand {
+                                minute: true,
+                                day: true,
+                            });
+                        if !(if interval == ChartInterval::OneMinute {
+                            demand.minute
+                        } else {
+                            demand.day
+                        }) {
                             shared_initialized.remove(&shared_key);
                             due.remove(&selection.binding);
                             continue;
                         }
-                        if fresh && due.get(&selection.binding).is_some_and(|until| *until > now_ms()) { continue; }
-                        let source_selection = MarketSelection { binding: selection.binding.clone(), interval };
-                        let result = if let Some(bars) = visible_source_bars.get(&source_selection) {
+                        if fresh
+                            && due
+                                .get(&selection.binding)
+                                .is_some_and(|until| *until > now_ms())
+                        {
+                            continue;
+                        }
+                        let source_selection = MarketSelection {
+                            binding: selection.binding.clone(),
+                            interval,
+                        };
+                        let result = if let Some(bars) = visible_source_bars.get(&source_selection)
+                        {
                             Ok(bars.clone())
                         } else {
-                            candles(server, http, instrument, &source_selection, generation, None).await
+                            candles(
+                                server,
+                                http,
+                                instrument,
+                                &source_selection,
+                                generation,
+                                None,
+                            )
+                            .await
                         };
                         let Ok(mut bars) = result else {
                             due.insert(selection.binding.clone(), now_ms().saturating_add(30_000));
@@ -602,85 +810,179 @@ async fn subscription_loop(
                         };
                         if !fresh {
                             if let Some(cached) = public_cache::PublicHistoryCache::local()
-                                .and_then(|cache| cache.recent(&source_selection, generation)) {
+                                .and_then(|cache| cache.recent(&source_selection, generation))
+                            {
                                 bars = history::merge_latest(Some(cached), bars, generation);
                             }
                         }
                         if !fresh && interval == ChartInterval::OneMinute {
-                            bars = bars.into_iter().rev().take(360).collect::<Vec<_>>()
-                                .into_iter().rev().collect();
+                            bars = bars
+                                .into_iter()
+                                .rev()
+                                .take(360)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect();
                         }
                         let now = now_ms();
                         let forming = bars.last().filter(|bar| bar.close_time_ms >= now).cloned();
-                        let closed = bars.into_iter().filter(|bar| bar.close_time_ms < now).collect::<Vec<_>>();
+                        let closed = bars
+                            .into_iter()
+                            .filter(|bar| bar.close_time_ms < now)
+                            .collect::<Vec<_>>();
                         if !fresh {
                             let event = if interval == ChartInterval::OneMinute {
-                                LocalMarketClientEvent::BaseMinuteHistory { generation,
-                                    binding: selection.binding.clone(), bars: closed, forming }
-                            } else { LocalMarketClientEvent::SessionDayHistory { generation,
-                                binding: selection.binding.clone(), bars: closed, forming } };
+                                LocalMarketClientEvent::BaseMinuteHistory {
+                                    generation,
+                                    binding: selection.binding.clone(),
+                                    bars: closed,
+                                    forming,
+                                }
+                            } else {
+                                LocalMarketClientEvent::SessionDayHistory {
+                                    generation,
+                                    binding: selection.binding.clone(),
+                                    bars: closed,
+                                    forming,
+                                }
+                            };
                             emitter.emit(event)?;
                         } else {
                             for bar in closed.into_iter().rev().take(2).rev() {
                                 let event = if interval == ChartInterval::OneMinute {
-                                    LocalMarketClientEvent::BaseMinuteBar { generation,
-                                        binding: selection.binding.clone(), bar, confirmed: true }
-                                } else { LocalMarketClientEvent::SessionDayBar { generation,
-                                    binding: selection.binding.clone(), bar, confirmed: true } };
+                                    LocalMarketClientEvent::BaseMinuteBar {
+                                        generation,
+                                        binding: selection.binding.clone(),
+                                        bar,
+                                        confirmed: true,
+                                    }
+                                } else {
+                                    LocalMarketClientEvent::SessionDayBar {
+                                        generation,
+                                        binding: selection.binding.clone(),
+                                        bar,
+                                        confirmed: true,
+                                    }
+                                };
                                 emitter.emit(event)?;
                             }
                             if let Some(bar) = forming {
                                 let event = if interval == ChartInterval::OneMinute {
-                                    LocalMarketClientEvent::BaseMinuteBar { generation,
-                                        binding: selection.binding.clone(), bar, confirmed: false }
-                                } else { LocalMarketClientEvent::SessionDayBar { generation,
-                                    binding: selection.binding.clone(), bar, confirmed: false } };
+                                    LocalMarketClientEvent::BaseMinuteBar {
+                                        generation,
+                                        binding: selection.binding.clone(),
+                                        bar,
+                                        confirmed: false,
+                                    }
+                                } else {
+                                    LocalMarketClientEvent::SessionDayBar {
+                                        generation,
+                                        binding: selection.binding.clone(),
+                                        bar,
+                                        confirmed: false,
+                                    }
+                                };
                                 emitter.emit(event)?;
                             }
                         }
-                        due.insert(selection.binding.clone(), now.saturating_add(
-                            if interval == ChartInterval::OneMinute { 15_000 } else { 1_800_000 }));
+                        due.insert(
+                            selection.binding.clone(),
+                            now.saturating_add(if interval == ChartInterval::OneMinute {
+                                15_000
+                            } else {
+                                1_800_000
+                            }),
+                        );
                         shared_initialized.insert(shared_key);
                     }
                 }
                 if matches!(server, MarketServer::Gate | MarketServer::Okx) {
                     for binding in &bindings {
                         let now = now_ms();
-                        if interest_history_due.get(binding).is_some_and(|until| *until > now) { continue; }
-                        let Some(instrument) = instruments.iter().find(|item| item.symbol == binding.symbol) else { continue; };
+                        if interest_history_due
+                            .get(binding)
+                            .is_some_and(|until| *until > now)
+                        {
+                            continue;
+                        }
+                        let Some(instrument) = instruments
+                            .iter()
+                            .find(|item| item.symbol == binding.symbol)
+                        else {
+                            continue;
+                        };
                         let cache = public_cache::PublicHistoryCache::local();
-                        let cached = cache.as_ref().and_then(|cache| cache.interest(binding, generation));
-                        let warm = cached.as_ref().is_some_and(|samples|
-                            public_cache::PublicHistoryCache::interest_fresh(samples, now));
+                        let cached = cache
+                            .as_ref()
+                            .and_then(|cache| cache.interest(binding, generation));
+                        let warm = cached.as_ref().is_some_and(|samples| {
+                            public_cache::PublicHistoryCache::interest_fresh(samples, now)
+                        });
                         let result = if let Some(samples) = cached.as_ref().filter(|_| warm) {
                             Ok(samples.clone())
                         } else if server == MarketServer::Gate {
-                            venue_gateway_gate::display::open_interest_history(http, instrument, generation, now).await
+                            venue_gateway_gate::display::open_interest_history(
+                                http, instrument, generation, now,
+                            )
+                            .await
                         } else {
-                            let since = cached.as_ref().and_then(|samples| samples.last())
+                            let since = cached
+                                .as_ref()
+                                .and_then(|samples| samples.last())
                                 .map(|sample| sample.exchange_time_ms);
-                            venue_gateway_okx::display::open_interest_history(http, instrument, generation, now, since).await
+                            venue_gateway_okx::display::open_interest_history(
+                                http, instrument, generation, now, since,
+                            )
+                            .await
                         };
                         let result = result.and_then(|samples| {
-                            if samples.is_empty() { Err("OI history has no completed samples".into()) }
-                            else { Ok(samples) }
+                            if samples.is_empty() {
+                                Err("OI history has no completed samples".into())
+                            } else {
+                                Ok(samples)
+                            }
                         });
                         let (payload, next) = match result {
-                            Ok(samples) => (MarketPayload::OpenInterestHistory(
-                                if warm { samples } else { cache.as_ref().and_then(|cache|
-                                    cache.remember_interest(binding, generation, samples.clone()))
-                                    .unwrap_or(samples) }),
-                                now / 300_000 * 300_000 + 310_000),
-                            Err(error) => (MarketPayload::OpenInterestHistoryUnavailable(error), now.saturating_add(60_000)),
+                            Ok(samples) => (
+                                MarketPayload::OpenInterestHistory(if warm {
+                                    samples
+                                } else {
+                                    cache
+                                        .as_ref()
+                                        .and_then(|cache| {
+                                            cache.remember_interest(
+                                                binding,
+                                                generation,
+                                                samples.clone(),
+                                            )
+                                        })
+                                        .unwrap_or(samples)
+                                }),
+                                now / 300_000 * 300_000 + 310_000,
+                            ),
+                            Err(error) => (
+                                MarketPayload::OpenInterestHistoryUnavailable(error),
+                                now.saturating_add(60_000),
+                            ),
                         };
                         interest_history_due.insert(binding.clone(), next);
-                        let event_time = match &payload { MarketPayload::OpenInterestHistory(samples) =>
-                            samples.last().map_or(now, |sample| sample.exchange_time_ms), _ => now };
+                        let event_time = match &payload {
+                            MarketPayload::OpenInterestHistory(samples) => {
+                                samples.last().map_or(now, |sample| sample.exchange_time_ms)
+                            }
+                            _ => now,
+                        };
                         for selection in selections.iter().filter(|item| item.binding == *binding) {
-                            emitter.emit(LocalMarketClientEvent::Market(Box::new(MarketEnvelope {
-                                generation, selection: selection.clone(), event_time_ms: event_time,
-                                received_ms: now, payload: payload.clone(),
-                            })))?;
+                            emitter.emit(LocalMarketClientEvent::Market(Box::new(
+                                MarketEnvelope {
+                                    generation,
+                                    selection: selection.clone(),
+                                    event_time_ms: event_time,
+                                    received_ms: now,
+                                    payload: payload.clone(),
+                                },
+                            )))?;
                         }
                     }
                 }
@@ -689,7 +991,9 @@ async fn subscription_loop(
                 // enqueue hundreds of pages, so draining the entire channel here
                 // would make otherwise healthy Funding/OI appear stale.
                 for _ in 0..2 {
-                    let Ok(request) = history.try_recv() else { break; };
+                    let Ok(request) = history.try_recv() else {
+                        break;
+                    };
                     let result = if request.generation != generation {
                         Err("expired history request".into())
                     } else if let Some(i) = instruments
@@ -743,7 +1047,10 @@ async fn refresh(
     shared: Option<&(Book, Vec<PublicTrade>)>,
 ) -> Result<(Option<(Book, Vec<PublicTrade>)>, Option<Vec<PublicBar>>), String> {
     let (bars, fetched) = if shared.is_some() {
-        (candles(server, http, instrument, selection, generation, None).await?, None)
+        (
+            candles(server, http, instrument, selection, generation, None).await?,
+            None,
+        )
     } else {
         let (bars, book, prints) = tokio::join!(
             candles(server, http, instrument, selection, generation, None),
@@ -752,7 +1059,9 @@ async fn refresh(
         );
         (bars?, Some((book?, prints?)))
     };
-    let (book, prints) = shared.or(fetched.as_ref()).ok_or("missing public snapshot")?;
+    let (book, prints) = shared
+        .or(fetched.as_ref())
+        .ok_or("missing public snapshot")?;
     let received = now_ms();
     let send = |emitter: &mut EventEmitter, payload, event_time_ms| {
         emitter.emit(LocalMarketClientEvent::Market(Box::new(MarketEnvelope {
@@ -763,21 +1072,26 @@ async fn refresh(
             payload,
         })))
     };
-    let mut source_bars = matches!(selection.interval, ChartInterval::OneMinute | ChartInterval::OneDay)
-        .then(|| bars.clone());
+    let mut source_bars = matches!(
+        selection.interval,
+        ChartInterval::OneMinute | ChartInterval::OneDay
+    )
+    .then(|| bars.clone());
     if !initialized.contains(selection) {
-        let closed = bars.iter().filter(|bar| bar.close_time_ms < received)
-            .cloned().collect::<Vec<_>>();
-        let history = initial_visible_history(server, http, instrument, selection,
-            generation, closed).await;
+        let closed = bars
+            .iter()
+            .filter(|bar| bar.close_time_ms < received)
+            .cloned()
+            .collect::<Vec<_>>();
+        let history =
+            initial_visible_history(server, http, instrument, selection, generation, closed).await;
         if let Some(source) = &mut source_bars {
-            *source = history::merge_latest(Some(history.clone()), std::mem::take(source), generation);
+            *source =
+                history::merge_latest(Some(history.clone()), std::mem::take(source), generation);
         }
         send(
             emitter,
-            MarketPayload::RestHistory {
-                bars: history,
-            },
+            MarketPayload::RestHistory { bars: history },
             received,
         )?;
         initialized.insert(selection.clone());
@@ -809,7 +1123,10 @@ async fn refresh(
     let levels = |values: &[(rust_decimal::Decimal, rust_decimal::Decimal)]| {
         values
             .iter()
-            .map(|(price, quantity)| UiBookLevel { price: *price, quantity: *quantity })
+            .map(|(price, quantity)| UiBookLevel {
+                price: *price,
+                quantity: *quantity,
+            })
             .collect()
     };
     send(
@@ -857,9 +1174,7 @@ mod tests {
         for server in MarketServer::ALL
             .into_iter()
             .filter(|s| *s != MarketServer::Binance)
-            .filter(|s| {
-                std::env::var("VENUE_DISPLAY_TEST_VENUE").map_or(true, |v| v == s.label())
-            })
+            .filter(|s| std::env::var("VENUE_DISPLAY_TEST_VENUE").map_or(true, |v| v == s.label()))
         {
             let result = async {
                 let instruments = catalog(server, &http)

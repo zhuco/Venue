@@ -19,6 +19,7 @@ impl NoopReason {
             Self::BudgetExhausted => "waiting_budget",
             Self::PositionLimit => "waiting_position_limit",
             Self::QuantityTooSmall => "waiting_amount",
+            Self::ExecutionLimits => "waiting_execution_limits",
             Self::ExitOnly => "waiting_exit_only",
             Self::TakeProfitBlocked => "waiting_take_profit",
             Self::WaitingForCancel => "waiting_cancel",

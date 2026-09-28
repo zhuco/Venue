@@ -195,6 +195,10 @@ mod tests {
                 account: &account,
                 reference: &reference,
                 execution_market: market,
+                execution_limits: Some(&crate::multi_venue_risk::StrategyRiskLimits {
+                    max_order_notional: Decimal::from(1000),
+                    max_symbol_notional: Decimal::from(1000),
+                }),
                 consumed_supports: &consumed,
                 last_support_lower: Some(Decimal::from(100)),
                 current_take_profit: None,

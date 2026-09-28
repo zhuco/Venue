@@ -33,13 +33,20 @@ impl Vwap {
     }
 
     pub(crate) fn from_totals(price_volume: Decimal, volume: Decimal) -> Self {
-        Self { cumulative_price_volume: price_volume, cumulative_volume: volume }
+        Self {
+            cumulative_price_volume: price_volume,
+            cumulative_volume: volume,
+        }
     }
 
     pub(crate) fn current_value(&self) -> Result<Option<Decimal>, ChartIndicatorError> {
-        if self.cumulative_volume.is_zero() { return Ok(None); }
-        self.cumulative_price_volume.checked_div(self.cumulative_volume)
-            .map(Some).ok_or(ChartIndicatorError::Arithmetic)
+        if self.cumulative_volume.is_zero() {
+            return Ok(None);
+        }
+        self.cumulative_price_volume
+            .checked_div(self.cumulative_volume)
+            .map(Some)
+            .ok_or(ChartIndicatorError::Arithmetic)
     }
 
     pub fn update(&mut self, bar: &PublicBar) -> Result<Option<Decimal>, ChartIndicatorError> {
@@ -69,7 +76,8 @@ impl Vwap {
             .cumulative_volume
             .checked_add(*volume)
             .ok_or(ChartIndicatorError::Arithmetic)?;
-        let value = Self::from_totals(cumulative_price_volume, cumulative_volume).current_value()?;
+        let value =
+            Self::from_totals(cumulative_price_volume, cumulative_volume).current_value()?;
         self.cumulative_price_volume = cumulative_price_volume;
         self.cumulative_volume = cumulative_volume;
         Ok(value)

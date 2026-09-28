@@ -126,12 +126,19 @@ impl StrategyGateway {
     pub(crate) fn order_observation(
         &mut self,
         command: &ExecutionCommand,
+        native_order_id: Option<&str>,
     ) -> Result<Option<venue_execution::DurableOrderObservation>, StrategyExchangeError> {
+        if let Self::Gate(gateway) = self {
+            return gateway
+                .durable_order_observation_with_native_id(command, native_order_id)
+                .map_err(|_| StrategyExchangeError);
+        }
         gateway_call!(self, durable_order_observation, command)
     }
     pub(crate) fn order_observation_detailed(
         &mut self,
         command: &ExecutionCommand,
+        native_order_id: Option<&str>,
     ) -> Result<Option<venue_execution::DurableOrderObservation>, String> {
         match self {
             Self::Bitget(gateway) => gateway
@@ -141,7 +148,7 @@ impl StrategyGateway {
                 .durable_order_observation(command)
                 .map_err(|error| error.to_string()),
             Self::Gate(gateway) => gateway
-                .durable_order_observation(command)
+                .durable_order_observation_with_native_id(command, native_order_id)
                 .map_err(|error| error.to_string()),
             Self::Okx(gateway) => gateway
                 .durable_order_observation(command)

@@ -6,11 +6,14 @@ fn funding_readout_separates_current_prediction_and_expired_settlement()
     use rust_decimal::Decimal;
     use venue_domain::{FieldState, MarkFunding, MarketTimeSource};
     let funding = MarkFunding {
-        symbol: "DOGE/USDC".parse()?, generation: 1,
-        received_at_ms: 1_000_000, exchange_time_ms: 999_000,
+        symbol: "DOGE/USDC".parse()?,
+        generation: 1,
+        received_at_ms: 1_000_000,
+        exchange_time_ms: 999_000,
         time_source: MarketTimeSource::Exchange,
         next_funding_time_ms: Some(1_060_001),
-        mark_price: FieldState::Missing, index_price: FieldState::Missing,
+        mark_price: FieldState::Missing,
+        index_price: FieldState::Missing,
         funding_rate: Decimal::new(-25, 4),
         estimated_settle_price: FieldState::Missing,
         predicted_funding_rate: FieldState::Known(Decimal::new(1, 3)),
@@ -30,30 +33,47 @@ fn funding_readout_separates_current_prediction_and_expired_settlement()
 fn oi_current_readout_keeps_unknown_unit_visible_and_marks_clock_skew()
 -> Result<(), Box<dyn std::error::Error>> {
     use rust_decimal::Decimal;
-    use venue_domain::{FieldState, MarketTimeSource, OpenInterestSample, OpenInterestUnit,
-        UnknownReason};
-    let mut interest = OpenInterestSample {
-        symbol: "DOGE/USDC".parse()?, generation: 1,
-        received_at_ms: 1_001_000, exchange_time_ms: 1_001_000,
-        time_source: MarketTimeSource::Exchange, sampling_interval_ms: None,
-        native_quantity: Decimal::from(125),
-        native_unit: OpenInterestUnit::Contracts { base_per_contract: Decimal::ONE },
-        base_quantity: FieldState::Unavailable { reason: UnknownReason::Ambiguous },
-        quote_notional: FieldState::Missing, quote_asset: None,
+    use venue_domain::{
+        FieldState, MarketTimeSource, OpenInterestSample, OpenInterestUnit, UnknownReason,
     };
-    let (label, tooltip) = presentation::open_interest_display(&interest, 1_000_000,
-        Language::SimplifiedChinese);
+    let mut interest = OpenInterestSample {
+        symbol: "DOGE/USDC".parse()?,
+        generation: 1,
+        received_at_ms: 1_001_000,
+        exchange_time_ms: 1_001_000,
+        time_source: MarketTimeSource::Exchange,
+        sampling_interval_ms: None,
+        native_quantity: Decimal::from(125),
+        native_unit: OpenInterestUnit::Contracts {
+            base_per_contract: Decimal::ONE,
+        },
+        base_quantity: FieldState::Unavailable {
+            reason: UnknownReason::Ambiguous,
+        },
+        quote_notional: FieldState::Missing,
+        quote_asset: None,
+    };
+    let (label, tooltip) =
+        presentation::open_interest_display(&interest, 1_000_000, Language::SimplifiedChinese);
     assert_eq!(label, "OI — · stale");
     assert!(tooltip.contains("基础币数量不可用：合约单位不明确"));
-    assert!(presentation::open_interest_history_stale(Some(&interest), 1_000_000));
+    assert!(presentation::open_interest_history_stale(
+        Some(&interest),
+        1_000_000
+    ));
     interest.base_quantity = FieldState::Known(Decimal::from(125));
     interest.received_at_ms = 1_000_000;
     interest.exchange_time_ms = 1_000_000;
-    let (label, _) = presentation::open_interest_display(&interest, 1_000_000,
-        Language::English);
+    let (label, _) = presentation::open_interest_display(&interest, 1_000_000, Language::English);
     assert_eq!(label, "OI 125 DOGE");
-    assert!(!presentation::open_interest_history_stale(Some(&interest), 1_900_000));
-    assert!(presentation::open_interest_history_stale(Some(&interest), 1_900_001));
+    assert!(!presentation::open_interest_history_stale(
+        Some(&interest),
+        1_900_000
+    ));
+    assert!(presentation::open_interest_history_stale(
+        Some(&interest),
+        1_900_001
+    ));
     Ok(())
 }
 
@@ -62,32 +82,63 @@ fn three_avwap_anchors_and_fixed_profile_survive_restart_in_their_market_scope()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::chart_view::analysis::{AvwapAnchor, FixedProfileRange};
     let doge = crate::market::MarketSelection::binance_usd_m(
-        "DOGE/USDC", crate::chart::ChartInterval::OneMinute)?.binding;
+        "DOGE/USDC",
+        crate::chart::ChartInterval::OneMinute,
+    )?
+    .binding;
     let btc = crate::market::MarketSelection::binance_usd_m(
-        "BTC/USDC", crate::chart::ChartInterval::OneMinute)?.binding;
+        "BTC/USDC",
+        crate::chart::ChartInterval::OneMinute,
+    )?
+    .binding;
     let mut preferences = crate::model::Preferences::default();
     for id in 1..=3 {
         preferences.analysis_anchors.push(AvwapAnchor {
-            id, pane_instance: 7, binding: doge.clone(), open_time_ms: id * 60_000,
-            reference_price: rust_decimal::Decimal::ONE, color: [240, 185, 11],
+            id,
+            pane_instance: 7,
+            binding: doge.clone(),
+            open_time_ms: id * 60_000,
+            reference_price: rust_decimal::Decimal::ONE,
+            color: [240, 185, 11],
         });
     }
     preferences.analysis_anchors.push(AvwapAnchor {
-        id: 4, pane_instance: 7, binding: btc.clone(), open_time_ms: 60_000,
-        reference_price: rust_decimal::Decimal::ONE, color: [90, 200, 250],
+        id: 4,
+        pane_instance: 7,
+        binding: btc.clone(),
+        open_time_ms: 60_000,
+        reference_price: rust_decimal::Decimal::ONE,
+        color: [90, 200, 250],
     });
     preferences.fixed_profile_ranges.push(FixedProfileRange {
-        pane_instance: 7, binding: doge.clone(), start_ms: 60_000, end_ms: 240_000,
+        pane_instance: 7,
+        binding: doge.clone(),
+        start_ms: 60_000,
+        end_ms: 240_000,
     });
     let restored: crate::model::Preferences =
         serde_json::from_slice(&serde_json::to_vec(&preferences)?)?;
-    assert_eq!(restored.analysis_anchors.iter()
-        .filter(|anchor| anchor.pane_instance == 7 && anchor.binding == doge)
-        .map(|anchor| (anchor.id, anchor.open_time_ms))
-        .collect::<Vec<_>>(), vec![(1, 60_000), (2, 120_000), (3, 180_000)]);
-    assert_eq!(restored.analysis_anchors.iter()
-        .filter(|anchor| anchor.binding == btc).count(), 1);
-    assert_eq!(restored.fixed_profile_ranges, preferences.fixed_profile_ranges);
+    assert_eq!(
+        restored
+            .analysis_anchors
+            .iter()
+            .filter(|anchor| anchor.pane_instance == 7 && anchor.binding == doge)
+            .map(|anchor| (anchor.id, anchor.open_time_ms))
+            .collect::<Vec<_>>(),
+        vec![(1, 60_000), (2, 120_000), (3, 180_000)]
+    );
+    assert_eq!(
+        restored
+            .analysis_anchors
+            .iter()
+            .filter(|anchor| anchor.binding == btc)
+            .count(),
+        1
+    );
+    assert_eq!(
+        restored.fixed_profile_ranges,
+        preferences.fixed_profile_ranges
+    );
     Ok(())
 }
 

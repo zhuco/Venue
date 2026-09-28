@@ -25,6 +25,15 @@ use super::{
 
 const SIGNAL_SEND_AGE_MS: u64 = 30_000;
 
+fn budget_limits(budget: Decimal) -> crate::multi_venue_risk::StrategyRiskLimits {
+    // The instance budget is reserved atomically across symbols. Do not impose a second
+    // independent single-order ceiling that makes exchange minimum quantities unreachable.
+    crate::multi_venue_risk::StrategyRiskLimits {
+        max_order_notional: budget,
+        max_symbol_notional: budget,
+    }
+}
+
 #[derive(Clone)]
 pub struct SupportMartingaleRuntime {
     store: SupportMartingaleStore,
@@ -46,9 +55,14 @@ pub(crate) struct SupportSendFence {
     kind: SupportSendKind,
     price_ceiling: Option<Decimal>,
     stop_floor: Option<Decimal>,
+    entry_budget: Option<Decimal>,
 }
 
 impl SupportSendFence {
+    pub(crate) fn entry_limits(&self) -> Option<crate::multi_venue_risk::StrategyRiskLimits> {
+        self.entry_budget.map(budget_limits)
+    }
+
     pub(crate) fn market_allows(&self, price: Decimal) -> bool {
         self.price_ceiling.is_none_or(|ceiling| price <= ceiling)
             && self.stop_floor.is_none_or(|floor| price > floor)
@@ -237,11 +251,27 @@ impl SupportMartingaleRuntime {
             .as_ref()
             .map(|order| vec![order.command.clone()])
             .unwrap_or_default();
-        let (snapshot, market, observations) = self
+        let facts = self
             .credentials
             .grid_facts(owner, &instance.credential_id, symbol.clone(), queries)
-            .await
-            .map_err(|_| MultiVenueStoreError::Unavailable)?;
+            .await;
+        let (snapshot, market, observations) = match facts {
+            Ok(facts) => facts,
+            Err(_) => {
+                if instance.health != SupportMartingaleHealth::Unavailable {
+                    self.store
+                        .mark_health(
+                            &instance.instance_id,
+                            SupportMartingaleHealth::Unavailable,
+                            Some("signed_readback_unavailable"),
+                            now_ms()?,
+                        )
+                        .await
+                        .map_err(map_store)?;
+                }
+                return Err(MultiVenueStoreError::Unavailable);
+            }
+        };
         let now = now_ms()?;
         let observed_take_profit_terminal = observations
             .first()
@@ -488,12 +518,14 @@ impl SupportMartingaleRuntime {
             .await
             .map_err(map_store)?;
         let decision_now = now_ms()?;
+        let execution_limits = budget_limits(instance.config.total_budget);
         let input = PlannerInput {
             instance: &instance,
             symbol,
             reference: &reference,
             account: &snapshot,
             execution_market: &market,
+            execution_limits: Some(&execution_limits),
             consumed_supports: &consumed,
             last_support_lower: runtime_state.last_support_lower,
             current_take_profit: current_tp.as_ref(),
@@ -894,6 +926,7 @@ impl SupportMartingaleRuntime {
         }
         let mut price_ceiling = None;
         let mut stop_floor = None;
+        let mut entry_budget = None;
         if matches!(kind, SupportSendKind::Entry | SupportSendKind::Add) {
             let config: venue_control_protocol::support_martingale::SupportMartingaleConfig =
                 serde_json::from_value(
@@ -901,6 +934,7 @@ impl SupportMartingaleRuntime {
                         .map_err(|_| MultiVenueStoreError::Conflict)?,
                 )
                 .map_err(|_| MultiVenueStoreError::Conflict)?;
+            entry_budget = Some(config.total_budget);
             if config.entry_mode
                 == venue_control_protocol::support_martingale::MartingaleEntryMode::FixedPrice
             {
@@ -930,6 +964,7 @@ impl SupportMartingaleRuntime {
             kind,
             price_ceiling,
             stop_floor,
+            entry_budget,
         }))
     }
 }
@@ -1065,6 +1100,7 @@ mod tests {
             kind: SupportSendKind::Entry,
             price_ceiling: Some(Decimal::from(100)),
             stop_floor: Some(Decimal::from(90)),
+            entry_budget: Some(Decimal::from(20)),
         };
         assert!(fence.market_allows(Decimal::from(100)));
         assert!(fence.market_allows(Decimal::from(95)));
@@ -1114,7 +1150,8 @@ mod tests {
             !SupportSendFence {
                 kind: SupportSendKind::Add,
                 price_ceiling: None,
-                stop_floor: None
+                stop_floor: None,
+                entry_budget: Some(Decimal::from(20)),
             }
             .validates(&command, &snapshot)
         );

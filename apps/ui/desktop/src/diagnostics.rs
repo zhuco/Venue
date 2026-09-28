@@ -126,10 +126,15 @@ mod tests {
         struct Capture(Arc<Mutex<Vec<u8>>>);
         impl Write for Capture {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.0.lock().map_err(|_| io::Error::other("capture poisoned"))?.extend_from_slice(bytes);
+                self.0
+                    .lock()
+                    .map_err(|_| io::Error::other("capture poisoned"))?
+                    .extend_from_slice(bytes);
                 Ok(bytes.len())
             }
-            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
         }
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let captured = bytes.clone();
@@ -142,8 +147,13 @@ mod tests {
             tracing::info!(target: "venueflow::indicator_performance", "indicator-sample-probe");
             tracing::info!(target: "venueflow::unrelated", "filtered-probe");
         });
-        let output = String::from_utf8(bytes.lock().map_err(|_| io::Error::other("capture poisoned"))?.clone())
-            .map_err(io::Error::other)?;
+        let output = String::from_utf8(
+            bytes
+                .lock()
+                .map_err(|_| io::Error::other("capture poisoned"))?
+                .clone(),
+        )
+        .map_err(io::Error::other)?;
         assert!(output.contains("frame-sample-probe"));
         assert!(output.contains("indicator-sample-probe"));
         assert!(!output.contains("filtered-probe"));

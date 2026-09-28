@@ -75,7 +75,10 @@ pub async fn candles(
         .unwrap_or_default();
     let value = get(
         http,
-        &format!("kline?category=linear&symbol={native}&interval={interval}&limit={}{cursor}", limit.clamp(1, 200)),
+        &format!(
+            "kline?category=linear&symbol={native}&interval={interval}&limit={}{cursor}",
+            limit.clamp(1, 200)
+        ),
     )
     .await?;
     let mut result = Vec::new();
@@ -150,23 +153,42 @@ pub async fn quotes(http: &reqwest::Client, instruments: &[Instrument]) -> Resul
 }
 
 /// The public V5 series reports both sides of a linear contract in base units.
-pub async fn open_interest_history(http: &reqwest::Client, instrument: &Instrument,
-    generation: u64, now: u64, since: Option<u64>) -> Result<Vec<OpenInterestSample>> {
+pub async fn open_interest_history(
+    http: &reqwest::Client,
+    instrument: &Instrument,
+    generation: u64,
+    now: u64,
+    since: Option<u64>,
+) -> Result<Vec<OpenInterestSample>> {
     let native = format!("{}{}", instrument.symbol.base(), instrument.symbol.quote());
     let mut samples = Vec::new();
     let mut before = None::<u64>;
     for _ in 0..2 {
-        let cursor = before.map(|time| format!("&endTime={}", time.saturating_sub(1))).unwrap_or_default();
-        let value = get(http, &format!("open-interest?category=linear&symbol={native}&intervalTime=5min&limit=200{cursor}")).await?;
+        let cursor = before
+            .map(|time| format!("&endTime={}", time.saturating_sub(1)))
+            .unwrap_or_default();
+        let value = get(
+            http,
+            &format!(
+                "open-interest?category=linear&symbol={native}&intervalTime=5min&limit=200{cursor}"
+            ),
+        )
+        .await?;
         if value["result"]["symbol"] != native || value["result"]["category"] != "linear" {
             return Err("Bybit OI scope mismatch".into());
         }
         let page = parse_open_interest_history(&value, instrument, generation, now)?;
-        if page.is_empty() { break; }
+        if page.is_empty() {
+            break;
+        }
         before = page.first().map(|sample| sample.exchange_time_ms);
         samples.extend(page);
-        if before.is_some_and(|time| since.is_some_and(|cached| time <= cached)) { break; }
-        if before.is_some_and(|time| time <= now.saturating_sub(86_700_000)) { break; }
+        if before.is_some_and(|time| since.is_some_and(|cached| time <= cached)) {
+            break;
+        }
+        if before.is_some_and(|time| time <= now.saturating_sub(86_700_000)) {
+            break;
+        }
     }
     samples.sort_by_key(|sample| sample.exchange_time_ms);
     samples.dedup_by_key(|sample| sample.exchange_time_ms);
@@ -174,20 +196,37 @@ pub async fn open_interest_history(http: &reqwest::Client, instrument: &Instrume
     Ok(samples)
 }
 
-fn parse_open_interest_history(value: &Value, instrument: &Instrument,
-    generation: u64, now: u64) -> Result<Vec<OpenInterestSample>> {
+fn parse_open_interest_history(
+    value: &Value,
+    instrument: &Instrument,
+    generation: u64,
+    now: u64,
+) -> Result<Vec<OpenInterestSample>> {
     let mut samples = Vec::new();
     for row in array(&value["result"]["list"])? {
         let time = stamp(&row["timestamp"])?;
         let quantity = number(&row["openInterest"])?;
-        if time == 0 || time > now || quantity < Decimal::ZERO { return Err("invalid Bybit OI history".into()); }
-        let sample = OpenInterestSample { symbol: instrument.symbol.clone(), generation,
-            received_at_ms: now, exchange_time_ms: time, time_source: venue_domain::MarketTimeSource::Exchange, sampling_interval_ms: Some(300_000),
-            native_quantity: quantity, native_unit: OpenInterestUnit::BaseAsset,
+        if time == 0 || time > now || quantity < Decimal::ZERO {
+            return Err("invalid Bybit OI history".into());
+        }
+        let sample = OpenInterestSample {
+            symbol: instrument.symbol.clone(),
+            generation,
+            received_at_ms: now,
+            exchange_time_ms: time,
+            time_source: venue_domain::MarketTimeSource::Exchange,
+            sampling_interval_ms: Some(300_000),
+            native_quantity: quantity,
+            native_unit: OpenInterestUnit::BaseAsset,
             base_quantity: FieldState::Known(quantity),
-            quote_notional: FieldState::Unavailable { reason: UnknownReason::SourceOmitted },
-            quote_asset: None };
-        if !sample.is_valid() { return Err("invalid Bybit OI history".into()); }
+            quote_notional: FieldState::Unavailable {
+                reason: UnknownReason::SourceOmitted,
+            },
+            quote_asset: None,
+        };
+        if !sample.is_valid() {
+            return Err("invalid Bybit OI history".into());
+        }
         samples.push(sample);
     }
     samples.sort_by_key(|sample| sample.exchange_time_ms);
@@ -249,16 +288,24 @@ mod derivative_tests {
 
     #[test]
     fn bybit_history_keeps_exact_linear_symbol_and_completed_five_minute_samples() -> Result<()> {
-        let instrument = Instrument { symbol: "DOGE/USDC".parse().map_err(|_| "symbol")?, native_symbol: "DOGEUSDC".into(),
-            price_tick: Some(Decimal::new(1, 4)), price_scale: 4,
-            quantity_scale: 0, contract_size: Decimal::ONE };
+        let instrument = Instrument {
+            symbol: "DOGE/USDC".parse().map_err(|_| "symbol")?,
+            native_symbol: "DOGEUSDC".into(),
+            price_tick: Some(Decimal::new(1, 4)),
+            price_scale: 4,
+            quantity_scale: 0,
+            contract_size: Decimal::ONE,
+        };
         let payload = serde_json::json!({"result":{"symbol":"DOGEUSDC","category":"linear",
             "list":[{"openInterest":"12345.5","timestamp":"600000"},
                 {"openInterest":"12300","timestamp":"300000"}]}});
         let samples = parse_open_interest_history(&payload, &instrument, 9, 900_000)?;
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].exchange_time_ms, 300_000);
-        assert_eq!(samples[1].base_quantity, FieldState::Known(Decimal::new(123455, 1)));
+        assert_eq!(
+            samples[1].base_quantity,
+            FieldState::Known(Decimal::new(123455, 1))
+        );
         assert!(samples.iter().all(OpenInterestSample::is_valid));
         Ok(())
     }
